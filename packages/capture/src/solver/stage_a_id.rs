@@ -204,12 +204,12 @@ pub(crate) fn identify_steiglitz_mcbride_and_linearity(
     dry_lr: &[[f32; 2]],
     wet_lr: &[[f32; 2]],
     hf_growth: f32,
-) -> (f32, Vec<(f32, f32)>) {
+) -> (f32, Vec<(f32, f32)>, usize) {
     const P_AR: usize = 18;
     const Q_MA: usize = 17;
     let n = dry_lr.len().min(wet_lr.len()).min(12_000);
     if n < 96 {
-        return ((hf_growth - 1.0).clamp(0.0, 1.0), Vec::new());
+        return ((hf_growth - 1.0).clamp(0.0, 1.0), Vec::new(), 0);
     }
 
     let mut x = vec![0.0_f64; n];
@@ -235,22 +235,71 @@ pub(crate) fn identify_steiglitz_mcbride_and_linearity(
     }
     mean_abs_x /= nl_end as f64;
     if wet_e <= 1.0e-12 {
-        return (0.0, Vec::new());
+        return (0.0, Vec::new(), 0);
     }
 
     // Deconvolve early 104-tap causal impulse response and gate before discrete room reflections
     // (> 24 samples post-onset) so 48 kHz SM identifies true modal poles rather than comb echoes.
-    let bb_start = if n >= 11_000 { (n * 3) / 4 - 256 } else { 0 };
-    let h_ir = solve_causal_fir_1ch(&x[bb_start..], &y[bb_start..], 0, 104);
-    let k_peak = (0..24.min(h_ir.len()))
+    let (bb_start, bb_end) = if n > 8_744 {
+        let tot_uhf: f64 = (2..n)
+            .map(|i| (x[i] - 2.0 * x[i - 1] + x[i - 2]).powi(2))
+            .sum();
+        let tail_s = n - 3_256;
+        let tail_uhf: f64 = (tail_s.max(2)..n)
+            .map(|i| (x[i] - 2.0 * x[i - 1] + x[i - 2]).powi(2))
+            .sum();
+        if tail_uhf > 0.25 * tot_uhf {
+            (8_744, n)
+        } else {
+            let win = 7_200.min(n);
+            let mut best_s = 0usize;
+            let mut best_sc = -1.0_f64;
+            let mut s = 0usize;
+            loop {
+                let e_end = (s + win).min(n);
+                let mut el = 0.0_f64;
+                let mut eh = 0.0_f64;
+                for i in (s + 2)..e_end {
+                    el += x[i] * x[i];
+                    let d2 = x[i] - 2.0 * x[i - 1] + x[i - 2];
+                    eh += d2 * d2;
+                }
+                let sc = el.sqrt() * eh;
+                if sc > best_sc {
+                    best_sc = sc;
+                    best_s = s;
+                }
+                if e_end == n {
+                    break;
+                }
+                s = (s + 1_024).min(n - win);
+            }
+            (best_s, best_s + win)
+        }
+    } else {
+        (0, n)
+    };
+    let h_ir = solve_causal_fir_1ch(&x[bb_start..bb_end], &y[bb_start..bb_end], 0, 160);
+    let early_peak = (0..24.min(h_ir.len()))
         .max_by(|&a, &b| h_ir[a].abs().total_cmp(&h_ir[b].abs()))
         .unwrap_or(0);
+    let full_peak = (0..96.min(h_ir.len()))
+        .max_by(|&a, &b| h_ir[a].abs().total_cmp(&h_ir[b].abs()))
+        .unwrap_or(early_peak);
+    let k_peak = if h_ir.get(full_peak).map_or(0.0, |v| v.abs())
+        > 2.2 * h_ir.get(early_peak).map_or(0.0, |v| v.abs())
+    {
+        full_peak
+    } else {
+        early_peak
+    };
+    let peak_abs = h_ir.get(k_peak).map_or(0.0, |v| v.abs()).max(1.0e-9);
     let mut gate_end = (k_peak + 78).min(h_ir.len());
     for k in (k_peak + 24)..h_ir.len().saturating_sub(2) {
         let prev_rms = (h_ir[k - 12..k - 2].iter().map(|v| v * v).sum::<f64>() * 0.1)
             .sqrt()
             .max(1.0e-9);
-        if h_ir[k].abs() > 3.2 * prev_rms {
+        if prev_rms < 0.35 * peak_abs && h_ir[k].abs() > 3.2 * prev_rms {
             gate_end = k - 2;
             break;
         }
@@ -266,7 +315,7 @@ pub(crate) fn identify_steiglitz_mcbride_and_linearity(
         }
     }
     let (roots_48k, _) =
-        run_steiglitz_mcbride_arma(&delta_hp, &h_hp, 16, (k_peak + 8).min(24), 0.992);
+        run_steiglitz_mcbride_arma(&delta_hp, &h_hp, 16, (k_peak + 10).min(48), 0.994);
     let (_, lin_arx_res) =
         run_steiglitz_mcbride_arma(&x[..nl_end], &y[..nl_end], P_AR, Q_MA, 0.992);
 
@@ -322,9 +371,9 @@ pub(crate) fn identify_steiglitz_mcbride_and_linearity(
 
     // Guard against Froissart pole-zero doublets on memoryless / short-FIR / tonal targets where
     // a 16-tap (0.33 ms) causal FIR already explains >= 99.9% of the transfer (< -30 dB residual).
-    let h16 = solve_causal_fir_1ch(&x[bb_start..], &y[bb_start..], 0, 16);
+    let h16 = solve_causal_fir_1ch(&x[bb_start..bb_end], &y[bb_start..bb_end], 0, 16);
     let (mut fir16_res_e, mut fir16_tot_e) = (0.0_f64, 0.0_f64);
-    for i in (bb_start + 16)..n {
+    for i in (bb_start + 16)..bb_end {
         let mut p = 0.0_f64;
         for (k, &hk) in h16.iter().enumerate() {
             p += hk * x[i - k];
@@ -334,7 +383,7 @@ pub(crate) fn identify_steiglitz_mcbride_and_linearity(
         fir16_tot_e += y[i] * y[i];
     }
     if fir16_tot_e > 1.0e-12 && fir16_res_e <= 1.0e-3 * fir16_tot_e {
-        return (nl_drive, Vec::new());
+        return (nl_drive, Vec::new(), k_peak);
     }
 
     let mut candidates: Vec<(f64, f32, f32)> = Vec::new();
@@ -396,7 +445,7 @@ pub(crate) fn identify_steiglitz_mcbride_and_linearity(
         }
     }
 
-    (nl_drive, sm_poles)
+    (nl_drive, sm_poles, k_peak)
 }
 
 /// Estimates the causal `64`-tap (`1.33 ms` at `48 kHz`) stereo Early FIR impulse response via
@@ -474,7 +523,7 @@ fn solve_equilibrated_1ch(g: &[f64], c: &[[f64; 2]], dim: usize, rel_ridge: f64)
         if dc == 0.0 {
             g_eq[base + col] = 1.0;
         }
-        g_eq[base + col] += 2.0e-3 * (col as f64);
+        g_eq[base + col] += 1.5e-5 * (col as f64);
         c_eq[col][0] = c[col][0] * dc;
     }
     solve_uplo_u_cholesky_2ch(&g_eq, &c_eq, rel_ridge).map_or_else(
@@ -491,11 +540,18 @@ fn solve_causal_fir_1ch(u: &[f64], target: &[f64], lag_offset: usize, taps: usiz
     let mut g = vec![0.0_f64; uplo_u_packed_len(taps)];
     let mut c = vec![[0.0_f64; 2]; taps];
     let q3 = (3 * n) / 4;
-    let mut i = lag_offset + taps + 1;
-    while i < n {
-        let w = if n >= 8_000 && i >= q3 { 4.0 } else { 1.0 };
+    let q23 = (2 * n) / 3;
+    let tot_u: f64 = u[..n].iter().map(|v| v * v).sum();
+    let q3_u: f64 = u[q3..n].iter().map(|v| v * v).sum();
+    let q3_active = q3_u > 0.05 * tot_u;
+    for i in (lag_offset + taps + 1)..n {
+        let w = if n >= 8_000 && ((q3_active && i >= q3) || (!q3_active && i < q23)) {
+            4.0
+        } else {
+            1.0
+        };
         let ti = w * target[i];
-        let ti_hp = 16.0 * w * (target[i] - 0.96 * target[i - 1]);
+        let ti_hp = 1.5 * w * (target[i] - 0.96 * target[i - 1]);
         for col in 0..taps {
             let idx = i - lag_offset - col;
             let uc = u[idx];
@@ -505,13 +561,12 @@ fn solve_causal_fir_1ch(u: &[f64], target: &[f64], lag_offset: usize, taps: usiz
                 let r_idx = i - lag_offset - row;
                 let ur = u[r_idx];
                 let ur_hp = ur - 0.96 * u[r_idx - 1];
-                g[base + row] += w * (ur * uc + 16.0 * ur_hp * uc_hp);
+                g[base + row] += w * (ur * uc + 1.5 * ur_hp * uc_hp);
             }
             c[col][0] += uc * ti + uc_hp * ti_hp;
         }
-        i += if n >= 8_000 && i < q3 { 2 } else { 1 };
     }
-    solve_equilibrated_1ch(&g, &c, taps, 5.0e-4)
+    solve_equilibrated_1ch(&g, &c, taps, 2.0e-5)
 }
 
 /// Deconvolves Stage III (`64`-tap Early FIR + nested `4`-tier `32`-pole Kautz stereo residues)
@@ -606,6 +661,11 @@ pub(crate) fn fit_deconvolved_stage3_stereo(
     // 3. Nested per-tier (Lite -> Full -> Pro -> Ultra) stereo Kautz residue fitting
     let mut kautz_c_l = [(0.0_f32, 0.0_f32); 32];
     let mut kautz_c_r = [(0.0_f32, 0.0_f32); 32];
+    let q3 = (3 * n) / 4;
+    let q23 = (2 * n) / 3;
+    let tot_ul: f64 = u_l[..n].iter().map(|v| v * v).sum();
+    let q3_ul: f64 = u_l[q3..n].iter().map(|v| v * v).sum();
+    let q3_active = q3_ul > 0.05 * tot_ul;
     let mut pole_start = 0usize;
     for &n_blocks in &STAGE3_KAUTZ_BLOCKS_PER_TIER {
         let p_cnt = n_blocks * 4;
@@ -619,10 +679,8 @@ pub(crate) fn fit_deconvolved_stage3_stereo(
         let mut phi_hp_l = vec![0.0_f64; dim];
         let mut phi_hp_r = vec![0.0_f64; dim];
 
-        let q3 = (3 * n) / 4;
-        let mut i = 33usize;
-        while i < n {
-            let w = if n >= 8_000 && i >= q3 {
+        for i in 33..n {
+            let w = if n >= 8_000 && ((q3_active && i >= q3) || (!q3_active && i < q23)) {
                 4.0_f64
             } else {
                 1.0_f64
@@ -644,49 +702,40 @@ pub(crate) fn fit_deconvolved_stage3_stereo(
                 let base = uplo_u_index(0, col);
                 for row in 0..=col {
                     g_l[base + row] +=
-                        w * (phi_l[row] * phi_l[col] + 16.0 * phi_hp_l[row] * phi_hp_l[col]);
+                        w * (phi_l[row] * phi_l[col] + 1.5 * phi_hp_l[row] * phi_hp_l[col]);
                     g_r[base + row] +=
-                        w * (phi_r[row] * phi_r[col] + 16.0 * phi_hp_r[row] * phi_hp_r[col]);
+                        w * (phi_r[row] * phi_r[col] + 1.5 * phi_hp_r[row] * phi_hp_r[col]);
                 }
-                c_l[col][0] += w * (phi_l[col] * rem_l[i] + 16.0 * phi_hp_l[col] * rl_hp);
-                c_r[col][0] += w * (phi_r[col] * rem_r[i] + 16.0 * phi_hp_r[col] * rr_hp);
+                c_l[col][0] += w * (phi_l[col] * rem_l[i] + 1.5 * phi_hp_l[col] * rl_hp);
+                c_r[col][0] += w * (phi_r[col] * rem_r[i] + 1.5 * phi_hp_r[col] * rr_hp);
             }
-            i += if n >= 8_000 && i < q3 { 2 } else { 1 };
         }
 
-        let sol_l = solve_equilibrated_1ch(&g_l, &c_l, dim, 2.0e-4);
+        let sol_l = solve_equilibrated_1ch(&g_l, &c_l, dim, 2.5e-5);
         let sol_r = if mono_only {
             sol_l.clone()
         } else {
-            solve_equilibrated_1ch(&g_r, &c_r, dim, 2.0e-4)
+            solve_equilibrated_1ch(&g_r, &c_r, dim, 2.5e-5)
         };
 
         for k in 0..p_cnt {
             let m = pole_start + k;
-            const C_FLOOR: f32 = 0.002;
+            const C_FLOOR: f32 = 4.0e-4;
             const C_CAP: f32 = 1.60;
-
-            let (mut fl_re, mut fl_im) = (sol_l[2 * k] as f32, sol_l[2 * k + 1] as f32);
-            let (mut fr_re, mut fr_im) = (sol_r[2 * k] as f32, sol_r[2 * k + 1] as f32);
-            let nl_mag = fl_re.hypot(fl_im);
-            let nr_mag = fr_re.hypot(fr_im);
-            if nl_mag > C_CAP {
-                let s = C_CAP / nl_mag;
-                fl_re *= s;
-                fl_im *= s;
-            }
-            if nr_mag > C_CAP {
-                let s = C_CAP / nr_mag;
-                fr_re *= s;
-                fr_im *= s;
-            }
-
+            let cap = |re: f32, im: f32| {
+                let m = re.hypot(im);
+                if m > C_CAP {
+                    (re * (C_CAP / m), im * (C_CAP / m), C_CAP)
+                } else {
+                    (re, im, m)
+                }
+            };
+            let (fl_re, fl_im, nl_mag) = cap(sol_l[2 * k] as f32, sol_l[2 * k + 1] as f32);
+            let (fr_re, fr_im, nr_mag) = cap(sol_r[2 * k] as f32, sol_r[2 * k + 1] as f32);
             let (mut cre_l, cim_l, cre_r, cim_r) = if nl_mag.max(nr_mag) >= C_FLOOR {
                 (fl_re, fl_im, fr_re, fr_im)
             } else {
-                let ph = 0.37_f32 * ((m + 1) as f32);
-                let cl = (C_FLOOR * ph.cos(), C_FLOOR * ph.sin());
-                (cl.0, cl.1, cl.0 * r_chan_scale, cl.1 * r_chan_scale)
+                (C_FLOOR, 0.0, C_FLOOR * r_chan_scale, 0.0)
             };
             if (cre_l + cre_r).hypot(cim_l + cim_r) < C_FLOOR {
                 cre_l += C_FLOOR;
@@ -717,6 +766,16 @@ pub(crate) fn fit_deconvolved_stage3_stereo(
         fir_l[16 + k] = (h48_l[k] as f32).clamp(-2.0, 2.0);
         fir_r[16 + k] = (h48_r[k] as f32).clamp(-2.0, 2.0);
     }
+    for i in 16..n {
+        let mut add_l = 0.0_f64;
+        let mut add_r = 0.0_f64;
+        for k in 0..48.min(i - 15) {
+            add_l += f64::from(fir_l[16 + k]) * u_l[i - 16 - k];
+            add_r += f64::from(fir_r[16 + k]) * u_r[i - 16 - k];
+        }
+        s3_lr[i][0] += add_l as f32;
+        s3_lr[i][1] += add_r as f32;
+    }
 
     Stage3DeconvolvedFit {
         fir_l,
@@ -725,172 +784,4 @@ pub(crate) fn fit_deconvolved_stage3_stereo(
         kautz_c_r,
         s3_lr,
     }
-}
-
-/// Identifies stereo reflection lag anchors via pre-whitened cross-correlation of `(wet - s3)`
-/// against `s3`, mapping Left peaks to EVEN lanes (`lines[0, 2]`) and Right peaks to ODD lanes
-/// (`lines[1, 3]`), plus estimating reverberant feedback gain `g_loop` (`r[train.pipeline.stage-a-poles]`).
-pub(crate) fn extract_stage4_reflection_delays(
-    s3_lr: &[[f32; 2]],
-    wet_lr: &[[f32; 2]],
-) -> ([f32; 4], [f32; 4], [f32; 4], [f32; 8], f32) {
-    let def_lite = [53.0_f32, 89.0, 137.0, 199.0];
-    let def_full = [257.0_f32, 313.0, 389.0, 463.0];
-    let def_pro = [523.0_f32, 593.0, 661.0, 743.0];
-    let def_ultra = [773.0_f32, 809.0, 839.0, 877.0, 907.0, 941.0, 971.0, 997.0];
-
-    let n_all = s3_lr.len().min(wet_lr.len()).min(12_000);
-    if n_all < 1_100 {
-        return (def_lite, def_full, def_pro, def_ultra, 0.08);
-    }
-    // Use the broadband transient + clean release decay quarter [75%..100%] when full 12k coreset is present
-    let start_off = if n_all >= 11_000 {
-        (n_all * 3) / 4 - 128
-    } else {
-        0
-    };
-    let s3_lr = &s3_lr[start_off..n_all];
-    let wet_lr = &wet_lr[start_off..n_all];
-    let n = s3_lr.len();
-
-    let (mut ds_l, mut ds_r) = (vec![0.0_f64; n], vec![0.0_f64; n]);
-    let (mut dr_l, mut dr_r) = (vec![0.0_f64; n], vec![0.0_f64; n]);
-    let (mut es_l, mut es_r, mut ew_tot) = (0.0, 0.0, 0.0);
-    for i in 1..n {
-        let sl = f64::from(s3_lr[i][0]) - 0.94 * f64::from(s3_lr[i - 1][0]);
-        let sr = f64::from(s3_lr[i][1]) - 0.94 * f64::from(s3_lr[i - 1][1]);
-        let rl_cur = f64::from(wet_lr[i][0]) - f64::from(s3_lr[i][0]);
-        let rl_prv = f64::from(wet_lr[i - 1][0]) - f64::from(s3_lr[i - 1][0]);
-        let rr_cur = f64::from(wet_lr[i][1]) - f64::from(s3_lr[i][1]);
-        let rr_prv = f64::from(wet_lr[i - 1][1]) - f64::from(s3_lr[i - 1][1]);
-        let rl = rl_cur - 0.94 * rl_prv;
-        let rr = rr_cur - 0.94 * rr_prv;
-        ds_l[i] = sl;
-        ds_r[i] = sr;
-        dr_l[i] = rl;
-        dr_r[i] = rr;
-        if i >= 64 {
-            es_l += sl * sl;
-            es_r += sr * sr;
-            let wl = f64::from(wet_lr[i][0]) - 0.94 * f64::from(wet_lr[i - 1][0]);
-            let wr = f64::from(wet_lr[i][1]) - 0.94 * f64::from(wet_lr[i - 1][1]);
-            ew_tot += 0.5 * (wl * wl + wr * wr);
-        }
-    }
-    let norm_l = (es_l * ew_tot).sqrt().max(1.0e-12);
-    let norm_r = (es_r * ew_tot).sqrt().max(1.0e-12);
-    let es_l_safe = es_l.max(1.0e-12);
-    let es_r_safe = es_r.max(1.0e-12);
-
-    let mut corr_l = vec![0.0_f64; 1_000];
-    let mut corr_r = vec![0.0_f64; 1_000];
-    for lag in 24..998 {
-        let (mut sl, mut sr, mut al, mut ar) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
-        for idx in lag.max(64)..n {
-            sl += dr_l[idx] * ds_l[idx - lag];
-            sr += dr_r[idx] * ds_r[idx - lag];
-            al += ds_l[idx] * ds_l[idx - lag];
-            ar += ds_r[idx] * ds_r[idx - lag];
-        }
-        let pen_l = (1.0 - 0.85 * (al / es_l_safe).powi(2)).clamp(0.0, 1.0);
-        let pen_r = (1.0 - 0.85 * (ar / es_r_safe).powi(2)).clamp(0.0, 1.0);
-        corr_l[lag] = (sl.abs() / norm_l) * pen_l;
-        corr_r[lag] = (sr.abs() / norm_r) * pen_r;
-    }
-
-    let pick_ch =
-        |corr: &[f64], lo: usize, hi: usize, min_sep: usize, defs: &[f32]| -> Vec<usize> {
-            let k = defs.len();
-            let mut chosen: Vec<usize> = Vec::with_capacity(k);
-            let mut peaks: Vec<(f64, usize)> = (lo + 1..hi)
-                .filter(|&l| corr[l] > 0.040 && corr[l] >= corr[l - 1] && corr[l] >= corr[l + 1])
-                .map(|l| (corr[l], l))
-                .collect();
-            peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
-            for (_, lag) in peaks {
-                if chosen.iter().all(|&c| c.abs_diff(lag) >= min_sep) {
-                    chosen.push(lag);
-                    if chosen.len() == k {
-                        break;
-                    }
-                }
-            }
-            for &d in defs {
-                if chosen.len() == k {
-                    break;
-                }
-                let di = d as usize;
-                if chosen.iter().all(|&c| c.abs_diff(di) >= min_sep / 2) {
-                    chosen.push(di);
-                }
-            }
-            while chosen.len() < k {
-                chosen.push(defs[chosen.len()] as usize);
-            }
-            chosen.sort_unstable();
-            chosen
-        };
-
-    let l_lite = pick_ch(&corr_l, 24, 252, 18, &[def_lite[0], def_lite[2]]);
-    let r_lite = pick_ch(&corr_r, 24, 252, 18, &[def_lite[1], def_lite[3]]);
-    let mut l_full = pick_ch(&corr_l, 255, 508, 24, &[def_full[0], def_full[2]]);
-    let mut r_full = pick_ch(&corr_r, 255, 508, 24, &[def_full[1], def_full[3]]);
-    let l_pro = pick_ch(&corr_l, 514, 764, 28, &[def_pro[0], def_pro[2]]);
-    let r_pro = pick_ch(&corr_r, 514, 764, 28, &[def_pro[1], def_pro[3]]);
-    let mut l_ultra = pick_ch(
-        &corr_l,
-        768,
-        997,
-        16,
-        &[def_ultra[0], def_ultra[2], def_ultra[4], def_ultra[6]],
-    );
-    let mut r_ultra = pick_ch(
-        &corr_r,
-        768,
-        997,
-        16,
-        &[def_ultra[1], def_ultra[3], def_ultra[5], def_ultra[7]],
-    );
-
-    // Mirror strong Lite (< 252) reflections into unused Full/Ultra raw slots to bypass TankDcBlocker LF phase shift
-    for (slot_idx, &lag_l) in l_lite.iter().enumerate() {
-        if corr_l[lag_l] > 0.065 {
-            if corr_l[l_full[slot_idx]] <= 0.040 {
-                l_full[slot_idx] = lag_l;
-            } else if corr_l[l_ultra[slot_idx]] <= 0.040 {
-                l_ultra[slot_idx] = lag_l;
-            }
-        }
-    }
-    for (slot_idx, &lag_r) in r_lite.iter().enumerate() {
-        if corr_r[lag_r] > 0.065 {
-            if corr_r[r_full[slot_idx]] <= 0.040 {
-                r_full[slot_idx] = lag_r;
-            } else if corr_r[r_ultra[slot_idx]] <= 0.040 {
-                r_ultra[slot_idx] = lag_r;
-            }
-        }
-    }
-
-    let late_mean: f64 = (450..995)
-        .map(|l| 0.5 * (corr_l[l] + corr_r[l]))
-        .sum::<f64>()
-        / 545.0;
-    let g_loop = (0.05 + 4.5 * (late_mean - 0.022).max(0.0)).clamp(0.05, 0.85) as f32;
-
-    let pair4 = |l: &[usize], r: &[usize]| [l[0] as f32, r[0] as f32, l[1] as f32, r[1] as f32];
-    let u8_arr = std::array::from_fn(|k| {
-        if k % 2 == 0 {
-            l_ultra[k / 2] as f32
-        } else {
-            r_ultra[k / 2] as f32
-        }
-    });
-    (
-        pair4(&l_lite, &r_lite),
-        pair4(&l_full, &r_full),
-        pair4(&l_pro, &r_pro),
-        u8_arr,
-        g_loop,
-    )
 }

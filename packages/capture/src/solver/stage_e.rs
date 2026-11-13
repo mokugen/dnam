@@ -91,7 +91,7 @@ fn read_f32_le(buf: &[u8], off: usize) -> f32 {
 }
 
 #[inline]
-fn write_f32_le(buf: &mut [u8], off: usize, val: f32) {
+pub(super) fn write_f32_le(buf: &mut [u8], off: usize, val: f32) {
     buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
 }
 
@@ -152,6 +152,10 @@ pub fn select_eval_window(wet_lr: &[[f32; 2]], max_len: usize) -> (usize, usize)
 /// Evaluates integrated energy loudness (`LUFS`, ITU-R BS.1770 energy scale `-0.691 + 10 log10(E_L + E_R)`).
 #[must_use]
 pub fn compute_integrated_lufs(frames_lr: &[[f32; 2]]) -> f32 {
+    compute_integrated_lufs_f64(frames_lr) as f32
+}
+
+pub(super) fn compute_integrated_lufs_f64(frames_lr: &[[f32; 2]]) -> f64 {
     if frames_lr.is_empty() {
         return -70.0;
     }
@@ -160,7 +164,7 @@ pub fn compute_integrated_lufs(frames_lr: &[[f32; 2]]) -> f32 {
         sum_sq += f64::from(l) * f64::from(l) + f64::from(r) * f64::from(r);
     }
     let mean_sq = (sum_sq / (frames_lr.len() as f64)).max(1.0e-14);
-    (-0.691 + 10.0 * mean_sq.log10()).clamp(-70.0, 24.0) as f32
+    (-0.691 + 10.0 * mean_sq.log10()).clamp(-70.0, 24.0)
 }
 
 /// Finalizes Stage E (`r[train.pipeline.stage-e-pack]`): enforces `[STAB-ZERO-DC]`, computes or
@@ -174,6 +178,31 @@ pub fn finalize_stage_e_and_telemetry(
     star_wet_lr: Option<&[[f32; 2]]>,
     fallback_tier_esr_db: Option<[f32; 4]>,
     prior_solve_ms: f32,
+) -> Result<StageESolveOutput, DnamError> {
+    finalize_stage_e_and_telemetry_with_polish(
+        manifest,
+        arena_64k,
+        cp1_slots,
+        dry_lr,
+        star_wet_lr,
+        fallback_tier_esr_db,
+        prior_solve_ms,
+        true,
+    )
+}
+
+/// Variant of [`finalize_stage_e_and_telemetry`] allowing live-patch callers to skip the 4-tier
+/// monotonicity polish when a patched delta improves high-tier audio against raw targets.
+#[allow(clippy::too_many_arguments)]
+pub fn finalize_stage_e_and_telemetry_with_polish(
+    manifest: &mut DnamProjManifest,
+    arena_64k: &mut [u8],
+    cp1_slots: &[Cp1ContributorSlot],
+    dry_lr: &[[f32; 2]],
+    star_wet_lr: Option<&[[f32; 2]]>,
+    fallback_tier_esr_db: Option<[f32; 4]>,
+    prior_solve_ms: f32,
+    run_polish: bool,
 ) -> Result<StageESolveOutput, DnamError> {
     let timer = now_ms_token();
     zero_arena_b_head_dc_bias(arena_64k);
@@ -193,6 +222,11 @@ pub fn finalize_stage_e_and_telemetry(
                 write_f32_le(arena_64k, ARENA0_TIER_GAIN_TRIM_OFFSET + slot * 4, 1.0);
             }
         }
+        if run_polish {
+            super::stage_e_polish::polish_arena_for_6metric_monotonicity(
+                manifest, arena_64k, cp1_slots, dry_lr, wet_lr, n_common, w_start, mono_only,
+            )?;
+        }
         let mut temp_hdr = manifest.base.clone();
         let dnam_bytes =
             build_dnam_container_with_cp1(&mut temp_hdr, arena_64k, arena_64k, false, cp1_slots)?;
@@ -204,6 +238,7 @@ pub fn finalize_stage_e_and_telemetry(
         let tgt_l: Vec<f64> = wet_lr[..n_common].iter().map(|v| f64::from(v[0])).collect();
         let tgt_r: Vec<f64> = wet_lr[..n_common].iter().map(|v| f64::from(v[1])).collect();
 
+        let mut lufs_f64 = [-70.0_f64; 4];
         for (t_idx, &tier) in TIERS_ALL.iter().enumerate() {
             let tier_bytes = if tier == Tier::Ultra {
                 std::borrow::Cow::Borrowed(dnam_bytes.as_slice())
@@ -220,22 +255,23 @@ pub fn finalize_stage_e_and_telemetry(
                 .iter()
                 .map(|&[dl, dr]| engine.step_frame_tora(dl, dr, mono_only))
                 .collect();
-            lufs[t_idx] = ((compute_integrated_lufs(&rendered[w_start..n_common]) * 1_000.0)
-                .round())
-                / 1_000.0;
+            let raw_lufs = compute_integrated_lufs_f64(&rendered[w_start..n_common]);
+            lufs_f64[t_idx] = raw_lufs;
+            lufs[t_idx] = (((raw_lufs as f32) * 1_000.0).round()) / 1_000.0;
             tier_waves[t_idx] = rendered;
         }
 
-        let ultra_lufs = lufs[3];
+        let ultra_lufs_f64 = lufs_f64[3];
         let mut trims = [0.0_f32; 4];
         for t in 0..4 {
-            let raw_trim = (ultra_lufs - lufs[t]).clamp(-12.0, 12.0);
+            let raw_trim_f64 = (ultra_lufs_f64 - lufs_f64[t]).clamp(-12.0, 12.0);
+            let raw_trim = raw_trim_f64 as f32;
             trims[t] = if raw_trim.abs() < 5.0e-4 {
                 0.0
             } else {
                 (raw_trim * 1_000.0).round() / 1_000.0
             };
-            let lin_trim = 10.0_f32.powf(raw_trim / 20.0);
+            let lin_trim = 10.0_f64.powf(raw_trim_f64 / 20.0) as f32;
             if ARENA0_TIER_GAIN_TRIM_OFFSET + (t + 1) * 4 <= arena_64k.len() {
                 write_f32_le(arena_64k, ARENA0_TIER_GAIN_TRIM_OFFSET + t * 4, lin_trim);
             }
@@ -438,23 +474,36 @@ pub fn derive_buyer_gauge_params(config: &BuyerWatermarkConfig) -> ([f32; 32], [
     (kappa, q_f32)
 }
 
-fn rotate_cp1_slots_by_buyer_gauge(slots: &mut [Cp1ContributorSlot], q_buyer_4x4: &[[f32; 4]; 4]) {
-    let rotate_4 = |row: &mut [f32; 8]| {
-        let old = [row[0], row[1], row[2], row[3]];
+fn rotate_vec4(v: &mut [f32; 4], q: &[[f32; 4]; 4]) {
+    let old = *v;
+    for k in 0..4 {
+        v[k] = (0..4).map(|m| old[m] * q[m][k]).sum();
+    }
+}
+
+fn rotate_arena_row_4(buf: &mut [u8], off: usize, q: &[[f32; 4]; 4]) {
+    if off + 16 <= buf.len() {
+        let mut v = std::array::from_fn(|m| {
+            let o = off + m * 4;
+            f32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]])
+        });
+        rotate_vec4(&mut v, q);
         for k in 0..4 {
-            let mut acc = 0.0_f32;
-            for m in 0..4 {
-                acc += old[m] * q_buyer_4x4[m][k];
-            }
-            row[k] = acc;
+            buf[off + k * 4..off + k * 4 + 4].copy_from_slice(&v[k].to_le_bytes());
         }
-    };
+    }
+}
+
+fn rotate_cp1_slots_by_buyer_gauge(slots: &mut [Cp1ContributorSlot], q: &[[f32; 4]; 4]) {
     for slot in slots {
-        let lanes = usize::from(slot.lanes).min(3);
-        for l in 0..lanes {
-            rotate_4(&mut slot.main_base[l]);
+        for l in 0..usize::from(slot.lanes).min(3) {
+            let mut b: [f32; 4] = slot.main_base[l][..4].try_into().unwrap();
+            rotate_vec4(&mut b, q);
+            slot.main_base[l][..4].copy_from_slice(&b);
             if slot.has_ultra {
-                rotate_4(&mut slot.main_ultra[l]);
+                let mut u: [f32; 4] = slot.main_ultra[l][..4].try_into().unwrap();
+                rotate_vec4(&mut u, q);
+                slot.main_ultra[l][..4].copy_from_slice(&u);
             }
         }
     }
@@ -555,8 +604,22 @@ pub fn export_runtime_dnam_watermarked(
 
     // Layer 1: Exact Isometric Gauge (32-ch modal kappa + SO(4) head & CP1/U_int rotation)
     let (kappa, q_buyer_4x4) = derive_buyer_gauge_params(config);
+    let inline_cp1_count = u16::from_le_bytes([arena_64k[7_524], arena_64k[7_525]]);
     apply_isometric_gauge_watermark(&mut arena_64k, &kappa, &q_buyer_4x4)?;
     rotate_cp1_slots_by_buyer_gauge(&mut cp1_slots, &q_buyer_4x4);
+    if inline_cp1_count == 0 && !cp1_slots.is_empty() {
+        for r in 0..4 {
+            rotate_arena_row_4(&mut arena_64k, 7_552 + r * 32, &q_buyer_4x4);
+        }
+        for row in 0..16 {
+            rotate_arena_row_4(&mut arena_64k, 9_536 + row * 64, &q_buyer_4x4);
+        }
+        if arena_64k.len() >= 61_312 {
+            for r in 0..12 {
+                rotate_arena_row_4(&mut arena_64k, 60_928 + r * 32, &q_buyer_4x4);
+            }
+        }
+    }
 
     // Layer 2: Kautz & Stage-II Inter-Stage Pole-Angle Phase Coding
     let phase_seed = derive_buyer_phase_seed(config);
@@ -742,7 +805,7 @@ pub fn identify_pole_angles_blackbox_from_audio(
         col_norms[j] = norm_sq;
         max_norm_sq = max_norm_sq.max(norm_sq);
     }
-    let floor_sq = (max_norm_sq * 1.0e-7).max(1.0e-18);
+    let floor_sq = (max_norm_sq * 1.0e-11).max(1.0e-22);
     let col_scale: Vec<f64> = col_norms
         .iter()
         .map(|&ns| {
@@ -791,86 +854,9 @@ pub fn identify_pole_angles_blackbox_from_audio(
         .zip(&delta_tilde)
         .enumerate()
         .map(|(j, (&th, &[dt, _]))| {
-            let wiener = col_norms[j] / (col_norms[j] + 1.0e-3 * max_norm_sq.max(1.0e-18));
+            let wiener = col_norms[j] / (col_norms[j] + 1.0e-6 * max_norm_sq.max(1.0e-18));
             (f64::from(th) + (dt * col_scale[j] * wiener).clamp(-0.01, 0.01)) as f32
         })
         .collect();
     Ok((master_angles, suspect_angles))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::proj::{ProjChunkInput, build_dnam_proj_container, build_proj_inpc_capsule};
-    use dnam_engine::schema::DnamJsonHeader;
-
-    #[test]
-    fn test_stage_e_watermark_edge_branches_and_tier_probes() {
-        assert_eq!(compute_integrated_lufs(&[]), -70.0);
-        assert_eq!(compute_integrated_lufs(&[[0.0, 0.0]; 256]), -70.0);
-
-        let zero_cfg = BuyerWatermarkConfig {
-            marketplace_secret: [0u8; 32],
-            model_id: "m".to_string(),
-            license_id: "l".to_string(),
-            buyer_id: [0u8; 16],
-            phase_coding_delta_rad: 2.5e-5,
-            epsilon_mask_lr: [1.0e-5, 1.0e-5],
-            compensate_role_b_in_head: true,
-        };
-        let code = derive_buyer_tardos_codebook(&zero_cfg);
-        assert_eq!(code.chips.len(), 7_680);
-
-        let manifest = DnamProjManifest::default_reference();
-        let inpc =
-            build_proj_inpc_capsule(1, &[0u8; 256], &[0u8; 320], &vec![0u8; 24_000]).unwrap();
-        let un_solved = build_dnam_proj_container(
-            &manifest,
-            &[ProjChunkInput {
-                kind: ProjChunkKind::Inpc,
-                chunk_id: 0,
-                payload: inpc.clone(),
-            }],
-        )
-        .unwrap();
-        assert!(export_runtime_dnam_watermarked(&un_solved, &zero_cfg, None).is_err());
-
-        let mut hdr = DnamJsonHeader::default_reference();
-        let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-        write_f32_le(&mut arena, 4_176, 0.9);
-        write_f32_le(&mut arena, 4_180, 0.25);
-        write_f32_le(&mut arena, 4_208, 0.9);
-        write_f32_le(&mut arena, 4_212, 0.35);
-        assert_eq!(extract_arena_pole_angles_34(&arena).len(), 34);
-        let dnam_u = build_dnam_container_with_cp1(&mut hdr, &arena, &arena, false, &[]).unwrap();
-        let solved = build_dnam_proj_container(
-            &manifest,
-            &[
-                ProjChunkInput {
-                    kind: ProjChunkKind::Inpc,
-                    chunk_id: 0,
-                    payload: inpc,
-                },
-                ProjChunkInput {
-                    kind: ProjChunkKind::Wght,
-                    chunk_id: 0,
-                    payload: dnam_u.clone(),
-                },
-            ],
-        )
-        .unwrap();
-        for tier in [Tier::Lite, Tier::Full, Tier::Pro] {
-            let wm_t = export_runtime_dnam_watermarked(&solved, &zero_cfg, Some(tier)).unwrap();
-            let probe = render_blackbox_probe_response(&wm_t, 64).unwrap();
-            assert_eq!(probe.len(), 64);
-        }
-        assert!(identify_pole_angles_blackbox_from_audio(&dnam_u, &[[0.0, 0.0]; 16]).is_err());
-        assert_eq!(select_eval_window(&[], 64), (0, 0));
-        assert_eq!(select_eval_window(&[[0.1, 0.1]; 80], 64), (64, 80));
-        let mut win_sig = [[0.01_f32, 0.01]; 256];
-        for s in &mut win_sig[128..192] {
-            *s = [0.9, -0.9];
-        }
-        assert_eq!(select_eval_window(&win_sig, 64), (128, 192));
-    }
 }

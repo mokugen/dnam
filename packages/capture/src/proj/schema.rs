@@ -116,7 +116,7 @@ pub struct StemProvenance {
 }
 
 /// Extracted white-box / blind physical descriptors cached per stem in [`StemRegistryEntry`].
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ExtractedPhysics {
     /// Extracted delay-line times in milliseconds.
@@ -381,7 +381,9 @@ impl DnamProjManifest {
         let raw_bytes = serde_json::to_vec(&normalized)
             .map_err(|e| DnamError::InvalidJsonHeader(e.to_string()))?;
         let val = parse_strict_json_object_bytes(&raw_bytes)?;
-        let jcs = serialize_jcs_value(&val, false)?;
+        let jcs_pass1 = serialize_jcs_value(&val, false)?;
+        let val2 = parse_strict_json_object_bytes(jcs_pass1.as_bytes())?;
+        let jcs = serialize_jcs_value(&val2, false)?;
         Ok(jcs.into_bytes())
     }
 

@@ -18,7 +18,7 @@ use crate::audit::{run_full_3phase_arena_audit, run_head_only_3phase_arena_audit
 use crate::proj::bundle::zero_arena_b_head_dc_bias;
 use crate::proj::directory::{StmcTrajectoryWindow, verify_proj_stmc_capsule};
 use crate::proj::schema::{AuditReport, DnamProjManifest, StemRegistryEntry};
-use crate::proj::{STMC_FLAG_MODE_A_SWEEP, STMC_FLAG_STEREO, fp16_bytes_to_f32};
+use crate::proj::{STMC_FLAG_MODE_A_SWEEP, STMC_FLAG_STEREO};
 use crate::solver::{
     factorize_uplo_u_cholesky, solve_factorized_uplo_u_2ch, uplo_u_index, uplo_u_packed_len,
 };
@@ -71,45 +71,10 @@ fn write_f32_le(buf: &mut [u8], off: usize, val: f32) {
     }
 }
 
-pub(crate) fn decode_coreset_lr(fp16_bytes: &[u8], channels: usize) -> Vec<[f32; 2]> {
-    let samples = fp16_bytes_to_f32(fp16_bytes);
-    if channels == 2 {
-        samples.as_chunks::<2>().0.to_vec()
-    } else {
-        samples.into_iter().map(|s| [s, s]).collect()
-    }
-}
+pub(crate) use super::stage_d_basis::decode_coreset_lr;
+pub use super::stage_d_basis::star_center_control_values;
 
-/// Resolves the canonical `StarCenter` physical control vector (`default` for `Range`, `default_index` for `Switch`).
-#[must_use]
-pub fn star_center_control_values(manifest: &DnamProjManifest) -> Vec<f32> {
-    manifest
-        .base
-        .controls_schema
-        .iter()
-        .map(|ctrl| match ctrl.kind {
-            ControlKind::Range => {
-                let [lo, hi] = ctrl.declared_range.unwrap_or([0.0, 1.0]);
-                ctrl.default
-                    .as_f64()
-                    .map_or(0.5 * (lo + hi), |v| v as f32)
-                    .clamp(lo, hi)
-            }
-            ControlKind::Switch => {
-                let opts = ctrl.declared_options.as_deref().unwrap_or(&[]);
-                let def_idx = ctrl
-                    .default
-                    .as_str()
-                    .and_then(|s| opts.iter().position(|o| o == s))
-                    .or_else(|| ctrl.default.as_u64().map(|u| u as usize))
-                    .unwrap_or(0);
-                def_idx.min(opts.len().saturating_sub(1)) as f32
-            }
-        })
-        .collect()
-}
-
-fn resolve_stationary_range_value(
+pub(super) fn resolve_stationary_range_value(
     ctrl: &ControlSchemaDef,
     ctrl_idx: usize,
     stem: &StemRegistryEntry,
@@ -132,7 +97,7 @@ fn resolve_stationary_range_value(
     default_val
 }
 
-fn resolve_stationary_switch_option(
+pub(super) fn resolve_stationary_switch_option(
     ctrl: &ControlSchemaDef,
     ctrl_idx: usize,
     stem: &StemRegistryEntry,
@@ -159,7 +124,7 @@ fn resolve_stationary_switch_option(
     default_opt
 }
 
-fn interpolate_sweep_windows(knots: &[f32], frac_01: f32) -> f32 {
+pub(super) fn interpolate_sweep_windows(knots: &[f32], frac_01: f32) -> f32 {
     if knots.is_empty() {
         return 0.0;
     }
@@ -249,12 +214,7 @@ pub fn solve_stage_d_cp1_and_audit_with_harvest(
         arena_64k[60_928..61_312].fill(0);
     }
     if clear_dynamic_w_ctrl {
-        if arena_64k.len() >= 10_560 {
-            arena_64k[9_536..10_560].fill(0);
-        }
-        if arena_64k.len() >= 60_928 {
-            arena_64k[60_672..60_928].fill(0);
-        }
+        super::stage_d_basis::zero_w_ctrl_columns_0_8(arena_64k, &mut []);
     }
     write_f32_le(arena_64k, 7_520, 10.0);
     write_f32_le(arena_64k, 10_560, 10.0);
@@ -406,9 +366,23 @@ pub fn solve_stage_d_cp1_and_audit_with_harvest(
         gram_frame_stride,
     )?;
     let n_frames = resolved.n_total_frames;
-    let gram_256 = resolved.gram_256;
+    let star_gram_256 = resolved.gram_256;
     let sample_stride = resolved.sample_stride;
     let eval_stereo = manifest.base.io_config.output_mode != "mono";
+    let stage_d_basis_active = super::stage_d_basis::fit_nonlinear_stage_ctrl_basis(
+        manifest,
+        arena_64k,
+        &mut cp1_slots,
+        &descriptors,
+        &off_center_stems,
+        stmc_by_id,
+        dry_lr,
+        &star_ctrls,
+        eval_stereo,
+        clear_dynamic_w_ctrl,
+    )?;
+    let mut mod_gram_sum = vec![0.0_f64; uplo_u_packed_len(256)];
+    let mut mod_gram_cnt = 0usize;
     let sampled_frames = n_frames.div_ceil(sample_stride);
     let stride_scale = (n_frames as f64) / (sampled_frames.max(1) as f64);
 
@@ -538,8 +512,60 @@ pub fn solve_stage_d_cp1_and_audit_with_harvest(
             }
         };
 
+        let mod_harvest = if stage_d_basis_active {
+            super::stage_d_basis::harvest_modulated_stem_mode0(
+                manifest,
+                arena_64k,
+                &cp1_slots,
+                &descriptors,
+                &dry_lr[..m_len],
+                sample_stride,
+                stride_scale,
+                star_emr_w.as_deref(),
+                eval_stereo,
+                is_mode_a_sweep,
+                &sweep_knots,
+                &stat_range,
+                &stat_switch,
+            )?
+        } else {
+            None
+        };
+        let (stem_feats, stem_pred0, stem_compact): (&[[f32; 256]], &[[f32; 2]], bool) =
+            if let Some((ref mf, ref mp, ref mg)) = mod_harvest {
+                let len_scale = (n_frames as f64) / (m_len.max(1) as f64);
+                for (acc, &v) in mod_gram_sum.iter_mut().zip(mg) {
+                    *acc += v * len_scale;
+                }
+                mod_gram_cnt += 1;
+                (mf.as_slice(), mp.as_slice(), true)
+            } else {
+                (
+                    &resolved.features,
+                    &resolved.pred0_lr,
+                    resolved.compact_strided,
+                )
+            };
+
         let mut psi_vec = vec![0.0_f64; l_total];
         let mut z_c_by_slot = vec![0.0_f64; cp1_slots.len()];
+        let sample_frame = |n: usize, step_idx: usize| -> (&[f32; 256], f64, f64, f64) {
+            let f_idx = if stem_compact { step_idx } else { n };
+            let wet_n = decode_coreset_frame_lr_at(stmc.wet_coreset_fp16, stmc_ch, n);
+            let pred_n = stem_pred0[f_idx];
+            let dl = f64::from(wet_n[0]) - f64::from(pred_n[0]);
+            let dr = if eval_stereo {
+                f64::from(wet_n[1]) - f64::from(pred_n[1])
+            } else {
+                dl
+            };
+            let sw = star_emr_w
+                .as_ref()
+                .and_then(|w| w.get(n))
+                .copied()
+                .unwrap_or(1.0);
+            (&stem_feats[f_idx], dl, dr, stride_scale * sw)
+        };
 
         if !is_mode_a_sweep {
             eval_psi_at(0.0, &mut psi_vec, &mut z_c_by_slot);
@@ -547,31 +573,8 @@ pub fn solve_stage_d_cp1_and_audit_with_harvest(
             let mut stem_w_sum = 0.0_f64;
             let mut step_idx = 0usize;
             while step_idx * sample_stride < m_len {
-                let n = step_idx * sample_stride;
-                let f_idx = if resolved.compact_strided {
-                    step_idx
-                } else {
-                    n
-                };
-                let wet_n = decode_coreset_frame_lr_at(stmc.wet_coreset_fp16, stmc_ch, n);
-                let pred_n = resolved.pred0_lr[f_idx];
-                let yl = f64::from(wet_n[0]);
-                let yr = if eval_stereo { f64::from(wet_n[1]) } else { yl };
-                let dl = yl - f64::from(pred_n[0]);
-                let dr = if eval_stereo {
-                    yr - f64::from(pred_n[1])
-                } else {
-                    dl
-                };
-                let fb = &resolved.features[f_idx];
-                let sw = star_emr_w
-                    .as_ref()
-                    .and_then(|w| w.get(n))
-                    .copied()
-                    .unwrap_or(1.0);
-                let w_frame = stride_scale * sw;
-                let w_dl = w_frame * dl;
-                let w_dr = w_frame * dr;
+                let (fb, dl, dr, w_frame) = sample_frame(step_idx * sample_stride, step_idx);
+                let (w_dl, w_dr) = (w_frame * dl, w_frame * dr);
                 for d in 0..256 {
                     let fd = f64::from(fb[d]);
                     stem_rhs[d][0] += fd * w_dl;
@@ -599,34 +602,13 @@ pub fn solve_stage_d_cp1_and_audit_with_harvest(
             let mut step_idx = 0usize;
             while step_idx * sample_stride < m_len {
                 let n = step_idx * sample_stride;
-                let f_idx = if resolved.compact_strided {
-                    step_idx
-                } else {
-                    n
-                };
                 let frac = if m_len > 1 {
                     (n as f32) / ((m_len - 1) as f32)
                 } else {
                     0.0
                 };
                 eval_psi_at(frac, &mut psi_vec, &mut z_c_by_slot);
-                let wet_n = decode_coreset_frame_lr_at(stmc.wet_coreset_fp16, stmc_ch, n);
-                let pred_n = resolved.pred0_lr[f_idx];
-                let yl = f64::from(wet_n[0]);
-                let yr = if eval_stereo { f64::from(wet_n[1]) } else { yl };
-                let dl = yl - f64::from(pred_n[0]);
-                let dr = if eval_stereo {
-                    yr - f64::from(pred_n[1])
-                } else {
-                    dl
-                };
-                let fb = &resolved.features[f_idx];
-                let sw = star_emr_w
-                    .as_ref()
-                    .and_then(|w| w.get(n))
-                    .copied()
-                    .unwrap_or(1.0);
-                let w_frame = stride_scale * sw;
+                let (fb, dl, dr, w_frame) = sample_frame(n, step_idx);
                 for i in 0..l_total {
                     let pi = psi_vec[i];
                     if pi.abs() <= 1.0e-12 {
@@ -637,8 +619,7 @@ pub fn solve_stage_d_cp1_and_audit_with_harvest(
                         h_psi[i][j] += w_pi * psi_vec[j];
                     }
                     let rhs_i = &mut rhs_lanes[i];
-                    let pdl = w_pi * dl;
-                    let pdr = w_pi * dr;
+                    let (pdl, pdr) = (w_pi * dl, w_pi * dr);
                     for d in 0..256 {
                         let fd = f64::from(fb[d]);
                         rhs_i[d][0] += fd * pdl;
@@ -648,6 +629,14 @@ pub fn solve_stage_d_cp1_and_audit_with_harvest(
                 total_weight_frames += w_frame;
                 step_idx += 1;
             }
+        }
+    }
+
+    let mut gram_256 = star_gram_256;
+    if mod_gram_cnt > 0 {
+        let inv_c = 1.0 / (mod_gram_cnt as f64);
+        for (g, &m) in gram_256.iter_mut().zip(&mod_gram_sum) {
+            *g = 0.5 * *g + 0.5 * (m * inv_c);
         }
     }
 
@@ -685,7 +674,7 @@ pub fn solve_stage_d_cp1_and_audit_with_harvest(
     // Factorize G_0 once and solve G_0^{-1} * R_l for each active lane l in 0..l_total
     let tr_g: f64 = (0..256).map(|d| gram_256[uplo_u_index(d, d)]).sum();
     let mean_diag_g = (tr_g / 256.0).max(1.0e-9);
-    let g_ridge = (5.0e-5 * mean_diag_g).max(1.0e-8);
+    let g_ridge = (2.0e-6 * mean_diag_g).max(1.0e-9);
     let mut g_inv_r = vec![[0.0_f64; 512]; l_total];
     if let Ok(r_g) = factorize_uplo_u_cholesky(256, &gram_256, g_ridge) {
         for l in 0..l_total {
@@ -771,8 +760,8 @@ pub fn solve_stage_d_cp1_and_audit_with_harvest(
                 }
                 max_tier_rms = max_tier_rms.max((sq_l.max(sq_r) / 16.0).sqrt());
             }
-            if max_tier_rms > 1.25 {
-                let shrink = 1.25 / max_tier_rms;
+            if max_tier_rms > 1.92 {
+                let shrink = 1.92 / max_tier_rms;
                 let grow = 1.0 / shrink;
                 for v in mode.iter_mut() {
                     *v *= shrink;
@@ -783,43 +772,33 @@ pub fn solve_stage_d_cp1_and_audit_with_harvest(
             }
         }
     };
+    let has_ultra_modes = arena_64k.len() >= ULTRA_MODES_5_TO_8_BASE + 8_192;
+    let mut write_mode = |mode_off: usize, mode: &[f64; 512], t: usize| {
+        for i in 0..64 {
+            let idx = t * 64 + i;
+            write_f32_le(
+                arena_64k,
+                mode_off + i * 4,
+                (mode[idx * 2] as f32).clamp(-64.0, 64.0),
+            );
+            write_f32_le(
+                arena_64k,
+                mode_off + 256 + i * 4,
+                (mode[idx * 2 + 1] as f32).clamp(-64.0, 64.0),
+            );
+        }
+    };
     unscale_and_cap(&mut modes_base, &mut coords_base);
     for (k, mode) in modes_base.iter().enumerate() {
         for (t, &h_base) in HEAD_BASES.iter().enumerate() {
-            let mode_off = h_base + (k + 1) * 512;
-            for i in 0..64 {
-                let idx = t * 64 + i;
-                write_f32_le(
-                    arena_64k,
-                    mode_off + i * 4,
-                    (mode[idx * 2] as f32).clamp(-64.0, 64.0),
-                );
-                write_f32_le(
-                    arena_64k,
-                    mode_off + 256 + i * 4,
-                    (mode[idx * 2 + 1] as f32).clamp(-64.0, 64.0),
-                );
-            }
+            write_mode(h_base + (k + 1) * 512, mode, t);
         }
     }
-    if arena_64k.len() >= ULTRA_MODES_5_TO_8_BASE + 8_192 {
+    if has_ultra_modes {
         unscale_and_cap(&mut modes_ultra, &mut coords_ultra);
         for (k, mode) in modes_ultra.iter().enumerate() {
             for t in 0..4 {
-                let mode_off = ULTRA_MODES_5_TO_8_BASE + t * 2_048 + k * 512;
-                for i in 0..64 {
-                    let idx = t * 64 + i;
-                    write_f32_le(
-                        arena_64k,
-                        mode_off + i * 4,
-                        (mode[idx * 2] as f32).clamp(-64.0, 64.0),
-                    );
-                    write_f32_le(
-                        arena_64k,
-                        mode_off + 256 + i * 4,
-                        (mode[idx * 2 + 1] as f32).clamp(-64.0, 64.0),
-                    );
-                }
+                write_mode(ULTRA_MODES_5_TO_8_BASE + t * 2_048 + k * 512, mode, t);
             }
         }
     }

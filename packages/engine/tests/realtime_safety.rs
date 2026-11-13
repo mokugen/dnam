@@ -162,6 +162,7 @@ fn make_test_container() -> AlignedBuffer<CacheLine64> {
         stage2_cascade: Stage2CascadeConfig::default(),
         stage3_cabinet: Stage3CabinetKautzConfig::default(),
         stage4_tank: Stage4SpatialTankConfig::default(),
+        delay_histories: Vec::new(),
         tensor_directory: BTreeMap::new(),
     };
 

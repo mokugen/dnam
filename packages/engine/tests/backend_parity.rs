@@ -112,6 +112,7 @@ fn build_parity_container() -> Vec<u8> {
         stage2_cascade: Stage2CascadeConfig::default(),
         stage3_cabinet: Stage3CabinetKautzConfig::default(),
         stage4_tank: Stage4SpatialTankConfig::default(),
+        delay_histories: Vec::new(),
         tensor_directory: BTreeMap::new(),
     };
 

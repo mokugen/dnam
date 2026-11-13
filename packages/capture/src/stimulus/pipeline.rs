@@ -25,8 +25,8 @@ use crate::resampler::{resample_arbitrary_rate_to_48k, resampled_frame_len};
 use crate::targets::{DistillationTarget, StemResponse, StemStimulus};
 
 use super::batch::{
-    align_full_stem_and_seal_vault, build_controls_meta_map, build_freeze_transition_stem_stimulus,
-    control_declared_bounds, default_control_vector, resample_48k_channels_to_sr,
+    build_controls_meta_map, build_freeze_transition_stem_stimulus, control_declared_bounds,
+    default_control_vector, resample_48k_channels_to_sr,
 };
 use super::fft::{
     ADAPTIVE_FRAME_SAMPLES, ADC_PEAK_GOVERNOR_FS, CYCLIC_WINDOW_SAMPLES, PEDESTAL_BIN_MONO,
@@ -120,7 +120,7 @@ fn render_endpoint_probe_48k(
     sample_rate_hz: u32,
     topology_mode: TopologyProbeMode,
     control_values: &[f32],
-) -> Result<Vec<f32>, DnamError> {
+) -> Result<(Vec<f32>, Option<Vec<f32>>), DnamError> {
     let sr = sample_rate_hz.clamp(8_000, 384_000);
     let need_stereo = matches!(
         topology_mode,
@@ -148,34 +148,89 @@ fn render_endpoint_probe_48k(
     })?;
 
     let resp_sr = resp.sample_rate_hz.clamp(8_000, 384_000);
-    if resp_sr == 48_000 {
-        Ok(resp.out_1)
-    } else {
-        let dst = resampled_frame_len(resp.out_1.len(), resp_sr, 48_000);
-        Ok(resample_arbitrary_rate_to_48k(
-            &resp.out_1,
-            resp_sr,
-            Some(dst),
-        ))
-    }
+    let to_48k = |ch: &[f32]| -> Vec<f32> {
+        if resp_sr == 48_000 {
+            ch.to_vec()
+        } else {
+            let dst = resampled_frame_len(ch.len(), resp_sr, 48_000);
+            resample_arbitrary_rate_to_48k(ch, resp_sr, Some(dst))
+        }
+    };
+    let out_l = to_48k(&resp.out_1);
+    let out_r = resp.out_2.as_deref().map(to_48k);
+    Ok((out_l, out_r))
 }
+
+type StarProbe<'a> = (&'a [f32], &'a [f32], Option<&'a [f32]>, &'a [usize]);
+type ClosedLoopStemOut = (
+    Vec<u8>,
+    VaultCaptureSpec,
+    Vec<CaptureWarning>,
+    f64,
+    f64,
+    bool,
+);
 
 fn run_single_closed_loop_stem(
     target: &mut dyn DistillationTarget,
     cfg: StimulusConfig,
     is_star_center: bool,
     controls_meta: BTreeMap<String, serde_json::Value>,
-) -> Result<(Vec<u8>, VaultCaptureSpec, Vec<CaptureWarning>, f64), DnamError> {
+    shared_align: Option<(f64, bool)>,
+    star_probe: Option<StarProbe<'_>>,
+) -> Result<ClosedLoopStemOut, DnamError> {
     target.reset_state();
     let mut ctrl = AdaptiveStimulusController::new(cfg);
     let mut last_resp: Option<StemResponse> = None;
     while let Some(frame) = ctrl.next_frame(last_resp.as_ref()) {
+        if ctrl.is_entering_coreset() {
+            target.reset_state();
+        }
         last_resp = Some(target.render_frame(&frame)?);
     }
     let warnings = ctrl.warnings().to_vec();
-    let (inpc, spec) = ctrl.seal_inpc_and_vault_spec(is_star_center, controls_meta)?;
+    let (inpc, mut spec, lag, pol) = ctrl.seal_inpc_and_vault_spec_with_shared_align(
+        is_star_center,
+        controls_meta,
+        shared_align,
+    )?;
+    if is_star_center
+        && let Some((probe_dry_l, probe_wet_l, probe_wet_r, carrier_bins)) = star_probe
+    {
+        let (cdl, cdr, cwl, cwr) = ctrl.coreset_buffers_48k();
+        let comb_len = ADAPTIVE_FRAME_SAMPLES
+            .min(probe_dry_l.len())
+            .min(probe_wet_l.len());
+        let comb_wet_r = probe_wet_r.map(|r| &r[..comb_len.min(r.len())]);
+        let tail_wet_l = if probe_wet_l.len() > ADAPTIVE_FRAME_SAMPLES {
+            &probe_wet_l[ADAPTIVE_FRAME_SAMPLES..]
+        } else {
+            &[]
+        };
+        let tail_wet_r = probe_wet_r.map(|r| {
+            if r.len() > ADAPTIVE_FRAME_SAMPLES {
+                &r[ADAPTIVE_FRAME_SAMPLES..]
+            } else {
+                &[][..]
+            }
+        });
+        let phys = super::physics_probe::extract_star_physics_from_audio(
+            cdl,
+            cdr,
+            cwl,
+            cwr,
+            &probe_dry_l[..comb_len],
+            &probe_wet_l[..comb_len],
+            comb_wet_r,
+            tail_wet_l,
+            tail_wet_r,
+            carrier_bins,
+        );
+        spec.extracted_physics = Some(phys.extracted);
+        spec.user_metadata.extend(phys.metadata);
+    }
     let tilt = spectral_tilt_from_stmc_4096(&spec.spectral_summary_4096);
-    Ok((inpc, spec, warnings, tilt))
+    Ok((inpc, spec, warnings, tilt, lag, pol))
 }
 
 fn capture_freeze_transition_stem_mode1(
@@ -185,6 +240,7 @@ fn capture_freeze_transition_stem_mode1(
     options: &AdaptiveTrainingOptions,
     seed_256: &[u8; 256],
     carrier_bins: &[usize],
+    shared_align: Option<(f64, bool)>,
 ) -> Result<VaultCaptureSpec, DnamError> {
     let stim = build_freeze_transition_stem_stimulus(
         manifest,
@@ -247,7 +303,7 @@ fn capture_freeze_transition_stem_mode1(
             emr_velocity: 0.1,
         },
     ];
-    let (_, spec) = align_full_stem_and_seal_vault(
+    let (_, spec, _, _) = super::sealing::align_full_stem_and_seal_vault_with_override(
         &stim.stem_id,
         false,
         seed_256,
@@ -260,6 +316,7 @@ fn capture_freeze_transition_stem_mode1(
         windows,
         meta,
         user_meta,
+        shared_align,
     )?;
     Ok(spec)
 }
@@ -315,22 +372,13 @@ pub fn train_adaptive_target(
     let mut probe_dry_l_48k = probe_comb.samples;
     probe_dry_l_48k.resize(10 * ADAPTIVE_FRAME_SAMPLES, 0.0);
 
-    let has_range_controls = manifest
-        .base
-        .controls_schema
-        .iter()
-        .any(|c| c.kind == ControlKind::Range);
-    let star_probe_wet = if has_range_controls {
-        Some(render_endpoint_probe_48k(
-            target,
-            &probe_dry_l_48k,
-            options.sample_rate_hz,
-            options.topology_mode,
-            &base_ctrls,
-        )?)
-    } else {
-        None
-    };
+    let (star_probe_wet_l, star_probe_wet_r) = render_endpoint_probe_48k(
+        target,
+        &probe_dry_l_48k,
+        options.sample_rate_hz,
+        options.topology_mode,
+        &base_ctrls,
+    )?;
 
     // 1. Capture StarCenter (s = 0)
     let star_meta = build_controls_meta_map(&manifest, &base_ctrls, &empty_switches);
@@ -348,8 +396,21 @@ pub fn train_adaptive_target(
         noise_floor_dbfs,
         seed_256,
     };
-    let (inpc_bytes, star_spec, star_warns, star_tilt) =
-        run_single_closed_loop_stem(target, star_cfg, true, star_meta)?;
+    let (inpc_bytes, star_spec, star_warns, star_tilt, star_lag, star_pol) =
+        run_single_closed_loop_stem(
+            target,
+            star_cfg,
+            true,
+            star_meta,
+            None,
+            Some((
+                &probe_dry_l_48k,
+                &star_probe_wet_l,
+                star_probe_wet_r.as_deref(),
+                &probe_sched.carrier_bins,
+            )),
+        )?;
+    let shared_align = Some((star_lag, star_pol));
     all_warnings.extend(star_warns);
     let mut captured_specs = vec![star_spec];
 
@@ -371,6 +432,7 @@ pub fn train_adaptive_target(
                 options,
                 &seed_256,
                 &probe_sched.carrier_bins,
+                shared_align,
             )?;
             captured_specs.push(freeze_spec);
         }
@@ -386,16 +448,15 @@ pub fn train_adaptive_target(
                 };
                 let mut probe_v = base_ctrls.clone();
                 probe_v[p_idx] = probe_u;
-                let end_probe_wet = render_endpoint_probe_48k(
+                let (end_probe_wet, _) = render_endpoint_probe_48k(
                     target,
                     &probe_dry_l_48k,
                     options.sample_rate_hz,
                     options.topology_mode,
                     &probe_v,
                 )?;
-                let ref_wet = star_probe_wet.as_deref().unwrap_or(&end_probe_wet);
                 let mut ep = classify_knob_from_endpoint_probe(
-                    ref_wet,
+                    &star_probe_wet_l,
                     &end_probe_wet,
                     ADAPTIVE_FRAME_SAMPLES,
                     &probe_sched,
@@ -439,8 +500,8 @@ pub fn train_adaptive_target(
                         noise_floor_dbfs,
                         seed_256,
                     };
-                    let (_, mut spec, warns, tilt) =
-                        run_single_closed_loop_stem(target, cfg, false, meta)?;
+                    let (_, mut spec, warns, tilt, _, _) =
+                        run_single_closed_loop_stem(target, cfg, false, meta, shared_align, None)?;
                     if spec.windows.len() < 2 {
                         spec.windows = vec![
                             StmcTrajectoryWindow {
@@ -471,7 +532,16 @@ pub fn train_adaptive_target(
                     captured_specs.push(spec);
                 } else {
                     let mut tilts = Vec::new();
-                    for (s_idx, &stop_u) in [lo, hi].iter().enumerate() {
+                    let span = (hi - lo).max(1e-6);
+                    let mid_u = 0.5 * (lo + hi);
+                    let stops = if (base_ctrls[p_idx] - lo).abs() < 0.08 * span {
+                        [mid_u, hi]
+                    } else if (base_ctrls[p_idx] - hi).abs() < 0.08 * span {
+                        [lo, mid_u]
+                    } else {
+                        [lo, hi]
+                    };
+                    for (s_idx, &stop_u) in stops.iter().enumerate() {
                         let mut v = base_ctrls.clone();
                         v[p_idx] = stop_u;
                         let meta = build_controls_meta_map(&manifest, &v, &empty_switches);
@@ -489,18 +559,30 @@ pub fn train_adaptive_target(
                             noise_floor_dbfs,
                             seed_256,
                         };
-                        let (_, spec, warns, tilt) =
-                            run_single_closed_loop_stem(target, cfg, false, meta)?;
+                        let (_, spec, warns, tilt, _, _) = run_single_closed_loop_stem(
+                            target,
+                            cfg,
+                            false,
+                            meta,
+                            shared_align,
+                            None,
+                        )?;
                         all_warnings.extend(warns);
                         tilts.push(tilt);
                         captured_specs.push(spec);
                     }
-                    shape_spread_by_ctrl[p_idx] = (tilts[1] - tilts[0]).abs().max(probe_spread);
+                    shape_spread_by_ctrl[p_idx] =
+                        (tilts[tilts.len() - 1] - tilts[0]).abs().max(probe_spread);
                 }
             }
             ControlKind::Switch => {
                 let opts = ctrl.declared_options.clone().unwrap_or_default();
-                for (opt_idx, opt_name) in opts.iter().enumerate().skip(1) {
+                let def_opt =
+                    (base_ctrls[p_idx].round() as usize).min(opts.len().saturating_sub(1));
+                for (opt_idx, opt_name) in opts.iter().enumerate() {
+                    if opt_idx == def_opt {
+                        continue;
+                    }
                     let mut sw_map = BTreeMap::new();
                     sw_map.insert(p_idx, opt_name.clone());
                     let mut sw_ctrls = base_ctrls.clone();
@@ -520,8 +602,8 @@ pub fn train_adaptive_target(
                         noise_floor_dbfs,
                         seed_256,
                     };
-                    let (_, mut spec, warns, _) =
-                        run_single_closed_loop_stem(target, cfg, false, meta)?;
+                    let (_, mut spec, warns, _, _, _) =
+                        run_single_closed_loop_stem(target, cfg, false, meta, shared_align, None)?;
                     spec.windows = vec![StmcTrajectoryWindow {
                         control_id: p_idx as u16,
                         ctrl_kind: 1,
@@ -583,6 +665,9 @@ pub fn train_adaptive_target(
         let mut sfm_hist: [Option<Vec<f64>>; 2] = [None, None];
         let mut last_resp: Option<StemResponse> = None;
         while let Some(frame) = ctrl.next_frame(last_resp.as_ref()) {
+            if ctrl.is_entering_coreset() {
+                target.reset_state();
+            }
             let r = target.render_frame(&frame)?;
             if ctrl.is_in_active_learning() && !options.fixed_duration {
                 let (wl_48k, _) = ctrl.normalize_wet_to_48k(&r);
@@ -595,7 +680,8 @@ pub fn train_adaptive_target(
             last_resp = Some(r);
         }
         all_warnings.extend_from_slice(ctrl.warnings());
-        let (_, spec) = ctrl.seal_inpc_and_vault_spec(false, meta)?;
+        let (_, spec, _, _) =
+            ctrl.seal_inpc_and_vault_spec_with_shared_align(false, meta, shared_align)?;
         captured_specs.push(spec);
         hadamard_run += 1;
     }

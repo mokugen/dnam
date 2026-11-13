@@ -26,8 +26,9 @@ use crate::resampler::{
 };
 use crate::solver::stage_d::decode_coreset_lr;
 use crate::solver::{
-    compute_role_b_multipliers, contract_256d_gram_tiled_wide192, finalize_stage_e_and_telemetry,
-    solve_uplo_u_cholesky_2ch, uplo_u_index, uplo_u_packed_len, write_effective_mode0_weights,
+    compute_role_b_multipliers, contract_256d_gram_tiled_wide192,
+    finalize_stage_e_and_telemetry_with_polish, solve_uplo_u_cholesky_2ch, uplo_u_index,
+    uplo_u_packed_len, write_effective_mode0_weights,
 };
 use crate::targets::{DistillationTarget, StemStimulus};
 
@@ -424,7 +425,7 @@ pub fn run_live_null_test_and_autopatch(
             .solver_telemetry
             .as_ref()
             .map_or(0.0, |s| s.total_solve_ms);
-        if let Ok(se_out) = finalize_stage_e_and_telemetry(
+        if let Ok(se_out) = finalize_stage_e_and_telemetry_with_polish(
             &mut updated_manifest,
             &mut arena_64k,
             &rt_view.cp1_contributors,
@@ -432,6 +433,7 @@ pub fn run_live_null_test_and_autopatch(
             Some(&star_wet_lr),
             prev_coreset_esr,
             prev_ms + patch_ms,
+            false,
         ) {
             post_coreset_esr = Some(se_out.tier_esr_db);
         }
@@ -521,7 +523,7 @@ pub fn run_live_null_test_and_autopatch(
     };
     let coreset_tiers_ok = match (prev_coreset_esr, post_coreset_esr) {
         (Some(prev), Some(post)) => {
-            let rig_drifted = pre_esr_db > prev[3] + 25.0;
+            let rig_drifted = pre_esr_db > prev[3] + 6.0 && post_esr_db + 1.0 < pre_esr_db;
             let mono = post[3] <= post[2] + 1.0e-3
                 && post[2] <= post[1] + 1.0e-3
                 && post[1] <= post[0] + 1.0e-3;

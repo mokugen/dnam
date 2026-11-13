@@ -10,6 +10,8 @@ pub mod batch;
 pub mod fft;
 pub mod laws;
 pub mod null_test;
+pub(crate) mod physics_probe;
+pub(crate) mod physics_probe_tail;
 pub mod pipeline;
 pub mod safeguards;
 pub mod sealing;
@@ -333,6 +335,15 @@ impl AdaptiveStimulusController {
             self.active_primitive = None;
             self.bloom_probe_acc.clear();
         }
+    }
+
+    pub fn is_entering_coreset(&self) -> bool {
+        matches!(
+            self.phase,
+            ControllerPhase::Coreset {
+                coreset_frame_idx: 1
+            }
+        )
     }
 
     fn aux_for_non_active_48k(&self, ref_l: &[f32]) -> Option<Vec<f32>> {
@@ -807,6 +818,17 @@ impl AdaptiveStimulusController {
         is_star_center: bool,
         controls_meta: BTreeMap<String, serde_json::Value>,
     ) -> Result<(Vec<u8>, VaultCaptureSpec), DnamError> {
+        let (bytes, spec, _, _) =
+            self.seal_inpc_and_vault_spec_with_shared_align(is_star_center, controls_meta, None)?;
+        Ok((bytes, spec))
+    }
+
+    pub(crate) fn seal_inpc_and_vault_spec_with_shared_align(
+        &self,
+        is_star_center: bool,
+        controls_meta: BTreeMap<String, serde_json::Value>,
+        shared_align: Option<(f64, bool)>,
+    ) -> Result<(Vec<u8>, VaultCaptureSpec, f64, bool), DnamError> {
         let raw_wet_l = if self.coreset_wet_l.len() >= CORESET_FP16_FRAMES_PER_STEM {
             &self.coreset_wet_l[..self.coreset_wet_l.len().min(3 * ADAPTIVE_FRAME_SAMPLES)]
         } else {
@@ -830,7 +852,7 @@ impl AdaptiveStimulusController {
         } else {
             self.trajectory_windows.clone()
         };
-        batch::seal_coresets_to_inpc_and_vault(
+        batch::seal_coresets_to_inpc_and_vault_with_override(
             &self.config.stem_id,
             is_star_center,
             &self.config.seed_256,
@@ -842,6 +864,23 @@ impl AdaptiveStimulusController {
             (!self.coreset_wet_r.is_empty()).then_some(self.coreset_wet_r.as_slice()),
             windows,
             controls_meta,
+            shared_align,
+        )
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn coreset_buffers_48k(&self) -> (&[f32], Option<&[f32]>, &[f32], Option<&[f32]>) {
+        let raw_wet_l = if self.coreset_wet_l.len() >= CORESET_FP16_FRAMES_PER_STEM {
+            &self.coreset_wet_l[..self.coreset_wet_l.len().min(3 * ADAPTIVE_FRAME_SAMPLES)]
+        } else {
+            &self.recorded_wet_total_l
+        };
+        let raw_wet_r = (!self.coreset_wet_r.is_empty()).then_some(self.coreset_wet_r.as_slice());
+        (
+            &self.coreset_dry_l,
+            self.coreset_dry_r.as_deref(),
+            raw_wet_l,
+            raw_wet_r,
         )
     }
 }

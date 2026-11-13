@@ -106,6 +106,8 @@ pub struct StagePipeline {
     pub fir_taps_r: [[f32; 16]; 4],
     pub stage4: Stage4SpatialTank,
     pub head: MidSideKroneckerHead,
+    /// True when the loaded container sets `PIPE_FLAG_STAGE3_EXT` (preserves intentionally zero FIR taps and normalizes Kautz features).
+    pub ext_stage3: bool,
 }
 
 impl Default for StagePipeline {
@@ -146,7 +148,15 @@ impl StagePipeline {
             fir_taps_r: [[0.0625; 16], [0.0; 16], [0.0; 16], [0.0; 16]],
             stage4: Stage4SpatialTank::new(),
             head: MidSideKroneckerHead::new(),
+            ext_stage3: false,
         }
+    }
+
+    /// Pre-allocates non-RT Stage I / Stage IV extended delay ring buffers so `reload_model_in_place`
+    /// and `4x` offline bounce toggling remain strictly zero-allocation.
+    pub fn reserve_extended_capacity(&mut self) {
+        self.stage1.reserve_extended_capacity(16_384);
+        self.stage4.reserve_extended_capacity(131_072, 32_768);
     }
 
     pub fn reset(&mut self) {
@@ -197,6 +207,31 @@ impl StagePipeline {
         arena: &[u8],
         zoh: &crate::container::ZohRescaledParams,
     ) {
+        if arena.len() >= 64 {
+            let mut has_s = false;
+            let mut s_mat = [[0.0_f32; 4]; 4];
+            for (r, row) in s_mat.iter_mut().enumerate() {
+                for (c, cell) in row.iter_mut().enumerate() {
+                    let v = crate::provenance::watermark::read_f32_le(arena, (r * 4 + c) * 4);
+                    if v.is_finite() {
+                        *cell = v.clamp(-4.0, 4.0);
+                        if v.abs() > 1.0e-12 {
+                            has_s = true;
+                        }
+                    }
+                }
+            }
+            if has_s {
+                self.stage0.s_matrix = s_mat;
+            } else {
+                self.stage0.s_matrix = [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [1.0, 0.0, 1.0, 0.0],
+                    [0.0, 1.0, 0.0, 1.0],
+                ];
+            }
+        }
         if arena.len() >= 132 {
             let fc = crate::provenance::watermark::read_f32_le(arena, 128);
             if fc.is_finite() && (20.0..=1000.0).contains(&fc) {
@@ -204,8 +239,16 @@ impl StagePipeline {
             }
         }
         self.stage1.load_from_arena(arena);
+        if self.stage1.ext_active && self.stage1.comp_sidechain_aux_mix > 1.0e-6 {
+            self.stage0.s_matrix[2][2] = 0.0;
+            self.stage0.s_matrix[3][3] = 0.0;
+        }
         self.stage2.load_from_arena(arena);
         self.stage4.load_from_arena(arena);
+        self.ext_stage3 = crate::stages::weights::has_pipeline_flag(
+            arena,
+            crate::stages::weights::PIPE_FLAG_STAGE3_EXT,
+        );
         self.last_dtheta_kautz = 0.0;
         self.last_g_kautz = 0.5;
 
@@ -317,12 +360,18 @@ impl StagePipeline {
                     taps_l[i] = vl;
                     taps_r[i] = vr;
                 }
-                let default_taps = if tier == 0 { [0.0625; 16] } else { [0.0; 16] };
+                let default_taps = if tier == 0 && !self.ext_stage3 {
+                    [0.0625; 16]
+                } else {
+                    [0.0; 16]
+                };
                 let eff_l = if has_l { taps_l } else { default_taps };
                 let eff_r = if has_r {
                     taps_r
-                } else if has_l {
+                } else if has_l && !self.ext_stage3 {
                     taps_l
+                } else if has_l {
+                    taps_r
                 } else {
                     default_taps
                 };

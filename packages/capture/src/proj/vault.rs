@@ -34,7 +34,7 @@ use super::directory::{
 use super::schema::{DnamProjManifest, ExtractedPhysics, StemProvenance, StemRegistryEntry};
 use super::{
     PROJ_FLAG_COMPACTED_CAPSULES, STMC_FLAG_ENABLED, STMC_FLAG_MODE_A_SWEEP, STMC_FLAG_STAR_CENTER,
-    STMC_FLAG_STEREO, fp16_bytes_to_f32,
+    STMC_FLAG_STEREO, STMC_FLAG_WET_POLARITY_INVERTED, fp16_bytes_to_f32,
 };
 
 const HEAD_BASES: [usize; 4] = [4_928, 18_048, 31_936, 57_600];
@@ -89,6 +89,14 @@ impl VaultCaptureSpec {
         }
         if self.wet_coreset_fp16.len() == 48_000 {
             flags |= STMC_FLAG_STEREO;
+        }
+        if self
+            .user_metadata
+            .get("wet_polarity_inverted")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            flags |= STMC_FLAG_WET_POLARITY_INVERTED;
         }
         build_proj_stmc_capsule(
             stem_index,

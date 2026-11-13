@@ -19,9 +19,10 @@ use crate::proj::bundle::zero_arena_b_head_dc_bias;
 use crate::proj::schema::DnamProjManifest;
 
 use super::stage_a_id::{
-    extract_stage4_reflection_delays, fit_deconvolved_stage3_stereo,
-    identify_steiglitz_mcbride_and_linearity, solve_early_fir_64_stereo,
+    fit_deconvolved_stage3_stereo, identify_steiglitz_mcbride_and_linearity,
+    solve_early_fir_64_stereo,
 };
+use super::stage_a_refl::{cancel_discrete_early_reflections, extract_stage4_reflection_delays};
 
 /// Stage III contiguous `64`-tap (`1.33 ms`) Early FIR base offsets (`16 L + 16 R` `f32` per tier).
 pub const STAGE3_EARLY_FIR_BASES: [usize; 4] = [4_288, 17_408, 31_552, 48_512];
@@ -79,6 +80,7 @@ struct PhysicalDescriptors {
     amp_scale: f32,
     band_q_bias: [f32; 32],
     sm_poles: Vec<(f32, f32)>,
+    ir_peak_lag: usize,
 }
 
 #[inline]
@@ -181,7 +183,8 @@ fn estimate_physical_descriptors(
         .clamp(0.25, 3.5) as f32;
     let low2_rel_dry = low2_wet_e / (low_dry_e * gain_ratio.max(1.0e-6)).max(1.0e-12);
     let low_ratio = (low_wet_e / wet_e.max(1.0e-9)).clamp(0.02, 0.85) as f32;
-    let (nl_drive, sm_poles) = identify_steiglitz_mcbride_and_linearity(dry_lr, wet_lr, hf_growth);
+    let (nl_drive, sm_poles, ir_peak_lag) =
+        identify_steiglitz_mcbride_and_linearity(dry_lr, wet_lr, hf_growth);
     let crossover_hz = if nl_drive < 0.05 && low2_rel_dry < 0.10 {
         (20.0 + 600.0 * (low2_rel_dry as f32)).clamp(20.0, 80.0)
     } else {
@@ -230,6 +233,7 @@ fn estimate_physical_descriptors(
         amp_scale,
         band_q_bias,
         sm_poles,
+        ir_peak_lag,
     }
 }
 
@@ -328,74 +332,22 @@ fn simulate_stage2_and_sub_trajectories(
         for (p, &val) in star_ctrls.iter().enumerate() {
             eng.set_control_immediate(p, val);
         }
+        let s3_ext = dnam_engine::stages::weights::has_pipeline_flag(
+            &probe_arena,
+            dnam_engine::stages::weights::PIPE_FLAG_STAGE3_EXT,
+        );
         let mut s2_lr = Vec::with_capacity(n_fit);
         let mut sub_lr = Vec::with_capacity(n_fit);
         let mut fb = [0.0_f32; 256];
         let _ftz = FtzDazGuard::new();
         for &[dl, dr] in &dry_lr[..n_fit] {
             let _ = eng.step_frame_with_feature_bus(dl, dr, &mut fb);
-            sub_lr.push([fb[60], fb[61]]);
+            sub_lr.push(if s3_ext { [0.0, 0.0] } else { [fb[60], fb[61]] });
             s2_lr.push([fb[58] - fb[76], fb[59] - fb[77]]);
         }
         return (s2_lr, sub_lr);
     }
     (dry_lr[..n_fit].to_vec(), vec![[0.0_f32; 2]; n_fit])
-}
-
-fn cancel_discrete_early_reflections(
-    s3_lr: &[[f32; 2]],
-    wet_lr: &[[f32; 2]],
-    lags_l: [usize; 4],
-    lags_r: [usize; 4],
-) -> Vec<[f32; 2]> {
-    let n = s3_lr.len().min(wet_lr.len());
-    let mut out = wet_lr[..n].to_vec();
-    if n < 512 {
-        return out;
-    }
-    for (ch, lags) in [(0usize, lags_l), (1usize, lags_r)] {
-        let mut uniq: Vec<usize> = Vec::with_capacity(4);
-        for &d in &lags {
-            if (24..n / 2).contains(&d) && uniq.iter().all(|&u| u.abs_diff(d) >= 8) {
-                uniq.push(d);
-            }
-        }
-        let m = uniq.len();
-        if m == 0 {
-            continue;
-        }
-        let mut g = vec![0.0_f64; crate::solver::uplo_u_packed_len(m)];
-        let mut c = vec![[0.0_f64; 2]; m];
-        let max_d = *uniq.iter().max().unwrap_or(&24);
-        for i in (max_d + 16)..n {
-            let r_hp = (f64::from(wet_lr[i][ch]) - f64::from(s3_lr[i][ch]))
-                - 0.94 * (f64::from(wet_lr[i - 1][ch]) - f64::from(s3_lr[i - 1][ch]));
-            for col in 0..m {
-                let dc = uniq[col];
-                let sc = f64::from(s3_lr[i - dc][ch]) - 0.94 * f64::from(s3_lr[i - 1 - dc][ch]);
-                let base = crate::solver::uplo_u_index(0, col);
-                for row in 0..=col {
-                    let dr = uniq[row];
-                    let sr = f64::from(s3_lr[i - dr][ch]) - 0.94 * f64::from(s3_lr[i - 1 - dr][ch]);
-                    g[base + row] += sr * sc;
-                }
-                c[col][0] += sc * r_hp;
-            }
-        }
-        let tr: f64 = (0..m).map(|k| g[crate::solver::uplo_u_index(k, k)]).sum();
-        if let Ok(sol) = crate::solver::solve_uplo_u_cholesky_2ch(&g, &c, (1.0e-3 * tr).max(1.0e-9))
-        {
-            for (k, &d) in uniq.iter().enumerate() {
-                let alpha = (sol[k][0] as f32).clamp(-0.65, 0.65);
-                if alpha.abs() >= 0.03 {
-                    for i in d..n {
-                        out[i][ch] -= alpha * s3_lr[i - d][ch];
-                    }
-                }
-            }
-        }
-    }
-    out
 }
 
 /// Zeroes all `7,616` Role B cascade floats (`b = 1..K_t-1` across `CASCADE_W_BASES[0..4]`) so
@@ -440,17 +392,32 @@ pub fn lift_stage_a_backbone(
     let n_common = dry_lr.len().min(wet_lr.len());
     let (dry_lr, wet_lr) = if n_common > 12_000 {
         let win = 12_000usize;
+        let span = n_common - win;
+        let step = (span / 8).max(1);
         let mut best_off = 0usize;
         let mut best_score = -1.0_f64;
-        for off in [0, (n_common - win) / 2, n_common - win] {
-            let (mut we, mut d_hf) = (0.0_f64, 0.0_f64);
-            for i in (off + 1)..(off + win) {
+        for k in 0..=8 {
+            let off = if k == 8 { span } else { (k * step).min(span) };
+            let (mut we, mut e_lf, mut d2_uhf) = (0.0_f64, 0.0_f64, 0.0_f64);
+            for i in (off + 2)..(off + win) {
                 let y = 0.5 * (f64::from(wet_lr[i][0]) + f64::from(wet_lr[i][1]));
-                let dx = f64::from(dry_lr[i][0] - dry_lr[i - 1][0]);
+                let x0 = f64::from(dry_lr[i][0]);
+                let d2 = x0 - 2.0 * f64::from(dry_lr[i - 1][0]) + f64::from(dry_lr[i - 2][0]);
                 we += y * y;
-                d_hf += dx * dx;
+                e_lf += x0 * x0;
+                d2_uhf += d2 * d2;
             }
-            let score = we.sqrt() * d_hf.sqrt();
+            let tail_dry: f64 = dry_lr[(off + win - 1_024)..(off + win)]
+                .iter()
+                .map(|v| f64::from(v[0]) * f64::from(v[0]))
+                .sum();
+            let mean_dry = e_lf / (win as f64);
+            let tail_gap_bonus = if tail_dry < 0.05 * mean_dry * 1_024.0 {
+                1.5
+            } else {
+                1.0
+            };
+            let score = tail_gap_bonus * (we * e_lf).powf(0.25) * d2_uhf.sqrt();
             if score > best_score {
                 best_score = score;
                 best_off = off;
@@ -524,19 +491,28 @@ pub fn lift_stage_a_backbone(
     write_f32_le(arena_64k, 4_100, 0.9490);
     write_f32_le(arena_64k, 4_104, 0.8546);
     write_f32_le(arena_64k, 4_108, 0.9992);
+    let mono_out = manifest.base.io_config.output_mode == "mono";
     let v1a_vals = [
         lti_w * 0.55 + nl_w * (0.025 + 1.125 * nl),
-        lti_w * 0.55 + nl_w * (0.024 + 1.096 * nl),
+        if mono_out {
+            lti_w * 0.55 + nl_w * (0.025 + 1.125 * nl)
+        } else {
+            lti_w * 0.55 + nl_w * (0.024 + 1.096 * nl)
+        },
         0.08 * nl,
-        -0.06 * nl,
+        if mono_out { 0.08 * nl } else { -0.06 * nl },
         0.24 + 0.64 * nl,
         0.24 + 0.64 * nl,
     ];
     let v1b_vals = [
         lti_w * 1.25 + nl_w * (0.025 + 1.425 * nl),
-        lti_w * 1.25 + nl_w * (0.024 + 1.376 * nl),
+        if mono_out {
+            lti_w * 1.25 + nl_w * (0.025 + 1.425 * nl)
+        } else {
+            lti_w * 1.25 + nl_w * (0.024 + 1.376 * nl)
+        },
         -0.10 * nl,
-        0.09 * nl,
+        if mono_out { -0.10 * nl } else { 0.09 * nl },
         0.42 + 0.40 * nl,
         0.42 + 0.40 * nl,
     ];
@@ -577,20 +553,40 @@ pub fn lift_stage_a_backbone(
     for (t, &cw_base) in CASCADE_W_BASES.iter().enumerate() {
         let tier_scale = drive_scale * (1.0 - 0.12 * (t as f32));
         for k in 0..16 {
-            let sign = if (k + t) % 2 == 0 { 1.0_f32 } else { -0.75_f32 };
-            let harmonic_w = tier_scale * sign * (0.28 + 0.04 * ((k % 5) as f32));
+            let kl = if mono_out {
+                if t == 0 { (k & 3) | (k & 8) } else { k & 7 }
+            } else {
+                k
+            };
+            let sign = if (kl + t) % 2 == 0 {
+                1.0_f32
+            } else {
+                -0.75_f32
+            };
+            let harmonic_w = tier_scale * sign * (0.28 + 0.04 * ((kl % 5) as f32));
             write_f32_le(arena_64k, cw_base + k * 4, harmonic_w);
         }
     }
 
     // 7. 3 kHz OU analog drift & micro-dither (7,496..7,524) + default trust_radius_mh = 10.0
-    write_f32_le(arena_64k, 7_496, 0.0012);
+    write_f32_le(arena_64k, 7_496, 0.0);
     write_f32_le(arena_64k, 7_500, 0.9950);
-    write_f32_le(arena_64k, 7_516, 1.0e-7);
+    write_f32_le(arena_64k, 7_516, 0.0);
     write_f32_le(arena_64k, 7_520, 10.0);
     write_f32_le(arena_64k, 10_560, 10.0);
     write_f32_le(arena_64k, 10_688, 0.0625);
     zero_arena_b_head_dc_bias(arena_64k);
+
+    let n_fit = dry_lr.len().min(wet_lr.len()).min(12_000);
+    super::stage_a_ext::lift_v2_pre_s3(
+        manifest,
+        arena_64k,
+        dry_lr,
+        wet_lr,
+        n_fit,
+        desc.nl_drive,
+        desc.amp_scale,
+    );
 
     // Enforce Phase-2 [CLAMP-RAIL] on Stage II V1A BEFORE simulating Stage 0..II for Stage III fit
     let (occ, safe_scale, locked) =
@@ -598,24 +594,39 @@ pub fn lift_stage_a_backbone(
     let phase2_rail_warning = if locked && arena_64k.len() >= 4_136 {
         let cur_bl = read_f32_le(arena_64k, 4_112).max(0.1);
         let cur_br = read_f32_le(arena_64k, 4_116);
-        write_f32_le(arena_64k, 4_112, (cur_bl * safe_scale).clamp(0.1, 4.0));
+        let soft_scale = safe_scale.max(0.55);
+        write_f32_le(arena_64k, 4_112, (cur_bl * soft_scale).clamp(0.1, 1.80));
         if cur_br > 0.0 {
-            write_f32_le(arena_64k, 4_116, (cur_br * safe_scale).clamp(0.1, 4.0));
+            write_f32_le(arena_64k, 4_116, (cur_br * soft_scale).clamp(0.1, 1.80));
         }
+        let (occ2, safe_scale2, locked2) =
+            crate::audit::audit_phase2_polyadaa_rail_lockup(arena_64k, 3.0, 0.25);
+        if locked2 {
+            let b2l = read_f32_le(arena_64k, 4_112).max(0.1);
+            let b2r = read_f32_le(arena_64k, 4_116);
+            write_f32_le(arena_64k, 4_112, (b2l * safe_scale2).clamp(0.1, 1.80));
+            if b2r > 0.0 {
+                write_f32_le(arena_64k, 4_116, (b2r * safe_scale2).clamp(0.1, 1.80));
+            }
+        }
+        let eff_scale = if locked2 {
+            soft_scale * safe_scale2
+        } else {
+            soft_scale
+        };
         Some(format!(
             "[CLAMP-RAIL] PolyADAA corner rail occupancy {:.1}% > 95.0%; scaled V1A beta by {:.3}",
-            occ * 100.0,
-            safe_scale
+            occ.max(occ2) * 100.0,
+            eff_scale
         ))
     } else {
         None
     };
 
-    // 4 & 5. Adaptive Stage III: Deconvolved Stereo Fit on LTI/Clean vs. Broadband Basis on Driven
+    // 4 & 5. Adaptive Stage III: Deconvolved Stereo Fit on Stage 0..II output for all active models
     let pole_schedule = build_kautz_32_pole_schedule(&desc.sm_poles, &desc.band_q_bias);
     let mono_only = manifest.base.io_config.output_mode == "mono";
     let r_chan_scale = if mono_only { 1.0_f32 } else { 0.96_f32 };
-    let n_fit = dry_lr.len().min(wet_lr.len()).min(12_000);
 
     let (raw_fir_l, raw_fir_r) = solve_early_fir_64_stereo(dry_lr, wet_lr);
     let (mut fir_l, mut fir_r, kautz_c_l, kautz_c_r, s3_ref_lr) = if desc.amp_scale == 0.0 {
@@ -626,7 +637,7 @@ pub fn lift_stage_a_backbone(
             [(0.0_f32, 0.0_f32); 32],
             vec![[0.0_f32; 2]; n_fit],
         )
-    } else if lti_w > 0.01 {
+    } else {
         let (s2_lr, clean_sub_lr) =
             simulate_stage2_and_sub_trajectories(manifest, arena_64k, dry_lr, n_fit);
         let s3_fit0 = fit_deconvolved_stage3_stereo(
@@ -637,24 +648,28 @@ pub fn lift_stage_a_backbone(
             mono_only,
             r_chan_scale,
         );
-        let (ld0, fd0, _, _, _) =
+        let (ld0, fd0, _, _, _, has_refl0) =
             extract_stage4_reflection_delays(&s3_fit0.s3_lr, &wet_lr[..n_fit]);
-        let wet_cab_lr = cancel_discrete_early_reflections(
-            &s3_fit0.s3_lr,
-            &wet_lr[..n_fit],
-            [
-                ld0[0] as usize,
-                ld0[2] as usize,
-                fd0[0] as usize,
-                fd0[2] as usize,
-            ],
-            [
-                ld0[1] as usize,
-                ld0[3] as usize,
-                fd0[1] as usize,
-                fd0[3] as usize,
-            ],
-        );
+        let wet_cab_lr = if has_refl0 {
+            cancel_discrete_early_reflections(
+                &s3_fit0.s3_lr,
+                &wet_lr[..n_fit],
+                [
+                    ld0[0] as usize,
+                    ld0[2] as usize,
+                    fd0[0] as usize,
+                    fd0[2] as usize,
+                ],
+                [
+                    ld0[1] as usize,
+                    ld0[3] as usize,
+                    fd0[1] as usize,
+                    fd0[3] as usize,
+                ],
+            )
+        } else {
+            wet_lr[..n_fit].to_vec()
+        };
         let s3_fit = fit_deconvolved_stage3_stereo(
             &s2_lr,
             &clean_sub_lr,
@@ -663,70 +678,29 @@ pub fn lift_stage_a_backbone(
             mono_only,
             r_chan_scale,
         );
-        let mut bl = [0.0_f32; 64];
-        let mut br = [0.0_f32; 64];
-        for t in 0..4 {
-            let nl_seg_gain = if t == 0 { 0.15_f32 } else { 0.65_f32 };
-            for i in 0..16 {
-                let idx = t * 16 + i;
-                bl[idx] = lti_w * s3_fit.fir_l[idx] + (1.0 - lti_w) * nl_seg_gain * raw_fir_l[idx];
-                br[idx] = lti_w * s3_fit.fir_r[idx] + (1.0 - lti_w) * nl_seg_gain * raw_fir_r[idx];
-            }
+        let s3_e: f64 = s3_fit
+            .fir_l
+            .iter()
+            .chain(&s3_fit.fir_r)
+            .map(|&v| f64::from(v) * f64::from(v))
+            .sum();
+        if s3_e > 1.0e-8 {
+            (
+                s3_fit.fir_l,
+                s3_fit.fir_r,
+                s3_fit.kautz_c_l,
+                s3_fit.kautz_c_r,
+                s3_fit.s3_lr,
+            )
+        } else {
+            (
+                raw_fir_l,
+                raw_fir_r,
+                s3_fit.kautz_c_l,
+                s3_fit.kautz_c_r,
+                s3_fit.s3_lr,
+            )
         }
-        let mut cl = [(0.0_f32, 0.0_f32); 32];
-        let mut cr = [(0.0_f32, 0.0_f32); 32];
-        for m in 0..32 {
-            let base_c = if m < 4 { 0.30_f32 } else { 0.24_f32 };
-            let b_g = (1.0_f64 - f64::from(pole_schedule[m].0).powi(2))
-                .max(1.0e-6)
-                .sqrt() as f32;
-            let c_sc = (base_c * b_g).clamp(0.055, 0.125);
-            let ph = 0.37_f32 * ((m + 1) as f32);
-            let nl_cl = (c_sc * ph.cos(), c_sc * ph.sin());
-            cl[m] = (
-                lti_w * s3_fit.kautz_c_l[m].0 + (1.0 - lti_w) * nl_cl.0,
-                lti_w * s3_fit.kautz_c_l[m].1 + (1.0 - lti_w) * nl_cl.1,
-            );
-            cr[m] = (
-                lti_w * s3_fit.kautz_c_r[m].0 + (1.0 - lti_w) * nl_cl.0 * r_chan_scale,
-                lti_w * s3_fit.kautz_c_r[m].1 + (1.0 - lti_w) * nl_cl.1 * r_chan_scale,
-            );
-        }
-        (bl, br, cl, cr, s3_fit.s3_lr)
-    } else {
-        let mut bl = [0.0_f32; 64];
-        let mut br = [0.0_f32; 64];
-        for t in 0..4 {
-            let nl_seg_gain = if t == 0 { 0.15_f32 } else { 0.65_f32 };
-            for i in 0..16 {
-                let idx = t * 16 + i;
-                bl[idx] = nl_seg_gain * raw_fir_l[idx];
-                br[idx] = nl_seg_gain * raw_fir_r[idx];
-            }
-        }
-        let mut cl = [(0.0_f32, 0.0_f32); 32];
-        let mut cr = [(0.0_f32, 0.0_f32); 32];
-        for m in 0..32 {
-            let base_c = if m < 4 { 0.30_f32 } else { 0.24_f32 };
-            let b_g = (1.0_f64 - f64::from(pole_schedule[m].0).powi(2))
-                .max(1.0e-6)
-                .sqrt() as f32;
-            let c_sc = (base_c * b_g).clamp(0.055, 0.125);
-            let ph = 0.37_f32 * ((m + 1) as f32);
-            cl[m] = (c_sc * ph.cos(), c_sc * ph.sin());
-            cr[m] = (cl[m].0 * r_chan_scale, cl[m].1 * r_chan_scale);
-        }
-        let mut pred = vec![[0.0_f32; 2]; n_fit];
-        for i in 0..n_fit {
-            let mut dl = 0.0_f32;
-            let mut dr = 0.0_f32;
-            for k in 0..=i.min(63) {
-                dl += raw_fir_l[k] * dry_lr[i - k][0];
-                dr += raw_fir_r[k] * dry_lr[i - k][1];
-            }
-            pred[i] = [dl, dr];
-        }
-        (bl, br, cl, cr, pred)
     };
 
     let mut fir_energy: f64 = fir_l
@@ -749,7 +723,7 @@ pub fn lift_stage_a_backbone(
             .sum();
         for i in 0..16 {
             let fallback_seed = if t > 0 && seg_e < 1.0e-8 && i == (t * 3 + 1) % 16 {
-                0.015_f32 * desc.amp_scale
+                1.0e-4_f32 * desc.amp_scale
             } else {
                 0.0
             };
@@ -785,18 +759,66 @@ pub fn lift_stage_a_backbone(
         }
     }
 
-    // 6. Stage IV Channel-Aligned Spatial Tank Delays & Reverberant Loop Gain
-    let (lite_delays, full_delays, pro_delays, ultra_delays, refl_g_loop) =
-        extract_stage4_reflection_delays(&s3_ref_lr, &wet_lr[..n_fit]);
-    let eff_g_loop = lti_w * refl_g_loop + (1.0 - lti_w) * desc.g_loop;
-    let lite_allpass: [f32; 4] = [0.52, -0.47, 0.43, -0.39];
+    // 6. Stage IV Channel-Aligned Spatial Tank Delays, V2 Extensions & Reverberant Loop Gain
+    let (
+        mut lite_delays,
+        mut full_delays,
+        mut pro_delays,
+        mut ultra_delays,
+        refl_g_loop,
+        has_reflections,
+    ) = extract_stage4_reflection_delays(&s3_ref_lr, &wet_lr[..n_fit]);
+    if !has_reflections && desc.ir_peak_lag >= 16 {
+        let p = (desc.ir_peak_lag as f32).clamp(16.0, 220.0);
+        lite_delays = [
+            (p - 14.0).clamp(4.0, 250.0),
+            p.clamp(4.0, 250.0),
+            (p + 14.0).clamp(4.0, 250.0),
+            (p + 32.0).clamp(4.0, 250.0),
+        ];
+        full_delays = [
+            (p - 21.0).clamp(4.0, 250.0),
+            (p - 7.0).clamp(4.0, 250.0),
+            (p + 7.0).clamp(4.0, 250.0),
+            (p + 23.0).clamp(4.0, 250.0),
+        ];
+        const PRO_OFFS: [f32; 8] = [-28.0, -18.0, -10.0, -3.0, 3.0, 10.0, 20.0, 40.0];
+        for (k, d) in pro_delays.iter_mut().enumerate() {
+            *d = (p + PRO_OFFS[k % PRO_OFFS.len()]).clamp(4.0, 250.0);
+        }
+        for (k, d) in ultra_delays.iter_mut().enumerate() {
+            *d = (p - 32.0 + (k as f32) * 6.0).clamp(4.0, 250.0);
+        }
+    }
+    let eff_g_loop = if has_reflections && refl_g_loop <= 1.0e-6 && lti_w >= 0.85 {
+        0.0
+    } else {
+        lti_w * refl_g_loop + (1.0 - lti_w) * desc.g_loop
+    };
+    let discrete_refl_only = has_reflections && eff_g_loop <= 1.0e-6;
     for l in 0..4 {
         write_f32_le(arena_64k, 4_672 + l * 4, lite_delays[l]);
-        write_f32_le(arena_64k, 4_700 + l * 4, lite_allpass[l]);
     }
-    write_f32_le(arena_64k, 4_688, eff_g_loop.clamp(0.05, 0.9990));
+    write_f32_le(
+        arena_64k,
+        4_700,
+        if discrete_refl_only { 0.0 } else { 0.52 },
+    );
+    write_f32_le(
+        arena_64k,
+        4_688,
+        if discrete_refl_only {
+            0.0
+        } else {
+            eff_g_loop.clamp(0.0, 0.9990)
+        },
+    );
     write_f32_le(arena_64k, 4_692, 1.0); // sigma_knee
-    write_f32_le(arena_64k, 4_696, 0.36); // psi
+    write_f32_le(
+        arena_64k,
+        4_696,
+        if discrete_refl_only { 0.0 } else { 0.36 },
+    ); // psi
 
     for (l, &d) in full_delays.iter().enumerate() {
         write_f32_le(arena_64k, 17_792 + l * 4, d);
@@ -807,6 +829,16 @@ pub fn lift_stage_a_backbone(
     for (k, &d) in ultra_delays.iter().enumerate() {
         write_f32_le(arena_64k, 48_896 + k * 4, d);
     }
+    super::stage_a_ext::lift_v2_post_s3_stage4(
+        manifest,
+        arena_64k,
+        &s3_ref_lr,
+        wet_lr,
+        eff_g_loop,
+        has_reflections,
+        desc.ir_peak_lag,
+        n_fit,
+    );
 
     StageAReport {
         elapsed_ms: elapsed_ms_since(timer),

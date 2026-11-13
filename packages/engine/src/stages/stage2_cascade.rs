@@ -4,11 +4,13 @@
 
 pub mod conv6;
 pub mod filters;
+pub mod v2_basis;
 pub use conv6::{
     Stage2Backend, conv6_taps_1group_vec4, conv6_taps_2groups_vec4, conv6_taps_3groups_vec4,
     conv6_taps_4groups_vec4,
 };
 pub use filters::ToneBasisFilters;
+pub use v2_basis::Stage2V2BasisState;
 
 use crate::math::flush_recursive_state_f32;
 use crate::operators::op_n::{
@@ -100,6 +102,30 @@ pub struct Stage2CommutedCascade {
     pub sag_release_alpha: f32,
     /// Anchor-locked Role A (`b = 0`, 16 floats/tier at `CASCADE_W_BASES[t][0..16]`) inter-stage coupling scales `(1.0 + delta_a).clamp(0.5, 1.5)`.
     pub role_a_scales: [[f32; 16]; 4],
+    /// Extended Stage II v2 pipeline controls loaded from `Arena 0 [512..552]` (`PIPE_FLAG_STAGE2_EXT`).
+    pub ext_active: bool,
+    pub linear_v1a_v1b: bool,
+    pub base_pre_hpf_pole: f32,
+    pub base_pre_lpf_pole: f32,
+    pub pre_hpf_pole: f32,
+    pub pre_lpf_pole: f32,
+    pub pre_hpf_x1_l: f32,
+    pub pre_hpf_x1_r: f32,
+    pub pre_hpf_y1_l: f32,
+    pub pre_hpf_y1_r: f32,
+    pub pre_lpf_y1_l: f32,
+    pub pre_lpf_y1_r: f32,
+    pub l1_hpf_mix: f32,
+    pub l2_hpf_mix: f32,
+    pub v1b_wf_mix: f32,
+    pub pwr_hyst_mix: f32,
+    pub clean_bypass_mix: f32,
+    pub iron_sub_flux_mix: f32,
+    pub iron_flux_pole: f32,
+    pub iron_flux_l: f32,
+    pub iron_flux_r: f32,
+    pub stage2_out_gain: f32,
+    pub v2_basis: Stage2V2BasisState,
 }
 
 impl Default for Stage2CommutedCascade {
@@ -166,6 +192,29 @@ impl Stage2CommutedCascade {
             sag_attack_alpha: 0.980,
             sag_release_alpha: 0.999,
             role_a_scales: [[1.0; 16]; 4],
+            ext_active: false,
+            linear_v1a_v1b: false,
+            base_pre_hpf_pole: 0.0,
+            base_pre_lpf_pole: 0.0,
+            pre_hpf_pole: 0.0,
+            pre_lpf_pole: 0.0,
+            pre_hpf_x1_l: 0.0,
+            pre_hpf_x1_r: 0.0,
+            pre_hpf_y1_l: 0.0,
+            pre_hpf_y1_r: 0.0,
+            pre_lpf_y1_l: 0.0,
+            pre_lpf_y1_r: 0.0,
+            l1_hpf_mix: 0.0,
+            l2_hpf_mix: 0.0,
+            v1b_wf_mix: 0.3,
+            pwr_hyst_mix: 0.1,
+            clean_bypass_mix: 0.0,
+            iron_sub_flux_mix: 0.0,
+            iron_flux_pole: 0.992,
+            iron_flux_l: 0.0,
+            iron_flux_r: 0.0,
+            stage2_out_gain: 1.0,
+            v2_basis: Stage2V2BasisState::new(),
         }
     }
 
@@ -188,6 +237,15 @@ impl Stage2CommutedCascade {
         self.l2_state_r = [0.0; 6];
         self.branch_state_l = [[0.0; 3]; 3];
         self.branch_state_r = [[0.0; 3]; 3];
+        self.pre_hpf_x1_l = 0.0;
+        self.pre_hpf_x1_r = 0.0;
+        self.pre_hpf_y1_l = 0.0;
+        self.pre_hpf_y1_r = 0.0;
+        self.pre_lpf_y1_l = 0.0;
+        self.pre_lpf_y1_r = 0.0;
+        self.iron_flux_l = 0.0;
+        self.iron_flux_r = 0.0;
+        self.v2_basis.reset();
     }
 
     /// Initializes exact DC resting equilibrium for sample-0 pop-free startup.
@@ -210,6 +268,15 @@ impl Stage2CommutedCascade {
         self.l2_state_r = [0.0; 6];
         self.branch_state_l = [[0.0; 3]; 3];
         self.branch_state_r = [[0.0; 3]; 3];
+        self.pre_hpf_x1_l = 0.0;
+        self.pre_hpf_x1_r = 0.0;
+        self.pre_hpf_y1_l = 0.0;
+        self.pre_hpf_y1_r = 0.0;
+        self.pre_lpf_y1_l = 0.0;
+        self.pre_lpf_y1_r = 0.0;
+        self.iron_flux_l = 0.0;
+        self.iron_flux_r = 0.0;
+        self.v2_basis.reset();
     }
 
     #[allow(clippy::type_complexity)]
@@ -222,16 +289,80 @@ impl Stage2CommutedCascade {
         sag_depth: f32,
         beta_tone: f32,
         pwr_drive: f32,
-    ) -> ([f32; 4], [f32; 4], [f32; 4], [f32; 4], f32, f32) {
+    ) -> ([f32; 4], [f32; 4], [f32; 4], [f32; 4], f32, f32, f32, f32) {
         let r_ac = self.r_ac;
         let ra0 = self.role_a_scales[0];
+
+        // 0. Optional Extended Pre-HPF / Pre-LPF shaping
+        let (x_pre_l, x_pre_r) = if self.ext_active {
+            let (mut xl, mut xr) = (in_l, in_r);
+            if self.pre_hpf_pole > 1.0e-5 {
+                let g_hp = 0.5 * (1.0 + self.pre_hpf_pole);
+                let yl = self.pre_hpf_pole * self.pre_hpf_y1_l + g_hp * (xl - self.pre_hpf_x1_l);
+                let yr = self.pre_hpf_pole * self.pre_hpf_y1_r + g_hp * (xr - self.pre_hpf_x1_r);
+                self.pre_hpf_x1_l = flush_recursive_state_f32(xl);
+                self.pre_hpf_x1_r = flush_recursive_state_f32(xr);
+                self.pre_hpf_y1_l = flush_recursive_state_f32(yl);
+                self.pre_hpf_y1_r = flush_recursive_state_f32(yr);
+                xl = yl;
+                xr = yr;
+            }
+            if self.pre_lpf_pole > 1.0e-5 {
+                let a = self.pre_lpf_pole;
+                let om = 1.0 - a;
+                let yl = a * self.pre_lpf_y1_l + om * xl;
+                let yr = a * self.pre_lpf_y1_r + om * xr;
+                self.pre_lpf_y1_l = flush_recursive_state_f32(yl);
+                self.pre_lpf_y1_r = flush_recursive_state_f32(yr);
+                xl = yl;
+                xr = yr;
+            }
+            (xl, xr)
+        } else {
+            (in_l, in_r)
+        };
+
+        if self.ext_active && self.linear_v1a_v1b {
+            let (l1_lin_l, l1_lin_r) = Self::step_interstage_filter_stereo(
+                &mut self.l1_state_l,
+                &mut self.l1_state_r,
+                &self.l1_poles,
+                &self.base_l1_gains,
+                0.0,
+                x_pre_l,
+                0.0,
+                x_pre_r,
+                0.0,
+            );
+            let _ = Self::step_interstage_filter_stereo(
+                &mut self.l2_state_l,
+                &mut self.l2_state_r,
+                &self.l2_poles,
+                &self.base_l2_gains,
+                0.0,
+                l1_lin_l,
+                0.0,
+                l1_lin_r,
+                0.0,
+            );
+            return (
+                [x_pre_l * self.stage2_out_gain, 0.0, 0.0, 0.0],
+                [0.0; 4],
+                [x_pre_r * self.stage2_out_gain, 0.0, 0.0, 0.0],
+                [0.0; 4],
+                0.0,
+                0.0,
+                x_pre_l,
+                x_pre_r,
+            );
+        }
 
         // 1. Sub-stage 2.1: Preamp V1A
         let (v1a_out_l, v1a_out_r) = MultiDrivePolyAdaaChannel::step_stereo_pair(
             &mut self.v1a_left,
             &mut self.v1a_right,
-            in_l * drive_gain,
-            in_r * drive_gain,
+            x_pre_l * drive_gain,
+            x_pre_r * drive_gain,
             self.v1a_beta,
             self.v1a_delta,
             self.v1a_comp,
@@ -259,6 +390,7 @@ impl Stage2CommutedCascade {
             &mut self.l1_state_r,
             &self.l1_poles,
             &self.base_l1_gains,
+            self.l1_hpf_mix,
             sig_v1a_l,
             ae1_l,
             sig_v1a_r,
@@ -278,8 +410,13 @@ impl Stage2CommutedCascade {
 
         let wf_l = 0.5 * (wf_adaa_l + wf_inst_l);
         let wf_r = 0.5 * (wf_adaa_r + wf_inst_r);
-        let v1b_in_l = 0.7 * l1_out_l + 0.3 * wf_l;
-        let v1b_in_r = 0.7 * l1_out_r + 0.3 * wf_r;
+        let wf_mix = if self.ext_active {
+            self.v1b_wf_mix
+        } else {
+            0.3
+        };
+        let v1b_in_l = (1.0 - wf_mix) * l1_out_l + wf_mix * wf_l;
+        let v1b_in_r = (1.0 - wf_mix) * l1_out_r + wf_mix * wf_r;
 
         let (v1b_l1_raw, v1b_l2_raw, v1b_r1_raw, v1b_r2_raw) =
             MultiDrivePolyAdaaChannel::step_stereo_lanes_1_2_lr(
@@ -307,6 +444,7 @@ impl Stage2CommutedCascade {
             &mut self.l2_state_r,
             &self.l2_poles,
             &self.base_l2_gains,
+            self.l2_hpf_mix,
             v1b_l1_raw * ra0[10],
             ae2_l,
             v1b_r1_raw * ra0[14],
@@ -341,8 +479,25 @@ impl Stage2CommutedCascade {
             self.hyst_right
                 .step_with_rate(v1b_r1 * h_drv, v1b_r2 * h_drv, self.hyst_diff_scale);
 
-        let pwr_l = (v1b_l1 * pwr_drive + 0.1 * h_l) * sag_compression;
-        let pwr_r = (v1b_r1 * pwr_drive + 0.1 * h_r) * sag_compression;
+        let hyst_mix = if self.ext_active {
+            self.pwr_hyst_mix
+        } else {
+            0.1
+        };
+        let (mut pwr_l, mut pwr_r) = (
+            (v1b_l1 * pwr_drive + hyst_mix * h_l) * sag_compression,
+            (v1b_r1 * pwr_drive + hyst_mix * h_r) * sag_compression,
+        );
+        if self.ext_active && self.iron_sub_flux_mix > 1.0e-6 {
+            let pf = self.iron_flux_pole;
+            let om_pf = 1.0 - pf;
+            self.iron_flux_l = flush_recursive_state_f32(pf * self.iron_flux_l + om_pf * pwr_l);
+            self.iron_flux_r = flush_recursive_state_f32(pf * self.iron_flux_r + om_pf * pwr_r);
+            let ul = (self.iron_flux_l * 3.0).clamp(-1.0, 1.0);
+            let ur = (self.iron_flux_r * 3.0).clamp(-1.0, 1.0);
+            pwr_l += self.iron_sub_flux_mix * ul * (1.5 - 0.5 * ul * ul);
+            pwr_r += self.iron_sub_flux_mix * ur * (1.5 - 0.5 * ur * ur);
+        }
         self.last_v1b_hyst = [v1b_l1, v1b_l2, h_l, wf_l, v1b_r1, v1b_r2, h_r, wf_r];
 
         // 4. Tone basis filters [Direct, LPF_80, LPF_400, HPF_1200]
@@ -354,6 +509,20 @@ impl Stage2CommutedCascade {
             tone_l[0] += 0.25 * tone_tilt * (tone_l[3] - tone_l[1]);
             tone_r[0] += 0.25 * tone_tilt * (tone_r[3] - tone_r[1]);
         }
+        if self.ext_active {
+            if self.linear_v1a_v1b {
+                tone_l[0] = x_pre_l * self.stage2_out_gain;
+                tone_r[0] = x_pre_r * self.stage2_out_gain;
+            } else {
+                if self.clean_bypass_mix > 1.0e-6 {
+                    let dm = 1.0 - self.clean_bypass_mix;
+                    tone_l[0] = dm * tone_l[0] + self.clean_bypass_mix * x_pre_l;
+                    tone_r[0] = dm * tone_r[0] + self.clean_bypass_mix * x_pre_r;
+                }
+                tone_l[0] *= self.stage2_out_gain;
+                tone_r[0] *= self.stage2_out_gain;
+            }
+        }
 
         (
             tone_l,
@@ -362,6 +531,8 @@ impl Stage2CommutedCascade {
             v1a_out_r,
             wf_adaa_l - wf_inst_l,
             wf_adaa_r - wf_inst_r,
+            x_pre_l,
+            x_pre_r,
         )
     }
 
@@ -383,10 +554,88 @@ impl Stage2CommutedCascade {
         branch_tiers: usize,
         fb: &mut [f32; 256],
     ) -> (f32, f32) {
-        let (tone_l, v1a_out_l, tone_r, v1a_out_r, wf_diff_l, wf_diff_r) =
+        let (tone_l, v1a_out_l, tone_r, v1a_out_r, wf_diff_l, wf_diff_r, x_pre_l, x_pre_r) =
             self.step_frame_lite_core(in_l, in_r, drive_gain, sag_depth, beta_tone, pwr_drive);
         let brc1_l = self.l1_state_l[5];
         let brc1_r = self.l1_state_r[5];
+
+        if self.ext_active {
+            if self.linear_v1a_v1b {
+                self.v2_basis.step_pure_lti_into_fb(
+                    x_pre_l,
+                    x_pre_r,
+                    self.l1_state_l[3],
+                    self.l1_state_r[3],
+                    self.l2_state_l[3],
+                    self.l2_state_r[3],
+                    &self.role_a_scales,
+                    branch_tiers,
+                    fb,
+                );
+            } else {
+                let mut branch_res = [((0.0, 0.0, 0.0), (0.0, 0.0, 0.0), 0.0, 0.0); 3];
+                if branch_tiers >= 2 {
+                    let (b0_l, b0_r) = Self::step_branch_shaper_stereo(
+                        &mut self.branch_state_l[0],
+                        &mut self.branch_state_r[0],
+                        &self.branch_poles[0],
+                        &self.base_branch_params[0],
+                        self.l1_state_l[1] + 0.5 * self.l1_state_l[3],
+                        self.l1_state_r[1] + 0.5 * self.l1_state_r[3],
+                    );
+                    branch_res[0] = (b0_l, b0_r, 0.0, 0.0);
+                    if branch_tiers >= 3 {
+                        let (b1_l, b1_r) = Self::step_branch_shaper_stereo(
+                            &mut self.branch_state_l[1],
+                            &mut self.branch_state_r[1],
+                            &self.branch_poles[1],
+                            &self.base_branch_params[1],
+                            b0_l.0 + 0.5 * self.l2_state_l[1],
+                            b0_r.0 + 0.5 * self.l2_state_r[1],
+                        );
+                        let (wf2_l, _) = c2_wavefolder(b1_l.0);
+                        let (wf2_r, _) = c2_wavefolder(b1_r.0);
+                        branch_res[1] = (b1_l, b1_r, wf2_l, wf2_r);
+                        if branch_tiers >= 4 {
+                            let (b2_l, b2_r) = Self::step_branch_shaper_stereo(
+                                &mut self.branch_state_l[2],
+                                &mut self.branch_state_r[2],
+                                &self.branch_poles[2],
+                                &self.base_branch_params[2],
+                                b1_l.0 + 0.5 * self.l2_state_l[3],
+                                b1_r.0 + 0.5 * self.l2_state_r[3],
+                            );
+                            let (wf3_l, _) = c2_wavefolder(b2_l.0);
+                            let (wf3_r, _) = c2_wavefolder(b2_r.0);
+                            branch_res[2] = (b2_l, b2_r, wf3_l, wf3_r);
+                        }
+                    }
+                }
+                self.v2_basis.step_wiener_hammerstein_into_fb(
+                    x_pre_l,
+                    x_pre_r,
+                    tone_l,
+                    tone_r,
+                    v1a_out_l,
+                    v1a_out_r,
+                    self.last_v1b_hyst,
+                    brc1_l,
+                    brc1_r,
+                    self.l1_state_l,
+                    self.l1_state_r,
+                    self.l2_state_l,
+                    self.l2_state_r,
+                    branch_res,
+                    wf_diff_l,
+                    wf_diff_r,
+                    self.sag_envelope,
+                    &self.role_a_scales,
+                    branch_tiers,
+                    fb,
+                );
+            }
+            return (tone_l[0], tone_r[0]);
+        }
 
         // Write Lite Stage II slots directly into fb[20..52]
         fb[20..24].copy_from_slice(&tone_l);
@@ -616,7 +865,7 @@ impl Stage2CommutedCascade {
         drive_gain: f32,
         sag_depth: f32,
     ) -> ([f32; 8], [f32; 8]) {
-        let (tone_l, v1a_out_l, tone_r, v1a_out_r, _, _) =
+        let (tone_l, v1a_out_l, tone_r, v1a_out_r, _, _, _, _) =
             self.step_frame_lite_core(in_l, in_r, drive_gain, sag_depth, 0.5, 1.0);
         (
             [

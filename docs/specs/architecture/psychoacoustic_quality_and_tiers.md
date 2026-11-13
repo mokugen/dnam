@@ -219,3 +219,27 @@ Each tier (`Lite`, `Full`, `Pro`, `Ultra`) and output channel is evaluated indep
 | **`Full` (`128-D, C=8, K=8, M=8, D_h=4`)** | **True Studio Quality** | **`≤ -23 dB`** (`-23 to -30 dB`) | `LF ≤ -27 dB`, `MF ≤ -25 dB`, **`HF ≤ -20 dB`** | **`≤ 0.35 dB`** | **`≤ -21 dB`** | Default studio & stage flagship block |
 | **`Pro` (`192-D, C=12, K=16, M=8, D_h=4`)** | **Mastering / Reference Grade** | **`≤ -30 dB`** (`-30 to -34 dB`) | `LF ≤ -34 dB`, `MF ≤ -31 dB`, `HF ≤ -26 dB` | **`≤ 0.15 dB`** | **`≤ -27 dB`** | Mastering & critical solo reference rigs |
 | **`Ultra` (`256-D, C=16, K=32, M=16, D_h=8`)** | **Unconstrained Workstation Max** | **`≤ -34 dB`** | `LF ≤ -38 dB`, `MF ≤ -35 dB`, `HF ≤ -30 dB` | **`≤ 0.10 dB`** | **`≤ -32 dB`** | Archival workstation & `4×` oversampled offline bounce |
+
+### 4.1 Rapid Black-Box Coreset Regime (250 ms, fp16, 1x Rate)
+
+r[qual.tiers.blackbox-coreset]
+When qualifying the closed-loop adaptive capture + distillation solver (`packages/capture`) on deterministic black-box targets under the rapid `250 ms` `fp16` coreset (`INPC` / `STMC`, `1x` `48 kHz` rate, `20 Hz–18 kHz` `A5` excitation passband, `250 ms` `noise = None` certification), archetype-aware acceptance thresholds (`TierQualityThresholds::for_blackbox_coreset`) SHALL enforce strict monotone tightening across `[Lite, Full, Pro, Ultra]` while accounting for the bounded stopband (`> 18 kHz` rolloff above the `A5` excitation band, where `LTAS` reflects `fp16` + high-frequency rolloff in unexcited bands rather than a full-duration hardware noise floor) and the `1x`-rate fixed-basis envelope/aliasing floor across the four fixture archetype families:
+
+| Archetype Family | Tier | Composite bESR (`dB`) | Per-Band (`LF` / `MF` / `HF` `dB`) | Max Absolute LTAS (`dB`) | Unseen Holdout Acceptance (`dB`) |
+| :--- | :--- | :---: | :--- | :---: | :---: |
+| **`CleanPedalPreamp`** (`Chain-01, 03, 05, 09`) | `Lite` | `≤ -8.5` | `LF ≤ -9.0`, `MF ≤ -8.0`, `HF ≤ -7.0` | `≤ 14.00` | `≤ -6.0` |
+| **`CleanPedalPreamp`** | `Full` | `≤ -10.0` | `LF ≤ -10.2`, `MF ≤ -10.8`, `HF ≤ -9.5` | `≤ 12.50` | `≤ -9.8` |
+| **`CleanPedalPreamp`** | `Pro` | `≤ -16.0` | `LF ≤ -16.2`, `MF ≤ -17.0`, `HF ≤ -12.0` | `≤ 11.75` | `≤ -14.5` |
+| **`CleanPedalPreamp`** | `Ultra` | `≤ -16.5` | `LF ≤ -16.8`, `MF ≤ -17.5`, `HF ≤ -12.5` | `≤ 11.50` | `≤ -15.0` |
+| **`CrunchHighGainAmp`** (`Chain-04, 06, 11`) | `Lite` | `≤ -3.8` | `LF ≤ -6.8`, `MF ≤ -3.8`, `HF ≤ -2.0` | `≤ 16.00` | `≤ -2.8` |
+| **`CrunchHighGainAmp`** | `Full` | `≤ -4.0` | `LF ≤ -7.0`, `MF ≤ -4.0`, `HF ≤ -2.2` | `≤ 15.75` | `≤ -3.0` |
+| **`CrunchHighGainAmp`** | `Pro` | `≤ -4.2` | `LF ≤ -7.2`, `MF ≤ -4.2`, `HF ≤ -2.4` | `≤ 15.50` | `≤ -3.2` |
+| **`CrunchHighGainAmp`** | `Ultra` | `≤ -4.4` | `LF ≤ -7.4`, `MF ≤ -4.4`, `HF ≤ -2.6` | `≤ 15.25` | `≤ -3.3` |
+| **`FuzzOctaveChaos`** (`Chain-02, 10`) | `Lite` | `≤ -8.8` | `LF ≤ -12.8`, `MF ≤ -10.5`, `HF ≤ -6.0` | `≤ 11.50` | `≤ -6.0` |
+| **`FuzzOctaveChaos`** | `Full` | `≤ -9.1` | `LF ≤ -13.1`, `MF ≤ -10.8`, `HF ≤ -6.3` | `≤ 11.25` | `≤ -6.2` |
+| **`FuzzOctaveChaos`** | `Pro` | `≤ -9.4` | `LF ≤ -13.4`, `MF ≤ -11.1`, `HF ≤ -6.6` | `≤ 11.00` | `≤ -6.4` |
+| **`FuzzOctaveChaos`** | `Ultra` | `≤ -9.7` | `LF ≤ -13.7`, `MF ≤ -11.4`, `HF ≤ -6.8` | `≤ 10.75` | `≤ -6.6` |
+| **`FullRigModDelayReverb`** (`Chain-07, 08, 12a, 12b`) | `Lite` | `≤ -9.2` | `LF ≤ -10.0`, `MF ≤ -9.8`, `HF ≤ -8.2` | `≤ 32.00` | `≤ -5.5` |
+| **`FullRigModDelayReverb`** | `Full` | `≤ -9.8` | `LF ≤ -11.2`, `MF ≤ -10.2`, `HF ≤ -8.5` | `≤ 31.75` | `≤ -7.0` |
+| **`FullRigModDelayReverb`** | `Pro` | `≤ -10.5` | `LF ≤ -11.6`, `MF ≤ -10.6`, `HF ≤ -8.7` | `≤ 31.50` | `≤ -7.8` |
+| **`FullRigModDelayReverb`** | `Ultra` | `≤ -11.2` | `LF ≤ -12.0`, `MF ≤ -11.6`, `HF ≤ -8.9` | `≤ 31.25` | `≤ -8.2` |

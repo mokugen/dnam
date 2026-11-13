@@ -379,12 +379,22 @@ pub(crate) fn pack_tier_feature_bus_into(
     tank_l: f32,
     tank_r: f32,
     loop_tiers: usize,
+    pure_lti_v2: bool,
 ) {
     // Tier 0 — Lite (0..64):
     // 0..4: Stage III Kautz Block 0 (populated by Kautz loop)
-    // 4..12: Stage I T1 Sub-Harmonic Tracker L/R (8 floats)
-    fb[4..8].copy_from_slice(&stage1.last_tracker_l);
-    fb[8..12].copy_from_slice(&stage1.last_tracker_r);
+    // 4..12: Stage I T1 Sub-Harmonic Tracker L/R (8 floats; zeroed on Pure-LTI unless ext SVF/Chorus writes linear taps)
+    let mute_nl_stage1 = pure_lti_v2
+        && (!stage1.ext_active
+            || (stage1.svf_mix <= 1.0e-6
+                && stage1.chorus_wet_mix <= 1.0e-6
+                && stage1.rotary_am_depth <= 1.0e-6));
+    if mute_nl_stage1 {
+        fb[4..12].copy_from_slice(&[0.0; 8]);
+    } else {
+        fb[4..8].copy_from_slice(&stage1.last_tracker_l);
+        fb[8..12].copy_from_slice(&stage1.last_tracker_r);
+    }
     // 12..20: Stage I Pre-FX Stereo Op-M[Pre] z_re L/R (8 floats)
     fb[12..16].copy_from_slice(&stage1.op_m_pre.z_re);
     fb[16..20].copy_from_slice(&stage1.op_m_pre_r.z_re);
@@ -415,18 +425,24 @@ pub(crate) fn pack_tier_feature_bus_into(
             // 136..152: Stage I Pre-FX Pro Group 2 (16 floats: delta Op-M z_im L/R + Op-N/Op-T intermediate taps)
             fb[136..140].copy_from_slice(&stage1.op_m_pre_delta_l.z_im);
             fb[140..144].copy_from_slice(&stage1.op_m_pre_delta_r.z_im);
-            fb[144..148].copy_from_slice(&[
-                stage1.last_op_n_l,
-                stage1.last_op_n_r,
-                stage1.last_op_t_l,
-                stage1.last_op_t_r,
-            ]);
-            fb[148..152].copy_from_slice(&[
-                stage1.last_op_t_l - stage1.prev_op_t_l,
-                stage1.last_op_t_r - stage1.prev_op_t_r,
-                stage1.op_m_pre.z_im[0],
-                stage1.op_m_pre_r.z_im[0],
-            ]);
+            if mute_nl_stage1 {
+                fb[144..150].copy_from_slice(&[0.0; 6]);
+                fb[150] = stage1.op_m_pre.z_im[0];
+                fb[151] = stage1.op_m_pre_r.z_im[0];
+            } else {
+                fb[144..148].copy_from_slice(&[
+                    stage1.last_op_n_l,
+                    stage1.last_op_n_r,
+                    stage1.last_op_t_l,
+                    stage1.last_op_t_r,
+                ]);
+                fb[148..152].copy_from_slice(&[
+                    stage1.last_op_t_l - stage1.prev_op_t_l,
+                    stage1.last_op_t_r - stage1.prev_op_t_r,
+                    stage1.op_m_pre.z_im[0],
+                    stage1.op_m_pre_r.z_im[0],
+                ]);
+            }
             // 152..184: Stage II Commuted Cascade Pro (populated by step_frame_into_feature_bus)
             // 184..190: Stage IV Spatial Tank Pro (populated by read_multi_tier_taps_into)
             // 190..192: Stage III Early FIR Segment 2 L/R (2 floats, taps 32..47)
@@ -443,8 +459,16 @@ pub(crate) fn pack_tier_feature_bus_into(
                 fb[220..224].copy_from_slice(&[
                     stage1.dc_blocker_l.prev_d,
                     stage1.dc_blocker_r.prev_d,
-                    stage1.prev_op_t_l,
-                    stage1.prev_op_t_r,
+                    if mute_nl_stage1 {
+                        0.0
+                    } else {
+                        stage1.prev_op_t_l
+                    },
+                    if mute_nl_stage1 {
+                        0.0
+                    } else {
+                        stage1.prev_op_t_r
+                    },
                 ]);
                 // 224..246: Stage II Commuted Cascade Ultra (populated by step_frame_into_feature_bus)
                 // 246..254: Stage IV Spatial Tank Ultra (populated by read_multi_tier_taps_into)

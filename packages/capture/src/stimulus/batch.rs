@@ -26,9 +26,10 @@ use super::laws::TopologyProbeMode;
 use super::safeguards::{CaptureWarning, SafeguardState, evaluate_frame_safeguards};
 pub use super::sealing::recapture_clipped_stem;
 pub(crate) use super::sealing::{
-    CORESET_WITH_SETTLE_48K, align_full_stem_and_seal_vault, build_controls_meta_map,
+    CORESET_WITH_SETTLE_48K, align_full_stem_and_seal_vault_with_override, build_controls_meta_map,
     build_freeze_transition_stem_stimulus, control_declared_bounds, default_control_vector,
-    normalize_stem_channel_to_48k, resample_48k_channels_to_sr, seal_coresets_to_inpc_and_vault,
+    normalize_stem_channel_to_48k, resample_48k_channels_to_sr,
+    seal_coresets_to_inpc_and_vault_with_override,
 };
 use super::waveforms::{
     ActivePrimitiveKind, deterministic_seed_256, synthesize_a3_monophonic_glissando,
@@ -120,6 +121,7 @@ pub fn generate_stimulus_batch(
 
     let mut base_wave_l_48k =
         Vec::with_capacity(6 * ADAPTIVE_FRAME_SAMPLES + CORESET_WITH_SETTLE_48K);
+    base_wave_l_48k.extend_from_slice(&coreset_l);
     base_wave_l_48k.extend_from_slice(&comb_l.samples);
     base_wave_l_48k.extend_from_slice(&comb_l.samples);
     for ep_f in 0..4 {
@@ -130,13 +132,10 @@ pub fn generate_stimulus_batch(
             ADC_PEAK_GOVERNOR_FS,
         ));
     }
-    let active_prefix_48k = base_wave_l_48k.len();
-    base_wave_l_48k.extend_from_slice(&coreset_l);
 
-    let base_wave_r_48k = coreset_r.map(|cr| {
-        let mut wr = base_wave_l_48k[..active_prefix_48k].to_vec();
-        wr.extend_from_slice(&cr);
-        wr
+    let base_wave_r_48k = coreset_r.map(|mut cr| {
+        cr.extend_from_slice(&base_wave_l_48k[CORESET_WITH_SETTLE_48K..]);
+        cr
     });
     let base_aux_48k = if need_aux {
         let sched_r = build_disjoint_comb_schedule(
@@ -157,13 +156,39 @@ pub fn generate_stimulus_batch(
             &[0.0; 64],
         );
         let mut aux = Vec::with_capacity(base_wave_l_48k.len());
+        aux.extend_from_slice(&coreset_l);
         aux.extend_from_slice(&comb_aux.samples);
         aux.extend_from_slice(&comb_aux.samples);
-        aux.extend_from_slice(&base_wave_l_48k[2 * ADAPTIVE_FRAME_SAMPLES..]);
+        aux.extend_from_slice(
+            &base_wave_l_48k[CORESET_WITH_SETTLE_48K + 2 * ADAPTIVE_FRAME_SAMPLES..],
+        );
         Some(aux)
     } else {
         None
     };
+
+    let tail_pad = 8 * ADAPTIVE_FRAME_SAMPLES;
+    let mut star_wave_l_48k = Vec::with_capacity(base_wave_l_48k.len() + tail_pad);
+    star_wave_l_48k.extend_from_slice(&base_wave_l_48k);
+    star_wave_l_48k.resize(base_wave_l_48k.len() + tail_pad, 0.0);
+    let star_wave_r_48k = base_wave_r_48k.as_ref().map(|r| {
+        let mut sr_buf = Vec::with_capacity(r.len() + tail_pad);
+        sr_buf.extend_from_slice(r);
+        sr_buf.resize(r.len() + tail_pad, 0.0);
+        sr_buf
+    });
+    let star_aux_48k = base_aux_48k.as_ref().map(|a| {
+        let mut sa_buf = Vec::with_capacity(a.len() + tail_pad);
+        sa_buf.extend_from_slice(a);
+        sa_buf.resize(a.len() + tail_pad, 0.0);
+        sa_buf
+    });
+    let (star_wave_l, star_wave_r, star_aux) = resample_48k_channels_to_sr(
+        sr,
+        &star_wave_l_48k,
+        star_wave_r_48k.as_deref(),
+        star_aux_48k.as_deref(),
+    );
 
     let (base_wave_l, base_wave_r, base_aux) = resample_48k_channels_to_sr(
         sr,
@@ -176,9 +201,9 @@ pub fn generate_stimulus_batch(
     let mut stems = vec![StemStimulus {
         stem_id: "star_center".to_string(),
         sample_rate_hz: sr,
-        in_1: base_wave_l.clone(),
-        in_2: base_wave_r.clone(),
-        in_3: base_aux.clone(),
+        in_1: star_wave_l,
+        in_2: star_wave_r,
+        in_3: star_aux,
         in_4: None,
         control_values: base_ctrls.clone(),
         control_trajectories: None,
@@ -213,7 +238,16 @@ pub fn generate_stimulus_batch(
                         )
                     });
                 if force_mode_b {
-                    for (si, &u) in [lo, hi].iter().enumerate() {
+                    let span = (hi - lo).max(1e-6);
+                    let mid_u = 0.5 * (lo + hi);
+                    let stops = if (base_ctrls[p_idx] - lo).abs() < 0.08 * span {
+                        [mid_u, hi]
+                    } else if (base_ctrls[p_idx] - hi).abs() < 0.08 * span {
+                        [lo, mid_u]
+                    } else {
+                        [lo, hi]
+                    };
+                    for (si, &u) in stops.iter().enumerate() {
                         let mut v = base_ctrls.clone();
                         v[p_idx] = u;
                         stems.push(StemStimulus {
@@ -230,7 +264,8 @@ pub fn generate_stimulus_batch(
                     }
                 } else {
                     let n = base_wave_l.len();
-                    let prefix_sr = (active_prefix_48k as u64 * u64::from(sr) / 48_000) as usize;
+                    let settle_sr =
+                        ((CORESET_WITH_SETTLE_48K as u64 * u64::from(sr)) / 48_000).max(1) as usize;
                     let coreset_sr = ((CORESET_FP16_FRAMES_PER_STEM as u64 * u64::from(sr))
                         / 48_000)
                         .max(1) as usize;
@@ -240,10 +275,11 @@ pub fn generate_stimulus_batch(
                             trajs.push(
                                 (0..n)
                                     .map(|i| {
-                                        let frac = if i < prefix_sr {
-                                            i as f32 / (prefix_sr.max(1) as f32)
+                                        let frac = if i < settle_sr {
+                                            (i as f32 / (coreset_sr as f32)).clamp(0.0, 1.0)
                                         } else {
-                                            ((i - prefix_sr) as f32 / (coreset_sr as f32))
+                                            ((i - settle_sr) as f32
+                                                / (n.saturating_sub(settle_sr).max(1) as f32))
                                                 .clamp(0.0, 1.0)
                                         };
                                         lo + (hi - lo) * frac
@@ -271,7 +307,12 @@ pub fn generate_stimulus_batch(
             }
             ControlKind::Switch => {
                 let opts = ctrl.declared_options.as_deref().unwrap_or(&[]);
-                for opt_idx in 1..opts.len() {
+                let def_opt =
+                    (base_ctrls[p_idx].round() as usize).min(opts.len().saturating_sub(1));
+                for opt_idx in 0..opts.len() {
+                    if opt_idx == def_opt {
+                        continue;
+                    }
                     let mut v = base_ctrls.clone();
                     v[p_idx] = opt_idx as f32;
                     stems.push(StemStimulus {
@@ -333,19 +374,29 @@ pub fn generate_refinement_stimulus_batch(
             .map(|r| normalize_stem_channel_to_48k(r, resp.sample_rate_hz));
 
         let mut sg = SafeguardState::new(stim.stem_id.clone(), false, -100.0);
+        let comb_off = if dry_48k.len() >= CORESET_WITH_SETTLE_48K + ADAPTIVE_FRAME_SAMPLES
+            && wet_48k.len() >= CORESET_WITH_SETTLE_48K + ADAPTIVE_FRAME_SAMPLES
+        {
+            CORESET_WITH_SETTLE_48K
+        } else {
+            0
+        };
         let _ = evaluate_frame_safeguards(
             &mut sg,
             0,
-            &dry_48k[..ADAPTIVE_FRAME_SAMPLES],
-            &wet_48k[..ADAPTIVE_FRAME_SAMPLES],
-            wet_r_48k
-                .as_deref()
-                .map(|r| &r[..ADAPTIVE_FRAME_SAMPLES.min(r.len())]),
+            &dry_48k[comb_off..comb_off + ADAPTIVE_FRAME_SAMPLES],
+            &wet_48k[comb_off..comb_off + ADAPTIVE_FRAME_SAMPLES],
+            wet_r_48k.as_deref().map(|r| {
+                let end = (comb_off + ADAPTIVE_FRAME_SAMPLES).min(r.len());
+                let st = comb_off.min(end);
+                &r[st..end]
+            }),
             &sched,
         );
 
-        let check_len = wet_48k.len().min(2 * ADAPTIVE_FRAME_SAMPLES);
-        let out_rms = (wet_48k[..check_len]
+        let check_end = (comb_off + 2 * ADAPTIVE_FRAME_SAMPLES).min(wet_48k.len());
+        let check_len = check_end.saturating_sub(comb_off).max(1);
+        let out_rms = (wet_48k[comb_off..check_end]
             .iter()
             .map(|&x| f64::from(x) * f64::from(x))
             .sum::<f64>()
@@ -370,8 +421,11 @@ pub fn generate_refinement_stimulus_batch(
 
     let mut ref_stems = Vec::new();
     if let Some(ctrls) = oc2_ctrls {
-        let mut wave_48k = synthesize_a3_monophonic_glissando(48_000, 0.75 * ADC_PEAK_GOVERNOR_FS);
-        wave_48k.extend_from_slice(&coreset_l_48k);
+        let mut wave_48k = coreset_l_48k.clone();
+        wave_48k.extend_from_slice(&synthesize_a3_monophonic_glissando(
+            48_000,
+            0.75 * ADC_PEAK_GOVERNOR_FS,
+        ));
         let (in_1, _, _) = resample_48k_channels_to_sr(sr, &wave_48k, None, None);
         ref_stems.push(StemStimulus {
             stem_id: "refinement_oc2_glissando".to_string(),
@@ -385,13 +439,13 @@ pub fn generate_refinement_stimulus_batch(
             freeze_transition_window: None,
         });
     } else if let Some(ctrls) = gate_ctrls {
-        let mut wave_48k = synthesize_active_primitive_frame(
+        let mut wave_48k = coreset_l_48k.clone();
+        wave_48k.extend_from_slice(&synthesize_active_primitive_frame(
             ActivePrimitiveKind::P2MultiDriveBurst,
             0,
             false,
             ADC_PEAK_GOVERNOR_FS,
-        );
-        wave_48k.extend_from_slice(&coreset_l_48k);
+        ));
         let (in_1, _, _) = resample_48k_channels_to_sr(sr, &wave_48k, None, None);
         ref_stems.push(StemStimulus {
             stem_id: "refinement_gate_open".to_string(),
@@ -414,8 +468,8 @@ pub fn generate_refinement_stimulus_batch(
             ADC_PEAK_GOVERNOR_FS * scale,
             &[0.0; 64],
         );
-        let mut wave_48k = comb.samples;
-        wave_48k.extend(coreset_l_48k.iter().map(|&s| s * (scale as f32)));
+        let mut wave_48k: Vec<f32> = coreset_l_48k.iter().map(|&s| s * (scale as f32)).collect();
+        wave_48k.extend_from_slice(&comb.samples);
         let (in_1, _, _) = resample_48k_channels_to_sr(sr, &wave_48k, None, None);
         ref_stems.push(StemStimulus {
             stem_id: "refinement_clip_backoff".to_string(),
@@ -645,6 +699,7 @@ pub fn solve_from_responses(
     let mut inpc_built: Option<Vec<u8>> = None;
     let mut warnings = Vec::new();
     let mut specs = Vec::new();
+    let mut shared_align: Option<(f64, bool)> = None;
 
     for &(batch, resps) in batches {
         if batch.stems.len() != resps.len() {
@@ -679,27 +734,37 @@ pub fn solve_from_responses(
                 false,
                 calb.map_or(-100.0, |c| c.noise_floor_dbfs),
             );
-            if dry_48k_l.len() >= ADAPTIVE_FRAME_SAMPLES
-                && wet_48k_l.len() >= ADAPTIVE_FRAME_SAMPLES
+            let comb_off = if dry_48k_l.len() >= CORESET_WITH_SETTLE_48K + ADAPTIVE_FRAME_SAMPLES
+                && wet_48k_l.len() >= CORESET_WITH_SETTLE_48K + ADAPTIVE_FRAME_SAMPLES
+            {
+                CORESET_WITH_SETTLE_48K
+            } else {
+                0
+            };
+            if dry_48k_l.len() >= comb_off + ADAPTIVE_FRAME_SAMPLES
+                && wet_48k_l.len() >= comb_off + ADAPTIVE_FRAME_SAMPLES
             {
                 let _ = evaluate_frame_safeguards(
                     &mut sg,
                     0,
-                    &dry_48k_l[..ADAPTIVE_FRAME_SAMPLES],
-                    &wet_48k_l[..ADAPTIVE_FRAME_SAMPLES],
-                    wet_48k_r
-                        .as_deref()
-                        .map(|r| &r[..ADAPTIVE_FRAME_SAMPLES.min(r.len())]),
+                    &dry_48k_l[comb_off..comb_off + ADAPTIVE_FRAME_SAMPLES],
+                    &wet_48k_l[comb_off..comb_off + ADAPTIVE_FRAME_SAMPLES],
+                    wet_48k_r.as_deref().map(|r| {
+                        let end = (comb_off + ADAPTIVE_FRAME_SAMPLES).min(r.len());
+                        let st = comb_off.min(end);
+                        &r[st..end]
+                    }),
                     &sched,
                 );
             }
             warnings.extend(sg.warnings);
 
-            let (windows, sw_overrides, user_meta) =
+            let (windows, sw_overrides, mut user_meta) =
                 infer_batch_stem_windows_and_switches(&manifest, &base_ctrls, stim);
             let is_star = specs.is_empty();
+            let is_freeze = stim.freeze_transition_window.is_some();
             let meta = build_controls_meta_map(&manifest, &stim.control_values, &sw_overrides);
-            let (inpc, spec) = align_full_stem_and_seal_vault(
+            let (inpc, mut spec, lag, pol) = align_full_stem_and_seal_vault_with_override(
                 &stim.stem_id,
                 is_star,
                 &seed_256,
@@ -711,8 +776,51 @@ pub fn solve_from_responses(
                 wet_48k_r.as_deref(),
                 windows,
                 meta,
-                user_meta,
+                BTreeMap::new(),
+                if is_star || is_freeze {
+                    None
+                } else {
+                    shared_align
+                },
             )?;
+            if is_star {
+                shared_align = Some((lag, pol));
+                let coreset_end = CORESET_WITH_SETTLE_48K
+                    .min(dry_48k_l.len())
+                    .min(wet_48k_l.len());
+                let coreset_dry_l = &dry_48k_l[..coreset_end];
+                let coreset_dry_r = dry_48k_r.as_deref().map(|r| &r[..coreset_end.min(r.len())]);
+                let coreset_wet_l = &wet_48k_l[..coreset_end];
+                let coreset_wet_r = wet_48k_r.as_deref().map(|r| &r[..coreset_end.min(r.len())]);
+                let comb_end = (comb_off + ADAPTIVE_FRAME_SAMPLES)
+                    .min(dry_48k_l.len())
+                    .min(wet_48k_l.len());
+                let comb_dry_l = &dry_48k_l[comb_off.min(comb_end)..comb_end];
+                let comb_wet_l = &wet_48k_l[comb_off.min(comb_end)..comb_end];
+                let comb_wet_r = wet_48k_r.as_deref().map(|r| {
+                    let end = (comb_off + ADAPTIVE_FRAME_SAMPLES).min(r.len());
+                    let st = comb_off.min(end);
+                    &r[st..end]
+                });
+                let tail_start = (comb_off + 6 * ADAPTIVE_FRAME_SAMPLES).min(wet_48k_l.len());
+                let tail_wet_l = &wet_48k_l[tail_start..];
+                let tail_wet_r = wet_48k_r.as_deref().map(|r| &r[tail_start.min(r.len())..]);
+                let phys = super::physics_probe::extract_star_physics_from_audio(
+                    coreset_dry_l,
+                    coreset_dry_r,
+                    coreset_wet_l,
+                    coreset_wet_r,
+                    comb_dry_l,
+                    comb_wet_l,
+                    comb_wet_r,
+                    tail_wet_l,
+                    tail_wet_r,
+                    &sched.carrier_bins,
+                );
+                spec.extracted_physics = Some(phys.extracted);
+                user_meta.extend(phys.metadata);
+            }
+            spec.user_metadata = user_meta;
             if inpc_built.is_none() {
                 inpc_built = Some(inpc);
             }

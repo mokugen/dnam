@@ -111,6 +111,10 @@ reason = "Offline duration-weighted SegESR companion metric owned by packages/ca
 scope = "out-of-scope"
 reason = "Offline 4-tier psychoacoustic benchmark qualification matrix owned by packages/capture"
 
+[rules."qual.tiers.blackbox-coreset"]
+scope = "out-of-scope"
+reason = "Offline 250 ms fp16 1x-rate black-box coreset archetype tier thresholds owned by packages/capture"
+
 # ==============================================================================
 # 3. Architecture: TORA System Overview (`docs/specs/architecture/tora_architecture.md`)
 # ==============================================================================

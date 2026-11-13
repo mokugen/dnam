@@ -12,6 +12,7 @@ use dnam_engine::FtzDazGuard;
 use dnam_engine::provenance::{STAGE3_KAUTZ_BASES, STAGE3_KAUTZ_BLOCKS_PER_TIER};
 use dnam_engine::schema::ControlKind;
 use dnam_engine::stages::Stage2CommutedCascade;
+use dnam_engine::stages::weights::{PIPE_FLAG_STAGE4_EXT, has_pipeline_flag};
 
 use crate::proj::capsules::StmcTrajectoryWindow;
 use crate::proj::schema::{AuditReport, DnamProjManifest, StemRegistryEntry};
@@ -591,21 +592,53 @@ fn run_3phase_arena_audit_with_mode(
         }
 
         if arena_64k.len() >= 4_716 {
+            let stage4_ext = has_pipeline_flag(arena_64k, PIPE_FLAG_STAGE4_EXT);
             for l in 0..4 {
                 let d = read_arena_f32(arena_64k, 4_672 + l * 4);
                 if d != 0.0 && (!d.is_finite() || !(4.0..=255.0).contains(&d)) {
                     write_arena_f32(arena_64k, 4_672 + l * 4, d.clamp(4.0, 255.0));
                     phase1_set.insert("CLAMP-STABILITY".to_string());
                 }
-                let a_diff = read_arena_f32(arena_64k, 4_700 + l * 4);
-                if a_diff != 0.0 && (!a_diff.is_finite() || a_diff.abs() > 0.75) {
-                    let c_ad = if a_diff.is_finite() {
-                        a_diff.clamp(-0.75, 0.75)
-                    } else {
-                        0.0
-                    };
-                    write_arena_f32(arena_64k, 4_700 + l * 4, c_ad);
-                    phase1_set.insert("CLAMP-STABILITY".to_string());
+                if !stage4_ext || l == 0 {
+                    let a_diff = read_arena_f32(arena_64k, 4_700 + l * 4);
+                    if a_diff != 0.0 && (!a_diff.is_finite() || a_diff.abs() > 0.75) {
+                        let c_ad = if a_diff.is_finite() {
+                            a_diff.clamp(-0.75, 0.75)
+                        } else {
+                            0.0
+                        };
+                        write_arena_f32(arena_64k, 4_700 + l * 4, c_ad);
+                        phase1_set.insert("CLAMP-STABILITY".to_string());
+                    }
+                }
+            }
+            if stage4_ext && arena_64k.len() >= 4_772 {
+                let ext_bounds: [(usize, f32, f32); 17] = [
+                    (4_704, 0.0, 4.0),
+                    (4_708, 0.0, 4.0),
+                    (4_712, 0.0, 48_000.0),
+                    (4_716, 0.0, 48_000.0),
+                    (4_720, -0.995, 0.995),
+                    (4_724, -0.995, 0.995),
+                    (4_728, 0.0, 0.9999),
+                    (4_732, 0.0, 4.0),
+                    (4_736, 0.0, 48_000.0),
+                    (4_740, 0.0, 48_000.0),
+                    (4_744, 0.0, 48_000.0),
+                    (4_748, 0.0, 48_000.0),
+                    (4_752, -0.995, 0.995),
+                    (4_756, 0.0, 0.9999),
+                    (4_760, 0.0, 1.0),
+                    (4_764, 0.0, 2_048.0),
+                    (4_768, 0.0, 50.0),
+                ];
+                for &(off, lo, hi) in &ext_bounds {
+                    let v = read_arena_f32(arena_64k, off);
+                    if !v.is_finite() || v < lo || v > hi {
+                        let clamped = if v.is_finite() { v.clamp(lo, hi) } else { 0.0 };
+                        write_arena_f32(arena_64k, off, clamped);
+                        phase1_set.insert("CLAMP-STABILITY".to_string());
+                    }
                 }
             }
             let g_loop = read_arena_f32(arena_64k, 4_688);

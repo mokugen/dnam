@@ -181,6 +181,7 @@ fn build_demo_dnam_container() -> AlignedBuffer<CacheLine64> {
         stage2_cascade: Stage2CascadeConfig::default(),
         stage3_cabinet: Stage3CabinetKautzConfig::default(),
         stage4_tank: Stage4SpatialTankConfig::default(),
+        delay_histories: Vec::new(),
         tensor_directory: BTreeMap::new(),
     };
     header.io_config.capabilities.supports_freeze = true;

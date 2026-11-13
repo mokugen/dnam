@@ -209,72 +209,167 @@ pub fn synthesize_a5_musical_transient_coreset(
         let q2 = num_frames / 2;
         let q3 = (3 * num_frames) / 4;
 
+        let f_nyq_safe = 0.375 * sr;
         let jitter = (((splitmix64(rng) >> 16) as f64) / ((1u64 << 48) as f64) - 0.5) * 0.02;
         let freqs_pluck = [82.406_89 * (1.0 + jitter), 146.832_38, 246.941_65];
+        let pluck_gains = [0.42, 0.68, 0.92];
         let sub_len = (q1 / 3).max(1);
         for (i, slot) in buf.iter_mut().enumerate().take(q1) {
             let note_idx = (i / sub_len).min(2);
             let local_n = i % sub_len;
             let t = (local_n as f64) / sr;
             let f = freqs_pluck[note_idx] * pan_skew;
-            let attack = 1.0 - (-t / 0.0012).exp();
-            let decay = (-t / 0.045).exp();
+            let attack = 1.0 - (-t / 0.0007).exp();
+            let decay = (-t / 0.032).exp();
             let mut s = 0.0_f64;
-            for h in 1..=6 {
+            for h in 1..=14 {
                 let hf = f * (h as f64);
-                if hf < 0.45 * sr {
-                    let h_decay = (-t * (h as f64) * 9.0).exp();
-                    s += (1.0 / (h as f64)) * h_decay * (2.0 * PI * hf * t).sin();
+                if hf < f_nyq_safe {
+                    let h_decay = (-t * (h as f64) * 3.5).exp();
+                    s += (1.0 / (h as f64).powf(0.75)) * h_decay * (2.0 * PI * hf * t).sin();
                 }
             }
-            *slot = 0.65 * attack * decay * s;
+            *slot = pluck_gains[note_idx] * attack * decay * s;
         }
 
+        // [25..50%]: Stepped palm-muted chugs + low-level gated release tails + pick HF snap
         let chug_len = ((q2 - q1) / 3).max(1);
+        let chug_amps = [0.88, 0.32, 0.09];
         for i in q1..q2 {
+            let chug_idx = ((i - q1) / chug_len).min(2);
             let local = (i - q1) % chug_len;
             let t = (local as f64) / sr;
-            let env = (1.0 - (-t / 0.0008).exp()) * (-t / 0.018).exp();
+            let env = (1.0 - (-t / 0.0005).exp()) * (-t / 0.014).exp();
             let f = 92.498_6 * pan_skew;
             let noise_u = (((splitmix64(rng) >> 16) as f64) / ((1u64 << 48) as f64)) - 0.5;
-            let pick = noise_u * (-t / 0.0025).exp();
-            buf[i] = env
-                * (0.75 * (2.0 * PI * f * t).sin() + 0.35 * (4.0 * PI * f * t).sin() + 0.35 * pick);
+            let noise_v = (((splitmix64(rng) >> 16) as f64) / ((1u64 << 48) as f64)) - 0.5;
+            // First-difference shaped HF transient snap (minimal sub-Nyquist foldover)
+            let snap = (noise_u - 0.65 * noise_v) * (-t / 0.003).exp();
+            buf[i] = chug_amps[chug_idx]
+                * env
+                * (0.72 * (2.0 * PI * f * t).sin()
+                    + 0.35 * (4.0 * PI * f * t).sin()
+                    + 0.22 * (6.0 * PI * f * t).sin()
+                    + 0.45 * snap);
         }
 
-        let chord_freqs = [110.0, 164.813_78, 220.0, 277.182_63, 440.0, 659.255_1];
+        // [50..75%]: Rich multi-octave chord + stepped dynamic compression probe (20 Hz..18 kHz)
+        let chord_freqs = [
+            55.0, 110.0, 164.813_78, 220.0, 277.182_63, 440.0, 659.255_1, 1318.51, 2637.02,
+            5274.04, 10548.08,
+        ];
+        let q3_len = q3.saturating_sub(q2).max(1);
+        let mut chord_lp = 0.0_f64;
         for (idx, slot) in buf[q2..q3].iter_mut().enumerate() {
             let t = (idx as f64) / sr;
-            let env = (1.0 - (-t / 0.002).exp()) * (-t / 0.095).exp();
+            let dyn_step = if idx < q3_len / 3 {
+                1.0
+            } else if idx < (2 * q3_len) / 3 {
+                0.35
+            } else {
+                0.75
+            };
+            let env = (1.0 - (-t / 0.0012).exp()) * (-t / 0.085).exp() * dyn_step;
             let mut s = 0.0_f64;
             for (k, &cf) in chord_freqs.iter().enumerate() {
-                let f = cf * (1.0 + 0.003 * ((k as f64) - 2.5) * (pan_skew - 1.0));
-                if f < 0.45 * sr {
-                    s += (1.0 / ((k + 1) as f64).sqrt())
+                let f = cf * (1.0 + 0.003 * ((k as f64) - 5.0) * (pan_skew - 1.0));
+                if f < f_nyq_safe {
+                    s += (1.0 / ((k + 1) as f64).powf(0.45))
                         * (2.0 * PI * f * t + (k as f64) * 0.7).sin();
                 }
             }
-            *slot = 0.48 * env * s;
+            // Add subtle pink noise floor for dense inter-bin excitation
+            let nu = (((splitmix64(rng) >> 16) as f64) / ((1u64 << 48) as f64)) - 0.5;
+            chord_lp = 0.55 * chord_lp + 0.45 * nu;
+            *slot = 0.38 * env * s + 0.14 * dyn_step * chord_lp;
         }
 
-        // Final quarter: crisp transient burst in first 30% followed by clean decay gap
+        // [75..100%]: Analytic 25 Hz..19.5 kHz log-chirp (< 1 dB droop at 18 kHz) + percussive burst
+        // followed by clean natural decay gap so early reflections & reverb/delay tails ring cleanly.
         let q4_len = num_frames.saturating_sub(q3);
-        let burst_end = (q4_len * 3) / 10;
+        let burst_end = (q4_len * 55) / 100;
+        let f_start = 25.0_f64;
+        let f_end = 17_500.0_f64.min(f_nyq_safe);
+        let t_sweep = ((burst_end.max(2)) as f64) / sr;
+        let ln_ratio = (f_end / f_start).max(1.01).ln();
+        let fade_samples = (burst_end / 16).max(8);
         for idx in 0..burst_end {
             let t = (idx as f64) / sr;
-            let env = (1.0 - (-t / 0.0006).exp()) * (-t / 0.012).exp();
+            let phase = (2.0 * PI * f_start * t_sweep / ln_ratio)
+                * ((ln_ratio * (t / t_sweep)).exp() - 1.0)
+                + 0.35 * (pan_skew - 1.0) * 100.0;
+            let win_in = if idx < fade_samples {
+                0.5 * (1.0 - (PI * (idx as f64) / (fade_samples as f64)).cos())
+            } else {
+                1.0
+            };
+            let rem = burst_end.saturating_sub(1 + idx);
+            let win_out = if rem < fade_samples {
+                0.5 * (1.0 - (PI * (rem as f64) / (fade_samples as f64)).cos())
+            } else {
+                1.0
+            };
+            let imp_env = (1.0 - (-t / 0.0004).exp()) * (-t / 0.010).exp();
             let noise_u = (((splitmix64(rng) >> 16) as f64) / ((1u64 << 48) as f64)) - 0.5;
-            buf[q3 + idx] = env * (0.8 * noise_u + 0.5 * (2.0 * PI * 330.0 * pan_skew * t).sin());
+            let burst_transient =
+                imp_env * (0.45 * noise_u + 0.25 * (2.0 * PI * 330.0 * pan_skew * t).sin());
+            buf[q3 + idx] = 0.58 * win_in * win_out * phase.sin() + burst_transient;
         }
 
-        // Two-pass zero-phase [0.25, 0.5, 0.25] Nyquist-nulling anti-imaging filter
-        for _ in 0..2 {
-            let prev = buf.clone();
-            for i in 1..num_frames.saturating_sub(1) {
-                buf[i] = 0.25 * prev[i - 1] + 0.5 * prev[i] + 0.25 * prev[i + 1];
+        // Perform smooth raised-cosine tapered DC removal only over the active burst region
+        // BEFORE the zero-phase 25-tap lowpass so the silent decay tail stays strictly zero.
+        let active_end = (q3 + burst_end).min(num_frames);
+        if active_end > 2 {
+            let sum_x: f64 = buf[..active_end].iter().sum();
+            let denom = (active_end - 1) as f64;
+            let mut sum_w = 0.0_f64;
+            for idx in 0..active_end {
+                let w = 0.5 * (1.0 - (2.0 * PI * (idx as f64) / denom).cos());
+                sum_w += w;
+            }
+            if sum_w > 1.0e-12 {
+                let dc_scale = sum_x / sum_w;
+                for (idx, slot) in buf[..active_end].iter_mut().enumerate() {
+                    let w = 0.5 * (1.0 - (2.0 * PI * (idx as f64) / denom).cos());
+                    *slot -= dc_scale * w;
+                }
             }
         }
 
+        // Zero-phase 25-tap Blackman-sinc lowpass (fc = 0.375 cycles/sample) to suppress >18 kHz
+        // PRNG snap energy so round-trip Kaiser-64 fractional resampling achieves < -65 dB null.
+        let half = 12_isize;
+        let fc = 0.375_f64;
+        let mut taps = [0.0_f64; 25];
+        let mut tap_sum = 0.0_f64;
+        for k in -half..=half {
+            let x = k as f64;
+            let sinc = if k == 0 {
+                2.0 * fc
+            } else {
+                (2.0 * PI * fc * x).sin() / (PI * x)
+            };
+            let u = ((k + half) as f64) / ((2 * half) as f64);
+            let win = 0.42 - 0.5 * (2.0 * PI * u).cos() + 0.08 * (4.0 * PI * u).cos();
+            let w = sinc * win;
+            taps[(k + half) as usize] = w;
+            tap_sum += w;
+        }
+        for w in &mut taps {
+            *w /= tap_sum;
+        }
+        let raw_buf = buf.clone();
+        for (i, slot) in buf.iter_mut().enumerate() {
+            let mut acc = 0.0_f64;
+            for (t_idx, &w) in taps.iter().enumerate() {
+                let j = ((i as isize) + (t_idx as isize) - half).clamp(0, (num_frames - 1) as isize)
+                    as usize;
+                acc += w * raw_buf[j];
+            }
+            *slot = acc;
+        }
+
+        // Peak-govern strictly to 0.78 * ADC_PEAK_GOVERNOR_FS without injecting a DC offset into the decay tail.
         let peak = buf.iter().fold(1.0e-12_f64, |acc, &v| acc.max(v.abs()));
         let scale = (0.78 * ADC_PEAK_GOVERNOR_FS) / peak;
         buf.into_iter().map(|v| (v * scale) as f32).collect()

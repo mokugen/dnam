@@ -5,7 +5,8 @@
 use dnam_engine::schema::DnamError;
 
 use super::bezout_gram::{
-    BezoutHarvestStats, eval_4tier_besr_quad_1ch, eval_4tier_post_trim_besr_lin,
+    BezoutHarvestStats, eval_4tier_besr_quad_1ch, eval_4tier_post_trim_band_besr_lin,
+    eval_4tier_post_trim_besr_lin,
 };
 use super::stage_b_c::{StageBHarvest, eval_all_4_prefix_residuals, solve_cholesky_robust};
 use super::{
@@ -84,6 +85,45 @@ pub struct MultitierBesrSolution {
     pub prefix_besr_db: [f32; 4],
 }
 
+/// Diagonal regularization floor for out-of-class targets: damps unipolar, slow-envelope,
+/// DC rectifier, unrequested bistable `T1SubHarmonicTracker` slots, and higher-tier slots that tend to
+/// overfit the 250 ms coreset and diverge on holdout.
+fn out_of_class_slot_diag_floor(d: usize, max_g_dd: f64, stats: &BezoutHarvestStats) -> f64 {
+    let slot_frac = if matches!(d, 4..=11) {
+        if stats.stage1_ext_fb_active {
+            1.0e-5
+        } else if stats.stage1_svf_chorus_fb_active {
+            5.0e-4
+        } else {
+            8.0e-2
+        }
+    } else if matches!(
+        d,
+        47 | 51 | 100 | 108 | 146..=149 | 174 | 175 | 182 | 183 | 220..=223 | 237 | 239 | 242 | 245
+    ) {
+        2.5e-2
+    } else if matches!(d, 45 | 46 | 49 | 50 | 157 | 165 | 228 | 234) {
+        1.5e-3
+    } else if stats.limiting_saturator_active
+        && matches!(
+            d,
+            12..=19 | 24 | 32 | 39 | 43 | 44 | 48 | 58..=61 | 68..=83 | 136..=151 | 208..=219
+        )
+    {
+        1.2e-2
+    } else {
+        0.0
+    };
+    let tier = d / 64;
+    let tier_frac = if tier >= 1 {
+        let tf = tier as f64;
+        2.5e-5 * tf * tf
+    } else {
+        0.0
+    };
+    (slot_frac + tier_frac) * max_g_dd
+}
+
 /// Solves the 3-band Bézout Multi-Tier Nested SPD Normal Equations across `[Lite, Full, Pro, Ultra]`
 /// (`r[train.pipeline.stage-c-schur]`).
 pub fn solve_multitier_besr_4tier(
@@ -94,7 +134,14 @@ pub fn solve_multitier_besr_4tier(
     let n_pack = uplo_u_packed_len(256);
     let n_ch = if eval_stereo { 2 } else { 1 };
     let is_post_monotone =
-        |b: &[f64; 4]| b[3] <= b[2] + 1.0e-13 && b[2] <= b[1] + 1.0e-13 && b[1] <= b[0] + 1.0e-13;
+        |b: &[f64; 4]| b[3] <= b[2] + 1.0e-12 && b[2] <= b[1] + 1.0e-12 && b[1] <= b[0] + 1.0e-12;
+    let bands_monotone = |bm: &[[f64; 3]; 4]| -> bool {
+        (0..3).all(|band| {
+            bm[3][band] <= bm[2][band] + 1.0e-12
+                && bm[2][band] <= bm[1][band] + 1.0e-12
+                && bm[1][band] <= bm[0][band] + 1.0e-12
+        })
+    };
 
     let g_bb = &stats.tier_lufs_gram[3];
     let mut trace_bb = 0.0_f64;
@@ -111,6 +158,7 @@ pub fn solve_multitier_besr_4tier(
     let mut y_tot = [1.0_f64; 2];
     let mut base_lin = [1.0_f64; 4];
     let mut opt_tier_lin = [0.0_f64; 4];
+    let mut opt_w3_ch = [[0.0_f64; 256]; 2];
 
     for ch in 0..n_ch {
         let mut tr_w = 0.0_f64;
@@ -118,8 +166,8 @@ pub fn solve_multitier_besr_4tier(
             tr_w += stats.tier_gram_lr[3][ch][uplo_u_index(d, d)];
         }
         let mean_diag = (tr_w / 256.0).min(mean_bb_diag * 250.0).max(1.0e-12);
-        reg_ridge[ch] = (5.0e-6 * mean_diag).max(1.0e-10);
-        cond_ridge[ch] = (2.0e-5 * mean_diag).max(1.0e-9);
+        reg_ridge[ch] = (2.0e-8 * mean_diag).max(1.0e-12);
+        cond_ridge[ch] = (1.0e-7 * mean_diag).max(1.0e-11);
         y_tot[ch] = (stats.sampled_target_band_energy_lr[ch][0]
             + stats.sampled_target_band_energy_lr[ch][1]
             + stats.sampled_target_band_energy_lr[ch][2])
@@ -134,6 +182,9 @@ pub fn solve_multitier_besr_4tier(
             let mut pad = [0.0_f64; 256];
             pad[..dim].copy_from_slice(&sol_t);
             let q_pad = quantize_effective_1ch(&pad, role_b_multipliers, ch);
+            if t == 3 {
+                opt_w3_ch[ch] = q_pad;
+            }
             let ol = eval_4tier_besr_quad_1ch(stats, ch, &q_pad)[t] / y_tot[ch];
             opt_tier_lin[t] = if ch == 0 { ol } else { opt_tier_lin[t].max(ol) };
         }
@@ -151,6 +202,9 @@ pub fn solve_multitier_besr_4tier(
         }
         out
     };
+    let (opt_u_bands, _) =
+        eval_4tier_post_trim_band_besr_lin(stats, &pack_lr(&opt_w3_ch), eval_stereo);
+    let opt_ultra_bands_neg = opt_u_bands[3].iter().all(|&v| v < 0.998);
 
     // 0. Silent / muted target (`Y_tot <= 1e-12`): cancel backbone via sequential 64-D Schur
     // so all 4 tiers (`Lite..Ultra`) output `-70.000 LUFS` silence (`0.000 LU` spread).
@@ -222,15 +276,17 @@ pub fn solve_multitier_besr_4tier(
         let sol = solve_1ch_uplo_u_robust(256, g_bb, &rhs_u, base_r)?;
         q_in_ch[ch] = quantize_effective_1ch(&sol, role_b_multipliers, ch);
         let bb_u = eval_bb_mse_ultra(ch, &q_in_ch[ch]);
-        if bb_u > 1.0e-5 * y_tot[ch] || head_l1_norm(&q_in_ch[ch]) > 48.0 {
+        if bb_u > 1.0e-5 * y_tot[ch] || head_l1_norm(&q_in_ch[ch]) > 128.0 {
             inclass_ok = false;
         }
     }
     let w_in_lr = pack_lr(&q_in_ch);
     let (b_in, _) = eval_4tier_post_trim_besr_lin(stats, &w_in_lr, eval_stereo);
+    let (band_in, _) = eval_4tier_post_trim_band_besr_lin(stats, &w_in_lr, eval_stereo);
     if inclass_ok
         && opt_tier_lin[0] > 1.0e-3
         && is_post_monotone(&b_in)
+        && bands_monotone(&band_in)
         && b_in[0] <= 0.75
         && b_in[0] <= opt_tier_lin[0] * 12.0 + 0.05
     {
@@ -242,77 +298,100 @@ pub fn solve_multitier_besr_4tier(
         });
     }
 
-    let max_l1 = 42.0_f64;
-    let no_prefix_blowup = |b: &[f64; 4]| {
-        (0..3).all(|t| b[t] <= base_lin[t] * 1.01 + 1.0e-12 && b[t] <= opt_tier_lin[t] * 1.6 + 0.01)
+    let max_l1 = 128.0_f64;
+    let no_prefix_blowup = |b: &[f64; 4], bands: &[[f64; 3]; 4]| {
+        let tiers_ok = (0..4).all(|t| {
+            let hard_neg = if opt_tier_lin[t] < 0.995 {
+                0.995
+            } else {
+                base_lin[t] * 1.01 + 1.0e-12
+            };
+            let rel_cap = if t < 3 {
+                opt_tier_lin[t] * 4.5 + 0.12
+            } else {
+                f64::INFINITY
+            };
+            b[t] <= (base_lin[t] * 1.01 + 1.0e-12).min(hard_neg).min(rel_cap)
+        });
+        let ultra_bands_ok = !opt_ultra_bands_neg || bands[3].iter().all(|&v| v < 0.998);
+        tiers_ok && ultra_bands_ok
     };
 
     // 1b. Rank-deficient / band-limited in-class targets (e.g. 2-tone sinusoids with distinct
     // per-tier backbones): sequential 64-D Gauss-Markov broadband Schur cascade, gated on
     // monotone post-trim 3-band bESR, zero prefix blowup, and non-degraded Ultra bESR.
     if inclass_ok {
-        let seq_bb_ridge = (1.0e-6 * mean_bb_diag).max(1.0e-11);
-        let mut ch_ws = [[0.0_f64; 256]; 2];
-        let mut seq_bb_ok = true;
-        for ch in 0..n_ch {
-            let mut ws = [0.0_f64; 256];
-            for t in 0..4 {
-                let start = t * 64;
-                let g_t = &stats.tier_lufs_gram[t];
-                let mut sub_g = vec![0.0_f64; uplo_u_packed_len(64)];
-                for j in 0..64 {
-                    let row = start + j;
-                    let src_col = uplo_u_index(0, row) + start;
-                    let dst_col = uplo_u_index(0, j);
-                    sub_g[dst_col..dst_col + j + 1].copy_from_slice(&g_t[src_col..src_col + j + 1]);
-                    let is_late_tank = matches!(row, 116..=125 | 184..=189 | 246..=253);
-                    if is_late_tank {
-                        sub_g[dst_col + j] += 1.0e5 * seq_bb_ridge;
+        let base_seq_bb_ridge = (1.0e-6 * mean_bb_diag).max(1.0e-11);
+        for bb_mult in [1.0_f64, 16.0, 256.0, 4_096.0] {
+            let mut ch_ws = [[0.0_f64; 256]; 2];
+            let mut seq_bb_ok = true;
+            for ch in 0..n_ch {
+                let mut ws = [0.0_f64; 256];
+                for t in 0..4 {
+                    let start = t * 64;
+                    let seq_bb_ridge = base_seq_bb_ridge * bb_mult * (1.0 + 2.0 * (t as f64));
+                    let g_t = &stats.tier_lufs_gram[t];
+                    let mut sub_g = vec![0.0_f64; uplo_u_packed_len(64)];
+                    for j in 0..64 {
+                        let row = start + j;
+                        let src_col = uplo_u_index(0, row) + start;
+                        let dst_col = uplo_u_index(0, j);
+                        sub_g[dst_col..dst_col + j + 1]
+                            .copy_from_slice(&g_t[src_col..src_col + j + 1]);
+                        let is_slow_higher_tap = matches!(row, 116..=125 | 184..=189 | 246..=253)
+                            || (opt_tier_lin[0] <= 1.0e-4
+                                && matches!(row, 84..=115 | 152..=183 | 214..=245));
+                        if is_slow_higher_tap {
+                            sub_g[dst_col + j] += 1.0e5 * base_seq_bb_ridge;
+                        }
                     }
+                    let Ok(r_up) = factorize_uplo_u_cholesky(64, &sub_g, seq_bb_ridge)
+                        .or_else(|_| factorize_uplo_u_cholesky(64, &sub_g, seq_bb_ridge * 100.0))
+                    else {
+                        seq_bb_ok = false;
+                        break;
+                    };
+                    let mut sub_rhs = [0.0_f64; 64];
+                    for i in 0..64 {
+                        let row = start + i;
+                        let col_base = uplo_u_index(0, row);
+                        let mut c = stats.tier_bb_res_cross_256[t][row][ch];
+                        for (prev, &g_ij) in g_t[col_base..col_base + start].iter().enumerate() {
+                            c -= g_ij * ws[prev];
+                        }
+                        sub_rhs[i] = c;
+                    }
+                    let blk_w = solve_factorized_1ch(64, &r_up, &sub_rhs);
+                    ws[start..start + 64].copy_from_slice(&blk_w);
+                    let q_cur = quantize_effective_1ch(&ws, role_b_multipliers, ch);
+                    ws[..start + 64].copy_from_slice(&q_cur[..start + 64]);
                 }
-                let Ok(r_up) = factorize_uplo_u_cholesky(64, &sub_g, seq_bb_ridge)
-                    .or_else(|_| factorize_uplo_u_cholesky(64, &sub_g, seq_bb_ridge * 100.0))
-                else {
+                if !seq_bb_ok
+                    || head_l1_norm(&ws) > max_l1
+                    || eval_bb_mse_ultra(ch, &ws) > 1.0e-5 * y_tot[ch]
+                {
                     seq_bb_ok = false;
                     break;
-                };
-                let mut sub_rhs = [0.0_f64; 64];
-                for i in 0..64 {
-                    let row = start + i;
-                    let col_base = uplo_u_index(0, row);
-                    let mut c = stats.tier_bb_res_cross_256[t][row][ch];
-                    for (prev, &g_ij) in g_t[col_base..col_base + start].iter().enumerate() {
-                        c -= g_ij * ws[prev];
-                    }
-                    sub_rhs[i] = c;
                 }
-                let blk_w = solve_factorized_1ch(64, &r_up, &sub_rhs);
-                ws[start..start + 64].copy_from_slice(&blk_w);
-                let q_cur = quantize_effective_1ch(&ws, role_b_multipliers, ch);
-                ws[..start + 64].copy_from_slice(&q_cur[..start + 64]);
+                ch_ws[ch] = ws;
             }
-            if !seq_bb_ok
-                || head_l1_norm(&ws) > max_l1
-                || eval_bb_mse_ultra(ch, &ws) > 1.0e-5 * y_tot[ch]
-            {
-                seq_bb_ok = false;
-                break;
-            }
-            ch_ws[ch] = ws;
-        }
-        if seq_bb_ok {
-            let w_seq_bb = pack_lr(&ch_ws);
-            let (b_si, _) = eval_4tier_post_trim_besr_lin(stats, &w_seq_bb, eval_stereo);
-            if is_post_monotone(&b_si)
-                && no_prefix_blowup(&b_si)
-                && b_si[3] <= opt_tier_lin[3] * 2.0 + 1.0e-5
-            {
-                let db = b_si.map(|v| (10.0 * v.max(1.0e-16).log10()) as f32);
-                return Ok(MultitierBesrSolution {
-                    effective_w0_256: w_seq_bb.to_vec(),
-                    max_homotopy_eta: 1.0,
-                    prefix_besr_db: db,
-                });
+            if seq_bb_ok {
+                let w_seq_bb = pack_lr(&ch_ws);
+                let (b_si, _) = eval_4tier_post_trim_besr_lin(stats, &w_seq_bb, eval_stereo);
+                let (band_si, _) =
+                    eval_4tier_post_trim_band_besr_lin(stats, &w_seq_bb, eval_stereo);
+                if is_post_monotone(&b_si)
+                    && bands_monotone(&band_si)
+                    && no_prefix_blowup(&b_si, &band_si)
+                    && b_si[3] <= opt_tier_lin[3] * 2.0 + 1.0e-5
+                {
+                    let db = b_si.map(|v| (10.0 * v.max(1.0e-16).log10()) as f32);
+                    return Ok(MultitierBesrSolution {
+                        effective_w0_256: w_seq_bb.to_vec(),
+                        max_homotopy_eta: 1.0,
+                        prefix_besr_db: db,
+                    });
+                }
             }
         }
     }
@@ -333,6 +412,16 @@ pub fn solve_multitier_besr_4tier(
                     let dst_col = uplo_u_index(0, j);
                     sub_g[dst_col..dst_col + j + 1]
                         .copy_from_slice(&g_tier[src_col..src_col + j + 1]);
+                }
+                if !inclass_ok {
+                    let max_g_dd = (0..((t + 1) * 64))
+                        .map(|idx| g_tier[uplo_u_index(idx, idx)])
+                        .fold(0.0_f64, f64::max)
+                        .max(1.0e-12);
+                    for j in 0..64 {
+                        sub_g[uplo_u_index(j, j)] +=
+                            out_of_class_slot_diag_floor(start + j, max_g_dd, stats);
+                    }
                 }
                 let r_up = factorize_uplo_u_cholesky(64, &sub_g, blk_ridge)
                     .or_else(|_| factorize_uplo_u_cholesky(64, &sub_g, blk_ridge * 100.0))
@@ -359,43 +448,92 @@ pub fn solve_multitier_besr_4tier(
         Ok(pack_lr(&ch_ws))
     };
 
+    let feat_energy = (mean_bb_diag * (stats.post_warmup_frames.max(1) as f64)).max(1.0e-12);
+    let gain_scale = (raw_y_max / feat_energy).sqrt().clamp(1.0, 2.5);
+    let out_max_l1 = if inclass_ok {
+        max_l1
+    } else {
+        (48.0 * gain_scale).min(112.0)
+    };
     let l1_ok = |w_lr: &[[f64; 2]; 256]| -> bool {
         (0..n_ch).all(|ch| {
             let s: f64 = w_lr.iter().map(|v| v[ch].abs()).sum();
-            s <= max_l1
+            s <= out_max_l1
         })
     };
 
+    let all_monotone = |w_lr: &[[f64; 2]; 256]| -> ([f64; 4], [[f64; 3]; 4], [f64; 4], bool, bool) {
+        let (comp, g_next) = eval_4tier_post_trim_besr_lin(stats, w_lr, eval_stereo);
+        let (bands, _) = eval_4tier_post_trim_band_besr_lin(stats, w_lr, eval_stereo);
+        let comp_ok = is_post_monotone(&comp);
+        (
+            comp,
+            bands,
+            g_next,
+            comp_ok && (inclass_ok || bands_monotone(&bands)),
+            comp_ok,
+        )
+    };
+
     let mut seq_scale = 1.0_f64;
-    let mut w_seq = build_seq_lr(seq_scale, [1.0; 4])?;
-    if !l1_ok(&w_seq) {
-        seq_scale = 1_000.0;
-        w_seq = build_seq_lr(seq_scale, [1.0; 4])?;
-    }
-    let (mut b_seq, mut g_seq) = eval_4tier_post_trim_besr_lin(stats, &w_seq, eval_stereo);
-    for _ in 0..2 {
-        let w_next = build_seq_lr(seq_scale, g_seq)?;
-        if !l1_ok(&w_next) {
+    let mut w_seq = [[0.0_f64; 2]; 256];
+    let mut seq_l1_ok = false;
+    for s in [
+        1.0_f64,
+        16.0,
+        256.0,
+        4_096.0,
+        65_536.0,
+        1_048_576.0,
+        16_777_216.0,
+        268_435_456.0,
+    ] {
+        let cand = build_seq_lr(s, [1.0; 4])?;
+        if l1_ok(&cand) || s == 268_435_456.0 {
+            seq_scale = s;
+            w_seq = cand;
+            seq_l1_ok = true;
             break;
         }
-        let (b_next, g_next) = eval_4tier_post_trim_besr_lin(stats, &w_next, eval_stereo);
-        if (is_post_monotone(&b_next) && (!is_post_monotone(&b_seq) || b_next[3] <= b_seq[3]))
-            || (!is_post_monotone(&b_seq) && b_next[2] - b_next[1] < b_seq[2] - b_seq[1])
-        {
-            w_seq = w_next;
-            b_seq = b_next;
-        }
-        for t in 0..4 {
-            g_seq[t] = (0.5 * g_seq[t] + 0.5 * g_next[t]).clamp(0.25, 4.0);
+    }
+    let (mut b_seq, mut bands_seq, mut g_seq, mut seq_all_mono, mut seq_comp_mono) =
+        all_monotone(&w_seq);
+    if seq_l1_ok {
+        for _ in 0..2 {
+            let w_next = build_seq_lr(seq_scale, g_seq)?;
+            if !l1_ok(&w_next) {
+                break;
+            }
+            let (b_next, bands_next, g_next, next_all_mono, next_comp_mono) = all_monotone(&w_next);
+            let improves = (next_all_mono && (!seq_all_mono || b_next[3] <= b_seq[3]))
+                || (!seq_all_mono && next_comp_mono && (!seq_comp_mono || b_next[3] <= b_seq[3]))
+                || (!seq_comp_mono && b_next[2] - b_next[1] < b_seq[2] - b_seq[1]);
+            if improves {
+                w_seq = w_next;
+                b_seq = b_next;
+                bands_seq = bands_next;
+                seq_all_mono = next_all_mono;
+                seq_comp_mono = next_comp_mono;
+            }
+            for t in 0..4 {
+                g_seq[t] = (0.5 * g_seq[t] + 0.5 * g_next[t]).clamp(0.25, 4.0);
+            }
         }
     }
 
+    let fb_key = |b: &[f64; 4], bands: &[[f64; 3]; 4], all_m: bool| -> (usize, usize, bool, f64) {
+        let pos_tiers = b.iter().filter(|&&v| v >= 0.995).count();
+        let pos_ubands = bands[3].iter().filter(|&&v| v >= 0.998).count();
+        let tie_err = if inclass_ok { b[3] } else { b[3] + 0.15 * b[0] };
+        (pos_tiers, pos_ubands, !all_m, tie_err)
+    };
     let mut best_w = w_seq;
     let mut best_eta = 1.0_f64;
     let mut best_b = b_seq;
-    let mut has_valid_best = is_post_monotone(&b_seq) && no_prefix_blowup(&b_seq);
-    let mut best_mono_fallback: Option<([[f64; 2]; 256], f64, [f64; 4])> =
-        is_post_monotone(&b_seq).then_some((w_seq, 1.0, b_seq));
+    let mut has_valid_best = seq_all_mono && no_prefix_blowup(&b_seq, &bands_seq);
+    type BezoutFallback = ([[f64; 2]; 256], f64, [f64; 4], [[f64; 3]; 4], bool);
+    let mut best_fb: Option<BezoutFallback> =
+        seq_comp_mono.then_some((w_seq, 1.0, b_seq, bands_seq, seq_all_mono));
     let mut g_weighted = vec![0.0_f64; n_pack];
     let mut rhs_weighted = [0.0_f64; 256];
 
@@ -411,9 +549,19 @@ pub fn solve_multitier_besr_4tier(
         (0.97, [144.0, 28.0, 5.50, 1.0]),
         (0.99, [200.0, 80.0, 32.0, 1.0]),
     ] {
-        for ridge_mult in [1.0_f64, 4.0, 16.0, 128.0, 1_024.0] {
+        for ridge_mult in [
+            1.0_f64,
+            8.0,
+            64.0,
+            512.0,
+            4_096.0,
+            32_768.0,
+            262_144.0,
+            2_097_152.0,
+            16_777_216.0,
+        ] {
             let mut g_kkt = [1.0_f64; 4];
-            let mut ridge_exceeded_l1 = false;
+            let mut ridge_found_valid = false;
             for kkt_pass in 0..3 {
                 let g_sq = g_kkt.map(|g| g * g);
                 let big_gamma = [
@@ -449,8 +597,21 @@ pub fn solve_multitier_besr_4tier(
                                 + w_k * stats.tier_tgt_fb_cross[t][d][ch];
                         }
                     }
+                    let max_g_dd = if !inclass_ok {
+                        (0..256)
+                            .map(|d| g_weighted[uplo_u_index(d, d)])
+                            .fold(0.0_f64, f64::max)
+                            .max(1.0e-12)
+                    } else {
+                        0.0
+                    };
                     for d in 0..256 {
-                        g_weighted[uplo_u_index(d, d)] += big_gamma[d / 64] * cur_ridge;
+                        let extra = if !inclass_ok {
+                            out_of_class_slot_diag_floor(d, max_g_dd, stats)
+                        } else {
+                            0.0
+                        };
+                        g_weighted[uplo_u_index(d, d)] += big_gamma[d / 64] * cur_ridge + extra;
                     }
                     let Ok(cand_raw) = solve_1ch_uplo_u_robust(
                         256,
@@ -468,18 +629,19 @@ pub fn solve_multitier_besr_4tier(
                 }
                 let cand_lr = pack_lr(&cand_ch);
                 if !l1_ok(&cand_lr) {
-                    ridge_exceeded_l1 = true;
                     break;
                 }
-                let (b_cand, g_next) = eval_4tier_post_trim_besr_lin(stats, &cand_lr, eval_stereo);
-                if is_post_monotone(&b_cand) {
-                    if best_mono_fallback
-                        .as_ref()
-                        .is_none_or(|(_, _, mb)| b_cand[3] < mb[3])
-                    {
-                        best_mono_fallback = Some((cand_lr, eta, b_cand));
-                    }
-                    if no_prefix_blowup(&b_cand) && (!has_valid_best || b_cand[3] <= best_b[3]) {
+                let (b_cand, bands_cand, g_next, all_mono, comp_mono) = all_monotone(&cand_lr);
+                if comp_mono
+                    && best_fb.as_ref().is_none_or(|(_, _, mb, mbands, mall)| {
+                        fb_key(&b_cand, &bands_cand, all_mono) < fb_key(mb, mbands, *mall)
+                    })
+                {
+                    best_fb = Some((cand_lr, eta, b_cand, bands_cand, all_mono));
+                }
+                if all_mono && no_prefix_blowup(&b_cand, &bands_cand) {
+                    ridge_found_valid = true;
+                    if !has_valid_best || b_cand[3] <= best_b[3] {
                         best_w = cand_lr;
                         best_eta = eta;
                         best_b = b_cand;
@@ -493,18 +655,16 @@ pub fn solve_multitier_besr_4tier(
                     g_kkt[t] = (0.5 * g_kkt[t] + 0.5 * g_next[t]).clamp(0.25, 4.0);
                 }
             }
-            if !ridge_exceeded_l1 {
+            if ridge_found_valid || (inclass_ok && best_fb.is_some()) {
                 break;
             }
         }
-        if best_eta < 1.0 {
+        if has_valid_best && best_eta == 0.0 && best_b[0] <= opt_tier_lin[0] * 1.35 + 1.0e-4 {
             break;
         }
     }
 
-    if !is_post_monotone(&best_b)
-        && let Some((mw, meta, mb)) = best_mono_fallback
-    {
+    if !has_valid_best && let Some((mw, meta, mb, _, _)) = best_fb {
         best_w = mw;
         best_eta = meta;
         best_b = mb;
@@ -640,6 +800,13 @@ pub(super) fn apply_selective_hf_mm_and_ltas_polish(
             let mut cur_lr = [[0.0_f64; 2]; 256];
             cur_lr.copy_from_slice(&w_cand[..256]);
             let (b_before, _) = eval_4tier_post_trim_besr_lin(stats, &cur_lr, harvest.eval_stereo);
+            let (band_before, _) =
+                eval_4tier_post_trim_band_besr_lin(stats, &cur_lr, harvest.eval_stereo);
+            let was_bands_mono = (0..3).all(|b| {
+                band_before[3][b] <= band_before[2][b]
+                    && band_before[2][b] <= band_before[1][b]
+                    && band_before[1][b] <= band_before[0][b]
+            });
             for step in [0.5_f64, 0.15, 0.04] {
                 let mut raw_ch = [[0.0_f64; 256]; 2];
                 let mut q_ch = [[0.0_f64; 256]; 2];
@@ -649,7 +816,7 @@ pub(super) fn apply_selective_hf_mm_and_ltas_polish(
                     }
                     q_ch[ch] = quantize_effective_1ch(&raw_ch[ch], role_b_multipliers, ch);
                 }
-                if !(0..n_ch).all(|ch| head_l1_norm(&q_ch[ch]) <= 42.0) {
+                if !(0..n_ch).all(|ch| head_l1_norm(&q_ch[ch]) <= 128.0) {
                     continue;
                 }
                 let mut cand_lr = [[0.0_f64; 2]; 256];
@@ -658,6 +825,13 @@ pub(super) fn apply_selective_hf_mm_and_ltas_polish(
                     cand_lr[d][1] = q_ch[usize::from(harvest.eval_stereo)][d];
                 }
                 let (ba, _) = eval_4tier_post_trim_besr_lin(stats, &cand_lr, harvest.eval_stereo);
+                let (ba_band, _) =
+                    eval_4tier_post_trim_band_besr_lin(stats, &cand_lr, harvest.eval_stereo);
+                let now_bands_mono = (0..3).all(|b| {
+                    ba_band[3][b] <= ba_band[2][b]
+                        && ba_band[2][b] <= ba_band[1][b]
+                        && ba_band[1][b] <= ba_band[0][b]
+                });
                 let lower_ok = (0..3).all(|t| {
                     ba[t] <= b_before[t] * 1.02 + 1.0e-5 && (b_before[t] >= 1.0 || ba[t] < 1.0)
                 });
@@ -665,6 +839,7 @@ pub(super) fn apply_selective_hf_mm_and_ltas_polish(
                     && ba[3] <= ba[2]
                     && ba[2] <= ba[1]
                     && ba[1] <= ba[0]
+                    && (!was_bands_mono || now_bands_mono)
                     && lower_ok
                 {
                     w_cand[..256].copy_from_slice(&cand_lr);
@@ -685,7 +860,7 @@ pub(super) fn apply_selective_hf_mm_and_ltas_polish(
                     w[0] += step * d[0];
                     w[1] += step * d[1];
                 }
-                if !(0..2).all(|ch| cand.iter().map(|v| v[ch].abs()).sum::<f64>() <= 42.0) {
+                if !(0..2).all(|ch| cand.iter().map(|v| v[ch].abs()).sum::<f64>() <= 128.0) {
                     continue;
                 }
                 let ea = eval_all_4_prefix_residuals(
@@ -694,9 +869,7 @@ pub(super) fn apply_selective_hf_mm_and_ltas_polish(
                     &cand,
                     harvest.weighted_residual_energy,
                 );
-                let mono = ea[3] <= ea[2] + 1.0e-12
-                    && ea[2] <= ea[1] + 1.0e-12
-                    && ea[1] <= ea[0] + 1.0e-12;
+                let mono = ea[3] <= ea[2] && ea[2] <= ea[1] && ea[1] <= ea[0];
                 let lower_ok = (0..3).all(|t| ea[t] <= eb[t] * 1.02 + 1.0e-9);
                 if ea[3] <= eb[3] && mono && lower_ok {
                     w_cand.copy_from_slice(&cand);

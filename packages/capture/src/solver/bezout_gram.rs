@@ -49,10 +49,27 @@ pub struct BezoutHarvestStats {
     pub tier_bb_res_energy_lr: [[f64; 2]; 4],
     /// Per-tier (`0..4`) post-warmup unweighted broadband cross-correlation $\sum \phi^{(T)}_d r_{t,c}$.
     pub tier_bb_res_cross_256: [[[f64; 2]; 256]; 4],
+    /// Per-tier (`0..4`), per-band (`[LF, MF, HF]`) unweighted `uplo='U'` Gram matrices.
+    pub tier_band_gram: [[Vec<f64>; 3]; 4],
+    /// Per-tier (`0..4`), per-band (`[LF, MF, HF]`) `256 × 2` unweighted cross-correlations.
+    pub tier_band_cross_256: [[[[f64; 2]; 256]; 3]; 4],
+    /// Per-tier (`0..4`), per-band (`[LF, MF, HF]`) unweighted zero-head base residual energies.
+    pub tier_band_base_res_lr: [[[f64; 2]; 3]; 4],
+    /// Per-tier (`0..4`), per-band (`[LF, MF, HF]`) unweighted target-residual dot products.
+    pub tier_band_tgt_res_dot_lr: [[[f64; 2]; 3]; 4],
+    /// Per-tier (`0..4`), per-band (`[LF, MF, HF]`) `256 × 2` unweighted feature-target cross-correlations.
+    pub tier_band_tgt_fb_cross: [[[[f64; 2]; 256]; 3]; 4],
     /// Post-warmup frame count (`n - warmup`) for exact `LUFS` mean-square normalization.
     pub post_warmup_frames: usize,
     /// Post-warmup sample index (`min(512, n / 4)` when `n > 64`, else `0`).
     pub warmup_samples: usize,
+    /// Whether Stage I extended feature-bus slots `fb[4..12]` carry octave/ringmod readouts
+    /// rather than raw bistable `T1SubHarmonicTracker` flip-flops.
+    pub stage1_ext_fb_active: bool,
+    /// Whether Stage I extended feature-bus slots `fb[4..12]` carry chorus/rotary/SVF readouts.
+    pub stage1_svf_chorus_fb_active: bool,
+    /// Whether the target is a gated or series-limiting saturator where pre-Stage-II linear slots must be damped.
+    pub limiting_saturator_active: bool,
 }
 
 #[inline]
@@ -153,6 +170,12 @@ pub fn contract_bezout_3band_stats_4tier(
     };
     let empty_lufs_grams =
         || -> [Vec<f64>; 4] { std::array::from_fn(|t| vec![0.0; uplo_u_packed_len((t + 1) * 64)]) };
+    let empty_band_grams = || -> [[Vec<f64>; 3]; 4] {
+        std::array::from_fn(|t| {
+            let plen = uplo_u_packed_len((t + 1) * 64);
+            [vec![0.0; plen], vec![0.0; plen], vec![0.0; plen]]
+        })
+    };
     if n == 0 || warmup >= n {
         return BezoutHarvestStats {
             target_band_energy_lr: [[0.0; 3]; 2],
@@ -168,8 +191,16 @@ pub fn contract_bezout_3band_stats_4tier(
             tier_lufs_bb_cross: [[[0.0; 2]; 256]; 4],
             tier_bb_res_energy_lr: [[0.0; 2]; 4],
             tier_bb_res_cross_256: [[[0.0; 2]; 256]; 4],
+            tier_band_gram: empty_band_grams(),
+            tier_band_cross_256: [[[[0.0; 2]; 256]; 3]; 4],
+            tier_band_base_res_lr: [[[0.0; 2]; 3]; 4],
+            tier_band_tgt_res_dot_lr: [[[0.0; 2]; 3]; 4],
+            tier_band_tgt_fb_cross: [[[[0.0; 2]; 256]; 3]; 4],
             post_warmup_frames: 0,
             warmup_samples: warmup,
+            stage1_ext_fb_active: false,
+            stage1_svf_chorus_fb_active: false,
+            limiting_saturator_active: false,
         };
     }
 
@@ -265,6 +296,11 @@ pub fn contract_bezout_3band_stats_4tier(
     let mut tier_lufs_bb_cross = [[[0.0_f64; 2]; 256]; 4];
     let mut tier_bb_res_energy_lr = [[0.0_f64; 2]; 4];
     let mut tier_bb_res_cross_256 = [[[0.0_f64; 2]; 256]; 4];
+    let mut tier_band_gram = empty_band_grams();
+    let mut tier_band_cross_256 = [[[[0.0_f64; 2]; 256]; 3]; 4];
+    let mut tier_band_base_res_lr = [[[0.0_f64; 2]; 3]; 4];
+    let mut tier_band_tgt_res_dot_lr = [[[0.0_f64; 2]; 3]; 4];
+    let mut tier_band_tgt_fb_cross = [[[[0.0_f64; 2]; 256]; 3]; 4];
 
     for t in 0..4 {
         let dim = (t + 1) * 64;
@@ -397,6 +433,24 @@ pub fn contract_bezout_3band_stats_4tier(
         let (g_hf, c_hf) = contract_256d_gram_tiled_wide192(&hf_feats, &hf_res, &weights_hf, 1);
 
         tier_lufs_gram[t].copy_from_slice(&g_lufs_256[..p_len]);
+        tier_band_gram[t][0].copy_from_slice(&g_lf[..p_len]);
+        tier_band_gram[t][1].copy_from_slice(&g_mf[..p_len]);
+        tier_band_gram[t][2].copy_from_slice(&g_hf[..p_len]);
+        for d in 0..dim {
+            tier_band_cross_256[t][0][d] = c_lf[d];
+            tier_band_cross_256[t][1][d] = c_mf[d];
+            tier_band_cross_256[t][2][d] = c_hf[d];
+            for b in 0..3 {
+                tier_band_tgt_fb_cross[t][b][d] =
+                    [tgt_fb_acc[d][b][0].to_f64(), tgt_fb_acc[d][b][1].to_f64()];
+            }
+        }
+        for b in 0..3 {
+            for ch in 0..2 {
+                tier_band_base_res_lr[t][b][ch] = band_res_acc[ch][b].to_f64();
+                tier_band_tgt_res_dot_lr[t][b][ch] = tgt_res_acc[ch][b].to_f64();
+            }
+        }
         for ch in 0..2 {
             let [w0, w1, w2] = band_weights_lr[ch];
             for idx in 0..p_len {
@@ -437,8 +491,16 @@ pub fn contract_bezout_3band_stats_4tier(
         tier_lufs_bb_cross,
         tier_bb_res_energy_lr,
         tier_bb_res_cross_256,
+        tier_band_gram,
+        tier_band_cross_256,
+        tier_band_base_res_lr,
+        tier_band_tgt_res_dot_lr,
+        tier_band_tgt_fb_cross,
         post_warmup_frames: post_n,
         warmup_samples: warmup,
+        stage1_ext_fb_active: false,
+        stage1_svf_chorus_fb_active: false,
+        limiting_saturator_active: false,
     }
 }
 
@@ -496,15 +558,36 @@ fn eval_tier_lufs_energies_1ch(
     out
 }
 
-/// Evaluates exact post-`Stage E` `LUFS`-trimmed 4-tier 3-band `bESR` linear ratios (`worst_ch`)
-/// and linear gain trims `g_trim[0..4]`.
-#[must_use]
-pub fn eval_4tier_post_trim_besr_lin(
+#[inline]
+fn eval_tier_band_quad_1ch(
+    stats: &BezoutHarvestStats,
+    t: usize,
+    b: usize,
+    ch: usize,
+    w_1ch: &[f64; 256],
+) -> f64 {
+    let dim = (t + 1) * 64;
+    let g = &stats.tier_band_gram[t][b];
+    let mut quad_g = 0.0_f64;
+    let mut lin = 0.0_f64;
+    for j in 0..dim {
+        let wj = w_1ch[j];
+        lin += wj * stats.tier_band_cross_256[t][b][j][ch];
+        let col_base = uplo_u_index(0, j);
+        quad_g += g[col_base + j] * wj * wj;
+        for (i, &g_ij) in g[col_base..col_base + j].iter().enumerate() {
+            quad_g += 2.0 * g_ij * w_1ch[i] * wj;
+        }
+    }
+    (stats.tier_band_base_res_lr[t][b][ch] - 2.0 * lin + quad_g).max(0.0)
+}
+
+#[inline]
+fn compute_lufs_trims_and_w_ch(
     stats: &BezoutHarvestStats,
     w_lr: &[[f64; 2]; 256],
     eval_stereo: bool,
-) -> ([f64; 4], [f64; 4]) {
-    let n_ch = if eval_stereo { 2 } else { 1 };
+) -> ([[f64; 256]; 2], [f64; 4]) {
     let mut w_ch = [[0.0_f64; 256]; 2];
     for d in 0..256 {
         w_ch[0][d] = w_lr[d][0];
@@ -517,19 +600,31 @@ pub fn eval_4tier_post_trim_besr_lin(
         e0
     };
     let post_n = (stats.post_warmup_frames.max(1)) as f64;
-    let mut lufs = [-70.0_f32; 4];
+    let mut lufs = [-70.0_f64; 4];
     for t in 0..4 {
         let sum_sq = e0[t] + e1[t];
         let mean_sq = (sum_sq / post_n).max(1.0e-14);
-        let raw_lufs = (-0.691 + 10.0 * mean_sq.log10()).clamp(-70.0, 24.0) as f32;
-        lufs[t] = (raw_lufs * 1_000.0).round() / 1_000.0;
+        lufs[t] = (-0.691 + 10.0 * mean_sq.log10()).clamp(-70.0, 24.0);
     }
     let ultra_lufs = lufs[3];
     let mut g_trim = [1.0_f64; 4];
     for t in 0..4 {
         let raw_trim = (ultra_lufs - lufs[t]).clamp(-12.0, 12.0);
-        g_trim[t] = f64::from(10.0_f32.powf(raw_trim / 20.0));
+        g_trim[t] = 10.0_f64.powf(raw_trim / 20.0);
     }
+    (w_ch, g_trim)
+}
+
+/// Evaluates exact post-`Stage E` `LUFS`-trimmed 4-tier 3-band `bESR` linear ratios (`worst_ch`)
+/// and linear gain trims `g_trim[0..4]`.
+#[must_use]
+pub fn eval_4tier_post_trim_besr_lin(
+    stats: &BezoutHarvestStats,
+    w_lr: &[[f64; 2]; 256],
+    eval_stereo: bool,
+) -> ([f64; 4], [f64; 4]) {
+    let n_ch = if eval_stereo { 2 } else { 1 };
+    let (w_ch, g_trim) = compute_lufs_trims_and_w_ch(stats, w_lr, eval_stereo);
 
     let mut worst_lin = [0.0_f64; 4];
     for ch in 0..n_ch {
@@ -561,4 +656,47 @@ pub fn eval_4tier_post_trim_besr_lin(
         }
     }
     (worst_lin, g_trim)
+}
+
+/// Evaluates exact post-`Stage E` `LUFS`-trimmed 4-tier per-band `[LF, MF, HF]` linear `bESR` ratios
+/// (`worst_ch`) and linear gain trims `g_trim[0..4]`.
+#[must_use]
+pub fn eval_4tier_post_trim_band_besr_lin(
+    stats: &BezoutHarvestStats,
+    w_lr: &[[f64; 2]; 256],
+    eval_stereo: bool,
+) -> ([[f64; 3]; 4], [f64; 4]) {
+    let n_ch = if eval_stereo { 2 } else { 1 };
+    let (w_ch, g_trim) = compute_lufs_trims_and_w_ch(stats, w_lr, eval_stereo);
+    let mut worst_band_lin = [[0.0_f64; 3]; 4];
+    for ch in 0..n_ch {
+        let y_tot = (stats.sampled_target_band_energy_lr[ch][0]
+            + stats.sampled_target_band_energy_lr[ch][1]
+            + stats.sampled_target_band_energy_lr[ch][2])
+            .max(1.0e-15);
+        for t in 0..4 {
+            let dim = (t + 1) * 64;
+            let g = g_trim[t];
+            let om_g = 1.0 - g;
+            for b in 0..3 {
+                let y_b = stats.sampled_target_band_energy_lr[ch][b];
+                let denom_b = y_b.max(BAND_WEIGHT_REL_FLOOR * y_tot);
+                let j_untrimmed_b = eval_tier_band_quad_1ch(stats, t, b, ch, &w_ch[ch]);
+                let mut fk_b = 0.0_f64;
+                for d in 0..dim {
+                    fk_b += stats.tier_band_tgt_fb_cross[t][b][d][ch] * w_ch[ch][d];
+                }
+                let p_tc_b = stats.tier_band_tgt_res_dot_lr[t][b][ch] - fk_b;
+                let j_post_b =
+                    (om_g * om_g * y_b + 2.0 * g * om_g * p_tc_b + g * g * j_untrimmed_b).max(0.0);
+                let ratio_b = j_post_b / denom_b;
+                worst_band_lin[t][b] = if ch == 0 {
+                    ratio_b
+                } else {
+                    worst_band_lin[t][b].max(ratio_b)
+                };
+            }
+        }
+    }
+    (worst_band_lin, g_trim)
 }

@@ -129,6 +129,10 @@ impl<B: MathBackend> ControlBus<B> {
     /// **without** advancing LFO phasors or envelope followers, and clears `is_dirty`.
     #[inline]
     pub fn refresh_static_state(&mut self, arena_bytes: &[u8]) {
+        self.unified_w_ctrl = crate::stages::weights::has_pipeline_flag(
+            arena_bytes,
+            crate::stages::weights::PIPE_FLAG_UNIFIED_W_CTRL,
+        );
         for (current, &target) in self.current_u_norm.iter_mut().zip(&self.target_u_norm) {
             *current = flush_recursive_state_f32(target);
         }
@@ -366,6 +370,57 @@ impl<B: MathBackend> ControlBus<B> {
             return;
         }
 
+        if self.unified_w_ctrl {
+            let has_z_ctrl = self.z_head.iter().any(|&v| v != 0.0)
+                || self.ctrl_basis_4.iter().any(|&v| v != 0.0);
+            let has_ultra_ctrl = arena_bytes.len() >= W_CTRL_ULTRA_BASE + 256
+                && self.z_stage_ultra.iter().any(|&v| v != 0.0);
+            let q0 = B::Vec4::load(&self.z_head);
+            let q1 = B::Vec4::load(&self.ctrl_basis_4);
+            let q2_arr = [
+                self.lfo_harmonics[0] + 0.35 * self.lfo_harmonics[1],
+                self.lfo_harmonics[4] + 0.35 * self.lfo_harmonics[5],
+                self.lfo_phasors[0][0],
+                self.lfo_phasors[0][1],
+            ];
+            let q2 = B::Vec4::load(&q2_arr);
+            let q3 = B::Vec4::load(&self.env_states);
+            let qu = B::Vec4::load(&self.z_stage_ultra);
+            for r in 0..16 {
+                let row_off = W_CTRL_TANK_BASE + r * 64;
+                let mut v_acc = read_vec4_le::<B>(arena_bytes, row_off + 32)
+                    .mul(q2)
+                    .fma(read_vec4_le::<B>(arena_bytes, row_off + 48), q3);
+                if has_z_ctrl {
+                    v_acc = v_acc
+                        .fma(read_vec4_le::<B>(arena_bytes, row_off), q0)
+                        .fma(read_vec4_le::<B>(arena_bytes, row_off + 16), q1);
+                }
+                if has_ultra_ctrl {
+                    v_acc = v_acc.fma(
+                        read_vec4_le::<B>(arena_bytes, W_CTRL_ULTRA_BASE + r * 16),
+                        qu,
+                    );
+                }
+                self.stage_targets[r] = v_acc.horizontal_sum();
+            }
+            self.tank_delay_mod_samples =
+                [self.stage_targets[12], 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            self.tank_gain_targets = [
+                self.stage_targets[13],
+                self.stage_targets[13],
+                self.stage_targets[13],
+                self.stage_targets[13],
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ];
+            self.tank_state_mod = [0.0, self.stage_targets[11], 0.0, 0.0];
+            self.tank_mod_dirty = true;
+            return;
+        }
+
         let lfo0 =
             self.lfo_harmonics[0] + 0.35 * self.lfo_harmonics[1] + 0.15 * self.lfo_harmonics[2];
         let lfo1 =
@@ -565,6 +620,12 @@ impl<B: MathBackend> ControlBus<B> {
                 .add(B::Vec4::load(&d_chunks[c]))
                 .store(&mut t_chunks[c]);
         }
+    }
+
+    /// Audio-rate sample-by-sample parameter update for all 16 unified stage parameters (`0..16`).
+    #[inline(always)]
+    pub fn step_micro_ramp_16(theta_audio: &mut [f32; 16], deltas: &[f32; 16]) {
+        Self::step_micro_ramp(theta_audio, deltas);
     }
 }
 

@@ -102,10 +102,19 @@ pub fn apply_isometric_gauge_watermark(
         });
     }
 
-    // 1. Modal/Kautz reciprocal scaling gauge (b_gamma * kappa, c_re_l..c_im_r / kappa)
+    let ext_stage3 = crate::stages::weights::has_pipeline_flag(
+        arena,
+        crate::stages::weights::PIPE_FLAG_STAGE3_EXT,
+    );
+    let head_arena_offsets = [4_928_usize, 18_048_usize, 31_936_usize, 57_600_usize];
+
+    // 1. Modal/Kautz reciprocal scaling gauge (b_gamma * kappa, c_re_l..c_im_r / kappa;
+    //    when ext_stage3 is active, feature bus exposes s_re proportional to b_gamma,
+    //    so W_head Kautz slots scale by inv_kappa for 0 dB audio invariance).
     for tier in 0..max_tiers {
         let blocks = STAGE3_KAUTZ_BLOCKS_PER_TIER[tier];
         let ch_tier_base = STAGE3_KAUTZ_TIER_CHANNEL_BASE[tier];
+        let head_base = head_arena_offsets[tier];
         for blk in 0..blocks {
             let base = kautz_soa_byte_offset(tier, blk);
             for lane in 0..4 {
@@ -130,13 +139,30 @@ pub fn apply_isometric_gauge_watermark(
                 write_f32_le(arena, c_im_l_off, c_im_l * inv_kappa);
                 write_f32_le(arena, c_re_r_off, c_re_r * inv_kappa);
                 write_f32_le(arena, c_im_r_off, c_im_r * inv_kappa);
+
+                if ext_stage3 {
+                    let local_f = blk * 4 + lane;
+                    for mode in 0..5 {
+                        let off_l = head_base + mode * 512 + local_f * 4;
+                        let off_r = off_l + 256;
+                        write_f32_le(arena, off_l, read_f32_le(arena, off_l) * inv_kappa);
+                        write_f32_le(arena, off_r, read_f32_le(arena, off_r) * inv_kappa);
+                    }
+                    if max_tiers >= 4 {
+                        for k in 0..4 {
+                            let off_l = 49_408 + tier * 2_048 + k * 512 + local_f * 4;
+                            let off_r = off_l + 256;
+                            write_f32_le(arena, off_l, read_f32_le(arena, off_l) * inv_kappa);
+                            write_f32_le(arena, off_r, read_f32_le(arena, off_r) * inv_kappa);
+                        }
+                    }
+                }
             }
         }
     }
 
     // 2. Rotate SVD stereo head basis W_head[1..5] (each mode has 2*16*4 = 128 floats = 512 B)
     // across Arena 0 (4928..7488), Arena 1 (18048..20608), Arena 2 (31936..34496), Arena 3 (57600..60160):
-    let head_arena_offsets = [4_928_usize, 18_048_usize, 31_936_usize, 57_600_usize];
     for &head_base in head_arena_offsets.iter().take(max_tiers) {
         for elem_idx in 0..128 {
             let mut old_vals = [0.0_f32; 4];

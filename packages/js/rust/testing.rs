@@ -435,6 +435,7 @@ pub fn testing_reference_header_json(kind: Option<String>) -> Result<String> {
                 stage2_cascade: Stage2CascadeConfig::default(),
                 stage3_cabinet: Stage3CabinetKautzConfig::default(),
                 stage4_tank: Stage4SpatialTankConfig::default(),
+                delay_histories: Vec::new(),
                 tensor_directory: BTreeMap::from([
                     (
                         "stage3_early_fir".to_string(),

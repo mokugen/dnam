@@ -27,6 +27,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         )?;
 
         let freeze_mutes_dry = view.header.io_config.capabilities.freeze_mutes_dry;
+        let single_input = view.header.io_config.inputs == 1;
         self.preamble = view.preamble;
         self.header = Some(view.header);
         self.verification_status = view.verification_status;
@@ -80,7 +81,25 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         self.bypassed = false;
         self.trails_enabled = false;
         self.freeze_mutes_dry = freeze_mutes_dry;
+        self.single_input = single_input;
         self.stereo_width = 1.0;
+        {
+            let arena_b = self.arena_storage.as_bytes();
+            if crate::stages::weights::has_pipeline_flag(
+                arena_b,
+                crate::stages::weights::PIPE_FLAG_STAGE1_EXT,
+            ) {
+                self.stage_pipeline.stage1.reserve_extended_capacity(16_384);
+            }
+            if crate::stages::weights::has_pipeline_flag(
+                arena_b,
+                crate::stages::weights::PIPE_FLAG_STAGE4_EXT,
+            ) {
+                self.stage_pipeline
+                    .stage4
+                    .reserve_extended_capacity(131_072, 32_768);
+            }
+        }
 
         self.reconfigure_for_sample_rate_with_mode(sample_rate_hz, true)?;
         Ok(())
@@ -187,12 +206,19 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             .map(|h| h.stage4_tank.dc_blocker_pole)
             .filter(|&p| p > 0.8 && p < 1.0)
             .unwrap_or(0.995);
-        let tau_ref_tr = self
-            .header
-            .as_ref()
-            .map(|h| h.stage4_tank.tzf_reference_tap_samples)
-            .filter(|&t| t > 0.0)
-            .unwrap_or(64.0);
+        let zero_op_t = crate::stages::weights::has_pipeline_flag(
+            self.arena_storage.as_bytes(),
+            crate::stages::weights::PIPE_FLAG_ZERO_OP_T_PRE,
+        );
+        let tau_ref_tr = if zero_op_t {
+            0.0
+        } else {
+            self.header
+                .as_ref()
+                .map(|h| h.stage4_tank.tzf_reference_tap_samples)
+                .filter(|&t| t > 0.0)
+                .unwrap_or(64.0)
+        };
         let switch_xfade_tr = self
             .header
             .as_ref()
@@ -411,6 +437,25 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         self.header = None;
         self.tier = active_tier;
         self.max_available_tier = max_avail;
+        self.stage_pipeline.stage1.topology_mode = 0;
+        self.stage_pipeline.stage1.gate_threshold = 0.0;
+        {
+            let arena_b = self.arena_storage.as_bytes();
+            if crate::stages::weights::has_pipeline_flag(
+                arena_b,
+                crate::stages::weights::PIPE_FLAG_STAGE1_EXT,
+            ) {
+                self.stage_pipeline.stage1.reserve_extended_capacity(16_384);
+            }
+            if crate::stages::weights::has_pipeline_flag(
+                arena_b,
+                crate::stages::weights::PIPE_FLAG_STAGE4_EXT,
+            ) {
+                self.stage_pipeline
+                    .stage4
+                    .reserve_extended_capacity(131_072, 32_768);
+            }
+        }
         self.reconfigure_for_sample_rate_with_mode(sample_rate_hz, true)?;
         Ok(())
     }
@@ -502,11 +547,31 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                 }
             }
             self.freeze_mutes_dry = hdr.io_config.capabilities.freeze_mutes_dry;
+            self.single_input = hdr.io_config.inputs == 1;
         }
         self.preamble = preamble;
         self.header = parsed_header;
         self.tier = active_tier;
         self.max_available_tier = max_avail;
+        self.stage_pipeline.stage1.topology_mode = 0;
+        self.stage_pipeline.stage1.gate_threshold = 0.0;
+        {
+            let arena_b = self.arena_storage.as_bytes();
+            if crate::stages::weights::has_pipeline_flag(
+                arena_b,
+                crate::stages::weights::PIPE_FLAG_STAGE1_EXT,
+            ) {
+                self.stage_pipeline.stage1.reserve_extended_capacity(16_384);
+            }
+            if crate::stages::weights::has_pipeline_flag(
+                arena_b,
+                crate::stages::weights::PIPE_FLAG_STAGE4_EXT,
+            ) {
+                self.stage_pipeline
+                    .stage4
+                    .reserve_extended_capacity(131_072, 32_768);
+            }
+        }
         self.reconfigure_for_sample_rate_with_mode(sample_rate_hz, true)?;
         Ok(())
     }

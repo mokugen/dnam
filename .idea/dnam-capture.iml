@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <module type="WEB_MODULE" version="4">
   <component name="NewModuleRootManager">
-    <content url="file://$MODULE_DIR$/packages/trainer">
-      <sourceFolder url="file://$MODULE_DIR$/packages/trainer/benches" isTestSource="true" />
-      <sourceFolder url="file://$MODULE_DIR$/packages/trainer/src" isTestSource="false" />
-      <sourceFolder url="file://$MODULE_DIR$/packages/trainer/tests" isTestSource="true" />
+    <content url="file://$MODULE_DIR$/packages/capture">
+      <sourceFolder url="file://$MODULE_DIR$/packages/capture/benches" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/packages/capture/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/packages/capture/tests" isTestSource="true" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

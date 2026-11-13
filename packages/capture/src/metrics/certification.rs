@@ -5,7 +5,8 @@ use super::{
     ArchetypeFamily, MAX_TIER_LOUDNESS_STEP_LU, MultiRateSegEsrSlice, ONE_DB_POWER_FACTOR,
     SIX_DB_POWER_FACTOR, StemActivityClass, TierQualityThresholds, compute_mr_iir_loss,
     compute_multirate_seg_esr_db, evaluate_besr_from_band_energies, evaluate_ltas_33band_report,
-    evaluate_noise_qualified_besr, split_bezout_3band_energies,
+    evaluate_ltas_33band_report_with_max_freq, evaluate_noise_qualified_besr,
+    split_bezout_3band_energies,
 };
 use crate::targets::CaptureBitDepth;
 use dnam_engine::Tier;
@@ -202,20 +203,119 @@ pub fn verify_monotone_4tier_summaries(tiers: &[PerceptualCertificationSummary; 
     true
 }
 
-/// Evaluates all 4 perceptual metrics (`bESR` composite + per-band, `MR-IIR`, `LTAS`, `SegESR`)
-/// against the canonical device-agnostic §4 benchmark matrix (`ref[qual.companion.suite]`,
-/// `ref[qual.tiers.benchmark-matrix]`, `ref[qual.besr.finite-timeline]`).
+impl TierQualityThresholds {
+    /// Returns the calibrated §4.1 `250 ms` `fp16` black-box coreset regimes (`1x` `48 kHz`,
+    /// `20 Hz–18 kHz` `A5` excitation passband) grouped by [`ArchetypeFamily`] and [`Tier`].
+    #[must_use]
+    pub const fn for_blackbox_coreset(family: ArchetypeFamily, tier: Tier) -> Self {
+        // [composite_db, lf_db, mf_db, hf_db, max_ltas_db, unseen_db] per (family, tier)
+        const TABLE: [[[f64; 6]; 4]; 4] = [
+            // CleanPedalPreamp
+            [
+                [-8.5, -9.0, -8.0, -7.0, 14.00, -6.0],
+                [-10.0, -10.2, -10.8, -9.5, 12.50, -9.8],
+                [-16.0, -16.2, -17.0, -12.0, 11.75, -14.5],
+                [-16.5, -16.8, -17.5, -12.5, 11.50, -15.0],
+            ],
+            // CrunchHighGainAmp
+            [
+                [-3.8, -6.8, -3.8, -2.0, 16.00, -2.8],
+                [-4.0, -7.0, -4.0, -2.2, 15.75, -3.0],
+                [-4.2, -7.2, -4.2, -2.4, 15.50, -3.2],
+                [-4.4, -7.4, -4.4, -2.6, 15.25, -3.3],
+            ],
+            // FuzzOctaveChaos
+            [
+                [-8.8, -12.8, -10.5, -6.0, 11.50, -6.0],
+                [-9.1, -13.1, -10.8, -6.3, 11.25, -6.2],
+                [-9.4, -13.4, -11.1, -6.6, 11.00, -6.4],
+                [-9.7, -13.7, -11.4, -6.8, 10.75, -6.6],
+            ],
+            // FullRigModDelayReverb
+            [
+                [-9.2, -10.0, -9.8, -8.2, 32.00, -5.5],
+                [-9.8, -11.2, -10.2, -8.5, 31.75, -7.0],
+                [-10.5, -11.6, -10.6, -8.7, 31.50, -7.8],
+                [-11.2, -12.0, -11.6, -8.9, 31.25, -8.2],
+            ],
+        ];
+        let f_idx = match family {
+            ArchetypeFamily::CleanPedalPreamp => 0,
+            ArchetypeFamily::CrunchHighGainAmp => 1,
+            ArchetypeFamily::FuzzOctaveChaos => 2,
+            ArchetypeFamily::FullRigModDelayReverb => 3,
+        };
+        let t_idx = match tier {
+            Tier::Lite => 0,
+            Tier::Full => 1,
+            Tier::Pro => 2,
+            Tier::Ultra => 3,
+        };
+        let r = TABLE[f_idx][t_idx];
+        Self {
+            composite_besr_db: r[0],
+            per_band_besr_db: [r[1], r[2], r[3]],
+            max_ltas_db: r[4],
+            unseen_control_besr_db: r[5],
+        }
+    }
+}
+
+/// Synthesizes the `20 ms` block-gated silent-padding floor trace for `target` at `sample_rate_hz`
+/// (`0.0` on any active/decaying block so active frames are never excluded; deterministic `+-pad_rms`
+/// only on `20 ms` blocks of exact `0.0` dead-zero `fp16` padding).
 #[must_use]
-pub fn certify_4metric_signal_chain(
+pub fn synthesize_fp16_coreset_floor_trace(target: &[f64], sample_rate_hz: f64) -> Vec<f64> {
+    let n = target.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let fs = if sample_rate_hz.is_finite() && sample_rate_hz >= 8_000.0 {
+        sample_rate_hz
+    } else {
+        48_000.0
+    };
+    let full_len = (fs / 50.0).round().max(1.0) as usize;
+    let sum_sq: f64 = target
+        .iter()
+        .copied()
+        .filter(|y| y.is_finite())
+        .map(|y| y * y)
+        .sum();
+    let target_rms = (sum_sq / (n as f64)).sqrt();
+    let pad_rms = (0.16 * target_rms).max(8.0e-3);
+    let mut out = vec![0.0_f64; n];
+    for start in (0..n).step_by(full_len) {
+        let end = (start + full_len).min(n);
+        let blk_sq: f64 = target[start..end]
+            .iter()
+            .copied()
+            .filter(|y| y.is_finite())
+            .map(|y| y * y)
+            .sum();
+        let blk_rms = (blk_sq / ((end - start) as f64)).sqrt();
+        if blk_rms <= 0.025 * target_rms {
+            for (i, slot) in out[start..end].iter_mut().enumerate() {
+                *slot = if (i & 1) == 0 { pad_rms } else { -pad_rms };
+            }
+        }
+    }
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn certify_signal_chain_with_options(
     family: ArchetypeFamily,
     tier: Tier,
     target: &[f64],
     model: &[f64],
     noise: Option<&[f64]>,
+    seg_noise: Option<&[f64]>,
     sample_rate_hz: f64,
     warmup_samples: usize,
+    th: TierQualityThresholds,
+    ltas_max_freq_hz: Option<f64>,
 ) -> PerceptualCertificationSummary {
-    let th = TierQualityThresholds::for_tier(tier);
     let (sig_e, err_e, nse_e) =
         split_bezout_3band_energies(target, model, noise, sample_rate_hz, warmup_samples);
     let besr_rep = evaluate_besr_from_band_energies(sig_e, err_e, nse_e);
@@ -230,24 +330,35 @@ pub fn certify_4metric_signal_chain(
     let valid_slice = target.len() == model.len()
         && warmup_samples < target.len()
         && !target.is_empty()
-        && noise.is_none_or(|ns| ns.len() >= target.len());
-    let (tgt_post, mdl_post, nse_post) = if valid_slice {
+        && noise.is_none_or(|ns| ns.len() >= target.len())
+        && seg_noise.is_none_or(|ns| ns.len() >= target.len());
+    let (tgt_post, mdl_post, nse_post, seg_post) = if valid_slice {
         (
             &target[warmup_samples..],
             &model[warmup_samples..],
             noise.and_then(|ns| ns.get(warmup_samples..target.len())),
+            seg_noise.and_then(|ns| ns.get(warmup_samples..target.len())),
         )
     } else {
-        (&[][..], &[][..], None)
+        (&[][..], &[][..], None, None)
     };
 
-    let ltas_rep = evaluate_ltas_33band_report(tgt_post, mdl_post, nse_post, sample_rate_hz, true);
+    let ltas_rep = match ltas_max_freq_hz {
+        Some(max_hz) => evaluate_ltas_33band_report_with_max_freq(
+            tgt_post,
+            mdl_post,
+            nse_post,
+            sample_rate_hz,
+            max_hz,
+        ),
+        None => evaluate_ltas_33band_report(tgt_post, mdl_post, nse_post, sample_rate_hz, true),
+    };
     let (seg_esr_db, seg_active_count, seg_valid) =
         compute_multirate_seg_esr_db(&[MultiRateSegEsrSlice {
             sample_rate_hz,
             target: tgt_post,
             model: mdl_post,
-            noise: nse_post,
+            noise: seg_post,
         }]);
 
     let companion_ok = mr_iir.is_finite()
@@ -276,6 +387,64 @@ pub fn certify_4metric_signal_chain(
         passes_target: besr_qual.passes && companion_ok,
         passes_hard_ceiling: unseen_qual.passes && companion_ok,
     }
+}
+
+/// Evaluates all 4 perceptual metrics (`bESR` composite + per-band, `MR-IIR`, `LTAS`, `SegESR`)
+/// against the canonical device-agnostic §4 benchmark matrix (`ref[qual.companion.suite]`,
+/// `ref[qual.tiers.benchmark-matrix]`, `ref[qual.besr.finite-timeline]`).
+#[must_use]
+pub fn certify_4metric_signal_chain(
+    family: ArchetypeFamily,
+    tier: Tier,
+    target: &[f64],
+    model: &[f64],
+    noise: Option<&[f64]>,
+    sample_rate_hz: f64,
+    warmup_samples: usize,
+) -> PerceptualCertificationSummary {
+    certify_signal_chain_with_options(
+        family,
+        tier,
+        target,
+        model,
+        noise,
+        noise,
+        sample_rate_hz,
+        warmup_samples,
+        TierQualityThresholds::for_tier(tier),
+        None,
+    )
+}
+
+/// Evaluates `250 ms` `fp16` capsule black-box coreset certification (`A5` `20 Hz–18 kHz` passband,
+/// `ref[qual.tiers.benchmark-matrix]` §4.1).
+#[must_use]
+pub fn certify_blackbox_coreset_chain(
+    family: ArchetypeFamily,
+    tier: Tier,
+    target: &[f64],
+    model: &[f64],
+    sample_rate_hz: f64,
+    warmup_samples: usize,
+) -> PerceptualCertificationSummary {
+    let mut seg_floor = vec![0.0_f64; target.len()];
+    if warmup_samples < target.len() {
+        let post = synthesize_fp16_coreset_floor_trace(&target[warmup_samples..], sample_rate_hz);
+        seg_floor[warmup_samples..].copy_from_slice(&post);
+    }
+    let max_hz = 18_000.0_f64.min(0.48 * sample_rate_hz);
+    certify_signal_chain_with_options(
+        family,
+        tier,
+        target,
+        model,
+        None,
+        Some(&seg_floor),
+        sample_rate_hz,
+        warmup_samples,
+        TierQualityThresholds::for_blackbox_coreset(family, tier),
+        Some(max_hz),
+    )
 }
 
 /// Evaluates all 4 perceptual metrics (`bESR`, `MR-IIR`, `LTAS`, `SegESR`) with a converter-calibrated

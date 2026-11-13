@@ -2,12 +2,25 @@
 //!
 //! Canonical Reference: `docs/specs/dsp/router_and_stages_topology.md` (`ref[dsp.stage4.spatial-tank]`, `ref[dsp.stage4.dc-blocker]`, `ref[dsp.stage4.loop-saturator]`, `ref[dsp.stage4.quiet-feedback-knee]`).
 
+use crate::math::spec_math::q32_phase_to_phasor;
 use crate::math::{
     DefaultMathBackend, MathBackend, SimdVec4, flush_recursive_state_f32,
-    flush_recursive_state_vec4,
+    flush_recursive_state_vec4, newton6_reciprocal_f64,
 };
 use crate::operators::op_m::algebraic_unit_rotor_op_m;
 use crate::operators::op_t::BallisticDuckingVca;
+use crate::provenance::watermark::read_f32_le;
+use crate::stages::weights::{ARENA0_STAGE4_EXT_OFFSET, PIPE_FLAG_STAGE4_EXT, has_pipeline_flag};
+use alloc::vec::Vec;
+
+#[inline(always)]
+fn read_ring_linear_f32(ring: &[f32], mask: usize, wr_idx: usize, delay_samples: f32) -> f32 {
+    let d_int = delay_samples as usize;
+    let frac = delay_samples - (d_int as f32);
+    let s0 = ring[wr_idx.wrapping_sub(d_int) & mask];
+    let s1 = ring[wr_idx.wrapping_sub(d_int + 1) & mask];
+    s0 + frac * (s1 - s0)
+}
 
 /// State RAM footprint for Stage IV Lite: strictly 2,080 B.
 pub const STAGE4_TANK_RAM_BYTES: usize = 2080;
@@ -98,7 +111,51 @@ pub struct Stage4SpatialTank {
     pub sin_psi: f32,
     /// Unitary freeze mode flag.
     pub freeze: bool,
-    pub _pad: [u8; 7],
+    /// Active flag for extended Stage IV v2 spatial/BBD/FDN operators (`Arena 0 [4_704..4_772]`).
+    pub ext_active: bool,
+    pub _pad: [u8; 6],
+    /// Base `48 kHz` Stage IV loop gain (`Arena 0 [4_688]`) & Givens mixing angle (`4_696`).
+    pub base_g_loop: f32,
+    pub base_psi: f32,
+    /// Core 4-line Schroeder tank wet output gain (allows zeroing/scaling core tank in v2).
+    pub tank_wet_gain: f32,
+    /// Extended BBD stereo ping-pong / modulated delay (`0 FDIV`, `0 libm`, `0 rem_euclid`).
+    pub bbd_wet_gain: f32,
+    pub base_bbd_delay_l_48k: f32,
+    pub base_bbd_delay_r_48k: f32,
+    pub bbd_r_over_l: f32,
+    pub bbd_delay_l_host: f32,
+    pub bbd_delay_r_host: f32,
+    pub base_bbd_fb: f32,
+    pub bbd_fb: f32,
+    pub bbd_cross_fb: f32,
+    pub base_bbd_lpf_pole: f32,
+    pub bbd_lpf_pole: f32,
+    pub bbd_lpf_l: f32,
+    pub bbd_lpf_r: f32,
+    pub base_mod_depth_48k: f32,
+    pub mod_depth_host: f32,
+    pub base_mod_freq_hz: f32,
+    pub mod_inc_q32: u32,
+    pub mod_phase_q32: u32,
+    pub bbd_buf_l: Vec<f32>,
+    pub bbd_buf_r: Vec<f32>,
+    pub bbd_wr_idx: usize,
+    /// Extended 4-line Hadamard FDN with octave-up shimmer (`0 FDIV`, `0 libm`, `0 rem_euclid`).
+    pub fdn_wet_gain: f32,
+    pub base_fdn_delays_48k: [f32; 4],
+    pub fdn_delays_host: [usize; 4],
+    pub base_fdn_fb: f32,
+    pub fdn_fb: f32,
+    pub base_fdn_lpf_pole: f32,
+    pub fdn_lpf_pole: f32,
+    pub fdn_shimmer_mix: f32,
+    pub fdn_lpf_state: [f32; 4],
+    pub fdn_shimmer_phase_q32: u32,
+    pub fdn_shimmer_inc_q32: u32,
+    pub fdn_shimmer_grain_host: f32,
+    pub fdn_bufs: [Vec<f32>; 4],
+    pub fdn_wr_idx: usize,
 }
 
 impl Default for Stage4SpatialTank {
@@ -138,7 +195,64 @@ impl Stage4SpatialTank {
             cos_psi: core::f32::consts::FRAC_1_SQRT_2,
             sin_psi: core::f32::consts::FRAC_1_SQRT_2,
             freeze: false,
-            _pad: [0; 7],
+            ext_active: false,
+            _pad: [0; 6],
+            base_g_loop: 0.85,
+            base_psi: core::f32::consts::FRAC_PI_4,
+            tank_wet_gain: 1.0,
+            bbd_wet_gain: 0.0,
+            base_bbd_delay_l_48k: 0.0,
+            base_bbd_delay_r_48k: 0.0,
+            bbd_r_over_l: 1.0,
+            bbd_delay_l_host: 0.0,
+            bbd_delay_r_host: 0.0,
+            base_bbd_fb: 0.0,
+            bbd_fb: 0.0,
+            bbd_cross_fb: 0.0,
+            base_bbd_lpf_pole: 0.0,
+            bbd_lpf_pole: 0.0,
+            bbd_lpf_l: 0.0,
+            bbd_lpf_r: 0.0,
+            base_mod_depth_48k: 0.0,
+            mod_depth_host: 0.0,
+            base_mod_freq_hz: 0.0,
+            mod_inc_q32: 0,
+            mod_phase_q32: 0,
+            bbd_buf_l: Vec::new(),
+            bbd_buf_r: Vec::new(),
+            bbd_wr_idx: 0,
+            fdn_wet_gain: 0.0,
+            base_fdn_delays_48k: [1_487.0, 1_993.0, 2_417.0, 3_011.0],
+            fdn_delays_host: [1_487, 1_993, 2_417, 3_011],
+            base_fdn_fb: 0.0,
+            fdn_fb: 0.0,
+            base_fdn_lpf_pole: 0.0,
+            fdn_lpf_pole: 0.0,
+            fdn_shimmer_mix: 0.0,
+            fdn_lpf_state: [0.0; 4],
+            fdn_shimmer_phase_q32: 0,
+            fdn_shimmer_inc_q32: 2_097_152,
+            fdn_shimmer_grain_host: 1_024.0,
+            fdn_bufs: [Vec::new(), Vec::new(), Vec::new(), Vec::new()],
+            fdn_wr_idx: 0,
+        }
+    }
+
+    /// Pre-allocates non-RT Stage IV extended BBD (`131_072` frames) and FDN (`32_768` frames)
+    /// ring buffers so `reload_model_in_place` and `4x` bounce toggling perform zero heap allocations.
+    pub fn reserve_extended_capacity(&mut self, bbd_pow2: usize, fdn_pow2: usize) {
+        let b_cap = bbd_pow2.next_power_of_two().max(65_536);
+        let f_cap = fdn_pow2.next_power_of_two().max(16_384);
+        if self.bbd_buf_l.len() < b_cap {
+            self.bbd_buf_l.resize(b_cap, 0.0);
+        }
+        if self.bbd_buf_r.len() < b_cap {
+            self.bbd_buf_r.resize(b_cap, 0.0);
+        }
+        for line in &mut self.fdn_bufs {
+            if line.len() < f_cap {
+                line.resize(f_cap, 0.0);
+            }
         }
     }
 
@@ -155,32 +269,65 @@ impl Stage4SpatialTank {
         self.cos_psi = c;
         self.sin_psi = s;
         self.ducking_vca.reset();
+        self.bbd_lpf_l = 0.0;
+        self.bbd_lpf_r = 0.0;
+        self.mod_phase_q32 = 0;
+        self.bbd_wr_idx = 0;
+        self.bbd_buf_l.fill(0.0);
+        self.bbd_buf_r.fill(0.0);
+        self.fdn_lpf_state = [0.0; 4];
+        self.fdn_shimmer_phase_q32 = 0;
+        self.fdn_wr_idx = 0;
+        for line in &mut self.fdn_bufs {
+            line.fill(0.0);
+        }
     }
 
     /// Loads `48 kHz` Stage IV base delay lengths and loop parameters from `Arena 0 [4,672..4,704]`
-    /// and multi-tier tap lengths from `Arena 1..3` when non-zero, falling back to canonical defaults.
+    /// plus optional extended BBD/FDN parameters from `Arena 0 [4,704..4,772]` and multi-tier tap
+    /// lengths from `Arena 1..3`.
+    #[inline(always)]
+    pub const fn dry_mute_taps(&self) -> bool {
+        self._pad[0] != 0
+    }
+
     pub fn load_from_arena(&mut self, arena: &[u8]) {
         const DEFAULTS: [f32; TANK_LITE_LINES] = [149.0, 179.0, 211.0, 239.0];
+        self._pad[0] = 0;
         if arena.len() < 4_704 {
             self.base_delay_lengths = DEFAULTS;
             self.base_full_delay_lengths = Self::DEFAULT_FULL_DELAYS;
             self.base_pro_delay_lengths = Self::DEFAULT_PRO_DELAYS;
             self.base_ultra_delay_lengths = Self::DEFAULT_ULTRA_DELAYS;
+            self.ext_active = false;
+            self.base_g_loop = 0.85;
+            self.base_psi = core::f32::consts::FRAC_PI_4;
+            self.tank_wet_gain = 1.0;
+            self.bbd_wet_gain = 0.0;
+            self.fdn_wet_gain = 0.0;
             return;
         }
+        self.ext_active = has_pipeline_flag(arena, PIPE_FLAG_STAGE4_EXT)
+            && arena.len() >= ARENA0_STAGE4_EXT_OFFSET + 68;
+        let max_lite = if self.ext_active { 1000.0 } else { 255.0 };
         for (l, &def_d) in DEFAULTS.iter().enumerate() {
-            let v = crate::provenance::watermark::read_f32_le(arena, 4_672 + l * 4);
-            self.base_delay_lengths[l] = if v.is_finite() && (4.0..=255.0).contains(&v) {
+            let v = read_f32_le(arena, 4_672 + l * 4);
+            self.base_delay_lengths[l] = if v.is_finite() && (4.0..=max_lite).contains(&v) {
                 v
             } else {
                 def_d
             };
         }
-        let g = crate::provenance::watermark::read_f32_le(arena, 4_688);
-        if g.is_finite() && (0.05..=1.18).contains(&g) {
+        let g = read_f32_le(arena, 4_688);
+        let g_min = if self.ext_active { 0.0 } else { 0.05 };
+        if g.is_finite() && (g_min..=1.18).contains(&g) && (self.ext_active || g > 0.0) {
+            self.base_g_loop = g;
             self.g_loop = g;
+        } else {
+            self.base_g_loop = 0.85;
+            self.g_loop = 0.85;
         }
-        let sigma = crate::provenance::watermark::read_f32_le(arena, 4_692);
+        let sigma = read_f32_le(arena, 4_692);
         if sigma.is_finite() && (0.05..=10.0).contains(&sigma) {
             self.sigma_knee = sigma;
         }
@@ -188,24 +335,97 @@ impl Stage4SpatialTank {
         self.inv_sigma_knee = if (self.sigma_knee - 1.0).abs() <= 1e-6 {
             1.0_f64
         } else {
-            crate::math::newton6_reciprocal_f64(self.sigma_knee.max(1e-3) as f64)
+            newton6_reciprocal_f64(self.sigma_knee.max(1e-3) as f64)
         };
-        let psi = crate::provenance::watermark::read_f32_le(arena, 4_696);
+        let psi = read_f32_le(arena, 4_696);
         if psi.is_finite()
             && psi.abs() > 1e-6
             && (-core::f32::consts::PI..=core::f32::consts::PI).contains(&psi)
         {
+            self.base_psi = psi;
             self.target_psi = psi;
             self.current_psi = psi;
             let (c, s) = algebraic_unit_rotor_op_m(psi);
             self.cos_psi = c;
             self.sin_psi = s;
+        } else {
+            self.base_psi = core::f32::consts::FRAC_PI_4;
+        }
+
+        if self.ext_active {
+            let b = ARENA0_STAGE4_EXT_OFFSET;
+            let tw = read_f32_le(arena, b);
+            if tw.is_finite() && tw < -0.5 {
+                self._pad[0] = 1;
+                self.tank_wet_gain = 0.0;
+            } else {
+                self.tank_wet_gain = if tw.is_finite() {
+                    tw.clamp(0.0, 4.0)
+                } else {
+                    1.0
+                };
+            }
+            self.bbd_wet_gain = read_f32_le(arena, b + 4).clamp(0.0, 2.0);
+            self.base_bbd_delay_l_48k = read_f32_le(arena, b + 8).clamp(0.0, 120_000.0);
+            self.base_bbd_delay_r_48k = read_f32_le(arena, b + 12).clamp(0.0, 120_000.0);
+            self.bbd_r_over_l = if self.base_bbd_delay_l_48k > 1.0 {
+                (f64::from(self.base_bbd_delay_r_48k)
+                    * newton6_reciprocal_f64(f64::from(self.base_bbd_delay_l_48k)))
+                .clamp(0.125, 8.0) as f32
+            } else {
+                1.0
+            };
+            let mut fb = read_f32_le(arena, b + 16).clamp(-0.95, 0.95);
+            let mut xfb = read_f32_le(arena, b + 20).clamp(-0.95, 0.95);
+            let mag_sum = fb.abs() + xfb.abs();
+            if mag_sum > 0.96 {
+                let s = 0.96 * (newton6_reciprocal_f64(f64::from(mag_sum)) as f32);
+                fb *= s;
+                xfb *= s;
+            }
+            self.base_bbd_fb = fb;
+            self.bbd_fb = fb;
+            self.bbd_cross_fb = xfb;
+            let blp = read_f32_le(arena, b + 24);
+            self.base_bbd_lpf_pole = if blp.is_finite() {
+                blp.clamp(0.0, 0.9999)
+            } else {
+                0.0
+            };
+
+            self.fdn_wet_gain = read_f32_le(arena, b + 28).clamp(0.0, 2.0);
+            const DEF_FDN: [f32; 4] = [1_487.0, 1_993.0, 2_417.0, 3_011.0];
+            for (l, &def_d) in DEF_FDN.iter().enumerate() {
+                let d = read_f32_le(arena, b + 32 + l * 4);
+                self.base_fdn_delays_48k[l] = if d.is_finite() && d >= 16.0 {
+                    d.clamp(16.0, 30_000.0)
+                } else {
+                    def_d
+                };
+            }
+            self.fdn_fb = read_f32_le(arena, b + 48).clamp(-0.97, 0.97);
+            self.base_fdn_fb = self.fdn_fb;
+            let flp = read_f32_le(arena, b + 52);
+            self.base_fdn_lpf_pole = if flp.is_finite() {
+                flp.clamp(0.0, 0.9999)
+            } else {
+                0.0
+            };
+            self.fdn_shimmer_mix = read_f32_le(arena, b + 56).clamp(0.0, 1.0);
+            self.base_mod_depth_48k = read_f32_le(arena, b + 60).clamp(0.0, 500.0);
+            self.base_mod_freq_hz = read_f32_le(arena, b + 64).clamp(0.0, 25.0);
+        } else {
+            self.tank_wet_gain = 1.0;
+            self.bbd_wet_gain = 0.0;
+            self.fdn_wet_gain = 0.0;
         }
 
         if arena.len() >= 17_808 {
+            let max_full = if self.ext_active { 1000.0 } else { 511.0 };
             for (l, &def_d) in Self::DEFAULT_FULL_DELAYS.iter().enumerate() {
-                let v = crate::provenance::watermark::read_f32_le(arena, 17_792 + l * 4);
-                self.base_full_delay_lengths[l] = if v.is_finite() && (4.0..=511.0).contains(&v) {
+                let v = read_f32_le(arena, 17_792 + l * 4);
+                self.base_full_delay_lengths[l] = if v.is_finite() && (4.0..=max_full).contains(&v)
+                {
                     v
                 } else {
                     def_d
@@ -216,9 +436,10 @@ impl Stage4SpatialTank {
         }
 
         if arena.len() >= 34_512 {
+            let max_pro = if self.ext_active { 1000.0 } else { 767.0 };
             for (l, &def_d) in Self::DEFAULT_PRO_DELAYS.iter().enumerate() {
-                let v = crate::provenance::watermark::read_f32_le(arena, 34_496 + l * 4);
-                self.base_pro_delay_lengths[l] = if v.is_finite() && (4.0..=767.0).contains(&v) {
+                let v = read_f32_le(arena, 34_496 + l * 4);
+                self.base_pro_delay_lengths[l] = if v.is_finite() && (4.0..=max_pro).contains(&v) {
                     v
                 } else {
                     def_d
@@ -230,7 +451,7 @@ impl Stage4SpatialTank {
 
         if arena.len() >= 48_928 {
             for (k, &def_d) in Self::DEFAULT_ULTRA_DELAYS.iter().enumerate() {
-                let v = crate::provenance::watermark::read_f32_le(arena, 48_896 + k * 4);
+                let v = read_f32_le(arena, 48_896 + k * 4);
                 self.base_ultra_delay_lengths[k] = if v.is_finite() && (4.0..=1000.0).contains(&v) {
                     v
                 } else {
@@ -264,6 +485,33 @@ impl Stage4SpatialTank {
         }
         self.ducking_vca.alpha_att = zoh.rescale_real_pole(0.99);
         self.ducking_vca.alpha_rel = zoh.rescale_real_pole(0.9995);
+
+        let fs_eff = zoh.effective_sample_rate_hz();
+        let inv_fs_eff = newton6_reciprocal_f64(fs_eff);
+        let q32_per_hz = 4_294_967_296.0_f64 * inv_fs_eff;
+        self.bbd_delay_l_host = zoh.rescale_alignment_delay(self.base_bbd_delay_l_48k);
+        self.bbd_delay_r_host = zoh.rescale_alignment_delay(self.base_bbd_delay_r_48k);
+        self.mod_depth_host = zoh.rescale_alignment_delay(self.base_mod_depth_48k);
+        self.mod_inc_q32 = ((f64::from(self.base_mod_freq_hz) * q32_per_hz) + 0.5) as u32;
+        self.bbd_lpf_pole = if self.base_bbd_lpf_pole > 1.0e-4 {
+            zoh.rescale_real_pole(self.base_bbd_lpf_pole)
+        } else {
+            0.0
+        };
+        let fdn_cap = self.fdn_bufs[0].len().saturating_sub(4).max(32_764);
+        for l in 0..4 {
+            let scaled = (zoh.rescale_alignment_delay(self.base_fdn_delays_48k[l]) + 0.5) as usize;
+            self.fdn_delays_host[l] = scaled.clamp(16, fdn_cap);
+        }
+        self.fdn_lpf_pole = if self.base_fdn_lpf_pole > 1.0e-4 {
+            zoh.rescale_real_pole(self.base_fdn_lpf_pole)
+        } else {
+            0.0
+        };
+        let grain_samples = ((1_024.0_f64 / zoh.rho_sr) + 0.5).clamp(256.0, 8_192.0);
+        self.fdn_shimmer_grain_host = grain_samples as f32;
+        self.fdn_shimmer_inc_q32 =
+            ((4_294_967_296.0_f64 * newton6_reciprocal_f64(grain_samples)) + 0.5) as u32;
     }
 
     /// Sets Givens rotation angle with slew rate bound |delta_psi| <= 0.05 rad/frame.
@@ -451,10 +699,112 @@ impl Stage4SpatialTank {
         in_l: f32,
         in_r: f32,
     ) -> (f32, f32, [f32; TANK_LITE_LINES], [f32; TANK_LITE_LINES]) {
+        if self.ext_active
+            && self.dry_mute_taps()
+            && self.bbd_wet_gain <= 1.0e-6
+            && self.fdn_wet_gain <= 1.0e-6
+        {
+            return (0.0, 0.0, [0.0; TANK_LITE_LINES], [0.0; TANK_LITE_LINES]);
+        }
         let (cos_psi, sin_psi) = self.step_givens_slew();
         let (readout_sig, loop_sig) = self.step_reads_and_saturate();
-        let (wet_l, wet_r) =
+        let (mut wet_l, mut wet_r) =
             self.step_mix_write_duck(cos_psi, sin_psi, readout_sig, loop_sig, in_l, in_r);
+        if self.ext_active {
+            wet_l *= self.tank_wet_gain;
+            wet_r *= self.tank_wet_gain;
+
+            if self.bbd_wet_gain > 1.0e-6
+                && self.bbd_buf_l.len() >= 1_024
+                && self.bbd_buf_l.len() == self.bbd_buf_r.len()
+            {
+                let mask = self.bbd_buf_l.len() - 1;
+                let max_d = (mask - 4) as f32;
+                let wr = self.bbd_wr_idx;
+                let (_, mod_sin) = q32_phase_to_phasor(self.mod_phase_q32);
+                self.mod_phase_q32 = self.mod_phase_q32.wrapping_add(self.mod_inc_q32);
+                let d_l = (self.bbd_delay_l_host + self.mod_depth_host * mod_sin).clamp(1.0, max_d);
+                let d_r = (self.bbd_delay_r_host - self.mod_depth_host * mod_sin).clamp(1.0, max_d);
+                let raw_l = read_ring_linear_f32(&self.bbd_buf_l, mask, wr, d_l);
+                let raw_r = read_ring_linear_f32(&self.bbd_buf_r, mask, wr, d_r);
+                let p_b = self.bbd_lpf_pole;
+                let om_b = 1.0 - p_b;
+                let tap_l = flush_recursive_state_f32(p_b * self.bbd_lpf_l + om_b * raw_l);
+                let tap_r = flush_recursive_state_f32(p_b * self.bbd_lpf_r + om_b * raw_r);
+                self.bbd_lpf_l = tap_l;
+                self.bbd_lpf_r = tap_r;
+                let inj_l = if self.freeze { 0.0 } else { in_l };
+                let inj_r = if self.freeze { 0.0 } else { in_r };
+                let fb_l =
+                    (inj_l + self.bbd_fb * tap_l + self.bbd_cross_fb * tap_r).clamp(-4.0, 4.0);
+                let fb_r =
+                    (inj_r + self.bbd_fb * tap_r + self.bbd_cross_fb * tap_l).clamp(-4.0, 4.0);
+                self.bbd_buf_l[wr] = flush_recursive_state_f32(fb_l);
+                self.bbd_buf_r[wr] = flush_recursive_state_f32(fb_r);
+                self.bbd_wr_idx = (wr + 1) & mask;
+                wet_l += self.bbd_wet_gain * tap_l;
+                wet_r += self.bbd_wet_gain * tap_r;
+            }
+
+            if self.fdn_wet_gain > 1.0e-6 && self.fdn_bufs[0].len() >= 4_096 {
+                let f_cap = self.fdn_bufs[0].len();
+                let f_mask = f_cap - 1;
+                let wr = self.fdn_wr_idx;
+                let p_f = self.fdn_lpf_pole;
+                let om_f = 1.0 - p_f;
+                let mut fdn_taps = [0.0f32; 4];
+                for l in 0..4 {
+                    let dl = self.fdn_delays_host[l].min(f_mask - 4);
+                    let raw = self.fdn_bufs[l][wr.wrapping_sub(dl) & f_mask];
+                    let lp = flush_recursive_state_f32(p_f * self.fdn_lpf_state[l] + om_f * raw);
+                    self.fdn_lpf_state[l] = lp;
+                    fdn_taps[l] = lp;
+                }
+                let mut fb_vec = fdn_taps;
+                if self.fdn_shimmer_mix > 1.0e-6 {
+                    let pa_u32 = self.fdn_shimmer_phase_q32;
+                    let pb_u32 = pa_u32.wrapping_add(0x8000_0000);
+                    let pa = (pa_u32 as f32) * (1.0 / 4_294_967_296.0);
+                    let pb = (pb_u32 as f32) * (1.0 / 4_294_967_296.0);
+                    let wa = 1.0 - (2.0 * pa - 1.0).abs();
+                    let wb = 1.0 - wa;
+                    let g_len = self.fdn_shimmer_grain_host;
+                    let da = (g_len * (1.0 - pa)).clamp(1.0, (f_mask - 4) as f32);
+                    let db = (g_len * (1.0 - pb)).clamp(1.0, (f_mask - 4) as f32);
+                    self.fdn_shimmer_phase_q32 = pa_u32.wrapping_add(self.fdn_shimmer_inc_q32);
+                    let sh_m = self.fdn_shimmer_mix;
+                    let dry_m = 1.0 - sh_m;
+                    for (l, val) in fb_vec.iter_mut().enumerate() {
+                        let oct_a = read_ring_linear_f32(&self.fdn_bufs[l], f_mask, wr, da);
+                        let oct_b = read_ring_linear_f32(&self.fdn_bufs[l], f_mask, wr, db);
+                        let shimmer = wa * oct_a + wb * oct_b;
+                        *val = dry_m * (*val) + sh_m * shimmer;
+                    }
+                }
+                // Orthonormal 4x4 Hadamard matrix H4 = 0.5 * [[1,1,1,1],[1,-1,1,-1],[1,1,-1,-1],[1,-1,-1,1]]
+                let s01 = fb_vec[0] + fb_vec[1];
+                let d01 = fb_vec[0] - fb_vec[1];
+                let s23 = fb_vec[2] + fb_vec[3];
+                let d23 = fb_vec[2] - fb_vec[3];
+                let h = [
+                    0.5 * (s01 + s23),
+                    0.5 * (d01 + d23),
+                    0.5 * (s01 - s23),
+                    0.5 * (d01 - d23),
+                ];
+                let inj_l = if self.freeze { 0.0 } else { in_l };
+                let inj_r = if self.freeze { 0.0 } else { in_r };
+                let g_fdn = self.fdn_fb;
+                for l in 0..4 {
+                    let inj = if (l & 1) == 0 { inj_l } else { inj_r };
+                    let nxt = (inj + g_fdn * h[l]).clamp(-4.0, 4.0);
+                    self.fdn_bufs[l][wr] = flush_recursive_state_f32(nxt);
+                }
+                self.fdn_wr_idx = (wr + 1) & f_mask;
+                wet_l += self.fdn_wet_gain * 0.5 * (fdn_taps[0] + fdn_taps[2]);
+                wet_r += self.fdn_wet_gain * 0.5 * (fdn_taps[1] + fdn_taps[3]);
+            }
+        }
         (wet_l, wet_r, readout_sig, loop_sig)
     }
 
@@ -470,6 +820,16 @@ impl Stage4SpatialTank {
         fb: &mut [f32; 256],
     ) {
         if max_tier <= 1 {
+            return;
+        }
+        if self.ext_active && self.dry_mute_taps() {
+            fb[116..126].fill(0.0);
+            if max_tier >= 3 {
+                fb[184..190].fill(0.0);
+            }
+            if max_tier >= 4 {
+                fb[246..254].fill(0.0);
+            }
             return;
         }
         let base_ptr = (self.write_ptr + TANK_LINE_CAPACITY - 1) & TANK_LINE_MASK;

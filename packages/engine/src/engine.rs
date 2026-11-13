@@ -54,6 +54,7 @@ pub struct DnamEngine<'a, B: EngineBackend = DefaultMathBackend> {
     pub(crate) bypassed: bool,
     pub(crate) trails_enabled: bool,
     pub(crate) freeze_mutes_dry: bool,
+    pub(crate) single_input: bool,
     pub(crate) stereo_width: f32,
     pub(crate) current_stage_params: [f32; 16],
     pub(crate) stage_ramp_deltas: [f32; 16],
@@ -130,6 +131,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             bypassed: false,
             trails_enabled: false,
             freeze_mutes_dry: false,
+            single_input: false,
             stereo_width: 1.0,
             current_stage_params: [0.0; 16],
             stage_ramp_deltas: [0.0; 16],
@@ -268,6 +270,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         let mut engine = Self::new_empty(max_supported_tier);
         engine.arena_storage = ArenaStorage::with_max_tier(max_supported_tier);
         engine.control_bus.ensure_control_capacity(256);
+        engine.stage_pipeline.reserve_extended_capacity();
         engine
     }
 

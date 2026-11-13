@@ -145,12 +145,8 @@ impl<M: BlackBoxModel> BlackBoxDistillationAdapter<M> {
         let base_freeze_sw = sw_scratch.get(freeze_sw_idx).copied().unwrap_or(0);
         let n_in = self.inner.num_inputs().clamp(1, 4);
         let n_out = self.inner.num_outputs().clamp(1, 4);
-        let n_ctrl = meta
-            .controls
-            .len()
-            .max(control_values.len())
-            .max(dev_trajs.map_or(0, Vec::len));
-        let mut ctrl_scratch = vec![0.0_f32; n_ctrl];
+        let n_range = meta.controls.len();
+        let mut ctrl_scratch = vec![0.0_f32; n_range];
         let mut dev_out1 = vec![0.0_f32; dev_n];
         let mut dev_out2 = (n_out >= 2).then(|| vec![0.0_f32; dev_n]);
         let mut dev_out3 = (n_out >= 3).then(|| vec![0.0_f32; dev_n]);
@@ -166,7 +162,7 @@ impl<M: BlackBoxModel> BlackBoxDistillationAdapter<M> {
             };
             let x3 = dev_in3.and_then(|v| v.get(i).copied()).unwrap_or(0.0);
             let x4 = dev_in4.and_then(|v| v.get(i).copied()).unwrap_or(0.0);
-            for p in 0..n_ctrl {
+            for p in 0..n_range {
                 let fb = control_values
                     .get(p)
                     .copied()
@@ -176,6 +172,23 @@ impl<M: BlackBoxModel> BlackBoxDistillationAdapter<M> {
                     .and_then(|t| t.get(p))
                     .and_then(|t| t.get(i).copied())
                     .unwrap_or(fb);
+            }
+            for k in 0..n_sw {
+                let fb_sw = self
+                    .switches
+                    .get(k)
+                    .copied()
+                    .or_else(|| meta.switches.get(k).map(|s| s.default_index))
+                    .unwrap_or(0);
+                let max_opt = meta
+                    .switches
+                    .get(k)
+                    .map_or(255, |s| s.options.len().saturating_sub(1));
+                sw_scratch[k] = dev_trajs
+                    .and_then(|t| t.get(n_range + k))
+                    .and_then(|t| t.get(i).copied())
+                    .or_else(|| control_values.get(n_range + k).copied())
+                    .map_or(fb_sw, |v| (v.round().max(0.0) as usize).min(max_opt) as u8);
             }
             if let Some([fs, fe]) = dev_freeze
                 && let Some(slot) = sw_scratch.get_mut(freeze_sw_idx)
@@ -256,18 +269,19 @@ fn manifest_for_fixture<M: BlackBoxModel>(model: &M) -> DnamProjManifest {
     let meta = model.metadata();
     let mut manifest = DnamProjManifest::default_reference();
     manifest.base.metadata.name = meta.name.to_string();
+    manifest.base.io_config.inputs = model.num_inputs().clamp(1, 2) as u8;
     manifest.base.io_config.output_mode = if model.num_outputs() >= 2 {
         "stereo".to_string()
     } else {
         "mono".to_string()
     };
     let mut schema = Vec::new();
-    for c in meta.controls.iter().take(2) {
+    for c in meta.controls {
         let def: ControlSchemaDef = serde_json::from_value(serde_json::json!({
             "id": c.id,
             "name": c.name,
             "type": "range",
-            "lobatto_degree": 2,
+            "lobatto_degree": 3,
             "declared_range": [-1.0, 1.0],
             "safe_clamped_range": [-1.0, 1.0],
             "default": c.default_norm
@@ -275,7 +289,7 @@ fn manifest_for_fixture<M: BlackBoxModel>(model: &M) -> DnamProjManifest {
         .unwrap();
         schema.push(def);
     }
-    for sw in meta.switches.iter().take(1) {
+    for sw in meta.switches {
         let def: ControlSchemaDef = serde_json::from_value(serde_json::json!({
             "id": sw.id,
             "name": sw.name,

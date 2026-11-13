@@ -11,6 +11,10 @@
 use dnam_engine::container::build_dnam_container_with_cp1;
 use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::schema::DnamError;
+use dnam_engine::stages::weights::{
+    ARENA0_STAGE1_EXT_OFFSET, ARENA0_STAGE2_EXT_OFFSET, PIPE_FLAG_STAGE1_EXT, PIPE_FLAG_STAGE2_EXT,
+    has_pipeline_flag,
+};
 use dnam_engine::types::FtzDazGuard;
 use dnam_engine::{DnamEngine, Tier};
 
@@ -107,6 +111,44 @@ fn read_f32_le(buf: &[u8], off: usize) -> f32 {
     } else {
         0.0
     }
+}
+
+fn has_stage1_ext_offs(arena_64k: &[u8], offs: &[usize]) -> bool {
+    has_pipeline_flag(arena_64k, PIPE_FLAG_STAGE1_EXT)
+        && arena_64k.len() >= ARENA0_STAGE1_EXT_OFFSET + 128
+        && offs
+            .iter()
+            .any(|&off| read_f32_le(arena_64k, ARENA0_STAGE1_EXT_OFFSET + off) > 1.0e-6)
+}
+
+fn has_stage1_octave_ring_fb(arena_64k: &[u8]) -> bool {
+    has_stage1_ext_offs(arena_64k, &[48, 52, 56, 60])
+}
+
+fn has_stage1_svf_chorus_fb(arena_64k: &[u8]) -> bool {
+    has_stage1_ext_offs(arena_64k, &[68, 96, 100])
+}
+
+fn is_limiting_saturator(manifest: &DnamProjManifest, arena_64k: &[u8]) -> bool {
+    if !has_pipeline_flag(arena_64k, PIPE_FLAG_STAGE2_EXT)
+        || arena_64k.len() < ARENA0_STAGE2_EXT_OFFSET + 40
+    {
+        return false;
+    }
+    let clean_bypass = read_f32_le(arena_64k, ARENA0_STAGE2_EXT_OFFSET + 24);
+    let linear_s2 = read_f32_le(arena_64k, ARENA0_STAGE2_EXT_OFFSET + 32) > 0.5;
+    let gate_active = has_pipeline_flag(arena_64k, PIPE_FLAG_STAGE1_EXT)
+        && read_f32_le(arena_64k, ARENA0_STAGE1_EXT_OFFSET + 36) > 1.0e-5;
+    let comp_ratio = super::stage_a_ext::star_meta_f64(manifest, "phys_comp_ratio", 1.0);
+    let odd_harm = super::stage_a_ext::star_meta_f64(manifest, "phys_odd_harm", 0.0);
+    let even_harm = super::stage_a_ext::star_meta_f64(manifest, "phys_even_harm", 0.0);
+    let tail_ratio = super::stage_a_ext::star_meta_f64(manifest, "phys_tail_energy_ratio", 0.0);
+    !linear_s2
+        && clean_bypass < 0.08
+        && tail_ratio < 0.08
+        && !has_stage1_octave_ring_fb(arena_64k)
+        && !has_stage1_svf_chorus_fb(arena_64k)
+        && (gate_active || (comp_ratio < 0.68 && (odd_harm + even_harm) > 0.18))
 }
 
 /// Computes the exact static Role B (`b = 1..K_t-1`) multiplicative gauge factors cached by
@@ -289,7 +331,7 @@ pub fn harvest_star_center_256d(
     }
     tier_backbone_lr[3].clone_from(&backbone_out_lr);
 
-    let besr_stats = Some(contract_bezout_3band_stats_4tier(
+    let mut stats = contract_bezout_3band_stats_4tier(
         &[
             &lower_tier_features[0],
             &lower_tier_features[1],
@@ -300,7 +342,11 @@ pub fn harvest_star_center_256d(
         &tier_backbone_lr,
         eval_stereo,
         stride,
-    ));
+    );
+    stats.stage1_ext_fb_active = has_stage1_octave_ring_fb(arena_64k);
+    stats.stage1_svf_chorus_fb_active = has_stage1_svf_chorus_fb(arena_64k);
+    stats.limiting_saturator_active = is_limiting_saturator(manifest, arena_64k);
+    let besr_stats = Some(stats);
 
     let (features, polish_win_features, packed_gram_256, cross_256) = if stride == 1 {
         let (g, c) =
@@ -759,12 +805,14 @@ mod tests {
         }
 
         let role_b = [[1.0_f64; 2]; 256];
-        let besr_db = solve_multitier_besr_4tier(&stats, &role_b, false)
-            .unwrap()
-            .prefix_besr_db;
+        let sol = solve_multitier_besr_4tier(&stats, &role_b, false).unwrap();
+        let besr_db = sol.prefix_besr_db;
         assert!(besr_db[3] <= besr_db[2] + 1.0e-5);
         assert!(besr_db[2] <= besr_db[1] + 1.0e-5);
         assert!(besr_db[1] <= besr_db[0] + 1.0e-5);
-        assert!(besr_db[3] < -40.0);
+        assert!(
+            besr_db[3] < -40.0,
+            "expected besr_db[3] < -40.0 dB, got besr_db={besr_db:?}"
+        );
     }
 }

@@ -581,6 +581,39 @@ pub fn evaluate_ltas_33band_report(
     sample_rate_hz: f64,
     require_full_20khz: bool,
 ) -> LtasEvaluationReport {
+    let min_sr = if require_full_20khz {
+        40_000.0
+    } else {
+        8_000.0
+    };
+    if !(min_sr..=MAX_METRIC_SAMPLE_RATE_HZ).contains(&sample_rate_hz) {
+        return LtasEvaluationReport {
+            available: false,
+            excluded_band_guard_failed: false,
+            max_adj_deviation_db: f64::INFINITY,
+            max_unadjusted_deviation_db: f64::INFINITY,
+            active_band_count: 0,
+            excluded_bands: [false; 33],
+            residual_band_power: [0.0; 33],
+        };
+    }
+    let max_freq_hz = if require_full_20khz {
+        20_000.0
+    } else {
+        (0.48 * sample_rate_hz).min(20_000.0)
+    };
+    evaluate_ltas_33band_report_with_max_freq(target, model, noise, sample_rate_hz, max_freq_hz)
+}
+
+/// Evaluates the 33-band Base-10 1/3-Octave Noise-Adjusted LTAS report up to `max_freq_hz`.
+#[must_use]
+pub fn evaluate_ltas_33band_report_with_max_freq(
+    target: &[f64],
+    model: &[f64],
+    noise: Option<&[f64]>,
+    sample_rate_hz: f64,
+    max_freq_hz: f64,
+) -> LtasEvaluationReport {
     let fail_unavailable = LtasEvaluationReport {
         available: false,
         excluded_band_guard_failed: false,
@@ -591,12 +624,10 @@ pub fn evaluate_ltas_33band_report(
         residual_band_power: [0.0; 33],
     };
 
-    let min_sr = if require_full_20khz {
-        40_000.0
-    } else {
-        8_000.0
-    };
-    if !(min_sr..=MAX_METRIC_SAMPLE_RATE_HZ).contains(&sample_rate_hz)
+    if !(8_000.0..=MAX_METRIC_SAMPLE_RATE_HZ).contains(&sample_rate_hz)
+        || !max_freq_hz.is_finite()
+        || max_freq_hz < 20.0
+        || sample_rate_hz < 2.0 * max_freq_hz
         || target.is_empty()
         || target.len() != model.len()
         || !target.iter().all(|v| v.is_finite())
@@ -611,11 +642,6 @@ pub fn evaluate_ltas_33band_report(
         return fail_unavailable;
     }
 
-    let max_freq_hz = if require_full_20khz {
-        20_000.0
-    } else {
-        (0.48 * sample_rate_hz).min(20_000.0)
-    };
     let intervals = canonical_ltas_33_intervals_hz();
     let residual: Vec<f64> = model
         .iter()

@@ -212,9 +212,22 @@ pub struct DnamJsonHeader {
     /// Stage IV Spatial Tank configuration.
     #[serde(default)]
     pub stage4_tank: Stage4SpatialTankConfig,
+    /// Optional delay-history capacity declarations for non-RT BBD/FDN buffer pre-allocation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delay_histories: Vec<DelayHistoryDecl>,
     /// Tensor directory mapping symbolic tensor names to byte slices in `Arena 0..3`.
     #[serde(default)]
     pub tensor_directory: BTreeMap<String, TensorSliceEntry>,
+}
+
+/// Optional delay-history capacity declaration stored in the v2 JSON header.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DelayHistoryDecl {
+    /// Delay family identifier (`"bbd"` or `"fdn"`).
+    pub kind: String,
+    /// Maximum capacity in 48 kHz base samples.
+    #[serde(default)]
+    pub max_samples_48k: u32,
 }
 
 /// Essential model identity, calibration, dataset provenance, and cryptographic signatures.
@@ -330,6 +343,7 @@ impl DnamJsonHeader {
             stage2_cascade: Stage2CascadeConfig::default(),
             stage3_cabinet: Stage3CabinetKautzConfig::default(),
             stage4_tank: Stage4SpatialTankConfig::default(),
+            delay_histories: Vec::new(),
             tensor_directory: BTreeMap::new(),
         }
     }
@@ -629,6 +643,7 @@ fn is_skipped_optional_field(
         (Some("calibration"), "conditional_physical_anchors") => {
             v_in.as_object().is_some_and(serde_json::Map::is_empty)
         }
+        (None, "delay_histories") => v_in.as_array().is_some_and(Vec::is_empty) || v_in.is_null(),
         _ => false,
     }
 }

@@ -23,10 +23,38 @@ pub const ARENA_ULTRA_BYTES: usize = 64_000;
 
 /// Offset of `arena0_lite.router_and_pre_bus` (0..256 B, 4 CL):
 /// - CL 00 (0..64 B): 4x4 S_router scattering matrix
-/// - CL 01 (64..128 B): Dual Catmull-Rom latency alignment & normaling
+/// - CL 01 (64..128 B): Extended v2 pipeline flags (`64..68`), Dual Catmull-Rom latency alignment & normaling
 /// - CL 02 (128..192 B): 4th-Order Bezout 200 Hz crossover & phase compensator
 /// - CL 03 (192..256 B): WDW output mixer & dedicated dry out
 pub const ARENA0_ROUTER_AND_PRE_BUS_OFFSET: usize = 0;
+
+/// Extended v2 pipeline feature flags packed in `Arena 0 [64..68]`.
+/// High 16 bits carry magic `0x444E` (`"DN"`); low 16 bits carry `PIPE_FLAG_*`.
+pub const ARENA0_PIPELINE_FLAGS_OFFSET: usize = 64;
+pub const PIPE_MAGIC_MASK: u32 = 0xFFFF_0000;
+pub const PIPE_MAGIC_HI: u32 = 0x444E_0000;
+pub const PIPE_FLAG_ZERO_OP_T_PRE: u32 = 1 << 0;
+pub const PIPE_FLAG_STAGE1_EXT: u32 = 1 << 1;
+pub const PIPE_FLAG_STAGE2_EXT: u32 = 1 << 2;
+pub const PIPE_FLAG_STAGE3_EXT: u32 = 1 << 3;
+pub const PIPE_FLAG_STAGE4_EXT: u32 = 1 << 4;
+pub const PIPE_FLAG_UNIFIED_W_CTRL: u32 = 1 << 5;
+pub const PIPE_FLAG_ALL_V2: u32 = PIPE_FLAG_ZERO_OP_T_PRE
+    | PIPE_FLAG_STAGE1_EXT
+    | PIPE_FLAG_STAGE2_EXT
+    | PIPE_FLAG_STAGE3_EXT
+    | PIPE_FLAG_STAGE4_EXT
+    | PIPE_FLAG_UNIFIED_W_CTRL;
+
+/// Extended Stage I pre-dynamics parameters (`360..488 B`, gated by `PIPE_FLAG_STAGE1_EXT`).
+pub const ARENA0_STAGE1_EXT_OFFSET: usize = 360;
+pub const ARENA0_STAGE1_EXT_BYTES: usize = 128;
+/// Extended Stage II linear/filter/clean-bypass parameters (`512..552 B`, gated by `PIPE_FLAG_STAGE2_EXT`).
+pub const ARENA0_STAGE2_EXT_OFFSET: usize = 512;
+pub const ARENA0_STAGE2_EXT_BYTES: usize = 40;
+/// Extended Stage IV spatial/BBD/FDN parameters (`4_704..4_772 B`, gated by `PIPE_FLAG_STAGE4_EXT`).
+pub const ARENA0_STAGE4_EXT_OFFSET: usize = 4704;
+pub const ARENA0_STAGE4_EXT_BYTES: usize = 68;
 pub const ARENA0_ROUTER_AND_PRE_BUS_BYTES: usize = 256;
 pub const ARENA0_ROUTER_AND_PRE_BUS_CL: usize = 4;
 
@@ -234,6 +262,28 @@ pub fn read_f32_le(slice: &[u8], offset: usize) -> f32 {
     } else {
         0.0
     }
+}
+
+/// Read an explicit little-endian `u32` safely from an arena byte slice.
+#[inline(always)]
+pub fn read_u32_le(slice: &[u8], offset: usize) -> u32 {
+    if offset + 4 <= slice.len() {
+        u32::from_le_bytes([
+            slice[offset],
+            slice[offset + 1],
+            slice[offset + 2],
+            slice[offset + 3],
+        ])
+    } else {
+        0
+    }
+}
+
+/// Returns true when the canonical `v2.0` extended pipeline flags magic (`0x444E`) and `flag` are set.
+#[inline(always)]
+pub fn has_pipeline_flag(arena: &[u8], flag: u32) -> bool {
+    let word = read_u32_le(arena, ARENA0_PIPELINE_FLAGS_OFFSET);
+    (word & PIPE_MAGIC_MASK) == PIPE_MAGIC_HI && (word & flag) != 0
 }
 
 /// Zero-copy directory view into the 64,000 B tensor arena.

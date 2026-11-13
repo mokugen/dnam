@@ -128,6 +128,8 @@ pub struct ControlBus<B: MathBackend> {
     pub drift_prng_state: u64,
     /// 4-channel OU analog drift state $\boldsymbol{\eta}_{\text{drift}}[k] \in \mathbb{R}^4$.
     pub ou_drift_state: [f32; 4],
+    /// Non-colliding unified `16 x 16` + Ultra `16 x 4` `W_ctrl` mode (`PIPE_FLAG_UNIFIED_W_CTRL`).
+    pub unified_w_ctrl: bool,
     _backend: PhantomData<B>,
 }
 
@@ -188,6 +190,7 @@ impl<B: MathBackend> ControlBus<B> {
             offline_bounce: false,
             drift_prng_state: Self::DEFAULT_DRIFT_PRNG_SEED,
             ou_drift_state: [0.0; 4],
+            unified_w_ctrl: false,
             _backend: PhantomData,
         }
     }
@@ -293,6 +296,10 @@ impl<B: MathBackend> ControlBus<B> {
     /// inline `CP1` contributor slots (`Arena 0 [7,680..8,512]` and `Arena 3 [61,312..63,424]`), and
     /// global LFO/Envelope/Trust-Region anchors from `Arena 0..3` and snaps all controls to their `default_val`.
     pub fn load_from_arena0(&mut self, arena0_bytes: &[u8], num_controls: usize, rho_ctrl: f64) {
+        self.unified_w_ctrl = crate::stages::weights::has_pipeline_flag(
+            arena0_bytes,
+            crate::stages::weights::PIPE_FLAG_UNIFIED_W_CTRL,
+        );
         self.ensure_control_capacity(num_controls);
         self.num_controls = num_controls;
         let table_base = 8_512_usize;

@@ -4,6 +4,7 @@
 
 use super::Stage2CommutedCascade;
 use crate::math::flush_recursive_state_f32;
+use crate::stages::weights::{ARENA0_STAGE2_EXT_OFFSET, PIPE_FLAG_STAGE2_EXT, has_pipeline_flag};
 
 /// 4-Filter Tone Basis Filter State: `[Direct, LPF_80, LPF_400, HPF_1200]`.
 #[derive(Clone, Copy, Debug)]
@@ -372,6 +373,81 @@ impl Stage2CommutedCascade {
                 self.role_a_scales[t] = [1.0; 16];
             }
         }
+
+        self.ext_active = has_pipeline_flag(arena, PIPE_FLAG_STAGE2_EXT)
+            && arena.len() >= ARENA0_STAGE2_EXT_OFFSET + 40;
+        if self.ext_active {
+            let b = ARENA0_STAGE2_EXT_OFFSET;
+            let hp = read_f32_le(arena, b);
+            self.base_pre_hpf_pole = if hp.is_finite() && (1.0e-4..=0.999995).contains(&hp) {
+                hp
+            } else {
+                0.0
+            };
+            let lp = read_f32_le(arena, b + 4);
+            self.base_pre_lpf_pole = if lp.is_finite() && (1.0e-4..=0.999995).contains(&lp) {
+                lp
+            } else {
+                0.0
+            };
+            let l1h = read_f32_le(arena, b + 8);
+            self.l1_hpf_mix = if l1h.is_finite() {
+                l1h.clamp(-1.0, 2.0)
+            } else {
+                0.0
+            };
+            let l2h = read_f32_le(arena, b + 12);
+            self.l2_hpf_mix = if l2h.is_finite() {
+                l2h.clamp(-1.0, 2.0)
+            } else {
+                0.0
+            };
+            let wfm = read_f32_le(arena, b + 16);
+            self.v1b_wf_mix = if wfm.is_finite() {
+                wfm.clamp(0.0, 1.0)
+            } else {
+                0.3
+            };
+            let phm = read_f32_le(arena, b + 20);
+            self.pwr_hyst_mix = if phm.is_finite() {
+                phm.clamp(0.0, 1.0)
+            } else {
+                0.1
+            };
+            let cbm = read_f32_le(arena, b + 24);
+            self.clean_bypass_mix = if cbm.is_finite() {
+                cbm.clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let ifm = read_f32_le(arena, b + 28);
+            self.iron_sub_flux_mix = if ifm.is_finite() {
+                ifm.clamp(0.0, 2.0)
+            } else {
+                0.0
+            };
+            let lin = read_f32_le(arena, b + 32);
+            self.linear_v1a_v1b = lin.is_finite() && lin > 0.5;
+            let og = read_f32_le(arena, b + 36);
+            self.stage2_out_gain = if og.is_finite() && og > 1.0e-6 {
+                og.clamp(0.05, 8.0)
+            } else {
+                1.0
+            };
+        } else {
+            self.base_pre_hpf_pole = 0.0;
+            self.base_pre_lpf_pole = 0.0;
+            self.pre_hpf_pole = 0.0;
+            self.pre_lpf_pole = 0.0;
+            self.l1_hpf_mix = 0.0;
+            self.l2_hpf_mix = 0.0;
+            self.v1b_wf_mix = 0.3;
+            self.pwr_hyst_mix = 0.1;
+            self.clean_bypass_mix = 0.0;
+            self.iron_sub_flux_mix = 0.0;
+            self.linear_v1a_v1b = false;
+            self.stage2_out_gain = 1.0;
+        }
     }
 
     /// Reconfigures Stage II AC-coupling pole, sag integrator poles, hysteresis rate scale,
@@ -418,6 +494,19 @@ impl Stage2CommutedCascade {
             self.branch_poles[b][0] = zoh.rescale_real_pole(self.base_branch_params[b][0]);
             self.branch_poles[b][1] = zoh.rescale_real_pole(self.base_branch_params[b][1]);
         }
+
+        self.pre_hpf_pole = if self.base_pre_hpf_pole > 1.0e-4 {
+            zoh.rescale_real_pole(self.base_pre_hpf_pole)
+        } else {
+            0.0
+        };
+        self.pre_lpf_pole = if self.base_pre_lpf_pole > 1.0e-4 {
+            zoh.rescale_real_pole(self.base_pre_lpf_pole)
+        } else {
+            0.0
+        };
+        self.iron_flux_pole = zoh.rescale_real_pole(0.992);
+        self.v2_basis.reconfigure_sample_rate(zoh);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -427,6 +516,7 @@ impl Stage2CommutedCascade {
         state_r: &mut [f32; 6],
         poles: &[f32; 6],
         gains: &[f32; 3],
+        hpf_mix: f32,
         x_l: f32,
         a_even_l: f32,
         x_r: f32,
@@ -476,8 +566,17 @@ impl Stage2CommutedCascade {
         state_r[4] = flush_recursive_state_f32(next_im_r);
         state_r[5] = flush_recursive_state_f32(next_rc_r);
 
-        let y_l = x_l + g0 * shelf_hi_l + g1 * next_re_l - g2 * next_rc_l;
-        let y_r = x_r + g0 * shelf_hi_r + g1 * next_re_r - g2 * next_rc_r;
+        let (base_l, base_r) = if hpf_mix.abs() > 1.0e-6 {
+            let om_h = 1.0 - hpf_mix;
+            (
+                om_h * x_l + hpf_mix * hpf_y_l,
+                om_h * x_r + hpf_mix * hpf_y_r,
+            )
+        } else {
+            (x_l, x_r)
+        };
+        let y_l = base_l + g0 * shelf_hi_l + g1 * next_re_l - g2 * next_rc_l;
+        let y_r = base_r + g0 * shelf_hi_r + g1 * next_re_r - g2 * next_rc_r;
         (y_l, y_r)
     }
 

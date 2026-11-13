@@ -4,10 +4,14 @@
 pub mod bezout_gram;
 pub mod bezout_schur;
 pub mod stage_a;
+pub mod stage_a_ext;
 pub mod stage_a_id;
+pub mod stage_a_refl;
 pub mod stage_b_c;
 pub mod stage_d;
+pub mod stage_d_basis;
 pub mod stage_e;
+pub mod stage_e_polish;
 pub mod stages;
 pub mod wide_gram;
 
@@ -33,7 +37,8 @@ pub use stage_e::{
     BuyerWatermarkConfig, StageESolveOutput, compute_integrated_lufs, derive_buyer_gauge_params,
     derive_buyer_phase_seed, derive_buyer_tardos_codebook, export_runtime_dnam_watermarked,
     extract_arena_pole_angles_34, finalize_stage_e_and_telemetry,
-    identify_pole_angles_blackbox_from_audio, render_blackbox_probe_response,
+    finalize_stage_e_and_telemetry_with_polish, identify_pole_angles_blackbox_from_audio,
+    render_blackbox_probe_response,
 };
 pub use wide_gram::{Wide192Accum, accumulate_uplo_u_wide192, contract_256d_gram_tiled_wide192};
 
@@ -52,7 +57,7 @@ impl Default for SolverOptions {
     fn default() -> Self {
         Self {
             stage_a: StageAConfig::default(),
-            gram_frame_stride: 4,
+            gram_frame_stride: 1,
             clear_dynamic_w_ctrl: true,
         }
     }
@@ -68,7 +73,7 @@ impl SolverOptions {
                 preserve_existing_backbone: true,
                 vp_gn_steps: 1,
             },
-            gram_frame_stride: 2,
+            gram_frame_stride: 1,
             clear_dynamic_w_ctrl: false,
         }
     }

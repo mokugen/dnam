@@ -53,6 +53,23 @@ pub(crate) fn control_default_f32(ctrl: &dnam_engine::schema::ControlSchemaDef) 
         .clamp(lo, hi)
 }
 
+pub(crate) fn switch_default_index_f32(ctrl: &dnam_engine::schema::ControlSchemaDef) -> f32 {
+    let Some(opts) = ctrl.declared_options.as_ref() else {
+        return 0.0;
+    };
+    if opts.is_empty() {
+        return 0.0;
+    }
+    let idx = ctrl
+        .default
+        .as_str()
+        .and_then(|s| opts.iter().position(|o| o == s))
+        .or_else(|| ctrl.default.as_u64().map(|u| u as usize))
+        .unwrap_or(0)
+        .min(opts.len() - 1);
+    idx as f32
+}
+
 pub(crate) fn build_controls_meta_map(
     manifest: &DnamProjManifest,
     values: &[f32],
@@ -74,9 +91,16 @@ pub(crate) fn build_controls_meta_map(
             }
             ControlKind::Switch => {
                 let opt = switch_overrides.get(&idx).cloned().unwrap_or_else(|| {
-                    ctrl.default
-                        .as_str()
-                        .map(str::to_string)
+                    ctrl.declared_options
+                        .as_ref()
+                        .filter(|o| !o.is_empty())
+                        .and_then(|opts| {
+                            values.get(idx).and_then(|&v| {
+                                let k = (v.round().max(0.0) as usize).min(opts.len() - 1);
+                                opts.get(k).cloned()
+                            })
+                        })
+                        .or_else(|| ctrl.default.as_str().map(str::to_string))
                         .or_else(|| {
                             ctrl.declared_options
                                 .as_ref()
@@ -98,7 +122,7 @@ pub(crate) fn default_control_vector(manifest: &DnamProjManifest) -> Vec<f32> {
         .iter()
         .map(|c| match c.kind {
             ControlKind::Range => control_default_f32(c),
-            ControlKind::Switch => 0.0,
+            ControlKind::Switch => switch_default_index_f32(c),
         })
         .collect()
 }
@@ -252,7 +276,88 @@ pub(crate) fn build_freeze_transition_stem_stimulus(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+fn steady_silent_dc(dry_48k: &[f32], wet_48k: &[f32], start: usize, end: usize) -> Option<f64> {
+    let mut vals = Vec::new();
+    for i in start..end {
+        if dry_48k[i].abs() < 1.0e-4 {
+            vals.push(f64::from(wet_48k[i]));
+        }
+    }
+    if vals.len() < 64 {
+        return None;
+    }
+    let tail = &vals[vals.len().saturating_sub(512)..];
+    let mean = tail.iter().sum::<f64>() / (tail.len() as f64);
+    if mean.abs() <= 1.0e-3 {
+        return None;
+    }
+    let max_dev = tail.iter().fold(0.0_f64, |m, &v| m.max((v - mean).abs()));
+    (max_dev < 0.25 * mean.abs()).then_some(mean)
+}
+
+pub(crate) fn estimate_causal_bulk_alignment(dry_48k: &[f32], wet_48k: &[f32]) -> (f64, bool, f64) {
+    let n = dry_48k.len().min(wet_48k.len());
+    if n < 64 {
+        return (0.0, false, 0.0);
+    }
+    let settle_start = n.saturating_sub(SETTLE_PAD_SAMPLES_48K);
+    let first_dry_active = dry_48k[..n]
+        .iter()
+        .position(|&x| x.abs() >= 1.0e-3)
+        .unwrap_or(0);
+    let dc_offset = steady_silent_dc(dry_48k, wet_48k, settle_start, n)
+        .or_else(|| {
+            (first_dry_active >= 64)
+                .then(|| steady_silent_dc(dry_48k, wet_48k, 0, first_dry_active))
+                .flatten()
+        })
+        .unwrap_or(0.0);
+
+    let wet_centered_buf: Vec<f32>;
+    let wet_centered: &[f32] = if dc_offset.abs() > 0.0 {
+        wet_centered_buf = wet_48k[..n].iter().map(|&w| w - dc_offset as f32).collect();
+        &wet_centered_buf
+    } else {
+        &wet_48k[..n]
+    };
+
+    let dry_peak = dry_48k[..n]
+        .iter()
+        .fold(0.0_f64, |m, &x| m.max(f64::from(x).abs()));
+    let wet_peak = wet_centered
+        .iter()
+        .fold(0.0_f64, |m, &x| m.max(f64::from(x).abs()));
+    let causal_gap = if dry_peak > 1.0e-4 && wet_peak > 1.0e-4 {
+        let dry_thresh = (0.02 * dry_peak).max(1.0e-4);
+        let wet_thresh = (0.02 * wet_peak).max(1.0e-4);
+        let n_dry_onset = dry_48k[..n]
+            .iter()
+            .position(|&x| f64::from(x).abs() >= dry_thresh)
+            .unwrap_or(0) as f64;
+        let n_wet_onset = wet_centered
+            .iter()
+            .position(|&x| f64::from(x).abs() >= wet_thresh)
+            .unwrap_or(0) as f64;
+        (n_wet_onset - n_dry_onset).max(0.0)
+    } else {
+        0.0
+    };
+
+    let (raw_lag, inv_pol) =
+        match estimate_multiregime_alignment(&dry_48k[..n], wet_centered, 48_000, 1_024) {
+            Ok(al) => (al.total_lag_samples, al.polarity_inverted),
+            Err(_) => (0.0, false),
+        };
+    let upper = causal_gap + 12.0;
+    let bulk_lag = if raw_lag > upper {
+        causal_gap
+    } else {
+        raw_lag.max(0.0)
+    };
+    (bulk_lag, inv_pol, dc_offset)
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn seal_coresets_to_inpc_and_vault(
     stem_id: &str,
     is_star_center: bool,
@@ -266,6 +371,38 @@ pub(crate) fn seal_coresets_to_inpc_and_vault(
     windows: Vec<StmcTrajectoryWindow>,
     controls_meta: BTreeMap<String, serde_json::Value>,
 ) -> Result<(Vec<u8>, VaultCaptureSpec), DnamError> {
+    let (inpc_bytes, spec, _, _) = seal_coresets_to_inpc_and_vault_with_override(
+        stem_id,
+        is_star_center,
+        seed_256,
+        carrier_bins,
+        valid_frames,
+        coreset_dry_l,
+        coreset_dry_r,
+        raw_wet_l,
+        raw_wet_r,
+        windows,
+        controls_meta,
+        None,
+    )?;
+    Ok((inpc_bytes, spec))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn seal_coresets_to_inpc_and_vault_with_override(
+    stem_id: &str,
+    is_star_center: bool,
+    seed_256: &[u8; 256],
+    carrier_bins: &[usize],
+    valid_frames: usize,
+    coreset_dry_l: &[f32],
+    coreset_dry_r: Option<&[f32]>,
+    raw_wet_l: &[f32],
+    raw_wet_r: Option<&[f32]>,
+    windows: Vec<StmcTrajectoryWindow>,
+    controls_meta: BTreeMap<String, serde_json::Value>,
+    shared_align: Option<(f64, bool)>,
+) -> Result<(Vec<u8>, VaultCaptureSpec, f64, bool), DnamError> {
     let dry_12k_l = &coreset_dry_l[..CORESET_FP16_FRAMES_PER_STEM];
     let dry_12k_r = coreset_dry_r.map(|r| &r[..CORESET_FP16_FRAMES_PER_STEM]);
     let dry_fp16 = encode_coreset_12k_fp16(dry_12k_l, dry_12k_r);
@@ -282,14 +419,10 @@ pub(crate) fn seal_coresets_to_inpc_and_vault(
 
     let dry_ref = &coreset_dry_l[..raw_wet_l.len().min(coreset_dry_l.len())];
     let wet_ref = &raw_wet_l[..dry_ref.len()];
-    let (lag_samples, inv_pol) = if dry_ref.len() >= 64 {
-        match estimate_multiregime_alignment(dry_ref, wet_ref, 48_000, 512) {
-            Ok(al) => (al.total_lag_samples, al.polarity_inverted),
-            Err(_) => (0.0, false),
-        }
-    } else {
-        (0.0, false)
-    };
+    let (lag_samples, inv_pol) = shared_align.unwrap_or_else(|| {
+        let (lag, pol, _) = estimate_causal_bulk_alignment(dry_ref, wet_ref);
+        (lag, pol)
+    });
 
     let aligned_wet_l = realign_fractional_kaiser64(raw_wet_l, lag_samples, 0.0, inv_pol);
     let aligned_wet_r = raw_wet_r
@@ -308,6 +441,12 @@ pub(crate) fn seal_coresets_to_inpc_and_vault(
         num_frames: CORESET_FP16_FRAMES_PER_STEM as u64,
     };
 
+    let mut user_metadata = BTreeMap::new();
+    user_metadata.insert(
+        "wet_polarity_inverted".to_string(),
+        serde_json::Value::Bool(inv_pol),
+    );
+
     let spec = VaultCaptureSpec {
         stem_id: stem_id.to_string(),
         is_star_center,
@@ -316,7 +455,7 @@ pub(crate) fn seal_coresets_to_inpc_and_vault(
         fractional_lag_samples_f32: lag_samples as f32,
         controls_meta,
         provenance,
-        user_metadata: BTreeMap::new(),
+        user_metadata,
         extracted_physics: None,
         windows,
         band_psd_summary_88: psd_88,
@@ -325,12 +464,12 @@ pub(crate) fn seal_coresets_to_inpc_and_vault(
         wet_coreset_fp16: wet_fp16,
         optional_spcm: None,
     };
-    Ok((inpc_bytes, spec))
+    Ok((inpc_bytes, spec, lag_samples, inv_pol))
 }
 
 /// Aligns a full `48 kHz`-normalized stem on its aperiodic `A5` coreset+settle window FIRST
 /// (handling bulk converter/DSP latency without periodic comb aliases) before slicing `12,000` frames.
-#[allow(clippy::too_many_arguments)]
+#[allow(dead_code, clippy::too_many_arguments)]
 pub(crate) fn align_full_stem_and_seal_vault(
     stem_id: &str,
     is_star_center: bool,
@@ -345,8 +484,51 @@ pub(crate) fn align_full_stem_and_seal_vault(
     controls_meta: BTreeMap<String, serde_json::Value>,
     user_metadata: BTreeMap<String, serde_json::Value>,
 ) -> Result<(Vec<u8>, VaultCaptureSpec), DnamError> {
+    let (inpc_bytes, spec, _, _) = align_full_stem_and_seal_vault_with_override(
+        stem_id,
+        is_star_center,
+        seed_256,
+        carrier_bins,
+        valid_frames,
+        dry_48k_l,
+        dry_48k_r,
+        wet_48k_l,
+        wet_48k_r,
+        windows,
+        controls_meta,
+        user_metadata,
+        None,
+    )?;
+    Ok((inpc_bytes, spec))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn align_full_stem_and_seal_vault_with_override(
+    stem_id: &str,
+    is_star_center: bool,
+    seed_256: &[u8; 256],
+    carrier_bins: &[usize],
+    valid_frames: usize,
+    dry_48k_l: &[f32],
+    dry_48k_r: Option<&[f32]>,
+    wet_48k_l: &[f32],
+    wet_48k_r: Option<&[f32]>,
+    windows: Vec<StmcTrajectoryWindow>,
+    controls_meta: BTreeMap<String, serde_json::Value>,
+    mut user_metadata: BTreeMap<String, serde_json::Value>,
+    shared_align: Option<(f64, bool)>,
+) -> Result<(Vec<u8>, VaultCaptureSpec, f64, bool), DnamError> {
+    const RING_GUARD: usize = 128;
+    let has_leading_coreset = dry_48k_l.len() >= CORESET_WITH_SETTLE_48K + ADAPTIVE_FRAME_SAMPLES
+        && dry_48k_l
+            [CORESET_FP16_FRAMES_PER_STEM + RING_GUARD..CORESET_WITH_SETTLE_48K - RING_GUARD]
+            .iter()
+            .all(|&v| v.abs() < 1.0e-3)
+        && dry_48k_l[..CORESET_FP16_FRAMES_PER_STEM]
+            .iter()
+            .any(|&v| v.abs() > 1.0e-3);
     let has_settle_pad = dry_48k_l.len() >= CORESET_WITH_SETTLE_48K
-        && dry_48k_l[dry_48k_l.len() - SETTLE_PAD_SAMPLES_48K..]
+        && dry_48k_l[dry_48k_l.len() - SETTLE_PAD_SAMPLES_48K + RING_GUARD..]
             .iter()
             .all(|&v| v.abs() < 1.0e-3);
     let tail_span = if has_settle_pad {
@@ -354,9 +536,18 @@ pub(crate) fn align_full_stem_and_seal_vault(
     } else {
         CORESET_FP16_FRAMES_PER_STEM
     };
-    let core_start = dry_48k_l.len().saturating_sub(tail_span);
+    let core_start = if has_leading_coreset {
+        0
+    } else {
+        dry_48k_l.len().saturating_sub(tail_span)
+    };
+    let align_span = if has_leading_coreset {
+        CORESET_WITH_SETTLE_48K
+    } else {
+        tail_span
+    };
 
-    let dry_align_slice = &dry_48k_l[core_start..];
+    let dry_align_slice = &dry_48k_l[core_start..(core_start + align_span).min(dry_48k_l.len())];
     let wet_align_end = wet_48k_l.len().min(core_start + dry_align_slice.len());
     let wet_align_slice = if core_start < wet_align_end {
         &wet_48k_l[core_start..wet_align_end]
@@ -364,19 +555,13 @@ pub(crate) fn align_full_stem_and_seal_vault(
         &[]
     };
     let common_len = dry_align_slice.len().min(wet_align_slice.len());
-    let (lag_samples, inv_pol) = if common_len >= 64 {
-        match estimate_multiregime_alignment(
+    let (lag_samples, inv_pol) = shared_align.unwrap_or_else(|| {
+        let (lag, pol, _) = estimate_causal_bulk_alignment(
             &dry_align_slice[..common_len],
             &wet_align_slice[..common_len],
-            48_000,
-            1_024,
-        ) {
-            Ok(al) => (al.total_lag_samples, al.polarity_inverted),
-            Err(_) => (0.0, false),
-        }
-    } else {
-        (0.0, false)
-    };
+        );
+        (lag, pol)
+    });
 
     let full_aligned_l = realign_fractional_kaiser64(wet_48k_l, lag_samples, 0.0, inv_pol);
     let full_aligned_r = wet_48k_r
@@ -420,6 +605,10 @@ pub(crate) fn align_full_stem_and_seal_vault(
         target_pcm_sha256: compute_pcm_sha256(wet_12k_l),
         num_frames: CORESET_FP16_FRAMES_PER_STEM as u64,
     };
+    user_metadata.insert(
+        "wet_polarity_inverted".to_string(),
+        serde_json::Value::Bool(inv_pol),
+    );
 
     let spec = VaultCaptureSpec {
         stem_id: stem_id.to_string(),
@@ -438,7 +627,7 @@ pub(crate) fn align_full_stem_and_seal_vault(
         wet_coreset_fp16: wet_fp16,
         optional_spcm: None,
     };
-    Ok((inpc_bytes, spec))
+    Ok((inpc_bytes, spec, lag_samples, inv_pol))
 }
 
 /// Re-normalizes and replaces a clipped stem after the user engages a physical `-10 dB` / `-20 dB`

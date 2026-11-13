@@ -2,12 +2,59 @@
 //!
 //! Canonical Reference: `docs/dsp/router_and_stages_topology.md` §2.1 (4,144 B Lite RAM).
 
+use crate::math::backend::rsqrt_nr2_scalar_f32;
+use crate::math::spec_math::q32_phase_to_phasor;
+use crate::math::{flush_recursive_state_f32, init_math::powf_f64, newton6_reciprocal_f64};
 use crate::operators::op_m::{
     HilbertH1Lattice6Sec, SymplecticModal4Lane, T1DcBlocker, T1SubHarmonicTracker,
+    algebraic_unit_rotor_op_m,
 };
 use crate::operators::op_n::c2_wavefolder;
 use crate::operators::op_t::OpTDelayLine;
 use crate::provenance::watermark::read_f32_le;
+use crate::stages::weights::{
+    ARENA0_STAGE1_EXT_OFFSET, PIPE_FLAG_STAGE1_EXT, PIPE_FLAG_ZERO_OP_T_PRE, has_pipeline_flag,
+};
+use alloc::vec::Vec;
+
+#[inline(always)]
+fn recip_nr2_pos_f32(d: f32) -> f32 {
+    let clamped = d.max(1.0e-12);
+    let r = rsqrt_nr2_scalar_f32(clamped);
+    let y = r * r;
+    y * (2.0 - clamped * y)
+}
+
+#[inline(always)]
+fn exp2_pos_approx_f32(x: f32) -> f32 {
+    let xc = x.clamp(0.0, 4.0);
+    let k = xc as u32;
+    let f = xc - (k as f32);
+    let poly = 1.0
+        + f * (core::f32::consts::LN_2 + f * (0.240_226_5 + f * (0.055_504_1 + f * 0.009_618_1)));
+    ((1_u32 << k) as f32) * poly
+}
+
+#[inline(always)]
+fn rescale_alpha_48k_to_fs(alpha_48k: f32, pole_power_ratio: f64) -> f32 {
+    let a = f64::from(alpha_48k.clamp(0.0, 0.9999));
+    if a <= 0.0 {
+        return 0.0;
+    }
+    if (pole_power_ratio - 1.0).abs() <= 1.0e-9 {
+        return alpha_48k;
+    }
+    (1.0 - powf_f64((1.0 - a).clamp(1.0e-8, 1.0), pole_power_ratio)).clamp(1.0e-8, 0.9999) as f32
+}
+
+#[inline(always)]
+fn read_sample_linear(ring: &[f32], mask: usize, wr_idx: usize, delay_samples: f32) -> f32 {
+    let d_int = delay_samples as usize;
+    let frac = delay_samples - (d_int as f32);
+    let s0 = ring[wr_idx.wrapping_sub(d_int) & mask];
+    let s1 = ring[wr_idx.wrapping_sub(d_int + 1) & mask];
+    s0 + frac * (s1 - s0)
+}
 
 /// State RAM footprint for Stage I Lite: strictly 4,144 B.
 pub const STAGE1_PRE_RAM_BYTES: usize = 4144;
@@ -82,7 +129,93 @@ pub struct Stage1PreDynamics {
     /// 2 = T -> N -> M (Mod -> Drive -> Filter)
     /// 3 = T -> M -> N (Mod -> Filter -> Drive)
     pub topology_mode: u8,
-    pub _pad: [u8; 7],
+    /// Active flag for extended Stage I v2 operators loaded from `Arena 0 [360..488]`.
+    pub ext_active: bool,
+    /// Persistent flag indicating the loaded `.dnam` declares zero `Op-T[Pre]` alignment latency.
+    pub zero_op_t_flag: bool,
+    /// Active runtime bypass for `Op-T[Pre]` when `target_delay == 0.0`.
+    pub op_t_bypass: bool,
+    pub _pad: [u8; 4],
+    /// Op-N wavefolder residual mix in extended mode (`0.0..=1.0`; `1.0` preserves legacy 0.2x blend).
+    pub op_n_wf_mix: f32,
+    /// Dual-release optical / RMS compressor parameters & states (`0 FDIV`).
+    pub comp_thresh: f32,
+    pub comp_slope: f32,
+    pub base_comp_atk_48k: f32,
+    pub base_comp_rel_fast_48k: f32,
+    pub base_comp_rel_slow_48k: f32,
+    pub comp_atk_alpha: f32,
+    pub comp_rel_fast_alpha: f32,
+    pub comp_rel_slow_alpha: f32,
+    pub comp_makeup_gain: f32,
+    pub comp_mix: f32,
+    pub comp_sidechain_aux_mix: f32,
+    pub comp_fast_env: f32,
+    pub comp_slow_env: f32,
+    /// Extended envelope gate (`0.0` = disabled) & state.
+    pub gate_ext_thresh: f32,
+    pub gate_ext_inv_thresh: f32,
+    pub base_gate_atk_48k: f32,
+    pub base_gate_rel_48k: f32,
+    pub gate_atk_alpha: f32,
+    pub gate_rel_alpha: f32,
+    pub gate_ext_env: f32,
+    /// Sub-octave divider, Octavia rectifier & audio-rate ring-modulator (`0 libm`).
+    pub octave_rectify_mix: f32,
+    pub octave_sub1_mix: f32,
+    pub octave_sub2_mix: f32,
+    pub ringmod_mix: f32,
+    pub base_ringmod_freq_hz: f32,
+    pub ringmod_inc_q32: u32,
+    pub ringmod_phase_q32: u32,
+    pub oct_trk_alpha: f32,
+    pub oct_env_alpha: f32,
+    pub oct_tracker_lp: f32,
+    pub oct_env_follow: f32,
+    pub oct_prev_sign: f32,
+    pub oct_ff1: f32,
+    pub oct_ff2: f32,
+    pub oct_sub1_count: u32,
+    /// Stereo chorus & rotary AM/Doppler horn inertia (`0 libm`, `0 rem_euclid`).
+    pub chorus_wet_mix: f32,
+    pub base_chorus_delay_48k: f32,
+    pub base_chorus_depth_48k: f32,
+    pub chorus_delay_host: f32,
+    pub chorus_depth_host: f32,
+    pub base_chorus_freq_l_hz: f32,
+    pub base_chorus_freq_r_hz: f32,
+    pub chorus_inc_l_q32: u32,
+    pub chorus_inc_r_q32: u32,
+    pub chorus_phase_l_q32: u32,
+    pub chorus_phase_r_q32: u32,
+    pub base_horn_freq_hz: f32,
+    pub horn_current_hz: f32,
+    pub horn_target_hz: f32,
+    pub horn_inertia_alpha: f32,
+    pub freq_to_q32_scale: f32,
+    pub horn_phase_q32: u32,
+    pub base_rotary_doppler_48k: f32,
+    pub rotary_doppler_host: f32,
+    pub rotary_am_depth: f32,
+    pub chorus_buf_l: Vec<f32>,
+    pub chorus_buf_r: Vec<f32>,
+    pub chorus_wr_idx: usize,
+    /// Envelope-followed resonant TPT SVF (`0 FDIV`, `0 libm`).
+    pub svf_mix: f32,
+    pub svf_base_fc_hz: f32,
+    pub svf_env_sens: f32,
+    pub svf_k_damp: f32,
+    pub svf_lp_w: f32,
+    pub svf_bp_w: f32,
+    pub svf_hp_w: f32,
+    pub svf_atk_alpha: f32,
+    pub svf_rel_alpha: f32,
+    pub svf_inv_fs_eff: f32,
+    pub svf_env_state: f32,
+    pub svf_ic1_l: f32,
+    pub svf_ic2_l: f32,
+    pub svf_ic1_r: f32,
+    pub svf_ic2_r: f32,
 }
 
 impl Default for Stage1PreDynamics {
@@ -152,7 +285,96 @@ impl Stage1PreDynamics {
             gate_ratio: 0.0,
             pitch_blend: 0.0,
             topology_mode: 0,
-            _pad: [0; 7],
+            ext_active: false,
+            zero_op_t_flag: false,
+            op_t_bypass: false,
+            _pad: [0; 4],
+            op_n_wf_mix: 1.0,
+            comp_thresh: 1.0,
+            comp_slope: 0.0,
+            base_comp_atk_48k: 0.008,
+            base_comp_rel_fast_48k: 0.0014,
+            base_comp_rel_slow_48k: 0.000055,
+            comp_atk_alpha: 0.008,
+            comp_rel_fast_alpha: 0.0014,
+            comp_rel_slow_alpha: 0.000055,
+            comp_makeup_gain: 1.0,
+            comp_mix: 0.0,
+            comp_sidechain_aux_mix: 0.0,
+            comp_fast_env: 0.0,
+            comp_slow_env: 0.0,
+            gate_ext_thresh: 0.0,
+            gate_ext_inv_thresh: 0.0,
+            base_gate_atk_48k: 0.08,
+            base_gate_rel_48k: 0.0032,
+            gate_atk_alpha: 0.08,
+            gate_rel_alpha: 0.0032,
+            gate_ext_env: 0.0,
+            octave_rectify_mix: 0.0,
+            octave_sub1_mix: 0.0,
+            octave_sub2_mix: 0.0,
+            ringmod_mix: 0.0,
+            base_ringmod_freq_hz: 0.0,
+            ringmod_inc_q32: 0,
+            ringmod_phase_q32: 0,
+            oct_trk_alpha: 0.047,
+            oct_env_alpha: 0.020,
+            oct_tracker_lp: 0.0,
+            oct_env_follow: 0.0,
+            oct_prev_sign: 1.0,
+            oct_ff1: 1.0,
+            oct_ff2: 1.0,
+            oct_sub1_count: 0,
+            chorus_wet_mix: 0.0,
+            base_chorus_delay_48k: 0.0,
+            base_chorus_depth_48k: 0.0,
+            chorus_delay_host: 0.0,
+            chorus_depth_host: 0.0,
+            base_chorus_freq_l_hz: 0.0,
+            base_chorus_freq_r_hz: 0.0,
+            chorus_inc_l_q32: 0,
+            chorus_inc_r_q32: 0,
+            chorus_phase_l_q32: 0,
+            chorus_phase_r_q32: 0x4000_0000,
+            base_horn_freq_hz: 0.8,
+            horn_current_hz: 0.8,
+            horn_target_hz: 0.8,
+            horn_inertia_alpha: 1.7e-5,
+            freq_to_q32_scale: 89_478.484,
+            horn_phase_q32: 0,
+            base_rotary_doppler_48k: 0.0,
+            rotary_doppler_host: 0.0,
+            rotary_am_depth: 0.0,
+            chorus_buf_l: Vec::new(),
+            chorus_buf_r: Vec::new(),
+            chorus_wr_idx: 0,
+            svf_mix: 0.0,
+            svf_base_fc_hz: 320.0,
+            svf_env_sens: 0.0,
+            svf_k_damp: 0.5,
+            svf_lp_w: 0.0,
+            svf_bp_w: 1.0,
+            svf_hp_w: 0.0,
+            svf_atk_alpha: 0.032,
+            svf_rel_alpha: 0.0012,
+            svf_inv_fs_eff: 1.0 / 48_000.0,
+            svf_env_state: 0.0,
+            svf_ic1_l: 0.0,
+            svf_ic2_l: 0.0,
+            svf_ic1_r: 0.0,
+            svf_ic2_r: 0.0,
+        }
+    }
+
+    /// Pre-allocates non-RT stereo chorus ring buffers (pow2 `4_096` frames) so `reload_model_in_place`
+    /// and `4x` bounce toggling perform zero heap allocations.
+    pub fn reserve_extended_capacity(&mut self, pow2_frames: usize) {
+        let cap = pow2_frames.next_power_of_two().max(4_096);
+        if self.chorus_buf_l.len() < cap {
+            self.chorus_buf_l.resize(cap, 0.0);
+        }
+        if self.chorus_buf_r.len() < cap {
+            self.chorus_buf_r.resize(cap, 0.0);
         }
     }
 
@@ -176,6 +398,29 @@ impl Stage1PreDynamics {
         self.last_op_t_r = 0.0;
         self.prev_op_t_l = 0.0;
         self.prev_op_t_r = 0.0;
+        self.comp_fast_env = 0.0;
+        self.comp_slow_env = 0.0;
+        self.gate_ext_env = 0.0;
+        self.ringmod_phase_q32 = 0;
+        self.oct_tracker_lp = 0.0;
+        self.oct_env_follow = 0.0;
+        self.oct_prev_sign = 1.0;
+        self.oct_ff1 = 1.0;
+        self.oct_ff2 = 1.0;
+        self.oct_sub1_count = 0;
+        self.chorus_phase_l_q32 = 0;
+        self.chorus_phase_r_q32 = 0x4000_0000;
+        self.horn_phase_q32 = 0;
+        self.horn_current_hz = self.base_horn_freq_hz;
+        self.horn_target_hz = self.base_horn_freq_hz;
+        self.chorus_wr_idx = 0;
+        self.chorus_buf_l.fill(0.0);
+        self.chorus_buf_r.fill(0.0);
+        self.svf_env_state = 0.0;
+        self.svf_ic1_l = 0.0;
+        self.svf_ic2_l = 0.0;
+        self.svf_ic1_r = 0.0;
+        self.svf_ic2_r = 0.0;
     }
 
     /// Loads immutable 48 kHz Stage I Op-M, pre-gain, and topology parameters from `Arena 0 [256..360]`
@@ -270,10 +515,113 @@ impl Stage1PreDynamics {
         }
         self.last_dtheta_pre = 0.0;
         self.last_g_rad_pre = 0.5;
+
+        self.zero_op_t_flag = has_pipeline_flag(arena, PIPE_FLAG_ZERO_OP_T_PRE);
+        self.op_t_bypass = self.zero_op_t_flag;
+        self.ext_active = has_pipeline_flag(arena, PIPE_FLAG_STAGE1_EXT)
+            && arena.len() >= ARENA0_STAGE1_EXT_OFFSET + 128;
+        if self.ext_active {
+            let b = ARENA0_STAGE1_EXT_OFFSET;
+            self.op_n_wf_mix = read_f32_le(arena, b).clamp(0.0, 1.0);
+            self.comp_thresh = read_f32_le(arena, b + 4).clamp(0.0, 8.0);
+            self.comp_slope = read_f32_le(arena, b + 8).clamp(0.0, 32.0);
+            let ca = read_f32_le(arena, b + 12);
+            self.base_comp_atk_48k = if ca.is_finite() && ca > 0.0 {
+                ca.clamp(1e-6, 0.9999)
+            } else {
+                0.008
+            };
+            let crf = read_f32_le(arena, b + 16);
+            self.base_comp_rel_fast_48k = if crf.is_finite() && crf > 0.0 {
+                crf.clamp(1e-6, 0.9999)
+            } else {
+                0.0014
+            };
+            let crs = read_f32_le(arena, b + 20);
+            self.base_comp_rel_slow_48k = if crs.is_finite() && crs > 0.0 {
+                crs.clamp(1e-7, 0.9999)
+            } else {
+                0.000055
+            };
+            let mg = read_f32_le(arena, b + 24);
+            self.comp_makeup_gain = if mg.is_finite() && mg > 0.0 {
+                mg.clamp(0.01, 32.0)
+            } else {
+                1.0
+            };
+            self.comp_mix = read_f32_le(arena, b + 28).clamp(0.0, 1.0);
+            self.comp_sidechain_aux_mix = read_f32_le(arena, b + 32).clamp(0.0, 1.0);
+
+            self.gate_ext_thresh = read_f32_le(arena, b + 36).clamp(0.0, 1.0);
+            self.gate_ext_inv_thresh = if self.gate_ext_thresh > 1.0e-7 {
+                newton6_reciprocal_f64(f64::from(self.gate_ext_thresh)) as f32
+            } else {
+                0.0
+            };
+            let ga = read_f32_le(arena, b + 40);
+            self.base_gate_atk_48k = if ga.is_finite() && ga > 0.0 {
+                ga.clamp(1e-5, 0.9999)
+            } else {
+                0.077
+            };
+            let gr = read_f32_le(arena, b + 44);
+            self.base_gate_rel_48k = if gr.is_finite() && gr > 0.0 {
+                gr.clamp(1e-6, 0.9999)
+            } else {
+                0.0032
+            };
+
+            self.octave_rectify_mix = read_f32_le(arena, b + 48).clamp(0.0, 4.0);
+            self.octave_sub1_mix = read_f32_le(arena, b + 52).clamp(0.0, 4.0);
+            self.octave_sub2_mix = read_f32_le(arena, b + 56).clamp(0.0, 4.0);
+            self.ringmod_mix = read_f32_le(arena, b + 60).clamp(0.0, 4.0);
+            self.base_ringmod_freq_hz = read_f32_le(arena, b + 64).clamp(0.0, 20_000.0);
+
+            self.chorus_wet_mix = read_f32_le(arena, b + 68).clamp(0.0, 1.0);
+            self.base_chorus_delay_48k = read_f32_le(arena, b + 72).clamp(0.0, 1_800.0);
+            self.base_chorus_depth_48k = read_f32_le(arena, b + 76).clamp(0.0, 600.0);
+            self.base_chorus_freq_l_hz = read_f32_le(arena, b + 80).clamp(0.0, 40.0);
+            self.base_chorus_freq_r_hz = read_f32_le(arena, b + 84).clamp(0.0, 40.0);
+            self.base_horn_freq_hz = read_f32_le(arena, b + 88).clamp(0.0, 40.0);
+            self.horn_target_hz = self.base_horn_freq_hz;
+            self.horn_current_hz = self.base_horn_freq_hz;
+            self.base_rotary_doppler_48k = read_f32_le(arena, b + 92).clamp(0.0, 200.0);
+            self.rotary_am_depth = read_f32_le(arena, b + 96).clamp(0.0, 0.95);
+
+            self.svf_mix = read_f32_le(arena, b + 100).clamp(0.0, 1.0);
+            let sfc = read_f32_le(arena, b + 104);
+            self.svf_base_fc_hz = if sfc.is_finite() && sfc > 20.0 {
+                sfc.clamp(20.0, 18_000.0)
+            } else {
+                320.0
+            };
+            self.svf_env_sens = read_f32_le(arena, b + 108).clamp(0.0, 16.0);
+            let kd = read_f32_le(arena, b + 112);
+            self.svf_k_damp = if kd.is_finite() && kd > 0.02 {
+                kd.clamp(0.04, 4.0)
+            } else {
+                0.5
+            };
+            self.svf_lp_w = read_f32_le(arena, b + 116).clamp(-4.0, 4.0);
+            self.svf_bp_w = read_f32_le(arena, b + 120).clamp(-4.0, 4.0);
+            self.svf_hp_w = read_f32_le(arena, b + 124).clamp(-4.0, 4.0);
+        } else {
+            self.op_n_wf_mix = 1.0;
+            self.comp_mix = 0.0;
+            self.gate_ext_thresh = 0.0;
+            self.octave_rectify_mix = 0.0;
+            self.octave_sub1_mix = 0.0;
+            self.octave_sub2_mix = 0.0;
+            self.ringmod_mix = 0.0;
+            self.chorus_wet_mix = 0.0;
+            self.rotary_am_depth = 0.0;
+            self.svf_mix = 0.0;
+        }
     }
 
     /// Reconfigures Stage I Op-T delay, Op-M poles, T1 DC blockers, and H1 Hilbert lattices for `zoh`.
     pub fn reconfigure_sample_rate(&mut self, zoh: &crate::container::ZohRescaledParams) {
+        self.op_t_bypass = self.zero_op_t_flag && zoh.tau_ref_samples_host <= 1.0e-5;
         self.op_t_pre
             .set_xfade_len(zoh.switch_xfade_samples_host as usize);
         self.op_t_pre
@@ -353,6 +701,31 @@ impl Stage1PreDynamics {
             self.op_m_pre_delta_r.b_re[lane] = self.op_m_pre_delta_l.b_re[lane];
             self.op_m_pre_delta_r.b_im[lane] = 0.0;
         }
+
+        let inv_fs_eff = newton6_reciprocal_f64(fs_eff);
+        let q32_per_hz = 4_294_967_296.0_f64 * inv_fs_eff;
+        self.freq_to_q32_scale = q32_per_hz as f32;
+        self.svf_inv_fs_eff = inv_fs_eff as f32;
+
+        self.comp_atk_alpha = rescale_alpha_48k_to_fs(self.base_comp_atk_48k, zoh.rho_sr);
+        self.comp_rel_fast_alpha = rescale_alpha_48k_to_fs(self.base_comp_rel_fast_48k, zoh.rho_sr);
+        self.comp_rel_slow_alpha = rescale_alpha_48k_to_fs(self.base_comp_rel_slow_48k, zoh.rho_sr);
+        self.gate_atk_alpha = rescale_alpha_48k_to_fs(self.base_gate_atk_48k, zoh.rho_sr);
+        self.gate_rel_alpha = rescale_alpha_48k_to_fs(self.base_gate_rel_48k, zoh.rho_sr);
+
+        self.oct_trk_alpha = rescale_alpha_48k_to_fs(0.047, zoh.rho_sr);
+        self.oct_env_alpha = rescale_alpha_48k_to_fs(0.020, zoh.rho_sr);
+        self.horn_inertia_alpha = rescale_alpha_48k_to_fs(1.7e-5, zoh.rho_sr);
+        self.svf_atk_alpha = rescale_alpha_48k_to_fs(0.032, zoh.rho_sr);
+        self.svf_rel_alpha = rescale_alpha_48k_to_fs(0.0012, zoh.rho_sr);
+
+        self.ringmod_inc_q32 = ((f64::from(self.base_ringmod_freq_hz) * q32_per_hz) + 0.5) as u32;
+        self.chorus_inc_l_q32 = ((f64::from(self.base_chorus_freq_l_hz) * q32_per_hz) + 0.5) as u32;
+        self.chorus_inc_r_q32 = ((f64::from(self.base_chorus_freq_r_hz) * q32_per_hz) + 0.5) as u32;
+
+        self.chorus_delay_host = zoh.rescale_alignment_delay(self.base_chorus_delay_48k);
+        self.chorus_depth_host = zoh.rescale_alignment_delay(self.base_chorus_depth_48k);
+        self.rotary_doppler_host = zoh.rescale_alignment_delay(self.base_rotary_doppler_48k);
     }
 
     /// Retunes Stage I Op-M[Pre] (and Full+ delta Op-M when `retune_delta` is true) at the 3 kHz control rate (`0 FSQRT/FDIV/libm`).
@@ -519,7 +892,12 @@ impl Stage1PreDynamics {
         };
         // Soft pre-overdrive via C2 wavefolder
         let (w_odd, _) = c2_wavefolder(gated * 0.5);
-        0.8 * gated + 0.2 * w_odd
+        let wf_mix = if self.ext_active {
+            0.2 * self.op_n_wf_mix
+        } else {
+            0.2
+        };
+        (1.0 - wf_mix) * gated + wf_mix * w_odd
     }
 
     #[inline(always)]
@@ -573,11 +951,17 @@ impl Stage1PreDynamics {
 
     #[inline(always)]
     fn step_op_t(&mut self, x: f32) -> f32 {
+        if self.op_t_bypass {
+            return x;
+        }
         self.op_t_pre.step(x)
     }
 
     #[inline(always)]
     fn step_op_t_stereo(&mut self, in_l: f32, in_r: f32) -> (f32, f32) {
+        if self.op_t_bypass {
+            return (in_l, in_r);
+        }
         self.op_t_pre.step_stereo(in_l, in_r)
     }
 
@@ -679,6 +1063,299 @@ impl Stage1PreDynamics {
                 (n_l, n_r)
             }
         }
+    }
+
+    /// Evaluates extended Stage I operators (envelope gate, dual-release optical/sidechain compressor,
+    /// octave divider & audio-rate ring modulator, envelope-followed TPT SVF, core `Op-N`/`Op-M`/`Op-T`,
+    /// and stereo chorus / rotary AM+Doppler) with strict `0 FDIV / 0 FSQRT / 0 libm / 0 alloc`.
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
+    #[inline(always)]
+    pub fn step_stereo_ext(
+        &mut self,
+        in_l: f32,
+        in_r: f32,
+        aux_key: Option<(f32, f32)>,
+        stage_params: &[f32; 16],
+    ) -> (f32, f32) {
+        if !self.ext_active {
+            return self.step_stereo(in_l, in_r);
+        }
+
+        let mut x_l = in_l;
+        let mut x_r = in_r;
+
+        // 1. Envelope Gate
+        if self.gate_ext_thresh > 1.0e-6 {
+            let det = 0.5 * (x_l.abs() + x_r.abs());
+            let a_g = if det > self.gate_ext_env {
+                self.gate_atk_alpha
+            } else {
+                self.gate_rel_alpha
+            };
+            self.gate_ext_env =
+                flush_recursive_state_f32(self.gate_ext_env + a_g * (det - self.gate_ext_env));
+            let inv_t = self.gate_ext_inv_thresh * (1.0 - 0.5 * stage_params[0]).clamp(0.25, 4.0);
+            let u = (self.gate_ext_env * inv_t).clamp(0.0, 1.0);
+            let g = u * u * (3.0 - 2.0 * u);
+            x_l *= g;
+            x_r *= g;
+        }
+
+        // 2. Dual-Release Optical / Sidechain Compressor
+        if self.comp_mix > 1.0e-6 {
+            let sc = if self.comp_sidechain_aux_mix > 1.0e-6 {
+                let (main_det, aux_det) = if let Some((al, ar)) = aux_key {
+                    (0.5 * (x_l.abs() + x_r.abs()), 0.5 * (al.abs() + ar.abs()))
+                } else {
+                    let md = x_l.abs();
+                    let ad = x_r.abs();
+                    if self.comp_sidechain_aux_mix > 0.5 {
+                        x_r = x_l;
+                    }
+                    (md, ad)
+                };
+                (1.0 - self.comp_sidechain_aux_mix) * main_det
+                    + self.comp_sidechain_aux_mix * aux_det
+            } else {
+                0.5 * (x_l.abs() + x_r.abs())
+            };
+            let af = if sc > self.comp_fast_env {
+                self.comp_atk_alpha
+            } else {
+                self.comp_rel_fast_alpha
+            };
+            let asl = if sc > self.comp_slow_env {
+                0.25 * self.comp_atk_alpha
+            } else {
+                self.comp_rel_slow_alpha
+            };
+            self.comp_fast_env =
+                flush_recursive_state_f32(self.comp_fast_env + af * (sc - self.comp_fast_env));
+            self.comp_slow_env =
+                flush_recursive_state_f32(self.comp_slow_env + asl * (sc - self.comp_slow_env));
+            let env = 0.65 * self.comp_fast_env + 0.35 * self.comp_slow_env;
+            let thr =
+                (self.comp_thresh * (1.0 - 0.4 * stage_params[1]).clamp(0.15, 3.0)).max(1.0e-4);
+            let over = (env - thr).max(0.0);
+            let slope = (self.comp_slope * (1.0 + 0.5 * stage_params[2]).clamp(0.1, 4.0)).max(0.0);
+            let gr = recip_nr2_pos_f32(1.0 + slope * over * recip_nr2_pos_f32(thr))
+                * self.comp_makeup_gain;
+            let wet_m = self.comp_mix;
+            let dry_m = 1.0 - wet_m;
+            x_l = dry_m * x_l + wet_m * (gr * x_l);
+            x_r = dry_m * x_r + wet_m * (gr * x_r);
+        }
+
+        // 3. Sub-Octave Divider / Full-Wave Rectifier / Audio-Rate Ring Modulator
+        let mut ext_fb_l = [0.0_f32; 4];
+        let mut ext_fb_r = [0.0_f32; 4];
+        let mut has_ext_fb = false;
+        if self.octave_rectify_mix > 1.0e-6
+            || self.octave_sub1_mix > 1.0e-6
+            || self.octave_sub2_mix > 1.0e-6
+            || self.ringmod_mix > 1.0e-6
+            || self.base_ringmod_freq_hz > 0.0
+        {
+            let mono = 0.5 * (x_l + x_r);
+            self.oct_tracker_lp = flush_recursive_state_f32(
+                self.oct_tracker_lp + self.oct_trk_alpha * (mono - self.oct_tracker_lp),
+            );
+            self.oct_env_follow = flush_recursive_state_f32(
+                self.oct_env_follow + self.oct_env_alpha * (mono.abs() - self.oct_env_follow),
+            );
+            if self.oct_tracker_lp >= 0.0 && self.oct_prev_sign < 0.0 {
+                self.oct_ff1 = -self.oct_ff1;
+                self.oct_sub1_count = self.oct_sub1_count.wrapping_add(1);
+                if (self.oct_sub1_count & 1) == 0 {
+                    self.oct_ff2 = -self.oct_ff2;
+                }
+            }
+            self.oct_prev_sign = if self.oct_tracker_lp >= 0.0 {
+                1.0
+            } else {
+                -1.0
+            };
+
+            let rect_l = x_l.abs() - 0.5 * self.oct_env_follow;
+            let rect_r = x_r.abs() - 0.5 * self.oct_env_follow;
+            let sub1 = self.oct_ff1 * self.oct_env_follow;
+            let sub2 = self.oct_ff2 * self.oct_env_follow;
+
+            let mut rm_prod_l = 0.0_f32;
+            let mut rm_prod_r = 0.0_f32;
+            let (rm_l, rm_r) = if self.ringmod_mix > 1.0e-6 || self.base_ringmod_freq_hz > 0.0 {
+                let inc = if stage_params[13].abs() <= 1.0e-6 {
+                    self.ringmod_inc_q32
+                } else {
+                    ((self.ringmod_inc_q32 as f32)
+                        * exp2_pos_approx_f32((1.0 + stage_params[13]).clamp(0.0, 3.5))
+                        * 0.5) as u32
+                };
+                let (rm_cos, _) = q32_phase_to_phasor(self.ringmod_phase_q32);
+                self.ringmod_phase_q32 = self.ringmod_phase_q32.wrapping_add(inc);
+                rm_prod_l = x_l * rm_cos;
+                rm_prod_r = x_r * rm_cos;
+                let rm_gain = self.ringmod_mix;
+                if rm_gain <= 1.0e-6 {
+                    (0.0, 0.0)
+                } else if rm_gain <= 1.0 {
+                    (
+                        (1.0 - rm_gain) * x_l + rm_gain * rm_prod_l - x_l,
+                        (1.0 - rm_gain) * x_r + rm_gain * rm_prod_r - x_r,
+                    )
+                } else {
+                    (rm_gain * rm_prod_l, rm_gain * rm_prod_r)
+                }
+            } else {
+                (0.0, 0.0)
+            };
+
+            if self.octave_rectify_mix > 1.0e-6
+                || self.octave_sub1_mix > 1.0e-6
+                || self.octave_sub2_mix > 1.0e-6
+                || self.ringmod_mix > 1.0e-6
+            {
+                ext_fb_l = [rect_l, sub1, sub2, rm_prod_l];
+                ext_fb_r = [rect_r, sub1, sub2, rm_prod_r];
+                has_ext_fb = true;
+            }
+
+            x_l += self.octave_rectify_mix * rect_l
+                + self.octave_sub1_mix * sub1
+                + self.octave_sub2_mix * sub2
+                + rm_l;
+            x_r += self.octave_rectify_mix * rect_r
+                + self.octave_sub1_mix * sub1
+                + self.octave_sub2_mix * sub2
+                + rm_r;
+        }
+
+        // 4. Envelope-Followed Resonant TPT SVF
+        if self.svf_mix > 1.0e-6 {
+            let pre_svf_l = x_l;
+            let pre_svf_r = x_r;
+            let det = 0.5 * (x_l.abs() + x_r.abs());
+            let a_svf = if det > self.svf_env_state {
+                self.svf_atk_alpha
+            } else {
+                self.svf_rel_alpha
+            };
+            self.svf_env_state =
+                flush_recursive_state_f32(self.svf_env_state + a_svf * (det - self.svf_env_state));
+            let oct_shift = (self.svf_env_sens
+                * (1.0 + 0.5 * stage_params[14]).clamp(0.0, 3.0)
+                * self.svf_env_state
+                + stage_params[9])
+                .clamp(0.0, 3.8);
+            let fc = (self.svf_base_fc_hz * exp2_pos_approx_f32(oct_shift)).clamp(20.0, 18_000.0);
+            let w = (core::f32::consts::PI * fc * self.svf_inv_fs_eff).clamp(1.0e-4, 1.35);
+            let (c_w, s_w) = algebraic_unit_rotor_op_m(w);
+            let g = s_w * recip_nr2_pos_f32(c_w.max(0.05));
+            let k =
+                (self.svf_k_damp * (1.0 - 0.4 * stage_params[10]).clamp(0.2, 2.5)).clamp(0.05, 4.0);
+            let a1 = recip_nr2_pos_f32(1.0 + g * (g + k));
+            let a2 = g * a1;
+            let a3 = g * a2;
+
+            let v3_l = x_l - self.svf_ic2_l;
+            let v1_l = a1 * self.svf_ic1_l + a2 * v3_l;
+            let v2_l = self.svf_ic2_l + a2 * self.svf_ic1_l + a3 * v3_l;
+            self.svf_ic1_l = flush_recursive_state_f32(2.0 * v1_l - self.svf_ic1_l);
+            self.svf_ic2_l = flush_recursive_state_f32(2.0 * v2_l - self.svf_ic2_l);
+            let hp_l = x_l - k * v1_l - v2_l;
+            let svf_l = self.svf_lp_w * v2_l + self.svf_bp_w * v1_l + self.svf_hp_w * hp_l;
+
+            let v3_r = x_r - self.svf_ic2_r;
+            let v1_r = a1 * self.svf_ic1_r + a2 * v3_r;
+            let v2_r = self.svf_ic2_r + a2 * self.svf_ic1_r + a3 * v3_r;
+            self.svf_ic1_r = flush_recursive_state_f32(2.0 * v1_r - self.svf_ic1_r);
+            self.svf_ic2_r = flush_recursive_state_f32(2.0 * v2_r - self.svf_ic2_r);
+            let hp_r = x_r - k * v1_r - v2_r;
+            let svf_r = self.svf_lp_w * v2_r + self.svf_bp_w * v1_r + self.svf_hp_w * hp_r;
+
+            if !has_ext_fb {
+                ext_fb_l = [v2_l, v1_l, hp_l, pre_svf_l];
+                ext_fb_r = [v2_r, v1_r, hp_r, pre_svf_r];
+                has_ext_fb = true;
+            }
+
+            let dry_m = 1.0 - self.svf_mix;
+            x_l = dry_m * x_l + self.svf_mix * svf_l;
+            x_r = dry_m * x_r + self.svf_mix * svf_r;
+        }
+
+        // 5. Core Stage I Op-N / Op-M / Op-T
+        let (mut y_l, mut y_r) = self.step_stereo(x_l, x_r);
+
+        // 6. Stereo Chorus & Rotary Horn Inertia AM/Doppler
+        if (self.chorus_wet_mix > 1.0e-6 || self.rotary_am_depth > 1.0e-6)
+            && self.chorus_buf_l.len() >= 4_096
+            && self.chorus_buf_r.len() >= 4_096
+        {
+            let pre_chorus_l = y_l;
+            let pre_chorus_r = y_r;
+            let wr = self.chorus_wr_idx;
+            let mask = self.chorus_buf_l.len() - 1;
+            let max_d = (mask - 4) as f32;
+            self.chorus_buf_l[wr] = flush_recursive_state_f32(y_l);
+            self.chorus_buf_r[wr] = flush_recursive_state_f32(y_r);
+
+            let rate_scale = (1.0 + 0.5 * stage_params[15]).clamp(0.2, 4.0);
+            let inc_l = ((self.chorus_inc_l_q32 as f32) * rate_scale) as u32;
+            let inc_r = ((self.chorus_inc_r_q32 as f32) * rate_scale) as u32;
+            let (_, ch_sin_l) = q32_phase_to_phasor(self.chorus_phase_l_q32);
+            let (ch_cos_r, _) = q32_phase_to_phasor(self.chorus_phase_r_q32);
+            self.chorus_phase_l_q32 = self.chorus_phase_l_q32.wrapping_add(inc_l);
+            self.chorus_phase_r_q32 = self.chorus_phase_r_q32.wrapping_add(inc_r);
+
+            let horn_target = (self.base_horn_freq_hz * (1.0 + stage_params[15]).clamp(0.1, 8.0))
+                .clamp(0.0, 40.0);
+            self.horn_target_hz = horn_target;
+            self.horn_current_hz = flush_recursive_state_f32(
+                self.horn_current_hz
+                    + self.horn_inertia_alpha * (horn_target - self.horn_current_hz),
+            );
+            let horn_inc = (self.horn_current_hz * self.freq_to_q32_scale) as u32;
+            let (horn_cos, horn_sin) = q32_phase_to_phasor(self.horn_phase_q32);
+            self.horn_phase_q32 = self.horn_phase_q32.wrapping_add(horn_inc);
+
+            let depth_scale = if self.svf_mix <= 1.0e-6 {
+                (1.0 + 0.5 * stage_params[14]).clamp(0.0, 3.0)
+            } else {
+                1.0
+            };
+            let eff_depth = self.chorus_depth_host * depth_scale;
+            let d_l = (self.chorus_delay_host
+                + eff_depth * ch_sin_l
+                + self.rotary_doppler_host * horn_sin)
+                .clamp(1.0, max_d);
+            let d_r = (self.chorus_delay_host + eff_depth * ch_cos_r
+                - self.rotary_doppler_host * horn_sin)
+                .clamp(1.0, max_d);
+
+            let mut wet_l = read_sample_linear(&self.chorus_buf_l, mask, wr, d_l);
+            let mut wet_r = read_sample_linear(&self.chorus_buf_r, mask, wr, d_r);
+            if self.rotary_am_depth > 1.0e-6 {
+                wet_l *= 1.0 + self.rotary_am_depth * horn_cos;
+                wet_r *= 1.0 - self.rotary_am_depth * horn_cos;
+            }
+            if !has_ext_fb {
+                ext_fb_l = [wet_l, wet_r, pre_chorus_l, pre_chorus_r];
+                ext_fb_r = [wet_r, wet_l, pre_chorus_r, pre_chorus_l];
+                has_ext_fb = true;
+            }
+            let dry_c = 1.0 - self.chorus_wet_mix;
+            y_l = dry_c * y_l + self.chorus_wet_mix * wet_l;
+            y_r = dry_c * y_r + self.chorus_wet_mix * wet_r;
+            self.chorus_wr_idx = (wr + 1) & mask;
+        }
+
+        if has_ext_fb && self.pitch_blend.abs() <= 1.0e-6 {
+            self.last_tracker_l = ext_fb_l;
+            self.last_tracker_r = ext_fb_r;
+        }
+
+        (y_l, y_r)
     }
 }
 

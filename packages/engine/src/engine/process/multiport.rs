@@ -21,6 +21,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         mono_only: bool,
         mut feature_bus_out: Option<&mut [f32; 256]>,
     ) -> [f32; 4] {
+        let in_r = if self.single_input { in_l } else { in_r };
         let in_l = crate::math::sanitize_input_sample(
             in_l,
             crate::math::CERTIFIED_INPUT_ENVELOPE_MIN_F32,
@@ -87,30 +88,52 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         if self.ctrl_sub_counter >= k_ctrl {
             self.step_control_tick_3khz(loop_tiers);
         }
-        crate::control::ControlBus::<B>::step_micro_ramp_12(
-            &mut self.current_stage_params,
-            &self.stage_ramp_deltas,
-        );
+        if self.control_bus.unified_w_ctrl {
+            crate::control::ControlBus::<B>::step_micro_ramp_16(
+                &mut self.current_stage_params,
+                &self.stage_ramp_deltas,
+            );
+        } else {
+            crate::control::ControlBus::<B>::step_micro_ramp_12(
+                &mut self.current_stage_params,
+                &self.stage_ramp_deltas,
+            );
+        }
 
-        let theta = &self.current_stage_params;
-        self.stage_pipeline.stage1.boost_gain = (1.0 + theta[4]).clamp(0.0, 16.0);
-        self.stage_pipeline.stage1.pitch_blend = theta[3].clamp(-1.0, 1.0);
-        let drive_gain = ((1.0 + 0.25 * theta[5]).clamp(0.25, 4.0)
-            + 0.25 * self.control_bus.ctrl_basis_4[0])
-            .clamp(0.25, 4.0);
-        let beta_tone = (0.5 + theta[6]).clamp(0.0, 1.0);
-        let pwr_drive = (1.0 + 0.25 * theta[7]).clamp(0.25, 4.0);
-        let sag_depth = ((0.2 + 0.1 * theta[8]).clamp(0.0, 0.8)
-            + 0.1 * self.control_bus.ctrl_basis_4[1])
-            .clamp(0.0, 0.8);
-        let g_fir = (1.0 + theta[11]).clamp(0.0, 2.0);
+        let (boost_g, pitch_b, drive_gain, beta_tone, pwr_drive, sag_depth, g_fir) = {
+            let theta = &self.current_stage_params;
+            (
+                (1.0 + theta[4]).clamp(0.0, 16.0),
+                theta[3].clamp(-1.0, 1.0),
+                ((1.0 + 0.25 * theta[5]).clamp(0.25, 4.0)
+                    + 0.25 * self.control_bus.ctrl_basis_4[0])
+                    .clamp(0.25, 4.0),
+                (0.5 + theta[6]).clamp(0.0, 1.0),
+                (1.0 + 0.25 * theta[7]).clamp(0.25, 4.0),
+                ((0.2 + 0.1 * theta[8]).clamp(0.0, 0.8) + 0.1 * self.control_bus.ctrl_basis_4[1])
+                    .clamp(0.0, 0.8),
+                (1.0 + theta[11]).clamp(0.0, 2.0),
+            )
+        };
+        self.stage_pipeline.stage1.boost_gain = boost_g;
+        self.stage_pipeline.stage1.pitch_blend = pitch_b;
 
         let (down_l, down_r, clean_sub_l, clean_sub_r) = self
             .stage_pipeline
             .stage0
             .route_frame_no_return(eff_in_l, eff_in_r);
 
-        let (s1_l, s1_r) = self.stage_pipeline.stage1.step_stereo(down_l, down_r);
+        let aux_key = if has_return {
+            Some((eff_ret_l, eff_ret_r))
+        } else {
+            Some((eff_in_r, eff_in_r))
+        };
+        let (s1_l, s1_r) = self.stage_pipeline.stage1.step_stereo_ext(
+            down_l,
+            down_r,
+            aux_key,
+            &self.current_stage_params,
+        );
         if loop_tiers >= 2 {
             self.stage_pipeline.stage1.step_delta_branch(down_l, down_r);
         }
@@ -145,6 +168,11 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             &mut self.feature_bus_scratch,
         );
 
+        let (s3_sub_l, s3_sub_r) = if self.stage_pipeline.ext_stage3 {
+            (0.0, 0.0)
+        } else {
+            (clean_sub_l, clean_sub_r)
+        };
         let (s3_fir_raw_l, s3_fir_raw_r, s2_delayed_16_l, s2_delayed_16_r) = self
             .stage_pipeline
             .stage3
@@ -152,8 +180,8 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                 &mut self.stage_pipeline.stage3_r,
                 s2_l,
                 s2_r,
-                clean_sub_l,
-                clean_sub_r,
+                s3_sub_l,
+                s3_sub_r,
                 &self.stage_pipeline.fir_taps_l[0],
                 &self.stage_pipeline.fir_taps_r[0],
             );
@@ -164,8 +192,8 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                 &self.stage_pipeline.stage3_r,
                 s3_fir_raw_l,
                 s3_fir_raw_r,
-                clean_sub_l,
-                clean_sub_r,
+                s3_sub_l,
+                s3_sub_r,
                 &self.stage_pipeline.fir_taps_l,
                 &self.stage_pipeline.fir_taps_r,
                 loop_tiers,
@@ -199,11 +227,22 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                     xr_vec,
                 );
                 let fb_off = KAUTZ_FB_OFFSETS[blk_base + blk];
-                vl.add(vr).store(
-                    (&mut self.feature_bus_scratch[fb_off..fb_off + 4])
-                        .try_into()
-                        .unwrap(),
-                );
+                if self.stage_pipeline.ext_stage3 {
+                    B::Vec4::load(&tiers_l[blk].s_re)
+                        .add(B::Vec4::load(&tiers_r[blk].s_re))
+                        .mul(B::Vec4::splat(0.5))
+                        .store(
+                            (&mut self.feature_bus_scratch[fb_off..fb_off + 4])
+                                .try_into()
+                                .unwrap(),
+                        );
+                } else {
+                    vl.add(vr).store(
+                        (&mut self.feature_bus_scratch[fb_off..fb_off + 4])
+                            .try_into()
+                            .unwrap(),
+                    );
+                }
                 if t < active_tiers {
                     kautz_acc_l = kautz_acc_l.add(vl);
                     kautz_acc_r = kautz_acc_r.add(vr);
@@ -224,6 +263,8 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             &mut self.feature_bus_scratch,
         );
 
+        let pure_lti_v2 =
+            self.stage_pipeline.stage2.ext_active && self.stage_pipeline.stage2.linear_v1a_v1b;
         feature_bus::pack_tier_feature_bus_into(
             &mut self.feature_bus_scratch,
             &self.stage_pipeline.stage1,
@@ -245,6 +286,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             tank_l,
             tank_r,
             loop_tiers,
+            pure_lti_v2,
         );
         if let Some(fb) = feature_bus_out.as_mut() {
             **fb = *self.feature_bus_scratch;
@@ -352,6 +394,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         has_return: bool,
         mono_only: bool,
     ) -> [f32; 4] {
+        let in_r = if self.single_input { in_l } else { in_r };
         let in_l = crate::math::sanitize_input_sample(
             in_l,
             crate::math::CERTIFIED_INPUT_ENVELOPE_MIN_F32,

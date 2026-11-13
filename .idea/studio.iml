@@ -19,6 +19,6 @@
     <orderEntry type="module" module-name="engine" exported="" />
     <orderEntry type="module" module-name="js" exported="" />
     <orderEntry type="module" module-name="ui" exported="" />
-    <orderEntry type="module" module-name="dnam-trainer" exported="" />
+    <orderEntry type="module" module-name="dnam-capture" exported="" />
   </component>
 </module>
