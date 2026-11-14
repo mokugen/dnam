@@ -12,9 +12,7 @@ use dnam_engine::provenance::{STAGE3_KAUTZ_BLOCKS_PER_TIER, kautz_soa_byte_offse
 use dnam_engine::schema::DnamError;
 use dnam_engine::{DnamEngine, Tier};
 
-use crate::metrics::certification::{
-    PerceptualCertificationSummary, certify_blackbox_coreset_chain,
-};
+use crate::metrics::certification::{PerceptualCertificationSummary, certify_4metric_signal_chain};
 use crate::metrics::{
     ArchetypeFamily, evaluate_besr_from_band_energies, try_split_bezout_3band_energies,
 };
@@ -336,11 +334,12 @@ fn build_summaries_from_waves(
                 ))
             })
             .collect();
-        let sl = certify_blackbox_coreset_chain(
+        let sl = certify_4metric_signal_chain(
             ArchetypeFamily::FullRigModDelayReverb,
             TIERS_ALL[t],
             tgt_l,
             &mdl_l,
+            None,
             48_000.0,
             w_start,
         );
@@ -356,11 +355,12 @@ fn build_summaries_from_waves(
                     ))
                 })
                 .collect();
-            let sr = certify_blackbox_coreset_chain(
+            let sr = certify_4metric_signal_chain(
                 ArchetypeFamily::FullRigModDelayReverb,
                 TIERS_ALL[t],
                 tgt_r,
                 &mdl_r,
+                None,
                 48_000.0,
                 w_start,
             );

@@ -145,7 +145,7 @@ On container load, the loader validates the `DMU1`/`DME1` CRC-32C and `DMUE` foo
 
 `r[container.dnam.tier-prefix]`
 
-`Arena 0` stores the `Lite` base parameters once; `Arena 1..3` store only the newly introduced `Full`, `Pro`, and `Ultra` delta slices. Every runtime path gates execution at its active effective tier `T`.
+`Arena 0` stores the `Lite` base parameters and `Lite` linear readout once; `Arena 1..3` store the newly introduced `Full`, `Pro`, and `Ultra` causally nested state deltas and compact per-tier linear readout projections, trained jointly in one single run (`REQ-5.1`, `REQ-5.2`). Every runtime path gates execution at its active effective tier `T`.
 
 ### 2.2 Model-Declared Delay Histories (`delay_histories`)
 

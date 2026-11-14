@@ -12,10 +12,12 @@
 pub mod avx2;
 pub mod sse2;
 pub mod sse42;
+pub mod trainer_f64;
 
 pub use avx2::{Avx2FmaVec4, X86Avx2FmaBackend};
 pub use sse2::{Sse2Vec4, X86Sse2Backend};
 pub use sse42::{Sse42Vec4, X86Sse42Backend};
+pub use trainer_f64::{Avx2FmaF64Vec2, Sse2F64Vec2};
 
 use super::BackendKind;
 

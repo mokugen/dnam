@@ -9,7 +9,8 @@
 
 use std::f64::consts::PI;
 
-use super::wide_gram::{Wide192Accum, contract_256d_gram_tiled_wide192};
+use super::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
+use super::wide_gram::{Wide192Accum, contract_256d_gram_tiled_wide192_with_backend};
 use super::{uplo_u_index, uplo_u_packed_len};
 
 /// Canonical `48 kHz` sample rate for TORA Stage B / Stage C coreset contraction.
@@ -82,37 +83,6 @@ fn step_bezout7_lp_scalar(x: f64, r: f64, omr: f64, u: &mut [f64; 7]) -> f64 {
     35.0 * u[3] - 84.0 * u[4] + 70.0 * u[5] - 20.0 * u[6]
 }
 
-#[inline]
-fn advance_bezout7_lp_dim(fb: &[f32; 256], dim: usize, r: f64, omr: f64, u: &mut [[f64; 256]; 7]) {
-    for d in 0..dim {
-        let mut prev = f64::from(fb[d]);
-        for st in u.iter_mut() {
-            prev = omr * prev + r * st[d];
-            st[d] = prev;
-        }
-    }
-}
-
-#[inline]
-fn readout_bezout7_bands_dim(
-    fb: &[f32; 256],
-    dim: usize,
-    u1: &[[f64; 256]; 7],
-    u2: &[[f64; 256]; 7],
-    out_lf: &mut [f32; 256],
-    out_mf: &mut [f32; 256],
-    out_hf: &mut [f32; 256],
-) {
-    for d in 0..dim {
-        let x = f64::from(fb[d]);
-        let l250 = 35.0 * u1[3][d] - 84.0 * u1[4][d] + 70.0 * u1[5][d] - 20.0 * u1[6][d];
-        let l2500 = 35.0 * u2[3][d] - 84.0 * u2[4][d] + 70.0 * u2[5][d] - 20.0 * u2[6][d];
-        out_lf[d] = l250 as f32;
-        out_mf[d] = (l2500 - l250) as f32;
-        out_hf[d] = (x - l2500) as f32;
-    }
-}
-
 /// Computes canonical post-warmup offset matching Stage E and certification gates (`512` on `12,000` frames).
 #[must_use]
 pub const fn canonical_besr_warmup(n_frames: usize) -> usize {
@@ -152,6 +122,42 @@ pub fn contract_bezout_3band_stats(
 /// and post-warmup `LUFS` sufficient statistics via `Wide192Accum`.
 #[must_use]
 pub fn contract_bezout_3band_stats_4tier(
+    tier_features_256: &[&[[f32; 256]]; 4],
+    wet_lr: &[[f32; 2]],
+    tier_backbone_lr: &[Vec<[f32; 2]>; 4],
+    eval_stereo: bool,
+    gram_frame_stride: usize,
+) -> BezoutHarvestStats {
+    struct BezoutTask<'a> {
+        tier_features_256: &'a [&'a [[f32; 256]]; 4],
+        wet_lr: &'a [[f32; 2]],
+        tier_backbone_lr: &'a [Vec<[f32; 2]>; 4],
+        eval_stereo: bool,
+        gram_frame_stride: usize,
+    }
+    impl TrainerTask<BezoutHarvestStats> for BezoutTask<'_> {
+        fn run<B: TrainerBackend>(self) -> BezoutHarvestStats {
+            contract_bezout_3band_stats_4tier_with_backend::<B>(
+                self.tier_features_256,
+                self.wet_lr,
+                self.tier_backbone_lr,
+                self.eval_stereo,
+                self.gram_frame_stride,
+            )
+        }
+    }
+    DynamicTrainer::detect().dispatch(BezoutTask {
+        tier_features_256,
+        wet_lr,
+        tier_backbone_lr,
+        eval_stereo,
+        gram_frame_stride,
+    })
+}
+
+/// Backend-parameterized 4-tier Binomial/Bézout 3-band & `LUFS` contraction via `Wide192Accum`.
+#[must_use]
+pub fn contract_bezout_3band_stats_4tier_with_backend<B: TrainerBackend>(
     tier_features_256: &[&[[f32; 256]]; 4],
     wet_lr: &[[f32; 2]],
     tier_backbone_lr: &[Vec<[f32; 2]>; 4],
@@ -333,8 +339,8 @@ pub fn contract_bezout_3band_stats_4tier(
         let mut fb_hf = [0.0_f32; 256];
 
         for i in 0..n {
-            advance_bezout7_lp_dim(&feats_t[i], dim, r1, omr1, &mut u1_fb);
-            advance_bezout7_lp_dim(&feats_t[i], dim, r2, omr2, &mut u2_fb);
+            B::advance_bezout7_lp_dim(&feats_t[i], dim, r1, omr1, &mut u1_fb);
+            B::advance_bezout7_lp_dim(&feats_t[i], dim, r2, omr2, &mut u2_fb);
 
             let yl = f64::from(wet_lr[i][0]);
             let yr = if eval_stereo {
@@ -364,7 +370,7 @@ pub fn contract_bezout_3band_stats_4tier(
             }
 
             let tb = tgt_bands_seq[k];
-            readout_bezout7_bands_dim(
+            B::readout_bezout7_bands_dim(
                 &feats_t[i],
                 dim,
                 &u1_fb,
@@ -427,10 +433,13 @@ pub fn contract_bezout_3band_stats_4tier(
         }
 
         let (g_lufs_256, c_bb) =
-            contract_256d_gram_tiled_wide192(&raw_feats, &raw_bb, &weights_lm, 1);
-        let (g_lf, c_lf) = contract_256d_gram_tiled_wide192(&lf_feats, &lf_res, &weights_lm, 1);
-        let (g_mf, c_mf) = contract_256d_gram_tiled_wide192(&mf_feats, &mf_res, &weights_lm, 1);
-        let (g_hf, c_hf) = contract_256d_gram_tiled_wide192(&hf_feats, &hf_res, &weights_hf, 1);
+            contract_256d_gram_tiled_wide192_with_backend::<B>(&raw_feats, &raw_bb, &weights_lm, 1);
+        let (g_lf, c_lf) =
+            contract_256d_gram_tiled_wide192_with_backend::<B>(&lf_feats, &lf_res, &weights_lm, 1);
+        let (g_mf, c_mf) =
+            contract_256d_gram_tiled_wide192_with_backend::<B>(&mf_feats, &mf_res, &weights_lm, 1);
+        let (g_hf, c_hf) =
+            contract_256d_gram_tiled_wide192_with_backend::<B>(&hf_feats, &hf_res, &weights_hf, 1);
 
         tier_lufs_gram[t].copy_from_slice(&g_lufs_256[..p_len]);
         tier_band_gram[t][0].copy_from_slice(&g_lf[..p_len]);

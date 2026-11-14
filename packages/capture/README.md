@@ -1,6 +1,6 @@
 # `dnam-capture` — Pure-IO Capture, `.dnam-proj` (`DNPJ`) Container & `VarPro` Engine
 
-**`dnam-capture`** (`packages/capture/`) is the 100% safe-Rust (`#![forbid(unsafe_code)]`, `wasm32`-safe) pure IO-buffer capture, single-file `.dnam-proj` (`DNPJ`, `v2.0`) project container, and `< 25 ms` Analytical Variable-Projection (`VarPro`) system-identification crate for **Dynamic Neural Audio Modeler (DNAM)**.
+**`dnam-capture`** (`packages/capture/`) is the 100% safe-Rust (`#![forbid(unsafe_code)]`, `wasm32`-safe) pure IO-buffer capture, single-file `.dnam-proj` (`DNPJ`, `v2.0`) project container, and deterministic zero-GPU Analytical + Nonlinear Variable-Projection (`VarPro`) system-identification crate for **Dynamic Neural Audio Modeler (DNAM)**.
 
 By linking [`dnam-engine`](../engine/README.md) directly (`engine <- capture` `[dependencies]`, `fixtures <- capture` `[dev-dependencies]`), `dnam-capture` executes the exact `#![no_std]` + `alloc` DSP operators (`Op-T`, `Op-M`, `Op-N`), `256-D` `step_frame_with_feature_bus`, `3 kHz` Parametric Control Bus, and `.dnam` binary framing across native hosts, Node.js `N-API`, Browser `WebWorker`s, and Cloudflare Workers (`ref[arch.isomorphism.two-sweep]`, [`ADR-0017`](../../docs/adr/0017-pure-rust-analytical-varpro-solver-and-planar-decoupling.md), [`ADR-0020`](../../docs/adr/0020-modular-monorepo-and-dnam-proj-container.md)).
 

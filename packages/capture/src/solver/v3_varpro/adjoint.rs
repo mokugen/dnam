@@ -9,6 +9,8 @@ use dnam_engine::stages::v3_core::cascade::{
     tier_kautz_banks,
 };
 
+use crate::solver::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
+
 use super::gabor::GaborAdjointScratch;
 use super::model_f64::{HB_A0, HB_A1, V3OptModelF64, V3TrainDataset};
 use super::primitives::{
@@ -61,14 +63,44 @@ fn cl_mask(v: f64, lo: f64, hi: f64) -> (f64, f64) {
     (v.clamp(lo, hi), if v > lo && v < hi { 1.0 } else { 0.0 })
 }
 
+/// Evaluates the exact Bézout 3-band `bESR` objective on `dataset` in `f64` using backend `B`.
+pub fn evaluate_loss_f64_with_backend<B: TrainerBackend>(
+    model: &V3OptModelF64,
+    dataset: &V3TrainDataset,
+    ws: &mut AdjointWorkspace,
+) -> f64 {
+    let mut grad = V3OptModelF64::zeros(model.tier, model.os2x, model.mono_out);
+    evaluate_internal::<B>(model, dataset, ws, false, &mut grad)
+}
+
 /// Evaluates the exact Bézout 3-band `bESR` objective on `dataset` in `f64` (no gradient).
 pub fn evaluate_loss_f64(
     model: &V3OptModelF64,
     dataset: &V3TrainDataset,
     ws: &mut AdjointWorkspace,
 ) -> f64 {
+    struct LossTask<'a> {
+        model: &'a V3OptModelF64,
+        dataset: &'a V3TrainDataset,
+        ws: &'a mut AdjointWorkspace,
+    }
+    impl TrainerTask<f64> for LossTask<'_> {
+        fn run<B: TrainerBackend>(self) -> f64 {
+            evaluate_loss_f64_with_backend::<B>(self.model, self.dataset, self.ws)
+        }
+    }
+    DynamicTrainer::detect().dispatch(LossTask { model, dataset, ws })
+}
+
+/// Evaluates the exact Bézout 3-band `bESR` objective AND exact reverse-mode gradient in `f64` via `B`.
+pub fn evaluate_loss_and_grad_f64_with_backend<B: TrainerBackend>(
+    model: &V3OptModelF64,
+    dataset: &V3TrainDataset,
+    ws: &mut AdjointWorkspace,
+) -> (f64, V3OptModelF64) {
     let mut grad = V3OptModelF64::zeros(model.tier, model.os2x, model.mono_out);
-    evaluate_internal(model, dataset, ws, false, &mut grad)
+    let loss = evaluate_internal::<B>(model, dataset, ws, true, &mut grad);
+    (loss, grad)
 }
 
 /// Evaluates the exact Bézout 3-band `bESR` objective AND exact reverse-mode gradient in `f64`.
@@ -77,13 +109,21 @@ pub fn evaluate_loss_and_grad_f64(
     dataset: &V3TrainDataset,
     ws: &mut AdjointWorkspace,
 ) -> (f64, V3OptModelF64) {
-    let mut grad = V3OptModelF64::zeros(model.tier, model.os2x, model.mono_out);
-    let loss = evaluate_internal(model, dataset, ws, true, &mut grad);
-    (loss, grad)
+    struct LossGradTask<'a> {
+        model: &'a V3OptModelF64,
+        dataset: &'a V3TrainDataset,
+        ws: &'a mut AdjointWorkspace,
+    }
+    impl TrainerTask<(f64, V3OptModelF64)> for LossGradTask<'_> {
+        fn run<B: TrainerBackend>(self) -> (f64, V3OptModelF64) {
+            evaluate_loss_and_grad_f64_with_backend::<B>(self.model, self.dataset, self.ws)
+        }
+    }
+    DynamicTrainer::detect().dispatch(LossGradTask { model, dataset, ws })
 }
 
 #[allow(clippy::too_many_lines)]
-fn evaluate_internal(
+fn evaluate_internal<B: TrainerBackend>(
     model: &V3OptModelF64,
     dataset: &V3TrainDataset,
     ws: &mut AdjointWorkspace,
@@ -360,17 +400,16 @@ fn evaluate_internal(
                     .map(|k| fir[k] * ws.s2_out[ch][t - k])
                     .sum();
                 let x_del = if t >= 16 { ws.s2_out[ch][t - 16] } else { 0.0 };
-                let mut kv = 0.0_f64;
-                for m in 0..k_cnt {
-                    let (r, bg, ct, st, _, _) = k_poles[m];
-                    let (lr, li, pr, pi) = (r * ct, r * st, s_re[m], s_im[m]);
-                    let (nr, ni) = (lr * pr - li * pi + bg * x_del, li * pr + lr * pi);
-                    s_re[m] = nr;
-                    s_im[m] = ni;
-                    ws.kautz_re[ch][t * k_cnt + m] = nr;
-                    ws.kautz_im[ch][t * k_cnt + m] = ni;
-                    kv += kc[m].0 * nr - kc[m].1 * ni;
-                }
+                let row_off = t * k_cnt;
+                let kv = B::step_kautz_forward_frame(
+                    x_del,
+                    &k_poles[..k_cnt],
+                    &kc[..k_cnt],
+                    &mut s_re,
+                    &mut s_im,
+                    &mut ws.kautz_re[ch][row_off..row_off + k_cnt],
+                    &mut ws.kautz_im[ch][row_off..row_off + k_cnt],
+                );
                 let dir_svf: f64 = ws.svf_tape[t][ch]
                     .taps
                     .iter()
@@ -391,7 +430,7 @@ fn evaluate_internal(
                 .split_3band(&ws.err_buf[..n], &mut ws.err_bands);
             let bw = dataset.stem_band_weights[stem_idx][ch];
             for b in 0..3 {
-                let eb: f64 = ws.err_bands[b][warmup..n].iter().map(|&v| v * v).sum();
+                let eb = B::sum_sq_f64(&ws.err_bands[b][warmup..n]);
                 total_loss += ch_scale * bw[b] * eb;
             }
 
@@ -413,7 +452,7 @@ fn evaluate_internal(
                     &mut ws.adj_dy_scratch,
                 );
                 if dataset.gabor_env_weight > 0.0 || dataset.gabor_ltas_weight > 0.0 {
-                    total_loss += dataset.eval_gabor_loss_and_adjoint(
+                    total_loss += dataset.eval_gabor_loss_and_adjoint_with_backend::<B>(
                         stem_idx,
                         ch,
                         ch_scale,
@@ -423,7 +462,7 @@ fn evaluate_internal(
                     );
                 }
             } else if dataset.gabor_env_weight > 0.0 || dataset.gabor_ltas_weight > 0.0 {
-                total_loss += dataset.eval_gabor_loss_and_adjoint(
+                total_loss += dataset.eval_gabor_loss_and_adjoint_with_backend::<B>(
                     stem_idx,
                     ch,
                     ch_scale,
@@ -468,39 +507,35 @@ fn evaluate_internal(
                     ws.ds2_out[ch][t - k] += fir[k] * dy;
                 }
                 let x_del = if t >= 16 { ws.s2_out[ch][t - 16] } else { 0.0 };
-                let mut dx_del = 0.0_f64;
-                for m in 0..k_cnt {
-                    let nr = ws.kautz_re[ch][t * k_cnt + m];
-                    let ni = ws.kautz_im[ch][t * k_cnt + m];
-                    let pr = if t > 0 {
-                        ws.kautz_re[ch][(t - 1) * k_cnt + m]
-                    } else {
-                        0.0
-                    };
-                    let pi = if t > 0 {
-                        ws.kautz_im[ch][(t - 1) * k_cnt + m]
-                    } else {
-                        0.0
-                    };
-                    let d_kc = if ch == 0 {
-                        &mut grad.kautz_c_l[m]
-                    } else {
-                        &mut grad.kautz_c_r[m]
-                    };
-                    d_kc.0 += nr * dy;
-                    d_kc.1 += -ni * dy;
-                    let dnr = kc[m].0 * dy + ds_re[m];
-                    let dni = -kc[m].1 * dy + ds_im[m];
-                    let (r, bg, ct, st, r_m, t_m) = k_poles[m];
-                    let (lr, li) = (r * ct, r * st);
-                    dx_del += bg * dnr;
-                    let (d_lr, d_li, d_bg) =
-                        (pr * dnr + pi * dni, -pi * dnr + pr * dni, x_del * dnr);
-                    grad.kautz_poles[m].0 += r_m * (ct * d_lr + st * d_li - (r / bg) * d_bg);
-                    grad.kautz_poles[m].1 += t_m * r * (-st * d_lr + ct * d_li);
-                    ds_re[m] = lr * dnr + li * dni;
-                    ds_im[m] = -li * dnr + lr * dni;
-                }
+                let (d_kc, d_kp) = if ch == 0 {
+                    (&mut grad.kautz_c_l[..k_cnt], &mut grad.kautz_poles[..k_cnt])
+                } else {
+                    (&mut grad.kautz_c_r[..k_cnt], &mut grad.kautz_poles[..k_cnt])
+                };
+                let row_off = t * k_cnt;
+                let (prev_re, prev_im) = if t > 0 {
+                    let prev_off = (t - 1) * k_cnt;
+                    (
+                        Some(&ws.kautz_re[ch][prev_off..prev_off + k_cnt]),
+                        Some(&ws.kautz_im[ch][prev_off..prev_off + k_cnt]),
+                    )
+                } else {
+                    (None, None)
+                };
+                let dx_del = B::step_kautz_backward_frame(
+                    dy,
+                    x_del,
+                    &k_poles[..k_cnt],
+                    &kc[..k_cnt],
+                    &ws.kautz_re[ch][row_off..row_off + k_cnt],
+                    &ws.kautz_im[ch][row_off..row_off + k_cnt],
+                    prev_re,
+                    prev_im,
+                    &mut ds_re,
+                    &mut ds_im,
+                    d_kc,
+                    d_kp,
+                );
                 if t >= 16 {
                     ws.ds2_out[ch][t - 16] += dx_del;
                 }

@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 
 use crate::chains::{Oversampler4xF64, scale_alpha_from_192k, substep_rate_4x};
+use crate::sim_kernels::UnitaryHouseholder4;
 use crate::{
     BlackBoxModel, DEFAULT_FIXTURE_SAMPLE_RATE_HZ, FixtureBitDepth, FixtureControlSpec,
     FixtureDeviceMetadata, FixtureSwitchSpec, clamp_sample_rate_hz, sanitize_norm,
@@ -73,6 +74,7 @@ pub struct Chain08LongBbdEchoAnd30sShimmer {
     bbd_lp: f64,
     shimmer_dc: [f64; 4],
     sample_counter: usize,
+    fdn_matrix: UnitaryHouseholder4,
     freeze_window: Option<(usize, usize)>,
     anchor_freeze_window: Option<(usize, usize, u32)>,
     tempo_bpm: Option<f64>,
@@ -108,6 +110,7 @@ impl Chain08LongBbdEchoAnd30sShimmer {
             bbd_lp: 0.0,
             shimmer_dc: [0.0; 4],
             sample_counter: 0,
+            fdn_matrix: UnitaryHouseholder4::canonical_hadamard(),
             freeze_window: None,
             anchor_freeze_window: None,
             tempo_bpm: None,
@@ -208,9 +211,8 @@ impl Chain08LongBbdEchoAnd30sShimmer {
                     r[m] = self.fdn_rings[m][(self.wr_idx.wrapping_sub(fdn_taps[m])) & fdn_mask];
                 }
                 // Orthogonal 4x4 Householder / Hadamard feedback matrix (||H||_2 == 1.0)
-                let s = 0.5 * (r[0] + r[1] + r[2] + r[3]);
-                for m in 0..4 {
-                    let h = s - r[m];
+                let h_vec = self.fdn_matrix.apply(r);
+                for (m, &h) in h_vec.iter().enumerate() {
                     let next_v = if is_frozen {
                         // Strictly lossless unitary circulation when freeze latch is engaged
                         h

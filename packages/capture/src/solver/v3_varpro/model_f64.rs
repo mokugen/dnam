@@ -10,9 +10,11 @@ use dnam_engine::stages::v3_core::cascade::{
 use dnam_engine::stages::v3_core::svf::V3Stage1SvfParams;
 use dnam_engine::stages::v3_core::{V3CascadeBlockCold, V3ColdTierModel};
 
+use crate::solver::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
+
 use super::gabor::{
     AnalyticGaborBank, GaborAdjointScratch, GaborTargetSummary, build_gabor_target_summary,
-    eval_gabor_loss_and_adjoint as gabor_loss_and_adjoint,
+    eval_gabor_loss_and_adjoint_with_backend as gabor_loss_and_adjoint_with_backend,
 };
 
 pub(crate) const HB_A0: [f64; 2] = [0.079_866_426, 0.545_353_65];
@@ -209,8 +211,8 @@ impl V3TrainDataset {
     }
 
     /// Evaluates the closed-form 24-band Gabor envelope + log-LTAS loss and accumulates its exact
-    /// overlap-add reverse adjoint into `grad_dy` when provided.
-    pub fn eval_gabor_loss_and_adjoint(
+    /// overlap-add reverse adjoint into `grad_dy` when provided using backend `B`.
+    pub fn eval_gabor_loss_and_adjoint_with_backend<B: TrainerBackend>(
         &self,
         stem_idx: usize,
         ch: usize,
@@ -219,7 +221,7 @@ impl V3TrainDataset {
         grad_dy: Option<&mut [f64]>,
         scratch: &mut GaborAdjointScratch,
     ) -> f64 {
-        gabor_loss_and_adjoint(
+        gabor_loss_and_adjoint_with_backend::<B>(
             &self.gabor_bank,
             &self.gabor_targets[stem_idx][ch],
             y_mdl,
@@ -230,6 +232,49 @@ impl V3TrainDataset {
             self.gabor_ltas_weight,
             scratch,
         )
+    }
+
+    /// Evaluates the closed-form 24-band Gabor envelope + log-LTAS loss and accumulates its exact
+    /// overlap-add reverse adjoint into `grad_dy` when provided.
+    pub fn eval_gabor_loss_and_adjoint(
+        &self,
+        stem_idx: usize,
+        ch: usize,
+        ch_scale: f64,
+        y_mdl: &[f64],
+        grad_dy: Option<&mut [f64]>,
+        scratch: &mut GaborAdjointScratch,
+    ) -> f64 {
+        struct GaborEval<'a> {
+            ds: &'a V3TrainDataset,
+            stem_idx: usize,
+            ch: usize,
+            ch_scale: f64,
+            y_mdl: &'a [f64],
+            grad_dy: Option<&'a mut [f64]>,
+            scratch: &'a mut GaborAdjointScratch,
+        }
+        impl TrainerTask<f64> for GaborEval<'_> {
+            fn run<B: TrainerBackend>(self) -> f64 {
+                self.ds.eval_gabor_loss_and_adjoint_with_backend::<B>(
+                    self.stem_idx,
+                    self.ch,
+                    self.ch_scale,
+                    self.y_mdl,
+                    self.grad_dy,
+                    self.scratch,
+                )
+            }
+        }
+        DynamicTrainer::detect().dispatch(GaborEval {
+            ds: self,
+            stem_idx,
+            ch,
+            ch_scale,
+            y_mdl,
+            grad_dy,
+            scratch,
+        })
     }
 }
 

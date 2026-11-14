@@ -12,7 +12,7 @@ tags:
 
 project:
   name: "dnam-fixtures"
-  description: "Pure-Rust zero-dependency black-box ground-truth audio signal-chain models and hardware impairment decorators"
+  description: "Pure-Rust black-box ground-truth audio signal-chain models, ODE/FFT simulation kernels, and hardware impairment decorators"
 
 dependsOn: []
 

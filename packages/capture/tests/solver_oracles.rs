@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! Step 2.3 Structural Isomorphism Oracles (`Oracle-01`, `Oracle-02`, `Oracle-03`) for the
-//! `< 25 ms` 5-Stage Closed-Form + `VarPro` Solver (`dnam_capture::solver`).
+//! Deterministic 5-Stage Closed-Form + `VarPro` Solver (`dnam_capture::solver`).
 //!
 //! Canonical References:
 //! - `docs/specs/training/four_stage_pipeline.md` (`r[train.pipeline.*]`, `r[train.gram.*]`)

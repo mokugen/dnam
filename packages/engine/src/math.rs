@@ -18,6 +18,8 @@ pub mod kernels;
 pub mod scalar;
 #[forbid(unsafe_code)]
 pub mod spec_math;
+#[forbid(unsafe_code)]
+pub mod trainer;
 
 #[cfg(target_arch = "aarch64")]
 #[allow(unsafe_code)]
@@ -63,18 +65,21 @@ pub use spec_math::{
     trust_clip_outward_8d, trust_clip_outward_checked_bits, trust_clip_reference_bisection_bits,
     upper_product_f64, upper_sum_squares_f64, widen_f32_bits,
 };
+pub use trainer::{ScalarF64Vec2, SimdF64Vec2, TrainerMathBackend};
 
 #[cfg(target_arch = "aarch64")]
-pub use aarch64::{ArmSmeBackend, ArmSve2Backend, NeonBackend, NeonVec4, Sve2Vec4};
+pub use aarch64::{
+    ArmSmeBackend, ArmSve2Backend, NeonBackend, NeonF64Vec2, NeonVec4, Sve2F64Vec2, Sve2Vec4,
+};
 
 #[cfg(target_arch = "x86_64")]
 pub use x86::{
-    Avx2FmaVec4, Sse2Vec4, Sse42Vec4, X86Avx2FmaBackend, X86SimdBackend, X86Sse2Backend,
-    X86Sse42Backend, X86Vec4,
+    Avx2FmaF64Vec2, Avx2FmaVec4, Sse2F64Vec2, Sse2Vec4, Sse42Vec4, X86Avx2FmaBackend,
+    X86SimdBackend, X86Sse2Backend, X86Sse42Backend, X86Vec4,
 };
 
 #[cfg(target_arch = "wasm32")]
-pub use wasm::{WasmSimd128Backend, WasmVec4};
+pub use wasm::{WasmF64Vec2, WasmSimd128Backend, WasmVec4};
 
 /// Compile-time default `MathBackend` for `aarch64` (`NeonBackend`, while runtime dispatch via
 /// [`detect_best_backend`] / [`crate::DynamicDnamEngine`] automatically upgrades to [`ArmSmeBackend`]

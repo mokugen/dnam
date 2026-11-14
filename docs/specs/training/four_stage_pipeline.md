@@ -42,7 +42,7 @@ flowchart LR
     SD --> SE["Stage E: Kautz Contraction<br/>b_head = 0 + Watermark<br/>-> .dnam-proj & .dnam"]
 ```
 
-`dnam-capture` trains all four nested runtime tiers (`Lite` `64-D` $\subset$ `Full` `128-D` $\subset$ `Pro` `192-D` $\subset$ `Ultra` `256-D`) simultaneously in a **single deterministic analytical pass** (`REQ-4.1`, `REQ-5.2`) without Python, PyTorch, autograd tape allocations, or stochastic gradient descent, staying strictly within `< 64 MiB` working RAM on single-stem/capsule runs (`REQ-4.3`).
+`dnam-capture` trains all four causally nested runtime tiers (`Lite` `64-D` $\subset$ `Full` `128-D` $\subset$ `Pro` `192-D` $\subset$ `Ultra` `256-D`) with compact per-tier linear readout projections jointly in a **single deterministic training run** (`REQ-4.1`, `REQ-5.1`, `REQ-5.2`) without Python, PyTorch, GPU runtimes, autograd tape allocations, or stochastic gradient descent, supporting sub-second incremental linear/vault updates alongside multi-second nonlinear and dynamic identification over full-bandwidth `32-bit` float stems while staying within `< 64 MiB` working RAM on single-stem/capsule runs (`REQ-4.3`).
 
 ---
 
@@ -64,7 +64,7 @@ Freezing upstream nonlinear/modal recurrences from `Stage A`, `Stage B` steps th
 
 `r[train.pipeline.stage-c-schur]`
 
-`Stage C` solves the nested `Lite` (`64-D`), `Full` (`128-D`), `Pro` (`192-D`), and `Ultra` (`256-D`) Mid/Side Kronecker output heads simultaneously (`REQ-5.2`, `ADR-0017` Theorems 2 & 5):
+`Stage C` solves the causally nested `Lite` (`64-D`), `Full` (`128-D`), `Pro` (`192-D`), and `Ultra` (`256-D`) Mid/Side Kronecker per-tier linear readout projections jointly (`REQ-5.1`, `REQ-5.2`, `ADR-0017` Theorems 2 & 5):
 1. **Intra-Tier `64-D` Schur-Complement Re-Balancing:** Solves each lower tier's prefix submatrix ($\mathbf{G}_{1:D_T, 1:D_T} + \boldsymbol{\Lambda}_{D_T}$) via `IEEE-754 float64` Cholesky factorization (`solve_uplo_u_cholesky_2ch`) so `Lite`, `Full`, `Pro`, and `Ultra` each independently achieve optimal spectral balance without separate per-tier training jobs.
 2. **Psychoacoustic `bESR` + `33`-Band `LTAS` KKT Projection:** Weights normal equations across the 4th-order Bézout `LF`/`MF`/`HF` bands (`ref[qual.besr.bezout-crossover]`) and enforces `33`-band `1/3`-octave `LTAS` tilt bounds (`ref[qual.companion.ltas]`), baking the resulting effective cross-correlation into `STAT` (`ref[container.proj.stat-uplo-u]`).
 

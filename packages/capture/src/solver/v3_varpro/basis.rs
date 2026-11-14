@@ -5,13 +5,13 @@
 use std::f64::consts::PI;
 
 use dnam_engine::Tier;
-use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::stages::v3_core::cascade::{
     MAX_CASCADE_LANES, MAX_KAUTZ_POLES, NUM_CASCADE_BLOCKS, tier_cascade_lanes, tier_fir_segments,
     tier_kautz_banks,
 };
 use dnam_engine::stages::v3_core::{V3ColdTierModel, V3CoreInstance};
 
+use crate::solver::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
 use crate::solver::{solve_uplo_u_cholesky_2ch, uplo_u_index, uplo_u_packed_len};
 
 use super::model_f64::{HB_A0, HB_A1, V3OptModelF64, V3TrainDataset, V3TrainStem};
@@ -21,24 +21,6 @@ use super::primitives::{ap2_fwd, exp2_oct_with_deriv, step_tpt_fwd};
 #[must_use]
 pub const fn linear_basis_dim(tier: Tier) -> usize {
     7 + tier_cascade_lanes(tier) + tier_fir_segments(tier) * 16 + tier_kautz_banks(tier) * 8
-}
-
-#[inline]
-fn dot4(a: &[f64], b: &[f64]) -> f64 {
-    let (ac, ar) = a.as_chunks::<4>();
-    let (bc, br) = b.as_chunks::<4>();
-    let (mut s0, mut s1, mut s2, mut s3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
-    for (x, y) in ac.iter().zip(bc) {
-        s0 += x[0] * y[0];
-        s1 += x[1] * y[1];
-        s2 += x[2] * y[2];
-        s3 += x[3] * y[3];
-    }
-    let mut sum = (s0 + s1) + (s2 + s3);
-    for (&x, &y) in ar.iter().zip(br) {
-        sum += x * y;
-    }
-    sum
 }
 
 struct StemTraj {
@@ -232,7 +214,7 @@ fn extract_traj_opt(
     }
 }
 
-fn build_channel_basis(
+fn build_channel_basis<B: TrainerBackend>(
     tier: Tier,
     kautz_poles: &[(f64, f64)],
     traj: &StemTraj,
@@ -259,7 +241,6 @@ fn build_channel_basis(
         col[k..n].copy_from_slice(&s2[..n - k]);
     }
     let k_base = 7 + c_cnt + f_cnt;
-    let (mut s_re, mut s_im) = (vec![0.0_f64; k_cnt], vec![0.0_f64; k_cnt]);
     let pre: Vec<(f64, f64, f64)> = (0..k_cnt)
         .map(|m| {
             let r = kautz_poles[m].0.clamp(0.50, 0.997);
@@ -269,22 +250,11 @@ fn build_channel_basis(
             (r * ct, r * st, bg)
         })
         .collect();
-    for t in 0..n {
-        let x_del = if t >= 16 { s2[t - 16] } else { 0.0 };
-        for m in 0..k_cnt {
-            let (lr, li, bg) = pre[m];
-            let nr = lr * s_re[m] - li * s_im[m] + bg * x_del;
-            let ni = li * s_re[m] + lr * s_im[m];
-            s_re[m] = nr;
-            s_im[m] = ni;
-            cols[k_base + 2 * m][t] = nr;
-            cols[k_base + 2 * m + 1][t] = -ni;
-        }
-    }
+    B::filter_pole_bank_columns(s2, 16, &pre, &mut cols, k_base);
     cols
 }
 
-fn solve_weighted_basis(
+fn solve_weighted_basis<B: TrainerBackend>(
     model: &mut V3OptModelF64,
     dataset: &V3TrainDataset,
     trajs: &[StemTraj],
@@ -325,7 +295,7 @@ fn solve_weighted_basis(
                 y_w.extend(bands[b][w..n].iter().map(|&v| v * sq_w[b]));
             }
             let cols =
-                build_channel_basis(tier, &model.kautz_poles, &trajs[st_idx], ch, k_override);
+                build_channel_basis::<B>(tier, &model.kautz_poles, &trajs[st_idx], ch, k_override);
             for (j, col) in cols.iter().enumerate() {
                 dataset.bank.split_3band(col, &mut bands);
                 for b in 0..3 {
@@ -351,7 +321,7 @@ fn solve_weighted_basis(
                 col_re.resize(m_cnt, 0.0);
                 col_im.resize(m_cnt, 0.0);
                 for (j, col) in cols.iter().enumerate() {
-                    spec.project_frames(col, w, &mut col_re, &mut col_im);
+                    spec.project_frames_with_backend::<B>(col, w, &mut col_re, &mut col_im);
                     for m in 0..m_cnt {
                         phi_w[j].push(col_re[m] * sq_g);
                         phi_w[j].push(col_im[m] * sq_g);
@@ -364,15 +334,7 @@ fn solve_weighted_basis(
         }
         let mut gram = vec![0.0_f64; uplo_u_packed_len(p_dim)];
         let mut rhs = vec![[0.0_f64; 2]; p_dim];
-        let mut diag_sum = 0.0_f64;
-        for j in 0..p_dim {
-            let base = uplo_u_index(0, j);
-            for i in 0..=j {
-                gram[base + i] = dot4(&phi_w[i], &phi_w[j]);
-            }
-            diag_sum += gram[base + j];
-            rhs[j][0] = dot4(&phi_w[j], &y_w);
-        }
+        let diag_sum = B::assemble_uplo_gram_and_rhs(&phi_w, &y_w, &mut gram, &mut rhs);
         let avg_diag = (diag_sum / (p_dim as f64).max(1.0)).max(1.0e-12);
         let base_ridge = (1.0e-10 * avg_diag).max(1.0e-12);
         let direct_ridge = 1.0e-5 * avg_diag;
@@ -421,18 +383,38 @@ fn solve_weighted_basis(
     }
 }
 
-/// Solves closed-form Bézout-weighted `VarPro` Cholesky directly on [`V3OptModelF64`].
-pub fn solve_bezout_varpro_cholesky(model: &mut V3OptModelF64, dataset: &V3TrainDataset) {
+/// Solves closed-form Bézout-weighted `VarPro` Cholesky directly on [`V3OptModelF64`] via backend `B`.
+pub fn solve_bezout_varpro_cholesky_with_backend<B: TrainerBackend>(
+    model: &mut V3OptModelF64,
+    dataset: &V3TrainDataset,
+) {
     let trajs: Vec<StemTraj> = dataset
         .stems
         .iter()
         .map(|st| extract_traj_opt(model, st, None))
         .collect();
-    solve_weighted_basis(model, dataset, &trajs, None);
+    solve_weighted_basis::<B>(model, dataset, &trajs, None);
 }
 
-/// Solves Bézout-weighted `VarPro` Cholesky using the actual `f32` `V3HotCore` pre-cabinet trajectory.
-pub fn solve_bezout_varpro_cholesky_f32(model: &mut V3ColdTierModel, dataset: &V3TrainDataset) {
+/// Solves closed-form Bézout-weighted `VarPro` Cholesky directly on [`V3OptModelF64`].
+pub fn solve_bezout_varpro_cholesky(model: &mut V3OptModelF64, dataset: &V3TrainDataset) {
+    struct VarProTask<'a> {
+        model: &'a mut V3OptModelF64,
+        dataset: &'a V3TrainDataset,
+    }
+    impl TrainerTask<()> for VarProTask<'_> {
+        fn run<B: TrainerBackend>(self) {
+            solve_bezout_varpro_cholesky_with_backend::<B>(self.model, self.dataset);
+        }
+    }
+    DynamicTrainer::detect().dispatch(VarProTask { model, dataset });
+}
+
+/// Solves Bézout-weighted `VarPro` Cholesky using the actual `f32` `V3HotCore` pre-cabinet trajectory via backend `B`.
+pub fn solve_bezout_varpro_cholesky_f32_with_backend<B: TrainerBackend>(
+    model: &mut V3ColdTierModel,
+    dataset: &V3TrainDataset,
+) {
     let mut probe = model.clone();
     probe.svf.direct_taps_l = [0.0; 8];
     probe.svf.direct_taps_r = [0.0; 8];
@@ -445,7 +427,7 @@ pub fn solve_bezout_varpro_cholesky_f32(model: &mut V3ColdTierModel, dataset: &V
     probe.kautz_c_r = [(0.0, 0.0); MAX_KAUTZ_POLES];
 
     let mut opt = V3OptModelF64::from_cold_model(model);
-    let mut inst = V3CoreInstance::<DefaultMathBackend>::from_cold_model(&probe);
+    let mut inst = V3CoreInstance::<B>::from_cold_model(&probe);
     let trajs: Vec<StemTraj> = dataset
         .stems
         .iter()
@@ -471,12 +453,57 @@ pub fn solve_bezout_varpro_cholesky_f32(model: &mut V3ColdTierModel, dataset: &V
             extract_traj_opt(&opt, st, Some(&ov))
         })
         .collect();
-    solve_weighted_basis(&mut opt, dataset, &trajs, None);
+    solve_weighted_basis::<B>(&mut opt, dataset, &trajs, None);
     *model = opt.to_cold_model();
 }
 
-/// Selects complex conjugate Kautz poles `start_pole..end_pole` via 120-pole Orthogonal Matching Pursuit.
+/// Solves Bézout-weighted `VarPro` Cholesky using the actual `f32` `V3HotCore` pre-cabinet trajectory.
+pub fn solve_bezout_varpro_cholesky_f32(model: &mut V3ColdTierModel, dataset: &V3TrainDataset) {
+    struct VarProF32Task<'a> {
+        model: &'a mut V3ColdTierModel,
+        dataset: &'a V3TrainDataset,
+    }
+    impl TrainerTask<()> for VarProF32Task<'_> {
+        fn run<B: TrainerBackend>(self) {
+            solve_bezout_varpro_cholesky_f32_with_backend::<B>(self.model, self.dataset);
+        }
+    }
+    DynamicTrainer::detect().dispatch(VarProF32Task { model, dataset });
+}
+
+/// Selects complex conjugate Kautz poles `start_pole..end_pole` via 160-pole Orthogonal Matching Pursuit.
 pub fn select_omp_kautz_poles(
+    model: &mut V3OptModelF64,
+    dataset: &V3TrainDataset,
+    start_pole: usize,
+    end_pole: usize,
+) {
+    struct OmpTask<'a> {
+        model: &'a mut V3OptModelF64,
+        dataset: &'a V3TrainDataset,
+        start_pole: usize,
+        end_pole: usize,
+    }
+    impl TrainerTask<()> for OmpTask<'_> {
+        fn run<B: TrainerBackend>(self) {
+            select_omp_kautz_poles_with_backend::<B>(
+                self.model,
+                self.dataset,
+                self.start_pole,
+                self.end_pole,
+            );
+        }
+    }
+    DynamicTrainer::detect().dispatch(OmpTask {
+        model,
+        dataset,
+        start_pole,
+        end_pole,
+    });
+}
+
+/// Backend-parameterized complex conjugate Kautz pole selector via Orthogonal Matching Pursuit.
+pub fn select_omp_kautz_poles_with_backend<B: TrainerBackend>(
     model: &mut V3OptModelF64,
     dataset: &V3TrainDataset,
     start_pole: usize,
@@ -498,7 +525,7 @@ pub fn select_omp_kautz_poles(
     let mut sub_opt = model.clone();
     let c_cnt = tier_cascade_lanes(model.tier);
     let f_cnt = tier_fir_segments(model.tier) * 16;
-    solve_weighted_basis(&mut sub_opt, dataset, &trajs, Some(start_pole));
+    solve_weighted_basis::<B>(&mut sub_opt, dataset, &trajs, Some(start_pole));
 
     let active_ch = if model.mono_out { 1 } else { 2 };
     let mut res_w = Vec::<f64>::new();
@@ -514,7 +541,7 @@ pub fn select_omp_kautz_poles(
             let bw = dataset.stem_band_weights[st_idx][ch];
             let sq_w = [bw[0].sqrt(), bw[1].sqrt(), bw[2].sqrt()];
             let mut y_cur = vec![0.0_f64; n];
-            let cols = build_channel_basis(
+            let cols = build_channel_basis::<B>(
                 model.tier,
                 &sub_opt.kautz_poles,
                 &trajs[st_idx],
@@ -612,18 +639,7 @@ pub fn select_omp_kautz_poles(
                     col_im.extend(bands[b][w..n].iter().map(|&v| v * sq_w[b]));
                 }
             }
-            let n1 = dot4(&col_re, &col_re).sqrt().max(1.0e-15);
-            for v in &mut col_re {
-                *v /= n1;
-            }
-            let proj = dot4(&col_re, &col_im);
-            for (v2, &v1) in col_im.iter_mut().zip(&col_re) {
-                *v2 -= proj * v1;
-            }
-            let n2 = dot4(&col_im, &col_im).sqrt().max(1.0e-15);
-            for v in &mut col_im {
-                *v /= n2;
-            }
+            B::orthonormalize_pole_pair(&mut col_re, &mut col_im);
             dict_poles.push((r, th));
             dict_re.push(col_re);
             dict_im.push(col_im);
@@ -642,9 +658,7 @@ pub fn select_omp_kautz_poles(
             {
                 continue;
             }
-            let c1 = dot4(&res_w, &dict_re[di]);
-            let c2 = dot4(&res_w, &dict_im[di]);
-            let sc = c1 * c1 + c2 * c2;
+            let sc = B::score_pole_pair(&res_w, &dict_re[di], &dict_im[di]);
             if sc > best_score {
                 best_score = sc;
                 best_idx = di;
@@ -655,23 +669,17 @@ pub fn select_omp_kautz_poles(
         for cand in [&dict_re[best_idx], &dict_im[best_idx]] {
             let mut u = cand.clone();
             for q in &orth_basis {
-                let p = dot4(&u, q);
-                for (ui, &qi) in u.iter_mut().zip(q) {
-                    *ui -= p * qi;
-                }
+                let p = B::dot_f64(&u, q);
+                B::axpy_f64(&mut u, -p, q);
             }
-            let un = dot4(&u, &u).sqrt();
+            let un = B::sum_sq_f64(&u).sqrt();
             if un > 1.0e-10 {
-                for ui in &mut u {
-                    *ui /= un;
-                }
-                let rp = dot4(&res_w, &u);
-                for (ri, &ui) in res_w.iter_mut().zip(&u) {
-                    *ri -= rp * ui;
-                }
+                B::scale_f64(&mut u, un.recip());
+                let rp = B::dot_f64(&res_w, &u);
+                B::axpy_f64(&mut res_w, -rp, &u);
                 orth_basis.push(u);
             }
         }
     }
-    solve_weighted_basis(model, dataset, &trajs, None);
+    solve_weighted_basis::<B>(model, dataset, &trajs, None);
 }

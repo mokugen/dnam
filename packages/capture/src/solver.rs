@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Analytical Variable-Projection (`VarPro`), `uplo='U'` Cholesky & Noise-Subtracted `B-ESR` Solver.
 
+pub mod backends;
 pub mod bezout_gram;
 pub mod bezout_schur;
 pub mod stage_a;
@@ -22,6 +23,10 @@ pub use bezout_gram::{
 };
 pub use bezout_schur::solve_multitier_besr_4tier;
 
+pub use backends::{
+    DefaultTrainerBackend, DynamicTrainer, GaborOperatorBackend, GramCholeskyBackend,
+    KautzCascadeBackend, ScalarTrainerBackend, TrainerBackend, TrainerTask,
+};
 pub use stage_a::{
     StageAConfig, StageAReport, has_populated_physical_backbone, lift_stage_a_backbone,
     zero_all_role_b_cascade_weights,
@@ -41,10 +46,12 @@ pub use stage_e::{
     finalize_stage_e_and_telemetry_with_polish, identify_pole_angles_blackbox_from_audio,
     render_blackbox_probe_response,
 };
-pub use v3_varpro::{V3TrainDataset, V3TrainStem, fit_v3_core_four_tiers};
+pub use v3_varpro::{
+    V3TrainDataset, V3TrainStem, fit_v3_core_four_tiers, fit_v3_core_four_tiers_with_backend,
+};
 pub use wide_gram::{Wide192Accum, accumulate_uplo_u_wide192, contract_256d_gram_tiled_wide192};
 
-/// Tuning options for the 5-Stage `< 25 ms` Closed-Form + `VarPro` Solver (`Stage A..E`).
+/// Tuning options for the Deterministic 5-Stage Closed-Form + `VarPro` Solver (`Stage A..E`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SolverOptions {
     /// Stage A anchor-stem lifting configuration (`preserve_existing_backbone` for white-box oracles).

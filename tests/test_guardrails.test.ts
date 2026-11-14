@@ -1546,7 +1546,14 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       return sections;
     };
 
-    const allowedFixturesSections = new Set(["", "package", "lib", "lints", "dev-dependencies"]);
+    const allowedFixturesSections = new Set([
+      "",
+      "package",
+      "lib",
+      "lints",
+      "dependencies",
+      "dev-dependencies",
+    ]);
     const fixturesCargo = fs.readFileSync(
       path.join(PACKAGES_DIR, "fixtures", "Cargo.toml"),
       "utf8",
@@ -1554,7 +1561,7 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     for (const sec of parseTomlSections(fixturesCargo)) {
       expect(
         allowedFixturesSections.has(sec.header),
-        `packages/fixtures/Cargo.toml must only contain [package], [lib], [lints], and [dev-dependencies], found [${sec.header}]`,
+        `packages/fixtures/Cargo.toml must only contain [package], [lib], [lints], [dependencies], and [dev-dependencies], found [${sec.header}]`,
       ).toBe(true);
       expect(
         /(?:^|\n|\.)\s*target\s*(?:=|\.)/.test(sec.body),
@@ -1564,6 +1571,19 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
         /(?:^|\n|\.)\s*(?:(?:build|dev)-)?dependencies\s*(?:=|\.)/.test(sec.body),
         `packages/fixtures/Cargo.toml must not define inline or dotted dependency tables in [${sec.header}]`,
       ).toBe(false);
+      if (sec.header === "dependencies") {
+        const depKeys = sec.body
+          .split("\n")
+          .map((line) => line.trim())
+          .filter((line) => line.length > 0)
+          .map((line) => line.split(/[=.]/)[0]?.trim() ?? "");
+        for (const key of depKeys) {
+          expect(
+            key === "nalgebra" || key === "realfft",
+            `packages/fixtures/Cargo.toml [dependencies] may only contain simulation kernels (nalgebra, realfft), found ${key}`,
+          ).toBe(true);
+        }
+      }
     }
     expect(fs.existsSync(path.join(PACKAGES_DIR, "trainer"))).toBe(false);
     expect(
@@ -1657,7 +1677,8 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       ).not.toContain("fixtures");
     }
 
-    // Zero realfft / rustfft / ndarray / dialoguer across root and package Cargo manifests and Cargo.lock
+    // Keep ndarray and dialoguer banned everywhere across Cargo manifests and Cargo.lock,
+    // and keep realfft / rustfft / nalgebra banned in runtime/product crates (allowed only in fixtures).
     for (const cargoManifest of [
       path.join(REPO_ROOT, "Cargo.toml"),
       path.join(REPO_ROOT, "Cargo.lock"),
@@ -1666,17 +1687,24 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       ),
     ]) {
       const manifestText = fs.readFileSync(cargoManifest, "utf8");
-      expect(manifestText, `${relPath(cargoManifest)} must not depend on realfft`).not.toContain(
-        "realfft",
-      );
-      expect(manifestText, `${relPath(cargoManifest)} must not depend on rustfft`).not.toContain(
-        "rustfft",
-      );
       expect(manifestText, `${relPath(cargoManifest)} must not depend on ndarray`).not.toContain(
         "ndarray",
       );
       expect(manifestText, `${relPath(cargoManifest)} must not depend on dialoguer`).not.toContain(
         "dialoguer",
+      );
+    }
+    for (const runtimePkg of ["engine", "capture", "studio", "js"]) {
+      const pkgManifest = path.join(PACKAGES_DIR, runtimePkg, "Cargo.toml");
+      const manifestText = fs.readFileSync(pkgManifest, "utf8");
+      expect(manifestText, `${relPath(pkgManifest)} must not depend on realfft`).not.toContain(
+        "realfft",
+      );
+      expect(manifestText, `${relPath(pkgManifest)} must not depend on rustfft`).not.toContain(
+        "rustfft",
+      );
+      expect(manifestText, `${relPath(pkgManifest)} must not depend on nalgebra`).not.toContain(
+        "nalgebra",
       );
     }
 

@@ -23,7 +23,9 @@ use dnam_engine::container::{
     build_dnam_container,
 };
 use dnam_engine::engine::EngineBackend;
-use dnam_engine::math::{BackendKind, DefaultMathBackend, ScalarBackend, SimdVec4};
+use dnam_engine::math::{
+    BackendKind, DefaultMathBackend, ScalarBackend, SimdF64Vec2, SimdVec4, TrainerMathBackend,
+};
 use dnam_engine::schema::{
     ControlBusConfig, DatasetProvenance, DnamJsonHeader, IoConfig, ModelMetadata, RouterConfig,
     SlimmableTiersConfig, Stage1PreFxConfig, Stage2CascadeConfig, Stage3CabinetKautzConfig,
@@ -425,6 +427,96 @@ fn exercise_math_backend<B: EngineBackend>() {
     assert!((cp * cp + sp * sp - 1.0).abs() < 1e-4);
 }
 
+fn exercise_trainer_math_backend<B: TrainerMathBackend>() {
+    assert_eq!(B::trainer_backend_kind(), B::KIND);
+    let va = B::F64Vec2::from_f32_pair(1.5, -2.5);
+    let vb = B::F64Vec2::splat_pair(0.5, 4.0);
+    assert_eq!(
+        va.mul_add_ieee(vb, B::F64Vec2::splat(2.0)).to_array(),
+        [2.5, 5.5]
+    );
+    assert!((va.dot(vb) - (-9.25)).abs() <= 1e-12);
+
+    let a: Vec<f64> = (0..19)
+        .map(|i| 0.3 * ((i as f64) * 0.17).sin() - 0.1)
+        .collect();
+    let b: Vec<f64> = (0..19)
+        .map(|i| -0.25 * ((i as f64) * 0.23).cos() + 0.08)
+        .collect();
+    let c: Vec<f64> = (0..19)
+        .map(|i| 0.4 * ((i as f64) * 0.11).sin() + 0.04)
+        .collect();
+    assert!((ScalarBackend::dot_f64(&a, &b) - B::dot_f64(&a, &b)).abs() <= 1e-11);
+    let (sp0, sp1) = ScalarBackend::dot_pair_f64(&a, &b, &c);
+    let (bp0, bp1) = B::dot_pair_f64(&a, &b, &c);
+    assert!((sp0 - bp0).abs() <= 1e-11 && (sp1 - bp1).abs() <= 1e-11);
+    assert!((ScalarBackend::sum_sq_f64(&a) - B::sum_sq_f64(&a)).abs() <= 1e-11);
+
+    let a32: Vec<f32> = a.iter().map(|&v| v as f32).collect();
+    let b32: Vec<f32> = b.iter().map(|&v| v as f32).collect();
+    let (mut ds, mut db) = (vec![0.0; 19], vec![0.0; 19]);
+    ScalarBackend::sub_f32_to_f64(&mut ds, &a32, &b32);
+    B::sub_f32_to_f64(&mut db, &a32, &b32);
+    assert!(ds.iter().zip(&db).all(|(x, y)| x.to_bits() == y.to_bits()));
+
+    let fi0: Vec<[f64; 4]> = (0..11).map(|k| [k as f64 * 0.1, -0.3, 0.7, 0.2]).collect();
+    let fi1: Vec<[f64; 4]> = (0..11)
+        .map(|k| [-0.4, k as f64 * 0.05, 0.11, -0.9])
+        .collect();
+    let wfj: Vec<[f64; 4]> = (0..11)
+        .map(|k| [0.5, -0.25, 0.125 + k as f64 * 0.02, -0.75])
+        .collect();
+    let (t4s, t4b) = (
+        ScalarBackend::contract_tile_4x4_ieee_f64(&fi0, &wfj),
+        B::contract_tile_4x4_ieee_f64(&fi0, &wfj),
+    );
+    let ((t8as, t8bs), (t8ab, t8bb)) = (
+        ScalarBackend::contract_tile_8x4_ieee_f64(&fi0, &fi1, &wfj),
+        B::contract_tile_8x4_ieee_f64(&fi0, &fi1, &wfj),
+    );
+    for lj in 0..4 {
+        for li in 0..4 {
+            assert_eq!(t4s[lj][li].to_bits(), t4b[lj][li].to_bits());
+            assert_eq!(t8as[lj][li].to_bits(), t8ab[lj][li].to_bits());
+            assert_eq!(t8bs[lj][li].to_bits(), t8bb[lj][li].to_bits());
+        }
+    }
+
+    let mut fb = [0.0_f32; 256];
+    for (idx, v) in fb.iter_mut().enumerate() {
+        *v = ((idx as f32) * 0.19).sin() * 0.35;
+    }
+    let (mut u1s, mut u1b) = ([[0.0_f64; 256]; 7], [[0.0_f64; 256]; 7]);
+    let (mut u2s, mut u2b) = ([[0.0_f64; 256]; 7], [[0.0_f64; 256]; 7]);
+    ScalarBackend::advance_bezout7_lp_dim_f64(&fb, 65, 0.96, 0.04, &mut u1s);
+    B::advance_bezout7_lp_dim_f64(&fb, 65, 0.96, 0.04, &mut u1b);
+    ScalarBackend::advance_bezout7_lp_dim_f64(&fb, 65, 0.72, 0.28, &mut u2s);
+    B::advance_bezout7_lp_dim_f64(&fb, 65, 0.72, 0.28, &mut u2b);
+    for st in 0..7 {
+        assert!(
+            u1s[st][..65]
+                .iter()
+                .zip(&u1b[st][..65])
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+        );
+        assert!(
+            u2s[st][..65]
+                .iter()
+                .zip(&u2b[st][..65])
+                .all(|(x, y)| x.to_bits() == y.to_bits())
+        );
+    }
+    let (mut lfs, mut mfs, mut hfs) = ([0.0_f32; 256], [0.0_f32; 256], [0.0_f32; 256]);
+    let (mut lfb, mut mfb, mut hfb) = ([0.0_f32; 256], [0.0_f32; 256], [0.0_f32; 256]);
+    ScalarBackend::readout_bezout7_bands_dim_f64(&fb, 65, &u1s, &u2s, &mut lfs, &mut mfs, &mut hfs);
+    B::readout_bezout7_bands_dim_f64(&fb, 65, &u1b, &u2b, &mut lfb, &mut mfb, &mut hfb);
+    for d in 0..65 {
+        assert_eq!(lfs[d].to_bits(), lfb[d].to_bits());
+        assert_eq!(mfs[d].to_bits(), mfb[d].to_bits());
+        assert_eq!(hfs[d].to_bits(), hfb[d].to_bits());
+    }
+}
+
 #[test]
 fn test_all_math_backends_and_backend_kind_names() {
     for (kind, expected) in [
@@ -445,15 +537,23 @@ fn test_all_math_backends_and_backend_kind_names() {
 
     exercise_math_backend::<ScalarBackend>();
     exercise_math_backend::<DefaultMathBackend>();
+    exercise_trainer_math_backend::<ScalarBackend>();
+    exercise_trainer_math_backend::<DefaultMathBackend>();
     #[cfg(target_arch = "aarch64")]
     {
         exercise_math_backend::<dnam_engine::math::ArmSve2Backend>();
         exercise_math_backend::<dnam_engine::math::ArmSmeBackend>();
+        exercise_trainer_math_backend::<dnam_engine::math::NeonBackend>();
+        exercise_trainer_math_backend::<dnam_engine::math::ArmSve2Backend>();
+        exercise_trainer_math_backend::<dnam_engine::math::ArmSmeBackend>();
     }
     #[cfg(target_arch = "x86_64")]
     {
         exercise_math_backend::<dnam_engine::math::X86Sse2Backend>();
         exercise_math_backend::<dnam_engine::math::X86Sse42Backend>();
         exercise_math_backend::<dnam_engine::math::X86Avx2FmaBackend>();
+        exercise_trainer_math_backend::<dnam_engine::math::X86Sse2Backend>();
+        exercise_trainer_math_backend::<dnam_engine::math::X86Sse42Backend>();
+        exercise_trainer_math_backend::<dnam_engine::math::X86Avx2FmaBackend>();
     }
 }

@@ -35,7 +35,7 @@ stateDiagram-v2
     Capturing --> TrainedFull: Run 5-Stage VarPro -> STAT + WGHT (+ AUTH)
     TrainedFull --> TrainedCompacted: compact_to_capsules() strips SPCM (< 1 ms)
     TrainedFull --> RuntimeExport: export_runtime_dnam() slices WGHT (< 0.2 ms)
-    TrainedCompacted --> TrainedCompacted: Vault add/remove/replace/toggle (< 5-25 ms)
+    TrainedCompacted --> TrainedCompacted: Vault add/remove/replace/toggle (Two-Path)
     TrainedCompacted --> RuntimeExport: export_runtime_dnam() slices WGHT (< 0.2 ms)
 ```
 
@@ -97,7 +97,7 @@ A `.dnam-proj` container transitions monotonically or non-destructively across v
 
 1. **Active Capture (`CALB` + `SPCM` + `INPC`/`STMC`):** Retains lossless raw `SPCM` audio stems alongside extracted `INPC`/`STMC` capsules during active hardware recording.
 2. **Trained Full Project (`+ STAT + WGHT`):** Embeds `StarCenter` `uplo='U'` sufficient statistics (`STAT`) and the certified 4-tier `.dnam` runtime model (`WGHT`).
-3. **Capsule Compaction (`compact_to_capsules`, `< 1 ms`):** Requires `INPC` and `STMC` capsules whenever `stems_registry` is non-empty, strips all raw `SPCM` chunks in place without re-running solver passes, preserves `PROJ_FLAG_COMPACTED_CAPSULES` across capsule-only vault edits, and shrinks multi-stem projects to compact capsules (`~0.8–2.5 MB`) that still support `< 25 ms` full re-pooling and `< 0.2 ms` runtime `.dnam` export (`REQ-3.1`, `REQ-3.3`).
+3. **Capsule Compaction (`compact_to_capsules`):** Requires `INPC` and `STMC` capsules whenever `stems_registry` is non-empty, strips all raw `SPCM` chunks in place without re-running solver passes, preserves `PROJ_FLAG_COMPACTED_CAPSULES` across capsule-only vault edits, and shrinks multi-stem projects to compact capsules (`~0.8–2.5 MB`) that still support deterministic full re-pooling and fast runtime `.dnam` export (`REQ-3.1`, `REQ-3.3`).
 
 ---
 

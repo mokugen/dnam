@@ -9,7 +9,11 @@ use dnam_engine::stages::v3_core::cascade::{
     NUM_CASCADE_BLOCKS, tier_cascade_lanes, tier_fir_segments, tier_kautz_banks,
 };
 
-use super::adjoint::{AdjointWorkspace, evaluate_loss_and_grad_f64, evaluate_loss_f64};
+use crate::solver::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
+
+use super::adjoint::{
+    AdjointWorkspace, evaluate_loss_and_grad_f64_with_backend, evaluate_loss_f64_with_backend,
+};
 use super::model_f64::{V3OptModelF64, V3TrainDataset};
 
 #[derive(Clone, Copy)]
@@ -386,48 +390,40 @@ fn map_model_grad_to_u(
     g_u
 }
 
-#[inline]
-fn dot(a: &[f64], b: &[f64]) -> f64 {
-    a.iter().zip(b).map(|(&x, &y)| x * y).sum()
-}
-
-fn lbfgs_direction(g: &[f64], history: &VecDeque<(Vec<f64>, Vec<f64>, f64)>) -> Vec<f64> {
+fn lbfgs_direction<B: TrainerBackend>(
+    g: &[f64],
+    history: &VecDeque<(Vec<f64>, Vec<f64>, f64)>,
+) -> Vec<f64> {
     let mut q: Vec<f64> = g.to_vec();
     let k = history.len();
     let mut alpha = vec![0.0_f64; k];
     for (i, (s, y, rho)) in history.iter().enumerate().rev() {
-        let a = rho * dot(s, &q);
+        let a = rho * B::dot_f64(s, &q);
         alpha[i] = a;
-        for (qi, &yi) in q.iter_mut().zip(y) {
-            *qi -= a * yi;
-        }
+        B::axpy_f64(&mut q, -a, y);
     }
     let gamma = if let Some((s, y, _)) = history.back() {
-        let yy = dot(y, y);
+        let yy = B::sum_sq_f64(y);
         if yy > 1.0e-18 {
-            (dot(s, y) / yy).clamp(1.0e-6, 1.0e4)
+            (B::dot_f64(s, y) / yy).clamp(1.0e-6, 1.0e4)
         } else {
             1.0
         }
     } else {
-        let gg = dot(g, g).sqrt();
+        let gg = B::sum_sq_f64(g).sqrt();
         if gg > 1.0 {
             (1.0 / gg).clamp(1.0e-4, 1.0)
         } else {
             1.0
         }
     };
-    let mut r: Vec<f64> = q.into_iter().map(|v| v * gamma).collect();
+    let mut r = q;
+    B::scale_f64(&mut r, gamma);
     for (i, (s, y, rho)) in history.iter().enumerate() {
-        let beta = rho * dot(y, &r);
-        let diff = alpha[i] - beta;
-        for (ri, &si) in r.iter_mut().zip(s) {
-            *ri += diff * si;
-        }
+        let beta = rho * B::dot_f64(y, &r);
+        B::axpy_f64(&mut r, alpha[i] - beta, s);
     }
-    for ri in &mut r {
-        *ri = -*ri;
-    }
+    B::scale_f64(&mut r, -1.0);
     r
 }
 
@@ -441,7 +437,7 @@ struct TrialRollback<'a> {
 /// Evaluates a single backtracking line-search candidate wrapped in `core::mem::DropGuard`
 /// so rejected, non-finite, or early-exit trials deterministically restore `(model, u)`.
 #[allow(clippy::too_many_arguments)]
-fn try_armijo_line_search(
+fn try_armijo_line_search<B: TrainerBackend>(
     model: &mut V3OptModelF64,
     u: &mut Vec<f64>,
     g: &mut Vec<f64>,
@@ -465,19 +461,18 @@ fn try_armijo_line_search(
     );
 
     let orig_loss = *loss;
-    let d_len = guard.u.len();
     let mut step_alpha = 1.0_f64;
     for _ in 0..14 {
         {
             let rb = &mut *guard;
-            for i in 0..d_len {
-                rb.u[i] = rb.backup_u[i] + step_alpha * dir[i];
-            }
+            rb.u.copy_from_slice(&rb.backup_u);
+            B::axpy_f64(rb.u, step_alpha, dir);
             decode_u_into_model(rb.u, rb.model);
         }
-        let cand_loss = evaluate_loss_f64(guard.model, dataset, ws);
+        let cand_loss = evaluate_loss_f64_with_backend::<B>(guard.model, dataset, ws);
         if cand_loss.is_finite() && cand_loss <= orig_loss + 1.0e-4 * step_alpha * slope {
-            let (exact_loss, grad_model) = evaluate_loss_and_grad_f64(guard.model, dataset, ws);
+            let (exact_loss, grad_model) =
+                evaluate_loss_and_grad_f64_with_backend::<B>(guard.model, dataset, ws);
             let new_g = map_model_grad_to_u(guard.u, guard.model, &grad_model);
             if exact_loss.is_finite() && new_g.iter().all(|v| v.is_finite()) {
                 let s_vec: Vec<f64> = guard
@@ -502,41 +497,42 @@ fn try_armijo_line_search(
     None
 }
 
-/// Runs L-BFGS (`m = 12`) in smooth transformed parameter space with `DropGuard` rollback protection.
-pub fn run_lbfgs(
+/// Runs L-BFGS (`m = 12`) in smooth transformed parameter space via backend `B`.
+pub fn run_lbfgs_with_backend<B: TrainerBackend>(
     model: &mut V3OptModelF64,
     dataset: &V3TrainDataset,
     ws: &mut AdjointWorkspace,
     max_iters: usize,
 ) -> f64 {
     if max_iters == 0 {
-        return evaluate_loss_f64(model, dataset, ws);
+        return evaluate_loss_f64_with_backend::<B>(model, dataset, ws);
     }
     let mut u = encode_model_u(model);
     decode_u_into_model(&u, model);
-    let (mut loss, grad_model) = evaluate_loss_and_grad_f64(model, dataset, ws);
+    let (mut loss, grad_model) = evaluate_loss_and_grad_f64_with_backend::<B>(model, dataset, ws);
     let mut g = map_model_grad_to_u(&u, model, &grad_model);
     let mut history: VecDeque<(Vec<f64>, Vec<f64>, f64)> = VecDeque::with_capacity(12);
 
     for _ in 0..max_iters {
-        let g_norm = dot(&g, &g).sqrt();
+        let g_norm = B::sum_sq_f64(&g).sqrt();
         if !g_norm.is_finite() || g_norm < 1.0e-8 {
             break;
         }
-        let mut dir = lbfgs_direction(&g, &history);
-        let mut slope = dot(&dir, &g);
+        let mut dir = lbfgs_direction::<B>(&g, &history);
+        let mut slope = B::dot_f64(&dir, &g);
         if !slope.is_finite() || slope >= 0.0 {
             history.clear();
-            dir = g.iter().map(|&v| -v).collect();
-            slope = -dot(&g, &g);
+            dir.clone_from(&g);
+            B::scale_f64(&mut dir, -1.0);
+            slope = -B::sum_sq_f64(&g);
         }
 
         if let Some((s_vec, y_vec)) =
-            try_armijo_line_search(model, &mut u, &mut g, &mut loss, &dir, slope, dataset, ws)
+            try_armijo_line_search::<B>(model, &mut u, &mut g, &mut loss, &dir, slope, dataset, ws)
         {
-            let sy = dot(&s_vec, &y_vec);
-            let sn = dot(&s_vec, &s_vec).sqrt();
-            let yn = dot(&y_vec, &y_vec).sqrt();
+            let sy = B::dot_f64(&s_vec, &y_vec);
+            let sn = B::sum_sq_f64(&s_vec).sqrt();
+            let yn = B::sum_sq_f64(&y_vec).sqrt();
             if sy.is_finite() && sy > 1.0e-10 * (sn * yn).max(1.0e-18) {
                 if history.len() == 12 {
                     history.pop_front();
@@ -552,11 +548,40 @@ pub fn run_lbfgs(
     loss
 }
 
+/// Runs L-BFGS (`m = 12`) in smooth transformed parameter space with `DropGuard` rollback protection.
+pub fn run_lbfgs(
+    model: &mut V3OptModelF64,
+    dataset: &V3TrainDataset,
+    ws: &mut AdjointWorkspace,
+    max_iters: usize,
+) -> f64 {
+    struct LbfgsTask<'a> {
+        model: &'a mut V3OptModelF64,
+        dataset: &'a V3TrainDataset,
+        ws: &'a mut AdjointWorkspace,
+        max_iters: usize,
+    }
+    impl TrainerTask<f64> for LbfgsTask<'_> {
+        fn run<B: TrainerBackend>(self) -> f64 {
+            run_lbfgs_with_backend::<B>(self.model, self.dataset, self.ws, self.max_iters)
+        }
+    }
+    DynamicTrainer::detect().dispatch(LbfgsTask {
+        model,
+        dataset,
+        ws,
+        max_iters,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use super::super::adjoint::{evaluate_loss_and_grad_f64, evaluate_loss_f64};
     use super::super::model_f64::V3TrainStem;
     use super::*;
+    use crate::solver::backends::DefaultTrainerBackend;
     use dnam_engine::Tier;
+    use dnam_engine::math::TrainerMathBackend;
     use dnam_engine::stages::v3_core::V3ColdTierModel;
 
     fn make_test_stem(n: usize, warmup: usize) -> V3TrainStem {
@@ -598,7 +623,7 @@ mod tests {
         let mut g = map_model_grad_to_u(&u, &model, &grad_m);
 
         let bad_dir = vec![1.0e3_f64; u.len()];
-        let accepted = try_armijo_line_search(
+        let accepted = try_armijo_line_search::<DefaultTrainerBackend>(
             &mut model, &mut u, &mut g, &mut loss, &bad_dir, 1.0, &ds, &mut ws,
         );
         assert!(accepted.is_none());
@@ -606,9 +631,9 @@ mod tests {
         assert!((model.pre_cab_u_gain[0] - orig_gain).abs() < 1.0e-12);
 
         let good_dir: Vec<f64> = g.iter().map(|&v| -v).collect();
-        let slope = -dot(&g, &g);
+        let slope = -DefaultTrainerBackend::sum_sq_f64(&g);
         let prev_loss = loss;
-        let step = try_armijo_line_search(
+        let step = try_armijo_line_search::<DefaultTrainerBackend>(
             &mut model, &mut u, &mut g, &mut loss, &good_dir, slope, &ds, &mut ws,
         );
         assert!(step.is_some());

@@ -9,30 +9,34 @@ pub mod model_f64;
 pub(crate) mod primitives;
 pub mod svf_id;
 
-pub use lbfgs::run_lbfgs;
+pub use lbfgs::{run_lbfgs, run_lbfgs_with_backend};
 pub use model_f64::{V3OptModelF64, V3TrainDataset, V3TrainStem};
 
+use super::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
 use crate::metrics::{
-    ArchetypeFamily, PerceptualCertificationSummary, certify_blackbox_coreset_chain,
+    ArchetypeFamily, PerceptualCertificationSummary, certify_4metric_signal_chain,
 };
 use dnam_engine::Tier;
-use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::stages::v3_core::cascade::{
     MAX_CASCADE_LANES, MAX_KAUTZ_POLES, NUM_CASCADE_BLOCKS, tier_cascade_lanes, tier_kautz_banks,
 };
 use dnam_engine::stages::v3_core::{V3ColdTierModel, V3CoreInstance};
 
-use adjoint::{AdjointWorkspace, evaluate_loss_f64};
+use adjoint::{AdjointWorkspace, evaluate_loss_f64_with_backend};
 use basis::{
-    select_omp_kautz_poles, solve_bezout_varpro_cholesky, solve_bezout_varpro_cholesky_f32,
+    select_omp_kautz_poles_with_backend, solve_bezout_varpro_cholesky_f32_with_backend,
+    solve_bezout_varpro_cholesky_with_backend,
 };
 use gabor::GaborAdjointScratch;
 use svf_id::prescreen_lite_seeds;
 
-/// Evaluates the exact Bézout 3-band `bESR` loss using the real `f32` `V3CoreInstance`.
+/// Evaluates the exact Bézout 3-band `bESR` loss using the real `f32` `V3CoreInstance` via backend `B`.
 #[must_use]
-pub fn evaluate_cold_loss_f32(cold: &V3ColdTierModel, dataset: &V3TrainDataset) -> f64 {
-    let mut inst = V3CoreInstance::<DefaultMathBackend>::from_cold_model(cold);
+pub fn evaluate_cold_loss_f32_with_backend<B: TrainerBackend>(
+    cold: &V3ColdTierModel,
+    dataset: &V3TrainDataset,
+) -> f64 {
+    let mut inst = V3CoreInstance::<B>::from_cold_model(cold);
     let active_ch = if cold.mono_out { 1 } else { 2 };
     let ch_scale = if cold.mono_out { 1.0 } else { 0.5 };
     let mut bands = [Vec::new(), Vec::new(), Vec::new()];
@@ -68,12 +72,12 @@ pub fn evaluate_cold_loss_f32(cold: &V3ColdTierModel, dataset: &V3TrainDataset) 
             dataset.bank.split_3band(&err, &mut bands);
             let bw = dataset.stem_band_weights[stem_idx][ch];
             for b in 0..3 {
-                let eb: f64 = bands[b][w..n].iter().map(|&v| v * v).sum();
+                let eb = B::sum_sq_f64(&bands[b][w..n]);
                 total_loss += ch_scale * bw[b] * eb;
             }
             if dataset.gabor_env_weight > 0.0 || dataset.gabor_ltas_weight > 0.0 {
                 let y_f64: Vec<f64> = out[..n].iter().map(|&v| v as f64).collect();
-                total_loss += dataset.eval_gabor_loss_and_adjoint(
+                total_loss += dataset.eval_gabor_loss_and_adjoint_with_backend::<B>(
                     stem_idx,
                     ch,
                     ch_scale,
@@ -87,15 +91,30 @@ pub fn evaluate_cold_loss_f32(cold: &V3ColdTierModel, dataset: &V3TrainDataset) 
     total_loss
 }
 
-fn accept_varpro_if_improves(
+/// Evaluates the exact Bézout 3-band `bESR` loss using the real `f32` `V3CoreInstance`.
+#[must_use]
+pub fn evaluate_cold_loss_f32(cold: &V3ColdTierModel, dataset: &V3TrainDataset) -> f64 {
+    struct ColdLossTask<'a> {
+        cold: &'a V3ColdTierModel,
+        dataset: &'a V3TrainDataset,
+    }
+    impl TrainerTask<f64> for ColdLossTask<'_> {
+        fn run<B: TrainerBackend>(self) -> f64 {
+            evaluate_cold_loss_f32_with_backend::<B>(self.cold, self.dataset)
+        }
+    }
+    DynamicTrainer::detect().dispatch(ColdLossTask { cold, dataset })
+}
+
+fn accept_varpro_if_improves<B: TrainerBackend>(
     model: &mut V3OptModelF64,
     dataset: &V3TrainDataset,
     ws: &mut AdjointWorkspace,
     best_loss: &mut f64,
 ) {
     let backup = model.clone();
-    solve_bezout_varpro_cholesky(model, dataset);
-    let after = evaluate_loss_f64(model, dataset, ws);
+    solve_bezout_varpro_cholesky_with_backend::<B>(model, dataset);
+    let after = evaluate_loss_f64_with_backend::<B>(model, dataset, ws);
     if after.is_finite() && after <= *best_loss {
         *best_loss = after;
     } else {
@@ -146,7 +165,7 @@ fn seed_new_cascade_group(model: &mut V3OptModelF64, start_lane: usize, end_lane
     }
 }
 
-fn polish_and_quantize(
+fn polish_and_quantize<B: TrainerBackend>(
     cand: &mut V3OptModelF64,
     ds_polish: &V3TrainDataset,
     ds_eval: &V3TrainDataset,
@@ -154,18 +173,18 @@ fn polish_and_quantize(
     prev_k: usize,
     next_k: usize,
 ) -> (V3ColdTierModel, f64) {
-    select_omp_kautz_poles(cand, ds_polish, prev_k, next_k);
-    let mut cur_loss = evaluate_loss_f64(cand, ds_polish, ws);
-    accept_varpro_if_improves(cand, ds_polish, ws, &mut cur_loss);
-    cur_loss = run_lbfgs(cand, ds_polish, ws, 55);
-    accept_varpro_if_improves(cand, ds_polish, ws, &mut cur_loss);
-    run_lbfgs(cand, ds_polish, ws, 30);
+    select_omp_kautz_poles_with_backend::<B>(cand, ds_polish, prev_k, next_k);
+    let mut cur_loss = evaluate_loss_f64_with_backend::<B>(cand, ds_polish, ws);
+    accept_varpro_if_improves::<B>(cand, ds_polish, ws, &mut cur_loss);
+    cur_loss = run_lbfgs_with_backend::<B>(cand, ds_polish, ws, 55);
+    accept_varpro_if_improves::<B>(cand, ds_polish, ws, &mut cur_loss);
+    run_lbfgs_with_backend::<B>(cand, ds_polish, ws, 30);
 
     let mut cold = cand.to_cold_model();
-    let loss_before = evaluate_cold_loss_f32(&cold, ds_eval);
+    let loss_before = evaluate_cold_loss_f32_with_backend::<B>(&cold, ds_eval);
     let mut cold_vp = cold.clone();
-    solve_bezout_varpro_cholesky_f32(&mut cold_vp, ds_eval);
-    let loss_after = evaluate_cold_loss_f32(&cold_vp, ds_eval);
+    solve_bezout_varpro_cholesky_f32_with_backend::<B>(&mut cold_vp, ds_eval);
+    let loss_after = evaluate_cold_loss_f32_with_backend::<B>(&cold_vp, ds_eval);
     if loss_after.is_finite() && loss_after <= loss_before {
         cold = cold_vp;
         (cold, loss_after)
@@ -174,7 +193,7 @@ fn polish_and_quantize(
     }
 }
 
-fn coreset_summary_for_cold(
+fn signal_chain_summary_for_cold<B: TrainerBackend>(
     cold: &V3ColdTierModel,
     s0: &V3TrainStem,
     sr_hz: f64,
@@ -188,7 +207,7 @@ fn coreset_summary_for_cold(
     if n <= s0.warmup + 1 {
         return None;
     }
-    let mut inst = V3CoreInstance::<DefaultMathBackend>::from_cold_model(cold);
+    let mut inst = V3CoreInstance::<B>::from_cold_model(cold);
     let (mut out_l, mut out_r) = (vec![0.0_f32; n], vec![0.0_f32; n]);
     let r_in = if cold.mono_out {
         &s0.in_l[..n]
@@ -198,22 +217,24 @@ fn coreset_summary_for_cold(
     inst.reset_to_dc_equilibrium();
     inst.process_block_stereo(&s0.in_l[..n], r_in, &mut out_l, &mut out_r);
     let f64v = |v: &[f32]| v.iter().map(|&x| x as f64).collect::<Vec<f64>>();
-    let sl = certify_blackbox_coreset_chain(
+    let sl = certify_4metric_signal_chain(
         ArchetypeFamily::CleanPedalPreamp,
         cold.tier,
         &f64v(&s0.tgt_l[..n]),
         &f64v(&out_l),
+        None,
         sr_hz,
         s0.warmup,
     );
     if cold.mono_out {
         return Some(sl);
     }
-    let sr = certify_blackbox_coreset_chain(
+    let sr = certify_4metric_signal_chain(
         ArchetypeFamily::CleanPedalPreamp,
         cold.tier,
         &f64v(&s0.tgt_r[..n]),
         &f64v(&out_r),
+        None,
         sr_hz,
         s0.warmup,
     );
@@ -245,12 +266,25 @@ fn is_strict_summary_upgrade(
     lo: &PerceptualCertificationSummary,
     hi: &PerceptualCertificationSummary,
 ) -> bool {
-    hi.raw_besr_db <= lo.raw_besr_db
-        && hi.mr_iir <= lo.mr_iir
-        && hi.ltas_max_db <= lo.ltas_max_db
-        && hi.seg_esr_db <= lo.seg_esr_db
-        && hi.ltas_excluded_bands == lo.ltas_excluded_bands
-        && (0..3).all(|b| hi.band_esr_db[b] <= lo.band_esr_db[b])
+    let valid_db = |x: f64| !x.is_nan() && x < f64::INFINITY;
+    if !valid_db(lo.raw_besr_db) || !valid_db(hi.raw_besr_db) || hi.raw_besr_db > lo.raw_besr_db {
+        return false;
+    }
+    if (0..3).any(|b| hi.band_esr_db[b].is_nan() || hi.band_esr_db[b] > lo.band_esr_db[b]) {
+        return false;
+    }
+    if lo.mr_iir.is_finite() && (!hi.mr_iir.is_finite() || hi.mr_iir > lo.mr_iir) {
+        return false;
+    }
+    if lo.ltas_max_db.is_finite()
+        && (!hi.ltas_max_db.is_finite() || hi.ltas_max_db > lo.ltas_max_db)
+    {
+        return false;
+    }
+    if valid_db(lo.seg_esr_db) && (!valid_db(hi.seg_esr_db) || hi.seg_esr_db > lo.seg_esr_db) {
+        return false;
+    }
+    hi.ltas_excluded_bands == lo.ltas_excluded_bands
         && (0..33).all(|b| {
             !hi.ltas_excluded_bands[b]
                 || hi.ltas_residual_band_power[b] <= lo.ltas_residual_band_power[b]
@@ -294,6 +328,24 @@ fn blend_linear_readout(
 /// + exact reverse-mode adjoint L-BFGS + 160-pole OMP Kautz selection + `DropGuard` rollback.
 #[must_use]
 pub fn fit_v3_core_four_tiers(dataset: &V3TrainDataset, mono_out: bool) -> [V3ColdTierModel; 4] {
+    struct FitTask<'a> {
+        dataset: &'a V3TrainDataset,
+        mono_out: bool,
+    }
+    impl TrainerTask<[V3ColdTierModel; 4]> for FitTask<'_> {
+        fn run<B: TrainerBackend>(self) -> [V3ColdTierModel; 4] {
+            fit_v3_core_four_tiers_with_backend::<B>(self.dataset, self.mono_out)
+        }
+    }
+    DynamicTrainer::detect().dispatch(FitTask { dataset, mono_out })
+}
+
+/// Backend-parameterized nested `[Lite, Full, Pro, Ultra]` `v3` core fitter (`VarPro` + L-BFGS + OMP).
+#[must_use]
+pub fn fit_v3_core_four_tiers_with_backend<B: TrainerBackend>(
+    dataset: &V3TrainDataset,
+    mono_out: bool,
+) -> [V3ColdTierModel; 4] {
     let ds_homotopy = dataset.with_gabor_weights(0.45, 0.03);
     let ds_polish = dataset.with_gabor_weights(0.0, 0.012);
     let mut ws = AdjointWorkspace::default();
@@ -308,16 +360,16 @@ pub fn fit_v3_core_four_tiers(dataset: &V3TrainDataset, mono_out: bool) -> [V3Co
     let mut best_lite_opt = top_seeds[0].clone();
     let mut best_lite_loss = f64::MAX;
     for mut seed in top_seeds {
-        run_lbfgs(&mut seed, &ds_homotopy, &mut ws, 25);
-        let loss = evaluate_loss_f64(&seed, &ds_polish, &mut ws);
+        run_lbfgs_with_backend::<B>(&mut seed, &ds_homotopy, &mut ws, 25);
+        let loss = evaluate_loss_f64_with_backend::<B>(&seed, &ds_polish, &mut ws);
         if loss.is_finite() && loss < best_lite_loss {
             best_lite_loss = loss;
             best_lite_opt = seed;
         }
     }
     let (lite_cold, lite_loss_f32) =
-        polish_and_quantize(&mut best_lite_opt, &ds_polish, &ds_polish, &mut ws, 0, 4);
-    let raw_lite_loss = evaluate_loss_f64(&best_lite_opt, &ds_polish, &mut ws);
+        polish_and_quantize::<B>(&mut best_lite_opt, &ds_polish, &ds_polish, &mut ws, 0, 4);
+    let raw_lite_loss = evaluate_loss_f64_with_backend::<B>(&best_lite_opt, &ds_polish, &mut ws);
 
     // --- Helper for synchronous 1x monotone lifted tiers (progressive raw_opt + strict 7-metric guard) ---
     let fit_lifted = |cert_cold: &V3ColdTierModel,
@@ -335,10 +387,9 @@ pub fn fit_v3_core_four_tiers(dataset: &V3TrainDataset, mono_out: bool) -> [V3Co
         let cert_opt = V3OptModelF64::from_cold_model(cert_cold);
         let exact_opt = lift_opt_model(&cert_opt, next_tier, false);
         let exact_cold = exact_opt.to_cold_model();
-        let prev_sum = dataset
-            .stems
-            .first()
-            .and_then(|s0| coreset_summary_for_cold(cert_cold, s0, dataset.sample_rate_hz));
+        let prev_sum = dataset.stems.first().and_then(|s0| {
+            signal_chain_summary_for_cold::<B>(cert_cold, s0, dataset.sample_rate_hz)
+        });
         let summary_ok = |cold: &V3ColdTierModel| -> bool {
             let Some(ref lo) = prev_sum else {
                 return true;
@@ -346,7 +397,7 @@ pub fn fit_v3_core_four_tiers(dataset: &V3TrainDataset, mono_out: bool) -> [V3Co
             dataset
                 .stems
                 .first()
-                .and_then(|s0| coreset_summary_for_cold(cold, s0, dataset.sample_rate_hz))
+                .and_then(|s0| signal_chain_summary_for_cold::<B>(cold, s0, dataset.sample_rate_hz))
                 .is_some_and(|hi| is_strict_summary_upgrade(lo, &hi))
         };
 
@@ -358,16 +409,16 @@ pub fn fit_v3_core_four_tiers(dataset: &V3TrainDataset, mono_out: bool) -> [V3Co
 
         // Baseline 1: exact cert nonlinear + extended FIR/Kautz f32 VarPro with monotone blend fallback
         let mut ext_varpro_opt = exact_opt.clone();
-        select_omp_kautz_poles(&mut ext_varpro_opt, &ds_polish, prev_k, next_k);
+        select_omp_kautz_poles_with_backend::<B>(&mut ext_varpro_opt, &ds_polish, prev_k, next_k);
         let mut ext_varpro_cold = ext_varpro_opt.to_cold_model();
-        solve_bezout_varpro_cholesky_f32(&mut ext_varpro_cold, &ds_polish);
+        solve_bezout_varpro_cholesky_f32_with_backend::<B>(&mut ext_varpro_cold, &ds_polish);
         let mut ext_base_cold = exact_cold.clone();
         ext_base_cold.kautz_poles = ext_varpro_cold.kautz_poles;
         for alpha in [
             1.0_f32, 0.90, 0.80, 0.70, 0.55, 0.40, 0.25, 0.15, 0.08, 0.03, 0.01,
         ] {
             let b_cold = blend_linear_readout(&ext_base_cold, &ext_varpro_cold, alpha);
-            let b_loss = evaluate_cold_loss_f32(&b_cold, &ds_polish);
+            let b_loss = evaluate_cold_loss_f32_with_backend::<B>(&b_cold, &ds_polish);
             if b_loss.is_finite() && b_loss < best_loss && summary_ok(&b_cold) {
                 best_loss = b_loss;
                 best_cold = b_cold;
@@ -379,9 +430,9 @@ pub fn fit_v3_core_four_tiers(dataset: &V3TrainDataset, mono_out: bool) -> [V3Co
             |mut cand: V3OptModelF64, is_raw_path: bool, ws: &mut AdjointWorkspace| -> bool {
                 seed_new_cascade_group(&mut cand, prev_c, next_c);
                 let (cold_c, loss_c) =
-                    polish_and_quantize(&mut cand, &ds_polish, &ds_polish, ws, prev_k, next_k);
+                    polish_and_quantize::<B>(&mut cand, &ds_polish, &ds_polish, ws, prev_k, next_k);
                 if is_raw_path {
-                    let raw_c_loss = evaluate_loss_f64(&cand, &ds_polish, ws);
+                    let raw_c_loss = evaluate_loss_f64_with_backend::<B>(&cand, &ds_polish, ws);
                     if raw_c_loss.is_finite() && raw_c_loss < next_raw_loss {
                         next_raw_loss = raw_c_loss;
                         next_raw_opt = cand.clone();
@@ -396,14 +447,14 @@ pub fn fit_v3_core_four_tiers(dataset: &V3TrainDataset, mono_out: bool) -> [V3Co
                 for alpha in [0.90_f64, 0.75, 0.60, 0.45, 0.30, 0.15, 0.05] {
                     let b_opt = exact_opt.blend_same_os(&target_sync, alpha);
                     let mut b_cold = b_opt.to_cold_model();
-                    let d_loss = evaluate_cold_loss_f32(&b_cold, &ds_polish);
+                    let d_loss = evaluate_cold_loss_f32_with_backend::<B>(&b_cold, &ds_polish);
                     if d_loss.is_finite() && d_loss < best_loss && summary_ok(&b_cold) {
                         best_loss = d_loss;
                         best_cold = b_cold;
                         return false;
                     }
-                    solve_bezout_varpro_cholesky_f32(&mut b_cold, &ds_polish);
-                    let v_loss = evaluate_cold_loss_f32(&b_cold, &ds_polish);
+                    solve_bezout_varpro_cholesky_f32_with_backend::<B>(&mut b_cold, &ds_polish);
+                    let v_loss = evaluate_cold_loss_f32_with_backend::<B>(&b_cold, &ds_polish);
                     if v_loss.is_finite() && v_loss < best_loss && summary_ok(&b_cold) {
                         best_loss = v_loss;
                         best_cold = b_cold;
@@ -457,21 +508,28 @@ pub fn fit_v3_core_four_tiers(dataset: &V3TrainDataset, mono_out: bool) -> [V3Co
 mod tests {
     use std::f64::consts::PI;
 
-    use super::adjoint::evaluate_loss_and_grad_f64;
+    use super::adjoint::{evaluate_loss_and_grad_f64, evaluate_loss_f64};
     use super::*;
     use crate::metrics::{evaluate_besr_from_band_energies, split_bezout_3band_energies};
+    use crate::solver::backends::DefaultTrainerBackend;
+    use dnam_engine::math::DefaultMathBackend;
     use dnam_engine::stages::v3_core::cascade::tier_fir_segments;
 
     type ParamMutFn = fn(&mut V3OptModelF64, f64);
 
     fn make_synthetic_stem(n: usize, warmup: usize) -> V3TrainStem {
+        let centers = crate::metrics::canonical_ltas_33_centers_hz();
+        let scale = 0.42 / (centers.len() as f64).sqrt();
         let mut x = vec![0.0_f32; n];
         for (t, v) in x.iter_mut().enumerate() {
             let tf = t as f64 / 48_000.0;
-            let env = (0.3 + 0.7 * (2.0 * PI * 3.0 * tf).sin().abs()) as f32;
-            *v = env
-                * (0.45 * (2.0 * PI * 140.0 * tf).sin() + 0.25 * (2.0 * PI * 930.0 * tf).sin())
-                    as f32;
+            let env = 0.45 + 0.55 * (0.5 - 0.5 * (2.0 * PI * 3.0 * tf).cos());
+            let mut sum = 0.0_f64;
+            for (k, &fc) in centers.iter().enumerate() {
+                let phi = ((k as f64 + 1.0) * std::f64::consts::GOLDEN_RATIO).fract() * 2.0 * PI;
+                sum += (2.0 * PI * fc * tf + phi).cos();
+            }
+            *v = (env * scale * sum) as f32;
         }
         let mut tgt = vec![0.0_f32; n];
         let mut lp = 0.0_f32;
@@ -710,7 +768,7 @@ mod tests {
 
     #[test]
     fn test_fit_v3_core_four_tiers_monotone_nonlinear() {
-        let stem = make_synthetic_stem(2_400, 128);
+        let stem = make_synthetic_stem(4_800, 128);
         let ds = V3TrainDataset::new(vec![stem.clone()], 48_000.0);
         let models = fit_v3_core_four_tiers(&ds, true);
         let b: Vec<f64> = models.iter().map(|m| model_besr_db(m, &stem)).collect();
@@ -723,7 +781,9 @@ mod tests {
         );
         let sums: [PerceptualCertificationSummary; 4] = models
             .iter()
-            .map(|m| coreset_summary_for_cold(m, &stem, 48_000.0).unwrap())
+            .map(|m| {
+                signal_chain_summary_for_cold::<DefaultTrainerBackend>(m, &stem, 48_000.0).unwrap()
+            })
             .collect::<Vec<_>>()
             .try_into()
             .unwrap();

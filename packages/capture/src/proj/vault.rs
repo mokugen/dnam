@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Non-Destructive `.dnam-proj` (`DNPJ`) Capture Vault Editing (`proj::vault`):
 //! `add_capture`, `remove_capture`, `replace_capture`, `set_capture_enabled`,
-//! `solve_captures_batch_into_proj`, and Two-Path (`< 5–10 ms` Fast-Path vs. `< 15–25 ms` Full
+//! `solve_captures_batch_into_proj`, and Two-Path (Sub-Second Fast-Path vs. Deterministic Full
 //! Re-Pool) 5-Stage Compositional Re-Solve.
 //!
 //! Canonical References:
@@ -338,7 +338,7 @@ fn rebuild_vault_container(
             zero_arena_b_head_dc_bias(&mut arena_64k);
         }
     } else if let Some((ref stat_bytes, _)) = stat_out {
-        // Path 1 (< 5–10 ms): reuse cached G_0 from STAT; Mode 0 stays 0.000000 ULP untouched.
+        // Path 1 (Incremental Fast-Path): reuse cached G_0 from STAT; Mode 0 stays 0.000000 ULP untouched.
         let n_pack = uplo_u_packed_len(256);
         if stat_bytes.len() >= n_pack * 8 {
             let mut g = Vec::with_capacity(n_pack);
@@ -554,8 +554,8 @@ fn push_capture_into_vault_state(
 }
 
 /// Inserts a new capture into the `.dnam-proj` Capture Vault (`add_capture`), executing Path 1
-/// (`< 5–10 ms`, `0.000000 ULP` on `StarCenter` Mode 0) when `StarCenter` is unchanged or Path 2
-/// (`< 15–25 ms` full `STAT` + Mode 0 re-pool) when adding a new `StarCenter` (`r[train.cache.proj-vault]`).
+/// (incremental fast-path, `0.000000 ULP` on `StarCenter` Mode 0) when `StarCenter` is unchanged or Path 2
+/// (deterministic full `STAT` + Mode 0 re-pool) when adding a new `StarCenter` (`r[train.cache.proj-vault]`).
 pub fn add_capture(
     proj_bytes: &[u8],
     capture: VaultCaptureSpec,
@@ -590,8 +590,8 @@ pub fn add_capture_with_options(
     rebuild_vault_container(state, inpc_entry, is_new_star, Some(touched), options)
 }
 
-/// Inserts an entire batch of captured stems into `.dnam-proj` and executes the 5-Stage
-/// `< 25 ms` Closed-Form + `VarPro` Solver in a single pass (`r[train.pipeline.dispatch-solve]`).
+/// Inserts an entire batch of captured stems into `.dnam-proj` and executes the Deterministic 5-Stage
+/// Closed-Form + `VarPro` Solver in a single pass (`r[train.pipeline.dispatch-solve]`).
 pub fn solve_captures_batch_into_proj(
     proj_bytes: &[u8],
     captures: Vec<VaultCaptureSpec>,

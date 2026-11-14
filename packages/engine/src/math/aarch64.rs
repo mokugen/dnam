@@ -8,11 +8,16 @@
 
 pub mod neon;
 pub mod sme;
+pub mod sme_f64;
 pub mod sve2;
+pub mod sve2_f64;
+pub mod trainer_f64;
 
 pub use neon::{NeonBackend, NeonVec4};
 pub use sme::ArmSmeBackend;
 pub use sve2::{ArmSve2Backend, Sve2Vec4};
+pub use sve2_f64::Sve2F64Vec2;
+pub use trainer_f64::NeonF64Vec2;
 
 use super::BackendKind;
 

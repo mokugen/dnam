@@ -6,6 +6,7 @@
 //! - `docs/specs/training/four_stage_pipeline.md` (`ref[train.gram.wide192]`, `ref[train.gram.accuracy-contract]`)
 //! - `docs/specs/containers/project_container_format.md` (`ref[container.proj.stat-uplo-u]`)
 
+use super::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
 use super::{uplo_u_index, uplo_u_packed_len};
 
 /// Veltkamp-Dekker splitting constant $2^{27} + 1$ for exact `f64 * f64 -> (hi, lo)` decomposition
@@ -280,14 +281,6 @@ pub fn accumulate_uplo_u_wide192(
 }
 
 #[inline(always)]
-fn fma4(acc: &mut [f64; 4], x: [f64; 4], s: f64) {
-    acc[0] += x[0] * s;
-    acc[1] += x[1] * s;
-    acc[2] += x[2] * s;
-    acc[3] += x[3] * s;
-}
-
-#[inline(always)]
 fn mask256_overlaps(a: [u64; 4], b: [u64; 4]) -> bool {
     ((a[0] & b[0]) | (a[1] & b[1]) | (a[2] & b[2]) | (a[3] & b[3])) != 0
 }
@@ -297,74 +290,42 @@ fn mask256_or(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
     [a[0] | b[0], a[1] | b[1], a[2] | b[2], a[3] | b[3]]
 }
 
-#[inline(always)]
-fn contract_offdiag_tile_4x4(f_i: &[[f64; 4]], wf_j: &[[f64; 4]]) -> [[f64; 4]; 4] {
-    let (fi_pairs, fi_rem) = f_i.as_chunks::<2>();
-    let (wf_pairs, wf_rem) = wf_j.as_chunks::<2>();
-    let mut a0 = [0.0_f64; 4];
-    let mut a1 = [0.0_f64; 4];
-    let mut a2 = [0.0_f64; 4];
-    let mut a3 = [0.0_f64; 4];
-    let mut b0 = [0.0_f64; 4];
-    let mut b1 = [0.0_f64; 4];
-    let mut b2 = [0.0_f64; 4];
-    let mut b3 = [0.0_f64; 4];
-    for (&[fa, fb], &[wa, wb]) in fi_pairs.iter().zip(wf_pairs) {
-        fma4(&mut a0, fa, wa[0]);
-        fma4(&mut a1, fa, wa[1]);
-        fma4(&mut a2, fa, wa[2]);
-        fma4(&mut a3, fa, wa[3]);
-        fma4(&mut b0, fb, wb[0]);
-        fma4(&mut b1, fb, wb[1]);
-        fma4(&mut b2, fb, wb[2]);
-        fma4(&mut b3, fb, wb[3]);
-    }
-    for (&fa, &wa) in fi_rem.iter().zip(wf_rem) {
-        fma4(&mut a0, fa, wa[0]);
-        fma4(&mut a1, fa, wa[1]);
-        fma4(&mut a2, fa, wa[2]);
-        fma4(&mut a3, fa, wa[3]);
-    }
-    [
-        [a0[0] + b0[0], a0[1] + b0[1], a0[2] + b0[2], a0[3] + b0[3]],
-        [a1[0] + b1[0], a1[1] + b1[1], a1[2] + b1[2], a1[3] + b1[3]],
-        [a2[0] + b2[0], a2[1] + b2[1], a2[2] + b2[2], a2[3] + b2[3]],
-        [a3[0] + b3[0], a3[1] + b3[1], a3[2] + b3[2], a3[3] + b3[3]],
-    ]
-}
-
-#[inline(always)]
-fn contract_offdiag_tile_8x4(
-    f_i0: &[[f64; 4]],
-    f_i1: &[[f64; 4]],
-    wf_j: &[[f64; 4]],
-) -> ([[f64; 4]; 4], [[f64; 4]; 4]) {
-    let mut a0 = [0.0_f64; 4];
-    let mut a1 = [0.0_f64; 4];
-    let mut a2 = [0.0_f64; 4];
-    let mut a3 = [0.0_f64; 4];
-    let mut b0 = [0.0_f64; 4];
-    let mut b1 = [0.0_f64; 4];
-    let mut b2 = [0.0_f64; 4];
-    let mut b3 = [0.0_f64; 4];
-    for ((&fa, &fb), &w) in f_i0.iter().zip(f_i1).zip(wf_j) {
-        fma4(&mut a0, fa, w[0]);
-        fma4(&mut b0, fb, w[0]);
-        fma4(&mut a1, fa, w[1]);
-        fma4(&mut b1, fb, w[1]);
-        fma4(&mut a2, fa, w[2]);
-        fma4(&mut b2, fb, w[2]);
-        fma4(&mut a3, fa, w[3]);
-        fma4(&mut b3, fb, w[3]);
-    }
-    ([a0, a1, a2, a3], [b0, b1, b2, b3])
-}
-
 /// Contracts `256-D` feature frames and stereo targets into a canonical `uplo='U'` Gram matrix
 /// (`32,896 × f64`) and `[256][2]` cross-correlation matrix using `[8 × 4]` / `[4 × 4]`
 /// register-tiled micro-batches merged into `Wide192Accum` (`r[train.gram.wide192]`,
 /// `r[train.pipeline.stage-b-harvest]`).
 pub fn contract_256d_gram_tiled_wide192(
+    features: &[[f32; 256]],
+    targets_lr: &[[f64; 2]],
+    weights: &[f64],
+    frame_stride: usize,
+) -> (Vec<f64>, Vec<[f64; 2]>) {
+    struct ContractTask<'a> {
+        features: &'a [[f32; 256]],
+        targets_lr: &'a [[f64; 2]],
+        weights: &'a [f64],
+        frame_stride: usize,
+    }
+    impl TrainerTask<(Vec<f64>, Vec<[f64; 2]>)> for ContractTask<'_> {
+        fn run<B: TrainerBackend>(self) -> (Vec<f64>, Vec<[f64; 2]>) {
+            contract_256d_gram_tiled_wide192_with_backend::<B>(
+                self.features,
+                self.targets_lr,
+                self.weights,
+                self.frame_stride,
+            )
+        }
+    }
+    DynamicTrainer::detect().dispatch(ContractTask {
+        features,
+        targets_lr,
+        weights,
+        frame_stride,
+    })
+}
+
+/// Backend-parameterized `256-D` Gram & cross-correlation contraction (`r[train.gram.wide192]`).
+pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
     features: &[[f32; 256]],
     targets_lr: &[[f64; 2]],
     weights: &[f64],
@@ -689,7 +650,7 @@ pub fn contract_256d_gram_tiled_wide192(
             let f_j = &blk_f[bj][..b_len];
             let wf_j = &blk_wf[bj][..b_len];
 
-            let d_tile = contract_offdiag_tile_4x4(f_j, wf_j);
+            let d_tile = B::contract_tile_4x4_ieee(f_j, wf_j);
             for lj in 0..4 {
                 let j = j0 + lj;
                 let mask_hj = hi_col_mask[j];
@@ -765,12 +726,12 @@ pub fn contract_256d_gram_tiled_wide192(
             let (bi_pairs, bi_rem) = active_bi[..n_bi].as_chunks::<2>();
             for &[bi0, bi1] in bi_pairs {
                 let (t0, t1) =
-                    contract_offdiag_tile_8x4(&blk_f[bi0][..b_len], &blk_f[bi1][..b_len], wf_j);
+                    B::contract_tile_8x4_ieee(&blk_f[bi0][..b_len], &blk_f[bi1][..b_len], wf_j);
                 merge_tile(bi0, &t0);
                 merge_tile(bi1, &t1);
             }
             for &bi in bi_rem {
-                let t = contract_offdiag_tile_4x4(&blk_f[bi][..b_len], wf_j);
+                let t = B::contract_tile_4x4_ieee(&blk_f[bi][..b_len], wf_j);
                 merge_tile(bi, &t);
             }
         }

@@ -3,15 +3,20 @@
 //! Uses `core::arch::wasm32` 128-bit `v128` SIMD intrinsics when `target_feature = "simd128"` is
 //! enabled, with a portable `#[repr(C, align(16))]` fallback when `simd128` is not enabled.
 
+#[cfg(not(target_feature = "simd128"))]
+use super::trainer::ScalarF64Vec2;
+use super::trainer::{SimdF64Vec2, TrainerMathBackend};
 use super::{BackendKind, MathBackend, SimdVec4};
 use crate::math::crc32c::{Crc32cBackend, crc32c_software_slice};
 
 #[cfg(target_feature = "simd128")]
 use core::arch::wasm32::{
-    f32x4_abs, f32x4_add, f32x4_extract_lane, f32x4_mul, f32x4_pmax, f32x4_pmin,
-    f32x4_replace_lane, f32x4_splat, f32x4_sub, i32x4_add, i32x4_all_true, i32x4_eq, i32x4_shuffle,
-    i32x4_splat, i32x4_sub, u32x4, u32x4_ge, u32x4_lt, u32x4_min, u32x4_shl, u32x4_shr,
-    u32x4_splat, u64x2_splat, v128, v128_and, v128_andnot, v128_any_true, v128_or, v128_xor,
+    f32x4, f32x4_abs, f32x4_add, f32x4_extract_lane, f32x4_mul, f32x4_pmax, f32x4_pmin,
+    f32x4_replace_lane, f32x4_splat, f32x4_sub, f64x2_abs, f64x2_add, f64x2_extract_lane,
+    f64x2_mul, f64x2_pmax, f64x2_pmin, f64x2_promote_low_f32x4, f64x2_replace_lane, f64x2_splat,
+    f64x2_sub, i32x4_add, i32x4_all_true, i32x4_eq, i32x4_shuffle, i32x4_splat, i32x4_sub, u32x4,
+    u32x4_ge, u32x4_lt, u32x4_min, u32x4_shl, u32x4_shr, u32x4_splat, u64x2_splat, v128, v128_and,
+    v128_andnot, v128_any_true, v128_or, v128_xor,
 };
 
 /// Detects the WebAssembly backend (`WasmSimd128` when `target_feature = "simd128"` is active,
@@ -390,4 +395,171 @@ pub(crate) fn wasm_tracker_exp_scales_f32(max_l: f32, max_r: f32) -> (f32, f32, 
         f32x4_extract_lane::<1>(sd_v),
         f32x4_extract_lane::<1>(su_v),
     )
+}
+
+/// WebAssembly 2-lane `f64` vector (`v128` when `simd128` is enabled, or `[f64; 2]` fallback).
+#[cfg(target_feature = "simd128")]
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+pub struct WasmF64Vec2(pub v128);
+
+/// Fallback 2-lane `f64` vector on `wasm32` when `simd128` is not enabled at compile time.
+#[cfg(not(target_feature = "simd128"))]
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug)]
+pub struct WasmF64Vec2(pub [f64; 2]);
+
+#[cfg(target_feature = "simd128")]
+impl SimdF64Vec2 for WasmF64Vec2 {
+    #[inline(always)]
+    fn splat(val: f64) -> Self {
+        Self(f64x2_splat(val))
+    }
+
+    #[inline(always)]
+    fn splat_pair(a: f64, b: f64) -> Self {
+        Self(f64x2_replace_lane::<1>(f64x2_splat(a), b))
+    }
+
+    #[inline(always)]
+    fn from_f32_pair(a: f32, b: f32) -> Self {
+        Self(f64x2_promote_low_f32x4(f32x4(a, b, 0.0, 0.0)))
+    }
+
+    #[inline(always)]
+    fn load(src: &[f64; 2]) -> Self {
+        Self(zerocopy::transmute!(*src))
+    }
+
+    #[inline(always)]
+    fn store(self, dst: &mut [f64; 2]) {
+        *dst = zerocopy::transmute!(self.0);
+    }
+
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        Self(f64x2_add(self.0, rhs.0))
+    }
+
+    #[inline(always)]
+    fn sub(self, rhs: Self) -> Self {
+        Self(f64x2_sub(self.0, rhs.0))
+    }
+
+    #[inline(always)]
+    fn mul(self, rhs: Self) -> Self {
+        Self(f64x2_mul(self.0, rhs.0))
+    }
+
+    #[inline(always)]
+    fn fma(self, a: Self, b: Self) -> Self {
+        Self(f64x2_add(self.0, f64x2_mul(a.0, b.0)))
+    }
+
+    #[inline(always)]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        const { assert!(LANE < 2) };
+        let s = f64x2_splat(f64x2_extract_lane::<LANE>(v.0));
+        Self(f64x2_add(self.0, f64x2_mul(a.0, s)))
+    }
+
+    #[inline(always)]
+    fn fms(self, a: Self, b: Self) -> Self {
+        Self(f64x2_sub(self.0, f64x2_mul(a.0, b.0)))
+    }
+
+    #[inline(always)]
+    fn max(self, rhs: Self) -> Self {
+        Self(f64x2_pmax(self.0, rhs.0))
+    }
+
+    #[inline(always)]
+    fn min(self, rhs: Self) -> Self {
+        Self(f64x2_pmin(self.0, rhs.0))
+    }
+
+    #[inline(always)]
+    fn abs(self) -> Self {
+        Self(f64x2_abs(self.0))
+    }
+
+    #[inline(always)]
+    fn horizontal_sum(self) -> f64 {
+        f64x2_extract_lane::<0>(self.0) + f64x2_extract_lane::<1>(self.0)
+    }
+}
+
+#[cfg(not(target_feature = "simd128"))]
+impl SimdF64Vec2 for WasmF64Vec2 {
+    #[inline(always)]
+    fn splat(val: f64) -> Self {
+        Self(ScalarF64Vec2::splat(val).0)
+    }
+
+    #[inline(always)]
+    fn load(src: &[f64; 2]) -> Self {
+        Self(*src)
+    }
+
+    #[inline(always)]
+    fn store(self, dst: &mut [f64; 2]) {
+        *dst = self.0;
+    }
+
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        Self(ScalarF64Vec2(self.0).add(ScalarF64Vec2(rhs.0)).0)
+    }
+
+    #[inline(always)]
+    fn sub(self, rhs: Self) -> Self {
+        Self(ScalarF64Vec2(self.0).sub(ScalarF64Vec2(rhs.0)).0)
+    }
+
+    #[inline(always)]
+    fn mul(self, rhs: Self) -> Self {
+        Self(ScalarF64Vec2(self.0).mul(ScalarF64Vec2(rhs.0)).0)
+    }
+
+    #[inline(always)]
+    fn fma(self, a: Self, b: Self) -> Self {
+        Self(
+            ScalarF64Vec2(self.0)
+                .fma(ScalarF64Vec2(a.0), ScalarF64Vec2(b.0))
+                .0,
+        )
+    }
+
+    #[inline(always)]
+    fn fms(self, a: Self, b: Self) -> Self {
+        Self(
+            ScalarF64Vec2(self.0)
+                .fms(ScalarF64Vec2(a.0), ScalarF64Vec2(b.0))
+                .0,
+        )
+    }
+
+    #[inline(always)]
+    fn max(self, rhs: Self) -> Self {
+        Self(ScalarF64Vec2(self.0).max(ScalarF64Vec2(rhs.0)).0)
+    }
+
+    #[inline(always)]
+    fn min(self, rhs: Self) -> Self {
+        Self(ScalarF64Vec2(self.0).min(ScalarF64Vec2(rhs.0)).0)
+    }
+
+    #[inline(always)]
+    fn abs(self) -> Self {
+        Self(ScalarF64Vec2(self.0).abs().0)
+    }
+
+    #[inline(always)]
+    fn horizontal_sum(self) -> f64 {
+        ScalarF64Vec2(self.0).horizontal_sum()
+    }
+}
+
+impl TrainerMathBackend for WasmSimd128Backend {
+    type F64Vec2 = WasmF64Vec2;
 }

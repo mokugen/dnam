@@ -31,8 +31,8 @@ This specification defines **non-destructive `.dnam-proj` (`DNPJ`) Capture Vault
 ```mermaid
 flowchart TD
     Edit["Vault Mutation on .dnam-proj:<br/>add_capture / remove_capture /<br/>replace_capture / set_capture_enabled"] --> Gate{"Did StarCenter (s = 0) or<br/>Stage A Pole/Delay Basis Change?"}
-    Gate -- "No (Non-Reference Knob/Switch Edit)" --> Fast["Fast-Path (< 5-10 ms):<br/>Reuse Frozen Stage A Poles & STAT<br/>Re-Solve CP1 + Nested 4-Tier Cholesky"]
-    Gate -- "Yes (StarCenter Replaced or Basis Drift)" --> Full["Full Re-Pool (< 15-25 ms):<br/>Replay Compact INPC + Enabled STMC Capsules<br/>Re-Extract Poles, STAT & All 4 Tiers"]
+    Gate -- "No (Non-Reference Knob/Switch Edit)" --> Fast["Fast-Path (Sub-Second Incremental):<br/>Reuse Frozen Stage A Poles & STAT<br/>Re-Solve CP1 + Nested 4-Tier Cholesky"]
+    Gate -- "Yes (StarCenter Replaced or Basis Drift)" --> Full["Full Re-Pool (Deterministic Multi-Second):<br/>Replay Full-Bandwidth Stems or Enabled Capsules<br/>Re-Extract Poles, STAT & All 4 Tiers"]
     Fast --> Audit["Recompute 3-Phase Safety Clamps<br/>+ Update WGHT ([STAB-ZERO-DC])"]
     Full --> Audit
 ```
@@ -45,9 +45,9 @@ flowchart TD
 
 ### 1.2 Two-Path Vault Editing & Dependency Digests
 
-1. `r[train.resume.two-tier-execution]` **Two-Path Compositional Vault Execution (`< 5–10 ms` Fast-Path vs. `< 15–25 ms` Full Re-Pool):**
-   - **Path 1 — Fast-Path (`< 5–10 ms`):** When `extracted_physics` (`Stage A` poles and delay taps) and the `StarCenter` reference stem remain valid, `add_capture`, `remove_capture`, `replace_capture`, and `set_capture_enabled` harvest only newly added/replaced stem capsules against the frozen upstream basis, recompute `recompute_vault_phase1_audit_and_clamps` across currently enabled stems, and re-solve `CP1` + nested 4-tier `WGHT` weights in `< 5–10 ms`.
-   - **Path 2 — Full Re-Pool (`< 15–25 ms`):** When `StarCenter` is replaced or a new capture invalidates the upstream pole/delay basis, the vault automatically re-runs `Stage A`–`Stage E` directly over the embedded `INPC` and enabled `STMC` capsules in `< 15–25 ms`—never requiring external WAV files.
+1. `r[train.resume.two-tier-execution]` **Two-Path Compositional Vault Execution (Sub-Second Fast-Path vs. Deterministic Full Re-Pool):**
+   - **Path 1 — Incremental Fast-Path (Sub-Second):** When `extracted_physics` (`Stage A` poles and delay taps) and the `StarCenter` reference stem remain valid, `add_capture`, `remove_capture`, `replace_capture`, and `set_capture_enabled` harvest only newly added/replaced stem statistics against the frozen upstream basis, recompute `recompute_vault_phase1_audit_and_clamps` across currently enabled stems, and re-solve `CP1` + nested 4-tier `WGHT` weights incrementally on CPU or browser worker.
+   - **Path 2 — Full Re-Pool (Deterministic):** When `StarCenter` is replaced or a new capture invalidates the upstream pole/delay basis, the vault automatically re-runs `Stage A`–`Stage E` directly over the embedded full-bandwidth `32-bit` float stems (`SPCM`) or compact `INPC` + enabled `STMC` capsules without external WAV files, completing multi-second nonlinear/dynamic identification deterministically on CPU or browser worker.
 2. `r[train.resume.dependency-digests]` **Cryptographic Provenance & Dependency Invalidation (`REQ-3.2`):** Every `StemRegistryEntry` binds dry/wet PCM `SHA-256` digests, sample rate, bit depth, sub-sample lag, converter gain, and the `DNAM-GRAM-INPUT-v2` `SHA-256` fingerprint (`ref[container.proj.jcs-manifest]`). Statistics reuse is permitted if and only if upstream stage parameters, filter versions, and dependency digests match identically; any mismatch automatically triggers capsule replay rather than combining stale statistics.
 3. `r[train.resume.old-stem-nonregression]` **Unchanged-Stem Non-Regression Guarantee (`REQ-3.1`):** Expanding a `.dnam-proj` vault with additional knob settings or discrete switch positions (with `StarCenter` anchored at `Mode-0`) preserves `StarCenter` and previously captured stem `bESR` within tier certification tolerances without tone drift.
 

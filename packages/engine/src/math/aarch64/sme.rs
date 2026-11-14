@@ -32,36 +32,11 @@ impl ArmSmeBackend {
     fn detect_uncached() -> bool {
         #[cfg(all(target_os = "macos", any(test, feature = "std")))]
         {
-            type Void = core::ffi::c_void;
-            let (mut val, mut size) = (0_i32, core::mem::size_of::<i32>());
-            unsafe extern "C" {
-                fn sysctlbyname(
-                    n: *const u8,
-                    o: *mut Void,
-                    ol: *mut usize,
-                    np: *const Void,
-                    nl: usize,
-                ) -> i32;
-            }
-            // SAFETY: Null-terminated constant sysctl name and valid stack `val`/`size` pointers.
-            let rc = unsafe {
-                sysctlbyname(
-                    c"hw.optional.arm.FEAT_SME".as_ptr().cast::<u8>(),
-                    (&raw mut val).cast::<Void>(),
-                    &raw mut size,
-                    core::ptr::null(),
-                    0,
-                )
-            };
-            return rc == 0 && val == 1;
+            Self::sysctl_arm_feature(c"hw.optional.arm.FEAT_SME")
         }
         #[cfg(all(target_os = "linux", any(test, feature = "std")))]
         {
-            unsafe extern "C" {
-                fn getauxval(t: u64) -> u64;
-            }
-            // SAFETY: `getauxval(AT_HWCAP2 = 26)` is a read-only Linux libc query; bit 23 is `HWCAP2_SME`.
-            return unsafe { (getauxval(26) & (1_u64 << 23)) != 0 };
+            Self::linux_hwcap2_bit(23)
         }
         #[cfg(not(any(test, feature = "std")))]
         {
@@ -74,10 +49,104 @@ impl ArmSmeBackend {
                     options(nomem, nostack, preserves_flags),
                 );
             }
-            return ((pfr1 >> 24) & 0xF) >= 1;
+            ((pfr1 >> 24) & 0xF) >= 1
         }
-        #[allow(unreachable_code)]
-        false
+        #[cfg(all(
+            not(any(target_os = "macos", target_os = "linux")),
+            any(test, feature = "std")
+        ))]
+        {
+            false
+        }
+    }
+
+    /// Detects at runtime whether the host `aarch64` CPU supports `FEAT_SME_F64F64`
+    /// (double-precision `FMOPA`/`FMOPS` `ZA` tile accumulation, cached in an `AtomicU8`).
+    #[inline]
+    pub fn is_f64f64_supported() -> bool {
+        if !Self::is_supported() {
+            return false;
+        }
+        use core::sync::atomic::{AtomicU8, Ordering};
+        static CACHE: AtomicU8 = AtomicU8::new(0);
+        let c = CACHE.load(Ordering::Relaxed);
+        if c != 0 {
+            return c == 2;
+        }
+        let ok = Self::detect_f64f64_uncached();
+        CACHE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
+        ok
+    }
+
+    #[cold]
+    fn detect_f64f64_uncached() -> bool {
+        if !Self::is_supported() {
+            return false;
+        }
+        #[cfg(all(target_os = "macos", any(test, feature = "std")))]
+        {
+            Self::sysctl_arm_feature(c"hw.optional.arm.FEAT_SME_F64F64")
+        }
+        #[cfg(all(target_os = "linux", any(test, feature = "std")))]
+        {
+            Self::linux_hwcap2_bit(25)
+        }
+        #[cfg(not(any(test, feature = "std")))]
+        {
+            let smfr0: u64;
+            // SAFETY: Guarded by `Self::is_supported()` confirming `FEAT_SME`; `ID_AA64SMFR0_EL1`
+            // bit [48] (`F64F64`) is readable when `FEAT_SME` is present.
+            unsafe {
+                core::arch::asm!(
+                    ".arch armv8.6-a+sme\nmrs {s}, id_aa64smfr0_el1",
+                    s = out(reg) smfr0,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            ((smfr0 >> 48) & 1) != 0
+        }
+        #[cfg(all(
+            not(any(target_os = "macos", target_os = "linux")),
+            any(test, feature = "std")
+        ))]
+        {
+            false
+        }
+    }
+
+    #[cfg(all(target_os = "macos", any(test, feature = "std")))]
+    fn sysctl_arm_feature(name: &core::ffi::CStr) -> bool {
+        type Void = core::ffi::c_void;
+        let (mut val, mut size) = (0_i32, core::mem::size_of::<i32>());
+        unsafe extern "C" {
+            fn sysctlbyname(
+                n: *const u8,
+                o: *mut Void,
+                ol: *mut usize,
+                np: *const Void,
+                nl: usize,
+            ) -> i32;
+        }
+        // SAFETY: Null-terminated constant sysctl name and valid stack `val`/`size` pointers.
+        let rc = unsafe {
+            sysctlbyname(
+                name.as_ptr().cast::<u8>(),
+                (&raw mut val).cast::<Void>(),
+                &raw mut size,
+                core::ptr::null(),
+                0,
+            )
+        };
+        rc == 0 && val == 1
+    }
+
+    #[cfg(all(target_os = "linux", any(test, feature = "std")))]
+    fn linux_hwcap2_bit(bit: u32) -> bool {
+        unsafe extern "C" {
+            fn getauxval(t: u64) -> u64;
+        }
+        // SAFETY: `getauxval(AT_HWCAP2 = 26)` is a read-only Linux libc query.
+        unsafe { (getauxval(26) & (1_u64 << bit)) != 0 }
     }
 }
 

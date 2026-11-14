@@ -5,15 +5,14 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use dnam_capture::fp16_bits_to_f32;
 use dnam_capture::metrics::{
-    ArchetypeFamily, PerceptualCertificationSummary, certify_blackbox_coreset_chain,
-    evaluate_besr_from_band_energies, split_bezout_3band_energies, verify_monotone_4tier_summaries,
+    ArchetypeFamily, PerceptualCertificationSummary, canonical_ltas_33_centers_hz,
+    certify_4metric_signal_chain, evaluate_besr_from_band_energies, split_bezout_3band_energies,
+    verify_monotone_4tier_summaries,
 };
 use dnam_capture::proj::{
-    DnamProjManifest, DnamProjView, ProjChunkKind, STMC_FLAG_STEREO,
-    STMC_FLAG_WET_POLARITY_INVERTED, export_runtime_dnam, verify_proj_inpc_capsule,
-    verify_proj_stmc_capsule,
+    DnamProjManifest, DnamProjView, ProjChunkKind, STMC_FLAG_WET_POLARITY_INVERTED,
+    export_runtime_dnam, verify_proj_inpc_capsule, verify_proj_stmc_capsule,
 };
 use dnam_capture::solver::{
     V3TrainDataset, V3TrainStem, canonical_besr_warmup, fit_v3_core_four_tiers,
@@ -332,8 +331,8 @@ fn build_unseen_holdout_excitation(n: usize, sr_hz: f64) -> Vec<[f32; 2]> {
 fn build_identification_sweep_excitation(n: usize, sr_hz: f64) -> Vec<[f32; 2]> {
     let mut out = Vec::with_capacity(n);
     let mut phase = 0.0_f64;
-    let f0 = 35.0_f64;
-    let ratio = (14_000.0_f64 / f0).ln();
+    let f0 = 20.0_f64;
+    let ratio = (20_000.0_f64 / f0).ln();
     for i in 0..n {
         let frac = (i as f64) / (n.max(1) as f64);
         let t = (i as f64) / sr_hz;
@@ -348,6 +347,37 @@ fn build_identification_sweep_excitation(n: usize, sr_hz: f64) -> Vec<[f32; 2]> 
         let xl = (amp * (0.72 * phase.sin() + bass_mod)) as f32;
         let xr = (amp * (0.70 * (phase + 0.08).sin() + 0.95 * bass_mod)) as f32;
         out.push([xl, xr]);
+    }
+    out
+}
+
+fn build_fullband_eval_excitation(n: usize, sr_hz: f64) -> Vec<[f32; 2]> {
+    let centers = canonical_ltas_33_centers_hz();
+    let weights: [f64; 33] =
+        std::array::from_fn(|k| 1.0 / (1.0 + (centers[k] / 2_400.0).powi(2)).sqrt());
+    let norm = weights
+        .iter()
+        .map(|w| w * w)
+        .sum::<f64>()
+        .sqrt()
+        .max(1.0e-12);
+    let scale = 0.52 / norm;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let t = (i as f64) / sr_hz;
+        let env = (0.45 + 0.55 * (-((i % 2_400) as f64) / 800.0).exp())
+            * (0.72 + 0.28 * (std::f64::consts::TAU * 2.3 * t).sin());
+        let mut sl = 0.0_f64;
+        let mut sr = 0.0_f64;
+        for (k, &fc) in centers.iter().enumerate() {
+            let phi_l =
+                ((k as f64 + 1.0) * std::f64::consts::GOLDEN_RATIO).fract() * std::f64::consts::TAU;
+            let phi_r = phi_l + 0.29 * ((k & 3) as f64 + 0.5);
+            let arg = std::f64::consts::TAU * fc * t;
+            sl += weights[k] * (arg + phi_l).cos();
+            sr += weights[k] * (arg + phi_r).cos();
+        }
+        out.push([(env * scale * sl) as f32, (env * scale * sr) as f32]);
     }
     out
 }
@@ -397,28 +427,8 @@ fn benchmark_chain<M: BlackBoxModel>(
     let v2_ms = t_v2.elapsed().as_millis();
 
     let proj_view = DnamProjView::from_bytes(&report.proj_bytes, &crypto).unwrap();
-    let decode_fp16 = |bytes: &[u8]| -> Vec<f32> {
-        bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|b| fp16_bits_to_f32(u16::from_le_bytes(*b)))
-            .collect()
-    };
-    let inpc_view =
+    let _inpc_view =
         verify_proj_inpc_capsule(proj_view.chunk_slice(ProjChunkKind::Inpc, 0).unwrap()).unwrap();
-    let inpc_vals = decode_fp16(inpc_view.dry_coreset_fp16);
-    let inpc_ch = usize::from(inpc_view.channels).max(1);
-    let dry_lr: Vec<[f32; 2]> = inpc_vals
-        .chunks_exact(inpc_ch)
-        .map(|c| {
-            if inpc_ch >= 2 {
-                [c[0], c[1]]
-            } else {
-                [c[0], c[0]]
-            }
-        })
-        .collect();
     let star_entry = proj_view
         .manifest
         .stems_registry
@@ -431,27 +441,7 @@ fn benchmark_chain<M: BlackBoxModel>(
             .unwrap(),
     )
     .unwrap();
-    let stmc_vals = decode_fp16(stmc_view.wet_coreset_fp16);
-    let stmc_ch = if (stmc_view.flags & STMC_FLAG_STEREO) != 0 {
-        2
-    } else {
-        1
-    };
-    let wet_lr: Vec<[f32; 2]> = stmc_vals
-        .chunks_exact(stmc_ch)
-        .map(|c| {
-            if stmc_ch >= 2 {
-                [c[0], c[1]]
-            } else {
-                [c[0], c[0]]
-            }
-        })
-        .collect();
-    let n_common = dry_lr.len().min(wet_lr.len());
-    let warmup = canonical_besr_warmup(n_common);
     let mono_only = proj_view.manifest.base.io_config.output_mode == "mono";
-    let tgt_l: Vec<f64> = wet_lr[..n_common].iter().map(|v| f64::from(v[0])).collect();
-    let tgt_r: Vec<f64> = wet_lr[..n_common].iter().map(|v| f64::from(v[1])).collect();
 
     let star_ctrls = star_center_control_values(&proj_view.manifest);
     let hold_inv_pol = (stmc_view.flags & STMC_FLAG_WET_POLARITY_INVERTED) != 0;
@@ -492,15 +482,25 @@ fn benchmark_chain<M: BlackBoxModel>(
     let hold_in_l: Vec<f32> = holdout_dry.iter().map(|v| v[0]).collect();
     let hold_in_r: Vec<f32> = holdout_dry.iter().map(|v| v[1]).collect();
 
-    // v3 Identification Dataset: [aligned StarCenter coreset, disjoint sweep]
+    // Full-bandwidth 20 Hz-20 kHz f32 identification & certification signal (12,000 samples across all 33 LTAS bands)
+    let eval_dry = build_fullband_eval_excitation(12_000, 48_000.0);
+    let (eval_al_l, eval_al_r) = render_aligned(&mut adapter, "fullband_eval", &eval_dry);
+    let n_eval = eval_dry.len().min(eval_al_l.len()).min(eval_al_r.len());
+    let eval_tgt_l: Vec<f64> = eval_al_l[..n_eval].iter().map(|&v| f64::from(v)).collect();
+    let eval_tgt_r: Vec<f64> = eval_al_r[..n_eval].iter().map(|&v| f64::from(v)).collect();
+    let eval_warmup = canonical_besr_warmup(n_eval);
+    let eval_in_l: Vec<f32> = eval_dry[..n_eval].iter().map(|v| v[0]).collect();
+    let eval_in_r: Vec<f32> = eval_dry[..n_eval].iter().map(|v| v[1]).collect();
+
+    // v3 Identification Dataset: [fullband StarCenter excitation, disjoint 20 Hz-20 kHz sweep]
     let sweep_dry = build_identification_sweep_excitation(8_000, 48_000.0);
     let (sw_al_l, sw_al_r) = render_aligned(&mut adapter, "v3_id_sweep", &sweep_dry);
-    let coreset_stem = V3TrainStem {
-        in_l: dry_lr[..n_common].iter().map(|v| v[0]).collect(),
-        in_r: dry_lr[..n_common].iter().map(|v| v[1]).collect(),
-        tgt_l: wet_lr[..n_common].iter().map(|v| v[0]).collect(),
-        tgt_r: wet_lr[..n_common].iter().map(|v| v[1]).collect(),
-        warmup,
+    let fullband_stem = V3TrainStem {
+        in_l: eval_in_l.clone(),
+        in_r: eval_in_r.clone(),
+        tgt_l: eval_al_l[..n_eval].to_vec(),
+        tgt_r: eval_al_r[..n_eval].to_vec(),
+        warmup: eval_warmup,
     };
     let sw_len = sweep_dry.len().min(sw_al_l.len()).min(sw_al_r.len());
     let sweep_stem = V3TrainStem {
@@ -510,7 +510,8 @@ fn benchmark_chain<M: BlackBoxModel>(
         tgt_r: sw_al_r[..sw_len].to_vec(),
         warmup: canonical_besr_warmup(sw_len),
     };
-    let ds = V3TrainDataset::new_weighted(vec![(coreset_stem, 0.80), (sweep_stem, 0.20)], 48_000.0);
+    let ds =
+        V3TrainDataset::new_weighted(vec![(fullband_stem, 0.80), (sweep_stem, 0.20)], 48_000.0);
 
     let t_v3 = Instant::now();
     let v3_models = fit_v3_core_four_tiers(&ds, mono_only);
@@ -527,20 +528,34 @@ fn benchmark_chain<M: BlackBoxModel>(
             split_bezout_3band_energies(&hold_tgt_r, mdl_r, None, 48_000.0, hold_warmup);
         rl.max(evaluate_besr_from_band_energies(sr, er, nr).besr_db)
     };
-    let cert_coreset =
+
+    let cert_fullband =
         |tier: Tier, mdl_l: &[f64], mdl_r: &[f64]| -> PerceptualCertificationSummary {
-            let sl = certify_blackbox_coreset_chain(family, tier, &tgt_l, mdl_l, 48_000.0, warmup);
+            let sl = certify_4metric_signal_chain(
+                family,
+                tier,
+                &eval_tgt_l,
+                mdl_l,
+                None,
+                48_000.0,
+                eval_warmup,
+            );
             if mono_only {
                 sl
             } else {
-                let sr =
-                    certify_blackbox_coreset_chain(family, tier, &tgt_r, mdl_r, 48_000.0, warmup);
+                let sr = certify_4metric_signal_chain(
+                    family,
+                    tier,
+                    &eval_tgt_r,
+                    mdl_r,
+                    None,
+                    48_000.0,
+                    eval_warmup,
+                );
                 combine_stereo_summary(sl, sr)
             }
         };
 
-    let core_in_l: Vec<f32> = dry_lr[..n_common].iter().map(|v| v[0]).collect();
-    let core_in_r: Vec<f32> = dry_lr[..n_common].iter().map(|v| v[1]).collect();
     let mut v2_sums = Vec::with_capacity(4);
     let mut v3_sums = Vec::with_capacity(4);
     let mut v2_holds = [0.0_f64; 4];
@@ -557,13 +572,13 @@ fn benchmark_chain<M: BlackBoxModel>(
         for (p, &val) in star_ctrls.iter().enumerate() {
             eng.set_control_immediate(p, val);
         }
-        let v2_c: Vec<[f32; 2]> = dry_lr[..n_common]
+        let v2_c: Vec<[f32; 2]> = eval_dry[..n_eval]
             .iter()
             .map(|&[dl, dr]| eng.step_frame_tora(dl, dr, mono_only))
             .collect();
         let v2_cl: Vec<f64> = v2_c.iter().map(|v| f64::from(v[0])).collect();
         let v2_cr: Vec<f64> = v2_c.iter().map(|v| f64::from(v[1])).collect();
-        v2_sums.push(cert_coreset(tier, &v2_cl, &v2_cr));
+        v2_sums.push(cert_fullband(tier, &v2_cl, &v2_cr));
 
         eng.reset_to_dc_equilibrium();
         for (p, &val) in star_ctrls.iter().enumerate() {
@@ -578,17 +593,17 @@ fn benchmark_chain<M: BlackBoxModel>(
         v2_holds[t_idx] = eval_hold(&v2_hl, &v2_hr);
 
         let mut inst = V3CoreInstance::<DefaultMathBackend>::from_cold_model(&v3_models[t_idx]);
-        let (mut o3_l, mut o3_r) = (vec![0.0_f32; n_common], vec![0.0_f32; n_common]);
+        let (mut o3_l, mut o3_r) = (vec![0.0_f32; n_eval], vec![0.0_f32; n_eval]);
         inst.reset_to_dc_equilibrium();
         inst.process_block_stereo(
-            &core_in_l,
-            if mono_only { &core_in_l } else { &core_in_r },
+            &eval_in_l,
+            if mono_only { &eval_in_l } else { &eval_in_r },
             &mut o3_l,
             &mut o3_r,
         );
         let v3_cl: Vec<f64> = o3_l.iter().map(|&v| f64::from(v)).collect();
         let v3_cr: Vec<f64> = o3_r.iter().map(|&v| f64::from(v)).collect();
-        v3_sums.push(cert_coreset(tier, &v3_cl, &v3_cr));
+        v3_sums.push(cert_fullband(tier, &v3_cl, &v3_cr));
 
         let (mut h3_l, mut h3_r) = (
             vec![0.0_f32; hold_in_l.len()],
@@ -686,6 +701,18 @@ fn test_v3_prototype_head_to_head_vs_v2() {
     }
 
     for r in &rows {
+        assert!(
+            r.v3_sum.ltas_excluded_bands.iter().all(|&ex| !ex),
+            "{} {:?} v3 unexpectedly excluded LTAS bands",
+            r.label,
+            r.tier
+        );
+        assert!(
+            r.v2_sum.ltas_excluded_bands.iter().all(|&ex| !ex),
+            "{} {:?} v2 unexpectedly excluded LTAS bands",
+            r.label,
+            r.tier
+        );
         assert!(
             r.v3_monotone,
             "{} v3 failed strict 7-metric 4-tier monotonicity",

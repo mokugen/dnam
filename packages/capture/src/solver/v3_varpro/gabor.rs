@@ -8,6 +8,10 @@
 
 use std::f64::consts::PI;
 
+use crate::solver::backends::{
+    DefaultTrainerBackend, DynamicTrainer, GaborOperatorBackend, TrainerBackend, TrainerTask,
+};
+
 /// Number of log-spaced analytic Gabor bands spanning `24 Hz .. 17,500 Hz`.
 pub const K_GABOR: usize = 24;
 
@@ -49,28 +53,8 @@ pub struct GaborTargetSummary {
 pub struct GaborAdjointScratch {
     pub re: Vec<f64>,
     pub im: Vec<f64>,
-}
-
-#[inline(always)]
-pub(crate) fn dot_slice(a: &[f64], b: &[f64]) -> f64 {
-    let n = a.len().min(b.len());
-    let mut s0 = 0.0_f64;
-    let mut s1 = 0.0_f64;
-    let mut s2 = 0.0_f64;
-    let mut s3 = 0.0_f64;
-    let chunks = n / 4;
-    for c in 0..chunks {
-        let i = c * 4;
-        s0 += a[i] * b[i];
-        s1 += a[i + 1] * b[i + 1];
-        s2 += a[i + 2] * b[i + 2];
-        s3 += a[i + 3] * b[i + 3];
-    }
-    let mut s = (s0 + s1) + (s2 + s3);
-    for i in (chunks * 4)..n {
-        s += a[i] * b[i];
-    }
-    s
+    pub d_re: Vec<f64>,
+    pub d_im: Vec<f64>,
 }
 
 impl GaborBandSpec {
@@ -86,16 +70,30 @@ impl GaborBandSpec {
         }
     }
 
+    /// Projects `x` onto this band's cosine/sine atoms into `out_re` and `out_im` using `G`.
+    #[inline]
+    pub fn project_frames_with_backend<G: GaborOperatorBackend>(
+        &self,
+        x: &[f64],
+        warmup: usize,
+        out_re: &mut [f64],
+        out_im: &mut [f64],
+    ) {
+        G::project_frames(
+            x,
+            warmup,
+            self.win_len,
+            self.hop_len,
+            &self.cos_k,
+            &self.sin_k,
+            out_re,
+            out_im,
+        );
+    }
+
     /// Projects `x` onto this band's cosine/sine atoms into `out_re` and `out_im`.
     pub fn project_frames(&self, x: &[f64], warmup: usize, out_re: &mut [f64], out_im: &mut [f64]) {
-        let m_cnt = out_re.len().min(out_im.len());
-        let w = warmup.min(x.len());
-        for m in 0..m_cnt {
-            let start = w + m * self.hop_len;
-            let seg = &x[start..start + self.win_len];
-            out_re[m] = dot_slice(seg, &self.cos_k);
-            out_im[m] = dot_slice(seg, &self.sin_k);
-        }
+        self.project_frames_with_backend::<DefaultTrainerBackend>(x, warmup, out_re, out_im);
     }
 }
 
@@ -247,9 +245,9 @@ pub fn build_gabor_target_summary(
 }
 
 /// Evaluates the 24-band Gabor envelope + LTAS loss and accumulates the exact overlap-add
-/// reverse adjoint directly into `dy`.
+/// reverse adjoint directly into `dy` using backend `B`.
 #[allow(clippy::too_many_arguments)]
-pub fn eval_gabor_loss_and_adjoint(
+pub fn eval_gabor_loss_and_adjoint_with_backend<B: TrainerBackend>(
     bank: &AnalyticGaborBank,
     summary: &GaborTargetSummary,
     y: &[f64],
@@ -290,7 +288,7 @@ pub fn eval_gabor_loss_and_adjoint(
         let m_f = m_cnt as f64;
         let out_re = &mut scratch.re[off..off + m_cnt];
         let out_im = &mut scratch.im[off..off + m_cnt];
-        spec.project_frames(y, summary.warmup, out_re, out_im);
+        spec.project_frames_with_backend::<B>(y, summary.warmup, out_re, out_im);
 
         let mut pow_sum = 0.0_f64;
         let mut env_sum = 0.0_f64;
@@ -327,7 +325,10 @@ pub fn eval_gabor_loss_and_adjoint(
             } else {
                 0.0
             };
-
+            if scratch.d_re.len() < m_cnt {
+                scratch.d_re.resize(m_cnt, 0.0);
+                scratch.d_im.resize(m_cnt, 0.0);
+            }
             for m in 0..m_cnt {
                 let re = out_re[m];
                 let im = out_im[m];
@@ -338,17 +339,76 @@ pub fn eval_gabor_loss_and_adjoint(
                     } else {
                         0.0
                     };
-                let d_re = coeff * re;
-                let d_im = coeff * im;
-                let start = summary.warmup + m * spec.hop_len;
-                for u in 0..spec.win_len {
-                    dy[start + u] += d_re * spec.cos_k[u] + d_im * spec.sin_k[u];
-                }
+                scratch.d_re[m] = coeff * re;
+                scratch.d_im[m] = coeff * im;
             }
+            B::overlap_add_adjoint(
+                dy,
+                summary.warmup,
+                spec.win_len,
+                spec.hop_len,
+                &spec.cos_k,
+                &spec.sin_k,
+                &scratch.d_re[..m_cnt],
+                &scratch.d_im[..m_cnt],
+            );
         }
     }
 
     loss
+}
+
+/// Evaluates the 24-band Gabor envelope + LTAS loss and accumulates the exact overlap-add
+/// reverse adjoint directly into `dy`.
+#[allow(clippy::too_many_arguments)]
+pub fn eval_gabor_loss_and_adjoint(
+    bank: &AnalyticGaborBank,
+    summary: &GaborTargetSummary,
+    y: &[f64],
+    grad_dy: Option<&mut [f64]>,
+    stem_w: f64,
+    ch_scale: f64,
+    env_weight: f64,
+    ltas_weight: f64,
+    scratch: &mut GaborAdjointScratch,
+) -> f64 {
+    struct EvalTask<'a> {
+        bank: &'a AnalyticGaborBank,
+        summary: &'a GaborTargetSummary,
+        y: &'a [f64],
+        grad_dy: Option<&'a mut [f64]>,
+        stem_w: f64,
+        ch_scale: f64,
+        env_weight: f64,
+        ltas_weight: f64,
+        scratch: &'a mut GaborAdjointScratch,
+    }
+    impl TrainerTask<f64> for EvalTask<'_> {
+        fn run<B: TrainerBackend>(self) -> f64 {
+            eval_gabor_loss_and_adjoint_with_backend::<B>(
+                self.bank,
+                self.summary,
+                self.y,
+                self.grad_dy,
+                self.stem_w,
+                self.ch_scale,
+                self.env_weight,
+                self.ltas_weight,
+                self.scratch,
+            )
+        }
+    }
+    DynamicTrainer::detect().dispatch(EvalTask {
+        bank,
+        summary,
+        y,
+        grad_dy,
+        stem_w,
+        ch_scale,
+        env_weight,
+        ltas_weight,
+        scratch,
+    })
 }
 
 #[cfg(test)]
