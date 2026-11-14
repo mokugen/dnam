@@ -4,8 +4,9 @@
 //! 64-byte aligned (`ptr % 64 == 0`) across ARM64, x86-64, and WebAssembly, while eliminating
 //! first-touch OS page faults on the real-time audio thread.
 
-use alloc::vec;
+use alloc::alloc::Global;
 use alloc::vec::Vec;
+use core::alloc::Allocator;
 use core::ops::{Deref, DerefMut};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -47,29 +48,42 @@ impl Default for AlignedFp16Block {
     }
 }
 
-/// Heap-allocated buffer of 64-byte aligned blocks `T` that pre-faults all OS pages on creation.
+/// Heap-allocated buffer of 64-byte aligned blocks `T` that pre-faults all OS pages on creation,
+/// parameterized over a `core::alloc::Allocator` (`Global` by default, or an external arena/pool).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AlignedBuffer<T: Copy + Default + FromBytes + IntoBytes + Immutable> {
-    blocks: Vec<T>,
+pub struct AlignedBuffer<
+    T: Copy + Default + FromBytes + IntoBytes + Immutable,
+    A: Allocator = Global,
+> {
+    blocks: Vec<T, A>,
 }
 
-impl<T: Copy + Default + FromBytes + IntoBytes + Immutable> AlignedBuffer<T> {
+impl<T: Copy + Default + FromBytes + IntoBytes + Immutable> AlignedBuffer<T, Global> {
     /// Allocates `num_blocks` 64-byte aligned blocks and immediately pre-faults every cache line
     /// so the real-time audio thread never triggers a demand-paging trap.
     pub fn new_zeroed_prefaulted(num_blocks: usize) -> Self {
-        const {
-            assert!(core::mem::align_of::<T>() == 64);
-            assert!(core::mem::size_of::<T>() == 64);
-        }
-        let mut blocks = vec![T::default(); num_blocks];
-        Self::prefault_slice(&mut blocks);
-        Self { blocks }
+        Self::new_zeroed_prefaulted_in(num_blocks, Global)
     }
 
     /// Alias for [`Self::new_zeroed_prefaulted`].
     #[inline]
     pub fn new_zeroed(num_blocks: usize) -> Self {
         Self::new_zeroed_prefaulted(num_blocks)
+    }
+}
+
+impl<T: Copy + Default + FromBytes + IntoBytes + Immutable, A: Allocator> AlignedBuffer<T, A> {
+    /// Allocates `num_blocks` 64-byte aligned blocks inside `alloc` and immediately pre-faults
+    /// every cache line so the real-time audio thread never triggers a demand-paging trap.
+    pub fn new_zeroed_prefaulted_in(num_blocks: usize, alloc: A) -> Self {
+        const {
+            assert!(core::mem::align_of::<T>() == 64);
+            assert!(core::mem::size_of::<T>() == 64);
+        }
+        let mut blocks = Vec::with_capacity_in(num_blocks, alloc);
+        blocks.resize(num_blocks, T::default());
+        Self::prefault_slice(&mut blocks);
+        Self { blocks }
     }
 
     /// Pre-faults all 64-byte cache lines in `slice` using opaque `black_box` stores to commit
@@ -80,6 +94,12 @@ impl<T: Copy + Default + FromBytes + IntoBytes + Immutable> AlignedBuffer<T> {
         for block in slice.iter_mut() {
             *core::hint::black_box(block) = default_val;
         }
+    }
+
+    /// Returns a reference to the backing allocator.
+    #[inline(always)]
+    pub fn allocator(&self) -> &A {
+        self.blocks.allocator()
     }
 
     /// Returns the number of 64-byte blocks in the buffer.
@@ -107,7 +127,9 @@ impl<T: Copy + Default + FromBytes + IntoBytes + Immutable> AlignedBuffer<T> {
     }
 }
 
-impl<T: Copy + Default + FromBytes + IntoBytes + Immutable> Deref for AlignedBuffer<T> {
+impl<T: Copy + Default + FromBytes + IntoBytes + Immutable, A: Allocator> Deref
+    for AlignedBuffer<T, A>
+{
     type Target = [T];
 
     #[inline(always)]
@@ -116,7 +138,9 @@ impl<T: Copy + Default + FromBytes + IntoBytes + Immutable> Deref for AlignedBuf
     }
 }
 
-impl<T: Copy + Default + FromBytes + IntoBytes + Immutable> DerefMut for AlignedBuffer<T> {
+impl<T: Copy + Default + FromBytes + IntoBytes + Immutable, A: Allocator> DerefMut
+    for AlignedBuffer<T, A>
+{
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.blocks
@@ -125,34 +149,26 @@ impl<T: Copy + Default + FromBytes + IntoBytes + Immutable> DerefMut for Aligned
 
 /// Unified weight arena storage supporting zero-copy 64B-aligned borrowing (`mmap` / static flash)
 /// and owned 64B-aligned buffers (for unaligned slices, decrypted `ENCRYPTED_ARENA = 1` models,
-/// or in-place hot-swapping).
+/// or in-place hot-swapping), parameterized over a `core::alloc::Allocator`.
 #[derive(Clone, Debug)]
-pub enum ArenaStorage<'a> {
+pub enum ArenaStorage<'a, A: Allocator = Global> {
     /// Zero-copy borrowed slice of 64-byte cache lines (`0` bytes copied).
     Borrowed(&'a [CacheLine64]),
     /// Owned, 64-byte aligned and page-prefaulted cache-line buffer.
     Owned {
         /// Underlying 64-byte cache line allocation (may be pre-allocated up to `Ultra` 566 blocks).
-        buffer: AlignedBuffer<CacheLine64>,
+        buffer: AlignedBuffer<CacheLine64, A>,
         /// Active number of 64-byte blocks currently populated (`168` Lite, `349` Full, `566` Ultra).
         active_blocks: usize,
     },
 }
 
-impl<'a> ArenaStorage<'a> {
+impl<'a> ArenaStorage<'a, Global> {
     /// Creates an `ArenaStorage` from `bytes`. If `bytes` is already 64-byte aligned in memory
     /// (`ptr as usize % 64 == 0` and `bytes.len() % 64 == 0`), borrows it with zero copies;
     /// otherwise copies it into a 64-byte aligned `Owned` buffer.
     pub fn from_slice_zero_copy_or_owned(bytes: &'a [u8]) -> Self {
-        assert!(
-            bytes.len().is_multiple_of(64),
-            "Arena byte length must be a multiple of 64"
-        );
-        if let Ok(aligned_slice) = <[CacheLine64]>::ref_from_bytes(bytes) {
-            Self::Borrowed(aligned_slice)
-        } else {
-            Self::from_slice_owned(bytes)
-        }
+        Self::from_slice_zero_copy_or_owned_in(bytes, Global)
     }
 
     /// Alias for [`Self::from_slice_zero_copy_or_owned`].
@@ -161,40 +177,16 @@ impl<'a> ArenaStorage<'a> {
         Self::from_slice_zero_copy_or_owned(bytes)
     }
 
-    /// Wraps an already-allocated [`AlignedBuffer<CacheLine64>`] into [`ArenaStorage::Owned`].
-    #[inline]
-    pub fn from_owned_buffer(buffer: AlignedBuffer<CacheLine64>) -> Self {
-        let active_blocks = buffer.len_blocks();
-        Self::Owned {
-            buffer,
-            active_blocks,
-        }
-    }
-
     /// Allocates an `Owned` 64-byte aligned buffer and copies `bytes` into it.
     pub fn from_slice_owned(bytes: &[u8]) -> Self {
-        assert!(
-            bytes.len().is_multiple_of(64),
-            "Arena byte length must be a multiple of 64"
-        );
-        let num_blocks = bytes.len() / 64;
-        let mut buffer = AlignedBuffer::<CacheLine64>::new_zeroed_prefaulted(num_blocks);
-        buffer.as_bytes_mut().copy_from_slice(bytes);
-        Self::Owned {
-            buffer,
-            active_blocks: num_blocks,
-        }
+        Self::from_slice_owned_in(bytes, Global)
     }
 
     /// Pre-allocates an `Owned` 64-byte aligned arena with capacity for `max_blocks` (e.g., `566`
     /// for `Pro` = `36,224 B` or `1000` for `Ultra` = `64,000 B`) so models can be hot-swapped
     /// in-place with zero allocations.
     pub fn with_max_blocks(max_blocks: usize) -> Self {
-        let buffer = AlignedBuffer::<CacheLine64>::new_zeroed_prefaulted(max_blocks);
-        Self::Owned {
-            buffer,
-            active_blocks: 0,
-        }
+        Self::with_max_blocks_in(max_blocks, Global)
     }
 
     /// Pre-allocates an `Owned` 64-byte aligned arena capped at `max_tier` (`168` Lite, `349` Full,
@@ -203,6 +195,56 @@ impl<'a> ArenaStorage<'a> {
     #[inline]
     pub fn with_max_tier(max_tier: crate::types::Tier) -> Self {
         Self::with_max_blocks(max_tier.expected_cache_lines())
+    }
+}
+
+impl<'a, A: Allocator> ArenaStorage<'a, A> {
+    /// Creates an `ArenaStorage` from `bytes` using `alloc` if copying is required.
+    pub fn from_slice_zero_copy_or_owned_in(bytes: &'a [u8], alloc: A) -> Self {
+        assert!(
+            bytes.len().is_multiple_of(64),
+            "Arena byte length must be a multiple of 64"
+        );
+        if let Ok(aligned_slice) = <[CacheLine64]>::ref_from_bytes(bytes) {
+            Self::Borrowed(aligned_slice)
+        } else {
+            Self::from_slice_owned_in(bytes, alloc)
+        }
+    }
+
+    /// Wraps an already-allocated [`AlignedBuffer<CacheLine64, A>`] into [`ArenaStorage::Owned`].
+    #[inline]
+    pub fn from_owned_buffer(buffer: AlignedBuffer<CacheLine64, A>) -> Self {
+        let active_blocks = buffer.len_blocks();
+        Self::Owned {
+            buffer,
+            active_blocks,
+        }
+    }
+
+    /// Allocates an `Owned` 64-byte aligned buffer in `alloc` and copies `bytes` into it.
+    pub fn from_slice_owned_in(bytes: &[u8], alloc: A) -> Self {
+        assert!(
+            bytes.len().is_multiple_of(64),
+            "Arena byte length must be a multiple of 64"
+        );
+        let num_blocks = bytes.len() / 64;
+        let mut buffer =
+            AlignedBuffer::<CacheLine64, A>::new_zeroed_prefaulted_in(num_blocks, alloc);
+        buffer.as_bytes_mut().copy_from_slice(bytes);
+        Self::Owned {
+            buffer,
+            active_blocks: num_blocks,
+        }
+    }
+
+    /// Pre-allocates an `Owned` 64-byte aligned arena in `alloc` with capacity for `max_blocks`.
+    pub fn with_max_blocks_in(max_blocks: usize, alloc: A) -> Self {
+        let buffer = AlignedBuffer::<CacheLine64, A>::new_zeroed_prefaulted_in(max_blocks, alloc);
+        Self::Owned {
+            buffer,
+            active_blocks: 0,
+        }
     }
 
     /// Overwrites the arena in-place from `bytes` without allocating if `self` is `Owned` with
@@ -259,16 +301,16 @@ impl<'a> ArenaStorage<'a> {
 }
 
 /// Stage IV Spatial Tank `fp16` (`u16`) delay ring-buffer storage supporting either owned 64B-aligned
-/// heap memory (`Owned`) or caller-supplied static/shared scratch memory (`Borrowed`).
+/// heap memory (`Owned`, parameterized over `Allocator`) or caller-supplied static/shared scratch (`Borrowed`).
 #[derive(Debug)]
-pub enum DelayScratchStorage<'a> {
+pub enum DelayScratchStorage<'a, A: Allocator = Global> {
     /// Owned 64-byte aligned `fp16` blocks (allocated once on construction or `with_max_capacity`).
-    Owned(AlignedBuffer<AlignedFp16Block>),
+    Owned(AlignedBuffer<AlignedFp16Block, A>),
     /// Caller-supplied pre-allocated 64-byte aligned `fp16` blocks (`0` heap allocations).
     Borrowed(&'a mut [AlignedFp16Block]),
 }
 
-impl<'a> DelayScratchStorage<'a> {
+impl<'a> DelayScratchStorage<'a, Global> {
     /// Returns an empty `DelayScratchStorage` with `0` bytes of heap allocation (`0 KB` RAM).
     #[inline]
     pub const fn empty() -> Self {
@@ -277,12 +319,25 @@ impl<'a> DelayScratchStorage<'a> {
 
     /// Allocates an owned, page-prefaulted `fp16` delay buffer of `num_blocks` 64-byte [`AlignedFp16Block`]s.
     pub fn new_owned(num_blocks: usize) -> Self {
-        Self::Owned(AlignedBuffer::new_zeroed_prefaulted(num_blocks))
+        Self::new_owned_in(num_blocks, Global)
     }
 
     /// Wraps a caller-provided slice of 64-byte aligned `AlignedFp16Block`s and zeroes it.
     pub fn from_borrowed_scratch(scratch: &'a mut [AlignedFp16Block]) -> Self {
-        AlignedBuffer::prefault_slice(scratch);
+        Self::from_borrowed_scratch_in(scratch)
+    }
+}
+
+impl<'a, A: Allocator> DelayScratchStorage<'a, A> {
+    /// Allocates an owned, page-prefaulted `fp16` delay buffer of `num_blocks` 64-byte
+    /// [`AlignedFp16Block`]s inside `alloc`.
+    pub fn new_owned_in(num_blocks: usize, alloc: A) -> Self {
+        Self::Owned(AlignedBuffer::new_zeroed_prefaulted_in(num_blocks, alloc))
+    }
+
+    /// Wraps a caller-provided slice of 64-byte aligned `AlignedFp16Block`s and zeroes it.
+    pub fn from_borrowed_scratch_in(scratch: &'a mut [AlignedFp16Block]) -> Self {
+        AlignedBuffer::<AlignedFp16Block, A>::prefault_slice(scratch);
         Self::Borrowed(scratch)
     }
 
@@ -411,5 +466,36 @@ mod tests {
         assert_eq!(borrowed.as_slice().len(), 2);
         borrowed.as_slice_mut()[0].0[0] = 42;
         assert_eq!(borrowed.as_u16_slice()[0], 42);
+    }
+
+    #[test]
+    fn test_allocator_parameterized_memory_storage() {
+        let g = Global;
+        let buf = AlignedBuffer::<CacheLine64, _>::new_zeroed_prefaulted_in(3, &g);
+        assert_eq!(buf.len_blocks(), 3);
+        assert_eq!((buf.as_bytes().as_ptr() as usize) % 64, 0);
+        let _ = buf.allocator();
+
+        let mut arena = ArenaStorage::with_max_blocks_in(4, &g);
+        assert!(!arena.is_borrowed());
+        assert!(arena.reload_in_place(buf.as_bytes()));
+        assert_eq!(arena.as_cache_lines().len(), 3);
+
+        let mut delay = DelayScratchStorage::new_owned_in(2, &g);
+        assert_eq!(delay.byte_len(), 128);
+        delay.clear();
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_aligned_buffer_and_arena_in_global_ref(blocks in 1usize..16, active in 1usize..16) {
+            let active = active.min(blocks);
+            let buf = AlignedBuffer::<CacheLine64, _>::new_zeroed_prefaulted_in(blocks, &Global);
+            proptest::prop_assert_eq!(buf.len_blocks(), blocks);
+            proptest::prop_assert_eq!((buf.as_bytes().as_ptr() as usize) % 64, 0);
+            let mut arena = ArenaStorage::with_max_blocks_in(blocks, &Global);
+            proptest::prop_assert!(arena.reload_in_place(&buf.as_bytes()[..active * 64]));
+            proptest::prop_assert_eq!(arena.as_cache_lines().len(), active);
+        }
     }
 }

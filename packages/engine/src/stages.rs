@@ -12,6 +12,7 @@ pub mod stage2_cascade;
 pub mod stage3_cabinet;
 pub mod stage4_tank;
 pub mod topology;
+pub mod v3_core;
 pub mod weights;
 
 pub use topology::{

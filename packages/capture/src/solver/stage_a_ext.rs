@@ -148,7 +148,6 @@ fn eval_stage12_nl_loss(
     }
     let _ftz = FtzDazGuard::new();
     let svf_active = read_f32_le(arena_64k, ARENA0_STAGE1_EXT + 100) > 0.5;
-    let clean_bypass = read_f32_le(arena_64k, ARENA0_STAGE2_EXT + 24);
     let mut mdl = vec![0.0_f64; n_eval];
     let mut sub = vec![0.0_f64; n_eval];
     let mut svf_basis = Vec::with_capacity(if svf_active { n_eval } else { 0 });
@@ -177,7 +176,7 @@ fn eval_stage12_nl_loss(
         return f64::INFINITY;
     }
     if svf_active
-        && (clean_bypass >= 0.80 || star_meta_f64(manifest, "phys_odd_harm", 0.0) < 0.08)
+        && star_meta_f64(manifest, "phys_odd_harm", 0.0) < 0.08
         && let Some((w_svf, rel_err, _)) = solve_svf_weights_3x3(&svf_basis, &tgt, start, n_eval)
     {
         for i in 0..n_eval {
@@ -496,22 +495,27 @@ pub(crate) fn lift_v2_pre_s3(
         refine_s12.push((ARENA0_STAGE1_EXT + 68, 0.0, 1.0));
     }
     let eval_stereo = manifest.base.io_config.output_mode != "mono";
-    let svf_active = (env_bright > 1.32
+    let svf_candidate = (env_bright > 1.32
         || (spectral_q > 2.2 && odd_harm < 0.14 && pre_lpf_hz >= 8_000.0))
         && gate_ratio >= 0.65
         && subharm < 0.10
         && sideband < 0.12
         && tail_ratio < 0.08
-        && !amp_cab_nl;
-    if svf_active {
-        let (fc0, sens0, k0, [lp0, bp0, hp0]) = fit_svf_tpt_surrogate(
+        && (!amp_cab_nl || (env_bright > 1.45 && spectral_q > 4.5));
+    let svf_fit = if svf_candidate {
+        fit_svf_tpt_surrogate(
             dry_lr,
             wet_lr,
             eval_stereo,
             odd_harm >= 0.06 || nl_drive >= 0.05,
             n_fit.min(10_650),
         )
-        .unwrap_or((
+    } else {
+        None
+    };
+    let svf_active = svf_candidate && (!amp_cab_nl || svf_fit.is_some());
+    if svf_active {
+        let (fc0, sens0, k0, [lp0, bp0, hp0]) = svf_fit.unwrap_or((
             340.0,
             ((env_bright - 1.0) * 1.8).clamp(0.2, 4.5),
             (1.0 / spectral_q.clamp(0.7, 10.0)).clamp(0.08, 0.95),
@@ -548,12 +552,12 @@ pub(crate) fn lift_v2_pre_s3(
         && gate_ratio >= 0.65
         && lfo_hz <= 0.15;
     let nl_amt = ((1.0 - coherence).max(odd_harm + even_harm)).clamp(0.0, 1.0);
-    let pre_hpf_p = if pre_hpf_hz > 25.0 {
+    let pre_hpf_p = if !svf_active && pre_hpf_hz > 25.0 {
         (-tau * pre_hpf_hz / 48_000.0).exp().clamp(0.5, 0.999)
     } else {
         0.0
     };
-    let pre_lpf_p = if pre_lpf_hz < 15_000.0 {
+    let pre_lpf_p = if !svf_active && pre_lpf_hz < 15_000.0 {
         (-tau * pre_lpf_hz / 48_000.0).exp().clamp(0.0, 0.98)
     } else {
         0.0
@@ -679,7 +683,9 @@ pub(crate) fn lift_v2_pre_s3(
         2.20
     };
     if !is_pure_lti && (nl_amt > 0.08 || !refine_s12.is_empty()) {
-        let (hpf_lo, hpf_hi) = if pre_hpf_hz > 80.0 {
+        let (hpf_lo, hpf_hi) = if svf_active {
+            (0.0, 0.25)
+        } else if pre_hpf_hz > 80.0 {
             ((pre_hpf_p * 0.82).clamp(0.50, 0.90), 0.995)
         } else {
             (0.0, pre_hpf_p.max(0.35))
@@ -765,9 +771,21 @@ pub(crate) fn lift_v2_pre_s3(
             && let Some([lp_w, bp_w, hp_w]) =
                 solve_svf_lp_bp_hp_weights(manifest, arena_64k, dry_lr, wet_lr, n_eval)
         {
+            let prev_w = [
+                read_f32_le(arena_64k, ARENA0_STAGE1_EXT + 116),
+                read_f32_le(arena_64k, ARENA0_STAGE1_EXT + 120),
+                read_f32_le(arena_64k, ARENA0_STAGE1_EXT + 124),
+            ];
             write_f32_le(arena_64k, ARENA0_STAGE1_EXT + 116, lp_w);
             write_f32_le(arena_64k, ARENA0_STAGE1_EXT + 120, bp_w);
             write_f32_le(arena_64k, ARENA0_STAGE1_EXT + 124, hp_w);
+            if odd_harm >= 0.08
+                && eval_stage12_nl_loss(manifest, arena_64k, dry_lr, wet_lr, n_eval) > best_loss
+            {
+                write_f32_le(arena_64k, ARENA0_STAGE1_EXT + 116, prev_w[0]);
+                write_f32_le(arena_64k, ARENA0_STAGE1_EXT + 120, prev_w[1]);
+                write_f32_le(arena_64k, ARENA0_STAGE1_EXT + 124, prev_w[2]);
+            }
         }
     }
 }

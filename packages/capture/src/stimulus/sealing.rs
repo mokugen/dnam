@@ -321,6 +321,30 @@ pub(crate) fn estimate_causal_bulk_alignment(dry_48k: &[f32], wet_48k: &[f32]) -
         &wet_48k[..n]
     };
 
+    let tail_start = n.saturating_sub(512).max(settle_start);
+    let tail_dry_silent =
+        tail_start < n && dry_48k[tail_start..n].iter().all(|&x| x.abs() < 1.0e-4);
+    let quiet_peak = if first_dry_active >= 64 {
+        wet_centered[..first_dry_active]
+            .iter()
+            .fold(0.0_f64, |m, &w| m.max(f64::from(w).abs()))
+    } else if tail_dry_silent {
+        let mid = tail_start + (n - tail_start) / 2;
+        let tail_late = wet_centered[mid..n]
+            .iter()
+            .fold(0.0_f64, |m, &w| m.max(f64::from(w).abs()));
+        let tail_early = wet_centered[tail_start..mid]
+            .iter()
+            .fold(0.0_f64, |m, &w| m.max(f64::from(w).abs()));
+        if tail_early > 2.0 * tail_late && tail_late < 5.0e-3 {
+            0.0
+        } else {
+            tail_late
+        }
+    } else {
+        0.0
+    };
+
     let dry_peak = dry_48k[..n]
         .iter()
         .fold(0.0_f64, |m, &x| m.max(f64::from(x).abs()));
@@ -328,31 +352,67 @@ pub(crate) fn estimate_causal_bulk_alignment(dry_48k: &[f32], wet_48k: &[f32]) -
         .iter()
         .fold(0.0_f64, |m, &x| m.max(f64::from(x).abs()));
     let causal_gap = if dry_peak > 1.0e-4 && wet_peak > 1.0e-4 {
-        let dry_thresh = (0.02 * dry_peak).max(1.0e-4);
-        let wet_thresh = (0.02 * wet_peak).max(1.0e-4);
-        let n_dry_onset = dry_48k[..n]
+        let dry_thresh = (0.002 * dry_peak).max(2.5e-4);
+        let n_dry_idx = dry_48k[..n]
             .iter()
             .position(|&x| f64::from(x).abs() >= dry_thresh)
-            .unwrap_or(0) as f64;
+            .unwrap_or(0);
+        let m_init = (n_dry_idx + 6).clamp(4, n);
+        let e_d_init: f64 = dry_48k[..m_init]
+            .iter()
+            .map(|&x| f64::from(x).powi(2))
+            .sum();
+        let e_w_init: f64 = wet_centered[..m_init]
+            .iter()
+            .map(|&x| f64::from(x).powi(2))
+            .sum();
+        let g_init = if e_d_init > 1.0e-12 {
+            (e_w_init / e_d_init).sqrt()
+        } else {
+            1.0
+        };
+        let min_wet_floor = if g_init < 0.30 { 1.0e-4 } else { 2.5e-4 };
+        let wet_thresh = (3.5 * quiet_peak).max(min_wet_floor).max(1.0e-4 * wet_peak);
         let n_wet_onset = wet_centered
             .iter()
             .position(|&x| f64::from(x).abs() >= wet_thresh)
             .unwrap_or(0) as f64;
-        (n_wet_onset - n_dry_onset).max(0.0)
+        (n_wet_onset - (n_dry_idx as f64)).max(0.0)
     } else {
         0.0
     };
 
-    let (raw_lag, inv_pol) =
+    let (raw_lag, raw_inv_pol, lin_coh) =
         match estimate_multiregime_alignment(&dry_48k[..n], wet_centered, 48_000, 1_024) {
-            Ok(al) => (al.total_lag_samples, al.polarity_inverted),
-            Err(_) => (0.0, false),
+            Ok(al) => (
+                al.total_lag_samples,
+                al.polarity_inverted,
+                al.linear_coherence,
+            ),
+            Err(_) => (0.0, false, 0.0),
         };
-    let upper = causal_gap + 12.0;
-    let bulk_lag = if raw_lag > upper {
-        causal_gap
+    let upper = if lin_coh >= 0.35 {
+        causal_gap + 12.0
     } else {
-        raw_lag.max(0.0)
+        causal_gap + 2.0
+    };
+    let (bulk_lag, inv_pol) = if raw_lag > upper {
+        let shift = (causal_gap.round().max(0.0) as usize).min(n.saturating_sub(1));
+        let mut num = 0.0_f64;
+        let mut den_d = 0.0_f64;
+        let mut den_w = 0.0_f64;
+        for t in 0..n.saturating_sub(shift) {
+            let d = f64::from(dry_48k[t]);
+            let w = f64::from(wet_centered[t + shift]);
+            num += d * w;
+            den_d += d * d;
+            den_w += w * w;
+        }
+        let denom = (den_d * den_w).sqrt();
+        let causal_inv = denom > 1.0e-12 && (num / denom) < -0.05;
+        (causal_gap, causal_inv)
+    } else {
+        (raw_lag.max(0.0), raw_inv_pol)
     };
     (bulk_lag, inv_pol, dc_offset)
 }

@@ -115,12 +115,20 @@ fn is_realtime_root_symbol(sym: &str) -> bool {
         "ControlBus",
         "StagePipeline",
         "Stage1PreDynamics",
+        "V3HotCore",
+        "V3CoreInstance",
+        "v3_process_block_default",
+        "v3_process_block_infallible_default",
         "dnam_engine_process_block",
         "dnam_engine_process_mono",
     ];
     const RT_METHOD_PATTERNS: &[&str] = &[
         "::process_block",
         "::process_block_in_place",
+        "::process_block_stereo",
+        "::process_block_infallible",
+        "v3_process_block_default",
+        "v3_process_block_infallible_default",
         "::process_mono",
         "::process_mono_to_stereo",
         "::step_frame_tora",
@@ -404,6 +412,16 @@ fn test_release_disassembly_zero_pipeline_stalls_and_nondeterministic_calls() {
         }
     }
 
+    let has_v3_root = rt_closure.iter().any(|k| {
+        fns.get(k).is_some_and(|info| {
+            info.demangled.contains("v3_process_block") || info.demangled.contains("V3HotCore")
+        })
+    });
+    assert!(
+        has_v3_root,
+        "Expected v3_core real-time roots to be present and audited in {}",
+        rlib.display()
+    );
     assert!(
         root_count >= 15 && rt_closure.len() > root_count,
         "Expected >= 15 real-time root functions and non-empty transitive callees in {}, found {} roots and {} total in closure",

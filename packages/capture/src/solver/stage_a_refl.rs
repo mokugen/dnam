@@ -708,7 +708,13 @@ pub(super) fn fit_svf_tpt_surrogate(
             }
         }
     }
-    if !best_err.is_finite() || best_err >= 0.82 || best_sens < 0.5 {
+    let static_err =
+        eval_cfg(best_fc, 0.0, best_k, &mut svf_basis, &mut u_buf).map_or(1.0, |(e, _)| e);
+    if !best_err.is_finite()
+        || best_err >= 0.82
+        || best_sens < 0.5
+        || (has_post_nl && (best_err >= 0.52 || best_err >= 0.65 * static_err))
+    {
         return None;
     }
     let (_, w) = eval_cfg(best_fc, best_sens, best_k, &mut svf_basis, &mut u_buf)?;

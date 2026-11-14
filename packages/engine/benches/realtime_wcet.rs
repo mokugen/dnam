@@ -22,6 +22,7 @@ use dnam_engine::schema::{
     RouterConfig, SlimmableTiersConfig, Stage1PreFxConfig, Stage2CascadeConfig,
     Stage3CabinetKautzConfig, Stage4SpatialTankConfig, TempoSubdivision, TierProfile,
 };
+use dnam_engine::stages::v3_core::{V3ColdTierModel, V3CoreInstance, V3HotCore};
 use dnam_engine::{DnamEngine, Tier};
 
 fn make_bench_container() -> AlignedBuffer<CacheLine64> {
@@ -429,6 +430,141 @@ fn main() {
         Tier::Ultra,
         "Ultra (C=16, Modulated)",
     );
+    println!(
+        "==========================================================================================\n"
+    );
+
+    bench_v3_core_suite();
+}
+
+fn make_v3_bench_model(tier: Tier, os2x: bool, mono_out: bool) -> V3ColdTierModel {
+    let mut m = V3ColdTierModel::identity_for_tier(tier, os2x, mono_out);
+    m.svf.env_oct_sens = 1.8;
+    m.svf.stage2_feed_taps[..7].copy_from_slice(&[0.7, 0.15, 0.25, -0.1, 0.15, 0.1, 0.05]);
+    for b in 0..3 {
+        for c in 0..16 {
+            m.blocks[b].in_u_gain[c] = 0.65;
+            m.blocks[b].static_bias[c] = -0.25;
+            m.blocks[b].env_bias_sens[c] = 0.15;
+            m.blocks[b].skip_u_gain[c] = 0.20;
+            m.blocks[b].prev_skip_gain[c] = 0.15;
+            if b > 0 {
+                m.blocks[b].inter_mat[c][c] = 0.45;
+            }
+        }
+        m.pre_cab_w[0][b] = 0.25;
+        m.pre_cab_w[1][b] = 0.25;
+        m.direct_s2_w[0][b] = 0.10;
+        m.direct_s2_w[1][b] = 0.10;
+    }
+    m
+}
+
+fn bench_v3_row(tier: Tier, os2x: bool, mono_out: bool, label: &str) {
+    let model = make_v3_bench_model(tier, os2x, mono_out);
+    let mut inst = V3CoreInstance::<DefaultMathBackend>::from_cold_model(&model);
+    let in_l = [0.22_f32; 128];
+    let in_r = [-0.18_f32; 128];
+    let mut out_l = [0.0_f32; 128];
+    let mut out_r = [0.0_f32; 128];
+    for _ in 0..100 {
+        inst.process_block_stereo(&in_l, &in_r, &mut out_l, &mut out_r);
+    }
+    let blocks = 4_000_usize;
+    let total_samples = blocks * 128;
+    let t0 = Instant::now();
+    for _ in 0..blocks {
+        inst.process_block_stereo(
+            black_box(&in_l),
+            black_box(&in_r),
+            black_box(&mut out_l),
+            black_box(&mut out_r),
+        );
+    }
+    let elapsed_ns = t0.elapsed().as_nanos() as f64;
+    black_box((out_l[0], out_r[0]));
+    let ns_per_sample = elapsed_ns / (total_samples as f64);
+    let budget_ns = 1_000_000_000.0 / 48_000.0;
+    let x_rt = budget_ns / ns_per_sample;
+    let cpu_pct = (ns_per_sample / budget_ns) * 100.0;
+    let hot_b = V3HotCore::<DefaultMathBackend>::active_hot_bytes(tier, os2x);
+    println!(
+        "| {:<32} | {:>7} B | {:>10.2} ns | {:>10.1}x | {:>7.2}% |",
+        label, hot_b, ns_per_sample, x_rt, cpu_pct
+    );
+}
+
+fn bench_v3_wcet_row(tier: Tier, os2x: bool, mono_out: bool, label: &str) {
+    let model = make_v3_bench_model(tier, os2x, mono_out);
+    let mut inst = V3CoreInstance::<DefaultMathBackend>::from_cold_model(&model);
+    let in_l = [0.22_f32; 128];
+    let in_r = [-0.18_f32; 128];
+    let mut out_l = [0.0_f32; 128];
+    let mut out_r = [0.0_f32; 128];
+    for _ in 0..64 {
+        inst.process_block_stereo(&in_l, &in_r, &mut out_l, &mut out_r);
+    }
+    let num_blocks = 2_000_usize;
+    let mut latencies_us = Vec::with_capacity(num_blocks);
+    for _ in 0..num_blocks {
+        let t0 = Instant::now();
+        inst.process_block_stereo(
+            black_box(&in_l),
+            black_box(&in_r),
+            black_box(&mut out_l),
+            black_box(&mut out_r),
+        );
+        latencies_us.push(t0.elapsed().as_nanos() as f64 / 1_000.0);
+    }
+    black_box((out_l[0], out_r[0]));
+    latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let p50 = latencies_us[num_blocks / 2];
+    let p99 = latencies_us[(num_blocks * 99) / 100];
+    let p999 = latencies_us[(num_blocks * 999) / 1_000];
+    let max_us = latencies_us[num_blocks - 1];
+    let deadline_us = (128.0 / 48_000.0) * 1_000_000.0;
+    let max_budget_pct = (max_us / deadline_us) * 100.0;
+    println!(
+        "| {:<24} | {:>8.2} us | {:>8.2} us | {:>8.2} us | {:>8.2} us | {:>8.2}% |",
+        label, p50, p99, p999, max_us, max_budget_pct
+    );
+}
+
+fn bench_v3_core_suite() {
+    println!(
+        "=========================================================================================="
+    );
+    println!(" DNAM v3 Cache-Coherent Hot Core Throughput (48 kHz, 128-Sample Blocks, NEON/SIMD)");
+    println!(
+        "=========================================================================================="
+    );
+    println!(
+        "| {:<32} | {:>9} | {:>13} | {:>11} | {:>8} |",
+        "v3 Tier & OS Mode", "HotBytes", "Latency/Frame", "x Real-Time", "CPU Load"
+    );
+    println!(
+        "|----------------------------------|-----------|---------------|-------------|----------|"
+    );
+    bench_v3_row(Tier::Lite, false, false, "v3 Lite (C=4, 1x, Stereo)");
+    bench_v3_row(Tier::Lite, false, true, "v3 Lite (C=4, 1x, Mono)");
+    bench_v3_row(Tier::Full, false, false, "v3 Full (C=8, 1x, Stereo)");
+    bench_v3_row(Tier::Full, true, false, "v3 Full (C=8, 2x OS, Stereo)");
+    bench_v3_row(Tier::Pro, true, false, "v3 Pro (C=12, 2x OS, Stereo)");
+    bench_v3_row(Tier::Ultra, true, false, "v3 Ultra (C=16, 2x OS, Stereo)");
+    println!(
+        "==========================================================================================\n"
+    );
+    println!(
+        "| {:<24} | {:>11} | {:>11} | {:>11} | {:>11} | {:>9} |",
+        "v3 WCET (2000 x 128)", "P50 Block", "P99 Block", "P99.9 Block", "Max Block", "Max/Budget"
+    );
+    println!(
+        "|--------------------------|-------------|-------------|-------------|-------------|-----------|"
+    );
+    bench_v3_wcet_row(Tier::Lite, false, false, "v3 Lite (1x, Stereo)");
+    bench_v3_wcet_row(Tier::Full, true, false, "v3 Full (2x OS, Stereo)");
+    bench_v3_wcet_row(Tier::Pro, true, false, "v3 Pro (2x OS, Stereo)");
+    bench_v3_wcet_row(Tier::Ultra, true, false, "v3 Ultra (2x OS, Stereo)");
     println!(
         "=========================================================================================="
     );

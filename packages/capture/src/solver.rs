@@ -13,6 +13,7 @@ pub mod stage_d_basis;
 pub mod stage_e;
 pub mod stage_e_polish;
 pub mod stages;
+pub mod v3_varpro;
 pub mod wide_gram;
 
 pub use bezout_gram::{
@@ -40,6 +41,7 @@ pub use stage_e::{
     finalize_stage_e_and_telemetry_with_polish, identify_pole_angles_blackbox_from_audio,
     render_blackbox_probe_response,
 };
+pub use v3_varpro::{V3TrainDataset, V3TrainStem, fit_v3_core_four_tiers};
 pub use wide_gram::{Wide192Accum, accumulate_uplo_u_wide192, contract_256d_gram_tiled_wide192};
 
 /// Tuning options for the 5-Stage `< 25 ms` Closed-Form + `VarPro` Solver (`Stage A..E`).

@@ -6,3 +6,6 @@ rustflags = [
   "-C", "link-arg=--export-memory",
   "-C", "link-arg=--max-memory=268435456",
 ]
+
+[registry]
+global-min-publish-age = "3 days"

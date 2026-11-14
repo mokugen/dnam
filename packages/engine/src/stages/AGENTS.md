@@ -18,5 +18,6 @@ Implements the 4-stage rig pipeline and matrix routing core of TORA (`#[forbid(u
 | [`stage4_tank.rs`](stage4_tank.rs) | Stage IV Unitary Spatial Tank (`Givens+Householder`, diffusers, DC blocker & loop saturator) | [`router_and_stages_topology.md`](../../../../docs/specs/dsp/router_and_stages_topology.md) |
 | [`head.rs`](head.rs) | Unified 256-D Feature Bus & Canonical Mid/Side Kronecker Output Head | [`router_and_stages_topology.md`](../../../../docs/specs/dsp/router_and_stages_topology.md) |
 | [`weights.rs`](weights.rs) | 64-byte cache-line aligned `Arena 0..3` weight directory view | [`dnam_binary_format.md`](../../../../docs/specs/containers/dnam_binary_format.md) |
+| [`v3_core.rs`](v3_core.rs) | Cache-coherent L1D SIMD `v3` core (`Stage I..III`, `svf.rs`, `cascade.rs`) | [`tora_architecture.md`](../../../../docs/specs/architecture/tora_architecture.md) |
 
 See [`packages/engine/CONTRIBUTING.md`](../../CONTRIBUTING.md) for stage chaining and memory layout.
