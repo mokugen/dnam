@@ -304,18 +304,20 @@ fn capture_freeze_transition_stem_mode1(
         },
     ];
     let (_, spec, _, _) = super::sealing::align_full_stem_and_seal_vault_with_override(
-        &stim.stem_id,
-        false,
-        seed_256,
-        carrier_bins,
-        5,
-        &dry_48k_l,
-        dry_48k_r.as_deref(),
-        &wet_48k_l,
-        wet_48k_r.as_deref(),
-        windows,
-        meta,
-        user_meta,
+        super::sealing::StemSealRequest {
+            stem_id: &stim.stem_id,
+            is_star_center: false,
+            seed_256,
+            carrier_bins,
+            valid_frames: 5,
+            dry_48k_l: &dry_48k_l,
+            dry_48k_r: dry_48k_r.as_deref(),
+            wet_48k_l: &wet_48k_l,
+            wet_48k_r: wet_48k_r.as_deref(),
+            windows,
+            controls_meta: meta,
+            user_metadata: user_meta,
+        },
         shared_align,
     )?;
     Ok(spec)

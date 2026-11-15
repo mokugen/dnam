@@ -442,20 +442,23 @@ fn make_v3_bench_model(tier: Tier, os2x: bool, mono_out: bool) -> V3ColdTierMode
     m.svf.env_oct_sens = 1.8;
     m.svf.stage2_feed_taps[..7].copy_from_slice(&[0.7, 0.15, 0.25, -0.1, 0.15, 0.1, 0.05]);
     for b in 0..3 {
-        for c in 0..16 {
-            m.blocks[b].in_u_gain[c] = 0.65;
-            m.blocks[b].static_bias[c] = -0.25;
-            m.blocks[b].env_bias_sens[c] = 0.15;
-            m.blocks[b].skip_u_gain[c] = 0.20;
-            m.blocks[b].prev_skip_gain[c] = 0.15;
+        for dst in 0..16 {
+            m.blocks[b].w_in_n[0][dst] = 0.65;
+            m.blocks[b].w_in_z[0][dst] = 0.25;
+            m.blocks[b].w_in_r[0][dst] = 0.15;
+            m.blocks[b].b_n[dst] = -0.25;
+            m.blocks[b].b_z[dst] = -0.60;
+            m.blocks[b].b_r[dst] = 1.25;
+            m.blocks[b].w_rec_n[dst][dst] = 0.15;
             if b > 0 {
-                m.blocks[b].inter_mat[c][c] = 0.45;
+                m.blocks[b].w_prev_n[dst][dst] = 0.45;
             }
         }
-        m.pre_cab_w[0][b] = 0.25;
-        m.pre_cab_w[1][b] = 0.25;
-        m.direct_s2_w[0][b] = 0.10;
-        m.direct_s2_w[1][b] = 0.10;
+        let lane = dnam_engine::stages::v3_core::cascade::flat_gru_lane_index(b, 0, 0);
+        m.readout.pre_cab_w[0][lane] = 0.25;
+        m.readout.pre_cab_w[1][lane] = 0.25;
+        m.readout.direct_s2_w[0][lane] = 0.10;
+        m.readout.direct_s2_w[1][lane] = 0.10;
     }
     m
 }
@@ -545,12 +548,12 @@ fn bench_v3_core_suite() {
     println!(
         "|----------------------------------|-----------|---------------|-------------|----------|"
     );
-    bench_v3_row(Tier::Lite, false, false, "v3 Lite (C=4, 1x, Stereo)");
-    bench_v3_row(Tier::Lite, false, true, "v3 Lite (C=4, 1x, Mono)");
-    bench_v3_row(Tier::Full, false, false, "v3 Full (C=8, 1x, Stereo)");
-    bench_v3_row(Tier::Full, true, false, "v3 Full (C=8, 2x OS, Stereo)");
-    bench_v3_row(Tier::Pro, true, false, "v3 Pro (C=12, 2x OS, Stereo)");
-    bench_v3_row(Tier::Ultra, true, false, "v3 Ultra (C=16, 2x OS, Stereo)");
+    bench_v3_row(Tier::Lite, false, false, "v3 Lite (G=1, 1x, Stereo)");
+    bench_v3_row(Tier::Lite, false, true, "v3 Lite (G=1, 1x, Mono)");
+    bench_v3_row(Tier::Lite, true, false, "v3 Lite (G=1, 2x OS, Stereo)");
+    bench_v3_row(Tier::Full, true, false, "v3 Full (G=2, 2x OS, Stereo)");
+    bench_v3_row(Tier::Pro, true, false, "v3 Pro (G=3, 2x OS, Stereo)");
+    bench_v3_row(Tier::Ultra, true, false, "v3 Ultra (G=4, 2x OS, Stereo)");
     println!(
         "==========================================================================================\n"
     );
@@ -562,6 +565,7 @@ fn bench_v3_core_suite() {
         "|--------------------------|-------------|-------------|-------------|-------------|-----------|"
     );
     bench_v3_wcet_row(Tier::Lite, false, false, "v3 Lite (1x, Stereo)");
+    bench_v3_wcet_row(Tier::Lite, true, false, "v3 Lite (2x OS, Stereo)");
     bench_v3_wcet_row(Tier::Full, true, false, "v3 Full (2x OS, Stereo)");
     bench_v3_wcet_row(Tier::Pro, true, false, "v3 Pro (2x OS, Stereo)");
     bench_v3_wcet_row(Tier::Ultra, true, false, "v3 Ultra (2x OS, Stereo)");

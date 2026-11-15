@@ -511,8 +511,9 @@ mod x25519_tests {
         vec::Vec,
     };
 
+    use crate::provenance::OpenArenaCryptoProvider;
     use crate::provenance::{CryptoProvider, RustCryptoProvider, encode_hex};
-    use crate::schema::DnamError;
+    use crate::schema::{AuthorizedDevice, DnamError, MarketplaceReceipt};
     use chacha20poly1305::aead::{AeadInPlace, KeyInit};
     use chacha20poly1305::{ChaCha20Poly1305, Nonce};
     use hkdf::Hkdf;
@@ -603,5 +604,76 @@ mod x25519_tests {
             provider.unwrap_seal_slot_cek(&ephemeral_public, &device_id, &wrapped),
             Err(DnamError::CryptoVerificationFailed(_))
         ));
+
+        // `&T` blanket impl delegation and missing-key / bad-Ed25519 errors
+        fn exercise_ref_provider<P: CryptoProvider>(
+            p: P,
+            epk: &[u8; 32],
+            dev_id: &[u8; 16],
+            bad_wrapped: &[u8; 48],
+            receipt: &MarketplaceReceipt,
+            dev: &AuthorizedDevice,
+        ) {
+            assert!(p.local_device_id_hash().is_some());
+            assert!(p.marketplace_pubkey().is_none());
+            assert!(p.ed25519_verify(&[0xff; 32], b"msg", &[0u8; 64]).is_err());
+            assert!(p.unwrap_seal_slot_cek(epk, dev_id, bad_wrapped).is_err());
+            assert!(p.unwrap_device_cek(receipt, dev).is_err());
+        }
+
+        let open_provider = OpenArenaCryptoProvider;
+        let receipt = MarketplaceReceipt {
+            marketplace_id: alloc::string::String::from("mkt"),
+            license_id: alloc::string::String::from("lic"),
+            buyer_hash: alloc::string::String::from("00"),
+            license_tier: alloc::string::String::from("personal"),
+            issued_at: alloc::string::String::from("2026-10-23T00:00:00Z"),
+            buyer_arena_sha256: alloc::string::String::from("00"),
+            buyer_tier_arena_sha256: None,
+            encryption_mode: alloc::string::String::from("none"),
+            arena_nonce_96: None,
+            ephemeral_pubkey_x25519: None,
+            authorized_devices: alloc::vec::Vec::new(),
+            royalty_splits: alloc::vec::Vec::new(),
+            receipt_sig_ed25519: alloc::string::String::from("00"),
+        };
+        let dev = AuthorizedDevice {
+            oem_vendor: alloc::string::String::from("oem"),
+            model_code: alloc::string::String::from("dev"),
+            device_id_hash: device_id_hex.clone(),
+            wrapped_cek: None,
+        };
+        exercise_ref_provider(
+            &provider,
+            &ephemeral_public,
+            &device_id,
+            &wrapped,
+            &receipt,
+            &dev,
+        );
+
+        let mut hit_invalid_pk = false;
+        for b in 0..=255u8 {
+            let mut pk = [0xffu8; 32];
+            pk[0] = b;
+            pk[31] = 0x7f;
+            if matches!(
+                provider.ed25519_verify(&pk, b"m", &[0u8; 64]),
+                Err(DnamError::CryptoVerificationFailed(
+                    "invalid Ed25519 public key bytes"
+                ))
+            ) {
+                hit_invalid_pk = true;
+                break;
+            }
+        }
+        assert!(hit_invalid_pk);
+
+        assert!(
+            open_provider
+                .ed25519_verify(&[0u8; 32], b"m", &[0u8; 64])
+                .is_err()
+        );
+        assert!(provider.unwrap_device_cek(&receipt, &dev).is_err());
     }
 }

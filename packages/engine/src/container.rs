@@ -109,3 +109,13 @@ pub fn crc32c_update(crc: u32, data: &[u8]) -> u32 {
 pub fn crc32c_compute(data: &[u8]) -> u32 {
     crc32c_update(0, data)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_crc32c_compute_matches_standard_vector() {
+        assert_eq!(crc32c_compute(b"123456789"), 0xe306_9283);
+    }
+}

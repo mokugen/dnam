@@ -439,3 +439,49 @@ impl Stage2Backend<crate::math::WasmVec4> for crate::math::WasmSimd128Backend {
         conv6_taps_4groups_vec4(bias, w_tiles, h_taps)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::ScalarVec4;
+
+    #[test]
+    fn test_stage2_conv6_backend_dispatch_methods() {
+        let bias = ScalarVec4::splat(0.25);
+        let tap = [[0.1_f32; 4]; 4];
+        let h_taps = [&tap; 6];
+        let w1 = [[[0.05_f32; 4]; 4]; 6];
+        let w2 = [[[0.05_f32; 4]; 4]; 12];
+        let w3 = [[[0.05_f32; 4]; 4]; 18];
+        let w4 = [[[0.05_f32; 4]; 4]; 24];
+
+        let s1 = crate::math::ScalarBackend::conv6_taps_1group(bias, &w1, &h_taps);
+        let s2 = crate::math::ScalarBackend::conv6_taps_2groups(bias, &w2, &h_taps);
+        let s3 = crate::math::ScalarBackend::conv6_taps_3groups(bias, &w3, &h_taps);
+        let s4 = crate::math::ScalarBackend::conv6_taps_4groups(bias, &w4, &h_taps);
+        assert!(s1.to_array()[0] > 0.25 && s2.to_array()[0] > s1.to_array()[0]);
+        assert!(s3.to_array()[0] > s2.to_array()[0] && s4.to_array()[0] > s3.to_array()[0]);
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            let nb = crate::math::NeonVec4::splat(0.25);
+            let n1 = crate::math::NeonBackend::conv6_taps_1group(nb, &w1, &h_taps);
+            let n2 = crate::math::NeonBackend::conv6_taps_2groups(nb, &w2, &h_taps);
+            let n3 = crate::math::NeonBackend::conv6_taps_3groups(nb, &w3, &h_taps);
+            let n4 = crate::math::NeonBackend::conv6_taps_4groups(nb, &w4, &h_taps);
+            assert!((n1.to_array()[0] - s1.to_array()[0]).abs() < 1e-5);
+            assert!((n2.to_array()[0] - s2.to_array()[0]).abs() < 1e-5);
+            assert!((n3.to_array()[0] - s3.to_array()[0]).abs() < 1e-5);
+            assert!((n4.to_array()[0] - s4.to_array()[0]).abs() < 1e-5);
+
+            let sme1 = crate::math::ArmSmeBackend::conv6_taps_1group(nb, &w1, &h_taps);
+            let sme2 = crate::math::ArmSmeBackend::conv6_taps_2groups(nb, &w2, &h_taps);
+            let sme3 = crate::math::ArmSmeBackend::conv6_taps_3groups(nb, &w3, &h_taps);
+            let sme4 = crate::math::ArmSmeBackend::conv6_taps_4groups(nb, &w4, &h_taps);
+            assert!((sme1.to_array()[0] - s1.to_array()[0]).abs() < 1e-5);
+            assert!((sme2.to_array()[0] - s2.to_array()[0]).abs() < 1e-5);
+            assert!((sme3.to_array()[0] - s3.to_array()[0]).abs() < 1e-5);
+            assert!((sme4.to_array()[0] - s4.to_array()[0]).abs() < 1e-5);
+        }
+    }
+}

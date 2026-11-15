@@ -141,3 +141,50 @@ impl MathBackend for ScalarBackend {
     const NAME: &'static str = "Scalar (16B Aligned Reference)";
     const KIND: BackendKind = BackendKind::Scalar;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn test_scalar_vec4_ops_and_backend() {
+        let a = ScalarVec4::from_array([1.0, -2.0, 3.0, -4.0]);
+        let b = ScalarVec4::splat(2.0);
+        assert_eq!(a.abs().to_array(), [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(a.min(b).to_array(), [1.0, -2.0, 2.0, -4.0]);
+        assert_eq!(a.max(b).to_array(), [2.0, 2.0, 3.0, 2.0]);
+        assert_eq!(a.add(b).to_array(), [3.0, 0.0, 5.0, -2.0]);
+        assert_eq!(a.sub(b).to_array(), [-1.0, -4.0, 1.0, -6.0]);
+        assert_eq!(a.mul(b).to_array(), [2.0, -4.0, 6.0, -8.0]);
+        assert_eq!(a.fma(b, b).to_array(), [5.0, 2.0, 7.0, 0.0]);
+        assert_eq!(a.fms(b, b).to_array(), [-3.0, -6.0, -1.0, -8.0]);
+        assert_eq!(a.fma_lane::<1>(b, a).to_array(), [-3.0, -6.0, -1.0, -8.0]);
+        assert_eq!(a.horizontal_sum(), -2.0);
+        assert_eq!(ScalarBackend::crc32c_update(0, b"123456789"), 0xe306_9283);
+    }
+
+    proptest! {
+        #[test]
+        fn prop_scalar_vec4_abs_min_max_match_lanes(
+            v0 in -100.0_f32..100.0_f32,
+            v1 in -100.0_f32..100.0_f32,
+            v2 in -100.0_f32..100.0_f32,
+            v3 in -100.0_f32..100.0_f32,
+            bound in -50.0_f32..50.0_f32,
+        ) {
+            let v = ScalarVec4::from_array([v0, v1, v2, v3]);
+            let b = ScalarVec4::splat(bound);
+            prop_assert_eq!(v.abs().to_array(), [v0.abs(), v1.abs(), v2.abs(), v3.abs()]);
+            prop_assert_eq!(
+                v.min(b).to_array(),
+                [v0.min(bound), v1.min(bound), v2.min(bound), v3.min(bound)]
+            );
+            prop_assert_eq!(
+                v.max(b).to_array(),
+                [v0.max(bound), v1.max(bound), v2.max(bound), v3.max(bound)]
+            );
+            prop_assert!((v.horizontal_sum() - ((v0 + v1) + (v2 + v3))).abs() < 1e-4);
+        }
+    }
+}

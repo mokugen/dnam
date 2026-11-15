@@ -5,9 +5,6 @@ pub mod backends;
 pub mod bezout_gram;
 pub mod bezout_schur;
 pub mod stage_a;
-pub mod stage_a_ext;
-pub mod stage_a_id;
-pub mod stage_a_refl;
 pub mod stage_b_c;
 pub mod stage_d;
 pub mod stage_d_basis;
@@ -47,7 +44,9 @@ pub use stage_e::{
     render_blackbox_probe_response,
 };
 pub use v3_varpro::{
-    V3TrainDataset, V3TrainStem, fit_v3_core_four_tiers, fit_v3_core_four_tiers_with_backend,
+    V3TrainDataset, V3TrainStem, build_v3_causal_probe_excitation,
+    estimate_v3_causal_deadtime_and_polarity, fit_v3_core_four_tiers,
+    fit_v3_core_four_tiers_with_backend, fit_v3_matryoshka, fit_v3_matryoshka_with_backend,
 };
 pub use wide_gram::{Wide192Accum, accumulate_uplo_u_wide192, contract_256d_gram_tiled_wide192};
 

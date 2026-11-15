@@ -575,3 +575,66 @@ pub(crate) fn eval_tier_tank_head_contribution<B: crate::math::MathBackend>(
     }
     (tank_head_l, tank_head_r)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::math::ScalarBackend;
+
+    #[test]
+    fn test_feature_bus_backend_tiles_and_pack_branches() {
+        let mut a = [0.0_f32; 64];
+        let mut b = [0.0_f32; 64];
+        let mut c = [0.0_f32; 64];
+        for i in 0..64 {
+            a[i] = 0.5;
+            b[i] = 1.0;
+            c[i] = -1.0;
+        }
+        assert!((ScalarBackend::tile_dot64(&a, &b) - 32.0).abs() < 1e-4);
+        let [dl, dr] = ScalarBackend::tile_dot64_stereo(&a, &b, &c);
+        assert!((dl - 32.0).abs() < 1e-4);
+        assert!((dr + 32.0).abs() < 1e-4);
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            use crate::math::{ArmSmeBackend, NeonBackend};
+            assert!((NeonBackend::tile_dot64(&a, &b) - 32.0).abs() < 1e-4);
+            let [nl, nr] = NeonBackend::tile_dot64_stereo(&a, &b, &c);
+            assert!((nl - 32.0).abs() < 1e-4 && (nr + 32.0).abs() < 1e-4);
+            let svd = [0.25_f32; 64 * 4];
+            let mut out = [0.0_f32; 64];
+            NeonBackend::tile_collapse_svd_slice(&a, &svd, &[1.0, 0.5, 0.25, 0.1], 2, &mut out);
+            assert!((out[0] - (0.5 + 0.375)).abs() < 1e-4);
+
+            assert!((ArmSmeBackend::tile_dot64(&a, &b) - 32.0).abs() < 1e-4);
+            let [sl, sr] = ArmSmeBackend::tile_dot64_stereo(&a, &b, &c);
+            assert!((sl - 32.0).abs() < 1e-4 && (sr + 32.0).abs() < 1e-4);
+            let mut out_sme = [0.0_f32; 64];
+            ArmSmeBackend::tile_collapse_svd_slice(
+                &a,
+                &svd,
+                &[1.0, 0.5, 0.25, 0.1],
+                2,
+                &mut out_sme,
+            );
+            assert!((out_sme[0] - 0.875).abs() < 1e-4);
+        }
+
+        let svd = [0.25_f32; 64 * 4];
+        let mut out_s = [0.0_f32; 64];
+        ScalarBackend::tile_collapse_svd_slice(&a, &svd, &[1.0, 0.5, 0.25, 0.1], 2, &mut out_s);
+        assert!((out_s[0] - 0.875).abs() < 1e-4);
+
+        let stage1 = Stage1PreDynamics::default();
+        let mut fb = [0.0_f32; 256];
+        pack_tier_feature_bus_into(
+            &mut fb, &stage1, &[0.1; 4], &[0.2; 4], &[0.3; 4], 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7,
+            0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 4, true,
+        );
+        assert_eq!(&fb[4..12], &[0.0; 8]);
+        assert_eq!(&fb[144..150], &[0.0; 6]);
+        assert_eq!(fb[254], 0.1);
+        assert_eq!(fb[255], 0.2);
+    }
+}

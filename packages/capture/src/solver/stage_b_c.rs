@@ -139,10 +139,10 @@ fn is_limiting_saturator(manifest: &DnamProjManifest, arena_64k: &[u8]) -> bool 
     let linear_s2 = read_f32_le(arena_64k, ARENA0_STAGE2_EXT_OFFSET + 32) > 0.5;
     let gate_active = has_pipeline_flag(arena_64k, PIPE_FLAG_STAGE1_EXT)
         && read_f32_le(arena_64k, ARENA0_STAGE1_EXT_OFFSET + 36) > 1.0e-5;
-    let comp_ratio = super::stage_a_ext::star_meta_f64(manifest, "phys_comp_ratio", 1.0);
-    let odd_harm = super::stage_a_ext::star_meta_f64(manifest, "phys_odd_harm", 0.0);
-    let even_harm = super::stage_a_ext::star_meta_f64(manifest, "phys_even_harm", 0.0);
-    let tail_ratio = super::stage_a_ext::star_meta_f64(manifest, "phys_tail_energy_ratio", 0.0);
+    let comp_ratio = super::stage_a::ext::star_meta_f64(manifest, "phys_comp_ratio", 1.0);
+    let odd_harm = super::stage_a::ext::star_meta_f64(manifest, "phys_odd_harm", 0.0);
+    let even_harm = super::stage_a::ext::star_meta_f64(manifest, "phys_even_harm", 0.0);
+    let tail_ratio = super::stage_a::ext::star_meta_f64(manifest, "phys_tail_energy_ratio", 0.0);
     !linear_s2
         && clean_bypass < 0.08
         && tail_ratio < 0.08

@@ -554,3 +554,90 @@ impl<B: MathBackend> Default for ControlBus<B> {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::FtzDazGuard;
+    use crate::control::ConditionalClampRule;
+    use crate::math::{DefaultMathBackend, ScalarBackend};
+    use alloc::vec;
+
+    #[test]
+    fn test_control_bus_tick_lfo_fallback_and_micro_ramps() {
+        let _ftz = FtzDazGuard::new();
+        let mut arena = vec![0u8; 64_000];
+        for off in (7_552..8_512).step_by(4) {
+            arena[off..off + 4].copy_from_slice(&0.15_f32.to_le_bytes());
+        }
+
+        let mut bus = ControlBus::<ScalarBackend>::default();
+        let rec = ControlChannelRecord::default();
+        bus.load_control_records(&[rec, rec]);
+        let mut rec_bytes = [0u8; 256];
+        let raw64 = [
+            0u8, 2, 0, 0, // ctrl_kind, lobatto_degree, active_options_mask
+            0, 0, 0, 0, // default_val
+            0, 0, 0, 0, // safe_min
+            0, 0, 0x80, 0x3F, // safe_max = 1.0
+            0, 0, 0, 0x40, // scale_norm = 2.0
+            0, 0, 0x80, 0xBF, // offset_norm = -1.0
+        ];
+        rec_bytes[0..24].copy_from_slice(&raw64);
+        bus.load_control_records_from_bytes(&rec_bytes, 1);
+
+        let slot0 = Cp1ContributorSlot {
+            lanes: 1,
+            ctrl_kind: 0,
+            control_idx: 0,
+            option_idx: 0xFF,
+            partner_control_id: 0,
+            main_base: [[0.2; 8]; 3],
+            emb: [0.5, 0.0, 0.0],
+            v_base: [0.15; 4],
+            main_ultra: [[0.08; 8]; 3],
+            v_ultra: [0.05; 4],
+            has_ultra: true,
+        };
+        bus.load_cp1_contributors(&[slot0]);
+        bus.descriptors[0] = ControlClampDescriptor {
+            ctrl_kind: 0,
+            lobatto_degree: 2,
+            active_options_mask: 0,
+            default_val: 0.5,
+            safe_min_base: 0.0,
+            safe_max_base: 1.0,
+            scale_norm: 2.0,
+            offset_norm: -1.0,
+            anchor_nodes_norm: [0.0, -1.0, 1.0],
+            _reserved: 0,
+            cond_rules: [ConditionalClampRule::empty(); 3],
+        };
+        bus.num_controls = 1;
+        bus.set_control_value(0, 0.8);
+
+        bus.lfo_angle_bits = [0, 0x7000_0000];
+        let _ = bus.tick_3khz_with_detectors(0.3, None, &arena);
+        let _ = bus.tick_3khz_with_detectors(0.3, Some([0.2, 0.1, 0.05, 0.02]), &arena);
+        for _ in 0..8 {
+            let _ = bus.tick_3khz(0.15, &arena);
+        }
+
+        let telem = bus.telemetry_clamped_controls();
+        assert!(telem[0].is_finite());
+        bus.reset_dynamic_state();
+        bus.reset_to_defaults();
+
+        let q16 = ControlBus::<DefaultMathBackend>::assemble_q16(&[0.1; 8], &[0.2; 8]);
+        let d16 = ControlBus::<DefaultMathBackend>::compute_micro_ramp_deltas_16(&q16, &[0.3; 16]);
+        let d12 =
+            ControlBus::<DefaultMathBackend>::compute_micro_ramp_deltas_12(&q16, &[0.3; 16], 0.25);
+        let mut theta_audio = q16;
+        ControlBus::<DefaultMathBackend>::step_micro_ramp(&mut theta_audio, &d16);
+        ControlBus::<DefaultMathBackend>::step_micro_ramp_12(&mut theta_audio, &d12);
+        ControlBus::<DefaultMathBackend>::step_micro_ramp_16(&mut theta_audio, &d16);
+        let mut vec4 = [3.0_f32, 4.0, 0.0, 0.0];
+        trust_clip_outward_4d(&mut vec4, 2.0);
+        assert!(vec4[0].is_finite());
+    }
+}

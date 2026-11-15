@@ -1,773 +1,776 @@
 #![forbid(unsafe_code)]
-//! Exact `f64` mirror and reverse-mode adjoint gradient evaluator for `V3OptModelF64`
-//! minimizing the exact degree-7 Binomial/Bézout 3-band `bESR` objective.
+//! Single-Forward / Single-Reverse 4-Tier Matryoshka Loss & Exact BPTT Adjoint (`v3` Core).
+//!
+//! Projects shared core trajectories to active nested readouts (`Lite..Ultra`), accumulates
+//! Bézout-3 + Gabor-33 + Welch-33 LTAS gradients, and runs one exact reverse sweep.
 
-use std::f64::consts::PI;
-
+use dnam_engine::Tier;
 use dnam_engine::stages::v3_core::cascade::{
-    MAX_CASCADE_LANES, MAX_KAUTZ_POLES, NUM_CASCADE_BLOCKS, tier_cascade_lanes, tier_fir_segments,
-    tier_kautz_banks,
+    MAX_BLOCK_LANES, MAX_KAUTZ_POLES, MAX_TOTAL_GRU_LANES, NUM_GRU_BLOCKS, tier_block_lanes,
+    tier_fir_segments, tier_groups, tier_kautz_banks,
 };
 
 use crate::solver::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
 
-use super::gabor::GaborAdjointScratch;
-use super::model_f64::{HB_A0, HB_A1, V3OptModelF64, V3TrainDataset};
-use super::primitives::{
-    BlockSubTape, SvfChanTape, ap2_fwd, ap2_rev, exp2_oct_with_deriv, step_tpt_fwd, step_tpt_rev,
-};
+mod backward;
+use super::gabor::eval_gabor_loss_and_adjoint_with_backend;
+pub use super::gru_core::AdjointWorkspace;
+use super::gru_core::forward_shared_core;
+use super::ltas_adj::eval_welch33_ltas_loss_and_adjoint;
+use super::model_f64::{V3MatryoshkaOptF64, V3TierReadoutF64, V3TrainDataset};
+use super::primitives::{ClampedCoreParams, downsample_2x_fwd, par_map_indexed};
+use backward::{backward_shared_core, backward_tier_readout};
 
-/// Forward/backward workspace reused across L-BFGS iterations.
-#[derive(Clone, Debug, Default)]
-pub struct AdjointWorkspace {
-    svf_tape: Vec<[SvfChanTape; 2]>,
-    s2_sub_tapes: [Vec<[BlockSubTape; NUM_CASCADE_BLOCKS]>; 2],
-    u_s2: [Vec<f64>; 2],
-    s2_out: [Vec<f64>; 2],
-    dir_s2: [Vec<f64>; 2],
-    pub(crate) y_out: [Vec<f64>; 2],
-    kautz_re: [Vec<f64>; 2],
-    kautz_im: [Vec<f64>; 2],
-    err_buf: Vec<f64>,
-    err_bands: [Vec<f64>; 3],
-    d_bands: [Vec<f64>; 3],
-    adj_dy_scratch: [Vec<f64>; 2],
-    dy_c: [Vec<f64>; 2],
-    ds2_out: [Vec<f64>; 2],
-    du_s2: [Vec<f64>; 2],
-    gabor_scratch: GaborAdjointScratch,
-}
-
-impl AdjointWorkspace {
-    fn ensure_len(&mut self, n: usize, k_cnt: usize, os2x: bool) {
-        let sub_n = if os2x { n * 2 } else { n };
-        self.svf_tape.resize(n, [SvfChanTape::default(); 2]);
-        for ch in 0..2 {
-            self.s2_sub_tapes[ch].resize(sub_n, [BlockSubTape::default(); NUM_CASCADE_BLOCKS]);
-            self.u_s2[ch].resize(n, 0.0);
-            self.s2_out[ch].resize(n, 0.0);
-            self.dir_s2[ch].resize(n, 0.0);
-            self.y_out[ch].resize(n, 0.0);
-            self.kautz_re[ch].resize(n * k_cnt, 0.0);
-            self.kautz_im[ch].resize(n * k_cnt, 0.0);
-            self.dy_c[ch].resize(n, 0.0);
-            self.ds2_out[ch].resize(n, 0.0);
-            self.du_s2[ch].resize(n, 0.0);
-        }
-        self.err_buf.resize(n, 0.0);
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
-fn cl_mask(v: f64, lo: f64, hi: f64) -> (f64, f64) {
-    (v.clamp(lo, hi), if v > lo && v < hi { 1.0 } else { 0.0 })
-}
-
-/// Evaluates the exact Bézout 3-band `bESR` objective on `dataset` in `f64` using backend `B`.
-pub fn evaluate_loss_f64_with_backend<B: TrainerBackend>(
-    model: &V3OptModelF64,
-    dataset: &V3TrainDataset,
-    ws: &mut AdjointWorkspace,
-) -> f64 {
-    let mut grad = V3OptModelF64::zeros(model.tier, model.os2x, model.mono_out);
-    evaluate_internal::<B>(model, dataset, ws, false, &mut grad)
-}
-
-/// Evaluates the exact Bézout 3-band `bESR` objective on `dataset` in `f64` (no gradient).
-pub fn evaluate_loss_f64(
-    model: &V3OptModelF64,
-    dataset: &V3TrainDataset,
-    ws: &mut AdjointWorkspace,
-) -> f64 {
-    struct LossTask<'a> {
-        model: &'a V3OptModelF64,
-        dataset: &'a V3TrainDataset,
-        ws: &'a mut AdjointWorkspace,
+fn project_substep(
+    r: &V3TierReadoutF64,
+    dir_t: &[f64; 7],
+    ch: usize,
+    c_t: usize,
+    taps: &[f64; 7],
+    u: f64,
+    hp: f64,
+    h: &[f64; MAX_TOTAL_GRU_LANES],
+) -> (f64, f64) {
+    let mut s2v = r.pre_cab_u_gain[ch] * u + r.pre_cab_hp_gain[ch] * hp;
+    let mut dirv = r.direct_s2_u_gain[ch] * u + r.direct_s2_hp_gain[ch] * hp;
+    for i in 0..7 {
+        dirv += dir_t[i] * taps[i];
     }
-    impl TrainerTask<f64> for LossTask<'_> {
-        fn run<B: TrainerBackend>(self) -> f64 {
-            evaluate_loss_f64_with_backend::<B>(self.model, self.dataset, self.ws)
+    for b in 0..NUM_GRU_BLOCKS {
+        let base = b * MAX_BLOCK_LANES;
+        for idx in base..base + c_t {
+            s2v += r.pre_cab_w[ch][idx] * h[idx];
+            dirv += r.direct_s2_w[ch][idx] * h[idx];
         }
     }
-    DynamicTrainer::detect().dispatch(LossTask { model, dataset, ws })
+    (s2v, dirv)
 }
 
-/// Evaluates the exact Bézout 3-band `bESR` objective AND exact reverse-mode gradient in `f64` via `B`.
-pub fn evaluate_loss_and_grad_f64_with_backend<B: TrainerBackend>(
-    model: &V3OptModelF64,
+#[allow(clippy::too_many_arguments)]
+fn eval_single_stem_loss_and_grad<B: TrainerBackend>(
+    model: &V3MatryoshkaOptF64,
+    cp: &ClampedCoreParams,
     dataset: &V3TrainDataset,
+    st_idx: usize,
+    tiers_needed: &[usize; 4],
+    c_blk: usize,
+    active_ch: usize,
+    ch_scale: f64,
+    sub_steps: usize,
     ws: &mut AdjointWorkspace,
-) -> (f64, V3OptModelF64) {
-    let mut grad = V3OptModelF64::zeros(model.tier, model.os2x, model.mono_out);
-    let loss = evaluate_internal::<B>(model, dataset, ws, true, &mut grad);
-    (loss, grad)
-}
-
-/// Evaluates the exact Bézout 3-band `bESR` objective AND exact reverse-mode gradient in `f64`.
-pub fn evaluate_loss_and_grad_f64(
-    model: &V3OptModelF64,
-    dataset: &V3TrainDataset,
-    ws: &mut AdjointWorkspace,
-) -> (f64, V3OptModelF64) {
-    struct LossGradTask<'a> {
-        model: &'a V3OptModelF64,
-        dataset: &'a V3TrainDataset,
-        ws: &'a mut AdjointWorkspace,
+    mut grad: Option<&mut V3MatryoshkaOptF64>,
+) -> f64 {
+    const ALL_TIERS: [Tier; 4] = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra];
+    let stem = &dataset.stems[st_idx];
+    let n = stem.usable_len();
+    if n == 0 {
+        return 0.0;
     }
-    impl TrainerTask<(f64, V3OptModelF64)> for LossGradTask<'_> {
-        fn run<B: TrainerBackend>(self) -> (f64, V3OptModelF64) {
-            evaluate_loss_and_grad_f64_with_backend::<B>(self.model, self.dataset, self.ws)
+    let need_grad = grad.is_some();
+    let total_sub = n * sub_steps;
+    let (w, sw) = (stem.warmup.min(n), dataset.stem_weights[st_idx]);
+    ws.ensure_capacity(n, sub_steps, tiers_needed, need_grad, false);
+    forward_shared_core(
+        model,
+        cp,
+        &stem.in_l[..n],
+        &stem.in_r[..n],
+        n,
+        c_blk,
+        active_ch,
+        need_grad,
+        false,
+        ws,
+    );
+    if need_grad {
+        for ch in 0..active_ch {
+            ws.d_sub_taps[ch][..total_sub].fill([0.0; 7]);
+            ws.d_sub_u[ch][..total_sub].fill(0.0);
+            ws.d_sub_hp[ch][..total_sub].fill(0.0);
+            if c_blk == MAX_BLOCK_LANES {
+                ws.d_sub_h[ch][..total_sub].fill([0.0; MAX_TOTAL_GRU_LANES]);
+            } else {
+                for row in &mut ws.d_sub_h[ch][..total_sub] {
+                    for b in 0..NUM_GRU_BLOCKS {
+                        let base = b * MAX_BLOCK_LANES;
+                        row[base..base + c_blk].fill(0.0);
+                    }
+                }
+            }
         }
     }
-    DynamicTrainer::detect().dispatch(LossGradTask { model, dataset, ws })
-}
 
-#[allow(clippy::too_many_lines)]
-fn evaluate_internal<B: TrainerBackend>(
-    model: &V3OptModelF64,
-    dataset: &V3TrainDataset,
-    ws: &mut AdjointWorkspace,
-    compute_grad: bool,
-    grad: &mut V3OptModelF64,
-) -> f64 {
-    let c_cnt = tier_cascade_lanes(model.tier);
-    let f_cnt = tier_fir_segments(model.tier) * 16;
-    let k_cnt = tier_kautz_banks(model.tier) * 4;
-    let active_ch = if model.mono_out { 1 } else { 2 };
-
-    let (base_g, base_g_m) = cl_mask(model.svf_base_g, 1.0e-4, 1.45);
-    let (sec2_ratio, sec2_ratio_m) = cl_mask(model.svf_sec2_g_ratio, 0.25, 4.0);
-    let (env_oct, env_oct_m) = cl_mask(model.svf_env_oct_sens, -16.0, 16.0);
-    let (env_comp, env_comp_m) = cl_mask(model.svf_env_comp, 0.0, 16.0);
-    let (atk, atk_m) = cl_mask(model.svf_atk_alpha, 0.001, 0.9999);
-    let (rel, rel_m) = cl_mask(model.svf_rel_alpha, 0.001, 0.99995);
-    let (det_lp, det_lp_m) = cl_mask(model.svf_det_lp_pole, 0.05, 0.995);
-    let (det_hp_mix, det_hp_m) = cl_mask(model.svf_det_hp_mix, -1.0, 2.0);
-    let (damp_k1, damp_k1_m) = cl_mask(model.svf_damp_k1, 0.05, 4.0);
-    let (damp_k2, damp_k2_m) = cl_mask(model.svf_damp_k2, 0.05, 4.0);
-    let (sec2_bp, sec2_bp_m) = cl_mask(model.svf_sec2_bp_feed, -2.0, 2.0);
-    let (sec2_hp, sec2_hp_m) = cl_mask(model.svf_sec2_hp_feed, -2.0, 2.0);
-    let (link, link_m) = cl_mask(model.svf_stereo_link, 0.0, 1.0);
-    let (g_min, g_min_m) = cl_mask(model.svf_g_min, 1.0e-4, 1.45);
-    let (g_max, g_max_m) = if model.svf_g_max < g_min {
-        (g_min, 0.0)
-    } else if model.svf_g_max > 1.45 {
-        (1.45, 0.0)
-    } else {
-        (model.svf_g_max, 1.0)
-    };
-    let mut k_poles = [(0.0, 0.0, 0.0, 0.0, 0.0, 0.0); MAX_KAUTZ_POLES];
-    for m in 0..k_cnt {
-        let (r, r_m) = cl_mask(model.kautz_poles[m].0, 0.50, 0.997);
-        let (th, t_m) = cl_mask(model.kautz_poles[m].1, 1.0e-3, PI - 1.0e-3);
-        let bg = (1.0 - r * r).max(1.0e-7).sqrt();
-        let (sin_t, cos_t) = th.sin_cos();
-        k_poles[m] = (r, bg, cos_t, sin_t, r_m, t_m);
-    }
-
-    let mut total_loss = 0.0_f64;
-
-    for (stem_idx, stem) in dataset.stems.iter().enumerate() {
-        let n = stem
-            .in_l
-            .len()
-            .min(stem.in_r.len())
-            .min(stem.tgt_l.len())
-            .min(stem.tgt_r.len());
-        if n == 0 {
+    let mut stem_loss = 0.0_f64;
+    let (mut sc_re, mut sc_im) = ([0.0_f64; MAX_KAUTZ_POLES], [0.0_f64; MAX_KAUTZ_POLES]);
+    for (tau, &tier) in ALL_TIERS.iter().enumerate() {
+        let wt = model.active_tier_weights[tau];
+        if tiers_needed[tau] == 0 || wt <= 0.0 {
             continue;
         }
-        let warmup = stem.warmup.min(n);
-        ws.ensure_len(n, k_cnt, model.os2x);
+        let (c_t, f_t, k_t) = (
+            tier_block_lanes(tier),
+            tier_fir_segments(tier) * 16,
+            tiers_needed[tau],
+        );
+        let r = &model.readouts[tau];
 
-        // --- Stage I Forward ---
-        let (mut det_lp_s, mut env_s) = ([0.0_f64; 2], [0.0_f64; 2]);
-        let (mut ic1_s1, mut ic2_s1, mut ic1_s2, mut ic2_s2) =
-            ([0.0_f64; 2], [0.0_f64; 2], [0.0_f64; 2], [0.0_f64; 2]);
-        for t in 0..n {
-            let xl = stem.in_l[t] as f64;
-            let xr = if model.mono_out {
-                xl
-            } else {
-                stem.in_r[t] as f64
-            };
-            let xs = [xl, xr];
-            let mut det_raw = [0.0_f64; 2];
-            for ch in 0..2 {
-                let prev_lp = det_lp_s[ch];
-                let lp = det_lp * prev_lp + (1.0 - det_lp) * xs[ch];
-                det_lp_s[ch] = lp;
-                let v_det = xs[ch] + det_hp_mix * (xs[ch] - lp);
-                det_raw[ch] = v_det.abs();
-                let tp = &mut ws.svf_tape[t][ch];
-                tp.det_lp_prev = prev_lp;
-                tp.det_lp = lp;
-                tp.v_det_hp = v_det;
-                tp.det_raw_sign = if v_det > 0.0 {
-                    1.0
-                } else if v_det < 0.0 {
-                    -1.0
-                } else {
-                    0.0
-                };
-            }
-            let half_link = 0.5 * link;
-            let diff = det_raw[1] - det_raw[0];
-            let det = [det_raw[0] + half_link * diff, det_raw[1] - half_link * diff];
-            for ch in 0..active_ch {
-                let env_prev = env_s[ch];
-                let atk_taken = det[ch] > env_prev;
-                let alpha = if atk_taken { atk } else { rel };
-                let env_now = alpha * env_prev + (1.0 - alpha) * det[ch];
-                env_s[ch] = env_now;
-                let rsq = 1.0 / (1.0 + env_comp * env_now * env_now).sqrt();
-                let e = env_now * rsq;
-                let (oct_pow, _) = exp2_oct_with_deriv(env_oct * e);
-                let g1_unclamped = base_g * oct_pow;
-                let g1 = g1_unclamped.clamp(g_min, g_max);
-                let g2 = (g1 * sec2_ratio).clamp(1.0e-4, 1.45);
-                let (lp1, bp1, hp1, c1_1, a1_1, a2_1, a3_1, v3_1) =
-                    step_tpt_fwd(xs[ch], g1, damp_k1, &mut ic1_s1[ch], &mut ic2_s1[ch]);
-                let u2 = lp1 + sec2_bp * bp1 + sec2_hp * hp1;
-                let (lp2, bp2, hp2, c1_2, a1_2, a2_2, a3_2, v3_2) =
-                    step_tpt_fwd(u2, g2, damp_k2, &mut ic1_s2[ch], &mut ic2_s2[ch]);
-                let taps = [xs[ch], lp1, bp1, hp1, lp2, bp2, hp2];
-                ws.u_s2[ch][t] = taps
-                    .iter()
-                    .zip(&model.svf_stage2_feed_taps)
-                    .map(|(a, b)| a * b)
-                    .sum();
-                ws.svf_tape[t][ch] = SvfChanTape {
-                    env_prev,
-                    atk_taken,
-                    e,
-                    rsq3: rsq * rsq * rsq,
-                    g1_unclamped,
-                    g1,
-                    g2,
-                    s1_c1: c1_1,
-                    s1_v1: bp1,
-                    s1_a1: a1_1,
-                    s1_a2: a2_1,
-                    s1_a3: a3_1,
-                    s1_v3: v3_1,
-                    s2_c1: c1_2,
-                    s2_v1: bp2,
-                    s2_a1: a1_2,
-                    s2_a2: a2_2,
-                    s2_a3: a3_2,
-                    s2_v3: v3_2,
-                    taps,
-                    ..ws.svf_tape[t][ch]
-                };
-            }
-        }
-
-        // --- Stage II + III Forward ---
         for ch in 0..active_ch {
-            let mut lp_s = [[0.0_f64; MAX_CASCADE_LANES]; NUM_CASCADE_BLOCKS];
-            let mut env_q = [0.0_f64; NUM_CASCADE_BLOCKS];
-            let (mut up0, mut up1, mut dn_s0, mut dn_s1, mut dn_d0, mut dn_d1) =
-                ([0.0; 2], [0.0; 2], [0.0; 2], [0.0; 2], [0.0; 2], [0.0; 2]);
-            let sub_steps = if model.os2x { 2 } else { 1 };
-            for t in 0..n {
-                let u_in = ws.u_s2[ch][t];
-                let us = if model.os2x {
-                    [
-                        ap2_fwd(u_in, HB_A0, &mut up0),
-                        ap2_fwd(u_in, HB_A1, &mut up1),
-                    ]
-                } else {
-                    [u_in, 0.0]
-                };
-                let (mut s2_p, mut d_p) = ([0.0_f64; 2], [0.0_f64; 2]);
-                for sub in 0..sub_steps {
-                    let sub_t = if model.os2x { t * 2 + sub } else { t };
-                    let mut h_buf = [0.0_f64; MAX_CASCADE_LANES];
-                    for b in 0..NUM_CASCADE_BLOCKS {
-                        let blk = &model.blocks[b];
-                        let (ba, br) = (
-                            blk.atk_alpha.clamp(0.001, 0.9999),
-                            blk.rel_alpha.clamp(0.001, 0.99995),
-                        );
-                        let (gm, gs) = (
-                            blk.gate_mix.clamp(0.0, 1.0),
-                            blk.gate_sharpness.clamp(0.0, 1.0e4),
-                        );
-                        let h_prev = h_buf;
-                        let tp = &mut ws.s2_sub_tapes[ch][sub_t][b];
-                        tp.u_s2 = us[sub];
-                        let mut abs_sum = 0.0_f64;
-                        for l in 0..c_cnt {
-                            let mut v = blk.in_u_gain[l] * us[sub];
-                            if b > 0 {
-                                for s in 0..c_cnt {
-                                    v += blk.inter_mat[l][s] * h_prev[s];
-                                }
-                            }
-                            let a = blk.lp_pole[l].clamp(0.02, 0.9985);
-                            let sp = lp_s[b][l];
-                            let sn = a * sp + (1.0 - a) * v;
-                            lp_s[b][l] = sn;
-                            let up = blk.lp_mix[l] * sn + blk.hp_mix[l] * (v - sn);
-                            tp.lp_prev[l] = sp;
-                            tp.lp_next[l] = sn;
-                            tp.v[l] = v;
-                            tp.up[l] = up;
-                            tp.up_sign[l] = if up > 0.0 {
-                                1.0
-                            } else if up < 0.0 {
-                                -1.0
-                            } else {
-                                0.0
-                            };
-                            abs_sum += up.abs();
-                        }
-                        let det = 0.25 * abs_sum;
-                        let q_prev = env_q[b];
-                        let atk_taken = det > q_prev;
-                        let q = if atk_taken {
-                            ba * q_prev + (1.0 - ba) * det
-                        } else {
-                            br * q_prev + (1.0 - br) * det
-                        };
-                        env_q[b] = q;
-                        let (gg, ginv) = if gm > 0.0 {
-                            let inv = 1.0 / (1.0 + gs * q * q);
-                            ((1.0 - gm) + gm * (1.0 - inv), inv)
-                        } else {
-                            (1.0, 1.0)
-                        };
-                        tp.env_q_prev = q_prev;
-                        tp.atk_taken = atk_taken;
-                        tp.q = q;
-                        tp.g_gate = gg;
-                        tp.gate_inv = ginv;
-                        for l in 0..c_cnt {
-                            let sb = blk.static_bias[l].clamp(-4.0, 4.0);
-                            let es = blk.env_bias_sens[l].clamp(-4.0, 4.0);
-                            let z = tp.up[l] * gg + sb + es * q;
-                            let zc = z.clamp(-64.0, 64.0);
-                            let rz = 1.0 / (1.0 + zc * zc).sqrt();
-                            let r0 = 1.0 / (1.0 + sb * sb).sqrt();
-                            tp.dphi_dzc[l] = if z > -64.0 && z < 64.0 {
-                                rz * rz * rz
-                            } else {
-                                0.0
-                            };
-                            tp.dphi0_db0[l] = r0 * r0 * r0;
-                            let mut hn = (zc * rz - sb * r0) + blk.skip_u_gain[l] * tp.up[l];
-                            if b > 0 {
-                                hn += blk.prev_skip_gain[l] * h_prev[l];
-                            }
-                            tp.h_next[l] = hn;
-                            h_buf[l] = hn;
-                        }
-                    }
-                    let cab_dot: f64 = (0..c_cnt).map(|l| model.pre_cab_w[ch][l] * h_buf[l]).sum();
-                    let dir_dot: f64 = (0..c_cnt)
-                        .map(|l| model.direct_s2_w[ch][l] * h_buf[l])
-                        .sum();
-                    s2_p[sub] = model.pre_cab_u_gain[ch] * us[sub] + cab_dot;
-                    d_p[sub] = dir_dot;
-                }
-                if !model.os2x {
-                    ws.s2_out[ch][t] = s2_p[0];
-                    ws.dir_s2[ch][t] = d_p[0];
-                } else {
-                    ws.s2_out[ch][t] = 0.5
-                        * (ap2_fwd(s2_p[1], HB_A0, &mut dn_s0)
-                            + ap2_fwd(s2_p[0], HB_A1, &mut dn_s1));
-                    ws.dir_s2[ch][t] = 0.5
-                        * (ap2_fwd(d_p[1], HB_A0, &mut dn_d0) + ap2_fwd(d_p[0], HB_A1, &mut dn_d1));
-                }
-            }
-
-            let fir = if ch == 0 { &model.fir_l } else { &model.fir_r };
-            let kc = if ch == 0 {
-                &model.kautz_c_l
+            let (mut s_re, mut s_im) = ([0.0_f64; MAX_KAUTZ_POLES], [0.0_f64; MAX_KAUTZ_POLES]);
+            let (mut dec_s2_p, mut dec_dir_p) = (0.0_f64, 0.0_f64);
+            let (mut dec_s2_aa, mut dec_dir_aa) = ([0.0_f64; 4], [0.0_f64; 4]);
+            let dir_t = if ch == 0 {
+                &r.svf_direct_taps_l
             } else {
-                &model.kautz_c_r
+                &r.svf_direct_taps_r
             };
-            let dir_taps = if ch == 0 {
-                &model.svf_direct_taps_l
-            } else {
-                &model.svf_direct_taps_r
-            };
-            let (mut s_re, mut s_im) = (vec![0.0_f64; k_cnt], vec![0.0_f64; k_cnt]);
+            let fir = if ch == 0 { &r.fir_l } else { &r.fir_r };
+            let kc = if ch == 0 { &r.kautz_c_l } else { &r.kautz_c_r };
             for t in 0..n {
-                let fir_v: f64 = (0..f_cnt.min(t + 1))
-                    .map(|k| fir[k] * ws.s2_out[ch][t - k])
-                    .sum();
-                let x_del = if t >= 16 { ws.s2_out[ch][t - 16] } else { 0.0 };
-                let row_off = t * k_cnt;
-                let kv = B::step_kautz_forward_frame(
-                    x_del,
-                    &k_poles[..k_cnt],
-                    &kc[..k_cnt],
-                    &mut s_re,
-                    &mut s_im,
-                    &mut ws.kautz_re[ch][row_off..row_off + k_cnt],
-                    &mut ws.kautz_im[ch][row_off..row_off + k_cnt],
-                );
-                let dir_svf: f64 = ws.svf_tape[t][ch]
-                    .taps
-                    .iter()
-                    .zip(dir_taps)
-                    .map(|(a, b)| a * b)
-                    .sum();
-                ws.y_out[ch][t] = dir_svf + ws.dir_s2[ch][t] + fir_v + kv;
-            }
-
-            // Unmasked error -> Degree-7 Bézout 3-band split across all 0..n -> accumulate warmup..n
-            let tgt = if ch == 0 { &stem.tgt_l } else { &stem.tgt_r };
-            let ch_scale = if model.mono_out { 1.0 } else { 0.5 };
-            for t in 0..n {
-                ws.err_buf[t] = ws.y_out[ch][t] - (tgt[t] as f64);
-            }
-            dataset
-                .bank
-                .split_3band(&ws.err_buf[..n], &mut ws.err_bands);
-            let bw = dataset.stem_band_weights[stem_idx][ch];
-            for b in 0..3 {
-                let eb = B::sum_sq_f64(&ws.err_bands[b][warmup..n]);
-                total_loss += ch_scale * bw[b] * eb;
-            }
-
-            if compute_grad {
-                for b in 0..3 {
-                    ws.d_bands[b].resize(n, 0.0);
-                    let w = 2.0 * ch_scale * bw[b];
-                    for t in 0..warmup {
-                        ws.d_bands[b][t] = 0.0;
-                    }
-                    for t in warmup..n {
-                        ws.d_bands[b][t] = w * ws.err_bands[b][t];
-                    }
-                }
-                ws.dy_c[ch].fill(0.0);
-                dataset.bank.accumulate_adjoint(
-                    &ws.d_bands,
-                    &mut ws.dy_c[ch][..n],
-                    &mut ws.adj_dy_scratch,
-                );
-                if dataset.gabor_env_weight > 0.0 || dataset.gabor_ltas_weight > 0.0 {
-                    total_loss += dataset.eval_gabor_loss_and_adjoint_with_backend::<B>(
-                        stem_idx,
+                let dirv = if !model.os2x {
+                    let (s2v, dv) = project_substep(
+                        r,
+                        dir_t,
                         ch,
-                        ch_scale,
-                        &ws.y_out[ch][..n],
-                        Some(&mut ws.dy_c[ch][..n]),
-                        &mut ws.gabor_scratch,
+                        c_t,
+                        &ws.sub_taps[ch][t],
+                        ws.sub_u[ch][t],
+                        ws.sub_hp[ch][t],
+                        &ws.sub_h[ch][t],
                     );
-                }
-            } else if dataset.gabor_env_weight > 0.0 || dataset.gabor_ltas_weight > 0.0 {
-                total_loss += dataset.eval_gabor_loss_and_adjoint_with_backend::<B>(
-                    stem_idx,
-                    ch,
-                    ch_scale,
-                    &ws.y_out[ch][..n],
-                    None,
-                    &mut ws.gabor_scratch,
-                );
-            }
-        }
-
-        if !compute_grad {
-            continue;
-        }
-
-        // --- Stage III Backward + Stage I Direct Taps ---
-        for ch in 0..active_ch {
-            ws.ds2_out[ch].fill(0.0);
-            let fir = if ch == 0 { &model.fir_l } else { &model.fir_r };
-            let kc = if ch == 0 {
-                &model.kautz_c_l
-            } else {
-                &model.kautz_c_r
-            };
-            let (mut ds_re, mut ds_im) = (vec![0.0_f64; k_cnt], vec![0.0_f64; k_cnt]);
-            for t in (0..n).rev() {
-                let dy = ws.dy_c[ch][t];
-                let d_dir_t = if ch == 0 {
-                    &mut grad.svf_direct_taps_l
+                    ws.s2_tier[ch][t] = s2v;
+                    dv
                 } else {
-                    &mut grad.svf_direct_taps_r
+                    let (s0, s1) = (t * 2, t * 2 + 1);
+                    let (s2_0, d_0) = project_substep(
+                        r,
+                        dir_t,
+                        ch,
+                        c_t,
+                        &ws.sub_taps[ch][s0],
+                        ws.sub_u[ch][s0],
+                        ws.sub_hp[ch][s0],
+                        &ws.sub_h[ch][s0],
+                    );
+                    let (s2_1, d_1) = project_substep(
+                        r,
+                        dir_t,
+                        ch,
+                        c_t,
+                        &ws.sub_taps[ch][s1],
+                        ws.sub_u[ch][s1],
+                        ws.sub_hp[ch][s1],
+                        &ws.sub_h[ch][s1],
+                    );
+                    if need_grad {
+                        ws.s2_sub_tier[ch][s0] = s2_0;
+                        ws.s2_sub_tier[ch][s1] = s2_1;
+                        ws.dir_sub_tier[ch][s0] = d_0;
+                        ws.dir_sub_tier[ch][s1] = d_1;
+                    }
+                    let (s2v, _, s2_diff) = downsample_2x_fwd(
+                        s2_0,
+                        s2_1,
+                        &mut dec_s2_p,
+                        &mut dec_s2_aa,
+                        cp.dec_c_prev1.0,
+                        cp.dec_c0.0,
+                        cp.dec_aa_mix.0,
+                        need_grad,
+                    );
+                    let (dv, _, d_diff) = downsample_2x_fwd(
+                        d_0,
+                        d_1,
+                        &mut dec_dir_p,
+                        &mut dec_dir_aa,
+                        cp.dec_c_prev1.0,
+                        cp.dec_c0.0,
+                        cp.dec_aa_mix.0,
+                        need_grad,
+                    );
+                    ws.s2_tier[ch][t] = s2v;
+                    if need_grad {
+                        ws.s2_aa_diff[ch][t] = s2_diff;
+                        ws.dir_aa_diff[ch][t] = d_diff;
+                    }
+                    dv
                 };
-                for i in 0..7 {
-                    d_dir_t[i] += ws.svf_tape[t][ch].taps[i] * dy;
+                let mut fv = 0.0_f64;
+                for k in 0..f_t.min(t + 1) {
+                    fv += fir[k] * ws.s2_tier[ch][t - k];
                 }
-                let d_fir = if ch == 0 {
-                    &mut grad.fir_l
-                } else {
-                    &mut grad.fir_r
-                };
-                for k in 0..f_cnt.min(t + 1) {
-                    d_fir[k] += ws.s2_out[ch][t - k] * dy;
-                    ws.ds2_out[ch][t - k] += fir[k] * dy;
-                }
-                let x_del = if t >= 16 { ws.s2_out[ch][t - 16] } else { 0.0 };
-                let (d_kc, d_kp) = if ch == 0 {
-                    (&mut grad.kautz_c_l[..k_cnt], &mut grad.kautz_poles[..k_cnt])
-                } else {
-                    (&mut grad.kautz_c_r[..k_cnt], &mut grad.kautz_poles[..k_cnt])
-                };
-                let row_off = t * k_cnt;
-                let (prev_re, prev_im) = if t > 0 {
-                    let prev_off = (t - 1) * k_cnt;
+                let x_del = if t >= 16 { ws.s2_tier[ch][t - 16] } else { 0.0 };
+                let (ore, oim) = if need_grad {
+                    let off = t * k_t;
                     (
-                        Some(&ws.kautz_re[ch][prev_off..prev_off + k_cnt]),
-                        Some(&ws.kautz_im[ch][prev_off..prev_off + k_cnt]),
+                        &mut ws.kautz_re[tau][ch][off..off + k_t],
+                        &mut ws.kautz_im[tau][ch][off..off + k_t],
                     )
                 } else {
-                    (None, None)
+                    (&mut sc_re[..k_t], &mut sc_im[..k_t])
                 };
-                let dx_del = B::step_kautz_backward_frame(
-                    dy,
+                let kv = B::step_kautz_forward_frame(
                     x_del,
-                    &k_poles[..k_cnt],
-                    &kc[..k_cnt],
-                    &ws.kautz_re[ch][row_off..row_off + k_cnt],
-                    &ws.kautz_im[ch][row_off..row_off + k_cnt],
-                    prev_re,
-                    prev_im,
-                    &mut ds_re,
-                    &mut ds_im,
-                    d_kc,
-                    d_kp,
+                    &cp.kautz_pre[..k_t],
+                    &kc[..k_t],
+                    &mut s_re[..k_t],
+                    &mut s_im[..k_t],
+                    ore,
+                    oim,
                 );
-                if t >= 16 {
-                    ws.ds2_out[ch][t - 16] += dx_del;
-                }
+                ws.y_tier[ch][t] = dirv + fv + kv;
             }
+
+            let tgt = if ch == 0 {
+                &stem.tgt_l[..n]
+            } else {
+                &stem.tgt_r[..n]
+            };
+            for t in 0..n {
+                ws.err_buf[t] = ws.y_tier[ch][t] - f64::from(tgt[t]);
+            }
+            if need_grad {
+                ws.dy_tier[ch][..n].fill(0.0);
+            }
+            let bw = dataset.stem_band_weights[st_idx][ch].map(|v| wt * ch_scale * v);
+            stem_loss += dataset.bank.eval_loss_and_adjoint(
+                &ws.err_buf[..n],
+                w,
+                bw,
+                need_grad.then(|| &mut ws.dy_tier[ch][..n]),
+                &mut ws.bezout_scratch,
+            );
+            stem_loss += eval_gabor_loss_and_adjoint_with_backend::<B>(
+                &dataset.gabor_bank,
+                &dataset.gabor_summaries[st_idx][ch],
+                &ws.y_tier[ch][..n],
+                need_grad.then(|| &mut ws.dy_tier[ch][..n]),
+                wt * sw,
+                ch_scale,
+                dataset.gabor_env_weight,
+                dataset.gabor_ltas_weight,
+                &mut ws.gabor_scratch,
+            );
+            stem_loss += eval_welch33_ltas_loss_and_adjoint(
+                &dataset.welch33_summaries[st_idx][ch],
+                &ws.y_tier[ch][..n],
+                need_grad.then(|| &mut ws.dy_tier[ch][..n]),
+                wt * sw,
+                ch_scale,
+                dataset.welch_ltas_weight,
+                &mut ws.welch_scratch,
+            );
         }
 
-        // --- Stage II Backward ---
-        for ch in 0..active_ch {
-            ws.du_s2[ch].fill(0.0);
-            let mut rev_lp = [[0.0_f64; MAX_CASCADE_LANES]; NUM_CASCADE_BLOCKS];
-            let mut rev_q = [0.0_f64; NUM_CASCADE_BLOCKS];
-            let (mut dn_s0_r, mut dn_s1_r, mut dn_d0_r, mut dn_d1_r, mut up0_r, mut up1_r) =
-                ([0.0; 2], [0.0; 2], [0.0; 2], [0.0; 2], [0.0; 2], [0.0; 2]);
-            let sub_steps = if model.os2x { 2 } else { 1 };
-            for t in (0..n).rev() {
-                let (mut sub_s2, mut sub_dir) = ([0.0; 2], [0.0; 2]);
-                if !model.os2x {
-                    sub_s2[0] = ws.ds2_out[ch][t];
-                    sub_dir[0] = ws.dy_c[ch][t];
-                } else {
-                    sub_s2[1] = ap2_rev(0.5 * ws.ds2_out[ch][t], HB_A0, &mut dn_s0_r);
-                    sub_s2[0] = ap2_rev(0.5 * ws.ds2_out[ch][t], HB_A1, &mut dn_s1_r);
-                    sub_dir[1] = ap2_rev(0.5 * ws.dy_c[ch][t], HB_A0, &mut dn_d0_r);
-                    sub_dir[0] = ap2_rev(0.5 * ws.dy_c[ch][t], HB_A1, &mut dn_d1_r);
-                }
-                let mut u_sub_g = [0.0_f64; 2];
-                for sub in (0..sub_steps).rev() {
-                    let sub_t = if model.os2x { t * 2 + sub } else { t };
-                    let (d_s2, d_dir) = (sub_s2[sub], sub_dir[sub]);
-                    let tapes = &ws.s2_sub_tapes[ch][sub_t];
-                    let last_h = &tapes[NUM_CASCADE_BLOCKS - 1].h_next;
-                    let mut du_sub = model.pre_cab_u_gain[ch] * d_s2;
-                    grad.pre_cab_u_gain[ch] += tapes[0].u_s2 * d_s2;
-                    let mut d_h_curr = [0.0_f64; MAX_CASCADE_LANES];
-                    for l in 0..c_cnt {
-                        grad.pre_cab_w[ch][l] += last_h[l] * d_s2;
-                        grad.direct_s2_w[ch][l] += last_h[l] * d_dir;
-                        d_h_curr[l] =
-                            model.pre_cab_w[ch][l] * d_s2 + model.direct_s2_w[ch][l] * d_dir;
-                    }
-                    for b in (0..NUM_CASCADE_BLOCKS).rev() {
-                        let (blk, gblk, tp) = (&model.blocks[b], &mut grad.blocks[b], &tapes[b]);
-                        let h_prev = if b > 0 {
-                            &tapes[b - 1].h_next
-                        } else {
-                            &tapes[0].h_next
-                        };
-                        let (ba, atk_m) = cl_mask(blk.atk_alpha, 0.001, 0.9999);
-                        let (br, rel_m) = cl_mask(blk.rel_alpha, 0.001, 0.99995);
-                        let (gm, gm_m) = cl_mask(blk.gate_mix, 0.0, 1.0);
-                        let (gs, gs_m) = cl_mask(blk.gate_sharpness, 0.0, 1.0e4);
-                        let (mut d_h_prev, mut d_up, mut d_q, mut d_gg) = (
-                            [0.0; MAX_CASCADE_LANES],
-                            [0.0; MAX_CASCADE_LANES],
-                            rev_q[b],
-                            0.0,
-                        );
-                        for l in 0..c_cnt {
-                            let dh = d_h_curr[l];
-                            gblk.skip_u_gain[l] += tp.up[l] * dh;
-                            d_up[l] += blk.skip_u_gain[l] * dh;
-                            if b > 0 {
-                                gblk.prev_skip_gain[l] += h_prev[l] * dh;
-                                d_h_prev[l] += blk.prev_skip_gain[l] * dh;
-                            }
-                            let dz = dh * tp.dphi_dzc[l];
-                            d_up[l] += tp.g_gate * dz;
-                            d_gg += tp.up[l] * dz;
-                            let (_, sb_m) = cl_mask(blk.static_bias[l], -4.0, 4.0);
-                            let (es, es_m) = cl_mask(blk.env_bias_sens[l], -4.0, 4.0);
-                            gblk.static_bias[l] += sb_m * (dz - dh * tp.dphi0_db0[l]);
-                            gblk.env_bias_sens[l] += es_m * tp.q * dz;
-                            d_q += es * dz;
-                        }
-                        if gm > 0.0 {
-                            let inv2 = tp.gate_inv * tp.gate_inv;
-                            gblk.gate_mix += gm_m * (-tp.gate_inv) * d_gg;
-                            gblk.gate_sharpness += gs_m * gm * inv2 * tp.q * tp.q * d_gg;
-                            d_q += gm * inv2 * 2.0 * gs * tp.q * d_gg;
-                        }
-                        let alpha = if tp.atk_taken { ba } else { br };
-                        let det = 0.25 * tp.up[..c_cnt].iter().map(|&v| v.abs()).sum::<f64>();
-                        let d_det = (1.0 - alpha) * d_q;
-                        if tp.atk_taken {
-                            gblk.atk_alpha += atk_m * (tp.env_q_prev - det) * d_q;
-                        } else {
-                            gblk.rel_alpha += rel_m * (tp.env_q_prev - det) * d_q;
-                        }
-                        rev_q[b] = alpha * d_q;
-                        for l in 0..c_cnt {
-                            let dup = d_up[l] + 0.25 * tp.up_sign[l] * d_det;
-                            gblk.lp_mix[l] += tp.lp_next[l] * dup;
-                            gblk.hp_mix[l] += (tp.v[l] - tp.lp_next[l]) * dup;
-                            let ds_tot = (blk.lp_mix[l] - blk.hp_mix[l]) * dup + rev_lp[b][l];
-                            let (a, lp_m) = cl_mask(blk.lp_pole[l], 0.02, 0.9985);
-                            gblk.lp_pole[l] += lp_m * (tp.lp_prev[l] - tp.v[l]) * ds_tot;
-                            rev_lp[b][l] = a * ds_tot;
-                            let dv = blk.hp_mix[l] * dup + (1.0 - a) * ds_tot;
-                            gblk.in_u_gain[l] += tp.u_s2 * dv;
-                            du_sub += blk.in_u_gain[l] * dv;
-                            if b > 0 {
-                                for s in 0..c_cnt {
-                                    gblk.inter_mat[l][s] += h_prev[s] * dv;
-                                    d_h_prev[s] += blk.inter_mat[l][s] * dv;
-                                }
-                            }
-                        }
-                        d_h_curr = d_h_prev;
-                    }
-                    u_sub_g[sub] = du_sub;
-                }
-                ws.du_s2[ch][t] = if !model.os2x {
-                    u_sub_g[0]
-                } else {
-                    ap2_rev(u_sub_g[0], HB_A0, &mut up0_r) + ap2_rev(u_sub_g[1], HB_A1, &mut up1_r)
-                };
-            }
+        if let Some(g_mut) = grad.as_deref_mut() {
+            backward_tier_readout::<B>(model, cp, tau, n, active_ch, c_t, f_t, k_t, ws, g_mut);
         }
+    }
+    if let Some(g_mut) = grad {
+        backward_shared_core(model, cp, n, c_blk, active_ch, ws, g_mut);
+    }
+    stem_loss
+}
 
-        // --- Stage I Backward ---
-        let (mut r_dlp, mut r_env) = ([0.0_f64; 2], [0.0_f64; 2]);
-        let (mut r_ic1_1, mut r_ic2_1, mut r_ic1_2, mut r_ic2_2) =
-            ([0.0_f64; 2], [0.0_f64; 2], [0.0_f64; 2], [0.0_f64; 2]);
-        for t in (0..n).rev() {
-            let mut d_det = [0.0_f64; 2];
-            let d_raw0 = ws.svf_tape[t][0].v_det_hp.abs();
-            let d_raw1 = ws.svf_tape[t][1].v_det_hp.abs();
-            let diff = d_raw1 - d_raw0;
-            for ch in 0..active_ch {
-                let tp = &ws.svf_tape[t][ch];
-                let (d_dir, d_u) = (ws.dy_c[ch][t], ws.du_s2[ch][t]);
-                let dir_t = if ch == 0 {
-                    &model.svf_direct_taps_l
-                } else {
-                    &model.svf_direct_taps_r
-                };
-                let mut d_taps = [0.0_f64; 7];
-                for i in 0..7 {
-                    grad.svf_stage2_feed_taps[i] += tp.taps[i] * d_u;
-                    d_taps[i] = model.svf_stage2_feed_taps[i] * d_u + dir_t[i] * d_dir;
-                }
-                let (d_u2, d_g2, d_k2) = step_tpt_rev(
-                    d_taps[4],
-                    d_taps[5],
-                    d_taps[6],
-                    tp.g2,
-                    damp_k2,
-                    tp.s2_c1,
-                    tp.s2_v1,
-                    tp.s2_a1,
-                    tp.s2_a2,
-                    tp.s2_a3,
-                    tp.s2_v3,
-                    &mut r_ic1_2[ch],
-                    &mut r_ic2_2[ch],
-                );
-                grad.svf_damp_k2 += damp_k2_m * d_k2;
-                grad.svf_sec2_bp_feed += sec2_bp_m * tp.taps[2] * d_u2;
-                grad.svf_sec2_hp_feed += sec2_hp_m * tp.taps[3] * d_u2;
-                let (_, d_g1_dir, d_k1) = step_tpt_rev(
-                    d_taps[1] + d_u2,
-                    d_taps[2] + sec2_bp * d_u2,
-                    d_taps[3] + sec2_hp * d_u2,
-                    tp.g1,
-                    damp_k1,
-                    tp.s1_c1,
-                    tp.s1_v1,
-                    tp.s1_a1,
-                    tp.s1_a2,
-                    tp.s1_a3,
-                    tp.s1_v3,
-                    &mut r_ic1_1[ch],
-                    &mut r_ic2_1[ch],
-                );
-                grad.svf_damp_k1 += damp_k1_m * d_k1;
-                let g2_uncl = tp.g1 * sec2_ratio;
-                let d_g2_u = if g2_uncl > 1.0e-4 && g2_uncl < 1.45 {
-                    d_g2
-                } else {
-                    0.0
-                };
-                grad.svf_sec2_g_ratio += sec2_ratio_m * tp.g1 * d_g2_u;
-                let d_g1_t = d_g1_dir + sec2_ratio * d_g2_u;
-                let d_g1_u = if tp.g1_unclamped <= g_min {
-                    grad.svf_g_min += g_min_m * d_g1_t;
-                    0.0
-                } else if tp.g1_unclamped >= g_max {
-                    grad.svf_g_max += g_max_m * d_g1_t;
-                    0.0
-                } else {
-                    d_g1_t
-                };
-                let (oct_p, d_oct) = exp2_oct_with_deriv(env_oct * tp.e);
-                grad.svf_base_g += base_g_m * oct_p * d_g1_u;
-                let d_eo = base_g * d_oct * d_g1_u;
-                grad.svf_env_oct_sens += env_oct_m * tp.e * d_eo;
-                let d_e = env_oct * d_eo;
-                grad.svf_env_comp += env_comp_m * (-0.5 * tp.e * tp.e * tp.e) * d_e;
-                let d_env_now = tp.rsq3 * d_e + r_env[ch];
-                let alpha = if tp.atk_taken { atk } else { rel };
-                let det_ch = if ch == 0 {
-                    d_raw0 + 0.5 * link * diff
-                } else {
-                    d_raw1 - 0.5 * link * diff
-                };
-                if tp.atk_taken {
-                    grad.svf_atk_alpha += atk_m * (tp.env_prev - det_ch) * d_env_now;
-                } else {
-                    grad.svf_rel_alpha += rel_m * (tp.env_prev - det_ch) * d_env_now;
-                }
-                r_env[ch] = alpha * d_env_now;
-                d_det[ch] = (1.0 - alpha) * d_env_now;
-            }
-            let d_diff = 0.5 * link * (d_det[0] - d_det[1]);
-            grad.svf_stereo_link += link_m * 0.5 * diff * (d_det[0] - d_det[1]);
-            let d_dr = [d_det[0] - d_diff, d_det[1] + d_diff];
-            for ch in 0..2 {
-                let tp = &ws.svf_tape[t][ch];
-                let xl = stem.in_l[t] as f64;
-                let x_ch = if ch == 0 || model.mono_out {
-                    xl
-                } else {
-                    stem.in_r[t] as f64
-                };
-                let d_vd = tp.det_raw_sign * d_dr[ch];
-                grad.svf_det_hp_mix += det_hp_m * (x_ch - tp.det_lp) * d_vd;
-                let d_lp_tot = r_dlp[ch] - det_hp_mix * d_vd;
-                grad.svf_det_lp_pole += det_lp_m * (tp.det_lp_prev - x_ch) * d_lp_tot;
-                r_dlp[ch] = det_lp * d_lp_tot;
-            }
+/// Evaluates weighted 4-tier Matryoshka loss and optional exact reverse-mode BPTT gradient via `B`.
+pub fn evaluate_matryoshka_loss_and_grad_with_backend<B: TrainerBackend>(
+    model: &V3MatryoshkaOptF64,
+    dataset: &V3TrainDataset,
+    ws: &mut AdjointWorkspace,
+    mut grad: Option<&mut V3MatryoshkaOptF64>,
+) -> f64 {
+    const ALL_TIERS: [Tier; 4] = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra];
+    if let Some(g) = grad.as_deref_mut() {
+        *g = model.zero_like();
+    }
+    let cp = ClampedCoreParams::from_model(model);
+    let g_cnt = model.max_active_groups.clamp(1, 4);
+    let c_blk = g_cnt * 4;
+    let active_ch = if model.mono_out { 1 } else { 2 };
+    let ch_scale = if model.mono_out { 1.0 } else { 0.5 };
+    let sub_steps = if model.os2x { 2 } else { 1 };
+    let need_grad = grad.is_some();
+
+    let mut tiers_needed = [0usize; 4];
+    for (tau, &tier) in ALL_TIERS.iter().enumerate() {
+        if tier_groups(tier) <= g_cnt && model.active_tier_weights[tau] > 0.0 {
+            tiers_needed[tau] = tier_kautz_banks(tier) * 4;
         }
     }
 
+    let total_loss = if dataset.stems.len() >= 2
+        && dataset.stems.first().map_or(0, |s| s.usable_len()) >= 8_192
+    {
+        let per_stem = par_map_indexed(dataset.stems.len(), |st_idx| {
+            let mut stem_ws = AdjointWorkspace::default();
+            let mut stem_grad = need_grad.then(|| model.zero_like());
+            let loss = eval_single_stem_loss_and_grad::<B>(
+                model,
+                &cp,
+                dataset,
+                st_idx,
+                &tiers_needed,
+                c_blk,
+                active_ch,
+                ch_scale,
+                sub_steps,
+                &mut stem_ws,
+                stem_grad.as_mut(),
+            );
+            (loss, stem_grad)
+        });
+        let mut sum_loss = 0.0_f64;
+        for (stem_loss, stem_grad) in per_stem {
+            sum_loss += stem_loss;
+            if let (Some(g_tot), Some(sg)) = (grad.as_deref_mut(), stem_grad) {
+                g_tot.add_assign_grad(&sg);
+            }
+        }
+        sum_loss
+    } else {
+        let mut sum_loss = 0.0_f64;
+        for st_idx in 0..dataset.stems.len() {
+            sum_loss += eval_single_stem_loss_and_grad::<B>(
+                model,
+                &cp,
+                dataset,
+                st_idx,
+                &tiers_needed,
+                c_blk,
+                active_ch,
+                ch_scale,
+                sub_steps,
+                ws,
+                grad.as_deref_mut(),
+            );
+        }
+        sum_loss
+    };
+
+    if let Some(g_mut) = grad {
+        for blk in &mut g_mut.blocks {
+            blk.enforce_lower_triangular();
+        }
+        g_mut.mirror_mono();
+    }
     total_loss
+}
+
+/// Evaluates scalar 4-tier Matryoshka loss via explicit backend `B`.
+#[must_use]
+pub fn evaluate_matryoshka_loss_f64_with_backend<B: TrainerBackend>(
+    model: &V3MatryoshkaOptF64,
+    dataset: &V3TrainDataset,
+    ws: &mut AdjointWorkspace,
+) -> f64 {
+    evaluate_matryoshka_loss_and_grad_with_backend::<B>(model, dataset, ws, None)
+}
+
+/// Evaluates scalar 4-tier Matryoshka loss dispatching the fastest detected CPU backend.
+#[must_use]
+pub fn evaluate_matryoshka_loss_f64(model: &V3MatryoshkaOptF64, dataset: &V3TrainDataset) -> f64 {
+    struct EvalTask<'a>(&'a V3MatryoshkaOptF64, &'a V3TrainDataset);
+    impl TrainerTask<f64> for EvalTask<'_> {
+        fn run<B: TrainerBackend>(self) -> f64 {
+            let mut ws = AdjointWorkspace::default();
+            evaluate_matryoshka_loss_f64_with_backend::<B>(self.0, self.1, &mut ws)
+        }
+    }
+    DynamicTrainer::detect().dispatch(EvalTask(model, dataset))
+}
+
+/// Evaluates 4-tier Matryoshka loss and exact gradient via detected CPU backend.
+#[must_use]
+pub fn evaluate_matryoshka_loss_and_grad(
+    model: &V3MatryoshkaOptF64,
+    dataset: &V3TrainDataset,
+) -> (f64, V3MatryoshkaOptF64) {
+    struct GradTask<'a>(&'a V3MatryoshkaOptF64, &'a V3TrainDataset);
+    impl TrainerTask<(f64, V3MatryoshkaOptF64)> for GradTask<'_> {
+        fn run<B: TrainerBackend>(self) -> (f64, V3MatryoshkaOptF64) {
+            let mut ws = AdjointWorkspace::default();
+            let mut g = self.0.zero_like();
+            let l = evaluate_matryoshka_loss_and_grad_with_backend::<B>(
+                self.0,
+                self.1,
+                &mut ws,
+                Some(&mut g),
+            );
+            (l, g)
+        }
+    }
+    DynamicTrainer::detect().dispatch(GradTask(model, dataset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f64::consts::PI;
+
+    use dnam_engine::stages::v3_core::V3MatryoshkaModel;
+    use dnam_engine::stages::v3_core::cascade::{MAX_BLOCK_LANES, NUM_GRU_BLOCKS};
+
+    use super::super::model_f64::V3TrainStem;
+
+    fn build_fd_test_model(os2x: bool, mono_out: bool) -> V3MatryoshkaOptF64 {
+        let mut m =
+            V3MatryoshkaOptF64::from_matryoshka_cold(&V3MatryoshkaModel::identity(os2x, mono_out));
+        m.max_active_groups = 2;
+        m.active_tier_weights = [0.35, 0.65, 0.0, 0.0];
+        m.os_up_quad = -0.06;
+        m.os_dec_c_prev1 = 0.14;
+        m.os_dec_c0 = 0.36;
+        m.os_up_pre_emph = 0.12;
+        m.os_dec_aa_mix = 0.65;
+        m.os_up_aa_mix = 0.68;
+        m.svf_base_g = 0.14;
+        m.svf_sec2_g_ratio = 1.6;
+        m.svf_env_oct_sens = 1.25;
+        m.svf_env_comp = 0.8;
+        m.svf_atk_alpha = 0.72;
+        m.svf_rel_alpha = 0.88;
+        m.svf_det_lp_pole = 0.62;
+        m.svf_det_hp_mix = 0.35;
+        m.svf_damp_k1 = 0.75;
+        m.svf_damp_k2 = 0.95;
+        m.svf_sec2_bp_feed = 0.25;
+        m.svf_sec2_hp_feed = -0.18;
+        m.svf_stereo_link = 0.40;
+        m.svf_g_min = 0.02;
+        m.svf_g_max = 0.78;
+        m.svf_stage2_feed_taps = [0.40, 0.35, 0.22, -0.11, 0.28, -0.16, 0.09];
+        m.feat_in_hp_beta = 0.08;
+        m.feat_fast_atk_beta = 0.18;
+        m.feat_fast_rel_beta = 0.02;
+        m.feat_pinch_k = 6.5;
+        m.feat_slow_atk_beta = 0.04;
+        m.feat_slow_rel_beta = 0.005;
+        m.feat_slow_det_comp = 4.5;
+        for b in 0..NUM_GRU_BLOCKS {
+            for dst in 0..8 {
+                m.blocks[b].b_z[dst] = 0.15 * ((b + dst) as f64 * 0.2).sin();
+                m.blocks[b].b_r[dst] = 0.4 + 0.1 * (dst as f64);
+                m.blocks[b].b_n[dst] = -0.12 + 0.05 * (b as f64);
+                m.blocks[b].k_sag[dst] = 0.35 + 0.1 * (b as f64);
+                m.blocks[b].k_quad[dst] = if dst % 2 == 0 {
+                    0.12 - 0.02 * (b as f64)
+                } else {
+                    -0.09 + 0.015 * (b as f64)
+                };
+                for f in 0..5 {
+                    m.blocks[b].w_in_z[f][dst] = 0.08 * ((f + dst + 1) as f64 * 0.31).sin();
+                    m.blocks[b].w_in_r[f][dst] = 0.07 * ((f + dst + 2) as f64 * 0.27).cos();
+                    m.blocks[b].w_in_n[f][dst] = 0.11 * ((f + b + dst) as f64 * 0.41).sin();
+                }
+                for s in 0..(((dst >> 2) + 1) << 2) {
+                    m.blocks[b].w_prev_z[dst][s] = 0.06 * ((dst + s + 1) as f64).cos();
+                    m.blocks[b].w_prev_r[dst][s] = 0.05 * ((dst + s + 2) as f64).sin();
+                    m.blocks[b].w_prev_n[dst][s] = 0.09 * ((dst + s + 3) as f64).sin();
+                    m.blocks[b].w_rec_z[dst][s] = 0.04 * ((dst + s + 4) as f64).cos();
+                    m.blocks[b].w_rec_r[dst][s] = 0.05 * ((dst + s + 5) as f64).sin();
+                    m.blocks[b].w_rec_n[dst][s] = 0.08 * ((dst + s + 6) as f64).cos();
+                }
+            }
+            m.blocks[b].enforce_lower_triangular();
+        }
+        for k in 0..8 {
+            m.kautz_poles[k] = (0.80 + 0.015 * (k as f64), 0.18 + 0.22 * (k as f64));
+        }
+        for tau in 0..2 {
+            let r = &mut m.readouts[tau];
+            r.pre_cab_u_gain = [0.65, 0.58];
+            r.pre_cab_hp_gain = [0.18, -0.14];
+            r.direct_s2_u_gain = [0.12, 0.09];
+            r.direct_s2_hp_gain = [-0.07, 0.11];
+            for i in 0..7 {
+                r.svf_direct_taps_l[i] = 0.04 * ((i + tau + 1) as f64).sin();
+                r.svf_direct_taps_r[i] = 0.03 * ((i + tau + 2) as f64).cos();
+            }
+            for i in 0..(tau + 1) * 4 {
+                for b in 0..NUM_GRU_BLOCKS {
+                    let idx = b * MAX_BLOCK_LANES + i;
+                    r.pre_cab_w[0][idx] = 0.05 * ((idx + 1) as f64).sin();
+                    r.pre_cab_w[1][idx] = 0.04 * ((idx + 2) as f64).cos();
+                    r.direct_s2_w[0][idx] = -0.03 * ((idx + 3) as f64).sin();
+                    r.direct_s2_w[1][idx] = 0.03 * ((idx + 4) as f64).cos();
+                }
+            }
+            for k in 0..8 {
+                r.fir_l[k] = if k == 0 {
+                    0.72
+                } else {
+                    0.04 * (k as f64).sin()
+                };
+                r.fir_r[k] = if k == 0 {
+                    0.68
+                } else {
+                    0.03 * (k as f64).cos()
+                };
+            }
+            for m_idx in 0..8 {
+                r.kautz_c_l[m_idx] = (
+                    0.04 * (m_idx as f64 + 1.0).sin(),
+                    0.03 * (m_idx as f64).cos(),
+                );
+                r.kautz_c_r[m_idx] = (
+                    0.03 * (m_idx as f64 + 2.0).cos(),
+                    -0.02 * (m_idx as f64).sin(),
+                );
+            }
+        }
+        m.mirror_mono();
+        m
+    }
+
+    fn build_fd_dataset(n: usize) -> V3TrainDataset {
+        let centers = crate::metrics::canonical_ltas_33_centers_hz();
+        let scale = 0.42 / (centers.len() as f64).sqrt();
+        let (mut in_l, mut in_r, mut tgt_l, mut tgt_r) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for i in 0..n {
+            let t = (i as f64) / 48_000.0;
+            let env = (1.0 - (-t * 18.0).exp()) * (0.25 + 0.75 * (2.0 * PI * 3.1 * t).sin().abs());
+            let (mut sl, mut sr) = (0.0_f64, 0.0_f64);
+            for (k, &fc) in centers.iter().enumerate() {
+                sl += (2.0 * PI * fc * t + (k as f64) * 0.51).sin();
+                sr += (2.0 * PI * fc * t + (k as f64) * 0.89 + 0.3).cos();
+            }
+            let xl = env * scale * sl;
+            let xr = env * scale * sr;
+            in_l.push(xl as f32);
+            in_r.push(xr as f32);
+            tgt_l.push((0.75 * xl + 0.18 * (xl * 2.1).tanh()) as f32);
+            tgt_r.push((0.70 * xr + 0.22 * (xr * 1.9).tanh()) as f32);
+        }
+        V3TrainDataset::new(
+            vec![V3TrainStem {
+                in_l,
+                in_r,
+                tgt_l,
+                tgt_r,
+                warmup: 48,
+            }],
+            48_000.0,
+        )
+        .with_spectral_weights(0.18, 0.14, 0.08)
+    }
+
+    #[test]
+    fn test_v3_matryoshka_adjoint_matches_central_finite_diff() {
+        let ds = build_fd_dataset(384);
+        let ds_core = ds.with_spectral_weights(0.18, 0.14, 0.0);
+        for (os2x, mono) in [(false, true), (true, false)] {
+            let mut m = build_fd_test_model(os2x, mono);
+            let (_, grad) = evaluate_matryoshka_loss_and_grad(&m, &ds_core);
+            let mut check =
+                |name: &str,
+                 eps: f64,
+                 ana: f64,
+                 get_set: fn(&mut V3MatryoshkaOptF64) -> &mut f64| {
+                    let orig = *get_set(&mut m);
+                    *get_set(&mut m) = orig + eps;
+                    let lp = evaluate_matryoshka_loss_f64(&m, &ds_core);
+                    *get_set(&mut m) = orig - eps;
+                    let lm = evaluate_matryoshka_loss_f64(&m, &ds_core);
+                    *get_set(&mut m) = orig;
+                    let fd = (lp - lm) / (2.0 * eps);
+                    let rel = (ana - fd).abs() / ana.abs().max(fd.abs()).max(1.0e-4);
+                    assert!(
+                        rel < 1.0e-5,
+                        "{name} (os2x={os2x},mono={mono}): ana={ana} fd={fd} rel={rel}"
+                    );
+                };
+            check("svf_base_g", 1e-6, grad.svf_base_g, |x| &mut x.svf_base_g);
+            check("svf_sec2_g_ratio", 1e-6, grad.svf_sec2_g_ratio, |x| {
+                &mut x.svf_sec2_g_ratio
+            });
+            check("svf_env_oct_sens", 1e-6, grad.svf_env_oct_sens, |x| {
+                &mut x.svf_env_oct_sens
+            });
+            check("svf_env_comp", 5e-6, grad.svf_env_comp, |x| {
+                &mut x.svf_env_comp
+            });
+            check("svf_atk_alpha", 1e-6, grad.svf_atk_alpha, |x| {
+                &mut x.svf_atk_alpha
+            });
+            check("svf_rel_alpha", 1e-6, grad.svf_rel_alpha, |x| {
+                &mut x.svf_rel_alpha
+            });
+            check("svf_det_lp_pole", 1e-6, grad.svf_det_lp_pole, |x| {
+                &mut x.svf_det_lp_pole
+            });
+            check("svf_det_hp_mix", 1e-6, grad.svf_det_hp_mix, |x| {
+                &mut x.svf_det_hp_mix
+            });
+            check("svf_damp_k1", 1e-6, grad.svf_damp_k1, |x| {
+                &mut x.svf_damp_k1
+            });
+            check("svf_damp_k2", 1e-6, grad.svf_damp_k2, |x| {
+                &mut x.svf_damp_k2
+            });
+            check("svf_sec2_bp_feed", 1e-6, grad.svf_sec2_bp_feed, |x| {
+                &mut x.svf_sec2_bp_feed
+            });
+            check("svf_sec2_hp_feed", 1e-6, grad.svf_sec2_hp_feed, |x| {
+                &mut x.svf_sec2_hp_feed
+            });
+            check(
+                "svf_stage2_feed[2]",
+                1e-6,
+                grad.svf_stage2_feed_taps[2],
+                |x| &mut x.svf_stage2_feed_taps[2],
+            );
+            check("feat_in_hp_beta", 1e-6, grad.feat_in_hp_beta, |x| {
+                &mut x.feat_in_hp_beta
+            });
+            check("feat_fast_atk_beta", 1e-6, grad.feat_fast_atk_beta, |x| {
+                &mut x.feat_fast_atk_beta
+            });
+            check("feat_fast_rel_beta", 1e-6, grad.feat_fast_rel_beta, |x| {
+                &mut x.feat_fast_rel_beta
+            });
+            check("feat_pinch_k", 1e-5, grad.feat_pinch_k, |x| {
+                &mut x.feat_pinch_k
+            });
+            check("feat_slow_atk_beta", 1e-6, grad.feat_slow_atk_beta, |x| {
+                &mut x.feat_slow_atk_beta
+            });
+            check("feat_slow_rel_beta", 1e-6, grad.feat_slow_rel_beta, |x| {
+                &mut x.feat_slow_rel_beta
+            });
+            check("feat_slow_det_comp", 1e-5, grad.feat_slow_det_comp, |x| {
+                &mut x.feat_slow_det_comp
+            });
+            check("b0.w_in_n[2][3]", 1e-6, grad.blocks[0].w_in_n[2][3], |x| {
+                &mut x.blocks[0].w_in_n[2][3]
+            });
+            check("b0.k_sag[3]", 1e-6, grad.blocks[0].k_sag[3], |x| {
+                &mut x.blocks[0].k_sag[3]
+            });
+            check("b0.k_quad[3]", 1e-6, grad.blocks[0].k_quad[3], |x| {
+                &mut x.blocks[0].k_quad[3]
+            });
+            check("b0.b_r[2]", 1e-6, grad.blocks[0].b_r[2], |x| {
+                &mut x.blocks[0].b_r[2]
+            });
+            check(
+                "b0.w_rec_n[3][1]",
+                1e-6,
+                grad.blocks[0].w_rec_n[3][1],
+                |x| &mut x.blocks[0].w_rec_n[3][1],
+            );
+            check("b2.w_in_n[2][3]", 1e-6, grad.blocks[2].w_in_n[2][3], |x| {
+                &mut x.blocks[2].w_in_n[2][3]
+            });
+            check("b2.k_sag[4]", 1e-6, grad.blocks[2].k_sag[4], |x| {
+                &mut x.blocks[2].k_sag[4]
+            });
+            check("b2.k_quad[4]", 1e-6, grad.blocks[2].k_quad[4], |x| {
+                &mut x.blocks[2].k_quad[4]
+            });
+            check(
+                "b1.w_prev_z[5][2]",
+                1e-6,
+                grad.blocks[1].w_prev_z[5][2],
+                |x| &mut x.blocks[1].w_prev_z[5][2],
+            );
+            check(
+                "b2.w_rec_n[4][1]",
+                1e-6,
+                grad.blocks[2].w_rec_n[4][1],
+                |x| &mut x.blocks[2].w_rec_n[4][1],
+            );
+            check("b1.b_n[3]", 1e-6, grad.blocks[1].b_n[3], |x| {
+                &mut x.blocks[1].b_n[3]
+            });
+            check("kautz_poles[2].0", 1e-6, grad.kautz_poles[2].0, |x| {
+                &mut x.kautz_poles[2].0
+            });
+            check("kautz_poles[2].1", 1e-6, grad.kautz_poles[2].1, |x| {
+                &mut x.kautz_poles[2].1
+            });
+            check("r1.fir_l[3]", 1e-6, grad.readouts[1].fir_l[3], |x| {
+                &mut x.readouts[1].fir_l[3]
+            });
+            check(
+                "r1.kautz_c_l[1].0",
+                1e-6,
+                grad.readouts[1].kautz_c_l[1].0,
+                |x| &mut x.readouts[1].kautz_c_l[1].0,
+            );
+            if os2x {
+                check("os_up_quad", 1e-6, grad.os_up_quad, |x| &mut x.os_up_quad);
+                check("os_dec_c_prev1", 1e-6, grad.os_dec_c_prev1, |x| {
+                    &mut x.os_dec_c_prev1
+                });
+                check("os_dec_c0", 1e-6, grad.os_dec_c0, |x| &mut x.os_dec_c0);
+                check("os_up_pre_emph", 1e-6, grad.os_up_pre_emph, |x| {
+                    &mut x.os_up_pre_emph
+                });
+                check("os_dec_aa_mix", 1e-6, grad.os_dec_aa_mix, |x| {
+                    &mut x.os_dec_aa_mix
+                });
+                check("os_up_aa_mix", 1e-6, grad.os_up_aa_mix, |x| {
+                    &mut x.os_up_aa_mix
+                });
+                check("svf_stereo_link", 1e-6, grad.svf_stereo_link, |x| {
+                    &mut x.svf_stereo_link
+                });
+                check(
+                    "r1.kautz_c_r[1].1",
+                    1e-6,
+                    grad.readouts[1].kautz_c_r[1].1,
+                    |x| &mut x.readouts[1].kautz_c_r[1].1,
+                );
+            }
+
+            let (_, grad_full) = evaluate_matryoshka_loss_and_grad(&m, &ds);
+            let dirs = [1.0_f64, -0.7, 0.5, -0.9];
+            let eps_dir = 1.0e-7_f64;
+            let eval_dir = |dataset: &V3TrainDataset,
+                            g: &V3MatryoshkaOptF64,
+                            mod_m: &mut V3MatryoshkaOptF64,
+                            h: f64|
+             -> (f64, f64) {
+                let d_ana = g.svf_base_g * dirs[0]
+                    + g.svf_sec2_g_ratio * dirs[1]
+                    + g.blocks[0].w_in_n[2][3] * dirs[2]
+                    + g.readouts[1].fir_l[3] * dirs[3];
+                let (og, or_, ow, of) = (
+                    mod_m.svf_base_g,
+                    mod_m.svf_sec2_g_ratio,
+                    mod_m.blocks[0].w_in_n[2][3],
+                    mod_m.readouts[1].fir_l[3],
+                );
+                mod_m.svf_base_g = og + h * dirs[0];
+                mod_m.svf_sec2_g_ratio = or_ + h * dirs[1];
+                mod_m.blocks[0].w_in_n[2][3] = ow + h * dirs[2];
+                mod_m.readouts[1].fir_l[3] = of + h * dirs[3];
+                let lp = evaluate_matryoshka_loss_f64(mod_m, dataset);
+                mod_m.svf_base_g = og - h * dirs[0];
+                mod_m.svf_sec2_g_ratio = or_ - h * dirs[1];
+                mod_m.blocks[0].w_in_n[2][3] = ow - h * dirs[2];
+                mod_m.readouts[1].fir_l[3] = of - h * dirs[3];
+                let lm = evaluate_matryoshka_loss_f64(mod_m, dataset);
+                mod_m.svf_base_g = og;
+                mod_m.svf_sec2_g_ratio = or_;
+                mod_m.blocks[0].w_in_n[2][3] = ow;
+                mod_m.readouts[1].fir_l[3] = of;
+                (d_ana, (lp - lm) / (2.0 * h))
+            };
+            let (c_ana, c_fd) = eval_dir(&ds_core, &grad, &mut m, eps_dir);
+            let core_rel = (c_ana - c_fd).abs() / c_ana.abs().max(c_fd.abs()).max(1.0e-8);
+            assert!(
+                core_rel < 1.0e-6,
+                "core directional (os2x={os2x},mono={mono}): ana={c_ana} fd={c_fd} rel={core_rel}"
+            );
+            let (f_ana, f_fd) = eval_dir(&ds, &grad_full, &mut m, eps_dir);
+            let dir_rel = (f_ana - f_fd).abs() / f_ana.abs().max(f_fd.abs()).max(1.0e-8);
+            assert!(
+                dir_rel < 1.0e-6,
+                "full directional (os2x={os2x},mono={mono}): ana={f_ana} fd={f_fd} rel={dir_rel}"
+            );
+        }
+    }
 }

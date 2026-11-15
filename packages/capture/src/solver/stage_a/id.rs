@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Dual-Rate Steiglitz–McBride Rational Modal Pole Identification, Deconvolved Stage III
 //! Stereo FIR + Nested Kautz Residue Fitting, and Channel-Aligned Stage IV Reflection Extraction
-//! (`solver::stage_a_id`).
+//! (`solver::stage_a::id`).
 //!
 //! Canonical Reference: `docs/specs/training/four_stage_pipeline.md` (`ref[train.pipeline.stage-a-poles]`).
 
@@ -10,7 +10,7 @@ use std::f64::consts::TAU;
 use dnam_engine::operators::op_m::algebraic_unit_rotor_op_m;
 use dnam_engine::provenance::STAGE3_KAUTZ_BLOCKS_PER_TIER;
 
-use super::{solve_uplo_u_cholesky_2ch, uplo_u_index, uplo_u_packed_len};
+use super::super::{solve_uplo_u_cholesky_2ch, uplo_u_index, uplo_u_packed_len};
 
 /// Deconvolved Stage III stereo `64`-tap Early FIR, nested `32`-pole Kautz stereo residues,
 /// and simulated `(s3_l, s3_r)` backbone signal feeding Stage IV.

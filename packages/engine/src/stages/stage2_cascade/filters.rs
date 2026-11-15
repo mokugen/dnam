@@ -615,3 +615,102 @@ impl Stage2CommutedCascade {
         ((nl_bp_l, lpf_y_l, hpf_y_l), (nl_bp_r, lpf_y_r, hpf_y_r))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::stages::weights::{ARENA0_PIPELINE_FLAGS_OFFSET, PIPE_MAGIC_HI};
+
+    #[test]
+    fn test_stage2_filters_arena_loading_fallbacks_and_ext_mode() {
+        let mut cas = Stage2CommutedCascade::default();
+        // Arena smaller than 4160 bytes returns early without panicking
+        cas.load_from_arena(&[0u8; 1024]);
+
+        // Full Ultra-sized arena exercising stereo tail, legacy tail, NaN fallbacks, and STAGE2_EXT
+        let mut arena = alloc::vec![0u8; 64_000];
+        // V1A stereo tail with zero R drive -> mirrors L drive/asym/comp
+        arena[4_112..4_116].copy_from_slice(&2.5_f32.to_le_bytes());
+        arena[4_124..4_128].copy_from_slice(&0.3_f32.to_le_bytes());
+        arena[4_128..4_132].copy_from_slice(&f32::NAN.to_le_bytes());
+        // V1B stereo tail with positive R drive & valid R comp
+        arena[4_136..4_140].copy_from_slice(&2.0_f32.to_le_bytes());
+        arena[4_140..4_144].copy_from_slice(&1.5_f32.to_le_bytes());
+        arena[4_148..4_152].copy_from_slice(&0.4_f32.to_le_bytes());
+        arena[4_156..4_160].copy_from_slice(&f32::NAN.to_le_bytes());
+        // Non-finite L1/L2 gains, branch params, global scales, and Role A delta -> fallback defaults
+        for off in [
+            4_168, 4_184, 4_188, 4_200, 4_216, 4_220, 4_232, 4_236, 4_272, 4_276, 1_024,
+        ] {
+            arena[off..off + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        }
+        // Enable PIPE_FLAG_STAGE2_EXT with NaN values to cover all ext fallback arms
+        arena[ARENA0_PIPELINE_FLAGS_OFFSET..ARENA0_PIPELINE_FLAGS_OFFSET + 4]
+            .copy_from_slice(&(PIPE_MAGIC_HI | PIPE_FLAG_STAGE2_EXT).to_le_bytes());
+        for i in 0..10 {
+            let off = ARENA0_STAGE2_EXT_OFFSET + i * 4;
+            arena[off..off + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        }
+        cas.load_from_arena(&arena);
+        assert!(cas.ext_active);
+        assert!(!cas.linear_v1a_v1b);
+
+        // Now populate V1A with zero drive + V1B legacy 3-float mode + valid EXT values
+        let mut arena2 = alloc::vec![0u8; 4_288];
+        arena2[4_136..4_140].copy_from_slice(&1.8_f32.to_le_bytes());
+        arena2[4_144..4_148].copy_from_slice(&f32::NAN.to_le_bytes());
+        arena2[ARENA0_PIPELINE_FLAGS_OFFSET..ARENA0_PIPELINE_FLAGS_OFFSET + 4]
+            .copy_from_slice(&(PIPE_MAGIC_HI | PIPE_FLAG_STAGE2_EXT).to_le_bytes());
+        for (i, val) in [0.9_f32, 0.85, 0.2, 0.1, 0.4, 0.2, 0.3, 0.5, 1.0, 1.2]
+            .iter()
+            .enumerate()
+        {
+            let off = ARENA0_STAGE2_EXT_OFFSET + i * 4;
+            arena2[off..off + 4].copy_from_slice(&val.to_le_bytes());
+        }
+        cas.load_from_arena(&arena2);
+        assert!(cas.linear_v1a_v1b);
+
+        let mut sl = [0.0_f32; 6];
+        let mut sr = [0.0_f32; 6];
+        let (yl, yr) = Stage2CommutedCascade::step_interstage_filter_stereo(
+            &mut sl,
+            &mut sr,
+            &[0.9, 0.8, 0.7, 0.9, 0.2, 0.1],
+            &[0.1, 0.1, 0.1],
+            0.5,
+            0.25,
+            0.05,
+            -0.25,
+            -0.05,
+        );
+        assert!(yl.is_finite() && yr.is_finite());
+
+        // Exercise V1A non-stereo-tail + missing R-comp fallback and V1B missing-R-drive fallback
+        let mut arena3 = alloc::vec![0u8; 8_192];
+        arena3[4_112..4_116].copy_from_slice(&1.5_f32.to_le_bytes());
+        arena3[4_116..4_120].copy_from_slice(&0.3_f32.to_le_bytes());
+        arena3[4_120..4_124].copy_from_slice(&0.8_f32.to_le_bytes());
+        arena3[4_136..4_140].copy_from_slice(&1.5_f32.to_le_bytes());
+        arena3[4_148..4_152].copy_from_slice(&0.2_f32.to_le_bytes());
+        cas.load_from_arena(&arena3);
+        assert!((cas.v1a_comp - 0.8).abs() < 1e-6);
+        assert!((cas.v1b_beta_r - 1.5).abs() < 1e-6);
+
+        arena3[4_120..4_124].copy_from_slice(&0.0_f32.to_le_bytes());
+        arena3[4_140..4_144].copy_from_slice(&0.2_f32.to_le_bytes());
+        arena3[4_144..4_148].copy_from_slice(&0.8_f32.to_le_bytes());
+        arena3[4_148..4_152].copy_from_slice(&0.0_f32.to_le_bytes());
+        cas.load_from_arena(&arena3);
+        assert!((cas.v1a_comp - 0.5).abs() < 1e-6);
+        assert!((cas.v1b_comp - 0.8).abs() < 1e-6);
+
+        let mut arena4 = alloc::vec![0u8; 8_192];
+        arena4[4_112..4_116].copy_from_slice(&1.5_f32.to_le_bytes());
+        arena4[4_116..4_120].copy_from_slice(&1.2_f32.to_le_bytes());
+        arena4[4_124..4_128].copy_from_slice(&0.2_f32.to_le_bytes());
+        arena4[4_128..4_132].copy_from_slice(&0.8_f32.to_le_bytes());
+        cas.load_from_arena(&arena4);
+        assert!((cas.v1a_comp_r - 0.8).abs() < 1e-6);
+    }
+}

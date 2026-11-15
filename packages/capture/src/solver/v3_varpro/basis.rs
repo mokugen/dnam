@@ -1,685 +1,427 @@
 #![forbid(unsafe_code)]
-//! Linear basis extractors, Bézout-weighted `uplo='U'` `VarPro` Cholesky solver, and
-//! 120-pole orthogonal matching pursuit (`OMP`) Kautz dictionary selector.
+//! `uplo='U'` Bézout-Weighted Matryoshka VarPro Cholesky and Progressive-Slot Kautz OMP.
 
 use std::f64::consts::PI;
 
 use dnam_engine::Tier;
 use dnam_engine::stages::v3_core::cascade::{
-    MAX_CASCADE_LANES, MAX_KAUTZ_POLES, NUM_CASCADE_BLOCKS, tier_cascade_lanes, tier_fir_segments,
-    tier_kautz_banks,
+    MAX_BLOCK_LANES, MAX_TOTAL_GRU_LANES, NUM_GRU_BLOCKS, tier_block_lanes, tier_fir_segments,
+    tier_groups, tier_kautz_banks,
 };
-use dnam_engine::stages::v3_core::{V3ColdTierModel, V3CoreInstance};
 
-use crate::solver::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
-use crate::solver::{solve_uplo_u_cholesky_2ch, uplo_u_index, uplo_u_packed_len};
+use crate::solver::backends::TrainerBackend;
+use crate::solver::{solve_uplo_u_cholesky_2ch, uplo_u_index};
 
-use super::model_f64::{HB_A0, HB_A1, V3OptModelF64, V3TrainDataset, V3TrainStem};
-use super::primitives::{ap2_fwd, exp2_oct_with_deriv, step_tpt_fwd};
+mod als;
+mod cache;
 
-/// Linear readout basis dimension `7 + C + F + 2*K` for a given `Tier`.
+use super::model_f64::{Bezout7FilterBank, V3TierReadoutF64};
+pub(super) use als::{als_update_pre_cab_chan, solve_tier_output_k_chan};
+pub use als::{solve_matryoshka_varpro_cholesky, solve_matryoshka_varpro_cholesky_with_backend};
+pub(super) use cache::{
+    PreSplitStemChan, SubspaceGramData, assemble_tier_band_grams, eval_bezout_loss_from_gram,
+    sym_uplo_matvec,
+};
+
+pub const ALL_TIERS: [Tier; 4] = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra];
+pub const KAUTZ_DELAY_SAMPLES: usize = 16;
+
+/// Linear readout basis dimension (`45, 81, 125, 185` for `Lite..Ultra`).
+#[inline]
 #[must_use]
 pub const fn linear_basis_dim(tier: Tier) -> usize {
-    7 + tier_cascade_lanes(tier) + tier_fir_segments(tier) * 16 + tier_kautz_banks(tier) * 8
+    linear_basis_dim_with_k(tier, tier_kautz_banks(tier) * 4)
 }
 
-struct StemTraj {
-    s2_out: [Vec<f64>; 2],
-    taps: [Vec<[f64; 7]>; 2],
-    h_dn: [Vec<[f64; MAX_CASCADE_LANES]>; 2],
+/// Linear readout basis dimension capped at `k_keep` complex Kautz poles.
+#[inline]
+#[must_use]
+pub const fn linear_basis_dim_with_k(tier: Tier, k_keep: usize) -> usize {
+    let g = tier_groups(tier);
+    let f = tier_fir_segments(tier);
+    9 + 12 * g + 16 * f + 2 * k_keep
 }
 
-fn extract_traj_opt(
-    model: &V3OptModelF64,
-    stem: &V3TrainStem,
-    s2_override: Option<&[Vec<f64>; 2]>,
-) -> StemTraj {
-    let n = stem
-        .in_l
-        .len()
-        .min(stem.in_r.len())
-        .min(stem.tgt_l.len())
-        .min(stem.tgt_r.len());
-    let c_cnt = tier_cascade_lanes(model.tier);
-    let ch_cnt = if model.mono_out { 1 } else { 2 };
-
-    let mut taps_out = [vec![[0.0_f64; 7]; n], vec![[0.0_f64; 7]; n]];
-    let mut h_dn_out = [
-        vec![[0.0_f64; MAX_CASCADE_LANES]; n],
-        vec![[0.0_f64; MAX_CASCADE_LANES]; n],
-    ];
-    let mut s2_out = [vec![0.0_f64; n], vec![0.0_f64; n]];
-
-    let base_g = model.svf_base_g.clamp(1.0e-4, 1.45);
-    let sec2_r = model.svf_sec2_g_ratio.clamp(0.25, 4.0);
-    let env_oct = model.svf_env_oct_sens.clamp(-16.0, 16.0);
-    let env_comp = model.svf_env_comp.clamp(0.0, 16.0);
-    let atk = model.svf_atk_alpha.clamp(0.001, 0.9999);
-    let rel = model.svf_rel_alpha.clamp(0.001, 0.99995);
-    let det_lp_a = model.svf_det_lp_pole.clamp(0.05, 0.995);
-    let det_hp = model.svf_det_hp_mix.clamp(-1.0, 2.0);
-    let dk1 = model.svf_damp_k1.clamp(0.05, 4.0);
-    let dk2 = model.svf_damp_k2.clamp(0.05, 4.0);
-    let s2_bp = model.svf_sec2_bp_feed.clamp(-2.0, 2.0);
-    let s2_hp = model.svf_sec2_hp_feed.clamp(-2.0, 2.0);
-    let hl = 0.5 * model.svf_stereo_link.clamp(0.0, 1.0);
-    let g_min = model.svf_g_min.clamp(1.0e-4, 1.45);
-    let g_max = model.svf_g_max.clamp(g_min, 1.45);
-
-    let (mut det_lp, mut env) = ([0.0_f64; 2], [0.0_f64; 2]);
-    let (mut ic1_1, mut ic2_1, mut ic1_2, mut ic2_2) = ([0.0; 2], [0.0; 2], [0.0; 2], [0.0; 2]);
-    let mut u_s2 = [vec![0.0_f64; n], vec![0.0_f64; n]];
-    for t in 0..n {
-        let xl = stem.in_l[t] as f64;
-        let xr = if model.mono_out {
-            xl
-        } else {
-            stem.in_r[t] as f64
-        };
-        let xs = [xl, xr];
-        let mut dr = [0.0_f64; 2];
-        for ch in 0..2 {
-            det_lp[ch] = det_lp_a * det_lp[ch] + (1.0 - det_lp_a) * xs[ch];
-            dr[ch] = (xs[ch] + det_hp * (xs[ch] - det_lp[ch])).abs();
-        }
-        let diff = dr[1] - dr[0];
-        let det = [dr[0] + hl * diff, dr[1] - hl * diff];
-        for ch in 0..ch_cnt {
-            env[ch] = if det[ch] > env[ch] {
-                atk * env[ch] + (1.0 - atk) * det[ch]
-            } else {
-                rel * env[ch] + (1.0 - rel) * det[ch]
-            };
-            let e = env[ch] / (1.0 + env_comp * env[ch] * env[ch]).sqrt();
-            let (pow2, _) = exp2_oct_with_deriv(env_oct * e);
-            let g1 = (base_g * pow2).clamp(g_min, g_max);
-            let g2 = (g1 * sec2_r).clamp(1.0e-4, 1.45);
-            let (lp1, bp1, hp1, ..) = step_tpt_fwd(xs[ch], g1, dk1, &mut ic1_1[ch], &mut ic2_1[ch]);
-            let u2 = lp1 + s2_bp * bp1 + s2_hp * hp1;
-            let (lp2, bp2, hp2, ..) = step_tpt_fwd(u2, g2, dk2, &mut ic1_2[ch], &mut ic2_2[ch]);
-            let taps = [xs[ch], lp1, bp1, hp1, lp2, bp2, hp2];
-            taps_out[ch][t] = taps;
-            u_s2[ch][t] = taps
-                .iter()
-                .zip(&model.svf_stage2_feed_taps)
-                .map(|(a, b)| a * b)
-                .sum();
-        }
-    }
-
-    let sub_steps = if model.os2x { 2 } else { 1 };
-    for ch in 0..ch_cnt {
-        let mut lp_s = [[0.0_f64; MAX_CASCADE_LANES]; NUM_CASCADE_BLOCKS];
-        let mut env_q = [0.0_f64; NUM_CASCADE_BLOCKS];
-        let (mut up0, mut up1, mut dn_s0, mut dn_s1) = ([0.0; 2], [0.0; 2], [0.0; 2], [0.0; 2]);
-        let (mut dn_h0, mut dn_h1) = (
-            [[0.0_f64; 2]; MAX_CASCADE_LANES],
-            [[0.0_f64; 2]; MAX_CASCADE_LANES],
-        );
-        let mut h_sub = [[0.0_f64; MAX_CASCADE_LANES]; 2];
-        let mut s2_p = [0.0_f64; 2];
-        for t in 0..n {
-            let u_in = u_s2[ch][t];
-            let us = if model.os2x {
-                [
-                    ap2_fwd(u_in, HB_A0, &mut up0),
-                    ap2_fwd(u_in, HB_A1, &mut up1),
-                ]
-            } else {
-                [u_in, 0.0]
-            };
-            for sub in 0..sub_steps {
-                let mut h_buf = [0.0_f64; MAX_CASCADE_LANES];
-                for b in 0..NUM_CASCADE_BLOCKS {
-                    let blk = &model.blocks[b];
-                    let (ba, br) = (
-                        blk.atk_alpha.clamp(0.001, 0.9999),
-                        blk.rel_alpha.clamp(0.001, 0.99995),
-                    );
-                    let (gm, gs) = (
-                        blk.gate_mix.clamp(0.0, 1.0),
-                        blk.gate_sharpness.clamp(0.0, 1.0e4),
-                    );
-                    let h_prev = h_buf;
-                    let mut up_arr = [0.0_f64; MAX_CASCADE_LANES];
-                    let mut abs_sum = 0.0_f64;
-                    for l in 0..c_cnt {
-                        let mut v = blk.in_u_gain[l] * us[sub];
-                        if b > 0 {
-                            for s in 0..c_cnt {
-                                v += blk.inter_mat[l][s] * h_prev[s];
-                            }
-                        }
-                        let a = blk.lp_pole[l].clamp(0.02, 0.9985);
-                        lp_s[b][l] = a * lp_s[b][l] + (1.0 - a) * v;
-                        let up = blk.lp_mix[l] * lp_s[b][l] + blk.hp_mix[l] * (v - lp_s[b][l]);
-                        up_arr[l] = up;
-                        abs_sum += up.abs();
-                    }
-                    let det = 0.25 * abs_sum;
-                    env_q[b] = if det > env_q[b] {
-                        ba * env_q[b] + (1.0 - ba) * det
-                    } else {
-                        br * env_q[b] + (1.0 - br) * det
-                    };
-                    let q = env_q[b];
-                    let gg = if gm > 0.0 {
-                        (1.0 - gm) + gm * (1.0 - 1.0 / (1.0 + gs * q * q))
-                    } else {
-                        1.0
-                    };
-                    for l in 0..c_cnt {
-                        let sb = blk.static_bias[l].clamp(-4.0, 4.0);
-                        let es = blk.env_bias_sens[l].clamp(-4.0, 4.0);
-                        let zc = (up_arr[l] * gg + sb + es * q).clamp(-64.0, 64.0);
-                        let nl = zc / (1.0 + zc * zc).sqrt() - sb / (1.0 + sb * sb).sqrt();
-                        h_buf[l] = nl + blk.skip_u_gain[l] * up_arr[l];
-                        if b > 0 {
-                            h_buf[l] += blk.prev_skip_gain[l] * h_prev[l];
-                        }
-                    }
-                }
-                h_sub[sub] = h_buf;
-                s2_p[sub] = model.pre_cab_u_gain[ch] * us[sub]
-                    + (0..c_cnt)
-                        .map(|l| model.pre_cab_w[ch][l] * h_buf[l])
-                        .sum::<f64>();
-            }
-            if !model.os2x {
-                h_dn_out[ch][t][..c_cnt].copy_from_slice(&h_sub[0][..c_cnt]);
-                s2_out[ch][t] = s2_p[0];
-            } else {
-                for l in 0..c_cnt {
-                    h_dn_out[ch][t][l] = 0.5
-                        * (ap2_fwd(h_sub[1][l], HB_A0, &mut dn_h0[l])
-                            + ap2_fwd(h_sub[0][l], HB_A1, &mut dn_h1[l]));
-                }
-                s2_out[ch][t] = 0.5
-                    * (ap2_fwd(s2_p[1], HB_A0, &mut dn_s0) + ap2_fwd(s2_p[0], HB_A1, &mut dn_s1));
-            }
-        }
-    }
-    if let Some(ov) = s2_override {
-        s2_out = [ov[0].clone(), ov[1].clone()];
-    }
-    if model.mono_out {
-        taps_out[1] = taps_out[0].clone();
-        h_dn_out[1] = h_dn_out[0].clone();
-        s2_out[1] = s2_out[0].clone();
-    }
-    StemTraj {
-        s2_out,
-        taps: taps_out,
-        h_dn: h_dn_out,
-    }
-}
-
-fn build_channel_basis<B: TrainerBackend>(
-    tier: Tier,
-    kautz_poles: &[(f64, f64)],
-    traj: &StemTraj,
+pub(super) fn normalize_pre_cab_chan(
+    r: &mut V3TierReadoutF64,
+    prev: Option<&V3TierReadoutF64>,
+    tau: usize,
     ch: usize,
-    k_override: Option<usize>,
+) {
+    let c_t = tier_block_lanes(ALL_TIERS[tau]);
+    let mut sq = r.pre_cab_u_gain[ch].powi(2) + r.pre_cab_hp_gain[ch].powi(2);
+    for b in 0..NUM_GRU_BLOCKS {
+        let base = b * MAX_BLOCK_LANES;
+        sq += r.pre_cab_w[ch][base..base + c_t]
+            .iter()
+            .map(|w| w * w)
+            .sum::<f64>();
+        r.pre_cab_w[ch][base + c_t..base + MAX_BLOCK_LANES].fill(0.0);
+        r.direct_s2_w[ch][base + c_t..base + MAX_BLOCK_LANES].fill(0.0);
+    }
+    if sq <= 1.0e-12 {
+        return;
+    }
+    let mut scale = sq.sqrt();
+    if let Some(p) = prev {
+        let c_p = tier_block_lanes(ALL_TIERS[tau.saturating_sub(1)]);
+        let mut dot = r.pre_cab_u_gain[ch] * p.pre_cab_u_gain[ch]
+            + r.pre_cab_hp_gain[ch] * p.pre_cab_hp_gain[ch];
+        for b in 0..NUM_GRU_BLOCKS {
+            let base = b * MAX_BLOCK_LANES;
+            dot += r.pre_cab_w[ch][base..base + c_p]
+                .iter()
+                .zip(&p.pre_cab_w[ch][base..base + c_p])
+                .map(|(a, b)| a * b)
+                .sum::<f64>();
+        }
+        if dot < 0.0 {
+            scale = -scale;
+        }
+    }
+    let inv = 1.0 / scale;
+    r.pre_cab_u_gain[ch] *= inv;
+    r.pre_cab_hp_gain[ch] *= inv;
+    for w in r.pre_cab_w[ch].iter_mut() {
+        *w *= inv;
+    }
+    let fir = if ch == 0 { &mut r.fir_l } else { &mut r.fir_r };
+    fir.iter_mut().for_each(|v| *v *= scale);
+    let kc = if ch == 0 {
+        &mut r.kautz_c_l
+    } else {
+        &mut r.kautz_c_r
+    };
+    kc.iter_mut().for_each(|c| *c = (c.0 * scale, c.1 * scale));
+}
+
+pub(super) fn normalize_pre_cab_gauge(readouts: &mut [V3TierReadoutF64; 4], active_ch: usize) {
+    for ch in 0..active_ch {
+        for tau in 0..4 {
+            let prev = (tau > 0).then(|| readouts[tau - 1].clone());
+            normalize_pre_cab_chan(&mut readouts[tau], prev.as_ref(), tau, ch);
+        }
+    }
+}
+
+pub(super) fn eval_s2_from_readout(
+    r: &V3TierReadoutF64,
+    ch: usize,
+    c_t: usize,
+    u_dec: &[f64],
+    hp_dec: &[f64],
+    h_dec: &[[f64; MAX_TOTAL_GRU_LANES]],
+    out_s2: &mut Vec<f64>,
+) {
+    let n = u_dec.len();
+    out_s2.resize(n, 0.0);
+    for t in 0..n {
+        let mut s2 = r.pre_cab_u_gain[ch] * u_dec[t] + r.pre_cab_hp_gain[ch] * hp_dec[t];
+        let hd = &h_dec[t];
+        for b in 0..NUM_GRU_BLOCKS {
+            let base = b * MAX_BLOCK_LANES;
+            for l in 0..c_t {
+                s2 += r.pre_cab_w[ch][base + l] * hd[base + l];
+            }
+        }
+        out_s2[t] = s2;
+    }
+}
+
+pub(super) fn apply_fixed_cabinet_f64<B: TrainerBackend>(
+    sig: &[f64],
+    fir: &[f64],
+    kautz_pre6: &[(f64, f64, f64, f64, f64, f64)],
+    kc: &[(f64, f64)],
+    out: &mut [f64],
+) {
+    let n = sig.len().min(out.len());
+    let f_t = fir.len();
+    let k_t = kautz_pre6.len().min(kc.len()).min(32);
+    let mut s_re = [0.0_f64; 32];
+    let mut s_im = [0.0_f64; 32];
+    let mut out_re = [0.0_f64; 32];
+    let mut out_im = [0.0_f64; 32];
+    for t in 0..n {
+        let mut v = 0.0_f64;
+        for k in 0..f_t.min(t + 1) {
+            v += fir[k] * sig[t - k];
+        }
+        let x_del = if t >= KAUTZ_DELAY_SAMPLES {
+            sig[t - KAUTZ_DELAY_SAMPLES]
+        } else {
+            0.0
+        };
+        v += B::step_kautz_forward_frame(
+            x_del,
+            &kautz_pre6[..k_t],
+            &kc[..k_t],
+            &mut s_re[..k_t],
+            &mut s_im[..k_t],
+            &mut out_re[..k_t],
+            &mut out_im[..k_t],
+        );
+        out[t] = v;
+    }
+}
+
+pub(super) fn kautz_pre_tuples(poles: &[(f64, f64)]) -> Vec<(f64, f64, f64)> {
+    poles
+        .iter()
+        .map(|&(rr, tt)| {
+            let r = rr.clamp(0.25, 0.9985);
+            let th = tt.clamp(0.0, PI - 1.0e-3);
+            let bg = (1.0 - r * r).max(1.0e-7).sqrt();
+            (r * th.cos(), r * th.sin(), bg)
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_tier_columns_with_kautz_cap<B: TrainerBackend>(
+    tier: Tier,
+    poles: &[(f64, f64)],
+    k_keep: usize,
+    tap_dec: &[[f64; 7]],
+    u_dec: &[f64],
+    hp_dec: &[f64],
+    h_dec: &[[f64; MAX_TOTAL_GRU_LANES]],
+    s2: &[f64],
 ) -> Vec<Vec<f64>> {
-    let n = traj.s2_out[ch].len();
-    let c_cnt = tier_cascade_lanes(tier);
-    let f_cnt = tier_fir_segments(tier) * 16;
-    let k_cnt = k_override.unwrap_or_else(|| tier_kautz_banks(tier) * 4);
-    let p_dim = 7 + c_cnt + f_cnt + 2 * k_cnt;
+    let n = s2.len();
+    let c_t = tier_block_lanes(tier);
+    let f_t = tier_fir_segments(tier) * 16;
+    let k_t = (tier_kautz_banks(tier) * 4).min(k_keep);
+    let p_dim = 9 + 3 * c_t + f_t + 2 * k_t;
     let mut cols = vec![vec![0.0_f64; n]; p_dim];
     for t in 0..n {
         for i in 0..7 {
-            cols[i][t] = traj.taps[ch][t][i];
+            cols[i][t] = tap_dec[t][i];
         }
-        for l in 0..c_cnt {
-            cols[7 + l][t] = traj.h_dn[ch][t][l];
+        cols[7][t] = u_dec[t];
+        cols[8][t] = hp_dec[t];
+        let mut idx = 9;
+        for b in 0..NUM_GRU_BLOCKS {
+            let base = b * MAX_BLOCK_LANES;
+            for l in 0..c_t {
+                cols[idx][t] = h_dec[t][base + l];
+                idx += 1;
+            }
+        }
+        for k in 0..f_t {
+            if t >= k {
+                cols[idx + k][t] = s2[t - k];
+            }
         }
     }
-    let s2 = &traj.s2_out[ch];
-    for k in 0..f_cnt.min(n) {
-        let col = &mut cols[7 + c_cnt + k];
-        col[k..n].copy_from_slice(&s2[..n - k]);
+    let k_base = 9 + 3 * c_t + f_t;
+    if k_t > 0 {
+        let pre = kautz_pre_tuples(&poles[..k_t]);
+        B::filter_pole_bank_columns(s2, KAUTZ_DELAY_SAMPLES, &pre, &mut cols, k_base);
     }
-    let k_base = 7 + c_cnt + f_cnt;
-    let pre: Vec<(f64, f64, f64)> = (0..k_cnt)
-        .map(|m| {
-            let r = kautz_poles[m].0.clamp(0.50, 0.997);
-            let th = kautz_poles[m].1.clamp(1.0e-3, PI - 1.0e-3);
-            let bg = (1.0 - r * r).max(1.0e-7).sqrt();
-            let (st, ct) = th.sin_cos();
-            (r * ct, r * st, bg)
-        })
-        .collect();
-    B::filter_pole_bank_columns(s2, 16, &pre, &mut cols, k_base);
     cols
 }
 
-fn solve_weighted_basis<B: TrainerBackend>(
-    model: &mut V3OptModelF64,
-    dataset: &V3TrainDataset,
-    trajs: &[StemTraj],
-    k_override: Option<usize>,
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_tier_columns<B: TrainerBackend>(
+    tier: Tier,
+    poles: &[(f64, f64)],
+    tap_dec: &[[f64; 7]],
+    u_dec: &[f64],
+    hp_dec: &[f64],
+    h_dec: &[[f64; MAX_TOTAL_GRU_LANES]],
+    s2: &[f64],
+) -> Vec<Vec<f64>> {
+    build_tier_columns_with_kautz_cap::<B>(
+        tier,
+        poles,
+        tier_kautz_banks(tier) * 4,
+        tap_dec,
+        u_dec,
+        hp_dec,
+        h_dec,
+        s2,
+    )
+}
+
+pub(super) fn unpack_theta_k_to_readout(
+    tier: Tier,
+    ch: usize,
+    k_keep: usize,
+    theta: &[f64],
+    r: &mut V3TierReadoutF64,
 ) {
-    let tier = model.tier;
-    let c_cnt = tier_cascade_lanes(tier);
-    let f_cnt = tier_fir_segments(tier) * 16;
-    let k_cnt = k_override.unwrap_or_else(|| tier_kautz_banks(tier) * 4);
-    let p_dim = 7 + c_cnt + f_cnt + 2 * k_cnt;
-    let k_start = 7 + c_cnt + f_cnt;
-    let active_ch = if model.mono_out { 1 } else { 2 };
+    let c_t = tier_block_lanes(tier);
+    let f_t = tier_fir_segments(tier) * 16;
+    let k_t = (tier_kautz_banks(tier) * 4).min(k_keep);
+    if ch == 0 {
+        r.svf_direct_taps_l[..7].copy_from_slice(&theta[..7]);
+    } else {
+        r.svf_direct_taps_r[..7].copy_from_slice(&theta[..7]);
+    }
+    r.direct_s2_u_gain[ch] = theta[7];
+    r.direct_s2_hp_gain[ch] = theta[8];
+    let mut idx = 9;
+    r.direct_s2_w[ch].fill(0.0);
+    for b in 0..NUM_GRU_BLOCKS {
+        let base = b * MAX_BLOCK_LANES;
+        for l in 0..c_t {
+            r.direct_s2_w[ch][base + l] = theta[idx];
+            idx += 1;
+        }
+    }
+    let fir = if ch == 0 { &mut r.fir_l } else { &mut r.fir_r };
+    fir.fill(0.0);
+    fir[..f_t].copy_from_slice(&theta[idx..idx + f_t]);
+    idx += f_t;
+    let kc = if ch == 0 {
+        &mut r.kautz_c_l
+    } else {
+        &mut r.kautz_c_r
+    };
+    kc.fill((0.0, 0.0));
+    for m in 0..k_t {
+        kc[m] = (theta[idx + 2 * m], theta[idx + 2 * m + 1]);
+    }
+}
+
+pub(super) fn unpack_theta_to_readout(
+    tier: Tier,
+    ch: usize,
+    theta: &[f64],
+    r: &mut V3TierReadoutF64,
+) {
+    unpack_theta_k_to_readout(tier, ch, tier_kautz_banks(tier) * 4, theta, r);
+}
+
+pub(super) fn pack_readout_to_theta(tier: Tier, ch: usize, r: &V3TierReadoutF64) -> Vec<f64> {
+    let c_t = tier_block_lanes(tier);
+    let f_t = tier_fir_segments(tier) * 16;
+    let k_t = tier_kautz_banks(tier) * 4;
+    let mut theta = Vec::with_capacity(linear_basis_dim(tier));
+    let taps = if ch == 0 {
+        &r.svf_direct_taps_l
+    } else {
+        &r.svf_direct_taps_r
+    };
+    theta.extend_from_slice(&taps[..7]);
+    theta.push(r.direct_s2_u_gain[ch]);
+    theta.push(r.direct_s2_hp_gain[ch]);
+    for b in 0..NUM_GRU_BLOCKS {
+        let base = b * MAX_BLOCK_LANES;
+        for l in 0..c_t {
+            theta.push(r.direct_s2_w[ch][base + l]);
+        }
+    }
+    let fir = if ch == 0 { &r.fir_l } else { &r.fir_r };
+    theta.extend_from_slice(&fir[..f_t]);
+    let kc = if ch == 0 { &r.kautz_c_l } else { &r.kautz_c_r };
+    for &(re, im) in &kc[..k_t] {
+        theta.push(re);
+        theta.push(im);
+    }
+    theta
+}
+
+pub(super) fn map_prev_tier_anchor(
+    tau: usize,
+    prev_r: &V3TierReadoutF64,
+    ch: usize,
+) -> Vec<(usize, f64)> {
+    let prev_t = ALL_TIERS[tau - 1];
+    let cur_t = ALL_TIERS[tau];
+    let cp = tier_block_lanes(prev_t);
+    let cc = tier_block_lanes(cur_t);
+    let fp = tier_fir_segments(prev_t) * 16;
+    let fc = tier_fir_segments(cur_t) * 16;
+    let kp = tier_kautz_banks(prev_t) * 4;
+    let pt = pack_readout_to_theta(prev_t, ch, prev_r);
+    let mut out = Vec::with_capacity(pt.len());
+    for (i, &val) in pt.iter().enumerate().take(9) {
+        out.push((i, val));
+    }
+    let mut pidx = 9;
+    for b in 0..NUM_GRU_BLOCKS {
+        for l in 0..cp {
+            out.push((9 + b * cc + l, pt[pidx]));
+            pidx += 1;
+        }
+    }
+    let f_base = 9 + 3 * cc;
+    for k in 0..fp {
+        out.push((f_base + k, pt[pidx]));
+        pidx += 1;
+    }
+    let k_base = f_base + fc;
+    for m in 0..2 * kp {
+        out.push((k_base + m, pt[pidx + m]));
+    }
+    out
+}
+
+pub(super) fn split_append_3band(
+    bank: &Bezout7FilterBank,
+    sig: &[f64],
+    warmup: usize,
+    sq_bw: [f64; 3],
+    out_w: &mut Vec<f64>,
+) {
+    let w = warmup.min(sig.len());
     let mut bands = [Vec::new(), Vec::new(), Vec::new()];
-    let mut col_re = Vec::<f64>::new();
-    let mut col_im = Vec::<f64>::new();
-
-    for ch in 0..active_ch {
-        let mut phi_w = vec![Vec::<f64>::new(); p_dim];
-        let mut y_w = Vec::<f64>::new();
-        for (st_idx, stem) in dataset.stems.iter().enumerate() {
-            let n = trajs[st_idx].s2_out[ch].len();
-            let w = stem.warmup.min(n);
-            if n <= w {
-                continue;
-            }
-            let bw = dataset.stem_band_weights[st_idx][ch];
-            let sq_w = [bw[0].sqrt(), bw[1].sqrt(), bw[2].sqrt()];
-            let tgt_src: Vec<f64> = if ch == 0 {
-                &stem.tgt_l[..n]
-            } else {
-                &stem.tgt_r[..n]
-            }
-            .iter()
-            .map(|&v| v as f64)
-            .collect();
-            dataset.bank.split_3band(&tgt_src, &mut bands);
-            for b in 0..3 {
-                y_w.extend(bands[b][w..n].iter().map(|&v| v * sq_w[b]));
-            }
-            let cols =
-                build_channel_basis::<B>(tier, &model.kautz_poles, &trajs[st_idx], ch, k_override);
-            for (j, col) in cols.iter().enumerate() {
-                dataset.bank.split_3band(col, &mut bands);
-                for b in 0..3 {
-                    phi_w[j].extend(bands[b][w..n].iter().map(|&v| v * sq_w[b]));
-                }
-            }
-            let gab_sum = &dataset.gabor_targets[st_idx][ch];
-            let stem_w = dataset.stem_weights[st_idx];
-            for (b, spec) in dataset.gabor_bank.bands.iter().enumerate() {
-                let m_cnt = gab_sum.n_frames[b];
-                if m_cnt == 0 {
-                    continue;
-                }
-                let sq_g = (stem_w * gab_sum.varpro_band_w[b]).sqrt();
-                if sq_g <= 0.0 {
-                    continue;
-                }
-                let off = gab_sum.band_offsets[b];
-                for m in 0..m_cnt {
-                    y_w.push(gab_sum.tgt_re[off + m] * sq_g);
-                    y_w.push(gab_sum.tgt_im[off + m] * sq_g);
-                }
-                col_re.resize(m_cnt, 0.0);
-                col_im.resize(m_cnt, 0.0);
-                for (j, col) in cols.iter().enumerate() {
-                    spec.project_frames_with_backend::<B>(col, w, &mut col_re, &mut col_im);
-                    for m in 0..m_cnt {
-                        phi_w[j].push(col_re[m] * sq_g);
-                        phi_w[j].push(col_im[m] * sq_g);
-                    }
-                }
-            }
+    bank.split_3band(sig, &mut bands);
+    let seg = sig.len().saturating_sub(w);
+    let start = out_w.len();
+    out_w.resize(start + 3 * seg, 0.0);
+    for (b, band) in bands.iter().enumerate() {
+        let s = sq_bw[b];
+        let dst = &mut out_w[start + b * seg..start + (b + 1) * seg];
+        for (d, &v) in dst.iter_mut().zip(&band[w..sig.len()]) {
+            *d = s * v;
         }
-        if y_w.is_empty() {
-            continue;
-        }
-        let mut gram = vec![0.0_f64; uplo_u_packed_len(p_dim)];
-        let mut rhs = vec![[0.0_f64; 2]; p_dim];
-        let diag_sum = B::assemble_uplo_gram_and_rhs(&phi_w, &y_w, &mut gram, &mut rhs);
-        let avg_diag = (diag_sum / (p_dim as f64).max(1.0)).max(1.0e-12);
-        let base_ridge = (1.0e-10 * avg_diag).max(1.0e-12);
-        let direct_ridge = 1.0e-5 * avg_diag;
-        for j in 0..7.min(p_dim) {
-            gram[uplo_u_index(j, j)] += direct_ridge;
-        }
-        let kautz_ridge = 1.0e-7 * avg_diag;
-        for j in k_start..p_dim {
-            gram[uplo_u_index(j, j)] += kautz_ridge;
-        }
-        if let Ok(sol) = solve_uplo_u_cholesky_2ch(&gram, &rhs, base_ridge) {
-            let dir_t = if ch == 0 {
-                &mut model.svf_direct_taps_l
-            } else {
-                &mut model.svf_direct_taps_r
-            };
-            for i in 0..7 {
-                dir_t[i] = sol[i][0];
-            }
-            for l in 0..c_cnt {
-                model.direct_s2_w[ch][l] = sol[7 + l][0];
-            }
-            let fir = if ch == 0 {
-                &mut model.fir_l
-            } else {
-                &mut model.fir_r
-            };
-            for k in 0..f_cnt {
-                fir[k] = sol[7 + c_cnt + k][0];
-            }
-            let kc = if ch == 0 {
-                &mut model.kautz_c_l
-            } else {
-                &mut model.kautz_c_r
-            };
-            for m in 0..k_cnt {
-                kc[m] = (sol[k_start + 2 * m][0], sol[k_start + 2 * m + 1][0]);
-            }
-        }
-    }
-    if model.mono_out {
-        model.svf_direct_taps_r = model.svf_direct_taps_l;
-        model.direct_s2_w[1] = model.direct_s2_w[0];
-        model.fir_r = model.fir_l;
-        model.kautz_c_r = model.kautz_c_l;
     }
 }
 
-/// Solves closed-form Bézout-weighted `VarPro` Cholesky directly on [`V3OptModelF64`] via backend `B`.
-pub fn solve_bezout_varpro_cholesky_with_backend<B: TrainerBackend>(
-    model: &mut V3OptModelF64,
-    dataset: &V3TrainDataset,
-) {
-    let trajs: Vec<StemTraj> = dataset
-        .stems
-        .iter()
-        .map(|st| extract_traj_opt(model, st, None))
-        .collect();
-    solve_weighted_basis::<B>(model, dataset, &trajs, None);
+pub(super) struct StemChanTraj {
+    pub(super) tap: Vec<[f64; 7]>,
+    pub(super) u: Vec<f64>,
+    pub(super) hp: Vec<f64>,
+    pub(super) h: Vec<[f64; MAX_TOTAL_GRU_LANES]>,
 }
 
-/// Solves closed-form Bézout-weighted `VarPro` Cholesky directly on [`V3OptModelF64`].
-pub fn solve_bezout_varpro_cholesky(model: &mut V3OptModelF64, dataset: &V3TrainDataset) {
-    struct VarProTask<'a> {
-        model: &'a mut V3OptModelF64,
-        dataset: &'a V3TrainDataset,
+pub(super) fn solve_uplo_with_bypass_and_anchor(
+    p_dim: usize,
+    gram: &[f64],
+    rhs: &[[f64; 2]],
+    bypass_cols: &[(usize, f64)],
+    anchor: &[(usize, f64)],
+    anchor_scale: f64,
+) -> Vec<f64> {
+    let mut trace = 0.0_f64;
+    for j in 0..p_dim {
+        trace += gram[uplo_u_index(j, j)];
     }
-    impl TrainerTask<()> for VarProTask<'_> {
-        fn run<B: TrainerBackend>(self) {
-            solve_bezout_varpro_cholesky_with_backend::<B>(self.model, self.dataset);
+    let mean_diag = (trace / (p_dim.max(1) as f64)).max(1.0e-12);
+    let mut g_work = gram.to_vec();
+    let mut r_work = rhs.to_vec();
+    for &(idx, scale) in bypass_cols {
+        if idx < p_dim && scale > 0.0 {
+            g_work[uplo_u_index(idx, idx)] += scale * mean_diag;
         }
     }
-    DynamicTrainer::detect().dispatch(VarProTask { model, dataset });
-}
-
-/// Solves Bézout-weighted `VarPro` Cholesky using the actual `f32` `V3HotCore` pre-cabinet trajectory via backend `B`.
-pub fn solve_bezout_varpro_cholesky_f32_with_backend<B: TrainerBackend>(
-    model: &mut V3ColdTierModel,
-    dataset: &V3TrainDataset,
-) {
-    let mut probe = model.clone();
-    probe.svf.direct_taps_l = [0.0; 8];
-    probe.svf.direct_taps_r = [0.0; 8];
-    probe.direct_s2_w = [[0.0; MAX_CASCADE_LANES]; 2];
-    probe.fir_l = [0.0; 64];
-    probe.fir_r = [0.0; 64];
-    probe.fir_l[0] = 1.0;
-    probe.fir_r[0] = 1.0;
-    probe.kautz_c_l = [(0.0, 0.0); MAX_KAUTZ_POLES];
-    probe.kautz_c_r = [(0.0, 0.0); MAX_KAUTZ_POLES];
-
-    let mut opt = V3OptModelF64::from_cold_model(model);
-    let mut inst = V3CoreInstance::<B>::from_cold_model(&probe);
-    let trajs: Vec<StemTraj> = dataset
-        .stems
-        .iter()
-        .map(|st| {
-            let n = st
-                .in_l
-                .len()
-                .min(st.in_r.len())
-                .min(st.tgt_l.len())
-                .min(st.tgt_r.len());
-            let (mut s2_l, mut s2_r) = (vec![0.0_f32; n], vec![0.0_f32; n]);
-            let r_in = if model.mono_out {
-                &st.in_l[..n]
-            } else {
-                &st.in_r[..n]
-            };
-            inst.reset_to_dc_equilibrium();
-            inst.process_block_stereo(&st.in_l[..n], r_in, &mut s2_l, &mut s2_r);
-            let ov = [
-                s2_l.iter().map(|&v| v as f64).collect(),
-                s2_r.iter().map(|&v| v as f64).collect(),
-            ];
-            extract_traj_opt(&opt, st, Some(&ov))
-        })
-        .collect();
-    solve_weighted_basis::<B>(&mut opt, dataset, &trajs, None);
-    *model = opt.to_cold_model();
-}
-
-/// Solves Bézout-weighted `VarPro` Cholesky using the actual `f32` `V3HotCore` pre-cabinet trajectory.
-pub fn solve_bezout_varpro_cholesky_f32(model: &mut V3ColdTierModel, dataset: &V3TrainDataset) {
-    struct VarProF32Task<'a> {
-        model: &'a mut V3ColdTierModel,
-        dataset: &'a V3TrainDataset,
-    }
-    impl TrainerTask<()> for VarProF32Task<'_> {
-        fn run<B: TrainerBackend>(self) {
-            solve_bezout_varpro_cholesky_f32_with_backend::<B>(self.model, self.dataset);
-        }
-    }
-    DynamicTrainer::detect().dispatch(VarProF32Task { model, dataset });
-}
-
-/// Selects complex conjugate Kautz poles `start_pole..end_pole` via 160-pole Orthogonal Matching Pursuit.
-pub fn select_omp_kautz_poles(
-    model: &mut V3OptModelF64,
-    dataset: &V3TrainDataset,
-    start_pole: usize,
-    end_pole: usize,
-) {
-    struct OmpTask<'a> {
-        model: &'a mut V3OptModelF64,
-        dataset: &'a V3TrainDataset,
-        start_pole: usize,
-        end_pole: usize,
-    }
-    impl TrainerTask<()> for OmpTask<'_> {
-        fn run<B: TrainerBackend>(self) {
-            select_omp_kautz_poles_with_backend::<B>(
-                self.model,
-                self.dataset,
-                self.start_pole,
-                self.end_pole,
-            );
-        }
-    }
-    DynamicTrainer::detect().dispatch(OmpTask {
-        model,
-        dataset,
-        start_pole,
-        end_pole,
-    });
-}
-
-/// Backend-parameterized complex conjugate Kautz pole selector via Orthogonal Matching Pursuit.
-pub fn select_omp_kautz_poles_with_backend<B: TrainerBackend>(
-    model: &mut V3OptModelF64,
-    dataset: &V3TrainDataset,
-    start_pole: usize,
-    end_pole: usize,
-) {
-    let end = end_pole.min(MAX_KAUTZ_POLES);
-    if start_pole >= end {
-        return;
-    }
-    let trajs: Vec<StemTraj> = dataset
-        .stems
-        .iter()
-        .map(|st| extract_traj_opt(model, st, None))
-        .collect();
-    for m in start_pole..MAX_KAUTZ_POLES {
-        model.kautz_c_l[m] = (0.0, 0.0);
-        model.kautz_c_r[m] = (0.0, 0.0);
-    }
-    let mut sub_opt = model.clone();
-    let c_cnt = tier_cascade_lanes(model.tier);
-    let f_cnt = tier_fir_segments(model.tier) * 16;
-    solve_weighted_basis::<B>(&mut sub_opt, dataset, &trajs, Some(start_pole));
-
-    let active_ch = if model.mono_out { 1 } else { 2 };
-    let mut res_w = Vec::<f64>::new();
-    let mut bands = [Vec::new(), Vec::new(), Vec::new()];
-    let mut s2_delayed_streams: Vec<(usize, usize, Vec<f64>)> = Vec::new();
-    for (st_idx, stem) in dataset.stems.iter().enumerate() {
-        let n = trajs[st_idx].s2_out[0].len();
-        let w = stem.warmup.min(n);
-        if n <= w {
-            continue;
-        }
-        for ch in 0..active_ch {
-            let bw = dataset.stem_band_weights[st_idx][ch];
-            let sq_w = [bw[0].sqrt(), bw[1].sqrt(), bw[2].sqrt()];
-            let mut y_cur = vec![0.0_f64; n];
-            let cols = build_channel_basis::<B>(
-                model.tier,
-                &sub_opt.kautz_poles,
-                &trajs[st_idx],
-                ch,
-                Some(start_pole),
-            );
-            let dir_t = if ch == 0 {
-                &sub_opt.svf_direct_taps_l
-            } else {
-                &sub_opt.svf_direct_taps_r
-            };
-            let fir = if ch == 0 {
-                &sub_opt.fir_l
-            } else {
-                &sub_opt.fir_r
-            };
-            let kc = if ch == 0 {
-                &sub_opt.kautz_c_l
-            } else {
-                &sub_opt.kautz_c_r
-            };
-            for t in 0..n {
-                let mut yv = 0.0;
-                for i in 0..7 {
-                    yv += dir_t[i] * cols[i][t];
-                }
-                for l in 0..c_cnt {
-                    yv += sub_opt.direct_s2_w[ch][l] * cols[7 + l][t];
-                }
-                for k in 0..f_cnt {
-                    yv += fir[k] * cols[7 + c_cnt + k][t];
-                }
-                let kb = 7 + c_cnt + f_cnt;
-                for m in 0..start_pole {
-                    yv += kc[m].0 * cols[kb + 2 * m][t] + kc[m].1 * cols[kb + 2 * m + 1][t];
-                }
-                let tgt = if ch == 0 {
-                    stem.tgt_l[t]
-                } else {
-                    stem.tgt_r[t]
-                } as f64;
-                y_cur[t] = tgt - yv;
-            }
-            dataset.bank.split_3band(&y_cur, &mut bands);
-            for b in 0..3 {
-                res_w.extend(bands[b][w..n].iter().map(|&v| v * sq_w[b]));
-            }
-            s2_delayed_streams.push((st_idx, ch, trajs[st_idx].s2_out[ch].clone()));
-        }
-    }
-    if res_w.is_empty() {
-        return;
-    }
-
-    // Build 160-pole dictionary (32 log-spaced freqs 18 Hz..16 kHz x 5 damping radii)
-    let radii = [0.75_f64, 0.87, 0.94, 0.982, 0.9955];
-    let mut dict_poles = Vec::with_capacity(160);
-    let mut dict_re = Vec::with_capacity(160);
-    let mut dict_im = Vec::with_capacity(160);
-    let log_lo = 18.0_f64.ln();
-    let log_hi = 16_000.0_f64.ln();
-    for fi in 0..32 {
-        let freq = (log_lo + (log_hi - log_lo) * (fi as f64) / 31.0).exp();
-        let th = (2.0 * PI * freq / dataset.sample_rate_hz).clamp(1.0e-3, PI - 1.0e-3);
-        let (st, ct) = th.sin_cos();
-        for &r in &radii {
-            let bg = (1.0 - r * r).max(1.0e-7).sqrt();
-            let (lr, li) = (r * ct, r * st);
-            let (mut col_re, mut col_im) = (
-                Vec::with_capacity(res_w.len()),
-                Vec::with_capacity(res_w.len()),
-            );
-            for (st_idx, ch, s2) in &s2_delayed_streams {
-                let n = s2.len();
-                let w = dataset.stems[*st_idx].warmup.min(n);
-                let bw = dataset.stem_band_weights[*st_idx][*ch];
-                let sq_w = [bw[0].sqrt(), bw[1].sqrt(), bw[2].sqrt()];
-                let (mut raw_re, mut raw_im) = (vec![0.0_f64; n], vec![0.0_f64; n]);
-                let (mut sr, mut si) = (0.0_f64, 0.0_f64);
-                for t in 0..n {
-                    let xd = if t >= 16 { s2[t - 16] } else { 0.0 };
-                    let nr = lr * sr - li * si + bg * xd;
-                    let ni = li * sr + lr * si;
-                    sr = nr;
-                    si = ni;
-                    raw_re[t] = nr;
-                    raw_im[t] = -ni;
-                }
-                dataset.bank.split_3band(&raw_re, &mut bands);
-                for b in 0..3 {
-                    col_re.extend(bands[b][w..n].iter().map(|&v| v * sq_w[b]));
-                }
-                dataset.bank.split_3band(&raw_im, &mut bands);
-                for b in 0..3 {
-                    col_im.extend(bands[b][w..n].iter().map(|&v| v * sq_w[b]));
-                }
-            }
-            B::orthonormalize_pole_pair(&mut col_re, &mut col_im);
-            dict_poles.push((r, th));
-            dict_re.push(col_re);
-            dict_im.push(col_im);
-        }
-    }
-
-    let mut chosen: Vec<(f64, f64)> = model.kautz_poles[..start_pole].to_vec();
-    let mut orth_basis: Vec<Vec<f64>> = Vec::new();
-    for slot in start_pole..end {
-        let mut best_idx = 0;
-        let mut best_score = -1.0_f64;
-        for (di, &(r, th)) in dict_poles.iter().enumerate() {
-            if chosen
-                .iter()
-                .any(|&(cr, ct)| (cr - r).abs() < 0.01 && (ct - th).abs() < 0.025)
-            {
-                continue;
-            }
-            let sc = B::score_pole_pair(&res_w, &dict_re[di], &dict_im[di]);
-            if sc > best_score {
-                best_score = sc;
-                best_idx = di;
-            }
-        }
-        model.kautz_poles[slot] = dict_poles[best_idx];
-        chosen.push(dict_poles[best_idx]);
-        for cand in [&dict_re[best_idx], &dict_im[best_idx]] {
-            let mut u = cand.clone();
-            for q in &orth_basis {
-                let p = B::dot_f64(&u, q);
-                B::axpy_f64(&mut u, -p, q);
-            }
-            let un = B::sum_sq_f64(&u).sqrt();
-            if un > 1.0e-10 {
-                B::scale_f64(&mut u, un.recip());
-                let rp = B::dot_f64(&res_w, &u);
-                B::axpy_f64(&mut res_w, -rp, &u);
-                orth_basis.push(u);
+    if anchor_scale > 0.0 && !anchor.is_empty() {
+        let lam_a = anchor_scale * mean_diag;
+        for &(idx, val) in anchor {
+            if idx < p_dim {
+                g_work[uplo_u_index(idx, idx)] += lam_a;
+                r_work[idx][0] += lam_a * val;
             }
         }
     }
-    solve_weighted_basis::<B>(model, dataset, &trajs, None);
+    for &mult in &[1.0e-8, 1.0e-7, 1.0e-6, 1.0e-5, 1.0e-3, 1.0e-1] {
+        let ridge = mult * mean_diag + 1.0e-11;
+        if let Ok(sol) = solve_uplo_u_cholesky_2ch(&g_work, &r_work, ridge) {
+            return sol.into_iter().map(|c| c[0]).collect();
+        }
+    }
+    vec![0.0; p_dim]
 }

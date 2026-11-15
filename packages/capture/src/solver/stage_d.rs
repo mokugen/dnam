@@ -144,7 +144,9 @@ enum LaneSource {
 }
 
 pub use super::stages::write_inline_cp1_if_fits;
-use super::stages::{decode_coreset_frame_lr_at, harvest_and_resolve_mode0_for_stage_d};
+use super::stages::{
+    Mode0GramHint, decode_coreset_frame_lr_at, harvest_and_resolve_mode0_for_stage_d,
+};
 
 /// Executes Stage D (`< 5 ms` Arbitrary-`P` `CP1` Control Projections, Kronecker SVD Modes `1..8`,
 /// Walsh-Hadamard `U_int` Factorization Machines & Full 3-Phase Audit, `r[train.pipeline.stage-d-control]`).
@@ -361,9 +363,11 @@ pub fn solve_stage_d_cp1_and_audit_with_harvest(
         dry_lr,
         &star_ctrls,
         precomputed_backbone_harvest,
-        cached_packed_gram_256,
-        star_emr_w.as_deref(),
-        gram_frame_stride,
+        Mode0GramHint {
+            cached_packed_gram_256,
+            star_emr_w: star_emr_w.as_deref(),
+            gram_frame_stride,
+        },
     )?;
     let n_frames = resolved.n_total_frames;
     let star_gram_256 = resolved.gram_256;

@@ -555,6 +555,14 @@ mod tests {
         assert_eq!(cr.step(0.875), 0.5);
         assert_eq!(cr.phase, saved_phase);
 
+        let mut fhz = FixedHzBitcrusher::default();
+        assert!(fhz.set_sample_rate(96_000.0).is_some());
+        let _ = fhz.step(0.25);
+        assert_eq!(fhz.step(0.25), 0.25);
+        assert!(FixedHzBitcrusher::new(8, -1.0, 48_000.0).is_none());
+        assert!(hertz_phase_parameters(1.0, 1e12).is_none());
+        assert!(hertz_phase_parameters(1e-30, 48_000.0).is_none());
+
         let rates = [44_100.0_f64, 48_000.0, 96_000.0, 192_000.0, 384_000.0];
         for &old_r in &rates {
             let (_, d_old, r_recip) = hertz_phase_parameters(12_000.0, old_r).unwrap();

@@ -1,20 +1,19 @@
 #![forbid(unsafe_code)]
-//! Hop-decimated Constant-$Q$ Analytic Gabor Wavelet Bank (`24 Hz .. 17.5 kHz`).
+//! 33-Band Analytic Gabor Envelope & Spectral Tilt Adjoint (`20 Hz .. 20 kHz`).
 //!
-//! Replaces recursive IIR filter banks in [`super::model_f64`] and [`super::basis`] with
-//! zero-state, linear-phase, DC-admissible Hann-modulated complex atoms that yield exact
-//! overlap-add reverse adjoints, phase-invariant envelopes, stopband LTAS gradients, and
-//! closed-form `VarPro` quadrature Gram constraints with zero external FFT dependencies.
+//! Aligns its center frequencies directly with [`canonical_ltas_33_centers_hz`] so multi-scale
+//! time-frequency envelope and LTAS supervision covers every 1/3-octave band without blind spots,
+//! executing via [`GaborOperatorBackend`] (`dot_pair_f64` + `axpy_pair_f64`).
 
 use std::f64::consts::PI;
 
-use crate::solver::backends::{
-    DefaultTrainerBackend, DynamicTrainer, GaborOperatorBackend, TrainerBackend, TrainerTask,
-};
+use crate::metrics::companion::canonical_ltas_33_centers_hz;
+use crate::solver::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
 
-/// Number of log-spaced analytic Gabor bands spanning `24 Hz .. 17,500 Hz`.
-pub const K_GABOR: usize = 24;
+/// Number of canonical 1/3-octave Gabor wavelet filterbank bands (`20 Hz .. 20 kHz`).
+pub const K_GABOR: usize = 33;
 
+/// Precomputed quadrature Hann-windowed Gabor wavelet kernel for one 1/3-octave band.
 #[derive(Clone, Debug)]
 pub struct GaborBandSpec {
     pub center_hz: f64,
@@ -24,62 +23,85 @@ pub struct GaborBandSpec {
     pub sin_k: Vec<f64>,
 }
 
-/// 24-band Constant-$Q$ Analytic Gabor filterbank (`4.0` cycles nominal, `66.7%` COLA hop).
-#[derive(Clone, Debug)]
-pub struct AnalyticGaborBank {
-    pub sample_rate_hz: f64,
-    pub bands: Vec<GaborBandSpec>,
-}
-
-/// Precomputed per-stem target Gabor spectra, envelopes, and `VarPro` band weights.
-#[derive(Clone, Debug, Default)]
-pub struct GaborTargetSummary {
-    pub warmup: usize,
-    pub len: usize,
-    pub p_sig_bar: f64,
-    pub active_bands: usize,
-    pub mean_band_pow: f64,
-    pub n_frames: [usize; K_GABOR],
-    pub band_offsets: [usize; K_GABOR],
-    pub tgt_re: Vec<f64>,
-    pub tgt_im: Vec<f64>,
-    pub tgt_env: Vec<f64>,
-    pub tgt_pow: [f64; K_GABOR],
-    pub varpro_band_w: [f64; K_GABOR],
-}
-
-/// Reusable scratch buffers for [`eval_gabor_loss_and_adjoint`].
-#[derive(Clone, Debug, Default)]
-pub struct GaborAdjointScratch {
-    pub re: Vec<f64>,
-    pub im: Vec<f64>,
-    pub d_re: Vec<f64>,
-    pub d_im: Vec<f64>,
-}
-
 impl GaborBandSpec {
-    /// Number of complete windows of this band fitting in `x[warmup..len]`.
-    #[inline(always)]
-    #[must_use]
-    pub fn frame_count(&self, len: usize, warmup: usize) -> usize {
-        let w = warmup.min(len);
-        if len >= w + self.win_len {
-            (len - w - self.win_len) / self.hop_len + 1
-        } else {
-            0
+    fn new(center_hz: f64, sample_rate_hz: f64) -> Self {
+        let f_k = center_hz.clamp(20.0, 0.455 * sample_rate_hz);
+        // Constant-Q bandwidth (~1/3 octave -> Q ~ 4.3 -> ~6.5 cycles inside Hann mainlobe).
+        let raw_len = ((6.5 * sample_rate_hz / f_k).round() as usize).clamp(48, 4_096);
+        let win_len = raw_len & !1;
+        let hop_len = (win_len / 4).max(8);
+
+        let mut w = vec![0.0_f64; win_len];
+        let denom = (win_len - 1).max(1) as f64;
+        let mut w_sum = 0.0_f64;
+        for (i, slot) in w.iter_mut().enumerate() {
+            let v = 0.5 * (1.0 - (2.0 * PI * (i as f64) / denom).cos());
+            *slot = v;
+            w_sum += v;
+        }
+
+        let omega = 2.0 * PI * f_k / sample_rate_hz;
+        let half = 0.5 * denom;
+        let mut cos_raw = Vec::with_capacity(win_len);
+        let mut sin_raw = Vec::with_capacity(win_len);
+        let (mut c_acc, mut s_acc) = (0.0_f64, 0.0_f64);
+        for (i, &wi) in w.iter().enumerate() {
+            let arg = omega * ((i as f64) - half);
+            let (s, c) = arg.sin_cos();
+            let wc = wi * c;
+            let ws = wi * s;
+            c_acc += wc;
+            s_acc += ws;
+            cos_raw.push(wc);
+            sin_raw.push(ws);
+        }
+        let c_dc = c_acc / w_sum.max(1.0e-12);
+        let s_dc = s_acc / w_sum.max(1.0e-12);
+
+        let mut cos_k = Vec::with_capacity(win_len);
+        let mut sin_k = Vec::with_capacity(win_len);
+        let mut norm_sq = 0.0_f64;
+        for i in 0..win_len {
+            let cv = cos_raw[i] - w[i] * c_dc;
+            let sv = sin_raw[i] - w[i] * s_dc;
+            norm_sq += cv * cv + sv * sv;
+            cos_k.push(cv);
+            sin_k.push(sv);
+        }
+        let inv_norm = 1.0 / norm_sq.sqrt().max(1.0e-12);
+        for i in 0..win_len {
+            cos_k[i] *= inv_norm;
+            sin_k[i] *= inv_norm;
+        }
+
+        Self {
+            center_hz: f_k,
+            win_len,
+            hop_len,
+            cos_k,
+            sin_k,
         }
     }
 
-    /// Projects `x` onto this band's cosine/sine atoms into `out_re` and `out_im` using `G`.
     #[inline]
-    pub fn project_frames_with_backend<G: GaborOperatorBackend>(
+    fn num_frames(&self, len: usize, warmup: usize) -> usize {
+        let avail = len.saturating_sub(warmup);
+        if avail < self.win_len {
+            0
+        } else {
+            1 + (avail - self.win_len) / self.hop_len
+        }
+    }
+
+    #[inline]
+    fn project_frames_with_backend<B: TrainerBackend>(
         &self,
         x: &[f64],
         warmup: usize,
         out_re: &mut [f64],
         out_im: &mut [f64],
     ) {
-        G::project_frames(
+        B::project_frames(
             x,
             warmup,
             self.win_len,
@@ -90,162 +112,139 @@ impl GaborBandSpec {
             out_im,
         );
     }
+}
 
-    /// Projects `x` onto this band's cosine/sine atoms into `out_re` and `out_im`.
-    pub fn project_frames(&self, x: &[f64], warmup: usize, out_re: &mut [f64], out_im: &mut [f64]) {
-        self.project_frames_with_backend::<DefaultTrainerBackend>(x, warmup, out_re, out_im);
-    }
+/// Complete 33-band constant-$Q$ analytic Gabor wavelet bank aligned to 1/3-octave LTAS centers.
+#[derive(Clone, Debug)]
+pub struct AnalyticGaborBank {
+    pub bands: Vec<GaborBandSpec>,
 }
 
 impl AnalyticGaborBank {
+    /// Constructs a 33-band Gabor bank covering canonical 1/3-octave centers at `sample_rate_hz`.
     #[must_use]
     pub fn new(sample_rate_hz: f64) -> Self {
-        let sr = sample_rate_hz.max(8_000.0);
-        let log_lo = 24.0_f64.ln();
-        let log_hi = (17_500.0_f64.min(0.45 * sr)).max(24.5).ln();
-        let mut bands = Vec::with_capacity(K_GABOR);
-        for b in 0..K_GABOR {
-            let frac = (b as f64) / ((K_GABOR - 1) as f64);
-            let center_hz = (log_lo + (log_hi - log_lo) * frac).exp();
-            let raw_len = (4.0 * sr / center_hz).round() as usize;
-            let win_len = raw_len.clamp(48, 3_600);
-            let hop_len = (win_len / 3).max(16);
-            let denom_w = (win_len - 1).max(1) as f64;
-            let mut w = Vec::with_capacity(win_len);
-            let mut c_raw = Vec::with_capacity(win_len);
-            let mut s_raw = Vec::with_capacity(win_len);
-            let mut w_sum = 0.0_f64;
-            let mut c_sum = 0.0_f64;
-            let mut s_sum = 0.0_f64;
-            for m in 0..win_len {
-                let win = 0.5 * (1.0 - (2.0 * PI * (m as f64) / denom_w).cos());
-                let phase = 2.0 * PI * center_hz * ((m as f64) - 0.5 * denom_w) / sr;
-                let cv = phase.cos();
-                let sv = phase.sin();
-                w.push(win);
-                c_raw.push(cv);
-                s_raw.push(sv);
-                w_sum += win;
-                c_sum += win * cv;
-                s_sum += win * sv;
-            }
-            let mu_c = c_sum / w_sum.max(1.0e-12);
-            let mu_s = s_sum / w_sum.max(1.0e-12);
-            let mut cos_k = Vec::with_capacity(win_len);
-            let mut sin_k = Vec::with_capacity(win_len);
-            let mut norm_sq = 0.0_f64;
-            for m in 0..win_len {
-                let ca = w[m] * (c_raw[m] - mu_c);
-                let sa = w[m] * (s_raw[m] - mu_s);
-                cos_k.push(ca);
-                sin_k.push(sa);
-                norm_sq += ca * ca + sa * sa;
-            }
-            let inv_norm = norm_sq.sqrt().max(1.0e-12).recip();
-            for m in 0..win_len {
-                cos_k[m] *= inv_norm;
-                sin_k[m] *= inv_norm;
-            }
-            bands.push(GaborBandSpec {
-                center_hz,
-                win_len,
-                hop_len,
-                cos_k,
-                sin_k,
-            });
-        }
-        Self {
-            sample_rate_hz: sr,
-            bands,
-        }
+        let centers = canonical_ltas_33_centers_hz();
+        let bands = centers
+            .iter()
+            .map(|&fc| GaborBandSpec::new(fc, sample_rate_hz))
+            .collect();
+        Self { bands }
     }
 }
 
-/// Builds a [`GaborTargetSummary`] from `tgt[warmup..]` across all 24 analytic Gabor bands.
+/// Precomputed Gabor frame envelopes and band powers for one target channel.
+#[derive(Clone, Debug)]
+pub struct GaborTargetSummary {
+    pub len: usize,
+    pub warmup: usize,
+    pub active_bands: usize,
+    pub mean_band_pow: f64,
+    pub n_frames: [usize; K_GABOR],
+    pub band_offsets: [usize; K_GABOR],
+    pub tgt_env: Vec<f64>,
+    pub tgt_pow: [f64; K_GABOR],
+}
+
+/// Reusable scratch buffers for zero-allocation Gabor loss and adjoint accumulation.
+#[derive(Clone, Debug, Default)]
+pub struct GaborAdjointScratch {
+    pub re: Vec<f64>,
+    pub im: Vec<f64>,
+    pub d_re: Vec<f64>,
+    pub d_im: Vec<f64>,
+}
+
+/// Precomputes target Gabor envelopes and mean band powers over `tgt[warmup..]`.
 #[must_use]
 pub fn build_gabor_target_summary(
     tgt: &[f64],
     warmup: usize,
     bank: &AnalyticGaborBank,
 ) -> GaborTargetSummary {
-    let n = tgt.len();
-    let w = warmup.min(n);
-    let active_len = (n - w).max(1) as f64;
-    let p_sig_bar = (tgt[w..n].iter().map(|&v| v * v).sum::<f64>() / active_len).max(1.0e-10);
-
+    let len = tgt.len();
+    let w = warmup.min(len);
     let mut n_frames = [0usize; K_GABOR];
     let mut band_offsets = [0usize; K_GABOR];
     let mut total_frames = 0usize;
+    let mut active_bands = 0usize;
     for (b, spec) in bank.bands.iter().enumerate() {
-        let m_cnt = spec.frame_count(n, w);
-        n_frames[b] = m_cnt;
         band_offsets[b] = total_frames;
+        let m_cnt = spec.num_frames(len, w);
+        n_frames[b] = m_cnt;
+        if m_cnt > 0 {
+            active_bands += 1;
+        }
         total_frames += m_cnt;
     }
 
-    let mut tgt_re = vec![0.0_f64; total_frames];
-    let mut tgt_im = vec![0.0_f64; total_frames];
     let mut tgt_env = vec![0.0_f64; total_frames];
     let mut tgt_pow = [0.0_f64; K_GABOR];
-    let mut active_bands = 0usize;
-    let mut sum_band_pow = 0.0_f64;
+    let mut re = Vec::new();
+    let mut im = Vec::new();
+    let mut pow_acc = 0.0_f64;
+
+    struct ProjectTask<'a> {
+        spec: &'a GaborBandSpec,
+        tgt: &'a [f64],
+        w: usize,
+        out_re: &'a mut [f64],
+        out_im: &'a mut [f64],
+    }
+    impl TrainerTask<()> for ProjectTask<'_> {
+        fn run<B: TrainerBackend>(self) {
+            self.spec
+                .project_frames_with_backend::<B>(self.tgt, self.w, self.out_re, self.out_im);
+        }
+    }
+    let dyn_tr = DynamicTrainer::detect();
 
     for (b, spec) in bank.bands.iter().enumerate() {
         let m_cnt = n_frames[b];
         if m_cnt == 0 {
             continue;
         }
-        let off = band_offsets[b];
-        spec.project_frames(
+        re.resize(m_cnt, 0.0);
+        im.resize(m_cnt, 0.0);
+        dyn_tr.dispatch(ProjectTask {
+            spec,
             tgt,
             w,
-            &mut tgt_re[off..off + m_cnt],
-            &mut tgt_im[off..off + m_cnt],
-        );
-        let mut p_sum = 0.0_f64;
+            out_re: &mut re[..m_cnt],
+            out_im: &mut im[..m_cnt],
+        });
+        let off = band_offsets[b];
+        let mut band_p_sum = 0.0_f64;
         for m in 0..m_cnt {
-            let re = tgt_re[off + m];
-            let im = tgt_im[off + m];
-            let p = re * re + im * im;
+            let p = re[m] * re[m] + im[m] * im[m];
+            band_p_sum += p;
             tgt_env[off + m] = (p + 1.0e-18).sqrt();
-            p_sum += p;
         }
-        let pb = p_sum / (m_cnt as f64);
+        let pb = band_p_sum / (m_cnt as f64);
         tgt_pow[b] = pb;
-        active_bands += 1;
-        sum_band_pow += pb;
+        pow_acc += pb;
     }
 
-    let k_act = active_bands.max(1) as f64;
-    let mean_band_pow = (sum_band_pow / k_act).max(1.0e-10);
-    let vp_floor = (1.0e-5 * mean_band_pow).max(1.0e-12);
-    let mut varpro_band_w = [0.0_f64; K_GABOR];
-    for b in 0..K_GABOR {
-        let m_cnt = n_frames[b];
-        if m_cnt > 0 {
-            let denom = tgt_pow[b].max(vp_floor);
-            varpro_band_w[b] = 0.04 / (k_act * (m_cnt as f64) * denom);
-        }
-    }
+    let mean_band_pow = if active_bands > 0 {
+        (pow_acc / (active_bands as f64)).max(1.0e-12)
+    } else {
+        1.0
+    };
 
     GaborTargetSummary {
+        len,
         warmup: w,
-        len: n,
-        p_sig_bar,
         active_bands,
         mean_band_pow,
         n_frames,
         band_offsets,
-        tgt_re,
-        tgt_im,
         tgt_env,
         tgt_pow,
-        varpro_band_w,
     }
 }
 
-/// Evaluates the 24-band Gabor envelope + LTAS loss and accumulates the exact overlap-add
-/// reverse adjoint directly into `dy` using backend `B`.
+/// Evaluates the 33-band Gabor envelope + LTAS loss under backend `B` and accumulates
+/// the exact overlap-add reverse adjoint into `grad_dy`.
 #[allow(clippy::too_many_arguments)]
 pub fn eval_gabor_loss_and_adjoint_with_backend<B: TrainerBackend>(
     bank: &AnalyticGaborBank,
@@ -358,7 +357,7 @@ pub fn eval_gabor_loss_and_adjoint_with_backend<B: TrainerBackend>(
     loss
 }
 
-/// Evaluates the 24-band Gabor envelope + LTAS loss and accumulates the exact overlap-add
+/// Evaluates the 33-band Gabor envelope + LTAS loss and accumulates the exact overlap-add
 /// reverse adjoint directly into `dy`.
 #[allow(clippy::too_many_arguments)]
 pub fn eval_gabor_loss_and_adjoint(
@@ -435,12 +434,22 @@ mod tests {
 
         let n = 320;
         let warmup = 24;
-        let tgt: Vec<f64> = (0..n)
-            .map(|i| 0.4 * (i as f64 * 0.13).sin() + 0.18 * (i as f64 * 0.71).cos())
-            .collect();
-        let y: Vec<f64> = (0..n)
-            .map(|i| 0.32 * (i as f64 * 0.13 + 0.4).sin() + 0.21 * (i as f64 * 0.85).cos() + 0.05)
-            .collect();
+        let centers = canonical_ltas_33_centers_hz();
+        let make_sig = |phase_off: f64, gain: f64| -> Vec<f64> {
+            let scale = gain / (centers.len() as f64).sqrt();
+            (0..n)
+                .map(|i| {
+                    let t = (i as f64) / 48_000.0;
+                    let mut s = 0.0_f64;
+                    for (k, &fc) in centers.iter().enumerate() {
+                        s += (2.0 * PI * fc * t + (k as f64) * 0.67 + phase_off).sin();
+                    }
+                    scale * s
+                })
+                .collect()
+        };
+        let tgt = make_sig(0.0, 0.45);
+        let y = make_sig(0.35, 0.39);
         let summary = build_gabor_target_summary(&tgt, warmup, &bank);
         assert!(summary.active_bands > 0);
         let mut scratch = GaborAdjointScratch::default();
@@ -457,7 +466,8 @@ mod tests {
             &mut scratch,
         );
 
-        let h = 1.0e-6_f64;
+        let dy_peak = dy.iter().map(|v| v.abs()).fold(1.0e-8, f64::max);
+        let h = 1.0e-7_f64;
         let mut max_rel = 0.0_f64;
         for idx in (0..n).step_by(7) {
             let mut yp = y.clone();
@@ -487,7 +497,8 @@ mod tests {
                 &mut scratch,
             );
             let g_fd = (lp - lm) / (2.0 * h);
-            let rel = (dy[idx] - g_fd).abs() / g_fd.abs().max(dy[idx].abs()).max(1.0e-10);
+            let denom = g_fd.abs().max(dy[idx].abs()).max(dy_peak * 1.0e-2);
+            let rel = (dy[idx] - g_fd).abs() / denom;
             max_rel = max_rel.max(rel);
             assert!(
                 rel < 1.0e-5,

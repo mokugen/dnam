@@ -303,3 +303,146 @@ pub fn update_header_in_place(
     container_bytes[layout.mutable_extent.0..layout.mutable_extent.0 + cap].copy_from_slice(&dmu1);
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::container::{
+        ARENA_OFFSET_FULL_END, ARENA_OFFSET_LITE_END, ARENA_OFFSET_PRO_END, ARENA_OFFSET_ULTRA_END,
+        DnamPreamble,
+    };
+    use crate::schema::{ControlKind, ControlSchemaDef, ControlUiHints, DnamJsonHeader, PresetDef};
+    use crate::types::Tier;
+    use alloc::collections::BTreeMap;
+    use alloc::string::ToString;
+    use alloc::vec;
+
+    fn header_with_mutable_fields() -> DnamJsonHeader {
+        let mut hdr = DnamJsonHeader::default_reference();
+        hdr.user_metadata
+            .insert("note".to_string(), serde_json::json!("initial"));
+        let mut preset_meta = BTreeMap::new();
+        preset_meta.insert("favorite".to_string(), serde_json::json!(true));
+        hdr.presets.push(PresetDef {
+            id: "clean".to_string(),
+            name: "Clean".to_string(),
+            description: Some("Clean preset".to_string()),
+            controls: BTreeMap::from([("gain".to_string(), serde_json::json!(0.25))]),
+            user_metadata: preset_meta,
+        });
+        hdr.controls_schema.push(ControlSchemaDef {
+            id: "gain".to_string(),
+            name: "Gain".to_string(),
+            kind: ControlKind::Range,
+            unit: Some("%".to_string()),
+            lobatto_degree: Some(2),
+            anchor_nodes_norm: Some(vec![0.0, -1.0, 1.0]),
+            declared_range: Some([0.0, 1.0]),
+            safe_clamped_range: Some([0.0, 1.0]),
+            default: serde_json::json!(0.5),
+            conditional_min: BTreeMap::new(),
+            conditional_max: BTreeMap::new(),
+            declared_options: None,
+            active_options: None,
+            clamp_warning: None,
+            ui_hints: ControlUiHints::default(),
+            calibration: None,
+            user_metadata: BTreeMap::from([("color".to_string(), serde_json::json!("amber"))]),
+        });
+        hdr
+    }
+
+    #[test]
+    fn test_build_dnam_container_tier_sizes_and_errors() {
+        for (len, expected_tier) in [
+            (ARENA_OFFSET_LITE_END as usize, Tier::Lite),
+            (ARENA_OFFSET_FULL_END as usize, Tier::Full),
+            (ARENA_OFFSET_PRO_END as usize, Tier::Pro),
+            (ARENA_OFFSET_ULTRA_END as usize, Tier::Ultra),
+        ] {
+            let mut hdr = header_with_mutable_fields();
+            let arena = vec![0x3Cu8; len];
+            let bytes = build_dnam_container(&mut hdr, &arena, &arena, false).unwrap();
+            let preamble = DnamPreamble::from_bytes(&bytes).unwrap();
+            assert_eq!(preamble.highest_tier(), expected_tier);
+        }
+
+        // Sub-Lite / unaligned length returns UnalignedOffset; wrong 64B-aligned size returns SchemaValidationError
+        let mut hdr = DnamJsonHeader::default_reference();
+        let short_arena = vec![0u8; 128];
+        assert!(matches!(
+            build_dnam_container(&mut hdr, &short_arena, &short_arena, false),
+            Err(DnamError::UnalignedOffset { .. })
+        ));
+        let bad_arena = vec![0u8; ARENA_OFFSET_LITE_END as usize + 64];
+        assert!(matches!(
+            build_dnam_container(&mut hdr, &bad_arena, &bad_arena, false),
+            Err(DnamError::SchemaValidationError(_))
+        ));
+
+        // Encrypted arena requires plaintext CRC source >= stored arena length
+        let full_arena = vec![0u8; ARENA_OFFSET_FULL_END as usize];
+        let short_plain = vec![0u8; 64];
+        assert!(matches!(
+            build_dnam_container(&mut hdr, &short_plain, &full_arena, true),
+            Err(DnamError::BufferTooSmall { .. })
+        ));
+        let enc_bytes = build_dnam_container(&mut hdr, &full_arena, &full_arena, true).unwrap();
+        assert!(
+            DnamPreamble::from_bytes(&enc_bytes)
+                .unwrap()
+                .is_encrypted_arena()
+        );
+
+        // Oversized mutable DMU1 metadata exceeds DEFAULT_DMU1_TRAILER_CAPACITY
+        let mut huge_hdr = DnamJsonHeader::default_reference();
+        huge_hdr.user_metadata.insert(
+            "blob".to_string(),
+            serde_json::Value::String("x".repeat(DEFAULT_DMU1_TRAILER_CAPACITY + 512)),
+        );
+        assert!(matches!(
+            build_dnam_container(&mut huge_hdr, &full_arena, &full_arena, false),
+            Err(DnamError::HeaderCapacityExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn test_update_header_in_place_mutable_only_and_capacity_checks() {
+        let mut orig = header_with_mutable_fields();
+        let lite_arena = vec![0u8; ARENA_OFFSET_LITE_END as usize];
+        let mut container =
+            build_dnam_container(&mut orig, &lite_arena, &lite_arena, false).unwrap();
+
+        // Editing mutable fields (user_metadata, presets, controls_schema[*].user_metadata) succeeds
+        let mut edited = orig.clone();
+        edited
+            .user_metadata
+            .insert("note".to_string(), serde_json::json!("updated"));
+        edited.presets[0]
+            .user_metadata
+            .insert("favorite".to_string(), serde_json::json!(false));
+        edited.controls_schema[0]
+            .user_metadata
+            .insert("color".to_string(), serde_json::json!("cyan"));
+        update_header_in_place(&mut container, &edited).unwrap();
+
+        // Editing immutable field (metadata.name) must fail cleanly
+        let mut immut_edited = edited.clone();
+        immut_edited.metadata.name = "Changed Immutable Name".to_string();
+        assert!(matches!(
+            update_header_in_place(&mut container, &immut_edited),
+            Err(DnamError::SchemaValidationError(_))
+        ));
+
+        // Exceeding DMU1 frame capacity must return HeaderCapacityExceeded
+        let mut too_big = edited;
+        too_big.user_metadata.insert(
+            "huge".to_string(),
+            serde_json::Value::String("y".repeat(DEFAULT_DMU1_TRAILER_CAPACITY + 256)),
+        );
+        assert!(matches!(
+            update_header_in_place(&mut container, &too_big),
+            Err(DnamError::HeaderCapacityExceeded { .. })
+        ));
+    }
+}

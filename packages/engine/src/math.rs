@@ -169,3 +169,28 @@ pub fn detect_best_backend() -> BackendKind {
         BackendKind::Scalar
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_backend_kind_names_and_detection() {
+        let all_kinds = [
+            (BackendKind::Scalar, "Scalar"),
+            (BackendKind::ArmNeon, "ARM64 NEON"),
+            (BackendKind::Neon, "ARM64 NEON"),
+            (BackendKind::ArmSve2, "ARMv9 SVE2"),
+            (BackendKind::ArmSme, "ARM SME"),
+            (BackendKind::X86Sse2, "x86 SSE2"),
+            (BackendKind::X86Sse42, "x86 SSE4.2"),
+            (BackendKind::X86Avx2Fma, "x86 AVX2"),
+            (BackendKind::X86Simd, "x86 AVX2"),
+            (BackendKind::WasmSimd128, "WASM SIMD"),
+        ];
+        for (kind, expected_name) in all_kinds {
+            assert_eq!(kind.name(), expected_name);
+        }
+        assert!(!detect_best_backend().name().is_empty());
+    }
+}

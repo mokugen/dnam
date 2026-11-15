@@ -1,18 +1,11 @@
 #![forbid(unsafe_code)]
 //! Canonical Stage Decomposition, Step-0 Variance Gating & 3-Phase Control-Space Audit Helpers.
 
-use dnam_engine::container::build_dnam_container_with_cp1;
 use dnam_engine::control::{ControlClampDescriptor, Cp1ContributorSlot};
-use dnam_engine::math::DefaultMathBackend;
-use dnam_engine::schema::{ControlCalibrationRole, DnamError, DnamJsonHeader};
-use dnam_engine::{DnamEngine, FtzDazGuard, Tier};
+use dnam_engine::schema::{DnamError, DnamJsonHeader};
 
-use crate::proj::bundle::zero_arena_b_head_dc_bias;
-use crate::proj::schema::DnamProjManifest;
-
-use super::stage_b_c::{HEAD_BASES, ULTRA_MODES_5_TO_8_BASE, compute_role_b_multipliers};
-use super::wide_gram::{Wide192Accum, contract_256d_gram_tiled_wide192};
-use super::{uplo_u_index, uplo_u_packed_len};
+pub(crate) mod mode0_harvest;
+pub(crate) use mode0_harvest::*;
 
 /// Stability and clamping bounds enforced across Sweep 1 and Sweep 2 (`ref[train.audit.phase1.clamp-stability]`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -232,7 +225,7 @@ pub fn write_inline_cp1_if_fits(arena_64k: &mut [u8], cp1_slots: &[Cp1Contributo
 }
 
 #[inline]
-fn read_f32_le(buf: &[u8], off: usize) -> f32 {
+pub(super) fn read_f32_le(buf: &[u8], off: usize) -> f32 {
     if off + 4 <= buf.len() {
         f32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
     } else {
@@ -257,403 +250,11 @@ pub(crate) fn sync_clamp_descriptors_to_arena(
     Ok(descriptors)
 }
 
-/// Evaluates `Mode 0` (`StarCenter`) predictions directly from `StageBHarvest`'s `features` and
-/// `backbone_out_lr` when standard unit-wet / non-WDW routing applies (`0` redundant engine passes).
-pub(crate) fn compute_mode0_pred_from_backbone_harvest(
-    manifest: &DnamProjManifest,
-    arena_64k: &[u8],
-    features: &[[f32; 256]],
-    backbone_out_lr: &[[f32; 2]],
-) -> Option<Vec<[f32; 2]>> {
-    if features.len() != backbone_out_lr.len() || arena_64k.len() < 60_160 {
-        return None;
-    }
-    if manifest.base.io_config.output_mode == "wdw" || (arena_64k[112] & 1) != 0 {
-        return None;
-    }
-    if read_f32_le(arena_64k, 9_024) != 0.0 || read_f32_le(arena_64k, 9_028) != 0.0 {
-        return None;
-    }
-    if manifest.base.controls_schema.iter().any(|c| {
-        c.calibration.as_ref().is_some_and(|cal| {
-            matches!(
-                cal.role,
-                ControlCalibrationRole::Mix
-                    | ControlCalibrationRole::StereoMode
-                    | ControlCalibrationRole::StereoWidth
-                    | ControlCalibrationRole::FreezeLatch
-            )
-        })
-    }) {
-        return None;
-    }
-    let dry_g = read_f32_le(arena_64k, 116);
-    let wet_g = read_f32_le(arena_64k, 120);
-    if dry_g.abs() > 1.0e-7 || (wet_g - 1.0).abs() > 1.0e-6 {
-        return None;
-    }
-    let ultra_trim = read_f32_le(arena_64k, 10_624 + 3 * 4);
-    if (0.0625..=16.0).contains(&ultra_trim) && (ultra_trim - 1.0).abs() > 1.0e-6 {
-        return None;
-    }
-    if backbone_out_lr.iter().any(|&[bl, br]| {
-        !bl.is_finite() || !br.is_finite() || bl.abs() >= 5.0e8 || br.abs() >= 5.0e8
-    }) {
-        return None;
-    }
-
-    let role_b = compute_role_b_multipliers(arena_64k);
-    let mut w0_eff = [[0.0_f32; 2]; 256];
-    for (t, &h_base) in HEAD_BASES.iter().enumerate() {
-        for i in 0..64 {
-            let idx = t * 64 + i;
-            let wl = read_f32_le(arena_64k, h_base + i * 4);
-            let wr = read_f32_le(arena_64k, h_base + 256 + i * 4);
-            w0_eff[idx][0] = wl * (role_b[idx][0] as f32);
-            w0_eff[idx][1] = wr * (role_b[idx][1] as f32);
-        }
-    }
-    let mono_only = manifest.base.io_config.output_mode == "mono";
-    let mut out = Vec::with_capacity(features.len());
-    for (fb, &[bl, br]) in features.iter().zip(backbone_out_lr.iter()) {
-        // Match `eval_tier_feature_bus_head_dot` 4xVec4 SIMD reduction tree order
-        let mut acc_l = [[0.0_f32; 4]; 4];
-        let mut acc_r = [[0.0_f32; 4]; 4];
-        for g4 in 0..16 {
-            let base = g4 * 16;
-            for b in 0..4 {
-                let d0 = base + b * 4;
-                for lane in 0..4 {
-                    let fd = fb[d0 + lane];
-                    acc_l[b][lane] += fd * w0_eff[d0 + lane][0];
-                    acc_r[b][lane] += fd * w0_eff[d0 + lane][1];
-                }
-            }
-        }
-        let sl: [f32; 4] =
-            std::array::from_fn(|c| (acc_l[0][c] + acc_l[1][c]) + (acc_l[2][c] + acc_l[3][c]));
-        let sr: [f32; 4] =
-            std::array::from_fn(|c| (acc_r[0][c] + acc_r[1][c]) + (acc_r[2][c] + acc_r[3][c]));
-        let raw_l = bl + ((sl[0] + sl[1]) + (sl[2] + sl[3]));
-        let raw_r = br + ((sr[0] + sr[1]) + (sr[2] + sr[3]));
-        let yl = if raw_l.is_finite() {
-            raw_l.clamp(-1.0e9, 1.0e9)
-        } else {
-            0.0
-        };
-        let yr_s = if raw_r.is_finite() {
-            raw_r.clamp(-1.0e9, 1.0e9)
-        } else {
-            0.0
-        };
-        out.push([yl, if mono_only { yl } else { yr_s }]);
-    }
-    Some(out)
-}
-
-/// Validates and resolves `cached_packed_gram_256` against `features` (auto-detecting the exact
-/// `gram_frame_stride` used to build `STAT` in `< 0.01 ms`), or re-contracts via `Wide192Accum`.
-pub(crate) fn resolve_cached_gram_or_recontract(
-    cached_packed_gram_256: Option<&[f64]>,
-    features: &[[f32; 256]],
-    star_emr_w: Option<&[f64]>,
-    requested_stride: usize,
-) -> (Vec<f64>, usize) {
-    let n_frames = features.len();
-    let req_s = requested_stride.max(1);
-    if n_frames == 0 {
-        return (vec![0.0_f64; uplo_u_packed_len(256)], req_s);
-    }
-
-    if let Some(g) = cached_packed_gram_256
-        && g.len() == uplo_u_packed_len(256)
-        && let Some(emr_w) = star_emr_w
-        && emr_w.len() >= n_frames
-    {
-        if let Some(d_probe) = (0..256).find(|&d| g[uplo_u_index(d, d)] > 1.0e-12) {
-            let target_diag = g[uplo_u_index(d_probe, d_probe)];
-            let mut candidates = [req_s, 4, 2, 1, 8];
-            let mut seen = [0usize; 5];
-            let mut seen_len = 0usize;
-            for cand in &mut candidates {
-                if !seen[..seen_len].contains(cand) {
-                    seen[seen_len] = *cand;
-                    seen_len += 1;
-                }
-            }
-            for &s in &seen[..seen_len] {
-                let mut sampled = 0usize;
-                let mut idx = 0usize;
-                while idx < n_frames {
-                    if emr_w[idx].is_finite()
-                        && emr_w[idx] > 0.0
-                        && features[idx][d_probe].is_finite()
-                    {
-                        sampled += 1;
-                    }
-                    idx += s;
-                }
-                if sampled == 0 {
-                    continue;
-                }
-                let scale = (n_frames as f64) / (sampled as f64);
-                let mut acc = Wide192Accum::zero();
-                let mut idx2 = 0usize;
-                while idx2 < n_frames {
-                    let w = emr_w[idx2] * scale;
-                    let f = f64::from(features[idx2][d_probe]);
-                    if w.is_finite() && w > 0.0 && f.is_finite() {
-                        acc.add_product(f, w * f);
-                    }
-                    idx2 += s;
-                }
-                let est = acc.to_f64();
-                if (est - target_diag).abs() <= 1.0e-6 * (1.0 + target_diag.abs()) {
-                    return (g.to_vec(), s);
-                }
-            }
-        } else {
-            return (g.to_vec(), req_s);
-        }
-    }
-
-    let weights: Vec<f64> = match star_emr_w {
-        Some(w) if w.len() >= n_frames => w[..n_frames].to_vec(),
-        _ => vec![1.0_f64; n_frames],
-    };
-    let zero_targets = vec![[0.0_f64; 2]; n_frames];
-    let (gram, _) = contract_256d_gram_tiled_wide192(features, &zero_targets, &weights, req_s);
-    (gram, req_s)
-}
-
-#[inline]
-pub(crate) fn decode_coreset_frame_lr_at(fp16: &[u8], channels: usize, idx: usize) -> [f32; 2] {
-    if channels == 2 {
-        let o = idx * 4;
-        let l = crate::proj::fp16_bits_to_f32(u16::from_le_bytes([fp16[o], fp16[o + 1]]));
-        let r = crate::proj::fp16_bits_to_f32(u16::from_le_bytes([fp16[o + 2], fp16[o + 3]]));
-        [l, r]
-    } else {
-        let o = idx * 2;
-        let v = crate::proj::fp16_bits_to_f32(u16::from_le_bytes([fp16[o], fp16[o + 1]]));
-        [v, v]
-    }
-}
-
-pub(crate) struct StageDMode0Resolved {
-    pub features: Vec<[f32; 256]>,
-    pub pred0_lr: Vec<[f32; 2]>,
-    pub compact_strided: bool,
-    pub n_total_frames: usize,
-    pub gram_256: Vec<f64>,
-    pub sample_stride: usize,
-}
-
-pub(crate) type PrecomputedBackboneRefs<'a> = (&'a [[f32; 256]], &'a [[f32; 2]]);
-
-/// Harvests or reuses `Mode 0` predictions and `256-D` features for Stage D, avoiding `12.28 MB`
-/// full-frame feature allocations on Path 1 when `cached_packed_gram_256` matches `gram_frame_stride`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn harvest_and_resolve_mode0_for_stage_d(
-    manifest: &DnamProjManifest,
-    arena_64k: &[u8],
-    dry_lr: &[[f32; 2]],
-    star_ctrls: &[f32],
-    precomputed_backbone_harvest: Option<PrecomputedBackboneRefs<'_>>,
-    cached_packed_gram_256: Option<&[f64]>,
-    star_emr_w: Option<&[f64]>,
-    gram_frame_stride: usize,
-) -> Result<StageDMode0Resolved, DnamError> {
-    if let Some((pre_f, pre_back)) = precomputed_backbone_harvest {
-        let req_s = gram_frame_stride.max(1);
-        if req_s > 1
-            && pre_f.len() == pre_back.len().div_ceil(req_s)
-            && let Some(g) = cached_packed_gram_256
-            && g.len() == uplo_u_packed_len(256)
-        {
-            let back_sub: Vec<[f32; 2]> = (0..pre_f.len()).map(|k| pre_back[k * req_s]).collect();
-            if let Some(pred0) =
-                compute_mode0_pred_from_backbone_harvest(manifest, arena_64k, pre_f, &back_sub)
-            {
-                return Ok(StageDMode0Resolved {
-                    features: pre_f.to_vec(),
-                    pred0_lr: pred0,
-                    compact_strided: true,
-                    n_total_frames: pre_back.len(),
-                    gram_256: g.to_vec(),
-                    sample_stride: req_s,
-                });
-            }
-        }
-        if let Some(pred0) =
-            compute_mode0_pred_from_backbone_harvest(manifest, arena_64k, pre_f, pre_back)
-        {
-            let n_total = pre_f.len();
-            let (gram_256, sample_stride) = resolve_cached_gram_or_recontract(
-                cached_packed_gram_256,
-                pre_f,
-                star_emr_w,
-                gram_frame_stride,
-            );
-            if sample_stride > 1 {
-                let m = n_total.div_ceil(sample_stride);
-                let mut f_sub = Vec::with_capacity(m);
-                let mut p_sub = Vec::with_capacity(m);
-                let mut idx = 0usize;
-                while idx < n_total {
-                    f_sub.push(pre_f[idx]);
-                    p_sub.push(pred0[idx]);
-                    idx += sample_stride;
-                }
-                return Ok(StageDMode0Resolved {
-                    features: f_sub,
-                    pred0_lr: p_sub,
-                    compact_strided: true,
-                    n_total_frames: n_total,
-                    gram_256,
-                    sample_stride,
-                });
-            }
-            return Ok(StageDMode0Resolved {
-                features: pre_f.to_vec(),
-                pred0_lr: pred0,
-                compact_strided: false,
-                n_total_frames: n_total,
-                gram_256,
-                sample_stride,
-            });
-        }
-    }
-
-    let mut mode0_arena = arena_64k.to_vec();
-    for &h_base in &HEAD_BASES {
-        if mode0_arena.len() >= h_base + 5 * 512 {
-            mode0_arena[h_base + 512..h_base + 5 * 512].fill(0);
-        }
-    }
-    if mode0_arena.len() >= ULTRA_MODES_5_TO_8_BASE + 8_192 {
-        mode0_arena[ULTRA_MODES_5_TO_8_BASE..ULTRA_MODES_5_TO_8_BASE + 8_192].fill(0);
-    }
-    if mode0_arena.len() >= 10_560 {
-        mode0_arena[7_524..8_512].fill(0);
-    }
-    if mode0_arena.len() >= 63_424 {
-        mode0_arena[60_928..63_424].fill(0);
-    }
-    zero_arena_b_head_dc_bias(&mut mode0_arena);
-    let _ = sync_clamp_descriptors_to_arena(&manifest.base, &mut mode0_arena)?;
-
-    let mut temp_hdr = manifest.base.clone();
-    let dnam_bytes =
-        build_dnam_container_with_cp1(&mut temp_hdr, &mode0_arena, &mode0_arena, false, &[])?;
-    let mut engine =
-        DnamEngine::<DefaultMathBackend>::from_bytes(&dnam_bytes, Tier::Ultra, 48_000)?;
-    for (p, &val) in star_ctrls.iter().enumerate() {
-        engine.set_control_immediate(p, val);
-    }
-
-    let n_total = dry_lr.len();
-    let req_s = gram_frame_stride.max(1);
-    if req_s > 1
-        && n_total > 0
-        && let Some(g) = cached_packed_gram_256
-        && g.len() == uplo_u_packed_len(256)
-    {
-        let m_sub = n_total.div_ceil(req_s);
-        let mut f_sub = Vec::with_capacity(m_sub);
-        let mut p_sub = Vec::with_capacity(m_sub);
-        let mut fb = [0.0_f32; 256];
-        {
-            let _ftz = FtzDazGuard::new();
-            for (n, &[il, ir]) in dry_lr.iter().enumerate() {
-                if n % req_s == 0 {
-                    let y = engine.step_frame_with_feature_bus(il, ir, &mut fb);
-                    f_sub.push(fb);
-                    p_sub.push(y);
-                } else {
-                    let _ = engine.step_frame_tora(il, ir, false);
-                }
-            }
-        }
-
-        let stride_matches = if let Some(emr_w) = star_emr_w
-            && emr_w.len() >= n_total
-            && let Some(d_probe) = (0..256).find(|&d| g[uplo_u_index(d, d)] > 1.0e-12)
-        {
-            let target_diag = g[uplo_u_index(d_probe, d_probe)];
-            let mut sampled = 0usize;
-            for (k, feat) in f_sub.iter().enumerate() {
-                let w = emr_w[k * req_s];
-                if w.is_finite() && w > 0.0 && feat[d_probe].is_finite() {
-                    sampled += 1;
-                }
-            }
-            if sampled > 0 {
-                let scale = (n_total as f64) / (sampled as f64);
-                let mut acc = Wide192Accum::zero();
-                for (k, feat) in f_sub.iter().enumerate() {
-                    let w = emr_w[k * req_s] * scale;
-                    let f = f64::from(feat[d_probe]);
-                    if w.is_finite() && w > 0.0 && f.is_finite() {
-                        acc.add_product(f, w * f);
-                    }
-                }
-                (acc.to_f64() - target_diag).abs() <= 1.0e-6 * (1.0 + target_diag.abs())
-            } else {
-                false
-            }
-        } else {
-            true
-        };
-
-        if stride_matches {
-            return Ok(StageDMode0Resolved {
-                features: f_sub,
-                pred0_lr: p_sub,
-                compact_strided: true,
-                n_total_frames: n_total,
-                gram_256: g.to_vec(),
-                sample_stride: req_s,
-            });
-        }
-
-        // Fallback when STAT was built with a different stride than req_s (e.g. stride = 2 vs 4)
-        engine = DnamEngine::<DefaultMathBackend>::from_bytes(&dnam_bytes, Tier::Ultra, 48_000)?;
-        for (p, &val) in star_ctrls.iter().enumerate() {
-            engine.set_control_immediate(p, val);
-        }
-    }
-
-    let mut in_l = Vec::with_capacity(n_total);
-    let mut in_r = Vec::with_capacity(n_total);
-    for &[il, ir] in dry_lr {
-        in_l.push(il);
-        in_r.push(ir);
-    }
-    let mut features = vec![[0.0_f32; 256]; n_total];
-    let mut out_l = vec![0.0_f32; n_total];
-    let mut out_r = vec![0.0_f32; n_total];
-    engine.process_block_with_feature_bus(&in_l, &in_r, &mut out_l, &mut out_r, &mut features);
-    let pred0_lr = out_l.into_iter().zip(out_r).map(|(l, r)| [l, r]).collect();
-    let (gram_256, sample_stride) = resolve_cached_gram_or_recontract(
-        cached_packed_gram_256,
-        &features,
-        star_emr_w,
-        gram_frame_stride,
-    );
-    Ok(StageDMode0Resolved {
-        features,
-        pred0_lr,
-        compact_strided: false,
-        n_total_frames: n_total,
-        gram_256,
-        sample_stride,
-    })
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::uplo_u_packed_len;
     use super::*;
+    use crate::proj::schema::DnamProjManifest;
     use proptest::prelude::*;
 
     #[test]
@@ -752,9 +353,11 @@ mod tests {
             &[[0.1_f32, -0.1]; 4],
             &[],
             Some((&feats[..2], &bbone)),
-            Some(&zero_g),
-            None,
-            2,
+            Mode0GramHint {
+                cached_packed_gram_256: Some(&zero_g),
+                star_emr_w: None,
+                gram_frame_stride: 2,
+            },
         )
         .unwrap();
         assert!(res_pre_strided.compact_strided);
@@ -764,9 +367,11 @@ mod tests {
             &[[0.1_f32, -0.1]; 4],
             &[],
             Some((&feats, &bbone)),
-            Some(&zero_g),
-            None,
-            2,
+            Mode0GramHint {
+                cached_packed_gram_256: Some(&zero_g),
+                star_emr_w: None,
+                gram_frame_stride: 2,
+            },
         )
         .unwrap();
         assert_eq!(res_pre_sub.features.len(), 2);
@@ -776,9 +381,11 @@ mod tests {
             &[[0.1_f32, -0.1]; 4],
             &[],
             Some((&feats, &bbone)),
-            Some(&zero_g),
-            None,
-            1,
+            Mode0GramHint {
+                cached_packed_gram_256: Some(&zero_g),
+                star_emr_w: None,
+                gram_frame_stride: 1,
+            },
         )
         .unwrap();
         assert!(!res_pre_full.compact_strided);

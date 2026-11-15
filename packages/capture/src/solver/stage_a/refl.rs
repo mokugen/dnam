@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Stage IV Stereo Reflection & Reverberation Delay Anchor Identification (`solver::stage_a_refl`, `REQ-1.6`).
+//! Stage IV Stereo Reflection & Reverberation Delay Anchor Identification (`solver::stage_a::refl`, `REQ-1.6`).
 
 const WIENER_FFT_LEN: usize = 4_096;
 
@@ -395,9 +395,7 @@ pub(crate) fn lift_v2_post_s3_stage4(
     ir_peak_lag: usize,
     n_fit: usize,
 ) {
-    use super::stage_a_ext::{
-        coord_refine_arena_scalars, star_has_meta, star_meta_f64, write_f32_le,
-    };
+    use super::ext::{coord_refine_arena_scalars, star_has_meta, star_meta_f64, write_f32_le};
     use dnam_engine::stages::Stage4SpatialTank;
     use dnam_engine::stages::weights::ARENA0_STAGE4_EXT_OFFSET as ARENA0_STAGE4_EXT;
 
@@ -564,7 +562,7 @@ pub(super) fn solve_svf_weights_3x3(
         y_e += y * y;
         let b = svf_basis[i];
         for c in 0..3 {
-            let col = super::uplo_u_index(0, c);
+            let col = super::super::uplo_u_index(0, c);
             for r in 0..=c {
                 gram[col + r] += b[r] * b[c];
             }
@@ -575,7 +573,8 @@ pub(super) fn solve_svf_weights_3x3(
         return None;
     }
     let tr = gram[0] + gram[2] + gram[5];
-    let h = super::solve_uplo_u_cholesky_2ch(&gram, &rhs, (1.0e-5 * tr).max(1.0e-12)).ok()?;
+    let h =
+        super::super::solve_uplo_u_cholesky_2ch(&gram, &rhs, (1.0e-5 * tr).max(1.0e-12)).ok()?;
     let w = [h[0][0], h[1][0], h[2][0]];
     let mut err_e = 0.0_f64;
     for i in start..n_eval {

@@ -456,6 +456,33 @@ mod tests {
         assert_eq!(p.crc32c_for_tier(Tier::Full), 22);
         assert_eq!(p.crc32c_for_tier(Tier::Pro), 33);
         assert_eq!(p.crc32c_for_tier(Tier::Ultra), 44);
+        assert_eq!(p.arena_end_for_tier(Tier::Lite), 168 * 64);
+        assert_eq!(p.arena_end_for_tier(Tier::Full), 349 * 64);
+        assert_eq!(p.arena_end_for_tier(Tier::Pro), 566 * 64);
+        assert_eq!(p.arena_end_for_tier(Tier::Ultra), 1000 * 64);
+
+        // Scan CP1 shared controls until sentinel or CP1 magic
+        let mut shared_buf = vec![0u8; 64];
+        shared_buf[0..4].copy_from_slice(&crate::container::CP1_MAGIC);
+        assert_eq!(scan_shared_control_count(&shared_buf), 0);
+        let mut one_desc = vec![0u8; 128];
+        one_desc[12..16].copy_from_slice(&1.0f32.to_le_bytes()); // safe_max_base (offset 12..16) > safe_min_base
+        assert_eq!(scan_shared_control_count(&one_desc), 1);
+        one_desc[64..68].copy_from_slice(&crate::container::CP1_MAGIC);
+        assert_eq!(scan_shared_control_count(&one_desc), 1);
+
+        // Directory invariants & unaligned tier_end rejections
+        let mut bad_dir = container.clone();
+        bad_dir[64 + 8] = 0; // header_length = 0
+        assert!(DnamPreamble::from_bytes(&bad_dir).is_err());
+
+        let mut bad_align = container.clone();
+        bad_align[64 + 2 * 8] += 1; // shared_offset unaligned
+        assert!(DnamPreamble::from_bytes(&bad_align).is_err());
+
+        let mut bad_tier_end = container.clone();
+        bad_tier_end[64 + 9 * 8..64 + 10 * 8].copy_from_slice(&(u64::MAX - 63).to_le_bytes());
+        assert!(DnamPreamble::from_bytes(&bad_tier_end).is_err());
 
         // Unaligned tier_end in directory must fail with UnalignedOffset
         container[64 + 9 * 8] = 65;

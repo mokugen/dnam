@@ -3,9 +3,12 @@
 //! `ref[dsp.tempo.event-tracker]`, `ref[dsp.tempo.physical-inversion]`,
 //! `ref[dsp.tempo.coprime-fdn]`, `ref[dsp.tempo.transport-jump]`).
 
+pub mod inversion;
+pub use inversion::*;
+
 use alloc::vec::Vec;
 
-use crate::math::{f32_bits_at_rank, f32_rank_intersection, q32_phase_to_phasor, widen_f32_bits};
+use crate::math::q32_phase_to_phasor;
 use crate::schema::cold_exp_f64;
 
 /// Canonical 12 rhythmic subdivision period ratios `(a_s, b_s)` (`ref[dsp.tempo.subdivisions]`).
@@ -52,8 +55,7 @@ pub fn eval_q32_subdivision_phase(
         1 => 0,
         2 => u32::from(beat_mod12) & 1,
         3 => REM3_TABLE_24[beat_mod12 as usize],
-        4 => u32::from(beat_mod12) & 3,
-        _ => return None,
+        _ => u32::from(beat_mod12) & 3,
     };
     let product = u64::from(b) * ((u64::from(beat_rem) << 32) + u64::from(within_beat_q32));
     let high = (product >> 32) as usize;
@@ -65,8 +67,7 @@ pub fn eval_q32_subdivision_phase(
             let rem = u64::from(REM3_TABLE_24[high]);
             rem * 0x5555_5555 + (((low + rem) * 0xaaaa_aaab) >> 33)
         }
-        4 => (((high as u64 & 3) << 32) + low) >> 2,
-        _ => unreachable!(),
+        _ => (((high as u64 & 3) << 32) + low) >> 2,
     };
     Some((phase as u32).wrapping_add(offset_q32))
 }
@@ -247,176 +248,6 @@ pub fn smooth_relock_q32_tick(
     predicted.wrapping_add(corr as u32)
 }
 
-/// Evaluates the 3-node physical calibration curve $v(u) = \frac{1}{2} v_{\min} u (u - 1) + v_{\text{mid}}(1 - u^2) + \frac{1}{2} v_{\max} u (u + 1)$
-/// (`ref[dsp.tempo.physical-inversion]`).
-#[inline]
-pub fn eval_3node_calibration_f64(anchors: [f64; 3], u: f64) -> f64 {
-    let [lo, mid, hi] = anchors;
-    0.5 * lo * u * (u - 1.0) + mid * (1.0 - u * u) + 0.5 * hi * u * (u + 1.0)
-}
-
-/// Result of inverting a 3-node physical calibration curve over the admissible `f32` rank set
-/// (`ref[dsp.tempo.physical-inversion]`).
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct TempoPhysicalInversionResult {
-    pub physical_f32: f32,
-    pub normalized_f32: f32,
-    pub realized_value: f64,
-    pub residual: f64,
-    pub search_steps: (u32, u32),
-}
-
-/// Inverts a monotone 3-node physical calibration curve `anchors = [v_min, v_mid, v_max]` over the
-/// admissible `f32` physical rank interval `[first, end)` for `declared = (decl_lo, decl_hi)` and
-/// `safe = (safe_lo, safe_hi)` in at most 32 binary-search comparisons per pass, breaking ties toward
-/// the lower physical rank (`ref[dsp.tempo.physical-inversion]`).
-pub fn invert_tempo_physical_calibration(
-    declared: (f32, f32),
-    safe: (f32, f32),
-    anchors: [f64; 3],
-    target: f64,
-    flush_subnormals: bool,
-) -> Option<TempoPhysicalInversionResult> {
-    if !target.is_finite()
-        || !declared.0.is_finite()
-        || !declared.1.is_finite()
-        || !safe.0.is_finite()
-        || !safe.1.is_finite()
-        || declared.0 >= declared.1
-        || safe.0 > safe.1
-    {
-        return None;
-    }
-    let lo_phys = declared.0.max(safe.0);
-    let hi_phys = declared.1.min(safe.1);
-    if lo_phys > hi_phys {
-        return None;
-    }
-    let (first, end) =
-        f32_rank_intersection(&[lo_phys as f64], &[hi_phys as f64], flush_subnormals)?;
-
-    let [v_lo, v_mid, v_hi] = anchors;
-    let c1 = 0.5 * (v_hi - v_lo);
-    let c2 = 0.5 * (v_hi + v_lo) - v_mid;
-    let target_delta = target - v_mid;
-
-    let eval_at_rank = |rank: u64| -> Option<(f32, f32, f64, f64)> {
-        let p_bits = f32_bits_at_rank(rank, flush_subnormals)?;
-        let low = widen_f32_bits(declared.0.to_bits())?;
-        let high = widen_f32_bits(declared.1.to_bits())?;
-        let val = widen_f32_bits(p_bits)?;
-        let span = high - low;
-        let inv_span = crate::math::newton6_reciprocal_f64(span);
-        let num = if (low < 0.0) != (high < 0.0) {
-            2.0 * val - (low + high)
-        } else {
-            (val - low) + (val - high)
-        };
-        let coord = (num * inv_span).clamp(-1.0, 1.0);
-        let mut u = f32::from_bits(crate::math::round_f64_to_f32_bits(coord)?);
-        if flush_subnormals && (u.to_bits() & 0x7fff_ffff) < 0x0080_0000 {
-            u = 0.0;
-        }
-        let u64_val = widen_f32_bits(u.to_bits())?;
-        let delta_v = u64_val * (c1 + c2 * u64_val);
-        let v = v_mid + delta_v;
-        Some((f32::from_bits(p_bits), u, v, delta_v))
-    };
-
-    let (_, _, _, dv_first) = eval_at_rank(first)?;
-    let (_, _, _, dv_last) = eval_at_rank(end - 1)?;
-    let ascending = dv_last >= dv_first;
-
-    let mut low = first;
-    let mut high = end;
-    let mut crossing_steps = 0u32;
-    while low < high {
-        let mid = low + (high - low) / 2;
-        let (_, _, _, dv) = eval_at_rank(mid)?;
-        crossing_steps += 1;
-        let before = if ascending {
-            dv < target_delta
-        } else {
-            dv > target_delta
-        };
-        if before {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-
-    let cand0 = low.saturating_sub(1).clamp(first, end - 1);
-    let cand1 = low.clamp(first, end - 1);
-    let (_, _, _, dv0) = eval_at_rank(cand0)?;
-    let (_, _, _, dv1) = eval_at_rank(cand1)?;
-    let best = if (dv0 - target_delta).abs() <= (dv1 - target_delta).abs() {
-        cand0
-    } else {
-        cand1
-    };
-    let (_, _, _, chosen_dv) = eval_at_rank(best)?;
-
-    // Second pass: find lowest rank on any constant plateau matching `chosen_dv`
-    let mut p_low = first;
-    let mut p_high = best;
-    let mut plateau_steps = 0u32;
-    while p_low < p_high {
-        let mid = p_low + (p_high - p_low) / 2;
-        let (_, _, _, dv) = eval_at_rank(mid)?;
-        plateau_steps += 1;
-        let before = if ascending {
-            dv < chosen_dv
-        } else {
-            dv > chosen_dv
-        };
-        if before {
-            p_low = mid + 1;
-        } else {
-            p_high = mid;
-        }
-    }
-    let (physical_f32, normalized_f32, realized_value, realized_dv) = eval_at_rank(p_low)?;
-    Some(TempoPhysicalInversionResult {
-        physical_f32,
-        normalized_f32,
-        realized_value,
-        residual: (realized_dv - target_delta).abs(),
-        search_steps: (crossing_steps, plateau_steps),
-    })
-}
-
-/// Prime reference lengths for Stage IV FDN lines (`ref[dsp.tempo.coprime-fdn]`).
-pub const FDN_COPRIME_BASE_PRIMES: [u32; 8] = [149, 211, 307, 401, 503, 601, 701, 887];
-
-/// Verifies that for any of the 144 `(idx_l, idx_r)` stereo subdivision pairs (`0..12 × 0..12`),
-/// the scaled FDN modal delay ratios $\alpha_m = P_m / P_{\text{ref}}$ preserve distinct prime
-/// factors (`gcd(P_i, P_j) == 1` within each channel, `ref[dsp.tempo.coprime-fdn]`).
-pub const fn verify_coprime_fdn_pair(subdiv_l: usize, subdiv_r: usize) -> bool {
-    if subdiv_l >= 12 || subdiv_r >= 12 {
-        return false;
-    }
-    let mut i = 0;
-    while i < 8 {
-        let mut j = i + 1;
-        while j < 8 {
-            let mut a = FDN_COPRIME_BASE_PRIMES[i];
-            let mut b = FDN_COPRIME_BASE_PRIMES[j];
-            while b != 0 {
-                let r = a % b;
-                a = b;
-                b = r;
-            }
-            if a != 1 {
-                return false;
-            }
-            j += 1;
-        }
-        i += 1;
-    }
-    true
-}
-
 /// Maps a `Q0.32` subdivision phase directly to a contractive unit phasor `(cos, sin)`
 /// (`ref[dsp.tempo.q64-q32-phase]`).
 #[inline]
@@ -467,18 +298,26 @@ mod tests {
             }
         }
 
-        // 2. Q64 beat accumulator wraps modulo 12 on carry
+        // 2. Q64 beat accumulator: carry wraps modulo 12, no-carry preserves beat
         assert_eq!(advance_q64_beat_accumulator(11, u64::MAX - 10, 20), (0, 9));
+        assert_eq!(advance_q64_beat_accumulator(5, 100, 20), (5, 120));
+        assert!(eval_q32_subdivision_phase(12, 0, (1, 1), 0).is_none());
 
-        // 3. Q64 host-frame increment & 4x subframe offsets
+        // 3. Q64 host-frame increment & 4x subframe offsets (including odd-tie & >0.5 rounding)
         let inc_48k = host_frame_q64_increment(48_000.0).unwrap();
         assert!(inc_48k > 0);
+        let inc_44k = host_frame_q64_increment(44_100.0).unwrap();
+        assert!(inc_44k > inc_48k);
         assert_eq!(subframe_4x_q64_offset(inc_48k, 0), 0);
         assert_eq!(subframe_4x_q64_offset(inc_48k, 4), inc_48k);
+        assert_eq!(subframe_4x_q64_offset(3, 1), 1);
+        assert_eq!(subframe_4x_q64_offset(3, 2), 2);
         assert!(host_frame_q64_increment(12_000.0).is_none());
 
-        // 4. Ordered clock pulse tracker: equal/out-of-order rejection and 2-fresh-event recovery
-        let mut tracker = OrderedClockPulseTracker::new();
+        // 4. Ordered clock pulse tracker: unavailable on early timing loss, out-of-order rejection, and recovery
+        let mut tracker = OrderedClockPulseTracker::default();
+        tracker.lose_timing();
+        assert_eq!(tracker.state, ClockTrackerState::Unavailable);
         assert!(tracker.pulse(0));
         assert!(tracker.pulse(10));
         assert_eq!(tracker.state, ClockTrackerState::Candidate);
@@ -491,7 +330,11 @@ mod tests {
         assert!(!tracker.pulse(40)); // out-of-order rejected
         assert_eq!(tracker.state, ClockTrackerState::Holdover);
 
-        // Event-rate-aware exponential filter
+        // Event-rate-aware exponential filter (empty and steady stream)
+        assert_eq!(
+            eval_event_rate_aware_tracker(&[], 0.5, 0.5),
+            (Vec::new(), Vec::new())
+        );
         let events: Vec<f64> = (0..100).map(|n| (n as f64) * 0.5).collect();
         let (periods, _) = eval_event_rate_aware_tracker(&events, 0.5, 0.5);
         assert_eq!(periods.len(), 100);
@@ -631,8 +474,7 @@ mod tempo_reference_tests {
             1 => 0,
             2 => beat & 1,
             3 => REM3[beat as usize],
-            4 => beat & 3,
-            _ => panic!("unsupported subdivision"),
+            _ => beat & 3,
         };
         let product = u64::from(b) * ((u64::from(beat_remainder) << 32) + u64::from(fraction));
         let high = (product >> 32) as usize;
@@ -644,8 +486,7 @@ mod tempo_reference_tests {
                 let remainder = u64::from(REM3[high]);
                 remainder * 0x5555_5555 + (((low + remainder) * 0xaaaa_aaab) >> 33)
             }
-            4 => ((u64::from((high as u32) & 3) << 32) + low) >> 2,
-            _ => unreachable!(),
+            _ => ((u64::from((high as u32) & 3) << 32) + low) >> 2,
         };
         assert!(phase <= u64::from(u32::MAX));
         (phase as u32).wrapping_add(offset)

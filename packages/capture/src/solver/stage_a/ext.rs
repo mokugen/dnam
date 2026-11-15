@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Stage A V2 Blind Physical Extension Lifting (`solver::stage_a_ext`, `REQ-1.6`).
+//! Stage A V2 Blind Physical Extension Lifting (`solver::stage_a::ext`, `REQ-1.6`).
 //!
 //! Populates `Arena 0` V2 extension blocks (`ARENA0_STAGE1_EXT`, `ARENA0_STAGE2_EXT`,
 //! `ARENA0_STAGE4_EXT`, `PIPE_FLAG_ALL_V2`, Stage 0 sidechain isolation, and multi-tier Stage II
@@ -16,9 +16,9 @@ use dnam_engine::{DnamEngine, FtzDazGuard, Tier};
 
 use crate::proj::schema::DnamProjManifest;
 
-use super::solve_uplo_u_cholesky_2ch;
-use super::stage_a::STAGE3_EARLY_FIR_BASES;
-use super::stage_a_refl::{fit_svf_tpt_surrogate, solve_svf_weights_3x3};
+use super::super::solve_uplo_u_cholesky_2ch;
+use super::STAGE3_EARLY_FIR_BASES;
+use super::refl::{fit_svf_tpt_surrogate, solve_svf_weights_3x3};
 
 #[inline]
 pub(super) fn write_f32_le(buf: &mut [u8], off: usize, val: f32) {
@@ -70,11 +70,11 @@ fn solve_svf_lp_bp_hp_weights(
     n_eval: usize,
 ) -> Option<[f32; 3]> {
     let mut probe = arena_64k.to_vec();
-    let _ = super::stages::sync_clamp_descriptors_to_arena(&manifest.base, &mut probe);
+    let _ = super::super::stages::sync_clamp_descriptors_to_arena(&manifest.base, &mut probe);
     let mut hdr = manifest.base.clone();
     let bytes = build_dnam_container_with_cp1(&mut hdr, &probe, &probe, false, &[]).ok()?;
     let mut eng = DnamEngine::<DefaultMathBackend>::from_bytes(&bytes, Tier::Full, 48_000).ok()?;
-    let star_ctrls = super::star_center_control_values(manifest);
+    let star_ctrls = super::super::star_center_control_values(manifest);
     for (p, &v) in star_ctrls.iter().enumerate() {
         eng.set_control_immediate(p, v);
     }
@@ -116,7 +116,7 @@ fn eval_stage12_nl_loss(
     n_eval: usize,
 ) -> f64 {
     let mut probe = arena_64k.to_vec();
-    let _ = super::stages::sync_clamp_descriptors_to_arena(&manifest.base, &mut probe);
+    let _ = super::super::stages::sync_clamp_descriptors_to_arena(&manifest.base, &mut probe);
     for &fb in &STAGE3_EARLY_FIR_BASES {
         if fb + 128 <= probe.len() {
             probe[fb..fb + 128].fill(0);
@@ -142,7 +142,7 @@ fn eval_stage12_nl_loss(
     else {
         return f64::INFINITY;
     };
-    let star_ctrls = super::star_center_control_values(manifest);
+    let star_ctrls = super::super::star_center_control_values(manifest);
     for (p, &v) in star_ctrls.iter().enumerate() {
         eng.set_control_immediate(p, v);
     }
@@ -211,7 +211,7 @@ fn eval_stage12_nl_loss(
         reg[K + K_LP] = sub[i];
         for c in 0..K_TOT {
             let xc = reg[c];
-            let col = super::uplo_u_index(0, c);
+            let col = super::super::uplo_u_index(0, c);
             for r in 0..=c {
                 gram[col + r] += reg[r] * xc;
             }
@@ -221,7 +221,9 @@ fn eval_stage12_nl_loss(
     if y_e <= 1.0e-12 {
         return 0.0;
     }
-    let tr: f64 = (0..K_TOT).map(|k| gram[super::uplo_u_index(k, k)]).sum();
+    let tr: f64 = (0..K_TOT)
+        .map(|k| gram[super::super::uplo_u_index(k, k)])
+        .sum();
     let Ok(h) = solve_uplo_u_cholesky_2ch(&gram, &rhs, (1.0e-5 * tr).max(1.0e-12)) else {
         return f64::INFINITY;
     };
@@ -614,7 +616,7 @@ pub(crate) fn lift_v2_pre_s3(
     write_f32_le(arena_64k, ARENA0_STAGE2_EXT + 36, 1.0); // stage2_out_gain
     if is_pure_lti || nl_amt < 0.25 {
         let base_s = amp_scale.clamp(0.35, 1.5);
-        for (t, &cw_base) in super::stage_a::CASCADE_W_BASES.iter().enumerate() {
+        for (t, &cw_base) in super::CASCADE_W_BASES.iter().enumerate() {
             let tier_s = base_s * (1.0 - 0.08 * (t as f32));
             for k in 0..16 {
                 let kl = if !eval_stereo {
@@ -790,4 +792,4 @@ pub(crate) fn lift_v2_pre_s3(
     }
 }
 
-pub(crate) use super::stage_a_refl::lift_v2_post_s3_stage4;
+pub(crate) use super::refl::lift_v2_post_s3_stage4;

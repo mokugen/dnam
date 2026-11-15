@@ -14,6 +14,15 @@
 //!   `binary64` declared-range normalization and ordered admissible `f32` rank-space intersection.
 //! - `ref[dsp.op-n.polyadaa.rail-crossing]`: 6-step division-free Newton reciprocal in `f64`.
 
+/// Submodules:
+/// - [`rotor_q192`]: Quadrant-reduced contractive Horner rotor & `Q0.192` LFO phase accumulator.
+/// - [`float_rank`]: `binary64` declared-range normalization & ordered admissible `f32` rank bounds.
+pub mod float_rank;
+pub mod rotor_q192;
+
+pub use float_rank::*;
+pub use rotor_q192::*;
+
 /// Error returned when a non-finite or out-of-domain floating-point bit pattern is rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InvalidFloatInput;
@@ -431,284 +440,6 @@ pub fn trust_clip_outward_8d(z: &mut [f32; 8], rho_max: f32) {
 }
 
 // ============================================================================
-// Quadrant-Reduced Contractive Rotor & Q0.192 LFO (`ref[dsp.op-m.rotor.*]`)
-// ============================================================================
-
-/// `pi` in IEEE-754 `f64` (`0x400921FB54442D18`, `ref[dsp.op-m.rotor.quadrant-horner]`).
-pub const PI_F64_BITS: u64 = 0x4009_21FB_5444_2D18;
-/// `pi / 2` in IEEE-754 `f64` (`0x3FF921FB54442D18`, `ref[dsp.op-m.rotor.quadrant-horner]`).
-pub const HALF_PI_F64_BITS: u64 = 0x3FF9_21FB_5444_2D18;
-/// `pi / 4` in IEEE-754 `f64` (`0x3FE921FB54442D18`, `ref[dsp.op-m.rotor.quadrant-horner]`).
-pub const QUARTER_PI_F64_BITS: u64 = 0x3FE9_21FB_5444_2D18;
-/// Largest admissible `f32` angle magnitude strictly below `pi` (`0x40490FDA`).
-pub const MAX_ROTOR_ANGLE_F32_BITS: u32 = 0x4049_0FDA;
-
-/// Applies the adaptive 1–2 ULP norm guard to `(c_bits, s_bits)` (`ref[dsp.op-m.rotor.ulp-guard]`).
-#[inline(always)]
-pub fn project_rotor_components_ulp_guard(
-    mut c_bits: u32,
-    mut s_bits: u32,
-    active: bool,
-) -> (u32, u32) {
-    if !active {
-        return (c_bits, s_bits);
-    }
-    let reduce_cosine = (c_bits & 0x7fff_ffff) >= (s_bits & 0x7fff_ffff);
-    for _ in 0..2 {
-        let c = widen_f32_bits(c_bits).unwrap_or(0.0);
-        let s = widen_f32_bits(s_bits).unwrap_or(0.0);
-        if c * c + s * s >= 1.0 {
-            if reduce_cosine {
-                c_bits -= 1;
-            } else {
-                s_bits -= 1;
-            }
-        }
-    }
-    (c_bits, s_bits)
-}
-
-/// Evaluates the quadrant-reduced degree-13/14 Horner contractive rotor on a signed `f32` bit
-/// pattern `theta_bits` (`-pi < theta < pi`), returning `(cos_bits, sin_bits)` (`ref[dsp.op-m.rotor.contractive]`,
-/// `ref[dsp.op-m.rotor.zero-hold]`, `ref[dsp.op-m.rotor.quadrant-horner]`, `ref[dsp.op-m.rotor.ulp-guard]`).
-/// Returns `None` if `theta` is non-finite or `|theta| >= pi`.
-#[inline(always)]
-pub fn contractive_rotor_f32_bits(theta_bits: u32) -> Option<(u32, u32)> {
-    let mag_bits = theta_bits & 0x7fff_ffff;
-    if mag_bits == 0 {
-        return Some((1.0_f32.to_bits(), 0.0_f32.to_bits()));
-    }
-    let theta = widen_f32_bits(theta_bits)?;
-    let magnitude = theta.abs();
-    let pi64 = f64::from_bits(PI_F64_BITS);
-    let half_pi64 = f64::from_bits(HALF_PI_F64_BITS);
-    let quarter_pi64 = f64::from_bits(QUARTER_PI_F64_BITS);
-    if !theta.is_finite() || magnitude >= pi64 {
-        return None;
-    }
-
-    let reflected = magnitude > half_pi64;
-    let quadrant = if reflected {
-        pi64 - magnitude
-    } else {
-        magnitude
-    };
-    let swapped = quadrant > quarter_pi64;
-    let reduced = if swapped {
-        half_pi64 - quadrant
-    } else {
-        quadrant
-    };
-    let sq = reduced * reduced;
-
-    let sine = reduced
-        * (1.0
-            + sq * (-1.0 / 6.0
-                + sq * (1.0 / 120.0
-                    + sq * (-1.0 / 5040.0
-                        + sq * (1.0 / 362_880.0
-                            + sq * (-1.0 / 39_916_800.0 + sq * (1.0 / 6_227_020_800.0)))))));
-    let cosine = 1.0
-        + sq * (-0.5
-            + sq * (1.0 / 24.0
-                + sq * (-1.0 / 720.0
-                    + sq * (1.0 / 40_320.0
-                        + sq * (-1.0 / 3_628_800.0
-                            + sq * (1.0 / 479_001_600.0 - sq * (1.0 / 87_178_291_200.0)))))));
-
-    let quad_cos = if swapped { sine } else { cosine };
-    let quad_sin = if swapped { cosine } else { sine };
-    let res_cos_f64 = if reflected { -quad_cos } else { quad_cos };
-    let res_sin_f64 = if (theta_bits & 0x8000_0000) != 0 {
-        -quad_sin
-    } else {
-        quad_sin
-    };
-
-    let c_bits = round_f64_to_f32_bits(res_cos_f64)?;
-    let s_bits = round_f64_to_f32_bits(res_sin_f64)?;
-    Some(project_rotor_components_ulp_guard(c_bits, s_bits, true))
-}
-
-/// Evaluates `contractive_rotor_f32_bits` on `theta: f32`, returning `Some((cos, sin))` for `|theta| < pi`.
-#[inline(always)]
-pub fn contractive_rotor_f32(theta: f32) -> Option<(f32, f32)> {
-    let (c_bits, s_bits) = contractive_rotor_f32_bits(theta.to_bits())?;
-    Some((f32::from_bits(c_bits), f32::from_bits(s_bits)))
-}
-
-/// Steps an `f32` LFO state `(re, im)` with zero-increment hold (`ref[dsp.op-m.rotor.zero-hold]`):
-/// when `theta == ±0.0`, `(re, im)` is returned unchanged bit-for-bit.
-#[inline]
-pub fn step_lfo_phasor_zero_hold(re: f32, im: f32, theta: f32) -> Option<(f32, f32)> {
-    if (theta.to_bits() & 0x7fff_ffff) == 0 {
-        return Some((re, im));
-    }
-    let (c, s) = contractive_rotor_f32(theta)?;
-    let next_re = c * re - s * im;
-    let next_im = s * re + c * im;
-    let corr = 1.5 - 0.5 * (next_re * next_re + next_im * next_im);
-    Some((next_re * corr, next_im * corr))
-}
-
-/// 256-bit constant $K = \lfloor 2^{256} / (2\pi) \rfloor$ in little-endian `u64` words (`ref[dsp.op-m.rotor.q0-192-lfo]`).
-pub const INV_TAU_256_LE: [u64; 4] = [
-    0x7f94_58ea_f7ae_f158,
-    0x36d8_a566_4f10_e410,
-    0x7f09_d5f4_7d4d_3770,
-    0x28be_60db_9391_054a,
-];
-
-/// `Q0.192` fixed-point LFO phase accumulator (`3 × u64` little-endian words modulo $2^{192}$,
-/// `ref[dsp.op-m.rotor.q0-192-lfo]`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Q0_192Phase {
-    /// Little-endian limbs: `words[0]` = bits `0..64`, `words[1]` = bits `64..128`, `words[2]` = bits `128..192`.
-    pub words: [u64; 3],
-}
-
-impl Q0_192Phase {
-    pub const ZERO: Self = Self { words: [0; 3] };
-
-    /// Advances `self` modulo $2^{192}$ by a signed increment `(sign_negative, mag_words)`.
-    #[inline]
-    pub fn advance_signed(&mut self, negative: bool, mag: [u64; 3]) {
-        if mag == [0, 0, 0] {
-            return;
-        }
-        if !negative {
-            let (w0, c0) = self.words[0].overflowing_add(mag[0]);
-            let (w1a, c1a) = self.words[1].overflowing_add(mag[1]);
-            let (w1, c1b) = w1a.overflowing_add(u64::from(c0));
-            let w2 = self.words[2]
-                .wrapping_add(mag[2])
-                .wrapping_add(u64::from(c1a || c1b));
-            self.words = [w0, w1, w2];
-        } else {
-            let (w0, b0) = self.words[0].overflowing_sub(mag[0]);
-            let (w1a, b1a) = self.words[1].overflowing_sub(mag[1]);
-            let (w1, b1b) = w1a.overflowing_sub(u64::from(b0));
-            let w2 = self.words[2]
-                .wrapping_sub(mag[2])
-                .wrapping_sub(u64::from(b1a || b1b));
-            self.words = [w0, w1, w2];
-        }
-    }
-
-    /// Advances `self` by the increment corresponding to `theta_bits` (`f32` bit pattern in `(-pi, pi)`).
-    #[inline]
-    pub fn step_angle_bits(&mut self, theta_bits: u32) -> Option<()> {
-        let (neg, mag) = q0_192_phase_increment_from_f32_bits(theta_bits)?;
-        self.advance_signed(neg, mag);
-        Some(())
-    }
-
-    /// Maps the top 32 bits of the `Q0.192` phase to a unit phasor `(cos, sin)` (`ref[dsp.op-m.rotor.q0-192-lfo]`).
-    #[inline]
-    pub fn to_phasor(self) -> (f32, f32) {
-        let q32 = (self.words[2] >> 32) as u32;
-        q32_phase_to_phasor(q32)
-    }
-}
-
-/// Computes the signed `Q0.192` increment `(negative, [u64; 3])` for an `f32` angle bit pattern
-/// `theta_bits` with `|theta| < pi` (`ref[dsp.op-m.rotor.q0-192-lfo]`).
-pub fn q0_192_phase_increment_from_f32_bits(theta_bits: u32) -> Option<(bool, [u64; 3])> {
-    let negative = (theta_bits >> 31) != 0;
-    let magnitude = theta_bits & 0x7fff_ffff;
-    if magnitude > MAX_ROTOR_ANGLE_F32_BITS {
-        return None;
-    }
-    if magnitude == 0 {
-        return Some((false, [0, 0, 0]));
-    }
-    let exponent = magnitude >> 23;
-    let mut mantissa = (magnitude & 0x007f_ffff) as u64;
-    let power: i32 = if exponent != 0 {
-        mantissa |= 1 << 23;
-        (exponent as i32) - 150
-    } else {
-        -149
-    };
-
-    // Multiply 24-bit `mantissa` by 256-bit `INV_TAU_256_LE` -> 5 x u64 little-endian limbs (`prod[0..5]`).
-    let mut prod = [0u64; 5];
-    let mut carry = 0u128;
-    for i in 0..4 {
-        let cur = (mantissa as u128) * (INV_TAU_256_LE[i] as u128) + carry;
-        prod[i] = cur as u64;
-        carry = cur >> 64;
-    }
-    prod[4] = carry as u64;
-
-    // Shift right by `shift = 64 - power` with ties-to-even rounding.
-    let shift = (64 - power) as u32;
-    let word_shift = (shift / 64) as usize;
-    let bit_shift = shift % 64;
-
-    let mut out = [0u64; 3];
-    for (i, slot) in out.iter_mut().enumerate() {
-        let src = i + word_shift;
-        if src < 5 {
-            let lo = prod[src] >> bit_shift;
-            let hi = if bit_shift > 0 && src + 1 < 5 {
-                prod[src + 1] << (64 - bit_shift)
-            } else {
-                0
-            };
-            *slot = lo | hi;
-        }
-    }
-
-    // Check rounding bit at `shift - 1` and sticky bits below `shift - 1`.
-    let half_pos = shift - 1;
-    let half_word = (half_pos / 64) as usize;
-    let half_bit = half_pos % 64;
-    let half_set = half_word < 5 && ((prod[half_word] >> half_bit) & 1) != 0;
-
-    let mut sticky = false;
-    for &w in prod.iter().take(half_word.min(5)) {
-        if w != 0 {
-            sticky = true;
-            break;
-        }
-    }
-    if !sticky && half_word < 5 && half_bit > 0 {
-        let mask = (1u64 << half_bit) - 1;
-        if (prod[half_word] & mask) != 0 {
-            sticky = true;
-        }
-    }
-
-    if half_set && (sticky || (out[0] & 1) != 0) {
-        let (w0, c0) = out[0].overflowing_add(1);
-        let (w1, c1) = out[1].overflowing_add(u64::from(c0));
-        let w2 = out[2].wrapping_add(u64::from(c1));
-        out = [w0, w1, w2];
-    }
-
-    Some((negative, out))
-}
-
-/// Maps a 32-bit `Q0.32` turn phase `q32` into a unit phasor `(cos, sin)` by splitting quadrant
-/// `j = q32 >> 30` and residual `n = q32 & 0x3FFF_FFFF`, multiplying by `0x30C90FDB` ($2\pi/2^{32}$),
-/// and applying the quadrant-reduced contractive rotor (`ref[dsp.op-m.rotor.q0-192-lfo]`, `ref[dsp.tempo.q64-q32-phase]`).
-#[inline]
-pub fn q32_phase_to_phasor(q32: u32) -> (f32, f32) {
-    let quadrant = q32 >> 30;
-    let remainder = q32 & 0x3fff_ffff;
-    let scale = f32::from_bits(0x30c9_0fdb);
-    let angle = (remainder as f32) * scale;
-    let (c, s) = contractive_rotor_f32(angle).unwrap_or((1.0, 0.0));
-    match quadrant {
-        0 => (c, s),
-        1 => (-s, c),
-        2 => (-c, -s),
-        _ => (s, -c),
-    }
-}
-
-// ============================================================================
 // Pitch-Ratio and Time-Warp Profile (`ref[dsp.ctrl.math.pitch-profile]`)
 // ============================================================================
 
@@ -849,209 +580,6 @@ pub fn eval_monotone_log2_f32_bits(bits: u32) -> Result<Option<f32>, InvalidFloa
 }
 
 // ============================================================================
-// Declared-Range Normalization & Ordered Admissible f32 Ranks
-// (`ref[dsp.ctrl.range.normalize-clamp]`, `ref[dsp.ctrl.range.f32-rank-bounds]`)
-// ============================================================================
-
-/// Normalizes a physical `f32` value `x` into `[-1.0, +1.0]` against declared `f32` endpoints
-/// `low < high` using cold-path `f64` reciprocal arithmetic (`ref[dsp.ctrl.range.normalize-clamp]`).
-#[inline]
-pub fn normalize_declared_range_bits(
-    low_bits: u32,
-    high_bits: u32,
-    value_bits: u32,
-) -> Option<f32> {
-    let low = widen_f32_bits(low_bits)?;
-    let high = widen_f32_bits(high_bits)?;
-    let value = widen_f32_bits(value_bits)?;
-    if !(low < high && value >= low && value <= high) {
-        return None;
-    }
-    let span = high - low;
-    let reciprocal = 1.0 / span;
-    let distance = value - low;
-    let product = distance * reciprocal;
-    let coord = (2.0 * product - 1.0).clamp(-1.0, 1.0);
-    let bits = round_f64_to_f32_bits(coord)?;
-    Some(f32::from_bits(bits))
-}
-
-const F32_NEG_FIRST_KEY: u64 = 0x0080_0000;
-const F32_NEG_NORMAL_END_KEY: u64 = 0x7f7f_ffff;
-const F32_NEG_ZERO_KEY: u64 = 0x7fff_ffff;
-const F32_POS_ZERO_KEY: u64 = 0x8000_0000;
-const F32_POS_NORMAL_START_KEY: u64 = 0x8080_0000;
-const F32_NORMALS_PER_SIGN: u64 = 254 * (1 << 23);
-
-/// Returns the total cardinality of admissible `f32` physical knob values (`4,278,190,079` under
-/// gradual underflow or `4,261,412,865` under FTZ/DAZ, `ref[dsp.ctrl.range.f32-rank-bounds]`).
-#[inline]
-pub const fn f32_coordinate_count(flush_subnormals: bool) -> u64 {
-    if flush_subnormals {
-        2 * F32_NORMALS_PER_SIGN + 1
-    } else {
-        2 * 255 * (1 << 23) - 1
-    }
-}
-
-/// Maps an ordered rank `0 <= rank < f32_coordinate_count(flush_subnormals)` to its canonical `f32`
-/// bit pattern (`+0.0` at the origin, `ref[dsp.ctrl.range.f32-rank-bounds]`).
-#[inline]
-pub const fn f32_bits_at_rank(rank: u64, flush_subnormals: bool) -> Option<u32> {
-    let count = f32_coordinate_count(flush_subnormals);
-    if rank >= count {
-        return None;
-    }
-    let key = if flush_subnormals {
-        if rank < F32_NORMALS_PER_SIGN {
-            F32_NEG_FIRST_KEY + rank
-        } else if rank == F32_NORMALS_PER_SIGN {
-            F32_POS_ZERO_KEY
-        } else {
-            F32_POS_NORMAL_START_KEY + rank - F32_NORMALS_PER_SIGN - 1
-        }
-    } else {
-        let mut k = F32_NEG_FIRST_KEY + rank;
-        if k >= F32_NEG_ZERO_KEY {
-            k += 1;
-        }
-        k
-    };
-    let bits = if (key & F32_POS_ZERO_KEY) != 0 {
-        (key ^ F32_POS_ZERO_KEY) as u32
-    } else {
-        !(key as u32)
-    };
-    Some(bits)
-}
-
-/// Maps a finite `f32` bit pattern to its ordered rank in `[0, f32_coordinate_count(flush_subnormals))`
-/// (`ref[dsp.ctrl.range.f32-rank-bounds]`). Returns `Ok(None)` if `bits` is a subnormal when
-/// `flush_subnormals == true`, or `Err(InvalidFloatInput)` if `bits` is non-finite.
-#[inline]
-pub const fn f32_rank_of_bits(
-    bits: u32,
-    flush_subnormals: bool,
-) -> Result<Option<u64>, InvalidFloatInput> {
-    if ((bits >> 23) & 0xff) == 0xff {
-        return Err(InvalidFloatInput);
-    }
-    let magnitude = bits & 0x7fff_ffff;
-    let key = if magnitude == 0 {
-        F32_POS_ZERO_KEY
-    } else {
-        if flush_subnormals && magnitude < 0x0080_0000 {
-            return Ok(None);
-        }
-        if (bits & 0x8000_0000) != 0 {
-            (!bits) as u64
-        } else {
-            (bits as u64) ^ F32_POS_ZERO_KEY
-        }
-    };
-    let rank = if flush_subnormals {
-        if key <= F32_NEG_NORMAL_END_KEY {
-            key - F32_NEG_FIRST_KEY
-        } else if key == F32_POS_ZERO_KEY {
-            F32_NORMALS_PER_SIGN
-        } else {
-            F32_NORMALS_PER_SIGN + 1 + key - F32_POS_NORMAL_START_KEY
-        }
-    } else {
-        key - F32_NEG_FIRST_KEY - if key >= F32_POS_ZERO_KEY { 1 } else { 0 }
-    };
-    Ok(Some(rank))
-}
-
-/// Binary-searches the rank boundary for a finite `binary64` bound (`upper == false` -> lower bound
-/// `first >= value`; `upper == true` -> upper exclusive bound `first > value`, `ref[dsp.ctrl.range.f32-rank-bounds]`).
-pub fn f32_rank_boundary_for_f64(value: f64, flush_subnormals: bool, upper: bool) -> Option<u64> {
-    if !value.is_finite() {
-        return None;
-    }
-    let mut low = 0u64;
-    let mut high = f32_coordinate_count(flush_subnormals);
-    while low < high {
-        let mid = low + (high - low) / 2;
-        let current = widen_f32_bits(f32_bits_at_rank(mid, flush_subnormals)?)?;
-        if current < value || (upper && current == value) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    Some(low)
-}
-
-/// Intersects slices of `binary64` lower and upper bounds onto the inward admissible `f32` rank
-/// interval `[first, end)` (`first < end`, `ref[dsp.ctrl.range.f32-rank-bounds]`).
-pub fn f32_rank_intersection(
-    lower_bounds: &[f64],
-    upper_bounds: &[f64],
-    flush_subnormals: bool,
-) -> Option<(u64, u64)> {
-    let count = f32_coordinate_count(flush_subnormals);
-    let mut first = 0u64;
-    for &lo in lower_bounds {
-        let b = f32_rank_boundary_for_f64(lo, flush_subnormals, false)?;
-        if b > first {
-            first = b;
-        }
-    }
-    let mut end = count;
-    for &hi in upper_bounds {
-        let b = f32_rank_boundary_for_f64(hi, flush_subnormals, true)?;
-        if b < end {
-            end = b;
-        }
-    }
-    if first >= end {
-        return None;
-    }
-    Some((first, end))
-}
-
-/// Maps any finite `f32` request bit pattern to the nearest admissible `f32` bit pattern in `[first, end)`
-/// (ties toward zero, `ref[dsp.ctrl.range.f32-rank-bounds]`).
-pub fn f32_nearest_admissible_bits(
-    requested_bits: u32,
-    first: u64,
-    end: u64,
-    flush_subnormals: bool,
-) -> Option<u32> {
-    let count = f32_coordinate_count(flush_subnormals);
-    if !(first < end && end <= count) {
-        return None;
-    }
-    let req_f64 = widen_f32_bits(requested_bits)?;
-    let at = f32_rank_boundary_for_f64(req_f64, flush_subnormals, false)?;
-    let idx0 = at.saturating_sub(1).clamp(first, end - 1);
-    let idx1 = at.clamp(first, end - 1);
-    let b0 = f32_bits_at_rank(idx0, flush_subnormals)?;
-    if idx0 == idx1 {
-        return Some(b0);
-    }
-    let b1 = f32_bits_at_rank(idx1, flush_subnormals)?;
-    let v0 = widen_f32_bits(b0)?;
-    let v1 = widen_f32_bits(b1)?;
-    let d0 = (v0 - req_f64).abs();
-    let d1 = (v1 - req_f64).abs();
-    if d0 < d1 {
-        Some(b0)
-    } else if d1 < d0 {
-        Some(b1)
-    } else if v0.abs() < v1.abs() {
-        Some(b0)
-    } else if v1.abs() < v0.abs() {
-        Some(b1)
-    } else if v0 <= v1 {
-        Some(b0)
-    } else {
-        Some(b1)
-    }
-}
-
-// ============================================================================
 // 6-Step Newton Reciprocal for Saturated PolyADAA (`ref[dsp.op-n.polyadaa.rail-crossing]`)
 // ============================================================================
 
@@ -1087,35 +615,25 @@ mod spec_tests {
     // - `verify[arch.fp.callback-env]`
     // - `verify[arch.fp.range-saturation]`
     // - `verify[arch.simd.lane-packing]`
-    // - `verify[dsp.op-m.rotor.contractive]`
-    // - `verify[dsp.op-m.rotor.zero-hold]`
-    // - `verify[dsp.op-m.rotor.quadrant-horner]`
-    // - `verify[dsp.op-m.rotor.ulp-guard]`
-    // - `verify[dsp.op-m.rotor.q0-192-lfo]`
     // - `verify[dsp.ctrl.math.pitch-profile]`
     // - `verify[dsp.ctrl.math.log2-lut]`
     // - `verify[dsp.ctrl.op-n.trust-clip]`
     // - `verify[dsp.op-n.ctrl.trust-clip]`
-    // - `verify[dsp.ctrl.range.normalize-clamp]`
-    // - `verify[dsp.ctrl.range.f32-rank-bounds]`
     // - `verify[dsp.op-n.polyadaa.rail-crossing]`
 
     use crate::test_support as support;
 
     use crate::math::{
         CERTIFIED_INPUT_ENVELOPE_MIN_F32, DefaultMathBackend, FP16_MAX_FINITE_F32,
-        LOG2_MANTISSA_LUT_129_BITS, Log2EnvelopeDecomp, MathBackend, Q0_192Phase,
-        SAFETY_CEILING_F32, ScalarBackend, SimdVec4, contractive_rotor_f32,
-        contractive_rotor_f32_bits, decompose_positive_f32_bits, eval_monotone_log2_f32_bits,
-        eval_pitch_profile_f32, f32_bits_at_rank, f32_coordinate_count,
-        f32_nearest_admissible_bits, f32_rank_boundary_for_f64, f32_rank_intersection,
-        f32_rank_of_bits, f32_to_fp16_with_telemetry, flush_subnormal_f32_bits,
-        lookup_log2_mantissa_f32, newton6_reciprocal_f64, normalize_declared_range_bits,
-        project_rotor_components_ulp_guard, q0_192_phase_increment_from_f32_bits,
-        q32_phase_to_phasor, sanitize_input_sample, sanitize_internal_sample,
-        sanitize_output_sample, saturation_flags, step_lfo_phasor_zero_hold,
+        LOG2_MANTISSA_LUT_129_BITS, Log2EnvelopeDecomp, MathBackend, SAFETY_CEILING_F32,
+        ScalarBackend, SimdVec4, contractive_rotor_f32, decompose_positive_f32_bits,
+        eval_monotone_log2_f32_bits, eval_pitch_profile_f32, f32_to_fp16_with_telemetry,
+        f32_unbiased_exponent, flush_subnormal_f32_bits, lookup_log2_mantissa_f32,
+        newton6_reciprocal_f64, round_f64_to_f32_bits, sanitize_input_sample,
+        sanitize_internal_sample, sanitize_output_sample, saturation_flags,
         trust_clip_fast_candidate, trust_clip_outward_4d, trust_clip_outward_8d,
-        trust_clip_outward_checked_bits, trust_clip_reference_bisection_bits, widen_f32_bits,
+        trust_clip_outward_checked_bits, trust_clip_reference_bisection_bits, upper_product_f64,
+        widen_f32_bits,
     };
     use crate::operators::OpNBackend;
     use crate::provenance::sha256_digest;
@@ -1205,6 +723,22 @@ mod spec_tests {
         flags = 0;
         assert_eq!(sanitize_input_sample(f32::NAN, 100.0, &mut flags), 0.0);
         assert_eq!(flags, saturation_flags::INVALID_NONFINITE);
+
+        flags = 0;
+        assert_eq!(sanitize_internal_sample(f32::NAN, &mut flags), 0.0);
+        assert_eq!(flags, saturation_flags::INVALID_NONFINITE);
+
+        flags = 0;
+        assert_eq!(sanitize_internal_sample(5.0, &mut flags), 5.0);
+        assert_eq!(flags, 0);
+
+        flags = 0;
+        assert_eq!(sanitize_output_sample(f32::NAN, &mut flags), 0.0);
+        assert_eq!(flags, saturation_flags::INVALID_NONFINITE);
+
+        flags = 0;
+        assert_eq!(f32_to_fp16_with_telemetry(f32::NAN, &mut flags), 0);
+        assert_eq!(flags, saturation_flags::INVALID_NONFINITE);
     }
 
     /// verify[arch.simd.lane-packing]
@@ -1240,147 +774,6 @@ mod spec_tests {
         for lane in 0..4 {
             assert!((s_out[lane] - d_out[lane]).abs() < 1e-6);
         }
-    }
-
-    /// verify[dsp.op-m.rotor.contractive]
-    /// verify[dsp.op-m.rotor.zero-hold]
-    /// verify[dsp.op-m.rotor.quadrant-horner]
-    /// verify[dsp.op-m.rotor.ulp-guard]
-    /// Verifies quadrant-reduced degree-13/14 Horner rotor accuracy (`< 1.6e-7`), strict contractive
-    /// norm (`c^2 + s^2 < 1` for non-zero angles), signed symmetry, quadrant boundaries, and `±0.0` hold.
-    #[test]
-    fn test_contractive_rotor_zero_hold_quadrant_horner_and_ulp_guard() {
-        let _guard = FtzDazGuard::new();
-
-        // 1. Exact zero-increment hold on +0.0 and -0.0
-        assert_eq!(
-            contractive_rotor_f32_bits(0x0000_0000),
-            Some((1.0_f32.to_bits(), 0.0_f32.to_bits()))
-        );
-        assert_eq!(
-            contractive_rotor_f32_bits(0x8000_0000),
-            Some((1.0_f32.to_bits(), 0.0_f32.to_bits()))
-        );
-        let held = (0.6_f32, 0.8_f32);
-        assert_eq!(step_lfo_phasor_zero_hold(held.0, held.1, 0.0), Some(held));
-        assert_eq!(step_lfo_phasor_zero_hold(held.0, held.1, -0.0), Some(held));
-
-        // 2. Rejects |theta| >= pi or non-finite
-        for bad in [
-            core::f32::consts::PI,
-            -core::f32::consts::PI,
-            f32::INFINITY,
-            f32::NEG_INFINITY,
-            f32::NAN,
-        ] {
-            assert!(contractive_rotor_f32(bad).is_none());
-        }
-
-        // 3. Signed angles & subnormal/boundary angles
-        for bits in [1_u32, 0x007f_ffff, 0x0080_0000, 0x3f80_0000, 0x4049_0fda] {
-            let (cp, sp) = contractive_rotor_f32_bits(bits).unwrap();
-            let (cn, sn) = contractive_rotor_f32_bits(bits | 0x8000_0000).unwrap();
-            assert_eq!(cp, cn);
-            assert_eq!(sp ^ 0x8000_0000, sn);
-            let c = widen_f32_bits(cp).unwrap();
-            let s = widen_f32_bits(sp).unwrap();
-            assert!(c * c + s * s < 1.0);
-        }
-
-        // 4. Small cosine near pi/2 quadrant boundary
-        let half_pi_bits = (core::f64::consts::FRAC_PI_2 as f32).to_bits();
-        for bits in (half_pi_bits - 2)..=(half_pi_bits + 2) {
-            let theta64 = widen_f32_bits(bits).unwrap();
-            let (c_bits, _) = contractive_rotor_f32_bits(bits).unwrap();
-            let c64 = widen_f32_bits(c_bits).unwrap();
-            assert!((c64 - theta64.cos()).abs() < 1e-14);
-        }
-
-        // 5. ULP guard two-step limit verification
-        let small_bits = (-30.0_f64).exp2() as f32;
-        let (cg, sg) =
-            project_rotor_components_ulp_guard(1.0_f32.to_bits(), small_bits.to_bits(), true);
-        let cg64 = widen_f32_bits(cg).unwrap();
-        let sg64 = widen_f32_bits(sg).unwrap();
-        assert!(cg64 < 1.0);
-        assert!(cg64 * cg64 + sg64 * sg64 < 1.0);
-
-        let above_sqrt_half = f32::from_bits((0.5_f64.sqrt() as f32).to_bits() + 1);
-        let (c2, s2) = project_rotor_components_ulp_guard(
-            above_sqrt_half.to_bits(),
-            above_sqrt_half.to_bits(),
-            true,
-        );
-        let c2_64 = widen_f32_bits(c2).unwrap();
-        let s2_64 = widen_f32_bits(s2).unwrap();
-        assert_eq!(c2, above_sqrt_half.to_bits() - 2);
-        assert_eq!(s2, above_sqrt_half.to_bits());
-        assert!(c2_64 * c2_64 + s2_64 * s2_64 < 1.0);
-
-        // 6. Sweep across 200,000 angles in (0, pi)
-        let last_f32 = f32::from_bits(0x4049_0fda);
-        let steps = 200_000usize;
-        let mut max_comp_err = 0.0_f64;
-        let mut max_ang_err = 0.0_f64;
-        let mut min_norm_sq = 1.0_f64;
-        for i in 1..=steps {
-            let theta = (last_f32 as f64 * (i as f64) / (steps as f64)) as f32;
-            let (c, s) = contractive_rotor_f32(theta).unwrap();
-            let c64 = c as f64;
-            let s64 = s as f64;
-            let t64 = theta as f64;
-            max_comp_err = max_comp_err
-                .max((c64 - t64.cos()).abs())
-                .max((s64 - t64.sin()).abs());
-            max_ang_err = max_ang_err.max((s64.atan2(c64) - t64).abs());
-            let n2 = c64 * c64 + s64 * s64;
-            assert!(n2 < 1.0, "Non-contractive norm at theta={theta}: n2={n2}");
-            min_norm_sq = min_norm_sq.min(n2);
-        }
-        assert!(max_comp_err < 1.6e-7);
-        assert!(max_ang_err < 2.3e-7);
-        assert!(min_norm_sq > 0.999_999_8);
-    }
-
-    /// verify[dsp.op-m.rotor.q0-192-lfo]
-    /// Verifies `Q0.192` fixed-point LFO phase increment and slow-motion retention at `2^-30 rad/tick`.
-    #[test]
-    fn test_q0_192_lfo_phase_accumulator_and_slow_motion() {
-        let _guard = FtzDazGuard::new();
-        // Slow LFO angle 2^-30 rad/tick over 300,000 ticks
-        let theta = f32::from_bits((127 - 30) << 23);
-        let mut phase = Q0_192Phase {
-            words: [0, 0, 1u64 << 61], // pi / 4 initial phase (1 << 189)
-        };
-        let initial = phase;
-        assert_eq!(
-            q0_192_phase_increment_from_f32_bits(0),
-            Some((false, [0, 0, 0]))
-        );
-        phase.step_angle_bits(0).unwrap();
-        assert_eq!(phase, initial);
-
-        let (neg, step_words) = q0_192_phase_increment_from_f32_bits(theta.to_bits()).unwrap();
-        assert!(!neg);
-        assert!(step_words[0] >= (1u64 << 40));
-        let (neg_sign, neg_words) =
-            q0_192_phase_increment_from_f32_bits(theta.to_bits() | 0x8000_0000).unwrap();
-        assert!(neg_sign);
-        assert_eq!(neg_words, step_words);
-
-        for _ in 0..300_000 {
-            phase.step_angle_bits(theta.to_bits()).unwrap();
-        }
-        let (c, s) = phase.to_phasor();
-        let actual_angle = (s as f64).atan2(c as f64);
-        let expected_angle = core::f64::consts::FRAC_PI_4 + (theta as f64) * 300_000.0;
-        assert!((actual_angle - expected_angle).abs() < 4e-7);
-
-        // Verify q32_phase_to_phasor quadrant boundaries
-        assert_eq!(q32_phase_to_phasor(0), (1.0, 0.0));
-        assert_eq!(q32_phase_to_phasor(0x4000_0000), (0.0, 1.0));
-        assert_eq!(q32_phase_to_phasor(0x8000_0000), (-1.0, 0.0));
-        assert_eq!(q32_phase_to_phasor(0xc000_0000), (0.0, -1.0));
     }
 
     /// verify[dsp.ctrl.math.pitch-profile]
@@ -1582,83 +975,62 @@ mod spec_tests {
         trust_clip_outward_8d(&mut z8, 2.5);
         let n8: f64 = z8.iter().map(|&v| (v as f64) * (v as f64)).sum();
         assert!(n8 <= 2.5 * 2.5);
-    }
 
-    /// verify[dsp.ctrl.range.normalize-clamp]
-    /// verify[dsp.ctrl.range.f32-rank-bounds]
-    /// Verifies `binary64` declared-range normalization (closely spaced `2^30` endpoints & wide `±f32::MAX` spans)
-    /// and ordered admissible `f32` rank bounds (`4,278,190,079` vs `4,261,412,865`).
-    #[test]
-    fn test_declared_range_normalization_and_f32_rank_bounds() {
-        let _guard = FtzDazGuard::new();
-
-        // 1. Closely spaced endpoints 2^30 and 2^30 + 128
-        let low = (1u64 << 30) as f32;
-        let high = f32::from_bits(low.to_bits() + 1);
+        // 4. Bitwise rounding, exponent, upper product & guard-path edge cases
+        assert!(round_f64_to_f32_bits(f64::NAN).is_none());
+        assert!(round_f64_to_f32_bits(1.0e50).is_none());
+        assert!(round_f64_to_f32_bits(f64::from_bits(1)).is_none());
+        assert_eq!(round_f64_to_f32_bits(-0.0), Some(0x8000_0000));
         assert_eq!(
-            normalize_declared_range_bits(low.to_bits(), high.to_bits(), low.to_bits()),
-            Some(-1.0)
-        );
-        assert_eq!(
-            normalize_declared_range_bits(low.to_bits(), high.to_bits(), high.to_bits()),
-            Some(1.0)
-        );
-
-        // 2. Extreme span [-f32::MAX, +f32::MAX]
-        let max_bits = 0x7f7f_ffff_u32;
-        let min_bits = 0xff7f_ffff_u32;
-        assert_eq!(
-            normalize_declared_range_bits(min_bits, max_bits, min_bits),
-            Some(-1.0)
-        );
-        assert_eq!(
-            normalize_declared_range_bits(min_bits, max_bits, 0),
-            Some(0.0)
-        );
-        assert_eq!(
-            normalize_declared_range_bits(min_bits, max_bits, max_bits),
-            Some(1.0)
-        );
-
-        // 3. Cardinalities and rank round-trips
-        assert_eq!(f32_coordinate_count(false), 4_278_190_079);
-        assert_eq!(f32_coordinate_count(true), 4_261_412_865);
-        for flush in [false, true] {
-            let count = f32_coordinate_count(flush);
-            assert_eq!(f32_bits_at_rank(0, flush), Some(0xff7f_ffff));
-            assert_eq!(f32_bits_at_rank(count - 1, flush), Some(0x7f7f_ffff));
-            let zero_rank = f32_rank_of_bits(0, flush).unwrap().unwrap();
-            assert_eq!(f32_rank_of_bits(0x8000_0000, flush), Ok(Some(zero_rank)));
-            assert_eq!(f32_bits_at_rank(zero_rank, flush), Some(0));
-        }
-
-        // 4. Inward binary64 bound intersection and halfway ties toward zero
-        assert!(f32_rank_intersection(&[0.1], &[0.1], false).is_none());
-        let (first, end) = f32_rank_intersection(&[0.1], &[0.2], false).unwrap();
-        let lo_v = widen_f32_bits(f32_bits_at_rank(first, false).unwrap()).unwrap();
-        let hi_v = widen_f32_bits(f32_bits_at_rank(end - 1, false).unwrap()).unwrap();
-        assert!(lo_v >= 0.1 && hi_v <= 0.2);
-
-        let min_norm_f64 = widen_f32_bits(0x0080_0000).unwrap();
-        let (f_ftz, e_ftz) =
-            f32_rank_intersection(&[-min_norm_f64], &[min_norm_f64], true).unwrap();
-        assert_eq!(
-            f32_nearest_admissible_bits(0x0040_0000, f_ftz, e_ftz, true),
+            round_f64_to_f32_bits(f64::from_bits(872_u64 << 52)),
             Some(0)
         );
         assert_eq!(
-            f32_nearest_admissible_bits(0x8040_0000, f_ftz, e_ftz, true),
-            Some(0)
+            round_f64_to_f32_bits(f64::from_bits(0x3fff_ffff_f000_0000_u64)),
+            Some(2.0_f32.to_bits())
         );
+        assert!(round_f64_to_f32_bits(f64::from_bits(0x47ef_ffff_f000_0000_u64)).is_none());
+
+        assert!(f32_unbiased_exponent(0).is_none());
+        assert!(f32_unbiased_exponent(0x7f80_0000).is_none());
+        assert_eq!(f32_unbiased_exponent(0x0000_0001), Some(-149));
+        assert_eq!(f32_unbiased_exponent(1.0_f32.to_bits()), Some(0));
+
+        assert_eq!(upper_product_f64(0.0, 5.0), 0.0);
+        assert_eq!(upper_product_f64(5.0, 0.0), 0.0);
+
+        assert!(trust_clip_fast_candidate(&[0u32; 4], 0, 0x0080_0000).is_none());
+        assert!(trust_clip_fast_candidate(&[0u32; 4], 1.0_f32.to_bits(), 0).is_none());
+        assert!(
+            trust_clip_outward_checked_bits(&[0u32; 3], 1.0_f32.to_bits(), 0x0080_0000).is_none()
+        );
+        assert!(trust_clip_outward_checked_bits(&[0u32; 4], 0, 0x0080_0000).is_none());
+        assert!(
+            trust_clip_reference_bisection_bits(&[0u32; 3], 1.0_f32.to_bits(), 0x0080_0000)
+                .is_none()
+        );
+        assert!(trust_clip_reference_bisection_bits(&[0u32; 4], 0, 0x0080_0000).is_none());
         assert_eq!(
-            f32_nearest_admissible_bits(0x0040_0001, f_ftz, e_ftz, true),
-            Some(0x0080_0000)
+            trust_clip_reference_bisection_bits(&[0u32; 4], 1.0_f32.to_bits(), 0x0080_0000),
+            Some(([0u32; 4], 1.0, 1.0))
         );
-        assert_eq!(
-            f32_nearest_admissible_bits(0x8040_0001, f_ftz, e_ftz, true),
-            Some(0x8080_0000)
-        );
-        assert!(f32_rank_boundary_for_f64(f64::NAN, false, false).is_none());
+        let rad_11 = 1.1_f32.to_bits();
+        let (ref_near, _, init_high) = trust_clip_reference_bisection_bits(
+            &[1.0_f32.to_bits(), 1.0_f32.to_bits(), 0, 0],
+            rad_11,
+            0x0080_0000,
+        )
+        .unwrap();
+        assert_eq!(init_high, 1.0);
+        let sq_near: f64 = ref_near
+            .iter()
+            .map(|&b| {
+                let w = widen_f32_bits(b).unwrap();
+                w * w
+            })
+            .sum();
+        let rad_11_f64 = widen_f32_bits(rad_11).unwrap();
+        assert!(sq_near <= rad_11_f64 * rad_11_f64);
     }
 
     /// verify[dsp.op-n.polyadaa.rail-crossing]
@@ -1898,6 +1270,11 @@ mod trust_clip_reference_tests {
         assert!(round_f64_to_f32_bits(f64::from_bits(1)).is_none());
         assert!(round_f64_to_f32_bits(f64::INFINITY).is_none());
         assert!(round_f64_to_f32_bits(f64::from_bits((1151_u64) << 52)).is_none());
+        assert_eq!(
+            round_f64_to_f32_bits(f64::from_bits(0x3fff_ffff_f000_0000_u64)),
+            Some(2.0_f32.to_bits())
+        );
+        assert!(round_f64_to_f32_bits(f64::from_bits(0x47ef_ffff_f000_0000_u64)).is_none());
         for exponent in 1..=254 {
             for fraction in [0, 1, 0x003f_ffff, 0x007f_fffe] {
                 let lower = (exponent << 23) | fraction;

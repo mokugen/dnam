@@ -312,5 +312,104 @@ mod tests {
         let v = ScalarVec4::splat(0.5);
         let mat = [[0.1f32; 4]; 4];
         let _ = ScalarBackend::fma_mat4x4_vec4(v, &mat, &[0.5; 4]);
+
+        let r1 = ScalarBackend::rsqrt_nr2_f32(4.0);
+        assert!((r1 - 0.5).abs() < 1e-3);
+        let (p0, p1) = ScalarBackend::rsqrt_nr2_pair_f32(4.0, 9.0);
+        assert!((p0 - 0.5).abs() < 1e-3);
+        assert!((p1 - 1.0 / 3.0).abs() < 1e-3);
+
+        #[derive(Clone, Copy)]
+        struct DefaultLaneVec([f32; 4]);
+        impl SimdVec4 for DefaultLaneVec {
+            fn splat(v: f32) -> Self {
+                Self([v; 4])
+            }
+            fn load(s: &[f32; 4]) -> Self {
+                Self(*s)
+            }
+            fn store(self, d: &mut [f32; 4]) {
+                *d = self.0;
+            }
+            fn add(self, r: Self) -> Self {
+                Self([
+                    self.0[0] + r.0[0],
+                    self.0[1] + r.0[1],
+                    self.0[2] + r.0[2],
+                    self.0[3] + r.0[3],
+                ])
+            }
+            fn sub(self, r: Self) -> Self {
+                Self([
+                    self.0[0] - r.0[0],
+                    self.0[1] - r.0[1],
+                    self.0[2] - r.0[2],
+                    self.0[3] - r.0[3],
+                ])
+            }
+            fn mul(self, r: Self) -> Self {
+                Self([
+                    self.0[0] * r.0[0],
+                    self.0[1] * r.0[1],
+                    self.0[2] * r.0[2],
+                    self.0[3] * r.0[3],
+                ])
+            }
+            fn fma(self, a: Self, b: Self) -> Self {
+                self.add(a.mul(b))
+            }
+            fn fms(self, a: Self, b: Self) -> Self {
+                self.sub(a.mul(b))
+            }
+            fn max(self, r: Self) -> Self {
+                Self([
+                    self.0[0].max(r.0[0]),
+                    self.0[1].max(r.0[1]),
+                    self.0[2].max(r.0[2]),
+                    self.0[3].max(r.0[3]),
+                ])
+            }
+            fn min(self, r: Self) -> Self {
+                Self([
+                    self.0[0].min(r.0[0]),
+                    self.0[1].min(r.0[1]),
+                    self.0[2].min(r.0[2]),
+                    self.0[3].min(r.0[3]),
+                ])
+            }
+            fn abs(self) -> Self {
+                Self(self.0.map(f32::abs))
+            }
+            fn pair_swap_neg(self) -> Self {
+                Self([-self.0[1], self.0[0], -self.0[3], self.0[2]])
+            }
+            fn horizontal_sum(self) -> f32 {
+                self.0.iter().sum()
+            }
+        }
+        let dl = DefaultLaneVec([1.0, 2.0, 3.0, 4.0]);
+        let res = dl.fma_lane::<2>(
+            DefaultLaneVec([10.0; 4]),
+            DefaultLaneVec([0.5, 1.5, 2.5, 3.5]),
+        );
+        assert_eq!(res.0, [26.0, 27.0, 28.0, 29.0]);
+
+        let dl_loaded = DefaultLaneVec::load(&[-1.0, 2.0, -3.0, 4.0]);
+        let other = DefaultLaneVec::splat(1.5);
+        assert_eq!(dl_loaded.sub(other).0, [-2.5, 0.5, -4.5, 2.5]);
+        assert_eq!(
+            dl_loaded
+                .fms(other, DefaultLaneVec::load(&[2.0, 2.0, 2.0, 2.0]))
+                .0,
+            [-4.0, -1.0, -6.0, 1.0]
+        );
+        assert_eq!(dl_loaded.max(other).0, [1.5, 2.0, 1.5, 4.0]);
+        assert_eq!(dl_loaded.min(other).0, [-1.0, 1.5, -3.0, 1.5]);
+        assert_eq!(dl_loaded.abs().0, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(dl_loaded.pair_swap_neg().0, [-2.0, -1.0, -4.0, -3.0]);
+        assert_eq!(dl_loaded.abs().horizontal_sum(), 10.0);
+        let mut stored = [0.0; 4];
+        dl_loaded.store(&mut stored);
+        assert_eq!(stored, [-1.0, 2.0, -3.0, 4.0]);
     }
 }

@@ -345,6 +345,7 @@ mod control_bus_tests {
     //   bytes, 64-byte $\mathcal{O}(1)$ `LatentAccumulator64B` delta updates across $P = 32$ controls,
     //   and non-stop Phase-1/2/3 clamping (`[CLAMP-RANGE]`, `[CLAMP-SWITCH]`, `[CLAMP-STABILITY]`).
 
+    use super::*;
     use std::collections::BTreeMap;
     use std::f64::consts::TAU;
 
@@ -705,5 +706,59 @@ mod control_bus_tests {
             view.header.controls_schema[0].user_metadata.get("midi_cc"),
             Some(&serde_json::json!(14))
         );
+    }
+
+    #[test]
+    fn test_uint_and_decode_cp1_inline_edge_paths() {
+        let put_f32 = |buf: &mut [u8], off: usize, val: f32| {
+            buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+        };
+
+        assert_eq!(eval_uint_base_3x8(&[0u8; 64], [0.5; 3]), [0.0; 8]);
+        assert!(!eval_uint_base_4x8(&[0u8; 64], [0.5; 4], [0.5; 3]).1);
+        assert_eq!(
+            eval_uint_ultra_delta_6x8(&[0u8; 1024], [0.5; 3], [0.2; 3]),
+            [0.0; 8]
+        );
+        assert!(!eval_uint_ultra_delta_3x4x8(&[0u8; 1024], [0.5; 4], [0.5; 4], [0.5; 3]).2);
+
+        let mut short_slots = vec![Cp1ContributorSlot::default(); 4];
+        assert_eq!(
+            decode_cp1_inline_contributors(&[0u8; 128], &mut short_slots).unwrap(),
+            0
+        );
+
+        let mut arena = vec![0u8; 64_000];
+        assert_eq!(
+            decode_cp1_inline_contributors(&arena, &mut short_slots).unwrap(),
+            0
+        );
+        arena[7_524..7_526].copy_from_slice(&27_u16.to_le_bytes());
+        assert!(decode_cp1_inline_contributors(&arena, &mut short_slots).is_err());
+
+        // 1-byte directory with 9 single-lane contributors + overflow to Arena 3
+        arena[7_524..7_526].copy_from_slice(&9_u16.to_le_bytes());
+        for c in 0..9 {
+            arena[7_526 + c] = 1;
+        }
+        for off in (7_552..8_512).step_by(4) {
+            put_f32(&mut arena, off, 0.15);
+        }
+        for off in (60_928..63_424).step_by(4) {
+            put_f32(&mut arena, off, 0.12);
+        }
+        let mut big_slots = vec![Cp1ContributorSlot::default(); 16];
+        assert_eq!(
+            decode_cp1_inline_contributors(&arena, &mut big_slots).unwrap(),
+            9
+        );
+
+        let uint_b3 = eval_uint_base_3x8(&arena, [0.4, -0.3, 0.2]);
+        let uint_u6 = eval_uint_ultra_delta_6x8(&arena, [0.4, -0.3, 0.2], [0.1, 0.2, -0.1]);
+        assert!(uint_b3.iter().all(|v| v.is_finite()) && uint_u6.iter().all(|v| v.is_finite()));
+
+        // Invalid lanes (0) triggers error in 1-byte directory
+        arena[7_526] = 0;
+        assert!(decode_cp1_inline_contributors(&arena, &mut big_slots).is_err());
     }
 }

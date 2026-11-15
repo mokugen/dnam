@@ -11,7 +11,6 @@ pub mod fft;
 pub mod laws;
 pub mod null_test;
 pub(crate) mod physics_probe;
-pub(crate) mod physics_probe_tail;
 pub mod pipeline;
 pub mod safeguards;
 pub mod sealing;
@@ -442,15 +441,17 @@ impl AdaptiveStimulusController {
 
         let is_coreset = matches!(self.phase, ControllerPhase::Coreset { .. });
         let (cur_ctrls, control_trajectories) = sealing::interpolate_frame_trajectories(
-            &self.config.control_values,
-            self.config.sweep_end_control_values.as_deref(),
-            self.config.active_control_id,
-            self.safeguards.law4c_subframe_weights[1],
-            t0,
-            t1,
-            reset_coreset_knots,
-            is_coreset,
-            in_1.len(),
+            &sealing::TrajectoryInterpSpec {
+                start_vals: &self.config.control_values,
+                end_vals_opt: self.config.sweep_end_control_values.as_deref(),
+                active_control_id: self.config.active_control_id,
+                window_weight: self.safeguards.law4c_subframe_weights[1],
+                t0,
+                t1,
+                reset_coreset_knots,
+                is_coreset,
+                frame_len: in_1.len(),
+            },
             &mut self.trajectory_windows,
         );
 
@@ -853,17 +854,21 @@ impl AdaptiveStimulusController {
             self.trajectory_windows.clone()
         };
         batch::seal_coresets_to_inpc_and_vault_with_override(
-            &self.config.stem_id,
-            is_star_center,
-            &self.config.seed_256,
-            &self.schedule_l.carrier_bins,
-            self.laws.valid_frames,
-            &self.coreset_dry_l,
-            self.coreset_dry_r.as_deref(),
-            raw_wet_l,
-            (!self.coreset_wet_r.is_empty()).then_some(self.coreset_wet_r.as_slice()),
-            windows,
-            controls_meta,
+            sealing::StemSealRequest {
+                stem_id: &self.config.stem_id,
+                is_star_center,
+                seed_256: &self.config.seed_256,
+                carrier_bins: &self.schedule_l.carrier_bins,
+                valid_frames: self.laws.valid_frames,
+                dry_48k_l: &self.coreset_dry_l,
+                dry_48k_r: self.coreset_dry_r.as_deref(),
+                wet_48k_l: raw_wet_l,
+                wet_48k_r: (!self.coreset_wet_r.is_empty())
+                    .then_some(self.coreset_wet_r.as_slice()),
+                windows,
+                controls_meta,
+                user_metadata: BTreeMap::new(),
+            },
             shared_align,
         )
     }

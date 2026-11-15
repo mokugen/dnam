@@ -1,150 +1,20 @@
-//! RFC 8785 JCS `immutable_header_sha256` & 2-Certificate `Ed25519` Verification.
+//! 2-Certificate `Ed25519` Provenance Verification & Marketplace Receipt Signing.
+
+pub mod jcs;
+
+pub(crate) use jcs::canonicalize_jcs_value;
+pub use jcs::{
+    compute_immutable_header_sha256, compute_immutable_header_sha256_for_version,
+    project_immutable_header_for_schema_version,
+};
 
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::schema::{
-    DnamError, DnamJsonHeader, MarketplaceReceipt, OemDeviceCertificate, SchemaVersion,
-};
+use crate::schema::{DnamError, DnamJsonHeader, MarketplaceReceipt, OemDeviceCertificate};
 
 use super::provider::{CryptoProvider, VerificationStatus};
 use super::sha256::{decode_hex_array, encode_hex, sha256_digest};
-
-/// Recursively canonicalizes a `serde_json::Value` per RFC 8785 JSON Canonicalization Scheme (JCS).
-pub(crate) fn canonicalize_jcs_value(val: &serde_json::Value, out: &mut String) {
-    match val {
-        serde_json::Value::Null => out.push_str("null"),
-        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        serde_json::Value::Number(n) => {
-            if let Some(f) = n.as_f64()
-                && f == 0.0
-            {
-                out.push('0');
-                return;
-            }
-            out.push_str(&serde_json::to_string(n).unwrap_or_default());
-        }
-        serde_json::Value::String(s) => {
-            out.push_str(&serde_json::to_string(s).unwrap_or_default());
-        }
-        serde_json::Value::Array(arr) => {
-            out.push('[');
-            for (i, item) in arr.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                canonicalize_jcs_value(item, out);
-            }
-            out.push(']');
-        }
-        serde_json::Value::Object(map) => {
-            // Sort keys by RFC 8785 UTF-16 code-unit lexicographical order
-            let mut sorted: Vec<(&str, &serde_json::Value)> =
-                map.iter().map(|(k, v)| (k.as_str(), v)).collect();
-            sorted.sort_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
-            out.push('{');
-            for (i, (k, v)) in sorted.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push_str(&serde_json::to_string(k).unwrap_or_default());
-                out.push(':');
-                canonicalize_jcs_value(v, out);
-            }
-            out.push('}');
-        }
-    }
-}
-
-/// Projects a serialized [`DnamJsonHeader`] `serde_json::Value` onto the canonical immutable
-/// field set for `schema_version`, stripping mutable DAW/user fields and any additive fields
-/// introduced in minor schema versions newer than `schema_version`.
-pub fn project_immutable_header_for_schema_version(
-    val: &mut serde_json::Value,
-    schema_version: SchemaVersion,
-) -> Result<(), DnamError> {
-    schema_version.ensure_supported()?;
-
-    if let Some(obj) = val.as_object_mut() {
-        obj.remove("presets");
-        obj.remove("user_metadata");
-
-        if let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut()) {
-            meta.remove("signatures");
-        }
-        if let Some(tiers) = obj
-            .get_mut("slimmable_tiers")
-            .and_then(|t| t.as_object_mut())
-        {
-            for tier_key in ["lite", "full", "pro", "ultra"] {
-                if let Some(t_obj) = tiers.get_mut(tier_key).and_then(|t| t.as_object_mut()) {
-                    t_obj.remove("prefix_crc32c");
-                }
-            }
-        }
-        if let Some(ctrls) = obj
-            .get_mut("controls_schema")
-            .and_then(|c| c.as_array_mut())
-        {
-            for c_item in ctrls {
-                if let Some(c_obj) = c_item.as_object_mut() {
-                    c_obj.remove("user_metadata");
-                }
-            }
-        }
-        if let Some(stems) = obj.get_mut("stems_registry").and_then(|s| s.as_array_mut()) {
-            for s_item in stems {
-                if let Some(s_obj) = s_item.as_object_mut() {
-                    s_obj.remove("user_metadata");
-                }
-            }
-        }
-
-        // Future minor-version projection hooks (e.g. `if schema_version.minor < 1 { ... }`)
-        // strip additive `#[serde(default)]` fields introduced after `schema_version` so
-        // containers signed under an earlier `1.x` minor version retain their exact JCS digest.
-    }
-
-    Ok(())
-}
-
-/// Computes the preset-safe RFC 8785 JCS `immutable_header_sha256` digest over a [`DnamJsonHeader`]
-/// projected to a specific [`SchemaVersion`].
-pub fn compute_immutable_header_sha256_for_version(
-    header: &DnamJsonHeader,
-    schema_version: SchemaVersion,
-) -> Result<[u8; 32], DnamError> {
-    let hdr_bytes = header
-        .to_json_vec()
-        .map_err(|e| DnamError::InvalidJsonHeader(alloc::format!("{e}")))?;
-    let mut val: serde_json::Value = serde_json::from_slice(&hdr_bytes)
-        .map_err(|e| DnamError::InvalidJsonHeader(alloc::format!("{e}")))?;
-    project_immutable_header_for_schema_version(&mut val, schema_version)?;
-
-    let mut canonical = String::with_capacity(2048);
-    canonicalize_jcs_value(&val, &mut canonical);
-    Ok(sha256_digest(canonical.as_bytes()))
-}
-
-/// Computes the preset-safe RFC 8785 JCS `immutable_header_sha256` digest over a [`DnamJsonHeader`]
-/// using the header's declared [`SchemaVersion`].
-///
-/// Excludes mutable fields (`presets`, `user_metadata`, `metadata.signatures`,
-/// `slimmable_tiers.*.prefix_crc32c`, `controls_schema[*].user_metadata`, and
-/// `stems_registry[*].user_metadata`) so users can save DAW presets and tags in-place
-/// (`0x40..0x1000`) without invalidating `creator_signature` or `marketplace_receipt`.
-pub fn compute_immutable_header_sha256(header: &DnamJsonHeader) -> Result<[u8; 32], DnamError> {
-    let schema_version = header.schema_version()?;
-    compute_immutable_header_sha_inner(header, schema_version)
-}
-
-#[inline]
-fn compute_immutable_header_sha_inner(
-    header: &DnamJsonHeader,
-    schema_version: SchemaVersion,
-) -> Result<[u8; 32], DnamError> {
-    compute_immutable_header_sha256_for_version(header, schema_version)
-}
 
 /// Builds the canonical 64-byte message signed by the creator's `Ed25519` key:
 /// `immutable_header_sha256 (32 B) || master_arena_sha256 (32 B)`.
@@ -544,7 +414,7 @@ pub fn sign_marketplace_receipt_json(
 mod tests {
     use super::*;
     use crate::provenance::DefaultCryptoProvider;
-    use crate::schema::PresetDef;
+    use crate::schema::{PresetDef, SchemaVersion};
     use alloc::collections::BTreeMap;
 
     #[test]
@@ -699,6 +569,27 @@ mod tests {
             // Test sign_creator_header_json and sign_marketplace_receipt_json
             let base_hdr = DnamJsonHeader::default_reference();
             let base_json = serde_json::to_string(&base_hdr).unwrap();
+            assert!(
+                sign_marketplace_receipt_json(
+                    &base_json,
+                    &full_arena,
+                    &[22u8; 32],
+                    MarketplaceReceiptSigningSpec {
+                        marketplace_id: String::from("mkt-1"),
+                        license_id: String::from("lic-1"),
+                        buyer_hash: encode_hex(&[0xBB; 32]),
+                        license_tier: String::from("lite"),
+                        issued_at: None,
+                        encryption_mode: None,
+                        arena_nonce_96: None,
+                        ephemeral_pubkey_x25519: None,
+                        authorized_devices: alloc::vec![],
+                        royalty_splits: alloc::vec![],
+                        include_buyer_tier_prefixes: false,
+                    },
+                )
+                .is_err()
+            );
             let signed_creator_json =
                 sign_creator_header_json(&base_json, &full_arena, &seed, "creator-1", true)
                     .unwrap();

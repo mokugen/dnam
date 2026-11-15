@@ -496,3 +496,66 @@ pub fn apply_cascade_head_gauge(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::container::{
+        ARENA_OFFSET_FULL_END, ARENA_OFFSET_LITE_END, ARENA_OFFSET_PRO_END, ARENA_OFFSET_ULTRA_END,
+    };
+
+    #[test]
+    fn test_tardos_codebook_embedding_scoring_and_gauge_branches() {
+        assert_eq!(role_b_head_slot_for_index(TARDOS_CASCADE_WEIGHTS), None);
+        assert_eq!(role_b_head_slot_for_index(0), None);
+        assert!(role_b_head_slot_for_index(16).is_some());
+
+        let codebook = generate_tardos_code_7680(&[0u8; 32], "model-x", "lic-y");
+        assert_eq!(codebook.as_ref().len(), TARDOS_CASCADE_WEIGHTS);
+
+        // BufferTooSmall and short-code errors
+        let mut tiny = [0u8; 64];
+        assert!(apply_tardos_watermark_7680(&mut tiny, &codebook.chips, 1e-4).is_err());
+        assert!(
+            apply_tardos_watermark_7680_envelopes(
+                &mut tiny,
+                &codebook.chips,
+                &[1e-4; TARDOS_CASCADE_WEIGHTS]
+            )
+            .is_err()
+        );
+        assert!(score_tardos_watermark_7680(&tiny, &tiny, &codebook).is_err());
+        assert!(apply_cascade_head_gauge(&mut tiny, 0, &[[0.0; 4]; 32]).is_err());
+
+        for size in [
+            ARENA_OFFSET_LITE_END as usize,
+            ARENA_OFFSET_FULL_END as usize,
+            ARENA_OFFSET_PRO_END as usize,
+            ARENA_OFFSET_ULTRA_END as usize,
+        ] {
+            let mut arena = alloc::vec![0u8; size];
+            assert!(apply_tardos_watermark_7680(&mut arena, &[1.0; 10], 1e-4).is_err());
+            assert!(
+                apply_tardos_watermark_7680_envelopes(
+                    &mut arena,
+                    &[1.0; 10],
+                    &[1e-4; TARDOS_CASCADE_WEIGHTS]
+                )
+                .is_err()
+            );
+            apply_tardos_watermark_7680(&mut arena, &codebook.chips, 1e-4).unwrap();
+            let env = [1e-4_f32; TARDOS_CASCADE_WEIGHTS];
+            apply_tardos_watermark_7680_envelopes(&mut arena, &[0.0; TARDOS_CASCADE_WEIGHTS], &env)
+                .unwrap();
+            let zero_score = score_tardos_watermark_7680(&arena, &arena, &codebook).unwrap();
+            assert_eq!(zero_score, 0.0);
+        }
+
+        // Ultra gauge test & degenerate sum_after ~ 0 rejection
+        let mut ultra = alloc::vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+        apply_cascade_head_gauge(&mut ultra, 3, &[[0.5; 4]; 32]).unwrap();
+        let mut bad_delta = [[0.0_f32; 4]; 32];
+        bad_delta[0][0] = -1.0;
+        assert!(apply_cascade_head_gauge(&mut ultra, 0, &bad_delta).is_err());
+    }
+}

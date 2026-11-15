@@ -12,12 +12,12 @@ Implements the 4-stage rig pipeline and matrix routing core of TORA (`#[forbid(u
 | Stage / File | Responsibility | Canonical Spec (SSOT) |
 | :--- | :--- | :--- |
 | [`router.rs`](router.rs), [`topology.rs`](topology.rs) ([`router_and_head.rs`](topology/router_and_head.rs), [`zoh_fir_onset.rs`](topology/zoh_fir_onset.rs)) | 8-Port Matrix Router, return aligners, ZOH/FIR onset & clean crossover | [`router_and_stages_topology.md`](../../../../docs/specs/dsp/router_and_stages_topology.md) |
-| [`stage1_pre.rs`](stage1_pre.rs) | Stage I Pre-Dynamics and envelope-governed input conditioning | [`router_and_stages_topology.md`](../../../../docs/specs/dsp/router_and_stages_topology.md) |
+| [`stage1_pre.rs`](stage1_pre.rs), [`stage1_pre/AGENTS.md`](stage1_pre/AGENTS.md) | Stage I Pre-Dynamics and envelope-governed input conditioning | [`router_and_stages_topology.md`](../../../../docs/specs/dsp/router_and_stages_topology.md) |
 | [`stage2_cascade.rs`](stage2_cascade.rs) | Stage II Commuted 3-stage nonlinear cascade and 4-filter tone basis | [`op_n_commuted_cascade.md`](../../../../docs/specs/dsp/op_n_commuted_cascade.md) |
 | [`stage3_cabinet.rs`](stage3_cabinet.rs) | Stage III early FIR and modal cabinet synthesis | [`op_m_modal_kautz.md`](../../../../docs/specs/dsp/op_m_modal_kautz.md) |
 | [`stage4_tank.rs`](stage4_tank.rs) | Stage IV Unitary Spatial Tank (`Givens+Householder`, diffusers, DC blocker & loop saturator) | [`router_and_stages_topology.md`](../../../../docs/specs/dsp/router_and_stages_topology.md) |
 | [`head.rs`](head.rs) | Unified 256-D Feature Bus & Canonical Mid/Side Kronecker Output Head | [`router_and_stages_topology.md`](../../../../docs/specs/dsp/router_and_stages_topology.md) |
 | [`weights.rs`](weights.rs) | 64-byte cache-line aligned `Arena 0..3` weight directory view | [`dnam_binary_format.md`](../../../../docs/specs/containers/dnam_binary_format.md) |
-| [`v3_core.rs`](v3_core.rs) | Cache-coherent L1D SIMD `v3` core (`Stage I..III`, `svf.rs`, `cascade.rs`) | [`tora_architecture.md`](../../../../docs/specs/architecture/tora_architecture.md) |
+| [`v3_core.rs`](v3_core.rs), [`v3_core/AGENTS.md`](v3_core/AGENTS.md) | Cache-coherent L1D SIMD `v3` Matryoshka core (`Stage I..III`) | [`tora_architecture.md`](../../../../docs/specs/architecture/tora_architecture.md) |
 
 See [`packages/engine/CONTRIBUTING.md`](../../CONTRIBUTING.md) for stage chaining and memory layout.

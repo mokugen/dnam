@@ -19,31 +19,34 @@ use crate::types::FtzDazGuard;
 fn read_vec4_le<B: MathBackend>(bytes: &[u8], off: usize) -> B::Vec4 {
     #[cfg(target_endian = "little")]
     {
-        if let Ok(chunk) = <&[u8; 16]>::try_from(&bytes[off..off + 16]) {
-            let arr: [f32; 4] = zerocopy::transmute!(*chunk);
-            return B::Vec4::load(&arr);
-        }
+        let mut raw = [0u8; 16];
+        raw.copy_from_slice(&bytes[off..off + 16]);
+        let arr: [f32; 4] = zerocopy::transmute!(raw);
+        B::Vec4::load(&arr)
     }
-    let f0 = f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
-    let f1 = f32::from_le_bytes([
-        bytes[off + 4],
-        bytes[off + 5],
-        bytes[off + 6],
-        bytes[off + 7],
-    ]);
-    let f2 = f32::from_le_bytes([
-        bytes[off + 8],
-        bytes[off + 9],
-        bytes[off + 10],
-        bytes[off + 11],
-    ]);
-    let f3 = f32::from_le_bytes([
-        bytes[off + 12],
-        bytes[off + 13],
-        bytes[off + 14],
-        bytes[off + 15],
-    ]);
-    B::Vec4::from_array([f0, f1, f2, f3])
+    #[cfg(not(target_endian = "little"))]
+    {
+        let f0 = f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
+        let f1 = f32::from_le_bytes([
+            bytes[off + 4],
+            bytes[off + 5],
+            bytes[off + 6],
+            bytes[off + 7],
+        ]);
+        let f2 = f32::from_le_bytes([
+            bytes[off + 8],
+            bytes[off + 9],
+            bytes[off + 10],
+            bytes[off + 11],
+        ]);
+        let f3 = f32::from_le_bytes([
+            bytes[off + 12],
+            bytes[off + 13],
+            bytes[off + 14],
+            bytes[off + 15],
+        ]);
+        B::Vec4::from_array([f0, f1, f2, f3])
+    }
 }
 
 impl<'a, B: EngineBackend> DnamEngine<'a, B> {

@@ -7,273 +7,61 @@
 //!   (`ref[train.capture.planner.freeze-transition]`, `ref[train.capture.calib.clean-pad]`)
 //! - `docs/specs/training/iterative_resume_and_caching.md` (`ref[train.cache.proj-vault]`)
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use dnam_engine::schema::{ControlKind, DnamError};
+use dnam_engine::schema::DnamError;
 
 use crate::CORESET_FP16_FRAMES_PER_STEM;
 use crate::align::{
-    DifferentialPadCalibration, compute_pcm_sha256, estimate_multiregime_alignment,
-    measure_differential_pad_ratio, realign_fractional_kaiser64, rescale_padded_stem,
+    compute_pcm_sha256, estimate_multiregime_alignment, realign_fractional_kaiser64,
 };
 use crate::proj::capsules::build_proj_inpc_capsule;
 use crate::proj::directory::StmcTrajectoryWindow;
-use crate::proj::fp16_bytes_to_f32;
-use crate::proj::schema::{DnamProjManifest, StemProvenance};
-use crate::proj::vault::{VaultCaptureSpec, replace_capture};
-use crate::resampler::{
-    resample_48k_to_arbitrary_rate, resample_arbitrary_rate_to_48k, resampled_frame_len,
-};
-use crate::targets::StemStimulus;
+use crate::proj::vault::VaultCaptureSpec;
 
-use super::laws::TopologyProbeMode;
-use super::waveforms::{
-    ActivePrimitiveKind, compute_stmc_psd_88_and_spectral_4096, encode_coreset_12k_fp16,
-    synthesize_a5_musical_transient_coreset, synthesize_active_primitive_frame,
+use super::ADAPTIVE_FRAME_SAMPLES;
+use super::waveforms::{compute_stmc_psd_88_and_spectral_4096, encode_coreset_12k_fp16};
+
+pub(crate) mod controls;
+pub(crate) mod freeze_and_pad;
+
+pub(crate) use controls::{
+    TrajectoryInterpSpec, build_controls_meta_map, control_declared_bounds, default_control_vector,
+    interpolate_frame_trajectories,
 };
-use super::{
-    ADAPTIVE_FRAME_SAMPLES, ADC_PEAK_GOVERNOR_FS, PEDESTAL_BIN_MONO, build_disjoint_comb_schedule,
-    synthesize_cyclic_comb_frame,
+pub use freeze_and_pad::recapture_clipped_stem;
+pub(crate) use freeze_and_pad::{
+    build_freeze_transition_stem_stimulus, normalize_stem_channel_to_48k,
+    resample_48k_channels_to_sr,
 };
 
 /// `3 * 4,608 = 13,824` samples at `48 kHz` (`12,000` `A5` coreset frames + `1,824` settle zeros).
 pub(crate) const CORESET_WITH_SETTLE_48K: usize = 3 * ADAPTIVE_FRAME_SAMPLES;
 const SETTLE_PAD_SAMPLES_48K: usize = CORESET_WITH_SETTLE_48K - CORESET_FP16_FRAMES_PER_STEM;
 
-pub(crate) fn control_declared_bounds(ctrl: &dnam_engine::schema::ControlSchemaDef) -> (f32, f32) {
-    let [lo, hi] = ctrl.declared_range.unwrap_or([0.0, 1.0]);
-    (lo, hi)
+/// Cohesive inputs for encoding `INPC` dry provenance and `STMC` `VaultCaptureSpec` metadata.
+pub(crate) struct StemSealRequest<'a> {
+    pub stem_id: &'a str,
+    pub is_star_center: bool,
+    pub seed_256: &'a [u8; 256],
+    pub carrier_bins: &'a [usize],
+    pub valid_frames: usize,
+    pub dry_48k_l: &'a [f32],
+    pub dry_48k_r: Option<&'a [f32]>,
+    pub wet_48k_l: &'a [f32],
+    pub wet_48k_r: Option<&'a [f32]>,
+    pub windows: Vec<StmcTrajectoryWindow>,
+    pub controls_meta: BTreeMap<String, serde_json::Value>,
+    pub user_metadata: BTreeMap<String, serde_json::Value>,
 }
 
-pub(crate) fn control_default_f32(ctrl: &dnam_engine::schema::ControlSchemaDef) -> f32 {
-    let (lo, hi) = control_declared_bounds(ctrl);
-    ctrl.default
-        .as_f64()
-        .map_or(0.5 * (lo + hi), |v| v as f32)
-        .clamp(lo, hi)
-}
-
-pub(crate) fn switch_default_index_f32(ctrl: &dnam_engine::schema::ControlSchemaDef) -> f32 {
-    let Some(opts) = ctrl.declared_options.as_ref() else {
-        return 0.0;
-    };
-    if opts.is_empty() {
-        return 0.0;
-    }
-    let idx = ctrl
-        .default
-        .as_str()
-        .and_then(|s| opts.iter().position(|o| o == s))
-        .or_else(|| ctrl.default.as_u64().map(|u| u as usize))
-        .unwrap_or(0)
-        .min(opts.len() - 1);
-    idx as f32
-}
-
-pub(crate) fn build_controls_meta_map(
-    manifest: &DnamProjManifest,
-    values: &[f32],
-    switch_overrides: &BTreeMap<usize, String>,
-) -> BTreeMap<String, serde_json::Value> {
-    let mut map = BTreeMap::new();
-    for (idx, ctrl) in manifest.base.controls_schema.iter().enumerate() {
-        match ctrl.kind {
-            ControlKind::Range => {
-                let v = f64::from(
-                    values
-                        .get(idx)
-                        .copied()
-                        .unwrap_or_else(|| control_default_f32(ctrl)),
-                );
-                if let Some(num) = serde_json::Number::from_f64(v) {
-                    map.insert(ctrl.id.clone(), serde_json::Value::Number(num));
-                }
-            }
-            ControlKind::Switch => {
-                let opt = switch_overrides.get(&idx).cloned().unwrap_or_else(|| {
-                    ctrl.declared_options
-                        .as_ref()
-                        .filter(|o| !o.is_empty())
-                        .and_then(|opts| {
-                            values.get(idx).and_then(|&v| {
-                                let k = (v.round().max(0.0) as usize).min(opts.len() - 1);
-                                opts.get(k).cloned()
-                            })
-                        })
-                        .or_else(|| ctrl.default.as_str().map(str::to_string))
-                        .or_else(|| {
-                            ctrl.declared_options
-                                .as_ref()
-                                .and_then(|o| o.first().cloned())
-                        })
-                        .unwrap_or_else(|| "default".to_string())
-                });
-                map.insert(ctrl.id.clone(), serde_json::Value::String(opt));
-            }
-        }
-    }
-    map
-}
-
-pub(crate) fn default_control_vector(manifest: &DnamProjManifest) -> Vec<f32> {
-    manifest
-        .base
-        .controls_schema
-        .iter()
-        .map(|c| match c.kind {
-            ControlKind::Range => control_default_f32(c),
-            ControlKind::Switch => switch_default_index_f32(c),
-        })
-        .collect()
-}
-
-pub(crate) fn resample_48k_channels_to_sr(
-    sr: u32,
-    l_48k: &[f32],
-    r_48k: Option<&[f32]>,
-    aux_48k: Option<&[f32]>,
-) -> (Vec<f32>, Option<Vec<f32>>, Option<Vec<f32>>) {
-    if sr == 48_000 {
-        return (
-            l_48k.to_vec(),
-            r_48k.map(<[f32]>::to_vec),
-            aux_48k.map(<[f32]>::to_vec),
-        );
-    }
-    let dst_len = resampled_frame_len(l_48k.len(), 48_000, sr);
-    let l = resample_48k_to_arbitrary_rate(l_48k, sr, Some(dst_len));
-    let r = r_48k.map(|ch| resample_48k_to_arbitrary_rate(ch, sr, Some(dst_len)));
-    let aux = aux_48k.map(|ch| resample_48k_to_arbitrary_rate(ch, sr, Some(dst_len)));
-    (l, r, aux)
-}
-
-pub(crate) fn normalize_stem_channel_to_48k(samples: &[f32], sr: u32) -> Vec<f32> {
-    let clamped_sr = sr.clamp(8_000, 384_000);
-    if clamped_sr == 48_000 {
-        samples.to_vec()
-    } else {
-        let dst_len = resampled_frame_len(samples.len(), clamped_sr, 48_000);
-        resample_arbitrary_rate_to_48k(samples, clamped_sr, Some(dst_len))
-    }
-}
-
-/// Synthesizes a timed `freeze_latch` sustain-entry -> live play-over -> release [`StemStimulus`]
-/// (`r[train.capture.planner.freeze-transition]`).
-pub(crate) fn build_freeze_transition_stem_stimulus(
-    manifest: &DnamProjManifest,
-    freeze_ctrl_idx: usize,
-    sample_rate_hz: u32,
-    topology_mode: TopologyProbeMode,
-    seed_256: &[u8; 256],
-) -> StemStimulus {
-    let empty_mask = BTreeSet::new();
-    let sched_l =
-        build_disjoint_comb_schedule(48_000, false, Some(PEDESTAL_BIN_MONO), &empty_mask, &[]);
-    let bin_amps_l: Vec<(usize, f64)> = sched_l.carrier_bins.iter().map(|&b| (b, 1.0)).collect();
-    let comb_l = synthesize_cyclic_comb_frame(
-        &bin_amps_l,
-        Some(PEDESTAL_BIN_MONO),
-        0.05,
-        0.18,
-        ADC_PEAK_GOVERNOR_FS,
-        &[0.0; 64],
-    );
-    let need_stereo = matches!(
-        topology_mode,
-        TopologyProbeMode::TrueStereo2To2 | TopologyProbeMode::DualInToMono2To1
-    );
-    let need_aux = matches!(
-        topology_mode,
-        TopologyProbeMode::FourCableMethod4Cm | TopologyProbeMode::DualInToMono2To1
-    );
-    let (mut coreset_l, mut coreset_r) = synthesize_a5_musical_transient_coreset(
-        seed_256,
-        CORESET_FP16_FRAMES_PER_STEM,
-        if need_stereo { 2 } else { 1 },
-        48_000,
-    );
-    coreset_l.resize(CORESET_WITH_SETTLE_48K, 0.0);
-    if let Some(ref mut cr) = coreset_r {
-        cr.resize(CORESET_WITH_SETTLE_48K, 0.0);
-    }
-
-    // [0..9,216): unfrozen tank charge; [9,216..18,432): frozen play-over; [18,432..23,040): release;
-    // [23,040..36,864): A5 transient coreset + settle.
-    let mut wave_l_48k = Vec::with_capacity(8 * ADAPTIVE_FRAME_SAMPLES);
-    wave_l_48k.extend_from_slice(&comb_l.samples);
-    wave_l_48k.extend_from_slice(&synthesize_active_primitive_frame(
-        ActivePrimitiveKind::P4TankDuckingBurst,
-        0,
-        false,
-        ADC_PEAK_GOVERNOR_FS,
-    ));
-    let n_earliest_48k = wave_l_48k.len();
-    wave_l_48k.extend_from_slice(&synthesize_active_primitive_frame(
-        ActivePrimitiveKind::P1BranchCutChirp,
-        0,
-        false,
-        ADC_PEAK_GOVERNOR_FS,
-    ));
-    wave_l_48k.extend_from_slice(&comb_l.samples);
-    let n_latest_48k = wave_l_48k.len();
-    wave_l_48k.resize(n_latest_48k + ADAPTIVE_FRAME_SAMPLES, 0.0);
-    wave_l_48k.extend_from_slice(&coreset_l);
-
-    let wave_r_48k = coreset_r.map(|cr| {
-        let prefix_len = wave_l_48k.len() - CORESET_WITH_SETTLE_48K;
-        let mut wr = wave_l_48k[..prefix_len].to_vec();
-        wr.extend_from_slice(&cr);
-        wr
-    });
-    let aux_48k = need_aux.then(|| wave_l_48k.clone());
-
-    let sr = sample_rate_hz.clamp(8_000, 384_000);
-    let (in_1, in_2, in_3) =
-        resample_48k_channels_to_sr(sr, &wave_l_48k, wave_r_48k.as_deref(), aux_48k.as_deref());
-    let n_earliest = resampled_frame_len(n_earliest_48k, 48_000, sr).min(in_1.len());
-    let n_latest = resampled_frame_len(n_latest_48k, 48_000, sr)
-        .max(n_earliest + 1)
-        .min(in_1.len());
-
-    let base_ctrls = default_control_vector(manifest);
-    let ctrl_def = &manifest.base.controls_schema[freeze_ctrl_idx];
-    let (unfrozen_val, frozen_val) = match ctrl_def.kind {
-        ControlKind::Switch => (0.0_f32, 1.0_f32),
-        ControlKind::Range => control_declared_bounds(ctrl_def),
-    };
-    let mut trajs = Vec::with_capacity(base_ctrls.len());
-    for (q, &def_v) in base_ctrls.iter().enumerate() {
-        if q == freeze_ctrl_idx {
-            let tr: Vec<f32> = (0..in_1.len())
-                .map(|idx| {
-                    if (n_earliest..n_latest).contains(&idx) {
-                        frozen_val
-                    } else {
-                        unfrozen_val
-                    }
-                })
-                .collect();
-            trajs.push(tr);
-        } else {
-            trajs.push(vec![def_v; in_1.len()]);
-        }
-    }
-    let mut active_ctrls = base_ctrls;
-    if let Some(slot) = active_ctrls.get_mut(freeze_ctrl_idx) {
-        *slot = frozen_val;
-    }
-
-    StemStimulus {
-        stem_id: format!("freeze_transition_{freeze_ctrl_idx}"),
-        sample_rate_hz: sr,
-        in_1,
-        in_2,
-        in_3,
-        in_4: None,
-        control_values: active_ctrls,
-        control_trajectories: Some(trajs),
-        freeze_transition_window: Some([n_earliest, n_latest]),
-    }
+struct AlignedCoresetSlices<'a> {
+    dry_12k_l: &'a [f32],
+    dry_12k_r: Option<&'a [f32]>,
+    wet_12k_l: &'a [f32],
+    wet_12k_r: Option<&'a [f32]>,
+    lag_samples: f64,
+    inv_pol: bool,
 }
 
 fn steady_silent_dc(dry_48k: &[f32], wet_48k: &[f32], start: usize, end: usize) -> Option<f64> {
@@ -295,6 +83,78 @@ fn steady_silent_dc(dry_48k: &[f32], wet_48k: &[f32], start: usize, end: usize) 
     (max_dev < 0.25 * mean.abs()).then_some(mean)
 }
 
+fn estimate_quiet_tail_peak(
+    dry_48k: &[f32],
+    wet_centered: &[f32],
+    n: usize,
+    settle_start: usize,
+    first_dry_active: usize,
+) -> f64 {
+    if first_dry_active >= 64 {
+        return wet_centered[..first_dry_active]
+            .iter()
+            .fold(0.0_f64, |m, &w| m.max(f64::from(w).abs()));
+    }
+    let tail_start = n.saturating_sub(512).max(settle_start);
+    let tail_dry_silent =
+        tail_start < n && dry_48k[tail_start..n].iter().all(|&x| x.abs() < 1.0e-4);
+    if !tail_dry_silent {
+        return 0.0;
+    }
+    let mid = tail_start + (n - tail_start) / 2;
+    let tail_late = wet_centered[mid..n]
+        .iter()
+        .fold(0.0_f64, |m, &w| m.max(f64::from(w).abs()));
+    let tail_early = wet_centered[tail_start..mid]
+        .iter()
+        .fold(0.0_f64, |m, &w| m.max(f64::from(w).abs()));
+    if tail_early > 2.0 * tail_late && tail_late < 5.0e-3 {
+        0.0
+    } else {
+        tail_late
+    }
+}
+
+fn estimate_causal_onset_gap(dry_48k: &[f32], wet_centered: &[f32], quiet_peak: f64) -> f64 {
+    let n = dry_48k.len().min(wet_centered.len());
+    let dry_peak = dry_48k[..n]
+        .iter()
+        .fold(0.0_f64, |m, &x| m.max(f64::from(x).abs()));
+    let wet_peak = wet_centered[..n]
+        .iter()
+        .fold(0.0_f64, |m, &x| m.max(f64::from(x).abs()));
+    if dry_peak <= 1.0e-4 || wet_peak <= 1.0e-4 {
+        return 0.0;
+    }
+    let dry_thresh = (0.002 * dry_peak).max(2.5e-4);
+    let n_dry_idx = dry_48k[..n]
+        .iter()
+        .position(|&x| f64::from(x).abs() >= dry_thresh)
+        .unwrap_or(0);
+    let m_init = (n_dry_idx + 6).clamp(4, n);
+    let e_d_init: f64 = dry_48k[..m_init]
+        .iter()
+        .map(|&x| f64::from(x).powi(2))
+        .sum();
+    let e_w_init: f64 = wet_centered[..m_init]
+        .iter()
+        .map(|&x| f64::from(x).powi(2))
+        .sum();
+    let g_init = if e_d_init > 1.0e-12 {
+        (e_w_init / e_d_init).sqrt()
+    } else {
+        1.0
+    };
+    let min_wet_floor = if g_init < 0.30 { 1.0e-4 } else { 2.5e-4 };
+    let wet_thresh = (3.5 * quiet_peak).max(min_wet_floor).max(1.0e-4 * wet_peak);
+    let n_wet_onset = wet_centered[..n]
+        .iter()
+        .position(|&x| f64::from(x).abs() >= wet_thresh)
+        .unwrap_or(0) as f64;
+    (n_wet_onset - (n_dry_idx as f64)).max(0.0)
+}
+
+/// Estimates `(bulk_lag_samples, polarity_inverted, dc_offset)` causally across dry & wet `48 kHz` stems.
 pub(crate) fn estimate_causal_bulk_alignment(dry_48k: &[f32], wet_48k: &[f32]) -> (f64, bool, f64) {
     let n = dry_48k.len().min(wet_48k.len());
     if n < 64 {
@@ -321,66 +181,9 @@ pub(crate) fn estimate_causal_bulk_alignment(dry_48k: &[f32], wet_48k: &[f32]) -
         &wet_48k[..n]
     };
 
-    let tail_start = n.saturating_sub(512).max(settle_start);
-    let tail_dry_silent =
-        tail_start < n && dry_48k[tail_start..n].iter().all(|&x| x.abs() < 1.0e-4);
-    let quiet_peak = if first_dry_active >= 64 {
-        wet_centered[..first_dry_active]
-            .iter()
-            .fold(0.0_f64, |m, &w| m.max(f64::from(w).abs()))
-    } else if tail_dry_silent {
-        let mid = tail_start + (n - tail_start) / 2;
-        let tail_late = wet_centered[mid..n]
-            .iter()
-            .fold(0.0_f64, |m, &w| m.max(f64::from(w).abs()));
-        let tail_early = wet_centered[tail_start..mid]
-            .iter()
-            .fold(0.0_f64, |m, &w| m.max(f64::from(w).abs()));
-        if tail_early > 2.0 * tail_late && tail_late < 5.0e-3 {
-            0.0
-        } else {
-            tail_late
-        }
-    } else {
-        0.0
-    };
-
-    let dry_peak = dry_48k[..n]
-        .iter()
-        .fold(0.0_f64, |m, &x| m.max(f64::from(x).abs()));
-    let wet_peak = wet_centered
-        .iter()
-        .fold(0.0_f64, |m, &x| m.max(f64::from(x).abs()));
-    let causal_gap = if dry_peak > 1.0e-4 && wet_peak > 1.0e-4 {
-        let dry_thresh = (0.002 * dry_peak).max(2.5e-4);
-        let n_dry_idx = dry_48k[..n]
-            .iter()
-            .position(|&x| f64::from(x).abs() >= dry_thresh)
-            .unwrap_or(0);
-        let m_init = (n_dry_idx + 6).clamp(4, n);
-        let e_d_init: f64 = dry_48k[..m_init]
-            .iter()
-            .map(|&x| f64::from(x).powi(2))
-            .sum();
-        let e_w_init: f64 = wet_centered[..m_init]
-            .iter()
-            .map(|&x| f64::from(x).powi(2))
-            .sum();
-        let g_init = if e_d_init > 1.0e-12 {
-            (e_w_init / e_d_init).sqrt()
-        } else {
-            1.0
-        };
-        let min_wet_floor = if g_init < 0.30 { 1.0e-4 } else { 2.5e-4 };
-        let wet_thresh = (3.5 * quiet_peak).max(min_wet_floor).max(1.0e-4 * wet_peak);
-        let n_wet_onset = wet_centered
-            .iter()
-            .position(|&x| f64::from(x).abs() >= wet_thresh)
-            .unwrap_or(0) as f64;
-        (n_wet_onset - (n_dry_idx as f64)).max(0.0)
-    } else {
-        0.0
-    };
+    let quiet_peak =
+        estimate_quiet_tail_peak(dry_48k, wet_centered, n, settle_start, first_dry_active);
+    let causal_gap = estimate_causal_onset_gap(dry_48k, wet_centered, quiet_peak);
 
     let (raw_lag, raw_inv_pol, lin_coh) =
         match estimate_multiregime_alignment(&dry_48k[..n], wet_centered, 48_000, 1_024) {
@@ -417,167 +220,95 @@ pub(crate) fn estimate_causal_bulk_alignment(dry_48k: &[f32], wet_48k: &[f32]) -
     (bulk_lag, inv_pol, dc_offset)
 }
 
-#[allow(dead_code, clippy::too_many_arguments)]
-pub(crate) fn seal_coresets_to_inpc_and_vault(
-    stem_id: &str,
-    is_star_center: bool,
-    seed_256: &[u8; 256],
-    carrier_bins: &[usize],
-    valid_frames: usize,
-    coreset_dry_l: &[f32],
-    coreset_dry_r: Option<&[f32]>,
-    raw_wet_l: &[f32],
-    raw_wet_r: Option<&[f32]>,
-    windows: Vec<StmcTrajectoryWindow>,
-    controls_meta: BTreeMap<String, serde_json::Value>,
-) -> Result<(Vec<u8>, VaultCaptureSpec), DnamError> {
-    let (inpc_bytes, spec, _, _) = seal_coresets_to_inpc_and_vault_with_override(
-        stem_id,
-        is_star_center,
-        seed_256,
-        carrier_bins,
-        valid_frames,
-        coreset_dry_l,
-        coreset_dry_r,
-        raw_wet_l,
-        raw_wet_r,
-        windows,
-        controls_meta,
-        None,
-    )?;
-    Ok((inpc_bytes, spec))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn seal_coresets_to_inpc_and_vault_with_override(
-    stem_id: &str,
-    is_star_center: bool,
-    seed_256: &[u8; 256],
-    carrier_bins: &[usize],
-    valid_frames: usize,
-    coreset_dry_l: &[f32],
-    coreset_dry_r: Option<&[f32]>,
-    raw_wet_l: &[f32],
-    raw_wet_r: Option<&[f32]>,
-    windows: Vec<StmcTrajectoryWindow>,
-    controls_meta: BTreeMap<String, serde_json::Value>,
-    shared_align: Option<(f64, bool)>,
+fn build_inpc_and_vault_spec(
+    mut req: StemSealRequest<'_>,
+    slices: &AlignedCoresetSlices<'_>,
 ) -> Result<(Vec<u8>, VaultCaptureSpec, f64, bool), DnamError> {
-    let dry_12k_l = &coreset_dry_l[..CORESET_FP16_FRAMES_PER_STEM];
-    let dry_12k_r = coreset_dry_r.map(|r| &r[..CORESET_FP16_FRAMES_PER_STEM]);
-    let dry_fp16 = encode_coreset_12k_fp16(dry_12k_l, dry_12k_r);
-    let inpc_channels = if dry_12k_r.is_some() { 2_u16 } else { 1_u16 };
+    let dry_fp16 = encode_coreset_12k_fp16(slices.dry_12k_l, slices.dry_12k_r);
+    let inpc_channels = if slices.dry_12k_r.is_some() {
+        2_u16
+    } else {
+        1_u16
+    };
 
     let mut schedule_320 = [0u8; 320];
-    schedule_320[0..4].copy_from_slice(&(carrier_bins.len() as u32).to_le_bytes());
-    schedule_320[4..8].copy_from_slice(&(valid_frames as u32).to_le_bytes());
-    for (idx, &b) in carrier_bins.iter().take(76).enumerate() {
+    schedule_320[0..4].copy_from_slice(&(req.carrier_bins.len() as u32).to_le_bytes());
+    schedule_320[4..8].copy_from_slice(&(req.valid_frames as u32).to_le_bytes());
+    for (idx, &b) in req.carrier_bins.iter().take(76).enumerate() {
         let off = 16 + idx * 4;
         schedule_320[off..off + 4].copy_from_slice(&(b as u32).to_le_bytes());
     }
-    let inpc_bytes = build_proj_inpc_capsule(inpc_channels, seed_256, &schedule_320, &dry_fp16)?;
+    let inpc_bytes =
+        build_proj_inpc_capsule(inpc_channels, req.seed_256, &schedule_320, &dry_fp16)?;
 
-    let dry_ref = &coreset_dry_l[..raw_wet_l.len().min(coreset_dry_l.len())];
-    let wet_ref = &raw_wet_l[..dry_ref.len()];
+    let wet_fp16 = encode_coreset_12k_fp16(slices.wet_12k_l, slices.wet_12k_r);
+    let (psd_88, spec_4096) =
+        compute_stmc_psd_88_and_spectral_4096(slices.wet_12k_l, slices.wet_12k_r);
+
+    let provenance = crate::proj::schema::StemProvenance {
+        input_pcm_sha256: compute_pcm_sha256(slices.dry_12k_l),
+        target_pcm_sha256: compute_pcm_sha256(
+            &slices.wet_12k_l[..slices.wet_12k_l.len().min(CORESET_FP16_FRAMES_PER_STEM)],
+        ),
+        num_frames: CORESET_FP16_FRAMES_PER_STEM as u64,
+    };
+    req.user_metadata.insert(
+        "wet_polarity_inverted".to_string(),
+        serde_json::Value::Bool(slices.inv_pol),
+    );
+
+    let spec = VaultCaptureSpec {
+        stem_id: req.stem_id.to_string(),
+        is_star_center: req.is_star_center,
+        enabled: true,
+        pad_gain_f32: 1.0,
+        fractional_lag_samples_f32: slices.lag_samples as f32,
+        controls_meta: req.controls_meta,
+        provenance,
+        user_metadata: req.user_metadata,
+        extracted_physics: None,
+        windows: req.windows,
+        band_psd_summary_88: psd_88,
+        n_comb_bins: req.carrier_bins.len() as u32,
+        spectral_summary_4096: spec_4096,
+        wet_coreset_fp16: wet_fp16,
+        optional_spcm: None,
+    };
+    Ok((inpc_bytes, spec, slices.lag_samples, slices.inv_pol))
+}
+
+/// Seals `12,000`-frame dry/wet coresets into `(INPC, VaultCaptureSpec)` with optional shared alignment override.
+pub(crate) fn seal_coresets_to_inpc_and_vault_with_override(
+    req: StemSealRequest<'_>,
+    shared_align: Option<(f64, bool)>,
+) -> Result<(Vec<u8>, VaultCaptureSpec, f64, bool), DnamError> {
+    let dry_12k_l = &req.dry_48k_l[..CORESET_FP16_FRAMES_PER_STEM];
+    let dry_12k_r = req.dry_48k_r.map(|r| &r[..CORESET_FP16_FRAMES_PER_STEM]);
+    let dry_ref = &req.dry_48k_l[..req.wet_48k_l.len().min(req.dry_48k_l.len())];
+    let wet_ref = &req.wet_48k_l[..dry_ref.len()];
     let (lag_samples, inv_pol) = shared_align.unwrap_or_else(|| {
         let (lag, pol, _) = estimate_causal_bulk_alignment(dry_ref, wet_ref);
         (lag, pol)
     });
 
-    let aligned_wet_l = realign_fractional_kaiser64(raw_wet_l, lag_samples, 0.0, inv_pol);
-    let aligned_wet_r = raw_wet_r
+    let aligned_wet_l = realign_fractional_kaiser64(req.wet_48k_l, lag_samples, 0.0, inv_pol);
+    let aligned_wet_r = req
+        .wet_48k_r
         .filter(|r| !r.is_empty())
         .map(|r| realign_fractional_kaiser64(r, lag_samples, 0.0, inv_pol));
 
-    let wet_fp16 = encode_coreset_12k_fp16(&aligned_wet_l, aligned_wet_r.as_deref());
-    let (psd_88, spec_4096) =
-        compute_stmc_psd_88_and_spectral_4096(&aligned_wet_l, aligned_wet_r.as_deref());
-
-    let provenance = StemProvenance {
-        input_pcm_sha256: compute_pcm_sha256(dry_12k_l),
-        target_pcm_sha256: compute_pcm_sha256(
-            &aligned_wet_l[..aligned_wet_l.len().min(CORESET_FP16_FRAMES_PER_STEM)],
-        ),
-        num_frames: CORESET_FP16_FRAMES_PER_STEM as u64,
+    let slices = AlignedCoresetSlices {
+        dry_12k_l,
+        dry_12k_r,
+        wet_12k_l: &aligned_wet_l,
+        wet_12k_r: aligned_wet_r.as_deref(),
+        lag_samples,
+        inv_pol,
     };
-
-    let mut user_metadata = BTreeMap::new();
-    user_metadata.insert(
-        "wet_polarity_inverted".to_string(),
-        serde_json::Value::Bool(inv_pol),
-    );
-
-    let spec = VaultCaptureSpec {
-        stem_id: stem_id.to_string(),
-        is_star_center,
-        enabled: true,
-        pad_gain_f32: 1.0,
-        fractional_lag_samples_f32: lag_samples as f32,
-        controls_meta,
-        provenance,
-        user_metadata,
-        extracted_physics: None,
-        windows,
-        band_psd_summary_88: psd_88,
-        n_comb_bins: carrier_bins.len() as u32,
-        spectral_summary_4096: spec_4096,
-        wet_coreset_fp16: wet_fp16,
-        optional_spcm: None,
-    };
-    Ok((inpc_bytes, spec, lag_samples, inv_pol))
+    build_inpc_and_vault_spec(req, &slices)
 }
 
-/// Aligns a full `48 kHz`-normalized stem on its aperiodic `A5` coreset+settle window FIRST
-/// (handling bulk converter/DSP latency without periodic comb aliases) before slicing `12,000` frames.
-#[allow(dead_code, clippy::too_many_arguments)]
-pub(crate) fn align_full_stem_and_seal_vault(
-    stem_id: &str,
-    is_star_center: bool,
-    seed_256: &[u8; 256],
-    carrier_bins: &[usize],
-    valid_frames: usize,
-    dry_48k_l: &[f32],
-    dry_48k_r: Option<&[f32]>,
-    wet_48k_l: &[f32],
-    wet_48k_r: Option<&[f32]>,
-    windows: Vec<StmcTrajectoryWindow>,
-    controls_meta: BTreeMap<String, serde_json::Value>,
-    user_metadata: BTreeMap<String, serde_json::Value>,
-) -> Result<(Vec<u8>, VaultCaptureSpec), DnamError> {
-    let (inpc_bytes, spec, _, _) = align_full_stem_and_seal_vault_with_override(
-        stem_id,
-        is_star_center,
-        seed_256,
-        carrier_bins,
-        valid_frames,
-        dry_48k_l,
-        dry_48k_r,
-        wet_48k_l,
-        wet_48k_r,
-        windows,
-        controls_meta,
-        user_metadata,
-        None,
-    )?;
-    Ok((inpc_bytes, spec))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn align_full_stem_and_seal_vault_with_override(
-    stem_id: &str,
-    is_star_center: bool,
-    seed_256: &[u8; 256],
-    carrier_bins: &[usize],
-    valid_frames: usize,
-    dry_48k_l: &[f32],
-    dry_48k_r: Option<&[f32]>,
-    wet_48k_l: &[f32],
-    wet_48k_r: Option<&[f32]>,
-    windows: Vec<StmcTrajectoryWindow>,
-    controls_meta: BTreeMap<String, serde_json::Value>,
-    mut user_metadata: BTreeMap<String, serde_json::Value>,
-    shared_align: Option<(f64, bool)>,
-) -> Result<(Vec<u8>, VaultCaptureSpec, f64, bool), DnamError> {
+fn locate_coreset_align_span(dry_48k_l: &[f32]) -> (usize, usize) {
     const RING_GUARD: usize = 128;
     let has_leading_coreset = dry_48k_l.len() >= CORESET_WITH_SETTLE_48K + ADAPTIVE_FRAME_SAMPLES
         && dry_48k_l
@@ -606,11 +337,22 @@ pub(crate) fn align_full_stem_and_seal_vault_with_override(
     } else {
         tail_span
     };
+    (core_start, align_span)
+}
 
-    let dry_align_slice = &dry_48k_l[core_start..(core_start + align_span).min(dry_48k_l.len())];
-    let wet_align_end = wet_48k_l.len().min(core_start + dry_align_slice.len());
+/// Aligns a full `48 kHz`-normalized stem on its aperiodic `A5` coreset+settle window FIRST
+/// (handling bulk converter/DSP latency without periodic comb aliases) before slicing `12,000` frames,
+/// accepting an optional `(lag, inv_pol)` override.
+pub(crate) fn align_full_stem_and_seal_vault_with_override(
+    req: StemSealRequest<'_>,
+    shared_align: Option<(f64, bool)>,
+) -> Result<(Vec<u8>, VaultCaptureSpec, f64, bool), DnamError> {
+    let (core_start, align_span) = locate_coreset_align_span(req.dry_48k_l);
+    let dry_align_slice =
+        &req.dry_48k_l[core_start..(core_start + align_span).min(req.dry_48k_l.len())];
+    let wet_align_end = req.wet_48k_l.len().min(core_start + dry_align_slice.len());
     let wet_align_slice = if core_start < wet_align_end {
-        &wet_48k_l[core_start..wet_align_end]
+        &req.wet_48k_l[core_start..wet_align_end]
     } else {
         &[]
     };
@@ -623,26 +365,17 @@ pub(crate) fn align_full_stem_and_seal_vault_with_override(
         (lag, pol)
     });
 
-    let full_aligned_l = realign_fractional_kaiser64(wet_48k_l, lag_samples, 0.0, inv_pol);
-    let full_aligned_r = wet_48k_r
+    let full_aligned_l = realign_fractional_kaiser64(req.wet_48k_l, lag_samples, 0.0, inv_pol);
+    let full_aligned_r = req
+        .wet_48k_r
         .filter(|r| !r.is_empty())
         .map(|r| realign_fractional_kaiser64(r, lag_samples, 0.0, inv_pol));
 
-    let dry_12k_l = &dry_48k_l[core_start..core_start + CORESET_FP16_FRAMES_PER_STEM];
-    let dry_12k_r = dry_48k_r
+    let dry_12k_l = &req.dry_48k_l[core_start..core_start + CORESET_FP16_FRAMES_PER_STEM];
+    let dry_12k_r = req
+        .dry_48k_r
         .filter(|r| r.len() >= core_start + CORESET_FP16_FRAMES_PER_STEM)
         .map(|r| &r[core_start..core_start + CORESET_FP16_FRAMES_PER_STEM]);
-    let dry_fp16 = encode_coreset_12k_fp16(dry_12k_l, dry_12k_r);
-    let inpc_channels = if dry_12k_r.is_some() { 2_u16 } else { 1_u16 };
-
-    let mut schedule_320 = [0u8; 320];
-    schedule_320[0..4].copy_from_slice(&(carrier_bins.len() as u32).to_le_bytes());
-    schedule_320[4..8].copy_from_slice(&(valid_frames as u32).to_le_bytes());
-    for (idx, &b) in carrier_bins.iter().take(76).enumerate() {
-        let off = 16 + idx * 4;
-        schedule_320[off..off + 4].copy_from_slice(&(b as u32).to_le_bytes());
-    }
-    let inpc_bytes = build_proj_inpc_capsule(inpc_channels, seed_256, &schedule_320, &dry_fp16)?;
 
     let wet_start = core_start.min(
         full_aligned_l
@@ -657,171 +390,115 @@ pub(crate) fn align_full_stem_and_seal_vault_with_override(
         &r[ws..we]
     });
 
-    let wet_fp16 = encode_coreset_12k_fp16(wet_12k_l, wet_12k_r);
-    let (psd_88, spec_4096) = compute_stmc_psd_88_and_spectral_4096(wet_12k_l, wet_12k_r);
-
-    let provenance = StemProvenance {
-        input_pcm_sha256: compute_pcm_sha256(dry_12k_l),
-        target_pcm_sha256: compute_pcm_sha256(wet_12k_l),
-        num_frames: CORESET_FP16_FRAMES_PER_STEM as u64,
+    let slices = AlignedCoresetSlices {
+        dry_12k_l,
+        dry_12k_r,
+        wet_12k_l,
+        wet_12k_r,
+        lag_samples,
+        inv_pol,
     };
-    user_metadata.insert(
-        "wet_polarity_inverted".to_string(),
-        serde_json::Value::Bool(inv_pol),
-    );
-
-    let spec = VaultCaptureSpec {
-        stem_id: stem_id.to_string(),
-        is_star_center,
-        enabled: true,
-        pad_gain_f32: 1.0,
-        fractional_lag_samples_f32: lag_samples as f32,
-        controls_meta,
-        provenance,
-        user_metadata,
-        extracted_physics: None,
-        windows,
-        band_psd_summary_88: psd_88,
-        n_comb_bins: carrier_bins.len() as u32,
-        spectral_summary_4096: spec_4096,
-        wet_coreset_fp16: wet_fp16,
-        optional_spcm: None,
-    };
-    Ok((inpc_bytes, spec, lag_samples, inv_pol))
+    build_inpc_and_vault_spec(req, &slices)
 }
 
-/// Re-normalizes and replaces a clipped stem after the user engages a physical `-10 dB` / `-20 dB`
-/// mic/preamp pad (`Law 0.F`), using the `400 ms` `-18 dB` differential reference probe to recover
-/// $\hat{G}_{\text{pad}}$ and rescale the re-captured stem by $\hat{G}_{\text{pad}}^{-1}$
-/// (`r[train.capture.safeguards.mic-capsule-clip]`, `r[train.cache.proj-vault]`).
-pub fn recapture_clipped_stem(
-    proj_bytes: &[u8],
-    stem_id: &str,
-    prev_unpadded_probe_400ms: &[f32],
-    new_padded_probe_400ms: &[f32],
-    mut padded_capture: VaultCaptureSpec,
-) -> Result<(Vec<u8>, DifferentialPadCalibration), DnamError> {
-    let pad_cal =
-        measure_differential_pad_ratio(prev_unpadded_probe_400ms, new_padded_probe_400ms, 128)
-            .map_err(|e| {
-                DnamError::SchemaValidationError(format!("mic-pad probe calibration failed: {e}"))
-            })?;
+#[cfg(test)]
+mod tests {
+    use super::super::waveforms::synthesize_a5_musical_transient_coreset;
+    use super::*;
 
-    let is_stereo = padded_capture.wet_coreset_fp16.len() == 48_000;
-    let decoded = fp16_bytes_to_f32(&padded_capture.wet_coreset_fp16);
-    let rescaled = rescale_padded_stem(&decoded, pad_cal.pad_gain_linear).map_err(|e| {
-        DnamError::SchemaValidationError(format!("mic-pad stem rescale failed: {e}"))
-    })?;
+    #[test]
+    fn test_steady_silent_dc_and_causal_bulk_alignment_paths() {
+        assert!(steady_silent_dc(&[0.0; 16], &[0.1; 16], 0, 16).is_none());
+        assert!(steady_silent_dc(&[0.0; 128], &[1.0e-4; 128], 0, 128).is_none());
+        let mut noisy = vec![0.1; 128];
+        noisy[127] = 0.25;
+        assert!(steady_silent_dc(&[0.0; 128], &noisy, 0, 128).is_none());
+        let dc_found = steady_silent_dc(&[0.0; 128], &[0.05; 128], 0, 128).unwrap();
+        assert!((dc_found - 0.05).abs() < 1.0e-6);
 
-    if is_stereo {
-        let mut l = Vec::with_capacity(CORESET_FP16_FRAMES_PER_STEM);
-        let mut r = Vec::with_capacity(CORESET_FP16_FRAMES_PER_STEM);
-        for pair in rescaled.as_chunks::<2>().0 {
-            l.push(pair[0]);
-            r.push(pair[1]);
-        }
-        padded_capture.wet_coreset_fp16 = encode_coreset_12k_fp16(&l, Some(&r));
-        let (psd_88, spec_4096) = compute_stmc_psd_88_and_spectral_4096(&l, Some(&r));
-        padded_capture.band_psd_summary_88 = psd_88;
-        padded_capture.spectral_summary_4096 = spec_4096;
-        padded_capture.provenance.target_pcm_sha256 = compute_pcm_sha256(&l);
-    } else {
-        padded_capture.wet_coreset_fp16 = encode_coreset_12k_fp16(&rescaled, None);
-        let (psd_88, spec_4096) = compute_stmc_psd_88_and_spectral_4096(&rescaled, None);
-        padded_capture.band_psd_summary_88 = psd_88;
-        padded_capture.spectral_summary_4096 = spec_4096;
-        padded_capture.provenance.target_pcm_sha256 = compute_pcm_sha256(&rescaled);
-    }
-    padded_capture.pad_gain_f32 = pad_cal.pad_gain_linear as f32;
-
-    let updated_proj = replace_capture(proj_bytes, stem_id, padded_capture)?;
-    Ok((updated_proj, pad_cal))
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn interpolate_frame_trajectories(
-    start_vals: &[f32],
-    end_vals_opt: Option<&[f32]>,
-    active_control_id: u16,
-    window_weight: f32,
-    t0: f32,
-    t1: f32,
-    reset_coreset_knots: bool,
-    is_coreset: bool,
-    frame_len: usize,
-    trajectory_windows: &mut Vec<StmcTrajectoryWindow>,
-) -> (Vec<f32>, Option<Vec<Vec<f32>>>) {
-    let mut cur_ctrls = start_vals.to_vec();
-    let Some(end_vals) = end_vals_opt.filter(|e| e.len() == start_vals.len() && !e.is_empty())
-    else {
-        return (cur_ctrls, None);
-    };
-
-    if reset_coreset_knots {
-        trajectory_windows.clear();
-        let swept_indices: Vec<usize> = start_vals
-            .iter()
-            .zip(end_vals)
-            .enumerate()
-            .filter_map(|(p, (&v0, &v1))| ((v1 - v0).abs() > 1.0e-5).then_some(p))
-            .collect();
-        if !swept_indices.is_empty() {
-            let knots = (36 / swept_indices.len()).clamp(2, 6);
-            for k in 0..knots {
-                let frac = (k as f32) / ((knots - 1) as f32);
-                for &p in &swept_indices {
-                    let v0 = start_vals[p];
-                    let v1 = end_vals[p];
-                    trajectory_windows.push(StmcTrajectoryWindow {
-                        control_id: p as u16,
-                        ctrl_kind: 0,
-                        active_opt: 0,
-                        u_phys: v0 + (v1 - v0) * frac,
-                        window_weight,
-                        emr_velocity: 1.0 / (knots as f32),
-                    });
-                }
-            }
-        }
-    }
-
-    let mut trajs = Vec::with_capacity(end_vals.len());
-    let mut moved_any = false;
-    let n_len = frame_len.max(1);
-    for (p, (&v0, &v1)) in start_vals.iter().zip(end_vals).enumerate() {
-        let s0 = v0 + (v1 - v0) * t0;
-        let s1 = v0 + (v1 - v0) * t1;
-        cur_ctrls[p] = s0;
-        trajs.push(
-            (0..frame_len)
-                .map(|i| s0 + (s1 - s0) * (i as f32 / n_len as f32))
-                .collect(),
+        assert_eq!(
+            estimate_causal_bulk_alignment(&[0.0; 16], &[0.0; 16]),
+            (0.0, false, 0.0)
         );
-        if !is_coreset && (v1 - v0).abs() > 1.0e-5 && trajectory_windows.len() < 36 {
-            moved_any = true;
-            trajectory_windows.push(StmcTrajectoryWindow {
-                control_id: p as u16,
-                ctrl_kind: 0,
-                active_opt: 0,
-                u_phys: s0,
-                window_weight,
-                emr_velocity: (t1 - t0).abs(),
-            });
+
+        // Delayed + inverted + DC-offset signal with silent lead-in & trailing settle tail
+        let seed = [0x42u8; 256];
+        let (core, _) = synthesize_a5_musical_transient_coreset(&seed, 8_192, 1, 48_000);
+        let mut dry = vec![0.0_f32; 512];
+        dry.extend_from_slice(&core);
+        dry.resize(dry.len() + SETTLE_PAD_SAMPLES_48K, 0.0);
+
+        let delay = 24_usize;
+        let dc = 0.02_f32;
+        let mut wet = vec![dc; dry.len()];
+        for i in delay..dry.len() {
+            wet[i] = dc - 0.8 * dry[i - delay];
         }
+        let (lag, inv, dc_est) = estimate_causal_bulk_alignment(&dry, &wet);
+        assert!((dc_est - f64::from(dc)).abs() < 1.0e-3);
+        assert!(inv);
+        assert!((lag - (delay as f64)).abs() < 2.0);
     }
-    if !is_coreset
-        && !moved_any
-        && trajectory_windows.len() < 36
-        && let Some(&u_val) = cur_ctrls.get(usize::from(active_control_id))
-    {
-        trajectory_windows.push(StmcTrajectoryWindow {
-            control_id: active_control_id,
+
+    #[test]
+    fn test_seal_coresets_and_align_full_stem_variants() {
+        let seed = [0x71u8; 256];
+        let (dry_core, r_opt) =
+            synthesize_a5_musical_transient_coreset(&seed, CORESET_FP16_FRAMES_PER_STEM, 2, 48_000);
+        let dry_r = r_opt.unwrap();
+        let meta = BTreeMap::new();
+        let win = vec![StmcTrajectoryWindow {
+            control_id: 0,
             ctrl_kind: 0,
             active_opt: 0,
-            u_phys: u_val,
-            window_weight,
-            emr_velocity: (t1 - t0).abs(),
-        });
+            u_phys: 0.5,
+            window_weight: 1.0,
+            emr_velocity: 0.0,
+        }];
+
+        let (inpc_a, spec_a, _, _) = seal_coresets_to_inpc_and_vault_with_override(
+            StemSealRequest {
+                stem_id: "seal_a",
+                is_star_center: true,
+                seed_256: &seed,
+                carrier_bins: &[6, 12],
+                valid_frames: 2,
+                dry_48k_l: &dry_core,
+                dry_48k_r: None,
+                wet_48k_l: &dry_core,
+                wet_48k_r: None,
+                windows: win.clone(),
+                controls_meta: meta.clone(),
+                user_metadata: BTreeMap::new(),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(!inpc_a.is_empty());
+        assert_eq!(spec_a.stem_id, "seal_a");
+
+        // Leading coreset + frame + settle span
+        let mut lead_dry = dry_core.clone();
+        lead_dry.resize(CORESET_WITH_SETTLE_48K + ADAPTIVE_FRAME_SAMPLES, 0.0);
+        let (inpc_lead, spec_lead, _, _) = align_full_stem_and_seal_vault_with_override(
+            StemSealRequest {
+                stem_id: "seal_lead",
+                is_star_center: false,
+                seed_256: &seed,
+                carrier_bins: &[6, 12],
+                valid_frames: 3,
+                dry_48k_l: &lead_dry,
+                dry_48k_r: Some(&dry_r),
+                wet_48k_l: &lead_dry,
+                wet_48k_r: Some(&lead_dry),
+                windows: win,
+                controls_meta: meta,
+                user_metadata: BTreeMap::new(),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(!inpc_lead.is_empty());
+        assert_eq!(spec_lead.stem_id, "seal_lead");
     }
-    (cur_ctrls, Some(trajs))
 }

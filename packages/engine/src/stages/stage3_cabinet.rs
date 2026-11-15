@@ -401,6 +401,13 @@ mod tests {
         let out = cab.step(1.0, 0.2, &taps);
         assert!(out.is_finite());
         assert_eq!(cab.fir_write_ptr, 1);
+
+        let mut cab_r = Stage3CabinetModals::default();
+        let (sl, sr, dl, dr) = cab.step_fir_stereo_with_delayed_tap::<crate::math::ScalarBackend>(
+            &mut cab_r, 0.5, -0.5, 0.1, -0.1, &taps,
+        );
+        assert!(sl.is_finite() && sr.is_finite() && dl.is_finite() && dr.is_finite());
+
         cab.reset();
         assert_eq!(cab.fir_write_ptr, 0);
         assert_eq!(cab.fir_history, [0.0; STAGE3_FIR_HISTORY_CAPACITY]);

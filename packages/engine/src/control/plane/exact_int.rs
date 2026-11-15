@@ -393,4 +393,44 @@ mod tests {
 
         assert_eq!(core::mem::size_of::<ControlClampDescriptor>(), 64);
     }
+
+    #[test]
+    fn test_exact_int_rounding_subnormals_overflow_and_errors() {
+        assert_eq!(
+            SignedExactInt::<EXACT_SUM_WORDS>::default(),
+            SignedExactInt::zero()
+        );
+        let mut acc = ExactIntFactorAccumulator::new(2);
+        assert!(matches!(
+            acc.update_contributor(99, 0),
+            Err(DnamError::InvalidControlIndex(99))
+        ));
+        assert!(acc.update_contributor(0, f32::NAN.to_bits()).is_err());
+
+        // Zero interaction & subnormal tiny magnitude (< 2^23 and < 2^173)
+        assert_eq!(acc.sum.to_rounded_f32_bits(), Some(0));
+        assert_eq!(acc.interaction_f32_bits(), Some(0));
+
+        // Carry into next exponent when rounding 0x00ffffff -> (1 << 24)
+        let mut small_sum = SignedExactInt::<EXACT_SUM_WORDS>::zero();
+        small_sum.magnitude.words[0] = 0x123;
+        assert_eq!(small_sum.to_rounded_f32_bits(), Some(0x123));
+
+        let mut carry_sum = SignedExactInt::<EXACT_SUM_WORDS>::zero();
+        carry_sum.magnitude.words[0] = 0x01ff_ffff;
+        assert!(carry_sum.to_rounded_f32_bits().is_some());
+
+        // Overflow (> exponent 127) returns None
+        let mut ov_sum = SignedExactInt::<EXACT_SUM_WORDS>::zero();
+        ov_sum.magnitude.words[EXACT_SUM_WORDS - 1] = 0x8000_0000;
+        assert_eq!(ov_sum.to_rounded_f32_bits(), None);
+
+        let mut small_sq = SignedExactInt::<EXACT_SQUARE_WORDS>::zero();
+        small_sq.magnitude.words[5] = 0x10;
+        assert!(small_sq.to_interaction_f32_bits().is_some());
+
+        let mut ov_sq = SignedExactInt::<EXACT_SQUARE_WORDS>::zero();
+        ov_sq.magnitude.words[EXACT_SQUARE_WORDS - 1] = 0x8000_0000;
+        assert_eq!(ov_sq.to_interaction_f32_bits(), None);
+    }
 }

@@ -961,6 +961,33 @@ mod tests {
         assert_eq!(tank.write_ptr, 0);
         assert_eq!(tank.ducking_vca.env, 0.0);
 
+        // Short-arena load resets defaults; EXT NaN parameters fall back cleanly; sigma_knee = 1.0 fast path
+        tank.ext_active = true;
+        tank.base_g_loop = 0.2;
+        tank.load_from_arena(&[0u8; 64]);
+        assert!(!tank.ext_active && (tank.base_g_loop - 0.85).abs() < 1e-6);
+
+        let mut ext_arena = alloc::vec![0u8; crate::stages::weights::ARENA0_STAGE4_EXT_OFFSET + 68];
+        let ext_flags =
+            crate::stages::weights::PIPE_MAGIC_HI | crate::stages::weights::PIPE_FLAG_STAGE4_EXT;
+        ext_arena[crate::stages::weights::ARENA0_PIPELINE_FLAGS_OFFSET
+            ..crate::stages::weights::ARENA0_PIPELINE_FLAGS_OFFSET + 4]
+            .copy_from_slice(&ext_flags.to_le_bytes());
+        let b = crate::stages::weights::ARENA0_STAGE4_EXT_OFFSET;
+        for off in [b, b + 24, b + 52] {
+            ext_arena[off..off + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        }
+        tank.load_from_arena(&ext_arena);
+        assert!(tank.ext_active);
+        assert_eq!(tank.tank_wet_gain, 1.0);
+        assert_eq!(tank.base_bbd_lpf_pole, 0.0);
+        assert_eq!(tank.base_fdn_lpf_pole, 0.0);
+        tank.sigma_knee = 1.0;
+        tank.cached_sigma_knee = 0.5;
+        assert!(tank.coercive_saturate(0.25).is_finite());
+        let sat4 = tank.coercive_saturate_4ch([0.25, -0.25, 0.1, -0.1]);
+        assert!(sat4.iter().all(|v| v.is_finite()));
+
         // Dual-mono vs asymmetric sidechain: stereo-linked ducking VCA steps once per frame
         let mut tank_mono = Stage4SpatialTank::default();
         let mut tank_single = BallisticDuckingVca::default();

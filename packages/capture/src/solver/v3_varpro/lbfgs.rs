@@ -1,691 +1,630 @@
 #![forbid(unsafe_code)]
-//! Bounded parameter codecs and L-BFGS (`m = 12`) optimizer with `DropGuard` line-search rollback.
+//! Smooth Unconstrained Parameter Codec, `DropGuard` Armijo Line Search, and Two-Loop L-BFGS (`v3`).
 
-use std::collections::VecDeque;
 use std::f64::consts::PI;
-use std::mem::DropGuard;
 
 use dnam_engine::stages::v3_core::cascade::{
-    NUM_CASCADE_BLOCKS, tier_cascade_lanes, tier_fir_segments, tier_kautz_banks,
+    MAX_BLOCK_LANES, MAX_GROUPS, NUM_GRU_BLOCKS, NUM_IN_FEATS_B0, tier_block_lanes,
+    tier_fir_segments, tier_groups, tier_kautz_banks,
 };
 
 use crate::solver::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
 
 use super::adjoint::{
-    AdjointWorkspace, evaluate_loss_and_grad_f64_with_backend, evaluate_loss_f64_with_backend,
+    AdjointWorkspace, evaluate_matryoshka_loss_and_grad_with_backend,
+    evaluate_matryoshka_loss_f64_with_backend,
 };
-use super::model_f64::{V3OptModelF64, V3TrainDataset};
+use super::basis::ALL_TIERS;
+use super::model_f64::{V3MatryoshkaOptF64, V3TrainDataset};
 
 #[derive(Clone, Copy)]
-enum MapKind {
-    Identity,
-    LinearLogit(f64, f64),
-    LogLogit(f64, f64),
-    ComplementLogLogit(f64, f64),
+enum ParamSpec {
+    Free,
+    Bounded(f64, f64),
+    LogBounded(f64, f64),
+    /// Encodes complement `c = 1.0 - v` on `(lo_c, hi_c)` in log space (`v = 1.0 - c`).
+    ComplementLogBounded(f64, f64),
 }
 
-#[inline]
-fn sigmoid(u: f64) -> f64 {
-    if u >= 0.0 {
-        let z = (-u).exp();
-        1.0 / (1.0 + z)
-    } else {
-        let z = u.exp();
-        z / (1.0 + z)
-    }
-}
-
-#[inline]
-fn encode_param(x: f64, kind: MapKind) -> f64 {
-    match kind {
-        MapKind::Identity => x,
-        MapKind::LinearLogit(lo, hi) => {
-            let p = ((x - lo) / (hi - lo)).clamp(1.0e-5, 1.0 - 1.0e-5);
-            (p / (1.0 - p)).ln()
-        }
-        MapKind::LogLogit(lo, hi) => {
-            let llo = lo.ln();
-            let lhi = hi.ln();
-            let lx = x.clamp(lo, hi).ln();
-            let p = ((lx - llo) / (lhi - llo)).clamp(1.0e-5, 1.0 - 1.0e-5);
-            (p / (1.0 - p)).ln()
-        }
-        MapKind::ComplementLogLogit(lo, hi) => {
-            let c_min = (1.0 - hi).max(1.0e-9);
-            let c_max = (1.0 - lo).max(c_min * 1.0001);
-            let lc_min = c_min.ln();
-            let lc_max = c_max.ln();
-            let lc = (1.0 - x).clamp(c_min, c_max).ln();
-            let p = ((lc - lc_min) / (lc_max - lc_min)).clamp(1.0e-5, 1.0 - 1.0e-5);
-            (p / (1.0 - p)).ln()
+impl ParamSpec {
+    #[inline(always)]
+    fn encode(self, v: f64) -> f64 {
+        match self {
+            Self::Free => v,
+            Self::Bounded(lo, hi) => {
+                let span = (hi - lo).max(1.0e-12);
+                let vc = v.clamp(lo + 1.0e-7 * span, hi - 1.0e-7 * span);
+                let p = ((vc - lo) / span).clamp(1.0e-7, 1.0 - 1.0e-7);
+                (p / (1.0 - p)).ln()
+            }
+            Self::LogBounded(lo, hi) => {
+                let (la, lb) = (lo.ln(), hi.ln());
+                let vc = v.clamp(lo * (1.0 + 1.0e-7), hi * (1.0 - 1.0e-7));
+                let p = ((vc.ln() - la) / (lb - la).max(1.0e-12)).clamp(1.0e-7, 1.0 - 1.0e-7);
+                (p / (1.0 - p)).ln()
+            }
+            Self::ComplementLogBounded(lo_c, hi_c) => Self::LogBounded(lo_c, hi_c).encode(1.0 - v),
         }
     }
-}
 
-#[inline]
-fn decode_param(u: f64, kind: MapKind) -> (f64, f64) {
-    match kind {
-        MapKind::Identity => (u, 1.0),
-        MapKind::LinearLogit(lo, hi) => {
-            let s = sigmoid(u.clamp(-30.0, 30.0));
-            let span = hi - lo;
-            (lo + span * s, span * s * (1.0 - s))
-        }
-        MapKind::LogLogit(lo, hi) => {
-            let llo = lo.ln();
-            let span = hi.ln() - llo;
-            let s = sigmoid(u.clamp(-30.0, 30.0));
-            let x = (llo + span * s).exp();
-            (x, x * span * s * (1.0 - s))
-        }
-        MapKind::ComplementLogLogit(lo, hi) => {
-            let c_min = (1.0 - hi).max(1.0e-9);
-            let c_max = (1.0 - lo).max(c_min * 1.0001);
-            let lc_min = c_min.ln();
-            let span = c_max.ln() - lc_min;
-            let s = sigmoid(u.clamp(-30.0, 30.0));
-            let c = (lc_min + span * s).exp();
-            (1.0 - c, -c * span * s * (1.0 - s))
+    #[inline(always)]
+    fn decode_and_deriv(self, u: f64) -> (f64, f64) {
+        match self {
+            Self::Free => (u, 1.0),
+            Self::Bounded(lo, hi) => {
+                let uc = u.clamp(-24.0, 24.0);
+                let s = 1.0 / (1.0 + (-uc).exp());
+                let span = hi - lo;
+                (lo + span * s, span * s * (1.0 - s))
+            }
+            Self::LogBounded(lo, hi) => {
+                let uc = u.clamp(-24.0, 24.0);
+                let s = 1.0 / (1.0 + (-uc).exp());
+                let (la, lb) = (lo.ln(), hi.ln());
+                let lspan = lb - la;
+                let v = (la + lspan * s).exp();
+                (v, v * lspan * s * (1.0 - s))
+            }
+            Self::ComplementLogBounded(lo_c, hi_c) => {
+                let (c, dc) = Self::LogBounded(lo_c, hi_c).decode_and_deriv(u);
+                (1.0 - c, -dc)
+            }
         }
     }
 }
 
-/// Visits every active parameter slot for `(model.tier, model.mono_out)` in canonical order
-/// alongside its optional gradient value so encode/decode/chain-rule never drift out of sync.
-fn visit_active_params<F>(model: &mut V3OptModelF64, grad: Option<&V3OptModelF64>, mut f: F)
-where
-    F: FnMut(&mut f64, f64, MapKind),
-{
-    let c_cnt = tier_cascade_lanes(model.tier);
-    let f_cnt = tier_fir_segments(model.tier) * 16;
-    let k_cnt = tier_kautz_banks(model.tier) * 4;
-    let active_ch = if model.mono_out { 1 } else { 2 };
+fn visit_active_params(
+    m: &mut V3MatryoshkaOptF64,
+    include_linear_out: bool,
+    mut cb: impl FnMut(&mut f64, ParamSpec),
+) {
+    let g_cnt = m.max_active_groups.clamp(1, MAX_GROUPS);
+    let c_blk = g_cnt * 4;
+    let active_ch = if m.mono_out { 1 } else { 2 };
 
-    macro_rules! p {
-        ($field:expr, |$g:ident| $gfield:expr, $kind:expr) => {{
-            let gv = match grad {
-                Some($g) => $gfield,
-                None => 0.0,
-            };
-            f(&mut $field, gv, $kind);
-        }};
+    if m.os2x {
+        cb(&mut m.os_up_quad, ParamSpec::Bounded(-0.195, 0.045));
+        cb(&mut m.os_dec_c_prev1, ParamSpec::Bounded(0.005, 0.275));
+        cb(&mut m.os_dec_c0, ParamSpec::Bounded(0.005, 0.545));
+        cb(&mut m.os_up_pre_emph, ParamSpec::Bounded(-0.27, 0.98));
+        cb(&mut m.os_dec_aa_mix, ParamSpec::Bounded(1.0e-4, 0.9999));
+        cb(&mut m.os_up_aa_mix, ParamSpec::Bounded(1.0e-4, 0.9999));
+    }
+    cb(&mut m.svf_base_g, ParamSpec::LogBounded(2.0e-4, 0.90));
+    cb(&mut m.svf_sec2_g_ratio, ParamSpec::LogBounded(0.26, 3.90));
+    cb(&mut m.svf_env_oct_sens, ParamSpec::Bounded(-23.5, 23.5));
+    cb(&mut m.svf_env_comp, ParamSpec::LogBounded(1.0e-4, 15.5));
+    cb(
+        &mut m.svf_atk_alpha,
+        ParamSpec::ComplementLogBounded(5.0e-5, 0.998),
+    );
+    cb(
+        &mut m.svf_rel_alpha,
+        ParamSpec::ComplementLogBounded(8.0e-6, 0.998),
+    );
+    cb(
+        &mut m.svf_det_lp_pole,
+        ParamSpec::ComplementLogBounded(6.0e-3, 0.94),
+    );
+    cb(&mut m.svf_det_hp_mix, ParamSpec::Bounded(-0.98, 1.98));
+    cb(&mut m.svf_damp_k1, ParamSpec::LogBounded(0.06, 3.90));
+    cb(&mut m.svf_damp_k2, ParamSpec::LogBounded(0.06, 3.90));
+    cb(&mut m.svf_sec2_bp_feed, ParamSpec::Bounded(-1.95, 1.95));
+    cb(&mut m.svf_sec2_hp_feed, ParamSpec::Bounded(-1.95, 1.95));
+    if !m.mono_out {
+        cb(&mut m.svf_stereo_link, ParamSpec::Bounded(0.001, 0.999));
+    }
+    cb(&mut m.svf_g_min, ParamSpec::LogBounded(1.5e-4, 0.15));
+    cb(&mut m.svf_g_max, ParamSpec::LogBounded(0.02, 0.94));
+    for v in &mut m.svf_stage2_feed_taps {
+        cb(v, ParamSpec::Free);
     }
 
-    // Stage I nonlinear SVF + taps
-    p!(
-        model.svf_base_g,
-        |g| g.svf_base_g,
-        MapKind::LogLogit(1.0e-4, 1.45)
+    cb(&mut m.feat_in_hp_beta, ParamSpec::LogBounded(1.2e-4, 0.48));
+    cb(
+        &mut m.feat_fast_atk_beta,
+        ParamSpec::LogBounded(1.2e-4, 0.995),
     );
-    p!(
-        model.svf_sec2_g_ratio,
-        |g| g.svf_sec2_g_ratio,
-        MapKind::LogLogit(0.25, 4.0)
+    cb(
+        &mut m.feat_fast_rel_beta,
+        ParamSpec::LogBounded(1.2e-5, 0.995),
     );
-    p!(
-        model.svf_env_oct_sens,
-        |g| g.svf_env_oct_sens,
-        MapKind::LinearLogit(-16.0, 16.0)
+    cb(&mut m.feat_pinch_k, ParamSpec::LogBounded(1.0e-4, 24_500.0));
+    cb(
+        &mut m.feat_slow_atk_beta,
+        ParamSpec::LogBounded(1.2e-5, 0.48),
     );
-    p!(
-        model.svf_env_comp,
-        |g| g.svf_env_comp,
-        MapKind::LinearLogit(0.0, 16.0)
+    cb(
+        &mut m.feat_slow_rel_beta,
+        ParamSpec::LogBounded(1.2e-6, 0.095),
     );
-    p!(
-        model.svf_atk_alpha,
-        |g| g.svf_atk_alpha,
-        MapKind::ComplementLogLogit(0.001, 0.9999)
-    );
-    p!(
-        model.svf_rel_alpha,
-        |g| g.svf_rel_alpha,
-        MapKind::ComplementLogLogit(0.001, 0.99995)
-    );
-    p!(
-        model.svf_det_lp_pole,
-        |g| g.svf_det_lp_pole,
-        MapKind::ComplementLogLogit(0.05, 0.995)
-    );
-    p!(
-        model.svf_det_hp_mix,
-        |g| g.svf_det_hp_mix,
-        MapKind::LinearLogit(-1.0, 2.0)
-    );
-    p!(
-        model.svf_damp_k1,
-        |g| g.svf_damp_k1,
-        MapKind::LogLogit(0.05, 4.0)
-    );
-    p!(
-        model.svf_damp_k2,
-        |g| g.svf_damp_k2,
-        MapKind::LogLogit(0.05, 4.0)
-    );
-    p!(
-        model.svf_sec2_bp_feed,
-        |g| g.svf_sec2_bp_feed,
-        MapKind::LinearLogit(-2.0, 2.0)
-    );
-    p!(
-        model.svf_sec2_hp_feed,
-        |g| g.svf_sec2_hp_feed,
-        MapKind::LinearLogit(-2.0, 2.0)
-    );
-    p!(
-        model.svf_stereo_link,
-        |g| g.svf_stereo_link,
-        MapKind::LinearLogit(0.0, 1.0)
-    );
-    p!(
-        model.svf_g_min,
-        |g| g.svf_g_min,
-        MapKind::LogLogit(1.0e-4, 1.45)
-    );
-    p!(
-        model.svf_g_max,
-        |g| g.svf_g_max,
-        MapKind::LogLogit(1.0e-4, 1.45)
-    );
-    for i in 0..7 {
-        p!(
-            model.svf_stage2_feed_taps[i],
-            |g| g.svf_stage2_feed_taps[i],
-            MapKind::Identity
-        );
-        p!(
-            model.svf_direct_taps_l[i],
-            |g| g.svf_direct_taps_l[i],
-            MapKind::Identity
-        );
-        if !model.mono_out {
-            p!(
-                model.svf_direct_taps_r[i],
-                |g| g.svf_direct_taps_r[i],
-                MapKind::Identity
-            );
-        }
-    }
+    cb(&mut m.feat_slow_det_comp, ParamSpec::Bounded(0.0, 63.0));
 
-    // Stage II nonlinear cascade blocks (active lanes only)
-    for b in 0..NUM_CASCADE_BLOCKS {
-        p!(
-            model.blocks[b].atk_alpha,
-            |g| g.blocks[b].atk_alpha,
-            MapKind::ComplementLogLogit(0.001, 0.9999)
-        );
-        p!(
-            model.blocks[b].rel_alpha,
-            |g| g.blocks[b].rel_alpha,
-            MapKind::ComplementLogLogit(0.001, 0.99995)
-        );
-        p!(
-            model.blocks[b].gate_mix,
-            |g| g.blocks[b].gate_mix,
-            MapKind::LinearLogit(0.0, 1.0)
-        );
-        p!(
-            model.blocks[b].gate_sharpness,
-            |g| g.blocks[b].gate_sharpness,
-            MapKind::LogLogit(0.05, 1.0e4)
-        );
-        for l in 0..c_cnt {
-            p!(
-                model.blocks[b].in_u_gain[l],
-                |g| g.blocks[b].in_u_gain[l],
-                MapKind::Identity
-            );
-            p!(
-                model.blocks[b].lp_pole[l],
-                |g| g.blocks[b].lp_pole[l],
-                MapKind::ComplementLogLogit(0.02, 0.9985)
-            );
-            p!(
-                model.blocks[b].lp_mix[l],
-                |g| g.blocks[b].lp_mix[l],
-                MapKind::Identity
-            );
-            p!(
-                model.blocks[b].hp_mix[l],
-                |g| g.blocks[b].hp_mix[l],
-                MapKind::Identity
-            );
-            p!(
-                model.blocks[b].static_bias[l],
-                |g| g.blocks[b].static_bias[l],
-                MapKind::LinearLogit(-4.0, 4.0)
-            );
-            p!(
-                model.blocks[b].env_bias_sens[l],
-                |g| g.blocks[b].env_bias_sens[l],
-                MapKind::LinearLogit(-4.0, 4.0)
-            );
-            p!(
-                model.blocks[b].skip_u_gain[l],
-                |g| g.blocks[b].skip_u_gain[l],
-                MapKind::Identity
-            );
+    for b in 0..NUM_GRU_BLOCKS {
+        let blk = &mut m.blocks[b];
+        for dst in 0..c_blk {
+            let g_end = ((dst >> 2) + 1) << 2;
+            for f in 0..NUM_IN_FEATS_B0 {
+                cb(&mut blk.w_in_z[f][dst], ParamSpec::Free);
+                cb(&mut blk.w_in_r[f][dst], ParamSpec::Free);
+                cb(&mut blk.w_in_n[f][dst], ParamSpec::Free);
+            }
             if b > 0 {
-                p!(
-                    model.blocks[b].prev_skip_gain[l],
-                    |g| g.blocks[b].prev_skip_gain[l],
-                    MapKind::Identity
-                );
-                for s in 0..c_cnt {
-                    p!(
-                        model.blocks[b].inter_mat[l][s],
-                        |g| g.blocks[b].inter_mat[l][s],
-                        MapKind::Identity
-                    );
+                for src in 0..g_end {
+                    cb(&mut blk.w_prev_z[dst][src], ParamSpec::Free);
+                    cb(&mut blk.w_prev_r[dst][src], ParamSpec::Free);
+                    cb(&mut blk.w_prev_n[dst][src], ParamSpec::Free);
+                }
+            }
+            for src in 0..g_end {
+                cb(&mut blk.w_rec_z[dst][src], ParamSpec::Free);
+                cb(&mut blk.w_rec_r[dst][src], ParamSpec::Free);
+                cb(&mut blk.w_rec_n[dst][src], ParamSpec::Free);
+            }
+            cb(&mut blk.b_z[dst], ParamSpec::Bounded(-7.9, 8.1));
+            cb(&mut blk.b_r[dst], ParamSpec::Bounded(-7.9, 8.1));
+            cb(&mut blk.b_n[dst], ParamSpec::Bounded(-3.7, 3.7));
+            cb(&mut blk.k_sag[dst], ParamSpec::Bounded(0.0, 7.8));
+            cb(&mut blk.k_quad[dst], ParamSpec::Bounded(-0.44, 0.44));
+        }
+    }
+
+    let mut max_k = 0_usize;
+    for (tau, &tier) in ALL_TIERS.iter().enumerate() {
+        if tier_groups(tier) <= g_cnt && m.active_tier_weights[tau] > 0.0 {
+            max_k = max_k.max(tier_kautz_banks(tier) * 4);
+        }
+    }
+    for pole in m.kautz_poles.iter_mut().take(max_k) {
+        cb(&mut pole.0, ParamSpec::ComplementLogBounded(1.6e-3, 0.745));
+        if pole.1 > 5.0e-4 {
+            cb(&mut pole.1, ParamSpec::LogBounded(1.0e-3, PI - 0.002));
+        }
+    }
+
+    for (tau, &tier) in ALL_TIERS.iter().enumerate() {
+        if tier_groups(tier) > g_cnt || m.active_tier_weights[tau] <= 0.0 {
+            continue;
+        }
+        let c_t = tier_block_lanes(tier);
+        let f_t = tier_fir_segments(tier) * 16;
+        let k_t = tier_kautz_banks(tier) * 4;
+        let r = &mut m.readouts[tau];
+        for ch in 0..active_ch {
+            if include_linear_out {
+                let taps = if ch == 0 {
+                    &mut r.svf_direct_taps_l
+                } else {
+                    &mut r.svf_direct_taps_r
+                };
+                for v in taps.iter_mut() {
+                    cb(v, ParamSpec::Free);
+                }
+            }
+            cb(&mut r.pre_cab_u_gain[ch], ParamSpec::Free);
+            cb(&mut r.pre_cab_hp_gain[ch], ParamSpec::Free);
+            if include_linear_out {
+                cb(&mut r.direct_s2_u_gain[ch], ParamSpec::Free);
+                cb(&mut r.direct_s2_hp_gain[ch], ParamSpec::Free);
+            }
+            for b in 0..NUM_GRU_BLOCKS {
+                let base = b * MAX_BLOCK_LANES;
+                for l in 0..c_t {
+                    cb(&mut r.pre_cab_w[ch][base + l], ParamSpec::Free);
+                    if include_linear_out {
+                        cb(&mut r.direct_s2_w[ch][base + l], ParamSpec::Free);
+                    }
+                }
+            }
+            if include_linear_out {
+                let fir = if ch == 0 { &mut r.fir_l } else { &mut r.fir_r };
+                for v in fir.iter_mut().take(f_t) {
+                    cb(v, ParamSpec::Free);
+                }
+                let kc = if ch == 0 {
+                    &mut r.kautz_c_l
+                } else {
+                    &mut r.kautz_c_r
+                };
+                for p in kc.iter_mut().take(k_t) {
+                    cb(&mut p.0, ParamSpec::Free);
+                    cb(&mut p.1, ParamSpec::Free);
                 }
             }
         }
     }
-
-    // Stage II->III pre-cab + Stage III linear & Kautz poles
-    for ch in 0..active_ch {
-        p!(
-            model.pre_cab_u_gain[ch],
-            |g| g.pre_cab_u_gain[ch],
-            MapKind::Identity
-        );
-        for l in 0..c_cnt {
-            p!(
-                model.pre_cab_w[ch][l],
-                |g| g.pre_cab_w[ch][l],
-                MapKind::Identity
-            );
-            p!(
-                model.direct_s2_w[ch][l],
-                |g| g.direct_s2_w[ch][l],
-                MapKind::Identity
-            );
-        }
-    }
-    for k in 0..f_cnt {
-        p!(model.fir_l[k], |g| g.fir_l[k], MapKind::Identity);
-        if !model.mono_out {
-            p!(model.fir_r[k], |g| g.fir_r[k], MapKind::Identity);
-        }
-    }
-    for m in 0..k_cnt {
-        p!(
-            model.kautz_poles[m].0,
-            |g| g.kautz_poles[m].0,
-            MapKind::ComplementLogLogit(0.50, 0.997)
-        );
-        p!(
-            model.kautz_poles[m].1,
-            |g| g.kautz_poles[m].1,
-            MapKind::LogLogit(1.0e-3, PI - 1.0e-3)
-        );
-        p!(
-            model.kautz_c_l[m].0,
-            |g| g.kautz_c_l[m].0,
-            MapKind::Identity
-        );
-        p!(
-            model.kautz_c_l[m].1,
-            |g| g.kautz_c_l[m].1,
-            MapKind::Identity
-        );
-        if !model.mono_out {
-            p!(
-                model.kautz_c_r[m].0,
-                |g| g.kautz_c_r[m].0,
-                MapKind::Identity
-            );
-            p!(
-                model.kautz_c_r[m].1,
-                |g| g.kautz_c_r[m].1,
-                MapKind::Identity
-            );
-        }
-    }
 }
 
-fn mirror_mono_channels(model: &mut V3OptModelF64) {
-    if model.mono_out {
-        model.svf_direct_taps_r = model.svf_direct_taps_l;
-        model.pre_cab_u_gain[1] = model.pre_cab_u_gain[0];
-        model.pre_cab_w[1] = model.pre_cab_w[0];
-        model.direct_s2_w[1] = model.direct_s2_w[0];
-        model.fir_r = model.fir_l;
-        model.kautz_c_r = model.kautz_c_l;
-    }
-}
-
-fn encode_model_u(model: &V3OptModelF64) -> Vec<f64> {
-    let mut clone = model.clone();
-    let mut u = Vec::with_capacity(256);
-    visit_active_params(&mut clone, None, |val, _, kind| {
-        u.push(encode_param(*val, kind));
-    });
+fn pack_params(m: &mut V3MatryoshkaOptF64, include_linear_out: bool) -> Vec<f64> {
+    let mut u = Vec::with_capacity(2048);
+    visit_active_params(m, include_linear_out, |v, spec| u.push(spec.encode(*v)));
     u
 }
 
-fn decode_u_into_model(u: &[f64], model: &mut V3OptModelF64) {
-    let mut idx = 0_usize;
-    visit_active_params(model, None, |val, _, kind| {
-        let (x, _) = decode_param(u[idx], kind);
-        *val = x;
-        idx += 1;
-    });
-    mirror_mono_channels(model);
-}
-
-fn map_model_grad_to_u(
+fn unpack_and_derivs(
+    m: &mut V3MatryoshkaOptF64,
+    include_linear_out: bool,
     u: &[f64],
-    template: &V3OptModelF64,
-    grad_model: &V3OptModelF64,
-) -> Vec<f64> {
-    let mut scratch = template.clone();
-    let mut g_u = Vec::with_capacity(u.len());
-    let mut idx = 0_usize;
-    visit_active_params(&mut scratch, Some(grad_model), |_, g_val, kind| {
-        let (_, dx_du) = decode_param(u[idx], kind);
-        g_u.push(g_val * dx_du);
-        idx += 1;
+    jac_out: &mut [f64],
+) {
+    let mut i = 0_usize;
+    visit_active_params(m, include_linear_out, |v, spec| {
+        let (val, dv) = spec.decode_and_deriv(u[i]);
+        *v = val;
+        jac_out[i] = dv;
+        i += 1;
     });
-    g_u
+    m.mirror_mono();
 }
 
-fn lbfgs_direction<B: TrainerBackend>(
-    g: &[f64],
-    history: &VecDeque<(Vec<f64>, Vec<f64>, f64)>,
-) -> Vec<f64> {
-    let mut q: Vec<f64> = g.to_vec();
-    let k = history.len();
-    let mut alpha = vec![0.0_f64; k];
-    for (i, (s, y, rho)) in history.iter().enumerate().rev() {
-        let a = rho * B::dot_f64(s, &q);
-        alpha[i] = a;
-        B::axpy_f64(&mut q, -a, y);
+fn pack_chain_grad(
+    g: &mut V3MatryoshkaOptF64,
+    include_linear_out: bool,
+    jac: &[f64],
+    out: &mut [f64],
+) {
+    let mut i = 0_usize;
+    visit_active_params(g, include_linear_out, |gv, _| {
+        out[i] = *gv * jac[i];
+        i += 1;
+    });
+}
+
+struct ModelBestGuard<'a> {
+    target: &'a mut V3MatryoshkaOptF64,
+    best: V3MatryoshkaOptF64,
+    best_loss: f64,
+    committed: bool,
+}
+
+impl Drop for ModelBestGuard<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            *self.target = self.best.clone();
+            for blk in &mut self.target.blocks {
+                blk.enforce_lower_triangular();
+            }
+            self.target.mirror_mono();
+        }
     }
-    let gamma = if let Some((s, y, _)) = history.back() {
-        let yy = B::sum_sq_f64(y);
-        if yy > 1.0e-18 {
-            (B::dot_f64(s, y) / yy).clamp(1.0e-6, 1.0e4)
+}
+
+fn run_lbfgs_impl<B: TrainerBackend>(
+    model: &mut V3MatryoshkaOptF64,
+    dataset: &V3TrainDataset,
+    max_iters: usize,
+    include_linear_out: bool,
+) -> f64 {
+    if max_iters == 0 || dataset.stems.is_empty() {
+        return 0.0;
+    }
+    let mut ws = AdjointWorkspace::default();
+    let init_loss = evaluate_matryoshka_loss_f64_with_backend::<B>(model, dataset, &mut ws);
+    let mut guard = ModelBestGuard {
+        best: model.clone(),
+        best_loss: if init_loss.is_finite() {
+            init_loss
         } else {
-            1.0
-        }
-    } else {
-        let gg = B::sum_sq_f64(g).sqrt();
-        if gg > 1.0 {
-            (1.0 / gg).clamp(1.0e-4, 1.0)
-        } else {
-            1.0
-        }
+            f64::INFINITY
+        },
+        target: model,
+        committed: false,
     };
-    let mut r = q;
-    B::scale_f64(&mut r, gamma);
-    for (i, (s, y, rho)) in history.iter().enumerate() {
-        let beta = rho * B::dot_f64(y, &r);
-        B::axpy_f64(&mut r, alpha[i] - beta, s);
+
+    let mut u = pack_params(guard.target, include_linear_out);
+    let dim = u.len();
+    if dim == 0 {
+        guard.committed = true;
+        return guard.best_loss;
     }
-    B::scale_f64(&mut r, -1.0);
-    r
-}
-
-struct TrialRollback<'a> {
-    model: &'a mut V3OptModelF64,
-    u: &'a mut Vec<f64>,
-    backup_model: V3OptModelF64,
-    backup_u: Vec<f64>,
-}
-
-/// Evaluates a single backtracking line-search candidate wrapped in `core::mem::DropGuard`
-/// so rejected, non-finite, or early-exit trials deterministically restore `(model, u)`.
-#[allow(clippy::too_many_arguments)]
-fn try_armijo_line_search<B: TrainerBackend>(
-    model: &mut V3OptModelF64,
-    u: &mut Vec<f64>,
-    g: &mut Vec<f64>,
-    loss: &mut f64,
-    dir: &[f64],
-    slope: f64,
-    dataset: &V3TrainDataset,
-    ws: &mut AdjointWorkspace,
-) -> Option<(Vec<f64>, Vec<f64>)> {
-    let mut guard = DropGuard::new(
-        TrialRollback {
-            backup_model: model.clone(),
-            backup_u: u.clone(),
-            model,
-            u,
-        },
-        |rb| {
-            *rb.model = rb.backup_model;
-            *rb.u = rb.backup_u;
-        },
-    );
-
-    let orig_loss = *loss;
-    let mut step_alpha = 1.0_f64;
-    for _ in 0..14 {
-        {
-            let rb = &mut *guard;
-            rb.u.copy_from_slice(&rb.backup_u);
-            B::axpy_f64(rb.u, step_alpha, dir);
-            decode_u_into_model(rb.u, rb.model);
-        }
-        let cand_loss = evaluate_loss_f64_with_backend::<B>(guard.model, dataset, ws);
-        if cand_loss.is_finite() && cand_loss <= orig_loss + 1.0e-4 * step_alpha * slope {
-            let (exact_loss, grad_model) =
-                evaluate_loss_and_grad_f64_with_backend::<B>(guard.model, dataset, ws);
-            let new_g = map_model_grad_to_u(guard.u, guard.model, &grad_model);
-            if exact_loss.is_finite() && new_g.iter().all(|v| v.is_finite()) {
-                let s_vec: Vec<f64> = guard
-                    .u
-                    .iter()
-                    .zip(&guard.backup_u)
-                    .map(|(&nu, &ou)| nu - ou)
-                    .collect();
-                let y_vec: Vec<f64> = new_g
-                    .iter()
-                    .zip(g.iter())
-                    .map(|(&ng, &og)| ng - og)
-                    .collect();
-                *loss = exact_loss;
-                *g = new_g;
-                DropGuard::dismiss(guard);
-                return Some((s_vec, y_vec));
-            }
-        }
-        step_alpha *= 0.5;
-    }
-    None
-}
-
-/// Runs L-BFGS (`m = 12`) in smooth transformed parameter space via backend `B`.
-pub fn run_lbfgs_with_backend<B: TrainerBackend>(
-    model: &mut V3OptModelF64,
-    dataset: &V3TrainDataset,
-    ws: &mut AdjointWorkspace,
-    max_iters: usize,
-) -> f64 {
-    if max_iters == 0 {
-        return evaluate_loss_f64_with_backend::<B>(model, dataset, ws);
-    }
-    let mut u = encode_model_u(model);
-    decode_u_into_model(&u, model);
-    let (mut loss, grad_model) = evaluate_loss_and_grad_f64_with_backend::<B>(model, dataset, ws);
-    let mut g = map_model_grad_to_u(&u, model, &grad_model);
-    let mut history: VecDeque<(Vec<f64>, Vec<f64>, f64)> = VecDeque::with_capacity(12);
-
-    for _ in 0..max_iters {
-        let g_norm = B::sum_sq_f64(&g).sqrt();
-        if !g_norm.is_finite() || g_norm < 1.0e-8 {
-            break;
-        }
-        let mut dir = lbfgs_direction::<B>(&g, &history);
-        let mut slope = B::dot_f64(&dir, &g);
-        if !slope.is_finite() || slope >= 0.0 {
-            history.clear();
-            dir.clone_from(&g);
-            B::scale_f64(&mut dir, -1.0);
-            slope = -B::sum_sq_f64(&g);
-        }
-
-        if let Some((s_vec, y_vec)) =
-            try_armijo_line_search::<B>(model, &mut u, &mut g, &mut loss, &dir, slope, dataset, ws)
-        {
-            let sy = B::dot_f64(&s_vec, &y_vec);
-            let sn = B::sum_sq_f64(&s_vec).sqrt();
-            let yn = B::sum_sq_f64(&y_vec).sqrt();
-            if sy.is_finite() && sy > 1.0e-10 * (sn * yn).max(1.0e-18) {
-                if history.len() == 12 {
-                    history.pop_front();
-                }
-                history.push_back((s_vec, y_vec, 1.0 / sy));
-            }
-        } else if !history.is_empty() {
-            history.clear();
-        } else {
-            break;
-        }
-    }
-    loss
-}
-
-/// Runs L-BFGS (`m = 12`) in smooth transformed parameter space with `DropGuard` rollback protection.
-pub fn run_lbfgs(
-    model: &mut V3OptModelF64,
-    dataset: &V3TrainDataset,
-    ws: &mut AdjointWorkspace,
-    max_iters: usize,
-) -> f64 {
-    struct LbfgsTask<'a> {
-        model: &'a mut V3OptModelF64,
-        dataset: &'a V3TrainDataset,
-        ws: &'a mut AdjointWorkspace,
-        max_iters: usize,
-    }
-    impl TrainerTask<f64> for LbfgsTask<'_> {
-        fn run<B: TrainerBackend>(self) -> f64 {
-            run_lbfgs_with_backend::<B>(self.model, self.dataset, self.ws, self.max_iters)
-        }
-    }
-    DynamicTrainer::detect().dispatch(LbfgsTask {
-        model,
+    let (mut jac, mut g_u, mut g_model) =
+        (vec![1.0; dim], vec![0.0; dim], guard.target.zero_like());
+    unpack_and_derivs(guard.target, include_linear_out, &u, &mut jac);
+    let mut loss = evaluate_matryoshka_loss_and_grad_with_backend::<B>(
+        guard.target,
         dataset,
-        ws,
-        max_iters,
-    })
+        &mut ws,
+        Some(&mut g_model),
+    );
+    pack_chain_grad(&mut g_model, include_linear_out, &jac, &mut g_u);
+    if loss.is_finite() && loss < guard.best_loss {
+        guard.best_loss = loss;
+        guard.best = guard.target.clone();
+    }
+
+    let (mut s_hist, mut y_hist, mut rho_hist) = (
+        Vec::<Vec<f64>>::with_capacity(10),
+        Vec::<Vec<f64>>::with_capacity(10),
+        Vec::<f64>::with_capacity(10),
+    );
+    let (mut prev_u, mut prev_g, mut cand_u) = (vec![0.0; dim], vec![0.0; dim], vec![0.0; dim]);
+    let mut small_improve_streak = 0_usize;
+
+    for _iter in 0..max_iters {
+        let g_norm2 = B::sum_sq_f64(&g_u);
+        if !g_norm2.is_finite() || g_norm2.sqrt() < 1.0e-7 {
+            break;
+        }
+        let mut q: Vec<f64> = g_u.iter().map(|&v| -v).collect();
+        if !s_hist.is_empty() {
+            let m = s_hist.len();
+            let mut alpha = vec![0.0; m];
+            for i in (0..m).rev() {
+                alpha[i] = rho_hist[i] * B::dot_f64(&s_hist[i], &q);
+                B::axpy_f64(&mut q, -alpha[i], &y_hist[i]);
+            }
+            if let (Some(sl), Some(yl)) = (s_hist.last(), y_hist.last()) {
+                let yy = B::dot_f64(yl, yl).max(1.0e-18);
+                let scale = (B::dot_f64(sl, yl) / yy).clamp(1.0e-6, 1.0e6);
+                B::scale_f64(&mut q, scale);
+            }
+            for i in 0..m {
+                let beta = rho_hist[i] * B::dot_f64(&y_hist[i], &q);
+                B::axpy_f64(&mut q, alpha[i] - beta, &s_hist[i]);
+            }
+            let slope = B::dot_f64(&g_u, &q);
+            if !slope.is_finite() || slope >= 0.0 {
+                s_hist.clear();
+                y_hist.clear();
+                rho_hist.clear();
+                for j in 0..dim {
+                    q[j] = -g_u[j];
+                }
+            }
+        }
+        prev_u.copy_from_slice(&u);
+        prev_g.copy_from_slice(&g_u);
+        let prev_accepted_loss = loss;
+
+        let mut accepted = false;
+        for attempt in 0..2 {
+            if attempt == 1 {
+                if s_hist.is_empty() {
+                    break;
+                }
+                s_hist.clear();
+                y_hist.clear();
+                rho_hist.clear();
+                for j in 0..dim {
+                    q[j] = -prev_g[j];
+                }
+            }
+            let q_max = q
+                .iter()
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs()))
+                .max(1.0e-12);
+            let init_step = if attempt == 1 {
+                (0.20 / q_max).min(0.15)
+            } else if s_hist.is_empty() {
+                (0.30 / q_max).min(0.25)
+            } else {
+                (2.0 / q_max).min(1.0)
+            };
+            let eff_slope = B::dot_f64(&prev_g, &q);
+            if !eff_slope.is_finite() || eff_slope >= 0.0 {
+                continue;
+            }
+            let mut step = init_step;
+            let max_ls = if attempt == 0 { 5 } else { 3 };
+            for ls_try in 0..max_ls {
+                for j in 0..dim {
+                    cand_u[j] = prev_u[j] + step * q[j];
+                }
+                unpack_and_derivs(guard.target, include_linear_out, &cand_u, &mut jac);
+                let trial_l = if ls_try == 0 {
+                    evaluate_matryoshka_loss_and_grad_with_backend::<B>(
+                        guard.target,
+                        dataset,
+                        &mut ws,
+                        Some(&mut g_model),
+                    )
+                } else {
+                    evaluate_matryoshka_loss_f64_with_backend::<B>(guard.target, dataset, &mut ws)
+                };
+                if trial_l.is_finite() && trial_l <= loss + 1.0e-4 * step * eff_slope {
+                    u.copy_from_slice(&cand_u);
+                    loss = if ls_try == 0 {
+                        trial_l
+                    } else {
+                        evaluate_matryoshka_loss_and_grad_with_backend::<B>(
+                            guard.target,
+                            dataset,
+                            &mut ws,
+                            Some(&mut g_model),
+                        )
+                    };
+                    pack_chain_grad(&mut g_model, include_linear_out, &jac, &mut g_u);
+                    if loss.is_finite() && loss < guard.best_loss {
+                        guard.best_loss = loss;
+                        guard.best = guard.target.clone();
+                    }
+                    accepted = true;
+                    break;
+                }
+                step = if trial_l.is_finite() {
+                    let denom = 2.0 * (trial_l - loss - eff_slope * step);
+                    if denom > 1.0e-18 {
+                        ((-eff_slope * step * step) / denom).clamp(0.15 * step, 0.60 * step)
+                    } else {
+                        0.35 * step
+                    }
+                } else {
+                    0.25 * step
+                };
+            }
+            if accepted {
+                break;
+            }
+        }
+        if !accepted {
+            break;
+        }
+        if (prev_accepted_loss - loss).abs() < 5.0e-5 * prev_accepted_loss.abs().max(1.0e-12) {
+            small_improve_streak += 1;
+            if small_improve_streak >= 3 {
+                break;
+            }
+        } else {
+            small_improve_streak = 0;
+        }
+        let s: Vec<f64> = u.iter().zip(&prev_u).map(|(a, b)| a - b).collect();
+        let y: Vec<f64> = g_u.iter().zip(&prev_g).map(|(a, b)| a - b).collect();
+        let sy = B::dot_f64(&s, &y);
+        if sy.is_finite() && sy > 1.0e-18 {
+            if s_hist.len() == 10 {
+                s_hist.remove(0);
+                y_hist.remove(0);
+                rho_hist.remove(0);
+            }
+            s_hist.push(s);
+            y_hist.push(y);
+            rho_hist.push(1.0 / sy);
+        }
+    }
+
+    *guard.target = guard.best.clone();
+    for blk in &mut guard.target.blocks {
+        blk.enforce_lower_triangular();
+    }
+    guard.target.mirror_mono();
+    guard.committed = true;
+    guard.best_loss
+}
+
+/// Runs `max_iters` two-loop L-BFGS (`m = 10`) steps on unconstrained codec with `Drop` rollback safety via `B`.
+pub fn run_lbfgs_matryoshka_with_backend<B: TrainerBackend>(
+    model: &mut V3MatryoshkaOptF64,
+    dataset: &V3TrainDataset,
+    max_iters: usize,
+) -> f64 {
+    run_lbfgs_impl::<B>(model, dataset, max_iters, true)
+}
+
+/// Runs `max_iters` two-loop L-BFGS (`m = 10`) steps optimizing core + `pre_cab` weights (holding Stage III linear output fixed) via `B`.
+pub fn run_lbfgs_core_matryoshka_with_backend<B: TrainerBackend>(
+    model: &mut V3MatryoshkaOptF64,
+    dataset: &V3TrainDataset,
+    max_iters: usize,
+) -> f64 {
+    run_lbfgs_impl::<B>(model, dataset, max_iters, false)
+}
+
+/// Dispatches [`run_lbfgs_matryoshka_with_backend`] via fastest CPU backend.
+pub fn run_lbfgs_matryoshka(
+    model: &mut V3MatryoshkaOptF64,
+    dataset: &V3TrainDataset,
+    max_iters: usize,
+) -> f64 {
+    struct Task<'a>(&'a mut V3MatryoshkaOptF64, &'a V3TrainDataset, usize);
+    impl TrainerTask<f64> for Task<'_> {
+        fn run<B: TrainerBackend>(self) -> f64 {
+            run_lbfgs_matryoshka_with_backend::<B>(self.0, self.1, self.2)
+        }
+    }
+    DynamicTrainer::detect().dispatch(Task(model, dataset, max_iters))
+}
+
+/// Dispatches [`run_lbfgs_core_matryoshka_with_backend`] via fastest CPU backend.
+pub fn run_lbfgs_core_matryoshka(
+    model: &mut V3MatryoshkaOptF64,
+    dataset: &V3TrainDataset,
+    max_iters: usize,
+) -> f64 {
+    struct Task<'a>(&'a mut V3MatryoshkaOptF64, &'a V3TrainDataset, usize);
+    impl TrainerTask<f64> for Task<'_> {
+        fn run<B: TrainerBackend>(self) -> f64 {
+            run_lbfgs_core_matryoshka_with_backend::<B>(self.0, self.1, self.2)
+        }
+    }
+    DynamicTrainer::detect().dispatch(Task(model, dataset, max_iters))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::adjoint::{evaluate_loss_and_grad_f64, evaluate_loss_f64};
-    use super::super::model_f64::V3TrainStem;
+    use dnam_engine::stages::v3_core::V3MatryoshkaModel;
+
     use super::*;
-    use crate::solver::backends::DefaultTrainerBackend;
-    use dnam_engine::Tier;
-    use dnam_engine::math::TrainerMathBackend;
-    use dnam_engine::stages::v3_core::V3ColdTierModel;
+    use crate::solver::v3_varpro::model_f64::V3TrainStem;
 
-    fn make_test_stem(n: usize, warmup: usize) -> V3TrainStem {
-        let mut x = vec![0.0_f32; n];
-        for (t, v) in x.iter_mut().enumerate() {
-            let tf = t as f64 / 48_000.0;
-            let env = (0.3 + 0.7 * (2.0 * PI * 3.0 * tf).sin().abs()) as f32;
-            *v = env
-                * (0.45 * (2.0 * PI * 140.0 * tf).sin() + 0.25 * (2.0 * PI * 930.0 * tf).sin())
-                    as f32;
+    #[test]
+    fn test_codec_roundtrip_and_chain_rule_matches_fd() {
+        let mut m =
+            V3MatryoshkaOptF64::from_matryoshka_cold(&V3MatryoshkaModel::identity(true, false));
+        m.max_active_groups = 1;
+        m.active_tier_weights = [1.0, 0.0, 0.0, 0.0];
+        m.svf_base_g = 0.11;
+        m.feat_slow_rel_beta = 1.2e-5;
+        m.feat_pinch_k = 12.0;
+        m.feat_slow_det_comp = 3.5;
+        m.blocks[0].w_in_n[0][0] = 0.7;
+        m.blocks[0].k_sag[0] = 0.45;
+
+        let u0 = pack_params(&mut m, true);
+        let mut jac = vec![0.0; u0.len()];
+        unpack_and_derivs(&mut m, true, &u0, &mut jac);
+        let u1 = pack_params(&mut m, true);
+        for (a, b) in u0.iter().zip(&u1) {
+            assert!((a - b).abs() < 1.0e-6);
         }
-        let mut tgt = vec![0.0_f32; n];
-        let mut lp = 0.0_f32;
-        for t in 0..n {
-            lp = 0.72 * lp + 0.28 * x[t];
-            let d = (2.8 * lp + 0.22 * x[t] - 0.18).tanh();
-            tgt[t] = 0.65 * d + if t >= 2 { 0.15 * x[t - 2] } else { 0.0 };
-        }
-        V3TrainStem {
-            in_l: x.clone(),
-            in_r: x,
-            tgt_l: tgt.clone(),
-            tgt_r: tgt,
-            warmup,
+
+        let n = 128;
+        let in_l: Vec<f32> = (0..n).map(|i| 0.4 * ((i as f32) * 0.07).sin()).collect();
+        let in_r: Vec<f32> = (0..n).map(|i| 0.35 * ((i as f32) * 0.11).cos()).collect();
+        let tgt_l: Vec<f32> = in_l.iter().map(|&x| (1.2 * x).tanh()).collect();
+        let tgt_r: Vec<f32> = in_r.iter().map(|&x| (1.1 * x).tanh()).collect();
+        let ds = V3TrainDataset::new(
+            vec![V3TrainStem {
+                in_l,
+                in_r,
+                tgt_l,
+                tgt_r,
+                warmup: 16,
+            }],
+            48_000.0,
+        );
+
+        let mut gm = m.zero_like();
+        let mut ws = AdjointWorkspace::default();
+        let _ = evaluate_matryoshka_loss_and_grad_with_backend::<
+            crate::solver::backends::ScalarTrainerBackend,
+        >(&m, &ds, &mut ws, Some(&mut gm));
+        let mut gu = vec![0.0; u0.len()];
+        pack_chain_grad(&mut gm, true, &jac, &mut gu);
+
+        for idx in [0, 3, 10, 25, u0.len() - 5] {
+            let mut up = u0.clone();
+            let mut um = u0.clone();
+            up[idx] += 1.0e-5;
+            um[idx] -= 1.0e-5;
+            let mut mp = m.clone();
+            unpack_and_derivs(&mut mp, true, &up, &mut jac);
+            let lp = evaluate_matryoshka_loss_f64_with_backend::<
+                crate::solver::backends::ScalarTrainerBackend,
+            >(&mp, &ds, &mut ws);
+            let mut mm = m.clone();
+            unpack_and_derivs(&mut mm, true, &um, &mut jac);
+            let lm = evaluate_matryoshka_loss_f64_with_backend::<
+                crate::solver::backends::ScalarTrainerBackend,
+            >(&mm, &ds, &mut ws);
+            let fd = (lp - lm) / 2.0e-5;
+            let err = (gu[idx] - fd).abs() / gu[idx].abs().max(fd.abs()).max(1.0e-8);
+            assert!(err < 1.0e-4, "idx={idx} gu={} fd={fd} err={err}", gu[idx]);
         }
     }
 
     #[test]
-    fn test_drop_guard_line_search_rollback_and_dismiss() {
-        let stem = make_test_stem(512, 64);
-        let ds = V3TrainDataset::new(vec![stem], 48_000.0);
-        let mut ws = AdjointWorkspace::default();
-        let cold = V3ColdTierModel::identity_for_tier(Tier::Lite, false, true);
-        let mut model = V3OptModelF64::from_cold_model(&cold);
-        let orig_gain = model.pre_cab_u_gain[0];
-        let mut u = encode_model_u(&model);
-        let orig_u = u.clone();
-        let (mut loss, grad_m) = evaluate_loss_and_grad_f64(&model, &ds, &mut ws);
-        let mut g = map_model_grad_to_u(&u, &model, &grad_m);
-
-        let bad_dir = vec![1.0e3_f64; u.len()];
-        let accepted = try_armijo_line_search::<DefaultTrainerBackend>(
-            &mut model, &mut u, &mut g, &mut loss, &bad_dir, 1.0, &ds, &mut ws,
-        );
-        assert!(accepted.is_none());
-        assert_eq!(u, orig_u);
-        assert!((model.pre_cab_u_gain[0] - orig_gain).abs() < 1.0e-12);
-
-        let good_dir: Vec<f64> = g.iter().map(|&v| -v).collect();
-        let slope = -DefaultTrainerBackend::sum_sq_f64(&g);
-        let prev_loss = loss;
-        let step = try_armijo_line_search::<DefaultTrainerBackend>(
-            &mut model, &mut u, &mut g, &mut loss, &good_dir, slope, &ds, &mut ws,
-        );
-        assert!(step.is_some());
-        assert!(loss < prev_loss);
-        assert_ne!(u, orig_u);
-    }
-
-    #[test]
-    fn test_opt_codec_chain_rule_matches_central_finite_diff() {
-        let stem = make_test_stem(400, 48);
-        let ds = V3TrainDataset::new(vec![stem], 48_000.0);
-        let mut ws = AdjointWorkspace::default();
-        let mut cold = V3ColdTierModel::identity_for_tier(Tier::Lite, true, false);
-        cold.svf.base_g = 0.08;
-        cold.svf.g_min = 0.085;
-        cold.svf.g_max = 0.125;
-        cold.svf.env_oct_sens = 1.3;
-        cold.svf.env_comp = 1.2;
-        cold.blocks[0].gate_mix = 0.25;
-        cold.blocks[0].gate_sharpness = 12.0;
-        cold.blocks[0].in_u_gain = [
-            1.4, -0.9, 0.7, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-        ];
-        let mut model = V3OptModelF64::from_cold_model(&cold);
-        let u = encode_model_u(&model);
-        decode_u_into_model(&u, &mut model);
-        let (_, grad_m) = evaluate_loss_and_grad_f64(&model, &ds, &mut ws);
-        let g_u = map_model_grad_to_u(&u, &model, &grad_m);
-
-        let h = 1.0e-6_f64;
-        for idx in (0..u.len())
-            .step_by(9)
-            .chain([2, 4, 5, 6, 13, 14, 36, 37, 41])
+    fn test_drop_guard_restores_best_model_on_early_abort() {
+        let m0 =
+            V3MatryoshkaOptF64::from_matryoshka_cold(&V3MatryoshkaModel::identity(false, true));
+        let mut m = m0.clone();
         {
-            if idx >= u.len() {
-                continue;
-            }
-            let (mut up, mut um) = (u.clone(), u.clone());
-            up[idx] += h;
-            um[idx] -= h;
-            let (mut mp, mut mm) = (model.clone(), model.clone());
-            decode_u_into_model(&up, &mut mp);
-            decode_u_into_model(&um, &mut mm);
-            let fd = (evaluate_loss_f64(&mp, &ds, &mut ws) - evaluate_loss_f64(&mm, &ds, &mut ws))
-                / (2.0 * h);
-            let err = (g_u[idx] - fd).abs();
-            let scale = g_u[idx].abs().max(fd.abs()).max(1.0);
-            assert!(
-                err / scale < 5.0e-4,
-                "codec u[{idx}] grad={}, fd={fd}",
-                g_u[idx]
-            );
+            let _guard = ModelBestGuard {
+                best: m0.clone(),
+                best_loss: 1.0,
+                target: &mut m,
+                committed: false,
+            };
         }
+        assert_eq!(m.svf_base_g, m0.svf_base_g);
     }
 }

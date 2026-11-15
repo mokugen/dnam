@@ -765,18 +765,20 @@ pub fn solve_from_responses(
             let is_freeze = stim.freeze_transition_window.is_some();
             let meta = build_controls_meta_map(&manifest, &stim.control_values, &sw_overrides);
             let (inpc, mut spec, lag, pol) = align_full_stem_and_seal_vault_with_override(
-                &stim.stem_id,
-                is_star,
-                &seed_256,
-                &sched.carrier_bins,
-                2,
-                &dry_48k_l,
-                dry_48k_r.as_deref(),
-                &wet_48k_l,
-                wet_48k_r.as_deref(),
-                windows,
-                meta,
-                BTreeMap::new(),
+                super::sealing::StemSealRequest {
+                    stem_id: &stim.stem_id,
+                    is_star_center: is_star,
+                    seed_256: &seed_256,
+                    carrier_bins: &sched.carrier_bins,
+                    valid_frames: 2,
+                    dry_48k_l: &dry_48k_l,
+                    dry_48k_r: dry_48k_r.as_deref(),
+                    wet_48k_l: &wet_48k_l,
+                    wet_48k_r: wet_48k_r.as_deref(),
+                    windows,
+                    controls_meta: meta,
+                    user_metadata: BTreeMap::new(),
+                },
                 if is_star || is_freeze {
                     None
                 } else {

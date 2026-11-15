@@ -89,5 +89,16 @@ mod tests {
         // Stripping an already-Lite container to Pro clamps cleanly to Lite
         let clamped_lite = strip_container_to_tier(&lite_stripped, Tier::Pro).unwrap();
         assert_eq!(clamped_lite, lite_stripped);
+
+        // Corrupted header prefix must trigger header Crc32cMismatch
+        let mut corrupt_hdr = container.clone();
+        corrupt_hdr[crate::container::V2_HEADER_OFFSET] ^= 0x01;
+        assert!(matches!(
+            strip_container_to_tier(&corrupt_hdr, Tier::Lite),
+            Err(DnamError::Crc32cMismatch {
+                region: "header",
+                ..
+            })
+        ));
     }
 }

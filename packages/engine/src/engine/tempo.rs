@@ -473,6 +473,32 @@ mod tests {
         assert!((snap.clamped_controls[0] - 5.0).abs() < 1e-3);
         assert!((snap.clamped_controls[1] - 2.0).abs() < 1e-3);
 
+        // Direct resolve_sync_updates + resolve_sync_updates_into + extreme-BPM clamp mask + >3s pause tap reset
+        let direct = TempoSyncState::resolve_sync_updates(&header, 120.0, None, false);
+        assert_eq!(direct.len(), 2);
+        let mut buf = [(0usize, 0.0_f32); 16];
+        let into_n =
+            TempoSyncState::resolve_sync_updates_into(&header, 120.0, None, false, &mut buf);
+        assert_eq!(into_n, 2);
+        let mut mask = 0u16;
+        let clamped_n = TempoSyncState::resolve_sync_updates_with_clamp_mask_into(
+            &header,
+            5.0,
+            Some(TempoSubdivision::HalfDotted),
+            false,
+            &mut buf,
+            &mut mask,
+        );
+        assert_eq!(clamped_n, 2);
+
+        let mut tap_state = TempoSyncState::new();
+        tap_state.register_tap();
+        tap_state.advance_frames(24_000);
+        let bpm1 = tap_state.register_tap();
+        assert!((bpm1 - 120.0).abs() < 1.0);
+        tap_state.advance_frames(200_000); // > 3s resets interval history
+        tap_state.register_tap();
+
         engine.set_bypass(true, false);
         assert_eq!(engine.bypass_state(), (true, false));
         let mut l_out = [0.0_f32; 4];

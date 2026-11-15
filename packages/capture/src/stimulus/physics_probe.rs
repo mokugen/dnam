@@ -15,7 +15,10 @@ use super::fft::{
     ADAPTIVE_FRAME_SAMPLES, CYCLIC_PREFIX_SAMPLES, CYCLIC_WINDOW_SAMPLES, Complex64,
     fft_radix2_in_place, rfft_bins,
 };
-use super::physics_probe_tail::{analyze_decay_tail, detect_short_delay_and_chorus_lfo};
+pub(crate) mod echo_peaks;
+pub(crate) mod tail;
+
+use self::tail::{DecayTailInput, analyze_decay_tail, detect_short_delay_and_chorus_lfo};
 
 const SR_48K: f64 = 48_000.0;
 
@@ -62,17 +65,17 @@ pub(crate) fn extract_star_physics_from_audio(
     let dyn_stats = analyze_coreset_dynamics(dc_l, wc_l);
 
     // 4. Post-comb zero-input tail analysis (echo delays, feedback gains, RT60, BBD dark LPF, shimmer, LFO).
-    let tail_stats = analyze_decay_tail(
-        coreset_dry_l,
-        coreset_wet_l,
-        coreset_wet_r,
-        comb_dry_l,
+    let tail_stats = analyze_decay_tail(&DecayTailInput {
+        cs_dry_l: coreset_dry_l,
+        cs_wet_l: coreset_wet_l,
+        cs_wet_r: coreset_wet_r,
+        comb_dry: comb_dry_l,
         comb_wet_l,
         comb_wet_r,
         tail_wet_l,
         tail_wet_r,
-        spec.mid_hf_ratio,
-    );
+        comb_hf_ratio: spec.mid_hf_ratio,
+    });
 
     // 5. Short-delay (1.5..22 ms) reflection & comb/coreset stereo LFO detection.
     let (short_delay_ms, short_delay_gain, chorus_lfo_hz, chorus_lfo_depth) =

@@ -366,6 +366,10 @@ mod spec_tests {
             br#"{"name":"\ud800"}"#.as_slice(),
             br#"{"name":"\ufdd0"}"#.as_slice(),
             br#"{"name":"\uffff"}"#.as_slice(),
+            br#"{"\ufdd0":1}"#.as_slice(),
+            &[0xEF, 0xBB, 0xBF, b'{', b'}'],
+            &[0xFF, b'{', b'}'],
+            b"{\"a\":\"\x01\"}".as_slice(),
             b"{\"\\".as_slice(),
             b"{\"unclosed".as_slice(),
             b"[]".as_slice(),
@@ -373,6 +377,28 @@ mod spec_tests {
             assert!(parse_strict_json_object_bytes(bad).is_err());
             assert!(validate_canonical_jcs_header_bytes(bad, true).is_err());
         }
+
+        // Invalid nested field types in project_immutable_header_value
+        for bad_hdr in [
+            json!({"metadata": 1}),
+            json!({"controls_schema": 1}),
+            json!({"controls_schema": [1]}),
+            json!({"stems_registry": 1}),
+            json!({"stems_registry": [1]}),
+            json!({"slimmable_tiers": 1}),
+            json!({"slimmable_tiers": {"lite": 1}}),
+        ] {
+            assert!(project_immutable_header_value(&bad_hdr).is_err());
+        }
+        assert!(project_immutable_header_value(&json!({"stems_registry": null})).is_ok());
+
+        // Scalar JCS serialization paths (null, bool, large ints, float rejection vs emission)
+        let scalar_arr = json!([null, true, false, 42, -7, 2.0, 1.5, ["\t\r\n"]]);
+        let rendered = serialize_jcs_value(&scalar_arr, false).unwrap();
+        assert_eq!(rendered, r#"[null,true,false,42,-7,2,1.5,["\t\r\n"]]"#);
+        assert!(serialize_jcs_value(&json!(1.5), true).is_err());
+        assert!(serialize_jcs_value(&json!(9_007_199_254_740_992_u64), true).is_err());
+        assert!(serialize_jcs_value(&json!(-9_007_199_254_740_992_i64), true).is_err());
     }
 }
 

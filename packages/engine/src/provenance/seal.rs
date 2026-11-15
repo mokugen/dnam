@@ -604,6 +604,16 @@ mod tests {
         assert!(DnamSealRecipientSlot::from_bytes(&[0u8; 16]).is_err());
 
         let mut header = DnamJsonHeader::default_reference();
+        header
+            .user_metadata
+            .insert(String::from("tag"), serde_json::json!("studio"));
+        header.presets.push(crate::schema::PresetDef {
+            id: String::from("p1"),
+            name: String::from("Preset 1"),
+            description: None,
+            controls: alloc::collections::BTreeMap::new(),
+            user_metadata: alloc::collections::BTreeMap::new(),
+        });
         let arena = alloc::vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
         let dnam = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
 
@@ -653,6 +663,11 @@ mod tests {
             &[3u8; 12],
         )
         .unwrap();
+        let unsealed_first_slot = unseal_dnam_container(&sealed, &crypto).unwrap();
+        assert_eq!(unsealed_first_slot.len(), dnam.len());
+        let wrong_id_crypto =
+            RustCryptoProvider::new().with_device_key("ffffffffffffffffffffffffffffffff", dev_sk);
+        assert!(unseal_dnam_container(&sealed, &wrong_id_crypto).is_err());
 
         // Corrupt num_recipients = 0
         let mut bad_n = sealed.clone();

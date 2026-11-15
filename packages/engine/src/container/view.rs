@@ -1,5 +1,7 @@
 //! Zero-copy canonical `v2.0` container view (`DnamContainerView`).
 
+pub mod auth;
+
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
@@ -9,7 +11,7 @@ use crate::control::{
 use crate::memory::{AlignedBuffer, ArenaStorage, CacheLine64};
 use crate::provenance::{
     CryptoProvider, DNSL_MAGIC, VerificationStatus, chacha20_xor_arena_blocks, decode_hex_array,
-    enforce_distribution_policy, unseal_dnam_container, verify_container_provenance,
+    unseal_dnam_container,
 };
 use crate::schema::{DnamError, DnamJsonHeader, DnamProtectionProfile};
 use crate::types::Tier;
@@ -294,30 +296,12 @@ impl<'a> DnamContainerView<'a> {
                 ArenaStorage::from_slice_or_copy(raw_arena)
             };
 
-        let has_authorized_devices = header
-            .metadata
-            .signatures
-            .as_ref()
-            .and_then(|s| s.marketplace_receipt.as_ref())
-            .is_some_and(|r| !r.authorized_devices.is_empty());
-        let protection_profile = if is_enclave_sealed_wrapper {
-            DnamProtectionProfile::EnclaveSealed
-        } else {
-            match layout.protection_profile {
-                0 if dcrc_encrypted || has_authorized_devices => {
-                    DnamProtectionProfile::DeviceAllowlisted
-                }
-                0 => DnamProtectionProfile::Open,
-                1 => DnamProtectionProfile::DeviceAllowlisted,
-                2 => DnamProtectionProfile::EnclaveSealed,
-                _ => {
-                    return Err(DnamError::SchemaValidationError(
-                        "invalid v2 protection_profile".to_string(),
-                    ));
-                }
-            }
-        };
-        enforce_distribution_policy(&header, protection_profile)?;
+        let protection_profile = auth::resolve_protection_profile_and_policy(
+            &header,
+            layout.protection_profile,
+            dcrc_encrypted,
+            is_enclave_sealed_wrapper,
+        )?;
 
         let plain_bytes = arena_storage.as_bytes();
         if maybe_dcrc.is_some() {
@@ -329,128 +313,18 @@ impl<'a> DnamContainerView<'a> {
         let (clamp_descriptors, cp1_contributors, control_records) =
             decode_shared_controls_extent(shared_slice, &header)?;
 
-        let verification_status = if auth_slice.starts_with(b"DAU1") || layout.auth_kind > 0 {
-            let env = crate::provenance::Dau1Envelope::from_bytes(auth_slice)?;
-            if env.auth_kind != layout.auth_kind {
-                return Err(DnamError::CryptoVerificationFailed(
-                    "DAU1 auth_kind mismatch with preamble",
-                ));
-            }
-            let shared_framing = crate::provenance::build_plaintext_shared_v1(
-                &bytes[0..64],
-                &bytes[64..192],
-                shared_slice,
-            );
-            let hdr_sha = crate::provenance::sha256_digest(json_slice);
-            let mut tier_slices_vec = Vec::with_capacity((retained_tier as usize) + 1);
-            let mut prev_t = layout.tier_start;
-            for t_idx in 0..=(retained_tier as usize) {
-                let end_t = layout.tier_ends[t_idx];
-                tier_slices_vec.push(&bytes[prev_t..end_t]);
-                prev_t = end_t;
-            }
-            if env.auth_kind == 0 {
-                if env.creator_max_tier != layout.maximum_tier {
-                    return Err(DnamError::CryptoVerificationFailed(
-                        "DAU1 creator_max_tier mismatch with preamble",
-                    ));
-                }
-                let prefixes = crate::provenance::compute_plaintext_prefixes_v1(
-                    b"DNAM-MASTER-PREFIX-V1",
-                    &hdr_sha,
-                    &shared_framing,
-                    &tier_slices_vec,
-                )?;
-                for (t_idx, pfx) in prefixes.iter().enumerate() {
-                    if env.master_prefixes.get(t_idx) != Some(pfx) {
-                        return Err(DnamError::CryptoVerificationFailed(
-                            "DAU1 master tier prefix digest mismatch",
-                        ));
-                    }
-                }
-            }
-            let creator_manifest = crate::provenance::build_creator_manifest_v1(
-                &env.creator_pubkey,
-                &hdr_sha,
-                &env.master_prefixes,
-            )?;
-            crypto.ed25519_verify(
-                &env.creator_pubkey,
-                &creator_manifest,
-                &env.creator_signature,
-            )?;
-            if env.auth_kind == 1 {
-                let m_pub = env
-                    .marketplace_pubkey
-                    .ok_or(DnamError::CryptoVerificationFailed(
-                        "missing DAU1 marketplace_pubkey",
-                    ))?;
-                if let Some(pinned_mp) = crypto.marketplace_pubkey()
-                    && &m_pub != pinned_mp
-                {
-                    return Err(DnamError::CryptoVerificationFailed(
-                        "DAU1 marketplace_pubkey mismatch against pinned trusted marketplace key",
-                    ));
-                }
-                let b_max = env
-                    .buyer_max_tier
-                    .ok_or(DnamError::CryptoVerificationFailed(
-                        "missing DAU1 buyer_max_tier",
-                    ))?;
-                if b_max != layout.maximum_tier || b_max > env.creator_max_tier {
-                    return Err(DnamError::CryptoVerificationFailed(
-                        "DAU1 buyer_max_tier mismatch with preamble or creator_max_tier",
-                    ));
-                }
-                let m_sig =
-                    env.marketplace_signature
-                        .ok_or(DnamError::CryptoVerificationFailed(
-                            "missing DAU1 marketplace_signature",
-                        ))?;
-                let buyer_prefixes = crate::provenance::compute_plaintext_prefixes_v1(
-                    b"DNAM-BUYER-PREFIX-V1",
-                    &hdr_sha,
-                    &shared_framing,
-                    &tier_slices_vec,
-                )?;
-                for (t_idx, bpfx) in buyer_prefixes.iter().enumerate() {
-                    if env.buyer_prefixes.get(t_idx) != Some(bpfx) {
-                        return Err(DnamError::CryptoVerificationFailed(
-                            "DAU1 buyer tier prefix digest mismatch",
-                        ));
-                    }
-                }
-                let creator_signed_sha = crate::provenance::compute_creator_signed_manifest_sha256(
-                    &creator_manifest,
-                    &env.creator_signature,
-                );
-                let policy_sha =
-                    crate::provenance::compute_license_policy_sha256(&env.policy_bytes);
-                let buyer_receipt = crate::provenance::build_buyer_receipt_v1(
-                    &m_pub,
-                    &creator_signed_sha,
-                    &policy_sha,
-                    layout.protection_profile,
-                    &env.buyer_prefixes,
-                    None,
-                    &[],
-                )?;
-                crypto.ed25519_verify(&m_pub, &buyer_receipt, &m_sig)?;
-                VerificationStatus::MarketplaceVerified {
-                    signer_id: header.metadata.author.clone().unwrap_or_default(),
-                    marketplace_id: alloc::string::String::from("dnam-marketplace"),
-                    license_id: alloc::string::String::from("dau1"),
-                    license_tier: Tier::from_u8(b_max).as_str().to_string(),
-                }
-            } else {
-                VerificationStatus::CreatorVerified {
-                    signer_id: header.metadata.author.clone().unwrap_or_default(),
-                    pubkey_ed25519: env.creator_pubkey,
-                }
-            }
-        } else {
-            verify_container_provenance(&header, preamble.has_signatures(), plain_bytes, crypto)?
-        };
+        let verification_status = auth::verify_dau1_or_legacy_provenance(
+            bytes,
+            auth_slice,
+            json_slice,
+            shared_slice,
+            &layout,
+            &header,
+            preamble.has_signatures(),
+            retained_tier,
+            plain_bytes,
+            crypto,
+        )?;
 
         if !matches!(verification_status, VerificationStatus::Unsigned) {
             preamble.flags |= FLAG_HAS_SIGNATURES;
@@ -468,69 +342,6 @@ impl<'a> DnamContainerView<'a> {
             control_records,
             arena_storage,
         })
-    }
-
-    /// Verifies `arena_crc32c_lite`, `arena_crc32c_full`, `arena_crc32c_pro`, and `arena_crc32c_ultra`
-    /// over the available prefix of `plain_arena` in a single incremental pass.
-    pub fn verify_arena_prefix_crcs(
-        preamble: &DnamPreamble,
-        plain_arena: &[u8],
-    ) -> Result<(), DnamError> {
-        let lite_end = preamble.arena_offset_lite_end() as usize;
-        let mut crc = 0_u32;
-        if plain_arena.len() >= lite_end && lite_end > 0 {
-            crc = crc32c_update(0, &plain_arena[..lite_end]);
-            if crc != preamble.arena_crc32c_lite {
-                return Err(DnamError::Crc32cMismatch {
-                    region: "arena_lite",
-                    expected: preamble.arena_crc32c_lite,
-                    computed: crc,
-                });
-            }
-        }
-        let full_end = preamble.arena_offset_full_end() as usize;
-        if (preamble.flags & FLAG_HAS_FULL_DELTA) != 0
-            && plain_arena.len() >= full_end
-            && full_end > lite_end
-        {
-            crc = crc32c_update(crc, &plain_arena[lite_end..full_end]);
-            if crc != preamble.arena_crc32c_full {
-                return Err(DnamError::Crc32cMismatch {
-                    region: "arena_full",
-                    expected: preamble.arena_crc32c_full,
-                    computed: crc,
-                });
-            }
-        }
-        let pro_end = preamble.arena_offset_pro_end() as usize;
-        if (preamble.flags & FLAG_HAS_PRO_DELTA) != 0
-            && plain_arena.len() >= pro_end
-            && pro_end > full_end
-        {
-            crc = crc32c_update(crc, &plain_arena[full_end..pro_end]);
-            if crc != preamble.arena_crc32c_pro {
-                return Err(DnamError::Crc32cMismatch {
-                    region: "arena_pro",
-                    expected: preamble.arena_crc32c_pro,
-                    computed: crc,
-                });
-            }
-        }
-        let ultra_end = preamble.arena_offset_ultra_end() as usize;
-        if (preamble.flags & FLAG_HAS_ULTRA_DELTA) != 0
-            && plain_arena.len() >= ultra_end
-            && ultra_end > pro_end
-        {
-            crc = crc32c_update(crc, &plain_arena[pro_end..ultra_end]);
-            if crc != preamble.arena_crc32c_ultra {
-                return Err(DnamError::Crc32cMismatch {
-                    region: "arena_ultra",
-                    expected: preamble.arena_crc32c_ultra,
-                    computed: crc,
-                });
-            }
-        }
-        Ok(())
     }
 }
 
@@ -737,6 +548,48 @@ mod tests {
         let mut bad_crc = ultra_bytes.clone();
         bad_crc[layout.auth_extent.0 + 4] ^= 0x55;
         assert!(DnamContainerView::from_bytes(&bad_crc, &crypto).is_err());
+
+        #[cfg(feature = "crypto")]
+        {
+            use crate::provenance::{RustCryptoProvider, encode_hex, seal_dnam_container};
+            use crate::schema::OemDeviceCertificate;
+
+            let oem_seed = [21u8; 32];
+            let oem_pk = RustCryptoProvider::ed25519_pubkey_from_seed(&oem_seed);
+            let dev_sk = [22u8; 32];
+            let dev_pk = RustCryptoProvider::x25519_pubkey_from_secret(&dev_sk);
+            let dev_id = "0102030405060708090a0b0c0d0e0f10";
+            let cert_msg = crate::provenance::build_oem_device_cert_signing_message(
+                "darkglass",
+                "anagram",
+                dev_id,
+                &dev_pk,
+            );
+            let cert_sig = RustCryptoProvider::ed25519_sign(&oem_seed, &cert_msg);
+            let cert = OemDeviceCertificate {
+                oem_vendor: alloc::string::String::from("darkglass"),
+                model_code: alloc::string::String::from("anagram"),
+                device_id_hash: alloc::string::String::from(dev_id),
+                pubkey_x25519: encode_hex(&dev_pk),
+                oem_sig_ed25519: encode_hex(&cert_sig),
+            };
+            let sealed = seal_dnam_container(
+                &ultra_bytes,
+                &[cert],
+                &[("darkglass", oem_pk)],
+                &[1u8; 32],
+                &[2u8; 32],
+                &[4u8; 32],
+                &[3u8; 12],
+            )
+            .unwrap();
+            let dev_crypto = RustCryptoProvider::new().with_device_key(dev_id, dev_sk);
+            let owned_view = DnamContainerView::from_bytes(&sealed, &dev_crypto).unwrap();
+            assert_eq!(
+                owned_view.protection_profile,
+                DnamProtectionProfile::EnclaveSealed
+            );
+        }
 
         // 4. Invalid JSON header (with recomputed DCRC prefix CRC)
         let mut bad_json = ultra_bytes.clone();

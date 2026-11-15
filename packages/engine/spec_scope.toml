@@ -1054,6 +1054,10 @@ scope = "engine"
 scope = "out-of-scope"
 reason = "Repository-wide static source guardrail for coverage(off) and math/ macro_rules! verified in tests/test_guardrails.test.ts"
 
+[rules."repo.code.modular-decomposition-and-tests"]
+scope = "out-of-scope"
+reason = "Repository-wide modular decomposition, zero code-golfing, and co-located unit-test guardrail verified in tests/test_guardrails.test.ts"
+
 [rules."arch.simd.two-level-traits"]
 scope = "engine"
 

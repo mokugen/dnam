@@ -19,6 +19,26 @@ pub fn recip_nr3_pos_f32(d: f32) -> f32 {
     y * (2.0 - d_safe * y)
 }
 
+/// 4-lane SIMD positive reciprocal `1.0 / d` (`d` clamped to `>= 1.0e-6`) using IEEE-754 integer
+/// seed `0x7EF1_27EA` followed by 3 SIMD FMA/FMS Newton steps (`0 FDIV`, `< 1 ULP`).
+#[inline(always)]
+#[must_use]
+pub fn recip_nr3_pos_vec4<B: MathBackend>(d: B::Vec4) -> B::Vec4 {
+    let d_safe = d.max(B::Vec4::splat(1.0e-6));
+    let arr = d_safe.to_array();
+    let seeds = [
+        f32::from_bits(0x7EF1_27EA_u32.wrapping_sub(arr[0].to_bits())),
+        f32::from_bits(0x7EF1_27EA_u32.wrapping_sub(arr[1].to_bits())),
+        f32::from_bits(0x7EF1_27EA_u32.wrapping_sub(arr[2].to_bits())),
+        f32::from_bits(0x7EF1_27EA_u32.wrapping_sub(arr[3].to_bits())),
+    ];
+    let two = B::Vec4::splat(2.0);
+    let mut y = B::Vec4::from_array(seeds);
+    y = y.mul(two.fms(d_safe, y));
+    y = y.mul(two.fms(d_safe, y));
+    y.mul(two.fms(d_safe, y))
+}
+
 /// Fast inverse square root `1.0 / sqrt(d)` (`d` clamped to `>= 1.0e-12`) using Quake III /
 /// IEEE-754 seed `0x5F37_5A86` followed by 3 Newton–Raphson iterations (`0 FSQRT`, `0 FDIV`).
 #[inline(always)]
@@ -96,15 +116,24 @@ pub fn exp2_signed_oct_f32(oct: f32) -> f32 {
     f32::from_bits(exp_bits) * poly
 }
 
+/// 5th-order division-free bilinear `tan(w_half)` frequency pre-warping (`0 FDIV`, `0 libm`).
+#[inline(always)]
+#[must_use]
+pub fn tan_prewarp_f32(w_half: f32) -> f32 {
+    let x = w_half.clamp(1.0e-4, 0.95);
+    let x2 = x * x;
+    x * (1.0 + x2 * ((1.0 / 3.0) + (2.0 / 15.0) * x2))
+}
+
 /// Stage I Envelope-Warped 2-Section Cytomic TPT SVF parameters (`48 kHz` host-rate).
-#[repr(C, align(64))]
+#[repr(C, align(32))]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct V3Stage1SvfParams {
     /// Resting Section-1 integrator coefficient $g_0 = \tan(\pi f_0 / f_s) \in [10^{-4}, 1.45]$.
     pub base_g: f32,
     /// Section-2 frequency multiplier `g2_base / g1_base in [0.25, 4.0]`.
     pub sec2_g_ratio: f32,
-    /// Envelope-to-octave sensitivity in `[-16.0, 16.0]` octaves.
+    /// Envelope-to-octave sensitivity in `[-24.0, 24.0]` octaves.
     pub env_oct_sens: f32,
     /// Algebraic envelope compression factor `>= 0.0` (`env / sqrt(1 + env_comp * env^2)`).
     pub env_comp: f32,
@@ -165,7 +194,7 @@ impl V3Stage1SvfParams {
             sec2_hp_feed: 0.0,
             stereo_link: 0.5,
             g_min: 1.0e-4,
-            g_max: 1.45,
+            g_max: 0.95,
             _pad: 0.0,
             stage2_feed_taps: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
             direct_taps_l: [0.0; 8],
@@ -175,9 +204,9 @@ impl V3Stage1SvfParams {
 
     /// Clamps nonlinear physical/stability parameters into unconditional passivity bounds.
     pub fn clamp_in_place(&mut self) {
-        self.base_g = self.base_g.clamp(1.0e-4, 1.45);
+        self.base_g = self.base_g.clamp(1.0e-4, 0.95);
         self.sec2_g_ratio = self.sec2_g_ratio.clamp(0.25, 4.0);
-        self.env_oct_sens = self.env_oct_sens.clamp(-16.0, 16.0);
+        self.env_oct_sens = self.env_oct_sens.clamp(-24.0, 24.0);
         self.env_comp = self.env_comp.clamp(0.0, 16.0);
         self.atk_alpha = self.atk_alpha.clamp(0.001, 0.9999);
         self.rel_alpha = self.rel_alpha.clamp(0.001, 0.99995);
@@ -188,8 +217,8 @@ impl V3Stage1SvfParams {
         self.sec2_bp_feed = self.sec2_bp_feed.clamp(-2.0, 2.0);
         self.sec2_hp_feed = self.sec2_hp_feed.clamp(-2.0, 2.0);
         self.stereo_link = self.stereo_link.clamp(0.0, 1.0);
-        self.g_min = self.g_min.clamp(1.0e-4, 1.45);
-        self.g_max = self.g_max.clamp(self.g_min, 1.45);
+        self.g_min = self.g_min.clamp(1.0e-4, 0.95);
+        self.g_max = self.g_max.clamp(self.g_min, 0.95);
         self._pad = 0.0;
         self.stage2_feed_taps[7] = 0.0;
         self.direct_taps_l[7] = 0.0;
@@ -252,14 +281,14 @@ impl V3Stage1SvfState {
             + taps[6] * w[6]
     }
 
-    /// Steps stereo Stage I SVF for one host sample pair, returning `([u_s2_l, u_s2_r], [dir_l, dir_r])`.
+    /// Steps stereo Stage I SVF for one host sample pair, returning `([u_s2_l, u_s2_r], [dir_l, dir_r], [taps_l, taps_r])`.
     #[inline(always)]
-    pub fn step_stereo(
+    pub fn step_stereo_with_taps(
         &mut self,
         params: &V3Stage1SvfParams,
         x_l: f32,
         x_r: f32,
-    ) -> ([f32; 2], [f32; 2]) {
+    ) -> ([f32; 2], [f32; 2], [[f32; 7]; 2]) {
         let lp_a = params.det_lp_pole;
         let lp_b = 1.0 - lp_a;
         self.det_lp_l = flush_recursive_state_f32(lp_a * self.det_lp_l + lp_b * x_l);
@@ -288,10 +317,12 @@ impl V3Stage1SvfState {
         let e_l = self.env_l * rsqrt_nr3_f32(1.0 + params.env_comp * self.env_l * self.env_l);
         let e_r = self.env_r * rsqrt_nr3_f32(1.0 + params.env_comp * self.env_r * self.env_r);
 
-        let g1_l = (params.base_g * exp2_signed_oct_f32(params.env_oct_sens * e_l))
+        let w1_l = (params.base_g * exp2_signed_oct_f32(params.env_oct_sens * e_l))
             .clamp(params.g_min, params.g_max);
-        let g1_r = (params.base_g * exp2_signed_oct_f32(params.env_oct_sens * e_r))
+        let w1_r = (params.base_g * exp2_signed_oct_f32(params.env_oct_sens * e_r))
             .clamp(params.g_min, params.g_max);
+        let g1_l = tan_prewarp_f32(w1_l).clamp(1.0e-4, 1.45);
+        let g1_r = tan_prewarp_f32(w1_r).clamp(1.0e-4, 1.45);
         let g2_l = (g1_l * params.sec2_g_ratio).clamp(1.0e-4, 1.45);
         let g2_r = (g1_r * params.sec2_g_ratio).clamp(1.0e-4, 1.45);
 
@@ -338,6 +369,104 @@ impl V3Stage1SvfState {
             Self::dot7(&taps_l, &params.direct_taps_l),
             Self::dot7(&taps_r, &params.direct_taps_r),
         ];
+        (u_s2, direct, [taps_l, taps_r])
+    }
+
+    /// Steps stereo Stage I SVF for one host sample pair, returning `([u_s2_l, u_s2_r], [dir_l, dir_r])`.
+    #[inline(always)]
+    pub fn step_stereo(
+        &mut self,
+        params: &V3Stage1SvfParams,
+        x_l: f32,
+        x_r: f32,
+    ) -> ([f32; 2], [f32; 2]) {
+        let (u_s2, direct, _) = self.step_stereo_with_taps(params, x_l, x_r);
         (u_s2, direct)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_step_stereo_with_taps_matches_step_stereo_and_basis() {
+        let mut params = V3Stage1SvfParams::identity_bypass();
+        params.base_g = 0.04;
+        params.sec2_g_ratio = 1.4;
+        params.env_oct_sens = 3.2;
+        params.stage2_feed_taps = [0.25, 0.4, 0.3, -0.1, 0.2, 0.15, -0.05, 0.0];
+        params.direct_taps_l = [0.1, -0.2, 0.35, 0.05, 0.15, -0.1, 0.2, 0.0];
+        params.direct_taps_r = [-0.05, 0.25, -0.15, 0.3, 0.1, 0.2, -0.1, 0.0];
+        params.clamp_in_place();
+
+        let (mut st_a, mut st_b) = (V3Stage1SvfState::default(), V3Stage1SvfState::default());
+        for i in 0..32 {
+            let xl = 0.35 * ((i as f32) * 0.19).sin();
+            let xr = -0.28 * ((i as f32) * 0.23).cos();
+            let (ua, da) = st_a.step_stereo(&params, xl, xr);
+            let (ub, db, [tl, tr]) = st_b.step_stereo_with_taps(&params, xl, xr);
+            assert_eq!(ua[0].to_bits(), ub[0].to_bits());
+            assert_eq!(ua[1].to_bits(), ub[1].to_bits());
+            assert_eq!(da[0].to_bits(), db[0].to_bits());
+            assert_eq!(da[1].to_bits(), db[1].to_bits());
+            assert_eq!(tl[0], xl);
+            assert_eq!(tr[0], xr);
+            let recon_ul: f32 = (0..7).map(|k| tl[k] * params.stage2_feed_taps[k]).sum();
+            let recon_dr: f32 = (0..7).map(|k| tr[k] * params.direct_taps_r[k]).sum();
+            assert!((recon_ul - ub[0]).abs() < 1.0e-7);
+            assert!((recon_dr - db[1]).abs() < 1.0e-7);
+        }
+    }
+
+    #[test]
+    fn test_svf_primitives_vec4_backends_and_reset() {
+        use crate::math::{DefaultMathBackend, ScalarBackend};
+
+        assert!((recip_nr3_pos_f32(8.0) - 0.125).abs() < 1.0e-6);
+        assert!((rsqrt_nr3_f32(9.0) - (1.0 / 3.0)).abs() < 1.0e-6);
+        assert!(exp2_signed_oct_f32(-4.0) > 0.0 && exp2_signed_oct_f32(4.0) > 1.0);
+        assert!(tan_prewarp_f32(0.05) > 0.0 && tan_prewarp_f32(1.4) > 0.0);
+
+        let vx_s = <ScalarBackend as MathBackend>::Vec4::load(&[-2.0, -0.5, 0.5, 2.0]);
+        let bias_s = <ScalarBackend as MathBackend>::Vec4::splat(0.15);
+        let bias0_s = algebraic_softclip_vec4::<ScalarBackend>(bias_s);
+        let _ = (
+            recip_nr3_pos_vec4::<ScalarBackend>(<ScalarBackend as MathBackend>::Vec4::splat(2.0)),
+            rsqrt_nr3_vec4::<ScalarBackend>(<ScalarBackend as MathBackend>::Vec4::splat(4.0)),
+            zero_dc_asym_sat_vec4::<ScalarBackend>(vx_s, bias_s, bias0_s),
+        );
+        let vx_d = <DefaultMathBackend as MathBackend>::Vec4::load(&[-2.0, -0.5, 0.5, 2.0]);
+        let bias_d = <DefaultMathBackend as MathBackend>::Vec4::splat(0.15);
+        let bias0_d = algebraic_softclip_vec4::<DefaultMathBackend>(bias_d);
+        let _ = (
+            recip_nr3_pos_vec4::<DefaultMathBackend>(
+                <DefaultMathBackend as MathBackend>::Vec4::splat(2.0),
+            ),
+            rsqrt_nr3_vec4::<DefaultMathBackend>(<DefaultMathBackend as MathBackend>::Vec4::splat(
+                4.0,
+            )),
+            zero_dc_asym_sat_vec4::<DefaultMathBackend>(vx_d, bias_d, bias0_d),
+        );
+
+        let mut svf_params = V3Stage1SvfParams {
+            base_g: 0.12,
+            sec2_g_ratio: 1.4,
+            env_oct_sens: 2.0,
+            det_hp_mix: 0.3,
+            sec2_bp_feed: 0.25,
+            sec2_hp_feed: 0.15,
+            direct_taps_l: [0.1; 8],
+            direct_taps_r: [0.1; 8],
+            ..V3Stage1SvfParams::identity_bypass()
+        };
+        svf_params.clamp_in_place();
+        let mut svf_state = V3Stage1SvfState::default();
+        let (u_s2, direct, taps) = svf_state.step_stereo_with_taps(&svf_params, 0.4, -0.3);
+        assert!(u_s2[0].is_finite() && direct[0].is_finite() && taps[0][0].is_finite());
+        let (sl_pair, sr_pair) = svf_state.step_stereo(&svf_params, 0.3, -0.3);
+        assert!(sl_pair[0].is_finite() && sr_pair[0].is_finite());
+        svf_state.reset();
+        assert_eq!(svf_state, V3Stage1SvfState::default());
     }
 }

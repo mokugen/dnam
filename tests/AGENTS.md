@@ -1,6 +1,6 @@
-# `tests/` — Monorepo Guardrail Suite Routing Guide
+# `tests/` — Highest-Level Monorepo Integration & Guardrail Suite
 
-Top-level guardrail suite (`moon check tests`) enforcing [`project_and_documentation_quality.md`](../docs/specs/architecture/project_and_documentation_quality.md) (`r[repo.*]`) and [`system_goals_and_requirements.md`](../docs/requirements/system_goals_and_requirements.md) (`REQ-1.1`–`REQ-8.8`).
+Highest-level workspace integration and guardrail test directory (`moon check tests`), verifying monorepo-wide invariants across [`project_and_documentation_quality.md`](../docs/specs/architecture/project_and_documentation_quality.md) (`r[repo.*]`) and [`system_goals_and_requirements.md`](../docs/requirements/system_goals_and_requirements.md) (`REQ-1.1`–`REQ-8.8`). (Lower tiers: unit `#[cfg(test)]` in leaf submodules, inter-unit integration in parent `name.rs` files, and crate suites in `packages/*/tests/`.)
 
 | File / Domain | Spec Rules Enforced | Canonical Specification (SSOT) |
 | :--- | :--- | :--- |

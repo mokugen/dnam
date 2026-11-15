@@ -606,4 +606,14 @@ mod spec_tests {
             prop_assert!((w3[0] + w3[1] + w3[2] - 1.0).abs() < 1e-6);
         }
     }
+
+    #[test]
+    fn test_op_t_error_and_wrap_branches() {
+        assert!(admit_op_t_memory_budget(u64::MAX, 1, u64::MAX).is_err());
+        assert_eq!(op_t_branchless_wrap_index(5, 4), None);
+        assert_eq!(op_t_branchless_next_write(4, 4), None);
+        assert_eq!(bounded_q32_reader_position(1, 0, (4, 0), (10, 0)), None);
+        let (_, w, _) = eval_m2_pitch_grain_delays(100, 32, 20.0, 0.1).unwrap();
+        assert!((w[0] + w[1] - 1.0).abs() < 1e-9);
+    }
 }

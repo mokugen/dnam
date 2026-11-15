@@ -18,11 +18,15 @@ use dnam_engine::{DnamEngine, FtzDazGuard, Tier};
 use crate::proj::bundle::zero_arena_b_head_dc_bias;
 use crate::proj::schema::DnamProjManifest;
 
-use super::stage_a_id::{
+pub mod ext;
+pub mod id;
+pub mod refl;
+
+use self::id::{
     fit_deconvolved_stage3_stereo, identify_steiglitz_mcbride_and_linearity,
     solve_early_fir_64_stereo,
 };
-use super::stage_a_refl::{cancel_discrete_early_reflections, extract_stage4_reflection_delays};
+use self::refl::{cancel_discrete_early_reflections, extract_stage4_reflection_delays};
 
 /// Stage III contiguous `64`-tap (`1.33 ms`) Early FIR base offsets (`16 L + 16 R` `f32` per tier).
 pub const STAGE3_EARLY_FIR_BASES: [usize; 4] = [4_288, 17_408, 31_552, 48_512];
@@ -578,7 +582,7 @@ pub fn lift_stage_a_backbone(
     zero_arena_b_head_dc_bias(arena_64k);
 
     let n_fit = dry_lr.len().min(wet_lr.len()).min(12_000);
-    super::stage_a_ext::lift_v2_pre_s3(
+    self::ext::lift_v2_pre_s3(
         manifest,
         arena_64k,
         dry_lr,
@@ -829,7 +833,7 @@ pub fn lift_stage_a_backbone(
     for (k, &d) in ultra_delays.iter().enumerate() {
         write_f32_le(arena_64k, 48_896 + k * 4, d);
     }
-    super::stage_a_ext::lift_v2_post_s3_stage4(
+    self::ext::lift_v2_post_s3_stage4(
         manifest,
         arena_64k,
         &s3_ref_lr,

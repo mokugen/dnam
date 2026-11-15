@@ -1,367 +1,165 @@
 #![forbid(unsafe_code)]
-//! `f64` optimization parameter mirror (`V3OptModelF64`), `V3TrainDataset`, and 3-band LR4 filter bank.
+//! Double-precision Matryoshka `v3` Parameterization, Bezout-7 Filter Bank, and Dataset Containers.
 
 use std::f64::consts::PI;
 
 use dnam_engine::Tier;
 use dnam_engine::stages::v3_core::cascade::{
-    MAX_CASCADE_LANES, MAX_KAUTZ_POLES, NUM_CASCADE_BLOCKS, tier_cascade_lanes,
+    MAX_BLOCK_LANES, MAX_GROUPS, MAX_KAUTZ_POLES, MAX_TOTAL_GRU_LANES, NUM_GRU_BLOCKS,
+    NUM_IN_FEATS_B0, V3InputFeaturesParams, V3OversamplerParams,
 };
-use dnam_engine::stages::v3_core::svf::V3Stage1SvfParams;
-use dnam_engine::stages::v3_core::{V3CascadeBlockCold, V3ColdTierModel};
+use dnam_engine::stages::v3_core::{V3GruBlockCold, V3MatryoshkaModel, V3SvfParams, V3TierReadout};
 
-use crate::solver::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
+pub use super::bezout7::Bezout7FilterBank;
+pub use super::dataset::{V3TrainDataset, V3TrainStem};
 
-use super::gabor::{
-    AnalyticGaborBank, GaborAdjointScratch, GaborTargetSummary, build_gabor_target_summary,
-    eval_gabor_loss_and_adjoint_with_backend as gabor_loss_and_adjoint_with_backend,
-};
-
-pub(crate) const HB_A0: [f64; 2] = [0.079_866_426, 0.545_353_65];
-pub(crate) const HB_A1: [f64; 2] = [0.283_829_34, 0.834_411_89];
-
-/// Single labeled stereo capture stem for `v3` `VarPro` + adjoint system identification.
-#[derive(Clone, Debug)]
-pub struct V3TrainStem {
-    pub in_l: Vec<f32>,
-    pub in_r: Vec<f32>,
-    pub tgt_l: Vec<f32>,
-    pub tgt_r: Vec<f32>,
-    pub warmup: usize,
+/// Double-precision mirror of [`V3GruBlockCold`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct V3GruBlockF64 {
+    pub w_in_z: [[f64; MAX_BLOCK_LANES]; NUM_IN_FEATS_B0],
+    pub w_in_r: [[f64; MAX_BLOCK_LANES]; NUM_IN_FEATS_B0],
+    pub w_in_n: [[f64; MAX_BLOCK_LANES]; NUM_IN_FEATS_B0],
+    pub w_prev_z: [[f64; MAX_BLOCK_LANES]; MAX_BLOCK_LANES],
+    pub w_prev_r: [[f64; MAX_BLOCK_LANES]; MAX_BLOCK_LANES],
+    pub w_prev_n: [[f64; MAX_BLOCK_LANES]; MAX_BLOCK_LANES],
+    pub w_rec_z: [[f64; MAX_BLOCK_LANES]; MAX_BLOCK_LANES],
+    pub w_rec_r: [[f64; MAX_BLOCK_LANES]; MAX_BLOCK_LANES],
+    pub w_rec_n: [[f64; MAX_BLOCK_LANES]; MAX_BLOCK_LANES],
+    pub b_z: [f64; MAX_BLOCK_LANES],
+    pub b_r: [f64; MAX_BLOCK_LANES],
+    pub b_n: [f64; MAX_BLOCK_LANES],
+    pub k_sag: [f64; MAX_BLOCK_LANES],
+    pub k_quad: [f64; MAX_BLOCK_LANES],
 }
 
-#[inline(always)]
-fn step_bezout7_lp(x: f64, r: f64, omr: f64, u: &mut [f64; 7]) -> f64 {
-    let mut prev = x;
-    for stage in u.iter_mut() {
-        *stage = omr * prev + r * *stage;
-        prev = *stage;
-    }
-    35.0 * u[3] - 84.0 * u[4] + 70.0 * u[5] - 20.0 * u[6]
-}
-
-#[inline]
-fn accumulate_bezout7_lp_adjoint(dy: &[f64], r: f64, omr: f64, dx: &mut [f64]) {
-    let mut du_future = [0.0_f64; 7];
-    for t in (0..dy.len()).rev() {
-        let mut du = du_future;
-        let dy_t = dy[t];
-        du[3] += 35.0 * dy_t;
-        du[4] -= 84.0 * dy_t;
-        du[5] += 70.0 * dy_t;
-        du[6] -= 20.0 * dy_t;
-        for k in (1..7).rev() {
-            du_future[k] = r * du[k];
-            du[k - 1] += omr * du[k];
-        }
-        du_future[0] = r * du[0];
-        dx[t] += omr * du[0];
-    }
-}
-
-/// Exact degree-7 complementary Binomial/Bézout 3-band crossover (`250 Hz` & `2500 Hz`) matching
-/// `dnam_capture::metrics::try_split_bezout_3band_energies`.
-#[derive(Clone, Copy, Debug)]
-pub struct Bezout7FilterBank {
-    r1: f64,
-    omr1: f64,
-    r2: f64,
-    omr2: f64,
-}
-
-impl Bezout7FilterBank {
-    #[must_use]
-    pub fn new(sample_rate_hz: f64) -> Self {
-        let r1 = (-2.0 * PI * 250.0 / sample_rate_hz).exp();
-        let r2 = (-2.0 * PI * 2_500.0 / sample_rate_hz).exp();
-        Self {
-            r1,
-            omr1: 1.0 - r1,
-            r2,
-            omr2: 1.0 - r2,
-        }
-    }
-
-    pub fn split_3band(&self, x: &[f64], bands: &mut [Vec<f64>; 3]) {
-        let n = x.len();
-        for b in bands.iter_mut() {
-            b.resize(n, 0.0);
-        }
-        let (mut u1, mut u2) = ([0.0_f64; 7], [0.0_f64; 7]);
-        for t in 0..n {
-            let xt = x[t];
-            let l250 = step_bezout7_lp(xt, self.r1, self.omr1, &mut u1);
-            let l2500 = step_bezout7_lp(xt, self.r2, self.omr2, &mut u2);
-            bands[0][t] = l250;
-            bands[1][t] = l2500 - l250;
-            bands[2][t] = xt - l2500;
-        }
-    }
-
-    pub fn accumulate_adjoint(
-        &self,
-        d_bands: &[Vec<f64>; 3],
-        dx: &mut [f64],
-        dy_scratch: &mut [Vec<f64>; 2],
-    ) {
-        let n = dx.len();
-        for s in dy_scratch.iter_mut() {
-            s.resize(n, 0.0);
-        }
-        for t in 0..n {
-            let (dlf, dmf, dhf) = (d_bands[0][t], d_bands[1][t], d_bands[2][t]);
-            dy_scratch[0][t] = dlf - dmf;
-            dy_scratch[1][t] = dmf - dhf;
-            dx[t] += dhf;
-        }
-        accumulate_bezout7_lp_adjoint(&dy_scratch[0], self.r1, self.omr1, dx);
-        accumulate_bezout7_lp_adjoint(&dy_scratch[1], self.r2, self.omr2, dx);
-    }
-}
-
-/// Multi-stem training dataset with precomputed Bézout `bESR` and 24-band Gabor summaries.
-#[derive(Clone, Debug)]
-pub struct V3TrainDataset {
-    pub stems: Vec<V3TrainStem>,
-    pub sample_rate_hz: f64,
-    pub bank: Bezout7FilterBank,
-    pub stem_band_weights: Vec<[[f64; 3]; 2]>,
-    pub stem_weights: Vec<f64>,
-    pub gabor_bank: AnalyticGaborBank,
-    pub gabor_targets: Vec<[GaborTargetSummary; 2]>,
-    pub gabor_env_weight: f64,
-    pub gabor_ltas_weight: f64,
-}
-
-impl V3TrainDataset {
-    #[must_use]
-    pub fn new(stems: Vec<V3TrainStem>, sample_rate_hz: f64) -> Self {
-        let weighted = stems.into_iter().map(|s| (s, 1.0)).collect();
-        Self::new_weighted(weighted, sample_rate_hz)
-    }
-
-    #[must_use]
-    pub fn new_weighted(weighted_stems: Vec<(V3TrainStem, f64)>, sample_rate_hz: f64) -> Self {
-        let bank = Bezout7FilterBank::new(sample_rate_hz);
-        let gabor_bank = AnalyticGaborBank::new(sample_rate_hz);
-        let raw_sum: f64 = weighted_stems.iter().map(|(_, w)| w.max(0.0)).sum();
-        let fallback_w = 1.0 / (weighted_stems.len().max(1) as f64);
-
-        let mut stems = Vec::with_capacity(weighted_stems.len());
-        let mut stem_weights = Vec::with_capacity(weighted_stems.len());
-        let mut stem_band_weights = Vec::with_capacity(weighted_stems.len());
-        let mut gabor_targets = Vec::with_capacity(weighted_stems.len());
-        let mut bands = [Vec::new(), Vec::new(), Vec::new()];
-
-        for (st, w_raw) in weighted_stems {
-            let norm_w = if raw_sum > 0.0 {
-                w_raw.max(0.0) / raw_sum
-            } else {
-                fallback_w
-            };
-            let n = st
-                .tgt_l
-                .len()
-                .min(st.tgt_r.len())
-                .min(st.in_l.len())
-                .min(st.in_r.len());
-            let w = st.warmup.min(n);
-            let mut bw = [[0.0_f64; 3]; 2];
-            let mut gab_ch = [GaborTargetSummary::default(), GaborTargetSummary::default()];
-            for ch in 0..2 {
-                let src = if ch == 0 {
-                    &st.tgt_l[..n]
-                } else {
-                    &st.tgt_r[..n]
-                };
-                let x_f64: Vec<f64> = src.iter().map(|&v| v as f64).collect();
-                bank.split_3band(&x_f64, &mut bands);
-                let e_tot: f64 = x_f64[w..].iter().map(|&v| v * v).sum();
-                for b in 0..3 {
-                    let e_b: f64 = bands[b][w..].iter().map(|&v| v * v).sum();
-                    bw[ch][b] = norm_w / (3.0 * (e_b.max(1.0e-9 * e_tot) + 1.0e-15));
-                }
-                gab_ch[ch] = build_gabor_target_summary(&x_f64, w, &gabor_bank);
-            }
-            stems.push(st);
-            stem_weights.push(norm_w);
-            stem_band_weights.push(bw);
-            gabor_targets.push(gab_ch);
-        }
-
-        Self {
-            stems,
-            sample_rate_hz,
-            bank,
-            stem_band_weights,
-            stem_weights,
-            gabor_bank,
-            gabor_targets,
-            gabor_env_weight: 0.0,
-            gabor_ltas_weight: 0.0,
-        }
-    }
-
-    #[must_use]
-    pub fn with_gabor_weights(&self, gabor_env_weight: f64, gabor_ltas_weight: f64) -> Self {
-        let mut out = self.clone();
-        out.gabor_env_weight = gabor_env_weight.max(0.0);
-        out.gabor_ltas_weight = gabor_ltas_weight.max(0.0);
-        out
-    }
-
-    /// Evaluates the closed-form 24-band Gabor envelope + log-LTAS loss and accumulates its exact
-    /// overlap-add reverse adjoint into `grad_dy` when provided using backend `B`.
-    pub fn eval_gabor_loss_and_adjoint_with_backend<B: TrainerBackend>(
-        &self,
-        stem_idx: usize,
-        ch: usize,
-        ch_scale: f64,
-        y_mdl: &[f64],
-        grad_dy: Option<&mut [f64]>,
-        scratch: &mut GaborAdjointScratch,
-    ) -> f64 {
-        gabor_loss_and_adjoint_with_backend::<B>(
-            &self.gabor_bank,
-            &self.gabor_targets[stem_idx][ch],
-            y_mdl,
-            grad_dy,
-            self.stem_weights[stem_idx],
-            ch_scale,
-            self.gabor_env_weight,
-            self.gabor_ltas_weight,
-            scratch,
-        )
-    }
-
-    /// Evaluates the closed-form 24-band Gabor envelope + log-LTAS loss and accumulates its exact
-    /// overlap-add reverse adjoint into `grad_dy` when provided.
-    pub fn eval_gabor_loss_and_adjoint(
-        &self,
-        stem_idx: usize,
-        ch: usize,
-        ch_scale: f64,
-        y_mdl: &[f64],
-        grad_dy: Option<&mut [f64]>,
-        scratch: &mut GaborAdjointScratch,
-    ) -> f64 {
-        struct GaborEval<'a> {
-            ds: &'a V3TrainDataset,
-            stem_idx: usize,
-            ch: usize,
-            ch_scale: f64,
-            y_mdl: &'a [f64],
-            grad_dy: Option<&'a mut [f64]>,
-            scratch: &'a mut GaborAdjointScratch,
-        }
-        impl TrainerTask<f64> for GaborEval<'_> {
-            fn run<B: TrainerBackend>(self) -> f64 {
-                self.ds.eval_gabor_loss_and_adjoint_with_backend::<B>(
-                    self.stem_idx,
-                    self.ch,
-                    self.ch_scale,
-                    self.y_mdl,
-                    self.grad_dy,
-                    self.scratch,
-                )
-            }
-        }
-        DynamicTrainer::detect().dispatch(GaborEval {
-            ds: self,
-            stem_idx,
-            ch,
-            ch_scale,
-            y_mdl,
-            grad_dy,
-            scratch,
-        })
-    }
-}
-
-/// Complete `f64` mirror of [`V3CascadeBlockCold`] (used both for exact `f64` L-BFGS iterates and gradients).
-#[derive(Clone, Debug)]
-pub struct V3OptBlockF64 {
-    pub atk_alpha: f64,
-    pub rel_alpha: f64,
-    pub gate_mix: f64,
-    pub gate_sharpness: f64,
-    pub in_u_gain: [f64; MAX_CASCADE_LANES],
-    pub inter_mat: [[f64; MAX_CASCADE_LANES]; MAX_CASCADE_LANES],
-    pub lp_pole: [f64; MAX_CASCADE_LANES],
-    pub lp_mix: [f64; MAX_CASCADE_LANES],
-    pub hp_mix: [f64; MAX_CASCADE_LANES],
-    pub static_bias: [f64; MAX_CASCADE_LANES],
-    pub env_bias_sens: [f64; MAX_CASCADE_LANES],
-    pub skip_u_gain: [f64; MAX_CASCADE_LANES],
-    pub prev_skip_gain: [f64; MAX_CASCADE_LANES],
-}
-
-impl Default for V3OptBlockF64 {
+impl Default for V3GruBlockF64 {
     fn default() -> Self {
         Self {
-            atk_alpha: 0.0,
-            rel_alpha: 0.0,
-            gate_mix: 0.0,
-            gate_sharpness: 0.0,
-            in_u_gain: [0.0; MAX_CASCADE_LANES],
-            inter_mat: [[0.0; MAX_CASCADE_LANES]; MAX_CASCADE_LANES],
-            lp_pole: [0.0; MAX_CASCADE_LANES],
-            lp_mix: [0.0; MAX_CASCADE_LANES],
-            hp_mix: [0.0; MAX_CASCADE_LANES],
-            static_bias: [0.0; MAX_CASCADE_LANES],
-            env_bias_sens: [0.0; MAX_CASCADE_LANES],
-            skip_u_gain: [0.0; MAX_CASCADE_LANES],
-            prev_skip_gain: [0.0; MAX_CASCADE_LANES],
+            w_in_z: [[0.0; MAX_BLOCK_LANES]; NUM_IN_FEATS_B0],
+            w_in_r: [[0.0; MAX_BLOCK_LANES]; NUM_IN_FEATS_B0],
+            w_in_n: [[0.0; MAX_BLOCK_LANES]; NUM_IN_FEATS_B0],
+            w_prev_z: [[0.0; MAX_BLOCK_LANES]; MAX_BLOCK_LANES],
+            w_prev_r: [[0.0; MAX_BLOCK_LANES]; MAX_BLOCK_LANES],
+            w_prev_n: [[0.0; MAX_BLOCK_LANES]; MAX_BLOCK_LANES],
+            w_rec_z: [[0.0; MAX_BLOCK_LANES]; MAX_BLOCK_LANES],
+            w_rec_r: [[0.0; MAX_BLOCK_LANES]; MAX_BLOCK_LANES],
+            w_rec_n: [[0.0; MAX_BLOCK_LANES]; MAX_BLOCK_LANES],
+            b_z: [0.0; MAX_BLOCK_LANES],
+            b_r: [1.5; MAX_BLOCK_LANES],
+            b_n: [0.0; MAX_BLOCK_LANES],
+            k_sag: [0.0; MAX_BLOCK_LANES],
+            k_quad: [0.0; MAX_BLOCK_LANES],
         }
     }
 }
 
-impl V3OptBlockF64 {
+impl V3GruBlockF64 {
+    /// Returns an all-zero block (suitable as reverse-mode gradient accumulator).
     #[must_use]
-    pub fn from_cold(b: &V3CascadeBlockCold) -> Self {
-        let mut out = Self {
-            atk_alpha: b.atk_alpha as f64,
-            rel_alpha: b.rel_alpha as f64,
-            gate_mix: b.gate_mix as f64,
-            gate_sharpness: b.gate_sharpness as f64,
+    pub fn zeros() -> Self {
+        Self {
+            b_r: [0.0; MAX_BLOCK_LANES],
             ..Self::default()
-        };
-        for l in 0..MAX_CASCADE_LANES {
-            out.in_u_gain[l] = b.in_u_gain[l] as f64;
-            out.lp_pole[l] = b.lp_pole[l] as f64;
-            out.lp_mix[l] = b.lp_mix[l] as f64;
-            out.hp_mix[l] = b.hp_mix[l] as f64;
-            out.static_bias[l] = b.static_bias[l] as f64;
-            out.env_bias_sens[l] = b.env_bias_sens[l] as f64;
-            out.skip_u_gain[l] = b.skip_u_gain[l] as f64;
-            out.prev_skip_gain[l] = b.prev_skip_gain[l] as f64;
-            for s in 0..MAX_CASCADE_LANES {
-                out.inter_mat[l][s] = b.inter_mat[l][s] as f64;
+        }
+    }
+
+    /// Zeros strictly upper-triangular group entries so lower tiers remain causal prefixes.
+    pub fn enforce_lower_triangular(&mut self) {
+        for dst in 0..MAX_BLOCK_LANES {
+            let dst_g = dst >> 2;
+            for src in 0..MAX_BLOCK_LANES {
+                if (src >> 2) > dst_g {
+                    self.w_prev_z[dst][src] = 0.0;
+                    self.w_prev_r[dst][src] = 0.0;
+                    self.w_prev_n[dst][src] = 0.0;
+                    self.w_rec_z[dst][src] = 0.0;
+                    self.w_rec_r[dst][src] = 0.0;
+                    self.w_rec_n[dst][src] = 0.0;
+                }
             }
         }
+    }
+
+    /// Converts from cold `f32` engine representation.
+    #[must_use]
+    pub fn from_cold(c: &V3GruBlockCold) -> Self {
+        let mut out = Self::zeros();
+        for f in 0..NUM_IN_FEATS_B0 {
+            for l in 0..MAX_BLOCK_LANES {
+                out.w_in_z[f][l] = f64::from(c.w_in_z[f][l]);
+                out.w_in_r[f][l] = f64::from(c.w_in_r[f][l]);
+                out.w_in_n[f][l] = f64::from(c.w_in_n[f][l]);
+            }
+        }
+        for d in 0..MAX_BLOCK_LANES {
+            out.b_z[d] = f64::from(c.b_z[d]);
+            out.b_r[d] = f64::from(c.b_r[d]);
+            out.b_n[d] = f64::from(c.b_n[d]);
+            out.k_sag[d] = f64::from(c.k_sag[d]);
+            out.k_quad[d] = f64::from(c.k_quad[d]);
+            for s in 0..MAX_BLOCK_LANES {
+                out.w_prev_z[d][s] = f64::from(c.w_prev_z[d][s]);
+                out.w_prev_r[d][s] = f64::from(c.w_prev_r[d][s]);
+                out.w_prev_n[d][s] = f64::from(c.w_prev_n[d][s]);
+                out.w_rec_z[d][s] = f64::from(c.w_rec_z[d][s]);
+                out.w_rec_r[d][s] = f64::from(c.w_rec_r[d][s]);
+                out.w_rec_n[d][s] = f64::from(c.w_rec_n[d][s]);
+            }
+        }
+        out.enforce_lower_triangular();
         out
     }
 
+    /// Accumulates another block (e.g., per-stem gradient) element-wise into `self`.
+    pub fn add_assign(&mut self, rhs: &Self) {
+        for f in 0..NUM_IN_FEATS_B0 {
+            for l in 0..MAX_BLOCK_LANES {
+                self.w_in_z[f][l] += rhs.w_in_z[f][l];
+                self.w_in_r[f][l] += rhs.w_in_r[f][l];
+                self.w_in_n[f][l] += rhs.w_in_n[f][l];
+            }
+        }
+        for d in 0..MAX_BLOCK_LANES {
+            self.b_z[d] += rhs.b_z[d];
+            self.b_r[d] += rhs.b_r[d];
+            self.b_n[d] += rhs.b_n[d];
+            self.k_sag[d] += rhs.k_sag[d];
+            self.k_quad[d] += rhs.k_quad[d];
+            for s in 0..MAX_BLOCK_LANES {
+                self.w_prev_z[d][s] += rhs.w_prev_z[d][s];
+                self.w_prev_r[d][s] += rhs.w_prev_r[d][s];
+                self.w_prev_n[d][s] += rhs.w_prev_n[d][s];
+                self.w_rec_z[d][s] += rhs.w_rec_z[d][s];
+                self.w_rec_r[d][s] += rhs.w_rec_r[d][s];
+                self.w_rec_n[d][s] += rhs.w_rec_n[d][s];
+            }
+        }
+    }
+
+    /// Converts to clamped `f32` engine representation.
     #[must_use]
-    pub fn to_cold(&self) -> V3CascadeBlockCold {
-        let mut out = V3CascadeBlockCold {
-            atk_alpha: self.atk_alpha as f32,
-            rel_alpha: self.rel_alpha as f32,
-            gate_mix: self.gate_mix as f32,
-            gate_sharpness: self.gate_sharpness as f32,
-            ..V3CascadeBlockCold::default()
-        };
-        for l in 0..MAX_CASCADE_LANES {
-            out.in_u_gain[l] = self.in_u_gain[l] as f32;
-            out.lp_pole[l] = self.lp_pole[l] as f32;
-            out.lp_mix[l] = self.lp_mix[l] as f32;
-            out.hp_mix[l] = self.hp_mix[l] as f32;
-            out.static_bias[l] = self.static_bias[l] as f32;
-            out.env_bias_sens[l] = self.env_bias_sens[l] as f32;
-            out.skip_u_gain[l] = self.skip_u_gain[l] as f32;
-            out.prev_skip_gain[l] = self.prev_skip_gain[l] as f32;
-            for s in 0..MAX_CASCADE_LANES {
-                out.inter_mat[l][s] = self.inter_mat[l][s] as f32;
+    pub fn to_cold(&self) -> V3GruBlockCold {
+        let mut out = V3GruBlockCold::default();
+        for f in 0..NUM_IN_FEATS_B0 {
+            for l in 0..MAX_BLOCK_LANES {
+                out.w_in_z[f][l] = self.w_in_z[f][l] as f32;
+                out.w_in_r[f][l] = self.w_in_r[f][l] as f32;
+                out.w_in_n[f][l] = self.w_in_n[f][l] as f32;
+            }
+        }
+        for d in 0..MAX_BLOCK_LANES {
+            out.b_z[d] = self.b_z[d].clamp(-8.0, 8.2) as f32;
+            out.b_r[d] = self.b_r[d].clamp(-8.0, 8.2) as f32;
+            out.b_n[d] = self.b_n[d].clamp(-3.8, 3.8) as f32;
+            out.k_sag[d] = self.k_sag[d].clamp(0.0, 8.0) as f32;
+            out.k_quad[d] = self.k_quad[d].clamp(-0.45, 0.45) as f32;
+            for s in 0..MAX_BLOCK_LANES {
+                out.w_prev_z[d][s] = self.w_prev_z[d][s] as f32;
+                out.w_prev_r[d][s] = self.w_prev_r[d][s] as f32;
+                out.w_prev_n[d][s] = self.w_prev_n[d][s] as f32;
+                out.w_rec_z[d][s] = self.w_rec_z[d][s] as f32;
+                out.w_rec_r[d][s] = self.w_rec_r[d][s] as f32;
+                out.w_rec_n[d][s] = self.w_rec_n[d][s] as f32;
             }
         }
         out.clamp_in_place();
@@ -369,12 +167,154 @@ impl V3OptBlockF64 {
     }
 }
 
-/// Complete `f64` mirror of [`V3ColdTierModel`] (used for smooth L-BFGS optimization AND exact gradients).
-#[derive(Clone, Debug)]
-pub struct V3OptModelF64 {
-    pub tier: Tier,
+/// Double-precision mirror of [`V3TierReadout`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct V3TierReadoutF64 {
+    pub svf_direct_taps_l: [f64; 7],
+    pub svf_direct_taps_r: [f64; 7],
+    pub pre_cab_u_gain: [f64; 2],
+    pub pre_cab_hp_gain: [f64; 2],
+    pub pre_cab_w: [[f64; MAX_TOTAL_GRU_LANES]; 2],
+    pub direct_s2_u_gain: [f64; 2],
+    pub direct_s2_hp_gain: [f64; 2],
+    pub direct_s2_w: [[f64; MAX_TOTAL_GRU_LANES]; 2],
+    pub fir_l: [f64; 64],
+    pub fir_r: [f64; 64],
+    pub kautz_c_l: [(f64, f64); MAX_KAUTZ_POLES],
+    pub kautz_c_r: [(f64, f64); MAX_KAUTZ_POLES],
+}
+
+impl Default for V3TierReadoutF64 {
+    fn default() -> Self {
+        let mut r = Self::zeros();
+        r.pre_cab_u_gain = [1.0, 1.0];
+        r.fir_l[0] = 1.0;
+        r.fir_r[0] = 1.0;
+        r
+    }
+}
+
+impl V3TierReadoutF64 {
+    /// Returns an all-zero readout head (for gradient accumulation).
+    #[must_use]
+    pub fn zeros() -> Self {
+        Self {
+            svf_direct_taps_l: [0.0; 7],
+            svf_direct_taps_r: [0.0; 7],
+            pre_cab_u_gain: [0.0; 2],
+            pre_cab_hp_gain: [0.0; 2],
+            pre_cab_w: [[0.0; MAX_TOTAL_GRU_LANES]; 2],
+            direct_s2_u_gain: [0.0; 2],
+            direct_s2_hp_gain: [0.0; 2],
+            direct_s2_w: [[0.0; MAX_TOTAL_GRU_LANES]; 2],
+            fir_l: [0.0; 64],
+            fir_r: [0.0; 64],
+            kautz_c_l: [(0.0, 0.0); MAX_KAUTZ_POLES],
+            kautz_c_r: [(0.0, 0.0); MAX_KAUTZ_POLES],
+        }
+    }
+
+    /// Converts from `f32` engine readout head.
+    #[must_use]
+    pub fn from_cold(r: &V3TierReadout) -> Self {
+        let mut out = Self::zeros();
+        for i in 0..7 {
+            out.svf_direct_taps_l[i] = f64::from(r.svf_direct_taps_l[i]);
+            out.svf_direct_taps_r[i] = f64::from(r.svf_direct_taps_r[i]);
+        }
+        for ch in 0..2 {
+            out.pre_cab_u_gain[ch] = f64::from(r.pre_cab_u_gain[ch]);
+            out.pre_cab_hp_gain[ch] = f64::from(r.pre_cab_hp_gain[ch]);
+            out.direct_s2_u_gain[ch] = f64::from(r.direct_s2_u_gain[ch]);
+            out.direct_s2_hp_gain[ch] = f64::from(r.direct_s2_hp_gain[ch]);
+            for i in 0..MAX_TOTAL_GRU_LANES {
+                out.pre_cab_w[ch][i] = f64::from(r.pre_cab_w[ch][i]);
+                out.direct_s2_w[ch][i] = f64::from(r.direct_s2_w[ch][i]);
+            }
+        }
+        for i in 0..64 {
+            out.fir_l[i] = f64::from(r.fir_l[i]);
+            out.fir_r[i] = f64::from(r.fir_r[i]);
+        }
+        for m in 0..MAX_KAUTZ_POLES {
+            out.kautz_c_l[m] = (f64::from(r.kautz_c_l[m].0), f64::from(r.kautz_c_l[m].1));
+            out.kautz_c_r[m] = (f64::from(r.kautz_c_r[m].0), f64::from(r.kautz_c_r[m].1));
+        }
+        out
+    }
+
+    /// Converts to masked `f32` engine readout head for `tier`.
+    #[must_use]
+    pub fn to_cold(&self, tier: Tier) -> V3TierReadout {
+        let mut out = V3TierReadout::zeros();
+        for i in 0..7 {
+            out.svf_direct_taps_l[i] = self.svf_direct_taps_l[i] as f32;
+            out.svf_direct_taps_r[i] = self.svf_direct_taps_r[i] as f32;
+        }
+        for ch in 0..2 {
+            out.pre_cab_u_gain[ch] = self.pre_cab_u_gain[ch] as f32;
+            out.pre_cab_hp_gain[ch] = self.pre_cab_hp_gain[ch] as f32;
+            out.direct_s2_u_gain[ch] = self.direct_s2_u_gain[ch] as f32;
+            out.direct_s2_hp_gain[ch] = self.direct_s2_hp_gain[ch] as f32;
+            for i in 0..MAX_TOTAL_GRU_LANES {
+                out.pre_cab_w[ch][i] = self.pre_cab_w[ch][i] as f32;
+                out.direct_s2_w[ch][i] = self.direct_s2_w[ch][i] as f32;
+            }
+        }
+        for i in 0..64 {
+            out.fir_l[i] = self.fir_l[i] as f32;
+            out.fir_r[i] = self.fir_r[i] as f32;
+        }
+        for m in 0..MAX_KAUTZ_POLES {
+            out.kautz_c_l[m] = (self.kautz_c_l[m].0 as f32, self.kautz_c_l[m].1 as f32);
+            out.kautz_c_r[m] = (self.kautz_c_r[m].0 as f32, self.kautz_c_r[m].1 as f32);
+        }
+        out.mask_to_tier(tier);
+        out
+    }
+
+    /// Accumulates another readout (e.g., per-stem gradient) element-wise into `self`.
+    pub fn add_assign(&mut self, rhs: &Self) {
+        for i in 0..7 {
+            self.svf_direct_taps_l[i] += rhs.svf_direct_taps_l[i];
+            self.svf_direct_taps_r[i] += rhs.svf_direct_taps_r[i];
+        }
+        for ch in 0..2 {
+            self.pre_cab_u_gain[ch] += rhs.pre_cab_u_gain[ch];
+            self.pre_cab_hp_gain[ch] += rhs.pre_cab_hp_gain[ch];
+            self.direct_s2_u_gain[ch] += rhs.direct_s2_u_gain[ch];
+            self.direct_s2_hp_gain[ch] += rhs.direct_s2_hp_gain[ch];
+            for i in 0..MAX_TOTAL_GRU_LANES {
+                self.pre_cab_w[ch][i] += rhs.pre_cab_w[ch][i];
+                self.direct_s2_w[ch][i] += rhs.direct_s2_w[ch][i];
+            }
+        }
+        for i in 0..64 {
+            self.fir_l[i] += rhs.fir_l[i];
+            self.fir_r[i] += rhs.fir_r[i];
+        }
+        for m in 0..MAX_KAUTZ_POLES {
+            self.kautz_c_l[m].0 += rhs.kautz_c_l[m].0;
+            self.kautz_c_l[m].1 += rhs.kautz_c_l[m].1;
+            self.kautz_c_r[m].0 += rhs.kautz_c_r[m].0;
+            self.kautz_c_r[m].1 += rhs.kautz_c_r[m].1;
+        }
+    }
+}
+
+/// Complete double-precision single-run 4-tier Matryoshka `v3` optimization state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct V3MatryoshkaOptF64 {
     pub os2x: bool,
     pub mono_out: bool,
+    pub max_active_groups: usize,
+    pub active_tier_weights: [f64; 4],
+    pub os_up_quad: f64,
+    pub os_dec_c_prev1: f64,
+    pub os_dec_c0: f64,
+    pub os_up_pre_emph: f64,
+    pub os_dec_aa_mix: f64,
+    pub os_up_aa_mix: f64,
     pub svf_base_g: f64,
     pub svf_sec2_g_ratio: f64,
     pub svf_env_oct_sens: f64,
@@ -391,26 +331,33 @@ pub struct V3OptModelF64 {
     pub svf_g_min: f64,
     pub svf_g_max: f64,
     pub svf_stage2_feed_taps: [f64; 7],
-    pub svf_direct_taps_l: [f64; 7],
-    pub svf_direct_taps_r: [f64; 7],
-    pub blocks: [V3OptBlockF64; NUM_CASCADE_BLOCKS],
-    pub pre_cab_u_gain: [f64; 2],
-    pub pre_cab_w: [[f64; MAX_CASCADE_LANES]; 2],
-    pub direct_s2_w: [[f64; MAX_CASCADE_LANES]; 2],
-    pub fir_l: [f64; 64],
-    pub fir_r: [f64; 64],
+    pub feat_in_hp_beta: f64,
+    pub feat_fast_atk_beta: f64,
+    pub feat_fast_rel_beta: f64,
+    pub feat_pinch_k: f64,
+    pub feat_slow_atk_beta: f64,
+    pub feat_slow_rel_beta: f64,
+    pub feat_slow_det_comp: f64,
+    pub blocks: [V3GruBlockF64; NUM_GRU_BLOCKS],
     pub kautz_poles: [(f64, f64); MAX_KAUTZ_POLES],
-    pub kautz_c_l: [(f64, f64); MAX_KAUTZ_POLES],
-    pub kautz_c_r: [(f64, f64); MAX_KAUTZ_POLES],
+    pub readouts: [V3TierReadoutF64; 4],
 }
 
-impl V3OptModelF64 {
+impl V3MatryoshkaOptF64 {
+    /// Returns an all-zero gradient accumulator with matching structural flags and weights.
     #[must_use]
-    pub fn zeros(tier: Tier, os2x: bool, mono_out: bool) -> Self {
+    pub fn zero_like(&self) -> Self {
         Self {
-            tier,
-            os2x,
-            mono_out,
+            os2x: self.os2x,
+            mono_out: self.mono_out,
+            max_active_groups: self.max_active_groups,
+            active_tier_weights: self.active_tier_weights,
+            os_up_quad: 0.0,
+            os_dec_c_prev1: 0.0,
+            os_dec_c0: 0.0,
+            os_up_pre_emph: 0.0,
+            os_dec_aa_mix: 0.0,
+            os_up_aa_mix: 0.0,
             svf_base_g: 0.0,
             svf_sec2_g_ratio: 0.0,
             svf_env_oct_sens: 0.0,
@@ -427,206 +374,201 @@ impl V3OptModelF64 {
             svf_g_min: 0.0,
             svf_g_max: 0.0,
             svf_stage2_feed_taps: [0.0; 7],
-            svf_direct_taps_l: [0.0; 7],
-            svf_direct_taps_r: [0.0; 7],
-            blocks: [
-                V3OptBlockF64::default(),
-                V3OptBlockF64::default(),
-                V3OptBlockF64::default(),
-            ],
-            pre_cab_u_gain: [0.0; 2],
-            pre_cab_w: [[0.0; MAX_CASCADE_LANES]; 2],
-            direct_s2_w: [[0.0; MAX_CASCADE_LANES]; 2],
-            fir_l: [0.0; 64],
-            fir_r: [0.0; 64],
+            feat_in_hp_beta: 0.0,
+            feat_fast_atk_beta: 0.0,
+            feat_fast_rel_beta: 0.0,
+            feat_pinch_k: 0.0,
+            feat_slow_atk_beta: 0.0,
+            feat_slow_rel_beta: 0.0,
+            feat_slow_det_comp: 0.0,
+            blocks: std::array::from_fn(|_| V3GruBlockF64::zeros()),
             kautz_poles: [(0.0, 0.0); MAX_KAUTZ_POLES],
-            kautz_c_l: [(0.0, 0.0); MAX_KAUTZ_POLES],
-            kautz_c_r: [(0.0, 0.0); MAX_KAUTZ_POLES],
+            readouts: std::array::from_fn(|_| V3TierReadoutF64::zeros()),
         }
     }
 
-    #[must_use]
-    pub fn from_cold_model(m: &V3ColdTierModel) -> Self {
-        let mut out = Self::zeros(m.tier, m.os2x, m.mono_out);
-        let s = &m.svf;
-        out.svf_base_g = s.base_g as f64;
-        out.svf_sec2_g_ratio = s.sec2_g_ratio as f64;
-        out.svf_env_oct_sens = s.env_oct_sens as f64;
-        out.svf_env_comp = s.env_comp as f64;
-        out.svf_atk_alpha = s.atk_alpha as f64;
-        out.svf_rel_alpha = s.rel_alpha as f64;
-        out.svf_det_lp_pole = s.det_lp_pole as f64;
-        out.svf_det_hp_mix = s.det_hp_mix as f64;
-        out.svf_damp_k1 = s.damp_k1 as f64;
-        out.svf_damp_k2 = s.damp_k2 as f64;
-        out.svf_sec2_bp_feed = s.sec2_bp_feed as f64;
-        out.svf_sec2_hp_feed = s.sec2_hp_feed as f64;
-        out.svf_stereo_link = s.stereo_link as f64;
-        out.svf_g_min = s.g_min as f64;
-        out.svf_g_max = s.g_max as f64;
+    /// Accumulates another gradient struct deterministically into `self`.
+    pub fn add_assign_grad(&mut self, rhs: &Self) {
+        self.os_up_quad += rhs.os_up_quad;
+        self.os_dec_c_prev1 += rhs.os_dec_c_prev1;
+        self.os_dec_c0 += rhs.os_dec_c0;
+        self.os_up_pre_emph += rhs.os_up_pre_emph;
+        self.os_dec_aa_mix += rhs.os_dec_aa_mix;
+        self.os_up_aa_mix += rhs.os_up_aa_mix;
+        self.svf_base_g += rhs.svf_base_g;
+        self.svf_sec2_g_ratio += rhs.svf_sec2_g_ratio;
+        self.svf_env_oct_sens += rhs.svf_env_oct_sens;
+        self.svf_env_comp += rhs.svf_env_comp;
+        self.svf_atk_alpha += rhs.svf_atk_alpha;
+        self.svf_rel_alpha += rhs.svf_rel_alpha;
+        self.svf_det_lp_pole += rhs.svf_det_lp_pole;
+        self.svf_det_hp_mix += rhs.svf_det_hp_mix;
+        self.svf_damp_k1 += rhs.svf_damp_k1;
+        self.svf_damp_k2 += rhs.svf_damp_k2;
+        self.svf_sec2_bp_feed += rhs.svf_sec2_bp_feed;
+        self.svf_sec2_hp_feed += rhs.svf_sec2_hp_feed;
+        self.svf_stereo_link += rhs.svf_stereo_link;
+        self.svf_g_min += rhs.svf_g_min;
+        self.svf_g_max += rhs.svf_g_max;
         for i in 0..7 {
-            out.svf_stage2_feed_taps[i] = s.stage2_feed_taps[i] as f64;
-            out.svf_direct_taps_l[i] = s.direct_taps_l[i] as f64;
-            out.svf_direct_taps_r[i] = s.direct_taps_r[i] as f64;
+            self.svf_stage2_feed_taps[i] += rhs.svf_stage2_feed_taps[i];
         }
-        for b in 0..NUM_CASCADE_BLOCKS {
-            out.blocks[b] = V3OptBlockF64::from_cold(&m.blocks[b]);
+        self.feat_in_hp_beta += rhs.feat_in_hp_beta;
+        self.feat_fast_atk_beta += rhs.feat_fast_atk_beta;
+        self.feat_fast_rel_beta += rhs.feat_fast_rel_beta;
+        self.feat_pinch_k += rhs.feat_pinch_k;
+        self.feat_slow_atk_beta += rhs.feat_slow_atk_beta;
+        self.feat_slow_rel_beta += rhs.feat_slow_rel_beta;
+        self.feat_slow_det_comp += rhs.feat_slow_det_comp;
+        for b in 0..NUM_GRU_BLOCKS {
+            self.blocks[b].add_assign(&rhs.blocks[b]);
         }
-        out.pre_cab_u_gain = [m.pre_cab_u_gain[0] as f64, m.pre_cab_u_gain[1] as f64];
-        for l in 0..MAX_CASCADE_LANES {
-            for ch in 0..2 {
-                out.pre_cab_w[ch][l] = m.pre_cab_w[ch][l] as f64;
-                out.direct_s2_w[ch][l] = m.direct_s2_w[ch][l] as f64;
-            }
+        for m in 0..MAX_KAUTZ_POLES {
+            self.kautz_poles[m].0 += rhs.kautz_poles[m].0;
+            self.kautz_poles[m].1 += rhs.kautz_poles[m].1;
         }
-        for k in 0..64 {
-            out.fir_l[k] = m.fir_l[k] as f64;
-            out.fir_r[k] = m.fir_r[k] as f64;
+        for tau in 0..4 {
+            self.readouts[tau].add_assign(&rhs.readouts[tau]);
         }
-        for k in 0..MAX_KAUTZ_POLES {
-            out.kautz_poles[k] = (m.kautz_poles[k].0 as f64, m.kautz_poles[k].1 as f64);
-            out.kautz_c_l[k] = (m.kautz_c_l[k].0 as f64, m.kautz_c_l[k].1 as f64);
-            out.kautz_c_r[k] = (m.kautz_c_r[k].0 as f64, m.kautz_c_r[k].1 as f64);
-        }
-        out
     }
 
+    /// Copies left-channel readout weights to right channel when `mono_out` is enabled.
+    pub fn mirror_mono(&mut self) {
+        if !self.mono_out {
+            return;
+        }
+        for r in &mut self.readouts {
+            r.svf_direct_taps_r = r.svf_direct_taps_l;
+            r.pre_cab_u_gain[1] = r.pre_cab_u_gain[0];
+            r.pre_cab_hp_gain[1] = r.pre_cab_hp_gain[0];
+            r.pre_cab_w[1] = r.pre_cab_w[0];
+            r.direct_s2_u_gain[1] = r.direct_s2_u_gain[0];
+            r.direct_s2_hp_gain[1] = r.direct_s2_hp_gain[0];
+            r.direct_s2_w[1] = r.direct_s2_w[0];
+            r.fir_r = r.fir_l;
+            r.kautz_c_r = r.kautz_c_l;
+        }
+    }
+
+    /// Converts from cold `f32` [`V3MatryoshkaModel`].
     #[must_use]
-    pub fn to_cold_model(&self) -> V3ColdTierModel {
-        let mut svf = V3Stage1SvfParams {
-            base_g: self.svf_base_g as f32,
-            sec2_g_ratio: self.svf_sec2_g_ratio as f32,
-            env_oct_sens: self.svf_env_oct_sens as f32,
-            env_comp: self.svf_env_comp as f32,
-            atk_alpha: self.svf_atk_alpha as f32,
-            rel_alpha: self.svf_rel_alpha as f32,
-            det_lp_pole: self.svf_det_lp_pole as f32,
-            det_hp_mix: self.svf_det_hp_mix as f32,
-            damp_k1: self.svf_damp_k1 as f32,
-            damp_k2: self.svf_damp_k2 as f32,
-            sec2_bp_feed: self.svf_sec2_bp_feed as f32,
-            sec2_hp_feed: self.svf_sec2_hp_feed as f32,
-            stereo_link: self.svf_stereo_link as f32,
-            g_min: self.svf_g_min as f32,
-            g_max: self.svf_g_max as f32,
-            _pad: 0.0,
-            stage2_feed_taps: [0.0; 8],
-            direct_taps_l: [0.0; 8],
-            direct_taps_r: [0.0; 8],
+    pub fn from_matryoshka_cold(m: &V3MatryoshkaModel) -> Self {
+        Self {
+            os2x: m.os2x,
+            mono_out: m.mono_out,
+            max_active_groups: MAX_GROUPS,
+            active_tier_weights: [0.15, 0.20, 0.28, 0.37],
+            os_up_quad: f64::from(m.os_params.up_quad_coeff),
+            os_dec_c_prev1: f64::from(m.os_params.dec_c_prev1),
+            os_dec_c0: f64::from(m.os_params.dec_c0),
+            os_up_pre_emph: f64::from(m.os_params.up_pre_emph),
+            os_dec_aa_mix: f64::from(m.os_params.dec_aa_mix),
+            os_up_aa_mix: f64::from(m.os_params.up_aa_mix),
+            svf_base_g: f64::from(m.svf.base_g),
+            svf_sec2_g_ratio: f64::from(m.svf.sec2_g_ratio),
+            svf_env_oct_sens: f64::from(m.svf.env_oct_sens),
+            svf_env_comp: f64::from(m.svf.env_comp),
+            svf_atk_alpha: f64::from(m.svf.atk_alpha),
+            svf_rel_alpha: f64::from(m.svf.rel_alpha),
+            svf_det_lp_pole: f64::from(m.svf.det_lp_pole),
+            svf_det_hp_mix: f64::from(m.svf.det_hp_mix),
+            svf_damp_k1: f64::from(m.svf.damp_k1),
+            svf_damp_k2: f64::from(m.svf.damp_k2),
+            svf_sec2_bp_feed: f64::from(m.svf.sec2_bp_feed),
+            svf_sec2_hp_feed: f64::from(m.svf.sec2_hp_feed),
+            svf_stereo_link: f64::from(m.svf.stereo_link),
+            svf_g_min: f64::from(m.svf.g_min),
+            svf_g_max: f64::from(m.svf.g_max),
+            svf_stage2_feed_taps: std::array::from_fn(|i| f64::from(m.svf.stage2_feed_taps[i])),
+            feat_in_hp_beta: f64::from(m.feat_params.in_hp_beta),
+            feat_fast_atk_beta: f64::from(m.feat_params.fast_atk_beta),
+            feat_fast_rel_beta: f64::from(m.feat_params.fast_rel_beta),
+            feat_pinch_k: f64::from(m.feat_params.pinch_k),
+            feat_slow_atk_beta: f64::from(m.feat_params.slow_atk_beta),
+            feat_slow_rel_beta: f64::from(m.feat_params.slow_rel_beta),
+            feat_slow_det_comp: f64::from(m.feat_params.slow_det_comp),
+            blocks: [
+                V3GruBlockF64::from_cold(&m.blocks[0]),
+                V3GruBlockF64::from_cold(&m.blocks[1]),
+                V3GruBlockF64::from_cold(&m.blocks[2]),
+            ],
+            kautz_poles: m.kautz_poles.map(|(r, th)| (f64::from(r), f64::from(th))),
+            readouts: [
+                V3TierReadoutF64::from_cold(&m.readouts[0]),
+                V3TierReadoutF64::from_cold(&m.readouts[1]),
+                V3TierReadoutF64::from_cold(&m.readouts[2]),
+                V3TierReadoutF64::from_cold(&m.readouts[3]),
+            ],
+        }
+    }
+
+    /// Converts into clamped `f32` engine [`V3MatryoshkaModel`].
+    #[must_use]
+    pub fn to_matryoshka_cold(&self) -> V3MatryoshkaModel {
+        let mut os_params = V3OversamplerParams {
+            up_quad_coeff: self.os_up_quad as f32,
+            dec_c_prev1: self.os_dec_c_prev1 as f32,
+            dec_c0: self.os_dec_c0 as f32,
+            dec_c1: (1.0 - self.os_dec_c_prev1 - self.os_dec_c0) as f32,
+            up_pre_emph: self.os_up_pre_emph as f32,
+            dec_aa_mix: self.os_dec_aa_mix as f32,
+            up_aa_mix: self.os_up_aa_mix as f32,
+            _pad: [0.0; 1],
         };
+        os_params.clamp_in_place();
+
+        let mut svf = V3SvfParams::identity_bypass();
+        svf.base_g = self.svf_base_g as f32;
+        svf.sec2_g_ratio = self.svf_sec2_g_ratio as f32;
+        svf.env_oct_sens = self.svf_env_oct_sens as f32;
+        svf.env_comp = self.svf_env_comp as f32;
+        svf.atk_alpha = self.svf_atk_alpha as f32;
+        svf.rel_alpha = self.svf_rel_alpha as f32;
+        svf.det_lp_pole = self.svf_det_lp_pole as f32;
+        svf.det_hp_mix = self.svf_det_hp_mix as f32;
+        svf.damp_k1 = self.svf_damp_k1 as f32;
+        svf.damp_k2 = self.svf_damp_k2 as f32;
+        svf.sec2_bp_feed = self.svf_sec2_bp_feed as f32;
+        svf.sec2_hp_feed = self.svf_sec2_hp_feed as f32;
+        svf.stereo_link = self.svf_stereo_link as f32;
+        svf.g_min = self.svf_g_min as f32;
+        svf.g_max = self.svf_g_max as f32;
         for i in 0..7 {
             svf.stage2_feed_taps[i] = self.svf_stage2_feed_taps[i] as f32;
-            svf.direct_taps_l[i] = self.svf_direct_taps_l[i] as f32;
-            svf.direct_taps_r[i] = self.svf_direct_taps_r[i] as f32;
         }
         svf.clamp_in_place();
 
-        let mut m = V3ColdTierModel::identity_for_tier(self.tier, self.os2x, self.mono_out);
-        m.svf = svf;
-        m.blocks = [
-            self.blocks[0].to_cold(),
-            self.blocks[1].to_cold(),
-            self.blocks[2].to_cold(),
-        ];
-        m.pre_cab_u_gain = [self.pre_cab_u_gain[0] as f32, self.pre_cab_u_gain[1] as f32];
-        let c_cnt = tier_cascade_lanes(self.tier);
-        for ch in 0..2 {
-            let eff_ch = if self.mono_out { 0 } else { ch };
-            for l in 0..c_cnt {
-                m.pre_cab_w[ch][l] = self.pre_cab_w[eff_ch][l] as f32;
-                m.direct_s2_w[ch][l] = self.direct_s2_w[eff_ch][l] as f32;
-            }
-        }
-        for k in 0..64 {
-            m.fir_l[k] = self.fir_l[k] as f32;
-            m.fir_r[k] = if self.mono_out {
-                self.fir_l[k] as f32
-            } else {
-                self.fir_r[k] as f32
-            };
-        }
-        for k in 0..MAX_KAUTZ_POLES {
-            m.kautz_poles[k] = (
-                (self.kautz_poles[k].0 as f32).clamp(0.50, 0.997),
-                (self.kautz_poles[k].1 as f32).clamp(1.0e-3, std::f32::consts::PI - 1.0e-3),
-            );
-            m.kautz_c_l[k] = (self.kautz_c_l[k].0 as f32, self.kautz_c_l[k].1 as f32);
-            m.kautz_c_r[k] = if self.mono_out {
-                m.kautz_c_l[k]
-            } else {
-                (self.kautz_c_r[k].0 as f32, self.kautz_c_r[k].1 as f32)
-            };
-        }
-        m
-    }
-
-    /// Convex interpolation `(1 - a) * self + a * target` across all continuous parameters
-    /// for monotone blending at identical oversampling rates (`os2x`).
-    #[must_use]
-    pub fn blend_same_os(&self, target: &Self, a: f64) -> Self {
-        let mut out = self.clone();
-        let l = |x: f64, y: f64| x + a * (y - x);
-        let lerp_s = |dst: &mut [f64], src: &[f64]| {
-            for (d, &s) in dst.iter_mut().zip(src) {
-                *d += a * (s - *d);
-            }
+        let mut feat_params = V3InputFeaturesParams {
+            in_hp_beta: self.feat_in_hp_beta as f32,
+            fast_atk_beta: self.feat_fast_atk_beta as f32,
+            fast_rel_beta: self.feat_fast_rel_beta as f32,
+            pinch_k: self.feat_pinch_k as f32,
+            slow_atk_beta: self.feat_slow_atk_beta as f32,
+            slow_rel_beta: self.feat_slow_rel_beta as f32,
+            slow_det_comp: self.feat_slow_det_comp as f32,
+            _pad: 0.0,
         };
-        out.svf_base_g = l(out.svf_base_g, target.svf_base_g);
-        out.svf_sec2_g_ratio = l(out.svf_sec2_g_ratio, target.svf_sec2_g_ratio);
-        out.svf_env_oct_sens = l(out.svf_env_oct_sens, target.svf_env_oct_sens);
-        out.svf_env_comp = l(out.svf_env_comp, target.svf_env_comp);
-        out.svf_atk_alpha = l(out.svf_atk_alpha, target.svf_atk_alpha);
-        out.svf_rel_alpha = l(out.svf_rel_alpha, target.svf_rel_alpha);
-        out.svf_det_lp_pole = l(out.svf_det_lp_pole, target.svf_det_lp_pole);
-        out.svf_det_hp_mix = l(out.svf_det_hp_mix, target.svf_det_hp_mix);
-        out.svf_damp_k1 = l(out.svf_damp_k1, target.svf_damp_k1);
-        out.svf_damp_k2 = l(out.svf_damp_k2, target.svf_damp_k2);
-        out.svf_sec2_bp_feed = l(out.svf_sec2_bp_feed, target.svf_sec2_bp_feed);
-        out.svf_sec2_hp_feed = l(out.svf_sec2_hp_feed, target.svf_sec2_hp_feed);
-        out.svf_stereo_link = l(out.svf_stereo_link, target.svf_stereo_link);
-        out.svf_g_min = l(out.svf_g_min, target.svf_g_min);
-        out.svf_g_max = l(out.svf_g_max, target.svf_g_max);
-        lerp_s(&mut out.svf_stage2_feed_taps, &target.svf_stage2_feed_taps);
-        lerp_s(&mut out.svf_direct_taps_l, &target.svf_direct_taps_l);
-        lerp_s(&mut out.svf_direct_taps_r, &target.svf_direct_taps_r);
-        for (db, sb) in out.blocks.iter_mut().zip(&target.blocks) {
-            db.atk_alpha = l(db.atk_alpha, sb.atk_alpha);
-            db.rel_alpha = l(db.rel_alpha, sb.rel_alpha);
-            db.gate_mix = l(db.gate_mix, sb.gate_mix);
-            db.gate_sharpness = l(db.gate_sharpness, sb.gate_sharpness);
-            lerp_s(&mut db.in_u_gain, &sb.in_u_gain);
-            lerp_s(&mut db.lp_pole, &sb.lp_pole);
-            lerp_s(&mut db.lp_mix, &sb.lp_mix);
-            lerp_s(&mut db.hp_mix, &sb.hp_mix);
-            lerp_s(&mut db.static_bias, &sb.static_bias);
-            lerp_s(&mut db.env_bias_sens, &sb.env_bias_sens);
-            lerp_s(&mut db.skip_u_gain, &sb.skip_u_gain);
-            lerp_s(&mut db.prev_skip_gain, &sb.prev_skip_gain);
-            for (dr, sr) in db.inter_mat.iter_mut().zip(&sb.inter_mat) {
-                lerp_s(dr, sr);
-            }
+        feat_params.clamp_in_place();
+
+        V3MatryoshkaModel {
+            os2x: self.os2x,
+            mono_out: self.mono_out,
+            os_params,
+            svf,
+            feat_params,
+            blocks: self.blocks.each_ref().map(V3GruBlockF64::to_cold),
+            kautz_poles: self.kautz_poles.map(|(r, th)| {
+                (
+                    r.clamp(0.25, 0.9985) as f32,
+                    th.clamp(0.0, PI - 1.0e-3) as f32,
+                )
+            }),
+            readouts: [
+                self.readouts[0].to_cold(Tier::Lite),
+                self.readouts[1].to_cold(Tier::Full),
+                self.readouts[2].to_cold(Tier::Pro),
+                self.readouts[3].to_cold(Tier::Ultra),
+            ],
         }
-        lerp_s(&mut out.pre_cab_u_gain, &target.pre_cab_u_gain);
-        for ch in 0..2 {
-            lerp_s(&mut out.pre_cab_w[ch], &target.pre_cab_w[ch]);
-            lerp_s(&mut out.direct_s2_w[ch], &target.direct_s2_w[ch]);
-        }
-        lerp_s(&mut out.fir_l, &target.fir_l);
-        lerp_s(&mut out.fir_r, &target.fir_r);
-        for m in 0..MAX_KAUTZ_POLES {
-            out.kautz_poles[m] = (
-                l(out.kautz_poles[m].0, target.kautz_poles[m].0),
-                l(out.kautz_poles[m].1, target.kautz_poles[m].1),
-            );
-            out.kautz_c_l[m] = (
-                l(out.kautz_c_l[m].0, target.kautz_c_l[m].0),
-                l(out.kautz_c_l[m].1, target.kautz_c_l[m].1),
-            );
-            out.kautz_c_r[m] = (
-                l(out.kautz_c_r[m].0, target.kautz_c_r[m].0),
-                l(out.kautz_c_r[m].1, target.kautz_c_r[m].1),
-            );
-        }
-        out
     }
 }

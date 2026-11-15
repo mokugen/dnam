@@ -589,5 +589,21 @@ mod tests {
             assert!(w[1] >= w[0]);
             assert!((1.0..=2.0).contains(&w[0]));
         }
+
+        // Error branches across BoundedPerProducerIngress, VST3 curves, and ControlEventStamp
+        let mut ingress = BoundedPerProducerIngress::new(1, &["daw"], 2).unwrap();
+        assert!(ingress.reserve("unknown").is_none());
+        let id0 = ingress.reserve("daw").unwrap();
+        assert!(ingress.reserve("daw").is_none()); // unready reservation open
+        assert!(ingress.publish(id0).is_err()); // must be accepted before publish
+        assert!(ingress.accept(999).is_err());
+        assert!(ingress.publish(999).is_err());
+
+        let (multi_s, multi_u) =
+            reconstruct_vst3_normalized_curve(0.0, &[(2, 0.5), (5, 1.0)], 8, 100).unwrap();
+        assert_eq!(multi_s.len(), 8);
+        assert!(!multi_u.is_empty());
+        assert!(reconstruct_vst3_normalized_curve(0.0, &[(4, 0.2), (2, 0.8)], 8, 0).is_err());
+        assert!(ControlEventStamp::from_source(1, "invalid", 0).is_err());
     }
 }

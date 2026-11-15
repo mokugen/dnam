@@ -348,13 +348,82 @@ mod spec_tests {
         ]);
         let tie_curves = parse_structured_conditional_curves(&tie_json, &switches).unwrap();
         assert!(select_conditional_calibration_curve(&tie_curves, &switches, &eff, None).is_err());
+        let no_match_eff = BTreeMap::from([
+            ("mode=variant".to_string(), "off".to_string()),
+            ("mode".to_string(), "off".to_string()),
+        ]);
+        assert!(
+            select_conditional_calibration_curve(&tie_curves, &switches, &no_match_eff, None)
+                .is_err()
+        );
+        assert_eq!(
+            select_conditional_calibration_curve(
+                &tie_curves,
+                &switches,
+                &no_match_eff,
+                Some([7.0, 8.0, 9.0]),
+            )
+            .unwrap(),
+            [7.0, 8.0, 9.0]
+        );
 
-        // Midpoint-anchored UI power-skew law: x(0.5) == x_mid
+        // Error branches in switch, bound, and curve parsers
+        assert!(parse_structured_conditional_bounds(&json!({}), &switches).is_err());
+        assert!(parse_structured_conditional_curves(&json!({}), &switches).is_err());
+        assert!(
+            parse_structured_conditional_bounds(
+                &json!([{"when": [{"control_id": "mode=variant", "option_id": "x"}], "min": 9.0, "max": 2.0}]),
+                &switches
+            )
+            .is_err()
+        );
+        assert!(
+            parse_structured_conditional_bounds(
+                &json!([{"when": [
+                    {"control_id": "mode", "option_id": "off"},
+                    {"control_id": "mode", "option_id": "off"}
+                ], "min": 1.0}]),
+                &switches
+            )
+            .is_err()
+        );
+        assert!(
+            parse_structured_conditional_bounds(
+                &json!([{"when": [{"control_id": "unknown", "option_id": "a"}], "max": 5.0}]),
+                &switches
+            )
+            .is_err()
+        );
+        assert!(
+            parse_structured_conditional_curves(
+                &json!([{"when": [{"control_id": "unknown", "option_id": "a"}], "anchors": [1.0]}]),
+                &switches
+            )
+            .is_err()
+        );
+
+        // Midpoint-anchored UI power-skew law: x(0.5) == x_mid + clamped/degenerate bounds
         let (gamma, x_at_half, t_back) =
             eval_ui_midpoint_power_skew(20.0, 200.0, 2020.0, 0.5).unwrap();
         assert!(gamma > 0.0);
         assert!((x_at_half - 200.0).abs() < 1e-9);
         assert!((t_back - 0.5).abs() < 1e-12);
+        assert!(eval_ui_midpoint_power_skew(20.0, 200.0, 2020.0, -0.5).is_none());
+        assert!(eval_ui_midpoint_power_skew(20.0, 200.0, 2020.0, 1.5).is_none());
+        assert_eq!(
+            eval_ui_midpoint_power_skew(20.0, 200.0, 2020.0, 0.0)
+                .unwrap()
+                .1,
+            20.0
+        );
+        assert_eq!(
+            eval_ui_midpoint_power_skew(20.0, 200.0, 2020.0, 1.0)
+                .unwrap()
+                .1,
+            2020.0
+        );
+        assert!(eval_ui_midpoint_power_skew(20.0, 20.0, 2020.0, 0.5).is_none());
+        assert!(eval_ui_midpoint_power_skew(20.0, 200.0, 2020.0, f64::NAN).is_none());
     }
 
     proptest! {

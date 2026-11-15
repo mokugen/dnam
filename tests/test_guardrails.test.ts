@@ -8,6 +8,7 @@
  * - AGENTS.md
  *
  * verify[repo.code.type-safety-and-imports]
+ * verify[repo.code.modular-decomposition-and-tests]
  * verify[repo.docs.agents-md-budgets]
  * verify[repo.docs.requirements-layer]
  * verify[repo.docs.spec-rules-and-adrs]
@@ -1899,6 +1900,52 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       const content = fs.readFileSync(rsPath, "utf8");
       if (content.includes("macro_rules!")) {
         violations.push(`${relPath(rsPath)}: contains forbidden macro_rules! in math/`);
+      }
+    }
+    expect(violations).toEqual([]);
+  });
+
+  // verify[repo.code.modular-decomposition-and-tests]
+  it("test_modular_decomposition_no_isolated_src_unit_tests_or_code_golf", () => {
+    const sharedTestHelperNames = new Set(["test_support.rs", "test_utils.rs", "testing.rs"]);
+    const isolatedUnitTestFileRe = /^(?:tests?|.*_tests|test_.*)\.rs$/;
+    const externalTestModDeclRe =
+      /^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(?:tests|[a-z0-9_]+_tests)\s*;/m;
+    const srcOrRustRe = /^packages\/[^/]+\/(?:src|rust)\//;
+    const binSubdirRe = /^packages\/[^/]+\/(?:src|rust)\/bin\//;
+    const pkgIntegrationTestsRe = /^packages\/[^/]+\/tests\//;
+    const lineContinuationGolfRe = /\\n\\(?:\r?\n)/;
+
+    const violations: string[] = [];
+    for (const rsPath of walkFilesByExtensions(PACKAGES_DIR, new Set([".rs"]))) {
+      const rel = relPath(rsPath).split(path.sep).join("/");
+      const base = path.basename(rsPath);
+      const content = fs.readFileSync(rsPath, "utf8");
+
+      if (srcOrRustRe.test(rel) && !binSubdirRe.test(rel)) {
+        if (isolatedUnitTestFileRe.test(base) && !sharedTestHelperNames.has(base)) {
+          violations.push(
+            `${rel}: isolated unit-test file in src/rust (co-locate #[cfg(test)] mod tests { ... } in the production module instead)`,
+          );
+        }
+        const declMatch = externalTestModDeclRe.exec(content);
+        if (declMatch) {
+          violations.push(
+            `${rel}: external file-backed unit-test module declaration '${declMatch[0].trim()}' (use inline #[cfg(test)] mod tests { ... })`,
+          );
+        }
+      }
+
+      if (pkgIntegrationTestsRe.test(rel) && base.endsWith("_coverage.rs")) {
+        violations.push(
+          `${rel}: grab-bag '*_coverage.rs' integration test file (move unit tests to co-located #[cfg(test)] mod tests or name by domain)`,
+        );
+      }
+
+      if (lineContinuationGolfRe.test(content)) {
+        violations.push(
+          `${rel}: contains literal '\\n\\\\' line-continuation compression (write readable multi-line statements/assembly)`,
+        );
       }
     }
     expect(violations).toEqual([]);
