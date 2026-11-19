@@ -10,39 +10,39 @@
 # ==============================================================================
 [rules."repo.code.type-safety-and-imports"]
 scope = "out-of-scope"
-reason = "Repository-wide Rust/TypeScript static typing and import boundary guardrail verified in tests/test_guardrails.test.ts"
+reason = "Repository-wide Rust/TypeScript static typing and import boundary guardrail verified in tests/code_guardrails.test.ts"
 
 [rules."repo.code.zerocopy-wire-structs"]
 scope = "out-of-scope"
-reason = "Phase 1 declarative zerocopy wire-struct rule verified in tests/test_guardrails.test.ts (promoted to engine/capture in Phases 2-5)"
+reason = "Phase 1 declarative zerocopy wire-struct rule verified in tests/code_guardrails.test.ts (promoted to engine/capture in Phases 2-5)"
 
 [rules."repo.code.shared-nostd-kernels"]
 scope = "out-of-scope"
-reason = "Phase 1 shared no_std dnam-kernels and AOT .wgsl toolchain rule verified in tests/test_guardrails.test.ts (promoted in Phases 2-4)"
+reason = "Phase 1 shared no_std dnam-kernels and AOT .wgsl toolchain rule verified in tests/architecture_guardrails.test.ts (promoted in Phases 2-4)"
 
 [rules."repo.docs.agents-md-budgets"]
 scope = "out-of-scope"
-reason = "Repository-wide AGENTS.md byte budget guardrail verified in tests/test_guardrails.test.ts"
+reason = "Repository-wide AGENTS.md byte budget guardrail verified in tests/docs_registry_guardrails.test.ts"
 
 [rules."repo.docs.requirements-layer"]
 scope = "out-of-scope"
-reason = "Repository-wide requirements registry guardrail verified in tests/test_guardrails.test.ts"
+reason = "Repository-wide requirements registry guardrail verified in tests/docs_registry_guardrails.test.ts"
 
 [rules."repo.docs.spec-rules-and-adrs"]
 scope = "out-of-scope"
-reason = "Repository-wide specification rule and MADR structure guardrail verified in tests/test_guardrails.test.ts"
+reason = "Repository-wide specification rule and MADR structure guardrail verified in tests/docs_registry_guardrails.test.ts"
 
 [rules."repo.docs.markdown-table-math"]
 scope = "out-of-scope"
-reason = "Repository-wide Markdown table math guardrail verified in tests/test_guardrails.test.ts"
+reason = "Repository-wide Markdown table math guardrail verified in tests/docs_formatting_guardrails.test.ts"
 
 [rules."repo.docs.github-latex-and-mermaid"]
 scope = "out-of-scope"
-reason = "Repository-wide GitHub MathJax and Mermaid syntax guardrail verified in tests/test_guardrails.test.ts"
+reason = "Repository-wide GitHub MathJax and Mermaid syntax guardrail verified in tests/docs_formatting_guardrails.test.ts"
 
 [rules."repo.docs.relative-links-and-anchors"]
 scope = "out-of-scope"
-reason = "Repository-wide Markdown link and anchor resolution guardrail verified in tests/test_guardrails.test.ts"
+reason = "Repository-wide Markdown link and anchor resolution guardrail verified in tests/docs_formatting_guardrails.test.ts"
 
 # ==============================================================================
 # 2. Architecture: Psychoacoustic Quality & Tiers (`docs/specs/architecture/psychoacoustic_quality_and_tiers.md`)
@@ -121,7 +121,7 @@ reason = "Offline 4-tier psychoacoustic benchmark qualification matrix owned by 
 
 [rules."qual.tiers.floors-not-stopping-criteria"]
 scope = "out-of-scope"
-reason = "Phase 1 benchmark floor vs stopping-criteria policy verified in tests/test_guardrails.test.ts (enforced in capture Phase 5)"
+reason = "Phase 1 benchmark floor vs stopping-criteria policy verified in tests/architecture_guardrails.test.ts (enforced in capture Phase 5)"
 
 # ==============================================================================
 # 3. Architecture: SONA System Overview (`docs/specs/architecture/sona_architecture.md`)
@@ -188,7 +188,7 @@ scope = "engine"
 
 [rules."arch.tiers.maximize-quality-within-budget"]
 scope = "out-of-scope"
-reason = "Phase 1 Gate 0b headroom reinvestment and fixed const-tier policy verified in tests/test_guardrails.test.ts (promoted to engine in Phase 3)"
+reason = "Phase 1 Gate 0b headroom reinvestment and fixed const-tier policy verified in tests/architecture_guardrails.test.ts (promoted to engine in Phase 3)"
 
 [rules."arch.topology.spillover-trails"]
 scope = "engine"
@@ -248,7 +248,7 @@ scope = "engine"
 
 [rules."arch.index.subsystems"]
 scope = "out-of-scope"
-reason = "Documentation subsystem navigation index verified by relative-link guardrails in tests/test_guardrails.test.ts"
+reason = "Documentation subsystem navigation index verified by relative-link guardrails in tests/docs_formatting_guardrails.test.ts"
 
 # ==============================================================================
 # 4. Containers: Project & Capture Vault Format (`docs/specs/containers/project_container_format.md`)
@@ -899,7 +899,7 @@ reason = "SONA analytical VarPro, parallel-scan, and Cholesky pipeline orchestra
 
 [rules."train.pipeline.webgpu-scans-and-ozaki"]
 scope = "out-of-scope"
-reason = "Phase 1 32-bit WebGPU 16 KiB SRAM scans and i32 Ozaki rule verified in tests/test_guardrails.test.ts (promoted in Phase 4/5)"
+reason = "Phase 1 32-bit WebGPU 16 KiB SRAM scans and i32 Ozaki rule verified in tests/architecture_guardrails.test.ts (promoted in Phase 4/5)"
 
 [rules."train.pipeline.stage-a-poles"]
 scope = "out-of-scope"
@@ -1075,18 +1075,18 @@ scope = "engine"
 
 [rules."repo.code.explicit-simd-and-coverage"]
 scope = "out-of-scope"
-reason = "Repository-wide static source guardrail for coverage(off) and math/ macro_rules! verified in tests/test_guardrails.test.ts"
+reason = "Repository-wide static source guardrail for coverage(off) and math/ macro_rules! verified in tests/code_guardrails.test.ts"
 
 [rules."repo.code.modular-decomposition-and-tests"]
 scope = "out-of-scope"
-reason = "Repository-wide modular decomposition, zero code-golfing, and co-located unit-test guardrail verified in tests/test_guardrails.test.ts"
+reason = "Repository-wide modular decomposition, zero code-golfing, and co-located unit-test guardrail verified in tests/code_guardrails.test.ts"
 
 [rules."repo.code.constant-eval-and-derivations"]
 scope = "engine"
 
 [rules."repo.code.universal-black-box"]
 scope = "out-of-scope"
-reason = "Repository-wide universal black-box engine and solver purity guardrail verified in tests/test_guardrails.test.ts"
+reason = "Repository-wide universal black-box engine and solver purity guardrail verified in tests/architecture_guardrails.test.ts"
 
 [rules."arch.simd.two-level-traits"]
 scope = "engine"

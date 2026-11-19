@@ -126,23 +126,26 @@ tasks:
 
   coverage:
     type: "run"
-    command: "cargo"
+    command: "pnpm"
     args:
-      - "llvm-cov"
-      - "--profile"
-      - "cov"
+      - "run"
+      - "rust-coverage"
+      - "--"
       - "--package"
       - "dnam-fixtures"
-      - "--fail-under-lines"
-      - "95"
+      - "--sources"
+      - "packages/fixtures/src"
     inputs:
       - "Cargo.toml"
       - "src/**/*"
       - "tests/**/*"
       - "/Cargo.toml"
       - "/Cargo.lock"
+      - "/package.json"
+      - "/scripts/rust-coverage.mjs"
     options:
       mutex: "cargo"
+      runFromWorkspaceRoot: true
       runInCI: "skip"
     tags:
       - "coverage"

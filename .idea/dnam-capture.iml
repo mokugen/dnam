@@ -5,6 +5,7 @@
       <sourceFolder url="file://$MODULE_DIR$/packages/capture/benches" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/packages/capture/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/packages/capture/tests" isTestSource="true" />
+      <excludeFolder url="file://$MODULE_DIR$/packages/capture/.benchmarks" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />

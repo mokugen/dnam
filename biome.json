@@ -26,11 +26,11 @@
       "packages/studio/src/**/*.css",
       "packages/studio/tests/**/*.ts",
       "packages/studio/tests/**/*.tsx",
-      "packages/studio/bin/**/*.mjs",
       "packages/studio/*.ts",
       "packages/studio/*.json",
       "tests/**/*.ts",
       "tests/*.json",
+      "scripts/**/*.mjs",
       "package.json",
       "tsconfig.json",
       "biome.json"
@@ -235,11 +235,11 @@
         "packages/ui/src/**/*.fixture.tsx",
         "packages/ui/tests/**/*.ts",
         "packages/ui/tests/**/*.tsx",
-        "packages/studio/bin/**/*.mjs",
         "packages/studio/src/**/*.test.ts",
         "packages/studio/src/**/*.test.tsx",
         "packages/studio/tests/**/*.ts",
         "packages/studio/tests/**/*.tsx",
+        "scripts/**/*.mjs",
         "tests/**/*.ts"
       ],
       "linter": {

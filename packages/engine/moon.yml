@@ -13,7 +13,7 @@ project:
   name: "dnam-engine"
   description: "Pure Rust #![no_std] + alloc, zero-audio-alloc real-time SIMD audio engine for DNAM"
 
-dependsOn: []
+dependsOn: ["kernels"]
 
 tasks:
   format:
@@ -66,6 +66,8 @@ tasks:
       - "examples/**/*"
       - "/Cargo.toml"
       - "/Cargo.lock"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
     options:
       mutex: "cargo"
     tags:
@@ -87,6 +89,8 @@ tasks:
       - "examples/**/*"
       - "/Cargo.toml"
       - "/Cargo.lock"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
     options:
       mutex: "cargo"
     tags:
@@ -106,6 +110,8 @@ tasks:
       - "src/**/*"
       - "/Cargo.toml"
       - "/Cargo.lock"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
     options:
       mutex: "cargo"
     tags:
@@ -121,89 +127,89 @@ tasks:
       - "Cargo.toml"
       - "src/**/*"
       - "tests/**/*"
+      - "examples/**/*"
       - "/Cargo.toml"
       - "/Cargo.lock"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
     options:
       mutex: "cargo"
     tags:
       - "test"
 
-  coverage:
+  test-x86:
     type: "run"
-    script: |
-      set -euo pipefail
-      cargo llvm-cov clean --profraw-only
-      python3 - <<'PY'
-      import concurrent.futures, glob, json, os, re, subprocess, sys, time
-      repo = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
-      sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
-      host = next(
-          line.split(": ", 1)[1]
-          for line in subprocess.check_output(["rustc", "-vV"], text=True).splitlines()
-          if line.startswith("host: ")
-      )
-      llvm_bin = os.path.join(sysroot, "lib", "rustlib", host, "bin")
-      llvm_profdata = os.path.join(llvm_bin, "llvm-profdata")
-      llvm_cov = os.path.join(llvm_bin, "llvm-cov")
-      prof_dir = os.path.join(repo, "target", "llvm-cov-target")
-      os.makedirs(prof_dir, exist_ok=True)
-      res = subprocess.run(
-          [
-              "cargo", "llvm-cov", "--profile", "cov", "--package", "dnam-engine",
-              "--lib", "--tests", "--no-report", "--", "--exact", "__none__",
-          ],
-          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-      )
-      if res.returncode != 0:
-          print(res.stdout, file=sys.stderr)
-          sys.exit(res.returncode)
-      for old in glob.glob(os.path.join(prof_dir, "*.profraw")):
-          os.remove(old)
-      bins = []
-      for raw in re.findall(r"\(([^)\s]+/out/[^)\s]+)\)", res.stdout):
-          p = raw if os.path.isabs(raw) else os.path.join(repo, raw)
-          if p not in bins and os.path.exists(p):
-              bins.append(p)
-      if not bins:
-          sys.exit("No instrumented dnam-engine test binaries found")
-      env = os.environ.copy()
-      env["LLVM_PROFILE_FILE"] = os.path.join(prof_dir, "dnam-eng-%p-%8m.profraw")
-      t0 = time.monotonic()
-      def run_bin(b):
-          name = os.path.basename(b)
-          threads = "4" if name.startswith("dnam_engine-") else "2"
-          p = subprocess.run([b, f"--test-threads={threads}"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-          return name, p.returncode, p.stdout
-      with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(bins))) as ex:
-          for name, rc, out in ex.map(run_bin, bins):
-              if rc != 0:
-                  print(f"FAILED {name}:\n{out}", file=sys.stderr)
-                  sys.exit(rc)
-      profraws = glob.glob(os.path.join(prof_dir, "dnam-eng-*.profraw"))
-      if not profraws:
-          sys.exit("No dnam-eng profraw files generated")
-      profdata = os.path.join(prof_dir, "dnam-engine.profdata")
-      subprocess.run([llvm_profdata, "merge", "-sparse", *profraws, "-o", profdata], check=True)
-      obj_args = [bins[0], *(f"--object={b}" for b in bins[1:])]
-      src_dir = os.path.join(repo, "packages", "engine", "src")
-      subprocess.run([llvm_cov, "report", f"--instr-profile={profdata}", *obj_args, "--sources", src_dir], check=True)
-      exp = subprocess.check_output([llvm_cov, "export", "--summary-only", f"--instr-profile={profdata}", *obj_args, "--sources", src_dir], text=True)
-      pct = json.loads(exp)["data"][0]["totals"]["lines"]["percent"]
-      for f in [*profraws, profdata]:
-          if os.path.exists(f):
-              os.remove(f)
-      print(f"dnam-engine line coverage: {pct:.2f}% (tests ran in {time.monotonic() - t0:.2f}s)")
-      if pct < 95.0:
-          sys.exit(f"Line coverage {pct:.2f}% < 95.0%")
-      PY
+    command: "cargo"
+    args:
+      - "test"
+      - "--package"
+      - "dnam-engine"
+      - "--target"
+      - "x86_64-apple-darwin"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "examples/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+    options:
+      mutex: "cargo"
+      runInCI: "skip"
+    tags:
+      - "test"
+
+  test-sve2:
+    type: "run"
+    command: "cargo"
+    args:
+      - "test"
+      - "--package"
+      - "dnam-engine"
+      - "--test"
+      - "backend_parity"
+      - "--test"
+      - "sona_extended_pipeline"
     inputs:
       - "Cargo.toml"
       - "src/**/*"
       - "tests/**/*"
       - "/Cargo.toml"
       - "/Cargo.lock"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
     options:
       mutex: "cargo"
+      runInCI: "skip"
+    tags:
+      - "test"
+
+  coverage:
+    type: "run"
+    command: "pnpm"
+    args:
+      - "run"
+      - "rust-coverage"
+      - "--"
+      - "--package"
+      - "dnam-engine"
+      - "--sources"
+      - "packages/engine/src"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+      - "/package.json"
+      - "/scripts/rust-coverage.mjs"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+    options:
+      mutex: "cargo"
+      runFromWorkspaceRoot: true
       runInCI: "skip"
     tags:
       - "coverage"
@@ -221,6 +227,8 @@ tasks:
       - "benches/**/*"
       - "/Cargo.toml"
       - "/Cargo.lock"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
     options:
       cache: false
       mutex: "cargo"

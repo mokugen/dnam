@@ -4,6 +4,10 @@
   "private": true,
   "type": "module",
   "packageManager": "pnpm@12.9.0",
+  "scripts": {
+    "rust-coverage": "node scripts/rust-coverage.mjs",
+    "rust-test": "node scripts/rust-parallel-test.mjs"
+  },
   "engines": {
     "node": ">=26.0.0"
   },

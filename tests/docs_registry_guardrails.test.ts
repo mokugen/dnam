@@ -1,0 +1,646 @@
+/**
+ * Documentation Registry, Frontmatter, Requirements, ADRs, Spec Rule Identifiers,
+ * and Traceability Guardrail Tests.
+ *
+ * verify[repo.docs.requirements-layer]
+ * verify[repo.docs.spec-rules-and-adrs]
+ */
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { describe, expect, it } from "vitest";
+import {
+  ADR_DIR,
+  ADR_TOKEN_RE,
+  collectSourceRefTokens,
+  collectSpecRules,
+  collectTestVerifyTokens,
+  DOCS_DIR,
+  HEADING_RE,
+  isGuardrailFile,
+  MALFORMED_SPEC_MARKER_RE,
+  MD_LINK_RE,
+  normalizeSpecRelPath,
+  PACKAGES_DIR,
+  parseFrontmatter,
+  parseSpecScopeToml,
+  REPO_ROOT,
+  REQ_FILE,
+  REQ_TABLE_RE,
+  REQ_TOKEN_RE,
+  relPath,
+  SPEC_RULE_DEF_RE,
+  SPEC_VERIFY_TOKEN_RE,
+  SPECS_DIR,
+  type SpecScopeRuleEntry,
+  stripCode,
+  stripFencedCodeBlocks,
+  TESTS_DIR,
+  VALID_RULE_ID_RE,
+  walkFilesByExtensions,
+  walkMarkdownFiles,
+} from "./test-support.js";
+
+interface AdrRegistryMaps {
+  seenAdrIds: Map<string, string>;
+  adrStatuses: Map<string, string>;
+  adrSupersededBy: Map<string, string>;
+  adrFilenames: Map<string, string>;
+}
+
+function validateAdrFrontmatterFile(adrPath: string, maps: AdrRegistryMaps): void {
+  const requiredKeys = [
+    "id",
+    "title",
+    "status",
+    "supersedes",
+    "superseded_by",
+    "specs",
+    "requirements",
+  ];
+  const fm = parseFrontmatter(fs.readFileSync(adrPath, "utf8"));
+  expect(fm, `${relPath(adrPath)} is missing YAML frontmatter`).not.toBeNull();
+  if (!fm) return;
+  for (const key of requiredKeys) {
+    expect(key in fm, `${relPath(adrPath)} frontmatter is missing '${key}'`).toBe(true);
+  }
+  const adrId = String(fm["id"]);
+  expect(adrId).toMatch(/^ADR-\d{4}$/);
+  expect(path.basename(adrPath).startsWith(adrId.slice(4))).toBe(true);
+  expect(maps.seenAdrIds.has(adrId)).toBe(false);
+  maps.seenAdrIds.set(adrId, relPath(adrPath));
+  maps.adrFilenames.set(adrId, path.basename(adrPath));
+  const status = String(fm["status"]);
+  maps.adrStatuses.set(adrId, status);
+  expect(["proposed", "accepted", "superseded"].includes(status)).toBe(true);
+  expect(Array.isArray(fm["specs"])).toBe(true);
+  expect(Array.isArray(fm["requirements"])).toBe(true);
+  if (status === "accepted") expect((fm["specs"] as string[]).length).toBeGreaterThan(0);
+  if (status === "superseded") {
+    const supBy = String(fm["superseded_by"]);
+    expect(supBy).toMatch(/^ADR-\d{4}$/);
+    maps.adrSupersededBy.set(adrId, supBy);
+  }
+}
+
+function verifySupersededAdrsNotCited(
+  supersededIds: readonly string[],
+  adrFilenames: ReadonlyMap<string, string>,
+): void {
+  for (const docFile of [REQ_FILE, ...walkMarkdownFiles(SPECS_DIR)]) {
+    const rawText = fs.readFileSync(docFile, "utf8");
+    const cleanBody = stripCode(rawText);
+    const fm = parseFrontmatter(rawText);
+    const fmAdrs = Array.isArray(fm?.["adrs"]) ? fm["adrs"] : [];
+    for (const supId of supersededIds) {
+      const supFilename = adrFilenames.get(supId) ?? "";
+      expect(fmAdrs.includes(supId), `${relPath(docFile)} cites superseded ${supId}`).toBe(false);
+      expect(
+        cleanBody.includes(supId) || (supFilename !== "" && rawText.includes(supFilename)),
+        `${relPath(docFile)} cites superseded ${supId} (${supFilename})`,
+      ).toBe(false);
+    }
+  }
+}
+
+function checkSpecHeadingSections(specPath: string, clean: string, missing: string[]): void {
+  const headings = Array.from(clean.matchAll(/^(#{2,4})\s+(.+?)\s*$/gm));
+  for (let idx = 0; idx < headings.length; idx++) {
+    const h = headings[idx];
+    if (!h || h.index === undefined) continue;
+    const level = (h[1] ?? "").length;
+    const title = (h[2] ?? "").trim();
+    const start = h.index + h[0].length;
+    const nextH = headings[idx + 1];
+    const end = nextH && nextH.index !== undefined ? nextH.index : clean.length;
+    const nextLevel = nextH ? (nextH[1] ?? "").length : 0;
+    const hasRule = SPEC_RULE_DEF_RE.test(clean.slice(start, end));
+    SPEC_RULE_DEF_RE.lastIndex = 0;
+    if (!(idx + 1 < headings.length && nextLevel > level) && !hasRule) {
+      missing.push(`${relPath(specPath)}: leaf '${"#".repeat(level)} ${title}' has no r[...] rule`);
+    }
+  }
+}
+
+function verifySpecFileRulePrefixesAndLeafSections(specPath: string, missing: string[]): void {
+  const text = fs.readFileSync(specPath, "utf8");
+  const fm = parseFrontmatter(text);
+  const prefixes = Array.isArray(fm?.["rule_prefixes"]) ? fm["rule_prefixes"] : [];
+  const clean = stripFencedCodeBlocks(text);
+  const fileRules = Array.from(clean.matchAll(SPEC_RULE_DEF_RE), (m) => m[1] ?? m[2] ?? "");
+  expect(fileRules.length, `${relPath(specPath)} defines zero r[...] rules`).toBeGreaterThan(0);
+  for (const ruleId of fileRules) {
+    const fullToken = `r[${ruleId}]`;
+    expect(
+      prefixes.some((prefix) => fullToken.startsWith(prefix)),
+      `${relPath(specPath)}: '${fullToken}' does not match frontmatter rule_prefixes`,
+    ).toBe(true);
+  }
+  checkSpecHeadingSections(specPath, clean, missing);
+}
+
+function collectStrayRulesOutsideSpecs(templateRel: string): string[] {
+  const stray: string[] = [];
+  for (const mdPath of walkMarkdownFiles(REPO_ROOT)) {
+    const rel = relPath(mdPath);
+    if (
+      mdPath.startsWith(SPECS_DIR) ||
+      rel.startsWith(templateRel) ||
+      rel === "docs/CONTRIBUTING.md"
+    ) {
+      continue;
+    }
+    const lines = stripFencedCodeBlocks(fs.readFileSync(mdPath, "utf8")).split("\n");
+    for (let idx = 0; idx < lines.length; idx++) {
+      for (const m of (lines[idx] ?? "").matchAll(SPEC_RULE_DEF_RE)) {
+        stray.push(`${rel}:${idx + 1} defines r[${m[1] ?? m[2] ?? ""}] outside docs/specs/`);
+      }
+    }
+  }
+  return stray;
+}
+
+function collectMalformedDocMarkers(templateRel: string): string[] {
+  const malformed: string[] = [];
+  for (const mdPath of walkMarkdownFiles(DOCS_DIR)) {
+    const rel = relPath(mdPath);
+    if (rel.startsWith(templateRel) || rel === "docs/CONTRIBUTING.md") continue;
+    const lines = stripFencedCodeBlocks(fs.readFileSync(mdPath, "utf8")).split("\n");
+    for (let idx = 0; idx < lines.length; idx++) {
+      for (const m of (lines[idx] ?? "").matchAll(MALFORMED_SPEC_MARKER_RE)) {
+        const kind = m[1] ?? "";
+        const inner = m[2] ?? "";
+        const isPlaceholder =
+          (inner.endsWith(".") && kind === "r") ||
+          inner.includes("...") ||
+          inner.includes("*") ||
+          inner.includes("<") ||
+          inner.includes(">");
+        if (!isPlaceholder && !VALID_RULE_ID_RE.test(inner)) {
+          malformed.push(`${rel}:${idx + 1}: malformed '${kind}[${inner}]'`);
+        }
+      }
+    }
+  }
+  return malformed;
+}
+
+function collectVerifyTokensInDocs(templateRel: string): string[] {
+  const verifyInDocs: string[] = [];
+  for (const mdPath of walkMarkdownFiles(REPO_ROOT)) {
+    const rel = relPath(mdPath);
+    if (
+      rel.startsWith(templateRel) ||
+      rel === "docs/CONTRIBUTING.md" ||
+      rel === "docs/specs/architecture/project_and_documentation_quality.md"
+    ) {
+      continue;
+    }
+    const lines = fs.readFileSync(mdPath, "utf8").split("\n");
+    for (let idx = 0; idx < lines.length; idx++) {
+      for (const m of (lines[idx] ?? "").matchAll(SPEC_VERIFY_TOKEN_RE)) {
+        verifyInDocs.push(`${rel}:${idx + 1}: verify[${m[1] ?? ""}]`);
+      }
+    }
+  }
+  return verifyInDocs;
+}
+
+function collectLegacyTokenHits(): string[] {
+  const hits: string[] = [];
+  const legacyClRe = new RegExp(`\\b${"CL"}-\\d{2}\\b`);
+  const legacyGRe = new RegExp(`\\b${"G-0"}\\d\\b`);
+  for (const filePath of [REQ_FILE, ...walkMarkdownFiles(SPECS_DIR)]) {
+    const lines = fs.readFileSync(filePath, "utf8").split("\n");
+    lines.forEach((line, idx) => {
+      const m = legacyClRe.exec(line);
+      if (m) hits.push(`${relPath(filePath)}:${idx + 1}: ${m[0]}`);
+    });
+  }
+  for (const root of [DOCS_DIR, PACKAGES_DIR, TESTS_DIR]) {
+    for (const filePath of walkFilesByExtensions(root, new Set([".md", ".rs", ".ts", ".tsx"]))) {
+      const lines = fs.readFileSync(filePath, "utf8").split("\n");
+      lines.forEach((line, idx) => {
+        const m = legacyGRe.exec(line);
+        if (m) hits.push(`${relPath(filePath)}:${idx + 1}: ${m[0]}`);
+      });
+    }
+  }
+  return hits;
+}
+
+function collectDocToTestLinks(): string[] {
+  const links: string[] = [];
+  for (const mdPath of walkMarkdownFiles(DOCS_DIR)) {
+    const rel = relPath(mdPath);
+    if (rel === "docs/specs/architecture/project_and_documentation_quality.md") continue;
+    if (!mdPath.startsWith(SPECS_DIR) && !mdPath.startsWith(ADR_DIR) && mdPath !== REQ_FILE) {
+      continue;
+    }
+    const lines = stripCode(fs.readFileSync(mdPath, "utf8")).split("\n");
+    lines.forEach((line, idx) => {
+      for (const m of line.matchAll(MD_LINK_RE)) {
+        const target = m[2] ?? "";
+        if (
+          target.includes("test_") ||
+          target.includes("_spec_references") ||
+          target.includes("_verification") ||
+          target.includes("/tests/")
+        ) {
+          links.push(`${rel}:${idx + 1} -> ${target}`);
+        }
+      }
+    });
+  }
+  return links;
+}
+
+function collectSpecTextParseViolations(): string[] {
+  const patterns = [
+    new RegExp(`${"docs/specs"}/`),
+    new RegExp(`${"docs/adr"}/`),
+    new RegExp(`${"docs/requirements"}/`),
+  ];
+  const violations: string[] = [];
+  for (const root of [TESTS_DIR, PACKAGES_DIR]) {
+    for (const filePath of walkFilesByExtensions(root, new Set([".rs", ".ts", ".tsx"]))) {
+      const rel = relPath(filePath);
+      if (isGuardrailFile(filePath) || !rel.includes("test")) continue;
+      const lines = fs.readFileSync(filePath, "utf8").split("\n");
+      lines.forEach((line, idx) => {
+        const trimmed = line.trim();
+        if (
+          trimmed.startsWith("#") ||
+          trimmed.startsWith("//") ||
+          trimmed.startsWith("*") ||
+          trimmed.startsWith("/*")
+        ) {
+          return;
+        }
+        if (patterns.some((pat) => pat.test(line))) {
+          violations.push(`${rel}:${idx + 1}: ${trimmed}`);
+        }
+      });
+    }
+  }
+  return violations;
+}
+
+function collectAdrStatusAndSpecMaps(): {
+  adrStatuses: Map<string, string>;
+  adrEnforcesSpecs: Map<string, string[]>;
+} {
+  const adrStatuses = new Map<string, string>();
+  const adrEnforcesSpecs = new Map<string, string[]>();
+  for (const entry of fs.readdirSync(ADR_DIR).sort()) {
+    if (!entry.endsWith(".md") || entry === "README.md") continue;
+    const fm = parseFrontmatter(fs.readFileSync(path.join(ADR_DIR, entry), "utf8"));
+    if (!fm) continue;
+    const aid = String(fm["id"]);
+    adrStatuses.set(aid, String(fm["status"]));
+    const rawSpecs = Array.isArray(fm["specs"]) ? fm["specs"] : [];
+    adrEnforcesSpecs.set(aid, rawSpecs.map(normalizeSpecRelPath));
+  }
+  return { adrStatuses, adrEnforcesSpecs };
+}
+
+function collectSpecCitationSets(supersededAdrs: ReadonlySet<string>): {
+  specCitedReqs: Set<string>;
+  specCitedAdrs: Set<string>;
+  specFileSet: Set<string>;
+} {
+  const specCitedReqs = new Set<string>();
+  const specCitedAdrs = new Set<string>();
+  const specFileSet = new Set<string>();
+  for (const specPath of walkMarkdownFiles(SPECS_DIR)) {
+    specFileSet.add(path.relative(DOCS_DIR, specPath).split(path.sep).join("/"));
+    const text = fs.readFileSync(specPath, "utf8");
+    const fm = parseFrontmatter(text);
+    const reqs = fm?.["requirements"];
+    if (Array.isArray(reqs)) for (const r of reqs) specCitedReqs.add(r);
+    for (const m of text.matchAll(REQ_TOKEN_RE)) specCitedReqs.add(m[0]);
+    const adrs = fm?.["adrs"];
+    if (Array.isArray(adrs)) {
+      for (const a of adrs) {
+        expect(supersededAdrs.has(a), `${relPath(specPath)} cites superseded ${a}`).toBe(false);
+        specCitedAdrs.add(a);
+      }
+    }
+    for (const m of text.matchAll(ADR_TOKEN_RE)) specCitedAdrs.add(m[0]);
+  }
+  return { specCitedReqs, specCitedAdrs, specFileSet };
+}
+
+function checkEngineScopeEntry(
+  ruleId: string,
+  entry: SpecScopeRuleEntry,
+  actualVerifies: ReadonlyMap<string, Set<string>>,
+  errors: string[],
+): void {
+  if (entry.scope !== "engine" && entry.scope !== "out-of-scope") {
+    errors.push(`r[${ruleId}]: invalid scope '${entry.scope}'`);
+    return;
+  }
+  if (entry.scope === "out-of-scope") {
+    if (!(entry.reason ?? "").trim()) {
+      errors.push(`r[${ruleId}]: scope='out-of-scope' requires non-empty reason`);
+    }
+    const found = actualVerifies.get(ruleId);
+    if (found) {
+      errors.push(
+        `r[${ruleId}]: out-of-scope but verified in engine: ${Array.from(found).sort().join(", ")}`,
+      );
+    }
+    return;
+  }
+  if ((actualVerifies.get(ruleId)?.size ?? 0) === 0) {
+    errors.push(`r[${ruleId}]: scope='engine', but no verify[${ruleId}] in packages/engine`);
+  }
+}
+
+describe("DNAM Documentation Registry, Rules, ADRs & Traceability Guardrails", () => {
+  it("test_three_layer_docs_directory_structure", () => {
+    expect(fs.existsSync(path.join(DOCS_DIR, "index.md"))).toBe(true);
+    expect(fs.existsSync(path.join(DOCS_DIR, "CONTRIBUTING.md"))).toBe(true);
+    expect(fs.existsSync(REQ_FILE)).toBe(true);
+    expect(fs.existsSync(ADR_DIR) && fs.statSync(ADR_DIR).isDirectory()).toBe(true);
+    expect(fs.existsSync(SPECS_DIR) && fs.statSync(SPECS_DIR).isDirectory()).toBe(true);
+    expect(fs.existsSync(path.join(DOCS_DIR, "verification"))).toBe(false);
+
+    const templatesDir = path.join(DOCS_DIR, "templates");
+    expect(fs.existsSync(templatesDir) && fs.statSync(templatesDir).isDirectory()).toBe(true);
+    for (const tplName of ["requirement_template.md", "spec_template.md", "adr_template.md"]) {
+      const tplPath = path.join(templatesDir, tplName);
+      expect(fs.existsSync(tplPath), `Missing docs/templates/${tplName}`).toBe(true);
+      expect(parseFrontmatter(fs.readFileSync(tplPath, "utf8"))).not.toBeNull();
+    }
+
+    const actualDomains = new Set(
+      fs
+        .readdirSync(SPECS_DIR, { withFileTypes: true })
+        .filter((d) => d.isDirectory())
+        .map((d) => d.name),
+    );
+    expect(actualDomains).toEqual(
+      new Set(["architecture", "dsp", "containers", "training", "security", "sdks"]),
+    );
+  });
+
+  it("test_all_spec_files_have_valid_yaml_frontmatter", () => {
+    const requiredKeys = [
+      "id",
+      "title",
+      "status",
+      "version",
+      "domain",
+      "rule_prefixes",
+      "requirements",
+      "adrs",
+    ];
+    const specFiles = walkMarkdownFiles(SPECS_DIR);
+    expect(specFiles.length).toBe(17);
+
+    const seenSpecIds = new Map<string, string>();
+    for (const specPath of specFiles) {
+      const fm = parseFrontmatter(fs.readFileSync(specPath, "utf8"));
+      expect(fm, `${relPath(specPath)} is missing YAML frontmatter`).not.toBeNull();
+      if (!fm) continue;
+      expect("clamps" in fm, `${relPath(specPath)} has legacy 'clamps' key`).toBe(false);
+      for (const key of requiredKeys) {
+        expect(
+          key in fm && fm[key] !== "" && (Array.isArray(fm[key]) ? fm[key].length > 0 : true),
+          `${relPath(specPath)} missing '${key}'`,
+        ).toBe(true);
+      }
+      const specId = String(fm["id"]);
+      expect(specId.startsWith("spec.")).toBe(true);
+      expect(seenSpecIds.has(specId)).toBe(false);
+      seenSpecIds.set(specId, relPath(specPath));
+      expect(fm["status"]).toBe("canonical");
+      expect(Array.isArray(fm["rule_prefixes"])).toBe(true);
+      expect(Array.isArray(fm["requirements"])).toBe(true);
+      expect(Array.isArray(fm["adrs"])).toBe(true);
+    }
+  });
+
+  it("test_all_adr_files_have_valid_yaml_frontmatter", () => {
+    const adrFiles = fs
+      .readdirSync(ADR_DIR)
+      .filter((n) => n.endsWith(".md") && n !== "README.md")
+      .sort()
+      .map((n) => path.join(ADR_DIR, n));
+    expect(adrFiles.length).toBeGreaterThanOrEqual(18);
+
+    const maps: AdrRegistryMaps = {
+      seenAdrIds: new Map(),
+      adrStatuses: new Map(),
+      adrSupersededBy: new Map(),
+      adrFilenames: new Map(),
+    };
+    for (const adrPath of adrFiles) validateAdrFrontmatterFile(adrPath, maps);
+
+    for (const [adrId, supBy] of maps.adrSupersededBy.entries()) {
+      expect(maps.adrStatuses.has(supBy), `${adrId} superseded_by '${supBy}' missing`).toBe(true);
+      expect(maps.adrStatuses.get(supBy) !== "superseded").toBe(true);
+    }
+
+    const supersededIds = Array.from(maps.adrStatuses.entries())
+      .filter(([, st]) => st === "superseded")
+      .map(([aid]) => aid);
+    verifySupersededAdrsNotCited(supersededIds, maps.adrFilenames);
+  });
+
+  it("test_requirement_registry_and_agnostic_prose", () => {
+    const text = fs.readFileSync(REQ_FILE, "utf8");
+    const fm = parseFrontmatter(text);
+    expect(fm?.["id"]).toBe("req.system-goals");
+    expect(fm?.["status"]).toBe("canonical");
+    expect(fm?.["layer"]).toBe("requirements");
+
+    const reqIds = Array.from(text.matchAll(REQ_TABLE_RE), (m) => m[1] ?? "");
+    expect(reqIds.length).toBe(41);
+    expect(reqIds.length).toBe(new Set(reqIds).size);
+
+    const expectedCounts: Record<number, number> = {
+      1: 9,
+      2: 5,
+      3: 3,
+      4: 3,
+      5: 6,
+      6: 3,
+      7: 4,
+      8: 8,
+    };
+    for (const [goalStr, count] of Object.entries(expectedCounts)) {
+      for (let sub = 1; sub <= count; sub++) expect(reqIds).toContain(`REQ-${goalStr}.${sub}`);
+    }
+
+    for (const specPath of walkMarkdownFiles(SPECS_DIR)) {
+      const reqList = parseFrontmatter(fs.readFileSync(specPath, "utf8"))?.["requirements"];
+      if (Array.isArray(reqList)) {
+        for (const reqRef of reqList) {
+          expect(reqIds.includes(reqRef), `${relPath(specPath)} unknown req '${reqRef}'`).toBe(
+            true,
+          );
+        }
+      }
+    }
+
+    const proseOnly = stripFencedCodeBlocks(text).replace(/\]\([^)]+\)/g, "]()");
+    for (const field of [
+      "max_supported_tier",
+      "user_metadata",
+      "royalty_splits",
+      "allowed_protection_profiles",
+      "allowed_oem_vendors",
+      "output head",
+      "output-head",
+      "SIMD lane",
+      "Hann-windowed",
+      "JSON header",
+      ".dnam",
+      ".dnam-proj",
+      ".dnam-ckpt",
+      ".dnam-cache",
+      ".dnam-seal",
+      ".dnce",
+      "mono_only",
+      "CL-0",
+      "CL-1",
+      "CL-2",
+    ]) {
+      expect(proseOnly).not.toContain(field);
+    }
+  });
+
+  it("test_layer_separation_no_adr_narratives_in_canonical_specs", () => {
+    const forbidden = [
+      "rejected alternatives",
+      "counterexamples and failure modes",
+      "why alternatives lose",
+      "candidate comparison",
+    ];
+    for (const specPath of walkMarkdownFiles(SPECS_DIR)) {
+      const clean = stripFencedCodeBlocks(fs.readFileSync(specPath, "utf8"));
+      for (const match of clean.matchAll(HEADING_RE)) {
+        const headingText = (match[2] ?? "").toLowerCase();
+        for (const phrase of forbidden) expect(headingText).not.toContain(phrase);
+      }
+    }
+  });
+
+  it("test_spec_rule_identifiers_adr_structure_and_no_spec_text_parsing", () => {
+    const rules = collectSpecRules();
+    expect(rules.size).toBeGreaterThanOrEqual(150);
+    expect(
+      Array.from(rules.entries())
+        .filter(([, locs]) => locs.length > 1)
+        .map(([rid, locs]) => `r[${rid}]: ${locs.map(([p, ln]) => `${p}:${ln}`).join(", ")}`),
+    ).toEqual([]);
+
+    const missingLeafRules: string[] = [];
+    for (const specPath of walkMarkdownFiles(SPECS_DIR)) {
+      verifySpecFileRulePrefixesAndLeafSections(specPath, missingLeafRules);
+    }
+    expect(missingLeafRules).toEqual([]);
+
+    const templateRel = relPath(path.join(DOCS_DIR, "templates"));
+    expect(collectStrayRulesOutsideSpecs(templateRel)).toEqual([]);
+    expect(collectMalformedDocMarkers(templateRel)).toEqual([]);
+    expect(collectVerifyTokensInDocs(templateRel)).toEqual([]);
+    expect(collectLegacyTokenHits()).toEqual([]);
+    expect(collectDocToTestLinks()).toEqual([]);
+
+    const unresolvedRefs = collectSourceRefTokens()
+      .filter(([ruleId]) => !rules.has(ruleId))
+      .map(([ruleId, p, ln]) => `${p}:${ln} -> ref[${ruleId}]`);
+    expect(unresolvedRefs).toEqual([]);
+
+    const verifyTokens = collectTestVerifyTokens();
+    expect(verifyTokens.length).toBeGreaterThan(0);
+    expect(
+      verifyTokens
+        .filter(([ruleId]) => !rules.has(ruleId))
+        .map(([ruleId, p, ln]) => `${p}:${ln} -> verify[${ruleId}]`),
+    ).toEqual([]);
+
+    expect(collectSpecTextParseViolations()).toEqual([]);
+  });
+
+  it("test_spec_rules_verified_in_tests", () => {
+    const rules = collectSpecRules();
+    const verifiedIds = new Set(collectTestVerifyTokens().map(([ruleId]) => ruleId));
+    expect(
+      Array.from(rules.keys())
+        .filter((r) => !verifiedIds.has(r))
+        .sort(),
+    ).toEqual([]);
+  });
+
+  it("test_engine_spec_scope_manifest", () => {
+    const scopePath = path.join(PACKAGES_DIR, "engine", "spec_scope.toml");
+    expect(fs.existsSync(scopePath)).toBe(true);
+    const rulesMap = parseSpecScopeToml(fs.readFileSync(scopePath, "utf8"));
+    const canonicalIds = new Set(collectSpecRules().keys());
+    const manifestIds = new Set(rulesMap.keys());
+    expect(
+      Array.from(canonicalIds)
+        .filter((id) => !manifestIds.has(id))
+        .sort(),
+    ).toEqual([]);
+    expect(
+      Array.from(manifestIds)
+        .filter((id) => !canonicalIds.has(id))
+        .sort(),
+    ).toEqual([]);
+
+    const engineDir = path.join(PACKAGES_DIR, "engine");
+    const actualVerifies = new Map<string, Set<string>>();
+    for (const rsPath of walkFilesByExtensions(engineDir, new Set([".rs"]))) {
+      const rel = path.relative(engineDir, rsPath).split(path.sep).join("/");
+      for (const m of fs.readFileSync(rsPath, "utf8").matchAll(SPEC_VERIFY_TOKEN_RE)) {
+        const rid = m[1] ?? "";
+        const set = actualVerifies.get(rid) ?? new Set<string>();
+        set.add(rel);
+        actualVerifies.set(rid, set);
+      }
+    }
+
+    const errors: string[] = [];
+    for (const [ruleId, entry] of Array.from(rulesMap.entries()).sort(([a], [b]) =>
+      a.localeCompare(b),
+    )) {
+      checkEngineScopeEntry(ruleId, entry, actualVerifies, errors);
+    }
+    expect(errors).toEqual([]);
+  });
+
+  it("test_bidirectional_req_and_adr_traceability_across_specs", () => {
+    const reqText = fs.readFileSync(REQ_FILE, "utf8");
+    const definedReqs = new Set(Array.from(reqText.matchAll(REQ_TABLE_RE), (m) => m[1] ?? ""));
+    const { adrStatuses, adrEnforcesSpecs } = collectAdrStatusAndSpecMaps();
+    const supersededAdrs = new Set(
+      Array.from(adrStatuses.entries())
+        .filter(([, st]) => st === "superseded")
+        .map(([aid]) => aid),
+    );
+    const { specCitedReqs, specCitedAdrs, specFileSet } = collectSpecCitationSets(supersededAdrs);
+
+    for (const [aid, enforcedList] of adrEnforcesSpecs.entries()) {
+      for (const specRel of enforcedList) {
+        expect(specFileSet.has(specRel), `${aid} cites missing '${specRel}'`).toBe(true);
+        if (adrStatuses.get(aid) === "accepted") specCitedAdrs.add(aid);
+      }
+    }
+
+    expect(
+      Array.from(definedReqs)
+        .filter((r) => !specCitedReqs.has(r))
+        .sort(),
+    ).toEqual([]);
+    const accepted = Array.from(adrStatuses.entries())
+      .filter(([, st]) => st === "accepted")
+      .map(([aid]) => aid);
+    expect(accepted.filter((a) => !specCitedAdrs.has(a)).sort()).toEqual([]);
+  });
+});

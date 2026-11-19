@@ -25,6 +25,7 @@ tasks:
       - "format"
       - "--write"
       - "tests"
+      - "scripts"
     options:
       cache: false
       runFromWorkspaceRoot: true
@@ -39,9 +40,11 @@ tasks:
       - "biome"
       - "format"
       - "tests"
+      - "scripts"
     inputs:
       - "*.ts"
       - "*.json"
+      - "/scripts/**/*.mjs"
       - "/biome.json"
       - "/package.json"
       - "/pnpm-lock.yaml"
@@ -58,9 +61,11 @@ tasks:
       - "biome"
       - "check"
       - "tests"
+      - "scripts"
     inputs:
       - "*.ts"
       - "*.json"
+      - "/scripts/**/*.mjs"
       - "/biome.json"
       - "/package.json"
       - "/pnpm-lock.yaml"
@@ -81,6 +86,7 @@ tasks:
     inputs:
       - "*.ts"
       - "tsconfig.json"
+      - "/scripts/**/*.mjs"
       - "/package.json"
       - "/pnpm-lock.yaml"
     options:
@@ -101,6 +107,7 @@ tasks:
     inputs:
       - "*.ts"
       - "tsconfig.json"
+      - "/scripts/**/*.mjs"
       - "/package.json"
       - "/pnpm-lock.yaml"
     options:
@@ -115,7 +122,10 @@ tasks:
       - "exec"
       - "vitest"
       - "run"
-      - "tests/test_guardrails.test.ts"
+      - "tests/docs_registry_guardrails.test.ts"
+      - "tests/docs_formatting_guardrails.test.ts"
+      - "tests/code_guardrails.test.ts"
+      - "tests/architecture_guardrails.test.ts"
     inputs:
       - "*.md"
       - "*.ts"
@@ -129,13 +139,18 @@ tasks:
       - "/Cargo.lock"
       - "/package.json"
       - "/pnpm-lock.yaml"
+      - "/scripts/**/*.mjs"
       - "/biome.json"
       - "/mise.toml"
       - "/.moon/*.yml"
+      - "/.idea/modules.xml"
+      - "/.idea/*.iml"
+      - "/.agents/rules/*.md"
       - "/docs/**/*.md"
       - "/packages/**/*.{toml,yml,json,html}"
       - "/packages/**/*.md"
       - "/packages/**/*.mjs"
+      - "/packages/**/*.js"
       - "/packages/**/*.rs"
       - "/packages/**/*.ts"
       - "/packages/**/*.tsx"
