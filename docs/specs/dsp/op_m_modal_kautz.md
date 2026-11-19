@@ -231,7 +231,7 @@ $$H_{\mathrm{cab},a}(z) = \sum_{k=0}^{K_{\mathrm{early}}-1} b_{\mathrm{early},a}
 2. `r[dsp.op-m.stage3.radial-gate]` **Shared Radial Gate, `retune_kautz_formant_3khz` & $\mathcal{H}_2$ Normalizer:** Validate serialized $0.25 \le r_{\mathrm{base},m} \le r_{\mathrm{high},m} = \mathrm{clamp}(r_{\mathrm{low},m} + dr_m, 0.25, 0.9995)$ (`0.85..0.9995` standard acoustic range) and $\theta_m \in [0, \pi - 10^{-4}]$ at load (`kautz_zoh.rs`). Cold orthonormal input scaling initializes $b_{\gamma,m} = \sqrt{\max(1 - r_m^2, 10^{-7})}$, while $3\text{ kHz}$ formant and damping modulation (`retune_kautz_formant_3khz`, matching `stage_targets[10]` `kautz_oct_delta` and `stage_targets[11]` `kautz_damp_delta` in `[-1.5, 1.5]`) evaluates unambiguously:
    - *Pre-Damping Radial-Band Gate (`dr > 0`):* `g_gate = clamp(0.5 + stage_targets[11], 0.0, 1.0)`, `r_base = clamp(r_low + g_gate * dr, 0.25, 0.9995)` (when `dr == 0`, `r_base = r_low`).
    - *Frequency Scaling (`stage_targets[10]`):* `freq_scale = exp2_signed_oct_f32(clamp(kautz_oct_delta, -1.5, 1.5))`; if `th_base <= 1e-6`, set `(th_new = 0.0, dtheta = 0.0)`, else `th_new = clamp(th_base * freq_scale, 1e-4, pi - 1e-4)` and `dtheta = |th_new - th_prev|`.
-   - *Radial Damping & Sweep Contraction (`stage_targets[11]`):* `damp_scale = exp2_signed_oct_f32(clamp(kautz_damp_delta, -1.5, 1.5))`, `r_damped = clamp(1.0 - (1.0 - r_base) * damp_scale, 0.25, 0.9995)`, and `r_eff = min(r_damped, max(0.9950 - 0.15 * dtheta, 0.25))` when `dtheta > 1e-6` (else `r_damped`), updating pole `lambda = r_eff * algebraic_unit_rotor(th_new)`.
+   - *Radial Damping & Sweep Contraction (`stage_targets[11]`):* `damp_scale = exp2_signed_oct_f32(clamp(kautz_damp_delta, -1.5, 1.5))`, `r_damped = clamp(1.0 - (1.0 - r_base) * damp_scale, 0.25, 0.9995)`, and `r_eff = min(r_damped, max(0.9995 - 0.15 * dtheta, 0.25))` when `dtheta > 1e-6` (else `r_damped`), updating pole `lambda = r_eff * algebraic_unit_rotor(th_new)`.
    - *Orthonormal Input Rescaling (`rsqrt_pos_nr3`):*
      $$b_{\gamma,\mathrm{eff},m} = b_{\gamma,m} \sqrt{\frac{\max(1 - r_{\mathrm{eff},m}^2, 10^{-7})}{\max(1 - r_{\mathrm{base},m}^2, 10^{-7})}}$$
      while retaining optional gain scaling $\gamma_m = \sqrt{1 - r_{\mathrm{high},m}^2}$, $b_{\gamma,m} = \kappa_m \gamma_m$, $0.5 \le \kappa_m \le 2.0$.
@@ -252,7 +252,7 @@ For a prepared onset filter $u[n] = \sum_j h_j x[n-j]$ with $H_1 = \sum_j |h_j|$
 `r[dsp.op-m.stage3.sweep-contraction]`
 
 During rapid formant sweeps ($\Delta\theta_m$ per control tick), radial-polar interpolation preserves `> 99%` of the uncontracted decay proxy $1/(1-r)$ at sweep midpoints while contracting the effective pole radius after the radial gate:
-$$r_{\text{eff}, m} = \min\Big(r_m, \max\big(0.25, 0.9950 - 0.15 |\Delta\theta_m|\big)\Big)$$
+$$r_{\text{eff}, m} = \min\Big(r_m, \max\big(0.25, 0.9995 - 0.15 |\Delta\theta_m|\big)\Big)$$
 
 ### 4.4 Two-Step Warped Laguerre/Kautz Modal Pole Extraction (Refinement 4)
 

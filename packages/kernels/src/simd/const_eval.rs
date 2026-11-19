@@ -48,58 +48,75 @@ pub struct SonaTierSpec {
 }
 
 impl SonaTierSpec {
+    /// Constructs a compile-time `SONA` tier profile with `svf_quads` derived from `blocks`
+    /// and `opt_lines = 4 * tank_quads`.
+    #[inline(always)]
+    #[must_use]
+    pub const fn new(
+        blocks: [usize; 4],
+        fir_taps: usize,
+        kautz_pairs: usize,
+        tank_quads: usize,
+        oversample_factor: usize,
+    ) -> Self {
+        let svf_quads = blocks[0] + blocks[1] + blocks[2] + blocks[3];
+        Self {
+            blocks,
+            svf_quads,
+            fir_taps,
+            kautz_pairs,
+            opt_lines: 4 * tank_quads,
+            oversample_factor,
+        }
+    }
+
+    /// Returns the total number of 4-lane `Vec4` groups across all 4 Matryoshka `SONA` blocks.
+    #[inline(always)]
+    #[must_use]
+    pub const fn total_groups(&self) -> usize {
+        self.blocks[0] + self.blocks[1] + self.blocks[2] + self.blocks[3]
+    }
+
     /// Returns the total number of 4-lane `Vec4` quads across all 4 Matryoshka `SONA` core blocks.
     #[inline(always)]
+    #[must_use]
     pub const fn block_sum(&self) -> usize {
-        self.blocks[0] + self.blocks[1] + self.blocks[2] + self.blocks[3]
+        self.total_groups()
+    }
+
+    /// Returns the total number of scalar `SONA` core lanes (`4 * self.total_groups()`).
+    #[inline(always)]
+    #[must_use]
+    pub const fn lanes(&self) -> usize {
+        4 * self.total_groups()
     }
 
     /// Returns the total number of scalar `SONA` core lanes (`4 * self.block_sum()`).
     #[inline(always)]
+    #[must_use]
     pub const fn total_lanes(&self) -> usize {
-        4 * self.block_sum()
+        self.lanes()
+    }
+
+    /// Returns the number of Stage IV `Op-T` transport delay quads (`opt_lines >> 2`).
+    #[inline(always)]
+    #[must_use]
+    pub const fn tank_quads(&self) -> usize {
+        self.opt_lines >> 2
     }
 }
 
-/// `Lite` compile-time tier capacity profile (`[1, 1, 1, 1]`, `16` lanes, `4` SVF, `32` FIR, `8` Kautz).
-pub const LITE_SPEC: SonaTierSpec = SonaTierSpec {
-    blocks: [1, 1, 1, 1],
-    svf_quads: 1,
-    fir_taps: 32,
-    kautz_pairs: 8,
-    opt_lines: 4,
-    oversample_factor: 1,
-};
+/// `Lite` compile-time tier capacity profile (`[1, 1, 1, 1]`, `16` lanes, `4` SVF quads, `32` FIR, `8` Kautz).
+pub const LITE_SPEC: SonaTierSpec = SonaTierSpec::new([1, 1, 1, 1], 32, 8, 1, 1);
 
-/// `Full` compile-time tier capacity profile (`[2, 2, 1, 1]`, `24` lanes @ `2x`, `48` FIR, `12` Kautz).
-pub const FULL_SPEC: SonaTierSpec = SonaTierSpec {
-    blocks: [2, 2, 1, 1],
-    svf_quads: 2,
-    fir_taps: 48,
-    kautz_pairs: 12,
-    opt_lines: 8,
-    oversample_factor: 2,
-};
+/// `Full` compile-time tier capacity profile (`[2, 2, 1, 1]`, `24` lanes @ `2x`, `6` SVF quads, `48` FIR, `12` Kautz).
+pub const FULL_SPEC: SonaTierSpec = SonaTierSpec::new([2, 2, 1, 1], 48, 12, 2, 2);
 
-/// `Pro` compile-time tier capacity profile (`[3, 2, 2, 1]`, `32` lanes @ `2x`, `96` FIR, `24` Kautz).
-pub const PRO_SPEC: SonaTierSpec = SonaTierSpec {
-    blocks: [3, 2, 2, 1],
-    svf_quads: 2,
-    fir_taps: 96,
-    kautz_pairs: 24,
-    opt_lines: 12,
-    oversample_factor: 2,
-};
+/// `Pro` compile-time tier capacity profile (`[3, 2, 2, 1]`, `32` lanes @ `2x`, `8` SVF quads, `96` FIR, `24` Kautz).
+pub const PRO_SPEC: SonaTierSpec = SonaTierSpec::new([3, 2, 2, 1], 96, 24, 3, 2);
 
-/// `Ultra` compile-time tier capacity profile (`[4, 3, 2, 1]`, `40` lanes @ `2x`, `128` FIR, `32` Kautz).
-pub const ULTRA_SPEC: SonaTierSpec = SonaTierSpec {
-    blocks: [4, 3, 2, 1],
-    svf_quads: 3,
-    fir_taps: 128,
-    kautz_pairs: 32,
-    opt_lines: 16,
-    oversample_factor: 2,
-};
+/// `Ultra` compile-time tier capacity profile (`[4, 3, 2, 1]`, `40` lanes @ `2x`, `10` SVF quads, `128` FIR, `32` Kautz).
+pub const ULTRA_SPEC: SonaTierSpec = SonaTierSpec::new([4, 3, 2, 1], 128, 32, 4, 2);
 
 // Pure `u32`-limb 64-bit unsigned fixed-point helpers (zero `u64`/`f64` for `spirv` cleanliness).
 
@@ -433,6 +450,27 @@ pub const fn const_dc_blocker_pole_bits(fc_hz: u32, fs_hz: u32) -> u32 {
     (exp << 23) | (sig & 0x007F_FFFF)
 }
 
+const fn verify_tier_spec(
+    spec: &SonaTierSpec,
+    expected_groups: usize,
+    expected_tank_quads: usize,
+    expected_fir: usize,
+    expected_kautz: usize,
+    expected_os: usize,
+) -> bool {
+    spec.total_groups() == expected_groups
+        && spec.block_sum() == expected_groups
+        && spec.svf_quads == expected_groups
+        && spec.svf_quads * 4 == spec.lanes()
+        && spec.lanes() == spec.total_lanes()
+        && (spec.opt_lines & 3) == 0
+        && spec.tank_quads() == expected_tank_quads
+        && spec.opt_lines == expected_tank_quads * 4
+        && spec.fir_taps == expected_fir
+        && spec.kautz_pairs == expected_kautz
+        && spec.oversample_factor == expected_os
+}
+
 const fn is_matryoshka_monotonic(lo: &SonaTierSpec, hi: &SonaTierSpec) -> bool {
     lo.blocks[0] <= hi.blocks[0]
         && lo.blocks[1] <= hi.blocks[1]
@@ -453,10 +491,14 @@ const _: () = assert!(MAX_LOOP_GAIN_F32.to_bits() == 0x3F7F_BE76);
 const _: () = assert!(MAX_LOOP_GAIN_F32 <= 0.9990);
 const _: () = assert!(MAX_PARALRU_R_F32.to_bits() == 0x3F7F_FFAC);
 const _: () = assert!(MAX_PARALRU_R_F32 <= 0.999_995);
-const _: () = assert!(LITE_SPEC.block_sum() == 4 && LITE_SPEC.total_lanes() == 16);
-const _: () = assert!(FULL_SPEC.block_sum() == 6 && FULL_SPEC.total_lanes() == 24);
-const _: () = assert!(PRO_SPEC.block_sum() == 8 && PRO_SPEC.total_lanes() == 32);
-const _: () = assert!(ULTRA_SPEC.block_sum() == 10 && ULTRA_SPEC.total_lanes() == 40);
+const _: () = assert!(LITE_SPEC.svf_quads * 4 == LITE_SPEC.lanes());
+const _: () = assert!(FULL_SPEC.svf_quads * 4 == FULL_SPEC.lanes());
+const _: () = assert!(PRO_SPEC.svf_quads * 4 == PRO_SPEC.lanes());
+const _: () = assert!(ULTRA_SPEC.svf_quads * 4 == ULTRA_SPEC.lanes());
+const _: () = assert!(verify_tier_spec(&LITE_SPEC, 4, 1, 32, 8, 1));
+const _: () = assert!(verify_tier_spec(&FULL_SPEC, 6, 2, 48, 12, 2));
+const _: () = assert!(verify_tier_spec(&PRO_SPEC, 8, 3, 96, 24, 2));
+const _: () = assert!(verify_tier_spec(&ULTRA_SPEC, 10, 4, 128, 32, 2));
 const _: () = assert!(is_matryoshka_monotonic(&LITE_SPEC, &FULL_SPEC));
 const _: () = assert!(is_matryoshka_monotonic(&FULL_SPEC, &PRO_SPEC));
 const _: () = assert!(is_matryoshka_monotonic(&PRO_SPEC, &ULTRA_SPEC));
@@ -522,10 +564,27 @@ mod tests {
         add_wide_at(&mut wide, 0, U64Limb::from_u32(1));
         assert_eq!(wide, [0, 0, 0, 1]);
 
-        assert_eq!(LITE_SPEC.total_lanes(), 16);
-        assert_eq!(FULL_SPEC.total_lanes(), 24);
-        assert_eq!(PRO_SPEC.total_lanes(), 32);
-        assert_eq!(ULTRA_SPEC.total_lanes(), 40);
+        assert_eq!(DC_BLOCKER_5HZ_48K_F32, 0.999_345_7_f32);
+        assert!(verify_tier_spec(&LITE_SPEC, 4, 1, 32, 8, 1));
+        assert!(verify_tier_spec(&FULL_SPEC, 6, 2, 48, 12, 2));
+        assert!(verify_tier_spec(&PRO_SPEC, 8, 3, 96, 24, 2));
+        assert!(verify_tier_spec(&ULTRA_SPEC, 10, 4, 128, 32, 2));
+        assert_eq!(LITE_SPEC.svf_quads, 4);
+        assert_eq!(FULL_SPEC.svf_quads, 6);
+        assert_eq!(PRO_SPEC.svf_quads, 8);
+        assert_eq!(ULTRA_SPEC.svf_quads, 10);
+        assert_eq!(LITE_SPEC.total_groups(), 4);
+        assert_eq!(FULL_SPEC.total_groups(), 6);
+        assert_eq!(PRO_SPEC.total_groups(), 8);
+        assert_eq!(ULTRA_SPEC.total_groups(), 10);
+        assert_eq!(LITE_SPEC.tank_quads(), 1);
+        assert_eq!(FULL_SPEC.tank_quads(), 2);
+        assert_eq!(PRO_SPEC.tank_quads(), 3);
+        assert_eq!(ULTRA_SPEC.tank_quads(), 4);
+        assert_eq!(LITE_SPEC.lanes(), 16);
+        assert_eq!(FULL_SPEC.lanes(), 24);
+        assert_eq!(PRO_SPEC.lanes(), 32);
+        assert_eq!(ULTRA_SPEC.lanes(), 40);
         assert!(!is_matryoshka_monotonic(&FULL_SPEC, &LITE_SPEC));
     }
 

@@ -93,8 +93,24 @@ pub trait StereoVec8: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
     /// Lane-wise branchless select: `if lhs <= rhs { if_true } else { if_false }`.
     fn select_le(lhs: Self, rhs: Self, if_true: Self, if_false: Self) -> Self;
 
+    /// Returns `true` iff all 8 Left and Right lanes satisfy `self[i] <= rhs[i]` (`false` on `NaN`).
+    #[inline(always)]
+    fn all_le(self, rhs: Self) -> bool {
+        let (sl, sr) = self.into_lr();
+        let (rl, rr) = rhs.into_lr();
+        sl.all_le(rl) && sr.all_le(rr)
+    }
+
     /// Flushes subnormals to signed zero across all 8 lanes.
     fn flush_subnormal(self) -> Self;
+
+    /// Scrubs non-finite lanes (`NaN`/`±Inf`) to `+0.0` and flushes subnormals to signed zero
+    /// across all 8 lanes.
+    #[inline(always)]
+    fn flush_recursive_state(self) -> Self {
+        let (l, r) = self.into_lr();
+        Self::from_lr(l.flush_recursive_state(), r.flush_recursive_state())
+    }
 
     /// Clamped positive reciprocal `1.0 / max(self, 1.0e-6)` using seed + 2 NR steps.
     fn rcp_pos_nr2(self) -> Self;
@@ -235,10 +251,23 @@ impl<V: KernelVec4> StereoVec8 for InterleavedStereo8<V> {
     }
 
     #[inline(always)]
+    fn all_le(self, rhs: Self) -> bool {
+        V::all_le(self.left, rhs.left) && V::all_le(self.right, rhs.right)
+    }
+
+    #[inline(always)]
     fn flush_subnormal(self) -> Self {
         Self {
             left: self.left.flush_subnormal(),
             right: self.right.flush_subnormal(),
+        }
+    }
+
+    #[inline(always)]
+    fn flush_recursive_state(self) -> Self {
+        Self {
+            left: V::flush_recursive_state(self.left),
+            right: V::flush_recursive_state(self.right),
         }
     }
 
@@ -279,6 +308,68 @@ mod tests {
     use crate::simd::GpuVec4;
     use proptest::prelude::*;
 
+    #[derive(Copy, Clone, Debug, PartialEq)]
+    struct DefaultTraitStereo8(GpuVec4, GpuVec4);
+
+    impl StereoVec8 for DefaultTraitStereo8 {
+        type Half = GpuVec4;
+
+        fn from_lr(left: Self::Half, right: Self::Half) -> Self {
+            Self(left, right)
+        }
+        fn into_lr(self) -> (Self::Half, Self::Half) {
+            (self.0, self.1)
+        }
+        fn add(self, rhs: Self) -> Self {
+            Self(self.0.add(rhs.0), self.1.add(rhs.1))
+        }
+        fn sub(self, rhs: Self) -> Self {
+            Self(self.0.sub(rhs.0), self.1.sub(rhs.1))
+        }
+        fn mul(self, rhs: Self) -> Self {
+            Self(self.0.mul(rhs.0), self.1.mul(rhs.1))
+        }
+        fn fma(self, a: Self, b: Self) -> Self {
+            Self(self.0.fma(a.0, b.0), self.1.fma(a.1, b.1))
+        }
+        fn fms(self, a: Self, b: Self) -> Self {
+            Self(self.0.fms(a.0, b.0), self.1.fms(a.1, b.1))
+        }
+        fn max(self, rhs: Self) -> Self {
+            Self(self.0.max(rhs.0), self.1.max(rhs.1))
+        }
+        fn min(self, rhs: Self) -> Self {
+            Self(self.0.min(rhs.0), self.1.min(rhs.1))
+        }
+        fn abs(self) -> Self {
+            Self(self.0.abs(), self.1.abs())
+        }
+        fn neg(self) -> Self {
+            Self(self.0.neg(), self.1.neg())
+        }
+        fn select_le(lhs: Self, rhs: Self, if_true: Self, if_false: Self) -> Self {
+            Self(
+                GpuVec4::select_le(lhs.0, rhs.0, if_true.0, if_false.0),
+                GpuVec4::select_le(lhs.1, rhs.1, if_true.1, if_false.1),
+            )
+        }
+        fn flush_subnormal(self) -> Self {
+            Self(self.0.flush_subnormal(), self.1.flush_subnormal())
+        }
+        fn rcp_pos_nr2(self) -> Self {
+            Self(self.0.rcp_pos_nr2(), self.1.rcp_pos_nr2())
+        }
+        fn rcp_pos_nr3(self) -> Self {
+            Self(self.0.rcp_pos_nr3(), self.1.rcp_pos_nr3())
+        }
+        fn rsqrt_pos_nr2(self) -> Self {
+            Self(self.0.rsqrt_pos_nr2(), self.1.rsqrt_pos_nr2())
+        }
+        fn rsqrt_pos_nr3(self) -> Self {
+            Self(self.0.rsqrt_pos_nr3(), self.1.rsqrt_pos_nr3())
+        }
+    }
+
     #[test]
     fn test_interleaved_stereo8_ops_and_mat4x4() {
         type S8 = InterleavedStereo8<GpuVec4>;
@@ -314,12 +405,40 @@ mod tests {
         let sel = S8::select_le(a, S8::zero(), S8::splat(10.0), S8::splat(-10.0));
         assert_eq!(sel.into_lr().0.to_array(), [-10.0, 10.0, -10.0, 10.0]);
 
+        assert!(a.all_le(S8::splat(3.5)));
+        assert!(!a.all_le(S8::splat(2.9)));
+        assert!(!a.all_le(S8::load_lr(&[4.0; 4], &[4.0, 4.0, 2.0, 4.0])));
+        assert!(!S8::splat_lr(f32::NAN, 0.0).all_le(S8::splat(1.0)));
+
         let sub = S8::splat_lr(f32::from_bits(1), f32::from_bits(0x8000_0001));
         let flushed = sub.flush_subnormal();
         assert_eq!(flushed.into_lr().0.to_array().map(f32::to_bits), [0; 4]);
         assert_eq!(
             flushed.into_lr().1.to_array().map(f32::to_bits),
             [0x8000_0000; 4]
+        );
+
+        let dirty = S8::load_lr(
+            &[f32::from_bits(1), f32::NAN, 1.5, f32::INFINITY],
+            &[f32::from_bits(0x8000_0001), f32::NEG_INFINITY, -2.5, 0.0],
+        );
+        let scrubbed = dirty.flush_recursive_state();
+        assert_eq!(
+            scrubbed.into_lr().0.to_array().map(f32::to_bits),
+            [0, 0, 1.5_f32.to_bits(), 0]
+        );
+        assert_eq!(
+            scrubbed.into_lr().1.to_array().map(f32::to_bits),
+            [0x8000_0000, 0, (-2.5_f32).to_bits(), 0]
+        );
+
+        let da = DefaultTraitStereo8::from_lr(a.left, a.right);
+        let d_dirty = DefaultTraitStereo8::from_lr(dirty.left, dirty.right);
+        assert!(da.all_le(DefaultTraitStereo8::splat(3.5)));
+        assert!(!da.all_le(DefaultTraitStereo8::splat(2.9)));
+        assert_eq!(
+            d_dirty.flush_recursive_state().into_lr(),
+            scrubbed.into_lr()
         );
 
         let pos = S8::load_lr(&[1.0, 2.0, 4.0, 8.0], &[0.5, 4.0, 9.0, 16.0]);
@@ -349,9 +468,18 @@ mod tests {
         fn prop_interleaved_stereo8_matches_lane_algebra(
             l in prop::array::uniform4(-10.0_f32..10.0_f32),
             r in prop::array::uniform4(-10.0_f32..10.0_f32),
+            rl in prop::array::uniform4(-10.0_f32..10.0_f32),
+            rr in prop::array::uniform4(-10.0_f32..10.0_f32),
         ) {
             type S8 = InterleavedStereo8<GpuVec4>;
             let v = S8::load_lr(&l, &r);
+            let rhs = S8::load_lr(&rl, &rr);
+            let dv = DefaultTraitStereo8::from_lr(v.left, v.right);
+            let drhs = DefaultTraitStereo8::from_lr(rhs.left, rhs.right);
+            let expected_le = (0..4).all(|i| l[i] <= rl[i] && r[i] <= rr[i]);
+            prop_assert_eq!(v.all_le(rhs), expected_le);
+            prop_assert_eq!(dv.all_le(drhs), expected_le);
+
             let (sum_l, sum_r) = v.horizontal_sum_lr();
             prop_assert_eq!(sum_l, (l[0] + l[1]) + (l[2] + l[3]));
             prop_assert_eq!(sum_r, (r[0] + r[1]) + (r[2] + r[3]));

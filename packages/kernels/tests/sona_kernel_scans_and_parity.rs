@@ -7,14 +7,15 @@
 //! verify[train.pipeline.webgpu-scans-and-ozaki]
 
 use dnam_kernels::{
-    ComplexModalScanElem, GpuVec4, HilbertH1Kernel, InterleavedStereo8, KautzQuadState, KernelVec4,
-    ParaLruParams, SonaBlockParamsStereo4, SonaBlockStateStereo8, SonaParaLruCoeffs4,
-    SonaToneWeights4, StereoVec8, T1SubHarmonicKernel, TptScanElem, TptSvfCoeffs4,
-    accum_ozaki_chunk_i32, apply_tpt_init, compose_complex_modal_scan, compose_tpt_scan,
+    ComplexModalScanElem, FULL_SPEC, GpuVec4, HilbertH1Kernel, InterleavedStereo8, KautzQuadState,
+    KernelVec4, LITE_SPEC, PRO_SPEC, ParaLruParams, SonaBlockParamsStereo4, SonaBlockStateStereo8,
+    SonaParaLruCoeffs4, SonaToneWeights4, StereoVec8, T1DcBlockerKernel, T1SubHarmonicKernel,
+    TptScanElem, TptSvfCoeffs4, ULTRA_SPEC, accum_ozaki_chunk_i32, apply_tpt_init,
+    clamp_transport_delay_f32, compose_complex_modal_scan, compose_tpt_scan,
     eval_poly_adaa1_odd_even_vec4, eval_poly_adaa1_stereo8, pow2_ceil_fp32,
-    prewarp_tan_pi_f_over_fs_f32, reconstruct_ozaki_dot_f64, run_paralru_newton_scan_tile,
-    step_kautz_quad_stereo8, step_kautz_quad_vec4, step_paralru_vec4, step_sona_block_stereo8,
-    step_tpt_svf_stereo8, step_tpt_svf_vec4,
+    prewarp_tan_pi_f_over_fs_f32, reconstruct_ozaki_dot_f64, run_paralru_adjoint_scan_tile,
+    run_paralru_forward_tile, step_kautz_quad_stereo8, step_kautz_quad_vec4, step_paralru_vec4,
+    step_sona_block_stereo8, step_tpt_svf_stereo8, step_tpt_svf_vec4,
 };
 use proptest::prelude::*;
 
@@ -169,13 +170,21 @@ fn test_sona_kernels_zero_dc_and_0ulp_stereo_and_watermark_invariance() {
         assert_eq!(yv4_r.to_bits(), ys8_r.to_bits());
     }
 
+    for spec in [LITE_SPEC, FULL_SPEC, PRO_SPEC, ULTRA_SPEC] {
+        assert_eq!(spec.svf_quads * 4, spec.lanes());
+    }
+    assert_eq!(clamp_transport_delay_f32(200.0, 128, false), 126.0);
+    assert_eq!(clamp_transport_delay_f32(200.0, 128, true), 125.0);
+
+    let mut dc_blocker = T1DcBlockerKernel::new();
     let mut hilbert = HilbertH1Kernel::new();
     let mut tracker = T1SubHarmonicKernel::new();
     for _ in 0..64 {
-        let (hi, hq) = hilbert.step(0.0);
+        let xd = dc_blocker.step(0.0);
+        let (hi, hq) = hilbert.step(xd);
         assert_eq!(hi.to_bits(), 0);
         assert_eq!(hq.to_bits(), 0);
-        assert_eq!(tracker.step(hi, hq).to_bits(), 0);
+        assert_eq!(tracker.step(hi, hq).map(f32::to_bits), [0; 4]);
     }
 
     // Check Kautz associative complex modal scan parity on lane 0.
@@ -244,7 +253,25 @@ proptest! {
         prop_assert!((s1.to_array()[0] - scan_s[0]).abs() < 1.0e-5);
         prop_assert!((s2.to_array()[0] - scan_s[1]).abs() < 1.0e-5);
 
-        // 2. K=3 ParaLRU Newton scan converges cleanly to sequential recurrence.
+        // 1b. 256-wide TPT-SVF scan honors scale-aware <= 1.0e-4 * max(1.0, peak) at +-64.0.
+        let mut s1_64 = GpuVec4::zero();
+        let mut s2_64 = GpuVec4::zero();
+        let mut tpt_acc_64 = TptScanElem::identity();
+        let mut peak_64 = 1.0_f32;
+        for t in 0..256 {
+            let u = inputs[t % inputs.len()] * 25.0;
+            let _ = step_tpt_svf_vec4(GpuVec4::splat(u), &mut s1_64, &mut s2_64, &coeffs);
+            tpt_acc_64 = compose_tpt_scan(tpt_acc_64, TptScanElem::from_step(a1, a2, a3, u));
+            peak_64 = peak_64
+                .max(s1_64.to_array()[0].abs())
+                .max(s2_64.to_array()[0].abs());
+        }
+        let scan_s_64 = apply_tpt_init(tpt_acc_64, [0.0, 0.0]);
+        let tree_tol = 1.0e-4 * peak_64;
+        prop_assert!((s1_64.to_array()[0] - scan_s_64[0]).abs() <= tree_tol);
+        prop_assert!((s2_64.to_array()[0] - scan_s_64[1]).abs() <= tree_tol);
+
+        // 2. ParaLRU exact forward tile (0-ULP) and 2-tile chained reverse adjoint scan.
         let mut seq_tile = [0.0_f32; 16];
         let mut lru_state = GpuVec4::zero();
         let mut tile_in = [0.0_f32; 16];
@@ -260,7 +287,7 @@ proptest! {
             seq_tile[i] = v.to_array()[0];
         }
         let lru_p = ParaLruParams::clamped(alpha_rel, alpha_atk, kappa);
-        let scan_tile = run_paralru_newton_scan_tile::<16, 3>(
+        let (fwd_tile, fwd_end) = run_paralru_forward_tile::<16>(
             &tile_in,
             0.0,
             lru_p.alpha_rel,
@@ -268,8 +295,26 @@ proptest! {
             lru_p.kappa,
         );
         for i in 0..16 {
-            prop_assert!((seq_tile[i] - scan_tile[i]).abs() < 1.0e-3);
+            prop_assert_eq!(fwd_tile[i].to_bits(), seq_tile[i].to_bits());
         }
+        prop_assert_eq!(fwd_end.to_bits(), seq_tile[15].to_bits());
+
+        let adj_v = [0.5_f32; 16];
+        let full_g =
+            run_paralru_adjoint_scan_tile::<16>(&tile_in, &fwd_tile, 0.0, lru_p, &adj_v, 0.25);
+        let mut t0 = [0.0_f32; 8];
+        let mut t1 = [0.0_f32; 8];
+        let mut v0 = [0.0_f32; 8];
+        let mut v1 = [0.0_f32; 8];
+        t0.copy_from_slice(&tile_in[..8]);
+        t1.copy_from_slice(&tile_in[8..]);
+        v0.copy_from_slice(&fwd_tile[..8]);
+        v1.copy_from_slice(&fwd_tile[8..]);
+        let g1 = run_paralru_adjoint_scan_tile::<8>(&t1, &v1, v0[7], lru_p, &[0.5; 8], 0.25);
+        let g0 =
+            run_paralru_adjoint_scan_tile::<8>(&t0, &v0, 0.0, lru_p, &[0.5; 8], g1.adj_v_init);
+        prop_assert!((g0.adj_v_init - full_g.adj_v_init).abs() < 1.0e-5);
+        prop_assert!(((g0.adj_alpha_rel + g1.adj_alpha_rel) - full_g.adj_alpha_rel).abs() < 1.0e-4);
 
         // 3. Odd-lane sign-flip watermark gauge (s_i in {-1, +1}) preserves 0-ULP invariance in ADAA1.
         let s = if sign_flip { -1.0_f32 } else { 1.0_f32 };

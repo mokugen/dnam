@@ -115,8 +115,8 @@ pub fn step_tpt_svf_vec4<V: KernelVec4>(
     let v3 = u.sub(*s2);
     let v1 = coeffs.a1.mul(*s1).fma(coeffs.a2, v3);
     let v2 = s2.fma(coeffs.a2, *s1).fma(coeffs.a3, v3);
-    *s1 = v1.add(v1).sub(*s1);
-    *s2 = v2.add(v2).sub(*s2);
+    *s1 = v1.add(v1).sub(*s1).flush_recursive_state();
+    *s2 = v2.add(v2).sub(*s2).flush_recursive_state();
     let hp = u.fms(coeffs.k, v1).sub(v2);
     let ap = u.fms(coeffs.two_k, v1);
     TptSvfOutputs {
@@ -144,8 +144,8 @@ pub fn step_tpt_svf_stereo8<S: StereoVec8>(
     let v3 = u.sub(*s2);
     let v1 = a1.mul(*s1).fma(a2, v3);
     let v2 = s2.fma(a2, *s1).fma(a3, v3);
-    *s1 = v1.add(v1).sub(*s1);
-    *s2 = v2.add(v2).sub(*s2);
+    *s1 = v1.add(v1).sub(*s1).flush_recursive_state();
+    *s2 = v2.add(v2).sub(*s2).flush_recursive_state();
     let hp = u.fms(k, v1).sub(v2);
     let ap = u.fms(two_k, v1);
     TptSvfOutputs {
@@ -388,6 +388,19 @@ mod tests {
             }
         }
 
+        let id_coeffs = TptSvfCoeffs4 {
+            a1: GpuVec4::splat(1.0),
+            a2: GpuVec4::zero(),
+            a3: GpuVec4::zero(),
+            k: GpuVec4::zero(),
+            two_k: GpuVec4::zero(),
+        };
+        let mut sub_s1 = GpuVec4::splat(f32::from_bits(1));
+        let mut sub_s2 = GpuVec4::splat(f32::from_bits(1));
+        let _ = step_tpt_svf_vec4(GpuVec4::zero(), &mut sub_s1, &mut sub_s2, &id_coeffs);
+        assert_eq!(sub_s1.to_array(), [0.0; 4]);
+        assert_eq!(sub_s2.to_array(), [0.0; 4]);
+
         let mut st_s1 = InterleavedStereo8::<GpuVec4>::zero();
         let mut st_s2 = InterleavedStereo8::<GpuVec4>::zero();
         let u_l = GpuVec4::from_array([0.5, -0.75, 1.25, -0.25]);
@@ -505,19 +518,14 @@ mod tests {
             }
 
             // Binary-tree associative reduction across all 16 elements.
-            let mut l1 = [TptScanElem::identity(); 8];
-            for i in 0..8 {
-                l1[i] = compose_tpt_scan(elems[2 * i], elems[2 * i + 1]);
-            }
-            let mut l2 = [TptScanElem::identity(); 4];
-            for i in 0..4 {
-                l2[i] = compose_tpt_scan(l1[2 * i], l1[2 * i + 1]);
-            }
-            let l3 = [
+            let l1: [TptScanElem; 8] =
+                core::array::from_fn(|i| compose_tpt_scan(elems[2 * i], elems[2 * i + 1]));
+            let l2: [TptScanElem; 4] =
+                core::array::from_fn(|i| compose_tpt_scan(l1[2 * i], l1[2 * i + 1]));
+            let tree_total = compose_tpt_scan(
                 compose_tpt_scan(l2[0], l2[1]),
                 compose_tpt_scan(l2[2], l2[3]),
-            ];
-            let tree_total = compose_tpt_scan(l3[0], l3[1]);
+            );
             let tree_final = apply_tpt_init(tree_total, [s0_1, s0_2]);
             prop_assert!((tree_final[0] - seq_s1.to_array()[0]).abs() < 1.0e-4);
             prop_assert!((tree_final[1] - seq_s2.to_array()[0]).abs() < 1.0e-4);
@@ -545,8 +553,7 @@ mod tests {
                 a2[t] = coeffs.a2.to_array()[0];
                 a3[t] = coeffs.a3.to_array()[0];
                 s_prev_hist[t] = s_curr;
-                let step = TptScanElem::from_step(a1[t], a2[t], a3[t], u_seq[t]);
-                s_curr = apply_tpt_init(step, s_curr);
+                s_curr = apply_tpt_init(TptScanElem::from_step(a1[t], a2[t], a3[t], u_seq[t]), s_curr);
             }
 
             let mut adj_elems = [TptAdjointElem::identity(); 8];
@@ -559,8 +566,7 @@ mod tests {
             for rev in 0..8 {
                 let t = 7 - rev;
                 let lam = [w1_seq[t] + rev_acc.g0, w2_seq[t] + rev_acc.g1];
-                let two_a2 = a2[t] + a2[t];
-                let two_a3 = a3[t] + a3[t];
+                let (two_a2, two_a3) = (a2[t] + a2[t], a3[t] + a3[t]);
                 adj_u[t] = two_a2 * lam[0] + two_a3 * lam[1];
                 adj_a1[t] = 2.0 * lam[0] * s_prev_hist[t][0];
                 adj_a2[t] = 2.0 * lam[0] * (u_seq[t] - s_prev_hist[t][1])
@@ -573,75 +579,60 @@ mod tests {
             }
             let adj_s0 = apply_tpt_adjoint(rev_acc, [0.0, 0.0]);
 
-            // Tree-reduced check of reverse scan composition.
-            let p01 = compose_tpt_adjoint_scan(adj_elems[0], adj_elems[1]);
-            let p23 = compose_tpt_adjoint_scan(adj_elems[2], adj_elems[3]);
-            let p45 = compose_tpt_adjoint_scan(adj_elems[4], adj_elems[5]);
-            let p67 = compose_tpt_adjoint_scan(adj_elems[6], adj_elems[7]);
-            let q03 = compose_tpt_adjoint_scan(p01, p23);
-            let q47 = compose_tpt_adjoint_scan(p45, p67);
+            let q03 = compose_tpt_adjoint_scan(
+                compose_tpt_adjoint_scan(adj_elems[0], adj_elems[1]),
+                compose_tpt_adjoint_scan(adj_elems[2], adj_elems[3]),
+            );
+            let q47 = compose_tpt_adjoint_scan(
+                compose_tpt_adjoint_scan(adj_elems[4], adj_elems[5]),
+                compose_tpt_adjoint_scan(adj_elems[6], adj_elems[7]),
+            );
             let tree_adj = compose_tpt_adjoint_scan(q03, q47);
             prop_assert!((tree_adj.g0 - adj_s0[0]).abs() < 1.0e-5);
             prop_assert!((tree_adj.g1 - adj_s0[1]).abs() < 1.0e-5);
 
             // Finite-difference checks against f64 oracle.
-            let a1_64: Vec<f64> = a1.iter().map(|&v| v as f64).collect();
-            let a2_64: Vec<f64> = a2.iter().map(|&v| v as f64).collect();
-            let a3_64: Vec<f64> = a3.iter().map(|&v| v as f64).collect();
+            let (a1_64, a2_64, a3_64) = (a1.map(f64::from), a2.map(f64::from), a3.map(f64::from));
             let u_64: Vec<f64> = u_seq.iter().map(|&v| v as f64).collect();
             let w1_64: Vec<f64> = w1_seq.iter().map(|&v| v as f64).collect();
             let w2_64: Vec<f64> = w2_seq.iter().map(|&v| v as f64).collect();
             let s0_64 = [s0_1 as f64, s0_2 as f64];
             let eps = 1.0e-6_f64;
+            let fd_s0 = |d0: f64, d1: f64| {
+                let hi = tpt_forward_loss_f64(
+                    &a1_64, &a2_64, &a3_64, &u_64, [s0_64[0] + d0, s0_64[1] + d1], &w1_64, &w2_64,
+                );
+                let lo = tpt_forward_loss_f64(
+                    &a1_64, &a2_64, &a3_64, &u_64, [s0_64[0] - d0, s0_64[1] - d1], &w1_64, &w2_64,
+                );
+                (hi - lo) / (2.0 * eps)
+            };
+            prop_assert!((adj_s0[0] as f64 - fd_s0(eps, 0.0)).abs() < 1.0e-4);
+            prop_assert!((adj_s0[1] as f64 - fd_s0(0.0, eps)).abs() < 1.0e-4);
 
-            let fd_s0_0 = (tpt_forward_loss_f64(
-                &a1_64, &a2_64, &a3_64, &u_64, [s0_64[0] + eps, s0_64[1]], &w1_64, &w2_64,
-            ) - tpt_forward_loss_f64(
-                &a1_64, &a2_64, &a3_64, &u_64, [s0_64[0] - eps, s0_64[1]], &w1_64, &w2_64,
-            )) / (2.0 * eps);
-            let fd_s0_1 = (tpt_forward_loss_f64(
-                &a1_64, &a2_64, &a3_64, &u_64, [s0_64[0], s0_64[1] + eps], &w1_64, &w2_64,
-            ) - tpt_forward_loss_f64(
-                &a1_64, &a2_64, &a3_64, &u_64, [s0_64[0], s0_64[1] - eps], &w1_64, &w2_64,
-            )) / (2.0 * eps);
-            prop_assert!((adj_s0[0] as f64 - fd_s0_0).abs() < 1.0e-4);
-            prop_assert!((adj_s0[1] as f64 - fd_s0_1).abs() < 1.0e-4);
-
+            let fd_slice = |src: &[f64], t: usize, f: &dyn Fn(&[f64]) -> f64| {
+                let mut v = src.to_vec();
+                v[t] += eps;
+                let hi = f(&v);
+                v[t] -= 2.0 * eps;
+                (hi - f(&v)) / (2.0 * eps)
+            };
             for t in 0..8 {
-                let mut u_p = u_64.clone();
-                let mut u_m = u_64.clone();
-                u_p[t] += eps;
-                u_m[t] -= eps;
-                let fd_u = (tpt_forward_loss_f64(&a1_64, &a2_64, &a3_64, &u_p, s0_64, &w1_64, &w2_64)
-                    - tpt_forward_loss_f64(&a1_64, &a2_64, &a3_64, &u_m, s0_64, &w1_64, &w2_64))
-                    / (2.0 * eps);
+                let fd_u = fd_slice(&u_64, t, &|v| {
+                    tpt_forward_loss_f64(&a1_64, &a2_64, &a3_64, v, s0_64, &w1_64, &w2_64)
+                });
+                let fd_a1 = fd_slice(&a1_64, t, &|v| {
+                    tpt_forward_loss_f64(v, &a2_64, &a3_64, &u_64, s0_64, &w1_64, &w2_64)
+                });
+                let fd_a2 = fd_slice(&a2_64, t, &|v| {
+                    tpt_forward_loss_f64(&a1_64, v, &a3_64, &u_64, s0_64, &w1_64, &w2_64)
+                });
+                let fd_a3 = fd_slice(&a3_64, t, &|v| {
+                    tpt_forward_loss_f64(&a1_64, &a2_64, v, &u_64, s0_64, &w1_64, &w2_64)
+                });
                 prop_assert!((adj_u[t] as f64 - fd_u).abs() < 1.0e-4);
-
-                let mut a1_p = a1_64.clone();
-                let mut a1_m = a1_64.clone();
-                a1_p[t] += eps;
-                a1_m[t] -= eps;
-                let fd_a1 = (tpt_forward_loss_f64(&a1_p, &a2_64, &a3_64, &u_64, s0_64, &w1_64, &w2_64)
-                    - tpt_forward_loss_f64(&a1_m, &a2_64, &a3_64, &u_64, s0_64, &w1_64, &w2_64))
-                    / (2.0 * eps);
                 prop_assert!((adj_a1[t] as f64 - fd_a1).abs() < 1.0e-4);
-
-                let mut a2_p = a2_64.clone();
-                let mut a2_m = a2_64.clone();
-                a2_p[t] += eps;
-                a2_m[t] -= eps;
-                let fd_a2 = (tpt_forward_loss_f64(&a1_64, &a2_p, &a3_64, &u_64, s0_64, &w1_64, &w2_64)
-                    - tpt_forward_loss_f64(&a1_64, &a2_m, &a3_64, &u_64, s0_64, &w1_64, &w2_64))
-                    / (2.0 * eps);
                 prop_assert!((adj_a2[t] as f64 - fd_a2).abs() < 1.0e-4);
-
-                let mut a3_p = a3_64.clone();
-                let mut a3_m = a3_64.clone();
-                a3_p[t] += eps;
-                a3_m[t] -= eps;
-                let fd_a3 = (tpt_forward_loss_f64(&a1_64, &a2_64, &a3_p, &u_64, s0_64, &w1_64, &w2_64)
-                    - tpt_forward_loss_f64(&a1_64, &a2_64, &a3_m, &u_64, s0_64, &w1_64, &w2_64))
-                    / (2.0 * eps);
                 prop_assert!((adj_a3[t] as f64 - fd_a3).abs() < 1.0e-4);
             }
         }

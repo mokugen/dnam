@@ -37,11 +37,16 @@ const LOOP_KNEE_THREE_HALVES: f32 = 1.5;
 /// Stage IV cubic soft-knee cubic coefficient `0.5` (`ref[dsp.stage4.loop-saturator]`).
 const LOOP_KNEE_HALF: f32 = 0.5;
 
+/// Minimum causal delay floor in samples guaranteeing zero crossbar write collision
+/// (`ref[dsp.op-t.ring.q0-32-pointer]`).
+const MIN_CAUSAL_DELAY_SAMPLES: f32 = 4.0;
+
 const _: () = assert!(INV_6 > 0.16 && INV_6 < 0.17);
 const _: () = assert!(INV_3 > 0.33 && INV_3 < 0.34);
 const _: () = assert!(TWO_THIRDS > 0.66 && TWO_THIRDS < 0.67);
 const _: () = assert!(SCHROEDER_MAX_ABS_GAIN < MAX_LOOP_GAIN_F32);
 const _: () = assert!(LOOP_LIMIT_MIN_SIGMA > 0.0 && LOOP_LIMIT_MIN_SIGMA < LOOP_LIMIT_MAX_SIGMA);
+const _: () = assert!(MIN_CAUSAL_DELAY_SAMPLES == 4.0);
 
 #[inline(always)]
 const fn abs_f32(x: f32) -> f32 {
@@ -390,7 +395,7 @@ pub fn write_ring_with_freeze_f32(
 #[inline(always)]
 #[must_use]
 pub fn coercive_loop_limit_vec4<V: KernelVec4>(x: V, soft_limit: V, max_gain: V) -> V {
-    let x_finite = V::select_le(V::splat(-f32::INFINITY), x, x, V::zero());
+    let x_finite = V::select_le(x.abs(), V::splat(f32::MAX), x, V::zero());
     let g = max_gain.clamp(V::zero(), V::splat(MAX_LOOP_GAIN_F32));
     let sigma = soft_limit.clamp(
         V::splat(LOOP_LIMIT_MIN_SIGMA),
@@ -407,6 +412,29 @@ pub fn coercive_loop_limit_vec4<V: KernelVec4>(x: V, soft_limit: V, max_gain: V)
         .mul(v);
     let sat = sigma.mul(cubic).clamp(sigma.neg(), sigma);
     g.mul(sat).flush_subnormal()
+}
+
+/// Clamps a commanded `Op-T` transport delay (in samples) to the causal Catmull-Rom safe range
+/// `[4.0, (ring_capacity - 2) as f32]`, tightening the upper bound to `(ring_capacity - 3) as f32`
+/// when `lfo_modulated == true` so LFO modulation never collides with the backward write slot
+/// (`ref[dsp.op-t.ring.capacity]`, `ref[dsp.op-t.ring.q0-32-pointer]`).
+///
+/// Returns `4.0` when `delay_samples` is non-finite or `ring_capacity` is smaller than the causal
+/// minimum (`6` unmodulated, `7` LFO-modulated).
+#[inline(always)]
+#[must_use]
+pub fn clamp_transport_delay_f32(
+    delay_samples: f32,
+    ring_capacity: usize,
+    lfo_modulated: bool,
+) -> f32 {
+    let tail_margin = if lfo_modulated { 3 } else { 2 };
+    let min_cap = 4 + tail_margin;
+    if !delay_samples.is_finite() || ring_capacity < min_cap {
+        return MIN_CAUSAL_DELAY_SAMPLES;
+    }
+    let max_tau = (ring_capacity - tail_margin) as f32;
+    delay_samples.clamp(MIN_CAUSAL_DELAY_SAMPLES, max_tau)
 }
 
 #[cfg(test)]
@@ -511,6 +539,13 @@ mod tests {
         assert!((limited[1] + 0.9 * 0.8).abs() < 1.0e-5);
         assert!(limited[2] > 0.095 && limited[2] < 0.1);
         assert_eq!(limited[3], 0.0);
+        let scrubbed = coercive_loop_limit_vec4(
+            GpuVec4::from_array([f32::INFINITY, f32::NEG_INFINITY, f32::NAN, -0.0]),
+            GpuVec4::splat(0.8),
+            GpuVec4::splat(0.9),
+        )
+        .to_array();
+        assert_eq!(scrubbed, [0.0; 4]);
 
         assert_eq!(floor_f32(f32::NAN), 0.0);
         assert_eq!(floor_f32(1.0e9), 1.0e9);
@@ -519,6 +554,23 @@ mod tests {
         assert_eq!(frac_unit_f32(1.0 - 1.0e-20), 0.0);
         assert_eq!(split_nonneg_delay_f32(f32::NAN, 7), (0, 0.0));
         assert_eq!(split_nonneg_delay_f32(2.0 - 1.0e-9, 7), (2, 0.0));
+    }
+
+    /// verify[dsp.op-t.ring.capacity]
+    /// verify[dsp.op-t.ring.q0-32-pointer]
+    #[test]
+    fn test_clamp_transport_delay_bounds_and_lfo_margins() {
+        assert_eq!(clamp_transport_delay_f32(10.0, 0, false), 4.0);
+        assert_eq!(clamp_transport_delay_f32(10.0, 5, false), 4.0);
+        assert_eq!(clamp_transport_delay_f32(10.0, 6, false), 4.0);
+        assert_eq!(clamp_transport_delay_f32(10.0, 6, true), 4.0);
+        assert_eq!(clamp_transport_delay_f32(10.0, 7, true), 4.0);
+        assert_eq!(clamp_transport_delay_f32(f32::NAN, 128, false), 4.0);
+        assert_eq!(clamp_transport_delay_f32(f32::INFINITY, 128, true), 4.0);
+        assert_eq!(clamp_transport_delay_f32(-5.0, 128, false), 4.0);
+        assert_eq!(clamp_transport_delay_f32(64.5, 128, false), 64.5);
+        assert_eq!(clamp_transport_delay_f32(200.0, 128, false), 126.0);
+        assert_eq!(clamp_transport_delay_f32(200.0, 128, true), 125.0);
     }
 
     proptest! {
@@ -573,6 +625,23 @@ mod tests {
                 prop_assert!(out[lane].is_finite());
                 prop_assert!(out[lane].abs() <= eff_gain * soft_limit + 1.0e-5);
                 prop_assert!(out[lane].abs() <= x[lane].abs() + 1.0e-6);
+            }
+        }
+
+        #[test]
+        fn prop_clamp_transport_delay_enforces_causal_ceiling(
+            delay in -100.0_f32..300_000.0_f32,
+            cap in 0_usize..=262_144_usize,
+            lfo_modulated in prop::bool::ANY,
+        ) {
+            let clamped = clamp_transport_delay_f32(delay, cap, lfo_modulated);
+            let margin = if lfo_modulated { 3 } else { 2 };
+            let min_cap = 4 + margin;
+            prop_assert!(clamped.is_finite() && clamped >= 4.0);
+            if cap < min_cap {
+                prop_assert_eq!(clamped, 4.0);
+            } else {
+                prop_assert!(clamped <= (cap - margin) as f32);
             }
         }
     }

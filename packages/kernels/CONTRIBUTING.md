@@ -9,10 +9,10 @@ This guide defines the safety, numerical, `#![no_std]` / `SPIR-V`, testing, and 
 Consult [`AGENTS.md`](AGENTS.md) for the file routing table:
 
 - **`src/lib.rs`:** Crate root enforcing `#![cfg_attr(not(test), no_std)]` and `#![forbid(unsafe_code)]`.
-- **`src/simd.rs` & `src/simd/{const_eval,fp16,stereo8}.rs`:** `KernelVec4`, `GpuVec4`, `StereoVec8`, `InterleavedStereo8<V>`, compile-time `const fn` seeds/poles, branchless `fp16` codecs, and subnormal bit flushing.
-- **`src/ozaki_i32.rs`:** `pow2_ceil_fp32` and fast-math-immune `3 × 8-bit` `i32` Ozaki slicing primitives.
-- **`src/sona_core.rs` & `src/sona_core/{tpt_svf,paralru,poly_adaa}.rs`:** Passive `2×2` ZDF `TPT-SVF`, contractive `1D` `ParaLRU` + `K = 3` Newton scan, and pure-`f32` `PolyADAA1` + `C²` wavefolder.
-- **`src/modal_and_transport.rs` & `src/modal_and_transport/{kautz,op_t,op_p}.rs`:** Contractive `f32` rotor, `4`-lane `Q0.32` quadrature phasor bank, 4-lane/stereo `Kautz` resonators & associative complex modal scans, Catmull-Rom `f32`/`fp16` readers, `M=2`/`M=3` pitch/barberpole windowing, partitioned Schroeder diffusers, `0-ULP` freeze ring writes, coercive loop limiter, and pure-`f32` `H1` Hilbert + `T1` sub-harmonic `Op-P` kernels.
+- **`src/simd.rs` & `src/simd/{const_eval,fp16,gpu_vec4,stereo8}.rs`:** `KernelVec4`, `GpuVec4`, `StereoVec8`, `InterleavedStereo8<V>`, compile-time `const fn` seeds/poles, branchless `fp16` codecs, and subnormal/NaN bit flushing.
+- **`src/ozaki_i32.rs`:** `pow2_ceil_fp32` and fast-math-immune `(2^8, 2^16, 2^24)` `3 × 8-bit` `i32` Ozaki slicing primitives.
+- **`src/sona_core.rs` & `src/sona_core/{tpt_svf,paralru/{scans,adjoint},poly_adaa/wavefolder}.rs`:** Passive `2×2` ZDF `TPT-SVF`, contractive `1D` `ParaLRU` exact `0-ULP` forward tiles + `O(log2 N)` linear reverse-adjoint suffix scans, and pure-`f32` `PolyADAA1` + `C²` wavefolder.
+- **`src/modal_and_transport.rs` & `src/modal_and_transport/{kautz/rotor_and_phasor,op_t,op_p}.rs`:** Contractive `f32` rotor, `4`-lane `Q0.32` quadrature phasor bank, 4-lane/stereo `Kautz` resonators (`0.9995` ceiling) & associative complex modal scans, Catmull-Rom `f32`/`fp16` readers, `clamp_transport_delay_f32`, `M=2`/`M=3` pitch/barberpole windowing, partitioned Schroeder diffusers, `0-ULP` freeze ring writes, coercive loop limiter, and `5 Hz` upstream DC blocker + `H1` Hilbert + `4`-feature `T1` `Op-P` kernels.
 - **`tests/sona_kernel_scans_and_parity.rs`:** Cross-module associative scan, Ozaki, and stereo parity integration tests.
 
 ---
