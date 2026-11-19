@@ -3,7 +3,7 @@ id: ADR-0008
 title: "Per-Stem uplo='U' Kronecker Statistics & 192-Bit Wide-Significand Gram Contraction"
 status: superseded
 supersedes: []
-superseded_by: ADR-0021
+superseded_by: ADR-0022
 specs:
   - docs/specs/training/four_stage_pipeline.md
   - docs/specs/training/iterative_resume_and_caching.md
@@ -16,6 +16,9 @@ requirements:
 ---
 
 # ADR-0008: Per-Stem `uplo='U'` Kronecker Statistics & 192-Bit Wide-Significand Gram Contraction
+
+> [!NOTE]
+> **Superseded by [`ADR-0022`](0022-sona-state-space-operator-and-webgpu-architecture.md)** (originally superseded by [`ADR-0021`](0021-unified-matryoshka-gru-and-direct-register-stages.md)). `uplo='U'` Gram statistics and wide-accumulator precision remain active in `SONA` `v3.0`.
 
 This record justifies the per-stem sufficient-statistic layout and wide-significand Gram accumulation in [`../specs/training/four_stage_pipeline.md`](../specs/training/four_stage_pipeline.md), [`../specs/training/iterative_resume_and_caching.md`](../specs/training/iterative_resume_and_caching.md), and [`../specs/containers/project_container_format.md`](../specs/containers/project_container_format.md) fulfilling [`REQ-3.1`–`REQ-3.3`, `REQ-4.2`](../requirements/system_goals_and_requirements.md).
 

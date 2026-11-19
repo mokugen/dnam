@@ -1,7 +1,7 @@
 //! TORA Stages Pipeline Core: Stage 0 8-Port Router, Physical `v3` Stages I–IV & Direct Readout.
 //!
 //! Canonical Reference: `docs/specs/dsp/router_and_stages_topology.md` and
-//! `docs/specs/architecture/tora_architecture.md`.
+//! `docs/specs/architecture/sona_architecture.md`.
 //!
 //! Direct per-sample calls require a caller-held [`crate::FtzDazGuard`] for the
 //! enclosing batch; engine block methods provide the guard automatically.

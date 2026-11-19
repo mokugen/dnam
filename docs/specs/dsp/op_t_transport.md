@@ -2,7 +2,7 @@
 id: spec.dsp.op-t
 title: "Op-T: Universal Transport, Granular Windowing & All-Pass Diffusion Operator"
 status: canonical
-version: "1.0.0"
+version: "3.0.0"
 domain: dsp
 rule_prefixes:
   - "r[dsp.op-t."
@@ -12,12 +12,14 @@ requirements:
 adrs:
   - ADR-0006
   - ADR-0019
-  - ADR-0021
+  - ADR-0022
 ---
 
 # Op-T: Universal Transport, Granular Windowing & All-Pass Diffusion Operator
 
-This specification defines **Op-T (Transport)** ([`packages/engine/src/operators/op_t.rs`](../../../packages/engine/README.md), [`packages/capture/src/`](../../../packages/capture/README.md)), the universal operator kernel governing fractional delay transport, pitch shifting, time-warped granular grains, barberpole phase sweeps, bounded-history feedback guards, and in-buffer Schroeder all-pass diffusion across **Dynamic Neural Audio Modeler (DNAM)** ([`tora_architecture.md`](../architecture/tora_architecture.md)). For R&D counterexamples and candidate comparisons, see [`../../adr/0006-model-declared-delays-and-tank-feedback-guard.md`](../../adr/0006-model-declared-delays-and-tank-feedback-guard.md).
+This specification defines **Op-T (Transport)** (shared `#![no_std]` kernels in `packages/kernels/` `dnam-kernels`, runtime wiring in [`packages/engine/src/operators/op_t.rs`](../../../packages/engine/README.md), and identification in [`packages/capture/src/`](../../../packages/capture/README.md)), the universal operator kernel governing causal top-of-frame fractional delay transport, pitch-warped granular windows, barberpole phase sweeps, bounded-history coercive feedback loops, lossless integer-lag freeze hold, and partitioned Schroeder all-pass diffusion across **Dynamic Neural Audio Modeler (DNAM)** `SONA` `v3.0` ([`sona_architecture.md`](../architecture/sona_architecture.md)). For R&D counterexamples and candidate comparisons, see [`../../adr/0006-model-declared-delays-and-tank-feedback-guard.md`](../../adr/0006-model-declared-delays-and-tank-feedback-guard.md) and [`../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md).
+
+In `SONA` `v3.0`, every `Op-T` read satisfies the causal floor $\tau[n] \ge 4.0$ samples and is lifted into the **Top-of-Frame Causal Operator Crossbar** ahead of the 4-block Matryoshka `SONA` core (`TPT-SVF -> ParaLRU -> PolyADAA1`), while coercive loop writes (`||G_loop|| < 1`) update the delay rings at frame end. This unified causal-read / end-of-frame-write placement supports pre-drive chorus, rotary, and reverb-into-fuzz chains alongside post-core tape/BBD echo loops and shimmer tanks purely through learned weights with zero bespoke bypass flags.
 
 ---
 
@@ -27,7 +29,7 @@ This specification defines **Op-T (Transport)** ([`packages/engine/src/operators
 
 `r[dsp.op-t.ring.declaration]`
 
-Each active `Op-T` history declares its maximum reference-rate read delay $D_{\mathrm{ref}} \in \mathbb{N}^+$, storage scalar size $a$ (`2 B` for `fp16`, `4 B` for `f32`), tier ownership, and channel/line identity covering all admitted control, granular, and transition read paths.
+Each active `Op-T` history declares its maximum reference-rate read delay $D_{\mathrm{ref}} \in \mathbb{N}^+$, storage scalar size $a \in \lbrace 2, 4 \rbrace$ (`2 B` for `fp16` inline or low-footprint `ext_lines`, `4 B` for `f32` cold `ext_lines` in ultra-low-floor `30 s` shimmer tails), compile-time tier ownership (`LiteSpec`, `FullSpec`, `ProSpec`, `UltraSpec`), and channel/line identity covering all admitted control, granular, and transition read paths.
 
 ```text
 +---------------------------------------------------------------------------------------------------+
@@ -41,19 +43,22 @@ Each active `Op-T` history declares its maximum reference-rate read delay $D_{\m
 
 1. `r[dsp.op-t.ring.capacity]` **Cold-Path Capacity Sizing:** At effective rate $f_{\mathrm{eff}} = M 2^{e-52}$, compute exact integer ceiling $D_{\mathrm{eff}}$ in `u128` without floating-point rounding:
    $$D_{\mathrm{eff}} = \left\lceil D_{\mathrm{ref}} f_{\mathrm{eff}} / 48000 \right\rceil, \qquad L = D_{\mathrm{eff}} + 2, \qquad B = 64 \left\lceil aL / 64 \right\rceil$$
-   The `+2` margin holds the oldest 4-tap Catmull-Rom neighbor while enforces $\tau[n] \ge 4.0$ samples. Read all heads before overwriting the oldest slot.
+   The `+2` margin holds the oldest 4-tap Catmull-Rom neighbor while enforcing $\tau[n] \ge 4.0$ samples. Top-of-Frame Causal Crossbar reads execute across all active heads before end-of-frame writes overwrite the oldest slot.
 2. `r[dsp.op-t.ring.admission]` **Host Memory-Ceiling Admission:** Admit total instance and transition memory against the host ceiling on the cold path before activation; fail fast with an explicit error on overflow or ceiling exhaustion without truncating history or dropping active tails.
 3. `r[dsp.op-t.ring.branchless-wrap]` **Branchless Arbitrary-Length Wrap:** For write index $0 \le w < L$, integer delay $4 \le d \le L-2$, and tap offset $o \in \lbrace 1, 0, -1, -2 \rbrace$ ($i = w - d + o \in [-L, L)$):
    $$r = i + \big(L \mathbin{\mathrm{AND}} -[i < 0]\big), \qquad w' = (w + 1) - \big(L \mathbin{\mathrm{AND}} -[w + 1 = L]\big)$$
 4. `r[dsp.op-t.ring.q0-32-pointer]` **Integer-Plus-`Q0.32` Delay Pointer & Inward Reader Bounds:** Represent delay positions as an integer sample count $D_{\mathrm{int}}$ plus an unsigned `Q0.32` fraction (never a single `f32` total sample count, which loses `1/64`-sample resolution at `9 s` / `432,000` samples). Convert only the `Q0.32` fraction to `f32` ($\mu \in [0.0, 1.0)$), normalizing any `1.0f32` rounding carry to $(D_{\mathrm{int}} + 1, 0.0)$ and clamping inward to the nearest representable reader position inside all active physical and causal bounds.
-5. `r[dsp.op-t.ring.fp16-saturation]` **`fp16` Write Saturation Telemetry:** Finite delay writes exceeding `±65,504.0` saturate to `±65,504.0` (`0x7BFF` / `0xFBFF`) and set `FP16_SATURATED` ([`tora_architecture.md` §1.2](../architecture/tora_architecture.md#finite-precision-range-and-saturation-policy)).
-6. **Stage IV Inline L1D vs. Cold-Allocated Model-Declared Delay Capacity (`<= 48,000` ref samples):** For Stage IV FDN tanks, models whose total delay plus modulation margin fits within `1,024` frames (`max_delay + ceil(lfo_depth) + 4 <= 1,024`) execute strictly in the fixed inline L1D `fp16` ring (`0` heap allocations). Long-delay echo/modulation models (`1,024..=48,000` reference samples at `48 kHz`) declare `delay_histories` metadata and allocate a power-of-two `ext_lines` `fp16` buffer (including `4x` ZOH oversampling headroom) strictly during cold container loading (`0` allocations on RT `step_*`, `switch_tier`, `reconfigure_with_zoh`, or `& ext_mask` index wrapping, zero `UDIV`/`IDIV`).
+5. `r[dsp.op-t.ring.fp16-saturation]` **`fp16` Write Saturation Telemetry:** Finite delay writes into `a = 2` (`fp16`) rings exceeding `±65,504.0` saturate to `±65,504.0` (`0x7BFF` / `0xFBFF`) and set `FP16_SATURATED` ([`sona_architecture.md` §1.2](../architecture/sona_architecture.md#finite-precision-range-and-saturation-policy)).
+6. **Inline `SonaHotSlab` `fp16` Rings, Cold Power-of-Two `ext_lines` (`a in {2, 4}`) & `0-ULP` Integer-Lag Freeze Lock:**
+   - Every `SONA` tier uses compile-time `const` quad counts (`1` quad / `M = 4` lines on `Lite`, `2` quads / `M = 8` on `Full`, `3–4` quads / `M = 12–16` on `Pro`, and `4` quads / `M = 16` on `Ultra` locked at `Gate 0b`), keeping `Quad 0` (`Lite`/`Full`) inline inside the `64 B`-aligned `SonaHotSlab` `fp16` (`a = 2`) ring (`0` heap allocations for short modulation/delay models with `max_delay + ceil(lfo_depth) + 4 <= 1,024`).
+   - Long-delay echo, pitch-grain, and ambient tails (`1,024..=48,000` reference samples at `48 kHz` plus `4x` ZOH oversampling headroom) declare `delay_histories` metadata with `bytes_per_sample` $a \in \lbrace 2, 4 \rbrace$ (`fp16` inline/cold on `Lite`/`Full`; optional `fp16` or `f32` cold `ext_lines` DRAM on `Pro`/`Ultra`) and allocate a power-of-two `ext_lines` buffer strictly during cold container loading (`0 B` DRAM on dry rigs; `O(1)` `& ext_mask` index wrapping on RT paths, `0` `UDIV`/`IDIV`).
+   - **Zero-ULP Integer-Lag Freeze Lock:** When captured hardware `freeze == true` (`role == "freeze_latch"`), lock all `Op-T` ring writes (preserving the ring buffer contents bit-for-bit without overwriting or re-quantizing) and hold integer-lag reads at their fixed lag offset, guaranteeing `0` `fp16` re-quantization hiss buildup across `30 s+` infinite holds while the crossbar continues routing live play-over audio through the `SONA` core.
 
 ### 1.2 Stateless 4-Tap Catmull-Rom Hermite Cubic Delay Reader
 
 `r[dsp.op-t.reader.catmull-rom]`
 
-Decompose commanded delay $\tau[n] \ge 4.0$ into integer delay $D_{\mathrm{int}}[n] = \lfloor \tau[n] \rfloor$ and fractional offset $\mu[n] = \tau[n] - D_{\mathrm{int}}[n] \in [0.0, 1.0)$, and read the 4 neighboring history samples prior to writing sample $n$:
+Executed at the Top-of-Frame Causal Crossbar (and shared across CPU and WebGPU via `dnam-kernels`), decompose commanded delay $\tau[n] \ge 4.0$ into integer delay $D_{\mathrm{int}}[n] = \lfloor \tau[n] \rfloor$ and fractional offset $\mu[n] = \tau[n] - D_{\mathrm{int}}[n] \in [0.0, 1.0)$, reading the 4 neighboring history samples prior to writing sample $n$:
 $$s[-1] = \mathrm{ring}\big[\mathrm{addr}(n - D_{\mathrm{int}}[n] + 1)\big], \qquad s[0] = \mathrm{ring}\big[\mathrm{addr}(n - D_{\mathrm{int}}[n])\big]$$
 $$s[1] = \mathrm{ring}\big[\mathrm{addr}(n - D_{\mathrm{int}}[n] - 1)\big], \qquad s[2] = \mathrm{ring}\big[\mathrm{addr}(n - D_{\mathrm{int}}[n] - 2)\big]$$
 
@@ -64,24 +69,24 @@ $$c_1' = -0.5 s[-1] + 0.5 s[1], \qquad c_0' = s[0]$$
 
 | Invariant | Mathematical Property |
 | :--- | :--- |
-| **1. Endpoint Exactness** | At `μ = 0`, `d(τ) = c₀' = s[0]`; at `μ = 1`, `c₃' + c₂' + c₁' + c₀' = s[1]`. |
+| **1. Endpoint Exactness** | At `μ = 0`, `d(τ) = c₀' = s[0]`; at `μ = 1`, `c₃' + c₂' + c₁' + c₀' = s[1]`. At `freeze == true` with integer lag, `μ = 0` yields `0-ULP` lossless hold. |
 | **2. `C¹` Spline Continuity** | `lim_{μ→1⁻} (d/dμ) d(D_int + μ) = lim_{μ→0⁺} (d/dμ) d(D_int + 1 + μ) = 0.5(s[2] - s[0])` (`> 15×` lower 2nd-difference boundary jerk under LFO sweep than recursive Thiran). |
 | **3. Stationary Energy Passivity** | For fixed `μ`, `1 - |H_μ(e^{iω})|² = μ²(1-μ)²(1 - cos ω)²(3 + 2μ(1-μ)(1 - cos ω)) ≥ 0` (`‖H_μ‖_∞ ≤ 1`). |
-| **4. Peak Gain & Bounded-History Guard** | Instantaneous `L₁` kernel norm is `1 + μ(1 - μ) ≤ 1.25` (attained at `μ = 0.5` with `[-1, 9, 9, -1]/16`); time-varying feedback loops enforce BIBO decay via the grouped bounded-history feedback guard below. |
+| **4. Peak Gain & Bounded-History Guard** | Instantaneous `L₁` kernel norm is `1 + μ(1 - μ) ≤ 1.25` (attained at `μ = 0.5` with `[-1, 9, 9, -1]/16`); time-varying feedback loops enforce BIBO decay via the coercive bounded-history feedback guard below. |
 
-`r[dsp.op-t.reader.contiguous-fp16x4]` **Contiguous 4-Lane `fp16x4_to_f32x4` Stereo Delay Read Fast Path ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** Because the 4 Catmull-Rom tap indices `[p_2, p_1, p_0, p_m1]` occupy 4 consecutive ring slots `[p_0 - 2 .. p_0 + 2]` whenever the window does not straddle index `0` (`p_0 >= 2 && p_0 + 1 < Self::HALF_CAPACITY`), `read_delay_stereo` loads the 4 contiguous `u16` (`fp16`) samples per channel (`[l_2, l_1, l_0, l_m1]` and `[r_2, r_1, r_0, r_m1]`) and converts them in a single 4-lane hardware instruction via `MathBackend::fp16x4_to_f32x4` (`vcvt_f32_f16` on NEON, `_mm_cvtph_ps` on `F16C`), falling back to wrapped per-tap reads only during the `3 / L` wrap-straddling frames.
+`r[dsp.op-t.reader.contiguous-fp16x4]` **Contiguous 4-Lane `fp16x4_to_f32x4` Stereo Delay Read Fast Path ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** Because the 4 Catmull-Rom tap indices `[p_2, p_1, p_0, p_m1]` occupy 4 consecutive ring slots `[p_0 - 2 .. p_0 + 2]` whenever the window does not straddle index `0` (`p_0 >= 2 && p_0 + 1 < Self::HALF_CAPACITY`), `read_delay_stereo` loads the 4 contiguous `u16` (`fp16`) samples per channel (`[l_2, l_1, l_0, l_m1]` and `[r_2, r_1, r_0, r_m1]`) and converts them in a single 4-lane hardware instruction via `MathBackend::fp16x4_to_f32x4` (`vcvt_f32_f16` on NEON, `_mm_cvtph_ps` on `F16C`), falling back to wrapped per-tap reads only during the `3 / L` wrap-straddling frames (and direct `f32` 4-lane loads when `a = 4`).
 
 #### Bounded-History Feedback Guard
 
 `r[dsp.op-t.guard.bounded-history]`
 
-Because time-varying Catmull-Rom reads can reach `1.25×` instantaneous peak gain, Stage IV bounds feedback writes using the upper bound $M_n$ of all currently live samples across the tank delay histories:
+Because time-varying Catmull-Rom reads can reach `1.25×` instantaneous peak gain, end-of-frame coercive feedback writes (`||G_loop|| < 1`) bound every `Op-T` loop using the upper bound $M_n$ of all currently live samples across the delay histories (and skip ring overwrites completely when `freeze == true`):
 $$w_i[n] = x_i[n] + g_i[n] \cdot \mathrm{clamp}\big(v_i[n], -M_n, M_n\big), \qquad 0 \le g_i[n] \le g_{\max} < 1$$
 
 - `r[dsp.op-t.guard.max-tree]` **Grouped Max-Tree Tracking:** Partition each ring into blocks of at most $H$ samples (`H = 64`), maintaining block maxima in a binary max-tree plus an active-block running maximum.
 - `r[dsp.op-t.guard.incremental-counters]` **Division-Free Incremental `(block_idx, in_block_offset)` Counters (`0 UDIV`, [`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** To prevent integer division (`pos / block_size` or `.is_multiple_of(block_size)`, which lowers to hardware `UDIV`/`IDIV`) on arbitrary model-declared ring lengths, `OpTBlockMaxTreeGuard` maintains pre-allocated `block_indices: Vec<usize>` and `in_block_offsets: Vec<usize>` counters per delay line, advancing via branchless comparison (`offset + 1 == block_size` or `pos == 0`) with zero integer division instructions.
 - `r[dsp.op-t.guard.bibo-decay]` **Driven BIBO & Unforced Geometric Decay:** For $|x_i[n]| \le B$, every history sample remains bounded by $C = \max(M_0, B / (1 - g_{\max}))$; under zero input ($x_i[n] = 0$), $M_n$ decays by at least $g_{\max}$ every $L_{\max} + H$ frames regardless of read-pointer motion.
-- `r[dsp.op-t.guard.fp16-decay]` **Directed `fp16` Decay Rule:** Forming the guard ceiling with `0x3F7FBE76` (`0.999f32`) and rounding finite `fp16` writes toward zero guarantees strict subnormal decay to zero without nonzero `fp16` fixed points.
+- `r[dsp.op-t.guard.fp16-decay]` **Directed `fp16` Decay Rule:** Forming the guard ceiling with `0x3F7FBE76` (`0.999f32`) and rounding finite `fp16` writes toward zero (`a = 2`) guarantees strict subnormal decay to zero without nonzero `fp16` fixed points.
 
 ### 1.3 Dual-Mode Runtime Delay Transitions (`Range` Slew vs. `Switch` Crossfade)
 
@@ -103,23 +108,23 @@ While a crossfade is active, keep its two endpoints fixed and coalesce subsequen
 
 `r[dsp.op-t.window.partition-of-unity]`
 
-Op-T unifies standard delays, granular pitch shifting, and continuous barberpole phasing by selecting the window phase count $M \in [1, 2, 3]$:
+`Op-T` unifies standard delays, granular pitch shifting, and continuous barberpole phasing in the Top-of-Frame Causal Crossbar by selecting the window phase count $M \in [1, 2, 3]$:
 $$\sum_{m=0}^{M-1} W_m(\phi_m[n]) \equiv 1.000000000000, \quad \forall n$$
 
 ```mermaid
 flowchart TD
-    Mode["Op-T Window Mode Selector"] --> M1["M = 1: Single Fractional Read Pointer (Standard Delay, Chorus, TZF)"]
+    Mode["Op-T Window Mode Selector"] --> M1["M = 1: Single Fractional Read Pointer (Standard Delay, Chorus, TZF, Freeze)"]
     Mode --> M2["M = 2: Dual-Tap Centered Hermite-Hann Grains (Family 3 Pitch Shifter / Shimmer)"]
     Mode --> M3["M = 3: 3-Phase Raised-Cosine / B-Spline (Family 6 Endless Barberpole)"]
 
-    M1 --> O1["W_0 = 1.0 (Direct Catmull-Rom Readout)"]
+    M1 --> O1["W_0 = 1.0 (Direct Catmull-Rom Readout / 0-ULP Integer Freeze)"]
     M2 --> O2["H(phi_A) + H(phi_B) == 1.000000 (Partition of Unity, 0 Cosine LUTs)"]
     M3 --> O3["W_0 + W_1 + W_2 == 1.000000 (Non-Negative, Zero Phase Inversion)"]
 ```
 
 | Mode | Physical Role | Window Definition & Exact Partition-of-Unity Identity |
 | :--- | :--- | :--- |
-| **`M = 1`** | **Standard Delay / Chorus / TZF** | `W₀ ≡ 1.0` (single fractional read pointer). |
+| **`M = 1`** | **Standard Delay / Chorus / TZF / Freeze** | `W₀ ≡ 1.0` (single fractional Catmull-Rom read pointer, or `0-ULP` locked integer-lag read during `freeze == true`). |
 | **`M = 2`** | **Centered Hermite-Hann Granular Pitch Shifter (`Family 3`)** | Grain phases `φ_A[n] = frac(φ_A[n-1] + Δφ)` and `φ_B[n] = frac(φ_A[n] + 0.5)`. Symmetric triangular phase `u_A = 1 - ∣2φ_A - 1∣ ∈ [0, 1]`. Cubic Hermite window `H(φ_A) = u_A²(3 - 2u_A)`, `H(φ_B) = 1.0 - H(φ_A)`. |
 | **`M = 3`** | **Continuous Barberpole Frequency Sweep (`Family 6`)** | Three read heads spaced by `Δφ = 1/3`: `φ_m = frac(φ + m/3)` with non-negative raised-cosine `W_m(φ) = (1/3)(1 + cos(2π frac(φ + m/3))) ≥ 0` or 3-piece quadratic B-spline `B₂(3 frac(φ + m/3))`. |
 
@@ -127,7 +132,7 @@ flowchart TD
 
 `r[dsp.op-t.window.m1-delay]`
 
-In $M = 1$ mode, $W_0 \equiv 1.0$. Anchoring Tap 0 to a static reference delay $\tau_{\text{ref}} = 64.0\text{ samples}$ ($1.33\text{ ms}$) while sweeping line 1 across $\tau_1[n] \in [16.0, 112.0]\text{ samples}$ produces analog Through-Zero Flanging (TZF) with zero-crossing phase cancellation at $\Delta\tau = 0.0\text{ ms}$.
+In $M = 1$ mode, $W_0 \equiv 1.0$. Anchoring Tap 0 to a static reference delay $\tau_{\text{ref}} = 64.0\text{ samples}$ ($1.33\text{ ms}$) while sweeping line 1 across $\tau_1[n] \in [16.0, 112.0]\text{ samples}$ produces analog Through-Zero Flanging (TZF) with zero-crossing phase cancellation at $\Delta\tau = 0.0\text{ ms}$. When `freeze == true`, locking ring writes and anchoring integer-lag reads preserves steady-state loop content at `0 ULP` with zero `fp16` re-quantization hiss.
 
 ### 2.2 Mode $M = 2$: Centered Hermite-Hann Granular Pitch Shifter (`Family 3`)
 
@@ -138,7 +143,7 @@ $$\phi_A[n] = \mathrm{frac}(n/G), \qquad \phi_B[n] = \mathrm{frac}(\phi_A[n] + 1
 
 Using symmetric triangular phase $u_A = 1 - |2\phi_A - 1| \in [0, 1]$:
 $$H(\phi_A) = u_A^2\big(3 - 2u_A\big), \qquad H(\phi_B) = 1.0 - H(\phi_A), \qquad H(\phi_A) + H(\phi_B) \equiv 1.000000000000$$
-For a `100 ms` grain at `48 kHz` (`G = 4,800`) and `+24` semitones ($\nu = -3$), maintaining the 4-sample causal floor (`Refinement 15`) requires $D_c \ge 7,204$ samples and maximum delay $\ge 14,404$ samples.
+For a `100 ms` grain at `48 kHz` (`G = 4,800`) and `+24` semitones ($\nu = -3$), maintaining the 4-sample causal floor requires $D_c \ge 7,204$ samples and maximum delay $\ge 14,404$ samples.
 
 ### 2.3 Mode $M = 3$: Continuous Barberpole Frequency Sweep (`Family 6`)
 
@@ -156,7 +161,7 @@ where $B_2(t) = 0.5 t^2$ on $[0, 1)$, $B_2(t) = -t^2 + 3t - 1.5$ on $[1, 2)$, an
 
 `r[dsp.op-t.diffuser.partition]`
 
-Each Schroeder all-pass diffuser occupies a dedicated, non-overlapping 64B-aligned segment of the cold-allocated delay buffer with segment-local branchless wrap. At effective rate $f_{s,\text{eff}}$, convert each reference delay via $D_{\text{ap},m}(f_{s,\text{eff}}) = \max(1, \mathrm{round}(D_{\text{ap},m}(48000) / \rho_{\text{sr}}))$ ([router §9](router_and_stages_topology.md#9-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-44196-khz--4-bounce)) without capping at `255` samples (e.g., `223` reference samples $\to$ `1,784` samples = `3,584 B` aligned `fp16` at `384 kHz`).
+Each Schroeder all-pass diffuser (`PartitionedSchroederDiffuserBank`, scaling up to `8` stages on `Ultra`) occupies a dedicated, non-overlapping `64 B`-aligned segment of the cold-allocated delay buffer with segment-local branchless wrap. At effective rate $f_{s,\text{eff}}$, convert each reference delay via $D_{\text{ap},m}(f_{s,\text{eff}}) = \max(1, \mathrm{round}(D_{\text{ap},m}(48000) / \rho_{\text{sr}}))$ ([router §9](router_and_stages_topology.md#9-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-44196-khz--4-bounce)) without capping at `255` samples (e.g., `223` reference samples $\to$ `1,784` samples = `3,584 B` aligned `fp16` at `384 kHz`).
 
 ### 3.2 Reference-Length All-Pass Recurrence
 
@@ -174,7 +179,7 @@ For fixed $a_{\text{diff}}$ and $D_{\text{ap}}$, $|H_{\text{ap}}(e^{i\omega})|^2
 
 `r[dsp.op-t.ducking.vca]`
 
-To model dynamic ducking delays, gated reverbs, and sidechain-ducked ambient tails (`Family 4`), Op-T applies a 1-pole ballistic sidechain ducking VCA (`Refinement 9`, $\tau_{\text{attack}} \ge 0.5\text{ ms}$, $\tau_{\text{release}} \ge 20.0\text{ ms}$):
+To model dynamic ducking delays, gated reverbs, and sidechain-ducked ambient tails (`Family 4`), `Op-T` applies a 1-pole ballistic sidechain ducking VCA ($\tau_{\text{attack}} \ge 0.5\text{ ms}$, $\tau_{\text{release}} \ge 20.0\text{ ms}$):
 $$e_{\text{duck}}[n] = \alpha_{\text{duck}}[n] e_{\text{duck}}[n-1] + (1 - \alpha_{\text{duck}}[n]) |x_{\text{sidechain}}[n]|$$
 $$g_{\text{duck}}[n] = \mathrm{clamp}\Big(1.0 - \kappa_{\text{duck}}\big(e_{\text{duck}}[n] - \theta_{\text{duck}}\big), g_{\text{duck,min}}, 1.0\Big), \qquad y_{\text{wet,ducked}}[n] = g_{\text{duck}}[n] \cdot y_{\text{wet}}[n]$$
 
@@ -184,10 +189,11 @@ $$g_{\text{duck}}[n] = \mathrm{clamp}\Big(1.0 - \kappa_{\text{duck}}\big(e_{\tex
 
 `r[dsp.op-t.zero-fdiv]`
 
-| Operation | Naive Formulation | TORA Division-Free Factorization |
+| Operation | Naive Formulation | `SONA` Division-Free Factorization |
 | :--- | :--- | :--- |
-| **Ring buffer wrap** | `idx = pos % L_ring` (`IDIV`) | Branchless mask correction `i + (L & -[i < 0])` (§1.1) |
-| **Catmull-Rom delay read** | Recursive Thiran all-pass (`FDIV`) | Stateless 4-tap Horner cubic polynomial (§1.2) |
+| **Ring buffer wrap (inline / cold)** | `idx = pos % L_ring` (`IDIV`) | Branchless mask correction `i + (L & -[i < 0])` or power-of-two `ext_lines` `& ext_mask` (§1.1) |
+| **Catmull-Rom delay read** | Recursive Thiran all-pass (`FDIV`) | Stateless 4-tap Horner cubic polynomial + `fp16x4_to_f32x4` / `f32` fast path (§1.2) |
+| **Infinite freeze (`freeze == true`)** | Re-write `fp16` loop every frame | Lock ring writes (`0` `fp16` re-quantization hiss) + `0-ULP` integer-lag read (§1.1) |
 | **Granular windowing (`M=2, 3`)** | Real-time `cos(π φ)` (`libm`) | Cubic Hermite `u²(3 - 2u)` (`M=2`) and quadratic B-spline `B₂` (`M=3`) (§2) |
 | **Schroeder all-pass** | Direct-form rational division | Coupled state recurrence `v = x - a u`, `y = a v + u` (§3.2) |
 | **Base-delay slew** | Per-sample rate division | Precomputed 1-pole slew with `∣Δτ_base∣ ≤ 0.25` (§1.3) |

@@ -5,7 +5,7 @@ status: proposed
 supersedes: []
 superseded_by: null
 specs:
-  - docs/specs/architecture/tora_architecture.md
+  - docs/specs/architecture/sona_architecture.md
 requirements:
   - REQ-1.1
 ---
@@ -13,7 +13,7 @@ requirements:
 # ADR-NNNN: `<Short Noun Phrase Stating the Architectural Decision>`
 
 > [!NOTE]
-> Use this MADR (`docs/adr/NNNN-kebab-case-title.md`) template to record **why** a mathematical formulation, wire layout, or architectural trade-off was chosen over naive or exploratory R&D candidates (see [`../specs/architecture/tora_architecture.md`](../specs/architecture/tora_architecture.md) and [`REQ-1.1`](../requirements/system_goals_and_requirements.md)). Keep normative **"how"** contracts in `docs/specs/`.
+> Use this MADR (`docs/adr/NNNN-kebab-case-title.md`) template to record **why** a mathematical formulation, wire layout, or architectural trade-off was chosen over naive or exploratory R&D candidates (see [`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md) and [`REQ-1.1`](../requirements/system_goals_and_requirements.md)). Keep normative **"how"** contracts in `docs/specs/`.
 
 ---
 

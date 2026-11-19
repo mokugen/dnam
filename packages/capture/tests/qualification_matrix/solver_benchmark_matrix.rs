@@ -676,8 +676,7 @@ fn eval_unrecorded_controls_chain<M: BlackBoxModel>(
 
         let e_act: f64 = actual_l[warmup..].iter().map(|v| v * v).sum();
         let e_frz: f64 = frozen_l[warmup..].iter().map(|v| v * v).sum();
-        let frozen_rms_diff_db =
-            (10.0 * ((e_frz + 1.0e-15) / (e_act + 1.0e-15)).log10()).abs();
+        let frozen_rms_diff_db = (10.0 * ((e_frz + 1.0e-15) / (e_act + 1.0e-15)).log10()).abs();
 
         eng.reset_to_dc_equilibrium();
         for (p, &v) in unrec_ctrls.iter().enumerate() {
@@ -713,16 +712,56 @@ fn eval_unrecorded_controls_chain<M: BlackBoxModel>(
 fn test_multisetting_unrecorded_control_interpolation_matrix() {
     let mut rows = Vec::with_capacity(48);
     eval_unrecorded_controls_chain("Chain-01 SymmetricOD", Chain01SymmetricOd::new(), &mut rows);
-    eval_unrecorded_controls_chain("Chain-02 GatedFuzz", Chain02GatedAsymmetricFuzz::new(), &mut rows);
-    eval_unrecorded_controls_chain("Chain-03 CleanBlend", Chain03ParallelCleanBlend::new(), &mut rows);
-    eval_unrecorded_controls_chain("Chain-04 TubeAmp4x12", Chain04TubeAmpFmv4x12::new(), &mut rows);
-    eval_unrecorded_controls_chain("Chain-06 EnvSVF", Chain06EnvelopeResonantSvf::new(), &mut rows);
-    eval_unrecorded_controls_chain("Chain-09 LA2A", Chain09La2aOpticalCompressor::new(), &mut rows);
-    eval_unrecorded_controls_chain("Chain-10 OC2RingMod", Chain10Oc2OctaveDividerAndRingMod::new(), &mut rows);
-    eval_unrecorded_controls_chain("Chain-11 BiAmpBass", Chain11BiAmpBassAndOutputIron::new(), &mut rows);
-    eval_unrecorded_controls_chain("Chain-13 TriBandVcaComp", Chain13TriBandVcaCompressor::new(), &mut rows);
-    eval_unrecorded_controls_chain("Chain-14 TriBandEntropia", Chain14TriBandCompDistortion::new(), &mut rows);
-    eval_unrecorded_controls_chain("Chain-15 TubeAmpHeadDI", Chain15TubeAmpHeadDi::new(), &mut rows);
+    eval_unrecorded_controls_chain(
+        "Chain-02 GatedFuzz",
+        Chain02GatedAsymmetricFuzz::new(),
+        &mut rows,
+    );
+    eval_unrecorded_controls_chain(
+        "Chain-03 CleanBlend",
+        Chain03ParallelCleanBlend::new(),
+        &mut rows,
+    );
+    eval_unrecorded_controls_chain(
+        "Chain-04 TubeAmp4x12",
+        Chain04TubeAmpFmv4x12::new(),
+        &mut rows,
+    );
+    eval_unrecorded_controls_chain(
+        "Chain-06 EnvSVF",
+        Chain06EnvelopeResonantSvf::new(),
+        &mut rows,
+    );
+    eval_unrecorded_controls_chain(
+        "Chain-09 LA2A",
+        Chain09La2aOpticalCompressor::new(),
+        &mut rows,
+    );
+    eval_unrecorded_controls_chain(
+        "Chain-10 OC2RingMod",
+        Chain10Oc2OctaveDividerAndRingMod::new(),
+        &mut rows,
+    );
+    eval_unrecorded_controls_chain(
+        "Chain-11 BiAmpBass",
+        Chain11BiAmpBassAndOutputIron::new(),
+        &mut rows,
+    );
+    eval_unrecorded_controls_chain(
+        "Chain-13 TriBandVcaComp",
+        Chain13TriBandVcaCompressor::new(),
+        &mut rows,
+    );
+    eval_unrecorded_controls_chain(
+        "Chain-14 TriBandEntropia",
+        Chain14TriBandCompDistortion::new(),
+        &mut rows,
+    );
+    eval_unrecorded_controls_chain(
+        "Chain-15 TubeAmpHeadDI",
+        Chain15TubeAmpHeadDi::new(),
+        &mut rows,
+    );
 
     println!(
         "\n| Chain | Tier | Unrec ESR (dB) | Frozen ESR (dB) | dRMS (dB) | Unrec bESR (dB) | Unrec LTAS (dB) | Frozen LTAS (dB) | Unrec MR | Frozen MR | Improves |"
@@ -766,7 +805,10 @@ fn test_multisetting_unrecorded_control_interpolation_matrix() {
             ));
         }
     }
-    assert!(regressions.is_empty(), "Unrecorded control regressions: {regressions:?}");
+    assert!(
+        regressions.is_empty(),
+        "Unrecorded control regressions: {regressions:?}"
+    );
 }
 
 #[test]

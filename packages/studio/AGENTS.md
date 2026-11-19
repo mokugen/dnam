@@ -1,6 +1,6 @@
 # `packages/studio` — Standalone Tauri v2 Desktop Studio Routing Guide
 
-**`dnam-studio` (`@dnam-project/studio`)** owns the standalone Tauri v2 Desktop Studio GUI, native OS audio device enumeration (`cpal`), wait-free SPSC ring-buffer audio I/O, and the isolated IPC bridge over `dnam-engine` (`.dnam`) and `dnam-capture` (`.dnam-proj`).
+**`dnam-studio` (`@dnam-project/studio`)** owns the standalone Tauri v2 Desktop Studio GUI, native OS audio device enumeration (`cpal`), wait-free SPSC ring-buffer audio I/O, and the isolated IPC bridge over `dnam-engine` (`.dnam` `v3.0` `"sona"` in Phase 6) and `dnam-capture` (`.dnam-proj` + native `gpu-wgpu` `32-bit WebGPU` / `DNPR` telemetry in Phase 6).
 
 ## 1. Key Modules
 

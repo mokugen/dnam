@@ -37,7 +37,11 @@ fn svf_prewarp_g_rt(fc_hz: f64, fs_hz: f64) -> f64 {
     (PI * fc_hz.clamp(15.0, 0.42 * fs_hz) / fs_hz).tan()
 }
 
-fn base_specialty_model(mono_out: bool, os_up_aa_mix: f64, os_dec_aa_mix: f64) -> V3MatryoshkaOptF64 {
+fn base_specialty_model(
+    mono_out: bool,
+    os_up_aa_mix: f64,
+    os_dec_aa_mix: f64,
+) -> V3MatryoshkaOptF64 {
     let mut m =
         V3MatryoshkaOptF64::from_matryoshka_cold(&V3MatryoshkaModel::dual_rate_default(mono_out));
     m.tier_os2x = [true; 4];

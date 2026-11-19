@@ -16,13 +16,11 @@ It is engineered for embedded ARMv8.2-A/ARMv9.2-A pedalboards (**Rockchip RK3582
     - **`Op-T` (Transport & Elastic Buffer):** Catmull-Rom cubic fractional delay with ZOH-rescaled dual-mode slew/crossfade ($L_{\text{xfade}} = \max(16, \mathrm{round}(128/\rho_{\text{sr}}))$), branchless wrap, partitioned Schroeder diffusers, and dual-tap complementary Hermite-Hann grain reader ($H(\phi_A) + H(\phi_B) \equiv 1$).
     - **`Op-M` (Modal Bank & Kautz):** 4-lane SIMD symplectic resonator, quadrant-reduced degree-13/14 Horner contractive rotor with adaptive 1–2 ULP guard, `Q0.192` LFO phase accumulator, 12-allpass (`6` I + `6` Q) `H1` Hilbert SSB lattice, `5 Hz` `T1` DC-blocked sub-harmonic tracker, and Stage III 16-sample delayed Kautz modal bank.
     - **`Op-N` (Nonlinear Activation & Shaping):** Division-free Padé `[5/4]` `tanh` (`OpNBackend`), saturated `PolyADAA` reference verifier, analytical DC equilibrium, `C²` wavefolder, and `Q64.32` zero-order-hold bitcrusher with TPDF dither.
-  - **Stages & Matrix Router (`src/stages/`):**
-    - **Stage 0 Router:** 8-Port Matrix Router with return-to-send isolation, `200 Hz` `TPT` `LR4`/`Bèzout` crossover, Kaiser-sinc sub-sample alignment, WDW routing, and hysteresis gate.
-    - **Stage I Pre-SVF Bus:** Dynamic `Cytomic TPT-SVF` & envelope-governed input conditioning.
-    - **Stage II Matryoshka Core:** Zero-DC 3-block tapered `GRU` (`[1,1,1]` @ `1×` `Lite` $\subset$ `[2,1,1]` @ `1×` `Full` $\subset$ `[2,2,1]` @ `2×` `Pro` $\subset$ `[3,2,1]` @ `2×` `Ultra`) with inter-block `3 kHz` Tone `SVF` and direct register readout.
-    - **Stage III Cabinet Modals:** Early reflection FIR (`16/32/48/64` taps/ch) and orthonormal Kautz modal (`4/8/12/16` pairs) slices with `ZOH` onset delay.
-    - **Stage IV Spatial Tank:** Interleaved 4-line `fp16` FDN rings (`±65,504.0` clamp), Givens/Householder mixing, coercive loop saturation, input/readout `5 Hz` DC conditioning, and hardware freeze latch.
-  - **Control Bus & Runtime UX (`src/control/`, [`ADR-0021`](../../docs/adr/0021-unified-matryoshka-gru-and-direct-register-stages.md)):**
+  - **Stages, `SONA` State-Space Core & Matrix Router (`src/stages/`, [`sona_architecture.md`](../../docs/specs/architecture/sona_architecture.md)):**
+    - **Stage 0 Router & Top-of-Frame Causal Crossbar:** 8-Port Matrix Router with return-to-send isolation, `200 Hz` `TPT` `LR4`/`Bèzout` crossover, Kaiser-sinc sub-sample alignment, WDW routing, hysteresis gate, plus (`SONA` `v3.0`) causal `Op-T` reads ($\tau \ge 4$), input-only `Op-P` (`HilbertH1Lattice6Sec` + `T1SubHarmonicTracker`), and `4`-lane `Q0.32` quadrature carriers (`0.05 Hz–20 kHz`).
+    - **4-Block Matryoshka `SONA` Core (`ADR-0022`, Phase 2 cutover from `V3HotCore`):** Lower-triangular Matryoshka blocks (`Lite` `[1,1,1,1]` / `[1,1,1,0]` $\subset$ `Full` `[2,2,1,1]` $\subset$ `Pro` `[3,2,2,1]` $\subset$ `Ultra` `[4,3,2,1]` locked at `Gate 0b`) combining passive `2×2` ZDF `TPT-SVF`, contractive `1D` scalar `ParaLRU` diode-RC ballistics, and pure-`f32` divided-difference `PolyADAA1` + `C²` wavefolder (`process_tick16_const` + `StereoVec8`, zero `FDIV`/`FSQRT`/`libm`).
+    - **Stage III Cabinet Modals & Spatial `Op-T`:** Contiguous early reflection `FIR` (`32/48/96/128` target taps) and shared-pole orthonormal `Kautz` modal (`8/12/24/32` target pairs) with `ZOH` onset delay, plus coercive `Op-T` feedback rings (`a ∈ {2, 4}` `fp16`/`f32` precision, integer-lag lossless freeze).
+  - **Control Bus & Runtime UX (`src/control/`, [`ADR-0022`](../../docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md)):**
     - $3\text{ kHz}$ node-anchored Lobatto basis, `CP1` tier-local projections (`8-D` Rank-4 in `Lite..Pro`, `16-D` Rank-8 in `Ultra`), 9-word/18-word `ExactIntFactorAccumulator`, outward-checked trust-region clipping, and `Q64`/`Q32` `20–400 BPM` tempo synchronization with 32-step binary-search physical calibration inversion ([`parametric_control_bus.md`](../../docs/specs/dsp/parametric_control_bus.md)).
     - Atomic preset batch evaluation with two-path output crossfading on disjoint conditional switch transitions (`apply_preset`), `SpilloverTrails` vs. `HardBypass` ramping (`set_bypass`), `supports_freeze` hardware freeze gating, out-of-range tempo-sync rank clamping (`active_clamp_mask`), and `OUTSIDE_CERTIFIED_INPUT` (`bit 4`) telemetry reporting above $\pm 100.0$ (`+40 dBFS`) without unmodeled soft-limiting.
 - **Multi-Platform Hardware SIMD (`SimdVec4` & `MathBackend`):**
@@ -39,23 +37,20 @@ It is engineered for embedded ARMv8.2-A/ARMv9.2-A pedalboards (**Rockchip RK3582
 
 ## Floating-Point Scope
 
-Block-processing APIs establish and restore the audio floating-point environment automatically. Direct per-sample engine, operator, stage, or control-tick calls require one [`FtzDazGuard`](src/types.rs) around the entire batch. The low-level `step_frame_tora` steps a single stereo frame and does not perform block-level tempo advancement or `4×` offline bounce oversampling. See the [audio-callback policy](../../docs/specs/architecture/tora_architecture.md#floating-point-environment-at-the-audio-callback).
+Block-processing APIs establish and restore the audio floating-point environment automatically. Direct per-sample engine, operator, stage, or control-tick calls require one [`FtzDazGuard`](src/types.rs) around the entire batch. Low-level single-frame helpers step one stereo frame without block-level tempo advancement or `4×` offline bounce oversampling. See the [audio-callback policy](../../docs/specs/architecture/sona_architecture.md#floating-point-environment-at-the-audio-callback).
 
 ---
 
-## Measured Real-Time & WCET Benchmark Summary ($48\text{ kHz}$ Stereo, `128`-Sample Blocks)
+## `SONA` `v3.0` `Gate 0b` Target Budget Envelope ($48\text{ kHz}$ Stereo, `128`-Sample Blocks)
 
-Measured via `cargo bench -p dnam-engine --bench realtime_wcet` (`2,666.67 µs` per `128`-sample block budget at $48\text{ kHz}$, `32.63 µs` `#![no_std]` container load + `CRC32C` verification; `161.59 ns` `Lite` to `257.41 ns` `Ultra` steady-state in `benches/pipeline.rs`; see the [hardware budget requirements](../../docs/specs/architecture/tora_architecture.md#22-hardware--dsp-benchmark-summary)):
+In `SONA` `v3.0` (`Phases 2–3`), compile-time `const` tier dimensions (`LiteSpec`, `FullSpec`, `ProSpec`, `UltraSpec`) and constant-size `zerocopy` `Arena0LiteWire..Arena3UltraDeltaWire` layouts are locked at **`Gate 0b`** after `realtime_wcet`, `realtime_disassembly_audit`, and `hotpath` optimization (`process_tick16_const`, `StereoVec8`, zero-spill `SonaHotSlab`) to occupy `~85–90%` of each `REQ-6.1` `1× Cortex-A76` budget and `N × ActiveHot <= 64 KiB` L1D limit (benchmark via `cargo bench -p dnam-engine --bench realtime_wcet`; see [hardware budget requirements](../../docs/specs/architecture/sona_architecture.md#22-hardware--dsp-benchmark-summary)):
 
-| Tier & Subsystem Profile | Backend | Latency / Frame | `×` Real-Time | Single-Core CPU | Modulated `P50` Block | Modulated `P99.9` Block | `Max` / `2,666.67 µs` Budget |
-| :--- | :--- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **`Lite` (`C = 4`, `64-D` Bus)** | `ARM64 NEON` | **`178.53 ns`** | **`116.7x`** | **`0.86%`** | `21.42 µs` | `62.88 µs` | **`2.73%`** |
-| **`Full` (`C = 8`, `128-D` Bus)** | `ARM64 NEON` | **`214.80 ns`** | **`97.0x`** | **`1.03%`** | `25.67 µs` | `53.33 µs` | **`4.77%`** |
-| **`Pro` (`C = 12`, `192-D` Bus)** | `ARM64 NEON` | **`236.38 ns`** | **`88.1x`** | **`1.13%`** | `29.08 µs` | `74.88 µs` | **`2.86%`** |
-| **`Ultra` (`C = 16`, `256-D` Bus)** | `ARM64 NEON` | **`283.26 ns`** | **`73.5x`** | **`1.36%`** | `34.67 µs` | `216.25 µs` | **`10.60%`** |
-| **`Ultra` (`C = 16`, `4×` Offline Bounce)** | `ARM64 NEON` | **`1,130.75 ns`** | **`18.4x`** | **`5.43%`** | — | — | — |
-| **`Full` (`C = 8`, ARM SME)** | `ARM SME` | **`219.77 ns`** | **`94.8x`** | **`1.05%`** | — | — | — |
-| **`Full` (`C = 8`, Scalar Baseline)** | `Scalar` | **`250.56 ns`** | **`83.1x`** | **`1.20%`** | — | — | — |
+| Tier Profile | `REQ-6.1` `1× Cortex-A76` Ceiling (@ 80% RT Cap) | `Gate 0b` Target Core (`4`-Block `SONA` + `Stage III`) | Target `ActiveHot` Slab (`N × Slab ≤ 64 KiB` L1D) | Status |
+| :--- | :---: | :--- | :---: | :--- |
+| **`Lite`** | **`≥ 14×`** (`≤ 1,190 ns`/frame) | `[1,1,1,1]` `16` lanes / `4` `TPT-SVF` (`1×`) or `[1,1,1,0]` (`2×`), `32` FIR + `8` Kautz, `1` `Op-T` quad | **`≤ 4.5 KiB`** (`14× ≤ 63 KiB`) | `Gate 0b` lock pending (Phase 3) |
+| **`Full`** | **`≥ 8×`** (`≤ 2,083 ns`/frame) | `[2,2,1,1]` `24` lanes / `6` `TPT-SVF` (`2×`), `48` FIR + `12` Kautz, `2` `Op-T` quads | **`≤ 7.8 KiB`** (`8× ≤ 62.4 KiB`) | `Gate 0b` lock pending (Phase 3) |
+| **`Pro`** | **`≥ 4×`** (`≤ 4,166 ns`/frame) | `[3,2,2,1]` `32` lanes / `8` `TPT-SVF` (`2×`), `96` FIR + `24` Kautz, `3–4` `Op-T` quads | **`≤ 15.5 KiB`** (`4× ≤ 62 KiB`) | `Gate 0b` lock pending (Phase 3) |
+| **`Ultra`** | **`≥ 2×`** (`≤ 8,333 ns`/frame) + `4×` Bounce | `[4,3,2,1]` `40` lanes / `10–12` `TPT-SVF` (`2×` / `4×` bounce), `128` FIR + `32` Kautz, `4` `Op-T` quads | **`≤ 30.0 KiB`** (`2× ≤ 60 KiB`) | `Gate 0b` lock pending (Phase 3) |
 
 ---
 

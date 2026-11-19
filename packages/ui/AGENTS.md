@@ -10,7 +10,7 @@
 - [`src/components/base/`](src/components/base/button.tsx): `shadcn/ui` Base UI primitives (`@dnam-project/ui/base/*`).
 - [`src/components/controls/`](src/components/controls/RotaryKnob.tsx): `RotaryKnob`, `DiscreteSwitch`, `StatusBadges`, and [`geometry.ts`](src/components/controls/geometry.ts) (`@dnam-project/ui/controls/*`).
 - [`src/components/rack/`](src/components/rack/DnamPluginRack.tsx) & [`src/components/workflows/`](src/components/workflows/TrainingTimelinePanel.tsx): `DnamPluginRack`, `TriPhysicsTelemetry`, `CapturePlanPanel`, `TrainingTimelinePanel`, and musician-facing `TrainingFitVisualizer` (`@dnam-project/ui/{rack,workflows}/*`).
-- [`src/components/visualizers/`](src/components/visualizers/TrainerTelemetryVisualizer.tsx): Interactive TORA and trainer telemetry visualizers (`@dnam-project/ui/visualizers/*`).
+- [`src/components/visualizers/`](src/components/visualizers/TrainerTelemetryVisualizer.tsx): Interactive `SONA` DSP and `DNPR` trainer/WebGPU telemetry visualizers (`@dnam-project/ui/visualizers/*`).
 
 ## 2. Guides & Verification
 

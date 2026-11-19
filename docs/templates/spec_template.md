@@ -9,14 +9,14 @@ rule_prefixes:
 requirements:
   - REQ-1.1
 adrs:
-  - ADR-0002
+  - ADR-0022
 ---
 
 # Normative Specification Template (`docs/specs/<domain>/`)
 
 Use this template when authoring or extending a normative technical specification under `docs/specs/`. Every normative specification file must start with YAML frontmatter declaring its `id`, `title`, `status`, `version`, `domain`, `rule_prefixes`, `requirements`, and active `adrs` (never superseded ADRs), and every normative rule must carry a unique Rust Reference-style `r[<domain>.<subdomain>.<rule>]` identifier so implementation code and tests can cite an exact specification rule. See [`../CONTRIBUTING.md`](../CONTRIBUTING.md) for the complete authoring guide.
 
-This specification defines **how** the `<Subsystem Name>` operates (`packages/engine/` and `packages/capture/`, fulfilling [`REQ-1.1`](../requirements/system_goals_and_requirements.md)). Design rationales, rejected R&D alternatives, and counterexamples belong in [`../adr/0002-tri-operator-recurrent-architecture.md`](../adr/0002-tri-operator-recurrent-architecture.md)—never as narrative essays inside `docs/specs/`.
+This specification defines **how** the `<Subsystem Name>` operates (`packages/engine/` and `packages/capture/`, fulfilling [`REQ-1.1`](../requirements/system_goals_and_requirements.md)). Design rationales, rejected R&D alternatives, and counterexamples belong in [`../adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)—never as narrative essays inside `docs/specs/`.
 
 ---
 

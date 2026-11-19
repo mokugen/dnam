@@ -32,7 +32,10 @@ pub(super) struct SpectralSplitEstimate {
 pub(super) fn butterworth2_pole_rt(fc_hz: f64, fs_hz: f64) -> (f64, f64) {
     let f = fc_hz.clamp(12.0, 0.45 * fs_hz.max(8_000.0));
     let sigma = TAU * f / (fs_hz.max(8_000.0) * SQRT_2);
-    ((-sigma).exp().clamp(0.05, 0.9994), sigma.clamp(0.0, PI - 1e-4))
+    (
+        (-sigma).exp().clamp(0.05, 0.9994),
+        sigma.clamp(0.0, PI - 1e-4),
+    )
 }
 
 fn default_emp_poles(sr_hz: f64) -> [(f64, f64); 4] {
@@ -280,8 +283,10 @@ impl SpectralSplitEstimate {
                 let gain_l = ((b_py_l[b] + band_eps) / (b_px_l[b] + band_eps)).max(1.0e-12);
                 g_q[b] = 10.0 * gain_q.log10();
                 delta_g[b] = 10.0 * (gain_l / gain_q).max(1.0e-12).log10();
-                g_all[b] =
-                    10.0 * ((b_py_a[b] + band_eps) / (b_px_a[b] + band_eps)).max(1.0e-12).log10();
+                g_all[b] = 10.0
+                    * ((b_py_a[b] + band_eps) / (b_px_a[b] + band_eps))
+                        .max(1.0e-12)
+                        .log10();
                 coh[b] = (b_plin[b] / (b_py_a[b] + band_eps)).clamp(0.0, 1.0);
             }
         }
@@ -421,6 +426,11 @@ mod tests {
             est_a.f_hi_hz > est_b.f_hi_hz,
             "expected higher f_hi estimate on (135, 3100) vs (420, 1150): {est_a:?} vs {est_b:?}"
         );
-        assert!(est_a.emp_poles.iter().all(|&(r, th)| r > 0.0 && r < 1.0 && th.is_finite()));
+        assert!(
+            est_a
+                .emp_poles
+                .iter()
+                .all(|&(r, th)| r > 0.0 && r < 1.0 && th.is_finite())
+        );
     }
 }

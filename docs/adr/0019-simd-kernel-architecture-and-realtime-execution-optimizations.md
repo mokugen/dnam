@@ -8,7 +8,7 @@ deciders:
 supersedes: []
 superseded_by: null
 specs:
-  - "../specs/architecture/tora_architecture.md"
+  - "../specs/architecture/sona_architecture.md"
   - "../specs/architecture/project_and_documentation_quality.md"
   - "../specs/dsp/op_m_modal_kautz.md"
   - "../specs/dsp/op_n_commuted_cascade.md"

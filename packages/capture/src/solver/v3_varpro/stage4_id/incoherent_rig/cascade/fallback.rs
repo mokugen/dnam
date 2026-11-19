@@ -496,13 +496,7 @@ pub(super) fn try_phase_detune_fallback<B: TrainerBackend>(
             );
             (bl, br_opt) = eval_tier_cert::<B>(&cand, args.tier, stem0, ctx.certs);
             if pair_beats_margin(&bl, br_opt.as_ref(), args.hi_l, args.hi_r, quality_mode)
-                && eval_tier_passes_universal::<B>(
-                    &cand,
-                    args.tier,
-                    stem0,
-                    ctx.certs,
-                    quality_mode,
-                )
+                && eval_tier_passes_universal::<B>(&cand, args.tier, stem0, ctx.certs, quality_mode)
                 && let Some(cand_rms) = rms_within_gate::<B>(
                     &cand,
                     args.tier,

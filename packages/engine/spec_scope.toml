@@ -12,6 +12,14 @@
 scope = "out-of-scope"
 reason = "Repository-wide Rust/TypeScript static typing and import boundary guardrail verified in tests/test_guardrails.test.ts"
 
+[rules."repo.code.zerocopy-wire-structs"]
+scope = "out-of-scope"
+reason = "Phase 1 declarative zerocopy wire-struct rule verified in tests/test_guardrails.test.ts (promoted to engine/capture in Phases 2-5)"
+
+[rules."repo.code.shared-nostd-kernels"]
+scope = "out-of-scope"
+reason = "Phase 1 shared no_std dnam-kernels and AOT .wgsl toolchain rule verified in tests/test_guardrails.test.ts (promoted in Phases 2-4)"
+
 [rules."repo.docs.agents-md-budgets"]
 scope = "out-of-scope"
 reason = "Repository-wide AGENTS.md byte budget guardrail verified in tests/test_guardrails.test.ts"
@@ -111,8 +119,12 @@ reason = "Offline duration-weighted SegESR companion metric owned by packages/ca
 scope = "out-of-scope"
 reason = "Offline 4-tier psychoacoustic benchmark qualification matrix owned by packages/capture"
 
+[rules."qual.tiers.floors-not-stopping-criteria"]
+scope = "out-of-scope"
+reason = "Phase 1 benchmark floor vs stopping-criteria policy verified in tests/test_guardrails.test.ts (enforced in capture Phase 5)"
+
 # ==============================================================================
-# 3. Architecture: TORA System Overview (`docs/specs/architecture/tora_architecture.md`)
+# 3. Architecture: SONA System Overview (`docs/specs/architecture/sona_architecture.md`)
 # ==============================================================================
 [rules."arch.pillars.dual-space-control"]
 scope = "engine"
@@ -174,6 +186,10 @@ scope = "engine"
 [rules."arch.tiers.transition-contract"]
 scope = "engine"
 
+[rules."arch.tiers.maximize-quality-within-budget"]
+scope = "out-of-scope"
+reason = "Phase 1 Gate 0b headroom reinvestment and fixed const-tier policy verified in tests/test_guardrails.test.ts (promoted to engine in Phase 3)"
+
 [rules."arch.topology.spillover-trails"]
 scope = "engine"
 
@@ -212,7 +228,7 @@ scope = "engine"
 
 [rules."arch.isomorphism.two-sweep"]
 scope = "out-of-scope"
-reason = "TORA v3 analytical VarPro, Windowed-BPTT, and Cholesky solver owned by packages/capture"
+reason = "SONA analytical VarPro, parallel-scan, and Cholesky solver owned by packages/capture"
 
 [rules."arch.isomorphism.audit-wiring"]
 scope = "out-of-scope"
@@ -875,11 +891,15 @@ scope = "out-of-scope"
 reason = "Owned and verified by packages/capture"
 
 # ==============================================================================
-# 15. Training: TORA v3 Solver Pipeline (`docs/specs/training/four_stage_pipeline.md`)
+# 15. Training: SONA Solver Pipeline (`docs/specs/training/four_stage_pipeline.md`)
 # ==============================================================================
 [rules."train.pipeline.topology"]
 scope = "out-of-scope"
-reason = "TORA v3 analytical VarPro, Windowed-BPTT, and Cholesky pipeline orchestration owned by packages/capture"
+reason = "SONA analytical VarPro, parallel-scan, and Cholesky pipeline orchestration owned by packages/capture"
+
+[rules."train.pipeline.webgpu-scans-and-ozaki"]
+scope = "out-of-scope"
+reason = "Phase 1 32-bit WebGPU 16 KiB SRAM scans and i32 Ozaki rule verified in tests/test_guardrails.test.ts (promoted in Phase 4/5)"
 
 [rules."train.pipeline.stage-a-poles"]
 scope = "out-of-scope"

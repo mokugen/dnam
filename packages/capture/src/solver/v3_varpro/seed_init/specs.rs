@@ -100,8 +100,7 @@ const fn derive_os2x_quad_passband_pre_emph() -> f64 {
 
 /// Compile-time derived HF passband flatness pre-emphasis for `ZeroLagOversampler2x` (`-0.14602`).
 pub(super) const OS2X_QUAD_PASSBAND_PRE_EMPH: f64 = derive_os2x_quad_passband_pre_emph();
-const _: () =
-    assert!(OS2X_QUAD_PASSBAND_PRE_EMPH > -0.165 && OS2X_QUAD_PASSBAND_PRE_EMPH < -0.140);
+const _: () = assert!(OS2X_QUAD_PASSBAND_PRE_EMPH > -0.165 && OS2X_QUAD_PASSBAND_PRE_EMPH < -0.140);
 
 pub(super) const SEED_SPECS: [SeedSpec; 16] = [
     // GeneralDrive (4): poly 2x OS + Butterworth4 AI pre-HP overdrive + multi-band drive

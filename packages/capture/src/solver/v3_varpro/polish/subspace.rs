@@ -665,8 +665,8 @@ pub(super) fn subspace_lbfgs_polish_chan<B: TrainerBackend>(
     theta0: &[f64],
 ) -> Vec<f64> {
     let p_dim = theta0.len();
-    let use_cert =
-        cert_welch0.filter(|cw| cw.len > 0 && cols_stem0.first().is_some_and(|c| c.len() == cw.len));
+    let use_cert = cert_welch0
+        .filter(|cw| cw.len > 0 && cols_stem0.first().is_some_and(|c| c.len() == cw.len));
     let (welch_sum0, welch_sw0, n0) = match use_cert {
         Some(cw) => (cw, 1.0_f64, cw.len),
         None => (

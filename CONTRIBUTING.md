@@ -13,7 +13,7 @@ Dynamic Neural Audio Modeler (DNAM) is distributed under the [`DNAM Source-Avail
 Include a standard Git `Signed-off-by` trailer on every commit using `-s`:
 
 ```bash
-git commit -s -m "feat(engine): optimize Stage II SoA block execution"
+git commit -s -m "feat(engine): optimize SONA hot-slab block execution"
 ```
 
 Or include the trailer explicitly in your commit message:
@@ -38,6 +38,8 @@ DNAM is organized as a multi-language workspace across `docs/`, `packages/*`, an
 | **Design System & Visualizers (`@dnam-project/ui`)** | `packages/ui/` | [`packages/ui/AGENTS.md`](packages/ui/AGENTS.md) | [`packages/ui/CONTRIBUTING.md`](packages/ui/CONTRIBUTING.md) |
 | **Desktop Studio (`@dnam-project/studio`)** | `packages/studio/` | [`packages/studio/AGENTS.md`](packages/studio/AGENTS.md) | [`packages/studio/CONTRIBUTING.md`](packages/studio/CONTRIBUTING.md) |
 | **Project Guardrail Suite (`dnam-tests`)** | `tests/` | [`tests/AGENTS.md`](tests/AGENTS.md) | [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) |
+
+*(Note: `packages/kernels` (`dnam-kernels`, `#![no_std]` shared CPU/GPU primitives) and `tools/sona-shaders` (AOT `cargo-gpu` `.wgsl` kernels) are scheduled for `Phase 2` and `Phase 4` of the `SONA` `v3.0` cutover; see [`docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md).)*
 
 ---
 
@@ -92,17 +94,18 @@ moon check tests
 
 1. **Zero `FSQRT` / `FDIV` / `libm` in Real-Time Loops:**
    - Never introduce floating-point division (`/`), hardware square-root (`FSQRT`), or `libm` transcendental calls (`sin`, `cos`, `exp`, `tanh`) into the $48\text{ kHz}$ per-sample audio loop or the $3\text{ kHz}$ control-bus update.
-   - Always use the division-free algebraic `PolyADAA` ($m_n, d_n$ factorization) with $1\times$ passive B-spline weights $(0.875, 0.125)$ and the $3\text{ kHz}$ quadrant-reduced contractive rotor specified in [`docs/specs/dsp/op_n_commuted_cascade.md`](docs/specs/dsp/op_n_commuted_cascade.md) and [`docs/specs/dsp/op_m_modal_kautz.md`](docs/specs/dsp/op_m_modal_kautz.md).
-2. **128-Bit / 64-Byte SIMD Alignment:**
-   - Feature bus widths ($D$), channel counts ($C$), Kautz modal pole counts ($K$), and FDN delay line counts ($M$) must remain exact multiples of 4 (`D=64, C=4, K=4, M=4` for `Lite`; `D=128, C=8, K=8, M=8` for `Full`; `D=192, C=12, K=16, M=8` for `Pro`; `D=256, C=16, K=32, M=16` for `Ultra`), and `.dnam` / `.dnam-proj` binary chunks and tensor arenas must remain 64-byte cache-line aligned.
+   - Always use the division-free pure-`f32` divided-difference `PolyADAA1` (`(m_n, d_n)` cubic odd + quartic even + `C²` wavefolder), passive `2×2` ZDF `TPT-SVF`, contractive `1D ParaLRU`, and $3\text{ kHz}$ quadrant-reduced contractive rotor specified in [`docs/specs/architecture/sona_architecture.md`](docs/specs/architecture/sona_architecture.md), [`docs/specs/dsp/op_n_commuted_cascade.md`](docs/specs/dsp/op_n_commuted_cascade.md), and [`docs/specs/dsp/op_m_modal_kautz.md`](docs/specs/dsp/op_m_modal_kautz.md).
+2. **4-Lane SIMD, Compile-Time `const` `SONA` Tiers & 64-Byte Alignment:**
+   - Organize `SONA` (`State-Space Operator Neural Architecture`) 4-block Matryoshka tiers (`Lite` ⊂ `Full` ⊂ `Pro` ⊂ `Ultra`: `[1,1,1,1]`, `[2,2,1,1]`, `[3,2,2,1]`, `[4,3,2,1]` locked at `Gate 0b` inside `64 KiB` L1D), `Stage III` `FIR` + `Kautz` modal slices, and `Op-T` transport lines in exact 4-lane SIMD multiples (`SimdVec4` / `StereoVec8`), and keep `SonaHotSlab` + `v3.0` (`"sona"`) `.dnam` / `.dnam-proj` binary chunks and arenas strictly 64-byte cache-line aligned.
 3. **Unconditional Stability & Registered Clamps:**
-   - Every pole radius ($r_c \le 0.9995$), FDN loop gain ($g_{\text{lin},m} \le 0.9990$), all-pass diffusion coefficient ($|a_{\text{diff},m}| \le 0.75$), fractional delay ($\tau_m \ge 4.0$), and control range must obey the bounds in [`docs/specs/training/control_space_audit.md`](docs/specs/training/control_space_audit.md).
+   - Every pole radius ($r_c \le 0.9995$), `ParaLRU` contraction bound, `Op-T` loop gain ($g_{\text{lin},m} \le 0.9990$), all-pass diffusion coefficient ($|a_{\text{diff},m}| \le 0.75$), fractional delay ($\tau_m \ge 4.0$), and control range must obey the bounds in [`docs/specs/training/control_space_audit.md`](docs/specs/training/control_space_audit.md).
 4. **Fail-Fast Validation:**
-   - Never silently substitute default controls, sample rates, or tensor shapes when loading `.dnam` or `.dnam-proj` containers; return or raise explicit, typed diagnostic errors (`DnamError`).
-5. **Safe-Rust-First & Strict `#[allow(unsafe_code)]` Discipline (`ref[repo.code.type-safety-and-imports]`):**
+   - Never silently substitute default controls, sample rates, or tensor shapes when loading `v3.0` `.dnam` or `.dnam-proj` containers; return or raise explicit, typed diagnostic errors (`DnamError`).
+5. **Safe-Rust-First, `zerocopy` Wire Structs & Strict `#[allow(unsafe_code)]` Discipline (`ref[repo.code.type-safety-and-imports]`):**
    - Never be lazy and reach for `#[allow(unsafe_code)]` or `unsafe` (`UnsafeCell`, `AtomicPtr`, raw pointer casts, or `get_unchecked`) when a 100% safe Rust design exists (such as `AtomicU64` word arrays for lock-free SPSC rings and seqlocks, ping-pong slot indices, disjoint struct field borrows, `zerocopy::transmute!`, or checked `napi` buffer views).
+   - Use declarative `#[repr(C)]` `zerocopy::byteorder::little_endian::{U16, U32, U64, F32, F64}` structs deriving `FromBytes, IntoBytes, KnownLayout, Immutable` (`Unaligned` where slice-cast) with compile-time `size_of` / alignment assertions instead of manual byte-slicing (`from_le_bytes` / `to_le_bytes`) for `.dnam`, `.dnam-proj`, `DNWB`, and WAV headers (see `.agents/rules/zerocopy-wire-structs.md` and [`docs/specs/architecture/project_and_documentation_quality.md`](docs/specs/architecture/project_and_documentation_quality.md)).
    - `#[allow(unsafe_code)]` may **only** be used when **(a)** it is strictly unavoidable at a hardware/OS intrinsic or C-ABI boundary (`packages/engine/src/{math,types,memory,ffi}.rs`), or **(b)** benchmarks prove that the safe Rust version causes a high performance impact on a real-time hot path **and** the `unsafe` version can be formally guaranteed sound with an explicit `// SAFETY:` proof.
-   - All language SDK and application Rust crates (`packages/js/rust/`, `packages/studio/rust/`, `packages/capture/`, `packages/fixtures/`) and all algorithmic/host modules in `packages/engine/src/` (`operators`, `stages`, `control`, `container`, `provenance`, `schema`, `engine`, `dynamic`, `host`) must remain 100% safe Rust with zero `#[allow(unsafe_code)]`.
+   - All language SDK and application Rust crates (`packages/js/rust/`, `packages/studio/rust/`, `packages/capture/`, `packages/fixtures/`) and all algorithmic/host modules in `packages/engine/src/` (`operators`, `stages`, `control`, `container`, `provenance`, `schema`, `engine`, `dynamic`, `host`)—as well as the upcoming `#![no_std]` `packages/kernels` (`dnam-kernels`, Phase 2)—must remain 100% safe Rust with zero `#[allow(unsafe_code)]`.
 6. **Zero Duplicated Engine Logic in Language SDKs (`packages/js/`):**
    - Language SDKs (`@dnam-project/dnam`) and their FFI shims (`packages/js/rust/`) must **never** reimplement DSP math, ZOH rescaling, 3-Phase control clamping, Lobatto calibration inversion, schema validation, RFC 8785 JCS canonicalization, or provenance signature assembly in TypeScript (`ref[sdk.ts.runtime.dual-target-drivers]`).
    - Delegate 100% of domain logic to `dnam-engine` in Rust; keep SDK host-language layers strictly focused on idiomatic ergonomics, casing/type coercion, and zero-copy buffer/handle lifecycles.
@@ -148,18 +151,18 @@ Never copy mathematical equations, stability tables, or JSON schemas into `AGENT
 
 | When You Modify... | Update This Canonical Document (SSOT) |
 | :--- | :--- |
-| **System goals, complex full-rig requirements (`REQ-1.5`), hardware budgets, `bESR` tiers, or TORA topology** | [`docs/requirements/system_goals_and_requirements.md`](docs/requirements/system_goals_and_requirements.md), [`docs/specs/architecture/psychoacoustic_quality_and_tiers.md`](docs/specs/architecture/psychoacoustic_quality_and_tiers.md), [`docs/specs/architecture/tora_architecture.md`](docs/specs/architecture/tora_architecture.md) |
+| **System goals, complex full-rig requirements (`REQ-1.5`), hardware budgets, `bESR` tiers, or `SONA` topology** | [`docs/requirements/system_goals_and_requirements.md`](docs/requirements/system_goals_and_requirements.md), [`docs/specs/architecture/psychoacoustic_quality_and_tiers.md`](docs/specs/architecture/psychoacoustic_quality_and_tiers.md), [`docs/specs/architecture/sona_architecture.md`](docs/specs/architecture/sona_architecture.md) |
 | **Any 3-phase control-space audit or automatic clamping rule (`r[train.audit.*]`)** | [`docs/specs/training/control_space_audit.md`](docs/specs/training/control_space_audit.md) |
-| **Op-N Commuted Cascade, `1x B-Spline PolyADAA`, or DC resting equilibrium (`r[dsp.op-n.*]`)** | [`docs/specs/dsp/op_n_commuted_cascade.md`](docs/specs/dsp/op_n_commuted_cascade.md) |
+| **`Op-N` `PolyADAA1`, `ParaLRU`, `C²` wavefolder, or DC resting equilibrium (`r[dsp.op-n.*]`)** | [`docs/specs/dsp/op_n_commuted_cascade.md`](docs/specs/dsp/op_n_commuted_cascade.md) |
 | **Op-M Modal Bank, symplectic recurrence, Kautz filter, or contractive rotor (`r[dsp.op-m.*]`)** | [`docs/specs/dsp/op_m_modal_kautz.md`](docs/specs/dsp/op_m_modal_kautz.md) |
 | **Op-T Transport, Catmull-Rom fractional delay, diffusers, or dynamic ducking (`r[dsp.op-t.*]`)** | [`docs/specs/dsp/op_t_transport.md`](docs/specs/dsp/op_t_transport.md) |
-| **8-Port Matrix Router, dual return aligners, or multi-stage rig topology (`r[dsp.router.*]`, `r[dsp.zoh.*]`)** | [`docs/specs/dsp/router_and_stages_topology.md`](docs/specs/dsp/router_and_stages_topology.md) |
+| **8-Port Matrix Router, dual return aligners, or `SONA` crossbar/stage topology (`r[dsp.router.*]`, `r[dsp.zoh.*]`)** | [`docs/specs/dsp/router_and_stages_topology.md`](docs/specs/dsp/router_and_stages_topology.md) |
 | **Parametric Control Bus, Lobatto HDMR, Rank-4/8 FM, Chebyshev LFO, or tempo sync (`r[dsp.ctrl.*]`, `r[dsp.tempo.*]`)** | [`docs/specs/dsp/parametric_control_bus.md`](docs/specs/dsp/parametric_control_bus.md) |
-| **`.dnam` / `.dnam-proj` 64B preamble, JCS manifest, SoA arena offsets, or `INPC`/`STMC` capsules (`r[container.*]`)** | [`docs/specs/containers/dnam_binary_format.md`](docs/specs/containers/dnam_binary_format.md), [`docs/specs/containers/project_container_format.md`](docs/specs/containers/project_container_format.md) |
+| **`v3.0` `.dnam` / `.dnam-proj` 64B preamble, `zerocopy` wire layouts, JCS manifest, or `INPC`/`STMC` capsules (`r[container.*]`)** | [`docs/specs/containers/dnam_binary_format.md`](docs/specs/containers/dnam_binary_format.md), [`docs/specs/containers/project_container_format.md`](docs/specs/containers/project_container_format.md) |
 | **JCS SHA-256, `Ed25519` signatures, `.dnam-seal` (`DNSL`), or Buyer Watermarking (`r[sec.*]`)** | [`docs/specs/security/provenance_and_enclave_drm.md`](docs/specs/security/provenance_and_enclave_drm.md), [`docs/specs/security/watermarking_and_marketplace.md`](docs/specs/security/watermarking_and_marketplace.md) |
-| **Capture alignment, Two-Sweep Cholesky pipeline, `uplo='U'` Gram matrices, or stem expansion (`r[train.*]`)** | [`docs/specs/training/capture_and_alignment.md`](docs/specs/training/capture_and_alignment.md), [`docs/specs/training/four_stage_pipeline.md`](docs/specs/training/four_stage_pipeline.md), [`docs/specs/training/iterative_resume_and_caching.md`](docs/specs/training/iterative_resume_and_caching.md) |
-| **Repository, code, or documentation quality rules (`r[repo.*]`)** | [`docs/specs/architecture/project_and_documentation_quality.md`](docs/specs/architecture/project_and_documentation_quality.md) |
-| **Architectural trade-offs, mathematical counterexamples, or rejected R&D candidates (`ADR-NNNN`)** | [`docs/adr/`](docs/adr/0002-tri-operator-recurrent-architecture.md) (using [`docs/templates/adr_template.md`](docs/templates/adr_template.md)) |
+| **Capture alignment, `32-bit WebGPU` + Host-`f64` `VarPro` (`i32` Ozaki), `uplo='U'` Gram matrices, or stem expansion (`r[train.*]`)** | [`docs/specs/training/capture_and_alignment.md`](docs/specs/training/capture_and_alignment.md), [`docs/specs/training/four_stage_pipeline.md`](docs/specs/training/four_stage_pipeline.md), [`docs/specs/training/iterative_resume_and_caching.md`](docs/specs/training/iterative_resume_and_caching.md) |
+| **Repository, code, `zerocopy` wire-struct, or documentation quality rules (`r[repo.*]`)** | [`docs/specs/architecture/project_and_documentation_quality.md`](docs/specs/architecture/project_and_documentation_quality.md) |
+| **Architectural trade-offs, mathematical counterexamples, or rejected R&D candidates (`ADR-NNNN`)** | [`docs/adr/`](docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md) (using [`docs/templates/adr_template.md`](docs/templates/adr_template.md)) |
 
 ---
 

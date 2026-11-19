@@ -344,23 +344,27 @@ pub(super) fn cascade_down_tiers<B: TrainerBackend>(
             );
             let mut local_certs = ctx.certs.clone();
             let (sl, sr_opt) = eval_tier_cert::<B>(&trial, tier, stem0, &mut local_certs);
-            let univ_ok =
-                eval_tier_passes_universal::<B>(&trial, tier, stem0, &mut local_certs, quality_mode);
-            let cand_rms = if pair_beats_margin(&sl, sr_opt.as_ref(), hi_l, hi_r, quality_mode)
-                && univ_ok
-            {
-                rms_within_gate::<B>(
-                    &trial,
-                    tier,
-                    stem0,
-                    warmup,
-                    target_t_total_rms,
-                    hi_rms,
-                    mono_out,
-                )
-            } else {
-                None
-            };
+            let univ_ok = eval_tier_passes_universal::<B>(
+                &trial,
+                tier,
+                stem0,
+                &mut local_certs,
+                quality_mode,
+            );
+            let cand_rms =
+                if pair_beats_margin(&sl, sr_opt.as_ref(), hi_l, hi_r, quality_mode) && univ_ok {
+                    rms_within_gate::<B>(
+                        &trial,
+                        tier,
+                        stem0,
+                        warmup,
+                        target_t_total_rms,
+                        hi_rms,
+                        mono_out,
+                    )
+                } else {
+                    None
+                };
             let sc = eval_cand_rank(
                 &sl,
                 sr_opt.as_ref(),

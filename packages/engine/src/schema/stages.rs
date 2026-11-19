@@ -1,6 +1,6 @@
 //! TORA Stage and subsystem configurations (`schema/stages.rs`).
 //!
-//! Canonical Reference: `docs/dsp/parametric_control_bus.md` and `docs/overview/tora_architecture.md`.
+//! Canonical Reference: `docs/specs/dsp/parametric_control_bus.md` and `docs/specs/architecture/sona_architecture.md`.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;

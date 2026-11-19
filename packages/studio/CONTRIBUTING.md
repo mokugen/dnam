@@ -9,8 +9,8 @@ All contributions must also comply with the root [`CONTRIBUTING.md`](../../CONTR
 ## 1. Architecture Invariants
 
 - **Rust 2024 Non-`mod.rs` Module Roots:** Use `rust/capture.rs` + `rust/capture/backends.rs`, `rust/ipc.rs`, and `rust/main.rs` with `#![forbid(unsafe_code)]`.
-- **Single-File `.dnam-proj` & Native Audio Separation:** Capture math, WAV I/O, and `.dnam-proj` (`DNPJ`) container persistence live in `dnam-capture`; `packages/studio` owns only native OS audio device enumeration (`cpal`), `AtomicF32RingBuffer`, and the Tauri v2 Desktop Studio host.
-- **Native Hardware Acceleration in Tauri Studio:** [`src/host.ts`](src/host.ts) (`TauriNativeAudioHost`) implements `@dnam-project/ui`'s `DnamAudioHost` over native Rust SIMD (`ARM SME`, `ARM64 NEON`, `x86_64 AVX2+FMA`).
+- **Single-File `.dnam-proj` & Native Audio Separation:** Capture math, WAV I/O, and `.dnam-proj` (`DNPJ`, `v3.0` `"sona"` `zerocopy` in Phase 5–6) container persistence live in `dnam-capture`; `packages/studio` owns only native OS audio device enumeration (`cpal`), `AtomicF32RingBuffer`, and the Tauri v2 Desktop Studio host.
+- **Native Hardware Acceleration in Tauri Studio:** [`src/host.ts`](src/host.ts) (`TauriNativeAudioHost`) implements `@dnam-project/ui`'s `DnamAudioHost` over native Rust SIMD (`ARM SME`, `ARM64 NEON`, `x86_64 AVX2+FMA`), wiring native `gpu-wgpu` (`32-bit WebGPU`) training and `DNPR` adapter/planner telemetry in Phase 6.
 
 ---
 

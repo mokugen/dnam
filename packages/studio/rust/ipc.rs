@@ -16,9 +16,7 @@ use serde_json::{Value, json};
 use crate::capture::{list_backend_devices, list_capture_backends};
 use crate::error::{StudioError, StudioResult};
 
-pub use deep_link::{
-    DnamDeepLinkRoute, parse_dnam_deep_link, validate_isolated_ipc_request,
-};
+pub use deep_link::{DnamDeepLinkRoute, parse_dnam_deep_link, validate_isolated_ipc_request};
 pub use paths::{
     default_user_config_dir, detect_native_backend_str, write_private_studio_export_file,
 };

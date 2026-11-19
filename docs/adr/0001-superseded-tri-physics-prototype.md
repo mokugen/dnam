@@ -3,7 +3,7 @@ id: ADR-0001
 title: "Superseded Tri-Physics (Core 1 + Core 2 + q_8) Prototype Architecture"
 status: superseded
 supersedes: []
-superseded_by: ADR-0002
+superseded_by: ADR-0022
 specs: []
 requirements: []
 ---
@@ -11,11 +11,11 @@ requirements: []
 # ADR-0001: Superseded Tri-Physics (`Core 1` + `Core 2` + `q_8`) Prototype Architecture
 
 > [!NOTE]
-> This record (`status: superseded` by [`ADR-0002`](0002-tri-operator-recurrent-architecture.md)) archives the early **Tri-Physics R&D prototype** (`Core 1` + `Core 2` + `q_8` control bus) explored prior to the canonical [`../specs/architecture/tora_architecture.md`](../specs/architecture/tora_architecture.md) specification. The Tri-Physics prototype was an internal research architecture and was never deployed in production; its equations and layouts are retained solely for research provenance and comparative context.
+> This record (`status: superseded`, originally by `ADR-0002` and currently by [`ADR-0022`](0022-sona-state-space-operator-and-webgpu-architecture.md)) archives the early **Tri-Physics R&D prototype** (`Core 1` + `Core 2` + `q_8` control bus) explored prior to the canonical [`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md) specification. The Tri-Physics prototype was an internal research architecture and was never deployed in production; its equations and layouts are retained solely for research provenance and comparative context.
 
 This document summarizes the **signal topology, dual-rate (`48 kHz` / `3 kHz`) execution loop, 4-tier SIMD hierarchy, prior-art architectural comparison (`NAM A2`, `GuitarML PROTEUS`, `NAM ParametricOD`), gain staging, spillover bypass state machine, and R&D findings** from the Tri-Physics research phase.
 
-For implementation-agnostic system requirements and hardware budgets, see [`../requirements/system_goals_and_requirements.md`](../requirements/system_goals_and_requirements.md). For psychoacoustic `bESR` quality tiers, see [`../specs/architecture/psychoacoustic_quality_and_tiers.md`](../specs/architecture/psychoacoustic_quality_and_tiers.md). For the canonical TORA subsystem specifications, see [`../specs/architecture/tora_architecture.md`](../specs/architecture/tora_architecture.md), [`../specs/dsp/op_t_transport.md`](../specs/dsp/op_t_transport.md), [`../specs/dsp/op_m_modal_kautz.md`](../specs/dsp/op_m_modal_kautz.md), [`../specs/dsp/op_n_commuted_cascade.md`](../specs/dsp/op_n_commuted_cascade.md), [`../specs/dsp/router_and_stages_topology.md`](../specs/dsp/router_and_stages_topology.md), and [`../specs/dsp/parametric_control_bus.md`](../specs/dsp/parametric_control_bus.md). For the mathematical formulations of the R&D prototype's Core 1, Core 2, and `q_8` control bus, see [§5 below](#5-rd-prototype-reference-appendix-for-the-tri-physics-core-1--core-2--q_8-control-bus-architecture).
+For implementation-agnostic system requirements and hardware budgets, see [`../requirements/system_goals_and_requirements.md`](../requirements/system_goals_and_requirements.md). For psychoacoustic `bESR` quality tiers, see [`../specs/architecture/psychoacoustic_quality_and_tiers.md`](../specs/architecture/psychoacoustic_quality_and_tiers.md). For the canonical system architecture and DSP subsystem specifications, see [`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md), [`../specs/dsp/op_t_transport.md`](../specs/dsp/op_t_transport.md), [`../specs/dsp/op_m_modal_kautz.md`](../specs/dsp/op_m_modal_kautz.md), [`../specs/dsp/op_n_commuted_cascade.md`](../specs/dsp/op_n_commuted_cascade.md), [`../specs/dsp/router_and_stages_topology.md`](../specs/dsp/router_and_stages_topology.md), and [`../specs/dsp/parametric_control_bus.md`](../specs/dsp/parametric_control_bus.md). For the mathematical formulations of the R&D prototype's Core 1, Core 2, and `q_8` control bus, see [§5 below](#5-rd-prototype-reference-appendix-for-the-tri-physics-core-1--core-2--q_8-control-bus-architecture).
 
 ---
 
@@ -207,7 +207,7 @@ stateDiagram-v2
 
 ## 4. Index of the 18 Empirically Verified Engineering Breakthroughs
 
-Each structural breakthrough is specified in full mathematical detail in its dedicated subsystem document ([`../specs/architecture/tora_architecture.md`](../specs/architecture/tora_architecture.md)):
+Each structural breakthrough is specified in full mathematical detail in its dedicated subsystem document ([`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md)):
 
 | # | Architectural Breakthrough | What It Replaces | Verified Physical, Numerical & Hardware Benefit | Canonical Specification |
 | :- | :--- | :--- | :--- | :--- |
@@ -354,7 +354,7 @@ The R&D prototype JSON header schema used `core1_hybrid_ssm` and `core2_mufdn`.
 
 ### 5.6 Summary of the 5 R&D Prototype Findings (Findings 1–5)
 
-Evaluation of the Tri-Physics (`Core 1 -> Core 2`) R&D prototype identified five structural bottlenecks that motivated the canonical [`../specs/architecture/tora_architecture.md`](../specs/architecture/tora_architecture.md) design:
+Evaluation of the Tri-Physics (`Core 1 -> Core 2`) R&D prototype identified five structural bottlenecks that motivated the canonical [`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md) design:
 
 ```mermaid
 flowchart LR

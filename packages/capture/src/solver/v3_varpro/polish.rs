@@ -289,13 +289,7 @@ pub fn polish_f32_matryoshka_readouts_with_cert_stem<B: TrainerBackend>(
     let bundle_1x = need_1x.then(|| build_pre_split(trajs_1x, bg_1x));
     let bundle_2x = need_2x.then(|| build_pre_split(trajs_2x, bg_2x));
     let cert_welch = CertWelchData::build::<B>(
-        &cold_init,
-        cert_stem0,
-        dataset,
-        need_1x,
-        need_2x,
-        bg_1x,
-        bg_2x,
+        &cold_init, cert_stem0, dataset, need_1x, need_2x, bg_1x, bg_2x,
     );
 
     let mut summaries_l: [Option<PerceptualCertificationSummary>; 4] = [None, None, None, None];
@@ -428,9 +422,7 @@ pub fn polish_f32_matryoshka_readouts_with_cert_stem<B: TrainerBackend>(
                         let cand_r = blend_readout(&ls_r, &pol_r, alpha);
                         let (bl_sl, bl_sr, _) = ctx.eval::<B>(cand_r.clone());
                         let bl_ltas_ok = bl_sl.ltas_max_db <= bl_ltas_cap
-                            && bl_sr
-                                .as_ref()
-                                .is_none_or(|r| r.ltas_max_db <= bl_ltas_cap);
+                            && bl_sr.as_ref().is_none_or(|r| r.ltas_max_db <= bl_ltas_cap);
                         if passes_both(&bl_sl, &bl_sr) && bl_ltas_ok {
                             best = (cand_r, bl_sl, bl_sr);
                             break;

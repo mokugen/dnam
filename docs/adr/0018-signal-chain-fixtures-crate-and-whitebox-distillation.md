@@ -8,7 +8,7 @@ supersedes:
   - ADR-0014
 superseded_by: null
 specs:
-  - ../specs/architecture/tora_architecture.md
+  - ../specs/architecture/sona_architecture.md
   - ../specs/architecture/psychoacoustic_quality_and_tiers.md
   - ../specs/training/four_stage_pipeline.md
   - ../specs/sdks/typescript_sdk.md
@@ -62,5 +62,5 @@ We adopt **Candidate B**, superseding [`ADR-0012`](0012-python-sdk-architecture-
 ## 4. Verification & References
 
 - **Supersedes:** [`ADR-0012`](0012-python-sdk-architecture-and-idiomatic-api.md), [`ADR-0014`](0014-python-3-15-free-threading-and-stable-abi-abi3t.md)
-- **Canonical Specifications:** [`../specs/architecture/tora_architecture.md`](../specs/architecture/tora_architecture.md), [`../specs/architecture/psychoacoustic_quality_and_tiers.md`](../specs/architecture/psychoacoustic_quality_and_tiers.md), [`../specs/training/four_stage_pipeline.md`](../specs/training/four_stage_pipeline.md), [`../specs/sdks/typescript_sdk.md`](../specs/sdks/typescript_sdk.md), [`../specs/architecture/project_and_documentation_quality.md`](../specs/architecture/project_and_documentation_quality.md)
+- **Canonical Specifications:** [`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md), [`../specs/architecture/psychoacoustic_quality_and_tiers.md`](../specs/architecture/psychoacoustic_quality_and_tiers.md), [`../specs/training/four_stage_pipeline.md`](../specs/training/four_stage_pipeline.md), [`../specs/sdks/typescript_sdk.md`](../specs/sdks/typescript_sdk.md), [`../specs/architecture/project_and_documentation_quality.md`](../specs/architecture/project_and_documentation_quality.md)
 - **Requirements:** [`../requirements/system_goals_and_requirements.md`](../requirements/system_goals_and_requirements.md) (`REQ-1.5`, `REQ-1.6`, `REQ-1.8`, `REQ-6.1`, `REQ-6.2`)

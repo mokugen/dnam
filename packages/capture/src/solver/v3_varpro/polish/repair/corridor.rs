@@ -125,12 +125,9 @@ fn accept_repaired_cand<B: TrainerBackend>(
             *best_ok = Some((br, bsl, bsr));
             return true;
         }
-    } else if let Some((br, bsl, bsr)) = try_strict_monotone_blends::<B>(
-        ctx,
-        &None,
-        &Some((cand.clone(), sl, sr)),
-        prev_ref,
-    ) && (!require_pass || passes_both(&bsl, &bsr))
+    } else if let Some((br, bsl, bsr)) =
+        try_strict_monotone_blends::<B>(ctx, &None, &Some((cand.clone(), sl, sr)), prev_ref)
+        && (!require_pass || passes_both(&bsl, &bsr))
     {
         *best_ok = Some((br, bsl, bsr));
         return true;
@@ -542,15 +539,11 @@ pub(in super::super) fn try_corridor_repair<B: TrainerBackend>(
         if try_relaxed_prevs_pass::<B>(ctx, &relaxed_prevs, cands, &prev_ctx, false, best_ok) {
             return true;
         }
-        let mut strict_steps: Vec<PrefixStepKind> = [
-            (0.996, 0.06),
-            (0.994, 0.12),
-            (0.992, 0.18),
-            (0.990, 0.24),
-        ]
-        .iter()
-        .map(|&(s, d)| PrefixStepKind::FracDelayScale(s, d))
-        .collect();
+        let mut strict_steps: Vec<PrefixStepKind> =
+            [(0.996, 0.06), (0.994, 0.12), (0.992, 0.18), (0.990, 0.24)]
+                .iter()
+                .map(|&(s, d)| PrefixStepKind::FracDelayScale(s, d))
+                .collect();
         strict_steps.extend(
             CASCADE_SCHEDULE
                 .iter()

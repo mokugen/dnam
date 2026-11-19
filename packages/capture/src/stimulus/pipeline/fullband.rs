@@ -535,12 +535,8 @@ pub(super) fn probe_target_repeatability_profiles(
     let (causal_lag, inv_l, inv_r) = shared_align;
     let al_l = realign_fractional_kaiser64(&to_48k(&resp.out_1), causal_lag, 0.0, inv_l);
     let wl: Vec<f64> = al_l.iter().map(|&v| f64::from(v)).collect();
-    let prof_l = TargetRepeatabilityProfile::from_probe_response(
-        &wl,
-        &rep_windows,
-        rep_late_w,
-        48_000.0,
-    );
+    let prof_l =
+        TargetRepeatabilityProfile::from_probe_response(&wl, &rep_windows, rep_late_w, 48_000.0);
     let prof_r = resp.out_2.as_deref().map_or(prof_l, |o2| {
         let al_r = realign_fractional_kaiser64(&to_48k(o2), causal_lag, 0.0, inv_r);
         let wr: Vec<f64> = al_r.iter().map(|&v| f64::from(v)).collect();

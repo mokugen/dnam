@@ -213,7 +213,8 @@ pub fn fit_v3_matryoshka_with_backend<B: TrainerBackend>(
 
 #[inline]
 fn has_slow_envelope_or_sag(m: &V3MatryoshkaOptF64) -> bool {
-    let slow_opt = m.feat_det_thresh > 0.0 && m.feat_slow_rel_beta < 8.0e-5 && m.feat_pinch_k < 0.25;
+    let slow_opt =
+        m.feat_det_thresh > 0.0 && m.feat_slow_rel_beta < 8.0e-5 && m.feat_pinch_k < 0.25;
     let slow_sag = m.feat_slow_rel_beta < 5.0e-5
         && m.blocks
             .iter()
@@ -382,8 +383,12 @@ fn fit_v3_matryoshka_core<B: TrainerBackend>(
         s2a_loss = f64::INFINITY;
     }
     accept_varpro_if_improves::<B>(&mut model, &ds_s2a, &mut ws, 1, &mut s2a_loss);
-    let s2a_iters =
-        (if sweeping_svf || crossover_split { 10 } else { 7 } + s2a_bonus).min(fast_cap);
+    let s2a_iters = (if sweeping_svf || crossover_split {
+        10
+    } else {
+        7
+    } + s2a_bonus)
+        .min(fast_cap);
     let mut s2a_after =
         run_lbfgs_with_ws::<B>(&mut model, &ds_s2a, &mut ws, s2a_iters, true, true, true);
     if !s2a_after.is_finite() {
@@ -416,11 +421,7 @@ fn fit_v3_matryoshka_core<B: TrainerBackend>(
         s2b_loss = f64::INFINITY;
     }
     accept_varpro_if_improves::<B>(&mut model, &ds_s2b, &mut ws, 1, &mut s2b_loss);
-    let s2b_iters = (if slow_long
-        || crossover_split
-        || sweeping_svf
-        || model.feat_pinch_k > 80.0
-    {
+    let s2b_iters = (if slow_long || crossover_split || sweeping_svf || model.feat_pinch_k > 80.0 {
         11
     } else {
         7
@@ -466,7 +467,10 @@ fn fit_v3_matryoshka_core<B: TrainerBackend>(
     polish::polish_f32_matryoshka_readouts_with_cert_stem::<B>(
         &mut model,
         &ds_polish,
-        dataset.full_cert_stem.as_ref().or_else(|| dataset.stems.first()),
+        dataset
+            .full_cert_stem
+            .as_ref()
+            .or_else(|| dataset.stems.first()),
     );
     emit_dataset_opt_step::<B>(
         dataset,

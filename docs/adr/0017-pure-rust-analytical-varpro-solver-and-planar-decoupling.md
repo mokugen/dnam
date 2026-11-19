@@ -4,7 +4,7 @@ title: "100% Pure-Rust 5-Stage Analytical Variable-Projection (VarPro) Solver, P
 status: superseded
 date: "2026-03-30"
 supersedes: null
-superseded_by: ADR-0021
+superseded_by: ADR-0022
 specs:
   - ../specs/training/four_stage_pipeline.md
   - ../specs/training/iterative_resume_and_caching.md
@@ -20,6 +20,9 @@ requirements:
 ---
 
 # ADR-0017: 100% Pure-Rust 5-Stage Analytical Variable-Projection (`VarPro`) Solver, Planar Stage Decoupling & `fp16` Coreset Storage
+
+> [!NOTE]
+> **Superseded by [`ADR-0022`](0022-sona-state-space-operator-and-webgpu-architecture.md)** (originally superseded by [`ADR-0021`](0021-unified-matryoshka-gru-and-direct-register-stages.md)).
 
 ## 1. Context & Problem Statement
 

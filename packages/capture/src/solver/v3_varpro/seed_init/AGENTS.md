@@ -8,4 +8,4 @@ See [`../../../../CONTRIBUTING.md`](../../../../CONTRIBUTING.md) and [`../../../
 | [`specs.rs`](specs.rs) | Canonical circuit seed parameter tables & `const fn` filter derivations. | [`four_stage_pipeline.md`](../../../../../../docs/specs/training/four_stage_pipeline.md) |
 | [`spectral_id.rs`](spectral_id.rs) | Data-driven `(x, y)` linear `OMP` pole & level-stratified crossover/split estimation. | [`four_stage_pipeline.md`](../../../../../../docs/specs/training/four_stage_pipeline.md) |
 | [`specialty.rs`](specialty.rs) | Optical dynamics, series tube sag & crossover-split specialty seed builders. | [`four_stage_pipeline.md`](../../../../../../docs/specs/training/four_stage_pipeline.md) |
-| [`unlock.rs`](unlock.rs) | Post-prescreen tapered group & lane-role-preserving block unlocking. | [`tora_architecture.md`](../../../../../../docs/specs/architecture/tora_architecture.md) |
+| [`unlock.rs`](unlock.rs) | Post-prescreen tapered group & lane-role-preserving block unlocking. | [`sona_architecture.md`](../../../../../../docs/specs/architecture/sona_architecture.md) |

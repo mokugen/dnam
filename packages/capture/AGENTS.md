@@ -1,6 +1,6 @@
 # `packages/capture/` — Pure-IO Capture, `.dnam-proj` & `VarPro` Guide
 
-**`dnam-capture`** is the pure-Rust (`#![forbid(unsafe_code)]`, `wasm32`-safe) IO-buffer capture, `.dnam-proj` (`DNPJ`) container, and `VarPro` training crate, depending strictly on [`dnam-engine`](../engine/README.md) (`[dependencies]`) and [`dnam-fixtures`](../fixtures/README.md) (`[dev-dependencies]`). Read [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`README.md`](README.md) before editing.
+**`dnam-capture`** is the pure-Rust (`#![forbid(unsafe_code)]`, `wasm32`-safe) IO-buffer capture, `.dnam-proj` (`DNPJ`) container, and `SONA` (`32-bit WebGPU` + Host-`f64` `VarPro`) training crate, depending strictly on [`dnam-engine`](../engine/README.md) (`[dependencies]`) and [`dnam-fixtures`](../fixtures/README.md) (`[dev-dependencies]`). Read [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`README.md`](README.md) before editing.
 
 ## Submodule & Documentation Routing Map
 

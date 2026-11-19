@@ -3,9 +3,8 @@
 
 use crate::core::provenance::{
     apply_isometric_gauge_watermark_core, apply_tardos_watermark_core,
-    derive_watermark_seed_hex_core, extract_stage3_fingerprint_core,
-    extract_structural_hash_core, generate_tardos_code_core, score_tardos_watermark_core,
-    structural_cosine_similarity_core,
+    derive_watermark_seed_hex_core, extract_stage3_fingerprint_core, extract_structural_hash_core,
+    generate_tardos_code_core, score_tardos_watermark_core, structural_cosine_similarity_core,
 };
 use crate::error::validation_err;
 use crate::wasm::abi::{

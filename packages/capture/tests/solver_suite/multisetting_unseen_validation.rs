@@ -30,8 +30,7 @@ use dnam_capture::solver::{
 use dnam_capture::stimulus::{AdaptiveTrainingOptions, TopologyProbeMode, train_adaptive_target};
 use dnam_capture::{
     DistillationTarget, StemResponse, StemStimulus, StimulusFrame, realign_fractional_kaiser64,
-    resample_arbitrary_rate, resample_control_trajectory, resampled_frame_len,
-    scale_freeze_window,
+    resample_arbitrary_rate, resample_control_trajectory, resampled_frame_len, scale_freeze_window,
 };
 use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::provenance::DefaultCryptoProvider;
@@ -154,7 +153,9 @@ impl<M: BlackBoxModel> ValidationAdapter<M> {
                 *slot = if i >= fs && i < fe {
                     1
                 } else {
-                    meta.switches.get(freeze_sw_idx).map_or(0, |s| s.default_index)
+                    meta.switches
+                        .get(freeze_sw_idx)
+                        .map_or(0, |s| s.default_index)
                 };
             }
             let in_f = [x1, x2, x3, x4];
@@ -329,10 +330,9 @@ fn verify_blind_nondefault_fit<M: BlackBoxModel>(
     let prof = TargetRepeatabilityProfile::deterministic();
     let mut sums = Vec::with_capacity(4);
     for tier in [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra] {
-        let mut inst =
-            dnam_engine::stages::V3CoreInstance::<ScalarTrainerBackend>::from_cold_model(
-                &fitted.extract_tier(tier),
-            );
+        let mut inst = dnam_engine::stages::V3CoreInstance::<ScalarTrainerBackend>::from_cold_model(
+            &fitted.extract_tier(tier),
+        );
         inst.reset_to_dc_equilibrium();
         let (mut ol, mut or_) = (vec![0.0_f32; dry.len()], vec![0.0_f32; dry.len()]);
         inst.process_block_stereo(&dry, &dry, &mut ol, &mut or_);
@@ -462,8 +462,7 @@ fn validate_unrecorded_settings<M: BlackBoxModel>(
         DnamEngine::<DefaultMathBackend>::from_bytes_owned(&ultra_dnam, Tier::Ultra, 48_000)
             .unwrap();
     let mut eng_l =
-        DnamEngine::<DefaultMathBackend>::from_bytes_owned(&lite_dnam, Tier::Lite, 48_000)
-            .unwrap();
+        DnamEngine::<DefaultMathBackend>::from_bytes_owned(&lite_dnam, Tier::Lite, 48_000).unwrap();
     // Perturb away then snap back to StarCenter and assert bit-exact output
     for (p, &v) in unrecorded_settings[0].1.iter().enumerate() {
         eng_u.set_control_immediate(p, v);
@@ -529,8 +528,7 @@ fn validate_unrecorded_settings<M: BlackBoxModel>(
                 warmup,
             );
             let e_frz: f64 = frozen_mdl[warmup..].iter().map(|v| v * v).sum();
-            let frozen_rms_diff_db =
-                (10.0 * ((e_frz + 1.0e-15) / (e_act + 1.0e-15)).log10()).abs();
+            let frozen_rms_diff_db = (10.0 * ((e_frz + 1.0e-15) / (e_act + 1.0e-15)).log10()).abs();
 
             eng.reset_to_dc_equilibrium();
             for (p, &v) in u_unrec.iter().enumerate() {
@@ -609,11 +607,15 @@ fn test_multisetting_capture_validates_unrecorded_settings_against_actual_chains
         &[
             (
                 "offaxis_sculpt_ratios",
-                vec![-0.45, 0.35, -0.30, 0.35, -0.25, -0.20, 0.30, 0.25, 2.0, 0.0, 2.0],
+                vec![
+                    -0.45, 0.35, -0.30, 0.35, -0.25, -0.20, 0.30, 0.25, 2.0, 0.0, 2.0,
+                ],
             ),
             (
                 "offaxis_alt_thresh",
-                vec![0.35, -0.35, 0.25, -0.35, 0.20, 0.32, -0.30, -0.25, 0.0, 3.0, 0.0],
+                vec![
+                    0.35, -0.35, 0.25, -0.35, 0.20, 0.32, -0.30, -0.25, 0.0, 3.0, 0.0,
+                ],
             ),
         ],
     );
@@ -640,8 +642,14 @@ fn test_multisetting_capture_validates_unrecorded_settings_against_actual_chains
         "Chain-15 TubeAmpHeadDI",
         Chain15TubeAmpHeadDi::new(),
         &[
-            ("offaxis_lead_scoop", vec![0.40, -0.28, -0.45, 0.35, 0.30, 1.0]),
-            ("offaxis_crunch_warm", vec![-0.38, 0.35, 0.25, -0.32, -0.25, 0.0]),
+            (
+                "offaxis_lead_scoop",
+                vec![0.40, -0.28, -0.45, 0.35, 0.30, 1.0],
+            ),
+            (
+                "offaxis_crunch_warm",
+                vec![-0.38, 0.35, 0.25, -0.32, -0.25, 0.0],
+            ),
         ],
     );
 }

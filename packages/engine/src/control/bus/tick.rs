@@ -161,7 +161,8 @@ impl<B: MathBackend> ControlBus<B> {
             for p in 0..n {
                 if self.descriptors[p].ctrl_kind == 0 {
                     let def_val = self.descriptors[p].default_val;
-                    let (_, u_def, _) = self.descriptors[p].clamp_and_normalize(def_val, &def_sw[..n]);
+                    let (_, u_def, _) =
+                        self.descriptors[p].clamp_and_normalize(def_val, &def_sw[..n]);
                     self.prev_eval_u_norm[p] = flush_recursive_state_f32(u_def);
                     let lob = self.descriptors[p].eval_lobatto_basis(self.prev_eval_u_norm[p]);
                     self.prev_eval_psi[p] = lob[0] + lob[1] + lob[2];

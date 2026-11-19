@@ -8,6 +8,8 @@
  * - AGENTS.md
  *
  * verify[repo.code.type-safety-and-imports]
+ * verify[repo.code.zerocopy-wire-structs]
+ * verify[repo.code.shared-nostd-kernels]
  * verify[repo.code.modular-decomposition-and-tests]
  * verify[repo.code.constant-eval-and-derivations]
  * verify[repo.code.universal-black-box]
@@ -18,6 +20,9 @@
  * verify[repo.docs.github-latex-and-mermaid]
  * verify[repo.docs.relative-links-and-anchors]
  * verify[arch.index.subsystems]
+ * verify[arch.tiers.maximize-quality-within-budget]
+ * verify[qual.tiers.floors-not-stopping-criteria]
+ * verify[train.pipeline.webgpu-scans-and-ozaki]
  */
 
 import * as fs from "node:fs";
@@ -2166,5 +2171,50 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       }
     }
     expect(violations).toEqual([]);
+  });
+
+  // verify[arch.tiers.maximize-quality-within-budget]
+  // verify[qual.tiers.floors-not-stopping-criteria]
+  // verify[repo.code.zerocopy-wire-structs]
+  // verify[repo.code.shared-nostd-kernels]
+  // verify[train.pipeline.webgpu-scans-and-ozaki]
+  it("test_sona_zerocopy_and_quality_budget_rules", () => {
+    const zerocopyRulePath = path.join(REPO_ROOT, ".agents", "rules", "zerocopy-wire-structs.md");
+    expect(fs.existsSync(zerocopyRulePath), "Missing .agents/rules/zerocopy-wire-structs.md").toBe(
+      true,
+    );
+    const zerocopyRuleText = fs.readFileSync(zerocopyRulePath, "utf8");
+    expect(zerocopyRuleText).toContain("ref[repo.code.zerocopy-wire-structs]");
+    expect(zerocopyRuleText).toContain("ref[repo.code.constant-eval-and-derivations]");
+
+    const sonaSpecPath = path.join(SPECS_DIR, "architecture", "sona_architecture.md");
+    const legacyToraSpecPath = path.join(SPECS_DIR, "architecture", "tora_architecture.md");
+    expect(
+      fs.existsSync(sonaSpecPath),
+      "Missing docs/specs/architecture/sona_architecture.md",
+    ).toBe(true);
+    expect(fs.existsSync(legacyToraSpecPath)).toBe(false);
+    const sonaSpecText = fs.readFileSync(sonaSpecPath, "utf8");
+    expect(sonaSpecText).toContain("r[arch.tiers.maximize-quality-within-budget]");
+
+    const adr0022Path = path.join(
+      ADR_DIR,
+      "0022-sona-state-space-operator-and-webgpu-architecture.md",
+    );
+    expect(fs.existsSync(adr0022Path), "Missing ADR-0022").toBe(true);
+    const adr0022Fm = parseFrontmatter(fs.readFileSync(adr0022Path, "utf8"));
+    expect(adr0022Fm?.["id"]).toBe("ADR-0022");
+    expect(adr0022Fm?.["status"]).toBe("accepted");
+
+    const rules = collectSpecRules();
+    for (const reqRule of [
+      "arch.tiers.maximize-quality-within-budget",
+      "qual.tiers.floors-not-stopping-criteria",
+      "repo.code.zerocopy-wire-structs",
+      "repo.code.shared-nostd-kernels",
+      "train.pipeline.webgpu-scans-and-ozaki",
+    ]) {
+      expect(rules.has(reqRule), `Missing spec rule definition r[${reqRule}]`).toBe(true);
+    }
   });
 });

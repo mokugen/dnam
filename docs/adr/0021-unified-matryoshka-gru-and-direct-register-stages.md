@@ -1,7 +1,7 @@
 ---
 id: ADR-0021
 title: "TORA v3 Unified Zero-DC Matryoshka GRU, Direct-Register 5-Stage Topology, L1D-Resident Tier Sizing & Full-Bandwidth fp32 Capsules"
-status: accepted
+status: superseded
 version: "1.0.0"
 date: "2026-11-16"
 supersedes:
@@ -9,9 +9,9 @@ supersedes:
   - ADR-0008
   - ADR-0011
   - ADR-0017
-superseded_by: null
+superseded_by: ADR-0022
 specs:
-  - ../specs/architecture/tora_architecture.md
+  - ../specs/architecture/sona_architecture.md
   - ../specs/architecture/psychoacoustic_quality_and_tiers.md
   - ../specs/dsp/op_n_commuted_cascade.md
   - ../specs/dsp/op_m_modal_kautz.md
@@ -46,6 +46,9 @@ requirements:
 ---
 
 # ADR-0021: TORA `v3` Unified Zero-DC Matryoshka `GRU`, Direct-Register 5-Stage Topology, L1D-Resident Tier Sizing & Full-Bandwidth `fp32` Capsules
+
+> [!NOTE]
+> **Superseded by [`ADR-0022`](0022-sona-state-space-operator-and-webgpu-architecture.md):** `TORA` `v3` (`GRU`-based core, sequential CPU `L-BFGS`, and `Arena 1` `ControlBus` params) has been superseded by **`SONA` `v3.0`** ([`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md)). This record archives the `TORA v3` baseline design.
 
 This architectural decision record supersedes [`ADR-0004`](0004-division-free-polyadaa-and-c2-wavefolder.md), [`ADR-0008`](0008-per-stem-kronecker-statistics-and-wide-gram.md), [`ADR-0011`](0011-end-to-end-stage-wiring-and-arena-slice-topology.md), and [`ADR-0017`](0017-pure-rust-analytical-varpro-solver-and-planar-decoupling.md), unifying DNAM around the **TORA `v3` Direct-Register Matryoshka Architecture** across [`packages/engine/`](../../packages/engine/README.md) and [`packages/capture/`](../../packages/capture/README.md).
 

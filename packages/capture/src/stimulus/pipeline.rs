@@ -226,7 +226,12 @@ pub fn train_adaptive_target_with_progress(
             options.calb.is_some(),
             contiguous_96k,
         );
-        Some(((causal_lag, inv_l, inv_r), dry_pair, contiguous_96k, rep_profiles))
+        Some((
+            (causal_lag, inv_l, inv_r),
+            dry_pair,
+            contiguous_96k,
+            rep_profiles,
+        ))
     } else {
         None
     };

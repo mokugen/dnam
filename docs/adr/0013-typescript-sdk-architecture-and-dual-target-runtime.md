@@ -7,7 +7,7 @@ supersedes: null
 superseded_by: null
 specs:
   - "../specs/sdks/typescript_sdk.md"
-  - "../specs/architecture/tora_architecture.md"
+  - "../specs/architecture/sona_architecture.md"
   - "../specs/containers/dnam_binary_format.md"
 requirements:
   - REQ-2.4

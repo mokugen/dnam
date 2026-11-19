@@ -3,7 +3,9 @@
 //! so `has_sweep` stems optimize spectral uniformity on the exact `cert_stem0` certification domain.
 
 use dnam_engine::stages::V3MatryoshkaModel;
-use dnam_engine::stages::stage2_gru::{NUM_GRU_BLOCKS, tier_block_lanes_array, tier_total_gru_lanes};
+use dnam_engine::stages::stage2_gru::{
+    NUM_GRU_BLOCKS, tier_block_lanes_array, tier_total_gru_lanes,
+};
 
 use crate::metrics::certification::PerceptualCertificationSummary;
 use crate::solver::backends::TrainerBackend;

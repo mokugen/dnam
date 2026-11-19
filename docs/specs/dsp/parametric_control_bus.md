@@ -2,7 +2,7 @@
 id: spec.dsp.control-bus
 title: "Self-Similar 3 kHz Dual-Rate Control Plane & Parametric Control Bus"
 status: canonical
-version: "1.0.0"
+version: "3.0.0"
 domain: dsp
 rule_prefixes:
   - "r[dsp.ctrl."
@@ -15,12 +15,12 @@ adrs:
   - ADR-0007
   - ADR-0015
   - ADR-0019
-  - ADR-0021
+  - ADR-0022
 ---
 
 # Self-Similar 3 kHz Dual-Rate Control Plane & Parametric Control Bus
 
-This specification defines the **nominal 3 kHz Dual-Rate Control Plane** ([`packages/engine/src/control/`](../../../packages/engine/README.md), [`packages/capture/src/`](../../../packages/capture/README.md)), shared control descriptors and packed tier-local `CP1` `f32` projection slices, exact-integer sufficient-statistic accumulation, outward-checked trust-region clipping, tier-aware `16 × 16` + `16 × 4` stage dispatch, division-free linear micro-ramping, and `20–400 BPM` tempo synchronization across 12 rhythmic subdivisions ([`tora_architecture.md`](../architecture/tora_architecture.md), [`REQ-2.5`](../../requirements/system_goals_and_requirements.md)). For R&D counterexamples and derivations, see [`../../adr/0007-exact-integer-control-bus-and-tempo-inversion.md`](../../adr/0007-exact-integer-control-bus-and-tempo-inversion.md) and [`../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md`](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md).
+This specification defines the **nominal 3 kHz Dual-Rate Control Plane** (`16`-sample stride at `48 kHz`; [`packages/engine/src/control/`](../../../packages/engine/README.md), [`packages/capture/src/`](../../../packages/capture/README.md)), **self-contained `Arena 0` (`Arena0LiteWire`) `ControlClampDescriptorWire`, `CP1`, `U_int`, `W_ctrl`, and `fp16` `W_readout` (`VarProReadoutSubspaceWire`) subspace** (ensuring `strip_container_to_tier(Lite)` retains full parametric conditioning per `REQ-5.6` with `0` extra `48 kHz` MACs when static and `0-ULP` `StarCenter` invariance), exact-integer sufficient-statistic accumulation, outward-checked trust-region clipping, tier-aware `16 × 16` + `16 × 4` stage dispatch, division-free linear micro-ramping, and `20–400 BPM` tempo synchronization across 12 rhythmic subdivisions ([`sona_architecture.md`](../architecture/sona_architecture.md), [`REQ-2.5`](../../requirements/system_goals_and_requirements.md)). For R&D counterexamples and derivations, see [`../../adr/0007-exact-integer-control-bus-and-tempo-inversion.md`](../../adr/0007-exact-integer-control-bus-and-tempo-inversion.md), [`../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md`](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md), and [`../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md).
 
 ---
 
@@ -33,14 +33,14 @@ flowchart LR
         Live["Live Studio / MIDI Controls<br/>(Timestamped or Logical Cutoff Time)"] --> Cut
     end
 
-    subgraph CtrlTick ["2. 3 kHz Control Boundary (n mod K_ctrl == 0)"]
+    subgraph CtrlTick ["2. 3 kHz Control Boundary (16-Samp Stride @ 48 kHz, n mod K_ctrl == 0)"]
         direction TB
-        OpM["Op-M[Ctrl]: Dynamic Engine<br/>• Complete Previous Block-Peak Window<br/>• Q0.192 LFO 0 & 1 Rotors<br/>• 4-Band Ballistic Envelopes<br/>• Q64/Q32 Tempo Phase (REQ-2.5)"]
-        OpN["Op-N[Ctrl]: Static & FM Engine<br/>• Binary64 Declared-Range Normalization<br/>• Node-Anchored Lobatto Basis<br/>• Exact-Integer Pair Statistics (S, D)<br/>• Outward-Checked Trust Clip"]
+        OpM["Op-M[Ctrl]: Dynamic Engine<br/>• Complete Previous Block-Peak Window<br/>• Q0.192 LFO 0 & 1 + 4x Q0.32 Phasors<br/>• 4-Band Ballistic Envelopes<br/>• Q64/Q32 Tempo Phase (REQ-2.5)"]
+        OpN["Op-N[Ctrl]: Arena 0 Self-Contained Static & FM Engine<br/>• ControlClampDescriptorWire + CP1 + U_int + W_ctrl<br/>• Exact-Integer Pair Statistics (0-ULP StarCenter)<br/>• Outward Trust Clip & fp16 W_readout Subspace Collapse"]
     end
 
-    subgraph Dispatch ["3. Tier-Aware Dispatch & Audio Micro-Ramp"]
-        Bus["Modulation Vectors q_send, q_down in R^16<br/>• Lite..Pro: 16x16 W_ctrl^base<br/>• Ultra: + 16x4 W_ctrl,Delta^Ultra<br/>• Step: delta_theta * alpha_ramp"]
+    subgraph Dispatch ["3. Tier-Aware Dispatch & Audio Micro-Ramp (0 Extra Static 48 kHz MACs)"]
+        Bus["Modulation Vectors q_send, q_down in R^16<br/>• Lite..Pro (Arena 0): 16x16 W_ctrl^base<br/>• Ultra (+Arena 3): + 16x4 W_ctrl,Delta^Ultra<br/>• Step: delta_theta * alpha_ramp"]
     end
 
     Cut --> OpN
@@ -55,7 +55,7 @@ At each control boundary (decimation stride $K_{\text{ctrl}}(f_{s,\text{eff}}) =
 
 1. **Completed-Block 4-Band Asymmetric Ballistic Envelope Bank:** Collect rectified band peaks $|x_b[k]| = \max_{0 \le m < K_{\text{ctrl}}} |x_b[K_{\text{ctrl}}k + m]|$ over the completed block ($b \in \lbrace \text{Low}, \text{Mid}, \text{High}, \text{Aux Key} \rbrace$) and update:
    $$e_b[k] = \alpha_b[k] e_b[k-1] + (1 - \alpha_b[k]) |x_b[k]|, \qquad \alpha_b[k] = \mathrm{select}\big(|x_b[k]| > e_b[k-1],\ \alpha_{\text{att},b},\ \alpha_{\text{rel},b}\big)$$
-2. **Quadrature LFO 0 & 1 Rotors:** Advance the two independent `Q0.192` LFO phase accumulators by the previous window's effective increment and map their top 32 bits to unit phasors via the quadrant-reduced contractive rotor ([`op_m_modal_kautz.md` §1.2](op_m_modal_kautz.md#12-contractive-finite-precision-rotor)). Zero increments hold oscillator state bit-for-bit, and `ControlBus<B>` caches the converted signed 3-word `u64` `Q0.192` increment (`lfo_cached_angle_bits: [u32; 2]`, `lfo_cached_q192_inc: [Option<(bool, [u64; 3])>; 2]`) so `q0_192_phase_increment_from_f32_bits` is skipped whenever an LFO's frequency increment `lfo_angle_bits` is unchanged (`ADR-0019`).
+2. **Quadrature LFO 0 & 1 Rotors:** Advance the two independent `Q0.192` LFO phase accumulators by the previous window's effective increment and map their top 32 bits to unit phasors via the quadrant-reduced contractive rotor ([`op_m_modal_kautz.md` §1.2](op_m_modal_kautz.md#12-contractive-finite-precision-rotor)) alongside the Top-of-Frame `4`-lane `Q0.32` quadrature phasors (`0.05 Hz..20 kHz`). Zero increments hold oscillator state bit-for-bit, and `ControlBus<B>` caches the converted signed 3-word `u64` `Q0.192` increment (`lfo_cached_angle_bits: [u32; 2]`, `lfo_cached_q192_inc: [Option<(bool, [u64; 3])>; 2]`) so `q0_192_phase_increment_from_f32_bits` is skipped whenever an LFO's frequency increment `lfo_angle_bits` is unchanged (`ADR-0019`).
 3. `r[dsp.ctrl.op-m.rate-retime]` **Single-Rate-Change Window Retiming:** On an admitted effective-rate transition from $(f_o, K_o)$ to $(f_n, K_n)$ after $c \in \lbrace 0, \dots, K_o - 1 \rbrace$ old-rate samples, retain partial band peaks, LFO phases, and envelope states, completing the first mixed window after $d = \mathrm{round}((K_o - c)K_n / K_o)$ new-rate samples with actual duration $\Delta t = c/f_o + d/f_n$.
 
 #### Host Automation Timing
@@ -87,7 +87,7 @@ To prevent `f32` rounding from placing clipped vectors outside the exact Euclide
 1. **Bit-Preserving `f32 <-> f64` Conversion:** Widen `f32` bit patterns (including subnormals via leading-zero shift `p + 874`) directly to IEEE-754 `f64` bits without executing hardware `f32` instructions subject to FTZ/DAZ, and round `f64` outputs back to `f32` bits using integer significand shifts (`M >> 29` for normals, `M >> (-E - 97)` for subnormals, ties-to-even).
 2. **Outward-Rounded Energy & Output Check:** Using `nextup` (`bits + 1` on positive `f64`), form outward denominator bound $S = \mathrm{add-up}(\epsilon, \sum_i x_i^2)$ and exact $R^2 = \rho_{\max}^2$. Accept scale $t \in [0, 1]$ with rounded `f32` output $v_i = \mathrm{RN}_{32}(x_i t)$ only when both $\mathrm{mul-up}(\mathrm{mul-up}(t, t), S) \le R^2$ and $\sum_i v_i^2 \le R^2$.
 3. **6-Step Newton Fast Path & 32-Step Bisection Fallback:** Seed $y_0 = 2^{-\lfloor (E_s + 2)/2 \rfloor}$ from the unbiased exponent $E_s$ of $S$, iterate $y_{k+1} = \mathrm{fl}_{64}(y_k(1.5 - 0.5 S y_k^2))$ six times, and test $t_{\text{fast}} = \min(1 - 2^{-20}, \rho_{\max} y_6 (1 - 2^{-20}))$. If accepted, return $v_i$; otherwise bisect `32` times over $[0, \min(1, 2^{E_r + 1 - E})]$. For normal radii, relative scale contraction is $< 9.57 \times 10^{-7}$ and vector error is $< 1.185 \times 10^{-6} \rho_{\max}$.
-4. `r[dsp.ctrl.op-n.static-and-interior-fastpath]` **Static-Control Basis Skip & Interior Trust-Ball Fast Exit ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** When `is_dirty == false` at a `3 kHz` boundary (`0` user controls moved during the completed sub-block), `ControlBus<B>::tick_3khz_with_detectors` skips `evaluate_static_control_basis` (Lobatto basis, contributor deltas, and FM projection), retaining the cached `z_head`, `z_stage`, and `ctrl_basis_4` latents (`0` static control MACs, `REQ-6.1`). When `trust_clip_outward_4d` is invoked and the `f64` squared norm satisfies $\sum_{i=0}^3 z_i^2 + 10^{-9} < \rho_{\max}^2$ (with finite norm and $\rho_{\max} > 0$), it returns `z` immediately without executing `trust_clip_outward_checked_bits::<4>` Newton/bisection iterations.
+4. `r[dsp.ctrl.op-n.static-and-interior-fastpath]` **Static-Control Basis Skip (`0` Extra `48 kHz` MACs), `0-ULP` `StarCenter` & Interior Trust-Ball Fast Exit ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** When `is_dirty == false` at a `3 kHz` boundary (`0` user controls moved during the completed sub-block), `ControlBus<B>::tick_3khz_with_detectors` skips `evaluate_static_control_basis` (Lobatto basis, contributor deltas, FM projection, and `fp16` `W_readout` collapse), retaining the cached `z_head`, `z_stage`, `ctrl_basis_4`, and collapsed direct readout vectors (`0` extra `48 kHz` MACs, `REQ-6.1`). When resting at `StarCenter` (`Mode-0` exact anchor), contributor outputs are identically `+0.0f32`, preserving **`0-ULP` `StarCenter` invariance** across all parameter schedules and after `strip_container_to_tier(Lite)`. When `trust_clip_outward_4d` is invoked and the `f64` squared norm satisfies $\sum_{i=0}^3 z_i^2 + 10^{-9} < \rho_{\max}^2$ (with finite norm and $\rho_{\max} > 0$), it returns `z` immediately without executing `trust_clip_outward_checked_bits::<4>` Newton/bisection iterations.
 
 ---
 
@@ -111,7 +111,7 @@ Intersect signed `binary64` safety bounds onto the ordered set of admissible `f3
 
 `r[dsp.ctrl.basis.lobatto]`
 
-For $U_p$ distinct observed normalized coordinates and active degree $K_p = \min(\max(U_p - 1, 0), 3)$ with persisted anchor nodes $a_{p,1}, a_{p,2}, a_{p,3}$:
+For $U_p$ distinct observed normalized coordinates and active degree $K_p = \min(\max(U_p - 1, 0), 3)$ with persisted anchor nodes $a_{p,1}, a_{p,2}, a_{p,3}$ (anchoring $a_{p,1}$ at `StarCenter` so $\psi_{p,j}(u_{p,\text{star}}) = 0.0$):
 $$\psi_{p,1}(u_p) = u_p - a_{p,1}, \qquad \psi_{p,2}(u_p) = \psi_{p,1}(u_p)(u_p - a_{p,2}), \qquad \psi_{p,3}(u_p) = \psi_{p,2}(u_p)(u_p - a_{p,3})$$
 Lanes above $K_p$ are zero (`K_p = 0` emits no latent contributor).
 
@@ -121,25 +121,30 @@ Lanes above $K_p$ are zero (`K_p = 0` emits no latent contributor).
 
 $$\hat{y}(\mathbf{u}) = w_0 + \sum_{p=1}^P \mathbf{w}_p^\top \boldsymbol{\psi}_p(u_p) + \frac{1}{2} \sum_{f=1}^R \left[ \left(\sum_{p=1}^P v_{p,f} z_p\right)^2 - \sum_{p=1}^P v_{p,f}^2 z_p^2 \right]$$
 
+In `SONA` `v3.0`, **all base control descriptors (`ControlClampDescriptorWire`), `CP1` projections, `U_int^base`, `W_ctrl^base`, and `Lite` `fp16` `W_readout` (`VarProReadoutSubspaceWire`) reside self-contained inside `Arena 0` (`Arena0LiteWire`)** at the cold tail of `SonaHotSlab` (rather than in `Arena 1`). Calling `strip_container_to_tier(Lite)`—including for `.dnam-prev` storefront previews—therefore preserves full parametric conditioning (`REQ-5.6`) and `0-ULP` `StarCenter` baseline equivalence.
+
 ```text
 +---------------------------------------------------------------------------------------------------+
-| TIER-LOCAL PREFIX-DELTA 16-D ULTRA CONTROL ARCHITECTURE (CP1 PACKED PROFILE)                      |
+| SELF-CONTAINED ARENA 0 & ULTRA DELTA 16-D CONTROL ARCHITECTURE (CP1 + fp16 W_readout)             |
 +---------------------------------------------------------------------------------------------------+
-|  Arena 0 (Lite Base, Retained by Lite / Full / Pro / Ultra):                                      |
-|    • Static Latent z_ctrl^base in R^8 = [z_head^(0..3), z_stage^(0..3)]^T, FM Rank R = 4          |
+|  Arena 0 (Arena0LiteWire, Retained by Lite / Full / Pro / Ultra & .dnam-prev):                    |
+|    • ControlClampDescriptorWire[P] + Static Latent z_ctrl^base in R^8, FM Rank R = 4              |
 |    • Per Contributor (k active lanes): W_main[8,k] + w_proj[k] + v[4] = 4(9k + 4) B               |
-|    • Global Matrices: U_int^base[8,4] (128 B) + W_ctrl^base[16,16] (1,024 B)                      |
+|    • Global Matrices: U_int^base[8,4] (128 B) + W_ctrl^base[16,16] (1,024 B) + fp16 W_readout     |
++---------------------------------------------------------------------------------------------------+
+|  Arena 1..2 (Full / Pro Deltas):                                                                  |
+|    • Incremental fp16 W_readout,Delta projections for added Full/Pro core & Stage III blocks      |
 +---------------------------------------------------------------------------------------------------+
 |  Arena 3 (Ultra Delta, Truncated on Tier Stripping):                                              |
 |    • Static Latent Delta z_ctrl,Delta^Ultra in R^8 = [z_head^(4..7), z_stage^(4..7)]^T, R = 8     |
 |    • Per Contributor (k active lanes): W_main,Delta[8,k] + v_Delta[4] = 4(8k + 4) B               |
-|    • Global Matrices: 3 x U_int,Delta[8,4] (384 B) + W_ctrl,Delta^Ultra[16,4] (256 B)             |
+|    • Global Matrices: 3 x U_int,Delta[8,4] (384 B) + W_ctrl,Delta^Ultra[16,4] (256 B) + W_ro,D   |
 +---------------------------------------------------------------------------------------------------+
 ```
 
 | Tier Profile | Head Coordinates (`D_h`) | Stage Coordinates (`D_s`) | Total Static Dim (`D`) | FM Rank (`R`) | Active Contributor Slice (`k` lanes) |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`Lite` / `Full` / `Pro`** | `4` (`0..3`) | `4` (`0..3`) | `8` | `4` | `4(9k + 4) B` (`124 B` for `k=3`, `52 B` for switch `k=1`) |
+| **`Lite` / `Full` / `Pro` (`Arena 0`)** | `4` (`0..3`) | `4` (`0..3`) | `8` | `4` | `4(9k + 4) B` (`124 B` for `k=3`, `52 B` for switch `k=1`) |
 | **`Ultra` (`+ Arena 3` Delta)** | `8` (`0..7`) | `8` (`0..7`) | `16` | `8` | `+ 4(8k + 4) B` (`+112 B` for `k=3`, `+48 B` for switch `k=1`) |
 
 ### 2.4 Multi-Option Switch Contributors & Exact-Integer Realization
@@ -148,13 +153,13 @@ $$\hat{y}(\mathbf{u}) = w_0 + \sum_{p=1}^P \mathbf{w}_p^\top \boldsymbol{\psi}_p
 
 `r[dsp.ctrl.switch.option-contributors]`
 
-For a discrete switch $q$ with declared default reference option (`default_val`), each represented non-reference option $o$ is a separate `k = 1` contributor $\psi_{q,o}(\sigma_q) = \mathbf{1}(\sigma_q = o)$ (`0.0` at the reference option) per `ref[container.dnam.cp1-profile]` ([`../containers/dnam_binary_format.md` §2.4](../containers/dnam_binary_format.md#packed-control-projection-profile)).
+For a discrete switch $q$ with declared default reference option (`default_val`), each represented non-reference option $o$ is a separate `k = 1` contributor $\psi_{q,o}(\sigma_q) = \mathbf{1}(\sigma_q = o)$ (`0.0` at the reference option) per `ref[container.dnam.cp1-profile]` ([packed control projection profile](../containers/dnam_binary_format.md#packed-control-projection-profile)).
 
 ##### Conditional Batch Safety
 
 `r[dsp.ctrl.switch.conditional-batch]`
 
-1. **Whole-Candidate Preset & Event Evaluation:** Loading a partial preset restores signed defaults for all omitted controls at the effective tier, overlays the preset's assignments, resolves `[CLAMP-SWITCH]` active masks, and intersects all matching structured conditional bounds ([`../containers/dnam_binary_format.md` §2.4](../containers/dnam_binary_format.md#conditional-control-rules)).
+1. **Whole-Candidate Preset & Event Evaluation:** Loading a partial preset restores signed defaults for all omitted controls at the effective tier, overlays the preset's assignments, resolves `[CLAMP-SWITCH]` active masks, and intersects all matching structured conditional bounds ([conditional control rules](../containers/dnam_binary_format.md#conditional-control-rules)).
 2. **Active-Fade Endpoint Protection:** Validate candidate switches against all still-live delay and transition reads; defer or reject the entire batch if a new bound would invalidate an active crossfade endpoint.
 3. **Disjoint-Interval Two-Path Blend:** When a switch change moves a dependent continuous control between disjoint safe intervals, step isolated old and new paths under their respective safe states and crossfade their outputs $y = (1 - \alpha)y_{\text{old}} + \alpha y_{\text{new}}$ without feeding the blend back into either state.
 
@@ -167,8 +172,8 @@ $$\mathbf{s}_{vx} = \sum_{p=0}^{P-1} \mathbf{v}_p z_p \in \mathbb{R}^R, \qquad \
 $$\mathbf{z}_{\text{raw}}^{(0..7)} = \mathbf{z}_{\text{main}}^{(0..7)} + \mathbf{U}_{\text{int}}^{\text{base}}\mathbf{z}_{\text{fm}}^{(0..3)} + \mathbf{U}_{\text{int},\Delta}^{(0..7,4..7)}\mathbf{z}_{\text{fm}}^{(4..7)}, \qquad \mathbf{z}_{\text{raw}}^{(8..15)} = \mathbf{z}_{\text{main}}^{(8..15)} + \mathbf{U}_{\text{int},\Delta}^{(8..15,0..3)}\mathbf{z}_{\text{fm}}^{(0..3)} + \mathbf{U}_{\text{int},\Delta}^{(8..15,4..7)}\mathbf{z}_{\text{fm}}^{(4..7)}$$
 $$\mathbf{z}_{\text{ctrl}} = \mathrm{clip}_{\text{trust}}(\mathbf{z}_{\text{raw}})$$
 
-`r[dsp.ctrl.accum.exact-int]` **Exact-Integer Sufficient-Statistic Realization:**
-- Decode each finite materialized `f32` factor contribution as $a_p = b_p 2^{-149}$ ($|b_p| < 2^{277}$) and maintain exact fixed-width signed integers $S = \sum_p b_p$ (9 `u32` words) and $D = S^2 - \sum_p b_p^2 = 2 \sum_{p<q} b_p b_q$ (18 `u32` words), along with 9-word exact main sums.
+`r[dsp.ctrl.accum.exact-int]` **Exact-Integer Sufficient-Statistic Realization (`0-ULP` `StarCenter`):**
+- Decode each finite materialized `f32` factor contribution as $a_p = b_p 2^{-149}$ ($|b_p| < 2^{277}$) and maintain exact fixed-width signed integers $S = \sum_p b_p$ (9 `u32` words) and $D = S^2 - \sum_p b_p^2 = 2 \sum_{p<q} b_p b_q$ (18 `u32` words), along with 9-word exact main sums (`0` drift across closed control cycles and `0-ULP` exactness when returning to `StarCenter`).
 - When contributor $p$ changes from $b_o$ to $b_n$, update $D$ using two shifted 24-bit significand products without wide squaring:
   $$R = S - b_o, \qquad D_{\text{new}} = D - 2 b_o R + 2 b_n R, \qquad S_{\text{new}} = R + b_n, \qquad z_{\text{fm},f} = D_{\text{new}} \cdot 2^{-299}$$
 - Feed the resulting exact-real mixed coordinates into the outward-checked trust-region clip (`ref[dsp.ctrl.op-n.trust-clip]`) before narrowing to `f32`.
@@ -179,7 +184,7 @@ $$\mathbf{z}_{\text{ctrl}} = \mathrm{clip}_{\text{trust}}(\mathbf{z}_{\text{raw}
 
 `r[dsp.ctrl.modulators.dynamic]`
 
-At each control boundary, `Op-M[Ctrl]` and `Op-N[Ctrl]` emit the 8-D dynamic modulator vector $\mathbf{m}_{\text{dyn}}[k] = [z_{\mathrm{re},\text{lfo0}}, z_{\mathrm{im},\text{lfo0}}, T_{\text{shape}}(z_{\mathrm{re},\text{lfo0}}), T_{\text{shape}}(z_{\mathrm{re},\text{lfo1}}), e_{\text{low}}, e_{\text{mid}}, e_{\text{high}}, e_{\text{aux}}]^\top \in \mathbb{R}^8$. The `64 B`-aligned `control_modulators_and_lanes` slice in `Arena 0` stores `[c_step_0, s_step_0, sigma_drift, rho_drift_train, p_env_0, p_env_1, p_env_2, dither_snr_scale]` followed by `cp1_lanes_dir`, placed in the trailing `3 kHz` cold section of hot state for L1D cache locality; `live_analog_drift_enabled` defaults to `false` (`set_live_analog_drift(bool)`) and is automatically suppressed when `offline_bounce == true` to guarantee deterministic `0.000000 ULP` runtime, bounce, and training parity unless explicitly enabled for live auditioning.
+At each control boundary, `Op-M[Ctrl]` and `Op-N[Ctrl]` emit the 8-D dynamic modulator vector $\mathbf{m}_{\text{dyn}}[k] = [z_{\mathrm{re},\text{lfo0}}, z_{\mathrm{im},\text{lfo0}}, T_{\text{shape}}(z_{\mathrm{re},\text{lfo0}}), T_{\text{shape}}(z_{\mathrm{re},\text{lfo1}}), e_{\text{low}}, e_{\text{mid}}, e_{\text{high}}, e_{\text{aux}}]^\top \in \mathbb{R}^8$. The `64 B`-aligned `control_modulators_and_lanes` slice in `Arena 0` stores `[c_step_0, s_step_0, sigma_drift, rho_drift_train, p_env_0, p_env_1, p_env_2, dither_snr_scale]` followed by `cp1_lanes_dir`, placed in the trailing `3 kHz` cold section of `SonaHotSlab` for L1D cache locality; `live_analog_drift_enabled` defaults to `false` (`set_live_analog_drift(bool)`) and is automatically suppressed when `offline_bounce == true` to guarantee deterministic `0.000000 ULP` runtime, bounce, and training parity unless explicitly enabled for live auditioning.
 
 ### 3.1 Stage Parameter Dispatch Matrix $\mathbf{W}_{\text{ctrl}}$
 
@@ -191,23 +196,23 @@ $$\boldsymbol{\theta}_{\text{stage}}^{\text{Lite..Pro}}[k+1] = \mathbf{W}_{\text
 | Parameter Index | Target Stage | Physical Parameter Role |
 | :--- | :--- | :--- |
 | `θ_0, θ_1` | Stage 0 Router (Send-Safe) | External loop send gains `g_send,L`, `g_send,R` |
-| `θ_2, θ_3` | Stage I Pre-FX (Send-Safe) | Micro-delay `τ_pre`, pitch shift grain ratio `ν_pitch` |
-| `θ_4` | Stage I Pre-Drive (Send-Safe) | Pre-drive waveshaping boost gain |
-| `θ_5, θ_6` | Stage II Matryoshka `GRU` & Tone SVF | `FiLM` gain/shift + Zero-DC `b_n` scale, inter-block 3-band `TPT-SVF` cutoff/mix |
-| `θ_7, θ_8` | Stage II Power / Direct `VarPro` | Power `GRU` block `FiLM` drive, supply/envelope dynamic bias shift |
+| `θ_2, θ_3` | Top-of-Frame Crossbar `Op-T` (Send-Safe) | Micro-delay `τ_pre`, pitch shift grain ratio `ν_pitch` |
+| `θ_4` | Crossbar Pre-Drive / `Op-N[Pre]` (Send-Safe) | Pre-core drive gain and ZOH/bitcrusher scaling |
+| `θ_5, θ_6` | `4`-Block `SONA` Core `TPT-SVF` | Prewarped cutoff warp `g_warp` (`tan(pi * f_c / f_s)`), damping/mode blend `β_svf` (`LP/BP/HP/AP`) |
+| `θ_7, θ_8` | `4`-Block `SONA` Core `ParaLRU` & `PolyADAA1` | `ParaLRU` drive / attack-release retention scale, zero-DC bias / sag shift |
 | `θ_9, θ_10` | Stage III Cabinet | Kautz modal formant center frequency and shared radial gate `g[k]` |
 | `θ_11` | Stage III Early FIR | Direct early reflection blend gain |
-| `θ_12, θ_13` | Stage IV Spatial Tank | Master delay length `τ_tank`, loop feedback gain `g_loop` |
-| `θ_14` | Stage IV Diffuser | In-buffer Schroeder all-pass diffusion coefficient `a_diff` |
-| `θ_15` | Direct Stereo Readout | Master stereo width factor `α_width` |
+| `θ_12, θ_13` | Coercive `Op-T` Loop | Master delay length `τ_tank`, coercive loop feedback gain `g_loop` |
+| `θ_14` | Coercive `Op-T` Diffuser | In-buffer Schroeder all-pass diffusion coefficient `a_diff` |
+| `θ_15` | Direct Stereo Readout (`fp16 W_readout`) | Master stereo width factor `α_width` |
 
-`r[dsp.ctrl.dispatch.stage-laws]` **Closed-Form Per-Sample & `3 kHz` Stage Modulation Laws (`ADR-0021`):**
-Each micro-ramped parameter $\theta_i[n]$ (`§3.2`) combines with its base stage parameter and clamps into its certified stability interval (`0 FDIV`, `0 FSQRT`), while Stage I `Env-SVF` octave-warp coefficients and Stage II `FiLM` / Zero-DC $b_n$ / inter-block `TPT-SVF` coefficients update unconditionally at the `3 kHz` boundary (`0` static `48 kHz` MACs):
+`r[dsp.ctrl.dispatch.stage-laws]` **Closed-Form Per-Sample & `3 kHz` Stage Modulation Laws (`ADR-0022`):**
+Each micro-ramped parameter $\theta_i[n]$ (`§3.2`) combines with its base stage parameter and clamps into its certified stability interval (`0 FDIV`, `0 FSQRT`), while `TPT-SVF` prewarped `(a1, a2, a3)`, `ParaLRU` rates, and `fp16` `W_readout` (`VarProReadoutSubspaceWire`) linear readouts collapse unconditionally at the `3 kHz` boundary (`0` extra `48 kHz` MACs when controls are static):
 - **Stage 0 Sends ($\theta_0, \theta_1$):** $g_{\text{send},L}[n] = \mathrm{clamp}(g_{\text{send},L,0} + \theta_0[n], 0.0, 2.0)$, $g_{\text{send},R}[n] = \mathrm{clamp}(g_{\text{send},R,0} + \theta_1[n], 0.0, 2.0)$.
-- **Stage I `Env-SVF` & Pre-FX ($\theta_2, \theta_3, \theta_4$):** $\tau_{\text{pre}}[n] = \mathrm{clamp}(\tau_{\text{pre},0} + \theta_2[n], 4.0, D_{\text{eff},\text{pre}})$, $p_{\text{st}}[n] = \mathrm{clamp}(p_{\text{st},0} + 24.0 \cdot \theta_3[n], -24.0, 24.0)$ (evaluated via `ref[dsp.ctrl.math.pitch-profile]`), and $g_{\text{pre}}[n] = \mathrm{clamp}(g_{\text{pre},0} + \theta_4[n], 0.0, 16.0)$.
-- **Stage II Matryoshka `GRU` & `TPT-SVF` ($\theta_5, \theta_6, \theta_7, \theta_8$):** `FiLM` gain $\gamma_{\text{film}}[n] = \mathrm{clamp}(1.0 + 0.25 \theta_5[n], 0.25, 4.0)$, inter-block `TPT-SVF` tone balance $\beta_{\text{tone}}[n] = \mathrm{clamp}(0.5 + \theta_6[n], 0.0, 1.0)$, block-2 `FiLM` drive $g_{\text{pwr}}[n] = \mathrm{clamp}(1.0 + 0.25 \theta_7[n], 0.25, 4.0)$, and Zero-DC dynamic shift scale $\alpha_{\text{sag}}[n] = \mathrm{clamp}(0.2 + 0.1 \theta_8[n], 0.0, 0.8)$.
+- **Top-of-Frame Crossbar (`Op-T` / `Op-N[Pre]`, $\theta_2, \theta_3, \theta_4$):** $\tau_{\text{pre}}[n] = \mathrm{clamp}(\tau_{\text{pre},0} + \theta_2[n], 4.0, D_{\text{eff},\text{pre}})$, $p_{\text{st}}[n] = \mathrm{clamp}(p_{\text{st},0} + 24.0 \cdot \theta_3[n], -24.0, 24.0)$ (evaluated via `ref[dsp.ctrl.math.pitch-profile]`), and $g_{\text{pre}}[n] = \mathrm{clamp}(g_{\text{pre},0} + \theta_4[n], 0.0, 16.0)$.
+- **`4`-Block `SONA` Core (`TPT-SVF`, `ParaLRU`, `PolyADAA1`, $\theta_5, \theta_6, \theta_7, \theta_8$):** `TPT-SVF` cutoff warp $\gamma_{\text{svf}}[n] = \mathrm{clamp}(1.0 + 0.25 \theta_5[n], 0.25, 4.0)$, mode/damping balance $\beta_{\text{svf}}[n] = \mathrm{clamp}(0.5 + \theta_6[n], 0.0, 1.0)$, `ParaLRU`/`PolyADAA1` drive $g_{\text{pwr}}[n] = \mathrm{clamp}(1.0 + 0.25 \theta_7[n], 0.25, 4.0)$, and Zero-DC dynamic shift scale $\alpha_{\text{sag}}[n] = \mathrm{clamp}(0.2 + 0.1 \theta_8[n], 0.0, 0.8)$.
 - **Stage III Cabinet ($\theta_9, \theta_{10}, \theta_{11}$):** $\Delta\theta_{\text{kautz}}[n] = \mathrm{clamp}(\theta_9[n], -\pi/4, \pi/4)$, $g_{\text{kautz}}[n] = \mathrm{clamp}(0.5 + \theta_{10}[n], 0.0, 1.0)$ (`ref[dsp.op-m.stage3.radial-gate]`), and $g_{\text{fir}}[n] = \mathrm{clamp}(1.0 + \theta_{11}[n], 0.0, 2.0)$.
-- **Stage IV Tank & Head ($\theta_{12}, \theta_{13}, \theta_{14}, \theta_{15}$):** $\tau_{\text{tank},m}[n] = \mathrm{clamp}(\tau_{\text{tank},m,0} + \theta_{12}[n], 4.0, D_{\text{eff},\text{tank},m})$, $g_{\text{lin}}[n] = \mathrm{clamp}(g_{\text{lin},0} + \theta_{13}[n], 0.0, \mathtt{0x3F7FBE76})$, $a_{\text{diff}}[n] = \mathrm{clamp}(a_{\text{diff},0} + \theta_{14}[n], -0.75, 0.75)$, and $\alpha_{\text{width}}[n] = \mathrm{clamp}(\alpha_{\text{width},0} + \theta_{15}[n], 0.0, 2.0)$.
+- **Coercive `Op-T` Loop & Readout Head ($\theta_{12}, \theta_{13}, \theta_{14}, \theta_{15}$):** $\tau_{\text{tank},m}[n] = \mathrm{clamp}(\tau_{\text{tank},m,0} + \theta_{12}[n], 4.0, D_{\text{eff},\text{tank},m})$, $g_{\text{lin}}[n] = \mathrm{clamp}(g_{\text{lin},0} + \theta_{13}[n], 0.0, \mathtt{0x3F7FBE76})$, $a_{\text{diff}}[n] = \mathrm{clamp}(a_{\text{diff},0} + \theta_{14}[n], -0.75, 0.75)$, and $\alpha_{\text{width}}[n] = \mathrm{clamp}(\alpha_{\text{width},0} + \theta_{15}[n], 0.0, 2.0)$.
 
 ### 3.2 Division-Free Linear Micro-Ramping (`0.0625f32` at $48\text{ kHz}$, $\alpha_{\text{ramp}} = 1 / K_{\text{ctrl}}$ under ZOH)
 
@@ -234,7 +239,7 @@ Clamp each ramp within its endpoint interval and snap the final sample of the bl
 | **`"lfo_rate_hz"`** | `range` | Maps modulation oscillator frequency (Hz) for Tempo Sync |
 | **`"feedback"` / `"mix"` / `"crossover_hz"`** | `range` | Loop regeneration, wet/dry blend, or filter crossover frequency |
 | **`"stereo_mode"` / `"stereo_width"`** | `switch` / `range` | Stereo routing or width calibration |
-| **`"freeze_latch"`** | `switch` / `range` | Modeled hardware freeze control (unobserved options remain clamped) |
+| **`"freeze_latch"`** | `switch` / `range` | Modeled hardware freeze control (`0-ULP` integer-lag ring-write lock; unobserved options remain clamped) |
 | **`"grain_size_ms"` / `"grain_pitch_semitones"` / `"grain_spray"`** | `range` | Granular duration, pitch shift `[-24, +24]` st, and onset jitter |
 
 ---
@@ -264,12 +269,14 @@ $$d = \mathrm{RNE}_{f32}(T_{j+1} - T_j), \qquad p = \min\Big(T_{j+1},\ \mathrm{R
 
 ```text
 +---------------------------------------------------------------------------------------------------+
-| CONTROL BUS TIER-LOCAL PAYLOAD & SUFFICIENT-STATISTIC LEDGER                                      |
+| CONTROL BUS ARENA 0 SELF-CONTAINED PAYLOAD & SUFFICIENT-STATISTIC LEDGER                          |
 +---------------------------------------------------------------------------------------------------+
-|  Shared Control Descriptors: Normalization, safe bounds, conditional selectors & calibration      |
-|  Arena 0 (Lite..Pro Base):   Per contributor 4(9k + 4) B | U_int^base 128 B | W_ctrl^base 1,024 B |
-|  Arena 3 (Ultra Delta):      Per contributor 4(8k + 4) B | 3xU_int,D  384 B | W_ctrl,D      256 B |
-|  Exact-Integer Accumulator:  9-word S + 18-word D per factor (`108 B/factor`) + 9-word main sums  |
+|  Arena 0 (Arena0LiteWire, Retained by Lite..Ultra & .dnam-prev; Cold Tail of SonaHotSlab):       |
+|    • ControlClampDescriptorWire[P], CP1 contributors 4(9k + 4) B, U_int^base 128 B, W_ctrl 1,024 B|
+|    • Base fp16 W_readout (VarProReadoutSubspaceWire); 0 extra 48 kHz MACs when static             |
+|  Arena 1..2 (Full / Pro Deltas): Incremental fp16 W_readout,Delta slices                          |
+|  Arena 3 (Ultra Delta): Per contributor 4(8k + 4) B | 3xU_int,D 384 B | W_ctrl,D 256 B | W_ro,D   |
+|  Exact-Integer Accumulator: 9-word S + 18-word D per factor (108 B/factor) + 9-word main sums     |
 +---------------------------------------------------------------------------------------------------+
 ```
 
@@ -279,7 +286,7 @@ $$d = \mathrm{RNE}_{f32}(T_{j+1} - T_j), \qquad p = \min\Big(T_{j+1},\ \mathrm{R
 
 `r[dsp.tempo.subdivisions]`
 
-Synchronizes delay taps (`Op-T`), granular windows, and modulation LFOs (`Op-M`) across **20–400 BPM** inclusive (`144,000..7,200` samples per quarter note at `48 kHz`; `9 s` dotted-half to `25 ms` `1/16T`) for host DAW transport, `24 PPQN` MIDI clock (`0xF8`), and tap tempo across all **12 canonical rhythmic subdivisions**:
+Synchronizes delay taps (`Op-T`), granular windows, and modulation LFOs (`Op-M`, including the Top-of-Frame `4`-lane `Q0.32` quadrature phasors) across **20–400 BPM** inclusive (`144,000..7,200` samples per quarter note at `48 kHz`; `9 s` dotted-half to `25 ms` `1/16T`) for host DAW transport, `24 PPQN` MIDI clock (`0xF8`), and tap tempo across all **12 canonical rhythmic subdivisions**:
 
 | Subdivision Index (`idx`) | `0` | `1` | `2` | `3` | `4` | `5` | `6` | `7` | `8` | `9` | `10` | `11` |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |

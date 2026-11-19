@@ -102,8 +102,10 @@ fn eval_tier_passes_universal<B: TrainerBackend>(
         let mr: Vec<f64> = or.iter().map(|&v| f64::from(v)).collect();
         cr.certify_universal_with_prescreen(tier, &mr, &prof_r, None)
     });
-    let mode_ok =
-        summary_passes_mode(&sl, quality_mode) && sr.as_ref().is_none_or(|r| summary_passes_mode(r, quality_mode));
+    let mode_ok = summary_passes_mode(&sl, quality_mode)
+        && sr
+            .as_ref()
+            .is_none_or(|r| summary_passes_mode(r, quality_mode));
     if !mode_ok {
         return false;
     }

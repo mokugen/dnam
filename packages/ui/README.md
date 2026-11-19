@@ -11,5 +11,5 @@ Shared React 19, Tailwind CSS v4 (`@tailwindcss/vite`), `shadcn/ui`, and `lucide
 - `@dnam-project/ui/controls/*` — `RotaryKnob`, `DiscreteSwitch`, `StatusBadges`, and SVG `geometry`.
 - `@dnam-project/ui/rack/*` — `DnamPluginRack`, `TriPhysicsTelemetry`, and rack model types.
 - `@dnam-project/ui/workflows/*` — `CapturePlanPanel`, `TrainingTimelinePanel`, and musician-facing `TrainingFitVisualizer`.
-- `@dnam-project/ui/visualizers/*` — Interactive TORA DSP and `TrainerTelemetryVisualizer` components.
+- `@dnam-project/ui/visualizers/*` — Interactive `SONA` DSP and `TrainerTelemetryVisualizer` (`DNPR` seqlock) components.
 - `@dnam-project/ui/host/*` — `DnamAudioHost` (`types`), `DnamAudioHostProvider` (`context`), `WebAudioWorkletHost` (`web_worklet_host`), and `256 B` seqlock reader (`trainer-progress`).

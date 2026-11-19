@@ -133,8 +133,8 @@ impl TargetRepeatabilityProfile {
                         bands[b][ts..t1].iter().map(|&v| v * v).sum::<f64>() / (third as f64);
                     let p_w1: f64 =
                         bands[b][t1..t2].iter().map(|&v| v * v).sum::<f64>() / (third as f64);
-                    let p_w2: f64 = bands[b][t2..te].iter().map(|&v| v * v).sum::<f64>()
-                        / ((te - t2) as f64);
+                    let p_w2: f64 =
+                        bands[b][t2..te].iter().map(|&v| v * v).sum::<f64>() / ((te - t2) as f64);
 
                     let mut r_best = 0.0_f64;
                     let p_late_early = 0.5 * (p_w0 + p_w1);

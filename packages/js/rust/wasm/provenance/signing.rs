@@ -10,9 +10,7 @@ use crate::core::provenance::{
     verify_oem_device_cert_core, x25519_pubkey_hex_core,
 };
 use crate::error::validation_err;
-use crate::wasm::abi::{
-    read_bytes, read_opt_bytes, read_opt_str, read_str, set_error, set_result,
-};
+use crate::wasm::abi::{read_bytes, read_opt_bytes, read_opt_str, read_str, set_error, set_result};
 
 #[allow(clippy::too_many_arguments)]
 #[unsafe(no_mangle)]

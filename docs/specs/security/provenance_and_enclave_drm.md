@@ -2,7 +2,7 @@
 id: spec.sec.provenance-drm
 title: "Cryptographic Provenance (Ed25519), DistributionPolicy, OemDeviceCertificate & .dnam-seal (DNSL) Hardware DRM"
 status: canonical
-version: "1.0.0"
+version: "3.0.0"
 domain: security
 rule_prefixes:
   - "r[sec.taxonomy."
@@ -18,12 +18,12 @@ requirements:
   - REQ-8.8
 adrs:
   - ADR-0009
-  - ADR-0021
+  - ADR-0022
 ---
 
 # Cryptographic Provenance (`Ed25519`), `DistributionPolicy`, `OemDeviceCertificate` & `.dnam-seal` (`DNSL`) Hardware DRM
 
-This specification defines **Pillar 1 (Cryptographic Provenance & `DistributionPolicy`)**, **Pillar 2 (Hardware Enclave & OEM DRM via `OemDeviceCertificate` and `.dnam-seal` `b"DNSL"`)**, and the **Three Container Protection Profiles (`DnamProtectionProfile`)** of the DNAM 5-Pillar Security Architecture (paired with Pillars 3–5 in [`watermarking_and_marketplace.md`](watermarking_and_marketplace.md)), fulfilling [`../../requirements/system_goals_and_requirements.md` §9 (`REQ-8.1`–`REQ-8.8`)](../../requirements/system_goals_and_requirements.md#9-goal-8--model-provenance-hardware-drm-forensic-watermarking--marketplace-security). For security design rationales and counterexamples, see [`../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md`](../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md).
+This specification defines **Pillar 1 (Cryptographic Provenance & `DistributionPolicy`)**, **Pillar 2 (Hardware Enclave & OEM DRM via `OemDeviceCertificate` and `v3.0` `zerocopy` `.dnam-seal` `b"DNSL"`)**, and the **Three Container Protection Profiles (`DnamProtectionProfile`)** of the `SONA` `v3.0` DNAM 5-Pillar Security Architecture (paired with Pillars 3–5 in [`watermarking_and_marketplace.md`](watermarking_and_marketplace.md)), fulfilling [`../../requirements/system_goals_and_requirements.md` §9 (`REQ-8.1`–`REQ-8.8`)](../../requirements/system_goals_and_requirements.md#9-goal-8--model-provenance-hardware-drm-forensic-watermarking--marketplace-security) (see [`../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md`](../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md) and [`../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)).
 
 ---
 
@@ -33,19 +33,19 @@ This specification defines **Pillar 1 (Cryptographic Provenance & `DistributionP
 
 ```mermaid
 flowchart TB
-    subgraph Container ["TORA Declarative Binary Container Architecture (REQ-8.1, REQ-8.8)"]
+    subgraph Container ["SONA v3.0 Declarative Binary Container Architecture (REQ-8.1, REQ-8.8)"]
         direction LR
-        Preamble["64B Preamble & 128B Directory"] --> Header["RFC 8785 JCS Immutable Header<br/>+ Shared Descriptors + Auth Envelope"]
-        Header --> Arenas["Four Nested Tier Payloads<br/>Lite ⊂ Full ⊂ Pro ⊂ Ultra"]
+        Preamble["64B DnamPreambleWire & 128B Directory"] --> Header["RFC 8785 JCS Immutable Header ('sona')<br/>+ Shared Descriptors + Auth Envelope"]
+        Header --> Arenas["Four Nested const SONA Tier Payloads<br/>Lite (Self-Contained Controls) ⊂ Full ⊂ Pro ⊂ Ultra"]
         Arenas --> Mutable["Growable DMU1/DME1 + DMUE Suffix<br/>Presets & Open user_metadata"]
     end
 
-    subgraph Formats ["Four 64-Byte-Aligned Container Formats"]
+    subgraph Formats ["Four 64-Byte-Aligned v3.0 zerocopy Container Formats"]
         direction LR
-        F_PROJ[".dnam-proj (Magic: DNPJ) - Cloud-Ready Capture Vault"]
-        F_DNAM[".dnam (Magic: DNAM) - Zero-Copy Runtime Model"]
-        F_SEAL[".dnam-seal (Magic: DNSL) - Encrypted OEM Enclave Wrapper"]
-        F_PREV[".dnam-prev (container_kind: 'preview') - Lite-Only Storefront Preview"]
+        F_PROJ[".dnam-proj (Magic: DNPJ v3.0) - Cloud-Ready Capture Vault"]
+        F_DNAM[".dnam (Magic: DNAM v3.0) - Zero-Copy Runtime Model"]
+        F_SEAL[".dnam-seal (Magic: DNSL v3.0) - Encrypted OEM Enclave Wrapper"]
+        F_PREV[".dnam-prev (container_kind: 'preview' v3.0) - Lite-Only Storefront Preview"]
         F_PROJ --> F_DNAM --> F_SEAL
         F_DNAM --> F_PREV
     end
@@ -72,7 +72,7 @@ flowchart TB
 
 `r[sec.jcs.immutable-header-digest]`
 
-To allow user preset edits and storefront catalog tagging without invalidating creator or marketplace signatures, `immutable_header_sha256` hashes the exact **RFC 8785 JSON Canonicalization Scheme (JCS)** UTF-8 byte serialization (UTF-16 code-unit key ordering, ECMAScript `binary64` formatting, exact integers in $[-(2^{53}-1), 2^{53}-1]$) of the logical header after removing only these exact mutable/envelope paths:
+To allow user preset edits and storefront catalog tagging without invalidating creator or marketplace signatures, `immutable_header_sha256` hashes the exact **RFC 8785 JSON Canonicalization Scheme (JCS)** UTF-8 byte serialization (UTF-16 code-unit key ordering, ECMAScript `binary64` formatting, exact integers in $[-(2^{53}-1), 2^{53}-1]$) of the `v3.0` `"sona"` logical header (`"version": "3.0.0"`, `"architecture": "sona"`, zero `v2`/`tora` legacy compatibility) after removing only these exact mutable/envelope paths:
 
 ```text
 presets
@@ -85,10 +85,10 @@ slimmable_tiers.{lite,full,pro,ultra}.prefix_crc32c
 
 | JSON Header Path | Included in `immutable_header_sha256`? | Security Role |
 | :--- | :---: | :--- |
-| `version`, `container_kind`, `architecture`, `sample_rate_train_hz` | **Yes (Signed)** | Locks core model architecture and reference sample rate (`48000`) |
+| `version` (`"3.0.0"`), `container_kind`, `architecture` (`"sona"`), `sample_rate_train_hz` | **Yes (Signed)** | Locks `v3.0` `SONA` core architecture and reference sample rate (`48000`) |
 | `metadata.{name, author, description, license, created_at, input_reference_dbfs, provenance}` | **Yes (Signed)** | Locks creator attribution, license terms, and PCM dataset provenance |
 | **`metadata.distribution_policy`** (`allowed_protection_profiles`, `allowed_oem_vendors`) | **Yes (Signed)** | Locks permitted protection profiles and OEM hardware vendors/models |
-| `io_config`, `controls_schema`, `delay_histories`, `tensor_directory`, `slimmable_tiers` | **Yes (Signed)** | Locks safety clamps, delay capacities, tier offsets, and calibration |
+| `io_config`, `controls_schema`, `delay_histories`, `tensor_directory`, `slimmable_tiers` | **Yes (Signed)** | Locks safety clamps, delay capacities, constant tier offsets, and calibration |
 | **`presets`** & **`*_user_metadata`** | **No (Mutable Suffix)** | Stored in the growable `DMU1`/`DME1` + `DMUE` suffix |
 | **`metadata.signatures`** | **No (Auth Envelope)** | Stored in the `DAU1`/`DAI1`/`DSA1` authentication envelope |
 
@@ -116,7 +116,7 @@ slimmable_tiers.{lite,full,pro,ultra}.prefix_crc32c
 
 `r[sec.sig.prefix-delegation]`
 
-Let `F(label, value) = u32le(len(label)) || ASCII(label) || u64le(len(value)) || value` and `L = u8(count) || (u8(tier[0]) || digest[0][32]) || ...` (`count = maximum_tier + 1`, `tier = 0..3` for `Lite..Ultra`):
+Let `F(label, value) = u32le(len(label)) || ASCII(label) || u64le(len(value)) || value` and `L = u8(count) || (u8(tier[0]) || digest[0][32]) || ...` (`count = maximum_tier + 1`, `tier = 0..3` for `Lite..Ultra`). Because `Arena 0` (`Arena0LiteWire`) embeds self-contained `Lite` control descriptors, `CP1`, `U_int`, `W_ctrl`, and `Lite` `W_readout`, `strip_container_to_tier(Lite)` preserves authenticated parametric control descriptors and signatures without re-signing (`REQ-5.6`):
 
 ```text
 +---------------------------------------------------------------------------------------------------+
@@ -173,7 +173,7 @@ Let `F(label, value) = u32le(len(label)) || ASCII(label) || u64le(len(value)) ||
 +---------------------------------------------------------------------------------------------------+
 ```
 
-`r[sec.sig.dau1-envelope]` **Open `DAU1` Authentication Envelope:** In Open `2.0` containers (`protection_profile = 0`), the authentication region contains `ASCII("DAU1") || u8(auth_kind) || 00 00 00 || creator_pubkey[32] || u8(creator_max_tier) || L_master || creator_sig[64]` (`106 + 33 * N_c` bytes for `auth_kind = 0`), followed when `auth_kind = 1` by `marketplace_pubkey[32] || u32le(P) || policy[P] || u8(buyer_max_tier) || L_buyer || marketplace_sig[64]` (`208 + 33 * N_c + 33 * N_b + P` bytes).
+`r[sec.sig.dau1-envelope]` **Open `DAU1` Authentication Envelope:** In Open `3.0` containers (`protection_profile = 0`), the authentication region contains `ASCII("DAU1") || u8(auth_kind) || 00 00 00 || creator_pubkey[32] || u8(creator_max_tier) || L_master || creator_sig[64]` (`106 + 33 * N_c` bytes for `auth_kind = 0`), followed when `auth_kind = 1` by `marketplace_pubkey[32] || u32le(P) || policy[P] || u8(buyer_max_tier) || L_buyer || marketplace_sig[64]` (`208 + 33 * N_c + 33 * N_b + P` bytes).
 
 #### Offline Authorization and Future Revocation
 
@@ -227,10 +227,10 @@ sequenceDiagram
     Host->>App: Sends OemDeviceCertificate (V2 framed fields + oem_sig_ed25519)
     App->>DNAM: Forwards OemDeviceCertificate(s) + Model License Request
     DNAM->>DNAM: Verifies DistributionPolicy, V2 OEM certificate & key binding
-    DNAM->>DNAM: Embeds Pillar 3 buyer watermark across Arena 0..3
+    DNAM->>DNAM: Embeds Pillar 3 SONA buyer watermark across Arena 0..3
     DNAM->>DNAM: Encrypts inner tier chunks (HPKE + ChaCha20-Poly1305) & signs DAI1 receipt
     DNAM->>DNAM: Encrypts outer metadata & tier chunks & signs public DSA1 manifest
-    DNAM-->>Host: Delivers .dnam-seal (public strip directory + encrypted chunks)
+    DNAM-->>Host: Delivers v3.0 .dnam-seal (zerocopy strip directory + encrypted chunks)
     Host->>TZ: Supplies retained outer chunks and recipient slot
     TZ->>TZ: Verifies DSA1 prefix, unwraps outer & inner HPKE slots, verifies DAI1 receipt
     TZ-->>Host: Releases authorized UI metadata only
@@ -281,13 +281,13 @@ sequenceDiagram
 
 `r[sec.drm.dnsl-public-framing]`
 
-An `EnclaveSealed` (`.dnam-seal`) file orders `[preamble][directory][outer plan P][pad][outer slots S][pad][DSA1 manifest][pad][outer shared record][pad][outer Lite..Ultra records][pad][DME1 frame][DMUE footer]`:
+An `EnclaveSealed` (`v3.0` `.dnam-seal`) file is parsed strictly via declarative `#[repr(C)]` `zerocopy::byteorder::little_endian` wire structs (`DnslPreambleWire`, `DnslDirectoryWire`, `Dsa1HeaderWire`, `ref[repo.code.zerocopy-wire-structs]`) ordering `[preamble][directory][outer plan P][pad][outer slots S][pad][DSA1 manifest][pad][outer shared record][pad][outer Lite..Ultra records][pad][DME1 frame][DMUE footer]`:
 
 ```text
-DNSL Outer Preamble (64 B):
-  0..4: "DNSL" | 4..6: major=2 | 6..8: minor=0 | 8..9: profile=2 | 9..10: max_tier | 10..64: zero
+DnslPreambleWire (64 B, #[repr(C, align(64))], zerocopy LE):
+  0..4: "DNSL" | 4..6: major=3 (U16) | 6..8: minor=0 (U16) | 8..9: profile=2 | 9..10: max_tier | 10..64: zero
 
-DNSL Outer Directory (128 B):
+DnslDirectoryWire (128 B, #[repr(C)], zerocopy U64 LE):
    0..8:  plan_offset = 192     |  8..16: plan_length
   16..24: slots_offset          | 24..32: slots_length
   32..40: manifest_offset       | 40..48: manifest_length
@@ -303,10 +303,10 @@ DSA1 Public Manifest (105 + 33 * M bytes):
 
 `r[sec.drm.protected-inner-framing]`
 
-In `DeviceAllowlisted` (`profile = 1`, standalone `.dnam`) and inside the decrypted outer records of `EnclaveSealed` (`profile = 2`), the inner layer orders `[inner preamble][inner directory][DNPL logical metadata prefix][inner plan P][pad][inner slots S][pad][DAI1 envelope][pad][inner shared record][pad][inner Lite..Ultra records][pad]`:
+In `DeviceAllowlisted` (`profile = 1`, standalone `v3.0` `.dnam`) and inside the decrypted outer records of `EnclaveSealed` (`profile = 2`), the inner layer uses declarative `zerocopy` `InnerDirectoryWire` and `DnplPreambleWire` (`version_major = 3`, `version_minor = 0`, `ref[repo.code.zerocopy-wire-structs]`) ordering `[inner preamble][inner directory][DNPL logical metadata prefix][inner plan P][pad][inner slots S][pad][DAI1 envelope][pad][inner shared record][pad][inner Lite..Ultra records][pad]`:
 
 ```text
-Inner Directory (128 B):
+InnerDirectoryWire (128 B, #[repr(C)], zerocopy U64 LE):
    0..8:  plan_offset           |  8..16: plan_length
   16..24: slots_offset          | 24..32: slots_length
   32..40: authentication_offset | 40..48: authentication_length
@@ -314,9 +314,9 @@ Inner Directory (128 B):
   64..96: original_tier_ends[4] | 96..128: logical_metadata_sha256 (DNAM-LOGICAL-METADATA-V1)
 
 DNPL Logical Metadata Prefix (at inner offset 192..plan_offset):
-  • 0..64:   DNPL Preamble (magic="DNPL", version=2.0, profile=1|2, buyer_max_tier, SR=48000)
-  • 64..192: DNPL Directory (hdr_off=192, hdr_len, shared_off, shared_len, tier_start, ends[4])
-  • 192..:   Canonical RFC 8785 JCS Immutable Header + Zero Pad to 64 B
+  • 0..64:   DnplPreambleWire (magic="DNPL", major=3, minor=0, profile=1|2, buyer_max_tier, SR=48000)
+  • 64..192: DnamDirectoryWire (hdr_off=192, hdr_len, shared_off, shared_len, tier_start, ends[4])
+  • 192..:   Canonical RFC 8785 JCS Immutable Header ("sona") + Zero Pad to 64 B
 
 DAI1 Inner Authentication Envelope (209 + 33*N_c + 66*N_b + P bytes):
   ASCII("DAI1") || 00 00 00 00
@@ -331,11 +331,11 @@ DAI1 Inner Authentication Envelope (209 + 33*N_c + 66*N_b + P bytes):
 
 `r[sec.drm.dme1-mutable-suffix]`
 
-Both `DeviceAllowlisted` and `EnclaveSealed` containers place a growable `DME1` frame and `16 B` `DMUE` footer immediately after the retained outermost tier boundary:
+Both `DeviceAllowlisted` and `EnclaveSealed` containers place a growable `DME1` frame (`Dme1HeaderWire`, `#[repr(C)]` `zerocopy`) and `16 B` `DmueFooterWire` immediately after the retained outermost tier boundary:
 
 ```text
-DME1 Frame Layout:
-  0..4: "DME1" | 4..5: profile (1|2) | 5..8: zero | 8..12: u32le(N) | 12..20: u64le(C)
+Dme1HeaderWire & Frame Layout (zerocopy LE):
+  0..4: "DME1" | 4..5: profile (1|2) | 5..8: zero | 8..12: N (U32) | 12..20: C (U64)
   20 .. 20+80*N: HPKE slots S[0..N]  | 20+80*N .. 20+80*N+C: ChaCha20-Poly1305 ciphertext + tag
   Plaintext = u32le(N) || recipient_public_key[0..N][32] || complete DMU1 frame
 
@@ -358,8 +358,8 @@ DME1 Domain-Separated Transcripts:
 
 `r[sec.drm.protection-profiles]`
 
-| Protection Profile (`DnamProtectionProfile`) | Container | Metadata | Tier Payloads | Primary Target & Security Posture |
+| Protection Profile (`DnamProtectionProfile`) | Container (`v3.0`) | Metadata | Tier Payloads | Primary Target & Security Posture |
 | :--- | :--- | :--- | :--- | :--- |
-| **`Open` (`0`, `"open"`)** | `.dnam` (`b"DNAM"`) | Plaintext JCS | Plaintext (`DAU1` signed prefixes) | Community models and open commercial packs |
-| **`DeviceAllowlisted` (`1`, `"device_allowlisted"`)** | `.dnam` (`b"DNAM"`) | Plaintext `DNPL` JCS | Encrypted tier chunks (`DAI1` + HPKE) | Desktop/mobile/pedal licenses bound to allowlisted device keys |
+| **`Open` (`0`, `"open"`)** | `.dnam` (`b"DNAM"`) | Plaintext JCS (`"sona"`) | Plaintext (`DAU1` signed prefixes, `Arena 0` controls) | Community models and open commercial packs |
+| **`DeviceAllowlisted` (`1`, `"device_allowlisted"`)** | `.dnam` (`b"DNAM"`) | Plaintext `DNPL` JCS (`"sona"`) | Encrypted tier chunks (`DAI1` + HPKE) | Desktop/mobile/pedal licenses bound to allowlisted device keys |
 | **`EnclaveSealed` (`2`, `"enclave_sealed"`)** | `.dnam-seal` (`b"DNSL"`) | Encrypted (public `DSA1` strip directory) | Nested outer + inner encrypted tier chunks | Attested OEM hardware enclaves with protected DSP execution |

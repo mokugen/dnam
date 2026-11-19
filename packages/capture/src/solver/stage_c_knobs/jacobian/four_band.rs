@@ -214,13 +214,7 @@ impl FourBandJacobianCtx {
     }
 
     /// Evaluates total per-band RMS discrepancy `sum_b (wet_amp[b] - amp_b)^2` for `(Ultra, Lite)`.
-    pub(super) fn penalty(
-        &self,
-        ul: &[f32],
-        ur: &[f32],
-        ll: &[f32],
-        lr: &[f32],
-    ) -> (f64, f64) {
+    pub(super) fn penalty(&self, ul: &[f32], ur: &[f32], ll: &[f32], lr: &[f32]) -> (f64, f64) {
         let (bul, bur) = split_stereo_bands_f32(ul, ur, self.n, self.mono);
         let (bll, blr) = split_stereo_bands_f32(ll, lr, self.n, self.mono);
         let amp_u = band_amps(&bul, &bur, self.warmup, self.n, self.mono);
@@ -353,10 +347,8 @@ pub(super) fn has_per_band_wiener_collapse(
         .map(|v| if mono { v[0] } else { v[1] })
         .collect();
     let (wet_l, wet_r) = split_stereo_bands_f32(&wl, &wr, n, mono);
-    let (sul, sur) =
-        split_stereo_bands_f32(&eff_jac.star_out_l, &eff_jac.star_out_r, n, mono);
-    let (sll, slr) =
-        split_stereo_bands_f32(&eff_jac.lite_star_l, &eff_jac.lite_star_r, n, mono);
+    let (sul, sur) = split_stereo_bands_f32(&eff_jac.star_out_l, &eff_jac.star_out_r, n, mono);
+    let (sll, slr) = split_stereo_bands_f32(&eff_jac.lite_star_l, &eff_jac.lite_star_r, n, mono);
     let (mul, mur) = split_stereo_bands_f32(ul, ur, n, mono);
     let (mll, mlr) = split_stereo_bands_f32(ll, lr, n, mono);
 
@@ -504,7 +496,8 @@ mod tests {
         let render_shifted = |step: f64, src_jac: &[Vec<f64>]| -> Vec<f32> {
             (0..n)
                 .map(|i| {
-                    (f64::from(star_l[i]) + step * (dir[0] * src_jac[0][i] + dir[1] * src_jac[1][i]))
+                    (f64::from(star_l[i])
+                        + step * (dir[0] * src_jac[0][i] + dir[1] * src_jac[1][i]))
                         as f32
                 })
                 .collect()
@@ -516,8 +509,9 @@ mod tests {
         let (pu_p, pl_p) = ctx.penalty(&up_u, &up_u, &up_l, &up_l);
         let (pu_m, pl_m) = ctx.penalty(&dn_u, &dn_u, &dn_l, &dn_l);
         let fd_dir_deriv = 0.25 * w_band * ((pu_p + pl_p) - (pu_m + pl_m)) / (2.0 * eps);
-        let analytic_dir_deriv =
-            -0.5 * ((grad_out[0][0] + grad_out[1][0]) * dir[0] + (grad_out[0][1] + grad_out[1][1]) * dir[1]);
+        let analytic_dir_deriv = -0.5
+            * ((grad_out[0][0] + grad_out[1][0]) * dir[0]
+                + (grad_out[0][1] + grad_out[1][1]) * dir[1]);
         assert!(
             (fd_dir_deriv - analytic_dir_deriv).abs() < 1.0e-5,
             "FD={fd_dir_deriv} vs analytic={analytic_dir_deriv}"

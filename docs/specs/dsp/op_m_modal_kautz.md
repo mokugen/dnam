@@ -1,8 +1,8 @@
 ---
 id: spec.dsp.op-m
-title: "Op-M: Universal Symplectic Modal, Hilbert, Sub-Harmonic & Kautz Operator"
+title: "Op-M: Universal TPT-SVF Scan, Symplectic Modal, Op-P Hilbert/Tracker & Kautz Operator"
 status: canonical
-version: "1.0.0"
+version: "3.0.0"
 domain: dsp
 rule_prefixes:
   - "r[dsp.op-m."
@@ -14,44 +14,56 @@ requirements:
 adrs:
   - ADR-0005
   - ADR-0019
-  - ADR-0021
+  - ADR-0022
 ---
 
-# Op-M: Universal Symplectic Modal, Hilbert, Sub-Harmonic & Kautz Operator
+# Op-M: Universal `TPT-SVF` Scan, Symplectic Modal, `Op-P` Hilbert/Tracker & Kautz Operator
 
-This specification defines **Op-M (Modal)** ([`packages/engine/src/operators/op_m.rs`](../../../packages/engine/README.md), [`packages/capture/src/`](../../../packages/capture/README.md)), the universal operator kernel governing 4-lane SIMD symplectic complex-state recurrence, quadrant-reduced contractive rotors, `H1` Hilbert single-sideband generation, `T1` bistable sub-harmonic synthesis, shared-pole Stage III Kautz modal cabinets, and the `3 kHz` ballistic control engine across **Dynamic Neural Audio Modeler (DNAM)** ([`tora_architecture.md`](../architecture/tora_architecture.md), [`REQ-1.2`, `REQ-2.5`](../../requirements/system_goals_and_requirements.md)). For R&D derivations and counterexamples, see [`../../adr/0005-contractive-rotor-hilbert-and-t1-tracker.md`](../../adr/0005-contractive-rotor-hilbert-and-t1-tracker.md).
+This specification defines **Op-M (Modal & Linear State-Space)** (shared `#![no_std]` `32-bit` primitives in `packages/kernels/` `dnam-kernels`, runtime implementation in [`packages/engine/src/operators/op_m.rs`](../../../packages/engine/README.md), and identification in [`packages/capture/src/`](../../../packages/capture/README.md)), the universal operator kernel governing:
+1. Unconditionally passive **`2×2` Zero-Delay-Feedback (`ZDF`) `TPT-SVF` associative scans** inside the 4-block Matryoshka `SONA` core with analytical ZOH prewarping across `44.1..384 kHz`.
+2. **4-lane `Q0.32` quadrature phasors (`0.05 Hz..20 kHz`)** in the Top-of-Frame Causal Crossbar and **`Q0.192` contractive rotors** (`Op-M[Ctrl]`).
+3. Input-only **`Op-P` analytic basis** (`HilbertH1Lattice6Sec` + pure-`f32` branch-cut-guarded `T1SubHarmonicTracker` shared via `dnam-kernels` and precomputed on CPU before WebGPU uploads).
+4. **Stage III contiguous Early FIR (`32 / 48 / 96 / 128` taps/ch) + shared-pole `KautzModalBank` (`8 / 12 / 24 / 32` conjugate pairs)** hoisted across `16`-frame sub-blocks in `process_tick16_const`.
+
+For requirements and system context, see [`sona_architecture.md`](../architecture/sona_architecture.md) and [`REQ-1.2`, `REQ-1.3`, `REQ-2.5`](../../requirements/system_goals_and_requirements.md); for derivations and counterexamples, see [`../../adr/0005-contractive-rotor-hilbert-and-t1-tracker.md`](../../adr/0005-contractive-rotor-hilbert-and-t1-tracker.md) and [`../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md).
 
 ---
 
 ## 1. 4-Lane SIMD Symplectic Complex Recurrence & Algebraic Rotor
 
-### 1.1 Complex State Recurrence
+### 1.1 Complex State Recurrence & Passive `2x2` ZDF `TPT-SVF` Associative Scan
 
 `r[dsp.op-m.recurrence.symplectic]`
 
-Op-M maintains 4 parallel complex state variables $z_c[n] = z_{\mathrm{re}, c}[n] + i z_{\mathrm{im}, c}[n] \in \mathbb{C}$ for $c \in [0, 1, 2, 3]$:
-$$z_c[n] = a_c[n] z_c[n-1] + \tilde{b}_c[n] x_c[n], \qquad a_c[n] = r_c[n] \cdot u_{\mathrm{rot}, c}[k], \qquad |r_{c,\mathrm{ref}}[n]| \le 0.9995, \quad |u_{\mathrm{rot}, c}| \le 1.000000000000$$
+Inside the 4-block Matryoshka `SONA` core, resonant and crossover filter modes (`4 / 6 / 8 / 10–12` modes across `Lite..Ultra`) execute as **unconditionally passive `2×2` Zero-Delay-Feedback Trapezoidal State-Variable Filters (`TPT-SVF`)** (`0` `FDIV`, `0` `log`/`exp` stabilization). For each mode with cutoff frequency $f_c[n]$, prewarped ZOH tangent gain $g[n] = \tan(\pi f_c[n] / f_{s,\text{eff}}) > 0$, damping $k[n] = 1/Q[n] \ge 0$, $a_1 = \frac{1}{1 + g(g + k)}$, $a_2 = g a_1$, and $a_3 = g a_2$:
+$$v_3[n] = u[n] - s_2[n-1], \qquad v_1[n] = a_1 s_1[n-1] + a_2 v_3[n], \qquad v_2[n] = s_2[n-1] + a_2 s_1[n-1] + a_3 v_3[n]$$
+$$\mathbf{s}[n] = \mathbf{A}_{\text{tpt}}[n]\mathbf{s}[n-1] + \mathbf{b}_{\text{tpt}}[n]u[n], \qquad A_{11} = 2a_1 - 1, \quad A_{12} = -2a_2, \quad A_{21} = 2a_2, \quad A_{22} = 1 - 2a_3, \quad \mathbf{b}_{\text{tpt}}[n] = [2a_2, 2a_3]^\top$$
+$$s_1[n] = (2a_1 - 1)s_1[n-1] - 2a_2 s_2[n-1] + 2a_2 u[n], \qquad s_2[n] = 2a_2 s_1[n-1] + (1 - 2a_3)s_2[n-1] + 2a_3 u[n]$$
+$$\mathrm{LP}[n] = v_2[n], \qquad \mathrm{BP}[n] = v_1[n], \qquad \mathrm{HP}[n] = u[n] - k v_1[n] - v_2[n], \qquad \mathrm{AP}[n] = u[n] - 2 k v_1[n]$$
 
-In Cartesian components, with $u_{\mathrm{rot}, c} = c_{\mathrm{rot}, c} + i s_{\mathrm{rot}, c}$, $\alpha_{\mathrm{re}, c}[n] = r_c[n] c_{\mathrm{rot}, c}$, and $\alpha_{\mathrm{im}, c}[n] = r_c[n] s_{\mathrm{rot}, c}$ (matching $O(\log_2 L)$ associative parallel scan evaluation in `f64` within $< 10^{-13}$):
-$$z_{\mathrm{re}, c}[n] = \alpha_{\mathrm{re}, c}[n] z_{\mathrm{re}, c}[n-1] - \alpha_{\mathrm{im}, c}[n] z_{\mathrm{im}, c}[n-1] + b_{\mathrm{re}, c} x_c[n]$$
-$$z_{\mathrm{im}, c}[n] = \alpha_{\mathrm{im}, c}[n] z_{\mathrm{re}, c}[n-1] + \alpha_{\mathrm{re}, c}[n] z_{\mathrm{im}, c}[n-1] + b_{\mathrm{im}, c} x_c[n]$$
+1. **Unconditional Passivity ($\Vert \mathbf{A}_{\text{tpt}}[n] \Vert_2 \le 1$):** By the discrete energy conservation identity $(s_1'[n])^2 + (s_2'[n])^2 = s_1[n-1]^2 + s_2[n-1]^2 - 4 g[n] k[n] v_1[n]^2 \le s_1[n-1]^2 + s_2[n-1]^2$ (at $u[n] = 0$), every prefix matrix product $\prod \mathbf{A}_{\text{tpt}}$ in a `mat2x2` Blelloch $O(\log_2 L)$ associative prefix scan (`8` `f32`s per mode inside WebGPU's `16 KiB` `var<workgroup>` SRAM) never overflows `binary32` under arbitrary audio-rate modulation (`Q = 12` Wah sweeps).
+2. **Analytical ZOH Prewarping (`44.1..384 kHz`):** Sample-rate transfer prepares $g_{\text{host}} = \tan(\pi f_c / f_{s,\text{eff}})$ analytically on the cold / `3 kHz` control boundary (`0` audio-rate transcendental or `FDIV` calls), while simultaneous `(LP, BP, HP, AP)` taps let weight optimization discover `LR4` crossovers, interactive tone stacks, and `4–12`-pole phasers without device-specific sub-circuits (`REQ-1.9`).
+3. **Symplectic Complex Recurrence (`SymplecticModal4Lane`):** For dedicated complex modal lanes $z_c[n] = z_{\mathrm{re},c}[n] + i z_{\mathrm{im},c}[n] \in \mathbb{C}$ ($c \in [0, 1, 2, 3]$):
+   $$z_c[n] = a_c[n] z_c[n-1] + \tilde{b}_c[n] x_c[n], \qquad a_c[n] = r_c[n] \cdot u_{\mathrm{rot}, c}[k], \qquad |r_{c,\mathrm{ref}}[n]| \le 0.9995, \quad |u_{\mathrm{rot}, c}| \le 1.000000000000$$
+   with Cartesian update $z_{\mathrm{re},c}[n] = \alpha_{\mathrm{re},c}[n] z_{\mathrm{re},c}[n-1] - \alpha_{\mathrm{im},c}[n] z_{\mathrm{im},c}[n-1] + b_{\mathrm{re},c} x_c[n]$ and $z_{\mathrm{im},c}[n] = \alpha_{\mathrm{im},c}[n] z_{\mathrm{re},c}[n-1] + \alpha_{\mathrm{re},c}[n] z_{\mathrm{im},c}[n-1] + b_{\mathrm{im},c} x_c[n]$ matching `f64` $O(\log_2 L)$ associative prefix scans within $< 10^{-13}$.
 
-`r[dsp.op-m.recurrence.stereo-simd]` **4-Lane Stereo Symplectic & Kautz SIMD Recurrence ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** In both Stage I (`SymplecticModal4Lane::step_4lane_stereo_simd` / `step_4lane_stereo_simd_with_readout`) and Stage III (`KautzModalBank<4>::step_4lane_stereo_simd_splatted` / `step_4lane_stereo_simd_unscaled`), Left and Right channel states `(z_re_l, z_im_l, z_re_r, z_im_r)` are stepped together in 4-pole `B::Vec4` SIMD blocks sharing the same loaded pole radii and rotor vectors `(r_c, cos_c, sin_c)`, halving parameter-load bandwidth and loop overhead relative to separate per-channel calls.
+`r[dsp.op-m.recurrence.stereo-simd]` **4-Lane Stereo `TPT-SVF`, Symplectic & `KautzModalBank` SIMD Recurrence ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** Both 4-mode `TPT-SVF` / `SymplecticModal4Lane` blocks and Stage III `KautzModalBank<4>` (`2 / 3 / 6 / 8` 4-pair blocks across `Lite..Ultra`) step Left and Right channel states together in `B::Vec4` / `StereoVec8` SIMD registers sharing loaded filter/pole vectors (`(a1, a2, a3)` or `(r_c, cos_c, sin_c)`), hoisted across `16`-frame sub-blocks inside `process_tick16_const` (`16x` fewer L1D state loads/stores, `0-ULP` parity).
 
 ### 1.2 Contractive Finite-Precision Rotor
 
 `r[dsp.op-m.rotor.contractive]`
 
-To guarantee $|u_{\mathrm{rot}, c}| \le 1.0$ in IEEE-754 `f32` without `libm` calls, hardware `FDIV`, or `FSQRT`, evaluate signed `f32` angles $-\pi < \theta < \pi$ at the control boundary as follows:
+To guarantee $|u_{\mathrm{rot}, c}| \le 1.0$ in IEEE-754 `f32` without `libm` calls, hardware `FDIV`, or `FSQRT`, evaluate signed `f32` angles $-\pi < \theta < \pi$ at the control boundary (and drive the Top-of-Frame `4`-lane `Q0.32` quadrature phasors across `0.05 Hz..20 kHz`) as follows:
 
 ```text
 +---------------------------------------------------------------------------------------------------+
-| QUADRANT-REDUCED CONTRACTIVE ROTOR & Q0.192 LFO PHASE ACCUMULATOR                         |
+| QUADRANT-REDUCED CONTRACTIVE ROTOR, 4-LANE Q0.32 AUDIO PHASORS & Q0.192 CTRL LFO                  |
 +---------------------------------------------------------------------------------------------------+
 |  1. Zero-Increment Hold: If theta == ±0.0f32 -> return (1.0f32, 0.0f32) & hold oscillator state   |
 |  2. Quadrant Reduction:  Widen |theta| to f64 -> fold across pi/2 and pi/4 into x in [0, pi/4]    |
 |  3. Horner Evaluation:   z = x^2; evaluate degree-13 S(x) and degree-14 C(x) in RNE f64 -> (c, s) |
 |  4. Adaptive ULP Guard:  If RNE_f64(c^2 + s^2) >= 1.0 -> decrement larger |c|,|s| by 1..2 f32 ULP |
+|  5. Crossbar Phasors:    4-lane u32 Q0.32 wrap (0.05 Hz..20 kHz) + degree-5 Hermite quadrature     |
 +---------------------------------------------------------------------------------------------------+
 ```
 
@@ -59,16 +71,18 @@ To guarantee $|u_{\mathrm{rot}, c}| \le 1.0$ in IEEE-754 `f32` without `libm` ca
 2. `r[dsp.op-m.rotor.quadrant-horner]` **Quadrant Reduction to $[0, \pi/4]$:** Using `pi64 = 0x400921FB54442D18`, `half_pi64 = 0x3FF921FB54442D18`, and `quarter_pi64 = 0x3FE921FB54442D18`, fold $|\theta|$ across $\pi/2$ (negating cosine) and $\pi/4$ (swapping sine/cosine) into $x \in [0, \pi/4]$. With $z = \mathrm{RNE}_{f64}(x \cdot x)$, evaluate in descending Horner order:
    $$S(x) = x \sum_{j=0}^{6} \frac{(-1)^j z^j}{(2j+1)!}, \qquad C(x) = \sum_{j=0}^{7} \frac{(-1)^j z^j}{(2j)!}$$
 3. `r[dsp.op-m.rotor.ulp-guard]` **Adaptive 1–2 ULP Norm Guard:** Round signed outputs to `f32` $(c, s)$ and evaluate $q = \mathrm{RNE}_{f64}(c^2 + s^2)$. If $q \ge 1.0$, decrement the `f32` magnitude bits of $\max(|c|, |s|)$ (choosing $c$ on a tie) by 1 ULP, and by 1 more ULP if the recomputed $q \ge 1.0$. This guarantees $|u_{\mathrm{rot}}|_2 < 1$ with component error $< 1.6 \times 10^{-7}$ and angular error $< 2.3 \times 10^{-7}\text{ rad}$.
-4. `r[dsp.op-m.rotor.q0-192-lfo]` **`Q0.192` Fixed-Point LFO Phase Accumulator:** To prevent slow LFO increments (such as $\Delta\theta = 2^{-30}\text{ rad/tick}$) from stalling at a rounded `f32` complex-state fixed point, represent LFO phase modulo $2^{192}$ and advance by the ties-to-even integer increment:
-   $$K = \left\lfloor \frac{2^{256}}{2\pi} \right\rfloor = \text{0x28be60db9391054a7f09d5f47d4d377036d8a5664f10e4107f9458eaf7aef158}, \qquad \Delta P = \mathrm{round}_{\text{even}}\big(m K / 2^{64 - e}\big)$$
-   for $|\Delta\theta| = m 2^e$, converting the top 32 phase bits directly into a unit phasor via the quadrant-reduced rotor.
-5. `r[dsp.op-m.rotor.angle-wrap-and-retune]` **Division-Free `floor_f32` Angle Wrapping & Incremental `3 kHz` 4-Lane Pole Rotation ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** Arbitrary `f32` angles wrap into $[-\pi, \pi)$ via `k = floor_f32((theta_rad + PI) * INV_TAU)` followed by `theta_rad - k * TAU` (`0 _fmodf`, `0 FDIV`, `0 while` loops). During `3 kHz` Stage I (`Stage1PreDynamics::retune_op_m_pre_3khz`) and Stage III (`StagePipeline::retune_kautz_formant_3khz`) formant/radial-gate modulation, each 4-pole block caches its host-rate `(host_op_m_cos, host_op_m_sin)` and `(kautz_host_cos, kautz_host_sin)` vectors, skips retuning when `|delta_theta - last_delta_theta| <= 1e-9 && |gate - last_gate| <= 1e-9`, and otherwise evaluates `algebraic_unit_rotor_op_m(delta_theta)` once per tick to rotate all 4 poles in `B::Vec4` via `cos_rot = host_cos * d_cos - host_sin * d_sin` and `sin_rot = host_sin * d_cos + host_cos * d_sin` with 1st-order Taylor renormalization `scale = min(1.0, 1.5 - 0.5 * (cos_rot^2 + sin_rot^2))`.
+4. `r[dsp.op-m.rotor.q0-192-lfo]` **`Q0.192` Control LFO & `4`-Lane `Q0.32` Full-Audio-Range Crossbar Phasors (`0.05 Hz..20 kHz`):**
+   - **Control-Plane `Q0.192` Accumulator:** To prevent slow `3 kHz` LFO increments (such as $\Delta\theta = 2^{-30}\text{ rad/tick}$) from stalling at a rounded `f32` complex-state fixed point, represent `Op-M[Ctrl]` LFO phase modulo $2^{192}$ and advance by the ties-to-even integer increment:
+     $$K = \left\lfloor \frac{2^{256}}{2\pi} \right\rfloor = \text{0x28be60db9391054a7f09d5f47d4d377036d8a5664f10e4107f9458eaf7aef158}, \qquad \Delta P = \mathrm{round}_{\text{even}}\big(m K / 2^{64 - e}\big)$$
+     for $|\Delta\theta| = m 2^e$, converting the top 32 phase bits directly into a unit phasor via the quadrant-reduced rotor.
+   - **Top-of-Frame `4`-Lane `Q0.32` Audio-Rate Quadrature Phasors (`0.05 Hz..20 kHz`):** Generalizing quadrature phase accumulators to `4` parallel `u32` lanes (`0.05 Hz..20 kHz`) via exact wrapping `u32` addition and degree-5 Hermite quarter-sine quadrature (`const_hermite5_quarter_sine_coeffs()`) inside `dnam-kernels` handles slow rotary/chorus sweeps, polyrhythmic tempo-synced LFO pairs (`REQ-2.5`), and audio-rate AM / ring-modulation carriers (`220 Hz` bilinear cross-products in the Top-of-Frame Causal Crossbar).
+5. `r[dsp.op-m.rotor.angle-wrap-and-retune]` **Division-Free `floor_f32` Angle Wrapping & Incremental `3 kHz` 4-Lane Pole Rotation ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** Arbitrary `f32` angles wrap into $[-\pi, \pi)$ via `k = floor_f32((theta_rad + PI) * INV_TAU)` followed by `theta_rad - k * TAU` (`0 _fmodf`, `0 FDIV`, `0 while` loops). During `3 kHz` `TPT-SVF` / `Op-M` and Stage III `KautzModalBank` (`retune_kautz_formant_3khz`) formant/radial-gate modulation, each 4-pole block caches its host-rate `(host_op_m_cos, host_op_m_sin)` and `(kautz_host_cos, kautz_host_sin)` vectors, skips retuning when `|delta_theta - last_delta_theta| <= 1e-9 && |gate - last_gate| <= 1e-9`, and otherwise evaluates `algebraic_unit_rotor_op_m(delta_theta)` once per tick to rotate all 4 poles in `B::Vec4` via `cos_rot = host_cos * d_cos - host_sin * d_sin` and `sin_rot = host_sin * d_cos + host_cos * d_sin` with 1st-order Taylor renormalization `scale = min(1.0, 1.5 - 0.5 * (cos_rot^2 + sin_rot^2))`.
 
 ### 1.3 Log-Octave Initialization & $\mathcal{H}_2$-Norm Input Scaling
 
 `r[dsp.op-m.init.log-octave-h2]`
 
-Poles are initialized logarithmically across $25\text{ Hz}\text{–}16\text{ kHz}$, with cold-path $\mathcal{H}_2$ input normalization $\gamma_m = \sqrt{1 - r_{\mathrm{high},m}^2}$ (see §4.1).
+`TPT-SVF` and Kautz modal poles are initialized logarithmically across $25\text{ Hz}\text{–}16\text{ kHz}$, with cold-path $\mathcal{H}_2$ input normalization $\gamma_m = \sqrt{1 - r_{\mathrm{high},m}^2}$ (see §4.1).
 
 ---
 
@@ -76,9 +90,9 @@ Poles are initialized logarithmically across $25\text{ Hz}\text{–}16\text{ kHz
 
 `r[dsp.op-m.hilbert.lattice]`
 
-Analytic-signal generation for Single-Sideband (SSB) frequency shifting and ring modulation (`Family 2`) uses six real-coefficient second-order all-pass sections per branch (`Q/I` quadrature phase $-90^\circ \pm 0.34^\circ$ over $20\text{ Hz}\text{–}20\text{ kHz}$ across `1×` and `4×` rate bands):
+Shared across CPU and GPU training precomputation in `#![no_std]` `dnam-kernels` as part of the **input-only `Op-P` basis**, analytic-signal generation for Single-Sideband (SSB) frequency shifting and ring modulation (`Family 2`) uses `HilbertH1Lattice6Sec`: six real-coefficient second-order all-pass sections per branch (`Q/I` quadrature phase $-90^\circ \pm 0.34^\circ$ over $20\text{ Hz}\text{–}20\text{ kHz}$ across `1×` and `4×` rate bands):
 $$H_I(z) = \prod_{k=0}^{5} \frac{\alpha_{I,k} - z^{-2}}{1 - \alpha_{I,k} z^{-2}}, \qquad H_Q(z) = z^{-1} \prod_{k=0}^{5} \frac{\alpha_{Q,k} - z^{-2}}{1 - \alpha_{Q,k} z^{-2}}$$
-With $I[n] = H_I(x)[n]$, $Q[n] = H_Q(x)[n]$, and carrier $(c[n], s[n])$, SSB output is $y_{\mathrm{ssb}}[n] = I[n]c[n] \mp Q[n]s[n]$ and ring modulation is $x[n]c[n]$.
+With $I[n] = H_I(x)[n]$, $Q[n] = H_Q(x)[n]$, and `Q0.32` carrier $(c[n], s[n])$, SSB output is $y_{\mathrm{ssb}}[n] = I[n]c[n] \mp Q[n]s[n]$ and ring modulation is $x[n]c[n]$ inside the Top-of-Frame Causal Crossbar. Because `Op-P` depends solely on dry input $x[n]$, `dnam-capture` precomputes its channels once on host CPU (`< 0.5 ms`) before uploading batches to WebGPU.
 
 ##### Hilbert Coefficient Profile `H1`
 
@@ -120,14 +134,14 @@ HILBERT-H1-ANCHORS
 
 ```mermaid
 flowchart LR
-    X["Stage I Source x[n]"] --> DC["Tracker-Only 5 Hz DC Blocker (T1)"] --> H1["H1 Analytic Pair (I[n], Q[n])"] --> Tracker["Half-Angle (cos, sin) &<br/>Toggle (f/2, f/4) Features"]
-    X --> Mix["Stage I Local Mix"] --> Next["Stage I Continuation & Sends"]
-    Tracker --> Mix
-    Tracker --> Head["Lite Feature Bus Slots 4..11"]
+    X["Router Input x[n]"] --> DC["Tracker-Only 5 Hz DC Blocker (T1)"] --> H1["HilbertH1Lattice6Sec (I[n], Q[n])"] --> Tracker["T1SubHarmonicTracker: Half-Angle (cos, sin) &<br/>Toggle (f/2, f/4) Features (Pure-f32 Guard)"]
+    X --> Crossbar["Top-of-Frame Causal Crossbar"] --> Core["4-Block Matryoshka SONA Core"]
+    Tracker --> Crossbar
+    Tracker --> Readout["Direct-Register VarPro Readout"]
     X --> SSB["Independent Unconditioned H1 for SSB"]
 ```
 
-The tracker profile `T1` applies a local passband-normalized one-pole `5 Hz` DC blocker before its `H1` analytic pair (`0x3F7FD51F` pole and `0x3F7FEA90` gain at `48 kHz`):
+The input-only `Op-P` tracker profile `T1` (`T1SubHarmonicTracker` in `dnam-kernels`) applies a local passband-normalized one-pole `5 Hz` DC blocker before its `H1` analytic pair (`0x3F7FD51F` pole and `0x3F7FEA90` gain at `48 kHz`):
 $$d[n] = \alpha_{\mathrm{trk}}\big(x[n]-x[n-1]\big)+R_{\mathrm{trk}}d[n-1], \qquad R_{\mathrm{trk,eff}} = \mathrm{RN}_{32}\left(R_{\mathrm{trk,ref}}^{48000/f_{\mathrm{eff}}}\right), \qquad \alpha_{\mathrm{trk,eff}} = \mathrm{RN}_{32}\left(\frac{1+R_{\mathrm{trk,eff}}}{2}\right)$$
 
 ```text
@@ -158,23 +172,23 @@ Effective rate (Hz) | First midpoint m | Last midpoint m | Maximum comparisons
 1. **Exponent-Split Pre-Scaling:** For $m = \max(|I|, |Q|) > 0$, scale $(I, Q)$ by $2^{-\min(E, 126)}$ (where $E$ is the unbiased exponent of $m$, pre-multiplying subnormals by $2^{24}$ under gradual underflow) so the scaled squared norm $r^2$ lies in $[1, 32)$.
 2. **Two-Step Newton `rsqrt` (`0 FSQRT`, `0 FDIV`):** Seed $\rho_0$ from `0x5F3759DF` and iterate $\rho_{j+1} = \rho_j(1.5 - (0.5 r^2 \rho_j)\rho_j)$ twice. Form $u_{\mathrm{re}} = \mathrm{clamp}(I_{\mathrm{sc}}\rho_2, -1, 1)$, $u_{\mathrm{im}} = \mathrm{clamp}(Q_{\mathrm{sc}}\rho_2, -1, 1)$, and envelope $\hat{A} = r^2 \rho_2 \cdot 2^{\min(E, 126)}$.
 3. **Exact Zero Handling:** When $I = Q = 0$, emit zero sub-octave features, invalidate the previous phasor, and hold the toggle/sheet signs without inventing a crossing on resumption.
-4. `r[dsp.op-m.tracker.stereo-batching]` **Interleaved Stereo `H1` Lattice & Batched `T1` `rsqrt_pos_pair_nr2` Execution ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [`ADR-0021`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md)):** `HilbertH1Lattice6Sec::step_stereo` packs the 4 real all-pass branches `[I_L, Q_L, I_R, Q_R]` into a single 4-lane `B::Vec4` register across all 6 cascaded sections (`1×` SIMD FMA chain per stereo frame instead of `4×` scalar loops), while `T1SubHarmonicTracker::step_analytic_stereo` and Stage I `Env-SVF` normalize paired stereo channels via in-register `SimdVec4::rsqrt_pos_pair_nr2` (backed by `vrsqrteq_f32`/`vrsqrtsq_f32` on `aarch64`) alongside `B::rsqrt_nr2_pair_f32` (`0` `FSQRT`, `0` GPR spills).
+4. `r[dsp.op-m.tracker.stereo-batching]` **Interleaved Stereo `H1` Lattice, Pure-`f32` Branch-Cut Guard & Batched `rsqrt_pos_pair_nr2` (`dnam-kernels`, [`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [`ADR-0022`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)):** `HilbertH1Lattice6Sec::step_stereo` packs the 4 real all-pass branches `[I_L, Q_L, I_R, Q_R]` into a single 4-lane `B::Vec4` register across all 6 cascaded sections (`1×` SIMD FMA chain per stereo frame instead of `4×` scalar loops). `T1SubHarmonicTracker` uses a pure-`f32` branch-cut guard (`0` `f64` instructions in `dnam-kernels` so runtime/shader kernels stay `100%` `32-bit`) alongside paired stereo normalization via in-register `SimdVec4::rsqrt_pos_pair_nr2` (`0` `FSQRT`, `0` GPR spills).
 
 ### 3.2 Discrete Toggle & Half-Angle Sheet
 
 `r[dsp.op-m.tracker.toggle-sheet]`
 
 1. **Unnormalized `I` Rising-Edge Dividers ($q_1, q_2 \in \lbrace -1, +1 \rbrace$):** Classify rising crossings $E_1[n] = \mathbb{I}(I[n-1] \le 0 < I[n])$ directly from the **unnormalized** `H1` $I[n]$ branch using a stored `prev_i_nonpositive` flag (preventing FTZ flush of normalized $u_{\mathrm{re}}$ from inventing or missing crossings). Toggle $q_1[n] = q_1[n-1] \cdot (1 - 2E_1[n])$ (`f₀/2` square) and toggle $q_2[n]$ when $q_1$ transitions `-1 -> +1` (`f₀/4` square).
-2. **Half-Angle Sheet Sign ($s_{\mathrm{sheet}} \in \lbrace -1, +1 \rbrace$):** For consecutive normalized phasors $p, u$ with $D = p_{\mathrm{re}}u_{\mathrm{im}} - p_{\mathrm{im}}u_{\mathrm{re}}$, flip $s_{\mathrm{sheet}}$ when (`p_im >= 0`, `u_im < 0`, `D > 0`) or (`p_im < 0`, `u_im >= 0`, `D < 0`), holding $s_{\mathrm{sheet}}$ on near-origin chords ($p \cdot u < 0$ and $|D| \le 2^{-18}$).
+2. **Half-Angle Sheet Sign ($s_{\mathrm{sheet}} \in \lbrace -1, +1 \rbrace$):** For consecutive normalized `f32` phasors $p, u$ with $D = p_{\mathrm{re}}u_{\mathrm{im}} - p_{\mathrm{im}}u_{\mathrm{re}}$ (evaluated under the pure-`f32` branch-cut guard), flip $s_{\mathrm{sheet}}$ when (`p_im >= 0`, `u_im < 0`, `D > 0`) or (`p_im < 0`, `u_im >= 0`, `D < 0`), holding $s_{\mathrm{sheet}}$ on near-origin chords ($p \cdot u < 0$ and $|D| \le 2^{-18}$).
 3. **Smooth Half-Angle Quadratures & Square Features:** With $h = (1 + |u_{\mathrm{re}}|)/2$, $\rho = \mathrm{rsqrt}_{\mathrm{NR2}}(h)$, $v_{\mathrm{large}} = \mathrm{clamp}(h\rho, 0, 1)$, and $v_{\mathrm{small}} = \mathrm{clamp}(|u_{\mathrm{im}}|(0.5\rho), 0, 1)$, assign $(v_{\cos}, v_{\sin}) = (v_{\mathrm{large}}, v_{\mathrm{small}})$ for $u_{\mathrm{re}} \ge 0$ and swap otherwise:
    $$w_{\cos} = \hat{A} s_{\mathrm{sheet}} v_{\cos}, \qquad w_{\sin} = \hat{A} s_{\mathrm{sheet}} \sigma_+(u_{\mathrm{im}}) v_{\sin}, \qquad w_{\mathrm{square}} = \hat{A} q_1, \qquad w_{\mathrm{quarter}} = \hat{A} q_2$$
-   Route these four features per channel into the Stage I direct-register readout ([router §7](router_and_stages_topology.md#7-unified-256-d-4-tier-kronecker-output-head)) and into the Stage I local mix $y_a = g_{d,a}x_a + g_{c,a}w_{\cos,a} + g_{s,a}w_{\sin,a} + g_{1,a}w_{\mathrm{square},a} + g_{2,a}w_{\mathrm{quarter},a}$ without duplicating the direct source. Present trackers advance on every sample even when locally muted.
+   Route these four features per channel into the Top-of-Frame Causal Crossbar (`0.0` weight when unused) and into the direct-register `VarPro` readout ([router §7](router_and_stages_topology.md#7-unified-256-d-4-tier-kronecker-output-head)). Present input-only `Op-P` trackers advance on every sample even when locally weighted to `0.0`.
 
 ### 3.3 Forward-Faithful Training
 
 `r[dsp.op-m.tracker.training]`
 
-Training executes the exact runtime toggle, sheet, silence, and ambiguity rules in the forward pass, pairing hard forward outputs with a surrogate backward gradient.
+Because `Op-P` (`HilbertH1Lattice6Sec` + pure-`f32` `T1SubHarmonicTracker`) depends strictly on dry input $x[n]$, training precomputes the exact runtime toggle, sheet, silence, and ambiguity tracks once on host CPU (`< 0.5 ms`) before uploading batches to WebGPU or stepping CPU `VarPro` solvers.
 
 ---
 
@@ -184,19 +198,19 @@ Training executes the exact runtime toggle, sheet, silence, and ambiguity rules 
 
 `r[dsp.op-m.stage3.kautz-allocation]`
 
-Stage III models speaker cabinet early reflections and modal tails (`REQ-1.2`) using independent L/R early FIR filters ($K_{\mathrm{early}} = 16 / 32 / 48 / 64$ taps/ch) and a shared-pole Kautz modal bank ($M_{\mathrm{kautz}} = 4 / 8 / 12 / 16$ complex conjugate pole pairs, `8 / 16 / 24 / 32` real poles) driven at fixed reference onset $K_{\mathrm{tail}} = 16$ samples ($x_a[n-16]$ at `48 kHz`):
+Stage III models speaker cabinet early reflections and resonant modal tails (`REQ-1.2`) using contiguous L/R early FIR filters ($K_{\mathrm{early}} = 32 / 48 / 96 / 128$ taps/ch across `Lite / Full / Pro / Ultra`) and a shared-pole `KautzModalBank<4>` ($M_{\mathrm{kautz}} = 8 / 12 / 24 / 32$ complex conjugate pole pairs = `16 / 24 / 48 / 64` real poles, grouped in `2 / 3 / 6 / 8` 4-mode SoA blocks) driven at fixed reference onset $K_{\mathrm{tail}} = 16$ samples ($x_a[n-16]$ at `48 kHz`). Both FIR tap vectors and `KautzModalBank<4>` `(lambda_re, lambda_im, b_gamma, c_re, c_im, s_re, s_im)` state stay resident in SIMD vector registers across all `16` host stereo frames (`32` @ `2x` OS) inside `process_tick16_const` (`16x` fewer L1D state loads/stores):
 $$s_{m,a}[n] = \lambda_m[n] s_{m,a}[n-1] + b_{\gamma,m} x_a[n - K_{\mathrm{tail}}], \qquad y_{\mathrm{tail},a}[n] = \sum_{m=1}^{M_{\mathrm{kautz}}} 2\mathrm{Re}\big(c_{m,a} s_{m,a}[n]\big)$$
 $$H_{\mathrm{cab},a}(z) = \sum_{k=0}^{K_{\mathrm{early}}-1} b_{\mathrm{early},a}[k] z^{-k} + z^{-K_{\mathrm{tail}}} \sum_{m=1}^{M_{\mathrm{kautz}}} \left(\frac{b_{\gamma,m} c_{m,a}}{1 - \lambda_m z^{-1}} + \frac{b_{\gamma,m} \overline{c_{m,a}}}{1 - \overline{\lambda_m} z^{-1}}\right), \qquad K_{\mathrm{tail}} = 16$$
 
 ```text
 +---------------------------------------------------------------------------------------------------+
-| STAGE III SEPARATE 64B-ALIGNED EARLY FIR & SHARED-POLE KAUTZ MODAL SLICES                         |
+| STAGE III CONTIGUOUS 64B-ALIGNED EARLY FIR & SHARED-POLE KAUTZ MODAL SLICES (32..128 / 8..32)    |
 +---------------------------------------------------------------------------------------------------+
-|  Tier          | Early FIR (L/R Taps)        | Shared Kautz Poles (8-Vec SoA) | State RAM (L+R)   |
-|  Lite (Arena 0)| +16 taps/ch = 128 B (2 CL)  | +4 pairs (1 blk) = 128 B (2 CL)| 128 B FIR +  64 B |
-|  Full (Arena 1)| +16 taps/ch = 128 B (2 CL)  | +4 pairs (1 blk) = 128 B (2 CL)| 256 B FIR + 128 B |
-|  Pro  (Arena 2)| +16 taps/ch = 128 B (2 CL)  | +4 pairs (1 blk) = 128 B (2 CL)| 384 B FIR + 192 B |
-|  Ultra(Arena 3)| +16 taps/ch = 128 B (2 CL)  | +4 pairs (1 blk) = 128 B (2 CL)| 512 B FIR + 256 B |
+|  Tier          | Cum. Early FIR (L/R Taps) | Cum. Shared Kautz (8-Vec SoA) | State RAM (L+R)     |
+|  Lite (Arena 0)| 32 taps/ch  ( 256 B taps) |  8 pairs (2 blks =   256 B)   | 256 B FIR + 128 B   |
+|  Full (Arena 1)| 48 taps/ch  ( 384 B taps) | 12 pairs (3 blks =   384 B)   | 384 B FIR + 192 B   |
+|  Pro  (Arena 2)| 96 taps/ch  ( 768 B taps) | 24 pairs (6 blks =   768 B)   | 768 B FIR + 384 B   |
+|  Ultra(Arena 3)|128 taps/ch  (1,024 B taps)| 32 pairs (8 blks = 1,024 B)   |1,024 B FIR + 512 B  |
 +---------------------------------------------------------------------------------------------------+
 ```
 
@@ -227,8 +241,8 @@ $$r_{\text{eff}, m} = \min\Big(r_m, \max\big(0.25, 0.9950 - 0.15 |\Delta\theta_m
 
 `r[dsp.op-m.stage3.pole-extraction]`
 
-1. Logarithmically pre-allocate initial cabinet eigenmode frequencies across $40\text{–}4500\text{ Hz}$.
-2. Fit shared pole dynamics against both channel targets and solve independent complex readouts $c_{m,L}, c_{m,R}$ while preserving lower-tier prefixes.
+1. Logarithmically pre-allocate initial cabinet eigenmode frequencies across $40\text{–}4500\text{ Hz}$ (`OMP` orthogonal matching pursuit initialization).
+2. Refine continuous Kautz pole radii and angles $(r_m, \theta_m)$ via `i32` Ozaki Gauss-Newton and `L-BFGS` polish beyond discrete dictionary quantization (`|Delta bESR| < 0.01 dB/epoch`) with shared pole dynamics across both channels and independent complex readouts $c_{m,L}, c_{m,R}$ while preserving lower-tier prefixes.
 
 ---
 
@@ -236,4 +250,4 @@ $$r_{\text{eff}, m} = \min\Big(r_m, \max\big(0.25, 0.9950 - 0.15 |\Delta\theta_m
 
 `r[dsp.op-m.ctrl.engine]`
 
-At each control boundary, `Op-M[Ctrl]` advances the two quadrature LFO complex states (`float32x4_t` vector 0) and the 4-band block-peak ballistic envelope detector (`Low`, `Mid`, `High`, `Aux Key` in `float32x4_t` vector 1), while maintaining the `Q64`/`Q32` tempo-sync accumulator in dedicated state ([`parametric_control_bus.md` §1.1](parametric_control_bus.md#11-op-mctrl-3-khz-4-lane-symplectic-complex--ballistic-engine)).
+At each control boundary, `Op-M[Ctrl]` advances the quadrature LFO complex states (`float32x4_t` vector 0) and the 4-band block-peak ballistic envelope detector (`Low`, `Mid`, `High`, `Aux Key` in `float32x4_t` vector 1), while maintaining the `Q64`/`Q32` tempo-sync accumulator in dedicated state ([`parametric_control_bus.md` §1.1](parametric_control_bus.md#11-op-mctrl-3-khz-4-lane-symplectic-complex--ballistic-engine)).

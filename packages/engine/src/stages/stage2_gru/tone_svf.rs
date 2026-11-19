@@ -191,8 +191,10 @@ impl V3InterBlockToneSvfState {
         );
         let hp_l = in_l - self.k_damp * v1_l - v2_l;
         let hp_r = in_r - self.k_damp * v1_r - v2_r;
-        let y_l = self.dry_eff * in_l + self.lp_eff * v2_l + self.bp_eff * v1_l + self.hp_eff * hp_l;
-        let y_r = self.dry_eff * in_r + self.lp_eff * v2_r + self.bp_eff * v1_r + self.hp_eff * hp_r;
+        let y_l =
+            self.dry_eff * in_l + self.lp_eff * v2_l + self.bp_eff * v1_l + self.hp_eff * hp_l;
+        let y_r =
+            self.dry_eff * in_r + self.lp_eff * v2_r + self.bp_eff * v1_r + self.hp_eff * hp_r;
         [
             if y_l == 0.0 {
                 0.0

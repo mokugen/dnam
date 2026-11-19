@@ -2,7 +2,7 @@
 id: spec.sec.watermark-marketplace
 title: "Forensic Watermarking, 3-Stage Anti-Cloning Gate & Marketplace Edge Infrastructure"
 status: canonical
-version: "1.0.0"
+version: "3.0.0"
 domain: security
 rule_prefixes:
   - "r[sec.watermark."
@@ -15,29 +15,29 @@ requirements:
   - REQ-8.7
 adrs:
   - ADR-0009
-  - ADR-0021
+  - ADR-0022
 ---
 
 # Forensic Watermarking, 3-Stage Anti-Cloning Gate & Marketplace Edge Infrastructure
 
-Complementing Cryptographic Provenance & Hardware Enclave DRM ([`provenance_and_enclave_drm.md`](provenance_and_enclave_drm.md), [`ADR-0009`](../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md), [`ADR-0021`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md)) and fulfilling [`../../requirements/system_goals_and_requirements.md` §9 (`REQ-8.5`–`REQ-8.7`)](../../requirements/system_goals_and_requirements.md#9-goal-8--model-provenance-hardware-drm-forensic-watermarking--marketplace-security), this specification defines **Pillar 3 (Dual-Mechanism Buyer Watermarking)**, **Pillar 4 (3-Stage Anti-Cloning Ingestion Gate)**, the **Commercial Storefront Platform (`.dnam-prev`)**, and the **Cloudflare + TiDB Edge Infrastructure**.
+Complementing Cryptographic Provenance & Hardware Enclave DRM ([`provenance_and_enclave_drm.md`](provenance_and_enclave_drm.md), [`ADR-0009`](../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md), [`ADR-0022`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)) and fulfilling [`../../requirements/system_goals_and_requirements.md` §9 (`REQ-8.5`–`REQ-8.7`)](../../requirements/system_goals_and_requirements.md#9-goal-8--model-provenance-hardware-drm-forensic-watermarking--marketplace-security), this specification defines **Pillar 3 (Dual-Mechanism Buyer Watermarking for `SONA` `v3.0`)**, **Pillar 4 (3-Stage Anti-Cloning Ingestion Gate)**, the **Commercial Storefront Platform (`.dnam-prev`)**, and the **Cloudflare + TiDB Edge Infrastructure**.
 
 ---
 
 ## 1. Pillar 3: Forensic Traitor Tracing (`< 0.2 ms` Dual-Mechanism Buyer Watermarking)
 
-### 1.1 Mechanism A — Reciprocal Scaling Gauge (Ideal Real-Arithmetic Invariance)
+### 1.1 Mechanism A — Reciprocal Scaling Gauge & Odd-Symmetric `SONA` Sign-Flip Gauge
 
-1. `r[sec.watermark.reciprocal-gauge]` **Per-Mode `Op-M` Reciprocal Scaling Gauge & `0-ULP` Odd-Activation `GRU` Hidden-Lane Sign-Flip Gauge:** For each shared Stage III Kautz mode $m$ ([`../dsp/op_m_modal_kautz.md` §4.1](../dsp/op_m_modal_kautz.md#41-stage-iii-architecture--tier-allocation)), scale the shared input coefficient and reciprocally compensate **both** Left and Right complex readouts within the mode's owning tier slice (`0.5 <= kappa_buyer <= 2.0`):
+1. `r[sec.watermark.reciprocal-gauge]` **Per-Mode `Op-M` Reciprocal Scaling Gauge & `0-ULP` Odd-Symmetric `SONA` (`PolyADAA1` / `ParaLRU`) Hidden-Lane Sign-Flip Gauge:** For each shared Stage III Kautz mode $m$ ([`../dsp/op_m_modal_kautz.md` §4.1](../dsp/op_m_modal_kautz.md#41-stage-iii-architecture--tier-allocation), `8 / 12 / 24 / 32` cumulative pairs across `Lite / Full / Pro / Ultra`), scale the shared input coefficient and reciprocally compensate **both** Left and Right complex readouts within the mode's owning tier slice (`0.5 <= kappa_buyer <= 2.0`):
    $$b_{\gamma,m}^{(\text{buyer})} = \eta_m b_{\gamma,m}^{(\text{master})}, \qquad c_{m,a}^{(\text{buyer})} = \frac{c_{m,a}^{(\text{master})}}{\eta_m}, \qquad a \in \lbrace L, R \rbrace$$
-   In parallel, Stage II applies the **`0-ULP` Odd-Activation `GRU` Hidden-Lane Sign-Flip Gauge**: choosing a buyer-keyed sign vector $s_i \in \lbrace -1, +1 \rbrace$ over each active hidden lane (`12 / 16 / 20 / 24` ch per channel, `2^8..2^48` prefix-safe key states) and flipping row $i$ of candidate weights, row/column $i$ of recurrent candidate matrices, Zero-DC bias shift $b_{n,i}$, and corresponding downstream inter-block / linear `VarPro` readout weights preserves `0.000000 ULP` forward invariance algebraically because `NR2` Padé $\tanh(-x) = -\tanh(x)$ and $h_{\text{eq}} = 0$, surviving lossless `strip_container_to_tier(Lite..Ultra)`.
+   In parallel, the `SONA` core applies the **`0-ULP` Odd-Symmetric `SONA` (`PolyADAA1` / `ParaLRU`) Hidden-Lane Sign-Flip Gauge**: choosing a buyer-keyed sign vector $s_i \in \lbrace -1, +1 \rbrace$ over each active hidden lane (`16 / 24 / 32 / 40` lanes per channel across `Lite / Full / Pro / Ultra`, `2^16..2^40` prefix-safe key states) and flipping crossbar input/feedback weights, inter-block `4×4` spatial tile rows/columns, odd-symmetric `PolyADAA1` / `C^2` wavefolder lane signs, `ParaLRU` lane channels, and downstream `VarPro` linear readout (`W_readout`) columns preserves `0.000000 ULP` forward invariance algebraically because odd-symmetric `PolyADAA1` satisfies $g(-x) = -g(x)$ with $h_{\text{eq}} = +0.0$ and decoupled `ParaLRU` channels commute with sign conjugation, surviving lossless `strip_container_to_tier(Lite..Ultra)` while keeping `Arena 0` controls and signatures intact.
 2. `r[sec.watermark.orthogonal-gauge]` **Block-Diagonal SVD Control Subspace Orthogonal Rotation Gauge ($\mathbf{Q}_{\text{buyer}} \in SO(4) \oplus SO(4)$) & Layer 2 Pole-Angle Phase Coding (`apply_phase_coding_watermark`):** Rotates the head-coordinate subspace consistently across the main projections, interaction mixer, and direct Mid/Side readout modes while preserving lower-tier prefixes and Euclidean trust-region norms. Complementing Layer 1, **Layer 2 Kautz & Pole-Angle Phase Coding** (`PHASE_CODING_MAX_RAD = 8.726646e-4`, `apply_phase_coding_watermark`, `score_phase_coding_arena`, `score_phase_coding_blackbox`) injects a buyer-keyed phase perturbation $\lvert\Delta\theta_m\rvert \le 8.726646 \times 10^{-4}\text{ rad}$ ($\le 0.05^\circ$, `0.00 dB` pole-radius change) via `"DNAM-WM-PHASE-V1"` into each tier's active Stage III Kautz pole angles (`STAGE3_KAUTZ_BASES`, surviving black-box re-distillation while remaining `100%` invariant under `quantize_pole_angle_1e2` `10^{-2} rad` grid).
 
 ### 1.2 Mechanism B — Coupled Spread-Spectrum Tardos Watermarking (`EMR` Envelopes)
 
 `r[sec.watermark.tardos-code]`
 
-Embeds a buyer-specific spread-spectrum Tardos codeword over each retained tier's linear readout / non-backbone parameters (`REQ-8.5`) while leaving nonlinear `GRU` state trajectories unperturbed and deriving per-tier Arcsine bias $p_i \in [\delta, 1 - \delta]$ via `HMAC-SHA256(shared_seed, tier_idx)` weighted by `compute_emr_masked_tardos_envelopes` so retained-tier codewords survive `strip_container_to_tier`:
+Embeds a buyer-specific spread-spectrum Tardos codeword over each retained tier's linear `VarPro` readout (`W_readout`) / non-backbone parameters (`REQ-8.5`) while leaving nonlinear `SONA` (`TPT-SVF` / `ParaLRU` / `PolyADAA1`) state trajectories unperturbed and deriving per-tier Arcsine bias $p_i \in [\delta, 1 - \delta]$ via `HMAC-SHA256(shared_seed, tier_idx)` weighted by `compute_emr_masked_tardos_envelopes` so retained-tier codewords survive `strip_container_to_tier`:
 $$W_{\text{ro},i}^{(\text{buyer})} = W_{\text{ro},i}^{(\text{master})} + \epsilon \sigma_{W,i} c_i^{(\text{buyer})}$$
 
 ### 1.3 License-Scoped Seed Derivation
@@ -74,7 +74,7 @@ Watermark Profile Digest ("DNAM-WM-PROFILE-V1"):
 
 ```mermaid
 flowchart TD
-    Upload["Uploaded .dnam Model"] --> StageA["Stage A (< 0.1 ms): Cryptographic & Provenance Gate<br/>Verify Ed25519 Signatures & Dataset SHA-256"]
+    Upload["Uploaded v3.0 .dnam Model"] --> StageA["Stage A (< 0.1 ms): Cryptographic & Provenance Gate<br/>Verify Ed25519 Signatures & Dataset SHA-256"]
     StageA --> StageB["Stage B: Prefix-Composable Structural Fingerprint<br/>Compare Retained Tier-Local Components"]
     StageB --> Match{"Fingerprint Match?"}
     Match -- "Yes" --> Trace["Pillar 3 Forensic Extractor: Decode Buyer Watermark"]
@@ -95,10 +95,10 @@ flowchart TD
 
 `r[sec.anticlone.stage3-fingerprint]`
 
-For each retained tier (`Lite..Ultra`), form the gauge-invariant Stage III component from that tier's 16 left FIR taps, 16 right FIR taps, and 7 `f64` values per added shared Kautz pole pair (`60 / 120 / 180 / 240` cumulative values across `Lite / Full / Pro / Ultra`, `4 / 8 / 12 / 16` pole pairs, [`dnam_binary_format.md` §2.4](../containers/dnam_binary_format.md#24-tier-local-projection--stage-iii-slice-layout)):
+For each retained tier (`Lite..Ultra`), form the gauge-invariant Stage III component from that tier's incremental L/R early FIR taps (`32 / +16 / +48 / +32`, cumulative `32 / 48 / 96 / 128`) and 7 `f64` values per added shared Kautz pole pair (`8 / +4 / +12 / +8` pairs, cumulative `8 / 12 / 24 / 32` pole pairs; `120 / 180 / 360 / 480` cumulative values across `Lite / Full / Pro / Ultra`, [`dnam_binary_format.md` §2.4](../containers/dnam_binary_format.md#24-tier-local-projection--stage-iii-slice-layout)):
 
 ```text
-[b_early_L[0..15], b_early_R[0..15], (r_low, dr, theta, b_gamma*c_re_l, b_gamma*c_im_l, b_gamma*c_re_r, b_gamma*c_im_r) x M_tier]
+[b_early_L[0..K_fir-1], b_early_R[0..K_fir-1], (r_low, dr, theta, b_gamma*c_re_l, b_gamma*c_im_l, b_gamma*c_re_r, b_gamma*c_im_r) x M_tier]
 ```
 
 Because `b_gamma * c_re` and `b_gamma * c_im` cancel the Mechanism A multiplier $\eta_m$ in exact arithmetic—and `extract_structural_hash_224d` quantizes each Kautz pole angle $\theta_m$ onto a $10^{-2}\text{ rad}$ grid via `quantize_pole_angle_1e2`—this vector is invariant under both reciprocal gauge watermarking and black-box re-capture solver jitter.
@@ -112,10 +112,10 @@ Because `b_gamma * c_re` and `b_gamma * c_im` cancel the Mechanism A multiplier 
 ```mermaid
 flowchart TD
     subgraph EdgeWorker ["Cloudflare Edge Worker (< 1 ms Stateless On-Demand Synthesis)"]
-        Vault["Private Master Vault (.dnam Master)"] --> Strip["1. Physically Omit Full, Pro & Ultra Arenas"]
+        Vault["Private Master Vault (v3.0 .dnam Master)"] --> Strip["1. Physically Omit Full, Pro & Ultra Arenas<br/>(Retain Arena 0 Self-Contained Lite Controls)"]
         Strip --> Bound["2. Apply Preset-Anchored Control Bounds / Rank-r Subspace"]
         Bound --> Disp["3. Apply Stage-Fused Static Phase Dispersion & Session Watermark"]
-        Disp --> Emit["Emit Ephemeral .dnam-prev (container_kind: 'preview')"]
+        Disp --> Emit["Emit Ephemeral v3.0 .dnam-prev (container_kind: 'preview')"]
     end
 
     subgraph Browser ["WebAudio WASM SIMD Runtime (Client Browser)"]
@@ -127,12 +127,12 @@ flowchart TD
 
 | Protection Layer | Structural & Mathematical Specification (`REQ-8.7`) |
 | :--- | :--- |
-| **1. Dedicated Preview Type & High-Tier Omission** | Sets `container_kind: "preview"` (rejected by DAW/pedal hosts via `DnamError::PreviewContainerRejected`) and physically omits `Full`, `Pro`, and `Ultra` arenas and projection slices. |
+| **1. Dedicated Preview Type & High-Tier Omission** | Sets `container_kind: "preview"` (`"architecture": "sona"`, `v3.0`, rejected by DAW/pedal hosts via `DnamError::PreviewContainerRejected`) and physically omits `Full`, `Pro`, and `Ultra` arenas while retaining `Arena 0` self-contained `Lite` controls. |
 | **2. Bounded Preview Controls & Fixed-Anchor Rank-`r` Containment** | • **Single control (`P = 1`):** Exposes a bounded continuous window `v ∈ [v₀ - δ, v₀ + δ] ∩ [0, 1]` (`0 < δ ≤ 0.15`) or at most one additional observed safe switch option.<br/>• **Multiple controls (`P ≥ 2`):** Fixes a master-scoped reference anchor `a` and rank-`r` (`r < D_cont`) direction matrix `B`, permitting only settings `a + B t` across all published previews while locking discrete switches. |
-| **3. Stateless On-Demand Generation (`< 1 ms`)** | Synthesizes `.dnam-prev` payloads at the CDN edge directly from the master's `Lite` prefix with zero per-session storage multiplication. |
-| **4. Stage-Fused Static Phase Dispersion** | Perturbs Stage III/IV phase response (`|20 log₁₀ |H_disp(e^{jω})|| ≤ 0.05 dB`, `τ_g^(demo)(ω) ≠ τ_g^(master)(ω)`) while preserving stability bounds. |
+| **3. Stateless On-Demand Generation (`< 1 ms`)** | Synthesizes `.dnam-prev` payloads at the CDN edge directly from the master's `Arena 0` `Lite` prefix (`strip_container_to_tier(Lite)`) with zero per-session storage multiplication. |
+| **4. Stage-Fused Static Phase Dispersion** | Perturbs Stage III/IV phase response (`∣20 log₁₀ ∣H_disp(e^{jω})∣∣ ≤ 0.05 dB`, `τ_g^(demo)(ω) ≠ τ_g^(master)(ω)`) while preserving stability bounds. |
 | **5. Dynamic Synthetic-Sweep & Impulse Input Guard** | Monitors `3 kHz` crest factor and zero-crossing regularity (`0 FDIV`, `0 FSQRT`), smoothly engaging phase flutter on synthetic probe stimuli while preserving natural musical playing. |
-| **6. Black-Box Acoustic Watermarking & Session Binding** | Embeds HMAC-keyed sparse micro-echoes (`y_wm[n] = y[n] + ∑ β_i y[n - d_i]`, `|β_i| ≤ 10^(-42/20)`, `d_i ∈ [120, 800]` samples) alongside session lease metadata. |
+| **6. Black-Box Acoustic Watermarking & Session Binding** | Embeds HMAC-keyed sparse micro-echoes (`y_wm[n] = y[n] + ∑ β_i y[n - d_i]`, `∣β_i∣ ≤ 10^(-42/20)`, `d_i ∈ [120, 800]` samples) alongside session lease metadata. |
 
 $$\gamma_{\text{crest}}[k] = \frac{\max_{n \in [0..15]} |x[16k + n]|}{p_{\text{rms}}[k] + \epsilon}, \qquad \sigma_{\text{zcr}}^2[k] = \frac{1}{M_z} \sum_{i=1}^{M_z} (z_i - \bar{z})^2$$
 $$g_{\text{poison}}[k] = g_{\text{poison}}[k-1] + \alpha_{\text{engage}} \big(1.0 - g_{\text{poison}}[k-1]\big), \qquad \Delta\tau_{\text{flutter}}[n] = g_{\text{poison}}[k] \cdot A_{\text{flutter}} \sin(\omega_{\text{flutter}} n + \phi_k)$$
@@ -166,7 +166,7 @@ erDiagram
     OEM_VENDORS ||--o{ HARDWARE_DEVICES : "attests via V2 OemDeviceCertificate"
     MODELS ||--|| MODEL_MANIFESTS : "1:1 manifest & fingerprint index"
     MODELS ||--o{ LICENSES : "licensed via"
-    LICENSES }o--o{ HARDWARE_DEVICES : "seals .dnam-seal (DNSL) for"
+    LICENSES }o--o{ HARDWARE_DEVICES : "seals v3.0 .dnam-seal (DNSL) for"
 ```
 
 | Logical Entity | Primary Key & Indexing Strategy | Core Attributes & Cryptographic Invariants |

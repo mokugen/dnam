@@ -6,7 +6,7 @@ date: "2026-11-06"
 supersedes: []
 superseded_by: null
 specs:
-  - "../specs/architecture/tora_architecture.md"
+  - "../specs/architecture/sona_architecture.md"
   - "../specs/dsp/parametric_control_bus.md"
   - "../specs/sdks/typescript_sdk.md"
 requirements:
@@ -18,7 +18,7 @@ requirements:
 
 # ADR-0015: Real-Time Host Concurrency: 3-Lane SPSC Control Ingress, `AcceptedStateShadow`, Wait-Free Telemetry Seqlock & Safe Engine Swap
 
-This record documents the architectural decision to introduce `dnam_engine::host` (`packages/engine/src/host.rs`) as a `#![no_std]` + `alloc`, 100% safe Rust (`#[forbid(unsafe_code)]`) real-time concurrency layer providing a **3-Lane SPSC Control Ingress (`SpscControlRing`)**, **synchronous producer-side validation and state shadowing (`AcceptedStateShadow`)**, a **wait-free `AtomicU64` seqlock (`TelemetryCell`)**, a **ping-pong non-blocking hot swap (`RealtimeEngineSwap`)**, and a unified **`DnamHostHandle`** shared across the Rust engine, desktop Studio (`packages/studio/`), and TypeScript 7 (`N-API v10` / `WASM`) SDK (`packages/js/`), specified normatively in [`../specs/architecture/tora_architecture.md`](../specs/architecture/tora_architecture.md), [`../specs/dsp/parametric_control_bus.md`](../specs/dsp/parametric_control_bus.md), and [`../specs/sdks/typescript_sdk.md`](../specs/sdks/typescript_sdk.md).
+This record documents the architectural decision to introduce `dnam_engine::host` (`packages/engine/src/host.rs`) as a `#![no_std]` + `alloc`, 100% safe Rust (`#[forbid(unsafe_code)]`) real-time concurrency layer providing a **3-Lane SPSC Control Ingress (`SpscControlRing`)**, **synchronous producer-side validation and state shadowing (`AcceptedStateShadow`)**, a **wait-free `AtomicU64` seqlock (`TelemetryCell`)**, a **ping-pong non-blocking hot swap (`RealtimeEngineSwap`)**, and a unified **`DnamHostHandle`** shared across the Rust engine, desktop Studio (`packages/studio/`), and TypeScript 7 (`N-API v10` / `WASM`) SDK (`packages/js/`), specified normatively in [`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md), [`../specs/dsp/parametric_control_bus.md`](../specs/dsp/parametric_control_bus.md), and [`../specs/sdks/typescript_sdk.md`](../specs/sdks/typescript_sdk.md).
 
 ---
 

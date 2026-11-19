@@ -361,11 +361,8 @@ fn unlock_standard_lane(blk: &mut V3GruBlockF64, b: usize, dst: usize, st: &Bloc
 }
 
 fn has_prev_reset_vca(m: &V3MatryoshkaOptF64) -> bool {
-    (1..NUM_GRU_BLOCKS).any(|b| {
-        (0..4).any(|dst| {
-            (0..4).any(|src| m.blocks[b].w_prev_r[dst][src].abs() > 0.5)
-        })
-    })
+    (1..NUM_GRU_BLOCKS)
+        .any(|b| (0..4).any(|dst| (0..4).any(|src| m.blocks[b].w_prev_r[dst][src].abs() > 0.5)))
 }
 
 fn unlock_split_or_vca_lane(blk: &mut V3GruBlockF64, b: usize, dst: usize) {
@@ -418,8 +415,8 @@ fn unlock_split_or_vca_lane(blk: &mut V3GruBlockF64, b: usize, dst: usize) {
         blk.k_sag[dst] = 0.0;
         blk.k_quad[dst] = 0.0;
     } else {
-        let has_vca_reset = (0..4)
-            .any(|s| blk.w_prev_r[src_l][s].abs() > 0.5 || blk.w_rec_r[src_l][s].abs() > 0.5);
+        let has_vca_reset =
+            (0..4).any(|s| blk.w_prev_r[src_l][s].abs() > 0.5 || blk.w_rec_r[src_l][s].abs() > 0.5);
         let scale = SPLIT_SLOPES[g_idx - 1];
         let alt = if has_vca_reset || ((dst + b) & 1) == 0 {
             1.0

@@ -2,7 +2,7 @@
 id: spec.arch.quality
 title: "Psychoacoustic Quality Standard (bESR) & 4-Tier Benchmarks"
 status: canonical
-version: "1.0.0"
+version: "3.0.0"
 domain: architecture
 rule_prefixes:
   - "r[qual."
@@ -14,14 +14,14 @@ requirements:
 adrs:
   - ADR-0003
   - ADR-0016
-  - ADR-0021
+  - ADR-0022
 ---
 
 # Psychoacoustic Quality Standard (`bESR`) & 4-Tier Benchmarks
 
 This specification defines the **perceptual quality evaluation framework (`bESR`, `MR-IIR`, `LTAS` spectral tilt, and `SegESR`), device-agnostic noise-floor rules, quiet vs. muted stem classification, and 4-tier (`Lite` / `Full` / `Pro` / `Ultra`) acceptance benchmarks** for **Dynamic Neural Audio Modeler (DNAM)**.
 
-For the overarching system goals and hardware budgets, see [`../../requirements/system_goals_and_requirements.md`](../../requirements/system_goals_and_requirements.md). For why plain broadband `ESR` and fixed pre-emphasis fail, see [`../../adr/0003-band-balanced-besr-and-noise-qualification.md`](../../adr/0003-band-balanced-besr-and-noise-qualification.md). The relationship between band-specific fitting statistics, noise-floor clipping, and actual output certification is described in [`../training/four_stage_pipeline.md` §2.3](../training/four_stage_pipeline.md#23-stage-c--nested-4-tier-schur-complement--selective-mm-cholesky-solve).
+For the overarching system goals and hardware budgets, see [`../../requirements/system_goals_and_requirements.md`](../../requirements/system_goals_and_requirements.md). For why plain broadband `ESR` and fixed pre-emphasis fail, see [`../../adr/0003-band-balanced-besr-and-noise-qualification.md`](../../adr/0003-band-balanced-besr-and-noise-qualification.md); for `SONA` tier sizing and headroom-maximized optimization, see [`sona_architecture.md` §2.2](sona_architecture.md#22-hardware--dsp-benchmark-summary) and [`../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md). The relationship between band-specific fitting statistics, noise-floor clipping, and actual output certification is described in [`../training/four_stage_pipeline.md` §2.3](../training/four_stage_pipeline.md#23-stage-c--nested-4-tier-schur-complement--selective-mm-cholesky-solve).
 
 ---
 
@@ -216,7 +216,9 @@ Each tier (`Lite`, `Full`, `Pro`, `Ultra`) and output channel is evaluated ident
 
 | DNAM Tier | Target Grade | Noise-Qualified Composite Acceptance | Per-Band Requirement (`LF` / `MF` / `HF` or `≤ NoiseFloor + 1.0 dB`) | Max Absolute Noise-Adjusted LTAS (`dB`) | Multi-Control Unseen Acceptance | Primary Application |
 | :--- | :--- | :---: | :--- | :---: | :---: | :--- |
-| **`Lite` (`[1,1,1] 12ch @ 1x, 16 FIR, K=4, M=4`)** | **Mix-Ready / Live Grade** | **`≤ -18 dB`** (`-18 to -23 dB`) | `LF ≤ -23 dB`, `MF ≤ -20 dB`, `HF ≤ -15 dB` | **`≤ 0.75 dB`** | **`≤ -16 dB`** | High-density live pedalboard chains & browser previews |
-| **`Full` (`[2,1,1] 16ch @ 1x, 32 FIR, K=8, M=8`)** | **True Studio Quality** | **`≤ -23 dB`** (`-23 to -30 dB`) | `LF ≤ -27 dB`, `MF ≤ -25 dB`, **`HF ≤ -20 dB`** | **`≤ 0.35 dB`** | **`≤ -21 dB`** | Default studio & stage flagship block |
-| **`Pro` (`[2,2,1] 20ch @ 2x, 48 FIR, K=12, M=8`)** | **Mastering / Reference Grade** | **`≤ -30 dB`** (`-30 to -34 dB`) | `LF ≤ -34 dB`, `MF ≤ -31 dB`, `HF ≤ -26 dB` | **`≤ 0.15 dB`** | **`≤ -27 dB`** | Mastering & critical solo reference rigs |
-| **`Ultra` (`[3,2,1] 24ch @ 2x, 64 FIR, K=16, M=16`)** | **Unconstrained Workstation Max** | **`≤ -34 dB`** | `LF ≤ -38 dB`, `MF ≤ -35 dB`, `HF ≤ -30 dB` | **`≤ 0.10 dB`** | **`≤ -32 dB`** | Archival workstation & `4×` oversampled offline bounce |
+| **`Lite` (`LiteSpec`: `[1,1,1,1]` `16`-lane / `4` `TPT-SVF` @ `1x` `PolyADAA1` or `[1,1,1,0]` @ `2x`, `32` FIR, `K=8`, `1` quad)** | **Mix-Ready / Live Grade** | **`≤ -18 dB`** (`-18 to -23 dB`) | `LF ≤ -23 dB`, `MF ≤ -20 dB`, `HF ≤ -15 dB` | **`≤ 0.75 dB`** | **`≤ -16 dB`** | High-density live pedalboard chains & browser previews |
+| **`Full` (`FullSpec`: `[2,2,1,1]` `24`-lane / `6` `TPT-SVF` @ `2x`, `48` FIR, `K=12`, `2` quads)** | **True Studio Quality** | **`≤ -23 dB`** (`-23 to -30 dB`) | `LF ≤ -27 dB`, `MF ≤ -25 dB`, **`HF ≤ -20 dB`** | **`≤ 0.35 dB`** | **`≤ -21 dB`** | Default studio & stage flagship block |
+| **`Pro` (`ProSpec`: `[3,2,2,1]` `32`-lane / `8` `TPT-SVF` @ `2x`, `96` FIR, `K=24`, `3–4` quads)** | **Mastering / Reference Grade** | **`≤ -30 dB`** (`-30 to -34 dB`) | `LF ≤ -34 dB`, `MF ≤ -31 dB`, `HF ≤ -26 dB` | **`≤ 0.15 dB`** | **`≤ -27 dB`** | Mastering & critical solo reference rigs |
+| **`Ultra` (`UltraSpec`: `[4,3,2,1]` `40`-lane / `10–12` `TPT-SVF` @ `2x`, `128` FIR, `K=32`, `4` quads)** | **Unconstrained Workstation Max** | **`≤ -34 dB`** | `LF ≤ -38 dB`, `MF ≤ -35 dB`, `HF ≤ -30 dB` | **`≤ 0.10 dB`** | **`≤ -32 dB`** | Archival workstation & `4×` oversampled offline bounce |
+
+1. `r[qual.tiers.floors-not-stopping-criteria]` **Qualification Floors Are Not Solver Stopping Criteria (`REQ-2.1`, `REQ-5.2`):** The composite `bESR` acceptance thresholds (`-18 / -23 / -30 / -34 dB`), per-band requirements, `LTAS` tilt limits (`≤ 0.75 / 0.35 / 0.15 / 0.10 dB`), and multi-control unseen thresholds (`-16 / -21 / -27 / -32 dB`) are minimum qualification **failure floors**, never optimization stopping criteria or `ThresholdStop` early-exit triggers. `SONA` maximizes per-tier perceptual fidelity inside the `Gate 0b` locked compile-time `const` `SonaTierSpec` hardware and `64 KiB` L1D budgets (`ref[arch.tiers.maximize-quality-within-budget]`, [`sona_architecture.md` §2.2](sona_architecture.md#22-hardware--dsp-benchmark-summary)) via asymptotic `BestUntilDiminishingReturns` convergence (`∣ΔbESR∣ < 0.01 dB/epoch` across full `2.0–2.5 s` capsules, wide `64–128`-seed exploration, and continuous `Kautz` pole / `Op-T` lag refinement), subject to adjacent-tier monotone non-regression (`Ultra ≤ Pro ≤ Full ≤ Lite`).

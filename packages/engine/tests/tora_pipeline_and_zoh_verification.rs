@@ -1,6 +1,6 @@
 //! Empirical TORA End-to-End Pipeline, ZOH Multi-Rate, `4x` Bounce, and Lifecycle Verification (`Tests 8H, 8I`).
 //!
-//! Canonical Reference: `docs/specs/architecture/tora_architecture.md` and `docs/specs/containers/dnam_binary_format.md`.
+//! Canonical Reference: `docs/specs/architecture/sona_architecture.md` and `docs/specs/containers/dnam_binary_format.md`.
 //!
 //! Verifies:
 //! - `Test 8H & 8I` (`verify[container.dnam.tier-prefix]`, `verify[arch.bounce.oversampling]`): 64-byte binary framing, cache-line tier offsets
@@ -443,7 +443,7 @@ fn test_engine_constructors_calibration_roles_and_tempo_sync() {
 mod arch_spec_integration {
     // Specification Verification Suite: Phase 9 — TORA System Architecture Integration.
     //
-    // Verifies all 35 engine-scope rules in `docs/specs/architecture/tora_architecture.md`:
+    // Verifies all 35 engine-scope rules in `docs/specs/architecture/sona_architecture.md`:
     // - `verify[arch.pillars.dual-space-control]`
     // - `verify[arch.pillars.dual-rate-plane]`
     // - `verify[arch.pillars.cp1-projections]`

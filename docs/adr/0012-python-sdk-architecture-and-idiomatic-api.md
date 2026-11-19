@@ -7,7 +7,7 @@ supersedes: null
 superseded_by: ADR-0018
 specs:
   - "../specs/architecture/project_and_documentation_quality.md"
-  - "../specs/architecture/tora_architecture.md"
+  - "../specs/architecture/sona_architecture.md"
   - "../specs/containers/dnam_binary_format.md"
 requirements:
   - REQ-4.1

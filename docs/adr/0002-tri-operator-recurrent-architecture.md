@@ -1,12 +1,12 @@
 ---
 id: ADR-0002
 title: "Tri-Operator Recurrent Architecture (TORA) & 4-Tier Slimmable Hierarchy"
-status: accepted
+status: superseded
 supersedes:
   - ADR-0001
-superseded_by: null
+superseded_by: ADR-0022
 specs:
-  - docs/specs/architecture/tora_architecture.md
+  - docs/specs/architecture/sona_architecture.md
   - docs/specs/dsp/router_and_stages_topology.md
 requirements:
   - REQ-1.2
@@ -19,7 +19,10 @@ requirements:
 
 # ADR-0002: Tri-Operator Recurrent Architecture (`TORA`) & 4-Tier Slimmable Hierarchy
 
-This record (superseding [`ADR-0001`](0001-superseded-tri-physics-prototype.md)) justifies the canonical [`tora_architecture.md`](../specs/architecture/tora_architecture.md) and [`router_and_stages_topology.md`](../specs/dsp/router_and_stages_topology.md) specifications.
+> [!NOTE]
+> **Superseded by [`ADR-0022`](0022-sona-state-space-operator-and-webgpu-architecture.md):** `TORA` (`v2`/`v3`) has been superseded by the **State-Space Operator Neural Architecture (`SONA` `v3.0`)** in [`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md). This historical record archives the original `TORA` rationale and comparison against grey-box Multi-FX approximations.
+
+This record (historically superseding [`ADR-0001`](0001-superseded-tri-physics-prototype.md) and now superseded by [`ADR-0022`](0022-sona-state-space-operator-and-webgpu-architecture.md)) documented the former `TORA` choices for [`sona_architecture.md`](../specs/architecture/sona_architecture.md) and [`router_and_stages_topology.md`](../specs/dsp/router_and_stages_topology.md).
 
 ## 1. Context: Five Structural Bottlenecks in Conventional Neural Audio
 

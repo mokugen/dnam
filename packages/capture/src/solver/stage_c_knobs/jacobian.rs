@@ -292,8 +292,7 @@ impl GnSolveCtx<'_> {
                         dot_l += self.eff_jac.lite_jac_r[k][t] * r_lr;
                     }
                 }
-                rhs[k][0] = 0.5 * (dot_u + grad_out[0][k])
-                    + 0.5 * (dot_l + grad_out[1][k])
+                rhs[k][0] = 0.5 * (dot_u + grad_out[0][k]) + 0.5 * (dot_l + grad_out[1][k])
                     - self.ridge * f64::from(best_targets[k]);
             }
             let Ok(sol) = solve_uplo_u_cholesky_2ch(&gram_step, &rhs, self.ridge) else {
@@ -403,8 +402,8 @@ pub(super) fn solve_point_stage_targets(
         }
     }
     let eps = 1.0e-12_f64;
-    let rho_wave =
-        0.5 * (dot_wu / ((e_wet * e_star_u).sqrt() + eps)) + 0.5 * (dot_wl / ((e_wet * e_star_l).sqrt() + eps));
+    let rho_wave = 0.5 * (dot_wu / ((e_wet * e_star_u).sqrt() + eps))
+        + 0.5 * (dot_wl / ((e_wet * e_star_l).sqrt() + eps));
     let e_star = 0.5 * e_star_u + 0.5 * e_star_l;
     let oct_tot = (0.5 * ((e_wet + eps) / (e_star + eps)).log2()) as f32;
 
@@ -420,8 +419,7 @@ pub(super) fn solve_point_stage_targets(
     if heterodyne_uncorrelated || allpass_dispersive {
         let lo9 = (oct_tot - TIGHT_INCOHERENT_MARGIN_OCT)
             .clamp(STAGE_TARGET_BOUNDS[9].0, STAGE_TARGET_BOUNDS[9].1);
-        let hi9 = (oct_tot + TIGHT_INCOHERENT_MARGIN_OCT)
-            .clamp(lo9, STAGE_TARGET_BOUNDS[9].1);
+        let hi9 = (oct_tot + TIGHT_INCOHERENT_MARGIN_OCT).clamp(lo9, STAGE_TARGET_BOUNDS[9].1);
         bounds[9] = (lo9, hi9);
         for idx in [10_usize, 12, 13, 14] {
             bounds[idx] = (-TIGHT_INCOHERENT_MARGIN_OCT, TIGHT_INCOHERENT_MARGIN_OCT);

@@ -3,7 +3,7 @@ id: ADR-0004
 title: "Unclamped 6-Step PolyADAA Rail Crossing, C² Wavefolder & Fixed-Hertz ZOH Bitcrusher"
 status: superseded
 supersedes: []
-superseded_by: ADR-0021
+superseded_by: ADR-0022
 specs:
   - docs/specs/dsp/op_n_commuted_cascade.md
 requirements:
@@ -12,6 +12,9 @@ requirements:
 ---
 
 # ADR-0004: Unclamped 6-Step `PolyADAA` Rail Crossing, `C²` Wavefolder & Fixed-Hertz ZOH Bitcrusher
+
+> [!NOTE]
+> **Superseded by [`ADR-0022`](0022-sona-state-space-operator-and-webgpu-architecture.md)** (originally superseded by [`ADR-0021`](0021-unified-matryoshka-gru-and-direct-register-stages.md)). `SONA` `v3.0` retains the $C^2$ wavefolder and fixed-hertz ZOH bitcrusher formulations while migrating `PolyADAA1` rail-crossing evaluation to pure-`f32` batched `rcp_pos_quad_nr2`.
 
 This record justifies the nonlinear operator formulations in [`../specs/dsp/op_n_commuted_cascade.md`](../specs/dsp/op_n_commuted_cascade.md) fulfilling [`REQ-1.1`, `REQ-6.2`](../requirements/system_goals_and_requirements.md).
 

@@ -290,9 +290,7 @@ mod tests {
 
         // 3+ knob sweep on long capture (> CORESET_A5_FRAMES_48K) extracts 4 interior windows normally
         let n_long = CORESET_A5_FRAMES_48K + 1_024;
-        let dry_long: Vec<[f32; 2]> = (0..n_long)
-            .map(|i| dry[i % dry.len()])
-            .collect();
+        let dry_long: Vec<[f32; 2]> = (0..n_long).map(|i| dry[i % dry.len()]).collect();
         let wet_long: Vec<[f32; 2]> = dry_long
             .iter()
             .enumerate()
