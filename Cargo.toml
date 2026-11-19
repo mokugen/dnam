@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["packages/engine", "packages/capture", "packages/fixtures", "packages/js", "packages/studio"]
-default-members = ["packages/engine", "packages/capture", "packages/fixtures", "packages/studio"]
+members = ["packages/kernels", "packages/engine", "packages/capture", "packages/fixtures", "packages/js", "packages/studio"]
+default-members = ["packages/kernels", "packages/engine", "packages/capture", "packages/fixtures", "packages/studio"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ license = "LicenseRef-DNAM-1.0.0"
 repository = "https://github.com/dnam-project/dnam"
 
 [workspace.dependencies]
+dnam-kernels = { path = "packages/kernels", default-features = false }
 dnam-engine = { path = "packages/engine", default-features = true }
 dnam-capture = { path = "packages/capture", default-features = false }
 dnam-fixtures = { path = "packages/fixtures" }
@@ -47,6 +48,7 @@ tauri-plugin-process = "2"
 unsafe_op_in_unsafe_fn = "deny"
 missing_debug_implementations = "warn"
 rust_2018_idioms = { level = "deny", priority = -1 }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("spirv"))'] }
 
 [workspace.lints.clippy]
 all = { level = "deny", priority = -1 }
@@ -67,6 +69,9 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 2
 
+[profile.dev.package.dnam-kernels]
+opt-level = 3
+
 [profile.dev.package.dnam-engine]
 opt-level = 3
 
@@ -79,6 +84,9 @@ opt-level = 3
 [profile.test]
 opt-level = 2
 codegen-units = 16
+
+[profile.test.package.dnam-kernels]
+opt-level = 3
 
 [profile.test.package.dnam-engine]
 opt-level = 3
@@ -96,6 +104,9 @@ codegen-units = 16
 debug = "line-tables-only"
 strip = "none"
 incremental = false
+
+[profile.cov.package.dnam-kernels]
+opt-level = 3
 
 [profile.cov.package.dnam-engine]
 opt-level = 3

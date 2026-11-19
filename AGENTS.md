@@ -19,7 +19,8 @@
 | Package / Domain | Package `AGENTS.md` & Contributing | Canonical Documentation (SSOT) |
 | :--- | :--- | :--- |
 | **Guardrails (`tests/`)** | [`README.md`](README.md), [`tests/AGENTS.md`](tests/AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) | [`index.md`](docs/index.md), [`project_and_documentation_quality.md`](docs/specs/architecture/project_and_documentation_quality.md) |
-| **Engine (`packages/engine/`, `kernels` Ph.2)** | [`engine/AGENTS.md`](packages/engine/AGENTS.md), [`engine/CONTRIBUTING.md`](packages/engine/CONTRIBUTING.md) | [`sona_architecture.md`](docs/specs/architecture/sona_architecture.md), [`router_and_stages_topology.md`](docs/specs/dsp/router_and_stages_topology.md) |
+| **Kernels (`packages/kernels/`)** | [`kernels/AGENTS.md`](packages/kernels/AGENTS.md), [`kernels/CONTRIBUTING.md`](packages/kernels/CONTRIBUTING.md) | [`sona_architecture.md`](docs/specs/architecture/sona_architecture.md), [`op_n_commuted_cascade.md`](docs/specs/dsp/op_n_commuted_cascade.md) |
+| **Engine (`packages/engine/`)** | [`engine/AGENTS.md`](packages/engine/AGENTS.md), [`engine/CONTRIBUTING.md`](packages/engine/CONTRIBUTING.md) | [`sona_architecture.md`](docs/specs/architecture/sona_architecture.md), [`router_and_stages_topology.md`](docs/specs/dsp/router_and_stages_topology.md) |
 | **Capture (`packages/capture/`)** | [`capture/AGENTS.md`](packages/capture/AGENTS.md), [`capture/CONTRIBUTING.md`](packages/capture/CONTRIBUTING.md) | [`project_container_format.md`](docs/specs/containers/project_container_format.md), [`four_stage_pipeline.md`](docs/specs/training/four_stage_pipeline.md) |
 | **JS (`packages/js/`)** | [`js/AGENTS.md`](packages/js/AGENTS.md), [`js/CONTRIBUTING.md`](packages/js/CONTRIBUTING.md) | [`typescript_sdk.md`](docs/specs/sdks/typescript_sdk.md), [`dnam_binary_format.md`](docs/specs/containers/dnam_binary_format.md) |
 | **UI (`packages/ui/`)** | [`ui/AGENTS.md`](packages/ui/AGENTS.md), [`ui/CONTRIBUTING.md`](packages/ui/CONTRIBUTING.md) | [`control_space_audit.md`](docs/specs/training/control_space_audit.md), [`watermarking_and_marketplace.md`](docs/specs/security/watermarking_and_marketplace.md) |
@@ -28,6 +29,4 @@
 
 ## 4. Maintaining `AGENTS.md` & Documentation
 
-- **Root `README.md` Audience:** Keep [`README.md`](README.md) focused on musicians and OEM/SDK overviews; keep setup and specs in [`CONTRIBUTING.md`](CONTRIBUTING.md), package `README.md`s, and [`docs/`](docs/index.md).
-- **Zero Duplication:** Keep `AGENTS.md` files strictly as routing maps (`< 5,000` B root, `< 2,500` B scoped).
-- **Single Source of Truth:** Document equations, rules (`r[...]`), and workflows in canonical `docs/` per [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md).
+- See [`CONTRIBUTING.md` §5](CONTRIBUTING.md#5-maintaining-agentsmd--progressive-disclosure-documentation) and [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) for `AGENTS.md` byte budgets (`< 5,000` B / `< 2,500` B), SSOT rule routing, and [`README.md`](README.md) audience scope.

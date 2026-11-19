@@ -1102,6 +1102,7 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     expect(modRsFiles).toEqual([]);
 
     const proptestDirs = [
+      path.join(PACKAGES_DIR, "kernels", "src"),
       path.join(PACKAGES_DIR, "engine", "src", "math"),
       path.join(PACKAGES_DIR, "engine", "src", "operators"),
       path.join(PACKAGES_DIR, "engine", "src", "stages"),
@@ -1527,6 +1528,7 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     }
 
     const strictForbidRootSet = new Set<string>([
+      "packages/kernels/src/lib.rs",
       "packages/fixtures/src/lib.rs",
       "packages/capture/src/lib.rs",
       "packages/studio/rust/lib.rs",
@@ -1534,7 +1536,7 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       "packages/studio/build.rs",
       "packages/js/build.rs",
     ]);
-    for (const safePkg of ["fixtures", "capture", "studio"]) {
+    for (const safePkg of ["kernels", "fixtures", "capture", "studio"]) {
       for (const subDir of ["src/bin", "rust/bin", "tests", "benches", "examples"]) {
         for (const p of walkFilesByExtensions(
           path.join(PACKAGES_DIR, safePkg, subDir),
@@ -1562,7 +1564,7 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       /\bunsafe\s*(?:\{|fn\b|impl\b|trait\b|extern\b)|(?<!r#)\bunsafe\s*\(|#\s*!?\s*\[\s*unsafe\s*\(/;
     const unsafeBlockOrItemOnlyRe = /\bunsafe\s*(?:\{|fn\b|impl\b|trait\b|extern\b)/;
     const unsafeViolations: string[] = [];
-    for (const safePkg of ["fixtures", "capture", "studio"]) {
+    for (const safePkg of ["kernels", "fixtures", "capture", "studio"]) {
       for (const rsFile of walkFilesByExtensions(
         path.join(PACKAGES_DIR, safePkg),
         new Set([".rs"]),
@@ -1595,6 +1597,7 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
   function checkPackageLineCeilings(): void {
     const lineCeilingViolations: string[] = [];
     const strictLinePackages: Array<{ pkg: string; exts: Set<string> }> = [
+      { pkg: "kernels", exts: new Set([".rs"]) },
       { pkg: "fixtures", exts: new Set([".rs"]) },
       { pkg: "capture", exts: new Set([".rs"]) },
       { pkg: "ui", exts: new Set([".ts", ".tsx"]) },
@@ -1667,8 +1670,20 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     }
   }
 
+  function checkKernelsManifestZeroDeps(): void {
+    const kernelsCargo = fs.readFileSync(path.join(PACKAGES_DIR, "kernels", "Cargo.toml"), "utf8");
+    const depsSec = parseTomlSections(kernelsCargo).find((s) => s.header === "dependencies");
+    expect(
+      (depsSec?.body ?? "").trim(),
+      "packages/kernels/Cargo.toml [dependencies] must stay empty (0 external crates)",
+    ).toBe("");
+    const kernelsMoon = fs.readFileSync(path.join(PACKAGES_DIR, "kernels", "moon.yml"), "utf8");
+    expect(kernelsMoon).toMatch(/^dependsOn:\s*\[\]\s*$/m);
+  }
+
   function checkFixturesAndCaptureCargoBoundaries(): void {
     checkFixturesManifestStrictness();
+    checkKernelsManifestZeroDeps();
     expect(fs.existsSync(path.join(PACKAGES_DIR, "trainer"))).toBe(false);
     expect(
       fs.existsSync(path.join(DOCS_DIR, "specs", "containers", "checkpoint_and_cache_format.md")),
@@ -1687,7 +1702,7 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       /^dependsOn:\s*\[\]\s*$/m,
     );
     const engineMoon = fs.readFileSync(path.join(PACKAGES_DIR, "engine", "moon.yml"), "utf8");
-    expect(engineMoon).toMatch(/^dependsOn:\s*\[\]\s*$/m);
+    expect(engineMoon).toMatch(/^dependsOn:\s*(?:\[\]|\n\s*-\s*"?kernels"?\s*)$/m);
     expect(engineMoon).not.toContain("fixtures");
 
     const captureCargo = fs.readFileSync(path.join(PACKAGES_DIR, "capture", "Cargo.toml"), "utf8");
@@ -1746,7 +1761,7 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     for (const cargoManifest of [
       path.join(REPO_ROOT, "Cargo.toml"),
       path.join(REPO_ROOT, "Cargo.lock"),
-      ...["engine", "fixtures", "capture", "studio", "js"].map((pkg) =>
+      ...["kernels", "engine", "fixtures", "capture", "studio", "js"].map((pkg) =>
         path.join(PACKAGES_DIR, pkg, "Cargo.toml"),
       ),
     ]) {
@@ -1758,7 +1773,7 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
         "dialoguer",
       );
     }
-    for (const runtimePkg of ["engine", "capture", "studio", "js"]) {
+    for (const runtimePkg of ["kernels", "engine", "capture", "studio", "js"]) {
       const pkgManifest = path.join(PACKAGES_DIR, runtimePkg, "Cargo.toml");
       const manifestText = fs.readFileSync(pkgManifest, "utf8");
       expect(manifestText, `${relPath(pkgManifest)} must not depend on realfft`).not.toContain(
@@ -1797,6 +1812,7 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     const pathOrIncludeFixturesRe =
       /(?:#\s*\[\s*path\s*=|include(?:_str|_bytes)?\s*!)\s*\(?[^;\n]*fixtures/;
     for (const scanDir of [
+      path.join(PACKAGES_DIR, "kernels"),
       path.join(PACKAGES_DIR, "capture", "src"),
       path.join(PACKAGES_DIR, "engine"),
       path.join(PACKAGES_DIR, "studio"),
@@ -1948,15 +1964,64 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     }
   }
 
+  function advanceNonSpirvSkip(
+    line: string,
+    trimmed: string,
+    state: { depth: number; awaitingBrace: boolean },
+  ): boolean {
+    if (trimmed.includes('cfg(not(target_arch = "spirv"))')) {
+      state.awaitingBrace = true;
+      return true;
+    }
+    if (!state.awaitingBrace && state.depth <= 0) {
+      return false;
+    }
+    const opens = (line.match(/\{/g) ?? []).length;
+    const closes = (line.match(/\}/g) ?? []).length;
+    state.depth += opens - closes;
+    if (opens > 0 || trimmed.endsWith(";")) {
+      state.awaitingBrace = false;
+    }
+    return true;
+  }
+
+  function scanKernelsFileFor64BitOr128Bit(rsPath: string, violations: string[]): void {
+    const lines = fs.readFileSync(rsPath, "utf8").split("\n");
+    const forbiddenTypeRe = /\b(?:f64|u64|i64|u128|i128)\b/;
+    const skipState = { depth: 0, awaitingBrace: false };
+
+    for (let idx = 0; idx < lines.length; idx++) {
+      const line = lines[idx] ?? "";
+      const trimmed = line.trim();
+      const nextTrimmed = (lines[idx + 1] ?? "").trim();
+      const isTestsMod = nextTrimmed.startsWith("mod ") || nextTrimmed.startsWith("pub mod ");
+      if (trimmed.startsWith("#[cfg(test)]") && isTestsMod) {
+        break;
+      }
+      if (advanceNonSpirvSkip(line, trimmed, skipState)) {
+        continue;
+      }
+      if (!trimmed.startsWith("//") && !trimmed.startsWith("*") && forbiddenTypeRe.test(line)) {
+        violations.push(`${relPath(rsPath)}:${idx + 1}: ${trimmed}`);
+      }
+    }
+  }
+
   // verify[repo.code.realtime-disassembly-audit]
   // verify[arch.simd.zero-stall-lowering]
   it("test_engine_realtime_no_libm_or_float_rem_euclid", () => {
     const engineSrcDir = path.join(PACKAGES_DIR, "engine", "src");
+    const kernelsSrcDir = path.join(PACKAGES_DIR, "kernels", "src");
     const forbiddenCallRe =
       /\.(?:rem_euclid|sin|cos|tan|asin|acos|atan|atan2|sinh|cosh|tanh|exp|exp2|ln|log2|log10|powf|powi|sqrt|cbrt|hypot)\s*\(/;
     const violations: string[] = [];
-    for (const rsPath of walkFilesByExtensions(engineSrcDir, new Set([".rs"]))) {
-      scanEngineFileForForbiddenCalls(rsPath, forbiddenCallRe, violations);
+    for (const srcDir of [engineSrcDir, kernelsSrcDir]) {
+      for (const rsPath of walkFilesByExtensions(srcDir, new Set([".rs"]))) {
+        scanEngineFileForForbiddenCalls(rsPath, forbiddenCallRe, violations);
+      }
+    }
+    for (const rsPath of walkFilesByExtensions(kernelsSrcDir, new Set([".rs"]))) {
+      scanKernelsFileFor64BitOr128Bit(rsPath, violations);
     }
     expect(violations).toEqual([]);
   });
@@ -1964,19 +2029,21 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
   // verify[repo.code.explicit-simd-and-coverage]
   it("test_engine_no_coverage_off_or_simd_macros", () => {
     const engineSrcDir = path.join(PACKAGES_DIR, "engine", "src");
-    const mathSrcDir = path.join(engineSrcDir, "math");
+    const kernelsSrcDir = path.join(PACKAGES_DIR, "kernels", "src");
     const violations: string[] = [];
 
-    for (const rsPath of walkFilesByExtensions(engineSrcDir, new Set([".rs"]))) {
-      const content = fs.readFileSync(rsPath, "utf8");
-      if (content.includes("coverage(off)")) {
-        violations.push(`${relPath(rsPath)}: contains forbidden coverage(off)`);
+    for (const srcDir of [engineSrcDir, kernelsSrcDir]) {
+      for (const rsPath of walkFilesByExtensions(srcDir, new Set([".rs"]))) {
+        if (fs.readFileSync(rsPath, "utf8").includes("coverage(off)")) {
+          violations.push(`${relPath(rsPath)}: contains forbidden coverage(off)`);
+        }
       }
     }
-    for (const rsPath of walkFilesByExtensions(mathSrcDir, new Set([".rs"]))) {
-      const content = fs.readFileSync(rsPath, "utf8");
-      if (content.includes("macro_rules!")) {
-        violations.push(`${relPath(rsPath)}: contains forbidden macro_rules! in math/`);
+    for (const simdDir of [path.join(engineSrcDir, "math"), path.join(kernelsSrcDir, "simd")]) {
+      for (const rsPath of walkFilesByExtensions(simdDir, new Set([".rs"]))) {
+        if (fs.readFileSync(rsPath, "utf8").includes("macro_rules!")) {
+          violations.push(`${relPath(rsPath)}: contains forbidden macro_rules! in SIMD modules`);
+        }
       }
     }
     expect(violations).toEqual([]);

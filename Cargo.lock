@@ -1356,6 +1356,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "dnam-kernels"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "dnam-studio"
 version = "0.1.0"
 dependencies = [

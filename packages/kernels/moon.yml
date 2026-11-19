@@ -1,0 +1,203 @@
+$schema: "https://moonrepo.dev/schemas/project.json"
+
+id: "kernels"
+language: "rust"
+layer: "library"
+stack: "systems"
+tags:
+  - "rust"
+  - "dsp"
+  - "simd"
+  - "webgpu"
+
+project:
+  name: "dnam-kernels"
+  description: "Shared #![no_std], zero-dependency 32-bit SONA DSP, associative scan, and Ozaki kernels for CPU SIMD and WebGPU"
+
+dependsOn: []
+
+tasks:
+  format:
+    type: "run"
+    command: "cargo"
+    args:
+      - "fmt"
+      - "--package"
+      - "dnam-kernels"
+    options:
+      cache: false
+      runInCI: false
+    tags:
+      - "format"
+
+  format-check:
+    command: "cargo"
+    args:
+      - "fmt"
+      - "--package"
+      - "dnam-kernels"
+      - "--"
+      - "--check"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+    tags:
+      - "quality"
+      - "format"
+
+  lint:
+    command: "cargo"
+    args:
+      - "clippy"
+      - "--package"
+      - "dnam-kernels"
+      - "--all-targets"
+      - "--"
+      - "-D"
+      - "warnings"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+    options:
+      mutex: "cargo"
+    tags:
+      - "quality"
+      - "lint"
+
+  typecheck:
+    command: "cargo"
+    args:
+      - "check"
+      - "--package"
+      - "dnam-kernels"
+      - "--all-targets"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+    options:
+      mutex: "cargo"
+    tags:
+      - "quality"
+      - "typecheck"
+
+  build:
+    type: "build"
+    command: "cargo"
+    args:
+      - "build"
+      - "--package"
+      - "dnam-kernels"
+      - "--release"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+    options:
+      mutex: "cargo"
+    tags:
+      - "build"
+
+  test:
+    command: "cargo"
+    args:
+      - "test"
+      - "--package"
+      - "dnam-kernels"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+    options:
+      mutex: "cargo"
+    tags:
+      - "test"
+
+  coverage:
+    type: "run"
+    script: |
+      set -euo pipefail
+      cargo llvm-cov clean --profraw-only
+      python3 - <<'PY'
+      import concurrent.futures, glob, json, os, re, subprocess, sys, time
+      repo = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+      sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
+      host = next(
+          line.split(": ", 1)[1]
+          for line in subprocess.check_output(["rustc", "-vV"], text=True).splitlines()
+          if line.startswith("host: ")
+      )
+      llvm_bin = os.path.join(sysroot, "lib", "rustlib", host, "bin")
+      llvm_profdata = os.path.join(llvm_bin, "llvm-profdata")
+      llvm_cov = os.path.join(llvm_bin, "llvm-cov")
+      prof_dir = os.path.join(repo, "target", "llvm-cov-target")
+      os.makedirs(prof_dir, exist_ok=True)
+      res = subprocess.run(
+          [
+              "cargo", "llvm-cov", "--profile", "cov", "--package", "dnam-kernels",
+              "--lib", "--tests", "--no-report", "--", "--exact", "__none__",
+          ],
+          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+      )
+      if res.returncode != 0:
+          print(res.stdout, file=sys.stderr)
+          sys.exit(res.returncode)
+      for old in glob.glob(os.path.join(prof_dir, "dnam-krn-*.profraw")):
+          os.remove(old)
+      bins = []
+      for raw in re.findall(r"\(([^)\s]+/out/[^)\s]+)\)", res.stdout):
+          p = raw if os.path.isabs(raw) else os.path.join(repo, raw)
+          if p not in bins and os.path.exists(p):
+              bins.append(p)
+      if not bins:
+          sys.exit("No instrumented dnam-kernels test binaries found")
+      env = os.environ.copy()
+      env["LLVM_PROFILE_FILE"] = os.path.join(prof_dir, "dnam-krn-%p-%8m.profraw")
+      t0 = time.monotonic()
+      def run_bin(b):
+          name = os.path.basename(b)
+          p = subprocess.run([b, "--test-threads=4"], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          return name, p.returncode, p.stdout
+      with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(bins))) as ex:
+          for name, rc, out in ex.map(run_bin, bins):
+              if rc != 0:
+                  print(f"FAILED {name}:\n{out}", file=sys.stderr)
+                  sys.exit(rc)
+      profraws = glob.glob(os.path.join(prof_dir, "dnam-krn-*.profraw"))
+      if not profraws:
+          sys.exit("No dnam-krn profraw files generated")
+      profdata = os.path.join(prof_dir, "dnam-kernels.profdata")
+      subprocess.run([llvm_profdata, "merge", "-sparse", *profraws, "-o", profdata], check=True)
+      obj_args = [bins[0], *(f"--object={b}" for b in bins[1:])]
+      src_dir = os.path.join(repo, "packages", "kernels", "src")
+      subprocess.run([llvm_cov, "report", f"--instr-profile={profdata}", *obj_args, "--sources", src_dir], check=True)
+      exp = subprocess.check_output([llvm_cov, "export", "--summary-only", f"--instr-profile={profdata}", *obj_args, "--sources", src_dir], text=True)
+      pct = json.loads(exp)["data"][0]["totals"]["lines"]["percent"]
+      for f in [*profraws, profdata]:
+          if os.path.exists(f):
+              os.remove(f)
+      print(f"dnam-kernels line coverage: {pct:.2f}% (tests ran in {time.monotonic() - t0:.2f}s)")
+      if pct < 95.0:
+          sys.exit(f"Line coverage {pct:.2f}% < 95.0%")
+      PY
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+    options:
+      mutex: "cargo"
+      runInCI: "skip"
+    tags:
+      - "coverage"

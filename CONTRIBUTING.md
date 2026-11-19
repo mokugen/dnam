@@ -31,6 +31,7 @@ DNAM is organized as a multi-language workspace across `docs/`, `packages/*`, an
 | Scope / Package | Directory | Scoped `AGENTS.md` / Router | Contributing Guide |
 | :--- | :--- | :--- | :--- |
 | **Specification Manual (`docs/`)** | `docs/` | [`docs/index.md`](docs/index.md) | [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) |
+| **Shared CPU/WebGPU Kernels (`dnam-kernels`)** | `packages/kernels/` | [`packages/kernels/AGENTS.md`](packages/kernels/AGENTS.md) | [`packages/kernels/CONTRIBUTING.md`](packages/kernels/CONTRIBUTING.md) |
 | **Rust SIMD Engine (`dnam-engine`)** | `packages/engine/` | [`packages/engine/AGENTS.md`](packages/engine/AGENTS.md) | [`packages/engine/CONTRIBUTING.md`](packages/engine/CONTRIBUTING.md) |
 | **TypeScript / WebAudio SDK (`@dnam-project/dnam`)** | `packages/js/` | [`packages/js/AGENTS.md`](packages/js/AGENTS.md) | [`packages/js/CONTRIBUTING.md`](packages/js/CONTRIBUTING.md) |
 | **Pure-Rust Capture, Solver & `.dnam-proj` (`dnam-capture`)** | `packages/capture/` | [`packages/capture/AGENTS.md`](packages/capture/AGENTS.md) | [`packages/capture/CONTRIBUTING.md`](packages/capture/CONTRIBUTING.md) |
@@ -39,7 +40,7 @@ DNAM is organized as a multi-language workspace across `docs/`, `packages/*`, an
 | **Desktop Studio (`@dnam-project/studio`)** | `packages/studio/` | [`packages/studio/AGENTS.md`](packages/studio/AGENTS.md) | [`packages/studio/CONTRIBUTING.md`](packages/studio/CONTRIBUTING.md) |
 | **Project Guardrail Suite (`dnam-tests`)** | `tests/` | [`tests/AGENTS.md`](tests/AGENTS.md) | [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) |
 
-*(Note: `packages/kernels` (`dnam-kernels`, `#![no_std]` shared CPU/GPU primitives) and `tools/sona-shaders` (AOT `cargo-gpu` `.wgsl` kernels) are scheduled for `Phase 2` and `Phase 4` of the `SONA` `v3.0` cutover; see [`docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md).)*
+*(Note: `tools/sona-shaders` (AOT `cargo-gpu` `.wgsl` kernels compiled from `packages/kernels`) is scheduled for `Phase 4` of the `SONA` `v3.0` cutover; see [`docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md).)*
 
 ---
 
@@ -79,6 +80,7 @@ moon run :bench
 moon run studio:test-e2e
 
 # Check a single project via moon
+moon check kernels
 moon check engine
 moon check capture
 moon check fixtures
@@ -105,7 +107,7 @@ moon check tests
    - Never be lazy and reach for `#[allow(unsafe_code)]` or `unsafe` (`UnsafeCell`, `AtomicPtr`, raw pointer casts, or `get_unchecked`) when a 100% safe Rust design exists (such as `AtomicU64` word arrays for lock-free SPSC rings and seqlocks, ping-pong slot indices, disjoint struct field borrows, `zerocopy::transmute!`, or checked `napi` buffer views).
    - Use declarative `#[repr(C)]` `zerocopy::byteorder::little_endian::{U16, U32, U64, F32, F64}` structs deriving `FromBytes, IntoBytes, KnownLayout, Immutable` (`Unaligned` where slice-cast) with compile-time `size_of` / alignment assertions instead of manual byte-slicing (`from_le_bytes` / `to_le_bytes`) for `.dnam`, `.dnam-proj`, `DNWB`, and WAV headers (see `.agents/rules/zerocopy-wire-structs.md` and [`docs/specs/architecture/project_and_documentation_quality.md`](docs/specs/architecture/project_and_documentation_quality.md)).
    - `#[allow(unsafe_code)]` may **only** be used when **(a)** it is strictly unavoidable at a hardware/OS intrinsic or C-ABI boundary (`packages/engine/src/{math,types,memory,ffi}.rs`), or **(b)** benchmarks prove that the safe Rust version causes a high performance impact on a real-time hot path **and** the `unsafe` version can be formally guaranteed sound with an explicit `// SAFETY:` proof.
-   - All language SDK and application Rust crates (`packages/js/rust/`, `packages/studio/rust/`, `packages/capture/`, `packages/fixtures/`) and all algorithmic/host modules in `packages/engine/src/` (`operators`, `stages`, `control`, `container`, `provenance`, `schema`, `engine`, `dynamic`, `host`)—as well as the upcoming `#![no_std]` `packages/kernels` (`dnam-kernels`, Phase 2)—must remain 100% safe Rust with zero `#[allow(unsafe_code)]`.
+   - All language SDK and application Rust crates (`packages/js/rust/`, `packages/studio/rust/`, `packages/capture/`, `packages/fixtures/`) and all algorithmic/host modules in `packages/engine/src/` (`operators`, `stages`, `control`, `container`, `provenance`, `schema`, `engine`, `dynamic`, `host`)—as well as `#![no_std]` `packages/kernels` (`dnam-kernels`)—must remain 100% safe Rust with zero `#[allow(unsafe_code)]`.
 6. **Zero Duplicated Engine Logic in Language SDKs (`packages/js/`):**
    - Language SDKs (`@dnam-project/dnam`) and their FFI shims (`packages/js/rust/`) must **never** reimplement DSP math, ZOH rescaling, 3-Phase control clamping, Lobatto calibration inversion, schema validation, RFC 8785 JCS canonicalization, or provenance signature assembly in TypeScript (`ref[sdk.ts.runtime.dual-target-drivers]`).
    - Delegate 100% of domain logic to `dnam-engine` in Rust; keep SDK host-language layers strictly focused on idiomatic ergonomics, casing/type coercion, and zero-copy buffer/handle lifecycles.
