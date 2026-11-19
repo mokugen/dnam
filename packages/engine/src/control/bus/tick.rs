@@ -141,6 +141,36 @@ impl<B: MathBackend> ControlBus<B> {
         for (current, &target) in self.current_u_norm.iter_mut().zip(&self.target_u_norm) {
             *current = flush_recursive_state_f32(target);
         }
+        if self.num_contributors == 0 {
+            self.latent_acc.reset();
+            self.s_vx_ultra = [0.0; 4];
+            self.s_v2x2_ultra = [0.0; 4];
+            for acc in &mut self.exact_fm_acc {
+                acc.reset();
+            }
+            let n = self
+                .num_controls
+                .min(self.raw_values.len())
+                .min(crate::control::plane::MAX_EXACT_CONTRIBUTORS);
+            let mut def_sw = [0_u8; crate::control::plane::MAX_EXACT_CONTRIBUTORS];
+            for (p, slot) in def_sw[..n].iter_mut().enumerate() {
+                if self.descriptors[p].ctrl_kind == 1 {
+                    *slot = (self.descriptors[p].default_val.max(0.0) + 0.5) as u8;
+                }
+            }
+            for p in 0..n {
+                if self.descriptors[p].ctrl_kind == 0 {
+                    let def_val = self.descriptors[p].default_val;
+                    let (_, u_def, _) = self.descriptors[p].clamp_and_normalize(def_val, &def_sw[..n]);
+                    self.prev_eval_u_norm[p] = flush_recursive_state_f32(u_def);
+                    let lob = self.descriptors[p].eval_lobatto_basis(self.prev_eval_u_norm[p]);
+                    self.prev_eval_psi[p] = lob[0] + lob[1] + lob[2];
+                } else {
+                    self.prev_eval_u_norm[p] = 0.0;
+                    self.prev_eval_psi[p] = 0.0;
+                }
+            }
+        }
         self.evaluate_static_control_basis(arena_bytes);
         self.is_dirty = false;
     }
@@ -251,7 +281,7 @@ impl<B: MathBackend> ControlBus<B> {
                 }
             }
 
-            if arena_bytes.len() >= 64_000 {
+            if arena_bytes.len() >= crate::stages::weights::ARENA_ULTRA_BYTES {
                 let (delta_base_8, uint_ultra_8, has_uint_ultra) =
                     eval_uint_ultra_delta_3x4x8(arena_bytes, z_fm_base, z_fm_ultra, s_emb);
                 for d in 0..8 {
@@ -351,7 +381,7 @@ impl<B: MathBackend> ControlBus<B> {
         self.z_head = z_head_4;
         self.ctrl_basis_4 = z_stage_4;
 
-        if arena_bytes.len() >= 64_000 {
+        if arena_bytes.len() >= crate::stages::weights::ARENA_ULTRA_BYTES {
             trust_clip_outward_4d(&mut z_acc_ultra_4, self.trust_radius_mh);
             self.z_head_ultra = z_acc_ultra_4;
             self.z_stage_ultra = [0.0; 4];
@@ -364,12 +394,12 @@ impl<B: MathBackend> ControlBus<B> {
     }
 
     /// Evaluates the $3\text{ kHz}$ `8 × 32` / `16 × 16` Control/LFO/Envelope $\to$ Stage & Spatial Tank
-    /// state-space projection matrix `W_ctrl` (`CL 32..47`, `bytes 9536..10560` in `Arena 0`, plus
-    /// `16 × 4` Ultra delta at `bytes 60672..60928` in `Arena 3`, `0 FDIV`, `0 FSQRT`).
+    /// state-space projection matrix `W_ctrl` (`3,520..4,544` in `Arena 0`, plus
+    /// `16 × 4` Ultra delta at `21,120..21,376` in `Arena 3`, `0 FDIV`, `0 FSQRT`).
     #[inline]
     pub(super) fn evaluate_tank_modulation(&mut self, arena_bytes: &[u8]) {
-        const W_CTRL_TANK_BASE: usize = 9_536;
-        const W_CTRL_ULTRA_BASE: usize = 60_672;
+        const W_CTRL_TANK_BASE: usize = crate::stages::weights::ARENA0_W_CTRL_OFFSET;
+        const W_CTRL_ULTRA_BASE: usize = crate::stages::weights::ARENA3_W_CTRL_ULTRA_OFFSET;
         if arena_bytes.len() < W_CTRL_TANK_BASE + 1024 {
             self.tank_mod_dirty = false;
             return;
@@ -555,7 +585,7 @@ mod tests {
     #[test]
     fn test_static_basis_edge_kinds_and_zero_prng_seed_drift() {
         let _audio = crate::FtzDazGuard::new();
-        let mut arena = vec![0u8; 64_000];
+        let mut arena = vec![0u8; crate::stages::weights::ARENA_ULTRA_BYTES];
         let flags = crate::stages::weights::PIPE_MAGIC_HI
             | crate::stages::weights::PIPE_FLAG_UNIFIED_W_CTRL;
         arena[crate::stages::weights::ARENA0_PIPELINE_FLAGS_OFFSET
@@ -645,18 +675,18 @@ mod tests {
     #[test]
     fn test_control_bus_slewing_and_trust_region_softclip() {
         let _audio = crate::FtzDazGuard::new();
-        let mut arena0 = vec![0u8; 64_000];
-        arena0[7488 + 16..7488 + 20].copy_from_slice(&0.95_f32.to_le_bytes());
-        arena0[10560..10564].copy_from_slice(&0.5_f32.to_le_bytes());
-        // Populate cp1_lanes_dir at 7,524 with 2 inline CP1 contributors (ctrl 0: 3-lane Range, ctrl 1: 1-lane Switch)
-        arena0[7_524..7_526].copy_from_slice(&2_u16.to_le_bytes());
-        arena0[7_526] = 3;
-        arena0[7_527] = (1 << 4) | 1;
-        for off in (7_680..8_512).step_by(4) {
+        let mut arena0 = vec![0u8; crate::stages::weights::ARENA_ULTRA_BYTES];
+        arena0[3_008 + 16..3_008 + 20].copy_from_slice(&0.95_f32.to_le_bytes());
+        arena0[4_544..4_548].copy_from_slice(&0.5_f32.to_le_bytes());
+        // Populate cp1_lanes_dir at 3,044 with 2 inline CP1 contributors (ctrl 0: 3-lane Range, ctrl 1: 1-lane Switch)
+        arena0[3_044..3_046].copy_from_slice(&2_u16.to_le_bytes());
+        arena0[3_046] = 3;
+        arena0[3_047] = (1 << 4) | 1;
+        for off in (3_200..3_520).step_by(4) {
             arena0[off..off + 4].copy_from_slice(&2.0_f32.to_le_bytes());
         }
-        // Populate inline Ultra CP1 payload (61,312..63,424) with large weights to exercise outward_checked_trust_clip
-        for off in (61_312..63_424).step_by(4) {
+        // Populate inline Ultra CP1 payload (21,760..23,872) with large weights to exercise outward_checked_trust_clip
+        for off in (21_760..23_872).step_by(4) {
             arena0[off..off + 4].copy_from_slice(&2.0_f32.to_le_bytes());
         }
         let mut cb = Box::new(ControlBus::<ScalarBackend>::default());
@@ -701,27 +731,27 @@ mod tests {
         assert!(!cb.tick_3khz(0.5, &arena0));
 
         // Also test canonical R17-E2 3-byte cp1_lanes_dir encoding: (control_id, packed_kind_and_lanes, option_or_partner)
-        let mut arena_3b = vec![0u8; 64_000];
-        arena_3b[7_524] = 3;
+        let mut arena_3b = vec![0u8; crate::stages::weights::ARENA_ULTRA_BYTES];
+        arena_3b[3_044] = 3;
         // Slot 0: control 0, Range (kind 0), 2 lanes
-        arena_3b[7_528] = 0;
-        arena_3b[7_529] = 2;
-        arena_3b[7_530] = 0;
+        arena_3b[3_048] = 0;
+        arena_3b[3_049] = 2;
+        arena_3b[3_050] = 0;
         // Slot 1: control 1, Switch (kind 1), 1 lane, option 1
-        arena_3b[7_531] = 1;
-        arena_3b[7_532] = (1 << 4) | 1;
-        arena_3b[7_533] = 1;
+        arena_3b[3_051] = 1;
+        arena_3b[3_052] = (1 << 4) | 1;
+        arena_3b[3_053] = 1;
         // Slot 2: control 0 x control 2 Cross-term (kind 2), 1 lane, partner 2
-        arena_3b[7_534] = 0;
-        arena_3b[7_535] = (2 << 4) | 1;
-        arena_3b[7_536] = 2;
-        for off in (7_552..7_680).step_by(4) {
+        arena_3b[3_054] = 0;
+        arena_3b[3_055] = (2 << 4) | 1;
+        arena_3b[3_056] = 2;
+        for off in (3_072..3_200).step_by(4) {
             arena_3b[off..off + 4].copy_from_slice(&0.15_f32.to_le_bytes());
         }
-        for off in (7_680..8_100).step_by(4) {
+        for off in (3_200..3_520).step_by(4) {
             arena_3b[off..off + 4].copy_from_slice(&0.25_f32.to_le_bytes());
         }
-        for off in (60_928..61_600).step_by(4) {
+        for off in (21_376..22_000).step_by(4) {
             arena_3b[off..off + 4].copy_from_slice(&0.10_f32.to_le_bytes());
         }
         cb.ensure_control_capacity(3);
@@ -747,8 +777,8 @@ mod tests {
 
         // Verify live analog drift is active when live_analog_drift_enabled && !offline_bounce,
         // and strictly suppressed (0-ULP deterministic) when offline_bounce == true.
-        arena_3b[7_496..7_500].copy_from_slice(&0.02_f32.to_le_bytes()); // sigma_drift
-        arena_3b[7_500..7_504].copy_from_slice(&0.95_f32.to_le_bytes()); // rho_drift_train
+        arena_3b[3_016..3_020].copy_from_slice(&0.02_f32.to_le_bytes()); // sigma_drift
+        arena_3b[3_020..3_024].copy_from_slice(&0.95_f32.to_le_bytes()); // rho_drift_train
         cb.load_from_arena0(&arena_3b, 3, 1.0);
         cb.live_analog_drift_enabled = true;
         cb.offline_bounce = false;
@@ -800,10 +830,8 @@ mod tests {
             let _audio = crate::FtzDazGuard::new();
             let s_step = (1.0 - c_step * c_step).max(0.0).sqrt();
             let mut arena0 = vec![0u8; ARENA_OFFSET_LITE_END as usize];
-            arena0[7488..7492].copy_from_slice(&c_step.to_le_bytes());
-            arena0[7492..7496].copy_from_slice(&s_step.to_le_bytes());
-            arena0[7496..7500].copy_from_slice(&c_step.to_le_bytes());
-            arena0[7500..7504].copy_from_slice(&s_step.to_le_bytes());
+            arena0[3_008..3_012].copy_from_slice(&(c_step.abs() * 0.5).to_le_bytes());
+            arena0[3_012..3_016].copy_from_slice(&(s_step * 0.5).to_le_bytes());
 
             let mut cb = Box::new(ControlBus::<ScalarBackend>::default());
             cb.load_from_arena0(&arena0, 0, 1.0);

@@ -372,11 +372,11 @@ pub fn prepare_ballistic_band_alphas(band_idx: usize, rate_hz: f64) -> Option<(f
 
 /// Largest `f32` bit pattern $\le 0.985$ (`0x3F7C28F5`, since `0x3F7C28F6 > 0.985`,
 /// `ref[dsp.stage4.loop-saturator]`).
-pub const STAGE4_MAX_V_CEIL_BITS: u32 = 0x3F7C_28F5;
+pub const STAGE4_MAX_V_CEIL_BITS: u32 = crate::math::STAGE4_MAX_V_CEIL_BITS_DERIVED;
 
 /// Largest `f32` bit pattern $\le 0.9990$ (`0x3F7FBE76`, since `0x3F7FBE77 > 0.9990`,
 /// `ref[dsp.stage4.quiet-feedback-knee]`).
-pub const STAGE4_MAX_G_LIN_BITS: u32 = 0x3F7F_BE76;
+pub const STAGE4_MAX_G_LIN_BITS: u32 = crate::math::STAGE4_MAX_G_LIN_BITS_DERIVED;
 
 /// Evaluates the Stage IV unity-slope cubic loop saturator with explicit outer clamp to $\pm V_{\text{ceil}}$
 /// (`0 < V_ceil <= f32::from_bits(0x3F7C28F5)`, `ref[dsp.stage4.loop-saturator]`).
@@ -546,8 +546,8 @@ mod spec_tests {
     use crate::schema::DnamJsonHeader;
     use crate::stages::{
         MidSideKroneckerHead, ParallelAlignmentMode, STAGE4_MAX_G_LIN_BITS, STAGE4_MAX_V_CEIL_BITS,
-        Stage0Router, Stage1PreDynamics, Stage2CommutedCascade, Stage3CabinetModals,
-        Stage4SpatialTank, TankDcBlocker, TptLr4Crossover, WdwDryTapMode,
+        Stage0Router, Stage1PreDynamics, Stage3CabinetModals, Stage4SpatialTank, TankDcBlocker,
+        TptLr4Crossover, V3ColdTierModel, V3HotCore, WdwDryTapMode,
         eval_min_latency_4tap_alignment, eval_stage4_blended_feedback_knee,
         eval_stage4_loop_saturator, eval_stereo_linked_aux_detector, eval_wdw_routing_outputs,
         pack_stage3_modal_block_features, prepare_ballistic_band_alphas,
@@ -665,8 +665,9 @@ mod spec_tests {
         let (s1_l, s1_r) = s1.step_stereo(0.25, -0.25);
         assert!(s1_l.is_finite() && s1_r.is_finite());
 
-        let mut s2 = Stage2CommutedCascade::new();
-        let (s2_l, s2_r) = s2.step_stereo(s1_l, s1_r);
+        let cold = V3ColdTierModel::identity_for_tier(Tier::Lite, false, false);
+        let mut core = V3HotCore::<DefaultMathBackend>::from_cold_model(&cold);
+        let [s2_l, s2_r] = core.step_stereo(s1_l, s1_r);
         assert!(s2_l.is_finite() && s2_r.is_finite());
 
         let mut s3 = Stage3CabinetModals::new();
@@ -837,11 +838,11 @@ mod spec_tests {
         assert_eq!(clamped[14], 0.75);
         assert_eq!(clamped[15], 2.0);
 
-        assert!(super::validate_tensor_directory_slice(0, 64, 10_752));
-        assert!(super::validate_tensor_directory_slice(128, 256, 10_752));
-        assert!(!super::validate_tensor_directory_slice(32, 64, 10_752));
-        assert!(!super::validate_tensor_directory_slice(64, 100, 10_752));
-        assert!(!super::validate_tensor_directory_slice(10_752, 64, 10_752));
+        assert!(super::validate_tensor_directory_slice(0, 64, 4_608));
+        assert!(super::validate_tensor_directory_slice(128, 256, 4_608));
+        assert!(!super::validate_tensor_directory_slice(32, 64, 4_608));
+        assert!(!super::validate_tensor_directory_slice(64, 100, 4_608));
+        assert!(!super::validate_tensor_directory_slice(4_608, 64, 4_608));
     }
 
     proptest! {

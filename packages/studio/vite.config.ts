@@ -51,8 +51,9 @@ export default defineConfig(({ mode }) => {
             sourcemap: isTauriBuild ? isTauriDebug : true,
             lib: {
               entry: {
-                index: resolve(import.meta.dirname, "src/index.ts"),
-                "ui/index": resolve(import.meta.dirname, "src/ui/index.ts"),
+                ipc: resolve(import.meta.dirname, "src/ipc.ts"),
+                host: resolve(import.meta.dirname, "src/host.ts"),
+                "ui/StudioApp": resolve(import.meta.dirname, "src/ui/StudioApp.tsx"),
               },
               formats: ["es"],
               fileName: (_format, entryName) => `${entryName}.js`,
@@ -63,7 +64,7 @@ export default defineConfig(({ mode }) => {
                 "react/jsx-runtime",
                 "react-dom",
                 "lucide-react",
-                "@dnam-project/ui",
+                /^@dnam-project\/ui/,
                 /^@dnam-project\/dnam/,
                 /^node:/,
               ],

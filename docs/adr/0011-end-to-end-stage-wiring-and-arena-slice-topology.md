@@ -1,10 +1,10 @@
 ---
 id: ADR-0011
 title: "End-to-End Stage Wiring, 256-D Feature Bus Slot Map, Stage Modulation Laws & Arena Slice Directory"
-status: accepted
+status: superseded
 date: "2026-11-04"
 supersedes: null
-superseded_by: null
+superseded_by: ADR-0021
 specs:
   - "../specs/dsp/router_and_stages_topology.md"
   - "../specs/dsp/parametric_control_bus.md"

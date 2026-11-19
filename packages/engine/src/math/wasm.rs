@@ -61,8 +61,23 @@ impl SimdVec4 for WasmVec4 {
     }
 
     #[inline(always)]
+    fn from_array(arr: [f32; 4]) -> Self {
+        Self(f32x4(arr[0], arr[1], arr[2], arr[3]))
+    }
+
+    #[inline(always)]
     fn store(self, dst: &mut [f32; 4]) {
         *dst = zerocopy::transmute!(self.0);
+    }
+
+    #[inline(always)]
+    fn to_array(self) -> [f32; 4] {
+        [
+            f32x4_extract_lane::<0>(self.0),
+            f32x4_extract_lane::<1>(self.0),
+            f32x4_extract_lane::<2>(self.0),
+            f32x4_extract_lane::<3>(self.0),
+        ]
     }
 
     #[inline(always)]
@@ -147,6 +162,30 @@ impl SimdVec4 for WasmVec4 {
             f32x4_extract_lane::<0>(totals),
             f32x4_extract_lane::<2>(totals),
         )
+    }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        Self(i32x4_sub(
+            u32x4_splat(crate::math::IEEE754_F32_RCP_SEED),
+            self.0,
+        ))
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        Self(i32x4_sub(
+            u32x4_splat(crate::math::IEEE754_F32_RSQRT_SEED),
+            u32x4_shr(self.0, 1),
+        ))
+    }
+
+    #[inline(always)]
+    fn pow2_from_biased_int_bits(self) -> Self {
+        Self(u32x4_shl(
+            i32x4_add(self.0, u32x4_splat(crate::math::IEEE754_F32_EXP_BIAS)),
+            23,
+        ))
     }
 }
 
@@ -256,6 +295,16 @@ impl SimdVec4 for WasmVec4 {
     #[inline(always)]
     fn horizontal_sum(self) -> f32 {
         super::scalar::ScalarVec4(self.0).horizontal_sum()
+    }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        Self(super::scalar::ScalarVec4(self.0).rcp_pos_seed_bits().0)
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        Self(super::scalar::ScalarVec4(self.0).rsqrt_pos_seed_bits().0)
     }
 }
 

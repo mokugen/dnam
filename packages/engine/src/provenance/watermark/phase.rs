@@ -27,12 +27,10 @@ fn phase_chip_from_digest(digest: &[u8; 32], chip_idx: usize) -> f32 {
     if bit == 1 { 1.0_f32 } else { -1.0_f32 }
 }
 
-/// Applies **Layer 2 (Kautz & Inter-Stage Pole-Angle Phase Coding)** in-place on `Arena 0..3`
+/// Applies **Layer 2 (Kautz Pole-Angle Phase Coding)** in-place on `Arena 0..3`
 /// using domain tag `"DNAM-WM-PHASE-V1"` (`delta_rad <= PHASE_CODING_MAX_RAD = 8.726646e-4 rad` = `0.05 deg`):
 /// - Perturbs each tier's Stage III Kautz modal pole angles $\theta_m$ (`STAGE3_KAUTZ_BASES`, `+32..+48` in each `128 B` block)
 ///   by $\pm\Delta\theta$ (`0.00 dB` pole-radius change).
-/// - Perturbs active Stage II lifted inter-stage resonator pole angles (`theta_mid_1` at `4,180` when `r_mid_1 > 0.0`,
-///   and `theta_mid_2` at `4,212` when `r_mid_2 > 0.0`) by $\pm\Delta\theta$.
 pub fn apply_phase_coding_watermark(
     arena: &mut [u8],
     buyer_seed: &[u8; 32],
@@ -41,7 +39,7 @@ pub fn apply_phase_coding_watermark(
     let max_tiers = max_tiers_for_arena_len(arena.len());
     if max_tiers == 0 {
         return Err(DnamError::BufferTooSmall {
-            expected: 10_752,
+            expected: 4_608,
             actual: arena.len(),
         });
     }
@@ -64,28 +62,6 @@ pub fn apply_phase_coding_watermark(
                 }
             }
         }
-        if tier == 0 {
-            let r_mid_1 = read_f32_le(arena, 4_176);
-            let th1 = read_f32_le(arena, 4_180);
-            if r_mid_1 > 0.0 && (1e-3..=core::f32::consts::PI - 1e-3).contains(&th1) {
-                let chip = phase_chip_from_digest(&digest, 16);
-                write_f32_le(
-                    arena,
-                    4_180,
-                    (th1 + step_rad * chip).clamp(1e-4, core::f32::consts::PI - 1e-4),
-                );
-            }
-            let r_mid_2 = read_f32_le(arena, 4_208);
-            let th2 = read_f32_le(arena, 4_212);
-            if r_mid_2 > 0.0 && (1e-3..=core::f32::consts::PI - 1e-3).contains(&th2) {
-                let chip = phase_chip_from_digest(&digest, 17);
-                write_f32_le(
-                    arena,
-                    4_212,
-                    (th2 + step_rad * chip).clamp(1e-4, core::f32::consts::PI - 1e-4),
-                );
-            }
-        }
     }
     Ok(())
 }
@@ -101,7 +77,7 @@ pub fn score_phase_coding_arena(
     let max_tiers = max_tiers_for_arena_len(shared_len);
     if max_tiers == 0 {
         return Err(DnamError::BufferTooSmall {
-            expected: 10_752,
+            expected: 4_608,
             actual: shared_len,
         });
     }
@@ -133,28 +109,6 @@ pub fn score_phase_coding_arena(
                 active += y * y;
             }
         }
-        if tier == 0 {
-            for (r_off, th_off, chip_idx) in
-                [(4_176_usize, 4_180_usize, 16_usize), (4_208, 4_212, 17)]
-            {
-                let theta_m = read_f32_le(master_arena, th_off);
-                if read_f32_le(master_arena, r_off) > 0.0
-                    && (1e-3..=core::f32::consts::PI - 1e-3).contains(&theta_m)
-                {
-                    let chip = phase_chip_from_digest(&digest, chip_idx) as f64;
-                    let diff = (read_f32_le(suspect_arena, th_off) - theta_m) as f64;
-                    let y = if diff > 1e-6 {
-                        1.0
-                    } else if diff < -1e-6 {
-                        -1.0
-                    } else {
-                        0.0
-                    };
-                    corr += chip * y;
-                    active += y * y;
-                }
-            }
-        }
     }
     Ok(corr / cold_sqrt_f64(active.max(1.0)))
 }
@@ -174,7 +128,7 @@ pub fn score_phase_coding_blackbox(
             actual: n,
         });
     }
-    let tier_counts = [4_usize, 4, 8, 16];
+    let tier_counts = [4_usize, 4, 4, 4];
     let mut corr = 0.0_f64;
     let mut active = 0.0_f64;
     let mut global_idx = 0_usize;
@@ -199,23 +153,6 @@ pub fn score_phase_coding_blackbox(
             global_idx += 1;
         }
     }
-    if n > 32 {
-        let digest0 = derive_phase_coding_tier_digest(buyer_seed, 0);
-        for extra in 0..(n - 32).min(2) {
-            let idx = 32 + extra;
-            let chip = phase_chip_from_digest(&digest0, 16 + extra) as f64;
-            let diff = (suspect_pole_angles[idx] - master_pole_angles[idx]) as f64;
-            let y = if diff > 1e-6 {
-                1.0
-            } else if diff < -1e-6 {
-                -1.0
-            } else {
-                0.0
-            };
-            corr += chip * y;
-            active += y * y;
-        }
-    }
     Ok(corr / cold_sqrt_f64(active.max(1.0)))
 }
 
@@ -232,46 +169,49 @@ mod tests {
         assert!(score_phase_coding_arena(&short, &short, &[0x11; 32]).is_err());
         assert!(score_phase_coding_blackbox(&[0.1; 2], &[0.1; 2], &[0x11; 32]).is_err());
 
-        let mut master = alloc::vec![0u8; 64_000];
+        let mut master = alloc::vec![0u8; 28_672];
+        let mut master_angles = alloc::vec::Vec::with_capacity(16);
         for tier in 0..4 {
             for blk in 0..STAGE3_KAUTZ_BLOCKS_PER_TIER[tier] {
                 let base = kautz_soa_byte_offset(tier, blk);
                 for lane in 0..4 {
-                    write_f32_le(
-                        &mut master,
-                        base + (8 + lane) * 4,
-                        0.25 + 0.05 * (lane as f32),
-                    );
+                    let th = 0.25 + 0.05 * (lane as f32) + 0.02 * (tier as f32);
+                    write_f32_le(&mut master, base + (8 + lane) * 4, th);
+                    master_angles.push(th);
                 }
             }
         }
-        write_f32_le(&mut master, 4_176, 0.85);
-        write_f32_le(&mut master, 4_180, 0.35);
-        write_f32_le(&mut master, 4_208, 0.85);
-        write_f32_le(&mut master, 4_212, 0.65);
 
         let seed = [0x3Cu8; 32];
         let mut wm = master.clone();
         apply_phase_coding_watermark(&mut wm, &seed, PHASE_CODING_MAX_RAD).unwrap();
 
-        // Identical suspect gives 0.0 (covers `else { 0.0 }` branch); inverted delta covers opposite sign
         assert_eq!(
             score_phase_coding_arena(&master, &master, &seed).unwrap(),
             0.0
         );
         let z_pos = score_phase_coding_arena(&master, &wm, &seed).unwrap();
-        assert!(z_pos > 5.0);
+        assert!(z_pos > 3.9);
+
+        let mut suspect_angles = alloc::vec::Vec::with_capacity(16);
+        for tier in 0..4 {
+            for blk in 0..STAGE3_KAUTZ_BLOCKS_PER_TIER[tier] {
+                let base = kautz_soa_byte_offset(tier, blk);
+                for lane in 0..4 {
+                    suspect_angles.push(read_f32_le(&wm, base + (8 + lane) * 4));
+                }
+            }
+        }
+        let z_bb = score_phase_coding_blackbox(&master_angles, &suspect_angles, &seed).unwrap();
+        assert!((z_bb - z_pos).abs() < 1e-9);
 
         let z_bb_short = score_phase_coding_blackbox(&[0.5; 6], &[0.5; 6], &seed).unwrap();
         assert_eq!(z_bb_short, 0.0);
-        let m34 = alloc::vec![0.5; 34];
-        let mut s34 = m34.clone();
-        s34[0] += 1e-4;
-        s34[1] -= 1e-4;
-        s34[32] += 1e-4;
-        s34[33] -= 1e-4;
+        let mut s_bb = master_angles.clone();
+        s_bb[0] += 1e-4;
+        s_bb[1] -= 1e-4;
         assert!(
-            score_phase_coding_blackbox(&m34, &s34, &seed)
+            score_phase_coding_blackbox(&master_angles, &s_bb, &seed)
                 .unwrap()
                 .is_finite()
         );

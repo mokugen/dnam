@@ -364,6 +364,74 @@ impl SimdVec4 for Sve2Vec4 {
             )
         }
     }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        if ArmSve2Backend::is_supported() {
+            let inp = to_zreg(self.0);
+            let magic: float32x4_t = zerocopy::transmute!([crate::math::IEEE754_F32_RCP_SEED; 4]);
+            let out: float32x4_t;
+            // SAFETY: Guarded by `ArmSve2Backend::is_supported()` confirming `FEAT_SVE2`.
+            unsafe {
+                core::arch::asm!(
+                    ".arch armv9-a+sve2\nsub z0.s, z1.s, z0.s",
+                    in("q0") inp,
+                    in("q1") magic,
+                    lateout("q0") out,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            Self(from_zreg(out))
+        } else {
+            Self(ScalarVec4(self.0).rcp_pos_seed_bits().0)
+        }
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        if ArmSve2Backend::is_supported() {
+            let inp = to_zreg(self.0);
+            let magic: float32x4_t = zerocopy::transmute!([crate::math::IEEE754_F32_RSQRT_SEED; 4]);
+            let out: float32x4_t;
+            // SAFETY: Guarded by `ArmSve2Backend::is_supported()` confirming `FEAT_SVE2`.
+            unsafe {
+                core::arch::asm!(
+                    ".arch armv9-a+sve2\nlsr z0.s, z0.s, #1\nsub z0.s, z1.s, z0.s",
+                    in("q0") inp,
+                    in("q1") magic,
+                    lateout("q0") out,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            Self(from_zreg(out))
+        } else {
+            Self(ScalarVec4(self.0).rsqrt_pos_seed_bits().0)
+        }
+    }
+
+    #[inline(always)]
+    fn pow2_from_biased_int_bits(self) -> Self {
+        if ArmSve2Backend::is_supported() {
+            let inp = to_zreg(self.0);
+            let bias: float32x4_t = zerocopy::transmute!([127_u32; 4]);
+            let out: float32x4_t;
+            // SAFETY: Guarded by `ArmSve2Backend::is_supported()` confirming `FEAT_SVE2`.
+            unsafe {
+                core::arch::asm!(
+                    ".arch armv9-a+sve2",
+                    "add z0.s, z0.s, z1.s",
+                    "lsl z0.s, z0.s, #23",
+                    in("q0") inp,
+                    in("q1") bias,
+                    lateout("q0") out,
+                    options(pure, nomem, nostack, preserves_flags),
+                );
+            }
+            Self(from_zreg(out))
+        } else {
+            Self(ScalarVec4(self.0).pow2_from_biased_int_bits().0)
+        }
+    }
 }
 
 /// ARMv9-A Scalable Vector Extension 2 (`FEAT_SVE2`) hardware backend for `aarch64`.

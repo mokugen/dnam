@@ -4,49 +4,24 @@
 //! Projects shared core trajectories to active nested readouts (`Lite..Ultra`), accumulates
 //! Bézout-3 + Gabor-33 + Welch-33 LTAS gradients, and runs one exact reverse sweep.
 
-use dnam_engine::Tier;
-use dnam_engine::stages::v3_core::cascade::{
-    MAX_BLOCK_LANES, MAX_KAUTZ_POLES, MAX_TOTAL_GRU_LANES, NUM_GRU_BLOCKS, tier_block_lanes,
-    tier_fir_segments, tier_groups, tier_kautz_banks,
-};
+use dnam_engine::stages::stage2_gru::{MAX_GROUPS, NUM_GRU_BLOCKS, tier_groups, tier_kautz_banks};
 
 use crate::solver::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
 
 mod backward;
-use super::gabor::eval_gabor_loss_and_adjoint_with_backend;
+mod rescale_1x;
+mod tier_pass;
+use super::basis::active_block_lanes;
 pub use super::gru_core::AdjointWorkspace;
-use super::gru_core::forward_shared_core;
-use super::ltas_adj::eval_welch33_ltas_loss_and_adjoint;
-use super::model_f64::{V3MatryoshkaOptF64, V3TierReadoutF64, V3TrainDataset};
-use super::primitives::{ClampedCoreParams, downsample_2x_fwd, par_map_indexed};
-use backward::{backward_shared_core, backward_tier_readout};
-
-#[allow(clippy::too_many_arguments)]
-#[inline(always)]
-fn project_substep(
-    r: &V3TierReadoutF64,
-    dir_t: &[f64; 7],
-    ch: usize,
-    c_t: usize,
-    taps: &[f64; 7],
-    u: f64,
-    hp: f64,
-    h: &[f64; MAX_TOTAL_GRU_LANES],
-) -> (f64, f64) {
-    let mut s2v = r.pre_cab_u_gain[ch] * u + r.pre_cab_hp_gain[ch] * hp;
-    let mut dirv = r.direct_s2_u_gain[ch] * u + r.direct_s2_hp_gain[ch] * hp;
-    for i in 0..7 {
-        dirv += dir_t[i] * taps[i];
-    }
-    for b in 0..NUM_GRU_BLOCKS {
-        let base = b * MAX_BLOCK_LANES;
-        for idx in base..base + c_t {
-            s2v += r.pre_cab_w[ch][idx] * h[idx];
-            dirv += r.direct_s2_w[ch][idx] * h[idx];
-        }
-    }
-    (s2v, dirv)
-}
+use super::gru_core::{forward_shared_core, max_lanes_for_mask};
+use super::model_f64::{V3MatryoshkaOptF64, V3TrainDataset};
+use super::primitives::{ClampedCoreParams, par_map_indexed};
+use backward::backward_shared_core;
+use rescale_1x::pullback_grad_1x_to_2x;
+pub(in crate::solver::v3_varpro) use rescale_1x::{
+    calibrate_1x_tiers_with_backend, rescale_model_2x_to_1x_f64,
+};
+use tier_pass::{ALL_TIERS, StemEvalCtx, eval_active_tiers_and_fuse};
 
 #[allow(clippy::too_many_arguments)]
 fn eval_single_stem_loss_and_grad<B: TrainerBackend>(
@@ -55,14 +30,13 @@ fn eval_single_stem_loss_and_grad<B: TrainerBackend>(
     dataset: &V3TrainDataset,
     st_idx: usize,
     tiers_needed: &[usize; 4],
-    c_blk: usize,
+    c_blk: [usize; NUM_GRU_BLOCKS],
     active_ch: usize,
     ch_scale: f64,
     sub_steps: usize,
     ws: &mut AdjointWorkspace,
     mut grad: Option<&mut V3MatryoshkaOptF64>,
 ) -> f64 {
-    const ALL_TIERS: [Tier; 4] = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra];
     let stem = &dataset.stems[st_idx];
     let n = stem.usable_len();
     if n == 0 {
@@ -70,8 +44,7 @@ fn eval_single_stem_loss_and_grad<B: TrainerBackend>(
     }
     let need_grad = grad.is_some();
     let total_sub = n * sub_steps;
-    let (w, sw) = (stem.warmup.min(n), dataset.stem_weights[st_idx]);
-    ws.ensure_capacity(n, sub_steps, tiers_needed, need_grad, false);
+    ws.ensure_capacity(n, sub_steps, active_ch, tiers_needed, need_grad, false);
     forward_shared_core(
         model,
         cp,
@@ -84,239 +57,62 @@ fn eval_single_stem_loss_and_grad<B: TrainerBackend>(
         false,
         ws,
     );
-    if need_grad {
-        for ch in 0..active_ch {
-            ws.d_sub_taps[ch][..total_sub].fill([0.0; 7]);
-            ws.d_sub_u[ch][..total_sub].fill(0.0);
-            ws.d_sub_hp[ch][..total_sub].fill(0.0);
-            if c_blk == MAX_BLOCK_LANES {
-                ws.d_sub_h[ch][..total_sub].fill([0.0; MAX_TOTAL_GRU_LANES]);
-            } else {
-                for row in &mut ws.d_sub_h[ch][..total_sub] {
-                    for b in 0..NUM_GRU_BLOCKS {
-                        let base = b * MAX_BLOCK_LANES;
-                        row[base..base + c_blk].fill(0.0);
-                    }
-                }
-            }
-        }
-    }
 
-    let mut stem_loss = 0.0_f64;
-    let (mut sc_re, mut sc_im) = ([0.0_f64; MAX_KAUTZ_POLES], [0.0_f64; MAX_KAUTZ_POLES]);
-    for (tau, &tier) in ALL_TIERS.iter().enumerate() {
-        let wt = model.active_tier_weights[tau];
-        if tiers_needed[tau] == 0 || wt <= 0.0 {
-            continue;
-        }
-        let (c_t, f_t, k_t) = (
-            tier_block_lanes(tier),
-            tier_fir_segments(tier) * 16,
-            tiers_needed[tau],
-        );
-        let r = &model.readouts[tau];
-
-        for ch in 0..active_ch {
-            let (mut s_re, mut s_im) = ([0.0_f64; MAX_KAUTZ_POLES], [0.0_f64; MAX_KAUTZ_POLES]);
-            let (mut dec_s2_p, mut dec_dir_p) = (0.0_f64, 0.0_f64);
-            let (mut dec_s2_aa, mut dec_dir_aa) = ([0.0_f64; 4], [0.0_f64; 4]);
-            let dir_t = if ch == 0 {
-                &r.svf_direct_taps_l
-            } else {
-                &r.svf_direct_taps_r
-            };
-            let fir = if ch == 0 { &r.fir_l } else { &r.fir_r };
-            let kc = if ch == 0 { &r.kautz_c_l } else { &r.kautz_c_r };
-            for t in 0..n {
-                let dirv = if !model.os2x {
-                    let (s2v, dv) = project_substep(
-                        r,
-                        dir_t,
-                        ch,
-                        c_t,
-                        &ws.sub_taps[ch][t],
-                        ws.sub_u[ch][t],
-                        ws.sub_hp[ch][t],
-                        &ws.sub_h[ch][t],
-                    );
-                    ws.s2_tier[ch][t] = s2v;
-                    dv
-                } else {
-                    let (s0, s1) = (t * 2, t * 2 + 1);
-                    let (s2_0, d_0) = project_substep(
-                        r,
-                        dir_t,
-                        ch,
-                        c_t,
-                        &ws.sub_taps[ch][s0],
-                        ws.sub_u[ch][s0],
-                        ws.sub_hp[ch][s0],
-                        &ws.sub_h[ch][s0],
-                    );
-                    let (s2_1, d_1) = project_substep(
-                        r,
-                        dir_t,
-                        ch,
-                        c_t,
-                        &ws.sub_taps[ch][s1],
-                        ws.sub_u[ch][s1],
-                        ws.sub_hp[ch][s1],
-                        &ws.sub_h[ch][s1],
-                    );
-                    if need_grad {
-                        ws.s2_sub_tier[ch][s0] = s2_0;
-                        ws.s2_sub_tier[ch][s1] = s2_1;
-                        ws.dir_sub_tier[ch][s0] = d_0;
-                        ws.dir_sub_tier[ch][s1] = d_1;
-                    }
-                    let (s2v, _, s2_diff) = downsample_2x_fwd(
-                        s2_0,
-                        s2_1,
-                        &mut dec_s2_p,
-                        &mut dec_s2_aa,
-                        cp.dec_c_prev1.0,
-                        cp.dec_c0.0,
-                        cp.dec_aa_mix.0,
-                        need_grad,
-                    );
-                    let (dv, _, d_diff) = downsample_2x_fwd(
-                        d_0,
-                        d_1,
-                        &mut dec_dir_p,
-                        &mut dec_dir_aa,
-                        cp.dec_c_prev1.0,
-                        cp.dec_c0.0,
-                        cp.dec_aa_mix.0,
-                        need_grad,
-                    );
-                    ws.s2_tier[ch][t] = s2v;
-                    if need_grad {
-                        ws.s2_aa_diff[ch][t] = s2_diff;
-                        ws.dir_aa_diff[ch][t] = d_diff;
-                    }
-                    dv
-                };
-                let mut fv = 0.0_f64;
-                for k in 0..f_t.min(t + 1) {
-                    fv += fir[k] * ws.s2_tier[ch][t - k];
-                }
-                let x_del = if t >= 16 { ws.s2_tier[ch][t - 16] } else { 0.0 };
-                let (ore, oim) = if need_grad {
-                    let off = t * k_t;
-                    (
-                        &mut ws.kautz_re[tau][ch][off..off + k_t],
-                        &mut ws.kautz_im[tau][ch][off..off + k_t],
-                    )
-                } else {
-                    (&mut sc_re[..k_t], &mut sc_im[..k_t])
-                };
-                let kv = B::step_kautz_forward_frame(
-                    x_del,
-                    &cp.kautz_pre[..k_t],
-                    &kc[..k_t],
-                    &mut s_re[..k_t],
-                    &mut s_im[..k_t],
-                    ore,
-                    oim,
-                );
-                ws.y_tier[ch][t] = dirv + fv + kv;
-            }
-
-            let tgt = if ch == 0 {
-                &stem.tgt_l[..n]
-            } else {
-                &stem.tgt_r[..n]
-            };
-            for t in 0..n {
-                ws.err_buf[t] = ws.y_tier[ch][t] - f64::from(tgt[t]);
-            }
-            if need_grad {
-                ws.dy_tier[ch][..n].fill(0.0);
-            }
-            let bw = dataset.stem_band_weights[st_idx][ch].map(|v| wt * ch_scale * v);
-            stem_loss += dataset.bank.eval_loss_and_adjoint(
-                &ws.err_buf[..n],
-                w,
-                bw,
-                need_grad.then(|| &mut ws.dy_tier[ch][..n]),
-                &mut ws.bezout_scratch,
-            );
-            stem_loss += eval_gabor_loss_and_adjoint_with_backend::<B>(
-                &dataset.gabor_bank,
-                &dataset.gabor_summaries[st_idx][ch],
-                &ws.y_tier[ch][..n],
-                need_grad.then(|| &mut ws.dy_tier[ch][..n]),
-                wt * sw,
-                ch_scale,
-                dataset.gabor_env_weight,
-                dataset.gabor_ltas_weight,
-                &mut ws.gabor_scratch,
-            );
-            stem_loss += eval_welch33_ltas_loss_and_adjoint(
-                &dataset.welch33_summaries[st_idx][ch],
-                &ws.y_tier[ch][..n],
-                need_grad.then(|| &mut ws.dy_tier[ch][..n]),
-                wt * sw,
-                ch_scale,
-                dataset.welch_ltas_weight,
-                &mut ws.welch_scratch,
-            );
-        }
-
-        if let Some(g_mut) = grad.as_deref_mut() {
-            backward_tier_readout::<B>(model, cp, tau, n, active_ch, c_t, f_t, k_t, ws, g_mut);
-        }
-    }
+    let ctx = StemEvalCtx {
+        model,
+        cp,
+        dataset,
+        st_idx,
+        n,
+        active_ch,
+        ch_scale,
+    };
+    let stem_loss =
+        eval_active_tiers_and_fuse::<B>(&ctx, tiers_needed, total_sub, ws, grad.as_deref_mut());
     if let Some(g_mut) = grad {
         backward_shared_core(model, cp, n, c_blk, active_ch, ws, g_mut);
     }
     stem_loss
 }
 
-/// Evaluates weighted 4-tier Matryoshka loss and optional exact reverse-mode BPTT gradient via `B`.
-pub fn evaluate_matryoshka_loss_and_grad_with_backend<B: TrainerBackend>(
+#[derive(Clone, Copy)]
+struct RatePassSpec {
+    tiers_needed: [usize; 4],
+    c_blk: [usize; NUM_GRU_BLOCKS],
+    active_ch: usize,
+    ch_scale: f64,
+}
+
+fn eval_rate_pass<B: TrainerBackend>(
     model: &V3MatryoshkaOptF64,
     dataset: &V3TrainDataset,
+    spec: RatePassSpec,
     ws: &mut AdjointWorkspace,
     mut grad: Option<&mut V3MatryoshkaOptF64>,
 ) -> f64 {
-    const ALL_TIERS: [Tier; 4] = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra];
-    if let Some(g) = grad.as_deref_mut() {
-        *g = model.zero_like();
-    }
     let cp = ClampedCoreParams::from_model(model);
-    let g_cnt = model.max_active_groups.clamp(1, 4);
-    let c_blk = g_cnt * 4;
-    let active_ch = if model.mono_out { 1 } else { 2 };
-    let ch_scale = if model.mono_out { 1.0 } else { 0.5 };
     let sub_steps = if model.os2x { 2 } else { 1 };
     let need_grad = grad.is_some();
-
-    let mut tiers_needed = [0usize; 4];
-    for (tau, &tier) in ALL_TIERS.iter().enumerate() {
-        if tier_groups(tier) <= g_cnt && model.active_tier_weights[tau] > 0.0 {
-            tiers_needed[tau] = tier_kautz_banks(tier) * 4;
-        }
-    }
-
-    let total_loss = if dataset.stems.len() >= 2
-        && dataset.stems.first().map_or(0, |s| s.usable_len()) >= 8_192
-    {
+    if dataset.stems.len() >= 2 && dataset.stems.first().map_or(0, |s| s.usable_len()) >= 4_096 {
+        ws.ensure_stem_pool(dataset.stems.len());
+        let pool_ref = &ws.stem_pool[..dataset.stems.len()];
         let per_stem = par_map_indexed(dataset.stems.len(), |st_idx| {
-            let mut stem_ws = AdjointWorkspace::default();
-            let mut stem_grad = need_grad.then(|| model.zero_like());
+            let mut stem_ws = pool_ref[st_idx]
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut stem_grad = need_grad.then(|| Box::new(model.zero_like()));
             let loss = eval_single_stem_loss_and_grad::<B>(
                 model,
                 &cp,
                 dataset,
                 st_idx,
-                &tiers_needed,
-                c_blk,
-                active_ch,
-                ch_scale,
+                &spec.tiers_needed,
+                spec.c_blk,
+                spec.active_ch,
+                spec.ch_scale,
                 sub_steps,
                 &mut stem_ws,
-                stem_grad.as_mut(),
+                stem_grad.as_deref_mut(),
             );
             (loss, stem_grad)
         });
@@ -336,17 +132,76 @@ pub fn evaluate_matryoshka_loss_and_grad_with_backend<B: TrainerBackend>(
                 &cp,
                 dataset,
                 st_idx,
-                &tiers_needed,
-                c_blk,
-                active_ch,
-                ch_scale,
+                &spec.tiers_needed,
+                spec.c_blk,
+                spec.active_ch,
+                spec.ch_scale,
                 sub_steps,
                 ws,
                 grad.as_deref_mut(),
             );
         }
         sum_loss
-    };
+    }
+}
+
+/// Evaluates weighted 4-tier Matryoshka loss and optional exact reverse-mode BPTT gradient via `B`.
+pub fn evaluate_matryoshka_loss_and_grad_with_backend<B: TrainerBackend>(
+    model: &V3MatryoshkaOptF64,
+    dataset: &V3TrainDataset,
+    ws: &mut AdjointWorkspace,
+    mut grad: Option<&mut V3MatryoshkaOptF64>,
+) -> f64 {
+    if let Some(g) = grad.as_deref_mut() {
+        *g = model.zero_like();
+    }
+    let g_cnt = model.max_active_groups.clamp(1, MAX_GROUPS);
+    let c_cap = active_block_lanes(g_cnt);
+    let active_ch = if model.mono_out { 1 } else { 2 };
+    let ch_scale = if model.mono_out { 1.0 } else { 0.5 };
+
+    let mut tiers_1x = [0usize; 4];
+    let mut tiers_2x = [0usize; 4];
+    for (tau, &tier) in ALL_TIERS.iter().enumerate() {
+        if tier_groups(tier) <= g_cnt && model.active_tier_weights[tau] > 0.0 {
+            let k_t = tier_kautz_banks(tier) * 4;
+            if model.os2x && model.tier_os2x[tau] {
+                tiers_2x[tau] = k_t;
+            } else {
+                tiers_1x[tau] = k_t;
+            }
+        }
+    }
+
+    let mut total_loss = 0.0_f64;
+    if tiers_1x.iter().any(|&k| k > 0) {
+        let spec_1x = RatePassSpec {
+            tiers_needed: tiers_1x,
+            c_blk: max_lanes_for_mask(&tiers_1x, c_cap),
+            active_ch,
+            ch_scale,
+        };
+        if model.os2x {
+            let m_1x = Box::new(rescale_model_2x_to_1x_f64(model));
+            let mut g_1x = grad.as_deref().map(|g| Box::new(g.zero_like()));
+            total_loss += eval_rate_pass::<B>(&m_1x, dataset, spec_1x, ws, g_1x.as_deref_mut());
+            if let (Some(g_out), Some(ref g1)) = (grad.as_deref_mut(), g_1x) {
+                pullback_grad_1x_to_2x(model, g1, g_out);
+            }
+        } else {
+            total_loss += eval_rate_pass::<B>(model, dataset, spec_1x, ws, grad.as_deref_mut());
+        }
+    }
+
+    if tiers_2x.iter().any(|&k| k > 0) {
+        let spec_2x = RatePassSpec {
+            tiers_needed: tiers_2x,
+            c_blk: max_lanes_for_mask(&tiers_2x, c_cap),
+            active_ch,
+            ch_scale,
+        };
+        total_loss += eval_rate_pass::<B>(model, dataset, spec_2x, ws, grad.as_deref_mut());
+    }
 
     if let Some(g_mut) = grad {
         for blk in &mut g_mut.blocks {
@@ -408,22 +263,26 @@ mod tests {
     use super::*;
     use std::f64::consts::PI;
 
-    use dnam_engine::stages::v3_core::V3MatryoshkaModel;
-    use dnam_engine::stages::v3_core::cascade::{MAX_BLOCK_LANES, NUM_GRU_BLOCKS};
+    use dnam_engine::stages::V3MatryoshkaModel;
+    use dnam_engine::stages::stage2_gru::{
+        MAX_BLOCK_LANES, MAX_GROUPS_PER_BLOCK, NUM_GRU_BLOCKS, tier_block_lanes_array,
+    };
 
+    use super::super::basis::ALL_TIERS;
     use super::super::model_f64::V3TrainStem;
 
     fn build_fd_test_model(os2x: bool, mono_out: bool) -> V3MatryoshkaOptF64 {
         let mut m =
             V3MatryoshkaOptF64::from_matryoshka_cold(&V3MatryoshkaModel::identity(os2x, mono_out));
-        m.max_active_groups = 2;
-        m.active_tier_weights = [0.35, 0.65, 0.0, 0.0];
+        m.max_active_groups = 3;
+        m.active_tier_weights = [0.25, 0.35, 0.0, 0.40];
         m.os_up_quad = -0.06;
         m.os_dec_c_prev1 = 0.14;
         m.os_dec_c0 = 0.36;
         m.os_up_pre_emph = 0.12;
         m.os_dec_aa_mix = 0.65;
         m.os_up_aa_mix = 0.68;
+        m.os_up_zoh_mix = 0.35;
         m.svf_base_g = 0.14;
         m.svf_sec2_g_ratio = 1.6;
         m.svf_env_oct_sens = 1.25;
@@ -439,6 +298,7 @@ mod tests {
         m.svf_stereo_link = 0.40;
         m.svf_g_min = 0.02;
         m.svf_g_max = 0.78;
+        m.svf_feat_lp2_mix = 0.42;
         m.svf_stage2_feed_taps = [0.40, 0.35, 0.22, -0.11, 0.28, -0.16, 0.09];
         m.feat_in_hp_beta = 0.08;
         m.feat_fast_atk_beta = 0.18;
@@ -447,8 +307,10 @@ mod tests {
         m.feat_slow_atk_beta = 0.04;
         m.feat_slow_rel_beta = 0.005;
         m.feat_slow_det_comp = 4.5;
+        m.feat_key_link = 0.35;
+        m.feat_det_thresh = 0.08;
         for b in 0..NUM_GRU_BLOCKS {
-            for dst in 0..8 {
+            for dst in 0..(MAX_GROUPS_PER_BLOCK[b] * 4) {
                 m.blocks[b].b_z[dst] = 0.15 * ((b + dst) as f64 * 0.2).sin();
                 m.blocks[b].b_r[dst] = 0.4 + 0.1 * (dst as f64);
                 m.blocks[b].b_n[dst] = -0.12 + 0.05 * (b as f64);
@@ -477,7 +339,8 @@ mod tests {
         for k in 0..8 {
             m.kautz_poles[k] = (0.80 + 0.015 * (k as f64), 0.18 + 0.22 * (k as f64));
         }
-        for tau in 0..2 {
+        for tau in [0, 1, 3] {
+            let c_t = tier_block_lanes_array(ALL_TIERS[tau]);
             let r = &mut m.readouts[tau];
             r.pre_cab_u_gain = [0.65, 0.58];
             r.pre_cab_hp_gain = [0.18, -0.14];
@@ -487,8 +350,8 @@ mod tests {
                 r.svf_direct_taps_l[i] = 0.04 * ((i + tau + 1) as f64).sin();
                 r.svf_direct_taps_r[i] = 0.03 * ((i + tau + 2) as f64).cos();
             }
-            for i in 0..(tau + 1) * 4 {
-                for b in 0..NUM_GRU_BLOCKS {
+            for b in 0..NUM_GRU_BLOCKS {
+                for i in 0..c_t[b] {
                     let idx = b * MAX_BLOCK_LANES + i;
                     r.pre_cab_w[0][idx] = 0.05 * ((idx + 1) as f64).sin();
                     r.pre_cab_w[1][idx] = 0.04 * ((idx + 2) as f64).cos();
@@ -642,6 +505,15 @@ mod tests {
             check("feat_slow_det_comp", 1e-5, grad.feat_slow_det_comp, |x| {
                 &mut x.feat_slow_det_comp
             });
+            check("svf_feat_lp2_mix", 1e-6, grad.svf_feat_lp2_mix, |x| {
+                &mut x.svf_feat_lp2_mix
+            });
+            check("feat_key_link", 1e-6, grad.feat_key_link, |x| {
+                &mut x.feat_key_link
+            });
+            check("feat_det_thresh", 1e-6, grad.feat_det_thresh, |x| {
+                &mut x.feat_det_thresh
+            });
             check("b0.w_in_n[2][3]", 1e-6, grad.blocks[0].w_in_n[2][3], |x| {
                 &mut x.blocks[0].w_in_n[2][3]
             });
@@ -660,14 +532,20 @@ mod tests {
                 grad.blocks[0].w_rec_n[3][1],
                 |x| &mut x.blocks[0].w_rec_n[3][1],
             );
-            check("b2.w_in_n[2][3]", 1e-6, grad.blocks[2].w_in_n[2][3], |x| {
-                &mut x.blocks[2].w_in_n[2][3]
+            check(
+                "b0.w_rec_n[9][2]",
+                1e-6,
+                grad.blocks[0].w_rec_n[9][2],
+                |x| &mut x.blocks[0].w_rec_n[9][2],
+            );
+            check("b1.w_in_n[2][3]", 1e-6, grad.blocks[1].w_in_n[2][3], |x| {
+                &mut x.blocks[1].w_in_n[2][3]
             });
-            check("b2.k_sag[4]", 1e-6, grad.blocks[2].k_sag[4], |x| {
-                &mut x.blocks[2].k_sag[4]
+            check("b1.k_sag[4]", 1e-6, grad.blocks[1].k_sag[4], |x| {
+                &mut x.blocks[1].k_sag[4]
             });
-            check("b2.k_quad[4]", 1e-6, grad.blocks[2].k_quad[4], |x| {
-                &mut x.blocks[2].k_quad[4]
+            check("b1.k_quad[4]", 1e-6, grad.blocks[1].k_quad[4], |x| {
+                &mut x.blocks[1].k_quad[4]
             });
             check(
                 "b1.w_prev_z[5][2]",
@@ -676,14 +554,29 @@ mod tests {
                 |x| &mut x.blocks[1].w_prev_z[5][2],
             );
             check(
-                "b2.w_rec_n[4][1]",
+                "b1.w_rec_n[4][1]",
                 1e-6,
-                grad.blocks[2].w_rec_n[4][1],
-                |x| &mut x.blocks[2].w_rec_n[4][1],
+                grad.blocks[1].w_rec_n[4][1],
+                |x| &mut x.blocks[1].w_rec_n[4][1],
             );
             check("b1.b_n[3]", 1e-6, grad.blocks[1].b_n[3], |x| {
                 &mut x.blocks[1].b_n[3]
             });
+            check("b2.w_in_n[2][3]", 1e-6, grad.blocks[2].w_in_n[2][3], |x| {
+                &mut x.blocks[2].w_in_n[2][3]
+            });
+            check("b2.k_sag[2]", 1e-6, grad.blocks[2].k_sag[2], |x| {
+                &mut x.blocks[2].k_sag[2]
+            });
+            check("b2.k_quad[2]", 1e-6, grad.blocks[2].k_quad[2], |x| {
+                &mut x.blocks[2].k_quad[2]
+            });
+            check(
+                "b2.w_rec_n[3][1]",
+                1e-6,
+                grad.blocks[2].w_rec_n[3][1],
+                |x| &mut x.blocks[2].w_rec_n[3][1],
+            );
             check("kautz_poles[2].0", 1e-6, grad.kautz_poles[2].0, |x| {
                 &mut x.kautz_poles[2].0
             });
@@ -713,6 +606,9 @@ mod tests {
                 });
                 check("os_up_aa_mix", 1e-6, grad.os_up_aa_mix, |x| {
                     &mut x.os_up_aa_mix
+                });
+                check("os_up_zoh_mix", 1e-6, grad.os_up_zoh_mix, |x| {
+                    &mut x.os_up_zoh_mix
                 });
                 check("svf_stereo_link", 1e-6, grad.svf_stereo_link, |x| {
                     &mut x.svf_stereo_link

@@ -26,14 +26,12 @@ pub use op_m::{
     validate_and_eval_stage3_radial_gate,
 };
 pub use op_n::{
-    FixedHzBitcrusher, MULTI_DRIVE_SCALES, MultiDrivePolyAdaaChannel, OpNBackend,
-    QuadratureHysteresis2D, ZohBitcrusher, c2_wavefolder, eval_adaa_cubic_c2_wavefolder_f64,
-    eval_chebyshev_4harm, eval_commuted_vs_uncommuted_lti_cascade_f64, eval_lobatto_basis_3node,
-    eval_saturated_polyadaa_rail_crossing_f64, eval_stage2_stereo_coupling_16d,
-    fold_stage2_latent_weights, hertz_phase_parameters, hertz_phase_step,
-    poly_adaa_algebraic_4ch_vec4, poly_adaa_algebraic_eval,
-    quantize_bitcrusher_nearest_ties_pos_inf, rescale_bitcrusher_phase_u128,
-    trust_region_softclip_4d,
+    FixedHzBitcrusher, OpNBackend, QuadratureHysteresis2D, ZohBitcrusher, c2_wavefolder,
+    eval_adaa_cubic_c2_wavefolder_f64, eval_adaa_cubic_c2_wavefolder_odd_f32, eval_chebyshev_4harm,
+    eval_commuted_vs_uncommuted_lti_cascade_f64, eval_lobatto_basis_3node,
+    eval_stage2_stereo_coupling_16d, fold_stage2_latent_weights, hertz_phase_parameters,
+    hertz_phase_step, quantize_bitcrusher_nearest_ties_pos_inf, rescale_bitcrusher_phase_u128,
+    tanh_pade5_4ch_vec4, trust_region_softclip_4d,
 };
 pub use op_t::{
     BallisticDuckingVca, FP16_DECAY_GAIN_BITS, OP_T_FULL_RING_CAPACITY, OP_T_LITE_RING_CAPACITY,
@@ -47,7 +45,8 @@ pub use op_t::{
 };
 pub use reference::{
     catmull_rom_hermite_f64, cubic_lagrange_weights_f64, eval_chebyshev_lfo_4harm_f64,
-    eval_newton_lobatto_basis_f64, eval_rank4_fm_interaction_f64, eval_trust_region_softclip_f64,
+    eval_newton_lobatto_basis_f64, eval_rank4_fm_interaction_f64,
+    eval_saturated_polyadaa_rail_crossing_f64, eval_trust_region_softclip_f64,
     givens_householder_mix_8ch_f64, givens_householder_mix_16ch_f64, op_m_modal_step_f64,
     op_t_coercive_step_f64, op_t_tank_slice_f64, poly_adaa_algebraic_f64, poly_adaa_slice_f64,
     poly_adaa_step_f64,

@@ -100,10 +100,11 @@ export default defineConfig(({ mode }) => {
         exclude: [
           "src/**/*.d.ts",
           "src/**/index.ts",
-          "src/public-exports.ts",
           "src/browser.ts",
           "src/node.ts",
           "src/internal/native/driver.ts",
+          "src/internal/native/wasm/exports.ts",
+          "src/internal/native/napi/bindings.ts",
           "src/web-audio/protocol.ts",
           "src/**/*.test.ts",
           "src/**/*.browser.test.ts",

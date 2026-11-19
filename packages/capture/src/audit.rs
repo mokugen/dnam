@@ -8,12 +8,19 @@
 
 use std::collections::BTreeSet;
 
-use dnam_engine::FtzDazGuard;
-use dnam_engine::stages::Stage2CommutedCascade;
+use dnam_engine::math::ScalarBackend;
+use dnam_engine::stages::hot_core::V3CoreInstance;
+use dnam_engine::stages::weights::{
+    ARENA_LITE_BYTES, PIPE_FLAG_V3_MATRYOSHKA, has_pipeline_flag, unpack_v3_tier_from_arena,
+};
+use dnam_engine::{FtzDazGuard, Tier};
 
 pub mod arena;
 pub mod manifest;
 
+pub(crate) use arena::{
+    ensure_gru_block_zero_input_contraction, ensure_model_overdrive_silence_recovery,
+};
 pub use arena::{run_full_3phase_arena_audit, run_head_only_3phase_arena_audit};
 pub use manifest::{
     recompute_vault_phase1_audit_and_clamps, recompute_vault_phase1_audit_and_clamps_with_windows,
@@ -143,10 +150,12 @@ pub fn verify_dynamic_stability_excursion(
 #[must_use]
 pub fn clamp_head_spectral_gain_linear(peak_gain_linear: f32) -> (f32, bool) {
     const MAX_GAIN_6DB_LIN: f32 = 1.995_262_3; // 10^(6/20)
+    // Stay ~33 ULPs inside +6.0 dB so f32 readout scaling is 0-ULP idempotent under re-audit.
+    const MAX_GAIN_IDEMPOTENT: f32 = 1.995_258_3;
     if !peak_gain_linear.is_finite() || peak_gain_linear < 0.0 {
         (0.0, true)
     } else if peak_gain_linear > MAX_GAIN_6DB_LIN {
-        (MAX_GAIN_6DB_LIN / peak_gain_linear, true)
+        (MAX_GAIN_IDEMPOTENT / peak_gain_linear, true)
     } else {
         (1.0, false)
     }
@@ -232,49 +241,64 @@ pub fn compute_phase2_corner_barrier_loss(
     barrier.max(0.0)
 }
 
-/// Phase-2 `[CLAMP-RAIL]` `2,048`-Sample `PolyADAA` Rail-Lockup Audit (`ref[train.audit.phase2.clamp-rail]`).
+/// Phase-2 `[CLAMP-RAIL]` `2,048`-Sample GRU Bounded-State Saturation Audit (`ref[train.audit.phase2.clamp-rail]`).
 ///
-/// Steps `2,048` samples of a multi-tone probe through [`Stage2CommutedCascade`] at `corner_drive`
-/// and `corner_sag`. Returns `(rail_occupancy_ratio, safe_drive_scale, rail_locked)` where
-/// `rail_locked == true` when normalized drive occupancy exceeds `0.95` (`95%`).
+/// Steps `2,048` samples of a multi-tone probe through [`V3CoreInstance`] at `corner_drive`,
+/// checking output envelope and GRU hidden-state saturation (`[-2.5, 2.5]`). Returns
+/// `(saturation_occupancy_ratio, safe_drive_scale, saturated)` where `saturated == true` when
+/// normalized saturation occupancy exceeds `0.95` (`95%`) or any sample is non-finite / `> 100.0`.
 #[must_use]
-pub fn audit_phase2_polyadaa_rail_lockup(
+pub fn audit_phase2_gru_state_saturation(
     arena_bytes: &[u8],
     corner_drive: f32,
-    corner_sag: f32,
 ) -> (f32, f32, bool) {
     const BURST_SAMPLES: usize = 2_048;
-    const RAIL_OCCUPANCY_LIMIT: f32 = 0.95;
+    const SAT_OCCUPANCY_LIMIT: f32 = 0.95;
 
-    if !corner_drive.is_finite() || corner_drive <= 0.0 || !corner_sag.is_finite() {
+    if !corner_drive.is_finite() || corner_drive <= 0.0 || arena_bytes.len() < ARENA_LITE_BYTES {
         return (1.0, 0.25, true);
     }
     let _ftz = FtzDazGuard::new();
-    let mut cascade = Stage2CommutedCascade::default();
-    cascade.load_from_arena(arena_bytes);
-    cascade.init_dc_equilibrium(0.0, cascade.v1a_beta, cascade.v1a_delta);
+    let cold = if has_pipeline_flag(arena_bytes, PIPE_FLAG_V3_MATRYOSHKA) {
+        unpack_v3_tier_from_arena(arena_bytes, Tier::Lite, false)
+    } else {
+        dnam_engine::stages::stage3_cab::V3ColdTierModel::identity_for_tier(
+            Tier::Lite,
+            false,
+            false,
+        )
+    };
+    let mut inst = V3CoreInstance::<ScalarBackend>::from_cold_model(&cold);
+    inst.reset_to_dc_equilibrium();
 
     let eff_drive = corner_drive.clamp(0.1, 64.0);
-    let eff_sag = corner_sag.clamp(0.0, 0.8);
-    let mut rail_hits = 0usize;
-    let v1a_beta = cascade.v1a_beta.max(0.1);
-    let v1b_beta = cascade.v1b_beta.max(0.1);
-
+    let mut sat_hits = 0usize;
+    let mut max_out = 0.0_f32;
     for n in 0..BURST_SAMPLES {
         let t = n as f32;
-        let x = 0.85 * ((0.065_449_85 * t).sin() + 0.35 * (0.219_911_49 * t).cos());
-        let _ = cascade.step_frame(x, -x, eff_drive, eff_sag);
-        let u1_norm = (x * eff_drive * v1a_beta).abs();
-        let u2_norm = (cascade.prev_v1a_l * v1b_beta).abs();
-        if u1_norm >= 1.0 || u2_norm >= 1.0 {
-            rail_hits += 1;
+        let x = 0.85 * eff_drive * ((0.065_449_85 * t).sin() + 0.35 * (0.219_911_49 * t).cos());
+        let [yl, yr] = inst.step_stereo(x, -x);
+        if !yl.is_finite() || !yr.is_finite() {
+            return (1.0, 0.25, true);
+        }
+        max_out = max_out.max(yl.abs()).max(yr.abs());
+        let hot = inst.hot_core();
+        let gru_sat = hot
+            .state_l
+            .h
+            .iter()
+            .chain(hot.state_r.h.iter())
+            .flat_map(|blk| blk.iter().flat_map(|g| g.iter()))
+            .any(|&h| h.abs() >= 2.35);
+        if gru_sat || yl.abs() >= 0.65 || yr.abs() >= 0.65 || yl.abs() > 25.0 || yr.abs() > 25.0 {
+            sat_hits += 1;
         }
     }
 
-    let occupancy = (rail_hits as f32) / (BURST_SAMPLES as f32);
-    if occupancy > RAIL_OCCUPANCY_LIMIT {
-        let safe_scale = (0.85 / (eff_drive * v1a_beta).max(1.0)).clamp(0.05, 1.0);
-        (occupancy, safe_scale, true)
+    let occupancy = (sat_hits as f32) / (BURST_SAMPLES as f32);
+    if occupancy > SAT_OCCUPANCY_LIMIT || max_out > 100.0 {
+        let safe_scale = (2.0 / eff_drive.max(2.0)).clamp(0.05, 1.0);
+        (occupancy.max(0.96), safe_scale, true)
     } else {
         (occupancy, 1.0, false)
     }
@@ -364,26 +388,40 @@ mod tests {
         assert!(b_viol > 1.0e4);
         assert!(b_nan >= 1.0e6);
 
-        let mut arena = vec![0u8; 64_000];
-        let (occ_lo, scale_lo, locked_lo) = audit_phase2_polyadaa_rail_lockup(&arena, 0.5, 0.2);
+        use dnam_engine::stages::stage3_cab::V3MatryoshkaModel;
+        use dnam_engine::stages::weights::{
+            ARENA_ULTRA_BYTES, ARENA0_DIRECT_READOUT_OFFSET, ARENA0_STAGE3_KAUTZ_OFFSET,
+            ARENA0_STAGE4_TANK_OFFSET, pack_v3_matryoshka_to_arena,
+        };
+
+        let mut arena = vec![0u8; ARENA_ULTRA_BYTES];
+        let v3_id = V3MatryoshkaModel::identity(true, false);
+        pack_v3_matryoshka_to_arena(&v3_id, &mut arena);
+
+        let (occ_lo, scale_lo, locked_lo) = audit_phase2_gru_state_saturation(&arena, 0.5);
         assert!(!locked_lo && scale_lo == 1.0 && occ_lo < 0.95);
-        write_arena_f32(&mut arena, 4_112, 8.0);
-        let (occ_hi, scale_hi, locked_hi) = audit_phase2_polyadaa_rail_lockup(&arena, 12.0, 0.2);
+        let (occ_hi, scale_hi, locked_hi) = audit_phase2_gru_state_saturation(&arena, 12.0);
         assert!(locked_hi && occ_hi > 0.95 && scale_hi < 1.0);
-        let (_, _, locked_nan) = audit_phase2_polyadaa_rail_lockup(&arena, f32::NAN, 0.2);
+        let (_, _, locked_nan) = audit_phase2_gru_state_saturation(&arena, f32::NAN);
         assert!(locked_nan);
 
-        // Trigger full 3-phase arena audit clamping on out-of-bounds poles, tank, and head modes
-        write_arena_f32(&mut arena, 4_416, 1.02);
-        write_arena_f32(&mut arena, 4_672, 2.0);
-        write_arena_f32(&mut arena, 4_688, 1.05);
-        write_arena_f32(&mut arena, 4_928 + 512, 25.0);
+        // Trigger full 3-phase v3 arena audit clamping on out-of-bounds Kautz poles, tank, and readout
+        write_arena_f32(&mut arena, ARENA0_STAGE3_KAUTZ_OFFSET, 1.02);
+        arena[ARENA0_STAGE4_TANK_OFFSET..ARENA0_STAGE4_TANK_OFFSET + 4]
+            .copy_from_slice(&2_u32.to_le_bytes());
+        write_arena_f32(&mut arena, ARENA0_STAGE4_TANK_OFFSET + 16, 1.05);
+        write_arena_f32(&mut arena, ARENA0_DIRECT_READOUT_OFFSET + 96, 25.0);
         let mut manifest = DnamProjManifest::default_reference();
         run_full_3phase_arena_audit(&mut manifest, &mut arena);
-        assert!(read_arena_f32(&arena, 4_416) <= 0.9995);
-        assert!(read_arena_f32(&arena, 4_672) >= 4.0);
-        assert!(read_arena_f32(&arena, 4_688) <= 0.9990);
-        assert!(read_arena_f32(&arena, 4_928 + 512) < 25.0);
+        assert!(read_arena_f32(&arena, ARENA0_STAGE3_KAUTZ_OFFSET) <= 0.9995);
+        let clamped_delay = u32::from_le_bytes(
+            arena[ARENA0_STAGE4_TANK_OFFSET..ARENA0_STAGE4_TANK_OFFSET + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert!(clamped_delay >= 4);
+        assert!(read_arena_f32(&arena, ARENA0_STAGE4_TANK_OFFSET + 16) <= 0.9990);
+        assert!(read_arena_f32(&arena, ARENA0_DIRECT_READOUT_OFFSET + 96) < 25.0);
         let ar = manifest.audit_report.expect("audit report");
         assert!(ar.phase1_clamps.iter().any(|t| t == "CLAMP-STABILITY"));
         assert!(ar.phase3_clamps.iter().any(|t| t == "CLAMP-HEAD-GAIN"));

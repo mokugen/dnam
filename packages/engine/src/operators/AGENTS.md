@@ -3,7 +3,7 @@
 Implements the three fundamental real-time DSP kernel operators of TORA (`#[forbid(unsafe_code)]`):
 1. **Op-T (Transport & Elastic Buffer):** Fractional delay, Dual-Mode slew/crossfade, and diffusers.
 2. **Op-M (Modal Bank & Kautz):** Symplectic recurrence, Newton rotor, and Kautz filter.
-3. **Op-N (Commuted Cascade & PolyADAA):** Multi-drive `1×` B-spline `PolyADAA` and wavefolders.
+3. **Op-N (Nonlinear Activation & Shaping):** Division-free Padé `[5/4]` `tanh` (`OpNBackend`), wavefolder & bitcrusher.
 
 ## 1. Submodule Map
 
@@ -11,6 +11,7 @@ Implements the three fundamental real-time DSP kernel operators of TORA (`#[forb
 | :--- | :--- | :--- |
 | [`op_t.rs`](op_t.rs) ([`delay_and_diffuser.rs`](op_t/delay_and_diffuser.rs), [`ring_and_guard.rs`](op_t/ring_and_guard.rs)) | Catmull-Rom fractional delay, ring buffer mask, and Schroeder diffusers | [`op_t_transport.md`](../../../../docs/specs/dsp/op_t_transport.md) |
 | [`op_m.rs`](op_m.rs) ([`kautz.rs`](op_m/kautz.rs), [`kautz/simd.rs`](op_m/kautz/simd.rs), [`hilbert.rs`](op_m/hilbert.rs), [`tracker.rs`](op_m/tracker.rs), [`tracker/dc_blocker.rs`](op_m/tracker/dc_blocker.rs)) | 4-lane SIMD symplectic recurrence, Kautz modal bank, Hilbert & pitch tracker | [`op_m_modal_kautz.md`](../../../../docs/specs/dsp/op_m_modal_kautz.md) |
-| [`op_n.rs`](op_n.rs) ([`polyadaa.rs`](op_n/polyadaa.rs), [`polyadaa/lanes.rs`](op_n/polyadaa/lanes.rs), [`polyadaa/rail.rs`](op_n/polyadaa/rail.rs), [`wavefolder_and_bitcrusher.rs`](op_n/wavefolder_and_bitcrusher.rs), [`commuted_and_ctrl.rs`](op_n/commuted_and_ctrl.rs)) | `PolyADAA`, resting DC equilibrium, wavefolder & bitcrusher kernels | [`op_n_commuted_cascade.md`](../../../../docs/specs/dsp/op_n_commuted_cascade.md) |
+| [`op_n.rs`](op_n.rs) ([`wavefolder_and_bitcrusher.rs`](op_n/wavefolder_and_bitcrusher.rs), [`commuted_and_ctrl.rs`](op_n/commuted_and_ctrl.rs)) | `OpNBackend` Padé `[5/4]` `tanh`, `C^2` wavefolder, hysteresis & bitcrusher kernels | [`op_n_commuted_cascade.md`](../../../../docs/specs/dsp/op_n_commuted_cascade.md) |
+| [`reference.rs`](reference.rs) ([`rail_crossing.rs`](reference/rail_crossing.rs)) | Standalone `f64` reference DSP & saturated `PolyADAA` rail-crossing verifier | [`op_n_commuted_cascade.md`](../../../../docs/specs/dsp/op_n_commuted_cascade.md) |
 
 See [`packages/engine/CONTRIBUTING.md`](../../CONTRIBUTING.md) for SIMD vector register and zero-allocation invariants.

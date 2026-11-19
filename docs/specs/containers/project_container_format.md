@@ -15,14 +15,13 @@ requirements:
   - REQ-8.2
   - REQ-8.8
 adrs:
-  - ADR-0008
-  - ADR-0017
   - ADR-0020
+  - ADR-0021
 ---
 
 # Single-File Cloud-Ready Project & Capture Vault Container (`.dnam-proj` / `DNPJ`)
 
-This specification defines the **`.dnam-proj` (`b"DNPJ"`, `v2.0`-Only) Project & Capture Vault Binary Format** owned by [`packages/capture/`](../../../packages/capture/README.md) (`dnam_capture::proj`), pairing with the runtime `.dnam` wire specification in [`dnam_binary_format.md`](dnam_binary_format.md) to fulfill [`REQ-3.1`–`REQ-3.3`, `REQ-5.3`, `REQ-8.1`, `REQ-8.2`, `REQ-8.8`](../../requirements/system_goals_and_requirements.md). For architectural trade-offs and cloud object-storage design rationales, see [`../../adr/0008-per-stem-kronecker-statistics-and-wide-gram.md`](../../adr/0008-per-stem-kronecker-statistics-and-wide-gram.md), [`../../adr/0017-pure-rust-analytical-varpro-solver-and-planar-decoupling.md`](../../adr/0017-pure-rust-analytical-varpro-solver-and-planar-decoupling.md), and [`../../adr/0020-modular-monorepo-and-dnam-proj-container.md`](../../adr/0020-modular-monorepo-and-dnam-proj-container.md).
+This specification defines the **`.dnam-proj` (`b"DNPJ"`, `v2.0`-Only) Project & Capture Vault Binary Format** owned by [`packages/capture/`](../../../packages/capture/README.md) (`dnam_capture::proj`), pairing with the runtime `.dnam` wire specification in [`dnam_binary_format.md`](dnam_binary_format.md) to fulfill [`REQ-3.1`–`REQ-3.3`, `REQ-5.3`, `REQ-8.1`, `REQ-8.2`, `REQ-8.8`](../../requirements/system_goals_and_requirements.md). For architectural trade-offs and cloud object-storage design rationales, see [`../../adr/0020-modular-monorepo-and-dnam-proj-container.md`](../../adr/0020-modular-monorepo-and-dnam-proj-container.md) and [`../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md).
 
 ---
 
@@ -31,8 +30,8 @@ This specification defines the **`.dnam-proj` (`b"DNPJ"`, `v2.0`-Only) Project &
 ```mermaid
 stateDiagram-v2
     [*] --> Calibrated: Record CALB (64 B)
-    Calibrated --> Capturing: Append SPCM raw stems + INPC/STMC capsules
-    Capturing --> TrainedFull: Run 5-Stage VarPro -> STAT + WGHT (+ AUTH)
+    Calibrated --> Capturing: Append SPCM raw stems + 2.0-2.5s fp32 INPC/STMC capsules
+    Capturing --> TrainedFull: Run Windowed-BPTT + VarPro -> STAT + WGHT (+ AUTH)
     TrainedFull --> TrainedCompacted: compact_to_capsules() strips SPCM (< 1 ms)
     TrainedFull --> RuntimeExport: export_runtime_dnam() slices WGHT (< 0.2 ms)
     TrainedCompacted --> TrainedCompacted: Vault add/remove/replace/toggle (Two-Path)
@@ -59,9 +58,9 @@ stateDiagram-v2
 | [Payload Region: 64 B-aligned chunks in contiguous ascending file-offset order]                   |
 |   • CALB (64 B)                        Loopback latency, converter gain, noise-floor profile      |
 |   • SPCM (optional raw PCM stems)      Active-session lossless audio (stripped on compaction)     |
-|   • INPC (24,640 B mono / 48,640 B st) Shared 250 ms fp16 dry excitation coreset                  |
-|   • STMC (28,800 B mono / 52,800 B st) 128 B hdr + R<=36 16 B windows + 4,096 B spec + fp16 wet   |
-|   • STAT (267,264 B at Ultra 256-D)    StarCenter uplo='U' f64 Gram + 2-ch cross-correlation      |
+|   • INPC (64 B aligned fp32, <= 960KB) Shared 2.0-2.5 s (96k-120k) full-bandwidth fp32 dry capsule|
+|   • STMC (64 B aligned fp32, ~400-960K) 128 B hdr + R<=36 windows + 4,096 B spec + fp32 wet cap.  |
+|   • STAT (cached trajectories + uploU) StarCenter Stage B trajectories + f64 uplo='U' readout Gram|
 |   • WGHT (canonical v2.0 .dnam bytes)  Complete [STAB-ZERO-DC] runtime model (< 0.2 ms export)    |
 |   • AUTH (128 B Ed25519 envelope)      Creator signature ("DNPJ-PROJECT-MANIFEST-V2")             |
 +===================================================================================================+
@@ -107,24 +106,24 @@ A `.dnam-proj` container transitions monotonically or non-destructively across v
 
 `r[container.proj.inpc-capsule]`
 
-The `INPC` chunk (`chunk_id = 0`) stores the shared `250 ms` (`12,000`-frame at `48 kHz`) dry excitation coreset quantized to IEEE-754 binary16 (`fp16`, round-to-nearest-even with full 10-bit subnormals) inside a fixed `64 B`-aligned record (`24,640 B` for mono `C_in = 1`, or `48,640 B` for stereo `C_in = 2`), prefixed by a `640 B` `INPC` header (`magic = b"INPC"`, `version = 2`, `channels`, `coreset_frames = 12_000`, `header_crc32c` at `24..28`, `256 B` dry spectral envelope, and `320 B` transient/comb leverage index).
+The `INPC` chunk (`chunk_id = 0`) stores the shared **`2.0–2.5 s` (`96,000–120,000`-frame at `48 kHz`) full-bandwidth (`20 Hz–20 kHz`) `fp32` (`IEEE-754 binary32`)** dry excitation capsule inside a `64 B`-aligned record (`~384–480 KiB` for mono `C_in = 1`, `~768–960 KiB` for stereo `C_in = 2`), prefixed by the `640 B` `INPC` header (`magic = b"INPC"`, `version`, `channels`, `coreset_frames`, `header_crc32c` at `24..28`, `256 B` dry spectral envelope, and `320 B` transient/comb leverage index), retaining full `18–20 kHz` HF air and sub-second/multi-second dynamic envelopes inside `< 20 MB` multi-stem `.dnam-proj` vaults (`REQ-5.4`).
 
 ### 2.2 Per-Stem Response Coreset Capsule (`STMC`)
 
 `r[container.proj.stmc-capsule]`
 
-Each stem $s$ in `stems_registry` owns a dedicated `STMC` chunk (`chunk_id == stem_index`) of fixed `64 B`-aligned size (`28,800 B` for mono `C_out = 1`, or `52,800 B` for stereo `C_out = 2`) containing:
-1. **`128 B` `STMC` Header (`magic = b"STMC"`, `version = 2`):** `stem_index` (`u16`, matching `StemRegistryEntry::chunk_id`), `flags` (`STMC_FLAG_ENABLED`, `STMC_FLAG_STAR_CENTER`, `STMC_FLAG_MODE_A_SWEEP`, `STMC_FLAG_STEREO`, verified in strict bijection with `stems_registry`), `window_count` (`1..=36`), `pad_gain_f32`, `fractional_lag_samples_f32`, `88 B` `uplo='U'` band-energy PSD summary (`24..112`), `n_comb_bins` (`112..116`), `coreset_frames = 12_000` (`116..120`), and `capsule_crc32c` (`120..124`).
+Each stem $s$ in `stems_registry` owns a dedicated `STMC` chunk (`chunk_id == stem_index`) of `64 B`-aligned size (`~389–485 KiB` for mono `C_out = 1`, `~773–965 KiB` for stereo `C_out = 2`, keeping compacted multi-stem projects strictly `< 20 MB` per `REQ-5.4`) containing:
+1. **`128 B` `STMC` Header (`magic = b"STMC"`, `version`):** `stem_index` (`u16`, matching `StemRegistryEntry::chunk_id`), `flags` (`STMC_FLAG_ENABLED`, `STMC_FLAG_STAR_CENTER`, `STMC_FLAG_MODE_A_SWEEP`, `STMC_FLAG_STEREO`, verified in strict bijection with `stems_registry`), `window_count` (`1..=36`), `pad_gain_f32`, `fractional_lag_samples_f32`, `88 B` `uplo='U'` band-energy PSD summary (`24..112`), `n_comb_bins` (`112..116`), `coreset_frames` (`96,000..=120,000` at `48 kHz`), and `capsule_crc32c` (`120..124`).
 2. **`576 B` Trajectory Window Table (`128..704`) & `4,096 B` Spectral Summary (`704..4,800`):** Up to `R <= 36` `16 B` `StmcTrajectoryWindow` records (`control_id`, `ctrl_kind`, `active_opt`, `u_phys`, `window_weight`, `emr_velocity`) driving Phase-1 range/switch unlocking and `CP1` Newton-Lobatto assembly, followed by a `4,096 B` harmonic/sideband/ballistic summary block.
-3. **`24,000 B` (`C_out = 1`) / `48,000 B` (`C_out = 2`) `fp16` Aligned Wet Coreset (`4,800..`):** Exact `12,000`-frame phase-aligned wet response paired sample-for-sample with `INPC`.
+3. **Full-Bandwidth `fp32` Aligned Wet Capsule (`4,800..`):** `96,000–120,000`-frame `f32` phase-aligned full-bandwidth wet response paired sample-for-sample with `INPC`, enabling lossless raw-audio-free `Path 2` Stage B/C/D re-pooling without source WAV files.
 
 ### 2.3 Tier-Ordered Upper-Triangular `StarCenter` Statistics (`STAT`)
 
 `r[container.proj.stat-uplo-u]`
 
-The `STAT` chunk stores the `StarCenter` (`Mode-0`) feature-bus sufficient statistics in **tier-ordered column-major upper-triangular (`uplo = 'U'`) `IEEE-754 float64` layout** (`Lite` `64-D` $\subset$ `Full` `128-D` $\subset$ `Pro` `192-D` $\subset$ `Ultra` `256-D`, `REQ-5.3`):
+The `STAT` chunk stores cached `StarCenter` Stage B backbone trajectories paired with tier-ordered column-major upper-triangular (`uplo = 'U'`) `IEEE-754 float64` direct-readout sufficient statistics (`Lite` $\subset$ `Full` $\subset$ `Pro` $\subset$ `Ultra`, `REQ-5.3`):
 $$\mathrm{idx}(i, j) = i + \frac{j(j + 1)}{2}, \qquad 0 \le i \le j < D_T$$
-At tier dimension $D_T \in \lbrace 64, 128, 192, 256 \rbrace$, `STAT` packs $\frac{D_T(D_T + 1)}{2}$ upper-triangular `f64` Gram entries ($\mathbf{G}_0$, `263,168 B` at `D = 256`) followed immediately by $2 \times D_T$ `f64` two-channel cross-correlation entries ($\mathbf{C}_0$, `4,096 B` at `D = 256`, total `267,264 B` = `4,176` cache lines), verified on load for exact byte length, finite `f64` values, and non-negative diagonal entries $G_{ii} \ge 0$.
+At active tier readout dimension $D_T$, `STAT` packs $\frac{D_T(D_T + 1)}{2}$ upper-triangular `f64` Gram entries ($\mathbf{G}_0$), $2 \times D_T$ `f64` two-channel cross-correlation entries ($\mathbf{C}_0$), and the cached `StarCenter` trajectory prefix, verified on load for exact byte alignment, finite `f64`/`f32` values, and non-negative diagonal entries $G_{ii} \ge 0$, guaranteeing `< 150 ms` `Path 1` incremental control solves with `0-ULP` `StarCenter` invariance.
 
 ---
 

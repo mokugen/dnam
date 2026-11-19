@@ -5,7 +5,7 @@
 //! inside a single `64 B`-aligned cloud-ready container featuring:
 //! - Front-loaded `64 B` Preamble + `64 B * N` Chunk Directory (`crc32c` + `sha256`) + RFC 8785 JCS
 //!   `DnamProjManifest` at byte `0` for `HTTP Range: bytes=0-65535` inspection (`parse_proj_manifest_range`).
-//! - `CALB`, `SPCM`, `INPC` (`24,640 B` / `48,640 B`), `STMC` (`28,800 B` / `52,800 B`), `STAT`
+//! - `CALB`, `SPCM`, `INPC` (`384,640 B` / `768,640 B`), `STMC` (`388,800 B` / `772,800 B`), `STAT`
 //!   (`267,264 B` `StarCenter` `uplo='U'`), `WGHT` (`[STAB-ZERO-DC]` runtime `.dnam`), and `AUTH` chunks.
 //! - `< 1 ms` `compact_to_capsules`, `< 0.2 ms` `export_runtime_dnam`, and Two-Path Capture Vault
 //!   editing (`add_capture`, `remove_capture`, `replace_capture`, `set_capture_enabled`).
@@ -28,20 +28,21 @@ pub use directory::{
     CalbChunk64B, DnamProjPreamble, InpcCapsuleView, ParsedProjManifestRange, ProjAuthRecord,
     ProjChunkDirEntry, ProjChunkKind, StmcCapsuleView, StmcTrajectoryWindow,
     build_proj_auth_signing_message, build_proj_inpc_capsule, build_proj_stmc_capsule,
-    compute_proj_header_crc32c, parse_proj_manifest_range, set_stmc_capsule_enabled_flag,
-    set_stmc_capsule_star_center_flag, verify_proj_auth_chunk, verify_proj_inpc_capsule,
-    verify_proj_stat_uplo_u, verify_proj_stmc_capsule,
+    compute_proj_header_crc32c, decode_proj_inpc_f32, decode_proj_stmc_f32,
+    parse_proj_manifest_range, set_stmc_capsule_enabled_flag, set_stmc_capsule_star_center_flag,
+    verify_proj_auth_chunk, verify_proj_inpc_capsule, verify_proj_stat_uplo_u,
+    verify_proj_stmc_capsule,
 };
 pub use schema::{
     AuditReport, CalibrationSummary, DnamProjManifest, ExtractedPhysics, ProjectMeta,
     RigRoutingConfig, SolverTelemetrySummary, StemProvenance, StemRegistryEntry,
 };
 pub use vault::{
-    VaultCaptureSpec, add_capture, add_capture_with_options,
+    VaultCaptureSpec, add_capture, add_capture_with_options, add_capture_with_progress,
     recompute_vault_phase1_audit_and_clamps, recompute_vault_phase1_audit_and_clamps_with_windows,
     remove_capture, remove_capture_with_options, replace_capture, replace_capture_with_options,
     set_capture_enabled, set_capture_enabled_with_options, solve_captures_batch_into_proj,
-    solve_captures_batch_with_options,
+    solve_captures_batch_with_options, solve_captures_batch_with_progress,
 };
 
 /// Magic bytes for a `.dnam-proj` authoring project & Capture Vault container (`b"DNPJ"`).
@@ -68,17 +69,17 @@ pub const MAX_PROJ_CHUNKS: usize = 4_096;
 /// Byte length of the `AUTH` `Ed25519` creator attestation chunk (`128 B` = `2 × 64 B`).
 pub const PROJ_AUTH_RECORD_BYTES: usize = 128;
 
-/// Byte length of a mono `INPC` dry stimulus capsule (`385 × 64 B = 24,640 B`).
-pub const INPC_MONO_BYTES: usize = 24_640;
+/// Canonical byte length of a `2.0 s` mono `INPC` dry stimulus capsule (`640 + 384,000 = 384,640 B`).
+pub const INPC_MONO_BYTES: usize = 640 + crate::CORESET_FP32_MONO_BYTES;
 
-/// Byte length of a stereo `INPC` dry stimulus capsule (`760 × 64 B = 48,640 B`).
-pub const INPC_STEREO_BYTES: usize = 48_640;
+/// Canonical byte length of a `2.0 s` stereo `INPC` dry stimulus capsule (`640 + 768,000 = 768,640 B`).
+pub const INPC_STEREO_BYTES: usize = 640 + crate::CORESET_FP32_STEREO_BYTES;
 
-/// Byte length of a mono `STMC` `StemCaptureRecord` capsule (`450 × 64 B = 28,800 B`).
-pub const STMC_MONO_BYTES: usize = 28_800;
+/// Canonical byte length of a `2.0 s` mono `STMC` `StemCaptureRecord` capsule (`4,800 + 384,000 = 388,800 B`).
+pub const STMC_MONO_BYTES: usize = 4_800 + crate::CORESET_FP32_MONO_BYTES;
 
-/// Byte length of a stereo `STMC` `StemCaptureRecord` capsule (`825 × 64 B = 52,800 B`).
-pub const STMC_STEREO_BYTES: usize = 52_800;
+/// Canonical byte length of a `2.0 s` stereo `STMC` `StemCaptureRecord` capsule (`4,800 + 768,000 = 772,800 B`).
+pub const STMC_STEREO_BYTES: usize = 4_800 + crate::CORESET_FP32_STEREO_BYTES;
 
 /// Maximum trajectory windows in an `STMC` capsule (`36 × 16 B = 576 B`).
 pub const STMC_MAX_TRAJECTORY_WINDOWS: usize = 36;
@@ -124,7 +125,7 @@ pub const STMC_FLAG_ENABLED: u16 = 1 << 0;
 pub const STMC_FLAG_STAR_CENTER: u16 = 1 << 1;
 /// Bit 2: Stem is a time-varying Mode A continuous sweep (`R > 1` windows).
 pub const STMC_FLAG_MODE_A_SWEEP: u16 = 1 << 2;
-/// Bit 3: Stem wet coreset has stereo (`2`) channels (`48,000 B`).
+/// Bit 3: Stem wet coreset has stereo (`2`) channels (`fp32`).
 pub const STMC_FLAG_STEREO: u16 = 1 << 3;
 /// Bit 4: Wet return was polarity-inverted prior to alignment normalization.
 pub const STMC_FLAG_WET_POLARITY_INVERTED: u16 = 1 << 4;

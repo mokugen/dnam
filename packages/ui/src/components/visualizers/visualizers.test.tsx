@@ -2,9 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { expectZeroAxeViolations, setRangeInputValue } from "../../../tests/setup.js";
+import { ClampAuditVisualizer } from "./ClampAuditVisualizer.js";
+import { ControlBusVisualizer } from "./ControlBusVisualizer.js";
+import { KroneckerResumeVisualizer } from "./KroneckerResumeVisualizer.js";
+import { ModulatedUfdnVisualizer } from "./ModulatedUfdnVisualizer.js";
 import {
-  ClampAuditVisualizer,
-  ControlBusVisualizer,
   computeLobattoDegree,
   computePolyAdaaMetrics,
   computeRgLruInterpolation,
@@ -12,12 +14,10 @@ import {
   computeTrustRegionDamping,
   computeUfdnCrossfadeWeights,
   computeZohPoleRescaling,
-  KroneckerResumeVisualizer,
-  ModulatedUfdnVisualizer,
-  PolyAdaaVisualizer,
-  RgLruPoleVisualizer,
-  ZohRescalerVisualizer,
-} from "./index.js";
+} from "./models.js";
+import { PolyAdaaVisualizer } from "./PolyAdaaVisualizer.js";
+import { RgLruPoleVisualizer } from "./RgLruPoleVisualizer.js";
+import { ZohRescalerVisualizer } from "./ZohRescalerVisualizer.js";
 
 describe("Tri-Physics visualizer mathematical models", () => {
   it("computes PolyADAA, RG-LRU, M-UFDN, Lobatto, Kronecker, Trust-Region, and ZOH metrics", () => {

@@ -32,6 +32,12 @@ import type {
   Tier,
   TierInput,
 } from "../types.js";
+import {
+  averageStereoToMono,
+  finalizeAsyncOutput,
+  resolveOutputBuffers,
+  validateOutputBuffers,
+} from "./io-buffers.js";
 import { type BypassOptions, createStateScope, type FreezeOptions } from "./state-scopes.js";
 import { createEngineTransformStream, type StreamOptions } from "./stream.js";
 import { decodeTelemetryF64, type TelemetrySnapshot } from "./telemetry.js";
@@ -591,31 +597,7 @@ export class Engine<TParams extends ParameterValueMap = Record<string, number | 
     const { channels, frames } = coerceAudioChannels(input);
     const outChannelsCount = this.outputChannels;
     const blockSize = options?.blockSize;
-
-    let out: Float32Array[];
-    if (options?.output !== undefined) {
-      if (options.output.length !== outChannelsCount) {
-        throw new DnamError(
-          "ERR_DNAM_VALIDATION",
-          `options.output must have ${String(outChannelsCount)} channel(s), got ${String(options.output.length)}`,
-        );
-      }
-      for (let c = 0; c < outChannelsCount; c++) {
-        if (options.output[c]?.length !== frames) {
-          throw new DnamError(
-            "ERR_DNAM_VALIDATION",
-            `options.output[${String(c)}] length (${String(options.output[c]?.length)}) must match input frames (${String(frames)})`,
-          );
-        }
-      }
-      out = options.output;
-    } else {
-      out =
-        outChannelsCount === 2
-          ? [new Float32Array(frames), new Float32Array(frames)]
-          : [new Float32Array(frames)];
-    }
-
+    const out = resolveOutputBuffers(options?.output, outChannelsCount, frames);
     if (frames === 0) {
       return out;
     }
@@ -637,7 +619,6 @@ export class Engine<TParams extends ParameterValueMap = Record<string, number | 
       return out;
     }
 
-    // Mono output (`outChannelsCount === 1`)
     const monoOut = out[0] as Float32Array;
     if (channels.length === 1) {
       h.processMono(ch0In, monoOut, blockSize);
@@ -653,9 +634,7 @@ export class Engine<TParams extends ParameterValueMap = Record<string, number | 
     const scratchL = this.#monoScratchLeft.subarray(0, frames);
     const scratchR = this.#monoScratchRight.subarray(0, frames);
     h.processStereo(ch0In, ch1In, scratchL, scratchR, blockSize);
-    for (let i = 0; i < frames; i++) {
-      monoOut[i] = 0.5 * ((scratchL[i] ?? 0) + (scratchR[i] ?? 0));
-    }
+    averageStereoToMono(scratchL, scratchR, monoOut, frames);
     return out;
   }
 
@@ -682,20 +661,7 @@ export class Engine<TParams extends ParameterValueMap = Record<string, number | 
     const { channels, frames } = coerceAudioChannels(input);
     const outChannelsCount = this.outputChannels;
     if (out !== undefined) {
-      if (out.length !== outChannelsCount) {
-        throw new DnamError(
-          "ERR_DNAM_VALIDATION",
-          `output must have ${String(outChannelsCount)} channel(s), got ${String(out.length)}`,
-        );
-      }
-      for (let c = 0; c < outChannelsCount; c++) {
-        if (out[c]?.length !== frames) {
-          throw new DnamError(
-            "ERR_DNAM_VALIDATION",
-            `output[${String(c)}] length (${String(out[c]?.length)}) must match input frames (${String(frames)})`,
-          );
-        }
-      }
+      validateOutputBuffers(out, outChannelsCount, frames, "output");
     }
     const leftIn = channels[0] as Float32Array;
     const rightIn = (channels[1] ?? channels[0]) as Float32Array;
@@ -704,24 +670,7 @@ export class Engine<TParams extends ParameterValueMap = Record<string, number | 
       detachInputBuffers(channels, out);
     }
     const [leftOut, rightOut] = await pending;
-
-    if (outChannelsCount === 1) {
-      const monoOut = out !== undefined ? (out[0] as Float32Array) : leftOut;
-      if (channels.length === 2) {
-        for (let i = 0; i < frames; i++) {
-          monoOut[i] = 0.5 * ((leftOut[i] ?? 0) + (rightOut[i] ?? 0));
-        }
-      } else if (out !== undefined) {
-        monoOut.set(leftOut);
-      }
-      return out !== undefined ? out : [monoOut];
-    }
-    if (out !== undefined) {
-      out[0]?.set(leftOut);
-      out[1]?.set(rightOut);
-      return out;
-    }
-    return [leftOut, rightOut];
+    return finalizeAsyncOutput(leftOut, rightOut, channels.length, outChannelsCount, frames, out);
   }
 
   /**

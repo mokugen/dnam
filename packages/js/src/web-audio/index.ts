@@ -6,12 +6,14 @@
  */
 
 export {
-  createWasmMemory,
-  isSharedWasmMemorySupported,
   WASM_DEFAULT_INITIAL_PAGES,
   WASM_DEFAULT_MAXIMUM_PAGES,
   WASM_MAX_PAGES,
   WASM_MIN_INITIAL_PAGES,
+} from "../internal/native/wasm/memory.js";
+export {
+  createWasmMemory,
+  isSharedWasmMemorySupported,
   type WasmMemoryOptions,
 } from "../internal/native/wasm.js";
 export {

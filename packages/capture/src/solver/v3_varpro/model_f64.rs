@@ -4,11 +4,16 @@
 use std::f64::consts::PI;
 
 use dnam_engine::Tier;
-use dnam_engine::stages::v3_core::cascade::{
+use dnam_engine::stages::router::V3Stage0Params;
+use dnam_engine::stages::stage1_svf::V3Stage1SvfParams as V3SvfParams;
+use dnam_engine::stages::stage2_gru::{
     MAX_BLOCK_LANES, MAX_GROUPS, MAX_KAUTZ_POLES, MAX_TOTAL_GRU_LANES, NUM_GRU_BLOCKS,
-    NUM_IN_FEATS_B0, V3InputFeaturesParams, V3OversamplerParams,
+    NUM_IN_FEATS_B0, V3ControlBusParams, V3GruBlockCold, V3InputFeaturesParams,
+    V3InterBlockToneSvfParams, V3OversamplerParams,
 };
-use dnam_engine::stages::v3_core::{V3GruBlockCold, V3MatryoshkaModel, V3SvfParams, V3TierReadout};
+use dnam_engine::stages::stage3_cab::V3Rate1xCalibration;
+use dnam_engine::stages::stage4_tank::v3_fdn::V3Stage4TankParams;
+use dnam_engine::stages::{V3MatryoshkaModel, V3TierReadout};
 
 pub use super::bezout7::Bezout7FilterBank;
 pub use super::dataset::{V3TrainDataset, V3TrainStem};
@@ -306,15 +311,22 @@ impl V3TierReadoutF64 {
 #[derive(Clone, Debug, PartialEq)]
 pub struct V3MatryoshkaOptF64 {
     pub os2x: bool,
+    pub tier_os2x: [bool; 4],
+    pub tier_blocks: [usize; 4],
     pub mono_out: bool,
     pub max_active_groups: usize,
     pub active_tier_weights: [f64; 4],
+    pub stage0: V3Stage0Params,
+    pub ctrl: V3ControlBusParams,
+    pub tone_svf: V3InterBlockToneSvfParams,
+    pub stage4: [V3Stage4TankParams; 4],
     pub os_up_quad: f64,
     pub os_dec_c_prev1: f64,
     pub os_dec_c0: f64,
     pub os_up_pre_emph: f64,
     pub os_dec_aa_mix: f64,
     pub os_up_aa_mix: f64,
+    pub os_up_zoh_mix: f64,
     pub svf_base_g: f64,
     pub svf_sec2_g_ratio: f64,
     pub svf_env_oct_sens: f64,
@@ -330,6 +342,7 @@ pub struct V3MatryoshkaOptF64 {
     pub svf_stereo_link: f64,
     pub svf_g_min: f64,
     pub svf_g_max: f64,
+    pub svf_feat_lp2_mix: f64,
     pub svf_stage2_feed_taps: [f64; 7],
     pub feat_in_hp_beta: f64,
     pub feat_fast_atk_beta: f64,
@@ -338,7 +351,10 @@ pub struct V3MatryoshkaOptF64 {
     pub feat_slow_atk_beta: f64,
     pub feat_slow_rel_beta: f64,
     pub feat_slow_det_comp: f64,
+    pub feat_key_link: f64,
+    pub feat_det_thresh: f64,
     pub blocks: [V3GruBlockF64; NUM_GRU_BLOCKS],
+    pub rate_1x_cal: Option<V3Rate1xCalibration>,
     pub kautz_poles: [(f64, f64); MAX_KAUTZ_POLES],
     pub readouts: [V3TierReadoutF64; 4],
 }
@@ -349,15 +365,22 @@ impl V3MatryoshkaOptF64 {
     pub fn zero_like(&self) -> Self {
         Self {
             os2x: self.os2x,
+            tier_os2x: self.tier_os2x,
+            tier_blocks: self.tier_blocks,
             mono_out: self.mono_out,
             max_active_groups: self.max_active_groups,
             active_tier_weights: self.active_tier_weights,
+            stage0: self.stage0,
+            ctrl: self.ctrl,
+            tone_svf: self.tone_svf,
+            stage4: self.stage4,
             os_up_quad: 0.0,
             os_dec_c_prev1: 0.0,
             os_dec_c0: 0.0,
             os_up_pre_emph: 0.0,
             os_dec_aa_mix: 0.0,
             os_up_aa_mix: 0.0,
+            os_up_zoh_mix: 0.0,
             svf_base_g: 0.0,
             svf_sec2_g_ratio: 0.0,
             svf_env_oct_sens: 0.0,
@@ -373,6 +396,7 @@ impl V3MatryoshkaOptF64 {
             svf_stereo_link: 0.0,
             svf_g_min: 0.0,
             svf_g_max: 0.0,
+            svf_feat_lp2_mix: 0.0,
             svf_stage2_feed_taps: [0.0; 7],
             feat_in_hp_beta: 0.0,
             feat_fast_atk_beta: 0.0,
@@ -381,7 +405,10 @@ impl V3MatryoshkaOptF64 {
             feat_slow_atk_beta: 0.0,
             feat_slow_rel_beta: 0.0,
             feat_slow_det_comp: 0.0,
+            feat_key_link: 0.0,
+            feat_det_thresh: 0.0,
             blocks: std::array::from_fn(|_| V3GruBlockF64::zeros()),
+            rate_1x_cal: None,
             kautz_poles: [(0.0, 0.0); MAX_KAUTZ_POLES],
             readouts: std::array::from_fn(|_| V3TierReadoutF64::zeros()),
         }
@@ -395,6 +422,7 @@ impl V3MatryoshkaOptF64 {
         self.os_up_pre_emph += rhs.os_up_pre_emph;
         self.os_dec_aa_mix += rhs.os_dec_aa_mix;
         self.os_up_aa_mix += rhs.os_up_aa_mix;
+        self.os_up_zoh_mix += rhs.os_up_zoh_mix;
         self.svf_base_g += rhs.svf_base_g;
         self.svf_sec2_g_ratio += rhs.svf_sec2_g_ratio;
         self.svf_env_oct_sens += rhs.svf_env_oct_sens;
@@ -410,6 +438,7 @@ impl V3MatryoshkaOptF64 {
         self.svf_stereo_link += rhs.svf_stereo_link;
         self.svf_g_min += rhs.svf_g_min;
         self.svf_g_max += rhs.svf_g_max;
+        self.svf_feat_lp2_mix += rhs.svf_feat_lp2_mix;
         for i in 0..7 {
             self.svf_stage2_feed_taps[i] += rhs.svf_stage2_feed_taps[i];
         }
@@ -420,6 +449,8 @@ impl V3MatryoshkaOptF64 {
         self.feat_slow_atk_beta += rhs.feat_slow_atk_beta;
         self.feat_slow_rel_beta += rhs.feat_slow_rel_beta;
         self.feat_slow_det_comp += rhs.feat_slow_det_comp;
+        self.feat_key_link += rhs.feat_key_link;
+        self.feat_det_thresh += rhs.feat_det_thresh;
         for b in 0..NUM_GRU_BLOCKS {
             self.blocks[b].add_assign(&rhs.blocks[b]);
         }
@@ -451,19 +482,27 @@ impl V3MatryoshkaOptF64 {
     }
 
     /// Converts from cold `f32` [`V3MatryoshkaModel`].
+    #[inline(never)]
     #[must_use]
     pub fn from_matryoshka_cold(m: &V3MatryoshkaModel) -> Self {
         Self {
             os2x: m.os2x,
+            tier_os2x: m.tier_os2x,
+            tier_blocks: m.tier_blocks,
             mono_out: m.mono_out,
             max_active_groups: MAX_GROUPS,
             active_tier_weights: [0.15, 0.20, 0.28, 0.37],
+            stage0: m.stage0,
+            ctrl: m.ctrl,
+            tone_svf: m.tone_svf,
+            stage4: m.stage4,
             os_up_quad: f64::from(m.os_params.up_quad_coeff),
             os_dec_c_prev1: f64::from(m.os_params.dec_c_prev1),
             os_dec_c0: f64::from(m.os_params.dec_c0),
             os_up_pre_emph: f64::from(m.os_params.up_pre_emph),
             os_dec_aa_mix: f64::from(m.os_params.dec_aa_mix),
             os_up_aa_mix: f64::from(m.os_params.up_aa_mix),
+            os_up_zoh_mix: f64::from(m.os_params.up_zoh_mix),
             svf_base_g: f64::from(m.svf.base_g),
             svf_sec2_g_ratio: f64::from(m.svf.sec2_g_ratio),
             svf_env_oct_sens: f64::from(m.svf.env_oct_sens),
@@ -479,6 +518,7 @@ impl V3MatryoshkaOptF64 {
             svf_stereo_link: f64::from(m.svf.stereo_link),
             svf_g_min: f64::from(m.svf.g_min),
             svf_g_max: f64::from(m.svf.g_max),
+            svf_feat_lp2_mix: f64::from(m.svf.feat_lp2_mix),
             svf_stage2_feed_taps: std::array::from_fn(|i| f64::from(m.svf.stage2_feed_taps[i])),
             feat_in_hp_beta: f64::from(m.feat_params.in_hp_beta),
             feat_fast_atk_beta: f64::from(m.feat_params.fast_atk_beta),
@@ -487,11 +527,10 @@ impl V3MatryoshkaOptF64 {
             feat_slow_atk_beta: f64::from(m.feat_params.slow_atk_beta),
             feat_slow_rel_beta: f64::from(m.feat_params.slow_rel_beta),
             feat_slow_det_comp: f64::from(m.feat_params.slow_det_comp),
-            blocks: [
-                V3GruBlockF64::from_cold(&m.blocks[0]),
-                V3GruBlockF64::from_cold(&m.blocks[1]),
-                V3GruBlockF64::from_cold(&m.blocks[2]),
-            ],
+            feat_key_link: f64::from(m.feat_params.key_link),
+            feat_det_thresh: f64::from(m.feat_params.det_thresh),
+            blocks: std::array::from_fn(|b| V3GruBlockF64::from_cold(&m.blocks[b])),
+            rate_1x_cal: m.rate_1x_cal,
             kautz_poles: m.kautz_poles.map(|(r, th)| (f64::from(r), f64::from(th))),
             readouts: [
                 V3TierReadoutF64::from_cold(&m.readouts[0]),
@@ -503,6 +542,7 @@ impl V3MatryoshkaOptF64 {
     }
 
     /// Converts into clamped `f32` engine [`V3MatryoshkaModel`].
+    #[inline(never)]
     #[must_use]
     pub fn to_matryoshka_cold(&self) -> V3MatryoshkaModel {
         let mut os_params = V3OversamplerParams {
@@ -513,7 +553,7 @@ impl V3MatryoshkaOptF64 {
             up_pre_emph: self.os_up_pre_emph as f32,
             dec_aa_mix: self.os_dec_aa_mix as f32,
             up_aa_mix: self.os_up_aa_mix as f32,
-            _pad: [0.0; 1],
+            up_zoh_mix: self.os_up_zoh_mix as f32,
         };
         os_params.clamp_in_place();
 
@@ -533,6 +573,7 @@ impl V3MatryoshkaOptF64 {
         svf.stereo_link = self.svf_stereo_link as f32;
         svf.g_min = self.svf_g_min as f32;
         svf.g_max = self.svf_g_max as f32;
+        svf.feat_lp2_mix = self.svf_feat_lp2_mix as f32;
         for i in 0..7 {
             svf.stage2_feed_taps[i] = self.svf_stage2_feed_taps[i] as f32;
         }
@@ -546,17 +587,35 @@ impl V3MatryoshkaOptF64 {
             slow_atk_beta: self.feat_slow_atk_beta as f32,
             slow_rel_beta: self.feat_slow_rel_beta as f32,
             slow_det_comp: self.feat_slow_det_comp as f32,
-            _pad: 0.0,
+            key_link: self.feat_key_link as f32,
+            det_thresh: self.feat_det_thresh as f32,
         };
         feat_params.clamp_in_place();
 
+        let mut stage0 = self.stage0;
+        stage0.clamp_in_place();
+        let mut ctrl = self.ctrl;
+        ctrl.clamp_in_place();
+        let mut tone_svf = self.tone_svf;
+        tone_svf.clamp_in_place();
+        let mut stage4 = self.stage4;
+        for tank in &mut stage4 {
+            tank.clamp_in_place();
+        }
+
         V3MatryoshkaModel {
             os2x: self.os2x,
+            tier_os2x: self.tier_os2x,
+            tier_blocks: self.tier_blocks,
             mono_out: self.mono_out,
+            stage0,
+            ctrl,
+            tone_svf,
             os_params,
             svf,
             feat_params,
             blocks: self.blocks.each_ref().map(V3GruBlockF64::to_cold),
+            rate_1x_cal: self.rate_1x_cal,
             kautz_poles: self.kautz_poles.map(|(r, th)| {
                 (
                     r.clamp(0.25, 0.9985) as f32,
@@ -569,6 +628,50 @@ impl V3MatryoshkaOptF64 {
                 self.readouts[2].to_cold(Tier::Pro),
                 self.readouts[3].to_cold(Tier::Ultra),
             ],
+            stage4,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_model_f64_roundtrip_accumulate_and_mirror_mono() {
+        let cold = V3MatryoshkaModel::identity(false, true);
+        let mut opt = V3MatryoshkaOptF64::from_matryoshka_cold(&cold);
+        assert!(opt.mono_out);
+
+        let mut grad = opt.zero_like();
+        grad.os_up_quad = 0.05;
+        grad.svf_stage2_feed_taps[0] = 0.25;
+        grad.kautz_poles[0] = (0.1, 0.2);
+        grad.blocks[0].add_assign(&opt.blocks[0]);
+        grad.readouts[0].svf_direct_taps_l[0] = 0.5;
+        grad.readouts[0].pre_cab_u_gain[0] = 0.75;
+        grad.readouts[0].pre_cab_w[0][0] = 0.125;
+        grad.readouts[0].fir_l[0] = 0.5;
+        grad.readouts[0].kautz_c_l[0] = (0.3, -0.4);
+        opt.add_assign_grad(&grad);
+        opt.mirror_mono();
+        assert_eq!(
+            opt.readouts[0].pre_cab_u_gain[1],
+            opt.readouts[0].pre_cab_u_gain[0]
+        );
+        assert_eq!(opt.readouts[0].kautz_c_r[0], opt.readouts[0].kautz_c_l[0]);
+
+        let back = opt.to_matryoshka_cold();
+        assert_eq!(back.mono_out, cold.mono_out);
+        assert_eq!(
+            back.readouts[0].pre_cab_u_gain[0],
+            back.readouts[0].pre_cab_u_gain[1]
+        );
+
+        let mut stereo_opt = opt.clone();
+        stereo_opt.mono_out = false;
+        stereo_opt.readouts[0].pre_cab_u_gain[1] = 2.0;
+        stereo_opt.mirror_mono();
+        assert_eq!(stereo_opt.readouts[0].pre_cab_u_gain[1], 2.0);
     }
 }

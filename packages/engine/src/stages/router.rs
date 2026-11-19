@@ -2,6 +2,10 @@
 //!
 //! Canonical Reference: `docs/specs/dsp/router_and_stages_topology.md` (`ref[dsp.router.return-to-send-isolation]`, `REQ-7.4`).
 
+pub mod v3_stage0;
+
+pub use v3_stage0::{V3Stage0Hot, V3Stage0Params};
+
 use crate::math::{
     DefaultMathBackend, MathBackend, SimdVec4, flush_recursive_state_f32,
     flush_recursive_state_vec4,

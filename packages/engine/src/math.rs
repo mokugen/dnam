@@ -7,6 +7,8 @@
 #[forbid(unsafe_code)]
 pub mod backend;
 #[forbid(unsafe_code)]
+pub mod const_eval;
+#[forbid(unsafe_code)]
 pub mod crc32c;
 #[forbid(unsafe_code)]
 pub mod fp16;
@@ -35,6 +37,13 @@ pub mod wasm;
 
 pub use backend::{MathBackend, SimdVec4, flush_subnormal_f32_bits};
 pub(crate) use backend::{flush_recursive_state_f32, flush_recursive_state_vec4};
+pub use const_eval::{
+    IEEE754_F32_EXP_BIAS, IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED, IEEE754_F64_RSQRT_SEED,
+    STAGE4_DC_BLOCKER_48K_F32, STAGE4_MAX_G_LIN_BITS_DERIVED, STAGE4_MAX_V_CEIL_BITS_DERIVED,
+    const_abs_f64, const_c1_clamped_tanh_coeffs, const_cos_f64, const_dc_blocker_pole_f32,
+    const_f32_rcp_chebyshev_seed, const_hermite5_quarter_sine_coeffs, const_max_f32_bits_le,
+    const_sin_cos_f64, const_sin_f64, const_sqrt_f64, const_tan_f64,
+};
 pub use crc32c::{Crc32cBackend, crc32c, crc32c_slice, crc32c_software_slice};
 pub use fp16::{
     f32_to_fp16, f32_to_fp16 as f32_to_fp16_bits, fp16_to_f32, fp16_to_f32 as fp16_bits_to_f32,

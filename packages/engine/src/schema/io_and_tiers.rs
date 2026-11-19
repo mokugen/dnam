@@ -181,7 +181,7 @@ pub fn default_pro_tier_profile() -> TierProfile {
         loudness_lufs: -20.5,
         output_trim_db: 0.0,
         validation_esr_db: -48.0,
-        arena_end_byte_offset: 36_224,
+        arena_end_byte_offset: 18_432,
         prefix_crc32c: 0,
     }
 }
@@ -189,14 +189,14 @@ pub fn default_pro_tier_profile() -> TierProfile {
 /// Slimmable tier profiles (`lite`, `full`, `pro`, `ultra`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SlimmableTiersConfig {
-    /// `Lite` ($C=4$, $M=4$, $D_h=4$, `10,752 B`) tier profile.
+    /// `Lite` (`4,608 B`) tier profile.
     pub lite: TierProfile,
-    /// `Full` ($C=8$, $M=8$, $D_h=4$, `22,336 B`) tier profile.
+    /// `Full` (`10,240 B`) tier profile.
     pub full: TierProfile,
-    /// `Pro` ($C=12$, $M=8$, $D_h=4$, `36,224 B`) tier profile.
+    /// `Pro` (`18,432 B`) tier profile.
     #[serde(default = "default_pro_tier_profile")]
     pub pro: TierProfile,
-    /// `Ultra` ($C=16$, $M=16$, $D_h=8$, `64,000 B`) tier profile.
+    /// `Ultra` (`28,672 B`) tier profile.
     pub ultra: TierProfile,
 }
 

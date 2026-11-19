@@ -1,19 +1,26 @@
 #![forbid(unsafe_code)]
-//! Candidate scoring, monotonicity verification, blend fallback, and corridor repair for `v3` polish.
+//! Candidate scoring, monotonicity verification, and blend fallback for `v3` polish.
+
+mod corridor;
+mod rate_split;
 
 use dnam_engine::Tier;
-use dnam_engine::stages::v3_core::cascade::MAX_KAUTZ_POLES;
+use dnam_engine::stages::stage2_gru::{MAX_KAUTZ_POLES, MAX_TOTAL_GRU_LANES};
 
 use crate::metrics::TierQualityThresholds;
 use crate::metrics::certification::{
-    PerceptualCertificationSummary, verify_monotone_4tier_summaries,
+    PerceptualCertificationSummary, TargetChannelCertCache, verify_monotone_4tier_summaries,
 };
 use crate::solver::backends::TrainerBackend;
 
-use super::super::basis::{ALL_TIERS, PreSplitStemChan, StemChanTraj};
+use super::super::basis::{ALL_TIERS, PreSplitStemChan, StemChanTraj, SubspaceGramData};
 use super::super::model_f64::{V3MatryoshkaOptF64, V3TierReadoutF64, V3TrainDataset, V3TrainStem};
+use super::cert_cols::{CertWelchData, apply_subspace_polish};
+use super::fit_ls_candidate;
+use super::live_switch_tier_safe;
 use super::prescreen::{certify_cold_tier_with_prescreen, shares_pre_cab};
-use super::{apply_subspace_polish, blend_readout, fit_ls_candidate};
+pub(super) use corridor::{scale_linear_out, try_corridor_repair};
+pub(super) use rate_split::maybe_promote_1x_rate_split;
 
 pub(super) type TierCandidate = (
     V3TierReadoutF64,
@@ -21,20 +28,103 @@ pub(super) type TierCandidate = (
     Option<PerceptualCertificationSummary>,
 );
 
+fn mono_slice_ok(s: &[Option<PerceptualCertificationSummary>; 4], tau: usize) -> bool {
+    let mut dummy: [_; 4] = std::array::from_fn(|i| s[i.min(tau)].clone().unwrap());
+    for (k, &tier) in ALL_TIERS.iter().enumerate() {
+        dummy[k].tier = tier;
+    }
+    verify_monotone_4tier_summaries(&dummy)
+}
+
+fn mono_pair_ok(s: &[Option<PerceptualCertificationSummary>; 4], tau: usize) -> bool {
+    let a = s[tau - 1].clone().unwrap();
+    let b = s[tau].clone().unwrap();
+    let mut dummy = [a, b.clone(), b.clone(), b];
+    for (k, &tier) in ALL_TIERS.iter().enumerate() {
+        dummy[k].tier = tier;
+    }
+    verify_monotone_4tier_summaries(&dummy)
+}
+
 pub(super) fn ok_for_tau(
     tau: usize,
     mono_out: bool,
     sl: &[Option<PerceptualCertificationSummary>; 4],
     sr: &[Option<PerceptualCertificationSummary>; 4],
 ) -> bool {
-    let mono_ok = |s: &[Option<PerceptualCertificationSummary>; 4]| {
-        let mut dummy: [_; 4] = std::array::from_fn(|i| s[i.min(tau)].clone().unwrap());
-        for (k, &tier) in ALL_TIERS.iter().enumerate() {
-            dummy[k].tier = tier;
-        }
-        verify_monotone_4tier_summaries(&dummy)
+    let full = mono_slice_ok(sl, tau) && (mono_out || mono_slice_ok(sr, tau));
+    if full || tau < 2 {
+        return full;
+    }
+    let prev_full = mono_slice_ok(sl, tau - 1) && (mono_out || mono_slice_ok(sr, tau - 1));
+    if !prev_full {
+        return mono_pair_ok(sl, tau) && (mono_out || mono_pair_ok(sr, tau));
+    }
+    false
+}
+
+fn chan_pair_meets_margin(
+    lo: &PerceptualCertificationSummary,
+    hi: &PerceptualCertificationSummary,
+    is_ultra: bool,
+) -> bool {
+    let (mr_fac, mr_abs) = if lo.mr_iir <= 0.006 && lo.ltas_max_db > 0.065 {
+        (0.975, 1.0e-4)
+    } else {
+        (0.985, 1.5e-4)
     };
-    mono_ok(sl) && (mono_out || mono_ok(sr))
+    let mr_lim = (lo.mr_iir - mr_abs)
+        .max(lo.mr_iir * 0.96)
+        .min(lo.mr_iir * mr_fac);
+    let ltas_lim = if lo.ltas_max_db > 0.06 {
+        if is_ultra {
+            (lo.ltas_max_db - 0.004).min(lo.ltas_max_db * 0.94)
+        } else {
+            (lo.ltas_max_db - 0.007).min(lo.ltas_max_db * 0.90)
+        }
+    } else {
+        (lo.ltas_max_db - 0.003).min(lo.ltas_max_db * 0.96)
+    };
+    let esr_cush = if hi.raw_besr_db <= -35.0 { 0.26 } else { 0.08 };
+    let band_cush = |b: usize| {
+        if hi.band_esr_db[b] <= -35.0 {
+            0.26
+        } else {
+            0.08
+        }
+    };
+    let seg_cush = if hi.seg_esr_db <= -42.0 { 0.18 } else { 0.08 };
+    hi.raw_besr_db <= lo.raw_besr_db - esr_cush
+        && (0..3).all(|b| hi.band_esr_db[b] <= lo.band_esr_db[b] - band_cush(b))
+        && (lo.mr_iir <= 1.0e-5 || hi.mr_iir <= mr_lim)
+        && (lo.ltas_max_db <= 1.0e-4 || hi.ltas_max_db <= ltas_lim)
+        && hi.seg_esr_db <= lo.seg_esr_db - seg_cush
+}
+
+fn margin_pair_opt(
+    lo: Option<&PerceptualCertificationSummary>,
+    hi: Option<&PerceptualCertificationSummary>,
+    is_ultra: bool,
+) -> bool {
+    lo.zip(hi)
+        .is_some_and(|(a, b)| chan_pair_meets_margin(a, b, is_ultra))
+}
+
+pub(super) fn ok_for_tau_with_margin(
+    tau: usize,
+    mono_out: bool,
+    sl: &[Option<PerceptualCertificationSummary>; 4],
+    sr: &[Option<PerceptualCertificationSummary>; 4],
+) -> bool {
+    if !ok_for_tau(tau, mono_out, sl, sr) {
+        return false;
+    }
+    if tau == 0 {
+        return true;
+    }
+    let is_ultra = tau == 3;
+    margin_pair_opt(sl[tau - 1].as_ref(), sl[tau].as_ref(), is_ultra)
+        && (mono_out || margin_pair_opt(sr[tau - 1].as_ref(), sr[tau].as_ref(), is_ultra))
 }
 
 pub(super) fn passes_both(
@@ -80,7 +170,16 @@ pub(super) fn candidate_score(
         || fin(sl.raw_besr_db),
         |r| fin(sl.raw_besr_db).max(fin(r.raw_besr_db)),
     );
-    (passes_t, passes_c, -worst_viol, -worst_besr)
+    let worst_ltas = sr.as_ref().map_or_else(
+        || fin(sl.ltas_max_db),
+        |r| fin(sl.ltas_max_db).max(fin(r.ltas_max_db)),
+    );
+    let ltas_tie = if passes_t && passes_c && worst_besr <= thr.composite_besr_db - 2.0 {
+        2.5 * worst_ltas
+    } else {
+        0.0
+    };
+    (passes_t, passes_c, -worst_viol, -(worst_besr + ltas_tie))
 }
 
 pub(super) fn record_tier_candidate(
@@ -112,9 +211,8 @@ pub(super) struct PolishEvalCtx<'a> {
     pub(super) model: &'a mut V3MatryoshkaOptF64,
     pub(super) tau: usize,
     pub(super) stem0: &'a V3TrainStem,
-    pub(super) tgt_l_f64: &'a [f64],
-    pub(super) tgt_r_f64: &'a [f64],
-    pub(super) sr_hz: f64,
+    pub(super) cert_l: TargetChannelCertCache,
+    pub(super) cert_r: Option<TargetChannelCertCache>,
     pub(super) sl: &'a mut [Option<PerceptualCertificationSummary>; 4],
     pub(super) sr: &'a mut [Option<PerceptualCertificationSummary>; 4],
 }
@@ -131,7 +229,7 @@ impl PolishEvalCtx<'_> {
     ) {
         self.model.readouts[self.tau] = readout;
         self.model.mirror_mono();
-        let cold_cur = self.model.to_matryoshka_cold();
+        let cold_cur = Box::new(self.model.to_matryoshka_cold());
         let prev_req = if fast_monotone && self.tau > 0 {
             self.sl[self.tau - 1]
                 .as_ref()
@@ -143,14 +241,13 @@ impl PolishEvalCtx<'_> {
             &cold_cur,
             ALL_TIERS[self.tau],
             self.stem0,
-            self.tgt_l_f64,
-            self.tgt_r_f64,
-            self.sr_hz,
+            &mut self.cert_l,
+            self.cert_r.as_mut(),
             prev_req,
         );
         self.sl[self.tau] = Some(sl.clone());
         self.sr[self.tau] = sr.clone();
-        let ok = ok_for_tau(self.tau, cold_cur.mono_out, self.sl, self.sr);
+        let ok = ok_for_tau_with_margin(self.tau, cold_cur.mono_out, self.sl, self.sr);
         (sl, sr, ok)
     }
 
@@ -196,11 +293,52 @@ impl PolishEvalCtx<'_> {
         }
         record_tier_candidate(tier, best_ok, best_any, r, &sl, &sr, ok);
         let thr = TierQualityThresholds::for_tier(tier);
-        let headroom_ok = self.tau == 3
-            || (sl.ltas_max_db <= thr.max_ltas_db * 0.78
+        let ltas_headroom_ok = sl.ltas_max_db <= thr.max_ltas_db * 0.68
+            && sr
+                .as_ref()
+                .is_none_or(|v| v.ltas_max_db <= thr.max_ltas_db * 0.68);
+        let band_headroom_ok = sl
+            .band_esr_db
+            .iter()
+            .zip(&thr.per_band_besr_db)
+            .all(|(&b, &lim)| b <= lim - 1.5)
+            && sr.as_ref().is_none_or(|r| {
+                r.band_esr_db
+                    .iter()
+                    .zip(&thr.per_band_besr_db)
+                    .all(|(&b, &lim)| b <= lim - 1.5)
+            });
+        let same_rate_prev =
+            self.tau == 0 || self.model.tier_os2x[self.tau] == self.model.tier_os2x[self.tau - 1];
+        let margin_pair =
+            |cur: &PerceptualCertificationSummary,
+             prev: Option<&PerceptualCertificationSummary>| {
+                prev.is_none_or(|p| {
+                    let (mr_fac, ltas_fac) = if self.tau == 3 {
+                        (0.95, 0.82)
+                    } else {
+                        (0.98, 0.92)
+                    };
+                    let deep_cross_rate = !same_rate_prev && p.raw_besr_db <= -35.0;
+                    let gap = if p.raw_besr_db <= -44.0 || deep_cross_rate {
+                        0.35
+                    } else {
+                        0.08
+                    };
+                    let seg_gap = if deep_cross_rate { 0.25 } else { 0.08 };
+                    cur.raw_besr_db <= p.raw_besr_db - gap
+                        && (0..3).all(|b| cur.band_esr_db[b] <= p.band_esr_db[b] - gap)
+                        && cur.mr_iir <= p.mr_iir * mr_fac
+                        && cur.ltas_max_db <= p.ltas_max_db * ltas_fac
+                        && cur.seg_esr_db <= p.seg_esr_db - seg_gap
+                })
+            };
+        let adj_margin_ok = self.tau == 0
+            || (margin_pair(&sl, self.sl[self.tau - 1].as_ref())
                 && sr
                     .as_ref()
-                    .is_none_or(|v| v.ltas_max_db <= thr.max_ltas_db * 0.78));
+                    .is_none_or(|r| margin_pair(r, self.sr[self.tau - 1].as_ref())));
+        let headroom_ok = ltas_headroom_ok && band_headroom_ok && adj_margin_ok;
         if ok && passes_both(&sl, &sr) && headroom_ok {
             return (true, sl, sr, ok);
         }
@@ -236,7 +374,7 @@ impl PolishEvalCtx<'_> {
 }
 
 pub(super) struct PolishBranchSpec<'a> {
-    pub(super) prev_r: &'a V3TierReadoutF64,
+    pub(super) prev_r: Option<&'a V3TierReadoutF64>,
     pub(super) prev_sum: [Option<&'a PerceptualCertificationSummary>; 2],
     pub(super) do_als: usize,
     pub(super) use_prev_pre_cab: bool,
@@ -244,19 +382,29 @@ pub(super) struct PolishBranchSpec<'a> {
     pub(super) dataset: &'a V3TrainDataset,
     pub(super) trajs: &'a [Vec<StemChanTraj>; 2],
     pub(super) stems_pre: &'a [Vec<PreSplitStemChan>; 2],
+    pub(super) cert_welch: Option<&'a CertWelchData<'a>>,
 }
 
-pub(super) fn try_polish_branch<B: TrainerBackend>(
+pub(super) struct LsBranchResult {
+    pub(super) ls_r: V3TierReadoutF64,
+    pub(super) grams: [Option<SubspaceGramData>; 2],
+    pub(super) thetas: [Vec<f64>; 2],
+    pub(super) ls_ok: bool,
+    pub(super) ls_passes: bool,
+    pub(super) worst_raw_besr_db: f64,
+}
+
+pub(super) fn eval_branch_ls<B: TrainerBackend>(
     ctx: &mut PolishEvalCtx<'_>,
     spec: &PolishBranchSpec<'_>,
     best_ok: &mut Option<TierCandidate>,
     best_any: &mut Option<TierCandidate>,
     mut same_s2_best: Option<&mut Option<TierCandidate>>,
-) -> bool {
-    let (ls_r, grams, cols0, thetas) = fit_ls_candidate::<B>(
+) -> (bool, LsBranchResult) {
+    let (ls_r, grams, thetas) = fit_ls_candidate::<B>(
         ctx.model,
         ctx.tau,
-        Some(spec.prev_r),
+        spec.prev_r,
         spec.do_als,
         spec.use_prev_pre_cab,
         spec.kautz_pre,
@@ -264,28 +412,52 @@ pub(super) fn try_polish_branch<B: TrainerBackend>(
         spec.trajs,
         spec.stems_pre,
     );
-    let (done, _, _, ls_ok) = ctx.accept::<B>(&ls_r, best_ok, best_any, &mut same_s2_best);
-    if done {
-        return true;
-    }
+    let (done, sl, sr, ls_ok) = ctx.accept::<B>(&ls_r, best_ok, best_any, &mut same_s2_best);
+    let ls_passes = passes_both(&sl, &sr);
+    let worst_raw_besr_db = sr
+        .as_ref()
+        .map_or(sl.raw_besr_db, |r| sl.raw_besr_db.max(r.raw_besr_db));
+    (
+        done,
+        LsBranchResult {
+            ls_r,
+            grams,
+            thetas,
+            ls_ok,
+            ls_passes,
+            worst_raw_besr_db,
+        },
+    )
+}
+
+pub(super) fn run_branch_subspace<B: TrainerBackend>(
+    ctx: &mut PolishEvalCtx<'_>,
+    spec: &PolishBranchSpec<'_>,
+    ls_res: &LsBranchResult,
+    best_ok: &mut Option<TierCandidate>,
+    best_any: &mut Option<TierCandidate>,
+    mut same_s2_best: Option<&mut Option<TierCandidate>>,
+) -> bool {
     let pol_r = apply_subspace_polish::<B>(
         ctx.model,
         ctx.tau,
         spec.prev_sum,
-        &ls_r,
-        &grams,
-        &cols0,
-        &thetas,
+        &ls_res.ls_r,
+        &ls_res.grams,
+        &ls_res.thetas,
+        spec.trajs,
+        spec.stems_pre,
         spec.dataset,
+        spec.cert_welch,
     );
     let (done, pol_sl, pol_sr, pol_ok) =
         ctx.accept::<B>(&pol_r, best_ok, best_any, &mut same_s2_best);
     if done {
         return true;
     }
-    if !pol_ok || (!passes_both(&pol_sl, &pol_sr) && ls_ok) {
+    if !pol_ok || (!passes_both(&pol_sl, &pol_sr) && ls_res.ls_ok) {
         for &alpha in &[0.88, 0.65, 0.38, 0.15] {
-            let cand_r = blend_readout(&pol_r, &ls_r, alpha);
+            let cand_r = blend_readout(&pol_r, &ls_res.ls_r, alpha);
             if ctx
                 .accept_with_mode::<B>(&cand_r, best_ok, best_any, &mut same_s2_best, true)
                 .0
@@ -308,6 +480,7 @@ pub(super) fn try_monotone_blends<B: TrainerBackend>(
         return;
     }
     let tier = ALL_TIERS[ctx.tau];
+    let thr = TierQualityThresholds::for_tier(tier);
     for &alpha in &[0.98, 0.92, 0.82, 0.68, 0.50, 0.30, 0.12] {
         let blended = blend_readout(cand_r, prev_r, alpha);
         let (sl, sr, ok) = ctx.eval_fast_monotone::<B>(blended.clone());
@@ -320,102 +493,167 @@ pub(super) fn try_monotone_blends<B: TrainerBackend>(
             if better {
                 *best_ok = Some((blended, sl.clone(), sr.clone()));
             }
-            if passes_both(&sl, &sr) {
+            let ltas_margin = sl.ltas_max_db <= thr.max_ltas_db * 0.80
+                && sr
+                    .as_ref()
+                    .is_none_or(|v| v.ltas_max_db <= thr.max_ltas_db * 0.80);
+            if passes_both(&sl, &sr) && ltas_margin {
                 break;
             }
         }
     }
 }
 
-fn scale_linear_out(a: &V3TierReadoutF64, s: f64) -> V3TierReadoutF64 {
-    let mut out = a.clone();
+pub(super) fn try_strict_monotone_blends<B: TrainerBackend>(
+    ctx: &mut PolishEvalCtx<'_>,
+    same_s2_best: &Option<TierCandidate>,
+    best_any: &Option<TierCandidate>,
+    prev_r: &V3TierReadoutF64,
+) -> Option<TierCandidate> {
+    let tier = ALL_TIERS[ctx.tau];
+    let active_ch = if ctx.model.mono_out { 1 } else { 2 };
+    let mut hit: Option<TierCandidate> = None;
+    for src_opt in [same_s2_best, best_any] {
+        let Some(src) = src_opt.as_ref() else {
+            continue;
+        };
+        if !shares_pre_cab(&src.0, prev_r, active_ch) {
+            continue;
+        }
+        for &alpha in &[0.96, 0.88, 0.75, 0.58, 0.40, 0.22, 0.08] {
+            let cand_r = blend_readout(&src.0, prev_r, alpha);
+            let (bsl, bsr, _) = ctx.eval_fast_monotone::<B>(cand_r.clone());
+            if ok_for_tau(ctx.tau, ctx.model.mono_out, ctx.sl, ctx.sr)
+                && hit.as_ref().is_none_or(|(_, hsl, hsr)| {
+                    candidate_score(tier, &bsl, &bsr) > candidate_score(tier, hsl, hsr)
+                })
+            {
+                hit = Some((cand_r, bsl, bsr));
+            }
+        }
+    }
+    hit
+}
+
+pub(super) fn blend_readout(
+    a: &V3TierReadoutF64,
+    b: &V3TierReadoutF64,
+    alpha: f64,
+) -> V3TierReadoutF64 {
+    let om = 1.0 - alpha;
+    let mut out = V3TierReadoutF64::zeros();
     for i in 0..7 {
-        out.svf_direct_taps_l[i] *= s;
-        out.svf_direct_taps_r[i] *= s;
+        out.svf_direct_taps_l[i] = alpha * a.svf_direct_taps_l[i] + om * b.svf_direct_taps_l[i];
+        out.svf_direct_taps_r[i] = alpha * a.svf_direct_taps_r[i] + om * b.svf_direct_taps_r[i];
     }
     for ch in 0..2 {
-        out.direct_s2_u_gain[ch] *= s;
-        out.direct_s2_hp_gain[ch] *= s;
-        for v in &mut out.direct_s2_w[ch] {
-            *v *= s;
+        out.pre_cab_u_gain[ch] = alpha * a.pre_cab_u_gain[ch] + om * b.pre_cab_u_gain[ch];
+        out.pre_cab_hp_gain[ch] = alpha * a.pre_cab_hp_gain[ch] + om * b.pre_cab_hp_gain[ch];
+        out.direct_s2_u_gain[ch] = alpha * a.direct_s2_u_gain[ch] + om * b.direct_s2_u_gain[ch];
+        out.direct_s2_hp_gain[ch] = alpha * a.direct_s2_hp_gain[ch] + om * b.direct_s2_hp_gain[ch];
+        for i in 0..MAX_TOTAL_GRU_LANES {
+            out.pre_cab_w[ch][i] = alpha * a.pre_cab_w[ch][i] + om * b.pre_cab_w[ch][i];
+            out.direct_s2_w[ch][i] = alpha * a.direct_s2_w[ch][i] + om * b.direct_s2_w[ch][i];
         }
     }
     for k in 0..64 {
-        out.fir_l[k] *= s;
-        out.fir_r[k] *= s;
+        out.fir_l[k] = alpha * a.fir_l[k] + om * b.fir_l[k];
+        out.fir_r[k] = alpha * a.fir_r[k] + om * b.fir_r[k];
     }
     for m in 0..MAX_KAUTZ_POLES {
-        out.kautz_c_l[m].0 *= s;
-        out.kautz_c_l[m].1 *= s;
-        out.kautz_c_r[m].0 *= s;
-        out.kautz_c_r[m].1 *= s;
+        out.kautz_c_l[m] = (
+            alpha * a.kautz_c_l[m].0 + om * b.kautz_c_l[m].0,
+            alpha * a.kautz_c_l[m].1 + om * b.kautz_c_l[m].1,
+        );
+        out.kautz_c_r[m] = (
+            alpha * a.kautz_c_r[m].0 + om * b.kautz_c_r[m].0,
+            alpha * a.kautz_c_r[m].1 + om * b.kautz_c_r[m].1,
+        );
     }
     out
 }
 
-pub(super) fn try_corridor_repair<B: TrainerBackend>(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn refine_cross_rate_pro_ltas<B: TrainerBackend>(
     ctx: &mut PolishEvalCtx<'_>,
-    cands: &[&V3TierReadoutF64],
+    same_rate_prev: bool,
+    spec0: &PolishBranchSpec<'_>,
+    ls_res0: &LsBranchResult,
+    prev_sl: Option<&PerceptualCertificationSummary>,
+    prev_sr: Option<&PerceptualCertificationSummary>,
+    thr_tau: &TierQualityThresholds,
     best_ok: &mut Option<TierCandidate>,
-) -> bool {
+) {
+    let cross_rate_tight_ltas = ctx.tau == 2
+        && !same_rate_prev
+        && best_ok.as_ref().is_some_and(|(_, bsl, bsr)| {
+            let cur_ltas = bsr
+                .as_ref()
+                .map_or(bsl.ltas_max_db, |r| bsl.ltas_max_db.max(r.ltas_max_db));
+            let prev_ltas = prev_sl.map_or(0.0, |p| {
+                prev_sr.map_or(p.ltas_max_db, |pr| p.ltas_max_db.max(pr.ltas_max_db))
+            });
+            cur_ltas > 0.022
+                && (prev_ltas <= 0.25
+                    || cur_ltas > prev_ltas * 0.70
+                    || cur_ltas > thr_tau.max_ltas_db * 0.65)
+        });
+    if !cross_rate_tight_ltas {
+        return;
+    }
+    let mut sub_ok: Option<TierCandidate> = None;
+    let mut sub_any: Option<TierCandidate> = None;
+    let _ = run_branch_subspace::<B>(ctx, spec0, ls_res0, &mut sub_ok, &mut sub_any, None);
+    if let Some((sr_r, sr_sl, sr_sr)) = sub_ok {
+        let cur_ltas = best_ok.as_ref().map_or(f64::INFINITY, |(_, bsl, bsr)| {
+            bsr.as_ref()
+                .map_or(bsl.ltas_max_db, |r| bsl.ltas_max_db.max(r.ltas_max_db))
+        });
+        let new_ltas = sr_sr
+            .as_ref()
+            .map_or(sr_sl.ltas_max_db, |r| sr_sl.ltas_max_db.max(r.ltas_max_db));
+        let new_besr_ok = sr_sl.raw_besr_db <= thr_tau.composite_besr_db - 2.0
+            && sr_sr
+                .as_ref()
+                .is_none_or(|r| r.raw_besr_db <= thr_tau.composite_besr_db - 2.0);
+        if new_besr_ok && passes_both(&sr_sl, &sr_sr) && new_ltas + 1.0e-4 < cur_ltas {
+            *best_ok = Some((sr_r, sr_sl, sr_sr));
+        }
+    }
+}
+
+pub(super) fn repair_live_switch_safety<B: TrainerBackend>(
+    ctx: &mut PolishEvalCtx<'_>,
+    stem0: &V3TrainStem,
+    prev_r: &V3TierReadoutF64,
+    same_rate_prev: bool,
+) {
     let tau = ctx.tau;
-    if tau < 1 || cands.is_empty() {
-        return false;
+    let cold_chk = Box::new(ctx.model.to_matryoshka_cold());
+    if live_switch_tier_safe::<B>(&cold_chk, stem0, tau) {
+        return;
     }
-    let active_ch = if ctx.model.mono_out { 1 } else { 2 };
-    let orig_prev = ctx.model.readouts[tau - 1].clone();
-    let relaxed_prevs: Vec<V3TierReadoutF64> = if tau >= 2 {
-        let lower_r = ctx.model.readouts[tau - 2].clone();
-        if !shares_pre_cab(&orig_prev, &lower_r, active_ch) {
-            return false;
-        }
-        [0.94, 0.86, 0.76, 0.64, 0.50, 0.35]
-            .iter()
-            .map(|&alpha| blend_readout(&orig_prev, &lower_r, alpha))
-            .collect()
-    } else {
-        [0.992, 0.985, 0.975]
-            .iter()
-            .map(|&s| scale_linear_out(&orig_prev, s))
-            .collect()
-    };
-    let orig_psl = ctx.sl[tau - 1].clone();
-    let orig_psr = ctx.sr[tau - 1].clone();
-    for relaxed_prev in relaxed_prevs {
-        ctx.tau = tau - 1;
-        let (psl, psr, pok) = ctx.eval_fast_monotone::<B>(relaxed_prev.clone());
-        ctx.tau = tau;
-        if !(pok && passes_both(&psl, &psr)) {
-            continue;
-        }
-        for &cand in cands {
-            let (sl, sr, ok) = ctx.eval_fast_monotone::<B>(cand.clone());
-            if ok && passes_both(&sl, &sr) {
-                *best_ok = Some((cand.clone(), sl, sr));
-                return true;
-            }
-            let mut local_ok = None;
-            try_monotone_blends::<B>(ctx, cand, &relaxed_prev, &mut local_ok);
-            if let Some((br, bsl, bsr)) = local_ok
-                && passes_both(&bsl, &bsr)
-            {
-                *best_ok = Some((br, bsl, bsr));
-                return true;
-            }
+    let cur_r = ctx.model.readouts[tau].clone();
+    for &alpha in &[0.85, 0.65, 0.40, 0.15, 0.0] {
+        let cand_r = if same_rate_prev {
+            blend_readout(&cur_r, prev_r, alpha)
+        } else {
+            scale_linear_out(&cur_r, alpha.max(0.10))
+        };
+        let (sl, sr, ok) = ctx.eval::<B>(cand_r.clone());
+        let cold_sw = ctx.model.to_matryoshka_cold();
+        if (ok || alpha == 0.0) && live_switch_tier_safe::<B>(&cold_sw, stem0, tau) {
+            ctx.commit(cand_r, sl, sr);
+            break;
         }
     }
-    ctx.model.readouts[tau - 1] = orig_prev;
-    ctx.model.mirror_mono();
-    ctx.sl[tau - 1] = orig_psl;
-    ctx.sr[tau - 1] = orig_psr;
-    false
 }
 
 #[cfg(test)]
 mod tests {
     use std::f64::consts::PI;
 
-    use dnam_engine::stages::v3_core::V3MatryoshkaModel;
+    use dnam_engine::stages::V3MatryoshkaModel;
 
     use super::*;
     use crate::metrics::ArchetypeFamily;
@@ -446,7 +684,7 @@ mod tests {
 
     fn make_identity_stem(len: usize) -> V3TrainStem {
         use crate::metrics::companion::canonical_ltas_33_centers_hz;
-        use dnam_engine::stages::v3_core::{V3CoreInstance, V3MatryoshkaModel};
+        use dnam_engine::stages::{V3CoreInstance, V3MatryoshkaModel};
         use dnam_engine::types::Tier;
 
         let centers = canonical_ltas_33_centers_hz();
@@ -475,7 +713,7 @@ mod tests {
     }
 
     #[test]
-    fn test_candidate_score_record_and_scale_linear_out() {
+    fn test_candidate_score_record_and_monotone_blends() {
         let mut r = V3TierReadoutF64 {
             svf_direct_taps_l: [1.0; 7],
             svf_direct_taps_r: [1.0; 7],
@@ -487,13 +725,6 @@ mod tests {
         r.fir_l[0] = 1.0;
         r.fir_r[0] = 1.0;
         r.kautz_c_l[0] = (0.4, -0.2);
-        r.kautz_c_r[0] = (-0.4, 0.2);
-        let scaled = scale_linear_out(&r, 0.5);
-        assert!((scaled.svf_direct_taps_l[0] - 0.5).abs() < 1.0e-12);
-        assert!((scaled.direct_s2_u_gain[0] - 0.25).abs() < 1.0e-12);
-        assert!((scaled.direct_s2_w[0][0] - 0.4).abs() < 1.0e-12);
-        assert!((scaled.fir_r[0] - 0.5).abs() < 1.0e-12);
-        assert!((scaled.kautz_c_l[0].0 - 0.2).abs() < 1.0e-12);
 
         let sl_good = make_summary(Tier::Full, -28.0, 1.0);
         let sr_bad = Some(make_summary(Tier::Full, -8.0, 6.0));
@@ -522,7 +753,7 @@ mod tests {
             Tier::Full,
             &mut best_ok,
             &mut best_any,
-            &scaled,
+            &r,
             &sl_good,
             &None,
             true,
@@ -532,10 +763,11 @@ mod tests {
     }
 
     #[test]
-    fn test_monotone_blends_and_corridor_repair_paths() {
+    fn test_monotone_blends_and_margin_checks() {
         let stem = make_identity_stem(4_800);
-        let tgt_l: Vec<f64> = stem.tgt_l.iter().map(|&v| f64::from(v)).collect();
-        let tgt_r: Vec<f64> = stem.tgt_r.iter().map(|&v| f64::from(v)).collect();
+        let n0 = stem.usable_len();
+        let w0 = stem.warmup.min(n0);
+        let tgt_l: Vec<f64> = stem.tgt_l[..n0].iter().map(|&v| f64::from(v)).collect();
         let mut model =
             V3MatryoshkaOptF64::from_matryoshka_cold(&V3MatryoshkaModel::identity(true, true));
         let mut sl = [None, None, None, None];
@@ -544,9 +776,8 @@ mod tests {
             model: &mut model,
             tau: 0,
             stem0: &stem,
-            tgt_l_f64: &tgt_l,
-            tgt_r_f64: &tgt_r,
-            sr_hz: 48_000.0,
+            cert_l: TargetChannelCertCache::new(&tgt_l, 48_000.0, w0),
+            cert_r: None,
             sl: &mut sl,
             sr: &mut sr,
         };
@@ -558,7 +789,6 @@ mod tests {
         assert!(ok0 && s0_detuned.passes_target);
         ctx.commit(tau0_r.clone(), s0_detuned, None);
 
-        // shares_pre_cab mismatch causes early return
         let mut diff_pre_cab = id_r.clone();
         diff_pre_cab.pre_cab_u_gain[0] = 2.0;
         ctx.tau = 1;
@@ -566,63 +796,7 @@ mod tests {
         try_monotone_blends::<DefaultTrainerBackend>(&mut ctx, &diff_pre_cab, &id_r, &mut blend_ok);
         assert!(blend_ok.is_none());
 
-        // Matching pre_cab blending from tau0 (0.98) toward id_r (1.0) improves over tau=0
         try_monotone_blends::<DefaultTrainerBackend>(&mut ctx, &id_r, &tau0_r, &mut blend_ok);
         assert!(blend_ok.is_some());
-
-        // tau = 0 or empty cands returns false in try_corridor_repair
-        ctx.tau = 0;
-        let mut corr_ok = None;
-        assert!(!try_corridor_repair::<DefaultTrainerBackend>(
-            &mut ctx,
-            &[&id_r],
-            &mut corr_ok
-        ));
-        ctx.tau = 1;
-        assert!(!try_corridor_repair::<DefaultTrainerBackend>(
-            &mut ctx,
-            &[],
-            &mut corr_ok
-        ));
-
-        // Commit exact id_r at tau=0, then test tau=1 corridor repair via blend & direct cand paths
-        ctx.tau = 0;
-        let (s_exact, _, _) = ctx.eval::<DefaultTrainerBackend>(id_r.clone());
-        ctx.commit(id_r.clone(), s_exact, None);
-        ctx.tau = 1;
-        let mut overshoot = id_r.clone();
-        overshoot.fir_l[0] = 1.02;
-        assert!(try_corridor_repair::<DefaultTrainerBackend>(
-            &mut ctx,
-            &[&overshoot],
-            &mut corr_ok
-        ));
-
-        ctx.tau = 0;
-        let (s_exact2, _, _) = ctx.eval::<DefaultTrainerBackend>(id_r.clone());
-        ctx.commit(id_r.clone(), s_exact2, None);
-        ctx.tau = 1;
-        assert!(try_corridor_repair::<DefaultTrainerBackend>(
-            &mut ctx,
-            &[&id_r],
-            &mut corr_ok
-        ));
-
-        // tau = 2 pre_cab mismatch returns false; matching pre_cab with failing cand rolls back
-        ctx.tau = 2;
-        ctx.model.readouts[0] = id_r.clone();
-        ctx.model.readouts[1] = diff_pre_cab;
-        assert!(!try_corridor_repair::<DefaultTrainerBackend>(
-            &mut ctx,
-            &[&id_r],
-            &mut corr_ok
-        ));
-
-        ctx.model.readouts[1] = id_r.clone();
-        let mut bad_cand = id_r.clone();
-        bad_cand.fir_l[0] = 0.0;
-        let repaired =
-            try_corridor_repair::<DefaultTrainerBackend>(&mut ctx, &[&bad_cand], &mut corr_ok);
-        assert!(!repaired);
     }
 }

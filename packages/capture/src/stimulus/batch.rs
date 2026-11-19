@@ -12,23 +12,23 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use dnam_engine::schema::{ControlCalibrationRole, ControlKind, DnamError};
 
-use crate::CORESET_FP16_FRAMES_PER_STEM;
 use crate::proj::bundle::{
     ProjChunkInput, build_dnam_proj_container_with_cp1_and_compacted, export_runtime_dnam,
 };
 use crate::proj::capsules::CalbChunk64B;
 use crate::proj::directory::{ProjChunkKind, StmcTrajectoryWindow};
 use crate::proj::schema::DnamProjManifest;
-use crate::proj::vault::{initialize_backbone_arena_if_needed, solve_captures_batch_into_proj};
+use crate::proj::vault::{initialize_backbone_arena_if_needed, solve_captures_batch_with_progress};
+use crate::solver::{SolverOptions, TrainerProgressHandle, TrainingPhase, TrainingStatus};
 use crate::targets::{StemResponse, StemStimulus, StemStimulusBatch};
 
 use super::laws::TopologyProbeMode;
 use super::safeguards::{CaptureWarning, SafeguardState, evaluate_frame_safeguards};
 pub use super::sealing::recapture_clipped_stem;
 pub(crate) use super::sealing::{
-    CORESET_WITH_SETTLE_48K, align_full_stem_and_seal_vault_with_override, build_controls_meta_map,
-    build_freeze_transition_stem_stimulus, control_declared_bounds, default_control_vector,
-    normalize_stem_channel_to_48k, resample_48k_channels_to_sr,
+    CORESET_A5_FRAMES_48K, CORESET_WITH_SETTLE_48K, align_full_stem_and_seal_vault_with_override,
+    build_controls_meta_map, build_freeze_transition_stem_stimulus, control_declared_bounds,
+    default_control_vector, normalize_stem_channel_to_48k, resample_48k_channels_to_sr,
     seal_coresets_to_inpc_and_vault_with_override,
 };
 use super::waveforms::{
@@ -110,7 +110,7 @@ pub fn generate_stimulus_batch(
     );
     let (mut coreset_l, mut coreset_r) = synthesize_a5_musical_transient_coreset(
         &seed_256,
-        CORESET_FP16_FRAMES_PER_STEM,
+        CORESET_A5_FRAMES_48K,
         if need_stereo { 2 } else { 1 },
         48_000,
     );
@@ -266,9 +266,8 @@ pub fn generate_stimulus_batch(
                     let n = base_wave_l.len();
                     let settle_sr =
                         ((CORESET_WITH_SETTLE_48K as u64 * u64::from(sr)) / 48_000).max(1) as usize;
-                    let coreset_sr = ((CORESET_FP16_FRAMES_PER_STEM as u64 * u64::from(sr))
-                        / 48_000)
-                        .max(1) as usize;
+                    let coreset_sr =
+                        ((CORESET_A5_FRAMES_48K as u64 * u64::from(sr)) / 48_000).max(1) as usize;
                     let mut trajs = Vec::with_capacity(base_ctrls.len());
                     for (q, &def_v) in base_ctrls.iter().enumerate() {
                         if q == p_idx {
@@ -354,7 +353,7 @@ pub fn generate_refinement_stimulus_batch(
         build_disjoint_comb_schedule(48_000, false, Some(PEDESTAL_BIN_MONO), &empty_mask, &[]);
     let seed_256 = deterministic_seed_256(0xACE5_2026_BA7C);
     let (mut coreset_l_48k, _) =
-        synthesize_a5_musical_transient_coreset(&seed_256, CORESET_FP16_FRAMES_PER_STEM, 1, 48_000);
+        synthesize_a5_musical_transient_coreset(&seed_256, CORESET_A5_FRAMES_48K, 1, 48_000);
     coreset_l_48k.resize(CORESET_WITH_SETTLE_48K, 0.0);
 
     let default_ctrls = default_control_vector(manifest);
@@ -664,15 +663,26 @@ fn infer_batch_stem_windows_and_switches(
 /// Mode 2 (Sans-IO Solve): Aligns & safeguards 1-or-2-pass batch responses across arbitrary
 /// `8..384 kHz` device sample rates and seals `.dnam-proj` (`INPC`, `STMC`, `STAT`, `WGHT`) + `.dnam`.
 pub fn solve_from_responses(
+    manifest: DnamProjManifest,
+    batches: &[(&StemStimulusBatch, &[StemResponse])],
+    calb: Option<CalbChunk64B>,
+) -> Result<BatchSolveReport, DnamError> {
+    solve_from_responses_with_progress(manifest, batches, calb, &TrainerProgressHandle::default())
+}
+
+/// Variant of [`solve_from_responses`] emitting alignment and solver milestones into [`TrainerProgressHandle`].
+pub fn solve_from_responses_with_progress(
     mut manifest: DnamProjManifest,
     batches: &[(&StemStimulusBatch, &[StemResponse])],
     calb: Option<CalbChunk64B>,
+    progress: &TrainerProgressHandle,
 ) -> Result<BatchSolveReport, DnamError> {
     if batches.is_empty() {
         return Err(DnamError::SchemaValidationError(
             "solve_from_responses requires at least one stimulus/response batch".to_string(),
         ));
     }
+    progress.emit_phase(TrainingStatus::Running, TrainingPhase::Capture, 40);
     manifest.stems_registry.clear();
     let mut init_chunks = Vec::new();
     if let Some(c) = calb {
@@ -721,12 +731,10 @@ pub fn solve_from_responses(
                 .as_ref()
                 .map(|r| normalize_stem_channel_to_48k(r, resp.sample_rate_hz));
 
-            if dry_48k_l.len() < CORESET_FP16_FRAMES_PER_STEM
-                || wet_48k_l.len() < CORESET_FP16_FRAMES_PER_STEM
-            {
+            if dry_48k_l.len() < CORESET_A5_FRAMES_48K || wet_48k_l.len() < CORESET_A5_FRAMES_48K {
                 return Err(DnamError::SchemaValidationError(format!(
                     "stem '{}' shorter than {} coreset frames at 48 kHz",
-                    stim.stem_id, CORESET_FP16_FRAMES_PER_STEM
+                    stim.stem_id, CORESET_A5_FRAMES_48K
                 )));
             }
             let mut sg = SafeguardState::new(
@@ -831,8 +839,16 @@ pub fn solve_from_responses(
     }
 
     let stem_count = specs.len();
-    proj_bytes = solve_captures_batch_into_proj(&proj_bytes, specs, inpc_built.as_deref())?;
+    progress.emit_phase(TrainingStatus::Running, TrainingPhase::Capture, 300);
+    proj_bytes = solve_captures_batch_with_progress(
+        &proj_bytes,
+        specs,
+        inpc_built.as_deref(),
+        SolverOptions::default(),
+        &progress.subrange(300, 960),
+    )?;
     let runtime_dnam_bytes = export_runtime_dnam(&proj_bytes, None)?;
+    progress.emit_phase(TrainingStatus::Completed, TrainingPhase::Completed, 1_000);
     Ok(BatchSolveReport {
         proj_bytes,
         runtime_dnam_bytes,

@@ -4,9 +4,10 @@
 use std::f64::consts::PI;
 
 use dnam_engine::Tier;
-use dnam_engine::stages::v3_core::cascade::{
-    MAX_BLOCK_LANES, MAX_TOTAL_GRU_LANES, NUM_GRU_BLOCKS, tier_block_lanes, tier_fir_segments,
-    tier_groups, tier_kautz_banks,
+use dnam_engine::stages::stage2_gru::{
+    MAX_BLOCK_LANES, MAX_GROUPS, MAX_GROUPS_PER_BLOCK, MAX_KAUTZ_POLES, MAX_TOTAL_GRU_LANES,
+    NUM_GRU_BLOCKS, tier_block_lanes_array, tier_fir_segments, tier_kautz_banks,
+    tier_total_gru_lanes,
 };
 
 use crate::solver::backends::TrainerBackend;
@@ -16,7 +17,7 @@ mod als;
 mod cache;
 
 use super::model_f64::{Bezout7FilterBank, V3TierReadoutF64};
-pub(super) use als::{als_update_pre_cab_chan, solve_tier_output_k_chan};
+pub(super) use als::{als_update_pre_cab_chan, solve_tier_output_chan, solve_tier_output_k_chan};
 pub use als::{solve_matryoshka_varpro_cholesky, solve_matryoshka_varpro_cholesky_with_backend};
 pub(super) use cache::{
     PreSplitStemChan, SubspaceGramData, assemble_tier_band_grams, eval_bezout_loss_from_gram,
@@ -26,7 +27,7 @@ pub(super) use cache::{
 pub const ALL_TIERS: [Tier; 4] = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra];
 pub const KAUTZ_DELAY_SAMPLES: usize = 16;
 
-/// Linear readout basis dimension (`45, 81, 125, 185` for `Lite..Ultra`).
+/// Linear readout basis dimension (`45, 73, 101, 129` for `Lite..Ultra`).
 #[inline]
 #[must_use]
 pub const fn linear_basis_dim(tier: Tier) -> usize {
@@ -37,9 +38,16 @@ pub const fn linear_basis_dim(tier: Tier) -> usize {
 #[inline]
 #[must_use]
 pub const fn linear_basis_dim_with_k(tier: Tier, k_keep: usize) -> usize {
-    let g = tier_groups(tier);
-    let f = tier_fir_segments(tier);
-    9 + 12 * g + 16 * f + 2 * k_keep
+    let f = tier_fir_segments(tier) * 16;
+    9 + tier_total_gru_lanes(tier) + f + 2 * k_keep
+}
+
+/// Active per-block GRU lane counts for `max_groups` (`[4,4,4]`, `[8,4,4]`, or `[12,8,4]`).
+#[inline]
+#[must_use]
+pub(super) fn active_block_lanes(max_groups: usize) -> [usize; NUM_GRU_BLOCKS] {
+    let g_cnt = max_groups.clamp(1, MAX_GROUPS);
+    std::array::from_fn(|b| g_cnt.saturating_sub(b).clamp(1, MAX_GROUPS_PER_BLOCK[b]) * 4)
 }
 
 pub(super) fn normalize_pre_cab_chan(
@@ -48,30 +56,32 @@ pub(super) fn normalize_pre_cab_chan(
     tau: usize,
     ch: usize,
 ) {
-    let c_t = tier_block_lanes(ALL_TIERS[tau]);
+    let c_t = tier_block_lanes_array(ALL_TIERS[tau]);
     let mut sq = r.pre_cab_u_gain[ch].powi(2) + r.pre_cab_hp_gain[ch].powi(2);
     for b in 0..NUM_GRU_BLOCKS {
         let base = b * MAX_BLOCK_LANES;
-        sq += r.pre_cab_w[ch][base..base + c_t]
+        let c_b = c_t[b];
+        sq += r.pre_cab_w[ch][base..base + c_b]
             .iter()
             .map(|w| w * w)
             .sum::<f64>();
-        r.pre_cab_w[ch][base + c_t..base + MAX_BLOCK_LANES].fill(0.0);
-        r.direct_s2_w[ch][base + c_t..base + MAX_BLOCK_LANES].fill(0.0);
+        r.pre_cab_w[ch][base + c_b..base + MAX_BLOCK_LANES].fill(0.0);
+        r.direct_s2_w[ch][base + c_b..base + MAX_BLOCK_LANES].fill(0.0);
     }
     if sq <= 1.0e-12 {
         return;
     }
     let mut scale = sq.sqrt();
     if let Some(p) = prev {
-        let c_p = tier_block_lanes(ALL_TIERS[tau.saturating_sub(1)]);
+        let c_p = tier_block_lanes_array(ALL_TIERS[tau.saturating_sub(1)]);
         let mut dot = r.pre_cab_u_gain[ch] * p.pre_cab_u_gain[ch]
             + r.pre_cab_hp_gain[ch] * p.pre_cab_hp_gain[ch];
         for b in 0..NUM_GRU_BLOCKS {
             let base = b * MAX_BLOCK_LANES;
-            dot += r.pre_cab_w[ch][base..base + c_p]
+            let c_pb = c_p[b];
+            dot += r.pre_cab_w[ch][base..base + c_pb]
                 .iter()
-                .zip(&p.pre_cab_w[ch][base..base + c_p])
+                .zip(&p.pre_cab_w[ch][base..base + c_pb])
                 .map(|(a, b)| a * b)
                 .sum::<f64>();
         }
@@ -107,7 +117,7 @@ pub(super) fn normalize_pre_cab_gauge(readouts: &mut [V3TierReadoutF64; 4], acti
 pub(super) fn eval_s2_from_readout(
     r: &V3TierReadoutF64,
     ch: usize,
-    c_t: usize,
+    c_t: [usize; NUM_GRU_BLOCKS],
     u_dec: &[f64],
     hp_dec: &[f64],
     h_dec: &[[f64; MAX_TOTAL_GRU_LANES]],
@@ -120,7 +130,7 @@ pub(super) fn eval_s2_from_readout(
         let hd = &h_dec[t];
         for b in 0..NUM_GRU_BLOCKS {
             let base = b * MAX_BLOCK_LANES;
-            for l in 0..c_t {
+            for l in 0..c_t[b] {
                 s2 += r.pre_cab_w[ch][base + l] * hd[base + l];
             }
         }
@@ -137,16 +147,28 @@ pub(super) fn apply_fixed_cabinet_f64<B: TrainerBackend>(
 ) {
     let n = sig.len().min(out.len());
     let f_t = fir.len();
-    let k_t = kautz_pre6.len().min(kc.len()).min(32);
-    let mut s_re = [0.0_f64; 32];
-    let mut s_im = [0.0_f64; 32];
-    let mut out_re = [0.0_f64; 32];
-    let mut out_im = [0.0_f64; 32];
-    for t in 0..n {
-        let mut v = 0.0_f64;
-        for k in 0..f_t.min(t + 1) {
-            v += fir[k] * sig[t - k];
+    let k_t = kautz_pre6.len().min(kc.len()).min(MAX_KAUTZ_POLES);
+    let mut fir_rev = [0.0_f64; 64];
+    let fast_fir = f_t > 0 && f_t <= fir_rev.len();
+    if fast_fir {
+        for (k, &w) in fir.iter().rev().enumerate() {
+            fir_rev[k] = w;
         }
+    }
+    let mut s_re = [0.0_f64; MAX_KAUTZ_POLES];
+    let mut s_im = [0.0_f64; MAX_KAUTZ_POLES];
+    let mut out_re = [0.0_f64; MAX_KAUTZ_POLES];
+    let mut out_im = [0.0_f64; MAX_KAUTZ_POLES];
+    for t in 0..n {
+        let mut v = if fast_fir && t + 1 >= f_t {
+            B::dot_f64(&fir_rev[..f_t], &sig[t + 1 - f_t..=t])
+        } else {
+            let mut acc = 0.0_f64;
+            for k in 0..f_t.min(t + 1) {
+                acc += fir[k] * sig[t - k];
+            }
+            acc
+        };
         let x_del = if t >= KAUTZ_DELAY_SAMPLES {
             sig[t - KAUTZ_DELAY_SAMPLES]
         } else {
@@ -189,32 +211,38 @@ pub(super) fn build_tier_columns_with_kautz_cap<B: TrainerBackend>(
     s2: &[f64],
 ) -> Vec<Vec<f64>> {
     let n = s2.len();
-    let c_t = tier_block_lanes(tier);
+    let c_t = tier_block_lanes_array(tier);
+    let total_h = tier_total_gru_lanes(tier);
     let f_t = tier_fir_segments(tier) * 16;
     let k_t = (tier_kautz_banks(tier) * 4).min(k_keep);
-    let p_dim = 9 + 3 * c_t + f_t + 2 * k_t;
+    let p_dim = 9 + total_h + f_t + 2 * k_t;
     let mut cols = vec![vec![0.0_f64; n]; p_dim];
-    for t in 0..n {
-        for i in 0..7 {
-            cols[i][t] = tap_dec[t][i];
-        }
-        cols[7][t] = u_dec[t];
-        cols[8][t] = hp_dec[t];
-        let mut idx = 9;
-        for b in 0..NUM_GRU_BLOCKS {
-            let base = b * MAX_BLOCK_LANES;
-            for l in 0..c_t {
-                cols[idx][t] = h_dec[t][base + l];
-                idx += 1;
-            }
-        }
-        for k in 0..f_t {
-            if t >= k {
-                cols[idx + k][t] = s2[t - k];
-            }
+    for i in 0..7 {
+        let col = &mut cols[i][..n];
+        for (t, taps) in tap_dec[..n].iter().enumerate() {
+            col[t] = taps[i];
         }
     }
-    let k_base = 9 + 3 * c_t + f_t;
+    cols[7][..n].copy_from_slice(&u_dec[..n]);
+    cols[8][..n].copy_from_slice(&hp_dec[..n]);
+    let mut idx = 9;
+    for b in 0..NUM_GRU_BLOCKS {
+        let base = b * MAX_BLOCK_LANES;
+        for l in 0..c_t[b] {
+            let lane = base + l;
+            let col = &mut cols[idx][..n];
+            for (t, h_row) in h_dec[..n].iter().enumerate() {
+                col[t] = h_row[lane];
+            }
+            idx += 1;
+        }
+    }
+    for k in 0..f_t {
+        if k < n {
+            cols[idx + k][k..n].copy_from_slice(&s2[..n - k]);
+        }
+    }
+    let k_base = 9 + total_h + f_t;
     if k_t > 0 {
         let pre = kautz_pre_tuples(&poles[..k_t]);
         B::filter_pole_bank_columns(s2, KAUTZ_DELAY_SAMPLES, &pre, &mut cols, k_base);
@@ -251,7 +279,7 @@ pub(super) fn unpack_theta_k_to_readout(
     theta: &[f64],
     r: &mut V3TierReadoutF64,
 ) {
-    let c_t = tier_block_lanes(tier);
+    let c_t = tier_block_lanes_array(tier);
     let f_t = tier_fir_segments(tier) * 16;
     let k_t = (tier_kautz_banks(tier) * 4).min(k_keep);
     if ch == 0 {
@@ -265,7 +293,7 @@ pub(super) fn unpack_theta_k_to_readout(
     r.direct_s2_w[ch].fill(0.0);
     for b in 0..NUM_GRU_BLOCKS {
         let base = b * MAX_BLOCK_LANES;
-        for l in 0..c_t {
+        for l in 0..c_t[b] {
             r.direct_s2_w[ch][base + l] = theta[idx];
             idx += 1;
         }
@@ -295,7 +323,7 @@ pub(super) fn unpack_theta_to_readout(
 }
 
 pub(super) fn pack_readout_to_theta(tier: Tier, ch: usize, r: &V3TierReadoutF64) -> Vec<f64> {
-    let c_t = tier_block_lanes(tier);
+    let c_t = tier_block_lanes_array(tier);
     let f_t = tier_fir_segments(tier) * 16;
     let k_t = tier_kautz_banks(tier) * 4;
     let mut theta = Vec::with_capacity(linear_basis_dim(tier));
@@ -309,7 +337,7 @@ pub(super) fn pack_readout_to_theta(tier: Tier, ch: usize, r: &V3TierReadoutF64)
     theta.push(r.direct_s2_hp_gain[ch]);
     for b in 0..NUM_GRU_BLOCKS {
         let base = b * MAX_BLOCK_LANES;
-        for l in 0..c_t {
+        for l in 0..c_t[b] {
             theta.push(r.direct_s2_w[ch][base + l]);
         }
     }
@@ -330,8 +358,8 @@ pub(super) fn map_prev_tier_anchor(
 ) -> Vec<(usize, f64)> {
     let prev_t = ALL_TIERS[tau - 1];
     let cur_t = ALL_TIERS[tau];
-    let cp = tier_block_lanes(prev_t);
-    let cc = tier_block_lanes(cur_t);
+    let cp = tier_block_lanes_array(prev_t);
+    let cc = tier_block_lanes_array(cur_t);
     let fp = tier_fir_segments(prev_t) * 16;
     let fc = tier_fir_segments(cur_t) * 16;
     let kp = tier_kautz_banks(prev_t) * 4;
@@ -341,13 +369,15 @@ pub(super) fn map_prev_tier_anchor(
         out.push((i, val));
     }
     let mut pidx = 9;
+    let mut dst_off = 9;
     for b in 0..NUM_GRU_BLOCKS {
-        for l in 0..cp {
-            out.push((9 + b * cc + l, pt[pidx]));
+        for l in 0..cp[b] {
+            out.push((dst_off + l, pt[pidx]));
             pidx += 1;
         }
+        dst_off += cc[b];
     }
-    let f_base = 9 + 3 * cc;
+    let f_base = 9 + tier_total_gru_lanes(cur_t);
     for k in 0..fp {
         out.push((f_base + k, pt[pidx]));
         pidx += 1;
@@ -417,11 +447,186 @@ pub(super) fn solve_uplo_with_bypass_and_anchor(
             }
         }
     }
-    for &mult in &[1.0e-8, 1.0e-7, 1.0e-6, 1.0e-5, 1.0e-3, 1.0e-1] {
-        let ridge = mult * mean_diag + 1.0e-11;
+    let mults: &[f64] = if bypass_cols.is_empty() && anchor.is_empty() {
+        &[
+            1.0e-12, 1.0e-10, 1.0e-8, 1.0e-7, 1.0e-6, 1.0e-5, 1.0e-3, 1.0e-1,
+        ]
+    } else {
+        &[1.0e-8, 1.0e-7, 1.0e-6, 1.0e-5, 1.0e-3, 1.0e-1]
+    };
+    for &mult in mults {
+        let ridge = mult * mean_diag
+            + if bypass_cols.is_empty() {
+                1.0e-15
+            } else {
+                1.0e-11
+            };
         if let Ok(sol) = solve_uplo_u_cholesky_2ch(&g_work, &r_work, ridge) {
             return sol.into_iter().map(|c| c[0]).collect();
         }
     }
     vec![0.0; p_dim]
+}
+
+fn readout_theta_feasible(
+    theta: &[f64],
+    p_dim: usize,
+    total_h: usize,
+    dir_w_budget_sq: f64,
+) -> bool {
+    const LIN_CAP: f64 = 64.0;
+    let lin_end = 9.min(theta.len()).min(p_dim);
+    let max_lin = theta[..lin_end].iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+    let w_start = 9.min(theta.len()).min(p_dim);
+    let w_end = (9 + total_h).min(theta.len()).min(p_dim);
+    let dir_w_sq: f64 = theta[w_start..w_end].iter().map(|v| v * v).sum();
+    dir_w_sq <= dir_w_budget_sq && max_lin <= LIN_CAP
+}
+
+/// Solves a tier linear readout via `solve_uplo_with_bypass_and_anchor` while enforcing an exact
+/// trust region on `svf_direct_taps`, `direct_s2_u_gain`, `direct_s2_hp_gain`, and `direct_s2_w`
+/// (`<= 240.0 - ||pre_cab_w||_2^2`) so Stage III FIR/Kautz weights compensate instead of relying
+/// on collinear cancellations that Phase-3 `[CLAMP-HEAD-GAIN]` would later truncate.
+pub(super) fn solve_tier_readout_uplo_bounded(
+    p_dim: usize,
+    total_h: usize,
+    pre_cab_w_sq: f64,
+    gram: &[f64],
+    rhs: &[[f64; 2]],
+    bypass_cols: &[(usize, f64)],
+    anchor_spec: Option<(&[(usize, f64)], f64)>,
+) -> Vec<f64> {
+    const LIN_CAP: f64 = 64.0;
+    const BRACKET_MUS: [f64; 9] = [
+        1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0, 10.0, 1.0e2, 1.0e3, 1.0e4,
+    ];
+
+    let (anchor, anchor_scale) = anchor_spec.unwrap_or((&[], 0.0));
+    let theta =
+        solve_uplo_with_bypass_and_anchor(p_dim, gram, rhs, bypass_cols, anchor, anchor_scale);
+    let dir_w_budget_sq = (240.0 - pre_cab_w_sq).max(64.0);
+    if readout_theta_feasible(&theta, p_dim, total_h, dir_w_budget_sq) {
+        return theta;
+    }
+
+    let anchor_w_sq: f64 = anchor
+        .iter()
+        .filter(|&&(idx, _)| idx >= 9 && idx < 9 + total_h)
+        .map(|&(_, v)| v * v)
+        .sum();
+    let anchor_lin: f64 = anchor
+        .iter()
+        .filter(|&&(idx, _)| idx < 9)
+        .fold(0.0_f64, |m, &(_, v)| m.max(v.abs()));
+    let eff_anchor_scale = if anchor_w_sq <= dir_w_budget_sq && anchor_lin <= LIN_CAP {
+        anchor_scale
+    } else {
+        0.0
+    };
+
+    let pen_end = (9 + total_h).min(p_dim);
+    let eval_mu = |mu: f64| -> Vec<f64> {
+        let mut aug = Vec::with_capacity(bypass_cols.len() + pen_end);
+        aug.extend_from_slice(bypass_cols);
+        for idx in 0..pen_end {
+            aug.push((idx, mu));
+        }
+        solve_uplo_with_bypass_and_anchor(p_dim, gram, rhs, &aug, anchor, eff_anchor_scale)
+    };
+
+    let mut mu_lo = 0.0_f64;
+    let mut mu_hi = *BRACKET_MUS.last().unwrap_or(&1.0e4);
+    let mut best_theta: Option<Vec<f64>> = None;
+    for &mu in &BRACKET_MUS {
+        let cand = eval_mu(mu);
+        if readout_theta_feasible(&cand, p_dim, total_h, dir_w_budget_sq) {
+            mu_hi = mu;
+            best_theta = Some(cand);
+            break;
+        }
+        mu_lo = mu;
+    }
+
+    let Some(mut feasible_theta) = best_theta else {
+        return eval_mu(mu_hi);
+    };
+    for _ in 0..8 {
+        let mu_mid = if mu_lo > 0.0 {
+            (mu_lo * mu_hi).sqrt()
+        } else {
+            0.5 * mu_hi
+        };
+        let cand = eval_mu(mu_mid);
+        if readout_theta_feasible(&cand, p_dim, total_h, dir_w_budget_sq) {
+            mu_hi = mu_mid;
+            feasible_theta = cand;
+        } else {
+            mu_lo = mu_mid;
+        }
+    }
+    feasible_theta
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::solver::uplo_u_packed_len;
+
+    #[test]
+    fn test_solve_tier_readout_uplo_bounded_trust_region_compensates_collinear_cols() {
+        let p_dim = 12_usize;
+        let total_h = 2_usize;
+        // Build nearly collinear direct columns (7 = u, 8 = hp, 9..11 = direct_s2_w) while column 11
+        // (Stage III FIR tap 0) cleanly reproduces target y = 0.5 * x.
+        let n = 64_usize;
+        let mut gram = vec![0.0_f64; uplo_u_packed_len(p_dim)];
+        let mut rhs = vec![[0.0_f64; 2]; p_dim];
+        for t in 0..n {
+            let x = (0.13 * (t as f64)).sin();
+            let mut row = [0.0_f64; 12];
+            row[7] = x;
+            row[8] = x + 1.0e-5 * ((0.31 * (t as f64)).cos());
+            row[9] = x - 1.0e-5 * ((0.27 * (t as f64)).sin());
+            row[10] = x + 1.0e-5 * ((0.19 * (t as f64)).sin());
+            row[11] = 0.99 * x;
+            // Target requires large collinear cancellation unless regularized toward col 11.
+            let y = 0.5 * x
+                + 2.5e-4 * ((0.31 * (t as f64)).cos())
+                + 2.5e-4 * ((0.27 * (t as f64)).sin());
+            for j in 0..p_dim {
+                rhs[j][0] += row[j] * y;
+                for i in 0..=j {
+                    gram[uplo_u_index(i, j)] += row[i] * row[j];
+                }
+            }
+        }
+        let mut excessive_anchor = vec![(8_usize, 120.0), (9_usize, 30.0)];
+        let unconstrained =
+            solve_uplo_with_bypass_and_anchor(p_dim, &gram, &rhs, &[], &excessive_anchor, 1.0e-2);
+        assert!(
+            !readout_theta_feasible(&unconstrained, p_dim, total_h, 240.0),
+            "synthetic collinear system should violate raw unconstrained norm cap"
+        );
+
+        let bounded = solve_tier_readout_uplo_bounded(
+            p_dim,
+            total_h,
+            0.0,
+            &gram,
+            &rhs,
+            &[],
+            Some((&excessive_anchor, 1.0e-2)),
+        );
+        assert!(readout_theta_feasible(&bounded, p_dim, total_h, 240.0));
+        assert!(
+            bounded[11].abs() > 0.25,
+            "Stage III col 11 should compensate when direct_s2 cols are damped: {:?}",
+            bounded
+        );
+
+        excessive_anchor.clear();
+        let well_cond =
+            solve_tier_readout_uplo_bounded(p_dim, total_h, 0.0, &gram, &rhs, &[], None);
+        assert!(readout_theta_feasible(&well_cond, p_dim, total_h, 240.0));
+    }
 }

@@ -7,7 +7,7 @@
 use super::neon::{NeonBackend, NeonVec4, aarch64_crc32c_update};
 use super::sve2::ArmSve2Backend;
 use crate::math::crc32c::Crc32cBackend;
-use crate::math::{BackendKind, MathBackend};
+use crate::math::{BackendKind, MathBackend, SimdVec4};
 
 /// ARMv9.2-A Scalable Matrix Extension (`FEAT_SME` / `SME2`) hardware backend for `aarch64`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -161,6 +161,32 @@ impl MathBackend for ArmSmeBackend {
     type Vec4 = NeonVec4;
     const NAME: &'static str = "ARMv9.2-A SME (Scalable Matrix Extension + SVE2/NEON)";
     const KIND: BackendKind = BackendKind::ArmSme;
+
+    #[inline(always)]
+    fn transpose_4x4(
+        r0: Self::Vec4,
+        r1: Self::Vec4,
+        r2: Self::Vec4,
+        r3: Self::Vec4,
+    ) -> [Self::Vec4; 4] {
+        NeonBackend::transpose_4x4(r0, r1, r2, r3)
+    }
+
+    #[inline(always)]
+    fn vec4_to_fp16x4(src: Self::Vec4) -> [u16; 4] {
+        if ArmSve2Backend::is_supported() {
+            return ArmSve2Backend::f32x4_to_fp16x4(&src.to_array());
+        }
+        NeonBackend::vec4_to_fp16x4(src)
+    }
+
+    #[inline(always)]
+    fn fp16x4_to_vec4(src: &[u16; 4]) -> Self::Vec4 {
+        if ArmSve2Backend::is_supported() {
+            return NeonVec4::load(&ArmSve2Backend::fp16x4_to_f32x4(src));
+        }
+        NeonBackend::fp16x4_to_vec4(src)
+    }
 
     #[inline(always)]
     fn f32x4_to_fp16x4(src: &[f32; 4]) -> [u16; 4] {

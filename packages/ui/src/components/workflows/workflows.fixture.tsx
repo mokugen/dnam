@@ -1,5 +1,7 @@
 import { useFixtureSelect } from "react-cosmos/client";
-import { CapturePlanPanel, TrainingTimelinePanel } from "./index.js";
+import { CapturePlanPanel } from "./CapturePlanPanel.js";
+import { TrainingFitVisualizer } from "./TrainingFitVisualizer.js";
+import { TrainingTimelinePanel } from "./TrainingTimelinePanel.js";
 
 function TrainingTimelineFixture() {
   const [status] = useFixtureSelect("Training Status", {
@@ -57,4 +59,5 @@ export default {
     />
   ),
   "Two-Sweep Analytical Trainer": <TrainingTimelineFixture />,
+  "Tone Lock Live Convergence": <TrainingFitVisualizer status="running" progressFraction={0.78} />,
 };

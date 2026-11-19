@@ -155,7 +155,7 @@ pub fn bounded_q32_reader_position(
 }
 
 /// Directed `fp16` decay multiplier `0.999f32` (`0x3F7FBE76`, `ref[dsp.op-t.guard.fp16-decay]`).
-pub const FP16_DECAY_GAIN_BITS: u32 = 0x3F7F_BE76;
+pub const FP16_DECAY_GAIN_BITS: u32 = crate::math::STAGE4_MAX_G_LIN_BITS_DERIVED;
 
 /// Clamps `value` against the directed `fp16` decay ceiling `0.999f32 * max_bound` and rounds the
 /// `fp16` magnitude toward zero so every positive `fp16` history value strictly contracts under

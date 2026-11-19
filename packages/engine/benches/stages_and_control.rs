@@ -188,10 +188,13 @@ fn make_bench_container() -> AlignedBuffer<CacheLine64> {
         tensor_directory: BTreeMap::new(),
     };
 
-    let mut arena = vec![0u8; 64_000];
-    for (i, byte) in arena[128..62_000].iter_mut().enumerate() {
-        *byte = ((i * 7 + 3) & 0x3F) as u8;
+    let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+    let mut model = dnam_engine::stages::V3MatryoshkaModel::dual_rate_default(false);
+    for s4 in &mut model.stage4 {
+        s4.g_loop = 0.80;
+        s4.wet_mix = 0.15;
     }
+    dnam_engine::stages::weights::pack_v3_matryoshka_to_arena(&model, &mut arena);
     let raw = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
     let mut aligned = AlignedBuffer::<CacheLine64>::new_zeroed(raw.len() / 64);
     aligned.as_bytes_mut().copy_from_slice(&raw);
@@ -216,64 +219,44 @@ fn bench_stages_and_tank(c: &mut Criterion) {
         b.iter(|| {
             black_box(
                 engine
-                    .stage_pipeline
-                    .stage0
+                    .stage0_router
                     .route_frame_no_return(black_box(0.15), black_box(-0.15)),
             )
         });
     });
 
+    let mut s1 = dnam_engine::stages::Stage1PreDynamics::default();
     group.bench_function("stage1_pre_dynamics_stereo", |b| {
         let _audio = FtzDazGuard::new();
-        b.iter(|| {
-            black_box(
-                engine
-                    .stage_pipeline
-                    .stage1
-                    .step_stereo(black_box(0.15), black_box(-0.15)),
-            )
-        });
+        b.iter(|| black_box(s1.step_stereo(black_box(0.15), black_box(-0.15))));
     });
 
-    group.bench_function("stage2_commuted_cascade_stereo", |b| {
+    let mut s2_core = dnam_engine::stages::V3HotCore::<DefaultMathBackend>::from_cold_model(
+        &dnam_engine::stages::V3ColdTierModel::identity_for_tier(Tier::Lite, false, false),
+    );
+    group.bench_function("stage2_v3_hot_core_lite_stereo", |b| {
         let _audio = FtzDazGuard::new();
-        b.iter(|| {
-            black_box(engine.stage_pipeline.stage2.step_frame(
-                black_box(0.15),
-                black_box(-0.15),
-                black_box(1.0),
-                black_box(0.2),
-            ))
-        });
+        b.iter(|| black_box(s2_core.step_stereo(black_box(0.15), black_box(-0.15))));
     });
 
-    let fir_taps = engine.stage_pipeline.fir_taps;
+    let mut s3_l = dnam_engine::stages::Stage3CabinetModals::default();
+    let mut s3_r = dnam_engine::stages::Stage3CabinetModals::default();
+    let fir_taps = [0.0625_f32; 16];
     group.bench_function("stage3_early_fir_stereo", |b| {
         let _audio = FtzDazGuard::new();
         b.iter(|| {
-            let l = engine.stage_pipeline.stage3.step_fir_only_with_delayed_tap(
-                black_box(0.15),
-                black_box(0.02),
-                &fir_taps,
-            );
-            let r = engine
-                .stage_pipeline
-                .stage3_r
-                .step_fir_only_with_delayed_tap(black_box(-0.15), black_box(-0.02), &fir_taps);
+            let l =
+                s3_l.step_fir_only_with_delayed_tap(black_box(0.15), black_box(0.02), &fir_taps);
+            let r =
+                s3_r.step_fir_only_with_delayed_tap(black_box(-0.15), black_box(-0.02), &fir_taps);
             black_box((l, r))
         });
     });
 
+    let mut s4 = dnam_engine::stages::Stage4SpatialTank::new();
     group.bench_function("stage4_spatial_tank_stereo", |b| {
         let _audio = FtzDazGuard::new();
-        b.iter(|| {
-            black_box(
-                engine
-                    .stage_pipeline
-                    .stage4
-                    .step_stereo(black_box(0.15), black_box(-0.15)),
-            )
-        });
+        b.iter(|| black_box(s4.step_stereo(black_box(0.15), black_box(-0.15))));
     });
 
     let mut lr4 = TptLr4Crossover::new_48khz();

@@ -5,7 +5,7 @@
  * (`ref[sdk.ts.api.sync-init]`, `ref[sdk.ts.layout.dependency-direction]`).
  *
  * Automatically initializes the WebAssembly SIMD128 driver via top-level `await` when
- * `dnam.wasm` is reachable via `fetch`, while allowing explicit override via `await initWasm(...)`.
+ * `dnam.wasm` is reachable via `fetch`, while allowing explicit override via `await initWasm({ ... })`.
  *
  * @module
  */
@@ -20,76 +20,86 @@ try {
 }
 
 export {
-  type ActiveBackend,
-  type AudioBlock,
-  type AudioInput,
-  type Backend,
   type BounceOptions,
+  Engine,
+  type EngineOptions,
+  type HostMixOptions,
+  type ProcessAsyncOptions,
+  type ProcessOptions,
+  type ReloadOptions,
+  type RenderOptions,
+} from "./engine/engine.js";
+export type { BypassOptions, FreezeOptions } from "./engine/state-scopes.js";
+export type { StreamOptions } from "./engine/stream.js";
+export type { OverflowFlags, TelemetrySnapshot } from "./engine/telemetry.js";
+export {
+  DnamError,
+  type DnamErrorOptions,
+  type ErrorCode,
+  type ErrorDetail,
+  errorCodes,
+  isDnamError,
+} from "./errors.js";
+export { initWasm } from "./internal/native/load.js";
+export type { InitWasmOptions, WasmMemoryOptions } from "./internal/native/wasm.js";
+export { GramMatrix, uploUPackedLength } from "./model/gram-matrix.js";
+export type { ModelSource } from "./model/load.js";
+export {
   type BuildModelOptions,
-  type BypassOptions,
-  backends,
+  crc32c,
+  Model,
+  type ModelLoadOptions,
+  type ReferenceModelOptions,
+  type V2OpenLayoutInfo,
+} from "./model/model.js";
+export type { PreambleInfo, TierArenas } from "./model/preamble.js";
+export {
   type ClampedParameterEntry,
   type ClampReport,
   ControlSpace,
   clampParameters,
-  crc32c,
-  DnamError,
-  type DnamErrorOptions,
-  decodeHeader,
+} from "./parameters/clamp.js";
+export { Parameter, type SetParameterOptions } from "./parameters/parameter.js";
+export { ParameterMap } from "./parameters/parameter-map.js";
+export {
   defineModelTypes,
-  Engine,
-  type EngineOptions,
-  type ErrorCode,
-  type ErrorDetail,
-  encodeHeader,
-  errorCodes,
-  type FreezeOptions,
-  GramMatrix,
-  type HostMixOptions,
-  headerToJcs,
   type InferParameterMap,
-  type InitWasmOptions,
-  initWasm,
-  isDnamError,
-  Model,
-  type ModelHeader,
-  type ModelLoadOptions,
-  type ModelSource,
-  type OverflowFlags,
-  Parameter,
-  type ParameterCalibration,
-  type ParameterDescriptor,
-  type ParameterKind,
-  ParameterMap,
-  type ParameterUiHints,
   type ParameterValueMap,
-  type PreambleInfo,
-  type Preset,
-  type ProcessAsyncOptions,
-  type ProcessOptions,
-  type ProtectionProfile,
+  type TypedParameterEntry,
+} from "./parameters/typed-model.js";
+export {
+  decodeHeader,
+  encodeHeader,
+  headerToJcs,
+  type ModelHeader,
   parseSchemaVersion,
-  protectionProfiles,
-  type ReferenceModelOptions,
-  type ReloadOptions,
-  type RenderOptions,
   type SchemaVersion,
-  type SetParameterOptions,
-  type StateScope,
-  type StreamOptions,
-  type Subdivision,
-  subdivisions,
+} from "./schema/header.js";
+export type {
+  ParameterCalibration,
+  ParameterDescriptor,
+  ParameterKind,
+  ParameterUiHints,
+  Preset,
+} from "./schema/parameters.js";
+export {
   type TapTempoResult,
-  type TelemetrySnapshot,
   TempoController,
   type TempoSyncOptions,
   type TempoTapOptions,
+} from "./tempo/tempo.js";
+export {
+  type ActiveBackend,
+  type AudioBlock,
+  type AudioInput,
+  type Backend,
+  backends,
+  type ProtectionProfile,
+  protectionProfiles,
+  type StateScope,
+  type Subdivision,
+  subdivisions,
   type Tier,
-  type TierArenas,
   type TierInput,
-  type TypedParameterEntry,
   tiers,
-  uploUPackedLength,
-  type V2OpenLayoutInfo,
-  type WasmMemoryOptions,
-} from "./public-exports.js";
+} from "./types.js";

@@ -5,8 +5,6 @@
  * @module
  */
 
-export { type Subdivision, subdivisions } from "../types.js";
-
 /**
  * Continuous-Time Zero-Order Hold (ZOH) sample-rate rescaled parameters (`ref[dsp.zoh.ctrl-stride]`).
  */

@@ -1,245 +1,22 @@
 #![forbid(unsafe_code)]
 //! Generic Multi-Timescale `96 kHz` Physical Seed Bank & Matryoshka Group Unlocking (`v3`).
 
+mod specialty;
+mod specs;
+mod spectral_id;
 mod unlock;
 
-use dnam_engine::stages::v3_core::V3MatryoshkaModel;
-use dnam_engine::stages::v3_core::cascade::{MAX_BLOCK_LANES, NUM_GRU_BLOCKS};
+use dnam_engine::stages::V3MatryoshkaModel;
+use dnam_engine::stages::stage2_gru::{MAX_BLOCK_LANES, NUM_GRU_BLOCKS};
 
 use super::model_f64::V3MatryoshkaOptF64;
 
+pub use specialty::build_specialty_seeds_for_dataset;
+pub use specs::SeedArchetype;
+use specs::{ASYM_OFF, SAG_B2_PREV, SEED_SPECS, SeedSpec};
 pub use unlock::unlock_matryoshka_groups_after_prescreen;
 
-/// Circuit archetype partition preserved across Phase 0a/0b Gabor homotopy screening.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SeedArchetype {
-    GeneralDrive,
-    SeriesTubeSag,
-    PinchBiasClipper,
-    EnvResonantSvf,
-}
-
-impl SeedArchetype {
-    pub(super) fn index(self) -> usize {
-        match self {
-            Self::GeneralDrive => 0,
-            Self::SeriesTubeSag => 1,
-            Self::PinchBiasClipper => 2,
-            Self::EnvResonantSvf => 3,
-        }
-    }
-}
-
-struct SeedSpec {
-    arch: SeedArchetype,
-    svf: [f64; 14],
-    feat: [f64; 7],
-    drv: [f64; 6],
-    route_pre_hp: bool,
-    taps: [f64; 7],
-}
-
-impl SeedSpec {
-    const fn row(
-        arch: SeedArchetype,
-        svf: [f64; 14],
-        feat: [f64; 7],
-        drv: [f64; 6],
-        route_pre_hp: bool,
-        taps: [f64; 7],
-    ) -> Self {
-        Self {
-            arch,
-            svf,
-            feat,
-            drv,
-            route_pre_hp,
-            taps,
-        }
-    }
-}
-
-const SAG_B2_PREV: [[f64; 4]; 4] = [
-    [0.50, 0.22, 0.11, -0.37],
-    [-0.50, -0.22, -0.11, 0.37],
-    [0.68, 0.30, 0.15, -0.50],
-    [0.32, 0.36, 0.18, -0.18],
-];
-
-const ASYM_OFF: [f64; 4] = [-0.45, 0.30, -0.85, 0.55];
-
-const SEED_SPECS: [SeedSpec; 16] = [
-    // GeneralDrive (4): poly 2x OS + Butterworth4 AI pre-HP overdrive + multi-band drive
-    SeedSpec::row(
-        SeedArchetype::GeneralDrive,
-        [
-            0.035, 1.50, 0.0, 0.6, 0.920, 0.992, 0.72, 0.25, 0.90, 1.00, 0.10, 0.10, 0.002, 0.65,
-        ],
-        [0.012, 0.08, 0.006, 0.05, 0.005, 1.0e-4, 0.0],
-        [1.65, 0.25, 0.25, 0.002, 0.05, 0.0],
-        false,
-        [0.88, 0.12, 0.04, 0.0, 0.0, 0.0, 0.0],
-    ),
-    SeedSpec::row(
-        SeedArchetype::GeneralDrive,
-        [
-            0.66, 1.00, 0.0, 0.5, 0.950, 0.995, 0.78, 0.0, 1.848, 0.765, 0.0, 0.0, 0.002, 0.90,
-        ],
-        [0.046, 0.08, 0.006, 1.0e-4, 0.005, 1.0e-4, 0.0],
-        [3.20, 0.0, 0.0, 0.05, 0.96, -0.18],
-        true,
-        [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-    ),
-    SeedSpec::row(
-        SeedArchetype::GeneralDrive,
-        [
-            0.66, 1.00, 0.0, 0.5, 0.950, 0.995, 0.78, 0.0, 1.848, 0.765, 0.0, 0.0, 0.002, 0.90,
-        ],
-        [0.036, 0.08, 0.006, 1.0e-4, 0.005, 1.0e-4, 0.0],
-        [6.40, 0.0, 0.0, 0.05, 0.96, -0.18],
-        true,
-        [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
-    ),
-    SeedSpec::row(
-        SeedArchetype::GeneralDrive,
-        [
-            0.045, 2.20, 0.0, 1.3, 0.860, 0.985, 0.70, 0.75, 0.68, 0.75, -0.20, 0.45, 0.002, 0.80,
-        ],
-        [0.060, 0.15, 0.015, 3.50, 0.012, 1.8e-4, 0.0],
-        [2.95, 0.60, 0.55, 0.002, 0.08, 0.0],
-        false,
-        [0.45, 0.12, 0.35, 0.15, 0.08, 0.10, 0.0],
-    ),
-    // SeriesTubeSag (4): Butterworth4 AI -> RC diode -> commuted (LP_lp - LP_hp) -> V1B/FMV -> sagged power
-    SeedSpec::row(
-        SeedArchetype::SeriesTubeSag,
-        [
-            0.64, 1.00, 0.0, 0.5, 0.980, 0.9990, 0.80, 0.0, 1.848, 0.765, 0.0, 0.0, 0.002, 0.90,
-        ],
-        [0.015, 0.05, 0.003, 0.0, 0.0024, 8.0e-6, 4.5],
-        [4.2, 1.05, 0.85, 0.002, 0.96, -0.18],
-        false,
-        [0.0, 0.15, -0.10, 0.0, 0.85, 0.22, 0.05],
-    ),
-    SeedSpec::row(
-        SeedArchetype::SeriesTubeSag,
-        [
-            0.68, 1.00, 0.0, 0.5, 0.980, 0.9990, 0.80, 0.0, 1.848, 0.765, 0.0, 0.0, 0.002, 0.90,
-        ],
-        [0.015, 0.06, 0.003, 0.0, 0.0030, 8.0e-6, 7.5],
-        [6.4, 1.35, 1.00, 0.002, 0.96, -0.18],
-        false,
-        [-0.08, 0.80, -0.45, -0.02, 0.28, 0.44, 0.18],
-    ),
-    SeedSpec::row(
-        SeedArchetype::SeriesTubeSag,
-        [
-            0.70, 1.00, 0.0, 0.5, 0.985, 0.9992, 0.82, 0.0, 1.848, 0.765, 0.0, 0.0, 0.002, 0.90,
-        ],
-        [0.015, 0.07, 0.003, 0.0, 0.0032, 9.0e-6, 10.5],
-        [8.4, 1.55, 1.00, 0.002, 0.96, -0.18],
-        false,
-        [0.06, 0.72, -0.20, -0.15, 0.22, 0.38, 0.14],
-    ),
-    SeedSpec::row(
-        SeedArchetype::SeriesTubeSag,
-        [
-            0.72, 1.00, 0.0, 0.5, 0.985, 0.9992, 0.82, 0.0, 1.848, 0.765, 0.0, 0.0, 0.002, 0.90,
-        ],
-        [0.015, 0.08, 0.004, 0.0, 0.0035, 1.1e-5, 14.0],
-        [10.6, 1.70, 1.10, 0.002, 0.96, -0.18],
-        false,
-        [0.0, 0.0, -0.08, 0.0, 1.00, 0.16, 0.0],
-    ),
-    // PinchBiasClipper (4): memoryless wide-slope pinch-bias clipper + causal HF group-delay SVF
-    SeedSpec::row(
-        SeedArchetype::PinchBiasClipper,
-        [
-            0.55, 1.25, 0.0, 0.7, 0.940, 0.994, 0.76, 0.25, 1.40, 1.40, 0.0, 0.0, 0.002, 0.75,
-        ],
-        [0.012, 0.035, 0.0015, 280.0, 0.012, 3.0e-5, 0.0],
-        [1.85, 0.75, 1.15, 0.002, 0.96, -0.17],
-        false,
-        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-    ),
-    SeedSpec::row(
-        SeedArchetype::PinchBiasClipper,
-        [
-            0.68, 1.00, 0.0, 1.2, 0.930, 0.995, 0.78, 0.45, 1.80, 0.78, 0.0, 0.0, 0.002, 0.80,
-        ],
-        [0.016, 0.042, 0.0020, 650.0, 0.014, 2.5e-5, 0.0],
-        [2.45, 0.90, 1.35, 0.002, 0.96, -0.17],
-        false,
-        [0.68, 0.32, 0.14, 0.0, 0.0, 0.24, 0.10],
-    ),
-    SeedSpec::row(
-        SeedArchetype::PinchBiasClipper,
-        [
-            0.62, 1.25, 0.0, 1.6, 0.910, 0.996, 0.80, 0.65, 1.40, 1.40, 0.0, 0.0, 0.002, 0.82,
-        ],
-        [0.020, 0.050, 0.0025, 1_800.0, 0.016, 2.0e-5, 0.0],
-        [3.10, 1.05, 1.55, 0.002, 0.96, -0.17],
-        false,
-        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-    ),
-    SeedSpec::row(
-        SeedArchetype::PinchBiasClipper,
-        [
-            0.48, 1.00, 0.0, 1.4, 0.950, 0.997, 0.84, 0.35, 1.80, 0.78, 0.0, 0.0, 0.002, 0.75,
-        ],
-        [0.014, 0.058, 0.0032, 6_500.0, 0.010, 1.5e-5, 0.0],
-        [3.75, 1.15, 1.35, 0.002, 0.96, -0.17],
-        false,
-        [0.68, 0.32, 0.14, 0.0, 0.0, 0.24, 0.10],
-    ),
-    // EnvResonantSvf (4): LP / BP / HP / 2-sec calibrated to 96 kHz octave ceiling
-    SeedSpec::row(
-        SeedArchetype::EnvResonantSvf,
-        [
-            0.0102, 1.00, 8.40, 0.001, 0.984, 0.9994, 0.25, -0.42, 0.18, 0.70, 0.0, 0.0, 0.0040,
-            0.096,
-        ],
-        [0.012, 0.08, 0.006, 0.20, 0.008, 3.0e-5, 0.0],
-        [1.45, 0.0, 0.0, 0.002, 0.96, -0.18],
-        false,
-        [0.0, 1.15, 0.0, 0.0, 0.0, 0.0, 0.0],
-    ),
-    SeedSpec::row(
-        SeedArchetype::EnvResonantSvf,
-        [
-            0.0105, 1.00, 8.45, 0.001, 0.984, 0.9994, 0.25, -0.42, 0.148, 0.70, 0.0, 0.0, 0.0040,
-            0.096,
-        ],
-        [0.014, 0.09, 0.007, 0.15, 0.008, 3.0e-5, 0.0],
-        [1.45, 0.0, 0.0, 0.002, 0.96, -0.18],
-        false,
-        [0.0, 0.0, 2.20, 0.0, 0.0, 0.0, 0.0],
-    ),
-    SeedSpec::row(
-        SeedArchetype::EnvResonantSvf,
-        [
-            0.0108, 1.00, 8.00, 0.001, 0.982, 0.9993, 0.25, -0.42, 0.19, 0.65, 0.0, 0.0, 0.0040,
-            0.135,
-        ],
-        [0.012, 0.08, 0.006, 0.25, 0.008, 3.0e-5, 0.0],
-        [1.45, 0.0, 0.0, 0.002, 0.96, -0.18],
-        false,
-        [0.0, 0.0, 0.25, 1.05, 0.0, 0.0, 0.0],
-    ),
-    SeedSpec::row(
-        SeedArchetype::EnvResonantSvf,
-        [
-            0.0095, 1.08, 8.60, 0.001, 0.985, 0.9994, 0.28, -0.36, 0.20, 0.30, 0.20, 0.0, 0.0040,
-            0.115,
-        ],
-        [0.014, 0.09, 0.007, 0.30, 0.008, 3.0e-5, 0.0],
-        [1.50, 0.0, 0.0, 0.002, 0.96, -0.18],
-        false,
-        [0.0, 0.15, 0.35, 0.0, 0.85, 0.35, 0.0],
-    ),
-];
-
-fn init_sag_group0(m: &mut V3MatryoshkaOptF64, drive: f64, sag_fb: f64, asym: f64) {
+pub(super) fn init_sag_group0(m: &mut V3MatryoshkaOptF64, drive: f64, sag_fb: f64, asym: f64) {
     // Block 0: 2-lane exact Pade [5/4] thresholded RC diode (lanes 0..2) + two 1-pole LPs (lanes 2..4).
     let b0 = &mut m.blocks[0];
     b0.b_z[0] = -6.57;
@@ -305,8 +82,8 @@ fn init_sag_group0(m: &mut V3MatryoshkaOptF64, drive: f64, sag_fb: f64, asym: f6
 }
 
 fn init_gated_group0(m: &mut V3MatryoshkaOptF64, drive: f64, asym: f64, signs: [f64; 4]) {
-    const GATED_B0_SLOPES: [f64; 4] = [3.5, 8.2, 13.5, 22.0];
-    const GATED_BN_SLOPES: [f64; 4] = [5.5, 11.0, 18.0, 29.0];
+    const GATED_B0_SLOPES: [f64; 4] = [3.6, 9.2, 17.5, 29.0];
+    const GATED_BN_SLOPES: [f64; 4] = [5.5, 12.0, 20.0, 31.0];
     let ds = drive / 2.2;
     let ar = asym / 1.35;
     for (l, &st) in signs.iter().enumerate() {
@@ -512,12 +289,26 @@ fn init_group0_for_seed(m: &mut V3MatryoshkaOptF64, s: &SeedSpec) {
 
 fn build_model_from_spec(s: &SeedSpec, mono_out: bool) -> (SeedArchetype, V3MatryoshkaOptF64) {
     let mut m =
-        V3MatryoshkaOptF64::from_matryoshka_cold(&V3MatryoshkaModel::identity(true, mono_out));
+        V3MatryoshkaOptF64::from_matryoshka_cold(&V3MatryoshkaModel::dual_rate_default(mono_out));
+    m.tier_os2x = [true; 4];
     m.max_active_groups = 1;
     m.active_tier_weights = [1.0, 0.0, 0.0, 0.0];
-    m.os_up_quad = -0.125;
-    m.os_dec_c_prev1 = 0.15;
-    m.os_dec_c0 = 0.50;
+    if s.arch == SeedArchetype::PinchBiasClipper && s.drv[4] < 0.10 {
+        m.os_up_zoh_mix = 0.98;
+        m.os_up_quad = 0.0;
+        m.os_dec_c_prev1 = 0.20;
+        m.os_dec_c0 = 0.50;
+    } else if s.arch == SeedArchetype::SeriesTubeSag {
+        m.os_up_zoh_mix = 0.85;
+        m.os_up_quad = -0.125;
+        m.os_dec_c_prev1 = 0.15;
+        m.os_dec_c0 = 0.50;
+    } else {
+        m.os_up_zoh_mix = 0.02;
+        m.os_up_quad = -0.125;
+        m.os_dec_c_prev1 = 0.15;
+        m.os_dec_c0 = 0.50;
+    }
     m.os_up_pre_emph = s.drv[5];
     m.os_up_aa_mix = s.drv[3];
     m.os_dec_aa_mix = s.drv[4];

@@ -8,11 +8,11 @@
 //! 2. **Hardware-Agnostic [`CryptoProvider`] Trait** supporting the built-in `#![no_std]`
 //!    [`RustCryptoProvider`] (`ENCRYPTED_ARENA = 0` & software-keyed `ENCRYPTED_ARENA = 1`),
 //!    Rockchip RK3582 `OP-TEE` TrustZone, Apple Secure Enclave (`SEP`), and Windows/Linux `TPM 2.0`.
-//! 3. **RFC 8439 `ChaCha20` 64-Byte Cache-Line Arena Stream Encryption** (`Lite=168`, `Full=349`,
-//!    `Pro=566`, `Ultra=1000` blocks, `0` bytes padding overhead).
+//! 3. **RFC 8439 `ChaCha20` 64-Byte Cache-Line Arena Stream Encryption** (`Lite=72`, `Full=160`,
+//!    `Pro=288`, `Ultra=448` blocks, `0` bytes padding overhead).
 //! 4. **Dual-Mechanism Buyer Watermarking (`Test 8H`):**
-//!    - **Mechanism A:** 64-channel modal/Kautz reciprocal scaling ($\kappa_{b,c}$) + $SO(4)$ SVD head rotation ($\mathbf{Q}_{\text{buyer}}$).
-//!    - **Mechanism B:** 7,680-weight Coupled Spread-Spectrum Tardos code surviving 4-buyer collusion + `fp16` truncation.
+//!    - **Mechanism A:** 16-channel modal/Kautz reciprocal scaling ($\kappa_{b,c}$) + $SO(4)$ control subspace rotation ($\mathbf{Q}_{\text{buyer}}$) + `0-ULP` 24-lane GRU hidden-lane sign-flip gauge.
+//!    - **Mechanism B:** Coupled Spread-Spectrum Tardos code surviving 4-buyer collusion + `fp16` truncation (`7,680`-coordinate `TardosCodebook7680` view).
 //! 5. **224-Dimensional Gauge-Invariant Structural Hash** ($\mathbf{f}_{\text{struct}} \in \mathbb{R}^{224}$).
 
 mod chacha20;
@@ -66,21 +66,22 @@ pub use verify::{
     sign_marketplace_receipt_json,
 };
 pub use watermark::{
-    PHASE_CODING_MAX_RAD, STAGE3_EARLY_FIR_BASES, STAGE3_KAUTZ_BASES, STAGE3_KAUTZ_BLOCKS_PER_TIER,
-    STAGE3_KAUTZ_TIER_CHANNEL_BASE, TARDOS_CASCADE_RANGES, TardosCodebook7680,
-    apply_cascade_head_gauge, apply_isometric_gauge_watermark, apply_phase_coding_watermark,
+    GRU_SIGN_LANES_PER_TIER, GRU_TOTAL_LANES, PHASE_CODING_MAX_RAD, STAGE3_EARLY_FIR_BASES,
+    STAGE3_KAUTZ_BASES, STAGE3_KAUTZ_BLOCKS_PER_TIER, STAGE3_KAUTZ_TIER_CHANNEL_BASE,
+    TARDOS_CASCADE_RANGES, TardosCodebook7680, apply_cascade_head_gauge,
+    apply_gru_sign_gauge_watermark, apply_isometric_gauge_watermark, apply_phase_coding_watermark,
     apply_tardos_watermark_7680, apply_tardos_watermark_7680_envelopes,
-    compute_emr_masked_tardos_envelopes, extract_structural_hash_224d, generate_tardos_code_7680,
-    generate_tardos_codebook_7680, is_role_a_cascade_index, kautz_soa_byte_offset,
-    role_b_head_slot_for_index, score_phase_coding_arena, score_phase_coding_blackbox,
-    score_tardos_watermark_7680, structural_cosine_similarity,
+    compute_emr_masked_tardos_envelopes, derive_gru_sign_gauge_24, extract_structural_hash_224d,
+    generate_tardos_code_7680, generate_tardos_codebook_7680, is_role_a_cascade_index,
+    kautz_soa_byte_offset, role_b_head_slot_for_index, score_phase_coding_arena,
+    score_phase_coding_blackbox, score_tardos_watermark_7680, structural_cosine_similarity,
 };
 
 /// Number of Stage II commuted nonlinear cascade projection weights across `Arena 0..3` (`768 + 1536 + 2304 + 3072 = 7680`).
 pub const TARDOS_CASCADE_WEIGHTS: usize = 7680;
 
-/// Number of modal/Kautz complex resonator channels across `Arena 0..3` (`4 blocks × 16 channels = 64`).
-pub const KAUTZ_TOTAL_CHANNELS: usize = 64;
+/// Number of modal/Kautz complex resonator channels across `Arena 0..3` (`4 tiers × 4 channels = 16`).
+pub const KAUTZ_TOTAL_CHANNELS: usize = 16;
 
 /// Per-tier dimension of the prefix-composable gauge-invariant structural hash (`56-D` per tier).
 pub const STRUCTURAL_HASH_TIER_DIM: usize = 56;

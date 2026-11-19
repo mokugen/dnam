@@ -123,6 +123,34 @@ impl SimdVec4 for ScalarVec4 {
     fn horizontal_sum(self) -> f32 {
         (self.0[0] + self.0[1]) + (self.0[2] + self.0[3])
     }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        Self([
+            f32::from_bits(crate::math::IEEE754_F32_RCP_SEED.wrapping_sub(self.0[0].to_bits())),
+            f32::from_bits(crate::math::IEEE754_F32_RCP_SEED.wrapping_sub(self.0[1].to_bits())),
+            f32::from_bits(crate::math::IEEE754_F32_RCP_SEED.wrapping_sub(self.0[2].to_bits())),
+            f32::from_bits(crate::math::IEEE754_F32_RCP_SEED.wrapping_sub(self.0[3].to_bits())),
+        ])
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        Self([
+            f32::from_bits(
+                crate::math::IEEE754_F32_RSQRT_SEED.wrapping_sub(self.0[0].to_bits() >> 1),
+            ),
+            f32::from_bits(
+                crate::math::IEEE754_F32_RSQRT_SEED.wrapping_sub(self.0[1].to_bits() >> 1),
+            ),
+            f32::from_bits(
+                crate::math::IEEE754_F32_RSQRT_SEED.wrapping_sub(self.0[2].to_bits() >> 1),
+            ),
+            f32::from_bits(
+                crate::math::IEEE754_F32_RSQRT_SEED.wrapping_sub(self.0[3].to_bits() >> 1),
+            ),
+        ])
+    }
 }
 
 /// Portable scalar reference backend implementing [`MathBackend`].
@@ -161,6 +189,11 @@ mod tests {
         assert_eq!(a.fms(b, b).to_array(), [-3.0, -6.0, -1.0, -8.0]);
         assert_eq!(a.fma_lane::<1>(b, a).to_array(), [-3.0, -6.0, -1.0, -8.0]);
         assert_eq!(a.horizontal_sum(), -2.0);
+        let pos = ScalarVec4::from_array([0.25, 1.0, 2.5, 8.0]);
+        assert!((pos.rcp_pos_nr2().to_array()[0] - 4.0).abs() < 1e-4);
+        assert!((pos.rcp_pos_nr3().to_array()[2] - 0.4).abs() < 1e-6);
+        assert!((pos.rsqrt_pos_nr2().to_array()[0] - 2.0).abs() < 1e-2);
+        assert!((pos.rsqrt_pos_nr3().to_array()[1] - 1.0).abs() < 1e-5);
         assert_eq!(ScalarBackend::crc32c_update(0, b"123456789"), 0xe306_9283);
     }
 

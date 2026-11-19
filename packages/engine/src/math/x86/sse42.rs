@@ -109,6 +109,11 @@ impl SimdVec4 for Sse42Vec4 {
     }
 
     #[inline(always)]
+    fn from_array(arr: [f32; 4]) -> Self {
+        Self(Sse2Vec4::from_array(arr).0)
+    }
+
+    #[inline(always)]
     fn store(self, dst: &mut [f32; 4]) {
         Sse2Vec4(self.0).store(dst);
     }
@@ -190,6 +195,21 @@ impl SimdVec4 for Sse42Vec4 {
         } else {
             Sse2Vec4(self.0).horizontal_sum_pair(Sse2Vec4(rhs.0))
         }
+    }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        Self(Sse2Vec4(self.0).rcp_pos_seed_bits().0)
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        Self(Sse2Vec4(self.0).rsqrt_pos_seed_bits().0)
+    }
+
+    #[inline(always)]
+    fn pow2_from_biased_int_bits(self) -> Self {
+        Self(Sse2Vec4(self.0).pow2_from_biased_int_bits().0)
     }
 }
 

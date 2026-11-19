@@ -1,18 +1,13 @@
 import { describe, expect, it } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
-import {
-  CapturePlanPanel,
-  ClampAuditVisualizer,
-  DnamAudioHostProvider,
-  DnamPluginRack,
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-  TrainingTimelinePanel,
-  WebAudioWorkletHost,
-} from "../../src/index.js";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "../../src/components/base/tabs.js";
+import { DnamPluginRack } from "../../src/components/rack/DnamPluginRack.js";
+import { ClampAuditVisualizer } from "../../src/components/visualizers/ClampAuditVisualizer.js";
+import { CapturePlanPanel } from "../../src/components/workflows/CapturePlanPanel.js";
+import { TrainingTimelinePanel } from "../../src/components/workflows/TrainingTimelinePanel.js";
+import { DnamAudioHostProvider } from "../../src/host/context.js";
+import { WebAudioWorkletHost } from "../../src/host/web_worklet_host.js";
 import { expectZeroAxeViolations, setRangeInputValue } from "../setup.js";
 
 describe("Cross-feature Studio workflow integration", () => {

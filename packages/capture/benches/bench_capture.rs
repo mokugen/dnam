@@ -6,6 +6,7 @@
 use std::collections::BTreeMap;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use dnam_capture::CORESET_FP32_FRAMES_PER_STEM;
 use dnam_capture::proj::{
     DnamProjManifest, ProjChunkInput, ProjChunkKind, StemProvenance, StmcTrajectoryWindow,
     VaultCaptureSpec, add_capture, build_dnam_proj_container, build_dnam_proj_container_with_cp1,
@@ -14,10 +15,10 @@ use dnam_capture::proj::{
 use dnam_capture::solver::{
     accumulate_uplo_u_gram_and_cross, solve_uplo_u_cholesky_2ch, uplo_u_packed_len,
 };
-use dnam_capture::stimulus::{AdaptiveStimulusController, StimulusConfig};
+use dnam_capture::stimulus::{AdaptiveStimulusController, StimulusConfig, encode_coreset_fp32};
 use dnam_capture::targets::StemResponse;
-use dnam_capture::{CORESET_FP16_FRAMES_PER_STEM, f32_to_fp16_bits};
-use dnam_engine::container::ARENA_OFFSET_ULTRA_END;
+use dnam_engine::stages::V3MatryoshkaModel;
+use dnam_engine::stages::weights::{ARENA_ULTRA_BYTES, pack_v3_matryoshka_to_arena};
 
 fn bench_uplo_u_cholesky_lite(c: &mut Criterion) {
     let n = 64usize;
@@ -92,7 +93,8 @@ fn bench_adaptive_stimulus_next_frame(c: &mut Criterion) {
 
 fn bench_dnam_proj_compact_and_export(c: &mut Criterion) {
     let mut manifest = DnamProjManifest::default_reference();
-    let arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+    let mut arena = vec![0u8; ARENA_ULTRA_BYTES];
+    pack_v3_matryoshka_to_arena(&V3MatryoshkaModel::identity(false, false), &mut arena);
     let mut spcm = vec![0u8; 48_000 * 4];
     spcm[0..4].copy_from_slice(b"SPCM");
     let proj_with_spcm = build_dnam_proj_container_with_cp1(
@@ -134,49 +136,48 @@ fn bench_5stage_proj_vault_solver(c: &mut Criterion) {
         .expect("range control"),
     ];
     let empty_proj = build_dnam_proj_container(&manifest, &[]).expect("empty proj");
-    let dry: Vec<f32> = (0..CORESET_FP16_FRAMES_PER_STEM)
+    let dry: Vec<f32> = (0..CORESET_FP32_FRAMES_PER_STEM)
         .map(|i| 0.45 * ((i as f32) * 0.058).sin() + 0.25 * ((i as f32) * 0.19).cos())
         .collect();
-    let fp16_bytes = |s: &[f32]| -> Vec<u8> {
-        let mut out = Vec::with_capacity(s.len() * 2);
-        for &v in s {
-            out.extend_from_slice(&f32_to_fp16_bits(v).to_le_bytes());
+    let mut schedule_320 = [0u8; 320];
+    schedule_320[8..12].copy_from_slice(&1_024_u32.to_le_bytes());
+    let inpc = build_proj_inpc_capsule(
+        1,
+        &[0x11; 256],
+        &schedule_320,
+        &encode_coreset_fp32(&dry, None),
+    )
+    .expect("inpc capsule");
+    let make_spec = |id: &str, is_star: bool, g: f32| {
+        let wet: Vec<f32> = dry.iter().map(|&x| ((0.5 + 0.25 * g) * x).tanh()).collect();
+        VaultCaptureSpec {
+            stem_id: id.to_string(),
+            is_star_center: is_star,
+            enabled: true,
+            pad_gain_f32: 1.0,
+            fractional_lag_samples_f32: 0.0,
+            controls_meta: BTreeMap::from([("gain".to_string(), serde_json::json!(f64::from(g)))]),
+            provenance: StemProvenance {
+                input_pcm_sha256: "0".repeat(64),
+                target_pcm_sha256: "1".repeat(64),
+                num_frames: CORESET_FP32_FRAMES_PER_STEM as u64,
+            },
+            user_metadata: BTreeMap::new(),
+            extracted_physics: None,
+            windows: vec![StmcTrajectoryWindow {
+                control_id: 0,
+                ctrl_kind: 0,
+                active_opt: 0xFF,
+                u_phys: g,
+                window_weight: 1.0,
+                emr_velocity: 0.0,
+            }],
+            band_psd_summary_88: [0u8; 88],
+            n_comb_bins: 32,
+            spectral_summary_4096: [0u8; 4_096],
+            wet_coreset_fp32: encode_coreset_fp32(&wet, None),
+            optional_spcm: None,
         }
-        out
-    };
-    let inpc = build_proj_inpc_capsule(1, &[0x11; 256], &[0x22; 320], &fp16_bytes(&dry))
-        .expect("inpc capsule");
-    let make_spec = |id: &str, is_star: bool, g: f32| VaultCaptureSpec {
-        stem_id: id.to_string(),
-        is_star_center: is_star,
-        enabled: true,
-        pad_gain_f32: 1.0,
-        fractional_lag_samples_f32: 0.0,
-        controls_meta: BTreeMap::from([("gain".to_string(), serde_json::json!(f64::from(g)))]),
-        provenance: StemProvenance {
-            input_pcm_sha256: "0".repeat(64),
-            target_pcm_sha256: "1".repeat(64),
-            num_frames: CORESET_FP16_FRAMES_PER_STEM as u64,
-        },
-        user_metadata: BTreeMap::new(),
-        extracted_physics: None,
-        windows: vec![StmcTrajectoryWindow {
-            control_id: 0,
-            ctrl_kind: 0,
-            active_opt: 0xFF,
-            u_phys: g,
-            window_weight: 1.0,
-            emr_velocity: 0.0,
-        }],
-        band_psd_summary_88: [0u8; 88],
-        n_comb_bins: 32,
-        spectral_summary_4096: [0u8; 4_096],
-        wet_coreset_fp16: fp16_bytes(
-            &dry.iter()
-                .map(|&x| ((0.5 + 0.25 * g) * x).tanh())
-                .collect::<Vec<_>>(),
-        ),
-        optional_spcm: None,
     };
     let star_spec = make_spec("star_0", true, 5.0);
     let seeded_proj = add_capture(&empty_proj, star_spec.clone(), Some(&inpc)).expect("seed solve");

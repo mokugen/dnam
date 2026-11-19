@@ -403,10 +403,29 @@ mod tests {
         assert_eq!(cab.fir_write_ptr, 1);
 
         let mut cab_r = Stage3CabinetModals::default();
+        cab.reconfigure_sample_rate(&crate::container::ZohRescaledParams::new(48_000, 96_000));
         let (sl, sr, dl, dr) = cab.step_fir_stereo_with_delayed_tap::<crate::math::ScalarBackend>(
             &mut cab_r, 0.5, -0.5, 0.1, -0.1, &taps,
         );
         assert!(sl.is_finite() && sr.is_finite() && dl.is_finite() && dr.is_finite());
+        let taps_4 = [[0.05_f32; 16]; 4];
+        let taps_r4 = [[0.04_f32; 16]; 4];
+        let (hl_s, hr_s) = cab.eval_higher_tier_fir_segments::<crate::math::ScalarBackend>(
+            &cab_r, sl, sr, 0.1, -0.1, &taps_4, &taps_r4, 4, 0.85,
+        );
+        let (hl_d, hr_d) = cab.eval_higher_tier_fir_segments::<crate::math::DefaultMathBackend>(
+            &cab_r, sl, sr, 0.1, -0.1, &taps_4, &taps_r4, 4, 0.85,
+        );
+        assert!((hl_s[3] - hl_d[3]).abs() < 1e-5 && (hr_s[3] - hr_d[3]).abs() < 1e-5);
+        #[cfg(target_arch = "aarch64")]
+        {
+            let _ = cab.eval_higher_tier_fir_segments::<crate::math::ArmSve2Backend>(
+                &cab_r, sl, sr, 0.1, -0.1, &taps_4, &taps_r4, 4, 1.0,
+            );
+            let _ = cab.eval_higher_tier_fir_segments::<crate::math::ArmSmeBackend>(
+                &cab_r, sl, sr, 0.1, -0.1, &taps_4, &taps_r4, 4, 1.0,
+            );
+        }
 
         cab.reset();
         assert_eq!(cab.fir_write_ptr, 0);

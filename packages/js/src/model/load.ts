@@ -57,6 +57,52 @@ async function readStreamToBytes(stream: ReadableStream<Uint8Array>): Promise<Ui
   return combined;
 }
 
+async function readNodeFsBytes(source: string | URL, str: string): Promise<Uint8Array> {
+  try {
+    const fsModuleName = "node:fs/promises";
+    const fs = (await import(/* @vite-ignore */ fsModuleName)) as {
+      readFile(path: string | URL): Promise<Uint8Array>;
+    };
+    const filePath = source instanceof URL && source.protocol === "file:" ? source : str;
+    const buf = await fs.readFile(filePath);
+    return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+  } catch (err) {
+    throw new DnamError(
+      "ERR_DNAM_CONTAINER",
+      `Failed to read container file '${str}': ${String(err)}`,
+      { cause: err },
+    );
+  }
+}
+
+async function readStringOrUrlBytes(source: string | URL): Promise<Uint8Array | undefined> {
+  const str = source instanceof URL ? source.href : source;
+  const isHttpOrBlobUrl =
+    str.startsWith("http://") ||
+    str.startsWith("https://") ||
+    str.startsWith("blob:") ||
+    str.startsWith("data:");
+  const isNodeEnv =
+    typeof process !== "undefined" &&
+    typeof process.versions === "object" &&
+    Boolean(process.versions?.node);
+
+  if (!isHttpOrBlobUrl && isNodeEnv) {
+    return readNodeFsBytes(source, str);
+  }
+  if (typeof fetch === "function") {
+    const resp = await fetch(source);
+    if (!resp.ok) {
+      throw new DnamError(
+        "ERR_DNAM_CONTAINER",
+        `Failed to fetch container from '${str}': HTTP ${String(resp.status)}`,
+      );
+    }
+    return new Uint8Array(await resp.arrayBuffer());
+  }
+  return undefined;
+}
+
 /**
  * Reads any `ModelSource` (`string` path/URL, `URL`, `Blob`, `Response`, `ReadableStream`,
  * `Uint8Array`, or `ArrayBuffer`) into a `Uint8Array`.
@@ -81,44 +127,9 @@ export async function readModelSourceBytes(source: ModelSource): Promise<Uint8Ar
     return readStreamToBytes(source);
   }
   if (source instanceof URL || typeof source === "string") {
-    const str = source instanceof URL ? source.href : source;
-    const isHttpOrBlobUrl =
-      str.startsWith("http://") ||
-      str.startsWith("https://") ||
-      str.startsWith("blob:") ||
-      str.startsWith("data:");
-    const isNodeEnv =
-      typeof process !== "undefined" &&
-      typeof process.versions === "object" &&
-      Boolean(process.versions?.node);
-
-    if (!isHttpOrBlobUrl && isNodeEnv) {
-      try {
-        const fsModuleName = "node:fs/promises";
-        const fs = (await import(/* @vite-ignore */ fsModuleName)) as {
-          readFile(path: string | URL): Promise<Uint8Array>;
-        };
-        const filePath = source instanceof URL && source.protocol === "file:" ? source : str;
-        const buf = await fs.readFile(filePath);
-        return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-      } catch (err) {
-        throw new DnamError(
-          "ERR_DNAM_CONTAINER",
-          `Failed to read container file '${str}': ${String(err)}`,
-          { cause: err },
-        );
-      }
-    }
-
-    if (typeof fetch === "function") {
-      const resp = await fetch(source);
-      if (!resp.ok) {
-        throw new DnamError(
-          "ERR_DNAM_CONTAINER",
-          `Failed to fetch container from '${str}': HTTP ${String(resp.status)}`,
-        );
-      }
-      return new Uint8Array(await resp.arrayBuffer());
+    const bytes = await readStringOrUrlBytes(source);
+    if (bytes) {
+      return bytes;
     }
   }
   throw new DnamError("ERR_DNAM_VALIDATION", "Unsupported ModelSource input");

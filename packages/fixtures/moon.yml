@@ -129,6 +129,8 @@ tasks:
     command: "cargo"
     args:
       - "llvm-cov"
+      - "--profile"
+      - "cov"
       - "--package"
       - "dnam-fixtures"
       - "--fail-under-lines"

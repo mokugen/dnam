@@ -3,7 +3,7 @@ import { page } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { TauriNativeAudioHost } from "../../src/host.js";
 import { StudioIpcClient, tauriIsolationHook } from "../../src/ipc.js";
-import { StudioApp } from "../../src/ui/index.js";
+import { StudioApp } from "../../src/ui/StudioApp.js";
 import { expectZeroAxeViolations, setRangeInputValue } from "../setup.js";
 
 describe("Studio IPC Isolation + Native Host + StudioApp integration", () => {

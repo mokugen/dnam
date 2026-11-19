@@ -83,26 +83,46 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         self.freeze_mutes_dry = freeze_mutes_dry;
         self.single_input = single_input;
         self.stereo_width = 1.0;
-        {
-            let arena_b = self.arena_storage.as_bytes();
-            if crate::stages::weights::has_pipeline_flag(
-                arena_b,
-                crate::stages::weights::PIPE_FLAG_STAGE1_EXT,
-            ) {
-                self.stage_pipeline.stage1.reserve_extended_capacity(16_384);
-            }
-            if crate::stages::weights::has_pipeline_flag(
-                arena_b,
-                crate::stages::weights::PIPE_FLAG_STAGE4_EXT,
-            ) {
-                self.stage_pipeline
-                    .stage4
-                    .reserve_extended_capacity(131_072, 32_768);
-            }
-        }
 
+        self.preallocate_cold_stage4_for(&view.preamble, active_tier);
         self.reconfigure_for_sample_rate_with_mode(sample_rate_hz, true)?;
         Ok(())
+    }
+
+    /// Pre-allocates Stage IV extended delay ring coldly outside RT / `reconfigure_*` call graphs.
+    pub(crate) fn preallocate_cold_stage4_for(
+        &mut self,
+        preamble: &DnamPreamble,
+        target_tier: Tier,
+    ) {
+        let arena = self.arena_storage.as_bytes();
+        let max_tier_idx = (Self::detect_max_tier(preamble, arena.len()) as usize).min(3);
+        let declared_48k = self.header.as_ref().map_or(0usize, |hdr| {
+            hdr.delay_histories
+                .iter()
+                .map(|d| d.max_samples_48k as usize)
+                .max()
+                .unwrap_or(0)
+        });
+        let mono_out = !preamble.is_stereo_out();
+        let mat = crate::stages::weights::unpack_v3_matryoshka_from_arena(arena, mono_out);
+        *self.cold_tiers = mat.to_four_tiers();
+        let tier_max_req = self.cold_tiers[..=max_tier_idx]
+            .iter()
+            .map(|m| {
+                m.stage4.delay_lengths.iter().copied().max().unwrap_or(0)
+                    + (m.stage4.lfo_depth_samples as usize)
+                    + 6
+            })
+            .max()
+            .unwrap_or(0);
+        let max_ref = declared_48k.max(tier_max_req);
+        if max_ref > crate::stages::stage4_tank::v3_fdn::V3_TANK_CAP {
+            let stage4_min_cap = max_ref.saturating_mul(4).saturating_add(32);
+            let eff = (target_tier as usize).min(max_tier_idx);
+            self.hot_core
+                .ensure_cold_stage4_cap(&self.cold_tiers[eff].stage4, stage4_min_cap);
+        }
     }
 
     pub(crate) fn detect_max_tier(preamble: &DnamPreamble, arena_len: usize) -> Tier {
@@ -133,6 +153,61 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         self.reconfigure_for_sample_rate_with_mode(sample_rate_hz, false)
     }
 
+    pub(crate) fn load_v3_hot_core_from_arena(&mut self, reset_state: bool) {
+        let arena = self.arena_storage.as_bytes();
+        if arena.len() >= 64 {
+            let mut has_s = false;
+            let mut s_mat = [[0.0_f32; 4]; 4];
+            for (r, row) in s_mat.iter_mut().enumerate() {
+                for (c, cell) in row.iter_mut().enumerate() {
+                    let v = crate::stages::weights::read_f32_le(arena, (r * 4 + c) * 4);
+                    if v.is_finite() {
+                        *cell = v.clamp(-4.0, 4.0);
+                        if v.abs() > 1.0e-12 {
+                            has_s = true;
+                        }
+                    }
+                }
+            }
+            if has_s {
+                self.stage0_router.set_scattering_matrix(s_mat);
+            } else {
+                self.stage0_router.s_matrix = crate::stages::Stage0Router::new().s_matrix;
+            }
+        }
+        if let Some(ref hdr) = self.header {
+            self.stage0_router
+                .set_crossover_hz(hdr.stage0_router.sub_crossover_hz);
+        }
+        self.stage0_router.reconfigure_sample_rate(&self.zoh);
+
+        for t in 0..4 {
+            let trim_off = crate::stages::weights::ARENA0_TIER_GAIN_TRIM_OFFSET + t * 4;
+            let raw_trim = crate::stages::weights::read_f32_le(arena, trim_off);
+            self.cached_tier_gain_trim[t] = if (0.0625..=16.0).contains(&raw_trim) {
+                raw_trim
+            } else {
+                1.0
+            };
+        }
+
+        let mono_out = !self.preamble.is_stereo_out();
+        let mat = crate::stages::weights::unpack_v3_matryoshka_from_arena(arena, mono_out);
+        *self.cold_tiers = mat.to_four_tiers();
+        let eff = self.effective_tier() as usize;
+        let was_frozen = self.hot_core.stage4.freeze;
+        if reset_state {
+            self.hot_core.reload_in_place(&self.cold_tiers[eff]);
+        } else {
+            self.hot_core.switch_tier(&self.cold_tiers[eff]);
+            self.hot_core.stage4.freeze = was_frozen;
+        }
+        if (self.zoh.rho_sr - 1.0).abs() > 1.0e-12 {
+            self.hot_core
+                .reconfigure_with_zoh(&self.cold_tiers[eff], &self.zoh);
+        }
+    }
+
     /// Reconfigures ZOH parameters for a live/offline-bounce transition without wiping
     /// recursive DSP state or dynamic `ControlBus` state (`R20-E4`).
     pub(crate) fn reconfigure_for_bounce_toggle(&mut self) -> Result<(), DnamError> {
@@ -149,54 +224,32 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             tau_ref_tr,
             switch_xfade_tr,
         )?;
-        let arena = self.arena_storage.as_bytes();
-        self.control_bus
-            .update_sample_rate_params(arena, self.zoh.rho_ctrl);
-        self.control_bus.refresh_static_state(arena);
-        self.current_stage_params = self.control_bus.stage_targets;
-        self.stage_ramp_deltas = [0.0; 16];
-        self.stage_pipeline
-            .load_kautz_and_fir_from_arena_with_zoh(arena, &self.zoh);
-        self.stage_pipeline.reconfigure_sample_rate(&self.zoh);
-        if self.control_bus.tank_mod_dirty {
-            self.apply_tank_modulations();
-            self.control_bus.tank_mod_dirty = false;
+        let rho_ctrl = self.zoh.rho_ctrl;
+        {
+            let arena = self.arena_storage.as_bytes();
+            self.control_bus.update_sample_rate_params(arena, rho_ctrl);
         }
+        self.load_v3_hot_core_from_arena(false);
+        self.sync_immediate_control_state_inner();
         self.oversampler.reset();
         self.oversampler_aux.reset();
         self.ctrl_sub_counter = 0;
         self.ctrl_energy_accum = 0.0;
-        self.refresh_cached_role_b_slices();
-        let arena_len = self.arena_storage.as_bytes().len();
-        let loop_tiers = crate::provenance::watermark::max_tiers_for_arena_len(arena_len)
-            .min((self.max_supported_tier as usize) + 1)
-            .max(1);
-        let dtheta = self.current_stage_params[9]
-            .clamp(-core::f32::consts::FRAC_PI_4, core::f32::consts::FRAC_PI_4);
-        let g_rad_pre = (0.5 + self.current_stage_params[6]).clamp(0.0, 1.0);
-        let g_kautz = (0.5 + self.control_bus.ctrl_basis_4[2] + self.current_stage_params[10])
-            .clamp(0.0, 1.0);
-        self.stage_pipeline
-            .stage1
-            .retune_op_m_pre_3khz(dtheta, g_rad_pre, true);
-        self.stage_pipeline
-            .retune_kautz_formant_3khz(loop_tiers, dtheta, g_kautz);
-        self.cached_head_tiers = 0;
         Ok(())
     }
 
     pub(crate) fn training_zoh_poles(&self) -> (f32, f32, f32, u32) {
-        let arena_len = self.arena_storage.as_bytes().len();
+        let arena = self.arena_storage.as_bytes();
         let hdr_ac_pole = self
             .header
             .as_ref()
             .map(|h| h.stage2_cascade.ac_coupling_pole)
             .filter(|&p| p > 0.8 && p < 1.0)
             .unwrap_or(0.9993);
-        let r_ac_tr = if arena_len >= 128 {
-            let arena = self.arena_storage.as_bytes();
-            let v = f32::from_le_bytes([arena[124], arena[125], arena[126], arena[127]]);
-            if v > 0.9 && v < 1.0 { v } else { hdr_ac_pole }
+        let v_ac =
+            crate::stages::weights::read_f32_le(arena, crate::stages::weights::ARENA0_R_AC_OFFSET);
+        let r_ac_tr = if v_ac > 0.9 && v_ac < 1.0 {
+            v_ac
         } else {
             hdr_ac_pole
         };
@@ -247,28 +300,12 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         )?;
 
         if reset_controls {
-            let arena = self.arena_storage.as_bytes();
-            let has_arena_mix = if arena.len() >= 128 {
-                let dry = f32::from_le_bytes([arena[116], arena[117], arena[118], arena[119]]);
-                let wet = f32::from_le_bytes([arena[120], arena[121], arena[122], arena[123]]);
-                if wet.abs() > 1e-6 || dry.abs() > 1e-6 {
-                    self.mix_dry_gain = dry;
-                    self.mix_wet_gain = wet;
-                    true
-                } else {
-                    false
-                }
+            if let Some(ref hdr) = self.header {
+                let default_blend = hdr.io_config.capabilities.default_blend;
+                self.configure_host_mix_and_leveling(default_blend, 0.0, true);
             } else {
-                false
-            };
-            if !has_arena_mix {
-                if let Some(ref hdr) = self.header {
-                    let default_blend = hdr.io_config.capabilities.default_blend;
-                    self.configure_host_mix_and_leveling(default_blend, 0.0, true);
-                } else {
-                    self.mix_dry_gain = 0.0;
-                    self.mix_wet_gain = 1.0;
-                }
+                self.mix_dry_gain = 0.0;
+                self.mix_wet_gain = 1.0;
             }
             let arena = self.arena_storage.as_bytes();
             self.control_bus.load_from_arena0(
@@ -283,22 +320,8 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                     self.control_bus.inv_trust_radius_mh2 =
                         crate::math::newton6_reciprocal_f64((mh as f64) * (mh as f64)) as f32;
                 }
-                self.stage_pipeline
-                    .stage0
-                    .set_crossover_hz(hdr.stage0_router.sub_crossover_hz);
-                self.stage_pipeline.stage1.topology_mode = hdr.stage1_pre.topology_selector & 0x03;
-                self.stage_pipeline.stage1.gate_threshold = if hdr.stage1_pre.noise_gate_enabled {
-                    crate::schema::cold_pow_f64(
-                        10.0,
-                        (hdr.stage1_pre.gate_threshold_db as f64) * 0.05,
-                    ) as f32
-                } else {
-                    0.0
-                };
             }
             self.control_bus.refresh_static_state(arena);
-            self.stage_pipeline
-                .load_from_arena_with_zoh(arena, &self.zoh);
         } else {
             let arena = self.arena_storage.as_bytes();
             self.control_bus
@@ -313,15 +336,13 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             }
             self.control_bus.reset_dynamic_state();
             self.control_bus.refresh_static_state(arena);
-            self.stage_pipeline
-                .load_from_arena_with_zoh(arena, &self.zoh);
         }
+
+        self.load_v3_hot_core_from_arena(reset_controls);
         self.current_stage_params = self.control_bus.stage_targets;
         self.stage_ramp_deltas = [0.0; 16];
-        if self.control_bus.tank_mod_dirty {
-            self.apply_tank_modulations();
-            self.control_bus.tank_mod_dirty = false;
-        }
+        self.hot_core
+            .snap_control_bus_stage_targets(&self.current_stage_params);
 
         let num_ctrls = self.control_bus.num_controls;
         for ctrl_idx in 0..num_ctrls {
@@ -332,36 +353,8 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         self.oversampler.reset();
         self.oversampler_aux.reset();
         self.tempo_state.sample_rate_hz = sample_rate_hz;
-        self.stage_pipeline.stage1.op_t_pre.current_delay =
-            self.stage_pipeline.stage1.op_t_pre.target_delay;
-        self.stage_pipeline.stage1.op_t_pre.old_delay =
-            self.stage_pipeline.stage1.op_t_pre.target_delay;
-        self.stage_pipeline.stage1.op_t_pre.xfade_active = false;
-        self.stage_pipeline.stage1.op_t_pre.xfade_idx = 0;
-        self.stage_pipeline.stage4.current_psi = self.stage_pipeline.stage4.target_psi;
-        let (c_psi, s_psi) = crate::operators::op_m::algebraic_unit_rotor_op_m(
-            self.stage_pipeline.stage4.current_psi,
-        );
-        self.stage_pipeline.stage4.cos_psi = c_psi;
-        self.stage_pipeline.stage4.sin_psi = s_psi;
         self.ctrl_sub_counter = 0;
         self.ctrl_energy_accum = 0.0;
-        self.refresh_cached_role_b_slices();
-        let arena_len = self.arena_storage.as_bytes().len();
-        let loop_tiers = crate::provenance::watermark::max_tiers_for_arena_len(arena_len)
-            .min((self.max_supported_tier as usize) + 1)
-            .max(1);
-        let dtheta = self.current_stage_params[9]
-            .clamp(-core::f32::consts::FRAC_PI_4, core::f32::consts::FRAC_PI_4);
-        let g_rad_pre = (0.5 + self.current_stage_params[6]).clamp(0.0, 1.0);
-        let g_kautz = (0.5 + self.control_bus.ctrl_basis_4[2] + self.current_stage_params[10])
-            .clamp(0.0, 1.0);
-        self.stage_pipeline
-            .stage1
-            .retune_op_m_pre_3khz(dtheta, g_rad_pre, true);
-        self.stage_pipeline
-            .retune_kautz_formant_3khz(loop_tiers, dtheta, g_kautz);
-        self.cached_head_tiers = 0;
         Ok(())
     }
 
@@ -372,23 +365,15 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         self.control_bus.refresh_static_state(arena);
         self.current_stage_params = self.control_bus.stage_targets;
         self.stage_ramp_deltas = [0.0; 16];
-        self.stage_pipeline.reset_to_dc_equilibrium();
-        if self.control_bus.tank_mod_dirty {
-            self.apply_tank_modulations();
-            self.control_bus.tank_mod_dirty = false;
-        }
+        self.hot_core.reset_to_dc_equilibrium();
+        self.stage0_router.reset();
+        self.hot_core
+            .snap_control_bus_stage_targets(&self.current_stage_params);
         let num_ctrls = self.control_bus.num_controls;
         for ctrl_idx in 0..num_ctrls {
             let raw_val = self.control_bus.raw_values[ctrl_idx];
             self.refresh_calibrated_control_effects(ctrl_idx, raw_val);
         }
-        self.stage_pipeline.stage1.op_t_pre.current_delay =
-            self.stage_pipeline.stage1.op_t_pre.target_delay;
-        self.stage_pipeline.stage1.op_t_pre.old_delay =
-            self.stage_pipeline.stage1.op_t_pre.target_delay;
-        self.stage_pipeline.stage1.op_t_pre.xfade_active = false;
-        self.stage_pipeline.stage1.op_t_pre.xfade_idx = 0;
-        self.stage_pipeline.stage4.current_psi = self.stage_pipeline.stage4.target_psi;
         self.oversampler.reset();
         self.oversampler_aux.reset();
         self.tempo_state.reset();
@@ -489,28 +474,28 @@ mod tests {
         let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
         let mut preamble = DnamPreamble::from_bytes(&container).unwrap();
         assert_eq!(
-            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 10752),
+            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 4_608),
             Tier::Lite
         );
 
         preamble.flags |= FLAG_HAS_FULL_DELTA;
-        preamble.arena_full_end_cl = 349;
+        preamble.arena_full_end_cl = 160;
         assert_eq!(
-            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 22336),
+            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 10_240),
             Tier::Full
         );
 
         preamble.flags |= FLAG_HAS_PRO_DELTA;
-        preamble.arena_pro_end_cl = 566;
+        preamble.arena_pro_end_cl = 288;
         assert_eq!(
-            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 36224),
+            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 18_432),
             Tier::Pro
         );
 
         preamble.flags |= FLAG_HAS_ULTRA_DELTA;
-        preamble.arena_ultra_end_cl = 1000;
+        preamble.arena_ultra_end_cl = 448;
         assert_eq!(
-            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 64000),
+            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 28_672),
             Tier::Ultra
         );
     }
@@ -611,19 +596,11 @@ mod tests {
         assert_eq!(owned_engine.tempo_state.total_frames, 8);
         let (bpm_tap, _) = owned_engine.register_tap_tempo(None, true);
         assert!((20.0..=400.0).contains(&bpm_tap));
-        let d_before = owned_engine
-            .stage_pipeline
-            .stage0
-            .return_aligner_l
-            .delay_samples;
+        let d_before = owned_engine.stage0_router.return_aligner_l.delay_samples;
         assert!((d_before - 8.0).abs() < 1e-5);
         owned_engine.reset_to_dc_equilibrium();
         assert_eq!(
-            owned_engine
-                .stage_pipeline
-                .stage0
-                .return_aligner_l
-                .delay_samples,
+            owned_engine.stage0_router.return_aligner_l.delay_samples,
             d_before
         );
 

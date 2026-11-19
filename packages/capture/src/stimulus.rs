@@ -20,7 +20,6 @@ use std::collections::BTreeMap;
 
 use dnam_engine::schema::DnamError;
 
-use crate::CORESET_FP16_FRAMES_PER_STEM;
 use crate::align::{DecayTailDecision, evaluate_live_decay_tail};
 use crate::proj::directory::StmcTrajectoryWindow;
 use crate::proj::vault::VaultCaptureSpec;
@@ -28,10 +27,12 @@ use crate::resampler::{
     resample_48k_to_arbitrary_rate, resample_arbitrary_rate_to_48k, resampled_frame_len,
 };
 use crate::targets::{StemResponse, StimulusFrame};
+use sealing::CORESET_A5_FRAMES_48K;
 
 pub use batch::{
     BatchSolveReport, BatchStimulusOptions, generate_refinement_stimulus_batch,
     generate_stimulus_batch, recapture_clipped_stem, solve_from_responses,
+    solve_from_responses_with_progress,
 };
 pub use fft::{
     ADAPTIVE_FRAME_SAMPLES, ADC_PEAK_GOVERNOR_FS, CYCLIC_PREFIX_SAMPLES, CYCLIC_WINDOW_SAMPLES,
@@ -48,15 +49,19 @@ pub use laws::{
     is_master_or_output_control, select_coupled_hadamard_pairs, select_sweep_execution_mode,
 };
 pub use null_test::{LiveNullTestReport, run_live_null_test_and_autopatch};
-pub use pipeline::{AdaptiveTrainingOptions, AdaptiveTrainingReport, train_adaptive_target};
+pub use pipeline::{
+    AdaptiveTrainingOptions, AdaptiveTrainingReport, train_adaptive_target,
+    train_adaptive_target_with_progress,
+};
 pub use safeguards::{CaptureWarning, LtvRegime, SafeguardState, evaluate_frame_safeguards};
 pub use waveforms::{
     A3_GLISSANDO_SAMPLES_250MS, A5_CORESET_SAMPLES_500MS, ActivePrimitiveKind,
     BLOOM_EPISODE2_TRIGGER_DB, BloomEpisodeTelemetry, PUMP_PROBE_COMB_PERIOD,
     analyze_pump_and_probe_recovery, apply_law4c_micro_staircase,
-    compute_stmc_psd_88_and_spectral_4096, deterministic_seed_256, encode_coreset_12k_fp16,
-    synthesize_a1_log_chirp, synthesize_a2_dynamic_staircase, synthesize_a3_monophonic_glissando,
-    synthesize_a5_musical_transient_coreset, synthesize_active_primitive_frame,
+    compute_stmc_psd_88_and_spectral_4096, deterministic_seed_256, encode_coreset_fp32,
+    encode_coreset_fp32_with_frames, synthesize_a1_log_chirp, synthesize_a2_dynamic_staircase,
+    synthesize_a3_monophonic_glissando, synthesize_a5_musical_transient_coreset,
+    synthesize_active_primitive_frame,
 };
 
 /// Configuration for [`AdaptiveStimulusController`].
@@ -179,7 +184,7 @@ impl AdaptiveStimulusController {
         );
         let (mut core_l, mut core_r) = synthesize_a5_musical_transient_coreset(
             &config.seed_256,
-            CORESET_FP16_FRAMES_PER_STEM,
+            CORESET_A5_FRAMES_48K,
             if need_stereo_dry { 2 } else { 1 },
             48_000,
         );
@@ -415,13 +420,13 @@ impl AdaptiveStimulusController {
 
         // Interpolate per-sample Mode A / Hadamard sweep trajectories if configured.
         // During Coreset frames 1..=3 (0..13,824 samples at 48 kHz, sealing 0..12,000), sweep [0 -> 1]
-        // directly across the 12,000-sample sealed coreset so STMC windows align with wet_coreset_fp16.
+        // directly across the 12,000-sample active A5 coreset so STMC windows align with wet_coreset_fp32.
         let (t0, t1, reset_coreset_knots) = match self.phase {
             ControllerPhase::Coreset { coreset_frame_idx } => {
                 let idx0 = coreset_frame_idx.saturating_sub(1);
                 let s_start = (idx0 * ADAPTIVE_FRAME_SAMPLES) as f32;
                 let s_end = (coreset_frame_idx * ADAPTIVE_FRAME_SAMPLES) as f32;
-                let denom = CORESET_FP16_FRAMES_PER_STEM as f32;
+                let denom = CORESET_A5_FRAMES_48K as f32;
                 (
                     (s_start / denom).clamp(0.0, 1.0),
                     (s_end / denom).clamp(0.0, 1.0),
@@ -812,8 +817,8 @@ impl AdaptiveStimulusController {
         }
     }
 
-    /// Seals the shared `INPC` dry stimulus capsule (`24,640 B` mono / `48,640 B` stereo) and
-    /// sub-sample-aligned [`VaultCaptureSpec`] (`STMC` `28,800 B` / `52,800 B`) from recorded audio.
+    /// Seals the shared `INPC` dry stimulus capsule (`384,640 B` mono / `768,640 B` stereo `fp32`)
+    /// and sub-sample-aligned [`VaultCaptureSpec`] (`STMC` `fp32`) from recorded audio.
     pub fn seal_inpc_and_vault_spec(
         &self,
         is_star_center: bool,
@@ -830,7 +835,7 @@ impl AdaptiveStimulusController {
         controls_meta: BTreeMap<String, serde_json::Value>,
         shared_align: Option<(f64, bool)>,
     ) -> Result<(Vec<u8>, VaultCaptureSpec, f64, bool), DnamError> {
-        let raw_wet_l = if self.coreset_wet_l.len() >= CORESET_FP16_FRAMES_PER_STEM {
+        let raw_wet_l = if self.coreset_wet_l.len() >= CORESET_A5_FRAMES_48K {
             &self.coreset_wet_l[..self.coreset_wet_l.len().min(3 * ADAPTIVE_FRAME_SAMPLES)]
         } else {
             &self.recorded_wet_total_l
@@ -875,7 +880,7 @@ impl AdaptiveStimulusController {
 
     #[allow(clippy::type_complexity)]
     pub(crate) fn coreset_buffers_48k(&self) -> (&[f32], Option<&[f32]>, &[f32], Option<&[f32]>) {
-        let raw_wet_l = if self.coreset_wet_l.len() >= CORESET_FP16_FRAMES_PER_STEM {
+        let raw_wet_l = if self.coreset_wet_l.len() >= CORESET_A5_FRAMES_48K {
             &self.coreset_wet_l[..self.coreset_wet_l.len().min(3 * ADAPTIVE_FRAME_SAMPLES)]
         } else {
             &self.recorded_wet_total_l

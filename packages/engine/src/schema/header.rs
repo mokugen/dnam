@@ -292,7 +292,7 @@ impl DnamJsonHeader {
                     loudness_lufs: -20.5,
                     output_trim_db: 0.0,
                     validation_esr_db: -40.0,
-                    arena_end_byte_offset: 10_752,
+                    arena_end_byte_offset: 4_608,
                     prefix_crc32c: 0,
                 },
                 full: TierProfile {
@@ -305,7 +305,7 @@ impl DnamJsonHeader {
                     loudness_lufs: -20.5,
                     output_trim_db: 0.0,
                     validation_esr_db: -45.0,
-                    arena_end_byte_offset: 22_336,
+                    arena_end_byte_offset: 10_240,
                     prefix_crc32c: 0,
                 },
                 pro: TierProfile {
@@ -318,7 +318,7 @@ impl DnamJsonHeader {
                     loudness_lufs: -20.5,
                     output_trim_db: 0.0,
                     validation_esr_db: -48.0,
-                    arena_end_byte_offset: 36_224,
+                    arena_end_byte_offset: 18_432,
                     prefix_crc32c: 0,
                 },
                 ultra: TierProfile {
@@ -331,7 +331,7 @@ impl DnamJsonHeader {
                     loudness_lufs: -20.5,
                     output_trim_db: 0.0,
                     validation_esr_db: -52.0,
-                    arena_end_byte_offset: 64_000,
+                    arena_end_byte_offset: 28_672,
                     prefix_crc32c: 0,
                 },
             },
@@ -729,9 +729,9 @@ mod tests {
             "stage3_cabinet": {},
             "stage4_tank": {},
             "slimmable_tiers": {
-                "lite": { "channels": 4, "tank_lines": 4, "arena_end_byte_offset": 10752, "prefix_crc32c": 0 },
-                "full": { "channels": 8, "tank_lines": 8, "arena_end_byte_offset": 22336, "prefix_crc32c": 0 },
-                "ultra": { "channels": 12, "tank_lines": 8, "arena_end_byte_offset": 36224, "prefix_crc32c": 0 }
+                "lite": { "channels": 4, "tank_lines": 4, "arena_end_byte_offset": 4608, "prefix_crc32c": 0 },
+                "full": { "channels": 8, "tank_lines": 8, "arena_end_byte_offset": 10240, "prefix_crc32c": 0 },
+                "ultra": { "channels": 12, "tank_lines": 8, "arena_end_byte_offset": 18432, "prefix_crc32c": 0 }
             },
             "controls_schema": [
                 {

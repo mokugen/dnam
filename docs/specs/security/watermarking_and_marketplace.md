@@ -15,11 +15,12 @@ requirements:
   - REQ-8.7
 adrs:
   - ADR-0009
+  - ADR-0021
 ---
 
 # Forensic Watermarking, 3-Stage Anti-Cloning Gate & Marketplace Edge Infrastructure
 
-Complementing Cryptographic Provenance & Hardware Enclave DRM ([`provenance_and_enclave_drm.md`](provenance_and_enclave_drm.md), [`ADR-0009`](../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md)) and fulfilling [`../../requirements/system_goals_and_requirements.md` §9 (`REQ-8.5`–`REQ-8.7`)](../../requirements/system_goals_and_requirements.md#9-goal-8--model-provenance-hardware-drm-forensic-watermarking--marketplace-security), this specification defines **Pillar 3 (Dual-Mechanism Buyer Watermarking)**, **Pillar 4 (3-Stage Anti-Cloning Ingestion Gate)**, the **Commercial Storefront Platform (`.dnam-prev`)**, and the **Cloudflare + TiDB Edge Infrastructure**.
+Complementing Cryptographic Provenance & Hardware Enclave DRM ([`provenance_and_enclave_drm.md`](provenance_and_enclave_drm.md), [`ADR-0009`](../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md), [`ADR-0021`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md)) and fulfilling [`../../requirements/system_goals_and_requirements.md` §9 (`REQ-8.5`–`REQ-8.7`)](../../requirements/system_goals_and_requirements.md#9-goal-8--model-provenance-hardware-drm-forensic-watermarking--marketplace-security), this specification defines **Pillar 3 (Dual-Mechanism Buyer Watermarking)**, **Pillar 4 (3-Stage Anti-Cloning Ingestion Gate)**, the **Commercial Storefront Platform (`.dnam-prev`)**, and the **Cloudflare + TiDB Edge Infrastructure**.
 
 ---
 
@@ -27,17 +28,17 @@ Complementing Cryptographic Provenance & Hardware Enclave DRM ([`provenance_and_
 
 ### 1.1 Mechanism A — Reciprocal Scaling Gauge (Ideal Real-Arithmetic Invariance)
 
-1. `r[sec.watermark.reciprocal-gauge]` **Per-Mode `Op-M` Reciprocal Scaling Gauge & Layer 1 Cascade-Head Gauge (`apply_cascade_head_gauge`):** For each shared Stage III Kautz mode $m$ ([`../dsp/op_m_modal_kautz.md` §4.1](../dsp/op_m_modal_kautz.md#41-stage-iii-architecture--tier-allocation)), scale the shared input coefficient and reciprocally compensate **both** Left and Right complex readouts within the mode's owning tier slice (`0.5 <= kappa_buyer <= 2.0`):
+1. `r[sec.watermark.reciprocal-gauge]` **Per-Mode `Op-M` Reciprocal Scaling Gauge & `0-ULP` Odd-Activation `GRU` Hidden-Lane Sign-Flip Gauge:** For each shared Stage III Kautz mode $m$ ([`../dsp/op_m_modal_kautz.md` §4.1](../dsp/op_m_modal_kautz.md#41-stage-iii-architecture--tier-allocation)), scale the shared input coefficient and reciprocally compensate **both** Left and Right complex readouts within the mode's owning tier slice (`0.5 <= kappa_buyer <= 2.0`):
    $$b_{\gamma,m}^{(\text{buyer})} = \eta_m b_{\gamma,m}^{(\text{master})}, \qquad c_{m,a}^{(\text{buyer})} = \frac{c_{m,a}^{(\text{master})}}{\eta_m}, \qquad a \in \lbrace L, R \rbrace$$
-   In parallel, **Layer 1 Cascade-Head Gauge** (`apply_cascade_head_gauge`) adds $\boldsymbol{\delta}_{c,g}$ to the Role B `Vec4` blocks (`b = 1..K_t-1`) mapped surjectively via $s = 16c + g = (4r + q) \bmod 32$ onto Tier $t$'s `32` `Vec4` head slices and reciprocally scales Tier $t$'s `W_head` slices across all $1 + D_h$ modes (`0..5` + `Ultra` `5..9`) by $\mathbf{m}_{\text{before}} / \mathbf{m}_{\text{after}}$, preserving `0.000000 ULP` dyadic forward invariance.
-2. `r[sec.watermark.orthogonal-gauge]` **Block-Diagonal SVD Control Subspace Orthogonal Rotation Gauge ($\mathbf{Q}_{\text{buyer}} \in SO(4) \oplus SO(4)$) & Layer 2 Pole-Angle Phase Coding (`apply_phase_coding_watermark`):** Rotates the head-coordinate subspace consistently across the main projections, interaction mixer, and Kronecker output head modes while preserving lower-tier prefixes and Euclidean trust-region norms. Complementing Layer 1, **Layer 2 Kautz & Inter-Stage Pole-Angle Phase Coding** (`PHASE_CODING_MAX_RAD = 8.726646e-4`, `apply_phase_coding_watermark`, `score_phase_coding_arena`, `score_phase_coding_blackbox`) injects a buyer-keyed phase perturbation $\lvert\Delta\theta_m\rvert \le 8.726646 \times 10^{-4}\text{ rad}$ ($\le 0.05^\circ$, `0.00 dB` pole-radius change) via `"DNAM-WM-PHASE-V1"` into each tier's active Stage III Kautz pole angles (`STAGE3_KAUTZ_BASES`) and Stage II lifted inter-stage pole angles (`theta_mid_1` at `4,180`, `theta_mid_2` at `4,212`), surviving black-box re-distillation while remaining `100%` invariant under `quantize_pole_angle_1e2` (`10^{-2} rad` grid).
+   In parallel, Stage II applies the **`0-ULP` Odd-Activation `GRU` Hidden-Lane Sign-Flip Gauge**: choosing a buyer-keyed sign vector $s_i \in \lbrace -1, +1 \rbrace$ over each active hidden lane (`12 / 16 / 20 / 24` ch per channel, `2^8..2^48` prefix-safe key states) and flipping row $i$ of candidate weights, row/column $i$ of recurrent candidate matrices, Zero-DC bias shift $b_{n,i}$, and corresponding downstream inter-block / linear `VarPro` readout weights preserves `0.000000 ULP` forward invariance algebraically because `NR2` Padé $\tanh(-x) = -\tanh(x)$ and $h_{\text{eq}} = 0$, surviving lossless `strip_container_to_tier(Lite..Ultra)`.
+2. `r[sec.watermark.orthogonal-gauge]` **Block-Diagonal SVD Control Subspace Orthogonal Rotation Gauge ($\mathbf{Q}_{\text{buyer}} \in SO(4) \oplus SO(4)$) & Layer 2 Pole-Angle Phase Coding (`apply_phase_coding_watermark`):** Rotates the head-coordinate subspace consistently across the main projections, interaction mixer, and direct Mid/Side readout modes while preserving lower-tier prefixes and Euclidean trust-region norms. Complementing Layer 1, **Layer 2 Kautz & Pole-Angle Phase Coding** (`PHASE_CODING_MAX_RAD = 8.726646e-4`, `apply_phase_coding_watermark`, `score_phase_coding_arena`, `score_phase_coding_blackbox`) injects a buyer-keyed phase perturbation $\lvert\Delta\theta_m\rvert \le 8.726646 \times 10^{-4}\text{ rad}$ ($\le 0.05^\circ$, `0.00 dB` pole-radius change) via `"DNAM-WM-PHASE-V1"` into each tier's active Stage III Kautz pole angles (`STAGE3_KAUTZ_BASES`, surviving black-box re-distillation while remaining `100%` invariant under `quantize_pole_angle_1e2` `10^{-2} rad` grid).
 
-### 1.2 Mechanism B — Coupled Spread-Spectrum Tardos Watermarking (`Role A = 0` & `EMR` Envelopes)
+### 1.2 Mechanism B — Coupled Spread-Spectrum Tardos Watermarking (`EMR` Envelopes)
 
 `r[sec.watermark.tardos-code]`
 
-Embeds a buyer-specific spread-spectrum Tardos codeword (`TardosCodebook7680`) over the Stage II Role B commuted cascade weights (`b = 1..K_t-1`) in each retained tier (`REQ-8.5`), while strictly locking **Role A (`b = 0`, indices `0..16`, `768..784`, `2304..2320`, `4608..4624`) to `0.0`** so upstream nonlinear trajectories remain unperturbed and deriving per-tier Arcsine bias $p_i \in [\delta, 1 - \delta]$ via `HMAC-SHA256(shared_seed, tier_idx)` weighted by `compute_emr_masked_tardos_envelopes`:
-$$W_{\text{stage},i}^{(\text{buyer})} = W_{\text{stage},i}^{(\text{master})} + \epsilon \sigma_{W,i} c_i^{(\text{buyer})}$$
+Embeds a buyer-specific spread-spectrum Tardos codeword over each retained tier's linear readout / non-backbone parameters (`REQ-8.5`) while leaving nonlinear `GRU` state trajectories unperturbed and deriving per-tier Arcsine bias $p_i \in [\delta, 1 - \delta]$ via `HMAC-SHA256(shared_seed, tier_idx)` weighted by `compute_emr_masked_tardos_envelopes` so retained-tier codewords survive `strip_container_to_tier`:
+$$W_{\text{ro},i}^{(\text{buyer})} = W_{\text{ro},i}^{(\text{master})} + \epsilon \sigma_{W,i} c_i^{(\text{buyer})}$$
 
 ### 1.3 License-Scoped Seed Derivation
 
@@ -94,7 +95,7 @@ flowchart TD
 
 `r[sec.anticlone.stage3-fingerprint]`
 
-For each retained tier (`Lite..Ultra`), form the gauge-invariant Stage III component from that tier's 16 left FIR taps, 16 right FIR taps, and 7 `f64` values per added shared Kautz pole pair (`60 / 120 / 208 / 352` cumulative values across `Lite / Full / Pro / Ultra`, [`dnam_binary_format.md` §2.4](../containers/dnam_binary_format.md#24-tier-local-projection--stage-iii-slice-layout)):
+For each retained tier (`Lite..Ultra`), form the gauge-invariant Stage III component from that tier's 16 left FIR taps, 16 right FIR taps, and 7 `f64` values per added shared Kautz pole pair (`60 / 120 / 180 / 240` cumulative values across `Lite / Full / Pro / Ultra`, `4 / 8 / 12 / 16` pole pairs, [`dnam_binary_format.md` §2.4](../containers/dnam_binary_format.md#24-tier-local-projection--stage-iii-slice-layout)):
 
 ```text
 [b_early_L[0..15], b_early_R[0..15], (r_low, dr, theta, b_gamma*c_re_l, b_gamma*c_im_l, b_gamma*c_re_r, b_gamma*c_im_r) x M_tier]

@@ -12,6 +12,7 @@ requirements:
 adrs:
   - ADR-0006
   - ADR-0019
+  - ADR-0021
 ---
 
 # Op-T: Universal Transport, Granular Windowing & All-Pass Diffusion Operator
@@ -46,6 +47,7 @@ Each active `Op-T` history declares its maximum reference-rate read delay $D_{\m
    $$r = i + \big(L \mathbin{\mathrm{AND}} -[i < 0]\big), \qquad w' = (w + 1) - \big(L \mathbin{\mathrm{AND}} -[w + 1 = L]\big)$$
 4. `r[dsp.op-t.ring.q0-32-pointer]` **Integer-Plus-`Q0.32` Delay Pointer & Inward Reader Bounds:** Represent delay positions as an integer sample count $D_{\mathrm{int}}$ plus an unsigned `Q0.32` fraction (never a single `f32` total sample count, which loses `1/64`-sample resolution at `9 s` / `432,000` samples). Convert only the `Q0.32` fraction to `f32` ($\mu \in [0.0, 1.0)$), normalizing any `1.0f32` rounding carry to $(D_{\mathrm{int}} + 1, 0.0)$ and clamping inward to the nearest representable reader position inside all active physical and causal bounds.
 5. `r[dsp.op-t.ring.fp16-saturation]` **`fp16` Write Saturation Telemetry:** Finite delay writes exceeding `±65,504.0` saturate to `±65,504.0` (`0x7BFF` / `0xFBFF`) and set `FP16_SATURATED` ([`tora_architecture.md` §1.2](../architecture/tora_architecture.md#finite-precision-range-and-saturation-policy)).
+6. **Stage IV Inline L1D vs. Cold-Allocated Model-Declared Delay Capacity (`<= 48,000` ref samples):** For Stage IV FDN tanks, models whose total delay plus modulation margin fits within `1,024` frames (`max_delay + ceil(lfo_depth) + 4 <= 1,024`) execute strictly in the fixed inline L1D `fp16` ring (`0` heap allocations). Long-delay echo/modulation models (`1,024..=48,000` reference samples at `48 kHz`) declare `delay_histories` metadata and allocate a power-of-two `ext_lines` `fp16` buffer (including `4x` ZOH oversampling headroom) strictly during cold container loading (`0` allocations on RT `step_*`, `switch_tier`, `reconfigure_with_zoh`, or `& ext_mask` index wrapping, zero `UDIV`/`IDIV`).
 
 ### 1.2 Stateless 4-Tap Catmull-Rom Hermite Cubic Delay Reader
 

@@ -24,7 +24,8 @@ use dnam_engine::container::{
 };
 use dnam_engine::engine::EngineBackend;
 use dnam_engine::math::{
-    BackendKind, DefaultMathBackend, ScalarBackend, SimdF64Vec2, SimdVec4, TrainerMathBackend,
+    BackendKind, DefaultMathBackend, MathBackend, ScalarBackend, SimdF64Vec2, SimdVec4,
+    TrainerMathBackend,
 };
 use dnam_engine::schema::{
     ControlBusConfig, DatasetProvenance, DnamJsonHeader, IoConfig, ModelMetadata, RouterConfig,
@@ -118,47 +119,59 @@ fn build_parity_container() -> Vec<u8> {
         tensor_directory: BTreeMap::new(),
     };
 
-    let mut arena = vec![0u8; 64_000];
-    arena[124..128].copy_from_slice(&0.9993_f32.to_le_bytes());
-    for off in (4_096..4_288).step_by(4) {
-        arena[off..off + 4].copy_from_slice(&0.5_f32.to_le_bytes());
-    }
-
-    let cascade_w_bases = [1_024_usize, 11_264_usize, 22_336_usize, 36_224_usize];
-    let cascade_w_counts = [768_usize, 1536_usize, 2304_usize, 3072_usize];
-    for tier in 0..4 {
-        let cw_base = cascade_w_bases[tier];
-        for w in 0..cascade_w_counts[tier] {
-            let val = 0.015_f32 * (((w + tier * 5) % 9) as f32 - 4.0);
-            let off = cw_base + w * 4;
-            arena[off..off + 4].copy_from_slice(&val.to_le_bytes());
+    let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+    let mut model = dnam_engine::stages::V3MatryoshkaModel::dual_rate_default(false);
+    model.stage0.xo_low_gain = 1.05;
+    model.stage0.xo_high_gain = 0.95;
+    model.stage0.clean_sub_mix = 0.25;
+    model.stage0.op_p_sub_mix = 0.1;
+    model.svf.env_oct_sens = 1.2;
+    model.tone_svf.h0_proj_w = [0.25, -0.15, 0.10, 0.05];
+    model.tone_svf.s1_proj_w = 0.25;
+    for b in 0..dnam_engine::stages::stage2_gru::NUM_GRU_BLOCKS {
+        for f in 0..dnam_engine::stages::stage2_gru::NUM_IN_FEATS_B0 {
+            for l in 0..12 {
+                model.blocks[b].w_in_z[f][l] = 0.05;
+                model.blocks[b].w_in_r[f][l] = 0.04;
+                model.blocks[b].w_in_n[f][l] = 0.10 * if ((f + l) & 1) == 0 { 1.0 } else { -1.0 };
+            }
         }
-        for blk in 0..4 {
-            let k_base = dnam_engine::provenance::kautz_soa_byte_offset(tier, blk);
-            for lane in 0..4 {
-                arena[k_base + lane * 4..k_base + (lane + 1) * 4]
-                    .copy_from_slice(&0.55_f32.to_le_bytes());
-                arena[k_base + 16 + lane * 4..k_base + 16 + (lane + 1) * 4]
-                    .copy_from_slice(&0.05_f32.to_le_bytes());
-                arena[k_base + 32 + lane * 4..k_base + 32 + (lane + 1) * 4]
-                    .copy_from_slice(&0.45_f32.to_le_bytes());
-                arena[k_base + 48 + lane * 4..k_base + 48 + (lane + 1) * 4]
-                    .copy_from_slice(&0.25_f32.to_le_bytes());
-                arena[k_base + 64 + lane * 4..k_base + 64 + (lane + 1) * 4]
-                    .copy_from_slice(&0.15_f32.to_le_bytes());
-                arena[k_base + 80 + lane * 4..k_base + 80 + (lane + 1) * 4]
-                    .copy_from_slice(&(-0.10_f32).to_le_bytes());
+        for l in 0..12 {
+            model.blocks[b].b_z[l] = -0.35;
+            model.blocks[b].b_r[l] = 0.25;
+            model.blocks[b].k_sag[l] = 0.2;
+            model.blocks[b].k_quad[l] = 0.1;
+            model.blocks[b].w_rec_n[l][l] = 0.12;
+            if b > 0 {
+                model.blocks[b].w_prev_n[l][l] = 0.2;
             }
         }
     }
-
-    for &hbase in &[4_928_usize, 18_048_usize, 31_936_usize, 57_600_usize] {
-        for i in 0..640 {
-            let val = 0.04_f32 * (((i * 11 + 3) % 15) as f32 - 7.0);
-            let off = hbase + i * 4;
-            arena[off..off + 4].copy_from_slice(&val.to_le_bytes());
+    for tier in 0..4 {
+        for lane in 0..4 {
+            model.kautz_poles[tier * 4 + lane] = (0.90, 0.15 + 0.08 * (lane as f32));
         }
+        let mut ro = dnam_engine::stages::V3TierReadout::default();
+        for ch in 0..2 {
+            for l in 0..24 {
+                ro.pre_cab_w[ch][l] = 0.04 * (((l + ch + tier) % 5) as f32 - 2.0);
+                ro.direct_s2_w[ch][l] = 0.025;
+            }
+        }
+        for tap in 0..64 {
+            ro.fir_l[tap] = if tap % 16 == 0 { 0.06 } else { 0.004 };
+            ro.fir_r[tap] = if tap % 16 == 0 { 0.05 } else { 0.004 };
+        }
+        for m in 0..16 {
+            ro.kautz_b_gamma[m] = 0.35;
+            ro.kautz_c_l[m] = (0.15, -0.08);
+            ro.kautz_c_r[m] = (0.12, -0.06);
+        }
+        model.readouts[tier] = ro;
+        model.stage4[tier].g_loop = 0.72;
+        model.stage4[tier].wet_mix = 0.2;
     }
+    dnam_engine::stages::weights::pack_v3_matryoshka_to_arena(&model, &mut arena);
 
     build_dnam_container(&mut header, &arena, &arena, false).unwrap()
 }
@@ -362,51 +375,57 @@ fn exercise_math_backend<B: EngineBackend>() {
     let v_mat = B::fma_mat4x4_vec4(B::Vec4::zero(), &mat, &[1.0, 2.0, 3.0, 4.0]);
     assert!(v_mat.horizontal_sum().is_finite());
 
+    let xl_arr = [0.25_f32, -0.5, 0.75, 1.0];
+    let xr_arr = [-0.4_f32, 0.8, -0.2, 0.6];
+    let (st_l, st_r) =
+        B::fma_mat4x4_stereo(va, vb, &mat, B::Vec4::load(&xl_arr), B::Vec4::load(&xr_arr));
+    let ref_l = B::fma_mat4x4_vec4(va, &mat, &xl_arr).to_array();
+    let ref_r = B::fma_mat4x4_vec4(vb, &mat, &xr_arr).to_array();
+    for i in 0..4 {
+        assert!((st_l.to_array()[i] - ref_l[i]).abs() < 1.0e-6);
+        assert!((st_r.to_array()[i] - ref_r[i]).abs() < 1.0e-6);
+    }
+
+    let seed_inputs = [0.125_f32, 1.0, 3.75, 12.5];
+    let sv_seed_in = <ScalarBackend as MathBackend>::Vec4::load(&seed_inputs);
+    let bv_seed_in = B::Vec4::load(&seed_inputs);
+    assert_eq!(
+        bv_seed_in.rcp_pos_seed_bits().to_array().map(f32::to_bits),
+        sv_seed_in.rcp_pos_seed_bits().to_array().map(f32::to_bits)
+    );
+    assert_eq!(
+        bv_seed_in
+            .rsqrt_pos_seed_bits()
+            .to_array()
+            .map(f32::to_bits),
+        sv_seed_in
+            .rsqrt_pos_seed_bits()
+            .to_array()
+            .map(f32::to_bits)
+    );
+    let r2 = bv_seed_in.rcp_pos_nr2().to_array();
+    let r3 = bv_seed_in.rcp_pos_nr3().to_array();
+    let s2 = bv_seed_in.rsqrt_pos_nr2().to_array();
+    let s3 = bv_seed_in.rsqrt_pos_nr3().to_array();
+    for i in 0..4 {
+        let d = seed_inputs[i];
+        assert!((r2[i] * d - 1.0).abs() < 1.0e-5);
+        assert!((r3[i] * d - 1.0).abs() < 1.0e-6);
+        let ref_rsq = 1.0 / d.sqrt();
+        assert!(((s2[i] - ref_rsq) / ref_rsq).abs() < 2.5e-3);
+        assert!(((s3[i] - ref_rsq) / ref_rsq).abs() < 2.0e-5);
+    }
+
     let (d16_l, d16_r) = B::dot16_stereo(&mat, &mat, &mat, &mat);
     assert!((d16_l - 0.16).abs() < 1e-6 && (d16_r - 0.16).abs() < 1e-6);
     let (d16_vl, d16_vr) =
         dnam_engine::stages::dot16_stereo_vec4::<B::Vec4>(&mat, &mat, &mat, &mat);
     assert!((d16_vl - 0.16).abs() < 1e-6 && (d16_vr - 0.16).abs() < 1e-6);
 
-    let h_frame = [[0.2_f32; 4]; 4];
-    let h_taps = [&h_frame; 6];
-    let w1 = [[[0.1_f32; 4]; 4]; 6];
-    let w2 = [[[0.1_f32; 4]; 4]; 12];
-    let w3 = [[[0.1_f32; 4]; 4]; 18];
-    let w4 = [[[0.1_f32; 4]; 4]; 24];
-    let _ = B::conv6_taps_1group(B::Vec4::zero(), &w1, &h_taps);
-    let _ = B::conv6_taps_2groups(B::Vec4::zero(), &w2, &h_taps);
-    let _ = B::conv6_taps_3groups(B::Vec4::zero(), &w3, &h_taps);
-    let _ = B::conv6_taps_4groups(B::Vec4::zero(), &w4, &h_taps);
-    let _ = dnam_engine::stages::conv6_taps_1group_vec4::<B::Vec4>(B::Vec4::zero(), &w1, &h_taps);
-    let _ = dnam_engine::stages::conv6_taps_2groups_vec4::<B::Vec4>(B::Vec4::zero(), &w2, &h_taps);
-    let _ = dnam_engine::stages::conv6_taps_3groups_vec4::<B::Vec4>(B::Vec4::zero(), &w3, &h_taps);
-    let _ = dnam_engine::stages::conv6_taps_4groups_vec4::<B::Vec4>(B::Vec4::zero(), &w4, &h_taps);
-
-    let _ = B::poly_adaa_algebraic_4ch(va, vb, B::Vec4::splat(1.0), B::Vec4::splat(0.1));
+    let _ = <B as dnam_engine::operators::op_n::OpNBackend<B::Vec4>>::tanh_pade5_4ch(va);
+    let _ = va.rcp_ge1_nr2();
+    let _ = B::Vec4::rsqrt_pos_pair_nr2(B::Vec4::splat(1.5), B::Vec4::splat(2.5));
     let _ = B::cubic_lagrange_weights_4ch(B::Vec4::splat(0.25));
-    let tile64 = [0.1_f32; 64];
-    assert!((B::tile_dot64(&tile64, &tile64) - 0.64).abs() < 1e-5);
-    assert!(
-        (dnam_engine::engine::tile_dot64_vec4::<B::Vec4>(&tile64, &tile64) - 0.64).abs() < 1e-5
-    );
-    let stereo64 = B::tile_dot64_stereo(&tile64, &tile64, &tile64);
-    assert!((stereo64[0] - 0.64).abs() < 1e-5 && (stereo64[1] - 0.64).abs() < 1e-5);
-    let stereo64_v =
-        dnam_engine::engine::tile_dot64_stereo_vec4::<B::Vec4>(&tile64, &tile64, &tile64);
-    assert!((stereo64_v[0] - 0.64).abs() < 1e-5 && (stereo64_v[1] - 0.64).abs() < 1e-5);
-
-    let svd_base = [0.5_f32; 16];
-    let svd_modes = [0.1_f32; 64];
-    let mut svd_collapsed = [0.0_f32; 16];
-    B::tile_collapse_svd_slice(
-        &svd_base,
-        &svd_modes,
-        &[1.0, 2.0, 3.0, 4.0],
-        4,
-        &mut svd_collapsed,
-    );
-    assert!((svd_collapsed[0] - 1.5).abs() < 1e-5);
 
     let fp16_4 = B::f32x4_to_fp16x4(&[0.5, -0.5, 1.0, 0.0]);
     let f32_4 = B::fp16x4_to_f32x4(&fp16_4);

@@ -13,10 +13,18 @@ use dnam_engine::container::{
     validate_v2_dnam_layout_with_max_profile,
 };
 use dnam_engine::control::Cp1ContributorSlot;
+use dnam_engine::math::ScalarBackend;
 use dnam_engine::provenance::{
     CryptoProvider, DefaultCryptoProvider, enforce_distribution_policy, sha256_digest,
 };
-use dnam_engine::schema::DnamError;
+use dnam_engine::schema::header::DelayHistoryDecl;
+use dnam_engine::schema::{DnamError, DnamJsonHeader};
+use dnam_engine::stages::hot_core::V3CoreInstance;
+use dnam_engine::stages::stage4_tank::v3_fdn::{V3_TANK_CAP, V3_TANK_MAX_DECLARED_DELAY};
+use dnam_engine::stages::weights::{
+    PIPE_FLAG_V3_MATRYOSHKA, has_pipeline_flag, unpack_v3_matryoshka_from_arena,
+    unpack_v3_tier_from_arena,
+};
 
 use super::directory::{
     CalbChunk64B, DnamProjPreamble, ProjAuthRecord, ProjChunkDirEntry, ProjChunkKind,
@@ -52,18 +60,56 @@ pub(crate) struct VaultChunkInput {
 }
 
 type ValidatedWghtPair<'a> = (&'a [u8], DnamContainerView<'a>);
-/// Enforces `b_head = 0.0` (`[STAB-ZERO-DC]`) in `Arena 0..3` at `9_024..9_064` (`Lite..Pro` modes)
-/// and `63_424..63_456` (`Ultra` delta modes 5..8).
+/// Byte range inside `Arena 0` `ARENA0_META` reserved for the `[STAB-ZERO-DC]` guard slot.
+pub const ARENA0_ZERO_DC_GUARD_RANGE: core::ops::Range<usize> = 216..256;
+
+/// Byte range inside `Arena 3` `ARENA3_STAGE1_PRE` reserved for the `Ultra` `[STAB-ZERO-DC]` guard slot.
+pub const ARENA3_ZERO_DC_GUARD_RANGE: core::ops::Range<usize> = 18_528..18_560;
+
+/// Enforces `b_head = 0.0` / zeroed `[STAB-ZERO-DC]` guard slots in `v3` `Arena 0..3`
+/// (`216..256` for `Lite..Ultra` and `18_528..18_560` for `Ultra`).
 pub fn zero_arena_b_head_dc_bias(arena_bytes: &mut [u8]) {
-    if arena_bytes.len() >= 9_064 {
-        arena_bytes[9_024..9_064].fill(0);
+    if arena_bytes.len() >= ARENA0_ZERO_DC_GUARD_RANGE.end {
+        arena_bytes[ARENA0_ZERO_DC_GUARD_RANGE].fill(0);
     }
-    if arena_bytes.len() >= 63_456 {
-        arena_bytes[63_424..63_456].fill(0);
+    if arena_bytes.len() >= ARENA_OFFSET_ULTRA_END as usize {
+        arena_bytes[ARENA3_ZERO_DC_GUARD_RANGE].fill(0);
     }
 }
 
-/// Verifies that `b_head == 0.0` (`[STAB-ZERO-DC]`) holds across all retained modes in `arena_bytes`.
+/// Synchronizes `header.delay_histories` (`kind: "fdn"`) from unpacked `v3` Stage IV tank
+/// parameters in `arena` so engine cold loading pre-allocates extended delay rings without
+/// real-time heap allocations (`ref[dsp.op-t.ring.declaration]`).
+pub(crate) fn sync_manifest_stage4_delay_history(header: &mut DnamJsonHeader, arena: &[u8]) {
+    header.delay_histories.retain(|d| d.kind != "fdn");
+    if !has_pipeline_flag(arena, PIPE_FLAG_V3_MATRYOSHKA)
+        || arena.len() < ARENA_OFFSET_ULTRA_END as usize
+    {
+        return;
+    }
+    let mono_out = header.io_config.output_mode == "mono";
+    let model = unpack_v3_matryoshka_from_arena(arena, mono_out);
+    let max_req = model
+        .stage4
+        .iter()
+        .map(|t| {
+            let max_d = t.delay_lengths.iter().copied().max().unwrap_or(0);
+            let lfo_pad = (t.lfo_depth_samples.max(0.0).ceil() as usize).saturating_add(6);
+            max_d.saturating_add(lfo_pad)
+        })
+        .max()
+        .unwrap_or(0);
+    if max_req > V3_TANK_CAP {
+        header.delay_histories.push(DelayHistoryDecl {
+            kind: "fdn".to_string(),
+            max_samples_48k: max_req.min(V3_TANK_MAX_DECLARED_DELAY) as u32,
+        });
+    }
+}
+
+/// Verifies `[STAB-ZERO-DC]` holds across all retained tiers in `arena_bytes`: zeroed guard slots
+/// (`216..256`, plus `18_528..18_560` at `Ultra`) and resting DC residual `<= 1.0e-5` (`-100 dBFS`)
+/// when `PIPE_FLAG_V3_MATRYOSHKA` is present.
 pub fn verify_arena_b_head_zero_dc(arena_bytes: &[u8]) -> Result<(), DnamError> {
     if arena_bytes.len() < ARENA_OFFSET_LITE_END as usize {
         return Err(DnamError::BufferTooSmall {
@@ -71,18 +117,48 @@ pub fn verify_arena_b_head_zero_dc(arena_bytes: &[u8]) -> Result<(), DnamError> 
             actual: arena_bytes.len(),
         });
     }
-    if arena_bytes[9_024..9_064].iter().any(|&b| b != 0) {
+    if arena_bytes[ARENA0_ZERO_DC_GUARD_RANGE]
+        .iter()
+        .any(|&b| b != 0)
+    {
         return Err(DnamError::SchemaValidationError(
-            "WGHT Arena 0 violates [STAB-ZERO-DC]: non-zero b_head in bytes 9024..9064".to_string(),
+            "WGHT Arena 0 violates [STAB-ZERO-DC]: non-zero guard bytes in 216..256".to_string(),
         ));
     }
     if arena_bytes.len() >= ARENA_OFFSET_ULTRA_END as usize
-        && arena_bytes[63_424..63_456].iter().any(|&b| b != 0)
+        && arena_bytes[ARENA3_ZERO_DC_GUARD_RANGE]
+            .iter()
+            .any(|&b| b != 0)
     {
         return Err(DnamError::SchemaValidationError(
-            "WGHT Arena 3 violates [STAB-ZERO-DC]: non-zero b_head in bytes 63424..63456"
+            "WGHT Arena 3 violates [STAB-ZERO-DC]: non-zero guard bytes in 18528..18560"
                 .to_string(),
         ));
+    }
+    if has_pipeline_flag(arena_bytes, PIPE_FLAG_V3_MATRYOSHKA) {
+        let check_tiers: &[Tier] = if arena_bytes.len() >= ARENA_OFFSET_ULTRA_END as usize {
+            &[Tier::Lite, Tier::Ultra]
+        } else {
+            &[Tier::Lite]
+        };
+        for &tier in check_tiers {
+            let cold = unpack_v3_tier_from_arena(arena_bytes, tier, false);
+            let mut inst = V3CoreInstance::<ScalarBackend>::from_cold_model(&cold);
+            inst.reset_to_dc_equilibrium();
+            for _ in 0..4 {
+                let y = inst.step_stereo(0.0, 0.0);
+                if !y[0].is_finite()
+                    || !y[1].is_finite()
+                    || y[0].abs() > 1.0e-5
+                    || y[1].abs() > 1.0e-5
+                {
+                    return Err(DnamError::SchemaValidationError(format!(
+                        "WGHT {tier:?} violates [STAB-ZERO-DC]: resting DC output ({:.2e}, {:.2e}) > 1e-5",
+                        y[0], y[1]
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -554,14 +630,8 @@ pub(crate) fn build_dnam_proj_container_from_vault(
     )?;
     let mut clean_arena = arena_0_to_3.to_vec();
     zero_arena_b_head_dc_bias(&mut clean_arena);
-    let descriptors = manifest.base.compile_clamp_descriptors()?;
-    if clean_arena.len() >= 9_024 {
-        clean_arena[8_512..9_024].fill(0);
-        for (idx, desc) in descriptors.iter().take(8).enumerate() {
-            let off = 8_512 + idx * 64;
-            clean_arena[off..off + 64].copy_from_slice(&desc.to_bytes());
-        }
-    }
+    sync_manifest_stage4_delay_history(&mut manifest.base, &clean_arena);
+    let _ = manifest.base.compile_clamp_descriptors()?;
     let wght_dnam = build_dnam_container_with_cp1(
         &mut manifest.base,
         &clean_arena,
@@ -588,14 +658,8 @@ pub(crate) fn build_dnam_proj_container_with_cp1_and_compacted(
 ) -> Result<Vec<u8>, DnamError> {
     let mut clean_arena = arena_0_to_3.to_vec();
     zero_arena_b_head_dc_bias(&mut clean_arena);
-    let descriptors = manifest.base.compile_clamp_descriptors()?;
-    if clean_arena.len() >= 9_024 {
-        clean_arena[8_512..9_024].fill(0);
-        for (idx, desc) in descriptors.iter().take(8).enumerate() {
-            let off = 8_512 + idx * 64;
-            clean_arena[off..off + 64].copy_from_slice(&desc.to_bytes());
-        }
-    }
+    sync_manifest_stage4_delay_history(&mut manifest.base, &clean_arena);
+    let _ = manifest.base.compile_clamp_descriptors()?;
     let wght_dnam = build_dnam_container_with_cp1(
         &mut manifest.base,
         &clean_arena,

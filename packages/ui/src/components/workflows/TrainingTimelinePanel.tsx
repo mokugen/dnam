@@ -1,23 +1,65 @@
 import { Flame, Play } from "lucide-react";
-import { Badge } from "../ui/badge.js";
-import { Button } from "../ui/button.js";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../ui/card.js";
-import { Progress } from "../ui/progress.js";
+import type { TrainerProgressFrame } from "../../host/trainer-progress.js";
+import { Badge } from "../base/badge.js";
+import { Button } from "../base/button.js";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../base/card.js";
+import { Progress } from "../base/progress.js";
 import type { TrainingTimelineView } from "./models.js";
+import { TrainingFitVisualizer } from "./TrainingFitVisualizer.js";
 
 export interface TrainingTimelinePanelProps {
   readonly timeline: TrainingTimelineView;
   readonly onStartTraining?: (() => void) | undefined;
 }
 
+function buildPreviewFrame(
+  timeline: TrainingTimelineView,
+  progressFraction: number,
+): TrainerProgressFrame | null {
+  if (timeline.progressFrame !== undefined) {
+    return timeline.progressFrame;
+  }
+  const latest = timeline.history[timeline.history.length - 1];
+  if (!latest) {
+    return null;
+  }
+  return {
+    seq: 2,
+    status: timeline.status,
+    phase: timeline.status === "completed" ? "completed" : "stage_b_backbone",
+    activeTier: "pro",
+    clampedControls: timeline.clampedParameterCount,
+    hasVisualFrame: false,
+    progressPermille: Math.round(progressFraction * 1000),
+    step: latest.epoch,
+    totalSteps: latest.totalEpochs,
+    stageStep: latest.epoch,
+    stageTotalSteps: latest.totalEpochs,
+    bestLoss: latest.esrLoss,
+    mrIirLoss: latest.mrIirLoss,
+    tierBesrDb: [Number.NaN, Number.NaN, Number.NaN, Number.NaN],
+    tierLtasDb: [Number.NaN, Number.NaN, Number.NaN, Number.NaN],
+    targetWave: [],
+    modelWave: [],
+    targetWaveI8: [],
+    modelWaveI8: [],
+    ltasErrorQ20: [],
+    ltasErrorDb: [],
+    kautzPoles: [],
+  };
+}
+
 export function TrainingTimelinePanel({ timeline, onStartTraining }: TrainingTimelinePanelProps) {
   const latest = timeline.history[timeline.history.length - 1];
   const progressPct =
-    latest && latest.totalEpochs > 0
-      ? (latest.epoch / latest.totalEpochs) * 100
-      : timeline.status === "completed"
-        ? 100
-        : 0;
+    timeline.progressFrame !== undefined && timeline.progressFrame !== null
+      ? timeline.progressFrame.progressPermille * 0.1
+      : latest && latest.totalEpochs > 0
+        ? (latest.epoch / latest.totalEpochs) * 100
+        : timeline.status === "completed"
+          ? 100
+          : 0;
+  const fitFrame = buildPreviewFrame(timeline, progressPct / 100);
 
   return (
     <Card data-testid={`training-timeline-panel-${timeline.modelId}`}>
@@ -28,8 +70,7 @@ export function TrainingTimelinePanel({ timeline, onStartTraining }: TrainingTim
             <CardTitle>Two-Sweep Analytical Trainer ({timeline.modelId})</CardTitle>
           </div>
           <CardDescription>
-            Non-Stop 3-Phase Control Clamping + Kronecker .dnam-proj Solver (
-            {timeline.backendDevice})
+            Automatic Safe Knob Range Protection ({timeline.backendDevice})
           </CardDescription>
         </div>
 
@@ -58,32 +99,11 @@ export function TrainingTimelinePanel({ timeline, onStartTraining }: TrainingTim
 
         <Progress value={progressPct} indicatorClassName="bg-violet-400" />
 
-        {latest ? (
-          <div className="grid grid-cols-2 gap-2 font-mono text-xs sm:grid-cols-4">
-            <div className="rounded border border-slate-800 bg-slate-950/60 p-2">
-              <div className="text-xs text-slate-400">ESR Loss</div>
-              <div className="mt-0.5 font-semibold text-amber-300">{latest.esrLoss.toFixed(5)}</div>
-            </div>
-            <div className="rounded border border-slate-800 bg-slate-950/60 p-2">
-              <div className="text-xs text-slate-400">MR-IIR Loss</div>
-              <div className="mt-0.5 font-semibold text-cyan-300">
-                {latest.mrIirLoss.toFixed(5)}
-              </div>
-            </div>
-            <div className="rounded border border-slate-800 bg-slate-950/60 p-2">
-              <div className="text-xs text-slate-400">RG-LRU r_max</div>
-              <div className="mt-0.5 font-semibold text-emerald-300">
-                {latest.maxRgLruRadius.toFixed(4)}
-              </div>
-            </div>
-            <div className="rounded border border-slate-800 bg-slate-950/60 p-2">
-              <div className="text-xs text-slate-400">UFDN ||U||_2</div>
-              <div className="mt-0.5 font-semibold text-violet-300">
-                {latest.ufdnSpectralNorm.toFixed(4)}
-              </div>
-            </div>
-          </div>
-        ) : null}
+        <TrainingFitVisualizer
+          frame={fitFrame}
+          status={timeline.status}
+          progressFraction={progressPct / 100}
+        />
       </CardContent>
     </Card>
   );

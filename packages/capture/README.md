@@ -2,7 +2,7 @@
 
 **`dnam-capture`** (`packages/capture/`) is the 100% safe-Rust (`#![forbid(unsafe_code)]`, `wasm32`-safe) pure IO-buffer capture, single-file `.dnam-proj` (`DNPJ`, `v2.0`) project container, and deterministic zero-GPU Analytical + Nonlinear Variable-Projection (`VarPro`) system-identification crate for **Dynamic Neural Audio Modeler (DNAM)**.
 
-By linking [`dnam-engine`](../engine/README.md) directly (`engine <- capture` `[dependencies]`, `fixtures <- capture` `[dev-dependencies]`), `dnam-capture` executes the exact `#![no_std]` + `alloc` DSP operators (`Op-T`, `Op-M`, `Op-N`), `256-D` `step_frame_with_feature_bus`, `3 kHz` Parametric Control Bus, and `.dnam` binary framing across native hosts, Node.js `N-API`, Browser `WebWorker`s, and Cloudflare Workers (`ref[arch.isomorphism.two-sweep]`, [`ADR-0017`](../../docs/adr/0017-pure-rust-analytical-varpro-solver-and-planar-decoupling.md), [`ADR-0020`](../../docs/adr/0020-modular-monorepo-and-dnam-proj-container.md)).
+By linking [`dnam-engine`](../engine/README.md) directly (`engine <- capture` `[dependencies]`, `fixtures <- capture` `[dev-dependencies]`), `dnam-capture` executes the exact `#![no_std]` + `alloc` DSP operators (`Op-T`, `Op-M`, `Op-N`), TORA `v3` `VarPro` + Windowed-BPTT kernels, `3 kHz` Parametric Control Bus, and `.dnam` binary framing across native hosts, Node.js `N-API`, Browser `WebWorker`s, and Cloudflare Workers (`ref[arch.isomorphism.two-sweep]`, [`ADR-0020`](../../docs/adr/0020-modular-monorepo-and-dnam-proj-container.md), [`ADR-0021`](../../docs/adr/0021-unified-matryoshka-gru-and-direct-register-stages.md)).
 
 ---
 
@@ -65,15 +65,10 @@ packages/capture/
 │   └── solver/
 │       └── stages.rs           # AuditBounds, Step-0 variance gating & Family-5 surrogate
 ├── tests/
-│   ├── capture_spec_verification.rs           # Integration & proptest verify[...] suite
-│   ├── capture_multirate_bitdepth_fixtures.rs # Multi-rate & 5-bit-depth Chain-01..12 suite
-│   ├── capture_stimulus_and_safeguards.rs     # AdaptiveStimulusController, Laws 0.A-0.F, Laws 1-3 & Bloom suite
-│   ├── capture_dual_mode_and_align.rs         # CALB, 4-regime align, Theorem 4.5-4.6 & Mode 1/2 Null-Test suite
-│   ├── capture_proj_security.rs               # .dnam-proj Range, capsules, zero-DC & vault suite
-│   ├── capture_proj_dau1_security.rs          # AUTH, DAU1/DMU1 & live DNWB subprocess suite
-│   ├── capture_align_and_capsules_edges.rs    # WAV codec, schema JCS & capsule edge suite
-│   ├── capture_proj_bundle_and_vault_edges.rs # Directory, bijection & stereo vault edge suite
-│   └── capture_proj_adversarial_regressions.rs# P>8 Mode A, >64KB Range, STAT PSD & DMU1 growth suite
+│   ├── proj_suite.rs                # .dnam-proj Range, DAU1/AUTH & vault suites (proj_suite/*)
+│   ├── stimulus_and_align_suite.rs  # Stimulus, alignment, bit-depth & spec suites (stimulus_and_align_suite/*)
+│   ├── solver_suite.rs              # VarPro oracles, chains, adversaries & audit suites (solver_suite/*)
+│   └── qualification_matrix.rs      # Full 13x4 & v3 qualification (--ignored; run via capture:qualify)
 └── benches/
     └── bench_capture.rs        # Criterion Cholesky, compact_to_capsules & export_runtime_dnam
 ```
@@ -88,4 +83,7 @@ moon check capture
 
 # Enforce >= 95% line coverage
 moon run capture:coverage
+
+# Run full multi-chain --release acoustic qualification matrices
+moon run capture:qualify
 ```

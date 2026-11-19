@@ -1,10 +1,11 @@
 //! x86-64 SSE2 (`x86-64-v1`) baseline hardware math backend (`Sse2Vec4` & `X86Sse2Backend`).
 
 use core::arch::x86_64::{
-    __m128, _mm_add_ps, _mm_and_si128, _mm_andnot_ps, _mm_andnot_si128, _mm_castps_si128,
-    _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_cmpgt_epi32, _mm_cvtss_f32, _mm_max_ps, _mm_min_ps,
-    _mm_movehl_ps, _mm_mul_ps, _mm_or_si128, _mm_set1_epi32, _mm_set1_ps, _mm_setr_ps,
-    _mm_shuffle_ps, _mm_srli_epi32, _mm_sub_epi32, _mm_sub_ps, _mm_xor_ps,
+    __m128, _mm_add_epi32, _mm_add_ps, _mm_and_si128, _mm_andnot_ps, _mm_andnot_si128,
+    _mm_castps_si128, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_cmpgt_epi32, _mm_cvtss_f32,
+    _mm_max_ps, _mm_min_ps, _mm_movehl_ps, _mm_mul_ps, _mm_or_si128, _mm_set1_epi32, _mm_set1_ps,
+    _mm_setr_ps, _mm_shuffle_ps, _mm_slli_epi32, _mm_srli_epi32, _mm_sub_epi32, _mm_sub_ps,
+    _mm_xor_ps,
 };
 
 use crate::math::crc32c::{Crc32cBackend, crc32c_software_slice};
@@ -31,6 +32,12 @@ impl SimdVec4 for Sse2Vec4 {
     #[inline(always)]
     fn load(src: &[f32; 4]) -> Self {
         Self(zerocopy::transmute!(*src))
+    }
+
+    #[inline(always)]
+    fn from_array(arr: [f32; 4]) -> Self {
+        // SAFETY: SSE is part of the x86-64 architectural baseline.
+        unsafe { Self(_mm_setr_ps(arr[0], arr[1], arr[2], arr[3])) }
     }
 
     #[inline(always)]
@@ -144,6 +151,40 @@ impl SimdVec4 for Sse2Vec4 {
                 _mm_cvtss_f32(totals),
                 _mm_cvtss_f32(_mm_movehl_ps(totals, totals)),
             )
+        }
+    }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        // SAFETY: SSE2 is part of the x86-64 architectural baseline.
+        unsafe {
+            Self(_mm_castsi128_ps(_mm_sub_epi32(
+                _mm_set1_epi32(crate::math::IEEE754_F32_RCP_SEED as i32),
+                _mm_castps_si128(self.0),
+            )))
+        }
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        // SAFETY: SSE2 is part of the x86-64 architectural baseline.
+        unsafe {
+            Self(_mm_castsi128_ps(_mm_sub_epi32(
+                _mm_set1_epi32(crate::math::IEEE754_F32_RSQRT_SEED as i32),
+                _mm_srli_epi32::<1>(_mm_castps_si128(self.0)),
+            )))
+        }
+    }
+
+    #[inline(always)]
+    fn pow2_from_biased_int_bits(self) -> Self {
+        // SAFETY: SSE2 is part of the x86-64 architectural baseline.
+        unsafe {
+            let biased = _mm_add_epi32(
+                _mm_castps_si128(self.0),
+                _mm_set1_epi32(crate::math::IEEE754_F32_EXP_BIAS as i32),
+            );
+            Self(_mm_castsi128_ps(_mm_slli_epi32::<23>(biased)))
         }
     }
 }

@@ -752,23 +752,13 @@ mod spec_tests {
         assert_eq!((Tier::Ultra.channels(), Tier::Ultra.simd_groups()), (16, 4));
 
         let _guard = FtzDazGuard::new();
-        let u_prev = [-0.5_f32, 0.0, 0.25, 0.75];
-        let u_curr = [-0.25_f32, 0.125, 0.5, -0.5];
-        let beta = [0.8_f32, 0.9, 1.0, 0.7];
-        let delta = [-0.2_f32, 0.1, -0.15, 0.25];
+        let x = [-2.5_f32, -0.5, 0.0, 1.5];
 
-        let s_out = ScalarBackend::poly_adaa_algebraic_4ch(
-            <ScalarBackend as MathBackend>::Vec4::from_array(u_prev),
-            <ScalarBackend as MathBackend>::Vec4::from_array(u_curr),
-            <ScalarBackend as MathBackend>::Vec4::from_array(beta),
-            <ScalarBackend as MathBackend>::Vec4::from_array(delta),
-        )
-        .to_array();
-        let d_out = DefaultMathBackend::poly_adaa_algebraic_4ch(
-            <DefaultMathBackend as MathBackend>::Vec4::from_array(u_prev),
-            <DefaultMathBackend as MathBackend>::Vec4::from_array(u_curr),
-            <DefaultMathBackend as MathBackend>::Vec4::from_array(beta),
-            <DefaultMathBackend as MathBackend>::Vec4::from_array(delta),
+        let s_out =
+            ScalarBackend::tanh_pade5_4ch(<ScalarBackend as MathBackend>::Vec4::from_array(x))
+                .to_array();
+        let d_out = DefaultMathBackend::tanh_pade5_4ch(
+            <DefaultMathBackend as MathBackend>::Vec4::from_array(x),
         )
         .to_array();
         for lane in 0..4 {

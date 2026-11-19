@@ -18,7 +18,8 @@ use dnam_fixtures::{
     Chain03ParallelCleanBlend, Chain04TubeAmpFmv4x12, Chain05PureLtiCabAndRoom,
     Chain06EnvelopeResonantSvf, Chain07StereoChorusAndRotary, Chain08LongBbdEchoAnd30sShimmer,
     Chain09La2aOpticalCompressor, Chain10Oc2OctaveDividerAndRingMod, Chain11BiAmpBassAndOutputIron,
-    Chain12FullEndToEndStereoRig, Chain12RigMode, ConverterLoopbackDecorator,
+    Chain12FullEndToEndStereoRig, Chain12RigMode, Chain13TriBandVcaCompressor,
+    Chain14TriBandCompDistortion, Chain15TubeAmpHeadDi, ConverterLoopbackDecorator,
     DEFAULT_FIXTURE_SAMPLE_RATE_HZ, DigitalQuirksDecorator, FixtureBitDepth,
     GermaniumTempDriftDecorator, HardwareNoiseGateDecorator, HumanHandTrajectoryDecorator,
     IdleSquealDecorator, MainsHumAndNoiseFloorDecorator, MicrophoneCapsuleClipDecorator,
@@ -65,6 +66,9 @@ fn build_all_chains() -> Vec<Box<dyn BlackBoxModel>> {
         Box::new(Chain12FullEndToEndStereoRig::new(
             Chain12RigMode::Parametric16,
         )),
+        Box::new(Chain13TriBandVcaCompressor::new()),
+        Box::new(Chain14TriBandCompDistortion::new()),
+        Box::new(Chain15TubeAmpHeadDi::new()),
     ]
 }
 

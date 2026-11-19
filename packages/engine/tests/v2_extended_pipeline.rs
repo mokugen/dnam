@@ -10,14 +10,13 @@ use arena_builder::{build_v2_extended_container, build_v2_header, populate_v2_ar
 use dnam_engine::container::build_dnam_container_with_cp1;
 use dnam_engine::control::Cp1ContributorSlot;
 #[cfg(target_arch = "aarch64")]
-use dnam_engine::math::{ArmSmeBackend, ArmSve2Backend, NeonBackend};
-use dnam_engine::math::{DefaultMathBackend, MathBackend, ScalarBackend, SimdVec4};
+use dnam_engine::math::{ArmSmeBackend, ArmSve2Backend};
+use dnam_engine::math::{DefaultMathBackend, ScalarBackend};
 use dnam_engine::memory::AlignedFp16Block;
 use dnam_engine::schema::TempoSubdivision;
-use dnam_engine::stages::stage2_cascade::Stage2V2BasisState;
-use dnam_engine::stages::stage2_cascade::conv6::Stage2Backend;
+use dnam_engine::stages::stage2_gru::{V3InterBlockToneSvfParams, V3InterBlockToneSvfState};
 use dnam_engine::stages::{
-    Stage1PreDynamics, Stage2CommutedCascade, Stage4SpatialTank, ToneBasisFilters, WdwDryTapMode,
+    Stage1PreDynamics, Stage4SpatialTank, V3ColdTierModel, V3HotCore, WdwDryTapMode,
 };
 use dnam_engine::{DnamAudioIo, DnamEngine, DynamicDnamEngine, FtzDazGuard, Tier};
 
@@ -27,7 +26,6 @@ fn exercise_backend_full_matrix<B: dnam_engine::engine::EngineBackend>(bytes: &[
     let in_r: Vec<f32> = (0..n).map(|i| 0.35 * ((i as f32) * 0.17).cos()).collect();
     let mut out_l = vec![0.0_f32; n];
     let mut out_r = vec![0.0_f32; n];
-    let mut fb_frames = vec![[0.0_f32; 256]; n];
 
     let mut eng = DnamEngine::<B>::from_bytes(bytes, Tier::Lite, 48_000).unwrap();
     for &sr in &[44_100_u32, 48_000, 96_000] {
@@ -49,14 +47,6 @@ fn exercise_backend_full_matrix<B: dnam_engine::engine::EngineBackend>(bytes: &[
 
             eng.process_block(&in_l, &in_r, &mut out_l, &mut out_r);
             assert!(out_l.iter().all(|v| v.is_finite()));
-            eng.process_block_with_feature_bus(
-                &in_l,
-                &in_r,
-                &mut out_l,
-                &mut out_r,
-                &mut fb_frames,
-            );
-            assert!(fb_frames[n - 1][0].is_finite());
 
             let mut ip_l = in_l.clone();
             let mut ip_r = in_r.clone();
@@ -176,11 +166,11 @@ fn test_v2_multiport_4cm_wdw_mono_reload_and_constructors() {
     assert!(main_l.iter().all(|v| v.is_finite()));
 
     eng.set_stereo_width(1.5);
-    eng.stage_pipeline.stage0.wdw_tap_mode = WdwDryTapMode::PreSpatialCore;
+    eng.stage0_router.wdw_tap_mode = WdwDryTapMode::PreSpatialCore;
     eng.process_block_wdw(&inst_l, &inst_r, &mut main_l, &mut main_r, &mut dry_center);
     assert!(dry_center.iter().all(|v| v.is_finite()));
 
-    eng.stage_pipeline.stage0.wdw_tap_mode = WdwDryTapMode::DirectDry;
+    eng.stage0_router.wdw_tap_mode = WdwDryTapMode::DirectDry;
     eng.process_block_wdw(&inst_l, &inst_r, &mut main_l, &mut main_r, &mut dry_center);
     assert!(main_r.iter().all(|v| v.is_finite()));
 
@@ -273,59 +263,21 @@ fn test_direct_stage1_stage2_conv6_and_stage4_subpaths() {
     s1.retune_op_m_pre_3khz(-2.5, 0.2, true);
     s1.reset();
 
-    // Stage 2 conv6 direct group backends + WH/LTI branches
-    let w24 = [[[0.02_f32; 4]; 4]; 24];
-    let w18: &[[[f32; 4]; 4]; 18] = w24[..18].try_into().unwrap();
-    let w12: &[[[f32; 4]; 4]; 12] = w24[..12].try_into().unwrap();
-    let w6: &[[[f32; 4]; 4]; 6] = w24[..6].try_into().unwrap();
-    let tile = [[0.25_f32; 4]; 4];
-    let taps = [&tile; 6];
-    let b_s = <ScalarBackend as MathBackend>::Vec4::splat(0.1);
-    let b_d = <DefaultMathBackend as MathBackend>::Vec4::splat(0.1);
-    let _ = (
-        <ScalarBackend as Stage2Backend<_>>::conv6_taps_1group(b_s, w6, &taps),
-        <ScalarBackend as Stage2Backend<_>>::conv6_taps_2groups(b_s, w12, &taps),
-        <ScalarBackend as Stage2Backend<_>>::conv6_taps_3groups(b_s, w18, &taps),
-        <ScalarBackend as Stage2Backend<_>>::conv6_taps_4groups(b_s, &w24, &taps),
-        <DefaultMathBackend as Stage2Backend<_>>::conv6_taps_1group(b_d, w6, &taps),
-        <DefaultMathBackend as Stage2Backend<_>>::conv6_taps_2groups(b_d, w12, &taps),
-        <DefaultMathBackend as Stage2Backend<_>>::conv6_taps_3groups(b_d, w18, &taps),
-        <DefaultMathBackend as Stage2Backend<_>>::conv6_taps_4groups(b_d, &w24, &taps),
-    );
-    #[cfg(target_arch = "aarch64")]
-    {
-        let b_n = <NeonBackend as MathBackend>::Vec4::splat(0.1);
-        let b_sv = <ArmSve2Backend as MathBackend>::Vec4::splat(0.1);
-        let b_sm = <ArmSmeBackend as MathBackend>::Vec4::splat(0.1);
-        let _ = (
-            <NeonBackend as Stage2Backend<_>>::conv6_taps_2groups(b_n, w12, &taps),
-            <NeonBackend as Stage2Backend<_>>::conv6_taps_3groups(b_n, w18, &taps),
-            <NeonBackend as Stage2Backend<_>>::conv6_taps_4groups(b_n, &w24, &taps),
-            <ArmSve2Backend as Stage2Backend<_>>::conv6_taps_1group(b_sv, w6, &taps),
-            <ArmSve2Backend as Stage2Backend<_>>::conv6_taps_2groups(b_sv, w12, &taps),
-            <ArmSve2Backend as Stage2Backend<_>>::conv6_taps_3groups(b_sv, w18, &taps),
-            <ArmSve2Backend as Stage2Backend<_>>::conv6_taps_4groups(b_sv, &w24, &taps),
-            <ArmSmeBackend as Stage2Backend<_>>::conv6_taps_1group(b_sm, w6, &taps),
-            <ArmSmeBackend as Stage2Backend<_>>::conv6_taps_2groups(b_sm, w12, &taps),
-            <ArmSmeBackend as Stage2Backend<_>>::conv6_taps_3groups(b_sm, w18, &taps),
-            <ArmSmeBackend as Stage2Backend<_>>::conv6_taps_4groups(b_sm, &w24, &taps),
+    // Stage II v3 Tone SVF & Matryoshka V3HotCore execution paths
+    let mut tone_svf = V3InterBlockToneSvfState::from_cold(&V3InterBlockToneSvfParams::identity());
+    let [tl, tr] = tone_svf.step_stereo(0.2, -0.2);
+    assert!(tl.is_finite() && tr.is_finite());
+
+    for tier in [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra] {
+        let cold = V3ColdTierModel::identity_for_tier(tier, tier as u8 >= 2, false);
+        let mut core_s = V3HotCore::<ScalarBackend>::from_cold_model(&cold);
+        let mut core_d = V3HotCore::<DefaultMathBackend>::from_cold_model(&cold);
+        let [yl, yr] = core_s.step_stereo(0.25, -0.25);
+        let [zl, zr] = core_d.step_stereo(0.25, -0.25);
+        assert!(
+            yl.is_finite() && yr.is_finite() && (yl - zl).abs() < 1e-6 && (yr - zr).abs() < 1e-6
         );
     }
-
-    let mut tone_flt = ToneBasisFilters::default();
-    tone_flt.init_dc_equilibrium(0.1);
-    assert!(tone_flt.step(0.2)[0].is_finite());
-
-    let mut v2b = Stage2V2BasisState::default();
-    v2b.reset();
-
-    let mut s2 = Stage2CommutedCascade::new();
-    s2.load_from_arena(&arena);
-    let out_wh = s2.step_frame_with_branches(0.3, -0.3, 1.5, 0.25, 0.4, 1.1, 4);
-    assert!(out_wh.s2_l.is_finite() && out_wh.ultra_features[0].is_finite());
-    s2.linear_v1a_v1b = true;
-    let out_lti = s2.step_frame_with_branches(0.3, -0.3, 1.5, 0.25, 0.4, 1.1, 4);
-    assert!(out_lti.s2_l.is_finite());
 
     // Stage 4 direct knee / coercive / multi-tier tap paths
     let mut s4 = Stage4SpatialTank::new();

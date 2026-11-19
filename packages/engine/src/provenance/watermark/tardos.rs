@@ -14,24 +14,24 @@ use crate::schema::{DnamError, cold_sqrt_f64};
 
 use super::{max_tiers_for_arena_len, read_f32_le, write_f32_le};
 
-/// Cumulative global float index boundaries `[start, end)` of `stage2_cascade_w` across `Arena 0..3`:
-/// - `Tier 0` (`Lite`): `0..768` at `1_024..4_096`
-/// - `Tier 1` (`Full`): `768..2304` at `11_264..17_408`
-/// - `Tier 2` (`Pro`): `2304..4608` at `22_336..31_552`
-/// - `Tier 3` (`Ultra`): `4608..7680` at `36_224..48_512`
+/// Cumulative global float index boundaries `[start, end)` of non-backbone Tardos carrier
+/// parameters across `v3` `Arena 0..3` (`4,608 / 10,240 / 18,432 / 28,672 B`):
+/// - `Tier 0` (`Lite`): `0..336` at `3_200..4_544` (`320` Role B carriers)
+/// - `Tier 1` (`Full`): `768..1792` at `6_144..10_240` (`+1,008` Role B carriers)
+/// - `Tier 2` (`Pro`): `2304..3120` at `15_168..18_432` (`+800` Role B carriers)
+/// - `Tier 3` (`Ultra`): `4608..5808` at `23_872..28_672` (`+1,184` Role B carriers)
 pub const TARDOS_CASCADE_RANGES: [(usize, usize, usize); 4] = [
-    (0, 768, 1_024),
-    (768, 2_304, 11_264),
-    (2_304, 4_608, 22_336),
-    (4_608, 7_680, 36_224),
+    (0, 336, 3_200),
+    (768, 1_792, 6_144),
+    (2_304, 3_120, 15_168),
+    (4_608, 5_808, 23_872),
 ];
 
 /// Returns `true` if `global_idx` (`0..7680`) belongs to the `64` Role A coordinates
-/// (`word_in_tier < 16` in each tier's `CASCADE_W_BASES[t]`: `0..16`, `768..784`, `2304..2320`, `4608..4624`).
+/// (`word_in_tier < 16` in each tier's `TARDOS_CASCADE_RANGES[t]`: `0..16`, `768..784`, `2304..2320`, `4608..4624`).
 ///
-/// Role A coordinates feed the `48 kHz` Stage II inter-stage `L^{(1)}` / `L^{(2)}` nonlinear coupling
-/// and are strictly excluded from Layer 3 Tardos perturbation (`chips[i] == 0.0`, `accusation_weights[i] == 0.0`,
-/// `epsilon_i == 0.0`).
+/// Role A coordinates feed the anchor/header boundary words and are strictly excluded from Layer 3
+/// Tardos perturbation (`chips[i] == 0.0`, `accusation_weights[i] == 0.0`, `epsilon_i == 0.0`).
 #[inline]
 pub const fn is_role_a_cascade_index(global_idx: usize) -> bool {
     global_idx < 16
@@ -40,8 +40,7 @@ pub const fn is_role_a_cascade_index(global_idx: usize) -> bool {
         || (global_idx >= 4_608 && global_idx < 4_624)
 }
 
-/// Visits the `(global_idx, byte_offset)` of all Stage II commuted nonlinear cascade projection weights
-/// (`stage2_cascade_w`) present in `arena_len`.
+/// Visits the `(global_idx, byte_offset)` of all Tardos carrier weights present in `arena_len`.
 pub(crate) fn for_each_conv_weight_offset_up_to<F: FnMut(usize, usize)>(
     arena_len: usize,
     mut f: F,
@@ -58,19 +57,19 @@ pub(crate) fn for_each_conv_weight_offset_up_to<F: FnMut(usize, usize)>(
     count
 }
 
-/// Maps a Role B `stage2_cascade_w` global float index `global_idx` (`0..7680`) to its `(tier, slot_32, lane_4)`
-/// target in Tier `tier`'s collapsed head weights (`slot_32 = 16 * c + g = (4 * r + q) % 32`).
-/// Returns `None` if `global_idx` is a Role A index (`word_in_tier < 16`) or out of range.
+/// Maps a Role B global float index `global_idx` (`0..7680`) to its `(tier, slot_32, lane_4)`
+/// target (`slot_32 = (4 * r + q) % 32`).
+/// Returns `None` if `global_idx` is a Role A index (`word_in_tier < 16`), unmapped tail index, or out of range.
 #[inline]
 pub const fn role_b_head_slot_for_index(global_idx: usize) -> Option<(usize, usize, usize)> {
-    let (tier, tier_start) = if global_idx < 768 {
-        (0, 0)
-    } else if global_idx < 2_304 {
-        (1, 768)
-    } else if global_idx < 4_608 {
-        (2, 2_304)
-    } else if global_idx < TARDOS_CASCADE_WEIGHTS {
-        (3, 4_608)
+    let (tier, tier_start) = if global_idx < TARDOS_CASCADE_RANGES[0].1 {
+        (0, TARDOS_CASCADE_RANGES[0].0)
+    } else if global_idx >= TARDOS_CASCADE_RANGES[1].0 && global_idx < TARDOS_CASCADE_RANGES[1].1 {
+        (1, TARDOS_CASCADE_RANGES[1].0)
+    } else if global_idx >= TARDOS_CASCADE_RANGES[2].0 && global_idx < TARDOS_CASCADE_RANGES[2].1 {
+        (2, TARDOS_CASCADE_RANGES[2].0)
+    } else if global_idx >= TARDOS_CASCADE_RANGES[3].0 && global_idx < TARDOS_CASCADE_RANGES[3].1 {
+        (3, TARDOS_CASCADE_RANGES[3].0)
     } else {
         return None;
     };
@@ -304,16 +303,11 @@ pub fn apply_tardos_watermark_7680(
     let max_tiers = max_tiers_for_arena_len(arena.len());
     if max_tiers == 0 {
         return Err(DnamError::BufferTooSmall {
-            expected: 10_752,
+            expected: 4_608,
             actual: arena.len(),
         });
     }
-    let needed_chips = match max_tiers {
-        1 => 768,
-        2 => 2_304,
-        3 => 4_608,
-        _ => TARDOS_CASCADE_WEIGHTS,
-    };
+    let needed_chips = TARDOS_CASCADE_RANGES[max_tiers - 1].1;
     if code.len() < needed_chips {
         return Err(DnamError::BufferTooSmall {
             expected: needed_chips,
@@ -347,16 +341,11 @@ pub fn apply_tardos_watermark_7680_envelopes(
     let max_tiers = max_tiers_for_arena_len(arena.len());
     if max_tiers == 0 {
         return Err(DnamError::BufferTooSmall {
-            expected: 10_752,
+            expected: 4_608,
             actual: arena.len(),
         });
     }
-    let needed_chips = match max_tiers {
-        1 => 768,
-        2 => 2_304,
-        3 => 4_608,
-        _ => TARDOS_CASCADE_WEIGHTS,
-    };
+    let needed_chips = TARDOS_CASCADE_RANGES[max_tiers - 1].1;
     if code.len() < needed_chips {
         return Err(DnamError::BufferTooSmall {
             expected: needed_chips,
@@ -382,7 +371,7 @@ pub fn apply_tardos_watermark_7680_envelopes(
 }
 
 /// Computes the symmetric Škorić–Tardos Z-score ($\sigma$) of a suspect `Arena 0..3` (including
-/// tier-stripped containers down to `10,752 B` `Lite`) against `master_arena` and a candidate buyer's `code`:
+/// tier-stripped containers down to `4,608 B` `Lite`) against `master_arena` and a candidate buyer's `code`:
 /// $$Z_j = \frac{1}{\sqrt{\max\!\big(\sum_{i=0}^{N_{\text{prefix}}-1} y_i^2,\, 1\big)}} \sum_{i=0}^{N_{\text{prefix}}-1} U_{j,i} \, y_i, \qquad y_i = \operatorname{sign}_{\text{deadzone}}\!\big(W_i^{(\text{suspect})} - W_i^{(\text{master})},\, 10^{-7}\big)$$
 pub fn score_tardos_watermark_7680(
     master_arena: &[u8],
@@ -393,16 +382,11 @@ pub fn score_tardos_watermark_7680(
     let max_tiers = max_tiers_for_arena_len(shared_len);
     if max_tiers == 0 {
         return Err(DnamError::BufferTooSmall {
-            expected: 10_752,
+            expected: 4_608,
             actual: shared_len,
         });
     }
-    let needed_chips = match max_tiers {
-        1 => 768,
-        2 => 2_304,
-        3 => 4_608,
-        _ => TARDOS_CASCADE_WEIGHTS,
-    };
+    let needed_chips = TARDOS_CASCADE_RANGES[max_tiers - 1].1;
     if code.len() < needed_chips {
         return Err(DnamError::BufferTooSmall {
             expected: needed_chips,
@@ -431,13 +415,10 @@ pub fn score_tardos_watermark_7680(
     Ok(corr / cold_sqrt_f64(active_y2.max(1.0)))
 }
 
-/// Standalone Role B $\leftrightarrow$ `W_head` reciprocal bilinear gauge helper (`Oracle-01`):
-/// Adds `role_b_delta_32` to the first 32 Role B `Vec4` slots (`b = 1..9` at `CASCADE_W_BASES[tier] + 64..576`,
-/// updating Tier `tier`'s runtime multiplier $\mathbf{m}_{t,c,g} \gets \mathbf{m}_{t,c,g} + \boldsymbol{\delta}_{c,g}$)
-/// and reciprocally scales Tier `tier`'s `W_head` slices across all modes (`0..5` in `HEAD_BASES[tier]`,
-/// plus `Ultra` modes `5..8` at `49,408 + tier * 2,048` when `arena.len() >= 64,000`) so that
-/// $\mathbf{m}_{t,c,g} \odot \widetilde{\mathbf{w}}_{t,m,c,g}$ is invariant (`0.000000 ULP` for dyadic
-/// $1 + \delta \in \{0.5, 1.0, 2.0\}$, and `max_audio_diff < 1e-5` for continuous $1 + \delta \in [0.985, 1.015]$).
+/// Standalone Role B reciprocal bilinear gauge helper:
+/// Adds `role_b_delta_32` to the second 32-Vec4 carrier block (`cascade_base + 576..1088`) and
+/// reciprocally scales the paired 32-Vec4 block (`cascade_base + 64..576`) by `sum_before / sum_after`
+/// strictly in-bounds within `TARDOS_CASCADE_RANGES[tier]`.
 pub fn apply_cascade_head_gauge(
     arena: &mut [u8],
     tier: usize,
@@ -446,21 +427,18 @@ pub fn apply_cascade_head_gauge(
     let max_tiers = max_tiers_for_arena_len(arena.len());
     if max_tiers == 0 || tier >= max_tiers {
         return Err(DnamError::BufferTooSmall {
-            expected: 10_752,
+            expected: 4_608,
             actual: arena.len(),
         });
     }
     let cascade_base = TARDOS_CASCADE_RANGES[tier].2;
     let cascade_words = TARDOS_CASCADE_RANGES[tier].1 - TARDOS_CASCADE_RANGES[tier].0;
     let role_b_vec4_count = (cascade_words - 16) / 4;
-    let head_arena_offsets = [4_928_usize, 18_048_usize, 31_936_usize, 57_600_usize];
-    let head_base = head_arena_offsets[tier];
 
     for (s, delta_vec) in role_b_delta_32.iter().enumerate() {
         for lane in 0..4 {
-            // Compute existing Role B sum for (s, lane) before perturbation:
             let mut sum_before = 1.0_f32;
-            let mut v_idx = s;
+            let mut v_idx = 32 + s;
             while v_idx < role_b_vec4_count {
                 let off = cascade_base + 64 + (v_idx * 4 + lane) * 4;
                 sum_before += read_f32_le(arena, off);
@@ -473,25 +451,14 @@ pub fn apply_cascade_head_gauge(
                     "Role B gauge multiplier sum_after must be non-zero".into(),
                 ));
             }
-            // Write delta into the first Role B block for slot `s`:
-            let first_off = cascade_base + 64 + (s * 4 + lane) * 4;
+            let first_off = cascade_base + 576 + (s * 4 + lane) * 4;
             let cur_first = read_f32_le(arena, first_off);
             write_f32_le(arena, first_off, cur_first + delta);
 
             let scale_ratio = sum_before / sum_after;
-            for mode in 0..5 {
-                let w_off = head_base + mode * 512 + (s * 4 + lane) * 4;
-                let w_val = read_f32_le(arena, w_off);
-                write_f32_le(arena, w_off, w_val * scale_ratio);
-            }
-            if max_tiers >= 4 {
-                let ultra_base = 49_408 + tier * 2_048;
-                for m_u in 0..4 {
-                    let w_off = ultra_base + m_u * 512 + (s * 4 + lane) * 4;
-                    let w_val = read_f32_le(arena, w_off);
-                    write_f32_le(arena, w_off, w_val * scale_ratio);
-                }
-            }
+            let paired_off = cascade_base + 64 + (s * 4 + lane) * 4;
+            let paired_val = read_f32_le(arena, paired_off);
+            write_f32_le(arena, paired_off, paired_val * scale_ratio);
         }
     }
     Ok(())

@@ -13,9 +13,9 @@ requirements:
   - REQ-6.2
 adrs:
   - ADR-0007
-  - ADR-0011
   - ADR-0015
   - ADR-0019
+  - ADR-0021
 ---
 
 # Self-Similar 3 kHz Dual-Rate Control Plane & Parametric Control Bus
@@ -179,7 +179,7 @@ $$\mathbf{z}_{\text{ctrl}} = \mathrm{clip}_{\text{trust}}(\mathbf{z}_{\text{raw}
 
 `r[dsp.ctrl.modulators.dynamic]`
 
-At each control boundary, `Op-M[Ctrl]` and `Op-N[Ctrl]` emit the 8-D dynamic modulator vector $\mathbf{m}_{\text{dyn}}[k] = [z_{\mathrm{re},\text{lfo0}}, z_{\mathrm{im},\text{lfo0}}, T_{\text{shape}}(z_{\mathrm{re},\text{lfo0}}), T_{\text{shape}}(z_{\mathrm{re},\text{lfo1}}), e_{\text{low}}, e_{\text{mid}}, e_{\text{high}}, e_{\text{aux}}]^\top \in \mathbb{R}^8$. `Arena 0 [7,488..7,552]` (`control_modulators_and_lanes`) stores `[c_step_0, s_step_0, sigma_drift, rho_drift_train, p_env_0, p_env_1, p_env_2, dither_snr_scale]` at `7,488..7,520` (`sigma_drift: f32` at `7,496..7,500`, `rho_drift_train: f32` at `7,500..7,504`, and `dither_snr_scale: f32` at `7,516..7,520`) followed by `cp1_lanes_dir` at `7,520..7,552`; `live_analog_drift_enabled` defaults to `false` (`set_live_analog_drift(bool)`) and is automatically suppressed when `offline_bounce == true` to guarantee deterministic `0.000000 ULP` runtime, bounce, and training parity unless explicitly enabled for live auditioning.
+At each control boundary, `Op-M[Ctrl]` and `Op-N[Ctrl]` emit the 8-D dynamic modulator vector $\mathbf{m}_{\text{dyn}}[k] = [z_{\mathrm{re},\text{lfo0}}, z_{\mathrm{im},\text{lfo0}}, T_{\text{shape}}(z_{\mathrm{re},\text{lfo0}}), T_{\text{shape}}(z_{\mathrm{re},\text{lfo1}}), e_{\text{low}}, e_{\text{mid}}, e_{\text{high}}, e_{\text{aux}}]^\top \in \mathbb{R}^8$. The `64 B`-aligned `control_modulators_and_lanes` slice in `Arena 0` stores `[c_step_0, s_step_0, sigma_drift, rho_drift_train, p_env_0, p_env_1, p_env_2, dither_snr_scale]` followed by `cp1_lanes_dir`, placed in the trailing `3 kHz` cold section of hot state for L1D cache locality; `live_analog_drift_enabled` defaults to `false` (`set_live_analog_drift(bool)`) and is automatically suppressed when `offline_bounce == true` to guarantee deterministic `0.000000 ULP` runtime, bounce, and training parity unless explicitly enabled for live auditioning.
 
 ### 3.1 Stage Parameter Dispatch Matrix $\mathbf{W}_{\text{ctrl}}$
 
@@ -193,19 +193,19 @@ $$\boldsymbol{\theta}_{\text{stage}}^{\text{Lite..Pro}}[k+1] = \mathbf{W}_{\text
 | `θ_0, θ_1` | Stage 0 Router (Send-Safe) | External loop send gains `g_send,L`, `g_send,R` |
 | `θ_2, θ_3` | Stage I Pre-FX (Send-Safe) | Micro-delay `τ_pre`, pitch shift grain ratio `ν_pitch` |
 | `θ_4` | Stage I Pre-Drive (Send-Safe) | Pre-drive waveshaping boost gain |
-| `θ_5, θ_6` | Stage II Preamp (2.1) | V1A drive scale, tone stack low/high balance |
-| `θ_7, θ_8` | Stage II Power (2.3) | Power amp push-pull drive, supply sag depth |
+| `θ_5, θ_6` | Stage II Matryoshka `GRU` & Tone SVF | `FiLM` gain/shift + Zero-DC `b_n` scale, inter-block 3-band `TPT-SVF` cutoff/mix |
+| `θ_7, θ_8` | Stage II Power / Direct `VarPro` | Power `GRU` block `FiLM` drive, supply/envelope dynamic bias shift |
 | `θ_9, θ_10` | Stage III Cabinet | Kautz modal formant center frequency and shared radial gate `g[k]` |
 | `θ_11` | Stage III Early FIR | Direct early reflection blend gain |
 | `θ_12, θ_13` | Stage IV Spatial Tank | Master delay length `τ_tank`, loop feedback gain `g_loop` |
 | `θ_14` | Stage IV Diffuser | In-buffer Schroeder all-pass diffusion coefficient `a_diff` |
-| `θ_15` | Output Head | Master stereo width factor `α_width` |
+| `θ_15` | Direct Stereo Readout | Master stereo width factor `α_width` |
 
-`r[dsp.ctrl.dispatch.stage-laws]` **Closed-Form Per-Sample Stage Modulation Laws (`ADR-0011`):**
-Each micro-ramped parameter $\theta_i[n]$ (`§3.2`) combines with its base stage parameter and clamps into its certified stability interval (`0 FDIV`, `0 FSQRT`):
+`r[dsp.ctrl.dispatch.stage-laws]` **Closed-Form Per-Sample & `3 kHz` Stage Modulation Laws (`ADR-0021`):**
+Each micro-ramped parameter $\theta_i[n]$ (`§3.2`) combines with its base stage parameter and clamps into its certified stability interval (`0 FDIV`, `0 FSQRT`), while Stage I `Env-SVF` octave-warp coefficients and Stage II `FiLM` / Zero-DC $b_n$ / inter-block `TPT-SVF` coefficients update unconditionally at the `3 kHz` boundary (`0` static `48 kHz` MACs):
 - **Stage 0 Sends ($\theta_0, \theta_1$):** $g_{\text{send},L}[n] = \mathrm{clamp}(g_{\text{send},L,0} + \theta_0[n], 0.0, 2.0)$, $g_{\text{send},R}[n] = \mathrm{clamp}(g_{\text{send},R,0} + \theta_1[n], 0.0, 2.0)$.
-- **Stage I Pre-FX ($\theta_2, \theta_3, \theta_4$):** $\tau_{\text{pre}}[n] = \mathrm{clamp}(\tau_{\text{pre},0} + \theta_2[n], 4.0, D_{\text{eff},\text{pre}})$, $p_{\text{st}}[n] = \mathrm{clamp}(p_{\text{st},0} + 24.0 \cdot \theta_3[n], -24.0, 24.0)$ (evaluated via `ref[dsp.ctrl.math.pitch-profile]`), and $g_{\text{pre}}[n] = \mathrm{clamp}(g_{\text{pre},0} + \theta_4[n], 0.0, 16.0)$.
-- **Stage II Cascade ($\theta_5, \theta_6, \theta_7, \theta_8$):** $g_{\text{v1a}}[n] = \mathrm{clamp}(1.0 + 0.25 \theta_5[n], 0.25, 4.0)$, $\beta_{\text{tone}}[n] = \mathrm{clamp}(0.5 + \theta_6[n], 0.0, 1.0)$, $g_{\text{pwr}}[n] = \mathrm{clamp}(1.0 + 0.25 \theta_7[n], 0.25, 4.0)$, and $\alpha_{\text{sag}}[n] = \mathrm{clamp}(0.2 + 0.1 \theta_8[n], 0.0, 0.8)$.
+- **Stage I `Env-SVF` & Pre-FX ($\theta_2, \theta_3, \theta_4$):** $\tau_{\text{pre}}[n] = \mathrm{clamp}(\tau_{\text{pre},0} + \theta_2[n], 4.0, D_{\text{eff},\text{pre}})$, $p_{\text{st}}[n] = \mathrm{clamp}(p_{\text{st},0} + 24.0 \cdot \theta_3[n], -24.0, 24.0)$ (evaluated via `ref[dsp.ctrl.math.pitch-profile]`), and $g_{\text{pre}}[n] = \mathrm{clamp}(g_{\text{pre},0} + \theta_4[n], 0.0, 16.0)$.
+- **Stage II Matryoshka `GRU` & `TPT-SVF` ($\theta_5, \theta_6, \theta_7, \theta_8$):** `FiLM` gain $\gamma_{\text{film}}[n] = \mathrm{clamp}(1.0 + 0.25 \theta_5[n], 0.25, 4.0)$, inter-block `TPT-SVF` tone balance $\beta_{\text{tone}}[n] = \mathrm{clamp}(0.5 + \theta_6[n], 0.0, 1.0)$, block-2 `FiLM` drive $g_{\text{pwr}}[n] = \mathrm{clamp}(1.0 + 0.25 \theta_7[n], 0.25, 4.0)$, and Zero-DC dynamic shift scale $\alpha_{\text{sag}}[n] = \mathrm{clamp}(0.2 + 0.1 \theta_8[n], 0.0, 0.8)$.
 - **Stage III Cabinet ($\theta_9, \theta_{10}, \theta_{11}$):** $\Delta\theta_{\text{kautz}}[n] = \mathrm{clamp}(\theta_9[n], -\pi/4, \pi/4)$, $g_{\text{kautz}}[n] = \mathrm{clamp}(0.5 + \theta_{10}[n], 0.0, 1.0)$ (`ref[dsp.op-m.stage3.radial-gate]`), and $g_{\text{fir}}[n] = \mathrm{clamp}(1.0 + \theta_{11}[n], 0.0, 2.0)$.
 - **Stage IV Tank & Head ($\theta_{12}, \theta_{13}, \theta_{14}, \theta_{15}$):** $\tau_{\text{tank},m}[n] = \mathrm{clamp}(\tau_{\text{tank},m,0} + \theta_{12}[n], 4.0, D_{\text{eff},\text{tank},m})$, $g_{\text{lin}}[n] = \mathrm{clamp}(g_{\text{lin},0} + \theta_{13}[n], 0.0, \mathtt{0x3F7FBE76})$, $a_{\text{diff}}[n] = \mathrm{clamp}(a_{\text{diff},0} + \theta_{14}[n], -0.75, 0.75)$, and $\alpha_{\text{width}}[n] = \mathrm{clamp}(\alpha_{\text{width},0} + \theta_{15}[n], 0.0, 2.0)$.
 

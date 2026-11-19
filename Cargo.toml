@@ -67,6 +67,45 @@ debug = "line-tables-only"
 [profile.dev.package."*"]
 opt-level = 2
 
+[profile.dev.package.dnam-engine]
+opt-level = 3
+
+[profile.dev.package.dnam-fixtures]
+opt-level = 3
+
+[profile.dev.package.dnam-capture]
+opt-level = 3
+
+[profile.test]
+opt-level = 2
+codegen-units = 16
+
+[profile.test.package.dnam-engine]
+opt-level = 3
+
+[profile.test.package.dnam-fixtures]
+opt-level = 3
+
+[profile.test.package.dnam-capture]
+opt-level = 3
+
+[profile.cov]
+inherits = "dev"
+opt-level = 2
+codegen-units = 16
+debug = "line-tables-only"
+strip = "none"
+incremental = false
+
+[profile.cov.package.dnam-engine]
+opt-level = 3
+
+[profile.cov.package.dnam-fixtures]
+opt-level = 3
+
+[profile.cov.package.dnam-capture]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = "thin"

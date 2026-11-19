@@ -1,9 +1,9 @@
 ---
 id: ADR-0004
 title: "Unclamped 6-Step PolyADAA Rail Crossing, C² Wavefolder & Fixed-Hertz ZOH Bitcrusher"
-status: accepted
+status: superseded
 supersedes: []
-superseded_by: null
+superseded_by: ADR-0021
 specs:
   - docs/specs/dsp/op_n_commuted_cascade.md
 requirements:

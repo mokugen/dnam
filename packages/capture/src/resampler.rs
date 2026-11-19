@@ -49,6 +49,53 @@ pub fn resampled_frame_len(src_len: usize, src_rate_hz: u32, dst_rate_hz: u32) -
         .min(usize::MAX as u128) as usize
 }
 
+fn build_kaiser_half_wing(fc_norm: f64, radius: f64) -> std::sync::Arc<[f64]> {
+    const TABLE_STEPS_PER_UNIT: usize = 512;
+    let table_len = (radius as usize) * TABLE_STEPS_PER_UNIT + 2;
+    let beta = 8.6_f64;
+    let inv_i0_beta = 1.0 / bessel_i0(beta);
+    let mut table = vec![0.0_f64; table_len];
+    for (idx, slot) in table.iter_mut().enumerate() {
+        let u = (idx as f64) / (TABLE_STEPS_PER_UNIT as f64);
+        if u >= radius {
+            *slot = 0.0;
+        } else {
+            let arg = 2.0 * fc_norm * u;
+            let sinc = if arg.abs() < 1.0e-12 {
+                1.0
+            } else {
+                let pix = PI * arg;
+                pix.sin() / pix
+            };
+            let ratio = u / radius;
+            let win = bessel_i0(beta * (1.0 - ratio * ratio).max(0.0).sqrt()) * inv_i0_beta;
+            *slot = 2.0 * fc_norm * sinc * win;
+        }
+    }
+    std::sync::Arc::from(table)
+}
+
+fn cached_kaiser_half_wing(fc_norm: f64, radius: f64) -> std::sync::Arc<[f64]> {
+    type CacheEntry = ((u64, u64), std::sync::Arc<[f64]>);
+    thread_local! {
+        static KAISER_TABLE_CACHE: std::cell::RefCell<Vec<CacheEntry>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+    let key = (fc_norm.to_bits(), radius.to_bits());
+    KAISER_TABLE_CACHE.with(|cell| {
+        let mut cache = cell.borrow_mut();
+        if let Some((_, existing)) = cache.iter().find(|(k, _)| *k == key) {
+            return std::sync::Arc::clone(existing);
+        }
+        let built = build_kaiser_half_wing(fc_norm, radius);
+        if cache.len() >= 8 {
+            cache.remove(0);
+        }
+        cache.push((key, std::sync::Arc::clone(&built)));
+        built
+    })
+}
+
 /// Resamples `signal` from `src_rate_hz` to `dst_rate_hz` using a zero-phase (`0.00`-sample group delay),
 /// partition-of-unity-normalized Kaiser-windowed sinc interpolator ($\beta = 8.6$, `> 85 dB` stopband rejection).
 #[must_use]
@@ -77,29 +124,9 @@ pub fn resample_arbitrary_rate(
     let radius = (64.0 * stretch).ceil().max(32.0);
     let half_support = radius as isize;
 
-    // Precompute symmetric half-wing table h(u) for u in [0, radius] at fine resolution
+    // Precompute (and cache) symmetric half-wing table h(u) for u in [0, radius] at fine resolution
     const TABLE_STEPS_PER_UNIT: usize = 512;
-    let table_len = (radius as usize) * TABLE_STEPS_PER_UNIT + 2;
-    let beta = 8.6_f64;
-    let inv_i0_beta = 1.0 / bessel_i0(beta);
-    let mut table = vec![0.0_f64; table_len];
-    for (idx, slot) in table.iter_mut().enumerate() {
-        let u = (idx as f64) / (TABLE_STEPS_PER_UNIT as f64);
-        if u >= radius {
-            *slot = 0.0;
-        } else {
-            let arg = 2.0 * fc_norm * u;
-            let sinc = if arg.abs() < 1.0e-12 {
-                1.0
-            } else {
-                let pix = PI * arg;
-                pix.sin() / pix
-            };
-            let ratio = u / radius;
-            let win = bessel_i0(beta * (1.0 - ratio * ratio).max(0.0).sqrt()) * inv_i0_beta;
-            *slot = 2.0 * fc_norm * sinc * win;
-        }
-    }
+    let table = cached_kaiser_half_wing(fc_norm, radius);
 
     let clean_src: Vec<f64> = signal.iter().map(|&x| f64::from(sanitize_f32(x))).collect();
     let n_src = clean_src.len() as isize;

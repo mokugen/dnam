@@ -42,13 +42,13 @@ pub struct DnamPreamble {
     pub tensor_arena_offset: u32,
     /// Total retained byte length of tier slices (`% 64 == 0`).
     pub tensor_arena_byte_len: u32,
-    /// Arena-relative end of `Lite` (`tier 0`) in 64B cache lines (`168` $\to$ `10,752 B`).
+    /// Arena-relative end of `Lite` (`tier 0`) in 64B cache lines (`72` $\to$ `4,608 B`).
     pub arena_lite_end_cl: u16,
-    /// Arena-relative end of `Full` (`tier 0..=1`) in 64B cache lines (`349` $\to$ `22,336 B`).
+    /// Arena-relative end of `Full` (`tier 0..=1`) in 64B cache lines (`160` $\to$ `10,240 B`).
     pub arena_full_end_cl: u16,
-    /// Arena-relative end of `Pro` (`tier 0..=2`) in 64B cache lines (`566` $\to$ `36,224 B`).
+    /// Arena-relative end of `Pro` (`tier 0..=2`) in 64B cache lines (`288` $\to$ `18,432 B`).
     pub arena_pro_end_cl: u16,
-    /// Arena-relative end of `Ultra` (`tier 0..=3`) in 64B cache lines (`1,000` $\to$ `64,000 B`).
+    /// Arena-relative end of `Ultra` (`tier 0..=3`) in 64B cache lines (`448` $\to$ `28,672 B`).
     pub arena_ultra_end_cl: u16,
     /// Castagnoli `CRC32C` over `arena[0..arena_offset_lite_end]`.
     pub arena_crc32c_lite: u32,
@@ -442,10 +442,10 @@ mod tests {
         assert_eq!(p.version_major, 2);
         assert_eq!(p.version_minor, 0);
         assert_eq!(p.highest_tier(), Tier::Ultra);
-        assert_eq!(p.arena_lite_end_cl, 168);
-        assert_eq!(p.arena_full_end_cl, 349);
-        assert_eq!(p.arena_pro_end_cl, 566);
-        assert_eq!(p.arena_ultra_end_cl, 1000);
+        assert_eq!(p.arena_lite_end_cl, 72);
+        assert_eq!(p.arena_full_end_cl, 160);
+        assert_eq!(p.arena_pro_end_cl, 288);
+        assert_eq!(p.arena_ultra_end_cl, 448);
         assert_eq!(p.to_bytes()[0..4], DNAM_MAGIC);
 
         p.arena_crc32c_lite = 11;
@@ -456,10 +456,10 @@ mod tests {
         assert_eq!(p.crc32c_for_tier(Tier::Full), 22);
         assert_eq!(p.crc32c_for_tier(Tier::Pro), 33);
         assert_eq!(p.crc32c_for_tier(Tier::Ultra), 44);
-        assert_eq!(p.arena_end_for_tier(Tier::Lite), 168 * 64);
-        assert_eq!(p.arena_end_for_tier(Tier::Full), 349 * 64);
-        assert_eq!(p.arena_end_for_tier(Tier::Pro), 566 * 64);
-        assert_eq!(p.arena_end_for_tier(Tier::Ultra), 1000 * 64);
+        assert_eq!(p.arena_end_for_tier(Tier::Lite), 72 * 64);
+        assert_eq!(p.arena_end_for_tier(Tier::Full), 160 * 64);
+        assert_eq!(p.arena_end_for_tier(Tier::Pro), 288 * 64);
+        assert_eq!(p.arena_end_for_tier(Tier::Ultra), 448 * 64);
 
         // Scan CP1 shared controls until sentinel or CP1 magic
         let mut shared_buf = vec![0u8; 64];

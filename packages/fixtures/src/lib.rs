@@ -496,7 +496,8 @@ pub use chains::{
     Chain03ParallelCleanBlend, Chain04TubeAmpFmv4x12, Chain05PureLtiCabAndRoom,
     Chain06EnvelopeResonantSvf, Chain07StereoChorusAndRotary, Chain08LongBbdEchoAnd30sShimmer,
     Chain09La2aOpticalCompressor, Chain10Oc2OctaveDividerAndRingMod, Chain11BiAmpBassAndOutputIron,
-    Chain12FullEndToEndStereoRig, Chain12RigMode,
+    Chain12FullEndToEndStereoRig, Chain12RigMode, Chain13TriBandVcaCompressor,
+    Chain14TriBandCompDistortion, Chain15TubeAmpHeadDi,
 };
 pub use sim_kernels::{
     DiscreteStateSpace, FftCabinetIrModel, FftConvolver, ImplicitNodalClipper2Node,

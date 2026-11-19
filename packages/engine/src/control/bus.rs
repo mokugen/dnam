@@ -300,29 +300,25 @@ impl<B: MathBackend> ControlBus<B> {
             arena0_bytes,
             crate::stages::weights::PIPE_FLAG_UNIFIED_W_CTRL,
         );
-        self.ensure_control_capacity(num_controls);
-        self.num_controls = num_controls;
-        let table_base = 8_512_usize;
-        if arena0_bytes.len() >= table_base + 512 {
-            for p in 0..8.min(self.num_controls) {
-                let off = table_base + p * 64;
-                let mut desc_bytes = [0u8; 64];
-                desc_bytes.copy_from_slice(&arena0_bytes[off..off + 64]);
-                let desc = ControlClampDescriptor::from_bytes(&desc_bytes);
-                let is_populated = desc.ctrl_kind <= 1
-                    && (desc.safe_max_base > desc.safe_min_base
-                        || desc.scale_norm != 0.0
-                        || desc.active_options_mask != 0);
-                if is_populated {
-                    self.descriptors[p] = desc;
-                }
-            }
-        }
+        let preallocated_cap = self
+            .descriptors
+            .len()
+            .min(self.projections.len())
+            .min(self.raw_values.len())
+            .min(self.clamped_values.len())
+            .min(self.target_u_norm.len())
+            .min(self.current_u_norm.len())
+            .min(self.prev_eval_u_norm.len())
+            .min(self.prev_eval_psi.len())
+            .min(self.active_switch_options.len());
+        self.num_controls = num_controls.min(preallocated_cap);
 
         // Decode inline CP1 contributor slots if Region 4 CP1 stream was not already loaded
         if self.num_contributors == 0
-            && let Ok(inline_count) =
-                decode_cp1_inline_contributors(arena0_bytes, &mut self.contributors)
+            && let Ok(inline_count) = cp1_and_uint::decode_cp1_inline_contributors_static(
+                arena0_bytes,
+                &mut self.contributors,
+            )
             && inline_count > 0
         {
             self.num_contributors = inline_count;
@@ -333,11 +329,11 @@ impl<B: MathBackend> ControlBus<B> {
     }
 
     /// Updates sample-rate-dependent LFO phasor increments and envelope follower poles from `Arena 0`
-    /// (`CL 00..03` at `7,488..7,744` and `CL 48` at `10,560..10,624`) without resetting user control values.
+    /// (`CL 47` at `3,008..3,072` and `ARENA0_RHO_HEAD_OFFSET` at `4,544..4,608`) without resetting user control values.
     pub fn update_sample_rate_params(&mut self, arena0_bytes: &[u8], rho_ctrl: f64) {
         self.anti_zipper_pole =
             crate::schema::cold_pow_f64(DEFAULT_ANTI_ZIPPER_POLE as f64, rho_ctrl) as f32;
-        let global_base = 7_488_usize;
+        let global_base = crate::stages::weights::ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET;
         if arena0_bytes.len() >= global_base + 64 {
             for j in 0..2 {
                 let dphi_off = global_base + j * 4;
@@ -407,12 +403,13 @@ impl<B: MathBackend> ControlBus<B> {
                 0.0
             };
             let mh_off = global_base + 32;
-            let mh_from_table = if arena0_bytes.len() >= 10_564 {
+            let rho_head_off = crate::stages::weights::ARENA0_RHO_HEAD_OFFSET;
+            let mh_from_table = if arena0_bytes.len() >= rho_head_off + 4 {
                 f32::from_le_bytes([
-                    arena0_bytes[10_560],
-                    arena0_bytes[10_561],
-                    arena0_bytes[10_562],
-                    arena0_bytes[10_563],
+                    arena0_bytes[rho_head_off],
+                    arena0_bytes[rho_head_off + 1],
+                    arena0_bytes[rho_head_off + 2],
+                    arena0_bytes[rho_head_off + 3],
                 ])
             } else {
                 0.0
@@ -566,8 +563,8 @@ mod tests {
     #[test]
     fn test_control_bus_tick_lfo_fallback_and_micro_ramps() {
         let _ftz = FtzDazGuard::new();
-        let mut arena = vec![0u8; 64_000];
-        for off in (7_552..8_512).step_by(4) {
+        let mut arena = vec![0u8; crate::stages::weights::ARENA_ULTRA_BYTES];
+        for off in (3_072..3_520).step_by(4) {
             arena[off..off + 4].copy_from_slice(&0.15_f32.to_le_bytes());
         }
 

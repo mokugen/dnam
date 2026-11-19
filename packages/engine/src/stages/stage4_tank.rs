@@ -1,6 +1,11 @@
-//! Stage IV: Unitary Spatial Tank with Givens+Householder Mixing (2,080 B Lite RAM).
+//! Stage IV: Unitary Spatial Tank with Givens+Householder Mixing (`2,080 B` Lite RAM & `v3` FDN).
 //!
 //! Canonical Reference: `docs/specs/dsp/router_and_stages_topology.md` (`ref[dsp.stage4.spatial-tank]`, `ref[dsp.stage4.dc-blocker]`, `ref[dsp.stage4.loop-saturator]`, `ref[dsp.stage4.quiet-feedback-knee]`).
+
+pub mod v3_fdn;
+pub use v3_fdn::{
+    V3_TANK_CAP, V3_TANK_LINES, V3_TANK_RING_STRIDE, V3Stage4TankHot, V3Stage4TankParams,
+};
 
 use crate::math::spec_math::q32_phase_to_phasor;
 use crate::math::{
@@ -1053,11 +1058,13 @@ mod tank_verification_tests {
 
     use std::f64::consts::{PI, TAU};
 
-    use crate::container::ARENA_OFFSET_ULTRA_END;
+    use crate::math::DefaultMathBackend;
     use crate::operators::reference::{
         givens_householder_mix_8ch_f64, givens_householder_mix_16ch_f64, op_t_coercive_step_f64,
     };
-    use crate::stages::{MidSideKroneckerHead, Stage0Router, Stage4SpatialTank, StagePipeline};
+    use crate::stages::{
+        MidSideKroneckerHead, Stage0Router, Stage4SpatialTank, V3ColdTierModel, V3HotCore,
+    };
     use crate::{FtzDazGuard, Tier};
     use proptest::prelude::*;
 
@@ -1241,30 +1248,88 @@ mod tank_verification_tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(32))]
 
-        /// Property test verifying that `StagePipeline` remains finite across all 4 Stage I topologies
-        /// and resets cleanly to DC equilibrium.
+        /// Property test verifying that [`V3HotCore`] remains finite across all tiers and resets
+        /// cleanly to DC equilibrium.
         #[test]
         fn prop_stage_pipeline_finite_and_dc_resettable(
             in_l in -2.0_f32..2.0_f32,
             in_r in -2.0_f32..2.0_f32,
-            topo in 0_u8..4_u8,
+            tier_idx in 0_usize..4_usize,
         ) {
             let _audio = FtzDazGuard::new();
-            let mut pipe = StagePipeline::default();
-            let arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-            pipe.load_from_arena(&arena);
-            pipe.stage1.topology_mode = topo;
-
-            let (s1_l, s1_r) = pipe.stage1.step_stereo(in_l, in_r);
-            let (s2_l, s2_r) = pipe.stage2.step_stereo(s1_l, s1_r);
-            let s3_l = pipe.stage3.step(s2_l, 0.0, &pipe.fir_taps);
-            let s3_r = pipe.stage3_r.step(s2_r, 0.0, &pipe.fir_taps);
-            let (s4_l, s4_r) = pipe.stage4.step_stereo(s3_l, s3_r);
+            let tier = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra][tier_idx];
+            let cold = V3ColdTierModel::identity_for_tier(tier, false, false);
+            let mut core = V3HotCore::<DefaultMathBackend>::from_cold_model(&cold);
+            let [s4_l, s4_r] = core.step_stereo(in_l, in_r);
             prop_assert!(s4_l.is_finite() && s4_r.is_finite());
 
-            pipe.reset_to_dc_equilibrium();
-            let (z_l, z_r) = pipe.stage2.step_stereo(0.0, 0.0);
+            core.reset_to_dc_equilibrium();
+            let [z_l, z_r] = core.step_stereo(0.0, 0.0);
             prop_assert!(z_l.abs() < 1e-7 && z_r.abs() < 1e-7);
         }
+    }
+
+    #[test]
+    fn test_stage4_load_reconfigure_and_multi_tier_taps() {
+        use crate::container::ZohRescaledParams;
+        use crate::stages::weights::{
+            ARENA0_PIPELINE_FLAGS_OFFSET, ARENA0_STAGE4_EXT_OFFSET, PIPE_FLAG_STAGE4_EXT,
+            PIPE_MAGIC_HI,
+        };
+        let _audio = FtzDazGuard::new();
+        let mut tank = Stage4SpatialTank::default();
+        tank.reserve_extended_capacity(4096, 32768);
+        tank.load_from_arena(&[]);
+
+        let mut arena = alloc::vec![0u8; 49_000];
+        let ext_flags = PIPE_MAGIC_HI | PIPE_FLAG_STAGE4_EXT;
+        arena[ARENA0_PIPELINE_FLAGS_OFFSET..ARENA0_PIPELINE_FLAGS_OFFSET + 4]
+            .copy_from_slice(&ext_flags.to_le_bytes());
+        for l in 0..4 {
+            arena[4_672 + l * 4..4_676 + l * 4]
+                .copy_from_slice(&((150 + l * 20) as f32).to_le_bytes());
+            arena[17_792 + l * 4..17_796 + l * 4]
+                .copy_from_slice(&((160 + l * 20) as f32).to_le_bytes());
+            arena[34_496 + l * 4..34_500 + l * 4]
+                .copy_from_slice(&((170 + l * 20) as f32).to_le_bytes());
+            arena[48_896 + l * 4..48_900 + l * 4]
+                .copy_from_slice(&((180 + l * 20) as f32).to_le_bytes());
+        }
+        arena[4_688..4_692].copy_from_slice(&0.8_f32.to_le_bytes());
+        arena[4_692..4_696].copy_from_slice(&1.5_f32.to_le_bytes());
+        arena[4_696..4_700].copy_from_slice(&0.35_f32.to_le_bytes());
+        let b = ARENA0_STAGE4_EXT_OFFSET;
+        arena[b..b + 4].copy_from_slice(&0.5_f32.to_le_bytes());
+        arena[b + 4..b + 8].copy_from_slice(&0.25_f32.to_le_bytes());
+        arena[b + 8..b + 12].copy_from_slice(&128.0_f32.to_le_bytes());
+        arena[b + 12..b + 16].copy_from_slice(&160.0_f32.to_le_bytes());
+        arena[b + 16..b + 20].copy_from_slice(&0.6_f32.to_le_bytes());
+        arena[b + 20..b + 24].copy_from_slice(&0.5_f32.to_le_bytes());
+        arena[b + 24..b + 28].copy_from_slice(&0.4_f32.to_le_bytes());
+        arena[b + 28..b + 32].copy_from_slice(&0.3_f32.to_le_bytes());
+        for l in 0..4 {
+            arena[b + 32 + l * 4..b + 36 + l * 4]
+                .copy_from_slice(&((1_500 + l * 400) as f32).to_le_bytes());
+        }
+        arena[b + 48..b + 52].copy_from_slice(&0.5_f32.to_le_bytes());
+        arena[b + 52..b + 56].copy_from_slice(&0.7_f32.to_le_bytes());
+        arena[b + 56..b + 60].copy_from_slice(&0.1_f32.to_le_bytes());
+        arena[b + 60..b + 64].copy_from_slice(&4.0_f32.to_le_bytes());
+        arena[b + 64..b + 68].copy_from_slice(&1.5_f32.to_le_bytes());
+        tank.load_from_arena(&arena);
+        assert!(tank.ext_active);
+        tank.reconfigure_sample_rate(&ZohRescaledParams::new(48_000, 96_000));
+        tank.set_target_psi(0.45);
+        assert!(tank.eval_quiet_feedback_knee(0.5, 1.0, 0.2).is_finite());
+        assert!(tank.coercive_saturate(1.5).abs() <= 0.985 + 1e-6);
+        let (wl, wr) = tank.step_stereo(0.2, -0.2);
+        assert!(wl.is_finite() && wr.is_finite());
+        let mut fb = [0.0_f32; 256];
+        tank.read_multi_tier_taps_into(1, [0.1; 4], [0.05; 4], &mut fb);
+        tank.read_multi_tier_taps_into(4, [0.1; 4], [0.05; 4], &mut fb);
+        arena[b..b + 4].copy_from_slice(&(-1.0_f32).to_le_bytes());
+        tank.load_from_arena(&arena);
+        tank.read_multi_tier_taps_into(4, [0.1; 4], [0.05; 4], &mut fb);
+        assert_eq!(fb[116], 0.0);
     }
 }

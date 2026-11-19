@@ -167,10 +167,18 @@
       },
       "performance": {
         "noAccumulatingSpread": "error",
-        "noDelete": "error"
+        "noBarrelFile": "error",
+        "noDelete": "error",
+        "noReExportAll": "error"
       },
       "complexity": {
         "noBannedTypes": "error",
+        "noExcessiveCognitiveComplexity": {
+          "level": "error",
+          "options": {
+            "maxAllowedComplexity": 25
+          }
+        },
         "noUselessConstructor": "error",
         "noUselessTernary": "error",
         "noUselessTypeConstraint": "error",
@@ -186,6 +194,7 @@
       "includes": [
         "packages/js/src/browser.ts",
         "packages/js/src/internal/native/wasm.ts",
+        "packages/js/src/internal/native/wasm/**/*.ts",
         "packages/js/src/schema/**/*.ts",
         "packages/js/src/web-audio/**/*.ts",
         "packages/ui/src/**/*.ts",
@@ -237,6 +246,26 @@
         "rules": {
           "suspicious": {
             "noConsole": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": [
+        "packages/js/src/index.ts",
+        "packages/js/src/node.ts",
+        "packages/js/src/browser.ts",
+        "packages/js/src/dsp/index.ts",
+        "packages/js/src/parameters/index.ts",
+        "packages/js/src/provenance/index.ts",
+        "packages/js/src/schema/index.ts",
+        "packages/js/src/tempo/index.ts",
+        "packages/js/src/web-audio/index.ts"
+      ],
+      "linter": {
+        "rules": {
+          "performance": {
+            "noBarrelFile": "off"
           }
         }
       }

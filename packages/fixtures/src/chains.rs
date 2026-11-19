@@ -1,10 +1,10 @@
-//! 12 `4x`-Oversampled Black-Box Physical Musical Signal-Chain Models (`Chain-01..12`),
+//! `15` `4x`-Oversampled Black-Box Physical Musical Signal-Chain Models (`Chain-01..15`),
 //! supporting configurable device sample rates (`8..192 kHz`) and bit depths
 //! (`Int12`, `Int16`, `Int24`, `Int32`, `Float32`), organized into category and per-chain submodules:
-//! - [`drives`]: [`Chain01SymmetricOd`], [`Chain02GatedAsymmetricFuzz`], [`Chain03ParallelCleanBlend`]
-//! - [`amps_and_cabs`]: [`Chain04TubeAmpFmv4x12`], [`Chain05PureLtiCabAndRoom`]
+//! - [`drives`]: [`Chain01SymmetricOd`], [`Chain02GatedAsymmetricFuzz`], [`Chain03ParallelCleanBlend`], [`Chain14TriBandCompDistortion`]
+//! - [`amps_and_cabs`]: [`Chain04TubeAmpFmv4x12`], [`Chain05PureLtiCabAndRoom`], [`Chain15TubeAmpHeadDi`]
 //! - [`mod_and_spatial`]: [`Chain06EnvelopeResonantSvf`], [`Chain07StereoChorusAndRotary`], [`Chain08LongBbdEchoAnd30sShimmer`]
-//! - [`dynamics_and_pitch`]: [`Chain09La2aOpticalCompressor`], [`Chain10Oc2OctaveDividerAndRingMod`]
+//! - [`dynamics_and_pitch`]: [`Chain09La2aOpticalCompressor`], [`Chain10Oc2OctaveDividerAndRingMod`], [`Chain13TriBandVcaCompressor`]
 //! - [`rigs`]: [`Chain11BiAmpBassAndOutputIron`], [`Chain12FullEndToEndStereoRig`]
 
 #![forbid(unsafe_code)]
@@ -15,9 +15,14 @@ pub mod dynamics_and_pitch;
 pub mod mod_and_spatial;
 pub mod rigs;
 
-pub use amps_and_cabs::{Chain04TubeAmpFmv4x12, Chain05PureLtiCabAndRoom};
-pub use drives::{Chain01SymmetricOd, Chain02GatedAsymmetricFuzz, Chain03ParallelCleanBlend};
-pub use dynamics_and_pitch::{Chain09La2aOpticalCompressor, Chain10Oc2OctaveDividerAndRingMod};
+pub use amps_and_cabs::{Chain04TubeAmpFmv4x12, Chain05PureLtiCabAndRoom, Chain15TubeAmpHeadDi};
+pub use drives::{
+    Chain01SymmetricOd, Chain02GatedAsymmetricFuzz, Chain03ParallelCleanBlend,
+    Chain14TriBandCompDistortion,
+};
+pub use dynamics_and_pitch::{
+    Chain09La2aOpticalCompressor, Chain10Oc2OctaveDividerAndRingMod, Chain13TriBandVcaCompressor,
+};
 pub use mod_and_spatial::{
     CANONICAL_SUBDIVISION_RATIOS, Chain06EnvelopeResonantSvf, Chain07StereoChorusAndRotary,
     Chain08LongBbdEchoAnd30sShimmer,
@@ -85,25 +90,134 @@ pub(crate) fn write_stereo_output(outputs: &mut [f32], yl: f32, yr: f32) {
     }
 }
 
-/// 4th-order Butterworth damping factors `2 * R_k = 2 * sin((2k - 1) * pi / 8)` for upsampler TPT SVF.
-const BUTTER4_TWO_R: [f64; 2] = [0.765_366_864_730_179_6, 1.847_759_065_022_573_5];
+const fn const_sin_cos_f64(x: f64) -> (f64, f64) {
+    let k_real = x * core::f64::consts::FRAC_2_PI;
+    let k = if k_real >= 0.0 {
+        (k_real + 0.5) as i64
+    } else {
+        (k_real - 0.5) as i64
+    };
+    let r = x - (k as f64) * core::f64::consts::FRAC_PI_2;
+    let r2 = r * r;
+    let mut sin_term = r;
+    let mut sin_sum = r;
+    let mut n = 1_u32;
+    while n <= 10 {
+        sin_term = -sin_term * r2 / ((2 * n) * (2 * n + 1)) as f64;
+        sin_sum += sin_term;
+        n += 1;
+    }
+    let mut cos_term = 1.0_f64;
+    let mut cos_sum = 1.0_f64;
+    let mut m = 1_u32;
+    while m <= 10 {
+        cos_term = -cos_term * r2 / ((2 * m - 1) * (2 * m)) as f64;
+        cos_sum += cos_term;
+        m += 1;
+    }
+    match k & 3 {
+        0 => (sin_sum, cos_sum),
+        1 => (cos_sum, -sin_sum),
+        2 => (-sin_sum, -cos_sum),
+        _ => (-cos_sum, sin_sum),
+    }
+}
 
-/// 8th-order Butterworth damping factors `2 * R_k = 2 * sin((2k - 1) * pi / 16)` for decimator TPT SVF.
+const fn const_tan_f64(x: f64) -> f64 {
+    let (s, c) = const_sin_cos_f64(x);
+    s / c
+}
+
+const fn const_butter_two_r(order: usize, k: usize) -> f64 {
+    let angle = ((2 * k + 1) as f64) * PI / ((2 * order) as f64);
+    2.0 * const_sin_cos_f64(angle).0
+}
+
+/// 4th-order Butterworth damping factors `2 * sin((2k + 1) * pi / 8)` derived at compile time.
+const BUTTER4_TWO_R: [f64; 2] = [const_butter_two_r(4, 0), const_butter_two_r(4, 1)];
+
+/// 8th-order Butterworth damping factors `2 * sin((2k + 1) * pi / 16)` derived at compile time.
 const BUTTER8_TWO_R: [f64; 4] = [
-    0.390_180_644_032_256_53,
-    1.111_140_466_039_204_4,
-    1.662_939_224_605_090_7,
-    1.961_570_560_806_460_9,
+    const_butter_two_r(8, 0),
+    const_butter_two_r(8, 1),
+    const_butter_two_r(8, 2),
+    const_butter_two_r(8, 3),
 ];
 
-/// Prewarped relative cutoff `g = tan(pi * (0.475 * fs) / (4 * fs)) = tan(pi * 0.475 / 4)` giving
-/// `< 0.35 dB` roundtrip passband flatness up to `0.375 * fs` (`18 kHz` @ `48 kHz`, `36 kHz` @ `96 kHz`)
-/// and exact zero DC imaging ripple when combined with pre-emphasized ZOH hold.
-const AA_SVF_G: f64 = 0.391_428_729_752_362_6;
+/// Prewarped relative cutoff `g = tan(pi * 0.475 / 4)` derived at compile time for `< 0.35 dB`
+/// passband flatness up to `0.375 * fs` and exact zero DC imaging ripple.
+const AA_SVF_G: f64 = const_tan_f64(PI * 0.475 / 4.0);
+
+/// Converts a default physical control value in `[min_phys, max_phys]` into normalized `[-1.0, 1.0]`
+/// at compile time (`ref[repo.code.constant-eval-and-derivations]`).
+pub(crate) const fn const_phys_to_norm(phys: f32, min_phys: f32, max_phys: f32) -> f32 {
+    let span = max_phys - min_phys;
+    let t = (phys - min_phys) / span;
+    let t_clamped = if t < 0.0 {
+        0.0
+    } else if t > 1.0 {
+        1.0
+    } else {
+        t
+    };
+    2.0 * t_clamped - 1.0
+}
+
+const _: () = assert!(BUTTER4_TWO_R[0] < BUTTER4_TWO_R[1] && BUTTER4_TWO_R[1] < 2.0);
+const _: () = assert!(AA_SVF_G > 0.39 && AA_SVF_G < 0.40);
+const _: () = assert!(const_phys_to_norm(250.0, 50.0, 800.0) > -0.5);
+const _: () = assert!(const_phys_to_norm(250.0, 50.0, 800.0) < -0.4);
 
 #[inline]
-fn flush_subnormal_f64(x: f64) -> f64 {
+pub(crate) fn flush_subnormal_f64(x: f64) -> f64 {
     if x.abs() < f64::MIN_POSITIVE { 0.0 } else { x }
+}
+
+/// Phase-coherent 4th-order Linkwitz–Riley (`LR4`) TPT-SVF crossover splitting a signal into
+/// `(lp4, hp4)` whose direct sum `(lp4 + hp4)` maintains unity all-pass magnitude (`0.00 dB` ripple).
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TptLr4Crossover2 {
+    lp_st: [[f64; 2]; 2],
+    hp_st: [[f64; 2]; 2],
+}
+
+impl TptLr4Crossover2 {
+    pub(crate) fn reset(&mut self) {
+        self.lp_st = [[0.0; 2]; 2];
+        self.hp_st = [[0.0; 2]; 2];
+    }
+
+    #[inline]
+    pub(crate) fn step(&mut self, x: f64, fc_hz: f64, fs_hz: f64) -> (f64, f64) {
+        let g = (PI * fc_hz.clamp(20.0, 0.42 * fs_hz) / fs_hz).tan();
+        let k = core::f64::consts::SQRT_2;
+        let a1 = 1.0 / (1.0 + g * (g + k));
+        let a2 = g * a1;
+        let a3 = g * a2;
+
+        let mut lp = x;
+        for st in &mut self.lp_st {
+            let v3 = lp - st[1];
+            let v1 = a1 * st[0] + a2 * v3;
+            let v2 = st[1] + a2 * st[0] + a3 * v3;
+            st[0] = flush_subnormal_f64(2.0 * v1 - st[0]);
+            st[1] = flush_subnormal_f64(2.0 * v2 - st[1]);
+            lp = flush_subnormal_f64(v2);
+        }
+
+        let mut hp = x;
+        for st in &mut self.hp_st {
+            let v3 = hp - st[1];
+            let v1 = a1 * st[0] + a2 * v3;
+            let v2 = st[1] + a2 * st[0] + a3 * v3;
+            let hp_out = hp - k * v1 - v2;
+            st[0] = flush_subnormal_f64(2.0 * v1 - st[0]);
+            st[1] = flush_subnormal_f64(2.0 * v2 - st[1]);
+            hp = flush_subnormal_f64(hp_out);
+        }
+
+        (lp, hp)
+    }
 }
 
 #[inline]
@@ -248,5 +362,9 @@ mod tests {
         os.reset();
         let after_reset = os.process_frame_4x(0.0, 0.0, |_, ul, ur| [ul, ur]);
         assert_eq!(after_reset, [0.0, 0.0]);
+
+        let mut xover = TptLr4Crossover2::default();
+        assert_eq!(xover.step(0.0, 500.0, 48_000.0), (0.0, 0.0));
+        xover.reset();
     }
 }

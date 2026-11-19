@@ -75,59 +75,63 @@ export interface ModelHeader {
   readonly tensorDirectory: Readonly<Record<string, TensorSliceEntry>>;
 }
 
+function setDefaultIfMissing(rec: Record<string, unknown>, key: string, value: unknown): void {
+  if (!(key in rec)) {
+    rec[key] = value;
+  }
+}
+
+function normalizeMetadataCamel(meta: unknown): void {
+  if (meta === null || typeof meta !== "object") {
+    return;
+  }
+  const mRec = meta as Record<string, unknown>;
+  setDefaultIfMissing(mRec, "distributionPolicy", null);
+  const sigs = mRec["signatures"];
+  if (sigs === null || typeof sigs !== "object") {
+    return;
+  }
+  const sigsRec = sigs as Record<string, unknown>;
+  setDefaultIfMissing(sigsRec, "tierArenaSha256", null);
+  const rcpt = sigsRec["marketplaceReceipt"];
+  if (rcpt !== null && typeof rcpt === "object") {
+    setDefaultIfMissing(rcpt as Record<string, unknown>, "buyerTierArenaSha256", null);
+  }
+}
+
+function normalizeCalibrationCamel(calRec: Record<string, unknown>): void {
+  setDefaultIfMissing(calRec, "lobattoPhysicalAnchors", null);
+  setDefaultIfMissing(calRec, "conditionalPhysicalAnchors", {});
+  setDefaultIfMissing(calRec, "tempoSyncDefaultSubdivision", null);
+}
+
+function normalizeControlsCamel(ctrls: unknown): void {
+  if (!Array.isArray(ctrls)) {
+    return;
+  }
+  for (const ctrl of ctrls) {
+    if (ctrl === null || typeof ctrl !== "object") {
+      continue;
+    }
+    const cRec = ctrl as Record<string, unknown>;
+    if (!("calibration" in cRec) || cRec["calibration"] === null) {
+      cRec["calibration"] = null;
+    } else if (typeof cRec["calibration"] === "object") {
+      normalizeCalibrationCamel(cRec["calibration"] as Record<string, unknown>);
+    }
+  }
+}
+
 function normalizeOptionalNullableFields(camel: Record<string, unknown>): void {
-  const meta = camel["metadata"];
-  if (meta !== null && typeof meta === "object") {
-    const mRec = meta as Record<string, unknown>;
-    if (!("distributionPolicy" in mRec)) {
-      mRec["distributionPolicy"] = null;
-    }
-    const sigs = mRec["signatures"];
-    if (sigs !== null && typeof sigs === "object") {
-      const sigsRec = sigs as Record<string, unknown>;
-      if (!("tierArenaSha256" in sigsRec)) {
-        sigsRec["tierArenaSha256"] = null;
-      }
-      const rcpt = sigsRec["marketplaceReceipt"];
-      if (rcpt !== null && typeof rcpt === "object") {
-        const rRec = rcpt as Record<string, unknown>;
-        if (!("buyerTierArenaSha256" in rRec)) {
-          rRec["buyerTierArenaSha256"] = null;
-        }
-      }
-    }
-  }
-  const ctrls = camel["controlsSchema"];
-  if (Array.isArray(ctrls)) {
-    for (const ctrl of ctrls) {
-      if (ctrl !== null && typeof ctrl === "object") {
-        const cRec = ctrl as Record<string, unknown>;
-        if (!("calibration" in cRec) || cRec["calibration"] === null) {
-          cRec["calibration"] = null;
-        } else if (typeof cRec["calibration"] === "object") {
-          const calRec = cRec["calibration"] as Record<string, unknown>;
-          if (!("lobattoPhysicalAnchors" in calRec)) {
-            calRec["lobattoPhysicalAnchors"] = null;
-          }
-          if (!("conditionalPhysicalAnchors" in calRec)) {
-            calRec["conditionalPhysicalAnchors"] = {};
-          }
-          if (!("tempoSyncDefaultSubdivision" in calRec)) {
-            calRec["tempoSyncDefaultSubdivision"] = null;
-          }
-        }
-      }
-    }
-  }
+  normalizeMetadataCamel(camel["metadata"]);
+  normalizeControlsCamel(camel["controlsSchema"]);
   const tdir = camel["tensorDirectory"];
   if (tdir !== null && typeof tdir === "object") {
     for (const sl of Object.values(tdir as Record<string, unknown>)) {
       if (sl !== null && typeof sl === "object") {
         const slRec = sl as Record<string, unknown>;
         for (const ok of ["packing", "featureDim", "packedLen", "shape"]) {
-          if (!(ok in slRec)) {
-            slRec[ok] = null;
-          }
+          setDefaultIfMissing(slRec, ok, null);
         }
       }
     }

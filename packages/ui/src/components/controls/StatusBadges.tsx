@@ -1,6 +1,6 @@
 import { Cpu, ShieldAlert, ShieldCheck } from "lucide-react";
 import type { DnamBackendAcceleration } from "../../host/types.js";
-import { Badge } from "../ui/badge.js";
+import { Badge } from "../base/badge.js";
 
 export interface AccelerationBadgeProps {
   readonly backend: DnamBackendAcceleration;

@@ -30,12 +30,13 @@ pub fn extract_structural_hash_224d(arena: &[u8]) -> Result<[f64; STRUCTURAL_HAS
     let max_tiers = max_tiers_for_arena_len(arena.len());
     if max_tiers == 0 {
         return Err(DnamError::BufferTooSmall {
-            expected: 10_752,
+            expected: 4_608,
             actual: arena.len(),
         });
     }
     let mut vec224 = [0.0_f64; STRUCTURAL_HASH_DIM];
-    let head_arena_offsets = [4_928_usize, 18_048_usize, 31_936_usize, 57_600_usize];
+    let readout_bases = [2_688_usize, 6_144_usize, 15_168_usize, 20_608_usize];
+    let readout_seg_floats = [20_usize, 24, 28, 32];
 
     for tier in 0..max_tiers {
         let t_base = tier * STRUCTURAL_HASH_TIER_DIM;
@@ -60,23 +61,29 @@ pub fn extract_structural_hash_224d(arena: &[u8]) -> Result<[f64; STRUCTURAL_HAS
             }
         }
 
-        // 4 Stage IV Spatial Tank delay invariants for this tier
+        // 4 Stage IV Spatial Tank delay invariants for this tier (`u32` lengths or `f32` test values)
         let delay_base = match tier {
-            0 => 4_672_usize,
-            1 => 17_792_usize,
-            2 => 34_496_usize,
-            _ => 48_896_usize,
+            0 => 2_624_usize,
+            1 => 6_080_usize,
+            2 => 15_104_usize,
+            _ => 20_480_usize,
         };
         for lane in 0..4 {
-            vec224[t_base + 48 + lane] = read_f32_le(arena, delay_base + lane * 4) as f64;
+            let bits = crate::stages::weights::read_u32_le(arena, delay_base + lane * 4);
+            vec224[t_base + 48 + lane] = if (1..=16_384).contains(&bits) {
+                bits as f64
+            } else {
+                f32::from_bits(bits) as f64
+            };
         }
 
-        // 4 Base stereo head W_head,0 energy norms for this tier (32 floats per segment × 4 segments = 128 floats)
-        let head_base = head_arena_offsets[tier];
+        // 4 Direct Readout energy norms for this tier (`4 * [20, 24, 28, 32]` floats = `320..512 B`)
+        let ro_base = readout_bases[tier];
+        let seg_len = readout_seg_floats[tier];
         for seg in 0..4 {
             let mut energy = 0.0_f64;
-            for i in 0..32 {
-                let v = read_f32_le(arena, head_base + (seg * 32 + i) * 4) as f64;
+            for i in 0..seg_len {
+                let v = read_f32_le(arena, ro_base + (seg * seg_len + i) * 4) as f64;
                 energy += v * v;
             }
             vec224[t_base + 52 + seg] = energy;

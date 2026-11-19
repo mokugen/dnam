@@ -20,11 +20,11 @@ requirements:
 adrs:
   - ADR-0002
   - ADR-0010
-  - ADR-0011
   - ADR-0013
   - ADR-0015
   - ADR-0018
   - ADR-0019
+  - ADR-0021
 ---
 
 # TypeScript SDK (`@dnam-project/dnam`): Idiomatic TypeScript 7 Interface, Dual-Target N-API v10 + WASM SIMD128 Runtime & WebAudio Contract
@@ -65,15 +65,15 @@ flowchart LR
     RNapi & RWasm --> RCore
 ```
 
-1. **Package Name & Feature Subpaths:** The TypeScript SDK is published as `@dnam-project/dnam` (`packages/js/`) and organized into kebab-case feature directories under `src/`: `model/`, `engine/`, `parameters/`, `tempo/`, `schema/`, `provenance/`, `dsp/`, `web-audio/`, and private `internal/`.
-2. **Modern Rust 2018+ Module Layout:** `packages/js/rust/` uses the `foo.rs` + `foo/bar.rs` module layout with zero `mod.rs` files (`ref[repo.docs.spec-rules-and-adrs]`), separating target-agnostic engine logic (`rust/core.rs` + `rust/core/*`) from the thin `cfg(not(target_arch = "wasm32"))` N-API v10 adapter (`rust/napi.rs`) and `cfg(target_arch = "wasm32")` raw `extern "C"` WASM adapter (`rust/wasm.rs`).
+1. **Package Name, Hierarchical Feature Submodules & Direct Leaf Imports (`ref[repo.code.modular-decomposition-and-tests]`):** The TypeScript SDK is published as `@dnam-project/dnam` (`packages/js/`) and organized into kebab-case feature directories under `src/`: `model/`, `engine/`, `parameters/`, `tempo/`, `schema/`, `provenance/`, `dsp/`, `web-audio/`, and private `internal/`. Route all intra-package imports directly to concrete leaf modules (`../schema/header.js`, `../engine/engine.js`) with zero non-exported internal barrel `index.ts` files (`model/`, `engine/`, `internal/native/{napi,wasm}/`), and decompose large TypeScript drivers (`src/internal/native/napi.ts` + `napi/*.ts`, `src/internal/native/wasm.ts` + `wasm/*.ts`) and domain modules into hierarchical child submodules (`< 900` LOC ceiling), co-locating unit/`fast-check` tests (`*.test.ts`, `*.browser.test.ts`) beside source modules and cross-domain suites in `tests/integration/`.
+2. **Modern Rust 2018+ Module Layout:** `packages/js/rust/` uses the `foo.rs` + `foo/bar.rs` module layout with zero `mod.rs` files (`ref[repo.docs.spec-rules-and-adrs]`), separating target-agnostic engine logic (`rust/core.rs` + `rust/core/*`) from the thin `cfg(not(target_arch = "wasm32"))` N-API v10 adapter (`rust/napi.rs` + `rust/napi/*`) and `cfg(target_arch = "wasm32")` raw `extern "C"` WASM adapter (`rust/wasm.rs` + `rust/wasm/*`).
 3. **Private Native Seam:** `src/internal/` is strictly internal; neither `NativeDriver` nor any raw N-API/WASM handle symbol may be exported from any public subpath.
 
 ### 1.2 Curated Subpath Exports & Static Typing (`TypeScript 7` Strict)
 
 `r[sdk.ts.layout.curated-exports]`
 
-1. **Explicit Named Exports Only:** Every public entrypoint (`index.ts`, `node.ts`, `browser.ts`, `parameters/index.ts`, `tempo/index.ts`, `schema/index.ts`, `provenance/index.ts`, `dsp/index.ts`, `web-audio/index.ts`) uses explicit named exports (`export { ... }`) with zero wildcard re-exports (`export *`) and zero `default` exports.
+1. **Explicit Named Exports Only & Entrypoint-Restricted Barrels:** Biome's `lint/performance/noBarrelFile` and `lint/performance/noReExportAll` forbid wildcard re-exports (`export *`) and `default` exports across the entire repository and restrict explicit named re-exports (`export { ... }`) strictly to the declared `package.json` `"exports"` entrypoints (`index.ts`, `node.ts`, `browser.ts`, `parameters/index.ts`, `tempo/index.ts`, `schema/index.ts`, `provenance/index.ts`, `dsp/index.ts`, `web-audio/index.ts`).
 2. **TypeScript 7 Strictness & Zero `any`:** The package compiles cleanly under TypeScript `7.0+` with `strict: true`, `noUncheckedIndexedAccess: true`, `exactOptionalPropertyTypes: true`, and `verbatimModuleSyntax: true`, with zero `any` types or non-null assertions (`!`, `ref[repo.code.type-safety-and-imports]`).
 
 ### 1.3 Enforced Layered Dependency Direction & Runtime Isolation
@@ -82,7 +82,7 @@ flowchart LR
 
 1. **Acyclic Feature Layering:** Internal imports follow the strict one-way hierarchy:
    `errors.ts` / `types.ts` $\rightarrow$ `schema/` $\rightarrow$ `internal/` $\rightarrow$ `model/` $\rightarrow$ `parameters/` & `tempo/` $\rightarrow$ `engine/` $\rightarrow$ `web-audio/`, with `provenance/` depending on `model/` and `dsp/` depending only on `internal/` and `errors.ts`.
-2. **Zero Runtime Dependencies & Browser / `AudioWorkletGlobalScope` Isolation:** `@dnam-project/dnam` has zero runtime npm dependencies (`"dependencies"` is omitted). `src/browser.ts`, `src/internal/native/wasm.ts`, `src/schema/**/*.ts`, and `src/web-audio/**/*.ts` must never import `node:*` built-in modules, and `src/web-audio/processor.ts` + `src/web-audio/shared-state.ts` must remain 100% self-contained for `AudioWorkletGlobalScope`.
+2. **Zero Runtime Dependencies & Browser / `AudioWorkletGlobalScope` Isolation:** `@dnam-project/dnam` has zero runtime npm dependencies (`"dependencies"` is omitted). `src/browser.ts`, `src/internal/native/wasm.ts`, `src/internal/native/wasm/**/*.ts`, `src/schema/**/*.ts`, and `src/web-audio/**/*.ts` must never import `node:*` built-in modules, and `src/web-audio/processor.ts` + `src/web-audio/shared-state.ts` must remain 100% self-contained for `AudioWorkletGlobalScope`.
 
 ---
 
@@ -264,7 +264,7 @@ flowchart LR
    - To achieve fast parallel WASM compilation (`~10.4 s` Rust compile + `~11.7 s` Binaryen pass) and compact binary size (`2.2 MB` `dist/wasm/release/dnam.wasm`) while maximizing L1 instruction-cache (`L1i`) locality, `[profile.release]` and `[profile.profiling]` use `opt-level = 3`, `lto = "thin"`, `codegen-units = 16`, and `panic = "abort"`, post-processed by Binaryen `wasm-opt -O1 --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals`; `DnamEngine::step_frame_tora`, `step_frame_4x_tora`, `step_frame_4port_tora`, `step_frame_4x_4port_tora`, `step_control_tick_3khz`, and `refresh_collapsed_head_weights` use `#[inline(never)]` so each backend compiles a single L1i-resident frame kernel instead of duplicating 20 inlined copies across block entrypoints, and `DnamJsonHeader` / `DnamCkptHeader` expose non-generic `#[inline(never)]` `from_json_slice` / `to_json_vec` entrypoints to prevent cross-CGU `serde_json` monomorphization bloat.
    - At `48 kHz` stereo (`128`-frame WebAudio quantum = `2,666.67 us` real-time budget), both `N-API v10` (`21.73 us` `lite` / `25.40 us` `full` / `28.03 us` `pro` / `34.32 us` `ultra` mean in `js:profile`; `21.2 us`–`33.8 us` in `js:bench`, `77.7x–122.7x` real-time) and `WASM SIMD128` (`31.55 us` `lite` / `37.66 us` `full` / `42.87 us` `pro` / `49.05 us` `ultra` mean in `js:profile`; `30.6 us`–`48.4 us` in `js:bench` across Node.js and Chromium bounded/`SharedArrayBuffer` `WebAssembly.Memory`, `54.4x–84.5x` real-time) in-place `engine.process(input, { output })` must execute in `< 250 us/block` (`> 10x` real-time headroom) with zero JS heap allocations on the in-place path:
 
-| Target & Memory Mode | `lite` (`64-D`) | `full` (`128-D`) | `pro` (`192-D`) | `ultra` (`256-D`) | Real-Time Speedup (`lite`..`ultra`) |
+| Target & Memory Mode | `lite` (`[1,1,1] @ 1x`) | `full` (`[2,1,1] @ 1x`) | `pro` (`[2,2,1] @ 2x`) | `ultra` (`[3,2,1] @ 2x`) | Real-Time Speedup (`lite`..`ultra`) |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Node.js 26 N-API v10 (`neon`, `js:profile` / `js:bench`)** | `21.73 us` / `21.2 us` | `25.40 us` / `25.2 us` | `28.03 us` / `28.1 us` | `34.32 us` / `33.8 us` | **`122.7x – 77.7x`** (`0.81% – 1.29%` CPU) |
 | **Node.js 26 WASM SIMD128 (`v128`, `js:profile` / `js:bench`)** | `31.55 us` / `30.6 us` | `37.66 us` / `37.4 us` | `42.87 us` / `42.0 us` | `49.05 us` / `48.4 us` | **`84.5x – 54.4x`** (`1.18% – 1.84%` CPU) |

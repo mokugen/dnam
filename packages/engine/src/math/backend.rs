@@ -2,8 +2,8 @@
 //! and core division-free math primitives.
 //!
 //! Higher-level domain modules define their own `<Domain>Backend` traits in their respective
-//! modules (`OpMBackend`, `OpNBackend`, `OpTBackend`, `Stage2Backend`, `Stage3Backend`,
-//! `FeatureBusBackend`), keeping the dependency DAG strictly one-way (`engine -> stages -> operators -> math`).
+//! modules (`OpMBackend`, `OpNBackend`, `OpTBackend`, `Stage2Backend`, `Stage3Backend`),
+//! keeping the dependency DAG strictly one-way (`engine -> stages -> operators -> math`).
 
 use super::{BackendKind, algebraic_unit_rotor, f32_to_fp16, fp16_to_f32};
 use crate::math::crc32c::Crc32cBackend;
@@ -82,6 +82,20 @@ pub trait SimdVec4: Copy + Clone + Send + Sync + 'static {
     fn splat_pair(a: f32, b: f32) -> Self {
         Self::from_array([a, b, a, b])
     }
+
+    /// Duplicate lanes `[0, 1]` across `[0, 1, 2, 3]`.
+    #[inline(always)]
+    fn dup_low_pair(self) -> Self {
+        let a = self.to_array();
+        Self::from_array([a[0], a[1], a[0], a[1]])
+    }
+
+    /// Duplicate lanes `[2, 3]` across `[0, 1, 2, 3]`.
+    #[inline(always)]
+    fn dup_high_pair(self) -> Self {
+        let a = self.to_array();
+        Self::from_array([a[2], a[3], a[2], a[3]])
+    }
     /// Loads 4 `f32` lanes from a slice.
     fn load(src: &[f32; 4]) -> Self;
     /// Stores 4 `f32` lanes into a slice.
@@ -99,6 +113,12 @@ pub trait SimdVec4: Copy + Clone + Send + Sync + 'static {
     fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
         const { assert!(LANE < 4) };
         self.fma(a, Self::splat(v.to_array()[LANE]))
+    }
+    /// Multiplies `self` by an indexed scalar lane broadcast (`self * v[LANE]`, `LANE < 4`).
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        const { assert!(LANE < 4) };
+        self.mul(Self::splat(v.to_array()[LANE]))
     }
     /// Fused multiply-subtract (`self - a * b`).
     fn fms(self, a: Self, b: Self) -> Self;
@@ -136,6 +156,117 @@ pub trait SimdVec4: Copy + Clone + Send + Sync + 'static {
     fn dot(self, rhs: Self) -> f32 {
         self.mul(rhs).horizontal_sum()
     }
+    /// Computes IEEE-754 integer-sub reciprocal seed (`0x7EF3_11C3_u32 - bits(self)`) in registers.
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        Self::from_array(
+            self.to_array().map(|x| {
+                f32::from_bits(crate::math::IEEE754_F32_RCP_SEED.wrapping_sub(x.to_bits()))
+            }),
+        )
+    }
+    /// Computes IEEE-754 integer-sub inverse-sqrt seed (`IEEE754_F32_RSQRT_SEED - (bits(self) >> 1)`) in registers.
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        Self::from_array(self.to_array().map(|x| {
+            f32::from_bits(crate::math::IEEE754_F32_RSQRT_SEED.wrapping_sub(x.to_bits() >> 1))
+        }))
+    }
+    /// Converts `k + 12_582_912.0` (`1.5 * 2^23` biased integer bits) into exact `2^k` (`k in [-126, 127]`).
+    #[inline(always)]
+    fn pow2_from_biased_int_bits(self) -> Self {
+        Self::from_array(self.to_array().map(|x| {
+            f32::from_bits(x.to_bits().wrapping_add(crate::math::IEEE754_F32_EXP_BIAS) << 23)
+        }))
+    }
+    /// Fast base-2 exponential `2^clamp(self, -5.0, 5.0)` via range reduction + Chebyshev-economized degree-5 polynomial (`< 2.2e-7`).
+    #[inline(always)]
+    fn exp2_clamped5(self) -> Self {
+        const C2: f32 = 0.240_221_09;
+        const C3: f32 = 0.055_504_11;
+        const C4: f32 = 0.009_675_892;
+        const C5: f32 = 0.001_333_355_8;
+        let x = self.clamp(Self::splat(-5.0), Self::splat(5.0));
+        let magic = Self::splat(12_582_912.0);
+        let k_biased = x.add(magic);
+        let k = k_biased.sub(magic);
+        let f = x.sub(k);
+        let pow2_k = k_biased.pow2_from_biased_int_bits();
+        let poly = Self::splat(C4).fma(Self::splat(C5), f);
+        let poly = Self::splat(C3).fma(poly, f);
+        let poly = Self::splat(C2).fma(poly, f);
+        let poly = Self::splat(core::f32::consts::LN_2).fma(poly, f);
+        let poly = Self::splat(1.0).fma(poly, f);
+        pow2_k.mul(poly)
+    }
+    /// Fast positive reciprocal `1.0 / self` using 2 Newton-Raphson FMA/FMS steps (`< 6.6e-6`) when `self >= 1.0`.
+    #[inline(always)]
+    fn rcp_ge1_nr2(self) -> Self {
+        let one = Self::splat(1.0);
+        let y = self.rcp_pos_seed_bits();
+        let err0 = one.fms(self, y);
+        let y = y.fma(y, err0);
+        let err1 = one.fms(self, y);
+        y.fma(y, err1)
+    }
+    /// Evaluates two independent `rcp_ge1_nr2` vectors simultaneously to hide FMA latency.
+    #[inline(always)]
+    fn rcp_ge1_pair_nr2(self, other: Self) -> (Self, Self) {
+        (self.rcp_ge1_nr2(), other.rcp_ge1_nr2())
+    }
+    /// Evaluates four independent `rcp_ge1_nr2` vectors simultaneously across all SIMD pipes.
+    #[inline(always)]
+    fn rcp_ge1_quad_nr2(d: [Self; 4]) -> [Self; 4] {
+        let (y0, y1) = d[0].rcp_ge1_pair_nr2(d[1]);
+        let (y2, y3) = d[2].rcp_ge1_pair_nr2(d[3]);
+        [y0, y1, y2, y3]
+    }
+    /// Computes positive reciprocal `1.0 / max(self, 1.0e-6)` using 2 Newton-Raphson FMA/FMS steps (`< 6.6e-6`).
+    #[inline(always)]
+    fn rcp_pos_nr2(self) -> Self {
+        let d_safe = self.max(Self::splat(1.0e-6));
+        let two = Self::splat(2.0);
+        let mut y = d_safe.rcp_pos_seed_bits();
+        y = y.mul(two.fms(d_safe, y));
+        y.mul(two.fms(d_safe, y))
+    }
+    /// Computes positive reciprocal `1.0 / max(self, 1.0e-6)` using 3 Newton-Raphson FMA/FMS steps (`< 1 ULP`).
+    #[inline(always)]
+    fn rcp_pos_nr3(self) -> Self {
+        let d_safe = self.max(Self::splat(1.0e-6));
+        let two = Self::splat(2.0);
+        let mut y = d_safe.rcp_pos_seed_bits();
+        y = y.mul(two.fms(d_safe, y));
+        y = y.mul(two.fms(d_safe, y));
+        y.mul(two.fms(d_safe, y))
+    }
+    /// Computes inverse square root `1.0 / sqrt(max(self, 1.0e-12))` using 2 Newton-Raphson FMA/FMS steps.
+    #[inline(always)]
+    fn rsqrt_pos_nr2(self) -> Self {
+        let d_safe = self.max(Self::splat(1.0e-12));
+        let half_d = d_safe.mul(Self::splat(0.5));
+        let three_halves = Self::splat(1.5);
+        let mut y = d_safe.rsqrt_pos_seed_bits();
+        y = y.mul(three_halves.fms(half_d, y.mul(y)));
+        y.mul(three_halves.fms(half_d, y.mul(y)))
+    }
+
+    /// Computes `(rsqrt_pos_nr2(a), rsqrt_pos_nr2(b))` for dual-stream SIMD interleaving.
+    #[inline(always)]
+    fn rsqrt_pos_pair_nr2(a: Self, b: Self) -> (Self, Self) {
+        (a.rsqrt_pos_nr2(), b.rsqrt_pos_nr2())
+    }
+    /// Computes inverse square root `1.0 / sqrt(max(self, 1.0e-12))` using 3 Newton-Raphson FMA/FMS steps.
+    #[inline(always)]
+    fn rsqrt_pos_nr3(self) -> Self {
+        let d_safe = self.max(Self::splat(1.0e-12));
+        let half_d = d_safe.mul(Self::splat(0.5));
+        let three_halves = Self::splat(1.5);
+        let mut y = d_safe.rsqrt_pos_seed_bits();
+        y = y.mul(three_halves.fms(half_d, y.mul(y)));
+        y = y.mul(three_halves.fms(half_d, y.mul(y)));
+        y.mul(three_halves.fms(half_d, y.mul(y)))
+    }
     /// Returns a 4-lane vector of zeros (`0.0`).
     #[inline(always)]
     fn zero() -> Self {
@@ -169,10 +300,78 @@ pub trait MathBackend: Copy + Clone + Send + Sync + 'static + Crc32cBackend {
     #[inline(always)]
     fn fma_mat4x4_vec4(acc: Self::Vec4, mat: &[[f32; 4]; 4], x: &[f32; 4]) -> Self::Vec4 {
         let xv = Self::Vec4::load(x);
-        acc.fma_lane::<0>(Self::Vec4::load(&mat[0]), xv)
-            .fma_lane::<1>(Self::Vec4::load(&mat[1]), xv)
-            .fma_lane::<2>(Self::Vec4::load(&mat[2]), xv)
-            .fma_lane::<3>(Self::Vec4::load(&mat[3]), xv)
+        let c0 = Self::Vec4::load(&mat[0]);
+        let c1 = Self::Vec4::load(&mat[1]);
+        let c2 = Self::Vec4::load(&mat[2]);
+        let c3 = Self::Vec4::load(&mat[3]);
+        let p01 = c0.mul_lane::<0>(xv).fma_lane::<1>(c1, xv);
+        let p23 = c2.mul_lane::<2>(xv).fma_lane::<3>(c3, xv);
+        acc.add(p01.add(p23))
+    }
+
+    /// Stereo 4x4 matrix-vector FMA tile using 4 pre-loaded column vectors in registers.
+    #[inline(always)]
+    fn fma_cols4_stereo(
+        acc_l: Self::Vec4,
+        acc_r: Self::Vec4,
+        cols: [Self::Vec4; 4],
+        x_l: Self::Vec4,
+        x_r: Self::Vec4,
+    ) -> (Self::Vec4, Self::Vec4) {
+        let [c0, c1, c2, c3] = cols;
+        let p01_l = c0.mul_lane::<0>(x_l).fma_lane::<1>(c1, x_l);
+        let p23_l = c2.mul_lane::<2>(x_l).fma_lane::<3>(c3, x_l);
+        let p01_r = c0.mul_lane::<0>(x_r).fma_lane::<1>(c1, x_r);
+        let p23_r = c2.mul_lane::<2>(x_r).fma_lane::<3>(c3, x_r);
+        (acc_l.add(p01_l.add(p23_l)), acc_r.add(p01_r.add(p23_r)))
+    }
+
+    /// Stereo 4x4 matrix-vector FMA tile updating `(acc_l, acc_r)` with shared column loads.
+    #[inline(always)]
+    fn fma_mat4x4_stereo(
+        acc_l: Self::Vec4,
+        acc_r: Self::Vec4,
+        cols: &[[f32; 4]; 4],
+        x_l: Self::Vec4,
+        x_r: Self::Vec4,
+    ) -> (Self::Vec4, Self::Vec4) {
+        let c0 = Self::Vec4::load(&cols[0]);
+        let c1 = Self::Vec4::load(&cols[1]);
+        let c2 = Self::Vec4::load(&cols[2]);
+        let c3 = Self::Vec4::load(&cols[3]);
+        Self::fma_cols4_stereo(acc_l, acc_r, [c0, c1, c2, c3], x_l, x_r)
+    }
+
+    /// Transposes a 4×4 matrix of `Vec4` rows (`[r0, r1, r2, r3]`) into 4 `Vec4` columns.
+    #[inline(always)]
+    fn transpose_4x4(
+        r0: Self::Vec4,
+        r1: Self::Vec4,
+        r2: Self::Vec4,
+        r3: Self::Vec4,
+    ) -> [Self::Vec4; 4] {
+        let a0 = r0.to_array();
+        let a1 = r1.to_array();
+        let a2 = r2.to_array();
+        let a3 = r3.to_array();
+        [
+            Self::Vec4::from_array([a0[0], a1[0], a2[0], a3[0]]),
+            Self::Vec4::from_array([a0[1], a1[1], a2[1], a3[1]]),
+            Self::Vec4::from_array([a0[2], a1[2], a2[2], a3[2]]),
+            Self::Vec4::from_array([a0[3], a1[3], a2[3], a3[3]]),
+        ]
+    }
+
+    /// Converts a `Vec4` register directly to 4 IEEE-754 half-precision `fp16` (`u16`) values.
+    #[inline(always)]
+    fn vec4_to_fp16x4(src: Self::Vec4) -> [u16; 4] {
+        Self::f32x4_to_fp16x4(&src.to_array())
+    }
+
+    /// Converts 4 IEEE-754 half-precision `fp16` (`u16`) values directly into a `Vec4` register.
+    #[inline(always)]
+    fn fp16x4_to_vec4(src: &[u16; 4]) -> Self::Vec4 {
+        Self::Vec4::load(&Self::fp16x4_to_f32x4(src))
     }
 
     /// Converts 4 IEEE-754 single-precision `f32` samples to `fp16` (`u16`).
@@ -388,11 +587,10 @@ mod tests {
             }
         }
         let dl = DefaultLaneVec([1.0, 2.0, 3.0, 4.0]);
-        let res = dl.fma_lane::<2>(
-            DefaultLaneVec([10.0; 4]),
-            DefaultLaneVec([0.5, 1.5, 2.5, 3.5]),
-        );
+        let lane_src = DefaultLaneVec([0.5, 1.5, 2.5, 3.5]);
+        let res = dl.fma_lane::<2>(DefaultLaneVec([10.0; 4]), lane_src);
         assert_eq!(res.0, [26.0, 27.0, 28.0, 29.0]);
+        assert_eq!(dl.mul_lane::<2>(lane_src).0, [2.5, 5.0, 7.5, 10.0]);
 
         let dl_loaded = DefaultLaneVec::load(&[-1.0, 2.0, -3.0, 4.0]);
         let other = DefaultLaneVec::splat(1.5);
@@ -411,5 +609,119 @@ mod tests {
         let mut stored = [0.0; 4];
         dl_loaded.store(&mut stored);
         assert_eq!(stored, [-1.0, 2.0, -3.0, 4.0]);
+
+        let (dl_l, dl_r) = ScalarBackend::fma_mat4x4_stereo(v, v, &mat, v, v);
+        assert_eq!(dl_l.to_array(), dl_r.to_array());
+        let fp16_v = ScalarBackend::vec4_to_fp16x4(v);
+        assert_eq!(fp16_v, ScalarBackend::f32x4_to_fp16x4(&v.to_array()));
+        assert_eq!(
+            ScalarBackend::fp16x4_to_vec4(&fp16_v).to_array(),
+            ScalarBackend::fp16x4_to_f32x4(&fp16_v)
+        );
+        let t_s = ScalarBackend::transpose_4x4(
+            ScalarVec4::from_array([1.0, 2.0, 3.0, 4.0]),
+            ScalarVec4::from_array([5.0, 6.0, 7.0, 8.0]),
+            ScalarVec4::from_array([9.0, 10.0, 11.0, 12.0]),
+            ScalarVec4::from_array([13.0, 14.0, 15.0, 16.0]),
+        );
+        assert_eq!(t_s[0].to_array(), [1.0, 5.0, 9.0, 13.0]);
+        assert_eq!(t_s[1].to_array(), [2.0, 6.0, 10.0, 14.0]);
+        assert_eq!(t_s[2].to_array(), [3.0, 7.0, 11.0, 15.0]);
+        assert_eq!(t_s[3].to_array(), [4.0, 8.0, 12.0, 16.0]);
+        type DefB = crate::math::DefaultMathBackend;
+        let t_d = DefB::transpose_4x4(
+            <DefB as MathBackend>::Vec4::from_array([1.0, 2.0, 3.0, 4.0]),
+            <DefB as MathBackend>::Vec4::from_array([5.0, 6.0, 7.0, 8.0]),
+            <DefB as MathBackend>::Vec4::from_array([9.0, 10.0, 11.0, 12.0]),
+            <DefB as MathBackend>::Vec4::from_array([13.0, 14.0, 15.0, 16.0]),
+        );
+        for k in 0..4 {
+            assert_eq!(t_d[k].to_array(), t_s[k].to_array());
+        }
+        let fp16_d = DefB::vec4_to_fp16x4(<DefB as MathBackend>::Vec4::from_array([
+            0.25, -1.5, 12.5, -65504.0,
+        ]));
+        assert_eq!(
+            DefB::fp16x4_to_vec4(&fp16_d).to_array(),
+            ScalarBackend::fp16x4_to_vec4(&fp16_d).to_array()
+        );
+
+        let dl_pos = DefaultLaneVec([0.5, 1.0, 4.0, 0.0]);
+        assert_eq!(
+            dl_pos.rcp_pos_seed_bits().0[0].to_bits(),
+            0x7EF3_11C3_u32.wrapping_sub(0.5_f32.to_bits())
+        );
+        assert_eq!(
+            dl_pos.rsqrt_pos_seed_bits().0[1].to_bits(),
+            0x5F37_59DF_u32.wrapping_sub(1.0_f32.to_bits() >> 1)
+        );
+        assert!((dl_pos.rcp_pos_nr2().0[2] - 0.25).abs() < 1.0e-5);
+        assert!((dl_pos.rcp_pos_nr3().0[2] - 0.25).abs() < 1.0e-6);
+        assert!((dl_pos.rsqrt_pos_nr2().0[2] - 0.5).abs() < 2.5e-3);
+        assert!((dl_pos.rsqrt_pos_nr3().0[2] - 0.5).abs() < 2.0e-5);
+        assert!(dl_pos.rcp_pos_nr2().0[3].is_finite());
+        assert!(dl_pos.rsqrt_pos_nr2().0[3].is_finite());
+    }
+
+    proptest! {
+        #[test]
+        fn prop_rcp_and_rsqrt_seed_bits_and_nr2_nr3(
+            x0 in 1.0e-5_f32..1.0e5_f32,
+            x1 in 1.0e-5_f32..1.0e5_f32,
+            x2 in 1.0e-5_f32..1.0e5_f32,
+            x3 in 1.0e-5_f32..1.0e5_f32,
+        ) {
+            type DefVec = <crate::math::DefaultMathBackend as MathBackend>::Vec4;
+            let xs = [x0, x1, x2, x3];
+            let sv = ScalarVec4::from_array(xs);
+            let dv = DefVec::from_array(xs);
+            prop_assert_eq!(
+                sv.rcp_pos_seed_bits().to_array().map(f32::to_bits),
+                dv.rcp_pos_seed_bits().to_array().map(f32::to_bits)
+            );
+            prop_assert_eq!(
+                sv.rsqrt_pos_seed_bits().to_array().map(f32::to_bits),
+                dv.rsqrt_pos_seed_bits().to_array().map(f32::to_bits)
+            );
+            let r2 = dv.rcp_pos_nr2().to_array();
+            let r3 = dv.rcp_pos_nr3().to_array();
+            let g1 = dv.add(DefVec::splat(1.0)).rcp_ge1_nr2().to_array();
+            let s2 = dv.rsqrt_pos_nr2().to_array();
+            let s3 = dv.rsqrt_pos_nr3().to_array();
+            for i in 0..4 {
+                let d = f64::from(xs[i]);
+                prop_assert!((f64::from(r2[i]) * d - 1.0).abs() < 1.0e-5);
+                prop_assert!((f64::from(r3[i]) * d - 1.0).abs() < 1.0e-6);
+                let g1_expected = f64::from(xs[i] + 1.0);
+                prop_assert!((f64::from(g1[i]) * g1_expected - 1.0).abs() < 1.0e-5);
+                let exact_inv_sqrt = d.sqrt().recip();
+                prop_assert!(((f64::from(s2[i]) - exact_inv_sqrt) / exact_inv_sqrt).abs() < 2.5e-3);
+                prop_assert!(((f64::from(s3[i]) - exact_inv_sqrt) / exact_inv_sqrt).abs() < 2.0e-5);
+            }
+        }
+
+        #[test]
+        fn exp2_clamped5_and_pow2_bits_match_exact_and_default(
+            xs in prop::array::uniform4(-8.0_f32..8.0_f32),
+        ) {
+            type DefVec = <crate::math::DefaultMathBackend as MathBackend>::Vec4;
+            let sv = ScalarVec4::from_array(xs);
+            let dv = DefVec::from_array(xs);
+            let sa = sv.exp2_clamped5().to_array();
+            let out = dv.exp2_clamped5().to_array();
+            for i in 0..4 {
+                // Hardware FMA uses 1 rounding vs unfused `ScalarVec4` (`a * b + c`), allowing 1-2 ULP difference.
+                prop_assert!((sa[i] - out[i]).abs() <= 1.0e-6 * sa[i].abs().max(1.0));
+                let exact = f64::from(xs[i].clamp(-5.0, 5.0)).exp2();
+                prop_assert!(((f64::from(out[i]) - exact) / exact).abs() < 3.0e-6);
+            }
+            let biased = ScalarVec4::from_array([-5.0, -1.0, 0.0, 5.0].map(|k| k + 12_582_912.0));
+            let biased_d = DefVec::from_array([-5.0, -1.0, 0.0, 5.0].map(|k| k + 12_582_912.0));
+            prop_assert_eq!(biased.pow2_from_biased_int_bits().to_array(), [0.03125, 0.5, 1.0, 32.0]);
+            prop_assert_eq!(
+                biased_d.pow2_from_biased_int_bits().to_array().map(f32::to_bits),
+                [0.03125_f32, 0.5, 1.0, 32.0].map(f32::to_bits)
+            );
+        }
     }
 }

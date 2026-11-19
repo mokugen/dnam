@@ -198,8 +198,8 @@ pub fn derive_watermark_seed_hmac_sha256(
     Ok(hmac_sha256(key, &msg))
 }
 
-/// Extracts the gauge-invariant Stage III tier-local fingerprint component (`60` `f64` values for
-/// `Lite`/`Full`, `88` for `Pro`, `144` for `Ultra`; `60 / 120 / 208 / 352` cumulative values,
+/// Extracts the gauge-invariant Stage III tier-local fingerprint component (`60` `f64` values per
+/// tier across `Lite`/`Full`/`Pro`/`Ultra`; `60 / 120 / 180 / 240` cumulative values,
 /// `ref[sec.anticlone.stage3-fingerprint]`).
 pub fn extract_stage3_tier_fingerprint_component(
     early_fir_128b: &[u8],
@@ -349,14 +349,16 @@ pub fn extract_storefront_metadata(
 mod spec_tests {
     use crate::container::ARENA_OFFSET_ULTRA_END;
     use crate::provenance::{
-        AnticloneGateAction, WatermarkSeedScope, apply_isometric_gauge_watermark,
+        AnticloneGateAction, KAUTZ_TOTAL_CHANNELS, WatermarkSeedScope,
+        apply_gru_sign_gauge_watermark, apply_isometric_gauge_watermark,
         apply_tardos_watermark_7680, build_watermark_seed_message_v1,
         compute_preview_single_control_window, compute_watermark_profile_sha256,
-        derive_watermark_seed_hmac_sha256, evaluate_anticlone_revocation_policy,
-        extract_stage3_tier_fingerprint_component, extract_storefront_metadata,
-        extract_structural_hash_224d, generate_tardos_code_7680, kautz_soa_byte_offset,
-        score_tardos_watermark_7680, sha256_digest, structural_cosine_similarity,
-        validate_license_tier_and_royalty_splits, validate_preview_single_switch_options,
+        derive_gru_sign_gauge_24, derive_watermark_seed_hmac_sha256,
+        evaluate_anticlone_revocation_policy, extract_stage3_tier_fingerprint_component,
+        extract_storefront_metadata, extract_structural_hash_224d, generate_tardos_code_7680,
+        kautz_soa_byte_offset, score_tardos_watermark_7680, sha256_digest,
+        structural_cosine_similarity, validate_license_tier_and_royalty_splits,
+        validate_preview_single_switch_options,
     };
     use crate::schema::{DnamError, DnamJsonHeader, RoyaltySplit};
     use alloc::{
@@ -491,7 +493,7 @@ mod spec_tests {
             }
         }
         let h_before = extract_structural_hash_224d(&arena).unwrap();
-        let kappa = [1.0_f32; 64];
+        let kappa = [1.0_f32; KAUTZ_TOTAL_CHANNELS];
         let q_id = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 1.0, 0.0, 0.0],
@@ -501,6 +503,11 @@ mod spec_tests {
         apply_isometric_gauge_watermark(&mut arena, &kappa, &q_id).unwrap();
         let h_after = extract_structural_hash_224d(&arena).unwrap();
         assert!((structural_cosine_similarity(&h_before, &h_after) - 1.0).abs() < 1e-12);
+
+        let gru_signs = derive_gru_sign_gauge_24(&buyer_seed);
+        apply_gru_sign_gauge_watermark(&mut arena, &gru_signs).unwrap();
+        let h_gru = extract_structural_hash_224d(&arena).unwrap();
+        assert!((structural_cosine_similarity(&h_before, &h_gru) - 1.0).abs() < 1e-12);
 
         let master_arena = arena.clone();
         let code = generate_tardos_code_7680(&buyer_seed, "model_01", "license_01");

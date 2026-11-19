@@ -4,17 +4,17 @@
 //! 1. **Operators ([`operators`]):** Op-T (Transport / Elastic Buffer), Op-M (Symplectic Modal / Kautz Bank),
 //!    and Op-N (Multi-Drive PolyADAA Commuted Cascade / Waveshaping).
 //! 2. **Stages ([`stages`]):** Stage 0 8-Port Matrix Router, Stages I–IV Physical Topology, and
-//!    256-D Mid/Side Kronecker Output Head ([`StagePipeline`]).
+//!    L1D-Resident Matryoshka Core ([`V3HotCore`]).
 //! 3. **Control Bus ([`control`]):** $3\text{ kHz}$ Envelopes/LFOs + Node-Anchored Lobatto HDMR & Rank-4
 //!    Factorization Machine with 128-byte CCR table, division-free 16-sample micro-ramping,
-//!    and static `0 MACs/sample` collapsed head caching.
+//!    and `FiLM`/Zero-DC conditioning.
 //!
 //! ## Core Real-Time Invariants
 //! - **100% `#![no_std]` + `alloc` Foundation:** Zero OS calls, zero locks, and **zero heap allocations**
 //!   inside [`DnamEngine::process_block`], [`DnamEngine::process_block_in_place`],
 //!   [`DnamEngine::process_mono_to_stereo`], [`DnamEngine::process_mono`], and [`DnamEngine::reload_model_in_place`].
 //! - **Zero `FSQRT`, `FDIV`, or `libm` Calls** in $48\text{ kHz}$ audio and $3\text{ kHz}$ control loops.
-//! - **Total Lite State RAM:** Strictly audited at 8,656 B ([`TOTAL_LITE_STATE_RAM_BYTES`]).
+//! - **Total Lite State RAM:** Audited via [`TOTAL_LITE_STATE_RAM_BYTES`].
 //! - **Block Floating-Point Environment ([`FtzDazGuard`]):** Selects round-to-nearest-even and
 //!   non-trapping exceptions and `FPCR.FZ` with conditional `FIZ` (`aarch64`) or `MXCSR`
 //!   `FTZ | DAZ` (`x86_64`) on block entry, then restores the caller's control register. On x86-64,
@@ -62,5 +62,8 @@ pub mod types;
 pub use container::strip_container_to_tier;
 pub use dynamic::DynamicDnamEngine;
 pub use engine::{DnamAudioIo, DnamEngine, OFFLINE_BOUNCE_PDC_SAMPLES};
-pub use stages::{StagePipeline, TOTAL_LITE_STATE_RAM_BYTES};
+pub use stages::{
+    TOTAL_LITE_STATE_RAM_BYTES, V3ColdTierModel, V3CoreInstance, V3HotCore, V3MatryoshkaModel,
+    V3TierReadout,
+};
 pub use types::{DnamTelemetrySnapshot, FtzDazGuard, Tier};

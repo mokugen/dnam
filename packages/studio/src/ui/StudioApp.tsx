@@ -1,23 +1,18 @@
-import {
-  AccelerationBadge,
-  Badge,
-  Button,
-  CapturePlanPanel,
-  ClampAuditVisualizer,
-  ControlBusVisualizer,
-  DnamAudioHostProvider,
-  DnamPluginRack,
-  KroneckerResumeVisualizer,
-  ModulatedUfdnVisualizer,
-  PolyAdaaVisualizer,
-  RgLruPoleVisualizer,
-  Tabs,
-  TabsContent,
-  TabsList,
-  TabsTrigger,
-  TrainingTimelinePanel,
-  ZohRescalerVisualizer,
-} from "@dnam-project/ui";
+import { Badge } from "@dnam-project/ui/base/badge";
+import { Button } from "@dnam-project/ui/base/button";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@dnam-project/ui/base/tabs";
+import { AccelerationBadge } from "@dnam-project/ui/controls/StatusBadges";
+import { DnamAudioHostProvider } from "@dnam-project/ui/host/context";
+import { DnamPluginRack } from "@dnam-project/ui/rack/DnamPluginRack";
+import { ClampAuditVisualizer } from "@dnam-project/ui/visualizers/ClampAuditVisualizer";
+import { ControlBusVisualizer } from "@dnam-project/ui/visualizers/ControlBusVisualizer";
+import { KroneckerResumeVisualizer } from "@dnam-project/ui/visualizers/KroneckerResumeVisualizer";
+import { ModulatedUfdnVisualizer } from "@dnam-project/ui/visualizers/ModulatedUfdnVisualizer";
+import { PolyAdaaVisualizer } from "@dnam-project/ui/visualizers/PolyAdaaVisualizer";
+import { RgLruPoleVisualizer } from "@dnam-project/ui/visualizers/RgLruPoleVisualizer";
+import { ZohRescalerVisualizer } from "@dnam-project/ui/visualizers/ZohRescalerVisualizer";
+import { CapturePlanPanel } from "@dnam-project/ui/workflows/CapturePlanPanel";
+import { TrainingTimelinePanel } from "@dnam-project/ui/workflows/TrainingTimelinePanel";
 import { ExternalLink, FolderOpen, Layers } from "lucide-react";
 import { TauriNativeAudioHost } from "../host.js";
 import { DEFAULT_STUDIO_VIEW_MODEL, type StudioWorkspaceViewModel } from "./studio_store.js";

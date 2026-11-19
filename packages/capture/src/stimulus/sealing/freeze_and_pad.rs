@@ -6,30 +6,29 @@ use std::collections::BTreeSet;
 
 use dnam_engine::schema::{ControlKind, DnamError};
 
-use crate::CORESET_FP16_FRAMES_PER_STEM;
 use crate::align::{
     DifferentialPadCalibration, compute_pcm_sha256, measure_differential_pad_ratio,
     rescale_padded_stem,
 };
-use crate::proj::fp16_bytes_to_f32;
 use crate::proj::schema::DnamProjManifest;
 use crate::proj::vault::{VaultCaptureSpec, replace_capture};
 use crate::resampler::{
     resample_48k_to_arbitrary_rate, resample_arbitrary_rate_to_48k, resampled_frame_len,
 };
 use crate::targets::StemStimulus;
+use crate::{CORESET_FP32_FRAMES_PER_STEM, CORESET_FP32_MIN_FRAMES_PER_STEM};
 
 use super::super::laws::TopologyProbeMode;
 use super::super::waveforms::{
-    ActivePrimitiveKind, compute_stmc_psd_88_and_spectral_4096, encode_coreset_12k_fp16,
+    ActivePrimitiveKind, compute_stmc_psd_88_and_spectral_4096, encode_coreset_fp32_with_frames,
     synthesize_a5_musical_transient_coreset, synthesize_active_primitive_frame,
 };
 use super::super::{
     ADAPTIVE_FRAME_SAMPLES, ADC_PEAK_GOVERNOR_FS, PEDESTAL_BIN_MONO, build_disjoint_comb_schedule,
     synthesize_cyclic_comb_frame,
 };
-use super::CORESET_WITH_SETTLE_48K;
 use super::controls::{control_declared_bounds, default_control_vector};
+use super::{CORESET_A5_FRAMES_48K, CORESET_WITH_SETTLE_48K};
 
 /// Resamples up to three `48 kHz` channels (`l`, optional `r`, optional `aux`) to `sr`.
 pub(crate) fn resample_48k_channels_to_sr(
@@ -131,7 +130,7 @@ pub(crate) fn build_freeze_transition_stem_stimulus(
     );
     let (mut coreset_l, mut coreset_r) = synthesize_a5_musical_transient_coreset(
         seed_256,
-        CORESET_FP16_FRAMES_PER_STEM,
+        CORESET_A5_FRAMES_48K,
         if need_stereo { 2 } else { 1 },
         48_000,
     );
@@ -196,11 +195,12 @@ pub(crate) fn build_freeze_transition_stem_stimulus(
 
 fn recompute_rescaled_capture_stats(
     capture: &mut VaultCaptureSpec,
+    num_frames: usize,
     l: &[f32],
     r: Option<&[f32]>,
     pad_gain_linear: f64,
 ) {
-    capture.wet_coreset_fp16 = encode_coreset_12k_fp16(l, r);
+    capture.wet_coreset_fp32 = encode_coreset_fp32_with_frames(num_frames, l, r);
     let (psd_88, spec_4096) = compute_stmc_psd_88_and_spectral_4096(l, r);
     capture.band_psd_summary_88 = psd_88;
     capture.spectral_summary_4096 = spec_4096;
@@ -225,21 +225,31 @@ pub fn recapture_clipped_stem(
                 DnamError::SchemaValidationError(format!("mic-pad probe calibration failed: {e}"))
             })?;
 
-    let is_stereo = padded_capture.wet_coreset_fp16.len() == 48_000;
-    let decoded = fp16_bytes_to_f32(&padded_capture.wet_coreset_fp16);
+    let is_stereo = padded_capture.wet_coreset_fp32.len() >= CORESET_FP32_MIN_FRAMES_PER_STEM * 8;
+    let frame_bytes = if is_stereo { 8 } else { 4 };
+    let num_frames =
+        (padded_capture.wet_coreset_fp32.len() / frame_bytes).max(CORESET_FP32_FRAMES_PER_STEM);
+    let decoded: Vec<f32> = padded_capture
+        .wet_coreset_fp32
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|w| f32::from_le_bytes(*w))
+        .collect();
     let rescaled = rescale_padded_stem(&decoded, pad_cal.pad_gain_linear).map_err(|e| {
         DnamError::SchemaValidationError(format!("mic-pad stem rescale failed: {e}"))
     })?;
 
     if is_stereo {
-        let mut l = Vec::with_capacity(CORESET_FP16_FRAMES_PER_STEM);
-        let mut r = Vec::with_capacity(CORESET_FP16_FRAMES_PER_STEM);
+        let mut l = Vec::with_capacity(rescaled.len() / 2);
+        let mut r = Vec::with_capacity(rescaled.len() / 2);
         for pair in rescaled.as_chunks::<2>().0 {
             l.push(pair[0]);
             r.push(pair[1]);
         }
         recompute_rescaled_capture_stats(
             &mut padded_capture,
+            num_frames,
             &l,
             Some(&r),
             pad_cal.pad_gain_linear,
@@ -247,6 +257,7 @@ pub fn recapture_clipped_stem(
     } else {
         recompute_rescaled_capture_stats(
             &mut padded_capture,
+            num_frames,
             &rescaled,
             None,
             pad_cal.pad_gain_linear,

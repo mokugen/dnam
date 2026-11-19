@@ -17,21 +17,18 @@ use crate::schema::{
     ControlCalibrationRole, DnamError, DnamJsonHeader, DnamProtectionProfile, TempoSubdivision,
     cold_pow_f64,
 };
-use crate::stages::{StageBackend, StagePipeline};
+use crate::stages::{Stage0Router, StageBackend, V3ColdTierModel, V3HotCore};
 use crate::types::{DnamTelemetrySnapshot, Tier};
 
 pub use oversampler::{OFFLINE_BOUNCE_PDC_SAMPLES, Oversampler4xState};
 pub(crate) use presets::{apply_calibrated_control_role, resolve_preset_batch_by_id};
-pub use process::{
-    DnamAudioIo, FeatureBusBackend, tile_collapse_svd_slice_vec4, tile_dot64_stereo_vec4,
-    tile_dot64_vec4,
-};
+pub use process::DnamAudioIo;
 pub use tempo::TempoSyncState;
 
-/// Composite SIMD backend trait required by [`DnamEngine`] across all operators, stages, and the 256-D Feature Bus.
-pub trait EngineBackend: StageBackend + FeatureBusBackend {}
+/// Composite SIMD backend trait required by [`DnamEngine`] across all operators and stages.
+pub trait EngineBackend: StageBackend {}
 
-impl<B: StageBackend + FeatureBusBackend> EngineBackend for B {}
+impl<B: StageBackend> EngineBackend for B {}
 
 /// Zero-allocation real-time DNAM inference engine parameterized over an
 /// [`EngineBackend`] (`DefaultMathBackend` by default).
@@ -60,18 +57,12 @@ pub struct DnamEngine<'a, B: EngineBackend = DefaultMathBackend> {
     pub(crate) stereo_width: f32,
     pub(crate) current_stage_params: [f32; 16],
     pub(crate) stage_ramp_deltas: [f32; 16],
-    pub(crate) collapsed_head_wl: [[B::Vec4; 16]; 4],
-    pub(crate) collapsed_head_wr: [[B::Vec4; 16]; 4],
-    pub(crate) cached_role_b_slices: alloc::boxed::Box<[[B::Vec4; 32]; 4]>,
-    pub(crate) feature_bus_scratch: alloc::boxed::Box<[f32; 256]>,
-    pub(crate) collapsed_b_head: [f32; 2],
-    pub(crate) cached_z_head: [f32; 4],
-    pub(crate) cached_z_head_ultra: [f32; 4],
-    pub(crate) cached_head_tiers: usize,
     pub(crate) cached_tier_gain_trim: [f32; 4],
     pub saturation_flags: u32,
     pub control_bus: ControlBus<B>,
-    pub stage_pipeline: StagePipeline,
+    pub(crate) hot_core: alloc::boxed::Box<V3HotCore<B>>,
+    pub(crate) cold_tiers: alloc::boxed::Box<[V3ColdTierModel; 4]>,
+    pub stage0_router: Stage0Router,
     pub mix_dry_gain: f32,
     pub mix_wet_gain: f32,
 }
@@ -113,6 +104,13 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             tail_time_ms: 0.0,
             header_crc32c: 0,
         };
+        let cold_tiers = alloc::boxed::Box::new([
+            V3ColdTierModel::identity_for_tier(Tier::Lite, false, false),
+            V3ColdTierModel::identity_for_tier(Tier::Full, false, false),
+            V3ColdTierModel::identity_for_tier(Tier::Pro, false, false),
+            V3ColdTierModel::identity_for_tier(Tier::Ultra, false, false),
+        ]);
+        let hot_core = alloc::boxed::Box::new(V3HotCore::from_cold_model(&cold_tiers[0]));
         Self {
             preamble,
             header: None,
@@ -137,20 +135,12 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             stereo_width: 1.0,
             current_stage_params: [0.0; 16],
             stage_ramp_deltas: [0.0; 16],
-            collapsed_head_wl: [[<B::Vec4 as crate::math::SimdVec4>::zero(); 16]; 4],
-            collapsed_head_wr: [[<B::Vec4 as crate::math::SimdVec4>::zero(); 16]; 4],
-            cached_role_b_slices: alloc::boxed::Box::new(
-                [[<B::Vec4 as crate::math::SimdVec4>::splat(1.0); 32]; 4],
-            ),
-            feature_bus_scratch: alloc::boxed::Box::new([0.0; 256]),
-            collapsed_b_head: [0.0; 2],
-            cached_z_head: [f32::NAN; 4],
-            cached_z_head_ultra: [f32::NAN; 4],
-            cached_head_tiers: 0,
             cached_tier_gain_trim: [1.0; 4],
             saturation_flags: 0,
             control_bus: ControlBus::new(),
-            stage_pipeline: StagePipeline::new(),
+            hot_core,
+            cold_tiers,
+            stage0_router: Stage0Router::new(),
             mix_dry_gain: 0.0,
             mix_wet_gain: 1.0,
         }
@@ -262,7 +252,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         Self::from_bytes(bytes, tier, sample_rate_hz)
     }
 
-    /// Pre-allocates a [`DnamEngine`] with maximum `Arena 0..3` (`64,000 B`).
+    /// Pre-allocates a [`DnamEngine`] with maximum `Arena 0..3` (`28,672 B`).
     pub fn with_max_capacity() -> Self {
         Self::with_max_tier(Tier::Ultra)
     }
@@ -272,8 +262,21 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         let mut engine = Self::new_empty(max_supported_tier);
         engine.arena_storage = ArenaStorage::with_max_tier(max_supported_tier);
         engine.control_bus.ensure_control_capacity(256);
-        engine.stage_pipeline.reserve_extended_capacity();
         engine
+    }
+
+    #[inline]
+    pub(crate) fn sync_hot_core_tier(&mut self) {
+        let eff = self.effective_tier();
+        if self.hot_core.tier != eff {
+            let cold = &self.cold_tiers[eff as usize];
+            self.hot_core.switch_tier(cold);
+            if self.zoh.sample_rate_host_hz != 48_000 || self.offline_bounce {
+                self.hot_core.reconfigure_with_zoh(cold, &self.zoh);
+            }
+            self.hot_core
+                .apply_control_bus_stage_targets(&self.current_stage_params);
+        }
     }
 
     #[inline]
@@ -297,6 +300,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         if self.tier > max_tier {
             self.tier = max_tier;
         }
+        self.sync_hot_core_tier();
     }
 
     #[inline]
@@ -330,6 +334,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     #[inline]
     pub fn set_maximize_tier_on_bounce(&mut self, enabled: bool) {
         self.maximize_tier_on_bounce = enabled;
+        self.sync_hot_core_tier();
     }
 
     #[inline]
@@ -345,6 +350,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     pub fn set_tier(&mut self, tier: Tier) {
         let max_tier = self.max_available_tier.min(self.max_supported_tier);
         self.tier = tier.min(max_tier);
+        self.sync_hot_core_tier();
     }
 
     #[inline]
@@ -461,7 +467,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             ctrl_idx,
             physical_value,
             &mut self.stereo_width,
-            &mut self.stage_pipeline.stage4.freeze,
+            &mut self.hot_core.stage4.freeze,
             supports_freeze,
         );
     }
@@ -485,17 +491,17 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
     #[inline]
     pub fn set_freeze(&mut self, freeze: bool) {
-        self.stage_pipeline.stage4.freeze = freeze && self.supports_freeze();
+        self.hot_core.stage4.freeze = freeze && self.supports_freeze();
     }
 
     #[inline]
     pub fn set_freeze_amount(&mut self, alpha: f32) {
-        self.stage_pipeline.stage4.freeze = (alpha > 0.5) && self.supports_freeze();
+        self.hot_core.stage4.freeze = (alpha > 0.5) && self.supports_freeze();
     }
 
     #[inline]
     pub fn is_frozen(&self) -> bool {
-        self.stage_pipeline.stage4.freeze
+        self.hot_core.stage4.freeze
     }
 
     #[inline]
@@ -611,7 +617,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             control_decimation_host: self.zoh.control_decimation_host as u16,
             max_op_n_drive: 1.0,
             max_pole_radius: 0.999,
-            max_effective_loop_gain: self.stage_pipeline.stage4.g_loop,
+            max_effective_loop_gain: self.hot_core.stage4.params.g_loop,
             tail_time_ms: self.preamble.tail_time_ms,
             z_head: self.control_bus.z_head,
             env_states: self.control_bus.env_states,

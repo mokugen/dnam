@@ -135,11 +135,64 @@ export function camelToWireObject(value: unknown, parentField?: string): unknown
   return out;
 }
 
+function pruneNullField(rec: Record<string, unknown>, key: string): void {
+  if (rec[key] === null || rec[key] === undefined) {
+    rec[key] = undefined;
+  }
+}
+
+function pruneMetadataWire(meta: unknown): void {
+  if (meta === null || typeof meta !== "object") {
+    return;
+  }
+  const metaRec = meta as Record<string, unknown>;
+  pruneNullField(metaRec, "distribution_policy");
+  const sigs = metaRec["signatures"];
+  if (sigs === null || typeof sigs !== "object") {
+    return;
+  }
+  const sigsRec = sigs as Record<string, unknown>;
+  pruneNullField(sigsRec, "tier_arena_sha256");
+  const rcpt = sigsRec["marketplace_receipt"];
+  if (rcpt !== null && typeof rcpt === "object") {
+    pruneNullField(rcpt as Record<string, unknown>, "buyer_tier_arena_sha256");
+  }
+}
+
+function pruneCalibrationWire(calRec: Record<string, unknown>): void {
+  pruneNullField(calRec, "lobatto_physical_anchors");
+  const condAnchors = calRec["conditional_physical_anchors"];
+  const emptyObj =
+    typeof condAnchors === "object" &&
+    condAnchors !== null &&
+    Object.keys(condAnchors as Record<string, unknown>).length === 0;
+  if (condAnchors === null || condAnchors === undefined || emptyObj) {
+    calRec["conditional_physical_anchors"] = undefined;
+  }
+  pruneNullField(calRec, "tempo_sync_default_subdivision");
+}
+
+function pruneControlsWire(ctrls: unknown): void {
+  if (!Array.isArray(ctrls)) {
+    return;
+  }
+  for (const ctrl of ctrls) {
+    if (ctrl === null || typeof ctrl !== "object") {
+      continue;
+    }
+    const ctrlRec = ctrl as Record<string, unknown>;
+    const cal = ctrlRec["calibration"];
+    if (cal === null || cal === undefined) {
+      ctrlRec["calibration"] = undefined;
+    } else if (typeof cal === "object") {
+      pruneCalibrationWire(cal as Record<string, unknown>);
+    }
+  }
+}
+
 function pruneTensorSliceEntry(sl: Record<string, unknown>): void {
   for (const optKey of ["packing", "feature_dim", "packed_len", "shape"]) {
-    if (sl[optKey] === null || sl[optKey] === undefined) {
-      sl[optKey] = undefined;
-    }
+    pruneNullField(sl, optKey);
   }
 }
 
@@ -148,67 +201,8 @@ function pruneTensorSliceEntry(sl: Record<string, unknown>): void {
  * so `encodeHeader` produces byte-identical JSON to `serde_json::to_string(&DnamJsonHeader)`.
  */
 export function pruneRustSkipSerializingIf(raw: Record<string, unknown>): Record<string, unknown> {
-  const meta = raw["metadata"];
-  if (meta !== null && typeof meta === "object") {
-    const metaRec = meta as Record<string, unknown>;
-    if (metaRec["distribution_policy"] === null || metaRec["distribution_policy"] === undefined) {
-      metaRec["distribution_policy"] = undefined;
-    }
-    const sigs = metaRec["signatures"];
-    if (sigs !== null && typeof sigs === "object") {
-      const sigsRec = sigs as Record<string, unknown>;
-      if (sigsRec["tier_arena_sha256"] === null || sigsRec["tier_arena_sha256"] === undefined) {
-        sigsRec["tier_arena_sha256"] = undefined;
-      }
-      const rcpt = sigsRec["marketplace_receipt"];
-      if (rcpt !== null && typeof rcpt === "object") {
-        const rcptRec = rcpt as Record<string, unknown>;
-        if (
-          rcptRec["buyer_tier_arena_sha256"] === null ||
-          rcptRec["buyer_tier_arena_sha256"] === undefined
-        ) {
-          rcptRec["buyer_tier_arena_sha256"] = undefined;
-        }
-      }
-    }
-  }
-
-  const ctrls = raw["controls_schema"];
-  if (Array.isArray(ctrls)) {
-    for (const ctrl of ctrls) {
-      if (ctrl !== null && typeof ctrl === "object") {
-        const ctrlRec = ctrl as Record<string, unknown>;
-        const cal = ctrlRec["calibration"];
-        if (cal === null || cal === undefined) {
-          ctrlRec["calibration"] = undefined;
-        } else if (typeof cal === "object") {
-          const calRec = cal as Record<string, unknown>;
-          if (
-            calRec["lobatto_physical_anchors"] === null ||
-            calRec["lobatto_physical_anchors"] === undefined
-          ) {
-            calRec["lobatto_physical_anchors"] = undefined;
-          }
-          const condAnchors = calRec["conditional_physical_anchors"];
-          if (
-            condAnchors === null ||
-            condAnchors === undefined ||
-            (typeof condAnchors === "object" &&
-              Object.keys(condAnchors as Record<string, unknown>).length === 0)
-          ) {
-            calRec["conditional_physical_anchors"] = undefined;
-          }
-          if (
-            calRec["tempo_sync_default_subdivision"] === null ||
-            calRec["tempo_sync_default_subdivision"] === undefined
-          ) {
-            calRec["tempo_sync_default_subdivision"] = undefined;
-          }
-        }
-      }
-    }
-  }
-
+  pruneMetadataWire(raw["metadata"]);
+  pruneControlsWire(raw["controls_schema"]);
   const tdir = raw["tensor_directory"];
   if (tdir !== null && typeof tdir === "object") {
     for (const sl of Object.values(tdir as Record<string, unknown>)) {
@@ -217,6 +211,5 @@ export function pruneRustSkipSerializingIf(raw: Record<string, unknown>): Record
       }
     }
   }
-
   return raw;
 }

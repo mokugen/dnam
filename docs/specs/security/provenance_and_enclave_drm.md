@@ -18,6 +18,7 @@ requirements:
   - REQ-8.8
 adrs:
   - ADR-0009
+  - ADR-0021
 ---
 
 # Cryptographic Provenance (`Ed25519`), `DistributionPolicy`, `OemDeviceCertificate` & `.dnam-seal` (`DNSL`) Hardware DRM

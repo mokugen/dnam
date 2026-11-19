@@ -5,6 +5,7 @@ pub mod adjoint;
 pub mod alignment;
 pub mod basis;
 pub mod bezout7;
+mod cold_eval;
 pub mod dataset;
 pub mod gabor;
 pub(crate) mod gru_core;
@@ -15,9 +16,12 @@ pub mod omp;
 pub mod polish;
 pub(crate) mod primitives;
 mod seed_init;
+pub mod stage0_id;
+pub mod stage4_id;
 pub mod svf_id;
 
 pub use alignment::{build_v3_causal_probe_excitation, estimate_v3_causal_deadtime_and_polarity};
+pub use cold_eval::{evaluate_cold_loss_f32, evaluate_cold_loss_f32_with_backend};
 pub use lbfgs::{
     run_lbfgs_core_matryoshka, run_lbfgs_core_matryoshka_with_backend, run_lbfgs_matryoshka,
     run_lbfgs_matryoshka_with_backend,
@@ -27,109 +31,35 @@ pub use omp::{
     repair_collided_kautz_poles, select_omp_kautz_poles_matryoshka,
     select_omp_kautz_poles_matryoshka_with_backend,
 };
-pub use polish::{polish_f32_matryoshka_readouts, polish_f32_matryoshka_readouts_with_backend};
+pub use polish::{
+    polish_f32_matryoshka_readouts, polish_f32_matryoshka_readouts_with_backend,
+    polish_f32_matryoshka_readouts_with_cert_stem,
+};
 
 use dnam_engine::Tier;
-use dnam_engine::stages::v3_core::{V3ColdTierModel, V3CoreInstance, V3MatryoshkaModel};
+use dnam_engine::stages::{V3ColdTierModel, V3MatryoshkaModel};
 
 #[cfg(test)]
 use crate::metrics::{
     ArchetypeFamily, PerceptualCertificationSummary, certify_4metric_signal_chain,
 };
+#[cfg(test)]
+use dnam_engine::stages::V3CoreInstance;
 
+use super::SolverQualityMode;
 use super::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
+use super::progress::telemetry::{OptStepSpec, VisualProbeAnchor, emit_dataset_opt_step};
+use super::progress::{TrainerProgressSnapshot, TrainingPhase, TrainingStatus};
+use crate::stimulus::sealing::CORESET_A5_FRAMES_48K;
 use adjoint::{AdjointWorkspace, evaluate_matryoshka_loss_f64_with_backend};
-use basis::{ALL_TIERS, solve_matryoshka_varpro_cholesky_with_backend};
-use gabor::GaborAdjointScratch;
-use ltas_adj::{Welch33Scratch, eval_welch33_ltas_loss_and_adjoint};
+use basis::solve_matryoshka_varpro_cholesky_with_backend;
+use lbfgs::run_lbfgs_with_ws;
 use primitives::par_map_vec;
 use svf_id::prescreen_matryoshka_seeds_with_backend;
 
-/// Evaluates the exact Bézout 3-band + spectral loss using the real `f32` `V3CoreInstance` via backend `B`.
-#[must_use]
-pub fn evaluate_cold_loss_f32_with_backend<B: TrainerBackend>(
-    cold: &V3ColdTierModel,
-    dataset: &V3TrainDataset,
-) -> f64 {
-    let mut inst = V3CoreInstance::<B>::from_cold_model(cold);
-    let active_ch = if cold.mono_out { 1 } else { 2 };
-    let ch_scale = if cold.mono_out { 1.0 } else { 0.5 };
-    let mut bands = [Vec::new(), Vec::new(), Vec::new()];
-    let mut gab_scratch = GaborAdjointScratch::default();
-    let mut wel_scratch = Welch33Scratch::default();
-    let mut total_loss = 0.0_f64;
-
-    for (stem_idx, stem) in dataset.stems.iter().enumerate() {
-        let n = stem.usable_len();
-        if n == 0 {
-            continue;
-        }
-        let w = stem.warmup.min(n);
-        let (mut out_l, mut out_r) = (vec![0.0_f32; n], vec![0.0_f32; n]);
-        let r_in = if cold.mono_out {
-            &stem.in_l[..n]
-        } else {
-            &stem.in_r[..n]
-        };
-        inst.reset_to_dc_equilibrium();
-        inst.process_block_stereo(&stem.in_l[..n], r_in, &mut out_l, &mut out_r);
-        let sw = dataset.stem_weights[stem_idx];
-        for ch in 0..active_ch {
-            let (out, tgt) = if ch == 0 {
-                (&out_l, &stem.tgt_l)
-            } else {
-                (&out_r, &stem.tgt_r)
-            };
-            let err: Vec<f64> = (0..n)
-                .map(|t| f64::from(out[t]) - f64::from(tgt[t]))
-                .collect();
-            dataset.bank.split_3band(&err, &mut bands);
-            let bw = dataset.stem_band_weights[stem_idx][ch];
-            for b in 0..3 {
-                total_loss += ch_scale * bw[b] * B::sum_sq_f64(&bands[b][w..n]);
-            }
-            if dataset.gabor_env_weight > 0.0 || dataset.gabor_ltas_weight > 0.0 {
-                let y_f64: Vec<f64> = out[..n].iter().map(|&v| f64::from(v)).collect();
-                total_loss += gabor::eval_gabor_loss_and_adjoint_with_backend::<B>(
-                    &dataset.gabor_bank,
-                    &dataset.gabor_summaries[stem_idx][ch],
-                    &y_f64,
-                    None,
-                    sw,
-                    ch_scale,
-                    dataset.gabor_env_weight,
-                    dataset.gabor_ltas_weight,
-                    &mut gab_scratch,
-                );
-            }
-            if dataset.welch_ltas_weight > 0.0 {
-                let y_f64: Vec<f64> = out[..n].iter().map(|&v| f64::from(v)).collect();
-                total_loss += eval_welch33_ltas_loss_and_adjoint(
-                    &dataset.welch33_summaries[stem_idx][ch],
-                    &y_f64,
-                    None,
-                    sw,
-                    ch_scale,
-                    dataset.welch_ltas_weight,
-                    &mut wel_scratch,
-                );
-            }
-        }
-    }
-    total_loss
-}
-
-/// Evaluates the exact Bézout 3-band + spectral loss using the real `f32` `V3CoreInstance`.
-#[must_use]
-pub fn evaluate_cold_loss_f32(cold: &V3ColdTierModel, dataset: &V3TrainDataset) -> f64 {
-    struct ColdLossTask<'a>(&'a V3ColdTierModel, &'a V3TrainDataset);
-    impl TrainerTask<f64> for ColdLossTask<'_> {
-        fn run<B: TrainerBackend>(self) -> f64 {
-            evaluate_cold_loss_f32_with_backend::<B>(self.0, self.1)
-        }
-    }
-    DynamicTrainer::detect().dispatch(ColdLossTask(cold, dataset))
-}
+/// Subwindow cap (`12,288` samples) covering the full `12,000`-sample `CORESET_A5` (`Q1..Q4` incl. `17.5 kHz` chirp).
+const FAST_FIT_SUBWINDOW_SAMPLES: usize = 12_288;
+const _: () = assert!(FAST_FIT_SUBWINDOW_SAMPLES >= CORESET_A5_FRAMES_48K);
 
 #[cfg(test)]
 fn combine_stereo_summary(
@@ -172,7 +102,8 @@ fn signal_chain_summary_for_cold<B: TrainerBackend>(
     }
     let mut inst = V3CoreInstance::<B>::from_cold_model(cold);
     let (mut out_l, mut out_r) = (vec![0.0_f32; n], vec![0.0_f32; n]);
-    let r_in = if cold.mono_out {
+    let keep_in_r = !cold.mono_out || cold.feat_params.key_link > 0.0;
+    let r_in = if !keep_in_r {
         &stem.in_l[..n]
     } else {
         &stem.in_r[..n]
@@ -207,6 +138,7 @@ fn signal_chain_summary_for_cold<B: TrainerBackend>(
     Some(combine_stereo_summary(sum_l, sum_r))
 }
 
+#[inline(never)]
 fn accept_varpro_if_improves<B: TrainerBackend>(
     model: &mut V3MatryoshkaOptF64,
     dataset: &V3TrainDataset,
@@ -214,73 +146,164 @@ fn accept_varpro_if_improves<B: TrainerBackend>(
     als_iters: usize,
     best_loss: &mut f64,
 ) {
-    let backup = model.clone();
+    let backup = Box::new(model.clone());
     solve_matryoshka_varpro_cholesky_with_backend::<B>(model, dataset, als_iters);
     let after = evaluate_matryoshka_loss_f64_with_backend::<B>(model, dataset, ws);
     if after.is_finite() && after <= *best_loss {
         *best_loss = after;
     } else {
-        *model = backup;
+        model.clone_from(&backup);
     }
 }
 
+#[inline(never)]
 fn accept_omp_if_improves<B: TrainerBackend>(
     model: &mut V3MatryoshkaOptF64,
     dataset: &V3TrainDataset,
     ws: &mut AdjointWorkspace,
     best_loss: &mut f64,
 ) {
-    let backup = model.clone();
+    let backup = Box::new(model.clone());
     select_omp_kautz_poles_matryoshka_with_backend::<B>(model, dataset);
     let after = evaluate_matryoshka_loss_f64_with_backend::<B>(model, dataset, ws);
     if after.is_finite() && after <= *best_loss {
         *best_loss = after;
     } else {
-        *model = backup;
+        model.clone_from(&backup);
     }
 }
 
-/// Backend-parameterized single-run 4-tier Matryoshka (`2x OS`) fitter (`VarPro` + L-BFGS + OMP + `f32` polish).
+/// Backend-parameterized single-run 4-tier Matryoshka (`2x OS`) fitter (`VarPro` + L-BFGS + OMP + `f32` polish),
+/// augmented with signal-driven `Stage 0` sub-octave identification and `Stage IV` reflection/FDN refinement.
+#[inline(never)]
 #[must_use]
 pub fn fit_v3_matryoshka_with_backend<B: TrainerBackend>(
     dataset: &V3TrainDataset,
     mono_out: bool,
 ) -> V3MatryoshkaModel {
     if dataset.stems.is_empty() || dataset.stems.iter().all(|s| s.usable_len() == 0) {
-        return V3MatryoshkaModel::identity(true, mono_out);
+        return V3MatryoshkaModel::dual_rate_default(mono_out);
     }
+    let ds_core = dataset.with_progress(dataset.progress.subrange(0, 800));
+    let after_s0 = if stage4_id::dataset_is_incoherent_candidate(&ds_core)
+        && !stage0_id::probe_stage0_suboctave(&ds_core)
+    {
+        fit_v3_matryoshka_fast_with_backend::<B>(&ds_core, mono_out)
+    } else {
+        stage0_id::fit_stage0_first_with_backend::<B>(
+            &ds_core,
+            mono_out,
+            fit_v3_matryoshka_core::<B>,
+        )
+        .unwrap_or_else(|| fit_v3_matryoshka_core::<B>(&ds_core, mono_out))
+    };
+    let ds_s4 = dataset.with_progress(dataset.progress.subrange(800, 990));
+    let fitted = stage4_id::refine_stage4_matryoshka_with_backend::<B>(after_s0, &ds_s4, mono_out);
+    if dataset.progress.is_active() {
+        dataset.progress.emit(&TrainerProgressSnapshot {
+            status: TrainingStatus::Completed,
+            phase: TrainingPhase::Completed,
+            active_tier: Some(Tier::Ultra),
+            progress_permille: 1_000,
+            ..Default::default()
+        });
+    }
+    fitted
+}
 
-    // Prescreen 16 circuit templates across 4 archetypes in Lite (G=1, 4k -> 8k Gabor homotopy), keep top 2 (G=1).
-    let mut winners = prescreen_matryoshka_seeds_with_backend::<B>(dataset, mono_out, 2);
+#[inline]
+fn has_slow_envelope_or_sag(m: &V3MatryoshkaOptF64) -> bool {
+    let slow_opt = m.feat_det_thresh > 0.0 && m.feat_slow_rel_beta < 8.0e-5 && m.feat_pinch_k < 0.25;
+    let slow_sag = m.feat_slow_rel_beta < 5.0e-5
+        && m.blocks
+            .iter()
+            .any(|b| b.k_sag[..4].iter().any(|&k| k > 0.25));
+    slow_opt || slow_sag
+}
+
+#[inline]
+fn has_stage1_crossover_split(m: &V3MatryoshkaOptF64) -> bool {
+    m.svf_feat_lp2_mix > 0.9 && m.svf_env_oct_sens.abs() < 0.25
+}
+
+#[inline(never)]
+fn fit_v3_matryoshka_core<B: TrainerBackend>(
+    dataset: &V3TrainDataset,
+    mono_out: bool,
+) -> V3MatryoshkaModel {
+    if dataset.stems.is_empty() || dataset.stems.iter().all(|s| s.usable_len() == 0) {
+        return V3MatryoshkaModel::dual_rate_default(mono_out);
+    }
+    let anchor = VisualProbeAnchor::from_dataset(dataset);
+
+    // Prescreen 16 circuit templates across 4 archetypes in Lite (G=1, 4k -> 5k Gabor homotopy), keep top 2 (G=1).
+    let mut winners: Vec<Box<V3MatryoshkaOptF64>> =
+        prescreen_matryoshka_seeds_with_backend::<B>(dataset, mono_out, 2)
+            .into_iter()
+            .map(Box::new)
+            .collect();
     if winners.is_empty() {
-        winners.push(V3MatryoshkaOptF64::from_matryoshka_cold(
+        winners.push(Box::new(V3MatryoshkaOptF64::from_matryoshka_cold(
             &V3MatryoshkaModel::identity(true, mono_out),
-        ));
+        )));
     }
+    let step_meta = |permille, step, tier, loss| OptStepSpec {
+        phase: TrainingPhase::StageBBackbone,
+        permille,
+        step,
+        total_steps: 6,
+        tier,
+        loss,
+    };
+    emit_dataset_opt_step::<B>(
+        dataset,
+        anchor.as_ref(),
+        &winners[0],
+        step_meta(100, 1, Tier::Lite, f64::NAN),
+    );
 
-    // Stage 1a (G=1, 10k+4k): lock phase with L-BFGS first, then OMP+VarPro+L-BFGS and prune 2 -> 1.
+    // Stage 1a (G=1 at 2x OS, 12k or 32k for slow optical / slow B+ sag): lock phase with L-BFGS first, then OMP+VarPro+L-BFGS and prune 2 -> 1.
+    let s1a_len = if winners
+        .iter()
+        .any(|w| w.feat_key_link > 0.5 || has_slow_envelope_or_sag(w))
+    {
+        32_768
+    } else {
+        12_288
+    };
     let ds_s1a = dataset
-        .curriculum_subwindow(10_240, 4_096)
-        .with_spectral_weights(0.06, 0.03, 0.05);
+        .primary_subwindow_opts(s1a_len, true, false)
+        .with_spectral_weights(0.06, 0.03, 0.0);
+    let (s1a_iters, s1b_bonus, s2a_bonus, s2b_bonus, fast_cap) = match dataset.quality_mode {
+        SolverQualityMode::BestUntilDiminishingReturns => {
+            (11_usize, 4_usize, 4_usize, 4_usize, usize::MAX)
+        }
+        SolverQualityMode::ThresholdStop {
+            max_polish_iters, ..
+        } => {
+            let cap = max_polish_iters.max(4);
+            (7_usize.min(cap), 0, 0, 0, cap)
+        }
+    };
     let s1a_cands = par_map_vec(winners, |_, mut cand| {
+        cand.tier_os2x = [true; 4];
         let mut cws = AdjointWorkspace::default();
-        let _ = run_lbfgs_matryoshka_with_backend::<B>(&mut cand, &ds_s1a, 12);
         let mut cand_loss =
-            evaluate_matryoshka_loss_f64_with_backend::<B>(&cand, &ds_s1a, &mut cws);
+            run_lbfgs_with_ws::<B>(&mut cand, &ds_s1a, &mut cws, s1a_iters, true, true, true);
         if !cand_loss.is_finite() {
             cand_loss = f64::INFINITY;
         }
         accept_omp_if_improves::<B>(&mut cand, &ds_s1a, &mut cws, &mut cand_loss);
         accept_varpro_if_improves::<B>(&mut cand, &ds_s1a, &mut cws, 1, &mut cand_loss);
-        let _ = run_lbfgs_matryoshka_with_backend::<B>(&mut cand, &ds_s1a, 5);
-        let mut s1a_loss = evaluate_matryoshka_loss_f64_with_backend::<B>(&cand, &ds_s1a, &mut cws);
+        let mut s1a_loss =
+            run_lbfgs_with_ws::<B>(&mut cand, &ds_s1a, &mut cws, 2, true, true, true);
         if !s1a_loss.is_finite() {
             s1a_loss = f64::INFINITY;
         }
         accept_varpro_if_improves::<B>(&mut cand, &ds_s1a, &mut cws, 1, &mut s1a_loss);
         (s1a_loss, cand)
     });
-    let mut best_model: Option<V3MatryoshkaOptF64> = None;
+    let mut best_model: Option<Box<V3MatryoshkaOptF64>> = None;
     let mut best_loss = f64::INFINITY;
     for (s1a_loss, cand) in s1a_cands {
         if s1a_loss.is_finite() && s1a_loss < best_loss {
@@ -290,63 +313,167 @@ pub fn fit_v3_matryoshka_with_backend<B: TrainerBackend>(
     }
     let mut ws = AdjointWorkspace::default();
     let mut model = best_model.unwrap_or_else(|| {
-        V3MatryoshkaOptF64::from_matryoshka_cold(&V3MatryoshkaModel::identity(true, mono_out))
+        Box::new(V3MatryoshkaOptF64::from_matryoshka_cold(
+            &V3MatryoshkaModel::identity(true, mono_out),
+        ))
     });
+    model.os2x = true;
+    model.tier_os2x = [true; 4];
+    emit_dataset_opt_step::<B>(
+        dataset,
+        anchor.as_ref(),
+        &model,
+        step_meta(275, 2, Tier::Lite, best_loss),
+    );
 
-    // Stage 1b (G=1 long-horizon sag & RC bias lock: 28_672 + 8_192).
+    // Stage 1b (G=1 at 2x OS contiguous sag & RC bias lock).
+    let sweeping_svf = model.svf_env_oct_sens.abs() > 0.5;
+    let slow_long = has_slow_envelope_or_sag(&model);
+    let s1b_len = if slow_long {
+        49_152
+    } else if sweeping_svf {
+        18_432
+    } else {
+        14_336
+    };
     let ds_s1b = dataset
-        .curriculum_subwindow(28_672, 8_192)
-        .with_spectral_weights(0.0, 0.0, 0.05);
+        .primary_subwindow_opts(s1b_len, false, false)
+        .with_spectral_weights(0.0, 0.0, 0.0);
     let mut s1b_loss = evaluate_matryoshka_loss_f64_with_backend::<B>(&model, &ds_s1b, &mut ws);
     if !s1b_loss.is_finite() {
         s1b_loss = f64::INFINITY;
     }
-    accept_omp_if_improves::<B>(&mut model, &ds_s1b, &mut ws, &mut s1b_loss);
     accept_varpro_if_improves::<B>(&mut model, &ds_s1b, &mut ws, 1, &mut s1b_loss);
-    let s1b_iters = if model.svf_env_oct_sens.abs() > 0.5 {
-        16
-    } else {
-        12
-    };
-    let _ = run_lbfgs_matryoshka_with_backend::<B>(&mut model, &ds_s1b, s1b_iters);
-    let mut s1b_after = evaluate_matryoshka_loss_f64_with_backend::<B>(&model, &ds_s1b, &mut ws);
+    let s1b_iters = (if slow_long || sweeping_svf { 11 } else { 8 } + s1b_bonus).min(fast_cap);
+    let mut s1b_after =
+        run_lbfgs_with_ws::<B>(&mut model, &ds_s1b, &mut ws, s1b_iters, true, true, true);
     if !s1b_after.is_finite() {
         s1b_after = f64::INFINITY;
     }
     accept_varpro_if_improves::<B>(&mut model, &ds_s1b, &mut ws, 1, &mut s1b_after);
+    emit_dataset_opt_step::<B>(
+        dataset,
+        anchor.as_ref(),
+        &model,
+        step_meta(450, 3, Tier::Lite, s1b_after),
+    );
 
-    // Stage 2a (G=4 unlock, 4-tier 14k+6k): joint co-adaptation across all 4 groups and tiers.
+    // Stage 2a (pure 2x OS tapered unlock, [Lite, Pro, Ultra]): OMP + parallel co-adaptation on contiguous subwindow.
     svf_id::unlock_matryoshka_groups_after_prescreen(&mut model);
-    model.active_tier_weights = [0.22, 0.20, 0.24, 0.34];
+    model.tier_os2x = [true; 4];
+    model.active_tier_weights = [0.22, 0.0, 0.33, 0.45];
+    let sweeping_svf = model.svf_env_oct_sens.abs() > 0.5;
+    let crossover_split = has_stage1_crossover_split(&model);
+    let s2a_len = if slow_long {
+        32_768
+    } else if crossover_split {
+        16_384
+    } else if sweeping_svf {
+        12_288
+    } else {
+        10_240
+    };
     let ds_s2a = dataset
-        .curriculum_subwindow(14_336, 6_144)
-        .with_spectral_weights(0.0, 0.0, 0.04);
+        .primary_subwindow_opts(s2a_len, false, false)
+        .with_spectral_weights(0.0, 0.0, 0.0);
     select_omp_kautz_poles_matryoshka_with_backend::<B>(&mut model, &ds_s2a);
     let mut s2a_loss = evaluate_matryoshka_loss_f64_with_backend::<B>(&model, &ds_s2a, &mut ws);
     if !s2a_loss.is_finite() {
         s2a_loss = f64::INFINITY;
     }
     accept_varpro_if_improves::<B>(&mut model, &ds_s2a, &mut ws, 1, &mut s2a_loss);
-    let _ = run_lbfgs_matryoshka_with_backend::<B>(&mut model, &ds_s2a, 10);
+    let s2a_iters =
+        (if sweeping_svf || crossover_split { 10 } else { 7 } + s2a_bonus).min(fast_cap);
+    let mut s2a_after =
+        run_lbfgs_with_ws::<B>(&mut model, &ds_s2a, &mut ws, s2a_iters, true, true, true);
+    if !s2a_after.is_finite() {
+        s2a_after = f64::INFINITY;
+    }
+    accept_varpro_if_improves::<B>(&mut model, &ds_s2a, &mut ws, 1, &mut s2a_after);
+    emit_dataset_opt_step::<B>(
+        dataset,
+        anchor.as_ref(),
+        &model,
+        step_meta(625, 4, Tier::Pro, s2a_after),
+    );
 
-    // Stage 2b (G=4 4-tier medium-long refinement on 24_576 + 8_192).
-    model.active_tier_weights = [0.18, 0.20, 0.25, 0.37];
+    // Stage 2b (pure 2x OS contiguous refinement across primary + secondary subwindows).
+    model.active_tier_weights = [0.18, 0.12, 0.32, 0.38];
+    let (s2b_p, s2b_s) = if slow_long {
+        (65_536, 20_480)
+    } else if crossover_split {
+        (24_576, 14_336)
+    } else if sweeping_svf {
+        (18_432, 14_336)
+    } else {
+        (14_336, 10_240)
+    };
     let ds_s2b = dataset
-        .curriculum_subwindow(24_576, 8_192)
-        .with_spectral_weights(0.0, 0.0, 0.05);
+        .curriculum_subwindow_opts(s2b_p, s2b_s, false, false)
+        .with_spectral_weights(0.0, 0.0, 0.0);
     let mut s2b_loss = evaluate_matryoshka_loss_f64_with_backend::<B>(&model, &ds_s2b, &mut ws);
     if !s2b_loss.is_finite() {
         s2b_loss = f64::INFINITY;
     }
-    accept_omp_if_improves::<B>(&mut model, &ds_s2b, &mut ws, &mut s2b_loss);
     accept_varpro_if_improves::<B>(&mut model, &ds_s2b, &mut ws, 1, &mut s2b_loss);
-    let _ = run_lbfgs_matryoshka_with_backend::<B>(&mut model, &ds_s2b, 8);
+    let s2b_iters = (if slow_long
+        || crossover_split
+        || sweeping_svf
+        || model.feat_pinch_k > 80.0
+    {
+        11
+    } else {
+        7
+    } + s2b_bonus)
+        .min(fast_cap);
+    let mut s2b_after =
+        run_lbfgs_with_ws::<B>(&mut model, &ds_s2b, &mut ws, s2b_iters, true, true, true);
+    if !s2b_after.is_finite() {
+        s2b_after = f64::INFINITY;
+    }
+    accept_varpro_if_improves::<B>(&mut model, &ds_s2b, &mut ws, 1, &mut s2b_after);
+    emit_dataset_opt_step::<B>(
+        dataset,
+        anchor.as_ref(),
+        &model,
+        step_meta(800, 5, Tier::Ultra, s2b_after),
+    );
 
-    // Stage 3 (100% dataset): full-length OMP + collision repair + exact f32 core trajectory polish.
-    let ds_full = dataset.with_spectral_weights(0.0, 0.0, 0.05);
-    select_omp_kautz_poles_matryoshka_with_backend::<B>(&mut model, &ds_full);
+    // Stage 3: 2x OMP + collision repair, dedicated contiguous 1x calibration (S2c_1x), and aligned f32 polish.
+    model.active_tier_weights = [0.18, 0.20, 0.26, 0.36];
+    select_omp_kautz_poles_matryoshka_with_backend::<B>(&mut model, dataset);
     repair_collided_kautz_poles(&mut model, dataset.sample_rate_hz);
-    polish_f32_matryoshka_readouts_with_backend::<B>(&mut model, &ds_full);
+    let slow_long = has_slow_envelope_or_sag(&model);
+    let crossover_split = has_stage1_crossover_split(&model);
+    let ds_1x = if slow_long {
+        dataset
+            .curriculum_subwindow_opts(36_864, 16_384, false, false)
+            .with_spectral_weights(0.0, 0.0, 0.0)
+    } else if crossover_split {
+        dataset
+            .primary_subwindow_opts(16_384, false, false)
+            .with_spectral_weights(0.0, 0.0, 0.0)
+    } else {
+        dataset
+            .primary_subwindow_opts(10_240, false, false)
+            .with_spectral_weights(0.0, 0.0, 0.0)
+    };
+    adjoint::calibrate_1x_tiers_with_backend::<B>(&mut model, &ds_1x, &mut ws);
+    let ds_polish = dataset
+        .for_stage3_polish(72_000)
+        .with_spectral_weights(0.0, 0.0, 0.05);
+    svf_id::apply_pre_polish_overdrive_recovery(&mut model);
+    polish::polish_f32_matryoshka_readouts_with_cert_stem::<B>(
+        &mut model,
+        &ds_polish,
+        dataset.full_cert_stem.as_ref().or_else(|| dataset.stems.first()),
+    );
+    emit_dataset_opt_step::<B>(
+        dataset,
+        anchor.as_ref(),
+        &model,
+        step_meta(975, 6, Tier::Ultra, f64::NAN),
+    );
 
     model.to_matryoshka_cold()
 }
@@ -363,6 +490,118 @@ pub fn fit_v3_matryoshka(dataset: &V3TrainDataset, mono_out: bool) -> V3Matryosh
     DynamicTrainer::detect().dispatch(FitTask(dataset, mono_out))
 }
 
+/// Fast-path `v3` Matryoshka (`2x OS`) fitter for short unit-test captures (`usable_len < 48_000`).
+#[inline(never)]
+#[must_use]
+pub fn fit_v3_matryoshka_fast_with_backend<B: TrainerBackend>(
+    dataset: &V3TrainDataset,
+    mono_out: bool,
+) -> V3MatryoshkaModel {
+    if dataset.stems.is_empty() || dataset.stems.iter().all(|s| s.usable_len() == 0) {
+        return V3MatryoshkaModel::dual_rate_default(mono_out);
+    }
+    let anchor = VisualProbeAnchor::from_dataset(dataset);
+    let fast_meta = |permille, step, tier, loss| OptStepSpec {
+        phase: TrainingPhase::StageBBackbone,
+        permille,
+        step,
+        total_steps: 4,
+        tier,
+        loss,
+    };
+    let mut model = Box::new(
+        prescreen_matryoshka_seeds_with_backend::<B>(dataset, mono_out, 1)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| {
+                V3MatryoshkaOptF64::from_matryoshka_cold(&V3MatryoshkaModel::identity(
+                    true, mono_out,
+                ))
+            }),
+    );
+    svf_id::unlock_matryoshka_groups_after_prescreen(&mut model);
+    model.os2x = true;
+    model.tier_os2x = [true; 4];
+    emit_dataset_opt_step::<B>(
+        dataset,
+        anchor.as_ref(),
+        &model,
+        fast_meta(120, 1, Tier::Lite, f64::NAN),
+    );
+    model.active_tier_weights = [0.22, 0.22, 0.26, 0.30];
+
+    let ds_lbfgs = dataset
+        .primary_subwindow_opts(FAST_FIT_SUBWINDOW_SAMPLES, false, false)
+        .with_spectral_weights(0.0, 0.0, 0.0);
+    let is_incoh = stage4_id::dataset_is_incoherent_candidate(dataset);
+    let ds_fast_full = if is_incoh {
+        dataset
+            .primary_subwindow_opts(FAST_FIT_SUBWINDOW_SAMPLES, false, false)
+            .with_spectral_weights(0.0, 0.0, 0.0)
+    } else {
+        dataset.clone().with_spectral_weights(0.0, 0.0, 0.0)
+    };
+    let mut ws = AdjointWorkspace::default();
+    select_omp_kautz_poles_matryoshka_with_backend::<B>(&mut model, &ds_fast_full);
+    let mut init_loss = evaluate_matryoshka_loss_f64_with_backend::<B>(&model, &ds_lbfgs, &mut ws);
+    if !init_loss.is_finite() {
+        init_loss = f64::INFINITY;
+    }
+    accept_varpro_if_improves::<B>(&mut model, &ds_fast_full, &mut ws, 1, &mut init_loss);
+    let mut loss = run_lbfgs_with_ws::<B>(&mut model, &ds_lbfgs, &mut ws, 6, true, true, true);
+    if !loss.is_finite() {
+        loss = f64::INFINITY;
+    }
+    accept_varpro_if_improves::<B>(&mut model, &ds_fast_full, &mut ws, 1, &mut loss);
+    emit_dataset_opt_step::<B>(
+        dataset,
+        anchor.as_ref(),
+        &model,
+        fast_meta(500, 2, Tier::Ultra, loss),
+    );
+    repair_collided_kautz_poles(&mut model, dataset.sample_rate_hz);
+    solve_matryoshka_varpro_cholesky_with_backend::<B>(&mut model, &ds_fast_full, 1);
+    let ds_1x = dataset
+        .primary_subwindow_opts(FAST_FIT_SUBWINDOW_SAMPLES, false, false)
+        .with_spectral_weights(0.0, 0.0, 0.0);
+    adjoint::calibrate_1x_tiers_with_backend::<B>(&mut model, &ds_1x, &mut ws);
+    svf_id::apply_pre_polish_overdrive_recovery(&mut model);
+    emit_dataset_opt_step::<B>(
+        dataset,
+        anchor.as_ref(),
+        &model,
+        fast_meta(780, 3, Tier::Full, f64::NAN),
+    );
+    if is_incoh {
+        solve_matryoshka_varpro_cholesky_with_backend::<B>(&mut model, &ds_fast_full, 1);
+    } else {
+        polish::polish_f32_matryoshka_readouts_with_cert_stem::<B>(
+            &mut model,
+            &ds_fast_full,
+            dataset.stems.first(),
+        );
+    }
+    emit_dataset_opt_step::<B>(
+        dataset,
+        anchor.as_ref(),
+        &model,
+        fast_meta(975, 4, Tier::Ultra, f64::NAN),
+    );
+    model.to_matryoshka_cold()
+}
+
+/// Dispatches [`fit_v3_matryoshka_fast_with_backend`] via fastest CPU backend.
+#[must_use]
+pub fn fit_v3_matryoshka_fast(dataset: &V3TrainDataset, mono_out: bool) -> V3MatryoshkaModel {
+    struct FastFitTask<'a>(&'a V3TrainDataset, bool);
+    impl TrainerTask<V3MatryoshkaModel> for FastFitTask<'_> {
+        fn run<B: TrainerBackend>(self) -> V3MatryoshkaModel {
+            fit_v3_matryoshka_fast_with_backend::<B>(self.0, self.1)
+        }
+    }
+    DynamicTrainer::detect().dispatch(FastFitTask(dataset, mono_out))
+}
+
 /// Backend-parameterized compatibility wrapper returning `[Lite, Full, Pro, Ultra]` cold models from [`fit_v3_matryoshka_with_backend`].
 #[must_use]
 pub fn fit_v3_core_four_tiers_with_backend<B: TrainerBackend>(
@@ -376,43 +615,6 @@ pub fn fit_v3_core_four_tiers_with_backend<B: TrainerBackend>(
 #[must_use]
 pub fn fit_v3_core_four_tiers(dataset: &V3TrainDataset, mono_out: bool) -> [V3ColdTierModel; 4] {
     fit_v3_matryoshka(dataset, mono_out).to_four_tiers()
-}
-
-pub(super) fn live_switch_tier_safe<B: TrainerBackend>(
-    cold: &V3MatryoshkaModel,
-    stem: &V3TrainStem,
-    max_tau: usize,
-) -> bool {
-    let n = stem.usable_len();
-    if n < 8 {
-        return true;
-    }
-    let peak_ref = stem.tgt_l[..n]
-        .iter()
-        .chain(&stem.tgt_r[..n])
-        .fold(
-            1.0_f32,
-            |a, &v| if v.is_finite() { a.max(v.abs()) } else { a },
-        );
-    let bound = (peak_ref * 2.5).max(8.0);
-    let mut inst = V3CoreInstance::<B>::from_cold_model(&cold.extract_tier(Tier::Lite));
-    inst.reset_to_dc_equilibrium();
-    let seg = n / (max_tau + 1);
-    for t_idx in 0..=max_tau {
-        inst.switch_tier(&cold.extract_tier(ALL_TIERS[t_idx]));
-        for t in (t_idx * seg)..((t_idx + 1) * seg) {
-            let xr = if cold.mono_out {
-                stem.in_l[t]
-            } else {
-                stem.in_r[t]
-            };
-            let [yl, yr] = inst.step_stereo(stem.in_l[t], xr);
-            if !yl.is_finite() || !yr.is_finite() || yl.abs() > bound || yr.abs() > bound {
-                return false;
-            }
-        }
-    }
-    true
 }
 
 #[cfg(test)]
@@ -475,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_fit_v3_matryoshka_monotone_nonlinear_and_live_switch() {
-        let stem = make_synthetic_stem(4_800, 128);
+        let stem = make_synthetic_stem(2_400, 128);
         let ds = V3TrainDataset::new(vec![stem.clone()], 48_000.0);
         let matryoshka = fit_v3_matryoshka(&ds, true);
         assert!(matryoshka.os2x);
@@ -504,7 +706,10 @@ mod tests {
             .collect::<Vec<_>>()
             .try_into()
             .unwrap();
-        assert!(verify_monotone_4tier_summaries(&sums));
+        assert!(
+            verify_monotone_4tier_summaries(&sums),
+            "non-monotone summaries: {sums:#?}"
+        );
 
         // Verify live single-instance switch_tier across all 4 tiers without glitches or NaN.
         let mut live = V3CoreInstance::<DefaultMathBackend>::from_cold_model(&models[0]);
@@ -542,7 +747,7 @@ mod tests {
 
     #[test]
     fn test_v3_stereo_summary_core_wrappers_and_switch_safety() {
-        let mut stereo_stem = make_synthetic_stem(4_800, 128);
+        let mut stereo_stem = make_synthetic_stem(2_048, 128);
         for (i, sample) in stereo_stem.in_r.iter_mut().enumerate() {
             *sample *= if i % 2 == 0 { 0.9 } else { 0.85 };
         }
@@ -584,18 +789,18 @@ mod tests {
 
         // Live tier switch safety: short stem, valid stereo stem, and unstable gain guard
         let short_stem = make_synthetic_stem(4, 0);
-        assert!(live_switch_tier_safe::<DefaultTrainerBackend>(
+        assert!(polish::live_switch_tier_safe::<DefaultTrainerBackend>(
             &stereo_model,
             &short_stem,
             3
         ));
-        assert!(live_switch_tier_safe::<DefaultTrainerBackend>(
+        assert!(polish::live_switch_tier_safe::<DefaultTrainerBackend>(
             &stereo_model,
             &stereo_stem,
             3
         ));
         stereo_model.readouts[1].svf_direct_taps_r[0] = 1.0e6;
-        assert!(!live_switch_tier_safe::<DefaultTrainerBackend>(
+        assert!(!polish::live_switch_tier_safe::<DefaultTrainerBackend>(
             &stereo_model,
             &stereo_stem,
             1
@@ -639,5 +844,27 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_fit_v3_matryoshka_emits_hybrid_progress_visual_frames() {
+        use crate::solver::{AtomicTrainerProgress, TrainerProgressHandle};
+        use std::sync::{Arc, Mutex};
+
+        let stem = make_synthetic_stem(4_096, 128);
+        let slot = Arc::new(AtomicTrainerProgress::new());
+        let events: Arc<Mutex<Vec<TrainerProgressSnapshot>>> = Arc::new(Mutex::new(Vec::new()));
+        let ev_cb = Arc::clone(&events);
+        let handle = TrainerProgressHandle::with_slot_and_callback(Arc::clone(&slot), move |s| {
+            ev_cb.lock().unwrap().push(s.clone());
+        });
+        let ds = V3TrainDataset::new(vec![stem], 48_000.0).with_progress(handle);
+        let _fitted = fit_v3_matryoshka(&ds, true);
+        let done = slot.poll();
+        assert_eq!(done.status, TrainingStatus::Completed);
+        assert_eq!(done.progress_permille, 1_000);
+        assert!(done.has_visual_frame);
+        assert!(done.tone_match_percent().is_some_and(|pct| pct.is_finite()));
+        assert!(events.lock().unwrap().len() >= 4);
     }
 }

@@ -9,6 +9,8 @@
  *
  * verify[repo.code.type-safety-and-imports]
  * verify[repo.code.modular-decomposition-and-tests]
+ * verify[repo.code.constant-eval-and-derivations]
+ * verify[repo.code.universal-black-box]
  * verify[repo.docs.agents-md-budgets]
  * verify[repo.docs.requirements-layer]
  * verify[repo.docs.spec-rules-and-adrs]
@@ -100,7 +102,7 @@ function walkMarkdownFiles(root: string): string[] {
   return results.sort();
 }
 
-function walkFilesByExtensions(root: string, extensions: Set<string>): string[] {
+function walkFilesByExtensions(root: string, extensions: ReadonlySet<string>): string[] {
   const results: string[] = [];
   if (!fs.existsSync(root)) {
     return results;
@@ -334,6 +336,240 @@ function normalizeSpecRelPath(rawSpecRef: string): string {
   return trimmed;
 }
 
+function isEscapedBackslashRun(text: string, idx: number): boolean {
+  let bs = 0;
+  while (idx > bs && text[idx - 1 - bs] === "\\") {
+    bs++;
+  }
+  return (bs & 1) === 1;
+}
+
+function stripTomlComment(line: string): string {
+  let inSingle = false;
+  let inDouble = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === "'" && !inDouble) {
+      inSingle = !inSingle;
+    } else if (ch === '"' && !inSingle && !isEscapedBackslashRun(line, i)) {
+      inDouble = !inDouble;
+    } else if (ch === "#" && !inSingle && !inDouble) {
+      return line.slice(0, i);
+    }
+  }
+  return line;
+}
+
+function extractTomlTableHeader(clean: string): string {
+  const isArrayTable = clean.startsWith("[[");
+  const openLen = isArrayTable ? 2 : 1;
+  expect(
+    isArrayTable
+      ? clean.endsWith("]]") && clean.length > 4
+      : clean.endsWith("]") && clean.length > 2,
+    `Malformed TOML table header: ${clean}`,
+  ).toBe(true);
+  const inner = clean.slice(openLen, clean.length - openLen);
+  let inS = false;
+  let inD = false;
+  for (let i = 0; i < inner.length; i++) {
+    const ch = inner[i];
+    if (ch === "'" && !inD) {
+      inS = !inS;
+    } else if (ch === '"' && !inS && !isEscapedBackslashRun(inner, i)) {
+      inD = !inD;
+    } else if (!inS && !inD && (ch === "[" || ch === "]")) {
+      throw new Error(`Unquoted bracket inside TOML table header: ${clean}`);
+    }
+  }
+  expect(!inS && !inD, `Unterminated quote inside TOML table header: ${clean}`).toBe(true);
+  return inner.trim();
+}
+
+function updateTomlLineDepths(
+  clean: string,
+  bracketDepth: number,
+  braceDepth: number,
+): [number, number] {
+  let inS = false;
+  let inD = false;
+  let bDepth = bracketDepth;
+  let brDepth = braceDepth;
+  for (let i = 0; i < clean.length; i++) {
+    const ch = clean[i];
+    if (ch === "'" && !inD) {
+      inS = !inS;
+    } else if (ch === '"' && !inS && !isEscapedBackslashRun(clean, i)) {
+      inD = !inD;
+    } else if (!inS && !inD) {
+      if (ch === "[") bDepth++;
+      else if (ch === "]") bDepth = Math.max(0, bDepth - 1);
+      else if (ch === "{") brDepth++;
+      else if (ch === "}") brDepth = Math.max(0, brDepth - 1);
+    }
+  }
+  return [bDepth, brDepth];
+}
+
+function parseTomlSections(tomlText: string): Array<{ header: string; body: string }> {
+  expect(tomlText, "Cargo.toml must not use multi-line triple-quoted strings").not.toMatch(
+    /'''|"""/,
+  );
+  const sections: Array<{ header: string; body: string }> = [];
+  let currentHeader = "";
+  let currentLines: string[] = [];
+  let bracketDepth = 0;
+  let braceDepth = 0;
+  for (const rawLine of tomlText.split("\n")) {
+    const clean = stripTomlComment(rawLine).trim();
+    if (!clean) {
+      continue;
+    }
+    if (bracketDepth === 0 && braceDepth === 0 && clean.startsWith("[")) {
+      sections.push({ header: currentHeader, body: currentLines.join("\n") });
+      currentHeader = extractTomlTableHeader(clean);
+      currentLines = [];
+      continue;
+    }
+    currentLines.push(clean);
+    [bracketDepth, braceDepth] = updateTomlLineDepths(clean, bracketDepth, braceDepth);
+  }
+  sections.push({ header: currentHeader, body: currentLines.join("\n") });
+  return sections;
+}
+
+function skipRustBlockComment(src: string, start: number): [string, number] {
+  let i = start + 2;
+  let depth = 1;
+  let newlines = "";
+  while (i < src.length && depth > 0) {
+    if (src[i] === "/" && src[i + 1] === "*") {
+      depth++;
+      i += 2;
+    } else if (src[i] === "*" && src[i + 1] === "/") {
+      depth--;
+      i += 2;
+    } else {
+      if (src[i] === "\n") newlines += "\n";
+      i++;
+    }
+  }
+  return [`${newlines} `, i];
+}
+
+function matchRustRawStringEnd(src: string, i: number): [string, number] | null {
+  const ch = src[i] ?? "";
+  const next = src[i + 1] ?? "";
+  const isRaw = ch === "r" && (next === '"' || next === "#");
+  const isByteRaw = ch === "b" && next === "r" && (src[i + 2] === '"' || src[i + 2] === "#");
+  if (!isRaw && !isByteRaw) {
+    return null;
+  }
+  let hashes = 0;
+  let j = isByteRaw ? i + 2 : i + 1;
+  while (src[j] === "#") {
+    hashes++;
+    j++;
+  }
+  if (src[j] !== '"') {
+    return null;
+  }
+  const closing = `"${"#".repeat(hashes)}`;
+  const endIdx = src.indexOf(closing, j + 1);
+  if (endIdx === -1) {
+    return null;
+  }
+  const nlCount = (src.slice(j + 1, endIdx).match(/\n/g) ?? []).length;
+  return [`""${"\n".repeat(nlCount)}`, endIdx + closing.length];
+}
+
+function matchEscapedRustCharEnd(src: string, q: number): number {
+  const esc = src[q + 2] ?? "";
+  if (esc === "x") {
+    return src[q + 5] === "'" ? q + 6 : -1;
+  }
+  if (esc === "u" && src[q + 3] === "{") {
+    const braceIdx = src.indexOf("}", q + 4);
+    return braceIdx !== -1 && braceIdx <= q + 12 && src[braceIdx + 1] === "'" ? braceIdx + 2 : -1;
+  }
+  return esc !== "" && esc !== "\n" && esc !== "\r" && src[q + 3] === "'" ? q + 4 : -1;
+}
+
+function matchRustCharLiteralEnd(src: string, i: number): number {
+  const q = src[i] === "b" && src[i + 1] === "'" ? i + 1 : i;
+  const c1 = src[q + 1] ?? "";
+  if (c1 === "\\") {
+    return matchEscapedRustCharEnd(src, q);
+  }
+  if (c1 !== "" && c1 !== "'" && c1 !== "\n" && c1 !== "\r") {
+    const cp = src.codePointAt(q + 1);
+    const cpLen = cp !== undefined && cp > 0xffff ? 2 : 1;
+    return src[q + 1 + cpLen] === "'" ? q + 2 + cpLen : -1;
+  }
+  return -1;
+}
+
+function skipRustQuotedString(src: string, start: number): [string, number] {
+  let out = '"';
+  let i = start + 1;
+  while (i < src.length && src[i] !== '"') {
+    if (src[i] === "\\") {
+      if (src[i + 1] === "\n") out += "\n";
+      i += 2;
+    } else {
+      if (src[i] === "\n") out += "\n";
+      i++;
+    }
+  }
+  out += '"';
+  return [out, i < src.length ? i + 1 : i];
+}
+
+function tryConsumeRustComment(src: string, i: number): [string, number] | null {
+  const ch = src[i] ?? "";
+  const next = src[i + 1] ?? "";
+  if (ch === "/" && next === "/") {
+    let j = i;
+    while (j < src.length && src[j] !== "\n") j++;
+    return ["", j];
+  }
+  if (ch === "/" && next === "*") {
+    return skipRustBlockComment(src, i);
+  }
+  return null;
+}
+
+function tryConsumeRustStringOrChar(src: string, i: number): [string, number] | null {
+  const rawMatch = matchRustRawStringEnd(src, i);
+  if (rawMatch) return rawMatch;
+  const ch = src[i] ?? "";
+  const next = src[i + 1] ?? "";
+  if (ch === "b" && next === '"') return ["", i + 1];
+  if (ch === "'" || (ch === "b" && next === "'")) {
+    const charEnd = matchRustCharLiteralEnd(src, i);
+    if (charEnd !== -1) return ["''", charEnd];
+    if (ch === "b") return ["b'", i + 2];
+  }
+  if (ch === '"') return skipRustQuotedString(src, i);
+  return null;
+}
+
+function stripRustCommentsAndStrings(src: string): string {
+  let out = "";
+  let i = 0;
+  while (i < src.length) {
+    const token = tryConsumeRustComment(src, i) ?? tryConsumeRustStringOrChar(src, i);
+    if (token) {
+      out += token[0];
+      i = token[1];
+      continue;
+    }
+    out += src[i] ?? "";
+    i++;
+  }
+  return out;
+}
+
 describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
   it("test_three_layer_docs_directory_structure", () => {
     expect(fs.existsSync(path.join(DOCS_DIR, "index.md"))).toBe(true);
@@ -413,7 +649,14 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     }
   });
 
-  it("test_all_adr_files_have_valid_yaml_frontmatter", () => {
+  interface AdrRegistryMaps {
+    seenAdrIds: Map<string, string>;
+    adrStatuses: Map<string, string>;
+    adrSupersededBy: Map<string, string>;
+    adrFilenames: Map<string, string>;
+  }
+
+  function validateAdrFrontmatterFile(adrPath: string, maps: AdrRegistryMaps): void {
     const requiredKeys = [
       "id",
       "title",
@@ -423,59 +666,40 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       "specs",
       "requirements",
     ];
-    const adrFiles = fs
-      .readdirSync(ADR_DIR)
-      .filter((n) => n.endsWith(".md") && n !== "README.md")
-      .sort()
-      .map((n) => path.join(ADR_DIR, n));
-    expect(adrFiles.length).toBeGreaterThanOrEqual(18);
-
-    const seenAdrIds = new Map<string, string>();
-    const adrStatuses = new Map<string, string>();
-    const adrSupersededBy = new Map<string, string>();
-    const adrFilenames = new Map<string, string>();
-    for (const adrPath of adrFiles) {
-      const text = fs.readFileSync(adrPath, "utf8");
-      const fm = parseFrontmatter(text);
-      expect(fm, `${relPath(adrPath)} is missing YAML frontmatter`).not.toBeNull();
-      if (!fm) {
-        continue;
-      }
-      for (const key of requiredKeys) {
-        expect(key in fm, `${relPath(adrPath)} frontmatter is missing '${key}'`).toBe(true);
-      }
-      const adrId = String(fm["id"]);
-      expect(adrId).toMatch(/^ADR-\d{4}$/);
-      expect(path.basename(adrPath).startsWith(adrId.slice(4))).toBe(true);
-      expect(seenAdrIds.has(adrId)).toBe(false);
-      seenAdrIds.set(adrId, relPath(adrPath));
-      adrFilenames.set(adrId, path.basename(adrPath));
-      const status = String(fm["status"]);
-      adrStatuses.set(adrId, status);
-      expect(["proposed", "accepted", "superseded"].includes(status)).toBe(true);
-      expect(Array.isArray(fm["specs"])).toBe(true);
-      expect(Array.isArray(fm["requirements"])).toBe(true);
-      if (status === "accepted") {
-        expect((fm["specs"] as string[]).length).toBeGreaterThan(0);
-      }
-      if (status === "superseded") {
-        const supBy = String(fm["superseded_by"]);
-        expect(supBy).toMatch(/^ADR-\d{4}$/);
-        adrSupersededBy.set(adrId, supBy);
-      }
+    const text = fs.readFileSync(adrPath, "utf8");
+    const fm = parseFrontmatter(text);
+    expect(fm, `${relPath(adrPath)} is missing YAML frontmatter`).not.toBeNull();
+    if (!fm) {
+      return;
     }
-
-    for (const [adrId, supBy] of adrSupersededBy.entries()) {
-      expect(adrStatuses.has(supBy), `${adrId} superseded_by '${supBy}' does not exist`).toBe(true);
-      expect(
-        adrStatuses.get(supBy) !== "superseded",
-        `${adrId} superseded_by '${supBy}' points to another superseded ADR`,
-      ).toBe(true);
+    for (const key of requiredKeys) {
+      expect(key in fm, `${relPath(adrPath)} frontmatter is missing '${key}'`).toBe(true);
     }
+    const adrId = String(fm["id"]);
+    expect(adrId).toMatch(/^ADR-\d{4}$/);
+    expect(path.basename(adrPath).startsWith(adrId.slice(4))).toBe(true);
+    expect(maps.seenAdrIds.has(adrId)).toBe(false);
+    maps.seenAdrIds.set(adrId, relPath(adrPath));
+    maps.adrFilenames.set(adrId, path.basename(adrPath));
+    const status = String(fm["status"]);
+    maps.adrStatuses.set(adrId, status);
+    expect(["proposed", "accepted", "superseded"].includes(status)).toBe(true);
+    expect(Array.isArray(fm["specs"])).toBe(true);
+    expect(Array.isArray(fm["requirements"])).toBe(true);
+    if (status === "accepted") {
+      expect((fm["specs"] as string[]).length).toBeGreaterThan(0);
+    }
+    if (status === "superseded") {
+      const supBy = String(fm["superseded_by"]);
+      expect(supBy).toMatch(/^ADR-\d{4}$/);
+      maps.adrSupersededBy.set(adrId, supBy);
+    }
+  }
 
-    const supersededIds = Array.from(adrStatuses.entries())
-      .filter(([, st]) => st === "superseded")
-      .map(([aid]) => aid);
+  function verifySupersededAdrsNotCited(
+    supersededIds: readonly string[],
+    adrFilenames: ReadonlyMap<string, string>,
+  ): void {
     for (const docFile of [REQ_FILE, ...walkMarkdownFiles(SPECS_DIR)]) {
       const rawText = fs.readFileSync(docFile, "utf8");
       const cleanBody = stripCode(rawText);
@@ -493,6 +717,40 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
         ).toBe(false);
       }
     }
+  }
+
+  it("test_all_adr_files_have_valid_yaml_frontmatter", () => {
+    const adrFiles = fs
+      .readdirSync(ADR_DIR)
+      .filter((n) => n.endsWith(".md") && n !== "README.md")
+      .sort()
+      .map((n) => path.join(ADR_DIR, n));
+    expect(adrFiles.length).toBeGreaterThanOrEqual(18);
+
+    const maps: AdrRegistryMaps = {
+      seenAdrIds: new Map(),
+      adrStatuses: new Map(),
+      adrSupersededBy: new Map(),
+      adrFilenames: new Map(),
+    };
+    for (const adrPath of adrFiles) {
+      validateAdrFrontmatterFile(adrPath, maps);
+    }
+
+    for (const [adrId, supBy] of maps.adrSupersededBy.entries()) {
+      expect(maps.adrStatuses.has(supBy), `${adrId} superseded_by '${supBy}' does not exist`).toBe(
+        true,
+      );
+      expect(
+        maps.adrStatuses.get(supBy) !== "superseded",
+        `${adrId} superseded_by '${supBy}' points to another superseded ADR`,
+      ).toBe(true);
+    }
+
+    const supersededIds = Array.from(maps.adrStatuses.entries())
+      .filter(([, st]) => st === "superseded")
+      .map(([aid]) => aid);
+    verifySupersededAdrsNotCited(supersededIds, maps.adrFilenames);
   });
 
   it("test_requirement_registry_and_agnostic_prose", () => {
@@ -507,11 +765,11 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     expect(fm["layer"]).toBe("requirements");
 
     const reqIds = Array.from(text.matchAll(REQ_TABLE_RE), (m) => m[1] ?? "");
-    expect(reqIds.length).toBe(40);
+    expect(reqIds.length).toBe(41);
     expect(reqIds.length).toBe(new Set(reqIds).size);
 
     const expectedCounts: Record<number, number> = {
-      1: 8,
+      1: 9,
       2: 5,
       3: 3,
       4: 3,
@@ -587,67 +845,54 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     }
   });
 
-  it("test_spec_rule_identifiers_adr_structure_and_no_spec_text_parsing", () => {
-    const rules = collectSpecRules();
-    expect(rules.size).toBeGreaterThanOrEqual(150);
-
-    const duplicates: string[] = [];
-    for (const [ruleId, locations] of rules.entries()) {
-      if (locations.length > 1) {
-        const locStr = locations.map(([p, ln]) => `${p}:${ln}`).join(", ");
-        duplicates.push(`r[${ruleId}] defined multiple times: ${locStr}`);
-      }
-    }
-    expect(duplicates).toEqual([]);
-
-    const missingLeafRules: string[] = [];
+  function checkSpecHeadingSections(
+    specPath: string,
+    clean: string,
+    missingLeafRules: string[],
+  ): void {
     const sectionHeadingRe = /^(#{2,4})\s+(.+?)\s*$/gm;
-    for (const specPath of walkMarkdownFiles(SPECS_DIR)) {
-      const text = fs.readFileSync(specPath, "utf8");
-      const fm = parseFrontmatter(text);
-      const prefixes = Array.isArray(fm?.["rule_prefixes"]) ? fm["rule_prefixes"] : [];
-      const clean = stripFencedCodeBlocks(text);
-      const fileRules = Array.from(clean.matchAll(SPEC_RULE_DEF_RE), (m) => m[1] ?? m[2] ?? "");
-      expect(fileRules.length, `${relPath(specPath)} defines zero r[...] rules`).toBeGreaterThan(0);
-      for (const ruleId of fileRules) {
-        const fullToken = `r[${ruleId}]`;
-        expect(
-          prefixes.some((prefix) => fullToken.startsWith(prefix)),
-          `${relPath(specPath)}: rule '${fullToken}' does not match any frontmatter rule_prefixes`,
-        ).toBe(true);
-      }
-
-      const headings = Array.from(clean.matchAll(sectionHeadingRe));
-      for (let idx = 0; idx < headings.length; idx++) {
-        const h = headings[idx];
-        if (!h || h.index === undefined) {
-          continue;
-        }
-        const level = (h[1] ?? "").length;
-        const title = (h[2] ?? "").trim();
-        const start = h.index + h[0].length;
-        const nextH = headings[idx + 1];
-        const end = nextH && nextH.index !== undefined ? nextH.index : clean.length;
-        const nextLevel = nextH ? (nextH[1] ?? "").length : 0;
-        const sectionSlice = clean.slice(start, end);
-        const isParentWithImmediateChild =
-          idx + 1 < headings.length && nextLevel > level && !SPEC_RULE_DEF_RE.test(sectionSlice);
-        SPEC_RULE_DEF_RE.lastIndex = 0;
-        if (isParentWithImmediateChild) {
-          continue;
-        }
-        if (!SPEC_RULE_DEF_RE.test(sectionSlice)) {
-          missingLeafRules.push(
-            `${relPath(specPath)}: leaf section '${"#".repeat(level)} ${title}' has no r[...] rule`,
-          );
-        }
-        SPEC_RULE_DEF_RE.lastIndex = 0;
+    const headings = Array.from(clean.matchAll(sectionHeadingRe));
+    for (let idx = 0; idx < headings.length; idx++) {
+      const h = headings[idx];
+      if (!h || h.index === undefined) continue;
+      const level = (h[1] ?? "").length;
+      const title = (h[2] ?? "").trim();
+      const start = h.index + h[0].length;
+      const nextH = headings[idx + 1];
+      const end = nextH && nextH.index !== undefined ? nextH.index : clean.length;
+      const nextLevel = nextH ? (nextH[1] ?? "").length : 0;
+      const hasRule = SPEC_RULE_DEF_RE.test(clean.slice(start, end));
+      SPEC_RULE_DEF_RE.lastIndex = 0;
+      if (!(idx + 1 < headings.length && nextLevel > level) && !hasRule) {
+        missingLeafRules.push(
+          `${relPath(specPath)}: leaf section '${"#".repeat(level)} ${title}' has no r[...] rule`,
+        );
       }
     }
-    expect(missingLeafRules).toEqual([]);
+  }
 
+  function verifySpecFileRulePrefixesAndLeafSections(
+    specPath: string,
+    missingLeafRules: string[],
+  ): void {
+    const text = fs.readFileSync(specPath, "utf8");
+    const fm = parseFrontmatter(text);
+    const prefixes = Array.isArray(fm?.["rule_prefixes"]) ? fm["rule_prefixes"] : [];
+    const clean = stripFencedCodeBlocks(text);
+    const fileRules = Array.from(clean.matchAll(SPEC_RULE_DEF_RE), (m) => m[1] ?? m[2] ?? "");
+    expect(fileRules.length, `${relPath(specPath)} defines zero r[...] rules`).toBeGreaterThan(0);
+    for (const ruleId of fileRules) {
+      const fullToken = `r[${ruleId}]`;
+      expect(
+        prefixes.some((prefix) => fullToken.startsWith(prefix)),
+        `${relPath(specPath)}: rule '${fullToken}' does not match any frontmatter rule_prefixes`,
+      ).toBe(true);
+    }
+    checkSpecHeadingSections(specPath, clean, missingLeafRules);
+  }
+
+  function collectStrayRulesOutsideSpecs(templateRel: string): string[] {
     const strayRules: string[] = [];
-    const templateRel = relPath(path.join(DOCS_DIR, "templates"));
     for (const mdPath of walkMarkdownFiles(REPO_ROOT)) {
       const rel = relPath(mdPath);
       if (
@@ -660,45 +905,40 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       const clean = stripFencedCodeBlocks(fs.readFileSync(mdPath, "utf8"));
       const lines = clean.split("\n");
       for (let idx = 0; idx < lines.length; idx++) {
-        const line = lines[idx] ?? "";
-        for (const m of line.matchAll(SPEC_RULE_DEF_RE)) {
-          const rid = m[1] ?? m[2] ?? "";
-          strayRules.push(`${rel}:${idx + 1} defines r[${rid}] outside docs/specs/`);
+        for (const m of (lines[idx] ?? "").matchAll(SPEC_RULE_DEF_RE)) {
+          strayRules.push(`${rel}:${idx + 1} defines r[${m[1] ?? m[2] ?? ""}] outside docs/specs/`);
         }
       }
     }
-    expect(strayRules).toEqual([]);
+    return strayRules;
+  }
 
+  function collectMalformedDocMarkers(templateRel: string): string[] {
     const malformed: string[] = [];
     for (const mdPath of walkMarkdownFiles(DOCS_DIR)) {
       const rel = relPath(mdPath);
-      if (rel.startsWith(templateRel) || rel === "docs/CONTRIBUTING.md") {
-        continue;
-      }
-      const clean = stripFencedCodeBlocks(fs.readFileSync(mdPath, "utf8"));
-      const lines = clean.split("\n");
+      if (rel.startsWith(templateRel) || rel === "docs/CONTRIBUTING.md") continue;
+      const lines = stripFencedCodeBlocks(fs.readFileSync(mdPath, "utf8")).split("\n");
       for (let idx = 0; idx < lines.length; idx++) {
-        const line = lines[idx] ?? "";
-        for (const m of line.matchAll(MALFORMED_SPEC_MARKER_RE)) {
+        for (const m of (lines[idx] ?? "").matchAll(MALFORMED_SPEC_MARKER_RE)) {
           const kind = m[1] ?? "";
           const inner = m[2] ?? "";
-          if (
+          const isPlaceholder =
             (inner.endsWith(".") && kind === "r") ||
             inner.includes("...") ||
             inner.includes("*") ||
             inner.includes("<") ||
-            inner.includes(">")
-          ) {
-            continue;
-          }
-          if (!VALID_RULE_ID_RE.test(inner)) {
+            inner.includes(">");
+          if (!isPlaceholder && !VALID_RULE_ID_RE.test(inner)) {
             malformed.push(`${rel}:${idx + 1}: malformed '${kind}[${inner}]'`);
           }
         }
       }
     }
-    expect(malformed).toEqual([]);
+    return malformed;
+  }
 
+  function collectVerifyTokensInDocs(templateRel: string): string[] {
     const verifyInDocs: string[] = [];
     for (const mdPath of walkMarkdownFiles(REPO_ROOT)) {
       const rel = relPath(mdPath);
@@ -709,47 +949,40 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       ) {
         continue;
       }
-      const text = fs.readFileSync(mdPath, "utf8");
-      const lines = text.split("\n");
+      const lines = fs.readFileSync(mdPath, "utf8").split("\n");
       for (let idx = 0; idx < lines.length; idx++) {
-        const line = lines[idx] ?? "";
-        for (const m of line.matchAll(SPEC_VERIFY_TOKEN_RE)) {
+        for (const m of (lines[idx] ?? "").matchAll(SPEC_VERIFY_TOKEN_RE)) {
           verifyInDocs.push(`${rel}:${idx + 1}: verify[${m[1] ?? ""}]`);
         }
       }
     }
-    expect(verifyInDocs).toEqual([]);
+    return verifyInDocs;
+  }
 
+  function scanRegexHitsInFile(filePath: string, re: RegExp, hits: string[]): void {
+    const lines = fs.readFileSync(filePath, "utf8").split("\n");
+    for (let idx = 0; idx < lines.length; idx++) {
+      const m = re.exec(lines[idx] ?? "");
+      if (m) hits.push(`${relPath(filePath)}:${idx + 1}: ${m[0]}`);
+    }
+  }
+
+  function collectLegacyTokenHits(): string[] {
     const legacyHits: string[] = [];
     for (const filePath of [REQ_FILE, ...walkMarkdownFiles(SPECS_DIR)]) {
-      const text = fs.readFileSync(filePath, "utf8");
-      const lines = text.split("\n");
-      for (let idx = 0; idx < lines.length; idx++) {
-        const line = lines[idx] ?? "";
-        const m = LEGACY_ID_RE.exec(line);
-        if (m) {
-          legacyHits.push(`${relPath(filePath)}:${idx + 1}: ${m[0]}`);
-        }
-      }
+      scanRegexHitsInFile(filePath, LEGACY_ID_RE, legacyHits);
     }
     const legacyGuardrailRe = /\bG-0\d\b/;
     for (const root of [DOCS_DIR, PACKAGES_DIR, TESTS_DIR]) {
       for (const filePath of walkFilesByExtensions(root, new Set([".md", ".rs", ".ts", ".tsx"]))) {
-        if (path.basename(filePath) === "test_guardrails.test.ts") {
-          continue;
-        }
-        const lines = fs.readFileSync(filePath, "utf8").split("\n");
-        for (let idx = 0; idx < lines.length; idx++) {
-          const line = lines[idx] ?? "";
-          const m = legacyGuardrailRe.exec(line);
-          if (m) {
-            legacyHits.push(`${relPath(filePath)}:${idx + 1}: ${m[0]}`);
-          }
-        }
+        if (path.basename(filePath) === "test_guardrails.test.ts") continue;
+        scanRegexHitsInFile(filePath, legacyGuardrailRe, legacyHits);
       }
     }
-    expect(legacyHits).toEqual([]);
+    return legacyHits;
+  }
 
+  function collectDocToTestLinks(): string[] {
     const docToTestLinks: string[] = [];
     const docRoots = [
       ...walkMarkdownFiles(DOCS_DIR),
@@ -759,81 +992,104 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     ];
     for (const mdPath of docRoots) {
       const rel = relPath(mdPath);
-      if (rel === "docs/specs/architecture/project_and_documentation_quality.md") {
-        continue;
-      }
-      const clean = stripCode(fs.readFileSync(mdPath, "utf8"));
-      const lines = clean.split("\n");
+      if (rel === "docs/specs/architecture/project_and_documentation_quality.md") continue;
+      const isSpecOrReq =
+        mdPath.startsWith(SPECS_DIR) || mdPath.startsWith(ADR_DIR) || mdPath === REQ_FILE;
+      if (!isSpecOrReq) continue;
+      const lines = stripCode(fs.readFileSync(mdPath, "utf8")).split("\n");
       for (let idx = 0; idx < lines.length; idx++) {
-        const line = lines[idx] ?? "";
-        for (const m of line.matchAll(MD_LINK_RE)) {
+        for (const m of (lines[idx] ?? "").matchAll(MD_LINK_RE)) {
           const target = m[2] ?? "";
           if (
-            (mdPath.startsWith(SPECS_DIR) || mdPath.startsWith(ADR_DIR) || mdPath === REQ_FILE) &&
-            (target.includes("test_") ||
-              target.includes("_spec_references") ||
-              target.includes("_verification") ||
-              target.includes("/tests/"))
+            target.includes("test_") ||
+            target.includes("_spec_references") ||
+            target.includes("_verification") ||
+            target.includes("/tests/")
           ) {
             docToTestLinks.push(`${rel}:${idx + 1} -> ${target}`);
           }
         }
       }
     }
-    expect(docToTestLinks).toEqual([]);
+    return docToTestLinks;
+  }
 
-    const unresolvedRefs: string[] = [];
-    for (const [ruleId, pathStr, lineno] of collectSourceRefTokens()) {
-      if (!rules.has(ruleId)) {
-        unresolvedRefs.push(`${pathStr}:${lineno} -> ref[${ruleId}]`);
+  function scanFileForSpecTextParse(
+    filePath: string,
+    forbiddenPatterns: readonly RegExp[],
+    violations: string[],
+  ): void {
+    const rel = relPath(filePath);
+    if (path.basename(filePath) === "test_guardrails.test.ts") return;
+    if (!rel.includes("test") && !rel.includes("tests")) return;
+    const lines = fs.readFileSync(filePath, "utf8").split("\n");
+    for (let idx = 0; idx < lines.length; idx++) {
+      const line = lines[idx] ?? "";
+      const stripped = line.trim();
+      if (
+        stripped.startsWith("#") ||
+        stripped.startsWith("//") ||
+        stripped.startsWith("*") ||
+        stripped.startsWith("/*")
+      ) {
+        continue;
+      }
+      if (forbiddenPatterns.some((pat) => pat.test(line))) {
+        violations.push(`${rel}:${idx + 1}: ${stripped}`);
       }
     }
-    expect(unresolvedRefs).toEqual([]);
+  }
 
-    const verifyTokens = collectTestVerifyTokens();
-    expect(verifyTokens.length).toBeGreaterThan(0);
-    const unresolvedVerifies: string[] = [];
-    for (const [ruleId, pathStr, lineno] of verifyTokens) {
-      if (!rules.has(ruleId)) {
-        unresolvedVerifies.push(`${pathStr}:${lineno} -> verify[${ruleId}]`);
-      }
-    }
-    expect(unresolvedVerifies).toEqual([]);
-
+  function collectSpecTextParseViolations(): string[] {
     const exts = new Set([".rs", ".ts", ".tsx"]);
     const forbiddenPatterns = [/docs\/specs\//, /docs\/adr\//, /docs\/requirements\//];
     const violations: string[] = [];
     for (const root of [TESTS_DIR, PACKAGES_DIR]) {
       for (const filePath of walkFilesByExtensions(root, exts)) {
-        if (path.basename(filePath) === "test_guardrails.test.ts") {
-          continue;
-        }
-        const rel = relPath(filePath);
-        if (!rel.includes("test") && !rel.includes("tests")) {
-          continue;
-        }
-        const text = fs.readFileSync(filePath, "utf8");
-        const lines = text.split("\n");
-        for (let idx = 0; idx < lines.length; idx++) {
-          const line = lines[idx] ?? "";
-          const stripped = line.trim();
-          if (
-            stripped.startsWith("#") ||
-            stripped.startsWith("//") ||
-            stripped.startsWith("*") ||
-            stripped.startsWith("/*")
-          ) {
-            continue;
-          }
-          for (const pat of forbiddenPatterns) {
-            if (pat.test(line)) {
-              violations.push(`${rel}:${idx + 1}: ${stripped}`);
-            }
-          }
-        }
+        scanFileForSpecTextParse(filePath, forbiddenPatterns, violations);
       }
     }
-    expect(violations).toEqual([]);
+    return violations;
+  }
+
+  it("test_spec_rule_identifiers_adr_structure_and_no_spec_text_parsing", () => {
+    const rules = collectSpecRules();
+    expect(rules.size).toBeGreaterThanOrEqual(150);
+
+    const duplicates = Array.from(rules.entries())
+      .filter(([, locs]) => locs.length > 1)
+      .map(
+        ([rid, locs]) =>
+          `r[${rid}] defined multiple times: ${locs.map(([p, ln]) => `${p}:${ln}`).join(", ")}`,
+      );
+    expect(duplicates).toEqual([]);
+
+    const missingLeafRules: string[] = [];
+    for (const specPath of walkMarkdownFiles(SPECS_DIR)) {
+      verifySpecFileRulePrefixesAndLeafSections(specPath, missingLeafRules);
+    }
+    expect(missingLeafRules).toEqual([]);
+
+    const templateRel = relPath(path.join(DOCS_DIR, "templates"));
+    expect(collectStrayRulesOutsideSpecs(templateRel)).toEqual([]);
+    expect(collectMalformedDocMarkers(templateRel)).toEqual([]);
+    expect(collectVerifyTokensInDocs(templateRel)).toEqual([]);
+    expect(collectLegacyTokenHits()).toEqual([]);
+    expect(collectDocToTestLinks()).toEqual([]);
+
+    const unresolvedRefs = collectSourceRefTokens()
+      .filter(([ruleId]) => !rules.has(ruleId))
+      .map(([ruleId, pathStr, lineno]) => `${pathStr}:${lineno} -> ref[${ruleId}]`);
+    expect(unresolvedRefs).toEqual([]);
+
+    const verifyTokens = collectTestVerifyTokens();
+    expect(verifyTokens.length).toBeGreaterThan(0);
+    const unresolvedVerifies = verifyTokens
+      .filter(([ruleId]) => !rules.has(ruleId))
+      .map(([ruleId, pathStr, lineno]) => `${pathStr}:${lineno} -> verify[${ruleId}]`);
+    expect(unresolvedVerifies).toEqual([]);
+
+    expect(collectSpecTextParseViolations()).toEqual([]);
 
     const modRsFiles = walkFilesByExtensions(PACKAGES_DIR, new Set([".rs"]))
       .filter((p) => path.basename(p) === "mod.rs")
@@ -870,28 +1126,9 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     expect(unverified).toEqual([]);
   });
 
-  it("test_engine_spec_scope_manifest", () => {
-    const scopePath = path.join(PACKAGES_DIR, "engine", "spec_scope.toml");
-    expect(fs.existsSync(scopePath)).toBe(true);
-
-    const rulesMap = _parseSpecScopeToml(fs.readFileSync(scopePath, "utf8"));
-    const canonicalRules = collectSpecRules();
-    const canonicalIds = new Set(canonicalRules.keys());
-    const manifestIds = new Set(rulesMap.keys());
-
-    const missingInManifest = Array.from(canonicalIds)
-      .filter((id) => !manifestIds.has(id))
-      .sort();
-    const staleInManifest = Array.from(manifestIds)
-      .filter((id) => !canonicalIds.has(id))
-      .sort();
-    expect(missingInManifest).toEqual([]);
-    expect(staleInManifest).toEqual([]);
-
-    const engineDir = path.join(PACKAGES_DIR, "engine");
-    const engineRsFiles = walkFilesByExtensions(engineDir, new Set([".rs"]));
+  function collectActualEngineVerifies(engineDir: string): Map<string, Set<string>> {
     const actualEngineVerifies = new Map<string, Set<string>>();
-    for (const rsPath of engineRsFiles) {
+    for (const rsPath of walkFilesByExtensions(engineDir, new Set([".rs"]))) {
       const relToEngine = path.relative(engineDir, rsPath).split(path.sep).join("/");
       const text = fs.readFileSync(rsPath, "utf8");
       for (const m of text.matchAll(SPEC_VERIFY_TOKEN_RE)) {
@@ -901,35 +1138,64 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
         actualEngineVerifies.set(rid, set);
       }
     }
+    return actualEngineVerifies;
+  }
 
+  function validateEngineSpecScopeEntry(
+    ruleId: string,
+    entry: SpecScopeRuleEntry,
+    actualEngineVerifies: ReadonlyMap<string, Set<string>>,
+    errors: string[],
+  ): void {
+    const scope = entry.scope;
+    if (scope !== "engine" && scope !== "out-of-scope") {
+      errors.push(`r[${ruleId}]: invalid scope '${scope}'`);
+      return;
+    }
+    if (scope === "out-of-scope") {
+      if (!(entry.reason ?? "").trim()) {
+        errors.push(`r[${ruleId}]: scope='out-of-scope' requires a non-empty 'reason'`);
+      }
+      const found = actualEngineVerifies.get(ruleId);
+      if (found) {
+        errors.push(
+          `r[${ruleId}]: marked 'out-of-scope' but verified in packages/engine: ${Array.from(found).sort().join(", ")}`,
+        );
+      }
+      return;
+    }
+    if ((actualEngineVerifies.get(ruleId)?.size ?? 0) === 0) {
+      errors.push(
+        `r[${ruleId}]: scope='engine', but no 'verify[${ruleId}]' found in packages/engine/**/*.rs`,
+      );
+    }
+  }
+
+  it("test_engine_spec_scope_manifest", () => {
+    const scopePath = path.join(PACKAGES_DIR, "engine", "spec_scope.toml");
+    expect(fs.existsSync(scopePath)).toBe(true);
+
+    const rulesMap = _parseSpecScopeToml(fs.readFileSync(scopePath, "utf8"));
+    const canonicalIds = new Set(collectSpecRules().keys());
+    const manifestIds = new Set(rulesMap.keys());
+
+    expect(
+      Array.from(canonicalIds)
+        .filter((id) => !manifestIds.has(id))
+        .sort(),
+    ).toEqual([]);
+    expect(
+      Array.from(manifestIds)
+        .filter((id) => !canonicalIds.has(id))
+        .sort(),
+    ).toEqual([]);
+
+    const actualEngineVerifies = collectActualEngineVerifies(path.join(PACKAGES_DIR, "engine"));
     const errors: string[] = [];
     for (const [ruleId, entry] of Array.from(rulesMap.entries()).sort(([a], [b]) =>
       a.localeCompare(b),
     )) {
-      const scope = entry.scope;
-      if (scope !== "engine" && scope !== "out-of-scope") {
-        errors.push(`r[${ruleId}]: invalid scope '${scope}'`);
-        continue;
-      }
-      if (scope === "out-of-scope") {
-        const reason = (entry.reason ?? "").trim();
-        if (!reason) {
-          errors.push(`r[${ruleId}]: scope='out-of-scope' requires a non-empty 'reason'`);
-        }
-        if (actualEngineVerifies.has(ruleId)) {
-          const foundIn = Array.from(actualEngineVerifies.get(ruleId) ?? []).sort();
-          errors.push(
-            `r[${ruleId}]: marked 'out-of-scope' but verified in packages/engine: ${foundIn.join(", ")}`,
-          );
-        }
-      } else {
-        const actualFiles = actualEngineVerifies.get(ruleId) ?? new Set<string>();
-        if (actualFiles.size === 0) {
-          errors.push(
-            `r[${ruleId}]: scope='engine', but no 'verify[${ruleId}]' found in packages/engine/**/*.rs`,
-          );
-        }
-      }
+      validateEngineSpecScopeEntry(ruleId, entry, actualEngineVerifies, errors);
     }
     expect(errors).toEqual([]);
   });
@@ -976,116 +1242,132 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     expect(violations).toEqual([]);
   });
 
-  it("test_valid_github_latex_math_across_docs", () => {
-    const violations: string[] = [];
-    const unquotedMermaidLabelRe = /\b[A-Za-z0-9_]+\[(?!")([^\]]*[():][^\]]*)\]/;
-    const bidirMermaidArrowRe = /<(?:--|==)\s+[^->=\n]+\s+(?:-->|==>)/;
-
-    function checkMathBody(rel: string, kind: string, body: string): void {
-      if (BACKSLASH_PUNCT_ESCAPE_RE.test(body)) {
-        violations.push(`${rel} (${kind} backslash escape): ${body.trim().slice(0, 80)}`);
-      }
-      for (const macro of FORBIDDEN_MATH_MACROS) {
-        if (body.includes(macro)) {
-          violations.push(
-            `${rel} (${kind} forbidden macro '${macro}'): ${body.trim().slice(0, 80)}`,
-          );
-        }
-      }
-      if (TEXT_UNDERSCORE_RE.test(body)) {
-        violations.push(
-          `${rel} (${kind} unescaped '_' inside \\text/\\mathrm): ${body.trim().slice(0, 80)}`,
-        );
-      }
-      const openCount = (body.match(/\{/g) ?? []).length;
-      const closeCount = (body.match(/\}/g) ?? []).length;
-      if (openCount !== closeCount) {
-        violations.push(`${rel} (${kind} unbalanced braces): ${body.trim().slice(0, 80)}`);
+  function checkDocMathBody(violations: string[], rel: string, kind: string, body: string): void {
+    if (BACKSLASH_PUNCT_ESCAPE_RE.test(body)) {
+      violations.push(`${rel} (${kind} backslash escape): ${body.trim().slice(0, 80)}`);
+    }
+    for (const macro of FORBIDDEN_MATH_MACROS) {
+      if (body.includes(macro)) {
+        violations.push(`${rel} (${kind} forbidden macro '${macro}'): ${body.trim().slice(0, 80)}`);
       }
     }
+    if (TEXT_UNDERSCORE_RE.test(body)) {
+      violations.push(
+        `${rel} (${kind} unescaped '_' inside \\text/\\mathrm): ${body.trim().slice(0, 80)}`,
+      );
+    }
+    const openCount = (body.match(/\{/g) ?? []).length;
+    const closeCount = (body.match(/\}/g) ?? []).length;
+    if (openCount !== closeCount) {
+      violations.push(`${rel} (${kind} unbalanced braces): ${body.trim().slice(0, 80)}`);
+    }
+  }
 
+  function checkDocMermaidBlocks(violations: string[], rel: string, rawText: string): void {
+    const unquotedMermaidLabelRe = /\b[A-Za-z0-9_]+\[(?!")([^\]]*[():][^\]]*)\]/;
+    const bidirMermaidArrowRe = /<(?:--|==)\s+[^->=\n]+\s+(?:-->|==>)/;
+    for (const m of rawText.matchAll(/```mermaid\n([\s\S]*?)```/g)) {
+      const block = m[1] ?? "";
+      const strippedBlock = block.trimStart();
+      if (strippedBlock.startsWith("sequenceDiagram") && block.includes(";")) {
+        violations.push(`${rel}: semicolon inside Mermaid sequenceDiagram`);
+      } else if (strippedBlock.startsWith("flowchart")) {
+        if (unquotedMermaidLabelRe.test(block)) {
+          violations.push(`${rel}: unquoted special chars in Mermaid flowchart node label`);
+        }
+        if (bidirMermaidArrowRe.test(block)) {
+          violations.push(`${rel}: invalid bidirectional arrow in Mermaid flowchart`);
+        }
+      }
+    }
+  }
+
+  it("test_valid_github_latex_math_across_docs", () => {
+    const violations: string[] = [];
     for (const mdPath of walkMarkdownFiles(REPO_ROOT)) {
       const rel = relPath(mdPath);
       const rawText = fs.readFileSync(mdPath, "utf8");
-      for (const m of rawText.matchAll(/```mermaid\n([\s\S]*?)```/g)) {
-        const block = m[1] ?? "";
-        const strippedBlock = block.trimStart();
-        if (strippedBlock.startsWith("sequenceDiagram") && block.includes(";")) {
-          violations.push(`${rel}: semicolon inside Mermaid sequenceDiagram`);
-        } else if (strippedBlock.startsWith("flowchart")) {
-          if (unquotedMermaidLabelRe.test(block)) {
-            violations.push(`${rel}: unquoted special chars in Mermaid flowchart node label`);
-          }
-          if (bidirMermaidArrowRe.test(block)) {
-            violations.push(`${rel}: invalid bidirectional arrow in Mermaid flowchart`);
-          }
-        }
-      }
+      checkDocMermaidBlocks(violations, rel, rawText);
       const clean = stripCode(rawText);
       for (const m of clean.matchAll(DISPLAY_MATH_RE)) {
-        checkMathBody(rel, "display math", m[1] ?? "");
+        checkDocMathBody(violations, rel, "display math", m[1] ?? "");
       }
-      const noDisplay = clean.replace(DISPLAY_MATH_RE, " ");
-      for (const m of noDisplay.matchAll(INLINE_MATH_RE)) {
-        checkMathBody(rel, "inline math", m[1] ?? "");
+      for (const m of clean.replace(DISPLAY_MATH_RE, " ").matchAll(INLINE_MATH_RE)) {
+        checkDocMathBody(violations, rel, "inline math", m[1] ?? "");
       }
     }
     expect(violations).toEqual([]);
   });
 
+  function resolveRelativeLinkTarget(
+    mdPath: string,
+    rawTarget: string,
+  ): { targetFile: string; anchor: string } | null {
+    if (
+      rawTarget.startsWith("http://") ||
+      rawTarget.startsWith("https://") ||
+      rawTarget.startsWith("mailto:")
+    ) {
+      return null;
+    }
+    if (rawTarget.startsWith("#")) {
+      return { targetFile: mdPath, anchor: rawTarget.slice(1) };
+    }
+    const hashIdx = rawTarget.indexOf("#");
+    if (hashIdx !== -1) {
+      return {
+        targetFile: path.resolve(path.dirname(mdPath), rawTarget.slice(0, hashIdx)),
+        anchor: rawTarget.slice(hashIdx + 1),
+      };
+    }
+    return { targetFile: path.resolve(path.dirname(mdPath), rawTarget), anchor: "" };
+  }
+
+  function verifyResolvedLinkTarget(
+    mdPath: string,
+    lineNo: number,
+    rawTarget: string,
+    anchorCache: Map<string, Set<string>>,
+    brokenLinks: string[],
+  ): void {
+    const resolved = resolveRelativeLinkTarget(mdPath, rawTarget);
+    if (!resolved) return;
+    const { targetFile, anchor } = resolved;
+    if (!fs.existsSync(targetFile)) {
+      brokenLinks.push(`${relPath(mdPath)}:${lineNo} -> target '${rawTarget}' does not exist`);
+      return;
+    }
+    if (!anchor || !targetFile.endsWith(".md") || !fs.statSync(targetFile).isFile()) return;
+    let anchors = anchorCache.get(targetFile);
+    if (!anchors) {
+      anchors = extractHeadingAnchors(fs.readFileSync(targetFile, "utf8"));
+      anchorCache.set(targetFile, anchors);
+    }
+    if (!anchors.has(anchor)) {
+      brokenLinks.push(
+        `${relPath(mdPath)}:${lineNo} -> anchor '#${anchor}' not found in ${relPath(targetFile)}`,
+      );
+    }
+  }
+
+  function checkMarkdownFileLinks(
+    mdPath: string,
+    anchorCache: Map<string, Set<string>>,
+    brokenLinks: string[],
+  ): void {
+    const lines = stripCode(fs.readFileSync(mdPath, "utf8")).split("\n");
+    for (let idx = 0; idx < lines.length; idx++) {
+      for (const m of (lines[idx] ?? "").matchAll(MD_LINK_RE)) {
+        verifyResolvedLinkTarget(mdPath, idx + 1, m[2] ?? "", anchorCache, brokenLinks);
+      }
+    }
+  }
+
   it("test_relative_markdown_links_resolve", () => {
     const anchorCache = new Map<string, Set<string>>();
     const brokenLinks: string[] = [];
-
     for (const mdPath of walkMarkdownFiles(REPO_ROOT)) {
-      const clean = stripCode(fs.readFileSync(mdPath, "utf8"));
-      const lines = clean.split("\n");
-      for (let idx = 0; idx < lines.length; idx++) {
-        const line = lines[idx] ?? "";
-        for (const m of line.matchAll(MD_LINK_RE)) {
-          const rawTarget = m[2] ?? "";
-          if (
-            rawTarget.startsWith("http://") ||
-            rawTarget.startsWith("https://") ||
-            rawTarget.startsWith("mailto:")
-          ) {
-            continue;
-          }
-          let targetFile: string;
-          let anchor: string;
-          if (rawTarget.startsWith("#")) {
-            targetFile = mdPath;
-            anchor = rawTarget.slice(1);
-          } else if (rawTarget.includes("#")) {
-            const hashIdx = rawTarget.indexOf("#");
-            const filePart = rawTarget.slice(0, hashIdx);
-            anchor = rawTarget.slice(hashIdx + 1);
-            targetFile = path.resolve(path.dirname(mdPath), filePart);
-          } else {
-            targetFile = path.resolve(path.dirname(mdPath), rawTarget);
-            anchor = "";
-          }
-
-          if (!fs.existsSync(targetFile)) {
-            brokenLinks.push(
-              `${relPath(mdPath)}:${idx + 1} -> target '${rawTarget}' does not exist`,
-            );
-            continue;
-          }
-          if (anchor && targetFile.endsWith(".md") && fs.statSync(targetFile).isFile()) {
-            let anchors = anchorCache.get(targetFile);
-            if (!anchors) {
-              anchors = extractHeadingAnchors(fs.readFileSync(targetFile, "utf8"));
-              anchorCache.set(targetFile, anchors);
-            }
-            if (!anchors.has(anchor)) {
-              brokenLinks.push(
-                `${relPath(mdPath)}:${idx + 1} -> anchor '#${anchor}' not found in ${relPath(targetFile)}`,
-              );
-            }
-          }
-        }
-      }
+      checkMarkdownFileLinks(mdPath, anchorCache, brokenLinks);
     }
     expect(brokenLinks).toEqual([]);
   });
@@ -1115,21 +1397,16 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     expect(readmeText.match(SPEC_RULE_DEF_RE)).toBeNull();
   });
 
-  it("test_bidirectional_req_and_adr_traceability_across_specs", () => {
-    const reqText = fs.readFileSync(REQ_FILE, "utf8");
-    const definedReqs = new Set(Array.from(reqText.matchAll(REQ_TABLE_RE), (m) => m[1] ?? ""));
-
+  function collectAdrStatusesAndEnforcedSpecs(): {
+    adrStatuses: Map<string, string>;
+    adrEnforcesSpecs: Map<string, string[]>;
+  } {
     const adrStatuses = new Map<string, string>();
     const adrEnforcesSpecs = new Map<string, string[]>();
     for (const entry of fs.readdirSync(ADR_DIR).sort()) {
-      if (!entry.endsWith(".md") || entry === "README.md") {
-        continue;
-      }
-      const adrPath = path.join(ADR_DIR, entry);
-      const fm = parseFrontmatter(fs.readFileSync(adrPath, "utf8"));
-      if (!fm) {
-        continue;
-      }
+      if (!entry.endsWith(".md") || entry === "README.md") continue;
+      const fm = parseFrontmatter(fs.readFileSync(path.join(ADR_DIR, entry), "utf8"));
+      if (!fm) continue;
       const adrId = String(fm["id"]);
       adrStatuses.set(adrId, String(fm["status"]));
       const rawSpecs = Array.isArray(fm["specs"]) ? fm["specs"] : [];
@@ -1138,7 +1415,37 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
         rawSpecs.map((s) => normalizeSpecRelPath(s)),
       );
     }
+    return { adrStatuses, adrEnforcesSpecs };
+  }
 
+  function collectSpecReqAndAdrCitations(
+    specPath: string,
+    supersededAdrs: ReadonlySet<string>,
+    specCitedReqs: Set<string>,
+    specCitedAdrs: Set<string>,
+  ): void {
+    const text = fs.readFileSync(specPath, "utf8");
+    const fm = parseFrontmatter(text);
+    if (Array.isArray(fm?.["requirements"])) {
+      for (const r of fm["requirements"]) specCitedReqs.add(r);
+    }
+    for (const m of text.matchAll(REQ_TOKEN_RE)) specCitedReqs.add(m[0]);
+    if (Array.isArray(fm?.["adrs"])) {
+      for (const a of fm["adrs"]) {
+        expect(
+          supersededAdrs.has(a),
+          `${relPath(specPath)} frontmatter cites superseded ADR '${a}'`,
+        ).toBe(false);
+        specCitedAdrs.add(a);
+      }
+    }
+    for (const m of text.matchAll(ADR_TOKEN_RE)) specCitedAdrs.add(m[0]);
+  }
+
+  it("test_bidirectional_req_and_adr_traceability_across_specs", () => {
+    const reqText = fs.readFileSync(REQ_FILE, "utf8");
+    const definedReqs = new Set(Array.from(reqText.matchAll(REQ_TABLE_RE), (m) => m[1] ?? ""));
+    const { adrStatuses, adrEnforcesSpecs } = collectAdrStatusesAndEnforcedSpecs();
     const supersededAdrs = new Set(
       Array.from(adrStatuses.entries())
         .filter(([, st]) => st === "superseded")
@@ -1149,65 +1456,34 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     const specCitedAdrs = new Set<string>();
     const specFileSet = new Set<string>();
     for (const specPath of walkMarkdownFiles(SPECS_DIR)) {
-      const relFromDocs = path.relative(DOCS_DIR, specPath).split(path.sep).join("/");
-      specFileSet.add(relFromDocs);
-      const text = fs.readFileSync(specPath, "utf8");
-      const fm = parseFrontmatter(text);
-      if (Array.isArray(fm?.["requirements"])) {
-        for (const r of fm["requirements"]) {
-          specCitedReqs.add(r);
-        }
-      }
-      for (const m of text.matchAll(REQ_TOKEN_RE)) {
-        specCitedReqs.add(m[0]);
-      }
-      if (Array.isArray(fm?.["adrs"])) {
-        for (const a of fm["adrs"]) {
-          expect(
-            supersededAdrs.has(a),
-            `${relPath(specPath)} frontmatter cites superseded ADR '${a}'`,
-          ).toBe(false);
-          specCitedAdrs.add(a);
-        }
-      }
-      for (const m of text.matchAll(ADR_TOKEN_RE)) {
-        specCitedAdrs.add(m[0]);
-      }
+      specFileSet.add(path.relative(DOCS_DIR, specPath).split(path.sep).join("/"));
+      collectSpecReqAndAdrCitations(specPath, supersededAdrs, specCitedReqs, specCitedAdrs);
     }
 
     for (const [aid, enforcedList] of adrEnforcesSpecs.entries()) {
-      if (adrStatuses.get(aid) === "accepted") {
-        for (const specRel of enforcedList) {
-          if (specFileSet.has(specRel)) {
-            specCitedAdrs.add(aid);
-          }
-        }
-      }
       for (const specRel of enforcedList) {
         expect(
           specFileSet.has(specRel),
           `${aid} frontmatter specs cites non-existent '${specRel}'`,
         ).toBe(true);
+        if (adrStatuses.get(aid) === "accepted") {
+          specCitedAdrs.add(aid);
+        }
       }
     }
 
-    const uncitedReqs = Array.from(definedReqs)
-      .filter((r) => !specCitedReqs.has(r))
-      .sort();
-    expect(uncitedReqs).toEqual([]);
-
-    const acceptedAdrs = new Set(
-      Array.from(adrStatuses.entries())
-        .filter(([, st]) => st === "accepted")
-        .map(([aid]) => aid),
-    );
-    const uncitedAdrs = Array.from(acceptedAdrs)
-      .filter((a) => !specCitedAdrs.has(a))
-      .sort();
-    expect(uncitedAdrs).toEqual([]);
+    expect(
+      Array.from(definedReqs)
+        .filter((r) => !specCitedReqs.has(r))
+        .sort(),
+    ).toEqual([]);
+    const acceptedAdrs = Array.from(adrStatuses.entries())
+      .filter(([, st]) => st === "accepted")
+      .map(([aid]) => aid);
+    expect(acceptedAdrs.filter((a) => !specCitedAdrs.has(a)).sort()).toEqual([]);
   });
 
-  it("test_type_safety_and_import_boundaries", () => {
+  function checkTsTypeSafety(): void {
     const tsViolations: string[] = [];
     const forbiddenTsPatterns = [
       /@ts-ignore\b/,
@@ -1218,141 +1494,22 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     ];
     for (const root of [PACKAGES_DIR, TESTS_DIR]) {
       for (const tsPath of walkFilesByExtensions(root, new Set([".ts", ".tsx"]))) {
-        if (path.basename(tsPath) === "test_guardrails.test.ts") {
-          continue;
-        }
+        if (path.basename(tsPath) === "test_guardrails.test.ts") continue;
         const lines = fs.readFileSync(tsPath, "utf8").split("\n");
         for (let idx = 0; idx < lines.length; idx++) {
           const line = lines[idx] ?? "";
           const trimmed = line.trim();
-          if (trimmed.startsWith("//") || trimmed.startsWith("*")) {
-            continue;
-          }
-          for (const pat of forbiddenTsPatterns) {
-            if (pat.test(line)) {
-              tsViolations.push(`${relPath(tsPath)}:${idx + 1}: ${trimmed}`);
-            }
+          if (trimmed.startsWith("//") || trimmed.startsWith("*")) continue;
+          if (forbiddenTsPatterns.some((pat) => pat.test(line))) {
+            tsViolations.push(`${relPath(tsPath)}:${idx + 1}: ${trimmed}`);
           }
         }
       }
     }
     expect(tsViolations).toEqual([]);
+  }
 
-    const stripRustCommentsAndStrings = (src: string): string => {
-      let out = "";
-      let i = 0;
-      while (i < src.length) {
-        const ch = src[i] ?? "";
-        const next = src[i + 1] ?? "";
-        if (ch === "/" && next === "/") {
-          while (i < src.length && src[i] !== "\n") {
-            i++;
-          }
-          continue;
-        }
-        if (ch === "/" && next === "*") {
-          i += 2;
-          let depth = 1;
-          while (i < src.length && depth > 0) {
-            if (src[i] === "/" && src[i + 1] === "*") {
-              depth++;
-              i += 2;
-            } else if (src[i] === "*" && src[i + 1] === "/") {
-              depth--;
-              i += 2;
-            } else {
-              if (src[i] === "\n") out += "\n";
-              i++;
-            }
-          }
-          out += " ";
-          continue;
-        }
-        const isRawStr = ch === "r" && (next === '"' || next === "#");
-        const isByteRawStr =
-          ch === "b" && next === "r" && (src[i + 2] === '"' || src[i + 2] === "#");
-        if (isRawStr || isByteRawStr) {
-          let hashes = 0;
-          let j = isByteRawStr ? i + 2 : i + 1;
-          while (src[j] === "#") {
-            hashes++;
-            j++;
-          }
-          if (src[j] === '"') {
-            j++;
-            const closing = `"${"#".repeat(hashes)}`;
-            const endIdx = src.indexOf(closing, j);
-            if (endIdx !== -1) {
-              const nlCount = (src.slice(j, endIdx).match(/\n/g) ?? []).length;
-              out += `""${"\n".repeat(nlCount)}`;
-              i = endIdx + closing.length;
-              continue;
-            }
-          }
-        }
-        if (ch === "b" && next === '"') {
-          i++;
-          continue;
-        }
-        const isByteChar = ch === "b" && next === "'";
-        if (ch === "'" || isByteChar) {
-          const q = isByteChar ? i + 1 : i;
-          const c1 = src[q + 1] ?? "";
-          let charEnd = -1;
-          if (c1 === "\\") {
-            const esc = src[q + 2] ?? "";
-            if (esc === "x") {
-              if (src[q + 5] === "'") {
-                charEnd = q + 6;
-              }
-            } else if (esc === "u" && src[q + 3] === "{") {
-              const braceIdx = src.indexOf("}", q + 4);
-              if (braceIdx !== -1 && braceIdx <= q + 12 && src[braceIdx + 1] === "'") {
-                charEnd = braceIdx + 2;
-              }
-            } else if (esc !== "" && esc !== "\n" && esc !== "\r" && src[q + 3] === "'") {
-              charEnd = q + 4;
-            }
-          } else if (c1 !== "" && c1 !== "'" && c1 !== "\n" && c1 !== "\r") {
-            const cp = src.codePointAt(q + 1);
-            const cpLen = cp !== undefined && cp > 0xffff ? 2 : 1;
-            if (src[q + 1 + cpLen] === "'") {
-              charEnd = q + 2 + cpLen;
-            }
-          }
-          if (charEnd !== -1) {
-            out += "''";
-            i = charEnd;
-            continue;
-          }
-          if (isByteChar) {
-            out += "b'";
-            i += 2;
-            continue;
-          }
-        }
-        if (ch === '"') {
-          out += '"';
-          i++;
-          while (i < src.length && src[i] !== '"') {
-            if (src[i] === "\\") {
-              if (src[i + 1] === "\n") out += "\n";
-              i += 2;
-            } else {
-              if (src[i] === "\n") out += "\n";
-              i++;
-            }
-          }
-          out += '"';
-          if (i < src.length) i++;
-          continue;
-        }
-        out += ch;
-        i++;
-      }
-      return out;
-    };
-
+  function checkRustCrateUnsafeAttributes(): void {
     const crateForbidOrDenyRe = /#\s*!\s*\[\s*(?:forbid|deny)\s*\(\s*unsafe_code\s*\)\s*\]/;
     for (const rustLibRel of ["packages/engine/src/lib.rs", "packages/js/rust/lib.rs"]) {
       const libPath = path.join(REPO_ROOT, rustLibRel);
@@ -1392,17 +1549,19 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
         `${strictForbidLibRel} must declare #![forbid(unsafe_code)] in active code`,
       ).toBe(true);
     }
+  }
 
-    // Scan every .rs file across safe-only crates (multi-line, char-literal & block-comment aware)
-    // for allow/warn/expect(unsafe_code), #[unsafe(...)] / #[cfg_attr(..., unsafe(...))], and unsafe blocks/items.
+  function checkRustSafeOnlyCrates(): void {
     const unsafeLintOverrideRe = /\b(?:allow|warn|expect)\s*\([^)]*\bunsafe_code\b/;
     const unsafeConstructRe =
       /\bunsafe\s*(?:\{|fn\b|impl\b|trait\b|extern\b)|(?<!r#)\bunsafe\s*\(|#\s*!?\s*\[\s*unsafe\s*\(/;
     const unsafeBlockOrItemOnlyRe = /\bunsafe\s*(?:\{|fn\b|impl\b|trait\b|extern\b)/;
     const unsafeViolations: string[] = [];
     for (const safePkg of ["fixtures", "capture", "studio"]) {
-      const pkgDir = path.join(PACKAGES_DIR, safePkg);
-      for (const rsFile of walkFilesByExtensions(pkgDir, new Set([".rs"]))) {
+      for (const rsFile of walkFilesByExtensions(
+        path.join(PACKAGES_DIR, safePkg),
+        new Set([".rs"]),
+      )) {
         const stripped = stripRustCommentsAndStrings(fs.readFileSync(rsFile, "utf8"));
         if (unsafeLintOverrideRe.test(stripped) || unsafeConstructRe.test(stripped)) {
           unsafeViolations.push(`${relPath(rsFile)}: contains forbidden unsafe construct`);
@@ -1426,127 +1585,32 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       }
     }
     expect(unsafeViolations).toEqual([]);
+  }
 
-    // Enforce < 900 line ceiling across all .rs files in fixtures and capture
+  function checkPackageLineCeilings(): void {
     const lineCeilingViolations: string[] = [];
-    for (const strictPkg of ["fixtures", "capture"]) {
-      for (const rsFile of walkFilesByExtensions(
-        path.join(PACKAGES_DIR, strictPkg),
-        new Set([".rs"]),
-      )) {
-        const content = fs.readFileSync(rsFile, "utf8");
+    const strictLinePackages: Array<{ pkg: string; exts: Set<string> }> = [
+      { pkg: "fixtures", exts: new Set([".rs"]) },
+      { pkg: "capture", exts: new Set([".rs"]) },
+      { pkg: "ui", exts: new Set([".ts", ".tsx"]) },
+      { pkg: "js", exts: new Set([".rs", ".ts", ".tsx"]) },
+      { pkg: "studio", exts: new Set([".rs", ".ts", ".tsx"]) },
+    ];
+    for (const { pkg, exts } of strictLinePackages) {
+      for (const srcFile of walkFilesByExtensions(path.join(PACKAGES_DIR, pkg), exts)) {
+        const content = fs.readFileSync(srcFile, "utf8");
         const lineCount = content.endsWith("\n")
           ? content.split("\n").length - 1
           : content.split("\n").length;
         if (lineCount >= 900) {
-          lineCeilingViolations.push(`${relPath(rsFile)} (${lineCount} lines >= 900)`);
+          lineCeilingViolations.push(`${relPath(srcFile)} (${lineCount} lines >= 900)`);
         }
       }
     }
     expect(lineCeilingViolations).toEqual([]);
+  }
 
-    // Parse TOML sections strictly (quote-, escape-, and bracket-depth-aware) so zero runtime/build
-    // dependencies can sneak into dnam-fixtures, and dnam-fixtures can ONLY appear inside
-    // [dev-dependencies] in consumer crates.
-    const stripTomlComment = (line: string): string => {
-      let inSingle = false;
-      let inDouble = false;
-      for (let i = 0; i < line.length; i++) {
-        const ch = line[i];
-        if (ch === "'" && !inDouble) {
-          inSingle = !inSingle;
-        } else if (ch === '"' && !inSingle) {
-          let bs = 0;
-          while (i > bs && line[i - 1 - bs] === "\\") {
-            bs++;
-          }
-          if ((bs & 1) === 0) {
-            inDouble = !inDouble;
-          }
-        } else if (ch === "#" && !inSingle && !inDouble) {
-          return line.slice(0, i);
-        }
-      }
-      return line;
-    };
-    const extractTomlTableHeader = (clean: string): string => {
-      const isArrayTable = clean.startsWith("[[");
-      const openLen = isArrayTable ? 2 : 1;
-      expect(
-        isArrayTable
-          ? clean.endsWith("]]") && clean.length > 4
-          : clean.endsWith("]") && clean.length > 2,
-        `Malformed TOML table header: ${clean}`,
-      ).toBe(true);
-      const inner = clean.slice(openLen, clean.length - openLen);
-      let inS = false;
-      let inD = false;
-      for (let i = 0; i < inner.length; i++) {
-        const ch = inner[i];
-        if (ch === "'" && !inD) {
-          inS = !inS;
-        } else if (ch === '"' && !inS) {
-          let bs = 0;
-          while (i > bs && inner[i - 1 - bs] === "\\") {
-            bs++;
-          }
-          if ((bs & 1) === 0) {
-            inD = !inD;
-          }
-        } else if (!inS && !inD && (ch === "[" || ch === "]")) {
-          throw new Error(`Unquoted bracket inside TOML table header: ${clean}`);
-        }
-      }
-      expect(!inS && !inD, `Unterminated quote inside TOML table header: ${clean}`).toBe(true);
-      return inner.trim();
-    };
-    const parseTomlSections = (tomlText: string): Array<{ header: string; body: string }> => {
-      expect(tomlText, "Cargo.toml must not use multi-line triple-quoted strings").not.toMatch(
-        /'''|"""/,
-      );
-      const sections: Array<{ header: string; body: string }> = [];
-      let currentHeader = "";
-      let currentLines: string[] = [];
-      let bracketDepth = 0;
-      let braceDepth = 0;
-      for (const rawLine of tomlText.split("\n")) {
-        const clean = stripTomlComment(rawLine).trim();
-        if (!clean) {
-          continue;
-        }
-        if (bracketDepth === 0 && braceDepth === 0 && clean.startsWith("[")) {
-          sections.push({ header: currentHeader, body: currentLines.join("\n") });
-          currentHeader = extractTomlTableHeader(clean);
-          currentLines = [];
-          continue;
-        }
-        currentLines.push(clean);
-        let inS = false;
-        let inD = false;
-        for (let i = 0; i < clean.length; i++) {
-          const ch = clean[i];
-          if (ch === "'" && !inD) {
-            inS = !inS;
-          } else if (ch === '"' && !inS) {
-            let bs = 0;
-            while (i > bs && clean[i - 1 - bs] === "\\") {
-              bs++;
-            }
-            if ((bs & 1) === 0) {
-              inD = !inD;
-            }
-          } else if (!inS && !inD) {
-            if (ch === "[") bracketDepth++;
-            else if (ch === "]") bracketDepth = Math.max(0, bracketDepth - 1);
-            else if (ch === "{") braceDepth++;
-            else if (ch === "}") braceDepth = Math.max(0, braceDepth - 1);
-          }
-        }
-      }
-      sections.push({ header: currentHeader, body: currentLines.join("\n") });
-      return sections;
-    };
-
+  function checkFixturesManifestStrictness(): void {
     const allowedFixturesSections = new Set([
       "",
       "package",
@@ -1586,6 +1650,20 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
         }
       }
     }
+    for (const badTok of [
+      "dnam-engine",
+      "dnam-capture",
+      "dnam-trainer",
+      "dnam-studio",
+      "dnam-js",
+      "dnam_js",
+    ]) {
+      expect(fixturesCargo).not.toContain(badTok);
+    }
+  }
+
+  function checkFixturesAndCaptureCargoBoundaries(): void {
+    checkFixturesManifestStrictness();
     expect(fs.existsSync(path.join(PACKAGES_DIR, "trainer"))).toBe(false);
     expect(
       fs.existsSync(path.join(DOCS_DIR, "specs", "containers", "checkpoint_and_cache_format.md")),
@@ -1594,25 +1672,14 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       fs.existsSync(path.join(DOCS_DIR, "specs", "containers", "project_container_format.md")),
     ).toBe(true);
 
-    expect(fixturesCargo).not.toContain("dnam-engine");
-    expect(fixturesCargo).not.toContain("dnam-capture");
-    expect(fixturesCargo).not.toContain("dnam-trainer");
-    expect(fixturesCargo).not.toContain("dnam-studio");
-    expect(fixturesCargo).not.toContain("dnam-js");
-    expect(fixturesCargo).not.toContain("dnam_js");
-
-    const fixturesMoon = fs.readFileSync(path.join(PACKAGES_DIR, "fixtures", "moon.yml"), "utf8");
-    expect(fixturesMoon).toMatch(/^dependsOn:\s*\[\]\s*$/m);
-
-    // Strict V-shaped leaf convergence & ADR-0020 pure-IO boundary:
-    // - engine: leaf crate (dependsOn: [], zero dnam-fixtures or dnam-capture references)
-    // - capture: engine <- capture in [dependencies], fixtures <- capture in [dev-dependencies], zero CLI/OS-audio
-    // - studio & js: zero dnam-fixtures references
     const fixturesRefRegex = /dnam[-_]fixtures|packages\/fixtures|\.\.\/fixtures/;
     const engineCargo = fs.readFileSync(path.join(PACKAGES_DIR, "engine", "Cargo.toml"), "utf8");
     expect(engineCargo).not.toMatch(fixturesRefRegex);
     expect(engineCargo).not.toMatch(
       /dnam[-_](?:capture|trainer)|packages\/(?:capture|trainer)|\.\.\/(?:capture|trainer)/,
+    );
+    expect(fs.readFileSync(path.join(PACKAGES_DIR, "fixtures", "moon.yml"), "utf8")).toMatch(
+      /^dependsOn:\s*\[\]\s*$/m,
     );
     const engineMoon = fs.readFileSync(path.join(PACKAGES_DIR, "engine", "moon.yml"), "utf8");
     expect(engineMoon).toMatch(/^dependsOn:\s*\[\]\s*$/m);
@@ -1637,25 +1704,16 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
         foundEngineInCaptureDeps = true;
       }
     }
-    expect(
-      foundFixturesInCaptureDevDeps,
-      "packages/capture/Cargo.toml must list dnam-fixtures in [dev-dependencies] (fixtures <- capture)",
-    ).toBe(true);
-    expect(
-      foundEngineInCaptureDeps,
-      "packages/capture/Cargo.toml must list dnam-engine in [dependencies] (engine <- capture)",
-    ).toBe(true);
+    expect(foundFixturesInCaptureDevDeps).toBe(true);
+    expect(foundEngineInCaptureDeps).toBe(true);
     expect(captureCargo).not.toMatch(/\b(?:clap|cpal|toml)\b/);
-
-    const studioCargo = fs.readFileSync(path.join(PACKAGES_DIR, "studio", "Cargo.toml"), "utf8");
-    expect(studioCargo).not.toMatch(/\b(?:clap|toml)\b/);
+    expect(fs.readFileSync(path.join(PACKAGES_DIR, "studio", "Cargo.toml"), "utf8")).not.toMatch(
+      /\b(?:clap|toml)\b/,
+    );
 
     const captureMoon = fs.readFileSync(path.join(PACKAGES_DIR, "capture", "moon.yml"), "utf8");
     expect(captureMoon).toMatch(/^\s*-\s*"engine"\s*$/m);
-    expect(
-      captureMoon,
-      "packages/capture/moon.yml must scope fixtures dependency as development",
-    ).toMatch(/-\s*id:\s*"fixtures"\s*\n\s*scope:\s*"development"/);
+    expect(captureMoon).toMatch(/-\s*id:\s*"fixtures"\s*\n\s*scope:\s*"development"/);
 
     for (const nonConsumerPkg of ["studio", "js"]) {
       const pkgCargo = fs.readFileSync(
@@ -1677,9 +1735,9 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
         `packages/${nonConsumerMoonPkg}/moon.yml must not depend on fixtures`,
       ).not.toContain("fixtures");
     }
+  }
 
-    // Keep ndarray and dialoguer banned everywhere across Cargo manifests and Cargo.lock,
-    // and keep realfft / rustfft / nalgebra banned in runtime/product crates (allowed only in fixtures).
+  function checkBannedDependenciesAndIsolation(): void {
     for (const cargoManifest of [
       path.join(REPO_ROOT, "Cargo.toml"),
       path.join(REPO_ROOT, "Cargo.lock"),
@@ -1709,13 +1767,10 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       );
     }
 
-    expect(fs.existsSync(path.join(PACKAGES_DIR, "capture", "src", "metrics.rs"))).toBe(true);
-    expect(fs.existsSync(path.join(PACKAGES_DIR, "capture", "src", "whitebox.rs"))).toBe(true);
-    expect(fs.existsSync(path.join(PACKAGES_DIR, "capture", "src", "proj.rs"))).toBe(true);
-    expect(fs.existsSync(path.join(PACKAGES_DIR, "capture", "src", "align.rs"))).toBe(true);
+    for (const mod of ["metrics.rs", "whitebox.rs", "proj.rs", "align.rs"]) {
+      expect(fs.existsSync(path.join(PACKAGES_DIR, "capture", "src", mod))).toBe(true);
+    }
 
-    // ADR-0018 & ADR-0020 source-level black-box isolation: zero engine/capture/tier/distillation/DNWB leakage
-    // in packages/fixtures/**/*.rs, and zero dnam_fixtures imports in packages/capture/src/**/*.rs.
     const forbiddenFixturesSymbolsRe =
       /\b(?:Tier|DistillationTarget|internal_nodes|DnwbHeader64B|DNWB|dnam_engine|dnam_capture|dnam_trainer)\b/;
     const fixturesLeakViolations: string[] = [];
@@ -1723,104 +1778,118 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
       path.join(PACKAGES_DIR, "fixtures"),
       new Set([".rs"]),
     )) {
-      const stripped = stripRustCommentsAndStrings(fs.readFileSync(rsFile, "utf8"));
-      if (forbiddenFixturesSymbolsRe.test(stripped)) {
+      if (
+        forbiddenFixturesSymbolsRe.test(
+          stripRustCommentsAndStrings(fs.readFileSync(rsFile, "utf8")),
+        )
+      ) {
         fixturesLeakViolations.push(relPath(rsFile));
       }
     }
     expect(fixturesLeakViolations).toEqual([]);
 
     const nonTestFixturesViolations: string[] = [];
-    const nonTestScanDirs = [
+    const pathOrIncludeFixturesRe =
+      /(?:#\s*\[\s*path\s*=|include(?:_str|_bytes)?\s*!)\s*\(?[^;\n]*fixtures/;
+    for (const scanDir of [
       path.join(PACKAGES_DIR, "capture", "src"),
       path.join(PACKAGES_DIR, "engine"),
       path.join(PACKAGES_DIR, "studio"),
       path.join(PACKAGES_DIR, "js"),
-    ];
-    const pathOrIncludeFixturesRe =
-      /(?:#\s*\[\s*path\s*=|include(?:_str|_bytes)?\s*!)\s*\(?[^;\n]*fixtures/;
-    for (const scanDir of nonTestScanDirs) {
+    ]) {
       for (const rsFile of walkFilesByExtensions(scanDir, new Set([".rs"]))) {
         const raw = fs.readFileSync(rsFile, "utf8");
         const noComments = raw.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
-        const stripped = stripRustCommentsAndStrings(raw);
-        if (/\bdnam_fixtures\b/.test(stripped) || pathOrIncludeFixturesRe.test(noComments)) {
+        if (
+          /\bdnam_fixtures\b/.test(stripRustCommentsAndStrings(raw)) ||
+          pathOrIncludeFixturesRe.test(noComments)
+        ) {
           nonTestFixturesViolations.push(relPath(rsFile));
         }
       }
     }
     const captureBuildRs = path.join(PACKAGES_DIR, "capture", "build.rs");
-    if (fs.existsSync(captureBuildRs)) {
-      nonTestFixturesViolations.push(relPath(captureBuildRs));
-    }
+    if (fs.existsSync(captureBuildRs)) nonTestFixturesViolations.push(relPath(captureBuildRs));
     expect(nonTestFixturesViolations).toEqual([]);
+  }
 
-    // Enforce zero retired prototype .dnam-ckpt / .dnam-cache / .dnce / DNCK / DNCE / dnam_trainer tokens
-    // across packages/ and canonical docs/specs/ (outside project_and_documentation_quality.md's forbidden list)
+  function collectTreeMatches(
+    roots: readonly string[],
+    exts: ReadonlySet<string>,
+    pattern: RegExp,
+    skipRel?: string,
+  ): string[] {
+    const hits: string[] = [];
+    for (const rootDir of roots) {
+      for (const fPath of walkFilesByExtensions(rootDir, exts)) {
+        const rel = relPath(fPath);
+        if (rel === skipRel) continue;
+        if (pattern.test(fs.readFileSync(fPath, "utf8"))) hits.push(rel);
+      }
+    }
+    return hits;
+  }
+
+  function checkZeroRetiredTokensAndPython(): void {
     const retiredCkptOrTrainerRe =
       /(?:\.dnam-ckpt|\.dnam-cache|\.dnce\b|\bDNCK\b|\bDNCE\b|\bdnam[-_]trainer\b)/;
-    const retiredTokenViolations: string[] = [];
-    for (const rootDir of [PACKAGES_DIR, SPECS_DIR]) {
-      for (const fPath of walkFilesByExtensions(
-        rootDir,
-        new Set([".md", ".rs", ".ts", ".tsx", ".json", ".toml", ".yml"]),
-      )) {
-        const rel = relPath(fPath);
-        if (rel === "docs/specs/architecture/project_and_documentation_quality.md") {
-          continue;
-        }
-        if (retiredCkptOrTrainerRe.test(fs.readFileSync(fPath, "utf8"))) {
-          retiredTokenViolations.push(rel);
-        }
-      }
-    }
-    expect(retiredTokenViolations).toEqual([]);
+    const scanExts = new Set([".md", ".rs", ".ts", ".tsx", ".json", ".toml", ".yml"]);
+    expect(
+      collectTreeMatches(
+        [PACKAGES_DIR, SPECS_DIR],
+        scanExts,
+        retiredCkptOrTrainerRe,
+        "docs/specs/architecture/project_and_documentation_quality.md",
+      ),
+    ).toEqual([]);
 
-    // Enforce MR-IIR companion rule presence and zero retired MR-STFT references across docs, root & packages
     expect(collectSpecRules().has("qual.companion.mr-iir")).toBe(true);
     const retiredMrStftRe = /\bmr[-_]?stft\b/i;
-    const mrStftViolations: string[] = [];
+    const mrStftViolations = collectTreeMatches(
+      [DOCS_DIR, PACKAGES_DIR],
+      scanExts,
+      retiredMrStftRe,
+    );
     for (const rootMd of ["AGENTS.md", "README.md", "CONTRIBUTING.md", "CLA.md"]) {
       const p = path.join(REPO_ROOT, rootMd);
-      if (fs.existsSync(p) && retiredMrStftRe.test(fs.readFileSync(p, "utf8"))) {
+      if (fs.existsSync(p) && retiredMrStftRe.test(fs.readFileSync(p, "utf8")))
         mrStftViolations.push(relPath(p));
-      }
-    }
-    for (const rootDir of [DOCS_DIR, PACKAGES_DIR]) {
-      for (const fPath of walkFilesByExtensions(
-        rootDir,
-        new Set([".md", ".rs", ".ts", ".tsx", ".json", ".toml", ".yml"]),
-      )) {
-        if (retiredMrStftRe.test(fs.readFileSync(fPath, "utf8"))) {
-          mrStftViolations.push(relPath(fPath));
-        }
-      }
     }
     expect(mrStftViolations).toEqual([]);
+    expect(walkFilesByExtensions(REPO_ROOT, new Set([".py"]))).toEqual([]);
+  }
 
-    const pyFiles = walkFilesByExtensions(REPO_ROOT, new Set([".py"]));
-    expect(pyFiles).toEqual([]);
+  it("test_type_safety_and_import_boundaries", () => {
+    checkTsTypeSafety();
+    checkRustCrateUnsafeAttributes();
+    checkRustSafeOnlyCrates();
+    checkPackageLineCeilings();
+    checkFixturesAndCaptureCargoBoundaries();
+    checkBannedDependenciesAndIsolation();
+    checkZeroRetiredTokensAndPython();
   });
+
+  function collectTodoViolationsInFile(
+    filePath: string,
+    todoRe: RegExp,
+    violations: string[],
+  ): void {
+    const lines = fs.readFileSync(filePath, "utf8").split("\n");
+    for (let idx = 0; idx < lines.length; idx++) {
+      const line = lines[idx] ?? "";
+      if (!todoRe.test(line)) continue;
+      if (line.includes("`TODO`") || line.includes("`FIXME`") || line.includes("todo =")) continue;
+      violations.push(`${relPath(filePath)}:${idx + 1}: ${line.trim().slice(0, 100)}`);
+    }
+  }
 
   it("test_zero_todo_placeholders_in_docs_and_source", () => {
     const todoRe = /\b(?:TODO|FIXME|XXX|HACK)\b/;
     const violations: string[] = [];
     for (const root of [DOCS_DIR, PACKAGES_DIR, TESTS_DIR]) {
       for (const filePath of walkFilesByExtensions(root, new Set([".md", ".rs", ".ts", ".tsx"]))) {
-        if (path.basename(filePath) === "test_guardrails.test.ts") {
-          continue;
-        }
-        const text = fs.readFileSync(filePath, "utf8");
-        const lines = text.split("\n");
-        for (let idx = 0; idx < lines.length; idx++) {
-          const line = lines[idx] ?? "";
-          if (todoRe.test(line)) {
-            if (line.includes("`TODO`") || line.includes("`FIXME`") || line.includes("todo =")) {
-              continue;
-            }
-            violations.push(`${relPath(filePath)}:${idx + 1}: ${line.trim().slice(0, 100)}`);
-          }
-        }
+        if (path.basename(filePath) === "test_guardrails.test.ts") continue;
+        collectTodoViolationsInFile(filePath, todoRe, violations);
       }
     }
     expect(violations).toEqual([]);
@@ -1850,6 +1919,30 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     }
   });
 
+  function scanEngineFileForForbiddenCalls(
+    rsPath: string,
+    forbiddenCallRe: RegExp,
+    violations: string[],
+  ): void {
+    const base = path.basename(rsPath);
+    if (base === "test_support.rs" || base === "exact_int_verify.rs") return;
+    const lines = fs.readFileSync(rsPath, "utf8").split("\n");
+    for (let idx = 0; idx < lines.length; idx++) {
+      const line = lines[idx] ?? "";
+      const trimmed = line.trim();
+      const nextTrimmed = (lines[idx + 1] ?? "").trim();
+      if (
+        trimmed.startsWith("#[cfg(test)]") &&
+        (nextTrimmed.startsWith("mod ") || nextTrimmed.startsWith("pub mod "))
+      ) {
+        break;
+      }
+      if (!trimmed.startsWith("//") && !trimmed.startsWith("*") && forbiddenCallRe.test(line)) {
+        violations.push(`${relPath(rsPath)}:${idx + 1}: ${trimmed}`);
+      }
+    }
+  }
+
   // verify[repo.code.realtime-disassembly-audit]
   // verify[arch.simd.zero-stall-lowering]
   it("test_engine_realtime_no_libm_or_float_rem_euclid", () => {
@@ -1857,29 +1950,8 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     const forbiddenCallRe =
       /\.(?:rem_euclid|sin|cos|tan|asin|acos|atan|atan2|sinh|cosh|tanh|exp|exp2|ln|log2|log10|powf|powi|sqrt|cbrt|hypot)\s*\(/;
     const violations: string[] = [];
-
     for (const rsPath of walkFilesByExtensions(engineSrcDir, new Set([".rs"]))) {
-      const base = path.basename(rsPath);
-      if (base === "test_support.rs" || base === "exact_int_verify.rs") {
-        continue;
-      }
-      const lines = fs.readFileSync(rsPath, "utf8").split("\n");
-      for (let idx = 0; idx < lines.length; idx++) {
-        const line = lines[idx] ?? "";
-        const trimmed = line.trim();
-        if (trimmed.startsWith("#[cfg(test)]")) {
-          const nextTrimmed = (lines[idx + 1] ?? "").trim();
-          if (nextTrimmed.startsWith("mod ") || nextTrimmed.startsWith("pub mod ")) {
-            break;
-          }
-        }
-        if (trimmed.startsWith("//") || trimmed.startsWith("*")) {
-          continue;
-        }
-        if (forbiddenCallRe.test(line)) {
-          violations.push(`${relPath(rsPath)}:${idx + 1}: ${trimmed}`);
-        }
-      }
+      scanEngineFileForForbiddenCalls(rsPath, forbiddenCallRe, violations);
     }
     expect(violations).toEqual([]);
   });
@@ -1905,8 +1977,7 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     expect(violations).toEqual([]);
   });
 
-  // verify[repo.code.modular-decomposition-and-tests]
-  it("test_modular_decomposition_no_isolated_src_unit_tests_or_code_golf", () => {
+  function checkRustModularFile(rsPath: string, violations: string[]): void {
     const sharedTestHelperNames = new Set(["test_support.rs", "test_utils.rs", "testing.rs"]);
     const isolatedUnitTestFileRe = /^(?:tests?|.*_tests|test_.*)\.rs$/;
     const externalTestModDeclRe =
@@ -1916,36 +1987,182 @@ describe("DNAM Monorepo Architectural & Documentation Guardrails", () => {
     const pkgIntegrationTestsRe = /^packages\/[^/]+\/tests\//;
     const lineContinuationGolfRe = /\\n\\(?:\r?\n)/;
 
+    const rel = relPath(rsPath).split(path.sep).join("/");
+    const base = path.basename(rsPath);
+    const content = fs.readFileSync(rsPath, "utf8");
+
+    if (srcOrRustRe.test(rel) && !binSubdirRe.test(rel)) {
+      if (isolatedUnitTestFileRe.test(base) && !sharedTestHelperNames.has(base)) {
+        violations.push(
+          `${rel}: isolated unit-test file in src/rust (co-locate #[cfg(test)] mod tests { ... } in the production module instead)`,
+        );
+      }
+      const declMatch = externalTestModDeclRe.exec(content);
+      if (declMatch) {
+        violations.push(
+          `${rel}: external file-backed unit-test module declaration '${declMatch[0].trim()}' (use inline #[cfg(test)] mod tests { ... })`,
+        );
+      }
+    }
+    if (pkgIntegrationTestsRe.test(rel) && base.endsWith("_coverage.rs")) {
+      violations.push(
+        `${rel}: grab-bag '*_coverage.rs' integration test file (move unit tests to co-located #[cfg(test)] mod tests or name by domain)`,
+      );
+    }
+    if (lineContinuationGolfRe.test(content)) {
+      violations.push(
+        `${rel}: contains literal '\\n\\\\' line-continuation compression (write readable multi-line statements/assembly)`,
+      );
+    }
+  }
+
+  function checkTsModularFile(tsPath: string, violations: string[]): void {
+    const tsSrcRe = /^packages\/[^/]+\/src\//;
+    const tsPkgTestsRe = /^packages\/[^/]+\/tests\//;
+    const genericTsTestNames = new Set([
+      "test.ts",
+      "tests.ts",
+      "test.tsx",
+      "tests.tsx",
+      "test.js",
+      "tests.js",
+      "test.mjs",
+      "tests.mjs",
+    ]);
+    const specTsRe = /\.spec\.(?:ts|tsx|js|mjs)$/;
+    const coverageGrabBagTsRe = /coverage[^/]*\.(?:test|spec)\.(?:ts|tsx|js|mjs)$/;
+    const lineContinuationGolfRe = /\\n\\(?:\r?\n)/;
+
+    const rel = relPath(tsPath).split(path.sep).join("/");
+    const base = path.basename(tsPath);
+    const content = fs.readFileSync(tsPath, "utf8");
+
+    if (tsSrcRe.test(rel)) {
+      if (rel.includes("/__tests__/")) {
+        violations.push(
+          `${rel}: isolated '__tests__/' directory in src/ (co-locate '<name>.test.ts(x)' beside its source module instead)`,
+        );
+      }
+      if (genericTsTestNames.has(base)) {
+        violations.push(
+          `${rel}: generic unpaired '${base}' file in src/ (name co-located unit tests '<module>.test.ts(x)')`,
+        );
+      }
+      if (specTsRe.test(base)) {
+        violations.push(
+          `${rel}: '*.spec.ts(x)' inside src/ (reserve '*.spec.ts' for tests/e2e/ and use '<module>.test.ts(x)' in src/)`,
+        );
+      }
+    }
+    if ((tsSrcRe.test(rel) || tsPkgTestsRe.test(rel)) && coverageGrabBagTsRe.test(base)) {
+      violations.push(
+        `${rel}: grab-bag '*coverage*.test/spec' test file (co-locate unit tests beside source modules or name integration suites by domain)`,
+      );
+    }
+    if (lineContinuationGolfRe.test(content)) {
+      violations.push(
+        `${rel}: contains literal '\\n\\\\' line-continuation compression (write readable multi-line statements)`,
+      );
+    }
+  }
+
+  // verify[repo.code.modular-decomposition-and-tests]
+  it("test_modular_decomposition_no_isolated_src_unit_tests_or_code_golf", () => {
     const violations: string[] = [];
     for (const rsPath of walkFilesByExtensions(PACKAGES_DIR, new Set([".rs"]))) {
+      checkRustModularFile(rsPath, violations);
+    }
+    for (const tsPath of walkFilesByExtensions(
+      PACKAGES_DIR,
+      new Set([".ts", ".tsx", ".js", ".mjs"]),
+    )) {
+      checkTsModularFile(tsPath, violations);
+    }
+    expect(violations).toEqual([]);
+  });
+
+  // verify[repo.code.constant-eval-and-derivations]
+  it("test_constant_eval_and_magic_number_guardrails", () => {
+    const ruleFile = path.join(REPO_ROOT, ".agents", "rules", "constant-eval-and-magic-numbers.md");
+    expect(fs.existsSync(ruleFile)).toBe(true);
+    expect(fs.readFileSync(ruleFile, "utf8")).toContain(
+      "ref[repo.code.constant-eval-and-derivations]",
+    );
+
+    const constEvalRs = path.join(PACKAGES_DIR, "engine", "src", "math", "const_eval.rs");
+    expect(fs.existsSync(constEvalRs)).toBe(true);
+    const constEvalSrc = fs.readFileSync(constEvalRs, "utf8");
+    expect(constEvalSrc).toContain("pub const fn");
+    expect(constEvalSrc).toContain("const _: () = assert!(");
+
+    const progressRs = fs.readFileSync(
+      path.join(PACKAGES_DIR, "capture", "src", "solver", "progress.rs"),
+      "utf8",
+    );
+    expect(progressRs).toContain("const WORD_MAGIC: usize = WORD_TIER_LTAS + 4;");
+    expect(progressRs).toContain("pub const PROGRESS_WIRE_BYTES: usize = PROGRESS_WIRE_WORDS * 4;");
+
+    const progressTs = fs.readFileSync(
+      path.join(PACKAGES_DIR, "ui", "src", "host", "trainer-progress.ts"),
+      "utf8",
+    );
+    expect(progressTs).toContain("export const WORD_MAGIC = WORD_TIER_LTAS + 4;");
+    expect(progressTs).toContain("export const PROGRESS_WIRE_BYTES = PROGRESS_WIRE_WORDS * 4;");
+
+    const barrelViolations: string[] = [];
+    const allowedJsBarrels = new Set([
+      "packages/js/src/index.ts",
+      "packages/js/src/dsp/index.ts",
+      "packages/js/src/parameters/index.ts",
+      "packages/js/src/provenance/index.ts",
+      "packages/js/src/schema/index.ts",
+      "packages/js/src/tempo/index.ts",
+      "packages/js/src/web-audio/index.ts",
+    ]);
+    for (const pkg of ["ui", "studio", "js"]) {
+      for (const file of walkFilesByExtensions(
+        path.join(PACKAGES_DIR, pkg, "src"),
+        new Set([".ts", ".tsx"]),
+      )) {
+        const base = path.basename(file);
+        if (base !== "index.ts" && base !== "index.tsx") {
+          continue;
+        }
+        const rel = relPath(file).split(path.sep).join("/");
+        if (pkg !== "js" || !allowedJsBarrels.has(rel)) {
+          barrelViolations.push(`${rel}: forbidden internal barrel index file`);
+        }
+      }
+    }
+    expect(barrelViolations).toEqual([]);
+  });
+
+  // verify[arch.index.subsystems]
+  // verify[repo.code.universal-black-box]
+  it("test_capture_trainer_blackbox_purity_no_fixture_leakage", () => {
+    const blackboxRuleFile = path.join(REPO_ROOT, ".agents", "rules", "universal-black-box.md");
+    expect(fs.existsSync(blackboxRuleFile)).toBe(true);
+    const blackboxRuleText = fs.readFileSync(blackboxRuleFile, "utf8");
+    expect(blackboxRuleText).toContain("ref[arch.pillars.universal-black-box]");
+    expect(blackboxRuleText).toContain("ref[repo.code.universal-black-box]");
+
+    const captureSrcDir = path.join(PACKAGES_DIR, "capture", "src");
+    const forbiddenTokens = [
+      "dnam_fixtures",
+      "dnam-fixtures",
+      "build_tube_amp_di_seed",
+      "build_triband_entropia_seed",
+      "DI_LOAD_LF_POLE",
+      "unlock_triband_",
+    ];
+    const violations: string[] = [];
+    for (const rsPath of walkFilesByExtensions(captureSrcDir, new Set([".rs"]))) {
       const rel = relPath(rsPath).split(path.sep).join("/");
-      const base = path.basename(rsPath);
       const content = fs.readFileSync(rsPath, "utf8");
-
-      if (srcOrRustRe.test(rel) && !binSubdirRe.test(rel)) {
-        if (isolatedUnitTestFileRe.test(base) && !sharedTestHelperNames.has(base)) {
-          violations.push(
-            `${rel}: isolated unit-test file in src/rust (co-locate #[cfg(test)] mod tests { ... } in the production module instead)`,
-          );
+      for (const token of forbiddenTokens) {
+        if (content.includes(token)) {
+          violations.push(`${rel}: forbidden white-box token '${token}'`);
         }
-        const declMatch = externalTestModDeclRe.exec(content);
-        if (declMatch) {
-          violations.push(
-            `${rel}: external file-backed unit-test module declaration '${declMatch[0].trim()}' (use inline #[cfg(test)] mod tests { ... })`,
-          );
-        }
-      }
-
-      if (pkgIntegrationTestsRe.test(rel) && base.endsWith("_coverage.rs")) {
-        violations.push(
-          `${rel}: grab-bag '*_coverage.rs' integration test file (move unit tests to co-located #[cfg(test)] mod tests or name by domain)`,
-        );
-      }
-
-      if (lineContinuationGolfRe.test(content)) {
-        violations.push(
-          `${rel}: contains literal '\\n\\\\' line-continuation compression (write readable multi-line statements/assembly)`,
-        );
       }
     }
     expect(violations).toEqual([]);

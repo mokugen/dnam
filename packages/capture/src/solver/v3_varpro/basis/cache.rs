@@ -2,8 +2,9 @@
 //! Pre-Split 3-Band Bézout Stem Cache & `O(P^2)` Per-Band Gram/RHS Assembly.
 
 use dnam_engine::Tier;
-use dnam_engine::stages::v3_core::cascade::{
-    MAX_BLOCK_LANES, NUM_GRU_BLOCKS, tier_block_lanes, tier_fir_segments, tier_kautz_banks,
+use dnam_engine::stages::stage2_gru::{
+    MAX_BLOCK_LANES, MAX_TOTAL_GRU_LANES, NUM_GRU_BLOCKS, tier_block_lanes_array,
+    tier_fir_segments, tier_kautz_banks,
 };
 
 use crate::solver::backends::TrainerBackend;
@@ -34,7 +35,7 @@ pub(in crate::solver::v3_varpro) struct PreSplitStemChan {
     pub(in crate::solver::v3_varpro) w: usize,
     pub(in crate::solver::v3_varpro) seg: usize,
     pub(in crate::solver::v3_varpro) bw: [f64; 3],
-    pub(in crate::solver::v3_varpro) c_max: usize,
+    pub(in crate::solver::v3_varpro) c_max: [usize; NUM_GRU_BLOCKS],
     pub(in crate::solver::v3_varpro) tap_b: [[Vec<f64>; 7]; 3],
     pub(in crate::solver::v3_varpro) u_b: [Vec<f64>; 3],
     pub(in crate::solver::v3_varpro) hp_b: [Vec<f64>; 3],
@@ -49,9 +50,16 @@ impl PreSplitStemChan {
         dataset: &V3TrainDataset,
         trajs: &[StemChanTraj],
         ch: usize,
-        c_max: usize,
+        c_max: [usize; NUM_GRU_BLOCKS],
     ) -> Vec<Self> {
         let mut out = Vec::with_capacity(dataset.stems.len());
+        let mut h_map = Vec::with_capacity(MAX_TOTAL_GRU_LANES);
+        for blk in 0..NUM_GRU_BLOCKS {
+            for l in 0..c_max[blk].min(MAX_BLOCK_LANES) {
+                h_map.push((blk, l));
+            }
+        }
+        let active_h = h_map.len();
 
         for (si, st) in dataset.stems.iter().enumerate() {
             let n = st.usable_len();
@@ -62,9 +70,9 @@ impl PreSplitStemChan {
             let mut u_b: [Vec<f64>; 3] = Default::default();
             let mut hp_b: [Vec<f64>; 3] = Default::default();
             let mut h_b = [
-                vec![Vec::new(); NUM_GRU_BLOCKS * c_max],
-                vec![Vec::new(); NUM_GRU_BLOCKS * c_max],
-                vec![Vec::new(); NUM_GRU_BLOCKS * c_max],
+                vec![Vec::new(); MAX_TOTAL_GRU_LANES],
+                vec![Vec::new(); MAX_TOTAL_GRU_LANES],
+                vec![Vec::new(); MAX_TOTAL_GRU_LANES],
             ];
             let mut tgt_b: [Vec<f64>; 3] = Default::default();
             let mut e_sig = [0.0_f64; 3];
@@ -76,7 +84,7 @@ impl PreSplitStemChan {
                 } else {
                     &st.tgt_r[..n]
                 };
-                let total_jobs = 9 + NUM_GRU_BLOCKS * c_max + 1;
+                let total_jobs = 9 + active_h + 1;
                 let build_job = |job: usize| -> [Vec<f64>; 3] {
                     let mut tmp_sig = vec![0.0_f64; n];
                     if job < 7 {
@@ -87,10 +95,8 @@ impl PreSplitStemChan {
                         tmp_sig.copy_from_slice(&tr.u[..n]);
                     } else if job == 8 {
                         tmp_sig.copy_from_slice(&tr.hp[..n]);
-                    } else if job < 9 + NUM_GRU_BLOCKS * c_max {
-                        let h_idx = job - 9;
-                        let blk = h_idx / c_max;
-                        let l = h_idx % c_max;
+                    } else if job < 9 + active_h {
+                        let (blk, l) = h_map[job - 9];
                         let col = blk * MAX_BLOCK_LANES + l;
                         for t in 0..n {
                             tmp_sig[t] = tr.h[t][col];
@@ -119,14 +125,12 @@ impl PreSplitStemChan {
                 }
                 u_b = it.next().unwrap_or_default();
                 hp_b = it.next().unwrap_or_default();
-                for blk in 0..NUM_GRU_BLOCKS {
-                    let cache_base = blk * c_max;
-                    for l in 0..c_max {
-                        let [b0, b1, b2] = it.next().unwrap_or_default();
-                        h_b[0][cache_base + l] = b0;
-                        h_b[1][cache_base + l] = b1;
-                        h_b[2][cache_base + l] = b2;
-                    }
+                for &(blk, l) in &h_map {
+                    let idx = blk * MAX_BLOCK_LANES + l;
+                    let [b0, b1, b2] = it.next().unwrap_or_default();
+                    h_b[0][idx] = b0;
+                    h_b[1][idx] = b1;
+                    h_b[2][idx] = b2;
                 }
                 tgt_b = it.next().unwrap_or_default();
                 for b in 0..3 {
@@ -273,7 +277,7 @@ pub(in crate::solver::v3_varpro) fn assemble_tier_band_grams<B: TrainerBackend>(
     stems_pre: &[PreSplitStemChan],
     s2_per_stem: &[Vec<f64>],
 ) -> SubspaceGramData {
-    let c_t = tier_block_lanes(tier);
+    let c_t = tier_block_lanes_array(tier);
     let f_t = tier_fir_segments(tier) * 16;
     let k_t = (tier_kautz_banks(tier) * 4).min(k_keep);
     let p_dim = linear_basis_dim_with_k(tier, k_t);
@@ -326,8 +330,9 @@ pub(in crate::solver::v3_varpro) fn assemble_tier_band_grams<B: TrainerBackend>(
             col_refs.push(&st.u_b[b]);
             col_refs.push(&st.hp_b[b]);
             for blk in 0..NUM_GRU_BLOCKS {
-                let cache_base = blk * st.c_max;
-                for l in 0..c_t {
+                debug_assert!(c_t[blk] <= st.c_max[blk]);
+                let cache_base = blk * MAX_BLOCK_LANES;
+                for l in 0..c_t[blk] {
                     col_refs.push(&st.h_b[b][cache_base + l]);
                 }
             }

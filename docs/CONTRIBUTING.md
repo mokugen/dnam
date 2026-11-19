@@ -120,7 +120,7 @@ Use standard **Markdown tables** when presenting flat registries (`REQ-1.1`–`R
 ## 5. Maintaining Requirements (`REQ-*`), Specifications (`r[...]`), Verification (`verify[...]`) & ADRs (`ref[repo.docs.requirements-layer]`, `ref[repo.docs.spec-rules-and-adrs]`)
 
 1. **System Requirements Registry ([`requirements/system_goals_and_requirements.md`](requirements/system_goals_and_requirements.md)):**
-   - Every requirement must appear as a canonical Markdown table row beginning with `| **\`REQ-X.Y\`** |` under its respective Goal (`40` total requirements). Use [`templates/requirement_template.md`](templates/requirement_template.md).
+   - Every requirement must appear as a canonical Markdown table row beginning with `| **\`REQ-X.Y\`** |` under its respective Goal (`41` total requirements). Use [`templates/requirement_template.md`](templates/requirement_template.md).
 2. **Normative Specifications (`docs/specs/**/*.md`) & Verification (`verify[...]`):**
    - Every normative specification section must include at least one unique `` `r[<domain>.<subdomain>.<rule>]` `` definition, and every `r[...]` rule in `docs/specs/` is tracked for `verify[...]` test coverage. Use [`templates/spec_template.md`](templates/spec_template.md).
 3. **Architectural Decision Records (`docs/adr/NNNN-*.md`):**

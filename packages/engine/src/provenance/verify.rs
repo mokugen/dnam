@@ -96,7 +96,7 @@ pub fn verify_container_provenance<C: CryptoProvider>(
 
     // 3. Verify either master_arena_sha256 (direct creator release) or marketplace_receipt,
     //    supporting zero-re-signing tier-stripped prefix containers via tier_arena_sha256 / buyer_tier_arena_sha256.
-    const TIER_END_OFFSETS: [usize; 4] = [10_752, 22_336, 36_224, 64_000];
+    const TIER_END_OFFSETS: [usize; 4] = [4_608, 10_240, 18_432, 28_672];
     let computed_arena_sha = sha256_digest(plaintext_arena);
     let prefix_tier_idx = TIER_END_OFFSETS
         .iter()
@@ -482,12 +482,12 @@ mod tests {
             assert!(verify_container_provenance(&h1, true, &[0u8; 64], &crypto).is_err());
 
             // Test tier_arena_sha256 prefix verification and mismatch on creator-only signed container
-            let full_arena = [0x42u8; 64_000];
+            let full_arena = [0x42u8; 28_672];
             let full_arena_sha = sha256_digest(&full_arena);
             let tier_shas = [
-                encode_hex(&sha256_digest(&full_arena[..10_752])),
-                encode_hex(&sha256_digest(&full_arena[..22_336])),
-                encode_hex(&sha256_digest(&full_arena[..36_224])),
+                encode_hex(&sha256_digest(&full_arena[..4_608])),
+                encode_hex(&sha256_digest(&full_arena[..10_240])),
+                encode_hex(&sha256_digest(&full_arena[..18_432])),
                 encode_hex(&full_arena_sha),
             ];
             let msg_full = build_creator_signing_message(&imm_sha, &full_arena_sha);
@@ -503,8 +503,8 @@ mod tests {
                 },
                 marketplace_receipt: None,
             });
-            assert!(verify_container_provenance(&h1, true, &full_arena[..22_336], &crypto).is_ok());
-            assert!(verify_container_provenance(&h1, true, &[0u8; 22_336], &crypto).is_err());
+            assert!(verify_container_provenance(&h1, true, &full_arena[..10_240], &crypto).is_ok());
+            assert!(verify_container_provenance(&h1, true, &[0u8; 10_240], &crypto).is_err());
 
             // Test marketplace_receipt error branches: buyer_tier_arena_sha256 mismatch,
             // buyer_arena_sha256 mismatch, and unauthorized local_device_id_hash
@@ -531,7 +531,7 @@ mod tests {
             h1.metadata.signatures.as_mut().unwrap().marketplace_receipt = Some(rcpt.clone());
 
             // 1. buyer_tier_arena_sha256 mismatch on prefix
-            assert!(verify_container_provenance(&h1, true, &[0u8; 22_336], &crypto).is_err());
+            assert!(verify_container_provenance(&h1, true, &[0u8; 10_240], &crypto).is_err());
 
             // 2. buyer_arena_sha256 mismatch when buyer_tier_arena_sha256 is None
             rcpt.buyer_tier_arena_sha256 = None;

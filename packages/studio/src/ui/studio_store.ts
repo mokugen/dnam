@@ -1,8 +1,5 @@
-import type {
-  CapturePlanStepView,
-  DnamPluginRackModel,
-  TrainingTimelineView,
-} from "@dnam-project/ui";
+import type { DnamPluginRackModel } from "@dnam-project/ui/rack/models";
+import type { CapturePlanStepView, TrainingTimelineView } from "@dnam-project/ui/workflows/models";
 
 export interface StudioWorkspaceViewModel {
   readonly workspaceName: string;

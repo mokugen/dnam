@@ -5,8 +5,8 @@
 ## 1. Key Modules
 
 - [`rust/capture.rs`](rust/capture.rs) & [`rust/capture/backends.rs`](rust/capture/backends.rs): `AtomicF32RingBuffer` and `cpal` native audio device enumeration (`CoreAudio` / `ALSA` / `WASAPI`).
-- [`rust/ipc.rs`](rust/ipc.rs) & [`rust/main.rs`](rust/main.rs): Tauri v2 `StudioIpcHandler` (`.dnam-proj` inspection, isolated IPC allowlisting, `dnam://` deep-link routing) and standalone `dnam-studio` desktop binary.
-- [`src/`](src/index.ts): TypeScript IPC client ([`ipc.ts`](src/ipc.ts)), `TauriNativeAudioHost` ([`host.ts`](src/host.ts)), and Tauri v2 React 19 UI ([`src/ui/StudioApp.tsx`](src/ui/StudioApp.tsx), [`src/ui/studio_store.ts`](src/ui/studio_store.ts)).
+- [`rust/ipc.rs`](rust/ipc.rs), [`rust/ipc/paths.rs`](rust/ipc/paths.rs), [`rust/ipc/deep_link.rs`](rust/ipc/deep_link.rs) & [`rust/main.rs`](rust/main.rs): Tauri v2 `StudioIpcHandler` (`.dnam-proj` inspection, isolated IPC allowlisting, `dnam://` deep-link routing, private exports) and standalone `dnam-studio` desktop binary.
+- [`src/ipc.ts`](src/ipc.ts), [`src/host.ts`](src/host.ts), [`src/ui/StudioApp.tsx`](src/ui/StudioApp.tsx) & [`src/ui/studio_store.ts`](src/ui/studio_store.ts): TypeScript IPC client, `TauriNativeAudioHost`, and Tauri v2 React 19 UI consuming `@dnam-project/ui/*` leaf subpath imports.
 
 ## 2. Guides & Verification
 

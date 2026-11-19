@@ -69,7 +69,7 @@ pub fn sqrt_f64(x: f64) -> f64 {
         (x, 1.0)
     };
     let bits = scaled_x.to_bits();
-    let rsqrt_bits = 0x5FE6_EB50_C7B5_37A9_u64.wrapping_sub(bits >> 1);
+    let rsqrt_bits = crate::math::IEEE754_F64_RSQRT_SEED.wrapping_sub(bits >> 1);
     let mut z = f64::from_bits(rsqrt_bits);
     let half_x = 0.5 * scaled_x;
     for _ in 0..6 {

@@ -55,29 +55,34 @@ pub const CONTAINER_VERSION_MAJOR: u16 = 2;
 /// Current container minor version (`0`).
 pub const CONTAINER_VERSION_MINOR: u16 = 0;
 
-/// Fixed byte length of `Arena 0 (Lite)` (`168 × 64 B = 10,752 B`).
-pub const ARENA_OFFSET_LITE_END: u32 = 10_752;
+/// End of `Arena 0 (Lite)` in 64-byte cache lines (`72`).
+pub const ARENA_LITE_END_CL: u16 = 72;
 
-/// Fixed cumulative byte end of `Arena 0..1 (Full)` (`349 × 64 B = 22,336 B`).
-pub const ARENA_OFFSET_FULL_END: u32 = 22_336;
+/// End of `Arena 0..1 (Full)` in 64-byte cache lines (`160`).
+pub const ARENA_FULL_END_CL: u16 = ARENA_LITE_END_CL + 88;
 
-/// Fixed cumulative byte end of `Arena 0..2 (Pro)` (`566 × 64 B = 36,224 B`).
-pub const ARENA_OFFSET_PRO_END: u32 = 36_224;
+/// End of `Arena 0..2 (Pro)` in 64-byte cache lines (`288`).
+pub const ARENA_PRO_END_CL: u16 = ARENA_FULL_END_CL + 128;
 
-/// Fixed cumulative byte end of `Arena 0..3 (Ultra)` (`1,000 × 64 B = 64,000 B`).
-pub const ARENA_OFFSET_ULTRA_END: u32 = 64_000;
+/// End of `Arena 0..3 (Ultra)` in 64-byte cache lines (`448`).
+pub const ARENA_ULTRA_END_CL: u16 = ARENA_PRO_END_CL + 160;
 
-/// End of `Arena 0 (Lite)` in 64-byte cache lines (`168`).
-pub const ARENA_LITE_END_CL: u16 = 168;
+/// Fixed byte length of `Arena 0 (Lite)` (`72 × 64 B = 4,608 B`).
+pub const ARENA_OFFSET_LITE_END: u32 = (ARENA_LITE_END_CL as u32) * 64;
 
-/// End of `Arena 0..1 (Full)` in 64-byte cache lines (`349`).
-pub const ARENA_FULL_END_CL: u16 = 349;
+/// Fixed cumulative byte end of `Arena 0..1 (Full)` (`160 × 64 B = 10,240 B`).
+pub const ARENA_OFFSET_FULL_END: u32 = (ARENA_FULL_END_CL as u32) * 64;
 
-/// End of `Arena 0..2 (Pro)` in 64-byte cache lines (`566`).
-pub const ARENA_PRO_END_CL: u16 = 566;
+/// Fixed cumulative byte end of `Arena 0..2 (Pro)` (`288 × 64 B = 18,432 B`).
+pub const ARENA_OFFSET_PRO_END: u32 = (ARENA_PRO_END_CL as u32) * 64;
 
-/// End of `Arena 0..3 (Ultra)` in 64-byte cache lines (`1,000`).
-pub const ARENA_ULTRA_END_CL: u16 = 1_000;
+/// Fixed cumulative byte end of `Arena 0..3 (Ultra)` (`448 × 64 B = 28,672 B`).
+pub const ARENA_OFFSET_ULTRA_END: u32 = (ARENA_ULTRA_END_CL as u32) * 64;
+
+const _: () = assert!(ARENA_OFFSET_LITE_END as usize == crate::stages::weights::ARENA_LITE_BYTES);
+const _: () = assert!(ARENA_OFFSET_FULL_END as usize == crate::stages::weights::ARENA_FULL_BYTES);
+const _: () = assert!(ARENA_OFFSET_PRO_END as usize == crate::stages::weights::ARENA_PRO_BYTES);
+const _: () = assert!(ARENA_OFFSET_ULTRA_END as usize == crate::stages::weights::ARENA_ULTRA_BYTES);
 
 // ============================================================================
 // Preamble Flag Bits (`flags: u16`)

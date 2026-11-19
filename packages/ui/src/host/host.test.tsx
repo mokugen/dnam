@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
-import { DnamAudioHostProvider, useDnamAudioHost, WebAudioWorkletHost } from "./index.js";
+import { DnamAudioHostProvider, useDnamAudioHost } from "./context.js";
+import { WebAudioWorkletHost } from "./web_worklet_host.js";
 
 function HostProbe() {
   const { host, telemetry, setParameter, setSwitchIndex } = useDnamAudioHost();

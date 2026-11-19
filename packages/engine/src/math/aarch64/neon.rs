@@ -1,13 +1,15 @@
 //! ARM64 NEON (`float32x4_t`) baseline hardware math backend (`NeonVec4` & `NeonBackend`).
 
 use core::arch::aarch64::{
-    __crc32cb, __crc32cd, float32x4_t, vabsq_f32, vaddq_f32, vaddvq_f32, vandq_u32, vcombine_f32,
-    vdup_n_f32, vdup_n_s32, vdupq_n_f32, vdupq_n_u32, vdupq_n_u64, veorq_u32, vfmaq_f32,
-    vfmaq_laneq_f32, vfmsq_f32, vget_high_f32, vget_lane_f32, vget_low_f32, vmaxnmq_f32,
-    vminnmq_f32, vminq_u32, vmul_f32, vmulq_f32, vpadd_f32, vpaddq_f32, vreinterpret_f32_s32,
-    vreinterpret_s32_u32, vreinterpret_u32_f32, vreinterpretq_f32_u32, vreinterpretq_u32_f32,
-    vreinterpretq_u32_u64, vrev64q_f32, vset_lane_f32, vshr_n_u32, vsub_f32, vsub_s32, vsubq_f32,
-    vsubq_u32,
+    __crc32cb, __crc32cd, float32x4_t, uint16x4_t, vabsq_f32, vaddq_f32, vaddq_u32, vaddvq_f32,
+    vandq_u32, vcombine_f32, vdup_n_f32, vdup_n_s32, vdupq_n_f32, vdupq_n_u32, vdupq_n_u64,
+    veorq_u32, vfmaq_f32, vfmaq_laneq_f32, vfmsq_f32, vget_high_f32, vget_lane_f32, vget_low_f32,
+    vgetq_lane_f32, vld1_u16, vmaxnmq_f32, vminnmq_f32, vminq_u32, vmul_f32, vmulq_f32,
+    vmulq_laneq_f32, vpadd_f32, vpaddq_f32, vreinterpret_f32_s32, vreinterpret_s32_u32,
+    vreinterpret_u32_f32, vreinterpretq_f32_f64, vreinterpretq_f32_u32, vreinterpretq_f64_f32,
+    vreinterpretq_u32_f32, vreinterpretq_u32_u64, vrev64q_f32, vset_lane_f32, vsetq_lane_f32,
+    vshlq_n_u32, vshr_n_u32, vshrq_n_u32, vsub_f32, vsub_s32, vsubq_f32, vsubq_u32, vtrn1q_f32,
+    vtrn1q_f64, vtrn2q_f32, vtrn2q_f64,
 };
 
 use crate::math::crc32c::{Crc32cBackend, crc32c_software_slice};
@@ -35,13 +37,55 @@ impl SimdVec4 for NeonVec4 {
     }
 
     #[inline(always)]
+    fn dup_low_pair(self) -> Self {
+        // SAFETY: `aarch64` guarantees baseline NEON availability.
+        unsafe {
+            let pair = vget_low_f32(self.0);
+            Self(vcombine_f32(pair, pair))
+        }
+    }
+
+    #[inline(always)]
+    fn dup_high_pair(self) -> Self {
+        // SAFETY: `aarch64` guarantees baseline NEON availability.
+        unsafe {
+            let pair = vget_high_f32(self.0);
+            Self(vcombine_f32(pair, pair))
+        }
+    }
+
+    #[inline(always)]
     fn load(src: &[f32; 4]) -> Self {
         Self(zerocopy::transmute!(*src))
     }
 
     #[inline(always)]
+    fn from_array(arr: [f32; 4]) -> Self {
+        // SAFETY: `aarch64` guarantees baseline NEON availability.
+        unsafe {
+            let v = vdupq_n_f32(arr[0]);
+            let v = vsetq_lane_f32::<1>(arr[1], v);
+            let v = vsetq_lane_f32::<2>(arr[2], v);
+            Self(vsetq_lane_f32::<3>(arr[3], v))
+        }
+    }
+
+    #[inline(always)]
     fn store(self, dst: &mut [f32; 4]) {
         *dst = zerocopy::transmute!(self.0);
+    }
+
+    #[inline(always)]
+    fn to_array(self) -> [f32; 4] {
+        // SAFETY: `aarch64` guarantees baseline NEON availability.
+        unsafe {
+            [
+                vgetq_lane_f32::<0>(self.0),
+                vgetq_lane_f32::<1>(self.0),
+                vgetq_lane_f32::<2>(self.0),
+                vgetq_lane_f32::<3>(self.0),
+            ]
+        }
     }
 
     #[inline(always)]
@@ -78,6 +122,20 @@ impl SimdVec4 for NeonVec4 {
                 1 => vfmaq_laneq_f32::<1>(self.0, a.0, v.0),
                 2 => vfmaq_laneq_f32::<2>(self.0, a.0, v.0),
                 _ => vfmaq_laneq_f32::<3>(self.0, a.0, v.0),
+            })
+        }
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        const { assert!(LANE < 4) };
+        // SAFETY: `aarch64` guarantees baseline NEON availability and `LANE < 4`.
+        unsafe {
+            Self(match LANE {
+                0 => vmulq_laneq_f32::<0>(self.0, v.0),
+                1 => vmulq_laneq_f32::<1>(self.0, v.0),
+                2 => vmulq_laneq_f32::<2>(self.0, v.0),
+                _ => vmulq_laneq_f32::<3>(self.0, v.0),
             })
         }
     }
@@ -133,6 +191,97 @@ impl SimdVec4 for NeonVec4 {
             let p2 = vpadd_f32(vget_low_f32(p1), vget_high_f32(p1));
             (vget_lane_f32::<0>(p2), vget_lane_f32::<1>(p2))
         }
+    }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        // SAFETY: `aarch64` guarantees baseline NEON availability.
+        unsafe {
+            let magic = vdupq_n_u32(crate::math::IEEE754_F32_RCP_SEED);
+            let bits = vreinterpretq_u32_f32(self.0);
+            Self(vreinterpretq_f32_u32(vsubq_u32(magic, bits)))
+        }
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        // SAFETY: `aarch64` guarantees baseline NEON availability.
+        unsafe {
+            let magic = vdupq_n_u32(crate::math::IEEE754_F32_RSQRT_SEED);
+            let bits = vshrq_n_u32::<1>(vreinterpretq_u32_f32(self.0));
+            Self(vreinterpretq_f32_u32(vsubq_u32(magic, bits)))
+        }
+    }
+
+    #[inline(always)]
+    fn pow2_from_biased_int_bits(self) -> Self {
+        // SAFETY: `aarch64` guarantees baseline NEON availability.
+        unsafe {
+            let biased = vaddq_u32(
+                vreinterpretq_u32_f32(self.0),
+                vdupq_n_u32(crate::math::IEEE754_F32_EXP_BIAS),
+            );
+            Self(vreinterpretq_f32_u32(vshlq_n_u32::<23>(biased)))
+        }
+    }
+
+    #[inline(always)]
+    fn rcp_ge1_pair_nr2(self, other: Self) -> (Self, Self) {
+        let one = Self::splat(1.0);
+        let y0 = self.rcp_pos_seed_bits();
+        let y1 = other.rcp_pos_seed_bits();
+        let e0 = one.fms(self, y0);
+        let e1 = one.fms(other, y1);
+        let y0 = y0.fma(y0, e0);
+        let y1 = y1.fma(y1, e1);
+        let f0 = one.fms(self, y0);
+        let f1 = one.fms(other, y1);
+        (y0.fma(y0, f0), y1.fma(y1, f1))
+    }
+
+    #[inline(always)]
+    fn rcp_ge1_quad_nr2(d: [Self; 4]) -> [Self; 4] {
+        let one = Self::splat(1.0);
+        let y0 = d[0].rcp_pos_seed_bits();
+        let y1 = d[1].rcp_pos_seed_bits();
+        let y2 = d[2].rcp_pos_seed_bits();
+        let y3 = d[3].rcp_pos_seed_bits();
+        let e0 = one.fms(d[0], y0);
+        let e1 = one.fms(d[1], y1);
+        let e2 = one.fms(d[2], y2);
+        let e3 = one.fms(d[3], y3);
+        let y0 = y0.fma(y0, e0);
+        let y1 = y1.fma(y1, e1);
+        let y2 = y2.fma(y2, e2);
+        let y3 = y3.fma(y3, e3);
+        let f0 = one.fms(d[0], y0);
+        let f1 = one.fms(d[1], y1);
+        let f2 = one.fms(d[2], y2);
+        let f3 = one.fms(d[3], y3);
+        [
+            y0.fma(y0, f0),
+            y1.fma(y1, f1),
+            y2.fma(y2, f2),
+            y3.fma(y3, f3),
+        ]
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_pair_nr2(a: Self, b: Self) -> (Self, Self) {
+        let floor = Self::splat(1.0e-12);
+        let half = Self::splat(0.5);
+        let three_halves = Self::splat(1.5);
+        let da = a.max(floor);
+        let db = b.max(floor);
+        let hda = da.mul(half);
+        let hdb = db.mul(half);
+        let mut ya = da.rsqrt_pos_seed_bits();
+        let mut yb = db.rsqrt_pos_seed_bits();
+        ya = ya.mul(three_halves.fms(hda, ya.mul(ya)));
+        yb = yb.mul(three_halves.fms(hdb, yb.mul(yb)));
+        ya = ya.mul(three_halves.fms(hda, ya.mul(ya)));
+        yb = yb.mul(three_halves.fms(hdb, yb.mul(yb)));
+        (ya, yb)
     }
 }
 
@@ -226,34 +375,48 @@ impl MathBackend for NeonBackend {
     const KIND: BackendKind = BackendKind::ArmNeon;
 
     #[inline(always)]
-    fn f32x4_to_fp16x4(src: &[f32; 4]) -> [u16; 4] {
+    fn transpose_4x4(
+        r0: Self::Vec4,
+        r1: Self::Vec4,
+        r2: Self::Vec4,
+        r3: Self::Vec4,
+    ) -> [Self::Vec4; 4] {
+        // SAFETY: `aarch64` guarantees baseline NEON `trn1`/`trn2` availability.
+        unsafe {
+            let t0 = vreinterpretq_f64_f32(vtrn1q_f32(r0.0, r1.0));
+            let t1 = vreinterpretq_f64_f32(vtrn2q_f32(r0.0, r1.0));
+            let t2 = vreinterpretq_f64_f32(vtrn1q_f32(r2.0, r3.0));
+            let t3 = vreinterpretq_f64_f32(vtrn2q_f32(r2.0, r3.0));
+            [
+                NeonVec4(vreinterpretq_f32_f64(vtrn1q_f64(t0, t2))),
+                NeonVec4(vreinterpretq_f32_f64(vtrn1q_f64(t1, t3))),
+                NeonVec4(vreinterpretq_f32_f64(vtrn2q_f64(t0, t2))),
+                NeonVec4(vreinterpretq_f32_f64(vtrn2q_f64(t1, t3))),
+            ]
+        }
+    }
+
+    #[inline(always)]
+    fn vec4_to_fp16x4(src: Self::Vec4) -> [u16; 4] {
         // SAFETY: `aarch64` guarantees baseline NEON `fcvtn` availability; clamp to `[-65504.0, 65504.0]`.
         unsafe {
-            let v = NeonVec4::load(src).clamp(NeonVec4::splat(-65504.0), NeonVec4::splat(65504.0));
-            let raw_out: u64;
+            let v = src.clamp(NeonVec4::splat(-65504.0), NeonVec4::splat(65504.0));
+            let raw_out: uint16x4_t;
             core::arch::asm!(
                 "fcvtn {d:v}.4h, {v:v}.4s",
                 v = in(vreg) v.0,
                 d = lateout(vreg) raw_out,
                 options(pure, nomem, nostack, preserves_flags),
             );
-            [
-                (raw_out & 0xFFFF) as u16,
-                ((raw_out >> 16) & 0xFFFF) as u16,
-                ((raw_out >> 32) & 0xFFFF) as u16,
-                (raw_out >> 48) as u16,
-            ]
+            zerocopy::transmute!(raw_out)
         }
     }
 
     #[inline(always)]
-    fn fp16x4_to_f32x4(src: &[u16; 4]) -> [f32; 4] {
-        // SAFETY: `aarch64` guarantees baseline NEON `fcvtl` availability.
+    fn fp16x4_to_vec4(src: &[u16; 4]) -> Self::Vec4 {
+        // SAFETY: `aarch64` guarantees baseline NEON `fcvtl` availability and `src` is valid for 8 bytes.
         unsafe {
-            let raw_in = u64::from(src[0])
-                | (u64::from(src[1]) << 16)
-                | (u64::from(src[2]) << 32)
-                | (u64::from(src[3]) << 48);
+            let raw_in = vld1_u16(src.as_ptr());
             let out_v: float32x4_t;
             core::arch::asm!(
                 "fcvtl {v:v}.4s, {d:v}.4h",
@@ -261,8 +424,18 @@ impl MathBackend for NeonBackend {
                 v = lateout(vreg) out_v,
                 options(pure, nomem, nostack, preserves_flags),
             );
-            NeonVec4(out_v).to_array()
+            NeonVec4(out_v)
         }
+    }
+
+    #[inline(always)]
+    fn f32x4_to_fp16x4(src: &[f32; 4]) -> [u16; 4] {
+        Self::vec4_to_fp16x4(NeonVec4::load(src))
+    }
+
+    #[inline(always)]
+    fn fp16x4_to_f32x4(src: &[u16; 4]) -> [f32; 4] {
+        Self::fp16x4_to_vec4(src).to_array()
     }
 
     #[inline(always)]

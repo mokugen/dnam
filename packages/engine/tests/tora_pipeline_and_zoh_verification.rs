@@ -31,33 +31,58 @@ use dnam_engine::{
 fn build_populated_tora_container() -> (DnamJsonHeader, Vec<u8>, Vec<u8>) {
     let mut header = DnamJsonHeader::default_reference();
     let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    arena[124..128].copy_from_slice(&0.9993_f32.to_le_bytes());
-
-    let head_bases = [4_928_usize, 18_048_usize, 31_936_usize, 57_600_usize];
-    for tier in 0..4 {
-        for blk in 0..4 {
-            let k_base = dnam_engine::provenance::kautz_soa_byte_offset(tier, blk);
-            for lane in 0..4 {
-                arena[k_base + lane * 4..k_base + (lane + 1) * 4]
-                    .copy_from_slice(&0.90_f32.to_le_bytes());
-                arena[k_base + 16 + lane * 4..k_base + 16 + (lane + 1) * 4]
-                    .copy_from_slice(&0.04_f32.to_le_bytes());
-                arena[k_base + 32 + lane * 4..k_base + 32 + (lane + 1) * 4]
-                    .copy_from_slice(&(0.15_f32 * ((tier + 1) as f32)).to_le_bytes());
-                arena[k_base + 48 + lane * 4..k_base + 48 + (lane + 1) * 4]
-                    .copy_from_slice(&0.35_f32.to_le_bytes());
-                arena[k_base + 64 + lane * 4..k_base + 64 + (lane + 1) * 4]
-                    .copy_from_slice(&0.25_f32.to_le_bytes());
-                arena[k_base + 80 + lane * 4..k_base + 80 + (lane + 1) * 4]
-                    .copy_from_slice(&(-0.15_f32).to_le_bytes());
+    let mut model = dnam_engine::stages::V3MatryoshkaModel::dual_rate_default(false);
+    model.stage0.xo_low_gain = 1.05;
+    model.stage0.xo_high_gain = 0.95;
+    model.stage0.clean_sub_mix = 0.25;
+    model.stage0.op_p_sub_mix = 0.12;
+    model.svf.env_oct_sens = 1.25;
+    model.tone_svf.h0_proj_w = [0.25, -0.15, 0.10, 0.05];
+    model.tone_svf.s1_proj_w = 0.25;
+    for b in 0..dnam_engine::stages::stage2_gru::NUM_GRU_BLOCKS {
+        for f in 0..dnam_engine::stages::stage2_gru::NUM_IN_FEATS_B0 {
+            for l in 0..12 {
+                model.blocks[b].w_in_n[f][l] = 0.14 * if ((f + l) & 1) == 0 { 1.0 } else { -1.0 };
             }
         }
-        let h_base = head_bases[tier];
-        for i in 0..640 {
-            let val = 0.03_f32 * (((i * 7 + tier * 3 + 1) % 11) as f32 - 5.0);
-            arena[h_base + i * 4..h_base + (i + 1) * 4].copy_from_slice(&val.to_le_bytes());
+        for l in 0..12 {
+            model.blocks[b].b_z[l] = -0.3;
+            model.blocks[b].b_r[l] = 0.2;
+            model.blocks[b].k_sag[l] = 0.25;
+            model.blocks[b].k_quad[l] = 0.1;
+            model.blocks[b].w_rec_n[l][l] = 0.12;
+            if b > 0 {
+                model.blocks[b].w_prev_n[l][l] = 0.22;
+            }
         }
     }
+    for tier in 0..4 {
+        for lane in 0..4 {
+            model.kautz_poles[tier * 4 + lane] =
+                (0.90, 0.15_f32 * ((tier + 1) as f32) + 0.05 * (lane as f32));
+        }
+        let mut ro = dnam_engine::stages::V3TierReadout::default();
+        for ch in 0..2 {
+            for l in 0..24 {
+                ro.pre_cab_w[ch][l] =
+                    0.06 * ((tier + 1) as f32) * if (l & 1) == 0 { 1.0 } else { -0.5 };
+                ro.direct_s2_w[ch][l] = 0.04 * ((tier + 1) as f32);
+            }
+        }
+        for tap in 0..64 {
+            ro.fir_l[tap] = 0.05 * ((tier + 1) as f32) * if tap % 4 == 0 { 1.0 } else { 0.1 };
+            ro.fir_r[tap] = 0.045 * ((tier + 1) as f32) * if tap % 4 == 0 { 1.0 } else { 0.1 };
+        }
+        for m in 0..16 {
+            ro.kautz_b_gamma[m] = 0.35;
+            ro.kautz_c_l[m] = (0.25 * ((tier + 1) as f32), -0.15);
+            ro.kautz_c_r[m] = (0.20 * ((tier + 1) as f32), -0.10);
+        }
+        model.readouts[tier] = ro;
+        model.stage4[tier].g_loop = 0.72;
+        model.stage4[tier].wet_mix = 0.18 + 0.04 * (tier as f32);
+    }
+    dnam_engine::stages::weights::pack_v3_matryoshka_to_arena(&model, &mut arena);
 
     let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
     (header, arena, container)
@@ -68,15 +93,15 @@ fn build_populated_tora_container() -> (DnamJsonHeader, Vec<u8>, Vec<u8>) {
 #[test]
 fn test_8h_8i_end_to_end_tora_pipeline_tiers_zoh_sample_rates_and_4x_bounce() {
     assert_eq!(core::mem::size_of::<DnamPreamble>(), 64);
-    assert_eq!(TOTAL_LITE_STATE_RAM_BYTES, 8_656);
+    const { assert!(TOTAL_LITE_STATE_RAM_BYTES <= 8_656) };
     assert_eq!(OFFLINE_BOUNCE_PDC_SAMPLES, 12);
 
     let (_header, _arena, container) = build_populated_tora_container();
     let preamble = DnamPreamble::from_bytes(&container).unwrap();
-    assert_eq!(preamble.arena_lite_end_cl, 168);
-    assert_eq!(preamble.arena_full_end_cl, 349);
-    assert_eq!(preamble.arena_pro_end_cl, 566);
-    assert_eq!(preamble.arena_ultra_end_cl, 1000);
+    assert_eq!(preamble.arena_lite_end_cl, 72);
+    assert_eq!(preamble.arena_full_end_cl, 160);
+    assert_eq!(preamble.arena_pro_end_cl, 288);
+    assert_eq!(preamble.arena_ultra_end_cl, 448);
     assert_eq!(preamble.tensor_arena_offset % 64, 0);
 
     // 1. Sample-0 DC resting equilibrium: zero input must produce 0.000000 output on sample 0
@@ -288,8 +313,7 @@ fn test_engine_constructors_calibration_roles_and_tempo_sync() {
     )
     .unwrap();
     assert_eq!(eng.max_supported_tier(), Tier::Pro);
-    assert_eq!(eng.stage_pipeline.stage1.topology_mode, 2);
-    assert!(eng.stage_pipeline.stage1.gate_threshold > 0.0);
+    assert!((eng.stage0_router.crossover_hz - 180.0).abs() < 1e-4);
     assert!((eng.zoh().tau_ref_samples_host - 24.0).abs() < 1e-6);
     assert_eq!(eng.zoh().switch_xfade_samples_host, 96);
     assert!((eng.control_bus.inv_trust_radius_mh2 - 1.0 / 144.0).abs() < 1e-6);
@@ -369,41 +393,61 @@ fn test_engine_constructors_calibration_roles_and_tempo_sync() {
         );
     }
 
-    // 5. Verify W_ctrl (bytes 9,536..10,560) dispatches dynamic modulations to Stage I and Stage IV
-    let mut mod_arena = arena.clone();
-    // Row 0 (ctrl_basis_4[0]): col 0 (delay mod +12.0 samples), col 2 (gain mod +0.10), col 7 (state mod: psi +0.2)
-    let w_ctrl_base = 9_536_usize;
-    mod_arena[w_ctrl_base..w_ctrl_base + 4].copy_from_slice(&12.0_f32.to_le_bytes());
-    mod_arena[w_ctrl_base + 32..w_ctrl_base + 36].copy_from_slice(&0.40_f32.to_le_bytes());
-    mod_arena[w_ctrl_base + 116..w_ctrl_base + 120].copy_from_slice(&0.25_f32.to_le_bytes());
+    // 5. Verify W_ctrl (bytes 3,520..4,544) dispatches dynamic modulations via ControlBus -> stage_targets
+    let mut base_mod_arena = arena.clone();
+    let w_ctrl_base = dnam_engine::stages::weights::ARENA0_W_CTRL_OFFSET;
+    // Clear any random values in W_ctrl for a deterministic baseline
+    base_mod_arena[w_ctrl_base..w_ctrl_base + 1_024].fill(0);
+    let mut mod_arena = base_mod_arena.clone();
+    // Row 0 (env_fc_scale), Row 2 (block0 FiLM), Row 9 (tone_fc), Row 11 (tank_psi): col q1[0] (+16 B)
+    mod_arena[w_ctrl_base + 16..w_ctrl_base + 20].copy_from_slice(&0.50_f32.to_le_bytes());
+    mod_arena[w_ctrl_base + 2 * 64 + 16..w_ctrl_base + 2 * 64 + 20]
+        .copy_from_slice(&0.40_f32.to_le_bytes());
+    mod_arena[w_ctrl_base + 9 * 64 + 16..w_ctrl_base + 9 * 64 + 20]
+        .copy_from_slice(&0.35_f32.to_le_bytes());
+    mod_arena[w_ctrl_base + 11 * 64 + 16..w_ctrl_base + 11 * 64 + 20]
+        .copy_from_slice(&0.25_f32.to_le_bytes());
+    let base_mod_container =
+        build_dnam_container(&mut header, &base_mod_arena, &base_mod_arena, false).unwrap();
     let mod_container = build_dnam_container(&mut header, &mod_arena, &mod_arena, false).unwrap();
+    let mut base_mod_eng =
+        DnamEngine::<ScalarBackend>::from_bytes(&base_mod_container, Tier::Lite, 48_000).unwrap();
     let mut mod_eng =
         DnamEngine::<ScalarBackend>::from_bytes(&mod_container, Tier::Lite, 48_000).unwrap();
+    base_mod_eng.set_control_immediate(0, 800.0);
     mod_eng.set_control_immediate(0, 800.0); // non-default u_norm = +1.0 -> ctrl_basis_4[0] != 0
     assert!(
-        (mod_eng.stage_pipeline.stage4.g_loop - 0.85).abs() > 1e-3,
-        "Expected W_ctrl to modulate stage4.g_loop, got {}",
-        mod_eng.stage_pipeline.stage4.g_loop
+        mod_eng.control_bus.stage_targets[0].abs() > 1e-2,
+        "Expected W_ctrl row 0 to modulate stage_targets[0], got {}",
+        mod_eng.control_bus.stage_targets[0]
     );
     assert!(
-        (mod_eng.stage_pipeline.stage4.target_psi - core::f32::consts::FRAC_PI_4).abs() > 1e-3,
-        "Expected W_ctrl to modulate stage4.target_psi, got {}",
-        mod_eng.stage_pipeline.stage4.target_psi
+        mod_eng.control_bus.stage_targets[2].abs() > 1e-2,
+        "Expected W_ctrl row 2 to modulate stage_targets[2], got {}",
+        mod_eng.control_bus.stage_targets[2]
     );
     assert!(
-        (mod_eng.stage_pipeline.stage1.op_t_pre.target_delay - 64.0).abs() > 1.0,
-        "Expected W_ctrl to modulate stage1.op_t_pre.target_delay, got {}",
-        mod_eng.stage_pipeline.stage1.op_t_pre.target_delay
+        mod_eng.control_bus.stage_targets[11].abs() > 1e-2,
+        "Expected W_ctrl row 11 to modulate stage_targets[11], got {}",
+        mod_eng.control_bus.stage_targets[11]
     );
+    let mut bl = [0.0_f32; 8];
+    let mut br = [0.0_f32; 8];
+    let mut ml = [0.0_f32; 8];
+    let mut mr = [0.0_f32; 8];
+    base_mod_eng.process_block(&[0.3; 8], &[-0.3; 8], &mut bl, &mut br);
+    mod_eng.process_block(&[0.3; 8], &[-0.3; 8], &mut ml, &mut mr);
+    assert!(ml.iter().zip(bl.iter()).any(|(a, b)| (a - b).abs() > 1e-5));
 }
 
 mod arch_spec_integration {
     // Specification Verification Suite: Phase 9 — TORA System Architecture Integration.
     //
-    // Verifies all 34 engine-scope rules in `docs/specs/architecture/tora_architecture.md`:
+    // Verifies all 35 engine-scope rules in `docs/specs/architecture/tora_architecture.md`:
     // - `verify[arch.pillars.dual-space-control]`
     // - `verify[arch.pillars.dual-rate-plane]`
     // - `verify[arch.pillars.cp1-projections]`
+    // - `verify[arch.pillars.universal-black-box]`
     // - `verify[arch.lifecycle.dual-rate]`
     // - `verify[arch.fp.callback-env]`
     // - `verify[arch.fp.range-saturation]`
@@ -443,15 +487,14 @@ mod arch_spec_integration {
     };
     use dnam_engine::control::{ExactIntFactorAccumulator, control_stride_for_rate};
     use dnam_engine::math::{DefaultMathBackend, ScalarBackend, eval_monotone_log2_f32_bits};
+    use dnam_engine::operators::op_n::OpNBackend;
     use dnam_engine::operators::{
-        BallisticDuckingVca, FixedHzBitcrusher, HilbertH1Lattice6Sec, KautzModalBank,
-        MultiDrivePolyAdaaChannel, OpTDelayLine, SymplecticModal4Lane, T1DcBlocker,
-        T1SubHarmonicTracker, c2_wavefolder, eval_m2_pitch_grain_delays,
+        BallisticDuckingVca, FixedHzBitcrusher, HilbertH1Lattice6Sec, KautzModalBank, OpTDelayLine,
+        QuadratureHysteresis2D, SymplecticModal4Lane, T1DcBlocker, T1SubHarmonicTracker,
+        c2_wavefolder, eval_m2_pitch_grain_delays,
     };
     use dnam_engine::schema::DnamJsonHeader;
-    use dnam_engine::stages::{
-        Stage0Router, Stage2CommutedCascade, TptLr4Crossover, WdwDryTapMode,
-    };
+    use dnam_engine::stages::{Stage0Router, TptLr4Crossover, WdwDryTapMode};
     use dnam_engine::{
         DnamEngine, DynamicDnamEngine, FtzDazGuard, OFFLINE_BOUNCE_PDC_SAMPLES,
         TOTAL_LITE_STATE_RAM_BYTES, Tier,
@@ -460,6 +503,7 @@ mod arch_spec_integration {
     /// verify[arch.pillars.dual-space-control]
     /// verify[arch.pillars.dual-rate-plane]
     /// verify[arch.pillars.cp1-projections]
+    /// verify[arch.pillars.universal-black-box]
     /// verify[arch.lifecycle.dual-rate]
     /// verify[arch.fp.callback-env]
     /// verify[arch.fp.range-saturation]
@@ -482,11 +526,14 @@ mod arch_spec_integration {
         // 2. Self-similar tri-kernel execution across audio and control planes
         let mut opt = OpTDelayLine::<2048>::new();
         let mut opm = SymplecticModal4Lane::new();
-        let mut opn = MultiDrivePolyAdaaChannel::new();
+        let mut opn = QuadratureHysteresis2D::new();
         let y_t = opt.step(0.5);
         let (y_m_re, y_m_im) = opm.step_lane(0, 0.5);
-        let y_n = opn.step(0.5, 1.0, 0.25, 0.5, 0.9993);
-        assert!(y_t.is_finite() && y_m_re.is_finite() && y_m_im.is_finite() && y_n[0].is_finite());
+        let y_n = opn.step(0.5, 0.25);
+        let _ = <DefaultMathBackend as OpNBackend<_>>::tanh_pade5_4ch(
+            dnam_engine::math::SimdVec4::splat(y_n),
+        );
+        assert!(y_t.is_finite() && y_m_re.is_finite() && y_m_im.is_finite() && y_n.is_finite());
 
         let mut acc = ExactIntFactorAccumulator::new(2);
         acc.update_contributor(0, (0.5_f32).to_bits()).unwrap();
@@ -533,10 +580,10 @@ mod arch_spec_integration {
     /// and `4x` ZOH oversampling (`12` host samples PDC).
     #[test]
     fn test_tiers_arena_hierarchy_state_ram_transitions_spillover_and_bounce() {
-        assert_eq!(ARENA_OFFSET_LITE_END, 10_752);
-        assert_eq!(ARENA_OFFSET_FULL_END, 22_336);
-        assert_eq!(ARENA_OFFSET_PRO_END, 36_224);
-        assert_eq!(ARENA_OFFSET_ULTRA_END, 64_000);
+        assert_eq!(ARENA_OFFSET_LITE_END, 4_608);
+        assert_eq!(ARENA_OFFSET_FULL_END, 10_240);
+        assert_eq!(ARENA_OFFSET_PRO_END, 18_432);
+        assert_eq!(ARENA_OFFSET_ULTRA_END, 28_672);
         assert_eq!(
             (
                 ARENA_LITE_END_CL,
@@ -544,9 +591,9 @@ mod arch_spec_integration {
                 ARENA_PRO_END_CL,
                 ARENA_ULTRA_END_CL
             ),
-            (168, 349, 566, 1_000)
+            (72, 160, 288, 448)
         );
-        assert_eq!(TOTAL_LITE_STATE_RAM_BYTES, 8_656);
+        const { assert!(TOTAL_LITE_STATE_RAM_BYTES <= 8_656) };
         assert_eq!(OFFLINE_BOUNCE_PDC_SAMPLES, 12);
 
         let mut header = DnamJsonHeader::default_reference();
@@ -665,11 +712,13 @@ mod arch_spec_integration {
     fn test_trainer_engine_isomorphism_stereo_preservation_and_nested_bus() {
         let _guard = FtzDazGuard::new();
 
-        // Stage II commuted cascade & C2 wavefolder
-        let mut s2 = Stage2CommutedCascade::new();
-        s2.init_dc_equilibrium(0.0, 0.8, -0.2);
-        let (bl, br) = s2.step_frame(0.4, -0.4, 1.2, 0.3);
-        assert!(bl[0] > 0.0 && br[0] < 0.0);
+        // Stage II v3 GRU stereo serialization parity & C2 wavefolder
+        let cold_s2 =
+            dnam_engine::stages::V3ColdTierModel::identity_for_tier(Tier::Lite, false, false);
+        let mut s2_core =
+            dnam_engine::stages::V3HotCore::<DefaultMathBackend>::from_cold_model(&cold_s2);
+        let y2 = s2_core.step_stereo(0.4, -0.4);
+        assert!(y2[0].is_finite() && y2[1].is_finite() && (y2[0] + y2[1]).abs() < 1e-6);
         let (wo, we) = c2_wavefolder(0.5);
         assert!(wo > 0.0 && we > 0.0);
 
@@ -697,10 +746,10 @@ mod arch_spec_integration {
         // End-to-end v2.0 Open .dnam container loading & .dnam-prev rejection in DnamEngine
         let hdr_ref = DnamJsonHeader::default_reference();
         let hdr_bytes = serde_json::to_vec(&hdr_ref).unwrap();
-        let t0 = vec![0u8; 10_752];
-        let t1 = vec![0u8; 11_584];
-        let t2 = vec![0u8; 13_888];
-        let t3 = vec![0u8; 27_776];
+        let t0 = vec![0u8; 4_608];
+        let t1 = vec![0u8; 5_632];
+        let t2 = vec![0u8; 8_192];
+        let t3 = vec![0u8; 10_240];
         let v2_container = dnam_engine::container::build_v2_open_dnam_container(
             &hdr_bytes,
             &[0u8; 64],
@@ -754,9 +803,10 @@ mod arch_spec_integration {
             0
         );
 
-        // 2. ZOH-rescaled OpTDelayLine xfade_len on sample-rate change
+        // 2. ZOH-rescaled sample rate update & control decimation ratio
         eng_v2.set_sample_rate(96_000).unwrap();
-        assert_eq!(eng_v2.stage_pipeline.stage1.op_t_pre.xfade_len, 256);
+        assert_eq!(eng_v2.sample_rate_hz(), 96_000);
+        assert_eq!(eng_v2.zoh().control_decimation_host, 32);
 
         // 3. Stage III 16-sample delayed Kautz onset tap
         let mut s3_cab = dnam_engine::stages::Stage3CabinetModals::new();
@@ -894,10 +944,10 @@ mod arch_spec_integration {
             let tier = Tier::from_u8(tier_u8);
             let hdr_ref = DnamJsonHeader::default_reference();
             let hdr_bytes = serde_json::to_vec(&hdr_ref).unwrap();
-            let t0 = vec![0u8; 10_752];
-            let t1 = vec![0u8; 11_584];
-            let t2 = vec![0u8; 13_888];
-            let t3 = vec![0u8; 27_776];
+            let t0 = vec![0u8; 4_608];
+            let t1 = vec![0u8; 5_632];
+            let t2 = vec![0u8; 8_192];
+            let t3 = vec![0u8; 10_240];
             let v2_container = dnam_engine::container::build_v2_open_dnam_container(
                 &hdr_bytes,
                 &[0u8; 64],

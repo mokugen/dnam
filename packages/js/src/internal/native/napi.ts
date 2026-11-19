@@ -10,9 +10,8 @@ import { createRequire } from "node:module";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { DnamError, fromNativeError } from "../../errors.js";
-import type { ActiveBackend } from "../../types.js";
-import { coerceBackend } from "../coerce.js";
+import { DnamError } from "../../errors.js";
+import { backendToCode } from "../coerce.js";
 import type {
   CreateNativeEngineOptions,
   NativeControlSpaceHandle,
@@ -20,6 +19,39 @@ import type {
   NativeEngineHandle,
   NativeValidatedContainerInfo,
 } from "./driver.js";
+import type { NativeTestingBindings, RawNapiAddon } from "./napi/bindings.js";
+import {
+  napiBuildDnamContainer,
+  napiBuildReferenceContainer,
+  napiComputeZoh,
+  napiEvalSubdivisionPhase,
+  napiInvertTempoCalibration,
+  napiParseSchemaVersion,
+  napiValidateContainer,
+} from "./napi/container.js";
+import { callNapi, NapiControlSpaceHandle, NapiEngineHandle } from "./napi/handles.js";
+import {
+  napiCubicLagrangeWeights,
+  napiEvalChebyshevLfo,
+  napiEvalLobattoBasis,
+  napiEvalRank4Fm,
+  napiOpMModalSlice,
+  napiOpMModalStep,
+  napiOpTCoerciveStep,
+  napiPolyAdaaSlice,
+  napiPolyAdaaStep,
+} from "./napi/kernels.js";
+import {
+  napiBuildOemCertV2SigningMessage,
+  napiComputePreviewWindow,
+  napiDeriveWatermarkSeedHex,
+  napiSealContainer,
+  napiSignCreatorHeader,
+  napiSignOemDeviceCert,
+  napiUnsealContainer,
+  napiValidatePreviewSwitchOptions,
+  napiVerifyContainerProvenance,
+} from "./napi/provenance.js";
 import {
   configureWasmMemoryImport,
   instantiateWasmDriver,
@@ -28,770 +60,9 @@ import {
   type WasmMemoryOptions,
 } from "./wasm.js";
 
-interface RawNapiEngine {
-  reload(containerBytes: Uint8Array, tier?: number, sampleRateHz?: number): void;
-  readonly backend: string;
-  readonly tier: number;
-  setTier(tier: number): void;
-  readonly maxSupportedTier: number;
-  setMaxSupportedTier(tier: number): void;
-  readonly maxAvailableTier: number;
-  readonly effectiveTier: number;
-  readonly sampleRate: number;
-  setSampleRate(sampleRateHz: number): void;
-  readonly latencySamples: number;
-  readonly offlineBounce: boolean;
-  setOfflineBounce(enabled: boolean): void;
-  readonly maximizeTierOnBounce: boolean;
-  setMaximizeTierOnBounce(enabled: boolean): void;
-  readonly numControls: number;
-  rawControlValues(): Float32Array;
-  clampedControlValues(): Float32Array;
-  clampedControlValue(ctrlIdx: number): number;
-  setControlValue(ctrlIdx: number, value: number): void;
-  setControlImmediate(ctrlIdx: number, value: number): void;
-  setControlsImmediateBatch(indices: number[], values: number[]): void;
-  resetControlsToDefaults(): void;
-  reset(): void;
-  readonly supportsFreeze: boolean;
-  readonly isFrozen: boolean;
-  setFreeze(freeze: boolean): void;
-  setFreezeAmount(alpha: number): void;
-  bypassState(): boolean[];
-  setBypass(bypassed: boolean, trails: boolean): void;
-  readonly stereoWidth: number;
-  setStereoWidth(width: number): void;
-  configureHostMix(blendWet: number, outputGainDb: number, applyUnityLeveling: boolean): void;
-  readonly currentBpm: number;
-  syncTempo(bpm: number, subdivision?: string, foldOctave?: boolean): number;
-  registerTapTempo(subdivision?: string, foldOctave?: boolean): number[];
-  applyPreset(presetId: string): void;
-  processStereoInPlace(leftIo: Float32Array, rightIo: Float32Array): void;
-  processStereo(
-    leftIn: Float32Array,
-    rightIn: Float32Array,
-    leftOut: Float32Array,
-    rightOut: Float32Array,
-    blockSize?: number,
-  ): void;
-  processMonoToStereo(
-    monoIn: Float32Array,
-    leftOut: Float32Array,
-    rightOut: Float32Array,
-    blockSize?: number,
-  ): void;
-  processMono(monoIn: Float32Array, monoOut: Float32Array, blockSize?: number): void;
-  renderOfflineBounce(
-    leftIn: Float32Array,
-    rightIn: Float32Array,
-    leftOut: Float32Array,
-    rightOut: Float32Array,
-  ): void;
-  processStereoAsync(
-    leftIn: Float32Array,
-    rightIn: Float32Array,
-    blockSize?: number,
-  ): Promise<Float32Array[]>;
-  telemetryInto(out56: Float64Array): void;
-}
-
-interface RawNapiControlSpace {
-  readonly numControls: number;
-  clampInto(rawNumeric: Float32Array, clampedOut: Float32Array, normOut: Float32Array): number;
-  toPhysical(ctrlIdx: number, normalizedU: number): number;
-  toNormalized(ctrlIdx: number, physicalVal: number): number;
-}
-
-export interface NativeTestingBindings {
-  testingRenderReferenceStereo(
-    containerBytes: Uint8Array,
-    tier: number,
-    backend: string,
-    sampleRateHz: number,
-    leftIn: Float32Array,
-    rightIn: Float32Array,
-    blockSize?: number,
-    reset?: boolean,
-  ): Float32Array[];
-  testingRenderReferenceMonoToStereo(
-    containerBytes: Uint8Array,
-    tier: number,
-    backend: string,
-    sampleRateHz: number,
-    monoIn: Float32Array,
-    blockSize?: number,
-    reset?: boolean,
-  ): Float32Array[];
-  testingRenderReferenceMono(
-    containerBytes: Uint8Array,
-    tier: number,
-    backend: string,
-    sampleRateHz: number,
-    monoIn: Float32Array,
-    blockSize?: number,
-    reset?: boolean,
-  ): Float32Array;
-  testingBenchmarkNativeStereoNs(
-    containerBytes: Uint8Array,
-    tier: number,
-    backend: string,
-    sampleRateHz: number,
-    frames: number,
-    iterations: number,
-  ): number;
-  testingReferenceHeaderJson(kind?: string): string;
-  testingErrorVariantNames(): string[];
-  testingRaiseErrorVariant(name: string): void;
-}
-
-interface RawNapiAddon extends NativeTestingBindings {
-  NativeEngine: new (
-    containerBytes: Uint8Array,
-    tier: number,
-    sampleRateHz: number,
-    backend?: string,
-    maxSupportedTier?: number,
-    offlineBounce?: boolean,
-    maximizeTierOnBounce?: boolean,
-  ) => RawNapiEngine;
-  NativeControlSpace: new (headerJson: string) => RawNapiControlSpace;
-  validateContainerWithKeyNative(
-    containerBytes: Uint8Array,
-    deviceIdHash?: string,
-    deviceSecret32?: Uint8Array,
-    trustedMarketplacePubkeyHex?: string,
-  ): NativeValidatedContainerInfo;
-  buildReferenceContainerNative(
-    supportsFreeze?: boolean,
-    inputs?: number,
-    outputMode?: string,
-  ): Uint8Array;
-  buildDnamContainerNative(
-    headerJson: string,
-    arenaBytes: Uint8Array,
-    encryptedArenaBytes?: Uint8Array,
-    hasSignaturesFlag?: boolean,
-  ): Uint8Array;
-  updateHeaderInPlaceNative(containerBytes: Uint8Array, newHeaderJson: string): Uint8Array;
-  stripContainerToTierNative(containerBytes: Uint8Array, maxTier: number): Uint8Array;
-  parseSchemaVersionNative(versionStr: string): number[];
-  crc32CComputeNative(data: Uint8Array): number;
-  validateAndNormalizeHeaderNative(headerJson: string): string;
-  canonicalizeJcsNative(jsonStr: string, stripMutable?: boolean, rejectFloats?: boolean): string;
-  buildDmu1FrameNative(mutableJsonBytes: Uint8Array, capacity: number): Uint8Array;
-  parseDmu1FrameNative(frameBytes: Uint8Array): string;
-  validateV2OpenDnamLayoutNative(containerBytes: Uint8Array): string;
-  stripV2OpenDnamContainerNative(containerBytes: Uint8Array, targetTier: number): Uint8Array;
-  uploUPackedLenNative(nDim: number): number;
-  packUploUF64IntoNative(denseFlat: Float64Array, nDim: number, outPacked: Float64Array): void;
-  unpackUploUF64IntoNative(packedU: Float64Array, nTier: number, outDense: Float64Array): void;
-  computeZohNative(
-    sampleRateTrainHz: number,
-    sampleRateHostHz: number,
-    rAcTrain?: number,
-    rDcTrain?: number,
-    tauRefTrain?: number,
-    switchXfadeTrain?: number,
-  ): Float64Array;
-  controlStrideForRateNative(sampleRateHz: number): number;
-  controlTickRatioNative(sampleRateHz: number): number;
-  evalSubdivisionPhaseNative(
-    beatMod12: number,
-    withinBeatQ32: number,
-    subdivision: string,
-    offsetQ32?: number,
-  ): number[];
-  eval3NodeCalibrationNative(anchors: Float64Array, u: number): number;
-  invertTempoCalibrationNative(
-    declaredMin: number,
-    declaredMax: number,
-    safeMin: number,
-    safeMax: number,
-    anchors: Float64Array,
-    target: number,
-    flushSubnormals?: boolean,
-  ): Float64Array;
-  verifyContainerProvenanceNative(
-    headerJson: string,
-    plaintextArena: Uint8Array,
-    hasSignaturesFlag?: boolean,
-    deviceIdHash?: string,
-    deviceSecret32?: Uint8Array,
-    trustedMarketplacePubkeyHex?: string,
-  ): string;
-  enforceDistributionPolicyNative(headerJson: string, activeProfile: string): void;
-  evaluateAnticlonePolicyNative(
-    fingerprintMatched: boolean,
-    buyerWatermarkIdentified: boolean,
-    independentDeviceSourceEvidence: boolean,
-  ): string;
-  immutableHeaderSha256Native(headerJson: string): string;
-  sha256HexNative(data: Uint8Array): string;
-  hmacSha256HexNative(key32: Uint8Array, message: Uint8Array): string;
-  ed25519PubkeyHexNative(seed32: Uint8Array): string;
-  ed25519SignHexNative(seed32: Uint8Array, message: Uint8Array): string;
-  x25519PubkeyHexNative(secret32: Uint8Array): string;
-  buildCreatorSigningMessageNative(
-    immutableHeaderSha256Hex: string,
-    masterArenaSha256Hex: string,
-  ): Uint8Array;
-  buildMarketplaceSigningMessageNative(
-    immutableHeaderSha256Hex: string,
-    masterArenaSha256Hex: string,
-    receiptJson: string,
-  ): Uint8Array;
-  signCreatorHeaderNative(
-    headerJson: string,
-    masterArena: Uint8Array,
-    creatorSeed32: Uint8Array,
-    signerId: string,
-    includeTierPrefixes?: boolean,
-  ): string;
-  signMarketplaceReceiptNative(
-    headerJson: string,
-    buyerArena: Uint8Array,
-    marketplaceSeed32: Uint8Array,
-    specJson: string,
-  ): string;
-  signOemDeviceCertNative(
-    oemSeed32: Uint8Array,
-    oemVendor: string,
-    modelCode: string,
-    deviceIdHash: string,
-    pubkeyX2551932: Uint8Array,
-  ): string;
-  verifyOemDeviceCertNative(certJson: string, trustedOemPubkeyHex: string): string;
-  buildOemCertV2SigningMessageNative(
-    oemVendor: string,
-    modelCode: string,
-    deviceIdHash16: Uint8Array,
-    pubkeyX2551932: Uint8Array,
-    issuerPubkeyEd2551932: Uint8Array,
-    assurance?: number,
-    attestationPolicySha25632?: Uint8Array,
-    attestationEvidenceSha25632?: Uint8Array,
-  ): Uint8Array;
-  chacha20XorArenaNative(
-    arenaBytes: Uint8Array,
-    key32: Uint8Array,
-    nonce12: Uint8Array,
-    startBlockCounter?: number,
-  ): Uint8Array;
-  wrapDeviceCekHexNative(
-    ephemeralSecret32: Uint8Array,
-    devicePubkey32: Uint8Array,
-    deviceIdHash: string,
-    cek32: Uint8Array,
-  ): string;
-  sealContainerNative(
-    innerDnamBytes: Uint8Array,
-    recipientCertsJson: string,
-    trustedOemPubkeysJson: string,
-    marketplaceSeed32: Uint8Array,
-    ephemeralSecret32: Uint8Array,
-    cek32: Uint8Array,
-    nonce12: Uint8Array,
-  ): Uint8Array;
-  unsealContainerNative(
-    sealedBytes: Uint8Array,
-    deviceIdHash?: string,
-    deviceSecret32?: Uint8Array,
-    trustedMarketplacePubkeyHex?: string,
-  ): Uint8Array;
-  encodeDau1EnvelopeNative(specJson: string): Uint8Array;
-  decodeDau1EnvelopeNative(wireBytes: Uint8Array): string;
-  buildDme1HeaderNative(
-    profile: number,
-    recipientCount: number,
-    ciphertextLength: number,
-  ): Uint8Array;
-  parseDme1PlaintextNative(plaintext: Uint8Array, recipientKeyDigestsHex: string[]): string;
-  encodeRecipientKeyIdsNative(keyDigestsHex: string[]): Uint8Array;
-  parseRecipientKeyIdsNative(data: Uint8Array, maxRecipients?: number): string[];
-  encodeHpkeSlotsNative(slotsJson: string): Uint8Array;
-  parseHpkeSlotsNative(data: Uint8Array, expectedCount: number, maxRecipients?: number): string;
-  encodeRecordDirectoryNative(maximumTier: number, recordsJson: string): Uint8Array;
-  parseRecordDirectoryNative(data: Uint8Array, maximumTier: number): string;
-  computePreviewWindowNative(
-    anchor: number,
-    delta: number,
-    safeMin: number,
-    safeMax: number,
-  ): Float64Array;
-  validatePreviewSwitchOptionsNative(
-    preset: string,
-    alternative: string,
-    observed: string[],
-    active: string[],
-    safe: string[],
-  ): string[];
-  validateRoyaltySplitsNative(licenseTier: string, royaltySplitsJson: string): void;
-  applyIsometricGaugeWatermarkNative(
-    arenaBytes: Uint8Array,
-    kappa: Float32Array,
-    qBuyerFlat16: Float32Array,
-  ): Uint8Array;
-  generateTardosCodeNative(
-    marketplaceSecret32: Uint8Array,
-    modelId: string,
-    licenseId: string,
-  ): Float32Array;
-  applyTardosWatermarkNative(
-    arenaBytes: Uint8Array,
-    code: Float32Array,
-    epsilon: number,
-  ): Uint8Array;
-  scoreTardosWatermarkNative(
-    masterArena: Uint8Array,
-    suspectArena: Uint8Array,
-    code: Float32Array,
-  ): number;
-  extractStructuralHashNative(arenaBytes: Uint8Array): Float64Array;
-  structuralCosineSimilarityNative(a: Float64Array, b: Float64Array): number;
-  deriveWatermarkSeedHexNative(
-    key32: Uint8Array,
-    marketplacePubkey32: Uint8Array,
-    watermarkKeyId16: Uint8Array,
-    creatorSignedManifestSha25632: Uint8Array,
-    modelId16: Uint8Array,
-    watermarkProfileSha25632: Uint8Array,
-    owningTier: number,
-    licenseId16?: Uint8Array,
-    buyerId16?: Uint8Array,
-  ): string;
-  extractStage3FingerprintNative(
-    earlyFir128b: Uint8Array,
-    kautzModalBytes: Uint8Array,
-    addedModes: number,
-  ): Float64Array;
-  catmullRomHermiteNative(sM1: number, s0: number, s1: number, s2: number, mu: number): number;
-  catmullRomHermiteSliceNative(
-    sM1: Float64Array,
-    s0: Float64Array,
-    s1: Float64Array,
-    s2: Float64Array,
-    mu: Float64Array,
-    out: Float64Array,
-  ): void;
-  opTCoerciveStepNative(
-    uIn: number,
-    gLin: number,
-    sigmaKnee: number,
-    vCeil: number,
-    rDc: number,
-    dcXPrev: number,
-    dcYPrev: number,
-  ): Float64Array;
-  opTTankSliceNative(
-    inp: Float64Array,
-    out: Float64Array,
-    gLin: number,
-    sigmaKnee: number,
-    vCeil: number,
-    rDc: number,
-  ): void;
-  opMModalStepNative(
-    x: number,
-    rLow: number,
-    drSpan: number,
-    wSel: number,
-    bGammaNorm: number,
-    cReal: number,
-    cImag: number,
-    uRotCos: number,
-    uRotSin: number,
-    zRe: number,
-    zIm: number,
-  ): Float64Array;
-  opMModalSliceNative(
-    inp: Float64Array,
-    out: Float64Array,
-    rLow: number,
-    drSpan: number,
-    wSel: number,
-    bGammaNorm: number,
-    cReal: number,
-    cImag: number,
-    uRotCos: number,
-    uRotSin: number,
-    zRe: number,
-    zIm: number,
-    reset: boolean,
-  ): Float64Array;
-  unitRotorNative(phi: number): Float64Array;
-  unitRotorSliceNative(phi: Float64Array, out: Float64Array): void;
-  polyAdaaAlgebraicNative(uPrev: number, uCurr: number, beta: number, delta: number): number;
-  polyAdaaStepNative(
-    x: number,
-    bConv: number,
-    alpha: number,
-    beta: number,
-    delta: number,
-    rAc: number,
-    uPrev: number,
-    aPrev: number,
-    mDc: number,
-  ): Float64Array;
-  polyAdaaSliceNative(
-    inp: Float64Array,
-    out: Float64Array,
-    bConv: number,
-    alpha: number,
-    beta: number,
-    delta: number,
-    rAc: number,
-    uPrev: number,
-    aPrev: number,
-    mDc: number,
-    reset: boolean,
-  ): Float64Array;
-  evalLobattoBasisNative(u: number, anchors: Float64Array, degree: number): Float64Array;
-  evalLobattoBasisSliceNative(
-    u: Float64Array,
-    out: Float64Array,
-    anchors: Float64Array,
-    degree: number,
-  ): void;
-  evalRank4FmNative(features: Float64Array, vFactorsFlat: Float64Array): Float64Array;
-  evalRank4FmSliceNative(
-    featuresFlat: Float64Array,
-    nFrames: number,
-    dDim: number,
-    vFactorsFlat: Float64Array,
-    out: Float64Array,
-  ): void;
-  evalChebyshevLfoNative(cosPhi: number): Float64Array;
-  evalChebyshevLfoSliceNative(cosPhi: Float64Array, out: Float64Array): void;
-  evalTrustRegionSoftclipNative(z: number, mh: number): number;
-  evalTrustRegionSoftclipSliceNative(z: Float64Array, out: Float64Array, mh: number): void;
-  cubicLagrangeWeightsNative(mu: number): Float64Array;
-  cubicLagrangeWeightsSliceNative(mu: Float64Array, out: Float64Array): void;
-  givensHouseholder8ChNative(x: Float64Array, cosPsi: number, sinPsi: number): Float64Array;
-  givensHouseholder8ChSliceNative(
-    xFlat: Float64Array,
-    out: Float64Array,
-    cosPsi: number,
-    sinPsi: number,
-  ): void;
-  givensHouseholder16ChNative(
-    x: Float64Array,
-    cosPsi: number,
-    sinPsi: number,
-    crossCos: Float64Array,
-    crossSin: Float64Array,
-  ): Float64Array;
-  givensHouseholder16ChSliceNative(
-    xFlat: Float64Array,
-    out: Float64Array,
-    cosPsi: number,
-    sinPsi: number,
-    crossCos: Float64Array,
-    crossSin: Float64Array,
-  ): void;
-}
-
-function callNapi<T>(fn: () => T): T {
-  try {
-    return fn();
-  } catch (err) {
-    throw fromNativeError(err);
-  }
-}
-
-class NapiEngineHandle implements NativeEngineHandle {
-  readonly #raw: RawNapiEngine;
-  #disposed = false;
-  #busy = false;
-
-  constructor(raw: RawNapiEngine) {
-    this.#raw = raw;
-  }
-
-  #ensureAlive(): RawNapiEngine {
-    if (this.#disposed) {
-      throw new DnamError("ERR_DNAM_DISPOSED", "Engine has been disposed");
-    }
-    return this.#raw;
-  }
-
-  #ensureAudioIdle(): RawNapiEngine {
-    if (this.#disposed) {
-      throw new DnamError("ERR_DNAM_DISPOSED", "Engine has been disposed");
-    }
-    if (this.#busy) {
-      throw new DnamError(
-        "ERR_DNAM_BUSY",
-        "Engine is busy executing an in-flight processAsync task",
-      );
-    }
-    return this.#raw;
-  }
-
-  reload(containerBytes: Uint8Array, tier?: number, sampleRateHz?: number): void {
-    callNapi(() => this.#ensureAlive().reload(containerBytes, tier, sampleRateHz));
-  }
-
-  backend(): ActiveBackend {
-    return coerceBackend(callNapi(() => this.#ensureAlive().backend)) as ActiveBackend;
-  }
-
-  tier(): number {
-    return callNapi(() => this.#ensureAlive().tier);
-  }
-
-  setTier(tier: number): void {
-    callNapi(() => this.#ensureAlive().setTier(tier));
-  }
-
-  maxSupportedTier(): number {
-    return callNapi(() => this.#ensureAlive().maxSupportedTier);
-  }
-
-  setMaxSupportedTier(tier: number): void {
-    callNapi(() => this.#ensureAlive().setMaxSupportedTier(tier));
-  }
-
-  maxAvailableTier(): number {
-    return callNapi(() => this.#ensureAlive().maxAvailableTier);
-  }
-
-  effectiveTier(): number {
-    return callNapi(() => this.#ensureAlive().effectiveTier);
-  }
-
-  sampleRate(): number {
-    return callNapi(() => this.#ensureAlive().sampleRate);
-  }
-
-  setSampleRate(sampleRateHz: number): void {
-    callNapi(() => this.#ensureAudioIdle().setSampleRate(sampleRateHz));
-  }
-
-  latencySamples(): number {
-    return callNapi(() => this.#ensureAlive().latencySamples);
-  }
-
-  offlineBounce(): boolean {
-    return callNapi(() => this.#ensureAlive().offlineBounce);
-  }
-
-  setOfflineBounce(enabled: boolean): void {
-    callNapi(() => this.#ensureAlive().setOfflineBounce(enabled));
-  }
-
-  maximizeTierOnBounce(): boolean {
-    return callNapi(() => this.#ensureAlive().maximizeTierOnBounce);
-  }
-
-  setMaximizeTierOnBounce(enabled: boolean): void {
-    callNapi(() => this.#ensureAlive().setMaximizeTierOnBounce(enabled));
-  }
-
-  numControls(): number {
-    return callNapi(() => this.#ensureAlive().numControls);
-  }
-
-  rawControlValues(): Float32Array {
-    return callNapi(() => this.#ensureAlive().rawControlValues());
-  }
-
-  clampedControlValue(ctrlIdx: number): number {
-    return callNapi(() => this.#ensureAlive().clampedControlValue(ctrlIdx));
-  }
-
-  setControlValue(ctrlIdx: number, value: number): void {
-    callNapi(() => this.#ensureAlive().setControlValue(ctrlIdx, value));
-  }
-
-  setControlImmediate(ctrlIdx: number, value: number): void {
-    callNapi(() => this.#ensureAlive().setControlImmediate(ctrlIdx, value));
-  }
-
-  setControlsImmediateBatch(indices: readonly number[], values: readonly number[]): void {
-    callNapi(() => this.#ensureAlive().setControlsImmediateBatch([...indices], [...values]));
-  }
-
-  resetControlsToDefaults(): void {
-    callNapi(() => this.#ensureAlive().resetControlsToDefaults());
-  }
-
-  reset(): void {
-    callNapi(() => this.#ensureAlive().reset());
-  }
-
-  supportsFreeze(): boolean {
-    return callNapi(() => this.#ensureAlive().supportsFreeze);
-  }
-
-  isFrozen(): boolean {
-    return callNapi(() => this.#ensureAlive().isFrozen);
-  }
-
-  setFreeze(freeze: boolean): void {
-    callNapi(() => this.#ensureAlive().setFreeze(freeze));
-  }
-
-  setFreezeAmount(alpha: number): void {
-    callNapi(() => this.#ensureAlive().setFreezeAmount(alpha));
-  }
-
-  bypassState(): readonly [boolean, boolean] {
-    const res = callNapi(() => this.#ensureAlive().bypassState());
-    return [Boolean(res[0]), Boolean(res[1])];
-  }
-
-  setBypass(bypassed: boolean, trails: boolean): void {
-    callNapi(() => this.#ensureAlive().setBypass(bypassed, trails));
-  }
-
-  stereoWidth(): number {
-    return callNapi(() => this.#ensureAlive().stereoWidth);
-  }
-
-  setStereoWidth(width: number): void {
-    callNapi(() => this.#ensureAlive().setStereoWidth(width));
-  }
-
-  configureHostMix(blendWet: number, outputGainDb: number, applyUnityLeveling: boolean): void {
-    callNapi(() =>
-      this.#ensureAlive().configureHostMix(blendWet, outputGainDb, applyUnityLeveling),
-    );
-  }
-
-  currentBpm(): number {
-    return callNapi(() => this.#ensureAlive().currentBpm);
-  }
-
-  syncTempo(bpm: number, subdivision: string | undefined, foldOctave: boolean): number {
-    return callNapi(() => this.#ensureAlive().syncTempo(bpm, subdivision, foldOctave));
-  }
-
-  registerTapTempo(
-    subdivision: string | undefined,
-    foldOctave: boolean,
-  ): readonly [number, number] {
-    const res = callNapi(() => this.#ensureAlive().registerTapTempo(subdivision, foldOctave));
-    return [Number(res[0]), Number(res[1])];
-  }
-
-  applyPreset(presetId: string): void {
-    callNapi(() => this.#ensureAlive().applyPreset(presetId));
-  }
-
-  processStereoInPlace(leftIo: Float32Array, rightIo: Float32Array): void {
-    callNapi(() => this.#ensureAudioIdle().processStereoInPlace(leftIo, rightIo));
-  }
-
-  processStereo(
-    leftIn: Float32Array,
-    rightIn: Float32Array,
-    leftOut: Float32Array,
-    rightOut: Float32Array,
-    blockSize?: number,
-  ): void {
-    callNapi(() =>
-      this.#ensureAudioIdle().processStereo(leftIn, rightIn, leftOut, rightOut, blockSize),
-    );
-  }
-
-  processMonoToStereo(
-    monoIn: Float32Array,
-    leftOut: Float32Array,
-    rightOut: Float32Array,
-    blockSize?: number,
-  ): void {
-    callNapi(() =>
-      this.#ensureAudioIdle().processMonoToStereo(monoIn, leftOut, rightOut, blockSize),
-    );
-  }
-
-  processMono(monoIn: Float32Array, monoOut: Float32Array, blockSize?: number): void {
-    callNapi(() => this.#ensureAudioIdle().processMono(monoIn, monoOut, blockSize));
-  }
-
-  renderOfflineBounce(
-    leftIn: Float32Array,
-    rightIn: Float32Array,
-    leftOut: Float32Array,
-    rightOut: Float32Array,
-  ): void {
-    callNapi(() => this.#ensureAudioIdle().renderOfflineBounce(leftIn, rightIn, leftOut, rightOut));
-  }
-
-  processStereoAsync(
-    leftIn: Float32Array,
-    rightIn: Float32Array,
-    blockSize?: number,
-  ): Promise<readonly [Float32Array, Float32Array]> {
-    const raw = this.#ensureAudioIdle();
-    this.#busy = true;
-    let task: Promise<Float32Array[]>;
-    try {
-      task = raw.processStereoAsync(leftIn, rightIn, blockSize);
-    } catch (err) {
-      this.#busy = false;
-      throw fromNativeError(err);
-    }
-    return task.then(
-      (out) => {
-        this.#busy = false;
-        const l = out[0];
-        const r = out[1];
-        if (!l || !r) {
-          throw new DnamError("ERR_DNAM_VALIDATION", "Invalid output from processStereoAsync");
-        }
-        return [l, r] as const;
-      },
-      (err: unknown) => {
-        this.#busy = false;
-        throw fromNativeError(err);
-      },
-    );
-  }
-
-  telemetryInto(out56: Float64Array): void {
-    callNapi(() => this.#ensureAlive().telemetryInto(out56));
-  }
-
-  dispose(): void {
-    this.#disposed = true;
-  }
-}
-
-class NapiControlSpaceHandle implements NativeControlSpaceHandle {
-  readonly #raw: RawNapiControlSpace;
-  #disposed = false;
-
-  constructor(raw: RawNapiControlSpace) {
-    this.#raw = raw;
-  }
-
-  clampInto(rawNumeric: Float32Array, clampedOut: Float32Array, normOut: Float32Array): number {
-    if (this.#disposed) {
-      throw new DnamError("ERR_DNAM_DISPOSED", "ControlSpace has been disposed");
-    }
-    return callNapi(() => this.#raw.clampInto(rawNumeric, clampedOut, normOut));
-  }
-
-  toPhysical(ctrlIdx: number, normalizedU: number): number {
-    if (this.#disposed) {
-      throw new DnamError("ERR_DNAM_DISPOSED", "ControlSpace has been disposed");
-    }
-    return callNapi(() => this.#raw.toPhysical(ctrlIdx, normalizedU));
-  }
-
-  toNormalized(ctrlIdx: number, physicalVal: number): number {
-    if (this.#disposed) {
-      throw new DnamError("ERR_DNAM_DISPOSED", "ControlSpace has been disposed");
-    }
-    return callNapi(() => this.#raw.toNormalized(ctrlIdx, physicalVal));
-  }
-
-  dispose(): void {
-    this.#disposed = true;
-  }
-}
-
+/**
+ * Node.js 26 `N-API v10` native driver delegating FFI and reference DSP calls to `dnam.*.node`.
+ */
 export class NapiDriver implements NativeDriver {
   readonly kind = "napi" as const;
   readonly #addon: RawNapiAddon;
@@ -801,6 +72,8 @@ export class NapiDriver implements NativeDriver {
   }
 
   createEngine(options: CreateNativeEngineOptions): NativeEngineHandle {
+    // Preserve exact coercion validation before invoking the native addon constructor.
+    backendToCode(options.backend);
     const raw = callNapi(
       () =>
         new this.#addon.NativeEngine(
@@ -822,394 +95,205 @@ export class NapiDriver implements NativeDriver {
   }
 
   validateContainer(
-    containerBytes: Uint8Array,
-    deviceIdHash?: string,
-    deviceSecret32?: Uint8Array,
-    trustedMarketplacePubkeyHex?: string,
+    ...args: Parameters<NativeDriver["validateContainer"]>
   ): NativeValidatedContainerInfo {
-    return callNapi(() =>
-      this.#addon.validateContainerWithKeyNative(
-        containerBytes,
-        deviceIdHash,
-        deviceSecret32,
-        trustedMarketplacePubkeyHex,
-      ),
-    );
+    return napiValidateContainer(this.#addon, ...args);
   }
 
-  buildReferenceContainer(supportsFreeze: boolean, inputs: number, outputMode: string): Uint8Array {
-    return callNapi(() =>
-      this.#addon.buildReferenceContainerNative(supportsFreeze, inputs, outputMode),
-    );
-  }
-
-  buildDnamContainer(
-    headerJson: string,
-    arenaBytes: Uint8Array,
-    encryptedArenaBytes?: Uint8Array,
-    hasSignaturesFlag?: boolean,
+  buildReferenceContainer(
+    ...args: Parameters<NativeDriver["buildReferenceContainer"]>
   ): Uint8Array {
-    return callNapi(() =>
-      this.#addon.buildDnamContainerNative(
-        headerJson,
-        arenaBytes,
-        encryptedArenaBytes,
-        hasSignaturesFlag,
-      ),
-    );
+    return napiBuildReferenceContainer(this.#addon, ...args);
   }
 
-  updateHeaderInPlace(containerBytes: Uint8Array, newHeaderJson: string): Uint8Array {
-    return callNapi(() => this.#addon.updateHeaderInPlaceNative(containerBytes, newHeaderJson));
+  buildDnamContainer(...args: Parameters<NativeDriver["buildDnamContainer"]>): Uint8Array {
+    return napiBuildDnamContainer(this.#addon, ...args);
   }
 
-  stripContainerToTier(containerBytes: Uint8Array, maxTier: number): Uint8Array {
-    return callNapi(() => this.#addon.stripContainerToTierNative(containerBytes, maxTier));
+  updateHeaderInPlace(...args: Parameters<NativeDriver["updateHeaderInPlace"]>): Uint8Array {
+    return callNapi(() => this.#addon.updateHeaderInPlaceNative(...args));
   }
 
-  parseSchemaVersion(versionStr: string): readonly [number, number, number, boolean] {
-    const res = callNapi(() => this.#addon.parseSchemaVersionNative(versionStr));
-    return [Number(res[0]), Number(res[1]), Number(res[2]), Number(res[3]) !== 0];
+  stripContainerToTier(...args: Parameters<NativeDriver["stripContainerToTier"]>): Uint8Array {
+    return callNapi(() => this.#addon.stripContainerToTierNative(...args));
   }
 
-  crc32c(data: Uint8Array): number {
-    return callNapi(() => this.#addon.crc32CComputeNative(data)) >>> 0;
+  parseSchemaVersion(
+    ...args: Parameters<NativeDriver["parseSchemaVersion"]>
+  ): readonly [number, number, number, boolean] {
+    return napiParseSchemaVersion(this.#addon, ...args);
   }
 
-  validateAndNormalizeHeader(headerJson: string): string {
-    return callNapi(() => this.#addon.validateAndNormalizeHeaderNative(headerJson));
+  crc32c(...args: Parameters<NativeDriver["crc32c"]>): number {
+    return callNapi(() => this.#addon.crc32CComputeNative(...args)) >>> 0;
+  }
+
+  validateAndNormalizeHeader(
+    ...args: Parameters<NativeDriver["validateAndNormalizeHeader"]>
+  ): string {
+    return callNapi(() => this.#addon.validateAndNormalizeHeaderNative(...args));
   }
 
   canonicalizeJcs(jsonStr: string, stripMutable = false, rejectFloats = false): string {
     return callNapi(() => this.#addon.canonicalizeJcsNative(jsonStr, stripMutable, rejectFloats));
   }
 
-  buildDmu1Frame(mutableJsonBytes: Uint8Array, capacity: number): Uint8Array {
-    return callNapi(() => this.#addon.buildDmu1FrameNative(mutableJsonBytes, capacity));
+  buildDmu1Frame(...args: Parameters<NativeDriver["buildDmu1Frame"]>): Uint8Array {
+    return callNapi(() => this.#addon.buildDmu1FrameNative(...args));
   }
 
-  parseDmu1Frame(frameBytes: Uint8Array): string {
-    return callNapi(() => this.#addon.parseDmu1FrameNative(frameBytes));
+  parseDmu1Frame(...args: Parameters<NativeDriver["parseDmu1Frame"]>): string {
+    return callNapi(() => this.#addon.parseDmu1FrameNative(...args));
   }
 
-  validateV2OpenDnamLayout(containerBytes: Uint8Array): string {
-    return callNapi(() => this.#addon.validateV2OpenDnamLayoutNative(containerBytes));
+  validateV2OpenDnamLayout(...args: Parameters<NativeDriver["validateV2OpenDnamLayout"]>): string {
+    return callNapi(() => this.#addon.validateV2OpenDnamLayoutNative(...args));
   }
 
-  stripV2OpenDnamContainer(containerBytes: Uint8Array, targetTier: number): Uint8Array {
-    return callNapi(() => this.#addon.stripV2OpenDnamContainerNative(containerBytes, targetTier));
+  stripV2OpenDnamContainer(
+    ...args: Parameters<NativeDriver["stripV2OpenDnamContainer"]>
+  ): Uint8Array {
+    return callNapi(() => this.#addon.stripV2OpenDnamContainerNative(...args));
   }
 
-  uploUPackedLen(nDim: number): number {
-    return callNapi(() => this.#addon.uploUPackedLenNative(nDim));
+  uploUPackedLen(...args: Parameters<NativeDriver["uploUPackedLen"]>): number {
+    return callNapi(() => this.#addon.uploUPackedLenNative(...args));
   }
 
-  packUploUF64Into(denseFlat: Float64Array, nDim: number, outPacked: Float64Array): void {
-    callNapi(() => this.#addon.packUploUF64IntoNative(denseFlat, nDim, outPacked));
+  packUploUF64Into(...args: Parameters<NativeDriver["packUploUF64Into"]>): void {
+    callNapi(() => this.#addon.packUploUF64IntoNative(...args));
   }
 
-  unpackUploUF64Into(packedU: Float64Array, nTier: number, outDense: Float64Array): void {
-    callNapi(() => this.#addon.unpackUploUF64IntoNative(packedU, nTier, outDense));
+  unpackUploUF64Into(...args: Parameters<NativeDriver["unpackUploUF64Into"]>): void {
+    callNapi(() => this.#addon.unpackUploUF64IntoNative(...args));
   }
 
-  computeZoh(
-    sampleRateTrainHz: number,
-    sampleRateHostHz: number,
-    rAcTrain: number,
-    rDcTrain: number,
-    tauRefTrain: number,
-    switchXfadeTrain: number,
-  ): Float64Array {
-    return callNapi(() =>
-      this.#addon.computeZohNative(
-        sampleRateTrainHz,
-        sampleRateHostHz,
-        rAcTrain,
-        rDcTrain,
-        tauRefTrain,
-        switchXfadeTrain,
-      ),
-    );
+  computeZoh(...args: Parameters<NativeDriver["computeZoh"]>): Float64Array {
+    return napiComputeZoh(this.#addon, ...args);
   }
 
-  controlStrideForRate(sampleRateHz: number): number {
-    return callNapi(() => this.#addon.controlStrideForRateNative(sampleRateHz));
+  controlStrideForRate(...args: Parameters<NativeDriver["controlStrideForRate"]>): number {
+    return callNapi(() => this.#addon.controlStrideForRateNative(...args));
   }
 
-  controlTickRatio(sampleRateHz: number): number {
-    return callNapi(() => this.#addon.controlTickRatioNative(sampleRateHz));
+  controlTickRatio(...args: Parameters<NativeDriver["controlTickRatio"]>): number {
+    return callNapi(() => this.#addon.controlTickRatioNative(...args));
   }
 
   evalSubdivisionPhase(
-    beatMod12: number,
-    withinBeatQ32: number,
-    subdivision: string,
-    offsetQ32: number,
+    ...args: Parameters<NativeDriver["evalSubdivisionPhase"]>
   ): readonly [number, number, number] {
-    const res = callNapi(() =>
-      this.#addon.evalSubdivisionPhaseNative(beatMod12, withinBeatQ32, subdivision, offsetQ32),
-    );
-    return [Number(res[0]), Number(res[1]), Number(res[2])];
+    return napiEvalSubdivisionPhase(this.#addon, ...args);
   }
 
-  eval3NodeCalibration(anchors3: Float64Array, u: number): number {
-    return callNapi(() => this.#addon.eval3NodeCalibrationNative(anchors3, u));
+  eval3NodeCalibration(...args: Parameters<NativeDriver["eval3NodeCalibration"]>): number {
+    return callNapi(() => this.#addon.eval3NodeCalibrationNative(...args));
   }
 
   invertTempoCalibration(
-    declaredMin: number,
-    declaredMax: number,
-    safeMin: number,
-    safeMax: number,
-    anchors3: Float64Array,
-    target: number,
-    flushSubnormals: boolean,
+    ...args: Parameters<NativeDriver["invertTempoCalibration"]>
   ): Float64Array {
-    return callNapi(() =>
-      this.#addon.invertTempoCalibrationNative(
-        declaredMin,
-        declaredMax,
-        safeMin,
-        safeMax,
-        anchors3,
-        target,
-        flushSubnormals,
-      ),
-    );
+    return napiInvertTempoCalibration(this.#addon, ...args);
   }
 
   verifyContainerProvenance(
-    headerJson: string,
-    plaintextArena: Uint8Array,
-    hasSignaturesFlag: boolean,
-    deviceIdHash?: string,
-    deviceSecret32?: Uint8Array,
-    trustedMarketplacePubkeyHex?: string,
+    ...args: Parameters<NativeDriver["verifyContainerProvenance"]>
   ): string {
-    return callNapi(() =>
-      this.#addon.verifyContainerProvenanceNative(
-        headerJson,
-        plaintextArena,
-        hasSignaturesFlag,
-        deviceIdHash,
-        deviceSecret32,
-        trustedMarketplacePubkeyHex,
-      ),
-    );
+    return napiVerifyContainerProvenance(this.#addon, ...args);
   }
 
-  enforceDistributionPolicy(headerJson: string, activeProfile: string): void {
-    callNapi(() => this.#addon.enforceDistributionPolicyNative(headerJson, activeProfile));
+  enforceDistributionPolicy(...args: Parameters<NativeDriver["enforceDistributionPolicy"]>): void {
+    callNapi(() => this.#addon.enforceDistributionPolicyNative(...args));
   }
 
-  evaluateAnticlonePolicy(
-    fingerprintMatched: boolean,
-    buyerWatermarkIdentified: boolean,
-    independentDeviceSourceEvidence: boolean,
-  ): string {
-    return callNapi(() =>
-      this.#addon.evaluateAnticlonePolicyNative(
-        fingerprintMatched,
-        buyerWatermarkIdentified,
-        independentDeviceSourceEvidence,
-      ),
-    );
+  evaluateAnticlonePolicy(...args: Parameters<NativeDriver["evaluateAnticlonePolicy"]>): string {
+    return callNapi(() => this.#addon.evaluateAnticlonePolicyNative(...args));
   }
 
-  immutableHeaderSha256(headerJson: string): string {
-    return callNapi(() => this.#addon.immutableHeaderSha256Native(headerJson));
+  immutableHeaderSha256(...args: Parameters<NativeDriver["immutableHeaderSha256"]>): string {
+    return callNapi(() => this.#addon.immutableHeaderSha256Native(...args));
   }
 
-  sha256Hex(data: Uint8Array): string {
-    return callNapi(() => this.#addon.sha256HexNative(data));
+  sha256Hex(...args: Parameters<NativeDriver["sha256Hex"]>): string {
+    return callNapi(() => this.#addon.sha256HexNative(...args));
   }
 
-  hmacSha256Hex(key32: Uint8Array, message: Uint8Array): string {
-    return callNapi(() => this.#addon.hmacSha256HexNative(key32, message));
+  hmacSha256Hex(...args: Parameters<NativeDriver["hmacSha256Hex"]>): string {
+    return callNapi(() => this.#addon.hmacSha256HexNative(...args));
   }
 
-  ed25519PubkeyHex(seed32: Uint8Array): string {
-    return callNapi(() => this.#addon.ed25519PubkeyHexNative(seed32));
+  ed25519PubkeyHex(...args: Parameters<NativeDriver["ed25519PubkeyHex"]>): string {
+    return callNapi(() => this.#addon.ed25519PubkeyHexNative(...args));
   }
 
-  ed25519SignHex(seed32: Uint8Array, message: Uint8Array): string {
-    return callNapi(() => this.#addon.ed25519SignHexNative(seed32, message));
+  ed25519SignHex(...args: Parameters<NativeDriver["ed25519SignHex"]>): string {
+    return callNapi(() => this.#addon.ed25519SignHexNative(...args));
   }
 
-  x25519PubkeyHex(secret32: Uint8Array): string {
-    return callNapi(() => this.#addon.x25519PubkeyHexNative(secret32));
+  x25519PubkeyHex(...args: Parameters<NativeDriver["x25519PubkeyHex"]>): string {
+    return callNapi(() => this.#addon.x25519PubkeyHexNative(...args));
   }
 
   buildCreatorSigningMessage(
-    immutableHeaderSha256Hex: string,
-    masterArenaSha256Hex: string,
+    ...args: Parameters<NativeDriver["buildCreatorSigningMessage"]>
   ): Uint8Array {
-    return callNapi(() =>
-      this.#addon.buildCreatorSigningMessageNative(immutableHeaderSha256Hex, masterArenaSha256Hex),
-    );
+    return callNapi(() => this.#addon.buildCreatorSigningMessageNative(...args));
   }
 
   buildMarketplaceSigningMessage(
-    immutableHeaderSha256Hex: string,
-    masterArenaSha256Hex: string,
-    receiptJson: string,
+    ...args: Parameters<NativeDriver["buildMarketplaceSigningMessage"]>
   ): Uint8Array {
-    return callNapi(() =>
-      this.#addon.buildMarketplaceSigningMessageNative(
-        immutableHeaderSha256Hex,
-        masterArenaSha256Hex,
-        receiptJson,
-      ),
-    );
+    return callNapi(() => this.#addon.buildMarketplaceSigningMessageNative(...args));
   }
 
-  signCreatorHeader(
-    headerJson: string,
-    masterArena: Uint8Array,
-    creatorSeed32: Uint8Array,
-    signerId: string,
-    includeTierPrefixes: boolean,
-  ): string {
-    return callNapi(() =>
-      this.#addon.signCreatorHeaderNative(
-        headerJson,
-        masterArena,
-        creatorSeed32,
-        signerId,
-        includeTierPrefixes,
-      ),
-    );
+  signCreatorHeader(...args: Parameters<NativeDriver["signCreatorHeader"]>): string {
+    return napiSignCreatorHeader(this.#addon, ...args);
   }
 
-  signMarketplaceReceipt(
-    headerJson: string,
-    buyerArena: Uint8Array,
-    marketplaceSeed32: Uint8Array,
-    specJson: string,
-  ): string {
-    return callNapi(() =>
-      this.#addon.signMarketplaceReceiptNative(headerJson, buyerArena, marketplaceSeed32, specJson),
-    );
+  signMarketplaceReceipt(...args: Parameters<NativeDriver["signMarketplaceReceipt"]>): string {
+    return callNapi(() => this.#addon.signMarketplaceReceiptNative(...args));
   }
 
-  signOemDeviceCert(
-    oemSeed32: Uint8Array,
-    oemVendor: string,
-    modelCode: string,
-    deviceIdHash: string,
-    pubkeyX2551932: Uint8Array,
-  ): string {
-    return callNapi(() =>
-      this.#addon.signOemDeviceCertNative(
-        oemSeed32,
-        oemVendor,
-        modelCode,
-        deviceIdHash,
-        pubkeyX2551932,
-      ),
-    );
+  signOemDeviceCert(...args: Parameters<NativeDriver["signOemDeviceCert"]>): string {
+    return napiSignOemDeviceCert(this.#addon, ...args);
   }
 
-  verifyOemDeviceCert(certJson: string, trustedOemPubkeyHex: string): string {
-    return callNapi(() => this.#addon.verifyOemDeviceCertNative(certJson, trustedOemPubkeyHex));
+  verifyOemDeviceCert(...args: Parameters<NativeDriver["verifyOemDeviceCert"]>): string {
+    return callNapi(() => this.#addon.verifyOemDeviceCertNative(...args));
   }
 
   buildOemCertV2SigningMessage(
-    oemVendor: string,
-    modelCode: string,
-    deviceIdHash16: Uint8Array,
-    pubkeyX2551932: Uint8Array,
-    issuerPubkeyEd2551932: Uint8Array,
-    assurance: number,
-    attestationPolicySha25632?: Uint8Array,
-    attestationEvidenceSha25632?: Uint8Array,
+    ...args: Parameters<NativeDriver["buildOemCertV2SigningMessage"]>
   ): Uint8Array {
-    return callNapi(() =>
-      this.#addon.buildOemCertV2SigningMessageNative(
-        oemVendor,
-        modelCode,
-        deviceIdHash16,
-        pubkeyX2551932,
-        issuerPubkeyEd2551932,
-        assurance,
-        attestationPolicySha25632,
-        attestationEvidenceSha25632,
-      ),
-    );
+    return napiBuildOemCertV2SigningMessage(this.#addon, ...args);
   }
 
-  chacha20XorArena(
-    arenaBytes: Uint8Array,
-    key32: Uint8Array,
-    nonce12: Uint8Array,
-    startBlockCounter: number,
-  ): Uint8Array {
-    return callNapi(() =>
-      this.#addon.chacha20XorArenaNative(arenaBytes, key32, nonce12, startBlockCounter),
-    );
+  chacha20XorArena(...args: Parameters<NativeDriver["chacha20XorArena"]>): Uint8Array {
+    return callNapi(() => this.#addon.chacha20XorArenaNative(...args));
   }
 
-  wrapDeviceCekHex(
-    ephemeralSecret32: Uint8Array,
-    devicePubkey32: Uint8Array,
-    deviceIdHash: string,
-    cek32: Uint8Array,
-  ): string {
-    return callNapi(() =>
-      this.#addon.wrapDeviceCekHexNative(ephemeralSecret32, devicePubkey32, deviceIdHash, cek32),
-    );
+  wrapDeviceCekHex(...args: Parameters<NativeDriver["wrapDeviceCekHex"]>): string {
+    return callNapi(() => this.#addon.wrapDeviceCekHexNative(...args));
   }
 
-  sealContainer(
-    innerDnamBytes: Uint8Array,
-    recipientCertsJson: string,
-    trustedOemPubkeysJson: string,
-    marketplaceSeed32: Uint8Array,
-    ephemeralSecret32: Uint8Array,
-    cek32: Uint8Array,
-    nonce12: Uint8Array,
-  ): Uint8Array {
-    return callNapi(() =>
-      this.#addon.sealContainerNative(
-        innerDnamBytes,
-        recipientCertsJson,
-        trustedOemPubkeysJson,
-        marketplaceSeed32,
-        ephemeralSecret32,
-        cek32,
-        nonce12,
-      ),
-    );
+  sealContainer(...args: Parameters<NativeDriver["sealContainer"]>): Uint8Array {
+    return napiSealContainer(this.#addon, ...args);
   }
 
-  unsealContainer(
-    sealedBytes: Uint8Array,
-    deviceIdHash?: string,
-    deviceSecret32?: Uint8Array,
-    trustedMarketplacePubkeyHex?: string,
-  ): Uint8Array {
-    return callNapi(() =>
-      this.#addon.unsealContainerNative(
-        sealedBytes,
-        deviceIdHash,
-        deviceSecret32,
-        trustedMarketplacePubkeyHex,
-      ),
-    );
+  unsealContainer(...args: Parameters<NativeDriver["unsealContainer"]>): Uint8Array {
+    return napiUnsealContainer(this.#addon, ...args);
   }
 
-  encodeDau1Envelope(specJson: string): Uint8Array {
-    return callNapi(() => this.#addon.encodeDau1EnvelopeNative(specJson));
+  encodeDau1Envelope(...args: Parameters<NativeDriver["encodeDau1Envelope"]>): Uint8Array {
+    return callNapi(() => this.#addon.encodeDau1EnvelopeNative(...args));
   }
 
-  decodeDau1Envelope(wireBytes: Uint8Array): string {
-    return callNapi(() => this.#addon.decodeDau1EnvelopeNative(wireBytes));
+  decodeDau1Envelope(...args: Parameters<NativeDriver["decodeDau1Envelope"]>): string {
+    return callNapi(() => this.#addon.decodeDau1EnvelopeNative(...args));
   }
 
-  buildDme1Header(profile: number, recipientCount: number, ciphertextLength: number): Uint8Array {
-    return callNapi(() =>
-      this.#addon.buildDme1HeaderNative(profile, recipientCount, ciphertextLength),
-    );
+  buildDme1Header(...args: Parameters<NativeDriver["buildDme1Header"]>): Uint8Array {
+    return callNapi(() => this.#addon.buildDme1HeaderNative(...args));
   }
 
   parseDme1Plaintext(plaintext: Uint8Array, recipientKeyDigestsHex: readonly string[]): string {
@@ -1222,418 +306,201 @@ export class NapiDriver implements NativeDriver {
     return callNapi(() => this.#addon.encodeRecipientKeyIdsNative([...keyDigestsHex]));
   }
 
-  parseRecipientKeyIds(data: Uint8Array, maxRecipients: number): readonly string[] {
-    return callNapi(() => this.#addon.parseRecipientKeyIdsNative(data, maxRecipients));
+  parseRecipientKeyIds(
+    ...args: Parameters<NativeDriver["parseRecipientKeyIds"]>
+  ): readonly string[] {
+    return callNapi(() => this.#addon.parseRecipientKeyIdsNative(...args));
   }
 
-  encodeHpkeSlots(slotsJson: string): Uint8Array {
-    return callNapi(() => this.#addon.encodeHpkeSlotsNative(slotsJson));
+  encodeHpkeSlots(...args: Parameters<NativeDriver["encodeHpkeSlots"]>): Uint8Array {
+    return callNapi(() => this.#addon.encodeHpkeSlotsNative(...args));
   }
 
-  parseHpkeSlots(data: Uint8Array, expectedCount: number, maxRecipients: number): string {
-    return callNapi(() => this.#addon.parseHpkeSlotsNative(data, expectedCount, maxRecipients));
+  parseHpkeSlots(...args: Parameters<NativeDriver["parseHpkeSlots"]>): string {
+    return callNapi(() => this.#addon.parseHpkeSlotsNative(...args));
   }
 
-  encodeRecordDirectory(maximumTier: number, recordsJson: string): Uint8Array {
-    return callNapi(() => this.#addon.encodeRecordDirectoryNative(maximumTier, recordsJson));
+  encodeRecordDirectory(...args: Parameters<NativeDriver["encodeRecordDirectory"]>): Uint8Array {
+    return callNapi(() => this.#addon.encodeRecordDirectoryNative(...args));
   }
 
-  parseRecordDirectory(data: Uint8Array, maximumTier: number): string {
-    return callNapi(() => this.#addon.parseRecordDirectoryNative(data, maximumTier));
+  parseRecordDirectory(...args: Parameters<NativeDriver["parseRecordDirectory"]>): string {
+    return callNapi(() => this.#addon.parseRecordDirectoryNative(...args));
   }
 
   computePreviewWindow(
-    anchor: number,
-    delta: number,
-    safeMin: number,
-    safeMax: number,
+    ...args: Parameters<NativeDriver["computePreviewWindow"]>
   ): readonly [number, number] {
-    const res = callNapi(() =>
-      this.#addon.computePreviewWindowNative(anchor, delta, safeMin, safeMax),
-    );
-    return [Number(res[0]), Number(res[1])];
+    return napiComputePreviewWindow(this.#addon, ...args);
   }
 
   validatePreviewSwitchOptions(
-    preset: string,
-    alternative: string,
-    observed: readonly string[],
-    active: readonly string[],
-    safe: readonly string[],
+    ...args: Parameters<NativeDriver["validatePreviewSwitchOptions"]>
   ): readonly [string, string] {
-    const res = callNapi(() =>
-      this.#addon.validatePreviewSwitchOptionsNative(
-        preset,
-        alternative,
-        [...observed],
-        [...active],
-        [...safe],
-      ),
-    );
-    return [String(res[0]), String(res[1])];
+    return napiValidatePreviewSwitchOptions(this.#addon, ...args);
   }
 
-  validateRoyaltySplits(licenseTier: string, royaltySplitsJson: string): void {
-    callNapi(() => this.#addon.validateRoyaltySplitsNative(licenseTier, royaltySplitsJson));
+  validateRoyaltySplits(...args: Parameters<NativeDriver["validateRoyaltySplits"]>): void {
+    callNapi(() => this.#addon.validateRoyaltySplitsNative(...args));
   }
 
   applyIsometricGaugeWatermark(
-    arenaBytes: Uint8Array,
-    kappa64: Float32Array,
-    qBuyerFlat16: Float32Array,
+    ...args: Parameters<NativeDriver["applyIsometricGaugeWatermark"]>
   ): Uint8Array {
-    return callNapi(() =>
-      this.#addon.applyIsometricGaugeWatermarkNative(arenaBytes, kappa64, qBuyerFlat16),
-    );
+    return callNapi(() => this.#addon.applyIsometricGaugeWatermarkNative(...args));
   }
 
-  generateTardosCode(
-    marketplaceSecret32: Uint8Array,
-    modelId: string,
-    licenseId: string,
-  ): Float32Array {
-    return callNapi(() =>
-      this.#addon.generateTardosCodeNative(marketplaceSecret32, modelId, licenseId),
-    );
+  generateTardosCode(...args: Parameters<NativeDriver["generateTardosCode"]>): Float32Array {
+    return callNapi(() => this.#addon.generateTardosCodeNative(...args));
   }
 
-  applyTardosWatermark(
-    arenaBytes: Uint8Array,
-    code7680: Float32Array,
-    epsilon: number,
-  ): Uint8Array {
-    return callNapi(() => this.#addon.applyTardosWatermarkNative(arenaBytes, code7680, epsilon));
+  applyTardosWatermark(...args: Parameters<NativeDriver["applyTardosWatermark"]>): Uint8Array {
+    return callNapi(() => this.#addon.applyTardosWatermarkNative(...args));
   }
 
-  scoreTardosWatermark(
-    masterArena: Uint8Array,
-    suspectArena: Uint8Array,
-    code7680: Float32Array,
+  scoreTardosWatermark(...args: Parameters<NativeDriver["scoreTardosWatermark"]>): number {
+    return callNapi(() => this.#addon.scoreTardosWatermarkNative(...args));
+  }
+
+  extractStructuralHash(...args: Parameters<NativeDriver["extractStructuralHash"]>): Float64Array {
+    return callNapi(() => this.#addon.extractStructuralHashNative(...args));
+  }
+
+  structuralCosineSimilarity(
+    ...args: Parameters<NativeDriver["structuralCosineSimilarity"]>
   ): number {
-    return callNapi(() =>
-      this.#addon.scoreTardosWatermarkNative(masterArena, suspectArena, code7680),
-    );
+    return callNapi(() => this.#addon.structuralCosineSimilarityNative(...args));
   }
 
-  extractStructuralHash(arenaBytes: Uint8Array): Float64Array {
-    return callNapi(() => this.#addon.extractStructuralHashNative(arenaBytes));
-  }
-
-  structuralCosineSimilarity(a: Float64Array, b: Float64Array): number {
-    return callNapi(() => this.#addon.structuralCosineSimilarityNative(a, b));
-  }
-
-  deriveWatermarkSeedHex(
-    key32: Uint8Array,
-    marketplacePubkey32: Uint8Array,
-    watermarkKeyId16: Uint8Array,
-    creatorSignedManifestSha25632: Uint8Array,
-    modelId16: Uint8Array,
-    watermarkProfileSha25632: Uint8Array,
-    owningTier: number,
-    licenseId16?: Uint8Array,
-    buyerId16?: Uint8Array,
-  ): string {
-    return callNapi(() =>
-      this.#addon.deriveWatermarkSeedHexNative(
-        key32,
-        marketplacePubkey32,
-        watermarkKeyId16,
-        creatorSignedManifestSha25632,
-        modelId16,
-        watermarkProfileSha25632,
-        owningTier,
-        licenseId16,
-        buyerId16,
-      ),
-    );
+  deriveWatermarkSeedHex(...args: Parameters<NativeDriver["deriveWatermarkSeedHex"]>): string {
+    return napiDeriveWatermarkSeedHex(this.#addon, ...args);
   }
 
   extractStage3Fingerprint(
-    earlyFir128b: Uint8Array,
-    kautzModalBytes: Uint8Array,
-    addedModes: number,
+    ...args: Parameters<NativeDriver["extractStage3Fingerprint"]>
   ): Float64Array {
-    return callNapi(() =>
-      this.#addon.extractStage3FingerprintNative(earlyFir128b, kautzModalBytes, addedModes),
-    );
+    return callNapi(() => this.#addon.extractStage3FingerprintNative(...args));
   }
 
-  catmullRomHermite(sM1: number, s0: number, s1: number, s2: number, mu: number): number {
-    return callNapi(() => this.#addon.catmullRomHermiteNative(sM1, s0, s1, s2, mu));
+  catmullRomHermite(...args: Parameters<NativeDriver["catmullRomHermite"]>): number {
+    return callNapi(() => this.#addon.catmullRomHermiteNative(...args));
   }
 
-  catmullRomHermiteSlice(
-    sM1: Float64Array,
-    s0: Float64Array,
-    s1: Float64Array,
-    s2: Float64Array,
-    mu: Float64Array,
-    out: Float64Array,
-  ): void {
-    callNapi(() => this.#addon.catmullRomHermiteSliceNative(sM1, s0, s1, s2, mu, out));
+  catmullRomHermiteSlice(...args: Parameters<NativeDriver["catmullRomHermiteSlice"]>): void {
+    callNapi(() => this.#addon.catmullRomHermiteSliceNative(...args));
   }
 
   opTCoerciveStep(
-    uIn: number,
-    gLin: number,
-    sigmaKnee: number,
-    vCeil: number,
-    rDc: number,
-    dcXPrev: number,
-    dcYPrev: number,
+    ...args: Parameters<NativeDriver["opTCoerciveStep"]>
   ): readonly [number, number, number] {
-    const res = callNapi(() =>
-      this.#addon.opTCoerciveStepNative(uIn, gLin, sigmaKnee, vCeil, rDc, dcXPrev, dcYPrev),
-    );
-    return [Number(res[0]), Number(res[1]), Number(res[2])];
+    return napiOpTCoerciveStep(this.#addon, ...args);
   }
 
-  opTTankSlice(
-    inp: Float64Array,
-    out: Float64Array,
-    gLin: number,
-    sigmaKnee: number,
-    vCeil: number,
-    rDc: number,
-  ): void {
-    callNapi(() => this.#addon.opTTankSliceNative(inp, out, gLin, sigmaKnee, vCeil, rDc));
+  opTTankSlice(...args: Parameters<NativeDriver["opTTankSlice"]>): void {
+    callNapi(() => this.#addon.opTTankSliceNative(...args));
   }
 
   opMModalStep(
-    x: number,
-    rLow: number,
-    drSpan: number,
-    wSel: number,
-    bGammaNorm: number,
-    cReal: number,
-    cImag: number,
-    uRotCos: number,
-    uRotSin: number,
-    zRe: number,
-    zIm: number,
+    ...args: Parameters<NativeDriver["opMModalStep"]>
   ): readonly [number, number, number] {
-    const res = callNapi(() =>
-      this.#addon.opMModalStepNative(
-        x,
-        rLow,
-        drSpan,
-        wSel,
-        bGammaNorm,
-        cReal,
-        cImag,
-        uRotCos,
-        uRotSin,
-        zRe,
-        zIm,
-      ),
-    );
-    return [Number(res[0]), Number(res[1]), Number(res[2])];
+    return napiOpMModalStep(this.#addon, ...args);
   }
 
-  opMModalSlice(
-    inp: Float64Array,
-    out: Float64Array,
-    rLow: number,
-    drSpan: number,
-    wSel: number,
-    bGammaNorm: number,
-    cReal: number,
-    cImag: number,
-    uRotCos: number,
-    uRotSin: number,
-    zRe: number,
-    zIm: number,
-    reset: boolean,
-  ): readonly [number, number] {
-    const res = callNapi(() =>
-      this.#addon.opMModalSliceNative(
-        inp,
-        out,
-        rLow,
-        drSpan,
-        wSel,
-        bGammaNorm,
-        cReal,
-        cImag,
-        uRotCos,
-        uRotSin,
-        zRe,
-        zIm,
-        reset,
-      ),
-    );
+  opMModalSlice(...args: Parameters<NativeDriver["opMModalSlice"]>): readonly [number, number] {
+    return napiOpMModalSlice(this.#addon, ...args);
+  }
+
+  unitRotor(...args: Parameters<NativeDriver["unitRotor"]>): readonly [number, number] {
+    const res = callNapi(() => this.#addon.unitRotorNative(...args));
     return [Number(res[0]), Number(res[1])];
   }
 
-  unitRotor(phi: number): readonly [number, number] {
-    const res = callNapi(() => this.#addon.unitRotorNative(phi));
-    return [Number(res[0]), Number(res[1])];
+  unitRotorSlice(...args: Parameters<NativeDriver["unitRotorSlice"]>): void {
+    callNapi(() => this.#addon.unitRotorSliceNative(...args));
   }
 
-  unitRotorSlice(phi: Float64Array, out: Float64Array): void {
-    callNapi(() => this.#addon.unitRotorSliceNative(phi, out));
-  }
-
-  polyAdaaAlgebraic(uPrev: number, uCurr: number, beta: number, delta: number): number {
-    return callNapi(() => this.#addon.polyAdaaAlgebraicNative(uPrev, uCurr, beta, delta));
+  polyAdaaAlgebraic(...args: Parameters<NativeDriver["polyAdaaAlgebraic"]>): number {
+    return callNapi(() => this.#addon.polyAdaaAlgebraicNative(...args));
   }
 
   polyAdaaStep(
-    x: number,
-    bConv: number,
-    alpha: number,
-    beta: number,
-    delta: number,
-    rAc: number,
-    uPrev: number,
-    aPrev: number,
-    mDc: number,
+    ...args: Parameters<NativeDriver["polyAdaaStep"]>
   ): readonly [number, number, number, number] {
-    const res = callNapi(() =>
-      this.#addon.polyAdaaStepNative(x, bConv, alpha, beta, delta, rAc, uPrev, aPrev, mDc),
-    );
-    return [Number(res[0]), Number(res[1]), Number(res[2]), Number(res[3])];
+    return napiPolyAdaaStep(this.#addon, ...args);
   }
 
   polyAdaaSlice(
-    inp: Float64Array,
-    out: Float64Array,
-    bConv: number,
-    alpha: number,
-    beta: number,
-    delta: number,
-    rAc: number,
-    uPrev: number,
-    aPrev: number,
-    mDc: number,
-    reset: boolean,
+    ...args: Parameters<NativeDriver["polyAdaaSlice"]>
   ): readonly [number, number, number] {
-    const res = callNapi(() =>
-      this.#addon.polyAdaaSliceNative(
-        inp,
-        out,
-        bConv,
-        alpha,
-        beta,
-        delta,
-        rAc,
-        uPrev,
-        aPrev,
-        mDc,
-        reset,
-      ),
-    );
-    return [Number(res[0]), Number(res[1]), Number(res[2])];
+    return napiPolyAdaaSlice(this.#addon, ...args);
   }
 
   evalLobattoBasis(
-    u: number,
-    anchors3: Float64Array,
-    degree: number,
+    ...args: Parameters<NativeDriver["evalLobattoBasis"]>
   ): readonly [number, number, number] {
-    const res = callNapi(() => this.#addon.evalLobattoBasisNative(u, anchors3, degree));
-    return [Number(res[0]), Number(res[1]), Number(res[2])];
+    return napiEvalLobattoBasis(this.#addon, ...args);
   }
 
-  evalLobattoBasisSlice(
-    u: Float64Array,
-    out: Float64Array,
-    anchors3: Float64Array,
-    degree: number,
-  ): void {
-    callNapi(() => this.#addon.evalLobattoBasisSliceNative(u, out, anchors3, degree));
+  evalLobattoBasisSlice(...args: Parameters<NativeDriver["evalLobattoBasisSlice"]>): void {
+    callNapi(() => this.#addon.evalLobattoBasisSliceNative(...args));
   }
 
   evalRank4Fm(
-    features: Float64Array,
-    vFactorsFlat: Float64Array,
+    ...args: Parameters<NativeDriver["evalRank4Fm"]>
   ): readonly [number, number, number, number] {
-    const res = callNapi(() => this.#addon.evalRank4FmNative(features, vFactorsFlat));
-    return [Number(res[0]), Number(res[1]), Number(res[2]), Number(res[3])];
+    return napiEvalRank4Fm(this.#addon, ...args);
   }
 
-  evalRank4FmSlice(
-    featuresFlat: Float64Array,
-    nFrames: number,
-    dDim: number,
-    vFactorsFlat: Float64Array,
-    out: Float64Array,
+  evalRank4FmSlice(...args: Parameters<NativeDriver["evalRank4FmSlice"]>): void {
+    callNapi(() => this.#addon.evalRank4FmSliceNative(...args));
+  }
+
+  evalChebyshevLfo(
+    ...args: Parameters<NativeDriver["evalChebyshevLfo"]>
+  ): readonly [number, number, number, number] {
+    return napiEvalChebyshevLfo(this.#addon, ...args);
+  }
+
+  evalChebyshevLfoSlice(...args: Parameters<NativeDriver["evalChebyshevLfoSlice"]>): void {
+    callNapi(() => this.#addon.evalChebyshevLfoSliceNative(...args));
+  }
+
+  evalTrustRegionSoftclip(...args: Parameters<NativeDriver["evalTrustRegionSoftclip"]>): number {
+    return callNapi(() => this.#addon.evalTrustRegionSoftclipNative(...args));
+  }
+
+  evalTrustRegionSoftclipSlice(
+    ...args: Parameters<NativeDriver["evalTrustRegionSoftclipSlice"]>
   ): void {
-    callNapi(() =>
-      this.#addon.evalRank4FmSliceNative(featuresFlat, nFrames, dDim, vFactorsFlat, out),
-    );
+    callNapi(() => this.#addon.evalTrustRegionSoftclipSliceNative(...args));
   }
 
-  evalChebyshevLfo(cosPhi: number): readonly [number, number, number, number] {
-    const res = callNapi(() => this.#addon.evalChebyshevLfoNative(cosPhi));
-    return [Number(res[0]), Number(res[1]), Number(res[2]), Number(res[3])];
+  cubicLagrangeWeights(
+    ...args: Parameters<NativeDriver["cubicLagrangeWeights"]>
+  ): readonly [number, number, number, number] {
+    return napiCubicLagrangeWeights(this.#addon, ...args);
   }
 
-  evalChebyshevLfoSlice(cosPhi: Float64Array, out: Float64Array): void {
-    callNapi(() => this.#addon.evalChebyshevLfoSliceNative(cosPhi, out));
+  cubicLagrangeWeightsSlice(...args: Parameters<NativeDriver["cubicLagrangeWeightsSlice"]>): void {
+    callNapi(() => this.#addon.cubicLagrangeWeightsSliceNative(...args));
   }
 
-  evalTrustRegionSoftclip(z: number, mh: number): number {
-    return callNapi(() => this.#addon.evalTrustRegionSoftclipNative(z, mh));
+  givensHouseholder8ch(...args: Parameters<NativeDriver["givensHouseholder8ch"]>): Float64Array {
+    return callNapi(() => this.#addon.givensHouseholder8ChNative(...args));
   }
 
-  evalTrustRegionSoftclipSlice(z: Float64Array, out: Float64Array, mh: number): void {
-    callNapi(() => this.#addon.evalTrustRegionSoftclipSliceNative(z, out, mh));
+  givensHouseholder8chSlice(...args: Parameters<NativeDriver["givensHouseholder8chSlice"]>): void {
+    callNapi(() => this.#addon.givensHouseholder8ChSliceNative(...args));
   }
 
-  cubicLagrangeWeights(mu: number): readonly [number, number, number, number] {
-    const res = callNapi(() => this.#addon.cubicLagrangeWeightsNative(mu));
-    return [Number(res[0]), Number(res[1]), Number(res[2]), Number(res[3])];
-  }
-
-  cubicLagrangeWeightsSlice(mu: Float64Array, out: Float64Array): void {
-    callNapi(() => this.#addon.cubicLagrangeWeightsSliceNative(mu, out));
-  }
-
-  givensHouseholder8ch(x8: Float64Array, cosPsi: number, sinPsi: number): Float64Array {
-    return callNapi(() => this.#addon.givensHouseholder8ChNative(x8, cosPsi, sinPsi));
-  }
-
-  givensHouseholder8chSlice(
-    xFlat: Float64Array,
-    out: Float64Array,
-    cosPsi: number,
-    sinPsi: number,
-  ): void {
-    callNapi(() => this.#addon.givensHouseholder8ChSliceNative(xFlat, out, cosPsi, sinPsi));
-  }
-
-  givensHouseholder16ch(
-    x16: Float64Array,
-    cosPsi: number,
-    sinPsi: number,
-    crossCos8: Float64Array,
-    crossSin8: Float64Array,
-  ): Float64Array {
-    return callNapi(() =>
-      this.#addon.givensHouseholder16ChNative(x16, cosPsi, sinPsi, crossCos8, crossSin8),
-    );
+  givensHouseholder16ch(...args: Parameters<NativeDriver["givensHouseholder16ch"]>): Float64Array {
+    return callNapi(() => this.#addon.givensHouseholder16ChNative(...args));
   }
 
   givensHouseholder16chSlice(
-    xFlat: Float64Array,
-    out: Float64Array,
-    cosPsi: number,
-    sinPsi: number,
-    crossCos8: Float64Array,
-    crossSin8: Float64Array,
+    ...args: Parameters<NativeDriver["givensHouseholder16chSlice"]>
   ): void {
-    callNapi(() =>
-      this.#addon.givensHouseholder16ChSliceNative(
-        xFlat,
-        out,
-        cosPsi,
-        sinPsi,
-        crossCos8,
-        crossSin8,
-      ),
-    );
+    callNapi(() => this.#addon.givensHouseholder16ChSliceNative(...args));
   }
 }
 

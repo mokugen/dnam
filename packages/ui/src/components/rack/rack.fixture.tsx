@@ -1,5 +1,6 @@
 import { useFixtureInput } from "react-cosmos/client";
-import { DnamPluginRack, TriPhysicsTelemetry } from "./index.js";
+import { DnamPluginRack } from "./DnamPluginRack.js";
+import { TriPhysicsTelemetry } from "./TriPhysicsTelemetry.js";
 
 function TelemetryPlayground() {
   const [dspLoadPercent] = useFixtureInput("SIMD DSP Load (%)", 8.4);

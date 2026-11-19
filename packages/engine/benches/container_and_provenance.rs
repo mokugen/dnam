@@ -130,10 +130,9 @@ fn make_bench_container() -> AlignedBuffer<CacheLine64> {
         tensor_directory: BTreeMap::new(),
     };
 
-    let mut arena = vec![0u8; 64_000];
-    for (i, byte) in arena[128..62_000].iter_mut().enumerate() {
-        *byte = ((i * 7 + 3) & 0x3F) as u8;
-    }
+    let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+    let model = dnam_engine::stages::V3MatryoshkaModel::dual_rate_default(false);
+    dnam_engine::stages::weights::pack_v3_matryoshka_to_arena(&model, &mut arena);
     let raw = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
     let mut aligned = AlignedBuffer::<CacheLine64>::new_zeroed(raw.len() / 64);
     aligned.as_bytes_mut().copy_from_slice(&raw);

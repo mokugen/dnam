@@ -14,6 +14,7 @@ requirements:
 adrs:
   - ADR-0005
   - ADR-0019
+  - ADR-0021
 ---
 
 # Op-M: Universal Symplectic Modal, Hilbert, Sub-Harmonic & Kautz Operator
@@ -157,7 +158,7 @@ Effective rate (Hz) | First midpoint m | Last midpoint m | Maximum comparisons
 1. **Exponent-Split Pre-Scaling:** For $m = \max(|I|, |Q|) > 0$, scale $(I, Q)$ by $2^{-\min(E, 126)}$ (where $E$ is the unbiased exponent of $m$, pre-multiplying subnormals by $2^{24}$ under gradual underflow) so the scaled squared norm $r^2$ lies in $[1, 32)$.
 2. **Two-Step Newton `rsqrt` (`0 FSQRT`, `0 FDIV`):** Seed $\rho_0$ from `0x5F3759DF` and iterate $\rho_{j+1} = \rho_j(1.5 - (0.5 r^2 \rho_j)\rho_j)$ twice. Form $u_{\mathrm{re}} = \mathrm{clamp}(I_{\mathrm{sc}}\rho_2, -1, 1)$, $u_{\mathrm{im}} = \mathrm{clamp}(Q_{\mathrm{sc}}\rho_2, -1, 1)$, and envelope $\hat{A} = r^2 \rho_2 \cdot 2^{\min(E, 126)}$.
 3. **Exact Zero Handling:** When $I = Q = 0$, emit zero sub-octave features, invalidate the previous phasor, and hold the toggle/sheet signs without inventing a crossing on resumption.
-4. `r[dsp.op-m.tracker.stereo-batching]` **Interleaved Stereo `H1` Lattice & Batched `T1` `rsqrt_nr2_pair_f32` Execution ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** `HilbertH1Lattice6Sec::step_stereo` packs the 4 real all-pass branches `[I_L, Q_L, I_R, Q_R]` into a single 4-lane `B::Vec4` register across all 6 cascaded sections (`1×` SIMD FMA chain per stereo frame instead of `4×` scalar loops), and `T1SubHarmonicTracker::step_analytic_stereo` batches Left and Right channel `rsqrt` evaluations into paired 2-lane SIMD calls `B::rsqrt_nr2_pair_f32([r2_l, r2_r])` and `B::rsqrt_nr2_pair_f32([h_l, h_r])`.
+4. `r[dsp.op-m.tracker.stereo-batching]` **Interleaved Stereo `H1` Lattice & Batched `T1` `rsqrt_pos_pair_nr2` Execution ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [`ADR-0021`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md)):** `HilbertH1Lattice6Sec::step_stereo` packs the 4 real all-pass branches `[I_L, Q_L, I_R, Q_R]` into a single 4-lane `B::Vec4` register across all 6 cascaded sections (`1×` SIMD FMA chain per stereo frame instead of `4×` scalar loops), while `T1SubHarmonicTracker::step_analytic_stereo` and Stage I `Env-SVF` normalize paired stereo channels via in-register `SimdVec4::rsqrt_pos_pair_nr2` (backed by `vrsqrteq_f32`/`vrsqrtsq_f32` on `aarch64`) alongside `B::rsqrt_nr2_pair_f32` (`0` `FSQRT`, `0` GPR spills).
 
 ### 3.2 Discrete Toggle & Half-Angle Sheet
 
@@ -167,7 +168,7 @@ Effective rate (Hz) | First midpoint m | Last midpoint m | Maximum comparisons
 2. **Half-Angle Sheet Sign ($s_{\mathrm{sheet}} \in \lbrace -1, +1 \rbrace$):** For consecutive normalized phasors $p, u$ with $D = p_{\mathrm{re}}u_{\mathrm{im}} - p_{\mathrm{im}}u_{\mathrm{re}}$, flip $s_{\mathrm{sheet}}$ when (`p_im >= 0`, `u_im < 0`, `D > 0`) or (`p_im < 0`, `u_im >= 0`, `D < 0`), holding $s_{\mathrm{sheet}}$ on near-origin chords ($p \cdot u < 0$ and $|D| \le 2^{-18}$).
 3. **Smooth Half-Angle Quadratures & Square Features:** With $h = (1 + |u_{\mathrm{re}}|)/2$, $\rho = \mathrm{rsqrt}_{\mathrm{NR2}}(h)$, $v_{\mathrm{large}} = \mathrm{clamp}(h\rho, 0, 1)$, and $v_{\mathrm{small}} = \mathrm{clamp}(|u_{\mathrm{im}}|(0.5\rho), 0, 1)$, assign $(v_{\cos}, v_{\sin}) = (v_{\mathrm{large}}, v_{\mathrm{small}})$ for $u_{\mathrm{re}} \ge 0$ and swap otherwise:
    $$w_{\cos} = \hat{A} s_{\mathrm{sheet}} v_{\cos}, \qquad w_{\sin} = \hat{A} s_{\mathrm{sheet}} \sigma_+(u_{\mathrm{im}}) v_{\sin}, \qquad w_{\mathrm{square}} = \hat{A} q_1, \qquad w_{\mathrm{quarter}} = \hat{A} q_2$$
-   Route these four features per channel into `Lite` feature bus slots `4..11` ([router §7](router_and_stages_topology.md#7-unified-256-d-4-tier-kronecker-output-head)) and into the Stage I local mix $y_a = g_{d,a}x_a + g_{c,a}w_{\cos,a} + g_{s,a}w_{\sin,a} + g_{1,a}w_{\mathrm{square},a} + g_{2,a}w_{\mathrm{quarter},a}$ without duplicating the direct source. Present trackers advance on every sample even when locally muted.
+   Route these four features per channel into the Stage I direct-register readout ([router §7](router_and_stages_topology.md#7-unified-256-d-4-tier-kronecker-output-head)) and into the Stage I local mix $y_a = g_{d,a}x_a + g_{c,a}w_{\cos,a} + g_{s,a}w_{\sin,a} + g_{1,a}w_{\mathrm{square},a} + g_{2,a}w_{\mathrm{quarter},a}$ without duplicating the direct source. Present trackers advance on every sample even when locally muted.
 
 ### 3.3 Forward-Faithful Training
 
@@ -183,7 +184,7 @@ Training executes the exact runtime toggle, sheet, silence, and ambiguity rules 
 
 `r[dsp.op-m.stage3.kautz-allocation]`
 
-Stage III models speaker cabinet early reflections and modal tails (`REQ-1.2`) using independent L/R early FIR filters ($K_{\mathrm{early}} = 16 / 32 / 48 / 64$ taps/ch) and a shared-pole Kautz modal bank ($M_{\mathrm{kautz}} = 4 / 8 / 16 / 32$ complex conjugate pole pairs) driven at fixed reference onset $K_{\mathrm{tail}} = 16$ samples ($x_a[n-16]$ at `48 kHz`):
+Stage III models speaker cabinet early reflections and modal tails (`REQ-1.2`) using independent L/R early FIR filters ($K_{\mathrm{early}} = 16 / 32 / 48 / 64$ taps/ch) and a shared-pole Kautz modal bank ($M_{\mathrm{kautz}} = 4 / 8 / 12 / 16$ complex conjugate pole pairs, `8 / 16 / 24 / 32` real poles) driven at fixed reference onset $K_{\mathrm{tail}} = 16$ samples ($x_a[n-16]$ at `48 kHz`):
 $$s_{m,a}[n] = \lambda_m[n] s_{m,a}[n-1] + b_{\gamma,m} x_a[n - K_{\mathrm{tail}}], \qquad y_{\mathrm{tail},a}[n] = \sum_{m=1}^{M_{\mathrm{kautz}}} 2\mathrm{Re}\big(c_{m,a} s_{m,a}[n]\big)$$
 $$H_{\mathrm{cab},a}(z) = \sum_{k=0}^{K_{\mathrm{early}}-1} b_{\mathrm{early},a}[k] z^{-k} + z^{-K_{\mathrm{tail}}} \sum_{m=1}^{M_{\mathrm{kautz}}} \left(\frac{b_{\gamma,m} c_{m,a}}{1 - \lambda_m z^{-1}} + \frac{b_{\gamma,m} \overline{c_{m,a}}}{1 - \overline{\lambda_m} z^{-1}}\right), \qquad K_{\mathrm{tail}} = 16$$
 
@@ -192,10 +193,10 @@ $$H_{\mathrm{cab},a}(z) = \sum_{k=0}^{K_{\mathrm{early}}-1} b_{\mathrm{early},a}
 | STAGE III SEPARATE 64B-ALIGNED EARLY FIR & SHARED-POLE KAUTZ MODAL SLICES                         |
 +---------------------------------------------------------------------------------------------------+
 |  Tier          | Early FIR (L/R Taps)        | Shared Kautz Poles (8-Vec SoA) | State RAM (L+R)   |
-|  Lite (Arena 0)| +16 taps/ch = 128 B (2 CL)  | +4 pairs (1 blk) = 128 B (2 CL)| 128 B FIR + 64 B  |
+|  Lite (Arena 0)| +16 taps/ch = 128 B (2 CL)  | +4 pairs (1 blk) = 128 B (2 CL)| 128 B FIR +  64 B |
 |  Full (Arena 1)| +16 taps/ch = 128 B (2 CL)  | +4 pairs (1 blk) = 128 B (2 CL)| 256 B FIR + 128 B |
-|  Pro  (Arena 2)| +16 taps/ch = 128 B (2 CL)  | +8 pairs (2 blk) = 256 B (4 CL)| 384 B FIR + 256 B |
-|  Ultra(Arena 3)| +16 taps/ch = 128 B (2 CL)  | +16 pairs(4 blk) = 512 B (8 CL)| 512 B FIR + 512 B |
+|  Pro  (Arena 2)| +16 taps/ch = 128 B (2 CL)  | +4 pairs (1 blk) = 128 B (2 CL)| 384 B FIR + 192 B |
+|  Ultra(Arena 3)| +16 taps/ch = 128 B (2 CL)  | +4 pairs (1 blk) = 128 B (2 CL)| 512 B FIR + 256 B |
 +---------------------------------------------------------------------------------------------------+
 ```
 

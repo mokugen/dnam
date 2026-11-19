@@ -1,3 +1,5 @@
+import type { TrainerProgressFrame } from "../../host/trainer-progress.js";
+
 export type CaptureStepTier =
   | "star_center"
   | "star_axis"
@@ -32,4 +34,5 @@ export interface TrainingTimelineView {
   readonly backendDevice: string;
   readonly clampedParameterCount: number;
   readonly history: readonly TrainingEpochPoint[];
+  readonly progressFrame?: TrainerProgressFrame | null | undefined;
 }

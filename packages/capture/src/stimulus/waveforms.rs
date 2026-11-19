@@ -10,7 +10,10 @@
 use std::f64::consts::PI;
 
 use crate::solver::bezout_three_band_weights;
-use crate::{CORESET_FP16_FRAMES_PER_STEM, f32_to_fp16_bits};
+use crate::{
+    CORESET_FP32_FRAMES_PER_STEM, CORESET_FP32_MAX_FRAMES_PER_STEM,
+    CORESET_FP32_MIN_FRAMES_PER_STEM,
+};
 
 use super::fft::{
     ADAPTIVE_FRAME_SAMPLES, ADC_PEAK_GOVERNOR_FS, CYCLIC_WINDOW_SAMPLES, HANN_CROSSFADE_SAMPLES,
@@ -603,31 +606,45 @@ pub fn analyze_pump_and_probe_recovery(
     }
 }
 
-/// Encodes `12,000` frames (`250 ms` at `48 kHz`) of mono (`24,000 B`) or stereo (`48,000 B`)
-/// audio into RNE `fp16` bytes for `INPC` or `STMC` capsules (`r[container.proj.stmc]`).
+/// Encodes `num_frames` (`96,000..=120,000`, `16`-frame multiple) of mono or stereo audio into
+/// little-endian IEEE-754 `binary32` (`fp32`) bytes for `INPC` or `STMC` capsules
+/// (`r[container.proj.stmc-capsule]`), zero-padding shorter slices and zeroing non-finite values.
 #[must_use]
-pub fn encode_coreset_12k_fp16(ch_l: &[f32], ch_r: Option<&[f32]>) -> Vec<u8> {
+pub fn encode_coreset_fp32_with_frames(
+    num_frames: usize,
+    ch_l: &[f32],
+    ch_r: Option<&[f32]>,
+) -> Vec<u8> {
+    let n = num_frames.clamp(
+        CORESET_FP32_MIN_FRAMES_PER_STEM,
+        CORESET_FP32_MAX_FRAMES_PER_STEM,
+    );
     let is_stereo = ch_r.is_some();
-    let mut out = Vec::with_capacity(CORESET_FP16_FRAMES_PER_STEM * if is_stereo { 4 } else { 2 });
-    for i in 0..CORESET_FP16_FRAMES_PER_STEM {
+    let mut out = Vec::with_capacity(n * if is_stereo { 8 } else { 4 });
+    for i in 0..n {
         let sl = ch_l
             .get(i)
             .copied()
             .filter(|v| v.is_finite())
-            .unwrap_or(0.0)
-            .clamp(-65_500.0, 65_500.0);
-        out.extend_from_slice(&f32_to_fp16_bits(sl).to_le_bytes());
+            .unwrap_or(0.0);
+        out.extend_from_slice(&sl.to_le_bytes());
         if let Some(r_slice) = ch_r {
             let sr = r_slice
                 .get(i)
                 .copied()
                 .filter(|v| v.is_finite())
-                .unwrap_or(0.0)
-                .clamp(-65_500.0, 65_500.0);
-            out.extend_from_slice(&f32_to_fp16_bits(sr).to_le_bytes());
+                .unwrap_or(0.0);
+            out.extend_from_slice(&sr.to_le_bytes());
         }
     }
     out
+}
+
+/// Encodes up to `96,000` frames (`2.0 s` at `48 kHz`) of mono (`384,000 B`) or stereo (`768,000 B`)
+/// audio into IEEE-754 `fp32` (`<f4`) bytes for `INPC` / `STMC` capsules (`r[container.proj.stmc-capsule]`).
+#[must_use]
+pub fn encode_coreset_fp32(ch_l: &[f32], ch_r: Option<&[f32]>) -> Vec<u8> {
+    encode_coreset_fp32_with_frames(CORESET_FP32_FRAMES_PER_STEM, ch_l, ch_r)
 }
 
 /// Computes the `88 B` `uplo='U'` 4-band PSD summary (`10 x f64` `uplo='U'` + `1 x f64` total power)

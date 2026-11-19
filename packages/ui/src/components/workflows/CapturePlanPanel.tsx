@@ -1,8 +1,8 @@
 import { CheckCircle2, CircleDot, Mic } from "lucide-react";
-import { Badge } from "../ui/badge.js";
-import { Button } from "../ui/button.js";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../ui/card.js";
-import { Progress } from "../ui/progress.js";
+import { Badge } from "../base/badge.js";
+import { Button } from "../base/button.js";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../base/card.js";
+import { Progress } from "../base/progress.js";
 import type { CapturePlanStepView } from "./models.js";
 
 export interface CapturePlanPanelProps {

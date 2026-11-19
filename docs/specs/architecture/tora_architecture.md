@@ -12,6 +12,7 @@ requirements:
   - REQ-1.3
   - REQ-1.4
   - REQ-1.5
+  - REQ-1.9
   - REQ-5.1
   - REQ-5.4
   - REQ-5.5
@@ -26,28 +27,31 @@ adrs:
   - ADR-0015
   - ADR-0019
   - ADR-0020
+  - ADR-0021
 ---
 
 # Tri-Operator Recurrent Architecture (`TORA`) System Overview
 
-This specification defines the **Tri-Operator Recurrent Architecture (`TORA`)** for **Dynamic Neural Audio Modeler (DNAM)** across [`packages/engine/`](../../../packages/engine/README.md) and [`packages/capture/`](../../../packages/capture/README.md). TORA unifies the modeling of all analog and digital audio gear across **three universal zero-`FDIV` SIMD operator kernels** (`Op-T`, `Op-M`, `Op-N`), four canonical physical stages, an **8-Port Matrix Router** (`Stage 0`), a **Self-Similar 3 kHz Dual-Rate Control Plane**, and a **256-D Mid/Side Kronecker Output Head**.
+This specification defines the **Tri-Operator Recurrent Architecture (`TORA` `v3`)** for **Dynamic Neural Audio Modeler (DNAM)** across [`packages/engine/`](../../../packages/engine/README.md) and [`packages/capture/`](../../../packages/capture/README.md). TORA unifies the modeling of all analog and digital audio gear across **three universal zero-`FDIV` SIMD operator kernels** (`Op-T`, `Op-M`, `Op-N`), an **8-Port Matrix Router** (`Stage 0`), a **Self-Similar 3 kHz Dual-Rate Control Plane**, and **four unconditionally active physical processing stages (`Stage I`–`Stage IV`) accumulating `pre_cab` and `direct` linear `VarPro` readouts directly in SIMD registers** (`0` stage-bypass flags, `0` `256-D` intermediate feature bus).
 
-For implementation-agnostic requirements, see [`../../requirements/system_goals_and_requirements.md`](../../requirements/system_goals_and_requirements.md). For psychoacoustic quality tiers, see [`psychoacoustic_quality_and_tiers.md`](psychoacoustic_quality_and_tiers.md). For architectural decision records, see [`../../adr/0002-tri-operator-recurrent-architecture.md`](../../adr/0002-tri-operator-recurrent-architecture.md).
+For implementation-agnostic requirements, see [`../../requirements/system_goals_and_requirements.md`](../../requirements/system_goals_and_requirements.md). For psychoacoustic quality tiers, see [`psychoacoustic_quality_and_tiers.md`](psychoacoustic_quality_and_tiers.md). For architectural decision records, see [`../../adr/0002-tri-operator-recurrent-architecture.md`](../../adr/0002-tri-operator-recurrent-architecture.md) and [`../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md).
 
 ---
 
 ## 1. Executive Summary & Core Architectural Pillars
 
-### 1.1 Three Foundational Pillars of `TORA`
+### 1.1 Four Foundational Pillars of `TORA`
 
-The **Tri-Operator Recurrent Architecture (`TORA`)** unifies all physical audio hardware into **three universal zero-`FDIV` SIMD operator kernels** (`Op-T`, `Op-M`, `Op-N`) orchestrated across **four canonical physical stages**, an **8-Port Matrix Router**, and a **Unified Dual-Rate Self-Similar Control Plane**:
+The **Tri-Operator Recurrent Architecture (`TORA` `v3`)** unifies all physical audio hardware into **three universal zero-`FDIV` SIMD operator kernels** (`Op-T`, `Op-M`, `Op-N`) orchestrated across an **8-Port Matrix Router**, **four unconditionally active direct-register physical stages (`Stages I–IV`)**, and a **Unified Dual-Rate Self-Similar Control Plane**:
 
 1. `r[arch.pillars.dual-space-control]` **Pillar 1: Dual-Space Factored Control Architecture:**  
-   Factors kinematic controls and nonlinear drive to support non-destructive Capture Vault stem refinement ([`../training/iterative_resume_and_caching.md` §1.2](../training/iterative_resume_and_caching.md#12-two-path-vault-editing--dependency-digests)).
+   Factors kinematic/parametric `FiLM`, Zero-DC $b_n$, and inter-block `TPT-SVF` controls from shared `StarCenter` trajectories to support non-destructive Capture Vault stem refinement ([`../training/iterative_resume_and_caching.md` §1.2](../training/iterative_resume_and_caching.md#12-two-path-vault-editing--dependency-digests)).
 2. `r[arch.pillars.dual-rate-plane]` **Pillar 2: Unified Self-Similar Dual-Rate Control Plane (`Op-M[Ctrl]` & `Op-N[Ctrl]`):**  
-   Executes the control plane using the `Op-M` and `Op-N` kernels at a 16-sample stride at the `48 kHz` reference rate (`3 kHz`), and the rate-dependent stride $K_{\text{ctrl}}(f_{s,\text{eff}})$ at other effective rates ([router §9](../dsp/router_and_stages_topology.md#9-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-44196-khz--4-bounce)).
+   Executes the control plane using the `Op-M` and `Op-N` kernels at a 16-sample stride at the `48 kHz` reference rate (`3 kHz`), decimated Stage I `Env-SVF` & Stage II `FiLM` / Zero-DC / `TPT-SVF` coefficient updates, and the rate-dependent stride $K_{\text{ctrl}}(f_{s,\text{eff}})$ at other effective rates ([router §9](../dsp/router_and_stages_topology.md#9-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-44196-khz--4-bounce)).
 3. `r[arch.pillars.cp1-projections]` **Pillar 3: Shared Control Descriptors & Tier-Local `CP1` Projections:**  
    Supports $P \ge 0$ physical controls using shared descriptors and packed tier-local `f32` projection slices ([`../containers/dnam_binary_format.md` §2.4](../containers/dnam_binary_format.md#packed-control-projection-profile)). `Lite`, `Full`, and `Pro` use `8-D` static latents (`4` head + `4` stage, Rank-4 FM); `Ultra` adds an `8-D` delta (`+4` head + `+4` stage, Rank-8 FM) and a `16 × 4` stage-dispatch delta in `Arena 3` ([`../dsp/parametric_control_bus.md` §2.3](../dsp/parametric_control_bus.md#23-o1-additive-latent-sufficient-statistic-control-scaling)).
+4. `r[arch.pillars.universal-black-box]` **Pillar 4: Universal Trainable & Data-Programmable Black-Box Runtime (`REQ-1.9`):**  
+   Executes a fixed, unconditional basis of general mathematical operators (`Op-T`, `Op-M`, `Op-N`, multi-section `TPT-SVF`, Matryoshka Zero-DC `GRU`, `FIR` + `Kautz` rational poles, `fp16` `FDN`, and `3 kHz` `ControlBus`) parameterized strictly by learned container weights and declarative coefficients—forbidding device-specific white-box sub-circuits, hardcoded crossover frequencies, conditional stage-bypass flags, and target-identity solver branches so newly encountered audio gear never requires engine modifications or major container version bumps.
 
 ### 1.2 The TORA Architectural Breakthrough
 
@@ -56,7 +60,7 @@ flowchart TD
     subgraph CtrlPlane ["Nominal 3 kHz Control Plane (16 Samples at 48 kHz Reference)"]
         direction TB
         CtrlTable["Shared Control Descriptors +<br/>Packed Tier-Local CP1 f32 Projections"]
-        OpNCtrl["Op-N[Ctrl]: Exact-Integer Sufficient-Statistic Engine<br/>• Lite/Full/Pro: 8-D (4 head + 4 stage, Rank-4 FM)<br/>• Ultra: 16-D (8 head + 8 stage, Rank-8 FM)<br/>• Outward-Checked Trust-Region Clip"]
+        OpNCtrl["Op-N[Ctrl]: Exact-Integer Sufficient-Statistic Engine<br/>• Lite/Full/Pro: 8-D (4 head + 4 stage, Rank-4 FM)<br/>• Ultra: 16-D (8 head + 8 stage, Rank-8 FM)<br/>• 3 kHz Env-SVF + FiLM/Zero-DC bn + Tone TPT-SVF Coeffs"]
         SendMod["Send-Safe Instrument / Independent-Key Dynamics"]
         DownMod["Downstream Instrument / Return / Key Dynamics"]
         SendBus["Send Dispatch Rows 0..4<br/>16x16 Base + Ultra 16x4 Delta + Micro-Ramp"]
@@ -72,13 +76,13 @@ flowchart TD
         ROut["Mode-dependent outputs:<br/>• Port Out 0: Send L<br/>• Port Out 1: Send R / WDW dry"]
     end
 
-    subgraph Stages ["Four Canonical Physical Stages (48 kHz Audio Rate)"]
+    subgraph Stages ["Unconditional Direct-Register Pipeline (All 5 Stages Active Every Frame)"]
         direction LR
-        S1["Stage I: Pre-FX / Synth / Mod<br/>(Op-T[Pre], Op-M[Pre], Op-N[Pre])"]
-        S2["Stage II: 3-Stage LTI-Commuted<br/>Nonlinear Amp Cascade (Op-N)"]
-        S3["Stage III: 64-Tap Early SIMD FIR<br/>+ Shared Kautz Modal Bank (Op-M)"]
-        S4["Stage IV: Unitary Spatial &<br/>Barberpole Tank (Op-T[Tank])"]
-        S1 -->|"Downstream LR4 high when split"| S2 --> S3 --> S4
+        S1["Stage I: Pre-FX & 2-Sec Env-SVF<br/>(Op-T/Op-M/Op-N + 3 kHz Coeffs)"]
+        S2["Stage II: Zero-DC Matryoshka GRU<br/>• Lite [1,1,1] 12ch @ 1x | Full [2,1,1] 16ch @ 1x<br/>• Pro [2,2,1] 20ch @ 2x | Ultra [3,2,1] 24ch @ 2x<br/>• Inter-Block 3-Band Tone TPT-SVF"]
+        S3["Stage III: Contiguous FIR (16/32/48/64)<br/>+ Shared Kautz Bank (4/8/12/16 Pairs)"]
+        S4["Stage IV: fp16 FDN Tank (4/8/8/16 Lines)<br/>+ Barberpole / Ducking / Gain-Trim"]
+        S1 -->|"Downstream LR4 high when split"| S2 -->|"pre_cab register path"| S3 --> S4
     end
 
     RIn -->|"Instrument inputs only"| S1
@@ -89,26 +93,12 @@ flowchart TD
     RIn -->|"Instrument / independent key"| SendMod
     RIn -->|"Downstream sources"| DownMod
 
-    DownBus --> S2 & S3 & S4
+    DownBus --> S1 & S2 & S3 & S4
     SendBus --> Router & S1
 
-    subgraph FeatBus ["Unified 256-D Feature Bus Phi[n]"]
-        direction LR
-        FB["Lite: ch [0..63] (64 D) | Full: ch [0..127] (128 D) | Pro: ch [0..191] (192 D) | Ultra: ch [0..255] (256 D)"]
-    end
-
-    S1 & S2 & S3 & S4 --> FB
-
-    subgraph MixHead ["Output Projection & Stereo Mixer"]
-        direction LR
-        KHead["256-D 4-Tier SVD Kronecker Head<br/>W_head(z) @ Phi[n] (2x256 FMAs, Canonical Mid/Side Slice 0 & Slice 1)"]
-        TankMix["Direct Tank Stereo<br/>Wet/Dry Mixer"]
-    end
-
-    FB --> KHead
-    S4 --> TankMix
-    DownBus --> KHead
-    KHead & TankMix --> MainOut["Output Ports:<br/>• Port Out 2: Main L / WDW wet L<br/>• Port Out 3: Main R / WDW wet R"]
+    S1 & S2 & S3 -->|"direct VarPro linear registers"| MixOut["Direct-Register Stereo Combine<br/>& Calibrated Tier Gain Trim -> Port Out 2 & 3"]
+    S4 --> MixOut
+    DownBus --> MixOut
 ```
 
 #### Dual-Rate (`48 kHz` Audio vs. `3 kHz` Control) TORA Execution Lifecycle
@@ -122,9 +112,9 @@ sequenceDiagram
     autonumber
     participant Host as Audio Host / 8-Port Router
     participant CtrlM as Op-M[Ctrl] (3 kHz Symplectic & Ballistic)
-    participant CtrlN as Op-N[Ctrl] (3 kHz Polynomial & FM)
+    participant CtrlN as Op-N[Ctrl] (3 kHz Polynomial, FiLM & SVF)
     participant Bus as Tier-aware modulation routing
-    participant Audio as Four Stages I-IV & Kronecker Head (48 kHz)
+    participant Audio as Stages I-IV & Direct Registers (48 kHz)
 
     Host->>CtrlM: Complete previous detector window at control boundary
     CtrlM->>CtrlM: Advance Q0.192 LFOs with previous-window parameters or hold zero increment
@@ -140,16 +130,14 @@ sequenceDiagram
     end
     CtrlN->>Bus: Emit tier-specific head (4 or 8) and stage-control (4 or 8) latents
 
-    Bus->>Bus: Route static latents and 8 dynamic values
-    Bus->>Audio: Dispatch 16x16 base + Ultra 16x4 stage parameters and collapse head modes
+    Bus->>Bus: Refresh 3 kHz Stage I Env-SVF + Stage II FiLM/Zero-DC bn/Tone-SVF & collapse linear readouts
     Bus->>Audio: Compute division-free ramp delta_theta = (theta_next - theta_curr) * alpha_ramp
 
-    loop For each sample n in 16-sample sub-block (48 kHz)
+    loop For each sample n in 16-sample sub-block (48 kHz, stack scratch)
         Audio->>Audio: theta_stage = theta_stage + delta_theta (Micro-Ramping FMA)
-        Host->>Audio: Route 8-Port Matrix S_router (S_{ret->send} == 0) & configured parallel alignment
-        Audio->>Audio: Stage I Pre-FX (Op-T/M/N) -> Loop Send L/R -> Stage II Multi-Drive Cascade
-        Audio->>Audio: Stage III SIMD Early FIR + Kautz Modals -> Stage IV Unitary Tank
-        Audio->>Host: Stream Phi[n] into 256-D Mid/Side Kronecker Head -> Port Out 2 & 3
+        Host->>Audio: Route Stage 0 8-Port Matrix (S_{ret->send} == 0) & LR4 parallel alignment
+        Audio->>Audio: Stage I Env-SVF -> Stage II Matryoshka GRU (1x/2x) + Tone TPT-SVF (pre_cab, direct)
+        Audio->>Audio: Stage III Contiguous FIR + Kautz -> Stage IV fp16 FDN -> Direct Register Mix -> Out 2 & 3
     end
 ```
 
@@ -161,7 +149,7 @@ All block-processing entry points enforce round-to-nearest, ties-to-even (`RNE`)
 
 | Target Architecture | Hardware Control Register Policy (`FtzDazGuard`) |
 | :--- | :--- |
-| **`aarch64`** | Save `FPCR`; clear `RMode` bits `23:22` and exception trap-enable bits `8:12, 15`; set `FZ` bit `24`; if `AH` bit `1` is set (`FEAT_AFP`), set `FIZ` bit `0`; restore saved `FPCR` on exit. Per-sample recursive-state software flushing (`flush_recursive_state_f32` / `flush_recursive_state_vec4`) compiles to a zero-cost no-op because hardware `FZ` is active throughout the callback. |
+| **`aarch64`** | Save `FPCR`; clear `RMode` bits `23:22` and exception trap-enable bits `8:12, 15`; set `FZ` bit `24`; if `AH` bit `1` is set (`FEAT_AFP`), set `FIZ` bit `0`; guard `FtzDazGuard::drop` with `cur_fpcr != self.prev_fpcr` to eliminate redundant `msr fpcr` pipeline flushes inside nested audio callbacks. Per-sample recursive-state software flushing (`flush_recursive_state_f32` / `flush_recursive_state_vec4`) compiles to a zero-cost no-op because hardware `FZ` is active throughout the callback. |
 | **`x86_64`** | Save `MXCSR`; clear `RC` bits `14:13` and sticky flags `0:5`; set `FTZ` (`15`), `DAZ` (`6`), and exception masks `7:12`; restore saved `MXCSR` on exit. Per-sample recursive-state software flushing (`flush_recursive_state_f32` / `flush_recursive_state_vec4`) compiles to a zero-cost no-op because hardware `FTZ`/`DAZ` is active throughout the callback. |
 | **WebAssembly / Portable** | Standard WASM enforces `RNE` with gradual underflow; apply branchless 4-lane `SimdVec4::flush_subnormal` (`v128` exponent-mask zeroing, `exp == 0 -> ±0.0f32`) in `flush_recursive_state_f32` / `flush_recursive_state_vec4` to persistent recursive-state writebacks while preserving sign, normals, infinities, and `NaN` payloads. |
 
@@ -208,9 +196,9 @@ flowchart LR
         M1["• 4-Lane SIMD Symplectic Complex Recurrence: z_c[n] = (r_c[n] u_rot,c[k]) z_c[n-1] + b_c x_c[n]<br/>• Radial-Polar Split (Quadrant-Reduced Rotor + H2 Norm + Radial Gate)<br/>• 15-Anchor 6-Section Dual All-Pass Hilbert Lattice (H1) for Quadrature (I, Q)<br/>• Bounded Half-Angle & Discrete Toggle Sub-Harmonic Trackers (T1)<br/>• Shared-Pole Kautz Modal Bank with Independent L/R Readouts"]
     end
 
-    subgraph OpN ["Op-N: LTI-Commuted Nonlinearity, Hysteresis & Quantizer Kernel"]
+    subgraph OpN ["Op-N: Zero-DC Matryoshka GRU, Hysteresis & Quantizer Kernel"]
         direction TB
-        N1["• Multi-Drive 1x B-Spline PolyADAA + 6-Step Division-Free Rail Crossing<br/>• C² Cubic-Envelope Wavefolder with Division-Free Degree-7/8 PolyADAA<br/>• 2D Quadrature Phase-Space Hysteresis: (s_re Δs_re, s_re s_im) + Multi-Tau Envelope Sag<br/>• Fixed-Hertz Precomputed-Reciprocal ZOH Reducer & Bitcrusher (0 FDIV Audio Loop)<br/>• LTI-Commuted SIMD Projection: v_k[n] = u_nl[n] W_k"]
+        N1["• 4-Lane SIMD Tapered Zero-DC Matryoshka GRU ([1,1,1]..[3,2,1], 12..24 ch) at 1x/2x ZOH<br/>• In-Register NR2 Rational Pade tanh/sigmoid via SimdVec4::rcp_ge1_nr2 (0 FDIV, 0 spills)<br/>• 3 kHz FiLM + Analytical Zero-DC Shift bn (h_eq = 0) + Inter-Block 3-Band Tone TPT-SVF<br/>• C² Cubic-Envelope Wavefolder, 2D Quadrature Hysteresis & Fixed-Hertz ZOH Bitcrusher"]
     end
 
     T1 <--> M1
@@ -221,41 +209,40 @@ flowchart LR
 
 `r[arch.operators.self-similar]`
 
-| Universal Kernel | Audio-Rate Execution (`48 kHz`) | Control-Plane Execution (`3 kHz`, `f_s / K_ctrl`) | Shared SIMD Mechanism |
+| Universal Kernel | Audio-Rate Execution (`48 kHz` / `96 kHz` `2x`) | Control-Plane Execution (`3 kHz`, `f_s / K_ctrl`) | Shared SIMD Mechanism |
 | :--- | :--- | :--- | :--- |
 | **`Op-T` (Transport)** | Fractional delay ring buffer, pitch grains, all-pass diffusers | Integer-plus-`Q0.32` delay targets and inward `f32` reader bounds | Branchless wrap and Catmull-Rom Horner FMA |
-| **`Op-M` (Symplectic Complex & Ballistics)** | Complex resonant filters, `H1` Hilbert SSB, Kautz modal bank | `Q0.192` quadrature LFO rotors, `Q64`/`Q32` tempo phase, 4-Band block-peak envelopes | Quadrant-reduced contractive rotor and 1-pole ballistics |
-| **`Op-N` (Polynomials & Nonlinearities)** | Multi-Drive `1×` B-Spline `PolyADAA`, `C²` wavefolder, bitcrushers | Packed `CP1` Lobatto/FM projections, exact-integer accumulator, outward trust clip | Branchless polynomial FMA and straight-through bounding |
+| **`Op-M` (Symplectic Complex & Ballistics)** | Complex resonant filters, `H1` Hilbert SSB, Kautz modal bank, `Env-SVF` | `Q0.192` quadrature LFO rotors, `Q64`/`Q32` tempo phase, 4-Band block-peak envelopes & `Env-SVF` / `TPT-SVF` coeff updates | Quadrant-reduced contractive rotor, 1-pole ballistics & `SimdVec4` ZDF filter |
+| **`Op-N` (Polynomials, `GRU` & Nonlinearities)** | Zero-DC Matryoshka `GRU` (`NR2` Padé `tanh`/`sigmoid`), `C²` wavefolder, bitcrushers | Packed `CP1` Lobatto/FM projections, exact-integer accumulator, `3 kHz` `FiLM` & `b_n`, outward trust clip | Branchless in-register `rcp_ge1_nr2` / FMA (`0` GPR spills) |
 
 #### 2.4.1 SIMD Lane Packing (AVX2, ARM NEON & WebAssembly SIMD128)
 
 `r[arch.simd.lane-packing]`
 
-`TORA` organizes all multichannel state, `fp16` delay conversions (`f32x4_to_fp16x4` / `fp16x4_to_f32x4`), and parameter matrices in **4-lane blocks** (`float32x4_t` in NEON, `v128` `f32x4` in WebAssembly `SIMD128`, half of `__m256` in AVX2) matching the nested tier hierarchy:
+`TORA` organizes all 4-lane Matryoshka `GRU` hidden blocks, `Env-SVF`/`TPT-SVF` states, `fp16` delay conversions (`f32x4_to_fp16x4` / `fp16x4_to_f32x4`), and parameter matrices in **4-lane SIMD blocks** (`float32x4_t` in NEON, `v128` `f32x4` in WebAssembly `SIMD128`, half of `__m256` in AVX2) matching the nested tier pyramid (`[1, 1, 1]` = `3×` 4-lane blocks in `Lite`, `[2, 1, 1]` = `4×` in `Full`, `[2, 2, 1]` = `5×` in `Pro`, `[3, 2, 1]` = `6×` in `Ultra`):
 
 ```text
-NEON 128-Bit Vector Layout:
-+-------------------+-------------------+-------------------+-------------------+
-|  Lane 0: Ch 0     |  Lane 1: Ch 1     |  Lane 2: Ch 2     |  Lane 3: Ch 3     |  -> Tier 0: Lite
-+-------------------+-------------------+-------------------+-------------------+
-|  Lane 4: Ch 4     |  Lane 5: Ch 5     |  Lane 6: Ch 6     |  Lane 7: Ch 7     |  -> Tier 1: Full
-+-------------------+-------------------+-------------------+-------------------+
-|  Lane 8: Ch 8     |  Lane 9: Ch 9     |  Lane 10: Ch 10   |  Lane 11: Ch 11   |  -> Tier 2: Pro
-+-------------------+-------------------+-------------------+-------------------+
-|  Lane 12: Ch 12   |  Lane 13: Ch 13   |  Lane 14: Ch 14   |  Lane 15: Ch 15   |  -> Tier 3: Ultra
-+-------------------+-------------------+-------------------+-------------------+
+TORA v3 Tapered 3-Block 4-Lane Matryoshka GRU SIMD Hierarchy:
++--------------------+--------------------+--------------------+
+| Block 0 (4-Lane B) | Block 1 (4-Lane B) | Block 2 (4-Lane B) | -> Tier / Mode
++--------------------+--------------------+--------------------+
+| 1 x Vec4 (4 ch)    | 1 x Vec4 (4 ch)    | 1 x Vec4 (4 ch)    | -> Lite  [1,1,1] = 12 ch @ 1x (48 kHz)
+| 2 x Vec4 (8 ch)    | 1 x Vec4 (4 ch)    | 1 x Vec4 (4 ch)    | -> Full  [2,1,1] = 16 ch @ 1x (48 kHz)
+| 2 x Vec4 (8 ch)    | 2 x Vec4 (8 ch)    | 1 x Vec4 (4 ch)    | -> Pro   [2,2,1] = 20 ch @ 2x (96 kHz)
+| 3 x Vec4 (12 ch)   | 2 x Vec4 (8 ch)    | 1 x Vec4 (4 ch)    | -> Ultra [3,2,1] = 24 ch @ 2x (4x Bounce)
++--------------------+--------------------+--------------------+
 ```
 
-| Tier | Tier Index | Active Channels (`C_tier`) | NEON 128-Bit Vectors (`float32x4_t`) | AVX2 256-Bit Vectors (`__m256`) |
-| :--- | :---: | :---: | :---: | :---: |
-| **`Lite`** | Tier `0` | `4` channels (`Ch 0..3`) | `1×` SIMD vector | `0.5×` SIMD vector (`__m128`) |
-| **`Full`** | Tier `1` | `8` channels (`Ch 0..7`) | `2×` SIMD vectors | `1×` SIMD vector |
-| **`Pro`** | Tier `2` | `12` channels (`Ch 0..11`) | `3×` SIMD vectors | `1.5×` SIMD vectors (`8 + 4`) |
-| **`Ultra`** | Tier `3` | `16` channels (`Ch 0..15`) | `4×` SIMD vectors | `2×` SIMD vectors |
+| Tier | Tier Index | Stage II `GRU` Pyramid (`C_gru` ch @ Rate) | Stage III (`FIR` + Kautz Pairs) | Stage IV (`fp16` FDN Lines + Taps) |
+| :--- | :---: | :--- | :---: | :---: |
+| **`Lite`** | Tier `0` | `[1, 1, 1]` (`12` ch, `3` `Vec4` blks) @ `1x` | `16` FIR + `4` Kautz (`8` poles) | `4`-line FDN + `1` tap |
+| **`Full`** | Tier `1` | `[2, 1, 1]` (`16` ch, `4` `Vec4` blks) @ `1x` | `32` FIR + `8` Kautz (`16` poles) | `8`-line FDN + `2` taps |
+| **`Pro`** | Tier `2` | `[2, 2, 1]` (`20` ch, `5` `Vec4` blks) @ `2x` | `48` FIR + `12` Kautz (`24` poles) | `8`-line FDN + `4` taps |
+| **`Ultra`** | Tier `3` | `[3, 2, 1]` (`24` ch, `6` `Vec4` blks) @ `2x` (`4x` bounce) | `64` FIR + `16` Kautz (`32` poles) | `16`-line FDN + `4` taps |
 
-1. `r[arch.simd.two-level-traits]` **Two-Level SIMD Trait Hierarchy & Domain-Scoped Backend Traits ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):**
-   - **Level 1 (`math/backend.rs`):** `SimdVec4` defines the portable 4-lane `f32` register abstraction—including broadcast lane multiply-accumulate `fma_lane::<const LANE: usize>` (`vfmaq_laneq_f32` on NEON), simultaneous stereo 4-lane horizontal reduction `horizontal_sum_pair(v0, v1) -> (f32, f32)` (`vpaddq_f32` on NEON, `_mm_hadd_ps` on SSE3+/AVX2), interleaved stereo pair broadcast `splat_pair(a, b) -> [a, b, a, b]`, orthogonal pair swap `pair_swap_neg([v0, v1, v2, v3]) -> [-v1, v0, -v3, v2]`, and `flush_subnormal` (paired with `flush_recursive_state_vec4`)—while `MathBackend` (`Crc32cBackend`) provides $4\times 4$ matrix-vector tile accumulation `fma_mat4x4_vec4`, batch 4-lane IEEE-754 half-precision conversion `f32x4_to_fp16x4` / `fp16x4_to_f32x4` (`vcvt_f16_f32` / `vcvt_f32_f16` on NEON, `_mm_cvtps_ph` / `_mm_cvtph_ps` on `F16C`), hardware `CRC32C` (`__crc32cd`/`__crc32cb` on ARM64 `+crc`, `_mm_crc32_u64`/`_mm_crc32_u8` on `SSE4.2+`), `fast_unit_phasor`, and unfused 2-step Newton-Raphson `rsqrt_nr2_f32` / `rsqrt_nr2_pair_f32`.
-   - **Level 2 (Domain-Scoped Backend Traits):** Higher-level DSP traits (`OpMBackend`, `OpNBackend`, `OpTBackend`, `Stage2Backend`, `Stage3Backend`, `FeatureBusBackend`, `StageBackend`, `EngineBackend`) are defined inside their respective domain modules (`operators/`, `stages/`, `engine/`) rather than `math/`, enforcing a strict one-way dependency DAG (`engine -> stages -> operators -> math`) while allowing `X86Avx2FmaBackend` and `ArmSmeBackend` to override wide multi-vector kernels (`tile_dot64`, `tile_dot64_stereo`, `dot16_stereo`, `conv6_taps_{1..4}groups`, `tracker_exp_scales_f32`).
+1. `r[arch.simd.two-level-traits]` **Two-Level SIMD Trait Hierarchy & Domain-Scoped Backend Traits ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [`ADR-0021`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md)):**
+   - **Level 1 (`math/backend.rs`):** `SimdVec4` defines the portable 4-lane `f32` register abstraction—including broadcast lane multiply-accumulate `fma_lane::<const LANE: usize>` (`vfmaq_laneq_f32` on NEON), simultaneous stereo 4-lane horizontal reduction `horizontal_sum_pair(v0, v1) -> (f32, f32)` (`vpaddq_f32` on NEON, `_mm_hadd_ps` on SSE3+/AVX2), interleaved stereo pair broadcast `splat_pair(a, b) -> [a, b, a, b]`, orthogonal pair swap `pair_swap_neg([v0, v1, v2, v3]) -> [-v1, v0, -v3, v2]`, in-register IEEE-754 exponential-halving inverse reciprocal `rcp_ge1_nr2`, fixed-latency 4-lane inverse square root `rsqrt_pos_nr2` and stereo pair `rsqrt_pos_pair_nr2` (backed by NEON `vrsqrteq_f32` / `vrsqrtsq_f32` on `aarch64`), and `flush_subnormal` (paired with `flush_recursive_state_vec4`)—while `MathBackend` (`Crc32cBackend`) provides $4\times 4$ matrix-vector tile accumulation `fma_mat4x4_vec4`, batch 4-lane IEEE-754 half-precision conversion `f32x4_to_fp16x4` / `fp16x4_to_f32x4` (`vcvt_f16_f32` / `vcvt_f32_f16` on NEON, `_mm_cvtps_ph` / `_mm_cvtph_ps` on `F16C`), hardware `CRC32C` (`__crc32cd`/`__crc32cb` on ARM64 `+crc`, `_mm_crc32_u64`/`_mm_crc32_u8` on `SSE4.2+`), `fast_unit_phasor`, and unfused 2-step Newton-Raphson `rsqrt_nr2_f32` / `rsqrt_nr2_pair_f32`.
+   - **Level 2 (Domain-Scoped Backend Traits):** Higher-level DSP traits (`OpMBackend`, `OpNBackend`, `OpTBackend`, `Stage2Backend`, `Stage3Backend`, `StageBackend`, `EngineBackend`) are defined inside their respective domain modules (`operators/`, `stages/`, `engine/`) rather than `math/`, enforcing a strict one-way dependency DAG (`engine -> stages -> operators -> math`) while allowing `X86Avx2FmaBackend` and `ArmSmeBackend` to override wide multi-vector kernels (`dot16_stereo`, `step_stage2_stereo`, `tracker_exp_scales_f32`) with zero GPR spills.
 2. `r[arch.simd.single-library-dispatch]` **Single-Library Per-Architecture Runtime SIMD Dispatch & `0.000000 ULP` Parity ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):**
    - Each target architecture compiles all of its ISA tiers into a single binary (`math/aarch64/{neon,sve2,sme}` on `aarch64`, `math/x86/{sse2,sse42,avx2}` on `x86_64`, `math/wasm.rs` on `wasm32`, plus `math/scalar.rs` fallback) using function-level `#[target_feature]` attributes and `AtomicU8`-cached runtime capability detection (`0 = Unchecked`, `1 = Unavailable`, `2 = Available`), dispatched once at engine construction via `DynamicDnamEngine`.
    - Where hardware fused multiply-add (`FMA`) vs. separate multiply-then-add would alter bit-exact rounding in non-FMA scalar reference formulas (such as the 2-step Newton-Raphson `rsqrt_nr2_pair_f32` step $\rho(1.5 - (0.5 r^2 \rho)\rho)$ in `Op-M` `T1`), all SIMD backends execute unfused IEEE-754 multiply and subtract instructions (`vmulq_f32`/`vsubq_f32`, `_mm_mul_ps`/`_mm_sub_ps`, `f32x4_mul`/`f32x4_sub`) to guarantee `0.000000 ULP` bit parity across `ScalarBackend`, `NeonBackend`, `ArmSve2Backend`, `ArmSmeBackend`, `X86Sse2Backend`, `X86Sse42Backend`, `X86Avx2FmaBackend`, and `WasmSimd128Backend`.
@@ -284,56 +271,53 @@ $$\frac{\partial d(\tau)}{\partial \mu} = 3 c_3' \mu^2 + 2 c_2' \mu + c_1', \qqu
 
 `r[arch.tiers.arena-hierarchy]`
 
-Weights use a four-tier causally nested lower-block-triangular delta layout (`Arena 0..3`) where lower-tier states are contiguous authenticated prefixes of higher-tier states alongside compact per-tier linear readout projections, all jointly fitted in one single training run (`REQ-5.1`, `REQ-5.2`):
+Weights use a four-tier causally nested lower-block-triangular delta layout (`Arena 0..3`, `64 B`-aligned) engineered via **Inverted L1D-Resident Max-Quality Sizing** inside the `64 KiB` ARM Cortex-A76 L1D cache budget (`REQ-5.1`, `REQ-5.2`): `Lite` and `Full` run Stage II natively at `1×` (`48 kHz`) using continuous-time ZOH gate scaling while nested inside `2×` (`96 kHz`, `4×` bounce) `Pro` and `Ultra`, transient `14.8 KiB` kernel scratch lives on the audio callback stack (`0 B/instance`), cold `3 kHz` control params sit at the trailing tail of the hot engine state, and all five stages execute unconditionally on every stereo frame (`0` bypass flags).
 
 | Parameter | `Lite` (`Arena 0`) | `Full` (`Arena 0..1`) | `Pro` (`Arena 0..2`) | `Ultra` (`Arena 0..3`) |
 | :--- | :---: | :---: | :---: | :---: |
-| **Feature Bus Width (`Phi[n]`)** | `64` channels | `128` channels | `192` channels | `256` channels |
-| **Stage I Pre Delay Buffer** | Model-declared 64B-aligned | Model-declared 64B-aligned | Model-declared 64B-aligned | Model-declared 64B-aligned |
-| **Stage II Nonlinear Basis** | `8L + 8R` multi-drive + fold/sag | Tier delta extension | Tier delta extension | Tier delta extension |
-| **Stage III Early FIR Taps** | `16` per channel (`128 B` L/R) | `32` per channel (`256 B` L/R) | `48` per channel (`384 B` L/R) | `64` per channel (`512 B` L/R) |
-| **Stage III Shared Kautz Pole Pairs** | `4` shared (`128 B` slice) | `8` shared (`256 B` cumulative) | `16` shared (`512 B` cumulative) | `32` shared (`1,024 B` cumulative) |
-| **Stage IV Tank Delay Lines (`M`)** | `M = 4` lines (`fp16`) | `M = 8` lines (`fp16`) | `M = 8` lines (`fp16`) | `M = 16` lines (`fp16`) |
-| **Control Bus Latent Dim (`z_ctrl`)**| `8-D` (`4` head + `4` stage, `R=4`) | `8-D` (`4` + `4`, `R=4`) | `8-D` (`4` + `4`, `R=4`) | `16-D` (`8` head + `8` stage, `R=8`) |
+| **Cumulative `64 B`-Aligned Arena Ceiling** | `≤ 4,608 B` | `≤ 10,240 B` | `≤ 18,432 B` | `≤ 28,672 B` |
+| **Stage I `Env-SVF` & Pre-FX Bus** | `2`-Sec ZDF + Pre-Bus | Prefix + Delta | Prefix + Delta | Prefix + Delta |
+| **Stage II Zero-DC Matryoshka `GRU`** | `[1, 1, 1]` (`12` ch) @ `1×` | `[2, 1, 1]` (`16` ch) @ `1×` | `[2, 2, 1]` (`20` ch) @ `2×` | `[3, 2, 1]` (`24` ch) @ `2×` (`4×` bounce) |
+| **Stage III Early FIR Taps (per ch)** | `16` (`128 B` slice) | `32` (`+128 B` = `256 B`) | `48` (`+128 B` = `384 B`) | `64` (`+128 B` = `512 B`) |
+| **Stage III Shared Kautz Pole Pairs** | `4` pairs (`8` poles, `128 B`) | `8` pairs (`16` poles, `256 B`) | `12` pairs (`24` poles, `384 B`) | `16` pairs (`32` poles, `512 B`) |
+| **Stage IV Tank Lines (`fp16`) & Taps** | `M = 4` lines + `1` tap | `M = 8` lines + `2` taps | `M = 8` lines + `4` taps | `M = 16` lines + `4` taps |
+| **Control Bus Latent Dim (`z_ctrl`)** | `8-D` (`4` + `4`, `R = 4`) | `8-D` (`4` + `4`, `R = 4`) | `8-D` (`4` + `4`, `R = 4`) | `16-D` (`8` + `8`, `R = 8`) |
 
 ### 2.2 Hardware & DSP Benchmark Summary
 
 `r[arch.tiers.hardware-budget]`
 
-Reference embedded instance budgets on `1×` ARM Cortex-A76 core (`2.4 GHz`, `20,833 ns/sample` at `48 kHz`, see [`../../requirements/system_goals_and_requirements.md` §7](../../requirements/system_goals_and_requirements.md#7-goal-6--real-time-commodity-hardware-budget--execution-constraints)):
+Reference embedded serial pedalboard budgets on `1×` ARM Cortex-A76 core (`Rockchip RK3582 @ 2.4 GHz`, `20,833.33 ns/sample` raw period at `48 kHz`, **`16,667 ns/sample` usable budget under the `80%` real-time scheduling cap** including LV2 host dispatch and multi-instance cache spill, executing **all 5 DSP stages unconditionally on every stereo frame with zero bypass flags**, see [`../../requirements/system_goals_and_requirements.md` §7](../../requirements/system_goals_and_requirements.md#7-goal-6--real-time-commodity-hardware-budget--execution-constraints)):
 
-| Requirement | Reference Budget |
+| Requirement | Reference Budget (`1×` Cortex-A76 @ `80%` RT Cap) |
 | :--- | :--- |
-| **`Lite` instances per embedded core** | `≥ 10×` at `48 kHz` (`≤ 2,083 ns/sample`) |
-| **`Full` instances per embedded core** | `≥ 6×` at `48 kHz` (`≤ 3,472 ns/sample`) |
-| **`Pro` instances per embedded core** | `≥ 2×` at `48 kHz` (`≤ 10,416 ns/sample`) |
+| **`Lite` instances per embedded core** | `≥ 14×` serial at `48 kHz` (`≤ 1,190 ns/sample`, `N × HotBytes ≈ 62 KiB ≤ 64 KiB` L1D) |
+| **`Full` instances per embedded core** | `≥ 8×` serial at `48 kHz` (`≤ 2,083 ns/sample`, `N × HotBytes ≈ 58 KiB ≤ 64 KiB` L1D) |
+| **`Pro` instances per embedded core** | `≥ 4×` serial at `48 kHz` (`≤ 4,166 ns/sample`, `N × HotBytes ≈ 39 KiB ≤ 64 KiB` L1D) |
+| **`Ultra` instances per embedded core** | `≥ 2×` serial at `48 kHz` (`≤ 8,333 ns/sample`, `N × HotBytes ≈ 52 KiB ≤ 64 KiB` L1D) + Desktop RT & `4×` Bounce |
 | **Real-time loop instruction invariant** | Zero pipeline-stalling `FDIV`, `FSQRT`, `IDIV`/`UDIV`/`SDIV`, `libm`/`fmodf`, unbounded loops, or nondeterministic calls (`REQ-6.2`, `REQ-6.3`) |
 
-**Rockchip RK3582 (`Cortex-A76 @ 2.4 GHz`) & LV2 Plugin Overhead Estimation Model:**
+**Measured Worst-Case All-Stages-Active Desktop NEON (`realtime_wcet`) & RK3582 Scaling Model:**
 
-To translate standalone desktop `ARM64 NEON` microbenchmark frame times $t_{\text{bench}}(t)$ (`161.59 ns` `Lite`, `189.30 ns` `Full`, `215.07 ns` `Pro`, `257.41 ns` `Ultra` at $f_s = 48\text{ kHz}$, $T_{\text{sample}} = 1 / f_s \approx 20,833.33\text{ ns}$ in `benches/pipeline.rs`; `178.53 ns`, `214.80 ns`, `236.38 ns`, `283.26 ns` in `benches/realtime_wcet.rs`) to practical embedded multi-plugin chains on the **Rockchip RK3582** (`2× Cortex-A76 @ 2.4 GHz` with `64 KB` L1D / `512 KB` L2 per core + `4× Cortex-A55 @ 2.0 GHz`, `3 MB` shared L3), the per-instance frame latency $t_{\text{A76+LV2}}(t, B)$, single-core utilization $u_{\text{core}}(t, B)$, and safe simultaneous instance count $N_{\text{safe}}(t, B)$ for block size $B \in [64, 128]$ are modeled as:
+In standalone desktop `ARM64 NEON` worst-case stereo WCET benchmarking (`cargo bench -p dnam-engine --bench realtime_wcet` with **all 5 DSP stages active unconditionally**, `0` bypass flags, stack-allocated scratch, `SimdVec4::rcp_ge1_nr2`, and guarded `FtzDazGuard`), measured stereo frame times $t_{\text{bench}}(t)$ are **`158.64 ns` (`Lite`)**, **`196.97 ns` (`Full`)**, **`452.70 ns` (`Pro`)**, and **`531.14 ns` (`Ultra`)**, clearing the tight desktop ceilings (`≤ 220 / 300 / 500 / 700 ns`) and validating serial chains (`14x Lite = 283.9 us P50`, `8x Full = 201.3 us P50`, `4x Pro = 230.5 us P50`, `2x Ultra = 134.9 us P50` vs. `2,666.67 us` block budget). On **Rockchip RK3582** (`2× Cortex-A76 @ 2.4 GHz` with `64 KB` L1D / `512 KB` L2 per core), per-instance frame latency $t_{\text{A76+LV2}}(t, B)$, utilization $u_{\text{core}}(t, B)$, and safe serial instance count $N_{\text{safe}}(t, B)$ for block size $B \in [64, 128]$ are modeled as:
 
 $$t_{\text{A76+LV2}}(t, B) = \kappa_{\text{cache}} \left(\alpha_{\text{uarch}}(t) \cdot t_{\text{bench}}(t) + \frac{T_{\text{LV2-block}}}{B}\right), \qquad u_{\text{core}}(t, B) = \frac{t_{\text{A76+LV2}}(t, B)}{T_{\text{sample}}}, \qquad N_{\text{safe}}(t, B) = \left\lfloor \frac{\eta_{\text{RT}}}{u_{\text{core}}(t, B)} \right\rfloor$$
 
-1. **Microarchitectural & Tier Scaling Factor ($\alpha_{\text{uarch}}(t)$):** Scales desktop wide-issue Apple Silicon NEON timings (`4× 128-bit` SIMD pipes, `~3.8 GHz`, large L1/L2) to a single in-order-constrained **Cortex-A76 @ `2.4 GHz`** (`2× 128-bit` NEON FMA pipes = `8` `f32` FLOPs/cycle peak or `19.2 GFLOP/s` per core), accounting for clock ratio (`~1.6×`), half the SIMD issue width (`2×`), and tier-dependent working-set growth from `Lite` (`64-D`, `K=4`, `M=4`) to `Ultra` (`256-D`, `K=32`, `M=16`).
-2. **Amortized LV2 Plugin & Host Graph Dispatch ($T_{\text{LV2-block}} / B \approx 50\text{–}120\text{ ns/frame}$):** Captures per-block `LV2_Descriptor::run()` C ABI entry/exit, `FPCR` control-register save/restore (`FtzDazGuard`), `LV2_Atom_Sequence` parameter automation and `LV2_Time_Position` host BPM/transport parsing, and host audio-port buffer routing over `64–128` sample blocks.
-3. **Multi-Instance Cache Spill Multiplier ($\kappa_{\text{cache}} \approx 1.15\text{–}1.30$):** Accounts for L1D (`64 KB`) $\to$ L2 (`512 KB`) cache refills when chaining multiple plugin instances whose combined parameter arenas (`Arena 0..3`), `fp16` delay ring buffers, and host port buffers exceed L1D residency.
-4. **Real-Time Scheduling Headroom Ceiling ($\eta_{\text{RT}} = 0.80$):** Caps usable audio DSP allocation at `80%` of the `20,833.33 ns/sample` period (`2,666.67 µs` per `128`-sample block), reserving `20%` margin for ALSA/DMA interrupts, inter-core graph synchronization, and OS scheduling jitter.
+1. **Microarchitectural Scaling ($\alpha_{\text{uarch}}(t)$):** Scales desktop wide-issue Apple Silicon NEON timings (`~3.8 GHz`, `4× 128-bit` pipes) to a single **Cortex-A76 @ `2.4 GHz`** (`2× 128-bit` NEON FMA pipes, `19.2 GFLOP/s` peak/core), keeping hot state inside `64 KiB` L1D via stereo `4×4` weight-tile reuse and stack scratch eviction.
+2. **Amortized LV2 Host Dispatch ($T_{\text{LV2-block}} / B \approx 50\text{–}120\text{ ns/frame}$):** Accounts for `LV2_Descriptor::run()`, nested `FtzDazGuard` check (`cur_fpcr != self.prev_fpcr` eliminates redundant flushes), `LV2_Atom_Sequence` automation, and port buffer routing.
+3. **L1D Residency at `N × HotBytes <= 64 KiB` ($\kappa_{\text{cache}} \approx 1.05\text{–}1.15$):** Keeping all `14× Lite` (`~62 KiB`), `8× Full` (`~58 KiB`), `4× Pro` (`~39 KiB`), and `2× Ultra` (`~52 KiB`) hot weights & states resident inside Cortex-A76's `64 KiB` L1D avoids L2/L3 cache-spill jitter spikes.
+4. **Real-Time Scheduling Headroom ($\eta_{\text{RT}} = 0.80$):** Caps usable DSP allocation at `80%` (`16,667 ns/sample`), reserving `20%` margin for ALSA/DMA interrupts and OS jitter.
 
-| Tier Profile | Desktop NEON (`t_bench`) | Est. RK3582 `1× A76` + LV2 (`t_A76+LV2`) | Est. `1× Cortex-A76` CPU / Instance | Est. Safe Instances (`1× A76` @ 80% RT Cap) | Est. Safe Instances (`2× A76` Audio Cores) | Normative Floor (`REQ-6.1` on `1× A76`) |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`Lite` (`64-D, C=4, K=4, M=4`)** | `161.59 ns` (`0.78%`) | `~550–780 ns` | **`2.6% – 3.7%`** | **`21 – 30×`** | `42 – 60×` | **`≥ 10×`** (`≤ 2,083 ns`) |
-| **`Full` (`128-D, C=8, K=8, M=8`)** | `189.30 ns` (`0.91%`) | `~880–1,220 ns` | **`4.2% – 5.9%`** | **`13 – 19×`** | `26 – 38×` | **`≥ 6×`** (`≤ 3,472 ns`) |
-| **`Pro` (`192-D, C=12, K=16, M=8`)** | `215.07 ns` (`1.03%`) | `~1,420–1,980 ns` | **`6.8% – 9.5%`** | **`8 – 11×`** | `16 – 22×` | **`≥ 2×`** (`≤ 10,416 ns`) |
-| **`Ultra` (`256-D, C=16, K=32, M=16`)** | `257.41 ns` (`1.24%`) | `~2,180–3,050 ns` | **`10.5% – 14.6%`** | **`5 – 7×`** | `10 – 14×` | Workstation / `4×` Bounce |
+| Tier Profile | Measured Desktop NEON (`t_bench` / Gate) | `N × HotBytes` vs `64 KiB` L1D | Est. RK3582 `1× A76` + LV2 | Normative Serial Core Budget (`1× A76` @ 80% RT Cap) | Safe Serial (`2× A76` Cores) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **`Lite` (`[1,1,1]` @ `1×`, `16` FIR, `4` Kautz, `4` FDN)** | **`158.64 ns`** (`≤ 220 ns`) | `14 × ~4.5 KiB ≈` **`62 KiB`** (`Arena ≤ 4,608 B`) | `~540–890 ns` (`2.6–4.3%`) | **`≥ 14×`** (`≤ 1,190 ns/sample`) | **`≥ 28×`** |
+| **`Full` (`[2,1,1]` @ `1×`, `32` FIR, `8` Kautz, `8` FDN)** | **`196.97 ns`** (`≤ 300 ns`) | `8 × ~7.2 KiB ≈` **`58 KiB`** (`Arena ≤ 10,240 B`) | `~850–1,350 ns` (`4.1–6.5%`) | **`≥ 8×`** (`≤ 2,083 ns/sample`) | **`≥ 16×`** |
+| **`Pro` (`[2,2,1]` @ `2×`, `48` FIR, `12` Kautz, `8` FDN)** | **`452.70 ns`** (`≤ 500 ns`) | `4 × ~9.8 KiB ≈` **`39 KiB`** (`Arena ≤ 18,432 B`) | `~1,850–2,850 ns` (`8.9–13.7%`) | **`≥ 4×`** (`≤ 4,166 ns/sample`) | **`≥ 8×`** |
+| **`Ultra` (`[3,2,1]` @ `2×`, `64` FIR, `16` Kautz, `16` FDN)** | **`531.14 ns`** (`≤ 700 ns`) | `2 × ~26 KiB ≈` **`52 KiB`** (`Arena ≤ 28,672 B`) | `~2,400–3,700 ns` (`11.5–17.8%`) | **`≥ 2×`** (`≤ 8,333 ns/sample`) + Desktop / `4×` Bounce | **`≥ 4×`** |
 
 **Prior-Art Equivalent-Quality LV2 Instance Comparison on `1× RK3582 Cortex-A76` (`2.4 GHz`, `48 kHz` + LV2 @ `80%` RT Cap):**
 
-When comparing plugin instance budgets on an embedded Linux LV2 host (such as Darkglass Anagram / MOD / Elk on Rockchip RK3582), **LV2 plugin and host-graph overhead** compounds across three distinct mechanisms:
-
-1. **Per-Instance LV2 Wrapper & Port Dispatch (`T_LV2-block / B ≈ 50–150 ns/sample`):** Every active LV2 plugin instance executes `LV2_Descriptor::run()`, parses `LV2_Atom_Sequence` / control ports, applies input/output gain-trim smoothing, and routes host audio port buffers on every `64–128` sample block.
-2. **Dual-Instance Penalty for Stereo (`2×` LV2 Instances):** Because `NAM A2`, `GuitarML Proteus`, and `NAM ParametricOD` are mono (`1 → 1`) architectures, processing a stereo bus or dual-channel path requires instantiating **two separate LV2 plugins**—doubling LV2 host dispatch, port buffer copies, and per-instance L1D/L2 state RAM (`2 × 203.1 KB = 406.2 KB` for stereo `NAM A2 Standard`, consuming `> 79%` of the core's `512 KB` L2 cache for a single stereo pair). By contrast, `DNAM` executes true stereo (`2 → 2`) inside **one LV2 instance** with a shared `3 kHz` control plane and shared Kautz cabinet poles.
-3. **Multi-Plugin Chain Penalty for Full Rigs (`4–6×` LV2 Instances vs. `1×` Unified `.dnam` LV2):** Modeling a complete stereo rig (`Drive → Amp → Cab IR → Stereo Delay/Reverb`) with mono amp-only plugins or discrete factory "grey-box" DSP blocks requires chaining **4 to 7 separate plugin blocks** (`4–7×` `run()` calls, per-block oversampling filter stages, intermediate host buffer reads/writes, and L1I/L1D instruction/data cache eviction across distinct `.so` binaries), whereas `DNAM` models the entire multi-stage hardware rig—or distills an offline SPICE/WDF solver and multi-plugin studio chain—in **a single LV2 plugin instance** (`1×` LV2 dispatch; see [`../../adr/0002-tri-operator-recurrent-architecture.md` §1.1](../../adr/0002-tri-operator-recurrent-architecture.md#11-why-tora-outperforms-grey-box-multi-fx-approximations--enables-offline-spice-distillation)).
+When comparing plugin instance budgets on an embedded Linux LV2 host (such as Darkglass Anagram / MOD / Elk on Rockchip RK3582), **LV2 plugin and host-graph overhead** compounds across per-block dispatch (`T_LV2-block / B`), dual mono-to-stereo duplication (`2×` instances consume `406.2 KB` in stereo `NAM A2 Standard`), and multi-block `4–7×` full-rig chaining, whereas `DNAM` executes a complete true-stereo hardware rig in **one unified LV2 instance**:
 
 | Architecture & Equivalent Quality Tier | Native LV2 Topology | Per-Instance Compute, Cache & LV2 Overhead on `Cortex-A76` (`64 KB` L1D / `512 KB` L2) | Est. `1× A76` CPU / LV2 Instance | Est. Safe Mono LV2 Instances (`1× A76` @ 80% Cap) | Est. Safe Stereo LV2 Chains (`1× A76` @ 80% Cap) | Est. Complete Stereo Rigs (`Drive+Amp+Cab+FX` on `1× A76`) |
 | :--- | :---: | :--- | :---: | :---: | :---: | :---: |
@@ -342,8 +326,8 @@ When comparing plugin instance budgets on an embedded Linux LV2 host (such as Da
 | **`NAM A2 Lite / Feather` (Live Grade)** | Mono LV2 (`2×` LV2s for stereo) | `~1,871` MACs at `75%` NEON utilization (`C = 3` unaligned loops) + `76.2 KB` state (`> 64 KB` L1D) + LV2 port/trim wrapper overhead | `6.5% – 9.0%` (mono)<br/>`13.0% – 18.0%` (stereo pair) | `8 – 12×` mono LV2s | `4 – 6×` stereo pairs (`8–12` LV2s) | `3 – 4×` full rigs (`4–6` chained LV2s each) |
 | **`GuitarML Proteus` (`LSTM-40`, 1–2 Knobs)** | Mono LV2 (`2×` LV2s for stereo) | `~6,560–7,040` serial recurrent MACs + `160×` `sigmoid`/`tanh` `libm` calls/sample + `48 kHz` LV2 knob port smoothing (`+40·P` MACs static) + LV2 dispatch | `12.0% – 17.0%` (mono)<br/>`24.0% – 34.0%` (stereo pair) | `4 – 6×` mono LV2s | `2 – 3×` stereo pairs (`4–6` LV2s) | `2 – 3×` full rigs (`4–6` chained LV2s each) |
 | **`NAM ParametricOD` (3-Knob WaveNet/LSTM)** | Mono LV2 (`2×` LV2s for stereo) | Dilated conv / LSTM stack + `48 kHz` per-sample `FiLM` knob projections (`+2·C·P` MACs/layer when static) + `tanh` + LV2 control port smoothing | `18.0% – 25.0%` (mono)<br/>`36.0% – 50.0%` (stereo pair) | `3 – 4×` mono LV2s | `1 – 2×` stereo pairs (`2–4` LV2s) | `1 – 2×` full rigs (`4–6` chained LV2s each) |
-| **`DNAM Full` (True Studio Quality)** | **True Stereo LV2 (`1×` unified LV2)** | **Commuted 4-lane SIMD (`100%` NEON), L1D-resident core state, `0` static control MACs (`3 kHz` bus), `0` `FDIV`/`FSQRT`/`libm`, `1×` LV2 dispatch for full rig** | **`4.2% – 5.9%` (true stereo)** | **`13 – 19×` LV2s** | **`13 – 19×` true-stereo LV2s** | **`13 – 19×` complete stereo rigs (`1` LV2 each)** |
-| **`DNAM Lite` (Live / Pedalboard Grade)** | **True Stereo LV2 (`1×` unified LV2)** | **`64-D` commuted 4-lane SIMD (`100%` NEON), `192 B` Stage III state, `0` static control MACs, `0` `FDIV`/`FSQRT`/`libm`, `1×` LV2 dispatch for full rig** | **`2.6% – 3.7%` (true stereo)** | **`21 – 30×` LV2s** | **`21 – 30×` true-stereo LV2s** | **`21 – 30×` complete stereo rigs (`1` LV2 each)** |
+| **`DNAM Full` (True Studio Quality)** | **True Stereo LV2 (`1×` unified LV2)** | **`[2,1,1]` `16`-ch `GRU` @ `1×`, `32` FIR + `8` Kautz + `8`-line FDN, L1D-resident across `8×` serial chains, `0` static control MACs, `0` `FDIV`/`FSQRT`/`libm`** | **`4.1% – 6.5%` (true stereo)** | **`8+` LV2s (`12–19×` est.)** | **`8+` true-stereo LV2s (`12–19×` est.)** | **`8+` complete stereo rigs (`1` LV2 each)** |
+| **`DNAM Lite` (Live / Pedalboard Grade)** | **True Stereo LV2 (`1×` unified LV2)** | **`[1,1,1]` `12`-ch `GRU` @ `1×`, `16` FIR + `4` Kautz + `4`-line FDN, L1D-resident across `14×` serial chains, `0` static control MACs, `0` `FDIV`/`FSQRT`/`libm`** | **`2.6% – 4.3%` (true stereo)** | **`14+` LV2s (`18–29×` est.)** | **`14+` true-stereo LV2s (`18–29×` est.)** | **`14+` complete stereo rigs (`1` LV2 each)** |
 
 ### 2.3 State RAM Audit: Lite Budget
 
@@ -352,16 +336,18 @@ When comparing plugin instance budgets on an embedded Linux LV2 host (such as Da
 | Raw State Component | `Lite` | `Full` | `Pro` | `Ultra` |
 | :--- | :---: | :---: | :---: | :---: |
 | **Stage III L/R FIR Histories (`f32`)** | `128 B` | `256 B` | `384 B` | `512 B` |
-| **Stage III L/R Complex Modal States (`f32`)** | `64 B` | `128 B` | `256 B` | `512 B` |
-| **Stage III Array Subtotal** | `192 B` | `384 B` | `640 B` | `1,024 B` |
+| **Stage III L/R Complex Modal States (`f32`)** | `64 B` | `128 B` | `192 B` | `256 B` |
+| **Stage III Array Subtotal** | `192 B` | `384 B` | `576 B` | `768 B` |
+| **Stage II `GRU` Hidden State (`12..24` ch L+R `f32`)** | `96 B` | `128 B` | `160 B` | `192 B` |
+| **Transient Kernel Scratch (`V3KernelScratch`)** | Stack (`0 B`/inst) | Stack (`0 B`/inst) | Stack (`0 B`/inst) | Stack (`0 B`/inst) |
 | **Static-Control Sufficient-Statistic Accumulator** | `64 B` | `64 B` | `64 B` | `128 B` |
-| **Stage I / IV Delay Ring Histories (`fp16`)** | Model-declared (admitted against host ceiling on cold path) | Model-declared | Model-declared | Model-declared |
+| **Stage I / IV Delay Ring Histories (`fp16`)** | Model-declared | Model-declared | Model-declared | Model-declared |
 
 ### 2.4 Computational Efficiency & Verification
 
 `r[arch.tiers.efficiency]`
 
-Both Stage III channel histories and modal states advance on every sample across all I/O topologies. Mono (`1 → 1`, `2 → 1`) output topologies evaluate only Slice 0 (`Mid`) of the Kronecker output head while retaining stereo-derived internal stage features. All inline and cold-allocated state is admitted against the host memory ceiling before activation with zero real-time heap allocation.
+All five DSP stages (`Stage 0`, `Stage I`, `Stage II`, `Stage III`, `Stage IV`) execute unconditionally on every stereo sample (`0` stage-bypass flags), with transient kernel scratch allocated on the audio callback stack (`0 B` per instance). Mono (`1 → 1`, `2 → 1`) output topologies emit the phase-coherent Mid readout while retaining dual-channel internal stage histories. All inline and cold-allocated state is admitted against the host memory ceiling before activation with zero real-time heap allocation.
 
 ---
 
@@ -395,18 +381,17 @@ flowchart TD
     S1 --> DownRouter
 
     DownRouter -->|"LR4 low: clean bypass"| S3
-    DownRouter -->|"LR4 high: drive path"| S2["Stage II: 3-Stage Amp Cascade<br/>(V1A Preamp -> V1B -> Power Amp)"]
-    S2 --> S3["Stage III: Cabinet & Modals<br/>(64-Tap SIMD FIR + Kautz Bank)"]
-    S3 --> S4["Stage IV: Unitary Spatial Tank<br/>(In-Buffer AP + Barberpole FDN)"]
+    DownRouter -->|"LR4 high: drive path"| S2["Stage II: Zero-DC Matryoshka GRU + Tone TPT-SVF<br/>(Lite/Full 1x, Pro/Ultra 2x)"]
+    S2 --> S3["Stage III: Cabinet & Modals<br/>(16/32/48/64 FIR + 4/8/12/16 Kautz Pairs)"]
+    S3 --> S4["Stage IV: Unitary Spatial Tank<br/>(4/8/8/16-Line fp16 FDN + Taps)"]
 
-    DownBus --> DownRouter & S2 & S3 & S4
+    DownBus --> DownRouter & S1 & S2 & S3 & S4
     SendBus --> PreRouter & S1
 
-    S1 & S2 & S3 & S4 --> Phi["Unified 256-D Feature Bus Phi[n]"]
-    Phi --> Head["256-D SVD Kronecker Head<br/>(Canonical Mid/Side Slices 0 & 1)"]
-    DownBus --> Head
-    Head --> Out2["Port Out 2: Main L / WDW wet L"]
-    Head --> Out3["Port Out 3: Main R / WDW wet R"]
+    S1 & S2 & S3 & S4 --> DirectReg["Direct SIMD Register Readouts<br/>(pre_cab + direct VarPro + Calibrated Trim)"]
+    DownBus --> DirectReg
+    DirectReg --> Out2["Port Out 2: Main L / WDW wet L"]
+    DirectReg --> Out3["Port Out 3: Main R / WDW wet R"]
 ```
 
 ---
@@ -539,7 +524,7 @@ flowchart TD
 `r[arch.families.f1-bistables]`
 
 - **Analog Archetypes:** Boss OC-2, Mu-Tron Octave Divider, Schumann PLL (CMOS 4013 dual D-flip-flops generating $f_0/2, f_0/4$ sub-octaves and 4046 VCO PLL tracking).
-- **TORA Realization (`Stage I` `Op-M[Pre]` + `Op-N[Pre]`):** Applies the tracker-only `5 Hz` `T1` DC blocker, scaled exponent-split envelope normalization, independent `prev_i_nonpositive` axis-crossing detection, smooth half-angle quadratures (`cos`, `sin`), and divider square features (`f/2`, `f/4`) routed into `Lite` feature bus slots `4..11` ([`op_m_modal_kautz.md` §3](../dsp/op_m_modal_kautz.md#3-family-1-sub-harmonic-synthesizers-bistable-dividers--pll-tracking), [router §7](../dsp/router_and_stages_topology.md#7-unified-256-d-4-tier-kronecker-output-head)).
+- **TORA Realization (`Stage I` `Op-M[Pre]` + `Op-N[Pre]`):** Applies the tracker-only `5 Hz` `T1` DC blocker, scaled exponent-split envelope normalization, independent `prev_i_nonpositive` axis-crossing detection, smooth half-angle quadratures (`cos`, `sin`), and divider square features (`f/2`, `f/4`) routed into the direct-register Stage I readout ([`op_m_modal_kautz.md` §3](../dsp/op_m_modal_kautz.md#3-family-1-sub-harmonic-synthesizers-bistable-dividers--pll-tracking), [router §7](../dsp/router_and_stages_topology.md#7-unified-256-d-4-tier-kronecker-output-head)).
 
 ### 4.2 Family 2: Audio-Rate Carrier Modulation & Hilbert SSB
 
@@ -593,23 +578,23 @@ TORA establishes five end-to-end capture–engine isomorphism and pipeline guara
 
 | Guarantee ID | Subsystem Scope | TORA Architectural Realization |
 | :--- | :--- | :--- |
-| **1. Direct Commuted Stage Serialization (§5.1)** | Stage II (`stages/stage2.rs` / `op_n.rs`) | Directly serializes fitted `W_stage^(2.1..2.3)` matrices into `Arena 0..3` using identical project-then-filter ordering in training and runtime. |
-| **2. Joint Full-Rig Training (§5.2)** | 5-Stage `VarPro` Pipeline (`packages/capture/src/solver.rs`) | Identifies rational poles and delays (`Stage A`), harvests the exact `256-D` feature bus (`Stage B`), and solves all 4 nested tiers via Schur-complement `MM-Cholesky` (`Stage C`). |
+| **1. Direct Stage Serialization (§5.1)** | Stage I/II (`stages/stage1_svf`, `stage2_gru`) | Directly serializes fitted Stage I `Env-SVF` & Stage II Zero-DC Matryoshka `GRU` (`[1,1,1]..[3,2,1]`, `FiLM`, `TPT-SVF`) weights into `Arena 0..3`. |
+| **2. Joint Full-Rig Training (§5.2)** | `VarPro` + Windowed-BPTT (`packages/capture/src/solver/`) | Extracts rational physics (`Stage A`), trains 4-tier Matryoshka `GRU` via parallel Windowed-BPTT (`Stage B`, `< 6 s/chain`), solves `VarPro` readouts (`Stage C`), fits multi-knob `FiLM + CP1` (`Stage D`), and audits (`Stage E`). |
 | **3. End-to-End 3-Phase Audit Wiring (§5.3)** | Audit Engine (`packages/capture/src/audit.rs`) | Wires pre-flight calibration, physical variance gates, non-stop 3-phase clamping, and `[STAB-ZERO-DC]` export certification into the training pipeline. |
 | **4. True-Stereo Calibration & 8-Port Routing (§5.4)** | Stem Extractor & Router | Preserves 2-channel stem arrays `X ∈ R^(N×2)` (`[Left, Right]` or `[Main, Aux]`) with causal parallel alignment and return-to-send isolation. |
-| **5. Nested 4-Tier Physical Hierarchy (§5.5)** | Feature Bus & Arenas (`Arena 0..3`, `stages/head.rs`) | Extracts four nested physical feature definitions (`64 / 128 / 192 / 256 D`) and stores `uplo='U'` sufficient statistics and compact capsules in `.dnam-proj`. |
+| **5. Nested 4-Tier Physical Hierarchy (§5.5)** | Direct-Register Hierarchy (`Arena 0..3`) | Evaluates nested `1x`/`2x` `GRU`, FIR (`16..64`), and Kautz (`4..16`) capacity (`<= 4,608..28,672 B`) alongside `uplo='U'` `STAT` statistics and `2.0–2.5 s` `fp32` capsules in `.dnam-proj`. |
 
 ### 5.1 Direct Stage II Commuted Cascade Serialization & Runtime Parity
 
 `r[arch.isomorphism.stage2-serialization]`
 
-Stage II serializes the fitted commuted projection matrices $\mathbf{W}_{\mathrm{stage}}^{(2.1..2.3)}$ directly into `Arena 0..3` and models the runtime's project-then-filter ordering under control automation ([`../training/four_stage_pipeline.md` §4.1](../training/four_stage_pipeline.md#41-zero-ulp-engine-capture-isomorphism-parity)).
+Stage II serializes the fitted Zero-DC Matryoshka `GRU`, `3 kHz` `FiLM` + $b_n$ shift tables, inter-block `TPT-SVF` coefficients, and ZOH `1x`/`2x` calibration parameters directly into `Arena 0..3` using identical `NR2` Padé evaluations in training and runtime ([`../training/four_stage_pipeline.md` §4.1](../training/four_stage_pipeline.md#41-zero-ulp-engine-capture-isomorphism-parity)).
 
 ### 5.2 Joint Stage I–IV Full-Rig Training via Two-Sweep Block-Coordinate Cholesky
 
 `r[arch.isomorphism.two-sweep]`
 
-The **Five-Stage Analytical Variable-Projection & Cholesky Pipeline** ([`../training/four_stage_pipeline.md`](../training/four_stage_pipeline.md)) identifies upstream rational poles and delays (`Stage A`), harvests the `256-D` feature bus (`Stage B`), and solves the joint 4-tier Mid/Side Kronecker head across all 4 stages via Schur-complement `MM-Cholesky` (`Stage C`), enabling single-run full-rig training (`REQ-1.5`).
+The **Analytical Variable-Projection, Windowed-BPTT & Cholesky Pipeline** ([`../training/four_stage_pipeline.md`](../training/four_stage_pipeline.md)) identifies upstream probes (`Stage A`), jointly fits the 4-tier Matryoshka `GRU` backbone + `2.0–2.5 s` `fp32` capsules (`Stage B`), and solves the direct-register `VarPro` linear readouts + multi-knob `FiLM` / `CP1` (`Stages C–E`), enabling single-run full-rig training (`REQ-1.5`).
 
 ### 5.3 Step-0 System-ID & Non-Stop 3-Phase Audit Wiring in `fit_job`
 
@@ -627,7 +612,7 @@ Stem extraction preserves 2-channel audio arrays $\mathbf{X} \in \mathbb{R}^{N \
 
 `r[arch.isomorphism.nested-bus]`
 
-TORA builds a nested 4-tier physical hierarchy matching `REQ-5`: `Lite` ($64\text{ D}$), `Full` ($128\text{ D}$), `Pro` ($192\text{ D}$), and `Ultra` ($256\text{ D}$), with embedded runtime weights (`WGHT`) and tier-ordered `uplo='U'` sufficient statistics (`STAT`) in `.dnam-proj` ([`../containers/project_container_format.md` §2.3](../containers/project_container_format.md#23-tier-ordered-upper-triangular-starcenter-statistics-stat)).
+TORA builds a nested 4-tier hierarchy matching `REQ-5` (`Lite` `[1,1,1] @ 1x`, `Full` `[2,1,1] @ 1x`, `Pro` `[2,2,1] @ 2x`, `Ultra` `[3,2,1] @ 2x`), persisting embedded runtime weights (`WGHT`), cached `StarCenter` trajectories, and tier-ordered `uplo='U'` sufficient statistics (`STAT`) inside `.dnam-proj` ([`../containers/project_container_format.md` §2.3](../containers/project_container_format.md#23-tier-ordered-upper-triangular-starcenter-statistics-stat)).
 
 ---
 
@@ -639,7 +624,7 @@ TORA builds a nested 4-tier physical hierarchy matching `REQ-5`: `Lite` ($64\tex
 | :- | :--- | :--- | :--- |
 | **1** | **Partitioned Schroeder All-Pass Buffer Segmentation** | Stage IV `Op-T[Tank]` | Non-overlapping `[0..L_main-1 ∣ L_main..L_main+L_ap-1]` segments with independent logical wrap ([Op-T §1 & §3](../dsp/op_t_transport.md#11-exact-sized-delay-histories-and-branchless-wrap)). |
 | **2** | **Strictly Causal Stage II Delays & Early FIR Fitting** | Stage II & Stage III | Causal offsets (`d ≥ 0`) in Stage II and Stage III early FIR taps ([Op-N §3.2](../dsp/op_n_commuted_cascade.md#32-causality-audit--elimination-of-acausal-lookahead)). |
-| **3** | **4-Filter Tone Stack Basis (`Direct + 2 LPF + 1 HPF`)** | Sub-Stage 2.1 | Adds matched-pole `HPF_1200` alongside `Direct`, `LPF_80`, and `LPF_400` ([Op-N §4.1](../dsp/op_n_commuted_cascade.md#41-four-filter-tone-basis-refinement-3)). |
+| **3** | **Inter-Block 3-Band `TPT-SVF` Tone Stack Basis** | Stage II | `3 kHz`-decimated trapezoidal SVF splitting low/mid/high energy between Matryoshka `GRU` blocks ([Op-N §4.1](../dsp/op_n_commuted_cascade.md#41-four-filter-tone-basis-refinement-3)). |
 | **4** | **Two-Step Warped Laguerre/Kautz Modal Pole Extraction** | Stage III Trainer | Log-spaced initial eigenmodes (`40–4500 Hz`) with shared poles and independent L/R readouts ([`op_m_modal_kautz.md` §4.4](../dsp/op_m_modal_kautz.md#44-two-step-warped-laguerrekautz-modal-pole-extraction-refinement-4)). |
 | **5** | **Slew-Rate Bounded Givens Rotation in Stage IV** | Stage IV `U(ψ, v)` | Bounds stereo rotation velocity to `∣Δψ∣ ≤ 0.05 rad/control tick` (`150 rad/s` at `3 kHz`). |
 | **6** | **Topological Order Descriptors (`stage1_topology`)** | Stage I `Arena 0` | 4-bit bitfield selecting among the 4 canonical `Op-T`/`Op-M`/`Op-N` pre-chain permutations without buffer contention. |
@@ -647,13 +632,13 @@ TORA builds a nested 4-tier physical hierarchy matching `REQ-5`: `Lite` ($64\tex
 | **8** | **Stage I Sub-Harmonic DC Conditioning (`T1`)** | Family 1 → Stage I | Dedicated `5 Hz` TPT DC blocker before the analytic tracker pair ([`op_m_modal_kautz.md` §3](../dsp/op_m_modal_kautz.md#3-family-1-sub-harmonic-synthesizers-bistable-dividers--pll-tracking)). |
 | **9** | **1-Pole Ballistic Slew Limiter on Sidechain Ducking Gains** | Family 4 Sidechain | `τ_attack ≥ 0.5 ms`, `τ_release ≥ 20.0 ms` eliminates zipper noise and transient chatter. |
 | **10** | **Radial-Polar Rotor Contraction during Formant Sweeps** | Stage III Kautz | Dynamic sweep contraction `r_eff,m = min(r_m, max(0.25, 0.9950 - 0.15|Δθ_m|))` ([`op_m_modal_kautz.md` §4.3](../dsp/op_m_modal_kautz.md#43-dynamic-sweep-contraction-rule-refinement-10)). |
-| **11** | **Block-Diagonal Lower-Triangular Kronecker Head Staging** | Output Head | Nested tier blocks with precomputed `tier_gain_trim_lin` loudness matching. |
-| **12** | **Projected LTI Filtering `L(u[n] W[k])`** | Stage II Cascade | Projects the nonlinear basis by `W_k[n]` before stepping the tone-stack filters. |
+| **11** | **Lower-Triangular Direct-Register `VarPro` Readouts** | Stage II/III Readout | Nested tier readouts with precomputed `tier_gain_trim_lin` loudness matching. |
+| **12** | **In-Register `NR2` Rational Padé & Zero-DC `b_n`** | Stage II `GRU` | Division-free `SimdVec4::rcp_ge1_nr2` Padé `tanh`/`sigmoid` with exact `h_eq = 0` rest equilibrium. |
 | **13** | **Normalized Coupled-Form State-Space for Kautz Modals** | Stage III `Op-M[Modal]` | Coupled-form recurrence with forced-state bound `‖x[n]‖ ≤ r_max ‖x[n-1]‖ + ‖b_m‖ |u[n]|` ([`op_m_modal_kautz.md` §4.2](../dsp/op_m_modal_kautz.md#42-normalized-coupled-form-state-space-refinement-13)). |
-| **14** | **Input Headroom Normalization & Denormal-Tail Handling** | Stage IV `Op-T[Tank]` | `-12 dB` tank input attenuation for `fp16` headroom plus `FtzDazGuard` denormal immunity ([audio-block policy](#floating-point-environment-at-the-audio-callback)). |
+| **14** | **Input Headroom Normalization & Denormal-Tail Handling** | Stage IV `Op-T[Tank]` | `-12 dB` tank input attenuation for `fp16` headroom plus guarded `FtzDazGuard` denormal immunity ([audio-block policy](#floating-point-environment-at-the-audio-callback)). |
 | **15** | **Per-Head Causal Floor Margin `τ_m ≥ 4.0` Samples** | `Op-T` Multi-Tap Reader | Enforces `τ_m[n] = max(4.0, τ_raw,m[n])` independently per granular/barberpole read head. |
 | **16** | **Return-to-Send Router Isolation** | Stage 0 8-Port Router | Enforces `S_{ret->send} == 0` and isolates send-path detectors/controls from returns. |
-| **17** | **Parallel-Path Sub-Sample Alignment** | Stage 0 Router | `FullBand64Tap` (default/bounce), `Live16Tap`, and `IntegerDelayOnly` alignment modes ([router §1](../dsp/router_and_stages_topology.md#parallel-path-sub-sample-alignment)). |
+| **17** | **Parallel-Path Sub-Sample Alignment** | Stage 0 Router | `FullBand64Tap` (default/bounce), `LowLatency16Tap`, and `MinLatency4Tap` alignment modes ([router §1](../dsp/router_and_stages_topology.md#parallel-path-sub-sample-alignment)). |
 | **18** | **Unified Self-Similar Dual-Rate Control Plane (`Op-M[Ctrl]` / `Op-N[Ctrl]`)** | Control Plane | Executes `3 kHz` control via 4-lane SIMD instances of `Op-M` and `Op-N`. |
 | **19** | **Dual-Space Factored Control & `CP1` Additive Latent Scaling** | Parameter Bus | Shared descriptors + packed tier-local `CP1` `f32` projections (`8-D` Rank-4 base + `16-D` Rank-8 `Ultra`) with exact-integer sufficient statistics ([`../dsp/parametric_control_bus.md` §2.3](../dsp/parametric_control_bus.md#23-o1-additive-latent-sufficient-statistic-control-scaling)). |
 
@@ -665,16 +650,17 @@ TORA builds a nested 4-tier physical hierarchy matching `REQ-5`: `Lite` ($64\tex
 
 | Goal ID | Requirement Domain | TORA Architectural Realization | Canonical Specifications |
 | :--- | :--- | :--- | :--- |
-| **`REQ-1`** | **Model Classes & Accuracy** | `Op-T`, `Op-M`, and `Op-N` across Stages 0–IV and the 256-D Mid/Side Kronecker head. | [`op_t_transport.md`](../dsp/op_t_transport.md), [`op_m_modal_kautz.md`](../dsp/op_m_modal_kautz.md), [`op_n_commuted_cascade.md`](../dsp/op_n_commuted_cascade.md) |
-| **`REQ-1.5`** | **Full-Rig Multi-Control Modeling** | Packed tier-local `CP1` projections (`8-D` Rank-4 in `Lite..Pro`, `16-D` Rank-8 + `16×4` stage-dispatch delta in `Ultra`). | [`parametric_control_bus.md`](../dsp/parametric_control_bus.md), [`four_stage_pipeline.md`](../training/four_stage_pipeline.md) |
+| **`REQ-1`** | **Model Classes & Accuracy** | `Op-T`, `Op-M`, and `Op-N` across Stages 0–IV (`Env-SVF`, Matryoshka `GRU`, Kautz, `fp16` FDN) with direct-register `VarPro` readouts. | [`op_t_transport.md`](../dsp/op_t_transport.md), [`op_m_modal_kautz.md`](../dsp/op_m_modal_kautz.md), [`op_n_commuted_cascade.md`](../dsp/op_n_commuted_cascade.md) |
+| **`REQ-1.5`** | **Full-Rig Multi-Control Modeling** | Packed tier-local `CP1` projections (`8-D` Rank-4 in `Lite..Pro`, `16-D` Rank-8 + `16×4` stage-dispatch delta in `Ultra`) + `3 kHz` `FiLM` / Zero-DC / `TPT-SVF`. | [`parametric_control_bus.md`](../dsp/parametric_control_bus.md), [`four_stage_pipeline.md`](../training/four_stage_pipeline.md) |
+| **`REQ-1.9`** | **Universal Black-Box Runtime & Solver** | Fixed unconditional mathematical basis parameterized strictly by learned weights/coefficients (`ref[arch.pillars.universal-black-box]`, `ref[repo.code.universal-black-box]`), zero white-box circuit sub-topologies, zero stage-bypass flags, and 100% data-driven identification. | [`tora_architecture.md` §1.1](#11-four-foundational-pillars-of-tora), [`project_and_documentation_quality.md` §1](project_and_documentation_quality.md#1-static-type-safety--package-import-boundaries) |
 | **`REQ-2`** | **Quality, Control Bus & Tempo Sync** | Per-output noise-adjusted `bESR`, `MR-IIR`, 33-band `LTAS`, and duration-weighted `SegESR` with non-stop 3-phase clamping. | [`psychoacoustic_quality_and_tiers.md`](psychoacoustic_quality_and_tiers.md), [`control_space_audit.md`](../training/control_space_audit.md) |
 | **`REQ-2.5`** | **MIDI / Host Tempo Sync** | `20–400 BPM` `Q64`/`Q32` tempo tracking across 12 subdivisions, reachable `f32` physical inversion, and `SmoothRelock` / `ImmediatePhaseLock`. | [`parametric_control_bus.md` §7](../dsp/parametric_control_bus.md#7-host-midi-and-tap-tempo-synchronization-req-25) |
-| **`REQ-3`** | **Capture Vault Editing & Capsule Persistence** | Single-file `.dnam-proj` (`DNPJ`), `INPC`/`STMC` `fp16` coreset capsules, `STAT` `uplo='U'` slices, `HTTP Range` cloud sync, and Two-Path sub-second/full-pool vault editing. | [`iterative_resume_and_caching.md`](../training/iterative_resume_and_caching.md), [`project_container_format.md`](../containers/project_container_format.md) |
-| **`REQ-4`** | **Deterministic Zero-GPU & Low-Memory Training** | Pure-Rust 5-Stage `VarPro` + Schur-complement `MM-Cholesky`, wide-significand Gram bound (`∣ĝ - g∣ ≤ γ_N S`), and `< 64 MiB` worker RAM ceiling. | [`four_stage_pipeline.md` §3](../training/four_stage_pipeline.md#3-wide-significand-gram-contraction--cross-platform-accuracy) |
+| **`REQ-3`** | **Capture Vault Editing & Capsule Persistence** | Single-file `.dnam-proj` (`DNPJ`), `2.0–2.5 s` `fp32` `INPC`/`STMC` capsules, `STAT` `uplo='U'` slices + cached trajectories, `HTTP Range` sync, and Two-Path Vault editing. | [`iterative_resume_and_caching.md`](../training/iterative_resume_and_caching.md), [`project_container_format.md`](../containers/project_container_format.md) |
+| **`REQ-4`** | **Deterministic Zero-GPU & Low-Memory Training** | Pure-Rust Windowed-BPTT + analytical `VarPro` Cholesky, wide-significand Gram bound (`∣ĝ - g∣ ≤ γ_N S`), `< 6 s/chain`, and `< 64 MiB` worker RAM ceiling. | [`four_stage_pipeline.md` §3](../training/four_stage_pipeline.md#3-wide-significand-gram-contraction--cross-platform-accuracy) |
 | **`REQ-5`** | **Multi-Tier Slimmable Scaling** | Four nested tiers (`Lite ⊂ Full ⊂ Pro ⊂ Ultra`), single-run joint training, on-demand bounded tier crossfade, and keyless prefix stripping. | [`tora_architecture.md` §2–§3](#2-4-tier-slimmable-simd-hierarchy-lite--full--pro--ultra), [`dnam_binary_format.md`](../containers/dnam_binary_format.md) |
-| **`REQ-6`** | **Embedded Real-Time Execution** | `≥ 10× Lite`, `≥ 6× Full`, `≥ 2× Pro` @ `48 kHz` on `1×` Cortex-A76, zero real-time `FDIV`/`FSQRT`/`IDIV`/`UDIV`/`SDIV`/`libm`/`fmodf`, zero unbounded loops, and zero callback allocations or nondeterministic syscalls. | [`tora_architecture.md` §1–§2](#1-executive-summary--core-architectural-pillars) |
+| **`REQ-6`** | **Embedded Real-Time Execution** | `≥ 14× Lite`, `≥ 8× Full`, `≥ 4× Pro`, `≥ 2× Ultra` @ `48 kHz` on `1×` Cortex-A76 (`80%` RT cap, all 5 stages unconditional), zero `FDIV`/`FSQRT`/`IDIV`/`UDIV`/`SDIV`/`libm`/`fmodf`, zero unbounded loops, zero allocations or syscalls. | [`tora_architecture.md` §1–§2](#1-executive-summary--core-architectural-pillars) |
 | **`REQ-7`** | **Unclipped `f32` Signal Chain, Topologies & Stability** | `±100.0` (`+40 dBFS`) certified unclipped envelope, `±1e9` all-finite safety guards, `1→1`/`2→1`/`1→2`/`2→2` topologies, and 3-phase control-space clamping (`ref[train.audit.phase1.clamp-stability]`). | [`router_and_stages_topology.md`](../dsp/router_and_stages_topology.md), [`control_space_audit.md`](../training/control_space_audit.md) |
-| **`REQ-8.1`–`REQ-8.8`** | **Provenance, Enclave DRM, Watermarking & Declarative Containers** | RFC 8785 JCS header digest, `DAU1`/`DAI1`/`DSA1` `Ed25519` prefix signatures, RFC 9180 HPKE `EnclaveSealed`, dual-mechanism Tardos/gauge watermark, `.dnam-prev` containment, and 64B-aligned code-execution-free containers. | [`provenance_and_enclave_drm.md`](../security/provenance_and_enclave_drm.md), [`watermarking_and_marketplace.md`](../security/watermarking_and_marketplace.md), [`dnam_binary_format.md`](../containers/dnam_binary_format.md) |
+| **`REQ-8.1`–`REQ-8.8`** | **Provenance, Enclave DRM, Watermarking & Declarative Containers** | RFC 8785 JCS header digest, `DAU1`/`DAI1`/`DSA1` `Ed25519` prefix signatures, RFC 9180 HPKE `EnclaveSealed`, `0-ULP` `GRU` sign-flip + Kautz + Tardos watermark, `.dnam-prev` containment, and 64B-aligned containers. | [`provenance_and_enclave_drm.md`](../security/provenance_and_enclave_drm.md), [`watermarking_and_marketplace.md`](../security/watermarking_and_marketplace.md), [`dnam_binary_format.md`](../containers/dnam_binary_format.md) |
 
 ---
 
@@ -688,12 +674,12 @@ TORA builds a nested 4-tier physical hierarchy matching `REQ-5`: `Lite` ($64\tex
 - **Real-Time DSP Subsystems (`docs/specs/dsp/`)**
   - [`op_t_transport.md`](../dsp/op_t_transport.md): Universal Transport, Windowing & Schroeder Diffusion Operator (`Op-T`).
   - [`op_m_modal_kautz.md`](../dsp/op_m_modal_kautz.md): Universal Symplectic Modal, Hilbert, Sub-Harmonic & Kautz Operator (`Op-M`).
-  - [`op_n_commuted_cascade.md`](../dsp/op_n_commuted_cascade.md): Universal Nonlinear, Hysteretic & Commuted Cascade Operator (`Op-N`).
-  - [`router_and_stages_topology.md`](../dsp/router_and_stages_topology.md): Stage 0 Router, Canonical Stages I–IV & 256-D Output Head.
+  - [`op_n_commuted_cascade.md`](../dsp/op_n_commuted_cascade.md): Stage II Zero-DC Matryoshka `GRU`, Nonlinear, Wavefolder & Bitcrusher Operator (`Op-N`).
+  - [`router_and_stages_topology.md`](../dsp/router_and_stages_topology.md): Stage 0 Router, Direct-Register 5-Stage Topology & ZOH Adaptation.
   - [`parametric_control_bus.md`](../dsp/parametric_control_bus.md): Self-Similar 3 kHz Dual-Rate Control Plane & Modulation Bus.
 - **Training Pipeline & Control Audit (`docs/specs/training/`)**
-  - [`four_stage_pipeline.md`](../training/four_stage_pipeline.md): Two-Sweep Block-Coordinate Cholesky Training Pipeline.
-  - [`iterative_resume_and_caching.md`](../training/iterative_resume_and_caching.md): Dual-Space Factored Control Stem Resume.
+  - [`four_stage_pipeline.md`](../training/four_stage_pipeline.md): TORA `v3` Analytical `VarPro`, Windowed-BPTT & Cholesky Training Pipeline.
+  - [`iterative_resume_and_caching.md`](../training/iterative_resume_and_caching.md): Dual-Space Factored Control Stem Resume & Two-Path Vault.
   - [`control_space_audit.md`](../training/control_space_audit.md): Non-Stop 3-Phase Control-Space Audit Specification.
   - [`capture_and_alignment.md`](../training/capture_and_alignment.md): Hardware Excitation, Multi-Mic Calibration & Router Alignment.
 - **Container Binary Formats (`docs/specs/containers/`)**
@@ -701,6 +687,6 @@ TORA builds a nested 4-tier physical hierarchy matching `REQ-5`: `Lite` ($64\tex
   - [`project_container_format.md`](../containers/project_container_format.md): Single-File Cloud-Ready Project & Capture Vault Container (`.dnam-proj` / `DNPJ`).
 - **Security, Provenance & Marketplace (`docs/specs/security/`)**
   - [`provenance_and_enclave_drm.md`](../security/provenance_and_enclave_drm.md): Ed25519 Signatures, Enclave DRM & Protection Profiles.
-  - [`watermarking_and_marketplace.md`](../security/watermarking_and_marketplace.md): Buyer Watermarking, Structural Fingerprint & Storefront Previews.
+  - [`watermarking_and_marketplace.md`](../security/watermarking_and_marketplace.md): Buyer Watermarking (`GRU` Sign-Flip + Kautz + Tardos), Structural Fingerprint & Storefront Previews.
 - **Architectural Decision Records (`docs/adr/`)**
-  - [`0002-tri-operator-recurrent-architecture.md`](../../adr/0002-tri-operator-recurrent-architecture.md) through [`0020-modular-monorepo-and-dnam-proj-container.md`](../../adr/0020-modular-monorepo-and-dnam-proj-container.md).
+  - [`0002-tri-operator-recurrent-architecture.md`](../../adr/0002-tri-operator-recurrent-architecture.md) through [`0021-unified-matryoshka-gru-and-direct-register-stages.md`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md).

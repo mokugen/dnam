@@ -17,6 +17,7 @@ fn clamp_range_conditional_corners(
     enabled_stems: &[&StemRegistryEntry],
     enabled_windows_by_stem: &BTreeMap<u32, Vec<StmcTrajectoryWindow>>,
     safe_bounds: (f32, f32),
+    default_clamped: f32,
     phase1_tags: &mut BTreeSet<String>,
 ) {
     let (safe_lo, safe_hi) = safe_bounds;
@@ -60,6 +61,9 @@ fn clamp_range_conditional_corners(
             }
         }
         for (cond_key, (c_lo, c_hi)) in by_opt {
+            if (c_hi - c_lo).abs() <= 1.0e-4 && (c_lo - default_clamped).abs() <= 1.0e-4 {
+                continue;
+            }
             if c_lo > safe_lo + 1.0e-4 {
                 ctrl.conditional_min.insert(cond_key.clone(), c_lo);
                 phase1_tags.insert("CLAMP-CORNER".to_string());
@@ -120,6 +124,7 @@ fn audit_range_control(
 
     ctrl.safe_clamped_range = Some([safe_lo, safe_hi]);
     ctrl.lobatto_degree = Some(deg);
+    let default_clamped = default_f32.clamp(safe_lo, safe_hi);
     clamp_range_conditional_corners(
         ctrl,
         ctrl_idx,
@@ -127,6 +132,7 @@ fn audit_range_control(
         enabled_stems,
         enabled_windows_by_stem,
         (safe_lo, safe_hi),
+        default_clamped,
         phase1_tags,
     );
 
@@ -472,5 +478,58 @@ mod tests {
         let rep = m.audit_report.as_ref().unwrap();
         assert!(!rep.phase1_clamps.iter().any(|t| t == "CLAMP-RANGE"));
         assert!(!rep.phase1_clamps.iter().any(|t| t == "CLAMP-SWITCH"));
+    }
+
+    #[test]
+    fn test_phase1_stationary_default_switch_stem_does_not_clamp_range_corners() {
+        let mut m = make_manifest_with_range_and_switch();
+        m.stems_registry = vec![
+            make_stem(
+                1,
+                true,
+                &[
+                    ("gain", serde_json::json!(4.0)),
+                    ("mode", serde_json::json!("crunch")),
+                ],
+            ),
+            make_stem(
+                2,
+                true,
+                &[
+                    ("gain", serde_json::json!(0.0)),
+                    ("mode", serde_json::json!("crunch")),
+                ],
+            ),
+            make_stem(
+                3,
+                true,
+                &[
+                    ("gain", serde_json::json!(10.0)),
+                    ("mode", serde_json::json!("crunch")),
+                ],
+            ),
+            make_stem(
+                4,
+                true,
+                &[
+                    ("gain", serde_json::json!(4.0)),
+                    ("mode", serde_json::json!("lead")),
+                ],
+            ),
+        ];
+        recompute_vault_phase1_audit_and_clamps(&mut m);
+        let range_ctrl = &m.base.controls_schema[0];
+        let switch_ctrl = &m.base.controls_schema[1];
+        assert_eq!(range_ctrl.safe_clamped_range, Some([0.0, 10.0]));
+        assert!(range_ctrl.conditional_min.is_empty());
+        assert!(range_ctrl.conditional_max.is_empty());
+        assert!(
+            switch_ctrl
+                .active_options
+                .as_ref()
+                .is_some_and(|opts| opts.iter().any(|o| o == "lead"))
+        );
+        let rep = m.audit_report.as_ref().unwrap();
+        assert!(!rep.phase1_clamps.iter().any(|t| t == "CLAMP-CORNER"));
     }
 }

@@ -33,19 +33,24 @@ pub use resampler::{
     scale_freeze_window,
 };
 pub use solver::{
-    BuyerWatermarkConfig, SolverOptions, StageAConfig, StageAReport, StageBHarvest,
-    StageCSolveOutput, StageDSolveOutput, StageESolveOutput, Wide192Accum,
-    accumulate_uplo_u_wide192, compute_integrated_lufs, contract_256d_gram_tiled_wide192,
-    derive_buyer_gauge_params, derive_buyer_phase_seed, derive_buyer_tardos_codebook,
-    export_runtime_dnam_watermarked, extract_arena_pole_angles_34, finalize_stage_e_and_telemetry,
-    harvest_star_center_256d, identify_pole_angles_blackbox_from_audio, lift_stage_a_backbone,
-    render_blackbox_probe_response, solve_stage_c_nested_schur_4tier, solve_stage_d_cp1_and_audit,
+    AtomicTrainerProgress, BuyerWatermarkConfig, PROGRESS_MAGIC_DNPR, PROGRESS_WIRE_BYTES,
+    PROGRESS_WIRE_WORDS, SolverOptions, SolverQualityMode, StageAConfig, StageAReport,
+    StageBOutputs, StageBSolveConfig, StageCKnobsOutput, StageDAuditOptions, StageDSolveOutput,
+    TrainerProgressHandle, TrainerProgressSnapshot, TrainingPhase, TrainingStatus, Wide192Accum,
+    accumulate_uplo_u_wide192, canonical_besr_warmup, compute_integrated_lufs,
+    contract_256d_gram_tiled_wide192, derive_buyer_gauge_params, derive_buyer_phase_seed,
+    derive_buyer_tardos_codebook, export_runtime_dnam_watermarked, extract_arena_pole_angles_16,
+    extract_arena_pole_angles_34, finalize_stage_d_and_audit, has_populated_v3_backbone,
+    identify_pole_angles_blackbox_from_audio, render_blackbox_probe_response,
+    run_stage_a_physics_probe, serialize_v3_stat_chunk_ultra, solve_stage_b_backbone,
+    solve_stage_b_backbone_with_progress, solve_stage_c_knobs,
 };
 pub use stimulus::{
     AdaptiveStimulusController, AdaptiveTrainingOptions, AdaptiveTrainingReport, BatchSolveReport,
     BatchStimulusOptions, CaptureWarning, LiveNullTestReport, StimulusConfig, TopologyProbeMode,
     generate_refinement_stimulus_batch, generate_stimulus_batch, recapture_clipped_stem,
-    run_live_null_test_and_autopatch, solve_from_responses, train_adaptive_target,
+    run_live_null_test_and_autopatch, solve_from_responses, solve_from_responses_with_progress,
+    train_adaptive_target, train_adaptive_target_with_progress,
 };
 pub use targets::{
     CaptureBitDepth, DistillationTarget, StemResponse, StemStimulus, StemStimulusBatch,
@@ -58,14 +63,20 @@ use sha2::{Digest, Sha256};
 /// Canonical reference sample rate (`48,000 Hz`) for Two-Sweep / `VarPro` system identification.
 pub const REFERENCE_SAMPLE_RATE_HZ: u32 = 48_000;
 
-/// Canonical `250 ms` `fp16` coreset window length (`12,000` frames at `48 kHz`, `ref[container.proj.stmc-capsule]`).
-pub const CORESET_FP16_FRAMES_PER_STEM: usize = 12_000;
+/// Minimum canonical `2.0 s` `fp32` (`<f4`) coreset length (`96,000` frames at `48 kHz`).
+pub const CORESET_FP32_MIN_FRAMES_PER_STEM: usize = 96_000;
 
-/// Canonical mono (`C = 1`) `fp16` coreset byte size (`12,000 * 1 * 2 B = 24,000 B`, `64 B`-aligned).
-pub const CORESET_FP16_MONO_BYTES: usize = CORESET_FP16_FRAMES_PER_STEM * 2;
+/// Maximum canonical `2.5 s` `fp32` (`<f4`) coreset length (`120,000` frames at `48 kHz`).
+pub const CORESET_FP32_MAX_FRAMES_PER_STEM: usize = 120_000;
 
-/// Canonical stereo (`C = 2`) `fp16` coreset byte size (`12,000 * 2 * 2 B = 48,000 B`, `64 B`-aligned).
-pub const CORESET_FP16_STEREO_BYTES: usize = CORESET_FP16_FRAMES_PER_STEM * 4;
+/// Canonical `2.0 s` full-bandwidth `fp32` coreset window length (`96,000` frames at `48 kHz`, `ref[container.proj.inpc-capsule]`).
+pub const CORESET_FP32_FRAMES_PER_STEM: usize = 96_000;
+
+/// Canonical mono (`C = 1`) `2.0 s` `fp32` coreset byte size (`96,000 * 1 * 4 B = 384,000 B`, `64 B`-aligned).
+pub const CORESET_FP32_MONO_BYTES: usize = CORESET_FP32_FRAMES_PER_STEM * 4;
+
+/// Canonical stereo (`C = 2`) `2.0 s` `fp32` coreset byte size (`96,000 * 2 * 4 B = 768,000 B`, `64 B`-aligned).
+pub const CORESET_FP32_STEREO_BYTES: usize = CORESET_FP32_FRAMES_PER_STEM * 8;
 
 /// Parses a case-insensitive tier identifier (`lite`, `full`, `pro`, `ultra`) into [`Tier`].
 pub fn parse_tier_name(name: &str) -> Result<Tier, String> {

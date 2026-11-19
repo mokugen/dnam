@@ -4,17 +4,17 @@
 //!
 //! Canonical Reference: `docs/specs/architecture/psychoacoustic_quality_and_tiers.md` (`r[qual.*]`).
 
+pub mod bezout;
 pub mod certification;
 pub mod companion;
+pub mod repeatability;
 
+pub use bezout::*;
 pub use certification::*;
 pub use companion::*;
+pub use repeatability::*;
 
 use dnam_engine::Tier;
-use std::f64::consts::PI;
-
-/// Worst-band bound offset $10 \log_{10}(3) \approx 4.771212547\text{ dB}$ (`ref[qual.besr.noise-subtracted]`).
-pub const BESR_WORST_BAND_OFFSET_DB: f64 = 4.771_212_547_196_624;
 
 /// Maximum allowed loudness step between adjacent tiers at `StarCenter`: `0.05 LU` (`ref[qual.tiers.benchmark-matrix]`).
 pub const MAX_TIER_LOUDNESS_STEP_LU: f64 = 0.05;
@@ -164,195 +164,6 @@ pub struct NoiseQualifiedBesrEvaluation {
     pub qualified_besr_db: f64,
     /// Overall tier `bESR` pass (`valid && all band_passes && qualified_besr_lin <= 10^{comp/10}`).
     pub passes: bool,
-}
-
-// ============================================================================
-// 1. Exact Degree-7 Binomial / Bézout Crossover (`r[qual.besr.bezout-crossover]`)
-// ============================================================================
-
-#[inline]
-fn eval_bezout_lowpass_complex(freq_hz: f64, cutoff_hz: f64, sample_rate_hz: f64) -> (f64, f64) {
-    let r = (-2.0 * PI * cutoff_hz / sample_rate_hz).exp();
-    let omega = 2.0 * PI * freq_hz / sample_rate_hz;
-    let (sin_w, cos_w) = omega.sin_cos();
-    // H_1(e^{jw}) = (1 - r) / (1 - r e^{-jw}) = (1 - r) / ((1 - r cos w) + j r sin w)
-    let den_re = 1.0 - r * cos_w;
-    let den_im = r * sin_w;
-    let den_norm = den_re * den_re + den_im * den_im;
-    let num = 1.0 - r;
-    let h_re = num * den_re / den_norm;
-    let h_im = -num * den_im / den_norm;
-
-    let c_mul = |(ar, ai): (f64, f64), (br, bi): (f64, f64)| (ar * br - ai * bi, ar * bi + ai * br);
-    let h2 = c_mul((h_re, h_im), (h_re, h_im));
-    let h4 = c_mul(h2, h2);
-    let h5 = c_mul(h4, (h_re, h_im));
-    let h6 = c_mul(h5, (h_re, h_im));
-    let h7 = c_mul(h6, (h_re, h_im));
-
-    (
-        35.0 * h4.0 - 84.0 * h5.0 + 70.0 * h6.0 - 20.0 * h7.0,
-        35.0 * h4.1 - 84.0 * h5.1 + 70.0 * h6.1 - 20.0 * h7.1,
-    )
-}
-
-/// Evaluates the exact complex frequency responses `[H_LF(e^{jω}), H_MF(e^{jω}), H_HF(e^{jω})]`
-/// of the causal degree-7 Binomial/Bézout crossover $\mathcal{L}_{f_c}(z) = 35 H_1^4 - 84 H_1^5 + 70 H_1^6 - 20 H_1^7$
-/// at `freq_hz` and `sample_rate_hz` (`48 kHz` canonical, satisfying $H_{\text{LF}} + H_{\text{MF}} + H_{\text{HF}} \equiv 1$,
-/// `ref[qual.besr.bezout-crossover]`, `ref[qual.besr.filter-response]`).
-#[must_use]
-pub fn eval_bezout_3band_complex(freq_hz: f64, sample_rate_hz: f64) -> [(f64, f64); 3] {
-    let fs = if (8_000.0..=1_536_000.0).contains(&sample_rate_hz) {
-        sample_rate_hz
-    } else {
-        48_000.0
-    };
-    let f = if freq_hz.is_finite() {
-        freq_hz.abs().clamp(0.0, 0.5 * fs)
-    } else {
-        0.0
-    };
-    let l_250 = eval_bezout_lowpass_complex(f, 250.0, fs);
-    let l_2500 = eval_bezout_lowpass_complex(f, 2_500.0, fs);
-    let h_lf = l_250;
-    let h_mf = (l_2500.0 - l_250.0, l_2500.1 - l_250.1);
-    let h_hf = (1.0 - l_2500.0, -l_2500.1);
-    [h_lf, h_mf, h_hf]
-}
-
-/// Evaluates the real-part coherent partition `[Re(H_LF), Re(H_MF), Re(H_HF)]` (which sums identically to `1.0`
-/// at every frequency) and individual squared gains via [`eval_bezout_3band_complex`] at `48 kHz`.
-#[must_use]
-pub fn eval_bezout_3band_weights(freq_hz: f64) -> [f64; 3] {
-    let [lf, mf, hf] = eval_bezout_3band_complex(freq_hz, 48_000.0);
-    [lf.0, mf.0, hf.0]
-}
-
-#[inline]
-fn step_bezout7_lp(x: f64, r: f64, one_minus_r: f64, u: &mut [f64; 7]) -> f64 {
-    let mut prev = x;
-    for stage in u.iter_mut() {
-        *stage = one_minus_r * prev + r * *stage;
-        prev = *stage;
-    }
-    35.0 * u[3] - 84.0 * u[4] + 70.0 * u[5] - 20.0 * u[6]
-}
-
-/// Splits a finite-timeline signal into 3 exact complementary Binomial/Bézout bands (`LF`, `MF`, `HF`),
-/// stepping zero-initialized filters across the **entire** aligned timeline `0..n_total` before accumulating
-/// energies over `warmup_samples..n_total` (`ref[qual.besr.bezout-crossover]`, `ref[qual.besr.finite-timeline]`).
-///
-/// Returns `None` if inputs are empty, mismatched in length, non-finite, or `warmup_samples >= len`.
-#[must_use]
-pub fn try_split_bezout_3band_energies(
-    target: &[f64],
-    model: &[f64],
-    noise: Option<&[f64]>,
-    sample_rate_hz: f64,
-    warmup_samples: usize,
-) -> Option<([f64; 3], [f64; 3], [f64; 3])> {
-    if !(8_000.0..=1_536_000.0).contains(&sample_rate_hz)
-        || target.is_empty()
-        || target.len() != model.len()
-        || warmup_samples >= target.len()
-        || !target.iter().all(|v| v.is_finite())
-        || !model.iter().all(|v| v.is_finite())
-    {
-        return None;
-    }
-    let n_total = target.len();
-    if let Some(ns) = noise
-        && (ns.len() < n_total || !ns[..n_total].iter().all(|v| v.is_finite()))
-    {
-        return None;
-    }
-
-    let r1 = (-2.0 * PI * 250.0 / sample_rate_hz).exp();
-    let omr1 = 1.0 - r1;
-    let r2 = (-2.0 * PI * 2_500.0 / sample_rate_hz).exp();
-    let omr2 = 1.0 - r2;
-
-    let (mut u1_t, mut u2_t) = ([0.0_f64; 7], [0.0_f64; 7]);
-    let (mut u1_e, mut u2_e) = ([0.0_f64; 7], [0.0_f64; 7]);
-    let (mut u1_n, mut u2_n) = ([0.0_f64; 7], [0.0_f64; 7]);
-
-    let mut sig_e = [0.0_f64; 3];
-    let mut err_e = [0.0_f64; 3];
-    let mut nse_e = [0.0_f64; 3];
-    let mut nz_sig = [false; 3];
-    let mut nz_err = [false; 3];
-    let mut nz_nse = [false; 3];
-
-    for i in 0..n_total {
-        let y = target[i];
-        let e = model[i] - y;
-        let eta = noise.map_or(0.0, |ns| ns[i]);
-
-        let l250_t = step_bezout7_lp(y, r1, omr1, &mut u1_t);
-        let l2500_t = step_bezout7_lp(y, r2, omr2, &mut u2_t);
-        let (lf_t, mf_t, hf_t) = (l250_t, l2500_t - l250_t, y - l2500_t);
-
-        let l250_e = step_bezout7_lp(e, r1, omr1, &mut u1_e);
-        let l2500_e = step_bezout7_lp(e, r2, omr2, &mut u2_e);
-        let (lf_e, mf_e, hf_e) = (l250_e, l2500_e - l250_e, e - l2500_e);
-
-        let l250_n = step_bezout7_lp(eta, r1, omr1, &mut u1_n);
-        let l2500_n = step_bezout7_lp(eta, r2, omr2, &mut u2_n);
-        let (lf_n, mf_n, hf_n) = (l250_n, l2500_n - l250_n, eta - l2500_n);
-
-        if i >= warmup_samples {
-            sig_e[0] += lf_t * lf_t;
-            sig_e[1] += mf_t * mf_t;
-            sig_e[2] += hf_t * hf_t;
-            nz_sig[0] |= lf_t != 0.0;
-            nz_sig[1] |= mf_t != 0.0;
-            nz_sig[2] |= hf_t != 0.0;
-
-            err_e[0] += lf_e * lf_e;
-            err_e[1] += mf_e * mf_e;
-            err_e[2] += hf_e * hf_e;
-            nz_err[0] |= lf_e != 0.0;
-            nz_err[1] |= mf_e != 0.0;
-            nz_err[2] |= hf_e != 0.0;
-
-            nse_e[0] += lf_n * lf_n;
-            nse_e[1] += mf_n * mf_n;
-            nse_e[2] += hf_n * hf_n;
-            nz_nse[0] |= lf_n != 0.0;
-            nz_nse[1] |= mf_n != 0.0;
-            nz_nse[2] |= hf_n != 0.0;
-        }
-    }
-
-    // Reject overflow/NaN (`+inf`/`NaN`) and IEEE-754 underflow-erased nonzero energy
-    // (`0 < |x| < 1.5e-154`) as unavailable (`r[qual.besr.zero-denominator]`)
-    for b in 0..3 {
-        if !sig_e[b].is_finite()
-            || !err_e[b].is_finite()
-            || !nse_e[b].is_finite()
-            || (nz_sig[b] && sig_e[b] == 0.0)
-            || (nz_err[b] && err_e[b] == 0.0)
-            || (nz_nse[b] && nse_e[b] == 0.0)
-        {
-            return None;
-        }
-    }
-
-    Some((sig_e, err_e, nse_e))
-}
-
-/// Convenience wrapper around [`try_split_bezout_3band_energies`] returning `[f64::NAN; 3]` on invalid inputs
-/// so downstream [`evaluate_besr_from_band_energies`] marks the report `valid = false`.
-#[must_use]
-pub fn split_bezout_3band_energies(
-    target: &[f64],
-    model: &[f64],
-    noise: Option<&[f64]>,
-    sample_rate_hz: f64,
-    warmup_samples: usize,
-) -> ([f64; 3], [f64; 3], [f64; 3]) {
-    try_split_bezout_3band_energies(target, model, noise, sample_rate_hz, warmup_samples)
-        .unwrap_or(([f64::NAN; 3], [f64::NAN; 3], [f64::NAN; 3]))
 }
 
 // ============================================================================
@@ -755,29 +566,7 @@ pub fn evaluate_uncertain_noise_interval_bounds(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_bezout7_exact_complex_sum_crossover_gain_and_finite_timeline() {
-        for fs in [44_100.0, 48_000.0, 88_200.0, 96_000.0] {
-            for f in [0.0, 20.0, 250.0, 1_000.0, 2_500.0, 10_000.0, 20_000.0] {
-                let [lf, mf, hf] = eval_bezout_3band_complex(f, fs);
-                assert!((lf.0 + mf.0 + hf.0 - 1.0).abs() < 1.0e-13);
-                assert!((lf.1 + mf.1 + hf.1).abs() < 1.0e-13);
-            }
-        }
-        // Verify §1.1 warning box: at fs = 48 kHz and f = 250 Hz, |H_LF| ≈ +9.33 dB
-        let [lf_250, _, _] = eval_bezout_3band_complex(250.0, 48_000.0);
-        let gain_db_250 = 10.0 * (lf_250.0 * lf_250.0 + lf_250.1 * lf_250.1).log10();
-        assert!((gain_db_250 - 9.33).abs() < 0.05);
-
-        // Verify r[qual.besr.finite-timeline]: filtering 0..N before warmup != resetting at warmup
-        let sig: Vec<f64> = (0..1_024).map(|i| (0.05 * (i as f64)).sin()).collect();
-        let mdl: Vec<f64> = sig.iter().map(|&v| 0.98 * v).collect();
-        let full_tl = try_split_bezout_3band_energies(&sig, &mdl, None, 48_000.0, 256).unwrap();
-        let reset_at_boundary =
-            try_split_bezout_3band_energies(&sig[256..], &mdl[256..], None, 48_000.0, 0).unwrap();
-        assert_ne!(full_tl.0, reset_at_boundary.0);
-    }
+    use std::f64::consts::PI;
 
     #[test]
     fn test_four_metrics_edge_cases_and_tier_gates() {

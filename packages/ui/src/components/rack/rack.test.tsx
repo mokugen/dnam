@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { expectZeroAxeViolations, setRangeInputValue } from "../../../tests/setup.js";
-import { DnamAudioHostProvider, WebAudioWorkletHost } from "../../host/index.js";
-import { DnamPluginRack, type DnamPluginRackModel, dbToMeterPercent } from "./index.js";
+import { DnamAudioHostProvider } from "../../host/context.js";
+import { WebAudioWorkletHost } from "../../host/web_worklet_host.js";
+import { DnamPluginRack } from "./DnamPluginRack.js";
+import type { DnamPluginRackModel } from "./models.js";
+import { dbToMeterPercent } from "./TriPhysicsTelemetry.js";
 
 const SAMPLE_MODEL: DnamPluginRackModel = {
   modelId: "SLO100_Lead",

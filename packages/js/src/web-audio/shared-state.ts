@@ -195,6 +195,68 @@ export class WorkletSharedState {
     Atomics.add(this.#i32, IDX_PARAM_SEQ, 1);
   }
 
+  #drainDirtyParams(
+    target: {
+      setControlValue(idx: number, val: number): void;
+      setControlImmediate(idx: number, val: number): void;
+    },
+    dirtyMask: number,
+    immMask: number,
+  ): void {
+    if (dirtyMask === 0) {
+      return;
+    }
+    for (let i = 0; i < 16; i++) {
+      const bit = 1 << i;
+      if ((dirtyMask & bit) === 0) {
+        continue;
+      }
+      const val = this.#f32[F32_PARAM_OFFSET + i] ?? 0;
+      if ((immMask & bit) !== 0) {
+        target.setControlImmediate(i, val);
+      } else {
+        target.setControlValue(i, val);
+      }
+    }
+  }
+
+  #drainCommandBits(
+    target: {
+      resetControlsToDefaults(): void;
+      reset(): void;
+      setBypass(bypassed: boolean, trails: boolean): void;
+      setFreeze(frozen: boolean): void;
+      setFreezeAmount(amount: number): void;
+      setTier(tier: number): void;
+      setStereoWidth(width: number): void;
+      syncTempo(bpm: number, sub: undefined, fold: boolean): number;
+    },
+    cmd: number,
+  ): void {
+    if ((cmd & CMD_RESET_CONTROLS) !== 0) {
+      target.resetControlsToDefaults();
+    }
+    if ((cmd & CMD_RESET) !== 0) {
+      target.reset();
+    }
+    if ((cmd & CMD_BYPASS_CHANGE) !== 0) {
+      target.setBypass((cmd & CMD_BYPASSED) !== 0, (cmd & CMD_TRAILS) !== 0);
+    }
+    if ((cmd & CMD_FREEZE_CHANGE) !== 0) {
+      target.setFreezeAmount(this.#f32[F32_FREEZE_AMOUNT_IDX] ?? 1.0);
+      target.setFreeze((cmd & CMD_FROZEN) !== 0);
+    }
+    if ((cmd & CMD_TIER_CHANGE) !== 0) {
+      target.setTier(Atomics.load(this.#i32, IDX_REQUESTED_TIER));
+    }
+    if ((cmd & CMD_WIDTH_CHANGE) !== 0) {
+      target.setStereoWidth(this.#f32[F32_STEREO_WIDTH_IDX] ?? 1.0);
+    }
+    if ((cmd & CMD_TEMPO_CHANGE) !== 0) {
+      target.syncTempo(this.#f32[F32_BPM_IDX] ?? 120.0, undefined, false);
+    }
+  }
+
   /**
    * Reader (audio thread): drains any pending parameter or command updates in O(1) with zero allocations.
    */
@@ -218,44 +280,11 @@ export class WorkletSharedState {
 
     const dirtyMask = Atomics.exchange(this.#i32, IDX_DIRTY_PARAM_MASK, 0);
     const immMask = Atomics.exchange(this.#i32, IDX_IMMEDIATE_PARAM_MASK, 0);
-    if (dirtyMask !== 0) {
-      for (let i = 0; i < 16; i++) {
-        const bit = 1 << i;
-        if ((dirtyMask & bit) !== 0) {
-          const val = this.#f32[F32_PARAM_OFFSET + i] ?? 0;
-          if ((immMask & bit) !== 0) {
-            target.setControlImmediate(i, val);
-          } else {
-            target.setControlValue(i, val);
-          }
-        }
-      }
-    }
+    this.#drainDirtyParams(target, dirtyMask, immMask);
 
     const cmd = Atomics.exchange(this.#i32, IDX_CMD_FLAGS, 0);
     if (cmd !== 0) {
-      if ((cmd & CMD_RESET_CONTROLS) !== 0) {
-        target.resetControlsToDefaults();
-      }
-      if ((cmd & CMD_RESET) !== 0) {
-        target.reset();
-      }
-      if ((cmd & CMD_BYPASS_CHANGE) !== 0) {
-        target.setBypass((cmd & CMD_BYPASSED) !== 0, (cmd & CMD_TRAILS) !== 0);
-      }
-      if ((cmd & CMD_FREEZE_CHANGE) !== 0) {
-        target.setFreezeAmount(this.#f32[F32_FREEZE_AMOUNT_IDX] ?? 1.0);
-        target.setFreeze((cmd & CMD_FROZEN) !== 0);
-      }
-      if ((cmd & CMD_TIER_CHANGE) !== 0) {
-        target.setTier(Atomics.load(this.#i32, IDX_REQUESTED_TIER));
-      }
-      if ((cmd & CMD_WIDTH_CHANGE) !== 0) {
-        target.setStereoWidth(this.#f32[F32_STEREO_WIDTH_IDX] ?? 1.0);
-      }
-      if ((cmd & CMD_TEMPO_CHANGE) !== 0) {
-        target.syncTempo(this.#f32[F32_BPM_IDX] ?? 120.0, undefined, false);
-      }
+      this.#drainCommandBits(target, cmd);
     }
     return true;
   }

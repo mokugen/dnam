@@ -1,10 +1,10 @@
 ---
 id: ADR-0017
 title: "100% Pure-Rust 5-Stage Analytical Variable-Projection (VarPro) Solver, Planar Stage Decoupling & fp16 Coreset Storage"
-status: accepted
+status: superseded
 date: "2026-03-30"
 supersedes: null
-superseded_by: null
+superseded_by: ADR-0021
 specs:
   - ../specs/training/four_stage_pipeline.md
   - ../specs/training/iterative_resume_and_caching.md

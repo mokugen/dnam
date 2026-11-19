@@ -132,7 +132,7 @@ pub fn validate_delay_histories(
 }
 
 /// Validates that a Stage III early FIR slice (`128 B` per tier) and Kautz modal slice
-/// (`128 B * {1, 1, 2, 4}` blocks per tier) are 64-byte aligned, non-overlapping, within their
+/// (`128 B * 1` block per tier in `v3`) are 64-byte aligned, non-overlapping, within their
 /// tier bounds, and contain only finite `f32` values (`ref[container.dnam.stage3-slices]`,
 /// `ref[container.dnam.load-validation]`).
 pub fn validate_stage3_tier_slices(
@@ -144,10 +144,7 @@ pub fn validate_stage3_tier_slices(
     kautz_len: usize,
 ) -> Result<(), DnamError> {
     let expected_kautz_blocks = match tier_index {
-        0 => 1usize,
-        1 => 1,
-        2 => 2,
-        3 => 4,
+        0..=3 => 1usize,
         _ => {
             return Err(DnamError::SchemaValidationError(
                 "invalid tier_index".to_string(),
@@ -616,8 +613,8 @@ mod spec_tests {
     /// Verifies Stage III separate 64B-aligned slices and `CP1` packed control projection records.
     #[test]
     fn test_stage3_slices_and_cp1_packed_projection_validation() {
-        // 1. Stage III slices across Lite (1 block), Full (1 block), Pro (2 blocks), Ultra (4 blocks)
-        for (tier, blocks) in [(0u8, 1usize), (1, 1), (2, 2), (3, 4)] {
+        // 1. Stage III slices across Lite, Full, Pro, Ultra (1 Kautz block = 128 B per tier)
+        for (tier, blocks) in [(0u8, 1usize), (1, 1), (2, 1), (3, 1)] {
             let kautz_len = blocks * 128;
             let arena_bytes = vec![0u8; 128 + kautz_len + 64];
             validate_stage3_tier_slices(tier, &arena_bytes, 0, 128, 128, kautz_len).unwrap();

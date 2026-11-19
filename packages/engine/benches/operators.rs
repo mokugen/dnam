@@ -2,17 +2,18 @@
 //!
 //! Benchmarks `Op-T` (Hermite Delay Line, Partitioned Schroeder Diffuser, Ballistic VCA),
 //! `Op-M` (Symplectic 4-Lane, 4-Lane SIMD Kautz Modal Bank, 12-Allpass Hilbert `H1`, Sub-Harmonic `T1`,
-//! `Q0.192` LFO Phase + Contractive Rotor), and `Op-N` (6-Step Rail-Crossing `MultiDrivePolyAdaaChannel`,
+//! `Q0.192` LFO Phase + Contractive Rotor), and `Op-N` (`NR2` Padé `tanh`,
 //! `Q64.32` `ZohBitcrusher`, `QuadratureHysteresis2D`, `c2_wavefolder`).
 
 use std::hint::black_box;
 
 use dnam_engine::FtzDazGuard;
-use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::math::spec_math::{Q0_192Phase, contractive_rotor_f32};
+use dnam_engine::math::{DefaultMathBackend, SimdVec4};
+use dnam_engine::operators::op_n::OpNBackend;
 use dnam_engine::operators::{
-    BallisticDuckingVca, HilbertSsbLattice10th, KautzModalBank, MultiDrivePolyAdaaChannel,
-    OpTDelayLine, PartitionedSchroederDiffuserBank, QuadratureHysteresis2D, SubHarmonicTracker,
+    BallisticDuckingVca, HilbertSsbLattice10th, KautzModalBank, OpTDelayLine,
+    PartitionedSchroederDiffuserBank, QuadratureHysteresis2D, SubHarmonicTracker,
     SymplecticModal4Lane, ZohBitcrusher, c2_wavefolder,
 };
 use hotpath::criterion::{Criterion, criterion_group, criterion_main};
@@ -90,17 +91,12 @@ fn bench_op_m_and_rotor_kernels(c: &mut Criterion) {
 fn bench_op_n_kernels(c: &mut Criterion) {
     let mut group = c.benchmark_group("op_n_nonlinear");
 
-    let mut op_n_ch = MultiDrivePolyAdaaChannel::new();
-    group.bench_function("multidrive_poly_adaa_6step_rail_crossing", |b| {
+    group.bench_function("nr2_pade_tanh_4ch", |b| {
         let _audio = FtzDazGuard::new();
         b.iter(|| {
-            black_box(op_n_ch.step(
-                black_box(0.45),
-                black_box(0.25),
-                black_box(0.10),
-                black_box(0.85),
-                black_box(0.9993),
-            ))
+            let x = black_box([0.45_f32, -0.75, 1.25, -2.10]);
+            let t = <DefaultMathBackend as OpNBackend<_>>::tanh_pade5_4ch(SimdVec4::load(&x));
+            black_box(t.to_array())
         });
     });
 

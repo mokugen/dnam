@@ -2,10 +2,10 @@ import { Sliders } from "lucide-react";
 import { useDnamAudioHost } from "../../host/context.js";
 import { DNAM_MODEL_TIER_LABELS, DNAM_MODEL_TIERS, tierOrderIndex } from "../../host/types.js";
 import { cn } from "../../lib/utils.js";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../base/card.js";
 import { DiscreteSwitch } from "../controls/DiscreteSwitch.js";
 import { RotaryKnob } from "../controls/RotaryKnob.js";
 import { AccelerationBadge, StabilityAuditBadge } from "../controls/StatusBadges.js";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../ui/card.js";
 import type { DnamPluginRackModel } from "./models.js";
 import { TriPhysicsTelemetry } from "./TriPhysicsTelemetry.js";
 

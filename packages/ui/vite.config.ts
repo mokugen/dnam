@@ -1,8 +1,36 @@
-import { resolve } from "node:path";
+import { readdirSync } from "node:fs";
+import { relative, resolve } from "node:path";
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { playwright } from "@vitest/browser-playwright";
 import { defineConfig } from "vitest/config";
+
+const SRC_ROOT = resolve(import.meta.dirname, "src");
+
+function collectUiEntries(dir: string): Record<string, string> {
+  const entries: Record<string, string> = {};
+  for (const item of readdirSync(dir, { withFileTypes: true })) {
+    const full = resolve(dir, item.name);
+    if (item.isDirectory()) {
+      Object.assign(entries, collectUiEntries(full));
+      continue;
+    }
+    if (!/\.(ts|tsx)$/.test(item.name)) {
+      continue;
+    }
+    if (
+      item.name === "cosmos.decorator.tsx" ||
+      /\.(d\.ts|test\.tsx?|browser\.test\.tsx?|fixture\.tsx|bench\.ts)$/.test(item.name)
+    ) {
+      continue;
+    }
+    const key = relative(SRC_ROOT, full)
+      .replace(/\.(ts|tsx)$/, "")
+      .replaceAll("\\", "/");
+    entries[key] = full;
+  }
+  return entries;
+}
 
 export default defineConfig(({ mode }) => ({
   plugins: [tailwindcss(), react()],
@@ -15,19 +43,15 @@ export default defineConfig(({ mode }) => ({
           minify: false,
           sourcemap: true,
           lib: {
-            entry: {
-              index: resolve(import.meta.dirname, "src/index.ts"),
-              tokens: resolve(import.meta.dirname, "src/tokens.ts"),
-              "host/index": resolve(import.meta.dirname, "src/host/index.ts"),
-              "components/visualizers/index": resolve(
-                import.meta.dirname,
-                "src/components/visualizers/index.ts",
-              ),
-            },
+            entry: collectUiEntries(SRC_ROOT),
             formats: ["es"],
-            fileName: (_format, entryName) => `${entryName}.js`,
           },
           rollupOptions: {
+            output: {
+              preserveModules: true,
+              preserveModulesRoot: SRC_ROOT,
+              entryFileNames: "[name].js",
+            },
             external: [
               "react",
               "react/jsx-runtime",

@@ -1,5 +1,5 @@
-import { Badge } from "../ui/badge.js";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../ui/card.js";
+import { Badge } from "../base/badge.js";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "../base/card.js";
 import { computePolyAdaaMetrics } from "./models.js";
 
 export interface PolyAdaaVisualizerProps {

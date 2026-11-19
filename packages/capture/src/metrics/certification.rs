@@ -1,6 +1,13 @@
 //! Quiet vs. Muted Stem Classification (`r[qual.eval.quiet-vs-muted]`), Cross-Tier Loudness Parity,
 //! and 4-Tier Perceptual Benchmark Certification (`r[qual.companion.suite]`, `r[qual.tiers.benchmark-matrix]`).
 
+mod scope;
+pub mod universal;
+
+pub use scope::certify_holdout_for_family;
+pub use universal::{certify_4metric_universal, certify_holdout_universal};
+
+use super::companion::{LtasTargetCache, MAX_METRIC_SAMPLE_RATE_HZ, MrIirTargetCache};
 use super::{
     ArchetypeFamily, MAX_TIER_LOUDNESS_STEP_LU, MultiRateSegEsrSlice, ONE_DB_POWER_FACTOR,
     SIX_DB_POWER_FACTOR, StemActivityClass, TierQualityThresholds, compute_mr_iir_loss,
@@ -202,20 +209,33 @@ pub fn verify_monotone_4tier_summaries(tiers: &[PerceptualCertificationSummary; 
     true
 }
 
-/// Evaluates all 4 perceptual metrics (`bESR` composite + per-band, `MR-IIR`, `LTAS`, `SegESR`)
-/// against the canonical device-agnostic §4 benchmark matrix (`ref[qual.companion.suite]`,
-/// `ref[qual.tiers.benchmark-matrix]`, `ref[qual.besr.finite-timeline]`).
-#[must_use]
-pub fn certify_4metric_signal_chain(
+struct CertEvalSpec<'a> {
     family: ArchetypeFamily,
     tier: Tier,
-    target: &[f64],
-    model: &[f64],
-    noise: Option<&[f64]>,
+    th: &'a TierQualityThresholds,
+    target: &'a [f64],
+    model: &'a [f64],
+    noise: Option<&'a [f64]>,
     sample_rate_hz: f64,
     warmup_samples: usize,
+}
+
+fn assemble_cert_summary(
+    spec: CertEvalSpec<'_>,
+    ltas_cache: Option<&mut LtasTargetCache>,
+    mr_fn: impl FnOnce() -> f64,
+    prev_ch: Option<&PerceptualCertificationSummary>,
 ) -> PerceptualCertificationSummary {
-    let th = TierQualityThresholds::for_tier(tier);
+    let CertEvalSpec {
+        family,
+        tier,
+        th,
+        target,
+        model,
+        noise,
+        sample_rate_hz,
+        warmup_samples,
+    } = spec;
     let (sig_e, err_e, nse_e) =
         split_bezout_3band_energies(target, model, noise, sample_rate_hz, warmup_samples);
     let besr_rep = evaluate_besr_from_band_energies(sig_e, err_e, nse_e);
@@ -226,7 +246,6 @@ pub fn certify_4metric_signal_chain(
     let unseen_qual =
         evaluate_noise_qualified_besr(&besr_rep, unseen_band_goals, th.unseen_control_besr_db);
 
-    let mr_iir = compute_mr_iir_loss(target, model, noise, sample_rate_hz, warmup_samples);
     let valid_slice = target.len() == model.len()
         && warmup_samples < target.len()
         && !target.is_empty()
@@ -241,7 +260,10 @@ pub fn certify_4metric_signal_chain(
         (&[][..], &[][..], None)
     };
 
-    let ltas_rep = evaluate_ltas_33band_report(tgt_post, mdl_post, nse_post, sample_rate_hz, true);
+    let ltas_rep = match (valid_slice, ltas_cache) {
+        (true, Some(lc)) => lc.eval_model(mdl_post),
+        _ => evaluate_ltas_33band_report(tgt_post, mdl_post, nse_post, sample_rate_hz, true),
+    };
     let (seg_esr_db, seg_active_count, seg_valid) =
         compute_multirate_seg_esr_db(&[MultiRateSegEsrSlice {
             sample_rate_hz,
@@ -250,15 +272,40 @@ pub fn certify_4metric_signal_chain(
             noise: nse_post,
         }]);
 
-    let companion_ok = mr_iir.is_finite()
-        && mr_iir >= 0.0
-        && ltas_rep.available
-        && !ltas_rep.excluded_band_guard_failed
-        && ltas_rep.max_adj_deviation_db <= th.max_ltas_db
-        && seg_valid
-        && seg_active_count > 0
-        && !seg_esr_db.is_nan()
-        && seg_esr_db < f64::INFINITY;
+    let (mr_iir, prescreen_rejected) = if let Some(p) = prev_ch {
+        let valid_db = |x: f64| !x.is_nan() && x < f64::INFINITY;
+        let ok = valid_db(besr_rep.besr_db)
+            && besr_rep.band_esr_db.iter().copied().all(valid_db)
+            && valid_db(seg_esr_db)
+            && ltas_rep.max_adj_deviation_db.is_finite()
+            && ltas_rep.max_adj_deviation_db >= 0.0
+            && besr_rep.besr_db <= p.raw_besr_db
+            && (0..3).all(|b| besr_rep.band_esr_db[b] <= p.band_esr_db[b])
+            && ltas_rep.max_adj_deviation_db <= p.ltas_max_db
+            && seg_esr_db <= p.seg_esr_db
+            && ltas_rep.excluded_bands == p.ltas_excluded_bands;
+        if !ok {
+            (p.mr_iir + 1.0, true)
+        } else {
+            (mr_fn(), false)
+        }
+    } else {
+        (mr_fn(), false)
+    };
+
+    let (passes_target, passes_hard_ceiling) = scope::passes_for_family(&scope::ScopeEvalInputs {
+        family,
+        tier,
+        th,
+        prescreen_rejected,
+        besr_qual_passes: besr_qual.passes,
+        unseen_qual_passes: unseen_qual.passes,
+        mr_iir,
+        ltas_rep: &ltas_rep,
+        seg_valid,
+        seg_active_count,
+        seg_esr_db,
+    });
 
     PerceptualCertificationSummary {
         family,
@@ -273,9 +320,40 @@ pub fn certify_4metric_signal_chain(
         ltas_excluded_bands: ltas_rep.excluded_bands,
         ltas_residual_band_power: ltas_rep.residual_band_power,
         seg_esr_db,
-        passes_target: besr_qual.passes && companion_ok,
-        passes_hard_ceiling: unseen_qual.passes && companion_ok,
+        passes_target,
+        passes_hard_ceiling,
     }
+}
+
+/// Evaluates all 4 perceptual metrics (`bESR` composite + per-band, `MR-IIR`, `LTAS`, `SegESR`)
+/// against the canonical device-agnostic §4 benchmark matrix (`ref[qual.companion.suite]`,
+/// `ref[qual.tiers.benchmark-matrix]`, `ref[qual.besr.finite-timeline]`).
+#[must_use]
+pub fn certify_4metric_signal_chain(
+    family: ArchetypeFamily,
+    tier: Tier,
+    target: &[f64],
+    model: &[f64],
+    noise: Option<&[f64]>,
+    sample_rate_hz: f64,
+    warmup_samples: usize,
+) -> PerceptualCertificationSummary {
+    let th = TierQualityThresholds::for_tier(tier);
+    assemble_cert_summary(
+        CertEvalSpec {
+            family,
+            tier,
+            th: &th,
+            target,
+            model,
+            noise,
+            sample_rate_hz,
+            warmup_samples,
+        },
+        None,
+        || compute_mr_iir_loss(target, model, noise, sample_rate_hz, warmup_samples),
+        None,
+    )
 }
 
 /// Evaluates all 4 perceptual metrics (`bESR`, `MR-IIR`, `LTAS`, `SegESR`) with a converter-calibrated
@@ -329,6 +407,40 @@ pub fn certify_4metric_with_bit_depth(
         sample_rate_hz,
         warmup_samples,
     )
+}
+
+/// Reusable per-channel certification evaluator caching target `MR-IIR` resonators and
+/// target `LTAS` Welch spectra (`noise = None`).
+#[derive(Clone)]
+pub(crate) struct TargetChannelCertCache {
+    target: Vec<f64>,
+    sample_rate_hz: f64,
+    warmup_samples: usize,
+    mr_cache: Option<MrIirTargetCache>,
+    ltas_cache: Option<LtasTargetCache>,
+}
+
+impl TargetChannelCertCache {
+    #[must_use]
+    pub(crate) fn new(target: &[f64], sample_rate_hz: f64, warmup_samples: usize) -> Self {
+        let mr_cache = MrIirTargetCache::new(target, sample_rate_hz, warmup_samples);
+        let ltas_cache = if (40_000.0..=MAX_METRIC_SAMPLE_RATE_HZ).contains(&sample_rate_hz)
+            && !target.is_empty()
+            && warmup_samples < target.len()
+            && target.iter().all(|v| v.is_finite())
+        {
+            LtasTargetCache::new(&target[warmup_samples..], sample_rate_hz, 20_000.0)
+        } else {
+            None
+        };
+        Self {
+            target: target.to_vec(),
+            sample_rate_hz,
+            warmup_samples,
+            mr_cache,
+            ltas_cache,
+        }
+    }
 }
 
 #[cfg(test)]

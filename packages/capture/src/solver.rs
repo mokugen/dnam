@@ -1,79 +1,98 @@
 #![forbid(unsafe_code)]
-//! Analytical Variable-Projection (`VarPro`), `uplo='U'` Cholesky & Noise-Subtracted `B-ESR` Solver.
+//! `v3` Analytical Variable-Projection (`VarPro`), `uplo='U'` Cholesky & Noise-Subtracted `B-ESR` Solver.
 
 pub mod backends;
-pub mod bezout_gram;
-pub mod bezout_schur;
-pub mod stage_a;
-pub mod stage_b_c;
-pub mod stage_d;
-pub mod stage_d_basis;
-pub mod stage_e;
-pub mod stage_e_polish;
+pub mod progress;
+pub mod stage_a_probe;
+pub mod stage_b_backbone;
+pub mod stage_c_knobs;
+pub mod stage_d_audit;
 pub mod stages;
 pub mod v3_varpro;
 pub mod wide_gram;
-
-pub use bezout_gram::{
-    BezoutHarvestStats, canonical_besr_warmup, contract_bezout_3band_stats,
-    contract_bezout_3band_stats_4tier, eval_4tier_besr_quad_1ch, eval_4tier_post_trim_besr_lin,
-};
-pub use bezout_schur::solve_multitier_besr_4tier;
 
 pub use backends::{
     DefaultTrainerBackend, DynamicTrainer, GaborOperatorBackend, GramCholeskyBackend,
     KautzCascadeBackend, ScalarTrainerBackend, TrainerBackend, TrainerTask,
 };
-pub use stage_a::{
-    StageAConfig, StageAReport, has_populated_physical_backbone, lift_stage_a_backbone,
-    zero_all_role_b_cascade_weights,
+pub use progress::{
+    AtomicTrainerProgress, PROGRESS_MAGIC_DNPR, PROGRESS_WIRE_BYTES, PROGRESS_WIRE_WORDS,
+    TrainerProgressHandle, TrainerProgressSnapshot, TrainingPhase, TrainingStatus,
 };
-pub use stage_b_c::{
-    StageBHarvest, StageCSolveOutput, compute_role_b_multipliers, harvest_star_center_256d,
-    serialize_stat_chunk_ultra, solve_stage_c_nested_schur_4tier, write_effective_mode0_weights,
+pub use stage_a_probe::{
+    StageAConfig, StageAReport, has_populated_v3_backbone, run_stage_a_physics_probe,
 };
-pub use stage_d::{
-    StageDSolveOutput, solve_stage_d_cp1_and_audit, solve_stage_d_cp1_and_audit_with_harvest,
-    star_center_control_values, write_inline_cp1_if_fits,
+pub use stage_b_backbone::{
+    StageBOutputs, StageBSolveConfig, WeightedStemRef, compute_v3_stat_chunk_bytes,
+    patch_v3_readouts_weighted_cholesky, serialize_v3_stat_chunk_ultra, solve_stage_b_backbone,
+    solve_stage_b_backbone_with_progress,
 };
-pub use stage_e::{
-    BuyerWatermarkConfig, StageESolveOutput, compute_integrated_lufs, derive_buyer_gauge_params,
-    derive_buyer_phase_seed, derive_buyer_tardos_codebook, export_runtime_dnam_watermarked,
-    extract_arena_pole_angles_34, finalize_stage_e_and_telemetry,
-    finalize_stage_e_and_telemetry_with_polish, identify_pole_angles_blackbox_from_audio,
+pub use stage_c_knobs::{
+    StageCKnobsOutput, decode_coreset_lr, solve_stage_c_knobs, star_center_control_values,
+};
+pub use stage_d_audit::{
+    BuyerWatermarkConfig, StageDAuditOptions, StageDSolveOutput, compute_integrated_lufs,
+    derive_buyer_gauge_params, derive_buyer_phase_seed, derive_buyer_tardos_codebook,
+    export_runtime_dnam_watermarked, extract_arena_pole_angles_16, extract_arena_pole_angles_34,
+    finalize_stage_d_and_audit, identify_pole_angles_blackbox_from_audio,
     render_blackbox_probe_response,
 };
+pub use stages::write_inline_cp1_if_fits;
 pub use v3_varpro::{
     V3TrainDataset, V3TrainStem, build_v3_causal_probe_excitation,
     estimate_v3_causal_deadtime_and_polarity, fit_v3_core_four_tiers,
-    fit_v3_core_four_tiers_with_backend, fit_v3_matryoshka, fit_v3_matryoshka_with_backend,
+    fit_v3_core_four_tiers_with_backend, fit_v3_matryoshka, fit_v3_matryoshka_fast,
+    fit_v3_matryoshka_fast_with_backend, fit_v3_matryoshka_with_backend,
 };
 pub use wide_gram::{Wide192Accum, accumulate_uplo_u_wide192, contract_256d_gram_tiled_wide192};
 
-/// Tuning options for the Deterministic 5-Stage Closed-Form + `VarPro` Solver (`Stage A..E`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Quality vs. wall-clock stopping policy for the `v3` Matryoshka solver.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SolverQualityMode {
+    /// Default: optimize every tier and candidate until relative improvement reaches genuine
+    /// diminishing returns (`|Δloss| / |loss| < ε` streak), selecting the highest-fidelity model.
+    #[default]
+    BestUntilDiminishingReturns,
+    /// Stop early once a candidate clears `target_slack_milli_db` (`0` = canonical §4 gates,
+    /// `500` = `+0.50 dB` looser preview) or reaches `max_polish_iters`.
+    ThresholdStop {
+        /// Extra slack in milli-dB (`1_000 == 1.0 dB`).
+        target_slack_milli_db: u32,
+        /// Per-tier polish iteration ceiling (`8..=64`).
+        max_polish_iters: usize,
+    },
+}
+
+/// Tuning options for the `v3` 4-Stage Analytical Pipeline (`Stage A..D`).
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SolverOptions {
     /// Stage A anchor-stem lifting configuration (`preserve_existing_backbone` for white-box oracles).
     pub stage_a: StageAConfig,
-    /// Stride when contracting `256 × 256` `Wide192Accum` Gram outer products (`default = 4` -> `3,000` frames).
+    /// Stride when contracting `256 × 256` `Wide192Accum` Gram outer products (`default = 4`).
     pub gram_frame_stride: usize,
-    /// Clears `W_ctrl^base` (`9,536..10,560`) during Stage D unless preserving a white-box dynamic backbone.
+    /// Clears `W_ctrl` and `U_int` during Stage C unless preserving a white-box dynamic backbone.
     pub clear_dynamic_w_ctrl: bool,
+    /// Convergence vs. early-threshold stopping policy across Stage B and Stage IV.
+    pub quality_mode: SolverQualityMode,
+    /// Optional empirical left/right repeatability profiles measured strictly from `(x, y)` probes.
+    pub rep_profiles: Option<[crate::metrics::TargetRepeatabilityProfile; 2]>,
 }
 
 impl Default for SolverOptions {
     fn default() -> Self {
         Self {
             stage_a: StageAConfig::default(),
-            gram_frame_stride: 1,
+            gram_frame_stride: 4,
             clear_dynamic_w_ctrl: true,
+            quality_mode: SolverQualityMode::BestUntilDiminishingReturns,
+            rep_profiles: None,
         }
     }
 }
 
 impl SolverOptions {
-    /// Returns white-box oracle options that preserve an existing populated `64,000 B` physical
-    /// backbone (`Stage 0..IV` + `W_ctrl`) while solving `W_head`, `CP1`, `U_int`, `STAT`, and trims.
+    /// Returns white-box oracle options that preserve an existing populated `28,672 B` physical
+    /// backbone (`Stage 0..IV` + `W_ctrl`) while solving linear readouts, `CP1`, `U_int`, `STAT`, and trims.
     #[must_use]
     pub const fn preserve_backbone() -> Self {
         Self {
@@ -81,13 +100,26 @@ impl SolverOptions {
                 preserve_existing_backbone: true,
                 vp_gn_steps: 1,
             },
-            gram_frame_stride: 1,
+            gram_frame_stride: 4,
             clear_dynamic_w_ctrl: false,
+            quality_mode: SolverQualityMode::BestUntilDiminishingReturns,
+            rep_profiles: None,
         }
     }
 }
 
 use dnam_engine::Tier;
+
+/// Computes canonical post-warmup offset matching Stage D certification gates (`512` on `>= 2,048` frames).
+#[must_use]
+pub const fn canonical_besr_warmup(n_frames: usize) -> usize {
+    if n_frames > 64 {
+        let q = n_frames / 4;
+        if q < 512 { q } else { 512 }
+    } else {
+        0
+    }
+}
 
 /// Returns the canonical feature-bus dimension $N_T \in \{64, 128, 192, 256\}$ for `tier`.
 #[must_use]
@@ -280,6 +312,7 @@ pub fn solve_uplo_u_cholesky_2ch(
 
 #[inline]
 fn eval_bezout_degree7_poly(h: f64) -> f64 {
+    let c = crate::metrics::BEZOUT7_LP_COEFFS;
     let u = if h.is_finite() {
         h.clamp(0.0, 1.0)
     } else {
@@ -288,12 +321,12 @@ fn eval_bezout_degree7_poly(h: f64) -> f64 {
     if u <= 0.5 {
         let u2 = u * u;
         let u4 = u2 * u2;
-        u4 * (35.0 - 84.0 * u + 70.0 * u2 - 20.0 * u * u2)
+        u4 * (c[0] + c[1] * u + c[2] * u2 + c[3] * u * u2)
     } else {
         let v = 1.0 - u;
         let v2 = v * v;
         let v4 = v2 * v2;
-        1.0 - v4 * (35.0 - 84.0 * v + 70.0 * v2 - 20.0 * v * v2)
+        1.0 - v4 * (c[0] + c[1] * v + c[2] * v2 + c[3] * v * v2)
     }
 }
 
@@ -349,135 +382,6 @@ pub fn compute_noise_subtracted_besr(
         let half_denom = 0.5 * target_energy + 0.5 * noise_energy;
         (0.5 * err_energy - 0.5 * noise_energy).max(0.0) / half_denom
     }
-}
-
-/// Cyclic Jacobi symmetric eigensolver for small $L \times L$ positive-semidefinite matrices.
-fn jacobi_top_eigenvectors_desc(sym_mat: &[Vec<f64>], max_modes: usize) -> Vec<(f64, Vec<f64>)> {
-    let n = sym_mat.len();
-    if n == 0 || max_modes == 0 {
-        return Vec::new();
-    }
-    let mut a = sym_mat.to_vec();
-    let mut v = vec![vec![0.0_f64; n]; n];
-    for (i, row) in v.iter_mut().enumerate() {
-        row[i] = 1.0;
-    }
-
-    for _sweep in 0..24 {
-        let mut max_off = 0.0_f64;
-        for p in 0..n {
-            for q in (p + 1)..n {
-                let apq = a[p][q];
-                max_off = max_off.max(apq.abs());
-                if apq.abs() <= 1.0e-15 {
-                    continue;
-                }
-                let tau = (a[q][q] - a[p][p]) / (2.0 * apq);
-                let t = if tau >= 0.0 {
-                    1.0 / (tau + (1.0 + tau * tau).sqrt())
-                } else {
-                    -1.0 / (-tau + (1.0 + tau * tau).sqrt())
-                };
-                let c = 1.0 / (1.0 + t * t).sqrt();
-                let s = t * c;
-
-                a[p][p] -= t * apq;
-                a[q][q] += t * apq;
-                a[p][q] = 0.0;
-                a[q][p] = 0.0;
-                for r in 0..n {
-                    if r != p && r != q {
-                        let arp = a[r][p];
-                        let arq = a[r][q];
-                        a[r][p] = c * arp - s * arq;
-                        a[p][r] = a[r][p];
-                        a[r][q] = s * arp + c * arq;
-                        a[q][r] = a[r][q];
-                    }
-                    let vrp = v[r][p];
-                    let vrq = v[r][q];
-                    v[r][p] = c * vrp - s * vrq;
-                    v[r][q] = s * vrp + c * vrq;
-                }
-            }
-        }
-        if max_off <= 1.0e-13 {
-            break;
-        }
-    }
-
-    let mut pairs: Vec<(f64, Vec<f64>)> = (0..n)
-        .map(|col| {
-            let eval = a[col][col];
-            let evec: Vec<f64> = (0..n).map(|row| v[row][col]).collect();
-            (eval, evec)
-        })
-        .collect();
-    pairs.sort_by(|x, y| y.0.total_cmp(&x.0));
-    pairs.truncate(max_modes.min(n));
-    pairs
-}
-
-/// Extracts up to `4` orthonormal right singular vectors $\mathbf{m}_k \in \mathbb{R}^{512}$ and
-/// left projection coordinates `coords[l][k]` from `u_mat` (`L × 512`).
-pub(crate) fn extract_rank4_svd_modes(u_mat: &[Vec<f64>]) -> (Vec<[f64; 512]>, Vec<[f64; 4]>) {
-    let l_cnt = u_mat.len();
-    let mut coords = vec![[0.0_f64; 4]; l_cnt];
-    if l_cnt == 0 {
-        return (Vec::new(), coords);
-    }
-    let mut cov = vec![vec![0.0_f64; l_cnt]; l_cnt];
-    for i in 0..l_cnt {
-        for j in i..l_cnt {
-            let mut dot = 0.0_f64;
-            for (&a, &b) in u_mat[i].iter().zip(&u_mat[j]) {
-                dot += a * b;
-            }
-            cov[i][j] = dot;
-            cov[j][i] = dot;
-        }
-    }
-
-    let eig = jacobi_top_eigenvectors_desc(&cov, 4);
-    let mut modes = Vec::with_capacity(4);
-    for (k, (eval, left_vec)) in eig.into_iter().enumerate() {
-        if eval <= 1.0e-16 {
-            continue;
-        }
-        let mut right = [0.0_f64; 512];
-        for (row_idx, &lv) in left_vec.iter().enumerate() {
-            if lv.abs() <= 1.0e-16 {
-                continue;
-            }
-            for (d, r_val) in right.iter_mut().enumerate() {
-                *r_val += lv * u_mat[row_idx][d];
-            }
-        }
-        let norm = right.iter().map(|&v| v * v).sum::<f64>().sqrt();
-        if norm <= 1.0e-12 {
-            continue;
-        }
-        let unit_inv = 1.0 / norm;
-        for v in &mut right {
-            *v *= unit_inv;
-        }
-        let mut max_coord = 0.0_f64;
-        for row in u_mat {
-            let dot: f64 = row.iter().zip(&right).map(|(&a, &b)| a * b).sum();
-            max_coord = max_coord.max(dot.abs());
-        }
-        let mode_scale = (max_coord / 4.0).max(1.0);
-        for v in &mut right {
-            *v *= mode_scale;
-        }
-        let right_norm_sq: f64 = right.iter().map(|&v| v * v).sum();
-        for l in 0..l_cnt {
-            let dot: f64 = u_mat[l].iter().zip(&right).map(|(&a, &b)| a * b).sum();
-            coords[l][k] = dot / right_norm_sq.max(1.0e-18);
-        }
-        modes.push(right);
-    }
-    (modes, coords)
 }
 
 #[cfg(test)]

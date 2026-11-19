@@ -13,8 +13,8 @@ requirements:
 adrs:
   - ADR-0006
   - ADR-0007
-  - ADR-0017
   - ADR-0020
+  - ADR-0021
 ---
 
 # Non-Stop 3-Phase Control-Space Audit & Automatic Clamping
@@ -31,9 +31,9 @@ flowchart TD
         CStab --> Warn["Emit Non-Blocking Warning Banner & Proceed Immediately to Stage A-E Solve"]
     end
 
-    subgraph P2 ["Phase 2: Stage D Analytical VarPro Corner Barrier & Rail Audit"]
+    subgraph P2 ["Phase 2: Stage D Control-Projection Corner Barrier & GRU/SVF Boundedness Audit"]
         direction TB
-        Step["Every Stage D Control-Projection Step (< 0.05 ms, Zero Audio Rendering):<br/>Stop-Gradient Corner Barrier L_barrier steers Rank-4/8 FM weights"] --> Rail["Corner Rail Check ([CLAMP-RAIL]):<br/>Run 2,048-sample burst across corners —<br/>if PolyADAA hits > 95% hard rail (|u_n| = 1.0), record conditional ceiling"]
+        Step["Every Stage D Control-Projection Step (< 0.05 ms, Zero Audio Rendering):<br/>Stop-Gradient Corner Barrier L_barrier steers Rank-4/8 FM & FiLM weights"] --> Rail["Corner State & Pole Check ([CLAMP-RAIL]):<br/>Run 2,048-sample burst across corners —<br/>verify GRU ISS contraction h in [-2.5, 2.5], Env-SVF/TPT-SVF poles & ZOH stability"]
     end
 
     subgraph P3 ["Phase 3: Post-Polish Export Certification (At .dnam Export)"]
@@ -61,15 +61,15 @@ flowchart TD
 
 1. `r[train.audit.phase2.corner-barrier]` **Stop-Gradient Corner Barrier Loss ($\mathcal{L}_{\text{barrier}}$ at Every Optimizer Step):**
    $$\mathcal{L}_{\text{barrier}} = \lambda_{\text{bar}} \sum_{(\mathbf{u}_c, \mathbf{s}_c) \in \mathcal{V}_{\text{corners}}} \mathrm{relu}\Big(\mathrm{sg}\big(\boldsymbol{\theta}_{\text{main}}(\mathbf{u}_c, \mathbf{s}_c)\big) + \Delta\boldsymbol{\theta}_{\text{FM}}(\mathbf{u}_c, \mathbf{s}_c) - \boldsymbol{\theta}_{\text{safe}}\Big)^2$$
-2. `r[train.audit.phase2.clamp-rail]` **Periodic Dynamic Rail-Lockup Audit (`[CLAMP-RAIL]`, Every 10 Epochs):** Runs a `2,048`-sample burst through the corners without gradient tracking and records a conditional gain ceiling if cascaded `PolyADAA` stages (`ref[dsp.op-n.polyadaa.clamp]`) exceed `95%` rail occupancy ($|u_n| = 1.0$).
+2. `r[train.audit.phase2.clamp-rail]` **Periodic Dynamic State & Rail Audit (`[CLAMP-RAIL]`, Corner Burst):** Runs a `2,048`-sample corner burst without gradient tracking and verifies Stage II Zero-DC Matryoshka `GRU` ISS contraction / bounded hidden-state envelope ($h \in [-2.5, 2.5]$), Stage I `Env-SVF` / inter-block `TPT-SVF` Schur pole bounds ($r < 1$), and reference Stage I waveshaper rail occupancy, recording a conditional gain ceiling whenever any corner approaches state saturation (`ref[dsp.op-n.polyadaa.clamp]`).
 
 ### 1.3 Phase 3 — Post-Training & Post-Polish Export Certification Audit
 
 1. `r[train.audit.phase3.clamp-dynamic]` **`[CLAMP-DYNAMIC]` (Combined Knob + Learned LFO/Envelope Excursion Clamp):**
    $$r_{c,\text{worst}}(\mathbf{u}, \mathbf{s}) = r_{\text{high},c}(\mathbf{u}, \mathbf{s}) + |\mathbf{w}_{r,c}|^\top \mathbf{m}_{\text{max}} \le 0.9995, \qquad \tau_{m,\text{min}}(\mathbf{u}, \mathbf{s}) = \tau_{0,m}(\mathbf{u}, \mathbf{s}) - |\mathbf{w}_{\tau,m}|^\top \mathbf{m}_{\text{max}} \ge 4.0\text{ samples}$$
    Stage III modal poles are bounded by their shared radial gate $g[n] \in [0, 1]$ and validated endpoint $r_{\text{high},m} \le 0.9995$ (`ref[dsp.op-m.stage3.radial-gate]`, [`../dsp/op_m_modal_kautz.md` §4.1](../dsp/op_m_modal_kautz.md#41-stage-iii-architecture--tier-allocation)).
-2. `r[train.audit.phase3.clamp-head-gain]` **`[CLAMP-HEAD-GAIN]` (Post-Polish 256-D Mid/Side Kronecker Head Spectral Gain Clamp):** Evaluates the active tier's rendered L/R audio frequency response and feature-to-output gain ($\le +6.0\text{ dB}$) over the permitted head-control and width domains (`ref[dsp.head.mid-side-factorization]`), retaining the tier-specific head radius after tier stripping (`ref[dsp.ctrl.op-n.trust-clip]`).
-3. `r[train.audit.phase3.numeric-envelope]` **`[NUMERIC-ENVELOPE]` (Finite-Precision Operating Range Certification):** Verifies the unclipped $\ge \pm 100.0$ (`+40 dBFS` peak) operating envelope simultaneously across all active audio inputs and outputs with zero representational safety saturation (`REQ-7.1`, `ref[arch.fp.range-saturation]`, [`../architecture/tora_architecture.md` §1.2](../architecture/tora_architecture.md#finite-precision-range-and-saturation-policy)).
+2. `r[train.audit.phase3.clamp-head-gain]` **`[CLAMP-HEAD-GAIN]` (Post-Polish Direct-Register Mid/Side Spectral Gain Clamp):** Evaluates the active tier's rendered L/R audio frequency response and linear `VarPro` readout gain ($\le +6.0\text{ dB}$) over the permitted head-control and width domains (`ref[dsp.head.mid-side-factorization]`), retaining the tier-specific head radius after tier stripping (`ref[dsp.ctrl.op-n.trust-clip]`).
+3. `r[train.audit.phase3.numeric-envelope]` **`[NUMERIC-ENVELOPE]` (Finite-Precision Operating Range Certification):** Verifies the unclipped $\ge \pm 100.0$ (`+40 dBFS` peak) operating envelope simultaneously across all active audio inputs and linear `VarPro` outputs—while `GRU` hidden states stay bounded inside `[-2.5, 2.5]` and Stage IV `fp16` writes remain $\le \pm 65,504.0$—with zero representational safety saturation (`REQ-7.1`, `ref[arch.fp.range-saturation]`, [`../architecture/tora_architecture.md` §1.2](../architecture/tora_architecture.md#finite-precision-range-and-saturation-policy)).
 
 ---
 

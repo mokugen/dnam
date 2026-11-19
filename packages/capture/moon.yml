@@ -119,12 +119,62 @@ tasks:
       - "build"
 
   test:
-    command: "cargo"
-    args:
-      - "test"
-      - "--package"
-      - "dnam-capture"
-      - "--all-features"
+    script: |
+      set -euo pipefail
+      python3 - <<'PY'
+      import concurrent.futures, json, os, subprocess, sys, time
+      t0 = time.monotonic()
+      res = subprocess.run(
+          [
+              "cargo", "test", "--package", "dnam-capture", "--all-features",
+              "--lib", "--tests", "--no-run", "--message-format=json",
+          ],
+          stdout=subprocess.PIPE,
+          stderr=subprocess.PIPE,
+          text=True,
+      )
+      if res.returncode != 0:
+          print(res.stdout, file=sys.stderr)
+          print(res.stderr, file=sys.stderr)
+          sys.exit(res.returncode)
+      bins = []
+      seen = set()
+      for line in res.stdout.splitlines():
+          if not line.startswith("{"):
+              continue
+          obj = json.loads(line)
+          exe = obj.get("executable")
+          if (
+              obj.get("reason") == "compiler-artifact"
+              and exe
+              and obj.get("profile", {}).get("test")
+              and exe not in seen
+              and os.path.exists(exe)
+          ):
+              seen.add(exe)
+              bins.append(exe)
+      if not bins:
+          sys.exit("No test binaries found in cargo test --no-run JSON output")
+      def threads_for(exe):
+          base = os.path.basename(exe)
+          if "solver_suite" in base or "stimulus_and_align_suite" in base:
+              return 4
+          return 2
+      def run_bin(exe):
+          s = time.monotonic()
+          cmd = [exe, f"--test-threads={threads_for(exe)}"]
+          p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          return os.path.basename(exe), p.returncode, p.stdout, time.monotonic() - s
+      timings = []
+      with concurrent.futures.ThreadPoolExecutor(max_workers=len(bins)) as ex:
+          for name, rc, out, dt in ex.map(run_bin, bins):
+              timings.append((dt, name))
+              if rc != 0:
+                  print(f"FAILED {name} ({dt:.2f}s):\n{out}", file=sys.stderr)
+                  sys.exit(rc)
+      summary = ", ".join(f"{n}={d:.2f}s" for d, n in sorted(timings, reverse=True))
+      print(f"All {len(bins)} dnam-capture test binaries passed in {time.monotonic() - t0:.2f}s ({summary})")
+      PY
     inputs:
       - "Cargo.toml"
       - "src/**/*"
@@ -142,14 +192,123 @@ tasks:
 
   coverage:
     type: "run"
-    command: "cargo"
-    args:
-      - "llvm-cov"
-      - "--package"
-      - "dnam-capture"
-      - "--all-features"
-      - "--fail-under-lines"
-      - "95"
+    script: |
+      set -euo pipefail
+      cargo llvm-cov clean --profraw-only
+      python3 - <<'PY'
+      import concurrent.futures, glob, json, os, re, subprocess, sys, time
+      repo = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
+      sysroot = subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip()
+      host = next(
+          line.split(": ", 1)[1]
+          for line in subprocess.check_output(["rustc", "-vV"], text=True).splitlines()
+          if line.startswith("host: ")
+      )
+      llvm_bin = os.path.join(sysroot, "lib", "rustlib", host, "bin")
+      llvm_profdata = os.path.join(llvm_bin, "llvm-profdata")
+      llvm_cov = os.path.join(llvm_bin, "llvm-cov")
+      prof_dir = os.path.join(repo, "target", "llvm-cov-target")
+      os.makedirs(prof_dir, exist_ok=True)
+      build_cmd = [
+          "cargo", "llvm-cov", "--profile", "cov", "--package", "dnam-capture",
+          "--all-features", "--lib", "--tests", "--no-report", "--", "--exact", "__none__",
+      ]
+      res = subprocess.run(build_cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+      if res.returncode != 0:
+          print(res.stdout, file=sys.stderr)
+          sys.exit(res.returncode)
+      for old in glob.glob(os.path.join(prof_dir, "*.profraw")):
+          os.remove(old)
+      bins = []
+      for raw in re.findall(r"\(([^)\s]+/out/[^)\s]+)\)", res.stdout):
+          p = raw if os.path.isabs(raw) else os.path.join(repo, raw)
+          if p not in bins and os.path.exists(p):
+              bins.append(p)
+      if not bins:
+          print(res.stdout, file=sys.stderr)
+          sys.exit("No instrumented test binaries found in cargo llvm-cov output")
+      heavy_keys = (
+          "mode1_streaming",
+          "mode2_batch_96khz",
+          "chains_and_watermarks",
+          "48k_window",
+          "silent_muted",
+          "steep_",
+          "live_null",
+          "multirate_bitdepth",
+          "case_09",
+          "routing_topologies",
+          "adversaries_and_topologies",
+      )
+      lib_jobs = []
+      heavy_jobs = []
+      mid_jobs = []
+      proj_jobs = []
+      list_env = {**os.environ, "LLVM_PROFILE_FILE": "/dev/null"}
+      for b in bins:
+          name = os.path.basename(b)
+          if name.startswith("dnam_capture-"):
+              lib_jobs.extend([
+                  ("lib:v3_varpro", [b, "solver::v3_varpro::", "--test-threads=1"]),
+                  ("lib:solver_core", [b, "solver::", "--skip", "solver::v3_varpro::", "--test-threads=1"]),
+                  ("lib:non_solver", [b, "--skip", "solver::", "--test-threads=1"]),
+              ])
+              continue
+          if "proj_suite" in name:
+              proj_jobs.extend([
+                  ("proj:adversarial", [b, "adversarial_regressions::", "--test-threads=1"]),
+                  ("proj:bundle_vault", [b, "bundle_and_vault_edges::", "--test-threads=1"]),
+                  ("proj:dau1_security", [b, "dau1_security::", "--test-threads=1"]),
+                  ("proj:security", [b, "security::", "--skip", "dau1_security::", "--test-threads=1"]),
+              ])
+              continue
+          all_t = subprocess.check_output([b, "--list"], env=list_env, text=True).splitlines()
+          ign_t = set(subprocess.check_output([b, "--list", "--ignored"], env=list_env, text=True).splitlines())
+          for line in all_t:
+              if line.endswith(": test") and line not in ign_t:
+                  tname = line[:-6]
+                  entry = (tname, [b, "--exact", tname, "--test-threads=1"])
+                  if any(k in tname for k in heavy_keys):
+                      heavy_jobs.append(entry)
+                  else:
+                      mid_jobs.append(entry)
+      jobs = lib_jobs + heavy_jobs + proj_jobs + mid_jobs
+      workers = max(4, min(8, os.cpu_count() or 8))
+      env = os.environ.copy()
+      env["LLVM_PROFILE_FILE"] = os.path.join(prof_dir, "dnam-cap-%p-%8m.profraw")
+      t0 = time.monotonic()
+      timings = []
+      def run_job(job):
+          label, cmd = job
+          s = time.monotonic()
+          p = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+          return label, p.returncode, p.stdout, time.monotonic() - s
+      with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+          for label, rc, out, dt in ex.map(run_job, jobs):
+              timings.append((dt, label))
+              if rc != 0:
+                  print(f"FAILED {label} ({dt:.2f}s):\n{out}", file=sys.stderr)
+                  sys.exit(rc)
+      timings.sort(reverse=True)
+      slow = ", ".join(f"{l}={d:.1f}s" for d, l in timings[:5])
+      print(f"Sharded coverage tests passed ({len(jobs)} jobs across {workers}w in {time.monotonic() - t0:.2f}s; top5: {slow})")
+      profraws = glob.glob(os.path.join(prof_dir, "dnam-cap-*.profraw"))
+      if not profraws:
+          sys.exit("No dnam-cap profraw files generated")
+      profdata = os.path.join(prof_dir, "dnam-capture.profdata")
+      subprocess.run([llvm_profdata, "merge", "-sparse", *profraws, "-o", profdata], check=True)
+      obj_args = [bins[0], *(f"--object={b}" for b in bins[1:])]
+      src_dir = os.path.join(repo, "packages", "capture", "src")
+      subprocess.run([llvm_cov, "report", f"--instr-profile={profdata}", *obj_args, "--sources", src_dir], check=True)
+      exp = subprocess.check_output([llvm_cov, "export", "--summary-only", f"--instr-profile={profdata}", *obj_args, "--sources", src_dir], text=True)
+      pct = json.loads(exp)["data"][0]["totals"]["lines"]["percent"]
+      for f in [*profraws, profdata]:
+          if os.path.exists(f):
+              os.remove(f)
+      print(f"dnam-capture line coverage: {pct:.2f}%")
+      if pct < 95.0:
+          sys.exit(f"Line coverage {pct:.2f}% < 95.0%")
+      PY
     inputs:
       - "Cargo.toml"
       - "src/**/*"
@@ -165,6 +324,35 @@ tasks:
       runInCI: "skip"
     tags:
       - "coverage"
+
+  qualify:
+    type: "run"
+    command: "cargo"
+    args:
+      - "test"
+      - "--package"
+      - "dnam-capture"
+      - "--all-features"
+      - "--release"
+      - "--"
+      - "--ignored"
+      - "--nocapture"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+      - "/packages/engine/Cargo.toml"
+      - "/packages/engine/src/**/*"
+      - "/packages/fixtures/Cargo.toml"
+      - "/packages/fixtures/src/**/*"
+    options:
+      cache: false
+      mutex: "cargo"
+      runInCI: false
+    tags:
+      - "qualify"
 
   bench:
     type: "run"

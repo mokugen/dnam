@@ -628,7 +628,7 @@ mod tests {
 
             let v2_hdr_json = serde_json::to_vec(&make_base_header("Dau1Market")).unwrap();
             let hdr_sha = sha256_digest(&v2_hdr_json);
-            let t0 = [0u8; 10_752];
+            let t0 = [0u8; 4_608];
             let tiers: [&[u8]; 1] = [&t0];
             let c_seed = [0x31u8; 32];
             let m_seed = [0x42u8; 32];

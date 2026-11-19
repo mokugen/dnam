@@ -14,8 +14,9 @@ use dnam_engine::schema::{DnamError, check_no_unknown_header_keys};
 
 pub use super::capsules::{
     CalbChunk64B, InpcCapsuleView, StmcCapsuleView, StmcTrajectoryWindow, build_proj_inpc_capsule,
-    build_proj_stmc_capsule, set_stmc_capsule_enabled_flag, set_stmc_capsule_star_center_flag,
-    verify_proj_inpc_capsule, verify_proj_stat_uplo_u, verify_proj_stmc_capsule,
+    build_proj_stmc_capsule, decode_proj_inpc_f32, decode_proj_stmc_f32,
+    set_stmc_capsule_enabled_flag, set_stmc_capsule_star_center_flag, verify_proj_inpc_capsule,
+    verify_proj_stat_uplo_u, verify_proj_stmc_capsule,
 };
 use super::schema::DnamProjManifest;
 use super::{
@@ -30,9 +31,9 @@ pub enum ProjChunkKind {
     Calb,
     /// `b"SPCM"`: Optional aligned raw stem PCM audio (stripped in `< 1 ms` by `compact_to_capsules`).
     Spcm,
-    /// `b"INPC"`: Deterministic dry stimulus seed + `12,000`-frame `fp16` dry coreset (`24,640 B` / `48,640 B`).
+    /// `b"INPC"`: Deterministic dry stimulus seed + `2.0–2.5 s` (`96k–120k`) `fp32` dry coreset.
     Inpc,
-    /// `b"STMC"`: `StemCaptureRecord` capsule (`28,800 B` mono / `52,800 B` stereo).
+    /// `b"STMC"`: `StemCaptureRecord` capsule (`4,800 B` header + `2.0–2.5 s` `fp32` wet coreset).
     Stmc,
     /// `b"STAT"`: `StarCenter` `uplo='U'` `G_0` + `C_0` sufficient statistics (`267,264 B` at `Ultra`).
     Stat,

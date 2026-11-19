@@ -1,8 +1,8 @@
 import { Activity, Gauge, Radio } from "lucide-react";
 import type { DnamTelemetrySnapshot } from "../../host/types.js";
 import { clampNumber, formatDecibels } from "../../lib/utils.js";
-import { Card, CardContent, CardHeader, CardTitle } from "../ui/card.js";
-import { Progress } from "../ui/progress.js";
+import { Card, CardContent, CardHeader, CardTitle } from "../base/card.js";
+import { Progress } from "../base/progress.js";
 
 export interface TriPhysicsTelemetryProps {
   readonly telemetry: DnamTelemetrySnapshot;

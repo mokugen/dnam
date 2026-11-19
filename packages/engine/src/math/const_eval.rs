@@ -1,0 +1,234 @@
+//! Compile-time mathematical evaluation, IEEE-754 seed derivations, and algebraic constant checks
+//! (`ref[repo.code.constant-eval-and-derivations]`).
+//!
+//! All trigonometric, filter-pole, minimax rational Padé, Hermite quadrature, and boundary bit-mask
+//! constants in `dnam-engine` derive here via pure `#![no_std]` `const fn` routines checked by
+//! compile-time assertions (`const _: () = assert!(...)`).
+
+/// IEEE-754 `binary32` exponent bias (`127`).
+pub const IEEE754_F32_EXP_BIAS: u32 = 127;
+
+/// Chebyshev minimax `binary32` positive reciprocal seed (`2*E_bias - 1` exponent + `(2*sqrt(6) - 4)` shift),
+/// balancing the relative seed error of `(1 + f)^-1` across `f in [0, 1)` (`< 3.5e-6` after `NR2`,
+/// `docs/specs/dsp/op_n_commuted_cascade.md` §1.2).
+pub const IEEE754_F32_RCP_SEED: u32 = const_f32_rcp_chebyshev_seed();
+
+/// Robertson/Lomont minimax `binary32` global two-binade inverse-square-root seed
+/// (`docs/specs/dsp/op_n_commuted_cascade.md` §1.2).
+pub const IEEE754_F32_RSQRT_SEED: u32 = 0x5F37_59DF;
+
+/// Robertson/Lomont minimax `binary64` global two-binade inverse-square-root seed
+/// (`docs/specs/dsp/op_n_commuted_cascade.md` §1.2).
+pub const IEEE754_F64_RSQRT_SEED: u64 = 0x5FE6_EB50_C7B5_37A9;
+
+/// Compile-time `5 Hz` Stage IV passband-normalized DC blocker pole at `48 kHz` (`0x3F7F_D51F`).
+pub const STAGE4_DC_BLOCKER_48K_F32: f32 = const_dc_blocker_pole_f32(5.0, 48_000.0);
+
+/// Compile-time largest positive `f32` bit pattern `<= 0.985` (`0x3F7C_28F5`).
+pub const STAGE4_MAX_V_CEIL_BITS_DERIVED: u32 = const_max_f32_bits_le(0.985);
+
+/// Compile-time largest positive `f32` bit pattern `<= 0.9990` (`0x3F7F_BE76`).
+pub const STAGE4_MAX_G_LIN_BITS_DERIVED: u32 = const_max_f32_bits_le(0.9990);
+
+/// Branch-free compile-time `|x|` for `f64`.
+#[inline]
+#[must_use]
+pub const fn const_abs_f64(x: f64) -> f64 {
+    f64::from_bits(x.to_bits() & (u64::MAX >> 1))
+}
+
+/// Compile-time `f64` square root via bit-seeded Newton–Raphson iteration (`< 1 ULP` for `x > 0`).
+#[must_use]
+pub const fn const_sqrt_f64(x: f64) -> f64 {
+    if x <= 0.0 || !x.is_finite() {
+        return 0.0;
+    }
+    let init_bits = (x.to_bits() >> 1) + (0x3FF0_0000_0000_0000_u64 >> 1);
+    let mut y = f64::from_bits(init_bits);
+    let mut i = 0;
+    while i < 8 {
+        y = 0.5 * (y + x / y);
+        i += 1;
+    }
+    y
+}
+
+/// Compile-time `(sin(x), cos(x))` via quadrant reduction (`[-pi/4, pi/4]`) and degree-21/20
+/// Maclaurin evaluation (`< 2e-16` error across standard ranges).
+#[must_use]
+pub const fn const_sin_cos_f64(x: f64) -> (f64, f64) {
+    let k_real = x * core::f64::consts::FRAC_2_PI;
+    let k = if k_real >= 0.0 {
+        (k_real + 0.5) as i64
+    } else {
+        (k_real - 0.5) as i64
+    };
+    let r = x - (k as f64) * core::f64::consts::FRAC_PI_2;
+    let r2 = r * r;
+
+    let mut sin_term = r;
+    let mut sin_sum = r;
+    let mut n = 1_u32;
+    while n <= 10 {
+        let denom = ((2 * n) * (2 * n + 1)) as f64;
+        sin_term = -sin_term * r2 / denom;
+        sin_sum += sin_term;
+        n += 1;
+    }
+
+    let mut cos_term = 1.0_f64;
+    let mut cos_sum = 1.0_f64;
+    let mut m = 1_u32;
+    while m <= 10 {
+        let denom = ((2 * m - 1) * (2 * m)) as f64;
+        cos_term = -cos_term * r2 / denom;
+        cos_sum += cos_term;
+        m += 1;
+    }
+
+    match k & 3 {
+        0 => (sin_sum, cos_sum),
+        1 => (cos_sum, -sin_sum),
+        2 => (-sin_sum, -cos_sum),
+        _ => (-cos_sum, sin_sum),
+    }
+}
+
+/// Compile-time `sin(x)` in `f64`.
+#[must_use]
+pub const fn const_sin_f64(x: f64) -> f64 {
+    const_sin_cos_f64(x).0
+}
+
+/// Compile-time `cos(x)` in `f64`.
+#[must_use]
+pub const fn const_cos_f64(x: f64) -> f64 {
+    const_sin_cos_f64(x).1
+}
+
+/// Compile-time `tan(x)` in `f64`.
+#[must_use]
+pub const fn const_tan_f64(x: f64) -> f64 {
+    let (s, c) = const_sin_cos_f64(x);
+    s / c
+}
+
+/// Compile-time passband-normalized DC blocker pole `R = cos(w) / (1 + sin(w))` rounded to `f32`
+/// (`ref[dsp.stage4.dc-blocker]`).
+#[must_use]
+pub const fn const_dc_blocker_pole_f32(fc_hz: f64, fs_hz: f64) -> f32 {
+    let omega = core::f64::consts::TAU * fc_hz / fs_hz;
+    let (s, c) = const_sin_cos_f64(omega);
+    (c / (1.0 + s)) as f32
+}
+
+/// Solves the exact closed-form $C^1$-clamped rational Padé-`[5/4]` $\tanh(x)$ linear system
+/// at clamping radius `r` (`docs/specs/dsp/op_n_commuted_cascade.md` §1.2), returning `[n1, n2, d1, d2]`.
+#[must_use]
+pub const fn const_c1_clamped_tanh_coeffs(r: f64) -> [f64; 4] {
+    let r2 = r * r;
+    let r3 = r2 * r;
+    let r4 = r2 * r2;
+    let r5 = r4 * r;
+
+    let a11 = 15.0 * r3 - 5.0 * r5 - 15.0 * r2;
+    let a12 = 15.0 * (r5 - r4);
+    let b1 = 15.0 - 15.0 * r + 5.0 * r3 - 2.0 * r5;
+
+    let a21 = 9.0 * r2 - 5.0 * r4 - 6.0 * r;
+    let a22 = 3.0 * (5.0 * r4 - 4.0 * r3);
+    let b2 = 3.0 * r2 - 2.0 * r4 - 3.0;
+
+    let det = a11 * a22 - a12 * a21;
+    let num_d1 = b1 * a22 - b2 * a12;
+    let num_d2 = a11 * b2 - a21 * b1;
+    let d1 = num_d1 / det;
+    let d2 = num_d2 / det;
+    let n1 = (3.0 * num_d1 - det) / (3.0 * det);
+    let n2 = (15.0 * num_d2 - 5.0 * num_d1 + 2.0 * det) / (15.0 * det);
+    [n1, n2, d1, d2]
+}
+
+/// Compile-time coefficients `(c1, c3, c5)` of the unique degree-5 odd Hermite quarter-sine
+/// matching $P(0)=0,\ P'(0)=\pi/2,\ P(1)=1,\ P'(1)=0,\ P''(1)=0$.
+#[must_use]
+pub const fn const_hermite5_quarter_sine_coeffs() -> (f32, f32, f32) {
+    (
+        core::f64::consts::FRAC_PI_2 as f32,
+        (core::f64::consts::PI - 2.5) as f32,
+        (core::f64::consts::FRAC_PI_2 - 1.5) as f32,
+    )
+}
+
+/// Compile-time largest positive normal `f32` bit pattern strictly `<= bound`.
+#[must_use]
+pub const fn const_max_f32_bits_le(bound: f64) -> u32 {
+    let candidate = bound as f32;
+    let bits = candidate.to_bits();
+    if (candidate as f64) > bound {
+        bits - 1
+    } else {
+        bits
+    }
+}
+
+/// Compile-time Chebyshev minimax `binary32` positive reciprocal integer-sub seed
+/// `((2*E_bias - 1) << 23) + round((2*sqrt(6) - 4) * 2^23) == 0x7EF3_11C3`.
+#[must_use]
+pub const fn const_f32_rcp_chebyshev_seed() -> u32 {
+    let shift = 2.0 * const_sqrt_f64(6.0) - 4.0;
+    let mant_round = (shift * ((1_u64 << 23) as f64) + 0.5) as u32;
+    ((2 * IEEE754_F32_EXP_BIAS - 1) << 23) + mant_round
+}
+
+const TANH_R4: [f64; 4] = const_c1_clamped_tanh_coeffs(4.0);
+const _: () = assert!(IEEE754_F32_RCP_SEED == 0x7EF3_11C3);
+const _: () = assert!(STAGE4_DC_BLOCKER_48K_F32.to_bits() == 0x3F7F_D51F);
+const _: () = assert!(STAGE4_MAX_V_CEIL_BITS_DERIVED == 0x3F7C_28F5);
+const _: () = assert!(STAGE4_MAX_G_LIN_BITS_DERIVED == 0x3F7F_BE76);
+const _: () = assert!(const_abs_f64(TANH_R4[0] - 61.0 / 600.0) < 1.0e-15);
+const _: () = assert!(const_abs_f64(TANH_R4[1] - 11.0 / 19_200.0) < 1.0e-15);
+const _: () = assert!(const_abs_f64(TANH_R4[2] - 87.0 / 200.0) < 1.0e-15);
+const _: () = assert!(const_abs_f64(TANH_R4[3] - 47.0 / 3_840.0) < 1.0e-15);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// verify[repo.code.constant-eval-and-derivations]
+    #[test]
+    fn test_const_eval_derivations_match_analytic_identities() {
+        assert!((const_sqrt_f64(2.0) - core::f64::consts::SQRT_2).abs() < 1.0e-15);
+        assert_eq!(const_sqrt_f64(0.0), 0.0);
+        assert_eq!(const_sqrt_f64(-1.0), 0.0);
+        assert_eq!(const_sqrt_f64(f64::INFINITY), 0.0);
+
+        for k in -12..=12 {
+            let x = (k as f64) * 0.37;
+            let (s, c) = (const_sin_f64(x), const_cos_f64(x));
+            assert!((s * s + c * c - 1.0).abs() < 1.0e-14);
+            assert!((const_tan_f64(x) - s / c).abs() < 1.0e-14);
+        }
+
+        // Verify C^1-clamped Padé [5/4] boundary conditions P5(4) == Q4(4) and P5'(4) == Q4'(4).
+        let [n1, n2, d1, d2] = const_c1_clamped_tanh_coeffs(4.0);
+        let r = 4.0_f64;
+        let r2 = r * r;
+        let r4 = r2 * r2;
+        let p5 = r * (1.0 + r2 * n1 + r4 * n2);
+        let q4 = 1.0 + r2 * d1 + r4 * d2;
+        let dp5 = 1.0 + 3.0 * r2 * n1 + 5.0 * r4 * n2;
+        let dq4 = 2.0 * r * d1 + 4.0 * r2 * r * d2;
+        assert!((p5 - q4).abs() < 1.0e-12);
+        assert!((dp5 - dq4).abs() < 1.0e-12);
+
+        // Verify degree-5 odd Hermite quarter-sine boundary conditions P(1)=1, P'(1)=0, and P(0.5) ~= sin(pi/4).
+        let (c1, c3, c5) = const_hermite5_quarter_sine_coeffs();
+        let p_1 = c1 - c3 + c5;
+        let dp_1 = c1 - 3.0 * c3 + 5.0 * c5;
+        let p_half = 0.5 * c1 - 0.125 * c3 + 0.03125 * c5;
+        assert!((p_1 - 1.0).abs() < 1.0e-6);
+        assert!(dp_1.abs() < 1.0e-5);
+        assert!((p_half - core::f32::consts::FRAC_1_SQRT_2).abs() < 2.0e-3);
+    }
+}

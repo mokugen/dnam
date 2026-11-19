@@ -6,8 +6,11 @@
 //! - `docs/specs/training/four_stage_pipeline.md` (`ref[train.gram.wide192]`, `ref[train.gram.accuracy-contract]`)
 //! - `docs/specs/containers/project_container_format.md` (`ref[container.proj.stat-uplo-u]`)
 
+mod cross_only;
+
 use super::backends::{DynamicTrainer, TrainerBackend, TrainerTask};
 use super::{uplo_u_index, uplo_u_packed_len};
+use cross_only::{accum_cross_corr_column, analyze_micro_batch_bounds, scan_valid_frame_indices};
 
 /// Veltkamp-Dekker splitting constant $2^{27} + 1$ for exact `f64 * f64 -> (hi, lo)` decomposition
 /// without hardware FMA dependence (strictly bit-identical across `ARM64`, `x86_64`, and `wasm32`).
@@ -324,146 +327,39 @@ pub fn contract_256d_gram_tiled_wide192(
     })
 }
 
-/// Backend-parameterized `256-D` Gram & cross-correlation contraction (`r[train.gram.wide192]`).
-pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
+/// Backend-parameterized `dim`-D (`4..=256`, multiple of `4`) Gram & cross-correlation
+/// contraction (`r[train.gram.wide192]`).
+pub fn contract_dim_gram_tiled_wide192_with_backend<B: TrainerBackend>(
     features: &[[f32; 256]],
     targets_lr: &[[f64; 2]],
     weights: &[f64],
     frame_stride: usize,
+    dim: usize,
 ) -> (Vec<f64>, Vec<[f64; 2]>) {
-    let n_frames = features.len().min(targets_lr.len()).min(weights.len());
-    let stride = frame_stride.max(1);
-    let n_pack = uplo_u_packed_len(256);
-
-    let mut valid_indices = Vec::with_capacity(n_frames.div_ceil(stride));
-    let mut scan_idx = 0usize;
-    while scan_idx < n_frames {
-        let w = weights[scan_idx];
-        let y = targets_lr[scan_idx];
-        let fb = &features[scan_idx];
-        if w.is_finite()
-            && w > 0.0
-            && y[0].is_finite()
-            && y[1].is_finite()
-            && fb.iter().all(|v| v.is_finite())
-        {
-            valid_indices.push(scan_idx);
-        }
-        scan_idx += stride;
-    }
+    let dim = dim.clamp(4, 256) & !3;
+    let n_blocks = dim >> 2;
+    let (valid_indices, n_frames) =
+        scan_valid_frame_indices(features, targets_lr, weights, frame_stride, dim);
     let sampled_frames = valid_indices.len();
+    let n_pack = uplo_u_packed_len(dim);
     if sampled_frames == 0 {
-        return (vec![0.0_f64; n_pack], vec![[0.0_f64; 2]; 256]);
+        return (vec![0.0_f64; n_pack], vec![[0.0_f64; 2]; dim]);
     }
 
     let mut wide_g = vec![Wide192Accum::zero(); n_pack];
-    let mut wide_c = vec![[Wide192Accum::zero(); 2]; 256];
+    let mut wide_c = vec![[Wide192Accum::zero(); 2]; dim];
 
-    // L1D-contiguous block layout `[64 blocks][256 frames][4 lanes]` (`8 KB` sequential per block).
+    // L1D-contiguous block layout `[n_blocks][256 frames][4 lanes]` (`8 KB` sequential per block).
     let b_cap = sampled_frames.min(MICRO_BATCH_FRAMES);
-    let mut blk_f = vec![[[0.0_f64; 4]; MICRO_BATCH_FRAMES]; 64];
-    let mut blk_wf = vec![[[0.0_f64; 4]; MICRO_BATCH_FRAMES]; 64];
+    let mut blk_f = vec![[[0.0_f64; 4]; MICRO_BATCH_FRAMES]; n_blocks];
+    let mut blk_wf = vec![[[0.0_f64; 4]; MICRO_BATCH_FRAMES]; n_blocks];
     let mut is_lo = vec![[false; 256]; b_cap];
-    let mut batch_y = [[0.0_f64; 2]; MICRO_BATCH_FRAMES];
-    let mut batch_w = [0.0_f64; MICRO_BATCH_FRAMES];
 
     let scale_w = (n_frames as f64) / (sampled_frames as f64);
     for chunk_indices in valid_indices.chunks(MICRO_BATCH_FRAMES) {
-        let b_len = chunk_indices.len();
-        let mut w_max = 0.0_f64;
-        let mut w_min = f64::INFINITY;
-        let mut y_nz_mask = [[0_u64; 4]; 2];
-        let mut max_y = [0.0_f64; 2];
-        let mut min_nz_y = [f64::INFINITY; 2];
-        let mut y_batch_mono = true;
-        let mut col_max_f32 = [0.0_f32; 256];
-        let mut col_min_nz_f32 = [f32::INFINITY; 256];
-
-        for (k, &idx) in chunk_indices.iter().enumerate() {
-            let w = weights[idx] * scale_w;
-            batch_w[k] = w;
-            w_max = w_max.max(w);
-            w_min = w_min.min(w);
-
-            let y = targets_lr[idx];
-            batch_y[k] = y;
-            if y[0].to_bits() != y[1].to_bits() {
-                y_batch_mono = false;
-            }
-            let w_word = k >> 6;
-            let w_bit = 1_u64 << (k & 63);
-            let ay0 = y[0].abs();
-            if ay0 > 0.0 {
-                y_nz_mask[0][w_word] |= w_bit;
-                max_y[0] = max_y[0].max(ay0);
-                min_nz_y[0] = min_nz_y[0].min(ay0);
-            }
-            let ay1 = y[1].abs();
-            if ay1 > 0.0 {
-                y_nz_mask[1][w_word] |= w_bit;
-                max_y[1] = max_y[1].max(ay1);
-                min_nz_y[1] = min_nz_y[1].min(ay1);
-            }
-
-            // Branchless NEON-vectorizable f32 abs/max/min scan across the 256 feature columns.
-            let fb = &features[idx];
-            for d in 0..256 {
-                let af = fb[d].abs();
-                col_max_f32[d] = col_max_f32[d].max(af);
-                let nz = if af > 0.0 { af } else { f32::INFINITY };
-                col_min_nz_f32[d] = col_min_nz_f32[d].min(nz);
-            }
-        }
-
-        let w_extreme = w_max > 1.0e90 || w_min < 1.0e-90;
-        let mut col_max_f = [0.0_f64; 256];
-        let mut col_min_nz_f = [f64::INFINITY; 256];
-        let mut col_max_wf = [0.0_f64; 256];
-        let mut col_min_nz_wf = [f64::INFINITY; 256];
-        let mut col_wide_exp = [false; 256];
-        let mut col_extreme = [false; 256];
-
-        for d in 0..256 {
-            let mf = f64::from(col_max_f32[d]);
-            if mf == 0.0 {
-                continue;
-            }
-            let nf = f64::from(col_min_nz_f32[d]);
-            col_max_f[d] = mf;
-            col_min_nz_f[d] = nf;
-            // Exact upper/lower envelope: col_max_wf <= mf * w_max and col_min_nz_wf >= nf * w_min.
-            if !w_extreme
-                && mf * w_max <= nf * w_min * 65_536.0
-                && mf * w_max <= 1.0e130
-                && nf * w_min >= 1.0e-130
-            {
-                col_max_wf[d] = mf * w_max;
-                col_min_nz_wf[d] = nf * w_min;
-            } else {
-                let mut mwf = 0.0_f64;
-                let mut nwf = f64::INFINITY;
-                for (k, &idx) in chunk_indices.iter().enumerate() {
-                    let fd = f64::from(features[idx][d]);
-                    if fd != 0.0 {
-                        let awf = (batch_w[k] * fd).abs();
-                        if awf > 0.0 && awf.is_finite() {
-                            mwf = mwf.max(awf);
-                            nwf = nwf.min(awf);
-                        }
-                    }
-                }
-                col_max_wf[d] = mwf;
-                col_min_nz_wf[d] = nwf;
-                let extreme = w_extreme
-                    || mf > 1.0e130
-                    || mwf > 1.0e130
-                    || nf < 1.0e-130
-                    || nwf < 1.0e-130
-                    || mwf == 0.0;
-                col_extreme[d] = extreme;
-                col_wide_exp[d] = extreme || mf > nf * 65_536.0 || mwf > nwf * 65_536.0;
-            }
-        }
+        let b =
+            analyze_micro_batch_bounds(features, targets_lr, weights, chunk_indices, scale_w, dim);
+        let b_len = b.b_len;
 
         let mut block_nz_mask = [[0_u64; 4]; 64];
         let mut col_nz_mask = [[0_u64; 4]; 256];
@@ -471,19 +367,19 @@ pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
         let mut frame_has_lo = [false; MICRO_BATCH_FRAMES];
         let mut any_lo = false;
 
-        for blk in 0..64 {
+        for blk in 0..n_blocks {
             let b0 = blk * 4;
-            if col_max_f[b0] == 0.0
-                && col_max_f[b0 + 1] == 0.0
-                && col_max_f[b0 + 2] == 0.0
-                && col_max_f[b0 + 3] == 0.0
+            if b.col_max_f[b0] == 0.0
+                && b.col_max_f[b0 + 1] == 0.0
+                && b.col_max_f[b0 + 2] == 0.0
+                && b.col_max_f[b0 + 3] == 0.0
             {
                 continue;
             }
-            let blk_has_wide = col_wide_exp[b0]
-                || col_wide_exp[b0 + 1]
-                || col_wide_exp[b0 + 2]
-                || col_wide_exp[b0 + 3];
+            let blk_has_wide = b.col_wide_exp[b0]
+                || b.col_wide_exp[b0 + 1]
+                || b.col_wide_exp[b0 + 2]
+                || b.col_wide_exp[b0 + 3];
             let dst_f = &mut blk_f[blk][..b_len];
             let dst_wf = &mut blk_wf[blk][..b_len];
 
@@ -493,7 +389,7 @@ pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
                 let mut m2 = [0_u64; 4];
                 let mut m3 = [0_u64; 4];
                 for (k, &idx) in chunk_indices.iter().enumerate() {
-                    let w = batch_w[k];
+                    let w = b.batch_w[k];
                     let fb = &features[idx];
                     let f0 = f64::from(fb[b0]);
                     let f1 = f64::from(fb[b0 + 1]);
@@ -528,19 +424,19 @@ pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
             } else {
                 let mut hi_mask = [0_u64; 4];
                 let tf = [
-                    col_max_f[b0] * (1.0 / 65_536.0),
-                    col_max_f[b0 + 1] * (1.0 / 65_536.0),
-                    col_max_f[b0 + 2] * (1.0 / 65_536.0),
-                    col_max_f[b0 + 3] * (1.0 / 65_536.0),
+                    b.col_max_f[b0] * (1.0 / 65_536.0),
+                    b.col_max_f[b0 + 1] * (1.0 / 65_536.0),
+                    b.col_max_f[b0 + 2] * (1.0 / 65_536.0),
+                    b.col_max_f[b0 + 3] * (1.0 / 65_536.0),
                 ];
                 let twf = [
-                    col_max_wf[b0] * (1.0 / 65_536.0),
-                    col_max_wf[b0 + 1] * (1.0 / 65_536.0),
-                    col_max_wf[b0 + 2] * (1.0 / 65_536.0),
-                    col_max_wf[b0 + 3] * (1.0 / 65_536.0),
+                    b.col_max_wf[b0] * (1.0 / 65_536.0),
+                    b.col_max_wf[b0 + 1] * (1.0 / 65_536.0),
+                    b.col_max_wf[b0 + 2] * (1.0 / 65_536.0),
+                    b.col_max_wf[b0 + 3] * (1.0 / 65_536.0),
                 ];
                 for (k, &idx) in chunk_indices.iter().enumerate() {
-                    let w = batch_w[k];
+                    let w = b.batch_w[k];
                     let fb = &features[idx];
                     let w_word = k >> 6;
                     let w_bit = 1_u64 << (k & 63);
@@ -554,8 +450,8 @@ pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
                         }
                         let wfd = w * fd;
                         col_nz_mask[d][w_word] |= w_bit;
-                        if col_wide_exp[d]
-                            && (col_extreme[d] || fd.abs() < tf[lane] || wfd.abs() < twf[lane])
+                        if b.col_wide_exp[d]
+                            && (b.col_extreme[d] || fd.abs() < tf[lane] || wfd.abs() < twf[lane])
                         {
                             is_lo[k][d] = true;
                             frame_has_lo[k] = true;
@@ -576,60 +472,39 @@ pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
 
         // Cross-correlation accumulation across active `(d, ch)` columns (`512` slots), using L1D-packed
         // `blk_wf` when span <= 2^16 AND no >= 2^32 cancellation occurred, else exact `Wide192Accum`.
-        let y_either_nz = mask256_or(y_nz_mask[0], y_nz_mask[1]);
+        let y_either_nz = mask256_or(b.y_nz_mask[0], b.y_nz_mask[1]);
         if y_either_nz != [0; 4] {
             let y_wide = [
-                max_y[0] > 1.0e130 || min_nz_y[0] < 1.0e-130 || max_y[0] > min_nz_y[0] * 65_536.0,
-                max_y[1] > 1.0e130 || min_nz_y[1] < 1.0e-130 || max_y[1] > min_nz_y[1] * 65_536.0,
+                b.max_y[0] > 1.0e130
+                    || b.min_nz_y[0] < 1.0e-130
+                    || b.max_y[0] > b.min_nz_y[0] * 65_536.0,
+                b.max_y[1] > 1.0e130
+                    || b.min_nz_y[1] < 1.0e-130
+                    || b.max_y[1] > b.min_nz_y[1] * 65_536.0,
             ];
-            for d in 0..256 {
+            for (d, wide_c_d) in wide_c.iter_mut().enumerate().take(dim) {
                 if !mask256_overlaps(col_nz_mask[d], y_either_nz) {
                     continue;
                 }
                 let blk_wf_d = &blk_wf[d >> 2][..b_len];
                 let ld = d & 3;
-                let ch_limit = if y_batch_mono { 1 } else { 2 };
-                for ch in 0..ch_limit {
-                    if !mask256_overlaps(col_nz_mask[d], y_nz_mask[ch]) {
-                        continue;
-                    }
-                    let fast_ok = !col_wide_exp[d] && !y_wide[ch];
-                    let mut used_fast = false;
-                    if fast_ok {
-                        let mut s = 0.0_f64;
-                        for (k, wf4) in blk_wf_d.iter().enumerate() {
-                            s += wf4[ld] * batch_y[k][ch];
-                        }
-                        if s.abs() > col_max_wf[d] * max_y[ch] * (1.0 / 4_294_967_296.0) {
-                            wide_c[d][ch].add_f64(s);
-                            if y_batch_mono {
-                                wide_c[d][1].add_f64(s);
-                            }
-                            used_fast = true;
-                        }
-                    }
-                    if !used_fast {
-                        let mut acc = Wide192Accum::zero();
-                        for (k, &idx) in chunk_indices.iter().enumerate() {
-                            acc.add_three_way_f64(
-                                batch_w[k],
-                                f64::from(features[idx][d]),
-                                batch_y[k][ch],
-                            );
-                        }
-                        wide_c[d][ch].merge(&acc);
-                        if y_batch_mono {
-                            wide_c[d][1].merge(&acc);
-                        }
-                    }
-                }
+                accum_cross_corr_column(
+                    wide_c_d,
+                    col_nz_mask[d],
+                    d,
+                    &b,
+                    y_wide,
+                    features,
+                    chunk_indices,
+                    |k| blk_wf_d[k][ld],
+                );
             }
         }
 
         // [8 x 4] / [4 x 4] L1D-sequential block upper-triangular contraction & fused Wide192Accum merge,
         // recomputing any pair with `>= 2^32` (`~193 dB`) cancellation via exact `w * (f_i * f_j)` products.
         let mut active_bi = [0usize; 64];
-        for bj in 0..64 {
+        for bj in 0..n_blocks {
             let mask_j = block_nz_mask[bj];
             if mask_j == [0; 4] {
                 continue;
@@ -642,10 +517,10 @@ pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
                 uplo_u_index(0, j0 + 3),
             ];
             let max_wf_j4 = [
-                col_max_wf[j0] * (1.0 / 4_294_967_296.0),
-                col_max_wf[j0 + 1] * (1.0 / 4_294_967_296.0),
-                col_max_wf[j0 + 2] * (1.0 / 4_294_967_296.0),
-                col_max_wf[j0 + 3] * (1.0 / 4_294_967_296.0),
+                b.col_max_wf[j0] * (1.0 / 4_294_967_296.0),
+                b.col_max_wf[j0 + 1] * (1.0 / 4_294_967_296.0),
+                b.col_max_wf[j0 + 2] * (1.0 / 4_294_967_296.0),
+                b.col_max_wf[j0 + 3] * (1.0 / 4_294_967_296.0),
             ];
             let f_j = &blk_f[bj][..b_len];
             let wf_j = &blk_wf[bj][..b_len];
@@ -661,29 +536,29 @@ pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
                 for li in 0..lj {
                     let i = j0 + li;
                     let v = d_tile[lj][li];
-                    if v.abs() > col_max_f[i] * max_wf_j4[lj] {
+                    if v.abs() > b.col_max_f[i] * max_wf_j4[lj] {
                         wide_g[col_j + i].add_f64(v);
-                    } else if col_max_f[i] > 0.0 && mask256_overlaps(hi_col_mask[i], mask_hj) {
+                    } else if b.col_max_f[i] > 0.0 && mask256_overlaps(hi_col_mask[i], mask_hj) {
                         for k in 0..b_len {
                             let prod_ff = f_j[k][li] * f_j[k][lj];
                             if prod_ff != 0.0 {
-                                wide_g[col_j + i].add_product(batch_w[k], prod_ff);
+                                wide_g[col_j + i].add_product(b.batch_w[k], prod_ff);
                             }
                         }
                     }
                 }
                 let dv = d_tile[lj][lj];
-                if w_min >= 0.0 {
+                if !b.w_extreme && b.w_min >= 0.0 {
                     if dv != 0.0 {
                         wide_g[col_j + j].add_f64(dv);
                     }
-                } else if dv.abs() > col_max_f[j] * max_wf_j4[lj] {
+                } else if dv.abs() > b.col_max_f[j] * max_wf_j4[lj] {
                     wide_g[col_j + j].add_f64(dv);
                 } else {
                     for k in 0..b_len {
                         let prod_ff = f_j[k][lj] * f_j[k][lj];
                         if prod_ff != 0.0 {
-                            wide_g[col_j + j].add_product(batch_w[k], prod_ff);
+                            wide_g[col_j + j].add_product(b.batch_w[k], prod_ff);
                         }
                     }
                 }
@@ -710,13 +585,14 @@ pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
                     for li in 0..4 {
                         let i = i0 + li;
                         let v = tile[lj][li];
-                        if v.abs() > col_max_f[i] * mwf {
+                        if v.abs() > b.col_max_f[i] * mwf {
                             wide_g[col_j + i].add_f64(v);
-                        } else if col_max_f[i] > 0.0 && mask256_overlaps(hi_col_mask[i], mask_hj) {
+                        } else if b.col_max_f[i] > 0.0 && mask256_overlaps(hi_col_mask[i], mask_hj)
+                        {
                             for k in 0..b_len {
                                 let prod_ff = f_i[k][li] * f_j[k][lj];
                                 if prod_ff != 0.0 {
-                                    wide_g[col_j + i].add_product(batch_w[k], prod_ff);
+                                    wide_g[col_j + i].add_product(b.batch_w[k], prod_ff);
                                 }
                             }
                         }
@@ -744,10 +620,10 @@ pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
                 if !frame_has_lo[k] {
                     continue;
                 }
-                let w = batch_w[k];
+                let w = b.batch_w[k];
                 let fb = &features[idx];
                 let lo_row = &mut is_lo[k];
-                for d in 0..256 {
+                for d in 0..dim {
                     if !lo_row[d] {
                         continue;
                     }
@@ -759,7 +635,7 @@ pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
                                 wide_g[col_d + i].add_product(w, f64::from(fi_f32) * fd);
                             }
                         }
-                        for j in (d + 1)..256 {
+                        for j in (d + 1)..dim {
                             if !lo_row[j] {
                                 let fj_f32 = fb[j];
                                 if fj_f32 != 0.0 {
@@ -770,7 +646,7 @@ pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
                         }
                     }
                 }
-                lo_row.fill(false);
+                lo_row[..dim].fill(false);
             }
         }
     }
@@ -783,7 +659,21 @@ pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
     (out_g, out_c)
 }
 
-pub(crate) use super::extract_rank4_svd_modes;
+/// Backend-parameterized `256-D` Gram & cross-correlation contraction (`r[train.gram.wide192]`).
+pub fn contract_256d_gram_tiled_wide192_with_backend<B: TrainerBackend>(
+    features: &[[f32; 256]],
+    targets_lr: &[[f64; 2]],
+    weights: &[f64],
+    frame_stride: usize,
+) -> (Vec<f64>, Vec<[f64; 2]>) {
+    contract_dim_gram_tiled_wide192_with_backend::<B>(
+        features,
+        targets_lr,
+        weights,
+        frame_stride,
+        256,
+    )
+}
 
 #[cfg(test)]
 mod tests {

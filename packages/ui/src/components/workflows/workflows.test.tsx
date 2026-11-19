@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { expectZeroAxeViolations } from "../../../tests/setup.js";
-import { CapturePlanPanel, TrainingTimelinePanel } from "./index.js";
+import { CapturePlanPanel } from "./CapturePlanPanel.js";
+import { TrainingTimelinePanel } from "./TrainingTimelinePanel.js";
 
 describe("CapturePlanPanel and TrainingTimelinePanel", () => {
   it("renders CapturePlanPanel steps and triggers stem recording callback", async () => {

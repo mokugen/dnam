@@ -109,10 +109,10 @@ fn build_demo_model(name: &str, seed: u8) -> AlignedBuffer<CacheLine64> {
         tensor_directory: BTreeMap::new(),
     };
 
-    let mut arena = vec![0u8; 64_000];
-    for (i, byte) in arena[128..35_200].iter_mut().enumerate() {
-        *byte = (((i as u8).wrapping_mul(7)).wrapping_add(seed)) & 0x3F;
-    }
+    let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+    let mut model = dnam_engine::stages::V3MatryoshkaModel::dual_rate_default(false);
+    model.stage0.xo_low_gain = 1.0 + 0.01 * (seed as f32);
+    dnam_engine::stages::weights::pack_v3_matryoshka_to_arena(&model, &mut arena);
     let raw = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
     let mut aligned = AlignedBuffer::<CacheLine64>::new_zeroed(raw.len() / 64);
     aligned.as_bytes_mut().copy_from_slice(&raw);

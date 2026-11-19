@@ -1,5 +1,7 @@
 import { useFixtureInput, useFixtureSelect } from "react-cosmos/client";
-import { AccelerationBadge, DiscreteSwitch, RotaryKnob, StabilityAuditBadge } from "./index.js";
+import { DiscreteSwitch } from "./DiscreteSwitch.js";
+import { RotaryKnob } from "./RotaryKnob.js";
+import { AccelerationBadge, StabilityAuditBadge } from "./StatusBadges.js";
 
 function RotaryKnobPlayground() {
   const [value, setValue] = useFixtureInput("Value", 6.5);

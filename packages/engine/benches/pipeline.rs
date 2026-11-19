@@ -128,10 +128,13 @@ fn make_bench_container() -> AlignedBuffer<CacheLine64> {
         tensor_directory: BTreeMap::new(),
     };
 
-    let mut arena = vec![0u8; 64_000];
-    for (i, byte) in arena[128..62_000].iter_mut().enumerate() {
-        *byte = ((i * 7 + 3) & 0x3F) as u8;
+    let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+    let mut model = dnam_engine::stages::V3MatryoshkaModel::dual_rate_default(false);
+    for s4 in &mut model.stage4 {
+        s4.g_loop = 0.80;
+        s4.wet_mix = 0.15;
     }
+    dnam_engine::stages::weights::pack_v3_matryoshka_to_arena(&model, &mut arena);
     let raw = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
     let mut aligned = AlignedBuffer::<CacheLine64>::new_zeroed(raw.len() / 64);
     aligned.as_bytes_mut().copy_from_slice(&raw);
@@ -324,10 +327,70 @@ fn bench_denormal_and_multi_instance(c: &mut Criterion) {
     multi_group.finish();
 }
 
+fn bench_serial_chain_rack(c: &mut Criterion) {
+    let container = make_bench_container();
+    let mut group = c.benchmark_group("serial_chain_rack_128");
+    let in_l = [0.15_f32; 128];
+    let in_r = [-0.15_f32; 128];
+    let mut ping_l = [0.0_f32; 128];
+    let mut ping_r = [0.0_f32; 128];
+    let mut pong_l = [0.0_f32; 128];
+    let mut pong_r = [0.0_f32; 128];
+
+    for &(label, tier, count) in &[
+        ("lite_14x", Tier::Lite, 14_usize),
+        ("full_8x", Tier::Full, 8_usize),
+        ("pro_4x", Tier::Pro, 4_usize),
+        ("ultra_2x", Tier::Ultra, 2_usize),
+    ] {
+        group.throughput(Throughput::Elements((count * 128) as u64));
+        let mut chain: Vec<DnamEngine<'_, DefaultMathBackend>> = (0..count)
+            .map(|_| {
+                DnamEngine::<DefaultMathBackend>::from_bytes(container.as_bytes(), tier, 48_000)
+                    .unwrap()
+            })
+            .collect();
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                chain[0].process_block(
+                    black_box(&in_l),
+                    black_box(&in_r),
+                    black_box(&mut ping_l),
+                    black_box(&mut ping_r),
+                );
+                for (idx, inst) in chain.iter_mut().enumerate().skip(1) {
+                    if idx & 1 == 1 {
+                        inst.process_block(
+                            black_box(&ping_l),
+                            black_box(&ping_r),
+                            black_box(&mut pong_l),
+                            black_box(&mut pong_r),
+                        );
+                    } else {
+                        inst.process_block(
+                            black_box(&pong_l),
+                            black_box(&pong_r),
+                            black_box(&mut ping_l),
+                            black_box(&mut ping_r),
+                        );
+                    }
+                }
+                if count & 1 == 1 {
+                    black_box((&ping_l, &ping_r));
+                } else {
+                    black_box((&pong_l, &pong_r));
+                }
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_process_block_tiers_and_backends,
     bench_io_topologies_and_buffer_sizes,
-    bench_denormal_and_multi_instance
+    bench_denormal_and_multi_instance,
+    bench_serial_chain_rack
 );
 criterion_main!(benches);

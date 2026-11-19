@@ -13,16 +13,16 @@ requirements:
   - REQ-8.8
 adrs:
   - ADR-0009
-  - ADR-0011
   - ADR-0020
+  - ADR-0021
 ---
 
 # `.dnam` Hybrid Binary Container & `< 50 ns` Zero-Copy Hardware Loader
 
-DNAM defines four companion **64-byte cache-line and SIMD-aligned `v2.0` Hybrid Binary Container formats** engineered for zero-copy hardware loading ([`REQ-5.1`, `REQ-5.6`](../../requirements/system_goals_and_requirements.md#6-goal-5--single-run-slimmable-multi-tier-architecture-lite--full--pro--ultra), [`REQ-8.1`, `REQ-8.8`](../../requirements/system_goals_and_requirements.md#9-goal-8--model-provenance-hardware-drm-forensic-watermarking--marketplace-security), [`ADR-0009`](../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md), [`ADR-0020`](../../adr/0020-modular-monorepo-and-dnam-proj-container.md)):
+DNAM defines four companion **64-byte cache-line and SIMD-aligned `v2.0` Hybrid Binary Container formats** engineered for zero-copy hardware loading ([`REQ-5.1`, `REQ-5.6`](../../requirements/system_goals_and_requirements.md#6-goal-5--single-run-slimmable-multi-tier-architecture-lite--full--pro--ultra), [`REQ-8.1`, `REQ-8.8`](../../requirements/system_goals_and_requirements.md#9-goal-8--model-provenance-hardware-drm-forensic-watermarking--marketplace-security), [`ADR-0009`](../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md), [`ADR-0020`](../../adr/0020-modular-monorepo-and-dnam-proj-container.md), [`ADR-0021`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md)):
 
-1. `r[container.dnam.formats]` **`.dnam` (Magic `b"DNAM"`, Version `2.0`):** Runtime deployment model with a 64B preamble, 128B directory, RFC 8785 JCS immutable header, Region 4 `shared_extent` (`P * 64 B` `ControlClampDescriptor` table + overflow `CP1` contributor stream), `DAU1`/`DAI1` authentication envelope, four nested tier payloads (`Arena 0..3`: `Lite ⊂ Full ⊂ Pro ⊂ Ultra`), and a growable `DMU1`/`DME1` + `DMUE` mutable suffix.
-2. **`.dnam-proj` (Magic `b"DNPJ"`, Version `2.0`):** Single-file cloud-ready project and Capture Vault container front-loading a 64B preamble, content-addressed `SHA-256` chunk directory, and RFC 8785 JCS manifest for `HTTP Range` inspection alongside `CALB`, `SPCM`, `INPC`/`STMC` `fp16` coreset capsules, `STAT` `uplo='U'` sufficient statistics, `WGHT` embedded `.dnam` weights, and `AUTH` provenance ([`project_container_format.md`](project_container_format.md)).
+1. `r[container.dnam.formats]` **`.dnam` (Magic `b"DNAM"`, Version `2.0`):** Runtime deployment model with a 64B preamble, 128B directory, RFC 8785 JCS immutable header, Region 4 `shared_extent` (`P * 64 B` `ControlClampDescriptor` table + overflow `CP1` contributor stream), `DAU1`/`DAI1` authentication envelope, four nested L1D-resident TORA `v3` tier payloads (`Arena 0..3`: `Lite ⊂ Full ⊂ Pro ⊂ Ultra`, cumulative ends `<= 4,608 / 10,240 / 18,432 / 28,672 B`), and a growable `DMU1`/`DME1` + `DMUE` mutable suffix.
+2. **`.dnam-proj` (Magic `b"DNPJ"`, Version `2.0`):** Single-file cloud-ready project and Capture Vault container front-loading a 64B preamble, content-addressed `SHA-256` chunk directory, and RFC 8785 JCS manifest for `HTTP Range` inspection alongside `CALB`, `SPCM`, `INPC`/`STMC` `2.0–2.5 s` full-bandwidth (`20 Hz–20 kHz`) `fp32` capsules, `STAT` cached `StarCenter` trajectories & `uplo='U'` sufficient statistics, `WGHT` embedded `.dnam` weights, and `AUTH` provenance ([`project_container_format.md`](project_container_format.md)).
 3. **`.dnam-seal` (Magic `b"DNSL"`, Version `2.0`):** Opaque 64-byte-aligned OEM hardware-enclave wrapper (`DnamProtectionProfile::EnclaveSealed`, `DSA1` manifest; see [`../security/provenance_and_enclave_drm.md` §3](../security/provenance_and_enclave_drm.md#3-pillar-2-hardware-enclave--oem-drm-oemdevicecertificate-attestation--dnam-seal-bdnsl-wrapper)).
 4. **`.dnam-prev`:** Dedicated `Lite`-only storefront auditioning container that physically omits `Full`, `Pro`, and `Ultra` payloads ([`../security/watermarking_and_marketplace.md` §3](../security/watermarking_and_marketplace.md#3-commercial-storefront-platform-auditioning-royalty-splits--storefront-metadata)).
 
@@ -42,12 +42,12 @@ flowchart LR
         P --> D --> H
     end
 
-    subgraph Arenas ["2. Contiguous 64B-Aligned Tier Payloads (tier_start..tier_end)"]
+    subgraph Arenas ["2. Contiguous 64B-Aligned L1D-Resident Tier Payloads (tier_start..tier_end)"]
         direction TB
-        A0["Arena 0: Lite Base Tier (C=4, K=4, M=4, 8-D Ctrl)"]
-        A1["Arena 1: Full Delta Tier (+4 ch, +4 Kautz, +4 FDN)"]
-        A2["Arena 2: Pro Delta Tier (+4 ch, +8 Kautz)"]
-        A3["Arena 3: Ultra Delta Tier (+4 ch, +16 Kautz, +8 FDN, +8-D Ctrl)"]
+        A0["Arena 0: Lite Base Tier ([1,1,1] 12ch @ 1x, 16 FIR, 4 Kautz, 4 FDN, 8-D Ctrl, <= 4,608 B)"]
+        A1["Arena 1: Full Delta Tier ([2,1,1] +4ch @ 1x, +16 FIR, +4 Kautz, +4 FDN, cum. <= 10,240 B)"]
+        A2["Arena 2: Pro Delta Tier ([2,2,1] +4ch @ 2x, +16 FIR, +4 Kautz, +2 FDN taps, cum. <= 18,432 B)"]
+        A3["Arena 3: Ultra Delta Tier ([3,2,1] +4ch @ 2x, +16 FIR, +4 Kautz, +8 FDN, +8-D Ctrl, <= 28,672 B)"]
         A0 --> A1 --> A2 --> A3
     end
 
@@ -172,18 +172,18 @@ Each `reference_samples` entry is canonical ASCII decimal text parsed as a nonze
 
 Loaders validate all tensor offsets, 64-byte alignments, shapes, finite coefficients, and signature commitments before exposing zero-copy tensor views, and initialize recursive stages to their resting DC equilibrium states ([`../dsp/op_n_commuted_cascade.md` §3.4](../dsp/op_n_commuted_cascade.md#34-boundary-conditions-resting-dc-equilibrium--pop-free-startup)).
 
-`r[container.dnam.tensor-directory]` **Canonical 64B-Aligned Tier Arena Slice Directory (`ADR-0011`):**
-Every slice declared in `tensor_directory` has a 64-byte-aligned `byte_offset` relative to `tier_start` (`byte_offset % 64 == 0`), a `byte_length` within its owning tier's prefix boundary `original_tier_ends[t] - tier_start`, and uses the canonical per-tier slice identifiers below:
+`r[container.dnam.tensor-directory]` **Canonical 64B-Aligned Tier Arena Slice Directory (`ADR-0021`):**
+Every slice declared in `tensor_directory` has a 64-byte-aligned `byte_offset` relative to `tier_start` (`byte_offset % 64 == 0`), a `byte_length` within its owning tier's cumulative prefix boundary `original_tier_ends[t] - tier_start` (`<= 4,608 / 10,240 / 18,432 / 28,672 B` across `Lite / Full / Pro / Ultra`), and uses the canonical per-tier slice identifiers below:
 
 | Slice Identifier | Owning Tier Arena | Element Shape & Layout | Aligned Size |
 | :--- | :---: | :--- | :---: |
 | `stage0_router` | `Arena 0` (`Lite`) | `S_router[4, 4]` (`S_ret->send == 0`) + alignment/crossover metadata (`16 x f32`) | `64 B` (`1 CL`) |
-| `stage1_pre_{lite,full,pro,ultra}` | `Arena 0..3` | `Op-M[Pre]` 4-lane complex poles + `Op-T[Pre]` / `Op-N[Pre]` base scalars (`32 x f32`) | `128 B` (`2 CL`) |
-| `stage2_commuted_{lite,full,pro,ultra}` | `Arena 0..3` | `K_t = 48 / 96 / 144 / 192` blocks (`16 x f32`/block): Role A (`b=0`) + Role B (`b=1..K_t-1`) | `3,072..12,288 B` |
+| `stage1_pre_{lite,full,pro,ultra}` | `Arena 0..3` | `Op-M[Pre]` 4-lane complex poles + `Env-SVF` + `Op-T[Pre]` / `Op-N[Pre]` base scalars (`32 x f32`) | `128 B` (`2 CL`) |
+| `stage2_gru_{lite,full,pro,ultra}` | `Arena 0..3` | Matryoshka `GRU` tiles (`[1,1,1]..[3,2,1]`, ZOH `1x`/`2x` gates, `FiLM`, Zero-DC `b_n`, `TPT-SVF` & `VarPro` readouts) | `<= 2,688..22,016 B` |
 | `stage3_early_fir_{lite,full,pro,ultra}` | `Arena 0..3` | `16` Left `f32` taps + `16` Right `f32` taps (`32 x f32`, `ref[container.dnam.stage3-slices]`) | `128 B` (`2 CL`) |
-| `stage3_kautz_modals_{lite,full,pro,ultra}` | `Arena 0..3` | `1 / 1 / 2 / 4` blocks of 8-vector SoA Kautz poles (`ref[container.dnam.stage3-slices]`) | `128..512 B` |
-| `stage4_tank_{lite,full,pro,ultra}` | `Arena 0..3` | Per-group delay lengths, `a_diff`, `g_lin`, `V_ceil`, `sigma_knee` & Householder `v` (`16 x f32`/group) | `64..128 B` |
-| `head_kronecker_{lite,full,pro,ultra}` | `Arena 0..3` | Mid/Side Kronecker weights `W_head[1 + D_h, 2, 64]` + bias `b_head[1 + D_h, 2]` | `2,560..4,608 B` |
+| `stage3_kautz_modals_{lite,full,pro,ultra}` | `Arena 0..3` | `1 / 1 / 1 / 1` incremental block (`4 / 8 / 12 / 16` cum. pairs) of 8-vector SoA Kautz poles (`ref[container.dnam.stage3-slices]`) | `128 B` (`2 CL`) / tier |
+| `stage4_tank_{lite,full,pro,ultra}` | `Arena 0..3` | Per-group delay lengths (`4 / 8 / 8 / 16` lines), `a_diff`, `g_lin`, `V_ceil`, `sigma_knee`, Householder `v`, `tap_gains`, & `Q0.32` LFO (`lfo_rate_hz`, `lfo_depth_samples`, `lfo_stereo_phase`) | `64..128 B` |
+| `direct_readout_{lite,full,pro,ultra}` | `Arena 0..3` | Direct-register Mid/Side `VarPro` `pre_cab` & `direct` weights + calibrated `tier_gain_trim_lin` | `256..1,024 B` |
 | `control_projection_lite` / `_ultra_delta` | `Arena 0` / `Arena 3` | Concatenated `CP1` contributor stream (`ref[container.dnam.cp1-profile]`, padded to `64 B`) | `64 B * ceil(...)` |
 | `control_interaction_lite` / `_ultra_delta` | `Arena 0` / `Arena 3` | `[4, 8]` base (`128 B`) / `[3, 4, 8]` Ultra delta (`384 B`) FM matrices (`0 B` if `< 2` controls) | `0 / 128 / 384 B` |
 | `control_dispatch_lite` / `_ultra_delta` | `Arena 0` / `Arena 3` | `W_ctrl^base[16, 16]` (`1,024 B`) / `W_ctrl,Delta^Ultra[4, 16]` (`256 B`) | `1,024 / 256 B` |
@@ -198,7 +198,7 @@ Every slice declared in `tensor_directory` has a 64-byte-aligned `byte_offset` r
 
 Each tier stores its Stage III early FIR taps and shared-pole Kautz modal blocks in separate, non-overlapping 64-byte-aligned slices ([`../dsp/op_m_modal_kautz.md` §4.1](../dsp/op_m_modal_kautz.md#41-stage-iii-architecture--tier-allocation)):
 - **Early FIR Slice (`stage3_early_fir`, `128 B = 2 CL` per tier):** 16 left `f32` taps followed by 16 right `f32` taps (`taps 0..15` in `Lite`, `16..31` in `Full`, `32..47` in `Pro`, `48..63` in `Ultra`; `512 B` cumulative).
-- **Kautz Modal Slice (`stage3_kautz_modals`, `128 B = 2 CL` per 4-mode SoA block):** Packs 4 shared pole pairs per `128 B` block as eight consecutive `f32 × 4` SIMD vectors (`[r_low, dr, theta, b_gamma, c_re_l, c_im_l, c_re_r, c_im_r]`):
+- **Kautz Modal Slice (`stage3_kautz_modals`, `128 B = 2 CL` per 4-mode SoA block):** Packs `4` shared pole pairs per `128 B` block (`4 / 8 / 12 / 16` cumulative pairs across `Lite / Full / Pro / Ultra`) as eight consecutive `f32 × 4` SIMD vectors (`[r_low, dr, theta, b_gamma, c_re_l, c_im_l, c_re_r, c_im_r]`):
 
 ```text
 +-----------------------------------------------------------------------------------+
@@ -207,9 +207,9 @@ Each tier stores its Stage III early FIR taps and shared-pole Kautz modal blocks
 |  Tier    | New Pairs | Early FIR Slice | Kautz Modal Slice (8-Vec SoA) | Subtotal |
 |  Lite    |     4     |  128 B (2 CL)   |  1 block  =   128 B (2 CL)    |   256 B  |
 |  Full    |     4     |  128 B (2 CL)   |  1 block  =   128 B (2 CL)    |   256 B  |
-|  Pro     |     8     |  128 B (2 CL)   |  2 blocks =   256 B (4 CL)    |   384 B  |
-|  Ultra   |    16     |  128 B (2 CL)   |  4 blocks =   512 B (8 CL)    |   640 B  |
-|  Total   |    32     |  512 B (8 CL)   |  8 blocks = 1,024 B (16 CL)   | 1,536 B  |
+|  Pro     |     4     |  128 B (2 CL)   |  1 block  =   128 B (2 CL)    |   256 B  |
+|  Ultra   |     4     |  128 B (2 CL)   |  1 block  =   128 B (2 CL)    |   256 B  |
+|  Total   |    16     |  512 B (8 CL)   |  4 blocks =   512 B (8 CL)    | 1,024 B  |
 +-----------------------------------------------------------------------------------+
 ```
 
@@ -310,5 +310,5 @@ The RFC 8785 JCS immutable header contains only signed structural, provenance, `
 | **Creator Exclusivity Policy** | `metadata.distribution_policy` (`allowed_protection_profiles`, `allowed_oem_vendors`). | [`../security/provenance_and_enclave_drm.md` §2.2](../security/provenance_and_enclave_drm.md#22-creator-signed-distributionpolicy--protection-profile-exclusivity) |
 | **2-Certificate `Ed25519` Delegation & 4-Tier Stripping** | `DAU1` (Open) and `DAI1` (Protected) envelopes binding creator and buyer 4-tier prefix-digest lists. | [`../security/provenance_and_enclave_drm.md` §2.3](../security/provenance_and_enclave_drm.md#23-two-certificate-ed25519-delegation-chain--4-tier-cumulative-arena-digests) |
 | **OEM Hardware Enclave & `.dnam-seal` (`b"DNSL"`)** | `DSA1` outer manifest + RFC 9180 HPKE recipient slots + `ChaCha20-Poly1305` tier records. | [`../security/provenance_and_enclave_drm.md` §3](../security/provenance_and_enclave_drm.md#3-pillar-2-hardware-enclave--oem-drm-oemdevicecertificate-attestation--dnam-seal-bdnsl-wrapper) |
-| **Dual-Mechanism Buyer Watermarking (`Arena 0..3`)** | Reciprocal-scaling gauge + Coupled Tardos buyer code across all tier slices. | [`../security/watermarking_and_marketplace.md` §1](../security/watermarking_and_marketplace.md#1-pillar-3-forensic-traitor-tracing--02-ms-dual-mechanism-buyer-watermarking) |
+| **Dual-Mechanism Buyer Watermarking (`Arena 0..3`)** | `0-ULP` odd-activation `GRU` hidden-lane sign-flip gauge + Kautz gauges + EMR-masked Tardos code | [`../security/watermarking_and_marketplace.md` §1](../security/watermarking_and_marketplace.md#1-pillar-3-forensic-traitor-tracing--02-ms-dual-mechanism-buyer-watermarking) |
 | **3 Container Protection Profiles** | `DnamProtectionProfile::{Open, DeviceAllowlisted, EnclaveSealed}`. | [`../security/provenance_and_enclave_drm.md` §4](../security/provenance_and_enclave_drm.md#4-three-container-protection-profiles-dnamprotectionprofile--loader-auto-detection) |

@@ -20,11 +20,11 @@ import {
   tierFromIndex,
 } from "../internal/coerce.js";
 import { TELEMETRY_F64_LEN } from "../internal/native/driver.js";
+import { WASM_MIN_INITIAL_PAGES } from "../internal/native/wasm/memory.js";
 import {
   compileWasmModule,
   createWasmMemory,
   isSharedWasmMemory,
-  WASM_MIN_INITIAL_PAGES,
 } from "../internal/native/wasm.js";
 import type { Model } from "../model/model.js";
 import { ControlSpace, defaultNumericValue } from "../parameters/clamp.js";
@@ -108,6 +108,117 @@ export async function registerDnamProcessor(
   await context.audioWorklet.addModule(url);
 }
 
+type WorkletPortLike = {
+  postMessage(msg: WorkletInboundMessage): void;
+  onmessage: ((ev: { readonly data: WorkletOutboundMessage }) => void) | null;
+};
+
+function resolveNodeWasmMemory(options: DnamAudioNodeOptions | undefined): {
+  wasmMemory: WebAssembly.Memory | undefined;
+  wantSharedWasm: boolean;
+} {
+  const wantSharedWasm = (options?.sharedWasmMemory ?? false) && isSharedMemorySupported();
+  if (options?.wasmMemory) {
+    return { wasmMemory: options.wasmMemory, wantSharedWasm };
+  }
+  if (!wantSharedWasm) {
+    return { wasmMemory: undefined, wantSharedWasm };
+  }
+  return {
+    wasmMemory: createWasmMemory({
+      ...(options?.initialMemoryPages !== undefined
+        ? { initialPages: options.initialMemoryPages }
+        : {}),
+      ...(options?.maximumMemoryPages !== undefined
+        ? { maximumPages: options.maximumMemoryPages }
+        : {}),
+      shared: true,
+    }),
+    wantSharedWasm,
+  };
+}
+
+function initNodeTelemetryScratch<TParams extends ParameterValueMap>(
+  scratch: Float64Array,
+  tierIdx: number,
+  sampleRate: number,
+  model: Model<TParams>,
+  defaultNumerics: Float32Array,
+): void {
+  scratch[0] = tierIdx;
+  scratch[1] = 4; // wasm-simd128
+  scratch[2] = sampleRate;
+  scratch[3] = model.header.ioConfig.outputMode === "stereo" ? 1 : 0;
+  scratch[7] = model.header.ioConfig.capabilities.supportsFreeze ? 1 : 0;
+  scratch[8] = 1.0;
+  scratch[9] = 120.0;
+  for (let i = 0; i < Math.min(16, defaultNumerics.length); i++) {
+    scratch[32 + i] = defaultNumerics[i] ?? 0;
+  }
+}
+
+function buildWorkletProcessorOptions<TParams extends ParameterValueMap>(params: {
+  wasmModule: WebAssembly.Module;
+  model: Model<TParams>;
+  tierIdx: number;
+  maxSupportedTierIdx: number;
+  sampleRate: number;
+  shared: WorkletSharedState | undefined;
+  wasmMemory: WebAssembly.Memory | undefined;
+  wantSharedWasm: boolean;
+  options: DnamAudioNodeOptions | undefined;
+}): DnamWorkletProcessorOptions {
+  const isCloneableSharedWasmMem =
+    params.wasmMemory !== undefined && isSharedWasmMemory(params.wasmMemory);
+  const derivedInitialPages =
+    params.options?.initialMemoryPages ??
+    (params.wasmMemory !== undefined
+      ? Math.max(WASM_MIN_INITIAL_PAGES, Math.ceil(params.wasmMemory.buffer.byteLength / 65536))
+      : undefined);
+
+  return {
+    wasmModule: params.wasmModule,
+    containerBytes: params.model.toBytes(),
+    tier: params.tierIdx,
+    sampleRate: params.sampleRate,
+    backend: coerceBackend(params.options?.backend ?? "auto"),
+    maxSupportedTier: params.maxSupportedTierIdx,
+    ...(params.shared ? { sharedBuffer: params.shared.buffer } : {}),
+    ...(isCloneableSharedWasmMem && params.wasmMemory ? { wasmMemory: params.wasmMemory } : {}),
+    ...(derivedInitialPages !== undefined ? { initialMemoryPages: derivedInitialPages } : {}),
+    ...(params.options?.maximumMemoryPages !== undefined
+      ? { maximumMemoryPages: params.options.maximumMemoryPages }
+      : {}),
+    ...(params.wantSharedWasm || isCloneableSharedWasmMem ? { sharedWasmMemory: true } : {}),
+    ...(params.options?.telemetryIntervalBlocks !== undefined
+      ? { telemetryIntervalBlocks: params.options.telemetryIntervalBlocks }
+      : {}),
+  };
+}
+
+function createWorkletNodeAndPort(
+  context: AudioContextLike,
+  outputMode: string,
+  processorOptions: DnamWorkletProcessorOptions,
+): { workletNode: AudioWorkletNode | undefined; port: WorkletPortLike } {
+  if (typeof AudioWorkletNode !== "undefined" && context instanceof BaseAudioContext) {
+    const workletNode = new AudioWorkletNode(context, DNAM_WORKLET_PROCESSOR_NAME, {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      outputChannelCount: [outputMode === "mono" ? 1 : 2],
+      processorOptions,
+    });
+    return {
+      workletNode,
+      port: workletNode.port as unknown as WorkletPortLike,
+    };
+  }
+  return {
+    workletNode: undefined,
+    port: { onmessage: null, postMessage: () => {} },
+  };
+}
+
 /**
  * WebAudio `AudioWorklet` controller node (`ref[sdk.ts.web-audio.realtime-bridge]`).
  *
@@ -129,10 +240,7 @@ export class DnamAudioNode<TParams extends ParameterValueMap = Record<string, nu
   readonly #context: AudioContextLike;
   readonly #workletNode: AudioWorkletNode | undefined;
   readonly #wasmMemory: WebAssembly.Memory | undefined;
-  readonly #port: {
-    postMessage(msg: WorkletInboundMessage): void;
-    onmessage: ((ev: { readonly data: WorkletOutboundMessage }) => void) | null;
-  };
+  readonly #port: WorkletPortLike;
   readonly #shared: WorkletSharedState | undefined;
   #controlSpace: ControlSpace<TParams>;
   #parameters: ParameterMap<TParams>;
@@ -174,76 +282,36 @@ export class DnamAudioNode<TParams extends ParameterValueMap = Record<string, nu
       this.#shared.initDefaults(defaultNumerics, this.#tierIdx, context.sampleRate);
     }
 
-    const wantSharedWasm = (options?.sharedWasmMemory ?? false) && isSharedMemorySupported();
-    if (options?.wasmMemory) {
-      this.#wasmMemory = options.wasmMemory;
-    } else if (wantSharedWasm) {
-      this.#wasmMemory = createWasmMemory({
-        ...(options?.initialMemoryPages !== undefined
-          ? { initialPages: options.initialMemoryPages }
-          : {}),
-        ...(options?.maximumMemoryPages !== undefined
-          ? { maximumPages: options.maximumMemoryPages }
-          : {}),
-        shared: true,
-      });
-    }
+    const { wasmMemory, wantSharedWasm } = resolveNodeWasmMemory(options);
+    this.#wasmMemory = wasmMemory;
 
-    this.#telemetryScratch[0] = this.#tierIdx;
-    this.#telemetryScratch[1] = 4; // wasm-simd128
-    this.#telemetryScratch[2] = context.sampleRate;
-    this.#telemetryScratch[3] = model.header.ioConfig.outputMode === "stereo" ? 1 : 0;
-    this.#telemetryScratch[7] = model.header.ioConfig.capabilities.supportsFreeze ? 1 : 0;
-    this.#telemetryScratch[8] = 1.0;
-    this.#telemetryScratch[9] = 120.0;
-    for (let i = 0; i < Math.min(16, defaultNumerics.length); i++) {
-      this.#telemetryScratch[32 + i] = defaultNumerics[i] ?? 0;
-    }
+    initNodeTelemetryScratch(
+      this.#telemetryScratch,
+      this.#tierIdx,
+      context.sampleRate,
+      model,
+      defaultNumerics,
+    );
 
-    const isCloneableSharedWasmMem =
-      this.#wasmMemory !== undefined && isSharedWasmMemory(this.#wasmMemory);
-    const derivedInitialPages =
-      options?.initialMemoryPages ??
-      (this.#wasmMemory !== undefined
-        ? Math.max(WASM_MIN_INITIAL_PAGES, Math.ceil(this.#wasmMemory.buffer.byteLength / 65536))
-        : undefined);
-
-    const processorOptions: DnamWorkletProcessorOptions = {
+    const processorOptions = buildWorkletProcessorOptions({
       wasmModule,
-      containerBytes: model.toBytes(),
-      tier: this.#tierIdx,
+      model,
+      tierIdx: this.#tierIdx,
+      maxSupportedTierIdx: this.#maxSupportedTierIdx,
       sampleRate: context.sampleRate,
-      backend: coerceBackend(options?.backend ?? "auto"),
-      maxSupportedTier: this.#maxSupportedTierIdx,
-      ...(this.#shared ? { sharedBuffer: this.#shared.buffer } : {}),
-      ...(isCloneableSharedWasmMem && this.#wasmMemory ? { wasmMemory: this.#wasmMemory } : {}),
-      ...(derivedInitialPages !== undefined ? { initialMemoryPages: derivedInitialPages } : {}),
-      ...(options?.maximumMemoryPages !== undefined
-        ? { maximumMemoryPages: options.maximumMemoryPages }
-        : {}),
-      ...(wantSharedWasm || isCloneableSharedWasmMem ? { sharedWasmMemory: true } : {}),
-      ...(options?.telemetryIntervalBlocks !== undefined
-        ? { telemetryIntervalBlocks: options.telemetryIntervalBlocks }
-        : {}),
-    };
+      shared: this.#shared,
+      wasmMemory: this.#wasmMemory,
+      wantSharedWasm,
+      options,
+    });
 
-    if (typeof AudioWorkletNode !== "undefined" && context instanceof BaseAudioContext) {
-      this.#workletNode = new AudioWorkletNode(context, DNAM_WORKLET_PROCESSOR_NAME, {
-        numberOfInputs: 1,
-        numberOfOutputs: 1,
-        outputChannelCount: [model.header.ioConfig.outputMode === "mono" ? 1 : 2],
-        processorOptions,
-      });
-      this.#port = this.#workletNode.port as unknown as {
-        postMessage(msg: WorkletInboundMessage): void;
-        onmessage: ((ev: { readonly data: WorkletOutboundMessage }) => void) | null;
-      };
-    } else {
-      this.#port = {
-        onmessage: null,
-        postMessage: () => {},
-      };
-    }
+    const created = createWorkletNodeAndPort(
+      context,
+      model.header.ioConfig.outputMode,
+      processorOptions,
+    );
+    this.#workletNode = created.workletNode;
+    this.#port = created.port;
 
     this.#port.onmessage = (event: { readonly data: WorkletOutboundMessage }) => {
       const msg = event.data;

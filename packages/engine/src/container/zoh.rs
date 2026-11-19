@@ -33,17 +33,18 @@ impl ZohRescaledParams {
     /// Convenience constructor with default DNAM training anchors (`r_ac=0.9993`, `r_dc=0.995`, `tau_ref=64.0`, `xfade=128`).
     #[inline]
     pub fn new(fs_train_hz: u32, fs_host_hz: u32) -> Self {
-        Self::compute(fs_train_hz, fs_host_hz, 0.9993, 0.995, 64.0, 128).unwrap_or(Self {
-            sample_rate_host_hz: fs_train_hz,
-            rho_sr: 1.0,
-            control_decimation_host: 16,
-            rho_ctrl: 1.0,
-            alpha_ramp_host: 0.0625,
-            r_ac_host: 0.9993,
-            r_dc_host: 0.995,
-            tau_ref_samples_host: 64.0,
-            switch_xfade_samples_host: 128,
-        })
+        Self::compute_oversampled_opt(fs_train_hz, fs_host_hz, 1, 0.9993, 0.995, 64.0, 128)
+            .unwrap_or(Self {
+                sample_rate_host_hz: fs_train_hz,
+                rho_sr: 1.0,
+                control_decimation_host: 16,
+                rho_ctrl: 1.0,
+                alpha_ramp_host: 0.0625,
+                r_ac_host: 0.9993,
+                r_dc_host: 0.995,
+                tau_ref_samples_host: 64.0,
+                switch_xfade_samples_host: 128,
+            })
     }
 
     /// Computes the closed-form ZOH rescaled parameters for `fs_host_hz` given training anchors.
@@ -67,11 +68,9 @@ impl ZohRescaledParams {
         )
     }
 
-    /// Computes the closed-form ZOH rescaled parameters for an internal oversampling rate
-    /// $f_{s,\text{internal}} = \text{oversample\_factor} \times f_{s,\text{host}}$
-    /// (`oversample_factor` $\in \{1, 2, 4\}$).
-    #[allow(clippy::too_many_arguments)]
-    pub fn compute_oversampled(
+    /// Allocation-free `Option` core so real-time callers never emit `DnamError` `Drop` glue.
+    #[inline]
+    fn compute_oversampled_opt(
         fs_train_hz: u32,
         fs_host_hz: u32,
         oversample_factor: u32,
@@ -79,16 +78,16 @@ impl ZohRescaledParams {
         r_dc_train: f32,
         tau_ref_train: f32,
         xfade_train: u32,
-    ) -> Result<Self, DnamError> {
+    ) -> Option<Self> {
         if !(44_100..=192_000).contains(&fs_host_hz) || !matches!(oversample_factor, 1 | 2 | 4) {
-            return Err(DnamError::InvalidSampleRate(fs_host_hz));
+            return None;
         }
         let fs_train = fs_train_hz as f64;
         let k_ctrl_train = (((fs_train / 3000.0) + 0.5) as usize).max(8);
         let fs_eff_hz = fs_host_hz * oversample_factor;
         if fs_eff_hz == fs_train_hz {
             let alpha_ramp_host = (1.0 / (k_ctrl_train as f64)) as f32;
-            return Ok(Self {
+            return Some(Self {
                 sample_rate_host_hz: fs_host_hz,
                 rho_sr: 1.0,
                 control_decimation_host: k_ctrl_train,
@@ -114,7 +113,7 @@ impl ZohRescaledParams {
         let tau_ref_samples_host = ((tau_ref_train as f64) / rho_sr) as f32;
         let switch_xfade_samples_host = (((xfade_train as f64) / rho_sr) + 0.5) as u32;
 
-        Ok(Self {
+        Some(Self {
             sample_rate_host_hz: fs_host_hz,
             rho_sr,
             control_decimation_host: k_host,
@@ -125,6 +124,30 @@ impl ZohRescaledParams {
             tau_ref_samples_host,
             switch_xfade_samples_host: switch_xfade_samples_host.max(16),
         })
+    }
+
+    /// Computes the closed-form ZOH rescaled parameters for an internal oversampling rate
+    /// $f_{s,\text{internal}} = \text{oversample\_factor} \times f_{s,\text{host}}$
+    /// (`oversample_factor` $\in \{1, 2, 4\}$).
+    pub fn compute_oversampled(
+        fs_train_hz: u32,
+        fs_host_hz: u32,
+        oversample_factor: u32,
+        r_ac_train: f32,
+        r_dc_train: f32,
+        tau_ref_train: f32,
+        xfade_train: u32,
+    ) -> Result<Self, DnamError> {
+        Self::compute_oversampled_opt(
+            fs_train_hz,
+            fs_host_hz,
+            oversample_factor,
+            r_ac_train,
+            r_dc_train,
+            tau_ref_train,
+            xfade_train,
+        )
+        .ok_or(DnamError::InvalidSampleRate(fs_host_hz))
     }
 
     /// Rescales an Op-M modal pole radius $r_c$, angle $\theta_{0,c}$, and $\mathcal{H}_2$-norm

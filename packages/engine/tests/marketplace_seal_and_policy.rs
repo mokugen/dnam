@@ -19,11 +19,11 @@ use dnam_engine::{DynamicDnamEngine, Tier};
 #[test]
 fn test_dnam_seal_dnsl_envelope_oem_certificate_and_distribution_policy() {
     let mut header = DnamJsonHeader::default_reference();
-    let mut master_arena = vec![0u8; 64_000];
-    master_arena[124..128].copy_from_slice(&0.9993_f32.to_le_bytes());
-    for i in 0..640 {
+    let mut master_arena = vec![0u8; 28_672];
+    master_arena[92..96].copy_from_slice(&0.9993_f32.to_le_bytes());
+    for i in 0..80 {
         let val = 0.03_f32 * (((i * 7 + 3) % 11) as f32 - 5.0);
-        master_arena[4_928 + i * 4..4_928 + (i + 1) * 4].copy_from_slice(&val.to_le_bytes());
+        master_arena[2_688 + i * 4..2_688 + (i + 1) * 4].copy_from_slice(&val.to_le_bytes());
     }
 
     // 1. Configure Creator-Signed DistributionPolicy restricting model to EnclaveSealed on Darkglass Anagram

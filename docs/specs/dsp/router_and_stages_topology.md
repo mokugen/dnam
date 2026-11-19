@@ -18,13 +18,13 @@ requirements:
 adrs:
   - ADR-0002
   - ADR-0006
-  - ADR-0011
   - ADR-0019
+  - ADR-0021
 ---
 
 # Stage 0 Router, Canonical Stages Topology & 256-D Mid/Side Head
 
-This specification defines the **Stage 0 8-Port Matrix Router**, the **Four Canonical Physical Stages (Stages I–IV)**, the **Unified 256-D Feature Bus & Canonical Mid/Side Kronecker Output Head**, and **Continuous-Time Zero-Order Hold (ZOH) Sample-Rate Adaptability (`44.1–96 kHz` & `4×` Bounce)** across **Dynamic Neural Audio Modeler (DNAM)** ([`packages/engine/src/engine/`](../../../packages/engine/README.md), [`packages/capture/src/`](../../../packages/capture/README.md), [`tora_architecture.md`](../architecture/tora_architecture.md), [`REQ-7.4`](../../requirements/system_goals_and_requirements.md)). For architectural rationales and counterexamples, see [`../../adr/0002-tri-operator-recurrent-architecture.md`](../../adr/0002-tri-operator-recurrent-architecture.md) and [`../../adr/0006-model-declared-delays-and-tank-feedback-guard.md`](../../adr/0006-model-declared-delays-and-tank-feedback-guard.md).
+This specification defines the **Stage 0 8-Port Matrix Router**, the **Unconditional Direct-Register Physical Stages (Stages I–IV)**, the **Direct-Register Mid/Side `VarPro` Readout Collapse**, and **Continuous-Time Zero-Order Hold (ZOH) Sample-Rate Adaptability (`44.1–96 kHz` & `4×` Bounce)** across **Dynamic Neural Audio Modeler (DNAM)** ([`packages/engine/src/engine/`](../../../packages/engine/README.md), [`packages/capture/src/`](../../../packages/capture/README.md), [`tora_architecture.md`](../architecture/tora_architecture.md), [`REQ-7.4`](../../requirements/system_goals_and_requirements.md)). For architectural rationales and counterexamples, see [`../../adr/0002-tri-operator-recurrent-architecture.md`](../../adr/0002-tri-operator-recurrent-architecture.md), [`../../adr/0006-model-declared-delays-and-tank-feedback-guard.md`](../../adr/0006-model-declared-delays-and-tank-feedback-guard.md), and [`../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md).
 
 ---
 
@@ -35,7 +35,7 @@ This specification defines the **Stage 0 8-Port Matrix Router**, the **Four Cano
 ```mermaid
 flowchart TD
     subgraph ControlBusGroup ["3 kHz Unified Control Plane"]
-        CtrlSrc["Shared Descriptors & Packed Tier-Local CP1 Projections"] --> OpN["Op-N[Ctrl]: Exact-Integer Sufficient-Statistic Engine"]
+        CtrlSrc["Shared Descriptors & Packed Tier-Local CP1 Projections"] --> OpN["Op-N[Ctrl]: Exact-Integer Sufficient-Statistic Engine<br/>+ 3 kHz Env-SVF, FiLM/Zero-DC bn & Tone TPT-SVF Coeffs"]
         SendDetector["Instrument / Independent Aux Detector"] --> SendMod["Send-Safe Dynamic Vector m_send"]
         DownDetector["Downstream Instrument / Return / Aux Detector"] --> DownMod["Downstream Dynamic Vector m_down"]
         OpN & SendMod --> SendBus["Send Dispatch Rows 0..4<br/>16x16 Base + Ultra 16x4 Delta + Micro-Ramp"]
@@ -47,25 +47,25 @@ flowchart TD
     PreRouter -.-> SendDetector
     PreRouter & DownRouter -.-> DownDetector
 
-    PreRouter --> S1["Stage I: Pre-FX / Synth / Mod<br/>(Op-T / Op-M / Op-N)"]
+    PreRouter --> S1["Stage I: Pre-FX & 2-Sec Env-SVF<br/>(Op-T / Op-M / Op-N, 3 kHz Coeffs)"]
     S1 --> Out0["Port Out 0: Send L<br/>(External Amp 1)"]
     S1 -->|"Dual-Amp Modes"| Out1["Port Out 1: Send R / WDW Dry"]
     DryTap["WDW Dry Selector<br/>PreSpatialCore / DirectDry"] -->|"WDW"| Out1
     S1 --> DownRouter
 
     DownRouter -->|"200 Hz TPT LR4 Low: Clean Bypass"| S3
-    DownRouter -->|"200 Hz TPT LR4 High: Drive Path"| S2["Stage II: 3-Stage Amp Cascade<br/>(V1A Preamp -> V1B -> Power Amp)"]
-    S2 --> S3["Stage III: Cabinet & Modals<br/>(64-Tap SIMD FIR + Shared Kautz Bank)"]
-    S3 --> S4["Stage IV: Unitary Spatial Tank<br/>(In-Buffer AP + Barberpole FDN)"]
+    DownRouter -->|"200 Hz TPT LR4 High: Drive Path"| S2["Stage II: Zero-DC Matryoshka GRU + Tone TPT-SVF<br/>(Lite/Full 1x, Pro/Ultra 2x)"]
+    S2 -->|"pre_cab register path"| S3["Stage III: Cabinet & Modals<br/>(16/32/48/64 FIR + 4/8/12/16 Kautz Pairs)"]
+    S3 --> S4["Stage IV: Unitary Spatial Tank<br/>(4/8/8/16-Line fp16 FDN + Taps)"]
 
-    DownBus --> DownRouter & S2 & S3 & S4
+    DownBus --> DownRouter & S1 & S2 & S3 & S4
     SendBus --> PreRouter & S1
 
-    S1 & S2 & S3 & S4 --> Phi["Unified 256-D Feature Bus Phi[n]"]
-    Phi --> Head["256-D SVD Kronecker Head<br/>(Canonical Mid/Side Slices 0 & 1)"]
-    DownBus --> Head
-    Head --> Out2["Port Out 2: Main L / WDW Wet L"]
-    Head --> Out3["Port Out 3: Main R / WDW Wet R"]
+    S1 & S2 & S3 -->|"direct VarPro linear registers"| DirectOut["Direct-Register Stereo Combine<br/>& Calibrated Tier Gain Trim"]
+    S4 --> DirectOut
+    DownBus --> DirectOut
+    DirectOut --> Out2["Port Out 2: Main L / WDW Wet L"]
+    DirectOut --> Out3["Port Out 3: Main R / WDW Wet R"]
 ```
 
 ---
@@ -158,7 +158,7 @@ $$x_{\mathrm{mid}}[n] = \frac{1}{2}\big(x_L[n] + x_R[n]\big), \qquad x_{\mathrm{
 
 `r[dsp.head.mid-side-factorization]`
 
-At each `3 kHz` control tick, the $D_h \in \lbrace 4, 8 \rbrace$ SVD head modes collapse into active Mid ($a = \mathrm{mid}$, Slice 0) and Side ($a = \mathrm{side}$, Slice 1) weight vectors over the unified feature bus $\boldsymbol{\Phi}[n] \in \mathbb{R}^D$ ($D \in \lbrace 64, 128, 192, 256 \rbrace$):
+At each `3 kHz` control tick, the $D_h \in \lbrace 4, 8 \rbrace$ SVD head modes collapse directly into Mid (`Slice 0`) and Side (`Slice 1`) linear readout vectors (`pre_cab` and `direct`) over the unconditional 5-stage stereo register state (`0` `256-D` `feature_bus_scratch` materialization):
 $$\mathbf{w}_a[n] = \mathbf{w}_{a,0} + \sum_{d=1}^{D_h} z_{\mathrm{head},d}[n] \mathbf{w}_{a,d}, \qquad b_a[n] = b_{a,0} + \sum_{d=1}^{D_h} z_{\mathrm{head},d}[n] b_{a,d}$$
 $$\mathbf{w}_{\mathrm{mid}} \triangleq \frac{1}{2}\big(\mathbf{w}_L + \mathbf{w}_R\big), \qquad \mathbf{w}_{\mathrm{side}} \triangleq \frac{1}{2}\big(\mathbf{w}_L - \mathbf{w}_R\big), \qquad b_{\mathrm{mid}} \triangleq \frac{1}{2}\big(b_L + b_R\big), \qquad b_{\mathrm{side}} \triangleq \frac{1}{2}\big(b_L - b_R\big)$$
 $$y_{\mathrm{mid}}[n] = \mathbf{w}_{\mathrm{mid}}^\top \boldsymbol{\Phi}[n] + b_{\mathrm{mid}}, \qquad y_{\mathrm{side}}'[n] = \alpha_{\mathrm{width}}[n] \big(\mathbf{w}_{\mathrm{side}}^\top \boldsymbol{\Phi}[n] + b_{\mathrm{side}}\big)$$
@@ -211,27 +211,27 @@ Audio-rate ballistic envelope smoothing prepares $\alpha_{\mathrm{att}} = 1 - \e
 | :--- | :--- | :--- |
 | **`Op-T[Pre]` (Transport & Pitch)** | Model-declared 64B-aligned delay histories with 4-tap Catmull-Rom ([`op_t_transport.md` §1](op_t_transport.md#11-exact-sized-delay-histories-and-branchless-wrap)) | • **`M = 1`:** Fractional micro-delay and through-zero flanging.<br/>• **`M = 2`:** Centered dual-tap Hermite-Hann pitch shifter (`±24 st`, Family 3).<br/>• **`M = 3`:** Endless barberpole phaser/flanger sweep (Family 6). |
 | **`Op-M[Pre]` (Modal, Hilbert & Bistable)** | `4` complex pole channels/tier + `H1` analytic pairs + `T1` DC blocker/tracker states ([`op_m_modal_kautz.md` §2–§3](op_m_modal_kautz.md#2-family-2-hilbert-ssb-lattice--carrier-modulation)) | • **`M-1`:** 6-section `H1` all-pass pair + carrier rotor for SSB/ring mod (Family 2).<br/>• **`M-2`:** `T1` sub-harmonic tracker routed to `Lite` slots `4..11` (Family 1).<br/>• **`M-3`:** High-`Q` auto-wah and resonant phaser sweeps. |
-| **`Op-N[Pre]` (Waveshaping, Dynamics & ZOH)** | `C_tier` ballistic envelope & fixed-hertz ZOH quantizer states ([`op_n_commuted_cascade.md` §2.3](op_n_commuted_cascade.md#23-family-5-precomputed-reciprocal-zoh-sample-rate-reducer--bitcrusher)) | • Hysteretic gate / auto-swell / compressor VCA (Family 4).<br/>• Fixed-hertz ZOH reducer + nearest-step bitcrusher (`0 FDIV`, Family 5).<br/>• Pre-drive boost and soft-clipping `PolyADAA`. |
+| **`Op-N[Pre]` (Pre-Drive, Dynamics & ZOH)** | `4`-lane ballistic envelope & fixed-hertz ZOH quantizer states ([`op_n_commuted_cascade.md` §2.3](op_n_commuted_cascade.md#23-family-5-precomputed-reciprocal-zoh-sample-rate-reducer--bitcrusher)) | • Hysteretic gate / auto-swell / compressor VCA (Family 4).<br/>• Fixed-hertz ZOH reducer + nearest-step bitcrusher (`0 FDIV`, Family 5).<br/>• Pre-drive shaping and 2-Section stereo ZDF `Env-SVF` (`3 kHz`-decimated warp coeffs). |
 
-For stereo downstream feed $(x_{0,L}[n], x_{0,R}[n])$ from Stage 0, the 2-bit serial permutation `sel = topology_selector & 0x03` executes with partitioned Left/Right state isolation:
+For stereo downstream feed $(x_{0,L}[n], x_{0,R}[n])$ from Stage 0, the 2-bit serial permutation `sel = topology_selector & 0x03` executes unconditionally with partitioned Left/Right state isolation (`0` stage-bypass flags):
 - `sel = 0`: $\mathbf{x}_{\text{s1}}[n] = \mathcal{T}_{\text{pre}}\big(\mathcal{M}_{\text{pre}}\big(\mathcal{N}_{\text{pre}}(\mathbf{x}_0[n])\big)\big)$ (`Drive -> Filter -> Mod`)
 - `sel = 1`: $\mathbf{x}_{\text{s1}}[n] = \mathcal{T}_{\text{pre}}\big(\mathcal{N}_{\text{pre}}\big(\mathcal{M}_{\text{pre}}(\mathbf{x}_0[n])\big)\big)$ (`Wah -> Overdrive -> Mod`)
 - `sel = 2`: $\mathbf{x}_{\text{s1}}[n] = \mathcal{M}_{\text{pre}}\big(\mathcal{N}_{\text{pre}}\big(\mathcal{T}_{\text{pre}}(\mathbf{x}_0[n])\big)\big)$ (`Mod -> Drive -> Filter`)
 - `sel = 3`: $\mathbf{x}_{\text{s1}}[n] = \mathcal{N}_{\text{pre}}\big(\mathcal{M}_{\text{pre}}\big(\mathcal{T}_{\text{pre}}(\mathbf{x}_0[n])\big)\big)$ (`Mod -> Filter -> Drive`)
 
-In parallel, the `T1` tracker branch (`5 Hz` passband-normalized DC blocker $\to$ 12-allpass `H1` analytic pair $\to$ rising-edge $f_0/2, f_0/4$ dividers and half-angle sheet tracker; [`op_m_modal_kautz.md` §3](op_m_modal_kautz.md#3-family-1-sub-harmonic-synthesizers-bistable-dividers--pll-tracking)) processes $(x_{0,L}[n], x_{0,R}[n])$ on every sample and writes the 8 features `[L-cos, L-sin, L-half-sq, L-quarter-sq, R-cos, R-sin, R-half-sq, R-quarter-sq]` directly into `Lite` feature-bus slots `4..11` (§7).
+In parallel, the `T1` tracker branch (`5 Hz` passband-normalized DC blocker $\to$ 12-allpass `H1` analytic pair $\to$ rising-edge $f_0/2, f_0/4$ dividers and half-angle sheet tracker; [`op_m_modal_kautz.md` §3](op_m_modal_kautz.md#3-family-1-sub-harmonic-synthesizers-bistable-dividers--pll-tracking)) and 2-section stereo ZDF `Env-SVF` (`coeffs` refreshed at `3 kHz` via `SimdVec4::rsqrt_pos_pair_nr2`, `0` NEON-to-GPR spills) process $(x_{0,L}[n], x_{0,R}[n])$ on every sample, feeding Stage II and the direct-register `VarPro` accumulators (§7).
 
 ---
 
-## 4. Stage II: 3-Stage LTI-Commuted Nonlinear Cascade
+## 4. Stage II: Zero-DC Matryoshka `GRU` & Inter-Block `TPT-SVF` Cascade
 
 `r[dsp.stage2.commuted-cascade]`
 
-Stage II models the 3-stage amplifier cascade (`V1A Preamp + Tone Stack` $\to$ `V1B Driver + C² Wavefolder` $\to$ `Push-Pull Power Amp + Sag + Hysteresis`) via the Exact LTI Commutativity Theorem (`Theorem 1`), evaluating the multi-drive $d_{\text{bank}} = [0.25\times, 1.0\times, 4.0\times, 16.0\times]$ `PolyADAA` bank and folding $\mathbf{z}_{\text{stage}}$ into $\mathbf{W}_k^{(s)}(\mathbf{z}_{\text{stage}})$ at `3 kHz` ([`op_n_commuted_cascade.md` §3–§4](op_n_commuted_cascade.md#3-exact-lti-basis-commutativity-theorem-theorem-1)):
+Stage II models nonlinear preamp saturation, power-amp sag/hysteresis, and interactive tone stacks using the **Unconditional 3-Block Zero-DC Matryoshka `GRU` Pyramid** (`Block 0 -> Inter-Block 3-Band Tone TPT-SVF -> Block 1 -> Block 2`) with continuous-time ZOH gate scaling ([`op_n_commuted_cascade.md` §3–§4](op_n_commuted_cascade.md#3-exact-lti-basis-commutativity-theorem-theorem-1)):
 
-1. **Sub-Stage 2.1 (`V1A` Preamp):** For stereo Stage I output $(x_{\text{s1},L}[n], x_{\text{s1},R}[n])$ and micro-ramped preamp drive $g_{\text{v1a}}[n]$, evaluate the 4-drive unclamped rail-crossing `PolyADAA` bank $\mathbf{u}_{\text{v1a},c}[n] \in \mathbb{R}^4$ ($c \in \lbrace L, R \rbrace$) and extract primary driver feed $v_{\text{v1a},c}[n] = u_{\text{v1a},c,1}[n]$.
-2. **Sub-Stage 2.2 (`V1B` Driver & Degree-7/8 ADAA $C^2$ Wavefolder):** Evaluate the interval-average cubed-envelope $C^2$ wavefolder $A_{\text{odd},3,c}[n]$ on $(v_{\text{v1a},c}[n-1], v_{\text{v1a},c}[n])$ and instantaneous $w_{\text{odd},3}(v_{\text{v1a},c}[n])$, form $x_{\text{v1b},c}[n] = 0.7 v_{\text{v1a},c}[n] + 0.15(A_{\text{odd},3,c}[n] + w_{\text{odd},3}(v_{\text{v1a},c}[n]))$, and step the second 4-drive `PolyADAA` bank $\mathbf{u}_{\text{v1b},c}[n] \in \mathbb{R}^4$.
-3. **Sub-Stage 2.3 (Power Amp, Supply Sag, 2D Quadrature Hysteresis & Role A / Role B Cascade Wiring):** Update the 1-pole B+ supply sag envelope $e_{\text{sag}}[n] = R_{\text{sag}} e_{\text{sag}}[n-1] + (1 - R_{\text{sag}}) \cdot \frac{1}{2}(|u_{\text{v1b},L,2}[n]| + |u_{\text{v1b},R,2}[n]|)$, form sag compression $c_{\text{sag}}[n] = \max(0.2, 1 - \alpha_{\text{sag}}[n] e_{\text{sag}}[n])$, evaluate 2D quadrature hysteresis $h_{\text{hyst},c}[n]$ on $(u_{\text{v1b},c,1}[n], u_{\text{v1b},c,2}[n])$, and step the 4-filter tone basis $\boldsymbol{\tau}_c[n] = [\text{Direct}, \text{LPF}_{80}, \text{LPF}_{400}, \text{HPF}_{1200}]^\top$ on $(u_{\text{v1b},c,1}[n] + 0.1 h_{\text{hyst},c}[n]) c_{\text{sag}}[n]$. Within each tier's `stage2_cascade_w` slice (`K_t = 48 / 96 / 144 / 192` 16-`f32` blocks), **Role A (`b = 0`)** applies the `4×4` inter-stage coupling matrix while **Role B (`b = 1..K_t-1`)** folds surjectively via `(b - 1) & 7` into the 8 Stage II feature-bus slots (`40..48` per tier, §7). Emit primary Stage II output $x_{\text{s2},c}[n] = \tau_{c,0}[n]$ into Stage III.
+1. **Tier Rates & Pyramid Widths:** **`Lite` (`[1, 1, 1]` = `12` ch)** and **`Full` (`[2, 1, 1]` = `16` ch)** execute natively at **`1×` (`48 kHz`)** using `V3Rate1xCalibration` (`up_zoh_mix` + low-delay `poly3` decimation), while **`Pro` (`[2, 2, 1]` = `20` ch)** and **`Ultra` (`[3, 2, 1]` = `24` ch)** execute at **`2×` (`96 kHz`, `4×` on bounce)** sharing lower-tier prefix weights (`0` stage-bypass flags).
+2. **`NR2` Padé Activations, `3 kHz` `FiLM` & Zero-DC Equilibrium Shift:** All hidden gates and candidate activations evaluate via in-register `SimdVec4::rcp_ge1_nr2` (`< 4.5e-5`, `0-ULP` odd symmetry, $\tanh(+0.0) = +0.0$, `0` GPR spills) paired with `3 kHz`-updated `FiLM` gains/shifts, Zero-DC rest shift $b_n$ ($h_{\text{eq}} = 0$), and stereo `L + R` `4×4` tile interleaving (`step_stage2_stereo`).
+3. **Inter-Block Tone Stack & Direct-Register `VarPro` Readouts (`0` `Role B` Blocks):** A `3 kHz`-decimated 3-band `TPT-SVF` (`LP/BP/HP`) splits tone between `Block 0` and `Block 1`, and linear `VarPro` readouts (`pre_cab` feeding Stage III and `direct` feeding stereo summation) accumulate directly in SIMD registers (`h` bounded in `[-2.5, 2.5]`, linear `VarPro` paths unclipped to `±100.0` `REQ-7.1`).
 
 ---
 
@@ -239,7 +239,7 @@ Stage II models the 3-stage amplifier cascade (`V1A Preamp + Tone Stack` $\to$ `
 
 `r[dsp.stage3.cabinet-bank]`
 
-Stage III executes between Stage II and Stage IV, combining independent L/R early FIR segments (`16 / 32 / 48 / 64` taps/ch) with shared-pole Kautz modal pairs (`4 / 8 / 16 / 32` pairs, driven at $x_a[n-16]$ at `48 kHz`) and independent L/R complex readouts ([`op_m_modal_kautz.md` §4](op_m_modal_kautz.md#4-stage-iii--family-6-shared-kautz-modal-bank)).
+Stage III executes between Stage II and Stage IV, combining independent L/R early FIR segments (`16 / 32 / 48 / 64` taps/ch) with shared-pole Kautz modal pairs (`4 / 8 / 12 / 16` pairs = `8 / 16 / 24 / 32` real poles, driven at $x_a[n-16]$ at `48 kHz`) and independent L/R complex readouts loaded via aligned contiguous SIMD loads ([`op_m_modal_kautz.md` §4](op_m_modal_kautz.md#4-stage-iii--family-6-shared-kautz-modal-bank)).
 
 `r[dsp.stage3.mirrored-fir-simd]` **Double-Mirrored Reverse-Order FIR History & Contiguous `dot16_stereo` Evaluation ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** To eliminate per-tap modulo index wrapping (`(pos - k) & 63`) and scalar gather loads across the 64-tap early FIR filter, each channel's `Stage3CabinetModals` instance (`stage3` and `stage3_r`) maintains a double-mirrored reverse-order circular buffer `fir_rev_history: [f32; 128]` where each incoming sample is written to both `rev` and `rev + 64` for `rev = (64 - (self.fir_write_ptr & 63)) & 63`. Because `[rev + tap_offset .. rev + tap_offset + 16]` is always contiguous in memory for every 16-tap tier slice (`tap_offset ∈ {0, 16, 32, 48}`), `Stage3Backend::dot16_stereo` loads four contiguous `B::Vec4` vectors per channel (or two 256-bit `__m256` vectors in `avx2_dot16_stereo`) and reduces Left and Right dot products simultaneously via `SimdVec4::horizontal_sum_pair`.
 
@@ -251,11 +251,13 @@ Stage III executes between Stage II and Stage IV, combining independent L/R earl
 
 | Stage IV Component | Architectural & Mathematical Specification |
 | :--- | :--- |
-| **Physical Structure** | `M` delay lines (`M = 4` Lite, `M = 8` Full/Pro, `M = 16` Ultra) with model-declared 64B-aligned `fp16` histories and grouped bounded-history feedback guard ([Op-T §1](op_t_transport.md#11-exact-sized-delay-histories-and-branchless-wrap)). |
+| **Physical Structure & Fractional LFO** | `M` delay lines (`M = 4` Lite, `M = 8` Full/Pro, `M = 16` Ultra) with inline `1,024`-frame L1D `fp16` ring (`delay <= 1,019`) or cold-allocated power-of-two `ext_lines` (`<= 48,000` ref samples @ `48 kHz` + `4x` bounce headroom), `Q0.32` degree-5 Hermite quadrature LFO + convex-blended 4-tap Catmull-Rom fractional reads (`0-ULP` resting endpoint identity), and grouped bounded-history feedback guard ([Op-T §1](op_t_transport.md#11-exact-sized-delay-histories-and-branchless-wrap)). |
 | **Partitioned Schroeder All-Pass Diffusers** | Non-overlapping in-buffer segments with rate-converted integer lengths and `∣a_diff,m∣ ≤ 0.75` ([Op-T §3](op_t_transport.md#31-memory-partitioning--rate-aware-capacity)). |
 | **`O(M)` Givens + Householder Mixing `U(ψ, v)`** | Block-diagonal `2×2` Givens rotation `R(ψ)` (`∣Δψ∣ ≤ 0.05 rad/tick`) paired with unit-norm Householder reflection `H(v) = I_M - 2vv^T` (`‖U^T U - I‖_∞ < 1e-14` in `f64`, `< 1e-6` in `f32` across `M ∈ {4, 8, 16}`). |
 | **Input & Readout DC Conditioning** | Passband-normalized `5 Hz` DC blocker (`0x3F7FD51F` @ `48 kHz`) applied at tank input injection and non-recirculating tank readouts (§6.2). |
 | **Blended Feedback Knee & Loop Saturator** | Per-line blended knee `K(u)` (`g_lin ≤ 0.9990`, §6.4) followed by unity-slope cubic saturator (`V_ceil,m ≤ 0.9850`, §6.3). |
+
+**`Q0.32` Degree-5 Hermite Quadrature LFO Derivation (`ref[repo.code.constant-eval-and-derivations]`):** On each quadrant $u \in [0, 1]$, the unique odd-degree polynomial $P(u) = c_1 u - c_3 u^3 + c_5 u^5$ satisfying the quarter-sine $C^1$ boundary conditions $P(0) = 0,\ P'(0) = \pi/2,\ P''(0) = 0,\ P(1) = 1,\ P'(1) = 0$ solves to $c_1 = \pi/2,\ c_3 = \pi - 5/2,\ c_5 = \pi/2 - 3/2$ via compile-time `const_hermite5_quarter_sine_coeffs()`. For long-delay FDN models (`> 1,024` frames), `ext_lines` is sized and allocated solely in cold container loading so all RT steps wrap solely via `& ext_mask` (`0 UDIV`/`FDIV`/`FSQRT`/`libm`).
 
 ### 6.1 Captured Freeze and Modeled Controls
 
@@ -298,62 +300,16 @@ At $\alpha = 0$, $K(u) = g_{\text{lin}} u$ is purely linear; at $\alpha = 1$, $K
 
 `r[dsp.head.feature-bus-slots]`
 
-For each 4-mode Kautz block in Stage III, pair-grouped L/R modal readouts expose four features `[y_0L + y_2L, y_1L + y_3L, y_0R + y_2R, y_1R + y_3R]`, and each tier's 16-tap L/R FIR segment exposes two features:
+In TORA `v3` (`ADR-0021`), the historical `v2` `256-D` `feature_bus_scratch` gather buffer and `Role B` cascade folding are replaced by **zero-copy direct-register `VarPro` linear readouts** (`pre_cab` and `direct`) accumulated inline in SIMD vector registers alongside the Stage III modal/FIR slices (`4 / 8 / 12 / 16` Kautz pairs and `16 / 32 / 48 / 64` FIR taps) and Stage IV FDN taps (`1 / 2 / 4 / 4` taps across `4 / 8 / 8 / 16` lines):
 
-| Tier | Cumulative Bus Width | New Modal Features | New FIR Features | Stage III Delta | Slots Available to Other Stages |
-| :--- | :---: | :---: | :---: | :---: | :---: |
-| **`Lite`** | `64` | `4` | `2` | `6` | `58` |
-| **`Full`** | `128` | `4` | `2` | `6` | `58` |
-| **`Pro`** | `192` | `8` | `2` | `10` | `54` |
-| **`Ultra`** | `256` | `16` | `2` | `18` | `46` |
-| **Total** | `256` | `32` | `8` | `40` | `216` |
+| Tier | Stage II `GRU` (`C_gru` @ Rate) | Stage III Kautz Pairs (`8-Vec SoA`) | Stage III FIR Taps (`L/R`) | Stage IV FDN Lines + Taps | Direct Readout Path (`0` Bypass Flags) |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| **`Lite`** | `[1, 1, 1]` (`12` ch) @ `1×` | `4` pairs (`1` blk = `128 B`) | `16` taps (`128 B`) | `4` lines + `1` tap | `pre_cab` + `direct` (`Mid`/`Side`) |
+| **`Full`** | `[2, 1, 1]` (`16` ch) @ `1×` | `8` pairs (`2` blks = `256 B`) | `32` taps (`256 B`) | `8` lines + `2` taps | Prefix + `Full` delta |
+| **`Pro`** | `[2, 2, 1]` (`20` ch) @ `2×` | `12` pairs (`3` blks = `384 B`) | `48` taps (`384 B`) | `8` lines + `4` taps | Prefix + `Pro` delta |
+| **`Ultra`** | `[3, 2, 1]` (`24` ch) @ `2×` | `16` pairs (`4` blks = `512 B`) | `64` taps (`512 B`) | `16` lines + `4` taps | Prefix + `Ultra` delta (`+8-D` Ctrl) |
 
-```text
-STAGE-III-TIER-SLOTS
-Tier    New modal groups          Other-stage slots    FIR L, FIR R
-Lite      0..3   (block 0)             4..61              62,  63
-Full     64..67  (block 1)            68..125            126, 127
-Pro     128..135 (blocks 2..3)       136..189            190, 191
-Ultra   192..207 (blocks 4..7)       208..253            254, 255
-```
-
-Slots `4..11` in the `Lite` block carry the L/R Stage I `T1` sub-harmonic tracker features ([`op_m_modal_kautz.md` §3.2](op_m_modal_kautz.md#32-discrete-toggle--half-angle-sheet)):
-
-```text
-STAGE-I-T1-FEATURES
-  4 | L-cos
-  5 | L-sin
-  6 | L-half-square
-  7 | L-quarter-square
-  8 | R-cos
-  9 | R-sin
- 10 | R-half-square
- 11 | R-quarter-square
-```
-
-Within each tier block, the remaining `"Other-stage slots"` (`12..61` in `Lite`, `68..125` in `Full`, `136..189` in `Pro`, and `208..253` in `Ultra`) follow the deterministic producer layout (`ADR-0011`):
-
-```text
-CANONICAL-256D-FEATURE-BUS-MAP
-Lite (0..63):
-  0..3    (4):  Stage III Kautz Modal Block 0 [y_0L+y_2L, y_1L+y_3L, y_0R+y_2R, y_1R+y_3R]
-  4..11   (8):  Stage I T1 Sub-Harmonic Tracker [L-cos, L-sin, L-f/2, L-f/4, R-cos, R-sin, R-f/2, R-f/4]
-  12..19  (8):  Stage I Pre-FX Stereo [op_t_l, op_t_r, op_m_re_l, op_m_im_l, op_m_re_r, op_m_im_r, ssb_l, ssb_r]
-  20..35 (16):  Stage II Sub-Stage 2.1 Tone Basis L/R (8) + V1A 4-Drive PolyADAA L/R (8)
-  36..51 (16):  Stage II Sub-Stage 2.2 V1B 4-Drive PolyADAA L/R (8) + Wavefolder/Power/Sag/Hyst L/R (8)
-  52..59  (8):  Stage IV Spatial Tank 4-Line Readouts (4) + Ducked Wet L/R (2) + Stage I/II Direct L/R (2)
-  60..61  (2):  Stage 0 200 Hz TPT LR4 Clean Sub [clean_sub_l, clean_sub_r]
-  62..63  (2):  Stage III Early FIR Segment 0 (taps 0..15) [fir_0_l, fir_0_r]
-
-Full (64..127), Pro (128..191) & Ultra (192..255):
-  64..67   (4) / 128..135  (8) / 192..207 (16): Stage III Kautz Modal Blocks 1 / 2..3 / 4..7
-  68..83  (16) / 136..151 (16) / 208..223 (16): Stage I Channel Group 1 / 2 / 3 Stereo Features
-  84..115 (32) / 152..183 (32) / 224..245 (22): Stage II Channel Group 1 / 2 / 3 Commuted Basis Features
- 116..125 (10) / 184..189  (6) / 246..253  (8): Stage IV Delta Tank Lines (4..7 in Full, 8..15 in Ultra) & Cross-Terms
- 126..127  (2) / 190..191  (2) / 254..255  (2): Stage III Early FIR Segments 1 / 2 / 3 (taps 16..31 / 32..47 / 48..63)
-```
-
-`r[dsp.head.tier-equivalence]` **Effective-Tier Equivalence:** For identical external inputs, control values, initial active-tier state, and backend, a container stripped to tier `T` produces bit-identical Stage II feeds, L/R FIR histories, and retained FIR-segment features to the unstripped container running at effective tier `T` (with all tier `> T` weights and `Ultra` control extensions gated off).
+`r[dsp.head.tier-equivalence]` **Effective-Tier Equivalence:** For identical external inputs, control values, initial active-tier state, and backend, a container stripped to tier `T` produces bit-identical Stage II trajectories, L/R FIR histories, and retained readout outputs to the unstripped container running at effective tier `T` (with all tier `> T` weights and `Ultra` control extensions gated off).
 
 #### Block-Diagonal Lower-Triangular Staging (Refinement 11)
 
@@ -366,10 +322,10 @@ W_head = [ W_lite           0             0             0           ]
          [ W_ultra,lite    W_ultra,full  W_ultra,pro   W_ultra,delta ]
 ```
 
-`r[dsp.head.precollapse-and-zerocopy]` **Zero-Copy Feature Bus Packing & Two-Stage Kronecker Output Head Pre-Collapse ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):**
-1. **In-Place `feature_bus_scratch` Assembly (`0` Intermediate Copies):** Each stage writes its per-tier features directly into pre-allocated `feature_bus_scratch: [f32; 256]` slots (`Stage2CommutedCascade::step_frame_into_feature_bus` for Stage II slots `20..51`, `84..115`, `152..183`, `224..245`; `KautzModalBank<4>::step_4lane_stereo_simd_unscaled` for Stage III Kautz slots `0..3`, `64..67`, `128..135`, `192..207`; and `Stage4SpatialTank::read_multi_tier_taps_into` for Stage IV slots), avoiding temporary `256 × f32` stack array copies per sample.
-2. **Load-Time Surjective Role B Folding (`cached_role_b_slices`):** At model load / hot-reload (`DnamEngine::refresh_cached_role_b_slices`), each tier's `stage2_cascade_w` Role B blocks (`b = 1..K_t-1`, up to `191` blocks of `16 × f32` in `Ultra`) are pre-folded via `slot = (b - 1) & 7` into `cached_role_b_slices: [[B::Vec4; 32]; 4]` (`[mid_0..15, side_0..15]`), eliminating `191` block loops per audio sample.
-3. **`3 kHz` Dirty-Checked SVD Head Collapse (`collapsed_head_wl` / `collapsed_head_wr`):** At each `3 kHz` control boundary where `z_head != cached_z_head` (or `z_head_ultra != cached_z_head_ultra` / `active_tiers != cached_head_tiers`), `DnamEngine::refresh_collapsed_head_weights` folds `cached_role_b_slices` and the active SVD head modes (`4` modes in `Lite..Pro`, `8` modes in `Ultra`) into `collapsed_head_wl: [[B::Vec4; 16]; 4]`, `collapsed_head_wr: [[B::Vec4; 16]; 4]`, and `collapsed_b_head: [f32; 2]` using `SimdVec4::fma_lane::<0..3>`. At `48 kHz`, `eval_tier_feature_bus_head_dot` reduces to a single 4-way unrolled `B::Vec4` FMA loop + `SimdVec4::horizontal_sum_pair` directly over `collapsed_head_wl/wr` (while `FeatureBusBackend::tile_dot64_stereo` and 256-bit `avx2_tile_dot64_stereo` on `X86Avx2FmaBackend` provide the corresponding `64-D` stereo `[f32; 64]` slice dot primitive), cutting per-sample Output Head work by `4×`–`8×`.
+`r[dsp.head.precollapse-and-zerocopy]` **Stack-Allocated Scratch, `3 kHz` Direct-Register Readout Pre-Collapse & Post-Stage-3 Partition-of-Unity Conditioner ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [`ADR-0021`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md)):**
+1. **Stack-Allocated Transient Scratch (`0 B/instance`):** Transient per-frame scratch (`V3KernelScratch`, `~14.8 KiB`) lives strictly on the audio callback stack rather than per-instance heap state, eliminating `14×` L1D cache multiplication on embedded multi-instance racks and `0` intermediate `feature_bus_scratch` array copies.
+2. **`3 kHz` Dirty-Checked Direct Readout & `FiLM` Collapse (`ADR-0021`):** At each `3 kHz` control boundary where `is_dirty` or dynamic modulation updates control latents, `ControlBus` collapses Stage I `Env-SVF` warp coeffs, Stage II `FiLM` + Zero-DC $b_n$ + inter-block `TPT-SVF` coeffs, and `pre_cab` / `direct` `VarPro` linear readout weights in vector registers (`0` `Role B` folding loops and `0` static control MACs at `48 kHz`).
+3. **Passive Post-Stage-3 4-Band Partition-of-Unity Conditioner (`V3PostStageConditioner`):** When the inter-block `Tone TPT-SVF` is inactive (`cab_inject_w == 0` and `b1_inject_w == 0`), `stage_targets[9, 10, 12, 13, 14]` drive a zero-overhead passive 4-band log-octave equalizer (`f_sub = 250 Hz` 1-pole TPT + `f_mid = 1,800 Hz`, damping `k = 1.25`, 2-integrator Cytomic SVF) compiled from exact `const_sin_cos_f64` at `48 kHz` and rescaled division-free via `tan_prewarp_f32` + `recip_nr3_pos_f32`. Using `lp_sub`, `v2` (`1.8 kHz` Cytomic LP), `k·v1` (BP), and `x - k·v1 - v2` (HP), the four band components `b_sub = lp_sub`, `b_lm = v2 - lp_sub`, `b_pres = k·v1`, and `b_hi = x - k·v1 - v2` satisfy the exact algebraic identity `b_sub + b_lm + b_pres + b_hi ≡ x` (guaranteed zero-error bypass when all `stage_targets` are `0` at `StarCenter`, preserving `0-ULP` backbone invariance), while clamping effective band octaves `(gm + band_oct)` in `[-4.5, +3.0]` guarantees bounded passive BIBO gain.
 
 ---
 
@@ -398,10 +354,9 @@ Containers store discrete-time parameters anchored at $f_{s,\text{train}} = 48,0
    At $f_{s,\text{eff}} = 48,000\text{ Hz}$, use the validated serialized coefficients directly. At each `3 kHz` control boundary, Stage I (`theta_2..4`) and Stage III (`theta_9, theta_10`) dynamically retune their effective delays, pre-drive gains, and Kautz modal angles/gates without division or `libm`.
 2. `r[dsp.zoh.router-detector]` **Stage 0 Relative Alignment Latency & `Op-M[Ctrl]` Detector Poles:**
    $$\delta_{\text{align},ch}^{\text{samples}}(f_{s,\text{eff}}) = \frac{\delta_{\text{align},ch}^{\text{samples}}(f_{s,\text{train}})}{\rho_{\text{sr}}}, \qquad p_{\text{det},b}(f_{s,\text{eff}}) = \big(p_{\text{det},b}(f_{s,\text{train}})\big)^{\rho_{\text{sr}}}$$
-3. `r[dsp.zoh.stage2-op-n]` **Stage II (`Op-N`) Tone-Stack Poles, Sag/Bias Poles, 2D Hysteresis & Family 5 ZOH Phase (`0.999995` Upper Clamp):**
-   $$p_{\text{tone},k}(f_{s,\text{eff}}) = \big(p_{\text{tone},k}(f_{s,\text{train}})\big)^{\rho_{\text{sr}}}, \qquad R_{\text{sag},k}(f_{s,\text{eff}}) = \big(R_{\text{sag},k}(f_{s,\text{train}})\big)^{\rho_{\text{sr}}}, \qquad R_{\text{ac}}(f_{s,\text{eff}}) = \big(R_{\text{ac}}(f_{s,\text{train}})\big)^{\rho_{\text{sr}}}$$
-   Real poles rescaled via `rescale_real_pole` clamp to $[0.0, 0.999995]$ ($Q \approx 100{,}000$), preserving sub-`5 Hz` AC blockers at $4\times$ oversampling (`192 kHz` / `384 kHz`).
-   $$\Delta s_{\text{re}}[n] = \rho_{\text{sr}}^{-1}\big(s_{\text{re}}[n] - s_{\text{re}}[n-1]\big)$$
+3. `r[dsp.zoh.stage2-op-n]` **Stage II Continuous-Time `GRU` Gate Retention, `Env-SVF`/`TPT-SVF` & Family 5 ZOH Phase (`0.999995` Upper Clamp):**
+   $$1 - z_{\text{eff}}(f_{s,\text{eff}}) = \big(1 - z_{\text{ref}}\big)^{\rho_{\text{sr}}}, \qquad p_{\text{tone},k}(f_{s,\text{eff}}) = \big(p_{\text{tone},k}(f_{s,\text{train}})\big)^{\rho_{\text{sr}}}, \qquad R_{\text{ac}}(f_{s,\text{eff}}) = \big(R_{\text{ac}}(f_{s,\text{train}})\big)^{\rho_{\text{sr}}}$$
+   In Stage II, `Lite` (`[1,1,1]`) and `Full` (`[2,1,1]`) step natively at `1×` (`48 kHz`) via $z_{1\times} = 1 - (1 - z_{2\times})^2$ and `V3Rate1xCalibration` (`up_zoh_mix` + low-delay `poly3` decimation), while `Pro` (`[2,2,1]`) and `Ultra` (`[3,2,1]`) step at `2×` (`4×` on offline bounce). Real poles rescaled via `rescale_real_pole` clamp to $[0.0, 0.999995]$ ($Q \approx 100{,}000$), preserving sub-`5 Hz` AC blockers at $4\times$ oversampling (`192 kHz` / `384 kHz`), alongside $\Delta s_{\text{re}}[n] = \rho_{\text{sr}}^{-1}(s_{\text{re}}[n] - s_{\text{re}}[n-1])$.
 4. `r[dsp.zoh.op-t-delays]` **Stage I & IV (`Op-T`) Delays, All-Pass Diffusers, Crossfades & DC Blocker:**
    $$\tau_{0,m}^{\text{samples}}(f_{s,\text{eff}}) = \max\left(4.0,\ \frac{\tau_{0,m}^{\text{samples}}(f_{s,\text{train}})}{\rho_{\text{sr}}}\right), \qquad D_{\text{ap},m}(f_{s,\text{eff}}) = \max\left(1,\ \mathrm{round}\left(\frac{D_{\text{ap},m}(f_{s,\text{train}})}{\rho_{\text{sr}}}\right)\right)$$
    $$L_{\text{xfade}}(f_{s,\text{eff}}) = \max\left(16,\ \mathrm{round}\left(\frac{L_{\text{xfade}}(f_{s,\text{train}})}{\rho_{\text{sr}}}\right)\right), \qquad R_{\text{dc}}(f_{s,\text{eff}}) = \big(R_{\text{dc}}(f_{s,\text{train}})\big)^{\rho_{\text{sr}}}$$

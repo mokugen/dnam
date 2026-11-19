@@ -60,6 +60,30 @@ fn avx2_fma_mat4x4_vec4(acc: __m128, mat: &[[f32; 4]; 4], x: &[f32; 4]) -> __m12
     _mm_fmadd_ps(_mm_broadcast_ss(&x[3]), Avx2FmaVec4::load(&mat[3]).0, out)
 }
 
+#[target_feature(enable = "avx,avx2,fma")]
+#[inline]
+fn avx2_fma_mat4x4_stereo(
+    acc_l: __m128,
+    acc_r: __m128,
+    cols: &[[f32; 4]; 4],
+    x_l: __m128,
+    x_r: __m128,
+) -> (__m128, __m128) {
+    let c0 = Avx2FmaVec4::load(&cols[0]).0;
+    let c1 = Avx2FmaVec4::load(&cols[1]).0;
+    let c2 = Avx2FmaVec4::load(&cols[2]).0;
+    let c3 = Avx2FmaVec4::load(&cols[3]).0;
+    let mut out_l = _mm_fmadd_ps(c0, _mm_permute_ps::<0x00>(x_l), acc_l);
+    let mut out_r = _mm_fmadd_ps(c0, _mm_permute_ps::<0x00>(x_r), acc_r);
+    out_l = _mm_fmadd_ps(c1, _mm_permute_ps::<0x55>(x_l), out_l);
+    out_r = _mm_fmadd_ps(c1, _mm_permute_ps::<0x55>(x_r), out_r);
+    out_l = _mm_fmadd_ps(c2, _mm_permute_ps::<0xAA>(x_l), out_l);
+    out_r = _mm_fmadd_ps(c2, _mm_permute_ps::<0xAA>(x_r), out_r);
+    out_l = _mm_fmadd_ps(c3, _mm_permute_ps::<0xFF>(x_l), out_l);
+    out_r = _mm_fmadd_ps(c3, _mm_permute_ps::<0xFF>(x_r), out_r);
+    (out_l, out_r)
+}
+
 #[target_feature(enable = "avx")]
 #[inline]
 fn avx_reduce256(v: core::arch::x86_64::__m256) -> __m128 {
@@ -255,6 +279,11 @@ impl SimdVec4 for Avx2FmaVec4 {
     }
 
     #[inline(always)]
+    fn from_array(arr: [f32; 4]) -> Self {
+        Self(Sse2Vec4::from_array(arr).0)
+    }
+
+    #[inline(always)]
     fn store(self, dst: &mut [f32; 4]) {
         Sse2Vec4(self.0).store(dst);
     }
@@ -348,6 +377,21 @@ impl SimdVec4 for Avx2FmaVec4 {
     fn horizontal_sum_pair(self, rhs: Self) -> (f32, f32) {
         Sse42Vec4(self.0).horizontal_sum_pair(Sse42Vec4(rhs.0))
     }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        Self(Sse2Vec4(self.0).rcp_pos_seed_bits().0)
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        Self(Sse2Vec4(self.0).rsqrt_pos_seed_bits().0)
+    }
+
+    #[inline(always)]
+    fn pow2_from_biased_int_bits(self) -> Self {
+        Self(Sse2Vec4(self.0).pow2_from_biased_int_bits().0)
+    }
 }
 
 /// x86-64 AVX2 + FMA + F16C (`x86-64-v3`) hardware math backend.
@@ -411,6 +455,30 @@ impl MathBackend for X86Avx2FmaBackend {
             unsafe { Avx2FmaVec4(avx2_fma_mat4x4_vec4(acc.0, mat, x)) }
         } else {
             Avx2FmaVec4(X86Sse42Backend::fma_mat4x4_vec4(Sse42Vec4(acc.0), mat, x).0)
+        }
+    }
+
+    #[inline(always)]
+    fn fma_mat4x4_stereo(
+        acc_l: Avx2FmaVec4,
+        acc_r: Avx2FmaVec4,
+        cols: &[[f32; 4]; 4],
+        x_l: Avx2FmaVec4,
+        x_r: Avx2FmaVec4,
+    ) -> (Avx2FmaVec4, Avx2FmaVec4) {
+        if Self::is_supported() {
+            // SAFETY: Guarded by `Self::is_supported()`.
+            let (l, r) = unsafe { avx2_fma_mat4x4_stereo(acc_l.0, acc_r.0, cols, x_l.0, x_r.0) };
+            (Avx2FmaVec4(l), Avx2FmaVec4(r))
+        } else {
+            let (l, r) = X86Sse42Backend::fma_mat4x4_stereo(
+                Sse42Vec4(acc_l.0),
+                Sse42Vec4(acc_r.0),
+                cols,
+                Sse42Vec4(x_l.0),
+                Sse42Vec4(x_r.0),
+            );
+            (Avx2FmaVec4(l.0), Avx2FmaVec4(r.0))
         }
     }
 

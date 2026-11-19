@@ -2,17 +2,15 @@ import { describe, expect, it, vi } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { expectZeroAxeViolations, setRangeInputValue } from "../../../tests/setup.js";
+import { DiscreteSwitch } from "./DiscreteSwitch.js";
 import {
-  AccelerationBadge,
-  DiscreteSwitch,
   describeRotaryArc,
-  formatBackendLabel,
   normalizedToAngleDeg,
   polarToCartesian,
-  RotaryKnob,
-  StabilityAuditBadge,
   valueToNormalized,
-} from "./index.js";
+} from "./geometry.js";
+import { RotaryKnob } from "./RotaryKnob.js";
+import { AccelerationBadge, formatBackendLabel, StabilityAuditBadge } from "./StatusBadges.js";
 
 describe("rotary SVG geometry", () => {
   it("computes rotary arcs and handles degenerate ranges", () => {

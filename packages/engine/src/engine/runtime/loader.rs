@@ -9,7 +9,6 @@ use crate::control::ControlClampDescriptor;
 use crate::engine::{DnamEngine, EngineBackend};
 use crate::memory::ArenaStorage;
 use crate::schema::{DnamError, DnamJsonHeader};
-use crate::stages::weights::{PIPE_FLAG_STAGE1_EXT, PIPE_FLAG_STAGE4_EXT, has_pipeline_flag};
 use crate::types::Tier;
 
 struct ValidatedReloadFrame<'b> {
@@ -99,19 +98,6 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         self.preamble = preamble;
         self.tier = active_tier;
         self.max_available_tier = max_avail;
-        self.stage_pipeline.stage1.topology_mode = 0;
-        self.stage_pipeline.stage1.gate_threshold = 0.0;
-        {
-            let arena_b = self.arena_storage.as_bytes();
-            if has_pipeline_flag(arena_b, PIPE_FLAG_STAGE1_EXT) {
-                self.stage_pipeline.stage1.reserve_extended_capacity(16_384);
-            }
-            if has_pipeline_flag(arena_b, PIPE_FLAG_STAGE4_EXT) {
-                self.stage_pipeline
-                    .stage4
-                    .reserve_extended_capacity(131_072, 32_768);
-            }
-        }
         self.reconfigure_for_sample_rate_with_mode(sample_rate_hz, true)?;
         Ok(())
     }
@@ -166,6 +152,9 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             self.single_input = hdr.io_config.inputs == 1;
         }
         self.header = parsed_header;
+        let max_avail = Self::detect_max_tier(&frame.preamble, frame.arena_slice.len());
+        let next_tier = tier.min(max_avail).min(self.max_supported_tier);
+        self.preallocate_cold_stage4_for(&frame.preamble, next_tier);
         self.apply_validated_reload(
             frame.preamble,
             frame.arena_slice.len(),

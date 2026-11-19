@@ -60,7 +60,7 @@ fn rlib_matches_current_arch(rlib_path: &Path) -> bool {
         return false;
     };
     let text = String::from_utf8_lossy(&out.stdout);
-    if !text.contains("step_frame_tora") {
+    if !text.contains("V3HotCore") && !text.contains("process_block") {
         return false;
     }
     #[cfg(target_arch = "aarch64")]
@@ -113,37 +113,41 @@ fn is_realtime_root_symbol(sym: &str) -> bool {
         "DnamEngine",
         "DynamicDnamEngine",
         "ControlBus",
-        "StagePipeline",
-        "Stage1PreDynamics",
+        "Stage0Router",
         "V3HotCore",
         "V3CoreInstance",
+        "V3Stage1SvfState",
+        "V3Stage3Hot",
+        "V3Stage4Hot",
         "v3_process_block_default",
         "v3_process_block_infallible_default",
         "dnam_engine_process_block",
         "dnam_engine_process_mono",
+        "dnam_engine_process_4port",
     ];
     const RT_METHOD_PATTERNS: &[&str] = &[
         "::process_block",
         "::process_block_in_place",
         "::process_block_stereo",
         "::process_block_infallible",
+        "::step_4port_frame",
+        "::step_stereo",
+        "::step_subblock",
+        "::step_subblock_fast",
+        "::run_3khz_tick",
+        "::step_blocks",
+        "::reconfigure",
         "v3_process_block_default",
         "v3_process_block_infallible_default",
         "::process_mono",
         "::process_mono_to_stereo",
-        "::step_frame_tora",
-        "::step_frame_4x_tora",
-        "::step_frame_4port_tora",
-        "::step_frame_4x_4port_tora",
-        "::step_frame_with_feature_bus",
         "::step_control_tick_3khz",
-        "::refresh_collapsed_head_weights",
         "::tick_3khz",
         "::tick_3khz_with_detectors",
-        "::retune_kautz_formant_3khz",
-        "::retune_op_m_pre_3khz",
+        "::kautz_formant",
         "dnam_engine_process_block",
         "dnam_engine_process_mono",
+        "dnam_engine_process_4port",
     ];
     RT_OWNER_PATTERNS.iter().any(|p| sym.contains(p))
         && RT_METHOD_PATTERNS.iter().any(|m| sym.contains(m))

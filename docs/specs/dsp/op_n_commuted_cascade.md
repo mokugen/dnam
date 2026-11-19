@@ -10,29 +10,34 @@ requirements:
   - REQ-1.1
   - REQ-6.2
 adrs:
-  - ADR-0004
   - ADR-0019
+  - ADR-0021
 ---
 
-# Op-N: Universal Nonlinear, Hysteretic & Commuted Cascade Operator
+# Op-N: Universal Nonlinear, Hysteretic & Matryoshka `GRU` Operator
 
-This specification defines **Op-N (Nonlinear)** ([`packages/engine/src/operators/op_n.rs`](../../../packages/engine/README.md), [`packages/capture/src/`](../../../packages/capture/README.md)), the universal operator kernel governing division-free polynomial antiderivative anti-aliasing (`PolyADAA`), `C²` cubic-envelope wavefolding, 2D quadrature phase-space hysteresis, fixed-hertz ZOH sample-rate reduction and bitcrushing (`Family 5`), the **Exact LTI Basis Commutativity Theorem**, the Stage II 3-stage commuted amplifier cascade, and the `3 kHz` polynomial control engine across **Dynamic Neural Audio Modeler (DNAM)** ([`tora_architecture.md`](../architecture/tora_architecture.md)). For R&D counterexamples and derivations, see [`../../adr/0004-division-free-polyadaa-and-c2-wavefolder.md`](../../adr/0004-division-free-polyadaa-and-c2-wavefolder.md).
+This specification defines **Op-N (Nonlinear)** ([`packages/engine/src/operators/op_n.rs`](../../../packages/engine/README.md), [`packages/capture/src/`](../../../packages/capture/README.md)), the universal operator kernel governing TORA `v3` Stage II Zero-DC Matryoshka `GRU` (`[1,1,1] / [2,1,1] / [2,2,1] / [3,2,1]` at `1×`/`2×` ZOH scaling), division-free in-register `NR2` rational Padé `tanh`/`sigmoid` via `SimdVec4::rcp_ge1_nr2`, inter-block `3 kHz` `TPT-SVF` + `FiLM`, `C²` cubic-envelope wavefolding, 2D quadrature phase-space hysteresis, fixed-hertz ZOH sample-rate reduction and bitcrushing (`Family 5`), pre-stage `PolyADAA` reference profiles, resting Zero-DC equilibrium startup, and the `3 kHz` polynomial control engine across **Dynamic Neural Audio Modeler (DNAM)** ([`tora_architecture.md`](../architecture/tora_architecture.md), [`ADR-0021`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md)).
 
 ---
 
-## 1. Multi-Drive $1\times$ B-Spline `PolyADAA` Bank
+## 1. TORA `v3` `NR2` Rational Padé Activations & Reference `PolyADAA` Profile
 
-### 1.1 Pre-Activation Clamping
+### 1.1 Pre-Activation Clamping & `NR2` Padé Argument Bounding
 
 `r[dsp.op-n.polyadaa.clamp]`
 
-Given pre-activation signal $x[n]$ and drive scale $d \in [0.25, 1.0, 4.0, 16.0]$, form the raw scaled input $r_n = \frac{2}{3} d \cdot x[n]$ and clamped coordinate $u_n = \mathrm{clamp}(r_n, -1.0, +1.0)$. Retain the unclamped previous sample $r_{n-1}$ so rail-crossing segments preserve overshoot weighting.
+In TORA `v3` Stage II (`GRU`), pre-activations bind finite operands cleanly before `SimdVec4` Padé evaluation (`tanh_pade5_vec4` / `sigmoid_pade5_vec4`), clamping linear gain paths only at the `±1e9` safety boundary (`REQ-7.1`). For reference Stage I / legacy `PolyADAA` shaping with drive scale $d \in [0.25, 1.0, 4.0, 16.0]$, form $r_n = \frac{2}{3} d \cdot x[n]$ and clamped $u_n = \mathrm{clamp}(r_n, -1.0, +1.0)$, retaining unclamped $r_{n-1}$.
 
-### 1.2 Exact Division-Free Algebraic Midpoint Factorization
+### 1.2 Division-Free In-Register `NR2` Rational Padé (`rcp_ge1_nr2`) & Midpoint Factorization
 
 `r[dsp.op-n.polyadaa.midpoint]`
 
-For clamped endpoints $u_n, u_{n-1} \in [-1, 1]$ with midpoint $m_n = \frac{1}{2}(u_n + u_{n-1})$ and half-difference $d_n = \frac{1}{2}(u_n - u_{n-1})$, the interior antiderivative quotients factor without division (`0 FDIV`, matching `f64` difference quotients within $< 10^{-12}$ algebraic error):
+To evaluate $\tanh(x)$ and $\sigma(x)$ in 4-lane SIMD registers with **zero `FDIV`, zero `libm`, zero LUT gathers, zero GPR spills, exact `0-ULP` odd symmetry, and exact $\tanh(+0.0) = +0.0$**:
+1. Clamp $|x|$ to $R = 4$ via the closed-form $C^1$-clamped rational Padé-`5/4` pair $P_5(x)/Q_4(x) = x(1 + n_1 x^2 + n_2 x^4)/(1 + d_1 x^2 + d_2 x^4)$ solved analytically from the `x^5` Maclaurin series matching of $\tanh(x)$ together with endpoint pinning $P_5(R) = Q_4(R)$ and $C^1$ zero-slope saturation $(P_5/Q_4)'(R) = 0$:
+   $$d_1 - n_1 = \frac{1}{3}, \qquad d_2 - n_2 - \frac{1}{3}d_1 = -\frac{2}{15}, \qquad R + R^3 n_1 + R^5 n_2 = 1 + R^2 d_1 + R^4 d_2, \qquad 1 + 3R^2 n_1 + 5R^4 n_2 = 2R d_1 + 4R^3 d_2$$
+   At $R = 4$, this yields the exact rationals $(n_1, n_2, d_1, d_2) = (61/600,\ 11/19200,\ 87/200,\ 47/3840)$ evaluated at compile time (`ref[repo.code.constant-eval-and-derivations]`).
+2. Evaluate $Q(x^2)^{-1}$ via **`SimdVec4::rcp_ge1_nr2`**: subtract normalized IEEE-754 `binary32` bits from the Chebyshev minimax reciprocal seed `0x7EF3_11C3` (`0x7E80_0000 +` $\mathrm{round}\big((2\sqrt{6} - 4)\cdot 2^{23}\big)$) (derived by balancing the relative seed error of $(1 + f)^{-1}$ across $f \in [0, 1)$) in vector registers (`0` `.to_array()`/`from_array()` GPR transfers) and execute `2` Newton-Raphson refinement steps (`NR2`, relative error $< 3.5 \times 10^{-6}$). Likewise, inverse-square-root helpers centralize the global two-binade minimax seeds (`0x5F37_59DF` for `f32`, `0x5FE6_EB50_C7B5_37A9` for `f64`).
+3. For reference interior `PolyADAA` midpoint endpoints $u_n, u_{n-1} \in [-1, 1]$ with $m_n = \frac{1}{2}(u_n + u_{n-1})$ and $d_n = \frac{1}{2}(u_n - u_{n-1})$:
 $$\mathcal{A}_{\text{odd}}[n] = m_n \Big(1.5 - 0.5\big(m_n^2 + d_n^2\big)\Big), \qquad \mathcal{A}_{\text{even}}[n] = \left(m_n^2 + \frac{1}{3}d_n^2\right) - \left(m_n^4 + 2 m_n^2 d_n^2 + \frac{1}{5}d_n^4\right)$$
 
 #### Saturated-Curve Rail Crossing (6-Step Division-Free Reciprocal)
@@ -99,89 +104,65 @@ $$h_{\text{hyst}}[n] = s_{\text{re}}[n] \cdot \big(s_{\text{re}}[n] - s_{\text{r
 
 `r[dsp.op-n.commuted.theorem1]`
 
-```mermaid
-flowchart LR
-    subgraph Uncommuted ["Constant-Weight Representation: Basis Filtering (y_uncomm[n])"]
-        direction LR
-        U1["P-D Basis Vector<br/>u_nl[n] in R^P"] --> L1["Filter All P Basis Channels<br/>L_k(u_nl)[n] (P * K filter states)"]
-        L1 --> W1["Project via W_k in R^{P x C}<br/>Sum_k L_k(u_nl)[n] * W_k"]
-    end
-
-    subgraph Commuted ["Runtime Representation: TORA LTI-Commuted Projection (y_comm[n])"]
-        direction LR
-        U2["P-D Basis Vector<br/>u_nl[n] in R^P"] --> W2["Project First via W_k<br/>v_k[n] = u_nl[n] * W_k in R^C"]
-        W2 --> L2["Step LTI Filter Once on C Lanes<br/>Sum_k L_k(v_k)[n]"]
-    end
-
-    W1 <==>|"Theorem 1: Constant-Weight Real-Arithmetic Identity"| L2
-```
+While TORA `v2` applied **Theorem 1** across a fixed-drive `PolyADAA` basis and LTI filter bank (`y_comm[n] = Sum_k L_k(u_nl[n] * W_k)`), **TORA `v3` promotes Stage II to a Direct-Register Matryoshka `GRU` + `3 kHz` `TPT-SVF` architecture** while retaining Theorem 1's causal linear-operator property for linear `VarPro` `pre_cab` and `direct` output-readout collapse (`3 kHz` control weight folding into direct SIMD registers without `256-D` `feature_bus_scratch`):
 
 **Theorem 1 (Exact LTI Basis Commutativity).**  
-Let $\mathbf{u}_{\text{nl}}[n] \in \mathbb{R}^P$ be a sequence of $P$-dimensional nonlinear basis vectors bounded by $\sup_{n, p} |u_p[n]| \le U_{\max} < \infty$, $\lbrace \mathcal{L}_k \rbrace_{k=0}^{K-1}$ be $K$ causal, stable LTI filters with impulse responses $h_k \in \ell_1(\mathbb{Z})$, and $\lbrace \mathbf{W}_k \rbrace_{k=0}^{K-1} \subset \mathbb{R}^{P \times C}$ be constant real projection matrices. Then for every channel $c \in [0, C-1]$ and sample $n \in \mathbb{Z}$:
-$$\sum_{k=0}^{K-1} \Big(\mathcal{L}_k\big(\mathbf{u}_{\text{nl}}\big)[n]\Big) \mathbf{W}_k \equiv \sum_{k=0}^{K-1} \mathcal{L}_k\Big(\mathbf{u}_{\text{nl}} \mathbf{W}_k\Big)[n]$$
+Let $\mathbf{u}[n] \in \mathbb{R}^P$ be bounded per-channel block activations or inputs ($\sup_{n, p} |u_p[n]| \le U_{\max} < \infty$), $\lbrace \mathcal{L}_k \rbrace_{k=0}^{K-1}$ be causal, stable LTI filters with impulse responses $h_k \in \ell_1(\mathbb{Z})$, and $\lbrace \mathbf{W}_k \rbrace_{k=0}^{K-1} \subset \mathbb{R}^{P \times C}$ be constant real projection matrices. Then for every channel $c \in [0, C-1]$ and sample $n \in \mathbb{Z}$:
+$$\sum_{k=0}^{K-1} \Big(\mathcal{L}_k\big(\mathbf{u}\big)[n]\Big) \mathbf{W}_k \equiv \sum_{k=0}^{K-1} \mathcal{L}_k\Big(\mathbf{u} \mathbf{W}_k\Big)[n]$$
 
-*Proof.* Because $h_k \in \ell_1(\mathbb{Z})$ and $\mathbf{u}_{\text{nl}}$ is bounded, the double sum $\sum_{m=-\infty}^\infty \sum_{p=0}^{P-1} h_k[m] u_p[n-m] W_{k,p,c}$ converges absolutely, permitting summation interchange by Fubini's theorem so $v_{k,c}[n-m] = (\mathbf{u}_{\text{nl}}[n-m]\mathbf{W}_k)_c$ is filtered directly on $C$ lanes. $\blacksquare$
+*Proof.* Because $h_k \in \ell_1(\mathbb{Z})$ and $\mathbf{u}$ is bounded, the double sum converges absolutely, permitting summation interchange by Fubini's theorem so $\mathbf{u}\mathbf{W}_k$ filters directly on $C$ SIMD lanes. $\blacksquare$
 
 ### 3.2 Causality Audit & Elimination of Acausal Lookahead
 
 `r[dsp.op-n.commuted.causality]`
 
-All delay offsets in Stage II are strictly causal ($d \ge 0$): $\mathbf{v}_{\text{delay},1}[n] = \mathbf{u}_{\text{nl}}[n-1]\mathbf{W}_{d=1}$ and $\mathbf{v}_{\text{delay},2}[n] = \mathbf{u}_{\text{nl}}[n-2]\mathbf{W}_{d=2}$.
+All delay offsets and `poly3` decimation / Stage II–III interfaces in TORA `v3` are strictly causal ($d \ge 0$), preserving sample-accurate alignment across `1×` (`Lite`/`Full`) and `2×` (`Pro`/`Ultra`) paths.
 
 ### 3.3 Commutator Perturbation Under $3\text{ kHz}$ Control-Rate Modulation
 
 `r[dsp.op-n.commuted.project-then-filter]`
 
-When $\mathbf{W}_k[n]$ varies at $3\text{ kHz}$ with rate bound $\Vert \mathbf{W}_k[n] - \mathbf{W}_k[n-m] \Vert \le \nu_{\text{ctrl}} m / f_s$ and $\Vert \mathbf{u}_{\text{nl}}[n] \Vert \le B_u$, the commutator perturbation for a 1-pole filter $h_k[m] = (1 - r_k)r_k^m u[m]$ satisfies:
-$$\Delta_{\text{comm}}[n] = \sum_{m=0}^\infty h_k[m] \mathbf{u}_{\text{nl}}[n - m] \Big(\mathbf{W}_k[n] - \mathbf{W}_k[n - m]\Big), \qquad \Vert \Delta_{\text{comm}}[n] \Vert \le \frac{B_u \nu_{\text{ctrl}}}{f_s} \cdot \frac{r_k}{1 - r_k}$$
-Under time-varying control modulation $\mathbf{W}_k[n] = \sum_r z_r[n] \mathbf{U}_{k,r}$, the runtime projects first ($\mathbf{v}_k[n] = \mathbf{u}_{\text{nl}}[n]\mathbf{W}_k[n]$) and then steps $\mathcal{L}_k$. Training matches this exact project-then-filter order by filtering the product columns $\mathcal{L}_k(u_p z_r)[n]$ when solving for $\mathbf{U}_{k,r}$:
-$$\mathcal{L}_k\left(\sum_p u_p W_{k,p,c}\right)[n] = \sum_{p,r} \mathcal{L}_k\left(u_p z_r\right)[n] U_{k,r,p,c}$$
+Under time-varying control modulation at the `3 kHz` boundary (`FiLM`, Zero-DC $b_n$, `TPT-SVF` coefficients, and linear `VarPro` readouts), all coefficient deltas micro-ramp across $K_{\text{ctrl}}$ samples, matching forward evaluation in [`packages/capture/`](../../../packages/capture/README.md) with zero train/runtime divergence:
+$$\Delta_{\text{comm}}[n] \le \frac{B_u \nu_{\text{ctrl}}}{f_s} \cdot \frac{r_k}{1 - r_k}$$
 
 ### 3.4 Boundary Conditions, Resting DC Equilibrium & Pop-Free Startup
 
 `r[dsp.op-n.commuted.dc-equilibrium]`
 
-Given resting basis $\mathbf{u}_{\text{rest}}$ and projected filter input $\mathbf{v}_{\text{rest},k} = \mathbf{u}_{\text{rest}}\mathbf{W}_k$, initialize the four-filter tone basis (§4.1) and B-spline ADAA blend (§1.3) at sample `-1` for pop-free startup:
-1. **Direct:** Stateless passthrough of $\mathbf{v}_{\text{rest},0}$.
-2. **Low-Pass ($y[n] = p y[n-1] + (1-p)v[n]$):** Initialize $y[-1] = v_{\text{rest}}$.
-3. **High-Pass ($y[n] = p y[n-1] + p(v[n] - v[n-1])$):** Initialize both $y[-1] = 0$ and previous input $v[-1] = v_{\text{rest}}$.
-4. **ADAA & AC Blocker:** Initialize $\mathcal{A}[-1] = m_{\text{dc}}[-1] = g_{\text{nl}}(u_{\text{rest}})$.
+Given Stage II Zero-DC Matryoshka `GRU` resting bias construction ($h_t = (1 - z_t) \odot h_{t-1} + z_t \odot n_t$), setting candidate rest offset $b_n = -W_{n} u_{\text{rest}} - b_{hn}$ (with $h_{\text{eq}} = 0$ at rest when user input $x = 0$) paired with `NR2` odd-symmetric $\tanh(+0.0) = +0.0$ guarantees exact `0.0f32` DC rest equilibrium without transient startup pops, and any auxiliary tone/AC filter initializes cleanly to zero rest:
+1. **Stage II Zero-DC `GRU` Hidden State:** $h_{\text{init}} = 0.0\text{f32}$ (`12 / 16 / 20 / 24` ch per channel).
+2. **`3-Band TPT-SVF` & AC Filters:** Initialize integrator states $s_1 = s_2 = 0.0\text{f32}$ at resting zero equilibrium.
 
 ---
 
-## 4. Stage II 3-Stage Commuted Nonlinear Cascade Architecture
+## 4. Stage II Zero-DC Matryoshka `GRU` & Inter-Block Tone Stack
 
 `r[dsp.op-n.stage2.sub-stages]`
 
-Stage II models vacuum tube amplifier heads and high-gain drive pedals across three commuted sub-stages:
-1. **Sub-Stage 2.1 (V1A Preamp):** Input grid impedance, initial triode clipping, and tone stack filtering.
-2. **Sub-Stage 2.2 (V1B Driver):** Driver stage saturation, cathode bypass capacitor recovery, and `C²` cubic-envelope wavefolding (§2.1).
-3. **Sub-Stage 2.3 (Power Amp / Sag / Hysteresis):** Push-pull power tubes, dynamic power supply $B^+$ sag, transformer core hysteresis (§2.2), and speaker back-EMF damping.
+Stage II models vacuum tube preamps, asymmetric drives, power-amp compression, and interactive tone stacks via a **3-block tapered feed-forward Zero-DC Matryoshka `GRU` pyramid** (`Block 0 -> Inter-Block Tone TPT-SVF -> Block 1 -> Block 2`) running natively at **`1×` (`48 kHz`) in `Lite` (`[1,1,1] = 12 ch`) and `Full` (`[2,1,1] = 16 ch`)** and **`2×` (`96 kHz`, `4×` bounce) in `Pro` (`[2,2,1] = 20 ch`) and `Ultra` (`[3,2,1] = 24 ch`)**:
+1. **Continuous-Time ZOH Gate Scaling & `1×` Aliasing Guard:** Stores continuous-time update-gate retention rates $1 - z_{\text{eff}}(q) = (1 - z_{1\times})^{1/q}$ so `Lite` and `Full` run natively at `1×` using `V3Rate1xCalibration` (`up_zoh_mix` + low-delay `poly3` decimation) while sharing prefix weights with `2×` `Pro` and `Ultra`.
+2. **Bounded ISS / Finite State Invariant:** Every `GRU` hidden lane stays bounded in `[-2.5, 2.5]` with spectral contraction under zero input, while linear `pre_cab` and `direct` `VarPro` bypass/readout paths carry unclipped audio signals across `±100.0` (`+40 dBFS`, `REQ-7.1`).
 
 ### 4.1 Four-Filter Tone Basis (Refinement 3)
 
 `r[dsp.op-n.stage2.tone-basis]`
 
-Sub-Stage 2.1 uses the four-filter tone basis with matched-pole coefficients $p_f = e^{-2\pi f / 48000}$ at `48 kHz` (rescaled at other rates via [router §9](router_and_stages_topology.md#9-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-44196-khz--4-bounce)):
-$$\mathcal{L} = \big[\text{Direct}, \ \text{LPF}_{80\text{ Hz}}, \ \text{LPF}_{400\text{ Hz}}, \ \text{HPF}_{1200\text{ Hz}}\big], \qquad L_f(z) = \frac{1-p_f}{1-p_f z^{-1}}, \qquad H_f(z) = \frac{p_f(1-z^{-1})}{1-p_f z^{-1}}$$
+Between `Block 0` and `Block 1` of the Stage II Matryoshka `GRU`, TORA `v3` steps a **3-band Trapezoidal State-Variable Filter (`TPT-SVF`) tone stack** (`Lowpass`, `Bandpass`, `Highpass`) whose normalized frequencies and gains refresh at `3 kHz` (micro-ramped over $K_{\text{ctrl}}$ samples, `0` per-sample transcendental or `FDIV` calls), replacing the `v2` `[Direct, LPF_80, LPF_400, HPF_1200]` fixed-pole bank while retaining the exact 4-basis structure at rest:
+$$H_{\text{tone},c}(z) = g_{\text{lp}} L_{\text{svf}}(z) + g_{\text{bp}} B_{\text{svf}}(z) + g_{\text{hp}} H_{\text{svf}}(z) + g_{\text{dir}}$$
 
 ### 4.2 Stereo Basis, Role A Inter-Stage Coupling & Surjective Role B Feature-Bus Folding
 
 `r[dsp.op-n.stage2.stereo-coupling]`
 
-Each sub-stage couples Left and Right nonlinear drive/fold/sag basis vectors across $2 \times 2$ block coupling matrices:
-$$\mathbf{u}_{\text{drive,stereo}}^{(s)}[n] = \big[\mathbf{u}_{\text{drive},L}^{(8)}[n], \ \mathbf{u}_{\text{drive},R}^{(8)}[n]\big]^\top \in \mathbb{R}^{16}$$
-- **Diagonal Blocks ($\mathbf{W}_{L\to L}, \mathbf{W}_{R\to R}$):** Primary Left and Right channel amplification.
-- **Off-Diagonal Blocks ($\mathbf{W}_{L\to R}, \mathbf{W}_{R\to L}$):** Shared power-supply $B^+$ sag coupling and transformer crosstalk ($-55\text{ to }-70\text{ dB}$).
-- **Role A (`b = 0`) vs. Surjective Role B (`b = 1..K_t-1`) Partition:** Within each tier's `stage2_cascade_w` slice (`K_t = 48 / 96 / 144 / 192` blocks of `16 x f32`), Block `b = 0` (**Role A**) parameterizes the `4×4` inter-stage coupling matrix driving Sub-Stages 2.1 $\to$ 2.2 $\to$ 2.3 (held watermark-free so nonlinear trajectories remain invariant), while Blocks `b = 1..K_t-1` (**Role B**) fold surjectively via `slot = (b - 1) & 7` into the 8 Stage II feature-bus readout slots (`40..48` per tier) for linear output-head projection and exact Layer 1 Cascade-Head Gauge compensation.
-- `r[dsp.op-n.stage2.conv6-simd]` **4-Accumulator `conv6_taps` Tiling & Stereo Filter Vectorization ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** Multi-tap commuted projections execute via `Stage2Backend::conv6_taps_{1..4}groups` (`conv6_taps_{1..4}groups_vec4`) using 4 independent vector accumulators (`acc0..acc3`) and broadcast lane FMA (`SimdVec4::fma_lane::<0..3>`), paired with stereo-packed inter-stage biquads (`step_interstage_filter_stereo`) and branch shapers (`step_branch_shaper_stereo`).
+Stage II preserves independent Left and Right recurrent state trajectories alongside optional cross-channel stereo coupling, retiring legacy `v2` `Role A / Role B` `stage2_cascade_w` block folding in favor of direct-register `pre_cab` (`Stage II -> Stage III`) and `direct` (`Stage II -> Out`) `VarPro` stereo linear accumulators (`0` intermediate scatter/gather copies into `feature_bus_scratch`).
+- `r[dsp.op-n.stage2.conv6-simd]` **Stereo `L + R` `4×4` Tile Interleaving (`step_stage2_stereo`) & `NR2` Vectorization ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [`ADR-0021`](../../adr/0021-unified-matryoshka-gru-and-direct-register-stages.md)):** `Stage2Backend` steps `Left` (`SimdVec4`) and `Right` (`SimdVec4`) hidden blocks side by side inside `step_stage2_stereo`, loading each `4×4` recurrent and input weight tile once from `Arena 0..3` into vector registers and dual-issuing `L` and `R` FMAs across both SIMD FMA pipes before applying `NR2` Padé `tanh`/`sigmoid` with zero NEON-to-GPR spills.
 
 ### 4.3 $3\text{ kHz}$ Bilinear Rank-$R$ Stage Latent Folding
 
 `r[dsp.op-n.stage2.latent-folding]`
 
-At each $3\text{ kHz}$ control boundary, stage latents $\mathbf{z}_{\text{stage}} \in \mathbb{R}^{D_{\text{stage}}}$ ($D_{\text{stage}} = 4$ in `Lite/Full/Pro`, $8$ in `Ultra`) fold into $\mathbf{W}_k^{(s)}$ (`Ultra` modes $5..8$ reside in `Arena 3`):
-$$\mathbf{W}_k^{(s)}(\mathbf{z}_{\text{stage}}) = \mathbf{W}_{k, 0}^{(s)} + \sum_{r=1}^{D_{\text{stage}}} z_{\text{stage}, r} \mathbf{W}_{k, r}^{(s)}$$
+At each $3\text{ kHz}$ control boundary, stage latents $\mathbf{z}_{\text{stage}} \in \mathbb{R}^{D_{\text{stage}}}$ ($D_{\text{stage}} = 4$ in `Lite/Full/Pro`, $8$ in `Ultra`) modulate Stage II's per-block **`FiLM` gain/shift vectors**, **Zero-DC $b_n$ shift**, **inter-block `TPT-SVF` cutoff/band gains**, and **direct `VarPro` linear readouts** (`Arena 3` holds `Ultra` extensions):
+$$\boldsymbol{\gamma}_{\text{film}}(\mathbf{z}_{\text{stage}}) = \boldsymbol{\gamma}_0 + \sum_{r=1}^{D_{\text{stage}}} z_{\text{stage}, r} \Delta\boldsymbol{\gamma}_r, \qquad \mathbf{W}_{\text{ro}}(\mathbf{z}_{\text{stage}}) = \mathbf{W}_{\text{ro},0} + \sum_{r=1}^{D_{\text{stage}}} z_{\text{stage}, r} \mathbf{W}_{\text{ro}, r}$$
 
 ---
 

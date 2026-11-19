@@ -3,7 +3,8 @@ import { page, userEvent } from "vitest/browser";
 import { render } from "vitest-browser-react";
 import { expectZeroAxeViolations } from "../../tests/setup.js";
 import { TauriNativeAudioHost } from "../host.js";
-import { DEFAULT_STUDIO_VIEW_MODEL, StudioApp } from "./index.js";
+import { StudioApp } from "./StudioApp.js";
+import { DEFAULT_STUDIO_VIEW_MODEL } from "./studio_store.js";
 
 describe("StudioApp Tauri v2 React 19 shell", () => {
   it("renders StudioApp, switches all 4 workspace tabs, matches ARIA snapshot, and passes axe audit", async () => {

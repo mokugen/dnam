@@ -1,11 +1,11 @@
 import {
-  clampNumber,
   clampTierToMaxSupported,
   type DnamAudioHost,
   type DnamBackendAcceleration,
   type DnamModelTier,
   type DnamTelemetrySnapshot,
-} from "@dnam-project/ui";
+} from "@dnam-project/ui/host/types";
+import { clampNumber } from "@dnam-project/ui/utils";
 import { StudioIpcClient } from "./ipc.js";
 
 export interface TauriNativeAudioHostOptions {

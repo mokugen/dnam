@@ -123,6 +123,9 @@ scope = "engine"
 [rules."arch.pillars.cp1-projections"]
 scope = "engine"
 
+[rules."arch.pillars.universal-black-box"]
+scope = "engine"
+
 [rules."arch.lifecycle.dual-rate"]
 scope = "engine"
 
@@ -209,7 +212,7 @@ scope = "engine"
 
 [rules."arch.isomorphism.two-sweep"]
 scope = "out-of-scope"
-reason = "Five-stage analytical VarPro and Cholesky solver owned by packages/capture"
+reason = "TORA v3 analytical VarPro, Windowed-BPTT, and Cholesky solver owned by packages/capture"
 
 [rules."arch.isomorphism.audit-wiring"]
 scope = "out-of-scope"
@@ -853,7 +856,7 @@ reason = "Stage D analytical VarPro corner barrier owned by packages/capture"
 
 [rules."train.audit.phase2.clamp-rail"]
 scope = "out-of-scope"
-reason = "Phase-2 2048-sample PolyADAA rail occupancy auditor owned by packages/capture"
+reason = "Phase-2 2048-sample GRU/SVF state boundedness and rail occupancy auditor owned by packages/capture"
 
 [rules."train.audit.phase3.clamp-dynamic"]
 scope = "out-of-scope"
@@ -872,31 +875,31 @@ scope = "out-of-scope"
 reason = "Owned and verified by packages/capture"
 
 # ==============================================================================
-# 15. Training: Five-Stage Pipeline (`docs/specs/training/four_stage_pipeline.md`)
+# 15. Training: TORA v3 Solver Pipeline (`docs/specs/training/four_stage_pipeline.md`)
 # ==============================================================================
 [rules."train.pipeline.topology"]
 scope = "out-of-scope"
-reason = "Five-stage analytical VarPro pipeline orchestration owned by packages/capture"
+reason = "TORA v3 analytical VarPro, Windowed-BPTT, and Cholesky pipeline orchestration owned by packages/capture"
 
 [rules."train.pipeline.stage-a-poles"]
 scope = "out-of-scope"
-reason = "Stage A Steiglitz-McBride rational pole and delay identification owned by packages/capture"
+reason = "Stage A Steiglitz-McBride / OMP rational pole and delay identification owned by packages/capture"
 
 [rules."train.pipeline.stage-b-harvest"]
 scope = "out-of-scope"
-reason = "Stage B exact 256-D feature harvesting and INPC/STMC extraction owned by packages/capture"
+reason = "Stage B joint 4-tier Windowed-BPTT backbone and 2.0-2.5s fp32 INPC/STMC extraction owned by packages/capture"
 
 [rules."train.pipeline.stage-c-schur"]
 scope = "out-of-scope"
-reason = "Stage C nested 4-tier Schur-complement MM-Cholesky and LTAS KKT solver owned by packages/capture"
+reason = "Stage C nested 4-tier VarPro uplo='U' Cholesky and LTAS KKT solver owned by packages/capture"
 
 [rules."train.pipeline.stage-d-control"]
 scope = "out-of-scope"
-reason = "Stage D triangular Newton CP1 control-bus projection solver owned by packages/capture"
+reason = "Stage D parallel multi-knob FiLM/Tone-SVF/CP1 control-bus projection solver owned by packages/capture"
 
 [rules."train.pipeline.stage-e-pack"]
 scope = "out-of-scope"
-reason = "Stage E Rank-1 Kautz contraction, [STAB-ZERO-DC], and container emission owned by packages/capture"
+reason = "Stage E f32 readout polish, ISS/Schur audit, [STAB-ZERO-DC], and container emission owned by packages/capture"
 
 [rules."train.gram.accuracy-contract"]
 scope = "out-of-scope"
@@ -904,7 +907,7 @@ reason = "IEEE-754 float64 Gram contraction accuracy contract owned by packages/
 
 [rules."train.gram.wide192"]
 scope = "out-of-scope"
-reason = "192-bit wide-significand Gram accumulation owned by packages/capture"
+reason = "Compensated and wide-significand Gram accumulation owned by packages/capture"
 
 [rules."train.pipeline.isomorphism-parity"]
 scope = "out-of-scope"
@@ -935,7 +938,7 @@ reason = "Time-varying stem statistics and trajectory windows owned by packages/
 
 [rules."train.resume.two-tier-execution"]
 scope = "out-of-scope"
-reason = "Two-Path (<5-10ms Fast-Path vs <15-25ms Full Re-Pool) vault execution owned by packages/capture"
+reason = "Two-Path (<150 ms Path 1 Fast-Path vs Raw-Audio-Free Path 2 Full Re-Pool) vault execution owned by packages/capture"
 
 [rules."train.resume.dependency-digests"]
 scope = "out-of-scope"
@@ -947,11 +950,11 @@ reason = "Unchanged-stem non-regression verification owned by packages/capture"
 
 [rules."train.resume.windowed-refresh"]
 scope = "out-of-scope"
-reason = "Bounded <32 MiB windowed Gram refresh owned by packages/capture"
+reason = "Bounded <64 MiB windowed Gram and Windowed-BPTT refresh owned by packages/capture"
 
 [rules."train.cache.proj-vault"]
 scope = "out-of-scope"
-reason = "Single-file .dnam-proj INPC/STMC capsule vault persistence owned by packages/capture"
+reason = "Single-file .dnam-proj fp32 INPC/STMC capsule vault persistence owned by packages/capture"
 
 [rules."train.cloud.job-protocol"]
 scope = "out-of-scope"
@@ -1057,6 +1060,13 @@ reason = "Repository-wide static source guardrail for coverage(off) and math/ ma
 [rules."repo.code.modular-decomposition-and-tests"]
 scope = "out-of-scope"
 reason = "Repository-wide modular decomposition, zero code-golfing, and co-located unit-test guardrail verified in tests/test_guardrails.test.ts"
+
+[rules."repo.code.constant-eval-and-derivations"]
+scope = "engine"
+
+[rules."repo.code.universal-black-box"]
+scope = "out-of-scope"
+reason = "Repository-wide universal black-box engine and solver purity guardrail verified in tests/test_guardrails.test.ts"
 
 [rules."arch.simd.two-level-traits"]
 scope = "engine"

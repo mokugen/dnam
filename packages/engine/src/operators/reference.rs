@@ -2,6 +2,10 @@
 //!
 //! Provides canonical mathematical references for bit-accurate parity testing across all SIMD backends.
 
+pub mod rail_crossing;
+
+pub use rail_crossing::eval_saturated_polyadaa_rail_crossing_f64;
+
 /// Reference `f64` division-free algebraic `PolyADAA` kernel (`ref[dsp.op-n.polyadaa.midpoint]`):
 #[inline]
 pub fn poly_adaa_algebraic_f64(u_prev: f64, u_curr: f64, beta: f64, delta: f64) -> f64 {
@@ -445,14 +449,7 @@ mod tests {
 
 #[cfg(test)]
 mod operator_verification_tests {
-    #[allow(unused_imports)]
-    use alloc::{
-        boxed::Box,
-        format,
-        string::{String, ToString},
-        vec,
-        vec::Vec,
-    };
+    use alloc::{vec, vec::Vec};
 
     // Empirical TORA Operator Verification Suite (`Tests 1A, 1B, 1C, 2A, 2B, 2C, 3`).
     //
@@ -474,12 +471,13 @@ mod operator_verification_tests {
     use std::f64::consts::{PI, TAU};
 
     use crate::FtzDazGuard;
-    use crate::math::ScalarBackend;
+    use crate::math::{MathBackend, ScalarBackend, SimdVec4};
     use crate::operators::op_m::{KautzModalBank, SymplecticModal4Lane, algebraic_unit_rotor_op_m};
-    use crate::operators::op_n::{MultiDrivePolyAdaaChannel, poly_adaa_algebraic_eval};
+    use crate::operators::op_n::{OpNBackend, c2_wavefolder};
     use crate::operators::op_t::{OP_T_LITE_RING_CAPACITY, OpTDelayLine};
     use crate::operators::reference::{
-        catmull_rom_hermite_f64, poly_adaa_algebraic_f64, poly_adaa_slice_f64,
+        catmull_rom_hermite_f64, eval_saturated_polyadaa_rail_crossing_f64,
+        poly_adaa_algebraic_f64, poly_adaa_slice_f64,
     };
     use proptest::prelude::*;
 
@@ -579,8 +577,10 @@ mod operator_verification_tests {
             let alg64 = poly_adaa_algebraic_f64(u, u, beta, delta);
             assert!((alg64 - inst).abs() < 1e-15);
 
-            let alg32 = poly_adaa_algebraic_eval(u as f32, u as f32, beta as f32, delta as f32);
-            assert!((alg32 - (inst as f32)).abs() < 1e-6);
+            let (rc_odd, rc_even, crossed) = eval_saturated_polyadaa_rail_crossing_f64(u, u);
+            assert!(!crossed);
+            assert!((rc_even - (u * u - u * u * u * u)).abs() < 1e-12);
+            assert!((rc_odd - u * (1.5 - 0.5 * u * u)).abs() < 1e-12);
         }
     }
 
@@ -850,8 +850,8 @@ mod operator_verification_tests {
             }
         }
 
-        /// Property test verifying `SymplecticModal4Lane`, `MultiDrivePolyAdaaChannel`, and `OpTDelayLine`
-        /// remain finite and bounded under arbitrary modulated drives and delay sweeps.
+        /// Property test verifying `SymplecticModal4Lane`, `OpNBackend::tanh_pade5_4ch` / `c2_wavefolder`,
+        /// and `OpTDelayLine` remain finite and bounded under arbitrary modulated drives and delay sweeps.
         #[test]
         fn prop_operators_bounded_and_finite(
             x in -10.0_f32..10.0_f32,
@@ -865,13 +865,21 @@ mod operator_verification_tests {
             let (re, im) = modal.step_lane(0, x);
             prop_assert!(re.is_finite() && im.is_finite());
 
-            let mut adaa = MultiDrivePolyAdaaChannel::default();
-            let y_adaa = adaa.step(re, g_base, bias, 0.5, 0.9993);
-            prop_assert!(y_adaa.iter().all(|v| v.is_finite()));
+            let drive_in = g_base * re + bias;
+            let t4 = ScalarBackend::tanh_pade5_4ch(<ScalarBackend as MathBackend>::Vec4::from_array([
+                drive_in,
+                -drive_in,
+                0.25 * drive_in,
+                0.0,
+            ]))
+            .to_array();
+            prop_assert!(t4.iter().all(|v| v.is_finite() && v.abs() <= 1.0));
+            let (wf_odd, wf_even) = c2_wavefolder(re);
+            prop_assert!(wf_odd.is_finite() && wf_even.is_finite());
 
             let mut dl = OpTDelayLine::<OP_T_LITE_RING_CAPACITY>::default();
             dl.set_target_delay(delay, false);
-            let y_dl = dl.step(y_adaa[0]);
+            let y_dl = dl.step(t4[0]);
             prop_assert!(y_dl.is_finite());
         }
     }

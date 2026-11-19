@@ -151,7 +151,8 @@ mod tests {
     use super::*;
     use crate::FtzDazGuard;
     use crate::container::ZohRescaledParams;
-    use crate::stages::{Stage2CommutedCascade, ToneBasisFilters};
+    use crate::math::{MathBackend, ScalarBackend, SimdVec4};
+    use crate::operators::op_n::OpNBackend;
     use alloc::vec::Vec;
     use proptest::prelude::*;
 
@@ -222,18 +223,18 @@ mod tests {
             assert!((yu - yc).abs() < 1e-13);
         }
 
-        let mut tb = ToneBasisFilters::new();
-        tb.init_dc_equilibrium(0.75);
-        let out_tb = tb.step(0.75);
-        assert!((out_tb[0] - 0.75).abs() < 1e-6);
-        assert!((out_tb[1] - 0.75).abs() < 1e-6);
-        assert!((out_tb[2] - 0.75).abs() < 1e-6);
-        assert!(out_tb[3].abs() < 1e-6);
-
         let zoh = ZohRescaledParams::compute(48_000, 96_000, 0.995, 0.99, 0.999, 64).unwrap();
-        let mut s2 = Stage2CommutedCascade::new();
-        s2.reconfigure_sample_rate(&zoh);
-        assert!((s2.hyst_diff_scale - 2.0).abs() < 1e-6);
+        assert!((zoh.rho_sr - 0.5).abs() < 1e-6);
+        let p_rescaled = zoh.rescale_real_pole(0.95);
+        assert!(p_rescaled > 0.95 && p_rescaled < 1.0);
+        let t_out =
+            ScalarBackend::tanh_pade5_4ch(<ScalarBackend as MathBackend>::Vec4::from_array([
+                0.0, 0.5, -0.5, 4.0,
+            ]))
+            .to_array();
+        assert_eq!(t_out[0].to_bits(), 0);
+        assert!((t_out[1] + t_out[2]).abs() < 1e-6);
+        assert!((t_out[3] - 1.0).abs() < 1e-5);
 
         let (cl, cr) = eval_stage2_stereo_coupling_16d(
             &[1.0; 8], &[0.5; 8], &[0.25; 8], &[0.01; 8], &[0.01; 8], &[0.25; 8],

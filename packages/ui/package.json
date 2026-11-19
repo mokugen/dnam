@@ -18,26 +18,39 @@
     "components.json",
     "README.md"
   ],
-  "main": "./dist/index.js",
-  "module": "./dist/index.js",
-  "types": "./dist/index.d.ts",
   "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "default": "./dist/index.js"
-    },
     "./styles.css": "./src/styles.css",
     "./tokens": {
       "types": "./dist/tokens.d.ts",
       "default": "./dist/tokens.js"
     },
-    "./host": {
-      "types": "./dist/host/index.d.ts",
-      "default": "./dist/host/index.js"
+    "./utils": {
+      "types": "./dist/lib/utils.d.ts",
+      "default": "./dist/lib/utils.js"
     },
-    "./visualizers": {
-      "types": "./dist/components/visualizers/index.d.ts",
-      "default": "./dist/components/visualizers/index.js"
+    "./base/*": {
+      "types": "./dist/components/base/*.d.ts",
+      "default": "./dist/components/base/*.js"
+    },
+    "./controls/*": {
+      "types": "./dist/components/controls/*.d.ts",
+      "default": "./dist/components/controls/*.js"
+    },
+    "./rack/*": {
+      "types": "./dist/components/rack/*.d.ts",
+      "default": "./dist/components/rack/*.js"
+    },
+    "./workflows/*": {
+      "types": "./dist/components/workflows/*.d.ts",
+      "default": "./dist/components/workflows/*.js"
+    },
+    "./visualizers/*": {
+      "types": "./dist/components/visualizers/*.d.ts",
+      "default": "./dist/components/visualizers/*.js"
+    },
+    "./host/*": {
+      "types": "./dist/host/*.d.ts",
+      "default": "./dist/host/*.js"
     }
   },
   "dependencies": {

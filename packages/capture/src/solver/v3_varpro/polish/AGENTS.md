@@ -8,4 +8,4 @@ See [`../../../../CONTRIBUTING.md`](../../../../CONTRIBUTING.md) and [`../../../
 | [`extract.rs`](extract.rs) | Exact `f32` decimated shared-core trajectory extraction. | [`four_stage_pipeline.md`](../../../../../../docs/specs/training/four_stage_pipeline.md) |
 | [`prescreen.rs`](prescreen.rs) | Cold-model perceptual prescreen & `pre_cab` sharing check. | [`psychoacoustic_quality_and_tiers.md`](../../../../../../docs/specs/architecture/psychoacoustic_quality_and_tiers.md) |
 | [`subspace.rs`](subspace.rs) | Whitened BESR hinge + Welch-33 LTAS subspace L-BFGS polish. | [`psychoacoustic_quality_and_tiers.md`](../../../../../../docs/specs/architecture/psychoacoustic_quality_and_tiers.md) |
-| [`repair.rs`](repair.rs) | Candidate scoring, monotone blends & corridor repair. | [`psychoacoustic_quality_and_tiers.md`](../../../../../../docs/specs/architecture/psychoacoustic_quality_and_tiers.md) |
+| [`repair.rs`](repair.rs), [`repair/corridor.rs`](repair/corridor.rs) | Candidate scoring, monotone blends & corridor repair. | [`psychoacoustic_quality_and_tiers.md`](../../../../../../docs/specs/architecture/psychoacoustic_quality_and_tiers.md) |

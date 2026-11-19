@@ -42,5 +42,6 @@ Run all checks from the workspace root via `moon`:
 ```bash
 moon check capture
 moon run capture:coverage
+moon run capture:qualify
 moon run capture:bench
 ```

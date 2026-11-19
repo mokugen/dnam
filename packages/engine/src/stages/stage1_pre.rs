@@ -484,13 +484,14 @@ impl Stage1PreDynamics {
         }
 
         let mut has_delta_poles = false;
-        if arena.len() >= 10_832 {
+        if arena.len() >= crate::stages::weights::ARENA_LITE_BYTES + 80 {
+            let base = crate::stages::weights::ARENA_LITE_BYTES;
             for lane in 0..4 {
-                let r_low = read_f32_le(arena, 10_752 + lane * 4);
-                let dr = read_f32_le(arena, 10_768 + lane * 4);
-                let theta = read_f32_le(arena, 10_784 + lane * 4);
-                let c_re = read_f32_le(arena, 10_800 + lane * 4);
-                let c_im = read_f32_le(arena, 10_816 + lane * 4);
+                let r_low = read_f32_le(arena, base + lane * 4);
+                let dr = read_f32_le(arena, base + 16 + lane * 4);
+                let theta = read_f32_le(arena, base + 32 + lane * 4);
+                let c_re = read_f32_le(arena, base + 48 + lane * 4);
+                let c_im = read_f32_le(arena, base + 64 + lane * 4);
                 if r_low.abs() > 1e-12 || dr.abs() > 1e-12 || theta.abs() > 1e-12 {
                     has_delta_poles = true;
                 }
@@ -1178,5 +1179,50 @@ mod tests {
                 prop_assert_eq!(or, 0.0);
             }
         }
+    }
+
+    #[test]
+    fn test_stage1_pre_load_reconfigure_retune_and_delta() {
+        use crate::container::ZohRescaledParams;
+        use crate::stages::weights::{
+            ARENA_LITE_BYTES, ARENA0_PIPELINE_FLAGS_OFFSET, PIPE_FLAG_STAGE1_EXT, PIPE_MAGIC_HI,
+        };
+        let _audio = crate::FtzDazGuard::new();
+        let mut pre = Stage1PreDynamics::default();
+        pre.reserve_extended_capacity(4096);
+        pre.load_from_arena(&[0u8; 64]);
+
+        let mut arena = alloc::vec![0u8; 64_000];
+        pre.load_from_arena(&arena);
+        let magic = PIPE_MAGIC_HI | PIPE_FLAG_STAGE1_EXT;
+        arena[ARENA0_PIPELINE_FLAGS_OFFSET..ARENA0_PIPELINE_FLAGS_OFFSET + 4]
+            .copy_from_slice(&magic.to_le_bytes());
+        for lane in 0..4 {
+            arena[256 + lane * 4..260 + lane * 4].copy_from_slice(&0.85_f32.to_le_bytes());
+            arena[272 + lane * 4..276 + lane * 4].copy_from_slice(&0.05_f32.to_le_bytes());
+            arena[288 + lane * 4..292 + lane * 4].copy_from_slice(&0.5_f32.to_le_bytes());
+            arena[ARENA_LITE_BYTES + lane * 4..ARENA_LITE_BYTES + 4 + lane * 4]
+                .copy_from_slice(&0.88_f32.to_le_bytes());
+            arena[ARENA_LITE_BYTES + 16 + lane * 4..ARENA_LITE_BYTES + 20 + lane * 4]
+                .copy_from_slice(&0.04_f32.to_le_bytes());
+            arena[ARENA_LITE_BYTES + 32 + lane * 4..ARENA_LITE_BYTES + 36 + lane * 4]
+                .copy_from_slice(&0.6_f32.to_le_bytes());
+        }
+        arena[352..356].copy_from_slice(&1.5_f32.to_le_bytes());
+        arena[356..360].copy_from_slice(&2_u32.to_le_bytes());
+        for off in (ARENA0_STAGE1_EXT_OFFSET..ARENA0_STAGE1_EXT_OFFSET + 128).step_by(4) {
+            arena[off..off + 4].copy_from_slice(&0.25_f32.to_le_bytes());
+        }
+        arena[ARENA0_STAGE1_EXT_OFFSET + 104..ARENA0_STAGE1_EXT_OFFSET + 108]
+            .copy_from_slice(&640.0_f32.to_le_bytes());
+        pre.load_from_arena(&arena);
+        assert!(pre.ext_active);
+        pre.reconfigure_sample_rate(&ZohRescaledParams::new(48_000, 96_000));
+        pre.retune_op_m_pre_3khz(0.15, 0.75, true);
+        pre.retune_op_m_pre_3khz(0.15, 0.75, true);
+        pre.retune_op_m_pre_3khz(3.2, 0.9, true);
+        pre.reconfigure_sample_rate(&ZohRescaledParams::new(48_000, 44_100));
+        pre.step_delta_branch(0.25, -0.25);
+        assert!(pre.op_m_pre_delta_l.z_re[0].is_finite());
     }
 }

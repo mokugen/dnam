@@ -4,12 +4,11 @@
  * @module
  */
 
-export {
-  type Subdivision,
-  type SubdivisionPhaseResult,
-  subdivisions,
-  type TempoCalibrationResult,
-  type ZohParams,
+export { type Subdivision, subdivisions } from "../types.js";
+export type {
+  SubdivisionPhaseResult,
+  TempoCalibrationResult,
+  ZohParams,
 } from "./subdivisions.js";
 export {
   computeZoh,

@@ -1,9 +1,9 @@
 ---
 id: ADR-0008
 title: "Per-Stem uplo='U' Kronecker Statistics & 192-Bit Wide-Significand Gram Contraction"
-status: accepted
+status: superseded
 supersedes: []
-superseded_by: null
+superseded_by: ADR-0021
 specs:
   - docs/specs/training/four_stage_pipeline.md
   - docs/specs/training/iterative_resume_and_caching.md

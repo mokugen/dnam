@@ -18,9 +18,9 @@ Consult [`AGENTS.md`](AGENTS.md) for the module-to-spec discovery table:
    - [`rust/core.rs`](rust/core.rs) + `rust/core/{engine,container,control,provenance,operators}.rs` implement the target-agnostic safe Rust core (`#[forbid(unsafe_code)]`).
    - **Host Target (`#[cfg(not(target_arch = "wasm32"))]` in [`rust/napi.rs`](rust/napi.rs)):** Compiles via `napi` (`napi10`) into `dist/native/{release,debug,profiling}/dnam.<platform>-<arch>.node` with zero-copy `Float32Array`, `Float64Array`, and `Uint8Array` borrows plus libuv worker-pool `AsyncTask` support (`processAsync`).
    - **WASM Target (`#[cfg(target_arch = "wasm32")]` in [`rust/wasm.rs`](rust/wasm.rs)):** Compiles for `wasm32-unknown-unknown` (`--no-default-features`, omitting `testing`) with `.cargo/config.toml` flags (`-C target-feature=+simd128 -C link-arg=-zstack-size=786432 -C link-arg=--import-memory -C link-arg=--export-memory -C link-arg=--max-memory=268435456`) across three targets in `scripts/build_wasm.mjs`: `--debug` (`[profile.dev]` into `dist/wasm/debug/dnam.wasm`, skipping `wasm-opt`), `--release` (`[profile.release]` + Binaryen `wasm-opt -O1 --strip-dwarf --strip-producers` into `dist/wasm/release/dnam.wasm`), and `--profiling` (`[profile.profiling]` + Binaryen `wasm-opt -O1 --debuginfo` into `dist/wasm/profiling/dnam.wasm`). `package.json` `"files"` explicitly excludes `dist/native/{debug,profiling}` and `dist/wasm/{debug,profiling}` so only `release` artifacts can be published.
-3. **Feature-Oriented TypeScript 7 & WebAudio `AudioWorklet` SDK (`src/`):**
+3. **Feature-Oriented TypeScript 7, Hierarchical Submodules & WebAudio `AudioWorklet` SDK (`src/`, `ref[repo.code.modular-decomposition-and-tests]`):**
    - Conditional `exports` in [`package.json`](package.json) route Node.js 26 LTS (`"node"` -> [`src/node.ts`](src/node.ts)) to `NapiDriver` ([`src/internal/native/napi.ts`](src/internal/native/napi.ts), with synchronous WASM fallback) and Browser/Bundler imports (`"browser"` -> [`src/browser.ts`](src/browser.ts)) to `WasmDriver` ([`src/internal/native/wasm.ts`](src/internal/native/wasm.ts)).
-   - Feature directories: `src/model/`, `src/engine/`, `src/parameters/`, `src/tempo/`, `src/schema/`, `src/provenance/`, `src/dsp/`, `src/web-audio/`, and private `src/internal/`.
+   - Feature directories: `src/model/`, `src/engine/`, `src/parameters/`, `src/tempo/`, `src/schema/`, `src/provenance/`, `src/dsp/`, `src/web-audio/`, and private `src/internal/`. Route all intra-package imports directly to concrete leaf modules with zero non-exported internal `index.ts` barrels (`model/`, `engine/`, `internal/native/{napi,wasm}/`), restrict explicit named re-exports strictly to declared `package.json` `"exports"` entrypoints, and decompose large drivers (`napi.ts` + `napi/*.ts`, `wasm.ts` + `wasm/**/*.ts`) and domain modules into focused child modules (`< 900` LOC ceiling, zero `\n\` code-golfing or JSDoc stripping).
 
 ---
 
@@ -45,15 +45,16 @@ moon run js:profile
 
 Root [`biome.json`](../../biome.json) and [`tsconfig.json`](tsconfig.json) enforce strict typing and runtime isolation:
 
-1. **Browser, Schema & Worklet Isolation:** `src/browser.ts`, `src/internal/native/wasm.ts`, `src/schema/**/*.ts`, and `src/web-audio/**/*.ts` must never import `node:*` built-in modules (`noRestrictedImports` in `biome.json`).
+1. **Browser, Schema & Worklet Isolation:** `src/browser.ts`, `src/internal/native/wasm.ts`, `src/internal/native/wasm/**/*.ts`, `src/schema/**/*.ts`, and `src/web-audio/**/*.ts` must never import `node:*` built-in modules (`noRestrictedImports` in `biome.json`).
 2. **Zero-Dependency Package & `AudioWorkletGlobalScope`:** `@dnam-project/dnam` has zero runtime npm dependencies (`"dependencies"` is omitted), and `src/web-audio/processor.ts` bundles into a standalone `dist/web-audio-processor.js` module.
 3. **Strict TypeScript 7 (`tsc --noEmit`):** Maintain `strict: true`, `noUncheckedIndexedAccess: true`, `exactOptionalPropertyTypes: true`, and `verbatimModuleSyntax: true` with zero `any` or non-null assertions (`!`).
+4. **Zero Internal Barrels & Wildcard Re-Exports (`noBarrelFile` & `noReExportAll`):** Forbid `export *` everywhere and forbid barrel files outside the 9 declared `package.json` `"exports"` entrypoints.
 
 ---
 
-## 4. Testing, Coverage (≥ 95%) & Benchmarks (`vitest` v5 + `@vitest/browser-playwright` + `fast-check`)
+## 4. 4-Tier Testing, Coverage (≥ 95%) & Benchmarks (`vitest` v5 + `@vitest/browser-playwright` + `fast-check`)
 
-Use **`fast-check`** (`fc.assert(fc.property(...))`) wherever possible across all Node (`src/**/*.test.ts`, `tests/integration/**/*.test.ts`) and headless Chromium (`src/**/*.browser.test.ts` via `@vitest/browser-playwright` with COOP/COEP `crossOriginIsolated` headers) test suites to verify snake_case $\leftrightarrow$ camelCase codec roundtrips, container header/arena integrity, 3-Phase parameter clamping, ZOH sample-rate rescaling, audio block processing stability, provenance signatures, WebAudio `OfflineAudioContext` + `AudioWorkletNode` shared-ring state transitions, and N-API vs WASM parity over arbitrary generated inputs.
+Follow the 4-tier testing hierarchy (`ref[repo.code.modular-decomposition-and-tests]`): co-locate leaf/domain **`fast-check`** (`fc.assert(fc.property(...))`) unit tests (`src/**/*.test.ts`) and headless Chromium WebAudio tests (`src/**/*.browser.test.ts` via `@vitest/browser-playwright` with COOP/COEP `crossOriginIsolated` headers) directly beside the modules they test (never create `src/**/__tests__/`, generic `test(s).ts`, `src/**/*.spec.ts`, or `*coverage*.test.ts` grab-bags), and keep cross-domain / N-API $\leftrightarrow$ WASM parity / profiling suites under `tests/integration/` and `tests/profile/`. Verify snake_case $\leftrightarrow$ camelCase codec roundtrips, container header/arena integrity, 3-Phase parameter clamping, ZOH sample-rate rescaling, audio block processing stability, provenance signatures, WebAudio `OfflineAudioContext` + `AudioWorkletNode` shared-ring state transitions, and N-API vs WASM parity over arbitrary generated inputs.
 
 ```bash
 # 1. Run all js quality gates (format-check, lint, typecheck, build, test)

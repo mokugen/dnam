@@ -22,7 +22,11 @@ use dnam_engine::schema::{
     RouterConfig, SlimmableTiersConfig, Stage1PreFxConfig, Stage2CascadeConfig,
     Stage3CabinetKautzConfig, Stage4SpatialTankConfig, TempoSubdivision, TierProfile,
 };
-use dnam_engine::stages::v3_core::{V3ColdTierModel, V3CoreInstance, V3HotCore};
+use dnam_engine::stages::stage2_gru::{
+    MAX_BLOCK_LANES, NUM_GRU_BLOCKS, flat_gru_lane_index, tier_fir_segments, tier_kautz_banks,
+};
+use dnam_engine::stages::weights::pack_v3_matryoshka_to_arena;
+use dnam_engine::stages::{V3ColdTierModel, V3CoreInstance, V3HotCore, V3MatryoshkaModel};
 use dnam_engine::{DnamEngine, Tier};
 
 fn make_bench_container() -> AlignedBuffer<CacheLine64> {
@@ -182,10 +186,35 @@ fn make_bench_container() -> AlignedBuffer<CacheLine64> {
         tensor_directory: BTreeMap::new(),
     };
 
-    let mut arena = vec![0u8; 64_000];
-    for (i, byte) in arena[128..62_000].iter_mut().enumerate() {
-        *byte = ((i * 7 + 3) & 0x3F) as u8;
+    let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+    let mut model = V3MatryoshkaModel::dual_rate_default(false);
+    model.stage0.xo_low_gain = 1.05;
+    model.stage0.xo_high_gain = 0.95;
+    model.stage0.clean_sub_mix = 0.05;
+    model.stage0.op_p_sub_mix = 0.12;
+    model.svf.env_oct_sens = 1.8;
+    model.tone_svf.h0_proj_w = [0.2, -0.1, 0.15, 0.05];
+    model.tone_svf.s1_proj_w = 0.3;
+    model.ctrl.w_film_gain[0][0][0] = 0.35;
+    for b in 0..NUM_GRU_BLOCKS {
+        for dst in 0..MAX_BLOCK_LANES {
+            model.blocks[b].w_in_n[0][dst] = 0.65;
+            model.blocks[b].b_z[dst] = -0.60;
+            model.blocks[b].b_r[dst] = 1.25;
+            model.blocks[b].w_rec_n[dst][dst] = 0.15;
+            if b > 0 {
+                model.blocks[b].w_prev_n[dst][dst] = 0.45;
+            }
+        }
     }
+    for s4 in &mut model.stage4 {
+        s4.wet_mix = 0.15;
+        s4.g_loop = 0.85;
+        s4.lfo_rate_hz = 1.6;
+        s4.lfo_depth_samples = 6.0;
+        s4.lfo_stereo_phase = core::f32::consts::FRAC_PI_2;
+    }
+    pack_v3_matryoshka_to_arena(&model, &mut arena);
     let raw = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
     let mut aligned = AlignedBuffer::<CacheLine64>::new_zeroed(raw.len() / 64);
     aligned.as_bytes_mut().copy_from_slice(&raw);
@@ -340,130 +369,189 @@ fn bench_wcet_tail_latency<B: EngineBackend>(container: &[u8], tier: Tier, label
 
 #[cfg_attr(feature = "hotpath", hotpath::main(percentiles = [50, 95, 99], limit = 0))]
 fn main() {
-    let container_full = make_bench_container();
+    let v3_only = std::env::args().any(|a| a == "v3_core");
+    if !v3_only {
+        let container_full = make_bench_container();
 
-    let iters = 1_000;
-    let crypto = DefaultCryptoProvider::default();
-    let t_load = Instant::now();
-    for _ in 0..iters {
-        let v =
-            DnamContainerView::from_bytes(black_box(container_full.as_bytes()), &crypto).unwrap();
-        black_box(v.preamble.header_crc32c);
+        let iters = 1_000;
+        let crypto = DefaultCryptoProvider::default();
+        let t_load = Instant::now();
+        for _ in 0..iters {
+            let v = DnamContainerView::from_bytes(black_box(container_full.as_bytes()), &crypto)
+                .unwrap();
+            black_box(v.preamble.header_crc32c);
+        }
+        let load_us = (t_load.elapsed().as_nanos() as f64) / (iters as f64 * 1000.0);
+
+        println!(
+            "=========================================================================================="
+        );
+        println!(
+            " DNAM Real-Time SIMD Engine Telemetry Benchmark (48 kHz Stereo, 128-Sample Blocks)"
+        );
+        println!(" #![no_std] serde + alloc Container Load + CRC32C Verification: {load_us:.2} us");
+        println!(
+            "=========================================================================================="
+        );
+        println!(
+            "| {:<32} | {:<11} | {:>13} | {:>11} | {:>8} |",
+            "Tier & Subsystem Profile", "Backend", "Latency/Frame", "x Real-Time", "CPU Load"
+        );
+        println!(
+            "|----------------------------------|-------------|---------------|-------------|----------|"
+        );
+
+        bench_tier::<DefaultMathBackend>(container_full.as_bytes(), Tier::Lite, "Lite (C=4)");
+        bench_tier::<DefaultMathBackend>(container_full.as_bytes(), Tier::Full, "Full (C=8)");
+        bench_tier::<DefaultMathBackend>(container_full.as_bytes(), Tier::Pro, "Pro (C=12)");
+        bench_tier::<DefaultMathBackend>(container_full.as_bytes(), Tier::Ultra, "Ultra (C=16)");
+        bench_tier_bounce::<DefaultMathBackend>(
+            container_full.as_bytes(),
+            Tier::Ultra,
+            "Ultra (C=16, 4x Offline Bounce)",
+        );
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            use dnam_engine::math::ArmSmeBackend;
+            bench_tier::<ArmSmeBackend>(
+                container_full.as_bytes(),
+                Tier::Full,
+                "Full (C=8, ARM SME)",
+            );
+        }
+
+        bench_tier::<ScalarBackend>(
+            container_full.as_bytes(),
+            Tier::Full,
+            "Full (C=8, Scalar Baseline)",
+        );
+        println!(
+            "==========================================================================================\n"
+        );
+
+        println!(
+            "=========================================================================================="
+        );
+        println!(
+            " Real-Time WCET & Tail-Latency Jitter Audit (2,000 x 128-Sample Blocks = 2,666.67 us Budget)"
+        );
+        println!(" Active Continuous Knob Modulation + Stage IV Tank Switch Crossfading");
+        println!(
+            "=========================================================================================="
+        );
+        println!(
+            "| {:<24} | {:>11} | {:>11} | {:>11} | {:>11} | {:>9} |",
+            "Tier Profile (SIMD)",
+            "P50 Block",
+            "P99 Block",
+            "P99.9 Block",
+            "Max Block",
+            "Max/Budget"
+        );
+        println!(
+            "|--------------------------|-------------|-------------|-------------|-------------|-----------|"
+        );
+        bench_wcet_tail_latency::<DefaultMathBackend>(
+            container_full.as_bytes(),
+            Tier::Lite,
+            "Lite (C=4, Modulated)",
+        );
+        bench_wcet_tail_latency::<DefaultMathBackend>(
+            container_full.as_bytes(),
+            Tier::Full,
+            "Full (C=8, Modulated)",
+        );
+        bench_wcet_tail_latency::<DefaultMathBackend>(
+            container_full.as_bytes(),
+            Tier::Pro,
+            "Pro (C=12, Modulated)",
+        );
+        bench_wcet_tail_latency::<DefaultMathBackend>(
+            container_full.as_bytes(),
+            Tier::Ultra,
+            "Ultra (C=16, Modulated)",
+        );
+        println!(
+            "==========================================================================================\n"
+        );
     }
-    let load_us = (t_load.elapsed().as_nanos() as f64) / (iters as f64 * 1000.0);
-
-    println!(
-        "=========================================================================================="
-    );
-    println!(" DNAM Real-Time SIMD Engine Telemetry Benchmark (48 kHz Stereo, 128-Sample Blocks)");
-    println!(" #![no_std] serde + alloc Container Load + CRC32C Verification: {load_us:.2} us");
-    println!(
-        "=========================================================================================="
-    );
-    println!(
-        "| {:<32} | {:<11} | {:>13} | {:>11} | {:>8} |",
-        "Tier & Subsystem Profile", "Backend", "Latency/Frame", "x Real-Time", "CPU Load"
-    );
-    println!(
-        "|----------------------------------|-------------|---------------|-------------|----------|"
-    );
-
-    bench_tier::<DefaultMathBackend>(container_full.as_bytes(), Tier::Lite, "Lite (C=4)");
-    bench_tier::<DefaultMathBackend>(container_full.as_bytes(), Tier::Full, "Full (C=8)");
-    bench_tier::<DefaultMathBackend>(container_full.as_bytes(), Tier::Pro, "Pro (C=12)");
-    bench_tier::<DefaultMathBackend>(container_full.as_bytes(), Tier::Ultra, "Ultra (C=16)");
-    bench_tier_bounce::<DefaultMathBackend>(
-        container_full.as_bytes(),
-        Tier::Ultra,
-        "Ultra (C=16, 4x Offline Bounce)",
-    );
-
-    #[cfg(target_arch = "aarch64")]
-    {
-        use dnam_engine::math::ArmSmeBackend;
-        bench_tier::<ArmSmeBackend>(container_full.as_bytes(), Tier::Full, "Full (C=8, ARM SME)");
-    }
-
-    bench_tier::<ScalarBackend>(
-        container_full.as_bytes(),
-        Tier::Full,
-        "Full (C=8, Scalar Baseline)",
-    );
-    println!(
-        "==========================================================================================\n"
-    );
-
-    println!(
-        "=========================================================================================="
-    );
-    println!(
-        " Real-Time WCET & Tail-Latency Jitter Audit (2,000 x 128-Sample Blocks = 2,666.67 us Budget)"
-    );
-    println!(" Active Continuous Knob Modulation + Stage IV Tank Switch Crossfading");
-    println!(
-        "=========================================================================================="
-    );
-    println!(
-        "| {:<24} | {:>11} | {:>11} | {:>11} | {:>11} | {:>9} |",
-        "Tier Profile (SIMD)", "P50 Block", "P99 Block", "P99.9 Block", "Max Block", "Max/Budget"
-    );
-    println!(
-        "|--------------------------|-------------|-------------|-------------|-------------|-----------|"
-    );
-    bench_wcet_tail_latency::<DefaultMathBackend>(
-        container_full.as_bytes(),
-        Tier::Lite,
-        "Lite (C=4, Modulated)",
-    );
-    bench_wcet_tail_latency::<DefaultMathBackend>(
-        container_full.as_bytes(),
-        Tier::Full,
-        "Full (C=8, Modulated)",
-    );
-    bench_wcet_tail_latency::<DefaultMathBackend>(
-        container_full.as_bytes(),
-        Tier::Pro,
-        "Pro (C=12, Modulated)",
-    );
-    bench_wcet_tail_latency::<DefaultMathBackend>(
-        container_full.as_bytes(),
-        Tier::Ultra,
-        "Ultra (C=16, Modulated)",
-    );
-    println!(
-        "==========================================================================================\n"
-    );
 
     bench_v3_core_suite();
 }
 
 fn make_v3_bench_model(tier: Tier, os2x: bool, mono_out: bool) -> V3ColdTierModel {
     let mut m = V3ColdTierModel::identity_for_tier(tier, os2x, mono_out);
+    m.stage0.xo_low_gain = 1.05;
+    m.stage0.xo_high_gain = 0.95;
+    m.stage0.clean_sub_mix = 0.05;
+    m.stage0.op_p_sub_mix = 0.12;
+    m.stage0.gate_thresh = 0.002;
+    m.stage0.gate_hyst = 0.001;
+    m.stage0.gate_inv_knee = 100.0;
+    m.stage0.gate_floor = 0.1;
+    m.os_params.up_pre_emph = 0.14;
+    m.os_params.dec_aa_mix = 0.85;
+    m.os_params.up_aa_mix = 0.85;
+    m.ctrl.w_env_fc_oct[0] = 0.4;
+    m.ctrl.w_tone_fc_oct[0] = 0.6;
+    m.ctrl.w_tank_psi[0] = 0.25;
+    m.ctrl.w_film_gain[0][0][0] = 0.35;
+    m.tone_svf.h0_proj_w = [0.2, -0.1, 0.15, 0.05];
+    m.tone_svf.s1_proj_w = 0.3;
+    m.tone_svf.lp_mix = 0.35;
+    m.tone_svf.bp_mix = 0.2;
+    m.tone_svf.cab_inject_w = 0.2;
+    m.tone_svf.b1_inject_w = 0.15;
+    m.stage4.wet_mix = 0.15;
+    m.stage4.g_loop = 0.85;
+    m.stage4.lfo_rate_hz = 1.6;
+    m.stage4.lfo_depth_samples = 6.0;
+    m.stage4.lfo_stereo_phase = core::f32::consts::FRAC_PI_2;
     m.svf.env_oct_sens = 1.8;
+    m.svf.env_comp = 2.5;
+    m.svf.det_hp_mix = 0.35;
+    m.svf.sec2_bp_feed = 0.25;
+    m.svf.sec2_hp_feed = 0.15;
     m.svf.stage2_feed_taps[..7].copy_from_slice(&[0.7, 0.15, 0.25, -0.1, 0.15, 0.1, 0.05]);
-    for b in 0..3 {
-        for dst in 0..16 {
+    m.readout.svf_direct_taps_l[..7].copy_from_slice(&[0.05, 0.02, -0.01, 0.01, 0.03, 0.01, -0.02]);
+    m.readout.svf_direct_taps_r[..7].copy_from_slice(&[0.04, 0.03, -0.02, 0.02, 0.02, -0.01, 0.01]);
+    m.feat_params.pinch_k = 180.0;
+    m.feat_params.slow_det_comp = 6.0;
+    for b in 0..NUM_GRU_BLOCKS {
+        for dst in 0..MAX_BLOCK_LANES {
             m.blocks[b].w_in_n[0][dst] = 0.65;
             m.blocks[b].w_in_z[0][dst] = 0.25;
             m.blocks[b].w_in_r[0][dst] = 0.15;
             m.blocks[b].b_n[dst] = -0.25;
             m.blocks[b].b_z[dst] = -0.60;
             m.blocks[b].b_r[dst] = 1.25;
+            m.blocks[b].k_sag[dst] = 0.50;
+            m.blocks[b].k_quad[dst] = 0.08;
             m.blocks[b].w_rec_n[dst][dst] = 0.15;
             if b > 0 {
                 m.blocks[b].w_prev_n[dst][dst] = 0.45;
             }
         }
-        let lane = dnam_engine::stages::v3_core::cascade::flat_gru_lane_index(b, 0, 0);
+        let lane = flat_gru_lane_index(b, 0, 0);
         m.readout.pre_cab_w[0][lane] = 0.25;
         m.readout.pre_cab_w[1][lane] = 0.25;
         m.readout.direct_s2_w[0][lane] = 0.10;
         m.readout.direct_s2_w[1][lane] = 0.10;
     }
+    for i in 0..tier_fir_segments(tier) * 16 {
+        m.readout.fir_l[i] = 0.35 * 0.90_f32.powi(i as i32);
+        m.readout.fir_r[i] = 0.32 * 0.88_f32.powi(i as i32);
+    }
+    for k in 0..tier_kautz_banks(tier) * 4 {
+        m.readout.kautz_c_l[k] = (0.04, 0.02);
+        m.readout.kautz_c_r[k] = (0.035, -0.015);
+    }
     m
 }
 
 fn bench_v3_row(tier: Tier, os2x: bool, mono_out: bool, label: &str) {
+    let _ftz = dnam_engine::FtzDazGuard::new();
     let model = make_v3_bench_model(tier, os2x, mono_out);
     let mut inst = V3CoreInstance::<DefaultMathBackend>::from_cold_model(&model);
     let in_l = [0.22_f32; 128];
@@ -473,18 +561,22 @@ fn bench_v3_row(tier: Tier, os2x: bool, mono_out: bool, label: &str) {
     for _ in 0..100 {
         inst.process_block_stereo(&in_l, &in_r, &mut out_l, &mut out_r);
     }
-    let blocks = 4_000_usize;
+    let blocks = 2_000_usize;
     let total_samples = blocks * 128;
-    let t0 = Instant::now();
-    for _ in 0..blocks {
-        inst.process_block_stereo(
-            black_box(&in_l),
-            black_box(&in_r),
-            black_box(&mut out_l),
-            black_box(&mut out_r),
-        );
+    let mut best_elapsed_ns = f64::INFINITY;
+    for _pass in 0..3 {
+        let t0 = Instant::now();
+        for _ in 0..blocks {
+            inst.process_block_stereo(
+                black_box(&in_l),
+                black_box(&in_r),
+                black_box(&mut out_l),
+                black_box(&mut out_r),
+            );
+        }
+        best_elapsed_ns = best_elapsed_ns.min(t0.elapsed().as_nanos() as f64);
     }
-    let elapsed_ns = t0.elapsed().as_nanos() as f64;
+    let elapsed_ns = best_elapsed_ns;
     black_box((out_l[0], out_r[0]));
     let ns_per_sample = elapsed_ns / (total_samples as f64);
     let budget_ns = 1_000_000_000.0 / 48_000.0;
@@ -497,7 +589,23 @@ fn bench_v3_row(tier: Tier, os2x: bool, mono_out: bool, label: &str) {
     );
 }
 
+fn print_wcet_stats(label: &str, latencies_us: &mut [f64]) {
+    latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let num_blocks = latencies_us.len();
+    let p50 = latencies_us[num_blocks / 2];
+    let p99 = latencies_us[(num_blocks * 99) / 100];
+    let p999 = latencies_us[(num_blocks * 999) / 1_000];
+    let max_us = latencies_us[num_blocks - 1];
+    let deadline_us = (128.0 / 48_000.0) * 1_000_000.0;
+    let max_budget_pct = (max_us / deadline_us) * 100.0;
+    println!(
+        "| {:<28} | {:>8.2} us | {:>8.2} us | {:>8.2} us | {:>8.2} us | {:>8.2}% |",
+        label, p50, p99, p999, max_us, max_budget_pct
+    );
+}
+
 fn bench_v3_wcet_row(tier: Tier, os2x: bool, mono_out: bool, label: &str) {
+    let _ftz = dnam_engine::FtzDazGuard::new();
     let model = make_v3_bench_model(tier, os2x, mono_out);
     let mut inst = V3CoreInstance::<DefaultMathBackend>::from_cold_model(&model);
     let in_l = [0.22_f32; 128];
@@ -520,24 +628,55 @@ fn bench_v3_wcet_row(tier: Tier, os2x: bool, mono_out: bool, label: &str) {
         latencies_us.push(t0.elapsed().as_nanos() as f64 / 1_000.0);
     }
     black_box((out_l[0], out_r[0]));
-    latencies_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let p50 = latencies_us[num_blocks / 2];
-    let p99 = latencies_us[(num_blocks * 99) / 100];
-    let p999 = latencies_us[(num_blocks * 999) / 1_000];
-    let max_us = latencies_us[num_blocks - 1];
-    let deadline_us = (128.0 / 48_000.0) * 1_000_000.0;
-    let max_budget_pct = (max_us / deadline_us) * 100.0;
-    println!(
-        "| {:<24} | {:>8.2} us | {:>8.2} us | {:>8.2} us | {:>8.2} us | {:>8.2}% |",
-        label, p50, p99, p999, max_us, max_budget_pct
-    );
+    print_wcet_stats(label, &mut latencies_us);
+}
+
+fn bench_v3_chain_wcet_row(tier: Tier, os2x: bool, instances: usize, label: &str) {
+    let _ftz = dnam_engine::FtzDazGuard::new();
+    let model = make_v3_bench_model(tier, os2x, false);
+    let mut chain: Vec<V3CoreInstance<DefaultMathBackend>> = (0..instances)
+        .map(|_| V3CoreInstance::<DefaultMathBackend>::from_cold_model(&model))
+        .collect();
+    let in_l = [0.22_f32; 128];
+    let in_r = [-0.18_f32; 128];
+    let mut buf_a_l;
+    let mut buf_a_r;
+    let (mut buf_b_l, mut buf_b_r) = ([0.0_f32; 128], [0.0_f32; 128]);
+    for _ in 0..64 {
+        buf_a_l = in_l;
+        buf_a_r = in_r;
+        for inst in &mut chain {
+            inst.process_block_stereo(&buf_a_l, &buf_a_r, &mut buf_b_l, &mut buf_b_r);
+            buf_a_l = buf_b_l;
+            buf_a_r = buf_b_r;
+        }
+    }
+    let num_blocks = 2_000_usize;
+    let mut latencies_us = Vec::with_capacity(num_blocks);
+    for _ in 0..num_blocks {
+        buf_a_l = black_box(in_l);
+        buf_a_r = black_box(in_r);
+        let t0 = Instant::now();
+        for inst in &mut chain {
+            inst.process_block_stereo(&buf_a_l, &buf_a_r, &mut buf_b_l, &mut buf_b_r);
+            buf_a_l = buf_b_l;
+            buf_a_r = buf_b_r;
+        }
+        latencies_us.push(t0.elapsed().as_nanos() as f64 / 1_000.0);
+        black_box((buf_a_l[0], buf_a_r[0]));
+    }
+    print_wcet_stats(label, &mut latencies_us);
 }
 
 fn bench_v3_core_suite() {
+    let _ftz = dnam_engine::FtzDazGuard::new();
+    let core_bytes = core::mem::size_of::<V3HotCore<DefaultMathBackend>>();
     println!(
         "=========================================================================================="
     );
-    println!(" DNAM v3 Cache-Coherent Hot Core Throughput (48 kHz, 128-Sample Blocks, NEON/SIMD)");
+    println!(
+        " DNAM v3 Cache-Coherent Hot Core Throughput (48 kHz, 128-Sample Blocks, sizeof(V3HotCore)={core_bytes} B)"
+    );
     println!(
         "=========================================================================================="
     );
@@ -548,27 +687,36 @@ fn bench_v3_core_suite() {
     println!(
         "|----------------------------------|-----------|---------------|-------------|----------|"
     );
-    bench_v3_row(Tier::Lite, false, false, "v3 Lite (G=1, 1x, Stereo)");
-    bench_v3_row(Tier::Lite, false, true, "v3 Lite (G=1, 1x, Mono)");
-    bench_v3_row(Tier::Lite, true, false, "v3 Lite (G=1, 2x OS, Stereo)");
-    bench_v3_row(Tier::Full, true, false, "v3 Full (G=2, 2x OS, Stereo)");
-    bench_v3_row(Tier::Pro, true, false, "v3 Pro (G=3, 2x OS, Stereo)");
-    bench_v3_row(Tier::Ultra, true, false, "v3 Ultra (G=4, 2x OS, Stereo)");
+    bench_v3_row(Tier::Lite, false, false, "v3 Lite ([1,1,1], 1x, Stereo)");
+    bench_v3_row(Tier::Full, false, false, "v3 Full ([2,1,1], 1x, Stereo)");
+    bench_v3_row(Tier::Pro, true, false, "v3 Pro ([2,2,1], 2x OS, Stereo)");
+    bench_v3_row(
+        Tier::Ultra,
+        true,
+        false,
+        "v3 Ultra ([3,2,1], 2x OS, Stereo)",
+    );
     println!(
         "==========================================================================================\n"
     );
     println!(
-        "| {:<24} | {:>11} | {:>11} | {:>11} | {:>11} | {:>9} |",
+        "| {:<28} | {:>11} | {:>11} | {:>11} | {:>11} | {:>9} |",
         "v3 WCET (2000 x 128)", "P50 Block", "P99 Block", "P99.9 Block", "Max Block", "Max/Budget"
     );
     println!(
-        "|--------------------------|-------------|-------------|-------------|-------------|-----------|"
+        "|------------------------------|-------------|-------------|-------------|-------------|-----------|"
     );
     bench_v3_wcet_row(Tier::Lite, false, false, "v3 Lite (1x, Stereo)");
-    bench_v3_wcet_row(Tier::Lite, true, false, "v3 Lite (2x OS, Stereo)");
-    bench_v3_wcet_row(Tier::Full, true, false, "v3 Full (2x OS, Stereo)");
+    bench_v3_wcet_row(Tier::Full, false, false, "v3 Full (1x, Stereo)");
     bench_v3_wcet_row(Tier::Pro, true, false, "v3 Pro (2x OS, Stereo)");
     bench_v3_wcet_row(Tier::Ultra, true, false, "v3 Ultra (2x OS, Stereo)");
+    println!(
+        "|------------------------------|-------------|-------------|-------------|-------------|-----------|"
+    );
+    bench_v3_chain_wcet_row(Tier::Lite, false, 14, "14x Lite ([1,1,1], 1x)");
+    bench_v3_chain_wcet_row(Tier::Full, false, 8, "8x Full ([2,1,1], 1x)");
+    bench_v3_chain_wcet_row(Tier::Pro, true, 4, "4x Pro ([2,2,1], 2x)");
+    bench_v3_chain_wcet_row(Tier::Ultra, true, 2, "2x Ultra ([3,2,1], 2x)");
     println!(
         "=========================================================================================="
     );

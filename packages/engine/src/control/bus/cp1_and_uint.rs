@@ -2,14 +2,14 @@
 
 use crate::control::record::Cp1ContributorSlot;
 
-/// Evaluates `U_int^base` (`4 × 8 = 128 B` at `Arena 0 [7,552..7,680]`) on `z_fm_base` (`r[dsp.ctrl.accum.anova-fm]`).
+/// Evaluates `U_int^base` (`4 × 8 = 128 B` at `Arena 0 [3,072..3,200]`) on `z_fm_base` (`r[dsp.ctrl.accum.anova-fm]`).
 #[inline]
 pub fn eval_uint_base_4x8(
     arena_bytes: &[u8],
     z_fm_base: [f32; 4],
     s_emb: [f32; 3],
 ) -> ([f32; 8], bool) {
-    const UINT_BASE_OFF: usize = 7_552;
+    const UINT_BASE_OFF: usize = crate::stages::weights::ARENA0_UINT_BASE_OFFSET;
     if arena_bytes.len() < UINT_BASE_OFF + 128 {
         return ([0.0; 8], false);
     }
@@ -48,16 +48,16 @@ pub fn eval_uint_base_4x8(
     (out, true)
 }
 
-/// Evaluates `U_int^base` (`3 × 8` at `Arena 0 [7,552..7,648]`) on the 3 pairwise products of `s_emb`.
+/// Evaluates `U_int^base` (`3 × 8` at `Arena 0 [3,072..3,168]`) on the 3 pairwise products of `s_emb`.
 #[inline]
 pub fn eval_uint_base_3x8(arena_bytes: &[u8], s_emb: [f32; 3]) -> [f32; 8] {
     eval_uint_base_4x8(arena_bytes, [0.0; 4], s_emb).0
 }
 
-/// Evaluates `3 × U_int,Delta` (`3 × 4 × 8 = 384 B` at `Arena 3 [60,928..61,312]`, `r[dsp.ctrl.accum.anova-fm]`):
-/// - Block 0 (`60,928..61,056`): maps `z_fm_ultra` into `\Delta z_raw[0..8]`
-/// - Block 1 (`61,056..61,184`): maps `z_fm_base` into `z_raw[8..16]`
-/// - Block 2 (`61,184..61,312`): maps `z_fm_ultra` into `z_raw[8..16]`
+/// Evaluates `3 × U_int,Delta` (`3 × 4 × 8 = 384 B` at `Arena 3 [21,376..21,760]`, `r[dsp.ctrl.accum.anova-fm]`):
+/// - Block 0 (`21,376..21,504`): maps `z_fm_ultra` into `\Delta z_raw[0..8]`
+/// - Block 1 (`21,504..21,632`): maps `z_fm_base` into `z_raw[8..16]`
+/// - Block 2 (`21,632..21,760`): maps `z_fm_ultra` into `z_raw[8..16]`
 #[inline]
 pub fn eval_uint_ultra_delta_3x4x8(
     arena_bytes: &[u8],
@@ -65,7 +65,7 @@ pub fn eval_uint_ultra_delta_3x4x8(
     z_fm_ultra: [f32; 4],
     s_emb: [f32; 3],
 ) -> ([f32; 8], [f32; 8], bool) {
-    const UINT_ULTRA_OFF: usize = 60_928;
+    const UINT_ULTRA_OFF: usize = crate::stages::weights::ARENA3_UINT_ULTRA_OFFSET;
     if arena_bytes.len() < UINT_ULTRA_OFF + 384 {
         return ([0.0; 8], [0.0; 8], false);
     }
@@ -138,14 +138,14 @@ pub fn eval_uint_ultra_delta_3x4x8(
     (delta_base_8, ultra_new_8, true)
 }
 
-/// Evaluates `U_int,Delta` (`6 × 8` at `Arena 3 [60,928..61,120]`) on 6 pairwise products.
+/// Evaluates `U_int,Delta` (`6 × 8` at `Arena 3 [21,376..21,568]`) on 6 pairwise products.
 #[inline]
 pub fn eval_uint_ultra_delta_6x8(
     arena_bytes: &[u8],
     s_emb: [f32; 3],
     s_emb_ultra: [f32; 3],
 ) -> [f32; 8] {
-    const UINT_ULTRA_OFF: usize = 60_928;
+    const UINT_ULTRA_OFF: usize = crate::stages::weights::ARENA3_UINT_ULTRA_OFFSET;
     if arena_bytes.len() < UINT_ULTRA_OFF + 192 {
         return [0.0; 8];
     }
@@ -176,18 +176,17 @@ pub fn eval_uint_ultra_delta_6x8(
     out
 }
 
-/// Decodes inline `CP1` contributors from `Arena 0 [7,680..8,512]` (`832 B` base) and
-/// `Arena 3 [61,312..63,424]` (`2,112 B` Ultra) using `cp1_lanes_dir` at `Arena 0 [7,524..7,552]`.
-/// Returns `Ok(0)` when `num_inline_contributors == 0`.
-pub fn decode_cp1_inline_contributors(
+/// Allocation-free `CP1` contributor decoder returning static error strings so real-time reloaders
+/// emit zero heap allocation/drop glue.
+pub(crate) fn decode_cp1_inline_contributors_static(
     arena_bytes: &[u8],
     out_slots: &mut [Cp1ContributorSlot],
-) -> Result<usize, crate::schema::DnamError> {
-    const DIR_OFF: usize = 7_524;
-    const BASE_OFF: usize = 7_680;
-    const BASE_END: usize = 8_512;
-    const ULTRA_OFF: usize = 61_312;
-    const ULTRA_END: usize = 63_424;
+) -> Result<usize, &'static str> {
+    const DIR_OFF: usize = crate::stages::weights::ARENA0_CP1_DIR_OFFSET;
+    const BASE_OFF: usize = crate::stages::weights::ARENA0_CP1_BASE_OFFSET;
+    const BASE_END: usize = crate::stages::weights::ARENA0_CP1_BASE_END;
+    const ULTRA_OFF: usize = crate::stages::weights::ARENA3_CP1_ULTRA_OFFSET;
+    const ULTRA_END: usize = crate::stages::weights::ARENA3_CP1_ULTRA_END;
 
     if arena_bytes.len() < BASE_END {
         return Ok(0);
@@ -197,9 +196,7 @@ pub fn decode_cp1_inline_contributors(
         return Ok(0);
     }
     if count > 26 || count > out_slots.len() {
-        return Err(crate::schema::DnamError::SchemaValidationError(
-            alloc::string::String::from("inline CP1 contributor count exceeds 26"),
-        ));
+        return Err("inline CP1 contributor count exceeds 26");
     }
     let use_3b_dir = count <= 8
         && arena_bytes[DIR_OFF + 2] == 0
@@ -234,16 +231,12 @@ pub fn decode_cp1_inline_contributors(
             (c as u16, kind, opt, partner, l)
         };
         if !(1..=3).contains(&lanes) {
-            return Err(crate::schema::DnamError::SchemaValidationError(
-                alloc::string::String::from("invalid inline CP1 lane count"),
-            ));
+            return Err("invalid inline CP1 lane count");
         }
         let l_cnt = lanes as usize;
         let b_bytes = 4 * (9 * l_cnt + 4);
         if b_cursor + b_bytes > BASE_END {
-            return Err(crate::schema::DnamError::SchemaValidationError(
-                alloc::string::String::from("inline CP1 base payload exceeds 832 B"),
-            ));
+            return Err("inline CP1 base payload exceeds 320 B");
         }
         let mut main_base = [[0.0f32; 8]; 3];
         for row in main_base.iter_mut().take(l_cnt) {
@@ -319,6 +312,18 @@ pub fn decode_cp1_inline_contributors(
         };
     }
     Ok(count)
+}
+
+/// Decodes inline `CP1` contributors from `Arena 0 [3,200..3,520]` (`320 B` base) and
+/// `Arena 3 [21,760..23,872]` (`2,112 B` Ultra) using `cp1_lanes_dir` at `Arena 0 [3,044..3,072]`.
+/// Returns `Ok(0)` when `num_inline_contributors == 0`.
+pub fn decode_cp1_inline_contributors(
+    arena_bytes: &[u8],
+    out_slots: &mut [Cp1ContributorSlot],
+) -> Result<usize, crate::schema::DnamError> {
+    decode_cp1_inline_contributors_static(arena_bytes, out_slots).map_err(|msg| {
+        crate::schema::DnamError::SchemaValidationError(alloc::string::String::from(msg))
+    })
 }
 
 #[cfg(test)]
@@ -728,37 +733,43 @@ mod control_bus_tests {
             0
         );
 
-        let mut arena = vec![0u8; 64_000];
+        let mut arena = vec![0u8; crate::stages::weights::ARENA_ULTRA_BYTES];
         assert_eq!(
             decode_cp1_inline_contributors(&arena, &mut short_slots).unwrap(),
             0
         );
-        arena[7_524..7_526].copy_from_slice(&27_u16.to_le_bytes());
+        arena[3_044..3_046].copy_from_slice(&27_u16.to_le_bytes());
         assert!(decode_cp1_inline_contributors(&arena, &mut short_slots).is_err());
 
-        // 1-byte directory with 9 single-lane contributors + overflow to Arena 3
-        arena[7_524..7_526].copy_from_slice(&9_u16.to_le_bytes());
-        for c in 0..9 {
-            arena[7_526 + c] = 1;
+        // 1-byte directory with 6 single-lane contributors + Ultra weights (fits 320 B base slot)
+        arena[3_044..3_046].copy_from_slice(&6_u16.to_le_bytes());
+        for c in 0..6 {
+            arena[3_046 + c] = 1;
         }
-        for off in (7_552..8_512).step_by(4) {
+        for off in (3_072..3_520).step_by(4) {
             put_f32(&mut arena, off, 0.15);
         }
-        for off in (60_928..63_424).step_by(4) {
+        for off in (21_376..23_872).step_by(4) {
             put_f32(&mut arena, off, 0.12);
         }
         let mut big_slots = vec![Cp1ContributorSlot::default(); 16];
         assert_eq!(
             decode_cp1_inline_contributors(&arena, &mut big_slots).unwrap(),
-            9
+            6
         );
 
         let uint_b3 = eval_uint_base_3x8(&arena, [0.4, -0.3, 0.2]);
         let uint_u6 = eval_uint_ultra_delta_6x8(&arena, [0.4, -0.3, 0.2], [0.1, 0.2, -0.1]);
         assert!(uint_b3.iter().all(|v| v.is_finite()) && uint_u6.iter().all(|v| v.is_finite()));
 
+        // Base payload overflow (7 single-lane contributors = 364 B > 320 B) returns error
+        arena[3_044..3_046].copy_from_slice(&7_u16.to_le_bytes());
+        arena[3_046 + 6] = 1;
+        assert!(decode_cp1_inline_contributors(&arena, &mut big_slots).is_err());
+
         // Invalid lanes (0) triggers error in 1-byte directory
-        arena[7_526] = 0;
+        arena[3_044..3_046].copy_from_slice(&6_u16.to_le_bytes());
+        arena[3_046] = 0;
         assert!(decode_cp1_inline_contributors(&arena, &mut big_slots).is_err());
     }
 }

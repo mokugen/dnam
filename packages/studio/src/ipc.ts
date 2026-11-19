@@ -1,4 +1,4 @@
-import type { DnamTelemetrySnapshot } from "@dnam-project/ui";
+import type { DnamTelemetrySnapshot } from "@dnam-project/ui/host/types";
 import { isTauri, invoke as tauriInvoke } from "@tauri-apps/api/core";
 
 export type StudioIpcCommand =
@@ -168,6 +168,39 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return proto === Object.prototype || proto === null;
 }
 
+function sanitizeCloneArray(value: unknown[], seen: Set<object>): unknown[] {
+  if (
+    Object.getPrototypeOf(value) !== Array.prototype ||
+    Object.getOwnPropertySymbols(value).length > 0
+  ) {
+    throw new Error("Tauri Isolation blocked non-plain array in IPC payload");
+  }
+  if (seen.has(value)) {
+    throw new Error("Tauri Isolation blocked cyclic IPC payload");
+  }
+  seen.add(value);
+  try {
+    for (const name of Object.getOwnPropertyNames(value)) {
+      if (name === "length") continue;
+      const idx = Number(name);
+      if (!Number.isInteger(idx) || idx < 0 || idx >= value.length || String(idx) !== name) {
+        throw new Error("Tauri Isolation blocked non-index property on array in IPC payload");
+      }
+      const desc = Object.getOwnPropertyDescriptor(value, name);
+      if (!desc || desc.get !== undefined || desc.set !== undefined || !desc.enumerable) {
+        throw new Error("Tauri Isolation blocked accessor property in IPC payload");
+      }
+    }
+    const clonedArr: unknown[] = [];
+    for (let i = 0; i < value.length; i += 1) {
+      clonedArr.push(sanitizeCloneValue(value[i], seen));
+    }
+    return clonedArr;
+  } finally {
+    seen.delete(value);
+  }
+}
+
 function sanitizeCloneValue(value: unknown, seen: Set<object>): unknown {
   if (typeof value === "string") {
     if (isUnsafeText(value)) {
@@ -185,36 +218,7 @@ function sanitizeCloneValue(value: unknown, seen: Set<object>): unknown {
     return value;
   }
   if (Array.isArray(value)) {
-    if (
-      Object.getPrototypeOf(value) !== Array.prototype ||
-      Object.getOwnPropertySymbols(value).length > 0
-    ) {
-      throw new Error("Tauri Isolation blocked non-plain array in IPC payload");
-    }
-    if (seen.has(value)) {
-      throw new Error("Tauri Isolation blocked cyclic IPC payload");
-    }
-    seen.add(value);
-    try {
-      for (const name of Object.getOwnPropertyNames(value)) {
-        if (name === "length") continue;
-        const idx = Number(name);
-        if (!Number.isInteger(idx) || idx < 0 || idx >= value.length || String(idx) !== name) {
-          throw new Error("Tauri Isolation blocked non-index property on array in IPC payload");
-        }
-        const desc = Object.getOwnPropertyDescriptor(value, name);
-        if (!desc || desc.get !== undefined || desc.set !== undefined || !desc.enumerable) {
-          throw new Error("Tauri Isolation blocked accessor property in IPC payload");
-        }
-      }
-      const clonedArr: unknown[] = [];
-      for (let i = 0; i < value.length; i += 1) {
-        clonedArr.push(sanitizeCloneValue(value[i], seen));
-      }
-      return clonedArr;
-    } finally {
-      seen.delete(value);
-    }
+    return sanitizeCloneArray(value, seen);
   }
   if (isPlainObject(value)) {
     return sanitizeCloneObject(value, seen);
@@ -263,12 +267,7 @@ function sanitizeCloneObject(value: unknown, seen: Set<object>): Record<string, 
   }
 }
 
-/**
- * Validates and sanitizes an outgoing Tauri v2 IPC payload per the Tauri Isolation Pattern
- * (`window.__TAURI_ISOLATION_HOOK__`).
- */
-export function tauriIsolationHook<T extends Readonly<Record<string, unknown>>>(payload: T): T {
-  const clean = sanitizeCloneObject(payload, new Set());
+function resolveEnvelopeCommand(clean: Record<string, unknown>): string {
   const hasCmd = clean["cmd"] !== undefined;
   const hasCommand = clean["command"] !== undefined;
   if (hasCmd && typeof clean["cmd"] !== "string") {
@@ -296,6 +295,13 @@ export function tauriIsolationHook<T extends Readonly<Record<string, unknown>>>(
   if (!isStudioCmd && !isAllowedPlugin) {
     throw new Error(`Tauri Isolation blocked unauthorized IPC command: ${cmdRaw}`);
   }
+  return cmdRaw;
+}
+
+function validateEnvelopeFields(
+  clean: Record<string, unknown>,
+  cmdRaw: string,
+): Record<string, unknown> {
   if (clean["args"] !== undefined && !isPlainObject(clean["args"])) {
     throw new Error("Tauri Isolation blocked non-object args field");
   }
@@ -316,54 +322,52 @@ export function tauriIsolationHook<T extends Readonly<Record<string, unknown>>>(
   ) {
     throw new Error("Tauri Isolation blocked unexpected top-level fields alongside payload/args");
   }
-  const effectiveArgs = isPlainObject(clean["payload"])
+  return isPlainObject(clean["payload"])
     ? clean["payload"]
     : clean["args"] !== undefined
       ? (clean["args"] as Record<string, unknown>)
       : clean;
-  if (cmdRaw === "studio_ipc") {
-    if (
-      clean["payload"] !== undefined &&
-      Object.keys(clean["payload"] as Record<string, unknown>).some((k) => k !== "req")
-    ) {
-      throw new Error("Tauri Isolation blocked malformed studio_ipc request");
-    }
-    if (
-      clean["args"] !== undefined &&
-      Object.keys(clean["args"] as Record<string, unknown>).some((k) => k !== "req")
-    ) {
-      throw new Error("Tauri Isolation blocked malformed studio_ipc request");
-    }
-    if (
-      clean["payload"] === undefined &&
-      clean["args"] === undefined &&
-      Object.keys(clean).some((k) => !ENVELOPE_META_KEYS.has(k) && k !== "req")
-    ) {
-      throw new Error("Tauri Isolation blocked malformed studio_ipc request");
-    }
-    const nestedReq = effectiveArgs["req"];
-    if (!isPlainObject(nestedReq)) {
-      throw new Error("Tauri Isolation blocked malformed studio_ipc request");
-    }
-    const nestedKeys = Object.keys(nestedReq);
-    if (
-      nestedReq["cmd"] !== undefined ||
-      typeof nestedReq["command"] !== "string" ||
-      nestedReq["command"].length === 0 ||
-      !isPlainObject(nestedReq["args"]) ||
-      !nestedKeys.every((k) => k === "command" || k === "args")
-    ) {
-      throw new Error("Tauri Isolation blocked malformed studio_ipc request");
-    }
-    const nestedCmd = nestedReq["command"];
-    if (
-      nestedCmd === "studio_ipc" ||
-      !(STUDIO_IPC_COMMANDS as readonly string[]).includes(nestedCmd)
-    ) {
-      throw new Error(`Tauri Isolation blocked unauthorized IPC command: ${nestedCmd}`);
-    }
-    tauriIsolationHook(nestedReq);
+}
+
+function validateNestedStudioIpcReq(
+  clean: Record<string, unknown>,
+  effectiveArgs: Record<string, unknown>,
+): void {
+  const hasPayloadOnly = clean["payload"] !== undefined;
+  const hasArgsOnly = clean["args"] !== undefined;
+  const badWrapperKeys = hasPayloadOnly
+    ? Object.keys(clean["payload"] as Record<string, unknown>).some((k) => k !== "req")
+    : hasArgsOnly
+      ? Object.keys(clean["args"] as Record<string, unknown>).some((k) => k !== "req")
+      : Object.keys(clean).some((k) => !ENVELOPE_META_KEYS.has(k) && k !== "req");
+  if (badWrapperKeys) {
+    throw new Error("Tauri Isolation blocked malformed studio_ipc request");
   }
+  const nestedReq = effectiveArgs["req"];
+  if (!isPlainObject(nestedReq)) {
+    throw new Error("Tauri Isolation blocked malformed studio_ipc request");
+  }
+  const nestedKeys = Object.keys(nestedReq);
+  if (
+    nestedReq["cmd"] !== undefined ||
+    typeof nestedReq["command"] !== "string" ||
+    nestedReq["command"].length === 0 ||
+    !isPlainObject(nestedReq["args"]) ||
+    !nestedKeys.every((k) => k === "command" || k === "args")
+  ) {
+    throw new Error("Tauri Isolation blocked malformed studio_ipc request");
+  }
+  const nestedCmd = nestedReq["command"];
+  if (
+    nestedCmd === "studio_ipc" ||
+    !(STUDIO_IPC_COMMANDS as readonly string[]).includes(nestedCmd)
+  ) {
+    throw new Error(`Tauri Isolation blocked unauthorized IPC command: ${nestedCmd}`);
+  }
+  tauriIsolationHook(nestedReq);
+}
+
+function validateCommandArgs(cmdRaw: string, effectiveArgs: Record<string, unknown>): void {
   if (
     cmdRaw === "set_parameter" &&
     (typeof effectiveArgs["value"] !== "number" ||
@@ -383,6 +387,20 @@ export function tauriIsolationHook<T extends Readonly<Record<string, unknown>>>(
       throw new Error("Tauri Isolation blocked invalid dnam:// deep link URI");
     }
   }
+}
+
+/**
+ * Validates and sanitizes an outgoing Tauri v2 IPC payload per the Tauri Isolation Pattern
+ * (`window.__TAURI_ISOLATION_HOOK__`).
+ */
+export function tauriIsolationHook<T extends Readonly<Record<string, unknown>>>(payload: T): T {
+  const clean = sanitizeCloneObject(payload, new Set());
+  const cmdRaw = resolveEnvelopeCommand(clean);
+  const effectiveArgs = validateEnvelopeFields(clean, cmdRaw);
+  if (cmdRaw === "studio_ipc") {
+    validateNestedStudioIpcReq(clean, effectiveArgs);
+  }
+  validateCommandArgs(cmdRaw, effectiveArgs);
   return clean as T;
 }
 

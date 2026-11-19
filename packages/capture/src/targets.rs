@@ -408,8 +408,7 @@ fn render_engine_slice<B: EngineBackend>(
 
     let mut out_1 = vec![0.0_f32; n];
     let mut out_2 = vec![0.0_f32; n];
-    let has_aux =
-        spec.in_3.is_some() || spec.in_4.is_some() || engine.stage_pipeline.stage0.wdw_mode;
+    let has_aux = spec.in_3.is_some() || spec.in_4.is_some() || engine.stage0_router.wdw_mode;
     let mut out_3 = if has_aux {
         Some(vec![0.0_f32; n])
     } else {

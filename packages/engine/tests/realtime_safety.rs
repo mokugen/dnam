@@ -166,7 +166,15 @@ fn make_test_container() -> AlignedBuffer<CacheLine64> {
         tensor_directory: BTreeMap::new(),
     };
 
-    let arena = vec![0u8; 64_000];
+    let mut model = dnam_engine::stages::V3MatryoshkaModel::dual_rate_default(false);
+    model.stage0.xo_low_gain = 1.0;
+    model.stage0.xo_high_gain = 1.0;
+    model.stage4.iter_mut().for_each(|s| {
+        s.g_loop = 0.72;
+        s.wet_mix = 0.25;
+    });
+    let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+    dnam_engine::stages::weights::pack_v3_matryoshka_to_arena(&model, &mut arena);
     let vec_bytes = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
     let mut aligned = AlignedBuffer::<CacheLine64>::new_zeroed(vec_bytes.len() / 64);
     aligned.as_bytes_mut().copy_from_slice(&vec_bytes);
