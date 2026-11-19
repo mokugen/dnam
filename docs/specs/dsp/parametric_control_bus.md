@@ -40,7 +40,7 @@ flowchart LR
     end
 
     subgraph Dispatch ["3. Tier-Aware Dispatch & Audio Micro-Ramp (0 Extra Static 48 kHz MACs)"]
-        Bus["Modulation Vectors q_send, q_down in R^16<br/>• Lite..Pro (Arena 0): 16x16 W_ctrl^base<br/>• Ultra (+Arena 3): + 16x4 W_ctrl,Delta^Ultra<br/>• Step: delta_theta * alpha_ramp"]
+        Bus["All 16 Rows r in 0..16 -> stage_targets[0..16]<br/>• 16x16 W_ctrl (+ Ultra 16x4 W_ctrl_ultra)<br/>• Optional OU Drift [2,5,10,14] & 16-Ch Micro-Ramp"]
     end
 
     Cut --> OpN
@@ -87,7 +87,7 @@ To prevent `f32` rounding from placing clipped vectors outside the exact Euclide
 1. **Bit-Preserving `f32 <-> f64` Conversion:** Widen `f32` bit patterns (including subnormals via leading-zero shift `p + 874`) directly to IEEE-754 `f64` bits without executing hardware `f32` instructions subject to FTZ/DAZ, and round `f64` outputs back to `f32` bits using integer significand shifts (`M >> 29` for normals, `M >> (-E - 97)` for subnormals, ties-to-even).
 2. **Outward-Rounded Energy & Output Check:** Using `nextup` (`bits + 1` on positive `f64`), form outward denominator bound $S = \mathrm{add-up}(\epsilon, \sum_i x_i^2)$ and exact $R^2 = \rho_{\max}^2$. Accept scale $t \in [0, 1]$ with rounded `f32` output $v_i = \mathrm{RN}_{32}(x_i t)$ only when both $\mathrm{mul-up}(\mathrm{mul-up}(t, t), S) \le R^2$ and $\sum_i v_i^2 \le R^2$.
 3. **6-Step Newton Fast Path & 32-Step Bisection Fallback:** Seed $y_0 = 2^{-\lfloor (E_s + 2)/2 \rfloor}$ from the unbiased exponent $E_s$ of $S$, iterate $y_{k+1} = \mathrm{fl}_{64}(y_k(1.5 - 0.5 S y_k^2))$ six times, and test $t_{\text{fast}} = \min(1 - 2^{-20}, \rho_{\max} y_6 (1 - 2^{-20}))$. If accepted, return $v_i$; otherwise bisect `32` times over $[0, \min(1, 2^{E_r + 1 - E})]$. For normal radii, relative scale contraction is $< 9.57 \times 10^{-7}$ and vector error is $< 1.185 \times 10^{-6} \rho_{\max}$.
-4. `r[dsp.ctrl.op-n.static-and-interior-fastpath]` **Static-Control Basis Skip (`0` Extra `48 kHz` MACs), `0-ULP` `StarCenter` & Interior Trust-Ball Fast Exit ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** When `is_dirty == false` at a `3 kHz` boundary (`0` user controls moved during the completed sub-block), `ControlBus<B>::tick_3khz_with_detectors` skips `evaluate_static_control_basis` (Lobatto basis, contributor deltas, FM projection, and `fp16` `W_readout` collapse), retaining the cached `z_head`, `z_stage`, `ctrl_basis_4`, and collapsed direct readout vectors (`0` extra `48 kHz` MACs, `REQ-6.1`). When resting at `StarCenter` (`Mode-0` exact anchor), contributor outputs are identically `+0.0f32`, preserving **`0-ULP` `StarCenter` invariance** across all parameter schedules and after `strip_container_to_tier(Lite)`. When `trust_clip_outward_4d` is invoked and the `f64` squared norm satisfies $\sum_{i=0}^3 z_i^2 + 10^{-9} < \rho_{\max}^2$ (with finite norm and $\rho_{\max} > 0$), it returns `z` immediately without executing `trust_clip_outward_checked_bits::<4>` Newton/bisection iterations.
+4. `r[dsp.ctrl.op-n.static-and-interior-fastpath]` **Static-Control Basis Skip (`0` Extra `48 kHz` MACs), `0-ULP` `StarCenter` & Interior Trust-Ball Fast Exit ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** When `is_dirty == false` at a `3 kHz` boundary (`0` user controls moved during the completed sub-block), `ControlBus<B>::tick_3khz_with_detectors` skips `evaluate_static_control_basis` (Lobatto basis, contributor deltas, FM projection, and `W_ctrl` / `z_stage` sensitivity dispatch), retaining the cached `z_head`, `z_stage`, `ctrl_basis_4`, and static `W_ro,0` direct readout vectors (`0` extra `48 kHz` MACs, `REQ-6.1`). When resting at `StarCenter` (`Mode-0` exact anchor), contributor outputs are identically `+0.0f32`, preserving **`0-ULP` `StarCenter` invariance** across all parameter schedules and after `strip_container_to_tier(Lite)`. When `trust_clip_outward_4d` is invoked and the `f64` squared norm satisfies $\sum_{i=0}^3 z_i^2 + 10^{-9} < \rho_{\max}^2$ (with finite norm and $\rho_{\max} > 0$), it returns `z` immediately without executing `trust_clip_outward_checked_bits::<4>` Newton/bisection iterations.
 
 ---
 
@@ -97,9 +97,9 @@ To prevent `f32` rounding from placing clipped vectors outside the exact Euclide
 
 `r[dsp.ctrl.range.normalize-clamp]`
 
-Clamp physical host values to the active safe interval and normalize against the declared endpoints $x_{\min,p} < x_{\max,p}$:
+Clamp physical host values to the active safe interval (sanitizing non-finite/`NaN` scalar inputs first via `default_val.clamp(eff_min, eff_max)` so `NaN` never propagates downstream, and using two-pass evaluation `ctrl_kind == 1` switches before `ctrl_kind == 0` dependent continuous ranges in `clamp_and_normalize_all` / `clamp_and_normalize` with `active_options_mask` fallback) and normalize against the declared endpoints $x_{\min,p} < x_{\max,p}$:
 $$u_p = \mathrm{clamp}\left(2.0 \frac{x_p - x_{\min,p}}{x_{\max,p} - x_{\min,p}} - 1.0,\ -1.0,\ +1.0\right)$$
-To prevent catastrophic cancellation on closely spaced `f32` endpoints (such as $2^{30}$ and $2^{30} + 128$) or overflow on wide spans, widen endpoints to `binary64` on the cold path, precompute $d = x_{\max,p} - x_{\min,p}$ and $r = 1/d$ in `f64`, and evaluate $\mathrm{RN}_{32}(\mathrm{clamp}(2.0 \cdot ((x_p - x_{\min,p}) \cdot r) - 1.0, -1.0, 1.0))$ at the control boundary (absolute error $< 2^{-24}$).
+To prevent catastrophic cancellation on closely spaced `f32` endpoints (such as $2^{30}$ and $2^{30} + 128$) or overflow on wide spans, widen endpoints to `binary64` on the cold path, precompute $d = x_{\max,p} - x_{\min,p}$ and $r = 1/d$ in `f64`, store `(scale_norm, offset_norm)` in `ControlClampDescriptorWire`, evaluate `RN32(clamp(x_clamped * scale_norm + offset_norm, -1.0, 1.0))` at the control boundary (`error < 2^-24`), and set the `was_clamped` flag whenever `!raw.is_finite()` or `|clamped - raw| > 1e-6`.
 
 #### Binary32 Physical-Coordinate Bounds
 
@@ -130,7 +130,9 @@ In `SONA` `v3.0`, **all base control descriptors (`ControlClampDescriptorWire`),
 |  Arena 0 (Arena0LiteWire, Retained by Lite / Full / Pro / Ultra & .dnam-prev):                    |
 |    • ControlClampDescriptorWire[P] + Static Latent z_ctrl^base in R^8, FM Rank R = 4              |
 |    • Per Contributor (k active lanes): W_main[8,k] + w_proj[k] + v[4] = 4(9k + 4) B               |
-|    • Global Matrices: U_int^base[8,4] (128 B) + W_ctrl^base[16,16] (1,024 B) + fp16 W_readout     |
+|    • Inline Dir & Matrices: cp1_dir[28] (Cp1InlineDirWire: u16le count<=8 + u16le flags=0         |
+|      + 8x[ctrl_idx, (ctrl_kind<<4)|lanes, aux]) + U_int^base[8,4] (128 B) + W_ctrl[16,16]        |
+|      (1,024 B) + static fp16 W_ro,0 & stage_latent_mods_fp16[0..80]                               |
 +---------------------------------------------------------------------------------------------------+
 |  Arena 1..2 (Full / Pro Deltas):                                                                  |
 |    • Incremental fp16 W_readout,Delta projections for added Full/Pro core & Stage III blocks      |
@@ -138,7 +140,7 @@ In `SONA` `v3.0`, **all base control descriptors (`ControlClampDescriptorWire`),
 |  Arena 3 (Ultra Delta, Truncated on Tier Stripping):                                              |
 |    • Static Latent Delta z_ctrl,Delta^Ultra in R^8 = [z_head^(4..7), z_stage^(4..7)]^T, R = 8     |
 |    • Per Contributor (k active lanes): W_main,Delta[8,k] + v_Delta[4] = 4(8k + 4) B               |
-|    • Global Matrices: 3 x U_int,Delta[8,4] (384 B) + W_ctrl,Delta^Ultra[16,4] (256 B) + W_ro,D   |
+|    • Global Matrices: 3 x U_int,Delta[8,4] (384 B) + W_ctrl_ultra[16,4] (256 B) + W_ro,D          |
 +---------------------------------------------------------------------------------------------------+
 ```
 
@@ -154,6 +156,8 @@ In `SONA` `v3.0`, **all base control descriptors (`ControlClampDescriptorWire`),
 `r[dsp.ctrl.switch.option-contributors]`
 
 For a discrete switch $q$ with declared default reference option (`default_val`), each represented non-reference option $o$ is a separate `k = 1` contributor $\psi_{q,o}(\sigma_q) = \mathbf{1}(\sigma_q = o)$ (`0.0` at the reference option) per `ref[container.dnam.cp1-profile]` ([packed control projection profile](../containers/dnam_binary_format.md#packed-control-projection-profile)).
+
+**Inline `Arena 0` `cp1_dir[28]` (`Cp1InlineDirWire`) & `shared_extent` `"CP1\0"` Precedence:** Inside `Arena0ControlBusWire` (offset `36..64`), `cp1_dir: [u8; 28]` is the exact `28 B` `Cp1InlineDirWire`: `cp1_dir_count: u16le` (`in 0..=8`), `flags: u16le = 0`, and `entries: [[u8; 3]; 8]` (`[ctrl_idx, (ctrl_kind << 4) | lanes, aux]`, where `ctrl_kind in {0 = Range, 1 = Switch, 2 = BilinearCrossTerm}`), indexing `cp1_base[576]`. Non-empty Region 4 `shared_extent` `"CP1\0"` takes precedence on overflow (arbitrary $P$ / `> 8` contributors); when `"CP1\0"` is absent in `shared_extent` or after `strip_container_to_tier(Lite)`, loaders read the self-contained `Arena 0` `cp1_dir[28]` + `cp1_base[576]` directly.
 
 ##### Conditional Batch Safety
 
@@ -184,45 +188,65 @@ $$\mathbf{z}_{\text{ctrl}} = \mathrm{clip}_{\text{trust}}(\mathbf{z}_{\text{raw}
 
 `r[dsp.ctrl.modulators.dynamic]`
 
-At each control boundary, `Op-M[Ctrl]` and `Op-N[Ctrl]` emit the 8-D dynamic modulator vector $\mathbf{m}_{\text{dyn}}[k] = [z_{\mathrm{re},\text{lfo0}}, z_{\mathrm{im},\text{lfo0}}, T_{\text{shape}}(z_{\mathrm{re},\text{lfo0}}), T_{\text{shape}}(z_{\mathrm{re},\text{lfo1}}), e_{\text{low}}, e_{\text{mid}}, e_{\text{high}}, e_{\text{aux}}]^\top \in \mathbb{R}^8$. The `64 B`-aligned `control_modulators_and_lanes` slice in `Arena 0` stores `[c_step_0, s_step_0, sigma_drift, rho_drift_train, p_env_0, p_env_1, p_env_2, dither_snr_scale]` followed by `cp1_lanes_dir`, placed in the trailing `3 kHz` cold section of `SonaHotSlab` for L1D cache locality; `live_analog_drift_enabled` defaults to `false` (`set_live_analog_drift(bool)`) and is automatically suppressed when `offline_bounce == true` to guarantee deterministic `0.000000 ULP` runtime, bounce, and training parity unless explicitly enabled for live auditioning.
+At each control boundary, `Op-M[Ctrl]` and `Op-N[Ctrl]` emit the dynamic modulators feeding `q2 = [lfo0_mix, lfo1_mix, lfo0_cos, lfo0_sin]` and `q3 = env_states[0..4] = [e_low, e_mid, e_high, e_aux]`. The `Arena0ControlBusWire` control slice at the cold tail of `SonaHotSlab` stores `[lfo_dphi_train[2], sigma_drift, rho_drift_train, env_poles[3], dither_snr_scale, trust_radius_mh]` (`36 B`), followed by `cp1_dir[28]` (`Cp1InlineDirWire`: `cp1_dir_count: u16le in 0..=8`, `flags: u16le = 0`, `entries: [[u8; 3]; 8]`, with non-empty `shared_extent` `"CP1\0"` taking precedence on overflow), `u_int_base` (`128 B`), `cp1_base` (`576 B`), `w_ctrl` (`16 × 16`, `1,024 B`), and `rho_head_and_ctrl_tail` (`128 B`); `live_analog_drift_enabled` defaults to `false` (`set_live_analog_drift(bool)`) and is automatically suppressed when `offline_bounce == true` to guarantee deterministic `0.000000 ULP` runtime, bounce, and training parity unless explicitly enabled for live auditioning.
 
 ### 3.1 Stage Parameter Dispatch Matrix $\mathbf{W}_{\text{ctrl}}$
 
 `r[dsp.ctrl.dispatch.matrix]`
 
-With send-safe $\mathbf{q}_{\text{send}} = [\mathbf{z}_{\text{ctrl}}^{(0..7)}, \mathbf{m}_{\text{send}}^{(8)}]^\top \in \mathbb{R}^{16}$ driving rows `0..4` and downstream $\mathbf{q}_{\text{down}} = [\mathbf{z}_{\text{ctrl}}^{(0..7)}, \mathbf{m}_{\text{down}}^{(8)}]^\top \in \mathbb{R}^{16}$ driving rows `5..15`:
-$$\boldsymbol{\theta}_{\text{stage}}^{\text{Lite..Pro}}[k+1] = \mathbf{W}_{\text{ctrl}}^{\text{base}} \mathbf{q}_{16}[k] \in \mathbb{R}^{16}, \qquad \boldsymbol{\theta}_{\text{stage}}^{\text{Ultra}}[k+1] = \mathbf{W}_{\text{ctrl}}^{\text{base}} \mathbf{q}_{16}[k] + \mathbf{W}_{\text{ctrl},\Delta}^{\text{Ultra}} \mathbf{z}_{\text{stage}}^{(4..7)}[k] \in \mathbb{R}^{16}$$
+`SONA` `v3.0` executes **one unconditional `16 × 16` `W_ctrl` (+ `16 × 4` `W_ctrl_ultra` on `Ultra`) stage-dispatch path** evaluating **all `16` rows `r in 0..16`** over $\mathbf{q}_{16}[k] = [\mathbf{q}_0^\top, \mathbf{q}_1^\top, \mathbf{q}_2^\top, \mathbf{q}_3^\top]^\top \in \mathbb{R}^{16}$, where `q0 = z_head[0..4]`, `q1 = ctrl_basis_4[0..4]` (`z_stage[0..4]`), `q2 = [lfo0_mix, lfo1_mix, lfo0_cos, lfo0_sin]`, and `q3 = env_states[0..4]` (with send-safe inputs masking return-derived detectors for `q_send`, and `qu = z_stage_ultra[0..4]` contracted via `16 × 4` `W_ctrl_ultra` on `Ultra`):
+$$\boldsymbol{\theta}_{\text{stage}}^{\text{Lite..Pro}}[k+1] = \mathbf{W}_{\text{ctrl}} \mathbf{q}_{16}[k] \in \mathbb{R}^{16}, \qquad \boldsymbol{\theta}_{\text{stage}}^{\text{Ultra}}[k+1] = \mathbf{W}_{\text{ctrl}} \mathbf{q}_{16}[k] + \mathbf{W}_{\text{ctrl,ultra}} \mathbf{q}_{u}[k] \in \mathbb{R}^{16}$$
 
-| Parameter Index | Target Stage | Physical Parameter Role |
+| `stage_targets` Index | Target Stage | Physical Parameter Role & Clamped Range |
 | :--- | :--- | :--- |
-| `θ_0, θ_1` | Stage 0 Router (Send-Safe) | External loop send gains `g_send,L`, `g_send,R` |
-| `θ_2, θ_3` | Top-of-Frame Crossbar `Op-T` (Send-Safe) | Micro-delay `τ_pre`, pitch shift grain ratio `ν_pitch` |
-| `θ_4` | Crossbar Pre-Drive / `Op-N[Pre]` (Send-Safe) | Pre-core drive gain and ZOH/bitcrusher scaling |
-| `θ_5, θ_6` | `4`-Block `SONA` Core `TPT-SVF` | Prewarped cutoff warp `g_warp` (`tan(pi * f_c / f_s)`), damping/mode blend `β_svf` (`LP/BP/HP/AP`) |
-| `θ_7, θ_8` | `4`-Block `SONA` Core `ParaLRU` & `PolyADAA1` | `ParaLRU` drive / attack-release retention scale, zero-DC bias / sag shift |
-| `θ_9, θ_10` | Stage III Cabinet | Kautz modal formant center frequency and shared radial gate `g[k]` |
-| `θ_11` | Stage III Early FIR | Direct early reflection blend gain |
-| `θ_12, θ_13` | Coercive `Op-T` Loop | Master delay length `τ_tank`, coercive loop feedback gain `g_loop` |
-| `θ_14` | Coercive `Op-T` Diffuser | In-buffer Schroeder all-pass diffusion coefficient `a_diff` |
-| `θ_15` | Direct Stereo Readout (`fp16 W_readout`) | Master stereo width factor `α_width` |
+| **`[0]`** | `4`-Block `SONA` Core `TPT-SVF` | `svf_g_oct` (`[-3.0, +3.0]` octaves; `exp2(svf_g_oct)` scaling `svf_g` clamped to `[1e-5, 64.0]`) |
+| **`[1]`** | `4`-Block `SONA` Core `TPT-SVF` | `svf_k_delta` (`[-0.8, +1.5]`, offsetting `svf_k` clamped to `[0.0, 8.0]`) |
+| **`[2..6]`** | `4`-Block `SONA` Core `PolyADAA1` | `block_adaa_oct[0..4]` (`[-1.5, +1.5]` octaves across Blocks `0..3`; optional OU drift on `[2, 5]`) |
+| **`[6..10]`** | `4`-Block `SONA` Core `ParaLRU` | `block_lru_bias[0..4]` (`[-2.0, +2.0]`, per-block `ParaLRU` bias shift across Blocks `0..3`) |
+| **`[10]`** | Stage III `KautzModalBank` | `kautz_oct_delta` (`[-1.5, +1.5]` octaves, shifting modal pole angles; optional OU drift on `[10]`) |
+| **`[11]`** | Stage III `KautzModalBank` | `kautz_damp_delta` (`[-1.5, +1.5]`, modulating radial gate / damping `(1 - r_m) * 2^delta`) |
+| **`[12]`** | Stage IV Coercive `Op-T` Tank | `tank_delay_mod` (samples, modulating fractional delay read pointer inside `[4.0, max_tau]`) |
+| **`[13]`** | Stage IV Coercive `Op-T` Tank | `tank_gain_mod` (clamped `<= MAX_LOOP_GAIN_F32` = `0x3F7F_BE76`, `≤ 0.9990`) |
+| **`[14]`** | Stage IV Coercive `Op-T` Tank | `tank_psi_delta` (`[-pi, +pi]` rad, modulating Givens angle `psi`; optional OU drift on `[14]`) |
+| **`[15]`** | Crossbar & Stereo Wet Readout | `crossbar_wet_mod` (`[-1.0, +1.0]`, modulating crossbar / wet output blend) |
 
-`r[dsp.ctrl.dispatch.stage-laws]` **Closed-Form Per-Sample & `3 kHz` Stage Modulation Laws (`ADR-0022`):**
-Each micro-ramped parameter $\theta_i[n]$ (`§3.2`) combines with its base stage parameter and clamps into its certified stability interval (`0 FDIV`, `0 FSQRT`), while `TPT-SVF` prewarped `(a1, a2, a3)`, `ParaLRU` rates, and `fp16` `W_readout` (`VarProReadoutSubspaceWire`) linear readouts collapse unconditionally at the `3 kHz` boundary (`0` extra `48 kHz` MACs when controls are static):
-- **Stage 0 Sends ($\theta_0, \theta_1$):** $g_{\text{send},L}[n] = \mathrm{clamp}(g_{\text{send},L,0} + \theta_0[n], 0.0, 2.0)$, $g_{\text{send},R}[n] = \mathrm{clamp}(g_{\text{send},R,0} + \theta_1[n], 0.0, 2.0)$.
-- **Top-of-Frame Crossbar (`Op-T` / `Op-N[Pre]`, $\theta_2, \theta_3, \theta_4$):** $\tau_{\text{pre}}[n] = \mathrm{clamp}(\tau_{\text{pre},0} + \theta_2[n], 4.0, D_{\text{eff},\text{pre}})$, $p_{\text{st}}[n] = \mathrm{clamp}(p_{\text{st},0} + 24.0 \cdot \theta_3[n], -24.0, 24.0)$ (evaluated via `ref[dsp.ctrl.math.pitch-profile]`), and $g_{\text{pre}}[n] = \mathrm{clamp}(g_{\text{pre},0} + \theta_4[n], 0.0, 16.0)$.
-- **`4`-Block `SONA` Core (`TPT-SVF`, `ParaLRU`, `PolyADAA1`, $\theta_5, \theta_6, \theta_7, \theta_8$):** `TPT-SVF` cutoff warp $\gamma_{\text{svf}}[n] = \mathrm{clamp}(1.0 + 0.25 \theta_5[n], 0.25, 4.0)$, mode/damping balance $\beta_{\text{svf}}[n] = \mathrm{clamp}(0.5 + \theta_6[n], 0.0, 1.0)$, `ParaLRU`/`PolyADAA1` drive $g_{\text{pwr}}[n] = \mathrm{clamp}(1.0 + 0.25 \theta_7[n], 0.25, 4.0)$, and Zero-DC dynamic shift scale $\alpha_{\text{sag}}[n] = \mathrm{clamp}(0.2 + 0.1 \theta_8[n], 0.0, 0.8)$.
-- **Stage III Cabinet ($\theta_9, \theta_{10}, \theta_{11}$):** $\Delta\theta_{\text{kautz}}[n] = \mathrm{clamp}(\theta_9[n], -\pi/4, \pi/4)$, $g_{\text{kautz}}[n] = \mathrm{clamp}(0.5 + \theta_{10}[n], 0.0, 1.0)$ (`ref[dsp.op-m.stage3.radial-gate]`), and $g_{\text{fir}}[n] = \mathrm{clamp}(1.0 + \theta_{11}[n], 0.0, 2.0)$.
-- **Coercive `Op-T` Loop & Readout Head ($\theta_{12}, \theta_{13}, \theta_{14}, \theta_{15}$):** $\tau_{\text{tank},m}[n] = \mathrm{clamp}(\tau_{\text{tank},m,0} + \theta_{12}[n], 4.0, D_{\text{eff},\text{tank},m})$, $g_{\text{lin}}[n] = \mathrm{clamp}(g_{\text{lin},0} + \theta_{13}[n], 0.0, \mathtt{0x3F7FBE76})$, $a_{\text{diff}}[n] = \mathrm{clamp}(a_{\text{diff},0} + \theta_{14}[n], -0.75, 0.75)$, and $\alpha_{\text{width}}[n] = \mathrm{clamp}(\alpha_{\text{width},0} + \theta_{15}[n], 0.0, 2.0)$.
+`r[dsp.ctrl.dispatch.stage-laws]` **Closed-Form `SONA` `v3.0` Gauge-Invariant `z_stage` Sensitivity, `stage_targets[0..16]` & Static `W_ro,0` Readout Laws (`ADR-0022`):**
+At each `3 kHz` tick, `ControlBus` updates all `16` modulation coordinates (`0 FDIV`, `0 FSQRT`, `0` extra `48 kHz` MACs when controls are static) while preserving **`0-ULP` `SO(4)` buyer-watermark invariance**: `SO(4)` buyer gauge `Q_buyer` rotates ONLY `z_head[0..4]` (plus `cols 0..4` of `main_base`, `u_int_base`, `w_ctrl`, and `u_int_ultra` Block `0`), whereas **`z_stage[0..D_s]`** (`D_s = 4` `ctrl_basis_4[0..4]` for `Lite..Pro`; `D_s = 8` `[ctrl_basis_4[0..4], z_stage_ultra[0..4]]` for `Ultra`) is unrotated (`cols 4..8` / `u_int_ultra` Blocks `1..2`):
+1. **Static Base `VarPro` Readout Matrix (`W_ro,0` in `VarProReadout*Wire`):** `VarProReadout*Wire` (`VarProReadoutLiteWire..VarProReadoutUltraWire`) stores **ONLY one static `fp16` base matrix `W_ro,0`** (`16×12` / `24×12` / `32×12` / `40×12`, decoded via `fp16_to_f32` into direct-register `pre_cab` `[pre_cab_w_odd/even/lru, pre_cab_u_gain, pre_cab_hp_gain]` and `direct` `[direct_w_odd/even/lru, direct_s2_u_gain, direct_s2_hp_gain]` accumulators, `ref[dsp.op-n.commuted.project-then-filter]`). There are **zero** per-latent `W_{ro,1..D_h}` wire matrices or `b_a` bias tables in `VarProReadout*Wire`; instead, `z_head` (`[z_head[0..4], z_head_ultra[0..4]]`) remains strictly inside `W_ctrl` (`f32`), while all `stage_latent_*` `fp16` additive sensitivity tables index strictly unrotated `z_stage[0..D_s]` (`0-ULP` `SO(4)` buyer-watermark invariance).
+2. **Unconditional `16 × 16` (+ `16 × 4` `Ultra`) `W_ctrl` + Additive `z_stage` Sensitivity Tables:**
+   - First, every row $r \in [0, 15]$ contracts `[q0 = z_head[0..4], q1 = ctrl_basis_4[0..4], q2 = [lfo0_mix, lfo1_mix, lfo0_cos, lfo0_sin], q3 = env_states[0..4]]` against `16 × 16` `W_ctrl[r]` (plus `qu = z_stage_ultra[0..4]` against `16 × 4` `W_ctrl_ultra[r]` in `Ultra`; when `live_analog_drift_enabled && !offline_bounce && sigma_drift > 0.0`, OU drift adds to slots `[2, 5, 10, 14]`).
+   - Inside `VarProReadoutLiteWire.stage_latent_mods_fp16[0..80]`, `[0..8]` stores `default_knobs[8]` (resting physical control defaults in `[0.0, 1.0]^8` for standalone `Arena 0` preset/audit inspection; `z_stage == 0` at `StarCenter`, adding `0.0` at runtime), `[8..48]` stores global scalar sensitivities (`w_svf_g_oct[8]`, `w_svf_k_delta[8]`, `w_kautz_oct[8]`, `w_kautz_damp[8]`, `w_tank_psi[8]`), and `[48..80]` stores `w_adaa_drive_scale[4][4]` and `w_lru_bias_shift[4][4]`:
+     - **`[0]` `svf_g_oct`:** `svf_g_oct = clamp(stage_targets[0] + sum_{k=0..D_s-1} w_svf_g_oct[k] * z_stage[k], -3.0, +3.0)` $\to$ `g_scale = 2^{svf_g_oct}` multiplying group `svf_g` clamped to `[1e-5, 64.0]`.
+     - **`[1]` `svf_k_delta`:** `svf_k_delta = clamp(stage_targets[1] + sum_{k=0..D_s-1} w_svf_k_delta[k] * z_stage[k], -0.8, +1.5)` offsetting group `svf_k` clamped to `[0.0, 8.0]`.
+     - **`[10]` `kautz_oct_delta`:** `kautz_oct_delta = clamp(stage_targets[10] + sum_{k=0..D_s-1} w_kautz_oct[k] * z_stage[k], -1.5, +1.5)` shifting Stage III `Kautz` pole angles (`theta_m`).
+     - **`[11]` `kautz_damp_delta`:** `kautz_damp_delta = clamp(stage_targets[11] + sum_{k=0..D_s-1} w_kautz_damp[k] * z_stage[k], -1.5, +1.5)` modulating Stage III shared radial gate / damping.
+     - **`[12]` `tank_delay_mod` (samples):** modulating Stage IV `Op-T` read delay clamped to `[4.0, max_tau]`.
+     - **`[13]` `tank_gain_mod` (`<= MAX_LOOP_GAIN_F32`):** modulating Stage IV coercive feedback gain clamped strictly to `[0.0, 0x3F7F_BE76]`.
+     - **`[14]` `tank_psi_delta`:** `tank_psi_delta = clamp(stage_targets[14] + sum_{k=0..D_s-1} w_tank_psi[k] * z_stage[k], -pi, +pi)` modulating Stage IV unitary $2\times 2$ Givens angle $\psi$ (`|Delta psi| <= 0.25 rad/tick`).
+     - **`[15]` `crossbar_wet_mod` (`[-1.0, +1.0]`):** modulating crossbar / stereo wet output blend.
+   - **Per-Block / Per-Group `ADAA` & `ParaLRU` Sensitivities (`[2..10]` Superseding Law):**
+     - *`Lite..Pro` (`D_s = 4`, no `Arena 3` dispatch):* `VarProReadoutLiteWire.stage_latent_mods_fp16[48..80]` provides `w_adaa_drive_scale[0..4][0..4]` and `w_lru_bias_shift[0..4][0..4]` indexed by `(k in 0..4, b in 0..4)` for the `4` cascade blocks `b in 0..4`:
+       `block_adaa_oct[b] = clamp(stage_targets[2 + b] + sum_{k=0..3} w_adaa_drive_scale[k][b] * z_stage[k], -1.5, +1.5)` and
+       `block_lru_bias[b] = clamp(stage_targets[6 + b] + sum_{k=0..3} w_lru_bias_shift[k][b] * z_stage[k], -2.0, +2.0)` (all groups `g` within block `b` share `block_*[b]`).
+     - *`Ultra` (`D_s = 8`, `Arena 3` present):* `Arena3ControlBusWire.stage_latent_ctrl_ultra_fp16[0..160]` (`w_adaa_drive_scale[8][10]` at `[0..80]` + `w_lru_bias_shift[8][10]` at `[80..160]`; `[160..256]` reserved `0`) **supersedes (replaces, never adds to)** `Arena 0`'s `[4][4]` subset, computing per-group `group_adaa_oct[g]` and `group_lru_bias[g]` for each of the `10` `SONA` groups `g in 0..10` (`block_of(g) = SONA_GROUP_BLOCK_AND_LOCAL[g].0`: `{0, 4, 6, 8} -> 0`, `{1, 5, 9} -> 1`, `{2, 7} -> 2`, `{3} -> 3`):
+       `group_adaa_oct[g] = clamp(stage_targets[2 + block_of(g)] + sum_{k=0..7} w_adaa_drive_scale[k][g] * z_stage[k], -1.5, +1.5)` and
+       `group_lru_bias[g] = clamp(stage_targets[6 + block_of(g)] + sum_{k=0..7} w_lru_bias_shift[k][g] * z_stage[k], -2.0, +2.0)`.
+   - **Per-Lane `SonaCoreUltraDeltaWire.stage_latent_core_mods_fp16[0..1024]` (`V3_META_CORE_MODS_PRESENT` = `0x0000_0200`):** Organized row-major as `[k in 0..8][col in 0..128]`. When `V3_META_CORE_MODS_PRESENT == 1` on `Ultra` (`D_s = 8`), for each lane `l in 0..40`:
+     - `delta_g_oct[l] = sum_{k=0..7} core_mods[k][l] * z_stage[k]`, combined with global `svf_g_oct`: `g_oct_lane[l] = clamp(svf_g_oct + delta_g_oct[l], -3.0, +3.0)` $\to$ `g_scale[l] = 2^{g_oct_lane[l]}` multiplying base `svf_g[l]` clamped to `[1e-5, 64.0]`;
+     - `delta_k[l] = sum_{k=0..7} core_mods[k][40 + l] * z_stage[k]`, combined with global `svf_k_delta`: `svf_k_eff[l] = clamp(svf_k[l] + svf_k_delta + delta_k[l], 0.0, 8.0)`;
+     - `delta_wf[l] = sum_{k=0..7} core_mods[k][80 + l] * z_stage[k]`, yielding `wf_mix_eff[l] = clamp(wavefolder_mix[l] + delta_wf[l], 0.0, 1.0)`;
+     - `col in 120..128` is reserved `0x0000`.
+     When `V3_META_CORE_MODS_PRESENT == 0`, skip `[0..1024]` (`0` MACs).
 
 ### 3.2 Division-Free Linear Micro-Ramping (`0.0625f32` at $48\text{ kHz}$, $\alpha_{\text{ramp}} = 1 / K_{\text{ctrl}}$ under ZOH)
 
 `r[dsp.ctrl.dispatch.micro-ramp]`
 
-Using $\alpha_{\text{ramp}}(f_{s,\text{eff}}) = 1.0 / K_{\text{ctrl}}(f_{s,\text{eff}})$ precomputed in cold `set_sample_rate()`:
+Using $\alpha_{\text{ramp}}(f_{s,\text{eff}}) = 1.0 / K_{\text{ctrl}}(f_{s,\text{eff}})$ precomputed in cold `set_sample_rate()` (`1.0 / 16 = 0.0625f32` at `48 kHz`):
 $$\Delta\boldsymbol{\theta}[k] = \big(\boldsymbol{\theta}_{\text{stage}}[k+1] - \boldsymbol{\theta}_{\text{stage}}[k]\big) \times \alpha_{\text{ramp}}(f_{s,\text{eff}}), \qquad \boldsymbol{\theta}_{\text{stage}}[n] = \boldsymbol{\theta}_{\text{stage}}[n-1] + \Delta\boldsymbol{\theta}[k]$$
-Clamp each ramp within its endpoint interval and snap the final sample of the block to $\boldsymbol{\theta}_{\text{stage}}[k+1]$.
+Clamp every ramped sample inside the closed interval `[min(theta[k], theta[k+1]), max(theta[k], theta[k+1])]` across **all `16` channels `stage_targets[0..16]`** so overshoot never escapes stability limits, and snap the final sample of the window to `theta_stage[k+1]` (`step_micro_ramp_16` + endpoint sync in `engine/process.rs`).
 
-`r[dsp.ctrl.dispatch.sparse-and-active-ramps]` **Sparse `W_ctrl` Row Evaluation & Active-Parameter Micro-Ramping ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** At each `3 kHz` control boundary, `ControlBus<B>::evaluate_tank_modulation` skips any `q_8` column whose magnitude is $\le 10^{-12}$ and restricts `W_ctrl` stage-row evaluation to rows `3..12` (`2..13` when `live_analog_drift_enabled && !offline_bounce && sigma_drift > 0.0`), while `compute_micro_ramp_deltas_12` and `step_micro_ramp_12` step the 3 active `B::Vec4` groups (`theta_stage[0..12]`) per `48 kHz` audio sample.
+`r[dsp.ctrl.dispatch.sparse-and-active-ramps]` **Sparse `W_ctrl` Column Skipping & Full `16`-Channel Micro-Ramping ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)):** At each `3 kHz` control boundary, `ControlBus<B>` skips any `q_16` (or `q_u`) input column whose magnitude is $\le 10^{-12}$ while unconditionally evaluating **all `16` rows `r in 0..16`** of `W_ctrl` (`+ W_ctrl_ultra` on `Ultra`), adding optional OU drift only to slots `[2, 5, 10, 14]` when `live_analog_drift_enabled && !offline_bounce && sigma_drift > 0.0`, and micro-ramping **all `16` channels `0..16`** via `4 × B::Vec4` (`step_micro_ramp_16`) per `48 kHz` audio sample.
 
 ---
 
@@ -272,10 +296,11 @@ $$d = \mathrm{RNE}_{f32}(T_{j+1} - T_j), \qquad p = \min\Big(T_{j+1},\ \mathrm{R
 | CONTROL BUS ARENA 0 SELF-CONTAINED PAYLOAD & SUFFICIENT-STATISTIC LEDGER                          |
 +---------------------------------------------------------------------------------------------------+
 |  Arena 0 (Arena0LiteWire, Retained by Lite..Ultra & .dnam-prev; Cold Tail of SonaHotSlab):       |
-|    • ControlClampDescriptorWire[P], CP1 contributors 4(9k + 4) B, U_int^base 128 B, W_ctrl 1,024 B|
-|    • Base fp16 W_readout (VarProReadoutSubspaceWire); 0 extra 48 kHz MACs when static             |
+|    • ControlClampDescriptorWire[P], cp1_dir[28] (Cp1InlineDirWire <= 8 entries; shared_extent |
+|      "CP1\0" precedence on overflow), U_int^base 128 B, W_ctrl 16x16 (1,024 B)                  |
+|    • Static fp16 W_ro,0 + stage_latent_mods_fp16[0..80]; 0 extra 48 kHz MACs when static        |
 |  Arena 1..2 (Full / Pro Deltas): Incremental fp16 W_readout,Delta slices                          |
-|  Arena 3 (Ultra Delta): Per contributor 4(8k + 4) B | 3xU_int,D 384 B | W_ctrl,D 256 B | W_ro,D   |
+|  Arena 3 (Ultra Delta): Per contributor 4(8k + 4) B | 3xU_int,D 384 B | W_ctrl_ultra 256B | W_ro,D  |
 |  Exact-Integer Accumulator: 9-word S + 18-word D per factor (108 B/factor) + 9-word main sums     |
 +---------------------------------------------------------------------------------------------------+
 ```

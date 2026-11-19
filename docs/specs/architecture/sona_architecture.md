@@ -46,7 +46,7 @@ For implementation-agnostic requirements, see [`../../requirements/system_goals_
 1. `r[arch.pillars.dual-space-control]` **Pillar 1: Dual-Space Factored Control Architecture:**  
    Factors `3 kHz` `ControlBus` trajectories and fixed-shape `W_readout` (`fp16`) subspace coordinates from shared `StarCenter` trajectories to enable non-destructive Capture Vault stem editing ([`../training/iterative_resume_and_caching.md` §1.2](../training/iterative_resume_and_caching.md#12-two-path-vault-editing--dependency-digests)).
 2. `r[arch.pillars.dual-rate-plane]` **Pillar 2: Unified Self-Similar Dual-Rate Control Plane (`Op-M[Ctrl]` & `Op-N[Ctrl]`):**  
-   Executes the control plane using `Op-M` and `Op-N` kernels at a `16`-sample stride at the `48 kHz` reference rate (`3 kHz`), updating `TPT-SVF` bilinear ZOH poles $g = \tan(\pi f_c / f_s)$ and damping $k = 1/Q$, `ParaLRU` ballistics $(\alpha_{\text{rel}}, \alpha_{\text{atk}}, \kappa)$, `4`-lane `Q0.32` quadrature phasor increments (`0.05 Hz..20 kHz`), `Op-T` target pointers, and collapsed `W_readout` deltas across rate-dependent strides $K_{\text{ctrl}}(f_{s,\text{eff}})$ ([router §9](../dsp/router_and_stages_topology.md#9-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-44196-khz--4-bounce)).
+   Executes the control plane using `Op-M` and `Op-N` kernels at a `16`-sample stride at the `48 kHz` reference rate (`3 kHz`), updating `TPT-SVF` bilinear ZOH poles $g = \tan(\pi f_c / f_s)$ and damping $k = 1/Q$, `ParaLRU` ballistics $(\alpha_{\text{rel}}, \alpha_{\text{atk}}, \kappa)$, `4`-lane `Q0.32` quadrature phasor increments (`0.05 Hz..20 kHz`), `Op-T` target pointers, and collapsed `W_readout` deltas across rate-dependent strides $K_{\text{ctrl}}(f_{s,\text{eff}})$ ([router §9](../dsp/router_and_stages_topology.md#9-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-441192-khz--4-bounce)).
 3. `r[arch.pillars.cp1-projections]` **Pillar 3: Self-Contained `Arena 0` Control Descriptors & Tier-Local `CP1` Projections:**  
    Supports $P \ge 0$ physical controls with base `ControlClampDescriptorWire`, `CP1`, `U_int`, `W_ctrl`, and `Lite` `fp16` `W_readout` slices stored wholly inside `Arena 0` (`Arena0LiteWire`, [`../containers/dnam_binary_format.md` §2.4](../containers/dnam_binary_format.md#packed-control-projection-profile)) so `strip_container_to_tier(Lite)` retains complete parametric conditioning (`REQ-5.6`). `Lite`, `Full`, and `Pro` use `8-D` static latents (`4` readout + `4` stage, Rank-4 FM); `Ultra` adds an `8-D` delta (`+4` readout + `+4` stage, Rank-8 FM) and a `16 × 4` stage-dispatch delta in `Arena 3` ([`../dsp/parametric_control_bus.md` §2.3](../dsp/parametric_control_bus.md#23-o1-additive-latent-sufficient-statistic-control-scaling)).
 4. `r[arch.pillars.universal-black-box]` **Pillar 4: Universal Trainable & Data-Programmable Black-Box Runtime (`REQ-1.9`):**  
@@ -115,18 +115,20 @@ sequenceDiagram
         CtrlN->>CtrlN: Evaluate CP1 contributor deltas into exact-integer sufficient statistics
         CtrlN->>CtrlN: Mix Rank-4/8 FM interactions and apply outward-checked trust clip
     end
-    CtrlN->>Bus: Emit tier-specific readout and stage-control latents from Arena 0..3
+    CtrlN->>Bus: Emit tier-specific stage-control latents and modulation targets from Arena 0..3
 
-    Bus->>Bus: Refresh 3 kHz TPT-SVF (g = tan(pi f_c / f_s), k), ParaLRU ballistics & fp16 W_readout
+    Bus->>Bus: Refresh 3 kHz TPT-SVF (g = tan(pi f_c / f_s), k), ParaLRU ballistics & stage_targets[0..16] around static W_ro,0
     Bus->>Audio: Compute division-free ramp delta_theta = (theta_next - theta_curr) * alpha_ramp
 
     loop For each sample n in 16-frame sub-block (process_tick16_const, register-hoisted)
         Audio->>Audio: theta_stage = theta_stage + delta_theta (Micro-Ramping FMA)
         Host->>Audio: Route Stage 0 8-Port Matrix (S_{ret->send} == 0) + Op-P + Q0.32 + Op-T tau >= 4 reads
         Audio->>Audio: Execute 4-Block SONA Core (TPT-SVF -> 1D ParaLRU -> PolyADAA1 + C2 Wavefolder)
-        Audio->>Audio: Execute Stage III (FIR + Kautz) -> W_readout + Coercive Op-T Feedback Write -> Out 2 & 3
+        Audio->>Audio: Execute Stage III (FIR + Kautz) -> static W_ro,0 + Coercive Op-T Feedback Write -> Out 2 & 3
     end
 ```
+
+Across all tiers, `VarProReadout*Wire` stores the static base readout matrix `W_ro,0` (`16×12` in `Lite`, `24×12` / `32×12` / `40×12` in `Full`/`Pro`/`Ultra`), while `3 kHz` latent/macro modulation drives `stage_targets[0..16]` plus `stage_latent_mods_fp16[0..80]` / `stage_latent_ctrl_ultra_fp16[0..256]` (and optional `stage_latent_core_mods_fp16[0..1024]` when `V3_META_CORE_MODS_PRESENT` is set). All `stage_latent_*` sensitivity tables index strictly the unrotated stage latent slice `z_stage[0..D_s]` (`D_s = 4` `ctrl_basis_4[0..4]` on `Lite..Pro`; `D_s = 8` `[ctrl_basis_4[0..4], z_stage_ultra[0..4]]` on `Ultra`) — never `z_head[0..4]` — preserving `0-ULP` compatibility with buyer `SO(4)` gauge `Q_buyer`; on `Ultra`, `Arena 3` `stage_latent_ctrl_ultra_fp16[0..160]` (`[8][10]`) supersedes (replaces, never sums with) `Arena 0`'s `[4][4]` `ADAA`/`ParaLRU` subset (`stage_latent_mods_fp16[48..80]`).
 
 #### Floating-Point Environment at the Audio Callback
 
@@ -161,7 +163,7 @@ Every model and configuration guarantees an unclipped operating envelope of at l
 
 Real-time host wrappers (`dnam_engine::host::DnamHostHandle`, [`../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md`](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md)) decouple audio rendering callbacks from concurrent UI, MIDI, Studio, and TypeScript (`N-API` / `WASM`) control and telemetry threads in 100% safe `#![no_std]` + `alloc` Rust (`#[forbid(unsafe_code)]`):
 1. **Wait-Free `AtomicU64` Seqlock (`TelemetryCell`):** `TelemetryWriter` packs `DnamTelemetrySnapshot` (`RawTelemetryRecord`) into a cache-line-aligned (`#[repr(align(64))]`) array of `29` `AtomicU64` words guarded by a monotonically advancing sequence counter `seq: AtomicU64` (`seq` odd before relaxed word stores, `Release` store `seq + 1` on completion). `TelemetryReader::read()` loads `seq1` (`Acquire`), copies the `29` atomic words, issues an `Acquire` fence, and verifies `seq1 == seq2` (with bounded retry and last-good snapshot fallback) without locking `DynamicDnamEngine`.
-2. **Sub-Block SPSC Drain & Telemetry Publication:** `DnamHostHandle` drains the 3-Lane `SpscControlRing` (`ref[dsp.ctrl.op-m.spsc-ingress]`) at the start of every `64`-frame sub-block and publishes the updated `DnamTelemetrySnapshot` to `TelemetryCell` at sub-block exit, while `RealtimeEngineSwap` performs non-blocking ping-pong hot-swaps so retired `DynamicDnamEngine` instances are dropped exclusively on the non-real-time controller thread. On the trainer side, lock-free `DNPR` seqlock telemetry surfaces active `WebGPU` adapter capabilities, `2-D` memory planner mode, and per-tier convergence progress.
+2. **Sub-Block SPSC Drain, Lock-Free Triple-Buffer `SlotSwapGuard` & Telemetry Publication:** `DnamHostHandle` drains the 3-Lane `SpscControlRing` (`ref[dsp.ctrl.op-m.spsc-ingress]`) at the start of every `64`-frame sub-block and publishes the updated `DnamTelemetrySnapshot` to `TelemetryCell` at sub-block exit. Hot-swapping containers or tiers uses a wait-free, lock-free triple-buffer SPSC `SlotSwapGuard` with epoch-based host-side retirement (**zero `Mutex`**, zero RT heap allocations or deallocations), dropping retired `SonaHotSlab` / `DynamicDnamEngine` allocations strictly on the non-real-time controller thread. On the trainer side, lock-free `DNPR` seqlock telemetry surfaces active `WebGPU` adapter capabilities, `2-D` memory planner mode, and per-tier convergence progress.
 
 ---
 
@@ -198,7 +200,7 @@ flowchart LR
 2. **Contractive `1D` Scalar `ParaLRU` (`K = 3` Newton Scans Forward, `1` Linear Scan Backward):** Each scalar lane $i$ applies a single decoupled self-rectification feedback scalar $\kappa_i \in [0, 1]$:
    $$v_i[n] = \alpha_{\text{rel},i} v_i[n-1] + (1 - \alpha_{\text{atk},i}) \phi_{\text{rect}}\big(u_i[n] - \kappa_i \alpha_{\text{rel},i} v_i[n-1]\big)$$
    Because $\phi_{\text{rect}}'$ stays bounded in $[0, 1]$, the scalar Jacobian satisfies $J_i[n] \in [\alpha_{\text{rel},i}(1 - \kappa_i(1 - \alpha_{\text{atk},i})), \alpha_{\text{rel},i}] \subset (0, r_{\max}] \subset (0, 1)$ unconditionally (`6` `SimdVec4` ops on CPU, `0` post-hoc `w_rec *= 0.5` ISS hacks; inter-lane mixing occurs solely via lower-triangular `4x4` spatial tiles between blocks).
-3. **Pure-`f32` Divided-Difference `PolyADAA1` + $C^2$ Wavefolder (`0-FDIV`, `0` `0/0`):** Pairs midpoint/half-difference `(m_n, d_n)` cubic-odd + quartic-even `PolyADAA1` (`eval_poly_adaa_algebraic`) and $C^2$ wavefolding (`eval_adaa_cubic_c2_wavefolder_odd_f32`) with pure-`f32` branchless rail-crossing reciprocals via `SimdVec4::rcp_pos_nr2(max(upper - lower, 2^-12))` and batched `rcp_pos_quad_nr2` (safe in `f32` because $g'(\pm 1) = 0$), preserving exact analytical `0.000000` DC equilibrium (`h_eq == +0.0`) and `0-ULP` hidden-lane sign-flip watermarking (`s_i in {-1, +1}`).
+3. **Pure-`f32` Divided-Difference `PolyADAA1` + $C^2$ Wavefolder (`0-FDIV`, `0` `0/0`):** Pairs midpoint/half-difference `(m_n, d_n)` cubic-odd + quartic-even `PolyADAA1` (`eval_poly_adaa1_*`) and $C^2$ wavefolding (`eval_c2_wavefolder_adaa_*`) with pure-`f32` branchless rail-crossing reciprocals via `SimdVec4::rcp_pos_nr2(max(upper - lower, 1.0e-6))` (`TINY_CROSSING_EPS = 1.0e-6`, `RAIL_CROSSING_MIN_SPAN = 1.0e-6`) and batched `rcp_pos_quad_nr2` (safe in `f32` because $g'(\pm 1) = 0$), preserving exact analytical `0.000000` DC equilibrium (`h_eq == +0.0`) and `0-ULP` hidden-lane sign-flip watermarking (`s_i in {-1, +1}`).
 
 #### 2.0 Self-Similar Dual-Rate Kernel Architecture
 
@@ -214,26 +216,56 @@ flowchart LR
 
 `r[arch.simd.lane-packing]`
 
-`SONA` organizes all 4-block Matryoshka state-space lanes (`16 / 24 / 32 / 40` lanes), `TPT-SVF` modes (`4 / 6 / 8 / 10–12`), Stage III `FIR` + `Kautz` banks, `fp16` delay conversions (`f32x4_to_fp16x4` / `fp16x4_to_f32x4`), and `4x4` spatial mixing tiles in `4`-lane SIMD primitives (`SimdVec4` / `GpuVec4` in `packages/kernels/`, paired into `StereoVec8` on `AVX2+FMA`/`SVE2`/`SME` or interleaved `2x SimdVec4` on `NEON`/`WASM SIMD128`):
+`SONA` organizes all 4-block Matryoshka state-space lanes (`16 / 24 / 32 / 40` lanes across `4 / 6 / 8 / 10` `SonaGroup` slots), `TPT-SVF` quads (`4 / 6 / 8 / 10` quads), inter-block tiles (`3 / 13 / 23 / 35` lower-triangular `4x4` triples), Stage III `FIR` + `Kautz` banks, `fp16` delay conversions (`f32x4_to_fp16x4` / `fp16x4_to_f32x4`), and `Stage 4` `Op-T` quads in `4`-lane SIMD primitives (`SimdVec4` / `GpuVec4` in `packages/kernels/`, paired into `StereoVec8` on `AVX2+FMA`/`SVE2`/`SME` or interleaved `2x SimdVec4` on `NEON`/`WASM SIMD128`):
 
 ```text
 SONA v3.0 4-Block Matryoshka 4-Lane SIMD Hierarchy (Compile-Time const SonaTierSpec Locked at Gate 0b):
 +--------------------+--------------------+--------------------+--------------------+
 | Block 0 (4-Lane B) | Block 1 (4-Lane B) | Block 2 (4-Lane B) | Block 3 (4-Lane B) | -> Tier / Mode
 +--------------------+--------------------+--------------------+--------------------+
-| 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | -> LiteSpec  [1,1,1,1] (or [1,1,1,0] @ 2x OS)
-| 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | -> FullSpec  [2,2,1,1] (24 lanes @ 2x OS)
-| 3 x Vec4 (12 lanes)| 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | 1 x Vec4 (4 lanes) | -> ProSpec   [3,2,2,1] (32 lanes @ 2x OS)
-| 4 x Vec4 (16 lanes)| 3 x Vec4 (12 lanes)| 2 x Vec4 (8 lanes) | 1 x Vec4 (4 lanes) | -> UltraSpec [4,3,2,1] (40 lanes @ 2x / 4x)
+| 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | -> LITE_SPEC  [1,1,1,1] (16 lanes @ 1x 48kHz)
+| 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | -> FULL_SPEC  [2,2,1,1] (24 lanes @ 2x OS)
+| 3 x Vec4 (12 lanes)| 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | 1 x Vec4 (4 lanes) | -> PRO_SPEC   [3,2,2,1] (32 lanes @ 2x OS)
+| 4 x Vec4 (16 lanes)| 3 x Vec4 (12 lanes)| 2 x Vec4 (8 lanes) | 1 x Vec4 (4 lanes) | -> ULTRA_SPEC [4,3,2,1] (40 lanes @ 2x / 4x)
 +--------------------+--------------------+--------------------+--------------------+
 ```
 
-| Tier (`const` `SonaTierSpec`) | Tier Index | 4-Block Matryoshka Core (`SONA`) | Stage III (`FIR` + Kautz Pairs) | `Op-T` Transport & Diffusion (`48 kHz`) |
-| :--- | :---: | :--- | :---: | :---: |
-| **`Lite` (`LiteSpec`)** | Tier `0` | `[1, 1, 1, 1]` (`16` lanes, `4` `TPT-SVF` @ `1x` `PolyADAA1`) or `[1, 1, 1, 0]` @ `2x` | `32` FIR + `8` Kautz (`16` poles) | `1` quad (`M = 4` lines + inline `fp16` + cold `ext`) |
-| **`Full` (`FullSpec`)** | Tier `1` | `[2, 2, 1, 1]` (`24` lanes, `6` `TPT-SVF` @ `2x` OS + `PolyADAA1`) | `48` FIR + `12` Kautz (`24` poles) | `2` quads (`M = 8` lines + Schroeder diffusion) |
-| **`Pro` (`ProSpec`)** | Tier `2` | `[3, 2, 2, 1]` (`32` lanes, `8` `TPT-SVF` @ `2x` OS + `PolyADAA1`) | `96` FIR + `24` Kautz (`48` poles) | `3–4` quads (`M = 12–16` lines, cold `fp16`/`f32`) |
-| **`Ultra` (`UltraSpec`)** | Tier `3` | `[4, 3, 2, 1]` (`40` lanes, `10–12` `TPT-SVF` @ `2x` OS / `4x` Bounce) | `128` FIR + `32` Kautz (`64` poles) | `4` quads (`M = 16` lines, `8`-stage Schroeder, `f32` option) |
+| Tier (`const` `SonaTierSpec`) | `blocks` & Groups/Lanes | `TPT-SVF` Quads & Tiles | `oversample_factor` | Stage III (`fir_taps` + `kautz_pairs`) | `tank_quads` (`Op-T`) | Wire Arena & `ActiveHot` Ceiling |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| **`Lite` (`LITE_SPEC`, Tier `0`)** | `[1, 1, 1, 1]` (`4` grps = `16` lanes) | `4` quads, tiles `0..3` (`3`) | `1` (`1x` @ `48 kHz` + `PolyADAA1`) | `32` FIR/ch + `8` Kautz (`2` blks = `16` poles) | `1` (`M = 4` lines, `128`-frame/`1,024 B` `[[u16; 4]; 128]` inline `fp16` in `Quad 0` + opt. cold `ext_lines`) | `ARENA_LITE_BYTES = 4,608 B` (`72 CL`), `ActiveHot <= 4,608 B` |
+| **`Full` (`FULL_SPEC`, Tier `1`)** | `[2, 2, 1, 1]` (`6` grps = `24` lanes) | `6` quads, tiles `0..13` (`13`) | `2` (`2x` OS + `PolyADAA1`) | `48` FIR/ch + `12` Kautz (`3` blks = `24` poles) | `2` (`M = 8` lines + Schroeder; `Quad 0` `128`-frame inline + `Quad 1`) | `ARENA_FULL_BYTES = 7,936 B` (`124 CL`, delta `3,328 B = 52 CL`), `ActiveHot <= 7,936 B` |
+| **`Pro` (`PRO_SPEC`, Tier `2`)** | `[3, 2, 2, 1]` (`8` grps = `32` lanes) | `8` quads, tiles `0..23` (`23`) | `2` (`2x` OS + `PolyADAA1`) | `96` FIR/ch + `24` Kautz (`6` blks = `48` poles) | `3` (`M = 12` lines + Schroeder; opt. `fp16`/`f32` cold `ext_lines`) | `ARENA_PRO_BYTES = 15,872 B` (`248 CL`, delta `7,936 B = 124 CL`), `ActiveHot <= 15,872 B` |
+| **`Ultra` (`ULTRA_SPEC`, Tier `3`)** | `[4, 3, 2, 1]` (`10` grps = `40` lanes) | `10` quads, tiles `0..35` (`35`) | `2` RT (`4x` bounce `FullBand64Tap` `43`-spl PDC) | `128` FIR/ch + `32` Kautz (`8` blks = `64` poles) | `4` (`M = 16` lines + `8`-stage `PartitionedSchroederDiffuserBank`) | `ARENA_ULTRA_BYTES = 30,720 B` (`480 CL`, delta `14,848 B = 232 CL`), `ActiveHot <= 30,720 B` |
+
+**Exact Matryoshka Block/Group Indexing & 35-Tile Lower-Triangular Edge Topology (`packages/engine/src/stages/sona_core/model.rs`):**
+
+```rust
+pub const SONA_GROUP_BLOCK_AND_LOCAL: [(usize, usize); 10] = [
+    (0, 0), (1, 0), (2, 0), (3, 0), // Groups 0..4: Lite [1,1,1,1]
+    (0, 1), (1, 1),                 // Groups 4..6: Full [2,2,1,1]
+    (0, 2), (2, 1),                 // Groups 6..8: Pro  [3,2,2,1]
+    (0, 3), (1, 2),                 // Groups 8..10: Ultra [4,3,2,1]
+];
+
+pub const SONA_BLOCK_GROUP_SLOTS: [[usize; 4]; 4] = [
+    [0, 4, 6, 8],                   // Block 0 (up to 4 groups = 16 lanes)
+    [1, 5, 9, usize::MAX],          // Block 1 (up to 3 groups = 12 lanes)
+    [2, 7, usize::MAX, usize::MAX], // Block 2 (up to 2 groups = 8 lanes)
+    [3, usize::MAX, usize::MAX, usize::MAX], // Block 3 (1 group = 4 lanes)
+];
+
+// All 35 lower-triangular (src_group, dst_group) edges ordered strictly by tier introduction:
+//   0..3   (Lite,  +3):  [1,1,1,1] -> 3 edges
+//   3..13  (Full, +10):  [2,2,1,1] -> 13 cumulative edges
+//   13..23 (Pro,  +10):  [3,2,2,1] -> 23 cumulative edges
+//   23..35 (Ultra,+12):  [4,3,2,1] -> 35 cumulative edges
+pub const SONA_INTERBLOCK_TILES: [(usize, usize); 35] = [
+    (0, 1), (1, 2), (2, 3),                                                         // 0..3   Lite
+    (0, 5), (4, 1), (4, 5), (0, 2), (4, 2), (0, 3), (4, 3), (5, 2), (1, 3), (5, 3), // 3..13  Full
+    (6, 1), (6, 5), (0, 7), (4, 7), (6, 2), (6, 7), (6, 3), (1, 7), (5, 7), (7, 3), // 13..23 Pro
+    (0, 9), (4, 9), (6, 9), (8, 1), (8, 5), (8, 9), (8, 2), (8, 7), (8, 3), (9, 2), (9, 7), (9, 3), // 23..35 Ultra
+];
+```
 
 1. `r[arch.simd.two-level-traits]` **Two-Level SIMD Trait Hierarchy & Shared `dnam-kernels` Primitives ([`ADR-0019`](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [`ADR-0022`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)):**
    - **Level 1 (`packages/kernels/` + `math/backend.rs`):** `SimdVec4` / `GpuVec4` (`f32x4` portable register abstraction) and `StereoVec8` (`256`-bit / scalable stereo `L+R` dispatch on `AVX2+FMA`, `SVE2`, `SME`, falling back to interleaved `2x SimdVec4` on `NEON` and `WASM SIMD128`), `MathBackend` (`Crc32cBackend`, `fma_mat4x4_vec4`, `f32x4_to_fp16x4`, `fp16x4_to_f32x4`, `rcp_pos_nr2`, batched `rcp_pos_quad_nr2`, `rsqrt_pos_nr2`, `rsqrt_pos_pair_nr2`, `flush_subnormal`), plus `const_eval`, `TPT-SVF` `mat2x2` step/compose, `ParaLRU` + scalar Newton op, fast-path `PolyADAA1` + $C^2$ wavefolder, `KautzModalBank`, `Op-T` readers, `HilbertH1`/`T1` tracker, and `pow2_ceil_fp32` + `3x8-bit` Ozaki slice helpers reside in `#![no_std]` `packages/kernels/` (`dnam-kernels`).
@@ -264,17 +296,18 @@ $$(a_2, \tilde{b}_2) \circ (a_1, \tilde{b}_1) = (a_2 a_1, a_2 \tilde{b}_1 + \til
 
 `r[arch.tiers.arena-hierarchy]`
 
-Weights use a four-tier causally nested lower-block-triangular delta layout (`Arena 0..3`, `64 B`-aligned, serialized as constant-size `zerocopy` `Arena0LiteWire..Arena3UltraDeltaWire` structs) monomorphized over **four compile-time `const` `SonaTierSpec` profiles (`LiteSpec`, `FullSpec`, `ProSpec`, `UltraSpec`)** locked once at **`Gate 0b`** inside the `64 KiB` ARM Cortex-A76 L1D cache budget (`REQ-5.1`, `REQ-5.2`):
-- **Self-Contained `Arena 0` Controls (`REQ-5.6`):** Base `ControlClampDescriptorWire`, `Cp1`, `U_int`, `W_ctrl`, and `Lite` `fp16` `W_readout` reside inside `Arena 0` (`Arena0LiteWire`), so `strip_container_to_tier(Lite)` preserves full parametric conditioning and `.dnam-prev` stays self-contained.
-- **Zero Capture-Time Tier Resizing:** All `48 kHz` operator counts (`blocks`, `lanes`, `TPT-SVF` modes, `FIR` taps, `Kautz` pairs, `Op-T` tap counts, and OS ratios) are strictly compile-time `const` once locked at `Gate 0b`. Only cold `Op-T` `ext_lines` ring duration (`0 B` on dry rigs up to multi-second power-of-two DRAM rings with `& ext_mask` `O(1)` wrap per `REQ-6.3`) and declared `3 kHz` control count `P` (`0` extra `48 kHz` static MACs per `REQ-6.1`) vary per captured `.dnam` model.
+Weights use a four-tier causally nested lower-block-triangular delta layout (`Arena 0..3`, `64 B`-aligned, serialized as constant-size `zerocopy` `Arena0LiteWire..Arena3UltraDeltaWire` structs) monomorphized over **four compile-time `const` `SonaTierSpec` profiles (`LITE_SPEC`, `FULL_SPEC`, `PRO_SPEC`, `ULTRA_SPEC`)** locked once at **`Gate 0b`** inside the `64 KiB` (`65,536 B`) ARM Cortex-A76 L1D cache budget (`REQ-5.1`, `REQ-5.2`):
+- **100% Self-Contained `Arena 0` & Elimination of `rate_1x_cal` Duality (`REQ-5.6`):** `Arena0LiteWire` (`Arena 0`, `4,608 B = 72 CL`) is **100% self-contained**: it carries `1x`-calibrated `48 kHz` `Lite` base parameters, `Stage 0` crossbar & `4× Q0.32` phasors, `Op-P` config, `32` FIR taps + `8` Kautz pairs, `Quad 0` `Op-T` tank, **self-contained control tables (`ControlClampDescriptorWire`, `CP1`, `U_int`, `W_ctrl`)**, and the static base `fp16` readout matrix `W_ro,0` inside `VarProReadoutLiteWire` (while `3 kHz` latent/macro modulation drives `stage_targets[0..16]` plus `z_stage[0..D_s]`-indexed `stage_latent_mods_fp16[0..80]` / superseding `Arena 3` `stage_latent_ctrl_ultra_fp16[0..256]` and optional `stage_latent_core_mods_fp16[0..1024]`, keeping buyer `SO(4)` gauge `Q_buyer` on `z_head[0..4]` invariant rather than using per-latent readout tensors). Stripping or extracting `Lite` from any higher-tier `.dnam` reads `Arena 0` directly without touching `Arena 1..3`. `Arena 1..3` hold strictly `2×`-OS-calibrated incremental deltas (`Full`, `Pro`, `Ultra`); analytical continuous-time ZOH handles arbitrary host sample rates (`44.1–384 kHz`). There is **zero** `rate_1x_cal` / `V3_META_RATE_1X_CAL` sidecar copy: the `2,688 B` span inside `SonaCoreProDeltaWire` (`4,608 B`) is a contiguous `reserve: [u8; 2_688]` alignment/Tardos-carrier region preserving exact `64 B` cache-line boundaries and `ARENA_PRO_BYTES = 15,872 B`.
+- **Zero Capture-Time Tier Resizing:** All `48 kHz` operator counts (`blocks`, `groups`, `lanes`, `TPT-SVF` quads, `FIR` taps, `Kautz` pairs, `Op-T` `tank_quads`, and OS ratios) are strictly compile-time `const` once locked at `Gate 0b`. Only cold `Op-T` `ext_lines` ring duration (`0 B` on dry rigs up to multi-second power-of-two DRAM rings with `& ext_mask` `O(1)` wrap per `REQ-6.3`) and declared `3 kHz` control count `P` (`0` extra `48 kHz` static MACs per `REQ-6.1`) vary per captured `.dnam` model.
 
-| Parameter | `Lite` (`Arena 0`, `LiteSpec`) | `Full` (`Arena 0..1`, `FullSpec`) | `Pro` (`Arena 0..2`, `ProSpec`) | `Ultra` (`Arena 0..3`, `UltraSpec`) |
+| Parameter (`const SonaTierSpec`) | `Lite` (`Arena 0`, `LITE_SPEC`) | `Full` (`Arena 0..1`, `FULL_SPEC`) | `Pro` (`Arena 0..2`, `PRO_SPEC`) | `Ultra` (`Arena 0..3`, `ULTRA_SPEC`) |
 | :--- | :---: | :---: | :---: | :---: |
-| **`SonaHotSlab` Target (`N × ActiveHot ≤ 64 KiB`)** | `≤ 4.5 KiB` (`14× ≤ 63 KiB`) | `≤ 7.8 KiB` (`8× ≤ 62.4 KiB`) | `≤ 15.5 KiB` (`4× ≤ 62 KiB`) | `≤ 30.0 KiB` (`2× ≤ 60 KiB`) |
-| **4-Block Matryoshka `SONA` Core** | `[1, 1, 1, 1]` (`16` lanes / `4` SVF @ `1×` `PolyADAA1`) or `[1, 1, 1, 0]` @ `2×` | `[2, 2, 1, 1]` (`24` lanes / `6` SVF @ `2×` OS) | `[3, 2, 2, 1]` (`32` lanes / `8` SVF @ `2×` OS) | `[4, 3, 2, 1]` (`40` lanes / `10–12` SVF @ `2×` / `4×` Bounce) |
+| **Cumulative Wire Arena Footprint (`64 B` CL)** | `4,608 B` (`72 CL`) | `7,936 B` (`124 CL`, `+3,328 B / 52 CL`) | `15,872 B` (`248 CL`, `+7,936 B / 124 CL`) | `30,720 B` (`480 CL`, `+14,848 B / 232 CL`) |
+| **`SonaHotSlab` `ActiveHot` Ceiling (`N × ActiveHot <= 64 KiB`)** | `<= 4,608 B` (`14× = 64,512 B <= 64 KiB`) | `<= 7,936 B` (`8× = 63,488 B <= 64 KiB`) | `<= 15,872 B` (`4× = 63,488 B <= 64 KiB`) | `<= 30,720 B` (`2× = 61,440 B <= 64 KiB`) |
+| **4-Block Matryoshka `SONA` Core** | `[1, 1, 1, 1]` (`4` groups / `16` lanes / `4` `TPT-SVF` quads, `3` tiles `0..3`) @ `1×` `PolyADAA1` | `[2, 2, 1, 1]` (`6` groups / `24` lanes / `6` `TPT-SVF` quads, `13` tiles `0..13`) @ `2×` OS | `[3, 2, 2, 1]` (`8` groups / `32` lanes / `8` `TPT-SVF` quads, `23` tiles `0..23`) @ `2×` OS | `[4, 3, 2, 1]` (`10` groups / `40` lanes / `10` `TPT-SVF` quads, `35` tiles `0..35`) @ `2×` RT / `4×` Bounce |
 | **Stage III Early `FIR` Taps (per ch)** | `32` | `48` | `96` (`2.0 ms`) | `128` (`2.67 ms`) |
-| **Stage III Shared `Kautz` Pole Pairs** | `8` pairs (`16` poles) | `12` pairs (`24` poles) | `24` pairs (`48` poles) | `32` pairs (`64` poles) |
-| **`Op-T` Transport & Schroeder Diffusion** | `1` quad (`M = 4` + inline `fp16` + cold `ext`) | `2` quads (`M = 8` + Schroeder diffusion) | `3–4` quads (`M = 12–16` + Schroeder, `fp16`/`f32`) | `4` quads (`M = 16` + `8`-stage Schroeder, `f32` option) |
+| **Stage III Shared `Kautz` Pole Pairs** | `8` pairs (`2` blocks = `16` poles) | `12` pairs (`3` blocks = `24` poles) | `24` pairs (`6` blocks = `48` poles) | `32` pairs (`8` blocks = `64` poles) |
+| **`Op-T` Transport (`tank_quads`) & Diffusion** | `1` quad (`M = 4` lines, `128`-frame/`1,024 B` inline `fp16` `Quad 0` `[[u16; 4]; 128]` + opt. cold `ext_lines`) | `2` quads (`M = 8` lines + Schroeder diffusion; `Quad 0` inline + `Quad 1`) | `3` quads (`M = 12` lines + Schroeder diffusion, opt. `fp16`/`f32` cold `ext_lines`) | `4` quads (`M = 16` lines + `8`-stage `PartitionedSchroederDiffuserBank`) |
 | **Control Bus Latent Dim (`z_ctrl`, `Arena 0` Base)** | `8-D` (`4` + `4`, `R = 4`) | `8-D` (`4` + `4`, `R = 4`) | `8-D` (`4` + `4`, `R = 4`) | `16-D` (`8` + `8`, `R = 8`, `+16×4` delta in `Arena 3`) |
 
 ### 2.2 Hardware & DSP Benchmark Summary
@@ -293,10 +326,10 @@ $$t_{\text{A76+LV2}}(t, B) = \kappa_{\text{cache}} \left(\alpha_{\text{uarch}}(t
 
 | Tier Profile (`const` `SonaTierSpec`) | `Gate 0b` Target `1× A76` Budget (`85–90%` Utilization) | `N × ActiveHot` vs `64 KiB` L1D | Normative Serial Core Budget (`1× A76` @ 80% RT Cap) | Safe Serial (`2× A76` Cores) | Real-Time Instruction Invariant |
 | :--- | :---: | :---: | :---: | :---: | :--- |
-| **`Lite` (`LiteSpec [1,1,1,1]` / `[1,1,1,0]`, `32` FIR, `8` Kautz, `1` quad)** | `≤ 1,000 ns/sample` | `14 × ≤ 4.5 KiB ≤ 63 KiB` | **`≥ 14×`** (`≤ 1,190 ns/sample`) | **`≥ 28×`** | Zero `FDIV`, `FSQRT`, `IDIV`/`UDIV`/`SDIV`, `libm`, allocs, or syscalls (`REQ-6.2`, `REQ-6.3`) |
-| **`Full` (`FullSpec [2,2,1,1]` @ `2×`, `48` FIR, `12` Kautz, `2` quads)** | `≤ 1,800 ns/sample` | `8 × ≤ 7.8 KiB ≤ 62.4 KiB` | **`≥ 8×`** (`≤ 2,083 ns/sample`) | **`≥ 16×`** | `2×` OS (`-90 dB` alias immunity) inside Studio flagship budget |
-| **`Pro` (`ProSpec [3,2,2,1]` @ `2×`, `96` FIR, `24` Kautz, `3–4` quads)** | `≤ 3,600 ns/sample` | `4 × ≤ 15.5 KiB ≤ 62 KiB` | **`≥ 4×`** (`≤ 4,166 ns/sample`) | **`≥ 8×`** | Mastering reference capacity (`2.0 ms` FIR + `48` Kautz poles) |
-| **`Ultra` (`UltraSpec [4,3,2,1]` @ `2×`/`4×`, `128` FIR, `32` Kautz, `4` quads)** | `≤ 7,200 ns/sample` | `2 × ≤ 30.0 KiB ≤ 60 KiB` | **`≥ 2×`** (`≤ 8,333 ns/sample`) + Bounce | **`≥ 4×`** | Dual-rig workstation max + `4×` polyphase offline bounce |
+| **`Lite` (`LITE_SPEC [1,1,1,1]` @ `1×`, `4` grps/`4` quads, `3` tiles, `32` FIR, `8` Kautz, `1` tank quad)** | `≤ 1,000 ns/sample` | `14 × <= 4,608 B = 64,512 B <= 64 KiB` | **`≥ 14×`** (`≤ 1,190 ns/sample`) | **`≥ 28×`** | Zero `FDIV`, `FSQRT`, `IDIV`/`UDIV`/`SDIV`, `libm`, allocs, locks, or syscalls (`REQ-6.2`, `REQ-6.3`) |
+| **`Full` (`FULL_SPEC [2,2,1,1]` @ `2×`, `6` grps/`6` quads, `13` tiles, `48` FIR, `12` Kautz, `2` tank quads)** | `≤ 1,800 ns/sample` | `8 × <= 7,936 B = 63,488 B <= 64 KiB` | **`≥ 8×`** (`≤ 2,083 ns/sample`) | **`≥ 16×`** | `2×` OS (`-90 dB` alias immunity) inside Studio flagship budget |
+| **`Pro` (`PRO_SPEC [3,2,2,1]` @ `2×`, `8` grps/`8` quads, `23` tiles, `96` FIR, `24` Kautz, `3` tank quads)** | `≤ 3,600 ns/sample` | `4 × <= 15,872 B = 63,488 B <= 64 KiB` | **`≥ 4×`** (`≤ 4,166 ns/sample`) | **`≥ 8×`** | Mastering reference capacity (`2.0 ms` FIR + `48` Kautz poles + `12` delay lines) |
+| **`Ultra` (`ULTRA_SPEC [4,3,2,1]` @ `2×`/`4×`, `10` grps/`10` quads, `35` tiles, `128` FIR, `32` Kautz, `4` tank quads)** | `≤ 7,200 ns/sample` | `2 × <= 30,720 B = 61,440 B <= 64 KiB` | **`≥ 2×`** (`≤ 8,333 ns/sample`) + Bounce | **`≥ 4×`** | Dual-rig workstation max + `4×` bounce (`FullBand64Tap` `43`-spl PDC) + `8`-stage Schroeder |
 
 **Prior-Art Equivalent-Quality LV2 Instance Comparison on `1× RK3582 Cortex-A76` (`2.4 GHz`, `48 kHz` + LV2 @ `80%` RT Cap):**
 
@@ -307,39 +340,51 @@ $$t_{\text{A76+LV2}}(t, B) = \kappa_{\text{cache}} \left(\alpha_{\text{uarch}}(t
 | **`NAM A2 Lite / Feather` (Live Grade)** | Mono LV2 (`2×` LV2s for stereo) | `~1,871` MACs at `75%` NEON utilization (`C = 3` unaligned loops) + `76.2 KB` state (`> 64 KB` L1D) + LV2 port/trim wrapper overhead | `6.5% – 9.0%` (mono)<br/>`13.0% – 18.0%` (stereo pair) | `8 – 12×` mono LV2s | `4 – 6×` stereo pairs (`8–12` LV2s) | `3 – 4×` full rigs (`4–6` chained LV2s each) |
 | **`GuitarML Proteus` (`LSTM-40`, 1–2 Knobs)** | Mono LV2 (`2×` LV2s for stereo) | `~6,560–7,040` serial recurrent MACs + `160×` `sigmoid`/`tanh` `libm` calls/sample + `48 kHz` LV2 knob port smoothing (`+40·P` MACs static) + LV2 dispatch | `12.0% – 17.0%` (mono)<br/>`24.0% – 34.0%` (stereo pair) | `4 – 6×` mono LV2s | `2 – 3×` stereo pairs (`4–6` LV2s) | `2 – 3×` full rigs (`4–6` chained LV2s each) |
 | **`NAM ParametricOD` (3-Knob WaveNet/LSTM)** | Mono LV2 (`2×` LV2s for stereo) | Dilated conv / LSTM stack + `48 kHz` per-sample `FiLM` knob projections (`+2·C·P` MACs/layer when static) + `tanh` + LV2 control port smoothing | `18.0% – 25.0%` (mono)<br/>`36.0% – 50.0%` (stereo pair) | `3 – 4×` mono LV2s | `1 – 2×` stereo pairs (`2–4` LV2s) | `1 – 2×` full rigs (`4–6` chained LV2s each) |
-| **`SONA Full` (`FullSpec` @ `2×` OS)** | **True Stereo LV2 (`1×` unified LV2)** | **`[2,2,1,1]` `24`-lane `SONA` core @ `2×` OS (`6` `TPT-SVF`, `48` FIR, `12` Kautz, `2` `Op-T` quads), `≤ 7.8 KiB` `SonaHotSlab`, `0` static control MACs, `0` `FDIV`/`FSQRT`/`libm`** | **Target `≤ 8.6%` (`≤ 1,800 ns` A76, `≤ 10.0%` ceiling)** | **`≥ 8×` LV2s** | **`≥ 8×` true-stereo LV2s** | **`≥ 8×` complete stereo rigs (`1` LV2 each)** |
-| **`SONA Lite` (`LiteSpec`)** | **True Stereo LV2 (`1×` unified LV2)** | **`[1,1,1,1]` `16`-lane / `4` `TPT-SVF` (`32` FIR, `8` Kautz, `1` `Op-T` quad), `≤ 4.5 KiB` `SonaHotSlab`, `0` static control MACs, `0` `FDIV`/`FSQRT`/`libm`** | **Target `≤ 4.8%` (`≤ 1,000 ns` A76, `≤ 5.7%` ceiling)** | **`≥ 14×` LV2s** | **`≥ 14×` true-stereo LV2s** | **`≥ 14×` complete stereo rigs (`1` LV2 each)** |
+| **`SONA Full` (`FULL_SPEC` @ `2×` OS)** | **True Stereo LV2 (`1×` unified LV2)** | **`[2,2,1,1]` `24`-lane `SONA` core @ `2×` OS (`6` `TPT-SVF` quads, `48` FIR, `12` Kautz, `2` `Op-T` quads), `<= 7,936 B` `SonaHotSlab`, `0` static control MACs, `0` `FDIV`/`FSQRT`/`libm`** | **Target `≤ 8.6%` (`≤ 1,800 ns` A76, `≤ 10.0%` ceiling)** | **`≥ 8×` LV2s** | **`≥ 8×` true-stereo LV2s** | **`≥ 8×` complete stereo rigs (`1` LV2 each)** |
+| **`SONA Lite` (`LITE_SPEC` @ `1×`)** | **True Stereo LV2 (`1×` unified LV2)** | **`[1,1,1,1]` `16`-lane / `4` `TPT-SVF` quads (`32` FIR, `8` Kautz, `1` `Op-T` quad), `<= 4,608 B` `SonaHotSlab`, `0` static control MACs, `0` `FDIV`/`FSQRT`/`libm`** | **Target `≤ 4.8%` (`≤ 1,000 ns` A76, `≤ 5.7%` ceiling)** | **`≥ 14×` LV2s** | **`≥ 14×` true-stereo LV2s** | **`≥ 14×` complete stereo rigs (`1` LV2 each)** |
 
 ### 2.3 State RAM Audit: Lite Budget
 
 `r[arch.tiers.state-ram]`
 
-`SonaHotSlab` packs hot `48 kHz` weights and recursive states contiguously in strict execution order inside `[0..ActiveHotBytes)` (`64 B`-aligned, `0 B/instance` transient scratch) while placing cold `P`-sized `ControlBusWire` + `U16` `VarProReadoutSubspaceWire` descriptors and cold `ext_lines` rings past `ActiveHotBytes`:
+`SonaHotSlab` packs hot `48 kHz` weights and recursive states contiguously in strict Matryoshka execution order inside `[0..ActiveHotBytes)` (`64 B`-aligned, `0 B/instance` transient scratch) **strictly BEFORE** all higher-tier extension arrays, cold `P`-sized `ControlBusWire` / `U16` `VarProReadout` staging, and cold `Op-T` `ext_lines` rings past `ActiveHotBytes`, guaranteeing that lower-tier audio callbacks never touch cache lines past `[0..ActiveHotBytes)`:
 
 ```text
 +---------------------------------------------------------------------------------------------------+
 | SonaHotSlab: Contiguous Execution-Ordered 64 B-Aligned Working Set ([0..ActiveHotBytes) + Tail)   |
 +---------------------------------------------------------------------------------------------------+
-| HOT REGION [0..ActiveHotBytes):                                                                   |
-|   [Stage 0 Router + Op-P H1/T1] -> [4x Q0.32 Phasors + Op-T Quad 0 Inline fp16]                   |
-|   -> [4-Block SONA Core: TPT-SVF (s1,s2) + 1D ParaLRU v_i + PolyADAA1 u_prev + 4x4 Tiles]         |
-|   -> [Stage III: Mirrored L/R FIR (32/48/96/128) + Shared Kautz (8/12/24/32 Pairs)]               |
-|   Targets: Lite <= 4.5 KiB | Full <= 7.8 KiB | Pro <= 15.5 KiB | Ultra <= 30.0 KiB                |
+| HOT REGION [0..ActiveHotBytes) — Strictly Ordered Before Higher-Tier & Cold Arrays:               |
+|   1. Stage 0 Router (Gain/Matrix/XO/Gate) -> Op-P (HilbertH1 + T1SubHarmonic) -> 4x Q0.32 Phasors |
+|   2. Lite Active Core: groups[0..4] (16 lanes, 4 TPT-SVF quads) + tiles[0..3] + Direct Readout    |
+|   3. Lite Stage III: 32-tap Mirrored L/R FIR + 8-pair Kautz SoA + Stage IV Quad 0 (128f/1,024B) |
+|   --- End of Lite Working Set: ActiveHotBytes <= 4,608 B (72 CL) -------------------------------- |
+|   4. Higher-Tier Hot Extensions (Contiguous per Tier Prefix):                                     |
+|      - Full Delta:  groups[4..6], tiles[3..13], FIR[32..48], Kautz[8..12], Quad 1 (+Schroeder)    |
+|        -> ActiveHotBytes <= 7,936 B (124 CL)                                                      |
+|      - Pro Delta:   groups[6..8], tiles[13..23], FIR[48..96], Kautz[12..24], Quad 2               |
+|        -> ActiveHotBytes <= 15,872 B (248 CL)                                                     |
+|      - Ultra Delta: groups[8..10], tiles[23..35], FIR[96..128], Kautz[24..32], Quad 3              |
+|        + 8-stage PartitionedSchroederDiffuserBank -> ActiveHotBytes <= 30,720 B (480 CL)          |
 +---------------------------------------------------------------------------------------------------+
-| COLD TAIL [ActiveHotBytes..):                                                                     |
-|   P-Sized ControlClampDescriptorWire + Cp1 + U_int + W_ctrl + U16 VarProReadoutSubspaceWire       |
-|   + Cold Op-T ext_lines Ring (0 B dry .. multi-second power-of-two DRAM, a in {2, 4} bytes/sample) |
+| COLD TAIL [ActiveHotBytes..) — Zero L1D Footprint on Hot 48 kHz Audio Loops:                      |
+|   - Inactive Higher-Tier Delta Arrays (groups[N_g..10], tiles[N_t..35], Stage III/IV extensions)  |
+|   - 3 kHz Control Bus: ControlClampDescriptorWire[P] + CP1 + U_int + W_ctrl + SonaControlBusState |
+|   - Cold VarProReadout*Wire FP16 Tables & Epoch-Retire Triple-Buffer Guard (SlotSwapGuard)        |
+|   - Cold Op-T ext_lines Ring (0 B dry .. multi-second power-of-two DRAM, a in {2, 4} bytes/sample) |
 +---------------------------------------------------------------------------------------------------+
 ```
 
-| State Component | `Lite` (`LiteSpec`) | `Full` (`FullSpec`) | `Pro` (`ProSpec`) | `Ultra` (`UltraSpec`) |
+| State Component | `Lite` (`LITE_SPEC`) | `Full` (`FULL_SPEC`) | `Pro` (`PRO_SPEC`) | `Ultra` (`ULTRA_SPEC`) |
 | :--- | :---: | :---: | :---: | :---: |
-| **Stage III L/R `FIR` Histories (`f32`, mirrored `32..128`)** | `256 B` | `384 B` | `768 B` | `1,024 B` |
+| **Stage III L/R `FIR` Logical Tap Weights (`f32`, `32..128`/ch + circular stereo history ring)** | `256 B` | `384 B` | `768 B` | `1,024 B` |
 | **Stage III L/R `Kautz` Complex States (`8..32` pairs `f32`)** | `128 B` | `192 B` | `384 B` | `512 B` |
-| **`SONA` Core State (`TPT-SVF` 2/mode + `ParaLRU` + `PolyADAA1`)** | `256 B` | `384 B` | `512 B` | `640 B` |
+| **`SONA` Core State (`TPT-SVF` + `ParaLRU` + `PolyADAA1`)** | `256 B` | `384 B` | `512 B` | `640 B` |
+| **Inline Stage IV `Quad 0` `fp16` Ring (`128` frames × `4` lines × `2 B` = `16 CL`, `[[u16; 4]; 128]`)** | `1,024 B` | `1,024 B` (`+ Quad 1`) | `1,024 B` (`+ Quad 1..2`) | `1,024 B` (`+ Quad 1..3`) |
 | **Transient Kernel Scratch (`SonaTickScratch`)** | Stack (`0 B`/inst) | Stack (`0 B`/inst) | Stack (`0 B`/inst) | Stack (`0 B`/inst) |
-| **Total `ActiveHot` `SonaHotSlab` Budget (`N × Slab ≤ 64 KiB`)** | **`≤ 4.5 KiB`** | **`≤ 7.8 KiB`** | **`≤ 15.5 KiB`** | **`≤ 30.0 KiB`** |
-| **Static-Control Accumulator + Cold `ext_lines` (`a ∈ {2, 4}`)** | `64 B` + Model-declared | `64 B` + Model-declared | `64 B` + Model-declared | `128 B` + Model-declared |
+| **Total `ActiveHot` `SonaHotSlab` Budget (`N × ActiveHot <= 64 KiB`)** | **`<= 4,608 B` (`72 CL`)** | **`<= 7,936 B` (`124 CL`)** | **`<= 15,872 B` (`248 CL`)** | **`<= 30,720 B` (`480 CL`)** |
+| **Static-Control Accumulator + Cold `ext_lines` (`a in {2, 4}`)** | `64 B` + Model-declared | `64 B` + Model-declared | `64 B` + Model-declared | `128 B` + Model-declared |
+
+Across every tier, the `FIR` line (`256 / 384 / 768 / 1,024 B` logical tap weights, paired with its circular stereo history ring) together with all active hot states and weights stays strictly inside the `ActiveHot <= 4,608 / 7,936 / 15,872 / 30,720 B` L1D working-set ceiling measured per tier at `Gate 0b`.
 
 ### 2.4 Computational Efficiency & Verification
 
@@ -615,8 +660,8 @@ Stem extraction preserves 2-channel audio arrays $\mathbf{X} \in \mathbb{R}^{N \
 | **5** | **Precomputable `Op-P` (`H1` + Pure-`f32` `T1`) & `4× Q0.32` Carriers** | Crossbar `Op-P` & `Q0.32` | Evaluates input-only `HilbertH1Lattice6Sec` + pure-`f32` branch-cut-guarded `T1` once on host (`< 0.5 ms`), plus `0.05 Hz..20 kHz` quadrature phasors for LFOs and audio-rate ring modulation (`Chain-10`). |
 | **6** | **Contiguous Stage III `FIR` (`32..128`) & Shared `Kautz` (`8..32`)** | Stage III `Op-M[Modal]` | Double-mirrored FIR histories + normalized coupled-form shared-pole Kautz resonators (`refinement 13`, dynamic sweep contraction `r_eff,m`, two-step warped pole extraction + continuous GPU/CPU pole polish). |
 | **7** | **`process_tick16_const` Hoisting & `StereoVec8` (`0-ULP` Parity)** | `dnam-kernels` & `dnam-engine` | Hoists state into SIMD registers across `16`-frame `3 kHz` ticks (`16×` fewer L1D loads/stores) and pairs `StereoVec8` (`AVX2`/`SVE2`/`SME`) with `2× SimdVec4` (`NEON`/`WASM`) via identical `Vec4` reduction trees. |
-| **8** | **Zero-Spill `SonaHotSlab` & Self-Contained `Arena 0` Controls** | `SonaInstance` & `Arena 0` | Packs `[0..ActiveHotBytes)` in execution order (`0 B` scratch/inst; `≤ 4.5 / 7.8 / 15.5 / 30.0 KiB`) with `ControlClampDescriptorWire`, `CP1`, `U_int`, `W_ctrl`, and `fp16` `W_readout` inside `Arena 0` (`REQ-5.6`). |
-| **9** | **Optimize-First `Gate 0b` `const` Tier Lock & Diminishing Returns** | `SonaTierSpec` & Capture | Locks fixed compile-time `const` `SonaTierSpec` shapes up to `~85–90%` of `REQ-6.1` WCET/L1D (`0` capture-time resizing); optimizes weights across `64–128` seeds and `2.0–2.5 s` capsules to `∣ΔbESR∣ < 0.01 dB/epoch`. |
+| **8** | **Zero-Spill `SonaHotSlab`, `SlotSwapGuard` & Self-Contained `Arena 0` Controls** | `SonaInstance` & `Arena 0` | Packs `[0..ActiveHotBytes)` in execution order (`0 B` scratch/inst; `<= 4,608 / 7,936 / 15,872 / 30,720 B`), lock-free triple-buffer SPSC `SlotSwapGuard` (zero `Mutex`), and self-contained `1x`-calibrated `Arena 0` (`REQ-5.6`). |
+| **9** | **Optimize-First `Gate 0b` `const` Tier Lock & Diminishing Returns** | `SonaTierSpec` & Capture | Locks fixed compile-time `const` `SonaTierSpec` shapes (`[1,1,1,1]..[4,3,2,1]`, `4/6/8/10` quads, `1/2/3/4` `tank_quads`, zero `rate_1x_cal`) inside `~85–90%` of `REQ-6.1` WCET/L1D (`0` capture-time resizing); optimizes weights across `64–128` seeds and `2.0–2.5 s` capsules to `|Delta_bESR| < 0.01 dB/epoch`. |
 | **10** | **AOT `.wgsl` (`16 KiB` SRAM, `i32` Ozaki, Host `f64` `VarPro`)** | `tools/sona-shaders` & Capture | Emits `naga`-validated `.wgsl` from `dnam-kernels` (`0 KB` WASM bloat), `256×` checkpointed scans (`~3.1 MiB`), fast-math-immune `3 × 8-bit` `i32` Ozaki (`~132 KiB`/epoch), and `0-ULP` CPU verification pass. |
 | **11** | **Declarative `zerocopy` `v3.0` `"sona"` Containers & `0-ULP` Freeze** | Containers & `Op-T` | Replaces manual byte slicing with `#[repr(C)]` `zerocopy::byteorder::little_endian` wire structs + compile-time asserts (`ref[repo.code.zerocopy-wire-structs]`), honoring `a ∈ {2, 4}` ring precision and `0-ULP` freeze lock. |
 | **12** | **LR4 Crossover, Return-to-Send Isolation & Ballistic VCA** | Stage 0 & `Op-T` | Preserves `S_{ret->send} == 0`, `FullBand64Tap`/`Live16Tap` alignment, `200 Hz` LR4 split, `τ_attack ≥ 0.5 ms` / `τ_release ≥ 20.0 ms` ducking slew, and `0-ULP` hidden-lane sign-flip + Kautz watermarking. |

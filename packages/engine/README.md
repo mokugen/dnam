@@ -10,16 +10,16 @@ It is engineered for embedded ARMv8.2-A/ARMv9.2-A pedalboards (**Rockchip RK3582
 
 - **`#![no_std]` + `alloc` & Zero Real-Time Allocations:**
   - Compiles without `std` across all targets using `serde` and `serde_json` (`default-features = false, features = ["alloc"]`) and `zerocopy` (`0.8`).
-  - Verified by the custom `#[global_allocator]` integration test ([`tests/realtime_safety.rs`](tests/realtime_safety.rs)), the release-binary disassembly audit ([`tests/realtime_disassembly_audit.rs`](tests/realtime_disassembly_audit.rs)), and [`spec_scope.toml`](spec_scope.toml) (`212` engine-scoped `r[...]` rules verified via `verify[...]`).
+  - Verified by the custom `#[global_allocator]` integration test ([`tests/realtime_safety.rs`](tests/realtime_safety.rs)), the release-binary disassembly audit ([`tests/realtime_disassembly_audit.rs`](tests/realtime_disassembly_audit.rs)), and [`spec_scope.toml`](spec_scope.toml) (`217` engine-scoped `r[...]` rules verified via `verify[...]`).
 - **Zero `FSQRT`, `FDIV`, and `libm` Calls at $48\text{ kHz}$ & $3\text{ kHz}$:**
   - **Operators (`src/operators/`):**
     - **`Op-T` (Transport & Elastic Buffer):** Catmull-Rom cubic fractional delay with ZOH-rescaled dual-mode slew/crossfade ($L_{\text{xfade}} = \max(16, \mathrm{round}(128/\rho_{\text{sr}}))$), branchless wrap, partitioned Schroeder diffusers, and dual-tap complementary Hermite-Hann grain reader ($H(\phi_A) + H(\phi_B) \equiv 1$).
-    - **`Op-M` (Modal Bank & Kautz):** 4-lane SIMD symplectic resonator, quadrant-reduced degree-13/14 Horner contractive rotor with adaptive 1–2 ULP guard, `Q0.192` LFO phase accumulator, 12-allpass (`6` I + `6` Q) `H1` Hilbert SSB lattice, `5 Hz` `T1` DC-blocked sub-harmonic tracker, and Stage III 16-sample delayed Kautz modal bank.
+    - **`Op-M` (Modal Bank & Kautz):** 4-lane SIMD symplectic resonator, quadrant-reduced degree-13/14 Horner contractive rotor with adaptive 1–2 ULP guard, `Q0.192` LFO phase accumulator, 12-allpass (`6` I + `6` Q) `H1` Hilbert SSB lattice, `T1` sub-harmonic tracker with `5 Hz` upstream DC blocker, and Stage III 16-sample delayed Kautz modal bank.
     - **`Op-N` (Nonlinear Activation & Shaping):** Division-free Padé `[5/4]` `tanh` (`OpNBackend`), saturated `PolyADAA` reference verifier, analytical DC equilibrium, `C²` wavefolder, and `Q64.32` zero-order-hold bitcrusher with TPDF dither.
   - **Stages, `SONA` State-Space Core & Matrix Router (`src/stages/`, [`sona_architecture.md`](../../docs/specs/architecture/sona_architecture.md)):**
     - **Stage 0 Router & Top-of-Frame Causal Crossbar:** 8-Port Matrix Router with return-to-send isolation, `200 Hz` `TPT` `LR4`/`Bèzout` crossover, Kaiser-sinc sub-sample alignment, WDW routing, hysteresis gate, plus (`SONA` `v3.0`) causal `Op-T` reads ($\tau \ge 4$), input-only `Op-P` (`HilbertH1Lattice6Sec` + `T1SubHarmonicTracker`), and `4`-lane `Q0.32` quadrature carriers (`0.05 Hz–20 kHz`).
-    - **4-Block Matryoshka `SONA` Core (`ADR-0022`, Phase 2 cutover from `V3HotCore`):** Lower-triangular Matryoshka blocks (`Lite` `[1,1,1,1]` / `[1,1,1,0]` $\subset$ `Full` `[2,2,1,1]` $\subset$ `Pro` `[3,2,2,1]` $\subset$ `Ultra` `[4,3,2,1]` locked at `Gate 0b`) combining passive `2×2` ZDF `TPT-SVF`, contractive `1D` scalar `ParaLRU` diode-RC ballistics, and pure-`f32` divided-difference `PolyADAA1` + `C²` wavefolder (`process_tick16_const` + `StereoVec8`, zero `FDIV`/`FSQRT`/`libm`).
-    - **Stage III Cabinet Modals & Spatial `Op-T`:** Contiguous early reflection `FIR` (`32/48/96/128` target taps) and shared-pole orthonormal `Kautz` modal (`8/12/24/32` target pairs) with `ZOH` onset delay, plus coercive `Op-T` feedback rings (`a ∈ {2, 4}` `fp16`/`f32` precision, integer-lag lossless freeze).
+    - **4-Block Matryoshka `SONA` Core (`ADR-0022`, [`SonaHotSlab`](src/stages/sona_core/slab.rs) / [`SonaInstance`](src/stages/sona_core.rs)):** Lower-triangular Matryoshka blocks (`Lite` `[1,1,1,1]` @ `1×` $\subset$ `Full` `[2,2,1,1]` @ `2×` $\subset$ `Pro` `[3,2,2,1]` @ `2×` $\subset$ `Ultra` `[4,3,2,1]` @ `2×`, `16 / 24 / 32 / 40` SVF modes = `4 / 6 / 8 / 10` quads, arenas `[4_608, 7_936, 15_872, 30_720]` B = `[72, 124, 248, 480]` CLs) combining passive `2×2` ZDF `TPT-SVF`, contractive `1D` scalar `ParaLRU` diode-RC ballistics, and pure-`f32` divided-difference `PolyADAA1` + `C²` wavefolder (`process_tick16_const` + `StereoVec8`, zero `FDIV`/`FSQRT`/`libm`).
+    - **Stage III Cabinet Modals & Spatial `Op-T`:** Contiguous early reflection `FIR` (`32/48/96/128` target taps) and shared-pole orthonormal `Kautz` modal (`8/12/24/32` target pairs) with `ZOH` onset delay, plus Stage IV coercive `Op-T` tank quads (`1 / 2 / 3 / 4` quads = `4 / 8 / 12 / 16` feedback lines, `a ∈ {2, 4}` `fp16`/`f32` precision, integer-lag lossless freeze).
   - **Control Bus & Runtime UX (`src/control/`, [`ADR-0022`](../../docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md)):**
     - $3\text{ kHz}$ node-anchored Lobatto basis, `CP1` tier-local projections (`8-D` Rank-4 in `Lite..Pro`, `16-D` Rank-8 in `Ultra`), 9-word/18-word `ExactIntFactorAccumulator`, outward-checked trust-region clipping, and `Q64`/`Q32` `20–400 BPM` tempo synchronization with 32-step binary-search physical calibration inversion ([`parametric_control_bus.md`](../../docs/specs/dsp/parametric_control_bus.md)).
     - Atomic preset batch evaluation with two-path output crossfading on disjoint conditional switch transitions (`apply_preset`), `SpilloverTrails` vs. `HardBypass` ramping (`set_bypass`), `supports_freeze` hardware freeze gating, out-of-range tempo-sync rank clamping (`active_clamp_mask`), and `OUTSIDE_CERTIFIED_INPUT` (`bit 4`) telemetry reporting above $\pm 100.0$ (`+40 dBFS`) without unmodeled soft-limiting.
@@ -29,9 +29,9 @@ It is engineered for embedded ARMv8.2-A/ARMv9.2-A pedalboards (**Rockchip RK3582
   - [`wasm.rs`](src/math/wasm.rs): Unified WebAssembly (`wasm32`) 128-bit SIMD (`v128`) backend (`WasmSimd128Backend`).
   - [`ScalarBackend`](src/math/scalar.rs): Portable 100% safe `#![no_std]` IEEE-754 reference backend.
 - **Sample-Rate Conversion & Offline Bounce:**
-  - [`src/container/zoh.rs`](src/container/zoh.rs): Continuous-Time ZOH parameter rescaling (`44.1–192 kHz`), Stage III first-tap/6-point Lagrange FIR resampling, and `4×` polyphase offline bounce ([`router_and_stages_topology.md` §9](../../docs/specs/dsp/router_and_stages_topology.md#9-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-44196-khz--4-bounce)).
+  - [`src/container/zoh.rs`](src/container/zoh.rs): Continuous-Time ZOH parameter rescaling (`44.1–192 kHz`), Stage III first-tap/6-point Lagrange FIR resampling, and `4×` polyphase offline bounce ([`router_and_stages_topology.md` §9](../../docs/specs/dsp/router_and_stages_topology.md#9-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-441192-khz--4-bounce)).
 - **Marketplace Provenance & Watermarking (`src/provenance/`):**
-  - RFC 8785 JCS header canonicalization, `Ed25519` prefix commitments (`DAU1`/`DAI1`/`DSA1`), `OemDeviceCertificate` V2, RFC 9180 HPKE recipient slots (`DNSL`/`DNPL`/`DME1`), `HMAC-SHA256` watermark seed derivation, Stage III gauge-invariant modal fingerprinting, dual-mechanism buyer watermarking, and `.dnam-prev` (`DNPR`) preview container rejection ([`provenance_and_enclave_drm.md`](../../docs/specs/security/provenance_and_enclave_drm.md), [`watermarking_and_marketplace.md`](../../docs/specs/security/watermarking_and_marketplace.md)).
+  - RFC 8785 JCS header canonicalization, `Ed25519` prefix commitments (`DAU1`/`DAI1`/`DSA1`) with fail-closed marketplace trust-anchor enforcement, `OemDeviceCertificate` V2, canonical `.dnam-seal` (`DNSL`/`DNPL`/`DME1`) RFC 9180 HPKE + `ChaCha20-Poly1305` AEAD (zero raw XOR), `HMAC-SHA256` watermark seed derivation, Stage III gauge-invariant modal fingerprinting, dual-mechanism buyer watermarking (`40`-lane `SONA` sign-flip, `Kautz` + `SO(4)` gauges, `[0.2, 0.8]` phase coding, and disjoint `7,680`-coord Tardos), and `.dnam-prev` (`container_kind: "preview"`) load/hot-swap rejection ([`provenance_and_enclave_drm.md`](../../docs/specs/security/provenance_and_enclave_drm.md), [`watermarking_and_marketplace.md`](../../docs/specs/security/watermarking_and_marketplace.md)).
 
 ---
 
@@ -47,10 +47,10 @@ In `SONA` `v3.0` (`Phases 2–3`), compile-time `const` tier dimensions (`LiteSp
 
 | Tier Profile | `REQ-6.1` `1× Cortex-A76` Ceiling (@ 80% RT Cap) | `Gate 0b` Target Core (`4`-Block `SONA` + `Stage III`) | Target `ActiveHot` Slab (`N × Slab ≤ 64 KiB` L1D) | Status |
 | :--- | :---: | :--- | :---: | :--- |
-| **`Lite`** | **`≥ 14×`** (`≤ 1,190 ns`/frame) | `[1,1,1,1]` `16` lanes / `4` `TPT-SVF` (`1×`) or `[1,1,1,0]` (`2×`), `32` FIR + `8` Kautz, `1` `Op-T` quad | **`≤ 4.5 KiB`** (`14× ≤ 63 KiB`) | `Gate 0b` lock pending (Phase 3) |
-| **`Full`** | **`≥ 8×`** (`≤ 2,083 ns`/frame) | `[2,2,1,1]` `24` lanes / `6` `TPT-SVF` (`2×`), `48` FIR + `12` Kautz, `2` `Op-T` quads | **`≤ 7.8 KiB`** (`8× ≤ 62.4 KiB`) | `Gate 0b` lock pending (Phase 3) |
-| **`Pro`** | **`≥ 4×`** (`≤ 4,166 ns`/frame) | `[3,2,2,1]` `32` lanes / `8` `TPT-SVF` (`2×`), `96` FIR + `24` Kautz, `3–4` `Op-T` quads | **`≤ 15.5 KiB`** (`4× ≤ 62 KiB`) | `Gate 0b` lock pending (Phase 3) |
-| **`Ultra`** | **`≥ 2×`** (`≤ 8,333 ns`/frame) + `4×` Bounce | `[4,3,2,1]` `40` lanes / `10–12` `TPT-SVF` (`2×` / `4×` bounce), `128` FIR + `32` Kautz, `4` `Op-T` quads | **`≤ 30.0 KiB`** (`2× ≤ 60 KiB`) | `Gate 0b` lock pending (Phase 3) |
+| **`Lite`** | **`≥ 14×`** (`≤ 1,190 ns`/frame) | `[1,1,1,1]` `16` SVF modes / `4` `TPT-SVF` quads (`1×`), `32` FIR + `8` Kautz, `1` `Op-T` tank quad (`4` lines) | **`≤ 4.5 KiB`** (`14× ≤ 63 KiB`) | `Gate 0b` lock pending (Phase 3) |
+| **`Full`** | **`≥ 8×`** (`≤ 2,083 ns`/frame) | `[2,2,1,1]` `24` SVF modes / `6` `TPT-SVF` quads (`2×`), `48` FIR + `12` Kautz, `2` `Op-T` tank quads (`8` lines) | **`≤ 7,936 B` (`7.75 KiB`)** (`8× ≤ 62.0 KiB`, `63,488 B ≤ 64 KiB`) | `Gate 0b` lock pending (Phase 3) |
+| **`Pro`** | **`≥ 4×`** (`≤ 4,166 ns`/frame) | `[3,2,2,1]` `32` SVF modes / `8` `TPT-SVF` quads (`2×`), `96` FIR + `24` Kautz, `3` `Op-T` tank quads (`12` lines) | **`≤ 15.5 KiB`** (`4× ≤ 62 KiB`) | `Gate 0b` lock pending (Phase 3) |
+| **`Ultra`** | **`≥ 2×`** (`≤ 8,333 ns`/frame) + `4×` Bounce | `[4,3,2,1]` `40` SVF modes / `10` `TPT-SVF` quads (`2×` / `4×` bounce), `128` FIR + `32` Kautz, `4` `Op-T` tank quads (`16` lines) | **`≤ 30.0 KiB`** (`2× ≤ 60 KiB`) | `Gate 0b` lock pending (Phase 3) |
 
 ---
 
@@ -58,7 +58,7 @@ In `SONA` `v3.0` (`Phases 2–3`), compile-time `const` tier dimensions (`LiteSp
 
 ```text
 packages/engine/
-├── spec_scope.toml         # Manifest mapping all 329 r[...] spec rules (212 engine-scoped)
+├── spec_scope.toml         # Manifest mapping all 322 r[...] spec rules (217 engine-scoped)
 ├── src/
 │   ├── lib.rs              # Crate root (#![no_std] + alloc) & public API re-exports
 │   ├── types.rs            # Tier (Lite/Full/Pro/Ultra), FtzDazGuard, DnamTelemetrySnapshot
