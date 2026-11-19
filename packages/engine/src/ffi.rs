@@ -156,7 +156,7 @@ pub unsafe extern "C" fn dnam_engine_get_latency_samples(handle: *const DnamEngi
     }
 }
 
-/// Rescales discrete-time parameters for a new host sample rate $f_{s,\text{host}} \in [44100, 96000]\text{ Hz}$.
+/// Rescales discrete-time parameters for a new host sample rate $f_{s,\text{host}} \in [44100, 192000]\text{ Hz}$.
 /// Returns `0` on success or `-1` on invalid sample rate.
 ///
 /// # Safety
@@ -207,7 +207,7 @@ pub unsafe extern "C" fn dnam_engine_set_control_immediate(
     }
 }
 
-/// Resets all TORA stage and operator states to their exact analytical DC resting equilibrium.
+/// Resets all SONA stage and operator states to their exact analytical DC resting equilibrium.
 ///
 /// # Safety
 /// `handle` must be a valid non-null pointer to a [`DnamEngineHandle`].
@@ -222,8 +222,13 @@ pub unsafe extern "C" fn dnam_engine_reset(handle: *mut DnamEngineHandle) {
 /// Processes a stereo audio block of `num_frames` samples with zero heap allocations.
 ///
 /// # Safety
-/// `handle` must be a valid pointer to [`DnamEngineHandle`], and `left_in`, `right_in`,
-/// `left_out`, `right_out` must each point to valid `f32` buffers of at least `num_frames` elements.
+/// - `handle` must be a valid pointer to [`DnamEngineHandle`].
+/// - `left_in`, `right_in`, `left_out`, and `right_out` must each point to valid `f32` buffers of
+///   at least `num_frames` elements.
+/// - `left_out` and `right_out` must not alias or overlap each other.
+/// - `left_in` and `right_in` must either not overlap `left_out` or `right_out` (`src` and `dst`
+///   disjoint), or use identical base pointers (`left_in == left_out`, `right_in == right_out`);
+///   partial shifted overlap is undefined behavior.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dnam_engine_process_block(
     handle: *mut DnamEngineHandle,
@@ -242,22 +247,58 @@ pub unsafe extern "C" fn dnam_engine_process_block(
     {
         return;
     }
-    // SAFETY: Caller guarantees non-null pointers valid for `num_frames` elements.
+    // SAFETY: Caller guarantees valid pointers for `num_frames` elements and disjoint outputs.
     unsafe {
         let h = &mut *handle;
-        let l_in = slice::from_raw_parts(left_in, num_frames);
-        let r_in = slice::from_raw_parts(right_in, num_frames);
-        let l_out = slice::from_raw_parts_mut(left_out, num_frames);
-        let r_out = slice::from_raw_parts_mut(right_out, num_frames);
-        h.engine.process_block(l_in, r_in, l_out, r_out);
+        let l_out_ro = left_out as *const f32;
+        let r_out_ro = right_out as *const f32;
+        if core::ptr::eq(left_in, l_out_ro) && core::ptr::eq(right_in, r_out_ro) {
+            let l_out = slice::from_raw_parts_mut(left_out, num_frames);
+            let r_out = slice::from_raw_parts_mut(right_out, num_frames);
+            h.engine.process_block_in_place(l_out, r_out);
+        } else if core::ptr::eq(left_in, l_out_ro)
+            || core::ptr::eq(left_in, r_out_ro)
+            || core::ptr::eq(right_in, l_out_ro)
+            || core::ptr::eq(right_in, r_out_ro)
+        {
+            const CHUNK: usize = 64;
+            let mut in_l_buf = [0.0_f32; CHUNK];
+            let mut in_r_buf = [0.0_f32; CHUNK];
+            let mut out_l_buf = [0.0_f32; CHUNK];
+            let mut out_r_buf = [0.0_f32; CHUNK];
+            let mut off = 0usize;
+            while off < num_frames {
+                let n = (num_frames - off).min(CHUNK);
+                core::ptr::copy_nonoverlapping(left_in.add(off), in_l_buf.as_mut_ptr(), n);
+                core::ptr::copy_nonoverlapping(right_in.add(off), in_r_buf.as_mut_ptr(), n);
+                h.engine.process_block(
+                    &in_l_buf[..n],
+                    &in_r_buf[..n],
+                    &mut out_l_buf[..n],
+                    &mut out_r_buf[..n],
+                );
+                core::ptr::copy_nonoverlapping(out_l_buf.as_ptr(), left_out.add(off), n);
+                core::ptr::copy_nonoverlapping(out_r_buf.as_ptr(), right_out.add(off), n);
+                off += n;
+            }
+        } else {
+            let l_in = slice::from_raw_parts(left_in, num_frames);
+            let r_in = slice::from_raw_parts(right_in, num_frames);
+            let l_out = slice::from_raw_parts_mut(left_out, num_frames);
+            let r_out = slice::from_raw_parts_mut(right_out, num_frames);
+            h.engine.process_block(l_in, r_in, l_out, r_out);
+        }
     }
 }
 
 /// Processes a mono audio block (`Mono -> Mono`, saving 50% of output head MACs) with zero heap allocations.
 ///
 /// # Safety
-/// `handle` must be a valid pointer to [`DnamEngineHandle`], and `mono_in`, `mono_out`
-/// must each point to valid `f32` buffers of at least `num_frames` elements.
+/// - `handle` must be a valid pointer to [`DnamEngineHandle`].
+/// - `mono_in` and `mono_out` must each point to valid `f32` buffers of at least `num_frames`
+///   elements.
+/// - `mono_in` and `mono_out` must either be disjoint (`src` and `dst` must not overlap) or have
+///   identical base pointers (`mono_in == mono_out`); partial shifted overlap is undefined behavior.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dnam_engine_process_mono(
     handle: *mut DnamEngineHandle,
@@ -268,12 +309,26 @@ pub unsafe extern "C" fn dnam_engine_process_mono(
     if handle.is_null() || mono_in.is_null() || mono_out.is_null() || num_frames == 0 {
         return;
     }
-    // SAFETY: Caller guarantees non-null pointers valid for `num_frames` elements.
+    // SAFETY: Caller guarantees valid pointers for `num_frames` elements without partial overlap.
     unsafe {
         let h = &mut *handle;
-        let m_in = slice::from_raw_parts(mono_in, num_frames);
-        let m_out = slice::from_raw_parts_mut(mono_out, num_frames);
-        h.engine.process_mono(m_in, m_out);
+        if core::ptr::eq(mono_in, mono_out as *const f32) {
+            const CHUNK: usize = 64;
+            let mut in_buf = [0.0_f32; CHUNK];
+            let mut out_buf = [0.0_f32; CHUNK];
+            let mut off = 0usize;
+            while off < num_frames {
+                let n = (num_frames - off).min(CHUNK);
+                core::ptr::copy_nonoverlapping(mono_in.add(off), in_buf.as_mut_ptr(), n);
+                h.engine.process_mono(&in_buf[..n], &mut out_buf[..n]);
+                core::ptr::copy_nonoverlapping(out_buf.as_ptr(), mono_out.add(off), n);
+                off += n;
+            }
+        } else {
+            let m_in = slice::from_raw_parts(mono_in, num_frames);
+            let m_out = slice::from_raw_parts_mut(mono_out, num_frames);
+            h.engine.process_mono(m_in, m_out);
+        }
     }
 }
 
@@ -415,12 +470,46 @@ mod tests {
             dnam_engine_process_mono(handle, l_in.as_ptr(), core::ptr::null_mut(), 16);
             dnam_engine_process_mono(handle, l_in.as_ptr(), l_out.as_mut_ptr(), 0);
 
+            // In-place stereo, crossed-channel alias, and in-place mono paths avoid aliasing UB
+            dnam_engine_process_block(
+                handle,
+                l_out.as_ptr(),
+                r_out.as_ptr(),
+                l_out.as_mut_ptr(),
+                r_out.as_mut_ptr(),
+                16,
+            );
+            dnam_engine_process_block(
+                handle,
+                l_out.as_ptr(),
+                l_out.as_ptr(),
+                l_out.as_mut_ptr(),
+                r_out.as_mut_ptr(),
+                16,
+            );
+            let mut alias_l = [0.25_f32; 80];
+            let mut alias_r = [-0.15_f32; 80];
+            dnam_engine_process_block(
+                handle,
+                alias_r.as_ptr(),
+                alias_l.as_ptr(),
+                alias_l.as_mut_ptr(),
+                alias_r.as_mut_ptr(),
+                80,
+            );
+            assert!(alias_l.iter().all(|v| v.is_finite()));
+            assert!(alias_r.iter().all(|v| v.is_finite()));
+            let mut mono_buf = [0.25_f32; 80];
+            dnam_engine_process_mono(handle, mono_buf.as_ptr(), mono_buf.as_mut_ptr(), 80);
+            assert!(mono_buf.iter().all(|v| v.is_finite()));
+
             // Valid setters on active handle
             dnam_engine_set_tier(handle, 2);
             dnam_engine_set_control_value(handle, 0, 0.7);
             dnam_engine_set_control_immediate(handle, 0, 0.7);
             dnam_engine_reset(handle);
             assert_eq!(dnam_engine_set_sample_rate(handle, 48000), 0);
+            assert_eq!(dnam_engine_set_sample_rate(handle, 192_000), 0);
             assert_eq!(dnam_engine_set_sample_rate(handle, 0), -1);
 
             // Valid container via dnam_engine_create_from_bytes + Debug formatting

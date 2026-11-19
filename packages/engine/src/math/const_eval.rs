@@ -1,21 +1,12 @@
 //! Compile-time mathematical evaluation, IEEE-754 seed derivations, and algebraic constant checks
 //! (`ref[repo.code.constant-eval-and-derivations]`).
 //!
-//! All trigonometric, filter-pole, minimax rational Padé, Hermite quadrature, and boundary bit-mask
-//! constants in `dnam-engine` derive here via pure `#![no_std]` `const fn` routines checked by
-//! compile-time assertions (`const _: () = assert!(...)`).
+//! Shared 32-bit `SONA` tier constants, IEEE-754 reciprocal/`rsqrt` seeds, and passband bounds
+//! re-export from [`dnam_kernels::simd::const_eval`]; engine-local `f64` Padé/Hermite/`tanh`
+//! derivations remain here as `#![no_std]` `const fn` routines checked via
+//! `const _: () = assert!(...)`.
 
-/// IEEE-754 `binary32` exponent bias (`127`).
-pub const IEEE754_F32_EXP_BIAS: u32 = 127;
-
-/// Chebyshev minimax `binary32` positive reciprocal seed (`2*E_bias - 1` exponent + `(2*sqrt(6) - 4)` shift),
-/// balancing the relative seed error of `(1 + f)^-1` across `f in [0, 1)` (`< 3.5e-6` after `NR2`,
-/// `docs/specs/dsp/op_n_commuted_cascade.md` §1.2).
-pub const IEEE754_F32_RCP_SEED: u32 = const_f32_rcp_chebyshev_seed();
-
-/// Robertson/Lomont minimax `binary32` global two-binade inverse-square-root seed
-/// (`docs/specs/dsp/op_n_commuted_cascade.md` §1.2).
-pub const IEEE754_F32_RSQRT_SEED: u32 = 0x5F37_59DF;
+pub use dnam_kernels::simd::const_eval::*;
 
 /// Robertson/Lomont minimax `binary64` global two-binade inverse-square-root seed
 /// (`docs/specs/dsp/op_n_commuted_cascade.md` §1.2).
@@ -53,10 +44,36 @@ pub const fn const_sqrt_f64(x: f64) -> f64 {
     y
 }
 
+const fn build_inv_sin_steps() -> [f64; 11] {
+    let mut out = [0.0_f64; 11];
+    let mut n = 1usize;
+    while n <= 10 {
+        out[n] = 1.0 / ((2 * n * (2 * n + 1)) as f64);
+        n += 1;
+    }
+    out
+}
+
+const fn build_inv_cos_steps() -> [f64; 11] {
+    let mut out = [0.0_f64; 11];
+    let mut m = 1usize;
+    while m <= 10 {
+        out[m] = 1.0 / (((2 * m - 1) * (2 * m)) as f64);
+        m += 1;
+    }
+    out
+}
+
+const INV_SIN_STEP: [f64; 11] = build_inv_sin_steps();
+const INV_COS_STEP: [f64; 11] = build_inv_cos_steps();
+
 /// Compile-time `(sin(x), cos(x))` via quadrant reduction (`[-pi/4, pi/4]`) and degree-21/20
-/// Maclaurin evaluation (`< 2e-16` error across standard ranges).
+/// Maclaurin evaluation (`< 2e-16` error across standard ranges, `0` runtime divisions).
 #[must_use]
 pub const fn const_sin_cos_f64(x: f64) -> (f64, f64) {
+    if !x.is_finite() || x > 1.0e15 || x < -1.0e15 {
+        return (0.0, 1.0);
+    }
     let k_real = x * core::f64::consts::FRAC_2_PI;
     let k = if k_real >= 0.0 {
         (k_real + 0.5) as i64
@@ -68,20 +85,18 @@ pub const fn const_sin_cos_f64(x: f64) -> (f64, f64) {
 
     let mut sin_term = r;
     let mut sin_sum = r;
-    let mut n = 1_u32;
+    let mut n = 1usize;
     while n <= 10 {
-        let denom = ((2 * n) * (2 * n + 1)) as f64;
-        sin_term = -sin_term * r2 / denom;
+        sin_term = -sin_term * r2 * INV_SIN_STEP[n];
         sin_sum += sin_term;
         n += 1;
     }
 
     let mut cos_term = 1.0_f64;
     let mut cos_sum = 1.0_f64;
-    let mut m = 1_u32;
+    let mut m = 1usize;
     while m <= 10 {
-        let denom = ((2 * m - 1) * (2 * m)) as f64;
-        cos_term = -cos_term * r2 / denom;
+        cos_term = -cos_term * r2 * INV_COS_STEP[m];
         cos_sum += cos_term;
         m += 1;
     }
@@ -149,8 +164,10 @@ pub const fn const_c1_clamped_tanh_coeffs(r: f64) -> [f64; 4] {
     [n1, n2, d1, d2]
 }
 
-/// Compile-time coefficients `(c1, c3, c5)` of the unique degree-5 odd Hermite quarter-sine
-/// matching $P(0)=0,\ P'(0)=\pi/2,\ P(1)=1,\ P'(1)=0,\ P''(1)=0$.
+/// Compile-time coefficients `(c1, c3, c5)` of the degree-5 odd Hermite quarter-sine
+/// $P(x) = c_1 x - c_3 x^3 + c_5 x^5$ matching
+/// $P(0)=0,\ P'(0)=\pi/2,\ P''(0)=0,\ P^{(4)}(0)=0,\ P(1)=1,\ P'(1)=0$
+/// (note $P''(1) = 4\pi - 15 \ne 0$).
 #[must_use]
 pub const fn const_hermite5_quarter_sine_coeffs() -> (f32, f32, f32) {
     (
@@ -172,20 +189,14 @@ pub const fn const_max_f32_bits_le(bound: f64) -> u32 {
     }
 }
 
-/// Compile-time Chebyshev minimax `binary32` positive reciprocal integer-sub seed
-/// `((2*E_bias - 1) << 23) + round((2*sqrt(6) - 4) * 2^23) == 0x7EF3_11C3`.
-#[must_use]
-pub const fn const_f32_rcp_chebyshev_seed() -> u32 {
-    let shift = 2.0 * const_sqrt_f64(6.0) - 4.0;
-    let mant_round = (shift * ((1_u64 << 23) as f64) + 0.5) as u32;
-    ((2 * IEEE754_F32_EXP_BIAS - 1) << 23) + mant_round
-}
-
 const TANH_R4: [f64; 4] = const_c1_clamped_tanh_coeffs(4.0);
 const _: () = assert!(IEEE754_F32_RCP_SEED == 0x7EF3_11C3);
+const _: () = assert!(const_f32_rcp_chebyshev_seed() == IEEE754_F32_RCP_SEED);
 const _: () = assert!(STAGE4_DC_BLOCKER_48K_F32.to_bits() == 0x3F7F_D51F);
+const _: () = assert!(STAGE4_DC_BLOCKER_48K_F32.to_bits() == DC_BLOCKER_5HZ_48K_F32.to_bits());
 const _: () = assert!(STAGE4_MAX_V_CEIL_BITS_DERIVED == 0x3F7C_28F5);
 const _: () = assert!(STAGE4_MAX_G_LIN_BITS_DERIVED == 0x3F7F_BE76);
+const _: () = assert!(STAGE4_MAX_G_LIN_BITS_DERIVED == MAX_LOOP_GAIN_F32.to_bits());
 const _: () = assert!(const_abs_f64(TANH_R4[0] - 61.0 / 600.0) < 1.0e-15);
 const _: () = assert!(const_abs_f64(TANH_R4[1] - 11.0 / 19_200.0) < 1.0e-15);
 const _: () = assert!(const_abs_f64(TANH_R4[2] - 87.0 / 200.0) < 1.0e-15);

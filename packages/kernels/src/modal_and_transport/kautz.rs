@@ -10,7 +10,9 @@ pub mod rotor_and_phasor;
 
 pub use rotor_and_phasor::{PhasorQ32Bank4, algebraic_unit_rotor_f32};
 
-use crate::simd::{KernelVec4, MAX_PARALRU_R_F32, StereoVec8, flush_subnormal_f32_bits};
+use crate::simd::{
+    KernelVec4, MAX_PARALRU_R_F32, StereoVec8, flush_subnormal_f32_bits, scrub_and_flush_f32_bits,
+};
 
 /// Minimum contracted pole radius allowed during rapid Stage III formant sweeps
 /// (`ref[dsp.op-m.stage3.sweep-contraction]`).
@@ -127,32 +129,36 @@ pub fn step_kautz_quad_vec4<V: KernelVec4>(
     x_l: f32,
     x_r: f32,
 ) -> (f32, f32) {
-    let xl = V::splat(x_l);
-    let xr = V::splat(x_r);
+    let xl = V::splat(scrub_and_flush_f32_bits(x_l));
+    let xr = V::splat(scrub_and_flush_f32_bits(x_r));
+    let z_re_l = state.z_re_l.flush_recursive_state();
+    let z_im_l = state.z_im_l.flush_recursive_state();
+    let z_re_r = state.z_re_r.flush_recursive_state();
+    let z_im_r = state.z_im_r.flush_recursive_state();
 
     let next_re_l = state
         .b_re
         .mul(xl)
-        .fma(state.alpha_re, state.z_re_l)
-        .fms(state.alpha_im, state.z_im_l)
-        .flush_subnormal();
+        .fma(state.alpha_re, z_re_l)
+        .fms(state.alpha_im, z_im_l)
+        .flush_recursive_state();
     let next_im_l = state
         .alpha_re
-        .mul(state.z_im_l)
-        .fma(state.alpha_im, state.z_re_l)
-        .flush_subnormal();
+        .mul(z_im_l)
+        .fma(state.alpha_im, z_re_l)
+        .flush_recursive_state();
 
     let next_re_r = state
         .b_re
         .mul(xr)
-        .fma(state.alpha_re, state.z_re_r)
-        .fms(state.alpha_im, state.z_im_r)
-        .flush_subnormal();
+        .fma(state.alpha_re, z_re_r)
+        .fms(state.alpha_im, z_im_r)
+        .flush_recursive_state();
     let next_im_r = state
         .alpha_re
-        .mul(state.z_im_r)
-        .fma(state.alpha_im, state.z_re_r)
-        .flush_subnormal();
+        .mul(z_im_r)
+        .fma(state.alpha_im, z_re_r)
+        .flush_recursive_state();
 
     state.z_re_l = next_re_l;
     state.z_im_l = next_im_l;
@@ -163,8 +169,8 @@ pub fn step_kautz_quad_vec4<V: KernelVec4>(
     let modal_r = state.c_re_r.mul(next_re_r).fms(state.c_im_r, next_im_r);
     let (sum_l, sum_r) = modal_l.horizontal_sum_pair(modal_r);
     (
-        flush_subnormal_f32_bits(2.0 * sum_l),
-        flush_subnormal_f32_bits(2.0 * sum_r),
+        scrub_and_flush_f32_bits(2.0 * sum_l),
+        scrub_and_flush_f32_bits(2.0 * sum_r),
     )
 }
 
@@ -177,29 +183,32 @@ pub fn step_kautz_quad_stereo8<S: StereoVec8>(
     x_l: f32,
     x_r: f32,
 ) -> (f32, f32) {
-    let z_re = S::from_lr(state.z_re_l, state.z_re_r);
-    let z_im = S::from_lr(state.z_im_l, state.z_im_r);
+    let z_re = S::from_lr(state.z_re_l, state.z_re_r).flush_recursive_state();
+    let z_im = S::from_lr(state.z_im_l, state.z_im_r).flush_recursive_state();
     let alpha_re = S::broadcast_half(state.alpha_re);
     let alpha_im = S::broadcast_half(state.alpha_im);
     let b_re = S::broadcast_half(state.b_re);
     let c_re = S::from_lr(state.c_re_l, state.c_re_r);
     let c_im = S::from_lr(state.c_im_l, state.c_im_r);
-    let x = S::splat_lr(x_l, x_r);
+    let x = S::splat_lr(scrub_and_flush_f32_bits(x_l), scrub_and_flush_f32_bits(x_r));
 
     let next_re = b_re
         .mul(x)
         .fma(alpha_re, z_re)
         .fms(alpha_im, z_im)
-        .flush_subnormal();
-    let next_im = alpha_re.mul(z_im).fma(alpha_im, z_re).flush_subnormal();
+        .flush_recursive_state();
+    let next_im = alpha_re
+        .mul(z_im)
+        .fma(alpha_im, z_re)
+        .flush_recursive_state();
     (state.z_re_l, state.z_re_r) = next_re.into_lr();
     (state.z_im_l, state.z_im_r) = next_im.into_lr();
 
     let modal = c_re.mul(next_re).fms(c_im, next_im);
     let (sum_l, sum_r) = modal.horizontal_sum_lr();
     (
-        flush_subnormal_f32_bits(2.0 * sum_l),
-        flush_subnormal_f32_bits(2.0 * sum_r),
+        scrub_and_flush_f32_bits(2.0 * sum_l),
+        scrub_and_flush_f32_bits(2.0 * sum_r),
     )
 }
 
@@ -366,6 +375,108 @@ mod tests {
         );
         assert!((tree.b_re - scan.b_re).abs() < 1.0e-5);
         assert!((tree.b_im - scan.b_im).abs() < 1.0e-5);
+    }
+
+    #[test]
+    fn test_kautz_quad_scrubs_nonfinite_inputs_and_poisoned_state() {
+        let base_state = || {
+            KautzQuadState::new(
+                GpuVec4::from_array([0.92, 0.85, 0.70, 0.40]),
+                GpuVec4::from_array([0.12, 0.25, 0.45, 0.65]),
+                GpuVec4::from_array([0.1, 0.15, 0.2, 0.25]),
+                GpuVec4::from_array([0.5, -0.3, 0.2, 0.1]),
+                GpuVec4::from_array([0.1, 0.2, -0.15, 0.05]),
+                GpuVec4::from_array([0.4, 0.25, -0.1, 0.3]),
+                GpuVec4::from_array([-0.2, 0.1, 0.05, -0.15]),
+            )
+        };
+        let poison_all = |st: &mut KautzQuadState<GpuVec4>| {
+            st.z_re_l = GpuVec4::from_array([f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::NAN]);
+            st.z_im_l =
+                GpuVec4::from_array([f32::INFINITY, f32::NEG_INFINITY, f32::NAN, f32::INFINITY]);
+            st.z_re_r = GpuVec4::from_array([
+                f32::NEG_INFINITY,
+                f32::NAN,
+                f32::INFINITY,
+                f32::NEG_INFINITY,
+            ]);
+            st.z_im_r = GpuVec4::from_array([f32::NAN, f32::INFINITY, f32::NEG_INFINITY, f32::NAN]);
+        };
+        let assert_state_finite = |st: &KautzQuadState<GpuVec4>| {
+            for arr in [
+                st.z_re_l.to_array(),
+                st.z_im_l.to_array(),
+                st.z_re_r.to_array(),
+                st.z_im_r.to_array(),
+            ] {
+                assert!(arr.iter().all(|v| v.is_finite()));
+            }
+        };
+
+        for (bad_l, bad_r) in [
+            (f32::NAN, f32::INFINITY),
+            (f32::INFINITY, f32::NEG_INFINITY),
+            (f32::NEG_INFINITY, f32::NAN),
+        ] {
+            // Fully poisoned state + non-finite inputs scrub to exact +0.0 on poisoned & zero follow-up.
+            let mut kv_zero = base_state();
+            poison_all(&mut kv_zero);
+            let mut ks_zero = kv_zero;
+            let ov0 = step_kautz_quad_vec4(&mut kv_zero, bad_l, bad_r);
+            let os0 =
+                step_kautz_quad_stereo8::<InterleavedStereo8<GpuVec4>>(&mut ks_zero, bad_l, bad_r);
+            assert_eq!(ov0.0.to_bits(), 0);
+            assert_eq!(ov0.1.to_bits(), 0);
+            assert_eq!(os0.0.to_bits(), 0);
+            assert_eq!(os0.1.to_bits(), 0);
+            assert_eq!(kv_zero, ks_zero);
+
+            let ov1 = step_kautz_quad_vec4(&mut kv_zero, 0.0, 0.0);
+            let os1 =
+                step_kautz_quad_stereo8::<InterleavedStereo8<GpuVec4>>(&mut ks_zero, 0.0, 0.0);
+            assert_eq!(ov1.0.to_bits(), 0);
+            assert_eq!(ov1.1.to_bits(), 0);
+            assert_eq!(os1.0.to_bits(), 0);
+            assert_eq!(os1.1.to_bits(), 0);
+
+            // Partially poisoned state + non-finite inputs scrub cleanly and recover on finite input.
+            let mut kv = base_state();
+            kv.z_re_l = GpuVec4::from_array([f32::NAN, 0.25, f32::INFINITY, f32::NEG_INFINITY]);
+            kv.z_im_l = GpuVec4::from_array([f32::INFINITY, -0.1, f32::NAN, f32::NEG_INFINITY]);
+            kv.z_re_r = GpuVec4::from_array([f32::NEG_INFINITY, f32::NAN, 0.2, f32::INFINITY]);
+            kv.z_im_r = GpuVec4::from_array([0.05, f32::INFINITY, f32::NAN, f32::NEG_INFINITY]);
+            let mut ks = kv;
+
+            let out_v = step_kautz_quad_vec4(&mut kv, bad_l, bad_r);
+            let out_s =
+                step_kautz_quad_stereo8::<InterleavedStereo8<GpuVec4>>(&mut ks, bad_l, bad_r);
+            assert!(out_v.0.is_finite() && out_v.1.is_finite());
+            assert_eq!(out_v.0.to_bits(), out_s.0.to_bits());
+            assert_eq!(out_v.1.to_bits(), out_s.1.to_bits());
+            assert_state_finite(&kv);
+            assert_eq!(kv, ks);
+
+            let rec_v = step_kautz_quad_vec4(&mut kv, 0.5, -0.5);
+            let rec_s = step_kautz_quad_stereo8::<InterleavedStereo8<GpuVec4>>(&mut ks, 0.5, -0.5);
+            assert!(rec_v.0.is_finite() && rec_v.1.is_finite());
+            assert!(rec_v.0.abs() > 0.0 && rec_v.1.abs() > 0.0);
+            assert_eq!(rec_v.0.to_bits(), rec_s.0.to_bits());
+            assert_eq!(rec_v.1.to_bits(), rec_s.1.to_bits());
+            assert_state_finite(&kv);
+            assert_eq!(kv, ks);
+        }
+
+        // Poisoned state with first finite sample (0.0, 0.0) scrubs directly to exact +0.0.
+        let mut kv_fin = base_state();
+        poison_all(&mut kv_fin);
+        let mut ks_fin = kv_fin;
+        let out_fv = step_kautz_quad_vec4(&mut kv_fin, 0.0, 0.0);
+        let out_fs = step_kautz_quad_stereo8::<InterleavedStereo8<GpuVec4>>(&mut ks_fin, 0.0, 0.0);
+        assert_eq!(out_fv.0.to_bits(), 0);
+        assert_eq!(out_fv.1.to_bits(), 0);
+        assert_eq!(out_fs.0.to_bits(), 0);
+        assert_eq!(out_fs.1.to_bits(), 0);
+        assert_eq!(kv_fin, ks_fin);
     }
 
     proptest! {

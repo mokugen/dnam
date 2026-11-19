@@ -16,13 +16,14 @@ use dnam_engine::ffi::{
     dnam_engine_set_sample_rate, dnam_engine_set_tier,
 };
 use dnam_engine::schema::DnamJsonHeader;
+use dnam_engine::stages::sona_core::SonaMatryoshkaModel;
+use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 
 fn main() {
     let mut header = DnamJsonHeader::default_reference();
     let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    for (i, b) in arena[128..36_000].iter_mut().enumerate() {
-        *b = ((i * 5 + 1) & 0x3F) as u8;
-    }
+    let model = SonaMatryoshkaModel::dual_rate_default(false);
+    pack_sona_matryoshka_to_arena(&model, &mut arena);
     let container_bytes = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
 
     // SAFETY: All pointers passed to the C-ABI functions below are valid, non-null stack/vec

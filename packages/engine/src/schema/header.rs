@@ -7,11 +7,16 @@ use alloc::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-use crate::control::{ConditionalClampRule, ControlClampDescriptor};
+pub use crate::container::wire::DelayHistoryEntry;
 
 use super::controls::{ControlKind, ControlSchemaDef, PresetDef};
 use super::error::DnamError;
 use super::signatures::{DatasetProvenance, DistributionPolicy, ModelSignatures};
+
+mod clamp_compiler;
+mod unknown_keys;
+
+pub use unknown_keys::check_no_unknown_header_keys;
 
 pub use super::io_and_tiers::{
     BlendMode, IoConfig, LevelingConfig, LevelingMetric, ModelCapabilities, SlimmableTiersConfig,
@@ -20,12 +25,10 @@ pub use super::io_and_tiers::{
 };
 pub use super::json_wire::TensorSliceEntry;
 pub use super::stages::{
-    ControlBusConfig, RouterConfig, Stage1PreFxConfig, Stage2CascadeConfig,
-    Stage3CabinetKautzConfig, Stage4SpatialTankConfig, default_ac_pole, default_adaa_mode,
-    default_allpass_delays, default_cascade_stages, default_dc_pole, default_delay_storage,
-    default_envelopes, default_fir_taps, default_fm_rank, default_gate_threshold_db,
-    default_interp, default_kautz_modals, default_lfo_harmonics, default_lfos,
-    default_loop_ceiling, default_modulation_bus_dim, default_router_ports,
+    ControlBusConfig, RouterConfig, Stage3CabinetKautzConfig, Stage4SpatialTankConfig,
+    default_allpass_delays, default_dc_pole, default_delay_storage, default_envelopes,
+    default_fir_taps, default_fm_rank, default_interp, default_kautz_modals, default_lfo_harmonics,
+    default_lfos, default_loop_ceiling, default_modulation_bus_dim, default_router_ports,
     default_sub_crossover_hz, default_switch_xfade, default_trust_radius, default_tzf_tap,
     deserialize_allpass_delays,
 };
@@ -42,15 +45,11 @@ pub struct SchemaVersion {
 }
 
 impl SchemaVersion {
-    /// Canonical `2.0.0` schema release (`ref[container.dnam.formats]`).
-    pub const V2_0_0: Self = Self::new(2, 0, 0);
+    /// Canonical `3.0.0` (`"sona"`) schema release (`ref[container.dnam.formats]`).
+    pub const V3_0_0: Self = Self::new(3, 0, 0);
 
     /// Current container schema version supported by this engine build.
-    pub const CURRENT: Self = Self::new(
-        crate::container::CONTAINER_VERSION_MAJOR,
-        crate::container::CONTAINER_VERSION_MINOR,
-        0,
-    );
+    pub const CURRENT: Self = Self::V3_0_0;
 
     /// Constructs a new [`SchemaVersion`].
     #[inline]
@@ -110,10 +109,9 @@ impl SchemaVersion {
 
     /// Returns `true` if this schema version is supported by the current engine build.
     #[inline]
-    #[allow(clippy::absurd_extreme_comparisons)]
     pub const fn is_supported(&self) -> bool {
         self.major == crate::container::CONTAINER_VERSION_MAJOR
-            && self.minor <= crate::container::CONTAINER_VERSION_MINOR
+            && self.minor == crate::container::CONTAINER_VERSION_MINOR
     }
 
     /// Fails with [`DnamError::UnsupportedVersion`] if this schema version is not supported.
@@ -148,8 +146,13 @@ impl SchemaVersion {
     }
 }
 
+const _: () = assert!(
+    SchemaVersion::CURRENT.major == crate::container::CONTAINER_VERSION_MAJOR
+        && SchemaVersion::CURRENT.minor == crate::container::CONTAINER_VERSION_MINOR
+);
+
 fn default_version() -> String {
-    SchemaVersion::V2_0_0.as_semver_string()
+    SchemaVersion::V3_0_0.as_semver_string()
 }
 
 fn default_container_kind() -> String {
@@ -157,23 +160,23 @@ fn default_container_kind() -> String {
 }
 
 fn default_architecture() -> String {
-    "DNAM_TORA".to_string()
+    "sona".to_string()
 }
 
 const fn default_sample_rate() -> u32 {
     48_000
 }
 
-/// Top-level UTF-8 JSON header in Region 3 of a canonical `v2.0` `.dnam` container.
+/// Top-level UTF-8 JSON header in Region 3 of a canonical `v3.0` `.dnam` container.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct DnamJsonHeader {
-    /// Semantic version of the container schema (`"2.0.0"`).
+    /// Semantic version of the container schema (`"3.0.0"`).
     #[serde(default = "default_version")]
     pub version: String,
     /// Container kind: `"dnam"` or `"preview"`.
     #[serde(default = "default_container_kind")]
     pub container_kind: String,
-    /// Target engine architecture tag (`"DNAM_TORA"`).
+    /// Target engine architecture tag (`"sona"`).
     #[serde(default = "default_architecture")]
     pub architecture: String,
     /// Sampling rate at which the neural model was trained (`48000`).
@@ -184,6 +187,9 @@ pub struct DnamJsonHeader {
     /// Open dictionary for arbitrary application/user-defined metadata.
     #[serde(default)]
     pub user_metadata: BTreeMap<String, serde_json::Value>,
+    /// Open per-stem mutable dictionary merged from `DMU1`/`DME1` (`stem_user_metadata`, stripped from JCS digest).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stem_user_metadata: BTreeMap<String, serde_json::Value>,
     /// Audio I/O topology, PDC latency, estimated tail time, capabilities, and auto-unity leveling.
     pub io_config: IoConfig,
     /// Slimmable tier profiles (`lite`, `full`, `pro`, `ultra`).
@@ -200,12 +206,6 @@ pub struct DnamJsonHeader {
     /// Stage 0 8-Port Matrix Router configuration.
     #[serde(default)]
     pub stage0_router: RouterConfig,
-    /// Stage I Pre-Dynamics and Tone Shaping configuration.
-    #[serde(default)]
-    pub stage1_pre: Stage1PreFxConfig,
-    /// Stage II Commuted Cascade configuration.
-    #[serde(default)]
-    pub stage2_cascade: Stage2CascadeConfig,
     /// Stage III Cabinet Early FIR + Orthonormal Kautz Modal Bank configuration.
     #[serde(default)]
     pub stage3_cabinet: Stage3CabinetKautzConfig,
@@ -214,20 +214,10 @@ pub struct DnamJsonHeader {
     pub stage4_tank: Stage4SpatialTankConfig,
     /// Optional delay-history capacity declarations for non-RT BBD/FDN buffer pre-allocation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub delay_histories: Vec<DelayHistoryDecl>,
+    pub delay_histories: Vec<DelayHistoryEntry>,
     /// Tensor directory mapping symbolic tensor names to byte slices in `Arena 0..3`.
     #[serde(default)]
     pub tensor_directory: BTreeMap<String, TensorSliceEntry>,
-}
-
-/// Optional delay-history capacity declaration stored in the v2 JSON header.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct DelayHistoryDecl {
-    /// Delay family identifier (`"bbd"` or `"fdn"`).
-    pub kind: String,
-    /// Maximum capacity in 48 kHz base samples.
-    #[serde(default)]
-    pub max_samples_48k: u32,
 }
 
 /// Essential model identity, calibration, dataset provenance, and cryptographic signatures.
@@ -264,9 +254,9 @@ impl DnamJsonHeader {
     /// Constructs a canonical reference [`DnamJsonHeader`] (used by tests and container builders).
     pub fn default_reference() -> Self {
         Self {
-            version: "2.0.0".to_string(),
+            version: SchemaVersion::V3_0_0.as_semver_string(),
             container_kind: "dnam".to_string(),
-            architecture: "DNAM_TORA".to_string(),
+            architecture: default_architecture(),
             sample_rate_train_hz: 48_000,
             metadata: ModelMetadata {
                 name: "Reference DNAM Model".to_string(),
@@ -280,58 +270,59 @@ impl DnamJsonHeader {
                 signatures: None,
             },
             user_metadata: BTreeMap::new(),
+            stem_user_metadata: BTreeMap::new(),
             io_config: IoConfig::default(),
             slimmable_tiers: SlimmableTiersConfig {
                 lite: TierProfile {
                     feature_bus_dim: 64,
-                    channels: 4,
-                    early_fir_taps: 16,
-                    kautz_modes: 4,
+                    channels: 16,
+                    early_fir_taps: 32,
+                    kautz_modes: 8,
                     tank_lines: 4,
                     head_svd_rank: 4,
                     loudness_lufs: -20.5,
                     output_trim_db: 0.0,
                     validation_esr_db: -40.0,
-                    arena_end_byte_offset: 4_608,
+                    arena_end_byte_offset: crate::container::ARENA_OFFSET_LITE_END,
                     prefix_crc32c: 0,
                 },
                 full: TierProfile {
                     feature_bus_dim: 128,
-                    channels: 8,
-                    early_fir_taps: 32,
-                    kautz_modes: 8,
+                    channels: 24,
+                    early_fir_taps: 48,
+                    kautz_modes: 12,
                     tank_lines: 8,
                     head_svd_rank: 4,
                     loudness_lufs: -20.5,
                     output_trim_db: 0.0,
                     validation_esr_db: -45.0,
-                    arena_end_byte_offset: 10_240,
+                    arena_end_byte_offset: crate::container::ARENA_OFFSET_FULL_END,
                     prefix_crc32c: 0,
                 },
                 pro: TierProfile {
                     feature_bus_dim: 192,
-                    channels: 12,
-                    early_fir_taps: 48,
-                    kautz_modes: 16,
-                    tank_lines: 8,
+                    channels: 32,
+                    early_fir_taps: 96,
+                    kautz_modes: 24,
+                    tank_lines: 12,
                     head_svd_rank: 4,
                     loudness_lufs: -20.5,
                     output_trim_db: 0.0,
                     validation_esr_db: -48.0,
-                    arena_end_byte_offset: 18_432,
+                    arena_end_byte_offset: crate::container::ARENA_OFFSET_PRO_END,
                     prefix_crc32c: 0,
                 },
                 ultra: TierProfile {
                     feature_bus_dim: 256,
-                    channels: 16,
-                    early_fir_taps: 64,
+                    channels: 40,
+                    early_fir_taps: 128,
                     kautz_modes: 32,
                     tank_lines: 16,
                     head_svd_rank: 8,
                     loudness_lufs: -20.5,
                     output_trim_db: 0.0,
                     validation_esr_db: -52.0,
-                    arena_end_byte_offset: 28_672,
+                    arena_end_byte_offset: crate::container::ARENA_OFFSET_ULTRA_END,
                     prefix_crc32c: 0,
                 },
             },
@@ -339,8 +330,6 @@ impl DnamJsonHeader {
             presets: Vec::new(),
             control_bus: ControlBusConfig::default(),
             stage0_router: RouterConfig::default(),
-            stage1_pre: Stage1PreFxConfig::default(),
-            stage2_cascade: Stage2CascadeConfig::default(),
             stage3_cabinet: Stage3CabinetKautzConfig::default(),
             stage4_tank: Stage4SpatialTankConfig::default(),
             delay_histories: Vec::new(),
@@ -366,13 +355,19 @@ impl DnamJsonHeader {
 
     /// Validates all structural, alignment, and safety invariants of the JSON header.
     pub fn validate(&self) -> Result<(), DnamError> {
-        let _ = self.schema_version()?;
+        let ver = self.schema_version()?;
+        if self.architecture != "sona" {
+            return Err(DnamError::UnsupportedVersion {
+                major: ver.major,
+                minor: ver.minor,
+            });
+        }
         if self.container_kind != "dnam" && self.container_kind != "preview" {
             return Err(DnamError::SchemaValidationError(
                 "container_kind must be 'dnam' or 'preview'".to_string(),
             ));
         }
-        if self.sample_rate_train_hz < 44_100 || self.sample_rate_train_hz > 96_000 {
+        if self.sample_rate_train_hz != 48_000 {
             return Err(DnamError::InvalidSampleRate(self.sample_rate_train_hz));
         }
         if self.controls_schema.len() > u8::MAX as usize {
@@ -380,7 +375,23 @@ impl DnamJsonHeader {
                 "controls_schema exceeds u8::MAX (255) controls in binary preamble".to_string(),
             ));
         }
+        let mut seen_delay_ids = alloc::collections::BTreeSet::new();
+        for decl in &self.delay_histories {
+            let _ = decl.validate_standalone(&mut seen_delay_ids)?;
+        }
+        let tier_ends = [
+            self.slimmable_tiers.lite.arena_end_byte_offset,
+            self.slimmable_tiers.full.arena_end_byte_offset,
+            self.slimmable_tiers.pro.arena_end_byte_offset,
+            self.slimmable_tiers.ultra.arena_end_byte_offset,
+        ];
         for entry in self.tensor_directory.values() {
+            if entry.arena > 3 {
+                return Err(DnamError::SchemaValidationError(alloc::format!(
+                    "tensor_directory arena {} exceeds maximum tier 3",
+                    entry.arena
+                )));
+            }
             if (entry.byte_offset & 0x3F) != 0 {
                 return Err(DnamError::UnalignedOffset {
                     field: "tensor_directory.byte_offset",
@@ -393,156 +404,36 @@ impl DnamJsonHeader {
                     offset: entry.byte_length,
                 });
             }
+            let end = entry
+                .byte_offset
+                .checked_add(entry.byte_length)
+                .ok_or_else(|| {
+                    DnamError::SchemaValidationError(
+                        "tensor_directory byte_offset + byte_length overflows u32".to_string(),
+                    )
+                })?;
+            let tier_limit = tier_ends[entry.arena as usize];
+            if end > tier_limit {
+                return Err(DnamError::SchemaValidationError(alloc::format!(
+                    "tensor_directory slice [{}..{}) exceeds arena {} end bound {}",
+                    entry.byte_offset,
+                    end,
+                    entry.arena,
+                    tier_limit
+                )));
+            }
         }
         let _ = self.compile_clamp_descriptors()?;
         Ok(())
     }
 
     /// Compiles `controls_schema` ($P \in [0, 255]$) into a vector of 64-byte binary
-    /// [`ControlClampDescriptor`] records (`CL 0` of each 128-byte `ControlChannelRecord[p]`)
+    /// [`crate::control::ControlClampDescriptor`] records (`CL 0` of each 128-byte `ControlChannelRecord[p]`)
     /// used at $3\text{ kHz}$ with zero string parsing and zero `FDIV`.
-    pub fn compile_clamp_descriptors(&self) -> Result<Vec<ControlClampDescriptor>, DnamError> {
-        if self.controls_schema.len() > u8::MAX as usize {
-            return Err(DnamError::SchemaValidationError(
-                "controls_schema exceeds u8::MAX (255) controls in binary preamble".to_string(),
-            ));
-        }
-        let mut table = alloc::vec![ControlClampDescriptor::empty(); self.controls_schema.len()];
-
-        for (p, ctrl) in self.controls_schema.iter().enumerate() {
-            match ctrl.kind {
-                ControlKind::Range => {
-                    let decl = ctrl.declared_range.ok_or_else(|| {
-                        DnamError::SchemaValidationError(
-                            "range control missing declared_range".to_string(),
-                        )
-                    })?;
-                    let safe = ctrl.safe_clamped_range.unwrap_or(decl);
-                    let span = decl[1] - decl[0];
-                    if span <= 1e-6 {
-                        return Err(DnamError::SchemaValidationError(
-                            "range control declared_range span must be > 0".to_string(),
-                        ));
-                    }
-                    let scale_norm = 2.0 / span;
-                    let offset_norm = -1.0 - decl[0] * scale_norm;
-                    let default_val = ctrl.default.as_f64().ok_or_else(|| {
-                        DnamError::SchemaValidationError(
-                            "range control default must be numeric".to_string(),
-                        )
-                    })? as f32;
-                    let degree = ctrl.lobatto_degree.unwrap_or(2).min(3);
-                    let mut anchors = [0.0_f32; 3];
-                    if let Some(ref nodes) = ctrl.anchor_nodes_norm {
-                        for (i, &val) in nodes.iter().take(3).enumerate() {
-                            anchors[i] = val.clamp(-1.0, 1.0);
-                        }
-                    } else {
-                        anchors[0] = (default_val * scale_norm + offset_norm).clamp(-1.0, 1.0);
-                        anchors[1] = -1.0;
-                        anchors[2] = 1.0;
-                    }
-
-                    let mut cond_rules = [ConditionalClampRule::empty(); 3];
-                    let mut rule_idx = 0;
-
-                    for (cond_key, &max_val) in &ctrl.conditional_max {
-                        if rule_idx < 3
-                            && let Some((sw_idx, opt_idx)) = self.resolve_switch_condition(cond_key)
-                        {
-                            cond_rules[rule_idx] = ConditionalClampRule {
-                                switch_ctrl_idx: sw_idx,
-                                switch_opt_idx: opt_idx,
-                                rule_op: 1,
-                                bound_val: max_val,
-                            };
-                            rule_idx += 1;
-                        }
-                    }
-                    for (cond_key, &min_val) in &ctrl.conditional_min {
-                        if rule_idx < 3
-                            && let Some((sw_idx, opt_idx)) = self.resolve_switch_condition(cond_key)
-                        {
-                            cond_rules[rule_idx] = ConditionalClampRule {
-                                switch_ctrl_idx: sw_idx,
-                                switch_opt_idx: opt_idx,
-                                rule_op: 2,
-                                bound_val: min_val,
-                            };
-                            rule_idx += 1;
-                        }
-                    }
-
-                    table[p] = ControlClampDescriptor {
-                        ctrl_kind: 0,
-                        lobatto_degree: degree,
-                        active_options_mask: 0x0001,
-                        default_val: default_val.clamp(safe[0], safe[1]),
-                        safe_min_base: safe[0].max(decl[0]),
-                        safe_max_base: safe[1].min(decl[1]),
-                        scale_norm,
-                        offset_norm,
-                        anchor_nodes_norm: anchors,
-                        _reserved: 0,
-                        cond_rules,
-                    };
-                }
-                ControlKind::Switch => {
-                    let decl_opts = ctrl.declared_options.as_ref().ok_or_else(|| {
-                        DnamError::SchemaValidationError(
-                            "switch control missing declared_options".to_string(),
-                        )
-                    })?;
-                    if decl_opts.is_empty() || decl_opts.len() > 16 {
-                        return Err(DnamError::SchemaValidationError(
-                            "switch control must have 1..=16 declared_options".to_string(),
-                        ));
-                    }
-                    let active_opts = ctrl.active_options.as_ref().unwrap_or(decl_opts);
-                    let mut mask: u16 = 0;
-                    for (idx, opt_id) in decl_opts.iter().enumerate() {
-                        if active_opts.iter().any(|a| a == opt_id) {
-                            mask |= 1_u16 << idx;
-                        }
-                    }
-                    if mask == 0 {
-                        mask = 1;
-                    }
-                    let default_str = ctrl.default.as_str().unwrap_or(decl_opts[0].as_str());
-                    let default_idx = decl_opts.iter().position(|o| o == default_str).unwrap_or(0);
-
-                    table[p] = ControlClampDescriptor {
-                        ctrl_kind: 1,
-                        lobatto_degree: (decl_opts.len() as u8).saturating_sub(1),
-                        active_options_mask: mask,
-                        default_val: default_idx as f32,
-                        safe_min_base: 0.0,
-                        safe_max_base: (decl_opts.len() - 1) as f32,
-                        scale_norm: 1.0,
-                        offset_norm: 0.0,
-                        anchor_nodes_norm: [0.0; 3],
-                        _reserved: 0,
-                        cond_rules: [ConditionalClampRule::empty(); 3],
-                    };
-                }
-            }
-        }
-
-        Ok(table)
-    }
-
-    fn resolve_switch_condition(&self, cond_key: &str) -> Option<(u16, u8)> {
-        let (sw_id, opt_id) = cond_key.split_once('=')?;
-        for (idx, ctrl) in self.controls_schema.iter().enumerate() {
-            if ctrl.id == sw_id
-                && ctrl.kind == ControlKind::Switch
-                && let Some(ref opts) = ctrl.declared_options
-                && let Some(opt_idx) = opts.iter().position(|o| o == opt_id)
-            {
-                return Some((idx as u16, opt_idx as u8));
-            }
-        }
-        None
+    pub fn compile_clamp_descriptors(
+        &self,
+    ) -> Result<Vec<crate::control::ControlClampDescriptor>, DnamError> {
+        clamp_compiler::compile_controls_schema_descriptors(&self.controls_schema)
     }
 
     /// Deserializes a [`DnamJsonHeader`] from UTF-8 JSON bytes in a single non-generic compilation unit.
@@ -612,84 +503,6 @@ impl DnamJsonHeader {
     }
 }
 
-const USER_DICT_KEYS: &[&str] = &[
-    "user_metadata",
-    "controls",
-    "controls_meta",
-    "conditional_min",
-    "conditional_max",
-    "conditional_physical_anchors",
-    "scale_labels",
-    "option_labels",
-];
-
-fn is_skipped_optional_field(
-    parent_key: Option<&str>,
-    key: &str,
-    v_in: &serde_json::Value,
-) -> bool {
-    match (parent_key, key) {
-        (None, "stems_registry" | "audit_report")
-        | (Some("metadata"), "distribution_policy")
-        | (Some("signatures"), "tier_arena_sha256")
-        | (Some("marketplace_receipt"), "buyer_tier_arena_sha256")
-        | (Some("controls_schema"), "calibration")
-        | (Some("calibration"), "lobatto_physical_anchors" | "tempo_sync_default_subdivision")
-        | (Some("stems_registry"), "extracted_physics")
-        | (
-            Some("tensor_directory_entry" | "g_audio_uplo_u_f64" | "c_audio_tier_f64"),
-            "packing" | "feature_dim" | "packed_len" | "shape",
-        ) => v_in.is_null(),
-        (Some("calibration"), "conditional_physical_anchors") => {
-            v_in.as_object().is_some_and(serde_json::Map::is_empty)
-        }
-        (None, "delay_histories") => v_in.as_array().is_some_and(Vec::is_empty) || v_in.is_null(),
-        _ => false,
-    }
-}
-
-/// Verifies that no unknown JSON schema fields exist in `input` relative to `normalized`.
-pub fn check_no_unknown_header_keys(
-    input: &serde_json::Value,
-    normalized: &serde_json::Value,
-    parent_key: Option<&str>,
-) -> Result<(), DnamError> {
-    if let Some(pk) = parent_key
-        && USER_DICT_KEYS.contains(&pk)
-    {
-        return Ok(());
-    }
-    match (input, normalized) {
-        (serde_json::Value::Object(in_map), serde_json::Value::Object(norm_map)) => {
-            if parent_key == Some("tensor_directory") {
-                for (k, v_in) in in_map {
-                    if let Some(v_norm) = norm_map.get(k) {
-                        check_no_unknown_header_keys(v_in, v_norm, Some("tensor_directory_entry"))?;
-                    }
-                }
-                return Ok(());
-            }
-            for (k, v_in) in in_map {
-                if let Some(v_norm) = norm_map.get(k) {
-                    check_no_unknown_header_keys(v_in, v_norm, Some(k.as_str()))?;
-                } else if !is_skipped_optional_field(parent_key, k.as_str(), v_in) {
-                    return Err(DnamError::SchemaValidationError(alloc::format!(
-                        "Unknown schema field '{k}'"
-                    )));
-                }
-            }
-            Ok(())
-        }
-        (serde_json::Value::Array(in_arr), serde_json::Value::Array(norm_arr)) => {
-            for (v_in, v_norm) in in_arr.iter().zip(norm_arr.iter()) {
-                check_no_unknown_header_keys(v_in, v_norm, parent_key)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -724,14 +537,12 @@ mod tests {
             "io_config": {},
             "control_bus": {},
             "stage0_router": {},
-            "stage1_pre": {},
-            "stage2_cascade": {},
             "stage3_cabinet": {},
             "stage4_tank": {},
             "slimmable_tiers": {
-                "lite": { "channels": 4, "tank_lines": 4, "arena_end_byte_offset": 4608, "prefix_crc32c": 0 },
-                "full": { "channels": 8, "tank_lines": 8, "arena_end_byte_offset": 10240, "prefix_crc32c": 0 },
-                "ultra": { "channels": 12, "tank_lines": 8, "arena_end_byte_offset": 18432, "prefix_crc32c": 0 }
+                "lite": { "channels": 16, "tank_lines": 4, "arena_end_byte_offset": 4608, "prefix_crc32c": 0 },
+                "full": { "channels": 24, "tank_lines": 8, "arena_end_byte_offset": 7936, "prefix_crc32c": 0 },
+                "ultra": { "channels": 40, "tank_lines": 16, "arena_end_byte_offset": 30720, "prefix_crc32c": 0 }
             },
             "controls_schema": [
                 {
@@ -740,8 +551,11 @@ mod tests {
                     "type": "range",
                     "declared_range": [0.0, 10.0],
                     "default": 5.0,
-                    "conditional_min": { "Sw=on": 2.0, "UnknownSw=on": 1.0 },
-                    "conditional_max": { "Sw=off": 8.0 }
+                    "conditional_bounds": [
+                        { "when": [{ "control_id": "Sw", "option_id": "on" }], "min": 2.0 },
+                        { "when": [{ "control_id": "UnknownSw", "option_id": "on" }], "min": 1.0 },
+                        { "when": [{ "control_id": "Sw", "option_id": "off" }], "max": 8.0 }
+                    ]
                 },
                 {
                     "id": "Sw",
@@ -754,21 +568,59 @@ mod tests {
             ]
         }"#;
         let mut h: DnamJsonHeader = serde_json::from_str(minimal_json).unwrap();
-        assert_eq!(h.version, "2.0.0");
+        assert_eq!(h.version, "3.0.0");
         assert_eq!(h.container_kind, "dnam");
-        assert_eq!(h.architecture, "DNAM_TORA");
+        assert_eq!(h.architecture, "sona");
         assert_eq!(h.sample_rate_train_hz, 48_000);
         assert_eq!(h.metadata.input_reference_dbfs, -20.5);
         assert_eq!(h.io_config.inputs, 2);
         assert_eq!(h.slimmable_tiers.lite.head_svd_rank, 4);
+        assert_eq!(h.slimmable_tiers.pro.arena_end_byte_offset, 15_872);
         assert_eq!(h.control_bus.envelopes, 4);
-        assert_eq!(h.stage2_cascade.num_stages, 3);
+        assert_eq!(h.stage3_cabinet.fir_taps, 32);
         assert_eq!(h.stage4_tank.dc_blocker_pole, 0.995);
         assert!(h.validate().is_ok());
 
+        // Legacy v2 or non-"sona" architecture must fail fast with UnsupportedVersion.
+        h.version = "2.0.0".to_string();
+        assert!(matches!(
+            h.validate(),
+            Err(DnamError::UnsupportedVersion { major: 2, minor: 0 })
+        ));
+        h.version = "3.0.0".to_string();
+
+        h.architecture = "DNAM_TORA".to_string();
+        assert!(matches!(
+            h.validate(),
+            Err(DnamError::UnsupportedVersion { major: 3, minor: 0 })
+        ));
+        h.architecture = "sona".to_string();
+
+        // delay_histories uses canonical DelayHistoryEntry schema.
+        let decl_default: DelayHistoryEntry = serde_json::from_str(
+            r#"{
+                "id": "tank.quad0.line0",
+                "stage": "op_t_tank",
+                "kind": "fractional",
+                "introduced_tier": "lite",
+                "sample_format": "fp16",
+                "reference_samples": { "lite": "1024" }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(decl_default.sample_format, "fp16");
+        assert_eq!(decl_default.max_samples_48k(), 1024);
+        h.delay_histories.push(decl_default);
+        assert!(h.validate().is_ok());
+        h.delay_histories[0].sample_format = "f32".to_string();
+        assert!(h.validate().is_ok());
+        h.delay_histories[0].sample_format = "f64".to_string();
+        assert!(h.validate().is_err());
+        h.delay_histories.clear();
+
         let compiled = h.compile_clamp_descriptors().unwrap();
-        assert_eq!(compiled[0].cond_rules[0].rule_op, 1);
-        assert_eq!(compiled[0].cond_rules[1].rule_op, 2);
+        assert_eq!(compiled[0].cond_rules[0].rule_op, 2);
+        assert_eq!(compiled[0].cond_rules[1].rule_op, 1);
         assert_eq!(compiled[1].active_options_mask, 1);
 
         // Validation error branches
@@ -779,6 +631,8 @@ mod tests {
         h.container_kind = "dnam".to_string();
 
         h.sample_rate_train_hz = 10_000;
+        assert!(h.validate().is_err());
+        h.sample_rate_train_hz = 44_100;
         assert!(h.validate().is_err());
         h.sample_rate_train_hz = 48_000;
 
@@ -797,6 +651,16 @@ mod tests {
         assert!(h.validate().is_err());
         bad_slice.byte_offset = 64;
         bad_slice.byte_length = 63;
+        h.tensor_directory
+            .insert("bad_off".to_string(), bad_slice.clone());
+        assert!(h.validate().is_err());
+        bad_slice.byte_offset = 4608;
+        bad_slice.byte_length = 64;
+        h.tensor_directory
+            .insert("bad_off".to_string(), bad_slice.clone());
+        assert!(h.validate().is_err());
+        bad_slice.arena = 4;
+        bad_slice.byte_offset = 0;
         h.tensor_directory.insert("bad_off".to_string(), bad_slice);
         assert!(h.validate().is_err());
         h.tensor_directory.clear();
@@ -812,8 +676,8 @@ mod tests {
             declared_range: None,
             safe_clamped_range: None,
             default: serde_json::json!(5.0),
-            conditional_min: BTreeMap::new(),
-            conditional_max: BTreeMap::new(),
+            conditional_bounds: Vec::new(),
+            represented_switch_options: None,
             declared_options: None,
             active_options: None,
             clamp_warning: None,
@@ -854,10 +718,12 @@ mod tests {
         assert!(SchemaVersion::parse("a.0.0").is_err());
         assert!(SchemaVersion::parse("1.b.0").is_err());
         assert!(SchemaVersion::parse("1.0.c").is_err());
-        assert_eq!(SchemaVersion::V2_0_0.as_semver_string(), "2.0.0");
+        assert_eq!(SchemaVersion::V3_0_0.as_semver_string(), "3.0.0");
+        assert_eq!(SchemaVersion::CURRENT, SchemaVersion::V3_0_0);
 
         let norm_json = DnamJsonHeader::validate_and_normalize_json_str(minimal_json).unwrap();
-        assert!(norm_json.contains("\"version\":\"2.0.0\""));
+        assert!(norm_json.contains("\"version\":\"3.0.0\""));
+        assert!(norm_json.contains("\"architecture\":\"sona\""));
         assert!(DnamJsonHeader::validate_and_normalize_json_str("not json").is_err());
         let bad_unknown = minimal_json.replace(
             "\"metadata\": {",
@@ -865,9 +731,11 @@ mod tests {
         );
         assert!(DnamJsonHeader::validate_and_normalize_json_str(&bad_unknown).is_err());
 
-        // Misplaced optional field ("shape" inside "stage1_pre" or "distribution_policy" at root) must fail
-        let bad_misplaced =
-            minimal_json.replace("\"stage1_pre\": {}", "\"stage1_pre\": {\"shape\": \"bad\"}");
+        // Misplaced optional field ("shape" inside "stage3_cabinet" or "distribution_policy" at root) must fail
+        let bad_misplaced = minimal_json.replace(
+            "\"stage3_cabinet\": {}",
+            "\"stage3_cabinet\": {\"shape\": \"bad\"}",
+        );
         assert!(DnamJsonHeader::validate_and_normalize_json_str(&bad_misplaced).is_err());
         let bad_root_opt = minimal_json.replace(
             "\"metadata\": {",

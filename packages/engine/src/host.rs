@@ -64,8 +64,8 @@ mod tests {
                 declared_range: Some([0.0, 10.0]),
                 safe_clamped_range: Some([1.0, 9.0]),
                 default: serde_json::json!(5.0),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
                 declared_options: None,
                 active_options: None,
                 clamp_warning: None,
@@ -83,8 +83,8 @@ mod tests {
                 declared_range: None,
                 safe_clamped_range: None,
                 default: serde_json::json!("Clean"),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
                 declared_options: Some(vec![
                     String::from("Clean"),
                     String::from("Crunch"),
@@ -106,15 +106,15 @@ mod tests {
                 declared_range: Some([20.0, 1000.0]),
                 safe_clamped_range: Some([50.0, 800.0]),
                 default: serde_json::json!(250.0),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
                 declared_options: None,
                 active_options: None,
                 clamp_warning: None,
                 calibration: Some(ControlCalibration {
                     role: ControlCalibrationRole::DelayTimeMs,
                     lobatto_physical_anchors: Some([20.0, 510.0, 1000.0]),
-                    conditional_physical_anchors: BTreeMap::new(),
+                    conditional_physical_anchors: Vec::new(),
                     tempo_sync_default_subdivision: Some(TempoSubdivision::Quarter),
                 }),
                 ui_hints: ControlUiHints::default(),
@@ -241,7 +241,6 @@ mod tests {
         // verify[dsp.ctrl.op-m.spsc-ingress]
         // verify[arch.telemetry.seqlock-publication]
         let mut header = DnamJsonHeader::default_reference();
-        header.stage2_cascade.ac_coupling_pole = 0.991;
         header.stage4_tank.dc_blocker_pole = 0.985;
         header.stage4_tank.tzf_reference_tap_samples = 48.0;
         header.stage4_tank.switch_xfade_samples = 96;
@@ -255,8 +254,8 @@ mod tests {
             declared_range: Some([0.0, 10.0]),
             safe_clamped_range: Some([0.0, 10.0]),
             default: serde_json::json!(5.0),
-            conditional_min: BTreeMap::new(),
-            conditional_max: BTreeMap::new(),
+            conditional_bounds: Vec::new(),
+            represented_switch_options: None,
             declared_options: None,
             active_options: None,
             clamp_warning: None,

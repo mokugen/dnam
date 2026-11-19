@@ -1,4 +1,4 @@
-//! Canonical v2.0 3 kHz Self-Similar Control Plane, Exact-Integer Sufficient-Statistic
+//! Canonical v3.0 ("sona") 3 kHz Self-Similar Control Plane, Exact-Integer Sufficient-Statistic
 //! Accumulator (`9-word S` + `18-word D`), SPSC Per-Producer Ingress, Host Curve & Timestamp
 //! Arbitration, `Q64`/`Q32` Tempo Synchronization, and Physical `f32` Calibration Inversion
 //! (`src/control/plane.rs`).
@@ -23,8 +23,6 @@
 //! - [`tempo`]: `Q64`/`Q32` tempo synchronization, clock pulse tracker, and physical `f32` calibration inversion.
 
 pub mod exact_int;
-#[cfg(test)]
-mod exact_int_verify;
 pub mod stride_and_ingress;
 pub mod tempo;
 

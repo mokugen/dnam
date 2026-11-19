@@ -6,7 +6,7 @@ Implements `#![no_std]` + `alloc` `serde` / `serde_json` parsing and validation 
 
 | File | Responsibility | Canonical Spec (SSOT) |
 | :--- | :--- | :--- |
-| [`header.rs`](header.rs) | `DnamJsonHeader`, `TierProfile`, TORA `StageConfigs`, `compile_clamp_descriptors` | [`dnam_binary_format.md`](../../../../docs/specs/containers/dnam_binary_format.md) |
+| [`header.rs`](header.rs) ([`clamp_compiler.rs`](header/clamp_compiler.rs), [`unknown_keys.rs`](header/unknown_keys.rs)) | `DnamJsonHeader`, `TierProfile`, `StageConfigs`, `compile_clamp_descriptors` | [`dnam_binary_format.md`](../../../../docs/specs/containers/dnam_binary_format.md) |
 | [`controls.rs`](controls.rs) | `ControlSchemaDef`, `ControlUiHints`, midpoint power-skew (`norm_to_physical` / `physical_to_norm`) + `proptest` | [`dnam_binary_format.md`](../../../../docs/specs/containers/dnam_binary_format.md) |
 | [`signatures.rs`](signatures.rs) | `ModelSignatures`, `CreatorSignature`, `MarketplaceReceipt`, `AuthorizedDevice`, `RoyaltySplit` | [`provenance_and_enclave_drm.md`](../../../../docs/specs/security/provenance_and_enclave_drm.md) |
 | [`error.rs`](error.rs) | `DnamError` (`core::error::Error`) and cold-path `f64` math wrappers | [`dnam_binary_format.md`](../../../../docs/specs/containers/dnam_binary_format.md) |

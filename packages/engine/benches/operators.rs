@@ -1,4 +1,4 @@
-//! Isolated TORA Operator & Spec-Math Criterion Benchmarks (`benches/operators.rs`).
+//! Isolated `SONA` (`Op-T`, `Op-M`, `Op-N`) Operator & Spec-Math Criterion Benchmarks (`benches/operators.rs`).
 //!
 //! Benchmarks `Op-T` (Hermite Delay Line, Partitioned Schroeder Diffuser, Ballistic VCA),
 //! `Op-M` (Symplectic 4-Lane, 4-Lane SIMD Kautz Modal Bank, 12-Allpass Hilbert `H1`, Sub-Harmonic `T1`,

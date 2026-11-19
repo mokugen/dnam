@@ -59,14 +59,11 @@ impl DnamHostHandle {
     }
 
     /// Sets a user control value with smooth $3\text{ kHz}$ interpolation via Lane 1 without
-    /// blocking on an active audio block.
+    /// blocking on or acquiring any audio lock.
     pub fn set_control_value(&self, ctrl_idx: usize, physical_value: f32) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.set_control_value(ctrl_idx, physical_value);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.set_control_value(ctrl_idx, physical_value);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Fallible variant of [`Self::set_control_value`] that validates bounds and finiteness.
@@ -75,27 +72,20 @@ impl DnamHostHandle {
         ctrl_idx: usize,
         physical_value: f32,
     ) -> Result<f32, DnamError> {
-        let clamped = {
-            let mut prod = self.producer.lock();
-            let c = prod
-                .producer
-                .try_set_control_value(ctrl_idx, physical_value)?;
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-            c
-        };
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        let clamped = prod
+            .producer
+            .try_set_control_value(ctrl_idx, physical_value)?;
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
         Ok(clamped)
     }
 
     /// Sets a user control value and snaps immediately via Lane 1 without blocking on an active audio block.
     pub fn set_control_immediate(&self, ctrl_idx: usize, physical_value: f32) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer
-                .set_control_immediate(ctrl_idx, physical_value);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer
+            .set_control_immediate(ctrl_idx, physical_value);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Fallible variant of [`Self::set_control_immediate`] that validates bounds and finiteness.
@@ -104,59 +94,42 @@ impl DnamHostHandle {
         ctrl_idx: usize,
         physical_value: f32,
     ) -> Result<f32, DnamError> {
-        let clamped = {
-            let mut prod = self.producer.lock();
-            let c = prod
-                .producer
-                .try_set_control_immediate(ctrl_idx, physical_value)?;
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-            c
-        };
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        let clamped = prod
+            .producer
+            .try_set_control_immediate(ctrl_idx, physical_value)?;
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
         Ok(clamped)
     }
 
     /// Applies a batch of immediate control updates (`ref[dsp.ctrl.switch.conditional-batch]`),
     /// ordering switch controls before continuous range controls, without blocking on an active audio block.
     pub fn set_controls_immediate_batch(&self, updates: &[(usize, f32)]) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.set_controls_immediate_batch(updates);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.set_controls_immediate_batch(updates);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Resets a single control `ctrl_idx` immediately back to its schema default.
     pub fn reset_control(&self, ctrl_idx: usize) -> Result<f32, DnamError> {
-        let clamped = {
-            let mut prod = self.producer.lock();
-            let c = prod.producer.reset_control(ctrl_idx)?;
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-            c
-        };
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        let clamped = prod.producer.reset_control(ctrl_idx)?;
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
         Ok(clamped)
     }
 
     /// Snaps all controls immediately back to their schema defaults without blocking on an active audio block.
     pub fn reset_controls_to_defaults(&self) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.reset_controls_to_defaults();
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.reset_controls_to_defaults();
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Resets all states to analytical DC resting equilibrium without blocking on an active audio block.
     pub fn reset_to_dc_equilibrium(&self) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.reset_to_dc_equilibrium();
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.reset_to_dc_equilibrium();
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Returns whether this model supports captured hardware freeze wait-free.
@@ -173,23 +146,17 @@ impl DnamHostHandle {
 
     /// Engages or disengages Unitary Spectral Freeze without blocking on an active audio block.
     pub fn set_freeze(&self, freeze: bool) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.set_freeze(freeze);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.set_freeze(freeze);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Sets continuous Unitary Spectral Freeze amount $\alpha_{\text{freeze}} \in [0.0, 1.0]$
     /// without blocking on an active audio block.
     pub fn set_freeze_amount(&self, alpha: f32) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.set_freeze_amount(alpha);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.set_freeze_amount(alpha);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Returns `(bypassed, trails_enabled)` wait-free.
@@ -202,12 +169,9 @@ impl DnamHostHandle {
     /// Sets the bypass state (`bypassed`) and spillover trails mode (`trails`) without blocking on
     /// an active audio block.
     pub fn set_bypass(&self, bypassed: bool, trails: bool) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.set_bypass(bypassed, trails);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.set_bypass(bypassed, trails);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Returns the output Mid/Side stereo width $\alpha_{\text{width}} \in [0.0, 2.0]$ wait-free.
@@ -219,12 +183,9 @@ impl DnamHostHandle {
     /// Sets the output Mid/Side stereo width $\alpha_{\text{width}} \in [0.0, 2.0]$ without
     /// blocking on an active audio block.
     pub fn set_stereo_width(&self, width: f32) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.set_stereo_width(width);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.set_stereo_width(width);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Configures host dry/wet blend, output gain trim (dB), and automatic unity loudness leveling
@@ -235,16 +196,13 @@ impl DnamHostHandle {
         output_gain_db: f32,
         apply_unity_leveling: bool,
     ) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.configure_host_mix_and_leveling(
-                blend_wet,
-                output_gain_db,
-                apply_unity_leveling,
-            );
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.configure_host_mix_and_leveling(
+            blend_wet,
+            output_gain_db,
+            apply_unity_leveling,
+        );
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Returns the active host tempo in BPM wait-free.
@@ -261,15 +219,11 @@ impl DnamHostHandle {
         subdivision_override: Option<TempoSubdivision>,
         fold_octave: bool,
     ) -> usize {
-        let count = {
-            let mut prod = self.producer.lock();
-            let c = prod
-                .producer
-                .sync_tempo(bpm, subdivision_override, fold_octave);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-            c
-        };
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        let count = prod
+            .producer
+            .sync_tempo(bpm, subdivision_override, fold_octave);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
         count
     }
 
@@ -279,27 +233,20 @@ impl DnamHostHandle {
         subdivision_override: Option<TempoSubdivision>,
         fold_octave: bool,
     ) -> (f32, usize) {
-        let res = {
-            let mut prod = self.producer.lock();
-            let r = prod
-                .producer
-                .register_tap_tempo(subdivision_override, fold_octave);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-            r
-        };
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        let res = prod
+            .producer
+            .register_tap_tempo(subdivision_override, fold_octave);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
         res
     }
 
     /// Applies a named preset atomically (`ref[dsp.ctrl.switch.conditional-batch]`) without
     /// blocking on an active audio block.
     pub fn apply_preset(&self, preset_id: &str) -> Result<(), DnamError> {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.apply_preset(preset_id)?;
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.apply_preset(preset_id)?;
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
         Ok(())
     }
 }
@@ -332,8 +279,8 @@ mod tests {
                 declared_range: Some([0.0, 10.0]),
                 safe_clamped_range: Some([1.0, 9.0]),
                 default: serde_json::json!(5.0),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
                 declared_options: None,
                 active_options: None,
                 clamp_warning: None,
@@ -351,8 +298,8 @@ mod tests {
                 declared_range: None,
                 safe_clamped_range: None,
                 default: serde_json::json!("Clean"),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
                 declared_options: Some(vec![String::from("Clean"), String::from("Crunch")]),
                 active_options: Some(vec![String::from("Clean"), String::from("Crunch")]),
                 clamp_warning: None,
@@ -370,15 +317,15 @@ mod tests {
                 declared_range: Some([20.0, 1000.0]),
                 safe_clamped_range: Some([50.0, 800.0]),
                 default: serde_json::json!(250.0),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
                 declared_options: None,
                 active_options: None,
                 clamp_warning: None,
                 calibration: Some(ControlCalibration {
                     role: ControlCalibrationRole::DelayTimeMs,
                     lobatto_physical_anchors: Some([20.0, 510.0, 1000.0]),
-                    conditional_physical_anchors: BTreeMap::new(),
+                    conditional_physical_anchors: Vec::new(),
                     tempo_sync_default_subdivision: Some(TempoSubdivision::Quarter),
                 }),
                 ui_hints: ControlUiHints::default(),

@@ -187,6 +187,7 @@ pub fn project_immutable_header_value(header: &Value) -> Result<Value, DnamError
         .or_schema_err("header must be an object")?;
     root.remove("presets");
     root.remove("user_metadata");
+    root.remove("stem_user_metadata");
 
     if let Some(meta) = root.get_mut("metadata") {
         let meta_obj = meta
@@ -246,11 +247,14 @@ pub fn serialize_jcs_value(value: &Value, reject_floats: bool) -> Result<String,
         Value::Bool(false) => Ok("false".to_string()),
         Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                reject_if(i.abs() > MAX_SAFE_INT, "integer outside reference subset")?;
+                reject_if(
+                    reject_floats && i.abs() > MAX_SAFE_INT,
+                    "integer outside reference subset",
+                )?;
                 Ok(i.to_string())
             } else if let Some(u) = n.as_u64() {
                 reject_if(
-                    u > (MAX_SAFE_INT as u64),
+                    reject_floats && u > (MAX_SAFE_INT as u64),
                     "integer outside reference subset",
                 )?;
                 Ok(u.to_string())
@@ -260,7 +264,12 @@ pub fn serialize_jcs_value(value: &Value, reject_floats: bool) -> Result<String,
                 ))
             } else {
                 let f = n.as_f64().or_schema_err("non-finite number")?;
-                if f.fract() == 0.0 && f.abs() <= (MAX_SAFE_INT as f64) {
+                const MAX_SAFE_INT_F64: f64 = MAX_SAFE_INT as f64;
+                if f == 0.0 {
+                    Ok(String::from("0"))
+                } else if (-MAX_SAFE_INT_F64..=MAX_SAFE_INT_F64).contains(&f)
+                    && (f as i64 as f64) == f
+                {
                     Ok((f as i64).to_string())
                 } else {
                     serde_json::to_string(&f).map_err(|e| {
@@ -290,6 +299,12 @@ pub fn serialize_jcs_value(value: &Value, reject_floats: bool) -> Result<String,
             Ok(alloc::format!("{{{}}}", parts.join(",")))
         }
     }
+}
+
+/// Canonicalizes a parsed JSON `Value` into RFC 8785 JCS UTF-8 bytes (`ref[sec.jcs.immutable-header-digest]`).
+pub fn canonicalize_jcs_bytes(value: &Value) -> Result<Vec<u8>, DnamError> {
+    validate_json_value_unicode_and_finite(value)?;
+    Ok(serialize_jcs_value(value, false)?.into_bytes())
 }
 
 /// Validates that `wire_bytes` are already canonical projected JCS bytes without mutable members

@@ -11,7 +11,7 @@ use crate::schema::{DnamError, DnamJsonHeader, DnamProtectionProfile};
 use crate::types::Tier;
 
 use super::super::preamble::DnamPreamble;
-use super::super::wire::V2ContainerLayout;
+use super::super::wire::{ContainerWireError, V3ContainerLayout};
 use super::DnamContainerView;
 use super::{FLAG_HAS_FULL_DELTA, FLAG_HAS_PRO_DELTA, FLAG_HAS_ULTRA_DELTA, crc32c_update};
 
@@ -39,7 +39,7 @@ pub(super) fn resolve_protection_profile_and_policy(
             2 => DnamProtectionProfile::EnclaveSealed,
             _ => {
                 return Err(DnamError::SchemaValidationError(
-                    "invalid v2 protection_profile".to_string(),
+                    "invalid v3 protection_profile".to_string(),
                 ));
             }
         }
@@ -54,7 +54,7 @@ pub(super) fn verify_dau1_or_legacy_provenance<C: CryptoProvider>(
     auth_slice: &[u8],
     json_slice: &[u8],
     shared_slice: &[u8],
-    layout: &V2ContainerLayout,
+    layout: &V3ContainerLayout,
     header: &DnamJsonHeader,
     preamble_has_signatures: bool,
     retained_tier: Tier,
@@ -63,6 +63,12 @@ pub(super) fn verify_dau1_or_legacy_provenance<C: CryptoProvider>(
 ) -> Result<VerificationStatus, DnamError> {
     if !(auth_slice.starts_with(b"DAU1") || layout.auth_kind > 0) {
         return verify_container_provenance(header, preamble_has_signatures, plain_bytes, crypto);
+    }
+
+    if layout.protection_profile != 0 {
+        return Err(DnamError::CryptoVerificationFailed(
+            "DAU1 authentication envelope is only permitted for protection_profile == 0",
+        ));
     }
 
     let env = crate::provenance::Dau1Envelope::from_bytes(auth_slice)?;
@@ -78,7 +84,15 @@ pub(super) fn verify_dau1_or_legacy_provenance<C: CryptoProvider>(
     let mut prev_t = layout.tier_start;
     for t_idx in 0..=(retained_tier as usize) {
         let end_t = layout.tier_ends[t_idx];
-        tier_slices_vec.push(&bytes[prev_t..end_t]);
+        let rel_start = prev_t.saturating_sub(layout.tier_start);
+        let rel_end = end_t.saturating_sub(layout.tier_start);
+        let tier_slice =
+            plain_bytes
+                .get(rel_start..rel_end)
+                .ok_or(DnamError::CryptoVerificationFailed(
+                    "DAU1 tier prefix exceeds plaintext arena",
+                ))?;
+        tier_slices_vec.push(tier_slice);
         prev_t = end_t;
     }
     if env.auth_kind == 0 {
@@ -117,9 +131,12 @@ pub(super) fn verify_dau1_or_legacy_provenance<C: CryptoProvider>(
             .ok_or(DnamError::CryptoVerificationFailed(
                 "missing DAU1 marketplace_pubkey",
             ))?;
-        if let Some(pinned_mp) = crypto.marketplace_pubkey()
-            && &m_pub != pinned_mp
-        {
+        let pinned_mp = crypto
+            .marketplace_pubkey()
+            .ok_or(DnamError::CryptoVerificationFailed(
+                "trusted marketplace_pubkey required to verify auth_kind=1 DAU1 container",
+            ))?;
+        if &m_pub != pinned_mp {
             return Err(DnamError::CryptoVerificationFailed(
                 "DAU1 marketplace_pubkey mismatch against pinned trusted marketplace key",
             ));
@@ -181,19 +198,51 @@ pub(super) fn verify_dau1_or_legacy_provenance<C: CryptoProvider>(
     }
 }
 
+/// Merges a validated `DMU1`/`DME1` mutable JSON object (`presets`, `user_metadata`,
+/// `control_user_metadata`, `stem_user_metadata`) into [`DnamJsonHeader`].
+pub(super) fn merge_mutable_doc_into_header(
+    header: &mut DnamJsonHeader,
+    dmu_val: &serde_json::Value,
+) -> Result<(), DnamError> {
+    crate::container::validate_mutable_json_schema(dmu_val)?;
+    if let Some(presets_val) = dmu_val.get("presets") {
+        header.presets = serde_json::from_value(presets_val.clone())
+            .map_err(|e| DnamError::SchemaValidationError(e.to_string()))?;
+    }
+    if let Some(um_val) = dmu_val.get("user_metadata") {
+        header.user_metadata = serde_json::from_value(um_val.clone())
+            .map_err(|e| DnamError::SchemaValidationError(e.to_string()))?;
+    }
+    if let Some(ctrl_um_obj) = dmu_val
+        .get("control_user_metadata")
+        .and_then(|v| v.as_object())
+    {
+        for ctrl in &mut header.controls_schema {
+            if let Some(entry_val) = ctrl_um_obj.get(&ctrl.id) {
+                ctrl.user_metadata = serde_json::from_value(entry_val.clone())
+                    .map_err(|e| DnamError::SchemaValidationError(e.to_string()))?;
+            }
+        }
+    }
+    if let Some(stem_um_val) = dmu_val.get("stem_user_metadata") {
+        header.stem_user_metadata = serde_json::from_value(stem_um_val.clone())
+            .map_err(|e| DnamError::SchemaValidationError(e.to_string()))?;
+    }
+    Ok(())
+}
+
 impl<'a> DnamContainerView<'a> {
-    /// Verifies `arena_crc32c_lite`, `arena_crc32c_full`, `arena_crc32c_pro`, and `arena_crc32c_ultra`
-    /// over the available prefix of `plain_arena` in a single incremental pass.
-    pub fn verify_arena_prefix_crcs(
+    /// Zero-drop-glue (`Copy` error) incremental arena prefix `CRC32C` check for RT reloaders.
+    pub(crate) fn verify_arena_prefix_crcs_rt(
         preamble: &DnamPreamble,
         plain_arena: &[u8],
-    ) -> Result<(), DnamError> {
+    ) -> Result<(), ContainerWireError> {
         let lite_end = preamble.arena_offset_lite_end() as usize;
         let mut crc = 0_u32;
         if plain_arena.len() >= lite_end && lite_end > 0 {
             crc = crc32c_update(0, &plain_arena[..lite_end]);
             if crc != preamble.arena_crc32c_lite {
-                return Err(DnamError::Crc32cMismatch {
+                return Err(ContainerWireError::Crc32cMismatch {
                     region: "arena_lite",
                     expected: preamble.arena_crc32c_lite,
                     computed: crc,
@@ -207,7 +256,7 @@ impl<'a> DnamContainerView<'a> {
         {
             crc = crc32c_update(crc, &plain_arena[lite_end..full_end]);
             if crc != preamble.arena_crc32c_full {
-                return Err(DnamError::Crc32cMismatch {
+                return Err(ContainerWireError::Crc32cMismatch {
                     region: "arena_full",
                     expected: preamble.arena_crc32c_full,
                     computed: crc,
@@ -221,7 +270,7 @@ impl<'a> DnamContainerView<'a> {
         {
             crc = crc32c_update(crc, &plain_arena[full_end..pro_end]);
             if crc != preamble.arena_crc32c_pro {
-                return Err(DnamError::Crc32cMismatch {
+                return Err(ContainerWireError::Crc32cMismatch {
                     region: "arena_pro",
                     expected: preamble.arena_crc32c_pro,
                     computed: crc,
@@ -235,7 +284,7 @@ impl<'a> DnamContainerView<'a> {
         {
             crc = crc32c_update(crc, &plain_arena[pro_end..ultra_end]);
             if crc != preamble.arena_crc32c_ultra {
-                return Err(DnamError::Crc32cMismatch {
+                return Err(ContainerWireError::Crc32cMismatch {
                     region: "arena_ultra",
                     expected: preamble.arena_crc32c_ultra,
                     computed: crc,
@@ -243,6 +292,16 @@ impl<'a> DnamContainerView<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Verifies `arena_crc32c_lite`, `arena_crc32c_full`, `arena_crc32c_pro`, and `arena_crc32c_ultra`
+    /// over the available prefix of `plain_arena` in a single incremental pass.
+    pub fn verify_arena_prefix_crcs(
+        preamble: &DnamPreamble,
+        plain_arena: &[u8],
+    ) -> Result<(), DnamError> {
+        Self::verify_arena_prefix_crcs_rt(preamble, plain_arena)
+            .map_err(ContainerWireError::into_dnam_error)
     }
 }
 
@@ -317,7 +376,7 @@ mod tests {
             };
             let env_creator_bytes = env_creator.to_bytes().unwrap();
 
-            let mut layout = V2ContainerLayout {
+            let mut layout = V3ContainerLayout {
                 magic: *b"DNAM",
                 protection_profile: 0,
                 auth_kind: 1, // mismatch with env.auth_kind = 0

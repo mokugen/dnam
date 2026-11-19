@@ -1,6 +1,6 @@
 //! 64-byte cache-line aligned memory management, OS page pre-faulting, and zero-copy storage.
 //!
-//! Ensures all weight arenas (`Arena 0..2`) and Stage IV tank `fp16` delay ring buffers are strictly
+//! Ensures all weight arenas (`Arena 0..3`) and Stage IV tank `fp16` delay ring buffers are strictly
 //! 64-byte aligned (`ptr % 64 == 0`) across ARM64, x86-64, and WebAssembly, while eliminating
 //! first-touch OS page faults on the real-time audio thread.
 
@@ -156,9 +156,9 @@ pub enum ArenaStorage<'a, A: Allocator = Global> {
     Borrowed(&'a [CacheLine64]),
     /// Owned, 64-byte aligned and page-prefaulted cache-line buffer.
     Owned {
-        /// Underlying 64-byte cache line allocation (may be pre-allocated up to `Ultra` 566 blocks).
+        /// Underlying 64-byte cache line allocation (may be pre-allocated up to `Ultra` `480` blocks).
         buffer: AlignedBuffer<CacheLine64, A>,
-        /// Active number of 64-byte blocks currently populated (`168` Lite, `349` Full, `566` Ultra).
+        /// Active number of 64-byte blocks currently populated (`72` Lite, `124` Full, `248` Pro, `480` Ultra).
         active_blocks: usize,
     },
 }
@@ -182,15 +182,15 @@ impl<'a> ArenaStorage<'a, Global> {
         Self::from_slice_owned_in(bytes, Global)
     }
 
-    /// Pre-allocates an `Owned` 64-byte aligned arena with capacity for `max_blocks` (e.g., `566`
-    /// for `Pro` = `36,224 B` or `1000` for `Ultra` = `64,000 B`) so models can be hot-swapped
+    /// Pre-allocates an `Owned` 64-byte aligned arena with capacity for `max_blocks` (e.g., `248`
+    /// for `Pro` = `15,872 B` or `480` for `Ultra` = `30,720 B`) so models can be hot-swapped
     /// in-place with zero allocations.
     pub fn with_max_blocks(max_blocks: usize) -> Self {
         Self::with_max_blocks_in(max_blocks, Global)
     }
 
-    /// Pre-allocates an `Owned` 64-byte aligned arena capped at `max_tier` (`168` Lite, `349` Full,
-    /// `566` Pro, `1,000` Ultra cache lines) so plugins on constrained hardware only allocate up to
+    /// Pre-allocates an `Owned` 64-byte aligned arena capped at `max_tier` (`72` Lite, `124` Full,
+    /// `248` Pro, `480` Ultra cache lines) so plugins on constrained hardware only allocate up to
     /// their maximum supported tier.
     #[inline]
     pub fn with_max_tier(max_tier: crate::types::Tier) -> Self {
@@ -266,6 +266,49 @@ impl<'a, A: Allocator> ArenaStorage<'a, A> {
             return true;
         }
         false
+    }
+
+    /// Updates an existing `Owned` arena in-place (if pre-allocated capacity fits) or rebinds a
+    /// `Borrowed` arena to a 64-byte-aligned slice `bytes` with zero heap allocations or buffer
+    /// drops (`0` frees).
+    #[inline]
+    pub fn reload_in_place_or_reborrow(&mut self, bytes: &'a [u8]) -> bool {
+        if !bytes.len().is_multiple_of(64) {
+            return false;
+        }
+        let req_blocks = bytes.len() / 64;
+        match self {
+            Self::Borrowed(slot) => {
+                if let Ok(aligned_slice) = <[CacheLine64]>::ref_from_bytes(bytes) {
+                    *slot = aligned_slice;
+                    true
+                } else {
+                    false
+                }
+            }
+            Self::Owned {
+                buffer,
+                active_blocks,
+            } => {
+                if buffer.len_blocks() >= req_blocks {
+                    buffer.as_bytes_mut()[..bytes.len()].copy_from_slice(bytes);
+                    *active_blocks = req_blocks;
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// Returns the total addressable byte capacity of this arena storage (`Owned` pre-allocation or
+    /// `Borrowed` slice length).
+    #[inline]
+    pub fn capacity_bytes(&self) -> usize {
+        match self {
+            Self::Borrowed(slice) => slice.len() * 64,
+            Self::Owned { buffer, .. } => buffer.len_blocks() * 64,
+        }
     }
 
     /// Returns `true` if the arena is borrowing an external 64-byte aligned buffer with zero copies.
@@ -433,9 +476,9 @@ mod tests {
         assert!(borrowed.is_borrowed());
         assert_eq!(borrowed.as_f32_slice().len(), 32);
 
-        let mut unaligned_vec = alloc::vec![0u8; 129];
-        unaligned_vec[1] = 0x3F;
-        let owned = ArenaStorage::from_slice_or_copy(&unaligned_vec[1..129]);
+        let mut unaligned_buf = [CacheLine64([0u8; 64]); 3];
+        unaligned_buf.as_mut_bytes()[1] = 0x3F;
+        let owned = ArenaStorage::from_slice_or_copy(&unaligned_buf.as_bytes()[1..129]);
         assert!(!owned.is_borrowed());
         assert_eq!(owned.as_bytes().len(), 128);
 
@@ -478,8 +521,20 @@ mod tests {
 
         let mut arena = ArenaStorage::with_max_blocks_in(4, &g);
         assert!(!arena.is_borrowed());
+        assert_eq!(arena.capacity_bytes(), 4 * 64);
         assert!(arena.reload_in_place(buf.as_bytes()));
         assert_eq!(arena.as_cache_lines().len(), 3);
+
+        let aligned_a = [CacheLine64([0x11; 64]); 2];
+        let aligned_b = [CacheLine64([0x22; 64]); 3];
+        let mut borrowed: ArenaStorage<'_, Global> = ArenaStorage::Borrowed(&aligned_a);
+        assert!(borrowed.reload_in_place_or_reborrow(aligned_b.as_bytes()));
+        assert_eq!(borrowed.as_cache_lines().len(), 3);
+        assert_eq!(borrowed.as_bytes()[0], 0x22);
+        let unaligned_buf = [CacheLine64([0x33u8; 64]); 2];
+        assert!(!borrowed.reload_in_place_or_reborrow(&unaligned_buf.as_bytes()[1..65]));
+        let mut small_owned = ArenaStorage::with_max_blocks_in(2, &g);
+        assert!(!small_owned.reload_in_place_or_reborrow(aligned_b.as_bytes()));
 
         let mut delay = DelayScratchStorage::new_owned_in(2, &g);
         assert_eq!(delay.byte_len(), 128);

@@ -9,110 +9,22 @@
 //! Run with:
 //!   `cargo run -p dnam-engine --example embedded_zero_alloc`
 
-use std::collections::BTreeMap;
-
-use dnam_engine::container::{
-    ARENA_OFFSET_FULL_END, ARENA_OFFSET_LITE_END, ARENA_OFFSET_PRO_END, ARENA_OFFSET_ULTRA_END,
-    build_dnam_container,
-};
+use dnam_engine::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
 use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::memory::{AlignedBuffer, AlignedFp16Block, CacheLine64};
-use dnam_engine::schema::{
-    ControlBusConfig, DatasetProvenance, DnamJsonHeader, IoConfig, ModelMetadata, RouterConfig,
-    SlimmableTiersConfig, Stage1PreFxConfig, Stage2CascadeConfig, Stage3CabinetKautzConfig,
-    Stage4SpatialTankConfig, TierProfile,
-};
+use dnam_engine::schema::DnamJsonHeader;
+use dnam_engine::stages::sona_core::SonaMatryoshkaModel;
+use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::{DnamEngine, Tier};
 
 fn build_demo_model(name: &str, seed: u8) -> AlignedBuffer<CacheLine64> {
-    let mut header = DnamJsonHeader {
-        version: "2.0.0".to_string(),
-        container_kind: "dnam".to_string(),
-        architecture: "DNAM_TORA".to_string(),
-        sample_rate_train_hz: 48_000,
-        metadata: ModelMetadata {
-            name: name.to_string(),
-            author: None,
-            description: None,
-            license: None,
-            created_at: "2026-10-23T00:00:00Z".to_string(),
-            input_reference_dbfs: -20.5,
-            provenance: DatasetProvenance::default(),
-            distribution_policy: None,
-            signatures: None,
-        },
-        user_metadata: BTreeMap::new(),
-        io_config: IoConfig::default(),
-        slimmable_tiers: SlimmableTiersConfig {
-            lite: TierProfile {
-                feature_bus_dim: 64,
-                channels: 4,
-                early_fir_taps: 16,
-                kautz_modes: 4,
-                tank_lines: 4,
-                head_svd_rank: 4,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -40.0,
-                arena_end_byte_offset: ARENA_OFFSET_LITE_END,
-                prefix_crc32c: 0,
-            },
-            full: TierProfile {
-                feature_bus_dim: 128,
-                channels: 8,
-                early_fir_taps: 32,
-                kautz_modes: 8,
-                tank_lines: 8,
-                head_svd_rank: 4,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -45.0,
-                arena_end_byte_offset: ARENA_OFFSET_FULL_END,
-                prefix_crc32c: 0,
-            },
-            pro: TierProfile {
-                feature_bus_dim: 192,
-                channels: 12,
-                early_fir_taps: 48,
-                kautz_modes: 16,
-                tank_lines: 8,
-                head_svd_rank: 4,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -48.0,
-                arena_end_byte_offset: ARENA_OFFSET_PRO_END,
-                prefix_crc32c: 0,
-            },
-            ultra: TierProfile {
-                feature_bus_dim: 256,
-                channels: 16,
-                early_fir_taps: 64,
-                kautz_modes: 32,
-                tank_lines: 16,
-                head_svd_rank: 8,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -51.0,
-                arena_end_byte_offset: ARENA_OFFSET_ULTRA_END,
-                prefix_crc32c: 0,
-            },
-        },
-        controls_schema: Vec::new(),
-        presets: Vec::new(),
-        control_bus: ControlBusConfig::default(),
-        stage0_router: RouterConfig::default(),
-        stage1_pre: Stage1PreFxConfig::default(),
-        stage2_cascade: Stage2CascadeConfig::default(),
-        stage3_cabinet: Stage3CabinetKautzConfig::default(),
-        stage4_tank: Stage4SpatialTankConfig::default(),
-        delay_histories: Vec::new(),
-        tensor_directory: BTreeMap::new(),
-    };
+    let mut header = DnamJsonHeader::default_reference();
+    header.metadata.name = name.to_string();
 
     let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    let mut model = dnam_engine::stages::V3MatryoshkaModel::dual_rate_default(false);
+    let mut model = SonaMatryoshkaModel::dual_rate_default(false);
     model.stage0.xo_low_gain = 1.0 + 0.01 * (seed as f32);
-    dnam_engine::stages::weights::pack_v3_matryoshka_to_arena(&model, &mut arena);
+    pack_sona_matryoshka_to_arena(&model, &mut arena);
     let raw = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
     let mut aligned = AlignedBuffer::<CacheLine64>::new_zeroed(raw.len() / 64);
     aligned.as_bytes_mut().copy_from_slice(&raw);

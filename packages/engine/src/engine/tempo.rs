@@ -143,20 +143,22 @@ impl TempoSyncState {
             let Some(ref cal) = ctrl_def.calibration else {
                 continue;
             };
-            let Some(res) = cal.resolve_tempo_sync(bpm, subdivision_override, fold_octave) else {
+            let Some((switch_sel, normalized_u, was_clamped)) =
+                cal.resolve_tempo_sync_borrowed(bpm, subdivision_override, fold_octave)
+            else {
                 continue;
             };
-            if res.was_clamped && ctrl_idx < 16 {
+            if was_clamped && ctrl_idx < 16 {
                 *clamp_mask |= 1u16 << ctrl_idx;
             }
-            if let Some((sw_id, opt_label)) = res.switch_selection
+            if let Some((sw_id, opt_label)) = switch_sel
                 && let Some((sw_idx, sw_def)) = header
                     .controls_schema
                     .iter()
                     .enumerate()
                     .find(|(_, c)| c.id == sw_id)
                 && let Some(ref opts) = sw_def.declared_options
-                && let Some(opt_idx) = opts.iter().position(|o| o == &opt_label)
+                && let Some(opt_idx) = opts.iter().position(|o| o == opt_label)
                 && count < out.len()
             {
                 out[count] = (sw_idx, opt_idx as f32);
@@ -164,7 +166,7 @@ impl TempoSyncState {
             }
             if count < out.len() {
                 let decl = ctrl_def.declared_range.unwrap_or([0.0, 10.0]);
-                let phys = decl[0] + 0.5 * (res.normalized_u + 1.0) * (decl[1] - decl[0]);
+                let phys = decl[0] + 0.5 * (normalized_u + 1.0) * (decl[1] - decl[0]);
                 out[count] = (ctrl_idx, phys);
                 count += 1;
             }
@@ -241,8 +243,8 @@ mod tests {
                 declared_range: Some([0.0, 10.0]),
                 safe_clamped_range: Some([1.0, 9.0]),
                 default: serde_json::json!(5.0),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: alloc::vec::Vec::new(),
+                represented_switch_options: None,
                 declared_options: None,
                 active_options: None,
                 clamp_warning: None,
@@ -260,8 +262,8 @@ mod tests {
                 declared_range: None,
                 safe_clamped_range: None,
                 default: serde_json::json!("Clean"),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: alloc::vec::Vec::new(),
+                represented_switch_options: None,
                 declared_options: Some(alloc::vec![String::from("Clean"), String::from("Lead")]),
                 active_options: Some(alloc::vec![String::from("Clean"), String::from("Lead")]),
                 clamp_warning: None,
@@ -358,10 +360,20 @@ mod tests {
         header.io_config.leveling.auto_unity_enabled = true;
         header.io_config.leveling.calibrated_trim_db = 6.0206; // ~2.0x linear gain
 
-        let mut cond_anchors = BTreeMap::new();
-        cond_anchors.insert(String::from("range=0.01-0.1s"), [10.0, 55.0, 100.0]);
-        cond_anchors.insert(String::from("range=0.1-1s"), [100.0, 550.0, 1000.0]);
-        cond_anchors.insert(String::from("range=1-2s"), [1000.0, 1500.0, 2000.0]);
+        let cond_anchors = alloc::vec![
+            crate::container::StructuredConditionalCurve {
+                when: alloc::vec![(String::from("range"), String::from("0.01-0.1s"))],
+                anchors: [10.0, 55.0, 100.0],
+            },
+            crate::container::StructuredConditionalCurve {
+                when: alloc::vec![(String::from("range"), String::from("0.1-1s"))],
+                anchors: [100.0, 550.0, 1000.0],
+            },
+            crate::container::StructuredConditionalCurve {
+                when: alloc::vec![(String::from("range"), String::from("1-2s"))],
+                anchors: [1000.0, 1500.0, 2000.0],
+            },
+        ];
 
         header.controls_schema = alloc::vec![
             ControlSchemaDef {
@@ -374,8 +386,8 @@ mod tests {
                 declared_range: Some([0.0, 10.0]),
                 safe_clamped_range: Some([0.0, 10.0]),
                 default: serde_json::json!(5.0),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: alloc::vec::Vec::new(),
+                represented_switch_options: None,
                 declared_options: None,
                 active_options: None,
                 clamp_warning: None,
@@ -398,8 +410,8 @@ mod tests {
                 declared_range: None,
                 safe_clamped_range: None,
                 default: serde_json::json!("0.1-1s"),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: alloc::vec::Vec::new(),
+                represented_switch_options: None,
                 declared_options: Some(alloc::vec![
                     String::from("0.01-0.1s"),
                     String::from("0.1-1s"),
@@ -425,15 +437,15 @@ mod tests {
                 declared_range: None,
                 safe_clamped_range: None,
                 default: serde_json::json!("Stereo"),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: alloc::vec::Vec::new(),
+                represented_switch_options: None,
                 declared_options: Some(alloc::vec![String::from("Mono"), String::from("Stereo")]),
                 active_options: Some(alloc::vec![String::from("Mono"), String::from("Stereo")]),
                 clamp_warning: None,
                 calibration: Some(ControlCalibration {
                     role: ControlCalibrationRole::StereoMode,
                     lobatto_physical_anchors: None,
-                    conditional_physical_anchors: BTreeMap::new(),
+                    conditional_physical_anchors: alloc::vec::Vec::new(),
                     tempo_sync_default_subdivision: None,
                 }),
                 ui_hints: ControlUiHints::default(),

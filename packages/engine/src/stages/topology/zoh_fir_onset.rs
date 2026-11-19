@@ -74,10 +74,11 @@ pub const GAIN_BOUNDED_FIRST_TAP_64_BITS: [u32; 64] = [
 /// for the live `44.1–48 kHz` first-tap difference family ($\lambda = (48000 - f)/3900$,
 /// `ref[dsp.zoh.stage3-fir-onset]`).
 pub fn prepare_live_first_tap_difference_coeffs(effective_rate_hz: f64) -> Option<[f32; 63]> {
+    const INV_3900: f64 = 1.0 / 3_900.0;
     if !effective_rate_hz.is_finite() || !(44_100.0..=48_000.0).contains(&effective_rate_hz) {
         return None;
     }
-    let lambda = (48_000.0 - effective_rate_hz) / 3_900.0;
+    let lambda = (48_000.0 - effective_rate_hz) * INV_3900;
     let mut prefix = 0.0_f64;
     let mut out = [0.0f32; 63];
     for (idx, slot) in out.iter_mut().enumerate() {
@@ -114,19 +115,33 @@ pub fn prepare_bounce_6point_lagrange_tap(
         return None;
     }
     let bits = effective_rate_hz.to_bits();
-    let exponent = (((bits >> 52) & 0x7ff) as u32) - 1023;
+    let exponent = (((bits >> 52) & 0x7ff) as u32).saturating_sub(1023);
+    if exponent > 52 {
+        return None;
+    }
     let significand = (bits & ((1u64 << 52) - 1)) | (1u64 << 52);
     let denominator = 48_000u64 << (52 - exponent);
     let numerator = u64::from(tap_k) * significand;
-    let m = (numerator / denominator) as usize;
-    let rem = numerator % denominator;
-    let mu = (rem as f64) / (denominator as f64);
+    // `tap_k in 1..=63` and `effective_rate_hz <= 384_000 Hz` imply quotient `m <= 504 < 2^11`.
+    let mut m = 0usize;
+    let mut rem = numerator;
+    let mut shift = 11usize;
+    while shift > 0 {
+        shift -= 1;
+        let d_shifted = denominator << shift;
+        if rem >= d_shifted {
+            rem -= d_shifted;
+            m |= 1usize << shift;
+        }
+    }
+    let mu = (rem as f64) * crate::math::newton6_reciprocal_f64(denominator as f64);
     let anchor_a = if 2 * rem <= denominator {
         2usize
     } else {
         3usize
     };
 
+    const INV_120: f64 = 1.0 / 120.0;
     let nodes = [-2.0_f64, -1.0, 0.0, 1.0, 2.0, 3.0];
     let scales = [-1.0_f64, 5.0, -10.0, 10.0, -5.0, 1.0];
     let mut h = [0.0_f64; 6];
@@ -137,7 +152,7 @@ pub fn prepare_bounce_6point_lagrange_tap(
                 prod *= mu - vl;
             }
         }
-        h[i] = prod / 120.0;
+        h[i] = prod * INV_120;
     }
     let mut prefix = 0.0_f64;
     let mut p_coeffs = [0.0f32; 5];

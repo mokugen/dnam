@@ -14,7 +14,7 @@ pub mod sse2;
 pub mod sse42;
 pub mod trainer_f64;
 
-pub use avx2::{Avx2FmaVec4, X86Avx2FmaBackend};
+pub use avx2::{Avx2FmaVec4, Avx2Stereo8, X86Avx2FmaBackend};
 pub use sse2::{Sse2Vec4, X86Sse2Backend};
 pub use sse42::{Sse42Vec4, X86Sse42Backend};
 pub use trainer_f64::{Avx2FmaF64Vec2, Sse2F64Vec2};
@@ -23,16 +23,28 @@ use super::BackendKind;
 
 /// Alias for the highest-tier x86-64 vector register wrapper ([`Avx2FmaVec4`]).
 pub type X86Vec4 = Avx2FmaVec4;
+/// Alias for the highest-tier x86-64 stereo 8-lane vector ([`Avx2Stereo8`]).
+pub type X86Stereo8 = Avx2Stereo8;
 /// Alias for the highest-tier x86-64 hardware math backend ([`X86Avx2FmaBackend`]).
 pub type X86SimdBackend = X86Avx2FmaBackend;
+
+/// Pre-warms every runtime-detected `x86_64` SIMD and hardware CRC32C capability cache outside the
+/// real-time audio callback so subsequent [`X86Avx2FmaBackend`] and [`X86Sse42Backend`] checks
+/// perform only a single relaxed atomic load.
+#[inline]
+pub fn warm_x86_feature_caches() {
+    let _ = X86Avx2FmaBackend::is_supported();
+    let _ = X86Sse42Backend::is_supported();
+}
 
 /// Detects the highest-capability `x86_64` backend supported by the current CPU at runtime:
 /// `X86Avx2Fma` (`x86-64-v3`) -> `X86Sse42` (`x86-64-v2`) -> `X86Sse2` (`x86-64-v1`).
 #[inline]
 pub fn detect_x86_backend() -> BackendKind {
-    if X86Avx2FmaBackend::is_supported() {
+    warm_x86_feature_caches();
+    if X86Avx2FmaBackend::is_supported_cached() {
         BackendKind::X86Avx2Fma
-    } else if X86Sse42Backend::is_supported() {
+    } else if X86Sse42Backend::is_supported_cached() {
         BackendKind::X86Sse42
     } else {
         BackendKind::X86Sse2

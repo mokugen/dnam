@@ -12,10 +12,10 @@ Lock-free real-time host concurrency primitives (`#[forbid(unsafe_code)]`): 3-La
 | [`spsc/producer.rs`](spsc/producer.rs) | Non-RT `ControlProducer` & presets | [`op_m_modal_kautz.md`](../../../../docs/specs/dsp/op_m_modal_kautz.md) |
 | [`spsc/consumer.rs`](spsc/consumer.rs) | Real-time `ControlConsumer` drain | [`op_m_modal_kautz.md`](../../../../docs/specs/dsp/op_m_modal_kautz.md) |
 | [`telemetry.rs`](telemetry.rs) | Wait-free Seqlock `TelemetryCell` | [`sona_architecture.md`](../../../../docs/specs/architecture/sona_architecture.md) |
-| [`swap.rs`](swap.rs) | Off-thread model swap & reclamation | [`sona_architecture.md`](../../../../docs/specs/architecture/sona_architecture.md) |
+| [`swap.rs`](swap.rs) | Lock-free `RETIRED_SLOTS=8` swap & `0` RT drops | [`sona_architecture.md`](../../../../docs/specs/architecture/sona_architecture.md) |
 | [`handle.rs`](handle.rs) | `DnamHostHandle` root & mutex | [`sona_architecture.md`](../../../../docs/specs/architecture/sona_architecture.md) |
-| [`handle/lifecycle.rs`](handle/lifecycle.rs) | Init, hot-reload, rate, telemetry | [`sona_architecture.md`](../../../../docs/specs/architecture/sona_architecture.md) |
-| [`handle/controls.rs`](handle/controls.rs) | Non-blocking control & tempo API | [`parametric_control_bus.md`](../../../../docs/specs/dsp/parametric_control_bus.md) |
+| [`handle/lifecycle.rs`](handle/lifecycle.rs) | Non-blocking init, swap & telemetry | [`sona_architecture.md`](../../../../docs/specs/architecture/sona_architecture.md) |
+| [`handle/controls.rs`](handle/controls.rs) | Wait-free SPSC control & shadow getters | [`parametric_control_bus.md`](../../../../docs/specs/dsp/parametric_control_bus.md) |
 | [`handle/process.rs`](handle/process.rs) | Sub-block audio & offline bounce | [`router_and_stages_topology.md`](../../../../docs/specs/dsp/router_and_stages_topology.md) |
 
 See [`packages/engine/CONTRIBUTING.md`](../../CONTRIBUTING.md) for real-time execution safety invariants.

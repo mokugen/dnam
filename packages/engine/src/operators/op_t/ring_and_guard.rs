@@ -174,8 +174,10 @@ pub fn directed_fp16_decay_write_bits(value: f32, max_bound: f32) -> u16 {
     }
 }
 
-/// Grouped block-maxima + binary max-tree feedback guard over $M$ delay lines (`ref[dsp.op-t.guard.bounded-history]`,
-/// `ref[dsp.op-t.guard.max-tree]`, `ref[dsp.op-t.guard.bibo-decay]`).
+/// Grouped block-maxima + flat 1-indexed binary max-tree feedback guard over $M$ delay lines
+/// (`O(1)` root query, `O(log2(N/H))` tree update every `H` samples, `0 UDIV`, `0 FDIV`,
+/// `ref[dsp.op-t.guard.bounded-history]`, `ref[dsp.op-t.guard.max-tree]`,
+/// `ref[dsp.op-t.guard.incremental-counters]`, `ref[dsp.op-t.guard.bibo-decay]`).
 #[derive(Clone, Debug)]
 pub struct OpTBlockMaxTreeGuard {
     pub block_size: usize,
@@ -184,22 +186,31 @@ pub struct OpTBlockMaxTreeGuard {
     pub block_indices: Vec<usize>,
     pub in_block_offsets: Vec<usize>,
     pub fresh_max: Vec<f64>,
-    pub block_maxima: Vec<Vec<f64>>,
+    pub line_leaf_bases: Vec<usize>,
+    pub leaf_cap: usize,
+    pub max_tree: Vec<f64>,
 }
 
 impl OpTBlockMaxTreeGuard {
     pub fn new(initial_histories: Vec<Vec<f64>>, block_size: usize) -> Self {
         assert!(block_size > 0 && !initial_histories.is_empty());
         let n_lines = initial_histories.len();
-        let mut block_maxima = Vec::with_capacity(n_lines);
+        let mut line_leaf_bases = Vec::with_capacity(n_lines);
+        let mut block_leaves = Vec::new();
         for h in &initial_histories {
             assert!(!h.is_empty());
-            let mut bm = Vec::new();
+            line_leaf_bases.push(block_leaves.len());
             for chunk in h.chunks(block_size) {
                 let m = chunk.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
-                bm.push(m);
+                block_leaves.push(m);
             }
-            block_maxima.push(bm);
+        }
+        let leaf_cap = block_leaves.len().max(1).next_power_of_two();
+        let mut max_tree = vec![0.0_f64; 2 * leaf_cap];
+        max_tree[leaf_cap..leaf_cap + block_leaves.len()].copy_from_slice(&block_leaves);
+        for node in (1..leaf_cap).rev() {
+            let left = node << 1;
+            max_tree[node] = max_tree[left].max(max_tree[left | 1]);
         }
         Self {
             block_size,
@@ -208,25 +219,40 @@ impl OpTBlockMaxTreeGuard {
             block_indices: vec![0; n_lines],
             in_block_offsets: vec![0; n_lines],
             fresh_max: vec![0.0; n_lines],
-            block_maxima,
+            line_leaf_bases,
+            leaf_cap,
+            max_tree,
         }
     }
 
-    /// Returns the upper bound $M_n$ across all active blocks and completed block maxima.
+    #[inline(always)]
+    fn update_tree_leaf(&mut self, mut idx: usize, val: f64) {
+        self.max_tree[idx] = val;
+        while idx > 1 {
+            let parent = idx >> 1;
+            let left = parent << 1;
+            let merged = self.max_tree[left].max(self.max_tree[left | 1]);
+            if merged == self.max_tree[parent] {
+                break;
+            }
+            self.max_tree[parent] = merged;
+            idx = parent;
+        }
+    }
+
+    /// Returns the `O(1)` global upper bound $M_n$ across the binary max-tree root and active block maxima.
+    #[inline(always)]
     pub fn bound(&self) -> f64 {
-        let mut m = 0.0_f64;
+        let mut m = self.max_tree[1];
         for &f in &self.fresh_max {
             m = m.max(f);
-        }
-        for bm in &self.block_maxima {
-            for &b in bm {
-                m = m.max(b);
-            }
         }
         m
     }
 
-    /// Writes `value` to `line` at its current write position and updates its block maximum (`0 UDIV`, `0 FDIV`).
+    /// Writes `value` to `line` at its current write position and maintains the binary max-tree
+    /// with incremental `(block_idx, in_block_offset)` counters (`0 UDIV`, `0 FDIV`).
+    #[inline]
     pub fn write(&mut self, line: usize, value: f64) {
         let pos = self.positions[line];
         let len = self.histories[line].len();
@@ -236,7 +262,8 @@ impl OpTBlockMaxTreeGuard {
         let next_pos = pos + 1;
         if next_in_block == self.block_size || next_pos == len {
             let b_idx = self.block_indices[line];
-            self.block_maxima[line][b_idx] = self.fresh_max[line];
+            let leaf_idx = self.leaf_cap + self.line_leaf_bases[line] + b_idx;
+            self.update_tree_leaf(leaf_idx, self.fresh_max[line]);
             self.fresh_max[line] = 0.0;
             self.in_block_offsets[line] = 0;
             self.block_indices[line] = if next_pos == len { 0 } else { b_idx + 1 };
@@ -247,29 +274,13 @@ impl OpTBlockMaxTreeGuard {
     }
 }
 
-/// Evaluates the 3-phase cardinal quadratic B-spline barberpole window ($M = 3$, `0 FDIV`, `0 libm`,
+/// Evaluates the 3-phase cardinal quadratic B-spline barberpole window via
+/// [`dnam_kernels::bspline_barberpole_3phase_f32`] ($M = 3$, `0 FDIV`, `0 libm`,
 /// $\sum_{m=0}^2 B_2(3 \cdot \mathrm{frac}(\phi + m/3)) \equiv 1.0$, `ref[dsp.op-t.window.m3-barberpole]`,
 /// `ref[dsp.op-t.window.partition-of-unity]`).
 #[inline]
 pub fn bspline_barberpole_3phase(phi: f32) -> [f32; 3] {
-    let p = phi - libm_free_floor_01(phi);
-    let t0 = 3.0 * p;
-    let k = (t0 as usize).min(2);
-    let u = (t0 - (k as f32)).clamp(0.0, 1.0);
-    let u2 = u * u;
-    let w_a = 0.5 * u2;
-    let w_c = 0.5 * (1.0 - u) * (1.0 - u);
-    let w_b = 1.0 - w_a - w_c;
-    match k {
-        0 => [w_a, w_b, w_c],
-        1 => [w_b, w_c, w_a],
-        _ => [w_c, w_a, w_b],
-    }
-}
-
-#[inline]
-fn libm_free_floor_01(x: f32) -> f32 {
-    crate::math::floor_f32(x)
+    dnam_kernels::bspline_barberpole_3phase_f32(phi)
 }
 
 /// Evaluates the two grain phases $(\phi_A, \phi_B)$, Hermite-Hann weights $(H_A, H_B)$, and read
@@ -478,6 +489,21 @@ mod spec_tests {
         }
         assert!(guard.bound() <= g_max * m0 + 1e-12);
 
+        // Non-multiple-of-64 history lengths with H = 64 binary max-tree conservative bound
+        let mut guard_64 = OpTBlockMaxTreeGuard::new(vec![vec![0.8; 130], vec![0.4; 195]], 64);
+        assert!((guard_64.bound() - 0.8).abs() < 1e-12);
+        for frame in 0..260 {
+            guard_64.write(0, 0.1 * ((frame % 5) as f64));
+            guard_64.write(1, 0.05);
+            let hist_max = guard_64
+                .histories
+                .iter()
+                .flat_map(|h| h.iter())
+                .fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            assert!(guard_64.bound() + 1e-12 >= hist_max);
+        }
+        assert!(guard_64.bound() <= 0.45);
+
         for bits in 1u16..0x7c00 {
             let max_val = fp16_to_f32(bits);
             let decayed_bits = directed_fp16_decay_write_bits(max_val, max_val);
@@ -600,7 +626,7 @@ mod spec_tests {
             prop_assert!((4..=1000).contains(&norm_int));
             prop_assert!((0.0..1.0).contains(&norm_mu));
 
-            let (ha, hb) = hermite_hann_partition_of_unity(phi.fract());
+            let (ha, hb) = hermite_hann_partition_of_unity(phi - crate::math::floor_f32(phi));
             prop_assert!((ha + hb - 1.0).abs() < 1e-6);
             let w3 = bspline_barberpole_3phase(phi);
             prop_assert!((w3[0] + w3[1] + w3[2] - 1.0).abs() < 1e-6);

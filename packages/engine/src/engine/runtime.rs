@@ -1,6 +1,6 @@
 //! State lifecycle, model reloading, and offline bounce rendering for [`DnamEngine`].
 
-use super::{DnamEngine, EngineBackend, OFFLINE_BOUNCE_PDC_SAMPLES};
+use super::{DnamEngine, EngineBackend};
 use crate::container::{DnamContainerView, DnamPreamble, ZohRescaledParams};
 use crate::schema::DnamError;
 use crate::types::Tier;
@@ -13,6 +13,18 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         max_supported_tier: Tier,
         sample_rate_hz: u32,
     ) -> Result<(), DnamError> {
+        if (view.preamble.version_major, view.preamble.version_minor)
+            != (
+                crate::container::CONTAINER_VERSION_MAJOR,
+                crate::container::CONTAINER_VERSION_MINOR,
+            )
+            || view.header.architecture != "sona"
+        {
+            return Err(DnamError::UnsupportedVersion {
+                major: view.preamble.version_major,
+                minor: view.preamble.version_minor,
+            });
+        }
         let arena_len = view.arena_storage.as_bytes().len();
         let max_available_tier = Self::detect_max_tier(&view.preamble, arena_len);
         let active_tier = tier.min(max_available_tier).min(max_supported_tier);
@@ -30,11 +42,19 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         let single_input = view.header.io_config.inputs == 1;
         self.preamble = view.preamble;
         self.header = Some(view.header);
+        self.header_active = true;
+        self.reloaded_header_flags = None;
         self.verification_status = view.verification_status;
+        self.verification_status_active = true;
         self.protection_profile = view.protection_profile;
         self.arena_storage = view.arena_storage;
         self.control_bus.num_contributors = 0;
         self.control_bus.load_control_records(&view.control_records);
+        let active_hdr = if self.header_active {
+            self.header.as_ref()
+        } else {
+            None
+        };
         if !view.clamp_descriptors.is_empty() {
             let n_desc = view.clamp_descriptors.len();
             self.control_bus.ensure_control_capacity(n_desc);
@@ -45,7 +65,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                 self.control_bus.num_controls = n_desc;
             }
         } else if view.control_records.is_empty()
-            && let Some(ref hdr) = self.header
+            && let Some(hdr) = active_hdr
             && !hdr.controls_schema.is_empty()
             && let Ok(compiled) = hdr.compile_clamp_descriptors()
         {
@@ -62,7 +82,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             self.control_bus
                 .load_cp1_contributors(&view.cp1_contributors);
         }
-        if let Some(ref hdr) = self.header {
+        if let Some(hdr) = active_hdr {
             self.control_bus
                 .ensure_control_capacity(hdr.controls_schema.len());
         }
@@ -72,6 +92,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         self.offline_bounce = false;
         self.control_bus.offline_bounce = false;
         self.maximize_tier_on_bounce = true;
+        self.control_bus.ultra_tier_active = self.effective_tier() == Tier::Ultra;
         self.oversampler.reset();
         self.oversampler_aux.reset();
         self.tempo_state.sample_rate_hz = sample_rate_hz;
@@ -97,31 +118,53 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     ) {
         let arena = self.arena_storage.as_bytes();
         let max_tier_idx = (Self::detect_max_tier(preamble, arena.len()) as usize).min(3);
-        let declared_48k = self.header.as_ref().map_or(0usize, |hdr| {
+        let declared_48k = self.header().map_or(0usize, |hdr| {
             hdr.delay_histories
                 .iter()
-                .map(|d| d.max_samples_48k as usize)
+                .map(|d| d.max_samples_48k() as usize)
                 .max()
                 .unwrap_or(0)
         });
         let mono_out = !preamble.is_stereo_out();
-        let mat = crate::stages::weights::unpack_v3_matryoshka_from_arena(arena, mono_out);
+        let mat = crate::stages::weights::unpack_sona_matryoshka_from_arena(arena, mono_out);
         *self.cold_tiers = mat.to_four_tiers();
-        let tier_max_req = self.cold_tiers[..=max_tier_idx]
-            .iter()
-            .map(|m| {
-                m.stage4.delay_lengths.iter().copied().max().unwrap_or(0)
-                    + (m.stage4.lfo_depth_samples as usize)
-                    + 6
-            })
-            .max()
-            .unwrap_or(0);
+        let mut tier_max_req = 0usize;
+        let mut needs_ext_or_diffuser = false;
+        for m in &self.cold_tiers[..=max_tier_idx] {
+            let aq = m.stage4.active_quads.clamp(1, 4);
+            if aq > 1 {
+                needs_ext_or_diffuser = true;
+            }
+            for q in 0..aq {
+                let qp = m.stage4.effective_quad_params(q);
+                if qp.ext_format == crate::stages::stage4_tank::v3_fdn::Stage4ExtFormat::F32
+                    || qp.allpass_delays.iter().any(|&d| d > 0)
+                {
+                    needs_ext_or_diffuser = true;
+                }
+                let q_req = qp.delay_lengths.iter().copied().max().unwrap_or(0)
+                    + (qp.lfo_depth_samples as usize)
+                    + 6;
+                tier_max_req = tier_max_req.max(q_req);
+            }
+        }
         let max_ref = declared_48k.max(tier_max_req);
-        if max_ref > crate::stages::stage4_tank::v3_fdn::V3_TANK_CAP {
-            let stage4_min_cap = max_ref.saturating_mul(4).saturating_add(32);
+        let bounce_min = max_ref.saturating_mul(16).saturating_add(32).max(2_048);
+        if max_ref > crate::stages::stage4_tank::v3_fdn::V3_TANK_CAP
+            || bounce_min > crate::stages::stage4_tank::v3_fdn::V3_TANK_CAP
+            || needs_ext_or_diffuser
+        {
+            self.hot_core
+                .ensure_cold_stage4_cap(&self.cold_tiers[max_tier_idx].stage4, bounce_min);
+            self.bounce_scratch
+                .hot_core
+                .ensure_cold_stage4_cap(&self.cold_tiers[max_tier_idx].stage4, bounce_min);
             let eff = (target_tier as usize).min(max_tier_idx);
             self.hot_core
-                .ensure_cold_stage4_cap(&self.cold_tiers[eff].stage4, stage4_min_cap);
+                .ensure_cold_stage4_cap(&self.cold_tiers[eff].stage4, bounce_min);
+            self.bounce_scratch
+                .hot_core
+                .ensure_cold_stage4_cap(&self.cold_tiers[eff].stage4, bounce_min);
         }
     }
 
@@ -155,6 +198,8 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
     pub(crate) fn load_v3_hot_core_from_arena(&mut self, reset_state: bool) {
         let arena = self.arena_storage.as_bytes();
+        let mono_out = !self.preamble.is_stereo_out();
+        let mat = crate::stages::weights::unpack_sona_matryoshka_from_arena(arena, mono_out);
         if arena.len() >= 64 {
             let mut has_s = false;
             let mut s_mat = [[0.0_f32; 4]; 4];
@@ -171,13 +216,24 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             }
             if has_s {
                 self.stage0_router.set_scattering_matrix(s_mat);
+            } else if mat
+                .stage0
+                .s_router
+                .iter()
+                .flatten()
+                .any(|v| v.is_finite() && v.abs() > 1.0e-12)
+            {
+                self.stage0_router
+                    .set_scattering_matrix(mat.stage0.s_router);
             } else {
-                self.stage0_router.s_matrix = crate::stages::Stage0Router::new().s_matrix;
+                self.stage0_router.s_matrix = crate::stages::Stage0Router::DEFAULT_S_MATRIX;
             }
         }
-        if let Some(ref hdr) = self.header {
+        if let Some(hdr) = self.header() {
             self.stage0_router
                 .set_crossover_hz(hdr.stage0_router.sub_crossover_hz);
+        } else if let Some(flags) = self.reloaded_header_flags {
+            self.stage0_router.set_crossover_hz(flags.sub_crossover_hz);
         }
         self.stage0_router.reconfigure_sample_rate(&self.zoh);
 
@@ -191,105 +247,80 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             };
         }
 
-        let mono_out = !self.preamble.is_stereo_out();
-        let mat = crate::stages::weights::unpack_v3_matryoshka_from_arena(arena, mono_out);
         *self.cold_tiers = mat.to_four_tiers();
         let eff = self.effective_tier() as usize;
-        let was_frozen = self.hot_core.stage4.freeze;
+        let was_frozen = self.hot_core.stage4_freeze();
         if reset_state {
             self.hot_core.reload_in_place(&self.cold_tiers[eff]);
         } else {
             self.hot_core.switch_tier(&self.cold_tiers[eff]);
-            self.hot_core.stage4.freeze = was_frozen;
+            self.hot_core.set_stage4_freeze(was_frozen);
         }
-        if (self.zoh.rho_sr - 1.0).abs() > 1.0e-12 {
-            self.hot_core
-                .reconfigure_with_zoh(&self.cold_tiers[eff], &self.zoh);
-        }
-    }
-
-    /// Reconfigures ZOH parameters for a live/offline-bounce transition without wiping
-    /// recursive DSP state or dynamic `ControlBus` state (`R20-E4`).
-    pub(crate) fn reconfigure_for_bounce_toggle(&mut self) -> Result<(), DnamError> {
-        self.control_bus.offline_bounce = self.offline_bounce;
-        let sample_rate_hz = self.zoh.sample_rate_host_hz;
-        let (r_ac_tr, r_dc_tr, tau_ref_tr, switch_xfade_tr) = self.training_zoh_poles();
-        let oversample_factor = if self.offline_bounce { 4 } else { 1 };
-        self.zoh = ZohRescaledParams::compute_oversampled(
-            self.preamble.sample_rate_train_hz,
-            sample_rate_hz,
-            oversample_factor,
-            r_ac_tr,
-            r_dc_tr,
-            tau_ref_tr,
-            switch_xfade_tr,
-        )?;
-        let rho_ctrl = self.zoh.rho_ctrl;
-        {
-            let arena = self.arena_storage.as_bytes();
-            self.control_bus.update_sample_rate_params(arena, rho_ctrl);
-        }
-        self.load_v3_hot_core_from_arena(false);
-        self.sync_immediate_control_state_inner();
-        self.oversampler.reset();
-        self.oversampler_aux.reset();
-        self.ctrl_sub_counter = 0;
-        self.ctrl_energy_accum = 0.0;
-        Ok(())
+        let target_os2x = self.cold_tiers[eff].os2x && !self.offline_bounce;
+        self.hot_core.reconfigure_with_zoh_mode(
+            &self.cold_tiers[eff],
+            &self.zoh,
+            if target_os2x { 2 } else { 1 },
+            self.offline_bounce,
+        );
+        self.hot_core.set_os2x(target_os2x);
+        self.hot_core.set_s0_s_router(self.stage0_router.s_matrix);
     }
 
     pub(crate) fn training_zoh_poles(&self) -> (f32, f32, f32, u32) {
         let arena = self.arena_storage.as_bytes();
-        let hdr_ac_pole = self
-            .header
-            .as_ref()
-            .map(|h| h.stage2_cascade.ac_coupling_pole)
-            .filter(|&p| p > 0.8 && p < 1.0)
-            .unwrap_or(0.9993);
         let v_ac =
             crate::stages::weights::read_f32_le(arena, crate::stages::weights::ARENA0_R_AC_OFFSET);
         let r_ac_tr = if v_ac > 0.9 && v_ac < 1.0 {
             v_ac
         } else {
-            hdr_ac_pole
+            0.9993
         };
-        let r_dc_tr = self
-            .header
-            .as_ref()
-            .map(|h| h.stage4_tank.dc_blocker_pole)
-            .filter(|&p| p > 0.8 && p < 1.0)
-            .unwrap_or(0.995);
+        let (hdr_dc, hdr_tau, hdr_xfade) = if let Some(h) = self.header() {
+            (
+                h.stage4_tank.dc_blocker_pole,
+                h.stage4_tank.tzf_reference_tap_samples,
+                h.stage4_tank.switch_xfade_samples,
+            )
+        } else if let Some(flags) = self.reloaded_header_flags {
+            (
+                flags.dc_blocker_pole,
+                flags.tzf_reference_tap_samples,
+                flags.switch_xfade_samples,
+            )
+        } else {
+            (0.995, 64.0, 128)
+        };
+        let r_dc_tr = if hdr_dc > 0.8 && hdr_dc < 1.0 {
+            hdr_dc
+        } else {
+            0.995
+        };
         let zero_op_t = crate::stages::weights::has_pipeline_flag(
             self.arena_storage.as_bytes(),
             crate::stages::weights::PIPE_FLAG_ZERO_OP_T_PRE,
         );
         let tau_ref_tr = if zero_op_t {
             0.0
+        } else if hdr_tau > 0.0 {
+            hdr_tau
         } else {
-            self.header
-                .as_ref()
-                .map(|h| h.stage4_tank.tzf_reference_tap_samples)
-                .filter(|&t| t > 0.0)
-                .unwrap_or(64.0)
+            64.0
         };
-        let switch_xfade_tr = self
-            .header
-            .as_ref()
-            .map(|h| h.stage4_tank.switch_xfade_samples)
-            .filter(|&x| x > 0)
-            .unwrap_or(128) as u32;
+        let switch_xfade_tr = if hdr_xfade > 0 { hdr_xfade as u32 } else { 128 };
         (r_ac_tr, r_dc_tr, tau_ref_tr, switch_xfade_tr)
     }
 
-    pub(crate) fn reconfigure_for_sample_rate_with_mode(
+    /// Zero-drop-glue (`Copy` error) sample-rate reconfiguration for real-time model reloaders.
+    pub(crate) fn reconfigure_for_sample_rate_rt(
         &mut self,
         sample_rate_hz: u32,
         reset_controls: bool,
-    ) -> Result<(), DnamError> {
+    ) -> Result<(), crate::container::ContainerWireError> {
         let (r_ac_tr, r_dc_tr, tau_ref_tr, switch_xfade_tr) = self.training_zoh_poles();
 
         let oversample_factor = if self.offline_bounce { 4 } else { 1 };
-        self.zoh = ZohRescaledParams::compute_oversampled(
+        let Some(new_zoh) = ZohRescaledParams::compute_oversampled_opt(
             self.preamble.sample_rate_train_hz,
             sample_rate_hz,
             oversample_factor,
@@ -297,23 +328,37 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             r_dc_tr,
             tau_ref_tr,
             switch_xfade_tr,
-        )?;
+        ) else {
+            return Err(crate::container::ContainerWireError::InvalidSampleRate(
+                sample_rate_hz,
+            ));
+        };
+        self.zoh = new_zoh;
 
+        self.control_bus.ultra_tier_active = self.effective_tier() == Tier::Ultra;
+        let eff_len = self
+            .effective_tier()
+            .expected_arena_bytes()
+            .min(self.arena_storage.as_bytes().len());
         if reset_controls {
-            if let Some(ref hdr) = self.header {
+            if let Some(hdr) = self.header() {
                 let default_blend = hdr.io_config.capabilities.default_blend;
                 self.configure_host_mix_and_leveling(default_blend, 0.0, true);
+            } else if let Some(flags) = self.reloaded_header_flags {
+                self.configure_host_mix_and_leveling(flags.default_blend, 0.0, true);
             } else {
                 self.mix_dry_gain = 0.0;
                 self.mix_wet_gain = 1.0;
             }
-            let arena = self.arena_storage.as_bytes();
-            self.control_bus.load_from_arena0(
-                arena,
-                self.preamble.num_controls as usize,
-                self.zoh.rho_ctrl,
-            );
-            if let Some(ref hdr) = self.header {
+            {
+                let arena = self.arena_storage.as_bytes();
+                self.control_bus.load_from_arena0(
+                    arena,
+                    self.preamble.num_controls as usize,
+                    self.zoh.rho_ctrl,
+                );
+            }
+            if let Some(hdr) = self.header() {
                 let mh = hdr.control_bus.head_trust_region_radius;
                 if mh > 1e-3 {
                     self.control_bus.trust_radius_mh = mh;
@@ -321,12 +366,15 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                         crate::math::newton6_reciprocal_f64((mh as f64) * (mh as f64)) as f32;
                 }
             }
-            self.control_bus.refresh_static_state(arena);
+            let eff_arena = &self.arena_storage.as_bytes()[..eff_len];
+            self.control_bus.refresh_static_state(eff_arena);
         } else {
-            let arena = self.arena_storage.as_bytes();
-            self.control_bus
-                .update_sample_rate_params(arena, self.zoh.rho_ctrl);
-            if let Some(ref hdr) = self.header {
+            {
+                let eff_arena = &self.arena_storage.as_bytes()[..eff_len];
+                self.control_bus
+                    .update_sample_rate_params(eff_arena, self.zoh.rho_ctrl);
+            }
+            if let Some(hdr) = self.header() {
                 let mh = hdr.control_bus.head_trust_region_radius;
                 if mh > 1e-3 {
                     self.control_bus.trust_radius_mh = mh;
@@ -335,14 +383,15 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                 }
             }
             self.control_bus.reset_dynamic_state();
-            self.control_bus.refresh_static_state(arena);
+            let eff_arena = &self.arena_storage.as_bytes()[..eff_len];
+            self.control_bus.refresh_static_state(eff_arena);
         }
 
         self.load_v3_hot_core_from_arena(reset_controls);
         self.current_stage_params = self.control_bus.stage_targets;
         self.stage_ramp_deltas = [0.0; 16];
         self.hot_core
-            .snap_control_bus_stage_targets(&self.current_stage_params);
+            .snap_control_bus_with_z_stage(&self.current_stage_params, &self.control_bus.z_stage);
 
         let num_ctrls = self.control_bus.num_controls;
         for ctrl_idx in 0..num_ctrls {
@@ -358,17 +407,31 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         Ok(())
     }
 
+    pub(crate) fn reconfigure_for_sample_rate_with_mode(
+        &mut self,
+        sample_rate_hz: u32,
+        reset_controls: bool,
+    ) -> Result<(), DnamError> {
+        self.reconfigure_for_sample_rate_rt(sample_rate_hz, reset_controls)
+            .map_err(loader::wire_err_to_dnam_rt)
+    }
+
     /// Resets all states to analytical DC resting equilibrium.
     pub fn reset_to_dc_equilibrium(&mut self) {
+        self.control_bus.ultra_tier_active = self.effective_tier() == Tier::Ultra;
         self.control_bus.reset_dynamic_state();
-        let arena = self.arena_storage.as_bytes();
+        let eff_len = self
+            .effective_tier()
+            .expected_arena_bytes()
+            .min(self.arena_storage.as_bytes().len());
+        let arena = &self.arena_storage.as_bytes()[..eff_len];
         self.control_bus.refresh_static_state(arena);
         self.current_stage_params = self.control_bus.stage_targets;
         self.stage_ramp_deltas = [0.0; 16];
         self.hot_core.reset_to_dc_equilibrium();
         self.stage0_router.reset();
         self.hot_core
-            .snap_control_bus_stage_targets(&self.current_stage_params);
+            .snap_control_bus_with_z_stage(&self.current_stage_params, &self.control_bus.z_stage);
         let num_ctrls = self.control_bus.num_controls;
         for ctrl_idx in 0..num_ctrls {
             let raw_val = self.control_bus.raw_values[ctrl_idx];
@@ -382,77 +445,9 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         self.ctrl_sub_counter = 0;
         self.ctrl_energy_accum = 0.0;
     }
-
-    /// Renders a complete stereo buffer in Offline Bounce mode, automatically stripping the 12-sample PDC lead-in.
-    pub fn render_offline_bounce(
-        &mut self,
-        left_in: &[f32],
-        right_in: &[f32],
-        left_out: &mut [f32],
-        right_out: &mut [f32],
-    ) {
-        let prev_bounce = self.offline_bounce;
-        if !prev_bounce {
-            self.set_offline_bounce(true);
-        }
-        self.reset_to_dc_equilibrium();
-
-        let n = left_in
-            .len()
-            .min(right_in.len())
-            .min(left_out.len())
-            .min(right_out.len());
-        let pdc = OFFLINE_BOUNCE_PDC_SAMPLES;
-        let mut sink_l = [0.0_f32; OFFLINE_BOUNCE_PDC_SAMPLES];
-        let mut sink_r = [0.0_f32; OFFLINE_BOUNCE_PDC_SAMPLES];
-
-        if n <= pdc {
-            let zeros = [0.0_f32; OFFLINE_BOUNCE_PDC_SAMPLES];
-            self.process_block(
-                &left_in[..n],
-                &right_in[..n],
-                &mut sink_l[..n],
-                &mut sink_r[..n],
-            );
-            let rem = pdc - n;
-            if rem > 0 {
-                self.process_block(
-                    &zeros[..rem],
-                    &zeros[..rem],
-                    &mut sink_l[..rem],
-                    &mut sink_r[..rem],
-                );
-            }
-            self.process_block(
-                &zeros[..n],
-                &zeros[..n],
-                &mut left_out[..n],
-                &mut right_out[..n],
-            );
-        } else {
-            self.process_block(&left_in[..pdc], &right_in[..pdc], &mut sink_l, &mut sink_r);
-            let body_len = n - pdc;
-            self.process_block(
-                &left_in[pdc..n],
-                &right_in[pdc..n],
-                &mut left_out[..body_len],
-                &mut right_out[..body_len],
-            );
-            let zeros = [0.0_f32; OFFLINE_BOUNCE_PDC_SAMPLES];
-            self.process_block(
-                &zeros,
-                &zeros,
-                &mut left_out[body_len..n],
-                &mut right_out[body_len..n],
-            );
-        }
-
-        if !prev_bounce {
-            self.set_offline_bounce(false);
-        }
-    }
 }
 
+pub mod bounce;
 pub mod loader;
 
 #[cfg(test)]
@@ -479,23 +474,23 @@ mod tests {
         );
 
         preamble.flags |= FLAG_HAS_FULL_DELTA;
-        preamble.arena_full_end_cl = 160;
+        preamble.arena_full_end_cl = 124;
         assert_eq!(
-            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 10_240),
+            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 7_936),
             Tier::Full
         );
 
         preamble.flags |= FLAG_HAS_PRO_DELTA;
-        preamble.arena_pro_end_cl = 288;
+        preamble.arena_pro_end_cl = 248;
         assert_eq!(
-            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 18_432),
+            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 15_872),
             Tier::Pro
         );
 
         preamble.flags |= FLAG_HAS_ULTRA_DELTA;
-        preamble.arena_ultra_end_cl = 448;
+        preamble.arena_ultra_end_cl = 480;
         assert_eq!(
-            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 28_672),
+            DnamEngine::<ScalarBackend>::detect_max_tier(&preamble, 30_720),
             Tier::Ultra
         );
     }
@@ -597,16 +592,16 @@ mod tests {
         let (bpm_tap, _) = owned_engine.register_tap_tempo(None, true);
         assert!((20.0..=400.0).contains(&bpm_tap));
         let d_before = owned_engine.stage0_router.return_aligner_l.delay_samples;
-        assert!((d_before - 8.0).abs() < 1e-5);
+        assert!((d_before - 62.0).abs() < 1e-5);
         owned_engine.reset_to_dc_equilibrium();
         assert_eq!(
             owned_engine.stage0_router.return_aligner_l.delay_samples,
             d_before
         );
 
-        // 5. Open v2.0 wire directory reload in-place and owned
+        // 5. Open v3.0 wire directory reload in-place and owned
         let hdr_json = serde_json::to_vec(&header).unwrap();
-        let open_v2 = crate::container::build_v2_open_dnam_container(
+        let open_v3 = crate::container::build_v3_open_dnam_container(
             &hdr_json,
             &arena[..crate::container::ARENA_OFFSET_LITE_END as usize],
             &[0xAA; 64],
@@ -625,12 +620,12 @@ mod tests {
         .unwrap();
         assert!(
             engine
-                .reload_model_in_place(&open_v2, Tier::Full, 48_000)
+                .reload_model_in_place(&open_v3, Tier::Full, 48_000)
                 .is_ok()
         );
         assert!(
             owned_engine
-                .reload_model_in_place_owned(&open_v2, Tier::Full, 48_000)
+                .reload_model_in_place_owned(&open_v3, Tier::Full, 48_000)
                 .is_ok()
         );
     }

@@ -1,13 +1,13 @@
 //! `dnam-engine` — Pure Rust `#![no_std]` + `alloc` Real-Time Stereo Neural Audio Modeling & Differentiable DSP Core.
 //!
-//! Unifies the Tri-Operator Recurrent Architecture (**TORA**) of **Dynamic Neural Audio Modeler (DNAM)**:
+//! Unifies the State-Space & Operator Neural Architecture (**SONA v3.0**) of **Dynamic Neural Audio Modeler (DNAM)**:
 //! 1. **Operators ([`operators`]):** Op-T (Transport / Elastic Buffer), Op-M (Symplectic Modal / Kautz Bank),
 //!    and Op-N (Multi-Drive PolyADAA Commuted Cascade / Waveshaping).
-//! 2. **Stages ([`stages`]):** Stage 0 8-Port Matrix Router, Stages I–IV Physical Topology, and
-//!    L1D-Resident Matryoshka Core ([`V3HotCore`]).
-//! 3. **Control Bus ([`control`]):** $3\text{ kHz}$ Envelopes/LFOs + Node-Anchored Lobatto HDMR & Rank-4
+//! 2. **Stages ([`stages`]):** Stage 0 8-Port Matrix Router, Unconditional Matryoshka Core
+//!    ([`SonaHotSlab`] / [`SonaInstance`]), Stage III Early FIR + Kautz, and Stage IV Spatial FDN Tank.
+//! 3. **Control Bus ([`control`]):** $3\text{ kHz}$ Envelopes/LFOs + Node-Anchored Lobatto HDMR & Rank-4/8
 //!    Factorization Machine with 128-byte CCR table, division-free 16-sample micro-ramping,
-//!    and `FiLM`/Zero-DC conditioning.
+//!    and `z_stage` sensitivity conditioning.
 //!
 //! ## Core Real-Time Invariants
 //! - **100% `#![no_std]` + `alloc` Foundation:** Zero OS calls, zero locks, and **zero heap allocations**
@@ -56,14 +56,14 @@ pub mod stages;
 #[cfg(test)]
 #[forbid(unsafe_code)]
 pub(crate) mod test_support;
-#[allow(unsafe_code)]
 pub mod types;
 
 pub use container::strip_container_to_tier;
 pub use dynamic::DynamicDnamEngine;
 pub use engine::{DnamAudioIo, DnamEngine, OFFLINE_BOUNCE_PDC_SAMPLES};
 pub use stages::{
+    SonaColdTierModel, SonaHotSlab, SonaInstance, SonaMatryoshkaModel, SonaTierReadout,
     TOTAL_LITE_STATE_RAM_BYTES, V3ColdTierModel, V3CoreInstance, V3HotCore, V3MatryoshkaModel,
-    V3TierReadout,
+    V3TierReadout, sona_process_block_default, sona_process_block_infallible_default,
 };
 pub use types::{DnamTelemetrySnapshot, FtzDazGuard, Tier};

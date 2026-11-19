@@ -24,17 +24,20 @@ pub mod prefix_delegation_crypto;
 pub mod watermark_and_preview;
 
 pub use oem_and_drm::{
-    HPKE_SUITE_X25519_SHA256_CHACHA20POLY1305, HpkeSlotPair, MAX_RECORD_CIPHERTEXT_BYTES,
-    MAX_RECORD_PLAINTEXT_BYTES, build_hpke_slot_binding_v1, build_oem_cert_v2_signing_message,
-    build_prewrap_plan_v1, build_record_aad_v1, build_record_nonce_v1,
-    compute_encrypted_structural_metadata_sha256, compute_record_context_sha256,
-    compute_wrap_plan_sha256, encode_hpke_slot_vector, encode_recipient_key_ids,
-    encode_record_directory, parse_hpke_slot_vector, parse_recipient_key_ids,
-    parse_record_directory,
+    DME1_WIRE_MAGIC, DNPL_WIRE_MAGIC, DNSL_WIRE_MAGIC, DRM_WIRE_VERSION_MAJOR,
+    DRM_WIRE_VERSION_MINOR, Dme1HeaderWire, DnplPreambleWire, DnslDirectoryWire, DnslPreambleWire,
+    HPKE_SUITE_X25519_SHA256_CHACHA20POLY1305, HpkeSlotPair, HpkeSlotWire, InnerDirectoryWire,
+    MAX_RECORD_CIPHERTEXT_BYTES, MAX_RECORD_PLAINTEXT_BYTES, RecordDirEntryWire,
+    build_hpke_slot_binding_v1, build_oem_cert_v2_signing_message, build_prewrap_plan_v1,
+    build_record_aad_v1, build_record_nonce_v1, compute_encrypted_structural_metadata_sha256,
+    compute_record_context_sha256, compute_wrap_plan_sha256, encode_hpke_slot_vector,
+    encode_recipient_key_ids, encode_record_directory, parse_hpke_slot_vector,
+    parse_recipient_key_ids, parse_record_directory,
 };
 pub use prefix_and_dau1::{
-    Dau1Envelope, build_plaintext_shared_v1, compute_ciphertext_prefixes_v1,
-    compute_plaintext_prefixes_v1, encode_prefix_list, hmac_sha256, parse_prefix_list,
+    Dai1Envelope, Dau1BuyerHeaderWire, Dau1CreatorPreambleWire, Dau1Envelope,
+    build_plaintext_shared_v1, compute_ciphertext_prefixes_v1, compute_plaintext_prefixes_v1,
+    encode_prefix_list, hmac_sha256, parse_prefix_list,
 };
 pub use prefix_delegation_crypto::{
     build_buyer_receipt_v1, build_creator_manifest_v1, build_outer_manifest_v1,

@@ -105,6 +105,15 @@ pub struct OemDeviceCertificate {
     pub device_id_hash: String,
     /// 32-byte (`64` lowercase hex chars) TrustZone `X25519` public key.
     pub pubkey_x25519: String,
+    /// Optional V2 attestation assurance level (`1 = remote_ota`, `2 = factory_hsm`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assurance: Option<u8>,
+    /// Optional V2 hex SHA-256 digest of the OEM attestation policy (`32 B` = 64 hex chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_policy_sha256: Option<String>,
+    /// Optional V2 hex SHA-256 digest of the OEM attestation evidence (`32 B` = 64 hex chars).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attestation_evidence_sha256: Option<String>,
     /// 64-byte (`128` lowercase hex chars) OEM factory `Ed25519` attestation signature.
     pub oem_sig_ed25519: String,
 }
@@ -164,7 +173,7 @@ pub struct MarketplaceReceipt {
     pub license_tier: String,
     /// ISO-8601 UTC timestamp of receipt issuance.
     pub issued_at: String,
-    /// Hex SHA-256 digest of the personalized buyer `Arena 0..3` (`64,000 B`, pre-encryption).
+    /// Hex SHA-256 digest of the personalized buyer `Arena 0..3` (`30,720 B`, pre-encryption).
     pub buyer_arena_sha256: String,
     /// Optional cumulative hex SHA-256 digests `[lite, full, pro, ultra]` of the buyer's watermarked arena.
     #[serde(default, skip_serializing_if = "Option::is_none")]

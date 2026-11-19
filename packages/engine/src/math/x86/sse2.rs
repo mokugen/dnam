@@ -1,12 +1,13 @@
 //! x86-64 SSE2 (`x86-64-v1`) baseline hardware math backend (`Sse2Vec4` & `X86Sse2Backend`).
 
 use core::arch::x86_64::{
-    __m128, _mm_add_epi32, _mm_add_ps, _mm_and_si128, _mm_andnot_ps, _mm_andnot_si128,
-    _mm_castps_si128, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_cmpgt_epi32, _mm_cvtss_f32,
-    _mm_max_ps, _mm_min_ps, _mm_movehl_ps, _mm_mul_ps, _mm_or_si128, _mm_set1_epi32, _mm_set1_ps,
-    _mm_setr_ps, _mm_shuffle_ps, _mm_slli_epi32, _mm_srli_epi32, _mm_sub_epi32, _mm_sub_ps,
-    _mm_xor_ps,
+    __m128, _mm_add_epi32, _mm_add_ps, _mm_and_ps, _mm_and_si128, _mm_andnot_ps, _mm_andnot_si128,
+    _mm_castps_si128, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_cmpgt_epi32, _mm_cmple_ps,
+    _mm_cvtss_f32, _mm_max_ps, _mm_min_ps, _mm_movehl_ps, _mm_movemask_ps, _mm_mul_ps, _mm_or_ps,
+    _mm_or_si128, _mm_set1_epi32, _mm_set1_ps, _mm_setr_ps, _mm_shuffle_ps, _mm_slli_epi32,
+    _mm_srli_epi32, _mm_sub_epi32, _mm_sub_ps, _mm_xor_ps,
 };
+use dnam_kernels::InterleavedStereo8;
 
 use crate::math::crc32c::{Crc32cBackend, crc32c_software_slice};
 use crate::math::{BackendKind, MathBackend, SimdVec4};
@@ -81,6 +82,21 @@ impl SimdVec4 for Sse2Vec4 {
             }
         };
         self.fma(a, Self(lane_v))
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        const { assert!(LANE < 4) };
+        // SAFETY: SSE is part of the x86-64 architectural baseline.
+        let lane_v = unsafe {
+            match LANE {
+                0 => _mm_shuffle_ps::<0x00>(v.0, v.0),
+                1 => _mm_shuffle_ps::<0x55>(v.0, v.0),
+                2 => _mm_shuffle_ps::<0xAA>(v.0, v.0),
+                _ => _mm_shuffle_ps::<0xFF>(v.0, v.0),
+            }
+        };
+        self.mul(Self(lane_v))
     }
 
     #[inline(always)]
@@ -187,6 +203,16 @@ impl SimdVec4 for Sse2Vec4 {
             Self(_mm_castsi128_ps(_mm_slli_epi32::<23>(biased)))
         }
     }
+
+    #[inline(always)]
+    fn exp2_clamped5(self) -> Self {
+        <Self as dnam_kernels::KernelVec4>::exp2_clamped5(self)
+    }
+
+    #[inline(always)]
+    fn scrub_recursive_state(self) -> Self {
+        <Self as dnam_kernels::KernelVec4>::flush_recursive_state(self)
+    }
 }
 
 /// Evaluates `T1` tracker exponent-split scales `(sd_l, su_l, sd_r, su_r)` in SSE2 registers.
@@ -213,6 +239,167 @@ pub(crate) fn sse2_tracker_exp_scales_f32(max_l: f32, max_r: f32) -> (f32, f32, 
     }
 }
 
+impl dnam_kernels::KernelVec4 for Sse2Vec4 {
+    #[inline(always)]
+    fn splat(val: f32) -> Self {
+        <Self as SimdVec4>::splat(val)
+    }
+
+    #[inline(always)]
+    fn splat_pair(a: f32, b: f32) -> Self {
+        <Self as SimdVec4>::splat_pair(a, b)
+    }
+
+    #[inline(always)]
+    fn from_array(arr: [f32; 4]) -> Self {
+        <Self as SimdVec4>::from_array(arr)
+    }
+
+    #[inline(always)]
+    fn to_array(self) -> [f32; 4] {
+        <Self as SimdVec4>::to_array(self)
+    }
+
+    #[inline(always)]
+    fn load(src: &[f32; 4]) -> Self {
+        <Self as SimdVec4>::load(src)
+    }
+
+    #[inline(always)]
+    fn store(self, dst: &mut [f32; 4]) {
+        <Self as SimdVec4>::store(self, dst);
+    }
+
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::add(self, rhs)
+    }
+
+    #[inline(always)]
+    fn sub(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::sub(self, rhs)
+    }
+
+    #[inline(always)]
+    fn mul(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::mul(self, rhs)
+    }
+
+    #[inline(always)]
+    fn fma(self, a: Self, b: Self) -> Self {
+        <Self as SimdVec4>::fma(self, a, b)
+    }
+
+    #[inline(always)]
+    fn fms(self, a: Self, b: Self) -> Self {
+        <Self as SimdVec4>::fms(self, a, b)
+    }
+
+    #[inline(always)]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        <Self as SimdVec4>::fma_lane::<LANE>(self, a, v)
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        <Self as SimdVec4>::mul_lane::<LANE>(self, v)
+    }
+
+    #[inline(always)]
+    fn max(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::max(self, rhs)
+    }
+
+    #[inline(always)]
+    fn min(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::min(self, rhs)
+    }
+
+    #[inline(always)]
+    fn abs(self) -> Self {
+        <Self as SimdVec4>::abs(self)
+    }
+
+    #[inline(always)]
+    fn neg(self) -> Self {
+        // SAFETY: SSE is part of the x86-64 architectural baseline.
+        unsafe { Self(_mm_xor_ps(self.0, _mm_set1_ps(-0.0))) }
+    }
+
+    #[inline(always)]
+    fn select_le(lhs: Self, rhs: Self, if_true: Self, if_false: Self) -> Self {
+        // SAFETY: SSE is part of the x86-64 architectural baseline.
+        unsafe {
+            let mask = _mm_cmple_ps(lhs.0, rhs.0);
+            Self(_mm_or_ps(
+                _mm_and_ps(mask, if_true.0),
+                _mm_andnot_ps(mask, if_false.0),
+            ))
+        }
+    }
+
+    #[inline(always)]
+    fn all_le(self, rhs: Self) -> bool {
+        // SAFETY: SSE is part of the x86-64 architectural baseline.
+        unsafe { _mm_movemask_ps(_mm_cmple_ps(self.0, rhs.0)) == 0xF }
+    }
+
+    #[inline(always)]
+    fn pair_swap_neg(self) -> Self {
+        <Self as SimdVec4>::pair_swap_neg(self)
+    }
+
+    #[inline(always)]
+    fn flush_subnormal(self) -> Self {
+        <Self as SimdVec4>::flush_subnormal(self)
+    }
+
+    #[inline(always)]
+    fn flush_recursive_state(self) -> Self {
+        // SAFETY: SSE2 is part of the x86-64 architectural baseline.
+        unsafe {
+            let bits = _mm_castps_si128(self.0);
+            let exp_mask = _mm_set1_epi32(0x7F80_0000);
+            let exp = _mm_and_si128(bits, exp_mask);
+            let is_nonfinite = _mm_cmpeq_epi32(exp, exp_mask);
+            let is_sub = _mm_cmpeq_epi32(exp, _mm_set1_epi32(0));
+            let clear_sub_mant = _mm_and_si128(is_sub, _mm_set1_epi32(0x007F_FFFF));
+            let cleared = _mm_andnot_si128(is_nonfinite, bits);
+            Self(_mm_castsi128_ps(_mm_andnot_si128(clear_sub_mant, cleared)))
+        }
+    }
+
+    #[inline(always)]
+    fn horizontal_sum(self) -> f32 {
+        <Self as SimdVec4>::horizontal_sum(self)
+    }
+
+    #[inline(always)]
+    fn horizontal_sum_pair(self, rhs: Self) -> (f32, f32) {
+        <Self as SimdVec4>::horizontal_sum_pair(self, rhs)
+    }
+
+    #[inline(always)]
+    fn dot(self, rhs: Self) -> f32 {
+        <Self as SimdVec4>::dot(self, rhs)
+    }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        <Self as SimdVec4>::rcp_pos_seed_bits(self)
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        <Self as SimdVec4>::rsqrt_pos_seed_bits(self)
+    }
+
+    #[inline(always)]
+    fn pow2_from_biased_int_bits(self) -> Self {
+        <Self as SimdVec4>::pow2_from_biased_int_bits(self)
+    }
+}
+
 /// x86-64 architectural baseline (`SSE` + `SSE2`) hardware math backend (`x86-64-v1`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct X86Sse2Backend;
@@ -234,6 +421,7 @@ impl Crc32cBackend for X86Sse2Backend {
 
 impl MathBackend for X86Sse2Backend {
     type Vec4 = Sse2Vec4;
+    type Stereo8 = InterleavedStereo8<Sse2Vec4>;
     const NAME: &'static str = "x86-64 SSE2 (128-bit __m128)";
     const KIND: BackendKind = BackendKind::X86Sse2;
 

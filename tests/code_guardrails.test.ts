@@ -129,6 +129,7 @@ function checkPackageLineCeilings(): void {
   const violations: string[] = [];
   const targets: Array<{ dir: string; exts: Set<string> }> = [
     { dir: path.join(PACKAGES_DIR, "kernels"), exts: new Set([".rs"]) },
+    { dir: path.join(PACKAGES_DIR, "engine"), exts: new Set([".rs"]) },
     { dir: path.join(PACKAGES_DIR, "fixtures"), exts: new Set([".rs"]) },
     { dir: path.join(PACKAGES_DIR, "capture"), exts: new Set([".rs"]) },
     { dir: path.join(PACKAGES_DIR, "ui"), exts: new Set([".ts", ".tsx"]) },
@@ -287,7 +288,7 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
     for (const srcDir of [engineSrcDir, kernelsSrcDir]) {
       for (const rsPath of walkFilesByExtensions(srcDir, new Set([".rs"]))) {
         const base = path.basename(rsPath);
-        if (base === "test_support.rs" || base === "exact_int_verify.rs") continue;
+        if (base === "test_support.rs") continue;
         scanRustProdLines(rsPath, (sLine, _raw, ln) => {
           if (forbiddenCallRe.test(sLine)) {
             violations.push(`${relPath(rsPath)}:${ln}: ${sLine.trim()}`);
@@ -328,6 +329,11 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
     const violations: string[] = [];
     for (const safeDir of [
       path.join(PACKAGES_DIR, "kernels", "src"),
+      path.join(PACKAGES_DIR, "engine", "src", "container"),
+      path.join(PACKAGES_DIR, "engine", "src", "control"),
+      path.join(PACKAGES_DIR, "engine", "src", "provenance"),
+      path.join(PACKAGES_DIR, "engine", "src", "stages"),
+      path.join(PACKAGES_DIR, "engine", "src", "schema"),
       path.join(PACKAGES_DIR, "studio", "rust"),
     ]) {
       for (const rsPath of walkFilesByExtensions(safeDir, new Set([".rs"]))) {

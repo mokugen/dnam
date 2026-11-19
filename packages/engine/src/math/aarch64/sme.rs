@@ -4,27 +4,51 @@
 //! when `FEAT_SVE2` is absent (such as on Apple M4 processors, which implement `FEAT_SME` + `NEON`
 //! without `FEAT_SVE2`).
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
+use dnam_kernels::InterleavedStereo8;
+
 use super::neon::{NeonBackend, NeonVec4, aarch64_crc32c_update};
 use super::sve2::ArmSve2Backend;
 use crate::math::crc32c::Crc32cBackend;
 use crate::math::{BackendKind, MathBackend, SimdVec4};
+
+/// SME stereo 8-lane vector (`lanes 0..3 = Left`, `4..7 = Right`, backed by `NeonVec4`).
+pub type SmeStereo8 = InterleavedStereo8<NeonVec4>;
+
+/// Cached `FEAT_SME` support state (`0 = uninitialized`, `1 = unsupported`, `2 = supported`).
+static SME_SUPPORT_CACHE: AtomicU8 = AtomicU8::new(0);
+/// Cached `FEAT_SME_F64F64` support state (`0 = uninitialized`, `1 = unsupported`, `2 = supported`).
+static SME_F64F64_SUPPORT_CACHE: AtomicU8 = AtomicU8::new(0);
 
 /// ARMv9.2-A Scalable Matrix Extension (`FEAT_SME` / `SME2`) hardware backend for `aarch64`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ArmSmeBackend;
 
 impl ArmSmeBackend {
+    /// Returns the cached `FEAT_SME` capability flag with a single relaxed atomic load and zero
+    /// OS feature-detection calls (`sysctlbyname`, `getauxval`, or `detect_and_initialize`).
+    #[inline(always)]
+    pub fn is_supported_cached() -> bool {
+        SME_SUPPORT_CACHE.load(Ordering::Relaxed) == 2
+    }
+
+    /// Returns the cached `FEAT_SME_F64F64` capability flag with a single relaxed atomic load and
+    /// zero OS feature-detection calls.
+    #[inline(always)]
+    pub fn is_f64f64_supported_cached() -> bool {
+        SME_F64F64_SUPPORT_CACHE.load(Ordering::Relaxed) == 2
+    }
+
     /// Detects at runtime whether the host `aarch64` CPU supports `FEAT_SME` (cached in an `AtomicU8`).
     #[inline]
     pub fn is_supported() -> bool {
-        use core::sync::atomic::{AtomicU8, Ordering};
-        static CACHE: AtomicU8 = AtomicU8::new(0);
-        let c = CACHE.load(Ordering::Relaxed);
+        let c = SME_SUPPORT_CACHE.load(Ordering::Relaxed);
         if c != 0 {
             return c == 2;
         }
         let ok = Self::detect_uncached();
-        CACHE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
+        SME_SUPPORT_CACHE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
         ok
     }
 
@@ -38,10 +62,10 @@ impl ArmSmeBackend {
         {
             Self::linux_hwcap2_bit(23)
         }
-        #[cfg(not(any(test, feature = "std")))]
+        #[cfg(all(target_os = "linux", not(any(test, feature = "std"))))]
         {
             let pfr1: u64;
-            // SAFETY: `ID_AA64PFR1_EL1` (`SME` bits [27:24]) is readable at EL1.
+            // SAFETY: `ID_AA64PFR1_EL1` (`SME` bits [27:24]) is emulated at EL0 by Linux.
             unsafe {
                 core::arch::asm!(
                     "mrs {p}, id_aa64pfr1_el1",
@@ -51,12 +75,12 @@ impl ArmSmeBackend {
             }
             ((pfr1 >> 24) & 0xF) >= 1
         }
-        #[cfg(all(
-            not(any(target_os = "macos", target_os = "linux")),
-            any(test, feature = "std")
-        ))]
+        #[cfg(not(any(
+            target_os = "linux",
+            all(target_os = "macos", any(test, feature = "std"))
+        )))]
         {
-            false
+            cfg!(target_feature = "sme")
         }
     }
 
@@ -65,16 +89,20 @@ impl ArmSmeBackend {
     #[inline]
     pub fn is_f64f64_supported() -> bool {
         if !Self::is_supported() {
+            let _ = SME_F64F64_SUPPORT_CACHE.compare_exchange(
+                0,
+                1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
             return false;
         }
-        use core::sync::atomic::{AtomicU8, Ordering};
-        static CACHE: AtomicU8 = AtomicU8::new(0);
-        let c = CACHE.load(Ordering::Relaxed);
+        let c = SME_F64F64_SUPPORT_CACHE.load(Ordering::Relaxed);
         if c != 0 {
             return c == 2;
         }
         let ok = Self::detect_f64f64_uncached();
-        CACHE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
+        SME_F64F64_SUPPORT_CACHE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
         ok
     }
 
@@ -91,11 +119,11 @@ impl ArmSmeBackend {
         {
             Self::linux_hwcap2_bit(25)
         }
-        #[cfg(not(any(test, feature = "std")))]
+        #[cfg(all(target_os = "linux", not(any(test, feature = "std"))))]
         {
             let smfr0: u64;
-            // SAFETY: Guarded by `Self::is_supported()` confirming `FEAT_SME`; `ID_AA64SMFR0_EL1`
-            // bit [48] (`F64F64`) is readable when `FEAT_SME` is present.
+            // SAFETY: Guarded by `Self::is_supported()` confirming `ID_AA64PFR1_EL1.SME != 0`;
+            // `ID_AA64SMFR0_EL1` bit [48] (`F64F64`) is emulated at EL0 by Linux.
             unsafe {
                 core::arch::asm!(
                     ".arch armv8.6-a+sme\nmrs {s}, id_aa64smfr0_el1",
@@ -105,12 +133,12 @@ impl ArmSmeBackend {
             }
             ((smfr0 >> 48) & 1) != 0
         }
-        #[cfg(all(
-            not(any(target_os = "macos", target_os = "linux")),
-            any(test, feature = "std")
-        ))]
+        #[cfg(not(any(
+            target_os = "linux",
+            all(target_os = "macos", any(test, feature = "std"))
+        )))]
         {
-            false
+            cfg!(target_feature = "sme-f64f64")
         }
     }
 
@@ -159,6 +187,7 @@ impl Crc32cBackend for ArmSmeBackend {
 
 impl MathBackend for ArmSmeBackend {
     type Vec4 = NeonVec4;
+    type Stereo8 = SmeStereo8;
     const NAME: &'static str = "ARMv9.2-A SME (Scalable Matrix Extension + SVE2/NEON)";
     const KIND: BackendKind = BackendKind::ArmSme;
 
@@ -172,55 +201,73 @@ impl MathBackend for ArmSmeBackend {
         NeonBackend::transpose_4x4(r0, r1, r2, r3)
     }
 
-    #[inline(always)]
+    #[inline]
     fn vec4_to_fp16x4(src: Self::Vec4) -> [u16; 4] {
-        if ArmSve2Backend::is_supported() {
+        if ArmSve2Backend::is_supported_cached() {
             return ArmSve2Backend::f32x4_to_fp16x4(&src.to_array());
         }
         NeonBackend::vec4_to_fp16x4(src)
     }
 
-    #[inline(always)]
+    #[inline]
     fn fp16x4_to_vec4(src: &[u16; 4]) -> Self::Vec4 {
-        if ArmSve2Backend::is_supported() {
+        if ArmSve2Backend::is_supported_cached() {
             return NeonVec4::load(&ArmSve2Backend::fp16x4_to_f32x4(src));
         }
         NeonBackend::fp16x4_to_vec4(src)
     }
 
-    #[inline(always)]
+    #[inline]
     fn f32x4_to_fp16x4(src: &[f32; 4]) -> [u16; 4] {
-        if ArmSve2Backend::is_supported() {
+        if ArmSve2Backend::is_supported_cached() {
             ArmSve2Backend::f32x4_to_fp16x4(src)
         } else {
             NeonBackend::f32x4_to_fp16x4(src)
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn fp16x4_to_f32x4(src: &[u16; 4]) -> [f32; 4] {
-        if ArmSve2Backend::is_supported() {
+        if ArmSve2Backend::is_supported_cached() {
             ArmSve2Backend::fp16x4_to_f32x4(src)
         } else {
             NeonBackend::fp16x4_to_f32x4(src)
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn rsqrt_nr2_f32(v0: f32) -> f32 {
-        if ArmSve2Backend::is_supported() {
+        if ArmSve2Backend::is_supported_cached() {
             ArmSve2Backend::rsqrt_nr2_f32(v0)
         } else {
             NeonBackend::rsqrt_nr2_f32(v0)
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn rsqrt_nr2_pair_f32(v0: f32, v1: f32) -> (f32, f32) {
-        if ArmSve2Backend::is_supported() {
+        if ArmSve2Backend::is_supported_cached() {
             ArmSve2Backend::rsqrt_nr2_pair_f32(v0, v1)
         } else {
             NeonBackend::rsqrt_nr2_pair_f32(v0, v1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ArmSmeBackend;
+
+    #[test]
+    fn test_sme_cached_feature_flags_match_warmed_detection() {
+        crate::math::warm_simd_feature_caches();
+        assert_eq!(
+            ArmSmeBackend::is_supported(),
+            ArmSmeBackend::is_supported_cached()
+        );
+        assert_eq!(
+            ArmSmeBackend::is_f64f64_supported(),
+            ArmSmeBackend::is_f64f64_supported_cached()
+        );
     }
 }

@@ -4,7 +4,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::schema::TempoSubdivision;
 use crate::types::Tier;
@@ -18,6 +18,7 @@ pub const SPSC_RING_CAPACITY: usize = 64;
 pub(crate) const SPSC_RING_MASK: usize = SPSC_RING_CAPACITY - 1;
 pub(crate) const MAX_EPOCH_29: u32 = (1 << 29) - 2;
 pub(crate) const FALLBACK_WORDS: usize = 20;
+const TAG_RESET_ENGINE: u8 = 15;
 
 /// Parameter update interpolation mode for Lane 1 (`Slewed` vs `Immediate`).
 #[repr(u8)]
@@ -273,7 +274,7 @@ impl RingEntry {
             }
             ControlCommand::ResetControl { index } => (13, 0, index, 0.0, 0.0),
             ControlCommand::ResetAllControls => (14, 0, 0, 0.0, 0.0),
-            ControlCommand::ResetEngine => (15, 0, 0, 0.0, 0.0),
+            ControlCommand::ResetEngine => (TAG_RESET_ENGINE, 0, 0, 0.0, 0.0),
         };
         let w0 = ((self.epoch as u64) << 32)
             | ((tag as u64) << 24)
@@ -333,7 +334,7 @@ impl RingEntry {
                 enabled: arg_u8 != 0,
             },
             13 => ControlCommand::ResetControl { index: arg_u16 },
-            15 => ControlCommand::ResetEngine,
+            TAG_RESET_ENGINE => ControlCommand::ResetEngine,
             _ => ControlCommand::ResetAllControls,
         };
         Self { epoch, cmd }
@@ -358,6 +359,12 @@ impl AtomicRingSlot {
         let w0 = self.words[0].load(Ordering::Relaxed);
         let w1 = self.words[1].load(Ordering::Relaxed);
         RingEntry::from_words([w0, w1])
+    }
+
+    #[inline]
+    pub(crate) fn is_reset_engine(&self) -> bool {
+        let w0 = self.words[0].load(Ordering::Relaxed);
+        ((w0 >> 24) & 0xFF) as u8 == TAG_RESET_ENGINE
     }
 }
 
@@ -536,10 +543,16 @@ pub struct SpscControlRing {
     pub(crate) lane2_slots: [AtomicRingSlot; SPSC_RING_CAPACITY],
     /// Lane 3: Seqlock counter for the overflow-proof fallback latch.
     pub(crate) fallback_seq: CachePadded<AtomicUsize>,
-    /// Lane 3: Epoch of the pending fallback latch (`0` = none).
-    pub(crate) fallback_epoch: AtomicU32,
-    /// Lane 3: Cumulative flag tracking whether `ResetEngine` occurred in the latched state.
-    pub(crate) fallback_reset_engine: AtomicU32,
+    /// Lane 3: Strictly monotonic 64-bit generation counter of the latest published fallback latch (`0` = none).
+    pub(crate) fallback_gen: AtomicU64,
+    /// Lane 3: Monotonic 64-bit generation counter last consumed by [`super::ControlConsumer`].
+    pub(crate) consumed_fallback_gen: AtomicU64,
+    /// Lane 3: 64-bit `epoch_base` captured inside the `fallback_seq` seqlock.
+    pub(crate) fallback_epoch_base: AtomicU64,
+    /// Lane 3: Full 64-bit causal epoch of the latched snapshot captured inside `fallback_seq`.
+    pub(crate) fallback_causal_epoch: AtomicU64,
+    /// Lane 3: Producer `head` cursor captured at latch time so pre-latch Lane 2 slots are skipped without mutation.
+    pub(crate) fallback_l2_head: AtomicUsize,
     /// Lane 3: Atomic words storing [`FallbackSnapshot`].
     pub(crate) fallback_words: [AtomicU64; FALLBACK_WORDS],
     /// Base 64-bit causal epoch offset added to 29-bit relative epochs (`next_epoch_29`).
@@ -566,8 +579,11 @@ impl SpscControlRing {
             tail: CachePadded::new(AtomicUsize::new(0)),
             lane2_slots: core::array::from_fn(|_| AtomicRingSlot::default()),
             fallback_seq: CachePadded::new(AtomicUsize::new(0)),
-            fallback_epoch: AtomicU32::new(0),
-            fallback_reset_engine: AtomicU32::new(0),
+            fallback_gen: AtomicU64::new(0),
+            consumed_fallback_gen: AtomicU64::new(0),
+            fallback_epoch_base: AtomicU64::new(0),
+            fallback_causal_epoch: AtomicU64::new(0),
+            fallback_l2_head: AtomicUsize::new(0),
             fallback_words: core::array::from_fn(|_| AtomicU64::new(0)),
             epoch_base: AtomicU64::new(0),
             drained_causal_epoch: CachePadded::new(AtomicU64::new(0)),
@@ -595,23 +611,19 @@ impl SpscControlRing {
         }
     }
 
-    pub(crate) fn tombstone_unconsumed_lane2(&self) -> bool {
-        let mut saw_reset_engine = false;
+    /// Scans queued Lane 2 slots `[tail..head)` read-only for an unconsumed `ResetEngine` entry
+    /// without mutating slots concurrently read by the SPSC consumer.
+    pub(crate) fn has_unconsumed_reset_in_lane2(&self) -> bool {
         let tail = self.tail.value.load(Ordering::Acquire);
         let head = self.head.value.load(Ordering::Relaxed);
-        let mut cursor = tail;
-        while cursor != head {
-            let slot = &self.lane2_slots[cursor & SPSC_RING_MASK];
-            if matches!(slot.load().cmd, ControlCommand::ResetEngine) {
-                saw_reset_engine = true;
+        let count = head.wrapping_sub(tail).min(SPSC_RING_CAPACITY);
+        for offset in 0..count {
+            let idx = tail.wrapping_add(offset) & SPSC_RING_MASK;
+            if self.lane2_slots[idx].is_reset_engine() {
+                return true;
             }
-            slot.store(RingEntry {
-                epoch: 0,
-                cmd: ControlCommand::ResetAllControls,
-            });
-            cursor = cursor.wrapping_add(1);
         }
-        saw_reset_engine
+        false
     }
 }
 
@@ -771,5 +783,30 @@ mod tests {
             prop_assert_eq!(fb_out.host_mix, fb.host_mix);
             prop_assert_eq!(fb_out.tempo_clamp_mask, fb.tempo_clamp_mask);
         }
+    }
+
+    #[test]
+    fn test_has_unconsumed_reset_in_lane2_is_readonly() {
+        let ring = SpscControlRing::new(8, 0);
+        assert!(!ring.has_unconsumed_reset_in_lane2());
+        ring.lane2_slots[0].store(RingEntry {
+            epoch: 10,
+            cmd: ControlCommand::ResetAllControls,
+        });
+        ring.lane2_slots[1].store(RingEntry {
+            epoch: 11,
+            cmd: ControlCommand::ResetEngine,
+        });
+        ring.tail.value.store(0, Ordering::Relaxed);
+        ring.head.value.store(2, Ordering::Relaxed);
+
+        assert!(ring.has_unconsumed_reset_in_lane2());
+        // Slot contents and epochs must remain completely unmutated
+        let slot1 = ring.lane2_slots[1].load();
+        assert_eq!(slot1.epoch, 11);
+        assert!(matches!(slot1.cmd, ControlCommand::ResetEngine));
+        // Consumed region does not report stale reset
+        ring.tail.value.store(2, Ordering::Relaxed);
+        assert!(!ring.has_unconsumed_reset_in_lane2());
     }
 }

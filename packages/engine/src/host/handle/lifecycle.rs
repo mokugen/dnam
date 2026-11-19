@@ -66,15 +66,8 @@ impl DnamHostHandle {
         Ok(Self::new(engine))
     }
 
-    #[inline]
-    pub(crate) fn try_drain_if_audio_idle(&self) {
-        if let Some(mut audio_ctx) = self.audio.try_lock() {
-            audio_ctx.drain_and_publish();
-        }
-    }
-
-    /// Explicitly drains any pending SPSC control updates into the audio engine if the audio
-    /// lock can be acquired (blocks until the current audio block completes).
+    /// Explicitly drains any pending SPSC control updates into the audio engine (blocks until the
+    /// current audio block completes; intended for non-RT/test flushes).
     pub fn flush_pending_controls(&self) {
         let mut audio_ctx = self.audio.lock();
         audio_ctx.drain_and_publish();
@@ -146,14 +139,11 @@ impl DnamHostHandle {
         self.telemetry_record().requested_tier
     }
 
-    /// Switches the active compute [`Tier`] without blocking on an active audio block.
+    /// Switches the active compute [`Tier`] without blocking on or locking `self.audio`.
     pub fn set_tier(&self, tier: Tier) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.set_tier(tier);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.set_tier(tier);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Returns the highest [`Tier`] present in the loaded `.dnam` container wait-free.
@@ -168,14 +158,11 @@ impl DnamHostHandle {
         self.telemetry_record().max_supported_tier
     }
 
-    /// Sets the host ceiling [`Tier`] (`max_supported_tier`) without blocking on an active audio block.
+    /// Sets the host ceiling [`Tier`] (`max_supported_tier`) without blocking on `self.audio`.
     pub fn set_max_supported_tier(&self, max_tier: Tier) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.set_max_supported_tier(max_tier);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.set_max_supported_tier(max_tier);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Returns the effective [`Tier`] wait-free.
@@ -191,14 +178,11 @@ impl DnamHostHandle {
         self.telemetry_record().offline_bounce
     }
 
-    /// Enables or disables $4\times$ oversampled Offline Bounce mode without blocking on an active audio block.
+    /// Enables or disables $4\times$ oversampled Offline Bounce mode without locking `self.audio`.
     pub fn set_offline_bounce(&self, enabled: bool) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.set_offline_bounce(enabled);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.set_offline_bounce(enabled);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Returns `true` if `maximize_tier_on_bounce` is enabled wait-free.
@@ -207,14 +191,11 @@ impl DnamHostHandle {
         self.telemetry_record().maximize_tier_on_bounce
     }
 
-    /// Enables or disables automatic tier promotion during Offline Bounce without blocking on an active audio block.
+    /// Enables or disables automatic tier promotion during Offline Bounce without locking `self.audio`.
     pub fn set_maximize_tier_on_bounce(&self, enabled: bool) {
-        {
-            let mut prod = self.producer.lock();
-            prod.producer.set_maximize_tier_on_bounce(enabled);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        self.try_drain_if_audio_idle();
+        let mut prod = self.producer.lock();
+        prod.producer.set_maximize_tier_on_bounce(enabled);
+        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
     /// Returns the current Plugin Delay Compensation (`PDC`) latency in host samples (`0` or `12`) wait-free.
@@ -281,12 +262,6 @@ impl DnamHostHandle {
             let epoch = prod.producer.causal_epoch();
             prod.swap_controller
                 .publish_engine_at_epoch(next_engine, epoch);
-            prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-        }
-        if let Some(mut audio_ctx) = self.audio.try_lock() {
-            audio_ctx.drain_and_publish();
-            let mut prod = self.producer.lock();
-            let _ = prod.swap_controller.reclaim_retired();
             prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
         }
         Ok(())

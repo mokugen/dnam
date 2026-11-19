@@ -16,153 +16,77 @@
 //! Verifies that `ScalarBackend`, `NeonBackend`, `ArmSmeBackend`, and `DynamicDnamEngine`
 //! produce matching audio across `Lite`, `Full`, and `Ultra` tiers and all 4 I/O topologies.
 
-use std::collections::BTreeMap;
-
-use dnam_engine::container::{
-    ARENA_OFFSET_FULL_END, ARENA_OFFSET_LITE_END, ARENA_OFFSET_PRO_END, ARENA_OFFSET_ULTRA_END,
-    build_dnam_container,
-};
+use dnam_engine::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
 use dnam_engine::engine::EngineBackend;
 use dnam_engine::math::{
     BackendKind, DefaultMathBackend, MathBackend, ScalarBackend, SimdF64Vec2, SimdVec4,
     TrainerMathBackend,
 };
-use dnam_engine::schema::{
-    ControlBusConfig, DatasetProvenance, DnamJsonHeader, IoConfig, ModelMetadata, RouterConfig,
-    SlimmableTiersConfig, Stage1PreFxConfig, Stage2CascadeConfig, Stage3CabinetKautzConfig,
-    Stage4SpatialTankConfig, TierProfile,
+use dnam_engine::schema::DnamJsonHeader;
+use dnam_engine::stages::sona_core::{
+    MAX_KAUTZ_POLES, MAX_SONA_GROUPS, MAX_SONA_TILES, MAX_TOTAL_SONA_LANES, SONA_FIR_MAX_TAPS,
+    SonaMatryoshkaModel, SonaTierReadout,
 };
+use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::{DnamEngine, DynamicDnamEngine, Tier};
 
 fn build_parity_container() -> Vec<u8> {
-    let mut header = DnamJsonHeader {
-        version: "2.0.0".to_string(),
-        container_kind: "dnam".to_string(),
-        architecture: "DNAM_TORA".to_string(),
-        sample_rate_train_hz: 48_000,
-        metadata: ModelMetadata {
-            name: "Backend Parity Test Rig".to_string(),
-            author: None,
-            description: None,
-            license: None,
-            created_at: "2026-10-23T00:00:00Z".to_string(),
-            input_reference_dbfs: -20.5,
-            provenance: DatasetProvenance::default(),
-            distribution_policy: None,
-            signatures: None,
-        },
-        user_metadata: BTreeMap::new(),
-        io_config: IoConfig::default(),
-        slimmable_tiers: SlimmableTiersConfig {
-            lite: TierProfile {
-                feature_bus_dim: 64,
-                channels: 4,
-                early_fir_taps: 16,
-                kautz_modes: 4,
-                tank_lines: 4,
-                head_svd_rank: 4,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -40.0,
-                arena_end_byte_offset: ARENA_OFFSET_LITE_END,
-                prefix_crc32c: 0,
-            },
-            full: TierProfile {
-                feature_bus_dim: 128,
-                channels: 8,
-                early_fir_taps: 32,
-                kautz_modes: 8,
-                tank_lines: 8,
-                head_svd_rank: 4,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -45.0,
-                arena_end_byte_offset: ARENA_OFFSET_FULL_END,
-                prefix_crc32c: 0,
-            },
-            pro: TierProfile {
-                feature_bus_dim: 192,
-                channels: 12,
-                early_fir_taps: 48,
-                kautz_modes: 16,
-                tank_lines: 8,
-                head_svd_rank: 4,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -48.0,
-                arena_end_byte_offset: ARENA_OFFSET_PRO_END,
-                prefix_crc32c: 0,
-            },
-            ultra: TierProfile {
-                feature_bus_dim: 256,
-                channels: 16,
-                early_fir_taps: 64,
-                kautz_modes: 32,
-                tank_lines: 16,
-                head_svd_rank: 8,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -51.0,
-                arena_end_byte_offset: ARENA_OFFSET_ULTRA_END,
-                prefix_crc32c: 0,
-            },
-        },
-        controls_schema: Vec::new(),
-        presets: Vec::new(),
-        control_bus: ControlBusConfig::default(),
-        stage0_router: RouterConfig::default(),
-        stage1_pre: Stage1PreFxConfig::default(),
-        stage2_cascade: Stage2CascadeConfig::default(),
-        stage3_cabinet: Stage3CabinetKautzConfig::default(),
-        stage4_tank: Stage4SpatialTankConfig::default(),
-        delay_histories: Vec::new(),
-        tensor_directory: BTreeMap::new(),
-    };
+    let mut header = DnamJsonHeader::default_reference();
+    header.metadata.name = "Backend Parity Test Rig".to_string();
 
     let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    let mut model = dnam_engine::stages::V3MatryoshkaModel::dual_rate_default(false);
+    let mut model = SonaMatryoshkaModel::dual_rate_default(false);
     model.stage0.xo_low_gain = 1.05;
     model.stage0.xo_high_gain = 0.95;
     model.stage0.clean_sub_mix = 0.25;
-    model.stage0.op_p_sub_mix = 0.1;
-    model.svf.env_oct_sens = 1.2;
-    model.tone_svf.h0_proj_w = [0.25, -0.15, 0.10, 0.05];
-    model.tone_svf.s1_proj_w = 0.25;
-    for b in 0..dnam_engine::stages::stage2_gru::NUM_GRU_BLOCKS {
-        for f in 0..dnam_engine::stages::stage2_gru::NUM_IN_FEATS_B0 {
-            for l in 0..12 {
-                model.blocks[b].w_in_z[f][l] = 0.05;
-                model.blocks[b].w_in_r[f][l] = 0.04;
-                model.blocks[b].w_in_n[f][l] = 0.10 * if ((f + l) & 1) == 0 { 1.0 } else { -1.0 };
-            }
+    model.crossbar.op_p_crossbar_gain = 0.15;
+    model.crossbar.op_t_crossbar_gain = 0.10;
+    for g in 0..MAX_SONA_GROUPS {
+        model.crossbar.op_p_to_group[g][0] = 0.08;
+        let grp = &mut model.groups[g];
+        for l in 0..4 {
+            grp.svf_g[l] = 0.20 + 0.04 * (l as f32);
+            grp.svf_k[l] = core::f32::consts::FRAC_1_SQRT_2;
+            grp.lru_alpha_rel[l] = 0.90;
+            grp.in_x_weight[l] = if l == 0 {
+                0.75
+            } else {
+                0.10 * if ((g + l) & 1) == 0 { 1.0 } else { -1.0 }
+            };
+            grp.adaa_drive[l] = 0.65;
+            grp.wavefolder_mix[l] = 0.08;
+            grp.sag_depth[l] = 0.20;
+            grp.lru_kappa[l] = 0.30;
+            grp.lru_alpha_atk[l] = 0.05;
+            grp.tone_lp[l] = 0.20;
+            grp.tone_dir[l] = 0.70;
+            grp.rect_sign[l] = 1.0;
         }
-        for l in 0..12 {
-            model.blocks[b].b_z[l] = -0.35;
-            model.blocks[b].b_r[l] = 0.25;
-            model.blocks[b].k_sag[l] = 0.2;
-            model.blocks[b].k_quad[l] = 0.1;
-            model.blocks[b].w_rec_n[l][l] = 0.12;
-            if b > 0 {
-                model.blocks[b].w_prev_n[l][l] = 0.2;
+    }
+    for tile in &mut model.tiles[..MAX_SONA_TILES] {
+        for col in 0..4 {
+            for row in 0..4 {
+                tile.w_odd_4x4[col][row] = if col == row { 0.12 } else { 0.02 };
+                tile.w_lru_4x4[col][row] = if col == row { 0.04 } else { 0.0 };
             }
         }
     }
+    for m in 0..MAX_KAUTZ_POLES {
+        model.kautz_poles[m] = (0.90, 0.15 + 0.08 * ((m & 3) as f32));
+    }
     for tier in 0..4 {
-        for lane in 0..4 {
-            model.kautz_poles[tier * 4 + lane] = (0.90, 0.15 + 0.08 * (lane as f32));
-        }
-        let mut ro = dnam_engine::stages::V3TierReadout::default();
+        let mut ro = SonaTierReadout::default();
         for ch in 0..2 {
-            for l in 0..24 {
-                ro.pre_cab_w[ch][l] = 0.04 * (((l + ch + tier) % 5) as f32 - 2.0);
-                ro.direct_s2_w[ch][l] = 0.025;
+            for l in 0..MAX_TOTAL_SONA_LANES {
+                ro.pre_cab_w_odd[ch][l] = 0.04 * (((l + ch + tier) % 5) as f32 - 2.0);
+                ro.direct_w_odd[ch][l] = 0.025;
             }
         }
-        for tap in 0..64 {
+        for tap in 0..SONA_FIR_MAX_TAPS {
             ro.fir_l[tap] = if tap % 16 == 0 { 0.06 } else { 0.004 };
             ro.fir_r[tap] = if tap % 16 == 0 { 0.05 } else { 0.004 };
         }
-        for m in 0..16 {
+        for m in 0..MAX_KAUTZ_POLES {
             ro.kautz_b_gamma[m] = 0.35;
             ro.kautz_c_l[m] = (0.15, -0.08);
             ro.kautz_c_r[m] = (0.12, -0.06);
@@ -171,7 +95,7 @@ fn build_parity_container() -> Vec<u8> {
         model.stage4[tier].g_loop = 0.72;
         model.stage4[tier].wet_mix = 0.2;
     }
-    dnam_engine::stages::weights::pack_v3_matryoshka_to_arena(&model, &mut arena);
+    pack_sona_matryoshka_to_arena(&model, &mut arena);
 
     build_dnam_container(&mut header, &arena, &arena, false).unwrap()
 }
@@ -299,7 +223,7 @@ fn test_cross_backend_parity_and_4_io_topologies() {
         assert_eq!(ip_l, out_dl);
         assert_eq!(ip_r, out_dr);
 
-        // Verify Topology 3 (mono_to_stereo) and Topology 4 (mono)
+        // Verify Topology 3 (mono_to_stereo), Topology 4 (mono), and Stereo-to-Mono mid reconstruction
         eng_default.reset_to_dc_equilibrium();
         let (mut m2s_l, mut m2s_r) = (vec![0.0_f32; 512], vec![0.0_f32; 512]);
         eng_default.process_mono_to_stereo(&in_l, &mut m2s_l, &mut m2s_r);
@@ -307,7 +231,28 @@ fn test_cross_backend_parity_and_4_io_topologies() {
         eng_default.reset_to_dc_equilibrium();
         let mut m_out = vec![0.0_f32; 512];
         eng_default.process_mono(&in_l, &mut m_out);
-        assert_eq!(m2s_l, m_out);
+        for (i, (&m, (&ml, &mr))) in m_out.iter().zip(m2s_l.iter().zip(m2s_r.iter())).enumerate() {
+            let expected_mid = 0.5 * (ml + mr);
+            assert!(
+                (m - expected_mid).abs() < 1e-6,
+                "Mono mid mismatch on {tier:?} at {i}: m={m}, expected={expected_mid}"
+            );
+        }
+
+        eng_default.reset_to_dc_equilibrium();
+        let mut s2m_out = vec![0.0_f32; 512];
+        eng_default.process_stereo_to_mono(&in_l, &in_r, &mut s2m_out);
+        for (i, (&s, (&dl, &dr))) in s2m_out
+            .iter()
+            .zip(out_dl.iter().zip(out_dr.iter()))
+            .enumerate()
+        {
+            let expected_mid = 0.5 * (dl + dr);
+            assert!(
+                (s - expected_mid).abs() < 1e-6,
+                "Stereo-to-mono mid mismatch on {tier:?} at {i}: s={s}, expected={expected_mid}"
+            );
+        }
     }
 
     // Verify DynamicDnamEngine across available backends

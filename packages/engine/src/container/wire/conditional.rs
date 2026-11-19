@@ -18,16 +18,68 @@ pub struct SwitchControlSpec {
 }
 
 /// Validated conditional bound rule (`ref[container.dnam.conditional-rules]`).
-#[derive(Clone, Debug, PartialEq)]
+mod selector_list_serde {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    #[derive(Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SelectorWire<'a> {
+        control_id: &'a str,
+        option_id: &'a str,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct SelectorOwned {
+        control_id: String,
+        option_id: String,
+    }
+
+    pub fn serialize<S>(when: &[(String, String)], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeSeq;
+        let mut seq = serializer.serialize_seq(Some(when.len()))?;
+        for (control_id, option_id) in when {
+            seq.serialize_element(&SelectorWire {
+                control_id,
+                option_id,
+            })?;
+        }
+        seq.end()
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<(String, String)>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let items = Vec::<SelectorOwned>::deserialize(deserializer)?;
+        Ok(items
+            .into_iter()
+            .map(|s| (s.control_id, s.option_id))
+            .collect())
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct StructuredConditionalBound {
+    #[serde(with = "selector_list_serde")]
     pub when: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max: Option<f64>,
 }
 
 /// Validated conditional calibration curve rule (`ref[container.dnam.conditional-rules]`).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct StructuredConditionalCurve {
+    #[serde(with = "selector_list_serde")]
     pub when: Vec<(String, String)>,
     pub anchors: [f64; 3],
 }
@@ -274,7 +326,7 @@ pub fn eval_ui_midpoint_power_skew(
 mod spec_tests {
     use super::*;
     use crate::container::{
-        build_v2_open_dnam_container, strip_v2_open_dnam_container, validate_v2_open_dnam_layout,
+        build_v3_open_dnam_container, strip_v3_open_dnam_container, validate_v3_open_dnam_layout,
     };
     use alloc::vec;
     use proptest::prelude::*;
@@ -433,7 +485,7 @@ mod spec_tests {
         /// verify[container.dnam.mutable-frame]
         /// verify[container.dnam.metadata-ui-hints]
         #[test]
-        fn prop_v2_container_stripping_dmu1_and_ui_power_skew_bijection(
+        fn prop_v3_container_stripping_dmu1_and_ui_power_skew_bijection(
             cls in prop::array::uniform4(1usize..=4usize),
             target_tier in 0u8..=3u8,
             x_min in -100.0_f64..0.0_f64,
@@ -445,16 +497,16 @@ mod spec_tests {
             let s1 = vec![0x22u8; cls[1] * 64];
             let s2 = vec![0x33u8; cls[2] * 64];
             let s3 = vec![0x44u8; cls[3] * 64];
-            let container = build_v2_open_dnam_container(
-                b"{\"schema_version\":\"2.0\"}",
+            let container = build_v3_open_dnam_container(
+                b"{\"schema_version\":\"3.0\"}",
                 &[0u8; 64],
                 b"DAU1-TEST",
                 &[&s0, &s1, &s2, &s3],
                 None,
                 0,
             ).unwrap();
-            let stripped = strip_v2_open_dnam_container(&container, target_tier).unwrap();
-            let layout = validate_v2_open_dnam_layout(&stripped).unwrap();
+            let stripped = strip_v3_open_dnam_container(&container, target_tier).unwrap();
+            let layout = validate_v3_open_dnam_layout(&stripped).unwrap();
             prop_assert_eq!(layout.retained_tier, target_tier);
 
             let x_max = x_min + span;

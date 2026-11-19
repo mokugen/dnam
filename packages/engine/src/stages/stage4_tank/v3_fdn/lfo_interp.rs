@@ -1,16 +1,152 @@
-//! Branch-free `Q0.32` quadrature LFO and convex-blended 4-tap Catmull-Rom fractional reads
-//! (`stage4_tank/v3_fdn/lfo_interp.rs`).
+//! Branch-free `Q0.32` quadrature LFO, Catmull-Rom delay readers, partitioned Schroeder all-pass
+//! diffusion, and `0-ULP` frozen integer-lag hold (`stage4_tank/v3_fdn/lfo_interp.rs`).
 
-use super::{V3_TANK_CAP, V3_TANK_LINES, V3_TANK_MASK, V3_TANK_RING_STRIDE, V3Stage4TankParams};
+use alloc::boxed::Box;
+use dnam_kernels::step_schroeder_quad_vec4;
+
+use super::{Stage4QuadParams, V3_TANK_CAP, V3_TANK_LINES, V3_TANK_MASK};
 use crate::math::{
     FP16_MAX_FINITE_F32, IEEE754_F32_EXP_BIAS, MathBackend, SimdVec4,
-    const_hermite5_quarter_sine_coeffs, flush_recursive_state_vec4, newton6_reciprocal_f64,
+    const_hermite5_quarter_sine_coeffs, flush_recursive_state_f32, flush_recursive_state_vec4,
+    fp16::fp16_to_f32, newton6_reciprocal_f64,
 };
 use crate::operators::op_t::BallisticDuckingVca;
 use crate::stages::topology::STAGE4_MAX_V_CEIL_BITS;
 
-/// Smooth $C^1$-peak degree-5 odd triangle-Hermite sine on `Q0.32` phase (`0` `libm`, `0` branches,
-/// exact `+0.0` at `p == 0`, peak `±1.0` at `p ∈ {0x4000_0000, 0xC000_0000}`).
+/// Partitioned cold-allocated power-of-two Schroeder all-pass diffuser bank (`4` parallel lanes).
+///
+/// Each active lane (`delay >= 1`) occupies an independent segment `[l * seg_cap .. (l + 1) * seg_cap]`
+/// with `& seg_mask` wrap (`0 UDIV`/`IDIV`) and exact `0-ULP` write lock during `freeze`.
+#[derive(Clone, Debug)]
+pub(crate) struct PartitionedSchroederBank {
+    pub(super) buf: Box<[f32]>,
+    pub(super) seg_cap: usize,
+    pub(super) seg_mask: usize,
+    pub(super) delays: [usize; V3_TANK_LINES],
+    pub(super) gains: [f32; V3_TANK_LINES],
+    pub(super) wr: usize,
+    pub(super) active_mask: [bool; V3_TANK_LINES],
+    pub(super) any_active: bool,
+}
+
+impl PartitionedSchroederBank {
+    #[must_use]
+    pub(crate) fn from_params(
+        delays: [usize; V3_TANK_LINES],
+        gains: [f32; V3_TANK_LINES],
+    ) -> Option<Self> {
+        let max_d = delays.iter().copied().max().unwrap_or(0);
+        if max_d == 0 {
+            return None;
+        }
+        let seg_cap = (max_d + 4).saturating_mul(4).max(64).next_power_of_two();
+        let mut clamped_g = [0.0_f32; V3_TANK_LINES];
+        let mut active_mask = [false; V3_TANK_LINES];
+        for l in 0..V3_TANK_LINES {
+            clamped_g[l] = if gains[l].is_finite() {
+                gains[l].clamp(-0.75, 0.75)
+            } else {
+                0.0
+            };
+            active_mask[l] = delays[l] > 0;
+        }
+        Some(Self {
+            buf: alloc::vec![0.0_f32; seg_cap * V3_TANK_LINES].into_boxed_slice(),
+            seg_cap,
+            seg_mask: seg_cap - 1,
+            delays,
+            gains: clamped_g,
+            wr: 0,
+            active_mask,
+            any_active: active_mask.iter().any(|&a| a),
+        })
+    }
+
+    pub(crate) fn ensure_cap(
+        &mut self,
+        delays: [usize; V3_TANK_LINES],
+        gains: [f32; V3_TANK_LINES],
+    ) {
+        let max_d = delays.iter().copied().max().unwrap_or(0);
+        let needed_cap = if max_d == 0 {
+            self.seg_cap
+        } else {
+            (max_d + 4).max(64).next_power_of_two()
+        };
+        if needed_cap > self.seg_cap {
+            let new_cap = (max_d + 4).saturating_mul(4).max(64).next_power_of_two();
+            self.buf = alloc::vec![0.0_f32; new_cap * V3_TANK_LINES].into_boxed_slice();
+            self.seg_cap = new_cap;
+            self.seg_mask = new_cap - 1;
+            self.wr = 0;
+        }
+        self.apply_params(delays, gains);
+    }
+
+    pub(crate) fn apply_params(
+        &mut self,
+        delays: [usize; V3_TANK_LINES],
+        gains: [f32; V3_TANK_LINES],
+    ) {
+        let max_d = self.seg_cap.saturating_sub(1);
+        for l in 0..V3_TANK_LINES {
+            self.active_mask[l] = delays[l] > 0;
+            self.delays[l] = if delays[l] > 0 {
+                delays[l].clamp(1, max_d)
+            } else {
+                0
+            };
+            self.gains[l] = if gains[l].is_finite() {
+                gains[l].clamp(-0.75, 0.75)
+            } else {
+                0.0
+            };
+        }
+        self.any_active = self.active_mask.iter().any(|&a| a);
+    }
+
+    pub(crate) fn reset(&mut self) {
+        self.buf.fill(0.0);
+        self.wr = 0;
+    }
+
+    #[inline(always)]
+    pub(super) fn step_quad<B: MathBackend, const FREEZE: bool>(&mut self, x: B::Vec4) -> B::Vec4 {
+        if !self.any_active {
+            return x;
+        }
+        let wr = self.wr & self.seg_mask;
+        let mut del = [0.0_f32; V3_TANK_LINES];
+        for l in 0..V3_TANK_LINES {
+            let r_idx = (wr + self.delays[l]) & self.seg_mask;
+            del[l] = self.buf[l * self.seg_cap + r_idx];
+        }
+        let (y_v, w_v) =
+            step_schroeder_quad_vec4::<B::Vec4>(x, B::Vec4::load(&del), B::Vec4::load(&self.gains));
+        let x_arr = x.to_array();
+        let y_arr = y_v.to_array();
+        let mut out = [0.0_f32; V3_TANK_LINES];
+        for l in 0..V3_TANK_LINES {
+            out[l] = if self.active_mask[l] {
+                flush_recursive_state_f32(y_arr[l])
+            } else {
+                x_arr[l]
+            };
+        }
+        if !FREEZE {
+            let w_arr = w_v.to_array();
+            for l in 0..V3_TANK_LINES {
+                if self.active_mask[l] {
+                    self.buf[l * self.seg_cap + wr] = flush_recursive_state_f32(w_arr[l]);
+                }
+            }
+            self.wr = wr.wrapping_sub(1) & self.seg_mask;
+        }
+        B::Vec4::load(&out)
+    }
+}
+
+/// Smooth $C^1$-peak degree-5 odd triangle-Hermite sine on `Q0.32` phase (`0` `libm`, `0` branches).
 #[inline(always)]
 pub(super) fn q32_smooth_sin(p: u32) -> f32 {
     const SCALE_Q30: f32 = f32::from_bits((IEEE754_F32_EXP_BIAS - 30) << 23);
@@ -41,10 +177,6 @@ pub(super) fn lfo_offsets_from_phase(
 }
 
 /// Computes `(lfo_inc_q32, half_alpha_cubic)` on the cold path with zero hardware division.
-///
-/// Sets `alpha_cubic ∈ [0, 1]` such that `|g_loop| * (1 + 0.25 * alpha_cubic) <= 0.9992`
-/// (`alpha_cubic == 1.0` for `|g_loop| <= 0.799`), preserving full 4-tap Catmull-Rom fidelity for
-/// chorus/rotary/BBD delays and strict per-sample $\ell_\infty$ BIBO stability up to `g_loop <= 0.9990`.
 #[inline]
 pub(super) fn cold_lfo_inc_and_half_alpha(
     lfo_rate_hz: f32,
@@ -63,84 +195,115 @@ pub(super) fn cold_lfo_inc_and_half_alpha(
     (inc_q32, (0.5 * alpha_cubic) as f32)
 }
 
-/// Ring storage abstraction decoupling inline L1D `[u16; 1028]` rings from cold-allocated
-/// power-of-two extended delay buffers (`ext_lines`) without runtime allocation or branching inside
-/// the inner sample loop.
-pub(super) trait TankRing {
+/// Ring abstraction decoupling inline frame-major `[[u16; 4]; 1024]` L1D buffers from cold-allocated
+/// power-of-two extended delay rings (`ext_lines` in `"fp16"` or `"f32"` format).
+pub(crate) trait TankRing {
     fn load_quad<B: MathBackend>(&self, line: usize, base: usize) -> B::Vec4;
-    fn write_quad(&mut self, wr: usize, packed: [u16; V3_TANK_LINES]) -> usize;
+    fn read_frame_f32(&self, frame: usize, line: usize) -> f32;
+    fn write_frame<B: MathBackend>(&mut self, wr: usize, val: B::Vec4) -> usize;
 }
 
-pub(super) struct InlineTankRing<'a>(
-    pub(super) &'a mut [[u16; V3_TANK_RING_STRIDE]; V3_TANK_LINES],
-);
+/// Frame-major inline `fp16` ring (`128` frames = `1,024 B` = `16` cache lines).
+///
+/// Active `Lite` delays `[53, 67, 79, 89]` touch only `(89 + 1) * 8 = 720` contiguous bytes.
+pub(super) struct InlineFrameRing<'a>(pub(super) &'a mut [[u16; V3_TANK_LINES]; V3_TANK_CAP]);
 
-impl TankRing for InlineTankRing<'_> {
+impl TankRing for InlineFrameRing<'_> {
     #[inline(always)]
     fn load_quad<B: MathBackend>(&self, line: usize, base: usize) -> B::Vec4 {
-        let b = base & V3_TANK_MASK;
-        let Some((quad, _)) = self.0[line][b..b + 4].split_first_chunk::<4>() else {
-            return B::Vec4::zero();
-        };
-        B::fp16x4_to_vec4(quad)
+        let quad = [
+            self.0[base & V3_TANK_MASK][line],
+            self.0[base.wrapping_add(1) & V3_TANK_MASK][line],
+            self.0[base.wrapping_add(2) & V3_TANK_MASK][line],
+            self.0[base.wrapping_add(3) & V3_TANK_MASK][line],
+        ];
+        B::fp16x4_to_vec4(&quad)
     }
 
     #[inline(always)]
-    fn write_quad(&mut self, wr: usize, packed: [u16; V3_TANK_LINES]) -> usize {
+    fn read_frame_f32(&self, frame: usize, line: usize) -> f32 {
+        fp16_to_f32(self.0[frame & V3_TANK_MASK][line])
+    }
+
+    #[inline(always)]
+    fn write_frame<B: MathBackend>(&mut self, wr: usize, val: B::Vec4) -> usize {
         let w = wr & V3_TANK_MASK;
-        for l in 0..V3_TANK_LINES {
-            self.0[l][w] = packed[l];
-        }
-        if w < 4 {
-            for l in 0..V3_TANK_LINES {
-                self.0[l][w + V3_TANK_CAP] = packed[l];
-            }
-        }
+        self.0[w] = B::vec4_to_fp16x4(val);
         w.wrapping_sub(1) & V3_TANK_MASK
     }
 }
 
-pub(super) struct ExtTankRing<'a> {
+pub(super) struct ExtFrameRingFp16<'a> {
     pub(super) buf: &'a mut [u16],
-    pub(super) cap: usize,
-    pub(super) stride: usize,
     pub(super) mask: usize,
 }
 
-impl TankRing for ExtTankRing<'_> {
+impl TankRing for ExtFrameRingFp16<'_> {
     #[inline(always)]
     fn load_quad<B: MathBackend>(&self, line: usize, base: usize) -> B::Vec4 {
-        let b = base & self.mask;
-        let start = line * self.stride + b;
-        let Some(slice) = self.buf.get(start..start + 4) else {
-            return B::Vec4::zero();
-        };
-        let Some((quad, _)) = slice.split_first_chunk::<4>() else {
-            return B::Vec4::zero();
-        };
-        B::fp16x4_to_vec4(quad)
+        let m = self.mask;
+        let q = [
+            self.buf[((base & m) << 2) + line],
+            self.buf[((base.wrapping_add(1) & m) << 2) + line],
+            self.buf[((base.wrapping_add(2) & m) << 2) + line],
+            self.buf[((base.wrapping_add(3) & m) << 2) + line],
+        ];
+        B::fp16x4_to_vec4(&q)
     }
 
     #[inline(always)]
-    fn write_quad(&mut self, wr: usize, packed: [u16; V3_TANK_LINES]) -> usize {
+    fn read_frame_f32(&self, frame: usize, line: usize) -> f32 {
+        fp16_to_f32(self.buf[((frame & self.mask) << 2) + line])
+    }
+
+    #[inline(always)]
+    fn write_frame<B: MathBackend>(&mut self, wr: usize, val: B::Vec4) -> usize {
         let w = wr & self.mask;
-        for l in 0..V3_TANK_LINES {
-            let base = l * self.stride;
-            if base + w < self.buf.len() {
-                self.buf[base + w] = packed[l];
-            }
-            if w < 4 && base + w + self.cap < self.buf.len() {
-                self.buf[base + w + self.cap] = packed[l];
-            }
+        let base = w << 2;
+        let packed = B::vec4_to_fp16x4(val);
+        if base + 3 < self.buf.len() {
+            self.buf[base..base + 4].copy_from_slice(&packed);
+        }
+        w.wrapping_sub(1) & self.mask
+    }
+}
+
+pub(super) struct ExtFrameRingF32<'a> {
+    pub(super) buf: &'a mut [f32],
+    pub(super) mask: usize,
+}
+
+impl TankRing for ExtFrameRingF32<'_> {
+    #[inline(always)]
+    fn load_quad<B: MathBackend>(&self, line: usize, base: usize) -> B::Vec4 {
+        let m = self.mask;
+        let arr = [
+            self.buf[((base & m) << 2) + line],
+            self.buf[((base.wrapping_add(1) & m) << 2) + line],
+            self.buf[((base.wrapping_add(2) & m) << 2) + line],
+            self.buf[((base.wrapping_add(3) & m) << 2) + line],
+        ];
+        B::Vec4::load(&arr)
+    }
+
+    #[inline(always)]
+    fn read_frame_f32(&self, frame: usize, line: usize) -> f32 {
+        self.buf[((frame & self.mask) << 2) + line]
+    }
+
+    #[inline(always)]
+    fn write_frame<B: MathBackend>(&mut self, wr: usize, val: B::Vec4) -> usize {
+        let w = wr & self.mask;
+        let base = w << 2;
+        if base + 3 < self.buf.len() {
+            let arr = val.to_array();
+            self.buf[base..base + 4].copy_from_slice(&arr);
         }
         w.wrapping_sub(1) & self.mask
     }
 }
 
 /// Branchless SIMD 4-tap convex-blended Catmull-Rom read across any [`TankRing`].
-///
-/// When `mu == 0.0` (e.g. `lfo_depth_samples == 0.0`), yields bit-exact `s_0` for exact zero-ULP
-/// parity with static integer-tap reads.
 #[inline(always)]
 #[expect(
     clippy::too_many_arguments,
@@ -152,11 +315,17 @@ pub(super) fn read_modulated_catmull_rom<B: MathBackend, R: TankRing>(
     base_delays_v: B::Vec4,
     mod_l: f32,
     mod_r: f32,
+    delay_mod_samples: f32,
     min_tau_v: B::Vec4,
     max_tau_v: B::Vec4,
     half_alpha_v: B::Vec4,
 ) -> B::Vec4 {
-    let mod_v = B::Vec4::from_array([mod_l, mod_r, -mod_l, -mod_r]);
+    let mod_v = B::Vec4::from_array([
+        mod_l + delay_mod_samples,
+        mod_r + delay_mod_samples,
+        -mod_l + delay_mod_samples,
+        -mod_r + delay_mod_samples,
+    ]);
     let tau_v = base_delays_v.add(mod_v).clamp(min_tau_v, max_tau_v);
     let [tau0, tau1, tau2, tau3] = tau_v.to_array();
     let i0 = tau0 as usize;
@@ -184,125 +353,219 @@ pub(super) fn read_modulated_catmull_rom<B: MathBackend, R: TankRing>(
     lin.fma(w, curv)
 }
 
+#[inline(always)]
+fn read_frozen_integer_lag<B: MathBackend, R: TankRing>(
+    ring: &R,
+    wr: usize,
+    delays: [usize; V3_TANK_LINES],
+    freeze_off: &mut [u32; V3_TANK_LINES],
+) -> B::Vec4 {
+    let mut raw = [0.0_f32; V3_TANK_LINES];
+    for l in 0..V3_TANK_LINES {
+        let d = delays[l].max(1);
+        let off = freeze_off[l] as usize;
+        let lag = if off < d { d - off } else { d };
+        raw[l] = ring.read_frame_f32(wr.wrapping_add(lag), l);
+        let next = off + 1;
+        freeze_off[l] = if next >= d { 0 } else { next as u32 };
+    }
+    B::Vec4::load(&raw)
+}
+
 #[derive(Clone, Copy)]
-pub(super) struct TankStepCtx {
-    pub(super) params: V3Stage4TankParams,
-    pub(super) inv_sigma: f32,
-    pub(super) cos_psi: f32,
-    pub(super) sin_psi: f32,
-    pub(super) cos_st: f32,
-    pub(super) sin_st: f32,
-    pub(super) half_alpha_cubic: f32,
-    pub(super) lfo_inc: u32,
-    pub(super) max_tau: f32,
-    pub(super) freeze: bool,
+pub(crate) struct TankStepCtx {
+    pub(crate) params: Stage4QuadParams,
+    pub(crate) inv_sigma: f32,
+    pub(crate) cos_psi: f32,
+    pub(crate) sin_psi: f32,
+    pub(crate) cos_st: f32,
+    pub(crate) sin_st: f32,
+    pub(crate) half_alpha_cubic: f32,
+    pub(crate) delay_mod_samples: f32,
+    pub(crate) lfo_inc: u32,
+    pub(crate) max_tau: f32,
+    pub(crate) freeze: bool,
+    pub(crate) wet_dc_pole: f32,
+    pub(crate) wet_dc_alpha: f32,
 }
 
-pub(super) struct TankMutableRefs<'a> {
-    pub(super) write_ptr: &'a mut u32,
-    pub(super) dc_x_prev: &'a mut [f32; V3_TANK_LINES],
-    pub(super) dc_y_prev: &'a mut [f32; V3_TANK_LINES],
-    pub(super) lfo_phase_q32: &'a mut u32,
-    pub(super) vca_env: &'a mut f32,
+pub(crate) struct TankMutableRefs<'a> {
+    pub(crate) write_ptr: &'a mut u32,
+    pub(crate) freeze_off: &'a mut [u32; V3_TANK_LINES],
+    pub(crate) dc_x_prev: &'a mut [f32; V3_TANK_LINES],
+    pub(crate) dc_y_prev: &'a mut [f32; V3_TANK_LINES],
+    pub(crate) wet_dc_x: &'a mut [f32; 2],
+    pub(crate) wet_dc_y: &'a mut [f32; 2],
+    pub(crate) lfo_phase_q32: &'a mut u32,
+    pub(crate) vca_env: &'a mut f32,
+    pub(crate) schroeder: Option<&'a mut PartitionedSchroederBank>,
 }
 
-pub(super) struct SubblockBuffers<'a> {
-    pub(super) s2_dir: &'a [[f32; 4]; 16],
-    pub(super) cab_out: &'a [[f32; 2]; 16],
-    pub(super) clean_sub: &'a [[f32; 2]; 16],
-    pub(super) out_l: &'a mut [f32],
-    pub(super) out_r: &'a mut [f32],
-    pub(super) len: usize,
+pub(crate) struct SubblockBuffers<'a> {
+    pub(crate) in_l: &'a [f32],
+    pub(crate) in_r: &'a [f32],
+    pub(crate) out_l: &'a mut [f32],
+    pub(crate) out_r: &'a mut [f32],
+    pub(crate) len: usize,
+    pub(crate) accumulate_output: bool,
+}
+
+/// Evaluates Stage IV quiet-feedback knee, cubic loop saturator, unitary `U(psi, v) = H_4(1) R(psi)`
+/// circulating feedback, and normalized `0.5 * (1 + r_dc)` loop DC blocker (`0` FDIV/FSQRT).
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Hoisted SIMD constants shared between stereo and subblock inner loops"
+)]
+fn step_loop_feedback<B: MathBackend>(
+    read_v: B::Vec4,
+    dc_x_p: B::Vec4,
+    dc_y_p: B::Vec4,
+    inv_sigma_v: B::Vec4,
+    g_loop_v: B::Vec4,
+    cos_psi_v: B::Vec4,
+    sin_psi_v: B::Vec4,
+    r_dc_v: B::Vec4,
+    alpha_dc_v: B::Vec4,
+    inj_g: f32,
+    in_l: f32,
+    in_r: f32,
+) -> (B::Vec4, B::Vec4) {
+    const V_CEIL: f32 = f32::from_bits(STAGE4_MAX_V_CEIL_BITS);
+    const TWO_OVER_3V: f32 = (2.0_f64 / (3.0_f64 * (V_CEIL as f64))) as f32;
+    let one = B::Vec4::splat(1.0);
+    let rv = read_v.mul(inv_sigma_v);
+    let inv_dv = one.fma(rv, rv).rcp_ge1_nr2();
+    let knee_u = read_v
+        .mul(g_loop_v)
+        .mul(B::Vec4::splat(0.85).fma(B::Vec4::splat(0.15), inv_dv));
+    let v = knee_u
+        .mul(B::Vec4::splat(TWO_OVER_3V))
+        .max(B::Vec4::splat(-1.0))
+        .min(one);
+    let v_ceil_v = B::Vec4::splat(V_CEIL);
+    let half_sq = B::Vec4::splat(0.5).mul(v).mul(v);
+    let loop_v = v_ceil_v
+        .mul(v)
+        .mul(B::Vec4::splat(1.5).sub(half_sq))
+        .max(B::Vec4::splat(-V_CEIL))
+        .min(v_ceil_v);
+
+    // U(psi, v) = H_4(1) * R(psi): pairwise 2x2 Givens before 4x4 Householder reflection.
+    let rot_v = loop_v.mul(cos_psi_v).fma(loop_v.pair_swap_neg(), sin_psi_v);
+    let h_offset = 0.5 * rot_v.horizontal_sum();
+    let fb_v = rot_v
+        .sub(B::Vec4::splat(h_offset))
+        .add(B::Vec4::splat_pair(inj_g * in_l, inj_g * in_r));
+
+    let fp16_lo = B::Vec4::splat(-FP16_MAX_FINITE_F32);
+    let fp16_hi = B::Vec4::splat(FP16_MAX_FINITE_F32);
+    let dc_y = flush_recursive_state_vec4(fb_v.sub(dc_x_p).mul(alpha_dc_v).fma(r_dc_v, dc_y_p))
+        .max(fp16_lo)
+        .min(fp16_hi);
+    (fb_v, dc_y)
+}
+
+/// Applies Givens readout rotation `R(psi)`, non-recirculating `5 Hz` wet DC blocker, and
+/// stereo-linked ducking VCA.
+#[inline(always)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Hot readout + DC blocker + VCA inline path avoiding extra indirection"
+)]
+fn step_wet_dc_and_vca(
+    raw_l: f32,
+    raw_r: f32,
+    cos_psi: f32,
+    sin_psi: f32,
+    wet_dc_x: &mut [f32; 2],
+    wet_dc_y: &mut [f32; 2],
+    wet_dc_pole: f32,
+    wet_dc_alpha: f32,
+    vca: &mut BallisticDuckingVca,
+    in_l: f32,
+    in_r: f32,
+) -> (f32, f32) {
+    let wet_l_rot = cos_psi * raw_l - sin_psi * raw_r;
+    let wet_r_rot = sin_psi * raw_l + cos_psi * raw_r;
+    let wet_l = flush_recursive_state_f32(
+        wet_dc_alpha * (wet_l_rot - wet_dc_x[0]) + wet_dc_pole * wet_dc_y[0],
+    );
+    let wet_r = flush_recursive_state_f32(
+        wet_dc_alpha * (wet_r_rot - wet_dc_x[1]) + wet_dc_pole * wet_dc_y[1],
+    );
+    wet_dc_x[0] = wet_l_rot;
+    wet_dc_y[0] = wet_l;
+    wet_dc_x[1] = wet_r_rot;
+    wet_dc_y[1] = wet_r;
+    vca.step_stereo(in_l, in_r, wet_l, wet_r)
 }
 
 #[inline(always)]
-pub(super) fn step_stereo_ring<B: MathBackend, R: TankRing>(
+pub(crate) fn step_stereo_ring<B: MathBackend, R: TankRing>(
     ring: &mut R,
     ctx: TankStepCtx,
     st: &mut TankMutableRefs<'_>,
     in_l: f32,
     in_r: f32,
 ) -> [f32; 2] {
-    const V_CEIL: f32 = f32::from_bits(STAGE4_MAX_V_CEIL_BITS);
-    const TWO_OVER_3V: f32 = (2.0_f64 / (3.0_f64 * (V_CEIL as f64))) as f32;
-
     let wr = *st.write_ptr as usize;
-    let (mod_l, mod_r) = lfo_offsets_from_phase(
-        *st.lfo_phase_q32,
-        ctx.params.lfo_depth_samples,
-        ctx.cos_st,
-        ctx.sin_st,
-    );
-    let half_alpha_v = if ctx.freeze {
-        B::Vec4::zero()
+    let raw_read_v = if ctx.freeze {
+        read_frozen_integer_lag::<B, R>(ring, wr, ctx.params.delay_lengths, st.freeze_off)
     } else {
+        let (mod_l, mod_r) = lfo_offsets_from_phase(
+            *st.lfo_phase_q32,
+            ctx.params.lfo_depth_samples,
+            ctx.cos_st,
+            ctx.sin_st,
+        );
         *st.lfo_phase_q32 = st.lfo_phase_q32.wrapping_add(ctx.lfo_inc);
-        B::Vec4::splat(ctx.half_alpha_cubic)
-    };
-    let base_delays_v = B::Vec4::from_array(ctx.params.delay_lengths.map(|x| x as f32));
-    let read_v = read_modulated_catmull_rom::<B, R>(
-        ring,
-        wr,
-        base_delays_v,
-        mod_l,
-        mod_r,
-        B::Vec4::splat(4.0),
-        B::Vec4::splat(ctx.max_tau),
-        half_alpha_v,
-    );
-    let weighted_f32 = read_v.mul(B::Vec4::load(&ctx.params.tap_gains)).to_array();
-    let fp16_lo = B::Vec4::splat(-FP16_MAX_FINITE_F32);
-    let fp16_hi = B::Vec4::splat(FP16_MAX_FINITE_F32);
-
-    let next_wr = if ctx.freeze {
-        let h_offset = 0.5 * read_v.horizontal_sum();
-        let circ = flush_recursive_state_vec4(read_v.sub(B::Vec4::splat(h_offset)))
-            .max(fp16_lo)
-            .min(fp16_hi);
-        ring.write_quad(wr, B::vec4_to_fp16x4(circ))
-    } else {
-        let one = B::Vec4::splat(1.0);
-        let rv = read_v.mul(B::Vec4::splat(ctx.inv_sigma));
-        let inv_dv = one.fma(rv, rv).rcp_ge1_nr2();
-        let knee_u = read_v
-            .mul(B::Vec4::splat(ctx.params.g_loop))
-            .mul(B::Vec4::splat(0.85).fma(B::Vec4::splat(0.15), inv_dv));
-        let v = knee_u
-            .mul(B::Vec4::splat(TWO_OVER_3V))
-            .max(B::Vec4::splat(-1.0))
-            .min(one);
-        let v_ceil_v = B::Vec4::splat(V_CEIL);
-        let half_sq = B::Vec4::splat(0.5).mul(v).mul(v);
-        let loop_v = v_ceil_v
-            .mul(v)
-            .mul(B::Vec4::splat(1.5).sub(half_sq))
-            .max(B::Vec4::splat(-V_CEIL))
-            .min(v_ceil_v);
-
-        let h_offset = 0.5 * loop_v.horizontal_sum();
-        let inj_g = ctx.params.inject_gain;
-        let fb_v = loop_v
-            .sub(B::Vec4::splat(h_offset))
-            .add(B::Vec4::splat_pair(inj_g * in_l, inj_g * in_r));
-
-        let dc_x_p = B::Vec4::load(st.dc_x_prev);
-        let dc_y_p = B::Vec4::load(st.dc_y_prev);
-        let dc_y = flush_recursive_state_vec4(
-            fb_v.sub(dc_x_p)
-                .fma(B::Vec4::splat(ctx.params.r_dc), dc_y_p),
+        let base_delays_v = B::Vec4::from_array(ctx.params.delay_lengths.map(|x| x as f32));
+        read_modulated_catmull_rom::<B, R>(
+            ring,
+            wr,
+            base_delays_v,
+            mod_l,
+            mod_r,
+            ctx.delay_mod_samples,
+            B::Vec4::splat(4.0),
+            B::Vec4::splat(ctx.max_tau),
+            B::Vec4::splat(ctx.half_alpha_cubic),
         )
-        .max(fp16_lo)
-        .min(fp16_hi);
+    };
+    let read_v = if let Some(ref mut ap) = st.schroeder {
+        if ctx.freeze {
+            ap.step_quad::<B, true>(raw_read_v)
+        } else {
+            ap.step_quad::<B, false>(raw_read_v)
+        }
+    } else {
+        raw_read_v
+    };
+    let weighted_f32 = read_v.mul(B::Vec4::load(&ctx.params.tap_gains)).to_array();
+
+    if !ctx.freeze {
+        let (fb_v, dc_y) = step_loop_feedback::<B>(
+            read_v,
+            B::Vec4::load(st.dc_x_prev),
+            B::Vec4::load(st.dc_y_prev),
+            B::Vec4::splat(ctx.inv_sigma),
+            B::Vec4::splat(ctx.params.g_loop),
+            B::Vec4::splat(ctx.cos_psi),
+            B::Vec4::splat(ctx.sin_psi),
+            B::Vec4::splat(ctx.params.r_dc),
+            B::Vec4::splat(0.5 * (1.0 + ctx.params.r_dc)),
+            ctx.params.inject_gain,
+            in_l,
+            in_r,
+        );
         fb_v.store(st.dc_x_prev);
         dc_y.store(st.dc_y_prev);
-        ring.write_quad(wr, B::vec4_to_fp16x4(dc_y))
-    };
-    *st.write_ptr = next_wr as u32;
+        *st.write_ptr = ring.write_frame::<B>(wr, dc_y) as u32;
+    }
 
     let raw_l = weighted_f32[0] + weighted_f32[2];
     let raw_r = weighted_f32[1] + weighted_f32[3];
-    let wet_l = ctx.cos_psi * raw_l - ctx.sin_psi * raw_r;
-    let wet_r = ctx.sin_psi * raw_l + ctx.cos_psi * raw_r;
     let mut vca = BallisticDuckingVca {
         env: *st.vca_env,
         alpha_att: ctx.params.vca_att,
@@ -311,7 +574,19 @@ pub(super) fn step_stereo_ring<B: MathBackend, R: TankRing>(
         kappa: ctx.params.vca_kappa,
         min_gain: ctx.params.vca_min_gain,
     };
-    let (duck_l, duck_r) = vca.step_stereo(in_l, in_r, wet_l, wet_r);
+    let (duck_l, duck_r) = step_wet_dc_and_vca(
+        raw_l,
+        raw_r,
+        ctx.cos_psi,
+        ctx.sin_psi,
+        st.wet_dc_x,
+        st.wet_dc_y,
+        ctx.wet_dc_pole,
+        ctx.wet_dc_alpha,
+        &mut vca,
+        in_l,
+        in_r,
+    );
     *st.vca_env = vca.env;
     [
         ctx.params.dry_mix * in_l + ctx.params.wet_mix * duck_l,
@@ -320,7 +595,7 @@ pub(super) fn step_stereo_ring<B: MathBackend, R: TankRing>(
 }
 
 #[inline(always)]
-pub(super) fn step_subblock_ring<
+pub(crate) fn step_subblock_ring<
     B: MathBackend,
     const MONO: bool,
     const FREEZE: bool,
@@ -331,9 +606,6 @@ pub(super) fn step_subblock_ring<
     st: &mut TankMutableRefs<'_>,
     io: SubblockBuffers<'_>,
 ) {
-    const V_CEIL: f32 = f32::from_bits(STAGE4_MAX_V_CEIL_BITS);
-    const TWO_OVER_3V: f32 = (2.0_f64 / (3.0_f64 * (V_CEIL as f64))) as f32;
-
     let mut wr = *st.write_ptr as usize;
     let base_delays_v = B::Vec4::from_array(ctx.params.delay_lengths.map(|x| x as f32));
     let tap_gains_v = B::Vec4::load(&ctx.params.tap_gains);
@@ -351,23 +623,15 @@ pub(super) fn step_subblock_ring<
     let inj_g = ctx.params.inject_gain;
     let cos_psi = ctx.cos_psi;
     let sin_psi = ctx.sin_psi;
+    let cos_psi_v = B::Vec4::splat(cos_psi);
+    let sin_psi_v = B::Vec4::splat(sin_psi);
     let dry_mix = ctx.params.dry_mix;
     let wet_mix = ctx.params.wet_mix;
 
-    let one = B::Vec4::splat(1.0);
     let inv_sigma_v = B::Vec4::splat(ctx.inv_sigma);
     let g_loop_v = B::Vec4::splat(ctx.params.g_loop);
-    let c085 = B::Vec4::splat(0.85);
-    let c015 = B::Vec4::splat(0.15);
-    let two_over_3v = B::Vec4::splat(TWO_OVER_3V);
-    let neg_one = B::Vec4::splat(-1.0);
-    let v_ceil_v = B::Vec4::splat(V_CEIL);
-    let neg_v_ceil_v = B::Vec4::splat(-V_CEIL);
-    let half = B::Vec4::splat(0.5);
-    let c15 = B::Vec4::splat(1.5);
     let r_dc_v = B::Vec4::splat(ctx.params.r_dc);
-    let fp16_lo = B::Vec4::splat(-FP16_MAX_FINITE_F32);
-    let fp16_hi = B::Vec4::splat(FP16_MAX_FINITE_F32);
+    let alpha_dc_v = B::Vec4::splat(0.5 * (1.0 + ctx.params.r_dc));
     let lfo_depth = ctx.params.lfo_depth_samples;
     let min_tau_v = B::Vec4::splat(4.0);
     let max_tau_v = B::Vec4::splat(ctx.max_tau);
@@ -375,88 +639,102 @@ pub(super) fn step_subblock_ring<
     let sin_st = ctx.sin_st;
     let mut lfo_p = *st.lfo_phase_q32;
     let lfo_inc = if FREEZE { 0 } else { ctx.lfo_inc };
-    let half_alpha_v = if FREEZE {
-        B::Vec4::zero()
-    } else {
-        B::Vec4::splat(ctx.half_alpha_cubic)
-    };
-    let n = io.len.min(16).min(io.out_l.len()).min(io.out_r.len());
-    let out_l = &mut io.out_l[..n];
-    let out_r = &mut io.out_r[..n];
+    let half_alpha_v = B::Vec4::splat(ctx.half_alpha_cubic);
+
+    let n = io
+        .len
+        .min(16)
+        .min(io.in_l.len())
+        .min(io.in_r.len())
+        .min(io.out_l.len())
+        .min(io.out_r.len());
 
     for i in 0..n {
-        let in_l = io.s2_dir[i][2] + io.cab_out[i][0] + io.clean_sub[i][0];
-        let in_r = if MONO {
-            in_l
-        } else {
-            io.s2_dir[i][3] + io.cab_out[i][1] + io.clean_sub[i][1]
-        };
+        let in_l = io.in_l[i];
+        let in_r = io.in_r[i];
 
-        let (mod_l, mod_r) = lfo_offsets_from_phase(lfo_p, lfo_depth, cos_st, sin_st);
-        lfo_p = lfo_p.wrapping_add(lfo_inc);
-        let read_v = read_modulated_catmull_rom::<B, R>(
-            ring,
-            wr,
-            base_delays_v,
-            mod_l,
-            mod_r,
-            min_tau_v,
-            max_tau_v,
-            half_alpha_v,
-        );
+        let raw_read_v = if FREEZE {
+            read_frozen_integer_lag::<B, R>(ring, wr, ctx.params.delay_lengths, st.freeze_off)
+        } else {
+            let (mod_l, mod_r) = lfo_offsets_from_phase(lfo_p, lfo_depth, cos_st, sin_st);
+            lfo_p = lfo_p.wrapping_add(lfo_inc);
+            read_modulated_catmull_rom::<B, R>(
+                ring,
+                wr,
+                base_delays_v,
+                mod_l,
+                mod_r,
+                ctx.delay_mod_samples,
+                min_tau_v,
+                max_tau_v,
+                half_alpha_v,
+            )
+        };
+        let read_v = if let Some(ref mut ap) = st.schroeder {
+            ap.step_quad::<B, FREEZE>(raw_read_v)
+        } else {
+            raw_read_v
+        };
         let weighted_f32 = read_v.mul(tap_gains_v).to_array();
 
-        if FREEZE {
-            let h_offset = 0.5 * read_v.horizontal_sum();
-            let circ = flush_recursive_state_vec4(read_v.sub(B::Vec4::splat(h_offset)))
-                .max(fp16_lo)
-                .min(fp16_hi);
-            wr = ring.write_quad(wr, B::vec4_to_fp16x4(circ));
-        } else {
-            let rv = read_v.mul(inv_sigma_v);
-            let inv_dv = one.fma(rv, rv).rcp_ge1_nr2();
-            let knee_u = read_v.mul(g_loop_v).mul(c085.fma(c015, inv_dv));
-            let v = knee_u.mul(two_over_3v).max(neg_one).min(one);
-            let half_sq = half.mul(v).mul(v);
-            let loop_v = v_ceil_v
-                .mul(v)
-                .mul(c15.sub(half_sq))
-                .max(neg_v_ceil_v)
-                .min(v_ceil_v);
-
-            let h_offset = 0.5 * loop_v.horizontal_sum();
-            let fb_v = loop_v
-                .sub(B::Vec4::splat(h_offset))
-                .add(B::Vec4::splat_pair(inj_g * in_l, inj_g * in_r));
-
-            let dc_y = flush_recursive_state_vec4(fb_v.sub(dc_x_p).fma(r_dc_v, dc_y_p))
-                .max(fp16_lo)
-                .min(fp16_hi);
+        if !FREEZE {
+            let (fb_v, dc_y) = step_loop_feedback::<B>(
+                read_v,
+                dc_x_p,
+                dc_y_p,
+                inv_sigma_v,
+                g_loop_v,
+                cos_psi_v,
+                sin_psi_v,
+                r_dc_v,
+                alpha_dc_v,
+                inj_g,
+                in_l,
+                in_r,
+            );
             dc_x_p = fb_v;
             dc_y_p = dc_y;
-            wr = ring.write_quad(wr, B::vec4_to_fp16x4(dc_y));
+            wr = ring.write_frame::<B>(wr, dc_y);
         }
 
         let raw_l = weighted_f32[0] + weighted_f32[2];
         let raw_r = weighted_f32[1] + weighted_f32[3];
-        let wet_l = cos_psi * raw_l - sin_psi * raw_r;
-        let wet_r = sin_psi * raw_l + cos_psi * raw_r;
-        let (duck_l, duck_r) = vca.step_stereo(in_l, in_r, wet_l, wet_r);
-        let yl = dry_mix * in_l + wet_mix * duck_l;
-        out_l[i] = yl;
-        out_r[i] = if MONO {
-            yl
+        let (duck_l, duck_r) = step_wet_dc_and_vca(
+            raw_l,
+            raw_r,
+            cos_psi,
+            sin_psi,
+            st.wet_dc_x,
+            st.wet_dc_y,
+            ctx.wet_dc_pole,
+            ctx.wet_dc_alpha,
+            &mut vca,
+            in_l,
+            in_r,
+        );
+        let full_l = dry_mix * in_l + wet_mix * duck_l;
+        let full_r = dry_mix * in_r + wet_mix * duck_r;
+        let (yl, yr) = if MONO {
+            let mid = 0.5 * (full_l + full_r);
+            (mid, mid)
         } else {
-            dry_mix * in_r + wet_mix * duck_r
+            (full_l, full_r)
         };
+        if io.accumulate_output {
+            io.out_l[i] += yl;
+            io.out_r[i] += yr;
+        } else {
+            io.out_l[i] = yl;
+            io.out_r[i] = yr;
+        }
     }
 
     if !FREEZE {
         dc_x_p.store(st.dc_x_prev);
         dc_y_p.store(st.dc_y_prev);
         *st.lfo_phase_q32 = lfo_p;
+        *st.write_ptr = wr as u32;
     }
-    *st.write_ptr = wr as u32;
     *st.vca_env = vca.env;
 }
 
@@ -464,90 +742,98 @@ pub(super) fn step_subblock_ring<
 mod tests {
     use super::super::V3_TANK_CAP;
     use super::*;
-    use crate::math::{DefaultMathBackend, ScalarBackend, fp16::f32_to_fp16};
+    use crate::math::{DefaultMathBackend, ScalarBackend};
 
-    fn write_test_lag(
-        lines: &mut [[u16; V3_TANK_RING_STRIDE]; V3_TANK_LINES],
+    fn write_test_frame_lag(
+        frames: &mut [[u16; V3_TANK_LINES]; V3_TANK_CAP],
         wr: usize,
         lag: usize,
         vals: [u16; V3_TANK_LINES],
     ) {
-        let idx = (wr + lag) & V3_TANK_MASK;
-        for l in 0..V3_TANK_LINES {
-            lines[l][idx] = vals[l];
-            if idx < 4 {
-                lines[l][idx + V3_TANK_CAP] = vals[l];
-            }
-        }
+        frames[(wr + lag) & V3_TANK_MASK] = vals;
     }
 
     #[test]
     fn test_q32_smooth_sin_exact_quadrature_and_catmull_rom_identity() {
+        use crate::math::fp16::f32_to_fp16;
         assert_eq!(q32_smooth_sin(0).to_bits(), 0);
         assert_eq!(q32_smooth_sin(0x8000_0000).to_bits(), 0);
         assert!((q32_smooth_sin(0x4000_0000) - 1.0).abs() < 1e-6);
         assert!((q32_smooth_sin(0xC000_0000) + 1.0).abs() < 1e-6);
         for k in 0..64 {
-            let p = k * 0x0400_0000;
-            let s = q32_smooth_sin(p);
+            let s = q32_smooth_sin(k * 0x0400_0000);
             assert!((-1.0..=1.0).contains(&s));
         }
 
-        // Verify half_alpha_cubic contractivity across g_loop range
-        let (inc_zero, ha_chorus) = cold_lfo_inc_and_half_alpha(0.0, 0.0, 0.72, 48_000.0);
-        assert_eq!(inc_zero, 0);
-        assert!((ha_chorus - 0.5).abs() < 1e-6);
-        let (inc_shimmer, ha_shimmer) = cold_lfo_inc_and_half_alpha(1.2, 8.0, 0.99, 48_000.0);
-        assert!(inc_shimmer > 0);
-        assert!(0.99 * (1.0 + 0.5 * ha_shimmer) <= 0.9995);
-
-        // Verify midpoint Catmull-Rom weights [-1/16, 9/16, 9/16, -1/16] on mirrored ring wrap boundary
-        let mut lines = [[0u16; V3_TANK_RING_STRIDE]; V3_TANK_LINES];
-        let wr = 1020_usize;
-        write_test_lag(&mut lines, wr, 10, [f32_to_fp16(1.0); 4]);
-        write_test_lag(&mut lines, wr, 11, [f32_to_fp16(1.0); 4]);
-        let base_delays_simd = <DefaultMathBackend as MathBackend>::Vec4::splat(10.0);
-        let base_delays_scal = <ScalarBackend as MathBackend>::Vec4::splat(10.0);
-        let ring_mid = InlineTankRing(&mut lines);
-        let v_mid = read_modulated_catmull_rom::<DefaultMathBackend, _>(
-            &ring_mid,
-            wr,
-            base_delays_simd,
-            0.5,
-            0.5,
+        let mut frames = [[0u16; V3_TANK_LINES]; V3_TANK_CAP];
+        let base_delays = [8_usize, 12, 16, 20];
+        let expected = [0.25_f32, -0.5, 0.75, -0.125];
+        for l in 0..V3_TANK_LINES {
+            let val = f32_to_fp16(expected[l]);
+            write_test_frame_lag(&mut frames, 0, base_delays[l], [val; 4]);
+        }
+        let ring = InlineFrameRing(&mut frames);
+        let simd = read_modulated_catmull_rom::<DefaultMathBackend, _>(
+            &ring,
+            0,
+            <DefaultMathBackend as MathBackend>::Vec4::from_array(base_delays.map(|x| x as f32)),
+            0.0,
+            0.0,
+            0.0,
             <DefaultMathBackend as MathBackend>::Vec4::splat(4.0),
             <DefaultMathBackend as MathBackend>::Vec4::splat((V3_TANK_CAP - 3) as f32),
             <DefaultMathBackend as MathBackend>::Vec4::splat(0.5),
-        );
-        let v_scal = read_modulated_catmull_rom::<ScalarBackend, _>(
-            &ring_mid,
-            wr,
-            base_delays_scal,
-            0.5,
-            0.5,
+        )
+        .to_array();
+        let scal = read_modulated_catmull_rom::<ScalarBackend, _>(
+            &ring,
+            0,
+            <ScalarBackend as MathBackend>::Vec4::from_array(base_delays.map(|x| x as f32)),
+            0.0,
+            0.0,
+            0.0,
             <ScalarBackend as MathBackend>::Vec4::splat(4.0),
             <ScalarBackend as MathBackend>::Vec4::splat((V3_TANK_CAP - 3) as f32),
             <ScalarBackend as MathBackend>::Vec4::splat(0.5),
-        );
-        assert!((v_mid.to_array()[0] - 1.125).abs() < 1e-4);
-        assert!((v_mid.to_array()[2] - 0.5).abs() < 1e-4);
-        assert_eq!(v_mid.to_array(), v_scal.to_array());
+        )
+        .to_array();
+        for l in 0..V3_TANK_LINES {
+            assert_eq!(simd[l].to_bits(), expected[l].to_bits());
+            assert_eq!(scal[l].to_bits(), expected[l].to_bits());
+        }
+    }
 
-        // Exact integer endpoint identity when mod == 0.0, including cross-wrap lag 4..1023
-        let mut wrap_lines = [[0u16; V3_TANK_RING_STRIDE]; V3_TANK_LINES];
-        write_test_lag(&mut wrap_lines, wr, 4, [f32_to_fp16(0.75); 4]);
-        write_test_lag(&mut wrap_lines, wr, 11, [f32_to_fp16(1.0); 4]);
-        let wrap_ring = InlineTankRing(&mut wrap_lines);
-        let v_exact = read_modulated_catmull_rom::<DefaultMathBackend, _>(
-            &wrap_ring,
-            wr,
-            <DefaultMathBackend as MathBackend>::Vec4::from_array([4.0, 11.0, 12.0, 1023.0]),
-            0.0,
-            0.0,
-            <DefaultMathBackend as MathBackend>::Vec4::splat(4.0),
-            <DefaultMathBackend as MathBackend>::Vec4::splat((V3_TANK_CAP - 1) as f32),
+    #[test]
+    fn test_schroeder_bank_allpass_unity_energy_and_freeze_hold() {
+        let mut ap =
+            PartitionedSchroederBank::from_params([19, 31, 47, 0], [0.65, -0.55, 0.5, 0.9])
+                .expect("non-zero delays allocate");
+        assert!((ap.gains[3] - 0.75).abs() < 1e-6);
+        assert!(!ap.active_mask[3]);
+
+        let mut e_in = 0.0_f64;
+        let mut e_out = 0.0_f64;
+        for n in 0..2048 {
+            let x = if n < 128 {
+                [(n as f32 * 0.13).sin(), (n as f32 * 0.21).cos(), 0.25, 0.5]
+            } else {
+                [0.0; 4]
+            };
+            let y = ap
+                .step_quad::<DefaultMathBackend, false>(
+                    <DefaultMathBackend as MathBackend>::Vec4::load(&x),
+                )
+                .to_array();
+            assert_eq!(y[3].to_bits(), x[3].to_bits());
+            e_in += f64::from(x[0]) * f64::from(x[0]) + f64::from(x[1]) * f64::from(x[1]);
+            e_out += f64::from(y[0]) * f64::from(y[0]) + f64::from(y[1]) * f64::from(y[1]);
+        }
+        assert!((e_out - e_in).abs() < 1e-3);
+
+        let before = ap.buf.clone();
+        let _ = ap.step_quad::<DefaultMathBackend, true>(
             <DefaultMathBackend as MathBackend>::Vec4::splat(0.5),
         );
-        assert_eq!(v_exact.to_array(), [0.75, 1.0, 0.0, 0.0]);
+        assert_eq!(&*ap.buf, &*before);
     }
 }

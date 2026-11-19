@@ -2,185 +2,88 @@
 //! Projections (`ref[container.dnam.delay-histories]`, `ref[container.dnam.load-validation]`,
 //! `ref[container.dnam.stage3-slices]`, `ref[container.dnam.cp1-profile]`).
 
-use alloc::collections::BTreeSet;
-use alloc::string::{String, ToString};
+pub mod delay_and_stage3;
+
+pub use delay_and_stage3::{
+    DeclaredDelayHistory, DelayHistoryEntry, parse_canonical_reference_samples,
+    validate_delay_histories, validate_delay_history_entries, validate_stage3_tier_slices,
+};
+
+use alloc::string::ToString;
 use alloc::vec::Vec;
+use core::mem::{align_of, size_of};
 
-use serde_json::Value;
+use zerocopy::byteorder::little_endian::{F32, U16};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+use super::layout::ContainerWireError;
 use crate::schema::{DnamError, SchemaOptionExt, reject_if};
+
+#[inline]
+fn read_finite_f32_words_rt(bytes: &[u8]) -> Result<&[F32], ContainerWireError> {
+    let words = <[F32]>::ref_from_bytes(bytes)
+        .map_err(|_| ContainerWireError::SchemaStatic("invalid f32 slice"))?;
+    for w in words {
+        if !w.get().is_finite() {
+            return Err(ContainerWireError::SchemaStatic("nonfinite coefficient"));
+        }
+    }
+    Ok(words)
+}
+
+#[inline]
+fn read_finite_f32_words(bytes: &[u8]) -> Result<&[F32], DnamError> {
+    read_finite_f32_words_rt(bytes).map_err(ContainerWireError::into_dnam_error)
+}
+
+/// Wire header (`8 B`) for a self-describing `CP1\0` stream in Region 4 `shared_extent`
+/// (`ref[container.dnam.cp1-profile]`).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct Cp1StreamHeaderWire {
+    pub magic: [u8; 4],
+    pub count: U16,
+    pub flags: u8,
+    pub reserved: u8,
+}
+
+const _: () =
+    assert!(size_of::<Cp1StreamHeaderWire>() == 8 && align_of::<Cp1StreamHeaderWire>() == 1);
+
+/// Wire directory entry (`4 B`) inside a `CP1\0` stream (`ref[container.dnam.cp1-profile]`).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct Cp1StreamDirEntryWire {
+    pub control_idx: U16,
+    pub raw_kl: u8,
+    pub aux: u8,
+}
+
+const _: () =
+    assert!(size_of::<Cp1StreamDirEntryWire>() == 4 && align_of::<Cp1StreamDirEntryWire>() == 1);
+
+/// Packed `4 B` contributor record descriptor header (`ref[container.dnam.cp1-profile]`).
+#[repr(C)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct Cp1ContributorRecordHeaderWire {
+    pub control_idx: U16,
+    pub kind_and_lanes: u8,
+    pub aux: u8,
+}
+
+const _: () = assert!(
+    size_of::<Cp1ContributorRecordHeaderWire>() == 4
+        && align_of::<Cp1ContributorRecordHeaderWire>() == 1
+);
 
 /// Magic bytes for a packed `CP1\0` control projection contributor stream in `shared_extent`.
 pub const CP1_MAGIC: [u8; 4] = *b"CP1\0";
-
-/// Validated `delay_histories` declaration (`ref[container.dnam.delay-histories]`).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeclaredDelayHistory {
-    pub id: String,
-    pub stage: String,
-    pub kind: String,
-    pub introduced_tier: u8,
-    pub sample_format: String,
-    /// Per-tier reference sample counts at `48 kHz` (`0` for tiers below `introduced_tier`).
-    pub reference_samples_by_tier: [u64; 4],
-}
-
-/// Parses a canonical decimal string (`[1-9][0-9]*`) as a non-zero `u64` (`ref[container.dnam.delay-histories]`).
-pub fn parse_canonical_reference_samples(text: &str) -> Result<u64, DnamError> {
-    let bytes = text.as_bytes();
-    reject_if(
-        bytes.is_empty() || !bytes[0].is_ascii_digit() || bytes[0] == b'0',
-        "noncanonical unsigned count",
-    )?;
-    reject_if(
-        bytes.iter().any(|b| !b.is_ascii_digit()),
-        "noncanonical unsigned count",
-    )?;
-    text.parse::<u64>()
-        .map_err(|_| DnamError::SchemaValidationError("count exceeds u64".to_string()))
-}
-
-fn tier_name_to_index(name: &str) -> Option<u8> {
-    match name {
-        "lite" => Some(0),
-        "full" => Some(1),
-        "pro" => Some(2),
-        "ultra" => Some(3),
-        _ => None,
-    }
-}
-
-/// Validates and parses the `delay_histories` array for a container with `max_tier` (`0..=3`,
-/// `ref[container.dnam.delay-histories]`, `ref[dsp.op-t.ring.declaration]`).
-pub fn validate_delay_histories(
-    entries: &[Value],
-    max_tier: u8,
-) -> Result<Vec<DeclaredDelayHistory>, DnamError> {
-    reject_if(max_tier > 3, "invalid max_tier")?;
-    let tier_names = ["lite", "full", "pro", "ultra"];
-    let mut seen_ids = BTreeSet::new();
-    let mut out = Vec::with_capacity(entries.len());
-
-    for item in entries {
-        let obj = item
-            .as_object()
-            .or_schema_err("delay history must be an object")?;
-        reject_if(obj.len() != 6, "invalid delay history fields")?;
-        let id = obj.get("id").and_then(Value::as_str).unwrap_or("");
-        reject_if(
-            id.is_empty() || !seen_ids.insert(id.to_string()),
-            "duplicate or empty delay history id",
-        )?;
-        let stage = obj.get("stage").and_then(Value::as_str).unwrap_or("");
-        reject_if(
-            !matches!(stage, "stage1_pre" | "stage4_tank"),
-            "invalid delay history stage",
-        )?;
-        let kind = obj.get("kind").and_then(Value::as_str).unwrap_or("");
-        reject_if(
-            !matches!(kind, "fractional" | "allpass"),
-            "invalid delay history kind",
-        )?;
-        let intro_str = obj
-            .get("introduced_tier")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let introduced_tier =
-            tier_name_to_index(intro_str).or_schema_err("invalid introduced_tier")?;
-        reject_if(
-            introduced_tier > max_tier,
-            "introduced_tier exceeds max_tier",
-        )?;
-        let sample_format = obj
-            .get("sample_format")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        reject_if(sample_format != "fp16", "invalid sample_format")?;
-        let ref_map = obj
-            .get("reference_samples")
-            .and_then(Value::as_object)
-            .or_schema_err("invalid reference_samples")?;
-
-        let expected_tier_count = (max_tier - introduced_tier + 1) as usize;
-        reject_if(
-            ref_map.len() != expected_tier_count,
-            "mismatched reference_samples tier keys",
-        )?;
-        let mut ref_by_tier = [0u64; 4];
-        for t in (introduced_tier as usize)..=(max_tier as usize) {
-            let s = ref_map
-                .get(tier_names[t])
-                .and_then(Value::as_str)
-                .or_schema_err("missing tier sample count")?;
-            let count = parse_canonical_reference_samples(s)?;
-            reject_if(
-                kind == "fractional" && count < 4,
-                "fractional delay reference_samples must be >= 4",
-            )?;
-            ref_by_tier[t] = count;
-        }
-        out.push(DeclaredDelayHistory {
-            id: id.to_string(),
-            stage: stage.to_string(),
-            kind: kind.to_string(),
-            introduced_tier,
-            sample_format: sample_format.to_string(),
-            reference_samples_by_tier: ref_by_tier,
-        });
-    }
-    Ok(out)
-}
-
-/// Validates that a Stage III early FIR slice (`128 B` per tier) and Kautz modal slice
-/// (`128 B * 1` block per tier in `v3`) are 64-byte aligned, non-overlapping, within their
-/// tier bounds, and contain only finite `f32` values (`ref[container.dnam.stage3-slices]`,
-/// `ref[container.dnam.load-validation]`).
-pub fn validate_stage3_tier_slices(
-    tier_index: u8,
-    tier_bytes: &[u8],
-    early_fir_offset_in_tier: usize,
-    early_fir_len: usize,
-    kautz_offset_in_tier: usize,
-    kautz_len: usize,
-) -> Result<(), DnamError> {
-    let expected_kautz_blocks = match tier_index {
-        0..=3 => 1usize,
-        _ => {
-            return Err(DnamError::SchemaValidationError(
-                "invalid tier_index".to_string(),
-            ));
-        }
-    };
-    let expected_kautz_len = expected_kautz_blocks * 128;
-    reject_if(
-        early_fir_len != 128 || kautz_len != expected_kautz_len,
-        "invalid Stage III slice byte length",
-    )?;
-    reject_if(
-        !early_fir_offset_in_tier.is_multiple_of(64) || !kautz_offset_in_tier.is_multiple_of(64),
-        "misaligned Stage III slice offset",
-    )?;
-    let fir_end = early_fir_offset_in_tier + early_fir_len;
-    let kautz_end = kautz_offset_in_tier + kautz_len;
-    reject_if(
-        fir_end > tier_bytes.len() || kautz_end > tier_bytes.len(),
-        "Stage III slice outside tier",
-    )?;
-    reject_if(
-        early_fir_offset_in_tier < kautz_end && kautz_offset_in_tier < fir_end,
-        "overlapping Stage III slices",
-    )?;
-    for slice in [
-        &tier_bytes[early_fir_offset_in_tier..fir_end],
-        &tier_bytes[kautz_offset_in_tier..kautz_end],
-    ] {
-        for &chunk in slice.as_chunks::<4>().0 {
-            let v = f32::from_le_bytes(chunk);
-            reject_if(!v.is_finite(), "non-finite Stage III coefficient")?;
-        }
-    }
-    Ok(())
-}
 
 /// Returns the byte length of a single `CP1` contributor record with `lanes` (`1..=3`):
 /// `4 * (9 * lanes + 4)` in `Arena 0` (`ultra == false`) or `4 * (8 * lanes + 4)` in `Arena 3`
@@ -234,13 +137,10 @@ pub fn decode_cp1_contributor_stream(
     }
 
     let read_f32_vec = |bytes: &[u8]| -> Result<Vec<f32>, DnamError> {
-        let mut out = Vec::with_capacity(bytes.len() / 4);
-        for &chunk in bytes.as_chunks::<4>().0 {
-            let v = f32::from_le_bytes(chunk);
-            reject_if(!v.is_finite(), "nonfinite coefficient")?;
-            out.push(v);
-        }
-        Ok(out)
+        Ok(read_finite_f32_words(bytes)?
+            .iter()
+            .map(|w| w.get())
+            .collect())
     };
 
     let mut records = Vec::with_capacity(contributor_lanes.len());
@@ -318,19 +218,18 @@ pub fn decode_cp1_contributor_stream_into_slice(
         ));
     }
 
-    let read_f32_at = |bytes: &[u8], idx: usize| -> Result<f32, DnamError> {
-        let off = idx * 4;
-        let v = f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
-        reject_if(!v.is_finite(), "nonfinite coefficient")?;
-        Ok(v)
+    let base_words = read_finite_f32_words(&base_bytes[..expected_base])?;
+    let ultra_words = match ultra_delta_bytes {
+        Some(ub) => Some(read_finite_f32_words(&ub[..expected_ultra])?),
+        None => None,
     };
 
-    let mut b_off = 0usize;
-    let mut u_off = 0usize;
+    let mut b_word_off = 0usize;
+    let mut u_word_off = 0usize;
     for (slot_idx, &lanes) in contributor_lanes.iter().enumerate() {
-        let b_len = cp1_contributor_record_bytes(lanes, false).unwrap();
-        let b_slice = &base_bytes[b_off..b_off + b_len];
-        b_off += b_len;
+        let b_words = 9 * lanes + 4;
+        let b_rec = &base_words[b_word_off..b_word_off + b_words];
+        b_word_off += b_words;
 
         let mut slot = crate::control::Cp1ContributorSlot::zero();
         slot.lanes = lanes as u8;
@@ -339,27 +238,27 @@ pub fn decode_cp1_contributor_stream_into_slice(
 
         for k in 0..lanes {
             for r in 0..8 {
-                slot.main_base[k][r] = read_f32_at(b_slice, k * 8 + r)?;
+                slot.main_base[k][r] = b_rec[k * 8 + r].get();
             }
-            slot.emb[k] = read_f32_at(b_slice, 8 * lanes + k)?;
+            slot.emb[k] = b_rec[8 * lanes + k].get();
         }
         let v_start = 9 * lanes;
         for f in 0..4 {
-            slot.v_base[f] = read_f32_at(b_slice, v_start + f)?;
+            slot.v_base[f] = b_rec[v_start + f].get();
         }
 
-        if let Some(ub) = ultra_delta_bytes {
-            let u_len = cp1_contributor_record_bytes(lanes, true).unwrap();
-            let u_slice = &ub[u_off..u_off + u_len];
-            u_off += u_len;
+        if let Some(uw) = ultra_words {
+            let u_words = 8 * lanes + 4;
+            let u_rec = &uw[u_word_off..u_word_off + u_words];
+            u_word_off += u_words;
             for k in 0..lanes {
                 for r in 0..8 {
-                    slot.main_ultra[k][r] = read_f32_at(u_slice, k * 8 + r)?;
+                    slot.main_ultra[k][r] = u_rec[k * 8 + r].get();
                 }
             }
             let uv_start = 8 * lanes;
             for f in 0..4 {
-                slot.v_ultra[f] = read_f32_at(u_slice, uv_start + f)?;
+                slot.v_ultra[f] = u_rec[uv_start + f].get();
             }
             slot.has_ultra = true;
         }
@@ -368,61 +267,70 @@ pub fn decode_cp1_contributor_stream_into_slice(
     Ok(contributor_lanes.len())
 }
 
-/// Decodes a self-describing `CP1\0` contributor stream from `shared_extent` into `out_slots`
-/// without heap allocation (`ref[container.dnam.cp1-profile]`).
-///
-/// Framing: `b"CP1\0"` (`4 B`), `count: u16le` (`2 B`), `flags: u8` (`1 B`, bit 0 = `has_ultra`),
-/// `reserved: u8` (`1 B`), followed by `count * 4 B` contributor directory entries
-/// `(control_idx: u16le, lanes: u8, option_idx: u8)`, followed by packed `base_bytes` and optional `ultra_bytes`.
-pub fn decode_cp1_shared_stream_into_slice(
+/// Zero-drop-glue (`Copy` error) `CP1\0` stream decoder for real-time container reloaders.
+pub(crate) fn decode_cp1_shared_stream_into_slice_rt(
     cp1_slice: &[u8],
     out_slots: &mut [crate::control::Cp1ContributorSlot],
-) -> Result<usize, DnamError> {
-    if cp1_slice.len() < 8 || cp1_slice[0..4] != CP1_MAGIC {
+) -> Result<usize, ContainerWireError> {
+    let Ok((hdr, after_hdr)) = Cp1StreamHeaderWire::ref_from_prefix(cp1_slice) else {
+        return Ok(0);
+    };
+    if hdr.magic != CP1_MAGIC {
         return Ok(0);
     }
-    let count = u16::from_le_bytes([cp1_slice[4], cp1_slice[5]]) as usize;
+    let count = hdr.count.get() as usize;
     if count == 0 {
         return Ok(0);
     }
-    let has_ultra = (cp1_slice[6] & 1) != 0;
-    let dir_end = 8 + count * 4;
-    reject_if(
-        count > out_slots.len() || cp1_slice.len() < dir_end,
-        "invalid CP1 shared stream header",
-    )?;
+    if hdr.reserved != 0 {
+        return Err(ContainerWireError::SchemaStatic(
+            "invalid CP1 shared stream header",
+        ));
+    }
+    let has_ultra = (hdr.flags & 1) != 0;
+    let Ok((dir_entries, payload_bytes)) =
+        <[Cp1StreamDirEntryWire]>::ref_from_prefix_with_elems(after_hdr, count)
+    else {
+        return Err(ContainerWireError::SchemaStatic(
+            "invalid CP1 shared stream header",
+        ));
+    };
+    if count > out_slots.len() {
+        return Err(ContainerWireError::SchemaStatic(
+            "invalid CP1 shared stream header",
+        ));
+    }
     let mut expected_base = 0usize;
     let mut expected_ultra = 0usize;
-    for i in 0..count {
-        let raw_kl = cp1_slice[8 + i * 4 + 2];
-        let lanes = (raw_kl & 0x03) as usize;
-        expected_base += cp1_contributor_record_bytes(lanes, false)
-            .or_schema_err("invalid contributor lane count")?;
+    for entry in dir_entries {
+        let lanes = (entry.raw_kl & 0x03) as usize;
+        expected_base += cp1_contributor_record_bytes(lanes, false).ok_or(
+            ContainerWireError::SchemaStatic("invalid contributor lane count"),
+        )?;
         if has_ultra {
             expected_ultra += cp1_contributor_record_bytes(lanes, true).unwrap();
         }
     }
-    reject_if(
-        cp1_slice.len() < dir_end + expected_base + expected_ultra,
-        "truncated CP1 shared stream payload",
-    )?;
-    let base_bytes = &cp1_slice[dir_end..dir_end + expected_base];
-    let ultra_bytes = &cp1_slice[dir_end + expected_base..dir_end + expected_base + expected_ultra];
-    let read_f32_at = |bytes: &[u8], idx: usize| -> Result<f32, DnamError> {
+    if payload_bytes.len() < expected_base + expected_ultra {
+        return Err(ContainerWireError::SchemaStatic(
+            "truncated CP1 shared stream payload",
+        ));
+    }
+    let base_bytes = &payload_bytes[..expected_base];
+    let ultra_bytes = &payload_bytes[expected_base..expected_base + expected_ultra];
+    let read_f32_at = |bytes: &[u8], idx: usize| -> Result<f32, ContainerWireError> {
         let off = idx * 4;
-        let v = f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
-        reject_if(!v.is_finite(), "nonfinite coefficient")?;
-        Ok(v)
+        let words = read_finite_f32_words_rt(&bytes[off..off + 4])?;
+        Ok(words[0].get())
     };
     let mut b_off = 0usize;
     let mut u_off = 0usize;
-    for (slot_idx, out_slot) in out_slots.iter_mut().take(count).enumerate() {
-        let d_off = 8 + slot_idx * 4;
-        let control_idx = u16::from_le_bytes([cp1_slice[d_off], cp1_slice[d_off + 1]]);
-        let raw_kl = cp1_slice[d_off + 2];
+    for (out_slot, dir_entry) in out_slots.iter_mut().take(count).zip(dir_entries.iter()) {
+        let control_idx = dir_entry.control_idx.get();
+        let raw_kl = dir_entry.raw_kl;
         let lanes = (raw_kl & 0x03) as usize;
         let ctrl_kind = (raw_kl >> 2) & 0x03;
-        let aux = cp1_slice[d_off + 3];
+        let aux = dir_entry.aux;
         let b_len = cp1_contributor_record_bytes(lanes, false).unwrap();
         let b_slice = &base_bytes[b_off..b_off + b_len];
         b_off += b_len;
@@ -468,6 +376,20 @@ pub fn decode_cp1_shared_stream_into_slice(
     Ok(count)
 }
 
+/// Decodes a self-describing `CP1\0` contributor stream from `shared_extent` into `out_slots`
+/// without heap allocation (`ref[container.dnam.cp1-profile]`).
+///
+/// Framing: `b"CP1\0"` (`4 B`), `count: u16le` (`2 B`), `flags: u8` (`1 B`, bit 0 = `has_ultra`),
+/// `reserved: u8` (`1 B`), followed by `count * 4 B` contributor directory entries
+/// `(control_idx: u16le, lanes: u8, option_idx: u8)`, followed by packed `base_bytes` and optional `ultra_bytes`.
+pub fn decode_cp1_shared_stream_into_slice(
+    cp1_slice: &[u8],
+    out_slots: &mut [crate::control::Cp1ContributorSlot],
+) -> Result<usize, DnamError> {
+    decode_cp1_shared_stream_into_slice_rt(cp1_slice, out_slots)
+        .map_err(ContainerWireError::into_dnam_error)
+}
+
 /// Encodes a slice of [`crate::control::Cp1ContributorSlot`] entries into a self-describing
 /// `CP1\0` stream suitable for Region 4 `shared_extent` (`ref[container.dnam.cp1-profile]`).
 pub fn encode_cp1_shared_stream(
@@ -491,11 +413,19 @@ pub fn encode_cp1_shared_stream(
             ultra_len += cp1_contributor_record_bytes(lanes, true).unwrap();
         }
     }
-    let mut out = Vec::with_capacity(8 + slots.len() * 4 + base_len + ultra_len);
-    out.extend_from_slice(&CP1_MAGIC);
-    out.extend_from_slice(&(slots.len() as u16).to_le_bytes());
-    out.push(u8::from(has_ultra));
-    out.push(0);
+    let hdr = Cp1StreamHeaderWire {
+        magic: CP1_MAGIC,
+        count: U16::new(slots.len() as u16),
+        flags: u8::from(has_ultra),
+        reserved: 0,
+    };
+    let mut out = Vec::with_capacity(
+        size_of::<Cp1StreamHeaderWire>()
+            + slots.len() * size_of::<Cp1StreamDirEntryWire>()
+            + base_len
+            + ultra_len,
+    );
+    out.extend_from_slice(hdr.as_bytes());
     for slot in slots {
         let raw_kl = ((slot.ctrl_kind & 0x03) << 2) | (slot.lanes & 0x03);
         let aux = if slot.ctrl_kind == 2 {
@@ -503,13 +433,16 @@ pub fn encode_cp1_shared_stream(
         } else {
             slot.option_idx
         };
-        out.extend_from_slice(&slot.control_idx.to_le_bytes());
-        out.push(raw_kl);
-        out.push(aux);
+        let entry = Cp1StreamDirEntryWire {
+            control_idx: U16::new(slot.control_idx),
+            raw_kl,
+            aux,
+        };
+        out.extend_from_slice(entry.as_bytes());
     }
     let push_f32 = |buf: &mut Vec<u8>, val: f32| -> Result<(), DnamError> {
         reject_if(!val.is_finite(), "nonfinite coefficient")?;
-        buf.extend_from_slice(&val.to_le_bytes());
+        buf.extend_from_slice(F32::new(val).as_bytes());
         Ok(())
     };
     for slot in slots {
@@ -566,6 +499,30 @@ mod spec_tests {
 
         let valid_entries = vec![
             json!({
+                "id": "tank.quad0.line0",
+                "stage": "op_t_tank",
+                "kind": "fractional",
+                "introduced_tier": "lite",
+                "sample_format": "fp16",
+                "reference_samples": {
+                    "lite": "432000",
+                    "full": "432000",
+                    "pro": "432000",
+                    "ultra": "432000"
+                }
+            }),
+            json!({
+                "id": "tank.ap.0",
+                "stage": "stage4_tank",
+                "kind": "allpass",
+                "introduced_tier": "pro",
+                "sample_format": "f32",
+                "reference_samples": {
+                    "pro": "149",
+                    "ultra": "149"
+                }
+            }),
+            json!({
                 "id": "pre.left",
                 "stage": "stage1_pre",
                 "kind": "fractional",
@@ -578,22 +535,24 @@ mod spec_tests {
                     "ultra": "960"
                 }
             }),
-            json!({
-                "id": "tank.ap.0",
-                "stage": "stage4_tank",
-                "kind": "allpass",
-                "introduced_tier": "pro",
-                "sample_format": "fp16",
-                "reference_samples": {
-                    "pro": "149",
-                    "ultra": "149"
-                }
-            }),
         ];
         let parsed = validate_delay_histories(&valid_entries, 3).unwrap();
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].reference_samples_by_tier, [480, 480, 960, 960]);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].stage, "op_t_tank");
+        assert_eq!(parsed[1].sample_format, "f32");
+        assert_eq!(parsed[2].reference_samples_by_tier, [480, 480, 960, 960]);
         assert_eq!(parsed[1].reference_samples_by_tier, [0, 0, 149, 149]);
+
+        // Unsupported sample_format ("f64") is rejected
+        let bad_fmt = vec![json!({
+            "id": "tank.bad_fmt",
+            "stage": "op_t_tank",
+            "kind": "fractional",
+            "introduced_tier": "lite",
+            "sample_format": "f64",
+            "reference_samples": { "lite": "64" }
+        })];
+        assert!(validate_delay_histories(&bad_fmt, 0).is_err());
 
         // Fractional delay < 4 is rejected
         let too_short = vec![json!({
@@ -613,18 +572,38 @@ mod spec_tests {
     /// Verifies Stage III separate 64B-aligned slices and `CP1` packed control projection records.
     #[test]
     fn test_stage3_slices_and_cp1_packed_projection_validation() {
-        // 1. Stage III slices across Lite, Full, Pro, Ultra (1 Kautz block = 128 B per tier)
-        for (tier, blocks) in [(0u8, 1usize), (1, 1), (2, 1), (3, 1)] {
+        // 1. Stage III slices across Lite, Full, Pro, Ultra:
+        //    FIR [256, 128, 384, 256] B, Kautz [2, 1, 3, 2] * 128 B = [256, 128, 384, 256] B
+        for (tier, fir_len, blocks) in [
+            (0u8, 256usize, 2usize),
+            (1, 128, 1),
+            (2, 384, 3),
+            (3, 256, 2),
+        ] {
             let kautz_len = blocks * 128;
-            let arena_bytes = vec![0u8; 128 + kautz_len + 64];
-            validate_stage3_tier_slices(tier, &arena_bytes, 0, 128, 128, kautz_len).unwrap();
+            let arena_bytes = vec![0u8; fir_len + kautz_len + 64];
+            validate_stage3_tier_slices(tier, &arena_bytes, 0, fir_len, fir_len, kautz_len)
+                .unwrap();
+            // Wrong FIR or Kautz length rejected
+            assert!(
+                validate_stage3_tier_slices(tier, &arena_bytes, 0, fir_len / 2, fir_len, kautz_len)
+                    .is_err()
+            );
             // Overlapping slices rejected
             assert!(
-                validate_stage3_tier_slices(tier, &arena_bytes, 0, 128, 64, kautz_len).is_err()
+                validate_stage3_tier_slices(tier, &arena_bytes, 0, fir_len, 64, kautz_len).is_err()
             );
             // Unaligned offset rejected
             assert!(
-                validate_stage3_tier_slices(tier, &arena_bytes, 32, 128, 192, kautz_len).is_err()
+                validate_stage3_tier_slices(
+                    tier,
+                    &arena_bytes,
+                    32,
+                    fir_len,
+                    fir_len + 64,
+                    kautz_len
+                )
+                .is_err()
             );
         }
 
@@ -671,18 +650,25 @@ mod spec_tests {
         assert!(slots[0].has_ultra);
 
         let mut shared_stream = Vec::new();
-        shared_stream.extend_from_slice(&CP1_MAGIC);
-        shared_stream.extend_from_slice(&2_u16.to_le_bytes());
-        shared_stream.push(1); // has_ultra = true
-        shared_stream.push(0);
-        // Entry 0: control_idx = 0, lanes = 3, ctrl_kind = 0, aux = 0xFF
-        shared_stream.extend_from_slice(&0_u16.to_le_bytes());
-        shared_stream.push(3);
-        shared_stream.push(0xFF);
-        // Entry 1: control_idx = 1, lanes = 1, ctrl_kind = 2 (dual-axis), aux = 2
-        shared_stream.extend_from_slice(&1_u16.to_le_bytes());
-        shared_stream.push((2 << 2) | 1);
-        shared_stream.push(2);
+        let hdr = Cp1StreamHeaderWire {
+            magic: CP1_MAGIC,
+            count: U16::new(2),
+            flags: 1, // has_ultra = true
+            reserved: 0,
+        };
+        let e0 = Cp1StreamDirEntryWire {
+            control_idx: U16::new(0),
+            raw_kl: 3,
+            aux: 0xFF,
+        };
+        let e1 = Cp1StreamDirEntryWire {
+            control_idx: U16::new(1),
+            raw_kl: (2 << 2) | 1,
+            aux: 2,
+        };
+        shared_stream.extend_from_slice(hdr.as_bytes());
+        shared_stream.extend_from_slice(e0.as_bytes());
+        shared_stream.extend_from_slice(e1.as_bytes());
         shared_stream.resize(8 + 8 + (124 + 52) + (112 + 48), 0);
         let n_shared = decode_cp1_shared_stream_into_slice(&shared_stream, &mut slots).unwrap();
         assert_eq!(n_shared, 2);

@@ -1,12 +1,57 @@
-//! Prefix Lists, Two-Certificate Ed25519 Delegation & Open `DAU1` Authentication Envelopes.
+//! Prefix Lists, Two-Certificate Ed25519 Delegation & Open `DAU1` / Protected `DAI1` Envelopes.
 //!
 //! Canonical Reference: `docs/specs/security/provenance_and_enclave_drm.md` (`ref[sec.sig.prefix-delegation]`, `ref[sec.sig.dau1-envelope]`, `ref[sec.sig.offline-auth]`).
 
 use alloc::vec::Vec;
+use core::mem::{align_of, offset_of, size_of};
+
+use zerocopy::byteorder::little_endian::U32;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::container::encode_domain_field;
 use crate::provenance::sha256::sha256_digest;
 use crate::schema::{DnamError, SchemaOptionExt, reject_if};
+
+/// Fixed 41-byte creator preamble wire header for `DAU1` and `DAI1` envelopes
+/// (`ref[sec.sig.dau1-envelope]`, `ref[repo.code.zerocopy-wire-structs]`).
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct Dau1CreatorPreambleWire {
+    /// Envelope magic (`b"DAU1"` or `b"DAI1"`).
+    pub magic: [u8; 4],
+    /// `DAU1`: `0` (creator-only) or `1` (creator + marketplace); `DAI1`: strictly `0`.
+    pub auth_kind: u8,
+    /// Reserved zero bytes (`[0, 0, 0]`).
+    pub reserved: [u8; 3],
+    /// Creator `Ed25519` public key (`32 B`).
+    pub creator_pubkey: [u8; 32],
+    /// Creator issued maximum tier (`0..=3`).
+    pub creator_max_tier: u8,
+}
+
+const _: () = assert!(size_of::<Dau1CreatorPreambleWire>() == 41);
+const _: () = assert!(align_of::<Dau1CreatorPreambleWire>() == 1);
+const _: () = assert!(offset_of!(Dau1CreatorPreambleWire, creator_pubkey) == 8);
+const _: () = assert!(offset_of!(Dau1CreatorPreambleWire, creator_max_tier) == 40);
+
+/// Fixed 36-byte marketplace header in `auth_kind == 1` `DAU1` and `DAI1` envelopes
+/// (`ref[sec.sig.dau1-envelope]`, `ref[repo.code.zerocopy-wire-structs]`).
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct Dau1BuyerHeaderWire {
+    /// Marketplace `Ed25519` public key (`32 B`).
+    pub marketplace_pubkey: [u8; 32],
+    /// Canonical UTF-8 RFC 8785 JCS license policy byte length `P`.
+    pub policy_len: U32,
+}
+
+const _: () = assert!(size_of::<Dau1BuyerHeaderWire>() == 36);
+const _: () = assert!(align_of::<Dau1BuyerHeaderWire>() == 1);
+const _: () = assert!(offset_of!(Dau1BuyerHeaderWire, policy_len) == 32);
 
 /// Computes `HMAC-SHA256(key, message)` (`ref[sec.watermark.seed-derivation]`).
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
@@ -164,12 +209,15 @@ impl Dau1Envelope {
             "invalid DAU1 creator fields",
         )?;
         let l_master = encode_prefix_list(&self.master_prefixes)?;
+        let header = Dau1CreatorPreambleWire {
+            magic: *b"DAU1",
+            auth_kind: self.auth_kind,
+            reserved: [0u8; 3],
+            creator_pubkey: self.creator_pubkey,
+            creator_max_tier: self.creator_max_tier,
+        };
         let mut out = Vec::new();
-        out.extend_from_slice(b"DAU1");
-        out.push(self.auth_kind);
-        out.extend_from_slice(&[0u8; 3]);
-        out.extend_from_slice(&self.creator_pubkey);
-        out.push(self.creator_max_tier);
+        out.extend_from_slice(header.as_bytes());
         out.extend_from_slice(&l_master);
         out.extend_from_slice(&self.creator_signature);
 
@@ -183,13 +231,19 @@ impl Dau1Envelope {
             let m_sig = self
                 .marketplace_signature
                 .or_schema_err("missing DAU1 marketplace_signature")?;
+            let policy_len = u32::try_from(self.policy_bytes.len())
+                .ok()
+                .or_schema_err("DAU1 policy_bytes length overflow")?;
             reject_if(
                 b_max > self.creator_max_tier || self.buyer_prefixes.len() != (b_max as usize + 1),
                 "invalid DAU1 buyer tier fields",
             )?;
             let l_buyer = encode_prefix_list(&self.buyer_prefixes)?;
-            out.extend_from_slice(&m_pub);
-            out.extend_from_slice(&(self.policy_bytes.len() as u32).to_le_bytes());
+            let buyer_hdr = Dau1BuyerHeaderWire {
+                marketplace_pubkey: m_pub,
+                policy_len: U32::new(policy_len),
+            };
+            out.extend_from_slice(buyer_hdr.as_bytes());
             out.extend_from_slice(&self.policy_bytes);
             out.push(b_max);
             out.extend_from_slice(&l_buyer);
@@ -200,18 +254,19 @@ impl Dau1Envelope {
 
     /// Parses and validates a `DAU1` binary wire envelope (`ref[sec.sig.dau1-envelope]`).
     pub fn from_bytes(data: &[u8]) -> Result<Self, DnamError> {
+        let (header, _) = Dau1CreatorPreambleWire::read_from_prefix(data)
+            .ok()
+            .or_schema_err("invalid DAU1 header")?;
         reject_if(
-            data.len() < 106 + 33
-                || &data[0..4] != b"DAU1"
-                || data[4] > 1
-                || data[5..8] != [0, 0, 0],
+            &header.magic != b"DAU1"
+                || header.auth_kind > 1
+                || header.reserved != [0, 0, 0]
+                || header.creator_max_tier > 3,
             "invalid DAU1 header",
         )?;
-        let auth_kind = data[4];
-        let mut creator_pubkey = [0u8; 32];
-        creator_pubkey.copy_from_slice(&data[8..40]);
-        let creator_max_tier = data[40];
-        reject_if(creator_max_tier > 3, "invalid DAU1 creator_max_tier")?;
+        let auth_kind = header.auth_kind;
+        let creator_pubkey = header.creator_pubkey;
+        let creator_max_tier = header.creator_max_tier;
         let nc = (creator_max_tier as usize) + 1;
         let l_master_end = 41 + 1 + 33 * nc;
         reject_if(
@@ -242,12 +297,16 @@ impl Dau1Envelope {
             });
         }
 
-        reject_if(data.len() < pos + 36, "truncated DAU1 marketplace header")?;
-        let mut marketplace_pubkey = [0u8; 32];
-        marketplace_pubkey.copy_from_slice(&data[pos..pos + 32]);
-        let p_len = u32::from_le_bytes(data[pos + 32..pos + 36].try_into().unwrap()) as usize;
-        let p_end = pos + 36 + p_len;
-        reject_if(data.len() < p_end + 1, "truncated DAU1 policy")?;
+        let (buyer_hdr, after_buyer_hdr) = Dau1BuyerHeaderWire::read_from_prefix(&data[pos..])
+            .ok()
+            .or_schema_err("truncated DAU1 marketplace header")?;
+        let marketplace_pubkey = buyer_hdr.marketplace_pubkey;
+        let p_len = buyer_hdr.policy_len.get() as usize;
+        let p_end = pos
+            .checked_add(size_of::<Dau1BuyerHeaderWire>())
+            .and_then(|v| v.checked_add(p_len))
+            .or_schema_err("DAU1 policy length overflow")?;
+        reject_if(after_buyer_hdr.len() < p_len + 1, "truncated DAU1 policy")?;
         let policy_bytes = data[pos + 36..p_end].to_vec();
         let buyer_max_tier = data[p_end];
         reject_if(
@@ -279,14 +338,136 @@ impl Dau1Envelope {
     }
 }
 
+/// Parsed Protected `DAI1` Inner Authentication Envelope (`209 + 33*N_c + 66*N_b + P` bytes,
+/// `ref[sec.drm.protected-inner-framing]`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Dai1Envelope {
+    pub creator_pubkey: [u8; 32],
+    pub creator_max_tier: u8,
+    pub master_prefixes: Vec<[u8; 32]>,
+    pub creator_signature: [u8; 64],
+    pub marketplace_pubkey: [u8; 32],
+    pub policy_bytes: Vec<u8>,
+    pub buyer_max_tier: u8,
+    pub buyer_prefixes: Vec<[u8; 32]>,
+    pub inner_ciphertext_prefixes: Vec<[u8; 32]>,
+    pub marketplace_signature: [u8; 64],
+}
+
+impl Dai1Envelope {
+    /// Serializes `self` into the canonical `DAI1` wire envelope (`209 + 33*N_c + 66*N_b + P` bytes).
+    pub fn to_bytes(&self) -> Result<Vec<u8>, DnamError> {
+        reject_if(
+            self.creator_max_tier > 3
+                || self.buyer_max_tier > self.creator_max_tier
+                || self.master_prefixes.len() != (self.creator_max_tier as usize + 1)
+                || self.buyer_prefixes.len() != (self.buyer_max_tier as usize + 1)
+                || self.inner_ciphertext_prefixes.len() != (self.buyer_max_tier as usize + 1),
+            "invalid DAI1 fields",
+        )?;
+        let policy_len = u32::try_from(self.policy_bytes.len())
+            .ok()
+            .or_schema_err("DAI1 policy_bytes length overflow")?;
+        let header = Dau1CreatorPreambleWire {
+            magic: *b"DAI1",
+            auth_kind: 0,
+            reserved: [0u8; 3],
+            creator_pubkey: self.creator_pubkey,
+            creator_max_tier: self.creator_max_tier,
+        };
+        let buyer_hdr = Dau1BuyerHeaderWire {
+            marketplace_pubkey: self.marketplace_pubkey,
+            policy_len: U32::new(policy_len),
+        };
+        let mut out = Vec::new();
+        out.extend_from_slice(header.as_bytes());
+        out.extend_from_slice(&encode_prefix_list(&self.master_prefixes)?);
+        out.extend_from_slice(&self.creator_signature);
+        out.extend_from_slice(buyer_hdr.as_bytes());
+        out.extend_from_slice(&self.policy_bytes);
+        out.push(self.buyer_max_tier);
+        out.extend_from_slice(&encode_prefix_list(&self.buyer_prefixes)?);
+        out.extend_from_slice(&encode_prefix_list(&self.inner_ciphertext_prefixes)?);
+        out.extend_from_slice(&self.marketplace_signature);
+        Ok(out)
+    }
+
+    /// Parses and validates a canonical `DAI1` binary wire envelope (`ref[sec.drm.protected-inner-framing]`).
+    pub fn from_bytes(data: &[u8]) -> Result<Self, DnamError> {
+        let (header, _) = Dau1CreatorPreambleWire::read_from_prefix(data)
+            .ok()
+            .or_schema_err("invalid DAI1 header")?;
+        reject_if(
+            &header.magic != b"DAI1"
+                || header.auth_kind != 0
+                || header.reserved != [0, 0, 0]
+                || header.creator_max_tier > 3,
+            "invalid DAI1 header",
+        )?;
+        let nc = (header.creator_max_tier as usize) + 1;
+        let l_master_end = 41 + 1 + 33 * nc;
+        reject_if(
+            data.len() < l_master_end + 64,
+            "truncated DAI1 creator section",
+        )?;
+        let master_prefixes = parse_prefix_list(&data[41..l_master_end], header.creator_max_tier)?;
+        let mut creator_signature = [0u8; 64];
+        creator_signature.copy_from_slice(&data[l_master_end..l_master_end + 64]);
+        let pos = l_master_end + 64;
+
+        let (buyer_hdr, after_buyer_hdr) = Dau1BuyerHeaderWire::read_from_prefix(&data[pos..])
+            .ok()
+            .or_schema_err("truncated DAI1 marketplace header")?;
+        let p_len = buyer_hdr.policy_len.get() as usize;
+        let p_end = pos
+            .checked_add(size_of::<Dau1BuyerHeaderWire>())
+            .and_then(|v| v.checked_add(p_len))
+            .or_schema_err("DAI1 policy length overflow")?;
+        reject_if(after_buyer_hdr.len() < p_len + 1, "truncated DAI1 policy")?;
+        let policy_bytes = data[pos + 36..p_end].to_vec();
+        let buyer_max_tier = data[p_end];
+        reject_if(
+            buyer_max_tier > header.creator_max_tier,
+            "DAI1 buyer_max_tier exceeds creator_max_tier",
+        )?;
+        let nb = (buyer_max_tier as usize) + 1;
+        let l_buyer_end = p_end + 1 + 1 + 33 * nb;
+        let l_ct_end = l_buyer_end + 1 + 33 * nb;
+        reject_if(
+            data.len() != l_ct_end + 64,
+            "invalid DAI1 buyer section length",
+        )?;
+        let buyer_prefixes = parse_prefix_list(&data[p_end + 1..l_buyer_end], buyer_max_tier)?;
+        let inner_ciphertext_prefixes =
+            parse_prefix_list(&data[l_buyer_end..l_ct_end], buyer_max_tier)?;
+        let mut marketplace_signature = [0u8; 64];
+        marketplace_signature.copy_from_slice(&data[l_ct_end..l_ct_end + 64]);
+
+        Ok(Self {
+            creator_pubkey: header.creator_pubkey,
+            creator_max_tier: header.creator_max_tier,
+            master_prefixes,
+            creator_signature,
+            marketplace_pubkey: buyer_hdr.marketplace_pubkey,
+            policy_bytes,
+            buyer_max_tier,
+            buyer_prefixes,
+            inner_ciphertext_prefixes,
+            marketplace_signature,
+        })
+    }
+}
+
 #[cfg(test)]
 mod spec_tests {
+    use crate::provenance::security::Dai1Envelope;
     use crate::provenance::{
         Dau1Envelope, WatermarkSeedScope, build_buyer_receipt_v1, build_creator_manifest_v1,
-        build_plaintext_shared_v1, build_record_nonce_v1, compute_creator_signed_manifest_sha256,
-        compute_immutable_header_sha256, compute_license_policy_sha256,
-        compute_plaintext_prefixes_v1, derive_watermark_seed_hmac_sha256, encode_prefix_list,
-        enforce_distribution_policy, parse_prefix_list,
+        build_plaintext_shared_v1, build_record_nonce_v1, compute_ciphertext_prefixes_v1,
+        compute_creator_signed_manifest_sha256, compute_immutable_header_sha256,
+        compute_license_policy_sha256, compute_plaintext_prefixes_v1,
+        derive_watermark_seed_hmac_sha256, encode_prefix_list, enforce_distribution_policy,
+        parse_prefix_list,
     };
     use crate::schema::{DistributionPolicy, DnamJsonHeader, DnamProtectionProfile};
     use alloc::{string::ToString, vec, vec::Vec};
@@ -390,17 +571,35 @@ mod spec_tests {
             auth_kind: 1,
             creator_pubkey: creator_pk,
             creator_max_tier: 3,
-            master_prefixes,
+            master_prefixes: master_prefixes.clone(),
             creator_signature: creator_sig,
             marketplace_pubkey: Some(market_pk),
             policy_bytes: policy_bytes.to_vec(),
             buyer_max_tier: Some(2),
-            buyer_prefixes,
+            buyer_prefixes: buyer_prefixes.clone(),
             marketplace_signature: Some(market_sig),
         };
         let dau1_bytes = dau1.to_bytes().unwrap();
         assert_eq!(dau1_bytes.len(), 208 + 33 * 4 + 33 * 3 + policy_bytes.len());
         assert_eq!(Dau1Envelope::from_bytes(&dau1_bytes).unwrap(), dau1);
+
+        let inner_ct_prefixes =
+            compute_ciphertext_prefixes_v1(&[0x99u8; 32], &[0xAA; 64], &tiers[..3]).unwrap();
+        let dai1 = Dai1Envelope {
+            creator_pubkey: creator_pk,
+            creator_max_tier: 3,
+            master_prefixes,
+            creator_signature: creator_sig,
+            marketplace_pubkey: market_pk,
+            policy_bytes: policy_bytes.to_vec(),
+            buyer_max_tier: 2,
+            buyer_prefixes,
+            inner_ciphertext_prefixes: inner_ct_prefixes,
+            marketplace_signature: market_sig,
+        };
+        let dai1_bytes = dai1.to_bytes().unwrap();
+        assert_eq!(dai1_bytes.len(), 209 + 33 * 4 + 66 * 3 + policy_bytes.len());
+        assert_eq!(Dai1Envelope::from_bytes(&dai1_bytes).unwrap(), dai1);
     }
 
     proptest! {

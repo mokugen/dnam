@@ -1,6 +1,6 @@
 //! 4-port (`4CM`, `WDW`, `Sidechain`) stereo processing loops for [`DnamEngine`].
 
-use super::DnamAudioIo;
+use super::{DnamAudioIo, micro_ramp_advance_clamped};
 use crate::engine::{DnamEngine, EngineBackend};
 use crate::math::{
     CERTIFIED_INPUT_ENVELOPE_MIN_F32, flush_recursive_state_f32, sanitize_input_sample,
@@ -10,9 +10,9 @@ use crate::types::FtzDazGuard;
 
 impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     /// Low-level 4-port (`[inst_l, inst_r, ret_l, ret_r] -> [main_l, main_r, send_or_wdw_3, send_4]`)
-    /// TORA stepping preserving strict `S_{ret->send} == 0` (`ref[dsp.router.ports]`).
+    /// `SONA` stepping preserving strict `S_{ret->send} == 0` (`ref[dsp.router.ports]`).
     #[inline(never)]
-    pub(crate) fn step_frame_4port_tora(
+    pub(crate) fn step_frame_4port_sona(
         &mut self,
         in_l: f32,
         in_r: f32,
@@ -51,7 +51,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             };
         }
 
-        let is_frozen = self.hot_core.stage4.freeze;
+        let is_frozen = self.hot_core.stage4_freeze();
         let live_scale = if !self.bypassed && self.freeze_mutes_dry && is_frozen {
             0.0
         } else {
@@ -76,23 +76,18 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         if self.ctrl_sub_counter >= k_ctrl {
             self.step_control_tick_3khz();
         }
-        if self.control_bus.unified_w_ctrl {
-            crate::control::ControlBus::<B>::step_micro_ramp_16(
-                &mut self.current_stage_params,
-                &self.stage_ramp_deltas,
-            );
-        } else {
-            crate::control::ControlBus::<B>::step_micro_ramp_12(
-                &mut self.current_stage_params,
-                &self.stage_ramp_deltas,
-            );
-        }
+        micro_ramp_advance_clamped(
+            &mut self.current_stage_params,
+            &self.stage_ramp_deltas,
+            &self.control_bus.stage_targets,
+            1.0,
+        );
         self.hot_core
-            .apply_control_bus_stage_targets(&self.current_stage_params);
+            .apply_control_bus_with_z_stage(&self.current_stage_params, &self.control_bus.z_stage);
 
-        let prev_mono = self.hot_core.mono_out;
+        let prev_mono = self.hot_core.mono_out();
         if mono_only {
-            self.hot_core.mono_out = true;
+            self.hot_core.set_mono_out(true);
         }
         let ([mut wet_l, mut wet_r], [core_l, core_r], [send_l, send_r]) =
             self.hot_core.step_4port_frame(
@@ -103,9 +98,13 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                 eff_ret_r,
                 has_return,
             );
-        self.hot_core.mono_out = prev_mono;
+        self.hot_core.set_mono_out(prev_mono);
 
-        if !mono_only && !self.hot_core.mono_out && (self.stereo_width - 1.0).abs() > 1e-6 {
+        if !mono_only
+            && !self.hot_core.mono_out()
+            && !self.stage0_router.wdw_mode
+            && (self.stereo_width - 1.0).abs() > 1e-6
+        {
             let mid = 0.5 * (wet_l + wet_r);
             let side = 0.5 * (wet_l - wet_r);
             wet_l = mid + self.stereo_width * side;
@@ -127,7 +126,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         };
 
         if self.stage0_router.wdw_mode {
-            let dry_mix = self.hot_core.stage4.params.dry_mix;
+            let dry_mix = self.hot_core.stage4_dry_mix();
             let w_wet_l = wet_l - dry_mix * core_l;
             let w_wet_r = wet_r - dry_mix * core_r;
             let core_mid = 0.5 * (core_l + core_r);
@@ -152,8 +151,9 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             return [out_l, out_r, out_3, 0.0];
         }
 
+        let eff_dry_in = if mono_only { 0.5 * (in_l + in_r) } else { in_l };
         let out_l = sanitize_output_sample(
-            eff_dry_g * in_l + eff_wet_g * wet_l,
+            eff_dry_g * eff_dry_in + eff_wet_g * wet_l,
             &mut self.saturation_flags,
         );
         let out_r = if mono_only {
@@ -171,7 +171,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
     /// Internal 4x oversampled 4-port stepping using `self.oversampler` and `self.oversampler_aux`.
     #[inline(never)]
-    pub(crate) fn step_frame_4x_4port_tora(
+    pub(crate) fn step_frame_4x_4port_sona(
         &mut self,
         in_l: f32,
         in_r: f32,
@@ -209,9 +209,9 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             [[0.0_f32; 2]; 4]
         };
         let mut proc_main = [[0.0_f32; 2]; 4];
-        let mut last_aux = [0.0_f32; 2];
+        let mut proc_aux = [[0.0_f32; 2]; 4];
         for m in 0..4 {
-            let [ol, or, o3, o4] = self.step_frame_4port_tora(
+            let [ol, or, o3, o4] = self.step_frame_4port_sona(
                 up_main[m][0],
                 up_main[m][1],
                 up_aux[m][0],
@@ -220,14 +220,15 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                 mono_only,
             );
             proc_main[m] = [ol, or];
-            last_aux = [o3, o4];
+            proc_aux[m] = [o3, o4];
         }
         let [dl, dr] = self.oversampler.downsample_4x(proc_main);
+        let [d3, d4] = self.oversampler_aux.downsample_4x(proc_aux);
         [
             sanitize_output_sample(dl, &mut self.saturation_flags),
             sanitize_output_sample(dr, &mut self.saturation_flags),
-            last_aux[0],
-            last_aux[1],
+            sanitize_output_sample(d3, &mut self.saturation_flags),
+            sanitize_output_sample(d4, &mut self.saturation_flags),
         ]
     }
 
@@ -274,9 +275,9 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             let rl = in_3.map_or(0.0, |s| s[i]);
             let rr = in_4.map_or(rl, |s| s[i]);
             let [ol, or, o3, o4] = if self.offline_bounce {
-                self.step_frame_4x_4port_tora(il, ir, rl, rr, has_return, mono_only)
+                self.step_frame_4x_4port_sona(il, ir, rl, rr, has_return, mono_only)
             } else {
-                self.step_frame_4port_tora(il, ir, rl, rr, has_return, mono_only)
+                self.step_frame_4port_sona(il, ir, rl, rr, has_return, mono_only)
             };
             out_1[i] = ol;
             if let Some(ref mut s2) = out_2 {
@@ -375,8 +376,8 @@ mod tests {
     use crate::engine::DnamEngine;
     use crate::math::ScalarBackend;
     use crate::schema::DnamJsonHeader;
-    use crate::stages::V3MatryoshkaModel;
-    use crate::stages::weights::pack_v3_matryoshka_to_arena;
+    use crate::stages::SonaMatryoshkaModel;
+    use crate::stages::weights::pack_sona_matryoshka_to_arena;
     use crate::types::Tier;
     extern crate alloc;
     use alloc::vec;
@@ -385,7 +386,7 @@ mod tests {
     fn test_4cm_wdw_sidechain_and_bypass_routing() {
         let _ftz = crate::types::FtzDazGuard::new();
         let mut header = DnamJsonHeader::default_reference();
-        let mut mat = V3MatryoshkaModel::dual_rate_default(false);
+        let mut mat = SonaMatryoshkaModel::dual_rate_default(false);
         for t in 0..4 {
             mat.readouts[t].pre_cab_u_gain = [0.25, 0.25];
             mat.readouts[t].direct_s2_u_gain = [0.5, 0.5];
@@ -394,7 +395,7 @@ mod tests {
             mat.stage4[t].wet_mix = 0.25;
         }
         let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-        pack_v3_matryoshka_to_arena(&mat, &mut arena);
+        pack_sona_matryoshka_to_arena(&mat, &mut arena);
         let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
 
         for tier in [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra] {
@@ -405,7 +406,7 @@ mod tests {
                 48_000,
             )
             .unwrap();
-            let y = eng.step_frame_tora(0.25, -0.20, false);
+            let y = eng.step_frame_sona(0.25, -0.20, false);
             assert!(y[0].is_finite() && y[1].is_finite());
         }
 
@@ -414,14 +415,14 @@ mod tests {
             DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
         let mut eng_4cm_b =
             DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
-        let inst_l = [0.2f32; 16];
-        let inst_r = [-0.15f32; 16];
-        let ret_zero = [0.0f32; 16];
-        let ret_sig = [0.4f32; 16];
+        let inst_l = [0.2f32; 64];
+        let inst_r = [-0.15f32; 64];
+        let ret_zero = [0.0f32; 64];
+        let ret_sig = [0.4f32; 64];
         let (mut main_l_a, mut main_r_a, mut send_l_a, mut send_r_a) =
-            ([0.0f32; 16], [0.0f32; 16], [0.0f32; 16], [0.0f32; 16]);
+            ([0.0f32; 64], [0.0f32; 64], [0.0f32; 64], [0.0f32; 64]);
         let (mut main_l_b, mut main_r_b, mut send_l_b, mut send_r_b) =
-            ([0.0f32; 16], [0.0f32; 16], [0.0f32; 16], [0.0f32; 16]);
+            ([0.0f32; 64], [0.0f32; 64], [0.0f32; 64], [0.0f32; 64]);
         eng_4cm_a.process_block_4cm(
             &inst_l,
             &inst_r,
@@ -491,7 +492,59 @@ mod tests {
         eng_wdw.set_offline_bounce(false);
         eng_wdw.set_bypass(true, false);
         let [b_l, b_r, b_3, b_4] =
-            eng_wdw.step_frame_4port_tora(0.25, -0.25, 0.0, 0.0, false, false);
+            eng_wdw.step_frame_4port_sona(0.25, -0.25, 0.0, 0.0, false, false);
         assert_eq!([b_l, b_r, b_3, b_4], [0.25, -0.25, 0.0, 0.0]);
+
+        // Verify WDW stereo_width applies linear width scaling (no pre-widening double width)
+        let mut wdw_w1 =
+            DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
+        let mut wdw_w2 =
+            DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
+        wdw_w1.set_stereo_width(1.0);
+        wdw_w2.set_stereo_width(2.0);
+        let in_l_asym = [0.6_f32; 16];
+        let in_r_asym = [-0.2_f32; 16];
+        let (mut l1, mut r1, mut d1) = ([0.0_f32; 16], [0.0_f32; 16], [0.0_f32; 16]);
+        let (mut l2, mut r2, mut d2) = ([0.0_f32; 16], [0.0_f32; 16], [0.0_f32; 16]);
+        wdw_w1.process_block_wdw(&in_l_asym, &in_r_asym, &mut l1, &mut r1, &mut d1);
+        wdw_w2.process_block_wdw(&in_l_asym, &in_r_asym, &mut l2, &mut r2, &mut d2);
+        let max_side_1 = l1
+            .iter()
+            .zip(r1.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(max_side_1 > 1e-4, "expected stereo difference in WDW wet");
+        for i in 0..16 {
+            let mid1 = 0.5 * (l1[i] + r1[i]);
+            let mid2 = 0.5 * (l2[i] + r2[i]);
+            let side1 = 0.5 * (l1[i] - r1[i]);
+            let side2 = 0.5 * (l2[i] - r2[i]);
+            assert!((mid2 - mid1).abs() < 1e-5, "WDW mid contaminated at {i}");
+            assert!(
+                (side2 - 2.0 * side1).abs() < 1e-5,
+                "WDW side double-widened at {i}: got {side2}, expected {}",
+                2.0 * side1
+            );
+            assert!((d2[i] - d1[i]).abs() < 1e-6);
+        }
+
+        // Verify 4x 4-port downsamples out_3/out_4 through oversampler_aux cleanly (DirectDry tap -> 0.5)
+        let mut eng_4x =
+            DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
+        eng_4x.stage0_router.wdw_tap_mode = crate::stages::WdwDryTapMode::DirectDry;
+        eng_4x.set_offline_bounce(true);
+        let dc_in = [0.5_f32; 32];
+        let (mut wdw_l_4x, mut wdw_r_4x, mut wdw_dry_4x) =
+            ([0.0_f32; 32], [0.0_f32; 32], [0.0_f32; 32]);
+        eng_4x.process_block_wdw(
+            &dc_in,
+            &dc_in,
+            &mut wdw_l_4x,
+            &mut wdw_r_4x,
+            &mut wdw_dry_4x,
+        );
+        assert!(wdw_dry_4x.iter().all(|v| v.is_finite()));
+        assert!(wdw_dry_4x[0].abs() < wdw_dry_4x[31].abs());
+        assert!((wdw_dry_4x[31] - 0.5).abs() < 0.05);
     }
 }

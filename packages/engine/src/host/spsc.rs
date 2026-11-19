@@ -46,10 +46,13 @@ pub fn spsc_control_channel(engine: &DynamicDnamEngine<'_>) -> (ControlProducer,
             shadow,
             next_epoch_29: 1,
             causal_epoch: 0,
+            producer_epoch_base: 0,
+            latched_reset_sticky: false,
         },
         ControlConsumer {
             ring,
             drained_causal_epoch: 0,
+            last_consumed_gen: 0,
         },
     )
 }

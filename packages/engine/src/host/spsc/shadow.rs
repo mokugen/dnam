@@ -383,6 +383,7 @@ impl AcceptedStateShadow {
 
     pub(crate) fn reset_engine(&mut self) {
         self.tempo_state.reset();
+        self.is_frozen = false;
         let n = self.num_controls;
         for idx in 0..n {
             let raw_val = self.raw_values[idx];
@@ -444,8 +445,11 @@ mod tests {
     fn build_shadow_test_engine() -> DynamicDnamEngine<'static> {
         let mut header = DnamJsonHeader::default_reference();
         header.io_config.capabilities.supports_freeze = true;
-        let mut cond_max = BTreeMap::new();
-        cond_max.insert(String::from("mode=Mono"), 6.0);
+        let cond_bounds = vec![crate::container::wire::StructuredConditionalBound {
+            when: vec![(String::from("mode"), String::from("Mono"))],
+            min: None,
+            max: Some(6.0),
+        }];
         header.controls_schema = vec![
             ControlSchemaDef {
                 id: String::from("gain"),
@@ -457,8 +461,8 @@ mod tests {
                 declared_range: Some([0.0, 10.0]),
                 safe_clamped_range: Some([1.0, 9.0]),
                 default: serde_json::json!(5.0),
-                conditional_min: BTreeMap::new(),
-                conditional_max: cond_max,
+                conditional_bounds: cond_bounds,
+                represented_switch_options: None,
                 declared_options: None,
                 active_options: None,
                 clamp_warning: None,
@@ -476,8 +480,8 @@ mod tests {
                 declared_range: None,
                 safe_clamped_range: None,
                 default: serde_json::json!("Stereo"),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
                 declared_options: Some(vec![
                     String::from("Mono"),
                     String::from("Stereo"),
@@ -488,7 +492,7 @@ mod tests {
                 calibration: Some(ControlCalibration {
                     role: ControlCalibrationRole::StereoMode,
                     lobatto_physical_anchors: None,
-                    conditional_physical_anchors: BTreeMap::new(),
+                    conditional_physical_anchors: Vec::new(),
                     tempo_sync_default_subdivision: None,
                 }),
                 ui_hints: ControlUiHints::default(),
@@ -504,15 +508,15 @@ mod tests {
                 declared_range: None,
                 safe_clamped_range: None,
                 default: serde_json::json!("Off"),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
                 declared_options: Some(vec![String::from("Off"), String::from("On")]),
                 active_options: None,
                 clamp_warning: None,
                 calibration: Some(ControlCalibration {
                     role: ControlCalibrationRole::FreezeLatch,
                     lobatto_physical_anchors: None,
-                    conditional_physical_anchors: BTreeMap::new(),
+                    conditional_physical_anchors: Vec::new(),
                     tempo_sync_default_subdivision: None,
                 }),
                 ui_hints: ControlUiHints::default(),

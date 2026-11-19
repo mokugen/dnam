@@ -12,7 +12,7 @@ pub mod lifecycle;
 pub mod process;
 
 use alloc::sync::Arc;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Mutex, MutexGuard};
 
 use crate::host::spsc::{ControlConsumer, ControlProducer};
 use crate::host::swap::{EngineSwapAudioHandle, EngineSwapController};
@@ -29,11 +29,15 @@ pub(crate) struct HostMutex<T> {
 }
 
 impl<T> HostMutex<T> {
+    /// Wraps `value` and pre-warms `std::sync::Mutex` so macOS `pthread`/`OnceBox`
+    /// initialization occurs during cold construction, never on the first audio callback.
     #[inline]
     pub(crate) fn new(value: T) -> Self {
-        Self {
-            inner: Mutex::new(value),
+        let inner = Mutex::new(value);
+        if let Ok(guard) = inner.lock() {
+            drop(guard);
         }
+        Self { inner }
     }
 
     #[inline]
@@ -43,12 +47,13 @@ impl<T> HostMutex<T> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
         match self.inner.try_lock() {
             Ok(guard) => Some(guard),
-            Err(TryLockError::Poisoned(p)) => Some(p.into_inner()),
-            Err(TryLockError::WouldBlock) => None,
+            Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => None,
         }
     }
 }

@@ -3,6 +3,8 @@
 //! Serves both as the universal fallback on any CPU architecture and as the deterministic
 //! reference oracle in cross-backend parity tests (`tests/backend_parity.rs`).
 
+use dnam_kernels::InterleavedStereo8;
+
 use super::{BackendKind, MathBackend, SimdVec4};
 use crate::math::crc32c::{Crc32cBackend, crc32c_software_slice};
 
@@ -151,6 +153,151 @@ impl SimdVec4 for ScalarVec4 {
             ),
         ])
     }
+
+    #[inline(always)]
+    fn exp2_clamped5(self) -> Self {
+        <Self as dnam_kernels::KernelVec4>::exp2_clamped5(self)
+    }
+
+    #[inline(always)]
+    fn scrub_recursive_state(self) -> Self {
+        <Self as dnam_kernels::KernelVec4>::flush_recursive_state(self)
+    }
+}
+
+impl dnam_kernels::KernelVec4 for ScalarVec4 {
+    #[inline(always)]
+    fn splat(val: f32) -> Self {
+        <Self as SimdVec4>::splat(val)
+    }
+
+    #[inline(always)]
+    fn splat_pair(a: f32, b: f32) -> Self {
+        <Self as SimdVec4>::splat_pair(a, b)
+    }
+
+    #[inline(always)]
+    fn from_array(arr: [f32; 4]) -> Self {
+        <Self as SimdVec4>::from_array(arr)
+    }
+
+    #[inline(always)]
+    fn to_array(self) -> [f32; 4] {
+        <Self as SimdVec4>::to_array(self)
+    }
+
+    #[inline(always)]
+    fn load(src: &[f32; 4]) -> Self {
+        <Self as SimdVec4>::load(src)
+    }
+
+    #[inline(always)]
+    fn store(self, dst: &mut [f32; 4]) {
+        <Self as SimdVec4>::store(self, dst);
+    }
+
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::add(self, rhs)
+    }
+
+    #[inline(always)]
+    fn sub(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::sub(self, rhs)
+    }
+
+    #[inline(always)]
+    fn mul(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::mul(self, rhs)
+    }
+
+    #[inline(always)]
+    fn fma(self, a: Self, b: Self) -> Self {
+        <Self as SimdVec4>::fma(self, a, b)
+    }
+
+    #[inline(always)]
+    fn fms(self, a: Self, b: Self) -> Self {
+        <Self as SimdVec4>::fms(self, a, b)
+    }
+
+    #[inline(always)]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        <Self as SimdVec4>::fma_lane::<LANE>(self, a, v)
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        <Self as SimdVec4>::mul_lane::<LANE>(self, v)
+    }
+
+    #[inline(always)]
+    fn max(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::max(self, rhs)
+    }
+
+    #[inline(always)]
+    fn min(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::min(self, rhs)
+    }
+
+    #[inline(always)]
+    fn abs(self) -> Self {
+        <Self as SimdVec4>::abs(self)
+    }
+
+    #[inline(always)]
+    fn all_le(self, rhs: Self) -> bool {
+        self.0[0] <= rhs.0[0]
+            && self.0[1] <= rhs.0[1]
+            && self.0[2] <= rhs.0[2]
+            && self.0[3] <= rhs.0[3]
+    }
+
+    #[inline(always)]
+    fn pair_swap_neg(self) -> Self {
+        <Self as SimdVec4>::pair_swap_neg(self)
+    }
+
+    #[inline(always)]
+    fn flush_subnormal(self) -> Self {
+        <Self as SimdVec4>::flush_subnormal(self)
+    }
+
+    #[inline(always)]
+    fn flush_recursive_state(self) -> Self {
+        Self(self.0.map(dnam_kernels::scrub_and_flush_f32_bits))
+    }
+
+    #[inline(always)]
+    fn horizontal_sum(self) -> f32 {
+        <Self as SimdVec4>::horizontal_sum(self)
+    }
+
+    #[inline(always)]
+    fn horizontal_sum_pair(self, rhs: Self) -> (f32, f32) {
+        <Self as SimdVec4>::horizontal_sum_pair(self, rhs)
+    }
+
+    #[inline(always)]
+    fn dot(self, rhs: Self) -> f32 {
+        <Self as SimdVec4>::dot(self, rhs)
+    }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        <Self as SimdVec4>::rcp_pos_seed_bits(self)
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        <Self as SimdVec4>::rsqrt_pos_seed_bits(self)
+    }
+
+    #[inline(always)]
+    fn pow2_from_biased_int_bits(self) -> Self {
+        <Self as SimdVec4>::pow2_from_biased_int_bits(self)
+    }
 }
 
 /// Portable scalar reference backend implementing [`MathBackend`].
@@ -166,6 +313,7 @@ impl Crc32cBackend for ScalarBackend {
 
 impl MathBackend for ScalarBackend {
     type Vec4 = ScalarVec4;
+    type Stereo8 = InterleavedStereo8<ScalarVec4>;
     const NAME: &'static str = "Scalar (16B Aligned Reference)";
     const KIND: BackendKind = BackendKind::Scalar;
 }

@@ -371,13 +371,13 @@ mod tests {
         use crate::engine::DnamEngine;
         use crate::math::ScalarBackend;
         use crate::operators::SymplecticModal4Lane;
-        use crate::stages::TankDcBlocker;
+        use dnam_kernels::T1DcBlockerKernel;
 
         let original = read_fp_control();
         let _restore = RestoreFpControl(original);
         let mut engine = DnamEngine::<ScalarBackend>::new_empty(Tier::Lite);
         let mut modal = std::hint::black_box(SymplecticModal4Lane::new());
-        let mut dc = std::hint::black_box(TankDcBlocker::new());
+        let mut dc = std::hint::black_box(T1DcBlockerKernel::new());
         #[cfg(target_arch = "aarch64")]
         let requested = (original & !(0x9f00 | (0b11 << 22) | (1 << 24))) | (0b01 << 22);
         #[cfg(target_arch = "x86_64")]
@@ -391,7 +391,7 @@ mod tests {
                 engine.ctrl_sub_counter = 0;
                 engine.ctrl_energy_accum = std::hint::black_box(1.0);
                 let half_ulp = std::hint::black_box(f32::from_bits(0x3380_0000));
-                let _ = engine.step_frame_tora(half_ulp, half_ulp, false);
+                let _ = engine.step_frame_sona(half_ulp, half_ulp, false);
                 assert_eq!(engine.ctrl_energy_accum.to_bits(), 1.0_f32.to_bits());
 
                 engine.control_bus.env_poles[0] = std::hint::black_box(0.5);
@@ -406,8 +406,6 @@ mod tests {
 
                 let tiny = std::hint::black_box(f32::from_bits(1));
                 assert_eq!(modal.step_lane(0, tiny).0.to_bits(), 0);
-                dc.y_prev = std::hint::black_box(f32::MIN_POSITIVE);
-                dc.r_dc = std::hint::black_box(0.5);
                 assert_eq!(dc.step(std::hint::black_box(0.0)).to_bits(), 0);
             }
             let active = read_fp_control();

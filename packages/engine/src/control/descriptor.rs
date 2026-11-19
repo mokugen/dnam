@@ -3,6 +3,138 @@
 
 use core::mem::{align_of, size_of};
 
+use zerocopy::byteorder::little_endian::{F32, U16, U32};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+
+/// Declarative little-endian wire layout for [`ConditionalClampRule`] (`8 B`).
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct ConditionalClampRuleWire {
+    /// Index of the conditioning `switch` control ($0 \dots P-1$).
+    pub switch_ctrl_idx: U16,
+    /// Active option index of the `switch` control ($0 \dots 15$).
+    pub switch_opt_idx: u8,
+    /// Rule operation: `0 = none`, `1 = max_ceil`, `2 = min_floor`, `3 = and_prefix`,
+    /// `5 = and_max_keep`, `6 = and_min_end`.
+    pub rule_op: u8,
+    /// Conditional physical bound value.
+    pub bound_val: F32,
+}
+
+const _: () = assert!(size_of::<ConditionalClampRuleWire>() == 8);
+const _: () = assert!(align_of::<ConditionalClampRuleWire>() == 1);
+
+impl ConditionalClampRuleWire {
+    /// Converts from native-endian [`ConditionalClampRule`].
+    #[inline]
+    pub fn from_rule(rule: &ConditionalClampRule) -> Self {
+        Self {
+            switch_ctrl_idx: U16::new(rule.switch_ctrl_idx),
+            switch_opt_idx: rule.switch_opt_idx,
+            rule_op: rule.rule_op,
+            bound_val: F32::new(rule.bound_val),
+        }
+    }
+
+    /// Converts into native-endian [`ConditionalClampRule`].
+    #[inline]
+    pub fn to_rule(self) -> ConditionalClampRule {
+        ConditionalClampRule {
+            switch_ctrl_idx: self.switch_ctrl_idx.get(),
+            switch_opt_idx: self.switch_opt_idx,
+            rule_op: self.rule_op,
+            bound_val: self.bound_val.get(),
+        }
+    }
+}
+
+/// Declarative little-endian wire layout for [`ControlClampDescriptor`] (`64 B`, `<2BH8fI3(H2Bf)`).
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct ControlClampDescriptorWire {
+    /// Control kind: `0 = range`, `1 = switch`, `0xFF = unused slot`.
+    pub ctrl_kind: u8,
+    /// Lobatto polynomial degree (`range`) or `num_declared_options - 1` (`switch`).
+    pub lobatto_degree: u8,
+    /// Bitmask of observed/active switch options.
+    pub active_options_mask: U16,
+    /// Default physical value (`range`) or default option index (`switch`).
+    pub default_val: F32,
+    /// Base safe minimum physical value.
+    pub safe_min_base: F32,
+    /// Base safe maximum physical value.
+    pub safe_max_base: F32,
+    /// Pre-inverted normalization scale.
+    pub scale_norm: F32,
+    /// Normalization offset.
+    pub offset_norm: F32,
+    /// Normalized Newton/Lobatto anchor nodes.
+    pub anchor_nodes_norm: [F32; 3],
+    /// Reserved 32-bit alignment gap (`0`).
+    pub _reserved: U32,
+    /// Up to 3 switch-coupled conditional clamp rules.
+    pub cond_rules: [ConditionalClampRuleWire; 3],
+}
+
+const _: () = assert!(size_of::<ControlClampDescriptorWire>() == 64);
+const _: () = assert!(align_of::<ControlClampDescriptorWire>() == 1);
+
+impl ControlClampDescriptorWire {
+    /// Encodes a native [`ControlClampDescriptor`] into little-endian wire layout.
+    pub fn from_descriptor(desc: &ControlClampDescriptor) -> Self {
+        Self {
+            ctrl_kind: desc.ctrl_kind,
+            lobatto_degree: desc.lobatto_degree,
+            active_options_mask: U16::new(desc.active_options_mask),
+            default_val: F32::new(desc.default_val),
+            safe_min_base: F32::new(desc.safe_min_base),
+            safe_max_base: F32::new(desc.safe_max_base),
+            scale_norm: F32::new(desc.scale_norm),
+            offset_norm: F32::new(desc.offset_norm),
+            anchor_nodes_norm: [
+                F32::new(desc.anchor_nodes_norm[0]),
+                F32::new(desc.anchor_nodes_norm[1]),
+                F32::new(desc.anchor_nodes_norm[2]),
+            ],
+            _reserved: U32::new(desc._reserved),
+            cond_rules: [
+                ConditionalClampRuleWire::from_rule(&desc.cond_rules[0]),
+                ConditionalClampRuleWire::from_rule(&desc.cond_rules[1]),
+                ConditionalClampRuleWire::from_rule(&desc.cond_rules[2]),
+            ],
+        }
+    }
+
+    /// Decodes into a cache-aligned native [`ControlClampDescriptor`].
+    pub fn to_descriptor(&self) -> ControlClampDescriptor {
+        ControlClampDescriptor {
+            ctrl_kind: self.ctrl_kind,
+            lobatto_degree: self.lobatto_degree,
+            active_options_mask: self.active_options_mask.get(),
+            default_val: self.default_val.get(),
+            safe_min_base: self.safe_min_base.get(),
+            safe_max_base: self.safe_max_base.get(),
+            scale_norm: self.scale_norm.get(),
+            offset_norm: self.offset_norm.get(),
+            anchor_nodes_norm: [
+                self.anchor_nodes_norm[0].get(),
+                self.anchor_nodes_norm[1].get(),
+                self.anchor_nodes_norm[2].get(),
+            ],
+            _reserved: self._reserved.get(),
+            cond_rules: [
+                self.cond_rules[0].to_rule(),
+                self.cond_rules[1].to_rule(),
+                self.cond_rules[2].to_rule(),
+            ],
+        }
+    }
+}
+
 /// Binary switch-conditioned clamp rule (`8 B`, `#[repr(C)]`) inside [`ControlClampDescriptor`].
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -11,7 +143,8 @@ pub struct ConditionalClampRule {
     pub switch_ctrl_idx: u16,
     /// Active option index of the `switch` control ($0 \dots 15$) that triggers this rule.
     pub switch_opt_idx: u8,
-    /// Rule operation: `0 = none`, `1 = max_ceil` ($x \le \text{bound}$), `2 = min_floor` ($x \ge \text{bound}$).
+    /// Rule operation: `0 = none`, `1 = max_ceil` ($x \le \text{bound}$), `2 = min_floor` ($x \ge \text{bound}$),
+    /// `3 = and_prefix`, `5 = and_max_keep`, `6 = and_min_end`.
     pub rule_op: u8,
     /// Conditional physical bound value (`[CLAMP-STABILITY]` or `[CLAMP-DYNAMIC]`).
     pub bound_val: f32,
@@ -87,76 +220,17 @@ impl ControlClampDescriptor {
 
     /// Serializes this 64-byte descriptor into little-endian bytes (`<2BH8fI3(H2Bf)`).
     pub fn to_bytes(&self) -> [u8; 64] {
+        let wire = ControlClampDescriptorWire::from_descriptor(self);
         let mut out = [0u8; 64];
-        out[0] = self.ctrl_kind;
-        out[1] = self.lobatto_degree;
-        out[2..4].copy_from_slice(&self.active_options_mask.to_le_bytes());
-        out[4..8].copy_from_slice(&self.default_val.to_le_bytes());
-        out[8..12].copy_from_slice(&self.safe_min_base.to_le_bytes());
-        out[12..16].copy_from_slice(&self.safe_max_base.to_le_bytes());
-        out[16..20].copy_from_slice(&self.scale_norm.to_le_bytes());
-        out[20..24].copy_from_slice(&self.offset_norm.to_le_bytes());
-        for i in 0..3 {
-            let base = 24 + i * 4;
-            out[base..base + 4].copy_from_slice(&self.anchor_nodes_norm[i].to_le_bytes());
-        }
-        out[36..40].copy_from_slice(&self._reserved.to_le_bytes());
-        for r in 0..3 {
-            let base = 40 + r * 8;
-            let rule = &self.cond_rules[r];
-            out[base..base + 2].copy_from_slice(&rule.switch_ctrl_idx.to_le_bytes());
-            out[base + 2] = rule.switch_opt_idx;
-            out[base + 3] = rule.rule_op;
-            out[base + 4..base + 8].copy_from_slice(&rule.bound_val.to_le_bytes());
-        }
+        out.copy_from_slice(wire.as_bytes());
         out
     }
 
     /// Parses a 64-byte [`ControlClampDescriptor`] from little-endian bytes.
     pub fn from_bytes(bytes: &[u8; 64]) -> Self {
-        let ctrl_kind = bytes[0];
-        let lobatto_degree = bytes[1];
-        let active_options_mask = u16::from_le_bytes([bytes[2], bytes[3]]);
-        let default_val = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        let safe_min_base = f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        let safe_max_base = f32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-        let scale_norm = f32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
-        let offset_norm = f32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
-        let mut anchor_nodes_norm = [0.0_f32; 3];
-        for i in 0..3 {
-            let b = 24 + i * 4;
-            anchor_nodes_norm[i] =
-                f32::from_le_bytes([bytes[b], bytes[b + 1], bytes[b + 2], bytes[b + 3]]);
-        }
-        let _reserved = u32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]);
-        let mut cond_rules = [ConditionalClampRule::empty(); 3];
-        for r in 0..3 {
-            let b = 40 + r * 8;
-            cond_rules[r] = ConditionalClampRule {
-                switch_ctrl_idx: u16::from_le_bytes([bytes[b], bytes[b + 1]]),
-                switch_opt_idx: bytes[b + 2],
-                rule_op: bytes[b + 3],
-                bound_val: f32::from_le_bytes([
-                    bytes[b + 4],
-                    bytes[b + 5],
-                    bytes[b + 6],
-                    bytes[b + 7],
-                ]),
-            };
-        }
-        Self {
-            ctrl_kind,
-            lobatto_degree,
-            active_options_mask,
-            default_val,
-            safe_min_base,
-            safe_max_base,
-            scale_norm,
-            offset_norm,
-            anchor_nodes_norm,
-            _reserved,
-            cond_rules,
-        }
+        ControlClampDescriptorWire::ref_from_bytes(bytes.as_slice())
+            .expect("64-byte slice matches ControlClampDescriptorWire")
+            .to_descriptor()
     }
 
     /// Evaluates division-free clamping (`[CLAMP-RANGE]`, `[CLAMP-SWITCH]`, `[CLAMP-STABILITY]`,
@@ -170,12 +244,18 @@ impl ControlClampDescriptor {
         active_switch_options: &[u8],
     ) -> (f32, f32, bool) {
         if self.ctrl_kind == 1 {
-            let req_opt = (raw_physical_val.max(0.0) + 0.5) as u8;
-            let bit = 1_u16.checked_shl(req_opt as u32).unwrap_or(0);
-            if (self.active_options_mask & bit) != 0 {
-                return (req_opt as f32, req_opt as f32, false);
+            if raw_physical_val.is_finite() {
+                let req_opt = (raw_physical_val.max(0.0) + 0.5) as u8;
+                let bit = 1_u16.checked_shl(req_opt as u32).unwrap_or(0);
+                if (self.active_options_mask & bit) != 0 {
+                    return (req_opt as f32, req_opt as f32, false);
+                }
             }
-            let def_opt = (self.default_val.max(0.0) + 0.5) as u8;
+            let def_opt = if self.default_val.is_finite() {
+                (self.default_val.max(0.0) + 0.5) as u8
+            } else {
+                0
+            };
             let def_bit = 1_u16.checked_shl(def_opt as u32).unwrap_or(0);
             let safe_opt = if (self.active_options_mask & def_bit) != 0 {
                 def_opt
@@ -187,18 +267,47 @@ impl ControlClampDescriptor {
 
         let mut eff_min = self.safe_min_base;
         let mut eff_max = self.safe_max_base;
+        let mut conj_active = true;
 
         for rule in &self.cond_rules {
-            if rule.rule_op != 0 {
-                let sw_idx = rule.switch_ctrl_idx as usize;
-                if let Some(&active_opt) = active_switch_options.get(sw_idx)
-                    && active_opt == rule.switch_opt_idx
-                {
-                    if rule.rule_op == 1 {
+            if rule.rule_op == 0 {
+                conj_active = true;
+                continue;
+            }
+            let sw_matches = active_switch_options
+                .get(rule.switch_ctrl_idx as usize)
+                .is_some_and(|&active_opt| active_opt == rule.switch_opt_idx);
+            match rule.rule_op {
+                1 => {
+                    if conj_active && sw_matches {
                         eff_max = eff_max.min(rule.bound_val);
-                    } else if rule.rule_op == 2 {
+                    }
+                    conj_active = true;
+                }
+                2 => {
+                    if conj_active && sw_matches {
                         eff_min = eff_min.max(rule.bound_val);
                     }
+                    conj_active = true;
+                }
+                3 => {
+                    conj_active = conj_active && sw_matches;
+                }
+                5 => {
+                    let hit = conj_active && sw_matches;
+                    if hit {
+                        eff_max = eff_max.min(rule.bound_val);
+                    }
+                    conj_active = hit;
+                }
+                6 => {
+                    if conj_active && sw_matches {
+                        eff_min = eff_min.max(rule.bound_val);
+                    }
+                    conj_active = true;
+                }
+                _ => {
+                    conj_active = true;
                 }
             }
         }
@@ -206,8 +315,18 @@ impl ControlClampDescriptor {
             eff_max = eff_min;
         }
 
-        let clamped = raw_physical_val.clamp(eff_min, eff_max);
-        let was_clamped = (clamped - raw_physical_val).abs() > 1e-6;
+        let (clamped, was_clamped) = if !raw_physical_val.is_finite() {
+            let safe_def = if self.default_val.is_finite() {
+                self.default_val
+            } else {
+                eff_min
+            };
+            (safe_def.clamp(eff_min, eff_max), true)
+        } else {
+            let c = raw_physical_val.clamp(eff_min, eff_max);
+            let w = (c - raw_physical_val).abs() > 1e-6;
+            (c, w)
+        };
         let u_norm = (clamped * self.scale_norm + self.offset_norm).clamp(-1.0, 1.0);
         (clamped, u_norm, was_clamped)
     }
@@ -259,8 +378,8 @@ impl ControlClampDescriptor {
                 clamped_values[p] = clamped;
                 normalized_values[p] = u_norm;
                 active_switch_options[p] = (clamped + 0.5) as u8;
-                if was_clamped && p < 16 {
-                    clamp_mask |= 1_u16 << p;
+                if was_clamped {
+                    clamp_mask |= 1_u16 << p.min(15);
                 }
             }
         }
@@ -270,8 +389,8 @@ impl ControlClampDescriptor {
                     descriptors[p].clamp_and_normalize(raw_values[p], active_switch_options);
                 clamped_values[p] = clamped;
                 normalized_values[p] = u_norm;
-                if was_clamped && p < 16 {
-                    clamp_mask |= 1_u16 << p;
+                if was_clamped {
+                    clamp_mask |= 1_u16 << p.min(15);
                 }
             }
         }
@@ -418,5 +537,134 @@ mod tests {
             let basis_def = desc.eval_lobatto_basis(u_def);
             prop_assert_eq!(basis_def, [0.0, 0.0, 0.0]);
         }
+    }
+
+    #[test]
+    fn test_nonfinite_guard_and_control_index_ge16_overflow_bit() {
+        let mut descs = [ControlClampDescriptor::empty(); 18];
+        for desc in &mut descs {
+            *desc = ControlClampDescriptor {
+                ctrl_kind: 0,
+                default_val: 5.0,
+                safe_min_base: 2.0,
+                safe_max_base: 8.0,
+                scale_norm: 0.2,
+                offset_norm: -1.0,
+                ..ControlClampDescriptor::empty()
+            };
+        }
+        descs[17].ctrl_kind = 1;
+        descs[17].active_options_mask = 0b0010;
+        descs[17].default_val = 1.0;
+
+        let sw = [0u8; 18];
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let (clamped, u_norm, was_clamped) = descs[0].clamp_and_normalize(bad, &sw);
+            assert!(was_clamped);
+            assert_eq!(clamped, 5.0);
+            assert!(u_norm.is_finite());
+
+            let (sw_val, sw_norm, sw_clamped) = descs[17].clamp_and_normalize(bad, &sw);
+            assert!(sw_clamped);
+            assert_eq!(sw_val, 1.0);
+            assert_eq!(sw_norm, 1.0);
+        }
+
+        let mut raw = [5.0_f32; 18];
+        raw[16] = 100.0; // outside [2.0, 8.0], must set overflow bit 1 << 15 (0x8000)
+        let mut clamped_all = [0.0_f32; 18];
+        let mut norm_all = [0.0_f32; 18];
+        let mut sw_all = [0u8; 18];
+        let mask = ControlClampDescriptor::clamp_and_normalize_all(
+            &descs,
+            18,
+            &raw,
+            &mut clamped_all,
+            &mut norm_all,
+            &mut sw_all,
+        );
+        assert_eq!(mask, 1_u16 << 15);
+        assert_eq!(clamped_all[16], 8.0);
+        assert_eq!(clamped_all[17], 1.0);
+    }
+
+    #[test]
+    fn test_multi_switch_conjunction_rule_ops_3_5_6_and_3way_max() {
+        // 2-switch conjunction (sw1 == 1 && sw2 == 2) with both max (7.0) and min (3.0)
+        let desc_2way = ControlClampDescriptor {
+            ctrl_kind: 0,
+            lobatto_degree: 1,
+            active_options_mask: 1,
+            default_val: 5.0,
+            safe_min_base: 0.0,
+            safe_max_base: 10.0,
+            scale_norm: 0.2,
+            offset_norm: -1.0,
+            anchor_nodes_norm: [0.0, -1.0, 1.0],
+            _reserved: 0,
+            cond_rules: [
+                ConditionalClampRule {
+                    switch_ctrl_idx: 1,
+                    switch_opt_idx: 1,
+                    rule_op: 3,
+                    bound_val: 0.0,
+                },
+                ConditionalClampRule {
+                    switch_ctrl_idx: 2,
+                    switch_opt_idx: 2,
+                    rule_op: 5,
+                    bound_val: 7.0,
+                },
+                ConditionalClampRule {
+                    switch_ctrl_idx: 2,
+                    switch_opt_idx: 2,
+                    rule_op: 6,
+                    bound_val: 3.0,
+                },
+            ],
+        };
+        assert_eq!(desc_2way.clamp_and_normalize(9.0, &[0, 0, 2]).0, 9.0);
+        assert_eq!(desc_2way.clamp_and_normalize(1.0, &[0, 0, 2]).0, 1.0);
+        assert_eq!(desc_2way.clamp_and_normalize(9.0, &[0, 1, 0]).0, 9.0);
+        assert_eq!(desc_2way.clamp_and_normalize(1.0, &[0, 1, 0]).0, 1.0);
+        assert_eq!(desc_2way.clamp_and_normalize(9.0, &[0, 1, 2]).0, 7.0);
+        assert_eq!(desc_2way.clamp_and_normalize(1.0, &[0, 1, 2]).0, 3.0);
+
+        // 3-switch conjunction (sw1 == 1 && sw2 == 1 && sw3 == 2) with max (4.0)
+        let desc_3way = ControlClampDescriptor {
+            ctrl_kind: 0,
+            lobatto_degree: 1,
+            active_options_mask: 1,
+            default_val: 5.0,
+            safe_min_base: 0.0,
+            safe_max_base: 10.0,
+            scale_norm: 0.2,
+            offset_norm: -1.0,
+            anchor_nodes_norm: [0.0, -1.0, 1.0],
+            _reserved: 0,
+            cond_rules: [
+                ConditionalClampRule {
+                    switch_ctrl_idx: 1,
+                    switch_opt_idx: 1,
+                    rule_op: 3,
+                    bound_val: 0.0,
+                },
+                ConditionalClampRule {
+                    switch_ctrl_idx: 2,
+                    switch_opt_idx: 1,
+                    rule_op: 3,
+                    bound_val: 0.0,
+                },
+                ConditionalClampRule {
+                    switch_ctrl_idx: 3,
+                    switch_opt_idx: 2,
+                    rule_op: 1,
+                    bound_val: 4.0,
+                },
+            ],
+        };
+        assert_eq!(desc_3way.clamp_and_normalize(8.0, &[0, 1, 0, 2]).0, 8.0);
+        assert_eq!(desc_3way.clamp_and_normalize(8.0, &[0, 1, 1, 0]).0, 8.0);
+        assert_eq!(desc_3way.clamp_and_normalize(8.0, &[0, 1, 1, 2]).0, 4.0);
     }
 }

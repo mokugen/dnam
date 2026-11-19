@@ -7,134 +7,92 @@
 use std::collections::BTreeMap;
 use std::hint::black_box;
 
-use dnam_engine::container::{
-    ARENA_OFFSET_FULL_END, ARENA_OFFSET_LITE_END, ARENA_OFFSET_PRO_END, ARENA_OFFSET_ULTRA_END,
-    build_dnam_container,
-};
+use dnam_engine::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
 use dnam_engine::engine::EngineBackend;
 use dnam_engine::math::{DefaultMathBackend, ScalarBackend};
 use dnam_engine::memory::{AlignedBuffer, CacheLine64};
-use dnam_engine::schema::{
-    ControlBusConfig, ControlKind, ControlSchemaDef, ControlUiHints, DatasetProvenance,
-    DnamJsonHeader, IoConfig, ModelMetadata, RouterConfig, SlimmableTiersConfig, Stage1PreFxConfig,
-    Stage2CascadeConfig, Stage3CabinetKautzConfig, Stage4SpatialTankConfig, TierProfile,
-};
+use dnam_engine::schema::{ControlKind, ControlSchemaDef, ControlUiHints, DnamJsonHeader};
+use dnam_engine::stages::sona_core::{SonaControlBusParams, SonaMatryoshkaModel};
+use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::{DnamEngine, Tier};
 use hotpath::criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
     measurement::WallTime,
 };
+use zerocopy::{FromBytes, byteorder::little_endian::F32};
+
+fn populate_active_ctrl(ctrl: &mut SonaControlBusParams) {
+    ctrl.w_svf_g_oct[0] = 0.35;
+    ctrl.w_svf_k_delta[0] = 0.12;
+    ctrl.w_tank_psi[0] = 0.20;
+    ctrl.w_adaa_drive_scale[0][0] = 0.25;
+    ctrl.cp1_dir_count = 1;
+    ctrl.cp1_dir_flags = 0;
+    ctrl.cp1_dir_entries[0] = [0, 2, 0xFF];
+    if let Ok(base_words) = <[F32]>::mut_from_bytes(&mut ctrl.cp1_base) {
+        for l in 0..2_usize {
+            for d in 0..8 {
+                base_words[l * 8 + d] = F32::new(0.12 - 0.03 * (((l + d) % 4) as f32));
+            }
+            base_words[16 + l] = F32::new(0.25);
+        }
+        for d in 0..4 {
+            base_words[18 + d] = F32::new(0.20 + 0.02 * (d as f32));
+        }
+    }
+    if let Ok(ultra_words) = <[F32]>::mut_from_bytes(&mut ctrl.cp1_ultra) {
+        for l in 0..2_usize {
+            for d in 0..8 {
+                ultra_words[l * 8 + d] = F32::new(0.06);
+            }
+        }
+        for d in 0..4 {
+            ultra_words[16 + d] = F32::new(0.10);
+        }
+    }
+    for r in 0..4 {
+        for c in 0..8 {
+            ctrl.u_int_base[r][c] = 0.05;
+        }
+    }
+    for r in 0..16 {
+        for c in 0..16 {
+            ctrl.w_ctrl[r][c] = if c < 8 { 0.04 } else { 0.0 };
+        }
+    }
+}
 
 fn make_bench_container() -> AlignedBuffer<CacheLine64> {
-    let mut header = DnamJsonHeader {
-        version: "2.0.0".to_string(),
-        container_kind: "dnam".to_string(),
-        architecture: "DNAM_TORA".to_string(),
-        sample_rate_train_hz: 48_000,
-        metadata: ModelMetadata {
-            name: "Pipeline Benchmark Model".to_string(),
-            author: None,
-            description: None,
-            license: None,
-            created_at: "2026-10-23T00:00:00Z".to_string(),
-            input_reference_dbfs: -20.5,
-            provenance: DatasetProvenance::default(),
-            distribution_policy: None,
-            signatures: None,
-        },
+    let mut header = DnamJsonHeader::default_reference();
+    header.metadata.name = "Pipeline Benchmark Model".to_string();
+    header.controls_schema = vec![ControlSchemaDef {
+        id: "gain".to_string(),
+        name: "Gain".to_string(),
+        kind: ControlKind::Range,
+        unit: Some("%".to_string()),
+        lobatto_degree: Some(2),
+        anchor_nodes_norm: Some(vec![0.0, -1.0, 1.0]),
+        declared_range: Some([0.0, 1.0]),
+        safe_clamped_range: Some([0.0, 1.0]),
+        default: serde_json::json!(0.85),
+        conditional_bounds: Vec::new(),
+        represented_switch_options: None,
+        declared_options: None,
+        active_options: None,
+        clamp_warning: None,
+        ui_hints: ControlUiHints::default(),
+        calibration: None,
         user_metadata: BTreeMap::new(),
-        io_config: IoConfig::default(),
-        slimmable_tiers: SlimmableTiersConfig {
-            lite: TierProfile {
-                feature_bus_dim: 64,
-                channels: 4,
-                early_fir_taps: 16,
-                kautz_modes: 4,
-                tank_lines: 4,
-                head_svd_rank: 4,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -40.0,
-                arena_end_byte_offset: ARENA_OFFSET_LITE_END,
-                prefix_crc32c: 0,
-            },
-            full: TierProfile {
-                feature_bus_dim: 128,
-                channels: 8,
-                early_fir_taps: 32,
-                kautz_modes: 8,
-                tank_lines: 8,
-                head_svd_rank: 4,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -45.0,
-                arena_end_byte_offset: ARENA_OFFSET_FULL_END,
-                prefix_crc32c: 0,
-            },
-            pro: TierProfile {
-                feature_bus_dim: 192,
-                channels: 12,
-                early_fir_taps: 48,
-                kautz_modes: 16,
-                tank_lines: 8,
-                head_svd_rank: 4,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -48.0,
-                arena_end_byte_offset: ARENA_OFFSET_PRO_END,
-                prefix_crc32c: 0,
-            },
-            ultra: TierProfile {
-                feature_bus_dim: 256,
-                channels: 16,
-                early_fir_taps: 64,
-                kautz_modes: 32,
-                tank_lines: 16,
-                head_svd_rank: 8,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -51.0,
-                arena_end_byte_offset: ARENA_OFFSET_ULTRA_END,
-                prefix_crc32c: 0,
-            },
-        },
-        controls_schema: vec![ControlSchemaDef {
-            id: "gain".to_string(),
-            name: "Gain".to_string(),
-            kind: ControlKind::Range,
-            unit: Some("%".to_string()),
-            lobatto_degree: Some(2),
-            anchor_nodes_norm: Some(vec![0.0, -1.0, 1.0]),
-            declared_range: Some([0.0, 1.0]),
-            safe_clamped_range: Some([0.0, 1.0]),
-            default: serde_json::json!(0.5),
-            conditional_min: BTreeMap::new(),
-            conditional_max: BTreeMap::new(),
-            declared_options: None,
-            active_options: None,
-            clamp_warning: None,
-            ui_hints: ControlUiHints::default(),
-            calibration: None,
-            user_metadata: BTreeMap::new(),
-        }],
-        presets: Vec::new(),
-        control_bus: ControlBusConfig::default(),
-        stage0_router: RouterConfig::default(),
-        stage1_pre: Stage1PreFxConfig::default(),
-        stage2_cascade: Stage2CascadeConfig::default(),
-        stage3_cabinet: Stage3CabinetKautzConfig::default(),
-        stage4_tank: Stage4SpatialTankConfig::default(),
-        delay_histories: Vec::new(),
-        tensor_directory: BTreeMap::new(),
-    };
+    }];
 
     let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    let mut model = dnam_engine::stages::V3MatryoshkaModel::dual_rate_default(false);
+    let mut model = SonaMatryoshkaModel::dual_rate_default(false);
+    populate_active_ctrl(&mut model.ctrl);
     for s4 in &mut model.stage4 {
         s4.g_loop = 0.80;
         s4.wet_mix = 0.15;
     }
-    dnam_engine::stages::weights::pack_v3_matryoshka_to_arena(&model, &mut arena);
+    pack_sona_matryoshka_to_arena(&model, &mut arena);
     let raw = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
     let mut aligned = AlignedBuffer::<CacheLine64>::new_zeroed(raw.len() / 64);
     aligned.as_bytes_mut().copy_from_slice(&raw);
@@ -148,6 +106,7 @@ fn bench_tier_profile<B: EngineBackend>(
     profile_name: &str,
 ) {
     let mut engine = DnamEngine::<B>::from_bytes(container, tier, 48_000).unwrap();
+    engine.set_control_immediate(0, 0.85);
     let in_l = [0.15_f32; 128];
     let in_r = [-0.15_f32; 128];
     let mut out_l = [0.0_f32; 128];

@@ -2,8 +2,6 @@
 //! `ref[dsp.ctrl.accum.exact-int]`, `ref[dsp.op-n.ctrl.incremental-update]`,
 //! `ref[dsp.ctrl.accum.anova-fm]`, `ref[dsp.ctrl.accum.cp1-scaling]`).
 
-use alloc::vec;
-use alloc::vec::Vec;
 use core::cmp::Ordering;
 
 use crate::schema::{DnamError, SchemaOptionExt};
@@ -227,12 +225,13 @@ fn sparse_product_18word(
 }
 
 /// Exact-integer sufficient-statistic accumulator for one FM factor (`9-word S` + `18-word D`,
-/// `108 B` state + contributor history, `ref[dsp.ctrl.accum.exact-int]`,
-/// `ref[dsp.op-n.ctrl.incremental-update]`, `ref[dsp.ctrl.ledger.memory-compute]`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// fixed inline history of `MAX_EXACT_CONTRIBUTORS` with zero heap allocation or `Drop` glue,
+/// `ref[dsp.ctrl.accum.exact-int]`, `ref[dsp.op-n.ctrl.incremental-update]`,
+/// `ref[dsp.ctrl.ledger.memory-compute]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ExactIntFactorAccumulator {
     pub count: usize,
-    pub previous_bits: Vec<u32>,
+    pub previous_bits: [u32; MAX_EXACT_CONTRIBUTORS],
     pub sum: SignedExactInt<EXACT_SUM_WORDS>,
     pub twice_pairs: SignedExactInt<EXACT_SQUARE_WORDS>,
 }
@@ -242,7 +241,7 @@ impl ExactIntFactorAccumulator {
         assert!(count <= MAX_EXACT_CONTRIBUTORS);
         Self {
             count,
-            previous_bits: vec![0; count],
+            previous_bits: [0; MAX_EXACT_CONTRIBUTORS],
             sum: SignedExactInt::zero(),
             twice_pairs: SignedExactInt::zero(),
         }
@@ -251,7 +250,7 @@ impl ExactIntFactorAccumulator {
     /// Resets the accumulator in place without heap allocation.
     #[inline]
     pub fn reset(&mut self) {
-        self.previous_bits.fill(0);
+        self.previous_bits[..self.count].fill(0);
         self.sum = SignedExactInt::zero();
         self.twice_pairs = SignedExactInt::zero();
     }
@@ -432,5 +431,41 @@ mod tests {
         let mut ov_sq = SignedExactInt::<EXACT_SQUARE_WORDS>::zero();
         ov_sq.magnitude.words[EXACT_SQUARE_WORDS - 1] = 0x8000_0000;
         assert_eq!(ov_sq.to_interaction_f32_bits(), None);
+    }
+
+    #[test]
+    fn test_exact_int_extreme_cancellation_ties_and_state_restoration() {
+        // Extreme dyadic cancellation: 2^60 + 1.0 - 2^60 == 1.0, interaction == -2^120
+        let big = 2.0_f32.powi(60);
+        let mut acc = ExactIntFactorAccumulator::new(4);
+        acc.update_contributor(0, big.to_bits()).unwrap();
+        acc.update_contributor(1, 1.0_f32.to_bits()).unwrap();
+        acc.update_contributor(2, (-big).to_bits()).unwrap();
+        assert_eq!(f32::from_bits(acc.sum.to_rounded_f32_bits().unwrap()), 1.0);
+
+        // State restoration when a contributor update is later rejected
+        let snap_sum = acc.sum;
+        let snap_sq = acc.twice_pairs;
+        assert!(acc.update_contributor(1, f32::INFINITY.to_bits()).is_err());
+        assert_eq!(acc.sum, snap_sum);
+        assert_eq!(acc.twice_pairs, snap_sq);
+
+        // Subnormal half-way tie-to-even rounding via round-to-even on exact sum
+        let mut tie_acc = ExactIntFactorAccumulator::new(2);
+        let tiny_odd = f32::from_bits(1); // smallest positive subnormal (2^-149)
+        let small_even = f32::from_bits(2); // 2 * 2^-149
+        tie_acc.update_contributor(0, small_even.to_bits()).unwrap();
+        tie_acc.update_contributor(1, tiny_odd.to_bits()).unwrap();
+        assert_eq!(tie_acc.sum.to_rounded_f32_bits(), Some(3));
+
+        // 255-contributor maximum boundary succeeds
+        let mut max_acc = ExactIntFactorAccumulator::new(MAX_EXACT_CONTRIBUTORS);
+        max_acc.update_contributor(254, 1.0_f32.to_bits()).unwrap();
+        max_acc.update_contributor(0, 2.0_f32.to_bits()).unwrap();
+        assert_eq!(
+            f32::from_bits(max_acc.sum.to_rounded_f32_bits().unwrap()),
+            3.0
+        );
+        assert_eq!(f32::from_bits(max_acc.interaction_f32_bits().unwrap()), 2.0);
     }
 }

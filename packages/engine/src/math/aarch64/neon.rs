@@ -2,15 +2,22 @@
 
 use core::arch::aarch64::{
     __crc32cb, __crc32cd, float32x4_t, uint16x4_t, vabsq_f32, vaddq_f32, vaddq_u32, vaddvq_f32,
-    vandq_u32, vcombine_f32, vdup_n_f32, vdup_n_s32, vdupq_n_f32, vdupq_n_u32, vdupq_n_u64,
-    veorq_u32, vfmaq_f32, vfmaq_laneq_f32, vfmsq_f32, vget_high_f32, vget_lane_f32, vget_low_f32,
-    vgetq_lane_f32, vld1_u16, vmaxnmq_f32, vminnmq_f32, vminq_u32, vmul_f32, vmulq_f32,
-    vmulq_laneq_f32, vpadd_f32, vpaddq_f32, vreinterpret_f32_s32, vreinterpret_s32_u32,
-    vreinterpret_u32_f32, vreinterpretq_f32_f64, vreinterpretq_f32_u32, vreinterpretq_f64_f32,
-    vreinterpretq_u32_f32, vreinterpretq_u32_u64, vrev64q_f32, vset_lane_f32, vsetq_lane_f32,
-    vshlq_n_u32, vshr_n_u32, vshrq_n_u32, vsub_f32, vsub_s32, vsubq_f32, vsubq_u32, vtrn1q_f32,
-    vtrn1q_f64, vtrn2q_f32, vtrn2q_f64,
+    vandq_u32, vbicq_u32, vbslq_f32, vceqq_u32, vcleq_f32, vcombine_f32, vdup_n_f32, vdup_n_s32,
+    vdupq_n_f32, vdupq_n_u32, vdupq_n_u64, veorq_u32, vfmaq_f32, vfmaq_laneq_f32, vfmsq_f32,
+    vget_high_f32, vget_lane_f32, vget_low_f32, vgetq_lane_f32, vld1_u16, vmaxnmq_f32, vminnmq_f32,
+    vminq_u32, vminvq_u32, vmul_f32, vmulq_f32, vmulq_laneq_f32, vnegq_f32, vorrq_u32, vpadd_f32,
+    vpaddq_f32, vreinterpret_f32_s32, vreinterpret_s32_u32, vreinterpret_u32_f32,
+    vreinterpretq_f32_f64, vreinterpretq_f32_u32, vreinterpretq_f64_f32, vreinterpretq_u32_f32,
+    vreinterpretq_u32_u64, vrev64q_f32, vset_lane_f32, vsetq_lane_f32, vshlq_n_u32, vshr_n_u32,
+    vshrq_n_u32, vsub_f32, vsub_s32, vsubq_f32, vsubq_u32, vtrn1q_f32, vtrn1q_f64, vtrn2q_f32,
+    vtrn2q_f64,
 };
+use core::sync::atomic::{AtomicU8, Ordering};
+use dnam_kernels::InterleavedStereo8;
+
+mod sha2;
+#[cfg(target_feature = "sha2")]
+pub(crate) use sha2::aarch64_sha256_compress;
 
 use crate::math::crc32c::{Crc32cBackend, crc32c_software_slice};
 use crate::math::{BackendKind, MathBackend, SimdVec4};
@@ -283,6 +290,170 @@ impl SimdVec4 for NeonVec4 {
         yb = yb.mul(three_halves.fms(hdb, yb.mul(yb)));
         (ya, yb)
     }
+
+    #[inline(always)]
+    fn exp2_clamped5(self) -> Self {
+        <Self as dnam_kernels::KernelVec4>::exp2_clamped5(self)
+    }
+
+    #[inline(always)]
+    fn scrub_recursive_state(self) -> Self {
+        <Self as dnam_kernels::KernelVec4>::flush_recursive_state(self)
+    }
+}
+
+impl dnam_kernels::KernelVec4 for NeonVec4 {
+    #[inline(always)]
+    fn splat(val: f32) -> Self {
+        <Self as SimdVec4>::splat(val)
+    }
+
+    #[inline(always)]
+    fn splat_pair(a: f32, b: f32) -> Self {
+        <Self as SimdVec4>::splat_pair(a, b)
+    }
+
+    #[inline(always)]
+    fn from_array(arr: [f32; 4]) -> Self {
+        <Self as SimdVec4>::from_array(arr)
+    }
+
+    #[inline(always)]
+    fn to_array(self) -> [f32; 4] {
+        <Self as SimdVec4>::to_array(self)
+    }
+
+    #[inline(always)]
+    fn load(src: &[f32; 4]) -> Self {
+        <Self as SimdVec4>::load(src)
+    }
+
+    #[inline(always)]
+    fn store(self, dst: &mut [f32; 4]) {
+        <Self as SimdVec4>::store(self, dst);
+    }
+
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::add(self, rhs)
+    }
+
+    #[inline(always)]
+    fn sub(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::sub(self, rhs)
+    }
+
+    #[inline(always)]
+    fn mul(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::mul(self, rhs)
+    }
+
+    #[inline(always)]
+    fn fma(self, a: Self, b: Self) -> Self {
+        <Self as SimdVec4>::fma(self, a, b)
+    }
+
+    #[inline(always)]
+    fn fms(self, a: Self, b: Self) -> Self {
+        <Self as SimdVec4>::fms(self, a, b)
+    }
+
+    #[inline(always)]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        <Self as SimdVec4>::fma_lane::<LANE>(self, a, v)
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        <Self as SimdVec4>::mul_lane::<LANE>(self, v)
+    }
+
+    #[inline(always)]
+    fn max(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::max(self, rhs)
+    }
+
+    #[inline(always)]
+    fn min(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::min(self, rhs)
+    }
+
+    #[inline(always)]
+    fn abs(self) -> Self {
+        <Self as SimdVec4>::abs(self)
+    }
+
+    #[inline(always)]
+    fn neg(self) -> Self {
+        // SAFETY: `aarch64` guarantees baseline NEON availability.
+        unsafe { Self(vnegq_f32(self.0)) }
+    }
+
+    #[inline(always)]
+    fn select_le(lhs: Self, rhs: Self, if_true: Self, if_false: Self) -> Self {
+        // SAFETY: `aarch64` guarantees baseline NEON availability.
+        unsafe { Self(vbslq_f32(vcleq_f32(lhs.0, rhs.0), if_true.0, if_false.0)) }
+    }
+
+    #[inline(always)]
+    fn all_le(self, rhs: Self) -> bool {
+        // SAFETY: `aarch64` guarantees baseline NEON availability.
+        unsafe { vminvq_u32(vcleq_f32(self.0, rhs.0)) != 0 }
+    }
+
+    #[inline(always)]
+    fn pair_swap_neg(self) -> Self {
+        <Self as SimdVec4>::pair_swap_neg(self)
+    }
+
+    #[inline(always)]
+    fn flush_subnormal(self) -> Self {
+        <Self as SimdVec4>::flush_subnormal(self)
+    }
+
+    #[inline(always)]
+    fn flush_recursive_state(self) -> Self {
+        // SAFETY: `aarch64` guarantees baseline NEON availability.
+        unsafe {
+            let bits = vreinterpretq_u32_f32(self.0);
+            let exp_mask = vdupq_n_u32(0x7F80_0000);
+            let exp = vandq_u32(bits, exp_mask);
+            let is_nonfinite = vceqq_u32(exp, exp_mask);
+            let is_sub = vceqq_u32(exp, vdupq_n_u32(0));
+            let clear_mask = vorrq_u32(is_nonfinite, vandq_u32(is_sub, vdupq_n_u32(0x007F_FFFF)));
+            Self(vreinterpretq_f32_u32(vbicq_u32(bits, clear_mask)))
+        }
+    }
+
+    #[inline(always)]
+    fn horizontal_sum(self) -> f32 {
+        <Self as SimdVec4>::horizontal_sum(self)
+    }
+
+    #[inline(always)]
+    fn horizontal_sum_pair(self, rhs: Self) -> (f32, f32) {
+        <Self as SimdVec4>::horizontal_sum_pair(self, rhs)
+    }
+
+    #[inline(always)]
+    fn dot(self, rhs: Self) -> f32 {
+        <Self as SimdVec4>::dot(self, rhs)
+    }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        <Self as SimdVec4>::rcp_pos_seed_bits(self)
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        <Self as SimdVec4>::rsqrt_pos_seed_bits(self)
+    }
+
+    #[inline(always)]
+    fn pow2_from_biased_int_bits(self) -> Self {
+        <Self as SimdVec4>::pow2_from_biased_int_bits(self)
+    }
 }
 
 /// ARM64 NEON hardware math backend targeting Rockchip RK3582 (Cortex-A76/A55) and Apple Silicon.
@@ -303,32 +474,27 @@ pub(crate) fn arm_crc32c_hw(crc_init: u32, data: &[u8]) -> u32 {
     !crc
 }
 
-#[inline]
-pub(crate) fn aarch64_crc32c_update(crc_init: u32, data: &[u8]) -> u32 {
-    if is_crc32_supported() {
-        // SAFETY: Runtime feature check confirmed `FEAT_CRC32` support.
-        unsafe { arm_crc32c_hw(crc_init, data) }
-    } else {
-        crc32c_software_slice(crc_init, data)
-    }
+/// Cached `FEAT_CRC32` support state (`0 = uninitialized`, `1 = unsupported`, `2 = supported`).
+static CRC32_SUPPORT_CACHE: AtomicU8 = AtomicU8::new(0);
+
+/// Returns the cached `FEAT_CRC32` capability flag with a single relaxed atomic load and zero OS
+/// feature-detection calls in hot / real-time CRC paths (`reload_model_in_place`, etc.).
+#[inline(always)]
+pub(crate) fn is_crc32_supported_cached() -> bool {
+    CRC32_SUPPORT_CACHE.load(Ordering::Relaxed) == 2
 }
 
-#[inline]
-fn is_crc32_supported() -> bool {
+/// Queries `FEAT_CRC32` once off the hot path when [`CRC32_SUPPORT_CACHE`] is uninitialized.
+#[cold]
+fn detect_crc32_uncached() -> bool {
     #[cfg(any(test, feature = "std"))]
     {
         std::arch::is_aarch64_feature_detected!("crc")
     }
-    #[cfg(not(any(test, feature = "std")))]
+    #[cfg(all(target_os = "linux", not(any(test, feature = "std"))))]
     {
-        use core::sync::atomic::{AtomicU8, Ordering};
-        static CACHE: AtomicU8 = AtomicU8::new(0);
-        let c = CACHE.load(Ordering::Relaxed);
-        if c != 0 {
-            return c == 2;
-        }
         let isar0: u64;
-        // SAFETY: `ID_AA64ISAR0_EL1` is readable at EL1 (and trapped/emulated by Linux at EL0).
+        // SAFETY: `ID_AA64ISAR0_EL1` is trapped and emulated at EL0 by the Linux kernel.
         unsafe {
             core::arch::asm!(
                 "mrs {x}, id_aa64isar0_el1",
@@ -336,9 +502,34 @@ fn is_crc32_supported() -> bool {
                 options(nomem, nostack, preserves_flags),
             );
         }
-        let ok = ((isar0 >> 16) & 0xF) >= 1;
-        CACHE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
-        ok
+        ((isar0 >> 16) & 0xF) >= 1
+    }
+    #[cfg(all(not(target_os = "linux"), not(any(test, feature = "std"))))]
+    {
+        cfg!(target_feature = "crc")
+    }
+}
+
+/// Warms [`CRC32_SUPPORT_CACHE`] outside the real-time path and returns whether `FEAT_CRC32` is
+/// available on the host `aarch64` CPU.
+#[inline]
+pub(crate) fn warm_crc32_support_cache() -> bool {
+    let cached = CRC32_SUPPORT_CACHE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached == 2;
+    }
+    let ok = detect_crc32_uncached();
+    CRC32_SUPPORT_CACHE.store(if ok { 2 } else { 1 }, Ordering::Relaxed);
+    ok
+}
+
+#[inline]
+pub(crate) fn aarch64_crc32c_update(crc_init: u32, data: &[u8]) -> u32 {
+    if is_crc32_supported_cached() {
+        // SAFETY: Runtime feature check confirmed `FEAT_CRC32` support.
+        unsafe { arm_crc32c_hw(crc_init, data) }
+    } else {
+        crc32c_software_slice(crc_init, data)
     }
 }
 
@@ -371,6 +562,7 @@ impl Crc32cBackend for NeonBackend {
 
 impl MathBackend for NeonBackend {
     type Vec4 = NeonVec4;
+    type Stereo8 = InterleavedStereo8<NeonVec4>;
     const NAME: &'static str = "ARM64 NEON (128-bit float32x4_t)";
     const KIND: BackendKind = BackendKind::ArmNeon;
 
@@ -398,13 +590,18 @@ impl MathBackend for NeonBackend {
 
     #[inline(always)]
     fn vec4_to_fp16x4(src: Self::Vec4) -> [u16; 4] {
-        // SAFETY: `aarch64` guarantees baseline NEON `fcvtn` availability; clamp to `[-65504.0, 65504.0]`.
+        // SAFETY: `aarch64` guarantees baseline NEON `fcvtn`; clamp finite lanes to `[-65504.0, 65504.0]`
+        // while keeping `NaN`/`±Inf` uncorrupted via bitwise finite mask blend before conversion.
         unsafe {
-            let v = src.clamp(NeonVec4::splat(-65504.0), NeonVec4::splat(65504.0));
+            let raw_bits = vreinterpretq_u32_f32(src.0);
+            let exp_mask = vdupq_n_u32(0x7F80_0000);
+            let is_nonfinite = vceqq_u32(vandq_u32(raw_bits, exp_mask), exp_mask);
+            let clamped = src.clamp(NeonVec4::splat(-65504.0), NeonVec4::splat(65504.0));
+            let v = vbslq_f32(is_nonfinite, src.0, clamped.0);
             let raw_out: uint16x4_t;
             core::arch::asm!(
                 "fcvtn {d:v}.4h, {v:v}.4s",
-                v = in(vreg) v.0,
+                v = in(vreg) v,
                 d = lateout(vreg) raw_out,
                 options(pure, nomem, nostack, preserves_flags),
             );
@@ -478,84 +675,5 @@ impl MathBackend for NeonBackend {
             }
             (vget_lane_f32::<0>(est), vget_lane_f32::<1>(est))
         }
-    }
-}
-
-/// Hardware ARMv8 `FEAT_SHA2` (`SHA256H`, `SHA256H2`, `SHA256SU0`, `SHA256SU1`) block compressor
-/// for non-RT container digest verification (`provenance::sha256_digest`).
-#[cfg(target_feature = "sha2")]
-pub(crate) fn aarch64_sha256_compress(state: &mut [u32; 8], blocks: &[[u8; 64]], k32: &[u32; 64]) {
-    use core::arch::aarch64::{
-        vaddq_u32, vld1q_u8, vld1q_u32, vreinterpretq_u32_u8, vrev32q_u8, vsha256h2q_u32,
-        vsha256hq_u32, vsha256su0q_u32, vsha256su1q_u32, vst1q_u32,
-    };
-    // SAFETY: Guarded by `#[cfg(target_feature = "sha2")]`; all slice bounds (`8`, `64`, `64`) are fixed at compile time.
-    unsafe {
-        let mut abcd = vld1q_u32(state.as_ptr());
-        let mut efgh = vld1q_u32(state.as_ptr().add(4));
-
-        for block in blocks {
-            let abcd_orig = abcd;
-            let efgh_orig = efgh;
-
-            let mut s0 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr())));
-            let mut s1 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(16))));
-            let mut s2 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(32))));
-            let mut s3 = vreinterpretq_u32_u8(vrev32q_u8(vld1q_u8(block.as_ptr().add(48))));
-
-            let mut tmp = vaddq_u32(s0, vld1q_u32(k32.as_ptr()));
-            let mut abcd_prev = abcd;
-            abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
-            efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
-
-            tmp = vaddq_u32(s1, vld1q_u32(k32.as_ptr().add(4)));
-            abcd_prev = abcd;
-            abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
-            efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
-
-            tmp = vaddq_u32(s2, vld1q_u32(k32.as_ptr().add(8)));
-            abcd_prev = abcd;
-            abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
-            efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
-
-            tmp = vaddq_u32(s3, vld1q_u32(k32.as_ptr().add(12)));
-            abcd_prev = abcd;
-            abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
-            efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
-
-            let mut t = 16usize;
-            while t < 64 {
-                s0 = vsha256su1q_u32(vsha256su0q_u32(s0, s1), s2, s3);
-                tmp = vaddq_u32(s0, vld1q_u32(k32.as_ptr().add(t)));
-                abcd_prev = abcd;
-                abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
-                efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
-
-                s1 = vsha256su1q_u32(vsha256su0q_u32(s1, s2), s3, s0);
-                tmp = vaddq_u32(s1, vld1q_u32(k32.as_ptr().add(t + 4)));
-                abcd_prev = abcd;
-                abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
-                efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
-
-                s2 = vsha256su1q_u32(vsha256su0q_u32(s2, s3), s0, s1);
-                tmp = vaddq_u32(s2, vld1q_u32(k32.as_ptr().add(t + 8)));
-                abcd_prev = abcd;
-                abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
-                efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
-
-                s3 = vsha256su1q_u32(vsha256su0q_u32(s3, s0), s1, s2);
-                tmp = vaddq_u32(s3, vld1q_u32(k32.as_ptr().add(t + 12)));
-                abcd_prev = abcd;
-                abcd = vsha256hq_u32(abcd_prev, efgh, tmp);
-                efgh = vsha256h2q_u32(efgh, abcd_prev, tmp);
-                t += 16;
-            }
-
-            abcd = vaddq_u32(abcd, abcd_orig);
-            efgh = vaddq_u32(efgh, efgh_orig);
-        }
-
-        vst1q_u32(state.as_mut_ptr(), abcd);
-        vst1q_u32(state.as_mut_ptr().add(4), efgh);
     }
 }

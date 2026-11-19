@@ -2,12 +2,12 @@
 //! (`examples/container_slimming.rs`).
 //!
 //! Demonstrates:
-//! 1. Stripping an `Ultra` (`64,000 B` arena) `.dnam` container down to `Pro` (`36,224 B`),
-//!    `Full` (`22,336 B`), and `Lite` (`10,752 B`) via [`strip_container_to_tier`] without
+//! 1. Stripping an `Ultra` (`30,720 B` arena) `.dnam` container down to `Pro` (`15,872 B`),
+//!    `Full` (`7,936 B`), and `Lite` (`4,608 B`) via [`strip_container_to_tier`] without
 //!    modifying the immutable JSON header.
 //! 2. Editing mutable `presets` and `user_metadata` in place within the `DMU1` mutable suffix
 //!    trailer via [`update_header_in_place`].
-//! 3. Round-tripping the v2.0 `DMU1` mutable suffix trailer (`build_dmu1_mutable_frame` /
+//! 3. Round-tripping the `v3.0` `DMU1` mutable suffix trailer (`build_dmu1_mutable_frame` /
 //!    `parse_and_validate_dmu1_frame`, `ref[container.dnam.mutable-frame]`).
 //!
 //! Run with:
@@ -22,15 +22,16 @@ use dnam_engine::container::{
 };
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::{DnamJsonHeader, PresetDef};
+use dnam_engine::stages::sona_core::SonaMatryoshkaModel;
+use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 
 fn main() {
     let mut header = DnamJsonHeader::default_reference();
     let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    for (i, byte) in arena[128..62_000].iter_mut().enumerate() {
-        *byte = ((i * 13 + 7) & 0x3F) as u8;
-    }
+    let model = SonaMatryoshkaModel::dual_rate_default(false);
+    pack_sona_matryoshka_to_arena(&model, &mut arena);
 
-    // 1. Build an Ultra (64,000 B arena) .dnam container and strip to Pro, Full, and Lite
+    // 1. Build an Ultra (30,720 B arena) .dnam container and strip to Pro, Full, and Lite
     let ultra_container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
     let crypto = DefaultCryptoProvider::default();
 

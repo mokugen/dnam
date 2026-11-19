@@ -47,27 +47,15 @@ pub fn eval_chebyshev_4harm(x: f32) -> [f32; 4] {
 /// Outward-Checked Ellipsoidal Trust-Region Clipping (`ref[dsp.ctrl.op-n.trust-clip]`, `ref[dsp.op-n.ctrl.trust-clip]`, `0 FDIV`, `0 FSQRT`).
 ///
 /// Applies the 6-step `f64` Newton fast path with 32-step bisection fallback so that
-/// $\sum_i \text{widen}(z_i)^2 \le \rho_{\max}^2$ holds strictly after `RN32` rounding.
+/// $\sum_i \text{widen}(z_i)^2 \le \rho_{\max}^2$ holds strictly after `RN32` rounding, while
+/// preserving no-op behavior for `rho_max <= 1.0e-12`, non-finite `rho_max`, or non-finite inputs.
 #[inline(always)]
 pub fn trust_region_softclip_4d(z: &mut [f32; 4], rho_max: f32) {
-    if rho_max <= 1.0e-12 {
+    const MIN_TRUST_RADIUS: f32 = 1.0e-12;
+    if !rho_max.is_finite() || rho_max <= MIN_TRUST_RADIUS || z.iter().any(|v| !v.is_finite()) {
         return;
     }
-    let val_bits = [
-        z[0].to_bits(),
-        z[1].to_bits(),
-        z[2].to_bits(),
-        z[3].to_bits(),
-    ];
-    if let Some((clipped_bits, _, _)) = crate::math::trust_clip_outward_checked_bits(
-        &val_bits,
-        rho_max.to_bits(),
-        1.0e-12_f32.to_bits(),
-    ) {
-        for i in 0..4 {
-            z[i] = f32::from_bits(clipped_bits[i]);
-        }
-    }
+    crate::math::spec_math::trust_clip_outward_4d(z, rho_max);
 }
 
 /// Evaluates Theorem 1 (Exact LTI Basis Commutativity) by running a 1-pole filter bank $\mathcal{L}_k$
@@ -185,6 +173,17 @@ mod tests {
         for &v in &z_in {
             assert!((v - 0.1).abs() < 1e-3);
         }
+
+        // Preserve no-op behavior for tiny/non-positive/non-finite rho_max and NaN coordinates.
+        let mut z_hold = [2.0, -1.0, 0.5, 0.25];
+        for bad_rho in [0.0_f32, 1.0e-12, -1.0, f32::NAN, f32::INFINITY] {
+            let before = z_hold;
+            trust_region_softclip_4d(&mut z_hold, bad_rho);
+            assert_eq!(z_hold, before);
+        }
+        let mut z_nan = [f32::NAN, 3.0, 0.0, 0.0];
+        trust_region_softclip_4d(&mut z_nan, 2.0);
+        assert!(z_nan[0].is_nan() && z_nan[1].to_bits() == 3.0_f32.to_bits());
     }
 
     /// verify[dsp.op-n.commuted.theorem1]

@@ -11,6 +11,7 @@ use crate::math::{
     flush_recursive_state_vec4,
 };
 use crate::operators::op_t::catmull_rom_hermite_cubic;
+use alloc::boxed::Box;
 
 /// Memory footprint for Stage 0 State: strictly 1,536 B.
 pub const ROUTER_STATE_RAM_BYTES: usize = 1536;
@@ -59,12 +60,13 @@ impl BezoutCleanCrossover {
 
     /// Sets the training-rate crossover frequency in Hz (default `200.0`).
     pub fn set_crossover_hz(&mut self, freq_hz: f32) {
+        const INV_200: f64 = 1.0 / 200.0;
         let f = freq_hz.clamp(20.0, 2000.0);
         if (f - 200.0).abs() < 1e-4 {
             self.base_pole = Self::POLE_200HZ_48K;
         } else {
             self.base_pole =
-                (crate::schema::cold_pow_f64(Self::POLE_200HZ_48K as f64, (f as f64) / 200.0)
+                (crate::schema::cold_pow_f64(Self::POLE_200HZ_48K as f64, (f as f64) * INV_200)
                     as f32)
                     .clamp(0.5, 0.9995);
         }
@@ -173,9 +175,53 @@ impl ReturnAligner {
         self.write_ptr = (self.write_ptr + 1) & RETURN_ALIGN_MASK;
         catmull_rom_hermite_cubic(s_m1, s_0, s_1, s_2, mu)
     }
+
+    /// Advances the return aligner using precomputed cold Kaiser-sinc taps (`FullBand64Tap` /
+    /// `LowLatency16Tap`) when `kaiser_taps` is active and delay covers centering offset `G`, or
+    /// falls back cleanly to centered 4-tap Catmull-Rom (`MinLatency4Tap`).
+    #[inline(always)]
+    pub fn step_aligned(
+        &mut self,
+        x: f32,
+        mode: super::topology::ParallelAlignmentMode,
+        kaiser_taps: Option<&[f32; 64]>,
+    ) -> f32 {
+        let g = mode.centering_offset_host_samples();
+        let tap_count = match mode {
+            super::topology::ParallelAlignmentMode::FullBand64Tap => 64,
+            super::topology::ParallelAlignmentMode::LowLatency16Tap => 16,
+            super::topology::ParallelAlignmentMode::MinLatency4Tap => 0,
+        };
+        let d_clamped = self
+            .delay_samples
+            .clamp(0.0, (RETURN_ALIGN_CAPACITY - 4) as f32);
+        let d_int = d_clamped as usize;
+        if tap_count > 0
+            && d_int >= g
+            && let Some(taps) = kaiser_taps
+        {
+            let base_offset = d_int - g;
+            if base_offset + tap_count <= RETURN_ALIGN_CAPACITY {
+                self.ring[self.write_ptr] = x;
+                let mut acc0 = 0.0_f32;
+                let mut acc1 = 0.0_f32;
+                for k in (0..tap_count).step_by(2) {
+                    let i0 = (self.write_ptr + RETURN_ALIGN_CAPACITY - (base_offset + k))
+                        & RETURN_ALIGN_MASK;
+                    let i1 = (self.write_ptr + RETURN_ALIGN_CAPACITY - (base_offset + k + 1))
+                        & RETURN_ALIGN_MASK;
+                    acc0 += taps[k] * self.ring[i0];
+                    acc1 += taps[k + 1] * self.ring[i1];
+                }
+                self.write_ptr = (self.write_ptr + 1) & RETURN_ALIGN_MASK;
+                return acc0 + acc1;
+            }
+        }
+        self.step(x)
+    }
 }
 
-///// Stage 0: 8-Port Matrix Router state (1,536 B RAM).
+///// Stage 0: 8-Port Matrix Router state (<= 1,536 B RAM).
 #[repr(C, align(64))]
 #[derive(Clone, Debug)]
 pub struct Stage0Router {
@@ -191,6 +237,10 @@ pub struct Stage0Router {
     /// Dual TPT Linkwitz-Riley 4th-order (`200 Hz`) crossovers (`ref[dsp.router.lr4-crossover]`).
     pub tpt_crossover_l: super::topology::TptLr4Crossover,
     pub tpt_crossover_r: super::topology::TptLr4Crossover,
+    /// Precomputed cold-path Kaiser-derived sinc alignment FIR weights (`FullBand64Tap` / `LowLatency16Tap`).
+    pub kaiser_taps: Box<[f32; 64]>,
+    /// Pre-allocated Kaiser sinc taps validity flag (`0` runtime allocs/drops on sample-rate changes).
+    pub kaiser_active: bool,
     /// Configured clean-sub / LR4 crossover frequency in Hz (default `200.0`).
     pub crossover_hz: f32,
     /// 4-band ballistic envelope detector state (`[Low, Mid, High, AuxKey]`, `ref[dsp.router.ballistic-envelope-bank]`).
@@ -200,12 +250,12 @@ pub struct Stage0Router {
     /// Stereo-link blend `alpha_link in [0, 1]` and Aux-key blend `beta_key in [0, 1]` (`ref[dsp.router.stereo-link-detector]`).
     pub stereo_link_alpha: f32,
     pub aux_key_beta: f32,
+    /// Parallel-path sub-sample alignment mode (default `FullBand64Tap`: `31` host centering, `43` PDC @ `4x`).
+    pub alignment_mode: super::topology::ParallelAlignmentMode,
     /// WDW dry tap routing mode (`PreSpatialCore` vs `DirectDry`, `ref[dsp.router.wdw-contract]`).
     pub wdw_tap_mode: super::topology::WdwDryTapMode,
     /// WDW mode: whether Port Out 3 outputs dedicated dry center feed.
     pub wdw_mode: bool,
-    /// Padding to strictly match 1,536 B footprint.
-    pub _pad: [u8; 4],
 }
 
 const _: () = assert!(core::mem::size_of::<Stage0Router>() <= ROUTER_STATE_RAM_BYTES);
@@ -217,30 +267,62 @@ impl Default for Stage0Router {
 }
 
 impl Stage0Router {
-    pub const fn new() -> Self {
+    /// Default `4x4` scattering matrix (`S_ret->send == 0`).
+    pub const DEFAULT_S_MATRIX: [[f32; 4]; 4] = [
+        [1.0, 0.0, 0.0, 0.0], // send_l = 1.0 * inst_l + 0.0 * ret
+        [0.0, 1.0, 0.0, 0.0], // send_r = 1.0 * inst_r + 0.0 * ret
+        [1.0, 0.0, 1.0, 0.0], // down_l = inst_l + ret_l
+        [0.0, 1.0, 0.0, 1.0], // down_r = inst_r + ret_r
+    ];
+
+    pub fn new() -> Self {
         Self {
-            s_matrix: [
-                [1.0, 0.0, 0.0, 0.0], // send_l = 1.0 * inst_l + 0.0 * ret
-                [0.0, 1.0, 0.0, 0.0], // send_r = 1.0 * inst_r + 0.0 * ret
-                [1.0, 0.0, 1.0, 0.0], // down_l = inst_l + ret_l
-                [0.0, 1.0, 0.0, 1.0], // down_r = inst_r + ret_r
-            ],
-            return_aligner_l: ReturnAligner::new(),
-            return_aligner_r: ReturnAligner::new(),
+            s_matrix: Self::DEFAULT_S_MATRIX,
+            return_aligner_l: ReturnAligner {
+                ring: [0.0; RETURN_ALIGN_CAPACITY],
+                write_ptr: 0,
+                delay_samples: super::topology::ParallelAlignmentMode::FullBand64Tap
+                    .centering_offset_host_samples() as f32,
+            },
+            return_aligner_r: ReturnAligner {
+                ring: [0.0; RETURN_ALIGN_CAPACITY],
+                write_ptr: 0,
+                delay_samples: super::topology::ParallelAlignmentMode::FullBand64Tap
+                    .centering_offset_host_samples() as f32,
+            },
             sub_crossover_l: BezoutCleanCrossover::new(),
             sub_crossover_r: BezoutCleanCrossover::new(),
             tpt_crossover_l: super::topology::TptLr4Crossover::new_48khz(),
             tpt_crossover_r: super::topology::TptLr4Crossover::new_48khz(),
+            kaiser_taps: Box::new([0.0; 64]),
+            kaiser_active: false,
             crossover_hz: 200.0,
             detector_envelopes: [0.0; 4],
             detector_att_alphas: [0.002081, 0.010363, 0.098925, 0.040811],
             detector_rel_alphas: [0.000139, 0.000521, 0.001388, 0.000417],
             stereo_link_alpha: 1.0,
             aux_key_beta: 0.0,
+            alignment_mode: super::topology::ParallelAlignmentMode::FullBand64Tap,
             wdw_tap_mode: super::topology::WdwDryTapMode::PreSpatialCore,
             wdw_mode: false,
-            _pad: [0; 4],
         }
+    }
+
+    /// Returns the total PDC latency in host samples for `oversampling` (`43` @ `4x` for `FullBand64Tap`).
+    #[inline]
+    pub const fn pdc_host_samples(&self, oversampling: usize) -> usize {
+        self.alignment_mode
+            .timing_at_oversampling(oversampling, 0.0)
+            .2
+    }
+
+    /// Cold-path setter to switch parallel alignment mode (`FullBand64Tap` default).
+    pub fn set_alignment_mode(&mut self, mode: super::topology::ParallelAlignmentMode) {
+        self.alignment_mode = mode;
+        let g = mode.centering_offset_host_samples() as f32;
+        self.return_aligner_l.set_delay(g);
+        self.return_aligner_r.set_delay(g);
+        self.kaiser_active = false;
     }
 
     pub fn reset(&mut self) {
@@ -263,11 +345,55 @@ impl Stage0Router {
         self.tpt_crossover_r = super::topology::TptLr4Crossover::new_at_rate(f as f64, 48_000.0);
     }
 
-    /// Reconfigures Stage 0 return aligners, crossovers, and 4-band ballistic detector alphas for `zoh`.
+    /// Reconfigures Stage 0 return aligners, crossovers, and 4-band ballistic detector alphas for `zoh`
+    /// without heap allocation (`0` RT allocs / drops).
     pub fn reconfigure_sample_rate(&mut self, zoh: &crate::container::ZohRescaledParams) {
-        let align_delay = zoh.rescale_alignment_delay(4.0);
+        let base_g = self.alignment_mode.centering_offset_host_samples() as f32;
+        let align_delay = zoh.rescale_alignment_delay(base_g);
         self.return_aligner_l.set_delay(align_delay);
         self.return_aligner_r.set_delay(align_delay);
+        self.kaiser_active = match self.alignment_mode {
+            super::topology::ParallelAlignmentMode::FullBand64Tap => {
+                let mu = (align_delay - crate::math::floor_f32(align_delay)).clamp(0.0, 0.999_999)
+                    as f64;
+                if mu > 1.0e-6 {
+                    let mut w = [0.0_f64; 64];
+                    if super::topology::prepare_kaiser_sinc_alignment_weights_into(
+                        64, 8.6, mu, &mut w,
+                    ) {
+                        for (dst, src) in self.kaiser_taps.iter_mut().zip(w.iter()) {
+                            *dst = *src as f32;
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            super::topology::ParallelAlignmentMode::LowLatency16Tap => {
+                let mu = (align_delay - crate::math::floor_f32(align_delay)).clamp(0.0, 0.999_999)
+                    as f64;
+                if mu > 1.0e-6 {
+                    let mut w = [0.0_f64; 64];
+                    if super::topology::prepare_kaiser_sinc_alignment_weights_into(
+                        16, 6.5, mu, &mut w,
+                    ) {
+                        self.kaiser_taps.fill(0.0);
+                        for (dst, src) in self.kaiser_taps[..16].iter_mut().zip(w[..16].iter()) {
+                            *dst = *src as f32;
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            }
+            super::topology::ParallelAlignmentMode::MinLatency4Tap => false,
+        };
         self.sub_crossover_l.reconfigure_sample_rate(zoh);
         self.sub_crossover_r.reconfigure_sample_rate(zoh);
         let fs_eff = zoh.effective_sample_rate_hz();
@@ -359,9 +485,18 @@ impl Stage0Router {
         ret_l: f32,
         ret_r: f32,
     ) -> (f32, f32, f32, f32, f32, f32) {
-        // 1. Align return latency via 4-tap Catmull-Rom
-        let ret_l_aligned = self.return_aligner_l.step(ret_l);
-        let ret_r_aligned = self.return_aligner_r.step(ret_r);
+        // 1. Align return latency (FullBand64Tap Kaiser-sinc or 4-tap Catmull-Rom fallback)
+        let taps = if self.kaiser_active {
+            Some(&*self.kaiser_taps)
+        } else {
+            None
+        };
+        let ret_l_aligned = self
+            .return_aligner_l
+            .step_aligned(ret_l, self.alignment_mode, taps);
+        let ret_r_aligned = self
+            .return_aligner_r
+            .step_aligned(ret_r, self.alignment_mode, taps);
 
         // 2. Scattering matrix evaluation (ref[dsp.router.return-to-send-isolation]: S_ret->send == 0)
         let send_l = self.s_matrix[0][0] * inst_l + self.s_matrix[0][1] * inst_r;
@@ -513,6 +648,16 @@ mod tests {
         assert!(sub_r.is_finite());
 
         router.reset();
+        assert_eq!(router.pdc_host_samples(4), 43);
+        assert_eq!(
+            router.alignment_mode,
+            crate::stages::ParallelAlignmentMode::FullBand64Tap
+        );
+        let zoh_88 = crate::container::ZohRescaledParams::new(48_000, 88_200);
+        router.reconfigure_sample_rate(&zoh_88);
+        assert!(router.kaiser_active);
+        let (_, _, out_88, _, _, _) = router.route_frame(0.0, 0.0, 1.0, -1.0);
+        assert!(out_88.is_finite());
     }
 
     #[test]

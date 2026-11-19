@@ -1,36 +1,52 @@
 //! Marketplace Provenance, Encrypted Arena, Isometric Gauge Audio Equivalence, Tardos Collusion
 //! Tracing, and In-Place Preset Update Integration Suite (`tests/marketplace_provenance_and_watermark.rs`).
 //!
-//! Canonical Reference: `docs/security/provenance_and_enclave_drm.md` & `docs/security/watermarking_and_marketplace.md`.
+//! Canonical Reference: `docs/specs/security/provenance_and_enclave_drm.md` & `docs/specs/security/watermarking_and_marketplace.md`.
 
 use std::collections::BTreeMap;
 
 use dnam_engine::container::{
     ARENA_OFFSET_FULL_END, ARENA_OFFSET_LITE_END, ARENA_OFFSET_PRO_END, ARENA_OFFSET_ULTRA_END,
-    DnamContainerView, build_dnam_container, strip_container_to_tier, update_header_in_place,
+    DnamContainerView, StructuredConditionalBound, build_dnam_container, strip_container_to_tier,
+    update_header_in_place,
 };
 use dnam_engine::math::{DefaultMathBackend, f32_to_fp16_bits, fp16_bits_to_f32};
 use dnam_engine::provenance::{
-    KAUTZ_TOTAL_CHANNELS, RustCryptoProvider, TARDOS_CASCADE_WEIGHTS, VerificationStatus,
-    apply_isometric_gauge_watermark, apply_tardos_watermark_7680, build_creator_signing_message,
-    build_marketplace_receipt_signing_message, chacha20_xor_arena_blocks,
-    compute_immutable_header_sha256, encode_hex, extract_structural_hash_224d,
-    generate_tardos_code_7680, score_tardos_watermark_7680, sha256_digest,
-    structural_cosine_similarity,
+    KAUTZ_TOTAL_CHANNELS, PHASE_CODING_MAX_RAD, RustCryptoProvider, STAGE3_KAUTZ_BLOCKS_PER_TIER,
+    TARDOS_CASCADE_WEIGHTS, VerificationStatus, apply_isometric_gauge_watermark,
+    apply_phase_coding_watermark, apply_sona_sign_gauge_watermark, apply_tardos_watermark_7680,
+    build_creator_signing_message_for_tiers, build_marketplace_receipt_signing_message,
+    chacha20_xor_arena_blocks, compute_immutable_header_sha256, derive_sona_sign_gauge_40,
+    encode_hex, extract_structural_hash_224d, for_each_tardos_f32_offset_up_to,
+    for_each_tardos_fp16_offset_up_to, generate_tardos_code_7680, score_phase_coding_arena,
+    score_tardos_watermark_7680, sha256_digest, structural_cosine_similarity,
 };
 use dnam_engine::schema::{
-    AuthorizedDevice, ControlBusConfig, ControlKind, ControlSchemaDef, ControlUiHints,
-    CreatorSignature, DatasetProvenance, DnamJsonHeader, DnamProtectionProfile, IoConfig,
-    LevelingConfig, MarketplaceReceipt, ModelCapabilities, ModelMetadata, ModelSignatures,
-    PresetDef, RouterConfig, SlimmableTiersConfig, Stage1PreFxConfig, Stage2CascadeConfig,
-    Stage3CabinetKautzConfig, Stage4SpatialTankConfig, TierProfile,
+    AuthorizedDevice, ControlKind, ControlSchemaDef, ControlUiHints, CreatorSignature,
+    DatasetProvenance, DnamError, DnamJsonHeader, DnamProtectionProfile, MarketplaceReceipt,
+    ModelSignatures, PresetDef,
+};
+use dnam_engine::stages::sona_core::{
+    MAX_KAUTZ_POLES, MAX_SONA_GROUPS, MAX_SONA_TILES, MAX_TOTAL_SONA_LANES, SONA_FIR_MAX_TAPS,
+    SonaMatryoshkaModel, SonaTierReadout,
+};
+use dnam_engine::stages::weights::{
+    Arena0LiteWire, Arena3UltraDeltaWire, Cp1InlineDirWire, V3_META_STAGE3_PREFIX_OVERRIDES,
+    pack_sona_matryoshka_to_arena, read_f32_le, write_f32_le,
 };
 use dnam_engine::{DnamEngine, Tier};
+use zerocopy::{
+    FromBytes, IntoBytes,
+    byteorder::little_endian::{F32, U16},
+};
 
 fn build_reference_header_and_arena() -> (DnamJsonHeader, Vec<u8>) {
-    let mut cond_max = BTreeMap::new();
-    cond_max.insert("boost=on".to_string(), 9.368_421_f32);
+    build_reference_header_and_arena_with_kautz_override(0.0)
+}
 
+fn build_reference_header_and_arena_with_kautz_override(
+    ultra_b0_override: f32,
+) -> (DnamJsonHeader, Vec<u8>) {
     let controls_schema = vec![
         ControlSchemaDef {
             id: "gain".to_string(),
@@ -42,8 +58,8 @@ fn build_reference_header_and_arena() -> (DnamJsonHeader, Vec<u8>) {
             declared_range: Some([0.0, 10.0]),
             safe_clamped_range: Some([2.0, 8.0]),
             default: serde_json::json!(5.0),
-            conditional_min: BTreeMap::new(),
-            conditional_max: BTreeMap::new(),
+            conditional_bounds: Vec::new(),
+            represented_switch_options: None,
             declared_options: None,
             active_options: None,
             clamp_warning: Some("CLAMP-RANGE: [2.0, 8.0]".to_string()),
@@ -64,8 +80,12 @@ fn build_reference_header_and_arena() -> (DnamJsonHeader, Vec<u8>) {
             declared_range: Some([0.0, 10.0]),
             safe_clamped_range: Some([0.0, 10.0]),
             default: serde_json::json!(5.0),
-            conditional_min: BTreeMap::new(),
-            conditional_max: cond_max,
+            conditional_bounds: vec![StructuredConditionalBound {
+                when: vec![("boost".to_string(), "on".to_string())],
+                min: None,
+                max: Some(9.368_421),
+            }],
+            represented_switch_options: None,
             declared_options: None,
             active_options: None,
             clamp_warning: Some("CLAMP-STABILITY: <= 9.37 when boost=on".to_string()),
@@ -83,8 +103,8 @@ fn build_reference_header_and_arena() -> (DnamJsonHeader, Vec<u8>) {
             declared_range: None,
             safe_clamped_range: None,
             default: serde_json::json!("off"),
-            conditional_min: BTreeMap::new(),
-            conditional_max: BTreeMap::new(),
+            conditional_bounds: Vec::new(),
+            represented_switch_options: None,
             declared_options: Some(vec![
                 "off".to_string(),
                 "on".to_string(),
@@ -103,152 +123,84 @@ fn build_reference_header_and_arena() -> (DnamJsonHeader, Vec<u8>) {
     preset_ctrls.insert("feedback".to_string(), serde_json::json!(9.0));
     preset_ctrls.insert("boost".to_string(), serde_json::json!("on"));
 
-    let header = DnamJsonHeader {
-        version: "2.0.0".to_string(),
-        container_kind: "dnam".to_string(),
-        architecture: "DNAM_TORA".to_string(),
-        sample_rate_train_hz: 48_000,
-        metadata: ModelMetadata {
-            name: "Test Vintage Tape Echo".to_string(),
-            author: Some("DNAM Test Suite".to_string()),
-            description: Some("Empirical verification test model".to_string()),
-            license: Some("MIT".to_string()),
-            created_at: "2026-10-23T00:00:00Z".to_string(),
-            input_reference_dbfs: -20.5,
-            provenance: DatasetProvenance {
-                dataset_manifest_sha256:
-                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
-                config_recipe_sha256: None,
-                epochs_trained: 120,
-            },
-            distribution_policy: None,
-            signatures: None,
-        },
-        user_metadata: BTreeMap::new(),
-        io_config: IoConfig {
-            inputs: 2,
-            output_mode: "stereo".to_string(),
-            latency_samples: 0,
-            tail_time_ms: 1250.0,
-            capabilities: ModelCapabilities::default(),
-            leveling: LevelingConfig::default(),
-        },
-        slimmable_tiers: SlimmableTiersConfig {
-            lite: TierProfile {
-                feature_bus_dim: 64,
-                channels: 4,
-                early_fir_taps: 16,
-                kautz_modes: 4,
-                tank_lines: 4,
-                head_svd_rank: 4,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -39.4,
-                arena_end_byte_offset: ARENA_OFFSET_LITE_END,
-                prefix_crc32c: 0,
-            },
-            full: TierProfile {
-                feature_bus_dim: 128,
-                channels: 8,
-                early_fir_taps: 32,
-                kautz_modes: 8,
-                tank_lines: 8,
-                head_svd_rank: 4,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -45.8,
-                arena_end_byte_offset: ARENA_OFFSET_FULL_END,
-                prefix_crc32c: 0,
-            },
-            pro: TierProfile {
-                feature_bus_dim: 192,
-                channels: 12,
-                early_fir_taps: 48,
-                kautz_modes: 16,
-                tank_lines: 8,
-                head_svd_rank: 4,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -47.63,
-                arena_end_byte_offset: ARENA_OFFSET_PRO_END,
-                prefix_crc32c: 0,
-            },
-            ultra: TierProfile {
-                feature_bus_dim: 256,
-                channels: 16,
-                early_fir_taps: 64,
-                kautz_modes: 32,
-                tank_lines: 16,
-                head_svd_rank: 8,
-                loudness_lufs: -20.5,
-                output_trim_db: 0.0,
-                validation_esr_db: -50.8,
-                arena_end_byte_offset: ARENA_OFFSET_ULTRA_END,
-                prefix_crc32c: 0,
-            },
-        },
-        controls_schema,
-        presets: vec![PresetDef {
-            id: "dub_swell".to_string(),
-            name: "Dub Swell".to_string(),
-            description: None,
-            controls: preset_ctrls,
-            user_metadata: BTreeMap::new(),
-        }],
-        control_bus: ControlBusConfig::default(),
-        stage0_router: RouterConfig::default(),
-        stage1_pre: Stage1PreFxConfig::default(),
-        stage2_cascade: Stage2CascadeConfig::default(),
-        stage3_cabinet: Stage3CabinetKautzConfig::default(),
-        stage4_tank: Stage4SpatialTankConfig::default(),
-        delay_histories: Vec::new(),
-        tensor_directory: BTreeMap::new(),
+    let mut header = DnamJsonHeader::default_reference();
+    header.metadata.name = "Test Vintage Tape Echo".to_string();
+    header.metadata.author = Some("DNAM Test Suite".to_string());
+    header.metadata.description = Some("Empirical verification test model".to_string());
+    header.metadata.license = Some("MIT".to_string());
+    header.metadata.provenance = DatasetProvenance {
+        dataset_manifest_sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            .to_string(),
+        config_recipe_sha256: None,
+        epochs_trained: 120,
     };
+    header.io_config.tail_time_ms = 1250.0;
+    header.controls_schema = controls_schema;
+    header.presets = vec![PresetDef {
+        id: "dub_swell".to_string(),
+        name: "Dub Swell".to_string(),
+        description: None,
+        controls: preset_ctrls,
+        user_metadata: BTreeMap::new(),
+    }];
 
     let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    let mut model = dnam_engine::stages::V3MatryoshkaModel::dual_rate_default(false);
+    let mut model = SonaMatryoshkaModel::dual_rate_default(false);
     model.stage0.xo_low_gain = 1.0;
     model.stage0.xo_high_gain = 1.0;
-    model.svf.env_oct_sens = 1.2;
-    model.tone_svf.h0_proj_w = [0.25, -0.15, 0.10, 0.05];
-    model.tone_svf.s1_proj_w = 0.25;
-    for b in 0..dnam_engine::stages::stage2_gru::NUM_GRU_BLOCKS {
-        for f in 0..dnam_engine::stages::stage2_gru::NUM_IN_FEATS_B0 {
-            for l in 0..12 {
-                model.blocks[b].w_in_n[f][l] = 0.1 * if ((f + l) & 1) == 0 { 1.0 } else { -1.0 };
+    model.crossbar.op_p_crossbar_gain = 0.12;
+    for g in 0..MAX_SONA_GROUPS {
+        model.crossbar.op_p_to_group[g][0] = 0.06;
+        let grp = &mut model.groups[g];
+        for l in 0..4 {
+            grp.svf_g[l] = 0.22 + 0.04 * (l as f32);
+            grp.lru_alpha_rel[l] = 0.90;
+            grp.in_x_weight[l] = if l == 0 {
+                0.75
+            } else {
+                0.10 * if ((g + l) & 1) == 0 { 1.0 } else { -1.0 }
+            };
+            grp.adaa_drive[l] = 0.6;
+            grp.tone_dir[l] = 0.7;
+            grp.rect_sign[l] = 1.0;
+        }
+    }
+    for tile in &mut model.tiles[..MAX_SONA_TILES] {
+        for col in 0..4 {
+            for row in 0..4 {
+                tile.w_odd_4x4[col][row] = if col == row { 0.12 } else { 0.02 };
             }
         }
-        for l in 0..12 {
-            model.blocks[b].b_z[l] = -0.3;
-            model.blocks[b].b_r[l] = 0.2;
-            model.blocks[b].w_rec_n[l][l] = 0.1;
-            if b > 0 {
-                model.blocks[b].w_prev_n[l][l] = 0.2;
+    }
+    let mut ch_idx = 0usize;
+    for (tier, &blocks) in STAGE3_KAUTZ_BLOCKS_PER_TIER.iter().enumerate() {
+        for blk in 0..blocks {
+            for lane in 0..4 {
+                model.kautz_poles[ch_idx] = (
+                    0.92 + 0.01 * (lane as f32),
+                    0.05 * (((tier + blk) * 4 + lane + 1) as f32),
+                );
+                ch_idx += 1;
             }
         }
     }
     for tier in 0..4 {
-        for blk in 0..dnam_engine::provenance::STAGE3_KAUTZ_BLOCKS_PER_TIER[tier] {
-            for lane in 0..4 {
-                model.kautz_poles[tier * 4 + lane] = (
-                    0.92 + 0.01 * (lane as f32),
-                    0.05 * ((blk * 4 + lane + 1) as f32),
-                );
-            }
-        }
-        let mut ro = dnam_engine::stages::V3TierReadout::default();
+        let mut ro = SonaTierReadout::default();
         for ch in 0..2 {
-            for l in 0..24 {
-                ro.pre_cab_w[ch][l] = 0.04;
-                ro.direct_s2_w[ch][l] = 0.025;
+            for l in 0..MAX_TOTAL_SONA_LANES {
+                ro.pre_cab_w_odd[ch][l] = 0.03 * (((l + ch + tier) % 5) as f32 - 2.0);
+                ro.direct_w_odd[ch][l] = 0.02;
             }
         }
-        for tap in 0..64 {
+        for tap in 0..SONA_FIR_MAX_TAPS {
             ro.fir_l[tap] = if tap % 16 == 0 { 0.0625 } else { 0.005 };
             ro.fir_r[tap] = if tap % 16 == 0 { 0.0625 } else { 0.005 };
         }
-        for m in 0..16 {
-            ro.kautz_b_gamma[m] = 0.35 + 0.02 * (tier as f32);
+        for m in 0..MAX_KAUTZ_POLES {
+            ro.kautz_b_gamma[m] = 0.35 + 0.002 * (m as f32);
+            if tier == 3 && m == 0 {
+                ro.kautz_b_gamma[m] += ultra_b0_override;
+            }
             ro.kautz_c_l[m] = (0.25, -0.15);
             ro.kautz_c_r[m] = (0.20, -0.10);
         }
@@ -256,34 +208,79 @@ fn build_reference_header_and_arena() -> (DnamJsonHeader, Vec<u8>) {
         model.stage4[tier].g_loop = 0.72;
         model.stage4[tier].wet_mix = 0.2;
     }
-    dnam_engine::stages::weights::pack_v3_matryoshka_to_arena(&model, &mut arena);
+    pack_sona_matryoshka_to_arena(&model, &mut arena);
 
-    // Populate cp1_lanes_dir at `3_044` with 3 inline CP1 contributors (`3_200..3_520` / `21_760..23_872`)
-    let dir_off = dnam_engine::stages::weights::ARENA0_CP1_DIR_OFFSET;
-    arena[dir_off..dir_off + 2].copy_from_slice(&3_u16.to_le_bytes());
-    arena[dir_off + 2] = 2;
-    arena[dir_off + 3] = 2;
-    arena[dir_off + 4] = (1 << 4) | 1;
-    let mut b_cur = dnam_engine::stages::weights::ARENA0_CP1_BASE_OFFSET;
-    let mut u_cur = dnam_engine::stages::weights::ARENA3_CP1_ULTRA_OFFSET;
-    for (c, &lanes) in [2_usize, 2, 1].iter().enumerate() {
-        for l in 0..lanes {
-            for d in 0..4 {
-                let val = 0.03_f32 * (((c * 7 + l * 3 + d + 1) % 11) as f32 - 5.0);
-                arena[b_cur + l * 32 + d * 4..b_cur + l * 32 + (d + 1) * 4]
-                    .copy_from_slice(&val.to_le_bytes());
-                arena[u_cur + l * 32 + d * 4..u_cur + l * 32 + (d + 1) * 4]
-                    .copy_from_slice(&(0.5 * val).to_le_bytes());
+    // Populate inline CP1 directory + payload + U_int + W_ctrl using safe zerocopy wire structs
+    if let Ok((a0, _)) = Arena0LiteWire::mut_from_prefix(&mut arena) {
+        let cb = &mut a0.ctrl_base;
+        cb.cp1_dir = Cp1InlineDirWire {
+            cp1_dir_count: U16::new(3),
+            flags: U16::new(0),
+            entries: [
+                [0, 2, 0xFF],         // gain (Range, 2 lanes)
+                [1, 2, 0xFF],         // feedback (Range, 2 lanes)
+                [2, (1 << 4) | 1, 1], // boost (Switch, 1 lane, option_idx = 1 "on")
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+                [0, 0, 0],
+            ],
+        };
+        if let Ok(cp1_words) = <[F32]>::mut_from_bytes(&mut cb.cp1_base) {
+            let mut b_cur = 0usize;
+            for (c, &lanes) in [2_usize, 2, 1].iter().enumerate() {
+                for l in 0..lanes {
+                    for d in 0..8 {
+                        let val = 0.08_f32 * (((c * 7 + l * 3 + d + 1) % 11) as f32 - 5.0);
+                        cp1_words[b_cur + l * 8 + d] = F32::new(val);
+                    }
+                }
+                for l in 0..lanes {
+                    cp1_words[b_cur + 8 * lanes + l] = F32::new(0.25);
+                }
+                for d in 0..4 {
+                    cp1_words[b_cur + 9 * lanes + d] = F32::new(0.15 + 0.03 * (d as f32));
+                }
+                b_cur += 9 * lanes + 4;
             }
         }
-        b_cur += 4 * (9 * lanes + 4);
-        u_cur += 32 * lanes + 16;
+        for r in 0..4 {
+            for c in 0..8 {
+                cb.u_int_base[r][c] = F32::new(0.05 * ((r + c + 1) as f32 * 0.25));
+            }
+        }
+        for r in 0..16 {
+            for c in 0..16 {
+                cb.w_ctrl[r][c] = F32::new(0.04);
+            }
+        }
     }
-    for off in (dnam_engine::stages::weights::ARENA0_W_CTRL_OFFSET
-        ..dnam_engine::stages::weights::ARENA0_W_CTRL_OFFSET + 1024)
-        .step_by(4)
+    if let Ok((a3, _)) =
+        Arena3UltraDeltaWire::mut_from_prefix(&mut arena[ARENA_OFFSET_PRO_END as usize..])
     {
-        arena[off..off + 4].copy_from_slice(&0.02_f32.to_le_bytes());
+        if let Ok(ultra_words) = <[F32]>::mut_from_bytes(&mut a3.ctrl_ultra.cp1_ultra) {
+            let mut u_cur = 0usize;
+            for (c, &lanes) in [2_usize, 2, 1].iter().enumerate() {
+                for l in 0..lanes {
+                    for d in 0..8 {
+                        let val = 0.04_f32 * (((c * 7 + l * 3 + d + 1) % 11) as f32 - 5.0);
+                        ultra_words[u_cur + l * 8 + d] = F32::new(val);
+                    }
+                }
+                for d in 0..4 {
+                    ultra_words[u_cur + 8 * lanes + d] = F32::new(0.10);
+                }
+                u_cur += 8 * lanes + 4;
+            }
+        }
+        for b in 0..3 {
+            for r in 0..4 {
+                for c in 0..8 {
+                    a3.ctrl_ultra.u_int_ultra[b][r][c] = F32::new(0.02);
+                }
+            }
+        }
     }
 
     (header, arena)
@@ -293,6 +290,7 @@ fn build_reference_header_and_arena() -> (DnamJsonHeader, Vec<u8>) {
 fn test_marketplace_provenance_enclave_encryption_and_gauge_audio_equivalence() {
     let (mut header, master_arena) = build_reference_header_and_arena();
     let mut buyer_arena = master_arena.clone();
+    let mut sign_only_arena = master_arena.clone();
 
     let mut kappa = [1.0_f32; KAUTZ_TOTAL_CHANNELS];
     for (i, k) in kappa.iter_mut().enumerate() {
@@ -307,6 +305,10 @@ fn test_marketplace_provenance_enclave_encryption_and_gauge_audio_equivalence() 
         [0.0, 0.0, sq, cq],
     ];
     apply_isometric_gauge_watermark(&mut buyer_arena, &kappa, &q_buyer).unwrap();
+    let mp_secret = *b"dnam-marketplace-master-key-2026";
+    let sona_signs = derive_sona_sign_gauge_40(&mp_secret);
+    apply_sona_sign_gauge_watermark(&mut buyer_arena, &sona_signs).unwrap();
+    apply_sona_sign_gauge_watermark(&mut sign_only_arena, &sona_signs).unwrap();
 
     // 1. Structural hash cosine similarity must be 1.00000000000000 across all 4 tiers (224-D) and prefixes!
     let hash_master = extract_structural_hash_224d(&master_arena).unwrap();
@@ -314,8 +316,15 @@ fn test_marketplace_provenance_enclave_encryption_and_gauge_audio_equivalence() 
     let cos_sim = structural_cosine_similarity(&hash_master, &hash_buyer);
     assert!((cos_sim - 1.0).abs() < 1e-12);
 
-    // Also verify tier-sliced isometric gauge watermark and Tardos scoring on Lite, Full, and Pro prefixes
-    let mp_secret = *b"dnam-marketplace-master-key-2026";
+    // Layer 2 [0.2, 0.8] phase coding preserves 224-D structural hash while remaining traceably positive
+    let mut phase_arena = master_arena.clone();
+    apply_phase_coding_watermark(&mut phase_arena, &mp_secret, PHASE_CODING_MAX_RAD).unwrap();
+    let hash_phase = extract_structural_hash_224d(&phase_arena).unwrap();
+    assert!((structural_cosine_similarity(&hash_master, &hash_phase) - 1.0).abs() < 1e-12);
+    let z_phase = score_phase_coding_arena(&master_arena, &phase_arena, &mp_secret).unwrap();
+    assert!(z_phase > 3.0, "Phase-coding Z-score too low: {z_phase:.2}");
+
+    // Also verify tier-sliced isometric + SONA sign gauge watermarks and Tardos scoring on Lite, Full, and Pro prefixes
     let test_code = generate_tardos_code_7680(&mp_secret, "tape_echo_v1", "tier_probe");
     for &tier_len in &[
         ARENA_OFFSET_LITE_END as usize,
@@ -324,6 +333,7 @@ fn test_marketplace_provenance_enclave_encryption_and_gauge_audio_equivalence() 
     ] {
         let mut sliced = master_arena[..tier_len].to_vec();
         apply_isometric_gauge_watermark(&mut sliced, &kappa, &q_buyer).unwrap();
+        apply_sona_sign_gauge_watermark(&mut sliced, &sona_signs).unwrap();
         let h_m = extract_structural_hash_224d(&master_arena[..tier_len]).unwrap();
         let h_s = extract_structural_hash_224d(&sliced).unwrap();
         assert!((structural_cosine_similarity(&h_m, &h_s) - 1.0).abs() < 1e-12);
@@ -341,31 +351,107 @@ fn test_marketplace_provenance_enclave_encryption_and_gauge_audio_equivalence() 
         assert!(z_tier > min_z);
     }
 
-    // 2. Render audio through master and Mechanism-A watermarked model -> < 1e-5 diff
+    // 2. Render audio with active CP1 (z_head != 0): verify 0.000000 ULP SONA sign-flip + SO(4) gauge equivalence
     let master_bytes =
         build_dnam_container(&mut header.clone(), &master_arena, &master_arena, false).unwrap();
+    let sign_only_bytes = build_dnam_container(
+        &mut header.clone(),
+        &sign_only_arena,
+        &sign_only_arena,
+        false,
+    )
+    .unwrap();
     let buyer_bytes =
         build_dnam_container(&mut header.clone(), &buyer_arena, &buyer_arena, false).unwrap();
 
     let mut eng_m =
         DnamEngine::<DefaultMathBackend>::from_bytes(&master_bytes, Tier::Ultra, 48_000).unwrap();
+    let mut eng_s =
+        DnamEngine::<DefaultMathBackend>::from_bytes(&sign_only_bytes, Tier::Ultra, 48_000)
+            .unwrap();
     let mut eng_b =
         DnamEngine::<DefaultMathBackend>::from_bytes(&buyer_bytes, Tier::Ultra, 48_000).unwrap();
     eng_m.apply_preset("dub_swell").unwrap();
+    eng_s.apply_preset("dub_swell").unwrap();
     eng_b.apply_preset("dub_swell").unwrap();
 
     let in_l: Vec<f32> = (0..256).map(|n| 0.35 * ((n as f32) * 0.11).sin()).collect();
     let in_r: Vec<f32> = (0..256).map(|n| 0.35 * ((n as f32) * 0.07).cos()).collect();
     let (mut out_ml, mut out_mr) = (vec![0.0_f32; 256], vec![0.0_f32; 256]);
+    let (mut out_sl, mut out_sr) = (vec![0.0_f32; 256], vec![0.0_f32; 256]);
     let (mut out_bl, mut out_br) = (vec![0.0_f32; 256], vec![0.0_f32; 256]);
     eng_m.process_block(&in_l, &in_r, &mut out_ml, &mut out_mr);
+    eng_s.process_block(&in_l, &in_r, &mut out_sl, &mut out_sr);
     eng_b.process_block(&in_l, &in_r, &mut out_bl, &mut out_br);
+
+    let zh_m = eng_m.telemetry_snapshot().z_head;
+    let zh_b = eng_b.telemetry_snapshot().z_head;
+    assert!(
+        zh_m.iter().any(|&z| z.abs() > 1e-6),
+        "expected active CP1 z_head != 0"
+    );
+    assert!(zh_b.iter().any(|&z| z.abs() > 1e-6));
+    assert_ne!(zh_m, zh_b, "SO(4) gauge must rotate z_head coordinates");
+    for i in 0..256 {
+        assert_eq!(out_ml[i].to_bits(), out_sl[i].to_bits());
+        assert_eq!(out_mr[i].to_bits(), out_sr[i].to_bits());
+    }
 
     let max_audio_diff = out_ml
         .iter()
         .zip(out_bl.iter())
+        .chain(out_mr.iter().zip(out_br.iter()))
         .fold(0.0_f32, |acc, (&a, &b)| acc.max((a - b).abs()));
-    assert!(max_audio_diff < 1e-5);
+    assert!(max_audio_diff < 1e-5, "SO(4) audio diff={max_audio_diff}");
+
+    // 2b. Verify V3_META_STAGE3_PREFIX_OVERRIDES == 0 on shared-prefix arena and == 1 with explicit Ultra override
+    let (a0_shared, _) = Arena0LiteWire::ref_from_prefix(&master_arena).unwrap();
+    assert_eq!(
+        a0_shared.stage0.meta.v3_meta_flags.get() & V3_META_STAGE3_PREFIX_OVERRIDES,
+        0
+    );
+    let (mut ov_header, ov_master_arena) =
+        build_reference_header_and_arena_with_kautz_override(0.02);
+    let (a0_ov, _) = Arena0LiteWire::ref_from_prefix(&ov_master_arena).unwrap();
+    assert_ne!(
+        a0_ov.stage0.meta.v3_meta_flags.get() & V3_META_STAGE3_PREFIX_OVERRIDES,
+        0
+    );
+    let mut ov_buyer_arena = ov_master_arena.clone();
+    apply_isometric_gauge_watermark(&mut ov_buyer_arena, &kappa, &q_buyer).unwrap();
+    apply_sona_sign_gauge_watermark(&mut ov_buyer_arena, &sona_signs).unwrap();
+    let hash_ov_m = extract_structural_hash_224d(&ov_master_arena).unwrap();
+    let hash_ov_b = extract_structural_hash_224d(&ov_buyer_arena).unwrap();
+    assert!((structural_cosine_similarity(&hash_ov_m, &hash_ov_b) - 1.0).abs() < 1e-12);
+    let ov_master_bytes = build_dnam_container(
+        &mut ov_header.clone(),
+        &ov_master_arena,
+        &ov_master_arena,
+        false,
+    )
+    .unwrap();
+    let ov_buyer_bytes =
+        build_dnam_container(&mut ov_header, &ov_buyer_arena, &ov_buyer_arena, false).unwrap();
+    let mut eng_ov_m =
+        DnamEngine::<DefaultMathBackend>::from_bytes(&ov_master_bytes, Tier::Ultra, 48_000)
+            .unwrap();
+    let mut eng_ov_b =
+        DnamEngine::<DefaultMathBackend>::from_bytes(&ov_buyer_bytes, Tier::Ultra, 48_000).unwrap();
+    eng_ov_m.apply_preset("dub_swell").unwrap();
+    eng_ov_b.apply_preset("dub_swell").unwrap();
+    let (mut out_ov_ml, mut out_ov_mr) = (vec![0.0_f32; 256], vec![0.0_f32; 256]);
+    let (mut out_ov_bl, mut out_ov_br) = (vec![0.0_f32; 256], vec![0.0_f32; 256]);
+    eng_ov_m.process_block(&in_l, &in_r, &mut out_ov_ml, &mut out_ov_mr);
+    eng_ov_b.process_block(&in_l, &in_r, &mut out_ov_bl, &mut out_ov_br);
+    let ov_audio_diff = out_ov_ml
+        .iter()
+        .zip(out_ov_bl.iter())
+        .chain(out_ov_mr.iter().zip(out_ov_br.iter()))
+        .fold(0.0_f32, |acc, (&a, &b)| acc.max((a - b).abs()));
+    assert!(
+        ov_audio_diff < 1e-3,
+        "V3_META_STAGE3_PREFIX_OVERRIDES audio diff={ov_audio_diff}"
+    );
 
     // 3. Verify Mechanism B (7,680-Weight Spread-Spectrum Tardos Watermark) under 4-buyer collusion + fp16 truncation
     let colluder_ids = ["lic_017", "lic_042", "lic_108", "lic_163"];
@@ -380,15 +466,23 @@ fn test_marketplace_provenance_enclave_encryption_and_gauge_audio_equivalence() 
     }
 
     let mut pirated_arena = master_arena.clone();
-    for off in (128..ARENA_OFFSET_ULTRA_END as usize).step_by(4) {
+    for_each_tardos_f32_offset_up_to(master_arena.len(), |_, off| {
         let mut sum = 0.0_f32;
         for ca in &colluder_arenas {
-            sum += f32::from_le_bytes([ca[off], ca[off + 1], ca[off + 2], ca[off + 3]]);
+            sum += read_f32_le(ca, off);
         }
-        let avg = sum * 0.25;
-        let fp16_attacked = fp16_bits_to_f32(f32_to_fp16_bits(avg));
-        pirated_arena[off..off + 4].copy_from_slice(&fp16_attacked.to_le_bytes());
-    }
+        let fp16_attacked = fp16_bits_to_f32(f32_to_fp16_bits(sum * 0.25));
+        write_f32_le(&mut pirated_arena, off, fp16_attacked);
+    });
+    for_each_tardos_fp16_offset_up_to(master_arena.len(), |_, off| {
+        let mut sum = 0.0_f32;
+        for ca in &colluder_arenas {
+            let (raw_u16, _) = U16::ref_from_prefix(&ca[off..]).unwrap();
+            sum += fp16_bits_to_f32(raw_u16.get());
+        }
+        let bits = f32_to_fp16_bits(sum * 0.25);
+        let _ = U16::new(bits).write_to_prefix(&mut pirated_arena[off..off + 2]);
+    });
 
     for code in &colluder_codes {
         let z = score_tardos_watermark_7680(&master_arena, &pirated_arena, code).unwrap();
@@ -449,7 +543,9 @@ fn test_marketplace_provenance_enclave_encryption_and_gauge_audio_equivalence() 
         encode_hex(&buyer_sha),
     ];
 
-    let creator_msg = build_creator_signing_message(&imm_sha, &master_sha);
+    let creator_msg =
+        build_creator_signing_message_for_tiers(&imm_sha, &master_sha, Some(&master_tier_shas))
+            .unwrap();
     let creator_sig = creator_sk.sign(&creator_msg).to_bytes();
 
     let mut receipt = MarketplaceReceipt {
@@ -528,4 +624,20 @@ fn test_marketplace_provenance_enclave_encryption_and_gauge_audio_equivalence() 
             &buyer_arena[..expected_arena_len]
         );
     }
+
+    // 5. Verify .dnam-prev (container_kind == "preview") is rejected by DAW loaders and accepted by storefront preview loader
+    let mut prev_header = DnamJsonHeader::default_reference();
+    prev_header.container_kind = "preview".to_string();
+    let prev_bytes =
+        build_dnam_container(&mut prev_header, &master_arena, &master_arena, false).unwrap();
+    assert!(matches!(
+        DnamContainerView::from_bytes(&prev_bytes, &crypto),
+        Err(DnamError::PreviewContainerRejected)
+    ));
+    assert_eq!(
+        DnamEngine::<DefaultMathBackend>::from_bytes(&prev_bytes, Tier::Lite, 48_000).unwrap_err(),
+        DnamError::PreviewContainerRejected
+    );
+    let prev_view = DnamContainerView::from_bytes_allowing_preview(&prev_bytes, &crypto).unwrap();
+    assert_eq!(prev_view.header.container_kind, "preview");
 }

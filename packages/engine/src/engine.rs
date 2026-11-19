@@ -17,7 +17,7 @@ use crate::schema::{
     ControlCalibrationRole, DnamError, DnamJsonHeader, DnamProtectionProfile, TempoSubdivision,
     cold_pow_f64,
 };
-use crate::stages::{Stage0Router, StageBackend, V3ColdTierModel, V3HotCore};
+use crate::stages::{SonaColdTierModel, SonaHotSlab, Stage0Router, StageBackend};
 use crate::types::{DnamTelemetrySnapshot, Tier};
 
 pub use oversampler::{OFFLINE_BOUNCE_PDC_SAMPLES, Oversampler4xState};
@@ -30,13 +30,66 @@ pub trait EngineBackend: StageBackend {}
 
 impl<B: StageBackend> EngineBackend for B {}
 
+/// Isolated offline-bounce scratch preventing [`DnamEngine::render_offline_bounce`] from
+/// mutating live recursive DSP or `Stage0Router` state (`0` runtime heap allocations).
+#[derive(Debug)]
+pub(crate) struct BounceScratch<B: EngineBackend = DefaultMathBackend> {
+    pub hot_core: alloc::boxed::Box<SonaHotSlab<B>>,
+    pub stage0_router: Stage0Router,
+    pub exact_fm_acc: [crate::control::ExactIntFactorAccumulator; 8],
+    pub u_norm: [f32; 256],
+    pub prev_u_norm: [f32; 256],
+    pub prev_psi: [f32; 256],
+}
+
+/// Compact, zero-allocation header flags retained when [`DnamEngine::reload_model_in_place`]
+/// discards the heap-allocated [`DnamJsonHeader`] (`r[sec.preview.containment]`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ReloadHeaderFlags {
+    pub(crate) single_input: bool,
+    pub(crate) stereo_out: bool,
+    pub(crate) freeze_mutes_dry: bool,
+    pub(crate) supports_freeze: bool,
+    pub(crate) default_blend: f32,
+    pub(crate) wet_polarity_inverted: bool,
+    pub(crate) auto_unity_enabled: bool,
+    pub(crate) calibrated_trim_db: f32,
+    pub(crate) sub_crossover_hz: f32,
+    pub(crate) dc_blocker_pole: f32,
+    pub(crate) tzf_reference_tap_samples: f32,
+    pub(crate) switch_xfade_samples: u16,
+}
+
+impl Default for ReloadHeaderFlags {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            single_input: false,
+            stereo_out: true,
+            freeze_mutes_dry: false,
+            supports_freeze: true,
+            default_blend: 1.0,
+            wet_polarity_inverted: false,
+            auto_unity_enabled: true,
+            calibrated_trim_db: 0.0,
+            sub_crossover_hz: 200.0,
+            dc_blocker_pole: 0.995,
+            tzf_reference_tap_samples: 64.0,
+            switch_xfade_samples: 128,
+        }
+    }
+}
+
 /// Zero-allocation real-time DNAM inference engine parameterized over an
 /// [`EngineBackend`] (`DefaultMathBackend` by default).
 #[derive(Debug)]
 pub struct DnamEngine<'a, B: EngineBackend = DefaultMathBackend> {
     pub(crate) preamble: DnamPreamble,
     pub(crate) header: Option<DnamJsonHeader>,
+    pub(crate) header_active: bool,
+    pub(crate) reloaded_header_flags: Option<ReloadHeaderFlags>,
     pub(crate) verification_status: VerificationStatus,
+    pub(crate) verification_status_active: bool,
     pub(crate) protection_profile: DnamProtectionProfile,
     pub(crate) arena_storage: ArenaStorage<'a>,
     pub(crate) tier: Tier,
@@ -60,8 +113,9 @@ pub struct DnamEngine<'a, B: EngineBackend = DefaultMathBackend> {
     pub(crate) cached_tier_gain_trim: [f32; 4],
     pub saturation_flags: u32,
     pub control_bus: ControlBus<B>,
-    pub(crate) hot_core: alloc::boxed::Box<V3HotCore<B>>,
-    pub(crate) cold_tiers: alloc::boxed::Box<[V3ColdTierModel; 4]>,
+    pub(crate) hot_core: alloc::boxed::Box<SonaHotSlab<B>>,
+    pub(crate) cold_tiers: alloc::boxed::Box<[SonaColdTierModel; 4]>,
+    pub(crate) bounce_scratch: alloc::boxed::Box<BounceScratch<B>>,
     pub stage0_router: Stage0Router,
     pub mix_dry_gain: f32,
     pub mix_wet_gain: f32,
@@ -70,6 +124,7 @@ pub struct DnamEngine<'a, B: EngineBackend = DefaultMathBackend> {
 impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     /// Creates an unconfigured zero-allocation [`DnamEngine`] shell.
     pub(crate) fn new_empty(max_supported_tier: Tier) -> Self {
+        crate::math::warm_simd_feature_caches();
         let zoh = ZohRescaledParams {
             sample_rate_host_hz: 48_000,
             rho_sr: 1.0,
@@ -105,16 +160,31 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             header_crc32c: 0,
         };
         let cold_tiers = alloc::boxed::Box::new([
-            V3ColdTierModel::identity_for_tier(Tier::Lite, false, false),
-            V3ColdTierModel::identity_for_tier(Tier::Full, false, false),
-            V3ColdTierModel::identity_for_tier(Tier::Pro, false, false),
-            V3ColdTierModel::identity_for_tier(Tier::Ultra, false, false),
+            SonaColdTierModel::identity_for_tier(Tier::Lite, false, false),
+            SonaColdTierModel::identity_for_tier(Tier::Full, false, false),
+            SonaColdTierModel::identity_for_tier(Tier::Pro, false, false),
+            SonaColdTierModel::identity_for_tier(Tier::Ultra, false, false),
         ]);
-        let hot_core = alloc::boxed::Box::new(V3HotCore::from_cold_model(&cold_tiers[0]));
+        let hot_core = alloc::boxed::Box::new(SonaHotSlab::from_cold_model(&cold_tiers[0]));
+        let bounce_scratch = alloc::boxed::Box::new(BounceScratch {
+            hot_core: alloc::boxed::Box::new(SonaHotSlab::from_cold_model(&cold_tiers[0])),
+            stage0_router: Stage0Router::new(),
+            exact_fm_acc: core::array::from_fn(|_| {
+                crate::control::ExactIntFactorAccumulator::new(
+                    crate::control::MAX_EXACT_CONTRIBUTORS,
+                )
+            }),
+            u_norm: [0.0; 256],
+            prev_u_norm: [0.0; 256],
+            prev_psi: [0.0; 256],
+        });
         Self {
             preamble,
             header: None,
+            header_active: false,
+            reloaded_header_flags: None,
             verification_status: VerificationStatus::Unsigned,
+            verification_status_active: true,
             protection_profile: DnamProtectionProfile::Open,
             arena_storage: ArenaStorage::from_slice_or_copy(&[]),
             tier: Tier::Lite,
@@ -140,6 +210,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             control_bus: ControlBus::new(),
             hot_core,
             cold_tiers,
+            bounce_scratch,
             stage0_router: Stage0Router::new(),
             mix_dry_gain: 0.0,
             mix_wet_gain: 1.0,
@@ -242,7 +313,9 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         Ok(engine)
     }
 
-    /// Zero-Copy Scratch Loader: borrows caller-supplied `scratch` and arena.
+    /// Zero-Copy Scratch Loader: borrows caller-supplied 64B-aligned `Arena 0..3` weight slices
+    /// when `bytes` yields a cache-line aligned arena prefix (`_scratch` retained for compatibility
+    /// because `SONA v3.0` embeds `quad0_frames` inline inside [`SonaHotSlab`]).
     pub fn from_bytes_with_scratch(
         bytes: &'a [u8],
         _scratch: &'a mut [AlignedFp16Block],
@@ -252,7 +325,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         Self::from_bytes(bytes, tier, sample_rate_hz)
     }
 
-    /// Pre-allocates a [`DnamEngine`] with maximum `Arena 0..3` (`28,672 B`).
+    /// Pre-allocates a [`DnamEngine`] with maximum `Arena 0..3` (`30,720 B`).
     pub fn with_max_capacity() -> Self {
         Self::with_max_tier(Tier::Ultra)
     }
@@ -262,20 +335,53 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         let mut engine = Self::new_empty(max_supported_tier);
         engine.arena_storage = ArenaStorage::with_max_tier(max_supported_tier);
         engine.control_bus.ensure_control_capacity(256);
+        let s4_max = crate::stages::stage4_tank::v3_fdn::V3Stage4TankParams::identity_for_tier(
+            max_supported_tier,
+        );
+        engine.hot_core.ensure_cold_stage4_cap(&s4_max, 16_384);
+        engine
+            .bounce_scratch
+            .hot_core
+            .ensure_cold_stage4_cap(&s4_max, 16_384);
         engine
     }
 
     #[inline]
     pub(crate) fn sync_hot_core_tier(&mut self) {
         let eff = self.effective_tier();
-        if self.hot_core.tier != eff {
-            let cold = &self.cold_tiers[eff as usize];
+        let target_ultra = eff == Tier::Ultra;
+        let ultra_changed = self.control_bus.ultra_tier_active != target_ultra;
+        self.control_bus.ultra_tier_active = target_ultra;
+        let cold = &self.cold_tiers[eff as usize];
+        let target_os2x = cold.os2x && !self.offline_bounce;
+        let tier_changed = self.hot_core.tier() != eff;
+        if tier_changed {
             self.hot_core.switch_tier(cold);
-            if self.zoh.sample_rate_host_hz != 48_000 || self.offline_bounce {
-                self.hot_core.reconfigure_with_zoh(cold, &self.zoh);
-            }
-            self.hot_core
-                .apply_control_bus_stage_targets(&self.current_stage_params);
+            self.hot_core.reconfigure_with_zoh_mode(
+                cold,
+                &self.zoh,
+                if target_os2x { 2 } else { 1 },
+                self.offline_bounce,
+            );
+            self.hot_core.set_os2x(target_os2x);
+        } else if self.hot_core.os2x() != target_os2x {
+            self.hot_core.set_os2x(target_os2x);
+        }
+        if ultra_changed {
+            let cap = eff
+                .expected_arena_bytes()
+                .min(self.arena_storage.as_bytes().len());
+            let eff_arena = &self.arena_storage.as_bytes()[..cap];
+            self.control_bus.refresh_static_state(eff_arena);
+            self.control_bus.is_dirty = true;
+            self.current_stage_params = self.control_bus.stage_targets;
+            self.stage_ramp_deltas = [0.0; 16];
+        }
+        if tier_changed || ultra_changed {
+            self.hot_core.apply_control_bus_with_z_stage(
+                &self.current_stage_params,
+                &self.control_bus.z_stage,
+            );
         }
     }
 
@@ -370,7 +476,12 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
     #[inline]
     pub const fn verification_status(&self) -> &VerificationStatus {
-        &self.verification_status
+        static UNSIGNED: VerificationStatus = VerificationStatus::Unsigned;
+        if self.verification_status_active {
+            &self.verification_status
+        } else {
+            &UNSIGNED
+        }
     }
 
     #[inline]
@@ -385,7 +496,11 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
     #[inline]
     pub const fn header(&self) -> Option<&DnamJsonHeader> {
-        self.header.as_ref()
+        if self.header_active {
+            self.header.as_ref()
+        } else {
+            None
+        }
     }
 
     /// Returns the active host tempo in BPM.
@@ -462,22 +577,29 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
     fn refresh_calibrated_control_effects(&mut self, ctrl_idx: usize, physical_value: f32) {
         let supports_freeze = self.supports_freeze();
+        let mut freeze = self.hot_core.stage4_freeze();
+        let active_header = if self.header_active {
+            self.header.as_ref()
+        } else {
+            None
+        };
         apply_calibrated_control_role(
-            self.header.as_ref(),
+            active_header,
             ctrl_idx,
             physical_value,
             &mut self.stereo_width,
-            &mut self.hot_core.stage4.freeze,
+            &mut freeze,
             supports_freeze,
         );
+        self.hot_core.set_stage4_freeze(freeze);
     }
 
     /// Returns whether this model supports captured hardware freeze (`supports_freeze == true` or
     /// a `FreezeLatch`-calibrated control in `controls_schema`, `ref[dsp.stage4.captured-freeze]`).
     #[inline]
     pub fn supports_freeze(&self) -> bool {
-        match self.header {
-            Some(ref hdr) => {
+        match self.header() {
+            Some(hdr) => {
                 hdr.io_config.capabilities.supports_freeze
                     || hdr.controls_schema.iter().any(|c| {
                         c.calibration
@@ -485,23 +607,27 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                             .is_some_and(|cal| cal.role == ControlCalibrationRole::FreezeLatch)
                     })
             }
-            None => true,
+            None => self
+                .reloaded_header_flags
+                .is_none_or(|flags| flags.supports_freeze),
         }
     }
 
     #[inline]
     pub fn set_freeze(&mut self, freeze: bool) {
-        self.hot_core.stage4.freeze = freeze && self.supports_freeze();
+        self.hot_core
+            .set_stage4_freeze(freeze && self.supports_freeze());
     }
 
     #[inline]
     pub fn set_freeze_amount(&mut self, alpha: f32) {
-        self.hot_core.stage4.freeze = (alpha > 0.5) && self.supports_freeze();
+        self.hot_core
+            .set_stage4_freeze((alpha > 0.5) && self.supports_freeze());
     }
 
     #[inline]
     pub fn is_frozen(&self) -> bool {
-        self.hot_core.stage4.freeze
+        self.hot_core.stage4_freeze()
     }
 
     #[inline]
@@ -532,7 +658,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         apply_unity_leveling: bool,
     ) {
         let b = blend_wet.clamp(0.0, 1.0);
-        let (pol_sign, cal_trim_db) = if let Some(ref hdr) = self.header {
+        let (pol_sign, cal_trim_db) = if let Some(hdr) = self.header() {
             let sign = if hdr.io_config.capabilities.wet_polarity_inverted {
                 -1.0_f32
             } else {
@@ -540,6 +666,18 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             };
             let trim = if apply_unity_leveling && hdr.io_config.leveling.auto_unity_enabled {
                 hdr.io_config.leveling.calibrated_trim_db
+            } else {
+                0.0_f32
+            };
+            (sign, trim)
+        } else if let Some(flags) = self.reloaded_header_flags {
+            let sign = if flags.wet_polarity_inverted {
+                -1.0_f32
+            } else {
+                1.0_f32
+            };
+            let trim = if apply_unity_leveling && flags.auto_unity_enabled {
+                flags.calibrated_trim_db
             } else {
                 0.0_f32
             };
@@ -563,7 +701,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         fold_octave: bool,
     ) -> usize {
         self.tempo_state.set_bpm(bpm);
-        let Some(ref hdr) = self.header else {
+        let Some(hdr) = self.header() else {
             return 0;
         };
         let mut updates = [(0usize, 0.0f32); 512];
@@ -617,7 +755,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             control_decimation_host: self.zoh.control_decimation_host as u16,
             max_op_n_drive: 1.0,
             max_pole_radius: 0.999,
-            max_effective_loop_gain: self.hot_core.stage4.params.g_loop,
+            max_effective_loop_gain: self.hot_core.stage4_g_loop(),
             tail_time_ms: self.preamble.tail_time_ms,
             z_head: self.control_bus.z_head,
             env_states: self.control_bus.env_states,

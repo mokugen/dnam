@@ -1,54 +1,16 @@
 //! RFC 8785 JCS canonicalization and preset-safe `immutable_header_sha256` projection.
 
 use alloc::string::String;
-use alloc::vec::Vec;
 
 use super::super::sha256::sha256_digest;
 use crate::schema::{DnamError, DnamJsonHeader, SchemaVersion};
 
-/// Recursively canonicalizes a `serde_json::Value` per RFC 8785 JSON Canonicalization Scheme (JCS).
+/// Canonicalizes a `serde_json::Value` per RFC 8785 JCS via the canonical container JCS codec.
 pub(crate) fn canonicalize_jcs_value(val: &serde_json::Value, out: &mut String) {
-    match val {
-        serde_json::Value::Null => out.push_str("null"),
-        serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        serde_json::Value::Number(n) => {
-            if let Some(f) = n.as_f64()
-                && f == 0.0
-            {
-                out.push('0');
-                return;
-            }
-            out.push_str(&serde_json::to_string(n).unwrap_or_default());
-        }
-        serde_json::Value::String(s) => {
-            out.push_str(&serde_json::to_string(s).unwrap_or_default());
-        }
-        serde_json::Value::Array(arr) => {
-            out.push('[');
-            for (i, item) in arr.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                canonicalize_jcs_value(item, out);
-            }
-            out.push(']');
-        }
-        serde_json::Value::Object(map) => {
-            // Sort keys by RFC 8785 UTF-16 code-unit lexicographical order
-            let mut sorted: Vec<(&str, &serde_json::Value)> =
-                map.iter().map(|(k, v)| (k.as_str(), v)).collect();
-            sorted.sort_by(|(a, _), (b, _)| a.encode_utf16().cmp(b.encode_utf16()));
-            out.push('{');
-            for (i, (k, v)) in sorted.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                out.push_str(&serde_json::to_string(k).unwrap_or_default());
-                out.push(':');
-                canonicalize_jcs_value(v, out);
-            }
-            out.push('}');
-        }
+    if let Ok(encoded) = crate::container::wire::jcs::canonicalize_jcs_bytes(val)
+        && let Ok(text) = core::str::from_utf8(&encoded)
+    {
+        out.push_str(text);
     }
 }
 
@@ -64,6 +26,7 @@ pub fn project_immutable_header_for_schema_version(
     if let Some(obj) = val.as_object_mut() {
         obj.remove("presets");
         obj.remove("user_metadata");
+        obj.remove("stem_user_metadata");
 
         if let Some(meta) = obj.get_mut("metadata").and_then(|m| m.as_object_mut()) {
             meta.remove("signatures");
@@ -117,9 +80,8 @@ pub fn compute_immutable_header_sha256_for_version(
         .map_err(|e| DnamError::InvalidJsonHeader(alloc::format!("{e}")))?;
     project_immutable_header_for_schema_version(&mut val, schema_version)?;
 
-    let mut canonical = String::with_capacity(2048);
-    canonicalize_jcs_value(&val, &mut canonical);
-    Ok(sha256_digest(canonical.as_bytes()))
+    let canonical = crate::container::wire::jcs::canonicalize_jcs_bytes(&val)?;
+    Ok(sha256_digest(&canonical))
 }
 
 /// Computes the preset-safe RFC 8785 JCS `immutable_header_sha256` digest over a [`DnamJsonHeader`]
@@ -146,7 +108,7 @@ mod tests {
             "controls_schema": [{"id": "drive", "user_metadata": {"note": 1}}],
             "stems_registry": [{"id": "s1", "user_metadata": {"tag": "warm"}}],
         });
-        project_immutable_header_for_schema_version(&mut val, SchemaVersion::V2_0_0).unwrap();
+        project_immutable_header_for_schema_version(&mut val, SchemaVersion::V3_0_0).unwrap();
         assert!(val.get("presets").is_none());
         assert!(val.get("user_metadata").is_none());
         assert!(val["controls_schema"][0].get("user_metadata").is_none());

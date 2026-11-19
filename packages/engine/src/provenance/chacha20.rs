@@ -1,5 +1,7 @@
 //! RFC 8439 `ChaCha20` 64-Byte Cache-Line Arena Stream Encryption.
 
+use zerocopy::byteorder::little_endian::U32;
+use zerocopy::{FromBytes, IntoBytes};
 use zeroize::Zeroizing;
 
 use crate::schema::DnamError;
@@ -25,11 +27,7 @@ const fn chacha20_quarter_round(state: &mut [u32; 16], a: usize, b: usize, c: us
 
 /// Generates a single 64-byte RFC 8439 `ChaCha20` keystream block for `(cek, nonce_96, block_counter)`.
 #[inline]
-pub const fn chacha20_block_64b(
-    cek: &[u8; 32],
-    nonce_96: &[u8; 12],
-    block_counter: u32,
-) -> [u8; 64] {
+pub fn chacha20_block_64b(cek: &[u8; 32], nonce_96: &[u8; 12], block_counter: u32) -> [u8; 64] {
     let mut initial = [0u32; 16];
     // "expand 32-byte k"
     initial[0] = 0x6170_7865;
@@ -37,20 +35,18 @@ pub const fn chacha20_block_64b(
     initial[2] = 0x7962_2d32;
     initial[3] = 0x6b20_6574;
 
-    let mut i = 0;
-    while i < 8 {
-        let j = i * 4;
-        initial[4 + i] = u32::from_le_bytes([cek[j], cek[j + 1], cek[j + 2], cek[j + 3]]);
-        i += 1;
+    let cek_words = <[U32; 8]>::ref_from_bytes(cek).expect("32-byte key");
+    for (idx, word) in cek_words.iter().enumerate() {
+        initial[4 + idx] = word.get();
     }
     initial[12] = block_counter;
-    initial[13] = u32::from_le_bytes([nonce_96[0], nonce_96[1], nonce_96[2], nonce_96[3]]);
-    initial[14] = u32::from_le_bytes([nonce_96[4], nonce_96[5], nonce_96[6], nonce_96[7]]);
-    initial[15] = u32::from_le_bytes([nonce_96[8], nonce_96[9], nonce_96[10], nonce_96[11]]);
+    let nonce_words = <[U32; 3]>::ref_from_bytes(nonce_96).expect("12-byte nonce");
+    initial[13] = nonce_words[0].get();
+    initial[14] = nonce_words[1].get();
+    initial[15] = nonce_words[2].get();
 
     let mut working = initial;
-    let mut r = 0;
-    while r < 10 {
+    for _ in 0..10 {
         // Column rounds
         chacha20_quarter_round(&mut working, 0, 4, 8, 12);
         chacha20_quarter_round(&mut working, 1, 5, 9, 13);
@@ -61,20 +57,14 @@ pub const fn chacha20_block_64b(
         chacha20_quarter_round(&mut working, 1, 6, 11, 12);
         chacha20_quarter_round(&mut working, 2, 7, 8, 13);
         chacha20_quarter_round(&mut working, 3, 4, 9, 14);
-        r += 1;
     }
 
-    let mut out = [0u8; 64];
-    let mut k = 0;
-    while k < 16 {
-        let word = working[k].wrapping_add(initial[k]).to_le_bytes();
-        let base = k * 4;
-        out[base] = word[0];
-        out[base + 1] = word[1];
-        out[base + 2] = word[2];
-        out[base + 3] = word[3];
-        k += 1;
+    let mut out_words = [U32::new(0); 16];
+    for k in 0..16 {
+        out_words[k] = U32::new(working[k].wrapping_add(initial[k]));
     }
+    let mut out = [0u8; 64];
+    out.copy_from_slice(out_words.as_bytes());
     out
 }
 

@@ -46,17 +46,51 @@ impl<B: MathBackend> ControlBus<B> {
         Self::compute_micro_ramp_deltas(theta_curr, theta_next, 0.0625)
     }
 
-    /// Audio-rate sample-by-sample parameter update via 4-lane SIMD addition.
+    /// Audio-rate sample-by-sample micro-ramp across all `16` unified stage parameters (`0..16`),
+    /// clamping each intermediate sample inside `[min(theta_curr, theta_next), max(theta_curr, theta_next)]`
+    /// via SIMD `min`/`max` and snapping strictly to `theta_next` on the final window sample `K_ctrl - 1`
+    /// (`ref[dsp.ctrl.dispatch.micro-ramp]`).
     /// Direct callers must hold a [`crate::FtzDazGuard`] for the enclosing batch.
     #[inline(always)]
-    pub fn step_micro_ramp(theta_audio: &mut [f32; 16], deltas: &[f32; 16]) {
+    pub fn step_micro_ramp(
+        theta_audio: &mut [f32; 16],
+        deltas: &[f32; 16],
+        theta_curr: &[f32; 16],
+        theta_next: &[f32; 16],
+        is_last_sample: bool,
+    ) {
+        if is_last_sample {
+            *theta_audio = *theta_next;
+            return;
+        }
         let t_chunks: &mut [[f32; 4]; 4] = zerocopy::transmute_mut!(theta_audio);
         let d_chunks: &[[f32; 4]; 4] = zerocopy::transmute_ref!(deltas);
+        let c_chunks: &[[f32; 4]; 4] = zerocopy::transmute_ref!(theta_curr);
+        let n_chunks: &[[f32; 4]; 4] = zerocopy::transmute_ref!(theta_next);
         for c in 0..4 {
+            let vc = B::Vec4::load(&c_chunks[c]);
+            let vn = B::Vec4::load(&n_chunks[c]);
+            let lo = vc.min(vn);
+            let hi = vc.max(vn);
             B::Vec4::load(&t_chunks[c])
                 .add(B::Vec4::load(&d_chunks[c]))
+                .clamp(lo, hi)
                 .store(&mut t_chunks[c]);
         }
+    }
+
+    /// Micro-ramp helper indexed by `sample_idx` within a `K_ctrl`-sample window (`snap` when `sample_idx + 1 >= k_ctrl`).
+    #[inline(always)]
+    pub fn step_micro_ramp_at_sample(
+        theta_audio: &mut [f32; 16],
+        deltas: &[f32; 16],
+        theta_curr: &[f32; 16],
+        theta_next: &[f32; 16],
+        sample_idx: usize,
+        k_ctrl: usize,
+    ) {
+        let snap = sample_idx.saturating_add(1) >= k_ctrl.max(1);
+        Self::step_micro_ramp(theta_audio, deltas, theta_curr, theta_next, snap);
     }
 
     /// Evaluates division-free linear micro-ramping deltas for the 12 active stage parameters (`0..12`).
@@ -92,45 +126,25 @@ impl<B: MathBackend> ControlBus<B> {
         }
     }
 
-    /// Audio-rate sample-by-sample parameter update for all 16 unified stage parameters (`0..16`).
+    /// Transitional 2-argument sample-by-sample micro-ramp across all `16` stage parameters (`0..16`).
     #[inline(always)]
     pub fn step_micro_ramp_16(theta_audio: &mut [f32; 16], deltas: &[f32; 16]) {
-        Self::step_micro_ramp(theta_audio, deltas);
+        let t_chunks: &mut [[f32; 4]; 4] = zerocopy::transmute_mut!(theta_audio);
+        let d_chunks: &[[f32; 4]; 4] = zerocopy::transmute_ref!(deltas);
+        for c in 0..4 {
+            B::Vec4::load(&t_chunks[c])
+                .add(B::Vec4::load(&d_chunks[c]))
+                .store(&mut t_chunks[c]);
+        }
     }
 }
 
-/// Applies the outward-checked 4-D trust-region clip (`ref[dsp.ctrl.op-n.trust-clip]`) with
-/// fallback to `trust_region_softclip_4d`.
+/// Applies the outward-checked 4-D trust-region clip (`ref[dsp.ctrl.op-n.trust-clip]`,
+/// `ref[dsp.ctrl.op-n.static-and-interior-fastpath]`) via
+/// [`crate::math::spec_math::trust_clip_outward_4d`].
 #[inline]
 pub fn trust_clip_outward_4d(vec: &mut [f32; 4], radius_mh: f32) {
-    let norm_sq = (vec[0] as f64) * (vec[0] as f64)
-        + (vec[1] as f64) * (vec[1] as f64)
-        + (vec[2] as f64) * (vec[2] as f64)
-        + (vec[3] as f64) * (vec[3] as f64);
-    let r = radius_mh as f64;
-    if norm_sq.is_finite() && r > 0.0 && norm_sq + 1.0e-9 < r * r {
-        return;
-    }
-    let in_bits = [
-        vec[0].to_bits(),
-        vec[1].to_bits(),
-        vec[2].to_bits(),
-        vec[3].to_bits(),
-    ];
-    if let Some((out_bits, _, _)) = crate::math::trust_clip_outward_checked_bits::<4>(
-        &in_bits,
-        radius_mh.to_bits(),
-        (1.0e-12_f32).to_bits(),
-    ) {
-        *vec = [
-            f32::from_bits(out_bits[0]),
-            f32::from_bits(out_bits[1]),
-            f32::from_bits(out_bits[2]),
-            f32::from_bits(out_bits[3]),
-        ];
-    } else {
-        crate::operators::op_n::trust_region_softclip_4d(vec, radius_mh);
-    }
+    crate::math::spec_math::trust_clip_outward_4d(vec, radius_mh);
 }
 
 #[inline(always)]
@@ -144,26 +158,15 @@ pub(super) fn read_vec4_le<B: MathBackend>(bytes: &[u8], off: usize) -> B::Vec4 
     }
     #[cfg(not(target_endian = "little"))]
     {
-        let f0 = f32::from_le_bytes([bytes[off], bytes[off + 1], bytes[off + 2], bytes[off + 3]]);
-        let f1 = f32::from_le_bytes([
-            bytes[off + 4],
-            bytes[off + 5],
-            bytes[off + 6],
-            bytes[off + 7],
-        ]);
-        let f2 = f32::from_le_bytes([
-            bytes[off + 8],
-            bytes[off + 9],
-            bytes[off + 10],
-            bytes[off + 11],
-        ]);
-        let f3 = f32::from_le_bytes([
-            bytes[off + 12],
-            bytes[off + 13],
-            bytes[off + 14],
-            bytes[off + 15],
-        ]);
-        B::Vec4::from_array([f0, f1, f2, f3])
+        let words: &[zerocopy::byteorder::little_endian::F32; 4] =
+            zerocopy::FromBytes::ref_from_bytes(&bytes[off..off + 16])
+                .expect("16-byte slice matches [F32; 4]");
+        B::Vec4::from_array([
+            words[0].get(),
+            words[1].get(),
+            words[2].get(),
+            words[3].get(),
+        ])
     }
 }
 
@@ -221,13 +224,42 @@ mod tests {
             "expected clipped norm 2.0, got {norm}"
         );
 
-        // Non-positive or NaN radius falls back to trust_region_softclip_4d.
+        // Non-positive/non-finite radius zeroes vector and NaN/Inf lanes are sanitized cleanly.
         let mut fallback = [2.0, 0.0, 0.0, 0.0];
         trust_clip_outward_4d(&mut fallback, -1.0);
-        for v in fallback {
-            assert!(v.is_finite());
-        }
+        assert_eq!(fallback, [0.0; 4]);
         let mut nan_vec = [f32::NAN, 1.0, 0.0, 0.0];
         trust_clip_outward_4d(&mut nan_vec, 2.0);
+        assert_eq!(nan_vec, [0.0, 1.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_step_micro_ramp_simd_bounds_and_final_sample_snap() {
+        let curr = [1.0_f32; 16];
+        let mut next = [3.0_f32; 16];
+        next[1] = -2.0;
+        let deltas = ControlBus::<DefaultMathBackend>::compute_micro_ramp_deltas_16(&curr, &next);
+        let mut audio = curr;
+        // Overstepping 20 iterations without snap must stay clamped strictly inside [min(curr, next), max(curr, next)]
+        for k in 0..20 {
+            ControlBus::<DefaultMathBackend>::step_micro_ramp(
+                &mut audio, &deltas, &curr, &next, false,
+            );
+            assert!(
+                audio[0] >= 1.0 && audio[0] <= 3.0,
+                "step {k} escaped: {}",
+                audio[0]
+            );
+            assert!(
+                audio[1] >= -2.0 && audio[1] <= 1.0,
+                "step {k} escaped: {}",
+                audio[1]
+            );
+        }
+        // Final window sample snaps strictly to theta_next
+        ControlBus::<DefaultMathBackend>::step_micro_ramp_at_sample(
+            &mut audio, &deltas, &curr, &next, 15, 16,
+        );
+        assert_eq!(audio, next);
     }
 }

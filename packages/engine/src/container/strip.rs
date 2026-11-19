@@ -1,4 +1,4 @@
-//! Zero-re-signing canonical v2.0 `.dnam` container tier stripper (`strip_container_to_tier`).
+//! Zero-re-signing canonical `v3.0` (`"sona"`) `.dnam` container tier stripper (`strip_container_to_tier`).
 //!
 //! Canonical Reference: `docs/specs/containers/dnam_binary_format.md`.
 
@@ -8,20 +8,20 @@ use alloc::vec::Vec;
 use crate::schema::DnamError;
 use crate::types::Tier;
 
-use super::wire::{V2_PREAMBLE_SIZE, parse_dcrc_record, validate_v2_dnam_layout_with_max_profile};
+use super::wire::{V3_PREAMBLE_SIZE, parse_dcrc_record, validate_v3_dnam_layout_with_max_profile};
 use super::{DNAM_MAGIC, crc32c_update};
 
-/// Strips a canonical `v2.0` `.dnam` container down to `max_tier` (`Lite = 10,752 B`,
-/// `Full = 22,336 B`, `Pro = 36,224 B`, or `Ultra = 64,000 B`) **without modifying the preamble,
-/// directory, Region 3 JCS header, Region 4 shared extent, or `auth_extent`**, preserving
-/// `DAU1` / `metadata.signatures` and `DMU1` mutable metadata with zero re-signing required.
+/// Strips a canonical `v3.0` (`"sona"`) `.dnam` container down to `max_tier` (`Lite = 4,608 B`,
+/// `Full = 7,936 B`, `Pro = 15,872 B`, or `Ultra = 30,720 B` arenas) **without modifying the
+/// preamble, directory, Region 3 JCS header, Region 4 shared extent, or `auth_extent`**,
+/// preserving `DAU1` / `metadata.signatures` and `DMU1` mutable metadata with zero re-signing.
 pub fn strip_container_to_tier(
     container_bytes: &[u8],
     max_tier: Tier,
 ) -> Result<Vec<u8>, DnamError> {
-    if container_bytes.len() < V2_PREAMBLE_SIZE {
+    if container_bytes.len() < V3_PREAMBLE_SIZE {
         return Err(DnamError::BufferTooSmall {
-            expected: V2_PREAMBLE_SIZE,
+            expected: V3_PREAMBLE_SIZE,
             actual: container_bytes.len(),
         });
     }
@@ -30,7 +30,7 @@ pub fn strip_container_to_tier(
             "strip_container_to_tier only applies to runtime .dnam containers".to_string(),
         ));
     }
-    let layout = validate_v2_dnam_layout_with_max_profile(container_bytes, 1)?;
+    let layout = validate_v3_dnam_layout_with_max_profile(container_bytes, 1)?;
     let auth_slice =
         &container_bytes[layout.auth_extent.0..layout.auth_extent.0 + layout.auth_extent.1];
     if let Some(dcrc) = parse_dcrc_record(auth_slice)? {
@@ -92,7 +92,7 @@ mod tests {
 
         // Corrupted header prefix must trigger header Crc32cMismatch
         let mut corrupt_hdr = container.clone();
-        corrupt_hdr[crate::container::V2_HEADER_OFFSET] ^= 0x01;
+        corrupt_hdr[crate::container::V3_HEADER_OFFSET] ^= 0x01;
         assert!(matches!(
             strip_container_to_tier(&corrupt_hdr, Tier::Lite),
             Err(DnamError::Crc32cMismatch {

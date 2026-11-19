@@ -83,7 +83,8 @@ opt-level = 3
 
 [profile.test]
 opt-level = 2
-codegen-units = 16
+codegen-units = 8
+debug = "line-tables-only"
 
 [profile.test.package.dnam-kernels]
 opt-level = 3

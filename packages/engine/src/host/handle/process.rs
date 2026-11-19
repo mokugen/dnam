@@ -97,6 +97,57 @@ impl DnamHostHandle {
         self.process_block_in_place_chunked(left_io, right_io, None);
     }
 
+    /// Processes a stereo audio block (`Stereo -> Stereo`), matching `process_block`.
+    #[inline]
+    pub fn process_stereo(
+        &self,
+        left_in: &[f32],
+        right_in: &[f32],
+        left_out: &mut [f32],
+        right_out: &mut [f32],
+    ) {
+        self.process_block(left_in, right_in, left_out, right_out);
+    }
+
+    /// Processes a stereo audio buffer into mono (`Stereo -> Mono`), draining SPSC control updates
+    /// and publishing wait-free Seqlock telemetry at every sub-block boundary.
+    pub fn process_stereo_to_mono_chunked(
+        &self,
+        left_in: &[f32],
+        right_in: &[f32],
+        mono_out: &mut [f32],
+        block_size: Option<usize>,
+    ) {
+        let total = left_in.len().min(right_in.len()).min(mono_out.len());
+        let step = block_size
+            .unwrap_or(DEFAULT_HOST_SUBBLOCK_FRAMES)
+            .max(1)
+            .min(total.max(1));
+        let mut audio_ctx = self.audio.lock();
+        if total == 0 {
+            audio_ctx.drain_and_publish();
+            return;
+        }
+        let mut offset = 0_usize;
+        while offset < total {
+            let end = (offset + step).min(total);
+            audio_ctx.poll_and_drain();
+            audio_ctx.swap_audio.engine_mut().process_stereo_to_mono(
+                &left_in[offset..end],
+                &right_in[offset..end],
+                &mut mono_out[offset..end],
+            );
+            audio_ctx.publish_telemetry();
+            offset = end;
+        }
+    }
+
+    /// Processes a stereo audio block into mono (`Stereo -> Mono`).
+    #[inline]
+    pub fn process_stereo_to_mono(&self, left_in: &[f32], right_in: &[f32], mono_out: &mut [f32]) {
+        self.process_stereo_to_mono_chunked(left_in, right_in, mono_out, None);
+    }
+
     /// Processes a mono audio buffer into true stereo (`Mono -> Stereo`), draining SPSC control
     /// updates and publishing telemetry at every sub-block boundary.
     pub fn process_mono_to_stereo_chunked(
@@ -232,7 +283,7 @@ impl DnamHostHandle {
         let mut non_bounce_zoh = if prev_bounce {
             let (r_ac_tr, r_dc_tr, tau_ref_tr, switch_xfade_tr) =
                 audio_ctx.swap_audio.engine().training_zoh_poles();
-            ZohRescaledParams::compute_oversampled(
+            ZohRescaledParams::compute_oversampled_opt(
                 audio_ctx
                     .swap_audio
                     .engine()

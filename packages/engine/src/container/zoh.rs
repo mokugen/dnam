@@ -1,10 +1,11 @@
 //! Continuous-Time Zero-Order Hold (ZOH) Sample-Rate Adaptability ($44.1\text{--}96\text{ kHz}$).
 
+use crate::math::newton6_reciprocal_f64;
 use crate::schema::{DnamError, cold_pow_f64, cold_sqrt_f64};
 
 /// Rescaled discrete-time parameters for a host sample rate $f_{s,\text{host}} \in [44100, 192000]\text{ Hz}$
-/// per [`docs/dsp/router_and_stages_topology.md` §9](../../../../docs/dsp/router_and_stages_topology.md#9-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-44196-khz--cl-20-4-bounce)
-/// and [`docs/containers/dnam_binary_format.md` §4](../../../../docs/containers/dnam_binary_format.md#4-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-44196-khz--cl-20-4-bounce).
+/// per [`docs/specs/dsp/router_and_stages_topology.md` §9](../../../../docs/specs/dsp/router_and_stages_topology.md#9-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-441192-khz--4-bounce)
+/// and [`docs/specs/containers/dnam_binary_format.md` §4](../../../../docs/specs/containers/dnam_binary_format.md#4-training-sample-rate-anchoring--continuous-time-zoh-cross-reference).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ZohRescaledParams {
     /// Host sample rate $f_{s,\text{host}}$ in Hz.
@@ -30,10 +31,11 @@ pub struct ZohRescaledParams {
 }
 
 impl ZohRescaledParams {
-    /// Convenience constructor with default DNAM training anchors (`r_ac=0.9993`, `r_dc=0.995`, `tau_ref=64.0`, `xfade=128`).
+    /// Convenience constructor accepting effective core sample rates in `44,100..=384,000 Hz`
+    /// with default DNAM training anchors (`r_ac=0.9993`, `r_dc=0.995`, `tau_ref=64.0`, `xfade=128`).
     #[inline]
-    pub fn new(fs_train_hz: u32, fs_host_hz: u32) -> Self {
-        Self::compute_oversampled_opt(fs_train_hz, fs_host_hz, 1, 0.9993, 0.995, 64.0, 128)
+    pub fn new(fs_train_hz: u32, fs_eff_hz: u32) -> Self {
+        Self::compute_effective_opt(fs_train_hz, fs_eff_hz, 1, 0.9993, 0.995, 64.0, 128, 384_000)
             .unwrap_or(Self {
                 sample_rate_host_hz: fs_train_hz,
                 rho_sr: 1.0,
@@ -70,7 +72,11 @@ impl ZohRescaledParams {
 
     /// Allocation-free `Option` core so real-time callers never emit `DnamError` `Drop` glue.
     #[inline]
-    fn compute_oversampled_opt(
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Allocation-free internal ZOH parameter kernel parameterized by effective rate ceiling"
+    )]
+    fn compute_effective_opt(
         fs_train_hz: u32,
         fs_host_hz: u32,
         oversample_factor: u32,
@@ -78,15 +84,19 @@ impl ZohRescaledParams {
         r_dc_train: f32,
         tau_ref_train: f32,
         xfade_train: u32,
+        max_host_hz: u32,
     ) -> Option<Self> {
-        if !(44_100..=192_000).contains(&fs_host_hz) || !matches!(oversample_factor, 1 | 2 | 4) {
+        const INV_3000: f64 = 1.0 / 3000.0;
+        if !(44_100..=max_host_hz).contains(&fs_host_hz) || !matches!(oversample_factor, 1 | 2 | 4)
+        {
             return None;
         }
         let fs_train = fs_train_hz as f64;
-        let k_ctrl_train = (((fs_train / 3000.0) + 0.5) as usize).max(8);
+        let k_ctrl_train = (((fs_train * INV_3000) + 0.5) as usize).max(8);
+        let inv_k_ctrl_train = newton6_reciprocal_f64(k_ctrl_train as f64);
         let fs_eff_hz = fs_host_hz * oversample_factor;
         if fs_eff_hz == fs_train_hz {
-            let alpha_ramp_host = (1.0 / (k_ctrl_train as f64)) as f32;
+            let alpha_ramp_host = inv_k_ctrl_train as f32;
             return Some(Self {
                 sample_rate_host_hz: fs_host_hz,
                 rho_sr: 1.0,
@@ -101,17 +111,20 @@ impl ZohRescaledParams {
         }
 
         let fs_eff = fs_eff_hz as f64;
-        let rho_sr = fs_train / fs_eff;
+        let inv_fs_eff = newton6_reciprocal_f64(fs_eff);
+        let inv_fs_train = newton6_reciprocal_f64(fs_train);
+        let rho_sr = fs_train * inv_fs_eff;
+        let inv_rho_sr = fs_eff * inv_fs_train;
 
-        let k_host_raw = ((fs_eff / 3000.0) + 0.5) as usize;
+        let k_host_raw = ((fs_eff * INV_3000) + 0.5) as usize;
         let k_host = k_host_raw.max(8);
-        let rho_ctrl = (fs_train * (k_host as f64)) / (fs_eff * (k_ctrl_train as f64));
-        let alpha_ramp_host = (1.0 / (k_host as f64)) as f32;
+        let rho_ctrl = (fs_train * (k_host as f64)) * (inv_fs_eff * inv_k_ctrl_train);
+        let alpha_ramp_host = newton6_reciprocal_f64(k_host as f64) as f32;
 
         let r_ac_host = cold_pow_f64(r_ac_train as f64, rho_sr) as f32;
         let r_dc_host = cold_pow_f64(r_dc_train as f64, rho_sr) as f32;
-        let tau_ref_samples_host = ((tau_ref_train as f64) / rho_sr) as f32;
-        let switch_xfade_samples_host = (((xfade_train as f64) / rho_sr) + 0.5) as u32;
+        let tau_ref_samples_host = ((tau_ref_train as f64) * inv_rho_sr) as f32;
+        let switch_xfade_samples_host = (((xfade_train as f64) * inv_rho_sr) + 0.5) as u32;
 
         Some(Self {
             sample_rate_host_hz: fs_host_hz,
@@ -124,6 +137,31 @@ impl ZohRescaledParams {
             tau_ref_samples_host,
             switch_xfade_samples_host: switch_xfade_samples_host.max(16),
         })
+    }
+
+    /// Computes the closed-form ZOH rescaled parameters for an internal oversampling rate
+    /// $f_{s,\text{internal}} = \text{oversample\_factor} \times f_{s,\text{host}}$
+    /// (`oversample_factor` $\in \{1, 2, 4\}$) without heap error allocation.
+    #[inline]
+    pub(crate) fn compute_oversampled_opt(
+        fs_train_hz: u32,
+        fs_host_hz: u32,
+        oversample_factor: u32,
+        r_ac_train: f32,
+        r_dc_train: f32,
+        tau_ref_train: f32,
+        xfade_train: u32,
+    ) -> Option<Self> {
+        Self::compute_effective_opt(
+            fs_train_hz,
+            fs_host_hz,
+            oversample_factor,
+            r_ac_train,
+            r_dc_train,
+            tau_ref_train,
+            xfade_train,
+            192_000,
+        )
     }
 
     /// Computes the closed-form ZOH rescaled parameters for an internal oversampling rate
@@ -153,7 +191,7 @@ impl ZohRescaledParams {
     /// Rescales an Op-M modal pole radius $r_c$, angle $\theta_{0,c}$, and $\mathcal{H}_2$-norm
     /// input normalizer $b_{\gamma,c}$ under ZOH (`ref[dsp.zoh.op-m-poles]`).
     ///
-    /// Per canonical TORA specification, pole radii are clamped to `[0.25, 0.9995]` *prior* to
+    /// Per canonical `SONA` specification, pole radii are clamped to `[0.25, 0.9995]` *prior* to
     /// exponentiation by $\rho_{\text{sr}}$ so that physical decay time $T_{60}$ is 100% invariant
     /// across $44.1 / 48 / 88.2 / 96 / 192\text{ kHz}$.
     #[inline]
@@ -180,7 +218,8 @@ impl ZohRescaledParams {
         let r_bar_host = 0.5 * ((r_low_host + r_high_host) as f64);
         let norm_train = cold_sqrt_f64((1.0 - r_bar_train * r_bar_train).max(1e-7));
         let norm_host = cold_sqrt_f64((1.0 - r_bar_host * r_bar_host).max(1e-7));
-        let b_gamma_host = ((b_gamma_train as f64) * (norm_host / norm_train)) as f32;
+        let b_gamma_host =
+            ((b_gamma_train as f64) * (norm_host * newton6_reciprocal_f64(norm_train))) as f32;
 
         (r_low_host, dr_span_host, theta_host, b_gamma_host)
     }
@@ -200,13 +239,13 @@ impl ZohRescaledParams {
     /// $\delta_{\text{host}} = \delta_{\text{train}} / \rho_{\text{sr}}$.
     #[inline]
     pub fn rescale_alignment_delay(&self, delay_train: f32) -> f32 {
-        ((delay_train as f64) / self.rho_sr) as f32
+        ((delay_train as f64) * newton6_reciprocal_f64(self.rho_sr.max(1e-9))) as f32
     }
 
     /// Returns the 2D quadrature hysteresis differential rate factor $\rho_{\text{sr}}^{-1}$.
     #[inline]
     pub fn hysteresis_diff_scale(&self) -> f32 {
-        (1.0 / self.rho_sr) as f32
+        newton6_reciprocal_f64(self.rho_sr.max(1e-9)) as f32
     }
 
     /// Returns the Family 5 ZOH bitcrusher phase-step scaling factor $\rho_{\text{sr}}$.
@@ -220,13 +259,12 @@ impl ZohRescaledParams {
     #[inline]
     pub fn effective_sample_rate_hz(&self) -> f64 {
         let host = (self.sample_rate_host_hz as f64).max(1.0);
-        let approx_os = ((self.control_decimation_host as f64) * 3000.0 / host).round();
-        let os_factor = if (approx_os - 4.0).abs() < 0.5 {
-            4.0
-        } else if (approx_os - 2.0).abs() < 0.5 {
-            2.0
-        } else {
-            1.0
+        let os_ratio =
+            (self.control_decimation_host as f64) * 3000.0 * newton6_reciprocal_f64(host);
+        let os_factor = match (os_ratio + 0.5) as u32 {
+            4 => 4.0,
+            2 => 2.0,
+            _ => 1.0,
         };
         host * os_factor
     }
@@ -234,14 +272,17 @@ impl ZohRescaledParams {
     /// Rescales an Op-T base delay $\tau_{0,m}^{\text{samples}}$ and integer Schroeder all-pass delay $D_{\text{ap},m}$ (`ref[dsp.zoh.op-t-delays]`).
     #[inline]
     pub fn rescale_op_t_delays(&self, tau0_samples_train: f32, d_ap_train: f32) -> (f32, usize) {
+        use crate::stages::stage4_tank::v3_fdn::STAGE4_SCHROEDER_MAX_DELAY;
         if (self.rho_sr - 1.0).abs() < 1e-12 {
             return (
                 tau0_samples_train.max(4.0),
-                (d_ap_train as usize).clamp(4, 255),
+                (d_ap_train as usize).clamp(4, STAGE4_SCHROEDER_MAX_DELAY),
             );
         }
-        let tau0_host = (((tau0_samples_train as f64) / self.rho_sr) as f32).max(4.0);
-        let d_ap_host = ((((d_ap_train as f64) / self.rho_sr) + 0.5) as usize).clamp(4, 255);
+        let inv_rho = newton6_reciprocal_f64(self.rho_sr.max(1e-9));
+        let tau0_host = (((tau0_samples_train as f64) * inv_rho) as f32).max(4.0);
+        let d_ap_host =
+            ((((d_ap_train as f64) * inv_rho) + 0.5) as usize).clamp(4, STAGE4_SCHROEDER_MAX_DELAY);
         (tau0_host, d_ap_host)
     }
 
@@ -266,7 +307,8 @@ impl ZohRescaledParams {
         let mut sum_out = 0.0_f64;
         for (n, out) in out_taps.iter_mut().enumerate() {
             let u = (n as f64) * self.rho_sr;
-            let i = u.floor() as isize;
+            let trunc = u as isize;
+            let i = if (trunc as f64) > u { trunc - 1 } else { trunc };
             let alpha = (u - (i as f64)) as f32;
             let a2 = alpha * alpha;
             let a3 = a2 * alpha;
@@ -290,7 +332,8 @@ impl ZohRescaledParams {
 
         // DC-preserving normalization
         if sum_out.abs() > 1e-9 && sum_in.abs() > 1e-9 {
-            let gain = (sum_in / sum_out) as f32;
+            let inv_abs = newton6_reciprocal_f64(sum_out.abs());
+            let gain = (sum_in * sum_out.signum() * inv_abs) as f32;
             for out in out_taps.iter_mut() {
                 *out *= gain;
             }
@@ -437,7 +480,11 @@ mod tests {
 
             let (tau_h, dap_h) = zoh.rescale_op_t_delays(64.0, 19.0);
             prop_assert!(tau_h >= 4.0);
-            prop_assert!((4..=255).contains(&dap_h));
+            prop_assert!((4..=crate::stages::stage4_tank::v3_fdn::STAGE4_SCHROEDER_MAX_DELAY).contains(&dap_h));
+
+            let oversampled = ZohRescaledParams::new(48_000, 192_000);
+            let (_, large_dap) = oversampled.rescale_op_t_delays(64.0, 223.0);
+            prop_assert!(large_dap > 255 && large_dap <= 16_384);
         }
     }
 }

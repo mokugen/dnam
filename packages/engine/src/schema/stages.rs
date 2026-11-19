@@ -1,4 +1,4 @@
-//! TORA Stage and subsystem configurations (`schema/stages.rs`).
+//! SONA Stage and subsystem configurations (`schema/stages.rs`).
 //!
 //! Canonical Reference: `docs/specs/dsp/parametric_control_bus.md` and `docs/specs/architecture/sona_architecture.md`.
 
@@ -92,73 +92,8 @@ impl Default for RouterConfig {
     }
 }
 
-pub const fn default_true() -> bool {
-    true
-}
-pub const fn default_gate_threshold_db() -> f32 {
-    -60.0
-}
-
-/// Stage I Pre-Dynamics and Tone Shaping configuration (`stage1_pre_fx`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Stage1PreFxConfig {
-    /// 4-bit topology selector (`0..=3`).
-    #[serde(default)]
-    pub topology_selector: u8,
-    /// Whether noise gate is active (`true`).
-    #[serde(default = "default_true")]
-    pub noise_gate_enabled: bool,
-    /// Noise gate threshold in dBFS (`-60.0`).
-    #[serde(default = "default_gate_threshold_db")]
-    pub gate_threshold_db: f32,
-}
-
-impl Default for Stage1PreFxConfig {
-    fn default() -> Self {
-        Self {
-            topology_selector: 0,
-            noise_gate_enabled: true,
-            gate_threshold_db: -60.0,
-        }
-    }
-}
-
-pub const fn default_cascade_stages() -> u8 {
-    3
-}
-pub fn default_adaa_mode() -> String {
-    "1x_bspline_algebraic".to_string()
-}
-pub const fn default_ac_pole() -> f32 {
-    0.9993
-}
-
-/// Stage II Commuted Cascade configuration (`stage2_cascade`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct Stage2CascadeConfig {
-    /// Number of cascaded non-linear stages (`3`).
-    #[serde(default = "default_cascade_stages")]
-    pub num_stages: u8,
-    /// Anti-aliasing mode (`"1x_bspline_algebraic"`).
-    #[serde(default = "default_adaa_mode")]
-    pub adaa_mode: String,
-    /// $5\text{ Hz}$ AC-coupling pole at $f_{s,\text{train}}$ (`0.9993`).
-    #[serde(default = "default_ac_pole")]
-    pub ac_coupling_pole: f32,
-}
-
-impl Default for Stage2CascadeConfig {
-    fn default() -> Self {
-        Self {
-            num_stages: 3,
-            adaa_mode: default_adaa_mode(),
-            ac_coupling_pole: 0.9993,
-        }
-    }
-}
-
 pub const fn default_fir_taps() -> u8 {
-    16
+    32
 }
 pub const fn default_kautz_modals() -> u8 {
     8
@@ -167,10 +102,10 @@ pub const fn default_kautz_modals() -> u8 {
 /// Stage III Cabinet Early FIR + Orthonormal Kautz Modal Bank configuration (`stage3_cabinet_kautz`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Stage3CabinetKautzConfig {
-    /// Number of direct early FIR taps (`16`).
+    /// Number of direct early FIR taps per channel (`32, 48, 96, 128`).
     #[serde(default = "default_fir_taps")]
     pub fir_taps: u8,
-    /// Number of Kautz modal sections (`4, 8, 16, 32`).
+    /// Number of shared Kautz modal pole pairs (`8, 12, 24, 32`).
     #[serde(default = "default_kautz_modals")]
     pub kautz_modals: u8,
 }
@@ -178,8 +113,8 @@ pub struct Stage3CabinetKautzConfig {
 impl Default for Stage3CabinetKautzConfig {
     fn default() -> Self {
         Self {
-            fir_taps: 16,
-            kautz_modals: 8,
+            fir_taps: default_fir_taps(),
+            kautz_modals: default_kautz_modals(),
         }
     }
 }
@@ -241,7 +176,7 @@ pub struct Stage4SpatialTankConfig {
     /// Raised-cosine switch crossfade window in samples (`128` at $48\text{ kHz}$).
     #[serde(default = "default_switch_xfade")]
     pub switch_xfade_samples: u16,
-    /// Coprime Schroeder all-pass delay lengths in samples (`16` lines across `Lite`/`Full`/`Pro`/`Ultra`).
+    /// Coprime Schroeder all-pass delay lengths in samples (`4..16` tank lines across `Lite`/`Full`/`Pro`/`Ultra`).
     #[serde(
         default = "default_allpass_delays",
         deserialize_with = "deserialize_allpass_delays"
@@ -283,16 +218,8 @@ mod tests {
         assert_eq!(router.input_ports, 4);
         assert_eq!(router.sub_crossover_hz, 200.0);
 
-        let stage1 = Stage1PreFxConfig::default();
-        assert!(stage1.noise_gate_enabled);
-        assert_eq!(stage1.gate_threshold_db, -60.0);
-
-        let stage2 = Stage2CascadeConfig::default();
-        assert_eq!(stage2.num_stages, 3);
-        assert_eq!(stage2.ac_coupling_pole, 0.9993);
-
         let stage3 = Stage3CabinetKautzConfig::default();
-        assert_eq!(stage3.fir_taps, 16);
+        assert_eq!(stage3.fir_taps, 32);
         assert_eq!(stage3.kautz_modals, 8);
 
         let stage4 = Stage4SpatialTankConfig::default();

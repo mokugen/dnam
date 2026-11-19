@@ -29,6 +29,7 @@ hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu"]
 hotpath-cloud = ["hotpath", "hotpath/hotpath-cloud"]
 
 [dependencies]
+dnam-kernels.workspace = true
 serde = { workspace = true, default-features = false, features = ["alloc", "derive"] }
 serde_json = { workspace = true, default-features = false, features = ["alloc"] }
 zeroize = { workspace = true, default-features = false, features = ["alloc", "derive"] }

@@ -24,10 +24,10 @@ pub use error::{
     DnamError, SchemaOptionExt, cold_exp_f64, cold_ln_f64, cold_pow_f64, cold_sqrt_f64, reject_if,
 };
 pub use header::{
-    BlendMode, ControlBusConfig, DnamJsonHeader, IoConfig, LevelingConfig, LevelingMetric,
-    ModelCapabilities, ModelMetadata, RouterConfig, SchemaVersion, SlimmableTiersConfig,
-    Stage1PreFxConfig, Stage2CascadeConfig, Stage3CabinetKautzConfig, Stage4SpatialTankConfig,
-    TensorSliceEntry, TierProfile, check_no_unknown_header_keys,
+    BlendMode, ControlBusConfig, DelayHistoryEntry, DnamJsonHeader, IoConfig, LevelingConfig,
+    LevelingMetric, ModelCapabilities, ModelMetadata, RouterConfig, SchemaVersion,
+    SlimmableTiersConfig, Stage3CabinetKautzConfig, Stage4SpatialTankConfig, TensorSliceEntry,
+    TierProfile, check_no_unknown_header_keys,
 };
 pub use signatures::{
     AuthorizedDevice, CreatorSignature, DatasetProvenance, DistributionPolicy,

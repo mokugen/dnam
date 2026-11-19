@@ -13,7 +13,10 @@ pub use tick::*;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 
+use zerocopy::FromBytes;
+
 use crate::math::{MathBackend, flush_recursive_state_f32};
+use crate::stages::weights::{ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET, Arena0ControlBusWire};
 
 use super::descriptor::ControlClampDescriptor;
 use super::plane::MAX_EXACT_CONTRIBUTORS;
@@ -74,6 +77,9 @@ pub struct ControlBus<B: MathBackend> {
     pub z_stage_ultra: [f32; 4],
     /// Gauge-invariant leading 4-D control basis coordinates $\mathbf{x}_{\text{basis},0..4} \in \mathbb{R}^4$ for stage/tank dispatch.
     pub ctrl_basis_4: [f32; 4],
+    /// Unrotated concatenated stage-latent vector `[ctrl_basis_4[0..4], z_stage_ultra[0..4]]`
+    /// (`8-D`, consumed directly by `stage_latent_*` without `SO(4)` rotation).
+    pub z_stage: [f32; 8],
     /// Current 3-band envelope follower states $\mathbf{e}[k] \in \mathbb{R}^3$ (`Low`, `Mid`, `High`) + pad.
     pub env_states: [f32; 4],
     /// Envelope 1-pole smoothing poles $R_{\text{env},b}$ at host control rate.
@@ -130,6 +136,8 @@ pub struct ControlBus<B: MathBackend> {
     pub ou_drift_state: [f32; 4],
     /// Non-colliding unified `16 x 16` + Ultra `16 x 4` `W_ctrl` mode (`PIPE_FLAG_UNIFIED_W_CTRL`).
     pub unified_w_ctrl: bool,
+    /// Whether `Tier::Ultra` (`Arena 3`) control extensions are active (`r[dsp.head.tier-equivalence]`).
+    pub ultra_tier_active: bool,
     _backend: PhantomData<B>,
 }
 
@@ -138,6 +146,7 @@ impl<B: MathBackend> ControlBus<B> {
 
     /// Creates a new [`ControlBus`] initialized at the default preset (`z_head = [0.0; 4]`, `is_dirty = false`).
     pub fn new() -> Self {
+        crate::math::warm_simd_feature_caches();
         Self {
             latent_acc: LatentAccumulator64B::new(),
             s_vx_ultra: [0.0; 4],
@@ -161,6 +170,7 @@ impl<B: MathBackend> ControlBus<B> {
             z_head_ultra: [0.0; 4],
             z_stage_ultra: [0.0; 4],
             ctrl_basis_4: [0.0; 4],
+            z_stage: [0.0; 8],
             env_states: [0.0; 4],
             env_poles: [0.985, 0.960, 0.910, 0.0],
             lfo_phasors: [[1.0, 0.0], [1.0, 0.0]],
@@ -191,6 +201,7 @@ impl<B: MathBackend> ControlBus<B> {
             drift_prng_state: Self::DEFAULT_DRIFT_PRNG_SEED,
             ou_drift_state: [0.0; 4],
             unified_w_ctrl: false,
+            ultra_tier_active: true,
             _backend: PhantomData,
         }
     }
@@ -292,9 +303,9 @@ impl<B: MathBackend> ControlBus<B> {
         out
     }
 
-    /// Loads the embedded [`ControlClampDescriptor`] table (`CL 16..23`, `bytes[8512..9024]`),
-    /// inline `CP1` contributor slots (`Arena 0 [7,680..8,512]` and `Arena 3 [61,312..63,424]`), and
-    /// global LFO/Envelope/Trust-Region anchors from `Arena 0..3` and snaps all controls to their `default_val`.
+    /// Loads the embedded Control-Bus global header (`Arena 0 [2,688..2,752]`),
+    /// inline `CP1` contributor slots (`Arena 0 [2,880..3,456]` and `Arena 3 [27,520..29,632]`),
+    /// and global LFO/Envelope/Trust-Region anchors from `Arena 0..3`, snapping controls to `default_val`.
     pub fn load_from_arena0(&mut self, arena0_bytes: &[u8], num_controls: usize, rho_ctrl: f64) {
         self.unified_w_ctrl = crate::stages::weights::has_pipeline_flag(
             arena0_bytes,
@@ -329,20 +340,17 @@ impl<B: MathBackend> ControlBus<B> {
     }
 
     /// Updates sample-rate-dependent LFO phasor increments and envelope follower poles from `Arena 0`
-    /// (`CL 47` at `3,008..3,072` and `ARENA0_RHO_HEAD_OFFSET` at `4,544..4,608`) without resetting user control values.
+    /// (`ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET..+64` at `2,688..2,752` and `ARENA0_RHO_HEAD_OFFSET` at
+    /// `4,480..4,544`) without resetting user control values.
     pub fn update_sample_rate_params(&mut self, arena0_bytes: &[u8], rho_ctrl: f64) {
         self.anti_zipper_pole =
             crate::schema::cold_pow_f64(DEFAULT_ANTI_ZIPPER_POLE as f64, rho_ctrl) as f32;
-        let global_base = crate::stages::weights::ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET;
-        if arena0_bytes.len() >= global_base + 64 {
+        let Some(arena0_tail) = arena0_bytes.get(ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET..) else {
+            return;
+        };
+        if let Ok((a0, _)) = Arena0ControlBusWire::ref_from_prefix(arena0_tail) {
             for j in 0..2 {
-                let dphi_off = global_base + j * 4;
-                let dphi_train = f32::from_le_bytes([
-                    arena0_bytes[dphi_off],
-                    arena0_bytes[dphi_off + 1],
-                    arena0_bytes[dphi_off + 2],
-                    arena0_bytes[dphi_off + 3],
-                ]);
+                let dphi_train = a0.lfo_dphi_train[j].get();
                 let dphi_host = ((dphi_train as f64) * rho_ctrl)
                     .clamp(0.0, core::f64::consts::PI * 0.25)
                     as f32;
@@ -354,23 +362,13 @@ impl<B: MathBackend> ControlBus<B> {
                 self.lfo_cached_q192_inc[j] =
                     crate::math::q0_192_phase_increment_from_f32_bits(angle_bits);
             }
-            let sigma_raw = f32::from_le_bytes([
-                arena0_bytes[global_base + 8],
-                arena0_bytes[global_base + 9],
-                arena0_bytes[global_base + 10],
-                arena0_bytes[global_base + 11],
-            ]);
+            let sigma_raw = a0.sigma_drift.get();
             self.sigma_drift = if sigma_raw.is_finite() && sigma_raw > 0.0 {
                 sigma_raw.clamp(0.0, 0.05)
             } else {
                 0.0
             };
-            let rho_drift_raw = f32::from_le_bytes([
-                arena0_bytes[global_base + 12],
-                arena0_bytes[global_base + 13],
-                arena0_bytes[global_base + 14],
-                arena0_bytes[global_base + 15],
-            ]);
+            let rho_drift_raw = a0.rho_drift_train.get();
             self.rho_drift_train = if rho_drift_raw.is_finite() && rho_drift_raw > 0.0 {
                 rho_drift_raw.clamp(0.0, 0.9999)
             } else {
@@ -379,50 +377,24 @@ impl<B: MathBackend> ControlBus<B> {
             self.rho_drift_host =
                 crate::schema::cold_pow_f64(self.rho_drift_train as f64, rho_ctrl) as f32;
             for b in 0..3 {
-                let r_off = global_base + (4 + b) * 4;
-                let r_train = f32::from_le_bytes([
-                    arena0_bytes[r_off],
-                    arena0_bytes[r_off + 1],
-                    arena0_bytes[r_off + 2],
-                    arena0_bytes[r_off + 3],
-                ]);
+                let r_train = a0.env_poles[b].get();
                 if r_train > 0.0 && r_train < 1.0 {
                     self.env_poles[b] =
                         crate::schema::cold_pow_f64(r_train as f64, rho_ctrl) as f32;
                 }
             }
-            let dither_raw = f32::from_le_bytes([
-                arena0_bytes[global_base + 28],
-                arena0_bytes[global_base + 29],
-                arena0_bytes[global_base + 30],
-                arena0_bytes[global_base + 31],
-            ]);
+            let dither_raw = a0.dither_snr_scale.get();
             self.dither_snr_scale = if dither_raw.is_finite() && dither_raw > 0.0 {
                 dither_raw.clamp(0.0, 0.005_623_413_3)
             } else {
                 0.0
             };
-            let mh_off = global_base + 32;
-            let rho_head_off = crate::stages::weights::ARENA0_RHO_HEAD_OFFSET;
-            let mh_from_table = if arena0_bytes.len() >= rho_head_off + 4 {
-                f32::from_le_bytes([
-                    arena0_bytes[rho_head_off],
-                    arena0_bytes[rho_head_off + 1],
-                    arena0_bytes[rho_head_off + 2],
-                    arena0_bytes[rho_head_off + 3],
-                ])
+            let mh_primary = a0.trust_radius_mh.get();
+            let mh_mirror = a0.rho_head_and_ctrl_tail[0].get();
+            let mh_val = if (0.5..=10.0).contains(&mh_primary) {
+                mh_primary
             } else {
-                0.0
-            };
-            let mh_val = if (0.5..=10.0).contains(&mh_from_table) {
-                mh_from_table
-            } else {
-                f32::from_le_bytes([
-                    arena0_bytes[mh_off],
-                    arena0_bytes[mh_off + 1],
-                    arena0_bytes[mh_off + 2],
-                    arena0_bytes[mh_off + 3],
-                ])
+                mh_mirror
             };
             if (0.5..=10.0).contains(&mh_val) {
                 self.trust_radius_mh = mh_val;
@@ -469,6 +441,8 @@ impl<B: MathBackend> ControlBus<B> {
         self.z_head = [0.0; 4];
         self.z_head_ultra = [0.0; 4];
         self.ctrl_basis_4 = [0.0; 4];
+        self.z_stage_ultra = [0.0; 4];
+        self.z_stage = [0.0; 8];
         self.stage_targets = [0.0; 16];
         self.tank_delay_mod_samples = [0.0; 8];
         self.tank_gain_targets = [0.0; 8];
@@ -519,8 +493,8 @@ impl<B: MathBackend> ControlBus<B> {
                 }
                 self.target_u_norm[p] = u_norm;
                 self.current_u_norm[p] = flush_recursive_state_f32(u_norm);
-                if was_clamped && p < 16 {
-                    clamp_mask |= 1_u16 << p;
+                if was_clamped {
+                    clamp_mask |= 1_u16 << p.min(15);
                 }
             }
         }
@@ -537,8 +511,8 @@ impl<B: MathBackend> ControlBus<B> {
                 } else if (self.current_u_norm[p] - u_norm).abs() > ANTI_ZIPPER_SNAP_EPS {
                     self.is_dirty = true;
                 }
-                if was_clamped && p < 16 {
-                    clamp_mask |= 1_u16 << p;
+                if was_clamped {
+                    clamp_mask |= 1_u16 << p.min(15);
                 }
             }
         }
@@ -559,13 +533,17 @@ mod tests {
     use crate::control::ConditionalClampRule;
     use crate::math::{DefaultMathBackend, ScalarBackend};
     use alloc::vec;
+    use zerocopy::byteorder::little_endian::F32;
 
     #[test]
     fn test_control_bus_tick_lfo_fallback_and_micro_ramps() {
         let _ftz = FtzDazGuard::new();
         let mut arena = vec![0u8; crate::stages::weights::ARENA_ULTRA_BYTES];
-        for off in (3_072..3_520).step_by(4) {
-            arena[off..off + 4].copy_from_slice(&0.15_f32.to_le_bytes());
+        for off in (crate::stages::weights::ARENA0_UINT_BASE_OFFSET
+            ..crate::stages::weights::ARENA0_CP1_BASE_END)
+            .step_by(4)
+        {
+            arena[off..off + 4].copy_from_slice(zerocopy::IntoBytes::as_bytes(&F32::new(0.15)));
         }
 
         let mut bus = ControlBus::<ScalarBackend>::default();
@@ -630,7 +608,14 @@ mod tests {
         let d12 =
             ControlBus::<DefaultMathBackend>::compute_micro_ramp_deltas_12(&q16, &[0.3; 16], 0.25);
         let mut theta_audio = q16;
-        ControlBus::<DefaultMathBackend>::step_micro_ramp(&mut theta_audio, &d16);
+        let theta_next = [0.3; 16];
+        ControlBus::<DefaultMathBackend>::step_micro_ramp(
+            &mut theta_audio,
+            &d16,
+            &q16,
+            &theta_next,
+            false,
+        );
         ControlBus::<DefaultMathBackend>::step_micro_ramp_12(&mut theta_audio, &d12);
         ControlBus::<DefaultMathBackend>::step_micro_ramp_16(&mut theta_audio, &d16);
         let mut vec4 = [3.0_f32, 4.0, 0.0, 0.0];

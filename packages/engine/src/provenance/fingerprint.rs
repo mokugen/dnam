@@ -1,19 +1,27 @@
 //! 224-D gauge-invariant structural fingerprinting and cosine similarity.
 //!
-//! Canonical Reference: `docs/security/watermarking_and_marketplace.md`.
+//! Canonical Reference: `docs/specs/security/watermarking_and_marketplace.md`.
+
+use core::mem::offset_of;
+
+use dnam_kernels::fp16_to_f32;
+use zerocopy::FromBytes;
+use zerocopy::byteorder::little_endian::U16;
 
 use crate::schema::DnamError;
-
-use super::watermark::{
-    STAGE3_KAUTZ_BLOCKS_PER_TIER, kautz_soa_byte_offset, max_tiers_for_arena_len, read_f32_le,
+use crate::stages::weights::{
+    ARENA_LITE_BYTES, KautzSoaBlockWire, STAGE3_KAUTZ_BLOCKS_PER_TIER, STAGE4_DELAY_BASES,
+    Stage4QuadWire, VARPRO_READOUT_BASES, VarProReadoutFullWire, VarProReadoutLiteWire,
+    VarProReadoutProWire, VarProReadoutUltraWire,
 };
+
+use super::watermark::{kautz_soa_byte_offset, max_tiers_for_arena_len};
 use super::{STRUCTURAL_HASH_DIM, STRUCTURAL_HASH_TIER_DIM};
 
 #[inline]
 pub(crate) fn quantize_pole_angle_1e2(theta: f64) -> f64 {
-    let scaled = theta * 100.0;
-    let rounded = (scaled + if scaled >= 0.0 { 0.5 } else { -0.5 }) as i64;
-    (rounded as f64) * 0.01
+    // Aligns 1:1 with the `10^-2 rad` `[0.2, 0.8]` floor-cell guard band in `phase.rs` (`ref[sec.watermark.seed-derivation]`).
+    crate::math::floor_f64(theta * 100.0) * 0.01
 }
 
 /// Extracts the 224-dimensional prefix-composable gauge-invariant structural hash vector $\mathbf{f}_{\text{struct}} \in \mathbb{R}^{224}$.
@@ -23,37 +31,45 @@ pub(crate) fn quantize_pole_angle_1e2(theta: f64) -> f64 {
 /// - `[16..32]`: gauge-invariant real products $I_{\text{real},b,c} = b_{\gamma,b,c} \cdot (c_{\text{real},L,b,c} + c_{\text{real},R,b,c})$,
 /// - `[32..48]`: gauge-invariant imaginary products $I_{\text{imag},b,c} = b_{\gamma,b,c} \cdot (c_{\text{imag},L,b,c} + c_{\text{imag},R,b,c})$,
 /// - `[48..52]`: 4 Stage IV Spatial Tank delay invariants for tier $t$,
-/// - `[52..56]`: 4 base stereo output head $\mathbf{W}_{\text{head},0}$ block energy invariants for tier $t$.
+/// - `[52..56]`: 4 `VarPro` linear `fp16` `W_readout` energy invariants for tier $t$ (invariant under `sona_gauge` & `isometric_gauge`).
 ///
 /// Any stripped higher tier remains zero-filled, enabling exact prefix cosine similarity across tier-stripped containers.
 pub fn extract_structural_hash_224d(arena: &[u8]) -> Result<[f64; STRUCTURAL_HASH_DIM], DnamError> {
     let max_tiers = max_tiers_for_arena_len(arena.len());
     if max_tiers == 0 {
         return Err(DnamError::BufferTooSmall {
-            expected: 4_608,
+            expected: ARENA_LITE_BYTES,
             actual: arena.len(),
         });
     }
     let mut vec224 = [0.0_f64; STRUCTURAL_HASH_DIM];
-    let readout_bases = [2_688_usize, 6_144_usize, 15_168_usize, 20_608_usize];
-    let readout_seg_floats = [20_usize, 24, 28, 32];
+
+    const W_RO_OFFSETS: [usize; 4] = [
+        VARPRO_READOUT_BASES[0] + offset_of!(VarProReadoutLiteWire, w_ro_fp16),
+        VARPRO_READOUT_BASES[1] + offset_of!(VarProReadoutFullWire, w_ro_and_mods_fp16),
+        VARPRO_READOUT_BASES[2] + offset_of!(VarProReadoutProWire, w_ro_and_mods_fp16),
+        VARPRO_READOUT_BASES[3] + offset_of!(VarProReadoutUltraWire, w_ro_and_mods_fp16),
+    ];
+    const W_RO_SEG_U16S: [usize; 4] = [48, 72, 96, 120];
 
     for tier in 0..max_tiers {
         let t_base = tier * STRUCTURAL_HASH_TIER_DIM;
         let blocks = STAGE3_KAUTZ_BLOCKS_PER_TIER[tier];
         for blk in 0..blocks {
             let base = kautz_soa_byte_offset(tier, blk);
+            let Ok((k_blk, _)) = KautzSoaBlockWire::ref_from_prefix(&arena[base..]) else {
+                continue;
+            };
             for lane in 0..4 {
                 let ch_in_tier = blk * 4 + lane;
-                let r_low = read_f32_le(arena, base + lane * 4) as f64;
-                let dr = read_f32_le(arena, base + (4 + lane) * 4) as f64;
-                let theta =
-                    quantize_pole_angle_1e2(read_f32_le(arena, base + (8 + lane) * 4) as f64);
-                let b_gamma = read_f32_le(arena, base + (12 + lane) * 4) as f64;
-                let c_re_l = read_f32_le(arena, base + (16 + lane) * 4) as f64;
-                let c_im_l = read_f32_le(arena, base + (20 + lane) * 4) as f64;
-                let c_re_r = read_f32_le(arena, base + (24 + lane) * 4) as f64;
-                let c_im_r = read_f32_le(arena, base + (28 + lane) * 4) as f64;
+                let r_low = f64::from(k_blk.r_low[lane].get());
+                let dr = f64::from(k_blk.dr[lane].get());
+                let theta = quantize_pole_angle_1e2(f64::from(k_blk.theta[lane].get()));
+                let b_gamma = f64::from(k_blk.b_gamma[lane].get());
+                let c_re_l = f64::from(k_blk.c_re_l[lane].get());
+                let c_im_l = f64::from(k_blk.c_im_l[lane].get());
+                let c_re_r = f64::from(k_blk.c_re_r[lane].get());
+                let c_im_r = f64::from(k_blk.c_im_r[lane].get());
 
                 vec224[t_base + ch_in_tier] = r_low + 0.5 * dr + 0.1 * theta;
                 vec224[t_base + 16 + ch_in_tier] = b_gamma * (c_re_l + c_re_r);
@@ -61,32 +77,37 @@ pub fn extract_structural_hash_224d(arena: &[u8]) -> Result<[f64; STRUCTURAL_HAS
             }
         }
 
-        // 4 Stage IV Spatial Tank delay invariants for this tier (`u32` lengths or `f32` test values)
-        let delay_base = match tier {
-            0 => 2_624_usize,
-            1 => 6_080_usize,
-            2 => 15_104_usize,
-            _ => 20_480_usize,
-        };
-        for lane in 0..4 {
-            let bits = crate::stages::weights::read_u32_le(arena, delay_base + lane * 4);
-            vec224[t_base + 48 + lane] = if (1..=16_384).contains(&bits) {
-                bits as f64
-            } else {
-                f32::from_bits(bits) as f64
-            };
+        // 4 Stage IV Spatial Tank delay invariants for this tier (`u32` lengths in `4..=48_000`)
+        if let Some(delay_tail) = arena.get(STAGE4_DELAY_BASES[tier]..)
+            && let Ok((s4, _)) = Stage4QuadWire::ref_from_prefix(delay_tail)
+        {
+            for lane in 0..4 {
+                let bits = s4.delay_lengths[lane].get();
+                vec224[t_base + 48 + lane] = if (4..=48_000).contains(&bits) {
+                    f64::from(bits)
+                } else {
+                    let f = f32::from_bits(bits);
+                    if f.is_finite() { f64::from(f) } else { 0.0 }
+                };
+            }
         }
 
-        // 4 Direct Readout energy norms for this tier (`4 * [20, 24, 28, 32]` floats = `320..512 B`)
-        let ro_base = readout_bases[tier];
-        let seg_len = readout_seg_floats[tier];
-        for seg in 0..4 {
-            let mut energy = 0.0_f64;
-            for i in 0..seg_len {
-                let v = read_f32_le(arena, ro_base + (seg * seg_len + i) * 4) as f64;
-                energy += v * v;
+        // 4 Direct `VarPro` Readout `fp16` energy norms (`4 * [48, 72, 96, 120]` U16s = `[192, 288, 384, 480]`)
+        let ro_base = W_RO_OFFSETS[tier];
+        let seg_len = W_RO_SEG_U16S[tier];
+        if let Some(ro_tail) = arena.get(ro_base..)
+            && let Ok((ro_words, _)) = <[U16]>::ref_from_prefix_with_elems(ro_tail, 4 * seg_len)
+        {
+            for seg in 0..4 {
+                let mut energy = 0.0_f64;
+                for i in 0..seg_len {
+                    let v = f64::from(fp16_to_f32(ro_words[seg * seg_len + i].get()));
+                    if v.is_finite() {
+                        energy += v * v;
+                    }
+                }
+                vec224[t_base + 52 + seg] = energy;
             }
-            vec224[t_base + 52 + seg] = energy;
         }
     }
 

@@ -4,9 +4,42 @@
 
 use core::mem::{align_of, size_of};
 
+use zerocopy::byteorder::little_endian::F32;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+
 use crate::math::flush_recursive_state_f32;
 
-use super::descriptor::ControlClampDescriptor;
+use super::descriptor::{ControlClampDescriptor, ControlClampDescriptorWire};
+
+/// Declarative little-endian wire layout for [`ControlLatentProjection`] (`64 B`).
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct ControlLatentProjectionWire {
+    /// Additive projection `W_main,p` (`8 x f32`).
+    pub w_main: [F32; 8],
+    /// Rank-4/8 FM low-rank interaction factor `v_p` (`8 x f32`).
+    pub v_factors: [F32; 8],
+}
+
+const _: () = assert!(size_of::<ControlLatentProjectionWire>() == 64);
+const _: () = assert!(align_of::<ControlLatentProjectionWire>() == 1);
+
+/// Declarative little-endian wire layout for [`ControlChannelRecord`] (`128 B`).
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct ControlChannelRecordWire {
+    /// Cache Line 0 (`64 B`): Control normalization and safe clamp descriptor.
+    pub clamp: ControlClampDescriptorWire,
+    /// Cache Line 1 (`64 B`): Additive projection and FM interaction factors.
+    pub projection: ControlLatentProjectionWire,
+}
+
+const _: () = assert!(size_of::<ControlChannelRecordWire>() == 128);
+const _: () = assert!(align_of::<ControlChannelRecordWire>() == 1);
 
 /// Cache Line 1 (64 B): ControlLatentProjection inside [`ControlChannelRecord`].
 #[repr(C, align(64))]
@@ -37,33 +70,28 @@ impl ControlLatentProjection {
 
     /// Serializes the 64-byte [`ControlLatentProjection`] into little-endian bytes.
     pub fn to_bytes(&self) -> [u8; 64] {
+        let mut wire = ControlLatentProjectionWire {
+            w_main: [F32::new(0.0); 8],
+            v_factors: [F32::new(0.0); 8],
+        };
+        for i in 0..8 {
+            wire.w_main[i] = F32::new(self.w_main[i]);
+            wire.v_factors[i] = F32::new(self.v_factors[i]);
+        }
         let mut out = [0u8; 64];
-        for (i, &w) in self.w_main.iter().enumerate() {
-            out[i * 4..(i + 1) * 4].copy_from_slice(&w.to_le_bytes());
-        }
-        for (i, &v) in self.v_factors.iter().enumerate() {
-            out[32 + i * 4..32 + (i + 1) * 4].copy_from_slice(&v.to_le_bytes());
-        }
+        out.copy_from_slice(wire.as_bytes());
         out
     }
 
     /// Deserializes a 64-byte [`ControlLatentProjection`] from little-endian bytes.
     pub fn from_bytes(bytes: &[u8; 64]) -> Self {
+        let wire = ControlLatentProjectionWire::ref_from_bytes(bytes.as_slice())
+            .expect("64-byte slice matches ControlLatentProjectionWire");
         let mut w_main = [0.0_f32; 8];
         let mut v_factors = [0.0_f32; 8];
         for i in 0..8 {
-            w_main[i] = f32::from_le_bytes([
-                bytes[i * 4],
-                bytes[i * 4 + 1],
-                bytes[i * 4 + 2],
-                bytes[i * 4 + 3],
-            ]);
-            v_factors[i] = f32::from_le_bytes([
-                bytes[32 + i * 4],
-                bytes[32 + i * 4 + 1],
-                bytes[32 + i * 4 + 2],
-                bytes[32 + i * 4 + 3],
-            ]);
+            w_main[i] = wire.w_main[i].get();
+            v_factors[i] = wire.v_factors[i].get();
         }
         Self { w_main, v_factors }
     }

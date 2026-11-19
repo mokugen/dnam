@@ -11,6 +11,10 @@ pub mod hilbert;
 pub mod kautz;
 pub mod tracker;
 
+pub use dnam_kernels::{
+    HilbertH1Kernel, KautzQuadState, PhasorQ32Bank4, T1SubHarmonicKernel, step_kautz_quad_stereo8,
+    step_kautz_quad_vec4,
+};
 pub use hilbert::*;
 pub use kautz::*;
 pub use tracker::*;

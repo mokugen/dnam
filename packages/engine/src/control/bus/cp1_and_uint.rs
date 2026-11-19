@@ -1,21 +1,29 @@
 //! Inline `CP1` contributor decoding and `U_int` ANOVA-FM interaction matrix evaluation (`r[dsp.ctrl.accum.anova-fm]`).
 
-use crate::control::record::Cp1ContributorSlot;
+use zerocopy::byteorder::little_endian::F32;
+use zerocopy::{FromBytes, IntoBytes};
 
-/// Evaluates `U_int^base` (`4 × 8 = 128 B` at `Arena 0 [3,072..3,200]`) on `z_fm_base` (`r[dsp.ctrl.accum.anova-fm]`).
+use crate::control::record::Cp1ContributorSlot;
+use crate::stages::weights::{
+    ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET, ARENA3_CTRL_OFFSET, ARENA3_UINT_ULTRA_OFFSET,
+    Arena0ControlBusWire, Arena3ControlBusWire,
+};
+
+/// Evaluates `U_int^base` (`4 × 8 = 128 B` at `Arena 0 [ARENA0_UINT_BASE_OFFSET..+128]`) on
+/// `z_fm_base` (`r[dsp.ctrl.accum.anova-fm]`).
 #[inline]
 pub fn eval_uint_base_4x8(
     arena_bytes: &[u8],
     z_fm_base: [f32; 4],
     s_emb: [f32; 3],
 ) -> ([f32; 8], bool) {
-    const UINT_BASE_OFF: usize = crate::stages::weights::ARENA0_UINT_BASE_OFFSET;
-    if arena_bytes.len() < UINT_BASE_OFF + 128 {
+    let Some(tail) = arena_bytes.get(ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET..) else {
         return ([0.0; 8], false);
-    }
-    let has_nonzero_uint = arena_bytes[UINT_BASE_OFF..UINT_BASE_OFF + 128]
-        .iter()
-        .any(|&b| b != 0);
+    };
+    let Ok((a0, _)) = Arena0ControlBusWire::ref_from_prefix(tail) else {
+        return ([0.0; 8], false);
+    };
+    let has_nonzero_uint = a0.u_int_base.as_bytes().iter().any(|&b| b != 0);
     if !has_nonzero_uint {
         return ([0.0; 8], false);
     }
@@ -32,32 +40,24 @@ pub fn eval_uint_base_4x8(
     let mut out = [0.0_f32; 8];
     for (r, &p_val) in inputs.iter().enumerate() {
         if p_val.abs() > 1e-12 {
-            let row_off = UINT_BASE_OFF + r * 32;
             for (d, out_d) in out.iter_mut().enumerate() {
-                let off = row_off + d * 4;
-                let w = f32::from_le_bytes([
-                    arena_bytes[off],
-                    arena_bytes[off + 1],
-                    arena_bytes[off + 2],
-                    arena_bytes[off + 3],
-                ]);
-                *out_d += p_val * w;
+                *out_d += p_val * a0.u_int_base[r][d].get();
             }
         }
     }
     (out, true)
 }
 
-/// Evaluates `U_int^base` (`3 × 8` at `Arena 0 [3,072..3,168]`) on the 3 pairwise products of `s_emb`.
+/// Evaluates `U_int^base` (`3 × 8` at `Arena 0 [ARENA0_UINT_BASE_OFFSET..+96]`) on the 3 pairwise products of `s_emb`.
 #[inline]
 pub fn eval_uint_base_3x8(arena_bytes: &[u8], s_emb: [f32; 3]) -> [f32; 8] {
     eval_uint_base_4x8(arena_bytes, [0.0; 4], s_emb).0
 }
 
-/// Evaluates `3 × U_int,Delta` (`3 × 4 × 8 = 384 B` at `Arena 3 [21,376..21,760]`, `r[dsp.ctrl.accum.anova-fm]`):
-/// - Block 0 (`21,376..21,504`): maps `z_fm_ultra` into `\Delta z_raw[0..8]`
-/// - Block 1 (`21,504..21,632`): maps `z_fm_base` into `z_raw[8..16]`
-/// - Block 2 (`21,632..21,760`): maps `z_fm_ultra` into `z_raw[8..16]`
+/// Evaluates `3 × U_int,Delta` (`3 × 4 × 8 = 384 B` at `Arena 3 [ARENA3_UINT_ULTRA_OFFSET..+384]`, `r[dsp.ctrl.accum.anova-fm]`):
+/// - Block 0 (`+0..+128`): maps `z_fm_ultra` into `\Delta z_raw[0..8]`
+/// - Block 1 (`+128..+256`): maps `z_fm_base` into `z_raw[8..16]`
+/// - Block 2 (`+256..+384`): maps `z_fm_ultra` into `z_raw[8..16]`
 #[inline]
 pub fn eval_uint_ultra_delta_3x4x8(
     arena_bytes: &[u8],
@@ -65,13 +65,16 @@ pub fn eval_uint_ultra_delta_3x4x8(
     z_fm_ultra: [f32; 4],
     s_emb: [f32; 3],
 ) -> ([f32; 8], [f32; 8], bool) {
-    const UINT_ULTRA_OFF: usize = crate::stages::weights::ARENA3_UINT_ULTRA_OFFSET;
-    if arena_bytes.len() < UINT_ULTRA_OFF + 384 {
+    if arena_bytes.len() < crate::stages::weights::ARENA_ULTRA_BYTES {
         return ([0.0; 8], [0.0; 8], false);
     }
-    let has_nonzero_uint = arena_bytes[UINT_ULTRA_OFF..UINT_ULTRA_OFF + 384]
-        .iter()
-        .any(|&b| b != 0);
+    let Some(tail) = arena_bytes.get(ARENA3_CTRL_OFFSET..) else {
+        return ([0.0; 8], [0.0; 8], false);
+    };
+    let Ok((a3, _)) = Arena3ControlBusWire::ref_from_prefix(tail) else {
+        return ([0.0; 8], [0.0; 8], false);
+    };
+    let has_nonzero_uint = a3.u_int_ultra.as_bytes().iter().any(|&b| b != 0);
     if !has_nonzero_uint {
         return ([0.0; 8], [0.0; 8], false);
     }
@@ -92,63 +95,44 @@ pub fn eval_uint_ultra_delta_3x4x8(
     let mut ultra_new_8 = [0.0_f32; 8];
     for (r, &val) in in_b0.iter().enumerate() {
         if val.abs() > 1e-12 {
-            let row_off = UINT_ULTRA_OFF + r * 32;
             for (d, out_d) in delta_base_8.iter_mut().enumerate() {
-                let off = row_off + d * 4;
-                let w = f32::from_le_bytes([
-                    arena_bytes[off],
-                    arena_bytes[off + 1],
-                    arena_bytes[off + 2],
-                    arena_bytes[off + 3],
-                ]);
-                *out_d += val * w;
+                *out_d += val * a3.u_int_ultra[0][r][d].get();
             }
         }
     }
     for (r, &val) in in_b1.iter().enumerate() {
         if val.abs() > 1e-12 {
-            let row_off = UINT_ULTRA_OFF + 128 + r * 32;
             for (d, out_d) in ultra_new_8.iter_mut().enumerate() {
-                let off = row_off + d * 4;
-                let w = f32::from_le_bytes([
-                    arena_bytes[off],
-                    arena_bytes[off + 1],
-                    arena_bytes[off + 2],
-                    arena_bytes[off + 3],
-                ]);
-                *out_d += val * w;
+                *out_d += val * a3.u_int_ultra[1][r][d].get();
             }
         }
     }
     for (r, &val) in in_b2.iter().enumerate() {
         if val.abs() > 1e-12 {
-            let row_off = UINT_ULTRA_OFF + 256 + r * 32;
             for (d, out_d) in ultra_new_8.iter_mut().enumerate() {
-                let off = row_off + d * 4;
-                let w = f32::from_le_bytes([
-                    arena_bytes[off],
-                    arena_bytes[off + 1],
-                    arena_bytes[off + 2],
-                    arena_bytes[off + 3],
-                ]);
-                *out_d += val * w;
+                *out_d += val * a3.u_int_ultra[2][r][d].get();
             }
         }
     }
     (delta_base_8, ultra_new_8, true)
 }
 
-/// Evaluates `U_int,Delta` (`6 × 8` at `Arena 3 [21,376..21,568]`) on 6 pairwise products.
+/// Evaluates `U_int,Delta` (`6 × 8` at `Arena 3 [ARENA3_UINT_ULTRA_OFFSET..+192]`) on 6 pairwise products.
 #[inline]
 pub fn eval_uint_ultra_delta_6x8(
     arena_bytes: &[u8],
     s_emb: [f32; 3],
     s_emb_ultra: [f32; 3],
 ) -> [f32; 8] {
-    const UINT_ULTRA_OFF: usize = crate::stages::weights::ARENA3_UINT_ULTRA_OFFSET;
-    if arena_bytes.len() < UINT_ULTRA_OFF + 192 {
+    if arena_bytes.len() < crate::stages::weights::ARENA_ULTRA_BYTES {
         return [0.0; 8];
     }
+    let Some(tail) = arena_bytes.get(ARENA3_UINT_ULTRA_OFFSET..) else {
+        return [0.0; 8];
+    };
+    let Ok((rows, _)) = <[[F32; 8]; 6]>::ref_from_prefix(tail) else {
+        return [0.0; 8];
+    };
     let pairs = [
         s_emb[0] * s_emb[1],
         s_emb[0] * s_emb[2],
@@ -160,16 +144,8 @@ pub fn eval_uint_ultra_delta_6x8(
     let mut out = [0.0_f32; 8];
     for (r, &p_val) in pairs.iter().enumerate() {
         if p_val.abs() > 1e-12 {
-            let row_off = UINT_ULTRA_OFF + r * 32;
             for (d, out_d) in out.iter_mut().enumerate() {
-                let off = row_off + d * 4;
-                let w = f32::from_le_bytes([
-                    arena_bytes[off],
-                    arena_bytes[off + 1],
-                    arena_bytes[off + 2],
-                    arena_bytes[off + 3],
-                ]);
-                *out_d += p_val * w;
+                *out_d += p_val * rows[r][d].get();
             }
         }
     }
@@ -178,122 +154,91 @@ pub fn eval_uint_ultra_delta_6x8(
 
 /// Allocation-free `CP1` contributor decoder returning static error strings so real-time reloaders
 /// emit zero heap allocation/drop glue.
+/// Decodes strictly via canonical [`crate::stages::weights::Cp1InlineDirWire`] (`cp1_dir_count in 0..=8`,
+/// `flags == 0`, `entries: [[ctrl_idx, (kind << 4) | lanes, aux]; 8]`) without legacy byte-sniffing
+/// (`ref[container.dnam.cp1-profile]`).
 pub(crate) fn decode_cp1_inline_contributors_static(
     arena_bytes: &[u8],
     out_slots: &mut [Cp1ContributorSlot],
 ) -> Result<usize, &'static str> {
-    const DIR_OFF: usize = crate::stages::weights::ARENA0_CP1_DIR_OFFSET;
-    const BASE_OFF: usize = crate::stages::weights::ARENA0_CP1_BASE_OFFSET;
-    const BASE_END: usize = crate::stages::weights::ARENA0_CP1_BASE_END;
-    const ULTRA_OFF: usize = crate::stages::weights::ARENA3_CP1_ULTRA_OFFSET;
-    const ULTRA_END: usize = crate::stages::weights::ARENA3_CP1_ULTRA_END;
-
-    if arena_bytes.len() < BASE_END {
+    let Some(a0_tail) = arena_bytes.get(ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET..) else {
         return Ok(0);
-    }
-    let count = u16::from_le_bytes([arena_bytes[DIR_OFF], arena_bytes[DIR_OFF + 1]]) as usize;
+    };
+    let Ok((a0, _)) = Arena0ControlBusWire::ref_from_prefix(a0_tail) else {
+        return Ok(0);
+    };
+    let count = a0.cp1_dir.cp1_dir_count.get() as usize;
     if count == 0 {
         return Ok(0);
     }
-    if count > 26 || count > out_slots.len() {
-        return Err("inline CP1 contributor count exceeds 26");
+    if a0.cp1_dir.flags.get() != 0 {
+        return Err("invalid inline CP1 directory flags");
     }
-    let use_3b_dir = count <= 8
-        && arena_bytes[DIR_OFF + 2] == 0
-        && arena_bytes[DIR_OFF + 3] == 0
-        && ((1..=3).contains(&(arena_bytes[DIR_OFF + 5] & 0x0F))
-            || (1..=3).contains(&(arena_bytes[DIR_OFF + 6] & 0x0F)));
-    let has_ultra = arena_bytes.len() >= ULTRA_END;
-    let mut b_cursor = BASE_OFF;
-    let mut u_cursor = ULTRA_OFF;
+    if count > 8 || count > out_slots.len() {
+        return Err("inline CP1 contributor count exceeds 8");
+    }
+    let Ok(base_words) = <[F32]>::ref_from_bytes(&a0.cp1_base) else {
+        return Err("invalid inline CP1 base buffer");
+    };
+    let a3 = arena_bytes
+        .get(ARENA3_CTRL_OFFSET..)
+        .and_then(|s| Arena3ControlBusWire::ref_from_prefix(s).ok())
+        .map(|(w, _)| w);
+    let ultra_words = a3.and_then(|w| <[F32]>::ref_from_bytes(&w.cp1_ultra).ok());
+
+    let mut b_word_cursor = 0usize;
+    let mut u_word_cursor = 0usize;
     for (c, slot) in out_slots.iter_mut().take(count).enumerate() {
-        let (control_idx, ctrl_kind, option_idx, partner_control_id, lanes) = if use_3b_dir {
-            let entry_off = DIR_OFF + 4 + c * 3;
-            let c_idx = arena_bytes[entry_off] as u16;
-            let b1 = arena_bytes[entry_off + 1];
-            let b2 = arena_bytes[entry_off + 2];
-            let (packed, aux) = if (1..=3).contains(&(b1 & 0x0F)) {
-                (b1, b2)
-            } else {
-                (b2, b1)
-            };
-            let kind = (packed >> 4) & 0x0F;
-            let l = packed & 0x0F;
-            let opt = if kind == 1 { aux } else { 0xFF };
-            let partner = if kind == 2 { aux as u16 } else { 0 };
-            (c_idx, kind, opt, partner, l)
-        } else {
-            let packed = arena_bytes[DIR_OFF + 2 + c];
-            let kind = (packed >> 4) & 0x0F;
-            let l = packed & 0x0F;
-            let opt = if kind == 1 { 1 } else { 0xFF };
-            let partner = if kind == 2 { (c + 1) as u16 } else { 0 };
-            (c as u16, kind, opt, partner, l)
-        };
+        let [c_idx, packed, aux] = a0.cp1_dir.entries[c];
+        let control_idx = c_idx as u16;
+        let ctrl_kind = (packed >> 4) & 0x0F;
+        let lanes = packed & 0x0F;
+        if ctrl_kind > 2 {
+            return Err("invalid inline CP1 contributor kind");
+        }
         if !(1..=3).contains(&lanes) {
             return Err("invalid inline CP1 lane count");
         }
+        let option_idx = if ctrl_kind == 1 { aux } else { 0xFF };
+        let partner_control_id = if ctrl_kind == 2 { aux as u16 } else { 0 };
         let l_cnt = lanes as usize;
-        let b_bytes = 4 * (9 * l_cnt + 4);
-        if b_cursor + b_bytes > BASE_END {
-            return Err("inline CP1 base payload exceeds 320 B");
+        let b_word_len = 9 * l_cnt + 4;
+        if b_word_cursor + b_word_len > base_words.len() {
+            return Err("inline CP1 base payload exceeds 576 B");
         }
         let mut main_base = [[0.0f32; 8]; 3];
         for row in main_base.iter_mut().take(l_cnt) {
             for val in row.iter_mut() {
-                *val = f32::from_le_bytes([
-                    arena_bytes[b_cursor],
-                    arena_bytes[b_cursor + 1],
-                    arena_bytes[b_cursor + 2],
-                    arena_bytes[b_cursor + 3],
-                ]);
-                b_cursor += 4;
+                *val = base_words[b_word_cursor].get();
+                b_word_cursor += 1;
             }
         }
         let mut emb = [0.0f32; 3];
         for val in emb.iter_mut().take(l_cnt) {
-            *val = f32::from_le_bytes([
-                arena_bytes[b_cursor],
-                arena_bytes[b_cursor + 1],
-                arena_bytes[b_cursor + 2],
-                arena_bytes[b_cursor + 3],
-            ]);
-            b_cursor += 4;
+            *val = base_words[b_word_cursor].get();
+            b_word_cursor += 1;
         }
         let mut v_base = [0.0f32; 4];
         for val in &mut v_base {
-            *val = f32::from_le_bytes([
-                arena_bytes[b_cursor],
-                arena_bytes[b_cursor + 1],
-                arena_bytes[b_cursor + 2],
-                arena_bytes[b_cursor + 3],
-            ]);
-            b_cursor += 4;
+            *val = base_words[b_word_cursor].get();
+            b_word_cursor += 1;
         }
         let mut main_ultra = [[0.0f32; 8]; 3];
         let mut v_ultra = [0.0f32; 4];
-        if has_ultra {
-            let u_bytes = (32 * l_cnt) + 16;
-            if u_cursor + u_bytes <= ULTRA_END {
+        let mut has_ultra = false;
+        if let Some(uw) = ultra_words {
+            let u_word_len = 8 * l_cnt + 4;
+            if u_word_cursor + u_word_len <= uw.len() {
+                has_ultra = true;
                 for row in main_ultra.iter_mut().take(l_cnt) {
                     for val in row.iter_mut() {
-                        *val = f32::from_le_bytes([
-                            arena_bytes[u_cursor],
-                            arena_bytes[u_cursor + 1],
-                            arena_bytes[u_cursor + 2],
-                            arena_bytes[u_cursor + 3],
-                        ]);
-                        u_cursor += 4;
+                        *val = uw[u_word_cursor].get();
+                        u_word_cursor += 1;
                     }
                 }
                 for val in &mut v_ultra {
-                    *val = f32::from_le_bytes([
-                        arena_bytes[u_cursor],
-                        arena_bytes[u_cursor + 1],
-                        arena_bytes[u_cursor + 2],
-                        arena_bytes[u_cursor + 3],
-                    ]);
-                    u_cursor += 4;
+                    *val = uw[u_word_cursor].get();
+                    u_word_cursor += 1;
                 }
             }
         }
@@ -314,9 +259,9 @@ pub(crate) fn decode_cp1_inline_contributors_static(
     Ok(count)
 }
 
-/// Decodes inline `CP1` contributors from `Arena 0 [3,200..3,520]` (`320 B` base) and
-/// `Arena 3 [21,760..23,872]` (`2,112 B` Ultra) using `cp1_lanes_dir` at `Arena 0 [3,044..3,072]`.
-/// Returns `Ok(0)` when `num_inline_contributors == 0`.
+/// Decodes inline `CP1` contributors from `Arena 0 [ARENA0_CP1_BASE_OFFSET..ARENA0_CP1_BASE_END]`
+/// (`576 B` base) and `Arena 3 [ARENA3_CP1_ULTRA_OFFSET..ARENA3_CP1_ULTRA_END]` (`2,112 B` Ultra)
+/// using `cp1_lanes_dir` at `Arena 0 [ARENA0_CP1_DIR_OFFSET..]`. Returns `Ok(0)` when count is `0`.
 pub fn decode_cp1_inline_contributors(
     arena_bytes: &[u8],
     out_slots: &mut [Cp1ContributorSlot],
@@ -337,7 +282,7 @@ mod control_bus_tests {
         vec::Vec,
     };
 
-    // Empirical TORA Control Bus and 3-Phase Clamping Verification (`Tests 8A, 8B, 8D, 8E`).
+    // Empirical SONA Control Bus and 3-Phase Clamping Verification (`Tests 8A, 8B, 8D, 8E`).
     //
     // Canonical Reference: `docs/specs/dsp/parametric_control_bus.md`
     // and `docs/specs/training/control_space_audit.md`.
@@ -468,8 +413,11 @@ mod control_bus_tests {
         }
 
         let mut header = DnamJsonHeader::default_reference();
-        let mut cond_max = BTreeMap::new();
-        cond_max.insert("boost=on".to_string(), 9.37_f32);
+        let cond_bounds = vec![crate::container::wire::StructuredConditionalBound {
+            when: vec![("boost".to_string(), "on".to_string())],
+            min: None,
+            max: Some(9.37),
+        }];
         header.controls_schema = vec![
             ControlSchemaDef {
                 id: "gain".to_string(),
@@ -481,8 +429,8 @@ mod control_bus_tests {
                 declared_range: Some([0.0, 10.0]),
                 safe_clamped_range: Some([2.0, 8.0]),
                 default: serde_json::json!(5.0),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
                 declared_options: None,
                 active_options: None,
                 clamp_warning: None,
@@ -500,8 +448,8 @@ mod control_bus_tests {
                 declared_range: Some([0.0, 10.0]),
                 safe_clamped_range: Some([0.0, 10.0]),
                 default: serde_json::json!(5.0),
-                conditional_min: BTreeMap::new(),
-                conditional_max: cond_max,
+                conditional_bounds: cond_bounds,
+                represented_switch_options: None,
                 declared_options: None,
                 active_options: None,
                 clamp_warning: None,
@@ -519,8 +467,8 @@ mod control_bus_tests {
                 declared_range: None,
                 safe_clamped_range: None,
                 default: serde_json::json!("off"),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
                 declared_options: Some(vec![
                     "off".to_string(),
                     "on".to_string(),
@@ -560,7 +508,7 @@ mod control_bus_tests {
         let crypto = DefaultCryptoProvider::default();
         let view_before = DnamContainerView::from_bytes(&container, &crypto).unwrap();
         assert_eq!(view_before.clamp_descriptors.len(), 3);
-        let layout = crate::container::validate_v2_open_dnam_layout(&container).unwrap();
+        let layout = crate::container::validate_v3_open_dnam_layout(&container).unwrap();
         let shared_off = layout.shared_extent.0;
         let shared_len = layout.shared_extent.1;
         assert_eq!(shared_len, 3 * 64);
@@ -595,8 +543,8 @@ mod control_bus_tests {
                     declared_range: Some([-12.0, 12.0]),
                     safe_clamped_range: Some([-12.0, 12.0]),
                     default: serde_json::json!(0.0),
-                    conditional_min: BTreeMap::new(),
-                    conditional_max: BTreeMap::new(),
+                    conditional_bounds: Vec::new(),
+                    represented_switch_options: None,
                     declared_options: None,
                     active_options: None,
                     clamp_warning: None,
@@ -679,8 +627,8 @@ mod control_bus_tests {
             declared_range: Some([0.0, 10.0]),
             safe_clamped_range: Some([1.0, 9.0]),
             default: serde_json::json!(5.0),
-            conditional_min: BTreeMap::new(),
-            conditional_max: BTreeMap::new(),
+            conditional_bounds: Vec::new(),
+            represented_switch_options: None,
             declared_options: None,
             active_options: None,
             clamp_warning: None,
@@ -715,8 +663,14 @@ mod control_bus_tests {
 
     #[test]
     fn test_uint_and_decode_cp1_inline_edge_paths() {
+        use crate::stages::weights::{
+            ARENA_LITE_BYTES, ARENA_ULTRA_BYTES, ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET,
+            ARENA0_CP1_BASE_END, ARENA0_UINT_BASE_OFFSET, ARENA3_CP1_ULTRA_END,
+            ARENA3_UINT_ULTRA_OFFSET,
+        };
+        use zerocopy::byteorder::little_endian::U16;
         let put_f32 = |buf: &mut [u8], off: usize, val: f32| {
-            buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
+            buf[off..off + 4].copy_from_slice(F32::new(val).as_bytes());
         };
 
         assert_eq!(eval_uint_base_3x8(&[0u8; 64], [0.5; 3]), [0.0; 8]);
@@ -733,43 +687,84 @@ mod control_bus_tests {
             0
         );
 
-        let mut arena = vec![0u8; crate::stages::weights::ARENA_ULTRA_BYTES];
+        let mut arena = vec![0u8; ARENA_ULTRA_BYTES];
         assert_eq!(
             decode_cp1_inline_contributors(&arena, &mut short_slots).unwrap(),
             0
         );
-        arena[3_044..3_046].copy_from_slice(&27_u16.to_le_bytes());
+        {
+            let (a0, _) = Arena0ControlBusWire::mut_from_prefix(
+                &mut arena[ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET..],
+            )
+            .unwrap();
+            a0.cp1_dir.cp1_dir_count = U16::new(9);
+        }
         assert!(decode_cp1_inline_contributors(&arena, &mut short_slots).is_err());
 
-        // 1-byte directory with 6 single-lane contributors + Ultra weights (fits 320 B base slot)
-        arena[3_044..3_046].copy_from_slice(&6_u16.to_le_bytes());
-        for c in 0..6 {
-            arena[3_046 + c] = 1;
+        // Canonical Cp1InlineDirWire with 8 single-lane contributors + Ultra weights (416 B <= 576 B base slot)
+        {
+            let (a0, _) = Arena0ControlBusWire::mut_from_prefix(
+                &mut arena[ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET..],
+            )
+            .unwrap();
+            a0.cp1_dir.cp1_dir_count = U16::new(8);
+            a0.cp1_dir.flags = U16::new(0);
+            for c in 0..8 {
+                a0.cp1_dir.entries[c] = [c as u8, 1, 0xFF];
+            }
         }
-        for off in (3_072..3_520).step_by(4) {
+        for off in (ARENA0_UINT_BASE_OFFSET..ARENA0_CP1_BASE_END).step_by(4) {
             put_f32(&mut arena, off, 0.15);
         }
-        for off in (21_376..23_872).step_by(4) {
+        for off in (ARENA3_UINT_ULTRA_OFFSET..ARENA3_CP1_ULTRA_END).step_by(4) {
             put_f32(&mut arena, off, 0.12);
         }
         let mut big_slots = vec![Cp1ContributorSlot::default(); 16];
         assert_eq!(
             decode_cp1_inline_contributors(&arena, &mut big_slots).unwrap(),
-            6
+            8
+        );
+        // Lite stripped slice preserves self-contained Arena 0 base CP1 contributors
+        assert_eq!(
+            decode_cp1_inline_contributors(&arena[..ARENA_LITE_BYTES], &mut big_slots).unwrap(),
+            8
         );
 
         let uint_b3 = eval_uint_base_3x8(&arena, [0.4, -0.3, 0.2]);
         let uint_u6 = eval_uint_ultra_delta_6x8(&arena, [0.4, -0.3, 0.2], [0.1, 0.2, -0.1]);
         assert!(uint_b3.iter().all(|v| v.is_finite()) && uint_u6.iter().all(|v| v.is_finite()));
 
-        // Base payload overflow (7 single-lane contributors = 364 B > 320 B) returns error
-        arena[3_044..3_046].copy_from_slice(&7_u16.to_le_bytes());
-        arena[3_046 + 6] = 1;
+        // Base payload overflow (5 three-lane contributors = 620 B > 576 B) returns error
+        {
+            let (a0, _) = Arena0ControlBusWire::mut_from_prefix(
+                &mut arena[ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET..],
+            )
+            .unwrap();
+            a0.cp1_dir.cp1_dir_count = U16::new(5);
+            for c in 0..5 {
+                a0.cp1_dir.entries[c] = [c as u8, 3, 0xFF];
+            }
+        }
         assert!(decode_cp1_inline_contributors(&arena, &mut big_slots).is_err());
 
-        // Invalid lanes (0) triggers error in 1-byte directory
-        arena[3_044..3_046].copy_from_slice(&6_u16.to_le_bytes());
-        arena[3_046] = 0;
+        // Non-zero flags or invalid lanes (0) triggers error
+        {
+            let (a0, _) = Arena0ControlBusWire::mut_from_prefix(
+                &mut arena[ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET..],
+            )
+            .unwrap();
+            a0.cp1_dir.cp1_dir_count = U16::new(2);
+            a0.cp1_dir.flags = U16::new(1);
+        }
+        assert!(decode_cp1_inline_contributors(&arena, &mut big_slots).is_err());
+        {
+            let (a0, _) = Arena0ControlBusWire::mut_from_prefix(
+                &mut arena[ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET..],
+            )
+            .unwrap();
+            a0.cp1_dir.flags = U16::new(0);
+            a0.cp1_dir.entries[0] = [0, 0, 0xFF];
+        }
         assert!(decode_cp1_inline_contributors(&arena, &mut big_slots).is_err());
     }
 }

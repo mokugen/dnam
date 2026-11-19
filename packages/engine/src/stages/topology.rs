@@ -26,8 +26,8 @@ pub use router_and_head::{
     eval_stage4_blended_feedback_knee_fast, eval_stage4_loop_saturator,
     eval_stage4_loop_saturator_fast, eval_stereo_linked_aux_detector, eval_wdw_routing_outputs,
     pack_stage3_modal_block_features, prepare_ballistic_band_alphas,
-    prepare_kaiser_sinc_alignment_weights, stage3_feature_bus_slot_ranges,
-    validate_tensor_directory_slice,
+    prepare_kaiser_sinc_alignment_weights, prepare_kaiser_sinc_alignment_weights_into,
+    stage3_feature_bus_slot_ranges, validate_tensor_directory_slice,
 };
 pub use zoh_fir_onset::{
     GAIN_BOUNDED_FIRST_TAP_64_BITS, eval_bounce_6point_lagrange_tap,

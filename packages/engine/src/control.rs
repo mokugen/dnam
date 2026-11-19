@@ -26,9 +26,13 @@ pub use bus::{
     ControlBus, decode_cp1_inline_contributors, eval_uint_base_3x8, eval_uint_ultra_delta_6x8,
     trust_clip_outward_4d,
 };
-pub use descriptor::{ConditionalClampRule, ControlClampDescriptor};
+pub use descriptor::{
+    ConditionalClampRule, ConditionalClampRuleWire, ControlClampDescriptor,
+    ControlClampDescriptorWire,
+};
 pub use record::{
-    ControlChannelRecord, ControlLatentProjection, Cp1ContributorSlot, LatentAccumulator64B,
+    ControlChannelRecord, ControlChannelRecordWire, ControlLatentProjection,
+    ControlLatentProjectionWire, Cp1ContributorSlot, LatentAccumulator64B,
 };
 pub use reference::{
     eval_chebyshev_lfo_4harm_f64, eval_newton_lobatto_basis_f64, eval_rank4_fm_interaction_f64,
@@ -36,7 +40,7 @@ pub use reference::{
 };
 
 /// Number of leading control slots captured in the fixed C-ABI [`crate::DnamTelemetrySnapshot`] preview array.
-/// Note: TORA supports an arbitrary number of user controls $P \in [0, 255]$ via the unified 128-byte
+/// Note: `SONA` supports an arbitrary number of user controls $P \in [0, 255]$ via the unified 128-byte
 /// [`ControlChannelRecord`] table and $\mathcal{O}(1)$ [`LatentAccumulator64B`] (`Theorem 3`), while
 /// SVD head rank ($D_h \in \{4, 8\}$) and FM interaction rank ($R \in \{4, 8\}$) scale dynamically with
 /// [`crate::Tier::svd_control_modes`] and [`crate::Tier::fm_interaction_rank`].

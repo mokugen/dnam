@@ -1,5 +1,6 @@
 //! Core execution types (`Tier`, `FtzDazGuard`, and `DnamTelemetrySnapshot`).
 
+#[allow(unsafe_code)]
 mod fp_env;
 
 pub use fp_env::FtzDazGuard;
@@ -7,23 +8,25 @@ pub use fp_env::FtzDazGuard;
 use crate::control::TELEMETRY_CONTROL_SLOTS;
 
 /// Slimmable execution tier (`Lite`, `Full`, `Pro`, or `Ultra`).
+#[forbid(unsafe_code)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
-    /// **`Lite` ($C=4$ channels, $M=4$ tank lines, $D_h=4$ SVD modes, `10,752 B` `Arena 0`):**
-    /// Mix-Ready / Live Grade (`168` cache lines).
+    /// **`Lite` ($C=16$ channels, $M=4$ tank lines, $D_h=4$ SVD modes, `4,608 B` `Arena 0`):**
+    /// Mix-Ready / Live Grade (`72` cache lines).
     Lite = 0,
-    /// **`Full` ($C=8$ channels, $M=8$ tank lines, $D_h=4$ SVD modes, `22,336 B` `Arena 0..1`):**
-    /// True Studio Quality (`349` cache lines).
+    /// **`Full` ($C=24$ channels, $M=8$ tank lines, $D_h=4$ SVD modes, `7,936 B` `Arena 0..1`):**
+    /// True Studio Quality (`124` cache lines).
     Full = 1,
-    /// **`Pro` ($C=12$ channels, $M=8$ tank lines, $D_h=4$ SVD modes, `36,224 B` `Arena 0..2`):**
-    /// Mastering / Reference Grade (`566` cache lines, `8 + 4` SIMD loop).
+    /// **`Pro` ($C=32$ channels, $M=12$ tank lines, $D_h=4$ SVD modes, `15,872 B` `Arena 0..2`):**
+    /// Mastering / Reference Grade (`248` cache lines).
     Pro = 2,
-    /// **`Ultra` ($C=16$ channels, $M=16$ tank lines, $D_h=8$ SVD modes, `64,000 B` `Arena 0..3`):**
-    /// Unconstrained Workstation Max (`1,000` cache lines, Rank-8 FM + 16-line Householder/Givens tank).
+    /// **`Ultra` ($C=40$ channels, $M=16$ tank lines, $D_h=8$ SVD modes, `30,720 B` `Arena 0..3`):**
+    /// Unconstrained Workstation Max (`480` cache lines, Rank-8 FM + 16-line Householder/Givens tank).
     Ultra = 3,
 }
 
+#[forbid(unsafe_code)]
 impl Tier {
     /// Converts a raw `u8` (`0`, `1`, `2`, `3`) into a [`Tier`], clamping values $\ge 3$ to [`Tier::Ultra`].
     #[inline]
@@ -63,14 +66,14 @@ impl Tier {
         }
     }
 
-    /// Returns the number of active channels ($C \in \{4, 8, 12, 16\}$).
+    /// Returns the number of active `SONA` core channels ($C \in \{16, 24, 32, 40\}$).
     #[inline]
     pub const fn channels(self) -> usize {
         match self {
-            Self::Lite => 4,
-            Self::Full => 8,
-            Self::Pro => 12,
-            Self::Ultra => 16,
+            Self::Lite => 16,
+            Self::Full => 24,
+            Self::Pro => 32,
+            Self::Ultra => 40,
         }
     }
 
@@ -80,9 +83,20 @@ impl Tier {
         self.channels()
     }
 
-    /// Returns the number of 4-channel SIMD tier groups (`1`, `2`, `3`, or `4`).
+    /// Returns the number of 4-channel SIMD tier groups (`4`, `6`, `8`, or `10`).
     #[inline]
     pub const fn simd_groups(self) -> usize {
+        match self {
+            Self::Lite => 4,
+            Self::Full => 6,
+            Self::Pro => 8,
+            Self::Ultra => 10,
+        }
+    }
+
+    /// Returns the number of 4-line SIMD groups in Stage IV tank (`1` for `Lite`, `2` for `Full`, `3` for `Pro`, `4` for `Ultra`).
+    #[inline]
+    pub const fn tank_groups(self) -> usize {
         match self {
             Self::Lite => 1,
             Self::Full => 2,
@@ -91,17 +105,7 @@ impl Tier {
         }
     }
 
-    /// Returns the number of 4-line SIMD groups in Stage IV tank (`1` for `Lite`, `2` for `Full`/`Pro`, `4` for `Ultra`).
-    #[inline]
-    pub const fn tank_groups(self) -> usize {
-        match self {
-            Self::Lite => 1,
-            Self::Full | Self::Pro => 2,
-            Self::Ultra => 4,
-        }
-    }
-
-    /// Returns the number of active Stage IV tank delay lines ($M \in \{4, 8, 8, 16\}$).
+    /// Returns the number of active Stage IV tank delay lines ($M \in \{4, 8, 12, 16\}$).
     #[inline]
     pub const fn tank_lines(self) -> usize {
         self.tank_groups() * 4
@@ -125,18 +129,18 @@ impl Tier {
         }
     }
 
-    /// Returns the cumulative arena byte end offset (`10,752`, `22,336`, `36,224`, or `64,000`).
+    /// Returns the cumulative `SONA` `v3.0` arena byte end offset (`4,608`, `7,936`, `15,872`, or `30,720`).
     #[inline]
     pub const fn expected_arena_bytes(self) -> usize {
         match self {
             Self::Lite => 4_608,
-            Self::Full => 10_240,
-            Self::Pro => 18_432,
-            Self::Ultra => 28_672,
+            Self::Full => 7_936,
+            Self::Pro => 15_872,
+            Self::Ultra => 30_720,
         }
     }
 
-    /// Returns the cumulative number of 64-byte cache lines (`168`, `349`, `566`, or `1,000`).
+    /// Returns the cumulative number of 64-byte cache lines (`72`, `124`, `248`, or `480`).
     #[inline]
     pub const fn expected_cache_lines(self) -> usize {
         self.expected_arena_bytes() / 64
@@ -144,7 +148,8 @@ impl Tier {
 }
 
 /// Lock-free, copyable `#[repr(C)]` telemetry snapshot for 60 fps UI visualizers
-/// (`ToraTelemetry.tsx`, `packages/plugin`, and `packages/js`).
+/// (`packages/ui`, `packages/studio`, and `packages/js`).
+#[forbid(unsafe_code)]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DnamTelemetrySnapshot {
@@ -180,6 +185,7 @@ pub struct DnamTelemetrySnapshot {
     pub overflow_or_saturation_flags: u32,
 }
 
+#[forbid(unsafe_code)]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,27 +209,27 @@ mod tests {
         assert_eq!(Tier::from_str_name("ultra"), Some(Tier::Ultra));
         assert_eq!(Tier::from_str_name("invalid"), None);
 
-        assert_eq!(Tier::Lite.channels(), 4);
-        assert_eq!(Tier::Full.channels(), 8);
-        assert_eq!(Tier::Pro.channels(), 12);
-        assert_eq!(Tier::Ultra.channels(), 16);
+        assert_eq!(Tier::Lite.channels(), 16);
+        assert_eq!(Tier::Full.channels(), 24);
+        assert_eq!(Tier::Pro.channels(), 32);
+        assert_eq!(Tier::Ultra.channels(), 40);
 
-        assert_eq!(Tier::Lite.active_channels(), 4);
-        assert_eq!(Tier::Ultra.active_channels(), 16);
+        assert_eq!(Tier::Lite.active_channels(), 16);
+        assert_eq!(Tier::Ultra.active_channels(), 40);
 
-        assert_eq!(Tier::Lite.simd_groups(), 1);
-        assert_eq!(Tier::Full.simd_groups(), 2);
-        assert_eq!(Tier::Pro.simd_groups(), 3);
-        assert_eq!(Tier::Ultra.simd_groups(), 4);
+        assert_eq!(Tier::Lite.simd_groups(), 4);
+        assert_eq!(Tier::Full.simd_groups(), 6);
+        assert_eq!(Tier::Pro.simd_groups(), 8);
+        assert_eq!(Tier::Ultra.simd_groups(), 10);
 
         assert_eq!(Tier::Lite.tank_groups(), 1);
         assert_eq!(Tier::Full.tank_groups(), 2);
-        assert_eq!(Tier::Pro.tank_groups(), 2);
+        assert_eq!(Tier::Pro.tank_groups(), 3);
         assert_eq!(Tier::Ultra.tank_groups(), 4);
 
         assert_eq!(Tier::Lite.tank_lines(), 4);
         assert_eq!(Tier::Full.tank_lines(), 8);
-        assert_eq!(Tier::Pro.tank_lines(), 8);
+        assert_eq!(Tier::Pro.tank_lines(), 12);
         assert_eq!(Tier::Ultra.tank_lines(), 16);
 
         assert_eq!(Tier::Lite.svd_control_modes(), 4);
@@ -235,14 +241,14 @@ mod tests {
         assert_eq!(Tier::Ultra.fm_interaction_rank(), 8);
 
         assert_eq!(Tier::Lite.expected_arena_bytes(), 4_608);
-        assert_eq!(Tier::Full.expected_arena_bytes(), 10_240);
-        assert_eq!(Tier::Pro.expected_arena_bytes(), 18_432);
-        assert_eq!(Tier::Ultra.expected_arena_bytes(), 28_672);
+        assert_eq!(Tier::Full.expected_arena_bytes(), 7_936);
+        assert_eq!(Tier::Pro.expected_arena_bytes(), 15_872);
+        assert_eq!(Tier::Ultra.expected_arena_bytes(), 30_720);
 
         assert_eq!(Tier::Lite.expected_cache_lines(), 72);
-        assert_eq!(Tier::Full.expected_cache_lines(), 160);
-        assert_eq!(Tier::Pro.expected_cache_lines(), 288);
-        assert_eq!(Tier::Ultra.expected_cache_lines(), 448);
+        assert_eq!(Tier::Full.expected_cache_lines(), 124);
+        assert_eq!(Tier::Pro.expected_cache_lines(), 248);
+        assert_eq!(Tier::Ultra.expected_cache_lines(), 480);
 
         let guard1 = FtzDazGuard::default();
         let guard2 = FtzDazGuard::new();

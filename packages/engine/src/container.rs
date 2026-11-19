@@ -1,9 +1,9 @@
 //! `.dnam` Hybrid Binary Container Parser, Builder & Continuous-Time ZOH Rescaling (`container`).
 //!
-//! Implements the canonical `v2.0` 64B-aligned wire framing, zero-copy `mmap` loader (`< 50 ns` zero-JSON hardware fast-path),
-//! `DMU1`/`DMUE` in-place mutable suffix editor, Castagnoli `CRC32C` verification,
-//! and Continuous-Time Zero-Order Hold (ZOH) sample-rate rescaling ($44.1\text{--}96\text{ kHz}$ live,
-//! plus $4\times$ internal ZOH oversampling for offline bounce)
+//! Implements the canonical `v3.0` (`"sona"`) `64 B`-aligned `zerocopy` wire framing, zero-copy `mmap`
+//! loader (`< 50 ns` zero-JSON hardware fast-path), `DMU1`/`DMUE` in-place mutable suffix editor,
+//! Castagnoli `CRC32C` verification, and Continuous-Time Zero-Order Hold (ZOH) sample-rate
+//! rescaling ($44.1\text{--}192\text{ kHz}$ live, plus $4\times$ internal ZOH oversampling for offline bounce)
 //! from [`docs/specs/containers/dnam_binary_format.md`](../../../docs/specs/containers/dnam_binary_format.md).
 
 pub mod builder;
@@ -16,30 +16,32 @@ pub mod zoh;
 pub use wire::{
     CP1_MAGIC, Cp1DecodedRecord, DCRC_MAGIC, DCRC_RECORD_SIZE, DEFAULT_DMU1_TRAILER_CAPACITY,
     DEFAULT_MAX_MUTABLE_CAPACITY, DMU1_HEADER_SIZE, DMUE_FOOTER_SIZE, DcrcAuthRecord,
-    DeclaredDelayHistory, StructuredConditionalBound, StructuredConditionalCurve,
-    SwitchControlSpec, V2_DIRECTORY_SIZE, V2_HEADER_OFFSET, V2_PREAMBLE_SIZE, V2ContainerLayout,
+    DcrcAuthRecordWire, DeclaredDelayHistory, Dmu1HeaderWire, DmueFooterWire, DnamDirectoryWire,
+    DnamPreambleWire, SonaCellDescWire, StructuredConditionalBound, StructuredConditionalCurve,
+    SwitchControlSpec, V3_DIRECTORY_SIZE, V3_HEADER_OFFSET, V3_PREAMBLE_SIZE, V3ContainerLayout,
     align64_u64, append_dmue_mutable_suffix, build_dmu1_mutable_frame,
-    build_v2_dnam_container_with_profile, build_v2_open_dnam_container,
-    compute_v2_open_retained_prefix_sha256, cp1_contributor_record_bytes,
+    build_v3_dnam_container_with_profile, build_v3_open_dnam_container,
+    compute_v3_open_retained_prefix_sha256, cp1_contributor_record_bytes,
     decode_cp1_contributor_stream, decode_cp1_contributor_stream_into_slice,
     decode_cp1_shared_stream_into_slice, encode_cp1_shared_stream, encode_domain_field,
     eval_ui_midpoint_power_skew, is_valid_jcs_unicode_text, parse_and_validate_dmu1_frame,
     parse_canonical_reference_samples, parse_dcrc_record, parse_strict_json_object_bytes,
     parse_structured_conditional_bounds, parse_structured_conditional_curves,
     project_immutable_header_value, resolve_conditional_safe_interval,
-    select_conditional_calibration_curve, serialize_jcs_value, strip_v2_open_dnam_container,
+    select_conditional_calibration_curve, serialize_jcs_value, strip_v3_open_dnam_container,
     validate_canonical_jcs_header_bytes, validate_delay_histories, validate_dmu1_frame_no_alloc,
-    validate_mutable_json_schema, validate_stage3_tier_slices, validate_v2_dnam_layout_no_alloc,
-    validate_v2_dnam_layout_with_max_profile, validate_v2_dnam_layout_with_max_profile_no_alloc,
-    validate_v2_open_dnam_layout,
+    validate_mutable_json_schema, validate_stage3_tier_slices, validate_v3_dnam_layout_no_alloc,
+    validate_v3_dnam_layout_with_max_profile, validate_v3_dnam_layout_with_max_profile_no_alloc,
+    validate_v3_open_dnam_layout,
+};
+pub(crate) use wire::{
+    ContainerWireError, decode_cp1_shared_stream_into_slice_rt, parse_dcrc_record_rt,
+    validate_v3_dnam_layout_no_alloc_rt,
 };
 
 #[cfg(feature = "crypto")]
 pub use crate::provenance::seal_dnam_container;
-pub use crate::provenance::{
-    DNSL_MAGIC, DnamSealEnvelopePreamble, DnamSealRecipientSlot, FLAG_SEAL_CHACHA20_FULL,
-    MAX_SEAL_RECIPIENTS, unseal_dnam_container,
-};
+pub use crate::provenance::{DNSL_MAGIC, MAX_SEAL_RECIPIENTS, unseal_dnam_container};
 pub use builder::{build_dnam_container, build_dnam_container_with_cp1, update_header_in_place};
 pub use preamble::DnamPreamble;
 pub use strip::strip_container_to_tier;
@@ -49,8 +51,8 @@ pub use zoh::ZohRescaledParams;
 /// Magic bytes for a `.dnam` deployment model container (`0x4D414E44` little-endian).
 pub const DNAM_MAGIC: [u8; 4] = *b"DNAM";
 
-/// Current container major version (`2`).
-pub const CONTAINER_VERSION_MAJOR: u16 = 2;
+/// Current container major version (`3`).
+pub const CONTAINER_VERSION_MAJOR: u16 = 3;
 
 /// Current container minor version (`0`).
 pub const CONTAINER_VERSION_MINOR: u16 = 0;
@@ -58,27 +60,35 @@ pub const CONTAINER_VERSION_MINOR: u16 = 0;
 /// End of `Arena 0 (Lite)` in 64-byte cache lines (`72`).
 pub const ARENA_LITE_END_CL: u16 = 72;
 
-/// End of `Arena 0..1 (Full)` in 64-byte cache lines (`160`).
-pub const ARENA_FULL_END_CL: u16 = ARENA_LITE_END_CL + 88;
+/// End of `Arena 0..1 (Full)` in 64-byte cache lines (`124`).
+pub const ARENA_FULL_END_CL: u16 = ARENA_LITE_END_CL + 52;
 
-/// End of `Arena 0..2 (Pro)` in 64-byte cache lines (`288`).
-pub const ARENA_PRO_END_CL: u16 = ARENA_FULL_END_CL + 128;
+/// End of `Arena 0..2 (Pro)` in 64-byte cache lines (`248`).
+pub const ARENA_PRO_END_CL: u16 = ARENA_FULL_END_CL + 124;
 
-/// End of `Arena 0..3 (Ultra)` in 64-byte cache lines (`448`).
-pub const ARENA_ULTRA_END_CL: u16 = ARENA_PRO_END_CL + 160;
+/// End of `Arena 0..3 (Ultra)` in 64-byte cache lines (`480`).
+pub const ARENA_ULTRA_END_CL: u16 = ARENA_PRO_END_CL + 232;
 
 /// Fixed byte length of `Arena 0 (Lite)` (`72 × 64 B = 4,608 B`).
 pub const ARENA_OFFSET_LITE_END: u32 = (ARENA_LITE_END_CL as u32) * 64;
 
-/// Fixed cumulative byte end of `Arena 0..1 (Full)` (`160 × 64 B = 10,240 B`).
+/// Fixed cumulative byte end of `Arena 0..1 (Full)` (`124 × 64 B = 7,936 B`).
 pub const ARENA_OFFSET_FULL_END: u32 = (ARENA_FULL_END_CL as u32) * 64;
 
-/// Fixed cumulative byte end of `Arena 0..2 (Pro)` (`288 × 64 B = 18,432 B`).
+/// Fixed cumulative byte end of `Arena 0..2 (Pro)` (`248 × 64 B = 15,872 B`).
 pub const ARENA_OFFSET_PRO_END: u32 = (ARENA_PRO_END_CL as u32) * 64;
 
-/// Fixed cumulative byte end of `Arena 0..3 (Ultra)` (`448 × 64 B = 28,672 B`).
+/// Fixed cumulative byte end of `Arena 0..3 (Ultra)` (`480 × 64 B = 30,720 B`).
 pub const ARENA_OFFSET_ULTRA_END: u32 = (ARENA_ULTRA_END_CL as u32) * 64;
 
+const _: () = assert!(ARENA_LITE_END_CL == 72);
+const _: () = assert!(ARENA_FULL_END_CL == 124);
+const _: () = assert!(ARENA_PRO_END_CL == 248);
+const _: () = assert!(ARENA_ULTRA_END_CL == 480);
+const _: () = assert!(ARENA_OFFSET_LITE_END == 4_608);
+const _: () = assert!(ARENA_OFFSET_FULL_END == 7_936);
+const _: () = assert!(ARENA_OFFSET_PRO_END == 15_872);
+const _: () = assert!(ARENA_OFFSET_ULTRA_END == 30_720);
 const _: () = assert!(ARENA_OFFSET_LITE_END as usize == crate::stages::weights::ARENA_LITE_BYTES);
 const _: () = assert!(ARENA_OFFSET_FULL_END as usize == crate::stages::weights::ARENA_FULL_BYTES);
 const _: () = assert!(ARENA_OFFSET_PRO_END as usize == crate::stages::weights::ARENA_PRO_BYTES);

@@ -1,20 +1,22 @@
-//! Canonical v2.0 `.dnam` container builder (`build_dnam_container`) and `DMU1` in-place
-//! mutable suffix editor (`update_header_in_place`).
+//! Canonical `v3.0` (`"sona"`) `.dnam` container builder (`build_dnam_container`) and `DMU1`
+//! in-place mutable suffix editor (`update_header_in_place`).
 //!
 //! Canonical Reference: `docs/specs/containers/dnam_binary_format.md`.
 
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use zerocopy::FromBytes;
+
 use crate::control::Cp1ContributorSlot;
 use crate::provenance::canonicalize_jcs_value;
-use crate::schema::{DnamError, DnamJsonHeader, SchemaVersion, reject_if};
+use crate::schema::{DnamError, DnamJsonHeader, SchemaOptionExt, SchemaVersion, reject_if};
 
 use super::wire::{
     DCRC_RECORD_SIZE, DEFAULT_DMU1_TRAILER_CAPACITY, DMU1_HEADER_SIZE, DcrcAuthRecord,
-    build_dmu1_mutable_frame, build_v2_dnam_container_with_profile, encode_cp1_shared_stream,
-    parse_strict_json_object_bytes, validate_mutable_json_schema,
-    validate_v2_dnam_layout_with_max_profile,
+    DnamDirectoryWire, V3_HEADER_OFFSET, V3_PREAMBLE_SIZE, build_dmu1_mutable_frame,
+    build_v3_dnam_container_with_profile, encode_cp1_shared_stream, parse_strict_json_object_bytes,
+    validate_mutable_json_schema, validate_v3_dnam_layout_with_max_profile,
 };
 use super::{
     ARENA_OFFSET_FULL_END, ARENA_OFFSET_LITE_END, ARENA_OFFSET_PRO_END, ARENA_OFFSET_ULTRA_END,
@@ -53,6 +55,13 @@ fn build_mutable_dmu1_json_bytes(header: &DnamJsonHeader) -> Result<Vec<u8>, Dna
             serde_json::Value::Object(ctrl_um),
         );
     }
+    if !header.stem_user_metadata.is_empty() {
+        dmu_obj.insert(
+            "stem_user_metadata".to_string(),
+            serde_json::to_value(&header.stem_user_metadata)
+                .map_err(|e| DnamError::InvalidJsonHeader(e.to_string()))?,
+        );
+    }
     let doc = serde_json::Value::Object(dmu_obj);
     validate_mutable_json_schema(&doc)?;
     serde_json::to_vec(&doc).map_err(|e| DnamError::InvalidJsonHeader(e.to_string()))
@@ -62,6 +71,7 @@ fn strip_dmu1_mutable_fields_from_header_value(val: &mut serde_json::Value) {
     if let Some(root) = val.as_object_mut() {
         root.remove("presets");
         root.remove("user_metadata");
+        root.remove("stem_user_metadata");
         if let Some(ctrls) = root
             .get_mut("controls_schema")
             .and_then(serde_json::Value::as_array_mut)
@@ -92,7 +102,7 @@ fn strip_mutable_and_crc_fields_for_in_place_comparison(val: &mut serde_json::Va
     }
 }
 
-/// Builds a canonical `v2.0` 64B-aligned runtime `.dnam` container byte vector.
+/// Builds a canonical `v3.0` (`"sona"`) 64B-aligned runtime `.dnam` container byte vector.
 pub fn build_dnam_container(
     header: &mut DnamJsonHeader,
     plaintext_arena_crc_source: &[u8],
@@ -108,7 +118,7 @@ pub fn build_dnam_container(
     )
 }
 
-/// Builds a canonical `v2.0` 64B-aligned runtime `.dnam` container byte vector with optional
+/// Builds a canonical `v3.0` (`"sona"`) 64B-aligned runtime `.dnam` container byte vector with optional
 /// packed `CP1\0` control contributors in Region 4 `shared_extent`.
 pub fn build_dnam_container_with_cp1(
     header: &mut DnamJsonHeader,
@@ -147,7 +157,7 @@ pub fn build_dnam_container_with_cp1(
         ],
         _ => {
             return Err(DnamError::SchemaValidationError(
-                "runtime .dnam arena must equal canonical Lite (10,752 B), Full (22,336 B), Pro (36,224 B), or Ultra (64,000 B)".to_string(),
+                "runtime .dnam arena must equal canonical Lite (4,608 B), Full (7,936 B), Pro (15,872 B), or Ultra (30,720 B)".to_string(),
             ));
         }
     };
@@ -161,9 +171,15 @@ pub fn build_dnam_container_with_cp1(
 
     let schema_ver = SchemaVersion::parse(&header.version)?;
     schema_ver.ensure_supported()?;
+    if header.architecture != "sona" {
+        return Err(DnamError::UnsupportedVersion {
+            major: schema_ver.major,
+            minor: schema_ver.minor,
+        });
+    }
     reject_if(
         header.sample_rate_train_hz != 48_000,
-        "v2.0 .dnam container requires sample_rate_train_hz == 48000",
+        "v3.0 .dnam container requires sample_rate_train_hz == 48000",
     )?;
 
     let weights_len = stored_arena_bytes.len();
@@ -235,7 +251,7 @@ pub fn build_dnam_container_with_cp1(
     }
 
     let placeholder_auth = [0u8; DCRC_RECORD_SIZE];
-    let mut container = build_v2_dnam_container_with_profile(
+    let mut container = build_v3_dnam_container_with_profile(
         protection_profile,
         &region3_bytes,
         &shared_bytes,
@@ -245,8 +261,10 @@ pub fn build_dnam_container_with_cp1(
         0,
     )?;
 
-    let auth_offset =
-        u64::from_le_bytes(container[64 + 4 * 8..64 + 5 * 8].try_into().unwrap()) as usize;
+    let dir = DnamDirectoryWire::ref_from_bytes(&container[V3_PREAMBLE_SIZE..V3_HEADER_OFFSET])
+        .ok()
+        .or_schema_err("invalid v3 directory")?;
+    let auth_offset = dir.authentication_envelope_offset.get() as usize;
     let crc_prefix = crc32c_update(0, &container[..auth_offset]);
     let dcrc = DcrcAuthRecord {
         crc_prefix,
@@ -261,13 +279,13 @@ pub fn build_dnam_container_with_cp1(
 }
 
 /// Updates the `DMU1` mutable suffix (`presets`, `user_metadata`, `control_user_metadata`) of an
-/// existing canonical `v2.0` `.dnam` container in-place (`< 0.1 ms`) without altering the immutable
+/// existing canonical `v3.0` `.dnam` container in-place (`< 0.1 ms`) without altering the immutable
 /// Region 3 JCS header, Region 4 control descriptors, or tensor arenas.
 pub fn update_header_in_place(
     container_bytes: &mut [u8],
     new_header: &DnamJsonHeader,
 ) -> Result<(), DnamError> {
-    let layout = validate_v2_dnam_layout_with_max_profile(container_bytes, 1)?;
+    let layout = validate_v3_dnam_layout_with_max_profile(container_bytes, 1)?;
     new_header.validate()?;
 
     let existing_json_slice =
@@ -340,8 +358,8 @@ mod tests {
             declared_range: Some([0.0, 1.0]),
             safe_clamped_range: Some([0.0, 1.0]),
             default: serde_json::json!(0.5),
-            conditional_min: BTreeMap::new(),
-            conditional_max: BTreeMap::new(),
+            conditional_bounds: Vec::new(),
+            represented_switch_options: None,
             declared_options: None,
             active_options: None,
             clamp_warning: None,

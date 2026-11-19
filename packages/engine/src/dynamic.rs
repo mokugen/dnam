@@ -42,6 +42,7 @@ pub enum DynamicDnamEngine<'a> {
 
 impl<'a> DynamicDnamEngine<'a> {
     pub(crate) fn new_empty(max_supported_tier: Tier, backend: BackendKind) -> Self {
+        crate::math::warm_simd_feature_caches();
         match backend {
             #[cfg(target_arch = "aarch64")]
             BackendKind::ArmSme => Self::ArmSme(DnamEngine::new_empty(max_supported_tier)),
@@ -116,6 +117,7 @@ impl<'a> DynamicDnamEngine<'a> {
         max_supported_tier: Tier,
         sample_rate_hz: u32,
     ) -> Result<Self, DnamError> {
+        crate::math::warm_simd_feature_caches();
         let crypto = DefaultCryptoProvider::default();
         let view = crate::container::DnamContainerView::from_bytes_with_max_tier(
             bytes,
@@ -144,6 +146,7 @@ impl<'a> DynamicDnamEngine<'a> {
         max_supported_tier: Tier,
         sample_rate_hz: u32,
     ) -> Result<DynamicDnamEngine<'static>, DnamError> {
+        crate::math::warm_simd_feature_caches();
         let crypto = DefaultCryptoProvider::default();
         let view = crate::container::DnamContainerView::from_bytes_with_max_tier(
             bytes,
@@ -215,6 +218,7 @@ impl<'a> DynamicDnamEngine<'a> {
         backend: BackendKind,
         crypto: &C,
     ) -> Result<DynamicDnamEngine<'static>, DnamError> {
+        crate::math::warm_simd_feature_caches();
         let view = crate::container::DnamContainerView::from_bytes(bytes, crypto)?;
         let arena_bytes = view.arena_storage.as_bytes();
         let mut owned_arena =
@@ -245,6 +249,7 @@ impl<'a> DynamicDnamEngine<'a> {
         sample_rate_hz: u32,
         backend: BackendKind,
     ) -> Result<Self, DnamError> {
+        crate::math::warm_simd_feature_caches();
         let crypto = DefaultCryptoProvider::default();
         let view = crate::container::DnamContainerView::from_bytes(bytes, &crypto)?;
         let mut engine = Self::new_empty(Tier::Ultra, backend);

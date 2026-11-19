@@ -40,6 +40,9 @@ pub enum ControlCalibrationRole {
     GrainSpray,
 }
 
+/// Borrowed switch-conditioned target resolution `(Option<(switch_id, option_id)>, u_norm, was_clamped)`.
+pub type BorrowedTempoTarget<'a> = (Option<(&'a str, &'a str)>, f32, bool);
+
 /// Physical calibration and MIDI tempo-sync metadata for a single parametric control.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ControlCalibration {
@@ -48,10 +51,10 @@ pub struct ControlCalibration {
     /// 3-point Lobatto physical anchor values $[v_{\min}, v_{\text{mid}}, v_{\max}]$ at $u \in \{-1, 0, +1\}$.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lobatto_physical_anchors: Option<[f32; 3]>,
-    /// Switch-conditioned 3-point Lobatto physical anchors keyed by `"switch_id=option_id"`,
-    /// e.g., `{"range=0.01-0.1s": [10.0, 55.0, 100.0], "range=0.1-1s": [100.0, 550.0, 1000.0], "range=1-2s": [1000.0, 1500.0, 2000.0]}`.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub conditional_physical_anchors: BTreeMap<String, [f32; 3]>,
+    /// Switch-conditioned 3-point Lobatto physical anchors (`ref[container.dnam.conditional-rules]`),
+    /// e.g., `[{"when": [{"control_id": "range", "option_id": "0.01-0.1s"}], "anchors": [10.0, 55.0, 100.0]}]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditional_physical_anchors: Vec<crate::container::wire::StructuredConditionalCurve>,
     /// Default musical subdivision when tempo sync is enabled on this control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tempo_sync_default_subdivision: Option<TempoSubdivision>,
@@ -158,26 +161,85 @@ impl ControlCalibration {
         ))
     }
 
-    /// Resolves `target_val` across `conditional_physical_anchors` (if non-empty) or
-    /// `lobatto_physical_anchors`, returning the matching switch throw and normalized $u \in [-1, 1]$.
-    pub fn resolve_conditional_target(
+    /// Resolves `[v_min, v_mid, v_max]` physical anchors for `active_switches` (`(control_id, option_id)`)
+    /// using greatest selector specificity across `conditional_physical_anchors`, falling back to
+    /// `lobatto_physical_anchors` and returning an error on a specificity tie
+    /// (`ref[container.dnam.conditional-rules]`).
+    pub fn resolve_physical_anchors_for_switches(
+        &self,
+        active_switches: &[(&str, &str)],
+    ) -> Result<Option<[f32; 3]>, super::error::DnamError> {
+        let mut best_spec = 0usize;
+        let mut best_anchors: Option<[f32; 3]> = None;
+        let mut tie = false;
+
+        for curve in &self.conditional_physical_anchors {
+            if !curve.anchors.iter().all(|v| v.is_finite()) {
+                return Err(super::error::DnamError::SchemaValidationError(
+                    "conditional_physical_anchors entry contains non-finite anchor".to_string(),
+                ));
+            }
+            if curve.when.is_empty() {
+                continue;
+            }
+            let matches = curve.when.iter().all(|(sw_id, opt_id)| {
+                active_switches
+                    .iter()
+                    .any(|&(a_sw, a_opt)| a_sw == sw_id && a_opt == opt_id)
+            });
+            if !matches {
+                continue;
+            }
+            let spec = curve.when.len();
+            if spec > best_spec {
+                best_spec = spec;
+                best_anchors = Some([
+                    curve.anchors[0] as f32,
+                    curve.anchors[1] as f32,
+                    curve.anchors[2] as f32,
+                ]);
+                tie = false;
+            } else if spec == best_spec {
+                tie = true;
+            }
+        }
+
+        if tie {
+            return Err(super::error::DnamError::SchemaValidationError(
+                "ambiguous conditional_physical_anchors specificity tie".to_string(),
+            ));
+        }
+        Ok(best_anchors.or(self.lobatto_physical_anchors))
+    }
+
+    /// Zero-allocation variant of [`Self::resolve_conditional_target`] borrowing `("sw_id", "opt_id")`.
+    pub fn resolve_conditional_target_borrowed(
         &self,
         target_val: f32,
         fold_octave: bool,
-    ) -> Option<TempoSyncResolution> {
+    ) -> Option<BorrowedTempoTarget<'_>> {
         if !self.conditional_physical_anchors.is_empty() {
-            // Find global [global_lo, global_hi] across all switch throws for optional octave folding
             let mut global_lo = f32::INFINITY;
             let mut global_hi = f32::NEG_INFINITY;
-            for anchors in self.conditional_physical_anchors.values() {
-                let lo = anchors[0].min(anchors[2]);
-                let hi = anchors[0].max(anchors[2]);
+            for curve in &self.conditional_physical_anchors {
+                if curve.when.is_empty() || !curve.anchors.iter().all(|v| v.is_finite()) {
+                    continue;
+                }
+                let a0 = curve.anchors[0] as f32;
+                let a2 = curve.anchors[2] as f32;
+                let lo = a0.min(a2);
+                let hi = a0.max(a2);
                 if lo < global_lo {
                     global_lo = lo;
                 }
                 if hi > global_hi {
                     global_hi = hi;
                 }
+            }
+            if !global_lo.is_finite() || !global_hi.is_finite() {
+                let (u, was_clamped) =
+                    self.physical_value_to_normalized_u(target_val, fold_octave)?;
+                return Some((None, u, was_clamped));
             }
 
             let mut eff_target = target_val;
@@ -193,11 +255,19 @@ impl ControlCalibration {
                 }
             }
 
-            let mut best_key: Option<&str> = None;
-            let mut best_anchors: Option<&[f32; 3]> = None;
+            let mut best_curve: Option<&crate::container::wire::StructuredConditionalCurve> = None;
+            let mut best_anchors = [0.0_f32; 3];
             let mut best_dist = f32::INFINITY;
 
-            for (key, anchors) in &self.conditional_physical_anchors {
+            for curve in &self.conditional_physical_anchors {
+                if curve.when.is_empty() || !curve.anchors.iter().all(|v| v.is_finite()) {
+                    continue;
+                }
+                let anchors = [
+                    curve.anchors[0] as f32,
+                    curve.anchors[1] as f32,
+                    curve.anchors[2] as f32,
+                ];
                 let lo = anchors[0].min(anchors[2]);
                 let hi = anchors[0].max(anchors[2]);
                 let dist = if eff_target < lo {
@@ -209,43 +279,50 @@ impl ControlCalibration {
                 };
                 if dist < best_dist {
                     best_dist = dist;
-                    best_key = Some(key.as_str());
-                    best_anchors = Some(anchors);
+                    best_curve = Some(curve);
+                    best_anchors = anchors;
                     if dist == 0.0 {
                         break;
                     }
                 }
             }
 
-            let key = best_key?;
-            let anchors = best_anchors?;
-            let (u, was_clamped) = Self::invert_lobatto_anchors(anchors, eff_target, false);
-            let switch_sel = key
-                .split_once('=')
-                .map(|(sw_id, opt_id)| (sw_id.to_string(), opt_id.to_string()));
-            return Some(TempoSyncResolution {
-                switch_selection: switch_sel,
-                normalized_u: u,
-                was_clamped,
-            });
+            let curve = best_curve?;
+            let (u, was_clamped) = Self::invert_lobatto_anchors(&best_anchors, eff_target, false);
+            let sw = curve
+                .when
+                .first()
+                .map(|(sw_id, opt_id)| (sw_id.as_str(), opt_id.as_str()));
+            return Some((sw, u, was_clamped));
         }
 
         let (u, was_clamped) = self.physical_value_to_normalized_u(target_val, fold_octave)?;
+        Some((None, u, was_clamped))
+    }
+
+    /// Resolves `target_val` across `conditional_physical_anchors` (if non-empty) or
+    /// `lobatto_physical_anchors`, returning the matching switch throw and normalized $u \in [-1, 1]$.
+    pub fn resolve_conditional_target(
+        &self,
+        target_val: f32,
+        fold_octave: bool,
+    ) -> Option<TempoSyncResolution> {
+        let (sw, normalized_u, was_clamped) =
+            self.resolve_conditional_target_borrowed(target_val, fold_octave)?;
         Some(TempoSyncResolution {
-            switch_selection: None,
-            normalized_u: u,
+            switch_selection: sw.map(|(a, b)| (a.to_string(), b.to_string())),
+            normalized_u,
             was_clamped,
         })
     }
 
-    /// Resolves a MIDI/Host `(bpm, subdivision)` into a [`TempoSyncResolution`] when `role` is
-    /// `DelayTimeMs`, `GrainSizeMs`, or `LfoRateHz`.
-    pub fn resolve_tempo_sync(
+    /// Zero-allocation variant of [`Self::resolve_tempo_sync`] borrowing `("sw_id", "opt_id")`.
+    pub fn resolve_tempo_sync_borrowed(
         &self,
         bpm: f32,
         subdivision: Option<TempoSubdivision>,
         fold_octave: bool,
-    ) -> Option<TempoSyncResolution> {
+    ) -> Option<BorrowedTempoTarget<'_>> {
         let sub = subdivision
             .or(self.tempo_sync_default_subdivision)
             .unwrap_or(TempoSubdivision::Quarter);
@@ -256,7 +333,24 @@ impl ControlCalibration {
             ControlCalibrationRole::LfoRateHz => sub.lfo_hz_at_bpm(bpm),
             _ => return None,
         };
-        self.resolve_conditional_target(target_val, fold_octave)
+        self.resolve_conditional_target_borrowed(target_val, fold_octave)
+    }
+
+    /// Resolves a MIDI/Host `(bpm, subdivision)` into a [`TempoSyncResolution`] when `role` is
+    /// `DelayTimeMs`, `GrainSizeMs`, or `LfoRateHz`.
+    pub fn resolve_tempo_sync(
+        &self,
+        bpm: f32,
+        subdivision: Option<TempoSubdivision>,
+        fold_octave: bool,
+    ) -> Option<TempoSyncResolution> {
+        let (sw, normalized_u, was_clamped) =
+            self.resolve_tempo_sync_borrowed(bpm, subdivision, fold_octave)?;
+        Some(TempoSyncResolution {
+            switch_selection: sw.map(|(a, b)| (a.to_string(), b.to_string())),
+            normalized_u,
+            was_clamped,
+        })
     }
 
     /// Maps a `StereoMode` switch option label (`"Mono"` vs `"Stereo"`) to stereo width $\alpha \in [0.0, 1.0]$.
@@ -341,12 +435,12 @@ pub struct ControlSchemaDef {
     pub safe_clamped_range: Option<[f32; 2]>,
     /// Default value (a JSON number for `range` controls or a JSON string for `switch` controls).
     pub default: serde_json::Value,
-    /// `range` only: Switch-conditioned minimum bounds (`"switch_id=option_id" -> min_val`).
-    #[serde(default)]
-    pub conditional_min: BTreeMap<String, f32>,
-    /// `range` only: Switch-conditioned maximum bounds (`"switch_id=option_id" -> max_val`).
-    #[serde(default)]
-    pub conditional_max: BTreeMap<String, f32>,
+    /// `range` only: Structured switch-conditioned safety bounds (`ref[container.dnam.conditional-rules]`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub conditional_bounds: Vec<crate::container::wire::StructuredConditionalBound>,
+    /// `switch` only: Optional list of option indices represented in `CP1` (`ref[container.dnam.jcs-header-schema]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub represented_switch_options: Option<Vec<u8>>,
     /// `switch` only: All declared switch option IDs (`1..=16`).
     #[serde(default)]
     pub declared_options: Option<Vec<String>>,
@@ -427,10 +521,20 @@ mod tests {
         assert!((TempoSubdivision::SixteenthTriplet.delay_ms_at_bpm(120.0) - 83.3333).abs() < 1e-2);
         assert!((TempoSubdivision::Quarter.lfo_hz_at_bpm(120.0) - 2.0).abs() < 1e-4);
 
-        let mut cond = BTreeMap::new();
-        cond.insert("range=0.01-0.1s".to_string(), [10.0, 55.0, 100.0]);
-        cond.insert("range=0.1-1s".to_string(), [100.0, 550.0, 1000.0]);
-        cond.insert("range=1-2s".to_string(), [1000.0, 1500.0, 2000.0]);
+        let cond = alloc::vec![
+            crate::container::wire::StructuredConditionalCurve {
+                when: alloc::vec![("range".to_string(), "0.01-0.1s".to_string())],
+                anchors: [10.0, 55.0, 100.0],
+            },
+            crate::container::wire::StructuredConditionalCurve {
+                when: alloc::vec![("range".to_string(), "0.1-1s".to_string())],
+                anchors: [100.0, 550.0, 1000.0],
+            },
+            crate::container::wire::StructuredConditionalCurve {
+                when: alloc::vec![("range".to_string(), "1-2s".to_string())],
+                anchors: [1000.0, 1500.0, 2000.0],
+            },
+        ];
 
         let cal = ControlCalibration {
             role: ControlCalibrationRole::DelayTimeMs,
@@ -491,7 +595,7 @@ mod tests {
         let stereo_cal = ControlCalibration {
             role: ControlCalibrationRole::StereoMode,
             lobatto_physical_anchors: None,
-            conditional_physical_anchors: BTreeMap::new(),
+            conditional_physical_anchors: Vec::new(),
             tempo_sync_default_subdivision: None,
         };
         assert_eq!(stereo_cal.stereo_width_for_option("Mono"), Some(0.0));
@@ -502,7 +606,7 @@ mod tests {
         let freeze_cal = ControlCalibration {
             role: ControlCalibrationRole::FreezeLatch,
             lobatto_physical_anchors: None,
-            conditional_physical_anchors: BTreeMap::new(),
+            conditional_physical_anchors: Vec::new(),
             tempo_sync_default_subdivision: None,
         };
         for opt in ["Off", "false", "NORMAL", "bypass", "0"] {
@@ -520,7 +624,7 @@ mod tests {
         let cal_anchors = ControlCalibration {
             role: ControlCalibrationRole::DelayTimeMs,
             lobatto_physical_anchors: Some(anchors),
-            conditional_physical_anchors: BTreeMap::new(),
+            conditional_physical_anchors: Vec::new(),
             tempo_sync_default_subdivision: None,
         };
         assert_eq!(cal_anchors.evaluate_lobatto_anchors(0.0), Some(50.0));
@@ -533,7 +637,7 @@ mod tests {
         let lfo_cal = ControlCalibration {
             role: ControlCalibrationRole::LfoRateHz,
             lobatto_physical_anchors: Some([0.1, 2.0, 10.0]),
-            conditional_physical_anchors: BTreeMap::new(),
+            conditional_physical_anchors: Vec::new(),
             tempo_sync_default_subdivision: Some(TempoSubdivision::Quarter),
         };
         let lfo_res = lfo_cal.resolve_tempo_sync(120.0, None, false).unwrap();
@@ -606,7 +710,7 @@ mod tests {
             let cal = ControlCalibration {
                 role: ControlCalibrationRole::DelayTimeMs,
                 lobatto_physical_anchors: Some([v_min, v_mid, v_max]),
-                conditional_physical_anchors: BTreeMap::new(),
+                conditional_physical_anchors: Vec::new(),
                 tempo_sync_default_subdivision: None,
             };
             let phys = cal.evaluate_lobatto_anchors(u).unwrap();
@@ -614,5 +718,64 @@ mod tests {
             prop_assert!(!was_clamped);
             prop_assert!((u_back - u).abs() < 1e-3);
         }
+    }
+
+    #[test]
+    fn test_resolve_physical_anchors_for_switches_specificity_and_ties() {
+        use crate::container::wire::StructuredConditionalCurve;
+        let cal = ControlCalibration {
+            role: ControlCalibrationRole::DelayTimeMs,
+            lobatto_physical_anchors: Some([5.0, 25.0, 50.0]),
+            conditional_physical_anchors: alloc::vec![
+                StructuredConditionalCurve {
+                    when: alloc::vec![("range".to_string(), "long".to_string())],
+                    anchors: [100.0, 500.0, 1000.0],
+                },
+                StructuredConditionalCurve {
+                    when: alloc::vec![
+                        ("range".to_string(), "long".to_string()),
+                        ("voicing".to_string(), "tape".to_string()),
+                    ],
+                    anchors: [120.0, 600.0, 1200.0],
+                },
+            ],
+            tempo_sync_default_subdivision: None,
+        };
+        assert_eq!(
+            cal.resolve_physical_anchors_for_switches(&[("range", "short")])
+                .unwrap(),
+            Some([5.0, 25.0, 50.0])
+        );
+        assert_eq!(
+            cal.resolve_physical_anchors_for_switches(&[("range", "long"), ("voicing", "clean")])
+                .unwrap(),
+            Some([100.0, 500.0, 1000.0])
+        );
+        assert_eq!(
+            cal.resolve_physical_anchors_for_switches(&[("range", "long"), ("voicing", "tape")])
+                .unwrap(),
+            Some([120.0, 600.0, 1200.0])
+        );
+
+        let tie_cal = ControlCalibration {
+            role: ControlCalibrationRole::DelayTimeMs,
+            lobatto_physical_anchors: None,
+            conditional_physical_anchors: alloc::vec![
+                StructuredConditionalCurve {
+                    when: alloc::vec![("range".to_string(), "long".to_string())],
+                    anchors: [100.0, 500.0, 1000.0],
+                },
+                StructuredConditionalCurve {
+                    when: alloc::vec![("voicing".to_string(), "tape".to_string())],
+                    anchors: [120.0, 600.0, 1200.0],
+                },
+            ],
+            tempo_sync_default_subdivision: None,
+        };
+        assert!(
+            tie_cal
+                .resolve_physical_anchors_for_switches(&[("range", "long"), ("voicing", "tape")])
+                .is_err()
+        );
     }
 }

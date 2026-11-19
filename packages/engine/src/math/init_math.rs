@@ -28,6 +28,18 @@ pub fn floor_f64(x: f64) -> f64 {
     if x < f { f - 1.0 } else { f }
 }
 
+/// Pure `#![no_std]` ceiling for `f32`.
+#[inline(always)]
+pub fn ceil_f32(x: f32) -> f32 {
+    -floor_f32(-x)
+}
+
+/// Pure `#![no_std]` ceiling for `f64`.
+#[inline(always)]
+pub fn ceil_f64(x: f64) -> f64 {
+    -floor_f64(-x)
+}
+
 /// Pure `#![no_std]` round-half-away-from-zero for `f32`.
 #[inline(always)]
 pub fn round_f32(x: f32) -> f32 {

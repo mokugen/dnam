@@ -10,7 +10,6 @@ use crate::math::{
     CERTIFIED_INPUT_ENVELOPE_MIN_F32, SAFETY_CEILING_F32, flush_recursive_state_f32,
     sanitize_input_sample, sanitize_output_sample,
 };
-use crate::stages::stage2_gru::kernels::V3HotScratch;
 use crate::types::FtzDazGuard;
 
 /// Unified multi-port audio I/O descriptor (`Stage 0` 8-port router contract: `in_1..4`, `out_1..4`).
@@ -38,26 +37,49 @@ fn all_within_envelope_bits(slice: &[f32], limit_bits: u32) -> bool {
     true
 }
 
+#[inline(always)]
+pub(crate) fn micro_ramp_advance_clamped(
+    cur: &mut [f32; 16],
+    deltas: &[f32; 16],
+    target: &[f32; 16],
+    steps: f32,
+) {
+    for r in 0..16 {
+        let lo = cur[r].min(target[r]);
+        let hi = cur[r].max(target[r]);
+        cur[r] = (cur[r] + steps * deltas[r]).clamp(lo, hi);
+    }
+}
+
 impl<'a, B: EngineBackend> DnamEngine<'a, B> {
-    /// Synchronizes static control projections, `current_stage_params`, and [`crate::stages::V3HotCore`]
+    /// Synchronizes static control projections, `current_stage_params`, and [`crate::stages::SonaHotSlab`]
     /// conditioning immediately without waiting for the next `3 kHz` tick.
     pub(crate) fn sync_immediate_control_state_inner(&mut self) {
-        let arena = self.arena_storage.as_bytes();
+        let eff_len = self
+            .effective_tier()
+            .expected_arena_bytes()
+            .min(self.arena_storage.as_bytes().len());
+        let arena = &self.arena_storage.as_bytes()[..eff_len];
         self.control_bus.refresh_static_state(arena);
         self.current_stage_params = self.control_bus.stage_targets;
         self.stage_ramp_deltas = [0.0; 16];
         self.hot_core
-            .snap_control_bus_stage_targets(&self.current_stage_params);
+            .snap_control_bus_with_z_stage(&self.current_stage_params, &self.control_bus.z_stage);
     }
 
     /// Executes the decimated `3 kHz` Control Bus tick and updates ramp slopes.
     #[inline(never)]
     pub(crate) fn step_control_tick_3khz(&mut self) {
+        self.current_stage_params = self.control_bus.stage_targets;
         let avg_energy = self.ctrl_energy_accum * self.zoh.alpha_ramp_host;
         self.ctrl_sub_counter = 0;
         self.ctrl_energy_accum = 0.0;
         let det_env = self.stage0_router.detector_envelopes;
-        let arena = self.arena_storage.as_bytes();
+        let eff_len = self
+            .effective_tier()
+            .expected_arena_bytes()
+            .min(self.arena_storage.as_bytes().len());
+        let arena = &self.arena_storage.as_bytes()[..eff_len];
         let _changed = self
             .control_bus
             .tick_3khz_with_detectors(avg_energy, Some(det_env), arena);
@@ -80,11 +102,14 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     fn advance_control_subblock(&mut self, in_l: &[f32], in_r: &[f32]) {
         let n = in_l.len();
         let nf = n as f32;
-        for r in 0..16 {
-            self.current_stage_params[r] += nf * self.stage_ramp_deltas[r];
-        }
+        micro_ramp_advance_clamped(
+            &mut self.current_stage_params,
+            &self.stage_ramp_deltas,
+            &self.control_bus.stage_targets,
+            nf,
+        );
         self.hot_core
-            .apply_control_bus_stage_targets(&self.current_stage_params);
+            .apply_control_bus_with_z_stage(&self.current_stage_params, &self.control_bus.z_stage);
         let mut e = self.ctrl_energy_accum;
         for i in 0..n {
             e += 0.5 * (in_l[i].abs() + in_r[i].abs());
@@ -116,7 +141,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             self.mix_wet_gain * tier_trim
         };
         let width = self.stereo_width;
-        let width_active = !self.hot_core.mono_out && (width - 1.0).abs() > 1.0e-6;
+        let width_active = !self.hot_core.mono_out() && (width - 1.0).abs() > 1.0e-6;
         let mix_active = eff_dry_g != 0.0 || (eff_wet_g - 1.0).abs() > 1.0e-6;
         let ceil_bits = SAFETY_CEILING_F32.to_bits();
 
@@ -158,13 +183,12 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         right_out: &mut [f32],
     ) {
         let num_frames = left_in.len();
-        let mut sc = V3HotScratch::for_core(&self.hot_core);
         let ctrl_active = self.control_bus.num_controls > 0
             || self.control_bus.is_dirty
             || self.control_bus.live_analog_drift_enabled;
         if !ctrl_active {
             self.hot_core
-                .process_subblock_no_ftz(&mut sc, left_in, right_in, left_out, right_out);
+                .process_subblock_with_z_stage_no_ftz(left_in, right_in, left_out, right_out, None);
             self.finalize_stereo_output_slice(left_in, right_in, left_out, right_out);
             return;
         }
@@ -179,13 +203,19 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             let sub_out_l = &mut left_out[off..off + chunk];
             let sub_out_r = &mut right_out[off..off + chunk];
             let nf = chunk as f32;
-            for r in 0..16 {
-                self.current_stage_params[r] += nf * self.stage_ramp_deltas[r];
-            }
-            self.hot_core
-                .apply_control_bus_stage_targets(&self.current_stage_params);
-            self.hot_core
-                .process_subblock_no_ftz(&mut sc, sub_in_l, sub_in_r, sub_out_l, sub_out_r);
+            micro_ramp_advance_clamped(
+                &mut self.current_stage_params,
+                &self.stage_ramp_deltas,
+                &self.control_bus.stage_targets,
+                nf,
+            );
+            self.hot_core.process_subblock_with_z_stage_no_ftz(
+                sub_in_l,
+                sub_in_r,
+                sub_out_l,
+                sub_out_r,
+                Some((&self.current_stage_params, &self.control_bus.z_stage)),
+            );
             let mut e = self.ctrl_energy_accum;
             for i in 0..chunk {
                 e += 0.5 * (sub_in_l[i].abs() + sub_in_r[i].abs());
@@ -203,7 +233,6 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     #[inline(never)]
     fn process_block_chunked_guarded(
         &mut self,
-        sc: &mut V3HotScratch,
         left_in: &[f32],
         right_in: &[f32],
         left_out: &mut [f32],
@@ -214,7 +243,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         let ctrl_active = self.control_bus.num_controls > 0
             || self.control_bus.is_dirty
             || self.control_bus.live_analog_drift_enabled;
-        let is_frozen = self.hot_core.stage4.freeze;
+        let is_frozen = self.hot_core.stage4_freeze();
         let live_scale = if self.bypassed || (self.freeze_mutes_dry && is_frozen) {
             0.0_f32
         } else {
@@ -259,12 +288,12 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             if ctrl_active {
                 self.advance_control_subblock(&eff_l[..n], &eff_r[..n]);
             }
-            self.hot_core.process_subblock_no_ftz(
-                sc,
+            self.hot_core.process_subblock_with_z_stage_no_ftz(
                 &eff_l[..n],
                 &eff_r[..n],
                 &mut left_out[off..off + n],
                 &mut right_out[off..off + n],
+                None,
             );
             self.finalize_stereo_output_slice(
                 &san_l[..n],
@@ -276,14 +305,14 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         }
     }
 
-    /// Low-level single-frame TORA stepping (`0 FDIV`, `0 FSQRT`).
+    /// Low-level single-frame `SONA` stepping (`0 FDIV`, `0 FSQRT`).
     ///
     /// Direct callers must hold a [`FtzDazGuard`] for the enclosing batch. This
     /// method does not perform block-level preview accounting, tempo advancement,
     /// or offline oversampling; use the block APIs when those behaviors are needed.
     #[cfg_attr(feature = "hotpath", hotpath::measure)]
     #[inline(never)]
-    pub fn step_frame_tora(&mut self, in_l: f32, in_r: f32, mono_only: bool) -> [f32; 2] {
+    pub fn step_frame_sona(&mut self, in_l: f32, in_r: f32, mono_only: bool) -> [f32; 2] {
         self.sync_hot_core_tier();
         let in_r = if self.single_input { in_l } else { in_r };
         let in_l = sanitize_input_sample(
@@ -298,13 +327,14 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         );
         if self.bypassed && !self.trails_enabled {
             return if mono_only {
-                [in_l, in_l]
+                let mid = 0.5 * (in_l + in_r);
+                [mid, mid]
             } else {
                 [in_l, in_r]
             };
         }
 
-        let is_frozen = self.hot_core.stage4.freeze;
+        let is_frozen = self.hot_core.stage4_freeze();
         let live_scale = if self.bypassed || (self.freeze_mutes_dry && is_frozen) {
             0.0
         } else {
@@ -321,23 +351,18 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         if self.ctrl_sub_counter >= k_ctrl {
             self.step_control_tick_3khz();
         }
-        if self.control_bus.unified_w_ctrl {
-            crate::control::ControlBus::<B>::step_micro_ramp_16(
-                &mut self.current_stage_params,
-                &self.stage_ramp_deltas,
-            );
-        } else {
-            crate::control::ControlBus::<B>::step_micro_ramp_12(
-                &mut self.current_stage_params,
-                &self.stage_ramp_deltas,
-            );
-        }
+        micro_ramp_advance_clamped(
+            &mut self.current_stage_params,
+            &self.stage_ramp_deltas,
+            &self.control_bus.stage_targets,
+            1.0,
+        );
         self.hot_core
-            .apply_control_bus_stage_targets(&self.current_stage_params);
+            .apply_control_bus_with_z_stage(&self.current_stage_params, &self.control_bus.z_stage);
 
         let [mut wet_l, mut wet_r] = self.hot_core.step_stereo(eff_in_l, eff_in_r);
 
-        if !mono_only && !self.hot_core.mono_out && (self.stereo_width - 1.0).abs() > 1e-6 {
+        if !mono_only && !self.hot_core.mono_out() && (self.stereo_width - 1.0).abs() > 1e-6 {
             let mid = 0.5 * (wet_l + wet_r);
             let side = 0.5 * (wet_l - wet_r);
             wet_l = mid + self.stereo_width * side;
@@ -356,8 +381,14 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             self.mix_wet_gain * tier_trim
         };
 
+        let eff_dry_l = if mono_only { 0.5 * (in_l + in_r) } else { in_l };
+        let eff_wet_l = if mono_only {
+            0.5 * (wet_l + wet_r)
+        } else {
+            wet_l
+        };
         let out_l = sanitize_output_sample(
-            eff_dry_g * in_l + eff_wet_g * wet_l,
+            eff_dry_g * eff_dry_l + eff_wet_g * eff_wet_l,
             &mut self.saturation_flags,
         );
         let out_r = if mono_only {
@@ -374,7 +405,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
     /// Internal 4x oversampled stepping.
     #[inline(never)]
-    pub(crate) fn step_frame_4x_tora(&mut self, in_l: f32, in_r: f32, mono_only: bool) -> [f32; 2] {
+    pub(crate) fn step_frame_4x_sona(&mut self, in_l: f32, in_r: f32, mono_only: bool) -> [f32; 2] {
         let in_r = if self.single_input { in_l } else { in_r };
         let in_l = sanitize_input_sample(
             in_l,
@@ -390,7 +421,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         let up_frames = self.oversampler.upsample_4x(in_l, in_r);
         let mut proc_frames = [[0.0_f32; 2]; 4];
         for (m, frame) in up_frames.iter().enumerate() {
-            proc_frames[m] = self.step_frame_tora(frame[0], frame[1], mono_only);
+            proc_frames[m] = self.step_frame_sona(frame[0], frame[1], mono_only);
         }
         let [dl, dr] = self.oversampler.downsample_4x(proc_frames);
         [
@@ -444,7 +475,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
         if self.offline_bounce {
             for i in 0..num_frames {
-                let [l, r] = self.step_frame_4x_tora(li[i], ri[i], false);
+                let [l, r] = self.step_frame_4x_sona(li[i], ri[i], false);
                 lo[i] = l;
                 ro[i] = r;
             }
@@ -453,15 +484,88 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
         let env_bits = CERTIFIED_INPUT_ENVELOPE_MIN_F32.to_bits();
         let clean_inputs = !self.bypassed
-            && !(self.freeze_mutes_dry && self.hot_core.stage4.freeze)
+            && !(self.freeze_mutes_dry && self.hot_core.stage4_freeze())
             && all_within_envelope_bits(li, env_bits)
             && (self.single_input || all_within_envelope_bits(ri, env_bits));
         if clean_inputs {
             self.process_block_clean_unity_or_ctrl(li, ri, lo, ro);
         } else {
-            let mut sc = V3HotScratch::for_core(&self.hot_core);
-            self.process_block_chunked_guarded(&mut sc, li, ri, lo, ro);
+            self.process_block_chunked_guarded(li, ri, lo, ro);
         }
+    }
+
+    /// Processes a stereo audio block (`Stereo -> Stereo`), matching `process_block`.
+    #[inline]
+    pub fn process_stereo(
+        &mut self,
+        left_in: &[f32],
+        right_in: &[f32],
+        left_out: &mut [f32],
+        right_out: &mut [f32],
+    ) {
+        self.process_block(left_in, right_in, left_out, right_out);
+    }
+
+    /// Processes a stereo audio block into mono (`Stereo -> Mono`), preserving Mid output.
+    pub fn process_stereo_to_mono(
+        &mut self,
+        left_in: &[f32],
+        right_in: &[f32],
+        mono_out: &mut [f32],
+    ) {
+        let _ftz = FtzDazGuard::new();
+        let num_frames = left_in.len().min(right_in.len()).min(mono_out.len());
+        self.tempo_state.advance_frames(num_frames);
+        self.sync_hot_core_tier();
+        let li = &left_in[..num_frames];
+        let ri = if self.single_input {
+            li
+        } else {
+            &right_in[..num_frames]
+        };
+        let mo = &mut mono_out[..num_frames];
+
+        if self.bypassed && !self.trails_enabled {
+            for i in 0..num_frames {
+                let sl = sanitize_input_sample(
+                    li[i],
+                    CERTIFIED_INPUT_ENVELOPE_MIN_F32,
+                    &mut self.saturation_flags,
+                );
+                let sr = sanitize_input_sample(
+                    ri[i],
+                    CERTIFIED_INPUT_ENVELOPE_MIN_F32,
+                    &mut self.saturation_flags,
+                );
+                mo[i] = 0.5 * (sl + sr);
+            }
+            return;
+        }
+        if self.offline_bounce {
+            for i in 0..num_frames {
+                let [l, r] = self.step_frame_4x_sona(li[i], ri[i], true);
+                mo[i] = 0.5 * (l + r);
+            }
+            return;
+        }
+        let prev_mono = self.hot_core.mono_out();
+        self.hot_core.set_mono_out(true);
+        let mut scratch_r = [0.0_f32; 64];
+        let mut off = 0;
+        while off < num_frames {
+            let n = (num_frames - off).min(64);
+            self.process_block_chunked_guarded(
+                &li[off..off + n],
+                &ri[off..off + n],
+                &mut mo[off..off + n],
+                &mut scratch_r[..n],
+            );
+            for i in 0..n {
+                mo[off + i] = 0.5 * (mo[off + i] + scratch_r[i]);
+            }
+            off += n;
+        }
+        self.hot_core.set_mono_out(prev_mono);
     }
 
     /// Processes a mono audio block into true stereo (`Mono -> Stereo`).
@@ -501,23 +605,27 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         }
         if self.offline_bounce {
             for i in 0..num_frames {
-                let [l, _] = self.step_frame_4x_tora(mi[i], mi[i], true);
-                mo[i] = l;
+                let [l, r] = self.step_frame_4x_sona(mi[i], mi[i], false);
+                mo[i] = 0.5 * (l + r);
             }
             return;
         }
-        let mut sc = V3HotScratch::for_core(&self.hot_core);
         let mut scratch_r = [0.0_f32; 64];
+        let is_mono_container = self.hot_core.mono_out();
         let mut off = 0;
         while off < num_frames {
             let n = (num_frames - off).min(64);
             self.process_block_chunked_guarded(
-                &mut sc,
                 &mi[off..off + n],
                 &mi[off..off + n],
                 &mut mo[off..off + n],
                 &mut scratch_r[..n],
             );
+            if !is_mono_container {
+                for i in 0..n {
+                    mo[off + i] = 0.5 * (mo[off + i] + scratch_r[i]);
+                }
+            }
             off += n;
         }
     }
@@ -532,9 +640,9 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         if self.offline_bounce || (self.bypassed && !self.trails_enabled) {
             for i in 0..num_frames {
                 let [l, r] = if self.offline_bounce {
-                    self.step_frame_4x_tora(left_io[i], right_io[i], false)
+                    self.step_frame_4x_sona(left_io[i], right_io[i], false)
                 } else {
-                    self.step_frame_tora(left_io[i], right_io[i], false)
+                    self.step_frame_sona(left_io[i], right_io[i], false)
                 };
                 left_io[i] = l;
                 right_io[i] = r;
@@ -542,7 +650,6 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             return;
         }
 
-        let mut sc = V3HotScratch::for_core(&self.hot_core);
         let mut in_l_buf = [0.0_f32; 64];
         let mut in_r_buf = [0.0_f32; 64];
         let mut off = 0;
@@ -551,7 +658,6 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             in_l_buf[..n].copy_from_slice(&left_io[off..off + n]);
             in_r_buf[..n].copy_from_slice(&right_io[off..off + n]);
             self.process_block_chunked_guarded(
-                &mut sc,
                 &in_l_buf[..n],
                 &in_r_buf[..n],
                 &mut left_io[off..off + n],
@@ -568,7 +674,8 @@ mod tests {
     use crate::engine::DnamEngine;
     use crate::math::ScalarBackend;
     use crate::schema::DnamJsonHeader;
-    use crate::stages::weights::ARENA0_STAGE3_EARLY_FIR_OFFSET;
+    use crate::stages::SonaMatryoshkaModel;
+    use crate::stages::weights::pack_sona_matryoshka_to_arena;
     use crate::types::Tier;
     extern crate alloc;
     use alloc::vec;
@@ -631,13 +738,8 @@ mod tests {
         let mut header = DnamJsonHeader::default_reference();
         header.io_config.inputs = 1;
         let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-        // Populate Stage 0 router (pass-through) + Stage III Early FIR (L/R tap 0)
-        arena[0..4].copy_from_slice(&1.0_f32.to_le_bytes());
-        arena[20..24].copy_from_slice(&1.0_f32.to_le_bytes());
-        arena[ARENA0_STAGE3_EARLY_FIR_OFFSET..ARENA0_STAGE3_EARLY_FIR_OFFSET + 4]
-            .copy_from_slice(&1.0_f32.to_le_bytes());
-        arena[ARENA0_STAGE3_EARLY_FIR_OFFSET + 64..ARENA0_STAGE3_EARLY_FIR_OFFSET + 68]
-            .copy_from_slice(&1.0_f32.to_le_bytes());
+        let mat = SonaMatryoshkaModel::identity(false, false);
+        pack_sona_matryoshka_to_arena(&mat, &mut arena);
         let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
 
         let mut eng_diff =
@@ -646,8 +748,8 @@ mod tests {
             DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
 
         for _ in 0..8 {
-            let y_diff = eng_diff.step_frame_tora(0.25, -0.73, false);
-            let y_same = eng_same.step_frame_tora(0.25, 0.25, false);
+            let y_diff = eng_diff.step_frame_sona(0.25, -0.73, false);
+            let y_same = eng_same.step_frame_sona(0.25, 0.25, false);
             assert_eq!(y_diff[0].to_bits(), y_same[0].to_bits());
             assert_eq!(y_diff[1].to_bits(), y_same[1].to_bits());
         }
@@ -663,6 +765,78 @@ mod tests {
         for i in 0..8 {
             assert_eq!(out_dl[i].to_bits(), out_sl[i].to_bits());
             assert_eq!(out_dr[i].to_bits(), out_sr[i].to_bits());
+        }
+    }
+
+    #[test]
+    fn process_mono_outputs_mid_and_advances_stereo_state() {
+        let mut header = DnamJsonHeader::default_reference();
+        let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+        let mut mat = SonaMatryoshkaModel::identity(false, false);
+        mat.readouts[0].direct_s2_u_gain = [0.25, -0.05];
+        pack_sona_matryoshka_to_arena(&mat, &mut arena);
+        let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+
+        let mut eng_mono =
+            DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
+        let mut eng_st =
+            DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
+
+        let mono_in = [0.4_f32; 32];
+        let mut mono_out = [0.0_f32; 32];
+        let (mut st_l, mut st_r) = ([0.0_f32; 32], [0.0_f32; 32]);
+        eng_mono.process_mono(&mono_in, &mut mono_out);
+        eng_st.process_block(&mono_in, &mono_in, &mut st_l, &mut st_r);
+
+        for i in 0..32 {
+            let expected_mid = 0.5 * (st_l[i] + st_r[i]);
+            assert!((mono_out[i] - expected_mid).abs() < 1.0e-6, "sample {i}");
+        }
+        assert_eq!(
+            eng_mono.hot_core.sample_tick(),
+            eng_st.hot_core.sample_tick()
+        );
+    }
+
+    /// verify[dsp.router.topology-dispatch]
+    #[test]
+    fn test_four_topology_entrypoints_preserve_dual_mic_and_mid_downmix() {
+        let mut header = DnamJsonHeader::default_reference();
+        let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+        let mut mat = SonaMatryoshkaModel::identity(false, false);
+        mat.readouts[0].pre_cab_u_gain = [0.4, -0.3];
+        mat.readouts[0].fir_l[1] = 0.7;
+        mat.readouts[0].fir_r[2] = -0.5;
+        mat.readouts[0].direct_s2_u_gain = [0.25, -0.15];
+        pack_sona_matryoshka_to_arena(&mat, &mut arena);
+        let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+
+        let in_l = [0.35_f32; 24];
+        let in_r = [-0.20_f32; 24];
+        let mut s_l = [0.0_f32; 24];
+        let mut s_r = [0.0_f32; 24];
+        let mut s2m_out = [0.0_f32; 24];
+        let mut m2s_l = [0.0_f32; 24];
+        let mut m2s_r = [0.0_f32; 24];
+        let mut m_out = [0.0_f32; 24];
+
+        let mut e_st =
+            DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
+        let mut e_s2m =
+            DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
+        let mut e_m2s =
+            DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
+        let mut e_mono =
+            DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
+
+        e_st.process_stereo(&in_l, &in_r, &mut s_l, &mut s_r);
+        e_s2m.process_stereo_to_mono(&in_l, &in_r, &mut s2m_out);
+        e_m2s.process_mono_to_stereo(&in_l, &mut m2s_l, &mut m2s_r);
+        e_mono.process_mono(&in_l, &mut m_out);
+
+        for i in 0..24 {
+            assert!((s2m_out[i] - 0.5 * (s_l[i] + s_r[i])).abs() < 1.0e-6);
+            assert!((m_out[i] - 0.5 * (m2s_l[i] + m2s_r[i])).abs() < 1.0e-6);
         }
     }
 }

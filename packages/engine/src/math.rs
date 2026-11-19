@@ -21,6 +21,8 @@ pub mod scalar;
 #[forbid(unsafe_code)]
 pub mod spec_math;
 #[forbid(unsafe_code)]
+pub mod svf_math;
+#[forbid(unsafe_code)]
 pub mod trainer;
 
 #[cfg(target_arch = "aarch64")]
@@ -38,19 +40,24 @@ pub mod wasm;
 pub use backend::{MathBackend, SimdVec4, flush_subnormal_f32_bits};
 pub(crate) use backend::{flush_recursive_state_f32, flush_recursive_state_vec4};
 pub use const_eval::{
-    IEEE754_F32_EXP_BIAS, IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED, IEEE754_F64_RSQRT_SEED,
-    STAGE4_DC_BLOCKER_48K_F32, STAGE4_MAX_G_LIN_BITS_DERIVED, STAGE4_MAX_V_CEIL_BITS_DERIVED,
-    const_abs_f64, const_c1_clamped_tanh_coeffs, const_cos_f64, const_dc_blocker_pole_f32,
-    const_f32_rcp_chebyshev_seed, const_hermite5_quarter_sine_coeffs, const_max_f32_bits_le,
-    const_sin_cos_f64, const_sin_f64, const_sqrt_f64, const_tan_f64,
+    DC_BLOCKER_5HZ_48K_F32, DC_BLOCKER_10HZ_48K_BITS, FULL_SPEC, IEEE754_F32_EXP_BIAS,
+    IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED, IEEE754_F64_RSQRT_SEED, LITE_SPEC,
+    MAX_LOOP_GAIN_F32, MAX_PARALRU_R_F32, PRO_SPEC, STAGE4_DC_BLOCKER_48K_F32,
+    STAGE4_MAX_G_LIN_BITS_DERIVED, STAGE4_MAX_V_CEIL_BITS_DERIVED, SonaTierSpec, ULTRA_SPEC,
+    const_abs_f64, const_c1_clamped_tanh_coeffs, const_cos_f64, const_dc_blocker_pole_bits,
+    const_dc_blocker_pole_f32, const_f32_rcp_chebyshev_seed, const_hermite5_quarter_sine_coeffs,
+    const_max_f32_bits_le, const_max_f32_bits_le_ratio, const_sin_cos_f64, const_sin_f64,
+    const_sqrt_f64, const_tan_f64,
 };
 pub use crc32c::{Crc32cBackend, crc32c, crc32c_slice, crc32c_software_slice};
+pub use dnam_kernels::{InterleavedStereo8, KernelVec4, StereoVec8};
 pub use fp16::{
-    f32_to_fp16, f32_to_fp16 as f32_to_fp16_bits, fp16_to_f32, fp16_to_f32 as fp16_bits_to_f32,
+    f32_to_fp16, f32_to_fp16 as f32_to_fp16_bits, f32_to_fp16_u32, fp16_to_f32,
+    fp16_to_f32 as fp16_bits_to_f32, fp16_u32_to_f32, pack_fp16x2_u32, unpack_fp16x2_u32,
 };
 pub use init_math::{
-    cos_pi_unit_f64, exp_f64, floor_f32, floor_f64, ln_f64, powf_f64, round_f32, round_f64,
-    sqrt_f64,
+    ceil_f32, ceil_f64, cos_pi_unit_f64, exp_f64, floor_f32, floor_f64, ln_f64, powf_f64,
+    round_f32, round_f64, sqrt_f64,
 };
 pub use kernels::{
     algebraic_unit_rotor, algebraic_unit_rotor_f64, clamp_pre_activation, cubic_lagrange_weights,
@@ -74,17 +81,23 @@ pub use spec_math::{
     trust_clip_outward_8d, trust_clip_outward_checked_bits, trust_clip_reference_bisection_bits,
     upper_product_f64, upper_sum_squares_f64, widen_f32_bits,
 };
+pub use svf_math::{
+    SVF_G_MAX, SVF_W_MAX, algebraic_softclip_vec4, exp2_signed_oct_f32, recip_nr2_pos_f32,
+    recip_nr2_pos_vec4, recip_nr3_pos_f32, recip_nr3_pos_vec4, rsqrt_nr2_f32, rsqrt_nr2_vec4,
+    rsqrt_nr3_f32, rsqrt_nr3_vec4, tan_prewarp_f32, tan_prewarp_vec4, zero_dc_asym_sat_vec4,
+};
 pub use trainer::{ScalarF64Vec2, SimdF64Vec2, TrainerMathBackend};
 
 #[cfg(target_arch = "aarch64")]
 pub use aarch64::{
-    ArmSmeBackend, ArmSve2Backend, NeonBackend, NeonF64Vec2, NeonVec4, Sve2F64Vec2, Sve2Vec4,
+    ArmSmeBackend, ArmSve2Backend, NeonBackend, NeonF64Vec2, NeonStereo8, NeonVec4, SmeStereo8,
+    Sve2F64Vec2, Sve2Stereo8, Sve2Vec4,
 };
 
 #[cfg(target_arch = "x86_64")]
 pub use x86::{
-    Avx2FmaF64Vec2, Avx2FmaVec4, Sse2F64Vec2, Sse2Vec4, Sse42Vec4, X86Avx2FmaBackend,
-    X86SimdBackend, X86Sse2Backend, X86Sse42Backend, X86Vec4,
+    Avx2FmaF64Vec2, Avx2FmaVec4, Avx2Stereo8, Sse2F64Vec2, Sse2Vec4, Sse42Vec4, X86Avx2FmaBackend,
+    X86SimdBackend, X86Sse2Backend, X86Sse42Backend, X86Stereo8, X86Vec4,
 };
 
 #[cfg(target_arch = "wasm32")]
@@ -154,9 +167,20 @@ impl BackendKind {
     }
 }
 
+/// Pre-warms all architecture-specific runtime CPU SIMD and CRC32C feature caches outside the
+/// real-time audio path so hot vector kernels execute only relaxed atomic flag loads.
+#[inline]
+pub fn warm_simd_feature_caches() {
+    #[cfg(target_arch = "aarch64")]
+    aarch64::warm_aarch64_feature_caches();
+    #[cfg(target_arch = "x86_64")]
+    x86::warm_x86_feature_caches();
+}
+
 /// Detects the highest-performance hardware math backend supported by the current CPU at runtime.
 #[inline]
 pub fn detect_best_backend() -> BackendKind {
+    warm_simd_feature_caches();
     #[cfg(target_arch = "aarch64")]
     {
         aarch64::detect_aarch64_backend()

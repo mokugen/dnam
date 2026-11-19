@@ -149,7 +149,7 @@ All integer and floating-point fields use `zerocopy::byteorder::little_endian::{
 
 | Offset | Bytes | LE Wire Type | Field Name | Clean-Room Validation Invariant |
 | :---: | :---: | :--- | :--- | :--- |
-| `0..1` | `1` | `u8` | `ctrl_kind` | `0 = Range`, `1 = Switch`, `2 = BilinearCrossTerm` (`aux` / `partner_control_id` pairs two range controls to emit `psi = u_norm(ctrl) * u_norm(partner)`), `0xFF = UnusedSlot` |
+| `0..1` | `1` | `u8` | `ctrl_kind` | `0 = Range`, `1 = Switch`, `0xFF = UnusedSlot` (`2 = BilinearCrossTerm` appears only in `CP1` contributor records; see §2.4) |
 | `1..2` | `1` | `u8` | `lobatto_degree` | Lobatto degree `k` (`Range`), or `num_declared_options - 1` (`Switch`) |
 | `2..4` | `2` | `u16le` | `active_options_mask` | Observed/active switch option bitmask |
 | `4..8` | `4` | `f32le` | `default_val` | Default physical value (`Range`) or option index (`Switch`) |
@@ -159,7 +159,7 @@ All integer and floating-point fields use `zerocopy::byteorder::little_endian::{
 | `20..24` | `4` | `f32le` | `offset_norm` | Normalization offset `-(x_max + x_min) / (x_max - x_min)` pairing with `scale_norm` so `[x_min, x_max]` maps linearly into `[-1.0, +1.0]` |
 | `24..36` | `12` | `[f32le; 3]` | `anchor_nodes_norm` | Normalized Lobatto anchor coordinates `t in [-1, +1]` |
 | `36..40` | `4` | `u32le` | `_reserved` | Must equal `0` |
-| `40..64` | `24` | `[ConditionalClampRuleWire; 3]` | `cond_rules` | Up to `3` conditional bounds (`8 B` each: `+0..2` `switch_ctrl_idx: u16le`, `+2` `switch_opt_idx: u8`, `+3` `rule_op: u8` (`0=none, 1=max_ceil, 2=min_floor`), `+4..8` `bound_val: f32le`) |
+| `40..64` | `24` | `[ConditionalClampRuleWire; 3]` | `cond_rules` | Up to `3` conditional bound slots (`8 B` each: `+0..2` `switch_ctrl_idx: u16le`, `+2` `switch_opt_idx: u8`, `+3` `rule_op: u8` (`0=none, 1=max_ceil, 2=min_floor, 3=and_prefix, 5=and_max_keep, 6=and_min_end`), `+4..8` `bound_val: f32le`); header compilation fails closed if `conditional_bounds` require `> 3` wire slots |
 
 ### 1.2 Open `.dnam` Structural Layout
 
@@ -271,14 +271,14 @@ Every slice declared in `tensor_directory` has a 64-byte-aligned `byte_offset` r
 1. **`Stage0CrossbarWire` (`256 B`, `Arena 0` `0..256`):**
    - `0..64`: `s_router: [[f32le; 4]; 4]` (`64 B`) — 4-port `S_router` (`S_ret->send == 0`).
    - `64..128`: `meta: SonaMetaWire` (`64 B`, `ARENA0_META_OFFSET = 64`):
-     - `64..68` (`+0`): `pipeline_flags: u32le` (`ARENA0_PIPELINE_FLAGS_OFFSET = 64`) — upper half `PIPE_MAGIC_HI = 0x444E_0000` (`PIPE_MAGIC_MASK = 0xFFFF_0000`); lower bits: `1<<0` `PIPE_FLAG_ZERO_OP_T_PRE`, `1<<1` `PIPE_FLAG_STAGE1_EXT`, `1<<2` `PIPE_FLAG_STAGE2_EXT`, `1<<3` `PIPE_FLAG_STAGE3_EXT`, `1<<4` `PIPE_FLAG_STAGE4_EXT`, `1<<5` `PIPE_FLAG_UNIFIED_W_CTRL`, `1<<6` `PIPE_FLAG_V3_MATRYOSHKA`, `1<<7` `PIPE_FLAG_SONA` (`PIPE_FLAG_ALL_V2 = 0x00FF`).
+     - `64..68` (`+0`): `pipeline_flags: u32le` (`ARENA0_PIPELINE_FLAGS_OFFSET = 64`) — upper half `PIPE_MAGIC_HI = 0x444E_0000` (`PIPE_MAGIC_MASK = 0xFFFF_0000`); lower bits: `1<<0` `PIPE_FLAG_ZERO_OP_T_PRE` (reserved `0`), `1<<1` `PIPE_FLAG_STAGE1_EXT` (reserved `0`), `1<<2` `PIPE_FLAG_STAGE2_EXT` (reserved `0`), `1<<3` `PIPE_FLAG_STAGE3_EXT`, `1<<4` `PIPE_FLAG_STAGE4_EXT`, `1<<5` `PIPE_FLAG_UNIFIED_W_CTRL`, `1<<6` `PIPE_FLAG_V3_MATRYOSHKA`, `1<<7` `PIPE_FLAG_SONA` (`PIPE_FLAG_ALL_SONA = 0x00F8`).
      - `68..84` (`+4`): `tier_gain_trim: [f32le; 4]` (`ARENA0_TIER_GAIN_TRIM_OFFSET = 68`) — `[Lite, Full, Pro, Ultra]` output trim (`<= 0.05 LU`).
      - `84..88` (`+20`): `v3_meta_flags: u32le` (`ARENA0_V3_META_OFFSET = 84`, mirrored identically in `SonaCellDescWire.cell_flags` at `204..208`):
        - Bits `0..=3`: `tier_os2x[0..4]` (`1<<0` Lite, `1<<1` Full, `1<<2` Pro, `1<<3` Ultra).
        - Bit `4` (`0x0000_0010`): `V3_META_OS2X` (master `2×` oversampling enable).
        - Bit `5` (`0x0000_0020`): Reserved (`0`; legacy `rate_1x_cal` eliminated).
        - Bit `6` (`0x0000_0040`): `SONA_META_TIER_OS_EXPLICIT` — when `1`, bits `0..=3` authoritatively specify `tier_os2x[0..4]` verbatim so disabling `2×` OS on any tier round-trips without `SonaTierSpec.oversample_factor > 1` fallback override; when `0`, loaders OR bits `0..=3` with `[false, true, true, true]`.
-       - Bit `7` (`0x0000_0080`): `V3_META_STAGE3_PREFIX_OVERRIDES`.
+       - Bit `7` (`0x0000_0080`): `V3_META_STAGE3_PREFIX_OVERRIDES` — encoders set this bit iff any packed tier `t in 1..=3` (`Full`: `fir[0..32]`/`kautz[0..8]`; `Pro`: `fir[0..48]`/`kautz[0..12]`; `Ultra`: `fir[0..96]`/`kautz[0..24]`) overrides its preceding tier's Stage III prefix readout by `> 1e-7`; when `0`, decoders retain the inherited `f32` `Stage3Fir*Wire`/`KautzSoaBlockWire` prefix weights verbatim; when `1`, decoders apply `Stage3PrefixOverride*Wire` (`f32`) plus the `VarProReadout*Wire` `fp16` Stage III override slots (`[296..352]` in `Full`, `[392..452]` in `Pro`, `[488..656]` in `Ultra`, with trailing spare words strictly `0x0000`).
        - Bit `8` (`0x0000_0100`): `SONA_META_OS_EXT_PRESENT` — guards the full `64 B` `SonaOsAndExtWire` slice (`128..192`); when `1`, all `16` `f32le` fields (`os_ext` oversampler and Stage 0 extended mix/`Op-P` parameters across `128..192`) are decoded and clamped verbatim even when `os_up_quad_coeff == 0.0 && os_dec_c0 == 0.0`, preventing default replacement on reload.
        - Bit `9` (`0x0000_0200`): `V3_META_CORE_MODS_PRESENT` — guards `Arena 3` `SonaCoreUltraDeltaWire.stage_latent_core_mods_fp16[0..1024]` (`18,048..20,096` rel. `tier_start`); all `1,024` `u16le` entries (`2,048 B`) are zeroed (`0x0000`) unless this bit is set (`1`).
        - Bits `16..=20`: `1<<16` `V3_META_STAGE4_TAP_GAINS`, `1<<17` `V3_META_STAGE0_EXT`, `1<<18` `V3_META_STAGE0_ROUTE_CLEAN`, `1<<19` `V3_META_STAGE0_SUB2_PHASE`, `1<<20` `V3_META_STAGE4_LFO`.

@@ -348,6 +348,29 @@ impl<'a> DynamicDnamEngine<'a> {
         dispatch_engine!(self, e => e.process_block(left_in, right_in, left_out, right_out))
     }
 
+    /// Processes a stereo audio block (`Stereo -> Stereo`), matching `process_block`.
+    #[inline]
+    pub fn process_stereo(
+        &mut self,
+        left_in: &[f32],
+        right_in: &[f32],
+        left_out: &mut [f32],
+        right_out: &mut [f32],
+    ) {
+        dispatch_engine!(self, e => e.process_stereo(left_in, right_in, left_out, right_out))
+    }
+
+    /// Processes a stereo audio block into mono (`Stereo -> Mono`).
+    #[inline]
+    pub fn process_stereo_to_mono(
+        &mut self,
+        left_in: &[f32],
+        right_in: &[f32],
+        mono_out: &mut [f32],
+    ) {
+        dispatch_engine!(self, e => e.process_stereo_to_mono(left_in, right_in, mono_out))
+    }
+
     /// Processes a mono audio block into true stereo (`Mono -> Stereo`).
     #[inline]
     pub fn process_mono_to_stereo(
@@ -363,6 +386,71 @@ impl<'a> DynamicDnamEngine<'a> {
     #[inline]
     pub fn process_mono(&mut self, mono_in: &[f32], mono_out: &mut [f32]) {
         dispatch_engine!(self, e => e.process_mono(mono_in, mono_out))
+    }
+
+    /// Processes a multi-port audio block (`1-to-4` channel input/output topology).
+    pub fn process_block_io(&mut self, io: crate::engine::DnamAudioIo<'_>) {
+        dispatch_engine!(self, e => e.process_block_io(io))
+    }
+
+    /// Processes a 4-Cable Method (`4CM`) block (`[inst_l, inst_r, ret_l, ret_r] -> [main_l, main_r, send_l, send_r]`).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "4-Cable Method exposes explicit 4 stereo I/O port buffers"
+    )]
+    pub fn process_block_4cm(
+        &mut self,
+        inst_l: &[f32],
+        inst_r: &[f32],
+        ret_l: &[f32],
+        ret_r: &[f32],
+        main_l: &mut [f32],
+        main_r: &mut [f32],
+        send_l: &mut [f32],
+        send_r: &mut [f32],
+    ) {
+        dispatch_engine!(self, e => e.process_block_4cm(
+            inst_l, inst_r, ret_l, ret_r, main_l, main_r, send_l, send_r
+        ))
+    }
+
+    /// Processes a Wet/Dry/Wet (`WDW`) 3-output block (`[in_l, in_r] -> [wet_l, wet_r, dry_center]`).
+    pub fn process_block_wdw(
+        &mut self,
+        in_l: &[f32],
+        in_r: &[f32],
+        wet_l: &mut [f32],
+        wet_r: &mut [f32],
+        dry_center: &mut [f32],
+    ) {
+        dispatch_engine!(self, e => e.process_block_wdw(in_l, in_r, wet_l, wet_r, dry_center))
+    }
+
+    /// Processes a sidechain / auxiliary return stereo block (`[main_l, main_r, aux_l, aux_r] -> [out_l, out_r]`).
+    pub fn process_block_sidechain(
+        &mut self,
+        main_l: &[f32],
+        main_r: &[f32],
+        aux_l: &[f32],
+        aux_r: &[f32],
+        out_l: &mut [f32],
+        out_r: &mut [f32],
+    ) {
+        dispatch_engine!(
+            self,
+            e => e.process_block_sidechain(main_l, main_r, aux_l, aux_r, out_l, out_r)
+        )
+    }
+
+    /// Hot-swaps a new canonical `v3.0` `"sona"` `.dnam` model in-place without heap allocations
+    /// (`bytes` must live for `'a`).
+    pub fn reload_model_in_place(
+        &mut self,
+        bytes: &'a [u8],
+        tier: Tier,
+        sample_rate_hz: u32,
+    ) -> Result<(), DnamError> {
+        dispatch_engine!(self, e => e.reload_model_in_place(bytes, tier, sample_rate_hz))
     }
 
     /// Hot-swaps a new `.dnam` model in-place into an owned engine without requiring `bytes`
@@ -485,7 +573,35 @@ mod tests {
             dyn_eng.process_block_in_place(&mut l_ip, &mut r_ip);
             dyn_eng.process_mono_to_stereo(&l_in, &mut l_out, &mut r_out);
             dyn_eng.process_mono(&l_in, &mut l_out);
+            dyn_eng.process_block_io(crate::engine::DnamAudioIo {
+                in_1: &l_in,
+                in_2: Some(&r_in),
+                in_3: None,
+                in_4: None,
+                out_1: &mut l_out,
+                out_2: Some(&mut r_out),
+                out_3: None,
+                out_4: None,
+            });
+            let mut send_l = [0.0f32; 32];
+            let mut send_r = [0.0f32; 32];
+            dyn_eng.process_block_4cm(
+                &l_in,
+                &r_in,
+                &l_in,
+                &r_in,
+                &mut l_out,
+                &mut r_out,
+                &mut send_l,
+                &mut send_r,
+            );
+            let mut dry_center = [0.0f32; 32];
+            dyn_eng.process_block_wdw(&l_in, &r_in, &mut l_out, &mut r_out, &mut dry_center);
+            dyn_eng.process_block_sidechain(&l_in, &r_in, &l_in, &r_in, &mut l_out, &mut r_out);
             dyn_eng.reset_to_dc_equilibrium();
+            dyn_eng
+                .reload_model_in_place(&container, Tier::Lite, 48_000)
+                .unwrap();
             dyn_eng
                 .reload_model_in_place_owned(&container, Tier::Lite, 48_000)
                 .unwrap();

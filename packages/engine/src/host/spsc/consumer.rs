@@ -8,7 +8,8 @@ use crate::dynamic::DynamicDnamEngine;
 
 use super::ring::{
     ControlCommand, ControlUpdateMode, ControlValueKind, FALLBACK_WORDS, FallbackSnapshot,
-    Lane1Entry, MAX_CONTROLS, SPSC_RING_MASK, SpscControlRing, unpack_lane1_slot,
+    Lane1Entry, MAX_CONTROLS, RingEntry, SPSC_RING_CAPACITY, SPSC_RING_MASK, SpscControlRing,
+    unpack_lane1_slot,
 };
 
 /// Tracks any explicit `offline_bounce` or `maximize_tier_on_bounce` transitions drained during
@@ -29,13 +30,16 @@ pub struct DrainedBounceOverrides {
 pub struct ControlConsumer {
     pub(crate) ring: Arc<SpscControlRing>,
     pub(crate) drained_causal_epoch: u64,
+    pub(crate) last_consumed_gen: u64,
 }
 
 impl ControlConsumer {
     /// Returns `true` if any of the 3 SPSC lanes has pending control updates.
     #[inline]
     pub fn has_pending(&self) -> bool {
-        if self.ring.fallback_epoch.load(Ordering::Acquire) != 0 {
+        if self.ring.fallback_gen.load(Ordering::Acquire)
+            > self.ring.consumed_fallback_gen.load(Ordering::Acquire)
+        {
             return true;
         }
         let tail = self.ring.tail.value.load(Ordering::Relaxed);
@@ -99,13 +103,115 @@ impl ControlConsumer {
         &mut self,
         engine: &mut DynamicDnamEngine<'_>,
     ) -> (usize, DrainedBounceOverrides) {
+        let mut l1_raw = [(0_u16, 0_u64); 256];
+        let mut l1_raw_len;
+        let default_ring_entry = RingEntry {
+            epoch: 0,
+            cmd: ControlCommand::ResetAllControls,
+        };
+        let mut l2_buf = [default_ring_entry; SPSC_RING_CAPACITY];
+        let mut l2_len;
+        let mut l2_head;
+        let mut fb_opt;
+        let mut fb_base;
+        let mut fb_causal;
+        let mut base_snapshot;
+        let mut consumed_gen_next;
+
+        // Lock-free consistent snapshot of all 3 lanes inside `fallback_seq` + `fallback_gen`.
+        loop {
+            let s1 = self.ring.fallback_seq.value.load(Ordering::Acquire);
+            if (s1 & 1) != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            let cur_gen = self.ring.fallback_gen.load(Ordering::Acquire);
+            let min_seen = self
+                .last_consumed_gen
+                .max(self.ring.consumed_fallback_gen.load(Ordering::Acquire));
+            consumed_gen_next = min_seen;
+            base_snapshot = self.ring.epoch_base.load(Ordering::Acquire);
+
+            let (snap, l2_cutoff, s_fb_base, s_fb_causal) = if cur_gen > min_seen {
+                let cutoff = self.ring.fallback_l2_head.load(Ordering::Relaxed);
+                let b = self.ring.fallback_epoch_base.load(Ordering::Relaxed);
+                let c = self.ring.fallback_causal_epoch.load(Ordering::Relaxed);
+                let mut words = [0_u64; FALLBACK_WORDS];
+                for (dst, slot) in words.iter_mut().zip(self.ring.fallback_words.iter()) {
+                    *dst = slot.load(Ordering::Relaxed);
+                }
+                consumed_gen_next = cur_gen;
+                (
+                    Some(FallbackSnapshot::from_words(&words)),
+                    Some(cutoff),
+                    b,
+                    c,
+                )
+            } else {
+                (None, None, 0, 0)
+            };
+            fb_opt = snap;
+            fb_base = s_fb_base;
+            fb_causal = s_fb_causal;
+
+            l1_raw_len = 0;
+            for (idx, slot) in self.ring.lane1_slots.iter().enumerate() {
+                let word = slot.load(Ordering::Acquire);
+                if word != 0 {
+                    l1_raw[l1_raw_len] = (idx as u16, word);
+                    l1_raw_len += 1;
+                }
+            }
+            for (ext_i, slot) in self.ring.lane1_ext.iter().enumerate() {
+                let word = slot.load(Ordering::Acquire);
+                if word != 0 && l1_raw_len < l1_raw.len() {
+                    l1_raw[l1_raw_len] = ((MAX_CONTROLS + ext_i) as u16, word);
+                    l1_raw_len += 1;
+                }
+            }
+
+            let mut l2_tail = self.ring.tail.value.load(Ordering::Relaxed);
+            l2_head = self.ring.head.value.load(Ordering::Acquire);
+            if let Some(cutoff) = l2_cutoff
+                && l2_head.wrapping_sub(cutoff) <= l2_head.wrapping_sub(l2_tail)
+            {
+                l2_tail = cutoff;
+            }
+            let avail = l2_head.wrapping_sub(l2_tail).min(SPSC_RING_CAPACITY);
+            l2_len = 0;
+            for offset in 0..avail {
+                l2_buf[l2_len] =
+                    self.ring.lane2_slots[l2_tail.wrapping_add(offset) & SPSC_RING_MASK].load();
+                l2_len += 1;
+            }
+
+            fence(Ordering::Acquire);
+            let s2 = self.ring.fallback_seq.value.load(Ordering::Relaxed);
+            let gen_after = self.ring.fallback_gen.load(Ordering::Acquire);
+            if s1 == s2 && gen_after == cur_gen {
+                break;
+            }
+            core::hint::spin_loop();
+        }
+
+        // Commit consumed generation, Lane 1 CAS clears (preserving newer post-snapshot writes),
+        // and Lane 2 `tail` advancement only after consistent snapshot verification.
+        self.last_consumed_gen = consumed_gen_next;
+        self.ring
+            .consumed_fallback_gen
+            .store(consumed_gen_next, Ordering::Release);
+        for &(ctrl_idx, raw_word) in &l1_raw[..l1_raw_len] {
+            if let Some(slot) = self.ring.lane1_slot(ctrl_idx as usize) {
+                let _ = slot.compare_exchange(raw_word, 0, Ordering::AcqRel, Ordering::Relaxed);
+            }
+        }
+        self.ring.tail.value.store(l2_head, Ordering::Release);
+
         let mut applied_count = 0_usize;
         let mut max_drained_epoch_29 = 0_u32;
         let mut bounce_overrides = DrainedBounceOverrides::default();
-
-        // 1. Drain Lane 3 (Overflow-Proof Full-Reset Epoch Latch) if active.
         let mut min_epoch_after_latch = 0_u32;
-        let fb_opt = self.take_lane3_fallback();
+
         if let Some(ref fb) = fb_opt {
             min_epoch_after_latch = fb.epoch;
             max_drained_epoch_29 = max_drained_epoch_29.max(fb.epoch);
@@ -113,8 +219,6 @@ impl ControlConsumer {
             bounce_overrides.maximize_tier_on_bounce = Some(fb.maximize_tier_on_bounce);
         }
 
-        // 2. Collect active Lane 1 inline (`0..32`) and extended (`32..256`) slots on the stack
-        //    and sort by ascending epoch.
         let default_entry = Lane1Entry {
             epoch: 0,
             mode: ControlUpdateMode::Slewed,
@@ -126,27 +230,18 @@ impl ControlConsumer {
         let mut ext_fb_buf = [(0_u16, default_entry); 256 - MAX_CONTROLS];
         let mut ext_fb_len = 0_usize;
 
-        for (idx, slot) in self.ring.lane1_slots.iter().enumerate() {
-            let word = slot.swap(0, Ordering::AcqRel);
+        for &(ctrl_idx, word) in &l1_raw[..l1_raw_len] {
             if let Some(entry) = unpack_lane1_slot(word) {
-                max_drained_epoch_29 = max_drained_epoch_29.max(entry.epoch);
-                if entry.epoch > min_epoch_after_latch {
-                    lane1_buf[lane1_len] = (idx as u16, entry);
-                    lane1_len += 1;
-                }
-            }
-        }
-        for (ext_i, slot) in self.ring.lane1_ext.iter().enumerate() {
-            let word = slot.swap(0, Ordering::AcqRel);
-            if let Some(entry) = unpack_lane1_slot(word) {
-                let ctrl_idx = (MAX_CONTROLS + ext_i) as u16;
                 max_drained_epoch_29 = max_drained_epoch_29.max(entry.epoch);
                 if entry.epoch > min_epoch_after_latch {
                     if lane1_len < lane1_buf.len() {
                         lane1_buf[lane1_len] = (ctrl_idx, entry);
                         lane1_len += 1;
                     }
-                } else if fb_opt.is_some() && ext_fb_len < ext_fb_buf.len() {
+                } else if (ctrl_idx as usize) >= MAX_CONTROLS
+                    && fb_opt.is_some()
+                    && ext_fb_len < ext_fb_buf.len()
+                {
                     ext_fb_buf[ext_fb_len] = (ctrl_idx, entry);
                     ext_fb_len += 1;
                 }
@@ -169,14 +264,13 @@ impl ControlConsumer {
             lane1_buf[j] = key;
         }
 
-        // 3. Two-way causal merge of Lane 2 FIFO ring and sorted Lane 1 stack buffer.
-        let mut tail = self.ring.tail.value.load(Ordering::Relaxed);
-        let head = self.ring.head.value.load(Ordering::Acquire);
+        // Two-way causal merge of snapshotted Lane 2 entries and sorted Lane 1 stack buffer.
+        let mut l2_idx = 0_usize;
         let mut l1_idx = 0_usize;
 
-        while tail != head || l1_idx < lane1_len {
-            let next_l2 = if tail != head {
-                Some(self.ring.lane2_slots[tail & SPSC_RING_MASK].load())
+        while l2_idx < l2_len || l1_idx < lane1_len {
+            let next_l2 = if l2_idx < l2_len {
+                Some(l2_buf[l2_idx])
             } else {
                 None
             };
@@ -185,7 +279,7 @@ impl ControlConsumer {
                 && l2_entry.epoch <= min_epoch_after_latch
             {
                 max_drained_epoch_29 = max_drained_epoch_29.max(l2_entry.epoch);
-                tail = tail.wrapping_add(1);
+                l2_idx += 1;
                 continue;
             }
 
@@ -202,7 +296,7 @@ impl ControlConsumer {
                 self.apply_lane1_entry(engine, ctrl_idx as usize, entry);
                 applied_count += 1;
             } else if let Some(l2_entry) = next_l2 {
-                tail = tail.wrapping_add(1);
+                l2_idx += 1;
                 max_drained_epoch_29 = max_drained_epoch_29.max(l2_entry.epoch);
                 match l2_entry.cmd {
                     ControlCommand::SetOfflineBounce { enabled } => {
@@ -218,51 +312,16 @@ impl ControlConsumer {
             }
         }
 
-        self.ring.tail.value.store(tail, Ordering::Release);
-
-        if max_drained_epoch_29 > 0 {
-            let base = self.ring.epoch_base.load(Ordering::Acquire);
-            let target_causal = base.wrapping_add(max_drained_epoch_29 as u64);
-            self.advance_causal_epoch(target_causal);
+        if let Some(ref _fb) = fb_opt {
+            self.advance_causal_epoch(fb_causal);
+            if max_drained_epoch_29 > 0 {
+                self.advance_causal_epoch(fb_base.wrapping_add(max_drained_epoch_29 as u64));
+            }
+        } else if max_drained_epoch_29 > 0 {
+            self.advance_causal_epoch(base_snapshot.wrapping_add(max_drained_epoch_29 as u64));
         }
         self.publish_total_frames(engine);
         (applied_count, bounce_overrides)
-    }
-
-    fn take_lane3_fallback(&self) -> Option<FallbackSnapshot> {
-        let ep = self.ring.fallback_epoch.load(Ordering::Acquire);
-        if ep == 0 {
-            return None;
-        }
-        loop {
-            let s1 = self.ring.fallback_seq.value.load(Ordering::Acquire);
-            if (s1 & 1) != 0 {
-                core::hint::spin_loop();
-                continue;
-            }
-            let mut words = [0_u64; FALLBACK_WORDS];
-            for (dst, slot) in words.iter_mut().zip(self.ring.fallback_words.iter()) {
-                *dst = slot.load(Ordering::Relaxed);
-            }
-            fence(Ordering::Acquire);
-            let s2 = self.ring.fallback_seq.value.load(Ordering::Relaxed);
-            if s1 == s2 {
-                let snap = FallbackSnapshot::from_words(&words);
-                if snap.epoch == 0 {
-                    return None;
-                }
-                if self
-                    .ring
-                    .fallback_epoch
-                    .compare_exchange(snap.epoch, 0, Ordering::AcqRel, Ordering::Relaxed)
-                    .is_ok()
-                {
-                    self.ring.fallback_reset_engine.store(0, Ordering::Release);
-                }
-                return Some(snap);
-            }
-            core::hint::spin_loop();
-        }
     }
 
     fn apply_fallback_snapshot(
@@ -448,8 +507,8 @@ mod tests {
                     declared_range: None,
                     safe_clamped_range: None,
                     default: serde_json::json!("A"),
-                    conditional_min: BTreeMap::new(),
-                    conditional_max: BTreeMap::new(),
+                    conditional_bounds: Vec::new(),
+                    represented_switch_options: None,
                     declared_options: Some(vec![String::from("A"), String::from("B")]),
                     active_options: Some(vec![String::from("A"), String::from("B")]),
                     clamp_warning: None,
@@ -468,8 +527,8 @@ mod tests {
                     declared_range: Some([0.0, 10.0]),
                     safe_clamped_range: Some([0.0, 10.0]),
                     default: serde_json::json!(2.0),
-                    conditional_min: BTreeMap::new(),
-                    conditional_max: BTreeMap::new(),
+                    conditional_bounds: Vec::new(),
+                    represented_switch_options: None,
                     declared_options: None,
                     active_options: None,
                     clamp_warning: None,
@@ -534,9 +593,11 @@ mod tests {
             }
         }
         assert!(consumer.has_pending());
+        assert!(producer.latched_reset_sticky);
+        assert!(producer.overflow_latch_count() >= 1);
         assert_eq!(
-            producer.ring.fallback_reset_engine.load(Ordering::Acquire),
-            1
+            producer.ring.fallback_gen.load(Ordering::Acquire),
+            producer.overflow_latch_count() as u64
         );
         // Latch stereo_width into Lane 3, then queue post-latch Lane 1 updates (both inline and extended)
         producer.set_stereo_width(1.3);
@@ -623,5 +684,103 @@ mod tests {
             prop_assert_eq!(engine.is_frozen(), producer.shadow().is_frozen());
             prop_assert!((engine.stereo_width() - producer.shadow().stereo_width()).abs() < 1e-6);
         }
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn test_spsc_2thread_concurrent_overflow_and_epoch_wrap_stress() {
+        let container = build_consumer_test_container(40);
+        let mut engine = DynamicDnamEngine::from_bytes_owned_with_backend(
+            &container,
+            Tier::Ultra,
+            48_000,
+            BackendKind::Scalar,
+        )
+        .unwrap();
+        let (mut producer, mut consumer) = spsc_control_channel(&engine);
+
+        let done = core::sync::atomic::AtomicBool::new(false);
+        let expected_shadow = std::thread::scope(|scope| {
+            let done_ref = &done;
+
+            let prod_handle = scope.spawn(move || {
+                for step in 0..4_000_usize {
+                    let v = ((step % 97) as f32) * 0.1;
+                    producer.set_control_value(step % 32, v);
+                    producer.set_control_immediate(32 + (step % 8), v * 0.5);
+                    if step % 17 == 0 {
+                        producer.set_control_immediate(34, (step & 1) as f32);
+                    }
+                    if step % 23 == 0 {
+                        producer.set_bypass((step & 1) != 0, (step & 2) != 0);
+                        producer.set_stereo_width(0.5 + ((step % 15) as f32) * 0.1);
+                    }
+                    if step % 79 == 0 {
+                        // Force dense Lane 2 overflow bursts + occasional ResetEngine + rollover.
+                        for j in 0..72 {
+                            producer.set_bypass((j & 1) == 0, true);
+                        }
+                        if step % 237 == 0 {
+                            producer.reset_to_dc_equilibrium();
+                        }
+                    }
+                    if step % 199 == 0 {
+                        producer.next_epoch_29 = crate::host::spsc::ring::MAX_EPOCH_29;
+                        producer.set_control_value(35, (step % 10) as f32);
+                    }
+                    if step % 311 == 0 {
+                        producer.set_tier(Tier::from_u8(((step / 311) % 4) as u8));
+                    }
+                }
+                done_ref.store(true, Ordering::Release);
+                producer
+            });
+
+            let mut prev_causal = 0_u64;
+            let mut in_buf = [0.0_f32; 16];
+            in_buf[0] = 0.05;
+            let mut out_l = [0.0_f32; 16];
+            let mut out_r = [0.0_f32; 16];
+            loop {
+                let _ = consumer.drain_into_tracking_bounce(&mut engine);
+                let causal = consumer.drained_causal_epoch();
+                assert!(
+                    causal >= prev_causal,
+                    "drained causal epoch regressed: {causal} < {prev_causal}"
+                );
+                prev_causal = causal;
+                engine.process_block(&in_buf, &in_buf, &mut out_l, &mut out_r);
+                if done_ref.load(Ordering::Acquire) && !consumer.has_pending() {
+                    break;
+                }
+                core::hint::spin_loop();
+            }
+
+            let finished_prod = prod_handle.join().expect("producer thread panicked");
+            let _ = consumer.drain_into_tracking_bounce(&mut engine);
+            assert!(consumer.drained_causal_epoch() >= prev_causal);
+            assert_eq!(
+                consumer.drained_causal_epoch(),
+                finished_prod.causal_epoch()
+            );
+            assert!(!consumer.has_pending());
+            finished_prod
+        });
+
+        assert_eq!(
+            engine.clamped_control_values(),
+            expected_shadow.shadow().clamped_control_values()
+        );
+        assert_eq!(engine.tier(), expected_shadow.shadow().tier());
+        assert_eq!(
+            engine.max_supported_tier(),
+            expected_shadow.shadow().max_supported_tier()
+        );
+        assert_eq!(
+            engine.bypass_state(),
+            expected_shadow.shadow().bypass_state()
+        );
+        assert_eq!(engine.is_frozen(), expected_shadow.shadow().is_frozen());
+        assert!((engine.stereo_width() - expected_shadow.shadow().stereo_width()).abs() < 1e-6);
     }
 }

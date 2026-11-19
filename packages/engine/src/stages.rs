@@ -1,4 +1,5 @@
-//! TORA Stages Pipeline Core: Stage 0 8-Port Router, Physical `v3` Stages I–IV & Direct Readout.
+//! `SONA` Stages Pipeline Core: Top-of-Frame Causal Crossbar (`Stage 0`, `Op-P`, `4x Q0.32`),
+//! `4`-Block Matryoshka State-Space Core (`SonaHotSlab`), Stage III `FIR` + `Kautz`, & Stage IV `Op-T` Tank.
 //!
 //! Canonical Reference: `docs/specs/dsp/router_and_stages_topology.md` and
 //! `docs/specs/architecture/sona_architecture.md`.
@@ -6,14 +7,10 @@
 //! Direct per-sample calls require a caller-held [`crate::FtzDazGuard`] for the
 //! enclosing batch; engine block methods provide the guard automatically.
 
-pub mod head;
 pub mod hot_core;
 pub mod router;
-pub mod stage1_pre;
-pub mod stage1_svf;
-pub mod stage2_gru;
+pub mod sona_core;
 pub mod stage3_cab;
-pub mod stage3_cabinet;
 pub mod stage4_tank;
 pub mod topology;
 pub mod weights;
@@ -30,29 +27,28 @@ pub use topology::{
     validate_tensor_directory_slice,
 };
 
-pub use head::{HEAD_RAM_BYTES, MidSideKroneckerHead};
 pub use hot_core::{
-    V3CoreInstance, V3HotCore, v3_process_block_default, v3_process_block_infallible_default,
+    SonaHotSlab, SonaInstance, V3CoreInstance, V3HotCore, sona_process_block_default,
+    sona_process_block_infallible_default, v3_process_block_default,
+    v3_process_block_infallible_default,
 };
 pub use router::{BezoutCleanCrossover, ROUTER_STATE_RAM_BYTES, ReturnAligner, Stage0Router};
-pub use stage1_pre::{STAGE1_PRE_RAM_BYTES, Stage1PreDynamics};
-pub use stage2_gru::Stage2Backend;
-pub use stage3_cab::{V3ColdTierModel, V3MatryoshkaModel, V3TierReadout};
-pub use stage3_cabinet::{
-    STAGE3_CABINET_RAM_BYTES, Stage3Backend, Stage3CabinetModals, dot16_stereo_vec4,
+pub use sona_core::{
+    SonaColdTierModel, SonaMatryoshkaModel, SonaTierReadout, V3ColdTierModel, V3MatryoshkaModel,
+    V3TierReadout,
 };
-pub use stage4_tank::{STAGE4_TANK_RAM_BYTES, Stage4SpatialTank, TankDcBlocker};
+pub use stage3_cab::{Stage3Backend, dot16_stereo_vec4};
+pub use stage4_tank::{V3_TANK_CAP, V3_TANK_LINES, V3Stage4TankHot, V3Stage4TankParams};
 pub use weights::{
     ARENA_FULL_BYTES, ARENA_LITE_BYTES, ARENA_PRO_BYTES, ARENA_ULTRA_BYTES, ArenaDirectoryView,
 };
 
-/// Composite SIMD backend trait for the TORA Stages 0–IV pipeline.
+/// Composite SIMD backend trait for the `SONA` Stages 0–IV pipeline.
 pub trait StageBackend:
     crate::math::MathBackend
     + crate::operators::op_m::OpMBackend
     + crate::operators::op_n::OpNBackend<Self::Vec4>
     + crate::operators::op_t::OpTBackend<Self::Vec4>
-    + Stage2Backend<Self::Vec4>
     + Stage3Backend
 {
 }
@@ -62,7 +58,6 @@ impl<B> StageBackend for B where
         + crate::operators::op_m::OpMBackend
         + crate::operators::op_n::OpNBackend<B::Vec4>
         + crate::operators::op_t::OpTBackend<B::Vec4>
-        + Stage2Backend<B::Vec4>
         + Stage3Backend
 {
 }
@@ -70,11 +65,11 @@ impl<B> StageBackend for B where
 /// 3 kHz Control Plane state RAM footprint.
 pub const CONTROL_PLANE_RAM_BYTES: usize = 256;
 
-/// Active `Lite` state working-set footprint strictly within the 11.2 KB L1D hot budget.
+/// Active `Lite` state working-set footprint strictly within the `4,608 B` (`4.5 KiB`) L1D hot budget.
 pub const TOTAL_LITE_STATE_RAM_BYTES: usize =
     stage3_cab::active_hot_bytes_for_tier(crate::types::Tier::Lite, false);
 
-const _: () = assert!(TOTAL_LITE_STATE_RAM_BYTES > 0 && TOTAL_LITE_STATE_RAM_BYTES <= 8_656);
+const _: () = assert!(TOTAL_LITE_STATE_RAM_BYTES > 0 && TOTAL_LITE_STATE_RAM_BYTES <= 4_608);
 
 #[cfg(test)]
 mod tests {
@@ -83,10 +78,10 @@ mod tests {
     use crate::types::{FtzDazGuard, Tier};
 
     #[test]
-    fn test_v3_hot_core_lite_budget_and_identity_silence() {
+    fn test_sona_hot_slab_lite_budget_and_identity_silence() {
         let _guard = FtzDazGuard::new();
-        let cold = V3ColdTierModel::identity_for_tier(Tier::Lite, false, false);
-        let mut core = V3HotCore::<DefaultMathBackend>::from_cold_model(&cold);
+        let cold = SonaColdTierModel::identity_for_tier(Tier::Lite, false, false);
+        let mut core = SonaHotSlab::<DefaultMathBackend>::from_cold_model(&cold);
         let y0 = core.step_stereo(0.0, 0.0);
         assert_eq!(y0.map(f32::to_bits), [0, 0]);
         let y1 = core.step_stereo(0.25, -0.25);

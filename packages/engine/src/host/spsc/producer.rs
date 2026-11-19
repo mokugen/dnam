@@ -24,6 +24,8 @@ pub struct ControlProducer {
     pub(crate) shadow: AcceptedStateShadow,
     pub(crate) next_epoch_29: u32,
     pub(crate) causal_epoch: u64,
+    pub(crate) producer_epoch_base: u64,
+    pub(crate) latched_reset_sticky: bool,
 }
 
 impl ControlProducer {
@@ -53,21 +55,40 @@ impl ControlProducer {
 
     /// Re-synchronizes the producer shadow with `engine` (e.g. after model reload or sample-rate change).
     pub fn resync_from_engine(&mut self, engine: &DynamicDnamEngine<'_>) {
+        let s0 = self.ring.fallback_seq.value.load(Ordering::Relaxed);
+        let s_odd = s0.wrapping_add(1) | 1;
+        self.ring.fallback_seq.value.store(s_odd, Ordering::Release);
+        fence(Ordering::AcqRel);
         self.ring.clear_all_lane1();
-        let _ = self.ring.tombstone_unconsumed_lane2();
         let h = self.ring.head.value.load(Ordering::Relaxed);
         self.ring.tail.value.store(h, Ordering::Release);
-        self.ring.fallback_epoch.store(0, Ordering::Release);
-        self.ring.fallback_reset_engine.store(0, Ordering::Release);
+        self.ring.fallback_l2_head.store(h, Ordering::Relaxed);
+        let cur_gen = self.ring.fallback_gen.load(Ordering::Relaxed);
+        self.ring
+            .consumed_fallback_gen
+            .store(cur_gen, Ordering::Release);
+        self.latched_reset_sticky = false;
         self.ring
             .published_total_frames
             .value
             .store(engine.tempo_total_frames(), Ordering::Release);
         self.shadow = AcceptedStateShadow::from_engine(engine);
         self.causal_epoch = self.causal_epoch.wrapping_add(1);
+        self.producer_epoch_base = self.causal_epoch;
         self.ring
             .epoch_base
-            .store(self.causal_epoch, Ordering::Release);
+            .store(self.producer_epoch_base, Ordering::Release);
+        self.ring
+            .fallback_epoch_base
+            .store(self.producer_epoch_base, Ordering::Relaxed);
+        self.ring
+            .fallback_causal_epoch
+            .store(self.causal_epoch, Ordering::Relaxed);
+        fence(Ordering::Release);
+        self.ring
+            .fallback_seq
+            .value
+            .store(s_odd.wrapping_add(1), Ordering::Release);
         self.next_epoch_29 = 1;
     }
 
@@ -76,10 +97,9 @@ impl ControlProducer {
         self.causal_epoch = self.causal_epoch.wrapping_add(1);
         let ep = self.next_epoch_29;
         if ep >= MAX_EPOCH_29 {
-            self.latch_into_lane3(1, false);
-            self.ring
-                .epoch_base
-                .store(self.causal_epoch.wrapping_sub(2), Ordering::Release);
+            let new_base = self.causal_epoch.wrapping_sub(2);
+            self.producer_epoch_base = new_base;
+            self.latch_into_lane3(1, false, new_base);
             self.next_epoch_29 = 3;
             2
         } else {
@@ -88,26 +108,28 @@ impl ControlProducer {
         }
     }
 
-    pub(crate) fn latch_into_lane3(&mut self, epoch: u32, reset_engine: bool) {
-        let saw_unconsumed_reset = self.ring.tombstone_unconsumed_lane2();
-        if reset_engine || saw_unconsumed_reset {
-            self.ring.fallback_reset_engine.store(1, Ordering::Release);
-        }
-        let reset_latched = self.ring.fallback_reset_engine.load(Ordering::Relaxed) != 0;
-        let snap = self.shadow.to_fallback_snapshot(epoch, reset_latched);
+    pub(crate) fn latch_into_lane3(&mut self, epoch: u32, reset_engine: bool, new_epoch_base: u64) {
+        let cur_gen = self.ring.fallback_gen.load(Ordering::Relaxed);
+        let consumed_gen = self.ring.consumed_fallback_gen.load(Ordering::Acquire);
+        let unconsumed = cur_gen > consumed_gen;
+        let sticky_reset = reset_engine
+            || (unconsumed && self.latched_reset_sticky)
+            || self.ring.has_unconsumed_reset_in_lane2();
+        self.latched_reset_sticky = sticky_reset;
+
+        let h_snap = self.ring.head.value.load(Ordering::Relaxed);
+        let snap = self.shadow.to_fallback_snapshot(epoch, sticky_reset);
         let packed = snap.to_words();
+        let new_gen = cur_gen.wrapping_add(1);
+        let fb_causal = new_epoch_base.wrapping_add(epoch as u64);
+
+        // Open seqlock before mutating Lane 1 (`clear_all_lane1` + `lane1_ext` repopulation),
+        // `epoch_base`, or `fallback_gen` so consumer never tears across generation boundaries.
         let s0 = self.ring.fallback_seq.value.load(Ordering::Relaxed);
         let s_odd = s0.wrapping_add(1) | 1;
         self.ring.fallback_seq.value.store(s_odd, Ordering::Release);
         fence(Ordering::AcqRel);
-        for (slot, &word) in self.ring.fallback_words.iter().zip(packed.iter()) {
-            slot.store(word, Ordering::Relaxed);
-        }
-        self.ring.fallback_epoch.store(epoch, Ordering::Release);
-        self.ring
-            .fallback_seq
-            .value
-            .store(s_odd.wrapping_add(1), Ordering::Release);
+
         self.ring.clear_all_lane1();
         for idx in MAX_CONTROLS..self.shadow.num_controls {
             let mode = if self.shadow.is_control_immediate(idx) {
@@ -117,6 +139,27 @@ impl ControlProducer {
             };
             self.write_lane1_slot(idx, epoch, self.shadow.raw_values[idx], mode);
         }
+
+        self.ring.fallback_l2_head.store(h_snap, Ordering::Relaxed);
+        self.ring
+            .fallback_epoch_base
+            .store(new_epoch_base, Ordering::Relaxed);
+        self.ring
+            .fallback_causal_epoch
+            .store(fb_causal, Ordering::Relaxed);
+        for (slot, &word) in self.ring.fallback_words.iter().zip(packed.iter()) {
+            slot.store(word, Ordering::Relaxed);
+        }
+        self.ring
+            .epoch_base
+            .store(new_epoch_base, Ordering::Release);
+        self.ring.fallback_gen.store(new_gen, Ordering::Release);
+        fence(Ordering::Release);
+        self.ring
+            .fallback_seq
+            .value
+            .store(s_odd.wrapping_add(1), Ordering::Release);
+
         self.ring
             .overflow_latch_count
             .fetch_add(1, Ordering::Relaxed);
@@ -127,7 +170,7 @@ impl ControlProducer {
         let tail = self.ring.tail.value.load(Ordering::Acquire);
         if head.wrapping_sub(tail) >= SPSC_RING_CAPACITY {
             let is_reset_engine = matches!(cmd, ControlCommand::ResetEngine);
-            self.latch_into_lane3(epoch, is_reset_engine);
+            self.latch_into_lane3(epoch, is_reset_engine, self.producer_epoch_base);
             return;
         }
         self.ring.lane2_slots[head & SPSC_RING_MASK].store(RingEntry { epoch, cmd });
@@ -496,7 +539,7 @@ impl ControlProducer {
         self.shadow.offline_bounce = enabled;
         let oversample_factor = if enabled { 4 } else { 1 };
         let (r_ac_tr, r_dc_tr, tau_ref_tr, switch_xfade_tr) = self.shadow.training_zoh_poles;
-        if let Ok(new_zoh) = ZohRescaledParams::compute_oversampled(
+        if let Some(new_zoh) = ZohRescaledParams::compute_oversampled_opt(
             self.shadow.sample_rate_train_hz,
             self.shadow.sample_rate_hz,
             oversample_factor,
@@ -536,8 +579,11 @@ mod tests {
     fn build_producer_test_container() -> Vec<u8> {
         let mut header = DnamJsonHeader::default_reference();
         header.io_config.capabilities.supports_freeze = true;
-        let mut cond_max = BTreeMap::new();
-        cond_max.insert(String::from("channel=Clean"), 6.0);
+        let cond_bounds = vec![crate::container::wire::StructuredConditionalBound {
+            when: vec![(String::from("channel"), String::from("Clean"))],
+            min: None,
+            max: Some(6.0),
+        }];
         header.controls_schema = vec![
             ControlSchemaDef {
                 id: String::from("gain"),
@@ -549,8 +595,8 @@ mod tests {
                 declared_range: Some([0.0, 10.0]),
                 safe_clamped_range: Some([1.0, 9.0]),
                 default: serde_json::json!(5.0),
-                conditional_min: BTreeMap::new(),
-                conditional_max: cond_max,
+                conditional_bounds: cond_bounds,
+                represented_switch_options: None,
                 declared_options: None,
                 active_options: None,
                 clamp_warning: None,
@@ -568,8 +614,8 @@ mod tests {
                 declared_range: None,
                 safe_clamped_range: None,
                 default: serde_json::json!("Clean"),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
                 declared_options: Some(vec![String::from("Clean"), String::from("Crunch")]),
                 active_options: Some(vec![String::from("Clean"), String::from("Crunch")]),
                 clamp_warning: None,
@@ -587,15 +633,15 @@ mod tests {
                 declared_range: Some([20.0, 1000.0]),
                 safe_clamped_range: Some([50.0, 800.0]),
                 default: serde_json::json!(250.0),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
                 declared_options: None,
                 active_options: None,
                 clamp_warning: None,
                 calibration: Some(ControlCalibration {
                     role: ControlCalibrationRole::DelayTimeMs,
                     lobatto_physical_anchors: Some([20.0, 510.0, 1000.0]),
-                    conditional_physical_anchors: BTreeMap::new(),
+                    conditional_physical_anchors: Vec::new(),
                     tempo_sync_default_subdivision: Some(TempoSubdivision::Quarter),
                 }),
                 ui_hints: ControlUiHints::default(),

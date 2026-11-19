@@ -11,54 +11,263 @@ pub use jcs::{
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use crate::schema::{DnamError, DnamJsonHeader, MarketplaceReceipt, OemDeviceCertificate};
+use zerocopy::IntoBytes;
+use zerocopy::byteorder::little_endian::{U16, U32};
+
+use crate::container::encode_domain_field;
+use crate::schema::{
+    DnamError, DnamJsonHeader, MarketplaceReceipt, ModelSignatures, OemDeviceCertificate,
+};
 
 use super::provider::{CryptoProvider, VerificationStatus};
-use super::sha256::{decode_hex_array, encode_hex, sha256_digest};
+use super::security::{build_oem_cert_v2_signing_message, encode_prefix_list};
+use super::sha256::{decode_hex_array, sha256_digest};
 
-/// Builds the canonical 64-byte message signed by the creator's `Ed25519` key:
-/// `immutable_header_sha256 (32 B) || master_arena_sha256 (32 B)`.
+/// Builds the domain-separated creator signing message binding `immutable_header_sha256`,
+/// `master_arena_sha256`, and optional 4-tier `tier_arena_sha256` prefix digests strictly via
+/// length-prefixed `encode_domain_field` (`"DNAM-CREATOR-MANIFEST-V1"`, `ref[sec.sig.prefix-delegation]`).
+pub fn build_creator_signing_message_for_tiers(
+    immutable_header_sha256: &[u8; 32],
+    master_arena_sha256: &[u8; 32],
+    tier_arena_sha256: Option<&[String; 4]>,
+) -> Result<Vec<u8>, DnamError> {
+    let mut msg = Vec::with_capacity(288);
+    msg.extend_from_slice(&encode_domain_field("domain", b"DNAM-CREATOR-MANIFEST-V1"));
+    msg.extend_from_slice(&encode_domain_field(
+        "immutable_header_sha256",
+        immutable_header_sha256,
+    ));
+    msg.extend_from_slice(&encode_domain_field(
+        "master_arena_sha256",
+        master_arena_sha256,
+    ));
+    if let Some(tier_shas) = tier_arena_sha256 {
+        let mut decoded = [[0u8; 32]; 4];
+        for (slot, hex) in decoded.iter_mut().zip(tier_shas.iter()) {
+            *slot = decode_hex_array::<32>(hex)?;
+        }
+        let prefix_list = encode_prefix_list(&decoded)?;
+        msg.extend_from_slice(&encode_domain_field("tier_arena_sha256", &prefix_list));
+    }
+    Ok(msg)
+}
+
+/// Builds the domain-separated creator signing message (`tier_arena_sha256 = None`) via
+/// length-prefixed `encode_domain_field` (`"DNAM-CREATOR-MANIFEST-V1"`, `ref[sec.sig.prefix-delegation]`).
 #[inline]
 pub fn build_creator_signing_message(
     immutable_header_sha256: &[u8; 32],
     master_arena_sha256: &[u8; 32],
-) -> [u8; 64] {
-    let mut msg = [0u8; 64];
-    msg[0..32].copy_from_slice(immutable_header_sha256);
-    msg[32..64].copy_from_slice(master_arena_sha256);
-    msg
+) -> Vec<u8> {
+    build_creator_signing_message_for_tiers(immutable_header_sha256, master_arena_sha256, None)
+        .expect("tierless creator signing message cannot fail")
 }
 
-/// Builds the canonical byte payload signed by the marketplace's `Ed25519` key for a [`MarketplaceReceipt`].
+/// Builds the domain-separated byte payload signed by the marketplace's `Ed25519` key for a
+/// [`MarketplaceReceipt`] using strict `encode_domain_field` framing across all receipt fields
+/// and prefix digests (`"DNAM-BUYER-RECEIPT-V1"`, `ref[sec.sig.prefix-delegation]`).
 pub fn build_marketplace_receipt_signing_message(
     immutable_header_sha256: &[u8; 32],
     master_arena_sha256: &[u8; 32],
     receipt: &MarketplaceReceipt,
 ) -> Result<Vec<u8>, DnamError> {
     let buyer_arena_sha256 = decode_hex_array::<32>(&receipt.buyer_arena_sha256)?;
-    let mut msg = Vec::with_capacity(256);
-    msg.extend_from_slice(b"DNAM-RECEIPT-V1:");
-    msg.extend_from_slice(immutable_header_sha256);
-    msg.extend_from_slice(master_arena_sha256);
-    msg.extend_from_slice(&buyer_arena_sha256);
-    msg.extend_from_slice(receipt.marketplace_id.as_bytes());
-    msg.push(b'|');
-    msg.extend_from_slice(receipt.license_id.as_bytes());
-    msg.push(b'|');
-    msg.extend_from_slice(receipt.buyer_hash.as_bytes());
-    msg.push(b'|');
-    msg.extend_from_slice(receipt.license_tier.as_bytes());
-    msg.push(b'|');
-    msg.extend_from_slice(receipt.encryption_mode.as_bytes());
+    let mut msg = Vec::with_capacity(512);
+    msg.extend_from_slice(&encode_domain_field("domain", b"DNAM-BUYER-RECEIPT-V1"));
+    msg.extend_from_slice(&encode_domain_field(
+        "immutable_header_sha256",
+        immutable_header_sha256,
+    ));
+    msg.extend_from_slice(&encode_domain_field(
+        "master_arena_sha256",
+        master_arena_sha256,
+    ));
+    msg.extend_from_slice(&encode_domain_field(
+        "buyer_arena_sha256",
+        &buyer_arena_sha256,
+    ));
+    if let Some(ref tier_shas) = receipt.buyer_tier_arena_sha256 {
+        let mut decoded = [[0u8; 32]; 4];
+        for (slot, hex) in decoded.iter_mut().zip(tier_shas.iter()) {
+            *slot = decode_hex_array::<32>(hex)?;
+        }
+        let prefix_list = encode_prefix_list(&decoded)?;
+        msg.extend_from_slice(&encode_domain_field(
+            "buyer_tier_arena_sha256",
+            &prefix_list,
+        ));
+    }
+    msg.extend_from_slice(&encode_domain_field(
+        "marketplace_id",
+        receipt.marketplace_id.as_bytes(),
+    ));
+    msg.extend_from_slice(&encode_domain_field(
+        "license_id",
+        receipt.license_id.as_bytes(),
+    ));
+    msg.extend_from_slice(&encode_domain_field(
+        "buyer_hash",
+        receipt.buyer_hash.as_bytes(),
+    ));
+    msg.extend_from_slice(&encode_domain_field(
+        "license_tier",
+        receipt.license_tier.as_bytes(),
+    ));
+    msg.extend_from_slice(&encode_domain_field(
+        "issued_at",
+        receipt.issued_at.as_bytes(),
+    ));
+    msg.extend_from_slice(&encode_domain_field(
+        "encryption_mode",
+        receipt.encryption_mode.as_bytes(),
+    ));
+    if let Some(ref nonce) = receipt.arena_nonce_96 {
+        msg.extend_from_slice(&encode_domain_field("arena_nonce_96", nonce.as_bytes()));
+    }
+    if let Some(ref epk) = receipt.ephemeral_pubkey_x25519 {
+        msg.extend_from_slice(&encode_domain_field(
+            "ephemeral_pubkey_x25519",
+            epk.as_bytes(),
+        ));
+    }
+    msg.extend_from_slice(&encode_domain_field(
+        "authorized_device_count",
+        U32::new(receipt.authorized_devices.len() as u32).as_bytes(),
+    ));
     for dev in &receipt.authorized_devices {
-        msg.push(b'|');
-        msg.extend_from_slice(dev.oem_vendor.as_bytes());
-        msg.push(b':');
-        msg.extend_from_slice(dev.model_code.as_bytes());
-        msg.push(b':');
-        msg.extend_from_slice(dev.device_id_hash.as_bytes());
+        msg.extend_from_slice(&encode_domain_field(
+            "device_oem_vendor",
+            dev.oem_vendor.as_bytes(),
+        ));
+        msg.extend_from_slice(&encode_domain_field(
+            "device_model_code",
+            dev.model_code.as_bytes(),
+        ));
+        msg.extend_from_slice(&encode_domain_field(
+            "device_id_hash",
+            dev.device_id_hash.as_bytes(),
+        ));
+        if let Some(ref wrapped) = dev.wrapped_cek {
+            msg.extend_from_slice(&encode_domain_field(
+                "device_wrapped_cek",
+                wrapped.as_bytes(),
+            ));
+        }
+    }
+    msg.extend_from_slice(&encode_domain_field(
+        "royalty_split_count",
+        U32::new(receipt.royalty_splits.len() as u32).as_bytes(),
+    ));
+    for split in &receipt.royalty_splits {
+        msg.extend_from_slice(&encode_domain_field(
+            "royalty_recipient_id",
+            split.recipient_id.as_bytes(),
+        ));
+        msg.extend_from_slice(&encode_domain_field("royalty_role", split.role.as_bytes()));
+        msg.extend_from_slice(&encode_domain_field(
+            "royalty_share_bps",
+            U16::new(split.share_bps).as_bytes(),
+        ));
     }
     Ok(msg)
+}
+
+const TIER_END_OFFSETS: [usize; 4] = [4_608, 7_936, 15_872, 30_720];
+
+type VerifiedCreatorDigests = ([u8; 32], [u8; 32], [u8; 32]);
+
+fn verify_header_and_creator_signature<C: CryptoProvider>(
+    header: &DnamJsonHeader,
+    sigs: &ModelSignatures,
+    crypto: &C,
+) -> Result<VerifiedCreatorDigests, DnamError> {
+    let expected_header_sha = decode_hex_array::<32>(&sigs.immutable_header_sha256)?;
+    let computed_header_sha = compute_immutable_header_sha256(header)?;
+    if expected_header_sha != computed_header_sha {
+        return Err(DnamError::CryptoVerificationFailed(
+            "immutable_header_sha256 mismatch (header was tampered with)",
+        ));
+    }
+
+    let master_arena_sha = decode_hex_array::<32>(&sigs.master_arena_sha256)?;
+    let creator_pubkey = decode_hex_array::<32>(&sigs.creator_signature.pubkey_ed25519)?;
+    let creator_sig = decode_hex_array::<64>(&sigs.creator_signature.sig_ed25519)?;
+    let creator_msg = build_creator_signing_message_for_tiers(
+        &expected_header_sha,
+        &master_arena_sha,
+        sigs.tier_arena_sha256.as_ref(),
+    )?;
+    crypto.ed25519_verify(&creator_pubkey, &creator_msg, &creator_sig)?;
+    Ok((expected_header_sha, master_arena_sha, creator_pubkey))
+}
+
+fn verify_arena_and_tier_shas(
+    plaintext_arena: &[u8],
+    expected_full_sha: &[u8; 32],
+    tier_shas: Option<&[String; 4]>,
+    full_mismatch_msg: &'static str,
+    tier_mismatch_msg: &'static str,
+) -> Result<(), DnamError> {
+    let computed_arena_sha = sha256_digest(plaintext_arena);
+    let prefix_tier_idx = TIER_END_OFFSETS
+        .iter()
+        .position(|&off| off == plaintext_arena.len());
+    let mut sha_matched = computed_arena_sha == *expected_full_sha;
+    if let (Some(t_idx), Some(tier_shas)) = (prefix_tier_idx, tier_shas) {
+        for (k, end_off) in TIER_END_OFFSETS.iter().copied().enumerate().take(t_idx + 1) {
+            let expected_tier_sha = decode_hex_array::<32>(&tier_shas[k])?;
+            let actual_tier_sha = if end_off == plaintext_arena.len() {
+                computed_arena_sha
+            } else {
+                sha256_digest(&plaintext_arena[..end_off])
+            };
+            if actual_tier_sha != expected_tier_sha {
+                return Err(DnamError::CryptoVerificationFailed(tier_mismatch_msg));
+            }
+        }
+        if t_idx < 3 {
+            sha_matched = true;
+        }
+    }
+    if !sha_matched {
+        return Err(DnamError::CryptoVerificationFailed(full_mismatch_msg));
+    }
+    Ok(())
+}
+
+fn verify_marketplace_receipt_sig<C: CryptoProvider>(
+    sigs: &ModelSignatures,
+    receipt: &MarketplaceReceipt,
+    expected_header_sha: &[u8; 32],
+    master_arena_sha: &[u8; 32],
+    crypto: &C,
+) -> Result<VerificationStatus, DnamError> {
+    if !receipt.authorized_devices.is_empty()
+        && let Some(local_id) = crypto.local_device_id_hash()
+        && !receipt
+            .authorized_devices
+            .iter()
+            .any(|d| d.device_id_hash == local_id)
+    {
+        return Err(DnamError::CryptoVerificationFailed(
+            "local hardware device_id_hash is not in receipt.authorized_devices",
+        ));
+    }
+    let mp_pubkey = crypto
+        .marketplace_pubkey()
+        .ok_or(DnamError::CryptoVerificationFailed(
+            "trusted marketplace_pubkey required to verify MarketplaceReceipt",
+        ))?;
+    let receipt_sig = decode_hex_array::<64>(&receipt.receipt_sig_ed25519)?;
+    let receipt_msg =
+        build_marketplace_receipt_signing_message(expected_header_sha, master_arena_sha, receipt)?;
+    crypto.ed25519_verify(mp_pubkey, &receipt_msg, &receipt_sig)?;
+    Ok(VerificationStatus::MarketplaceVerified {
+        signer_id: sigs.creator_signature.signer_id.clone(),
+        marketplace_id: receipt.marketplace_id.clone(),
+        license_id: receipt.license_id.clone(),
+        license_tier: receipt.license_tier.clone(),
+    })
 }
 
 /// Verifies the split-payload `Ed25519` signature chain (`creator_signature` and optional
@@ -78,110 +287,33 @@ pub fn verify_container_provenance<C: CryptoProvider>(
         return Ok(VerificationStatus::Unsigned);
     };
 
-    // 1. Verify immutable_header_sha256
-    let expected_header_sha = decode_hex_array::<32>(&sigs.immutable_header_sha256)?;
-    let computed_header_sha = compute_immutable_header_sha256(header)?;
-    if expected_header_sha != computed_header_sha {
-        return Err(DnamError::CryptoVerificationFailed(
-            "immutable_header_sha256 mismatch (header was tampered with)",
-        ));
-    }
-
-    // 2. Verify creator_signature over immutable_header_sha256 || master_arena_sha256
-    let master_arena_sha = decode_hex_array::<32>(&sigs.master_arena_sha256)?;
-    let creator_pubkey = decode_hex_array::<32>(&sigs.creator_signature.pubkey_ed25519)?;
-    let creator_sig = decode_hex_array::<64>(&sigs.creator_signature.sig_ed25519)?;
-    let creator_msg = build_creator_signing_message(&expected_header_sha, &master_arena_sha);
-    crypto.ed25519_verify(&creator_pubkey, &creator_msg, &creator_sig)?;
-
-    // 3. Verify either master_arena_sha256 (direct creator release) or marketplace_receipt,
-    //    supporting zero-re-signing tier-stripped prefix containers via tier_arena_sha256 / buyer_tier_arena_sha256.
-    const TIER_END_OFFSETS: [usize; 4] = [4_608, 10_240, 18_432, 28_672];
-    let computed_arena_sha = sha256_digest(plaintext_arena);
-    let prefix_tier_idx = TIER_END_OFFSETS
-        .iter()
-        .position(|&off| off == plaintext_arena.len());
+    let (expected_header_sha, master_arena_sha, creator_pubkey) =
+        verify_header_and_creator_signature(header, sigs, crypto)?;
 
     if let Some(ref receipt) = sigs.marketplace_receipt {
         let buyer_arena_sha = decode_hex_array::<32>(&receipt.buyer_arena_sha256)?;
-        let mut sha_matched = computed_arena_sha == buyer_arena_sha;
-        if let (Some(t_idx), Some(tier_shas)) =
-            (prefix_tier_idx, receipt.buyer_tier_arena_sha256.as_ref())
-        {
-            for (k, end_off) in TIER_END_OFFSETS.iter().copied().enumerate().take(t_idx + 1) {
-                let expected_tier_sha = decode_hex_array::<32>(&tier_shas[k])?;
-                let actual_tier_sha = if end_off == plaintext_arena.len() {
-                    computed_arena_sha
-                } else {
-                    sha256_digest(&plaintext_arena[..end_off])
-                };
-                if actual_tier_sha != expected_tier_sha {
-                    return Err(DnamError::CryptoVerificationFailed(
-                        "buyer_tier_arena_sha256 mismatch against plaintext tensor arena prefix",
-                    ));
-                }
-            }
-            if t_idx < 3 {
-                sha_matched = true;
-            }
-        }
-        if !sha_matched {
-            return Err(DnamError::CryptoVerificationFailed(
-                "buyer_arena_sha256 mismatch against plaintext tensor arena",
-            ));
-        }
-        // Check authorized_devices allowlist if local_device_id_hash is configured and list is non-empty
-        if !receipt.authorized_devices.is_empty()
-            && let Some(local_id) = crypto.local_device_id_hash()
-            && !receipt
-                .authorized_devices
-                .iter()
-                .any(|d| d.device_id_hash == local_id)
-        {
-            return Err(DnamError::CryptoVerificationFailed(
-                "local hardware device_id_hash is not in receipt.authorized_devices",
-            ));
-        }
-        if let Some(mp_pubkey) = crypto.marketplace_pubkey() {
-            let receipt_sig = decode_hex_array::<64>(&receipt.receipt_sig_ed25519)?;
-            let receipt_msg = build_marketplace_receipt_signing_message(
-                &expected_header_sha,
-                &master_arena_sha,
-                receipt,
-            )?;
-            crypto.ed25519_verify(mp_pubkey, &receipt_msg, &receipt_sig)?;
-        }
-        Ok(VerificationStatus::MarketplaceVerified {
-            signer_id: sigs.creator_signature.signer_id.clone(),
-            marketplace_id: receipt.marketplace_id.clone(),
-            license_id: receipt.license_id.clone(),
-            license_tier: receipt.license_tier.clone(),
-        })
+        verify_arena_and_tier_shas(
+            plaintext_arena,
+            &buyer_arena_sha,
+            receipt.buyer_tier_arena_sha256.as_ref(),
+            "buyer_arena_sha256 mismatch against plaintext tensor arena",
+            "buyer_tier_arena_sha256 mismatch against plaintext tensor arena prefix",
+        )?;
+        verify_marketplace_receipt_sig(
+            sigs,
+            receipt,
+            &expected_header_sha,
+            &master_arena_sha,
+            crypto,
+        )
     } else {
-        let mut sha_matched = computed_arena_sha == master_arena_sha;
-        if let (Some(t_idx), Some(tier_shas)) = (prefix_tier_idx, sigs.tier_arena_sha256.as_ref()) {
-            for (k, end_off) in TIER_END_OFFSETS.iter().copied().enumerate().take(t_idx + 1) {
-                let expected_tier_sha = decode_hex_array::<32>(&tier_shas[k])?;
-                let actual_tier_sha = if end_off == plaintext_arena.len() {
-                    computed_arena_sha
-                } else {
-                    sha256_digest(&plaintext_arena[..end_off])
-                };
-                if actual_tier_sha != expected_tier_sha {
-                    return Err(DnamError::CryptoVerificationFailed(
-                        "tier_arena_sha256 mismatch against plaintext tensor arena prefix",
-                    ));
-                }
-            }
-            if t_idx < 3 {
-                sha_matched = true;
-            }
-        }
-        if !sha_matched {
-            return Err(DnamError::CryptoVerificationFailed(
-                "master_arena_sha256 mismatch against plaintext tensor arena",
-            ));
-        }
+        verify_arena_and_tier_shas(
+            plaintext_arena,
+            &master_arena_sha,
+            sigs.tier_arena_sha256.as_ref(),
+            "master_arena_sha256 mismatch against plaintext tensor arena",
+            "tier_arena_sha256 mismatch against plaintext tensor arena prefix",
+        )?;
         Ok(VerificationStatus::CreatorVerified {
             signer_id: sigs.creator_signature.signer_id.clone(),
             pubkey_ed25519: creator_pubkey,
@@ -189,57 +321,71 @@ pub fn verify_container_provenance<C: CryptoProvider>(
     }
 }
 
-/// Builds the canonical signing message for a factory-provisioned [`OemDeviceCertificate`]:
-/// `b"DNAM-OEM-CERT-V1:" || oem_vendor || b"|" || model_code || b"|" || device_id_hash || b"|" || pubkey_x25519_bytes`.
-pub fn build_oem_device_cert_signing_message(
-    oem_vendor: &str,
-    model_code: &str,
-    device_id_hash: &str,
-    pubkey_x25519_bytes: &[u8; 32],
-) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(
-        17 + oem_vendor.len() + 1 + model_code.len() + 1 + device_id_hash.len() + 1 + 32,
-    );
-    msg.extend_from_slice(b"DNAM-OEM-CERT-V1:");
-    msg.extend_from_slice(oem_vendor.as_bytes());
-    msg.push(b'|');
-    msg.extend_from_slice(model_code.as_bytes());
-    msg.push(b'|');
-    msg.extend_from_slice(device_id_hash.as_bytes());
-    msg.push(b'|');
-    msg.extend_from_slice(pubkey_x25519_bytes);
-    msg
+/// Verifies `immutable_header_sha256`, `creator_signature` (against `master_arena_sha256`), and
+/// optional `marketplace_receipt` (`receipt_sig_ed25519` + `authorized_devices`) for a tier-capped
+/// `DAI1`-authenticated `.dnam-seal` prefix (`retained_tier < Tier::Ultra`) when optional per-tier
+/// JSON SHA-256 arrays are absent.
+pub fn verify_container_provenance_for_dai1_prefix<C: CryptoProvider>(
+    header: &DnamJsonHeader,
+    crypto: &C,
+) -> Result<VerificationStatus, DnamError> {
+    let Some(ref sigs) = header.metadata.signatures else {
+        return Err(DnamError::CryptoVerificationFailed(
+            "HAS_SIGNATURES flag is set in preamble, but metadata.signatures is missing",
+        ));
+    };
+    let (expected_header_sha, master_arena_sha, creator_pubkey) =
+        verify_header_and_creator_signature(header, sigs, crypto)?;
+    if let Some(ref receipt) = sigs.marketplace_receipt {
+        verify_marketplace_receipt_sig(
+            sigs,
+            receipt,
+            &expected_header_sha,
+            &master_arena_sha,
+            crypto,
+        )
+    } else {
+        Ok(VerificationStatus::CreatorVerified {
+            signer_id: sigs.creator_signature.signer_id.clone(),
+            pubkey_ed25519: creator_pubkey,
+        })
+    }
 }
 
-/// Verifies a factory-provisioned [`OemDeviceCertificate`] against the manufacturer's pinned
-/// 32-byte `Ed25519` public key, returning the verified 32-byte TrustZone `X25519` public key.
+/// Verifies a factory-provisioned V2 [`OemDeviceCertificate`] (`"DNAM-OEM-CERT-V2"`) against the
+/// manufacturer's pinned 32-byte `Ed25519` public key, returning the verified 32-byte TrustZone `X25519` public key.
 pub fn verify_oem_device_certificate<C: CryptoProvider>(
     cert: &OemDeviceCertificate,
     trusted_oem_pubkey_ed25519: &[u8; 32],
     crypto: &C,
 ) -> Result<[u8; 32], DnamError> {
     let raw_id = decode_hex_array::<16>(&cert.device_id_hash)?;
-    let normalized_id = encode_hex(&raw_id);
     let pubkey_x25519 = decode_hex_array::<32>(&cert.pubkey_x25519)?;
     let oem_sig = decode_hex_array::<64>(&cert.oem_sig_ed25519)?;
-    let msg = build_oem_device_cert_signing_message(
+    let assurance = cert.assurance.unwrap_or(1);
+    let policy_sha = match cert.attestation_policy_sha256 {
+        Some(ref hex) => decode_hex_array::<32>(hex)?,
+        None => [0u8; 32],
+    };
+    let evidence_sha = match cert.attestation_evidence_sha256 {
+        Some(ref hex) => decode_hex_array::<32>(hex)?,
+        None => [0u8; 32],
+    };
+    let msg = build_oem_cert_v2_signing_message(
         &cert.oem_vendor,
         &cert.model_code,
-        &normalized_id,
+        &raw_id,
         &pubkey_x25519,
-    );
+        trusted_oem_pubkey_ed25519,
+        assurance,
+        &policy_sha,
+        &evidence_sha,
+    )?;
     crypto.ed25519_verify(trusted_oem_pubkey_ed25519, &msg, &oem_sig)?;
     Ok(pubkey_x25519)
 }
 
-pub use super::seal::enforce_distribution_policy;
-
-#[allow(unused_imports)]
-pub use super::seal::{
-    DNSL_MAGIC, DnamSealEnvelopePreamble, DnamSealRecipientSlot, FLAG_SEAL_CHACHA20_FULL,
-    MAX_SEAL_RECIPIENTS, build_seal_envelope_signing_message, compute_seal_envelope_crc32c,
-    derive_nested_inner_arena_key_and_nonce,
-};
+pub use super::seal::{DNSL_MAGIC, MAX_SEAL_RECIPIENTS, enforce_distribution_policy};
 
 #[cfg(feature = "crypto")]
 pub use super::seal::seal_dnam_container;
@@ -289,6 +435,7 @@ pub fn sign_creator_header_json(
         ARENA_OFFSET_FULL_END, ARENA_OFFSET_LITE_END, ARENA_OFFSET_PRO_END, ARENA_OFFSET_ULTRA_END,
     };
     use crate::provenance::RustCryptoProvider;
+    use crate::provenance::sha256::encode_hex;
     use crate::schema::{CreatorSignature, ModelSignatures};
 
     let mut header: DnamJsonHeader = DnamJsonHeader::from_json_str(header_json)
@@ -296,9 +443,6 @@ pub fn sign_creator_header_json(
     let hdr_sha_bytes = compute_immutable_header_sha256(&header)?;
     let arena_sha_bytes = sha256_digest(master_arena);
     let pubkey = RustCryptoProvider::ed25519_pubkey_from_seed(creator_seed_32);
-    let msg = build_creator_signing_message(&hdr_sha_bytes, &arena_sha_bytes);
-    let sig = RustCryptoProvider::ed25519_sign(creator_seed_32, &msg);
-
     let tier_arena_sha256 =
         if include_tier_prefixes && master_arena.len() >= ARENA_OFFSET_ULTRA_END as usize {
             Some([
@@ -318,6 +462,12 @@ pub fn sign_creator_header_json(
         } else {
             None
         };
+    let msg = build_creator_signing_message_for_tiers(
+        &hdr_sha_bytes,
+        &arena_sha_bytes,
+        tier_arena_sha256.as_ref(),
+    )?;
+    let sig = RustCryptoProvider::ed25519_sign(creator_seed_32, &msg);
 
     header.metadata.signatures = Some(ModelSignatures {
         immutable_header_sha256: encode_hex(&hdr_sha_bytes),
@@ -348,6 +498,7 @@ pub fn sign_marketplace_receipt_json(
         ARENA_OFFSET_FULL_END, ARENA_OFFSET_LITE_END, ARENA_OFFSET_PRO_END, ARENA_OFFSET_ULTRA_END,
     };
     use crate::provenance::RustCryptoProvider;
+    use crate::provenance::sha256::encode_hex;
 
     let mut header: DnamJsonHeader = DnamJsonHeader::from_json_str(header_json)
         .map_err(|e| DnamError::InvalidJsonHeader(alloc::format!("{e}")))?;
@@ -482,15 +633,20 @@ mod tests {
             assert!(verify_container_provenance(&h1, true, &[0u8; 64], &crypto).is_err());
 
             // Test tier_arena_sha256 prefix verification and mismatch on creator-only signed container
-            let full_arena = [0x42u8; 28_672];
+            let full_arena = [0x42u8; 30_720];
             let full_arena_sha = sha256_digest(&full_arena);
             let tier_shas = [
                 encode_hex(&sha256_digest(&full_arena[..4_608])),
-                encode_hex(&sha256_digest(&full_arena[..10_240])),
-                encode_hex(&sha256_digest(&full_arena[..18_432])),
+                encode_hex(&sha256_digest(&full_arena[..7_936])),
+                encode_hex(&sha256_digest(&full_arena[..15_872])),
                 encode_hex(&full_arena_sha),
             ];
-            let msg_full = build_creator_signing_message(&imm_sha, &full_arena_sha);
+            let msg_full = build_creator_signing_message_for_tiers(
+                &imm_sha,
+                &full_arena_sha,
+                Some(&tier_shas),
+            )
+            .unwrap();
             let sig_full = RustCryptoProvider::ed25519_sign(&seed, &msg_full);
             h1.metadata.signatures = Some(ModelSignatures {
                 immutable_header_sha256: encode_hex(&imm_sha),
@@ -503,8 +659,8 @@ mod tests {
                 },
                 marketplace_receipt: None,
             });
-            assert!(verify_container_provenance(&h1, true, &full_arena[..10_240], &crypto).is_ok());
-            assert!(verify_container_provenance(&h1, true, &[0u8; 10_240], &crypto).is_err());
+            assert!(verify_container_provenance(&h1, true, &full_arena[..7_936], &crypto).is_ok());
+            assert!(verify_container_provenance(&h1, true, &[0u8; 7_936], &crypto).is_err());
 
             // Test marketplace_receipt error branches: buyer_tier_arena_sha256 mismatch,
             // buyer_arena_sha256 mismatch, and unauthorized local_device_id_hash
@@ -531,7 +687,7 @@ mod tests {
             h1.metadata.signatures.as_mut().unwrap().marketplace_receipt = Some(rcpt.clone());
 
             // 1. buyer_tier_arena_sha256 mismatch on prefix
-            assert!(verify_container_provenance(&h1, true, &[0u8; 10_240], &crypto).is_err());
+            assert!(verify_container_provenance(&h1, true, &[0u8; 7_936], &crypto).is_err());
 
             // 2. buyer_arena_sha256 mismatch when buyer_tier_arena_sha256 is None
             rcpt.buyer_tier_arena_sha256 = None;
@@ -553,18 +709,18 @@ mod tests {
             assert!(h_future.validate().is_err());
             assert!(compute_immutable_header_sha256(&h_future).is_err());
             assert!(
-                compute_immutable_header_sha256_for_version(&h1, SchemaVersion::new(3, 0, 0))
+                compute_immutable_header_sha256_for_version(&h1, SchemaVersion::new(4, 0, 0))
                     .is_err()
             );
 
             // SchemaVersion parsing and preamble matching
-            let v2 = SchemaVersion::parse("2.0.0").unwrap();
-            assert_eq!(v2, SchemaVersion::V2_0_0);
-            assert!(v2.is_supported());
-            assert!(v2.ensure_matches_preamble(2, 0).is_ok());
-            assert!(v2.ensure_matches_preamble(2, 1).is_err());
+            let v3 = SchemaVersion::parse("3.0.0").unwrap();
+            assert_eq!(v3, SchemaVersion::V3_0_0);
+            assert!(v3.is_supported());
+            assert!(v3.ensure_matches_preamble(3, 0).is_ok());
+            assert!(v3.ensure_matches_preamble(3, 1).is_err());
             assert!(SchemaVersion::parse("invalid").is_err());
-            assert!(SchemaVersion::parse("2.0.0.1").is_err());
+            assert!(SchemaVersion::parse("3.0.0.1").is_err());
 
             // Test sign_creator_header_json and sign_marketplace_receipt_json
             let base_hdr = DnamJsonHeader::default_reference();
@@ -627,6 +783,65 @@ mod tests {
                     license_id: String::from("lic-1"),
                     license_tier: String::from("pro"),
                 }
+            );
+
+            // Fail closed when marketplace_pubkey is None even if MarketplaceReceipt signatures match!
+            assert!(
+                verify_container_provenance(
+                    &signed_mkt_hdr,
+                    true,
+                    &full_arena,
+                    &RustCryptoProvider::new(),
+                )
+                .is_err()
+            );
+
+            // Receipt field tampering (issued_at / royalty_splits / tier_arena_sha256) must fail!
+            let mut tampered_issued = signed_mkt_hdr.clone();
+            tampered_issued
+                .metadata
+                .signatures
+                .as_mut()
+                .unwrap()
+                .marketplace_receipt
+                .as_mut()
+                .unwrap()
+                .issued_at = String::from("2027-01-01T00:00:00Z");
+            assert!(
+                verify_container_provenance(&tampered_issued, true, &full_arena, &mkt_crypto)
+                    .is_err()
+            );
+            let mut tampered_royalty = signed_mkt_hdr.clone();
+            tampered_royalty
+                .metadata
+                .signatures
+                .as_mut()
+                .unwrap()
+                .marketplace_receipt
+                .as_mut()
+                .unwrap()
+                .royalty_splits
+                .push(crate::schema::RoyaltySplit {
+                    recipient_id: String::from("attacker"),
+                    role: String::from("amp_capture"),
+                    share_bps: 10_000,
+                });
+            assert!(
+                verify_container_provenance(&tampered_royalty, true, &full_arena, &mkt_crypto)
+                    .is_err()
+            );
+            let mut tampered_tier_sha = signed_mkt_hdr;
+            tampered_tier_sha
+                .metadata
+                .signatures
+                .as_mut()
+                .unwrap()
+                .tier_arena_sha256
+                .as_mut()
+                .unwrap()[0] = encode_hex(&[0xEEu8; 32]);
+            assert!(
+                verify_container_provenance(&tampered_tier_sha, true, &full_arena, &mkt_crypto)
+                    .is_err()
             );
         }
     }

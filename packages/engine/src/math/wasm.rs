@@ -3,20 +3,21 @@
 //! Uses `core::arch::wasm32` 128-bit `v128` SIMD intrinsics when `target_feature = "simd128"` is
 //! enabled, with a portable `#[repr(C, align(16))]` fallback when `simd128` is not enabled.
 
-#[cfg(not(target_feature = "simd128"))]
-use super::trainer::ScalarF64Vec2;
-use super::trainer::{SimdF64Vec2, TrainerMathBackend};
+use dnam_kernels::InterleavedStereo8;
+
+pub mod f64;
+pub use f64::WasmF64Vec2;
+
 use super::{BackendKind, MathBackend, SimdVec4};
 use crate::math::crc32c::{Crc32cBackend, crc32c_software_slice};
 
 #[cfg(target_feature = "simd128")]
 use core::arch::wasm32::{
-    f32x4, f32x4_abs, f32x4_add, f32x4_extract_lane, f32x4_mul, f32x4_pmax, f32x4_pmin,
-    f32x4_replace_lane, f32x4_splat, f32x4_sub, f64x2_abs, f64x2_add, f64x2_extract_lane,
-    f64x2_mul, f64x2_pmax, f64x2_pmin, f64x2_promote_low_f32x4, f64x2_replace_lane, f64x2_splat,
-    f64x2_sub, i32x4_add, i32x4_all_true, i32x4_eq, i32x4_shuffle, i32x4_splat, i32x4_sub, u32x4,
-    u32x4_ge, u32x4_lt, u32x4_min, u32x4_shl, u32x4_shr, u32x4_splat, u64x2_splat, v128, v128_and,
-    v128_andnot, v128_any_true, v128_or, v128_xor,
+    f32x4, f32x4_abs, f32x4_add, f32x4_extract_lane, f32x4_le, f32x4_mul, f32x4_neg, f32x4_pmax,
+    f32x4_pmin, f32x4_replace_lane, f32x4_splat, f32x4_sub, i32x4_add, i32x4_all_true, i32x4_eq,
+    i32x4_shuffle, i32x4_splat, i32x4_sub, u32x4, u32x4_ge, u32x4_lt, u32x4_min, u32x4_shl,
+    u32x4_shr, u32x4_splat, u64x2_splat, v128, v128_and, v128_andnot, v128_any_true,
+    v128_bitselect, v128_or, v128_xor,
 };
 
 /// Detects the WebAssembly backend (`WasmSimd128` when `target_feature = "simd128"` is active,
@@ -113,6 +114,18 @@ impl SimdVec4 for WasmVec4 {
     }
 
     #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        const { assert!(LANE < 4) };
+        let lane_v = match LANE {
+            0 => i32x4_shuffle::<0, 0, 0, 0>(v.0, v.0),
+            1 => i32x4_shuffle::<1, 1, 1, 1>(v.0, v.0),
+            2 => i32x4_shuffle::<2, 2, 2, 2>(v.0, v.0),
+            _ => i32x4_shuffle::<3, 3, 3, 3>(v.0, v.0),
+        };
+        Self(f32x4_mul(self.0, lane_v))
+    }
+
+    #[inline(always)]
     fn fms(self, a: Self, b: Self) -> Self {
         Self(f32x4_sub(self.0, f32x4_mul(a.0, b.0)))
     }
@@ -187,6 +200,16 @@ impl SimdVec4 for WasmVec4 {
             23,
         ))
     }
+
+    #[inline(always)]
+    fn exp2_clamped5(self) -> Self {
+        <Self as dnam_kernels::KernelVec4>::exp2_clamped5(self)
+    }
+
+    #[inline(always)]
+    fn scrub_recursive_state(self) -> Self {
+        <Self as dnam_kernels::KernelVec4>::flush_recursive_state(self)
+    }
 }
 
 #[cfg(not(target_feature = "simd128"))]
@@ -258,6 +281,15 @@ impl SimdVec4 for WasmVec4 {
     }
 
     #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        Self(
+            super::scalar::ScalarVec4(self.0)
+                .mul_lane::<LANE>(super::scalar::ScalarVec4(v.0))
+                .0,
+        )
+    }
+
+    #[inline(always)]
     fn fms(self, a: Self, b: Self) -> Self {
         Self(
             super::scalar::ScalarVec4(self.0)
@@ -306,6 +338,216 @@ impl SimdVec4 for WasmVec4 {
     fn rsqrt_pos_seed_bits(self) -> Self {
         Self(super::scalar::ScalarVec4(self.0).rsqrt_pos_seed_bits().0)
     }
+
+    #[inline(always)]
+    fn exp2_clamped5(self) -> Self {
+        <Self as dnam_kernels::KernelVec4>::exp2_clamped5(self)
+    }
+
+    #[inline(always)]
+    fn scrub_recursive_state(self) -> Self {
+        <Self as dnam_kernels::KernelVec4>::flush_recursive_state(self)
+    }
+}
+
+impl dnam_kernels::KernelVec4 for WasmVec4 {
+    #[inline(always)]
+    fn splat(val: f32) -> Self {
+        <Self as SimdVec4>::splat(val)
+    }
+
+    #[inline(always)]
+    fn splat_pair(a: f32, b: f32) -> Self {
+        <Self as SimdVec4>::splat_pair(a, b)
+    }
+
+    #[inline(always)]
+    fn from_array(arr: [f32; 4]) -> Self {
+        <Self as SimdVec4>::from_array(arr)
+    }
+
+    #[inline(always)]
+    fn to_array(self) -> [f32; 4] {
+        <Self as SimdVec4>::to_array(self)
+    }
+
+    #[inline(always)]
+    fn load(src: &[f32; 4]) -> Self {
+        <Self as SimdVec4>::load(src)
+    }
+
+    #[inline(always)]
+    fn store(self, dst: &mut [f32; 4]) {
+        <Self as SimdVec4>::store(self, dst);
+    }
+
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::add(self, rhs)
+    }
+
+    #[inline(always)]
+    fn sub(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::sub(self, rhs)
+    }
+
+    #[inline(always)]
+    fn mul(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::mul(self, rhs)
+    }
+
+    #[inline(always)]
+    fn fma(self, a: Self, b: Self) -> Self {
+        <Self as SimdVec4>::fma(self, a, b)
+    }
+
+    #[inline(always)]
+    fn fms(self, a: Self, b: Self) -> Self {
+        <Self as SimdVec4>::fms(self, a, b)
+    }
+
+    #[inline(always)]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        <Self as SimdVec4>::fma_lane::<LANE>(self, a, v)
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        <Self as SimdVec4>::mul_lane::<LANE>(self, v)
+    }
+
+    #[inline(always)]
+    fn max(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::max(self, rhs)
+    }
+
+    #[inline(always)]
+    fn min(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::min(self, rhs)
+    }
+
+    #[inline(always)]
+    fn abs(self) -> Self {
+        <Self as SimdVec4>::abs(self)
+    }
+
+    #[inline(always)]
+    fn neg(self) -> Self {
+        #[cfg(target_feature = "simd128")]
+        {
+            Self(f32x4_neg(self.0))
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            Self(
+                <super::scalar::ScalarVec4 as dnam_kernels::KernelVec4>::neg(
+                    super::scalar::ScalarVec4(self.0),
+                )
+                .0,
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn select_le(lhs: Self, rhs: Self, if_true: Self, if_false: Self) -> Self {
+        #[cfg(target_feature = "simd128")]
+        {
+            Self(v128_bitselect(
+                if_true.0,
+                if_false.0,
+                f32x4_le(lhs.0, rhs.0),
+            ))
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            Self(
+                <super::scalar::ScalarVec4 as dnam_kernels::KernelVec4>::select_le(
+                    super::scalar::ScalarVec4(lhs.0),
+                    super::scalar::ScalarVec4(rhs.0),
+                    super::scalar::ScalarVec4(if_true.0),
+                    super::scalar::ScalarVec4(if_false.0),
+                )
+                .0,
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn all_le(self, rhs: Self) -> bool {
+        #[cfg(target_feature = "simd128")]
+        {
+            i32x4_all_true(f32x4_le(self.0, rhs.0))
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            <super::scalar::ScalarVec4 as dnam_kernels::KernelVec4>::all_le(
+                super::scalar::ScalarVec4(self.0),
+                super::scalar::ScalarVec4(rhs.0),
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn pair_swap_neg(self) -> Self {
+        <Self as SimdVec4>::pair_swap_neg(self)
+    }
+
+    #[inline(always)]
+    fn flush_subnormal(self) -> Self {
+        <Self as SimdVec4>::flush_subnormal(self)
+    }
+
+    #[inline(always)]
+    fn flush_recursive_state(self) -> Self {
+        #[cfg(target_feature = "simd128")]
+        {
+            let exp_mask = u32x4_splat(0x7F80_0000);
+            let exp = v128_and(self.0, exp_mask);
+            let is_nonfinite = i32x4_eq(exp, exp_mask);
+            let is_sub = i32x4_eq(exp, u32x4_splat(0));
+            let non_sign_sub = v128_andnot(is_sub, u32x4_splat(0x8000_0000));
+            Self(v128_andnot(v128_andnot(self.0, is_nonfinite), non_sign_sub))
+        }
+        #[cfg(not(target_feature = "simd128"))]
+        {
+            Self(
+                <super::scalar::ScalarVec4 as dnam_kernels::KernelVec4>::flush_recursive_state(
+                    super::scalar::ScalarVec4(self.0),
+                )
+                .0,
+            )
+        }
+    }
+
+    #[inline(always)]
+    fn horizontal_sum(self) -> f32 {
+        <Self as SimdVec4>::horizontal_sum(self)
+    }
+
+    #[inline(always)]
+    fn horizontal_sum_pair(self, rhs: Self) -> (f32, f32) {
+        <Self as SimdVec4>::horizontal_sum_pair(self, rhs)
+    }
+
+    #[inline(always)]
+    fn dot(self, rhs: Self) -> f32 {
+        <Self as SimdVec4>::dot(self, rhs)
+    }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        <Self as SimdVec4>::rcp_pos_seed_bits(self)
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        <Self as SimdVec4>::rsqrt_pos_seed_bits(self)
+    }
+
+    #[inline(always)]
+    fn pow2_from_biased_int_bits(self) -> Self {
+        <Self as SimdVec4>::pow2_from_biased_int_bits(self)
+    }
 }
 
 /// WebAssembly SIMD128 hardware math backend.
@@ -321,6 +563,7 @@ impl Crc32cBackend for WasmSimd128Backend {
 
 impl MathBackend for WasmSimd128Backend {
     type Vec4 = WasmVec4;
+    type Stereo8 = InterleavedStereo8<WasmVec4>;
     const NAME: &'static str = "WebAssembly SIMD128 (v128 f32x4)";
     const KIND: BackendKind = BackendKind::WasmSimd128;
 
@@ -444,171 +687,4 @@ pub(crate) fn wasm_tracker_exp_scales_f32(max_l: f32, max_r: f32) -> (f32, f32, 
         f32x4_extract_lane::<1>(sd_v),
         f32x4_extract_lane::<1>(su_v),
     )
-}
-
-/// WebAssembly 2-lane `f64` vector (`v128` when `simd128` is enabled, or `[f64; 2]` fallback).
-#[cfg(target_feature = "simd128")]
-#[repr(transparent)]
-#[derive(Clone, Copy, Debug)]
-pub struct WasmF64Vec2(pub v128);
-
-/// Fallback 2-lane `f64` vector on `wasm32` when `simd128` is not enabled at compile time.
-#[cfg(not(target_feature = "simd128"))]
-#[repr(C, align(16))]
-#[derive(Clone, Copy, Debug)]
-pub struct WasmF64Vec2(pub [f64; 2]);
-
-#[cfg(target_feature = "simd128")]
-impl SimdF64Vec2 for WasmF64Vec2 {
-    #[inline(always)]
-    fn splat(val: f64) -> Self {
-        Self(f64x2_splat(val))
-    }
-
-    #[inline(always)]
-    fn splat_pair(a: f64, b: f64) -> Self {
-        Self(f64x2_replace_lane::<1>(f64x2_splat(a), b))
-    }
-
-    #[inline(always)]
-    fn from_f32_pair(a: f32, b: f32) -> Self {
-        Self(f64x2_promote_low_f32x4(f32x4(a, b, 0.0, 0.0)))
-    }
-
-    #[inline(always)]
-    fn load(src: &[f64; 2]) -> Self {
-        Self(zerocopy::transmute!(*src))
-    }
-
-    #[inline(always)]
-    fn store(self, dst: &mut [f64; 2]) {
-        *dst = zerocopy::transmute!(self.0);
-    }
-
-    #[inline(always)]
-    fn add(self, rhs: Self) -> Self {
-        Self(f64x2_add(self.0, rhs.0))
-    }
-
-    #[inline(always)]
-    fn sub(self, rhs: Self) -> Self {
-        Self(f64x2_sub(self.0, rhs.0))
-    }
-
-    #[inline(always)]
-    fn mul(self, rhs: Self) -> Self {
-        Self(f64x2_mul(self.0, rhs.0))
-    }
-
-    #[inline(always)]
-    fn fma(self, a: Self, b: Self) -> Self {
-        Self(f64x2_add(self.0, f64x2_mul(a.0, b.0)))
-    }
-
-    #[inline(always)]
-    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
-        const { assert!(LANE < 2) };
-        let s = f64x2_splat(f64x2_extract_lane::<LANE>(v.0));
-        Self(f64x2_add(self.0, f64x2_mul(a.0, s)))
-    }
-
-    #[inline(always)]
-    fn fms(self, a: Self, b: Self) -> Self {
-        Self(f64x2_sub(self.0, f64x2_mul(a.0, b.0)))
-    }
-
-    #[inline(always)]
-    fn max(self, rhs: Self) -> Self {
-        Self(f64x2_pmax(self.0, rhs.0))
-    }
-
-    #[inline(always)]
-    fn min(self, rhs: Self) -> Self {
-        Self(f64x2_pmin(self.0, rhs.0))
-    }
-
-    #[inline(always)]
-    fn abs(self) -> Self {
-        Self(f64x2_abs(self.0))
-    }
-
-    #[inline(always)]
-    fn horizontal_sum(self) -> f64 {
-        f64x2_extract_lane::<0>(self.0) + f64x2_extract_lane::<1>(self.0)
-    }
-}
-
-#[cfg(not(target_feature = "simd128"))]
-impl SimdF64Vec2 for WasmF64Vec2 {
-    #[inline(always)]
-    fn splat(val: f64) -> Self {
-        Self(ScalarF64Vec2::splat(val).0)
-    }
-
-    #[inline(always)]
-    fn load(src: &[f64; 2]) -> Self {
-        Self(*src)
-    }
-
-    #[inline(always)]
-    fn store(self, dst: &mut [f64; 2]) {
-        *dst = self.0;
-    }
-
-    #[inline(always)]
-    fn add(self, rhs: Self) -> Self {
-        Self(ScalarF64Vec2(self.0).add(ScalarF64Vec2(rhs.0)).0)
-    }
-
-    #[inline(always)]
-    fn sub(self, rhs: Self) -> Self {
-        Self(ScalarF64Vec2(self.0).sub(ScalarF64Vec2(rhs.0)).0)
-    }
-
-    #[inline(always)]
-    fn mul(self, rhs: Self) -> Self {
-        Self(ScalarF64Vec2(self.0).mul(ScalarF64Vec2(rhs.0)).0)
-    }
-
-    #[inline(always)]
-    fn fma(self, a: Self, b: Self) -> Self {
-        Self(
-            ScalarF64Vec2(self.0)
-                .fma(ScalarF64Vec2(a.0), ScalarF64Vec2(b.0))
-                .0,
-        )
-    }
-
-    #[inline(always)]
-    fn fms(self, a: Self, b: Self) -> Self {
-        Self(
-            ScalarF64Vec2(self.0)
-                .fms(ScalarF64Vec2(a.0), ScalarF64Vec2(b.0))
-                .0,
-        )
-    }
-
-    #[inline(always)]
-    fn max(self, rhs: Self) -> Self {
-        Self(ScalarF64Vec2(self.0).max(ScalarF64Vec2(rhs.0)).0)
-    }
-
-    #[inline(always)]
-    fn min(self, rhs: Self) -> Self {
-        Self(ScalarF64Vec2(self.0).min(ScalarF64Vec2(rhs.0)).0)
-    }
-
-    #[inline(always)]
-    fn abs(self) -> Self {
-        Self(ScalarF64Vec2(self.0).abs().0)
-    }
-
-    #[inline(always)]
-    fn horizontal_sum(self) -> f64 {
-        ScalarF64Vec2(self.0).horizontal_sum()
-    }
-}
-
-impl TrainerMathBackend for WasmSimd128Backend {
-    type F64Vec2 = WasmF64Vec2;
 }

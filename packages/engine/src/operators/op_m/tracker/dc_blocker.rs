@@ -2,6 +2,42 @@
 
 use crate::math::flush_recursive_state_f32;
 
+/// Canonical `5 Hz` `T1` DC blocker pole at `48 kHz` (`dnam_kernels::DC_BLOCKER_5HZ_48K_F32`,
+/// `ref[dsp.op-m.tracker.t1-dc-blocker]`).
+pub(crate) const T1_DC_BLOCKER_5HZ_48K_POLE: f32 = dnam_kernels::DC_BLOCKER_5HZ_48K_F32;
+
+/// Canonical `5 Hz` `T1` DC blocker passband-normalized gain `0.5 * (1 + R)` at `48 kHz`
+/// (`0x3F7F_EA90`, `ref[dsp.op-m.tracker.t1-dc-blocker]`).
+pub(crate) const T1_DC_BLOCKER_5HZ_48K_GAIN: f32 = 0.5 * (1.0 + T1_DC_BLOCKER_5HZ_48K_POLE);
+
+/// 24-bit significand `(1 << 23) | frac(R_48k)` of [`T1_DC_BLOCKER_5HZ_48K_POLE`] for the 160-bit
+/// midpoint search (`0x00FF_D51F`).
+const T1_REF_POLE_MANTISSA_24: u64 =
+    ((1_u32 << 23) | (T1_DC_BLOCKER_5HZ_48K_POLE.to_bits() & 0x007F_FFFF)) as u64;
+
+const _: () = assert!(T1_DC_BLOCKER_5HZ_48K_POLE.to_bits() == 0x3F7F_D51F);
+const _: () = assert!(T1_DC_BLOCKER_5HZ_48K_GAIN.to_bits() == 0x3F7F_EA90);
+const _: () = assert!(T1_REF_POLE_MANTISSA_24 == 0x00FF_D51F);
+
+/// Shared `T1` `5 Hz` 1-pole DC blocker step scrubbing `NaN`/`±Inf` and flushing subnormals on all
+/// recursive state (`prev_x`, `prev_d`).
+#[inline(always)]
+pub(crate) fn step_t1_dc_blocker_state(
+    pole: f32,
+    gain: f32,
+    prev_x: &mut f32,
+    prev_d: &mut f32,
+    x: f32,
+) -> f32 {
+    let x_clean = flush_recursive_state_f32(x);
+    let prev_x_clean = flush_recursive_state_f32(*prev_x);
+    let prev_d_clean = flush_recursive_state_f32(*prev_d);
+    let d = flush_recursive_state_f32(gain * (x_clean - prev_x_clean) + pole * prev_d_clean);
+    *prev_x = x_clean;
+    *prev_d = d;
+    d
+}
+
 /// Outward 160-bit interval bounds on $\mathrm{atanh}((D - N) / (D + N)) \cdot 2^{160}$ using 8 terms
 /// (`ref[dsp.op-m.tracker.t1-dc-blocker]`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -98,7 +134,7 @@ pub fn compute_t1_dc_blocker_coeffs_bits(rate_hz: f64) -> Option<(u32, u32)> {
         (mant >> tz, 1u64 << (raw_k - tz))
     };
     let exponent_num = 48_000u64 * rate_den;
-    let ref_bounds = atanh_bounds_160bit(0x00ff_d51f, 1u64 << 24);
+    let ref_bounds = atanh_bounds_160bit(T1_REF_POLE_MANTISSA_24, 1u64 << 24);
 
     let mut lower = first + 1;
     let mut upper = last;
@@ -113,12 +149,14 @@ pub fn compute_t1_dc_blocker_coeffs_bits(rate_hz: f64) -> Option<(u32, u32)> {
             upper = candidate;
         }
     }
-    let pole_bits = 0x3f00_0000 + lower - (1 << 23);
+    const F32_HALF_EXP_BITS: u32 = (dnam_kernels::IEEE754_F32_EXP_BIAS - 1) << 23;
+    const F32_IMPLICIT_MANTISSA_BIT: u32 = 1u32 << 23;
+    let pole_bits = F32_HALF_EXP_BITS + lower - F32_IMPLICIT_MANTISSA_BIT;
     let num_gain = (1u32 << 24) + lower;
     let q = num_gain / 2;
     let r = num_gain % 2;
     let rounded_gain = q + u32::from(r == 1 && (q & 1) != 0);
-    let gain_bits = 0x3f00_0000 + rounded_gain - (1 << 23);
+    let gain_bits = F32_HALF_EXP_BITS + rounded_gain - F32_IMPLICIT_MANTISSA_BIT;
     Some((pole_bits, gain_bits))
 }
 
@@ -133,15 +171,16 @@ pub struct T1DcBlocker {
 
 impl Default for T1DcBlocker {
     fn default() -> Self {
-        Self::new_at_rate(48_000.0).unwrap()
+        Self::new_48khz()
     }
 }
 
 impl T1DcBlocker {
+    /// Creates a `48 kHz` `T1` DC blocker initialized from [`dnam_kernels::DC_BLOCKER_5HZ_48K_F32`].
     pub const fn new_48khz() -> Self {
         Self {
-            pole: f32::from_bits(0x3f7f_d51f),
-            gain: f32::from_bits(0x3f7f_ea90),
+            pole: T1_DC_BLOCKER_5HZ_48K_POLE,
+            gain: T1_DC_BLOCKER_5HZ_48K_GAIN,
             prev_x: 0.0,
             prev_d: 0.0,
         }
@@ -162,12 +201,11 @@ impl T1DcBlocker {
         })
     }
 
+    /// Advances the `T1` `5 Hz` DC blocker by one sample while scrubbing `NaN`/`±Inf` and flushing
+    /// subnormals on all recursive state.
     #[inline(always)]
     pub fn step(&mut self, x: f32) -> f32 {
-        let d = self.gain * (x - self.prev_x) + self.pole * self.prev_d;
-        self.prev_x = x;
-        self.prev_d = flush_recursive_state_f32(d);
-        d
+        step_t1_dc_blocker_state(self.pole, self.gain, &mut self.prev_x, &mut self.prev_d, x)
     }
 }
 
@@ -181,13 +219,17 @@ pub trait OpMBackend {
 /// Portable scalar reference implementation of [`OpMBackend::tracker_exp_scales_f32`].
 #[inline(always)]
 pub fn tracker_exp_scales_scalar_f32(max_l: f32, max_r: f32) -> (f32, f32, f32, f32) {
-    let cl_l = ((max_l.to_bits() >> 23) & 0xff).min(253);
-    let cl_r = ((max_r.to_bits() >> 23) & 0xff).min(253);
+    const F32_EXP_SHIFT: u32 = 23;
+    const F32_EXP_MASK: u32 = 0xFF;
+    const EXP_SUM_BIAS: u32 = 2 * dnam_kernels::IEEE754_F32_EXP_BIAS;
+    const MAX_BIASED_EXP: u32 = EXP_SUM_BIAS - 1;
+    let cl_l = ((max_l.to_bits() >> F32_EXP_SHIFT) & F32_EXP_MASK).min(MAX_BIASED_EXP);
+    let cl_r = ((max_r.to_bits() >> F32_EXP_SHIFT) & F32_EXP_MASK).min(MAX_BIASED_EXP);
     (
-        f32::from_bits((254 - cl_l) << 23),
-        f32::from_bits(cl_l << 23),
-        f32::from_bits((254 - cl_r) << 23),
-        f32::from_bits(cl_r << 23),
+        f32::from_bits((EXP_SUM_BIAS - cl_l) << F32_EXP_SHIFT),
+        f32::from_bits(cl_l << F32_EXP_SHIFT),
+        f32::from_bits((EXP_SUM_BIAS - cl_r) << F32_EXP_SHIFT),
+        f32::from_bits(cl_r << F32_EXP_SHIFT),
     )
 }
 
@@ -208,7 +250,7 @@ impl OpMBackend for crate::math::NeonBackend {
 
 #[cfg(target_arch = "aarch64")]
 impl OpMBackend for crate::math::ArmSve2Backend {
-    #[inline(always)]
+    #[inline]
     fn tracker_exp_scales_f32(max_l: f32, max_r: f32) -> (f32, f32, f32, f32) {
         crate::math::aarch64::sve2::sve2_tracker_exp_scales_f32(max_l, max_r)
             .unwrap_or_else(|| tracker_exp_scales_scalar_f32(max_l, max_r))
@@ -217,7 +259,7 @@ impl OpMBackend for crate::math::ArmSve2Backend {
 
 #[cfg(target_arch = "aarch64")]
 impl OpMBackend for crate::math::ArmSmeBackend {
-    #[inline(always)]
+    #[inline]
     fn tracker_exp_scales_f32(max_l: f32, max_r: f32) -> (f32, f32, f32, f32) {
         crate::math::aarch64::sve2::sve2_tracker_exp_scales_f32(max_l, max_r).unwrap_or_else(|| {
             crate::math::aarch64::neon::neon_tracker_exp_scales_f32(max_l, max_r)
@@ -235,7 +277,7 @@ impl OpMBackend for crate::math::X86Sse2Backend {
 
 #[cfg(target_arch = "x86_64")]
 impl OpMBackend for crate::math::X86Sse42Backend {
-    #[inline(always)]
+    #[inline]
     fn tracker_exp_scales_f32(max_l: f32, max_r: f32) -> (f32, f32, f32, f32) {
         crate::math::x86::sse42::sse42_tracker_exp_scales_f32(max_l, max_r)
     }
@@ -243,7 +285,7 @@ impl OpMBackend for crate::math::X86Sse42Backend {
 
 #[cfg(target_arch = "x86_64")]
 impl OpMBackend for crate::math::X86Avx2FmaBackend {
-    #[inline(always)]
+    #[inline]
     fn tracker_exp_scales_f32(max_l: f32, max_r: f32) -> (f32, f32, f32, f32) {
         crate::math::x86::sse42::sse42_tracker_exp_scales_f32(max_l, max_r)
     }
@@ -275,6 +317,22 @@ mod tests {
         let def = T1DcBlocker::default();
         assert_eq!(def.pole.to_bits(), 0x3f7f_d51f);
         assert_eq!(def.gain.to_bits(), 0x3f7f_ea90);
+        assert_eq!(
+            def.pole.to_bits(),
+            dnam_kernels::DC_BLOCKER_5HZ_48K_F32.to_bits()
+        );
+
+        let mut dcb = T1DcBlocker {
+            prev_x: f32::NAN,
+            prev_d: f32::INFINITY,
+            ..Default::default()
+        };
+        assert_eq!(dcb.step(f32::NAN).to_bits(), 0);
+        assert!(dcb.prev_x.is_finite() && dcb.prev_d.is_finite());
+        assert_eq!(dcb.step(f32::INFINITY).to_bits(), 0);
+        assert!(dcb.step(-3.0e38).is_finite());
+        assert_eq!(dcb.step(3.0e38).to_bits(), 0);
+        assert!(dcb.step(0.5).is_finite());
 
         let (sd_l, su_l, sd_r, su_r) = tracker_exp_scales_scalar_f32(0.5, 16.0);
         assert_eq!(

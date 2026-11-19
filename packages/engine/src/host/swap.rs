@@ -16,7 +16,7 @@ use crate::dynamic::DynamicDnamEngine;
 use crate::schema::DnamError;
 use crate::types::Tier;
 
-const RETIRED_SLOTS: usize = 4;
+const RETIRED_SLOTS: usize = 8;
 
 /// Shared safe ping-pong handoff state between [`EngineSwapController`] (non-RT thread) and
 /// [`EngineSwapAudioHandle`] (real-time audio thread).
@@ -25,26 +25,49 @@ const RETIRED_SLOTS: usize = 4;
 pub struct RealtimeEngineSwap {
     has_pending: AtomicBool,
     pending_slot: Mutex<Option<(DynamicDnamEngine<'static>, u64)>>,
+    retired_occupied: [AtomicBool; RETIRED_SLOTS],
     retired_slots: [Mutex<Option<DynamicDnamEngine<'static>>>; RETIRED_SLOTS],
     swap_epoch: AtomicUsize,
 }
 
 impl RealtimeEngineSwap {
     fn new() -> Self {
+        let pending_slot = Mutex::new(None);
+        let retired_slots: [Mutex<Option<DynamicDnamEngine<'static>>>; RETIRED_SLOTS] =
+            core::array::from_fn(|_| Mutex::new(None));
+        // Eagerly initialize platform mutex allocations (e.g., macOS `OnceBox<pthread_mutex_t>`)
+        // on the non-RT constructor thread so `poll_swap_epoch` performs zero audio-thread allocs.
+        drop(pending_slot.lock());
+        for slot in &retired_slots {
+            drop(slot.lock());
+        }
         Self {
             has_pending: AtomicBool::new(false),
-            pending_slot: Mutex::new(None),
-            retired_slots: core::array::from_fn(|_| Mutex::new(None)),
+            pending_slot,
+            retired_occupied: core::array::from_fn(|_| AtomicBool::new(false)),
+            retired_slots,
             swap_epoch: AtomicUsize::new(0),
         }
     }
 
     fn reclaim_all_retired(&self) -> usize {
         let mut count = 0_usize;
-        for slot in &self.retired_slots {
+        for (idx, slot) in self.retired_slots.iter().enumerate() {
+            if !self.retired_occupied[idx].load(Ordering::Acquire) {
+                continue;
+            }
             let retired = match slot.lock() {
-                Ok(mut g) => g.take(),
-                Err(poisoned) => poisoned.into_inner().take(),
+                Ok(mut g) => {
+                    let item = g.take();
+                    self.retired_occupied[idx].store(false, Ordering::Release);
+                    item
+                }
+                Err(poisoned) => {
+                    let mut g = poisoned.into_inner();
+                    let item = g.take();
+                    self.retired_occupied[idx].store(false, Ordering::Release);
+                    item
+                }
             };
             if let Some(old_engine) = retired {
                 drop(old_engine);
@@ -139,7 +162,9 @@ pub struct EngineSwapAudioHandle {
 
 impl EngineSwapAudioHandle {
     /// Checks if a newly staged engine is pending and swaps it in via non-blocking `try_lock`,
-    /// moving the retired engine into the non-RT reclamation slots (`0` `malloc`, `0` `drop`).
+    /// moving the retired engine into a pre-verified empty non-RT reclamation slot (`0` `malloc`,
+    /// `0` audio-thread `drop`). Returns `None` without popping `pending_slot` if all
+    /// `RETIRED_SLOTS` are currently full/contended so the audio thread never deallocates.
     ///
     /// Returns `Some(causal_epoch)` if a new engine was swapped in.
     #[inline]
@@ -147,32 +172,36 @@ impl EngineSwapAudioHandle {
         if !self.shared.has_pending.load(Ordering::Acquire) {
             return None;
         }
-        let next_entry = match self.shared.pending_slot.try_lock() {
-            Ok(mut guard) => {
-                let taken = guard.take();
-                if taken.is_some() {
-                    self.shared.has_pending.store(false, Ordering::Release);
+        for (idx, slot) in self.shared.retired_slots.iter().enumerate() {
+            if self.shared.retired_occupied[idx].load(Ordering::Acquire) {
+                continue;
+            }
+            let Ok(mut retired_guard) = slot.try_lock() else {
+                continue;
+            };
+            if retired_guard.is_some() {
+                self.shared.retired_occupied[idx].store(true, Ordering::Release);
+                continue;
+            }
+            let next_entry = match self.shared.pending_slot.try_lock() {
+                Ok(mut p_guard) => {
+                    let taken = p_guard.take();
+                    if taken.is_some() {
+                        self.shared.has_pending.store(false, Ordering::Release);
+                    }
+                    taken
                 }
-                taken
-            }
-            Err(_) => None,
-        };
-        let (next, causal_epoch) = next_entry?;
-        let old_engine = core::mem::replace(&mut self.active, next);
-        for slot in &self.shared.retired_slots {
-            if let Ok(mut guard) = slot.try_lock()
-                && guard.is_none()
-            {
-                *guard = Some(old_engine);
-                self.shared.swap_epoch.fetch_add(1, Ordering::Release);
-                return Some(causal_epoch);
-            }
+                Err(_) => return None,
+            };
+            let (next, causal_epoch) = next_entry?;
+            let old_engine = core::mem::replace(&mut self.active, next);
+            // `retired_guard` was just verified `None` above, so `replace` yields `None` without dropping `T`.
+            core::mem::forget((*retired_guard).replace(old_engine));
+            self.shared.retired_occupied[idx].store(true, Ordering::Release);
+            self.shared.swap_epoch.fetch_add(1, Ordering::Release);
+            return Some(causal_epoch);
         }
-        if let Ok(mut guard) = self.shared.retired_slots[0].try_lock() {
-            *guard = Some(old_engine);
-        }
-        self.shared.swap_epoch.fetch_add(1, Ordering::Release);
-        Some(causal_epoch)
+        None
     }
 
     /// Checks if a newly staged engine is pending and swaps it in via non-blocking `try_lock`,
@@ -299,11 +328,12 @@ mod tests {
         assert!(!did_swap_again);
         assert_eq!(controller.reclaim_retired(), 1);
 
-        // Pre-fill all RETIRED_SLOTS (4) to exercise the slot-0 fallback when all retired slots are full
-        for slot in &controller.shared.retired_slots {
+        // Pre-fill all RETIRED_SLOTS (8): audio thread MUST NOT swap or drop when all retired slots are occupied.
+        for (idx, slot) in controller.shared.retired_slots.iter().enumerate() {
             let dummy =
                 DynamicDnamEngine::from_bytes_owned(&container, Tier::Lite, 48_000).unwrap();
             *slot.lock().unwrap() = Some(dummy);
+            controller.shared.retired_occupied[idx].store(true, Ordering::Release);
         }
         let next = DynamicDnamEngine::from_bytes_owned(&container, Tier::Full, 48_000).unwrap();
         controller
@@ -313,9 +343,53 @@ mod tests {
             .unwrap()
             .replace((next, 77));
         controller.shared.has_pending.store(true, Ordering::Release);
+        assert_eq!(audio_handle.poll_swap_epoch(), None);
+        assert_eq!(controller.reclaim_retired(), RETIRED_SLOTS);
         assert_eq!(audio_handle.poll_swap_epoch(), Some(77));
         assert_eq!(audio_handle.engine().tier(), Tier::Full);
+        assert_eq!(controller.reclaim_retired(), 1);
+    }
+
+    #[test]
+    fn test_zero_audio_thread_drops_across_more_than_retired_slots_swaps_before_reclaim() {
+        let container = build_minimal_container();
+        let initial = DynamicDnamEngine::from_bytes_owned(&container, Tier::Lite, 48_000).unwrap();
+        let (mut controller, mut audio_handle) = realtime_engine_swap(initial);
+
+        // Stage & swap RETIRED_SLOTS times without reclaiming: fills every retired slot cleanly.
+        for i in 0..RETIRED_SLOTS {
+            let e = DynamicDnamEngine::from_bytes_owned(&container, Tier::Full, 48_000).unwrap();
+            controller
+                .shared
+                .pending_slot
+                .lock()
+                .unwrap()
+                .replace((e, (i + 1) as u64));
+            controller.shared.has_pending.store(true, Ordering::Release);
+            assert_eq!(audio_handle.poll_swap_epoch(), Some((i + 1) as u64));
+        }
+
+        // Now stage > RETIRED_SLOTS without reclaiming: audio thread refuses to swap/drop on RT!
+        for extra in 1..=4 {
+            let e = DynamicDnamEngine::from_bytes_owned(&container, Tier::Pro, 48_000).unwrap();
+            controller
+                .shared
+                .pending_slot
+                .lock()
+                .unwrap()
+                .replace((e, (RETIRED_SLOTS + extra) as u64));
+            controller.shared.has_pending.store(true, Ordering::Release);
+            assert_eq!(audio_handle.poll_swap_epoch(), None);
+        }
+
+        // Controller reclaims all 8 retired instances cleanly on non-RT thread, then pending swap lands!
         assert_eq!(controller.reclaim_retired(), RETIRED_SLOTS);
+        assert_eq!(
+            audio_handle.poll_swap_epoch(),
+            Some((RETIRED_SLOTS + 4) as u64)
+        );
+        assert_eq!(audio_handle.engine().tier(), Tier::Pro);
+        assert_eq!(controller.reclaim_retired(), 1);
     }
 
     proptest! {

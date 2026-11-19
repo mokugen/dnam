@@ -7,11 +7,8 @@ use crate::schema::{ControlCalibrationRole, ControlKind, DnamError, DnamJsonHead
 impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     /// Applies a preset by string identifier (`presets[*].id`).
     pub fn apply_preset(&mut self, preset_id: &str) -> Result<(), DnamError> {
-        let batch = resolve_preset_batch_by_id(
-            self.header.as_ref(),
-            &self.control_bus.descriptors,
-            preset_id,
-        )?;
+        let batch =
+            resolve_preset_batch_by_id(self.header(), &self.control_bus.descriptors, preset_id)?;
         self.apply_resolved_preset_batch(&batch);
         Ok(())
     }
@@ -19,7 +16,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     /// Applies a preset by index without any heap allocations (`ref[dsp.ctrl.op-m.spsc-ingress]`).
     pub fn apply_preset_by_index(&mut self, preset_index: usize) -> Result<(), DnamError> {
         let batch = resolve_preset_batch_by_index(
-            self.header.as_ref(),
+            self.header(),
             &self.control_bus.descriptors,
             preset_index,
         )?;
@@ -31,7 +28,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     #[inline]
     pub(crate) fn apply_preset_by_index_rt(&mut self, preset_index: usize) -> bool {
         let Some(batch) = resolve_preset_batch_by_index_opt(
-            self.header.as_ref(),
+            self.header(),
             &self.control_bus.descriptors,
             preset_index,
         ) else {
@@ -56,8 +53,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             self.set_control_value(idx, val);
         }
         let extra_len = self
-            .header
-            .as_ref()
+            .header()
             .map_or(0, |h| h.controls_schema.len().saturating_sub(256));
         if extra_len > 0 {
             let p_idx = batch.preset_index as usize;
@@ -66,7 +62,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                 self.control_bus.num_controls = total_len;
             }
             for idx in 256..total_len {
-                let Some((is_sw, target_val)) = self.header.as_ref().and_then(|hdr| {
+                let Some((is_sw, target_val)) = self.header().and_then(|hdr| {
                     let preset = hdr.presets.get(p_idx)?;
                     let def = hdr.controls_schema.get(idx)?;
                     let is_sw = def.kind == ControlKind::Switch;
@@ -130,7 +126,7 @@ pub(crate) fn apply_calibrated_control_role(
     match cal.role {
         ControlCalibrationRole::StereoMode => {
             if let Some(ref opts) = ctrl_def.declared_options {
-                let idx = (physical_value.round() as isize).max(0) as usize;
+                let idx = (crate::math::round_f32(physical_value) as isize).max(0) as usize;
                 if let Some(opt_label) = opts.get(idx)
                     && let Some(w) = cal.stereo_width_for_option(opt_label)
                 {
@@ -152,7 +148,7 @@ pub(crate) fn apply_calibrated_control_role(
         ControlCalibrationRole::FreezeLatch => {
             if ctrl_def.kind == ControlKind::Switch {
                 if let Some(ref opts) = ctrl_def.declared_options {
-                    let idx = (physical_value.round() as isize).max(0) as usize;
+                    let idx = (crate::math::round_f32(physical_value) as isize).max(0) as usize;
                     if let Some(opt_label) = opts.get(idx)
                         && let Some(alpha) = cal.freeze_amount_for_option(opt_label)
                     {
@@ -274,6 +270,7 @@ mod tests {
     use alloc::format;
     use alloc::string::String;
     use alloc::vec;
+    use alloc::vec::Vec;
 
     fn sample_range_ctrl(id: &str) -> ControlSchemaDef {
         ControlSchemaDef {
@@ -286,8 +283,8 @@ mod tests {
             declared_range: Some([0.0, 10.0]),
             safe_clamped_range: Some([0.0, 10.0]),
             default: serde_json::json!(5.0),
-            conditional_min: BTreeMap::new(),
-            conditional_max: BTreeMap::new(),
+            conditional_bounds: alloc::vec::Vec::new(),
+            represented_switch_options: None,
             declared_options: None,
             active_options: None,
             clamp_warning: None,
@@ -343,6 +340,7 @@ mod tests {
         let mut engine =
             DnamEngine::<ScalarBackend>::from_bytes(&container, crate::Tier::Lite, 48_000).unwrap();
         engine.header = Some(header);
+        engine.header_active = true;
         engine.control_bus.ensure_control_capacity(260);
 
         assert!(!engine.apply_preset_by_index_rt(99));
@@ -367,7 +365,7 @@ mod tests {
                 c.calibration = Some(ControlCalibration {
                     role: ControlCalibrationRole::StereoMode,
                     lobatto_physical_anchors: None,
-                    conditional_physical_anchors: BTreeMap::new(),
+                    conditional_physical_anchors: Vec::new(),
                     tempo_sync_default_subdivision: None,
                 });
                 c
@@ -378,7 +376,7 @@ mod tests {
                 c.calibration = Some(ControlCalibration {
                     role: ControlCalibrationRole::StereoWidth,
                     lobatto_physical_anchors: None,
-                    conditional_physical_anchors: BTreeMap::new(),
+                    conditional_physical_anchors: Vec::new(),
                     tempo_sync_default_subdivision: None,
                 });
                 c
@@ -389,7 +387,7 @@ mod tests {
                 c.calibration = Some(ControlCalibration {
                     role: ControlCalibrationRole::StereoWidth,
                     lobatto_physical_anchors: None,
-                    conditional_physical_anchors: BTreeMap::new(),
+                    conditional_physical_anchors: Vec::new(),
                     tempo_sync_default_subdivision: None,
                 });
                 c
@@ -401,7 +399,7 @@ mod tests {
                 c.calibration = Some(ControlCalibration {
                     role: ControlCalibrationRole::FreezeLatch,
                     lobatto_physical_anchors: None,
-                    conditional_physical_anchors: BTreeMap::new(),
+                    conditional_physical_anchors: Vec::new(),
                     tempo_sync_default_subdivision: None,
                 });
                 c
@@ -412,7 +410,7 @@ mod tests {
                 c.calibration = Some(ControlCalibration {
                     role: ControlCalibrationRole::FreezeLatch,
                     lobatto_physical_anchors: None,
-                    conditional_physical_anchors: BTreeMap::new(),
+                    conditional_physical_anchors: Vec::new(),
                     tempo_sync_default_subdivision: None,
                 });
                 c

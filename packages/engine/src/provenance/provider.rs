@@ -1,9 +1,14 @@
 //! Pluggable cryptographic and hardware-enclave provider traits and implementations.
 
-use alloc::string::{String, ToString};
+use alloc::string::String;
+#[cfg(feature = "crypto")]
+use alloc::string::ToString;
+use alloc::vec::Vec;
 use zeroize::Zeroizing;
 
-use crate::schema::{AuthorizedDevice, DnamError, MarketplaceReceipt, OemDeviceCertificate};
+#[cfg(feature = "crypto")]
+use crate::schema::OemDeviceCertificate;
+use crate::schema::{AuthorizedDevice, DnamError, MarketplaceReceipt};
 
 #[cfg(feature = "crypto")]
 use super::sha256::{decode_hex_array, encode_hex};
@@ -58,39 +63,35 @@ pub trait CryptoProvider {
         device: &AuthorizedDevice,
     ) -> Result<Zeroizing<[u8; 32]>, DnamError>;
 
-    /// Unwraps a 48-byte `wrapped_cek` from a `.dnam-seal` (`b"DNSL"`) binary recipient slot
-    /// using the 32-byte `ephemeral_pubkey_x25519` and 16-byte raw `device_id_hash`.
-    fn unwrap_seal_slot_cek(
+    /// Unwraps a 48-byte `wrapped_cek` from a `v3.0` HPKE slot (`enc[32] || wrapped_cek_and_tag[48]`)
+    /// using RFC 9180 Base mode (`DHKEM(X25519, HKDF-SHA256)` + `ChaCha20Poly1305`) bound to
+    /// `info` and `aad`.
+    fn hpke_open_slot_cek(
         &self,
-        ephemeral_pubkey_x25519: &[u8; 32],
-        device_id_hash_16: &[u8; 16],
-        wrapped_cek_48: &[u8; 48],
+        _enc: &[u8; 32],
+        _info: &[u8],
+        _aad: &[u8],
+        _wrapped_cek_and_tag: &[u8; 48],
     ) -> Result<Zeroizing<[u8; 32]>, DnamError> {
-        let epk_hex = super::sha256::encode_hex(ephemeral_pubkey_x25519);
-        let dev_id_hex = super::sha256::encode_hex(device_id_hash_16);
-        let wrapped_hex = super::sha256::encode_hex(wrapped_cek_48);
-        let dummy_dev = AuthorizedDevice {
-            oem_vendor: String::new(),
-            model_code: String::new(),
-            device_id_hash: dev_id_hex,
-            wrapped_cek: Some(wrapped_hex),
-        };
-        let dummy_receipt = MarketplaceReceipt {
-            marketplace_id: String::new(),
-            license_id: String::new(),
-            buyer_hash: String::new(),
-            license_tier: String::new(),
-            issued_at: String::new(),
-            buyer_arena_sha256: String::new(),
-            buyer_tier_arena_sha256: None,
-            encryption_mode: String::from("x25519_chacha20_arena"),
-            arena_nonce_96: None,
-            ephemeral_pubkey_x25519: Some(epk_hex),
-            authorized_devices: alloc::vec![],
-            royalty_splits: alloc::vec![],
-            receipt_sig_ed25519: String::new(),
-        };
-        self.unwrap_device_cek(&dummy_receipt, &dummy_dev)
+        Err(DnamError::EncryptedArenaRequiresDeviceKey)
+    }
+
+    /// Decrypts and verifies a `ChaCha20-Poly1305` AEAD record (`ct || tag`).
+    fn aead_chacha20poly1305_open(
+        &self,
+        _key: &[u8; 32],
+        _nonce: &[u8; 12],
+        _aad: &[u8],
+        _ciphertext_and_tag: &[u8],
+    ) -> Result<Vec<u8>, DnamError> {
+        Err(DnamError::CryptoVerificationFailed(
+            "ChaCha20-Poly1305 AEAD requires the 'crypto' feature or a custom CryptoProvider",
+        ))
+    }
+
+    /// Optional local device `X25519` public key (`32 B`) for matching HPKE recipient slots.
+    fn device_pubkey_x25519(&self) -> Option<[u8; 32]> {
+        None
     }
 
     /// Optional local hardware `device_id_hash` for automatic selection in `receipt.authorized_devices`.
@@ -125,13 +126,30 @@ impl<T: CryptoProvider + ?Sized> CryptoProvider for &T {
     }
 
     #[inline]
-    fn unwrap_seal_slot_cek(
+    fn hpke_open_slot_cek(
         &self,
-        ephemeral_pubkey_x25519: &[u8; 32],
-        device_id_hash_16: &[u8; 16],
-        wrapped_cek_48: &[u8; 48],
+        enc: &[u8; 32],
+        info: &[u8],
+        aad: &[u8],
+        wrapped_cek_and_tag: &[u8; 48],
     ) -> Result<Zeroizing<[u8; 32]>, DnamError> {
-        (**self).unwrap_seal_slot_cek(ephemeral_pubkey_x25519, device_id_hash_16, wrapped_cek_48)
+        (**self).hpke_open_slot_cek(enc, info, aad, wrapped_cek_and_tag)
+    }
+
+    #[inline]
+    fn aead_chacha20poly1305_open(
+        &self,
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        aad: &[u8],
+        ciphertext_and_tag: &[u8],
+    ) -> Result<Vec<u8>, DnamError> {
+        (**self).aead_chacha20poly1305_open(key, nonce, aad, ciphertext_and_tag)
+    }
+
+    #[inline]
+    fn device_pubkey_x25519(&self) -> Option<[u8; 32]> {
+        (**self).device_pubkey_x25519()
     }
 
     #[inline]
@@ -254,8 +272,8 @@ impl RustCryptoProvider {
         PublicKey::from(&sk).to_bytes()
     }
 
-    /// Signs a factory-provisioned [`OemDeviceCertificate`] binding a hardware device's
-    /// `(oem_vendor, model_code, device_id_hash, pubkey_x25519)` to the OEM's root `Ed25519` key.
+    /// Signs a factory-provisioned V2 [`OemDeviceCertificate`] (`"DNAM-OEM-CERT-V2"`) binding a
+    /// hardware device's `(oem_vendor, model_code, device_id_hash, pubkey_x25519)` to the OEM's root `Ed25519` key.
     pub fn sign_oem_device_certificate(
         oem_seed_ed25519: &[u8; 32],
         oem_vendor: &str,
@@ -263,20 +281,53 @@ impl RustCryptoProvider {
         device_id_hash: &str,
         pubkey_x25519: &[u8; 32],
     ) -> Result<OemDeviceCertificate, DnamError> {
-        let raw_id = decode_hex_array::<16>(device_id_hash)?;
-        let normalized_id = encode_hex(&raw_id);
-        let msg = super::verify::build_oem_device_cert_signing_message(
+        Self::sign_oem_device_certificate_v2(
+            oem_seed_ed25519,
             oem_vendor,
             model_code,
-            &normalized_id,
+            device_id_hash,
             pubkey_x25519,
-        );
+            1,
+            &[0u8; 32],
+            &[0u8; 32],
+        )
+    }
+
+    /// Signs a factory-provisioned V2 [`OemDeviceCertificate`] (`"DNAM-OEM-CERT-V2"`) with explicit
+    /// hardware attestation `assurance`, `attestation_policy_sha256`, and `attestation_evidence_sha256`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_oem_device_certificate_v2(
+        oem_seed_ed25519: &[u8; 32],
+        oem_vendor: &str,
+        model_code: &str,
+        device_id_hash: &str,
+        pubkey_x25519: &[u8; 32],
+        assurance: u8,
+        attestation_policy_sha256: &[u8; 32],
+        attestation_evidence_sha256: &[u8; 32],
+    ) -> Result<OemDeviceCertificate, DnamError> {
+        let raw_id = decode_hex_array::<16>(device_id_hash)?;
+        let normalized_id = encode_hex(&raw_id);
+        let issuer_pk = Self::ed25519_pubkey_from_seed(oem_seed_ed25519);
+        let msg = super::security::build_oem_cert_v2_signing_message(
+            oem_vendor,
+            model_code,
+            &raw_id,
+            pubkey_x25519,
+            &issuer_pk,
+            assurance,
+            attestation_policy_sha256,
+            attestation_evidence_sha256,
+        )?;
         let sig = Self::ed25519_sign(oem_seed_ed25519, &msg);
         Ok(OemDeviceCertificate {
             oem_vendor: oem_vendor.to_string(),
             model_code: model_code.to_string(),
             device_id_hash: normalized_id,
             pubkey_x25519: encode_hex(pubkey_x25519),
+            assurance: Some(assurance),
+            attestation_policy_sha256: Some(encode_hex(attestation_policy_sha256)),
+            attestation_evidence_sha256: Some(encode_hex(attestation_evidence_sha256)),
             oem_sig_ed25519: encode_hex(&sig),
         })
     }
@@ -414,6 +465,36 @@ impl CryptoProvider for RustCryptoProvider {
         Ok(cek)
     }
 
+    fn hpke_open_slot_cek(
+        &self,
+        enc: &[u8; 32],
+        info: &[u8],
+        aad: &[u8],
+        wrapped_cek_and_tag: &[u8; 48],
+    ) -> Result<Zeroizing<[u8; 32]>, DnamError> {
+        let dsk_bytes = self
+            .device_secret_x25519
+            .as_ref()
+            .ok_or(DnamError::EncryptedArenaRequiresDeviceKey)?;
+        super::seal::hpke_base::hpke_open_cek_base(dsk_bytes, enc, info, aad, wrapped_cek_and_tag)
+    }
+
+    fn aead_chacha20poly1305_open(
+        &self,
+        key: &[u8; 32],
+        nonce: &[u8; 12],
+        aad: &[u8],
+        ciphertext_and_tag: &[u8],
+    ) -> Result<Vec<u8>, DnamError> {
+        super::seal::hpke_base::aead_open_record(key, nonce, aad, ciphertext_and_tag)
+    }
+
+    fn device_pubkey_x25519(&self) -> Option<[u8; 32]> {
+        self.device_secret_x25519
+            .as_ref()
+            .map(|sk| Self::x25519_pubkey_from_secret(sk))
+    }
+
     fn local_device_id_hash(&self) -> Option<&str> {
         self.device_id_hash.as_deref()
     }
@@ -469,7 +550,7 @@ mod tests {
             Err(DnamError::EncryptedArenaRequiresDeviceKey)
         );
         assert_eq!(
-            open.unwrap_seal_slot_cek(&[0u8; 32], &[0u8; 16], &[0u8; 48]),
+            open.hpke_open_slot_cek(&[0u8; 32], b"info", b"aad", &[0u8; 48]),
             Err(DnamError::EncryptedArenaRequiresDeviceKey)
         );
 
@@ -512,6 +593,7 @@ mod x25519_tests {
     };
 
     use crate::provenance::OpenArenaCryptoProvider;
+    use crate::provenance::seal::hpke_base::hpke_seal_cek_base;
     use crate::provenance::{CryptoProvider, RustCryptoProvider, encode_hex};
     use crate::schema::{AuthorizedDevice, DnamError, MarketplaceReceipt};
     use chacha20poly1305::aead::{AeadInPlace, KeyInit};
@@ -521,6 +603,12 @@ mod x25519_tests {
 
     const NON_CONTRIBUTORY: DnamError =
         DnamError::CryptoVerificationFailed("non-contributory X25519 shared secret");
+    const NON_CONTRIBUTORY_HPKE_SEAL: DnamError = DnamError::CryptoVerificationFailed(
+        "non-contributory X25519 shared secret during HPKE seal",
+    );
+    const NON_CONTRIBUTORY_HPKE_OPEN: DnamError = DnamError::CryptoVerificationFailed(
+        "non-contributory X25519 shared secret during HPKE open",
+    );
 
     #[test]
     fn wrap_and_unwrap_reject_low_order_x25519_points() {
@@ -544,8 +632,12 @@ mod x25519_tests {
                 Err(NON_CONTRIBUTORY)
             );
             assert_eq!(
-                provider.unwrap_seal_slot_cek(&public_key, &device_id, &[0u8; 48]),
-                Err(NON_CONTRIBUTORY)
+                hpke_seal_cek_base(&[7u8; 32], &public_key, b"info", b"aad", &[42u8; 32]),
+                Err(NON_CONTRIBUTORY_HPKE_SEAL)
+            );
+            assert_eq!(
+                provider.hpke_open_slot_cek(&public_key, b"info", b"aad", &[0u8; 48]),
+                Err(NON_CONTRIBUTORY_HPKE_OPEN)
             );
         }
     }
@@ -572,8 +664,8 @@ mod x25519_tests {
         wrapped[32..].copy_from_slice(&tag);
         let provider = RustCryptoProvider::new().with_device_key(&device_id_hex, [9u8; 32]);
         assert_eq!(
-            provider.unwrap_seal_slot_cek(&[0u8; 32], &device_id, &wrapped),
-            Err(NON_CONTRIBUTORY)
+            provider.hpke_open_slot_cek(&[0u8; 32], b"info", b"aad", &wrapped),
+            Err(NON_CONTRIBUTORY_HPKE_OPEN)
         );
     }
 
@@ -585,23 +677,23 @@ mod x25519_tests {
         let device_id_hex = encode_hex(&device_id);
         let content_key = [42u8; 32];
         let device_public = RustCryptoProvider::x25519_pubkey_from_secret(&device_secret);
-        let ephemeral_public = RustCryptoProvider::x25519_pubkey_from_secret(&ephemeral_secret);
-        let mut wrapped = RustCryptoProvider::wrap_device_cek(
+        let (enc, mut wrapped) = hpke_seal_cek_base(
             &ephemeral_secret,
             &device_public,
-            &device_id_hex,
+            b"info",
+            b"aad",
             &content_key,
         )
         .unwrap();
         let provider = RustCryptoProvider::new().with_device_key(&device_id_hex, device_secret);
         let recovered = provider
-            .unwrap_seal_slot_cek(&ephemeral_public, &device_id, &wrapped)
+            .hpke_open_slot_cek(&enc, b"info", b"aad", &wrapped)
             .unwrap();
         assert_eq!(*recovered, content_key);
 
         wrapped[0] ^= 1;
         assert!(matches!(
-            provider.unwrap_seal_slot_cek(&ephemeral_public, &device_id, &wrapped),
+            provider.hpke_open_slot_cek(&enc, b"info", b"aad", &wrapped),
             Err(DnamError::CryptoVerificationFailed(_))
         ));
 
@@ -609,7 +701,6 @@ mod x25519_tests {
         fn exercise_ref_provider<P: CryptoProvider>(
             p: P,
             epk: &[u8; 32],
-            dev_id: &[u8; 16],
             bad_wrapped: &[u8; 48],
             receipt: &MarketplaceReceipt,
             dev: &AuthorizedDevice,
@@ -617,7 +708,10 @@ mod x25519_tests {
             assert!(p.local_device_id_hash().is_some());
             assert!(p.marketplace_pubkey().is_none());
             assert!(p.ed25519_verify(&[0xff; 32], b"msg", &[0u8; 64]).is_err());
-            assert!(p.unwrap_seal_slot_cek(epk, dev_id, bad_wrapped).is_err());
+            assert!(
+                p.hpke_open_slot_cek(epk, b"info", b"aad", bad_wrapped)
+                    .is_err()
+            );
             assert!(p.unwrap_device_cek(receipt, dev).is_err());
         }
 
@@ -643,14 +737,7 @@ mod x25519_tests {
             device_id_hash: device_id_hex.clone(),
             wrapped_cek: None,
         };
-        exercise_ref_provider(
-            &provider,
-            &ephemeral_public,
-            &device_id,
-            &wrapped,
-            &receipt,
-            &dev,
-        );
+        exercise_ref_provider(&provider, &enc, &wrapped, &receipt, &dev);
 
         let mut hit_invalid_pk = false;
         for b in 0..=255u8 {

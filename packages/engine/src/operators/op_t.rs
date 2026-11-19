@@ -11,6 +11,10 @@ pub use delay_and_diffuser::{
     catmull_rom_hermite_cubic, cubic_lagrange_weights_4ch_vec4, hermite_hann_partition_of_unity,
     raised_cosine_barberpole_3phase,
 };
+pub use dnam_kernels::{
+    coercive_loop_limit_vec4, read_catmull_rom_f32, read_catmull_rom_fp16_u16,
+    step_schroeder_allpass, step_schroeder_quad_vec4, write_ring_with_freeze_f32,
+};
 pub use ring_and_guard::{
     FP16_DECAY_GAIN_BITS, OpTBlockMaxTreeGuard, PartitionedSchroederDiffuserBank,
     admit_op_t_memory_budget, bounded_q32_reader_position, bspline_barberpole_3phase,

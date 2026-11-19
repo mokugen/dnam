@@ -8,11 +8,11 @@
 //! 2. **Hardware-Agnostic [`CryptoProvider`] Trait** supporting the built-in `#![no_std]`
 //!    [`RustCryptoProvider`] (`ENCRYPTED_ARENA = 0` & software-keyed `ENCRYPTED_ARENA = 1`),
 //!    Rockchip RK3582 `OP-TEE` TrustZone, Apple Secure Enclave (`SEP`), and Windows/Linux `TPM 2.0`.
-//! 3. **RFC 8439 `ChaCha20` 64-Byte Cache-Line Arena Stream Encryption** (`Lite=72`, `Full=160`,
-//!    `Pro=288`, `Ultra=448` blocks, `0` bytes padding overhead).
+//! 3. **RFC 8439 `ChaCha20` 64-Byte Cache-Line Arena Stream Encryption** (`Lite=72`, `Full=124`,
+//!    `Pro=248`, `Ultra=480` blocks, `0` bytes padding overhead).
 //! 4. **Dual-Mechanism Buyer Watermarking (`Test 8H`):**
-//!    - **Mechanism A:** 16-channel modal/Kautz reciprocal scaling ($\kappa_{b,c}$) + $SO(4)$ control subspace rotation ($\mathbf{Q}_{\text{buyer}}$) + `0-ULP` 24-lane GRU hidden-lane sign-flip gauge.
-//!    - **Mechanism B:** Coupled Spread-Spectrum Tardos code surviving 4-buyer collusion + `fp16` truncation (`7,680`-coordinate `TardosCodebook7680` view).
+//!    - **Mechanism A:** 32-channel modal/Kautz reciprocal scaling ($\kappa_{b,c}$) + $SO(4)$ control subspace rotation ($\mathbf{Q}_{\text{buyer}}$) + `0-ULP` 40-lane `SONA` (`TPT-SVF`/`ParaLRU`/`PolyADAA1`) sign-flip gauge.
+//!    - **Mechanism B:** Coupled Spread-Spectrum Tardos code surviving 4-buyer collusion + `fp16` truncation (`7,680`-coordinate `TardosCodebook7680` view across non-backbone `f32` & linear `fp16` `W_readout`).
 //! 5. **224-Dimensional Gauge-Invariant Structural Hash** ($\mathbf{f}_{\text{struct}} \in \mathbb{R}^{224}$).
 
 mod chacha20;
@@ -26,9 +26,11 @@ pub(crate) use verify::canonicalize_jcs_value;
 pub(crate) mod watermark;
 
 pub use security::{
-    AnticloneGateAction, Dau1Envelope, HPKE_SUITE_X25519_SHA256_CHACHA20POLY1305,
-    MAX_RECORD_CIPHERTEXT_BYTES, MAX_RECORD_PLAINTEXT_BYTES, WatermarkSeedScope,
-    build_buyer_receipt_v1, build_creator_manifest_v1, build_dme1_header,
+    AnticloneGateAction, DME1_WIRE_MAGIC, DNPL_WIRE_MAGIC, DNSL_WIRE_MAGIC, DRM_WIRE_VERSION_MAJOR,
+    DRM_WIRE_VERSION_MINOR, Dau1Envelope, Dme1HeaderWire, DnplPreambleWire, DnslDirectoryWire,
+    DnslPreambleWire, HPKE_SUITE_X25519_SHA256_CHACHA20POLY1305, HpkeSlotWire, InnerDirectoryWire,
+    MAX_RECORD_CIPHERTEXT_BYTES, MAX_RECORD_PLAINTEXT_BYTES, RecordDirEntryWire,
+    WatermarkSeedScope, build_buyer_receipt_v1, build_creator_manifest_v1, build_dme1_header,
     build_hpke_slot_binding_v1, build_mutable_content_aad_v1, build_mutable_hpke_binding_v1,
     build_oem_cert_v2_signing_message, build_outer_manifest_v1, build_plaintext_shared_v1,
     build_prewrap_plan_v1, build_record_aad_v1, build_record_nonce_v1,
@@ -51,14 +53,15 @@ pub use provider::RustCryptoProvider;
 pub use provider::{
     CryptoProvider, DefaultCryptoProvider, OpenArenaCryptoProvider, VerificationStatus,
 };
+pub use seal::{UnsealedDnslInner, parse_and_decrypt_dme1_frame, unseal_dnsl_up_to_tier};
 pub use sha256::{decode_hex_array, encode_hex, sha256_digest, sha256_software_digest};
 pub use verify::{
-    DNSL_MAGIC, DnamSealEnvelopePreamble, DnamSealRecipientSlot, FLAG_SEAL_CHACHA20_FULL,
-    MAX_SEAL_RECIPIENTS, build_creator_signing_message, build_marketplace_receipt_signing_message,
-    build_oem_device_cert_signing_message, compute_immutable_header_sha256,
-    compute_immutable_header_sha256_for_version, enforce_distribution_policy,
-    project_immutable_header_for_schema_version, unseal_dnam_container,
-    verify_container_provenance, verify_oem_device_certificate,
+    DNSL_MAGIC, MAX_SEAL_RECIPIENTS, build_creator_signing_message,
+    build_creator_signing_message_for_tiers, build_marketplace_receipt_signing_message,
+    compute_immutable_header_sha256, compute_immutable_header_sha256_for_version,
+    enforce_distribution_policy, project_immutable_header_for_schema_version,
+    unseal_dnam_container, verify_container_provenance,
+    verify_container_provenance_for_dai1_prefix, verify_oem_device_certificate,
 };
 #[cfg(feature = "crypto")]
 pub use verify::{
@@ -66,22 +69,26 @@ pub use verify::{
     sign_marketplace_receipt_json,
 };
 pub use watermark::{
-    GRU_SIGN_LANES_PER_TIER, GRU_TOTAL_LANES, PHASE_CODING_MAX_RAD, STAGE3_EARLY_FIR_BASES,
+    PHASE_CODING_MAX_RAD, SONA_SIGN_LANES_PER_TIER, SONA_TOTAL_LANES, STAGE3_EARLY_FIR_BASES,
     STAGE3_KAUTZ_BASES, STAGE3_KAUTZ_BLOCKS_PER_TIER, STAGE3_KAUTZ_TIER_CHANNEL_BASE,
-    TARDOS_CASCADE_RANGES, TardosCodebook7680, apply_cascade_head_gauge,
-    apply_gru_sign_gauge_watermark, apply_isometric_gauge_watermark, apply_phase_coding_watermark,
-    apply_tardos_watermark_7680, apply_tardos_watermark_7680_envelopes,
-    compute_emr_masked_tardos_envelopes, derive_gru_sign_gauge_24, extract_structural_hash_224d,
-    generate_tardos_code_7680, generate_tardos_codebook_7680, is_role_a_cascade_index,
-    kautz_soa_byte_offset, role_b_head_slot_for_index, score_phase_coding_arena,
-    score_phase_coding_blackbox, score_tardos_watermark_7680, structural_cosine_similarity,
+    TARDOS_CASCADE_RANGES, TARDOS_ULTRA_RESERVE_RANGE, TARDOS_W_READOUT_FP16_RANGES,
+    TardosCodebook7680, apply_cascade_head_gauge, apply_isometric_gauge_shared_cp1_stream,
+    apply_isometric_gauge_watermark, apply_phase_coding_watermark, apply_sona_sign_gauge_watermark,
+    apply_tardos_w_readout_fp16, apply_tardos_watermark_7680,
+    apply_tardos_watermark_7680_envelopes, compute_emr_masked_tardos_envelopes,
+    derive_sona_sign_gauge_40, extract_structural_hash_224d, for_each_tardos_f32_offset_up_to,
+    for_each_tardos_fp16_offset_up_to, generate_tardos_code_7680, generate_tardos_codebook_7680,
+    is_role_a_cascade_index, kautz_soa_byte_offset, role_b_head_slot_for_index,
+    score_phase_coding_arena, score_phase_coding_blackbox, score_tardos_w_readout_fp16,
+    score_tardos_watermark_7680, score_tardos_watermark_7680_with_buyer_gauge,
+    structural_cosine_similarity,
 };
 
-/// Number of Stage II commuted nonlinear cascade projection weights across `Arena 0..3` (`768 + 1536 + 2304 + 3072 = 7680`).
+/// Number of coordinates in the `TardosCodebook7680` watermark view across `Arena 0..3`.
 pub const TARDOS_CASCADE_WEIGHTS: usize = 7680;
 
-/// Number of modal/Kautz complex resonator channels across `Arena 0..3` (`4 tiers × 4 channels = 16`).
-pub const KAUTZ_TOTAL_CHANNELS: usize = 16;
+/// Number of Stage III modal/Kautz complex resonator channels across `Arena 0..3` (`8 + 4 + 12 + 8 = 32`).
+pub const KAUTZ_TOTAL_CHANNELS: usize = 32;
 
 /// Per-tier dimension of the prefix-composable gauge-invariant structural hash (`56-D` per tier).
 pub const STRUCTURAL_HASH_TIER_DIM: usize = 56;

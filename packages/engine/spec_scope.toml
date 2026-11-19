@@ -13,12 +13,10 @@ scope = "out-of-scope"
 reason = "Repository-wide Rust/TypeScript static typing and import boundary guardrail verified in tests/code_guardrails.test.ts"
 
 [rules."repo.code.zerocopy-wire-structs"]
-scope = "out-of-scope"
-reason = "Phase 1 declarative zerocopy wire-struct rule verified in tests/code_guardrails.test.ts (promoted to engine/capture in Phases 2-5)"
+scope = "engine"
 
 [rules."repo.code.shared-nostd-kernels"]
-scope = "out-of-scope"
-reason = "Phase 1 shared no_std dnam-kernels and AOT .wgsl toolchain rule verified in tests/architecture_guardrails.test.ts (promoted in Phases 2-4)"
+scope = "engine"
 
 [rules."repo.docs.agents-md-budgets"]
 scope = "out-of-scope"
@@ -187,8 +185,7 @@ scope = "engine"
 scope = "engine"
 
 [rules."arch.tiers.maximize-quality-within-budget"]
-scope = "out-of-scope"
-reason = "Phase 1 Gate 0b headroom reinvestment and fixed const-tier policy verified in tests/architecture_guardrails.test.ts (promoted to engine in Phase 3)"
+scope = "engine"
 
 [rules."arch.topology.spillover-trails"]
 scope = "engine"

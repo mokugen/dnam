@@ -173,15 +173,15 @@ impl Default for IoConfig {
 pub fn default_pro_tier_profile() -> TierProfile {
     TierProfile {
         feature_bus_dim: 192,
-        channels: 12,
-        early_fir_taps: 48,
-        kautz_modes: 16,
-        tank_lines: 8,
+        channels: 32,
+        early_fir_taps: 96,
+        kautz_modes: 24,
+        tank_lines: 12,
         head_svd_rank: 4,
         loudness_lufs: -20.5,
         output_trim_db: 0.0,
         validation_esr_db: -48.0,
-        arena_end_byte_offset: 18_432,
+        arena_end_byte_offset: crate::container::ARENA_OFFSET_PRO_END,
         prefix_crc32c: 0,
     }
 }
@@ -191,12 +191,12 @@ pub fn default_pro_tier_profile() -> TierProfile {
 pub struct SlimmableTiersConfig {
     /// `Lite` (`4,608 B`) tier profile.
     pub lite: TierProfile,
-    /// `Full` (`10,240 B`) tier profile.
+    /// `Full` (`7,936 B`) tier profile.
     pub full: TierProfile,
-    /// `Pro` (`18,432 B`) tier profile.
+    /// `Pro` (`15,872 B`) tier profile.
     #[serde(default = "default_pro_tier_profile")]
     pub pro: TierProfile,
-    /// `Ultra` (`28,672 B`) tier profile.
+    /// `Ultra` (`30,720 B`) tier profile.
     pub ultra: TierProfile,
 }
 
@@ -206,15 +206,15 @@ pub struct TierProfile {
     /// Dimension of the shared physical feature bus ($D_{\text{feat}} \in \{64, 128, 192, 256\}$).
     #[serde(default)]
     pub feature_bus_dim: u16,
-    /// Active channels ($C \in \{4, 8, 12, 16\}$).
+    /// Active `SONA` core lanes ($C \in \{16, 24, 32, 40\}$).
     pub channels: u8,
-    /// Active Stage III direct SIMD early-reflection FIR taps ($M_{\text{early}} \in \{16, 32, 48, 64\}$).
+    /// Active Stage III direct SIMD early-reflection FIR taps ($M_{\text{early}} \in \{32, 48, 96, 128\}$).
     #[serde(default)]
     pub early_fir_taps: u8,
-    /// Active Stage III Orthonormal Kautz modal bank modes ($M_{\text{kautz}} \in \{4, 8, 16, 32\}$).
+    /// Active Stage III Orthonormal Kautz modal bank pole pairs ($M_{\text{kautz}} \in \{8, 12, 24, 32\}$).
     #[serde(default)]
     pub kautz_modes: u8,
-    /// Active Stage IV tank delay lines ($M \in \{4, 8, 8, 16\}$).
+    /// Active Stage IV tank delay lines ($M \in \{4, 8, 12, 16\}$).
     pub tank_lines: u8,
     /// SVD output head rank ($D_h \in \{4, 8\}$).
     #[serde(default = "default_head_svd_rank")]
@@ -275,11 +275,15 @@ mod tests {
 
         let pro = default_pro_tier_profile();
         assert_eq!(pro.feature_bus_dim, 192);
-        assert_eq!(pro.channels, 12);
-        assert_eq!(pro.early_fir_taps, 48);
-        assert_eq!(pro.early_taps(), 48);
-        assert_eq!(pro.kautz_modes, 16);
-        assert_eq!(pro.tank_lines, 8);
-        assert_eq!(pro.fdn_lines(), 8);
+        assert_eq!(pro.channels, 32);
+        assert_eq!(pro.early_fir_taps, 96);
+        assert_eq!(pro.early_taps(), 96);
+        assert_eq!(pro.kautz_modes, 24);
+        assert_eq!(pro.tank_lines, 12);
+        assert_eq!(pro.fdn_lines(), 12);
+        assert_eq!(
+            pro.arena_end_byte_offset,
+            crate::container::ARENA_OFFSET_PRO_END
+        );
     }
 }

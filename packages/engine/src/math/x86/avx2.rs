@@ -1,15 +1,18 @@
-//! x86-64 AVX2 + FMA + F16C (`x86-64-v3`) hardware math backend (`Avx2FmaVec4` & `X86Avx2FmaBackend`).
+//! x86-64 AVX2 + FMA + F16C (`x86-64-v3`) hardware math backend (`Avx2FmaVec4`, `Avx2Stereo8`,
+//! and `X86Avx2FmaBackend`).
+
+pub mod stereo8;
 
 use core::arch::x86_64::{
-    __m128, __m128i, _MM_FROUND_TO_NEAREST_INT, _mm_add_ps, _mm_and_si128, _mm_broadcast_ss,
-    _mm_castps_si128, _mm_castsi128_ps, _mm_cvtph_ps, _mm_cvtps_ph, _mm_cvtss_f32, _mm_fmadd_ps,
-    _mm_fnmadd_ps, _mm_max_ps, _mm_min_ps, _mm_mul_ps, _mm_permute_ps, _mm_set1_epi32, _mm_set1_ps,
-    _mm_setr_ps, _mm_shuffle_ps, _mm_srli_epi32, _mm_sub_epi32, _mm_sub_ps, _mm_xor_ps,
-    _mm256_add_ps, _mm256_castps256_ps128, _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps,
-    _mm256_mul_ps,
+    __m128, __m128i, _MM_FROUND_TO_NEAREST_INT, _mm_add_ps, _mm_and_si128, _mm_blendv_ps,
+    _mm_broadcast_ss, _mm_castps_si128, _mm_castsi128_ps, _mm_cmpeq_epi32, _mm_cvtph_ps,
+    _mm_cvtps_ph, _mm_cvtss_f32, _mm_fmadd_ps, _mm_fnmadd_ps, _mm_max_ps, _mm_min_ps, _mm_mul_ps,
+    _mm_permute_ps, _mm_set1_epi32, _mm_set1_ps, _mm_setr_ps, _mm_shuffle_ps, _mm_srli_epi32,
+    _mm_sub_epi32, _mm_sub_ps, _mm_xor_ps, _mm256_add_ps, _mm256_castps256_ps128,
+    _mm256_extractf128_ps, _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_mul_ps,
 };
-#[cfg(not(any(test, feature = "std")))]
-use core::sync::atomic::AtomicU8;
+use core::sync::atomic::{AtomicU8, Ordering};
+pub use stereo8::Avx2Stereo8;
 
 use super::sse2::Sse2Vec4;
 use super::sse42::{Sse42Vec4, X86Sse42Backend, sse3_horizontal_sum, sse3_horizontal_sum_pair};
@@ -37,6 +40,18 @@ fn avx2_fma_lane<const LANE: usize>(acc: __m128, a: __m128, v: __m128) -> __m128
         _ => _mm_permute_ps::<0xFF>(v),
     };
     _mm_fmadd_ps(a, lane_v, acc)
+}
+
+#[target_feature(enable = "avx,avx2,fma")]
+#[inline]
+fn avx2_mul_lane<const LANE: usize>(lhs: __m128, v: __m128) -> __m128 {
+    let lane_v = match LANE {
+        0 => _mm_permute_ps::<0x00>(v),
+        1 => _mm_permute_ps::<0x55>(v),
+        2 => _mm_permute_ps::<0xAA>(v),
+        _ => _mm_permute_ps::<0xFF>(v),
+    };
+    _mm_mul_ps(lhs, lane_v)
 }
 
 #[target_feature(enable = "avx,avx2,fma")]
@@ -177,15 +192,15 @@ fn avx2_tile_dot64_stereo_hw(taps: &[f32; 64], w_l: &[f32; 64], w_r: &[f32; 64])
 }
 
 /// Evaluates a 16-element stereo dot product using 256-bit AVX2/FMA when supported at runtime.
-#[inline(always)]
+#[inline]
 pub(crate) fn avx2_dot16_stereo(
     x_l: &[[f32; 4]; 4],
     w_l: &[[f32; 4]; 4],
     x_r: &[[f32; 4]; 4],
     w_r: &[[f32; 4]; 4],
 ) -> Option<(f32, f32)> {
-    if X86Avx2FmaBackend::is_supported() {
-        // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported()`.
+    if X86Avx2FmaBackend::is_supported_cached() {
+        // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported_cached()`.
         Some(unsafe { avx2_dot16_stereo_hw(x_l, w_l, x_r, w_r) })
     } else {
         None
@@ -193,10 +208,10 @@ pub(crate) fn avx2_dot16_stereo(
 }
 
 /// Evaluates a 64-element dot product using 256-bit AVX2/FMA when supported at runtime.
-#[inline(always)]
+#[inline]
 pub(crate) fn avx2_tile_dot64(a: &[f32; 64], b: &[f32; 64]) -> Option<f32> {
-    if X86Avx2FmaBackend::is_supported() {
-        // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported()`.
+    if X86Avx2FmaBackend::is_supported_cached() {
+        // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported_cached()`.
         Some(unsafe { avx2_tile_dot64_hw(a, b) })
     } else {
         None
@@ -204,14 +219,14 @@ pub(crate) fn avx2_tile_dot64(a: &[f32; 64], b: &[f32; 64]) -> Option<f32> {
 }
 
 /// Evaluates a dual 64-element stereo dot product using 256-bit AVX2/FMA when supported at runtime.
-#[inline(always)]
+#[inline]
 pub(crate) fn avx2_tile_dot64_stereo(
     taps: &[f32; 64],
     w_l: &[f32; 64],
     w_r: &[f32; 64],
 ) -> Option<[f32; 2]> {
-    if X86Avx2FmaBackend::is_supported() {
-        // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported()`.
+    if X86Avx2FmaBackend::is_supported_cached() {
+        // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported_cached()`.
         Some(unsafe { avx2_tile_dot64_stereo_hw(taps, w_l, w_r) })
     } else {
         None
@@ -221,10 +236,14 @@ pub(crate) fn avx2_tile_dot64_stereo(
 #[target_feature(enable = "avx,f16c")]
 #[inline]
 fn avx2_f32x4_to_fp16x4(src: &[f32; 4]) -> [u16; 4] {
-    let v = _mm_max_ps(
-        _mm_min_ps(Avx2FmaVec4::load(src).0, _mm_set1_ps(65504.0)),
-        _mm_set1_ps(-65504.0),
-    );
+    let raw = Avx2FmaVec4::load(src).0;
+    let clamped = _mm_max_ps(_mm_min_ps(raw, _mm_set1_ps(65504.0)), _mm_set1_ps(-65504.0));
+    let exp_mask = _mm_set1_epi32(0x7F80_0000_u32 as i32);
+    let is_nonfinite = _mm_castsi128_ps(_mm_cmpeq_epi32(
+        _mm_and_si128(_mm_castps_si128(raw), exp_mask),
+        exp_mask,
+    ));
+    let v = _mm_blendv_ps(clamped, raw, is_nonfinite);
     let words: [u16; 8] = zerocopy::transmute!(_mm_cvtps_ph::<{ _MM_FROUND_TO_NEAREST_INT }>(v));
     [words[0], words[1], words[2], words[3]]
 }
@@ -303,21 +322,21 @@ impl SimdVec4 for Avx2FmaVec4 {
         Self(Sse2Vec4(self.0).mul(Sse2Vec4(rhs.0)).0)
     }
 
-    #[inline(always)]
+    #[inline]
     fn fma(self, a: Self, b: Self) -> Self {
-        if X86Avx2FmaBackend::is_supported() {
-            // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported()`.
+        if X86Avx2FmaBackend::is_supported_cached() {
+            // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported_cached()`.
             unsafe { Self(avx2_fma(self.0, a.0, b.0)) }
         } else {
             Self(Sse42Vec4(self.0).fma(Sse42Vec4(a.0), Sse42Vec4(b.0)).0)
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
         const { assert!(LANE < 4) };
-        if X86Avx2FmaBackend::is_supported() {
-            // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported()`.
+        if X86Avx2FmaBackend::is_supported_cached() {
+            // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported_cached()`.
             unsafe { Self(avx2_fma_lane::<LANE>(self.0, a.0, v.0)) }
         } else {
             Self(
@@ -328,10 +347,21 @@ impl SimdVec4 for Avx2FmaVec4 {
         }
     }
 
-    #[inline(always)]
+    #[inline]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        const { assert!(LANE < 4) };
+        if X86Avx2FmaBackend::is_supported_cached() {
+            // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported_cached()`.
+            unsafe { Self(avx2_mul_lane::<LANE>(self.0, v.0)) }
+        } else {
+            Self(Sse42Vec4(self.0).mul_lane::<LANE>(Sse42Vec4(v.0)).0)
+        }
+    }
+
+    #[inline]
     fn fms(self, a: Self, b: Self) -> Self {
-        if X86Avx2FmaBackend::is_supported() {
-            // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported()`.
+        if X86Avx2FmaBackend::is_supported_cached() {
+            // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported_cached()`.
             unsafe { Self(avx2_fms(self.0, a.0, b.0)) }
         } else {
             Self(Sse42Vec4(self.0).fms(Sse42Vec4(a.0), Sse42Vec4(b.0)).0)
@@ -353,10 +383,10 @@ impl SimdVec4 for Avx2FmaVec4 {
         Self(Sse2Vec4(self.0).abs().0)
     }
 
-    #[inline(always)]
+    #[inline]
     fn pair_swap_neg(self) -> Self {
-        if X86Avx2FmaBackend::is_supported() {
-            // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported()`.
+        if X86Avx2FmaBackend::is_supported_cached() {
+            // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported_cached()`.
             unsafe { Self(avx2_pair_swap_neg(self.0)) }
         } else {
             Self(Sse42Vec4(self.0).pair_swap_neg().0)
@@ -368,12 +398,12 @@ impl SimdVec4 for Avx2FmaVec4 {
         Self(Sse2Vec4(self.0).flush_subnormal().0)
     }
 
-    #[inline(always)]
+    #[inline]
     fn horizontal_sum(self) -> f32 {
         Sse42Vec4(self.0).horizontal_sum()
     }
 
-    #[inline(always)]
+    #[inline]
     fn horizontal_sum_pair(self, rhs: Self) -> (f32, f32) {
         Sse42Vec4(self.0).horizontal_sum_pair(Sse42Vec4(rhs.0))
     }
@@ -392,20 +422,185 @@ impl SimdVec4 for Avx2FmaVec4 {
     fn pow2_from_biased_int_bits(self) -> Self {
         Self(Sse2Vec4(self.0).pow2_from_biased_int_bits().0)
     }
+
+    #[inline(always)]
+    fn exp2_clamped5(self) -> Self {
+        <Self as dnam_kernels::KernelVec4>::exp2_clamped5(self)
+    }
+
+    #[inline(always)]
+    fn scrub_recursive_state(self) -> Self {
+        <Self as dnam_kernels::KernelVec4>::flush_recursive_state(self)
+    }
+}
+
+impl dnam_kernels::KernelVec4 for Avx2FmaVec4 {
+    #[inline(always)]
+    fn splat(val: f32) -> Self {
+        <Self as SimdVec4>::splat(val)
+    }
+
+    #[inline(always)]
+    fn splat_pair(a: f32, b: f32) -> Self {
+        <Self as SimdVec4>::splat_pair(a, b)
+    }
+
+    #[inline(always)]
+    fn from_array(arr: [f32; 4]) -> Self {
+        <Self as SimdVec4>::from_array(arr)
+    }
+
+    #[inline(always)]
+    fn to_array(self) -> [f32; 4] {
+        <Self as SimdVec4>::to_array(self)
+    }
+
+    #[inline(always)]
+    fn load(src: &[f32; 4]) -> Self {
+        <Self as SimdVec4>::load(src)
+    }
+
+    #[inline(always)]
+    fn store(self, dst: &mut [f32; 4]) {
+        <Self as SimdVec4>::store(self, dst);
+    }
+
+    #[inline(always)]
+    fn add(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::add(self, rhs)
+    }
+
+    #[inline(always)]
+    fn sub(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::sub(self, rhs)
+    }
+
+    #[inline(always)]
+    fn mul(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::mul(self, rhs)
+    }
+
+    #[inline]
+    fn fma(self, a: Self, b: Self) -> Self {
+        <Self as SimdVec4>::fma(self, a, b)
+    }
+
+    #[inline]
+    fn fms(self, a: Self, b: Self) -> Self {
+        <Self as SimdVec4>::fms(self, a, b)
+    }
+
+    #[inline]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        <Self as SimdVec4>::fma_lane::<LANE>(self, a, v)
+    }
+
+    #[inline]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        <Self as SimdVec4>::mul_lane::<LANE>(self, v)
+    }
+
+    #[inline(always)]
+    fn max(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::max(self, rhs)
+    }
+
+    #[inline(always)]
+    fn min(self, rhs: Self) -> Self {
+        <Self as SimdVec4>::min(self, rhs)
+    }
+
+    #[inline(always)]
+    fn abs(self) -> Self {
+        <Self as SimdVec4>::abs(self)
+    }
+
+    #[inline(always)]
+    fn neg(self) -> Self {
+        Self(<Sse2Vec4 as dnam_kernels::KernelVec4>::neg(Sse2Vec4(self.0)).0)
+    }
+
+    #[inline]
+    fn select_le(lhs: Self, rhs: Self, if_true: Self, if_false: Self) -> Self {
+        Self(
+            <Sse42Vec4 as dnam_kernels::KernelVec4>::select_le(
+                Sse42Vec4(lhs.0),
+                Sse42Vec4(rhs.0),
+                Sse42Vec4(if_true.0),
+                Sse42Vec4(if_false.0),
+            )
+            .0,
+        )
+    }
+
+    #[inline(always)]
+    fn all_le(self, rhs: Self) -> bool {
+        <Sse2Vec4 as dnam_kernels::KernelVec4>::all_le(Sse2Vec4(self.0), Sse2Vec4(rhs.0))
+    }
+
+    #[inline]
+    fn pair_swap_neg(self) -> Self {
+        <Self as SimdVec4>::pair_swap_neg(self)
+    }
+
+    #[inline(always)]
+    fn flush_subnormal(self) -> Self {
+        <Self as SimdVec4>::flush_subnormal(self)
+    }
+
+    #[inline(always)]
+    fn flush_recursive_state(self) -> Self {
+        Self(<Sse2Vec4 as dnam_kernels::KernelVec4>::flush_recursive_state(Sse2Vec4(self.0)).0)
+    }
+
+    #[inline]
+    fn horizontal_sum(self) -> f32 {
+        <Self as SimdVec4>::horizontal_sum(self)
+    }
+
+    #[inline]
+    fn horizontal_sum_pair(self, rhs: Self) -> (f32, f32) {
+        <Self as SimdVec4>::horizontal_sum_pair(self, rhs)
+    }
+
+    #[inline]
+    fn dot(self, rhs: Self) -> f32 {
+        <Self as SimdVec4>::dot(self, rhs)
+    }
+
+    #[inline(always)]
+    fn rcp_pos_seed_bits(self) -> Self {
+        <Self as SimdVec4>::rcp_pos_seed_bits(self)
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_seed_bits(self) -> Self {
+        <Self as SimdVec4>::rsqrt_pos_seed_bits(self)
+    }
+
+    #[inline(always)]
+    fn pow2_from_biased_int_bits(self) -> Self {
+        <Self as SimdVec4>::pow2_from_biased_int_bits(self)
+    }
 }
 
 /// x86-64 AVX2 + FMA + F16C (`x86-64-v3`) hardware math backend.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct X86Avx2FmaBackend;
 
-#[cfg(not(any(test, feature = "std")))]
+/// Cached `AVX`/`AVX2`/`FMA`/`F16C` support state (`0 = uninit`, `1 = no`, `2 = yes`).
 static AVX2_SUPPORT_CACHE: AtomicU8 = AtomicU8::new(0);
 
 impl X86Avx2FmaBackend {
-    /// Returns `true` if the host x86-64 CPU and OS support `AVX`, `AVX2`, `FMA`, and `F16C`
-    /// via [`std::arch::is_x86_feature_detected!`].
-    #[inline]
-    pub fn is_supported() -> bool {
+    /// Returns the cached `AVX2 + FMA + F16C` capability flag with a single relaxed atomic load and
+    /// zero OS or `std::arch::is_x86_feature_detected!` / `detect_and_initialize` calls.
+    #[inline(always)]
+    pub fn is_supported_cached() -> bool {
+        AVX2_SUPPORT_CACHE.load(Ordering::Relaxed) == 2
+    }
+
+    #[cold]
+    fn detect_uncached() -> bool {
         #[cfg(any(test, feature = "std"))]
         {
             std::arch::is_x86_feature_detected!("avx")
@@ -415,24 +610,26 @@ impl X86Avx2FmaBackend {
         }
         #[cfg(not(any(test, feature = "std")))]
         {
-            super::sse42::cached_cpuid_support(&AVX2_SUPPORT_CACHE, Self::detect_cpuid)
+            // SAFETY: `__cpuid` is always available on x86-64; `_xgetbv` is guarded by `OSXSAVE` (bit 27).
+            unsafe {
+                if core::arch::x86_64::__cpuid(0).eax < 7 {
+                    return false;
+                }
+                let cpuid1 = core::arch::x86_64::__cpuid(1);
+                let req = (1u32 << 12) | (1u32 << 27) | (1u32 << 28) | (1u32 << 29);
+                if (cpuid1.ecx & req) != req || (core::arch::x86_64::_xgetbv(0) & 0x6) != 0x6 {
+                    return false;
+                }
+                (core::arch::x86_64::__cpuid_count(7, 0).ebx & (1u32 << 5)) != 0
+            }
         }
     }
 
-    #[cfg(not(any(test, feature = "std")))]
-    fn detect_cpuid() -> bool {
-        // SAFETY: `__cpuid` is always available on x86-64; `_xgetbv` is guarded by `OSXSAVE` (bit 27).
-        unsafe {
-            if core::arch::x86_64::__cpuid(0).eax < 7 {
-                return false;
-            }
-            let cpuid1 = core::arch::x86_64::__cpuid(1);
-            let req = (1u32 << 12) | (1u32 << 27) | (1u32 << 28) | (1u32 << 29);
-            if (cpuid1.ecx & req) != req || (core::arch::x86_64::_xgetbv(0) & 0x6) != 0x6 {
-                return false;
-            }
-            (core::arch::x86_64::__cpuid_count(7, 0).ebx & (1u32 << 5)) != 0
-        }
+    /// Returns `true` if the host x86-64 CPU and OS support `AVX`, `AVX2`, `FMA`, and `F16C`
+    /// (cached in [`AVX2_SUPPORT_CACHE`]).
+    #[inline]
+    pub fn is_supported() -> bool {
+        super::sse42::cached_cpuid_support(&AVX2_SUPPORT_CACHE, Self::detect_uncached)
     }
 }
 
@@ -445,20 +642,21 @@ impl Crc32cBackend for X86Avx2FmaBackend {
 
 impl MathBackend for X86Avx2FmaBackend {
     type Vec4 = Avx2FmaVec4;
+    type Stereo8 = Avx2Stereo8;
     const NAME: &'static str = "x86-64 AVX2 + FMA + F16C";
     const KIND: BackendKind = BackendKind::X86Avx2Fma;
 
-    #[inline(always)]
+    #[inline]
     fn fma_mat4x4_vec4(acc: Avx2FmaVec4, mat: &[[f32; 4]; 4], x: &[f32; 4]) -> Avx2FmaVec4 {
-        if Self::is_supported() {
-            // SAFETY: Guarded by `Self::is_supported()`.
+        if Self::is_supported_cached() {
+            // SAFETY: Guarded by `Self::is_supported_cached()`.
             unsafe { Avx2FmaVec4(avx2_fma_mat4x4_vec4(acc.0, mat, x)) }
         } else {
             Avx2FmaVec4(X86Sse42Backend::fma_mat4x4_vec4(Sse42Vec4(acc.0), mat, x).0)
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn fma_mat4x4_stereo(
         acc_l: Avx2FmaVec4,
         acc_r: Avx2FmaVec4,
@@ -466,8 +664,8 @@ impl MathBackend for X86Avx2FmaBackend {
         x_l: Avx2FmaVec4,
         x_r: Avx2FmaVec4,
     ) -> (Avx2FmaVec4, Avx2FmaVec4) {
-        if Self::is_supported() {
-            // SAFETY: Guarded by `Self::is_supported()`.
+        if Self::is_supported_cached() {
+            // SAFETY: Guarded by `Self::is_supported_cached()`.
             let (l, r) = unsafe { avx2_fma_mat4x4_stereo(acc_l.0, acc_r.0, cols, x_l.0, x_r.0) };
             (Avx2FmaVec4(l), Avx2FmaVec4(r))
         } else {
@@ -482,38 +680,52 @@ impl MathBackend for X86Avx2FmaBackend {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn f32x4_to_fp16x4(src: &[f32; 4]) -> [u16; 4] {
-        if Self::is_supported() {
-            // SAFETY: Guarded by `Self::is_supported()`.
+        if Self::is_supported_cached() {
+            // SAFETY: Guarded by `Self::is_supported_cached()`.
             unsafe { avx2_f32x4_to_fp16x4(src) }
         } else {
             X86Sse42Backend::f32x4_to_fp16x4(src)
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn fp16x4_to_f32x4(src: &[u16; 4]) -> [f32; 4] {
-        if Self::is_supported() {
-            // SAFETY: Guarded by `Self::is_supported()`.
+        if Self::is_supported_cached() {
+            // SAFETY: Guarded by `Self::is_supported_cached()`.
             unsafe { avx2_fp16x4_to_f32x4(src) }
         } else {
             X86Sse42Backend::fp16x4_to_f32x4(src)
         }
     }
 
-    #[inline(always)]
+    #[inline]
     fn rsqrt_nr2_f32(v0: f32) -> f32 {
         Self::rsqrt_nr2_pair_f32(v0, 1.0).0
     }
 
-    #[inline(always)]
+    #[inline]
     fn rsqrt_nr2_pair_f32(v0: f32, v1: f32) -> (f32, f32) {
-        if Self::is_supported() {
-            // SAFETY: Guarded by `Self::is_supported()`.
+        if Self::is_supported_cached() {
+            // SAFETY: Guarded by `Self::is_supported_cached()`.
             unsafe { avx2_rsqrt_nr2_pair_f32(v0, v1) }
         } else {
             X86Sse42Backend::rsqrt_nr2_pair_f32(v0, v1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::X86Avx2FmaBackend;
+
+    #[test]
+    fn test_avx2_cached_feature_flag_matches_warmed_detection() {
+        crate::math::warm_simd_feature_caches();
+        assert_eq!(
+            X86Avx2FmaBackend::is_supported(),
+            X86Avx2FmaBackend::is_supported_cached()
+        );
     }
 }

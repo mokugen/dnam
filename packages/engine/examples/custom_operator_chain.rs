@@ -1,6 +1,6 @@
-//! Example 5: Standalone TORA Zero-`FDIV` Operator Chain (`examples/custom_operator_chain.rs`).
+//! Example 5: Standalone `SONA` Zero-`FDIV` Operator Chain (`examples/custom_operator_chain.rs`).
 //!
-//! Demonstrates composing the standalone real-time TORA operators (`Op-T`, `Op-M`, `Op-N`)
+//! Demonstrates composing the standalone real-time `SONA` operators (`Op-T`, `Op-M`, `Op-N`)
 //! and Stage 0 `TptLr4Crossover` directly inside a caller-held [`FtzDazGuard`]:
 //! - `TptLr4Crossover` (`200 Hz` Linkwitz-Riley 4th-order bass-mono / drive split, `ref[dsp.router.lr4-crossover]`)
 //! - `OpTDelayLine` + `HilbertSsbLattice10th` (`H1`) + `SubHarmonicTracker` (`T1`) (`ref[dsp.op-m.hilbert.lattice]`, `ref[dsp.op-m.tracker.toggle-sheet]`)
@@ -77,7 +77,7 @@ fn main() {
     }
 
     println!(
-        "Custom TORA operator chain processed 256 frames | Peak Output: {:.6} | Max Rotor Norm (<= 1.0): {:.8}",
+        "Custom SONA operator chain processed 256 frames | Peak Output: {:.6} | Max Rotor Norm (<= 1.0): {:.8}",
         peak_out, max_rotor_norm,
     );
     assert!(max_rotor_norm <= 1.0);

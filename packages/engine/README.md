@@ -2,7 +2,7 @@
 
 **`dnam-engine`** is the zero-audio-allocation, 16B/64B SIMD-aligned real-time inference, container, and provenance core for **Dynamic Neural Audio Modeler (DNAM)**.
 
-It is engineered for embedded ARMv8.2-A/ARMv9.2-A pedalboards (**Rockchip RK3582 / Darkglass Anagram**), desktop **VST3/CLAP/AU** audio plugins (`packages/plugin`), analytical **pure-Rust capture & training** (`packages/capture`), and **WebAssembly SIMD128 (`AudioWorklet`) / Node.js N-API** runtimes (`packages/js`, `packages/studio`).
+It is engineered for embedded ARMv8.2-A/ARMv9.2-A pedalboards (**Rockchip RK3582 / Darkglass Anagram**), desktop **VST3/CLAP/AU** audio plugins, analytical **pure-Rust capture & training** (`packages/capture`), and **WebAssembly SIMD128 (`AudioWorklet`) / Node.js N-API** runtimes (`packages/js`, `packages/studio`).
 
 ---
 
@@ -71,12 +71,14 @@ packages/engine/
 │   ├── test_support.rs     # #[cfg(test)] exact rational (Rat), SplitMix64 & ULP test harness
 │   ├── math.rs & math/     # SimdVec4, MathBackend, spec_math.rs, NEON/SME/AVX2/WASM
 │   ├── operators.rs & operators/ # Op-T (op_t.rs), Op-M (op_m.rs), Op-N (op_n.rs), reference.rs
-│   ├── stages.rs & stages/ # Stage 0–IV topology.rs, stage1..stage4, head.rs, weights.rs
+│   ├── stages.rs & stages/ # Stage 0–IV topology.rs, router.rs, sona_core.rs, hot_core.rs,
+│   │                       # stage3_cab.rs, stage4_tank.rs, weights.rs
 │   ├── control.rs & control/ # 3 kHz bus.rs, plane.rs (ExactIntFactorAccumulator, Q64/Q32 tempo)
 │   ├── container.rs & container/ # wire.rs, preamble.rs, view.rs, zoh.rs, strip.rs
 │   ├── provenance.rs & provenance/ # security.rs (DAU1/HPKE/DME1), seal.rs, watermark.rs
 │   └── schema.rs & schema/ # #![no_std] serde/serde_json .dnam runtime header & UI skew
-├── tests/                  # Cross-cutting integration tests (backend parity, 0-alloc, FFI, seal)
+├── tests/                  # Cross-cutting integration tests (backend parity, 0-alloc, FFI, seal,
+│                           # SONA pipeline/ZOH & calibration/lifecycle)
 ├── benches/                # Subsystem Criterion suites (pipeline, operators, stages_and_control,
 │                           # container_and_provenance) & WCET jitter audit (realtime_wcet)
 └── examples/               # 6 runnable API examples (realtime_audio_block, embedded_zero_alloc,

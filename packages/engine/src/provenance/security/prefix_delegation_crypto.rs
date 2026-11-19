@@ -170,12 +170,14 @@ mod prefix_reference_tests {
 
     use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
     use sha2::{Digest, Sha256};
+    use zerocopy::IntoBytes;
+    use zerocopy::byteorder::little_endian::{U16, U32, U64};
 
     fn field(label: &str, value: &[u8]) -> Vec<u8> {
         let mut output = Vec::new();
-        output.extend_from_slice(&u32::try_from(label.len()).unwrap().to_le_bytes());
+        output.extend_from_slice(U32::new(u32::try_from(label.len()).unwrap()).as_bytes());
         output.extend_from_slice(label.as_bytes());
-        output.extend_from_slice(&u64::try_from(value.len()).unwrap().to_le_bytes());
+        output.extend_from_slice(U64::new(u64::try_from(value.len()).unwrap()).as_bytes());
         output.extend_from_slice(value);
         output
     }
@@ -316,17 +318,17 @@ mod prefix_reference_tests {
     fn open_preamble(authentication_kind: u8, maximum_tier: u8) -> [u8; 64] {
         let mut preamble = [0; 64];
         preamble[..4].copy_from_slice(b"DNAM");
-        preamble[4..6].copy_from_slice(&2_u16.to_le_bytes());
+        preamble[4..6].copy_from_slice(U16::new(3).as_bytes());
         preamble[9] = authentication_kind;
         preamble[10] = maximum_tier;
-        preamble[12..16].copy_from_slice(&48_000_u32.to_le_bytes());
+        preamble[12..16].copy_from_slice(U32::new(48_000).as_bytes());
         preamble
     }
 
     fn open_directory(fields: [u64; 13]) -> [u8; 128] {
         let mut directory = [0; 128];
         for (index, value) in fields.iter().enumerate() {
-            directory[index * 8..index * 8 + 8].copy_from_slice(&value.to_le_bytes());
+            directory[index * 8..index * 8 + 8].copy_from_slice(U64::new(*value).as_bytes());
         }
         directory
     }
@@ -392,7 +394,7 @@ mod prefix_reference_tests {
         envelope.extend_from_slice(&prefix_list(&master_list));
         envelope.extend_from_slice(&creator_signature.to_bytes());
         envelope.extend_from_slice(&marketplace.verifying_key().to_bytes());
-        envelope.extend_from_slice(&u32::try_from(policy.len()).unwrap().to_le_bytes());
+        envelope.extend_from_slice(U32::new(u32::try_from(policy.len()).unwrap()).as_bytes());
         envelope.extend_from_slice(policy);
         envelope.push(1);
         envelope.extend_from_slice(&prefix_list(&buyer_list));
@@ -401,7 +403,7 @@ mod prefix_reference_tests {
         assert_eq!(&envelope[..8], b"DAU1\x01\x00\x00\x00");
         assert_eq!(envelope[40], 3);
         assert_eq!(&envelope[41..174], prefix_list(&master_list));
-        assert_eq!(&envelope[270..274], &6_u32.to_le_bytes());
+        assert_eq!(&envelope[270..274], U32::new(6).as_bytes());
         assert_eq!(&envelope[274..280], policy);
         assert_eq!(envelope[280], 1);
         assert_eq!(&envelope[281..348], prefix_list(&buyer_list));
