@@ -299,7 +299,7 @@ pub(crate) fn solve_factorized_uplo_u_2ch(
 
 /// Solves the regularized symmetric positive-definite linear system
 /// $(\mathbf{G} + \lambda \mathbf{I}) \mathbf{W} = \mathbf{C}$ from a `uplo='U'` packed Gram matrix
-/// via Cholesky factorization (`ref[train.pipeline.stage-b-harvest]`, `ref[train.resume.kronecker-reassembly]`).
+/// via Cholesky factorization (`ref[train.pipeline.backbone-trajectory-opt]`, `ref[train.resume.kronecker-reassembly]`).
 pub fn solve_uplo_u_cholesky_2ch(
     packed_gram: &[f64],
     cross_corr: &[[f64; 2]],

@@ -1,7 +1,7 @@
 //! `SONA` Stages Pipeline Core: Top-of-Frame Causal Crossbar (`Stage 0`, `Op-P`, `4x Q0.32`),
 //! `4`-Block Matryoshka State-Space Core (`SonaHotSlab`), Stage III `FIR` + `Kautz`, & Stage IV `Op-T` Tank.
 //!
-//! Canonical Reference: `docs/specs/dsp/router_and_stages_topology.md` and
+//! Canonical Reference: `docs/specs/dsp/router_and_crossbar_topology.md` and
 //! `docs/specs/architecture/sona_architecture.md`.
 //!
 //! Direct per-sample calls require a caller-held [`crate::FtzDazGuard`] for the

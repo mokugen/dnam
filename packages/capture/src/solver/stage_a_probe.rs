@@ -3,7 +3,7 @@
 //! `64`-Tap Early FIR, `Steiglitz–McBride` `16`-Pole Kautz Seeding, Stage IV Reflection Delay
 //! Extraction, and Bounded-State Pre-Audit (`solver::stage_a_probe`).
 //!
-//! Canonical Reference: `docs/specs/training/four_stage_pipeline.md` (`ref[train.pipeline.stage-a-poles]`).
+//! Canonical Reference: `docs/specs/training/webgpu_and_varpro_solver.md` (`ref[train.pipeline.physics-probe]`).
 
 use dnam_engine::provenance::STAGE3_KAUTZ_BLOCKS_PER_TIER;
 use dnam_engine::stages::stage3_cab::V3MatryoshkaModel;
@@ -22,7 +22,7 @@ pub mod refl;
 use self::id::{identify_steiglitz_mcbride_and_linearity, solve_early_fir_64_stereo};
 use self::refl::extract_stage4_reflection_delays;
 
-/// Configuration for Stage A physics probing & anchor seeding (`r[train.pipeline.stage-a-poles]`).
+/// Configuration for Stage A physics probing & anchor seeding (`r[train.pipeline.physics-probe]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StageAConfig {
     /// Preserve an already-populated `v3` physical backbone (`true` for white-box oracles or
@@ -41,7 +41,7 @@ impl Default for StageAConfig {
     }
 }
 
-/// Telemetry emitted by [`run_stage_a_physics_probe`] (`r[train.pipeline.stage-a-poles]`).
+/// Telemetry emitted by [`run_stage_a_physics_probe`] (`r[train.pipeline.physics-probe]`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StageAReport {
     /// Wall-clock Stage A execution time in milliseconds.
@@ -121,7 +121,7 @@ fn estimate_crossover_hz(spectral_summary_4096: Option<&[u8; 4_096]>) -> f32 {
     (95.0 + 130.0 * ratio as f32).clamp(80.0, 260.0)
 }
 
-/// Runs Stage A (`Physics Probe` & Anchor Seeding) in `28,672 B` `v3` layout (`r[train.pipeline.stage-a-poles]`).
+/// Runs Stage A (`Physics Probe` & Anchor Seeding) in `28,672 B` `v3` layout (`r[train.pipeline.physics-probe]`).
 pub fn run_stage_a_physics_probe(
     manifest: &DnamProjManifest,
     arena: &mut [u8],

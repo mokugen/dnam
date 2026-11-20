@@ -121,7 +121,7 @@ describe("Parameters, ControlSpace & Tempo", () => {
   it.each(["napi", "wasm"] as const)(
     "computes ZOH rescaling, subdivision phases, and 32-step tempo calibration inversion on %s driver",
     (driverKind) => {
-      // verify[sdk.ts.model.containers-and-checkpoints]
+      // verify[sdk.ts.model.containers-and-gram]
       const driver = driverKind === "napi" ? loadNodeDriverSync() : loadNodeWasmDriverSync();
       withDriver(driver, () => {
         expect(controlStride(48_000)).toBe(16);
@@ -174,7 +174,7 @@ describe("Parameters, ControlSpace & Tempo", () => {
 
   it("property: fast-check verifies 3-Phase clamping bounds, ZOH invariants, and tempo calibration inversion across N-API & WASM", () => {
     // verify[sdk.ts.parameters.audio-param-semantics]
-    // verify[sdk.ts.model.containers-and-checkpoints]
+    // verify[sdk.ts.model.containers-and-gram]
     const napiDriver = loadNodeDriverSync();
     const wasmDriver = loadNodeWasmDriverSync();
     using model = Model.reference();

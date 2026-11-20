@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 //! Shared `#![no_std]`, zero-dependency 32-bit `SONA` DSP, associative parallel-scan,
-//! modal/transport, and exact `i32` Ozaki kernels (`ref[repo.code.shared-nostd-kernels]`,
+//! modal/transport, and exact `i32` Ozaki kernels (`ref[sdk.rust.shared-nostd-kernels]`,
 //! `docs/specs/architecture/sona_architecture.md`).
 //!
 //! All non-host runtime modules execute strictly in 32-bit IEEE-754 `f32` and 32-bit

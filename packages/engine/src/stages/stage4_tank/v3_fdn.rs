@@ -37,7 +37,7 @@ pub struct V3Stage4TankHot {
     pub quad0: Stage4QuadHotState,
     pub params: V3Stage4TankParams,
     pub active_quads: usize,
-    /// Unitary captured hardware freeze latch (`ref[dsp.stage4.captured-freeze]`).
+    /// Unitary captured hardware freeze latch (`ref[dsp.tank.captured-freeze]`).
     pub freeze: bool,
     pub frames: [[u16; V3_TANK_LINES]; V3_TANK_CAP],
     pub extra_quads: [Stage4QuadHotState; 3],

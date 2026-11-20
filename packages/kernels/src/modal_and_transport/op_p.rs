@@ -5,7 +5,7 @@
 //! `ref[dsp.op-m.tracker.toggle-sheet]`).
 //!
 //! Strictly 32-bit, `#![no_std]`, zero `FDIV`/`FSQRT`, zero 64-bit scalars, and zero `libm` calls
-//! in runtime execution (`ref[repo.code.shared-nostd-kernels]`).
+//! in runtime execution (`ref[sdk.rust.shared-nostd-kernels]`).
 
 use crate::simd::{
     DC_BLOCKER_5HZ_48K_F32, GpuVec4, KernelVec4, MAX_PARALRU_R_F32, flush_subnormal_f32_bits,

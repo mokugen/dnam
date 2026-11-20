@@ -64,7 +64,7 @@ describe("Provenance, Sealing, Envelopes & Watermarking", () => {
   it.each(["napi", "wasm"] as const)(
     "signs, verifies, seals/unseals, and watermarks models identically on %s driver",
     (driverKind) => {
-      // verify[sdk.ts.provenance.v2-security]
+      // verify[sdk.ts.provenance.security-and-drm]
       const driver = driverKind === "napi" ? loadNodeDriverSync() : loadNodeWasmDriverSync();
       withDriver(driver, () => {
         using baseModel = Model.reference();
@@ -332,7 +332,7 @@ describe("Provenance, Sealing, Envelopes & Watermarking", () => {
   );
 
   it("property: fast-check verifies ChaCha20 arena involution, DAU1/RecordDirectory wire roundtrips, and preview window containment", () => {
-    // verify[sdk.ts.provenance.v2-security]
+    // verify[sdk.ts.provenance.security-and-drm]
     const creatorPubHex = ed25519PublicKey(new Uint8Array(32).fill(0x11));
 
     fc.assert(

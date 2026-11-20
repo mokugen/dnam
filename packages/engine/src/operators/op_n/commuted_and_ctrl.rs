@@ -1,6 +1,6 @@
 //! Op-N Commuted LTI Cascade, 3 kHz Latent Folding & Control-Plane Primitives.
 //!
-//! Canonical Reference: `docs/specs/dsp/op_n_commuted_cascade.md` (`ref[dsp.op-n.commuted.theorem1]`, `ref[dsp.op-n.stage2.latent-folding]`, `ref[dsp.op-n.stage2.stereo-coupling]`, `ref[dsp.op-n.ctrl.lobatto-basis]`, `ref[dsp.op-n.ctrl.chebyshev-lfo]`, `ref[dsp.op-n.ctrl.trust-clip]`).
+//! Canonical Reference: `docs/specs/dsp/op_n_paralru_and_polyadaa.md` (`ref[dsp.op-n.commuted.theorem1]`, `ref[dsp.op-n.core.control-sensitivity]`, `ref[dsp.op-n.core.interblock-tiles]`, `ref[dsp.op-n.ctrl.lobatto-basis]`, `ref[dsp.op-n.ctrl.chebyshev-lfo]`, `ref[dsp.op-n.ctrl.trust-clip]`).
 
 use alloc::vec::Vec;
 
@@ -97,7 +97,7 @@ pub fn eval_commuted_vs_uncommuted_lti_cascade_f64<const P: usize, const K: usiz
 
 /// Folds $3\text{ kHz}$ stage control latents $\mathbf{z}_{\text{stage}} \in \mathbb{R}^{D_s}$ into a
 /// sub-stage projection vector $\mathbf{w}(\mathbf{z}) = \mathbf{w}_0 + \sum_{r=0}^{D_s-1} z_r \mathbf{w}_{r+1}$
-/// (`ref[dsp.op-n.stage2.latent-folding]`).
+/// (`ref[dsp.op-n.core.control-sensitivity]`).
 pub fn fold_stage2_latent_weights<const N: usize>(
     w_base: &[f32; N],
     w_modes: &[[f32; N]],
@@ -116,7 +116,7 @@ pub fn fold_stage2_latent_weights<const N: usize>(
 
 /// Evaluates the $2 \times 2$ block stereo coupling matrix on a 16-D stereo drive basis
 /// $\mathbf{u}_{\text{stereo}} = [\mathbf{u}_L^{(8)}, \mathbf{u}_R^{(8)}]^\top$
-/// (`ref[dsp.op-n.stage2.stereo-coupling]`).
+/// (`ref[dsp.op-n.core.interblock-tiles]`).
 pub fn eval_stage2_stereo_coupling_16d(
     u_left: &[f32; 8],
     u_right: &[f32; 8],
@@ -190,16 +190,16 @@ mod tests {
     /// verify[dsp.op-n.commuted.causality]
     /// verify[dsp.op-n.commuted.project-then-filter]
     /// verify[dsp.op-n.commuted.dc-equilibrium]
-    /// verify[dsp.op-n.stage2.sub-stages]
-    /// verify[dsp.op-n.stage2.tone-basis]
-    /// verify[dsp.op-n.stage2.stereo-coupling]
-    /// verify[dsp.op-n.stage2.latent-folding]
+    /// verify[dsp.op-n.core.matryoshka-blocks]
+    /// verify[dsp.op-n.core.tpt-tone-basis]
+    /// verify[dsp.op-n.core.interblock-tiles]
+    /// verify[dsp.op-n.core.control-sensitivity]
     /// verify[dsp.op-n.ctrl.incremental-update]
     /// verify[dsp.op-n.ctrl.lobatto-basis]
     /// verify[dsp.op-n.ctrl.chebyshev-lfo]
     /// verify[dsp.op-n.ctrl.fm-interaction]
     /// verify[dsp.op-n.ctrl.trust-clip]
-    /// verify[dsp.zoh.stage2-op-n]
+    /// verify[dsp.zoh.core-paralru]
     #[test]
     fn test_commuted_lti_theorem1_dc_equilibrium_stage2_and_zoh() {
         let _guard = FtzDazGuard::new();

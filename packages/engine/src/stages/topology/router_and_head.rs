@@ -2,7 +2,7 @@
 //! Stereo-Linked & Aux-Key Detector), Stage IV Blended Quiet-Feedback Knee & Outer-Clamped Loop
 //! Saturator, and 256-D Feature Bus Slot Allocation.
 //!
-//! Canonical Reference: `docs/specs/dsp/router_and_stages_topology.md` (`ref[dsp.router.wdw-contract]`, `ref[dsp.router.parallel-alignment]`, `ref[dsp.router.lr4-crossover]`, `ref[dsp.router.stereo-link-detector]`, `ref[dsp.router.ballistic-envelope-bank]`, `ref[dsp.stage4.loop-saturator]`, `ref[dsp.stage4.quiet-feedback-knee]`, `ref[dsp.head.feature-bus-slots]`).
+//! Canonical Reference: `docs/specs/dsp/router_and_crossbar_topology.md` (`ref[dsp.router.wdw-contract]`, `ref[dsp.router.parallel-alignment]`, `ref[dsp.router.lr4-crossover]`, `ref[dsp.router.stereo-link-detector]`, `ref[dsp.router.ballistic-envelope-bank]`, `ref[dsp.tank.loop-saturator]`, `ref[dsp.tank.quiet-feedback-knee]`, `ref[dsp.head.direct-register-readout]`).
 
 pub mod stage4_and_laws;
 
@@ -529,9 +529,9 @@ mod spec_tests {
         #![proptest_config(ProptestConfig::with_cases(32))]
 
         /// verify[dsp.router.stereo-link-detector]
-        /// verify[dsp.stage4.loop-saturator]
-        /// verify[dsp.stage4.quiet-feedback-knee]
-        /// verify[dsp.ctrl.dispatch.stage-laws]
+        /// verify[dsp.tank.loop-saturator]
+        /// verify[dsp.tank.quiet-feedback-knee]
+        /// verify[dsp.ctrl.dispatch.modulation-laws]
         #[test]
         fn prop_topology_detector_stage4_saturator_knee_and_stage_laws(
             x_l in -10.0_f32..10.0_f32,

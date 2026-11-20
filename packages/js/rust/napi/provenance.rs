@@ -1,5 +1,5 @@
 //! Node-API v10 v2 provenance, signing, sealing, `DAU1`/`DME1`, preview containment,
-//! and buyer watermarking bindings (`ref[sdk.ts.provenance.v2-security]`).
+//! and buyer watermarking bindings (`ref[sdk.ts.provenance.security-and-drm]`).
 
 use napi::bindgen_prelude::{Float32Array, Float64Array, Result, Uint8Array};
 use napi_derive::napi;

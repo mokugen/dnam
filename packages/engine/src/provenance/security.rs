@@ -14,7 +14,7 @@
 //!   `ref[sec.drm.protection-profiles]`
 //! - `ref[sec.watermark.reciprocal-gauge]`, `ref[sec.watermark.orthogonal-gauge]`,
 //!   `ref[sec.watermark.tardos-code]`, `ref[sec.watermark.seed-derivation]`
-//! - `ref[sec.anticlone.three-stage-gate]`, `ref[sec.anticlone.stage3-fingerprint]`
+//! - `ref[sec.anticlone.three-gate-pipeline]`, `ref[sec.anticlone.cabinet-fingerprint]`
 //! - `ref[sec.preview.containment]`, `ref[sec.preview.royalty-splits]`,
 //!   `ref[sec.preview.storefront-metadata]`, `ref[sec.edge.data-model]`
 

@@ -50,7 +50,7 @@ export const VALID_RULE_ID_RE = /^[a-z0-9-]+(?:\.[a-z0-9-]+){2,}$/;
 export const REQ_TABLE_RE = /^\|\s*\*\*`(REQ-\d+\.\d+)`\*\*\s*\|/gm;
 export const REQ_TOKEN_RE = /\bREQ-\d+\.\d+\b/g;
 export const ADR_TOKEN_RE = /\bADR-\d{4}\b/g;
-export const MD_LINK_RE = /(?<!!)\[([^\]]+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
+export const MD_LINK_RE = /(?<!!)\[((?:[^[\]]|\[[^[\]]*\])+)\]\(([^)\s]+)(?:\s+"[^"]*")?\)/g;
 export const HEADING_RE = /^(#{1,6})\s+(.+?)\s*$/gm;
 
 const FRONTMATTER_RE = /^---\n([\s\S]*?)\n---\n/;
@@ -156,7 +156,7 @@ export function parseFrontmatter(text: string): Record<string, string | string[]
 export function githubSlugify(headingText: string): string {
   let text = headingText
     .trim()
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\[((?:[^[\]]|\[[^[\]]*\])+)\]\([^)]+\)/g, "$1")
     .replace(/`/g, "")
     .toLowerCase();
   const kept: string[] = [];
@@ -207,15 +207,17 @@ export function collectSourceRefTokens(): [string, string, number][] {
   const refs: [string, string, number][] = [];
   const exts = new Set([".rs", ".ts", ".tsx", ".mjs", ".md"]);
   const templateRel = relPath(path.join(DOCS_DIR, "templates"));
-  for (const root of [PACKAGES_DIR, DOCS_DIR, TESTS_DIR]) {
-    for (const filePath of walkFilesByExtensions(root, exts)) {
-      const rel = relPath(filePath);
-      if (isGuardrailFile(filePath) || rel.startsWith(templateRel)) continue;
-      const lines = fs.readFileSync(filePath, "utf8").split("\n");
-      for (let idx = 0; idx < lines.length; idx++) {
-        for (const m of (lines[idx] ?? "").matchAll(SPEC_REF_TOKEN_RE)) {
-          refs.push([m[1] ?? "", rel, idx + 1]);
-        }
+  const rootDocs = [path.join(REPO_ROOT, "AGENTS.md"), path.join(REPO_ROOT, "CONTRIBUTING.md")];
+  for (const filePath of [
+    ...rootDocs.filter((p) => fs.existsSync(p)),
+    ...[PACKAGES_DIR, DOCS_DIR, TESTS_DIR].flatMap((root) => walkFilesByExtensions(root, exts)),
+  ]) {
+    const rel = relPath(filePath);
+    if (isGuardrailFile(filePath) || rel.startsWith(templateRel)) continue;
+    const lines = fs.readFileSync(filePath, "utf8").split("\n");
+    for (let idx = 0; idx < lines.length; idx++) {
+      for (const m of (lines[idx] ?? "").matchAll(SPEC_REF_TOKEN_RE)) {
+        refs.push([m[1] ?? "", rel, idx + 1]);
       }
     }
   }
@@ -543,6 +545,121 @@ export function advanceAttributedBlockTracker(
   return true;
 }
 
+function extractBalancedCfgInner(trimmed: string): string | null {
+  const m = /^#\s*\[\s*cfg\s*\(/.exec(trimmed);
+  if (!m) return null;
+  let depth = 1;
+  for (let i = m[0].length; i < trimmed.length; i++) {
+    const ch = trimmed[i];
+    if (ch === "(") {
+      depth++;
+    } else if (ch === ")") {
+      depth--;
+      if (depth === 0) return trimmed.slice(m[0].length, i);
+    }
+  }
+  return null;
+}
+
+function stripBalancedNotClauses(text: string): string {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const m = /^not\s*\(/.exec(text.slice(i));
+    if (m && (i === 0 || !/[A-Za-z0-9_]/.test(text[i - 1] ?? ""))) {
+      let depth = 1;
+      let j = i + m[0].length;
+      while (j < text.length && depth > 0) {
+        if (text[j] === "(") depth++;
+        else if (text[j] === ")") depth--;
+        j++;
+      }
+      i = j;
+      continue;
+    }
+    out += text[i] ?? "";
+    i++;
+  }
+  return out;
+}
+
 export function isCfgTestAttributeLine(trimmed: string): boolean {
-  return /^#\s*\[\s*cfg\s*\(\s*(?:test\b|all\s*\([^)]*\btest\b)/.test(trimmed);
+  const inner = extractBalancedCfgInner(trimmed);
+  if (inner === null) return false;
+  return /\btest\b/.test(stripBalancedNotClauses(inner));
+}
+
+function readBalancedCfgAttr(
+  braceLines: readonly string[],
+  startIdx: number,
+): { endIdx: number; isInner: boolean; isCfgTest: boolean } | null {
+  const firstTrimmed = (braceLines[startIdx] ?? "").trim();
+  const startMatch = /^#\s*(!)?\s*\[\s*cfg\s*\(/.exec(firstTrimmed);
+  if (!startMatch) return null;
+  let bracketDepth = 0;
+  let endIdx = startIdx;
+  const parts: string[] = [];
+  while (endIdx < braceLines.length) {
+    const line = braceLines[endIdx] ?? "";
+    parts.push(line.trim());
+    for (const ch of line) {
+      if (ch === "[") bracketDepth++;
+      else if (ch === "]") bracketDepth--;
+    }
+    if (bracketDepth <= 0) break;
+    endIdx++;
+  }
+  const normalizedAttr = `#${parts.join(" ").replace(/^#\s*!?\s*\[/, "[")}`;
+  return {
+    endIdx,
+    isInner: startMatch[1] === "!",
+    isCfgTest: isCfgTestAttributeLine(normalizedAttr),
+  };
+}
+
+function updateCfgInnerScope(
+  braceLine: string,
+  state: { blockDepth: number; activeInnerDepth: number | null },
+  attrInfo: { endIdx: number; isInner: boolean; isCfgTest: boolean } | null,
+): boolean {
+  if (attrInfo?.isInner && attrInfo.isCfgTest && state.activeInnerDepth === null) {
+    state.activeInnerDepth = state.blockDepth;
+  }
+  const wasActive = state.activeInnerDepth !== null;
+  for (const ch of braceLine) {
+    if (ch === "{") state.blockDepth++;
+    else if (ch === "}") state.blockDepth = Math.max(0, state.blockDepth - 1);
+  }
+  if (state.activeInnerDepth !== null && state.blockDepth < state.activeInnerDepth) {
+    state.activeInnerDepth = null;
+  }
+  return wasActive;
+}
+
+/**
+ * Returns a per-line boolean mask indicating which lines of a Rust file reside inside any
+ * `#[cfg(test)]`, `#[cfg(all(..., test))]`, multi-line `#[cfg(...)]`, or `#![cfg(test)]` scope.
+ * Input lines must already be stripped of comments and string/char literals.
+ */
+export function computeRustCfgTestLineMask(braceLines: readonly string[]): boolean[] {
+  const mask = new Array<boolean>(braceLines.length).fill(false);
+  const tracker = createBraceTracker();
+  const innerState = { blockDepth: 0, activeInnerDepth: null as number | null };
+  let outerAttrEnd = -1;
+
+  for (let idx = 0; idx < braceLines.length; idx++) {
+    const braceLine = braceLines[idx] ?? "";
+    const attrInfo = idx > outerAttrEnd ? readBalancedCfgAttr(braceLines, idx) : null;
+    if (attrInfo && !attrInfo.isInner && attrInfo.isCfgTest) {
+      outerAttrEnd = attrInfo.endIdx;
+    }
+    const inInnerScope = updateCfgInnerScope(braceLine, innerState, attrInfo);
+    const inOuterItem = advanceAttributedBlockTracker(
+      braceLine,
+      tracker,
+      () => idx <= outerAttrEnd,
+    );
+    mask[idx] = inInnerScope || inOuterItem;
+  }
+  return mask;
 }

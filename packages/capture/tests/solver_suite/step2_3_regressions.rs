@@ -224,7 +224,7 @@ fn test_wide192_tiled_intra_and_cross_batch_cancellation_and_prime_stride() {
 
 #[test]
 fn test_engine_immediate_control_sync_reload_reset_and_tier_gain_trim() {
-    // verify[train.pipeline.stage-e-pack]
+    // verify[train.pipeline.host-parity-and-export]
     // verify[train.pipeline.isomorphism-parity]
     let mut hdr = DnamJsonHeader::default_reference();
     hdr.io_config.inputs = 4;

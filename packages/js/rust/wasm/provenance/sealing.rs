@@ -1,5 +1,5 @@
 //! WASM v2 container sealing/unsealing, `DAU1`/`DME1` envelopes, HPKE directories, preview
-//! containment, and royalty split exports (`ref[sdk.ts.provenance.v2-security]`,
+//! containment, and royalty split exports (`ref[sdk.ts.provenance.security-and-drm]`,
 //! `ref[sdk.ts.runtime.zero-unsafe]`).
 
 use crate::core::provenance::{

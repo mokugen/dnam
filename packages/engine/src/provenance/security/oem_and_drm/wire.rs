@@ -1,6 +1,6 @@
 //! Declarative `#[repr(C)]` `zerocopy` wire headers and directories for `.dnam-seal` (`DNSL`),
 //! protected inner framing (`DNPL`), `DME1` encrypted mutable frames, and HPKE record framing
-//! (`ref[repo.code.zerocopy-wire-structs]`, `ref[sec.drm.dnsl-public-framing]`,
+//! (`ref[sdk.rust.zerocopy-wire-structs]`, `ref[sec.drm.dnsl-public-framing]`,
 //! `ref[sec.drm.protected-inner-framing]`, `ref[sec.drm.dme1-mutable-suffix]`).
 
 use core::mem::{align_of, offset_of, size_of};

@@ -3,7 +3,7 @@
 //! `3-Layer Buyer Watermarking`, `solver::stage_d_audit`).
 //!
 //! Canonical References:
-//! - `docs/specs/training/four_stage_pipeline.md` (`ref[train.pipeline.stage-e-pack]`)
+//! - `docs/specs/training/webgpu_and_varpro_solver.md` (`ref[train.pipeline.host-parity-and-export]`)
 //! - `docs/specs/security/watermarking_and_marketplace.md` (`ref[sec.watermark.reciprocal-gauge]`)
 
 mod trims;
@@ -63,7 +63,7 @@ impl StageDAuditOptions {
     };
 }
 
-/// Output summary from Stage D finalization & 3-Phase audit (`r[train.pipeline.stage-e-pack]`).
+/// Output summary from Stage D finalization & 3-Phase audit (`r[train.pipeline.host-parity-and-export]`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct StageDSolveOutput {
     /// Wall-clock Stage D execution time in milliseconds.
@@ -147,7 +147,7 @@ impl BiquadK {
     }
 }
 
-/// Computes ITU-R BS.1770-4 K-weighted integrated loudness in LUFS (`r[train.pipeline.stage-e-pack]`).
+/// Computes ITU-R BS.1770-4 K-weighted integrated loudness in LUFS (`r[train.pipeline.host-parity-and-export]`).
 #[must_use]
 pub fn compute_integrated_lufs(samples_lr: &[[f32; 2]], sample_rate_hz: u32) -> f64 {
     if samples_lr.is_empty() {
@@ -505,7 +505,7 @@ impl StageDRepairCtx<'_> {
 }
 
 /// Finalizes Stage D (`3-Phase Audit`, `[STAB-ZERO-DC]`, `<= 0.05 LU` loudness trims, and solver
-/// telemetry, `r[train.pipeline.stage-e-pack]`).
+/// telemetry, `r[train.pipeline.host-parity-and-export]`).
 pub fn finalize_stage_d_and_audit(
     manifest: &mut DnamProjManifest,
     arena: &mut [u8],

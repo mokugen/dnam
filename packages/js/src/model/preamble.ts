@@ -1,6 +1,6 @@
 /**
  * 64-byte `.dnam` preamble metadata (`PreambleInfo`) and cumulative tier arenas
- * (`TierArenas`) (`ref[sdk.ts.model.containers-and-checkpoints]`).
+ * (`TierArenas`) (`ref[sdk.ts.model.containers-and-gram]`).
  *
  * @module
  */

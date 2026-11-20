@@ -1,5 +1,5 @@
 //! Pure-`u32` IEEE-754 `binary32` (`f32`) $\leftrightarrow$ `binary16` (`fp16`) software conversion
-//! primitives (`ref[repo.code.shared-nostd-kernels]`).
+//! primitives (`ref[sdk.rust.shared-nostd-kernels]`).
 //!
 //! Uses strictly `u32`/`i32` bit arithmetic with round-to-nearest-even (`RNE`), zero division,
 //! zero `u64`/`f64`, and finite clamping of `[65520.0, f32::MAX]` to `0x7BFF`/`0xFBFF`.

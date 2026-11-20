@@ -2,7 +2,7 @@
 //! Reload Containment, and Property Verification Suite (`tests/sona_tier_and_multiport_lifecycle.rs`).
 //!
 //! Canonical Reference: `docs/specs/architecture/sona_architecture.md` and
-//! `docs/specs/dsp/router_and_stages_topology.md`.
+//! `docs/specs/dsp/router_and_crossbar_topology.md`.
 
 #![forbid(unsafe_code)]
 

@@ -38,7 +38,7 @@ use super::{make_range_ctrl, make_spec, read_f32, write_f32};
 
 #[test]
 fn test_stage_d_p68_region4_cp1_and_collinear_controls_robustness() {
-    // verify[train.pipeline.stage-d-control]
+    // verify[train.pipeline.control-projection-fit]
     let crypto = DefaultCryptoProvider::default();
     let mut manifest = DnamProjManifest::default_reference();
     manifest.base.controls_schema = (0..68)
@@ -229,7 +229,7 @@ impl DistillationTarget for SimpleTanhTarget {
 
 #[test]
 fn test_live_null_test_autopatch_with_role_b_gauge_and_noisy_blackbox_phase_id() {
-    // verify[train.pipeline.stage-e-pack]
+    // verify[train.pipeline.host-parity-and-export]
     let crypto = DefaultCryptoProvider::default();
     let mut manifest = DnamProjManifest::default_reference();
     manifest.base.controls_schema = vec![make_range_ctrl("drive", 0.0, 10.0, 6.0)];
@@ -355,7 +355,7 @@ fn verify_whitebox_exported_audio(label: &str, proj_bytes: &[u8]) {
 
 #[test]
 fn test_tier4_whitebox_faust_runner_varpro_distillation() {
-    // verify[train.pipeline.stage-a-poles]
+    // verify[train.pipeline.physics-probe]
     // verify[train.pipeline.fixtures-matrix]
     let faust_json = r#"{"ui":[{"type":"vgroup","label":"Preamp","items":[{"type":"hslider","label":"Drive","init":0.5,"min":0.0,"max":1.0,"step":0.01},{"type":"hslider","label":"Tone","init":0.5,"min":0.0,"max":1.0,"step":0.01}]}]}"#;
     let parsed_specs = parse_faust_json_controls(faust_json).unwrap();
@@ -382,7 +382,7 @@ fn test_tier4_whitebox_faust_runner_varpro_distillation() {
 
 #[test]
 fn test_tier4_whitebox_spice_runner_varpro_distillation() {
-    // verify[train.pipeline.stage-a-poles]
+    // verify[train.pipeline.physics-probe]
     // verify[train.pipeline.fixtures-matrix]
     let mut spice = SpiceRunner::new("triode_stage.cir", 5_000);
     let mut m_spice = DnamProjManifest::default_reference();

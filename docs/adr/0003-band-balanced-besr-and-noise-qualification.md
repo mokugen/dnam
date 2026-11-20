@@ -18,7 +18,7 @@ This record justifies the perceptual quality evaluation framework in [`../specs/
 
 ## 1. Context: Why Plain Broadband `ESR` and Fixed High-Pass Pre-Emphasis Fail
 
-Evaluating neural audio models with plain broadband Error-to-Signal Ratio ($\text{ESR} = \Vert \hat{y} - y\Vert _2^2 / \Vert y\Vert _2^2$) or fixed first-order high-pass pre-emphasis ($H_{\text{pre}}(z) = 1 - 0.95 z^{-1}$) fails across universal instruments for five physical reasons:
+Evaluating neural audio models with plain broadband Error-to-Signal Ratio (`ESR = ||ŷ - y||₂² / ||y||₂²`) or fixed first-order high-pass pre-emphasis (`H_pre(z) = 1 - 0.95 z⁻¹`) fails across universal instruments for five physical reasons:
 
 | Failure Mode | Physical Cause | Audible Consequence |
 | :--- | :--- | :--- |

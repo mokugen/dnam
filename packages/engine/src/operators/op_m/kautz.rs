@@ -1,5 +1,5 @@
 //! Symplectic Modal Recurrence, Contractive Rotor, and Orthonormal Kautz Modal Bank (`Stage III` & Family 6,
-//! `ref[dsp.op-m.recurrence.symplectic]`, `ref[dsp.op-m.rotor.contractive]`, `ref[dsp.op-m.stage3.sweep-contraction]`).
+//! `ref[dsp.op-m.recurrence.symplectic]`, `ref[dsp.op-m.rotor.contractive]`, `ref[dsp.op-m.kautz.sweep-contraction]`).
 
 pub mod simd;
 
@@ -236,7 +236,7 @@ impl<const POLES: usize> KautzModalBank<POLES> {
         self.s_im.fill(0.0);
     }
 
-    /// Sets complex conjugate pole pair `m` with dynamic sweep contraction (`ref[dsp.op-m.stage3.sweep-contraction]`).
+    /// Sets complex conjugate pole pair `m` with dynamic sweep contraction (`ref[dsp.op-m.kautz.sweep-contraction]`).
     pub fn set_pole(
         &mut self,
         m: usize,
@@ -249,7 +249,7 @@ impl<const POLES: usize> KautzModalBank<POLES> {
         self.set_pole_with_b_gamma(m, r, theta, delta_theta, 1.0, c_re, c_im);
     }
 
-    /// Sets complex conjugate pole pair `m` with explicit input scaling `b_gamma` (`ref[dsp.op-m.stage3.sweep-contraction]`).
+    /// Sets complex conjugate pole pair `m` with explicit input scaling `b_gamma` (`ref[dsp.op-m.kautz.sweep-contraction]`).
     #[allow(clippy::too_many_arguments)]
     pub fn set_pole_with_b_gamma(
         &mut self,
@@ -340,7 +340,7 @@ pub fn init_log_octave_poles_h2(
 /// Validates Stage III serialized Kautz parameters (`0.85 <= r_low <= r_high = r_low + dr <= 0.9995`,
 /// `theta in (0, pi)`, `0.5 <= kappa <= 2.0`) and evaluates the shared radial gate
 /// $g = \mathrm{clamp}(0.5 + \theta_{10}, 0, 1)$, $r_{\text{gate}} = \mathrm{clamp}(r_{\text{low}} + g \cdot dr, r_{\text{low}}, r_{\text{high}})$,
-/// and $b_\gamma = \kappa \sqrt{1 - r_{\text{high}}^2}$ (`ref[dsp.op-m.stage3.radial-gate]`).
+/// and $b_\gamma = \kappa \sqrt{1 - r_{\text{high}}^2}$ (`ref[dsp.op-m.kautz.radial-gate]`).
 pub fn validate_and_eval_stage3_radial_gate(
     r_low: f32,
     dr: f32,
@@ -365,7 +365,7 @@ pub fn validate_and_eval_stage3_radial_gate(
 }
 
 /// Evaluates Stage III dynamic sweep contraction $r_{\text{eff}} = \min(r_m, \max(0.25, 0.9995 - 0.15 |\Delta\theta_m|))$
-/// via [`dnam_kernels::eval_stage3_sweep_contraction_f32`] (`ref[dsp.op-m.stage3.sweep-contraction]`).
+/// via [`dnam_kernels::eval_stage3_sweep_contraction_f32`] (`ref[dsp.op-m.kautz.sweep-contraction]`).
 #[inline]
 pub fn eval_stage3_sweep_contraction(r_m: f32, delta_theta_m: f32) -> f32 {
     dnam_kernels::eval_stage3_sweep_contraction_f32(r_m, delta_theta_m)
@@ -373,7 +373,7 @@ pub fn eval_stage3_sweep_contraction(r_m: f32, delta_theta_m: f32) -> f32 {
 
 /// Converts a Stage III shared Kautz pole pair `(r_low, dr, theta, b_gamma, c_re, c_im)` from the
 /// `48 kHz` reference rate to `effective_rate_hz` (`rho = 48000 / f_s,eff`), rescaling the complex
-/// readout at $g = 0.5$ so steady-state DC/modal transfer is preserved (`ref[dsp.op-m.stage3.rate-convert]`,
+/// readout at $g = 0.5$ so steady-state DC/modal transfer is preserved (`ref[dsp.op-m.kautz.rate-convert]`,
 /// `ref[dsp.zoh.op-m-poles]`).
 pub fn convert_stage3_kautz_pole_for_rate(
     r_low: f32,
@@ -571,7 +571,7 @@ mod tests {
             "Static Kautz pole radius was prematurely clamped: {static_r}"
         );
 
-        // ref[dsp.op-m.stage3.sweep-contraction]: dynamic sweep contraction bounds r_effective <= max(0.25, 0.9995 - 0.15 * |delta_theta|) when sweeping
+        // ref[dsp.op-m.kautz.sweep-contraction]: dynamic sweep contraction bounds r_effective <= max(0.25, 0.9995 - 0.15 * |delta_theta|) when sweeping
         bank.set_pole(0, 0.9995, 0.5, 0.1, 1.0, 0.0);
         let lambda_r =
             (bank.lambda_re[0] * bank.lambda_re[0] + bank.lambda_im[0] * bank.lambda_im[0]).sqrt();
@@ -614,12 +614,12 @@ mod tests {
         assert!((pc as f64) * (pc as f64) + (ps as f64) * (ps as f64) <= 1.0);
     }
 
-    /// verify[dsp.op-m.stage3.kautz-allocation]
-    /// verify[dsp.op-m.stage3.dual-state]
-    /// verify[dsp.op-m.stage3.radial-gate]
-    /// verify[dsp.op-m.stage3.rate-convert]
-    /// verify[dsp.op-m.stage3.coupled-form]
-    /// verify[dsp.op-m.stage3.sweep-contraction]
+    /// verify[dsp.op-m.kautz.tier-allocation]
+    /// verify[dsp.op-m.kautz.dual-state]
+    /// verify[dsp.op-m.kautz.radial-gate]
+    /// verify[dsp.op-m.kautz.rate-convert]
+    /// verify[dsp.op-m.kautz.coupled-form]
+    /// verify[dsp.op-m.kautz.sweep-contraction]
     /// verify[dsp.zoh.op-m-poles]
     #[test]
     fn test_stage3_kautz_allocation_dual_state_radial_gate_rate_convert_and_sweep() {
@@ -731,7 +731,7 @@ mod tests {
                 prop_assert!((y_s - y_g).abs() < 1e-4, "Gauge invariance mismatch: {} vs {}", y_s, y_g);
             }
 
-            // ref[dsp.op-m.stage3.sweep-contraction] pole contraction invariant
+            // ref[dsp.op-m.kautz.sweep-contraction] pole contraction invariant
             for k in 0..4 {
                 let lr2 = bank_scalar.lambda_re[k] * bank_scalar.lambda_re[k]
                     + bank_scalar.lambda_im[k] * bank_scalar.lambda_im[k];

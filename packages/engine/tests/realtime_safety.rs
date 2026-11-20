@@ -4,7 +4,7 @@
 //! real-time audio and control methods (`process_block`, `process_block_in_place`,
 //! `process_mono_to_stereo`, `process_mono`, `set_tier`, `set_control_value`,
 //! `reload_model_in_place`, `DnamHostHandle`, and C-ABI FFI) execute with **0 heap allocations**
-//! and **0 heap deallocations**.
+//! and **0 heap deallocations** (`verify[sdk.rust.c-abi-and-host-handle]`).
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
@@ -399,6 +399,7 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
 
     // 5b. Verify DnamHostHandle real-time control, audio processing, and wait-free telemetry
     //     execute with ZERO heap allocations and ZERO deallocations (pre-warmed HostMutex).
+    // verify[sdk.rust.c-abi-and-host-handle]
     {
         let host_handle =
             DnamHostHandle::from_bytes_owned(container_active.as_bytes(), Tier::Full, 48_000)

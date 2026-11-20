@@ -7,7 +7,7 @@ supersedes:
 superseded_by: ADR-0022
 specs:
   - docs/specs/architecture/sona_architecture.md
-  - docs/specs/dsp/router_and_stages_topology.md
+  - docs/specs/dsp/router_and_crossbar_topology.md
 requirements:
   - REQ-1.2
   - REQ-1.3
@@ -22,7 +22,7 @@ requirements:
 > [!NOTE]
 > **Superseded by [`ADR-0022`](0022-sona-state-space-operator-and-webgpu-architecture.md):** `TORA` (`v2`/`v3`) has been superseded by the **State-Space Operator Neural Architecture (`SONA` `v3.0`)** in [`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md). This historical record archives the original `TORA` rationale and comparison against grey-box Multi-FX approximations.
 
-This record (historically superseding [`ADR-0001`](0001-superseded-tri-physics-prototype.md) and now superseded by [`ADR-0022`](0022-sona-state-space-operator-and-webgpu-architecture.md)) documented the former `TORA` choices for [`sona_architecture.md`](../specs/architecture/sona_architecture.md) and [`router_and_stages_topology.md`](../specs/dsp/router_and_stages_topology.md).
+This record (historically superseding [`ADR-0001`](0001-superseded-tri-physics-prototype.md) and now superseded by [`ADR-0022`](0022-sona-state-space-operator-and-webgpu-architecture.md)) documented the former `TORA` choices for [`sona_architecture.md`](../specs/architecture/sona_architecture.md) and [`router_and_crossbar_topology.md`](../specs/dsp/router_and_crossbar_topology.md).
 
 ## 1. Context: Five Structural Bottlenecks in Conventional Neural Audio
 
@@ -112,8 +112,8 @@ flowchart LR
 | Domain | Canonical Decision | Superseded / Rejected R&D Alternative | Normative Spec & Test |
 | :--- | :--- | :--- | :--- |
 | **Slimmable Tier Hierarchy (`REQ-5.1`)** | Four nested tiers (`Lite ⊂ Full ⊂ Pro ⊂ Ultra`). `Lite..Pro` use `8-D` static control (`4` head + `4` stage, Rank-4 FM); `Ultra` adds an `8-D` delta (`+4` head + `+4` stage, Rank-8 FM) and a `16 × 4` stage-dispatch delta in `Arena 3`. | Capping `Ultra` at `4` stage coordinates (creates a rank-4 bottleneck across the 8 physical stage mechanisms) or baking `16-D` into `Lite..Pro`. | [`parametric_control_bus.md` §2.3](../specs/dsp/parametric_control_bus.md#23-o1-additive-latent-sufficient-statistic-control-scaling) |
-| **Stage III Cabinet Layout (`REQ-1.2`, `REQ-5.6`)** | Separate 64B-aligned per-tier slices for independent L/R early FIR taps (`16 / 32 / 48 / 64` taps/ch) and shared-pole Kautz modal pairs (`4 / 8 / 16 / 32` pairs) with independent L/R readouts. Fixed 16-sample reference modal onset (`x[n-16]`). Both channels advance in all I/O topologies. | Single unpartitioned `384 B` Stage III slot per tier (which collided `stage3_early_fir` with `stage2_filter_params` and assumed 16 poles/tier). | [`op_m_modal_kautz.md` §4.1](../specs/dsp/op_m_modal_kautz.md#41-stage-iii-architecture--tier-allocation), [`dnam_binary_format.md` §2.4](../specs/containers/dnam_binary_format.md#24-tier-local-projection--stage-iii-slice-layout) |
-| **Hardware Freeze (`REQ-1.4`)** | Freeze is modeled only when present and captured on the target hardware; unobserved options remain clamped. Stage IV freeze stops tank input injection while Stages I–III continue processing live play-over input. | Post-head synthetic native freeze with a separate `4,096 B` snapshot buffer and artificial visibility/blending rules. | [`router_and_stages_topology.md` §6.1](../specs/dsp/router_and_stages_topology.md#61-captured-freeze-and-modeled-controls) |
+| **Stage III Cabinet Layout (`REQ-1.2`, `REQ-5.6`)** | Separate 64B-aligned per-tier slices for independent L/R early FIR taps (`16 / 32 / 48 / 64` taps/ch) and shared-pole Kautz modal pairs (`4 / 8 / 16 / 32` pairs) with independent L/R readouts. Fixed 16-sample reference modal onset (`x[n-16]`). Both channels advance in all I/O topologies. | Single unpartitioned `384 B` Stage III slot per tier (which collided `stage3_early_fir` with `stage2_filter_params` and assumed 16 poles/tier). | [`op_m_modal_kautz.md`](../specs/dsp/op_m_modal_kautz.md), [`dnam_binary_format.md`](../specs/containers/dnam_binary_format.md) |
+| **Hardware Freeze (`REQ-1.4`)** | Freeze is modeled only when present and captured on the target hardware; unobserved options remain clamped. Stage IV freeze stops tank input injection while Stages I–III continue processing live play-over input. | Post-head synthetic native freeze with a separate `4,096 B` snapshot buffer and artificial visibility/blending rules. | [`router_and_crossbar_topology.md`](../specs/dsp/router_and_crossbar_topology.md) |
 
 ## 3. Companion Subsystem ADRs
 

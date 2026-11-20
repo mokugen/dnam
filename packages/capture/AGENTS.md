@@ -10,5 +10,5 @@
 | **Stimulus (`src/stimulus/`)** | [`src/stimulus/AGENTS.md`](src/stimulus/AGENTS.md), [`src/stimulus.rs`](src/stimulus.rs) | [`capture_and_alignment.md`](../../docs/specs/training/capture_and_alignment.md) |
 | **Project Vault (`src/proj/`)** | [`src/proj/AGENTS.md`](src/proj/AGENTS.md), [`src/proj.rs`](src/proj.rs) | [`project_container_format.md`](../../docs/specs/containers/project_container_format.md) |
 | **Metrics & White-Box (`src/metrics/`, `src/whitebox/`)** | [`src/metrics/AGENTS.md`](src/metrics/AGENTS.md), [`src/whitebox/AGENTS.md`](src/whitebox/AGENTS.md) | [`psychoacoustic_quality_and_tiers.md`](../../docs/specs/architecture/psychoacoustic_quality_and_tiers.md) |
-| **Solver (`src/solver/`)** | [`src/solver/AGENTS.md`](src/solver/AGENTS.md), [`src/solver.rs`](src/solver.rs) | [`four_stage_pipeline.md`](../../docs/specs/training/four_stage_pipeline.md) |
+| **Solver (`src/solver/`)** | [`src/solver/AGENTS.md`](src/solver/AGENTS.md), [`src/solver.rs`](src/solver.rs) | [`webgpu_and_varpro_solver.md`](../../docs/specs/training/webgpu_and_varpro_solver.md) |
 | **Tests (`tests/`)** | [`tests/AGENTS.md`](tests/AGENTS.md) | [`capture_and_alignment.md`](../../docs/specs/training/capture_and_alignment.md) |

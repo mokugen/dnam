@@ -1,6 +1,6 @@
-//! Shared `#![no_std]` `SONA` state-space core kernels (`ref[dsp.op-n.stage2.sub-stages]`,
-//! `ref[dsp.op-n.stage2.conv6-simd]`, `ref[dsp.op-n.commuted.dc-equilibrium]`,
-//! `ref[repo.code.shared-nostd-kernels]`):
+//! Shared `#![no_std]` `SONA` state-space core kernels (`ref[dsp.op-n.core.matryoshka-blocks]`,
+//! `ref[dsp.op-n.core.stereo-simd]`, `ref[dsp.op-n.commuted.dc-equilibrium]`,
+//! `ref[sdk.rust.shared-nostd-kernels]`):
 //! - [`tpt_svf`]: Unconditionally passive `2x2` ZDF `TPT-SVF` step, prewarping, and forward/adjoint scans.
 //! - [`paralru`]: Contractive `1D` scalar `ParaLRU` step, zero-DC soft rectifier, exact forward tile, & `O(log2 N)` linear adjoint scan.
 //! - [`poly_adaa`]: Pure-`f32` divided-difference `PolyADAA1` and $C^2$ wavefolder kernels.
@@ -29,7 +29,7 @@ pub use tpt_svf::{
     step_tpt_svf_vec4,
 };
 
-/// Simultaneous 4-mode `TPT-SVF` + direct-feed tone mixing weights (`ref[dsp.op-n.stage2.tone-basis]`).
+/// Simultaneous 4-mode `TPT-SVF` + direct-feed tone mixing weights (`ref[dsp.op-n.core.tpt-tone-basis]`).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SonaToneWeights4<V: KernelVec4> {
     pub lp: V,

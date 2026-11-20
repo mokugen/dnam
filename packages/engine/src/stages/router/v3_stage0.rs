@@ -247,7 +247,7 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
-    /// verify[dsp.stage1.pre-bus]
+    /// verify[dsp.crossbar.top-of-frame]
     #[test]
     fn test_stage0_identity_zero_dc_and_zoh_reconfigure() {
         let mut s0 = V3Stage0Hot::from_params(&V3Stage0Params::identity());

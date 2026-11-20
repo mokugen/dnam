@@ -1,5 +1,5 @@
 //! Declarative `#[repr(C)]` `zerocopy` wire structs for `.dnam` `v3.0` (`"sona"`) binary headers,
-//! directories, mutable frames, and `DCRC` records (`ref[repo.code.zerocopy-wire-structs]`,
+//! directories, mutable frames, and `DCRC` records (`ref[sdk.rust.zerocopy-wire-structs]`,
 //! `ref[container.dnam.preamble-directory]`, `ref[container.dnam.mutable-frame]`).
 
 use core::mem::{align_of, size_of};

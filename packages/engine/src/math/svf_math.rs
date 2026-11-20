@@ -6,26 +6,26 @@ use crate::math::{
     IEEE754_F32_RCP_SEED, MathBackend, ScalarVec4, SimdVec4, backend::rsqrt_nr2_scalar_f32,
 };
 
-/// Minimum normalized cutoff ratio `r = f_c / f_s` (`1.0e-5`, `ref[dsp.op-n.stage2.tone-basis]`).
+/// Minimum normalized cutoff ratio `r = f_c / f_s` (`1.0e-5`, `ref[dsp.op-n.core.tpt-tone-basis]`).
 const SVF_MIN_FREQ_RATIO: f32 = 1.0e-5;
 
-/// Maximum normalized cutoff ratio `r = f_c / f_s` (`0.495`, `ref[dsp.op-n.stage2.tone-basis]`).
+/// Maximum normalized cutoff ratio `r = f_c / f_s` (`0.495`, `ref[dsp.op-n.core.tpt-tone-basis]`).
 const SVF_MAX_FREQ_RATIO: f32 = 0.495;
 
 /// Minimum `SONA v3.0` normalized half-angle `w_half = pi * f0 / fs` (`pi * 1e-5`,
-/// `ref[dsp.op-n.stage2.tone-basis]`).
+/// `ref[dsp.op-n.core.tpt-tone-basis]`).
 const SVF_W_MIN: f32 = core::f32::consts::PI * SVF_MIN_FREQ_RATIO;
 
 /// Maximum `SONA v3.0` normalized half-angle `w_half = pi * f0 / fs` (`pi * 0.495`,
-/// `ref[dsp.op-n.stage2.tone-basis]`).
+/// `ref[dsp.op-n.core.tpt-tone-basis]`).
 pub const SVF_W_MAX: f32 = core::f32::consts::PI * SVF_MAX_FREQ_RATIO;
 
 /// Minimum prewarped `TPT-SVF` integrator coefficient `g = tan(w_half)` (`1.0e-5`,
-/// `ref[dsp.op-n.stage2.tone-basis]`).
+/// `ref[dsp.op-n.core.tpt-tone-basis]`).
 const SVF_G_MIN: f32 = 1.0e-5;
 
 /// Maximum prewarped `TPT-SVF` integrator coefficient `g = tan(w_half)` (`64.0`,
-/// `ref[dsp.op-n.stage2.tone-basis]`).
+/// `ref[dsp.op-n.core.tpt-tone-basis]`).
 pub const SVF_G_MAX: f32 = 64.0;
 
 /// Minimum positive denominator floor (`1.0e-6`) for Newton–Raphson reciprocals
@@ -214,7 +214,7 @@ pub fn tan_prewarp_vec4<B: MathBackend>(w_half: B::Vec4) -> B::Vec4 {
 
 /// Octant-reduced pure-`f32` bilinear `tan(w_half)` frequency pre-warping (`0 FDIV`, `0 libm`),
 /// delegated to [`dnam_kernels::prewarp_tan_pi_f_over_fs_f32`] across `r = f / fs in [1e-5, 0.495]`
-/// (`ref[dsp.op-n.stage2.tone-basis]`).
+/// (`ref[dsp.op-n.core.tpt-tone-basis]`).
 #[inline(always)]
 #[must_use]
 pub fn tan_prewarp_f32(w_half: f32) -> f32 {

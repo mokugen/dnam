@@ -10,10 +10,10 @@ Implements the top-level audio engine runtime dispatcher (`#[forbid(unsafe_code)
 
 | Component / File | Responsibility | Canonical Spec (SSOT) |
 | :--- | :--- | :--- |
-| [`process.rs`](process.rs) ([`multiport.rs`](process/multiport.rs)) | Dual-rate audio block callback, envelope guard, `4CM`/`WDW`/sidechain topology dispatch & frame stepping | [`sona_architecture.md`](../../../../docs/specs/architecture/sona_architecture.md), [`router_and_stages_topology.md`](../../../../docs/specs/dsp/router_and_stages_topology.md) |
+| [`process.rs`](process.rs) ([`multiport.rs`](process/multiport.rs)) | Dual-rate audio block callback, envelope guard, `4CM`/`WDW`/sidechain topology dispatch & frame stepping | [`sona_architecture.md`](../../../../docs/specs/architecture/sona_architecture.md), [`router_and_crossbar_topology.md`](../../../../docs/specs/dsp/router_and_crossbar_topology.md) |
 | [`runtime.rs`](runtime.rs) ([`bounce.rs`](runtime/bounce.rs), [`loader.rs`](runtime/loader.rs), [`json_scan.rs`](runtime/loader/json_scan.rs)) | `SonaMatryoshkaModel` unpacking, sample-rate ZOH rescaling, hot-swap reload & offline bounce | [`sona_architecture.md`](../../../../docs/specs/architecture/sona_architecture.md) |
 | [`presets.rs`](presets.rs) | Stack-allocated preset batch resolution and calibrated role side effects | [`sona_architecture.md`](../../../../docs/specs/architecture/sona_architecture.md), [`parametric_control_bus.md`](../../../../docs/specs/dsp/parametric_control_bus.md) |
-| [`oversampler.rs`](oversampler.rs) | `4x` linear-phase polyphase FIR oversampler (`OFFLINE_BOUNCE_PDC_SAMPLES = 12`) | [`router_and_stages_topology.md`](../../../../docs/specs/dsp/router_and_stages_topology.md) |
+| [`oversampler.rs`](oversampler.rs) | `4x` linear-phase polyphase FIR oversampler (`OFFLINE_BOUNCE_PDC_SAMPLES = 12`) | [`router_and_crossbar_topology.md`](../../../../docs/specs/dsp/router_and_crossbar_topology.md) |
 | [`tempo.rs`](tempo.rs) | Host BPM tempo-sync subdivision resolver and octave folding | [`parametric_control_bus.md`](../../../../docs/specs/dsp/parametric_control_bus.md) |
 
 See [`packages/engine/CONTRIBUTING.md`](../../CONTRIBUTING.md) for embedded memory budgets and real-time execution safety.

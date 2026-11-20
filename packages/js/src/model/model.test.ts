@@ -20,7 +20,7 @@ describe("Model & GramMatrix", () => {
   it.each(["napi", "wasm"] as const)(
     "loads, inspects, updates headers in-place, and strips tiers on %s driver",
     (driverKind) => {
-      // verify[sdk.ts.model.containers-and-checkpoints]
+      // verify[sdk.ts.model.containers-and-gram]
       // verify[sdk.ts.api.resources-and-data]
       // verify[sdk.ts.api.disposable-scopes]
       const driver = driverKind === "napi" ? loadNodeDriverSync() : loadNodeWasmDriverSync();
@@ -58,7 +58,7 @@ describe("Model & GramMatrix", () => {
   );
 
   it("loads Model asynchronously from file path, file URL, Blob, Response, ReadableStream, and ArrayBuffer", async () => {
-    // verify[sdk.ts.model.containers-and-checkpoints]
+    // verify[sdk.ts.model.containers-and-gram]
     // verify[sdk.ts.api.sync-init]
     const refBytes = Model.reference().toBytes();
     const tmpDir = mkdtempSync(join(tmpdir(), "dnam-js-test-"));
@@ -106,7 +106,7 @@ describe("Model & GramMatrix", () => {
   it.each(["napi", "wasm"] as const)(
     "validates canonical v2.0 Model layout, rejects non-DNAM magic, and packs GramMatrix on %s",
     (driverKind) => {
-      // verify[sdk.ts.model.containers-and-checkpoints]
+      // verify[sdk.ts.model.containers-and-gram]
       const driver = driverKind === "napi" ? loadNodeDriverSync() : loadNodeWasmDriverSync();
       withDriver(driver, () => {
         using model = Model.reference();
@@ -140,7 +140,7 @@ describe("Model & GramMatrix", () => {
   );
 
   it("property: fast-check verifies GramMatrix uplo='U' symmetric packing, CRC-32C sensitivity, and Model tier stripping", () => {
-    // verify[sdk.ts.model.containers-and-checkpoints]
+    // verify[sdk.ts.model.containers-and-gram]
     fc.assert(
       fc.property(
         fc.integer({ min: 1, max: 12 }),

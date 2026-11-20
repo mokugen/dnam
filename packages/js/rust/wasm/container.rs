@@ -1,5 +1,5 @@
 //! WASM `.dnam` container & `uplo='U'` Gram matrix exports
-//! (`ref[sdk.ts.model.containers-and-checkpoints]`, `ref[sdk.ts.runtime.zero-unsafe]`).
+//! (`ref[sdk.ts.model.containers-and-gram]`, `ref[sdk.ts.runtime.zero-unsafe]`).
 
 use crate::core::container::{
     build_dmu1_frame_core, build_dnam_container_core, build_reference_container_core,

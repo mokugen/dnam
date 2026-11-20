@@ -1,6 +1,6 @@
 /**
  * `Ed25519` / `X25519` key derivation, signing, SHA-256, HMAC-SHA256, and hex conversion
- * utilities (`ref[sdk.ts.provenance.v2-security]`).
+ * utilities (`ref[sdk.ts.provenance.security-and-drm]`).
  *
  * @module
  */

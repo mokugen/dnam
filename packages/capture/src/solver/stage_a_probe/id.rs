@@ -3,7 +3,7 @@
 //! Stereo FIR + Nested Kautz Residue Fitting, and Channel-Aligned Stage IV Reflection Extraction
 //! (`solver::stage_a::id`).
 //!
-//! Canonical Reference: `docs/specs/training/four_stage_pipeline.md` (`ref[train.pipeline.stage-a-poles]`).
+//! Canonical Reference: `docs/specs/training/webgpu_and_varpro_solver.md` (`ref[train.pipeline.physics-probe]`).
 
 use std::f64::consts::TAU;
 
@@ -186,7 +186,7 @@ fn run_steiglitz_mcbride_arma(
 }
 
 /// Runs dual-rate (`48 kHz` broadband + `6 kHz` `8x`-decimated LF) prefiltered Steiglitz–McBride
-/// rational pole identification AND measures nonlinear distortion variance (`r[train.pipeline.stage-a-poles]`).
+/// rational pole identification AND measures nonlinear distortion variance (`r[train.pipeline.physics-probe]`).
 pub(crate) fn identify_steiglitz_mcbride_and_linearity(
     dry_lr: &[[f32; 2]],
     wet_lr: &[[f32; 2]],
@@ -436,7 +436,7 @@ pub(crate) fn identify_steiglitz_mcbride_and_linearity(
 }
 
 /// Estimates the causal `64`-tap (`1.33 ms` at `48 kHz`) stereo Early FIR impulse response via
-/// regularized autocorrelation/cross-correlation Cholesky (`r[train.pipeline.stage-a-poles]`).
+/// regularized autocorrelation/cross-correlation Cholesky (`r[train.pipeline.physics-probe]`).
 pub(crate) fn solve_early_fir_64_stereo(
     dry_lr: &[[f32; 2]],
     wet_lr: &[[f32; 2]],

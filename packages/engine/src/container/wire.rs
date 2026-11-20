@@ -7,7 +7,7 @@
 //!   `ref[container.dnam.preamble-directory]`, `ref[container.dnam.open-layout]`
 //! - `ref[container.dnam.mutable-frame]`, `ref[container.dnam.mutable-json]`
 //! - `ref[container.dnam.tier-prefix]`, `ref[container.dnam.delay-histories]`,
-//!   `ref[container.dnam.load-validation]`, `ref[container.dnam.stage3-slices]`,
+//!   `ref[container.dnam.load-validation]`, `ref[container.dnam.cabinet-slices]`,
 //!   `ref[container.dnam.cp1-profile]`, `ref[container.dnam.conditional-rules]`
 //! - `ref[container.dnam.metadata-ui-hints]`, `ref[container.dnam.sample-rate-anchor]`,
 //!   `ref[container.dnam.jcs-header-schema]`, `ref[container.dnam.security-crossref]`

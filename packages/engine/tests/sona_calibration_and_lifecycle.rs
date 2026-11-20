@@ -293,7 +293,7 @@ fn test_engine_constructors_calibration_roles_and_tempo_sync() {
 }
 
 /// verify[arch.isomorphism.guarantees]
-/// verify[arch.isomorphism.stage2-serialization]
+/// verify[arch.isomorphism.sona-serialization]
 /// verify[arch.isomorphism.stereo-preservation]
 /// verify[arch.isomorphism.nested-bus]
 /// verify[arch.refinements.summary]

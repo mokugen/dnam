@@ -15,6 +15,7 @@ import {
   collectSourceRefTokens,
   collectSpecRules,
   collectTestVerifyTokens,
+  computeRustCfgTestLineMask,
   DOCS_DIR,
   HEADING_RE,
   isGuardrailFile,
@@ -35,6 +36,8 @@ import {
   type SpecScopeRuleEntry,
   stripCode,
   stripFencedCodeBlocks,
+  stripRustCommentsAndStrings,
+  stripRustCommentsOnly,
   TESTS_DIR,
   VALID_RULE_ID_RE,
   walkFilesByExtensions,
@@ -49,15 +52,7 @@ interface AdrRegistryMaps {
 }
 
 function validateAdrFrontmatterFile(adrPath: string, maps: AdrRegistryMaps): void {
-  const requiredKeys = [
-    "id",
-    "title",
-    "status",
-    "supersedes",
-    "superseded_by",
-    "specs",
-    "requirements",
-  ];
+  const requiredKeys = "id title status supersedes superseded_by specs requirements".split(" ");
   const fm = parseFrontmatter(fs.readFileSync(adrPath, "utf8"));
   expect(fm, `${relPath(adrPath)} is missing YAML frontmatter`).not.toBeNull();
   if (!fm) return;
@@ -99,6 +94,107 @@ function verifySupersededAdrsNotCited(
         cleanBody.includes(supId) || (supFilename !== "" && rawText.includes(supFilename)),
         `${relPath(docFile)} cites superseded ${supId} (${supFilename})`,
       ).toBe(false);
+    }
+  }
+}
+
+const STANDALONE_SPEC_RULE_LINE_RE = /^\s*`r\[[a-z0-9.-]+\]`\s*$/;
+const LEGACY_SPEC_STAGE_RE =
+  /\b(?:Stage\s*(?:0|I{1,3}|IV|[0-4]|[A-E])(?:[–-](?:IV|[0-4]|[A-E]))?|Stages\s*(?:0|I{1,3}|IV|[0-4]|[A-E])[–-](?:IV|[0-4]|[A-E])|Step[-\s]?0|Four-Stage|Five-Stage|Gate\s+0b|Refinement\s+\d+)\b/i;
+const RETIRED_SPEC_TOKEN_RE =
+  /\b(?:rate_1x_cal|V3_META_[A-Z0-9_]+|V3_TANK_[A-Z0-9_]+|stage2_gru|V3PostStageConditioner|Stage[0-4][A-Za-z0-9_]*|stage[0-4]_[A-Za-z0-9_]*|s[0-4]_[a-z0-9_]*|eval_stage[0-4]_[A-Za-z0-9_]*|STAGE[0-4]_[A-Z0-9_]+|PIPE_FLAG_STAGE[0-4]_[A-Z0-9_]+|HB_STAGE[12]_TAPS|V3Stage[0-9A-Za-z_]*|Op[MNT]Backend|fir_rev_history|specialty\.rs|src\/stages\b|DNAM-GRAM-INPUT-v2|Windowed-BPTT|Live16Tap|IntegerDelayOnly)\b/;
+const SPEC_CHAIN_ID_RE = /\bChain-\d+\b/;
+const CHAIN_SPEC_ALLOWED_REL = "docs/specs/training/webgpu_and_varpro_solver.md";
+
+function collectSpecHeadingHierarchyViolations(
+  rel: string,
+  clean: string,
+  violations: string[],
+): void {
+  const headings = Array.from(clean.matchAll(HEADING_RE));
+  if (headings.length === 0) {
+    violations.push(`${rel}: spec has no Markdown headings`);
+    return;
+  }
+  let prevLevel = 0;
+  for (let idx = 0; idx < headings.length; idx++) {
+    const match = headings[idx];
+    if (!match) continue;
+    const level = (match[1] ?? "").length;
+    const title = (match[2] ?? "").trim();
+    const lineNo = clean.slice(0, match.index ?? 0).split("\n").length;
+    if (idx === 0) {
+      if (level !== 1) {
+        violations.push(`${rel}:${lineNo}: first heading must be H1 '#', found H${level}`);
+      }
+      prevLevel = level;
+      continue;
+    }
+    if (level === 1) {
+      violations.push(`${rel}:${lineNo}: duplicate H1 '#' heading '${title}'`);
+    } else if (idx === 1 && level !== 2) {
+      violations.push(
+        `${rel}:${lineNo}: first section heading after H1 must be H2 '##', found H${level}`,
+      );
+    } else if (level >= 5) {
+      violations.push(`${rel}:${lineNo}: H${level} heading '${title}' exceeds H4 ceiling`);
+    } else if (level > prevLevel + 1) {
+      violations.push(
+        `${rel}:${lineNo}: skipped heading level H${prevLevel} -> H${level} '${title}'`,
+      );
+    }
+    prevLevel = level;
+  }
+}
+
+function collectNonSpecDocCleanlinessViolations(filePath: string, violations: string[]): void {
+  const rel = relPath(filePath);
+  const rawLines = fs.readFileSync(filePath, "utf8").split("\n");
+  for (let idx = 0; idx < rawLines.length; idx++) {
+    const rawLine = rawLines[idx] ?? "";
+    const stageMatch = LEGACY_SPEC_STAGE_RE.exec(rawLine);
+    if (stageMatch) {
+      violations.push(`${rel}:${idx + 1}: legacy stage label '${stageMatch[0]}'`);
+    }
+    const retiredMatch = RETIRED_SPEC_TOKEN_RE.exec(rawLine);
+    if (retiredMatch) {
+      violations.push(`${rel}:${idx + 1}: retired token '${retiredMatch[0]}'`);
+    }
+  }
+}
+
+function collectSpecCleanlinessViolations(specPath: string, violations: string[]): void {
+  const rel = relPath(specPath);
+  const rawText = fs.readFileSync(specPath, "utf8");
+  const clean = stripFencedCodeBlocks(rawText);
+  collectSpecHeadingHierarchyViolations(rel, clean, violations);
+
+  const cleanLines = clean.split("\n");
+  for (let idx = 0; idx < cleanLines.length; idx++) {
+    const line = cleanLines[idx] ?? "";
+    if (line.match(SPEC_RULE_DEF_RE) !== null && !STANDALONE_SPEC_RULE_LINE_RE.test(line)) {
+      violations.push(`${rel}:${idx + 1}: r[...] definition must stand alone on its own line`);
+    }
+  }
+
+  const rawLines = rawText.split("\n");
+  for (let idx = 0; idx < rawLines.length; idx++) {
+    const rawLine = rawLines[idx] ?? "";
+    const stageMatch = LEGACY_SPEC_STAGE_RE.exec(rawLine);
+    if (stageMatch) {
+      violations.push(`${rel}:${idx + 1}: legacy stage label '${stageMatch[0]}'`);
+    }
+    const retiredMatch = RETIRED_SPEC_TOKEN_RE.exec(rawLine);
+    if (retiredMatch) {
+      violations.push(`${rel}:${idx + 1}: retired token '${retiredMatch[0]}'`);
+    }
+    if (rel !== CHAIN_SPEC_ALLOWED_REL) {
+      const chainMatch = SPEC_CHAIN_ID_RE.exec(rawLine);
+      if (chainMatch) {
+        violations.push(
+          `${rel}:${idx + 1}: fixture ID '${chainMatch[0]}' belongs only in ${CHAIN_SPEC_ALLOWED_REL}`,
+        );
+      }
     }
   }
 }
@@ -233,7 +329,6 @@ function collectDocToTestLinks(): string[] {
   const links: string[] = [];
   for (const mdPath of walkMarkdownFiles(DOCS_DIR)) {
     const rel = relPath(mdPath);
-    if (rel === "docs/specs/architecture/project_and_documentation_quality.md") continue;
     if (!mdPath.startsWith(SPECS_DIR) && !mdPath.startsWith(ADR_DIR) && mdPath !== REQ_FILE) {
       continue;
     }
@@ -255,6 +350,67 @@ function collectDocToTestLinks(): string[] {
   return links;
 }
 
+function isStandaloneTestSourcePath(rel: string): boolean {
+  const norm = rel.split(path.sep).join("/");
+  return (
+    /(?:^|\/)tests\//.test(norm) ||
+    /\.(?:test|spec)\.tsx?$/.test(norm) ||
+    /(?:^|\/)(?:test_support|test_utils|testing)\.(?:rs|ts)$/.test(norm)
+  );
+}
+
+function checkRustCfgTestSpecParse(
+  rel: string,
+  src: string,
+  patterns: readonly RegExp[],
+  violations: string[],
+): void {
+  const braceLines = stripRustCommentsAndStrings(src).split("\n");
+  const codeLines = stripRustCommentsOnly(src).split("\n");
+  const cfgMask = computeRustCfgTestLineMask(braceLines);
+  const rawLines = src.split("\n");
+  for (let idx = 0; idx < codeLines.length; idx++) {
+    if (!cfgMask[idx]) continue;
+    const codeLine = codeLines[idx] ?? "";
+    if (patterns.some((pat) => pat.test(codeLine))) {
+      violations.push(`${rel}:${idx + 1}: ${(rawLines[idx] ?? "").trim()}`);
+    }
+  }
+}
+
+function scanStandaloneTsTestFile(
+  rel: string,
+  src: string,
+  patterns: readonly RegExp[],
+  violations: string[],
+): void {
+  const lines = src.split("\n");
+  lines.forEach((line, idx) => {
+    const trimmed = line.trim();
+    if (trimmed.startsWith("//") || trimmed.startsWith("*") || trimmed.startsWith("/*")) {
+      return;
+    }
+    if (patterns.some((pat) => pat.test(line))) {
+      violations.push(`${rel}:${idx + 1}: ${trimmed}`);
+    }
+  });
+}
+
+function scanStandaloneRsTestFile(
+  rel: string,
+  src: string,
+  patterns: readonly RegExp[],
+  violations: string[],
+): void {
+  const rawLines = src.split("\n");
+  const codeLines = stripRustCommentsOnly(src).split("\n");
+  codeLines.forEach((codeLine, idx) => {
+    if (patterns.some((pat) => pat.test(codeLine))) {
+      violations.push(`${rel}:${idx + 1}: ${(rawLines[idx] ?? "").trim()}`);
+    }
+  });
+}
+
 function collectSpecTextParseViolations(): string[] {
   const patterns = [
     new RegExp(`${"docs/specs"}/`),
@@ -265,22 +421,19 @@ function collectSpecTextParseViolations(): string[] {
   for (const root of [TESTS_DIR, PACKAGES_DIR]) {
     for (const filePath of walkFilesByExtensions(root, new Set([".rs", ".ts", ".tsx"]))) {
       const rel = relPath(filePath);
-      if (isGuardrailFile(filePath) || !rel.includes("test")) continue;
-      const lines = fs.readFileSync(filePath, "utf8").split("\n");
-      lines.forEach((line, idx) => {
-        const trimmed = line.trim();
-        if (
-          trimmed.startsWith("#") ||
-          trimmed.startsWith("//") ||
-          trimmed.startsWith("*") ||
-          trimmed.startsWith("/*")
-        ) {
-          return;
+      if (isGuardrailFile(filePath)) continue;
+      const src = fs.readFileSync(filePath, "utf8");
+      if (!isStandaloneTestSourcePath(rel)) {
+        if (filePath.endsWith(".rs")) {
+          checkRustCfgTestSpecParse(rel, src, patterns, violations);
         }
-        if (patterns.some((pat) => pat.test(line))) {
-          violations.push(`${rel}:${idx + 1}: ${trimmed}`);
-        }
-      });
+        continue;
+      }
+      if (filePath.endsWith(".rs")) {
+        scanStandaloneRsTestFile(rel, src, patterns, violations);
+      } else {
+        scanStandaloneTsTestFile(rel, src, patterns, violations);
+      }
     }
   }
   return violations;
@@ -329,6 +482,69 @@ function collectSpecCitationSets(supersededAdrs: ReadonlySet<string>): {
     for (const m of text.matchAll(ADR_TOKEN_RE)) specCitedAdrs.add(m[0]);
   }
   return { specCitedReqs, specCitedAdrs, specFileSet };
+}
+
+const RUST_INTERNAL_SYM_ALT = [
+  "SonaHotSlab|SonaInstance|DnamEngine|DynamicDnamEngine|DnamHostHandle|KernelVec4|SimdVec4",
+  "GpuVec4|StereoVec8|WasmSimd128Backend|WasmSimd128TrainerBackend|DnamJsonHeader",
+  "DnamProjManifest|hoist_groups_and_readouts|process_tick16_const|step_frame_sona",
+  "step_frame_4x_sona|step_frame_4port_sona|step_frame_4x_4port_sona|step_control_tick_3khz",
+  "strip_container_to_tier|rcp_pos_quad_nr2|f32x4_to_fp16x4|fp16x4_to_f32x4|flush_subnormal",
+].join("|");
+const RUST_ATTR_RE_SRC = [
+  "#\\s*!?\\s*\\[(?:forbid|deny|allow|warn|expect|cfg|cfg_attr|repr|derive",
+  "|inline|must_use|unsafe|napi|path|no_std)\\b",
+].join("");
+const NON_SDK_SPEC_FORBIDDEN_RE = new RegExp(
+  [
+    "\\b(?:packages|tools|scripts)/",
+    "(?:\\.\\./)+tests/|\\btests/(?:[A-Za-z0-9_*.-]+\\.(?:rs|ts|tsx|mjs|js))\\b",
+    "\\btests/(?:integration|profile|e2e|setup|\\*)|`tests/",
+    "\\.agents/|(?:\\b[A-Za-z0-9_-]+|\\*)\\.(?:rs|ts|tsx|mjs|cjs|toml)\\b",
+    "\\b(?:package\\.json|tsconfig\\.json|biome\\.json|moon\\.yml|Cargo\\.lock)\\b",
+    RUST_ATTR_RE_SRC,
+    "\\b(?:proptest|macro_rules|include_str|include_bytes)!",
+    "\\b(?:Result<|Vec<|Box<|Arc<|BTreeMap|BTreeSet|HashMap|HashSet|AtomicU64|AtomicUsize)\\b",
+    "\\b(?:Float32Array|Float64Array|Uint8Array|Int32Array|SharedArrayBuffer)\\b",
+    "\\b(?:dnam-kernels|dnam_kernels|dnam-engine|dnam_engine|dnam-capture|dnam_capture)\\b",
+    "\\b(?:dnam-fixtures|dnam_fixtures|dnam-js|dnam_js|dnam-studio|dnam_studio|dnam-ui)\\b",
+    "@dnam-project/[a-z-]+\\b|\\b(?:Rust|TypeScript|JavaScript|Biome|Vitest|Playwright|N-API)\\b",
+    "\\b(?:AudioWorklet|Cargo|rustc|rustfmt|clippy|fast-check|zerocopy|serde|serde_json)\\b",
+    "\\b(?:cargo-gpu|rlib|dnam\\.wasm)\\b|\\b[A-Z][A-Za-z0-9_]*Wire\\b",
+    `\\b(?:${RUST_INTERNAL_SYM_ALT}|FtzDazGuard|TelemetryReader|ControlConsumer)\\b`,
+    "\\b(?:FromBytes|IntoBytes|KnownLayout|from_le_bytes|to_le_bytes)\\b|`(?:Immutable|Unaligned)`",
+    "\\b(?:r|ref|verify)\\[sdk\\.|\\b(?:rust_sdk|typescript_sdk)\\.md\\b",
+  ].join("|"),
+);
+const TS_SDK_RUST_FORBIDDEN_RE = new RegExp(
+  [
+    "(?:\\b[A-Za-z0-9_-]+|\\*)\\.rs\\b|\\[profile\\.[a-z]+\\]|\\bCargo\\.(?:toml|lock)\\b",
+    "\\bpackages/(?:engine|kernels|capture|fixtures)\\b|\\bpackages/(?:js|studio)/rust\\b",
+    "\\btools/sona-shaders\\b",
+    RUST_ATTR_RE_SRC,
+    "\\b(?:dnam-kernels|dnam_kernels|dnam-engine|dnam_engine|dnam-capture|dnam_capture)\\b",
+    "\\b(?:dnam-fixtures|dnam_fixtures|dnam-js|dnam_js|serde|serde_json|zerocopy|rustc)\\b",
+    `\\b(?:cargo-gpu|proptest!|macro_rules!|ControlBus|${RUST_INTERNAL_SYM_ALT})\\b`,
+  ].join("|"),
+);
+const RUST_PATH_COLON_RE = /\b[A-Za-z_][A-Za-z0-9_]*::[A-Za-z_]/;
+
+function collectSpecLanguageLeaks(
+  specPath: string,
+  forbiddenRe: RegExp,
+  isTsSdk: boolean,
+  violations: string[],
+): void {
+  const rel = relPath(specPath);
+  const lines = fs.readFileSync(specPath, "utf8").split("\n");
+  for (let idx = 0; idx < lines.length; idx++) {
+    let cleaned = (lines[idx] ?? "").replace(/(?:https?|mailto):\S+/g, "");
+    cleaned = isTsSdk
+      ? cleaned.replace(/\bref\[sdk\.rust\.[a-z0-9.-]+\]/g, "")
+      : cleaned.replace(/\b(?:r|ref|verify)\[(?!sdk\.)[a-z0-9.-]+\]/g, "");
+    const hit = forbiddenRe.exec(cleaned) ?? RUST_PATH_COLON_RE.exec(cleaned);
+    if (hit) violations.push(`${rel}:${idx + 1}: forbidden token '${hit[0]}'`);
+  }
 }
 
 function checkEngineScopeEntry(
@@ -387,18 +603,19 @@ describe("DNAM Documentation Registry, Rules, ADRs & Traceability Guardrails", (
   });
 
   it("test_all_spec_files_have_valid_yaml_frontmatter", () => {
-    const requiredKeys = [
-      "id",
-      "title",
-      "status",
-      "version",
-      "domain",
-      "rule_prefixes",
-      "requirements",
-      "adrs",
-    ];
+    const requiredKeys = "id title status version domain rule_prefixes requirements adrs".split(
+      " ",
+    );
     const specFiles = walkMarkdownFiles(SPECS_DIR);
-    expect(specFiles.length).toBe(17);
+    expect(specFiles.length).toBe(18);
+
+    const validAdrIds = new Set(
+      fs
+        .readdirSync(ADR_DIR)
+        .filter((n) => n.endsWith(".md") && n !== "README.md")
+        .map((n) => parseFrontmatter(fs.readFileSync(path.join(ADR_DIR, n), "utf8"))?.["id"])
+        .filter((id): id is string => typeof id === "string"),
+    );
 
     const seenSpecIds = new Map<string, string>();
     for (const specPath of specFiles) {
@@ -420,6 +637,13 @@ describe("DNAM Documentation Registry, Rules, ADRs & Traceability Guardrails", (
       expect(Array.isArray(fm["rule_prefixes"])).toBe(true);
       expect(Array.isArray(fm["requirements"])).toBe(true);
       expect(Array.isArray(fm["adrs"])).toBe(true);
+      if (Array.isArray(fm["adrs"])) {
+        for (const adrRef of fm["adrs"]) {
+          expect(validAdrIds.has(adrRef), `${relPath(specPath)} cites unknown ${adrRef}`).toBe(
+            true,
+          );
+        }
+      }
     }
   });
 
@@ -461,18 +685,10 @@ describe("DNAM Documentation Registry, Rules, ADRs & Traceability Guardrails", (
     expect(reqIds.length).toBe(41);
     expect(reqIds.length).toBe(new Set(reqIds).size);
 
-    const expectedCounts: Record<number, number> = {
-      1: 9,
-      2: 5,
-      3: 3,
-      4: 3,
-      5: 6,
-      6: 3,
-      7: 4,
-      8: 8,
-    };
-    for (const [goalStr, count] of Object.entries(expectedCounts)) {
-      for (let sub = 1; sub <= count; sub++) expect(reqIds).toContain(`REQ-${goalStr}.${sub}`);
+    const expectedCounts = [9, 5, 3, 3, 6, 3, 4, 8];
+    for (let g = 0; g < expectedCounts.length; g++) {
+      const count = expectedCounts[g] ?? 0;
+      for (let sub = 1; sub <= count; sub++) expect(reqIds).toContain(`REQ-${g + 1}.${sub}`);
     }
 
     for (const specPath of walkMarkdownFiles(SPECS_DIR)) {
@@ -487,30 +703,15 @@ describe("DNAM Documentation Registry, Rules, ADRs & Traceability Guardrails", (
     }
 
     const proseOnly = stripFencedCodeBlocks(text).replace(/\]\([^)]+\)/g, "]()");
-    for (const field of [
-      "max_supported_tier",
-      "user_metadata",
-      "royalty_splits",
-      "allowed_protection_profiles",
-      "allowed_oem_vendors",
-      "output head",
-      "output-head",
-      "SIMD lane",
-      "Hann-windowed",
-      "JSON header",
-      ".dnam",
-      ".dnam-proj",
-      ".dnam-ckpt",
-      ".dnam-cache",
-      ".dnam-seal",
-      ".dnce",
-      "mono_only",
-      "CL-0",
-      "CL-1",
-      "CL-2",
-    ]) {
-      expect(proseOnly).not.toContain(field);
-    }
+    const forbiddenReqTokens = [
+      "max_supported_tier|user_metadata|royalty_splits|allowed_protection_profiles",
+      "allowed_oem_vendors|output head|output-head|SIMD lane|Hann-windowed|JSON header",
+      ".dnam|.dnam-proj|.dnam-ckpt|.dnam-cache|.dnam-seal|.dnce|mono_only|CL-0|CL-1|CL-2",
+      "WebGPU|IEEE-754|float64|f32|f64|fp16|i32|u32|0-ULP|48 kHz MACs|../specs/",
+    ]
+      .join("|")
+      .split("|");
+    for (const field of forbiddenReqTokens) expect(proseOnly).not.toContain(field);
   });
 
   it("test_layer_separation_no_adr_narratives_in_canonical_specs", () => {
@@ -565,6 +766,22 @@ describe("DNAM Documentation Registry, Rules, ADRs & Traceability Guardrails", (
     ).toEqual([]);
 
     expect(collectSpecTextParseViolations()).toEqual([]);
+  });
+
+  it("test_specs_have_monotonic_headings_standalone_rules_and_zero_legacy_stage_tokens", () => {
+    const violations: string[] = [];
+    for (const specPath of walkMarkdownFiles(SPECS_DIR)) {
+      collectSpecCleanlinessViolations(specPath, violations);
+    }
+    for (const docPath of [
+      REQ_FILE,
+      path.join(REPO_ROOT, "README.md"),
+      path.join(DOCS_DIR, "index.md"),
+      path.join(PACKAGES_DIR, "kernels", "README.md"),
+    ]) {
+      collectNonSpecDocCleanlinessViolations(docPath, violations);
+    }
+    expect(violations).toEqual([]);
   });
 
   it("test_spec_rules_verified_in_tests", () => {
@@ -642,5 +859,19 @@ describe("DNAM Documentation Registry, Rules, ADRs & Traceability Guardrails", (
       .filter(([, st]) => st === "accepted")
       .map(([aid]) => aid);
     expect(accepted.filter((a) => !specCitedAdrs.has(a)).sort()).toEqual([]);
+  });
+
+  it("test_non_sdk_specs_are_language_and_implementation_independent", () => {
+    const nonSdkSpecs = walkMarkdownFiles(SPECS_DIR).filter(
+      (p) => !relPath(p).split(path.sep).join("/").startsWith("docs/specs/sdks/"),
+    );
+    expect(nonSdkSpecs.length).toBe(16);
+    const violations: string[] = [];
+    for (const specPath of nonSdkSpecs) {
+      collectSpecLanguageLeaks(specPath, NON_SDK_SPEC_FORBIDDEN_RE, false, violations);
+    }
+    const tsSdkSpec = path.join(SPECS_DIR, "sdks", "typescript_sdk.md");
+    collectSpecLanguageLeaks(tsSdkSpec, TS_SDK_RUST_FORBIDDEN_RE, true, violations);
+    expect(violations).toEqual([]);
   });
 });

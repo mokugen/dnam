@@ -498,7 +498,7 @@ fn test_mode0_shortcut_wdw_binary_flag_and_b_head_guards() {
 
 #[test]
 fn test_strided_bezout_gram_inner_product_consistency() {
-    // verify[train.pipeline.stage-c-schur]
+    // verify[train.pipeline.nested-varpro-schur]
     // Strided 12,000-sample skewed-amplitude stem (`gram_frame_stride = 4`):
     // `packed_gram_256` and `STAT` diagonal must stay finite and PSD across stride phases.
     for phase_hit in [true, false] {
@@ -563,7 +563,7 @@ fn test_strided_bezout_gram_inner_product_consistency() {
 
 #[test]
 fn test_48k_window_lifting_selects_broadband_segment() {
-    // verify[train.pipeline.stage-a-poles]
+    // verify[train.pipeline.physics-probe]
     use dnam_capture::stimulus::waveforms::{
         deterministic_seed_256, synthesize_a5_musical_transient_coreset,
     };
@@ -690,9 +690,9 @@ fn assert_steep_lti_filter_besr(label: &str, dry: &[[f32; 2]], wet: &[[f32; 2]])
 
 #[test]
 fn test_silent_muted_target_besr_safety() {
-    // verify[train.pipeline.stage-a-poles]
-    // verify[train.pipeline.stage-c-schur]
-    // verify[train.pipeline.stage-e-pack]
+    // verify[train.pipeline.physics-probe]
+    // verify[train.pipeline.nested-varpro-schur]
+    // verify[train.pipeline.host-parity-and-export]
     let (_, dry) = synthesize_coreset_dry();
     let zero_wet = vec![[0.0_f32; 2]; 12_000];
     let mut man0 = DnamProjManifest::default_reference();

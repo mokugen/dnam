@@ -1,5 +1,5 @@
 //! Model-declared delay histories and Stage III 64B-aligned tier slice validation
-//! (`ref[container.dnam.delay-histories]`, `ref[container.dnam.stage3-slices]`).
+//! (`ref[container.dnam.delay-histories]`, `ref[container.dnam.cabinet-slices]`).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::{String, ToString};
@@ -260,7 +260,7 @@ pub fn validate_delay_histories(
 /// Validates that a Stage III early FIR slice (`[256, 128, 384, 256] B` across `Lite..Ultra`) and
 /// Kautz modal slice (`[2, 1, 3, 2]` `128 B` blocks = `[256, 128, 384, 256] B` in `v3.0`) are
 /// 64-byte aligned, non-overlapping, within their tier bounds, and contain only finite `f32`
-/// values (`ref[container.dnam.stage3-slices]`, `ref[container.dnam.load-validation]`).
+/// values (`ref[container.dnam.cabinet-slices]`, `ref[container.dnam.load-validation]`).
 pub fn validate_stage3_tier_slices(
     tier_index: u8,
     tier_bytes: &[u8],

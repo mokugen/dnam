@@ -29,17 +29,21 @@ adrs:
   - ADR-0022
 ---
 
-# TypeScript SDK (`@dnam-project/dnam`): Idiomatic TypeScript 7 Interface, Dual-Target `N-API v10` + `WASM SIMD128` Runtime, WebGPU Trainer & WebAudio Contract
+# TypeScript SDK (`@dnam-project/dnam`): Idiomatic TypeScript 7 Interface, Dual-Target N-API v10 + WASM SIMD128 Runtime, WebGPU Trainer & WebAudio Contract
 
-This specification defines the normative architecture, feature-module organization, idiomatic TypeScript 7 API semantics, dual-target `N-API v10` + WebAssembly `SIMD128` runtime invariants, browser `navigator.gpu` WebGPU trainer driver, WebAudio `AudioWorklet` bridge, and Rust behavioral parity contracts for **`@dnam-project/dnam`** ([`packages/js/`](../../../packages/js/README.md)), wrapping `packages/kernels/` and `packages/engine/` (`SONA` `v3.0`, [`../architecture/sona_architecture.md`](../architecture/sona_architecture.md)). For the design rationale, see [`../../adr/0013-typescript-sdk-architecture-and-dual-target-runtime.md`](../../adr/0013-typescript-sdk-architecture-and-dual-target-runtime.md), [`../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md`](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md), and [`../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md).
+This specification defines the normative architecture, feature-module layout, TypeScript 7 typing and Biome hygiene rules, dual-target N-API v10 plus WebAssembly SIMD128 runtime invariants, planned browser WebGPU trainer driver, WebAudio `AudioWorklet` bridge, and native behavioral parity contracts for `@dnam-project/dnam` ([JavaScript SDK README](../../../packages/js/README.md)).
+
+The TypeScript SDK consumes the native runtime engine and shared mathematical kernels defined in the [Rust Implementation Specification](rust_sdk.md) for SONA v3.0 ([SONA architecture](../architecture/sona_architecture.md)). Design rationales and concurrency trade-offs appear in [`ADR-0013`](../../adr/0013-typescript-sdk-architecture-and-dual-target-runtime.md), [`ADR-0015`](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md), and [`ADR-0022`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md).
 
 ---
 
 ## 1. Feature-Oriented Package Organization & Maintainability Contract
 
-### 1.1 Feature Module Layout & Rust Core Separation
+### 1.1 Feature Module Layout, Native Core Separation & Test Colocation
 
 `r[sdk.ts.layout.feature-modules]`
+
+The TypeScript SDK is published as `@dnam-project/dnam` from `packages/js/` and organizes its source code into kebab-case feature directories paired with a unified dual-target native binding layer ([Rust Implementation Specification](rust_sdk.md)):
 
 ```mermaid
 flowchart LR
@@ -47,19 +51,19 @@ flowchart LR
         Top["index / node / browser: Model, GramMatrix, Engine, Parameter, DnamError"]
         Mod["model/: Model, GramMatrix"]
         Eng["engine/: Engine, process, render, stream, bypass/freeze scopes"]
-        Par["parameters/ & tempo/: Parameter, clampParameters, Tempo, Subdivisions"]
-        Sch["schema/: Pure TS Interfaces, v3.0 sona camelCase Codec, Native Rust serde + JCS"]
+        Par["parameters/ & tempo/: Parameter, ControlSpace, clampParameters, Tempo, Subdivisions"]
+        Sch["schema/: Pure TS Interfaces, v3.0 sona camelCase Codec, Native Schema + JCS"]
         Prov["provenance/: verify, sign, seal/unseal, dau1, preview, watermark"]
-        Dsp["dsp/: SONA Reference Kernels (transport, modal, tpt-svf, paralu, polyadaa, control-bus, mixing)"]
+        Dsp["dsp/: SONA Reference Kernels (transport, modal, tpt-svf, paralru, polyadaa, control-bus, mixing)"]
         Web["web-audio/: DnamAudioNode, AudioWorkletProcessor, SAB + Atomics"]
-        Gpu["trainer/: Browser navigator.gpu .wgsl Driver (<= 128 MiB, < 256 MiB) + WasmSimd128 Fallback"]
+        Gpu["trainer/ (Planned M6): Browser navigator.gpu .wgsl Driver (<= 128 MiB, < 256 MiB) + WasmSimd128 Fallback"]
         Int["internal/native/: NativeDriver, NapiDriver, WasmDriver (Private)"]
     end
 
-    subgraph RustCrate ["dnam-js Dual-Target Rust Crate (packages/js/rust/)"]
-        RCore["core.rs + core/* -> DnamHostHandle, dnam-engine & dnam-capture"]
-        RNapi["napi.rs -> Node.js 26 N-API v10 Zero-Copy Addon"]
-        RWasm["wasm.rs -> Raw extern C WASM SIMD128 Linear-Memory ABI"]
+    subgraph NativeRuntime ["Dual-Target Native Binding Layer (rust_sdk.md)"]
+        RNapi["Host Addon Adapter -> Node.js 26 N-API v10 Zero-Copy Bridge"]
+        RWasm["WebAssembly Adapter -> Raw C-ABI SIMD128 Linear-Memory Bridge"]
+        RCore["Target-Agnostic Native Engine & Capture Runtime"]
     end
 
     Top --> Mod & Eng & Par
@@ -68,24 +72,68 @@ flowchart LR
     RNapi & RWasm --> RCore
 ```
 
-1. **Package Name, Hierarchical Feature Submodules & Zero-Barrel Concrete Imports (`ref[repo.code.modular-decomposition-and-tests]`):** The TypeScript SDK is published as `@dnam-project/dnam` (`packages/js/`) and organized into kebab-case feature directories under `src/`: `model/`, `engine/`, `parameters/`, `tempo/`, `schema/`, `provenance/`, `dsp/`, `web-audio/`, `trainer/`, and private `internal/`. Route **all** intra-package and test imports directly to concrete leaf modules with explicit ESM `.js` extensions (`../schema/header.js`, `../model/preamble.js`, `../engine/engine.js`) with **zero non-exported internal barrel `index.ts` files** (`model/`, `engine/`, `trainer/`, `internal/native/{napi,wasm}/`), and decompose large drivers (`src/internal/native/napi.ts` + `napi/*.ts`, `src/internal/native/wasm.ts` + `wasm/*.ts`) and domain modules into hierarchical child submodules (`< 900` LOC ceiling), co-locating unit/`fast-check` tests (`*.test.ts`, `*.browser.test.ts`) beside source modules and cross-domain suites in `tests/integration/`.
-2. **Modern Rust 2018+ Module Layout:** `packages/js/rust/` uses the `foo.rs` + `foo/bar.rs` module layout with zero `mod.rs` files (`ref[repo.docs.spec-rules-and-adrs]`), separating target-agnostic engine logic (`rust/core.rs` + `rust/core/*`) from the thin `cfg(not(target_arch = "wasm32"))` N-API v10 adapter (`rust/napi.rs` + `rust/napi/*`) and `cfg(target_arch = "wasm32")` raw `extern "C"` WASM adapter (`rust/wasm.rs` + `rust/wasm/*`).
-3. **Private Native Seam:** `src/internal/` is strictly internal; neither `NativeDriver` nor any raw N-API/WASM handle symbol may be exported from any public subpath.
+Implemented TypeScript domains under `packages/js/src/` cover container loading in `model/`, inference in `engine/`, parameter clamping in `parameters/`, tempo math in `tempo/`, and JSON schemas in `schema/`.
 
-### 1.2 Curated Subpath Exports & Static Typing (`TypeScript 7` Strict)
+Supporting domains provide provenance workflows in `provenance/`, DSP kernels in `dsp/`, Worklet bindings in `web-audio/`, and private driver plumbing in `internal/`. The `trainer/` directory is a planned M6 internal module for browser `navigator.gpu` WebGPU training rather than a shipped public subpath.
+
+All intra-package and test imports route directly to concrete leaf modules with explicit ESM `.js` extensions (`../schema/header.js`, `../model/preamble.js`, `../engine/engine.js`).
+
+Non-exported internal folders (`model/`, `engine/`, `internal/native/{napi,wasm}/`, and planned M6 `trainer/`) forbid `index.ts` barrels.
+
+Large drivers and domain modules across TypeScript packages decompose hierarchically under a 900-line ceiling (`ref[repo.code.modular-decomposition-and-tests]`), adhering to the 4-tier TypeScript testing layout below while native bindings follow the [Rust Implementation Specification](rust_sdk.md) (`ref[sdk.rust.modular-layout-and-proptest]`, `ref[sdk.rust.safe-rust-and-boundaries]`):
+
+| Test Tier | TypeScript / React Location | Verification Scope & Prohibited Anti-Patterns |
+| :--- | :--- | :--- |
+| **Tier 1 (Leaf Unit & Property)** | Adjacent `<leaf>.test.ts(x)` and `<leaf>.browser.test.ts(x)` beside source files | Uses `fast-check` property suites, ARIA/accessibility checks, and React Cosmos `<component>.fixture.tsx`; forbids `src/**/__tests__/`, generic `test(s).ts(x)`, and `src/**/*.spec.ts(x)`. |
+| **Tier 2 (Domain Integration)** | `<domain>.test.ts(x)` inside `src/<domain>/` without internal `index.ts` barrels | Tests collaboration across concrete leaf modules within `<domain>`; shared helpers belong in `test-support.ts`, `test-utils.ts`, `testing.ts`, or `tests/setup.ts`. |
+| **Tier 3 (Package Integration, Profile & E2E)** | `tests/integration/*.test.ts(x)`, `tests/profile/*.test.ts`, `tests/e2e/*.spec.ts` | Covers cross-domain N-API vs WASM parity, profiling, and Playwright E2E; forbids `*coverage*.test.ts(x)` grab-bag files. |
+| **Tier 4 (Workspace Guardrails)** | Top-level workspace guardrail suites | Enforces repository-wide typing, barrel, and modularity invariants (`ref[repo.code.modular-decomposition-and-tests]`). |
+
+The `src/internal/` tree is strictly private. Neither `NativeDriver` nor any raw N-API or WASM handle symbol may be exported from any public subpath.
+
+### 1.2 Curated Subpath Exports, Biome Barrel Bans & Strict TypeScript 7
 
 `r[sdk.ts.layout.curated-exports]`
 
-1. **Explicit Named Subpath Exports Only & Entrypoint-Restricted Re-Exports:** Downstream consumers import exclusively from the declared `package.json` `"exports"` subpath entrypoints (`@dnam-project/dnam`, `/node`, `/browser`, `/parameters`, `/tempo`, `/schema`, `/provenance`, `/dsp`, `/web-audio`, `/web-audio/processor`, `./dnam.wasm`). Biome's `lint/performance/noBarrelFile` and `lint/performance/noReExportAll` forbid wildcard `export *` and `default` exports repository-wide and restrict explicit named re-exports (`export { ... }`) strictly to those declared entrypoint files (`index.ts`, `node.ts`, `browser.ts`, `parameters/index.ts`, `tempo/index.ts`, `schema/index.ts`, `provenance/index.ts`, `dsp/index.ts`, `web-audio/index.ts`).
-2. **TypeScript 7 Strictness & Zero `any`:** The package compiles cleanly under TypeScript `7.0+` with `strict: true`, `noUncheckedIndexedAccess: true`, `exactOptionalPropertyTypes: true`, and `verbatimModuleSyntax: true`, with zero `any` types or non-null assertions (`!`, `ref[repo.code.type-safety-and-imports]`).
+Downstream consumers import exclusively from the 11 subpath entrypoints declared under `"exports"` in `packages/js/package.json`. Planned M6 `trainer/` code is not a public `@dnam-project/dnam/trainer` subpath export; it remains an internal/M6 module unless added explicitly to `"exports"` and guardrail allowlists:
+
+| Public Subpath | Entrypoint / Asset | Primary Exports |
+| :--- | :--- | :--- |
+| `@dnam-project/dnam` | `dist/node.js` / `dist/browser.js` / `dist/index.js` | `Model`, `GramMatrix`, `Engine`, `Parameter`, `ParameterMap`, `ControlSpace`, `clampParameters`, `TempoController`, `DnamError`, `initWasm` |
+| `./node` & `./browser` | `dist/node.js` & `dist/browser.js` | Explicit Node.js N-API v10 and browser WASM SIMD128 runtime entrypoints |
+| `./parameters` | `dist/parameters/index.js` | `Parameter`, `ParameterMap`, `ControlSpace`, `clampParameters`, `defineModelTypes` |
+| `./tempo` | `dist/tempo/index.js` | `TempoController`, `subdivisions`, `computeZoh`, `controlStride`, `subdivisionPhase`, `invertTempoCalibration` |
+| `./schema` | `dist/schema/index.js` | `ModelHeader`, `decodeHeader`, `encodeHeader`, `headerToJcs`, `canonicalJson`, schema interfaces |
+| `./provenance` | `dist/provenance/index.js` | `verify`, `enforcePolicy`, `signCreatorHeader`, `signMarketplaceReceipt`, `seal`, `unseal`, watermark helpers |
+| `./dsp` | `dist/dsp/index.js` | Vectorized SONA reference DSP kernels (`transport`, `modal`, `nonlinear`, `control-bus`, `mixing`) |
+| `./web-audio` & `./web-audio/processor` | `dist/web-audio/index.js` & `dist/web-audio-processor.js` | `DnamAudioNode`, `DnamAudioWorkletProcessor`, `WorkletSharedState`, standalone worklet bundle |
+| `./dnam.wasm` | `dist/wasm/release/dnam.wasm` | Release `wasm32-unknown-unknown` SIMD128 binary |
+
+Biome rules `lint/performance/noBarrelFile` and `lint/performance/noReExportAll` forbid internal `index.ts` barrel files, wildcard `export *`, and `default` exports repository-wide (`ref[repo.code.modular-decomposition-and-tests]`).
+
+Across `packages/js/`, `packages/ui/`, and `packages/studio/`, `@dnam-project/ui` exposes granular subpath exports (`@dnam-project/ui/base/*` and domain subpaths) with zero internal barrels.
+
+Explicit named re-exports (`export { ... }`) are restricted strictly to the declared public `package.json` `"exports"` entrypoints of `@dnam-project/dnam` listed above (`index.ts`, `node.ts`, `browser.ts`, and the six domain entrypoints).
+
+All TypeScript packages compile cleanly under TypeScript 7.0+ with `strict`, `noUncheckedIndexedAccess`, `exactOptionalPropertyTypes`, and `verbatimModuleSyntax` enabled.
+
+Zero `any` types, `@ts-ignore` or `@ts-expect-error` suppressions, or non-null assertions (`!`) are permitted (`ref[repo.code.type-safety-and-imports]`).
 
 ### 1.3 Enforced Layered Dependency Direction & Runtime Isolation
 
 `r[sdk.ts.layout.dependency-direction]`
 
-1. **Acyclic Feature Layering:** Internal imports follow the strict one-way hierarchy:
-   `errors.ts` / `types.ts` $\rightarrow$ `schema/` $\rightarrow$ `internal/` $\rightarrow$ `model/` $\rightarrow$ `parameters/` & `tempo/` $\rightarrow$ `engine/` $\rightarrow$ `web-audio/` & `trainer/`, with `provenance/` depending on `model/` and `dsp/` depending only on `internal/` and `errors.ts`.
-2. **Zero Runtime Dependencies & Browser / `AudioWorkletGlobalScope` Isolation:** `@dnam-project/dnam` has zero runtime npm dependencies (`"dependencies"` is omitted). `src/browser.ts`, `src/internal/native/wasm.ts`, `src/internal/native/wasm/**/*.ts`, `src/schema/**/*.ts`, `src/trainer/**/*.ts`, and `src/web-audio/**/*.ts` must never import `node:*` built-in modules, and `src/web-audio/processor.ts` + `src/web-audio/shared-state.ts` must remain 100% self-contained for `AudioWorkletGlobalScope`.
+Internal imports enforce a strict acyclic feature hierarchy from low-level primitives up to host adapters, rooted at `errors.ts` and `types.ts` into `schema/`, `internal/`, and `model/`.
+
+Above the container layer, `parameters/` and `tempo/` feed `engine/`, which in turn serves `web-audio/` and planned M6 `trainer/`.
+
+Adjacent feature domains stay narrow: `provenance/` depends on `model/`, while `dsp/` depends solely on `internal/` and `errors.ts`.
+
+`@dnam-project/dnam` declares zero runtime npm dependencies (`"dependencies"` is omitted).
+
+Browser-safe modules (`src/browser.ts`, `src/internal/native/wasm.ts`, `src/internal/native/wasm/**/*.ts`, `src/schema/**/*.ts`, `src/web-audio/**/*.ts`, and planned `src/trainer/**/*.ts`) must never import `node:*` built-in modules.
+
+Worklet runtime modules `src/web-audio/processor.ts` and `src/web-audio/shared-state.ts` remain completely self-contained for `AudioWorkletGlobalScope`.
 
 ---
 
@@ -95,186 +143,280 @@ flowchart LR
 
 `r[sdk.ts.api.resources-and-data]`
 
+The public API separates explicit-lifetime native wrappers from deeply frozen plain objects. `@dnam-project/dnam` targets strictly the v3.0 (`"architecture": "sona"`, `version_major = 3`, `version_minor = 0`) container and DSP schema:
+
 | Category | Public Types / Classes | Ownership & Immutability Contract |
 | :--- | :--- | :--- |
-| **Stateful Resources (Classes)** | `Model`, `Engine`, `Parameter` | Wrap native `DnamHostHandle` (`DynamicDnamEngine`) or validated `zerocopy` container buffers; expose `.dispose()` and `[Symbol.dispose]()`. |
+| **Stateful Resources (Classes)** | `Model`, `Engine`, `Parameter`, `ControlSpace`, `DnamAudioNode` | Wrap native host handles (`ref[sdk.rust.c-abi-and-host-handle]`) or validated aligned container buffers (`ref[sdk.rust.zerocopy-wire-structs]`); disposable resources expose `.dispose()` and `[Symbol.dispose]()`. |
 | **Plain Metadata (Frozen Objects)** | `ModelHeader`, `PreambleInfo`, `ParameterDescriptor`, `Preset`, `TelemetrySnapshot`, `ClampReport`, `VerificationResult` | Deeply `readonly` and `Object.freeze`-d plain camelCase objects with zero prototype methods or hidden native pointers. |
-
-1. **Zero Legacy `v2`/`TORA`/Tri-Physics Symbols:** Superseded identifiers (`SelectiveRgLru`, `SelectiveRgLruParams`, `ModulatedUfdn`, `MufdnParams`, `Core1Config`, `Core2Config`, `core2Active`, `Stage2CascadeConfig`, `V3PostStageConditioner`, `tora`) must not exist anywhere in `@dnam-project/dnam`; only `"sona"` `v3.0` (`version_major = 3, version_minor = 0`, `0` `v2`/`tora` legacy compat) is supported.
 
 ### 2.2 String-Literal Unions, Companion Tuples & Options Objects
 
 `r[sdk.ts.api.literal-unions-and-options]`
 
-1. **String-Literal Unions Over TS `enum`:** Domain enumerations are represented as lowercase string-literal unions paired with `readonly` tuple constants:
-   - `Tier = "lite" | "full" | "pro" | "ultra"` and `tiers = ["lite", "full", "pro", "ultra"] as const`.
-   - `Backend = "auto" | "scalar" | "neon" | "arm-sme" | "x86-simd" | "wasm-simd128"` and `backends`.
-   - `Subdivision = "1/2." | "1/2" | "1/2T" | "1/4." | "1/4" | "1/4T" | "1/8." | "1/8" | "1/8T" | "1/16." | "1/16" | "1/16T"` and `subdivisions`.
-2. **Options Objects:** Multi-flag configuration methods (`model.createEngine(options)`, `engine.bypass(options)`, `engine.freeze(options)`, `engine.render(audio, options)`, `param.setValue(value, options)`) accept typed options objects compatible with `exactOptionalPropertyTypes: true`.
+Domain enumerations use lowercase string-literal unions paired with `readonly` companion tuples rather than TypeScript `enum` declarations:
+
+| Union Type | Companion Tuple | Canonical Values |
+| :--- | :--- | :--- |
+| `Tier` | `tiers` | `"lite" \| "full" \| "pro" \| "ultra"` |
+| `Backend` | `backends` | `"auto" \| "scalar" \| "neon" \| "arm-sme" \| "x86-simd" \| "wasm-simd128"` |
+| `Subdivision` | `subdivisions` | `"1/2." \| "1/2" \| "1/2T" \| "1/4." \| "1/4" \| "1/4T" \| "1/8." \| "1/8" \| "1/8T" \| "1/16." \| "1/16" \| "1/16T"` |
+
+Multi-flag configuration methods (`model.createEngine(options)`, `engine.bypass(options)`, `engine.freeze(options)`, `engine.render(audio, options)`, and `param.setValue(value, options)`) accept typed options objects compatible with `exactOptionalPropertyTypes`.
 
 ### 2.3 Compile-Time Model Parameter Inference
 
 `r[sdk.ts.api.typed-model-inference]`
 
-1. **Typed Parameter Maps (`TParams`):** `Model<TParams>`, `Engine<TParams>`, and `DnamAudioNode<TParams>` accept a compile-time parameter map `TParams extends ParameterValueMap = Record<string, number | string>`, narrowing `engine.parameters.get(id)` to `Parameter<K, TParams[K]>` and `engine.parameters.set(partial)` to `Partial<TParams>`.
-2. **Helper Schema Definition (`defineModelTypes`):** `defineModelTypes<const TSchema>()` infers numeric range parameters as `number` and discrete switch parameters as the literal union of their declared options.
+`Model<TParams>`, `Engine<TParams>`, `ControlSpace<TParams>`, and `DnamAudioNode<TParams>` accept a compile-time parameter map `TParams extends ParameterValueMap = Record<string, number | string>`.
+
+That generic parameter narrows `engine.parameters.get(id)` to `Parameter<K, TParams[K]>` and `engine.parameters.set(partial)` to `Partial<TParams>`.
+
+The helper `defineModelTypes<const TSchema>()` infers continuous `range` parameters as `number` and discrete `switch` parameters as the literal union of their `declaredOptions`.
 
 ### 2.4 Uniform Synchronous API & Optional WASM Pre-Initialization
 
 `r[sdk.ts.api.sync-init]`
 
-1. **Synchronous Core Constructors:** Both `src/node.ts` (synchronous `N-API v10` load with synchronous WASM fallback) and `src/browser.ts` (top-level `await` WASM instantiation) initialize the default `NativeDriver` at module evaluation time so `Model.from(...)`, `Model.reference(...)`, `model.createEngine(...)`, and `engine.process(...)` are synchronous across all runtimes.
-2. **Explicit `initWasm` & Imported `WebAssembly.Memory` Override:** `initWasm(options?: { module?: WebAssembly.Module; bytes?: BufferSource; url?: string | URL; memory?: WebAssembly.Memory; initialPages?: number; maximumPages?: number; shared?: boolean }): Promise<WebAssembly.Module>` allows custom CDN hosting, Web Worker pre-compilation, `AudioWorklet` module sharing, and pre-allocated or `shared: true` (`SharedArrayBuffer`) linear `WebAssembly.Memory` injection via `{ env: { memory } }`.
+Both `src/node.ts` (synchronous N-API v10 load with synchronous WASM fallback) and `src/browser.ts` (top-level `await` WASM instantiation) initialize the default `NativeDriver` at module evaluation time. Consequently, `Model.from(...)`, `Model.reference(...)`, `model.createEngine(...)`, and `engine.process(...)` execute synchronously across all runtimes.
+
+Callers needing custom CDN hosting, Web Worker pre-compilation, `AudioWorklet` module sharing, or `shared: true` with `SharedArrayBuffer` memory injection call `initWasm(options?)`.
+
+The options object accepts custom binary sources via `module`, `bytes`, or `url`. Callers can also supply backing `memory`, `initialPages`, `maximumPages`, and `shared`, passing `{ env: { memory } }` at instantiation.
 
 ### 2.5 Dual-Mode Resource Disposal & Exception-Safe State Scopes
 
 `r[sdk.ts.api.disposable-scopes]`
 
-1. **Dual `.dispose()` and `[Symbol.dispose]()`:** `Model` and `Engine` implement both `.dispose(): void` and `[Symbol.dispose](): void` (idempotent) plus a `FinalizationRegistry` safety net. Entry `.d.ts` files include `/// <reference lib="esnext.disposable" />` so downstream `ES2024`/`ES2025` consumers compile without `tsconfig.json` changes even when `skipLibCheck` is `false`.
-2. **Scoped Bypass & Freeze (`bypass` / `withBypass`, `freeze` / `withFreeze`):**
-   - `engine.bypass(options?: { trails?: boolean }): StateScope` enters bypass (`SpilloverTrails` when `trails ?? true`, `HardBypass` when `trails === false`, `ref[arch.topology.spillover-trails]`) and returns a `StateScope` with both `.restore(): void` and `[Symbol.dispose](): void`.
-   - `engine.withBypass(options, fn)` and `engine.withFreeze(options, fn)` execute `fn` inside a `try / finally` block and restore the prior state on return or throw.
-   - `engine.freeze(options?: { amount?: number }): StateScope` engages Stage IV captured hardware freeze (`ref[dsp.stage4.captured-freeze]`, locking `Op-T` ring writes for exact lossless hold) if `engine.supportsFreeze` is `true`, throwing `DnamError` (`code: "ERR_DNAM_PARAMETER"`) if unsupported.
+`Model`, `Engine`, and `ControlSpace` implement both idempotent `.dispose(): void` and `[Symbol.dispose](): void`, backed by a `FinalizationRegistry` safety net.
 
-### 2.6 WebAudio `AudioParam`-Aligned `Parameter` & `ParameterMap`
+Entry `.d.ts` files emit `/// <reference lib="esnext.disposable" />` so downstream ES2024 and ES2025 consumers compile without `tsconfig.json` overrides even when `skipLibCheck` is `false`.
+
+`engine.bypass(options?: { trails?: boolean }): StateScope` enters `SpilloverTrails` when `trails ?? true` or `HardBypass` when `trails === false` (`ref[arch.topology.spillover-trails]`), returning a scope that exposes `.restore(): void` and `[Symbol.dispose](): void`.
+
+Similarly, `engine.freeze(options?: { amount?: number }): StateScope` engages Spatial Tank captured hardware freeze (`ref[dsp.tank.captured-freeze]`) when `engine.supportsFreeze` is `true`, or throws `DnamError` (`code: "ERR_DNAM_PARAMETER"`) if unsupported.
+
+Exception-safe closures `engine.withBypass(options, fn)` and `engine.withFreeze(options, fn)` wrap `fn` in `try / finally` blocks so prior state always restores on return or throw.
+
+### 2.6 WebAudio `AudioParam`-Aligned `Parameter`, `ParameterMap` & `ControlSpace`
 
 `r[sdk.ts.parameters.audio-param-semantics]`
 
-1. **`Parameter<TId, TValue>` Surface:** `engine.parameters.get(id)` returns a `Parameter` instance exposing:
-   - `id: TId`, `name: string`, `kind: "range" | "switch"`, `unit: string | undefined`
-   - `value: TValue` (getter returns live clamped value; setter schedules a 3 kHz smoothed transition via `set_control_value`, `ref[dsp.ctrl.range.normalize-clamp]`)
-   - `setValue(value: TValue, options?: { immediate?: boolean }): this` (uses `set_control_immediate` when `immediate: true`)
-   - `reset(): this`, `defaultValue: TValue`, `minValue: number | undefined`, `maxValue: number | undefined`, `safeRange: readonly [number, number] | undefined`, `options: readonly string[] | undefined`, `activeOptions: readonly string[] | undefined`, `clamped: boolean`
-   - `toPhysical(normalizedU: number): number` and `toNormalized(physicalValue: number): number`.
-2. **`ParameterMap<TParams>` Collection:** `engine.parameters` implements `Iterable<[keyof TParams, Parameter]>` and exposes `.get(id)`, `.has(id)`, `.set(values: Partial<TParams>, options?: { immediate?: boolean })`, `.resetAll()`, `.values()`, `.toObject()`, and `.clampedReport(): ClampReport`.
+`engine.parameters` implements `ParameterMap<TParams>` (`Iterable<[keyof TParams, Parameter]>`) and exposes the core collection accessors and clamp reporting methods summarized below.
+
+Each `Parameter<TId, TValue>` controller mirrors WebAudio `AudioParam` semantics with live 3 kHz smoothing on `.value = v` (`ref[dsp.ctrl.range.normalize-clamp]`). Immediate non-smoothed updates use `.setValue(v, { immediate: true })`, alongside `toPhysical` and `toNormalized` coordinate helpers.
+
+For standalone or zero-allocation host clamping, `@dnam-project/dnam` and `@dnam-project/dnam/parameters` expose `clampParameters(source, values)` and `ControlSpace<TParams>`. `ControlSpace.from(modelOrHeader)` compiles the container's binary control-clamp descriptor tables once, offering `.clamp(values): ClampReport` plus the zero-allocation numeric fast-path `clampNumericInto(rawNumeric: Float32Array, clampedOut: Float32Array, normOut?: Float32Array): number`, which writes clamped and normalized coordinates in-place inside the native driver and returns the 32-bit active clamp bitmask:
+
+| Surface | Key Members | Runtime Semantics |
+| :--- | :--- | :--- |
+| `Parameter<TId, TValue>` | `id`, `name`, `kind`, `unit`, `value`, `setValue`, `reset`, `defaultValue`, `minValue`, `maxValue`, `safeRange`, `options`, `activeOptions`, `clamped`, `toPhysical`, `toNormalized` | Getter returns live clamped value; setter triggers 3 kHz smoothing unless `immediate: true`. |
+| `ParameterMap<TParams>` | `get`, `has`, `set`, `resetAll`, `values`, `keys`, `toObject`, `clampedReport`, `[Symbol.iterator]` | Batches multi-knob updates and evaluates switch-conditioned clamps atomically. |
+| `ControlSpace<TParams>` | `ControlSpace.from`, `descriptors`, `size`, `indexOf`, `clamp`, `clampNumericInto`, `toPhysical`, `toNormalized`, `dispose` | Pre-compiled 3-Phase clamping space; `clampNumericInto` allocates zero JS objects. |
 
 ### 2.7 Coded `DnamError` & Exhaustive Native Tag Mapping
 
 `r[sdk.ts.errors.coded-error]`
 
-| Rust `DnamError` Variant(s) | Native Tag Prefix | `DnamError.code` (`ErrorCode`) |
-| :--- | :---: | :--- |
-| `InvalidMagic`, `UnsupportedVersion`, `BufferTooSmall`, `Crc32cMismatch`, `HeaderCapacityExceeded` | `[DNAM-CONTAINER]` | `"ERR_DNAM_CONTAINER"` |
-| `InvalidSampleRate` | `[DNAM-SAMPLERATE]` | `"ERR_DNAM_SAMPLE_RATE"` |
-| `InvalidControlIndex` (plus unknown parameter/preset IDs or unsupported freeze) | `[DNAM-CONTROL]` | `"ERR_DNAM_PARAMETER"` |
-| `CryptoVerificationFailed`, `EncryptedArenaRequiresDeviceKey`, `PreviewContainerRejected` | `[DNAM-PROVENANCE]` | `"ERR_DNAM_PROVENANCE"` |
-| `UnalignedOffset`, `InvalidJsonHeader`, `SchemaValidationError` | `[DNAM-VALIDATION]` | `"ERR_DNAM_VALIDATION"` |
-| Concurrent audio render / disposal during active `processAsync` or use after `.dispose()` | `[DNAM-BUSY]` / `[DNAM-DISPOSED]` | `"ERR_DNAM_BUSY"` / `"ERR_DNAM_DISPOSED"` |
+Every native runtime error maps exhaustively from the native engine error taxonomy ([Rust Implementation Specification](rust_sdk.md)) via structured tag prefixes without a wildcard fallback, so adding any native error variant forces an explicit TypeScript `ErrorCode` mapping. The `isDnamError(err, code?)` guard narrows `unknown` values to `DnamError` and optionally to a specific `ErrorCode`:
 
-1. **Exhaustive Rust Match:** `packages/js/rust/error.rs` matches `dnam_engine::schema::DnamError` without a wildcard arm so adding any variant in `packages/engine` forces an explicit error code mapping.
-2. **Type Guard:** `isDnamError(err: unknown, code?: ErrorCode)` narrows `err` to `DnamError` (and to the specific `code` when provided).
+| Native Error Condition | Native Tag Prefix | `DnamError.code` (`ErrorCode`) |
+| :--- | :---: | :--- |
+| Container magic, version, truncation, CRC32C, or header capacity failure | `[DNAM-CONTAINER]` | `"ERR_DNAM_CONTAINER"` |
+| Unsupported host or container sample-rate validation failure | `[DNAM-SAMPLERATE]` | `"ERR_DNAM_SAMPLE_RATE"` |
+| Invalid control index, unknown parameter or preset ID, or unsupported freeze | `[DNAM-CONTROL]` | `"ERR_DNAM_PARAMETER"` |
+| Cryptographic signature, encrypted arena key, or preview containment failure | `[DNAM-PROVENANCE]` | `"ERR_DNAM_PROVENANCE"` |
+| Unaligned container offset, malformed JSON header, or schema validation failure | `[DNAM-VALIDATION]` | `"ERR_DNAM_VALIDATION"` |
+| Concurrent audio render or disposal during active `processAsync` or use after `.dispose()` | `[DNAM-BUSY]` / `[DNAM-DISPOSED]` | `"ERR_DNAM_BUSY"` / `"ERR_DNAM_DISPOSED"` |
 
 ---
 
 ## 3. Dual-Target Runtime, Real-Time Engine & Behavioral Parity
 
-### 3.1 Unified `NativeDriver` Seam (`N-API v10` + Raw `WASM SIMD128`), Zero Duplicated Logic & Zero-`unsafe` Rust Bindings
+### 3.1 Unified `NativeDriver` Seam (N-API v10 + Raw WASM SIMD128), Zero Duplicated Logic & Safe Binding Boundaries
 
 `r[sdk.ts.runtime.dual-target-drivers]`
 
-1. **100% Delegation to `dnam-engine` (Zero Duplicated Logic in TypeScript or FFI Adapters):** `packages/js/rust/core/` and `packages/js/src/` must never reimplement any algorithm, validation rule, or domain constant already owned by `packages/engine` (`dnam-kernels`). Specifically, all DSP, ZOH rescaling (`ref[dsp.zoh.ctrl-stride]`), 3-Phase control clamping, Lobatto calibration inversion, preset loading, tempo synchronization, `DnamJsonHeader` / `SchemaVersion` (`3.0.0`, `"sona"`) validation, RFC 8785 JCS canonicalization and immutable-header projection (`ref[sec.jcs.immutable-header-digest]`), and creator/marketplace tier-prefix signing (`ref[sec.sig.prefix-delegation]`) must execute in Rust via `dnam-engine`. The TypeScript layer is restricted strictly to idiomatic API ergonomics, camelCase/snake_case key translation, input coercion, WebGPU `.wgsl` dispatch orchestration (`§4.5`), and memory/handle lifecycle management.
-2. **Identical Driver Semantics:** `NapiDriver` and `WasmDriver` implement the exact same `NativeDriver` interface in `src/internal/native/driver.ts`.
+`packages/js/src/` and its thin native binding glue must never reimplement any algorithm, validation rule, or domain constant already owned by the native engine and shared kernels ([Rust Implementation Specification](rust_sdk.md), `ref[sdk.rust.shared-nostd-kernels]`).
+
+All DSP, ZOH rescaling (`ref[dsp.zoh.ctrl-stride]`), 3-Phase control clamping, Lobatto calibration inversion, preset loading, tempo sync, and v3.0 `"sona"` header validation execute in compiled native code via the unified runtime seam.
+
+RFC 8785 JCS canonicalization, immutable-header projection (`ref[sec.jcs.immutable-header-digest]`), and creator or marketplace tier-prefix signing (`ref[sec.sig.prefix-delegation]`) likewise execute natively. The TypeScript layer handles only idiomatic API ergonomics, camelCase/snake_case key translation, input coercion, planned M6 WebGPU `.wgsl` dispatch orchestration (§4.5), and handle lifecycle management.
+
+Both `NapiDriver` and `WasmDriver` implement the exact same `NativeDriver` interface declared in `src/internal/native/driver.ts`.
 
 `r[sdk.ts.runtime.zero-unsafe]`
 
-1. **Zero `unsafe` Blocks & Module-Level `#[forbid(unsafe_code)]`:** `packages/js/rust/lib.rs` enforces `#![deny(unsafe_code)]` at the crate root (allowing only `#[napi]` proc-macro expansion and narrow `#[allow(unsafe_code)]` for Rust 2024 `#[unsafe(no_mangle)]` C-ABI symbol export attributes in `packages/js/rust/wasm/`) while enforcing `#[forbid(unsafe_code)]` on `core`, `error`, and `wasm::abi`, with zero `unsafe { ... }` blocks, zero raw-pointer slice dereferences, and zero `unsafe impl Send` anywhere in `packages/js/rust/`.
-2. **Safe WASM Linear-Memory Arena & Handle Tables:** `packages/js/rust/wasm/abi.rs` (`#[forbid(unsafe_code)]`) manages 64-byte-aligned `CacheLine64` allocations and `EngineCore` / `ControlSpaceCore` instances via safe thread-local handle tables and `zerocopy` (`FromBytes` / `IntoBytes` / `KnownLayout` / `Immutable`, `ref[repo.code.zerocopy-wire-structs]`) byte-slice conversions with `split_at_mut` disjoint multi-slice borrowing for zero-allocation audio processing.
-3. **Aliasing-Free `processAsync` Snapshot & `ArrayBuffer` Ownership Transfer:** `StereoProcessTask` (`packages/js/rust/napi/engine.rs`) and `WasmEngineHandle.processStereoAsync` snapshot caller input `Float32Array` channels on the main thread before dispatching asynchronous worker execution so concurrent JS-thread mutations to caller input buffers never race with or alias worker memory. `engine.processAsync` supports both `engine.processAsync(input, out)` and `engine.processAsync(input, { output, transfer, blockSize, signal })`, detaching the caller's input `ArrayBuffer`(s) via `ArrayBuffer.prototype.transfer()` when `{ transfer: true }` is specified.
+All native host-addon and WebAssembly linear-memory bindings uphold the safe-binding, aligned-wire, and host-handle isolation contracts specified in the [Rust Implementation Specification](rust_sdk.md) (`ref[sdk.rust.safe-rust-and-boundaries]`, `ref[sdk.rust.zerocopy-wire-structs]`, `ref[sdk.rust.c-abi-and-host-handle]`).
+
+Engine and control-space instances live inside safe handle tables accessed exclusively through disjoint-slice buffer borrows, never exposing raw linear-memory pointers or aliased mutable slices across JavaScript calls.
+
+Both the N-API worker dispatch and `WasmEngineHandle.processStereoAsync` snapshot caller input `Float32Array` channels on the main thread before dispatching worker execution so concurrent JS mutations never race with worker memory.
+
+`engine.processAsync` accepts both `engine.processAsync(input, out)` and `engine.processAsync(input, { output, transfer, blockSize, signal })`, detaching input buffers via `ArrayBuffer.prototype.transfer()` when `{ transfer: true }` is set.
 
 ### 3.2 Zero-Copy Planar Audio, In-Place Output & Libuv `processAsync`
 
 `r[sdk.ts.engine.zero-copy-and-async]`
 
-1. **Planar `Float32Array` Audio Contract:** `engine.process(input, options?: { output?: Float32Array[] })` accepts a mono `Float32Array` or planar `readonly Float32Array[]` (`[left]` or `[left, right]`) across all four model topologies (`1->1`, `2->1`, `1->2`, `2->2`, `ref[arch.topology.signal-flow]`). When `options.output` is provided with matching channel count and frame length, the SDK writes directly into the caller's `Float32Array` buffers with zero output allocation.
-2. **Imported `WebAssembly.Memory` (`--import-memory`) & Persistent Linear-Memory Scratch Arena:** `dnam.wasm` is linked with `-C link-arg=-zstack-size=786432 -C link-arg=--import-memory -C link-arg=--export-memory -C link-arg=--max-memory=268435456` and instantiated via `new WebAssembly.Instance(module, { env: { memory } })` using `new WebAssembly.Memory({ initial, maximum, shared })` (`default initial = 18` pages = `1.125 MiB` above the `15`-page module minimum from the `768 KiB` shadow stack + static data, `default maximum = 4,096` pages = `256 MiB`, architectural ceiling `65,536` pages = `4 GiB`, plus optional `shared: true` backed by a `SharedArrayBuffer` when `crossOriginIsolated !== false`). Specifying a bounded `maximum` enables V8 compile-time static guard-page bounds-check elision and reserves virtual address space upfront for in-place page commits without heap relocation copies, while `WasmDriver` caches typed-array views keyed by `memory.buffer` and `byteLength` and checks `dnam_wasm_alloc` (`Vec::try_reserve_exact`) for graceful `DnamError` OOM reporting.
-3. **Worker-Pool `processAsync` with Non-Blocking SPSC Control & Wait-Free Telemetry (`DnamHostHandle`, `ADR-0015`):** `engine.processAsync(input, outOrOptions?)` executes on the Node.js libuv worker pool via an `N-API` `AsyncTask` over `dnam_engine::host::DnamHostHandle` (and resolves asynchronously in browsers), honoring `AbortSignal` prior to dispatch, writing into caller-supplied `out` / `options.output` buffers when provided, and detaching caller input `ArrayBuffer`s when `options.transfer === true` (`ref[sdk.ts.runtime.zero-unsafe]`). Concurrent audio rendering or `.dispose()` calls while `processAsync` is in flight are rejected with `DnamError` (`"ERR_DNAM_BUSY"`), whereas parameter/preset/tempo/bypass/freeze/tier updates (`ref[dsp.ctrl.op-m.spsc-ingress]`) and `engine.telemetry` reads (`ref[arch.telemetry.seqlock-publication]`) complete synchronously and non-blockingly on the main thread during an active `processAsync` render.
+`engine.process(input, options?: { output?: Float32Array[] })` accepts a mono `Float32Array` or planar `readonly Float32Array[]` (`[left]` or `[left, right]`) across all four topologies (1-to-1, 2-to-1, 1-to-2, and 2-to-2, `ref[arch.topology.signal-flow]`). When `options.output` supplies matching channels and length, processing writes directly into caller buffers with zero output allocation.
 
-### 3.3 Offline `render` (`4x` Bounce) & Web `TransformStream`
+`dnam.wasm` links with `--import-memory --export-memory --max-memory=268435456` (768 KiB shadow stack) and instantiates via `{ env: { memory } }` over `WebAssembly.Memory`. Default allocation starts at 18 pages (1.125 MiB above the 15-page module minimum) with a default maximum of 4,096 pages (256 MiB), an architectural ceiling of 65,536 pages (4 GiB), and optional `shared: true` (`SharedArrayBuffer`) when `crossOriginIsolated !== false`.
+
+Specifying a bounded `maximum` enables V8 static guard-page bounds-check elision and reserves virtual address space upfront without heap relocation copies. `WasmDriver` caches typed-array views keyed by `memory.buffer` and `byteLength` and verifies bounded `dnam_wasm_alloc` allocation for graceful `DnamError` out-of-memory reporting.
+
+`engine.processAsync` runs on the Node.js libuv worker pool via an N-API `AsyncTask` over the thread-safe host handle (`ref[sdk.rust.c-abi-and-host-handle]`) and resolves asynchronously in browsers, honoring `AbortSignal` before dispatch.
+
+Concurrent rendering or `.dispose()` calls during an in-flight `processAsync` reject with `"ERR_DNAM_BUSY"`, while parameter, preset, tempo, bypass, freeze, and tier updates (`ref[dsp.ctrl.op-m.spsc-ingress]`) plus `engine.telemetry` reads (`ref[arch.telemetry.seqlock-publication]`) complete synchronously and non-blockingly on the main thread.
+
+### 3.3 Offline `render` (4x Bounce) & Web `TransformStream`
 
 `r[sdk.ts.engine.streaming-and-render]`
 
-1. **One-Shot Offline `engine.render` & `engine.bounce`:**
-   - `engine.render(input, options?: { sampleRate?: number; blockSize?: number; reset?: boolean; oversample?: 1 | 4; maxTier?: boolean })` optionally updates `sampleRate`, resets to analytical resting equilibrium (`ref[dsp.op-n.commuted.dc-equilibrium]`) when `reset ?? true`, and renders in chunks of `blockSize` (or executes `4x` linear-phase polyphase oversampling with `12`-sample PDC lead-in stripping when `oversample === 4`, `ref[arch.bounce.oversampling]`).
-   - `engine.bounce(input, options?: { maxTier?: boolean })` is a shorthand for `4x` oversampled offline rendering.
-2. **WHATWG `TransformStream` (`engine.stream`):** `engine.stream(options?: { blockSize?: number }): TransformStream<Float32Array | readonly Float32Array[], Float32Array[]>` provides a standard Web Streams stage for piping chunked audio through the engine.
+`engine.render(input, options?: { sampleRate?: number; blockSize?: number; reset?: boolean; oversample?: 1 | 4; maxTier?: boolean })` optionally updates `sampleRate`, resets to analytical resting equilibrium (`ref[dsp.op-n.commuted.dc-equilibrium]`) when `reset ?? true`, and renders in chunks of `blockSize`. Setting `oversample: 4` engages 4x linear-phase polyphase oversampling with 12-sample PDC lead-in stripping (`ref[arch.bounce.oversampling]`), and `engine.bounce(input, { maxTier? })` provides a concise 4x shorthand.
 
-### 3.4 Bit-Identical Cross-Driver & Rust Behavioral Parity
+`engine.stream(options?: { blockSize?: number }): TransformStream<Float32Array | readonly Float32Array[], Float32Array[]>` exposes a standard WHATWG Web Streams stage for piping chunked audio through the engine.
+
+### 3.4 Bit-Identical Cross-Driver & Native Reference Behavioral Parity
 
 `r[sdk.ts.engine.behavioral-parity]`
 
-1. **0-ULP Native Host Parity & Cross-ISA IEEE-754 Parity (`N-API` vs. `WASM` vs. Native Rust):** When instantiated with `backend: "scalar"` on the same host ISA, `NapiDriver` and native Rust `DynamicDnamEngine` produce bit-identical (`0 ULP`) `Float32Array` samples across all tiers (`lite`, `full`, `pro`, `ultra`), host sample rates (`44.1–192 kHz` subject to `M_os * f_{s,host} <= 384 kHz`: `44.1–96 kHz` at `2×` RT / `4×` bounce; `176.4–192 kHz` at `1×`/`2×`), I/O topologies, and block sizes; `WasmDriver` (`wasm32` IEEE-754 non-fused `f32.mul` + `f32.add`) agrees with host `NapiDriver` (hardware `fmadd`) within `<= 4 ULP` (`< 5e-7`) on `scalar` and `< 1e-5` on `wasm-simd128`.
-2. **SIMD Parity:** On default hardware backends (`neon`, `x86-simd`, `wasm-simd128`), `NapiDriver` matches native Rust on the same backend to `0 ULP`, and `WASM SIMD128` agrees with `N-API` within `< 1e-5` max absolute difference across multi-stage `SONA` rendering.
+When instantiated with `backend: "scalar"` on the same host ISA, `NapiDriver` and the native reference engine ([Rust Implementation Specification](rust_sdk.md)) produce bit-identical (0 ULP) `Float32Array` samples across all tiers (Lite, Full, Pro, Ultra), topologies, and block sizes. Host sample rates spanning 44.1–192 kHz obey `M_os * f_{s,host} <= 384 kHz` (44.1–96 kHz at 2× RT and 4× bounce; 176.4–192 kHz at 1× or 2×).
+
+`WasmDriver` (IEEE-754 non-fused `f32.mul` plus `f32.add`) agrees with host `NapiDriver` (hardware `fmadd`) within <= 4 ULP (< 5e-7) on scalar WASM and < 1e-5 on WASM SIMD128.
+
+On hardware SIMD backends (`neon`, `x86-simd`, `wasm-simd128`), `NapiDriver` matches the native engine on the same backend to 0 ULP, while WASM SIMD128 stays within < 1e-5 max absolute difference across multi-block SONA rendering.
 
 ---
 
 ## 4. Schema Codec, Containers, Provenance, DSP, WebAudio Worklet & WebGPU Trainer
 
-### 4.1 Bijective CamelCase `v3.0` `"sona"` Schema Codec & RFC 8785 JCS Parity
+### 4.1 Bijective CamelCase v3.0 `"sona"` Schema Codec & RFC 8785 JCS Parity
 
 `r[sdk.ts.schema.camel-case-codec-parity]`
 
-1. **Zero-Dependency Native-`serde` `v3.0` `"sona"` Schema Validation & CamelCase Codec (`@dnam-project/dnam/schema`):** Mirrors every `v3.0` `"sona"` struct and enum in `packages/engine/src/schema/` (`ModelHeader` enforcing literal discriminant fields `version: "3.0.0"`, `architecture: "sona"`, `sampleRateTrainHz: 48_000`, `containerKind: "dnam" | "preview"`, alongside `IoConfig`, `ModelCapabilities`, `LevelingConfig`, `SlimmableTiersConfig`, `ControlBusConfig`, `CrossbarConfig`, `SonaCoreConfig`, `SonaCellDesc`, `Stage3CabinetKautzConfig`, `Stage4SpatialTankConfig`, `TensorSliceEntry`, `ParameterDescriptor`, `Preset`, `ModelSignatures`) as pure `readonly` TypeScript interfaces with zero runtime JS dependencies and zero `v2`/`tora` legacy compatibility, delegating validation and default population directly to compiled Rust `serde` (`dnam_engine::schema::DnamJsonHeader`) in `decodeHeader(wireJson)` (returning deeply frozen camelCase `ModelHeader`) and `encodeHeader(header)` (emitting canonical snake_case wire JSON).
-2. **Byte-Identical RFC 8785 JCS Round-Trip Parity (`canonicalJson`):** Decoding any Rust-emitted `DnamJsonHeader` (both `default_reference()` and a fully populated header exercising every optional field and enum variant) via `decodeHeader` and re-encoding via `encodeHeader` + `canonicalJson` (`-0.0 -> "0"`, UTF-16 code-unit key sort, finite-number check, `serde` `Option::None` omission, non-recursive projection stripping `presets`, `user_metadata`, `metadata.signatures`, `controls_schema[*].user_metadata`, `stems_registry[*].user_metadata`, and `slimmable_tiers.*.prefix_crc32c`; `ref[sec.jcs.immutable-header-digest]`) produces byte-identical UTF-8 output and identical `immutableHeaderSha256` digests.
+`@dnam-project/dnam/schema` provides pure `readonly` TypeScript interfaces with zero runtime JS dependencies for every v3.0 `"sona"` schema object and union defined in [dnam_binary_format.md](../containers/dnam_binary_format.md).
 
-### 4.2 `.dnam` Models (`SONA v3.0` Wire Constants), `GramMatrix` & Tempo
+Mirrored definitions cover header metadata, I/O capabilities, slimmable tier profiles, operator topology, delay histories, tensor slices, controls, presets, and cryptographic provenance:
 
-`r[sdk.ts.model.containers-and-checkpoints]`
+| Canonical Wire Schema ([dnam_binary_format.md](../containers/dnam_binary_format.md)) | `@dnam-project/dnam/schema` TypeScript Interface | Schema Domain |
+| :--- | :--- | :--- |
+| Top-level header & `metadata` (`"3.0.0"`, `"sona"`, 48000 Hz, `"dnam" \| "preview"`) | `ModelHeader`, `ModelMetadata` | Discriminants (`"3.0.0"`, `"sona"`, 48000 Hz, `"dnam" \| "preview"`), identity, and attribution |
+| `io_config`, `capabilities`, `leveling`, `slimmable_tiers` | `IoConfig`, `ModelCapabilities`, `LevelingConfig`, `SlimmableTiersConfig`, `TierProfile` | Channel topology, capabilities, auto-unity leveling, and per-tier arena profiles |
+| `io_router`, `cabinet`, `spatial_tank`, `control_bus` | `IoRouterConfig`, `CabinetKautzConfig`, `SpatialTankConfig`, `ControlBusConfig` | I/O Router, Cabinet Bank, Spatial Tank, and 3 kHz Control Bus configurations |
+| `delay_histories`, `tensor_directory`, `controls_schema`, `presets` | `DelayHistoryEntry`, `TensorSliceEntry`, `ParameterDescriptor`, `ParameterCalibration`, `ParameterUiHints`, `Preset` | Delay capacities, 64 B-aligned tensor slices, macro controls, and factory presets |
+| `metadata.signatures`, `authorized_devices`, `royalty_splits`, `distribution_policy`, `provenance` | `ModelSignatures`, `CreatorSignature`, `MarketplaceReceipt`, `AuthorizedDevice`, `RoyaltySplit`, `DistributionPolicy`, `DatasetProvenance`, `OemDeviceCertificate` | Cryptographic provenance, distribution policies, receipts, and OEM device certs |
 
-1. **`Model` Operations & Exact `SONA v3.0` Wire Arena Constants:** `await Model.load(source)` (accepting filesystem path in Node.js, `URL`, `Response`, `Blob`, `ArrayBuffer`, or `Uint8Array`), `Model.from(bytes)`, `Model.reference(options?)`, and `Model.build(header, arenaBytes)` validate the `64 B`-aligned `v3.0` `zerocopy` `.dnam` container (`ref[container.dnam.load-validation]`, `REQ-8.8`):
-   - **Normative Tier Arena Sizes (`Arena 0..3`):** Cumulative `SONA` `v3.0` arena byte boundaries are **`[4_608, 7_936, 15_872, 30_720]` B** (`[72, 124, 248, 480]` `64 B` cache lines across `Lite / Full / Pro / Ultra`, zero `v2` / `rate_1x_cal` overlays). Loaders reject `versionMajor !== 3 || versionMinor !== 0` or non-`"sona"` headers fail-fast with `"ERR_DNAM_CONTAINER"` (`DnamError`).
-   - Exposes `model.preamble`, `model.header`, `model.parameters`, `model.presets`, `model.tierArenas`, `model.withHeader(updater)` (in-place within the 4 KB page budget when unsealed), `model.withMaxTier(tier)` (`strip_container_to_tier`, preserving full `Arena 0` parametric controls even when `tier === "lite"`, `ref[container.dnam.tier-prefix]`), and `model.createEngine(options?)`.
-2. **`GramMatrix` (`@dnam-project/dnam`):** `GramMatrix.fromDense(matrix, dim)` and `gram.toDense()` pack and unpack symmetric sufficient-statistic matrices in canonical `uplo='U'` upper-triangular `Float64Array` layout (`ref[container.proj.stat-uplo-u]`).
-3. **Offline Parameter Clamping & Tempo Inversion (`@dnam-project/dnam/parameters`, `@dnam-project/dnam/tempo`):** Exposes `clampParameters(modelOrHeader, values): ClampReport` (`ref[train.audit.phase1.clamp-range]`, `ref[train.audit.phase1.clamp-switch]`, `ref[train.audit.phase1.clamp-stability]`), `computeZoh(...)`, `controlStride(sampleRate)`, `subdivisionPhase(...)`, and 32-step binary-search `invertTempoCalibration(...)` (`ref[dsp.tempo.physical-inversion]`).
+`decodeHeader(wireJson)` and `encodeHeader(header)` delegate validation and default population directly to the native schema validator ([Rust Implementation Specification](rust_sdk.md)), returning deeply frozen camelCase `ModelHeader` values or canonical snake_case wire JSON.
+
+Decoding any natively emitted v3.0 `"sona"` header (both minimal reference headers and fully populated headers exercising every optional field and union variant) via `decodeHeader` and re-encoding via `encodeHeader` plus `canonicalJson` produces byte-identical UTF-8 output and identical `immutableHeaderSha256` digests.
+
+`canonicalJson` delegates natively to enforce -0.0 normalization to `"0"`, UTF-16 code-unit sorting, finite checks, and absent/null optional field omission (`ref[sec.jcs.immutable-header-digest]`).
+
+Before hashing, canonicalization performs non-recursive stripping of the seven canonical paths: `presets`, `user_metadata`, `stem_user_metadata`, `metadata.signatures`, `controls_schema[*].user_metadata`, `stems_registry[*].user_metadata`, and `slimmable_tiers.{lite,full,pro,ultra}.prefix_crc32c`.
+
+### 4.2 `.dnam` Models (SONA v3.0 Wire Constants), `GramMatrix` & Tempo
+
+`r[sdk.ts.model.containers-and-gram]`
+
+Asynchronous `await Model.load(source)` accepts Node.js paths as well as `URL`, `Response`, `Blob`, `ArrayBuffer`, or `Uint8Array` inputs.
+
+Together with `Model.from(bytes)`, `Model.reference(options?)`, and `Model.build(header, arenaBytes)`, every factory validates the 64 B-aligned v3.0 `.dnam` container (`ref[container.dnam.load-validation]`, `ref[sdk.rust.zerocopy-wire-structs]`, `REQ-8.8`).
+
+Cumulative SONA v3.0 tier arena boundaries span `[4_608, 7_936, 15_872, 30_720]` B (72, 124, 248, and 480 64 B cache lines across Lite, Full, Pro, and Ultra). Arena 0 carries 1× Lite weights and self-contained parametric controls, while Arena 1..3 carry 2×-OS incremental deltas; loaders reject `versionMajor !== 3 || versionMinor !== 0` or non-`"sona"` headers fail-fast with `"ERR_DNAM_CONTAINER"`.
+
+Immutable `Model` properties expose `model.preamble`, `model.header`, `model.parameters`, `model.presets`, and `model.tierArenas`.
+
+Transform and factory methods include `model.withHeader(updater)` (in-place within the 4 KB page budget when unsealed), `model.withMaxTier(tier)` (tier-prefix stripping that preserves full Arena 0 controls even at Lite, `ref[container.dnam.tier-prefix]`), and `model.createEngine(options?)`.
+
+`GramMatrix` packs and unpacks symmetric sufficient-statistic matrices in canonical `uplo='U'` upper-triangular `Float64Array` layout via `GramMatrix.fromDense(matrix, dim)` and `gram.toDense()` (`ref[container.proj.stat-uplo-u]`).
+
+`@dnam-project/dnam/parameters` exposes `ControlSpace` (`ControlSpace.from`, `.clamp`, and zero-allocation `.clampNumericInto`) alongside `clampParameters(source, values): ClampReport`.
+
+Parameter normalization and clamping enforce the 3-Phase pipeline (`ref[train.audit.phase1.clamp-range]`, `ref[train.audit.phase1.clamp-switch]`, `ref[train.audit.phase1.clamp-stability]`).
+
+`@dnam-project/dnam/tempo` provides `computeZoh(...)`, `controlStride(sampleRate)`, `subdivisionPhase(...)`, and 32-step binary-search `invertTempoCalibration(...)` (`ref[dsp.tempo.physical-inversion]`).
 
 ### 4.3 Marketplace Provenance, Hardware Sealing & Forensic Watermarking
 
-`r[sdk.ts.provenance.v2-security]`
+`r[sdk.ts.provenance.security-and-drm]`
 
-1. **Fail-Closed Verification, Signing & OEM Certificates (`@dnam-project/dnam/provenance`):** Exposes `verify(model, options?)`, `enforcePolicy(header, profile)`, `immutableHeaderSha256(header)`, `ed25519` / `x25519` key utilities, `signCreatorHeader(...)`, `signMarketplaceReceipt(...)`, and `signDeviceCertificate(...)` / `verifyDeviceCertificate(...)` (`ref[sec.sig.prefix-delegation]`, `ref[sec.drm.oem-certificate]`). Both `verify` and `unseal` MUST fail closed (`DnamError` code `"ERR_DNAM_PROVENANCE"`) whenever a container carries commercial marketplace data (`authKind === 1` / `marketplaceReceipt != null`) or non-`open` protection (`protectionProfile !== "open"`) without a matching `trustedMarketplacePubkeyHex` or recipient key.
-2. **Canonical AEAD `.dnam-seal` (`DNSL`), `DAU1`/`DME1` & Preview Containment:** Exposes `seal(model, options)` and `unseal(bytes, options)` exclusively in canonical `v3.0` RFC 9180 HPKE (`0x0020/0x0001/0x0003`) + `ChaCha20-Poly1305` AEAD framing (`DnslPreambleWire`, `DnslDirectoryWire`, `InnerDirectoryWire`, `DnplPreambleWire`, `Dme1HeaderWire`, `HpkeSlotWire`, `RecordDirEntryWire`; `0` raw unauthenticated ChaCha20 XOR compatibility, `ref[sec.drm.dnsl-public-framing]`), `wrapDeviceCek(...)`, `encodeDau1` / `decodeDau1`, `buildDme1Header` / `parseDme1Plaintext` (`ref[sec.sig.dau1-envelope]`), and preview validators (`computePreviewWindow`, `validatePreviewSwitchOptions`, enforcing `.dnam-prev` `containerKind === "preview"` rejection via `"ERR_DNAM_PROVENANCE"` on both initial load and hot-swap `reload`, `ref[sec.preview.containment]`).
-3. **Dual-Mechanism Buyer Watermarking & Structural Hashing:** Exposes `applyGaugeWatermark(...)` (Mechanism A1 Stage III Kautz reciprocal scaling + `ControlBus` `SO(4)` rotation paired with Mechanism A2 `0-ULP` `40`-lane `SONA` sign-flip gauge), Layer 2 `[0.2, 0.8]` guard-band phase coding, `generateTardosCode(...)`, `applyTardosWatermark(...)` (disjoint `7,680`-coord linear partition with `binary16` `2 * fp16_ulp(w)` floor on linear `fp16` `W_readout`/`W_mod` entries, strictly excluding crossbar/`Stage 0`/nonlinear `SONA` core weights), `scoreTardosWatermark(...)`, `extractStructuralHash(...)` (`zerocopy` LE), and `structuralCosineSimilarity(...)` (`ref[sec.watermark.reciprocal-gauge]`, `ref[sec.watermark.tardos-code]`, `ref[sec.anticlone.stage3-fingerprint]`).
+`@dnam-project/dnam/provenance` delegates container verification, policy checks, signing, HPKE sealing, preview containment, buyer watermarking, and anti-cloning fingerprinting directly to the native provenance runtime ([Rust Implementation Specification](rust_sdk.md)).
 
-### 4.4 Vectorized `SONA` Reference DSP Kernels (`@dnam-project/dnam/dsp`)
+Both `verify` and `unseal` MUST fail closed (`"ERR_DNAM_PROVENANCE"`) whenever a container carries commercial data (`authKind === 1` or non-null `marketplaceReceipt`) or non-Open protection (`protectionProfile !== "open"`) without a matching `trustedMarketplacePubkeyHex` or recipient key:
+
+| Exported Group (`@dnam-project/dnam/provenance`) | Key Functions & Wire Contracts | Specification Reference |
+| :--- | :--- | :--- |
+| **Verification & Signing** | `verify`, `enforcePolicy`, `immutableHeaderSha256`, `signCreatorHeader`, `signMarketplaceReceipt`, `signDeviceCertificate`, `verifyDeviceCertificate` | `ref[sec.sig.prefix-delegation]`, `ref[sec.drm.oem-certificate]` |
+| **HPKE `.dnam-seal` (`DNSL`) & Envelopes** | `seal`, `unseal` (RFC 9180 HPKE `0x0020` / `0x0001` / `0x0003` + ChaCha20-Poly1305 AEAD), `encodeDau1`, `decodeDau1`, `buildDme1Header`, `parseDme1Plaintext` | `ref[sec.drm.dnsl-public-framing]`, `ref[sec.sig.dau1-envelope]` |
+| **Preview Containment (`.dnam-prev`)** | `computePreviewWindow`, `validatePreviewSwitchOptions`, plus DAW/hardware host rejection of `containerKind === "preview"` on load and hot-swap `reload` | `ref[sec.preview.containment]` |
+| **Buyer Watermarking & Structural Hash** | `applyGaugeWatermark` (Cabinet Kautz + `SO(4)` + 40-lane SONA sign-flip), `generateTardosCode`, `applyTardosWatermark` (7,680-coord partition with `2 * fp16_ulp(w)` floor), `scoreTardosWatermark`, `extractStructuralHash`, `structuralCosineSimilarity` | `ref[sec.watermark.reciprocal-gauge]`, `ref[sec.watermark.tardos-code]`, `ref[sec.anticlone.cabinet-fingerprint]` |
+
+`applyTardosWatermark` restricts perturbations strictly to linear Role B coordinates (`W_readout` and `W_mod` plus linear reserves), preserving crossbar, I/O Router, and nonlinear SONA core trajectories unaltered.
+
+### 4.4 Vectorized SONA Reference DSP Kernels (`@dnam-project/dnam/dsp`)
 
 `r[sdk.ts.dsp.reference-kernels]`
 
-1. **Operator & Control-Bus Reference Functions:** Exposes vectorized `Float64Array` slice and scalar reference kernels across:
-   - `transport` (`Op-T`): `catmullRomHermite`, `coerciveStep`, `tankSlice` (`ref[dsp.op-t.reader.catmull-rom]`).
-   - `modal` (`Op-M`): `modalStep`, `modalSlice`, `unitRotor`, `unitRotorSlice` (`ref[dsp.op-m.recurrence.symplectic]`, `ref[dsp.op-m.rotor.contractive]`).
-   - `nonlinear` (`Op-N` & `SONA` Core): `polyAdaaAlgebraic`, `polyAdaaStep`, `polyAdaaSlice`, `tptSvfStep`, `paraLruStep` (`ref[dsp.op-n.polyadaa.midpoint]`).
-   - `control-bus`: `lobattoBasis`, `rank4Fm`, `chebyshevLfo`, `trustRegionSoftclip` (`ref[dsp.ctrl.basis.lobatto]`, `ref[dsp.ctrl.op-n.trust-clip]`).
-   - `mixing`: `cubicLagrangeWeights`, `givensHouseholder8ch`, `givensHouseholder16ch` (`ref[dsp.stage4.spatial-tank]`).
-2. **Zero Per-Sample JS Loops:** All slice-accepting DSP functions execute in compiled Rust loops, support optional `{ output }` pre-allocated `Float64Array` buffers, and agree with their single-sample counterparts to `0 ULP`.
+`@dnam-project/dnam/dsp` exposes vectorized `Float64Array` slice and scalar reference kernels across five operator families:
+
+| Submodule / Operator | Exported Reference Kernels | Specification Reference |
+| :--- | :--- | :--- |
+| `transport` (`Op-T`) | `catmullRomHermite`, `catmullRomHermiteSlice`, `coerciveStep`, `tankSlice` | `ref[dsp.op-t.reader.catmull-rom]` |
+| `modal` (`Op-M`) | `modalStep`, `modalSlice`, `unitRotor`, `unitRotorSlice` | `ref[dsp.op-m.recurrence.symplectic]`, `ref[dsp.op-m.rotor.contractive]` |
+| `nonlinear` (`Op-N` & SONA Core) | `polyAdaaAlgebraic`, `polyAdaaStep`, `polyAdaaSlice` | `ref[dsp.op-n.polyadaa.midpoint]` |
+| `control-bus` | `lobattoBasis`, `lobattoBasisSlice`, `rank4Fm`, `rank4FmSlice`, `chebyshevLfo`, `chebyshevLfoSlice`, `trustRegionSoftclip`, `trustRegionSoftclipSlice` | `ref[dsp.ctrl.basis.lobatto]`, `ref[dsp.ctrl.op-n.trust-clip]` |
+| `mixing` | `cubicLagrangeWeights`, `cubicLagrangeWeightsSlice`, `givensHouseholder8ch`, `givensHouseholder8chSlice`, `givensHouseholder16ch`, `givensHouseholder16chSlice` | `ref[dsp.tank.feedback-loop]` |
+
+All slice-accepting DSP functions execute in compiled native loops (`ref[sdk.rust.shared-nostd-kernels]`) with zero per-sample JavaScript iteration, accept optional `{ output }` pre-allocated `Float64Array` buffers, and agree with their single-sample counterparts to 0 ULP.
 
 ### 4.5 Lock-Free WebAudio `AudioWorklet` Bridge & Browser `navigator.gpu` WebGPU Trainer
 
 `r[sdk.ts.web-audio.realtime-bridge]`
 
-1. **`DnamAudioNode<TParams>` & Worklet Processor (`@dnam-project/dnam/web-audio`):** `DnamAudioNode.create(context, model, options?)` registers the standalone zero-dependency `web-audio-processor.js` module, passes the pre-compiled `WebAssembly.Module`, optional `shared: true` `WebAssembly.Memory` (`wasmMemory`, `initialMemoryPages`, `maximumMemoryPages`, `sharedWasmMemory`), and `v3.0` container bytes via `processorOptions`, and exposes the same `node.parameters.get(id)` `Parameter` API, `node.applyPreset(id)`, `node.tempo`, `node.bypass(...)`, `node.freeze(...)`, and typed `"telemetry"` events, verified end-to-end in headless Chromium (`OfflineAudioContext` + `AudioWorkletNode`) via `@vitest/browser-playwright`.
-2. **Lock-Free `SharedArrayBuffer` (`Atomics`) with `MessagePort` Fallback:** When `crossOriginIsolated === true`, parameter updates, transport commands, and telemetry snapshots are exchanged via a lock-free `SharedArrayBuffer` (`Int32Array` / `Float32Array` + `Atomics`) with zero allocations on the audio rendering thread; when `crossOriginIsolated === false`, the bridge transparently falls back to `MessagePort`.
-3. **Browser `navigator.gpu` WebGPU Trainer Driver (`0 KB` Added to `dnam.wasm`):** Browser background workers accelerate `SONA` `v3.0` capture training directly via `navigator.gpu` (`REQ-4.1`, `REQ-4.2`, `REQ-4.3`, `ref[train.pipeline.webgpu-scans-and-ozaki]`):
-   - Loads and compiles checked-in, `naga`-validated `.wgsl` compute pipelines (`prescreen_population.wgsl`, `fused_core_scan_256.wgsl`, `adjoint_scan_256.wgsl`, `gabor_bezout_grad.wgsl`, `ozaki_gram_rhs_i32.wgsl`, `inner_opt_step.wgsl`) via `device.createShaderModule` / `createComputePipeline` without embedding shader source strings or WGSL compilers in `dnam.wasm` (**`0 KB` added to `dnam.wasm`**).
-   - Runs `< 1 ms` startup WGSL numerics probes (`i32` Ozaki dot exactness, `pow2_ceil_fp32`, and `device.limits` checks including `>= 16 KiB` `var<workgroup>` SRAM and optional `subgroups`).
-   - Enforces **`<= 128 MiB` per GPU storage binding** (`maxStorageBufferBindingSize`) and **`< 256 MiB` total browser worker memory** (`256×` activation checkpointing + 2-D `RESIDENT_BATCHED`/`STREAMED` planner + `~132 KiB` async `mapAsync` Ozaki readbacks into host WASM `f64` `VarPro`), falling back seamlessly to **`WasmSimd128TrainerBackend` (`< 64 MiB` total worker cap)** whenever `navigator.gpu` is absent or fails numerics probes.
+`DnamAudioNode.create(context, model, options?)` in `@dnam-project/dnam/web-audio` registers the standalone zero-dependency `web-audio-processor.js` module and forwards the pre-compiled `WebAssembly.Module`, optional shared `WebAssembly.Memory`, and v3.0 container bytes via `processorOptions`.
+
+Each node instance exposes the identical `node.parameters`, `node.applyPreset(id)`, `node.tempo`, `node.bypass(...)`, `node.freeze(...)`, and typed `"telemetry"` events as the synchronous `Engine` API.
+
+End-to-end Worklet rendering is verified in headless Chromium (`OfflineAudioContext` plus `AudioWorkletNode`) via `@vitest/browser-playwright`.
+
+When `crossOriginIsolated === true`, parameter updates, transport commands, and telemetry snapshots flow across a lock-free `SharedArrayBuffer` (`Int32Array` / `Float32Array` + `Atomics`) with zero allocations on the audio thread. When `crossOriginIsolated === false`, the bridge falls back transparently to `MessagePort`.
+
+The planned M6 browser `navigator.gpu` trainer driver (`src/trainer/`, internal to `@dnam-project/dnam`) accelerates SONA v3.0 capture training in background Web Workers (`REQ-4.1`, `REQ-4.2`, `REQ-4.3`, `ref[train.pipeline.webgpu-scans-and-ozaki]`):
+
+| Browser Trainer Component | Normative Resource & Shader Contract |
+| :--- | :--- |
+| **Checked-In AOT `.wgsl` Pipelines** | Compiles `naga`-validated `.wgsl` files (`prescreen_population.wgsl`, `fused_core_scan_256.wgsl`, `adjoint_scan_256.wgsl`, `gabor_bezout_grad.wgsl`, `ozaki_gram_rhs_i32.wgsl`, `inner_opt_step.wgsl`) via `device.createShaderModule` with 0 KB added to `dnam.wasm`. |
+| **Startup Probes & Memory Planner** | Runs < 1 ms startup WGSL numerics probes (`i32` Ozaki dot exactness, `pow2_ceil_fp32`, >= 16 KiB workgroup SRAM), enforces <= 128 MiB per storage binding and < 256 MiB total browser worker memory (256× checkpointing, 2-D `RESIDENT_BATCHED`/`STREAMED` planner, ~132 KiB `mapAsync` Ozaki readbacks to host WASM `f64` VarPro), and falls back to the WebAssembly SIMD128 CPU trainer path (< 64 MiB worker cap) when `navigator.gpu` is absent or fails probes. |
 
 ### 4.6 Profiling Methodology & Real-Time FFI Overhead Budgets
 
 `r[sdk.ts.perf.profiling-budgets]`
 
-1. **3-Target Build Pipeline (`debug`, `release`, `profiling`) & Symbolicated WASM Profiling (`moon run js:test`, `moon run js:build`, `moon run js:bench`, `moon run js:profile`):**
-   - `packages/js/scripts/build_wasm.mjs` supports three targets aligned with the workspace Cargo profiles, outputting native N-API addons into `dist/native/{release,debug,profiling}/dnam.<platform>-<arch>.node` and WebAssembly binaries into `dist/wasm/{release,debug,profiling}/dnam.wasm` (with `dist/native/{debug,profiling}` and `dist/wasm/{debug,profiling}` excluded in `package.json` `"files"` so only `release` artifacts are publishable):
-     - **`--debug` (`moon run js:build-rust-debug`, used by `js:test` & `js:coverage`):** Compiles `dnam-js` under `[profile.dev]` (`opt-level = 1`, `debug = "line-tables-only"`, with `--config profile.dev.strip="debuginfo"` on `wasm32-unknown-unknown`) into `dist/native/debug/` and `dist/wasm/debug/dnam.wasm`, skipping Binaryen `wasm-opt` for fast test iteration.
-     - **`--release` (`moon run js:build-rust`, used by `js:build`):** Compiles `dnam-js` under `[profile.release]` (`opt-level = 3`, `lto = "thin"`, `codegen-units = 16`, `panic = "abort"`, `strip = "symbols"`) and runs Binaryen `wasm-opt -O1 --strip-dwarf --strip-producers --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals` into `dist/native/release/dnam.<platform>-<arch>.node` and `dist/wasm/release/dnam.wasm`.
-     - **`--profiling` (`moon run js:build-rust-profiling`, used by `js:bench` & `js:profile`):** Compiles `dnam-js` under `[profile.profiling]` (`inherits = "release"`, `debug = "line-tables-only"`, `strip = "none"`) and runs Binaryen `wasm-opt -O1 --debuginfo` into `dist/native/profiling/` and `dist/wasm/profiling/dnam.wasm`, guaranteeing identical `-O3` / `lto = "thin"` / `-O1` codegen to `release` while preserving native symbol tables and the WebAssembly `"name"` custom section so V8 `--cpu-prof` (`packages/js/scripts/profile_sdk.mjs`) attributes samples directly to Rust symbols in `dnam-engine`.
-   - `packages/js/src/engine/engine.bench.ts`, `packages/js/src/web-audio/web-audio.browser.bench.ts`, and `packages/js/tests/profile/profile-sdk.test.ts` benchmark and enforce per-block processing latency for both `N-API v10` and `WASM SIMD128` (Node.js and Chromium bounded/shared `WebAssembly.Memory`) across `lite`, `full`, `pro`, and `ultra` tiers, `ControlSpace.clampNumericInto`, `decodeHeader` / `encodeHeader` / `headerToJcs`, and `crc32c`.
-   - `packages/js/tests/integration/parity-and-public-api.test.ts` executes every runnable script in `packages/js/examples/` and uses `fast-check` property-based tests across all unit and integration suites.
-2. **4-Lane `WasmSimd128Backend` Parity, `StereoVec8` Dispatch & Real-Time Budget:**
-   - `WasmSimd128Backend` (`packages/kernels` / `packages/engine`) implements 4-lane `v128` `f32x4_to_fp16x4`, `fp16x4_to_f32x4`, batched `rcp_pos_quad_nr2`, and `flush_subnormal` (`ref[arch.fp.callback-env]`, `ref[arch.simd.lane-packing]`), paired with interleaved `2 × SimdVec4` stage kernels across `SonaInstance` (`Lite` `[1,1,1,1] @ 1×`, `Full` `[2,2,1,1] @ 2×`, `Pro` `[3,2,2,1] @ 2×`, `Ultra` `[4,3,2,1] @ 2×`; `tank_quads = [1, 2, 3, 4]` = `[4, 8, 12, 16]` Stage IV delay lines) and the `3 kHz` Control Bus.
-   - To preserve `L1i` locality and compact binary size (`0 KB` added to `dnam.wasm` for `.wgsl` WebGPU compute kernels), `SonaInstance::process_tick16_const`, `step_frame_4x`, `step_frame_4port`, `step_frame_4x_4port`, `step_control_tick_3khz`, and `refresh_collapsed_head_weights` use `#[inline(never)]` so each backend compiles a single L1i-resident `16`-frame register-hoisted kernel instead of duplicating inlined copies across block entrypoints, and `DnamJsonHeader` / `DnamProjManifest` expose non-generic `#[inline(never)]` `from_json_slice` / `to_json_vec` entrypoints to prevent cross-CGU `serde_json` monomorphization bloat.
-   - At `48 kHz` stereo (`128`-frame WebAudio quantum = `2,666.67 us` real-time budget), both `N-API v10` (`scalar` / `neon` / `x86-simd` / `arm-sme`) and `WASM SIMD128` (Node.js and Chromium bounded/`SharedArrayBuffer` `WebAssembly.Memory`) in-place `engine.process(input, { output })` must execute in `< 250 us/block` (`> 10x` real-time headroom) with zero JS heap allocations on the in-place path:
+`packages/js/scripts/build_wasm.mjs` compiles native N-API addons into `dist/native/{release,debug,profiling}/dnam.<platform>-<arch>.node` and WebAssembly binaries into `dist/wasm/{release,debug,profiling}/dnam.wasm`. Only `release` directories are included in `package.json` `"files"`:
 
-| Target & Memory Mode | `lite` (`[1,1,1,1] @ 1×` / `1` tank quad / `32` FIR) | `full` (`[2,2,1,1] @ 2×` / `2` tank quads / `48` FIR) | `pro` (`[3,2,2,1] @ 2×` / `3` tank quads / `96` FIR) | `ultra` (`[4,3,2,1] @ 2×` / `4` tank quads / `128` FIR) | Real-Time Block Budget (`128` Frames @ `48 kHz`) |
+| Build Flag | Moon Task & Outputs | Optimization Target & Binaryen Pass |
+| :--- | :--- | :--- |
+| `--debug` | `js:build-rust-debug` -> `dist/{native,wasm}/debug/` | Debug target (minimal optimization, line-table diagnostics, stripped symbols on `wasm32-unknown-unknown`); skips `wasm-opt` for fast `js:test` and `js:coverage` iteration. |
+| `--release` | `js:build-rust` -> `dist/{native,wasm}/release/` | Release target (maximum optimization, thin cross-module link optimization, abort-on-trap, stripped symbols) plus Binaryen `wasm-opt` with SIMD and bulk-memory passes. |
+| `--profiling` | `js:build-rust-profiling` -> `dist/{native,wasm}/profiling/` | Profiling target (release optimization with line-table diagnostics and unstripped symbols) plus `wasm-opt -O1 --debuginfo`, retaining WebAssembly `"name"` symbols for V8 CPU profiling (`profile_sdk.mjs`). |
+
+`packages/js/src/engine/engine.bench.ts`, `packages/js/src/web-audio/web-audio.browser.bench.ts`, and `packages/js/tests/profile/profile-sdk.test.ts` benchmark per-block audio latency for N-API v10 and WASM SIMD128 across Lite, Full, Pro, and Ultra tiers.
+
+Throughput suites also profile `ControlSpace.clampNumericInto` (alongside `ControlSpace.clamp` and `clampParameters`), `decodeHeader`, `encodeHeader`, `headerToJcs`, and `crc32c`.
+
+`packages/js/tests/integration/parity-and-public-api.test.ts` runs all `packages/js/examples/` scripts and `fast-check` property suites.
+
+The WebAssembly SIMD128 and shared portable math backends defined in the [Rust Implementation Specification](rust_sdk.md) (`ref[sdk.rust.explicit-simd-and-coverage]`, `ref[sdk.rust.shared-nostd-kernels]`) implement 4-lane SIMD128 floating-point, `fp16` packing, subnormal-flushing, and Newton–Raphson reciprocal primitives.
+
+Floating-point and SIMD lane layouts follow `ref[arch.fp.callback-env]` and `ref[arch.simd.lane-packing]`, pairing interleaved 8-lane stereo SIMD cascade kernels across all four SONA tiers ([1,1,1,1] at 1× Lite, [2,2,1,1] at 2× Full, [3,2,2,1] at 2× Pro, [4,3,2,1] at 2× Ultra; 1–4 tank quads = 4–16 Spatial Tank lines) and the 3 kHz Control Bus.
+
+To preserve L1 instruction-cache locality and keep `dnam.wasm` compact (with 0 KB added for `.wgsl` shaders), the native audio-loop and JSON schema boundaries prevent cross-unit inlining and monomorphization bloat per the [Rust Implementation Specification](rust_sdk.md) (`ref[sdk.rust.c-abi-and-host-handle]`).
+
+At 48 kHz stereo (where a 128-frame WebAudio quantum equals 2,666.67 us), in-place `engine.process(input, { output })` on both N-API v10 and WASM SIMD128 (bounded or `SharedArrayBuffer` `WebAssembly.Memory`) must meet these budgets with zero JS heap allocations:
+
+| Target & Memory Mode | `lite` (`[1,1,1,1]` @ 1× / 1 tank quad / 32 FIR) | `full` (`[2,2,1,1]` @ 2× / 2 tank quads / 48 FIR) | `pro` (`[3,2,2,1]` @ 2× / 3 tank quads / 96 FIR) | `ultra` (`[4,3,2,1]` @ 2× / 4 tank quads / 128 FIR) | Real-Time Block Budget (128 Frames @ 48 kHz) |
 | :--- | :---: | :---: | :---: | :---: | :---: |
-| **Node.js 26 `N-API v10` (`neon` / `avx2` / `sme`)** | In-place `< 250 us` | In-place `< 250 us` | In-place `< 250 us` | In-place `< 250 us` | **`< 250 us`** (`> 10x` real-time headroom, `0` JS allocs) |
-| **Node.js 26 / Chromium `WASM SIMD128` (`bounded` / `shared`)** | In-place `< 250 us` | In-place `< 250 us` | In-place `< 250 us` | In-place `< 250 us` | **`< 250 us`** (`> 10x` real-time headroom, `0` JS allocs) |
-| **Browser Trainer (`navigator.gpu` / `WasmSimd128` Fallback)** | `<= 128 MiB`/binding | `<= 128 MiB`/binding | `<= 128 MiB`/binding | `<= 128 MiB`/binding | **`< 256 MiB` WebGPU** / **`< 64 MiB` WASM CPU** (`0 KB` `dnam.wasm` shader bloat) |
+| **Node.js 26 N-API v10 (`neon` / `avx2` / `sme`)** | In-place < 250 us | In-place < 250 us | In-place < 250 us | In-place < 250 us | < 250 us (> 10x real-time headroom, 0 JS allocs) |
+| **Node.js 26 / Chromium WASM SIMD128 (`bounded` / `shared`)** | In-place < 250 us | In-place < 250 us | In-place < 250 us | In-place < 250 us | < 250 us (> 10x real-time headroom, 0 JS allocs) |
+| **Browser Trainer (`navigator.gpu` / `WasmSimd128` Fallback)** | <= 128 MiB/binding | <= 128 MiB/binding | <= 128 MiB/binding | <= 128 MiB/binding | < 256 MiB WebGPU / < 64 MiB WASM CPU (0 KB `dnam.wasm` shader bloat) |

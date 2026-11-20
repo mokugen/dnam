@@ -1,6 +1,6 @@
 /**
  * Marketplace v2 authentication (`DAU1`), encrypted mutable trailers (`DME1`), plaintext mutable
- * trailers (`DMU1`), HPKE recipient slots, and record directories (`ref[sdk.ts.provenance.v2-security]`,
+ * trailers (`DMU1`), HPKE recipient slots, and record directories (`ref[sdk.ts.provenance.security-and-drm]`,
  * `ref[sec.sig.dau1-envelope]`).
  *
  * @module

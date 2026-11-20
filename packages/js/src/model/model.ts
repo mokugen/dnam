@@ -1,7 +1,7 @@
 /**
  * Immutable, validated `.dnam` deployment artifact (`Model<TParams>`) supporting inspection,
  * `DMU1` mutable suffix updates, tier prefix stripping, and `Engine` creation
- * (`ref[sdk.ts.model.containers-and-checkpoints]`, `ref[sdk.ts.api.resources-and-data]`).
+ * (`ref[sdk.ts.model.containers-and-gram]`, `ref[sdk.ts.api.resources-and-data]`).
  *
  * @module
  */
@@ -81,7 +81,7 @@ export interface V2OpenLayoutInfo {
 }
 
 /**
- * Computes the Castagnoli `CRC32C` checksum over `data` (`ref[sdk.ts.model.containers-and-checkpoints]`).
+ * Computes the Castagnoli `CRC32C` checksum over `data` (`ref[sdk.ts.model.containers-and-gram]`).
  */
 export function crc32c(data: Uint8Array | ArrayBuffer | ArrayBufferView): number {
   return getActiveDriver().crc32c(coerceBytes(data));
@@ -89,7 +89,7 @@ export function crc32c(data: Uint8Array | ArrayBuffer | ArrayBufferView): number
 
 /**
  * Immutable, validated `.dnam` deployment model container (`ref[sdk.ts.api.resources-and-data]`,
- * `ref[sdk.ts.model.containers-and-checkpoints]`).
+ * `ref[sdk.ts.model.containers-and-gram]`).
  *
  * @example
  * ```ts
@@ -299,7 +299,7 @@ export class Model<TParams extends ParameterValueMap = Record<string, number | s
 
   /**
    * Returns a new `Model` with its `DMU1` mutable trailer updated in-place (or rebuilt when
-   * unsigned and immutable fields change) (`ref[sdk.ts.model.containers-and-checkpoints]`).
+   * unsigned and immutable fields change) (`ref[sdk.ts.model.containers-and-gram]`).
    *
    * Accepts either a replacement `ModelHeader` or an updater callback `(currentHeader) => nextHeader`.
    */

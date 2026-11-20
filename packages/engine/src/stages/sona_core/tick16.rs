@@ -577,7 +577,7 @@ mod tests {
     use crate::stages::sona_core::model::{SonaColdTierModel, SonaMatryoshkaModel};
     use crate::types::FtzDazGuard;
 
-    /// verify[dsp.stage1.pre-bus]
+    /// verify[dsp.crossbar.top-of-frame]
     #[test]
     fn test_op_p_skipped_when_crossbar_inactive_and_head_peel_parity() {
         let _g = FtzDazGuard::new();

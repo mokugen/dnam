@@ -1,5 +1,5 @@
 //! Reference `f64` `Op-T` Transport, Tank Mixing & Control-Plane Mathematical Kernels
-//! (`ref[dsp.op-t.reader.catmull-rom]`, `ref[dsp.stage4.spatial-tank]`,
+//! (`ref[dsp.op-t.reader.catmull-rom]`, `ref[dsp.tank.feedback-loop]`,
 //! `ref[dsp.ctrl.basis.lobatto]`, `ref[dsp.ctrl.op-n.trust-clip]`).
 
 /// Reference `f64` 4-tap Catmull-Rom cubic delay interpolation (`ref[dsp.op-t.reader.catmull-rom]`).
@@ -28,7 +28,7 @@ pub fn cubic_lagrange_weights_f64(mu: f64) -> [f64; 4] {
     ]
 }
 
-/// Reference `f64` 8-channel Orthogonal Givens + Householder mixing matrix (`ref[dsp.stage4.spatial-tank]`).
+/// Reference `f64` 8-channel Orthogonal Givens + Householder mixing matrix (`ref[dsp.tank.feedback-loop]`).
 pub fn givens_householder_mix_8ch_f64(x: &[f64; 8], cos_psi: f64, sin_psi: f64) -> [f64; 8] {
     let mut g_rot = [0.0_f64; 8];
     for p in 0..4 {
@@ -49,7 +49,7 @@ pub fn givens_householder_mix_8ch_f64(x: &[f64; 8], cos_psi: f64, sin_psi: f64) 
     out
 }
 
-/// Reference `f64` 16-channel Orthogonal Givens + Householder mixing matrix (`ref[dsp.stage4.spatial-tank]`).
+/// Reference `f64` 16-channel Orthogonal Givens + Householder mixing matrix (`ref[dsp.tank.feedback-loop]`).
 pub fn givens_householder_mix_16ch_f64(
     x: &[f64; 16],
     cos_psi: f64,
@@ -82,7 +82,7 @@ pub fn givens_householder_mix_16ch_f64(
 }
 
 /// Reference `f64` single-sample Op-T Coercive-Saturating Lyapunov loop step with exact gain-normalized
-/// $5\text{ Hz}$ DC blocker (`ref[dsp.stage4.dc-blocker]`, `ref[dsp.stage4.loop-saturator]`, `ref[dsp.stage4.quiet-feedback-knee]`).
+/// $5\text{ Hz}$ DC blocker (`ref[dsp.tank.dc-blocker]`, `ref[dsp.tank.loop-saturator]`, `ref[dsp.tank.quiet-feedback-knee]`).
 #[inline]
 pub fn op_t_coercive_step_f64(
     u_in: f64,

@@ -1,5 +1,5 @@
 //! Node-API v10 `.dnam` container & `uplo='U'` Gram matrix bindings
-//! (`ref[sdk.ts.model.containers-and-checkpoints]`).
+//! (`ref[sdk.ts.model.containers-and-gram]`).
 
 use napi::bindgen_prelude::{Float64Array, Result, Uint8Array};
 use napi_derive::napi;

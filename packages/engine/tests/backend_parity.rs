@@ -5,10 +5,10 @@
 //! - `verify[dsp.op-m.recurrence.stereo-simd]`
 //! - `verify[dsp.op-m.tracker.stereo-batching]`
 //! - `verify[dsp.op-n.polyadaa.stereo-and-rail-guard]`
-//! - `verify[dsp.op-n.stage2.conv6-simd]`
+//! - `verify[dsp.op-n.core.stereo-simd]`
 //! - `verify[dsp.op-t.reader.contiguous-fp16x4]`
-//! - `verify[dsp.stage3.mirrored-fir-simd]`
-//! - `verify[dsp.stage4.simd-tank-loop]`
+//! - `verify[dsp.cabinet.mirrored-fir-simd]`
+//! - `verify[dsp.tank.simd-loop]`
 //! - `verify[dsp.head.precollapse-and-zerocopy]`
 //! - `verify[dsp.ctrl.op-n.static-and-interior-fastpath]`
 //! - `verify[dsp.ctrl.dispatch.sparse-and-active-ramps]`

@@ -1,7 +1,7 @@
 //! Causal top-of-frame fractional delay transport (`Op-T`), partition-of-unity granular/barberpole
 //! windowing, partitioned Schroeder all-pass diffusion, lossless freeze, and coercive feedback
 //! limiting (`ref[dsp.op-t.reader.catmull-rom]`, `ref[dsp.op-t.zero-fdiv]`,
-//! `ref[repo.code.shared-nostd-kernels]`).
+//! `ref[sdk.rust.shared-nostd-kernels]`).
 //!
 //! All runtime routines are strictly 32-bit, `#![no_std]`, division-free (`0 FDIV` / `0 UDIV`), and
 //! `libm`-free (`ref[repo.code.constant-eval-and-derivations]`).
@@ -31,10 +31,10 @@ const LOOP_LIMIT_MIN_SIGMA: f32 = 1.0e-4;
 /// Maximum coercive soft-limit ceiling keeping `sigma * inv_sigma` strictly finite.
 const LOOP_LIMIT_MAX_SIGMA: f32 = 1.0e12;
 
-/// Stage IV cubic soft-knee linear coefficient `1.5` (`ref[dsp.stage4.loop-saturator]`).
+/// Stage IV cubic soft-knee linear coefficient `1.5` (`ref[dsp.tank.loop-saturator]`).
 const LOOP_KNEE_THREE_HALVES: f32 = 1.5;
 
-/// Stage IV cubic soft-knee cubic coefficient `0.5` (`ref[dsp.stage4.loop-saturator]`).
+/// Stage IV cubic soft-knee cubic coefficient `0.5` (`ref[dsp.tank.loop-saturator]`).
 const LOOP_KNEE_HALF: f32 = 0.5;
 
 /// Minimum causal delay floor in samples guaranteeing zero crossbar write collision
@@ -370,7 +370,7 @@ pub fn step_schroeder_quad_vec4<V: KernelVec4>(x: V, delayed: V, g: V) -> (V, V)
 }
 
 /// Writes `val` to a power-of-two `f32` delay ring only when `freeze == false`
-/// (`ref[dsp.stage4.captured-freeze]`).
+/// (`ref[dsp.tank.captured-freeze]`).
 ///
 /// Preserves exact `0-ULP` lossless buffer hold during freeze and safely ignores invalid ring/mask
 /// combinations.
@@ -388,7 +388,7 @@ pub fn write_ring_with_freeze_f32(
 }
 
 /// Applies the Stage IV unity-slope cubic saturator and bounded loop gain (`||G_loop|| < 1.0`,
-/// `0 FDIV`, `ref[dsp.stage4.loop-saturator]`, `ref[dsp.stage4.quiet-feedback-knee]`).
+/// `0 FDIV`, `ref[dsp.tank.loop-saturator]`, `ref[dsp.tank.quiet-feedback-knee]`).
 ///
 /// Guarantees `|out| <= MAX_LOOP_GAIN_F32 * soft_limit` and contractive small-signal slope
 /// `<= max_gain` without any runtime division or branches.

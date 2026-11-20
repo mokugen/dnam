@@ -44,7 +44,7 @@ export function catmullRomHermiteSlice(options: {
 }
 
 /**
- * Single-sample Op-T coercive-saturating Lyapunov loop step (`ref[dsp.stage4.loop-saturator]`).
+ * Single-sample Op-T coercive-saturating Lyapunov loop step (`ref[dsp.tank.loop-saturator]`).
  */
 export function coerciveStep(options: {
   readonly uIn: number;

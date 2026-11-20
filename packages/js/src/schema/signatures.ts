@@ -1,7 +1,7 @@
 /**
  * Model metadata, dataset provenance, distribution policy, `Ed25519` signatures, marketplace
  * receipts, and OEM device certificates (`ref[sdk.ts.schema.camel-case-codec-parity]`,
- * `ref[sdk.ts.provenance.v2-security]`).
+ * `ref[sdk.ts.provenance.security-and-drm]`).
  *
  * Zero runtime JS dependencies; validated by native Rust `serde` (`dnam_engine::schema`).
  *

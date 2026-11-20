@@ -3,7 +3,7 @@
 //! `solver::stage_c_knobs`).
 //!
 //! Canonical References:
-//! - `docs/specs/training/four_stage_pipeline.md` (`ref[train.pipeline.stage-d-control]`)
+//! - `docs/specs/training/webgpu_and_varpro_solver.md` (`ref[train.pipeline.control-projection-fit]`)
 //! - `docs/specs/dsp/parametric_control_bus.md` (`ref[dsp.ctrl.accum.cp1-scaling]`, `ref[dsp.ctrl.accum.anova-fm]`)
 
 mod jacobian;
@@ -41,7 +41,7 @@ const A5_STATIONARY_OFFSET: usize = A5_ACTIVE_BURST_END - A5_STATIONARY_FIT_LEN;
 const _: () = assert!(A5_STATIONARY_OFFSET >= CORESET_A5_FRAMES_48K / 2);
 const _: () = assert!(A5_STATIONARY_OFFSET + A5_STATIONARY_FIT_LEN == A5_ACTIVE_BURST_END);
 
-/// Output from Stage C multi-knob / switch projection (`r[train.pipeline.stage-d-control]`).
+/// Output from Stage C multi-knob / switch projection (`r[train.pipeline.control-projection-fit]`).
 #[derive(Debug, Clone)]
 pub struct StageCKnobsOutput {
     /// Wall-clock Stage C duration in milliseconds.

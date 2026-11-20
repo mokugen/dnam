@@ -9,7 +9,7 @@
 pub use dnam_kernels::simd::const_eval::*;
 
 /// Robertson/Lomont minimax `binary64` global two-binade inverse-square-root seed
-/// (`docs/specs/dsp/op_n_commuted_cascade.md` §1.2).
+/// (`docs/specs/dsp/op_n_paralru_and_polyadaa.md` §1.2).
 pub const IEEE754_F64_RSQRT_SEED: u64 = 0x5FE6_EB50_C7B5_37A9;
 
 /// Compile-time `5 Hz` Stage IV passband-normalized DC blocker pole at `48 kHz` (`0x3F7F_D51F`).
@@ -129,7 +129,7 @@ pub const fn const_tan_f64(x: f64) -> f64 {
 }
 
 /// Compile-time passband-normalized DC blocker pole `R = cos(w) / (1 + sin(w))` rounded to `f32`
-/// (`ref[dsp.stage4.dc-blocker]`).
+/// (`ref[dsp.tank.dc-blocker]`).
 #[must_use]
 pub const fn const_dc_blocker_pole_f32(fc_hz: f64, fs_hz: f64) -> f32 {
     let omega = core::f64::consts::TAU * fc_hz / fs_hz;
@@ -138,7 +138,7 @@ pub const fn const_dc_blocker_pole_f32(fc_hz: f64, fs_hz: f64) -> f32 {
 }
 
 /// Solves the exact closed-form $C^1$-clamped rational Padé-`[5/4]` $\tanh(x)$ linear system
-/// at clamping radius `r` (`docs/specs/dsp/op_n_commuted_cascade.md` §1.2), returning `[n1, n2, d1, d2]`.
+/// at clamping radius `r` (`docs/specs/dsp/op_n_paralru_and_polyadaa.md` §1.2), returning `[n1, n2, d1, d2]`.
 #[must_use]
 pub const fn const_c1_clamped_tanh_coeffs(r: f64) -> [f64; 4] {
     let r2 = r * r;

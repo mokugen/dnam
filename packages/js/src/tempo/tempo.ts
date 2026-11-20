@@ -1,6 +1,6 @@
 /**
  * Live `TempoController` (`engine.tempo`, `node.tempo`) and offline ZOH / tempo calibration
- * utilities (`ref[sdk.ts.model.containers-and-checkpoints]`, `ref[dsp.tempo.physical-inversion]`).
+ * utilities (`ref[sdk.ts.model.containers-and-gram]`, `ref[dsp.tempo.physical-inversion]`).
  *
  * @module
  */

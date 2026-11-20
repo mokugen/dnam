@@ -202,7 +202,7 @@ impl<'a> DynamicDnamEngine<'a> {
     }
 
     /// Returns whether this model supports captured hardware freeze (`supports_freeze == true` or
-    /// a `FreezeLatch`-calibrated control in `controls_schema`, `ref[dsp.stage4.captured-freeze]`).
+    /// a `FreezeLatch`-calibrated control in `controls_schema`, `ref[dsp.tank.captured-freeze]`).
     #[inline]
     pub fn supports_freeze(&self) -> bool {
         dispatch_engine!(self, e => e.supports_freeze())

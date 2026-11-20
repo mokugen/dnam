@@ -1,6 +1,6 @@
 //! Target-agnostic 3-Phase control clamping (`ControlSpaceCore`), ZOH rescaling, and tempo
 //! calibration inversion (`ref[sdk.ts.parameters.audio-param-semantics]`,
-//! `ref[sdk.ts.model.containers-and-checkpoints]`).
+//! `ref[sdk.ts.model.containers-and-gram]`).
 
 use dnam_engine::container::ZohRescaledParams;
 use dnam_engine::control::{

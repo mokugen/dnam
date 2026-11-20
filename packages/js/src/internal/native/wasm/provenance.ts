@@ -1,6 +1,6 @@
 /**
  * WebAssembly v2 provenance, Ed25519/X25519 signing, ChaCha20/`DAU1`/`DME1` sealing,
- * and preview/royalty validation delegates (`ref[sdk.ts.provenance.v2-security]`).
+ * and preview/royalty validation delegates (`ref[sdk.ts.provenance.security-and-drm]`).
  * Zero `node:*` dependencies.
  *
  * @module

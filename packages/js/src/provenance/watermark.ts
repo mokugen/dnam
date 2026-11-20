@@ -1,8 +1,8 @@
 /**
  * Dual-mechanism buyer watermarking (Isometric Gauge + Coupled Tardos-7680), 224-D Gauge-Invariant
  * Structural Hash, Stage III tier-local fingerprint, and HMAC-SHA256 seed derivation
- * (`ref[sdk.ts.provenance.v2-security]`, `ref[sec.watermark.tardos-code]`,
- * `ref[sec.anticlone.stage3-fingerprint]`).
+ * (`ref[sdk.ts.provenance.security-and-drm]`, `ref[sec.watermark.tardos-code]`,
+ * `ref[sec.anticlone.cabinet-fingerprint]`).
  *
  * @module
  */
@@ -99,7 +99,7 @@ export function scoreTardosWatermark(options: {
 
 /**
  * Extracts the prefix-composable `4 x 56-D = 224-D` Gauge-Invariant Structural Hash vector from
- * a `Model` or `arenaBytes` (`ref[sec.anticlone.stage3-fingerprint]`).
+ * a `Model` or `arenaBytes` (`ref[sec.anticlone.cabinet-fingerprint]`).
  */
 export function extractStructuralHash<
   TParams extends ParameterValueMap = Record<string, number | string>,

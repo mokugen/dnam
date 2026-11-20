@@ -1,7 +1,7 @@
 //! `DME1` Encrypted Mutable Suffix, Watermark Seed Derivation (`HMAC-SHA256`), Stage III Tier-Local
 //! Structural Fingerprinting & Preview Containment.
 //!
-//! Canonical Reference: `docs/specs/security/provenance_and_enclave_drm.md` & `docs/specs/security/watermarking_and_marketplace.md` (`ref[sec.drm.dme1-mutable-suffix]`, `ref[sec.drm.protected-inner-framing]`, `ref[sec.watermark.seed-derivation]`, `ref[sec.anticlone.three-stage-gate]`, `ref[sec.anticlone.stage3-fingerprint]`, `ref[sec.preview.containment]`, `ref[sec.preview.royalty-splits]`, `ref[sec.preview.storefront-metadata]`, `ref[sec.edge.data-model]`).
+//! Canonical Reference: `docs/specs/security/provenance_and_enclave_drm.md` & `docs/specs/security/watermarking_and_marketplace.md` (`ref[sec.drm.dme1-mutable-suffix]`, `ref[sec.drm.protected-inner-framing]`, `ref[sec.watermark.seed-derivation]`, `ref[sec.anticlone.three-gate-pipeline]`, `ref[sec.anticlone.cabinet-fingerprint]`, `ref[sec.preview.containment]`, `ref[sec.preview.royalty-splits]`, `ref[sec.preview.storefront-metadata]`, `ref[sec.edge.data-model]`).
 
 use alloc::collections::BTreeSet;
 use alloc::string::String;
@@ -18,7 +18,7 @@ use crate::provenance::sha256::sha256_digest;
 use crate::schema::{DnamError, RoyaltySplit, reject_if};
 
 /// Builds the 20-byte `DME1` encrypted mutable frame header via [`Dme1HeaderWire`]
-/// (`ref[sec.drm.dme1-mutable-suffix]`, `ref[repo.code.zerocopy-wire-structs]`).
+/// (`ref[sec.drm.dme1-mutable-suffix]`, `ref[sdk.rust.zerocopy-wire-structs]`).
 pub fn build_dme1_header(
     profile: u8,
     recipient_count: u32,
@@ -194,7 +194,7 @@ pub fn derive_watermark_seed_hmac_sha256(
 
 /// Extracts the gauge-invariant Stage III tier-local fingerprint component (`120` `f64` values in
 /// `Lite`/`Ultra`, `60` in `Full`, `180` in `Pro`; `120 / 180 / 360 / 480` cumulative values across
-/// `Lite` / `Full` / `Pro` / `Ultra`, `ref[sec.anticlone.stage3-fingerprint]`):
+/// `Lite` / `Full` / `Pro` / `Ultra`, `ref[sec.anticlone.cabinet-fingerprint]`):
 /// `[b_early_L[0..K_fir-1], b_early_R[0..K_fir-1], (r_low, dr, floor_1e2(theta), b_gamma*c_re_l, b_gamma*c_im_l, b_gamma*c_re_r, b_gamma*c_im_r) x M_tier]`.
 pub fn extract_stage3_tier_fingerprint_component(
     early_fir_bytes: &[u8],
@@ -252,7 +252,7 @@ pub fn extract_stage3_tier_fingerprint_component(
     Ok(values)
 }
 
-/// Decision outcome of the Stage B anti-cloning ingestion gate (`ref[sec.anticlone.three-stage-gate]`).
+/// Decision outcome of the Stage B anti-cloning ingestion gate (`ref[sec.anticlone.three-gate-pipeline]`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AnticloneGateAction {
     /// Fingerprint did not match known protected models; proceed to Stage C / admit.
@@ -266,7 +266,7 @@ pub enum AnticloneGateAction {
 }
 
 /// Evaluates the evidence-based revocation rule in the 3-stage anti-cloning gate
-/// (`ref[sec.anticlone.three-stage-gate]`, `ref[sec.sig.offline-auth]`).
+/// (`ref[sec.anticlone.three-gate-pipeline]`, `ref[sec.sig.offline-auth]`).
 #[inline]
 pub const fn evaluate_anticlone_revocation_policy(
     fingerprint_matched: bool,
@@ -380,8 +380,8 @@ mod spec_tests {
     /// verify[sec.watermark.orthogonal-gauge]
     /// verify[sec.watermark.tardos-code]
     /// verify[sec.watermark.seed-derivation]
-    /// verify[sec.anticlone.three-stage-gate]
-    /// verify[sec.anticlone.stage3-fingerprint]
+    /// verify[sec.anticlone.three-gate-pipeline]
+    /// verify[sec.anticlone.cabinet-fingerprint]
     #[test]
     fn test_watermark_seed_derivation_gauges_tardos_and_stage3_fingerprint() {
         let key: [u8; 32] = core::array::from_fn(|i| i as u8);

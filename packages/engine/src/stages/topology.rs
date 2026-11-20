@@ -9,12 +9,12 @@
 //!   `ref[dsp.router.lr4-crossover]`, `ref[dsp.router.mid-side-input]`,
 //!   `ref[dsp.router.topology-dispatch]`, `ref[dsp.router.stereo-link-detector]`,
 //!   `ref[dsp.router.ballistic-envelope-bank]`, `ref[dsp.router.modulation-bus]`
-//! - `ref[dsp.stage1.pre-bus]`, `ref[dsp.stage2.commuted-cascade]`, `ref[dsp.stage3.cabinet-bank]`,
-//!   `ref[dsp.stage4.spatial-tank]`, `ref[dsp.stage4.captured-freeze]`, `ref[dsp.stage4.dc-blocker]`,
-//!   `ref[dsp.stage4.loop-saturator]`, `ref[dsp.stage4.quiet-feedback-knee]`
-//! - `ref[dsp.head.mid-side-factorization]`, `ref[dsp.head.feature-bus-slots]`,
+//! - `ref[dsp.crossbar.top-of-frame]`, `ref[dsp.core.matryoshka-cascade]`, `ref[dsp.cabinet.fir-kautz-bank]`,
+//!   `ref[dsp.tank.feedback-loop]`, `ref[dsp.tank.captured-freeze]`, `ref[dsp.tank.dc-blocker]`,
+//!   `ref[dsp.tank.loop-saturator]`, `ref[dsp.tank.quiet-feedback-knee]`
+//! - `ref[dsp.head.mid-side-factorization]`, `ref[dsp.head.direct-register-readout]`,
 //!   `ref[dsp.head.tier-equivalence]`, `ref[dsp.head.lower-triangular]`
-//! - `ref[dsp.zoh.router-detector]`, `ref[dsp.zoh.stage3-fir-onset]`
+//! - `ref[dsp.zoh.router-detector]`, `ref[dsp.zoh.cabinet-fir-onset]`
 
 pub mod router_and_head;
 pub mod zoh_fir_onset;

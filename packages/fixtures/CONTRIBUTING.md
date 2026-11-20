@@ -6,7 +6,7 @@ Before editing `packages/fixtures/`, review the root [`CONTRIBUTING.md`](../../C
 
 ## 1. Architectural & Safety Invariants
 
-1. **100% Safe Rust (`#![forbid(unsafe_code)]`):**
+1. **100% Safe Rust (`#![forbid(unsafe_code)]`, `ref[sdk.rust.safe-rust-and-boundaries]`):**
    - `packages/fixtures/src/lib.rs` and every submodule must forbid `unsafe_code`. Never introduce `#[allow(unsafe_code)]` or raw pointer casts.
 2. **Workspace-Isolated Simulation Dependencies (`nalgebra`, `realfft` Only):**
    - `dnam-fixtures` is a test/benchmark ground-truth simulation leaf crate (`dependsOn: []`, never deployed in runtime products and consumed exclusively via `[dev-dependencies]` of `dnam-capture`). Only `nalgebra` and `realfft` may appear in `[dependencies]` (no workspace crates, `serde`, `ndarray`, or other external crates; `[dev-dependencies]` permits `proptest`).
@@ -15,7 +15,7 @@ Before editing `packages/fixtures/`, review the root [`CONTRIBUTING.md`](../../C
 4. **Submodule Organization & Unit vs. Integration Tests:**
    - Organize signal chains under category submodules (`src/chains/{drives,amps_and_cabs,mod_and_spatial,dynamics_and_pitch,rigs}/<chain>.rs`) and hardware decorators under domain submodules (`src/adversaries/{interface_and_control,thermal_and_noise,mechanical_and_capsule}.rs`).
    - Keep module unit tests inside `#[cfg(test)] mod tests` within each submodule (sharing helpers via `src/test_utils.rs`), and reserve `tests/` strictly for cross-module integration and `proptest!` tests.
-   - Never create `mod.rs` files (`ref[repo.code.type-safety-and-imports]`); keep every `.rs` source file strictly `< 900` lines after `cargo fmt`.
+   - Never create `mod.rs` files (`ref[repo.code.type-safety-and-imports]`, `ref[sdk.rust.modular-layout-and-proptest]`); keep every `.rs` source file strictly `< 900` lines after `cargo fmt`.
 
 ---
 

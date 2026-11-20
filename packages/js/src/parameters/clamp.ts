@@ -1,6 +1,6 @@
 /**
  * Pre-compiled 3-Phase control space (`ControlSpace`) and `clampParameters(...)`
- * (`ref[sdk.ts.parameters.audio-param-semantics]`, `ref[sdk.ts.model.containers-and-checkpoints]`).
+ * (`ref[sdk.ts.parameters.audio-param-semantics]`, `ref[sdk.ts.model.containers-and-gram]`).
  *
  * @module
  */

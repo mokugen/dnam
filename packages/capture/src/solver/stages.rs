@@ -88,7 +88,7 @@ impl AuditBounds {
     }
 }
 
-/// Evaluates the Step-0 variance gate for control parameter `p` (`ref[dsp.ctrl.step0.variance-gating]`).
+/// Evaluates the Step-0 variance gate for control parameter `p` (`ref[dsp.ctrl.calib.variance-gating]`).
 /// Returns `true` when the control is active across stems and `false` when it must be locked to $K_p = 0$.
 #[must_use]
 pub fn is_control_variance_active(observed_values: &[f64], min_spread: f64) -> bool {

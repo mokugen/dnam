@@ -1,5 +1,5 @@
 //! WASM v2 provenance verification, hashing, Ed25519/X25519 signing, and OEM certificate
-//! exports (`ref[sdk.ts.provenance.v2-security]`, `ref[sdk.ts.runtime.zero-unsafe]`).
+//! exports (`ref[sdk.ts.provenance.security-and-drm]`, `ref[sdk.ts.runtime.zero-unsafe]`).
 
 use crate::core::provenance::{
     build_creator_signing_message_core, build_marketplace_signing_message_core,

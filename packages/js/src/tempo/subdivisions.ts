@@ -1,6 +1,6 @@
 /**
  * Musical tempo subdivision types, ZOH rescaling parameters, and calibration inversion results
- * (`ref[sdk.ts.model.containers-and-checkpoints]`, `ref[dsp.tempo.physical-inversion]`).
+ * (`ref[sdk.ts.model.containers-and-gram]`, `ref[dsp.tempo.physical-inversion]`).
  *
  * @module
  */

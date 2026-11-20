@@ -105,7 +105,7 @@ fn wiener_deconv_abs(ds: &[f64], dr: &[f64]) -> Vec<f64> {
 /// Identifies stereo reflection lag anchors via 4096-pt Wiener deconvolution combined with
 /// pre-whitened cross-correlation of `(wet - s3)` against `s3`, mapping Left peaks to EVEN lanes
 /// and Right peaks to ODD lanes across `Lite..Ultra` (`4..=1000` in V2), plus dispersive neighbor
-/// taps (`[D, D-1, D+1, D±2]`) and diffuse loop gain (`r[train.pipeline.stage-a-poles]`).
+/// taps (`[D, D-1, D+1, D±2]`) and diffuse loop gain (`r[train.pipeline.physics-probe]`).
 /// Returns `(lite, full, pro, ultra, g_loop, has_reflections)`.
 pub(crate) fn extract_stage4_reflection_delays(
     s3_lr: &[[f32; 2]],

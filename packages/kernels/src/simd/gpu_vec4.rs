@@ -1,6 +1,6 @@
 //! Portable scalar/WGSL `[f32; 4]` backend ([`GpuVec4`]) implementing [`KernelVec4`] cleanly
 //! across host CPUs and `spirv-unknown-naga-wgsl` compute shaders
-//! (`ref[arch.simd.two-level-traits]`, `ref[repo.code.shared-nostd-kernels]`).
+//! (`ref[arch.simd.two-level-traits]`, `ref[sdk.rust.shared-nostd-kernels]`).
 
 use super::{KernelVec4, scrub_and_flush_f32_bits};
 

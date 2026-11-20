@@ -2,7 +2,7 @@
 //!
 //! Canonical References:
 //! - `docs/specs/training/capture_and_alignment.md` (`ref[train.capture.invariants]`)
-//! - `docs/specs/training/four_stage_pipeline.md` (`ref[train.pipeline.stage-b-harvest]`)
+//! - `docs/specs/training/webgpu_and_varpro_solver.md` (`ref[train.pipeline.backbone-trajectory-opt]`)
 //! - `docs/adr/0018-signal-chain-fixtures-crate-and-whitebox-distillation.md`
 
 #![forbid(unsafe_code)]

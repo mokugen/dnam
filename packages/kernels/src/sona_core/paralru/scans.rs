@@ -1,5 +1,5 @@
 //! `O(log2 N)` `LinearScanElem` prefix scan primitives and exact `0-ULP` `ParaLRU` forward tile
-//! execution (`ref[dsp.op-n.stage2.sub-stages]`, `ref[train.pipeline.webgpu-scans-and-ozaki]`).
+//! execution (`ref[dsp.op-n.core.matryoshka-blocks]`, `ref[train.pipeline.webgpu-scans-and-ozaki]`).
 
 use crate::simd::{GpuVec4, KernelVec4, MAX_PARALRU_R_F32, scrub_and_flush_f32_bits};
 
@@ -58,7 +58,7 @@ pub fn scan_linear_prefix_tile<const N: usize>(elems: &[LinearScanElem; N]) -> [
 
 /// Steps `valid_len.min(N)` frames of `u[0..N]` through exact decoupled `1D` scalar `ParaLRU`
 /// via [`step_paralru_vec4`] lane `0` (`0-ULP` CPU/SIMD bit-identity), zeroing unused tail entries
-/// `i >= valid_len` and returning `(v_traj, v_end_state)` (`ref[dsp.op-n.stage2.sub-stages]`).
+/// `i >= valid_len` and returning `(v_traj, v_end_state)` (`ref[dsp.op-n.core.matryoshka-blocks]`).
 #[inline]
 #[must_use]
 pub fn run_paralru_forward_partial_tile<const N: usize>(
@@ -108,7 +108,7 @@ pub fn run_paralru_forward_partial_tile<const N: usize>(
 
 /// Steps all `N` frames of `u[0..N]` through exact decoupled `1D` scalar `ParaLRU`, returning
 /// `(v_traj, v_end_state)` with exact `0-ULP` parity against [`step_paralru_vec4`] and
-/// `step_paralru_stereo8` (`ref[dsp.op-n.stage2.sub-stages]`,
+/// `step_paralru_stereo8` (`ref[dsp.op-n.core.matryoshka-blocks]`,
 /// `ref[train.pipeline.webgpu-scans-and-ozaki]`).
 #[inline]
 #[must_use]
@@ -129,7 +129,7 @@ mod tests {
     use crate::simd::{InterleavedStereo8, StereoVec8};
     use proptest::prelude::*;
 
-    /// verify[dsp.op-n.stage2.sub-stages]
+    /// verify[dsp.op-n.core.matryoshka-blocks]
     #[test]
     fn test_paralru_forward_tile_and_linear_scan_identities() {
         assert_eq!(

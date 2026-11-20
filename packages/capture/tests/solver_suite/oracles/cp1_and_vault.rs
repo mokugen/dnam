@@ -258,7 +258,7 @@ fn run_oracle_02_for_p(num_controls: usize) {
 
 #[test]
 fn test_oracle_02_cp1_arbitrary_p6_and_p16_asymmetric_switches_and_hadamard_fm() {
-    // verify[train.pipeline.stage-d-control]
+    // verify[train.pipeline.control-projection-fit]
     // verify[train.pipeline.dispatch-solve]
     run_oracle_02_for_p(6);
     run_oracle_02_for_p(16);
@@ -266,7 +266,7 @@ fn test_oracle_02_cp1_arbitrary_p6_and_p16_asymmetric_switches_and_hadamard_fm()
 
 #[test]
 fn test_oracle_03_zero_wav_dnam_proj_vault_fastpath_and_clamping() {
-    // verify[train.pipeline.stage-e-pack]
+    // verify[train.pipeline.host-parity-and-export]
     // verify[train.resume.kronecker-reassembly]
     // verify[train.cache.proj-vault]
     let crypto = DefaultCryptoProvider::default();

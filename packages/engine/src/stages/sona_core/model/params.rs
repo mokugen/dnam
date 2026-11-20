@@ -192,7 +192,7 @@ impl SonaGroupCold {
     }
 
     /// Rescales `TPT-SVF` prewarped `g` (`tan(pi * fc / fs_eff)`) and `ParaLRU` poles (`alpha^rho_sr`)
-    /// under continuous-time ZOH (`ref[dsp.op-n.stage2.sub-stages]`).
+    /// under continuous-time ZOH (`ref[dsp.op-n.core.matryoshka-blocks]`).
     pub fn rescale_with_zoh(&mut self, zoh: &ZohRescaledParams) {
         self.rescale_with_zoh_ratio(zoh.rho_sr);
     }

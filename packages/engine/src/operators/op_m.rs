@@ -1,6 +1,6 @@
 //! Op-M: Universal Symplectic Modal, Hilbert, Sub-Harmonic & Kautz Operator.
 //!
-//! Canonical Reference: `docs/specs/dsp/op_m_modal_kautz.md` (`ref[dsp.op-m.recurrence.symplectic]`, `ref[dsp.op-m.rotor.contractive]`, `ref[dsp.op-m.stage3.sweep-contraction]`, `REQ-1.2`, `REQ-2.5`).
+//! Canonical Reference: `docs/specs/dsp/op_m_modal_kautz.md` (`ref[dsp.op-m.recurrence.symplectic]`, `ref[dsp.op-m.rotor.contractive]`, `ref[dsp.op-m.kautz.sweep-contraction]`, `REQ-1.2`, `REQ-2.5`).
 //!
 //! Submodules:
 //! - [`kautz`]: Symplectic modal recurrence, contractive rotor, and orthonormal Kautz modal bank (`Stage III`).

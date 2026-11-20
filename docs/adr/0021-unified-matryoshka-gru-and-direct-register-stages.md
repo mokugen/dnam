@@ -13,13 +13,13 @@ superseded_by: ADR-0022
 specs:
   - ../specs/architecture/sona_architecture.md
   - ../specs/architecture/psychoacoustic_quality_and_tiers.md
-  - ../specs/dsp/op_n_commuted_cascade.md
+  - ../specs/dsp/op_n_paralru_and_polyadaa.md
   - ../specs/dsp/op_m_modal_kautz.md
-  - ../specs/dsp/router_and_stages_topology.md
+  - ../specs/dsp/router_and_crossbar_topology.md
   - ../specs/dsp/parametric_control_bus.md
   - ../specs/containers/dnam_binary_format.md
   - ../specs/containers/project_container_format.md
-  - ../specs/training/four_stage_pipeline.md
+  - ../specs/training/webgpu_and_varpro_solver.md
   - ../specs/training/iterative_resume_and_caching.md
   - ../specs/training/control_space_audit.md
   - ../specs/security/watermarking_and_marketplace.md
@@ -79,7 +79,7 @@ Practical multi-rig validation against the 13-chain black-box fixture matrix (`R
 
 We adopt **TORA `v3` Direct-Register Matryoshka Architecture**:
 
-1. **Stage II Zero-DC Matryoshka `GRU` Cascade (`ref[dsp.op-n.stage2.sub-stages]`):**
+1. **Stage II Zero-DC Matryoshka `GRU` Cascade (`ref[dsp.op-n.core.matryoshka-blocks]`):**
    - **Tapered Pyramid & Continuous-Time ZOH Gate Scaling:** Replaces `PolyADAA` + `Role A/B` blocks with a 3-block feed-forward `4`-lane SIMD `GRU` pyramid (`Lite [1,1,1] = 12 ch @ 1x`, `Full [2,1,1] = 16 ch @ 1x`, `Pro [2,2,1] = 20 ch @ 2x`, `Ultra [3,2,1] = 24 ch @ 2x` / `4x` bounce). Storing continuous-time gate retention $1 - z_{\text{eff}}(q) = (1 - z_{1\times})^{1/q}$ lets `Lite` and `Full` run natively at `1x` (`48 kHz`) using `V3Rate1xCalibration` (`up_zoh_mix` + low-delay `poly3` decimation) nested inside `2x` (`96 kHz`) `Pro` and `Ultra`.
    - **Division-Free In-Register `NR2` Padé Activations & Analytical Zero-DC Equilibrium:** Evaluates $\tanh$ and $\sigma$ via a degree-5/4 rational Padé approximation using `SimdVec4::rcp_ge1_nr2` (`2` Newton-Raphson iterations in vector registers: `< 4.5e-5` relative error, `-87 dB`, `0-ULP` odd symmetry, $\tanh(0) = +0.0$, `0` GPR spills, `0` `FDIV`, `0` `libm`) and applies an analytical Zero-DC bias shift $b_n$ guaranteeing $h_{\text{eq}} = 0$ at rest (`ref[dsp.op-n.commuted.dc-equilibrium]`).
    - **Stereo `L + R` Tile Interleaving, `3 kHz` `FiLM` & Inter-Block `TPT-SVF`:** Steps `Left` (`Vec4`) and `Right` (`Vec4`) side by side sharing loaded `4×4` weight tiles across dual NEON FMA pipes (`step_stage2_stereo`), applies `3 kHz` control-modulated per-block `FiLM` gain/shift + Zero-DC $b_n$, and steps a `3 kHz`-decimated inter-block 3-band `TPT-SVF` tone stack (`Block 0 -> Tone SVF -> Block 1 -> Block 2`).
@@ -97,13 +97,13 @@ We adopt **TORA `v3` Direct-Register Matryoshka Architecture**:
    - Decomposes the solver into `Stage A (Physics Probe) -> Stage B (Joint 4-Tier Parallel Windowed-BPTT Backbone + 2-Pass Kautz OMP + Fused Radix-4 Welch LTAS Adjoint) -> Stage C (Nested 4-Tier VarPro Cholesky) -> Stage D (Parallel Multi-Knob FiLM+ToneSVF+CP1 + 3-Phase Audit) -> Stage E (f32 Readout Polish, ISS/Schur Stability Audit & Pack)`, pairing `< 150 ms` `Path 1` incremental vault edits (`0-ULP` `StarCenter` invariance) with raw-audio-free `Path 2` capsule re-pooling (`ref[train.resume.two-tier-execution]`).
 
 5. **Lossless `0-ULP` `GRU` Hidden-Lane Sign-Flip Watermarking (`ref[sec.watermark.reciprocal-gauge]`):**
-   - Replaces `Role B` cascade gauges with an algebraically exact **`0-ULP` odd-activation `GRU` hidden-lane sign-flip gauge** ($s_i \in \lbrace -1, +1 \rbrace$ applied symmetrically to hidden-lane input rows, recurrent rows/columns, Zero-DC bias shift, and downstream readouts since $\tanh(-x) = -\tanh(x)$ and $h_{\text{eq}} = 0$) combined with Stage III Kautz reciprocal/phase gauges, `SO(4)` `CP1` rotation, and EMR-masked Coupled Tardos codes surviving `strip_container_to_tier`.
+   - Replaces `Role B` cascade gauges with an algebraically exact **`0-ULP` odd-activation `GRU` hidden-lane sign-flip gauge** (signs $s_i \in \lbrace -1, +1 \rbrace$ applied symmetrically to hidden-lane input rows, recurrent rows/columns, Zero-DC bias shift, and downstream readouts since $\tanh(-x) = -\tanh(x)$ and `h_eq = 0`) combined with Stage III Kautz reciprocal/phase gauges, `SO(4)` `CP1` rotation, and EMR-masked Coupled Tardos codes surviving `strip_container_to_tier`.
 
 ---
 
 ## 4. Carried-Forward Invariants from Superseded ADRs
 
 Superseding `ADR-0004`, `ADR-0008`, `ADR-0011`, and `ADR-0017` retires their obsolete `v2` internal topologies (`PolyADAA` cascade, `Role B` blocks, `256-D` feature bus scatter/gather, `Wide192` Kronecker head solve, `250 ms` `fp16` coresets), while explicitly carrying forward into TORA `v3`:
-- **From `ADR-0004`:** Family 5 ZOH Bitcrusher nearest-step quantizer (halfway ties to $+\infty$), `2^32` Hz integer ZOH phase accumulator, `u128` reciprocal rate transfer (`ref[dsp.op-n.bitcrusher.quantizer]`, `ref[dsp.op-n.bitcrusher.zoh-phase]`, `ref[dsp.op-n.bitcrusher.rate-transfer]`), and the $C^2$ cubed-envelope wavefolder (`ref[dsp.op-n.wavefolder.cubic-c2]`) used in Stage I/pre-processing.
+- **From `ADR-0004`:** Family 5 ZOH Bitcrusher nearest-step quantizer (halfway ties to `+∞`), `2^32` Hz integer ZOH phase accumulator, `u128` reciprocal rate transfer (`ref[dsp.op-n.bitcrusher.quantizer]`, `ref[dsp.op-n.bitcrusher.zoh-phase]`, `ref[dsp.op-n.bitcrusher.rate-transfer]`), and the $C^2$ cubed-envelope wavefolder (`ref[dsp.op-n.wavefolder.cubic-c2]`) used in Stage I/pre-processing.
 - **From `ADR-0008` & `ADR-0017`:** Column-major upper-triangular (`uplo = 'U'`) `f64` Gram formulation, compensated wide-accumulator determinism (`ref[train.gram.accuracy-contract]`), `33`-band `LTAS` KKT regularization, `[STAB-ZERO-DC]` export enforcement, and `< 64 MiB` browser worker bounds (`REQ-4.3`).
-- **From `ADR-0011`:** Stage 0–IV signal-chain integration contracts, partial-preset default restoration and disjoint-interval crossfading (`ref[dsp.ctrl.switch.conditional-batch]`), `SpilloverTrails` vs. `HardBypass` state machine (`ref[arch.topology.spillover-trails]`), captured hardware freeze (`ref[dsp.stage4.captured-freeze]`), and clamped control-bus modulation bounds on `theta_0..theta_15` (`ref[dsp.ctrl.dispatch.stage-laws]`).
+- **From `ADR-0011`:** Stage 0–IV signal-chain integration contracts, partial-preset default restoration and disjoint-interval crossfading (`ref[dsp.ctrl.switch.conditional-batch]`), `SpilloverTrails` vs. `HardBypass` state machine (`ref[arch.topology.spillover-trails]`), captured hardware freeze (`ref[dsp.tank.captured-freeze]`), and clamped control-bus modulation bounds on `theta_0..theta_15` (`ref[dsp.ctrl.dispatch.modulation-laws]`).

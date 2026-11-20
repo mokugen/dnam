@@ -6,7 +6,7 @@
 //!
 //! Canonical References:
 //! - `docs/specs/containers/project_container_format.md` (`ref[container.proj.lifecycle-states]`)
-//! - `docs/specs/training/four_stage_pipeline.md` (`ref[train.pipeline.dispatch-solve]`)
+//! - `docs/specs/training/webgpu_and_varpro_solver.md` (`ref[train.pipeline.dispatch-solve]`)
 //! - `docs/specs/training/iterative_resume_and_caching.md` (`ref[train.resume.kronecker-reassembly]`, `ref[train.cache.proj-vault]`)
 
 pub mod edit;

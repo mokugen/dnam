@@ -1,7 +1,7 @@
 //! Cold Stage III Early FIR & Kautz Onset Extension (`stage3_cab/high_sr.rs`).
 //!
 //! Handles all non-`48 kHz` rates via the four mutually exclusive cases of
-//! `docs/specs/dsp/router_and_stages_topology.md` §9 (`ref[dsp.zoh.stage3-fir-onset]`):
+//! `docs/specs/dsp/router_and_crossbar_topology.md` §9 (`ref[dsp.zoh.cabinet-fir-onset]`):
 //! - **Case (a):** Exact integer multiples `q * 48,000 Hz` (`q in {2, 4, 8}` = `96 / 192 / 384 kHz`),
 //!   sparse integer-stride taps `h[k] * x[n - q*k]` across all `32/48/96/128` base taps + `16*q` onset.
 //! - **Case (b):** Live `1x` (`os_factor == 1`, `44,100 <= fs_eff < 48,000`), `64`-tap first-tap

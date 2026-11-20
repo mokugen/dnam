@@ -3,15 +3,17 @@
  * `.idea/*.iml`, and Shared `pnpm` Tooling Guardrail Tests.
  *
  * verify[repo.code.type-safety-and-imports]
- * verify[repo.code.shared-nostd-kernels]
  * verify[repo.code.constant-eval-and-derivations]
  * verify[repo.code.modular-decomposition-and-tests]
  * verify[repo.code.universal-black-box]
  * verify[arch.index.subsystems]
  * verify[arch.tiers.maximize-quality-within-budget]
  * verify[qual.tiers.floors-not-stopping-criteria]
- * verify[repo.code.zerocopy-wire-structs]
  * verify[train.pipeline.webgpu-scans-and-ozaki]
+ * verify[sdk.rust.safe-rust-and-boundaries]
+ * verify[sdk.rust.shared-nostd-kernels]
+ * verify[sdk.rust.zerocopy-wire-structs]
+ * verify[sdk.rust.modular-layout-and-proptest]
  */
 
 import * as fs from "node:fs";
@@ -376,7 +378,8 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
       path.join(REPO_ROOT, ".agents", "rules", "zerocopy-wire-structs.md"),
       "utf8",
     );
-    expect(zerocopyRuleText).toContain("ref[repo.code.zerocopy-wire-structs]");
+    expect(zerocopyRuleText).toContain("ref[sdk.rust.zerocopy-wire-structs]");
+    expect(zerocopyRuleText).toContain("ref[sdk.rust.safe-rust-and-boundaries]");
     expect(zerocopyRuleText).toContain("ref[repo.code.constant-eval-and-derivations]");
 
     const sonaSpecPath = path.join(SPECS_DIR, "architecture", "sona_architecture.md");
@@ -399,8 +402,8 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
     for (const reqRule of [
       "arch.tiers.maximize-quality-within-budget",
       "qual.tiers.floors-not-stopping-criteria",
-      "repo.code.zerocopy-wire-structs",
-      "repo.code.shared-nostd-kernels",
+      "sdk.rust.zerocopy-wire-structs",
+      "sdk.rust.shared-nostd-kernels",
       "train.pipeline.webgpu-scans-and-ozaki",
     ]) {
       expect(rules.has(reqRule), `Missing r[${reqRule}]`).toBe(true);

@@ -4,7 +4,7 @@ use crate::math::newton6_reciprocal_f64;
 use crate::schema::{DnamError, cold_pow_f64, cold_sqrt_f64};
 
 /// Rescaled discrete-time parameters for a host sample rate $f_{s,\text{host}} \in [44100, 192000]\text{ Hz}$
-/// per [`docs/specs/dsp/router_and_stages_topology.md` §9](../../../../docs/specs/dsp/router_and_stages_topology.md#9-continuous-time-zero-order-hold-zoh-sample-rate-adaptability-441192-khz--4-bounce)
+/// per [`docs/specs/dsp/router_and_crossbar_topology.md` §9](../../../../docs/specs/dsp/router_and_crossbar_topology.md#9-continuous-time-zoh-rate-adaptation)
 /// and [`docs/specs/containers/dnam_binary_format.md` §4](../../../../docs/specs/containers/dnam_binary_format.md#4-training-sample-rate-anchoring--continuous-time-zoh-cross-reference).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ZohRescaledParams {

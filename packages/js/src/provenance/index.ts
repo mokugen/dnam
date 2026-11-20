@@ -1,6 +1,6 @@
 /**
  * Curated exports for `@dnam-project/dnam/provenance` (`ref[sdk.ts.layout.curated-exports]`,
- * `ref[sdk.ts.provenance.v2-security]`).
+ * `ref[sdk.ts.provenance.security-and-drm]`).
  *
  * @module
  */

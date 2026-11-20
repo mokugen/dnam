@@ -1,7 +1,7 @@
 //! Declarative `#[repr(C)]` `zerocopy` `SONA` `v3.0` Arena Wire Layout (`4,608 / 7,936 / 15,872 / 30,720 B`).
 //!
 //! Canonical Reference: `docs/specs/containers/dnam_binary_format.md` (`ref[container.dnam.tier-prefix]`,
-//! `ref[repo.code.zerocopy-wire-structs]`, `ref[repo.code.constant-eval-and-derivations]`).
+//! `ref[sdk.rust.zerocopy-wire-structs]`, `ref[repo.code.constant-eval-and-derivations]`).
 //!
 //! Exact `64 B`-aligned Matryoshka `SONA` Arena Layout:
 //! - `Arena 0` (`Lite`, `0..4,608 B`, `72 CL`): [`Arena0LiteWire`] (`Stage0CrossbarWire`,

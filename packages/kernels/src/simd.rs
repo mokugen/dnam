@@ -1,6 +1,6 @@
 //! Portable `#![no_std]` 4-lane (`KernelVec4` / `GpuVec4`) and 8-lane stereo (`StereoVec8`)
 //! SIMD abstractions, compile-time mathematical constants, and `fp16` codecs
-//! (`ref[arch.simd.two-level-traits]`, `ref[repo.code.shared-nostd-kernels]`).
+//! (`ref[arch.simd.two-level-traits]`, `ref[sdk.rust.shared-nostd-kernels]`).
 //!
 //! All runtime primitives execute with zero `FDIV`, zero `FSQRT`, zero `libm` calls, and zero
 //! `u64`/`f64` types so CPU SIMD backends and 32-bit `spirv-unknown-naga-wgsl` shaders evaluate

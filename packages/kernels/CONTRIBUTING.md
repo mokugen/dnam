@@ -19,12 +19,12 @@ Consult [`AGENTS.md`](AGENTS.md) for the file routing table:
 
 ## 2. Mandatory Engineering & `SPIR-V` / Real-Time Invariants
 
-1. **Zero `unsafe` & Zero External Dependencies (`ref[repo.code.type-safety-and-imports]`):**
+1. **Zero `unsafe` & Zero External Dependencies (`ref[repo.code.type-safety-and-imports]`, `ref[sdk.rust.safe-rust-and-boundaries]`):**
    - `dnam-kernels` must compile with `#![cfg_attr(not(test), no_std)]`, `#![forbid(unsafe_code)]`, zero external dependencies, and zero `alloc` / `Vec` usage in production code.
-2. **Strictly `32-bit` Non-Test Arithmetic (`ref[repo.code.shared-nostd-kernels]`):**
+2. **Strictly `32-bit` Non-Test Arithmetic (`ref[sdk.rust.shared-nostd-kernels]`):**
    - Non-test code (`src/**/*.rs` outside `#[cfg(test)]`) may use **only** `f32`, `i32`, `u32`, `u16`, `u8`, `bool`, `usize`, and fixed arrays/slices—never `f64`, `i64`, `u64`, `i128`, or `u128`.
    - Zero runtime `FDIV` (`/`), `FSQRT`, `IDIV`/`UDIV`/`SDIV`, `libm` calls (`.sin()`, `.cos()`, `.tan()`, `.sqrt()`, `.exp()`, `.ln()`, `.powf()`), or `.rem_euclid()` in non-test code; use `KernelVec4`/`GpuVec4` `NR2` reciprocals and `rsqrt_pos_nr2()`, reciprocal multiplication, and power-of-two `& mask` wrapping.
-3. **Explicit Implementations, `Debug` & File Ceilings (`ref[repo.code.explicit-simd-and-coverage]`, `ref[repo.code.modular-decomposition-and-tests]`):**
+3. **Explicit Implementations, `Debug` & File Ceilings (`ref[sdk.rust.explicit-simd-and-coverage]`, `ref[repo.code.modular-decomposition-and-tests]`):**
    - Zero `macro_rules!`, zero `#[cfg_attr(coverage, coverage(off))]`, and `#[derive(Debug)]` on every `pub struct` and `pub enum`.
    - Keep every `.rs` source file strictly `< 900` lines (`~250–650` lines), with zero `mod.rs` files and zero `\`-newline code golf.
 4. **Universal Black-Box & Compile-Time Constant Rules (`ref[repo.code.universal-black-box]`, `ref[repo.code.constant-eval-and-derivations]`):**

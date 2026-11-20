@@ -1,6 +1,6 @@
 /**
  * Asynchronous and synchronous binary container source loaders (`ModelSource`)
- * (`ref[sdk.ts.model.containers-and-checkpoints]`).
+ * (`ref[sdk.ts.model.containers-and-gram]`).
  *
  * @module
  */

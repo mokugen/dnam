@@ -3,7 +3,7 @@
 //! Cross-module `SONA` kernel scan, `0-ULP` stereo/watermark parity, Zero-DC equilibrium,
 //! and exact `i32` Ozaki reconstruction integration suites.
 //!
-//! verify[repo.code.shared-nostd-kernels]
+//! verify[sdk.rust.shared-nostd-kernels]
 //! verify[train.pipeline.webgpu-scans-and-ozaki]
 
 use dnam_kernels::{

@@ -1,6 +1,6 @@
-//! Decoupled `1D` scalar `ParaLRU` (`ref[dsp.op-n.stage2.conv6-simd]`), zero-DC smooth
+//! Decoupled `1D` scalar `ParaLRU` (`ref[dsp.op-n.core.stereo-simd]`), zero-DC smooth
 //! soft rectifier, exact `0-ULP` forward tile recurrence, and `O(log2 N)` cross-tile linear
-//! adjoint scan (`ref[dsp.op-n.stage2.sub-stages]`).
+//! adjoint scan (`ref[dsp.op-n.core.matryoshka-blocks]`).
 
 pub mod adjoint;
 pub mod scans;

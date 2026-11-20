@@ -15,7 +15,7 @@ requirements: []
 
 This document summarizes the **signal topology, dual-rate (`48 kHz` / `3 kHz`) execution loop, 4-tier SIMD hierarchy, prior-art architectural comparison (`NAM A2`, `GuitarML PROTEUS`, `NAM ParametricOD`), gain staging, spillover bypass state machine, and R&D findings** from the Tri-Physics research phase.
 
-For implementation-agnostic system requirements and hardware budgets, see [`../requirements/system_goals_and_requirements.md`](../requirements/system_goals_and_requirements.md). For psychoacoustic `bESR` quality tiers, see [`../specs/architecture/psychoacoustic_quality_and_tiers.md`](../specs/architecture/psychoacoustic_quality_and_tiers.md). For the canonical system architecture and DSP subsystem specifications, see [`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md), [`../specs/dsp/op_t_transport.md`](../specs/dsp/op_t_transport.md), [`../specs/dsp/op_m_modal_kautz.md`](../specs/dsp/op_m_modal_kautz.md), [`../specs/dsp/op_n_commuted_cascade.md`](../specs/dsp/op_n_commuted_cascade.md), [`../specs/dsp/router_and_stages_topology.md`](../specs/dsp/router_and_stages_topology.md), and [`../specs/dsp/parametric_control_bus.md`](../specs/dsp/parametric_control_bus.md). For the mathematical formulations of the R&D prototype's Core 1, Core 2, and `q_8` control bus, see [§5 below](#5-rd-prototype-reference-appendix-for-the-tri-physics-core-1--core-2--q_8-control-bus-architecture).
+For implementation-agnostic system requirements and hardware budgets, see [`../requirements/system_goals_and_requirements.md`](../requirements/system_goals_and_requirements.md). For psychoacoustic `bESR` quality tiers, see [`../specs/architecture/psychoacoustic_quality_and_tiers.md`](../specs/architecture/psychoacoustic_quality_and_tiers.md). For the canonical system architecture and DSP subsystem specifications, see [`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md), [`../specs/dsp/op_t_transport.md`](../specs/dsp/op_t_transport.md), [`../specs/dsp/op_m_modal_kautz.md`](../specs/dsp/op_m_modal_kautz.md), [`../specs/dsp/op_n_paralru_and_polyadaa.md`](../specs/dsp/op_n_paralru_and_polyadaa.md), [`../specs/dsp/router_and_crossbar_topology.md`](../specs/dsp/router_and_crossbar_topology.md), and [`../specs/dsp/parametric_control_bus.md`](../specs/dsp/parametric_control_bus.md). For the mathematical formulations of the R&D prototype's Core 1, Core 2, and `q_8` control bus, see [§5 below](#5-rd-prototype-reference-appendix-for-the-tri-physics-core-1--core-2--q_8-control-bus-architecture).
 
 ---
 
@@ -66,7 +66,7 @@ flowchart TD
 
 ### 1.2 Dual-Rate (`48 kHz` Audio vs. `3 kHz` Control) Execution Lifecycle
 
-DNAM decouples slowly varying control, envelope, LFO, and complex rotor updates ($3\text{ kHz}$, decimation stride $K_{\text{ctrl}} = 16$ at $f_s = 48\text{ kHz}$) from per-sample nonlinear waveshaping, radial state-space recurrence, and fractional delay readout ($48\text{ kHz}$):
+DNAM decouples slowly varying control, envelope, LFO, and complex rotor updates (`3 kHz`, decimation stride `K_ctrl = 16` at `f_s = 48 kHz`) from per-sample nonlinear waveshaping, radial state-space recurrence, and fractional delay readout (`48 kHz`):
 
 ```mermaid
 sequenceDiagram
@@ -158,19 +158,19 @@ To fulfill Goal 5 ([`../requirements/system_goals_and_requirements.md` §6 (`REQ
 ## 3. System-Level Audio Routing, Gain Staging, Spillover & Offline Bounce
 
 ### 3.1 Input Mid/Side Encoding, Unclipped `f32` Headroom & Hardware Denormal Immunity (`FTZ`/`DAZ`)
-Given stereo input samples $(L[n], R[n]) \in \mathbb{R}^2$ (or mono $L[n] = R[n] = x[n]$), the input router computes:
+Given stereo input samples $(L[n], R[n]) \in \mathbb{R}^2$ (or mono `L[n] = R[n] = x[n]`), the input router computes:
 $$x_{\text{mid}}[n] = \frac{1}{2}\big(L[n] + R[n]\big), \qquad x_{\text{side}}[n] = \frac{1}{2}\big(L[n] - R[n]\big)$$
 and projects $[x_{\text{mid}}[n], x_{\text{side}}[n], 0, 0]^\top$ into each active 4-channel tier block via its $4 \times 4$ input projection matrix. No hard input clipper is applied at `0.0 dBFS`, preserving unclipped 32-bit IEEE-754 float (`f32`) headroom from upstream blocks while `CL-01` bounds internal polynomial waveshaper inputs smoothly per layer. At the entry of every audio callback (`process_block`), the engine enables hardware **Flush-to-Zero (`FTZ`) and Denormals-Are-Zero (`DAZ`)** (`FPCR.FZ = 1` on ARM64 / `MXCSR` bits `6, 15` on x86_64) so decaying `RG-LRU` resonators, `WT-UFDN` delay tails, and 1-pole envelopes never trigger subnormal microcode traps.
 
 ### 3.2 Gated `rms_dbfs` Auto-Unity Leveling & Per-Tier Loudness Parity
-1. **Default-Control Anchor ($\mathbf{u} = \mathbf{0}$):** Auto-Unity leveling (`io_config.leveling`) is anchored strictly at the model's default control state (`controls_schema[*].default`, where normalized coordinates satisfy $\mathbf{u} = \mathbf{0}$ and $\mathbf{z}_{\text{head}} = \mathbf{0}$)—never at an arbitrary user preset—so turning a modeled `Volume` or `Output` knob away from default behaves exactly like the physical hardware.
+1. **Default-Control Anchor (`u = 0`):** Auto-Unity leveling (`io_config.leveling`) is anchored strictly at the model's default control state (`controls_schema[*].default`, where normalized coordinates satisfy `u = 0` and `z_head = 0`)—never at an arbitrary user preset—so turning a modeled `Volume` or `Output` knob away from default behaves exactly like the physical hardware.
 2. **Gated Electrical `Vrms` Calibration:** By default (`leveling_metric = "rms_dbfs"`), the trainer measures gated unweighted broadband RMS on active signal frames against `reference_input_level_db` and stores `calibrated_trim_db` so inserting the model at default settings maintains unity gain staging.
-3. **Zero-`pow10f` Per-Tier Loudness Trim:** `Arena 0` pre-stores linear scale factors `tier_gain_trim_lin` ($10^{\text{output-trim-db}/20}$) so switching between `Lite`, `Full`, `Pro`, and `Ultra` in a `#[no_std]` audio callback maintains $0.00\text{ dB}$ loudness parity with zero transcendental calls.
+3. **Zero-`pow10f` Per-Tier Loudness Trim:** `Arena 0` pre-stores linear scale factors `tier_gain_trim_lin` (`10^(output-trim-db / 20)`) so switching between `Lite`, `Full`, `Pro`, and `Ultra` in a `#[no_std]` audio callback maintains $0.00\text{ dB}$ loudness parity with zero transcendental calls.
 
 ### 3.3 Polarity-Corrected Host Parallel Blend & Spillover `Trails` State Machine
 1. **Polarity-Corrected Parallel Blend (`wet_polarity_inverted`):**
-   - Many physical single-/odd-stage tube and transistor circuits invert signal phase ($180^\circ$). If a host mixes raw dry and phase-inverted wet signals at `50%` blend, fundamental frequencies cancel out.
-   - When `io_config.capabilities.wet_polarity_inverted == true`, the mixer inverts the wet gain sign ($g_{\text{wet}} = -b$, $g_{\text{dry}} = 1 - b$ for blend $b \in [0, 1]$) so $b = 0$ preserves bypass polarity and $b \in (0, 1)$ sums constructively without comb cancellation.
+   - Many physical single-/odd-stage tube and transistor circuits invert signal phase (`180°`). If a host mixes raw dry and phase-inverted wet signals at `50%` blend, fundamental frequencies cancel out.
+   - When `io_config.capabilities.wet_polarity_inverted == true`, the mixer inverts the wet gain sign (`g_wet = -b`, `g_dry = 1 - b` for blend `b ∈ [0, 1]`) so $b = 0$ preserves bypass polarity and $b \in (0, 1)$ sums constructively without comb cancellation.
 2. **Spillover `Trails` Bypass State Machine (`supports_trails`):**
 
 ```mermaid
@@ -199,9 +199,9 @@ stateDiagram-v2
    $$t_{\text{eff}} = \min\big(t_{\text{req}}, t_{\text{max-sup}}, t_{\text{avail}}\big)$$
 2. **Offline Bounce Promotion & $4\times$ Oversampling (`CL-20`):** When a DAW host enters offline rendering (`is_offline_bounce == true`):
    - If `maximize_tier_on_bounce` is enabled, the engine promotes $t_{\text{bounce}} = \min(t_{\text{avail}}, t_{\text{max-sup}})$ (e.g., `Full` real-time monitoring $\to$ `Ultra` offline bounce).
-   - When $4\times$ oversampling is active, input blocks pass through a 2-stage linear-phase half-band polyphase upsampler ($> 95\text{ dB}$ stopband attenuation), step the Continuous-Time ZOH-rescaled engine at $f_{s,\text{bounce}} = 4 f_s$, and decimate through the matched 2-stage half-band downsampler with exact plugin delay compensation ($L_{\text{PDC}} = 12\text{ host samples}$).
+   - When $4\times$ oversampling is active, input blocks pass through a 2-stage linear-phase half-band polyphase upsampler (`> 95 dB` stopband attenuation), step the Continuous-Time ZOH-rescaled engine at $f_{s,\text{bounce}} = 4 f_s$, and decimate through the matched 2-stage half-band downsampler with exact plugin delay compensation (`L_PDC = 12 host samples`).
 
-   This is a historical oversampler-only claim, not the complete TORA plugin latency. The current [alignment contract](../specs/dsp/router_and_stages_topology.md#parallel-path-sub-sample-alignment) includes additional group latency and requires end-to-end verification.
+   This is a historical oversampler-only claim, not the complete TORA plugin latency. The current [alignment contract](../specs/dsp/router_and_crossbar_topology.md) includes additional group latency and requires end-to-end verification.
 
 ---
 
@@ -217,17 +217,17 @@ Each structural breakthrough is specified in full mathematical detail in its ded
 | **4** | **`1×` Passive B-Spline ADAA Blend + Linear Path Separation** | Full-signal ADAA (`-48.16 dB` droop) or post-ADAA HPF (`+6 dB` alias boost) | Direct linear residual `α_c x_c[n]` (`0.00 dB` droop) + passive `(7/8)A[n] + (1/8)A[n-1]` blend achieves **`-62.08 dBc` (`38.87 dB` less aliasing)** (`CL-02`) | [§5.1.2 below](#512-un-delayed-linear-path-separation-1times-passive-b-spline-blend-cl-02--resting-dc-equilibrium) |
 | **5** | **128-Bit Aligned 4-Tier Slimmable Hierarchy (`Lite`/`Full`/`Pro`/`Ultra`)** | Unaligned `C=3` Lite and 2-tier ceiling in NAM A2 | `100%` SIMD lane utilization across `C = 4, 8, 12, 16` and `M = 4, 8, 8, 16` with `0` stack spills in ARM64 NEON `v0`–`v31` | [§2 above](#2-4-tier-slimmable-simd-hierarchy-lite--full--pro--ultra--prior-art-comparison) |
 | **6** | **4-Tap Fractional Delay Readout + HF Shelf** | Recursive Thiran All-Pass on sweeping delay lines | The current Catmull-Rom fixture checks a relative jerk ratio for one stimulus; full-band quality and backend cost require validation. | [`Op-T §1`](../specs/dsp/op_t_transport.md#1-model-declared-ring-buffer-addressing--stateless-catmull-rom-reader) |
-| **7** | **Envelope-Guided Multi-Scale Surrogate Delay Gradient** | Myopic 4-sample Cubic Lagrange gradient during training | Coarse-to-fine Gaussian envelope derivative escapes carrier-cycle local minima (`54.52` samp error) and locks to **`0.0035` samples** | [`../specs/training/four_stage_pipeline.md` §2.1](../specs/training/four_stage_pipeline.md#21-stage-a--steiglitzmcbride-rational-pole--delay-identification) |
+| **7** | **Envelope-Guided Multi-Scale Surrogate Delay Gradient** | Myopic 4-sample Cubic Lagrange gradient during training | Coarse-to-fine Gaussian envelope derivative escapes carrier-cycle local minima (`54.52` samp error) and locks to **`0.0035` samples** | [`../specs/training/webgpu_and_varpro_solver.md`](../specs/training/webgpu_and_varpro_solver.md) |
 | **8** | **Givens + Householder Orthogonal Stereo Matrix `U(ψ, v)`** | Fixed ping-pong permutation or dense `M × M` matrix | Pairs `2×2` Givens rotation `R(ψ)` with `O(M)` Householder reflection `H(v)` (`< 10⁻¹⁴` orthogonality error across Dual-Mono, Reverb & Ping-Pong) | [§5.2.3 below](#523-om-givens--householder-orthogonal-stereo-feedback-matrix-mathbfupsi-mathbfv) |
 | **9** | **Passband-Normalized DC-Blocking Filter (`α_dc = (1 + R_dc)/2`)** | Unconstrained DC gain or unnormalized HPF (`> 1.0` at Nyquist) | Enforces strict passivity (`\|H_dc(e^{iω})\| ≤ 1.0000`) and **exact `0.0000` DC loop gain** (`1.03 × 10⁻⁶` DC under `+20 dBFS` overload, `CL-09`) | [§5.2.4 below](#524-passband-normalized-5text-hz-in-loop-dc-blocker-cl-09) |
 | **10** | **Unity-Slope Normalized Coercive-Saturating Loop Law** | Artificial on/off switch or unnormalized `1.5×` cubic slope | Pre-scaling by `2 / (3 V_ceil)` enforces **exact unity slope `S'(0) ≡ 1.0000`** so quiet tails decay while swells saturate below `V_ceil ≤ 0.985` (`CL-10`, `CL-11`) | [§5.2.5 below](#525-unity-slope-normalized-cubic-coercive-saturating-lyapunov-loop-law-cl-10-cl-11) |
 | **11** | **Mode-Free `WT-UFDN` with TZF, Spring Drip, Granular & Freeze** | Separate Chorus, Flanger, Spring, Reverb, Granular & Freeze modules | Unifies 64-sample TZF tap, negative all-pass dispersion (`CL-08`), **Self-Activating Hermite-Hann Grain Reader (`H(φ_A)+H(φ_B)≡1`)**, and **Unitary Freeze** | [§5.2.2 below](#522-mode-free-3text-khz-windowed-time-warped-unitary-fdn-wt-ufdn-granular-shimmer--spectral-freeze) |
 | **12** | **Control-Rate Stereo Tremolo & Leslie Rotary Beaming Gate** | Static post-mix gains incapable of AM/Tremolo | `3 kHz` multiplicative stereo gate `1 + w_{trem,L/R}^T m[k]` (`1 FMUL/ch`) models Optical/Harmonic Tremolo, Auto-Pan, and Rotary Beaming | [§5.2.6 below](#526-3text-khz-control-rate-stereo-tremolo--leslie-rotary-beaming-gate) |
-| **13** | **Blind Phase-Locked Teacher → 4-Harmonic Chebyshev LFO** | Naive fixed-frequency sine LFO during training | Tracks analog oscillator thermal drift during training (discarded at export) and shapes sine, triangle, saw, and asymmetric lamp LFOs | [`../specs/dsp/parametric_control_bus.md` §3](../specs/dsp/parametric_control_bus.md#3-autonomous-signal-driven-modulators-mathbfm_textdynk-in-mathbbr8) |
+| **13** | **Blind Phase-Locked Teacher → 4-Harmonic Chebyshev LFO** | Naive fixed-frequency sine LFO during training | Tracks analog oscillator thermal drift during training (discarded at export) and shapes sine, triangle, saw, and asymmetric lamp LFOs | [`../specs/dsp/parametric_control_bus.md`](../specs/dsp/parametric_control_bus.md) |
 | **14** | **Node-Anchored Newton/Lobatto HDMR-FM & Bilinear Tier Features** | `48 kHz` FiLM concatenation, dense MLP corner hallucination & rank bottlenecks | Evaluates knobs/switches at `3 kHz` (`0` MACs @ `48 kHz` static, `CL-12`–`CL-13`) and folds bilinear control modulators `[1, m_0, m_1, m_2]` into `W_head` for full multi-stem rank | [`../specs/dsp/parametric_control_bus.md` §2](../specs/dsp/parametric_control_bus.md#2-user-definable-parametric-controls-range--switch) |
-| **15** | **Order-Statistic Transport + Variance Gating + Switch Crossfade** | Double-echo channel crossfading, parasitic coupling & switch clicks | Targets sorted delay/pole fitting, gated invariant paths, and discrete-delay crossfades. The selected crossfade and its transition quality require implementation and verification. | [`../specs/dsp/parametric_control_bus.md` §4](../specs/dsp/parametric_control_bus.md#4-step-0-order-statistic-optimal-transport--physical-variance-gating) |
+| **15** | **Order-Statistic Transport + Variance Gating + Switch Crossfade** | Double-echo channel crossfading, parasitic coupling & switch clicks | Targets sorted delay/pole fitting, gated invariant paths, and discrete-delay crossfades. The selected crossfade and its transition quality require implementation and verification. | [`../specs/dsp/parametric_control_bus.md`](../specs/dsp/parametric_control_bus.md) |
 | **16** | **Non-Stop 3-Phase Audit & Factorized-Kronecker Stem Resume** | Blocking prompts, stale pre-summed Grams, `pickle` risks & full retraining | Clamps unobserved ranges/switches/corners non-stop (`CL-15`–`CL-17`) and retains tier-aware per-stem statistics and calibration records; redesigned resume timing is unverified. | [`../specs/training/control_space_audit.md`](../specs/training/control_space_audit.md) & [`../specs/training/iterative_resume_and_caching.md`](../specs/training/iterative_resume_and_caching.md) |
-| **17** | **32-Bit Device + Accurate Gram + Host `float64` Cascade & Polish** | Cold init, `float32` normal-equation overflow, band phase cancellation & OOMs | Targets 32-bit device streaming, high-precision accumulation, and host `float64` solving; accuracy and the redesigned `< 8 GiB` host budget require verification. | [`../specs/training/four_stage_pipeline.md` §2–§3](../specs/training/four_stage_pipeline.md#2-five-stage-analytical-variable-projection--cholesky-solver) |
+| **17** | **32-Bit Device + Accurate Gram + Host `float64` Cascade & Polish** | Cold init, `float32` normal-equation overflow, band phase cancellation & OOMs | Targets 32-bit device streaming, high-precision accumulation, and host `float64` solving; accuracy and the redesigned `< 8 GiB` host budget require verification. | [`../specs/training/webgpu_and_varpro_solver.md`](../specs/training/webgpu_and_varpro_solver.md) |
 | **18** | **Zero-Copy Hybrid Binary Container (`DNAM`/`DNCK`/`DNSL`) & ZOH** | `3.5×` bloated ASCII JSON `.nam` weights, `37.5%` structural zeros & fixed `48 kHz` | `64 B` preamble + `4 KB` JSON header + `64 B`-aligned 4-Tier `SoA` arenas (`< 50 ns` load), zero-re-sign tier stripping (`CL-19`), and native `44.1–96 kHz` ZOH rescaling | [`../specs/containers/dnam_binary_format.md`](../specs/containers/dnam_binary_format.md) |
 
 ---
@@ -238,7 +238,7 @@ This appendix records the mathematical, architectural, and container formulation
 
 ### 5.1 R&D Prototype Core 1: 12-Layer Dilated Conv + Selective Complex RG-LRU Stack
 
-In the Tri-Physics R&D prototype, Core 1 modeled instantaneous and dynamic nonlinear amplification across 4 blocks (12 layers total). Each block paired 2 local dilated causal convolutions ($K=6$, dilations $d \in [1, 3, 7, 19]$) using $1\times$ Passive B-Spline Division-Free Algebraic `PolyADAA` (Core 1A) with 1 Log-Octave, $\mathcal{H}_2$-Normalized Radial-Polar Selective Complex RG-LRU layer (Core 1B), feeding a 16-tap True-Stereo SVD-Kronecker Output Head.
+In the Tri-Physics R&D prototype, Core 1 modeled instantaneous and dynamic nonlinear amplification across 4 blocks (12 layers total). Each block paired 2 local dilated causal convolutions (`K = 6`, dilations `d ∈ [1, 3, 7, 19]`) using $1\times$ Passive B-Spline Division-Free Algebraic `PolyADAA` (Core 1A) with 1 Log-Octave, `H₂`-Normalized Radial-Polar Selective Complex RG-LRU layer (Core 1B), feeding a 16-tap True-Stereo SVD-Kronecker Output Head.
 
 #### 5.1.1 Exact Division-Free Algebraic Factorization (`FDIV = 0`)
 Pre-activation channel signal $x_c[n]$ was clamped to the unit interval (`CL-01`):
@@ -251,7 +251,7 @@ $$\mathcal{A}_c[n] = \beta_c m_n\Big(1.5 - 0.5\big(m_n^2 + d_n^2\big)\Big) + \de
 
 #### 5.1.2 Un-Delayed Linear Path Separation, $1\times$ Passive B-Spline Blend (`CL-02`) & Resting DC Equilibrium
 1. Direct un-delayed linear residual: $\alpha_c x_c[n]$.
-2. Passive B-spline blend ($0.875, 0.125$) and 5 Hz AC coupling ($R_{\text{ac}} = 0.9993$):
+2. Passive B-spline blend (`0.875, 0.125`) and 5 Hz AC coupling (`R_ac = 0.9993`):
    $$\tilde{y}_{\text{nl},c}[n] = 0.875 \mathcal{A}_c[n] + 0.125 \mathcal{A}_c[n-1]$$
    $$m_{\text{dc},c}[n] = 0.9993 m_{\text{dc},c}[n-1] + 0.0007 \tilde{y}_{\text{nl},c}[n]$$
    $$y_c[n] = \alpha_c x_c[n] + \big(\tilde{y}_{\text{nl},c}[n] - m_{\text{dc},c}[n]\big)$$
@@ -266,7 +266,7 @@ For pole angle $\theta_{\text{ctrl},c}[k] \in (0, \pi)$, shift $\phi = \theta - 
 $$y_1 = 1.5 - 0.5\big(\hat{c}^2 + \hat{s}^2\big), \qquad u_{\text{rot},c}[k] = (y_1 \hat{c}) + i(y_1 \hat{s})$$
 In exact arithmetic, $|u_{\text{rot},c}| \le 1$ when the unrounded squared norm lies in `[0, 2]`. That conditional argument does not prove a strict bound after `f32` rounding. This historical coefficient projection is superseded by the [current Op-M profile](../specs/dsp/op_m_modal_kautz.md#12-contractive-finite-precision-rotor).
 
-#### 5.1.5 $\mathcal{H}_2$-Norm Input Scaling & Associative Parallel Scan
+#### 5.1.5 `H₂`-Norm Input Scaling & Associative Parallel Scan
 Poles initialized log-octave from $25\text{ Hz}$ to $16\text{ kHz}$. Input energy normalized via $\gamma_{\text{norm},c} = \sqrt{1 - \bar{r}_c^2}$ (`CL-04`). Evaluated sequentially or via $O(\log_2 L)$ associative scan:
 $$(a_2, \tilde{b}_2) \circ (a_1, \tilde{b}_1) = (a_2 a_1, a_2 \tilde{b}_1 + \tilde{b}_2)$$
 
@@ -274,7 +274,7 @@ $$(a_2, \tilde{b}_2) \circ (a_1, \tilde{b}_1) = (a_2 a_1, a_2 \tilde{b}_1 + \til
 
 ### 5.2 R&D Prototype Core 2: `M-UFDN` / `WT-UFDN` with Separate `allpass_ring` and 16-Tap Head Injection
 
-Core 2 unified micro, short, and long delay horizons into a single Windowed Time-Warped Modulated Unitary Feedback Delay Network ($M \in [4, 8, 8, 16]$ lines).
+Core 2 unified micro, short, and long delay horizons into a single Windowed Time-Warped Modulated Unitary Feedback Delay Network (`M ∈ [4, 8, 8, 16]` lines).
 
 #### 5.2.1 Stateless 4-Tap Cubic Lagrange Fractional Delay Reader (`CL-06`)
 Decomposing causal delay $\tau_m[n] \ge 4.0$ into $D_{\text{int},m} = \lfloor \tau_m[n] \rfloor$ and $\mu_m = \tau_m[n] - D_{\text{int},m} \in [0, 1)$:
@@ -290,12 +290,12 @@ guaranteed exact partition of unity $H(\phi_A) + H(\phi_B) \equiv 1.000000$. Sel
 #### 5.2.3 $O(M)$ Givens + Householder Orthogonal Stereo Feedback Matrix $\mathbf{U}(\psi, \mathbf{v})$
 Paired block-diagonal $2\times 2$ Givens stereo rotation $\mathbf{R}(\psi)$ with unit-norm Householder reflection $\mathbf{H}(\mathbf{v}) = \mathbf{I}_M - 2\mathbf{v}\mathbf{v}^\top$:
 $$\mathbf{U}(\psi, \mathbf{v}) = \mathbf{H}(\mathbf{v})\mathbf{R}(\psi)$$
-Achieved $< 10^{-14}$ orthogonality error, spanning Dual-Mono ($\psi=0, \mathbf{v}=\mathbf{0}$), Reverb ($\psi=\pi/4$), and Ping-Pong ($\psi=\pi/2$).
+Achieved $< 10^{-14}$ orthogonality error, spanning Dual-Mono (`ψ = 0, v = 0`), Reverb (`ψ = π/4`), and Ping-Pong (`ψ = π/2`).
 
 #### 5.2.4 Passband-Normalized $5\text{ Hz}$ In-Loop DC Blocker (`CL-09`)
-The historical `0.995` pole below has a half-power point near `38.29 Hz` at `48 kHz`, not `5 Hz`. For the current TORA design, see [`CL-09`](../specs/dsp/router_and_stages_topology.md#62-stage-iv-passband-normalized-dc-blocker).
+The historical `0.995` pole below has a half-power point near `38.29 Hz` at `48 kHz`, not `5 Hz`. For the current TORA design, see [`CL-09`](../specs/dsp/router_and_crossbar_topology.md).
 
-Scaled numerator by $\alpha_{\text{dc}} = (1 + R_{\text{dc}})/2$ ($R_{\text{dc}} = 0.995$):
+Scaled numerator by $\alpha_{\text{dc}} = (1 + R_{\text{dc}})/2$ (`R_dc = 0.995`):
 $$\tilde{q}_m[n] = \alpha_{\text{dc}}\big(q_m[n] - q_m[n-1]\big) + R_{\text{dc}} \tilde{q}_m[n-1]$$
 guaranteeing exact $0.0000$ gain at DC and exact $\le 1.0000$ ceiling at Nyquist.
 

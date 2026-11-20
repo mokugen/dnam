@@ -4,7 +4,7 @@
 //! `ref[dsp.op-m.rotor.q0-192-lfo]`).
 //!
 //! Strictly 32-bit, `#![no_std]`, zero `FDIV`/`FSQRT`/`UDIV`, zero 64-bit scalars, and zero `libm`
-//! calls in runtime code (`ref[repo.code.shared-nostd-kernels]`).
+//! calls in runtime code (`ref[sdk.rust.shared-nostd-kernels]`).
 
 use crate::simd::{KernelVec4, flush_subnormal_f32_bits};
 

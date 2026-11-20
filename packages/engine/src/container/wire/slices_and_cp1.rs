@@ -1,6 +1,6 @@
 //! Model-Declared Delay Histories, Stage III Separate 64B-Aligned Slices, and `CP1` Packed Control
 //! Projections (`ref[container.dnam.delay-histories]`, `ref[container.dnam.load-validation]`,
-//! `ref[container.dnam.stage3-slices]`, `ref[container.dnam.cp1-profile]`).
+//! `ref[container.dnam.cabinet-slices]`, `ref[container.dnam.cp1-profile]`).
 
 pub mod delay_and_stage3;
 
@@ -567,7 +567,7 @@ mod spec_tests {
     }
 
     /// verify[container.dnam.load-validation]
-    /// verify[container.dnam.stage3-slices]
+    /// verify[container.dnam.cabinet-slices]
     /// verify[container.dnam.cp1-profile]
     /// Verifies Stage III separate 64B-aligned slices and `CP1` packed control projection records.
     #[test]

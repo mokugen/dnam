@@ -1,6 +1,6 @@
 //! Op-N: Universal Nonlinear, Hysteretic & Commuted Cascade Operator.
 //!
-//! Canonical Reference: `docs/specs/dsp/op_n_commuted_cascade.md` (`ref[dsp.op-n.polyadaa.clamp]`,
+//! Canonical Reference: `docs/specs/dsp/op_n_paralru_and_polyadaa.md` (`ref[dsp.op-n.polyadaa.clamp]`,
 //! `ref[dsp.op-n.polyadaa.midpoint]`, `ref[dsp.op-n.ctrl.lobatto-basis]`, `ref[dsp.op-n.ctrl.trust-clip]`).
 
 pub mod commuted_and_ctrl;
@@ -143,7 +143,7 @@ mod tests {
     /// verify[dsp.op-n.polyadaa.linear-residual]
     /// verify[dsp.op-n.polyadaa.bspline-ac]
     /// verify[dsp.op-n.polyadaa.drive-bank]
-    /// verify[dsp.op-n.stage2.conv6-simd]
+    /// verify[dsp.op-n.core.stereo-simd]
     #[test]
     fn test_sona_polyadaa_and_group_kernel_contracts() {
         use crate::FtzDazGuard;

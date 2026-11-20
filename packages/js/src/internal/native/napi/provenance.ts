@@ -1,6 +1,6 @@
 /**
  * `N-API v10` provenance, sealing, preview/royalty validation, and watermarking delegates
- * (`ref[sdk.ts.provenance.v2-security]`).
+ * (`ref[sdk.ts.provenance.security-and-drm]`).
  *
  * @module
  */

@@ -1,6 +1,6 @@
 /**
  * `.dnam-seal` (`DNSL`) hardware envelope sealing (`seal`), unsealing (`unseal`), `X25519` CEK
- * wrapping, and 64B cache-line `ChaCha20` arena encryption (`ref[sdk.ts.provenance.v2-security]`,
+ * wrapping, and 64B cache-line `ChaCha20` arena encryption (`ref[sdk.ts.provenance.security-and-drm]`,
  * `ref[sec.drm.dnsl-public-framing]`).
  *
  * @module

@@ -1,5 +1,5 @@
 //! `Op-M` / `Op-P` / `Op-T` modal, quadrature phase-tracker, and causal delay-transport kernels
-//! (`ref[repo.code.shared-nostd-kernels]`, `ref[dsp.op-m.hilbert.lattice]`,
+//! (`ref[sdk.rust.shared-nostd-kernels]`, `ref[dsp.op-m.hilbert.lattice]`,
 //! `ref[dsp.op-m.tracker.t1-dc-blocker]`, `ref[dsp.op-t.reader.catmull-rom]`).
 //!
 //! All modules are `#![no_std]`, `#![forbid(unsafe_code)]`, strictly 32-bit, zero-`libm`, and

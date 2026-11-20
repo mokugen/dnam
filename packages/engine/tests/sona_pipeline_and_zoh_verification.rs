@@ -11,8 +11,8 @@
 //!   Sample-0 DC resting equilibrium (`0.000000` pop on silence), distinct per-tier
 //!   (`Lite ⊂ Full ⊂ Pro ⊂ Ultra`) outputs, ZOH multi-sample-rate rescaling across
 //!   `44.1 kHz`–`192 kHz`, and `4x` ZOH linear-phase oversampled offline bounce with `12`-sample PDC trim.
-//! - `verify[arch.tiers.maximize-quality-within-budget]`, `verify[repo.code.zerocopy-wire-structs]`,
-//!   and `verify[repo.code.shared-nostd-kernels]`.
+//! - `verify[arch.tiers.maximize-quality-within-budget]`, `verify[sdk.rust.zerocopy-wire-structs]`,
+//!   and `verify[sdk.rust.shared-nostd-kernels]`.
 //! - See [`tests/sona_calibration_and_lifecycle.rs`](sona_calibration_and_lifecycle.rs) for engine
 //!   constructors, calibration roles, `W_ctrl` dispatch, isomorphism, `DAU1` signing, and property tests.
 
@@ -123,7 +123,7 @@ mod arch_spec_integration {
     // - `verify[arch.tiers.state-ram]`
     // - `verify[arch.tiers.efficiency]`
     // - `verify[arch.topology.signal-flow]`
-    // - `verify[arch.topology.stage0-router]`
+    // - `verify[arch.topology.io-router]`
     // - `verify[arch.topology.auto-unity-leveling]`
     // - `verify[arch.tiers.transition-contract]`
     // - `verify[arch.topology.spillover-trails]`
@@ -136,8 +136,8 @@ mod arch_spec_integration {
     // - `verify[arch.families.f5-bitcrusher]`
     // - `verify[arch.families.f6-formants]`
     // - `verify[arch.families.f7-multi-input]`
-    // - `verify[repo.code.zerocopy-wire-structs]`
-    // - `verify[repo.code.shared-nostd-kernels]`
+    // - `verify[sdk.rust.zerocopy-wire-structs]`
+    // - `verify[sdk.rust.shared-nostd-kernels]`
 
     use core::mem::{align_of, size_of};
 
@@ -238,7 +238,7 @@ mod arch_spec_integration {
     /// verify[arch.tiers.efficiency]
     /// verify[arch.tiers.transition-contract]
     /// verify[arch.topology.signal-flow]
-    /// verify[arch.topology.stage0-router]
+    /// verify[arch.topology.io-router]
     /// verify[arch.topology.auto-unity-leveling]
     /// verify[arch.topology.spillover-trails]
     /// verify[arch.bounce.oversampling]
@@ -335,8 +335,8 @@ mod arch_spec_integration {
         assert!(out_l.iter().all(|v| v.is_finite()));
     }
 
-    /// verify[repo.code.zerocopy-wire-structs]
-    /// verify[repo.code.shared-nostd-kernels]
+    /// verify[sdk.rust.zerocopy-wire-structs]
+    /// verify[sdk.rust.shared-nostd-kernels]
     #[test]
     fn test_zerocopy_wire_structs_and_shared_nostd_kernels() {
         let _guard = FtzDazGuard::new();

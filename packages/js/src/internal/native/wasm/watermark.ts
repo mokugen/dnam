@@ -1,6 +1,6 @@
 /**
  * WebAssembly isometric gauge / Tardos buyer watermarking and structural fingerprinting delegates
- * (`ref[sdk.ts.provenance.v2-security]`). Zero `node:*` dependencies.
+ * (`ref[sdk.ts.provenance.security-and-drm]`). Zero `node:*` dependencies.
  *
  * @module
  */

@@ -1,5 +1,5 @@
 //! Unconditionally passive `2x2` ZDF `TPT-SVF` (`ref[dsp.op-m.recurrence.symplectic]`,
-//! `ref[dsp.op-n.stage2.conv6-simd]`), division-free pure-`f32` bilinear prewarping,
+//! `ref[dsp.op-n.core.stereo-simd]`), division-free pure-`f32` bilinear prewarping,
 //! and forward/adjoint `2x2` associative scan operators.
 
 use crate::simd::{GpuVec4, KernelVec4, StereoVec8};
@@ -127,7 +127,7 @@ pub fn step_tpt_svf_vec4<V: KernelVec4>(
     }
 }
 
-/// Advances stereo `L+R` `4`-mode `TPT-SVF` states in `StereoVec8` (`ref[dsp.op-n.stage2.conv6-simd]`),
+/// Advances stereo `L+R` `4`-mode `TPT-SVF` states in `StereoVec8` (`ref[dsp.op-n.core.stereo-simd]`),
 /// broadcasting shared filter coefficients across both halves for `0-ULP` stereo parity.
 #[inline(always)]
 pub fn step_tpt_svf_stereo8<S: StereoVec8>(

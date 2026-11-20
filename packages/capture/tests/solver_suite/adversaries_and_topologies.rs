@@ -5,9 +5,9 @@
 //! and `Case #19` All Six Routing Topologies (`1->1`, `2->1`, `1->2`, `2->2`, `4CM`, `WDW`).
 //!
 //! Canonical References:
-//! - `docs/specs/training/four_stage_pipeline.md` (`r[train.pipeline.fixtures-matrix]`)
+//! - `docs/specs/training/webgpu_and_varpro_solver.md` (`r[train.pipeline.fixtures-matrix]`)
 //! - `docs/specs/training/control_space_audit.md` (`[STAB-ZERO-DC]`, 3-phase audit)
-//! - `docs/specs/dsp/router_and_stages_topology.md` (`S_{ret->send} == 0` causal `4CM` DAG)
+//! - `docs/specs/dsp/router_and_crossbar_topology.md` (`S_{ret->send} == 0` causal `4CM` DAG)
 
 use std::collections::BTreeMap;
 

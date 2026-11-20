@@ -1,5 +1,5 @@
 //! WASM v2 isometric gauge / Tardos buyer watermarking and structural fingerprinting exports
-//! (`ref[sdk.ts.provenance.v2-security]`, `ref[sdk.ts.runtime.zero-unsafe]`).
+//! (`ref[sdk.ts.provenance.security-and-drm]`, `ref[sdk.ts.runtime.zero-unsafe]`).
 
 use crate::core::provenance::{
     apply_isometric_gauge_watermark_core, apply_tardos_watermark_core,

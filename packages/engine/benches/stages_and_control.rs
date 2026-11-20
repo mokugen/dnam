@@ -50,13 +50,13 @@ fn make_bench_container() -> AlignedBuffer<CacheLine64> {
             conditional_bounds: vec![
                 StructuredConditionalBound {
                     when: vec![("mode".to_string(), "a".to_string())],
-                    min: Some(0.0),
+                    min: None,
                     max: Some(0.4),
                 },
                 StructuredConditionalBound {
                     when: vec![("mode".to_string(), "b".to_string())],
                     min: Some(0.6),
-                    max: Some(1.0),
+                    max: None,
                 },
             ],
             represented_switch_options: None,

@@ -1,6 +1,6 @@
 //! Stage 0: 8-Port Matrix Router, Lower-Block Triangular DAG Routing & Sub Crossover.
 //!
-//! Canonical Reference: `docs/specs/dsp/router_and_stages_topology.md` (`ref[dsp.router.return-to-send-isolation]`, `REQ-7.4`).
+//! Canonical Reference: `docs/specs/dsp/router_and_crossbar_topology.md` (`ref[dsp.router.return-to-send-isolation]`, `REQ-7.4`).
 
 pub mod v3_stage0;
 

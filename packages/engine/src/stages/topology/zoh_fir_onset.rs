@@ -1,8 +1,8 @@
 //! Stage III ZOH First-Tap (`44.1-48 kHz`) & 6-Point Lagrange (`176.4-384 kHz`) Difference Mappings.
 //!
-//! Canonical Reference: `docs/specs/dsp/router_and_stages_topology.md` (`ref[dsp.zoh.stage3-fir-onset]`).
+//! Canonical Reference: `docs/specs/dsp/router_and_crossbar_topology.md` (`ref[dsp.zoh.cabinet-fir-onset]`).
 
-/// Gain- and DC-constrained 64-tap first-tap anchor coefficients at `44.1 kHz` (`ref[dsp.zoh.stage3-fir-onset]`).
+/// Gain- and DC-constrained 64-tap first-tap anchor coefficients at `44.1 kHz` (`ref[dsp.zoh.cabinet-fir-onset]`).
 pub const GAIN_BOUNDED_FIRST_TAP_64_BITS: [u32; 64] = [
     0x3d6c_9268,
     0x3f83_725f,
@@ -72,7 +72,7 @@ pub const GAIN_BOUNDED_FIRST_TAP_64_BITS: [u32; 64] = [
 
 /// Computes the 63 residual difference coefficients $\widetilde p_j = \mathrm{RN}_{32}(\lambda p_j)$
 /// for the live `44.1–48 kHz` first-tap difference family ($\lambda = (48000 - f)/3900$,
-/// `ref[dsp.zoh.stage3-fir-onset]`).
+/// `ref[dsp.zoh.cabinet-fir-onset]`).
 pub fn prepare_live_first_tap_difference_coeffs(effective_rate_hz: f64) -> Option<[f32; 63]> {
     const INV_3900: f64 = 1.0 / 3_900.0;
     if !effective_rate_hz.is_finite() || !(44_100.0..=48_000.0).contains(&effective_rate_hz) {
@@ -91,7 +91,7 @@ pub fn prepare_live_first_tap_difference_coeffs(effective_rate_hz: f64) -> Optio
 
 /// Evaluates the previous-sample anchored live `44.1–48 kHz` first-tap difference filter
 /// $x[n-1] + \sum_{j=0}^{62} \widetilde p_j (x[n-j] - x[n-j-1])$, preserving exact `0 ULP` unit DC
-/// gain on constant normal histories (`ref[dsp.zoh.stage3-fir-onset]`).
+/// gain on constant normal histories (`ref[dsp.zoh.cabinet-fir-onset]`).
 pub fn eval_live_first_tap_difference(history: &[f32; 64], coeffs: &[f32; 63]) -> f32 {
     let mut out = history[1];
     for (j, &c) in coeffs.iter().enumerate() {
@@ -103,7 +103,7 @@ pub fn eval_live_first_tap_difference(history: &[f32; 64], coeffs: &[f32; 63]) -
 
 /// Computes the exact integer decomposition $d = k f / 48000 = m + r / D$ (`m >= 3`), anchor index
 /// $a \in \{2, 3\}$, and 5 difference coefficients $p_0..p_4$ for `4×` bounce (`176.4–384 kHz`)
-/// tap $k \in [1, 63]$ (`ref[dsp.zoh.stage3-fir-onset]`).
+/// tap $k \in [1, 63]$ (`ref[dsp.zoh.cabinet-fir-onset]`).
 pub fn prepare_bounce_6point_lagrange_tap(
     tap_k: u8,
     effective_rate_hz: f64,
@@ -165,7 +165,7 @@ pub fn prepare_bounce_6point_lagrange_tap(
 }
 
 /// Evaluates the 6-point Lagrange difference tap $x[n - m - a + 2] + \sum_{j=0}^4 p_j (x[n - m + 2 - j] - x[n - m + 1 - j])$
-/// (`ref[dsp.zoh.stage3-fir-onset]`).
+/// (`ref[dsp.zoh.cabinet-fir-onset]`).
 pub fn eval_bounce_6point_lagrange_tap(
     history: &[f32],
     m: usize,
@@ -193,10 +193,10 @@ mod spec_tests {
 
     /// verify[dsp.zoh.op-m-poles]
     /// verify[dsp.zoh.router-detector]
-    /// verify[dsp.zoh.stage2-op-n]
+    /// verify[dsp.zoh.core-paralru]
     /// verify[dsp.zoh.op-t-delays]
     /// verify[dsp.zoh.ctrl-stride]
-    /// verify[dsp.zoh.stage3-fir-onset]
+    /// verify[dsp.zoh.cabinet-fir-onset]
     #[test]
     fn test_zoh_rescaling_and_stage3_first_tap_and_6point_lagrange_mappings() {
         let _guard = FtzDazGuard::new();

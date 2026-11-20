@@ -12,15 +12,9 @@
 scope = "out-of-scope"
 reason = "Repository-wide Rust/TypeScript static typing and import boundary guardrail verified in tests/code_guardrails.test.ts"
 
-[rules."repo.code.zerocopy-wire-structs"]
-scope = "engine"
-
-[rules."repo.code.shared-nostd-kernels"]
-scope = "engine"
-
 [rules."repo.docs.agents-md-budgets"]
 scope = "out-of-scope"
-reason = "Repository-wide AGENTS.md byte budget guardrail verified in tests/docs_registry_guardrails.test.ts"
+reason = "Repository-wide AGENTS.md byte budget guardrail verified in tests/docs_formatting_guardrails.test.ts"
 
 [rules."repo.docs.requirements-layer"]
 scope = "out-of-scope"
@@ -119,7 +113,7 @@ reason = "Offline 4-tier psychoacoustic benchmark qualification matrix owned by 
 
 [rules."qual.tiers.floors-not-stopping-criteria"]
 scope = "out-of-scope"
-reason = "Phase 1 benchmark floor vs stopping-criteria policy verified in tests/architecture_guardrails.test.ts (enforced in capture Phase 5)"
+reason = "Benchmark floor vs stopping-criteria policy verified in tests/architecture_guardrails.test.ts and enforced in packages/capture"
 
 # ==============================================================================
 # 3. Architecture: SONA System Overview (`docs/specs/architecture/sona_architecture.md`)
@@ -175,7 +169,7 @@ scope = "engine"
 [rules."arch.topology.signal-flow"]
 scope = "engine"
 
-[rules."arch.topology.stage0-router"]
+[rules."arch.topology.io-router"]
 scope = "engine"
 
 [rules."arch.topology.auto-unity-leveling"]
@@ -220,7 +214,7 @@ scope = "engine"
 [rules."arch.isomorphism.guarantees"]
 scope = "engine"
 
-[rules."arch.isomorphism.stage2-serialization"]
+[rules."arch.isomorphism.sona-serialization"]
 scope = "engine"
 
 [rules."arch.isomorphism.two-sweep"]
@@ -315,7 +309,7 @@ scope = "engine"
 [rules."container.dnam.tensor-directory"]
 scope = "engine"
 
-[rules."container.dnam.stage3-slices"]
+[rules."container.dnam.cabinet-slices"]
 scope = "engine"
 
 [rules."container.dnam.cp1-profile"]
@@ -385,25 +379,25 @@ scope = "engine"
 scope = "out-of-scope"
 reason = "Capture differentiable sub-harmonic tracker forward/surrogate pass owned by packages/capture"
 
-[rules."dsp.op-m.stage3.kautz-allocation"]
+[rules."dsp.op-m.kautz.tier-allocation"]
 scope = "engine"
 
-[rules."dsp.op-m.stage3.dual-state"]
+[rules."dsp.op-m.kautz.dual-state"]
 scope = "engine"
 
-[rules."dsp.op-m.stage3.radial-gate"]
+[rules."dsp.op-m.kautz.radial-gate"]
 scope = "engine"
 
-[rules."dsp.op-m.stage3.rate-convert"]
+[rules."dsp.op-m.kautz.rate-convert"]
 scope = "engine"
 
-[rules."dsp.op-m.stage3.coupled-form"]
+[rules."dsp.op-m.kautz.coupled-form"]
 scope = "engine"
 
-[rules."dsp.op-m.stage3.sweep-contraction"]
+[rules."dsp.op-m.kautz.sweep-contraction"]
 scope = "engine"
 
-[rules."dsp.op-m.stage3.pole-extraction"]
+[rules."dsp.op-m.kautz.pole-extraction"]
 scope = "out-of-scope"
 reason = "Offline Steiglitz-McBride / Warped Kautz pole-extraction solver owned by packages/capture"
 
@@ -411,7 +405,7 @@ reason = "Offline Steiglitz-McBride / Warped Kautz pole-extraction solver owned 
 scope = "engine"
 
 # ==============================================================================
-# 7. DSP: Op-N Commuted Cascade (`docs/specs/dsp/op_n_commuted_cascade.md`)
+# 7. DSP: Op-N ParaLRU & PolyADAA (`docs/specs/dsp/op_n_paralru_and_polyadaa.md`)
 # ==============================================================================
 [rules."dsp.op-n.polyadaa.clamp"]
 scope = "engine"
@@ -462,16 +456,16 @@ scope = "engine"
 [rules."dsp.op-n.commuted.dc-equilibrium"]
 scope = "engine"
 
-[rules."dsp.op-n.stage2.sub-stages"]
+[rules."dsp.op-n.core.matryoshka-blocks"]
 scope = "engine"
 
-[rules."dsp.op-n.stage2.tone-basis"]
+[rules."dsp.op-n.core.tpt-tone-basis"]
 scope = "engine"
 
-[rules."dsp.op-n.stage2.stereo-coupling"]
+[rules."dsp.op-n.core.interblock-tiles"]
 scope = "engine"
 
-[rules."dsp.op-n.stage2.latent-folding"]
+[rules."dsp.op-n.core.control-sensitivity"]
 scope = "engine"
 
 [rules."dsp.op-n.ctrl.incremental-update"]
@@ -603,15 +597,15 @@ scope = "engine"
 [rules."dsp.ctrl.dispatch.matrix"]
 scope = "engine"
 
-[rules."dsp.ctrl.dispatch.stage-laws"]
+[rules."dsp.ctrl.dispatch.modulation-laws"]
 scope = "engine"
 
 [rules."dsp.ctrl.dispatch.micro-ramp"]
 scope = "engine"
 
-[rules."dsp.ctrl.step0.variance-gating"]
+[rules."dsp.ctrl.calib.variance-gating"]
 scope = "out-of-scope"
-reason = "Offline Step-0 transport and variance-based control locking owned by packages/capture"
+reason = "Offline Control-Space Audit variance-based control locking owned by packages/capture"
 
 [rules."dsp.ctrl.math.pitch-profile"]
 scope = "engine"
@@ -641,7 +635,7 @@ scope = "engine"
 scope = "engine"
 
 # ==============================================================================
-# 10. DSP: Router & Stages Topology (`docs/specs/dsp/router_and_stages_topology.md`)
+# 10. DSP: Router & Crossbar Topology (`docs/specs/dsp/router_and_crossbar_topology.md`)
 # ==============================================================================
 [rules."dsp.router.signal-flow"]
 scope = "engine"
@@ -676,31 +670,31 @@ scope = "engine"
 [rules."dsp.router.ballistic-envelope-bank"]
 scope = "engine"
 
-[rules."dsp.stage1.pre-bus"]
+[rules."dsp.crossbar.top-of-frame"]
 scope = "engine"
 
-[rules."dsp.stage2.commuted-cascade"]
+[rules."dsp.core.matryoshka-cascade"]
 scope = "engine"
 
-[rules."dsp.stage3.cabinet-bank"]
+[rules."dsp.cabinet.fir-kautz-bank"]
 scope = "engine"
 
-[rules."dsp.stage4.spatial-tank"]
+[rules."dsp.tank.feedback-loop"]
 scope = "engine"
 
-[rules."dsp.stage4.captured-freeze"]
+[rules."dsp.tank.captured-freeze"]
 scope = "engine"
 
-[rules."dsp.stage4.dc-blocker"]
+[rules."dsp.tank.dc-blocker"]
 scope = "engine"
 
-[rules."dsp.stage4.loop-saturator"]
+[rules."dsp.tank.loop-saturator"]
 scope = "engine"
 
-[rules."dsp.stage4.quiet-feedback-knee"]
+[rules."dsp.tank.quiet-feedback-knee"]
 scope = "engine"
 
-[rules."dsp.head.feature-bus-slots"]
+[rules."dsp.head.direct-register-readout"]
 scope = "engine"
 
 [rules."dsp.head.tier-equivalence"]
@@ -718,7 +712,7 @@ scope = "engine"
 [rules."dsp.zoh.router-detector"]
 scope = "engine"
 
-[rules."dsp.zoh.stage2-op-n"]
+[rules."dsp.zoh.core-paralru"]
 scope = "engine"
 
 [rules."dsp.zoh.op-t-delays"]
@@ -727,7 +721,7 @@ scope = "engine"
 [rules."dsp.zoh.ctrl-stride"]
 scope = "engine"
 
-[rules."dsp.zoh.stage3-fir-onset"]
+[rules."dsp.zoh.cabinet-fir-onset"]
 scope = "engine"
 
 # ==============================================================================
@@ -787,10 +781,10 @@ scope = "engine"
 [rules."sec.watermark.seed-derivation"]
 scope = "engine"
 
-[rules."sec.anticlone.three-stage-gate"]
+[rules."sec.anticlone.three-gate-pipeline"]
 scope = "engine"
 
-[rules."sec.anticlone.stage3-fingerprint"]
+[rules."sec.anticlone.cabinet-fingerprint"]
 scope = "engine"
 
 [rules."sec.preview.containment"]
@@ -865,11 +859,11 @@ reason = "Owned and verified by packages/capture"
 
 [rules."train.audit.phase2.corner-barrier"]
 scope = "out-of-scope"
-reason = "Stage D analytical VarPro corner barrier owned by packages/capture"
+reason = "Pass 4 analytical VarPro corner barrier owned by packages/capture"
 
 [rules."train.audit.phase2.clamp-rail"]
 scope = "out-of-scope"
-reason = "Phase-2 2048-sample GRU/SVF state boundedness and rail occupancy auditor owned by packages/capture"
+reason = "Pass 4 2048-sample TPT-SVF and decoupled 1D ParaLRU state boundedness and rail occupancy auditor owned by packages/capture"
 
 [rules."train.audit.phase3.clamp-dynamic"]
 scope = "out-of-scope"
@@ -888,7 +882,7 @@ scope = "out-of-scope"
 reason = "Owned and verified by packages/capture"
 
 # ==============================================================================
-# 15. Training: SONA Solver Pipeline (`docs/specs/training/four_stage_pipeline.md`)
+# 15. Training: WebGPU & VarPro Solver (`docs/specs/training/webgpu_and_varpro_solver.md`)
 # ==============================================================================
 [rules."train.pipeline.topology"]
 scope = "out-of-scope"
@@ -896,27 +890,27 @@ reason = "SONA analytical VarPro, parallel-scan, and Cholesky pipeline orchestra
 
 [rules."train.pipeline.webgpu-scans-and-ozaki"]
 scope = "out-of-scope"
-reason = "Phase 1 32-bit WebGPU 16 KiB SRAM scans and i32 Ozaki rule verified in tests/architecture_guardrails.test.ts (promoted in Phase 4/5)"
+reason = "32-bit WebGPU 16 KiB SRAM scans and i32 Ozaki rule verified in tests/architecture_guardrails.test.ts and owned by packages/capture"
 
-[rules."train.pipeline.stage-a-poles"]
+[rules."train.pipeline.physics-probe"]
 scope = "out-of-scope"
-reason = "Stage A Steiglitz-McBride / OMP rational pole and delay identification owned by packages/capture"
+reason = "Physics probe Steiglitz-McBride / OMP rational pole and delay identification owned by packages/capture"
 
-[rules."train.pipeline.stage-b-harvest"]
+[rules."train.pipeline.backbone-trajectory-opt"]
 scope = "out-of-scope"
-reason = "Stage B joint 4-tier Windowed-BPTT backbone and 2.0-2.5s fp32 INPC/STMC extraction owned by packages/capture"
+reason = "Joint 4-tier full-capsule associative scan and exact 3-pass reverse-mode BPTT trajectory optimization with 2.0-2.5s fp32 INPC/STMC extraction owned by packages/capture"
 
-[rules."train.pipeline.stage-c-schur"]
+[rules."train.pipeline.nested-varpro-schur"]
 scope = "out-of-scope"
-reason = "Stage C nested 4-tier VarPro uplo='U' Cholesky and LTAS KKT solver owned by packages/capture"
+reason = "Nested 4-tier VarPro uplo='U' Cholesky and LTAS KKT solver owned by packages/capture"
 
-[rules."train.pipeline.stage-d-control"]
+[rules."train.pipeline.control-projection-fit"]
 scope = "out-of-scope"
-reason = "Stage D parallel multi-knob FiLM/Tone-SVF/CP1 control-bus projection solver owned by packages/capture"
+reason = "Parallel multi-knob 3 kHz CP1/U_int/W_ctrl control-bus and W_readout projection solver owned by packages/capture"
 
-[rules."train.pipeline.stage-e-pack"]
+[rules."train.pipeline.host-parity-and-export"]
 scope = "out-of-scope"
-reason = "Stage E f32 readout polish, ISS/Schur audit, [STAB-ZERO-DC], and container emission owned by packages/capture"
+reason = "Deterministic host CPU SonaInstance + Wide192Accum parity pass, intrinsic TPT-SVF/ParaLRU/Op-T/Kautz stability audit, [STAB-ZERO-DC], and v3.0 container emission owned by packages/capture"
 
 [rules."train.gram.accuracy-contract"]
 scope = "out-of-scope"
@@ -955,11 +949,11 @@ reason = "Time-varying stem statistics and trajectory windows owned by packages/
 
 [rules."train.resume.two-tier-execution"]
 scope = "out-of-scope"
-reason = "Two-Path (<150 ms Path 1 Fast-Path vs Raw-Audio-Free Path 2 Full Re-Pool) vault execution owned by packages/capture"
+reason = "Two-Path (< 50 ms Path 1 incremental edit vs Raw-Audio-Free Path 2 full re-pool) vault execution owned by packages/capture"
 
 [rules."train.resume.dependency-digests"]
 scope = "out-of-scope"
-reason = "Stem SHA-256 and DNAM-GRAM-INPUT-v2 dependency digest invalidation owned by packages/capture"
+reason = "Stem SHA-256 and DNAM-GRAM-INPUT-V3 dependency digest invalidation owned by packages/capture"
 
 [rules."train.resume.old-stem-nonregression"]
 scope = "out-of-scope"
@@ -967,7 +961,7 @@ reason = "Unchanged-stem non-regression verification owned by packages/capture"
 
 [rules."train.resume.windowed-refresh"]
 scope = "out-of-scope"
-reason = "Bounded <64 MiB windowed Gram and Windowed-BPTT refresh owned by packages/capture"
+reason = "2-D memory-bounded RESIDENT_BATCHED / STREAMED refresh budgets (<= 128 MiB/binding, < 256 MiB browser WebGPU, < 64 MiB WASM fallback, < 512 MiB desktop) owned by packages/capture"
 
 [rules."train.cache.proj-vault"]
 scope = "out-of-scope"
@@ -1044,11 +1038,11 @@ reason = "TypeScript SDK (packages/js) contract verified by TypeScript test suit
 scope = "out-of-scope"
 reason = "TypeScript SDK (packages/js) contract verified by TypeScript test suite"
 
-[rules."sdk.ts.model.containers-and-checkpoints"]
+[rules."sdk.ts.model.containers-and-gram"]
 scope = "out-of-scope"
 reason = "TypeScript SDK (packages/js) contract verified by TypeScript test suite"
 
-[rules."sdk.ts.provenance.v2-security"]
+[rules."sdk.ts.provenance.security-and-drm"]
 scope = "out-of-scope"
 reason = "TypeScript SDK (packages/js) contract verified by TypeScript test suite"
 
@@ -1065,15 +1059,35 @@ scope = "out-of-scope"
 reason = "TypeScript SDK (packages/js) contract verified by TypeScript test suite"
 
 # ==============================================================================
-# ADR-0019: Two-Level SIMD Trait Architecture & Real-Time Loop Optimizations
+# 18. SDKs: Rust SDK (`docs/specs/sdks/rust_sdk.md`)
 # ==============================================================================
-[rules."repo.code.realtime-disassembly-audit"]
+[rules."sdk.rust.safe-rust-and-boundaries"]
+scope = "out-of-scope"
+reason = "Workspace-wide safe-Rust and crate dependency boundary guardrail verified in tests/code_guardrails.test.ts and tests/architecture_guardrails.test.ts"
+
+[rules."sdk.rust.zerocopy-wire-structs"]
 scope = "engine"
 
-[rules."repo.code.explicit-simd-and-coverage"]
-scope = "out-of-scope"
-reason = "Repository-wide static source guardrail for coverage(off) and math/ macro_rules! verified in tests/code_guardrails.test.ts"
+[rules."sdk.rust.shared-nostd-kernels"]
+scope = "engine"
 
+[rules."sdk.rust.realtime-disassembly-audit"]
+scope = "engine"
+
+[rules."sdk.rust.explicit-simd-and-coverage"]
+scope = "out-of-scope"
+reason = "Workspace-wide explicit SIMD trait and zero coverage(off) guardrail verified in tests/code_guardrails.test.ts and tests/architecture_guardrails.test.ts"
+
+[rules."sdk.rust.modular-layout-and-proptest"]
+scope = "out-of-scope"
+reason = "Workspace-wide Rust modular layout (zero mod.rs, < 900 LOC) and proptest! guardrail verified in tests/code_guardrails.test.ts and tests/architecture_guardrails.test.ts"
+
+[rules."sdk.rust.c-abi-and-host-handle"]
+scope = "engine"
+
+# ==============================================================================
+# ADR-0019: Two-Level SIMD Trait Architecture & Real-Time Loop Optimizations
+# ==============================================================================
 [rules."repo.code.modular-decomposition-and-tests"]
 scope = "out-of-scope"
 reason = "Repository-wide modular decomposition, zero code-golfing, and co-located unit-test guardrail verified in tests/code_guardrails.test.ts"
@@ -1106,7 +1120,7 @@ scope = "engine"
 [rules."dsp.op-n.polyadaa.stereo-and-rail-guard"]
 scope = "engine"
 
-[rules."dsp.op-n.stage2.conv6-simd"]
+[rules."dsp.op-n.core.stereo-simd"]
 scope = "engine"
 
 [rules."dsp.op-t.reader.contiguous-fp16x4"]
@@ -1115,10 +1129,10 @@ scope = "engine"
 [rules."dsp.op-t.guard.incremental-counters"]
 scope = "engine"
 
-[rules."dsp.stage3.mirrored-fir-simd"]
+[rules."dsp.cabinet.mirrored-fir-simd"]
 scope = "engine"
 
-[rules."dsp.stage4.simd-tank-loop"]
+[rules."dsp.tank.simd-loop"]
 scope = "engine"
 
 [rules."dsp.head.precollapse-and-zerocopy"]

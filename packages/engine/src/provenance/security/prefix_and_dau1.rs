@@ -13,7 +13,7 @@ use crate::provenance::sha256::sha256_digest;
 use crate::schema::{DnamError, SchemaOptionExt, reject_if};
 
 /// Fixed 41-byte creator preamble wire header for `DAU1` and `DAI1` envelopes
-/// (`ref[sec.sig.dau1-envelope]`, `ref[repo.code.zerocopy-wire-structs]`).
+/// (`ref[sec.sig.dau1-envelope]`, `ref[sdk.rust.zerocopy-wire-structs]`).
 #[repr(C)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
@@ -37,7 +37,7 @@ const _: () = assert!(offset_of!(Dau1CreatorPreambleWire, creator_pubkey) == 8);
 const _: () = assert!(offset_of!(Dau1CreatorPreambleWire, creator_max_tier) == 40);
 
 /// Fixed 36-byte marketplace header in `auth_kind == 1` `DAU1` and `DAI1` envelopes
-/// (`ref[sec.sig.dau1-envelope]`, `ref[repo.code.zerocopy-wire-structs]`).
+/// (`ref[sec.sig.dau1-envelope]`, `ref[sdk.rust.zerocopy-wire-structs]`).
 #[repr(C)]
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,

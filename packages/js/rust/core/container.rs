@@ -1,5 +1,5 @@
 //! Target-agnostic `.dnam` model, `DMU1` mutable frame, JCS, `CRC32C`,
-//! and `uplo='U'` Gram matrix core functions (`ref[sdk.ts.model.containers-and-checkpoints]`).
+//! and `uplo='U'` Gram matrix core functions (`ref[sdk.ts.model.containers-and-gram]`).
 
 use std::collections::BTreeMap;
 

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Stage B (`Joint 4-Tier Matryoshka Backbone` & `256-D` `uplo='U'` `STAT` Contraction, `solver::stage_b_backbone`).
 //!
-//! Canonical Reference: `docs/specs/training/four_stage_pipeline.md` (`ref[train.pipeline.stage-b-harvest]`).
+//! Canonical Reference: `docs/specs/training/webgpu_and_varpro_solver.md` (`ref[train.pipeline.backbone-trajectory-opt]`).
 
 use dnam_engine::Tier;
 use dnam_engine::math::DefaultMathBackend;
@@ -376,7 +376,7 @@ pub fn patch_v3_readouts_weighted_cholesky(
 }
 
 /// Executes Stage B (`Joint 4-Tier Matryoshka Backbone` fit or white-box preservation) and
-/// contracts the canonical `267,264 B` `uplo='U'` `STAT` chunk (`r[train.pipeline.stage-b-harvest]`).
+/// contracts the canonical `267,264 B` `uplo='U'` `STAT` chunk (`r[train.pipeline.backbone-trajectory-opt]`).
 pub fn solve_stage_b_backbone(
     manifest: &DnamProjManifest,
     arena: &mut [u8],

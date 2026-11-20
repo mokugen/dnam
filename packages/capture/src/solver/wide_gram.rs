@@ -3,7 +3,7 @@
 //! `uplo='U'` Sufficient-Statistic Accumulator (`solver::wide_gram`).
 //!
 //! Canonical References:
-//! - `docs/specs/training/four_stage_pipeline.md` (`ref[train.gram.wide192]`, `ref[train.gram.accuracy-contract]`)
+//! - `docs/specs/training/webgpu_and_varpro_solver.md` (`ref[train.gram.wide192]`, `ref[train.gram.accuracy-contract]`)
 //! - `docs/specs/containers/project_container_format.md` (`ref[container.proj.stat-uplo-u]`)
 
 mod cross_only;
@@ -296,7 +296,7 @@ fn mask256_or(a: [u64; 4], b: [u64; 4]) -> [u64; 4] {
 /// Contracts `256-D` feature frames and stereo targets into a canonical `uplo='U'` Gram matrix
 /// (`32,896 × f64`) and `[256][2]` cross-correlation matrix using `[8 × 4]` / `[4 × 4]`
 /// register-tiled micro-batches merged into `Wide192Accum` (`r[train.gram.wide192]`,
-/// `r[train.pipeline.stage-b-harvest]`).
+/// `r[train.pipeline.backbone-trajectory-opt]`).
 pub fn contract_256d_gram_tiled_wide192(
     features: &[[f32; 256]],
     targets_lr: &[[f64; 2]],

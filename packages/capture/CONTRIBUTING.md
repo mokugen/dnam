@@ -25,7 +25,7 @@ Consult [`AGENTS.md`](AGENTS.md), [`src/AGENTS.md`](src/AGENTS.md), [`src/align/
 ## 2. Core Invariants
 
 1. **100% Safe Rust (`#![forbid(unsafe_code)]`), `zerocopy` Wire Structs, Pure IO Buffers & File Hygiene:**
-   - `dnam-capture` enforces `#![forbid(unsafe_code)]` across all library, test, and benchmark targets (`ref[repo.code.type-safety-and-imports]`), zero `mod.rs` files, zero `clap` or `cpal` dependencies, `< 900` lines per `.rs` file, and declarative `zerocopy` wire structs (`.agents/rules/zerocopy-wire-structs.md`) for `.dnam-proj` / `DNWB` / WAV headers (`Phase 5`).
+   - `dnam-capture` enforces `#![forbid(unsafe_code)]` across all library, test, and benchmark targets (`ref[repo.code.type-safety-and-imports]`, `ref[sdk.rust.safe-rust-and-boundaries]`), zero `mod.rs` files (`ref[sdk.rust.modular-layout-and-proptest]`), zero `clap` or `cpal` dependencies, `< 900` lines per `.rs` file, and declarative `zerocopy` wire structs (`ref[sdk.rust.zerocopy-wire-structs]`, `.agents/rules/zerocopy-wire-structs.md`) for `.dnam-proj` / `DNWB` / WAV headers (`Phase 5`).
 2. **Exact Engine-Capture Isomorphism & `100%` Black-Box Solver Purity (`ref[arch.isomorphism.two-sweep]`, `ref[arch.isomorphism.audit-wiring]`):**
    - Never duplicate DSP operator math (`Op-T`, `Op-M`, `Op-N`), `3 kHz` control-bus recurrences, or `.dnam` binary framing; depend directly on [`dnam-engine`](../engine/README.md) (and shared `#![no_std]` `packages/kernels` + AOT `.wgsl` in `Phases 2–5`), and keep `src/` `100%` data-driven with zero fixture or circuit-template heuristics (`.agents/rules/universal-black-box.md`).
 3. **`f64` Sufficient Statistics & `uplo='U'` Packing (`ref[container.proj.stat-uplo-u]`, `ref[train.gram.accuracy-contract]`):**

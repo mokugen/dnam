@@ -1,7 +1,7 @@
 //! Stage IV: Unitary Spatial `Op-T` FDN Tank with Givens+Householder Mixing (`v3_fdn`).
 //!
-//! Canonical Reference: `docs/specs/dsp/router_and_stages_topology.md` (`ref[dsp.stage4.spatial-tank]`,
-//! `ref[dsp.stage4.dc-blocker]`, `ref[dsp.stage4.loop-saturator]`, `ref[dsp.stage4.quiet-feedback-knee]`).
+//! Canonical Reference: `docs/specs/dsp/router_and_crossbar_topology.md` (`ref[dsp.tank.feedback-loop]`,
+//! `ref[dsp.tank.dc-blocker]`, `ref[dsp.tank.loop-saturator]`, `ref[dsp.tank.quiet-feedback-knee]`).
 
 pub mod v3_fdn;
 

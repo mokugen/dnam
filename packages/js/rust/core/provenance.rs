@@ -1,6 +1,6 @@
 //! Target-agnostic v2 cryptographic provenance, `Ed25519`/`X25519` signing, `.dnam-seal` (`DNSL`)
 //! HPKE sealing, `DAU1`/`DME1` marketplace framing, preview containment, and dual-mechanism
-//! buyer watermarking (`ref[sdk.ts.provenance.v2-security]`).
+//! buyer watermarking (`ref[sdk.ts.provenance.security-and-drm]`).
 
 use std::collections::{BTreeMap, BTreeSet};
 

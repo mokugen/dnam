@@ -400,7 +400,7 @@ impl<B: MathBackend> ControlBus<B> {
     }
 
     /// Synchronizes the unrotated 8-D `z_stage = [ctrl_basis_4[0..4], z_stage_ultra[0..4]]` vector
-    /// for `VarPro` stage-latent sensitivities (`r[dsp.ctrl.dispatch.stage-laws]`).
+    /// for `VarPro` stage-latent sensitivities (`r[dsp.ctrl.dispatch.modulation-laws]`).
     #[inline(always)]
     pub(super) fn sync_z_stage(&mut self) {
         self.z_stage = [

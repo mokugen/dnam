@@ -1,6 +1,6 @@
 //! Fast-math-immune `(2^8, 2^16, 2^24)` `i32` Ozaki mantissa slicing and exact chunked
 //! dot-product accumulation (`ref[train.pipeline.webgpu-scans-and-ozaki]`,
-//! `ref[repo.code.shared-nostd-kernels]`).
+//! `ref[sdk.rust.shared-nostd-kernels]`).
 //!
 //! Decomposes each normalized `f32` operand into 3 signed slices (`|s0| <= 256`, `|s1| <= 128`,
 //! `|s2| <= 128` at `2^-8, 2^-16, 2^-24`) using branchless `1.5 * 2^23` IEEE-754 RNE rounding

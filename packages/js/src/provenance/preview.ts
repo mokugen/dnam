@@ -1,6 +1,6 @@
 /**
  * Interactive `.dnam-prev` (`DNPR`) preview single-control window & switch option validators
- * (`ref[sdk.ts.provenance.v2-security]`, `ref[sec.preview.containment]`).
+ * (`ref[sdk.ts.provenance.security-and-drm]`, `ref[sec.preview.containment]`).
  *
  * @module
  */

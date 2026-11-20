@@ -3,7 +3,7 @@
 //! `v3` Deterministic Analytical + `VarPro` Solver (`dnam_capture::solver`).
 //!
 //! Canonical References:
-//! - `docs/specs/training/four_stage_pipeline.md` (`r[train.pipeline.*]`, `r[train.gram.*]`)
+//! - `docs/specs/training/webgpu_and_varpro_solver.md` (`r[train.pipeline.*]`, `r[train.gram.*]`)
 //! - `docs/specs/containers/project_container_format.md` (`r[container.proj.*]`)
 
 #[path = "oracles/cp1_and_vault.rs"]
@@ -354,8 +354,8 @@ pub(super) fn assert_0_ulp_stereo(a: &[[f32; 2]], b: &[[f32; 2]], msg: &str) {
 
 #[test]
 fn test_oracle_01_256d_schur_recovery_prefix_strip_and_gauge_invariance() {
-    // verify[train.pipeline.stage-b-harvest]
-    // verify[train.pipeline.stage-c-schur]
+    // verify[train.pipeline.backbone-trajectory-opt]
+    // verify[train.pipeline.nested-varpro-schur]
     // verify[train.pipeline.isomorphism-parity]
     // verify[train.gram.accuracy-contract]
     // verify[train.gram.wide192]

@@ -2,7 +2,7 @@
  * Mixing and interpolation reference DSP kernels (`cubicLagrangeWeights`,
  * `cubicLagrangeWeightsSlice`, `givensHouseholder8ch`, `givensHouseholder8chSlice`,
  * `givensHouseholder16ch`, `givensHouseholder16chSlice`) (`ref[sdk.ts.dsp.reference-kernels]`,
- * `ref[dsp.stage4.spatial-tank]`).
+ * `ref[dsp.tank.feedback-loop]`).
  *
  * @module
  */
@@ -29,7 +29,7 @@ export function cubicLagrangeWeightsSlice(
 }
 
 /**
- * 8-channel Orthogonal Givens + Householder mixing matrix (`ref[dsp.stage4.spatial-tank]`).
+ * 8-channel Orthogonal Givens + Householder mixing matrix (`ref[dsp.tank.feedback-loop]`).
  */
 export function givensHouseholder8ch(
   x8: Float64Array | readonly number[],
@@ -65,7 +65,7 @@ const DEFAULT_CROSS_COS_8 = new Float64Array(8).fill(1.0);
 const DEFAULT_CROSS_SIN_8 = new Float64Array(8).fill(0.0);
 
 /**
- * 16-channel Orthogonal Givens + Householder mixing matrix (`ref[dsp.stage4.spatial-tank]`).
+ * 16-channel Orthogonal Givens + Householder mixing matrix (`ref[dsp.tank.feedback-loop]`).
  */
 export function givensHouseholder16ch(
   x16: Float64Array | readonly number[],

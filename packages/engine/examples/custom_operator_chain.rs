@@ -5,7 +5,7 @@
 //! - `TptLr4Crossover` (`200 Hz` Linkwitz-Riley 4th-order bass-mono / drive split, `ref[dsp.router.lr4-crossover]`)
 //! - `OpTDelayLine` + `HilbertSsbLattice10th` (`H1`) + `SubHarmonicTracker` (`T1`) (`ref[dsp.op-m.hilbert.lattice]`, `ref[dsp.op-m.tracker.toggle-sheet]`)
 //! - `Q0_192Phase` + `contractive_rotor_f32` (`ref[dsp.op-m.rotor.q0-192-lfo]`, `ref[dsp.op-m.rotor.contractive]`)
-//! - `QuadratureHysteresis2D` + `OpNBackend::tanh_pade5_4ch` (`ref[dsp.op-n.hysteresis.quadrature]`, `ref[dsp.op-n.stage2.conv6-simd]`)
+//! - `QuadratureHysteresis2D` + `OpNBackend::tanh_pade5_4ch` (`ref[dsp.op-n.hysteresis.quadrature]`, `ref[dsp.op-n.core.stereo-simd]`)
 //! - `ZohBitcrusher` (`Q64.32` zero-order hold + TPDF dither, `ref[dsp.op-n.bitcrusher.zoh-phase]`)
 //! - `KautzModalBank::<4>::step_4lane_simd` (`ref[dsp.op-m.recurrence.symplectic]`)
 //!

@@ -1,7 +1,7 @@
 /**
  * Container provenance verification (`verify`), distribution policy enforcement (`enforcePolicy`),
  * anti-cloning gate evaluation, and preset-safe RFC 8785 JCS `immutableHeaderSha256`
- * (`ref[sdk.ts.provenance.v2-security]`, `ref[sec.jcs.immutable-header-digest]`).
+ * (`ref[sdk.ts.provenance.security-and-drm]`, `ref[sec.jcs.immutable-header-digest]`).
  *
  * @module
  */
@@ -41,7 +41,7 @@ export interface VerifyOptions {
 }
 
 /**
- * 3-stage anti-cloning revocation policy action (`ref[sec.anticlone.three-stage-gate]`).
+ * 3-stage anti-cloning revocation policy action (`ref[sec.anticlone.three-gate-pipeline]`).
  */
 export type AnticloneAction =
   | "no_match_proceed"
@@ -50,7 +50,7 @@ export type AnticloneAction =
 
 /**
  * Verifies a `Model` (or `(header, arenaBytes)`) against its embedded `Ed25519` creator
- * signature and optional marketplace receipt (`ref[sdk.ts.provenance.v2-security]`).
+ * signature and optional marketplace receipt (`ref[sdk.ts.provenance.security-and-drm]`).
  */
 export function verify<TParams extends ParameterValueMap = Record<string, number | string>>(
   modelOrHeader: Model<TParams> | ModelHeader | string,
@@ -124,7 +124,7 @@ export function enforcePolicy<TParams extends ParameterValueMap = Record<string,
 }
 
 /**
- * Evaluates the 3-stage anti-cloning revocation policy (`ref[sec.anticlone.three-stage-gate]`).
+ * Evaluates the 3-stage anti-cloning revocation policy (`ref[sec.anticlone.three-gate-pipeline]`).
  */
 export function evaluateAnticlonePolicy(options: {
   readonly fingerprintMatched: boolean;

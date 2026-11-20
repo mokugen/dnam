@@ -3,7 +3,7 @@
 //! (`PCHIP` Variable-Step `4x` Interpolation + `309`-Tap Kaiser-Sinc `4x -> 1x` Decimation),
 //! and Analytical Rust `f64` Reference Twins (`whitebox`).
 //!
-//! Canonical Reference: `ADR-0018` and `docs/specs/training/four_stage_pipeline.md` (`r[train.pipeline.fixtures-matrix]`).
+//! Canonical Reference: `ADR-0018` and `docs/specs/training/webgpu_and_varpro_solver.md` (`r[train.pipeline.fixtures-matrix]`).
 
 mod faust;
 mod ipc;

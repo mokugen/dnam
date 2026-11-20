@@ -3,11 +3,14 @@
  * and `zerocopy` Wire-Struct Guardrail Tests.
  *
  * verify[repo.code.type-safety-and-imports]
- * verify[repo.code.zerocopy-wire-structs]
  * verify[repo.code.modular-decomposition-and-tests]
- * verify[repo.code.realtime-disassembly-audit]
  * verify[arch.simd.zero-stall-lowering]
- * verify[repo.code.explicit-simd-and-coverage]
+ * verify[sdk.rust.safe-rust-and-boundaries]
+ * verify[sdk.rust.zerocopy-wire-structs]
+ * verify[sdk.rust.shared-nostd-kernels]
+ * verify[sdk.rust.modular-layout-and-proptest]
+ * verify[sdk.rust.realtime-disassembly-audit]
+ * verify[sdk.rust.explicit-simd-and-coverage]
  */
 
 import * as fs from "node:fs";
@@ -15,8 +18,8 @@ import * as path from "node:path";
 import { describe, expect, it } from "vitest";
 import {
   advanceAttributedBlockTracker,
+  computeRustCfgTestLineMask,
   createBraceTracker,
-  isCfgTestAttributeLine,
   PACKAGES_DIR,
   REPO_ROOT,
   relPath,
@@ -157,16 +160,10 @@ function scanRustProdLines(
   const raw = fs.readFileSync(rsPath, "utf8");
   const commentFreeLines = stripRustCommentsOnly(raw).split("\n");
   const strippedLines = stripRustCommentsAndStrings(raw).split("\n");
-  const cfgTestTracker = createBraceTracker();
+  const cfgMask = computeRustCfgTestLineMask(strippedLines);
   for (let idx = 0; idx < strippedLines.length; idx++) {
-    const sLine = strippedLines[idx] ?? "";
-    const cfTrimmed = (commentFreeLines[idx] ?? "").trim();
-    if (
-      advanceAttributedBlockTracker(sLine, cfgTestTracker, () => isCfgTestAttributeLine(cfTrimmed))
-    ) {
-      continue;
-    }
-    checkLine(sLine, commentFreeLines[idx] ?? "", idx + 1);
+    if (cfgMask[idx]) continue;
+    checkLine(strippedLines[idx] ?? "", commentFreeLines[idx] ?? "", idx + 1);
   }
 }
 
@@ -176,7 +173,7 @@ function scanKernelsBottomTestsAnd64Bit(rsPath: string, violations: string[]): v
   const commentFreeLines = stripRustCommentsOnly(raw).split("\n");
   const strippedLines = stripRustCommentsAndStrings(raw).split("\n");
   const nonSpirvTracker = createBraceTracker();
-  const cfgTestTracker = createBraceTracker();
+  const cfgMask = computeRustCfgTestLineMask(strippedLines);
   const forbiddenTypeRe = /\b(?:f64|u64|i64|u128|i128)\b/;
 
   let inActiveTestMod = false;
@@ -185,18 +182,15 @@ function scanKernelsBottomTestsAnd64Bit(rsPath: string, violations: string[]): v
     const sLine = strippedLines[idx] ?? "";
     const cfTrimmed = (commentFreeLines[idx] ?? "").trim();
     const trimmed = sLine.trim();
-    const inCfgTest = advanceAttributedBlockTracker(sLine, cfgTestTracker, () =>
-      isCfgTestAttributeLine(cfTrimmed),
-    );
-    if (inCfgTest) {
+    if (cfgMask[idx]) {
       if (/\bmod\s+[A-Za-z_][A-Za-z0-9_]*\b/.test(cfTrimmed)) {
         inActiveTestMod = true;
       }
-      if (inActiveTestMod && !cfgTestTracker.awaitingOpenOrSemi && cfgTestTracker.depth <= 0) {
-        completedTestMod = true;
-        inActiveTestMod = false;
-      }
       continue;
+    }
+    if (inActiveTestMod) {
+      completedTestMod = true;
+      inActiveTestMod = false;
     }
     if (completedTestMod && trimmed.length > 0) {
       violations.push(`${rel}:${idx + 1}: production code after #[cfg(test)] mod tests`);

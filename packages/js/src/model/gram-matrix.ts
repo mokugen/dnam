@@ -1,6 +1,6 @@
 /**
  * Column-major upper-triangular (`LAPACK uplo='U'`) symmetric Gram matrix packing and unpacking
- * (`ref[sdk.ts.model.containers-and-checkpoints]`, `ref[container.proj.stat-uplo-u]`).
+ * (`ref[sdk.ts.model.containers-and-gram]`, `ref[container.proj.stat-uplo-u]`).
  *
  * @module
  */

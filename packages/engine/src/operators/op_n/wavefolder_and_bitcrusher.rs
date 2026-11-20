@@ -1,6 +1,6 @@
 //! Op-N Cubed-Envelope $C^2$ Wavefolder, 2D Quadrature Hysteresis & Fixed-Hertz ZOH Bitcrusher.
 //!
-//! Canonical Reference: `docs/specs/dsp/op_n_commuted_cascade.md` (`ref[dsp.op-n.wavefolder.cubic-c2]`,
+//! Canonical Reference: `docs/specs/dsp/op_n_paralru_and_polyadaa.md` (`ref[dsp.op-n.wavefolder.cubic-c2]`,
 //! `ref[dsp.op-n.hysteresis.quadrature]`, `ref[dsp.op-n.bitcrusher.quantizer]`,
 //! `ref[dsp.op-n.bitcrusher.zoh-phase]`, `ref[dsp.op-n.bitcrusher.rate-transfer]`).
 

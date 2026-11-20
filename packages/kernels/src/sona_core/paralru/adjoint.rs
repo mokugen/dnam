@@ -1,5 +1,5 @@
 //! Reverse-BPTT `O(log2 N)` parallel suffix adjoint scan for decoupled `1D` scalar `ParaLRU`
-//! (`ref[dsp.op-n.stage2.sub-stages]`, `ref[train.pipeline.webgpu-scans-and-ozaki]`).
+//! (`ref[dsp.op-n.core.matryoshka-blocks]`, `ref[train.pipeline.webgpu-scans-and-ozaki]`).
 
 use super::scans::{LinearScanElem, apply_linear_scan, compose_linear_scan};
 use super::{ParaLruParams, soft_rect_zero_dc_f32};

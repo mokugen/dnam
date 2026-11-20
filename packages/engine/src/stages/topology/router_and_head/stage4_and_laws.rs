@@ -5,15 +5,15 @@ use crate::math::{newton6_reciprocal_f64, widen_f32_bits};
 use crate::types::Tier;
 
 /// Largest `f32` bit pattern $\le 0.985$ (`0x3F7C28F5`, since `0x3F7C28F6 > 0.985`,
-/// `ref[dsp.stage4.loop-saturator]`).
+/// `ref[dsp.tank.loop-saturator]`).
 pub const STAGE4_MAX_V_CEIL_BITS: u32 = crate::math::STAGE4_MAX_V_CEIL_BITS_DERIVED;
 
 /// Largest `f32` bit pattern $\le 0.9990$ (`0x3F7FBE76`, since `0x3F7FBE77 > 0.9990`,
-/// `ref[dsp.stage4.quiet-feedback-knee]`).
+/// `ref[dsp.tank.quiet-feedback-knee]`).
 pub const STAGE4_MAX_G_LIN_BITS: u32 = crate::math::STAGE4_MAX_G_LIN_BITS_DERIVED;
 
 /// Evaluates the Stage IV unity-slope cubic loop saturator with explicit outer clamp to $\pm V_{\text{ceil}}$
-/// (`0 < V_ceil <= f32::from_bits(0x3F7C28F5)`, `ref[dsp.stage4.loop-saturator]`).
+/// (`0 < V_ceil <= f32::from_bits(0x3F7C28F5)`, `ref[dsp.tank.loop-saturator]`).
 #[inline]
 pub fn eval_stage4_loop_saturator(u: f32, v_ceil: f32) -> Option<f32> {
     let max_ceil = f32::from_bits(STAGE4_MAX_V_CEIL_BITS);
@@ -61,7 +61,7 @@ pub fn eval_stage4_blended_feedback_knee_fast(
 }
 
 /// Evaluates the Stage IV blended quiet-feedback knee
-/// $K(u) = g_{\text{lin}} u ((1 - \alpha) + \alpha / (1 + (|u| / \sigma)^2))$ (`ref[dsp.stage4.quiet-feedback-knee]`).
+/// $K(u) = g_{\text{lin}} u ((1 - \alpha) + \alpha / (1 + (|u| / \sigma)^2))$ (`ref[dsp.tank.quiet-feedback-knee]`).
 #[inline]
 pub fn eval_stage4_blended_feedback_knee(
     u: f32,
@@ -95,7 +95,7 @@ pub fn eval_stage4_blended_feedback_knee(
 }
 
 /// Returns `(modal_slot_range, other_stage_slot_range, fir_lr_slots)` for `tier` inside the
-/// 256-D feature bus $\boldsymbol{\Phi}[n]$ (`ref[dsp.head.feature-bus-slots]`).
+/// 256-D feature bus $\boldsymbol{\Phi}[n]$ (`ref[dsp.head.direct-register-readout]`).
 pub const fn stage3_feature_bus_slot_ranges(
     tier: Tier,
 ) -> (core::ops::Range<usize>, core::ops::Range<usize>, [usize; 2]) {
@@ -108,7 +108,7 @@ pub const fn stage3_feature_bus_slot_ranges(
 }
 
 /// Pair-groups 4 complex modal outputs `[y0, y1, y2, y3]` for L and R into the 4 Stage III feature
-/// bus slots `[y0_L + y2_L, y1_L + y3_L, y0_R + y2_R, y1_R + y3_R]` (`ref[dsp.head.feature-bus-slots]`).
+/// bus slots `[y0_L + y2_L, y1_L + y3_L, y0_R + y2_R, y1_R + y3_R]` (`ref[dsp.head.direct-register-readout]`).
 #[inline]
 pub fn pack_stage3_modal_block_features(y_l: &[f32; 4], y_r: &[f32; 4]) -> [f32; 4] {
     [
@@ -119,7 +119,7 @@ pub fn pack_stage3_modal_block_features(y_l: &[f32; 4], y_r: &[f32; 4]) -> [f32;
     ]
 }
 
-/// Evaluates the closed-form per-sample stage modulation laws (`ref[dsp.ctrl.dispatch.stage-laws]`)
+/// Evaluates the closed-form per-sample stage modulation laws (`ref[dsp.ctrl.dispatch.modulation-laws]`)
 /// mapping micro-ramped `theta[0..16]` and base parameters into clamped stage parameters (`0 FDIV`, `0 FSQRT`).
 #[allow(clippy::too_many_arguments)]
 #[inline]
@@ -186,13 +186,13 @@ mod tests {
     use alloc::vec;
     use dnam_kernels::T1DcBlockerKernel;
 
-    /// verify[dsp.stage2.commuted-cascade]
-    /// verify[dsp.stage3.cabinet-bank]
-    /// verify[dsp.stage4.spatial-tank]
-    /// verify[dsp.stage4.captured-freeze]
-    /// verify[dsp.stage4.dc-blocker]
-    /// verify[dsp.stage4.loop-saturator]
-    /// verify[dsp.stage4.quiet-feedback-knee]
+    /// verify[dsp.core.matryoshka-cascade]
+    /// verify[dsp.cabinet.fir-kautz-bank]
+    /// verify[dsp.tank.feedback-loop]
+    /// verify[dsp.tank.captured-freeze]
+    /// verify[dsp.tank.dc-blocker]
+    /// verify[dsp.tank.loop-saturator]
+    /// verify[dsp.tank.quiet-feedback-knee]
     #[test]
     fn test_sona_stages_loop_saturator_blended_knee_dc_blocker_and_freeze() {
         let _guard = FtzDazGuard::new();
@@ -248,7 +248,7 @@ mod tests {
         assert!(dc_out.abs() < 1e-5);
     }
 
-    /// verify[dsp.head.feature-bus-slots]
+    /// verify[dsp.head.direct-register-readout]
     /// verify[dsp.head.tier-equivalence]
     /// verify[dsp.head.lower-triangular]
     /// verify[dsp.router.topology-dispatch]
@@ -317,7 +317,7 @@ mod tests {
         }
     }
 
-    /// verify[dsp.ctrl.dispatch.stage-laws]
+    /// verify[dsp.ctrl.dispatch.modulation-laws]
     /// verify[container.dnam.tensor-directory]
     #[test]
     fn test_stage_modulation_laws_and_tensor_directory_slices() {

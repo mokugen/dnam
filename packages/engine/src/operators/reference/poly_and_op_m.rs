@@ -68,7 +68,7 @@ pub fn poly_adaa_slice_f64(
     }
 }
 
-/// Reference `f64` Radial-Polar `Op-M` modal single-sample step (`ref[dsp.op-m.recurrence.symplectic]`, `ref[dsp.op-m.stage3.radial-gate]`).
+/// Reference `f64` Radial-Polar `Op-M` modal single-sample step (`ref[dsp.op-m.recurrence.symplectic]`, `ref[dsp.op-m.kautz.radial-gate]`).
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn op_m_modal_step_f64(
@@ -316,7 +316,7 @@ mod tests {
         );
     }
 
-    /// Test 2A (`verify[dsp.op-m.recurrence.symplectic]`, `verify[dsp.op-m.stage3.radial-gate]`):
+    /// Test 2A (`verify[dsp.op-m.recurrence.symplectic]`, `verify[dsp.op-m.kautz.radial-gate]`):
     /// Verifies radial-polar Q preservation vs. Cartesian midpoint collapse.
     #[test]
     fn test_2a_radial_polar_q_preservation_vs_cartesian_collapse() {

@@ -1,6 +1,6 @@
 //! Automated Release-Binary Disassembly Audit for Goal 6 (`REQ-6.2`, `REQ-6.3`).
 //!
-//! - `verify[repo.code.realtime-disassembly-audit]`
+//! - `verify[sdk.rust.realtime-disassembly-audit]`
 //! - `verify[arch.simd.zero-stall-lowering]`
 //! - `verify[dsp.op-m.rotor.angle-wrap-and-retune]`
 //! - `verify[dsp.op-t.guard.incremental-counters]`

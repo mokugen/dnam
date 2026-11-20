@@ -1,10 +1,10 @@
 //! Stage III `Op-M` Kautz modal state-space steps, rapid-sweep radial contraction, associative
 //! complex modal scan operators, and contractive rotor / `Q0.32` phasor facade
-//! (`ref[dsp.op-m.stage3.sweep-contraction]`, `ref[dsp.op-m.stage3.coupled-form]`,
-//! `ref[dsp.op-m.stage3.dual-state]`, `ref[dsp.op-m.recurrence.stereo-simd]`).
+//! (`ref[dsp.op-m.kautz.sweep-contraction]`, `ref[dsp.op-m.kautz.coupled-form]`,
+//! `ref[dsp.op-m.kautz.dual-state]`, `ref[dsp.op-m.recurrence.stereo-simd]`).
 //!
 //! Strictly 32-bit, `#![no_std]`, zero `FDIV`/`FSQRT`/`UDIV`, zero 64-bit scalars, and zero `libm`
-//! calls in runtime code (`ref[repo.code.shared-nostd-kernels]`).
+//! calls in runtime code (`ref[sdk.rust.shared-nostd-kernels]`).
 
 pub mod rotor_and_phasor;
 
@@ -15,12 +15,12 @@ use crate::simd::{
 };
 
 /// Minimum contracted pole radius allowed during rapid Stage III formant sweeps
-/// (`ref[dsp.op-m.stage3.sweep-contraction]`).
+/// (`ref[dsp.op-m.kautz.sweep-contraction]`).
 const STAGE3_SWEEP_MIN_R: f32 = 0.25;
 
 /// Zero-sweep baseline radius ceiling (`0.9995`, Stage III acoustic Kautz pole ceiling per
 /// `docs/specs/dsp/op_m_modal_kautz.md`) for Stage III dynamic sweep contraction
-/// (`ref[dsp.op-m.stage3.sweep-contraction]`).
+/// (`ref[dsp.op-m.kautz.sweep-contraction]`).
 const STAGE3_SWEEP_BASE_CEIL: f32 = 0.9995;
 
 /// Sweep-rate slope coefficient (`0.15 * |delta_theta|`) for Stage III contraction.
@@ -29,7 +29,7 @@ const STAGE3_SWEEP_SLOPE: f32 = 0.15;
 const _: () = assert!(STAGE3_SWEEP_MIN_R > 0.0 && STAGE3_SWEEP_MIN_R < STAGE3_SWEEP_BASE_CEIL);
 const _: () = assert!(STAGE3_SWEEP_BASE_CEIL <= MAX_PARALRU_R_F32);
 
-/// Evaluates Stage III rapid-sweep radial contraction (`ref[dsp.op-m.stage3.sweep-contraction]`)
+/// Evaluates Stage III rapid-sweep radial contraction (`ref[dsp.op-m.kautz.sweep-contraction]`)
 /// purely in 32-bit `f32` (`min(radius, max(0.25, 0.9995 - 0.15 * |delta_theta|))`).
 #[inline(always)]
 #[must_use]
@@ -50,8 +50,8 @@ pub fn eval_stage3_sweep_contraction_f32(radius: f32, delta_theta_rad: f32) -> f
 }
 
 /// 4-pole stereo Stage III Kautz modal state block (`4` shared complex conjugate pole pairs
-/// across simultaneous `L` and `R` states, `ref[dsp.op-m.stage3.dual-state]`,
-/// `ref[dsp.op-m.stage3.coupled-form]`, `ref[dsp.op-m.recurrence.stereo-simd]`).
+/// across simultaneous `L` and `R` states, `ref[dsp.op-m.kautz.dual-state]`,
+/// `ref[dsp.op-m.kautz.coupled-form]`, `ref[dsp.op-m.recurrence.stereo-simd]`).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct KautzQuadState<V: KernelVec4> {
     /// Left-channel modal real state across 4 conjugate pole pairs.
@@ -118,7 +118,7 @@ impl<V: KernelVec4> KautzQuadState<V> {
 }
 
 /// Steps 4 conjugate Kautz modal pole pairs in both Left and Right channels simultaneously using
-/// 4-lane [`KernelVec4`] vectors (`ref[dsp.op-m.stage3.coupled-form]`,
+/// 4-lane [`KernelVec4`] vectors (`ref[dsp.op-m.kautz.coupled-form]`,
 /// `ref[dsp.op-m.recurrence.symplectic]`).
 ///
 /// Uses identical operation order and pairwise reductions as [`step_kautz_quad_stereo8`], yielding
@@ -213,7 +213,7 @@ pub fn step_kautz_quad_stereo8<S: StereoVec8>(
 }
 
 /// Associative affine complex recurrence element representing `z -> a * z + b` for Blelloch /
-/// Kogge-Stone parallel modal block scans (`ref[repo.code.shared-nostd-kernels]`).
+/// Kogge-Stone parallel modal block scans (`ref[sdk.rust.shared-nostd-kernels]`).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct ComplexModalScanElem {
     /// State transition real coefficient `a_re`.
@@ -284,9 +284,9 @@ mod tests {
     use crate::simd::{GpuVec4, InterleavedStereo8};
     use proptest::prelude::*;
 
-    /// verify[dsp.op-m.stage3.sweep-contraction]
-    /// verify[dsp.op-m.stage3.dual-state]
-    /// verify[dsp.op-m.stage3.coupled-form]
+    /// verify[dsp.op-m.kautz.sweep-contraction]
+    /// verify[dsp.op-m.kautz.dual-state]
+    /// verify[dsp.op-m.kautz.coupled-form]
     /// verify[dsp.op-m.recurrence.stereo-simd]
     #[test]
     fn test_stage3_sweep_contraction_and_kautz_zero_ulp_parity() {

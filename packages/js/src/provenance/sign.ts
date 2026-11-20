@@ -1,7 +1,7 @@
 /**
  * Creator header signing (`signCreatorHeader`), marketplace receipt signing
  * (`signMarketplaceReceipt`), and `OemDeviceCertificate` V1/V2 attestation
- * (`ref[sdk.ts.provenance.v2-security]`, `ref[sec.sig.prefix-delegation]`,
+ * (`ref[sdk.ts.provenance.security-and-drm]`, `ref[sec.sig.prefix-delegation]`,
  * `ref[sec.drm.oem-certificate]`).
  *
  * @module

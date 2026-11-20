@@ -4,8 +4,8 @@
 //! Pole-Angle Phase Identification (`dnam_capture::solver`).
 //!
 //! Canonical References:
-//! - `docs/specs/training/four_stage_pipeline.md` (`r[train.pipeline.stage-a-poles]`,
-//!   `r[train.pipeline.stage-e-pack]`, `r[train.pipeline.fixtures-matrix]`)
+//! - `docs/specs/training/webgpu_and_varpro_solver.md` (`r[train.pipeline.physics-probe]`,
+//!   `r[train.pipeline.host-parity-and-export]`, `r[train.pipeline.fixtures-matrix]`)
 //! - `docs/specs/security/watermarking_and_marketplace.md`
 
 use std::collections::BTreeMap;
@@ -592,7 +592,7 @@ macro_rules! chain_distill_test {
     ($name:ident, $ctor:expr) => {
         #[test]
         fn $name() {
-            // verify[train.pipeline.stage-a-poles]
+            // verify[train.pipeline.physics-probe]
             // verify[train.pipeline.fixtures-matrix]
             let _ = verify_chain_distillation($ctor, true);
         }
@@ -604,7 +604,7 @@ macro_rules! chain_qualify_test {
         #[test]
         #[ignore = "exhaustive chain qualification; run via moon run capture:qualify"]
         fn $name() {
-            // verify[train.pipeline.stage-a-poles]
+            // verify[train.pipeline.physics-probe]
             // verify[train.pipeline.fixtures-matrix]
             let _ = verify_chain_distillation($ctor, true);
         }
@@ -662,7 +662,7 @@ chain_qualify_test!(
 
 #[test]
 fn test_case_08_three_layer_buyer_watermark_collusion_and_blackbox_phase_id() {
-    // verify[train.pipeline.stage-e-pack]
+    // verify[train.pipeline.host-parity-and-export]
     let crypto = DefaultCryptoProvider::default();
     let proj_bytes = verify_chain_distillation(Chain04TubeAmpFmv4x12::new(), false);
     let master_dnam = export_runtime_dnam(&proj_bytes, Some(Tier::Ultra)).unwrap();

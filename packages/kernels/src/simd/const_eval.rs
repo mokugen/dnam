@@ -1,5 +1,5 @@
 //! Compile-time mathematical evaluation, IEEE-754 seed derivations, and fixed-shape `SONA` tier
-//! specifications (`ref[repo.code.constant-eval-and-derivations]`, `ref[repo.code.shared-nostd-kernels]`).
+//! specifications (`ref[repo.code.constant-eval-and-derivations]`, `ref[sdk.rust.shared-nostd-kernels]`).
 //!
 //! All constants derive from pure `u32` fixed-point `const fn` routines (zero `f64`, `u64`, `i64`,
 //! `u128`, `i128`, or `libm` dependencies) so this module compiles identically on `#![no_std]` CPU
@@ -18,13 +18,13 @@ pub const IEEE754_F32_RCP_SEED: u32 = const_f32_rcp_chebyshev_seed();
 pub const IEEE754_F32_RSQRT_SEED: u32 = 0x5F37_59DF;
 
 /// Compile-time `5 Hz` passband-normalized DC blocker pole at `48 kHz` (`0x3F7F_D51F`,
-/// `ref[dsp.stage4.dc-blocker]`).
+/// `ref[dsp.tank.dc-blocker]`).
 pub const DC_BLOCKER_5HZ_48K_F32: f32 = f32::from_bits(const_dc_blocker_pole_bits(5, 48_000));
 
 /// Compile-time `10 Hz` passband-normalized DC blocker pole bit pattern at `48 kHz` (`0x3F7F_AA45`).
 pub const DC_BLOCKER_10HZ_48K_BITS: u32 = const_dc_blocker_pole_bits(10, 48_000);
 
-/// Largest `binary32` value `<= 0.9990` (`0x3F7F_BE76`, `ref[dsp.stage4.quiet-feedback-knee]`).
+/// Largest `binary32` value `<= 0.9990` (`0x3F7F_BE76`, `ref[dsp.tank.quiet-feedback-knee]`).
 pub const MAX_LOOP_GAIN_F32: f32 = f32::from_bits(const_max_f32_bits_le_ratio(999, 1_000));
 
 /// Largest `binary32` value `<= 0.999995` (`0x3F7F_FFAC`, upper `ParaLRU` and ZOH pole bound).
@@ -383,7 +383,7 @@ pub const fn const_max_f32_bits_le_ratio(num: u32, den: u32) -> u32 {
 }
 
 /// Compile-time passband-normalized DC blocker pole `R = cos(w) / (1 + sin(w))` in `binary32` bits,
-/// where `w = 2 * pi * fc_hz / fs_hz` (`ref[dsp.stage4.dc-blocker]`).
+/// where `w = 2 * pi * fc_hz / fs_hz` (`ref[dsp.tank.dc-blocker]`).
 #[must_use]
 pub const fn const_dc_blocker_pole_bits(fc_hz: u32, fs_hz: u32) -> u32 {
     if fc_hz == 0 {
