@@ -29,28 +29,31 @@ Together, these mechanisms fulfill [`REQ-8.1`–`REQ-8.8`](../../requirements/sy
 
 ---
 
-## 1. Taxonomy Overview: 5 Security Pillars, 3 Protection Profiles & 4 Container Formats
+## 1. Taxonomy Overview: 5 Security Pillars, 3 Protection Profiles & 3-Layer Container Stack
 
 `r[sec.taxonomy.overview]`
 
-The DNAM security model binds every v3.0 container format (`.dnam-proj`, `.dnam`, `.dnam-seal`, and `.dnam-prev`) to a common 64 B-aligned little-endian binary layout with immutable signed regions and a growable mutable suffix. Pillars 1 and 2 establish creator authenticity, policy enforcement, and hardware enclave sealing, while Pillars 3 through 5 govern forensic buyer tracing, anti-cloning ingestion checks, and storefront preview containment.
+The DNAM security model binds every v3.0 deployment format (.dnam, `.dnam-seal`, `.dnam-prev`, and `.dnam-proj`) around a common 64 B-aligned little-endian binary layout with immutable signed regions, an embedded Layer 0 register prefix (`dbin_prefix`), and a growable mutable suffix.
+
+Bare `.dnam-bin` (`"DNBN"`) payloads hold zero JSON or signatures, whereas `.dnam` and `.dnam-seal` wrap them with cryptographic provenance, hardware DRM, and buyer tracing.
 
 ```mermaid
 flowchart TB
     subgraph Container ["SONA v3.0 Declarative Binary Container Architecture (REQ-8.1, REQ-8.8)"]
         direction LR
-        Preamble["64B Container Preamble & 128B Directory"] --> Header["RFC 8785 JCS Immutable Header ('sona')<br/>+ Shared Descriptors + Auth Envelope"]
+        Preamble["64B Container Preamble & 128B Directory"] --> Header["RFC 8785 JCS Immutable Header ('sona')<br/>+ Auth Envelope (DCRC/DAU1) + dbin_prefix"]
         Header --> Arenas["Four Nested Constant-Size SONA Tier Payloads<br/>Lite (Self-Contained Controls) ⊂ Full ⊂ Pro ⊂ Ultra"]
         Arenas --> Mutable["Growable DMU1/DME1 + DMUE Suffix<br/>Presets & Open user_metadata"]
     end
 
-    subgraph Formats ["Four 64-Byte-Aligned v3.0 Binary Container Formats"]
+    subgraph Formats ["3-Layer Stack & 64-Byte-Aligned v3.0 Binary Container Formats"]
         direction LR
-        F_PROJ[".dnam-proj (Magic: DNPJ v3.0) - Cloud-Ready Capture Vault"]
-        F_DNAM[".dnam (Magic: DNAM v3.0) - Zero-Copy Runtime Model"]
+        F_PROJ[".dnam-proj (Magic: DNPJ v3.0) - Layer 2 Capture Vault"]
+        F_BIN[".dnam-bin (Magic: DNBN v3.0) - Layer 0 Bare VM Register Image"]
+        F_DNAM[".dnam (Magic: DNAM v3.0) - Layer 1 Shell Wrapping dbin_prefix"]
         F_SEAL[".dnam-seal (Magic: DNSL v3.0) - Encrypted OEM Enclave Wrapper"]
         F_PREV[".dnam-prev (container_kind: 'preview' v3.0) - Lite-Only Storefront Preview"]
-        F_PROJ --> F_DNAM --> F_SEAL
+        F_PROJ --> F_BIN --> F_DNAM --> F_SEAL
         F_DNAM --> F_PREV
     end
 
@@ -152,6 +155,7 @@ Because the Arena 0 Lite payload embeds self-contained Lite control descriptors,
 |       || F("preamble", exact_plaintext_preamble[64])                                              |
 |       || F("directory", exact_plaintext_directory[128])                                           |
 |       || F("shared_model_binary", exact_immutable_shared_binary)                                  |
+|       [|| F("dbin_prefix", exact_dbin_prefix)   (required when dbin_prefix_bytes > 0; Region 4=0)]|
 +---------------------------------------------------------------------------------------------------+
 |  2. Plaintext Prefix Digest (domain = "DNAM-MASTER-PREFIX-V1" or "DNAM-BUYER-PREFIX-V1"):         |
 |     SHA256( F("domain", domain) || F("immutable_header_sha256", H_hdr[32])                        |
@@ -197,6 +201,21 @@ Because the Arena 0 Lite payload embeds self-contained Lite control descriptors,
 |       || F("issued_max_tier", u8(maximum_tier)) || F("outer_ciphertext_prefix_sha256", L_outer_ct)|
 +---------------------------------------------------------------------------------------------------+
 ```
+
+When a container embeds a Layer 0 register prefix (`dbin_prefix_bytes > 0`), Region 4 (`shared_extent`) MUST equal zero (`shared_binary_length == 0`) so no duplicate control or weight bytes reside outside the embedded prefix.
+
+In that layout, Region 5 `auth_extent` precedes `dbin_offset == align64(auth_end)`, `dbin_prefix_bytes` is a positive multiple of 64 B, and `tier_start == align64(dbin_offset + dbin_prefix_bytes)`.
+
+If both `shared_binary_length > 0` and `dbin_prefix_bytes > 0` appear simultaneously, or if `dbin_offset` or `dbin_prefix_bytes` fails 64 B alignment or monotonicity, loaders fail closed with `SchemaValidationError`.
+
+When `dbin_prefix_bytes > 0`, `build_plaintext_shared_v1` appends `F("dbin_prefix", exact_dbin_prefix)` after `shared_model_binary` so `DAU1` and `DAI1` signatures commit cryptographically to the executable VM prefix.
+
+| Security / Integrity Field | Layout & Byte Invariant (`dbin_prefix_bytes > 0`) | Fail-Closed Check & `REQ-5.6` Stripping Rule |
+| :--- | :--- | :--- |
+| **Directory Order & Region 4** | `auth_extent` precedes `dbin_offset`; `shared_binary_length == 0`; `tier_start == dbin_offset + dbin_prefix_bytes` | Rejects nonzero Region 4 alongside `dbin_prefix`, non-64 B padding, or misaligned `dbin_offset` (`SchemaValidationError`). |
+| **`DCRC` `[32..36)` `crc_dbin_prefix`** | `u32le` Castagnoli CRC-32C over `[dbin_offset..dbin_offset + dbin_prefix_bytes)`; bytes `[36..64)` strictly `0x00` | Checked alongside `crc_prefix` (`[0..auth_offset)`), `.dnam-bin` `prefix_crc32c`, `tier_arena_crc32c[T]`, and `crc_tiers` (`Crc32cMismatch`). |
+| **Zero-Mutation `REQ-5.6` Strip** | Retains `[0..original_tier_ends[T]]` (Headers, `DCRC`/`DAU1`, verbatim `dbin_prefix`, `Arena 0..T`) + mutable suffix | Strips both `.dnam` and embedded `.dnam-bin` cleanly without mutating headers, re-validating `crc_prefix`, `crc_dbin_prefix`, `prefix_crc32c`, `tier_arena_crc32c[T]`, and `crc_tiers[T]` without re-signing. |
+| **Buyer Issuance Re-Framing** | Recomputes `.dnam-bin` `tier_arena_crc32c[0..max]` & `prefix_crc32c`, `DCRC` `crc_dbin_prefix` & `crc_tiers`, and `L_buyer` `F("dbin_prefix", ...)` | Preserves creator `L_master` and `creator_signature` verbatim from pre-watermark master bytes while signing updated `dbin_prefix` inside `L_buyer` (`auth_kind == 1`) and `.dnam-seal`. |
 
 Region 3 JSON manifests (`metadata.signatures`, used by `DCRC`-backed Open and Path 1 `DeviceAllowlisted` containers instead of binary `DAU1`/`DAI1`) bind Ed25519 signatures over `F`-framed transcripts mixing raw 32 B digests, encoded tier prefix lists `L`, unsigned little-endian integers, and UTF-8 strings:
 
@@ -286,7 +305,9 @@ Under Path 1 (`DeviceAllowlisted`, profile 1), each 96-hex-character `wrapped_ce
 
 Splitting OKM yields a 32 B key (`OKM[0..32]`) and 12 B nonce (`OKM[32..44]`) for ChaCha20-Poly1305 with `AAD = UTF-8(device_id_hash)` over the 32 B `cek`, emitting `ciphertext[32] || tag[16]`. Unsealing selects `local_device_id_hash` (or the first wrapped entry when no device-ID filter is supplied).
 
-The unwrapper applies raw RFC 8439 ChaCha20 (`key = cek[32]`, `nonce = arena_nonce_96[12]`, `start_block = 0`) across every 64 B block of the retained tier span (72, 124, 248, or 480 blocks for Lite..Ultra), and validates `DCRC` `crc_tiers` CRC-32C digests against decrypted plaintext bytes.
+The unwrapper applies raw RFC 8439 ChaCha20 (`key = cek[32]`, `nonce = arena_nonce_96[12]`, `start_block = 0`) strictly across every 64 B block of `[tier_start..retained_end]` (72, 124, 248, or 480 blocks for Lite..Ultra).
+
+The embedded prefix `dbin_prefix` ahead of `tier_start` stays plaintext and authenticated by `DCRC` (`crc_dbin_prefix`), while decrypted tier arenas validate against `crc_tiers` CRC-32C digests.
 
 Both attested paths sign the V2 `OemDeviceCertificate` length-framed sequence using pure Ed25519 over the exact transcript below:
 
@@ -475,10 +496,13 @@ The `DNPL` logical metadata prefix spans `logical_prefix = inner[192..plan_offse
 | `logical_prefix` Offset | Structure / Content | Addressing Base & Invariant |
 | :--- | :--- | :--- |
 | 0..64 | Plaintext `DNPL` Inner Preamble | `magic = "DNPL"`, version 3.0, `protection_profile`, `auth_kind`, `buyer_max_tier`, `sample_rate_train_hz = 48000` |
-| 64..192 | Logical 128-byte Chunk Directory | Virtual plaintext `.dnam` offsets (`immutable_header_offset = 192`, shared/auth offsets, `tier_start`, `original_tier_ends[4]`, `reserved_tail` = 24 zero bytes) |
-| 192..`logical_prefix_len` | Canonical RFC 8785 JCS Immutable Header | Unencrypted `"architecture": "sona"`, `"version": "3.0.0"` JSON zero-padded to a 64 B boundary |
+| 64..192 | Logical 128-byte Chunk Directory | Virtual plaintext `.dnam` offsets (`immutable_header_offset = 192`, `shared_binary_length == 0` when `dbin_prefix_bytes > 0`, `dbin_offset`, `dbin_prefix_bytes`, `tier_start`, `original_tier_ends[4]`, `reserved_tail` = 24 zero bytes) |
+| 192..`align64(192 + l_hdr_len)` | Canonical RFC 8785 JCS Immutable Header | Unencrypted `"architecture": "sona"`, `"version": "3.0.0"` JSON zero-padded to a 64 B boundary (`l_hdr_len = immutable_header_length`) |
+| `align64(192 + l_hdr_len)`..`logical_prefix_len` | Embedded `.dnam-bin` Register Prefix (`dbin_prefix`) | Verbatim 64 B-aligned `dbin_prefix` (0 B only in legacy empty-dbin fixtures; otherwise trailing length strictly equals `logical_dnam_dir.dbin_prefix_bytes` and inner `shared_record` `shared_bytes` is 0 B) |
 
 All offsets inside the `DNPL` header table are relative to `logical_prefix` and hashed into `logical_metadata_sha256`, whereas the Inner Directory holds ciphertext record offsets relative to the inner framing buffer.
+
+When `dbin_prefix_bytes > 0`, unsealing verifies that the trailing slice at `logical_prefix[align64(192 + l_hdr_len)..]` matches `dbin_prefix_bytes` (`CryptoVerificationFailed` on mismatch) and feeds `dbin_prefix` to `build_plaintext_shared_v1` for `DAI1` `buyer_prefixes` verification.
 
 In `EnclaveSealed` (`protection_profile == 2`), outer record 0 decrypts to `DNPL Inner Preamble || Inner Directory || logical_prefix || inner_plan || inner_slots || DAI1 || inner_shared_record`, matching `logical_metadata_sha256` and `structural_metadata_sha256(layer = 1)`.
 
@@ -544,6 +568,6 @@ Container loaders inspect the 64 B preamble's `magic` bytes and `protection_prof
 
 | Protection Profile | Container (v3.0) | Metadata | Tier Payloads | Primary Target & Security Posture |
 | :--- | :--- | :--- | :--- | :--- |
-| **Open (0, `"open"`)** | `.dnam` (`"DNAM"`) | Plaintext JCS (`"sona"`) + `DMU1` | Plaintext (`DCRC` or binary `DAU1`, Arena 0 controls) | Community models and open commercial packs |
-| **`DeviceAllowlisted` (1, `"device_allowlisted"`)** | `.dnam` (`"DNAM"`) | Plaintext JCS (`"sona"`) + `marketplace_receipt` + `DMU1` | 64-byte ChaCha20 encrypted arena (`DCRC` verified) | Desktop, mobile, and pedal licenses bound to allowlisted device keys |
-| **`EnclaveSealed` (2, `"enclave_sealed"`)** | `.dnam-seal` (`"DNSL"`) | Encrypted `DNPL` JCS + `DME1` (public `DSA1` manifest) | Nested outer and inner AEAD records (`DAI1` + HPKE) | Attested OEM hardware enclaves with protected DSP execution |
+| **Open (0, `"open"`)** | `.dnam` (`"DNAM"`) wrapping `.dnam-bin` | Plaintext JCS (`"sona"`) + `DMU1` | Plaintext `dbin_prefix` (`Region 4 == 0 B`) + `Arena 0..T` (`DCRC` or `DAU1`) | Community models and open commercial packs |
+| **`DeviceAllowlisted` (1, `"device_allowlisted"`)** | `.dnam` (`"DNAM"`) wrapping `.dnam-bin` | Plaintext JCS (`"sona"`) + `marketplace_receipt` + `DMU1` | Plaintext `dbin_prefix` (`crc_dbin_prefix`) + 64-byte ChaCha20 encrypted `Arena 0..T` | Desktop, mobile, and pedal licenses bound to allowlisted device keys |
+| **`EnclaveSealed` (2, `"enclave_sealed"`)** | `.dnam-seal` (`"DNSL"`) | Encrypted `DNPL` JCS + `dbin_prefix` + `DME1` (`DSA1`) | Nested outer and inner AEAD records (`DAI1` + HPKE) | Attested OEM hardware enclaves with protected DSP execution |

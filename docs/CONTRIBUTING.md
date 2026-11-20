@@ -52,7 +52,7 @@ Normative specifications under `docs/specs/**/*.md` (18 canonical specifications
 
 Every normative specification under `docs/specs/**/*.md` annotates each section and sub-rule with a unique backtick-wrapped identifier `r[<domain>.<subdomain>.<rule>]` standing alone on its own line immediately under a `##`, `###`, or `####` heading (zero inline numbered-list definitions, zero skipped heading levels, and at least one rule per leaf section). Code and ADRs reference rules via `ref[<id>]`, and tests declare coverage via `verify[<id>]`.
 
-Every file under `docs/requirements/`, `docs/specs/`, `docs/adr/`, and `docs/templates/` begins at line 1 with YAML frontmatter (`--- ... ---`). ADRs follow [adr_template.md](templates/adr_template.md) with `NNNN-kebab-case.md` filenames and `id: ADR-NNNN`; normative specs and requirements must never cite superseded ADRs (`status: superseded`) in frontmatter or body links.
+Every file under `docs/requirements/`, `docs/specs/`, `docs/adr/`, and `docs/templates/` begins at line 1 with YAML frontmatter (`--- ... ---`). ADRs follow [adr_template.md](templates/adr_template.md) with `NNNN-kebab-case.md` filenames (`NNNN-superseded-kebab-case.md` whenever `status: superseded`, renamed with `git mv`), `id: ADR-NNNN`, descriptive candidate titles (never generic lettered or numbered shorthand labels), and terse timestamped "why" `## Amendment Appendix` bullets when updating accepted ADRs rather than duplicating git or spec diffs; normative specs and requirements must never cite superseded ADRs (`status: superseded`) in frontmatter or body links.
 
 ---
 
@@ -123,7 +123,7 @@ Canonical specifications under `docs/specs/**/*.md` are enforced as readable tec
 
 ## 5. Maintaining Requirements (`REQ-*`), Specifications (`r[...]`), Verification (`verify[...]`) & ADRs
 
-Every requirement in [system_goals_and_requirements.md](requirements/system_goals_and_requirements.md) appears as a Markdown table row beginning with ``| **`REQ-X.Y`** |`` under its Goal (41 total requirements) following [requirement_template.md](templates/requirement_template.md). Every normative specification section under `docs/specs/` defines at least one unique `r[<domain>.<subdomain>.<rule>]` tracked for `verify[...]` coverage following [spec_template.md](templates/spec_template.md), and every architectural trade-off lives in an atomic MADR under `docs/adr/` following [adr_template.md](templates/adr_template.md).
+Every requirement in [system_goals_and_requirements.md](requirements/system_goals_and_requirements.md) appears as a Markdown table row beginning with ``| **`REQ-X.Y`** |`` under its Goal (41 total requirements) following [requirement_template.md](templates/requirement_template.md). Every normative specification section under `docs/specs/` defines at least one unique `r[<domain>.<subdomain>.<rule>]` tracked for `verify[...]` coverage following [spec_template.md](templates/spec_template.md). Every architectural trade-off lives in an atomic MADR under `docs/adr/` following [adr_template.md](templates/adr_template.md) using `NNNN-superseded-*.md` filenames when superseded, descriptive option titles, and terse timestamped "why" `## Amendment Appendix` entries when amended.
 
 ---
 

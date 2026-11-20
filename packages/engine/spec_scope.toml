@@ -282,6 +282,10 @@ reason = "Owned and verified by packages/capture"
 [rules."container.dnam.formats"]
 scope = "engine"
 
+[rules."container.dnam.vm-binary"]
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (.dnam-bin) and packages/engine"
+
 [rules."container.dnam.wire-framing"]
 scope = "engine"
 

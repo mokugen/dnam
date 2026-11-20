@@ -39,7 +39,9 @@ All packages across the workspace enforce strict static typing, isolated unsafe 
 
 Every compiled and scripted module across the repository enforces strict static typing and compiler-level type checking. Untyped dynamic escape hatches, implicit dynamic casts, and type-checker suppression directives are forbidden across all production and test modules.
 
-Workspace packages enforce a strict one-way acyclic dependency graph separating zero-dependency portable arithmetic primitives, real-time audio inference, capture and system identification, host bindings, and application shells. Non-standard offline tooling stays isolated from default workspace builds.
+Workspace modules enforce a strict 5-layer diamond dependency graph alongside an isolated offline compute-shader generator. Zero-dependency portable 32-bit arithmetic and DSP primitives sit at the root, feeding a zero-allocation programmable DSP virtual machine for `.dnam-bin` inference without file parsing, cryptography, JSON metadata, or solver math.
+
+Above the virtual machine, the system-identification solver library and the runtime DRM and host shell (`.dnam` wrapper, lock-free queues, Tardos watermarking, and preview sweep protection) remain strictly mutually independent siblings. Capture and project orchestration (`.dnam-proj`) sit at the diamond apex above both, followed downstream by host bindings, UI components, and application shells.
 
 Capture and system-identification modules execute strictly over pure in-memory audio and container buffers. They must carry zero coupled CLI argument parsers, external ML frameworks, or OS audio device drivers ([ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)).
 
@@ -110,7 +112,7 @@ Outside Markdown link targets, requirement prose must remain strictly implementa
 
 | Prohibited Requirement-Prose Category | Forbidden Tokens Outside Link Targets |
 | :--- | :--- |
-| **Container & Wire Extensions / Fields** | `.dnam`, `.dnam-proj`, `.dnam-ckpt`, `.dnam-cache`, `.dnam-seal`, `.dnce`, `max_supported_tier`, `user_metadata`, `royalty_splits`, `allowed_protection_profiles`, `allowed_oem_vendors`, `mono_only`, `JSON header`, `CL-0`, `CL-1`, `CL-2` |
+| **Container & Wire Extensions / Fields** | `.dnam-bin`, `.dnam`, `.dnam-proj`, `.dnam-ckpt`, `.dnam-cache`, `.dnam-seal`, `.dnce`, `max_supported_tier`, `user_metadata`, `royalty_splits`, `allowed_protection_profiles`, `allowed_oem_vendors`, `mono_only`, `JSON header`, `CL-0`, `CL-1`, `CL-2` |
 | **Backend & Precision Implementation Tokens** | WebGPU, IEEE-754, float64, `f32`, `f64`, `fp16`, `i32`, `u32`, 0-ULP, 48 kHz MACs, SIMD lane, output head, output-head, Hann-windowed, `../specs/` |
 
 ### 3.2 Specification Rules (`r[...]`, `ref[...]`, `verify[...]`), Clean-Room Portability & ADRs
@@ -124,7 +126,7 @@ Every Markdown document under requirements, specifications, ADRs, and authoring 
 | **Rule Definition** | `r[<domain>.<subdomain>.<rule>]` standalone on its own line immediately under a `##`, `###`, or `####` heading in `docs/specs/` | Globally unique across the repository; matches frontmatter `rule_prefixes`; zero inline numbered-list definitions; zero skipped heading levels; every leaf normative section defines at least one rule. Never used outside canonical specification files and the spec template. |
 | **Rule Cross-Reference** | `ref[<domain>.<subdomain>.<rule>]` in ADRs, docs, or source comments | Must resolve to an existing `r[<domain>.<subdomain>.<rule>]` definition in `docs/specs/`. |
 | **Test Verification Citation** | `verify[<domain>.<subdomain>.<rule>]` in workspace guardrails, package integration suites, and co-located unit tests | Must resolve to an existing `r[<domain>.<subdomain>.<rule>]` definition in `docs/specs/`. Every spec rule is tracked for test verification coverage. |
-| **MADR Decision Files** | `NNNN-kebab-case-title.md` (`id: ADR-NNNN`, `status: proposed \| accepted \| superseded`) in `docs/adr/` | Numbered sequentially starting at 0001. Superseded ADRs must declare `superseded_by: ADR-NNNN` pointing to an active ADR, and normative specs or requirements must never cite a superseded ADR. |
+| **MADR Decision Files** | `NNNN-kebab-case-title.md` (using `NNNN-superseded-kebab-case-title.md` when `status: superseded`; `id: ADR-NNNN`, `status: proposed \| accepted \| superseded`) in `docs/adr/` | Numbered sequentially starting at 0001 with descriptive design-alternative titles (never generic lettered or numbered shorthand labels). Superseded ADRs set `superseded_by: ADR-NNNN` pointing to an active ADR (never cited by specs/requirements); amended accepted ADRs record a terse timestamped `## Amendment Appendix` stating why, leaving detailed diffs to version history and specs. |
 | **Authoring Templates** | [requirement_template.md](../../templates/requirement_template.md), [spec_template.md](../../templates/spec_template.md), [adr_template.md](../../templates/adr_template.md) | Canonical templates must exist in `docs/templates/` with valid YAML frontmatter. |
 | **Zero Spec-Text Parsing in Tests** | All test suites outside automated documentation guardrail runners | Functional unit, integration, and reference tests must never read or parse Markdown files from `docs/`; they reference specifications solely via `verify[...]` citations. |
 

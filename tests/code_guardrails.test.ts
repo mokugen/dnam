@@ -529,4 +529,39 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
     }
     expect(violations).toEqual([]);
   });
+
+  it("test_no_non_descriptive_option_or_variant_labels", () => {
+    const labelRe = /\b(?:Option|Variant|Alternative|Candidate)[\s-]+(?:[A-Z][0-9]*|[0-9]+)\b/;
+    const repoRoot = path.dirname(PACKAGES_DIR);
+    const docsDir = path.join(repoRoot, "docs");
+    const adrDir = path.join(docsDir, "adr");
+    const violations: string[] = [];
+
+    const checkFile = (filePath: string): void => {
+      const content = fs.readFileSync(filePath, "utf8");
+      if (filePath.startsWith(adrDir) && /^status:\s*superseded\b/m.test(content)) {
+        return;
+      }
+      content.split("\n").forEach((line, idx) => {
+        if (labelRe.test(line)) {
+          violations.push(`${relPath(filePath)}:${idx + 1}: ${line.trim().slice(0, 100)}`);
+        }
+      });
+    };
+
+    for (const filePath of walkFilesByExtensions(
+      PACKAGES_DIR,
+      new Set([".rs", ".ts", ".tsx", ".md"]),
+    )) {
+      checkFile(filePath);
+    }
+    for (const filePath of walkFilesByExtensions(docsDir, new Set([".md"]))) {
+      checkFile(filePath);
+    }
+    for (const rootDoc of ["README.md", "AGENTS.md"]) {
+      const p = path.join(repoRoot, rootDoc);
+      if (fs.existsSync(p)) checkFile(p);
+    }
+    expect(violations).toEqual([]);
+  });
 });

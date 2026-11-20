@@ -40,7 +40,7 @@ DNAM is organized as a multi-language workspace across `docs/`, `packages/*`, an
 | **Desktop Studio (`@dnam-project/studio`)** | `packages/studio/` | [`packages/studio/AGENTS.md`](packages/studio/AGENTS.md) | [`packages/studio/CONTRIBUTING.md`](packages/studio/CONTRIBUTING.md) |
 | **Project Guardrail Suite (`dnam-tests`)** | `tests/` | [`tests/AGENTS.md`](tests/AGENTS.md) | [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) |
 
-*(Note: `tools/sona-shaders` (AOT `cargo-gpu` `.wgsl` kernels compiled from `packages/kernels`) is scheduled for `Phase 4` of the `SONA` `v3.0` cutover; see [`docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md).)*
+*(Note: `packages/vm` (`dnam-vm`), `packages/train` (`dnam-train`), and `tools/sona-shaders` (AOT `cargo-gpu` `.wgsl` kernels compiled from `packages/kernels`) are scheduled for scaffolding across the 5-crate `SONA` `v3.0` cutover; see [`docs/adr/0020-modular-monorepo-and-dnam-proj-container.md`](docs/adr/0020-modular-monorepo-and-dnam-proj-container.md) and [`docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md).)*
 
 ---
 
@@ -164,7 +164,7 @@ Never copy mathematical equations, stability tables, or JSON schemas into `AGENT
 | **JCS SHA-256, `Ed25519` signatures, `.dnam-seal` (`DNSL`), or Buyer Watermarking (`r[sec.*]`)** | [`docs/specs/security/provenance_and_enclave_drm.md`](docs/specs/security/provenance_and_enclave_drm.md), [`docs/specs/security/watermarking_and_marketplace.md`](docs/specs/security/watermarking_and_marketplace.md) |
 | **Capture alignment, `32-bit WebGPU` + Host-`f64` `VarPro` (`i32` Ozaki), `uplo='U'` Gram matrices, or stem expansion (`r[train.*]`)** | [`docs/specs/training/capture_and_alignment.md`](docs/specs/training/capture_and_alignment.md), [`docs/specs/training/webgpu_and_varpro_solver.md`](docs/specs/training/webgpu_and_varpro_solver.md), [`docs/specs/training/iterative_resume_and_caching.md`](docs/specs/training/iterative_resume_and_caching.md) |
 | **Repository, code, `zerocopy` wire-struct, or documentation quality rules (`r[repo.*]`)** | [`docs/specs/architecture/project_and_documentation_quality.md`](docs/specs/architecture/project_and_documentation_quality.md) |
-| **Architectural trade-offs, mathematical counterexamples, or rejected R&D candidates (`ADR-NNNN`)** | [`docs/adr/`](docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md) (using [`docs/templates/adr_template.md`](docs/templates/adr_template.md)) |
+| **Architectural trade-offs, mathematical counterexamples, or rejected R&D candidates (`ADR-NNNN`)** | [`docs/adr/`](docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md) (use [`docs/templates/adr_template.md`](docs/templates/adr_template.md), `NNNN-superseded-*.md` for `status: superseded`, descriptive candidate names, and terse timestamped "why" `## Amendment Appendix` entries per [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md)) |
 
 ---
 

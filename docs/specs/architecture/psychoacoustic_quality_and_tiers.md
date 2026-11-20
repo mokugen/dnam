@@ -67,7 +67,7 @@ The nominal frequency ranges are descriptive spans rather than brick-wall bounda
 > [!WARNING]
 > Complementary summation does not bound individual filter gains. For $H_1(z)=(1-r)/(1-rz^{-1})$ at $f_s=48\text{ kHz}$ and $f_c=250\text{ Hz}$, the two branches reach approximately +9.33 dB and +9.19 dB near the crossover and cancel only when recombined unchanged. Do not silently reuse certificates or cached objectives computed with a different filter.
 
-These filters define the bESR evaluation crossover; the 8-Port I/O Router LR4 audio split in [router_and_crossbar_topology.md](../dsp/router_and_crossbar_topology.md) (`ref[dsp.router.lr4-crossover]`) is a separate runtime signal crossover.
+These filters define strictly the offline perceptual bESR evaluation crossover and are never instantiated inside the runtime DSP virtual machine; the 8-Port I/O Router LR4 audio split in [router_and_crossbar_topology.md](../dsp/router_and_crossbar_topology.md) (`ref[dsp.router.lr4-crossover]`) is a separate runtime signal crossover.
 
 ### 1.2 Per-Band Noise-Floor Subtraction & Worst-Band Mathematical Bound
 

@@ -28,3 +28,7 @@ This record justifies the modal, Hilbert, and tracker formulations in [`../specs
 
 1. **Quarter-Wave Fixed-Point Rotor Table:** 513-entry `u32` table $T[m] = \lfloor \sin(m\pi/1024) \cdot 2^{30} + 0.5 \rfloor$ with linear interpolation $S(u) = (1 - 2s)\big(((2^{16}-f)T[idx] + f T[idx+1] + 2^{15}) \gg 16\big)2^{-30}$ and unit-circle correction $\delta = \big((3 \cdot 2^{29} - (\tilde{c}^2 + \tilde{s}^2)2^{-31}) \gg 1\big)2^{-30}$.
 2. **Repeated-Window Cubic-Nuisance & Helmert LFO Detection:** Evaluates harmonic regression over $M$ repeated windows against a cubic drift baseline (`1, τ, τ², τ³`) via exact $F(2, \nu)$ variance ratios or orthonormal Helmert contrasts $z_k[n] = \big(\sum_{j=1}^k y^{(j)}[n] - k y^{(k+1)}[n]\big) / \sqrt{k(k+1)}$.
+
+## Amendment Appendix
+
+- **2026-11-20T02:07:00-05:00:** Amended to maintain sub-degree quadrature accuracy up to `192 kHz` and support stereo and silent-input carrier modulation (`ADR-0022`).

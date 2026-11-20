@@ -29,3 +29,7 @@ This record justifies the delay history, pitch windowing, and feedback stability
    - *Bounded Hermite Slope Clamp:* For $d_0 = x_1 - x_0$ and raw centered differences $m_0 = (x_1 - x_{-1})/2$, $m_1 = (x_2 - x_0)/2$, the bounded slope clamp $T(a, b) = \frac{1}{2}\big(\mathrm{clamp}(a + b, -3|d_0|, 3|d_0|) + \mathrm{clamp}(a - b, -|d_0|, |d_0|)\big)$ enforces $p(\mu) \in [\min(x_0, x_1), \max(x_0, x_1)]$.
    - *Passive Projected-State Update:* Projects history into orthogonal Legendre modes $z_m[n] = \langle \mathbf{x}_n, \mathbf{q}_m(\mu_{n-1}) \rangle$ so time-varying delay sweeps remain contractive (`‖z[n]‖₂ ≤ ‖x_n‖₂`).
 2. **Octave/Fractional Fixed-Point Pitch Table:** Decomposes $p_{\text{st}} = 12 q + r$ with 257-entry table $P[idx] = \lfloor 2^{idx/256} \cdot 2^{30} + 0.5 \rfloor$ and cubic correction, achieving $< 0.002$ cents error without runtime `exp2f`.
+
+## Amendment Appendix
+
+- **2026-11-20T02:07:00-05:00:** Amended to make transport loops continuously differentiable for black-box solver discovery without discrete mode switches or bespoke freeze forks (`ADR-0022`).

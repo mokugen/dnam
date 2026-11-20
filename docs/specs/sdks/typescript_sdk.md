@@ -14,6 +14,7 @@ requirements:
   - REQ-4.3
   - REQ-5.2
   - REQ-5.5
+  - REQ-5.6
   - REQ-6.1
   - REQ-7.1
   - REQ-7.4
@@ -49,14 +50,14 @@ The TypeScript SDK is published as `@dnam-project/dnam` from `packages/js/` and 
 flowchart LR
     subgraph TsSDK ["@dnam-project/dnam TypeScript 7 SDK (packages/js/src/)"]
         Top["index / node / browser: Model, GramMatrix, Engine, Parameter, DnamError"]
-        Mod["model/: Model, GramMatrix"]
-        Eng["engine/: Engine, process, render, stream, bypass/freeze scopes"]
+        Mod["model/: Model, .dnam-bin VM loader/inspector, GramMatrix"]
+        Eng["engine/: Engine, process, render, stream, bypass scopes"]
         Par["parameters/ & tempo/: Parameter, ControlSpace, clampParameters, Tempo, Subdivisions"]
         Sch["schema/: Pure TS Interfaces, v3.0 sona camelCase Codec, Native Schema + JCS"]
         Prov["provenance/: verify, sign, seal/unseal, dau1, preview, watermark"]
         Dsp["dsp/: SONA Reference Kernels (transport, modal, tpt-svf, paralru, polyadaa, control-bus, mixing)"]
         Web["web-audio/: DnamAudioNode, AudioWorkletProcessor, SAB + Atomics"]
-        Gpu["trainer/ (Planned M6): Browser navigator.gpu .wgsl Driver (<= 128 MiB, < 256 MiB) + WasmSimd128 Fallback"]
+        Gpu["trainer/ (Planned M16): Browser navigator.gpu .wgsl Driver (<= 128 MiB, < 256 MiB) + WasmSimd128 Fallback"]
         Int["internal/native/: NativeDriver, NapiDriver, WasmDriver (Private)"]
     end
 
@@ -74,11 +75,11 @@ flowchart LR
 
 Implemented TypeScript domains under `packages/js/src/` cover container loading in `model/`, inference in `engine/`, parameter clamping in `parameters/`, tempo math in `tempo/`, and JSON schemas in `schema/`.
 
-Supporting domains provide provenance workflows in `provenance/`, DSP kernels in `dsp/`, Worklet bindings in `web-audio/`, and private driver plumbing in `internal/`. The `trainer/` directory is a planned M6 internal module for browser `navigator.gpu` WebGPU training rather than a shipped public subpath.
+Supporting domains provide provenance workflows in `provenance/`, DSP kernels in `dsp/`, Worklet bindings in `web-audio/`, and private driver plumbing in `internal/`. The `trainer/` directory is a planned M16 internal module for browser `navigator.gpu` WebGPU training rather than a shipped public subpath.
 
 All intra-package and test imports route directly to concrete leaf modules with explicit ESM `.js` extensions (`../schema/header.js`, `../model/preamble.js`, `../engine/engine.js`).
 
-Non-exported internal folders (`model/`, `engine/`, `internal/native/{napi,wasm}/`, and planned M6 `trainer/`) forbid `index.ts` barrels.
+Non-exported internal folders (`model/`, `engine/`, `internal/native/{napi,wasm}/`, and planned M16 `trainer/`) forbid `index.ts` barrels.
 
 Large drivers and domain modules across TypeScript packages decompose hierarchically under a 900-line ceiling (`ref[repo.code.modular-decomposition-and-tests]`), adhering to the 4-tier TypeScript testing layout below while native bindings follow the [Rust Implementation Specification](rust_sdk.md) (`ref[sdk.rust.modular-layout-and-proptest]`, `ref[sdk.rust.safe-rust-and-boundaries]`):
 
@@ -95,11 +96,11 @@ The `src/internal/` tree is strictly private. Neither `NativeDriver` nor any raw
 
 `r[sdk.ts.layout.curated-exports]`
 
-Downstream consumers import exclusively from the 11 subpath entrypoints declared under `"exports"` in `packages/js/package.json`. Planned M6 `trainer/` code is not a public `@dnam-project/dnam/trainer` subpath export; it remains an internal/M6 module unless added explicitly to `"exports"` and guardrail allowlists:
+Downstream consumers import exclusively from the 11 subpath entrypoints declared under `"exports"` in `packages/js/package.json`. Planned M16 `trainer/` code is not a public `@dnam-project/dnam/trainer` subpath export; it remains an internal/M16 module unless added explicitly to `"exports"` and guardrail allowlists:
 
 | Public Subpath | Entrypoint / Asset | Primary Exports |
 | :--- | :--- | :--- |
-| `@dnam-project/dnam` | `dist/node.js` / `dist/browser.js` / `dist/index.js` | `Model`, `GramMatrix`, `Engine`, `Parameter`, `ParameterMap`, `ControlSpace`, `clampParameters`, `TempoController`, `DnamError`, `initWasm` |
+| `@dnam-project/dnam` | `dist/node.js` / `dist/browser.js` / `dist/index.js` | `Model`, `GramMatrix`, `inspectDnamBin`, `stripDnamBinToTier`, `Engine`, `Parameter`, `ParameterMap`, `ControlSpace`, `clampParameters`, `TempoController`, `DnamError`, `initWasm` |
 | `./node` & `./browser` | `dist/node.js` & `dist/browser.js` | Explicit Node.js N-API v10 and browser WASM SIMD128 runtime entrypoints |
 | `./parameters` | `dist/parameters/index.js` | `Parameter`, `ParameterMap`, `ControlSpace`, `clampParameters`, `defineModelTypes` |
 | `./tempo` | `dist/tempo/index.js` | `TempoController`, `subdivisions`, `computeZoh`, `controlStride`, `subdivisionPhase`, `invertTempoCalibration` |
@@ -125,7 +126,7 @@ Zero `any` types, `@ts-ignore` or `@ts-expect-error` suppressions, or non-null a
 
 Internal imports enforce a strict acyclic feature hierarchy from low-level primitives up to host adapters, rooted at `errors.ts` and `types.ts` into `schema/`, `internal/`, and `model/`.
 
-Above the container layer, `parameters/` and `tempo/` feed `engine/`, which in turn serves `web-audio/` and planned M6 `trainer/`.
+Above the container layer, `parameters/` and `tempo/` feed `engine/`, which in turn serves `web-audio/` and planned M16 `trainer/`.
 
 Adjacent feature domains stay narrow: `provenance/` depends on `model/`, while `dsp/` depends solely on `internal/` and `errors.ts`.
 
@@ -148,7 +149,7 @@ The public API separates explicit-lifetime native wrappers from deeply frozen pl
 | Category | Public Types / Classes | Ownership & Immutability Contract |
 | :--- | :--- | :--- |
 | **Stateful Resources (Classes)** | `Model`, `Engine`, `Parameter`, `ControlSpace`, `DnamAudioNode` | Wrap native host handles (`ref[sdk.rust.c-abi-and-host-handle]`) or validated aligned container buffers (`ref[sdk.rust.zerocopy-wire-structs]`); disposable resources expose `.dispose()` and `[Symbol.dispose]()`. |
-| **Plain Metadata (Frozen Objects)** | `ModelHeader`, `PreambleInfo`, `ParameterDescriptor`, `Preset`, `TelemetrySnapshot`, `ClampReport`, `VerificationResult` | Deeply `readonly` and `Object.freeze`-d plain camelCase objects with zero prototype methods or hidden native pointers. |
+| **Plain Metadata (Frozen Objects)** | `ModelHeader`, `PreambleInfo`, `DnamBinHeader`, `DnamBinRuntimeMeta`, `TempoSyncEntry`, `ParameterDescriptor`, `Preset`, `TelemetrySnapshot`, `ClampReport`, `VerificationResult` | Deeply `readonly` and `Object.freeze`-d plain camelCase objects with zero prototype methods or hidden native pointers. |
 
 ### 2.2 String-Literal Unions, Companion Tuples & Options Objects
 
@@ -162,7 +163,7 @@ Domain enumerations use lowercase string-literal unions paired with `readonly` c
 | `Backend` | `backends` | `"auto" \| "scalar" \| "neon" \| "arm-sme" \| "x86-simd" \| "wasm-simd128"` |
 | `Subdivision` | `subdivisions` | `"1/2." \| "1/2" \| "1/2T" \| "1/4." \| "1/4" \| "1/4T" \| "1/8." \| "1/8" \| "1/8T" \| "1/16." \| "1/16" \| "1/16T"` |
 
-Multi-flag configuration methods (`model.createEngine(options)`, `engine.bypass(options)`, `engine.freeze(options)`, `engine.render(audio, options)`, and `param.setValue(value, options)`) accept typed options objects compatible with `exactOptionalPropertyTypes`.
+Multi-flag configuration methods (`model.createEngine(options)`, `engine.bypass(options)`, `engine.render(audio, options)`, and `param.setValue(value, options)`) accept typed options objects compatible with `exactOptionalPropertyTypes`.
 
 ### 2.3 Compile-Time Model Parameter Inference
 
@@ -194,9 +195,9 @@ Entry `.d.ts` files emit `/// <reference lib="esnext.disposable" />` so downstre
 
 `engine.bypass(options?: { trails?: boolean }): StateScope` enters `SpilloverTrails` when `trails ?? true` or `HardBypass` when `trails === false` (`ref[arch.topology.spillover-trails]`), returning a scope that exposes `.restore(): void` and `[Symbol.dispose](): void`.
 
-Similarly, `engine.freeze(options?: { amount?: number }): StateScope` engages Spatial Tank captured hardware freeze (`ref[dsp.tank.captured-freeze]`) when `engine.supportsFreeze` is `true`, or throws `DnamError` (`code: "ERR_DNAM_PARAMETER"`) if unsupported.
+The exception-safe closure `engine.withBypass(options, fn)` wraps `fn` in a `try / finally` block so prior bypass state always restores on return or throw.
 
-Exception-safe closures `engine.withBypass(options, fn)` and `engine.withFreeze(options, fn)` wrap `fn` in `try / finally` blocks so prior state always restores on return or throw.
+Dedicated freeze scopes, capability flags, and special freeze calibration roles are absent from the TypeScript API. Captured hardware sustain or infinite-hold controls bind strictly as standard range or switch `Parameter` targets over continuous `Op-T` RAM `write_enable` (`WE`) and crossbar wet/dry balance.
 
 ### 2.6 WebAudio `AudioParam`-Aligned `Parameter`, `ParameterMap` & `ControlSpace`
 
@@ -224,7 +225,7 @@ Every native runtime error maps exhaustively from the native engine error taxono
 | :--- | :---: | :--- |
 | Container magic, version, truncation, CRC32C, or header capacity failure | `[DNAM-CONTAINER]` | `"ERR_DNAM_CONTAINER"` |
 | Unsupported host or container sample-rate validation failure | `[DNAM-SAMPLERATE]` | `"ERR_DNAM_SAMPLE_RATE"` |
-| Invalid control index, unknown parameter or preset ID, or unsupported freeze | `[DNAM-CONTROL]` | `"ERR_DNAM_PARAMETER"` |
+| Invalid control index or unknown parameter or preset ID | `[DNAM-CONTROL]` | `"ERR_DNAM_PARAMETER"` |
 | Cryptographic signature, encrypted arena key, or preview containment failure | `[DNAM-PROVENANCE]` | `"ERR_DNAM_PROVENANCE"` |
 | Unaligned container offset, malformed JSON header, or schema validation failure | `[DNAM-VALIDATION]` | `"ERR_DNAM_VALIDATION"` |
 | Concurrent audio render or disposal during active `processAsync` or use after `.dispose()` | `[DNAM-BUSY]` / `[DNAM-DISPOSED]` | `"ERR_DNAM_BUSY"` / `"ERR_DNAM_DISPOSED"` |
@@ -241,7 +242,7 @@ Every native runtime error maps exhaustively from the native engine error taxono
 
 All DSP, ZOH rescaling (`ref[dsp.zoh.ctrl-stride]`), 3-Phase control clamping, Lobatto calibration inversion, preset loading, tempo sync, and v3.0 `"sona"` header validation execute in compiled native code via the unified runtime seam.
 
-RFC 8785 JCS canonicalization, immutable-header projection (`ref[sec.jcs.immutable-header-digest]`), and creator or marketplace tier-prefix signing (`ref[sec.sig.prefix-delegation]`) likewise execute natively. The TypeScript layer handles only idiomatic API ergonomics, camelCase/snake_case key translation, input coercion, planned M6 WebGPU `.wgsl` dispatch orchestration (§4.5), and handle lifecycle management.
+RFC 8785 JCS canonicalization, immutable-header projection (`ref[sec.jcs.immutable-header-digest]`), and creator or marketplace tier-prefix signing (`ref[sec.sig.prefix-delegation]`) likewise execute natively. The TypeScript layer handles only idiomatic API ergonomics, camelCase/snake_case key translation, input coercion, planned M16 WebGPU `.wgsl` dispatch orchestration (§4.5), and handle lifecycle management.
 
 Both `NapiDriver` and `WasmDriver` implement the exact same `NativeDriver` interface declared in `src/internal/native/driver.ts`.
 
@@ -267,7 +268,7 @@ Specifying a bounded `maximum` enables V8 static guard-page bounds-check elision
 
 `engine.processAsync` runs on the Node.js libuv worker pool via an N-API `AsyncTask` over the thread-safe host handle (`ref[sdk.rust.c-abi-and-host-handle]`) and resolves asynchronously in browsers, honoring `AbortSignal` before dispatch.
 
-Concurrent rendering or `.dispose()` calls during an in-flight `processAsync` reject with `"ERR_DNAM_BUSY"`, while parameter, preset, tempo, bypass, freeze, and tier updates (`ref[dsp.ctrl.op-m.spsc-ingress]`) plus `engine.telemetry` reads (`ref[arch.telemetry.seqlock-publication]`) complete synchronously and non-blockingly on the main thread.
+Concurrent rendering or `.dispose()` calls during an in-flight `processAsync` reject with `"ERR_DNAM_BUSY"`, while parameter, preset, tempo, bypass, and tier updates (`ref[dsp.ctrl.op-m.spsc-ingress]`) plus `engine.telemetry` reads (`ref[arch.telemetry.seqlock-publication]`) complete synchronously and non-blockingly on the main thread.
 
 ### 3.3 Offline `render` (4x Bounce) & Web `TransformStream`
 
@@ -301,10 +302,11 @@ Mirrored definitions cover header metadata, I/O capabilities, slimmable tier pro
 
 | Canonical Wire Schema ([dnam_binary_format.md](../containers/dnam_binary_format.md)) | `@dnam-project/dnam/schema` TypeScript Interface | Schema Domain |
 | :--- | :--- | :--- |
+| Layer 0 `.dnam-bin` VM preamble (`"DNBN"` / `"DBRM"` / `"TSYN"`) | `DnamBinHeader`, `DnamBinRuntimeMeta`, `TempoSyncEntry` | Fixed-VM binary header, active-hot metadata, and tempo-sync calibration table |
 | Top-level header & `metadata` (`"3.0.0"`, `"sona"`, 48000 Hz, `"dnam" \| "preview"`) | `ModelHeader`, `ModelMetadata` | Discriminants (`"3.0.0"`, `"sona"`, 48000 Hz, `"dnam" \| "preview"`), identity, and attribution |
-| `io_config`, `capabilities`, `leveling`, `slimmable_tiers` | `IoConfig`, `ModelCapabilities`, `LevelingConfig`, `SlimmableTiersConfig`, `TierProfile` | Channel topology, capabilities, auto-unity leveling, and per-tier arena profiles |
-| `io_router`, `cabinet`, `spatial_tank`, `control_bus` | `IoRouterConfig`, `CabinetKautzConfig`, `SpatialTankConfig`, `ControlBusConfig` | I/O Router, Cabinet Bank, Spatial Tank, and 3 kHz Control Bus configurations |
-| `delay_histories`, `tensor_directory`, `controls_schema`, `presets` | `DelayHistoryEntry`, `TensorSliceEntry`, `ParameterDescriptor`, `ParameterCalibration`, `ParameterUiHints`, `Preset` | Delay capacities, 64 B-aligned tensor slices, macro controls, and factory presets |
+| `io_config`, `capabilities`, `leveling`, `slimmable_tiers` | `IoConfig`, `ModelCapabilities`, `LevelingConfig`, `SlimmableTiersConfig`, `TierProfile` | Channel topology, capabilities (without dedicated freeze flags), auto-unity leveling, and per-tier arena profiles |
+| `io_router`, `cabinet`, `spatial_tank`, `control_bus` | `IoRouterConfig`, `CabinetKautzConfig`, `SpatialTankConfig`, `ControlBusConfig` | I/O Router, Cabinet Bank, Spatial Tank, and 3 kHz control bus configurations |
+| `delay_histories`, `tensor_directory`, `controls_schema`, `presets` | `DelayHistoryEntry`, `TensorSliceEntry`, `ParameterDescriptor`, `ParameterCalibration`, `ParameterUiHints`, `Preset` | Delay capacities, 64 B-aligned tensor slices, 10 calibration roles (with freeze-latch removed in favor of `Op-T` hold controls), macro controls, and factory presets |
 | `metadata.signatures`, `authorized_devices`, `royalty_splits`, `distribution_policy`, `provenance` | `ModelSignatures`, `CreatorSignature`, `MarketplaceReceipt`, `AuthorizedDevice`, `RoyaltySplit`, `DistributionPolicy`, `DatasetProvenance`, `OemDeviceCertificate` | Cryptographic provenance, distribution policies, receipts, and OEM device certs |
 
 `decodeHeader(wireJson)` and `encodeHeader(header)` delegate validation and default population directly to the native schema validator ([Rust Implementation Specification](rust_sdk.md)), returning deeply frozen camelCase `ModelHeader` values or canonical snake_case wire JSON.
@@ -315,19 +317,23 @@ Decoding any natively emitted v3.0 `"sona"` header (both minimal reference heade
 
 Before hashing, canonicalization performs non-recursive stripping of the seven canonical paths: `presets`, `user_metadata`, `stem_user_metadata`, `metadata.signatures`, `controls_schema[*].user_metadata`, `stems_registry[*].user_metadata`, and `slimmable_tiers.{lite,full,pro,ultra}.prefix_crc32c`.
 
-### 4.2 `.dnam` Models (SONA v3.0 Wire Constants), `GramMatrix` & Tempo
+### 4.2 `.dnam-bin` VM Images, `.dnam` Models, `GramMatrix` & Tempo
 
 `r[sdk.ts.model.containers-and-gram]`
 
 Asynchronous `await Model.load(source)` accepts Node.js paths as well as `URL`, `Response`, `Blob`, `ArrayBuffer`, or `Uint8Array` inputs.
 
-Together with `Model.from(bytes)`, `Model.reference(options?)`, and `Model.build(header, arenaBytes)`, every factory validates the 64 B-aligned v3.0 `.dnam` container (`ref[container.dnam.load-validation]`, `ref[sdk.rust.zerocopy-wire-structs]`, `REQ-8.8`).
+Raw Layer 0 .dnam-bin VM executables load directly via `inspectDnamBin(bytes)`, `Model.fromDnamBin(bytes)`, and `stripDnamBinToTier(bytes, maxTier)`.
 
-Cumulative SONA v3.0 tier arena boundaries span `[4_608, 7_936, 15_872, 30_720]` B (72, 124, 248, and 480 64 B cache lines across Lite, Full, Pro, and Ultra). Arena 0 carries 1× Lite weights and self-contained parametric controls, while Arena 1..3 carry 2×-OS incremental deltas; loaders reject `versionMajor !== 3 || versionMinor !== 0` or non-`"sona"` headers fail-fast with `"ERR_DNAM_CONTAINER"`.
+Together with `Model.from(bytes)`, `Model.reference(options?)`, and `Model.build(header, arenaBytes)`, every factory validates 64 B-aligned v3.0 `.dnam-bin` and `.dnam` containers fail-fast (`ref[container.dnam.load-validation]`, `ref[sdk.rust.zerocopy-wire-structs]`, `REQ-8.8`).
+
+Cumulative SONA v3.0 tier arena boundaries span `[4_608, 7_936, 15_872, 30_720]` B across Lite, Full, Pro, and Ultra. Arena 0 carries 1× Lite weights and self-contained parametric controls, while Arena 1..3 carry 2×-OS incremental deltas; loaders reject invalid major/minor versions or non-`"sona"` / non-`"DNBN"` headers with `"ERR_DNAM_CONTAINER"`.
+
+When a `.dnam` container embeds an executable `dbin_prefix`, its Region 4 payload stays 0 B so weights are never duplicated; `model.extractDnamBin()` slices that embedded binary directly, while `stripDnamBinToTier` truncates `.dnam-bin` at `tierEndOffsets[maxTier]` with zero-mutation parity (`REQ-5.6`).
 
 Immutable `Model` properties expose `model.preamble`, `model.header`, `model.parameters`, `model.presets`, and `model.tierArenas`.
 
-Transform and factory methods include `model.withHeader(updater)` (in-place within the 4 KB page budget when unsealed), `model.withMaxTier(tier)` (tier-prefix stripping that preserves full Arena 0 controls even at Lite, `ref[container.dnam.tier-prefix]`), and `model.createEngine(options?)`.
+Transform and factory methods include `model.withHeader(updater)` (in-place within the 4 KB page budget when unsealed), `model.withMaxTier(tier)` (prefix stripping that trims both `.dnam` and embedded `dbin_prefix` consistently while keeping Arena 0 controls, `ref[container.dnam.tier-prefix]`), and `model.createEngine(options?)`.
 
 `GramMatrix` packs and unpacks symmetric sufficient-statistic matrices in canonical `uplo='U'` upper-triangular `Float64Array` layout via `GramMatrix.fromDense(matrix, dim)` and `gram.toDense()` (`ref[container.proj.stat-uplo-u]`).
 
@@ -343,6 +349,8 @@ Parameter normalization and clamping enforce the 3-Phase pipeline (`ref[train.au
 
 `@dnam-project/dnam/provenance` delegates container verification, policy checks, signing, HPKE sealing, preview containment, buyer watermarking, and anti-cloning fingerprinting directly to the native provenance runtime ([Rust Implementation Specification](rust_sdk.md)).
 
+Signature verification, HPKE `.dnam-seal` sealing, and unsealing authenticate any embedded `.dnam-bin` `dbin_prefix` alongside the canonical JCS header while requiring Region 4 to remain 0 B when embedded (`ref[sec.sig.dau1-envelope]`).
+
 Both `verify` and `unseal` MUST fail closed (`"ERR_DNAM_PROVENANCE"`) whenever a container carries commercial data (`authKind === 1` or non-null `marketplaceReceipt`) or non-Open protection (`protectionProfile !== "open"`) without a matching `trustedMarketplacePubkeyHex` or recipient key:
 
 | Exported Group (`@dnam-project/dnam/provenance`) | Key Functions & Wire Contracts | Specification Reference |
@@ -352,7 +360,11 @@ Both `verify` and `unseal` MUST fail closed (`"ERR_DNAM_PROVENANCE"`) whenever a
 | **Preview Containment (`.dnam-prev`)** | `computePreviewWindow`, `validatePreviewSwitchOptions`, plus DAW/hardware host rejection of `containerKind === "preview"` on load and hot-swap `reload` | `ref[sec.preview.containment]` |
 | **Buyer Watermarking & Structural Hash** | `applyGaugeWatermark` (Cabinet Kautz + `SO(4)` + 40-lane SONA sign-flip), `generateTardosCode`, `applyTardosWatermark` (7,680-coord partition with `2 * fp16_ulp(w)` floor), `scoreTardosWatermark`, `extractStructuralHash`, `structuralCosineSimilarity` | `ref[sec.watermark.reciprocal-gauge]`, `ref[sec.watermark.tardos-code]`, `ref[sec.anticlone.cabinet-fingerprint]` |
 
-`applyTardosWatermark` restricts perturbations strictly to linear Role B coordinates (`W_readout` and `W_mod` plus linear reserves), preserving crossbar, I/O Router, and nonlinear SONA core trajectories unaltered.
+`applyTardosWatermark` mutates only linear Role B coordinates (`W_readout` and `W_mod` plus linear reserves) in place, leaving `"DBRM"`, `shared_controls`, `"TSYN"`, `"CEXT"`, crossbar, `Op-N[Pre]`, and nonlinear SONA core trajectories untouched.
+
+When emitting a signed or sealed buyer container carrying `dbin_prefix_bytes > 0` (`authKind === 1` or `.dnam-seal`), buyer issuance updates integrity digests over the watermarked arenas.
+
+Specifically, issuance recomputes `tier_arena_crc32c`, `prefix_crc32c`, `crc_dbin_prefix`, `crc_tiers`, and buyer prefix digests (`L_buyer`) over the updated `dbin_prefix` while preserving creator `L_master` and `creatorSignature` verbatim.
 
 ### 4.4 Vectorized SONA Reference DSP Kernels (`@dnam-project/dnam/dsp`)
 
@@ -376,13 +388,13 @@ All slice-accepting DSP functions execute in compiled native loops (`ref[sdk.rus
 
 `DnamAudioNode.create(context, model, options?)` in `@dnam-project/dnam/web-audio` registers the standalone zero-dependency `web-audio-processor.js` module and forwards the pre-compiled `WebAssembly.Module`, optional shared `WebAssembly.Memory`, and v3.0 container bytes via `processorOptions`.
 
-Each node instance exposes the identical `node.parameters`, `node.applyPreset(id)`, `node.tempo`, `node.bypass(...)`, `node.freeze(...)`, and typed `"telemetry"` events as the synchronous `Engine` API.
+Each node instance exposes the identical `node.parameters`, `node.applyPreset(id)`, `node.tempo`, `node.bypass(...)`, and typed `"telemetry"` events as the synchronous `Engine` API.
 
 End-to-end Worklet rendering is verified in headless Chromium (`OfflineAudioContext` plus `AudioWorkletNode`) via `@vitest/browser-playwright`.
 
 When `crossOriginIsolated === true`, parameter updates, transport commands, and telemetry snapshots flow across a lock-free `SharedArrayBuffer` (`Int32Array` / `Float32Array` + `Atomics`) with zero allocations on the audio thread. When `crossOriginIsolated === false`, the bridge falls back transparently to `MessagePort`.
 
-The planned M6 browser `navigator.gpu` trainer driver (`src/trainer/`, internal to `@dnam-project/dnam`) accelerates SONA v3.0 capture training in background Web Workers (`REQ-4.1`, `REQ-4.2`, `REQ-4.3`, `ref[train.pipeline.webgpu-scans-and-ozaki]`):
+The planned M16 browser `navigator.gpu` trainer driver (`src/trainer/`, internal to `@dnam-project/dnam`) accelerates SONA v3.0 capture training in background Web Workers (`REQ-4.1`, `REQ-4.2`, `REQ-4.3`, `ref[train.pipeline.webgpu-scans-and-ozaki]`):
 
 | Browser Trainer Component | Normative Resource & Shader Contract |
 | :--- | :--- |
@@ -409,7 +421,7 @@ Throughput suites also profile `ControlSpace.clampNumericInto` (alongside `Contr
 
 The WebAssembly SIMD128 and shared portable math backends defined in the [Rust Implementation Specification](rust_sdk.md) (`ref[sdk.rust.explicit-simd-and-coverage]`, `ref[sdk.rust.shared-nostd-kernels]`) implement 4-lane SIMD128 floating-point, `fp16` packing, subnormal-flushing, and Newton–Raphson reciprocal primitives.
 
-Floating-point and SIMD lane layouts follow `ref[arch.fp.callback-env]` and `ref[arch.simd.lane-packing]`, pairing interleaved 8-lane stereo SIMD cascade kernels across all four SONA tiers ([1,1,1,1] at 1× Lite, [2,2,1,1] at 2× Full, [3,2,2,1] at 2× Pro, [4,3,2,1] at 2× Ultra; 1–4 tank quads = 4–16 Spatial Tank lines) and the 3 kHz Control Bus.
+Floating-point and SIMD lane layouts follow `ref[arch.fp.callback-env]` and `ref[arch.simd.lane-packing]`, pairing interleaved 8-lane stereo SIMD cascade kernels across all four SONA tiers ([1,1,1,1] at 1× Lite, [2,2,1,1] at 2× Full, [3,2,2,1] at 2× Pro, [4,3,2,1] at 2× Ultra; 4,544 / 7,552 / 11,200 / 14,656 B hot working sets inside 4,608 / 7,936 / 15,872 / 28,672 B L1D ceilings; 1–4 tank quads = 4–16 Spatial Tank lines) and the 3 kHz control bus.
 
 To preserve L1 instruction-cache locality and keep `dnam.wasm` compact (with 0 KB added for `.wgsl` shaders), the native audio-loop and JSON schema boundaries prevent cross-unit inlining and monomorphization bloat per the [Rust Implementation Specification](rust_sdk.md) (`ref[sdk.rust.c-abi-and-host-handle]`).
 

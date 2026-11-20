@@ -450,7 +450,11 @@ function collectAdrStatusAndSpecMaps(): {
     const fm = parseFrontmatter(fs.readFileSync(path.join(ADR_DIR, entry), "utf8"));
     if (!fm) continue;
     const aid = String(fm["id"]);
-    adrStatuses.set(aid, String(fm["status"]));
+    const status = String(fm["status"]);
+    expect(/^\d{4}-superseded-/.test(entry), `ADR filename '${entry}' vs status '${status}'`).toBe(
+      status === "superseded",
+    );
+    adrStatuses.set(aid, status);
     const rawSpecs = Array.isArray(fm["specs"]) ? fm["specs"] : [];
     adrEnforcesSpecs.set(aid, rawSpecs.map(normalizeSpecRelPath));
   }
@@ -485,7 +489,7 @@ function collectSpecCitationSets(supersededAdrs: ReadonlySet<string>): {
 }
 
 const RUST_INTERNAL_SYM_ALT = [
-  "SonaHotSlab|SonaInstance|DnamEngine|DynamicDnamEngine|DnamHostHandle|KernelVec4|SimdVec4",
+  "SonaHotSlab|SonaInstance|SonaVm|DnamEngine|DynamicDnamEngine|DnamHostHandle|KernelVec4|SimdVec4",
   "GpuVec4|StereoVec8|WasmSimd128Backend|WasmSimd128TrainerBackend|DnamJsonHeader",
   "DnamProjManifest|hoist_groups_and_readouts|process_tick16_const|step_frame_sona",
   "step_frame_4x_sona|step_frame_4port_sona|step_frame_4x_4port_sona|step_control_tick_3khz",
@@ -506,7 +510,7 @@ const NON_SDK_SPEC_FORBIDDEN_RE = new RegExp(
     "\\b(?:proptest|macro_rules|include_str|include_bytes)!",
     "\\b(?:Result<|Vec<|Box<|Arc<|BTreeMap|BTreeSet|HashMap|HashSet|AtomicU64|AtomicUsize)\\b",
     "\\b(?:Float32Array|Float64Array|Uint8Array|Int32Array|SharedArrayBuffer)\\b",
-    "\\b(?:dnam-kernels|dnam_kernels|dnam-engine|dnam_engine|dnam-capture|dnam_capture)\\b",
+    "\\b(?:dnam-kernels|dnam_kernels|dnam-vm|dnam_vm|dnam-train|dnam_train|dnam-engine|dnam_engine|dnam-capture|dnam_capture)\\b",
     "\\b(?:dnam-fixtures|dnam_fixtures|dnam-js|dnam_js|dnam-studio|dnam_studio|dnam-ui)\\b",
     "@dnam-project/[a-z-]+\\b|\\b(?:Rust|TypeScript|JavaScript|Biome|Vitest|Playwright|N-API)\\b",
     "\\b(?:AudioWorklet|Cargo|rustc|rustfmt|clippy|fast-check|zerocopy|serde|serde_json)\\b",
@@ -519,10 +523,10 @@ const NON_SDK_SPEC_FORBIDDEN_RE = new RegExp(
 const TS_SDK_RUST_FORBIDDEN_RE = new RegExp(
   [
     "(?:\\b[A-Za-z0-9_-]+|\\*)\\.rs\\b|\\[profile\\.[a-z]+\\]|\\bCargo\\.(?:toml|lock)\\b",
-    "\\bpackages/(?:engine|kernels|capture|fixtures)\\b|\\bpackages/(?:js|studio)/rust\\b",
+    "\\bpackages/(?:engine|kernels|vm|train|capture|fixtures)\\b|\\bpackages/(?:js|studio)/rust\\b",
     "\\btools/sona-shaders\\b",
     RUST_ATTR_RE_SRC,
-    "\\b(?:dnam-kernels|dnam_kernels|dnam-engine|dnam_engine|dnam-capture|dnam_capture)\\b",
+    "\\b(?:dnam-kernels|dnam_kernels|dnam-vm|dnam_vm|dnam-train|dnam_train|dnam-engine|dnam_engine|dnam-capture|dnam_capture)\\b",
     "\\b(?:dnam-fixtures|dnam_fixtures|dnam-js|dnam_js|serde|serde_json|zerocopy|rustc)\\b",
     `\\b(?:cargo-gpu|proptest!|macro_rules!|ControlBus|${RUST_INTERNAL_SYM_ALT})\\b`,
   ].join("|"),
@@ -785,11 +789,19 @@ describe("DNAM Documentation Registry, Rules, ADRs & Traceability Guardrails", (
   });
 
   it("test_spec_rules_verified_in_tests", () => {
+    const specFirstPendingVerifyRules: ReadonlySet<string> = new Set(["container.dnam.vm-binary"]);
     const rules = collectSpecRules();
     const verifiedIds = new Set(collectTestVerifyTokens().map(([ruleId]) => ruleId));
+    for (const pendingId of specFirstPendingVerifyRules) {
+      expect(rules.has(pendingId), `unknown pending rule ${pendingId}`).toBe(true);
+      expect(
+        verifiedIds.has(pendingId),
+        `${pendingId} is now verified; remove from specFirstPendingVerifyRules`,
+      ).toBe(false);
+    }
     expect(
       Array.from(rules.keys())
-        .filter((r) => !verifiedIds.has(r))
+        .filter((r) => !verifiedIds.has(r) && !specFirstPendingVerifyRules.has(r))
         .sort(),
     ).toEqual([]);
   });

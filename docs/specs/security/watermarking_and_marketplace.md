@@ -74,7 +74,7 @@ The control-plane `SO(4)` isometric gauge post-multiplies by $\mathbf{Q}_{\text{
 
 | `SO(4)` Rotation Target | Byte Range / Indexing | Rotated Columns & Strict Exclusions |
 | :--- | :--- | :--- |
-| Arena 0 Control Plane `cp1_base.main_base[l][0..4]` | Inline `CP1` directory at 2,724..2,752; `cp1_base` at 2,880..3,456; `"CP1\0"` overflow in `shared_extent` | Rotate 4-float prefix `main_base[l][0..4]` across each `CP1` contributor (`cp1_dir_count` in 0–8 inline or `"CP1\0"` overflow); leave columns 4..8 untouched |
+| Arena 0 Control Plane `cp1_base.main_base[l][0..4]` | Inline `CP1` directory at 2,724..2,752; `cp1_base` at 2,880..3,456; `"CP1\0"` overflow in `shared_controls` (when `dbin_prefix_bytes > 0`) or `shared_extent` | Rotate 4-float prefix `main_base[l][0..4]` across each `CP1` contributor (`cp1_dir_count` in 0–8 inline or `"CP1\0"` overflow); leave columns 4..8 untouched |
 | Arena 0 Control Plane `u_int_base[r][0..4]` | Starting at `2,752 + r * 32` for row `r` in 0..4 | Rotate strictly elements 0..4 (16 B) of each 8-element (32 B) row; leave elements 4..8 (`z_stage[0..4]`) untouched |
 | Arena 3 Control Plane `u_int_ultra[0][r][0..4]` | 27,136..27,520 (`f32le[3][4][8]`); Block 0 at `27,136 + r * 32` | Rotate strictly Block 0 elements `c` in 0..4 (16 B) feeding `z_head[0..4]`; leave Block 0 elements 4..8 and Blocks 1..2 (27,264..27,520) feeding `z_raw[8..16]` untouched |
 | Arena 0 Control Plane `w_ctrl[0..16][0..4]` | 3,456..4,480 (16 × 16 matrix) | Rotate strictly columns 0..4 (`q0 = z_head[0..4]`) across rows 0..16 |
@@ -132,9 +132,18 @@ All nonlinear trajectories, crossbar weights, control basis descriptors, and rec
 
 | Excluded Subsystem | Protected Wire Fields & Byte Ranges |
 | :--- | :--- |
-| **Crossbar & I/O Router** | Crossbar Block (0..256), all SONA Crossbar Coupling matrices, and Lite Readout crossbar aliases (`stage_latent_mods_fp16[80..96]` `op_p_to_group`, `w_ro_fp16[192..208]` `phasor_to_group`) |
-| **Nonlinear SONA Core & Spatial Tank** | All SONA Group Blocks, Inter-Block Tile Pairs, Ultra SONA Core Delta `stage_latent_core_mods_fp16[0..1,024]` (18,048..20,096), and active Spatial Tank delay quads |
-| **Control Plane & Kautz Poles** | Control scalars, `U_int`, `CP1` (Inline `CP1` Directory with `cp1_dir_count` in 0–8 inline in `cp1_base[576 B]` or `"CP1\0"` in `shared_extent`), `trust_radius_mh` (2,720..2,724), `rho_head_and_ctrl_tail[0]` (4,480..4,484), `opt_to_lr[0..4][0..2]` (4,576..4,608), and Kautz pole fields (`r_low`, `dr`, `theta`, `b_gamma`, `kautz_b_gamma`) |
+| **Crossbar, `Op-N[Pre]` & I/O Router** | Crossbar Block (0..256, including `Op-N[Pre]` at 180..192), all SONA Crossbar Coupling matrices, and Lite Readout crossbar aliases (`stage_latent_mods_fp16[80..96]`, `w_ro_fp16[192..208]`) |
+| **Nonlinear SONA Core & Spatial Tank** | All SONA Group Blocks, Inter-Block Tile Pairs, Ultra SONA Core Delta `stage_latent_core_mods_fp16[0..1,024]` (18,048..20,096), and active 128 B Spatial Tank quad blocks (`TANK_DELAY_BASES[0..4]`) |
+| **Control Plane & Kautz Poles** | Control scalars, `U_int`, `CP1` (Inline `CP1` Directory with `cp1_dir_count` in 0–8 inline in `cp1_base[576 B]` or `"CP1\0"` overflow), `trust_radius_mh` (2,720..2,724), `rho_head_and_ctrl_tail[0]` (4,480..4,484), `opt_to_lr[0..4][0..2]` (4,576..4,608), and Kautz pole fields (`r_low`, `dr`, `theta`, `b_gamma`, `kautz_b_gamma`) |
+| **`.dnam-bin` Prefix (`dbin_prefix`) & Framing** | Region 4 (0 B when `dbin_prefix_bytes > 0`), Region 5 `auth_extent`, embedded `dbin_prefix` (`[dbin_offset..tier_start)`: `"DNBN"`, `"DBRM"`, `shared_controls`, `"TSYN"`, `"CEXT"` 1,280 B), and unassigned tail 5,875..7,680 |
+
+When a container embeds a Layer 0 prefix (`dbin_prefix_bytes > 0`), Region 4 (`shared_extent`) MUST equal zero bytes (0 B) while `dbin_prefix` precedes `tier_start` (Arena 0..3). All 0..5,875 Tardos Role A and Role B coordinates reside strictly inside Arena 0..3, while 5,875..7,680 stays an unperturbed guard tail.
+
+Tardos watermark embedding and extraction operate strictly on Role B coordinates inside Arena 0..3, leaving `"DBRM"`, `shared_controls`, `"TSYN"`, `"CEXT"`, crossbar, `Op-N[Pre]`, and unassigned slots untouched.
+
+When issuing a watermarked buyer container with `dbin_prefix_bytes > 0` (`auth_kind == 1` or `.dnam-seal`), buyer issuance MUST recompute layer-0 `tier_arena_crc32c` and `prefix_crc32c` digests over the buyer arenas.
+
+Outer DCRC `crc_dbin_prefix` and `crc_tiers`, along with buyer prefix commitments (`L_buyer`, `DAI1/DSA1`), then commit to the updated `dbin_prefix` while preserving creator `L_master` and `creator_signature` verbatim.
 
 Because IEEE-754 binary16 (`fp16`) quantization with its 10-bit mantissa (`fp16_ulp(w) = 2^(max(-24, floor(log2|w|) - 10))`) erases sub-0.5 ULP `epsilon` shifts, naive perturbations disappear upon rounding.
 
@@ -235,7 +244,7 @@ The 224-D structural hash extractor emits a fixed 224-D (`56 * 4`) vector across
 | `[0..16]` | 16 | `r_low_{t,m} + 0.5 * dr_{t,m} + 0.1 * floor_1e2(theta_{0,t,m})` across tier `t` Kautz pairs, zero-padded to 16 |
 | `[16..32]` | 16 | `b_gamma_{t,m} * (c_re_L_{t,m} + c_re_R_{t,m})` across tier `t` Kautz pairs, zero-padded to 16 |
 | `[32..48]` | 16 | `b_gamma_{t,m} * (c_im_L_{t,m} + c_im_R_{t,m})` across tier `t` Kautz pairs, zero-padded to 16 |
-| `[48..52]` | 4 | Spatial Tank `delay_lengths` invariants (`TANK_DELAY_BASES`), read as `u32le` words (decoded as integer values for 4 to 48,000, else as finite IEEE-754 binary32 floats widened to binary64) |
+| `[48..52]` | 4 | Spatial Tank `delay_samples[0..4]` invariants (bytes 0..16 of each 128 B quad header at `TANK_DELAY_BASES[t]`), read as finite IEEE-754 binary32 `f32le` floats widened to binary64 (0.0 if non-finite) |
 | `[52..56]` | 4 | VarPro `fp16` `W_readout` segment squared norms (`sum(v^2)` over 4 equal segments of `[48, 72, 96, 120]` `u16` weights spanning `[192, 288, 384, 480]` `W_ro,0` entries of tier `t`) |
 
 Because `b_gamma * c_re` and `b_gamma * c_im` cancel the Mechanism A1 multiplier $\kappa_m$ in exact arithmetic—and the 224-D structural hash quantizes each Kautz pole angle $\theta_m$ onto a $10^{-2}\text{ rad}$ grid via `floor_1e2` inside the `[0.2, 0.8]` guard band—this 224-D vector stays invariant under reciprocal gauge watermarking, 40-lane sign flips, `SO(4)` rotations, Layer 2 phase coding, and black-box re-capture solver jitter.
@@ -270,7 +279,7 @@ flowchart TD
 | :--- | :--- |
 | **1. Dedicated Preview Type & High-Tier Omission** | Sets `container_kind: "preview"` (`"architecture": "sona"`, v3.0) and physically omits Full, Pro, and Ultra arenas while retaining Arena 0 self-contained Lite controls. Non-browser DAW and hardware hosts MUST reject preview containers (`PreviewContainerRejected`) on both initial load and live model hot-swap. |
 | **2. Bounded Preview Controls & Fixed-Anchor Rank-r Containment** | Single control (`P = 1`): exposes a bounded continuous window `v in [v_0 - delta, v_0 + delta]` intersected with `[0, 1]` (`0 < delta <= 0.15`), or at most one additional observed safe switch option. Multiple controls (`P >= 2`): fixes a master-scoped anchor `a` and rank-r (`r < D_cont`) matrix `B`, permitting only `a + B t` across published previews while locking discrete switches. |
-| **3. Stateless On-Demand Generation (< 1 ms)** | Synthesizes `.dnam-prev` payloads at the CDN edge directly from the master's Arena 0 Lite prefix (keyless tier stripping to Lite) with zero per-session storage multiplication. |
+| **3. Stateless On-Demand Generation (< 1 ms)** | Synthesizes `.dnam-prev` payloads at the CDN edge directly from the master's Arena 0 Lite prefix and Lite `.dnam-bin` prefix (`tier_end_offsets[0]`, Region 4 = 0 B) via keyless tier stripping with zero per-session storage multiplication. |
 | **4. Cascade-Fused Static Phase Dispersion** | Perturbs Cabinet Bank / Spatial Tank phase response (`|20 log10 |H_disp(e^{jw})|| <= 0.05 dB`, `tau_g^(demo)(w) != tau_g^(master)(w)`) while preserving stability bounds. |
 | **5. Dynamic Synthetic-Sweep & Impulse Input Guard** | Monitors 3 kHz crest factor and zero-crossing regularity (0 `FDIV`, 0 `FSQRT`), smoothly engaging phase flutter on synthetic probe stimuli while preserving natural musical playing. |
 | **6. Black-Box Acoustic Watermarking & Session Binding** | Embeds HMAC-keyed sparse micro-echoes (`y_wm[n] = y[n] + sum beta_i y[n - d_i]`, `|beta_i| <= 10^(-42/20)`, `d_i in [120, 800]` samples) alongside session lease metadata. |

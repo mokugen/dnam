@@ -17,15 +17,15 @@ requirements:
 
 # ADR-0014: Python 3.15 Free-Threaded Dev Runtime, PEP 803 Dual-ABI (`abi3.abi3t`) Wheels & PyO3 Concurrency
 
-> **Superseded by [`ADR-0018`](0018-signal-chain-fixtures-crate-and-whitebox-distillation.md) and [`ADR-0017`](0017-pure-rust-analytical-varpro-solver-and-planar-decoupling.md):** DNAM has unified training and inference in 100% pure Rust (`packages/engine`, `packages/trainer`, `packages/studio`) and TypeScript (`packages/js`), retiring Python/`PyO3`, `sdk.python.*`, and `docs/specs/sdks/python_sdk.md` (retired by `ADR-0018`).
+> **Superseded by [`ADR-0018`](0018-signal-chain-fixtures-crate-and-whitebox-distillation.md) and [`ADR-0017`](0017-superseded-pure-rust-analytical-varpro-solver-and-planar-decoupling.md):** DNAM has unified training and inference in 100% pure Rust (`packages/engine`, `packages/trainer`, `packages/studio`) and TypeScript (`packages/js`), retiring Python/`PyO3`, `sdk.python.*`, and `docs/specs/sdks/python_sdk.md` (retired by `ADR-0018`).
 
-This record documents the historical architectural decision to target Python `3.15t` free-threaded execution and PEP 803 `abi3t` wheels prior to the pure-Rust trainer unification in [`ADR-0017`](0017-pure-rust-analytical-varpro-solver-and-planar-decoupling.md) and [`ADR-0018`](0018-signal-chain-fixtures-crate-and-whitebox-distillation.md).
+This record documents the historical architectural decision to target Python `3.15t` free-threaded execution and PEP 803 `abi3t` wheels prior to the pure-Rust trainer unification in [`ADR-0017`](0017-superseded-pure-rust-analytical-varpro-solver-and-planar-decoupling.md) and [`ADR-0018`](0018-signal-chain-fixtures-crate-and-whitebox-distillation.md).
 
 ---
 
 ## 1. Context & Problem Statement
 
-Following [`ADR-0012`](0012-python-sdk-architecture-and-idiomatic-api.md), four runtime and packaging constraints motivated free-threaded concurrency hardening before the Python layer was ultimately superseded by pure Rust:
+Following [`ADR-0012`](0012-superseded-python-sdk-architecture-and-idiomatic-api.md), four runtime and packaging constraints motivated free-threaded concurrency hardening before the Python layer was ultimately superseded by pure Rust:
 
 | Previous Formulation | Failure Mechanism | Runtime or Packaging Consequence |
 | :--- | :--- | :--- |

@@ -13,7 +13,7 @@ requirements:
 # ADR-NNNN: `<Short Noun Phrase Stating the Architectural Decision>`
 
 > [!NOTE]
-> Use this MADR (`docs/adr/NNNN-kebab-case-title.md`) template to record **why** a mathematical formulation, wire layout, or architectural trade-off was chosen over naive or exploratory R&D candidates (see [`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md) and [`REQ-1.1`](../requirements/system_goals_and_requirements.md)). Keep normative **"how"** contracts in `docs/specs/`.
+> Use this MADR template (`docs/adr/NNNN-kebab-case-title.md`, or `docs/adr/NNNN-superseded-kebab-case-title.md` whenever `status: superseded`) to record **why** a mathematical formulation, wire layout, or architectural trade-off was chosen over naive or exploratory R&D designs (see [`../specs/architecture/sona_architecture.md`](../specs/architecture/sona_architecture.md) and [`REQ-1.1`](../requirements/system_goals_and_requirements.md)). Name every candidate with a descriptive domain title (never non-descriptive lettered or numbered shorthand labels), and keep normative **"how"** contracts in `docs/specs/`.
 
 ---
 
@@ -23,7 +23,7 @@ Describe the physical, numerical, or hardware constraint (e.g., `ARM Cortex-A76`
 
 | Naive Formulation | Failure Mechanism | Audible or Numerical Consequence |
 | :--- | :--- | :--- |
-| **`<Naive Approach A>`** | Explain the mathematical or hardware flaw (no raw dollar signs in table cells per `ref[repo.docs.markdown-table-math]`). | Quantify the error, drift, aliasing, or CPU budget violation. |
+| **`<Descriptive Rejected Approach Name>`** | Explain the mathematical or hardware flaw (no raw dollar signs in table cells per `ref[repo.docs.markdown-table-math]`). | Quantify the error, drift, aliasing, or CPU budget violation. |
 
 ---
 
@@ -39,3 +39,9 @@ Describe the physical, numerical, or hardware constraint (e.g., `ARM Cortex-A76`
 
 1. **Positive Consequences:** State the verified bound, invariant, or complexity improvement established by the decision.
 2. **Evaluated R&D Alternatives:** Record any secondary R&D candidate formulations evaluated and archived during design exploration.
+
+---
+
+## Amendment Appendix
+
+- **`YYYY-MM-DDTHH:MM:SS±HH:MM`:** State tersely **why** the decision was amended (referencing any companion ADR), leaving detailed diff tracking to `git` and normative specs. Omit this section on unamended ADRs.

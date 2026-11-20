@@ -20,7 +20,7 @@ requirements:
 # ADR-0011: End-to-End Stage Wiring, 256-D Feature Bus Slot Map, Stage Modulation Laws & Arena Slice Directory
 
 > [!NOTE]
-> **Superseded by [`ADR-0022`](0022-sona-state-space-operator-and-webgpu-architecture.md)** (originally superseded by [`ADR-0021`](0021-unified-matryoshka-gru-and-direct-register-stages.md)).
+> **Superseded by [`ADR-0022`](0022-sona-state-space-operator-and-webgpu-architecture.md)** (originally superseded by [`ADR-0021`](0021-superseded-unified-matryoshka-gru-and-direct-register-stages.md)).
 
 This record resolves the end-to-end integration ("glue") specifications connecting the leaf TORA operators (`Op-T`, `Op-M`, `Op-N`), the `3 kHz` parametric control bus, the 256-D 4-tier Kronecker output head, and the 64-byte-aligned `.dnam` tier arenas across [`../specs/dsp/router_and_crossbar_topology.md`](../specs/dsp/router_and_crossbar_topology.md), [`../specs/dsp/parametric_control_bus.md`](../specs/dsp/parametric_control_bus.md), and [`../specs/containers/dnam_binary_format.md`](../specs/containers/dnam_binary_format.md).
 

@@ -63,7 +63,7 @@ stateDiagram-v2
 |   • INPC (640 B INPC Header + fp32)    Shared 2.0-2.5 s (96k-120k) full-bandwidth fp32 dry capsule|
 |   • STMC (128 B STMC Header + fp32)    128 B hdr + R<=36 16 B Trajectory Windows + 4096 B + fp32  |
 |   • STAT (cached trajectories + uploU) StarCenter SONA trajectories + f64 uplo='U' fixed Gram     |
-|   • WGHT (canonical v3.0 .dnam bytes)  Complete [STAB-ZERO-DC] "sona" runtime model (< 0.2 ms)    |
+|   • WGHT (canonical v3.0 .dnam bytes)  "sona" .dnam wrapper around embedded .dnam-bin VM (< 0.2 ms)|
 |   • AUTH (128 B AUTH Record)           Creator signature ("DNPJ-PROJECT-MANIFEST-V3")             |
 +===================================================================================================+
 ```
@@ -140,8 +140,8 @@ Every chunk payload must also satisfy matching CRC-32C and SHA-256 digests over 
 | `DNWB` | 8..12 | 4 | `u32le` | `sample_rate_hz`: Supported 8,000–1,536,000 |
 | `DNWB` | 12..16 | 4 | `u32le` | `num_frames`: Sample frame count |
 | `DNWB` | 16..26 | 10 | `5 × u16le` | `num_input_channels`, `num_output_channels`, `num_controls`, `num_switches`, `num_internal_nodes` |
-| `DNWB` | 26..28 | 2 | `u16le` | `flags`: `1<<0 STRUCTURED_V1`, `1<<1 HAS_TRAJECTORIES`, `1<<2 HAS_FREEZE_WINDOW`, bits 8..11 = `ch_mask` (`popcount(ch_mask)` matches active channels) |
-| `DNWB` | 28..36 | 8 | `u64le` | `payload_byte_len`: `<= MAX_DNWB_PAYLOAD_BYTES` = 64 MiB (67,108,864 B); followed by request (`u16le stem_id_len \|\| stem_id \|\| f32le[ctrl] \|\| u8[sw] \|\| f32le[ch*frames] \|\| opt. (u16le traj_count \|\| f32le[traj_count*frames]) \|\| opt. u64le[2] freeze`) or response (`u16le stem_id_len \|\| stem_id \|\| f32le[out_ch*frames] \|\| internal_nodes`) |
+| `DNWB` | 26..28 | 2 | `u16le` | `flags`: `1<<0 STRUCTURED_V1`, `1<<1 HAS_TRAJECTORIES`, `1<<2 HAS_FREEZE_WINDOW` (white-box fixture hold interval lowered to data-driven `ControlBus` `WE` targets during training), bits 8..11 = `ch_mask` (`popcount(ch_mask)` matches active channels) |
+| `DNWB` | 28..36 | 8 | `u64le` | `payload_byte_len`: `<= MAX_DNWB_PAYLOAD_BYTES` = 64 MiB (67,108,864 B); followed by request (`u16le stem_id_len \|\| stem_id \|\| f32le[ctrl] \|\| u8[sw] \|\| f32le[ch*frames] \|\| opt. (u16le traj_count \|\| f32le[traj_count*frames]) \|\| opt. u64le[2] hold_window`) or response (`u16le stem_id_len \|\| stem_id \|\| f32le[out_ch*frames] \|\| internal_nodes`) |
 | `DNWB` | 36..64 | 28 | `u8[28]` | `reserved`: All `0x00` |
 | `DNPR` (256 B) | 0..64 | 64 | `16 × u32le` | Words 0..16: `w[0..7]` (`w[0] seq` odd=writing/even=consistent, `w[1] status\|phase<<8\|tier<<16\|permille<<20`, `w[2] step\|total<<16`, `w[3] stg_step\|stg_total<<16`, `w[4] best_loss f32`, `w[5] mr_iir f32`, `w[6] clamped_ctrls\|vis<<16`), `w[7..11] tier_besr_db[4]`, `w[11..15] tier_ltas_db[4]`, `w[15] = PROGRESS_MAGIC_DNPR = 0x444E_5052` |
 | `DNPR` | 64..256 | 192 | `48 × u32le` | Words 16..64: 16..32 `target_wave_i8[64]`, 32..48 `model_wave_i8[64]`, 48..56 `ltas_error_q20_i8[32]` (0.05 dB/step, ±6.35 dB), 56..64 `kautz_poles_q8[16]` (`16 × (r_u8, f_u8)`) |
@@ -177,7 +177,7 @@ Trained and signed containers add `HAS_STAT`, `HAS_WGHT`, and `HAS_AUTH` to trac
 | Lifecycle State | Embedded Chunks | Key Behavioral Invariant |
 | :--- | :--- | :--- |
 | Active Capture | `CALB` + `SPCM` + `INPC`/`STMC` | Retains lossless raw `SPCM` stems alongside extracted `INPC`/`STMC` capsules during active recording |
-| Trained Full Project | `+ STAT + WGHT` (+ optional `AUTH`) | Embeds `StarCenter` `uplo='U'` sufficient statistics (`STAT`) and certified 4-tier v3.0 `.dnam` runtime weights (`WGHT`) |
+| Trained Full Project | `+ STAT + WGHT` (+ optional `AUTH`) | Embeds `StarCenter` `uplo='U'` sufficient statistics (`STAT`) and certified 4-tier v3.0 `.dnam` weights (`WGHT`, wrapping the compiled `.dnam-bin` `"DNBN"` register program) |
 | Capsule Compaction | Strips `SPCM`, keeps `INPC`/`STMC`/`STAT`/`WGHT` | Requires `INPC`/`STMC` whenever `stems_registry` is non-empty; preserves `PROJ_FLAG_COMPACTED_CAPSULES` across capsule edits and shrinks multi-stem projects to 0.8–2.5 MB for full re-pooling and export (REQ-3.1, REQ-3.3) |
 
 ---
@@ -265,15 +265,15 @@ At active tier readout dimension $D_T$ (fixed per tier), `STAT` packs $D_T(D_T +
 
 `r[container.proj.wght-and-export]`
 
-Every trained v3.0 `.dnam-proj` embeds a complete, self-contained v3.0 (`"architecture": "sona"`) `.dnam` byte stream inside its `WGHT` chunk (`chunk_id = 0`, spanning from the 64-byte Container Preamble through the 16-byte Mutable Trailer Footer; see [dnam_binary_format.md](dnam_binary_format.md)).
+Every trained v3.0 `.dnam-proj` embeds a complete, self-contained v3.0 (`"architecture": "sona"`) `.dnam` byte stream inside its `WGHT` chunk (`chunk_id = 0`), wrapping the compiled Layer 0 `.dnam-bin` (`"DNBN"`) VM register image together with the shell JCS header, security tables, and mutable trailer footer; see [dnam_binary_format.md](dnam_binary_format.md).
 
 Container assembly and validation enforce `[STAB-ZERO-DC]` invariants across Arena 0..3 (`b_head == 0.0`, resting DC <= 1e-5), rejecting non-zero DC bias payloads immediately.
 
-Runtime `.dnam` export completes in < 0.2 ms at any target tier (Lite, Full, Pro, or Ultra) with zero solver recomputation.
+Runtime `.dnam` export completes in < 0.2 ms at any target tier (Lite, Full, Pro, or Ultra) with zero solver recomputation, and can also yield the bare Layer 0 `.dnam-bin` register program directly from the embedded wrapper.
 
 Export validates `DistributionPolicy` and merges mutable `presets`, `user_metadata`, `stem_user_metadata`, and `controls_schema[*].user_metadata` into the `DMU1` suffix, growing compact 48 B frames up to the 4,096 B mutable `DMU1` + `DMUE` trailer ceiling.
 
-Export then applies lossless keyless prefix truncation (`ref[container.dnam.tier-prefix]`), retaining self-contained 1×-calibrated Arena 0 controls and Lite `CP1`/`W_readout` slices without re-signing.
+Export then applies lossless keyless prefix truncation (`ref[container.dnam.tier-prefix]`), slicing both the shell prefix and the embedded `.dnam-bin` payload at its immutable `tier_end_offsets[t]` while retaining self-contained 1×-calibrated Arena 0 controls and Lite `CP1`/`W_readout` slices without re-signing.
 
 ### 3.2 Cryptographic Provenance Envelope (`AUTH`)
 
