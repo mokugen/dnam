@@ -45,13 +45,13 @@ const MAX_CODY_WAITE_RAD: f32 = 65_536.0;
 const REDUCED_QUADRANT_GUARD_RAD: f32 = 0.85;
 
 /// Degree-5 Hermite quarter-sine coefficient `c1 = pi / 2` (`ref[dsp.op-m.rotor.q0-192-lfo]`).
-const HERMITE5_C1: f32 = core::f32::consts::FRAC_PI_2;
+const HERMITE5_C1: f32 = crate::simd::HERMITE5_SIN_C1_F32;
 
 /// Degree-5 Hermite quarter-sine coefficient `c3 = pi - 2.5`.
-const HERMITE5_C3: f32 = core::f32::consts::PI - 2.5;
+const HERMITE5_C3: f32 = crate::simd::HERMITE5_SIN_C3_F32;
 
 /// Degree-5 Hermite quarter-sine coefficient `c5 = pi / 2 - 1.5`.
-const HERMITE5_C5: f32 = core::f32::consts::FRAC_PI_2 - 1.5;
+const HERMITE5_C5: f32 = crate::simd::HERMITE5_SIN_C5_F32;
 
 /// Compile-time Taylor inverse factorial `(-1)^neg / n!` computed purely in `f32`
 /// (`ref[repo.code.constant-eval-and-derivations]`).
@@ -106,6 +106,14 @@ fn round_ties_even_small_f32(x: f32) -> f32 {
 fn hermite5_quarter_sine(u: f32) -> f32 {
     let u2 = u * u;
     u * (HERMITE5_C1 + u2 * (-HERMITE5_C3 + u2 * HERMITE5_C5))
+}
+
+/// Evaluates quadrature `(cos, sin)` on a single `Q0.32` phase word via quadrant-folded
+/// degree-5 Hermite sine (`ref[dsp.op-m.rotor.q0-192-lfo]`).
+#[inline(always)]
+#[must_use]
+pub fn eval_q32_quadrature_f32(phase: u32) -> (f32, f32) {
+    eval_q32_lane(phase)
 }
 
 #[inline(always)]
@@ -268,6 +276,30 @@ impl PhasorQ32Bank4 {
         let (cos_arr, sin_arr) = self.step_quadrature();
         (V::from_array(cos_arr), V::from_array(sin_arr))
     }
+
+    /// Returns the `OS2X`-halved unsigned `Q0.32` phase increments (`inc >> 1`, `ref[dsp.op-m.rotor.q0-192-lfo]`).
+    #[inline(always)]
+    #[must_use]
+    pub const fn halved_increments(&self) -> [u32; 4] {
+        [
+            self.inc[0] >> 1,
+            self.inc[1] >> 1,
+            self.inc[2] >> 1,
+            self.inc[3] >> 1,
+        ]
+    }
+
+    /// Evaluates all 4 quadrature lanes and advances phases by caller-supplied `Q0.32` increments
+    /// (`inc >> 1` at `OS2X`, `ref[dsp.op-m.rotor.q0-192-lfo]`).
+    #[inline(always)]
+    pub fn step_with_inc_vec4<V: KernelVec4>(&mut self, inc_q32: [u32; 4]) -> (V, V) {
+        let (cos_arr, sin_arr) = self.eval_quadrature();
+        self.phase[0] = self.phase[0].wrapping_add(inc_q32[0]);
+        self.phase[1] = self.phase[1].wrapping_add(inc_q32[1]);
+        self.phase[2] = self.phase[2].wrapping_add(inc_q32[2]);
+        self.phase[3] = self.phase[3].wrapping_add(inc_q32[3]);
+        (V::from_array(cos_arr), V::from_array(sin_arr))
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +377,14 @@ mod tests {
         let (cc, cs) = corners.step_quadrature();
         assert_eq!(cc, [1.0, 0.0, -1.0, 0.0]);
         assert_eq!(cs, [0.0, 1.0, 0.0, -1.0]);
+
+        let mut os2x_bank = PhasorQ32Bank4::new([0; 4], [4, 8, 16, 32]);
+        let half = os2x_bank.halved_increments();
+        assert_eq!(half, [2, 4, 8, 16]);
+        let (c0, s0) = os2x_bank.step_with_inc_vec4::<GpuVec4>(half);
+        assert_eq!(c0.to_array(), [1.0; 4]);
+        assert_eq!(s0.to_array(), [0.0; 4]);
+        assert_eq!(os2x_bank.phase, [2, 4, 8, 16]);
     }
 
     proptest! {

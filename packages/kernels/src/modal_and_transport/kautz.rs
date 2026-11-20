@@ -8,7 +8,7 @@
 
 pub mod rotor_and_phasor;
 
-pub use rotor_and_phasor::{PhasorQ32Bank4, algebraic_unit_rotor_f32};
+pub use rotor_and_phasor::{PhasorQ32Bank4, algebraic_unit_rotor_f32, eval_q32_quadrature_f32};
 
 use crate::simd::{
     KernelVec4, MAX_PARALRU_R_F32, StereoVec8, flush_subnormal_f32_bits, scrub_and_flush_f32_bits,

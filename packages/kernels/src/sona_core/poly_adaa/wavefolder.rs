@@ -4,10 +4,7 @@
 
 use crate::simd::{KernelVec4, StereoVec8};
 
-use super::{
-    ONE_FIFTH, ONE_THIRD, SegmentGeom4, SegmentGeom8, TINY_CROSSING_EPS, all_lanes_le_one_stereo8,
-    all_lanes_le_one_vec4,
-};
+use super::{ONE_FIFTH, ONE_THIRD, SegmentGeom4, SegmentGeom8, TINY_CROSSING_EPS};
 
 const ONE_SEVENTH: f32 = 1.0 / 7.0;
 const ONE_NINTH: f32 = 1.0 / 9.0;
@@ -110,9 +107,6 @@ pub fn eval_c2_wavefolder_adaa_vec4<V: KernelVec4>(u_prev: V, u_curr: V) -> (V, 
     let geom = SegmentGeom4::from_endpoints(u_prev, u_curr);
     let (wf_odd_int, wf_even_int) =
         eval_c2_wf_interior_vec4(geom.m, geom.m2, geom.d2, geom.max_abs);
-    if all_lanes_le_one_vec4(geom.max_abs) {
-        return (wf_odd_int, wf_even_int);
-    }
 
     let zero = V::zero();
     let one = V::splat(1.0);
@@ -154,9 +148,6 @@ pub fn eval_c2_wavefolder_adaa_stereo8<S: StereoVec8>(u_prev: S, u_curr: S) -> (
     let geom = SegmentGeom8::from_endpoints(u_prev, u_curr);
     let (wf_odd_int, wf_even_int) =
         eval_c2_wf_interior_stereo8(geom.m, geom.m2, geom.d2, geom.max_abs);
-    if all_lanes_le_one_stereo8(geom.max_abs) {
-        return (wf_odd_int, wf_even_int);
-    }
 
     let zero = S::zero();
     let one = S::splat(1.0);
@@ -330,6 +321,65 @@ mod tests {
                 prop_assert!((pos_o as f64 - exp_o).abs() < 2.0e-5);
                 prop_assert!((e_l.to_array()[idx] as f64 - exp_e).abs() < 2.0e-5);
             }
+        }
+    }
+
+    /// verify[dsp.op-n.wavefolder.cubic-c2]
+    #[test]
+    fn test_c2_wavefolder_interior_0ulp_equivalence() {
+        let pairs: [([f32; 4], [f32; 4]); 4] = [
+            ([-1.0, -0.5, 0.0, 0.25], [-0.5, 0.5, 0.0, 0.75]),
+            (
+                [-0.0, 1.0, -0.999_9, 0.5],
+                [0.0, 1.0, 0.999_9, 0.5 + 1.0e-7],
+            ),
+            ([-0.75, -0.25, 0.125, -0.1], [-0.75, 0.25, -0.125, 0.9]),
+            ([-1.0, 1.0, -0.5, 0.0], [-1.0, 1.0, -0.5, 1.0]),
+        ];
+        for (idx, &(u_prev_arr, u_curr_arr)) in pairs.iter().enumerate() {
+            let u_prev = GpuVec4::from_array(u_prev_arr);
+            let u_curr = GpuVec4::from_array(u_curr_arr);
+            let geom = SegmentGeom4::from_endpoints(u_prev, u_curr);
+            let (int_odd, int_even) =
+                eval_c2_wf_interior_vec4(geom.m, geom.m2, geom.d2, geom.max_abs);
+            let (out_odd, out_even) = eval_c2_wavefolder_adaa_vec4(u_prev, u_curr);
+            assert_eq!(
+                out_odd.to_array().map(f32::to_bits),
+                int_odd.to_array().map(f32::to_bits),
+                "0-ULP odd mismatch at vec4 case {idx}"
+            );
+            assert_eq!(
+                out_even.to_array().map(f32::to_bits),
+                int_even.to_array().map(f32::to_bits),
+                "0-ULP even mismatch at vec4 case {idx}"
+            );
+
+            let prev_st = InterleavedStereo8::from_lr(u_prev, u_curr);
+            let curr_st = InterleavedStereo8::from_lr(u_curr, u_prev);
+            let geom8 = SegmentGeom8::from_endpoints(prev_st, curr_st);
+            let (int_odd8, int_even8) =
+                eval_c2_wf_interior_stereo8(geom8.m, geom8.m2, geom8.d2, geom8.max_abs);
+            let (out_odd8, out_even8) = eval_c2_wavefolder_adaa_stereo8(prev_st, curr_st);
+            let (ol, or) = out_odd8.into_lr();
+            let (iol, ior) = int_odd8.into_lr();
+            let (el, er) = out_even8.into_lr();
+            let (iel, ier) = int_even8.into_lr();
+            assert_eq!(
+                ol.to_array().map(f32::to_bits),
+                iol.to_array().map(f32::to_bits)
+            );
+            assert_eq!(
+                or.to_array().map(f32::to_bits),
+                ior.to_array().map(f32::to_bits)
+            );
+            assert_eq!(
+                el.to_array().map(f32::to_bits),
+                iel.to_array().map(f32::to_bits)
+            );
+            assert_eq!(
+                er.to_array().map(f32::to_bits),
+                ier.to_array().map(f32::to_bits)
+            );
         }
     }
 }

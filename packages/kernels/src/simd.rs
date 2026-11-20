@@ -9,6 +9,7 @@
 pub mod const_eval;
 pub mod fp16;
 pub mod gpu_vec4;
+pub mod op_constants;
 pub mod stereo8;
 
 pub use const_eval::{
@@ -20,6 +21,12 @@ pub use fp16::{
     f32_to_fp16, f32_to_fp16_u32, fp16_to_f32, fp16_u32_to_f32, pack_fp16x2_u32, unpack_fp16x2_u32,
 };
 pub use gpu_vec4::GpuVec4;
+pub use op_constants::{
+    HERMITE5_SIN_C1_F32, HERMITE5_SIN_C3_F32, HERMITE5_SIN_C5_F32, Q32_INV_2POW31_F32,
+    Q32_INV_2POW32_F32, TANK_MAX_G_LIN_BITS, TANK_MAX_G_LIN_F32, TANK_MAX_V_CEIL_BITS,
+    TANK_MAX_V_CEIL_F32, const_f32_pow2, exp2_clamped16_f32, os2x_midpoint_f32x4,
+    os2x_midpoint_vec4,
+};
 pub use stereo8::{InterleavedStereo8, StereoVec8};
 
 /// IEEE-754 `1.5 * 2^23` (`12_582_912.0`) magic integer-rounding bias (`0x4B40_0000`).
@@ -416,14 +423,14 @@ pub trait KernelVec4: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
         y.mul(three_halves.fms(half_d, y.mul(y)))
     }
 
-    /// Fast base-2 exponential `2^clamp(self, -5.0, 5.0)` (`< 2.5e-7`, `ref[dsp.op-n.polyadaa.midpoint]`).
+    /// Evaluates `2^x` for an already clamped input `x` via biased-integer splitting and
+    /// degree-5 minimax Horner polynomial (`ref[dsp.op-n.polyadaa.midpoint]`).
     #[inline(always)]
-    fn exp2_clamped5(self) -> Self {
-        let x = self.clamp(Self::splat(-5.0), Self::splat(5.0));
+    fn exp2_from_clamped(self) -> Self {
         let magic = Self::splat(BIASED_INT_MAGIC_F32);
-        let k_biased = x.add(magic);
+        let k_biased = self.add(magic);
         let k = k_biased.sub(magic);
-        let f = x.sub(k);
+        let f = self.sub(k);
         let pow2_k = k_biased.pow2_from_biased_int_bits();
         let poly = Self::splat(EXP2_C4).fma(Self::splat(EXP2_C5), f);
         let poly = Self::splat(EXP2_C3).fma(poly, f);
@@ -431,6 +438,20 @@ pub trait KernelVec4: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
         let poly = Self::splat(core::f32::consts::LN_2).fma(poly, f);
         let poly = Self::splat(1.0).fma(poly, f);
         pow2_k.mul(poly)
+    }
+
+    /// Fast base-2 exponential `2^clamp(self, -5.0, 5.0)` (`< 2.5e-7`, `ref[dsp.op-n.polyadaa.midpoint]`).
+    #[inline(always)]
+    fn exp2_clamped5(self) -> Self {
+        self.clamp(Self::splat(-5.0), Self::splat(5.0))
+            .exp2_from_clamped()
+    }
+
+    /// Wide-range base-2 exponential `2^clamp(self, -16.0, 16.0)` (`ref[dsp.op-n.bitcrusher.quantizer]`).
+    #[inline(always)]
+    fn exp2_clamped16(self) -> Self {
+        self.clamp(Self::splat(-16.0), Self::splat(16.0))
+            .exp2_from_clamped()
     }
 }
 

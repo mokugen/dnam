@@ -5,9 +5,16 @@
 //! - [`paralru`]: Contractive `1D` scalar `ParaLRU` step, zero-DC soft rectifier, exact forward tile, & `O(log2 N)` linear adjoint scan.
 //! - [`poly_adaa`]: Pure-`f32` divided-difference `PolyADAA1` and $C^2$ wavefolder kernels.
 
+pub mod op_n_pre;
 pub mod paralru;
 pub mod poly_adaa;
 pub mod tpt_svf;
+
+pub use op_n_pre::{
+    OP_N_PRE_BETA_BYPASS_EPS, OP_N_PRE_FULL_PASS_THRESH, OP_N_PRE_MAX_BETA_Q,
+    OP_N_PRE_MAX_ZOH_HOLD_DEPTH, OP_N_PRE_MIN_RHO_EFF, OP_N_PRE_QUANT_CLAMP_F32, OpNPreHoisted,
+    OpNPreHotState, compute_op_n_pre_inc_q32, quantize_nearest_step_f32,
+};
 
 use crate::simd::{KernelVec4, MAX_PARALRU_R_F32, StereoVec8};
 
