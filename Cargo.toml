@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["packages/kernels", "packages/engine", "packages/capture", "packages/fixtures", "packages/js", "packages/studio"]
-default-members = ["packages/kernels", "packages/engine", "packages/capture", "packages/fixtures", "packages/studio"]
+members = ["packages/kernels", "packages/vm", "packages/engine", "packages/capture", "packages/fixtures", "packages/js", "packages/studio"]
+default-members = ["packages/kernels", "packages/vm", "packages/engine", "packages/capture", "packages/fixtures", "packages/studio"]
 
 [workspace.package]
 version = "0.1.0"
@@ -72,6 +72,9 @@ opt-level = 2
 [profile.dev.package.dnam-kernels]
 opt-level = 3
 
+[profile.dev.package.dnam-vm]
+opt-level = 3
+
 [profile.dev.package.dnam-engine]
 opt-level = 3
 
@@ -87,6 +90,9 @@ codegen-units = 8
 debug = "line-tables-only"
 
 [profile.test.package.dnam-kernels]
+opt-level = 3
+
+[profile.test.package.dnam-vm]
 opt-level = 3
 
 [profile.test.package.dnam-engine]
@@ -107,6 +113,9 @@ strip = "none"
 incremental = false
 
 [profile.cov.package.dnam-kernels]
+opt-level = 3
+
+[profile.cov.package.dnam-vm]
 opt-level = 3
 
 [profile.cov.package.dnam-engine]

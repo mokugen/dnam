@@ -1,0 +1,28 @@
+[package]
+name = "dnam-vm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+autobins = false
+description = "Pure Rust #![no_std] + !alloc-capable zero-JSON SONA v3.0 real-time virtual machine (.dnam-bin loader, ControlBus, and multi-ISA f32 SIMD backend)"
+
+[lib]
+name = "dnam_vm"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = ["alloc", "zerocopy/std"]
+alloc = ["zerocopy/alloc"]
+
+[dependencies]
+dnam-kernels.workspace = true
+zerocopy.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

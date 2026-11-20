@@ -1,0 +1,151 @@
+$schema: "https://moonrepo.dev/schemas/project.json"
+
+id: "vm"
+language: "rust"
+layer: "library"
+stack: "systems"
+tags:
+  - "rust"
+  - "dsp"
+  - "simd"
+  - "vm"
+
+project:
+  name: "dnam-vm"
+  description: "Pure Rust #![no_std] + !alloc-capable zero-JSON SONA v3.0 real-time virtual machine"
+
+dependsOn:
+  - "kernels"
+
+tasks:
+  format:
+    type: "run"
+    command: "cargo"
+    args:
+      - "fmt"
+      - "--package"
+      - "dnam-vm"
+    options:
+      cache: false
+      runInCI: false
+    tags:
+      - "format"
+
+  format-check:
+    command: "cargo"
+    args:
+      - "fmt"
+      - "--package"
+      - "dnam-vm"
+      - "--"
+      - "--check"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+    tags:
+      - "quality"
+      - "format"
+
+  lint:
+    command: "cargo"
+    args:
+      - "clippy"
+      - "--package"
+      - "dnam-vm"
+      - "--all-targets"
+      - "--"
+      - "-D"
+      - "warnings"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+    options:
+      mutex: "cargo"
+    tags:
+      - "quality"
+      - "lint"
+
+  typecheck:
+    command: "cargo"
+    args:
+      - "check"
+      - "--package"
+      - "dnam-vm"
+      - "--all-targets"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+    options:
+      mutex: "cargo"
+    tags:
+      - "quality"
+      - "typecheck"
+
+  build:
+    type: "build"
+    command: "cargo"
+    args:
+      - "build"
+      - "--package"
+      - "dnam-vm"
+      - "--release"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+    options:
+      mutex: "cargo"
+    tags:
+      - "build"
+
+  test:
+    command: "cargo"
+    args:
+      - "test"
+      - "--package"
+      - "dnam-vm"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+    options:
+      mutex: "cargo"
+    tags:
+      - "test"
+
+  coverage:
+    type: "run"
+    command: "pnpm"
+    args:
+      - "run"
+      - "rust-coverage"
+      - "--"
+      - "--package"
+      - "dnam-vm"
+      - "--sources"
+      - "packages/vm/src"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+      - "/package.json"
+      - "/scripts/rust-coverage.mjs"
+    options:
+      mutex: "cargo"
+      runFromWorkspaceRoot: true
+      runInCI: "skip"
+    tags:
+      - "coverage"

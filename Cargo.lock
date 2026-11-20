@@ -1386,6 +1386,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dnam-vm"
+version = "0.1.0"
+dependencies = [
+ "dnam-kernels",
+ "proptest",
+ "zerocopy",
+]
+
+[[package]]
 name = "document-features"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"

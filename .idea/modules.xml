@@ -5,6 +5,7 @@
       <module fileurl="file://$PROJECT_DIR$/.idea/dnam-capture.iml" filepath="$PROJECT_DIR$/.idea/dnam-capture.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/dnam-fixtures.iml" filepath="$PROJECT_DIR$/.idea/dnam-fixtures.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/dnam-kernels.iml" filepath="$PROJECT_DIR$/.idea/dnam-kernels.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/dnam-vm.iml" filepath="$PROJECT_DIR$/.idea/dnam-vm.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/dnam-workspace.iml" filepath="$PROJECT_DIR$/.idea/dnam-workspace.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/engine.iml" filepath="$PROJECT_DIR$/.idea/engine.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/js.iml" filepath="$PROJECT_DIR$/.idea/js.iml" />

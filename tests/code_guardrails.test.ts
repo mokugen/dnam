@@ -64,9 +64,57 @@ function checkTsAndMjsTypeSafety(): void {
   expect(tsViolations).toEqual([]);
 }
 
+function collectJsUnsafeViolations(
+  unsafeOverrideRe: RegExp,
+  unsafeConstructRe: RegExp,
+  unsafeBlockRe: RegExp,
+  unsafeViolations: string[],
+): void {
+  for (const rsFile of walkFilesByExtensions(path.join(PACKAGES_DIR, "js"), new Set([".rs"]))) {
+    const rel = relPath(rsFile);
+    const stripped = stripRustCommentsAndStrings(fs.readFileSync(rsFile, "utf8"));
+    const isWasmExport =
+      rel === "packages/js/rust/wasm.rs" ||
+      (rel.startsWith("packages/js/rust/wasm/") && rel !== "packages/js/rust/wasm/abi.rs");
+    if (unsafeBlockRe.test(stripped)) {
+      unsafeViolations.push(`${rel}: contains forbidden unsafe block or item`);
+    }
+    if (!isWasmExport && (unsafeOverrideRe.test(stripped) || unsafeConstructRe.test(stripped))) {
+      unsafeViolations.push(`${rel}: contains forbidden unsafe_code override or #[unsafe(...)]`);
+    }
+  }
+}
+
+function collectVmUnsafeViolations(
+  unsafeOverrideRe: RegExp,
+  unsafeConstructRe: RegExp,
+  unsafeViolations: string[],
+): void {
+  for (const rsFile of walkFilesByExtensions(path.join(PACKAGES_DIR, "vm"), new Set([".rs"]))) {
+    const rel = relPath(rsFile).split(path.sep).join("/");
+    const stripped = stripRustCommentsAndStrings(fs.readFileSync(rsFile, "utf8"));
+    const isAllowedUnsafeMod =
+      rel === "packages/vm/src/types/fp_env.rs" ||
+      rel.startsWith("packages/vm/src/math/aarch64/") ||
+      rel.startsWith("packages/vm/src/math/x86/");
+    const isAllowedAllowAttr =
+      isAllowedUnsafeMod || rel === "packages/vm/src/types.rs" || rel === "packages/vm/src/math.rs";
+    if (!isAllowedUnsafeMod && unsafeConstructRe.test(stripped)) {
+      unsafeViolations.push(`${rel}: contains forbidden unsafe block or item`);
+    }
+    if (!isAllowedAllowAttr && unsafeOverrideRe.test(stripped)) {
+      unsafeViolations.push(`${rel}: contains forbidden unsafe_code override`);
+    }
+  }
+}
+
 function checkRustUnsafeIsolation(): void {
   const forbidOrDenyRe = /#\s*!\s*\[\s*(?:forbid|deny)\s*\(\s*unsafe_code\s*\)\s*\]/;
-  for (const rustLibRel of ["packages/engine/src/lib.rs", "packages/js/rust/lib.rs"]) {
+  for (const rustLibRel of [
+    "packages/vm/src/lib.rs",
+    "packages/engine/src/lib.rs",
+    "packages/js/rust/lib.rs",
+  ]) {
     const libPath = path.join(REPO_ROOT, rustLibRel);
     expect(fs.existsSync(libPath), `${rustLibRel} must exist`).toBe(true);
     expect(forbidOrDenyRe.test(stripRustCommentsAndStrings(fs.readFileSync(libPath, "utf8")))).toBe(
@@ -112,19 +160,8 @@ function checkRustUnsafeIsolation(): void {
       }
     }
   }
-  for (const rsFile of walkFilesByExtensions(path.join(PACKAGES_DIR, "js"), new Set([".rs"]))) {
-    const rel = relPath(rsFile);
-    const stripped = stripRustCommentsAndStrings(fs.readFileSync(rsFile, "utf8"));
-    const isWasmExport =
-      rel === "packages/js/rust/wasm.rs" ||
-      (rel.startsWith("packages/js/rust/wasm/") && rel !== "packages/js/rust/wasm/abi.rs");
-    if (unsafeBlockRe.test(stripped)) {
-      unsafeViolations.push(`${rel}: contains forbidden unsafe block or item`);
-    }
-    if (!isWasmExport && (unsafeOverrideRe.test(stripped) || unsafeConstructRe.test(stripped))) {
-      unsafeViolations.push(`${rel}: contains forbidden unsafe_code override or #[unsafe(...)]`);
-    }
-  }
+  collectJsUnsafeViolations(unsafeOverrideRe, unsafeConstructRe, unsafeBlockRe, unsafeViolations);
+  collectVmUnsafeViolations(unsafeOverrideRe, unsafeConstructRe, unsafeViolations);
   expect(unsafeViolations).toEqual([]);
 }
 
@@ -132,6 +169,7 @@ function checkPackageLineCeilings(): void {
   const violations: string[] = [];
   const targets: Array<{ dir: string; exts: Set<string> }> = [
     { dir: path.join(PACKAGES_DIR, "kernels"), exts: new Set([".rs"]) },
+    { dir: path.join(PACKAGES_DIR, "vm"), exts: new Set([".rs"]) },
     { dir: path.join(PACKAGES_DIR, "engine"), exts: new Set([".rs"]) },
     { dir: path.join(PACKAGES_DIR, "fixtures"), exts: new Set([".rs"]) },
     { dir: path.join(PACKAGES_DIR, "capture"), exts: new Set([".rs"]) },
@@ -167,7 +205,11 @@ function scanRustProdLines(
   }
 }
 
-function scanKernelsBottomTestsAnd64Bit(rsPath: string, violations: string[]): void {
+function scanBottomTestsAndTypes(
+  rsPath: string,
+  forbid64BitNonSpirv: boolean,
+  violations: string[],
+): void {
   const rel = relPath(rsPath);
   const raw = fs.readFileSync(rsPath, "utf8");
   const commentFreeLines = stripRustCommentsOnly(raw).split("\n");
@@ -203,7 +245,7 @@ function scanKernelsBottomTestsAnd64Bit(rsPath: string, violations: string[]): v
     ) {
       continue;
     }
-    if (forbiddenTypeRe.test(sLine)) {
+    if (forbid64BitNonSpirv && forbiddenTypeRe.test(sLine)) {
       violations.push(`${rel}:${idx + 1}: forbidden 64/128-bit type in GPU kernel: ${trimmed}`);
     }
   }
@@ -384,12 +426,13 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
 
   it("test_engine_realtime_no_libm_or_float_rem_euclid", () => {
     const engineSrcDir = path.join(PACKAGES_DIR, "engine", "src");
+    const vmSrcDir = path.join(PACKAGES_DIR, "vm", "src");
     const kernelsSrcDir = path.join(PACKAGES_DIR, "kernels", "src");
     const forbiddenCallRe =
       /\.(?:rem_euclid|sin|cos|tan|asin|acos|atan|atan2|sinh|cosh|tanh|exp|exp2|ln|log2|log10|powf|powi|sqrt|cbrt|hypot)\s*\(/;
     const violations: string[] = [];
 
-    for (const srcDir of [engineSrcDir, kernelsSrcDir]) {
+    for (const srcDir of [engineSrcDir, vmSrcDir, kernelsSrcDir]) {
       for (const rsPath of walkFilesByExtensions(srcDir, new Set([".rs"]))) {
         const base = path.basename(rsPath);
         if (base === "test_support.rs") continue;
@@ -401,24 +444,32 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
       }
     }
     for (const rsPath of walkFilesByExtensions(kernelsSrcDir, new Set([".rs"]))) {
-      scanKernelsBottomTestsAnd64Bit(rsPath, violations);
+      scanBottomTestsAndTypes(rsPath, true, violations);
+    }
+    for (const rsPath of walkFilesByExtensions(vmSrcDir, new Set([".rs"]))) {
+      scanBottomTestsAndTypes(rsPath, false, violations);
     }
     expect(violations).toEqual([]);
   });
 
   it("test_engine_no_coverage_off_or_simd_macros", () => {
     const engineSrcDir = path.join(PACKAGES_DIR, "engine", "src");
+    const vmSrcDir = path.join(PACKAGES_DIR, "vm", "src");
     const kernelsSrcDir = path.join(PACKAGES_DIR, "kernels", "src");
     const violations: string[] = [];
 
-    for (const srcDir of [engineSrcDir, kernelsSrcDir]) {
+    for (const srcDir of [engineSrcDir, vmSrcDir, kernelsSrcDir]) {
       for (const rsPath of walkFilesByExtensions(srcDir, new Set([".rs"]))) {
         if (fs.readFileSync(rsPath, "utf8").includes("coverage(off)")) {
           violations.push(`${relPath(rsPath)}: contains forbidden coverage(off)`);
         }
       }
     }
-    for (const simdDir of [path.join(engineSrcDir, "math"), path.join(kernelsSrcDir, "simd")]) {
+    for (const simdDir of [
+      path.join(engineSrcDir, "math"),
+      path.join(vmSrcDir, "math"),
+      path.join(kernelsSrcDir, "simd"),
+    ]) {
       for (const rsPath of walkFilesByExtensions(simdDir, new Set([".rs"]))) {
         if (fs.readFileSync(rsPath, "utf8").includes("macro_rules!")) {
           violations.push(`${relPath(rsPath)}: contains forbidden macro_rules! in SIMD modules`);
@@ -433,6 +484,8 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
     const violations: string[] = [];
     for (const safeDir of [
       path.join(PACKAGES_DIR, "kernels", "src"),
+      path.join(PACKAGES_DIR, "vm", "src", "bin"),
+      path.join(PACKAGES_DIR, "vm", "src", "control"),
       path.join(PACKAGES_DIR, "engine", "src", "container"),
       path.join(PACKAGES_DIR, "engine", "src", "control"),
       path.join(PACKAGES_DIR, "engine", "src", "provenance"),
@@ -494,6 +547,10 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
 
     for (const dirPath of [
       path.join(PACKAGES_DIR, "kernels", "src"),
+      path.join(PACKAGES_DIR, "vm", "src", "math"),
+      path.join(PACKAGES_DIR, "vm", "src", "bin"),
+      path.join(PACKAGES_DIR, "vm", "src", "control"),
+      path.join(PACKAGES_DIR, "vm", "tests"),
       path.join(PACKAGES_DIR, "engine", "src", "math"),
       path.join(PACKAGES_DIR, "engine", "src", "operators"),
       path.join(PACKAGES_DIR, "engine", "src", "graph"),

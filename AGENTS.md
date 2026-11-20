@@ -16,16 +16,10 @@
 
 ## 3. Progressive Disclosure & Codebase Discovery Map
 
-| Package / Domain | Package `AGENTS.md` & Contributing | Canonical Documentation (SSOT) |
+| Package / Domain | Scoped `AGENTS.md` & Contributing | Canonical Documentation (SSOT) |
 | :--- | :--- | :--- |
 | **Guardrails (`tests/`)** | [`README.md`](README.md), [`tests/AGENTS.md`](tests/AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) | [`index.md`](docs/index.md), [`project_and_documentation_quality.md`](docs/specs/architecture/project_and_documentation_quality.md) |
-| **Kernels (`packages/kernels/`)** | [`kernels/AGENTS.md`](packages/kernels/AGENTS.md), [`kernels/CONTRIBUTING.md`](packages/kernels/CONTRIBUTING.md) | [`sona_architecture.md`](docs/specs/architecture/sona_architecture.md), [`op_n_paralru_and_polyadaa.md`](docs/specs/dsp/op_n_paralru_and_polyadaa.md) |
-| **Engine (`packages/engine/`)** | [`engine/AGENTS.md`](packages/engine/AGENTS.md), [`engine/CONTRIBUTING.md`](packages/engine/CONTRIBUTING.md) | [`sona_architecture.md`](docs/specs/architecture/sona_architecture.md), [`router_and_crossbar_topology.md`](docs/specs/dsp/router_and_crossbar_topology.md) |
-| **Capture (`packages/capture/`)** | [`capture/AGENTS.md`](packages/capture/AGENTS.md), [`capture/CONTRIBUTING.md`](packages/capture/CONTRIBUTING.md) | [`project_container_format.md`](docs/specs/containers/project_container_format.md), [`webgpu_and_varpro_solver.md`](docs/specs/training/webgpu_and_varpro_solver.md) |
-| **JS (`packages/js/`)** | [`js/AGENTS.md`](packages/js/AGENTS.md), [`js/CONTRIBUTING.md`](packages/js/CONTRIBUTING.md) | [`typescript_sdk.md`](docs/specs/sdks/typescript_sdk.md), [`dnam_binary_format.md`](docs/specs/containers/dnam_binary_format.md) |
-| **UI (`packages/ui/`)** | [`ui/AGENTS.md`](packages/ui/AGENTS.md), [`ui/CONTRIBUTING.md`](packages/ui/CONTRIBUTING.md) | [`control_space_audit.md`](docs/specs/training/control_space_audit.md), [`watermarking_and_marketplace.md`](docs/specs/security/watermarking_and_marketplace.md) |
-| **Studio (`packages/studio/`)** | [`studio/AGENTS.md`](packages/studio/AGENTS.md), [`studio/CONTRIBUTING.md`](packages/studio/CONTRIBUTING.md) | [`capture_and_alignment.md`](docs/specs/training/capture_and_alignment.md), [`project_container_format.md`](docs/specs/containers/project_container_format.md) |
-| **Fixtures (`packages/fixtures/`)** | [`fixtures/AGENTS.md`](packages/fixtures/AGENTS.md), [`fixtures/CONTRIBUTING.md`](packages/fixtures/CONTRIBUTING.md) | [`webgpu_and_varpro_solver.md`](docs/specs/training/webgpu_and_varpro_solver.md), [`capture_and_alignment.md`](docs/specs/training/capture_and_alignment.md) |
+| **Packages (`packages/`)** | [`packages/AGENTS.md`](packages/AGENTS.md) (`kernels`, `vm`, `engine`, `capture`, `js`, `ui`, `studio`, `fixtures`) | [`sona_architecture.md`](docs/specs/architecture/sona_architecture.md), [`rust_sdk.md`](docs/specs/sdks/rust_sdk.md), [`typescript_sdk.md`](docs/specs/sdks/typescript_sdk.md) |
 
 ## 4. Maintaining `AGENTS.md` & Documentation
 

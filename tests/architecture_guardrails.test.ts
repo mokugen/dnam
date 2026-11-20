@@ -123,6 +123,41 @@ function checkCargoAndMoonBoundaries(): void {
   expect(fs.readFileSync(path.join(PACKAGES_DIR, "kernels", "moon.yml"), "utf8")).toMatch(
     /^dependsOn:\s*\[\]\s*$/m,
   );
+
+  const vmCargo = fs.readFileSync(path.join(PACKAGES_DIR, "vm", "Cargo.toml"), "utf8");
+  const vmDepsSec = parseTomlSections(vmCargo).find((s) => s.header === "dependencies");
+  const vmDepKeys = (vmDepsSec?.body ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"))
+    .map((line) => line.split(/[=.]/)[0]?.trim() ?? "")
+    .sort();
+  expect(vmDepKeys, "dnam-vm must depend strictly on dnam-kernels and zerocopy").toEqual([
+    "dnam-kernels",
+    "zerocopy",
+  ]);
+  for (const forbiddenVmDep of [
+    "dnam-engine",
+    "dnam-train",
+    "dnam-capture",
+    "dnam-fixtures",
+    "serde",
+    "serde_json",
+    "ed25519-dalek",
+    "x25519-dalek",
+    "chacha20poly1305",
+    "hpke",
+    "wgpu",
+    "libc",
+  ]) {
+    expect(vmCargo, `dnam-vm Cargo.toml must not reference ${forbiddenVmDep}`).not.toContain(
+      forbiddenVmDep,
+    );
+  }
+  const vmMoon = fs.readFileSync(path.join(PACKAGES_DIR, "vm", "moon.yml"), "utf8");
+  expect(vmMoon).toMatch(/^dependsOn:\s*(?:\[\s*"kernels"\s*\]|\n\s*-\s*"?kernels"?\s*)$/m);
+  expect(vmMoon).not.toContain("fixtures");
+  expect(vmMoon).not.toContain("engine");
   expect(fs.existsSync(path.join(PACKAGES_DIR, "trainer"))).toBe(false);
   expect(
     fs.existsSync(path.join(DOCS_DIR, "specs", "containers", "checkpoint_and_cache_format.md")),
@@ -204,7 +239,7 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
     for (const cargoPath of [
       path.join(REPO_ROOT, "Cargo.toml"),
       path.join(REPO_ROOT, "Cargo.lock"),
-      ...["kernels", "engine", "fixtures", "capture", "studio", "js"].map((pkg) =>
+      ...["kernels", "vm", "engine", "fixtures", "capture", "studio", "js"].map((pkg) =>
         path.join(PACKAGES_DIR, pkg, "Cargo.toml"),
       ),
     ]) {
@@ -212,7 +247,7 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
       expect(text, `${relPath(cargoPath)} must not depend on ndarray`).not.toContain("ndarray");
       expect(text, `${relPath(cargoPath)} must not depend on dialoguer`).not.toContain("dialoguer");
     }
-    for (const pkg of ["kernels", "engine", "capture", "studio", "js"]) {
+    for (const pkg of ["kernels", "vm", "engine", "capture", "studio", "js"]) {
       const text = fs.readFileSync(path.join(PACKAGES_DIR, pkg, "Cargo.toml"), "utf8");
       expect(text).not.toContain("realfft");
       expect(text).not.toContain("rustfft");
@@ -240,6 +275,7 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
       /(?:#\s*\[\s*path\s*=|include(?:_str|_bytes)?\s*!)\s*\(?[^;\n]*fixtures/;
     for (const dir of [
       path.join(PACKAGES_DIR, "kernels"),
+      path.join(PACKAGES_DIR, "vm"),
       path.join(PACKAGES_DIR, "capture", "src"),
       path.join(PACKAGES_DIR, "engine"),
       path.join(PACKAGES_DIR, "studio"),
@@ -427,6 +463,7 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
 
     for (const spec of [
       { pkg: "kernels", crate: "dnam-kernels", sources: "packages/kernels/src" },
+      { pkg: "vm", crate: "dnam-vm", sources: "packages/vm/src" },
       { pkg: "engine", crate: "dnam-engine", sources: "packages/engine/src" },
       { pkg: "fixtures", crate: "dnam-fixtures", sources: "packages/fixtures/src" },
       { pkg: "capture", crate: "dnam-capture", sources: "packages/capture/src" },

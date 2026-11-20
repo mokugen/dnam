@@ -393,6 +393,7 @@ describe("DNAM Documentation Formatting, Links & Progressive Disclosure Guardrai
       REQ_FILE,
       path.join(DOCS_DIR, "index.md"),
       path.join(PACKAGES_DIR, "kernels", "README.md"),
+      path.join(PACKAGES_DIR, "vm", "README.md"),
     ]) {
       collectDocPillViolations(docPath, violations);
     }
