@@ -32,9 +32,9 @@ It specifies < 50 ms Path 1 Vault edits over fixed-dimension `uplo='U'` `STAT` b
 ```mermaid
 flowchart TD
     Edit["Vault Mutation on v3.0 .dnam-proj:<br/>Add / Remove / Replace / Enable-Disable Stem"] --> Gate{"Did StarCenter (s = 0) or<br/>Pass 1/2 SONA Core Change?"}
-    Gate -- "No (Non-Reference Knob/Switch Edit)" --> Fast["Path 1 (< 50 ms Incremental):<br/>Freeze SONA Core & Fixed uplo='U' StarCenter STAT<br/>Fit CP1 + U_int + W_ctrl + W_readout Deltas & Audit"]
+    Gate -- "No (Non-Reference Knob/Switch Edit)" --> Fast["Path 1 (< 50 ms Incremental):<br/>Freeze SONA Core & Fixed uplo='U' StarCenter STAT<br/>Fit CP1 + U_int + W_ctrl/CEXT + stage_latent_* & Audit"]
     Gate -- "Yes (StarCenter Replaced or Basis Drift)" --> Full["Path 2 (Raw-Audio-Free Full Re-Pool):<br/>Replay SPCM or 2.0-2.5s fp32 Capsules<br/>Re-Run Passes 1-5 via WebGPU / CPU SIMD"]
-    Fast --> Audit["Recompute 3-Phase Safety Clamps<br/>+ Update WGHT ([STAB-ZERO-DC])"]
+    Fast --> Audit["Recompute 3-Phase Safety Clamps (32 Slots)<br/>+ Emit .dnam-bin inside WGHT ([STAB-ZERO-DC])"]
     Full --> Audit
 ```
 
@@ -44,21 +44,25 @@ flowchart TD
 
 `r[train.resume.kronecker-reassembly]`
 
-The solver factors 3 kHz control coordinates and crossbar, TPT-SVF, ParaLRU, and `W_readout` modulations $\boldsymbol{\psi}_s$ from cached StarCenter trajectories and fixed-dimension `uplo='U'` readout statistics (`STAT`). Canonically, `PROJ_STAT_BYTES_ULTRA` (267,264 B) packs a 256 × 256 `uplo='U'` Gram matrix plus 256 × 2 stereo cross-correlations in `f64` alongside fp32 `STMC` ([project_container_format.md §2](../containers/project_container_format.md#2-capture-capsules--compositional-sufficient-statistics)).
+Singleton `STAT` (`chunk_id = 0`, 17,664..267,264 B up to `PROJ_STAT_BYTES_ULTRA`) stores the cached `StarCenter` (`s = 0`) `uplo = 'U'` Gram and cross-correlation statistics $(\mathbf{G}_0, \mathbf{C}_0)$ determining static base readout `W_ro,0` ([project_container_format.md §2](../containers/project_container_format.md#2-capture-capsules--compositional-sufficient-statistics)).
 
-Because all four tiers nest inside one fixed `STAT` layout, adding, disabling, removing, or re-recording non-reference control stems updates Lite through Ultra in a single invocation without separate per-tier jobs or capture-time tier resizing (REQ-3.1, REQ-5.3).
+Non-center stems retain compact fp32 `STMC` capsules whose solved 32-slot control targets and `stage_latent_*` sensitivities factor over the 3 kHz control basis $\boldsymbol{\psi}_s$.
+
+Kronecker reassembly and sufficient-statistic updates span both the base 16 rows of `W_ctrl` (`stage_targets[0..16]`) and, whenever `"CEXT"` is present, extended rows 16..31 (`stage_targets[16..32]`, including slot 16 `op_t_we_drive` and slot 30 `router_gate_thresh_delta`, plus Ultra `w_ctrl_ultra_ext`). Because all four tiers nest inside one fixed `STAT` layout, editing non-reference stems updates Lite through Ultra in a single invocation without per-tier jobs or capture-time tier resizing (REQ-3.1, REQ-5.3).
 
 #### Stationary Control-Setting Stem Records
 
 `r[train.resume.constant-factor-records]`
 
-Stems recorded at stationary knob and switch coordinates $(\mathbf{u}_s, \boldsymbol{\sigma}_s)$ retain `uplo = 'U'` $(G_{s,T}, C_{s,T})$ statistics and 2.0–2.5 s fp32 capsules. They re-combine algebraically in host `f64` precision whenever `CP1` Newton/Lobatto control nodes expand (`P -> P + 1`).
+Stationary stems at fixed coordinates $(\mathbf{u}_s, \boldsymbol{\sigma}_s)$ retain 2.0–2.5 s fp32 `STMC` capsules (`spectral_summary_4096` and `band_psd_summary_88`) and cached per-stem 32-slot target vectors, without storing per-stem Gram arrays in `.dnam-proj`.
+
+They re-combine algebraically in host `f64` `uplo = 'U'` control-subspace Cholesky solves whenever `CP1` Newton/Lobatto nodes expand (`U_p -> U_p + 1, K_p -> K_p + 1`), emitting `"CP1\0"` overflow streams in `.dnam-bin` `shared_controls` when exceeding 8 contributors or 576 B in `cp1_base`.
 
 #### Time-Varying Trajectory & Transition Stems
 
 `r[train.resume.time-varying-records]`
 
-Dynamic sweep, commutator, and freeze-transition stems evaluate $\boldsymbol{\psi}_s[k]$ at the 3 kHz control stride over 2.0–2.5 s fp32 `INPC`/`STMC` capsules and `R <= 36` packed 16-byte trajectory window records (`ref[container.proj.stmc-capsule]`) without retaining multi-megabyte raw WAV files.
+Dynamic sweep, commutator, and sustain-hold transition stems evaluate $\boldsymbol{\psi}_s[k]$ at the 3 kHz control stride over 2.0–2.5 s fp32 `INPC`/`STMC` capsules and `R <= 36` packed 16-byte trajectory window records (`ref[container.proj.stmc-capsule]`) without retaining multi-megabyte raw WAV files. Sustain-hold transitions update empirical slot 16 (`op_t_we_drive`) inside `"CEXT"` alongside time-varying operator trajectories.
 
 ### 1.2 Two-Path Vault Editing & Dependency Digests
 
@@ -70,8 +74,8 @@ Vault mutations execute through either an incremental host fast-path or a full c
 
 | Execution Path | Trigger Condition | Execution Scope & Guarantees |
 | :--- | :--- | :--- |
-| Path 1 — Incremental Fast-Path (< 50 ms) | `extracted_physics` and StarCenter (`s = 0`) remain valid across stem addition, removal, replacement, or enablement changes | Freezes SONA core (`TPT-SVF`, `ParaLRU`, `PolyADAA1`) and fixed-dimension `uplo='U'` StarCenter `STAT` (0-ULP StarCenter invariance, REQ-4.2); fits added/edited stem `CP1`, `U_int`, `W_ctrl`, and `W_readout` deltas in host `f64`, runs Phase-1 control-space audit and clamping, and emits updated v3.0 `WGHT` |
-| Path 2 — Full Re-Pool (Zero Raw Audio) | StarCenter is replaced or a new capture invalidates the upstream basis | Re-runs Solver Passes 1–5 over embedded `SPCM` stems or compact 2.0–2.5 s fp32 `INPC` + enabled `STMC` capsules (< 20 MB, REQ-3.3) via 32-bit WebGPU or deterministic CPU SIMD fallback without external WAVs |
+| Path 1 — Incremental Fast-Path (< 50 ms) | `extracted_physics` and StarCenter (`s = 0`) remain valid across stem addition, removal, replacement, or enablement changes | Freezes SONA core (`TPT-SVF`, `ParaLRU`, `PolyADAA1`) and fixed-dimension `uplo='U'` StarCenter `STAT` (0-ULP StarCenter invariance, REQ-4.2); fits added/edited stem `CP1` (inline or `"CP1\0"`), `U_int`, 16-row `W_ctrl` plus optional 1,280 B `"CEXT"` rows 16..31, 40 B `"TSYN"` rows, and `stage_latent_*` sensitivity tables in host `f64` while holding static base `W_ro,0` untouched for exact 0-ULP StarCenter invariance; runs 3-phase clamping (<= 3 inline `cond_rules` per descriptor) and updates `WGHT` wrapping compiled `.dnam-bin` |
+| Path 2 — Full Re-Pool (Zero Raw Audio) | StarCenter is replaced or a new capture invalidates the upstream basis | Re-runs Solver Passes 1–5 over embedded `SPCM` stems or compact 2.0–2.5 s fp32 `INPC` + enabled `STMC` capsules (< 20 MB, REQ-3.3) via <= 15.5 KiB SRAM 32-bit WebGPU or deterministic CPU SIMD fallback without external WAVs, emitting updated `STAT` and `WGHT` (wrapping `.dnam-bin`) |
 
 #### Cryptographic Provenance & Dependency Invalidation
 
@@ -101,11 +105,11 @@ Memory stays below 256 MiB for browser WebGPU, below 64 MiB for CPU SIMD fallbac
 
 All reusable calibration (`CALB`), 2.0–2.5 s fp32 excitation (`INPC`), and per-stem response (`STMC`) capsules reside inside a single < 20 MB v3.0 `.dnam-proj` file (`ref[container.proj.lifecycle-states]`, REQ-3.3).
 
-The same `DNPJ` vault also retains StarCenter `STAT` trajectories, fixed-dimension `uplo='U'` statistics, and runtime `WGHT` weights.
+The same DNPJ vault retains StarCenter `STAT` trajectories, fixed-dimension `uplo='U'` statistics, and runtime `WGHT` weights. Both Path 1 and Path 2 pack the compiled pure-binary Layer-0 .dnam-bin payload (DNBN, DBRM, `shared_controls`, TSYN, optional CEXT, and Arena 0..3) directly inside `WGHT` (`dbin_offset` with Region 4 == 0 B and DCRC `crc_dbin_prefix`).
 
 Capsule compaction strips raw `SPCM` audio chunks in < 1 ms once `INPC` and `STMC` capsules are verified.
 
-Compacted projects preserve full non-destructive stem addition, removal, replacement, and enablement editing alongside < 0.2 ms runtime `.dnam` export, which strips all training-only `CALB`, `INPC`, `STMC`, and `STAT` chunks from the exported v3.0 `.dnam` model.
+Compacted projects preserve full non-destructive stem addition, removal, replacement, and enablement editing alongside < 0.2 ms runtime .dnam export (or direct .dnam-bin slicing), stripping all training-only `CALB`, `INPC`, `STMC`, and `STAT` chunks from the exported v3.0 .dnam model (`ref[container.proj.wght-and-export]`, `ref[container.dnam.vm-binary]`).
 
 ---
 

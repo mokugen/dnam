@@ -61,7 +61,7 @@ The VM crate (`dnam-vm`) compiles cleanly as `#![no_std]` with optional std and 
 | Borrowed `#![no_std]` / `!alloc` Surface | Stack / Caller-Owned Representation in `dnam-vm` |
 | :--- | :--- |
 | **Extended Cabinet FIR & Delay Tails** | `ColdBuf<'a, T>` on `CabinetHighSrFirExt<'a>`, `TankExtStorage::Borrowed*`, and `&'a mut [f32]` `PartitionedSchroederBank` |
-| **Control Bus Parameters & Rules** | Inlined `SonaControlBusParams` inside `SonaColdTail<'a>` plus `ControlBusBacking<'a>` including overflow `ConditionalClampRule` slices |
+| **Control Bus Parameters & Rules** | Inlined `SonaControlBusParams` inside `SonaColdTail<'a>` plus `ControlBusBacking<'a>` over caller-owned descriptor, contributor, and `CP1` overflow slices |
 | **Arena Slab Backing** | `ArenaStorage::Borrowed` slice bindings paired with fixed active-hot cache-line slabs |
 
 `dnam-vm` enforces zero JSON parsing, zero cryptography, and zero 64-bit trainer math, operating strictly as a pure-binary, continuous-4-lane runtime without clean-path crossovers or host freeze flags.
@@ -114,8 +114,8 @@ All shared 32-bit SONA operator math lives in `dnam-kernels` under `packages/ker
 | Shared `dnam-kernels` Module | Normative 32-Bit Primitives & Traits | Target Compilation & Parity |
 | :--- | :--- | :--- |
 | **SIMD, Constants & Codecs (`simd`)** | `KernelVec4`, `GpuVec4`, `StereoVec8`, `const_eval` (`SonaTierSpec`, `LITE_SPEC`..`ULTRA_SPEC`), `OS2X` midpoint helpers, software `fp16` codecs, and subnormal flushing | Identical LLVM CPU vector and `spirv-unknown-naga-wgsl` lowering; zero `f64`/`u64` runtime ops |
-| **SONA Core & Scans (`sona_core`)** | Passive 2×2 TPT-SVF step/compose (`TptScanElem`, `TptAdjointElem`), ParaLRU step/scans (`LinearScanElem`), pure `f32` PolyADAA1 + branchless C² wavefolder + `Op-N[Pre]` + `KernelVec4::rcp_pos_quad_nr2` | Exact 0-ULP CPU ParaLRU forward parity; <= 1.5 ULP/step WGSL FMA operator parity |
-| **Modal & Transport (`modal_and_transport`)** | `KautzQuadState`, `ComplexModalScanElem`, `PhasorQ32Bank4`, orthogonal 4-lane `Op-T` + `WE` + WGSL-safe triangle fold (`((p as i32) >> 31) as u32`) + `coercive_loop_limit_vec4`, stereo 6-pair Elliptic `HilbertH1Kernel`, `T1SubHarmonicKernel` | Shared CPU and GPU physics evaluation (<= 1e-4 * max(1.0, peak) on 256-wide linear scans) |
+| **SONA Core & Scans (`sona_core`)** | Passive 2×2 TPT-SVF step/compose (`TptScanElem`, `TptAdjointElem`), ParaLRU step/scans (`LinearScanElem`), pure `f32` PolyADAA1 + branchless C² wavefolder + `Op-N[Pre]` + `KernelVec4::rcp_pos_quad_nr2` | Exact 0-ULP same-FMA-class CPU ParaLRU forward parity (8-lane stereo == interleaved 4-lane == lane-0 tile); <= 1.5 ULP/step FMA vs non-FMA CPU/WGSL parity |
+| **Modal & Transport (`modal_and_transport`)** | `KautzQuadState`, `ComplexModalScanElem`, `PhasorQ32Bank4`, orthogonal 4-lane `Op-T` + `WE` + WGSL-safe triangle fold (`((p as i32) >> 31) as u32`) + `coercive_loop_limit_vec4`, stereo 6-pair Elliptic `HilbertH1StereoKernel` (248 B stereo kernel used in `SonaLiteHotPrefix`), mono `HilbertH1Kernel`, `T1DcBlockerStereo` (24 B), and `T1SubHarmonicKernel` | Shared CPU and GPU physics evaluation (<= 1e-4 * max(1.0, peak) on 256-wide linear scans) |
 | **Ozaki Integer Slices (`ozaki_i32`)** | `pow2_ceil_fp32`, `round_ties_even_f32`, `slice_f32_mantissa_i8x3`, `accum_ozaki_chunk_i32`, and host `reconstruct_ozaki_dot_f64` | Exact 0-ULP 32-bit `i32` Ozaki contraction parity across WebGPU drivers (REQ-4.2) |
 
 Under the Shared `#![no_std]` Kernels and Checked-In AOT WGSL pipeline, `tools/sona-shaders/` compiles `dnam-kernels` offline via `cargo-gpu` targeting `spirv-unknown-naga-wgsl` and checks in `naga`-validated `.wgsl` compute artifacts for `dnam-train`.
@@ -183,15 +183,18 @@ To keep `SonaVm` working sets strictly inside the 64 KiB L1D limit across 14×/8
 | `SonaUltraHotDelta` | 3,456 B (cum 14,656 B <= 28,672 B) | Incremental lag-ordered FIR history taps 96..128 (256 B) + Ultra core/tiles/Kautz + `quad3` (224 B) |
 | `TankQuadHotCompact` | 224 B (`#[repr(C, align(16))]`) | 64 B DF-I/damp/wet DC states + 32 B `delay_samples`/`ramp_spans_samples` + 56 B scalars incl. Family 4 `vca_env`/`vca_pole` + 72 B `we_hold_off`/Q16/`fp16`/non-colliding `flags: u8` (bit 0 = `QUAD_FLAG_WE_HOLD_ACTIVE`, bit 1 = `QUAD_FLAG_HAS_EXT`, bit 2 = `QUAD_FLAG_HOST_WRITE_LOCK`, bit 3 = `QUAD_FLAG_SCHROEDER_ENABLE`) |
 
-In `dnam-vm`, `ControlBus` expands `stage_targets` (plus `SonaColdTail.last_stage_targets`, `current_stage_params`, and `stage_ramp_deltas`) to `[f32; 32]`. Slots 0..15 retain base stage targets, while slots 16..31 map `"CEXT"` (defaulting to +0.0 when absent):
+In `dnam-vm`, `ControlBus` expands `stage_targets` (plus `SonaColdTail.last_stage_targets`, `current_stage_params`, and `stage_ramp_deltas`) to `[f32; 32]`.
 
-| `ControlBus` `"CEXT"` Slot | Target Field | Signal & Control Meaning |
+Half-open slice `stage_targets[0..16]` (slots 0..=15) retains base stage targets, while `stage_targets[16..32]` (slots 16..=31) maps `"CEXT"` (defaulting to +0.0 when absent):
+
+| `ControlBus` Slot | Target Field | Signal & Control Meaning |
 | :---: | :--- | :--- |
+| 0..=15 | Base stage targets (`svf_g_oct`..`crossbar_wet_mod`) | Core `TPT-SVF`, `PolyADAA1`, `ParaLRU`, Kautz, Tank, and crossbar wet blend |
 | 16 | `op_t_we_drive` | Direct write-enable drive (bypasses micro-ramping; snaps immediately) |
-| 17..21 | `op_t_delay_scale_oct`, `op_t_ramp_rate_hz_delta`, `op_t_lfo_rate_hz_delta`, `op_t_lfo_depth_scale`, `op_t_damp_pole_delta` | Spatial Tank scale, crossfade ramp speed, LFO speed/depth, and damping pole |
-| 22..25 | `op_t_dry_mix_mod`, `op_t_input_gain_mod`, `op_t_window_depth_delta`, `op_t_allpass_g_delta` | Tank wet/dry mix, input drive, pitch window depth, and Schroeder allpass feedback |
-| 26..28 | `op_n_pre_{gamma_bc,zoh_hold,beta_q}_delta` | Pre-core bitcrusher threshold, sample-and-hold depth, and quantization shape |
-| 29..31 | `op_p_phasor_rate_oct`, `router_gate_thresh_delta`, `reserved` | Crossbar quadrature carrier octave offset, gate threshold delta, and reserved (+0.0) |
+| 17..=21 | `op_t_delay_scale_oct`, `op_t_ramp_rate_hz_delta`, `op_t_lfo_rate_hz_delta`, `op_t_lfo_depth_scale`, `op_t_damp_pole_delta` | Spatial Tank scale, crossfade ramp speed, LFO speed/depth, and damping pole |
+| 22..=25 | `op_t_dry_mix_mod`, `op_t_input_gain_mod`, `op_t_window_depth_delta`, `op_t_allpass_g_delta` | Tank wet/dry mix, input drive, pitch window depth, and Schroeder allpass feedback |
+| 26..=28 | `op_n_pre_{gamma_bc,zoh_hold,beta_q}_delta` | Pre-core bitcrusher wet blend, sample-and-hold depth, and log2 quantizer bit-depth |
+| 29..=31 | `op_p_phasor_rate_oct`, `router_gate_thresh_delta`, `reserved` | Crossbar quadrature carrier octave offset, gate threshold delta, and reserved (+0.0) |
 
 `ControlBus` updates execute on every `K_ctrl` boundary whenever controls, tempo entries, internal modulators, dirty state, or analog drift are active.
 

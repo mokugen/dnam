@@ -31,7 +31,7 @@ This specification defines the universal hardware excitation schedule, two-step 
 ```mermaid
 flowchart LR
     Calib["1.2 Two-Step Calibration<br/>Loopback CALB (64 B Aligned)<br/>+ Clean Float32/Int Pad"] --> Plan["1.3 Star + Commutator Planner<br/>Mode-0 StarCenter + 1D Sweeps<br/>+ Null-Homing Verification"]
-    Plan --> Excite["1.4 Co-Designed Excitation<br/>Disjoint-Comb + A5 Transients<br/>+ Live Tail / DNWB White-Box"]
+    Plan --> Excite["1.4 Co-Designed Excitation<br/>Disjoint-Comb + Musical Transient Coreset<br/>+ Live Tail / DNWB White-Box"]
     Excite --> Align["1.5 Multi-Regime Alignment<br/>Parabolic Sub-Sample Lag<br/>& Converter Gain"]
 ```
 
@@ -43,8 +43,8 @@ All physical hardware captures and programmatic distillations enforce three devi
 
 | Invariant | Normative Requirement |
 | :--- | :--- |
-| Zero Control-Name or Topology Heuristics (REQ-1.6, REQ-1.9) | Excitation synthesis, lag alignment, and solver passes never inspect control labels (`"Gain"`, `"Mix"`, `"Drive"`), UI hints, circuit templates, or device category tags; fixed 0-control snapshots and multi-pedal + amp + cab + stereo rack rigs run identically |
-| Multi-Rate & 5-Bit-Depth Lossless Staging (REQ-1.7, REQ-7.3) | Capture I/O decodes Int12 (left-justified in 16-bit containers), Int16, Int24, Int32, and unclipped IEEE-754 Float32 (`WAVE_FORMAT_IEEE_FLOAT`) via validated little-endian WAV headers, resampling 8..192 kHz captures onto the 48 kHz identification grid via zero-phase polyphase Kaiser-sinc filtering |
+| Zero Control-Name or Topology Heuristics (REQ-1.6, REQ-1.9) | Excitation synthesis, lag alignment, and solver passes never inspect control labels (`"Gain"`, `"Mix"`, `"Drive"`), calibration role heuristics, UI hints, circuit templates, or device category tags; fixed 0-control snapshots and multi-pedal + amp + cab + stereo rack rigs run identically |
+| Multi-Rate & 5-Bit-Depth Lossless Staging (REQ-1.7, REQ-7.3) | Capture I/O decodes Int12 (left-justified in 16-bit containers), Int16, Int24, Int32, and unclipped IEEE-754 Float32 (`WAVE_FORMAT_IEEE_FLOAT`) via validated little-endian WAV headers, resampling 8..384 kHz captures onto the 48 kHz identification grid via zero-phase polyphase Kaiser-sinc filtering |
 | True-Stereo & Multi-Port Channel Preservation (REQ-7.2, REQ-7.4) | Mono (`1->1`), mono-to-stereo (`1->2`), stereo-to-mono (`2->1`), true-stereo (`2->2`), `4CM`, and `WDW` channel assignments remain intact without mono downmixing prior to I/O Router crossbar routing |
 
 ### 1.2 Two-Step Hardware Calibration & Clean 32-Bit Float Pad Staging
@@ -59,7 +59,7 @@ Converter calibration measures round-trip DAC-to-ADC loopback latency $\hat{\tau
 
 `r[train.capture.calib.clean-pad]`
 
-Before and after toggling hardware pad switches, capture records a 400 ms (`MIC_PAD_PROBE_SAMPLES_48K = 19,200` at 48 kHz, −18 dBFS) differential probe, solving $\hat{G}_{\text{pad}} \in (0, 2.0]$, relative lag compensation, and $\gamma^2$. It tracks `input_ref_dbfs` relative to 0 dBu, warns on converter clipping (>= −0.1 dBFS, 0.988553 full scale), and stages aligned signals in unclipped 32-bit IEEE-754 float buffers (±100.0 = +40 dBFS linear headroom, REQ-7.3).
+Before and after toggling hardware pad switches, capture records a 400 ms (`MIC_PAD_PROBE_SAMPLES_48K = 19,200` at 48 kHz, −18 dBFS) differential probe, solving $\hat{G}_{\text{pad}} \in (0, 2.0]$, relative lag compensation, and $\gamma^2$. It tracks `input_reference_dbfs` relative to 1 dBu (0.869 Vrms, default -20.5 dBFS), warns on converter clipping (>= −0.1 dBFS, 0.988553 full scale), and stages aligned signals in unclipped 32-bit IEEE-754 float buffers (±100.0 = +40 dBFS linear headroom, REQ-7.3).
 
 ### 1.3 Adaptive Star + Commutator Schedule & Null-Homing Verification
 
@@ -79,7 +79,9 @@ Before committing non-reference knob stems on physical hardware, the planner ver
 
 `r[train.capture.planner.freeze-transition]`
 
-When a rig exposes a hardware freeze or hold footswitch (`role == "freeze_latch"`), the capture schedule records at least one active sustain-entry transition from unfrozen to frozen while harmonic energy is present, followed by live play-over phrases and release back to unfrozen. This allows `Op-T` lossless ring-write freeze locking—holding tank states bit-clean across 30 s tails without fp16 re-quantization hiss—and play-over pass-through to be identified directly from signal trajectories (`ref[dsp.tank.captured-freeze]`).
+Sustain-hold state transitions are captured with zero control-name, string-matching, or calibration-role heuristics (REQ-1.6). Whenever physical hardware or a white-box `DNWB` runner (`HAS_FREEZE_WINDOW` bit 1<<2 or any general sustained-hold control axis across control trajectories) exhibits a write-hold transition, the planner records active-sustain entry while harmonic energy is present, held steady-state sustain under live play-over phrases, and release recovery.
+
+The identification solver lowers that write-hold trajectory purely from input/output signal telemetry into calibrated `ControlBus` slot 16 (`op_t_we_drive`), toggling bit 0 `WE_HOLD_ACTIVE` via Schmitt (0.45, 0.55) to drive `Op-T` `WE` RAM write lock (`ref[dsp.tank.captured-freeze]`). This keeps tank states bit-clean across 30 s tails without fp16 re-quantization hiss while play-over continues through the core—requiring zero dedicated host freeze APIs.
 
 ### 1.4 Co-Designed Disjoint-Comb Excitation, Live Tail Extension & White-Box Distillation
 
@@ -87,7 +89,9 @@ When a rig exposes a hardware freeze or hold footswitch (`role == "freeze_latch"
 
 `r[train.capture.excitation.codesigned]`
 
-Capture synthesizes a deterministic, crest-factor-controlled excitation combining odd and even disjoint harmonic combs, swept logarithmic chirps, multi-level dynamic steps (−48 dBFS to 0 dBFS), and full-bandwidth (20 Hz–20 kHz) 32-bit float content spanning all 33 canonical LTAS bands. This separates linear FRF pedestals from intermodulation sidebands and archives the shared 2.0–2.5 s (96,000–120,000 frames at 48 kHz) fp32 capsule in `INPC` (`ref[container.proj.inpc-capsule]`, [ADR-0016](../../adr/0016-codesigned-disjoint-comb-stimulus-and-null-homing-capture.md), REQ-1.6).
+Capture synthesizes a deterministic, crest-factor-controlled excitation combining odd-bin disjoint harmonic combs (leaving unexcited even harmonic bins open to isolate even-order intermodulation sidebands), swept exponential/logarithmic chirps, multi-level dynamic step envelopes (−48 dBFS to 0 dBFS), a deterministic 500 ms Musical Transient Coreset (capturing musical transient attacks and decay tails), and full-bandwidth (20 Hz–20 kHz) 32-bit float content spanning all 33 canonical LTAS bands.
+
+This excitation separates linear FRF pedestals from intermodulation sidebands and archives the shared 2.0–2.5 s (96,000–120,000 frames at 48 kHz) fp32 capsule in `INPC` (`ref[container.proj.inpc-capsule]`, [ADR-0016](../../adr/0016-codesigned-disjoint-comb-stimulus-and-null-homing-capture.md), REQ-1.6).
 
 #### Automatic Live Decay-Tail Extension
 
@@ -112,11 +116,11 @@ Given dry excitation $x[n]$ and recorded wet return $y[n]$ after subtracting loo
 | Alignment Regime | Activation Condition | Peak Selection & Estimator |
 | :--- | :--- | :--- |
 | `CleanLinear` | Broadband linear coherence `gamma_lin >= 0.35`, positive peak | Normalized waveform cross-correlation peak |
-| `PolarityInverted` | Broadband linear coherence `gamma_lin >= 0.35`, negative peak | Signed normalized cross-correlation peak (`\|k*\|`, sign restored on `g_hat`) |
+| `PolarityInverted` | Broadband linear coherence `gamma_lin >= 0.35`, negative peak | Signed normalized cross-correlation peak (`\|R[k*]\|`, sign restored on `g_hat`) |
 | `DispersiveAllPass` | Broadband linear coherence `gamma_lin >= 0.35`, dispersed phase | Causal HF wavefront correlation lock |
-| `NonlinearEnvelopeFallback` | Hard clipping or octave division pushes `gamma_lin < 0.35` | Broadband analytic Hilbert envelope cross-correlation |
+| `NonlinearEnvelopeFallback` | Hard clipping or octave division pushes `gamma_lin < 0.35` | True stereo 6-pair Jacobi elliptic `H1` Hilbert envelope cross-correlation |
 
-Alignment first evaluates normalized cross-correlation (or the analytic Hilbert envelope fallback) over the causal search window and fits a 3-point parabolic vertex around the correlation peak $k^\star$:
-$$\delta = \frac{R[k^\star - 1] - R[k^\star + 1]}{2\big(R[k^\star - 1] - 2 R[k^\star] + R[k^\star + 1]\big)} \in [-0.5, +0.5], \qquad \hat{\tau} = k^\star + \delta$$
+Alignment first evaluates normalized cross-correlation (or the true stereo `H1` elliptic Hilbert envelope fallback) over the causal search window and fits a 3-point parabolic vertex around the correlation magnitude peak $k^\star$:
+$$\delta = \frac{\lvert R[k^\star - 1] \rvert - \lvert R[k^\star + 1] \rvert}{2\big(\lvert R[k^\star - 1] \rvert - 2 \lvert R[k^\star] \rvert + \lvert R[k^\star + 1] \rvert\big)} \in [-0.5, +0.5], \qquad \hat{\tau} = k^\star + \delta$$
 
-Finally, fractional resampling maps the wet stem onto the zero-phase `INPC` grid using a 64-tap (`RADIUS = 32`) partition-of-unity Kaiser-sinc filter with $\beta = 8.6$ and 512-phase linear table interpolation when compensating clock skew. This achieves better than 0.02-sample accuracy at 48 kHz (`ref[qual.eval.jitter-floor]`).
+Finally, fractional resampling maps the wet stem onto the zero-phase `INPC` grid using a 64-tap (`RADIUS = 32`) partition-of-unity Kaiser-sinc filter with $\beta = 8.6$ and 512-phase linear table interpolation when compensating clock skew. This aligns dry-to-wet causal wavefronts consistently with the 4-frame causal micro-chunk latency floor of $\tau \ge 5.0$ crossbar or $\ge 4.0$ standalone, achieving better than 0.02-sample accuracy at 48 kHz (`ref[qual.eval.jitter-floor]`).
