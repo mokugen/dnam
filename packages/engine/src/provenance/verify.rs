@@ -1,6 +1,6 @@
 //! 2-Certificate `Ed25519` Provenance Verification & Marketplace Receipt Signing.
 
-pub mod jcs;
+mod jcs;
 
 pub(crate) use jcs::canonicalize_jcs_value;
 pub use jcs::{

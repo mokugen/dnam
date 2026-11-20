@@ -37,7 +37,7 @@ mod selector_list_serde {
         option_id: String,
     }
 
-    pub fn serialize<S>(when: &[(String, String)], serializer: S) -> Result<S::Ok, S::Error>
+    pub(super) fn serialize<S>(when: &[(String, String)], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -52,7 +52,7 @@ mod selector_list_serde {
         seq.end()
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<(String, String)>, D::Error>
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<Vec<(String, String)>, D::Error>
     where
         D: Deserializer<'de>,
     {

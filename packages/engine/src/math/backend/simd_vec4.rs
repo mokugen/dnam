@@ -457,6 +457,130 @@ mod tests {
         assert!((dl_pos.rsqrt_pos_nr3().0[2] - 0.5).abs() < 2.0e-6);
     }
 
+    #[test]
+    fn test_default_lane_vec_simd_and_kernel_bridge_coverage() {
+        use dnam_kernels::KernelVec4;
+
+        let arr = [1.5_f32, -2.5, 3.5, -4.5];
+        let rhs_arr = [2.0_f32, 4.0, -1.0, 0.5];
+        let a = <DefaultLaneVec as SimdVec4>::from_array(arr);
+        let b = <DefaultLaneVec as SimdVec4>::load(&rhs_arr);
+
+        assert_eq!(
+            <DefaultLaneVec as SimdVec4>::dup_low_pair(a).0,
+            [1.5, -2.5, 1.5, -2.5]
+        );
+        assert_eq!(
+            <DefaultLaneVec as SimdVec4>::dup_high_pair(a).0,
+            [3.5, -4.5, 3.5, -4.5]
+        );
+        assert_eq!(
+            <ScalarVec4 as SimdVec4>::dup_low_pair(ScalarVec4(arr)).0,
+            [1.5, -2.5, 1.5, -2.5]
+        );
+        assert_eq!(
+            <ScalarVec4 as SimdVec4>::dup_high_pair(ScalarVec4(arr)).0,
+            [3.5, -4.5, 3.5, -4.5]
+        );
+
+        assert_eq!(<DefaultLaneVec as SimdVec4>::abs(a).0, [1.5, 2.5, 3.5, 4.5]);
+        assert_eq!(
+            <DefaultLaneVec as SimdVec4>::pair_swap_neg(a).0,
+            [2.5, 1.5, 4.5, 3.5]
+        );
+        assert_eq!(<DefaultLaneVec as SimdVec4>::horizontal_sum(a), -2.0);
+        assert_eq!(
+            <DefaultLaneVec as SimdVec4>::horizontal_sum_pair(a, b),
+            (-2.0, 5.5)
+        );
+        assert_eq!(<DefaultLaneVec as SimdVec4>::dot(a, b), -12.75);
+
+        let dirty = DefaultLaneVec([f32::NAN, f32::INFINITY, f32::from_bits(1), -1.25]);
+        let scrubbed = <DefaultLaneVec as SimdVec4>::scrub_recursive_state(dirty);
+        assert_eq!(
+            scrubbed.0.map(f32::to_bits),
+            [0, 0, 0, (-1.25_f32).to_bits()]
+        );
+        let flushed = <DefaultLaneVec as SimdVec4>::flush_subnormal(dirty);
+        assert!(flushed.0[0].is_nan() && flushed.0[1].is_infinite() && flushed.0[2].to_bits() == 0);
+
+        let d0 = DefaultLaneVec([0.25, 1.0, 2.0, 4.0]);
+        let d1 = DefaultLaneVec([0.5, 1.5, 5.0, 8.0]);
+        let d2 = DefaultLaneVec([1.0, 3.0, 6.0, 10.0]);
+        let d3 = DefaultLaneVec([2.5, 4.5, 7.5, 12.5]);
+        let (rp0, rp1) = <DefaultLaneVec as SimdVec4>::rcp_ge1_pair_nr2(d0, d1);
+        let rq = <DefaultLaneVec as SimdVec4>::rcp_ge1_quad_nr2([d0, d1, d2, d3]);
+        assert!((rp0.0[0] - 1.0).abs() < 1.0e-5);
+        assert!((rp1.0[0] - 1.0).abs() < 1.0e-5);
+        assert!((rp0.0[3] - 0.25).abs() < 1.0e-5);
+        assert!((rp1.0[3] - 0.125).abs() < 1.0e-5);
+        for k in 0..4 {
+            let expected = [d0, d1, d2, d3][k].0.map(|v| 1.0 / v.max(1.0));
+            for lane in 0..4 {
+                assert!((rq[k].0[lane] - expected[lane]).abs() < 1.0e-5);
+            }
+        }
+
+        let ka = <DefaultLaneVec as KernelVec4>::load(&arr);
+        let mut stored = [0.0_f32; 4];
+        <DefaultLaneVec as KernelVec4>::store(ka, &mut stored);
+        assert_eq!(stored, arr);
+        assert_eq!(<DefaultLaneVec as KernelVec4>::from_array(arr).0, arr);
+        assert_eq!(<DefaultLaneVec as KernelVec4>::to_array(ka), arr);
+        assert_eq!(
+            <DefaultLaneVec as KernelVec4>::splat_pair(1.25, -3.75).0,
+            [1.25, -3.75, 1.25, -3.75]
+        );
+        let kb = <DefaultLaneVec as KernelVec4>::load(&rhs_arr);
+        let kc = <DefaultLaneVec as KernelVec4>::splat(2.0);
+        assert_eq!(
+            <DefaultLaneVec as KernelVec4>::fms(ka, kb, kc).0,
+            [-2.5, -10.5, 5.5, -5.5]
+        );
+        assert_eq!(
+            <DefaultLaneVec as KernelVec4>::fma_lane::<1>(ka, kc, kb).0,
+            [9.5, 5.5, 11.5, 3.5]
+        );
+        assert_eq!(
+            <DefaultLaneVec as KernelVec4>::mul_lane::<3>(ka, kb).0,
+            [0.75, -1.25, 1.75, -2.25]
+        );
+        assert_eq!(
+            <DefaultLaneVec as KernelVec4>::abs(ka).0,
+            [1.5, 2.5, 3.5, 4.5]
+        );
+        assert_eq!(
+            <DefaultLaneVec as KernelVec4>::pair_swap_neg(ka).0,
+            [2.5, 1.5, 4.5, 3.5]
+        );
+        assert_eq!(
+            <DefaultLaneVec as KernelVec4>::flush_subnormal(dirty).0[2].to_bits(),
+            0
+        );
+        assert_eq!(<DefaultLaneVec as KernelVec4>::horizontal_sum(ka), -2.0);
+        assert_eq!(
+            <DefaultLaneVec as KernelVec4>::horizontal_sum_pair(ka, kb),
+            (-2.0, 5.5)
+        );
+        assert_eq!(<DefaultLaneVec as KernelVec4>::dot(ka, kb), -12.75);
+        assert_eq!(
+            <DefaultLaneVec as KernelVec4>::rcp_pos_seed_bits(d2)
+                .0
+                .map(f32::to_bits),
+            <ScalarVec4 as KernelVec4>::rcp_pos_seed_bits(ScalarVec4(d2.0))
+                .0
+                .map(f32::to_bits)
+        );
+        assert_eq!(
+            <DefaultLaneVec as KernelVec4>::rsqrt_pos_seed_bits(d2)
+                .0
+                .map(f32::to_bits),
+            <ScalarVec4 as KernelVec4>::rsqrt_pos_seed_bits(ScalarVec4(d2.0))
+                .0
+                .map(f32::to_bits)
+        );
+    }
+
     proptest! {
         #[test]
         fn prop_rcp_and_rsqrt_seed_bits_and_nr2_nr3(

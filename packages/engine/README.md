@@ -16,9 +16,9 @@ It is engineered for embedded ARMv8.2-A/ARMv9.2-A pedalboards (**Rockchip RK3582
     - **`Op-T` (Transport & Elastic Buffer):** Catmull-Rom cubic fractional delay with ZOH-rescaled dual-mode slew/crossfade, where $L_{\text{xfade}} = \max(16, \mathrm{round}(128/\rho_{\text{sr}}))$, branchless wrap, partitioned Schroeder diffusers, and dual-tap complementary Hermite-Hann grain reader satisfying $H(\phi_A) + H(\phi_B) \equiv 1$.
     - **`Op-M` (Modal Bank & Kautz):** 4-lane SIMD symplectic resonator, quadrant-reduced degree-13/14 Horner contractive rotor with adaptive 1–2 ULP guard, `Q0.192` LFO phase accumulator, 12-allpass (`6` I + `6` Q) `H1` Hilbert SSB lattice, `T1` sub-harmonic tracker with `5 Hz` upstream DC blocker, and Cabinet Bank (`cabinet`) 16-sample delayed Kautz modal bank.
     - **`Op-N` (Nonlinear Activation & Shaping):** Division-free Padé `[5/4]` `tanh` (`OpNBackend`), saturated `PolyADAA` reference verifier, analytical DC equilibrium, `C²` wavefolder, and `Q64.32` zero-order-hold bitcrusher with TPDF dither.
-  - **Topology Subsystems, `SONA` State-Space Core & I/O Router (`src/stages/`, [`sona_architecture.md`](../../docs/specs/architecture/sona_architecture.md)):**
+  - **Topology Subsystems, `SONA` State-Space Core & I/O Router (`src/graph/`, [`sona_architecture.md`](../../docs/specs/architecture/sona_architecture.md)):**
     - **I/O Router (`io_router`) & Top-of-Frame Causal Crossbar:** 8-Port Matrix Router with return-to-send isolation, `200 Hz` `TPT` `LR4`/`Bèzout` crossover, Kaiser-sinc sub-sample alignment, WDW routing, hysteresis gate, plus (`SONA` `v3.0`) causal `Op-T` reads with $\tau \ge 4$, input-only `Op-P` (`HilbertH1Lattice6Sec` + `T1SubHarmonicTracker`), and `4`-lane `Q0.32` quadrature carriers (`0.05 Hz–20 kHz`).
-    - **4-Block Matryoshka `SONA` Core (`ADR-0022`, [`SonaHotSlab`](src/stages/sona_core/slab.rs) / [`SonaInstance`](src/stages/sona_core.rs)):** Lower-triangular Matryoshka blocks (`Lite` `[1,1,1,1]` @ `1×` $\subset$ `Full` `[2,2,1,1]` @ `2×` $\subset$ `Pro` `[3,2,2,1]` @ `2×` $\subset$ `Ultra` `[4,3,2,1]` @ `2×`, `16 / 24 / 32 / 40` SVF modes = `4 / 6 / 8 / 10` quads, arenas `[4_608, 7_936, 15_872, 30_720]` B = `[72, 124, 248, 480]` CLs) combining passive `2×2` ZDF `TPT-SVF`, contractive `1D` scalar `ParaLRU` diode-RC ballistics, and pure-`f32` divided-difference `PolyADAA1` + `C²` wavefolder (`process_tick16_const` + `StereoVec8`, zero `FDIV`/`FSQRT`/`libm`).
+    - **4-Block Matryoshka `SONA` Core (`ADR-0022`, [`SonaHotSlab`](src/graph/sona_core/slab.rs) / [`SonaInstance`](src/graph/sona_core.rs)):** Lower-triangular Matryoshka blocks (`Lite` `[1,1,1,1]` @ `1×` $\subset$ `Full` `[2,2,1,1]` @ `2×` $\subset$ `Pro` `[3,2,2,1]` @ `2×` $\subset$ `Ultra` `[4,3,2,1]` @ `2×`, `16 / 24 / 32 / 40` SVF modes = `4 / 6 / 8 / 10` quads, arenas `[4_608, 7_936, 15_872, 30_720]` B = `[72, 124, 248, 480]` CLs) combining passive `2×2` ZDF `TPT-SVF`, contractive `1D` scalar `ParaLRU` diode-RC ballistics, and pure-`f32` divided-difference `PolyADAA1` + `C²` wavefolder (`process_tick16_const` + `StereoVec8`, zero `FDIV`/`FSQRT`/`libm`).
     - **Cabinet Bank (`cabinet`) & Spatial Tank (`spatial_tank`):** Contiguous early reflection `FIR` (`32/48/96/128` target taps) and shared-pole orthonormal `Kautz` modal (`8/12/24/32` target pairs) with `ZOH` onset delay, plus coercive Spatial Tank `Op-T` quads (`1 / 2 / 3 / 4` quads = `4 / 8 / 12 / 16` feedback lines, `a ∈ {2, 4}` `fp16`/`f32` precision, integer-lag lossless freeze).
   - **Control Bus & Runtime UX (`src/control/`, [`ADR-0022`](../../docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md)):**
     - $3\text{ kHz}$ node-anchored Lobatto basis, `CP1` tier-local projections (`8-D` Rank-4 in `Lite..Pro`, `16-D` Rank-8 in `Ultra`), 9-word/18-word `ExactIntFactorAccumulator`, outward-checked trust-region clipping, and `Q64`/`Q32` `20–400 BPM` tempo synchronization with 32-step binary-search physical calibration inversion ([`parametric_control_bus.md`](../../docs/specs/dsp/parametric_control_bus.md)).
@@ -37,7 +37,7 @@ It is engineered for embedded ARMv8.2-A/ARMv9.2-A pedalboards (**Rockchip RK3582
 
 ## Floating-Point Scope
 
-Block-processing APIs establish and restore the audio floating-point environment automatically. Direct per-sample engine, operator, stage, or control-tick calls require one [`FtzDazGuard`](src/types.rs) around the entire batch. Low-level single-frame helpers step one stereo frame without block-level tempo advancement or `4×` offline bounce oversampling. See the [audio-callback policy](../../docs/specs/architecture/sona_architecture.md#floating-point-environment-at-the-audio-callback).
+Block-processing APIs establish and restore the audio floating-point environment automatically. Direct per-sample engine, operator, graph, or control-tick calls require one [`FtzDazGuard`](src/types.rs) around the entire batch. Low-level single-frame helpers step one stereo frame without block-level tempo advancement or `4×` offline bounce oversampling. See the [audio-callback policy](../../docs/specs/architecture/sona_architecture.md#floating-point-environment-at-the-audio-callback).
 
 ---
 
@@ -71,16 +71,16 @@ packages/engine/
 │   ├── test_support.rs     # #[cfg(test)] exact rational (Rat), SplitMix64 & ULP test harness
 │   ├── math.rs & math/     # SimdVec4, MathBackend, spec_math.rs, NEON/SME/AVX2/WASM
 │   ├── operators.rs & operators/ # Op-T (op_t.rs), Op-M (op_m.rs), Op-N (op_n.rs), reference.rs
-│   ├── stages.rs & stages/ # I/O Router, SONA Core, Cabinet Bank & Spatial Tank
-│   │                       # (topology.rs, router.rs, sona_core.rs, hot_core.rs,
-│   │                       # stage3_cab.rs, stage4_tank.rs, weights.rs)
+│   ├── graph.rs & graph/   # I/O Router, SONA Core, Cabinet Bank & Spatial Tank
+│   │                       # (topology.rs, router.rs, sona_core.rs, cabinet.rs,
+│   │                       # tank.rs, weights.rs)
 │   ├── control.rs & control/ # 3 kHz bus.rs, plane.rs (ExactIntFactorAccumulator, Q64/Q32 tempo)
 │   ├── container.rs & container/ # wire.rs, preamble.rs, view.rs, zoh.rs, strip.rs
 │   ├── provenance.rs & provenance/ # security.rs (DAU1/HPKE/DME1), seal.rs, watermark.rs
 │   └── schema.rs & schema/ # #![no_std] serde/serde_json .dnam runtime header & UI skew
 ├── tests/                  # Cross-cutting integration tests (backend parity, 0-alloc, FFI, seal,
 │                           # SONA pipeline/ZOH & calibration/lifecycle)
-├── benches/                # Subsystem Criterion suites (pipeline, operators, stages_and_control,
+├── benches/                # Subsystem Criterion suites (pipeline, operators, graph_and_control,
 │                           # container_and_provenance) & WCET jitter audit (realtime_wcet)
 └── examples/               # 6 runnable API examples (realtime_audio_block, embedded_zero_alloc,
                             # marketplace_provenance, container_slimming,
@@ -104,7 +104,7 @@ moon run engine:bench
 cargo bench -p dnam-engine --bench realtime_wcet
 cargo bench -p dnam-engine --bench pipeline
 cargo bench -p dnam-engine --bench operators
-cargo bench -p dnam-engine --bench stages_and_control
+cargo bench -p dnam-engine --bench graph_and_control
 cargo bench -p dnam-engine --bench container_and_provenance
 
 # Profiling with hotpath-rs (--profile profiling)

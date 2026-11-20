@@ -51,7 +51,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             };
         }
 
-        let is_frozen = self.hot_core.stage4_freeze();
+        let is_frozen = self.hot_core.tank_freeze();
         let live_scale = if !self.bypassed && self.freeze_mutes_dry && is_frozen {
             0.0
         } else {
@@ -91,7 +91,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         }
         let ([mut wet_l, mut wet_r], [core_l, core_r], [send_l, send_r]) =
             self.hot_core.step_4port_frame(
-                &mut self.stage0_router,
+                &mut self.io_router,
                 eff_in_l,
                 eff_in_r,
                 eff_ret_l,
@@ -102,7 +102,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
         if !mono_only
             && !self.hot_core.mono_out()
-            && !self.stage0_router.wdw_mode
+            && !self.io_router.wdw_mode
             && (self.stereo_width - 1.0).abs() > 1e-6
         {
             let mid = 0.5 * (wet_l + wet_r);
@@ -125,15 +125,15 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             self.mix_wet_gain * tier_trim
         };
 
-        if self.stage0_router.wdw_mode {
-            let dry_mix = self.hot_core.stage4_dry_mix();
+        if self.io_router.wdw_mode {
+            let dry_mix = self.hot_core.tank_dry_mix();
             let w_wet_l = wet_l - dry_mix * core_l;
             let w_wet_r = wet_r - dry_mix * core_r;
             let core_mid = 0.5 * (core_l + core_r);
             let wet_mid = 0.5 * (w_wet_l + w_wet_r);
             let wet_side = 0.5 * (w_wet_l - w_wet_r);
-            let (wdw_dry_c, wdw_wet_l, wdw_wet_r) = crate::stages::eval_wdw_routing_outputs(
-                self.stage0_router.wdw_tap_mode,
+            let (wdw_dry_c, wdw_wet_l, wdw_wet_r) = crate::graph::eval_wdw_routing_outputs(
+                self.io_router.wdw_tap_mode,
                 core_mid,
                 wet_mid,
                 wet_side,
@@ -235,6 +235,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     /// Processes a multi-port audio block (`Stage 0` 8-port router contract: `in_1..4`, `out_1..4`).
     pub fn process_block_io(&mut self, io: DnamAudioIo<'_>) {
         let _ftz = FtzDazGuard::new();
+        self.hot_core.cold.max_op_n_drive = 0.0;
         let mut num_frames = io.in_1.len().min(io.out_1.len());
         if let Some(s) = io.in_2 {
             num_frames = num_frames.min(s.len());
@@ -308,8 +309,8 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         send_l: &mut [f32],
         send_r: &mut [f32],
     ) {
-        let prev_wdw = self.stage0_router.wdw_mode;
-        self.stage0_router.wdw_mode = false;
+        let prev_wdw = self.io_router.wdw_mode;
+        self.io_router.wdw_mode = false;
         self.process_block_io(DnamAudioIo {
             in_1: inst_l,
             in_2: Some(inst_r),
@@ -320,7 +321,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             out_3: Some(send_l),
             out_4: Some(send_r),
         });
-        self.stage0_router.wdw_mode = prev_wdw;
+        self.io_router.wdw_mode = prev_wdw;
     }
 
     /// Processes a Wet/Dry/Wet (`WDW`) 3-output block (`[in_l, in_r] -> [wet_l, wet_r, dry_center]`).
@@ -332,8 +333,8 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         wet_r: &mut [f32],
         dry_center: &mut [f32],
     ) {
-        let prev_wdw = self.stage0_router.wdw_mode;
-        self.stage0_router.wdw_mode = true;
+        let prev_wdw = self.io_router.wdw_mode;
+        self.io_router.wdw_mode = true;
         self.process_block_io(DnamAudioIo {
             in_1: in_l,
             in_2: Some(in_r),
@@ -344,7 +345,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             out_3: Some(dry_center),
             out_4: None,
         });
-        self.stage0_router.wdw_mode = prev_wdw;
+        self.io_router.wdw_mode = prev_wdw;
     }
 
     /// Processes a sidechain / auxiliary return stereo block (`[main_l, main_r, aux_l, aux_r] -> [out_l, out_r]`).
@@ -374,10 +375,10 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 mod tests {
     use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
     use crate::engine::DnamEngine;
+    use crate::graph::SonaMatryoshkaModel;
+    use crate::graph::weights::pack_sona_matryoshka_to_arena;
     use crate::math::ScalarBackend;
     use crate::schema::DnamJsonHeader;
-    use crate::stages::SonaMatryoshkaModel;
-    use crate::stages::weights::pack_sona_matryoshka_to_arena;
     use crate::types::Tier;
     extern crate alloc;
     use alloc::vec;
@@ -531,7 +532,7 @@ mod tests {
         // Verify 4x 4-port downsamples out_3/out_4 through oversampler_aux cleanly (DirectDry tap -> 0.5)
         let mut eng_4x =
             DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
-        eng_4x.stage0_router.wdw_tap_mode = crate::stages::WdwDryTapMode::DirectDry;
+        eng_4x.io_router.wdw_tap_mode = crate::graph::WdwDryTapMode::DirectDry;
         eng_4x.set_offline_bounce(true);
         let dc_in = [0.5_f32; 32];
         let (mut wdw_l_4x, mut wdw_r_4x, mut wdw_dry_4x) =
@@ -546,5 +547,98 @@ mod tests {
         assert!(wdw_dry_4x.iter().all(|v| v.is_finite()));
         assert!(wdw_dry_4x[0].abs() < wdw_dry_4x[31].abs());
         assert!((wdw_dry_4x[31] - 0.5).abs() < 0.05);
+    }
+
+    #[test]
+    fn test_live_telemetry_peaks_op_n_drive_pole_radius_and_multi_quad_loop_gain() {
+        let mut header = DnamJsonHeader::default_reference();
+        let mut mat = SonaMatryoshkaModel::identity(false, false);
+        mat.tier_os2x = [false, true, false, false];
+        mat.groups[0].in_x_weight = [0.8, 0.0, 0.0, 0.0];
+        mat.groups[0].tone_dir = [1.0; 4];
+        mat.groups[0].tone_lp = [0.0; 4];
+        mat.groups[0].adaa_drive = [1.5, 0.0, 0.0, 0.0];
+        mat.groups[0].lru_alpha_rel = [0.85, 0.90, 0.70, 0.50];
+        mat.kautz_poles[16] = (0.96, 0.35);
+        for t in 0..4 {
+            mat.stage4[t].g_loop = 0.25;
+            mat.stage4[t].quads[0].g_loop = 0.25;
+            mat.stage4[t].quads[1].g_loop = 0.60;
+            mat.stage4[t].quads[2].g_loop = 0.88;
+            mat.stage4[t].quads[3].g_loop = 0.94;
+        }
+        let mut arena = alloc::vec![0_u8; ARENA_OFFSET_ULTRA_END as usize];
+        pack_sona_matryoshka_to_arena(&mat, &mut arena);
+        let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+
+        let mut engine =
+            DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Pro, 48_000).unwrap();
+        let init_snap = engine.telemetry_snapshot();
+        assert_eq!(init_snap.max_op_n_drive, 0.0);
+        assert!((init_snap.max_pole_radius - 0.96).abs() < 1.0e-4);
+        assert!((init_snap.max_effective_loop_gain - 0.88).abs() < 1.0e-6);
+
+        let zeros = [0.0_f32; 64];
+        let (mut out_l, mut out_r) = ([0.0_f32; 64], [0.0_f32; 64]);
+        engine.process_block(&zeros, &zeros, &mut out_l, &mut out_r);
+        assert_eq!(engine.telemetry_snapshot().max_op_n_drive, 0.0);
+
+        let drive_in: [f32; 64] = core::array::from_fn(|i| 0.5 * ((i as f32) * 0.2).sin());
+        engine.process_block(&drive_in, &drive_in, &mut out_l, &mut out_r);
+        let driven_snap = engine.telemetry_snapshot();
+        assert!(driven_snap.max_op_n_drive > 0.05 && driven_snap.max_op_n_drive <= 1.0);
+
+        engine.set_bypass(true, false);
+        engine.process_block(&drive_in, &drive_in, &mut out_l, &mut out_r);
+        assert_eq!(engine.telemetry_snapshot().max_op_n_drive, 0.0);
+
+        engine.set_tier(Tier::Ultra);
+        engine.set_bypass(false, false);
+        engine.process_block(&zeros, &zeros, &mut out_l, &mut out_r);
+        assert!((engine.telemetry_snapshot().max_effective_loop_gain - 0.94).abs() < 1.0e-6);
+
+        // Verify frame-0 impulse peaks inside short (<16) and multi-subblock (32 = 2x16) blocks match step_stereo across 1x & OS2X.
+        let mut imp_short = [0.0_f32; 12];
+        imp_short[0] = 0.85;
+        let mut imp_multi = [0.0_f32; 32];
+        imp_multi[0] = 0.85;
+        let (mut out_short_l, mut out_short_r) = ([0.0_f32; 12], [0.0_f32; 12]);
+        let (mut out_multi_l, mut out_multi_r) = ([0.0_f32; 32], [0.0_f32; 32]);
+        for (tier, expected_os2x) in [(Tier::Lite, false), (Tier::Full, true)] {
+            let mut short_eng =
+                DnamEngine::<ScalarBackend>::from_bytes(&container, tier, 48_000).unwrap();
+            assert_eq!(short_eng.hot_core.os2x(), expected_os2x);
+            short_eng.process_block(&imp_short, &imp_short, &mut out_short_l, &mut out_short_r);
+            let short_peak = short_eng.telemetry_snapshot().max_op_n_drive;
+
+            let mut multi_eng =
+                DnamEngine::<ScalarBackend>::from_bytes(&container, tier, 48_000).unwrap();
+            assert_eq!(multi_eng.hot_core.os2x(), expected_os2x);
+            multi_eng.process_block(&imp_multi, &imp_multi, &mut out_multi_l, &mut out_multi_r);
+            let multi_peak = multi_eng.telemetry_snapshot().max_op_n_drive;
+
+            let mut step_eng =
+                DnamEngine::<ScalarBackend>::from_bytes(&container, tier, 48_000).unwrap();
+            assert_eq!(step_eng.hot_core.os2x(), expected_os2x);
+            for &x in &imp_multi {
+                let _ = step_eng.hot_core.step_stereo(x, x);
+            }
+            let step_peak = step_eng.telemetry_snapshot().max_op_n_drive;
+            assert!(
+                short_peak > 0.1 && multi_peak > 0.1,
+                "tier {:?} (os2x={}) missed frame-0 impulse peak",
+                tier,
+                expected_os2x
+            );
+            assert!(
+                (short_peak - step_peak).abs() < 1.0e-6 && (multi_peak - step_peak).abs() < 1.0e-6,
+                "tier {:?} (os2x={}) subblock vs step_stereo drive peak mismatch: short={}, multi={}, step={}",
+                tier,
+                expected_os2x,
+                short_peak,
+                multi_peak,
+                step_peak
+            );
+        }
     }
 }

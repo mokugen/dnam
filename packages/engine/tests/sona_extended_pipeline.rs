@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 //! Integration coverage for `SONA` (`v3.0`) extended DSP pipelines, multi-port topologies,
-//! `DynamicDnamEngine`, `CP1` projections, `V3Stage0Hot`, `SonaHotSlab`, and `V3Stage4TankHot` paths.
+//! `DynamicDnamEngine`, `CP1` projections, `CrossbarHot`, `SonaHotSlab`, and `SpatialTankHot` paths.
 
 #[path = "sona_test_support/arena_builder.rs"]
 mod arena_builder;
@@ -8,19 +8,16 @@ mod arena_builder;
 use arena_builder::{build_sona_extended_container, build_sona_header, populate_sona_arena};
 use dnam_engine::container::build_dnam_container_with_cp1;
 use dnam_engine::control::Cp1ContributorSlot;
+use dnam_engine::graph::router::{CrossbarHot, CrossbarParams};
+use dnam_engine::graph::topology::{eval_tank_blended_feedback_knee, eval_tank_loop_saturator};
+use dnam_engine::graph::{
+    SonaColdTierModel, SonaHotSlab, SonaInstance, SpatialTankHot, SpatialTankParams, WdwDryTapMode,
+};
 #[cfg(target_arch = "aarch64")]
 use dnam_engine::math::{ArmSmeBackend, ArmSve2Backend};
 use dnam_engine::math::{DefaultMathBackend, ScalarBackend};
 use dnam_engine::memory::AlignedFp16Block;
 use dnam_engine::schema::TempoSubdivision;
-use dnam_engine::stages::router::{V3Stage0Hot, V3Stage0Params};
-use dnam_engine::stages::topology::{
-    eval_stage4_blended_feedback_knee, eval_stage4_loop_saturator,
-};
-use dnam_engine::stages::{
-    SonaColdTierModel, SonaHotSlab, SonaInstance, V3Stage4TankHot, V3Stage4TankParams,
-    WdwDryTapMode,
-};
 use dnam_engine::{DnamAudioIo, DnamEngine, DynamicDnamEngine, FtzDazGuard, Tier};
 
 fn exercise_backend_full_matrix<B: dnam_engine::engine::EngineBackend>(bytes: &[u8]) {
@@ -169,11 +166,11 @@ fn test_sona_multiport_4cm_wdw_mono_reload_and_constructors() {
     assert!(main_l.iter().all(|v| v.is_finite()));
 
     eng.set_stereo_width(1.5);
-    eng.stage0_router.wdw_tap_mode = WdwDryTapMode::PreSpatialCore;
+    eng.io_router.wdw_tap_mode = WdwDryTapMode::PreSpatialCore;
     eng.process_block_wdw(&inst_l, &inst_r, &mut main_l, &mut main_r, &mut dry_center);
     assert!(dry_center.iter().all(|v| v.is_finite()));
 
-    eng.stage0_router.wdw_tap_mode = WdwDryTapMode::DirectDry;
+    eng.io_router.wdw_tap_mode = WdwDryTapMode::DirectDry;
     eng.process_block_wdw(&inst_l, &inst_r, &mut main_l, &mut main_r, &mut dry_center);
     assert!(main_r.iter().all(|v| v.is_finite()));
 
@@ -239,27 +236,27 @@ fn test_sona_multiport_4cm_wdw_mono_reload_and_constructors() {
 }
 
 #[test]
-fn test_direct_stage0_sona_hot_slab_and_stage4_subpaths() {
+fn test_direct_crossbar_sona_hot_slab_and_tank_subpaths() {
     let _ftz = FtzDazGuard::new();
 
-    // Stage 0 unconditional V3Stage0Hot path (gain + mix + hysteresis gate + Bezout crossover)
-    let mut s0_params = V3Stage0Params::identity();
-    s0_params.xo_hz = 180.0;
-    s0_params.xo_low_gain = 1.05;
-    s0_params.xo_high_gain = 0.95;
-    s0_params.clean_sub_mix = 0.25;
-    s0_params.gate_thresh = 0.002;
-    s0_params.gate_hyst = 0.001;
-    s0_params.gate_inv_knee = 100.0;
-    s0_params.gate_floor = 0.1;
-    let mut s0 = V3Stage0Hot::from_cold(&s0_params);
-    assert_eq!(s0.step_stereo(0.0, 0.0).map(f32::to_bits), [0; 4]);
-    let y0 = s0.step_stereo(0.3, -0.25);
+    // Unconditional CrossbarHot path (gain + mix + hysteresis gate + Bezout crossover)
+    let mut cb_params = CrossbarParams::identity();
+    cb_params.xo_hz = 180.0;
+    cb_params.xo_low_gain = 1.05;
+    cb_params.xo_high_gain = 0.95;
+    cb_params.clean_sub_mix = 0.25;
+    cb_params.gate_thresh = 0.002;
+    cb_params.gate_hyst = 0.001;
+    cb_params.gate_inv_knee = 100.0;
+    cb_params.gate_floor = 0.1;
+    let mut cb = CrossbarHot::from_cold(&cb_params);
+    assert_eq!(cb.step_stereo(0.0, 0.0).map(f32::to_bits), [0; 4]);
+    let y0 = cb.step_stereo(0.3, -0.25);
     assert!(y0.iter().all(|v| v.is_finite()));
-    s0.reconfigure_sample_rate(&s0_params, 96_000.0);
-    let y0_96k = s0.step_stereo(0.25, -0.2);
+    cb.reconfigure_sample_rate(&cb_params, 96_000.0);
+    let y0_96k = cb.step_stereo(0.25, -0.2);
     assert!(y0_96k.iter().all(|v| v.is_finite()));
-    s0.reset();
+    cb.reset();
 
     // Unified SONA Matryoshka SonaHotSlab & SonaInstance execution parity across all 4 tiers
     for tier in [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra] {
@@ -279,21 +276,20 @@ fn test_direct_stage0_sona_hot_slab_and_stage4_subpaths() {
         assert!(ol.iter().all(|v| v.is_finite()) && or.iter().all(|v| v.is_finite()));
     }
 
-    // Stage 4 SONA V3Stage4TankHot multi-quad & topology knee / loop-saturator paths
-    let knee_v =
-        eval_stage4_blended_feedback_knee(0.35, 0.72, 0.25, 0.50).expect("valid knee input");
-    let sat_v = eval_stage4_loop_saturator(knee_v, 0.95).expect("valid saturator input");
+    // SONA SpatialTankHot multi-quad & topology knee / loop-saturator paths
+    let knee_v = eval_tank_blended_feedback_knee(0.35, 0.72, 0.25, 0.50).expect("valid knee input");
+    let sat_v = eval_tank_loop_saturator(knee_v, 0.95).expect("valid saturator input");
     assert!(knee_v.is_finite() && sat_v.is_finite());
 
-    let mut tp = V3Stage4TankParams::identity();
+    let mut tp = SpatialTankParams::identity();
     tp.g_loop = 0.72;
     tp.wet_mix = 0.30;
-    let mut s4 = V3Stage4TankHot::from_cold(&tp);
-    let [wl, wr] = s4.step_stereo::<DefaultMathBackend>(0.25, -0.25);
+    let mut tank = SpatialTankHot::from_cold(&tp);
+    let [wl, wr] = tank.step_stereo::<DefaultMathBackend>(0.25, -0.25);
     assert!(wl.is_finite() && wr.is_finite());
-    s4.freeze = true;
-    let [fl, fr] = s4.step_stereo::<DefaultMathBackend>(0.0, 0.0);
+    tank.freeze = true;
+    let [fl, fr] = tank.step_stereo::<DefaultMathBackend>(0.0, 0.0);
     assert!(fl.is_finite() && fr.is_finite());
-    s4.freeze = false;
-    s4.reset();
+    tank.freeze = false;
+    tank.reset();
 }

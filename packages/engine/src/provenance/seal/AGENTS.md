@@ -7,6 +7,6 @@ Implements RFC 9180 Base HPKE (`DHKEM(X25519, HKDF-SHA256)` + `ChaCha20Poly1305`
 | File | Responsibility | Canonical Spec (SSOT) |
 | :--- | :--- | :--- |
 | [`hpke_base.rs`](hpke_base.rs) | Audited RFC 9180 Base HPKE seal/open and `ChaCha20-Poly1305` record AEAD | [`provenance_and_enclave_drm.md`](../../../../../docs/specs/security/provenance_and_enclave_drm.md) |
-| [`v3_dnsl.rs`](v3_dnsl.rs) | `Dsa1ManifestHeaderWire`, `UnsealedDnslInner`, facade over [`seal_encode.rs`](v3_dnsl/seal_encode.rs) & [`seal_unseal.rs`](v3_dnsl/seal_unseal.rs) | [`provenance_and_enclave_drm.md`](../../../../../docs/specs/security/provenance_and_enclave_drm.md) |
+| [`dnsl.rs`](dnsl.rs) | `Dsa1ManifestHeaderWire`, `UnsealedDnslInner`, facade over [`seal_encode.rs`](dnsl/seal_encode.rs) & [`seal_unseal.rs`](dnsl/seal_unseal.rs) | [`provenance_and_enclave_drm.md`](../../../../../docs/specs/security/provenance_and_enclave_drm.md) |
 
 See [`packages/engine/CONTRIBUTING.md`](../../../CONTRIBUTING.md) for enclave DRM and AEAD invariants.

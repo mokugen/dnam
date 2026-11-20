@@ -1,4 +1,4 @@
-//! Symplectic Modal Recurrence, Contractive Rotor, and Orthonormal Kautz Modal Bank (`Stage III` & Family 6,
+//! Symplectic Modal Recurrence, Contractive Rotor, and Orthonormal Kautz Modal Bank (`Cabinet` & Family 6,
 //! `ref[dsp.op-m.recurrence.symplectic]`, `ref[dsp.op-m.rotor.contractive]`, `ref[dsp.op-m.kautz.sweep-contraction]`).
 
 pub mod simd;
@@ -200,7 +200,7 @@ impl SymplecticModal4Lane {
     }
 }
 
-/// Orthonormal Kautz Modal Bank (Stage III & Family 6, REQ-1.2).
+/// Orthonormal Kautz Modal Bank (`Cabinet` & Family 6, REQ-1.2).
 #[derive(Clone, Debug)]
 pub struct KautzModalBank<const POLES: usize> {
     pub s_re: [f32; POLES],
@@ -265,7 +265,7 @@ impl<const POLES: usize> KautzModalBank<POLES> {
             let r_effective = if !r.is_finite() {
                 0.0
             } else if delta_theta.is_finite() && delta_theta.abs() > 1.0e-9 {
-                eval_stage3_sweep_contraction(r, delta_theta)
+                eval_kautz_sweep_contraction(r, delta_theta)
             } else {
                 r.clamp(0.0, 0.9995)
             };
@@ -337,11 +337,11 @@ pub fn init_log_octave_poles_h2(
     out
 }
 
-/// Validates Stage III serialized Kautz parameters (`0.85 <= r_low <= r_high = r_low + dr <= 0.9995`,
+/// Validates `Cabinet` serialized Kautz parameters (`0.85 <= r_low <= r_high = r_low + dr <= 0.9995`,
 /// `theta in (0, pi)`, `0.5 <= kappa <= 2.0`) and evaluates the shared radial gate
 /// $g = \mathrm{clamp}(0.5 + \theta_{10}, 0, 1)$, $r_{\text{gate}} = \mathrm{clamp}(r_{\text{low}} + g \cdot dr, r_{\text{low}}, r_{\text{high}})$,
 /// and $b_\gamma = \kappa \sqrt{1 - r_{\text{high}}^2}$ (`ref[dsp.op-m.kautz.radial-gate]`).
-pub fn validate_and_eval_stage3_radial_gate(
+pub fn validate_and_eval_kautz_radial_gate(
     r_low: f32,
     dr: f32,
     theta: f32,
@@ -364,18 +364,18 @@ pub fn validate_and_eval_stage3_radial_gate(
     Some((g, r_gate, b_gamma))
 }
 
-/// Evaluates Stage III dynamic sweep contraction $r_{\text{eff}} = \min(r_m, \max(0.25, 0.9995 - 0.15 |\Delta\theta_m|))$
-/// via [`dnam_kernels::eval_stage3_sweep_contraction_f32`] (`ref[dsp.op-m.kautz.sweep-contraction]`).
+/// Evaluates `Cabinet` dynamic sweep contraction $r_{\text{eff}} = \min(r_m, \max(0.25, 0.9995 - 0.15 |\Delta\theta_m|))$
+/// via [`dnam_kernels::eval_kautz_sweep_contraction_f32`] (`ref[dsp.op-m.kautz.sweep-contraction]`).
 #[inline]
-pub fn eval_stage3_sweep_contraction(r_m: f32, delta_theta_m: f32) -> f32 {
-    dnam_kernels::eval_stage3_sweep_contraction_f32(r_m, delta_theta_m)
+pub fn eval_kautz_sweep_contraction(r_m: f32, delta_theta_m: f32) -> f32 {
+    dnam_kernels::eval_kautz_sweep_contraction_f32(r_m, delta_theta_m)
 }
 
-/// Converts a Stage III shared Kautz pole pair `(r_low, dr, theta, b_gamma, c_re, c_im)` from the
+/// Converts a `Cabinet` shared Kautz pole pair `(r_low, dr, theta, b_gamma, c_re, c_im)` from the
 /// `48 kHz` reference rate to `effective_rate_hz` (`rho = 48000 / f_s,eff`), rescaling the complex
 /// readout at $g = 0.5$ so steady-state DC/modal transfer is preserved (`ref[dsp.op-m.kautz.rate-convert]`,
 /// `ref[dsp.zoh.op-m-poles]`).
-pub fn convert_stage3_kautz_pole_for_rate(
+pub fn convert_kautz_pole_for_rate(
     r_low: f32,
     dr: f32,
     theta: f32,
@@ -502,8 +502,7 @@ mod tests {
         assert!(init_log_octave_poles_h2(0, 100.0, 1000.0, 48_000.0, 0.9).is_empty());
         let one = init_log_octave_poles_h2(1, 200.0, 2000.0, 48_000.0, 0.9);
         assert_eq!(one.len(), 1);
-        let unchanged =
-            convert_stage3_kautz_pole_for_rate(0.92, 0.04, 0.3, 0.25, 0.8, -0.1, 48_000.0);
+        let unchanged = convert_kautz_pole_for_rate(0.92, 0.04, 0.3, 0.25, 0.8, -0.1, 48_000.0);
         assert_eq!(unchanged, (0.92, 0.04, 0.3, 0.25, 0.8, -0.1));
     }
 
@@ -622,27 +621,27 @@ mod tests {
     /// verify[dsp.op-m.kautz.sweep-contraction]
     /// verify[dsp.zoh.op-m-poles]
     #[test]
-    fn test_stage3_kautz_allocation_dual_state_radial_gate_rate_convert_and_sweep() {
+    fn test_cabinet_kautz_allocation_dual_state_radial_gate_rate_convert_and_sweep() {
         let _guard = FtzDazGuard::new();
 
         // 1. Radial gate validation & evaluation
         let (g, r_gate, b_gamma) =
-            validate_and_eval_stage3_radial_gate(0.90, 0.08, 0.5, 1.0, 0.0).unwrap();
+            validate_and_eval_kautz_radial_gate(0.90, 0.08, 0.5, 1.0, 0.0).unwrap();
         assert!((g - 0.5).abs() < 1e-6);
         assert!((r_gate - 0.94).abs() < 1e-6);
         assert!(b_gamma > 0.0);
-        assert!(validate_and_eval_stage3_radial_gate(0.80, 0.08, 0.5, 1.0, 0.0).is_none());
-        assert!(validate_and_eval_stage3_radial_gate(0.90, 0.15, 0.5, 1.0, 0.0).is_none());
+        assert!(validate_and_eval_kautz_radial_gate(0.80, 0.08, 0.5, 1.0, 0.0).is_none());
+        assert!(validate_and_eval_kautz_radial_gate(0.90, 0.15, 0.5, 1.0, 0.0).is_none());
 
         // 2. Dynamic sweep contraction
-        let r_swept = eval_stage3_sweep_contraction(0.9990, 0.1);
+        let r_swept = eval_kautz_sweep_contraction(0.9990, 0.1);
         assert!((r_swept - (0.9995 - 0.015)).abs() < 1e-6);
 
-        // 3. Stage III rate conversion preserves kappa_m & ZOH Op-M pole rescaling
+        // 3. Cabinet rate conversion preserves kappa_m & ZOH Op-M pole rescaling
         let (rl_96, dr_96, th_96, bg_96, cr_96, ci_96) =
-            convert_stage3_kautz_pole_for_rate(0.90, 0.05, 0.4, 0.3, 0.5, -0.2, 96_000.0);
+            convert_kautz_pole_for_rate(0.90, 0.05, 0.4, 0.3, 0.5, -0.2, 96_000.0);
         let (_, _, _, bg_96_double, _, _) =
-            convert_stage3_kautz_pole_for_rate(0.90, 0.05, 0.4, 0.6, 0.5, -0.2, 96_000.0);
+            convert_kautz_pole_for_rate(0.90, 0.05, 0.4, 0.6, 0.5, -0.2, 96_000.0);
         assert!(rl_96 > 0.90 && dr_96 > 0.0 && (th_96 - 0.2).abs() < 1e-5);
         assert!(bg_96 > 0.0 && bg_96.is_finite() && cr_96.is_finite() && ci_96.is_finite());
         assert!((bg_96_double - 2.0 * bg_96).abs() < 1e-6);

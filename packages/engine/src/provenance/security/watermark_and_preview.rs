@@ -1,4 +1,4 @@
-//! `DME1` Encrypted Mutable Suffix, Watermark Seed Derivation (`HMAC-SHA256`), Stage III Tier-Local
+//! `DME1` Encrypted Mutable Suffix, Watermark Seed Derivation (`HMAC-SHA256`), Cabinet Tier-Local
 //! Structural Fingerprinting & Preview Containment.
 //!
 //! Canonical Reference: `docs/specs/security/provenance_and_enclave_drm.md` & `docs/specs/security/watermarking_and_marketplace.md` (`ref[sec.drm.dme1-mutable-suffix]`, `ref[sec.drm.protected-inner-framing]`, `ref[sec.watermark.seed-derivation]`, `ref[sec.anticlone.three-gate-pipeline]`, `ref[sec.anticlone.cabinet-fingerprint]`, `ref[sec.preview.containment]`, `ref[sec.preview.royalty-splits]`, `ref[sec.preview.storefront-metadata]`, `ref[sec.edge.data-model]`).
@@ -192,11 +192,11 @@ pub fn derive_watermark_seed_hmac_sha256(
     Ok(hmac_sha256(key, &msg))
 }
 
-/// Extracts the gauge-invariant Stage III tier-local fingerprint component (`120` `f64` values in
+/// Extracts the gauge-invariant cabinet tier-local fingerprint component (`120` `f64` values in
 /// `Lite`/`Ultra`, `60` in `Full`, `180` in `Pro`; `120 / 180 / 360 / 480` cumulative values across
 /// `Lite` / `Full` / `Pro` / `Ultra`, `ref[sec.anticlone.cabinet-fingerprint]`):
 /// `[b_early_L[0..K_fir-1], b_early_R[0..K_fir-1], (r_low, dr, floor_1e2(theta), b_gamma*c_re_l, b_gamma*c_im_l, b_gamma*c_re_r, b_gamma*c_im_r) x M_tier]`.
-pub fn extract_stage3_tier_fingerprint_component(
+pub fn extract_cabinet_tier_fingerprint_component(
     early_fir_bytes: &[u8],
     kautz_modal_bytes: &[u8],
     added_modes: usize,
@@ -213,7 +213,7 @@ pub fn extract_stage3_tier_fingerprint_component(
     let fir_words = <[F32]>::ref_from_bytes(early_fir_bytes)
         .map_err(|_| DnamError::SchemaValidationError("invalid FIR slice alignment".into()))?;
     let kautz_blocks =
-        <[crate::stages::weights::KautzSoaBlockWire]>::ref_from_bytes(kautz_modal_bytes)
+        <[crate::graph::weights::KautzSoaBlockWire]>::ref_from_bytes(kautz_modal_bytes)
             .map_err(|_| DnamError::SchemaValidationError("invalid Kautz slice length".into()))?;
     let mut values = Vec::with_capacity(added_modes * 15);
     for word in fir_words {
@@ -361,7 +361,7 @@ mod spec_tests {
         apply_tardos_watermark_7680, build_watermark_seed_message_v1,
         compute_preview_single_control_window, compute_watermark_profile_sha256,
         derive_sona_sign_gauge_40, derive_watermark_seed_hmac_sha256,
-        evaluate_anticlone_revocation_policy, extract_stage3_tier_fingerprint_component,
+        evaluate_anticlone_revocation_policy, extract_cabinet_tier_fingerprint_component,
         extract_storefront_metadata, extract_structural_hash_224d, generate_tardos_code_7680,
         kautz_soa_byte_offset, score_tardos_watermark_7680, sha256_digest,
         structural_cosine_similarity, validate_license_tier_and_royalty_splits,
@@ -461,7 +461,7 @@ mod spec_tests {
         let build_modal_block = |eta: f32| -> [u8; 128] {
             let mut blk = [0u8; 128];
             let (kw, _) =
-                <crate::stages::weights::KautzSoaBlockWire as zerocopy::FromBytes>::mut_from_prefix(
+                <crate::graph::weights::KautzSoaBlockWire as zerocopy::FromBytes>::mut_from_prefix(
                     &mut blk,
                 )
                 .unwrap();
@@ -499,13 +499,13 @@ mod spec_tests {
         kautz_256b_b[0..128].copy_from_slice(&build_modal_block(2.0));
         kautz_256b_b[128..256].copy_from_slice(&build_modal_block(2.0));
         let fp_master =
-            extract_stage3_tier_fingerprint_component(&fir_256b, &kautz_256b_m, 8).unwrap();
+            extract_cabinet_tier_fingerprint_component(&fir_256b, &kautz_256b_m, 8).unwrap();
         let fp_buyer =
-            extract_stage3_tier_fingerprint_component(&fir_256b, &kautz_256b_b, 8).unwrap();
+            extract_cabinet_tier_fingerprint_component(&fir_256b, &kautz_256b_b, 8).unwrap();
         assert_eq!(fp_master.len(), 120);
         assert_eq!(fp_master, fp_buyer);
         assert_eq!(
-            extract_stage3_tier_fingerprint_component(&fir_256b[..128], &kautz_256b_m[..128], 4)
+            extract_cabinet_tier_fingerprint_component(&fir_256b[..128], &kautz_256b_m[..128], 4)
                 .unwrap()
                 .len(),
             60
@@ -516,7 +516,7 @@ mod spec_tests {
         kautz_384b[..256].copy_from_slice(&kautz_256b_m);
         kautz_384b[256..384].copy_from_slice(&build_modal_block(1.0));
         assert_eq!(
-            extract_stage3_tier_fingerprint_component(&fir_384b, &kautz_384b, 12)
+            extract_cabinet_tier_fingerprint_component(&fir_384b, &kautz_384b, 12)
                 .unwrap()
                 .len(),
             180
@@ -527,7 +527,7 @@ mod spec_tests {
             for blk in 0..crate::provenance::STAGE3_KAUTZ_BLOCKS_PER_TIER[t] {
                 let base = kautz_soa_byte_offset(t, blk);
                 let (kw, _) = zerocopy::FromBytes::mut_from_prefix(&mut arena[base..]).unwrap();
-                let _: &mut crate::stages::weights::KautzSoaBlockWire = kw;
+                let _: &mut crate::graph::weights::KautzSoaBlockWire = kw;
                 for l in 0..4 {
                     kw.r_low[l] = zerocopy::byteorder::little_endian::F32::new(0.9);
                     kw.b_gamma[l] = zerocopy::byteorder::little_endian::F32::new(0.5);

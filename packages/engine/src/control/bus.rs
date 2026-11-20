@@ -15,8 +15,8 @@ use core::marker::PhantomData;
 
 use zerocopy::FromBytes;
 
+use crate::graph::weights::{ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET, Arena0ControlBusWire};
 use crate::math::{MathBackend, flush_recursive_state_f32};
-use crate::stages::weights::{ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET, Arena0ControlBusWire};
 
 use super::descriptor::ControlClampDescriptor;
 use super::plane::MAX_EXACT_CONTRIBUTORS;
@@ -112,8 +112,8 @@ pub struct ControlBus<B: MathBackend> {
     pub tank_grain_len_scale: [f32; 4],
     /// Spatial Tank global state modulation offsets (`[delta_freeze_alpha, delta_window_mix, delta_feedback_mix, delta_spray_samples]`).
     pub tank_state_mod: [f32; 4],
-    /// Whether Spatial Tank modulation outputs were updated on the most recent $3\text{ kHz}$ tick.
-    pub tank_mod_dirty: bool,
+    /// Whether `W_ctrl` target dispatch outputs were updated on the most recent $3\text{ kHz}$ tick.
+    pub target_dispatch_dirty: bool,
     /// Trust-region radius $M_h$ (`ref[dsp.ctrl.op-n.trust-clip]`, default `10.0`).
     pub trust_radius_mh: f32,
     /// Pre-computed reciprocal square $M_h^{-2}$ for division-free $3\text{ kHz}$ trust-region evaluation (`0 FDIV`).
@@ -189,7 +189,7 @@ impl<B: MathBackend> ControlBus<B> {
             tank_warp_mod: [0.0; 8],
             tank_grain_len_scale: [0.0; 4],
             tank_state_mod: [0.0; 4],
-            tank_mod_dirty: false,
+            target_dispatch_dirty: false,
             trust_radius_mh: 10.0,
             inv_trust_radius_mh2: 1.0 / (10.0 * 10.0),
             sigma_drift: 0.0,
@@ -307,9 +307,9 @@ impl<B: MathBackend> ControlBus<B> {
     /// inline `CP1` contributor slots (`Arena 0 [2,880..3,456]` and `Arena 3 [27,520..29,632]`),
     /// and global LFO/Envelope/Trust-Region anchors from `Arena 0..3`, snapping controls to `default_val`.
     pub fn load_from_arena0(&mut self, arena0_bytes: &[u8], num_controls: usize, rho_ctrl: f64) {
-        self.unified_w_ctrl = crate::stages::weights::has_pipeline_flag(
+        self.unified_w_ctrl = crate::graph::weights::has_pipeline_flag(
             arena0_bytes,
-            crate::stages::weights::PIPE_FLAG_UNIFIED_W_CTRL,
+            crate::graph::weights::PIPE_FLAG_UNIFIED_W_CTRL,
         );
         let preallocated_cap = self
             .descriptors
@@ -449,7 +449,7 @@ impl<B: MathBackend> ControlBus<B> {
         self.tank_warp_mod = [0.0; 8];
         self.tank_grain_len_scale = [0.0; 4];
         self.tank_state_mod = [0.0; 4];
-        self.tank_mod_dirty = false;
+        self.target_dispatch_dirty = false;
         self.lfo_phasors = [[1.0, 0.0], [1.0, 0.0]];
         self.lfo_phases_q192 = [crate::math::Q0_192Phase::ZERO; 2];
         self.env_states = [0.0; 4];
@@ -538,9 +538,9 @@ mod tests {
     #[test]
     fn test_control_bus_tick_lfo_fallback_and_micro_ramps() {
         let _ftz = FtzDazGuard::new();
-        let mut arena = vec![0u8; crate::stages::weights::ARENA_ULTRA_BYTES];
-        for off in (crate::stages::weights::ARENA0_UINT_BASE_OFFSET
-            ..crate::stages::weights::ARENA0_CP1_BASE_END)
+        let mut arena = vec![0u8; crate::graph::weights::ARENA_ULTRA_BYTES];
+        for off in (crate::graph::weights::ARENA0_UINT_BASE_OFFSET
+            ..crate::graph::weights::ARENA0_CP1_BASE_END)
             .step_by(4)
         {
             arena[off..off + 4].copy_from_slice(zerocopy::IntoBytes::as_bytes(&F32::new(0.15)));

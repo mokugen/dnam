@@ -11,7 +11,7 @@ pub mod op_t;
 
 pub use kautz::{
     ComplexModalScanElem, KautzQuadState, PhasorQ32Bank4, algebraic_unit_rotor_f32,
-    compose_complex_modal_scan, eval_stage3_sweep_contraction_f32, step_kautz_quad_stereo8,
+    compose_complex_modal_scan, eval_kautz_sweep_contraction_f32, step_kautz_quad_stereo8,
     step_kautz_quad_vec4,
 };
 pub use op_p::{

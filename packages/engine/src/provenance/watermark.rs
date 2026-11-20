@@ -4,22 +4,22 @@
 
 use crate::container::{CP1_MAGIC, decode_cp1_shared_stream_into_slice, encode_cp1_shared_stream};
 use crate::control::Cp1ContributorSlot;
-use crate::schema::DnamError;
-use crate::stages::weights::{
+use crate::graph::weights::{
     ARENA_FULL_BYTES, ARENA_LITE_BYTES, ARENA_PRO_BYTES, ARENA_ULTRA_BYTES, Arena0LiteWire,
     Arena3UltraDeltaWire, KautzSoaBlockWire, PIPE_FLAG_V3_MATRYOSHKA,
     V3_META_STAGE3_PREFIX_OVERRIDES, VARPRO_READOUT_BASES, VarProReadoutFullWire,
     VarProReadoutProWire, VarProReadoutUltraWire, has_pipeline_flag,
 };
+use crate::schema::DnamError;
 use dnam_kernels::{f32_to_fp16, fp16_to_f32};
 use zerocopy::byteorder::little_endian::{F32, U16};
 use zerocopy::{FromBytes, IntoBytes};
 
-pub mod phase;
-pub mod sona_gauge;
-pub mod tardos;
+pub(crate) mod phase;
+pub(crate) mod sona_gauge;
+pub(crate) mod tardos;
 
-pub use crate::stages::weights::{
+pub use crate::graph::weights::{
     STAGE3_EARLY_FIR_BASES, STAGE3_KAUTZ_BASES, STAGE3_KAUTZ_BLOCKS_PER_TIER,
     STAGE3_KAUTZ_TIER_CHANNEL_BASE,
 };
@@ -41,17 +41,7 @@ pub use tardos::{
     score_tardos_watermark_7680, score_tardos_watermark_7680_with_buyer_gauge,
 };
 
-// Preserved for unowned sibling modules (`stages::stage1_pre`, `stages::stage4_tank`).
-#[allow(unused_imports)]
-pub(crate) use crate::stages::weights::read_f32_le;
-
-#[cfg(test)]
-#[inline]
-pub(crate) fn write_f32_le(arena: &mut [u8], byte_offset: usize, val: f32) {
-    if let Some(dst) = arena.get_mut(byte_offset..) {
-        let _ = F32::new(val).write_to_prefix(dst);
-    }
-}
+pub use super::fingerprint::{extract_structural_hash_224d, structural_cosine_similarity};
 
 #[inline]
 pub(crate) const fn max_tiers_for_arena_len(arena_len: usize) -> usize {
@@ -104,7 +94,7 @@ fn rotate_row_4_f32(row: &mut [F32], q_buyer_4x4: &[[f32; 4]; 4]) {
 #[inline]
 fn cp1_inline_v_base_nonzero(
     cp1_base_words: &[F32],
-    dir: &crate::stages::weights::Cp1InlineDirWire,
+    dir: &crate::graph::weights::Cp1InlineDirWire,
 ) -> bool {
     let count = dir.cp1_dir_count.get() as usize;
     if !(1..=8).contains(&count) || dir.flags.get() != 0 {
@@ -350,15 +340,20 @@ pub fn apply_isometric_gauge_watermark(
     Ok(())
 }
 
-pub use super::fingerprint::{extract_structural_hash_224d, structural_cosine_similarity};
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::weights::{ARENA0_CP1_DIR_OFFSET, Cp1InlineDirWire, read_f32_le};
     use crate::provenance::KAUTZ_TOTAL_CHANNELS;
-    use crate::stages::weights::{ARENA0_CP1_DIR_OFFSET, Cp1InlineDirWire};
     use proptest::prelude::*;
     use zerocopy::byteorder::little_endian::U16 as LeU16;
+
+    #[inline]
+    fn write_f32_le(arena: &mut [u8], byte_offset: usize, val: f32) {
+        if let Some(dst) = arena.get_mut(byte_offset..) {
+            let _ = F32::new(val).write_to_prefix(dst);
+        }
+    }
 
     #[test]
     fn test_tardos_4buyer_collusion_gauge_and_phase_coding() {
@@ -629,5 +624,103 @@ mod tests {
             let f_watermarked = extract_structural_hash_224d(&watermarked).unwrap();
             prop_assert!((structural_cosine_similarity(&f_master, &f_watermarked) - 1.0).abs() < 1e-11);
         }
+    }
+
+    #[test]
+    fn test_isometric_gauge_prefix_overrides_inline_and_shared_cp1() {
+        use zerocopy::byteorder::little_endian::{F32 as LeF32, U32 as LeU32};
+
+        // OOB write_f32_le no-op path
+        let mut tiny = [0u8; 4];
+        write_f32_le(&mut tiny, 8, 1.0);
+
+        let q_rot = [
+            [0.0_f32, -1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+
+        // Shared CP1 stream: absent, zero count, invalid stream, and valid rotation
+        let mut no_cp1 = alloc::vec![0u8; 32];
+        apply_isometric_gauge_shared_cp1_stream(&mut no_cp1, &q_rot).unwrap();
+        let mut zero_cp1 = b"CP1\0\0\0\0\0".to_vec();
+        apply_isometric_gauge_shared_cp1_stream(&mut zero_cp1, &q_rot).unwrap();
+        let mut bad_cp1 = b"CP1\0\x01\0\0\0".to_vec();
+        assert!(apply_isometric_gauge_shared_cp1_stream(&mut bad_cp1, &q_rot).is_err());
+
+        let mut slot = Cp1ContributorSlot::zero();
+        slot.lanes = 2;
+        slot.control_idx = 0;
+        slot.main_base[0][0] = 2.0;
+        slot.main_base[0][4] = 5.0;
+        slot.main_base[1][1] = 3.0;
+        slot.v_base = [7.0, 0.0, 0.0, 0.0];
+        let encoded = encode_cp1_shared_stream(&[slot]).unwrap();
+        let mut shared = alloc::vec![0u8; 64];
+        shared.extend_from_slice(&encoded);
+        apply_isometric_gauge_shared_cp1_stream(&mut shared, &q_rot).unwrap();
+        let mut decoded = [Cp1ContributorSlot::zero(); 1];
+        assert_eq!(
+            decode_cp1_shared_stream_into_slice(&shared[64..], &mut decoded).unwrap(),
+            1
+        );
+        assert!((decoded[0].main_base[0][1] + 2.0).abs() < 1e-6);
+        assert!((decoded[0].main_base[0][4] - 5.0).abs() < 1e-6);
+        assert!((decoded[0].v_base[0] - 7.0).abs() < 1e-6);
+
+        // Lite arena with prefix_overrides enabled + inline CP1 variants
+        let mut lite = alloc::vec![0u8; ARENA_LITE_BYTES];
+        {
+            let (a0, _) = Arena0LiteWire::mut_from_prefix(&mut lite).unwrap();
+            a0.stage0.meta.pipeline_flags =
+                LeU32::new(crate::graph::weights::PIPE_MAGIC_HI | PIPE_FLAG_V3_MATRYOSHKA);
+            a0.stage0.meta.v3_meta_flags = LeU32::new(V3_META_STAGE3_PREFIX_OVERRIDES);
+            a0.ctrl_base.cp1_dir = Cp1InlineDirWire {
+                cp1_dir_count: LeU16::new(2),
+                flags: LeU16::new(0),
+                entries: [[0; 3]; 8],
+            };
+            a0.ctrl_base.cp1_dir.entries[0] = [0, 1, 0xFF];
+            a0.ctrl_base.cp1_dir.entries[1] = [1, 2, 0xFF];
+            let words = <[LeF32]>::mut_from_bytes(&mut a0.ctrl_base.cp1_base).unwrap();
+            words[13 + 18] = LeF32::new(1.5);
+        }
+        apply_isometric_gauge_watermark(&mut lite, &[1.25; KAUTZ_TOTAL_CHANNELS], &q_rot).unwrap();
+        let (a0_check, _) = Arena0LiteWire::ref_from_prefix(&lite).unwrap();
+        assert!((a0_check.ctrl_base.u_int_base[0][4].get() - 1.0).abs() < 1e-6);
+
+        // Inline CP1 with all-zero v_base, then invalid lanes (0) hitting break
+        {
+            let (a0, _) = Arena0LiteWire::mut_from_prefix(&mut lite).unwrap();
+            a0.ctrl_base.cp1_base.fill(0);
+            a0.ctrl_base.cp1_dir.cp1_dir_count = LeU16::new(1);
+        }
+        apply_isometric_gauge_watermark(&mut lite, &[1.0; KAUTZ_TOTAL_CHANNELS], &q_rot).unwrap();
+        {
+            let (a0, _) = Arena0LiteWire::mut_from_prefix(&mut lite).unwrap();
+            a0.ctrl_base.cp1_dir.entries[0] = [0, 0, 0xFF];
+        }
+        apply_isometric_gauge_watermark(&mut lite, &[1.0; KAUTZ_TOTAL_CHANNELS], &q_rot).unwrap();
+
+        // Ultra arena with prefix_overrides enabled and both zero & non-zero fp16 slots
+        let mut ultra = alloc::vec![0u8; ARENA_ULTRA_BYTES];
+        {
+            let (a0, _) = Arena0LiteWire::mut_from_prefix(&mut ultra).unwrap();
+            a0.stage0.meta.pipeline_flags =
+                LeU32::new(crate::graph::weights::PIPE_MAGIC_HI | PIPE_FLAG_V3_MATRYOSHKA);
+            a0.stage0.meta.v3_meta_flags = LeU32::new(V3_META_STAGE3_PREFIX_OVERRIDES);
+        }
+        let half = U16::new(f32_to_fp16(0.5));
+        let (wf, _) =
+            VarProReadoutFullWire::mut_from_prefix(&mut ultra[VARPRO_READOUT_BASES[1]..]).unwrap();
+        wf.w_ro_and_mods_fp16[296 + 32] = half;
+        let (wp, _) =
+            VarProReadoutProWire::mut_from_prefix(&mut ultra[VARPRO_READOUT_BASES[2]..]).unwrap();
+        wp.w_ro_and_mods_fp16[392 + 32] = half;
+        let (wu, _) =
+            VarProReadoutUltraWire::mut_from_prefix(&mut ultra[VARPRO_READOUT_BASES[3]..]).unwrap();
+        wu.w_ro_and_mods_fp16[488 + 96] = half;
+        apply_isometric_gauge_watermark(&mut ultra, &[1.25; KAUTZ_TOTAL_CHANNELS], &q_rot).unwrap();
     }
 }

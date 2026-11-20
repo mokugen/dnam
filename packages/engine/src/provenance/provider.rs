@@ -522,7 +522,12 @@ mod tests {
         let open = OpenArenaCryptoProvider;
         assert!(open.local_device_id_hash().is_none());
         assert!(open.marketplace_pubkey().is_none());
+        assert!(open.device_pubkey_x25519().is_none());
         assert!(open.ed25519_verify(&[0u8; 32], b"msg", &[0u8; 64]).is_err());
+        assert!(
+            open.aead_chacha20poly1305_open(&[0u8; 32], &[0u8; 12], b"", &[0u8; 16])
+                .is_err()
+        );
 
         let dummy_dev = AuthorizedDevice {
             oem_vendor: String::from("darkglass"),
@@ -578,6 +583,56 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[cfg(feature = "crypto")]
+    #[test]
+    fn test_ref_provider_aead_and_unwrap_device_cek_edges() {
+        fn call_ref<P: CryptoProvider>(p: P, dev_pk: [u8; 32]) {
+            assert_eq!(p.device_pubkey_x25519(), Some(dev_pk));
+            assert!(
+                p.aead_chacha20poly1305_open(&[0u8; 32], &[0u8; 12], b"", &[0u8; 16])
+                    .is_err()
+            );
+        }
+        let dev_sk = [9u8; 32];
+        let dev_pk = RustCryptoProvider::x25519_pubkey_from_secret(&dev_sk);
+        let dev_id = encode_hex(&[3u8; 16]);
+        let prov = RustCryptoProvider::new().with_device_key(&dev_id, dev_sk);
+        call_ref(&prov, dev_pk);
+
+        let eph_sk = [7u8; 32];
+        let eph_pk = RustCryptoProvider::x25519_pubkey_from_secret(&eph_sk);
+        let cek = [0xABu8; 32];
+        let wrapped = RustCryptoProvider::wrap_device_cek(&eph_sk, &dev_pk, &dev_id, &cek).unwrap();
+        let mut rcpt = MarketplaceReceipt {
+            marketplace_id: String::from("m"),
+            license_id: String::from("l"),
+            buyer_hash: String::from("00"),
+            license_tier: String::from("personal"),
+            issued_at: String::from("2026-10-23T00:00:00Z"),
+            buyer_arena_sha256: String::from("00"),
+            buyer_tier_arena_sha256: None,
+            encryption_mode: String::from("x25519"),
+            arena_nonce_96: None,
+            ephemeral_pubkey_x25519: Some(encode_hex(&[0u8; 32])),
+            authorized_devices: alloc::vec![],
+            royalty_splits: alloc::vec![],
+            receipt_sig_ed25519: String::from("00"),
+        };
+        let mut dev = AuthorizedDevice {
+            oem_vendor: String::from("oem"),
+            model_code: String::from("m"),
+            device_id_hash: dev_id,
+            wrapped_cek: Some(encode_hex(&wrapped)),
+        };
+        assert!(prov.unwrap_device_cek(&rcpt, &dev).is_err());
+        rcpt.ephemeral_pubkey_x25519 = Some(encode_hex(&eph_pk));
+        assert_eq!(*prov.unwrap_device_cek(&rcpt, &dev).unwrap(), cek);
+        let mut bad_wrapped = wrapped;
+        bad_wrapped[0] ^= 1;
+        dev.wrapped_cek = Some(encode_hex(&bad_wrapped));
+        assert!(prov.unwrap_device_cek(&rcpt, &dev).is_err());
     }
 }
 

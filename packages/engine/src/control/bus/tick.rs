@@ -1,7 +1,7 @@
 //! $3\text{ kHz}$ Control-Bus tick execution, static basis evaluation, tank modulation, and micro-ramping.
 
 pub mod simd_and_clip;
-pub mod tank_mod;
+mod target_dispatch;
 
 use crate::math::{MathBackend, flush_recursive_state_f32};
 
@@ -22,15 +22,15 @@ impl<B: MathBackend> ControlBus<B> {
     }
 
     /// Executes one $3\text{ kHz}$ Control-Bus tick with optional 4-band stereo-linked ballistic
-    /// detector states `[e_low, e_mid, e_high, e_aux]` from `Stage 0` (`r[dsp.ctrl.modulators.dynamic]`).
+    /// detector states `[e_low, e_mid, e_high, e_aux]` from `IoRouter` (`r[dsp.ctrl.modulators.dynamic]`).
     #[inline]
     pub fn tick_3khz_with_detectors(
         &mut self,
         audio_abs_energy: f32,
-        stage0_detectors: Option<[f32; 4]>,
+        crossbar_detectors: Option<[f32; 4]>,
         arena_bytes: &[u8],
     ) -> bool {
-        if let Some(det) = stage0_detectors {
+        if let Some(det) = crossbar_detectors {
             for b in 0..4 {
                 self.env_states[b] = flush_recursive_state_f32(det[b]);
             }
@@ -97,7 +97,7 @@ impl<B: MathBackend> ControlBus<B> {
         }
 
         if !self.is_dirty {
-            self.evaluate_tank_modulation(arena_bytes);
+            self.evaluate_target_dispatch(arena_bytes);
             return false;
         }
 
@@ -130,13 +130,13 @@ impl<B: MathBackend> ControlBus<B> {
     }
 
     /// Snaps `current_u_norm` to `target_u_norm`, evaluates `z_head`, `z_head_ultra`, and
-    /// `evaluate_tank_modulation` at the current control positions and LFO/envelope states
+    /// `evaluate_target_dispatch` at the current control positions and LFO/envelope states
     /// **without** advancing LFO phasors or envelope followers, and clears `is_dirty`.
     #[inline]
     pub fn refresh_static_state(&mut self, arena_bytes: &[u8]) {
-        self.unified_w_ctrl = crate::stages::weights::has_pipeline_flag(
+        self.unified_w_ctrl = crate::graph::weights::has_pipeline_flag(
             arena_bytes,
-            crate::stages::weights::PIPE_FLAG_UNIFIED_W_CTRL,
+            crate::graph::weights::PIPE_FLAG_UNIFIED_W_CTRL,
         );
         for (current, &target) in self.current_u_norm.iter_mut().zip(&self.target_u_norm) {
             *current = flush_recursive_state_f32(target);
@@ -283,7 +283,7 @@ impl<B: MathBackend> ControlBus<B> {
             }
 
             if self.ultra_tier_active
-                && arena_bytes.len() >= crate::stages::weights::ARENA_ULTRA_BYTES
+                && arena_bytes.len() >= crate::graph::weights::ARENA_ULTRA_BYTES
             {
                 let (delta_base_8, uint_ultra_8, has_uint_ultra) =
                     eval_uint_ultra_delta_3x4x8(arena_bytes, z_fm_base, z_fm_ultra, s_emb);
@@ -317,7 +317,7 @@ impl<B: MathBackend> ControlBus<B> {
             self.z_head = z_head_4;
             self.ctrl_basis_4 = z_stage_4;
             self.sync_z_stage();
-            self.evaluate_tank_modulation(arena_bytes);
+            self.evaluate_target_dispatch(arena_bytes);
             return;
         }
 
@@ -385,8 +385,7 @@ impl<B: MathBackend> ControlBus<B> {
         self.z_head = z_head_4;
         self.ctrl_basis_4 = z_stage_4;
 
-        if self.ultra_tier_active && arena_bytes.len() >= crate::stages::weights::ARENA_ULTRA_BYTES
-        {
+        if self.ultra_tier_active && arena_bytes.len() >= crate::graph::weights::ARENA_ULTRA_BYTES {
             trust_clip_outward_4d(&mut z_acc_ultra_4, self.trust_radius_mh);
             self.z_head_ultra = z_acc_ultra_4;
             self.z_stage_ultra = [0.0; 4];
@@ -396,7 +395,7 @@ impl<B: MathBackend> ControlBus<B> {
         }
 
         self.sync_z_stage();
-        self.evaluate_tank_modulation(arena_bytes);
+        self.evaluate_target_dispatch(arena_bytes);
     }
 
     /// Synchronizes the unrotated 8-D `z_stage = [ctrl_basis_4[0..4], z_stage_ultra[0..4]]` vector
@@ -421,12 +420,12 @@ mod tests {
     use super::*;
     use crate::container::ARENA_OFFSET_LITE_END;
     use crate::control::{ConditionalClampRule, ControlClampDescriptor};
-    use crate::math::ScalarBackend;
-    use crate::stages::weights::{
+    use crate::graph::weights::{
         ARENA_ULTRA_BYTES, ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET, ARENA0_PIPELINE_FLAGS_OFFSET,
         ARENA3_CTRL_OFFSET, Arena0ControlBusWire, Arena3ControlBusWire, Cp1InlineDirWire,
         PIPE_FLAG_UNIFIED_W_CTRL, PIPE_MAGIC_HI,
     };
+    use crate::math::ScalarBackend;
     use alloc::boxed::Box;
     use alloc::vec;
     use proptest::prelude::*;
@@ -642,10 +641,10 @@ mod tests {
         assert_eq!(&cb.z_stage[0..4], &cb.ctrl_basis_4);
         assert_eq!(&cb.z_stage[4..8], &cb.z_stage_ultra);
 
-        // Short arena slice exercises early return in evaluate_tank_modulation
+        // Short arena slice exercises early return in evaluate_target_dispatch
         let short_arena = [0u8; 1024];
         cb.refresh_static_state(&short_arena);
-        assert!(!cb.tank_mod_dirty);
+        assert!(!cb.target_dispatch_dirty);
 
         let q16 = ControlBus::<ScalarBackend>::assemble_q16(&[1.0; 8], &[2.0; 8]);
         assert_eq!(&q16[0..8], &[1.0; 8]);

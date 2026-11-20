@@ -219,3 +219,54 @@ pub fn validate_mutable_json_schema(doc: &Value) -> Result<(), DnamError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provenance::Dme1HeaderWire;
+    use serde_json::json;
+
+    #[test]
+    fn test_dmu1_dme1_framing_and_mutable_schema_error_paths() {
+        assert!(build_dmu1_mutable_frame(b"{", 32).is_err());
+        assert!(build_dmu1_mutable_frame(b"{}", 16).is_err());
+
+        assert!(validate_dmu1_frame_no_alloc(b"DMU1").is_err());
+        assert!(validate_dmu1_frame_no_alloc(b"XXXX000000000000{}").is_err());
+        assert!(validate_dmu1_frame_no_alloc(b"DMU1000000000000{").is_err());
+
+        let mut bad_len_small = [0u8; 20];
+        bad_len_small[..4].copy_from_slice(b"DMU1");
+        bad_len_small[8..16].copy_from_slice(U64::new(1).as_bytes());
+        assert!(validate_dmu1_frame_no_alloc(&bad_len_small).is_err());
+        bad_len_small[8..16].copy_from_slice(U64::new(99).as_bytes());
+        assert!(validate_dmu1_frame_no_alloc(&bad_len_small).is_err());
+
+        let bom_frame = build_dmu1_mutable_frame(b"\xEF\xBB\xBF{}", 24).unwrap();
+        assert!(validate_dmu1_frame_no_alloc(&bom_frame).is_err());
+        let bad_utf8 = build_dmu1_mutable_frame(b"\xFF\xFE{}", 24).unwrap();
+        assert!(validate_dmu1_frame_no_alloc(&bad_utf8).is_err());
+        let array_frame = build_dmu1_mutable_frame(b"[]", 24).unwrap();
+        assert!(validate_dmu1_frame_no_alloc(&array_frame).is_err());
+
+        let mut dme1 = vec![0u8; 192];
+        let dme_hdr = Dme1HeaderWire::new(1, 1, 70).unwrap().to_bytes();
+        dme1[..20].copy_from_slice(&dme_hdr);
+        validate_dme1_frame_no_alloc(&dme1, 1).unwrap();
+        assert!(validate_dme1_frame_no_alloc(&dme1, 2).is_err());
+        assert!(validate_dme1_frame_no_alloc(&dme1[..100], 1).is_err());
+        let mut dme1_pad = dme1.clone();
+        dme1_pad[180] = 1;
+        assert!(validate_dme1_frame_no_alloc(&dme1_pad, 1).is_err());
+        assert!(validate_dme1_frame_no_alloc(&[0u8; 32], 1).is_err());
+
+        let bad_desc = json!({
+            "presets": [{"id": "a", "name": "A", "description": 123, "controls": {}}]
+        });
+        assert!(validate_mutable_json_schema(&bad_desc).is_err());
+        let bad_um = json!({
+            "presets": [{"id": "a", "name": "A", "user_metadata": [], "controls": {}}]
+        });
+        assert!(validate_mutable_json_schema(&bad_um).is_err());
+    }
+}

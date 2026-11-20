@@ -29,8 +29,8 @@ pub use wire::{
     parse_structured_conditional_bounds, parse_structured_conditional_curves,
     project_immutable_header_value, resolve_conditional_safe_interval,
     select_conditional_calibration_curve, serialize_jcs_value, strip_v3_open_dnam_container,
-    validate_canonical_jcs_header_bytes, validate_delay_histories, validate_dmu1_frame_no_alloc,
-    validate_mutable_json_schema, validate_stage3_tier_slices, validate_v3_dnam_layout_no_alloc,
+    validate_cabinet_tier_slices, validate_canonical_jcs_header_bytes, validate_delay_histories,
+    validate_dmu1_frame_no_alloc, validate_mutable_json_schema, validate_v3_dnam_layout_no_alloc,
     validate_v3_dnam_layout_with_max_profile, validate_v3_dnam_layout_with_max_profile_no_alloc,
     validate_v3_open_dnam_layout,
 };
@@ -89,10 +89,10 @@ const _: () = assert!(ARENA_OFFSET_LITE_END == 4_608);
 const _: () = assert!(ARENA_OFFSET_FULL_END == 7_936);
 const _: () = assert!(ARENA_OFFSET_PRO_END == 15_872);
 const _: () = assert!(ARENA_OFFSET_ULTRA_END == 30_720);
-const _: () = assert!(ARENA_OFFSET_LITE_END as usize == crate::stages::weights::ARENA_LITE_BYTES);
-const _: () = assert!(ARENA_OFFSET_FULL_END as usize == crate::stages::weights::ARENA_FULL_BYTES);
-const _: () = assert!(ARENA_OFFSET_PRO_END as usize == crate::stages::weights::ARENA_PRO_BYTES);
-const _: () = assert!(ARENA_OFFSET_ULTRA_END as usize == crate::stages::weights::ARENA_ULTRA_BYTES);
+const _: () = assert!(ARENA_OFFSET_LITE_END as usize == crate::graph::weights::ARENA_LITE_BYTES);
+const _: () = assert!(ARENA_OFFSET_FULL_END as usize == crate::graph::weights::ARENA_FULL_BYTES);
+const _: () = assert!(ARENA_OFFSET_PRO_END as usize == crate::graph::weights::ARENA_PRO_BYTES);
+const _: () = assert!(ARENA_OFFSET_ULTRA_END as usize == crate::graph::weights::ARENA_ULTRA_BYTES);
 
 // ============================================================================
 // Preamble Flag Bits (`flags: u16`)

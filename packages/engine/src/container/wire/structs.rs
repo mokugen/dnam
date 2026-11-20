@@ -7,7 +7,7 @@ use core::mem::{align_of, size_of};
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-pub use crate::stages::weights::SonaCellDescWire;
+pub use crate::graph::weights::SonaCellDescWire;
 
 /// Fixed 64-byte preamble size (`0..64`, `ref[container.dnam.preamble-directory]`).
 pub const V3_PREAMBLE_SIZE: usize = 64;

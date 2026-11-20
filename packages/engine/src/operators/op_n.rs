@@ -9,8 +9,9 @@ pub mod wavefolder_and_bitcrusher;
 use crate::math::SimdVec4;
 
 pub use commuted_and_ctrl::{
-    eval_chebyshev_4harm, eval_commuted_vs_uncommuted_lti_cascade_f64, eval_lobatto_basis_3node,
-    eval_stage2_stereo_coupling_16d, fold_stage2_latent_weights, trust_region_softclip_4d,
+    eval_chebyshev_4harm, eval_commuted_vs_uncommuted_lti_cascade_f64,
+    eval_core_stereo_coupling_16d, eval_lobatto_basis_3node, fold_core_latent_weights,
+    trust_region_softclip_4d,
 };
 pub use dnam_kernels::{
     ParaLruParams, SOFT_RECT_EPS, SonaBlockOutputStereo8, SonaBlockParamsStereo4,
@@ -23,9 +24,8 @@ pub use dnam_kernels::{
 };
 pub use wavefolder_and_bitcrusher::{
     FixedHzBitcrusher, QuadratureHysteresis2D, ZohBitcrusher, c2_wavefolder,
-    eval_adaa_cubic_c2_wavefolder_f64, eval_adaa_cubic_c2_wavefolder_odd_f32,
-    hertz_phase_parameters, hertz_phase_step, quantize_bitcrusher_nearest_ties_pos_inf,
-    rescale_bitcrusher_phase_u128,
+    eval_adaa_cubic_c2_wavefolder_odd_f32, hertz_phase_parameters, hertz_phase_step,
+    quantize_bitcrusher_nearest_ties_pos_inf, rescale_bitcrusher_phase_u128,
 };
 
 const TANH_R4_F64: [f64; 4] = crate::math::const_c1_clamped_tanh_coeffs(4.0);
@@ -147,7 +147,6 @@ mod tests {
     #[test]
     fn test_sona_polyadaa_and_group_kernel_contracts() {
         use crate::FtzDazGuard;
-        use crate::operators::reference::eval_saturated_polyadaa_rail_crossing_f64;
         use dnam_kernels::{KernelVec4, StereoVec8};
 
         let _guard = FtzDazGuard::new();
@@ -196,8 +195,24 @@ mod tests {
         let rc_o_arr = KernelVec4::to_array(rc_odd);
         let rc_e_arr = KernelVec4::to_array(rc_even);
         for i in 0..4 {
-            let (exp_o, exp_e, _) =
-                eval_saturated_polyadaa_rail_crossing_f64(f64::from(rc_p[i]), f64::from(rc_c[i]));
+            let p = f64::from(rc_p[i]);
+            let c = f64::from(rc_c[i]);
+            let lower = p.min(c);
+            let upper = p.max(c);
+            let dist = upper - lower;
+            let below = (upper.min(-1.0) - lower).max(0.0);
+            let above = (upper - lower.max(1.0)).max(0.0);
+            let u0 = lower.max(-1.0);
+            let u1 = upper.min(1.0);
+            let (odd_int, even_int) = if u1 > u0 {
+                let f_odd = |u: f64| 0.75 * u * u - 0.125 * u * u * u * u;
+                let f_even = |u: f64| u * u * u / 3.0 - u * u * u * u * u / 5.0;
+                (f_odd(u1) - f_odd(u0), f_even(u1) - f_even(u0))
+            } else {
+                (0.0, 0.0)
+            };
+            let exp_o = (-below + odd_int + above) / dist;
+            let exp_e = even_int / dist;
             assert!((f64::from(rc_o_arr[i]) - exp_o).abs() < 2.0e-5);
             assert!((f64::from(rc_e_arr[i]) - exp_e).abs() < 2.0e-5);
         }

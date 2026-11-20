@@ -241,9 +241,9 @@ mod tests {
         // verify[dsp.ctrl.op-m.spsc-ingress]
         // verify[arch.telemetry.seqlock-publication]
         let mut header = DnamJsonHeader::default_reference();
-        header.stage4_tank.dc_blocker_pole = 0.985;
-        header.stage4_tank.tzf_reference_tap_samples = 48.0;
-        header.stage4_tank.switch_xfade_samples = 96;
+        header.spatial_tank.dc_blocker_pole = 0.985;
+        header.spatial_tank.tzf_reference_tap_samples = 48.0;
+        header.spatial_tank.switch_xfade_samples = 96;
         header.controls_schema = vec![ControlSchemaDef {
             id: String::from("gain"),
             name: String::from("Gain"),

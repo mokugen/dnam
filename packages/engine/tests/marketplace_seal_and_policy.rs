@@ -9,6 +9,8 @@ use dnam_engine::container::{
     ARENA_OFFSET_FULL_END, ARENA_OFFSET_ULTRA_END, DnamContainerView, DnamPreambleWire,
     build_dnam_container,
 };
+use dnam_engine::graph::sona_core::SonaMatryoshkaModel;
+use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::provenance::{
     DNSL_MAGIC, Dme1HeaderWire, DnslDirectoryWire, DnslPreambleWire, RustCryptoProvider,
@@ -20,8 +22,6 @@ use dnam_engine::schema::{
     AuthorizedDevice, CreatorSignature, DistributionPolicy, DnamError, DnamJsonHeader,
     DnamProtectionProfile, MarketplaceReceipt, ModelSignatures, PresetDef,
 };
-use dnam_engine::stages::sona_core::SonaMatryoshkaModel;
-use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::{DnamEngine, DynamicDnamEngine, Tier};
 use zerocopy::FromBytes;
 

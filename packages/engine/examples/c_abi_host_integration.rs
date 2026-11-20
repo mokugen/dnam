@@ -15,9 +15,9 @@ use dnam_engine::ffi::{
     dnam_engine_reset, dnam_engine_set_control_value, dnam_engine_set_offline_bounce,
     dnam_engine_set_sample_rate, dnam_engine_set_tier,
 };
+use dnam_engine::graph::sona_core::SonaMatryoshkaModel;
+use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::schema::DnamJsonHeader;
-use dnam_engine::stages::sona_core::SonaMatryoshkaModel;
-use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 
 fn main() {
     let mut header = DnamJsonHeader::default_reference();

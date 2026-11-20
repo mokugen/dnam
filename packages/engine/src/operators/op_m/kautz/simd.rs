@@ -1,4 +1,4 @@
-//! 4-lane SIMD and 8-lane stereo kernels for [`super::KautzModalBank`] (`Stage III`),
+//! 4-lane SIMD and 8-lane stereo kernels for [`super::KautzModalBank`] (`Cabinet`),
 //! bridged onto [`dnam_kernels::step_kautz_quad_stereo8`] and [`crate::math::MathBackend::Stereo8`].
 
 use dnam_kernels::{KautzQuadState, StereoVec8, step_kautz_quad_stereo8};

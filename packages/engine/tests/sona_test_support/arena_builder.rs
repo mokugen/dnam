@@ -8,19 +8,19 @@ use dnam_engine::container::{
     ARENA_OFFSET_ULTRA_END, StructuredConditionalBound, StructuredConditionalCurve,
     build_dnam_container,
 };
-use dnam_engine::schema::{
-    ControlCalibration, ControlCalibrationRole, ControlKind, ControlSchemaDef, ControlUiHints,
-    DnamJsonHeader, PresetDef, TempoSubdivision,
-};
-use dnam_engine::stages::sona_core::{
+use dnam_engine::graph::sona_core::{
     MAX_KAUTZ_POLES, MAX_SONA_GROUPS, MAX_SONA_TILES, MAX_TOTAL_SONA_LANES, SONA_FIR_MAX_TAPS,
     SonaControlBusParams, SonaCrossbarConfig, SonaMatryoshkaModel, SonaTierReadout,
 };
-use dnam_engine::stages::weights::{
+use dnam_engine::graph::weights::{
     ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET, ARENA0_CP1_BASE_OFFSET, ARENA0_CP1_DIR_OFFSET,
     ARENA0_RHO_HEAD_OFFSET, ARENA0_TIER_GAIN_TRIM_OFFSET, ARENA0_UINT_BASE_OFFSET,
     ARENA0_W_CTRL_OFFSET, ARENA3_CP1_ULTRA_OFFSET, ARENA3_UINT_ULTRA_OFFSET,
     ARENA3_W_CTRL_ULTRA_OFFSET, Cp1InlineDirWire, pack_sona_matryoshka_to_arena, write_f32_le,
+};
+use dnam_engine::schema::{
+    ControlCalibration, ControlCalibrationRole, ControlKind, ControlSchemaDef, ControlUiHints,
+    DnamJsonHeader, PresetDef, TempoSubdivision,
 };
 use zerocopy::FromBytes;
 use zerocopy::byteorder::little_endian::U16;

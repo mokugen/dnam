@@ -4,7 +4,6 @@
 
 pub mod op_t_and_ctrl;
 pub mod poly_and_op_m;
-pub mod rail_crossing;
 
 pub use op_t_and_ctrl::{
     catmull_rom_hermite_f64, cubic_lagrange_weights_f64, eval_chebyshev_lfo_4harm_f64,
@@ -15,4 +14,3 @@ pub use op_t_and_ctrl::{
 pub use poly_and_op_m::{
     op_m_modal_step_f64, poly_adaa_algebraic_f64, poly_adaa_slice_f64, poly_adaa_step_f64,
 };
-pub use rail_crossing::eval_saturated_polyadaa_rail_crossing_f64;

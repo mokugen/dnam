@@ -482,3 +482,202 @@ impl TrainerMathBackend for ArmSve2Backend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use alloc::{vec, vec::Vec};
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::math::trainer::{ScalarF64Vec2, SimdF64Vec2};
+    use crate::math::{BackendKind, warm_simd_feature_caches};
+
+    #[test]
+    fn test_sve2_f64_vec2_and_edge_lengths() {
+        warm_simd_feature_caches();
+        assert_eq!(ArmSve2Backend::trainer_backend_kind(), BackendKind::ArmSve2);
+
+        let a = Sve2F64Vec2::from_array([1.5, -2.5]);
+        let b = Sve2F64Vec2::splat_pair(2.0, -4.0);
+        let c = Sve2F64Vec2::from_f32_pair(0.5, -1.25);
+        let sa = ScalarF64Vec2::from_array([1.5, -2.5]);
+        let sb = ScalarF64Vec2::splat_pair(2.0, -4.0);
+        let sc = ScalarF64Vec2::from_f32_pair(0.5, -1.25);
+        let mut stored = [0.0_f64; 2];
+        a.store(&mut stored);
+        assert_eq!(stored, [1.5, -2.5]);
+        assert_eq!(Sve2F64Vec2::zero().to_array(), [0.0, 0.0]);
+        assert_eq!(a.add(b).to_array(), sa.add(sb).to_array());
+        assert_eq!(a.sub(b).to_array(), sa.sub(sb).to_array());
+        assert_eq!(a.mul(b).to_array(), sa.mul(sb).to_array());
+        assert!((a.fma(b, c).horizontal_sum() - sa.fma(sb, sc).horizontal_sum()).abs() <= 1e-12);
+        assert!((a.fms(b, c).horizontal_sum() - sa.fms(sb, sc).horizontal_sum()).abs() <= 1e-12);
+        assert_eq!(
+            a.fma_lane::<0>(b, c).to_array(),
+            sa.fma_lane::<0>(sb, sc).to_array()
+        );
+        assert_eq!(
+            a.fma_lane::<1>(b, c).to_array(),
+            sa.fma_lane::<1>(sb, sc).to_array()
+        );
+        assert_eq!(
+            a.mul_add_ieee(b, c).to_array(),
+            sa.mul_add_ieee(sb, sc).to_array()
+        );
+        assert_eq!(a.max(b).to_array(), sa.max(sb).to_array());
+        assert_eq!(a.min(b).to_array(), sa.min(sb).to_array());
+        assert_eq!(
+            a.clamp(Sve2F64Vec2::splat(-2.0), Sve2F64Vec2::splat(2.0))
+                .to_array(),
+            [1.5, -2.0]
+        );
+        assert_eq!(a.abs().to_array(), [1.5, 2.5]);
+        assert_eq!(
+            a.horizontal_sum_pair(b),
+            (sa.horizontal_sum(), sb.horizontal_sum())
+        );
+        assert_eq!(a.dot(b), sa.dot(sb));
+
+        for len in [0_usize, 1, 2, 3, 4, 7, 8, 9, 17] {
+            let x: Vec<f64> = (0..len)
+                .map(|i| 0.29 * ((i as f64) * 0.21).sin() - 0.1)
+                .collect();
+            let y: Vec<f64> = (0..len)
+                .map(|i| -0.37 * ((i as f64) * 0.17).cos() + 0.05)
+                .collect();
+            let z: Vec<f64> = (0..len)
+                .map(|i| 0.41 * ((i as f64) * 0.13).sin() + 0.08)
+                .collect();
+            let dot_diff = ArmSve2Backend::dot_f64(&x, &y) - ScalarBackend::dot_f64(&x, &y);
+            assert!(dot_diff.abs() <= 1e-11);
+            let (dp0, dp1) = ArmSve2Backend::dot_pair_f64(&x, &y, &z);
+            let (sp0, sp1) = ScalarBackend::dot_pair_f64(&x, &y, &z);
+            assert!((dp0 - sp0).abs() <= 1e-11 && (dp1 - sp1).abs() <= 1e-11);
+            let sq_diff = ArmSve2Backend::sum_sq_f64(&x) - ScalarBackend::sum_sq_f64(&x);
+            assert!(sq_diff.abs() <= 1e-11);
+
+            let (mut ay, mut sy) = (x.clone(), x.clone());
+            ArmSve2Backend::axpy_f64(&mut ay, -0.625, &y);
+            ScalarBackend::axpy_f64(&mut sy, -0.625, &y);
+            assert!(ay.iter().zip(&sy).all(|(u, v)| (u - v).abs() <= 1e-11));
+
+            let (mut apy, mut spy) = (x.clone(), x.clone());
+            ArmSve2Backend::axpy_pair_f64(&mut apy, 0.5, &y, -0.75, &z);
+            ScalarBackend::axpy_pair_f64(&mut spy, 0.5, &y, -0.75, &z);
+            assert!(apy.iter().zip(&spy).all(|(u, v)| (u - v).abs() <= 1e-11));
+
+            ArmSve2Backend::scale_f64(&mut ay, 1.375);
+            ScalarBackend::scale_f64(&mut sy, 1.375);
+            assert!(ay.iter().zip(&sy).all(|(u, v)| (u - v).abs() <= 1e-11));
+
+            let x32: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+            let y32: Vec<f32> = y.iter().map(|&v| v as f32).collect();
+            let (mut ds, mut db) = (vec![0.0_f64; len], vec![0.0_f64; len]);
+            ArmSve2Backend::sub_f32_to_f64(&mut db, &x32, &y32);
+            ScalarBackend::sub_f32_to_f64(&mut ds, &x32, &y32);
+            assert!(db.iter().zip(&ds).all(|(u, v)| u.to_bits() == v.to_bits()));
+
+            let ci = [x.as_slice(), y.as_slice(), z.as_slice(), x.as_slice()];
+            let cj = [y.as_slice(), z.as_slice(), x.as_slice(), z.as_slice()];
+            let gt_b = ArmSve2Backend::gram_tile_4x4_f64(ci, cj);
+            let gt_s = ScalarBackend::gram_tile_4x4_f64(ci, cj);
+            for r in 0..4 {
+                assert!(
+                    gt_b[r]
+                        .iter()
+                        .zip(&gt_s[r])
+                        .all(|(u, v)| (u - v).abs() <= 1e-11)
+                );
+            }
+            let gs_b = ArmSve2Backend::gram_sym_block4_f64(ci);
+            let gs_s = ScalarBackend::gram_sym_block4_f64(ci);
+            assert!(gs_b.iter().zip(&gs_s).all(|(u, v)| (u - v).abs() <= 1e-11));
+
+            let f0: Vec<[f64; 4]> = (0..len).map(|k| [k as f64 * 0.1, -0.2, 0.3, 0.4]).collect();
+            let f1: Vec<[f64; 4]> = (0..len)
+                .map(|k| [-0.5, k as f64 * 0.05, 0.15, -0.8])
+                .collect();
+            let wf: Vec<[f64; 4]> = (0..len)
+                .map(|k| [0.4, -0.3, 0.2 + k as f64 * 0.02, -0.6])
+                .collect();
+            let t4_b = ArmSve2Backend::contract_tile_4x4_ieee_f64(&f0, &wf);
+            let t4_s = ScalarBackend::contract_tile_4x4_ieee_f64(&f0, &wf);
+            let (t8a_b, t8b_b) = ArmSve2Backend::contract_tile_8x4_ieee_f64(&f0, &f1, &wf);
+            let (t8a_s, t8b_s) = ScalarBackend::contract_tile_8x4_ieee_f64(&f0, &f1, &wf);
+            for r in 0..4 {
+                for col in 0..4 {
+                    assert_eq!(t4_b[r][col].to_bits(), t4_s[r][col].to_bits());
+                    assert_eq!(t8a_b[r][col].to_bits(), t8a_s[r][col].to_bits());
+                    assert_eq!(t8b_b[r][col].to_bits(), t8b_s[r][col].to_bits());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sve2_f64_mismatched_lengths_and_bezout7() {
+        warm_simd_feature_caches();
+        let a = [1.0, 2.0, 3.0, 4.0, 5.0];
+        let b = [0.5, -1.0, 1.5];
+        let c = [2.0, 3.0];
+        assert!((ArmSve2Backend::dot_f64(&a, &b) - 3.0).abs() <= 1e-12);
+        let (p0, p1) = ArmSve2Backend::dot_pair_f64(&a, &b, &c);
+        assert!((p0 + 1.5).abs() <= 1e-12 && (p1 - 8.0).abs() <= 1e-12);
+
+        let mut dst = [9.0_f64; 5];
+        ArmSve2Backend::axpy_f64(&mut dst, 2.0, &b);
+        assert_eq!(dst, [10.0, 7.0, 12.0, 9.0, 9.0]);
+        ArmSve2Backend::axpy_pair_f64(&mut dst, 1.0, &b, -1.0, &c);
+        assert_eq!(dst, [8.5, 3.0, 12.0, 9.0, 9.0]);
+
+        let fb: [f32; 256] = core::array::from_fn(|idx| ((idx as f32) * 0.17).sin() * 0.3);
+        for dim in [0_usize, 1, 3, 7, 65, 256, 300] {
+            let (mut ub, mut us) = ([[0.0_f64; 256]; 7], [[0.0_f64; 256]; 7]);
+            ArmSve2Backend::advance_bezout7_lp_dim_f64(&fb, dim, 0.92, 0.08, &mut ub);
+            ScalarBackend::advance_bezout7_lp_dim_f64(&fb, dim, 0.92, 0.08, &mut us);
+            for st in 0..7 {
+                assert!(
+                    ub[st]
+                        .iter()
+                        .zip(&us[st])
+                        .all(|(u, v)| u.to_bits() == v.to_bits())
+                );
+            }
+            let (mut lfb, mut mfb, mut hfb) = ([0.0_f32; 256], [0.0_f32; 256], [0.0_f32; 256]);
+            let (mut lfs, mut mfs, mut hfs) = ([0.0_f32; 256], [0.0_f32; 256], [0.0_f32; 256]);
+            ArmSve2Backend::readout_bezout7_bands_dim_f64(
+                &fb, dim, &ub, &ub, &mut lfb, &mut mfb, &mut hfb,
+            );
+            ScalarBackend::readout_bezout7_bands_dim_f64(
+                &fb, dim, &us, &us, &mut lfs, &mut mfs, &mut hfs,
+            );
+            for d in 0..256 {
+                assert_eq!(lfb[d].to_bits(), lfs[d].to_bits());
+                assert_eq!(mfb[d].to_bits(), mfs[d].to_bits());
+                assert_eq!(hfb[d].to_bits(), hfs[d].to_bits());
+            }
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_sve2_f64_trainer_matches_scalar_across_lengths(
+            xs in prop::collection::vec(-5.0_f64..5.0_f64, 0..25),
+            ys in prop::collection::vec(-5.0_f64..5.0_f64, 0..25),
+        ) {
+            warm_simd_feature_caches();
+            let n = xs.len().min(ys.len());
+            let d_dot = ArmSve2Backend::dot_f64(&xs[..n], &ys[..n]);
+            let s_dot = ScalarBackend::dot_f64(&xs[..n], &ys[..n]);
+            prop_assert!((d_dot - s_dot).abs() <= 1.0e-11 * s_dot.abs().max(1.0));
+            let x32: Vec<f32> = xs[..n].iter().map(|&v| v as f32).collect();
+            let y32: Vec<f32> = ys[..n].iter().map(|&v| v as f32).collect();
+            let (mut db, mut ds) = (vec![0.0; n], vec![0.0; n]);
+            ArmSve2Backend::sub_f32_to_f64(&mut db, &x32, &y32);
+            ScalarBackend::sub_f32_to_f64(&mut ds, &x32, &y32);
+            for i in 0..n {
+                prop_assert_eq!(db[i].to_bits(), ds[i].to_bits());
+            }
+        }
+    }
+}

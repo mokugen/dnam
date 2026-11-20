@@ -15,6 +15,11 @@ use dnam_engine::container::{
     ARENA_OFFSET_ULTRA_END, build_dnam_container, build_v3_open_dnam_container,
     strip_container_to_tier, validate_v3_open_dnam_layout,
 };
+use dnam_engine::graph::cabinet::CabinetHot;
+use dnam_engine::graph::sona_core::{SonaColdTierModel, SonaHotSlab, SonaMatryoshkaModel};
+use dnam_engine::graph::weights::{
+    ARENA0_W_CTRL_OFFSET, pack_sona_matryoshka_to_arena, write_f32_le,
+};
 use dnam_engine::math::{DefaultMathBackend, ScalarBackend};
 use dnam_engine::memory::AlignedFp16Block;
 use dnam_engine::operators::c2_wavefolder;
@@ -26,11 +31,6 @@ use dnam_engine::schema::{
     ControlCalibration, ControlCalibrationRole, ControlKind, ControlSchemaDef, ControlUiHints,
     DnamError, DnamJsonHeader, TempoSubdivision,
 };
-use dnam_engine::stages::sona_core::{SonaColdTierModel, SonaHotSlab, SonaMatryoshkaModel};
-use dnam_engine::stages::stage3_cab::V3Stage3Hot;
-use dnam_engine::stages::weights::{
-    ARENA0_W_CTRL_OFFSET, pack_sona_matryoshka_to_arena, write_f32_le,
-};
 use dnam_engine::{DnamEngine, DynamicDnamEngine, FtzDazGuard, Tier};
 
 /// Verifies `from_bytes_owned_with_max_tier`, `from_bytes_with_scratch`, `with_max_tier`,
@@ -39,9 +39,9 @@ use dnam_engine::{DnamEngine, DynamicDnamEngine, FtzDazGuard, Tier};
 #[test]
 fn test_engine_constructors_calibration_roles_and_tempo_sync() {
     let (mut header, arena, _container) = build_populated_sona_container();
-    header.stage0_router.sub_crossover_hz = 180.0;
-    header.stage4_tank.tzf_reference_tap_samples = 24.0;
-    header.stage4_tank.switch_xfade_samples = 96;
+    header.io_router.sub_crossover_hz = 180.0;
+    header.spatial_tank.tzf_reference_tap_samples = 24.0;
+    header.spatial_tank.switch_xfade_samples = 96;
     header.control_bus.head_trust_region_radius = 12.0;
     header.io_config.capabilities.default_blend = 0.85;
     header.io_config.capabilities.wet_polarity_inverted = true;
@@ -181,7 +181,7 @@ fn test_engine_constructors_calibration_roles_and_tempo_sync() {
     )
     .unwrap();
     assert_eq!(eng.max_supported_tier(), Tier::Pro);
-    assert!((eng.stage0_router.crossover_hz - 180.0).abs() < 1e-4);
+    assert!((eng.io_router.crossover_hz - 180.0).abs() < 1e-4);
     assert!((eng.zoh().tau_ref_samples_host - 24.0).abs() < 1e-6);
     assert_eq!(eng.zoh().switch_xfade_samples_host, 96);
     assert!((eng.control_bus.inv_trust_radius_mh2 - 1.0 / 144.0).abs() < 1e-6);
@@ -410,24 +410,19 @@ fn test_trainer_engine_isomorphism_stereo_preservation_and_nested_bus() {
     assert_eq!(eng_v3.sample_rate_hz(), 96_000);
     assert_eq!(eng_v3.zoh().control_decimation_host, 32);
 
-    // Stage III 16-sample delayed Kautz onset tap on V3Stage3Hot
+    // Cabinet 16-sample delayed Kautz onset tap on CabinetHot
     let mut s3_cold = SonaColdTierModel::identity_for_tier(Tier::Lite, false, false);
     s3_cold.readout.fir_l.fill(0.0);
     s3_cold.readout.fir_r.fill(0.0);
     s3_cold.readout.kautz_b_gamma[0] = 1.0;
     s3_cold.readout.kautz_c_l[0] = (1.0, 0.0);
-    let mut s3_cab = V3Stage3Hot::from_cold(&s3_cold);
+    let mut cab = CabinetHot::from_cold(&s3_cold);
     for n in 0..16 {
-        let [out_l, _] = s3_cab.step_stereo::<DefaultMathBackend>(
-            if n == 0 { 1.0 } else { 0.0 },
-            0.0,
-            2,
-            1,
-            false,
-        );
+        let [out_l, _] =
+            cab.step_stereo::<DefaultMathBackend>(if n == 0 { 1.0 } else { 0.0 }, 0.0, 2, 1, false);
         assert_eq!(out_l, 0.0, "expected 16-sample onset silence at n={n}");
     }
-    let [delayed_at_16, _] = s3_cab.step_stereo::<DefaultMathBackend>(0.0, 0.0, 2, 1, false);
+    let [delayed_at_16, _] = cab.step_stereo::<DefaultMathBackend>(0.0, 0.0, 2, 1, false);
     assert!(
         delayed_at_16.abs() > 0.1,
         "expected non-zero Kautz onset response at sample 16, got {delayed_at_16}"

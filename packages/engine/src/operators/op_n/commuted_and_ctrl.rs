@@ -98,7 +98,7 @@ pub fn eval_commuted_vs_uncommuted_lti_cascade_f64<const P: usize, const K: usiz
 /// Folds $3\text{ kHz}$ stage control latents $\mathbf{z}_{\text{stage}} \in \mathbb{R}^{D_s}$ into a
 /// sub-stage projection vector $\mathbf{w}(\mathbf{z}) = \mathbf{w}_0 + \sum_{r=0}^{D_s-1} z_r \mathbf{w}_{r+1}$
 /// (`ref[dsp.op-n.core.control-sensitivity]`).
-pub fn fold_stage2_latent_weights<const N: usize>(
+pub fn fold_core_latent_weights<const N: usize>(
     w_base: &[f32; N],
     w_modes: &[[f32; N]],
     z_stage: &[f32],
@@ -117,7 +117,7 @@ pub fn fold_stage2_latent_weights<const N: usize>(
 /// Evaluates the $2 \times 2$ block stereo coupling matrix on a 16-D stereo drive basis
 /// $\mathbf{u}_{\text{stereo}} = [\mathbf{u}_L^{(8)}, \mathbf{u}_R^{(8)}]^\top$
 /// (`ref[dsp.op-n.core.interblock-tiles]`).
-pub fn eval_stage2_stereo_coupling_16d(
+pub fn eval_core_stereo_coupling_16d(
     u_left: &[f32; 8],
     u_right: &[f32; 8],
     w_ll: &[f32; 8],
@@ -235,13 +235,13 @@ mod tests {
         assert!((t_out[1] + t_out[2]).abs() < 1e-6);
         assert!((t_out[3] - 1.0).abs() < 1e-5);
 
-        let (cl, cr) = eval_stage2_stereo_coupling_16d(
+        let (cl, cr) = eval_core_stereo_coupling_16d(
             &[1.0; 8], &[0.5; 8], &[0.25; 8], &[0.01; 8], &[0.01; 8], &[0.25; 8],
         );
         assert!((cl - (2.0 + 0.04)).abs() < 1e-6);
         assert!((cr - (0.08 + 1.0)).abs() < 1e-6);
 
-        let w_folded = fold_stage2_latent_weights(
+        let w_folded = fold_core_latent_weights(
             &[1.0, 2.0, 3.0, 4.0],
             &[[0.5, 0.0, -0.5, 1.0], [0.0, 1.0, 0.0, -1.0]],
             &[2.0, 0.5],

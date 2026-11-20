@@ -14,7 +14,7 @@ const INV_6: f32 = 1.0 / 6.0;
 /// Exact compile-time reciprocal `1 / 3` for 3-phase barberpole windowing (`0 FDIV`).
 const INV_3: f32 = 1.0 / 3.0;
 
-/// Exact compile-time `2 / 3` factor for 3-phase offsets and unity-slope Stage IV saturation.
+/// Exact compile-time `2 / 3` factor for 3-phase offsets and unity-slope tank saturation.
 const TWO_THIRDS: f32 = 2.0 / 3.0;
 
 /// Maximum bounded Schroeder all-pass feedback magnitude (`|g| <= 0.75`,
@@ -31,10 +31,10 @@ const LOOP_LIMIT_MIN_SIGMA: f32 = 1.0e-4;
 /// Maximum coercive soft-limit ceiling keeping `sigma * inv_sigma` strictly finite.
 const LOOP_LIMIT_MAX_SIGMA: f32 = 1.0e12;
 
-/// Stage IV cubic soft-knee linear coefficient `1.5` (`ref[dsp.tank.loop-saturator]`).
+/// Tank cubic soft-knee linear coefficient `1.5` (`ref[dsp.tank.loop-saturator]`).
 const LOOP_KNEE_THREE_HALVES: f32 = 1.5;
 
-/// Stage IV cubic soft-knee cubic coefficient `0.5` (`ref[dsp.tank.loop-saturator]`).
+/// Tank cubic soft-knee cubic coefficient `0.5` (`ref[dsp.tank.loop-saturator]`).
 const LOOP_KNEE_HALF: f32 = 0.5;
 
 /// Minimum causal delay floor in samples guaranteeing zero crossbar write collision
@@ -387,7 +387,7 @@ pub fn write_ring_with_freeze_f32(
     }
 }
 
-/// Applies the Stage IV unity-slope cubic saturator and bounded loop gain (`||G_loop|| < 1.0`,
+/// Applies the tank unity-slope cubic saturator and bounded loop gain (`||G_loop|| < 1.0`,
 /// `0 FDIV`, `ref[dsp.tank.loop-saturator]`, `ref[dsp.tank.quiet-feedback-knee]`).
 ///
 /// Guarantees `|out| <= MAX_LOOP_GAIN_F32 * soft_limit` and contractive small-signal slope

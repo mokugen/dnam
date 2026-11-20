@@ -55,7 +55,7 @@ name = "operators"
 harness = false
 
 [[bench]]
-name = "stages_and_control"
+name = "graph_and_control"
 harness = false
 
 [[bench]]

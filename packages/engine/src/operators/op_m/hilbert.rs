@@ -304,12 +304,6 @@ impl HilbertH1Lattice6Sec {
         (vi, vq)
     }
 
-    /// Returns the most recently updated 4-lane stereo section-5 state `[s5_il, s5_ql, s5_ir, s5_qr]`.
-    #[inline(always)]
-    pub fn last_stereo_s5(&self) -> &[f32; 4] {
-        &self.stereo_state[(self.stereo_parity ^ 1) & 1][5]
-    }
-
     /// Steps a stereo pair (`self` = Left, `_right` = symmetry handle) of 6-section `H1` analytic
     /// pairs simultaneously using `B::Vec4` SIMD across `(vi_l, vq_l, vi_r, vq_r)` while recording
     /// retained section outputs for clickless [`Self::retune_sample_rate`] transitions
@@ -358,7 +352,7 @@ mod tests {
     use crate::FtzDazGuard;
     use crate::math::ScalarBackend;
     use crate::operators::{
-        normalize_tracker_phasor_exponent_split, validate_and_eval_stage3_radial_gate,
+        normalize_tracker_phasor_exponent_split, validate_and_eval_kautz_radial_gate,
     };
     use proptest::prelude::*;
 
@@ -524,7 +518,7 @@ mod tests {
             }
 
             let (g_k, r_k, b_eff) =
-                validate_and_eval_stage3_radial_gate(r_low, dr, 0.3, 1.0, theta_10).unwrap();
+                validate_and_eval_kautz_radial_gate(r_low, dr, 0.3, 1.0, theta_10).unwrap();
             prop_assert!((0.0..=1.0).contains(&g_k) && b_eff.is_finite());
             prop_assert!(r_k >= r_low && r_k <= r_low + dr && r_k < 1.0);
         }

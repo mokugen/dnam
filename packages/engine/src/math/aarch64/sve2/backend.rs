@@ -227,3 +227,229 @@ impl MathBackend for ArmSve2Backend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use dnam_kernels::{InterleavedStereo8, StereoVec8};
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::math::{ScalarVec4, warm_simd_feature_caches};
+
+    #[test]
+    fn test_sve2_backend_fp16_rsqrt_tracker_and_crc32c() {
+        warm_simd_feature_caches();
+        assert_eq!(
+            ArmSve2Backend::is_supported(),
+            ArmSve2Backend::is_supported_cached()
+        );
+        assert_eq!(ArmSve2Backend::KIND, BackendKind::ArmSve2);
+        assert!(!ArmSve2Backend::NAME.is_empty());
+
+        let tracked = sve2_tracker_exp_scales_f32(0.25, 4.0);
+        if ArmSve2Backend::is_supported_cached() {
+            let (sd_l, su_l, sd_r, su_r) = tracked.expect("SVE2 supported");
+            assert!((sd_l * su_l - 1.0).abs() < 1.0e-6);
+            assert!((sd_r * su_r - 1.0).abs() < 1.0e-6);
+        } else {
+            assert!(tracked.is_none());
+            assert!(sve2_tracker_exp_scales_f32(0.0, 0.0).is_none());
+        }
+
+        assert_eq!(ArmSve2Backend::crc32c(b"123456789"), 0xE306_9283);
+        let payload: [u8; 19] = core::array::from_fn(|i| (i as u8).wrapping_mul(13));
+        for len in [0, 1, 7, 8, 9, 19] {
+            assert_eq!(
+                ArmSve2Backend::crc32c_update(0x1234_5678, &payload[..len]),
+                ScalarBackend::crc32c_update(0x1234_5678, &payload[..len])
+            );
+        }
+
+        let cases = [
+            [0.5_f32, -1.5, 2.25, -0.0],
+            [65504.0, -65504.0, 100_000.0, -100_000.0],
+            [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, 1.0e-6],
+        ];
+        for src in cases {
+            let hw = ArmSve2Backend::f32x4_to_fp16x4(&src);
+            let sw = ScalarBackend::f32x4_to_fp16x4(&src);
+            assert_eq!(hw, sw);
+            assert_eq!(ArmSve2Backend::vec4_to_fp16x4(Sve2Vec4::load(&src)), hw);
+            let rt_hw = ArmSve2Backend::fp16x4_to_f32x4(&hw);
+            let rt_sw = ScalarBackend::fp16x4_to_f32x4(&hw);
+            assert_eq!(rt_hw.map(f32::to_bits), rt_sw.map(f32::to_bits));
+            assert_eq!(
+                ArmSve2Backend::fp16x4_to_vec4(&hw)
+                    .to_array()
+                    .map(f32::to_bits),
+                rt_sw.map(f32::to_bits)
+            );
+        }
+
+        let r0 = ArmSve2Backend::rsqrt_nr2_f32(4.0);
+        let (p0, p1) = ArmSve2Backend::rsqrt_nr2_pair_f32(4.0, 9.0);
+        assert!((r0 - 0.5).abs() < 2.5e-3);
+        assert!((p0 - 0.5).abs() < 2.5e-3);
+        assert!((p1 - 1.0 / 3.0).abs() < 2.5e-3);
+        if !ArmSve2Backend::is_supported_cached() {
+            assert_eq!(r0.to_bits(), ScalarBackend::rsqrt_nr2_f32(4.0).to_bits());
+            let (s0, s1) = ScalarBackend::rsqrt_nr2_pair_f32(4.0, 9.0);
+            assert_eq!((p0.to_bits(), p1.to_bits()), (s0.to_bits(), s1.to_bits()));
+        }
+
+        let (c, s) = ArmSve2Backend::fast_unit_phasor(0.45);
+        assert!((c * c + s * s - 1.0).abs() < 1.0e-4);
+    }
+
+    #[test]
+    fn test_sve2_vec4_kernel_and_stereo8_parity() {
+        warm_simd_feature_caches();
+        let a_arr = [1.5_f32, -2.5, 3.5, -4.5];
+        let b_arr = [2.0_f32, -4.0, 0.5, 8.0];
+        let va = Sve2Vec4::from_array(a_arr);
+        let vb = Sve2Vec4::load(&b_arr);
+        let sa = ScalarVec4::from_array(a_arr);
+        let sb = ScalarVec4::load(&b_arr);
+
+        let mut stored = [0.0_f32; 4];
+        va.store(&mut stored);
+        assert_eq!(stored, a_arr);
+        assert_eq!(Sve2Vec4::zero().to_array(), [0.0; 4]);
+        assert_eq!(
+            Sve2Vec4::splat_pair(1.25, -3.75).to_array(),
+            ScalarVec4::splat_pair(1.25, -3.75).to_array()
+        );
+        assert_eq!(va.dup_low_pair().to_array(), sa.dup_low_pair().to_array());
+        assert_eq!(va.dup_high_pair().to_array(), sa.dup_high_pair().to_array());
+        assert_eq!(va.add(vb).to_array(), sa.add(sb).to_array());
+        assert_eq!(va.sub(vb).to_array(), sa.sub(sb).to_array());
+        assert_eq!(va.mul(vb).to_array(), sa.mul(sb).to_array());
+        assert_eq!(va.fma(vb, vb).to_array(), sa.fma(sb, sb).to_array());
+        assert_eq!(va.fms(vb, vb).to_array(), sa.fms(sb, sb).to_array());
+        assert_eq!(
+            va.mul_lane::<1>(vb).to_array(),
+            sa.mul_lane::<1>(sb).to_array()
+        );
+        assert_eq!(
+            va.mul_lane::<3>(vb).to_array(),
+            sa.mul_lane::<3>(sb).to_array()
+        );
+        assert_eq!(
+            va.fma_lane::<2>(vb, vb).to_array(),
+            sa.fma_lane::<2>(sb, sb).to_array()
+        );
+        assert_eq!(va.max(vb).to_array(), sa.max(sb).to_array());
+        assert_eq!(va.min(vb).to_array(), sa.min(sb).to_array());
+        assert_eq!(va.abs().to_array(), sa.abs().to_array());
+        assert_eq!(va.pair_swap_neg().to_array(), sa.pair_swap_neg().to_array());
+        assert_eq!(va.horizontal_sum(), sa.horizontal_sum());
+        assert_eq!(va.horizontal_sum_pair(vb), sa.horizontal_sum_pair(sb));
+        assert_eq!(va.dot(vb), sa.dot(sb));
+
+        let dirty = Sve2Vec4::from_array([f32::NAN, f32::INFINITY, f32::from_bits(1), -1.25]);
+        let s_dirty = ScalarVec4::from_array([f32::NAN, f32::INFINITY, f32::from_bits(1), -1.25]);
+        assert_eq!(
+            dirty.scrub_recursive_state().to_array().map(f32::to_bits),
+            s_dirty.scrub_recursive_state().to_array().map(f32::to_bits)
+        );
+        assert_eq!(
+            <Sve2Vec4 as dnam_kernels::KernelVec4>::neg(va).to_array(),
+            <ScalarVec4 as dnam_kernels::KernelVec4>::neg(sa).to_array()
+        );
+        assert_eq!(
+            <Sve2Vec4 as dnam_kernels::KernelVec4>::select_le(va, vb, va, vb).to_array(),
+            <ScalarVec4 as dnam_kernels::KernelVec4>::select_le(sa, sb, sa, sb).to_array()
+        );
+        assert_eq!(
+            <Sve2Vec4 as dnam_kernels::KernelVec4>::all_le(va, vb),
+            <ScalarVec4 as dnam_kernels::KernelVec4>::all_le(sa, sb)
+        );
+        assert_eq!(
+            <Sve2Vec4 as dnam_kernels::KernelVec4>::flush_recursive_state(dirty)
+                .to_array()
+                .map(f32::to_bits),
+            <ScalarVec4 as dnam_kernels::KernelVec4>::flush_recursive_state(s_dirty)
+                .to_array()
+                .map(f32::to_bits)
+        );
+
+        let rows = [
+            Sve2Vec4::from_array([1.0, 2.0, 3.0, 4.0]),
+            Sve2Vec4::from_array([5.0, 6.0, 7.0, 8.0]),
+            Sve2Vec4::from_array([9.0, 10.0, 11.0, 12.0]),
+            Sve2Vec4::from_array([13.0, 14.0, 15.0, 16.0]),
+        ];
+        let t_hw = ArmSve2Backend::transpose_4x4(rows[0], rows[1], rows[2], rows[3]);
+        assert_eq!(t_hw[0].to_array(), [1.0, 5.0, 9.0, 13.0]);
+        assert_eq!(t_hw[3].to_array(), [4.0, 8.0, 12.0, 16.0]);
+
+        let st_a = Sve2Stereo8::load_lr(&a_arr, &b_arr);
+        let st_b = Sve2Stereo8::splat_lr(0.5, -0.5);
+        let sc_a = InterleavedStereo8::<ScalarVec4>::load_lr(&a_arr, &b_arr);
+        let sc_b = InterleavedStereo8::<ScalarVec4>::splat_lr(0.5, -0.5);
+        assert_eq!(st_a.horizontal_sum_lr(), sc_a.horizontal_sum_lr());
+        assert_eq!(
+            st_a.fma(st_b, st_b).horizontal_sum_lr(),
+            sc_a.fma(sc_b, sc_b).horizontal_sum_lr()
+        );
+        let cols = [
+            [0.25, 0.0, 0.0, 0.0],
+            [0.0, 0.5, 0.0, 0.0],
+            [0.0, 0.0, 0.75, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ];
+        assert_eq!(
+            Sve2Stereo8::fma_mat4x4_shared(Sve2Stereo8::zero(), &cols, st_a).horizontal_sum_lr(),
+            InterleavedStereo8::<ScalarVec4>::fma_mat4x4_shared(
+                InterleavedStereo8::<ScalarVec4>::zero(),
+                &cols,
+                sc_a,
+            )
+            .horizontal_sum_lr()
+        );
+        let mv = ArmSve2Backend::fma_mat4x4_vec4(va, &cols, &a_arr);
+        let smv = ScalarBackend::fma_mat4x4_vec4(sa, &cols, &a_arr);
+        assert_eq!(mv.to_array(), smv.to_array());
+        let (sl, sr) = ArmSve2Backend::fma_mat4x4_stereo(va, vb, &cols, va, vb);
+        let (cl, cr) = ScalarBackend::fma_mat4x4_stereo(sa, sb, &cols, sa, sb);
+        assert_eq!(sl.to_array(), cl.to_array());
+        assert_eq!(sr.to_array(), cr.to_array());
+        let pos = Sve2Vec4::from_array([1.0, 2.0, 4.0, 8.0]);
+        let spos = ScalarVec4::from_array([1.0, 2.0, 4.0, 8.0]);
+        let (pe, spe) = (
+            pos.exp2_clamped5().to_array(),
+            spos.exp2_clamped5().to_array(),
+        );
+        let (pr, spr) = (pos.rcp_pos_nr3().to_array(), spos.rcp_pos_nr3().to_array());
+        let (ps, sps) = (
+            pos.rsqrt_pos_nr3().to_array(),
+            spos.rsqrt_pos_nr3().to_array(),
+        );
+        for i in 0..4 {
+            assert!((pe[i] - spe[i]).abs() < 1.0e-5);
+            assert!((pr[i] - spr[i]).abs() < 1.0e-6);
+            assert!((ps[i] - sps[i]).abs() < 1.0e-6);
+        }
+    }
+
+    proptest! {
+        #[test]
+        fn prop_sve2_backend_fp16_and_rsqrt_parity(
+            xs in prop::array::uniform4(-1000.0_f32..1000.0_f32),
+            pos in prop::array::uniform2(1.0e-3_f32..1.0e4_f32),
+        ) {
+            warm_simd_feature_caches();
+            let hw = ArmSve2Backend::f32x4_to_fp16x4(&xs);
+            prop_assert_eq!(hw, ScalarBackend::f32x4_to_fp16x4(&xs));
+            prop_assert_eq!(
+                ArmSve2Backend::fp16x4_to_f32x4(&hw).map(f32::to_bits),
+                ScalarBackend::fp16x4_to_f32x4(&hw).map(f32::to_bits)
+            );
+            let (r0, r1) = ArmSve2Backend::rsqrt_nr2_pair_f32(pos[0], pos[1]);
+            let ex0 = 1.0 / pos[0].sqrt();
+            let ex1 = 1.0 / pos[1].sqrt();
+            prop_assert!(((r0 - ex0) / ex0).abs() < 2.5e-3);
+            prop_assert!(((r1 - ex1) / ex1).abs() < 2.5e-3);
+        }
+    }
+}

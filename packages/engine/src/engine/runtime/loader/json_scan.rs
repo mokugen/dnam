@@ -356,7 +356,7 @@ fn scan_io_config_obj(
     })
 }
 
-fn scan_stage0_router_obj(
+fn scan_io_router_obj(
     cursor: &mut JsonSliceCursor<'_>,
     flags: &mut ReloadHeaderFlags,
 ) -> Result<(), RtReloadError> {
@@ -370,7 +370,7 @@ fn scan_stage0_router_obj(
     })
 }
 
-fn scan_stage4_tank_obj(
+fn scan_spatial_tank_obj(
     cursor: &mut JsonSliceCursor<'_>,
     flags: &mut ReloadHeaderFlags,
 ) -> Result<(), RtReloadError> {
@@ -409,10 +409,10 @@ pub(super) fn scan_header_flags_rt(
             is_preview |= json_inner_eq_ascii(val, b"preview");
         } else if json_inner_eq_ascii(key, b"io_config") {
             scan_io_config_obj(c, &mut flags, &mut saw_supports_freeze)?;
-        } else if json_inner_eq_ascii(key, b"stage0_router") {
-            scan_stage0_router_obj(c, &mut flags)?;
-        } else if json_inner_eq_ascii(key, b"stage4_tank") {
-            scan_stage4_tank_obj(c, &mut flags)?;
+        } else if json_inner_eq_ascii(key, b"io_router") {
+            scan_io_router_obj(c, &mut flags)?;
+        } else if json_inner_eq_ascii(key, b"spatial_tank") {
+            scan_spatial_tank_obj(c, &mut flags)?;
         } else {
             c.skip_value(62)?;
         }
@@ -430,4 +430,63 @@ pub(super) fn scan_header_flags_rt(
     }
     flags.supports_freeze = saw_supports_freeze.unwrap_or(true);
     Ok(flags)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::format;
+
+    #[test]
+    fn test_json_inner_eq_ascii_and_scanner_edge_cases() {
+        assert!(json_inner_eq_ascii(
+            br#"\"\\\/\b\f\n\r\t"#,
+            b"\"\\/\x08\x0c\n\r\t"
+        ));
+        assert!(json_inner_eq_ascii(br#"\u0073\u006f\u006E\u0061"#, b"sona"));
+        assert!(!json_inner_eq_ascii(b"a\\", b"a"));
+        assert!(!json_inner_eq_ascii(br#"\u12"#, b"x"));
+        assert!(!json_inner_eq_ascii(br#"\u12zz"#, b"x"));
+        assert!(!json_inner_eq_ascii(br#"\u0080"#, b"x"));
+        assert!(!json_inner_eq_ascii(br#"\x"#, b"x"));
+        assert!(!json_inner_eq_ascii(br#"\u0073x"#, b"sa"));
+
+        let ok = concat!(
+            r#"{"architecture":"sona","extra":["\"\\\/\b\f\n\r\t","#,
+            r#"null,true,false,[],{},1.5e+2,-2E-1],"#,
+            r#""io_router":{"sub_crossover_hz":1.5e+2,"other":0},"#,
+            r#""spatial_tank":{"dc_blocker_pole":9.9E-1}}"#
+        );
+        let flags = scan_header_flags_rt(ok.as_bytes()).unwrap();
+        assert!((flags.sub_crossover_hz - 150.0).abs() < 1e-4);
+        assert!((flags.dc_blocker_pole - 0.99).abs() < 1e-4);
+
+        let deep = format!(
+            "{{\"architecture\":\"sona\",\"extra\":{}{}}}",
+            "[".repeat(64),
+            "]".repeat(64)
+        );
+        assert_eq!(
+            scan_header_flags_rt(deep.as_bytes()),
+            Err(RtReloadError::InvalidJson)
+        );
+
+        for bad in [
+            b"[]".as_slice(),
+            b"{\"a\":\"\x01\"}".as_slice(),
+            br#"{"a":"\u123Z"}"#.as_slice(),
+            br#"{"a":"\q"}"#.as_slice(),
+            br#"{"a":"unterminated"#.as_slice(),
+            br#"{"io_config":{"capabilities":{"freeze_mutes_dry":123}}}"#.as_slice(),
+            br#"{"io_config":{"inputs":true}}"#.as_slice(),
+            br#"{"io_router":{"sub_crossover_hz":1.}}"#.as_slice(),
+            br#"{"io_router":{"sub_crossover_hz":1e}}"#.as_slice(),
+            br#"{"io_router":{"sub_crossover_hz":1e40}}"#.as_slice(),
+            br#"{"extra":[1 2]}"#.as_slice(),
+            br#"{"extra":nulx}"#.as_slice(),
+            br#"{"architecture":"sona"} 123"#.as_slice(),
+        ] {
+            assert_eq!(scan_header_flags_rt(bad), Err(RtReloadError::InvalidJson));
+        }
+    }
 }

@@ -106,7 +106,6 @@ mod tests {
     use crate::FtzDazGuard;
     use crate::math::ScalarBackend;
     use crate::operators::op_m::{KautzModalBank, algebraic_unit_rotor_op_m};
-    use crate::operators::reference::eval_saturated_polyadaa_rail_crossing_f64;
     use proptest::prelude::*;
 
     #[test]
@@ -236,11 +235,6 @@ mod tests {
             let inst = beta * u * (1.5 - 0.5 * u * u) + delta * (u * u - u * u * u * u);
             let alg64 = poly_adaa_algebraic_f64(u, u, beta, delta);
             assert!((alg64 - inst).abs() < 1e-15);
-
-            let (rc_odd, rc_even, crossed) = eval_saturated_polyadaa_rail_crossing_f64(u, u);
-            assert!(!crossed);
-            assert!((rc_even - (u * u - u * u * u * u)).abs() < 1e-12);
-            assert!((rc_odd - u * (1.5 - 0.5 * u * u)).abs() < 1e-12);
         }
     }
 

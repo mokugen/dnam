@@ -272,7 +272,7 @@ impl ZohRescaledParams {
     /// Rescales an Op-T base delay $\tau_{0,m}^{\text{samples}}$ and integer Schroeder all-pass delay $D_{\text{ap},m}$ (`ref[dsp.zoh.op-t-delays]`).
     #[inline]
     pub fn rescale_op_t_delays(&self, tau0_samples_train: f32, d_ap_train: f32) -> (f32, usize) {
-        use crate::stages::stage4_tank::v3_fdn::STAGE4_SCHROEDER_MAX_DELAY;
+        use crate::graph::tank::fdn::STAGE4_SCHROEDER_MAX_DELAY;
         if (self.rho_sr - 1.0).abs() < 1e-12 {
             return (
                 tau0_samples_train.max(4.0),
@@ -480,7 +480,7 @@ mod tests {
 
             let (tau_h, dap_h) = zoh.rescale_op_t_delays(64.0, 19.0);
             prop_assert!(tau_h >= 4.0);
-            prop_assert!((4..=crate::stages::stage4_tank::v3_fdn::STAGE4_SCHROEDER_MAX_DELAY).contains(&dap_h));
+            prop_assert!((4..=crate::graph::tank::fdn::STAGE4_SCHROEDER_MAX_DELAY).contains(&dap_h));
 
             let oversampled = ZohRescaledParams::new(48_000, 192_000);
             let (_, large_dap) = oversampled.rescale_op_t_delays(64.0, 223.0);

@@ -3,12 +3,12 @@
 //! Canonical Reference: `docs/specs/security/provenance_and_enclave_drm.md` (`ref[sec.policy.distribution-policy]`,
 //! `ref[sec.drm.oem-certificate]`, `ref[sec.drm.hpke-record-encryption]`, `ref[sec.drm.dnsl-public-framing]`).
 
+pub mod dnsl;
 pub mod hpke_base;
-pub mod v3_dnsl;
 
 #[cfg(feature = "crypto")]
-pub use v3_dnsl::seal_dnam_container;
-pub use v3_dnsl::{
+pub use dnsl::seal_dnam_container;
+pub use dnsl::{
     Dsa1ManifestHeaderWire, UnsealedDnslInner, parse_and_decrypt_dme1_frame, unseal_dnam_container,
     unseal_dnsl_up_to_tier,
 };
@@ -175,7 +175,7 @@ mod tests {
 
     #[cfg(feature = "crypto")]
     #[test]
-    fn test_v3_dnsl_seal_unseal_fail_closed_and_tamper_resistance() {
+    fn test_dnsl_seal_unseal_fail_closed_and_tamper_resistance() {
         use crate::container::{ARENA_OFFSET_ULTRA_END, DnamContainerView, build_dnam_container};
         use crate::provenance::RustCryptoProvider;
         use crate::provenance::security::{DnslDirectoryWire, DnslPreambleWire};

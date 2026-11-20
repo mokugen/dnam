@@ -10,6 +10,7 @@ use crate::container::{
     ARENA_LITE_END_CL, ARENA_OFFSET_LITE_END, DnamContainerView, DnamPreamble, ZohRescaledParams,
 };
 use crate::control::ControlBus;
+use crate::graph::{GraphBackend, IoRouter, SonaColdTierModel, SonaHotSlab};
 use crate::math::DefaultMathBackend;
 use crate::memory::{AlignedBuffer, AlignedFp16Block, ArenaStorage, CacheLine64};
 use crate::provenance::{CryptoProvider, DefaultCryptoProvider, VerificationStatus};
@@ -17,7 +18,6 @@ use crate::schema::{
     ControlCalibrationRole, DnamError, DnamJsonHeader, DnamProtectionProfile, TempoSubdivision,
     cold_pow_f64,
 };
-use crate::stages::{SonaColdTierModel, SonaHotSlab, Stage0Router, StageBackend};
 use crate::types::{DnamTelemetrySnapshot, Tier};
 
 pub use oversampler::{OFFLINE_BOUNCE_PDC_SAMPLES, Oversampler4xState};
@@ -26,20 +26,20 @@ pub use process::DnamAudioIo;
 pub use tempo::TempoSyncState;
 
 /// Composite SIMD backend trait required by [`DnamEngine`] across all operators and stages.
-pub trait EngineBackend: StageBackend {}
+pub trait EngineBackend: GraphBackend {}
 
-impl<B: StageBackend> EngineBackend for B {}
+impl<B: GraphBackend> EngineBackend for B {}
 
 /// Isolated offline-bounce scratch preventing [`DnamEngine::render_offline_bounce`] from
-/// mutating live recursive DSP or `Stage0Router` state (`0` runtime heap allocations).
+/// mutating live recursive DSP or [`IoRouter`] state (`0` runtime heap allocations).
 #[derive(Debug)]
 pub(crate) struct BounceScratch<B: EngineBackend = DefaultMathBackend> {
-    pub hot_core: alloc::boxed::Box<SonaHotSlab<B>>,
-    pub stage0_router: Stage0Router,
-    pub exact_fm_acc: [crate::control::ExactIntFactorAccumulator; 8],
-    pub u_norm: [f32; 256],
-    pub prev_u_norm: [f32; 256],
-    pub prev_psi: [f32; 256],
+    pub(crate) hot_core: alloc::boxed::Box<SonaHotSlab<B>>,
+    pub(crate) io_router: IoRouter,
+    pub(crate) exact_fm_acc: [crate::control::ExactIntFactorAccumulator; 8],
+    pub(crate) u_norm: [f32; 256],
+    pub(crate) prev_u_norm: [f32; 256],
+    pub(crate) prev_psi: [f32; 256],
 }
 
 /// Compact, zero-allocation header flags retained when [`DnamEngine::reload_model_in_place`]
@@ -116,7 +116,7 @@ pub struct DnamEngine<'a, B: EngineBackend = DefaultMathBackend> {
     pub(crate) hot_core: alloc::boxed::Box<SonaHotSlab<B>>,
     pub(crate) cold_tiers: alloc::boxed::Box<[SonaColdTierModel; 4]>,
     pub(crate) bounce_scratch: alloc::boxed::Box<BounceScratch<B>>,
-    pub stage0_router: Stage0Router,
+    pub io_router: IoRouter,
     pub mix_dry_gain: f32,
     pub mix_wet_gain: f32,
 }
@@ -168,7 +168,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         let hot_core = alloc::boxed::Box::new(SonaHotSlab::from_cold_model(&cold_tiers[0]));
         let bounce_scratch = alloc::boxed::Box::new(BounceScratch {
             hot_core: alloc::boxed::Box::new(SonaHotSlab::from_cold_model(&cold_tiers[0])),
-            stage0_router: Stage0Router::new(),
+            io_router: IoRouter::new(),
             exact_fm_acc: core::array::from_fn(|_| {
                 crate::control::ExactIntFactorAccumulator::new(
                     crate::control::MAX_EXACT_CONTRIBUTORS,
@@ -211,7 +211,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             hot_core,
             cold_tiers,
             bounce_scratch,
-            stage0_router: Stage0Router::new(),
+            io_router: IoRouter::new(),
             mix_dry_gain: 0.0,
             mix_wet_gain: 1.0,
         }
@@ -335,14 +335,13 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         let mut engine = Self::new_empty(max_supported_tier);
         engine.arena_storage = ArenaStorage::with_max_tier(max_supported_tier);
         engine.control_bus.ensure_control_capacity(256);
-        let s4_max = crate::stages::stage4_tank::v3_fdn::V3Stage4TankParams::identity_for_tier(
-            max_supported_tier,
-        );
-        engine.hot_core.ensure_cold_stage4_cap(&s4_max, 16_384);
+        let s4_max =
+            crate::graph::tank::fdn::SpatialTankParams::identity_for_tier(max_supported_tier);
+        engine.hot_core.ensure_cold_tank_cap(&s4_max, 16_384);
         engine
             .bounce_scratch
             .hot_core
-            .ensure_cold_stage4_cap(&s4_max, 16_384);
+            .ensure_cold_tank_cap(&s4_max, 16_384);
         engine
     }
 
@@ -577,7 +576,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
     fn refresh_calibrated_control_effects(&mut self, ctrl_idx: usize, physical_value: f32) {
         let supports_freeze = self.supports_freeze();
-        let mut freeze = self.hot_core.stage4_freeze();
+        let mut freeze = self.hot_core.tank_freeze();
         let active_header = if self.header_active {
             self.header.as_ref()
         } else {
@@ -591,7 +590,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             &mut freeze,
             supports_freeze,
         );
-        self.hot_core.set_stage4_freeze(freeze);
+        self.hot_core.set_tank_freeze(freeze);
     }
 
     /// Returns whether this model supports captured hardware freeze (`supports_freeze == true` or
@@ -616,18 +615,18 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     #[inline]
     pub fn set_freeze(&mut self, freeze: bool) {
         self.hot_core
-            .set_stage4_freeze(freeze && self.supports_freeze());
+            .set_tank_freeze(freeze && self.supports_freeze());
     }
 
     #[inline]
     pub fn set_freeze_amount(&mut self, alpha: f32) {
         self.hot_core
-            .set_stage4_freeze((alpha > 0.5) && self.supports_freeze());
+            .set_tank_freeze((alpha > 0.5) && self.supports_freeze());
     }
 
     #[inline]
     pub fn is_frozen(&self) -> bool {
-        self.hot_core.stage4_freeze()
+        self.hot_core.tank_freeze()
     }
 
     #[inline]
@@ -753,9 +752,9 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             is_frozen: u8::from(self.is_frozen()),
             active_clamp_mask: self.control_bus.active_clamp_mask,
             control_decimation_host: self.zoh.control_decimation_host as u16,
-            max_op_n_drive: 1.0,
-            max_pole_radius: 0.999,
-            max_effective_loop_gain: self.hot_core.stage4_g_loop(),
+            max_op_n_drive: self.hot_core.cold.max_op_n_drive,
+            max_pole_radius: self.hot_core.cold.max_pole_radius,
+            max_effective_loop_gain: self.hot_core.max_active_loop_gain(),
             tail_time_ms: self.preamble.tail_time_ms,
             z_head: self.control_bus.z_head,
             env_states: self.control_bus.env_states,

@@ -133,64 +133,6 @@ fn avx2_dot16_stereo_hw(
     sse3_horizontal_sum_pair(avx2_dot16_1ch(x_l, w_l), avx2_dot16_1ch(x_r, w_r))
 }
 
-#[target_feature(enable = "avx,avx2,fma")]
-#[inline]
-fn avx2_tile_dot64_hw(a: &[f32; 64], b: &[f32; 64]) -> f32 {
-    // SAFETY: `[f32; 64]` has 8 contiguous 8-lane `f32` slices.
-    unsafe {
-        let mut acc0 = _mm256_mul_ps(_mm256_loadu_ps(a.as_ptr()), _mm256_loadu_ps(b.as_ptr()));
-        let mut acc1 = _mm256_mul_ps(
-            _mm256_loadu_ps(a.as_ptr().add(8)),
-            _mm256_loadu_ps(b.as_ptr().add(8)),
-        );
-        for k in (16..64).step_by(16) {
-            acc0 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(a.as_ptr().add(k)),
-                _mm256_loadu_ps(b.as_ptr().add(k)),
-                acc0,
-            );
-            acc1 = _mm256_fmadd_ps(
-                _mm256_loadu_ps(a.as_ptr().add(k + 8)),
-                _mm256_loadu_ps(b.as_ptr().add(k + 8)),
-                acc1,
-            );
-        }
-        sse3_horizontal_sum(avx_reduce256(_mm256_add_ps(acc0, acc1)))
-    }
-}
-
-#[target_feature(enable = "avx,avx2,fma")]
-#[inline]
-fn avx2_tile_dot64_stereo_hw(taps: &[f32; 64], w_l: &[f32; 64], w_r: &[f32; 64]) -> [f32; 2] {
-    // SAFETY: `[f32; 64]` has 8 contiguous 8-lane `f32` slices.
-    unsafe {
-        let (t0, t1) = (
-            _mm256_loadu_ps(taps.as_ptr()),
-            _mm256_loadu_ps(taps.as_ptr().add(8)),
-        );
-        let mut l0 = _mm256_mul_ps(t0, _mm256_loadu_ps(w_l.as_ptr()));
-        let mut r0 = _mm256_mul_ps(t0, _mm256_loadu_ps(w_r.as_ptr()));
-        let mut l1 = _mm256_mul_ps(t1, _mm256_loadu_ps(w_l.as_ptr().add(8)));
-        let mut r1 = _mm256_mul_ps(t1, _mm256_loadu_ps(w_r.as_ptr().add(8)));
-        for k in (16..64).step_by(16) {
-            let (tk0, tk1) = (
-                _mm256_loadu_ps(taps.as_ptr().add(k)),
-                _mm256_loadu_ps(taps.as_ptr().add(k + 8)),
-            );
-            l0 = _mm256_fmadd_ps(tk0, _mm256_loadu_ps(w_l.as_ptr().add(k)), l0);
-            r0 = _mm256_fmadd_ps(tk0, _mm256_loadu_ps(w_r.as_ptr().add(k)), r0);
-            l1 = _mm256_fmadd_ps(tk1, _mm256_loadu_ps(w_l.as_ptr().add(k + 8)), l1);
-            r1 = _mm256_fmadd_ps(tk1, _mm256_loadu_ps(w_r.as_ptr().add(k + 8)), r1);
-        }
-        let (sl128, sr128) = (
-            avx_reduce256(_mm256_add_ps(l0, l1)),
-            avx_reduce256(_mm256_add_ps(r0, r1)),
-        );
-        let (l, r) = sse3_horizontal_sum_pair(sl128, sr128);
-        [l, r]
-    }
-}
-
 /// Evaluates a 16-element stereo dot product using 256-bit AVX2/FMA when supported at runtime.
 #[inline]
 pub(crate) fn avx2_dot16_stereo(
@@ -202,32 +144,6 @@ pub(crate) fn avx2_dot16_stereo(
     if X86Avx2FmaBackend::is_supported_cached() {
         // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported_cached()`.
         Some(unsafe { avx2_dot16_stereo_hw(x_l, w_l, x_r, w_r) })
-    } else {
-        None
-    }
-}
-
-/// Evaluates a 64-element dot product using 256-bit AVX2/FMA when supported at runtime.
-#[inline]
-pub(crate) fn avx2_tile_dot64(a: &[f32; 64], b: &[f32; 64]) -> Option<f32> {
-    if X86Avx2FmaBackend::is_supported_cached() {
-        // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported_cached()`.
-        Some(unsafe { avx2_tile_dot64_hw(a, b) })
-    } else {
-        None
-    }
-}
-
-/// Evaluates a dual 64-element stereo dot product using 256-bit AVX2/FMA when supported at runtime.
-#[inline]
-pub(crate) fn avx2_tile_dot64_stereo(
-    taps: &[f32; 64],
-    w_l: &[f32; 64],
-    w_r: &[f32; 64],
-) -> Option<[f32; 2]> {
-    if X86Avx2FmaBackend::is_supported_cached() {
-        // SAFETY: Guarded by `X86Avx2FmaBackend::is_supported_cached()`.
-        Some(unsafe { avx2_tile_dot64_stereo_hw(taps, w_l, w_r) })
     } else {
         None
     }

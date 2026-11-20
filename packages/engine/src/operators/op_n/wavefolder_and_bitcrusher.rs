@@ -79,75 +79,33 @@ pub fn eval_adaa_cubic_c2_wavefolder_odd_f32(u_prev: f32, u_curr: f32) -> f32 {
         .to_array()[0]
 }
 
-/// Evaluates the division-free degree-7/8 interval-average `PolyADAA` basis polynomials
-/// $(A_{\text{odd},3}, A_{\text{even},3})$ for the cubed-envelope $C^2$ wavefolder across
-/// interior and rail-crossing segments `[-1, 1]` using active-length normalization (`0 FDIV`,
-/// `ref[dsp.op-n.wavefolder.cubic-c2]`).
-#[inline]
-pub fn eval_adaa_cubic_c2_wavefolder_f64(u_prev: f64, u_curr: f64) -> (f64, f64) {
-    const ONE_THIRD: f64 = 1.0 / 3.0;
-    const ONE_FIFTH: f64 = 1.0 / 5.0;
-    const ONE_SEVENTH: f64 = 1.0 / 7.0;
-    const ONE_NINTH: f64 = 1.0 / 9.0;
-    const TWENTY_EIGHT_THIRDS: f64 = 28.0 / 3.0;
-    const MAX_ENDPOINT: f64 = 1.0e18;
-    const TINY_CROSSING_EPS: f64 = 1.0e-12;
-
-    let p = if u_prev.is_finite() {
-        u_prev.clamp(-MAX_ENDPOINT, MAX_ENDPOINT)
-    } else {
-        0.0
-    };
-    let c = if u_curr.is_finite() {
-        u_curr.clamp(-MAX_ENDPOINT, MAX_ENDPOINT)
-    } else {
-        0.0
-    };
-    let lower = p.min(c);
-    let upper = p.max(c);
-    if upper <= -1.0 || lower >= 1.0 {
-        return (0.0, 0.0);
-    }
-
-    let u0 = lower.max(-1.0);
-    let u1 = upper.min(1.0);
-    let m = 0.5 * (u1 + u0);
-    let d = 0.5 * (u1 - u0);
-    let m2 = m * m;
-    let d2 = d * d;
-    let m3 = m2 * m;
-    let d3 = d2 * d;
-    let m4 = m2 * m2;
-    let d4 = d2 * d2;
-    let odd_int = m
-        * (1.0 - 3.0 * (m2 + d2) + 3.0 * m4 + 10.0 * m2 * d2 + 3.0 * d4
-            - m3 * m3
-            - 7.0 * m4 * d2
-            - 7.0 * m2 * d4
-            - d3 * d3);
-    let even_int = m2 + d2 * ONE_THIRD - 3.0 * (m4 + 2.0 * m2 * d2 + ONE_FIFTH * d4)
-        + 3.0 * (m3 * m3 + 5.0 * m4 * d2 + 3.0 * m2 * d4 + d3 * d3 * ONE_SEVENTH)
-        - (m4 * m4
-            + TWENTY_EIGHT_THIRDS * m3 * m3 * d2
-            + 14.0 * m4 * d4
-            + 4.0 * m2 * d3 * d3
-            + d4 * d4 * ONE_NINTH);
-
-    let distance = upper - lower;
-    if (lower >= -1.0 && upper <= 1.0) || distance <= TINY_CROSSING_EPS {
-        return (odd_int, even_int);
-    }
-    let inside = (u1 - u0).max(0.0);
-    let scale = inside * crate::math::newton6_reciprocal_f64(distance);
-    (scale * odd_int, scale * even_int)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::FtzDazGuard;
-    use crate::operators::eval_saturated_polyadaa_rail_crossing_f64;
     use proptest::prelude::*;
+
+    fn analytical_c2_wavefolder_odd_oracle_f64(u_prev: f64, u_curr: f64) -> f64 {
+        let lower = u_prev.min(u_curr);
+        let upper = u_prev.max(u_curr);
+        if upper <= -1.0 || lower >= 1.0 {
+            return 0.0;
+        }
+        let u0 = lower.max(-1.0);
+        let u1 = upper.min(1.0);
+        let dist = upper - lower;
+        if dist <= 1.0e-12 {
+            let m = 0.5 * (u0 + u1);
+            let t = 1.0 - m * m;
+            return m * t * t * t;
+        }
+        let antideriv = |u: f64| {
+            let u2 = u * u;
+            let u4 = u2 * u2;
+            0.5 * u2 - 0.75 * u4 + 0.5 * u4 * u2 - 0.125 * u4 * u4
+        };
+        (antideriv(u1) - antideriv(u0)) / dist
+    }
 
     /// verify[dsp.op-n.wavefolder.cubic-c2]
     /// verify[dsp.op-n.hysteresis.quadrature]
@@ -169,20 +127,19 @@ mod tests {
         assert!((wo - 0.5 * 0.421_875).abs() < 1e-6);
         assert!((we - 0.25 * 0.421_875).abs() < 1e-6);
 
-        let (ao_eq, ae_eq) = eval_adaa_cubic_c2_wavefolder_f64(0.5, 0.5);
-        assert!((ao_eq - 0.5 * 0.421_875).abs() < 1e-12);
-        assert!((ae_eq - 0.25 * 0.421_875).abs() < 1e-12);
+        assert!(
+            (f64::from(eval_adaa_cubic_c2_wavefolder_odd_f32(0.5, 0.5)) - 0.5 * 0.421_875).abs()
+                < 1e-6
+        );
 
-        // Rail-crossing scaling: (0.0, 3.0) has inside/distance = 1/3, outside [-1,1] yields (0,0)
-        assert_eq!(eval_adaa_cubic_c2_wavefolder_f64(2.0, 3.0), (0.0, 0.0));
+        // Rail-crossing scaling: (0.0, 3.0) has inside/distance = 1/3, outside [-1,1] yields 0.0
         assert_eq!(eval_adaa_cubic_c2_wavefolder_odd_f32(2.0, 3.0), 0.0);
-        let (ao_int, ae_int) = eval_adaa_cubic_c2_wavefolder_f64(0.0, 1.0);
-        let (ao_cross, ae_cross) = eval_adaa_cubic_c2_wavefolder_f64(0.0, 3.0);
-        assert!((ao_cross - ao_int / 3.0).abs() < 1e-12);
-        assert!((ae_cross - ae_int / 3.0).abs() < 1e-12);
+        let ao_int = eval_adaa_cubic_c2_wavefolder_odd_f32(0.0, 1.0);
+        let ao_cross = eval_adaa_cubic_c2_wavefolder_odd_f32(0.0, 3.0);
+        assert!((ao_cross - ao_int / 3.0).abs() < 1e-6);
         for &(p, c) in &[(0.0_f32, 3.0_f32), (-2.5, 1.5), (-3.0, -1.5), (-1.2, 0.4)] {
             let o32 = eval_adaa_cubic_c2_wavefolder_odd_f32(p, c);
-            let (o64, _) = eval_adaa_cubic_c2_wavefolder_f64(f64::from(p), f64::from(c));
+            let o64 = analytical_c2_wavefolder_odd_oracle_f64(f64::from(p), f64::from(c));
             assert!((f64::from(o32) - o64).abs() < 2.0e-5);
         }
 
@@ -215,13 +172,14 @@ mod tests {
                 prop_assert_eq!(w_even, 0.0);
             }
 
-            let (odd, even, _) = eval_saturated_polyadaa_rail_crossing_f64(raw_prev, raw_curr);
-            prop_assert!(odd.is_finite() && odd.abs() <= 1.0 + 1e-12);
-            prop_assert!(even.is_finite() && (0.0..=1.0).contains(&even));
-
-            let (wf_o, wf_e) = eval_adaa_cubic_c2_wavefolder_f64(raw_prev, raw_curr);
-            prop_assert!(wf_o.is_finite() && wf_o.abs() <= 1.0);
-            prop_assert!(wf_e.is_finite() && (0.0..=1.0).contains(&wf_e));
+            let prev32 = raw_prev as f32;
+            let curr32 = raw_curr as f32;
+            let wf_o = eval_adaa_cubic_c2_wavefolder_odd_f32(prev32, curr32);
+            prop_assert!(wf_o.is_finite() && wf_o.abs() <= 1.0 + 1e-6);
+            let wf_oracle =
+                analytical_c2_wavefolder_odd_oracle_f64(f64::from(prev32), f64::from(curr32));
+            prop_assert!(wf_oracle.is_finite() && wf_oracle.abs() <= 1.0 + 1e-12);
+            prop_assert!((f64::from(wf_o) - wf_oracle).abs() <= 2.5e-5);
         }
     }
 }

@@ -104,7 +104,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         let saved_cb_twarp = self.control_bus.tank_warp_mod;
         let saved_cb_tglen = self.control_bus.tank_grain_len_scale;
         let saved_cb_tstate = self.control_bus.tank_state_mod;
-        let saved_cb_tdirty = self.control_bus.tank_mod_dirty;
+        let saved_cb_tdirty = self.control_bus.target_dispatch_dirty;
         let saved_cb_rho = self.control_bus.rho_drift_host;
         let saved_cb_off = self.control_bus.offline_bounce;
         let saved_cb_ultra_active = self.control_bus.ultra_tier_active;
@@ -112,10 +112,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         let saved_cb_ou = self.control_bus.ou_drift_state;
 
         core::mem::swap(&mut self.hot_core, &mut self.bounce_scratch.hot_core);
-        core::mem::swap(
-            &mut self.stage0_router,
-            &mut self.bounce_scratch.stage0_router,
-        );
+        core::mem::swap(&mut self.io_router, &mut self.bounce_scratch.io_router);
 
         self.offline_bounce = true;
         self.control_bus.offline_bounce = true;
@@ -173,10 +170,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         }
 
         core::mem::swap(&mut self.hot_core, &mut self.bounce_scratch.hot_core);
-        core::mem::swap(
-            &mut self.stage0_router,
-            &mut self.bounce_scratch.stage0_router,
-        );
+        core::mem::swap(&mut self.io_router, &mut self.bounce_scratch.io_router);
 
         self.zoh = saved_zoh;
         self.offline_bounce = saved_bounce;
@@ -220,7 +214,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         self.control_bus.tank_warp_mod = saved_cb_twarp;
         self.control_bus.tank_grain_len_scale = saved_cb_tglen;
         self.control_bus.tank_state_mod = saved_cb_tstate;
-        self.control_bus.tank_mod_dirty = saved_cb_tdirty;
+        self.control_bus.target_dispatch_dirty = saved_cb_tdirty;
         self.control_bus.rho_drift_host = saved_cb_rho;
         self.control_bus.offline_bounce = saved_cb_off;
         self.control_bus.ultra_tier_active = saved_cb_ultra_active;

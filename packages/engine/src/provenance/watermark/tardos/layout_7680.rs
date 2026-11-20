@@ -1,31 +1,31 @@
 //! Canonical `0..7,680` Disjoint Coordinate Partition (`64` Role A + `5,811` Role B + `1,805` Unassigned)
-//! derived strictly from `stages/weights.rs` `#[repr(C)]` wire offsets (`ref[sec.watermark.tardos-code]`,
+//! derived strictly from `graph/weights.rs` `#[repr(C)]` wire offsets (`ref[sec.watermark.tardos-code]`,
 //! `ref[repo.code.constant-eval-and-derivations]`).
 
 use core::mem::offset_of;
 
-use crate::provenance::TARDOS_CASCADE_WEIGHTS;
-use crate::stages::weights::{
+use crate::graph::weights::{
     ARENA_FULL_BYTES, ARENA_LITE_BYTES, ARENA_PRO_BYTES, ARENA_ULTRA_BYTES, Arena0ControlBusWire,
     Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3ControlBusWire,
     Arena3UltraDeltaWire, KautzSoaBlockWire, SonaCoreProDeltaWire, SonaCoreUltraDeltaWire,
-    Stage4QuadWire, VarProReadoutFullWire, VarProReadoutLiteWire, VarProReadoutProWire,
+    TankQuadWire, VarProReadoutFullWire, VarProReadoutLiteWire, VarProReadoutProWire,
     VarProReadoutUltraWire,
 };
+use crate::provenance::TARDOS_CASCADE_WEIGHTS;
 
 /// Descriptor for one contiguous carrier span in the `0..7,680` Tardos partition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TardosSpan {
-    pub tier: u8,
-    pub start_idx: usize,
-    pub end_idx: usize,
-    pub byte_base: usize,
-    pub is_w_ctrl_role_b: bool,
+pub(crate) struct TardosSpan {
+    pub(crate) tier: u8,
+    pub(crate) start_idx: usize,
+    pub(crate) end_idx: usize,
+    pub(crate) byte_base: usize,
+    pub(crate) is_w_ctrl_role_b: bool,
 }
 
 impl TardosSpan {
     #[inline]
-    pub const fn len(&self) -> usize {
+    pub(crate) const fn len(&self) -> usize {
         self.end_idx - self.start_idx
     }
 }
@@ -97,7 +97,7 @@ pub const TARDOS_W_READOUT_FP16_RANGES: [(usize, usize, usize); 4] = [
 ];
 
 /// Exact per-tier coordinate bounds `(tier_start_idx, tier_end_idx)` across `0..5,875` (`[655, 504, 1892, 2824]`).
-pub const TARDOS_TIER_INDEX_BOUNDS: [(usize, usize); 4] =
+pub(crate) const TARDOS_TIER_INDEX_BOUNDS: [(usize, usize); 4] =
     [(0, 655), (655, 1_159), (1_159, 3_051), (3_051, 5_875)];
 
 const A0_WCTRL: usize =
@@ -115,7 +115,7 @@ const A2_PRO_RES: usize = ARENA_FULL_BYTES
     + offset_of!(SonaCoreProDeltaWire, reserve);
 const A2_S4_1: usize = ARENA_FULL_BYTES
     + offset_of!(Arena2ProDeltaWire, stage4_pro)
-    + core::mem::size_of::<Stage4QuadWire>();
+    + core::mem::size_of::<TankQuadWire>();
 const A2_KAUTZ: usize = ARENA_FULL_BYTES + offset_of!(Arena2ProDeltaWire, kautz_pro);
 const A2_RO: usize = ARENA_FULL_BYTES + offset_of!(Arena2ProDeltaWire, varpro_readout_pro);
 
@@ -124,13 +124,13 @@ const A3_ULTRA_RES: usize = ARENA_PRO_BYTES
     + offset_of!(SonaCoreUltraDeltaWire, reserve);
 const A3_S4_1: usize = ARENA_PRO_BYTES
     + offset_of!(Arena3UltraDeltaWire, stage4_ultra)
-    + core::mem::size_of::<Stage4QuadWire>();
+    + core::mem::size_of::<TankQuadWire>();
 const A3_KAUTZ: usize = ARENA_PRO_BYTES + offset_of!(Arena3UltraDeltaWire, kautz_ultra);
 const A3_RO: usize = ARENA_PRO_BYTES + offset_of!(Arena3UltraDeltaWire, varpro_readout_ultra);
 const A3_CTRL: usize = ARENA_PRO_BYTES + offset_of!(Arena3UltraDeltaWire, ctrl_ultra);
 
 /// Complete disjoint Role B `F32` carrier spans across `Arena 0..3` (`2,447` floats total).
-pub const TARDOS_F32_SPANS: &[TardosSpan] = &[
+pub(crate) const TARDOS_F32_SPANS: &[TardosSpan] = &[
     // Tier 0 (Arena 0): 16..383 (367 Role B F32)
     TardosSpan {
         tier: 0,
@@ -306,7 +306,7 @@ pub const TARDOS_F32_SPANS: &[TardosSpan] = &[
 ];
 
 /// Complete disjoint Role B `U16` (`fp16`) carrier spans across `Arena 0..3` (`3,364` half-floats total).
-pub const TARDOS_FP16_SPANS: &[TardosSpan] = &[
+pub(crate) const TARDOS_FP16_SPANS: &[TardosSpan] = &[
     // Tier 0 (Arena 0): 383..655 (272 Role B U16; excludes crossbar [80..96] & [192..208])
     TardosSpan {
         tier: 0,
@@ -438,3 +438,56 @@ const _: () = assert!(A2_RO == 13_568);
 const _: () = assert!(A3_ULTRA_RES == 20_096);
 const _: () = assert!(A3_RO == 23_296);
 const _: () = assert!(A3_CTRL == 26_880);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::hint::black_box;
+
+    #[test]
+    fn test_tardos_7680_runtime_span_verification() {
+        let f32_spans = black_box(TARDOS_F32_SPANS);
+        let fp16_spans = black_box(TARDOS_FP16_SPANS);
+        assert_eq!(sum_span_counts(f32_spans), 2_447);
+        assert_eq!(sum_span_counts(fp16_spans), 3_364);
+        assert!(check_spans_disjoint(f32_spans, 4, ARENA_ULTRA_BYTES));
+        assert!(check_spans_disjoint(fp16_spans, 2, ARENA_ULTRA_BYTES));
+        assert!(!check_spans_disjoint(f32_spans, 4, ARENA_LITE_BYTES));
+
+        let idx_overlap = [
+            TardosSpan {
+                tier: 0,
+                start_idx: 10,
+                end_idx: 20,
+                byte_base: 0,
+                is_w_ctrl_role_b: false,
+            },
+            TardosSpan {
+                tier: 0,
+                start_idx: 15,
+                end_idx: 25,
+                byte_base: 100,
+                is_w_ctrl_role_b: false,
+            },
+        ];
+        assert!(!check_spans_disjoint(black_box(&idx_overlap), 4, 4_096));
+
+        let byte_overlap = [
+            TardosSpan {
+                tier: 0,
+                start_idx: 0,
+                end_idx: 4,
+                byte_base: 0,
+                is_w_ctrl_role_b: false,
+            },
+            TardosSpan {
+                tier: 0,
+                start_idx: 4,
+                end_idx: 8,
+                byte_base: 8,
+                is_w_ctrl_role_b: false,
+            },
+        ];
+        assert!(!check_spans_disjoint(black_box(&byte_overlap), 4, 4_096));
+    }
+}

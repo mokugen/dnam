@@ -41,7 +41,7 @@ pub use security::{
     compute_preview_single_control_window, compute_record_context_sha256,
     compute_watermark_profile_sha256, compute_wrap_plan_sha256, derive_watermark_seed_hmac_sha256,
     encode_hpke_slot_vector, encode_prefix_list, encode_recipient_key_ids, encode_record_directory,
-    evaluate_anticlone_revocation_policy, extract_stage3_tier_fingerprint_component,
+    evaluate_anticlone_revocation_policy, extract_cabinet_tier_fingerprint_component,
     extract_storefront_metadata, hmac_sha256, parse_dme1_decrypted_plaintext,
     parse_hpke_slot_vector, parse_prefix_list, parse_recipient_key_ids, parse_record_directory,
     validate_license_tier_and_royalty_splits, validate_preview_single_switch_options,
@@ -87,7 +87,7 @@ pub use watermark::{
 /// Number of coordinates in the `TardosCodebook7680` watermark view across `Arena 0..3`.
 pub const TARDOS_CASCADE_WEIGHTS: usize = 7680;
 
-/// Number of Stage III modal/Kautz complex resonator channels across `Arena 0..3` (`8 + 4 + 12 + 8 = 32`).
+/// Number of cabinet modal/Kautz complex resonator channels across `Arena 0..3` (`8 + 4 + 12 + 8 = 32`).
 pub const KAUTZ_TOTAL_CHANNELS: usize = 32;
 
 /// Per-tier dimension of the prefix-composable gauge-invariant structural hash (`56-D` per tier).

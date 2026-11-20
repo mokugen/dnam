@@ -4,7 +4,7 @@
 //!
 //! Canonical Reference: `docs/specs/security/watermarking_and_marketplace.md` (`ref[sec.watermark.tardos-code]`).
 
-pub mod layout_7680;
+pub(crate) mod layout_7680;
 
 use alloc::vec::Vec;
 use core::ops::Deref;
@@ -13,18 +13,18 @@ use dnam_kernels::{f32_to_fp16, fp16_to_f32};
 use zerocopy::byteorder::little_endian::{F32, U16, U32};
 use zerocopy::{FromBytes, IntoBytes};
 
+use crate::graph::weights::{ARENA_LITE_BYTES, Arena0ControlBusWire};
 use crate::provenance::TARDOS_CASCADE_WEIGHTS;
 use crate::provenance::chacha20::chacha20_block_64b;
 use crate::provenance::security::{WatermarkSeedScope, derive_watermark_seed_hmac_sha256};
 use crate::provenance::sha256::sha256_digest;
 use crate::schema::{DnamError, cold_sqrt_f64};
-use crate::stages::weights::{ARENA_LITE_BYTES, Arena0ControlBusWire};
 
 use super::max_tiers_for_arena_len;
 pub use layout_7680::{
-    TARDOS_CASCADE_RANGES, TARDOS_F32_SPANS, TARDOS_FP16_SPANS, TARDOS_TIER_INDEX_BOUNDS,
-    TARDOS_ULTRA_RESERVE_RANGE, TARDOS_W_READOUT_FP16_RANGES,
+    TARDOS_CASCADE_RANGES, TARDOS_ULTRA_RESERVE_RANGE, TARDOS_W_READOUT_FP16_RANGES,
 };
+pub(crate) use layout_7680::{TARDOS_F32_SPANS, TARDOS_FP16_SPANS, TARDOS_TIER_INDEX_BOUNDS};
 
 const FP16_MAX_FINITE: f32 = 65_504.0;
 
@@ -60,7 +60,7 @@ pub(crate) fn write_u16_le(arena: &mut [u8], byte_offset: usize, val: u16) {
 
 /// Computes `binary16` (`fp16`) unit-in-last-place at `w`: `2^(max(-24, floor(log2|w|) - 10))`.
 #[inline]
-pub fn fp16_ulp(w: f32) -> f32 {
+pub(crate) fn fp16_ulp(w: f32) -> f32 {
     let aw = w.abs();
     if !aw.is_finite() || aw <= 6.103_515_6e-5 {
         5.960_464_5e-8 // 2^-24 subnormal fp16 ULP
@@ -515,7 +515,7 @@ pub fn score_tardos_watermark_7680_with_buyer_gauge(
 
     let suspect_w_ctrl_opt = q_buyer_4x4.and_then(|_| {
         Arena0ControlBusWire::ref_from_prefix(
-            suspect_arena.get(crate::stages::weights::ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET..)?,
+            suspect_arena.get(crate::graph::weights::ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET..)?,
         )
         .ok()
         .map(|(cb, _)| cb.w_ctrl)
@@ -709,5 +709,38 @@ mod tests {
         let mut bad_delta = [[0.0_f32; 4]; 32];
         bad_delta[0][0] = -1.0;
         assert!(apply_cascade_head_gauge(&mut ultra, 0, &bad_delta).is_err());
+    }
+
+    #[test]
+    fn test_tardos_non_finite_boundary_and_envelope_paths() {
+        let mut tiny = [0u8; 2];
+        write_f32_wire(&mut tiny, 8, 1.0);
+        write_u16_le(&mut tiny, 8, 1);
+
+        let mut code = alloc::vec![0.0_f32; TARDOS_CASCADE_WEIGHTS];
+        code[16] = 1.0;
+        code[17] = -1.0;
+        code[383] = 1.0;
+        code[384] = 1.0;
+        code[385] = 0.0;
+        let envs = [1e-4_f32; TARDOS_CASCADE_WEIGHTS];
+
+        let mut a1 = alloc::vec![0u8; ARENA_LITE_BYTES];
+        write_f32_wire(&mut a1, TARDOS_F32_SPANS[0].byte_base, f32::NAN);
+        write_u16_le(&mut a1, TARDOS_FP16_SPANS[0].byte_base, 0x7E00);
+        write_u16_le(
+            &mut a1,
+            TARDOS_FP16_SPANS[0].byte_base + 2,
+            f32_to_fp16(FP16_MAX_FINITE),
+        );
+        let mut a2 = a1.clone();
+        apply_tardos_watermark_7680(&mut a1, &code, 1e-4).unwrap();
+        apply_tardos_w_readout_fp16(&mut a1, &code, 0.0).unwrap();
+        apply_tardos_watermark_7680_envelopes(&mut a2, &code, &envs).unwrap();
+        let mut clean = alloc::vec![0u8; ARENA_LITE_BYTES];
+        apply_tardos_watermark_7680_envelopes(&mut clean, &code, &envs).unwrap();
+        let z_ro = score_tardos_w_readout_fp16(&a1, &clean, &code).unwrap();
+        let z_all = score_tardos_watermark_7680(&a1, &a2, &code).unwrap();
+        assert!(z_ro.is_finite() && z_all.is_finite());
     }
 }

@@ -14,14 +14,14 @@ use dnam_engine::container::{
     ARENA_OFFSET_ULTRA_END, build_dnam_container, build_v3_open_dnam_container,
     strip_container_to_tier,
 };
-use dnam_engine::math::ScalarBackend;
-use dnam_engine::schema::{DnamError, DnamJsonHeader};
-use dnam_engine::stages::WdwDryTapMode;
-use dnam_engine::stages::sona_core::{
+use dnam_engine::graph::WdwDryTapMode;
+use dnam_engine::graph::sona_core::{
     MAX_KAUTZ_POLES, MAX_SONA_GROUPS, MAX_SONA_TILES, MAX_TANK_LINES, MAX_TOTAL_SONA_LANES,
     SONA_FIR_MAX_TAPS, SonaControlBusParams, SonaCrossbarConfig, SonaMatryoshkaModel,
 };
-use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
+use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
+use dnam_engine::math::ScalarBackend;
+use dnam_engine::schema::{DnamError, DnamJsonHeader};
 use dnam_engine::{DnamEngine, DynamicDnamEngine, OFFLINE_BOUNCE_PDC_SAMPLES, Tier};
 use proptest::prelude::*;
 use zerocopy::FromBytes;
@@ -117,7 +117,7 @@ fn test_exact_tier_equivalence_unstripped_vs_stripped_with_arena0_and_crossbars(
     ctrl.w_ctrl = [[0.04; 16]; 16];
     // Populate Arena 3 (`Tier::Ultra` only) weights & couplings to prove non-Ultra tiers produce
     // 0-ULP bitwise-identical output across unstripped vs stripped containers (`r[dsp.head.tier-equivalence]`).
-    ctrl.w_ctrl_ultra = [[0.18; 16]; 4];
+    ctrl.w_ctrl_ultra = [[0.18; 4]; 16];
     ctrl.u_int_ultra[0] = [[0.32; 8]; 4];
     ctrl.u_int_ultra[1] = [[-0.24; 8]; 4];
     ctrl.u_int_ultra[2] = [[0.19; 8]; 4];
@@ -296,8 +296,8 @@ fn test_wdw_single_width_application_and_4x_4cm_send_downsampling() {
             DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
         let mut eng_w2 =
             DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
-        eng_w1.stage0_router.wdw_tap_mode = tap_mode;
-        eng_w2.stage0_router.wdw_tap_mode = tap_mode;
+        eng_w1.io_router.wdw_tap_mode = tap_mode;
+        eng_w2.io_router.wdw_tap_mode = tap_mode;
         eng_w1.set_stereo_width(1.0);
         eng_w2.set_stereo_width(1.75);
 

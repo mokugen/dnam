@@ -2,8 +2,8 @@
 //! and core division-free math primitives.
 //!
 //! Higher-level domain modules define their own `<Domain>Backend` traits in their respective
-//! modules (`OpMBackend`, `OpNBackend`, `OpTBackend`, `StageBackend`, `EngineBackend`),
-//! keeping the dependency DAG strictly one-way (`engine -> stages -> operators -> math`).
+//! modules (`OpMBackend`, `OpNBackend`, `OpTBackend`, `GraphBackend`, `EngineBackend`),
+//! keeping the dependency DAG strictly one-way (`engine -> graph -> operators -> math`).
 
 pub mod simd_vec4;
 
@@ -59,7 +59,7 @@ pub fn rsqrt_nr2_scalar_pair_f32(v0: f32, v1: f32) -> (f32, f32) {
     (e0, e1)
 }
 
-/// Level 2 Hardware Abstraction: Core SIMD math primitives across every architecture
+/// Level 1 Hardware Abstraction: Core SIMD math primitives across every architecture
 /// (`aarch64`, `x86_64`, `wasm32`, `scalar`).
 pub trait MathBackend: Copy + Clone + Send + Sync + 'static + Crc32cBackend {
     /// Underlying 128-bit 4-lane vector register type (also bridged to [`dnam_kernels::KernelVec4`]).

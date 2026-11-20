@@ -3,7 +3,7 @@
 Implements the top-level audio engine runtime dispatcher (`#[forbid(unsafe_code)]`, `SONA` `v3.0` target):
 - Dual-rate execution lifecycle (`48 kHz` audio / `3 kHz` control bus).
 - 4-tier Matryoshka SIMD dispatch (`Lite` ⊂ `Full` ⊂ `Pro` ⊂ `Ultra`).
-- Native Mono (`1 -> 1`, `2 -> 1`) and True Stereo (`1 -> 2`, `2 -> 2`) processing via [`SonaHotSlab`](../stages/sona_core/slab.rs) / [`SonaInstance`](../stages/sona_core.rs).
+- Native Mono (`1 -> 1`, `2 -> 1`) and True Stereo (`1 -> 2`, `2 -> 2`) processing via [`SonaHotSlab`](../graph/sona_core/slab.rs) / [`SonaInstance`](../graph/sona_core.rs).
 - Zero audio-loop allocations and L1D-resident state buffer management.
 
 ## 1. Submodule Map

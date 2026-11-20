@@ -368,8 +368,8 @@ mod tests {
     use crate::container::validate_v3_open_dnam_layout;
     use crate::provenance::DefaultCryptoProvider;
     use crate::schema::{
-        ControlBusConfig, DatasetProvenance, IoConfig, ModelMetadata, PresetDef, RouterConfig,
-        SlimmableTiersConfig, Stage3CabinetKautzConfig, Stage4SpatialTankConfig, TierProfile,
+        CabinetKautzConfig, ControlBusConfig, DatasetProvenance, IoConfig, IoRouterConfig,
+        ModelMetadata, PresetDef, SlimmableTiersConfig, SpatialTankConfig, TierProfile,
     };
     use alloc::collections::BTreeMap;
     use alloc::vec::Vec;
@@ -419,9 +419,9 @@ mod tests {
             controls_schema: Vec::new(),
             presets: Vec::new(),
             control_bus: ControlBusConfig::default(),
-            stage0_router: RouterConfig::default(),
-            stage3_cabinet: Stage3CabinetKautzConfig::default(),
-            stage4_tank: Stage4SpatialTankConfig::default(),
+            io_router: IoRouterConfig::default(),
+            cabinet: CabinetKautzConfig::default(),
+            spatial_tank: SpatialTankConfig::default(),
             delay_histories: Vec::new(),
             tensor_directory: BTreeMap::new(),
         }

@@ -4,7 +4,7 @@ use zerocopy::byteorder::little_endian::F32;
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::control::record::Cp1ContributorSlot;
-use crate::stages::weights::{
+use crate::graph::weights::{
     ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET, ARENA3_CTRL_OFFSET, ARENA3_UINT_ULTRA_OFFSET,
     Arena0ControlBusWire, Arena3ControlBusWire,
 };
@@ -65,7 +65,7 @@ pub fn eval_uint_ultra_delta_3x4x8(
     z_fm_ultra: [f32; 4],
     s_emb: [f32; 3],
 ) -> ([f32; 8], [f32; 8], bool) {
-    if arena_bytes.len() < crate::stages::weights::ARENA_ULTRA_BYTES {
+    if arena_bytes.len() < crate::graph::weights::ARENA_ULTRA_BYTES {
         return ([0.0; 8], [0.0; 8], false);
     }
     let Some(tail) = arena_bytes.get(ARENA3_CTRL_OFFSET..) else {
@@ -124,7 +124,7 @@ pub fn eval_uint_ultra_delta_6x8(
     s_emb: [f32; 3],
     s_emb_ultra: [f32; 3],
 ) -> [f32; 8] {
-    if arena_bytes.len() < crate::stages::weights::ARENA_ULTRA_BYTES {
+    if arena_bytes.len() < crate::graph::weights::ARENA_ULTRA_BYTES {
         return [0.0; 8];
     }
     let Some(tail) = arena_bytes.get(ARENA3_UINT_ULTRA_OFFSET..) else {
@@ -154,7 +154,7 @@ pub fn eval_uint_ultra_delta_6x8(
 
 /// Allocation-free `CP1` contributor decoder returning static error strings so real-time reloaders
 /// emit zero heap allocation/drop glue.
-/// Decodes strictly via canonical [`crate::stages::weights::Cp1InlineDirWire`] (`cp1_dir_count in 0..=8`,
+/// Decodes strictly via canonical [`crate::graph::weights::Cp1InlineDirWire`] (`cp1_dir_count in 0..=8`,
 /// `flags == 0`, `entries: [[ctrl_idx, (kind << 4) | lanes, aux]; 8]`) without legacy byte-sniffing
 /// (`ref[container.dnam.cp1-profile]`).
 pub(crate) fn decode_cp1_inline_contributors_static(
@@ -663,7 +663,7 @@ mod control_bus_tests {
 
     #[test]
     fn test_uint_and_decode_cp1_inline_edge_paths() {
-        use crate::stages::weights::{
+        use crate::graph::weights::{
             ARENA_LITE_BYTES, ARENA_ULTRA_BYTES, ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET,
             ARENA0_CP1_BASE_END, ARENA0_UINT_BASE_OFFSET, ARENA3_CP1_ULTRA_END,
             ARENA3_UINT_ULTRA_OFFSET,

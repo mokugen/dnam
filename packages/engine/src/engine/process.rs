@@ -52,7 +52,7 @@ pub(crate) fn micro_ramp_advance_clamped(
 }
 
 impl<'a, B: EngineBackend> DnamEngine<'a, B> {
-    /// Synchronizes static control projections, `current_stage_params`, and [`crate::stages::SonaHotSlab`]
+    /// Synchronizes static control projections, `current_stage_params`, and [`crate::graph::SonaHotSlab`]
     /// conditioning immediately without waiting for the next `3 kHz` tick.
     pub(crate) fn sync_immediate_control_state_inner(&mut self) {
         let eff_len = self
@@ -74,7 +74,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         let avg_energy = self.ctrl_energy_accum * self.zoh.alpha_ramp_host;
         self.ctrl_sub_counter = 0;
         self.ctrl_energy_accum = 0.0;
-        let det_env = self.stage0_router.detector_envelopes;
+        let det_env = self.io_router.detector_envelopes;
         let eff_len = self
             .effective_tier()
             .expected_arena_bytes()
@@ -243,7 +243,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         let ctrl_active = self.control_bus.num_controls > 0
             || self.control_bus.is_dirty
             || self.control_bus.live_analog_drift_enabled;
-        let is_frozen = self.hot_core.stage4_freeze();
+        let is_frozen = self.hot_core.tank_freeze();
         let live_scale = if self.bypassed || (self.freeze_mutes_dry && is_frozen) {
             0.0_f32
         } else {
@@ -334,7 +334,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             };
         }
 
-        let is_frozen = self.hot_core.stage4_freeze();
+        let is_frozen = self.hot_core.tank_freeze();
         let live_scale = if self.bypassed || (self.freeze_mutes_dry && is_frozen) {
             0.0
         } else {
@@ -440,6 +440,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         right_out: &mut [f32],
     ) {
         let _ftz = FtzDazGuard::new();
+        self.hot_core.cold.max_op_n_drive = 0.0;
         let num_frames = left_in
             .len()
             .min(right_in.len())
@@ -484,7 +485,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
         let env_bits = CERTIFIED_INPUT_ENVELOPE_MIN_F32.to_bits();
         let clean_inputs = !self.bypassed
-            && !(self.freeze_mutes_dry && self.hot_core.stage4_freeze())
+            && !(self.freeze_mutes_dry && self.hot_core.tank_freeze())
             && all_within_envelope_bits(li, env_bits)
             && (self.single_input || all_within_envelope_bits(ri, env_bits));
         if clean_inputs {
@@ -514,6 +515,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         mono_out: &mut [f32],
     ) {
         let _ftz = FtzDazGuard::new();
+        self.hot_core.cold.max_op_n_drive = 0.0;
         let num_frames = left_in.len().min(right_in.len()).min(mono_out.len());
         self.tempo_state.advance_frames(num_frames);
         self.sync_hot_core_tier();
@@ -587,6 +589,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     /// Processes a mono audio block (`Mono -> Mono`).
     pub fn process_mono(&mut self, mono_in: &[f32], mono_out: &mut [f32]) {
         let _ftz = FtzDazGuard::new();
+        self.hot_core.cold.max_op_n_drive = 0.0;
         let num_frames = mono_in.len().min(mono_out.len());
         self.tempo_state.advance_frames(num_frames);
         self.sync_hot_core_tier();
@@ -633,6 +636,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     /// Processes in-place stereo audio blocks.
     pub fn process_block_in_place(&mut self, left_io: &mut [f32], right_io: &mut [f32]) {
         let _ftz = FtzDazGuard::new();
+        self.hot_core.cold.max_op_n_drive = 0.0;
         let num_frames = left_io.len().min(right_io.len());
         self.tempo_state.advance_frames(num_frames);
         self.sync_hot_core_tier();
@@ -672,10 +676,10 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 mod tests {
     use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
     use crate::engine::DnamEngine;
+    use crate::graph::SonaMatryoshkaModel;
+    use crate::graph::weights::pack_sona_matryoshka_to_arena;
     use crate::math::ScalarBackend;
     use crate::schema::DnamJsonHeader;
-    use crate::stages::SonaMatryoshkaModel;
-    use crate::stages::weights::pack_sona_matryoshka_to_arena;
     use crate::types::Tier;
     extern crate alloc;
     use alloc::vec;

@@ -12,8 +12,8 @@ pub mod header;
 pub mod io_and_tiers;
 pub mod json_wire;
 pub mod signatures;
-pub mod stages;
 pub mod tempo_subdiv;
+pub mod topology;
 pub mod ui_hints;
 
 pub use controls::{
@@ -24,10 +24,10 @@ pub use error::{
     DnamError, SchemaOptionExt, cold_exp_f64, cold_ln_f64, cold_pow_f64, cold_sqrt_f64, reject_if,
 };
 pub use header::{
-    BlendMode, ControlBusConfig, DelayHistoryEntry, DnamJsonHeader, IoConfig, LevelingConfig,
-    LevelingMetric, ModelCapabilities, ModelMetadata, RouterConfig, SchemaVersion,
-    SlimmableTiersConfig, Stage3CabinetKautzConfig, Stage4SpatialTankConfig, TensorSliceEntry,
-    TierProfile, check_no_unknown_header_keys,
+    BlendMode, CabinetKautzConfig, ControlBusConfig, DelayHistoryEntry, DnamJsonHeader, IoConfig,
+    IoRouterConfig, LevelingConfig, LevelingMetric, ModelCapabilities, ModelMetadata,
+    SchemaVersion, SlimmableTiersConfig, SpatialTankConfig, TensorSliceEntry, TierProfile,
+    check_no_unknown_header_keys,
 };
 pub use signatures::{
     AuthorizedDevice, CreatorSignature, DatasetProvenance, DistributionPolicy,

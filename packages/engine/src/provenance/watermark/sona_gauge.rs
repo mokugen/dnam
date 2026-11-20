@@ -13,14 +13,14 @@ use zerocopy::FromBytes;
 use zerocopy::byteorder::little_endian::{F32, U16};
 
 use super::max_tiers_for_arena_len;
-use crate::provenance::sha256::sha256_digest;
-use crate::schema::DnamError;
-use crate::stages::sona_core::model::SONA_INTERBLOCK_TILES;
-use crate::stages::weights::{
+use crate::graph::sona_core::model::SONA_INTERBLOCK_TILES;
+use crate::graph::weights::{
     ARENA_FULL_BYTES, ARENA_LITE_BYTES, ARENA_PRO_BYTES, ARENA_ULTRA_BYTES, Arena0LiteWire,
     Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, SonaCrossbarBlockWire,
     SonaGroupWire, SonaInterBlockTilePairWire,
 };
+use crate::provenance::sha256::sha256_digest;
+use crate::schema::DnamError;
 
 /// Cumulative Matryoshka active `SONA` hidden lanes per tier (`16 / 24 / 32 / 40`).
 pub const SONA_SIGN_LANES_PER_TIER: [usize; 4] = [16, 24, 32, 40];
@@ -241,11 +241,11 @@ mod tests {
     use super::*;
     use crate::container::{build_dnam_container, strip_container_to_tier};
     use crate::engine::DnamEngine;
+    use crate::graph::sona_core::model::SonaMatryoshkaModel;
+    use crate::graph::weights::pack_sona_matryoshka_to_arena;
     use crate::math::DefaultMathBackend;
     use crate::provenance::{extract_structural_hash_224d, structural_cosine_similarity};
     use crate::schema::{ControlKind, ControlSchemaDef, ControlUiHints, DnamJsonHeader};
-    use crate::stages::sona_core::model::SonaMatryoshkaModel;
-    use crate::stages::weights::pack_sona_matryoshka_to_arena;
     use crate::types::Tier;
     use proptest::prelude::*;
 

@@ -677,3 +677,183 @@ impl MathBackend for NeonBackend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use dnam_kernels::{InterleavedStereo8, StereoVec8};
+    use proptest::prelude::*;
+
+    use super::super::{NeonF64Vec2, NeonStereo8};
+    use super::*;
+    use crate::math::trainer::{ScalarF64Vec2, SimdF64Vec2};
+    use crate::math::{ScalarBackend, ScalarVec4};
+
+    #[test]
+    fn test_neon_vec4_missed_lanes_and_rcp_ge1() {
+        let a_arr = [1.5_f32, -2.5, 3.5, -4.5];
+        let b_arr = [2.0_f32, -4.0, 0.5, 8.0];
+        let va = <NeonVec4 as SimdVec4>::from_array(a_arr);
+        let vb = <NeonVec4 as SimdVec4>::load(&b_arr);
+
+        assert_eq!(
+            <NeonVec4 as SimdVec4>::dup_low_pair(va).to_array(),
+            [1.5, -2.5, 1.5, -2.5]
+        );
+        assert_eq!(
+            <NeonVec4 as SimdVec4>::dup_high_pair(va).to_array(),
+            [3.5, -4.5, 3.5, -4.5]
+        );
+        assert_eq!(
+            <NeonVec4 as SimdVec4>::mul_lane::<0>(va, vb).to_array(),
+            [3.0, -5.0, 7.0, -9.0]
+        );
+        assert_eq!(
+            <NeonVec4 as SimdVec4>::mul_lane::<1>(va, vb).to_array(),
+            [-6.0, 10.0, -14.0, 18.0]
+        );
+        assert_eq!(
+            <NeonVec4 as SimdVec4>::mul_lane::<2>(va, vb).to_array(),
+            [0.75, -1.25, 1.75, -2.25]
+        );
+        assert_eq!(
+            <NeonVec4 as SimdVec4>::mul_lane::<3>(va, vb).to_array(),
+            [12.0, -20.0, 28.0, -36.0]
+        );
+
+        let d = [
+            <NeonVec4 as SimdVec4>::from_array([1.0, 2.0, 4.0, 8.0]),
+            <NeonVec4 as SimdVec4>::from_array([1.5, 3.0, 6.0, 10.0]),
+            <NeonVec4 as SimdVec4>::from_array([1.25, 2.5, 5.0, 12.5]),
+            <NeonVec4 as SimdVec4>::from_array([1.75, 3.5, 7.0, 16.0]),
+        ];
+        let (p0, p1) = <NeonVec4 as SimdVec4>::rcp_ge1_pair_nr2(d[0], d[1]);
+        let quad = <NeonVec4 as SimdVec4>::rcp_ge1_quad_nr2(d);
+        for idx in 0..4 {
+            let v0 = d[0].to_array()[idx];
+            let v1 = d[1].to_array()[idx];
+            assert!((p0.to_array()[idx] * v0 - 1.0).abs() < 1.0e-5);
+            assert!((p1.to_array()[idx] * v1 - 1.0).abs() < 1.0e-5);
+            for k in 0..4 {
+                let vk = d[k].to_array()[idx];
+                assert!((quad[k].to_array()[idx] * vk - 1.0).abs() < 1.0e-5);
+            }
+        }
+
+        let ka = <NeonVec4 as dnam_kernels::KernelVec4>::load(&a_arr);
+        let kb = <NeonVec4 as dnam_kernels::KernelVec4>::load(&b_arr);
+        let mut stored = [0.0_f32; 4];
+        <NeonVec4 as dnam_kernels::KernelVec4>::store(ka, &mut stored);
+        assert_eq!(stored, a_arr);
+        assert_eq!(
+            <NeonVec4 as dnam_kernels::KernelVec4>::splat_pair(1.25, -3.75).to_array(),
+            [1.25, -3.75, 1.25, -3.75]
+        );
+        assert_eq!(
+            <NeonVec4 as dnam_kernels::KernelVec4>::pair_swap_neg(ka).to_array(),
+            [2.5, 1.5, 4.5, 3.5]
+        );
+        assert_eq!(
+            <NeonVec4 as dnam_kernels::KernelVec4>::horizontal_sum(ka),
+            -2.0
+        );
+        assert_eq!(<NeonVec4 as dnam_kernels::KernelVec4>::dot(ka, kb), -21.25);
+        assert_eq!(
+            <NeonVec4 as dnam_kernels::KernelVec4>::mul_lane::<1>(ka, kb).to_array(),
+            [-6.0, 10.0, -14.0, 18.0]
+        );
+        assert_eq!(
+            <NeonVec4 as dnam_kernels::KernelVec4>::mul_lane::<3>(ka, kb).to_array(),
+            [12.0, -20.0, 28.0, -36.0]
+        );
+    }
+
+    #[test]
+    fn test_neon_backend_helpers_stereo8_and_f64_vec2() {
+        let _ = warm_crc32_support_cache();
+        let _ = is_crc32_supported_cached();
+        let bytes: [u8; 19] = core::array::from_fn(|i| (i as u8).wrapping_mul(17));
+        for len in [0, 1, 7, 8, 9, 19] {
+            assert_eq!(
+                aarch64_crc32c_update(0x1234_5678, &bytes[..len]),
+                crc32c_software_slice(0x1234_5678, &bytes[..len])
+            );
+        }
+
+        let (sd_l, su_l, sd_r, su_r) = neon_tracker_exp_scales_f32(0.25, 4.0);
+        assert_eq!((sd_l * su_l, sd_r * su_r), (1.0, 1.0));
+        let (sd_z, su_z, sd_hi, su_hi) = neon_tracker_exp_scales_f32(0.0, 1.0e35);
+        assert_eq!(su_z, 0.0);
+        assert!(sd_z > 0.0 && (sd_hi * su_hi - 1.0).abs() < 1.0e-6);
+
+        let edge = [f32::INFINITY, f32::NEG_INFINITY, f32::NAN, 100_000.0];
+        assert_eq!(
+            NeonBackend::f32x4_to_fp16x4(&edge),
+            ScalarBackend::f32x4_to_fp16x4(&edge)
+        );
+        let fp16_words = NeonBackend::vec4_to_fp16x4(<NeonVec4 as SimdVec4>::from_array([
+            0.5, -1.5, 2.25, -0.0,
+        ]));
+        assert_eq!(
+            NeonBackend::fp16x4_to_vec4(&fp16_words).to_array(),
+            [0.5, -1.5, 2.25, -0.0]
+        );
+        assert_eq!(NeonBackend::KIND, BackendKind::ArmNeon);
+
+        let s8_a = NeonStereo8::load_lr(&[1.0, 2.0, 3.0, 4.0], &[-1.0, -2.0, -3.0, -4.0]);
+        let s8_b = InterleavedStereo8::<ScalarVec4>::load_lr(
+            &[1.0, 2.0, 3.0, 4.0],
+            &[-1.0, -2.0, -3.0, -4.0],
+        );
+        assert_eq!(s8_a.horizontal_sum_lr(), s8_b.horizontal_sum_lr());
+
+        let f64_a = NeonF64Vec2::from_f32_pair(1.5, -2.5);
+        let f64_b = NeonF64Vec2::splat(2.0);
+        let sf64_a = ScalarF64Vec2::from_f32_pair(1.5, -2.5);
+        let sf64_b = ScalarF64Vec2::splat(2.0);
+        assert_eq!(
+            f64_a.mul_add_ieee(f64_b, f64_b).to_array(),
+            sf64_a.mul_add_ieee(sf64_b, sf64_b).to_array()
+        );
+        assert_eq!(f64_a.dot(f64_b), sf64_a.dot(sf64_b));
+    }
+
+    proptest! {
+        #[test]
+        fn prop_neon_vec4_pairs_lanes_and_rcp_ge1(
+            a in prop::array::uniform4(-100.0_f32..100.0_f32),
+            b in prop::array::uniform4(1.0_f32..1000.0_f32),
+        ) {
+            let na = <NeonVec4 as SimdVec4>::from_array(a);
+            let nb = <NeonVec4 as SimdVec4>::from_array(b);
+            let sa = ScalarVec4::from_array(a);
+            let sb = ScalarVec4::from_array(b);
+            prop_assert_eq!(
+                <NeonVec4 as SimdVec4>::dup_low_pair(na).to_array(),
+                [a[0], a[1], a[0], a[1]]
+            );
+            prop_assert_eq!(
+                <NeonVec4 as SimdVec4>::dup_high_pair(na).to_array(),
+                [a[2], a[3], a[2], a[3]]
+            );
+            prop_assert_eq!(
+                <NeonVec4 as SimdVec4>::mul_lane::<1>(na, nb).to_array(),
+                <ScalarVec4 as SimdVec4>::mul_lane::<1>(sa, sb).to_array()
+            );
+            prop_assert_eq!(
+                <NeonVec4 as SimdVec4>::mul_lane::<3>(na, nb).to_array(),
+                <ScalarVec4 as SimdVec4>::mul_lane::<3>(sa, sb).to_array()
+            );
+            prop_assert_eq!(
+                <NeonVec4 as dnam_kernels::KernelVec4>::pair_swap_neg(na).to_array(),
+                [-a[1], a[0], -a[3], a[2]]
+            );
+            let (rp0, rp1) = <NeonVec4 as SimdVec4>::rcp_ge1_pair_nr2(nb, nb);
+            let r0 = rp0.to_array();
+            let r1 = rp1.to_array();
+            for i in 0..4 {
+                prop_assert!((f64::from(r0[i]) * f64::from(b[i]) - 1.0).abs() < 1.0e-5);
+                prop_assert!((f64::from(r1[i]) * f64::from(b[i]) - 1.0).abs() < 1.0e-5);
+            }
+        }
+    }
+}

@@ -16,7 +16,7 @@ use f64_vec2::{load_vec2_quad, store_vec2_quad};
 
 use super::{BackendKind, MathBackend, ScalarBackend};
 
-/// Level-2 double-precision trainer hardware abstraction extending [`MathBackend`].
+/// Level-1 double-precision trainer hardware abstraction extending [`MathBackend`].
 ///
 /// All default implementations operate in unrolled `Self::F64Vec2` SIMD registers, while
 /// platform backends (`NeonBackend`, `ArmSmeBackend`, `X86Avx2FmaBackend`) override critical

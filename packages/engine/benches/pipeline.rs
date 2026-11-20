@@ -9,11 +9,11 @@ use std::hint::black_box;
 
 use dnam_engine::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
 use dnam_engine::engine::EngineBackend;
+use dnam_engine::graph::sona_core::{SonaControlBusParams, SonaMatryoshkaModel};
+use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::math::{DefaultMathBackend, ScalarBackend};
 use dnam_engine::memory::{AlignedBuffer, CacheLine64};
 use dnam_engine::schema::{ControlKind, ControlSchemaDef, ControlUiHints, DnamJsonHeader};
-use dnam_engine::stages::sona_core::{SonaControlBusParams, SonaMatryoshkaModel};
-use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::{DnamEngine, Tier};
 use hotpath::criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,

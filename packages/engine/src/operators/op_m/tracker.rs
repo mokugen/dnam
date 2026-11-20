@@ -466,7 +466,7 @@ mod tests {
 }
 
 #[cfg(test)]
-mod stage1_reference_tests {
+mod tracker_reference_tests {
     use crate::FtzDazGuard;
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     use std::hint::black_box;

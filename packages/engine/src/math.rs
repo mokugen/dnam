@@ -42,9 +42,9 @@ pub(crate) use backend::{flush_recursive_state_f32, flush_recursive_state_vec4};
 pub use const_eval::{
     DC_BLOCKER_5HZ_48K_F32, DC_BLOCKER_10HZ_48K_BITS, FULL_SPEC, IEEE754_F32_EXP_BIAS,
     IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED, IEEE754_F64_RSQRT_SEED, LITE_SPEC,
-    MAX_LOOP_GAIN_F32, MAX_PARALRU_R_F32, PRO_SPEC, STAGE4_DC_BLOCKER_48K_F32,
-    STAGE4_MAX_G_LIN_BITS_DERIVED, STAGE4_MAX_V_CEIL_BITS_DERIVED, SonaTierSpec, ULTRA_SPEC,
-    const_abs_f64, const_c1_clamped_tanh_coeffs, const_cos_f64, const_dc_blocker_pole_bits,
+    MAX_LOOP_GAIN_F32, MAX_PARALRU_R_F32, PRO_SPEC, SonaTierSpec, TANK_DC_BLOCKER_48K_F32,
+    TANK_MAX_G_LIN_BITS_DERIVED, TANK_MAX_V_CEIL_BITS_DERIVED, ULTRA_SPEC, const_abs_f64,
+    const_c1_clamped_tanh_coeffs, const_cos_f64, const_dc_blocker_pole_bits,
     const_dc_blocker_pole_f32, const_f32_rcp_chebyshev_seed, const_hermite5_quarter_sine_coeffs,
     const_max_f32_bits_le, const_max_f32_bits_le_ratio, const_sin_cos_f64, const_sin_f64,
     const_sqrt_f64, const_tan_f64,

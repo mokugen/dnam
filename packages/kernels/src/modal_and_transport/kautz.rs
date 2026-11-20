@@ -1,4 +1,4 @@
-//! Stage III `Op-M` Kautz modal state-space steps, rapid-sweep radial contraction, associative
+//! Cabinet `Op-M` Kautz modal state-space steps, rapid-sweep radial contraction, associative
 //! complex modal scan operators, and contractive rotor / `Q0.32` phasor facade
 //! (`ref[dsp.op-m.kautz.sweep-contraction]`, `ref[dsp.op-m.kautz.coupled-form]`,
 //! `ref[dsp.op-m.kautz.dual-state]`, `ref[dsp.op-m.recurrence.stereo-simd]`).
@@ -14,42 +14,42 @@ use crate::simd::{
     KernelVec4, MAX_PARALRU_R_F32, StereoVec8, flush_subnormal_f32_bits, scrub_and_flush_f32_bits,
 };
 
-/// Minimum contracted pole radius allowed during rapid Stage III formant sweeps
+/// Minimum contracted pole radius allowed during rapid cabinet formant sweeps
 /// (`ref[dsp.op-m.kautz.sweep-contraction]`).
-const STAGE3_SWEEP_MIN_R: f32 = 0.25;
+const KAUTZ_SWEEP_MIN_R: f32 = 0.25;
 
-/// Zero-sweep baseline radius ceiling (`0.9995`, Stage III acoustic Kautz pole ceiling per
-/// `docs/specs/dsp/op_m_modal_kautz.md`) for Stage III dynamic sweep contraction
+/// Zero-sweep baseline radius ceiling (`0.9995`, cabinet acoustic Kautz pole ceiling per
+/// `docs/specs/dsp/op_m_modal_kautz.md`) for cabinet dynamic sweep contraction
 /// (`ref[dsp.op-m.kautz.sweep-contraction]`).
-const STAGE3_SWEEP_BASE_CEIL: f32 = 0.9995;
+const KAUTZ_SWEEP_BASE_CEIL: f32 = 0.9995;
 
-/// Sweep-rate slope coefficient (`0.15 * |delta_theta|`) for Stage III contraction.
-const STAGE3_SWEEP_SLOPE: f32 = 0.15;
+/// Sweep-rate slope coefficient (`0.15 * |delta_theta|`) for cabinet contraction.
+const KAUTZ_SWEEP_SLOPE: f32 = 0.15;
 
-const _: () = assert!(STAGE3_SWEEP_MIN_R > 0.0 && STAGE3_SWEEP_MIN_R < STAGE3_SWEEP_BASE_CEIL);
-const _: () = assert!(STAGE3_SWEEP_BASE_CEIL <= MAX_PARALRU_R_F32);
+const _: () = assert!(KAUTZ_SWEEP_MIN_R > 0.0 && KAUTZ_SWEEP_MIN_R < KAUTZ_SWEEP_BASE_CEIL);
+const _: () = assert!(KAUTZ_SWEEP_BASE_CEIL <= MAX_PARALRU_R_F32);
 
-/// Evaluates Stage III rapid-sweep radial contraction (`ref[dsp.op-m.kautz.sweep-contraction]`)
+/// Evaluates cabinet rapid-sweep radial contraction (`ref[dsp.op-m.kautz.sweep-contraction]`)
 /// purely in 32-bit `f32` (`min(radius, max(0.25, 0.9995 - 0.15 * |delta_theta|))`).
 #[inline(always)]
 #[must_use]
-pub fn eval_stage3_sweep_contraction_f32(radius: f32, delta_theta_rad: f32) -> f32 {
+pub fn eval_kautz_sweep_contraction_f32(radius: f32, delta_theta_rad: f32) -> f32 {
     let r_clamped = if radius.is_finite() {
         radius.clamp(0.0, MAX_PARALRU_R_F32)
     } else {
-        STAGE3_SWEEP_MIN_R
+        KAUTZ_SWEEP_MIN_R
     };
     let abs_dtheta = if delta_theta_rad.is_finite() {
         rotor_and_phasor::abs_f32(delta_theta_rad)
     } else {
         8.0
     };
-    let ceiling = (STAGE3_SWEEP_BASE_CEIL - STAGE3_SWEEP_SLOPE * abs_dtheta)
-        .clamp(STAGE3_SWEEP_MIN_R, MAX_PARALRU_R_F32);
+    let ceiling = (KAUTZ_SWEEP_BASE_CEIL - KAUTZ_SWEEP_SLOPE * abs_dtheta)
+        .clamp(KAUTZ_SWEEP_MIN_R, MAX_PARALRU_R_F32);
     r_clamped.min(ceiling)
 }
 
-/// 4-pole stereo Stage III Kautz modal state block (`4` shared complex conjugate pole pairs
+/// 4-pole stereo cabinet Kautz modal state block (`4` shared complex conjugate pole pairs
 /// across simultaneous `L` and `R` states, `ref[dsp.op-m.kautz.dual-state]`,
 /// `ref[dsp.op-m.kautz.coupled-form]`, `ref[dsp.op-m.recurrence.stereo-simd]`).
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -289,16 +289,16 @@ mod tests {
     /// verify[dsp.op-m.kautz.coupled-form]
     /// verify[dsp.op-m.recurrence.stereo-simd]
     #[test]
-    fn test_stage3_sweep_contraction_and_kautz_zero_ulp_parity() {
-        assert_eq!(eval_stage3_sweep_contraction_f32(0.9995, 0.0), 0.9995);
-        assert_eq!(eval_stage3_sweep_contraction_f32(0.9999, 0.0), 0.9995);
-        assert_eq!(eval_stage3_sweep_contraction_f32(0.85, 0.0), 0.85);
-        let c_pos = eval_stage3_sweep_contraction_f32(0.9995, 0.1);
+    fn test_kautz_sweep_contraction_and_zero_ulp_parity() {
+        assert_eq!(eval_kautz_sweep_contraction_f32(0.9995, 0.0), 0.9995);
+        assert_eq!(eval_kautz_sweep_contraction_f32(0.9999, 0.0), 0.9995);
+        assert_eq!(eval_kautz_sweep_contraction_f32(0.85, 0.0), 0.85);
+        let c_pos = eval_kautz_sweep_contraction_f32(0.9995, 0.1);
         assert!((c_pos - (0.9995 - 0.015)).abs() < 1.0e-6 && c_pos < 0.9995);
-        let c_neg = eval_stage3_sweep_contraction_f32(0.9995, -0.2);
+        let c_neg = eval_kautz_sweep_contraction_f32(0.9995, -0.2);
         assert!((c_neg - (0.9995 - 0.030)).abs() < 1.0e-6);
-        assert_eq!(eval_stage3_sweep_contraction_f32(0.9995, 10.0), 0.25);
-        assert_eq!(eval_stage3_sweep_contraction_f32(f32::NAN, f32::NAN), 0.25);
+        assert_eq!(eval_kautz_sweep_contraction_f32(0.9995, 10.0), 0.25);
+        assert_eq!(eval_kautz_sweep_contraction_f32(f32::NAN, f32::NAN), 0.25);
 
         let alpha_re = GpuVec4::from_array([0.92, 0.85, 0.70, 0.40]);
         let alpha_im = GpuVec4::from_array([0.12, 0.25, 0.45, 0.65]);
@@ -481,16 +481,16 @@ mod tests {
 
     proptest! {
         #[test]
-        fn prop_stage3_sweep_contraction_is_monotone_and_bounded(
+        fn prop_kautz_sweep_contraction_is_monotone_and_bounded(
             radius in 0.0_f32..1.2_f32,
             delta_theta in -6.0_f32..6.0_f32,
         ) {
-            let r_eff = eval_stage3_sweep_contraction_f32(radius, delta_theta);
+            let r_eff = eval_kautz_sweep_contraction_f32(radius, delta_theta);
             prop_assert!(r_eff.is_finite());
             prop_assert!(r_eff <= 0.9995);
             prop_assert!(r_eff <= radius);
             if delta_theta.abs() > 0.05 {
-                prop_assert!(r_eff <= eval_stage3_sweep_contraction_f32(radius, 0.0));
+                prop_assert!(r_eff <= eval_kautz_sweep_contraction_f32(radius, 0.0));
             }
         }
 

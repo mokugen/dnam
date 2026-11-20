@@ -474,4 +474,158 @@ mod tests {
             bytes.clear();
         }
     }
+
+    #[test]
+    fn test_dau1_marketplace_key_mismatches_merge_mutable_and_crc_short_arena() {
+        use crate::container::{ARENA_OFFSET_LITE_END, build_dnam_container};
+        use crate::schema::{ControlKind, ControlSchemaDef};
+        use alloc::collections::BTreeMap;
+        use alloc::string::String;
+
+        let mut hdr = DnamJsonHeader::default_reference();
+        let arena = alloc::vec![0u8; ARENA_OFFSET_LITE_END as usize];
+        let c = build_dnam_container(&mut hdr, &arena, &arena, false).unwrap();
+        let pre = DnamPreamble::from_bytes(&c).unwrap();
+        DnamContainerView::verify_arena_prefix_crcs(&pre, &[]).unwrap();
+
+        hdr.controls_schema.push(ControlSchemaDef {
+            id: String::from("drive"),
+            name: String::from("Drive"),
+            kind: ControlKind::Range,
+            unit: None,
+            lobatto_degree: None,
+            anchor_nodes_norm: None,
+            declared_range: None,
+            safe_clamped_range: None,
+            default: serde_json::json!(0.5),
+            conditional_bounds: alloc::vec![],
+            represented_switch_options: None,
+            declared_options: None,
+            active_options: None,
+            clamp_warning: None,
+            calibration: None,
+            ui_hints: Default::default(),
+            user_metadata: BTreeMap::new(),
+        });
+        let doc = serde_json::json!({
+            "presets": [{"id": "p1", "name": "P1", "controls": {"drive": 1.0}}],
+            "user_metadata": {"k": "v"},
+            "control_user_metadata": {"drive": {"color": "blue"}},
+            "stem_user_metadata": {"s0": {"tag": "lead"}},
+        });
+        merge_mutable_doc_into_header(&mut hdr, &doc).unwrap();
+        assert_eq!(hdr.presets.len(), 1);
+        assert!(hdr.controls_schema[0].user_metadata.contains_key("color"));
+        assert!(hdr.stem_user_metadata.contains_key("s0"));
+
+        #[cfg(feature = "crypto")]
+        {
+            use crate::provenance::{
+                Dau1Envelope, RustCryptoProvider, build_creator_manifest_v1,
+                compute_plaintext_prefixes_v1, sha256_digest,
+            };
+
+            let bytes = alloc::vec![0u8; 512];
+            let json = br#"{}"#;
+            let shared = b"";
+            let tier0 = &bytes[256..320];
+            let hdr_sha = sha256_digest(json);
+            let shared_framing = crate::provenance::build_plaintext_shared_v1(
+                &bytes[0..64],
+                &bytes[64..192],
+                shared,
+            );
+            let master_pfx = compute_plaintext_prefixes_v1(
+                b"DNAM-MASTER-PREFIX-V1",
+                &hdr_sha,
+                &shared_framing,
+                &[tier0],
+            )
+            .unwrap();
+            let creator_seed = [9u8; 32];
+            let creator_pk = RustCryptoProvider::ed25519_pubkey_from_seed(&creator_seed);
+            let creator_manifest =
+                build_creator_manifest_v1(&creator_pk, &hdr_sha, &master_pfx).unwrap();
+            let creator_sig = RustCryptoProvider::ed25519_sign(&creator_seed, &creator_manifest);
+            let mkt_pk = RustCryptoProvider::ed25519_pubkey_from_seed(&[10u8; 32]);
+            let env_buyer = Dau1Envelope {
+                auth_kind: 1,
+                creator_pubkey: creator_pk,
+                creator_max_tier: 0,
+                master_prefixes: master_pfx,
+                creator_signature: creator_sig,
+                marketplace_pubkey: Some(mkt_pk),
+                policy_bytes: alloc::vec![],
+                buyer_max_tier: Some(0),
+                buyer_prefixes: alloc::vec![[0xAA; 32]],
+                marketplace_signature: Some([0u8; 64]),
+            };
+            let env_bytes = env_buyer.to_bytes().unwrap();
+            let mut layout = V3ContainerLayout {
+                magic: *b"DNAM",
+                protection_profile: 0,
+                auth_kind: 1,
+                maximum_tier: 1,
+                retained_tier: 0,
+                sample_rate_train_hz: 48_000,
+                header_extent: (192, json.len()),
+                shared_extent: (256, 0),
+                auth_extent: (256, env_bytes.len()),
+                tier_start: 256,
+                tier_ends: [320, 320, 320, 320],
+                mutable_extent: (320, 32),
+            };
+
+            let wrong_crypto = RustCryptoProvider::new().with_marketplace_pubkey([0xBB; 32]);
+            assert!(
+                verify_dau1_or_legacy_provenance(
+                    &bytes,
+                    &env_bytes,
+                    json,
+                    shared,
+                    &layout,
+                    &hdr,
+                    true,
+                    Tier::Lite,
+                    tier0,
+                    &wrong_crypto,
+                )
+                .is_err()
+            );
+
+            let right_crypto = RustCryptoProvider::new().with_marketplace_pubkey(mkt_pk);
+            assert!(
+                verify_dau1_or_legacy_provenance(
+                    &bytes,
+                    &env_bytes,
+                    json,
+                    shared,
+                    &layout,
+                    &hdr,
+                    true,
+                    Tier::Lite,
+                    tier0,
+                    &right_crypto,
+                )
+                .is_err()
+            );
+
+            layout.maximum_tier = 0;
+            assert!(
+                verify_dau1_or_legacy_provenance(
+                    &bytes,
+                    &env_bytes,
+                    json,
+                    shared,
+                    &layout,
+                    &hdr,
+                    true,
+                    Tier::Lite,
+                    tier0,
+                    &right_crypto,
+                )
+                .is_err()
+            );
+        }
+    }
 }

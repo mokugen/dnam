@@ -24,8 +24,8 @@ pub use super::io_and_tiers::{
     default_output_mode, default_pro_tier_profile, default_true,
 };
 pub use super::json_wire::TensorSliceEntry;
-pub use super::stages::{
-    ControlBusConfig, RouterConfig, Stage3CabinetKautzConfig, Stage4SpatialTankConfig,
+pub use super::topology::{
+    CabinetKautzConfig, ControlBusConfig, IoRouterConfig, SpatialTankConfig,
     default_allpass_delays, default_dc_pole, default_delay_storage, default_envelopes,
     default_fir_taps, default_fm_rank, default_interp, default_kautz_modals, default_lfo_harmonics,
     default_lfos, default_loop_ceiling, default_modulation_bus_dim, default_router_ports,
@@ -203,15 +203,15 @@ pub struct DnamJsonHeader {
     /// Control-Bus parameter definitions.
     #[serde(default)]
     pub control_bus: ControlBusConfig,
-    /// Stage 0 8-Port Matrix Router configuration.
+    /// 8-Port I/O Matrix Router configuration (`io_router`).
     #[serde(default)]
-    pub stage0_router: RouterConfig,
-    /// Stage III Cabinet Early FIR + Orthonormal Kautz Modal Bank configuration.
+    pub io_router: IoRouterConfig,
+    /// Early FIR + Orthonormal Kautz Modal Bank cabinet configuration (`cabinet`).
     #[serde(default)]
-    pub stage3_cabinet: Stage3CabinetKautzConfig,
-    /// Stage IV Spatial Tank configuration.
+    pub cabinet: CabinetKautzConfig,
+    /// Spatial `Op-T` FDN Tank configuration (`spatial_tank`).
     #[serde(default)]
-    pub stage4_tank: Stage4SpatialTankConfig,
+    pub spatial_tank: SpatialTankConfig,
     /// Optional delay-history capacity declarations for non-RT BBD/FDN buffer pre-allocation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delay_histories: Vec<DelayHistoryEntry>,
@@ -329,9 +329,9 @@ impl DnamJsonHeader {
             controls_schema: Vec::new(),
             presets: Vec::new(),
             control_bus: ControlBusConfig::default(),
-            stage0_router: RouterConfig::default(),
-            stage3_cabinet: Stage3CabinetKautzConfig::default(),
-            stage4_tank: Stage4SpatialTankConfig::default(),
+            io_router: IoRouterConfig::default(),
+            cabinet: CabinetKautzConfig::default(),
+            spatial_tank: SpatialTankConfig::default(),
             delay_histories: Vec::new(),
             tensor_directory: BTreeMap::new(),
         }
@@ -536,9 +536,9 @@ mod tests {
             },
             "io_config": {},
             "control_bus": {},
-            "stage0_router": {},
-            "stage3_cabinet": {},
-            "stage4_tank": {},
+            "io_router": {},
+            "cabinet": {},
+            "spatial_tank": {},
             "slimmable_tiers": {
                 "lite": { "channels": 16, "tank_lines": 4, "arena_end_byte_offset": 4608, "prefix_crc32c": 0 },
                 "full": { "channels": 24, "tank_lines": 8, "arena_end_byte_offset": 7936, "prefix_crc32c": 0 },
@@ -577,8 +577,8 @@ mod tests {
         assert_eq!(h.slimmable_tiers.lite.head_svd_rank, 4);
         assert_eq!(h.slimmable_tiers.pro.arena_end_byte_offset, 15_872);
         assert_eq!(h.control_bus.envelopes, 4);
-        assert_eq!(h.stage3_cabinet.fir_taps, 32);
-        assert_eq!(h.stage4_tank.dc_blocker_pole, 0.995);
+        assert_eq!(h.cabinet.fir_taps, 32);
+        assert_eq!(h.spatial_tank.dc_blocker_pole, 0.995);
         assert!(h.validate().is_ok());
 
         // Legacy v2 or non-"sona" architecture must fail fast with UnsupportedVersion.
@@ -600,7 +600,7 @@ mod tests {
         let decl_default: DelayHistoryEntry = serde_json::from_str(
             r#"{
                 "id": "tank.quad0.line0",
-                "stage": "op_t_tank",
+                "owner": "spatial_tank",
                 "kind": "fractional",
                 "introduced_tier": "lite",
                 "sample_format": "fp16",
@@ -731,11 +731,9 @@ mod tests {
         );
         assert!(DnamJsonHeader::validate_and_normalize_json_str(&bad_unknown).is_err());
 
-        // Misplaced optional field ("shape" inside "stage3_cabinet" or "distribution_policy" at root) must fail
-        let bad_misplaced = minimal_json.replace(
-            "\"stage3_cabinet\": {}",
-            "\"stage3_cabinet\": {\"shape\": \"bad\"}",
-        );
+        // Misplaced optional field ("shape" inside "cabinet" or "distribution_policy" at root) must fail
+        let bad_misplaced =
+            minimal_json.replace("\"cabinet\": {}", "\"cabinet\": {\"shape\": \"bad\"}");
         assert!(DnamJsonHeader::validate_and_normalize_json_str(&bad_misplaced).is_err());
         let bad_root_opt = minimal_json.replace(
             "\"metadata\": {",

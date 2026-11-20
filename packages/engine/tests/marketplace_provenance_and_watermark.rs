@@ -10,6 +10,14 @@ use dnam_engine::container::{
     DnamContainerView, StructuredConditionalBound, build_dnam_container, strip_container_to_tier,
     update_header_in_place,
 };
+use dnam_engine::graph::sona_core::{
+    MAX_KAUTZ_POLES, MAX_SONA_GROUPS, MAX_SONA_TILES, MAX_TOTAL_SONA_LANES, SONA_FIR_MAX_TAPS,
+    SonaMatryoshkaModel, SonaTierReadout,
+};
+use dnam_engine::graph::weights::{
+    Arena0LiteWire, Arena3UltraDeltaWire, Cp1InlineDirWire, V3_META_STAGE3_PREFIX_OVERRIDES,
+    pack_sona_matryoshka_to_arena, read_f32_le, write_f32_le,
+};
 use dnam_engine::math::{DefaultMathBackend, f32_to_fp16_bits, fp16_bits_to_f32};
 use dnam_engine::provenance::{
     KAUTZ_TOTAL_CHANNELS, PHASE_CODING_MAX_RAD, RustCryptoProvider, STAGE3_KAUTZ_BLOCKS_PER_TIER,
@@ -25,14 +33,6 @@ use dnam_engine::schema::{
     AuthorizedDevice, ControlKind, ControlSchemaDef, ControlUiHints, CreatorSignature,
     DatasetProvenance, DnamError, DnamJsonHeader, DnamProtectionProfile, MarketplaceReceipt,
     ModelSignatures, PresetDef,
-};
-use dnam_engine::stages::sona_core::{
-    MAX_KAUTZ_POLES, MAX_SONA_GROUPS, MAX_SONA_TILES, MAX_TOTAL_SONA_LANES, SONA_FIR_MAX_TAPS,
-    SonaMatryoshkaModel, SonaTierReadout,
-};
-use dnam_engine::stages::weights::{
-    Arena0LiteWire, Arena3UltraDeltaWire, Cp1InlineDirWire, V3_META_STAGE3_PREFIX_OVERRIDES,
-    pack_sona_matryoshka_to_arena, read_f32_le, write_f32_le,
 };
 use dnam_engine::{DnamEngine, Tier};
 use zerocopy::{

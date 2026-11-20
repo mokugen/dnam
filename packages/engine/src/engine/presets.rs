@@ -165,13 +165,13 @@ pub(crate) fn apply_calibrated_control_role(
 
 /// Stack-allocated preset update batch shared between [`DnamEngine`] and [`crate::host::ControlProducer`].
 pub(crate) struct ResolvedPresetBatch {
-    pub preset_index: u16,
-    pub default_restores: [(usize, f32, bool); 256],
-    pub restore_count: usize,
-    pub switch_updates: [(usize, f32); 256],
-    pub switch_count: usize,
-    pub range_updates: [(usize, f32); 256],
-    pub range_count: usize,
+    pub(crate) preset_index: u16,
+    pub(crate) default_restores: [(usize, f32, bool); 256],
+    pub(crate) restore_count: usize,
+    pub(crate) switch_updates: [(usize, f32); 256],
+    pub(crate) switch_count: usize,
+    pub(crate) range_updates: [(usize, f32); 256],
+    pub(crate) range_count: usize,
 }
 
 /// Resolves a preset by `preset_id` into a stack-allocated [`ResolvedPresetBatch`].

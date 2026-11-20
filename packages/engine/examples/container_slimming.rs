@@ -20,10 +20,10 @@ use dnam_engine::container::{
     ARENA_OFFSET_ULTRA_END, DnamContainerView, build_dmu1_mutable_frame, build_dnam_container,
     parse_and_validate_dmu1_frame, strip_container_to_tier, update_header_in_place,
 };
+use dnam_engine::graph::sona_core::SonaMatryoshkaModel;
+use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::{DnamJsonHeader, PresetDef};
-use dnam_engine::stages::sona_core::SonaMatryoshkaModel;
-use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 
 fn main() {
     let mut header = DnamJsonHeader::default_reference();

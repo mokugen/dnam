@@ -142,7 +142,7 @@ pub fn invert_tempo_physical_calibration(
     })
 }
 
-/// Prime reference lengths for Stage IV FDN lines (`ref[dsp.tempo.coprime-fdn]`).
+/// Prime reference lengths for Spatial Tank FDN lines (`ref[dsp.tempo.coprime-fdn]`).
 pub const FDN_COPRIME_BASE_PRIMES: [u32; 8] = [149, 211, 307, 401, 503, 601, 701, 887];
 
 /// Verifies that for any of the 144 `(idx_l, idx_r)` stereo subdivision pairs (`0..12 × 0..12`),

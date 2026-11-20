@@ -11,9 +11,13 @@
 //!   `cargo run -p dnam-engine --example marketplace_provenance`
 
 use dnam_engine::container::{ARENA_OFFSET_ULTRA_END, DnamContainerView, build_dnam_container};
+use dnam_engine::graph::sona_core::{
+    MAX_KAUTZ_POLES, MAX_SONA_GROUPS, SONA_FIR_MAX_TAPS, SonaMatryoshkaModel, SonaTierReadout,
+};
+use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::provenance::security::{
     WatermarkSeedScope, derive_watermark_seed_hmac_sha256, evaluate_anticlone_revocation_policy,
-    extract_stage3_tier_fingerprint_component,
+    extract_cabinet_tier_fingerprint_component,
 };
 use dnam_engine::provenance::{
     KAUTZ_TOTAL_CHANNELS, OpenArenaCryptoProvider, STAGE3_EARLY_FIR_BASES, STAGE3_KAUTZ_BASES,
@@ -22,10 +26,6 @@ use dnam_engine::provenance::{
     score_tardos_watermark_7680, structural_cosine_similarity,
 };
 use dnam_engine::schema::{DnamError, DnamJsonHeader};
-use dnam_engine::stages::sona_core::{
-    MAX_KAUTZ_POLES, MAX_SONA_GROUPS, SONA_FIR_MAX_TAPS, SonaMatryoshkaModel, SonaTierReadout,
-};
-use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 
 fn main() {
     // 1. Construct a 30,720-byte `SONA` `v3.0` `Arena 0..3` buffer with non-zero cores, FIR & Kautz modals
@@ -105,7 +105,7 @@ fn main() {
         );
     }
 
-    // 6. License-scoped HMAC-SHA256 watermark seed derivation & Stage III tier-local fingerprint (`Lite`: 8 pairs = 256 B)
+    // 6. License-scoped HMAC-SHA256 watermark seed derivation & Cabinet tier-local fingerprint (`Lite`: 8 pairs = 256 B)
     let wm_key = [0x5A_u8; 32];
     let scope = WatermarkSeedScope {
         marketplace_pubkey: [0x11; 32],
@@ -120,16 +120,16 @@ fn main() {
             .expect("valid buyer seed");
     let fir0 = STAGE3_EARLY_FIR_BASES[0];
     let kautz0 = STAGE3_KAUTZ_BASES[0];
-    let stage3_fp = extract_stage3_tier_fingerprint_component(
+    let cabinet_fp = extract_cabinet_tier_fingerprint_component(
         &master_arena[fir0..fir0 + 256],
         &master_arena[kautz0..kautz0 + 256],
         8,
     )
-    .expect("valid Stage III tier-local fingerprint");
+    .expect("valid Cabinet tier-local fingerprint");
     println!(
-        "Derived Buyer HMAC-SHA256 Seed[0..4]: {:02x?} | Stage III Fingerprint Dims: {}",
+        "Derived Buyer HMAC-SHA256 Seed[0..4]: {:02x?} | Cabinet Fingerprint Dims: {}",
         &buyer_seed[..4],
-        stage3_fp.len(),
+        cabinet_fp.len(),
     );
 
     // 7. Verify 3-stage anti-cloning gate policy & `v3.0` `"container_kind": "preview"` rejection (`PreviewContainerRejected`)

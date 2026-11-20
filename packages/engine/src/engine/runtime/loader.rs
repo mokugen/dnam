@@ -323,7 +323,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         } else {
             preamble.flags |= crate::container::FLAG_STEREO_OUT;
         }
-        self.preallocate_cold_stage4_for(&preamble, next_tier);
+        self.preallocate_cold_tank_for(&preamble, next_tier);
         self.apply_validated_reload_rt(
             preamble,
             frame.arena_slice.len(),
@@ -340,14 +340,14 @@ mod tests {
     use super::*;
     use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container, strip_container_to_tier};
     use crate::engine::ReloadHeaderFlags;
+    use crate::graph::weights::{
+        ARENA0_PIPELINE_FLAGS_OFFSET, PIPE_FLAG_STAGE1_EXT, PIPE_FLAG_STAGE4_EXT, PIPE_MAGIC_HI,
+    };
     use crate::math::ScalarBackend;
     use crate::provenance::OpenArenaCryptoProvider;
     use crate::schema::{
         ControlCalibration, ControlCalibrationRole, ControlKind, ControlSchemaDef, ControlUiHints,
         DnamJsonHeader, PresetDef,
-    };
-    use crate::stages::weights::{
-        ARENA0_PIPELINE_FLAGS_OFFSET, PIPE_FLAG_STAGE1_EXT, PIPE_FLAG_STAGE4_EXT, PIPE_MAGIC_HI,
     };
     use alloc::collections::BTreeMap;
     use alloc::string::String;
@@ -482,7 +482,7 @@ mod tests {
 
     #[test]
     fn test_scan_header_flags_no_alloc_and_preview_containment() {
-        let absent_sf = br#"{"architecture":"sona","container_kind":"dnam","io_config":{"inputs":1,"capabilities":{"freeze_mutes_dry":true,"default_blend":0.25,"wet_polarity_inverted":true},"leveling":{"auto_unity_enabled":true,"calibrated_trim_db":-3.5}},"stage0_router":{"sub_crossover_hz":150.0},"stage4_tank":{"dc_blocker_pole":0.992,"tzf_reference_tap_samples":32.0,"switch_xfade_samples":64}}"#;
+        let absent_sf = br#"{"architecture":"sona","container_kind":"dnam","io_config":{"inputs":1,"capabilities":{"freeze_mutes_dry":true,"default_blend":0.25,"wet_polarity_inverted":true},"leveling":{"auto_unity_enabled":true,"calibrated_trim_db":-3.5}},"io_router":{"sub_crossover_hz":150.0},"spatial_tank":{"dc_blocker_pole":0.992,"tzf_reference_tap_samples":32.0,"switch_xfade_samples":64}}"#;
         let flags = scan_header_flags_no_alloc(absent_sf).unwrap();
         assert!(flags.single_input);
         assert!(flags.freeze_mutes_dry);
@@ -554,10 +554,10 @@ mod tests {
         flags_hdr.io_config.capabilities.wet_polarity_inverted = true;
         flags_hdr.io_config.leveling.auto_unity_enabled = true;
         flags_hdr.io_config.leveling.calibrated_trim_db = -6.020_6;
-        flags_hdr.stage0_router.sub_crossover_hz = 160.0;
-        flags_hdr.stage4_tank.dc_blocker_pole = 0.992;
-        flags_hdr.stage4_tank.tzf_reference_tap_samples = 32.0;
-        flags_hdr.stage4_tank.switch_xfade_samples = 64;
+        flags_hdr.io_router.sub_crossover_hz = 160.0;
+        flags_hdr.spatial_tank.dc_blocker_pole = 0.992;
+        flags_hdr.spatial_tank.tzf_reference_tap_samples = 32.0;
+        flags_hdr.spatial_tank.switch_xfade_samples = 64;
         let flags_c = build_dnam_container(&mut flags_hdr, &arena, &arena, false).unwrap();
 
         let mut borrowed =
@@ -587,7 +587,7 @@ mod tests {
         assert!(borrowed.freeze_mutes_dry);
         assert!((borrowed.mix_dry_gain - 0.6).abs() < 1e-5);
         assert!((borrowed.mix_wet_gain + 0.2).abs() < 1e-4);
-        assert!((borrowed.stage0_router.crossover_hz - 160.0).abs() < 1e-4);
+        assert!((borrowed.io_router.crossover_hz - 160.0).abs() < 1e-4);
         assert!((borrowed.zoh().r_dc_host - 0.992).abs() < 1e-6);
         assert!((borrowed.zoh().tau_ref_samples_host - 32.0).abs() < 1e-6);
         assert_eq!(borrowed.zoh().switch_xfade_samples_host, 64);
@@ -650,5 +650,107 @@ mod tests {
             .unwrap();
         assert!(!owned.preamble.is_stereo_out());
         assert_eq!(owned.telemetry_snapshot().stereo_out, 0);
+    }
+
+    #[test]
+    fn test_reload_cp1_control_capacity_sample_rate_and_metadata_paths() {
+        use crate::container::{build_dnam_container_with_cp1, build_v3_open_dnam_container};
+        use crate::control::Cp1ContributorSlot;
+
+        assert!(matches!(
+            wire_err_to_dnam_rt(ContainerWireError::UnalignedOffset {
+                field: "f",
+                offset: 3,
+            }),
+            DnamError::UnalignedOffset {
+                field: "f",
+                offset: 3,
+            }
+        ));
+
+        let mut hdr = DnamJsonHeader::default_reference();
+        let mut ctrl_um = BTreeMap::new();
+        ctrl_um.insert(String::from("color"), serde_json::json!("red"));
+        hdr.controls_schema.push(ControlSchemaDef {
+            id: String::from("drive"),
+            name: String::from("Drive"),
+            kind: ControlKind::Range,
+            unit: None,
+            lobatto_degree: Some(1),
+            anchor_nodes_norm: Some(vec![0.0]),
+            declared_range: Some([0.0, 10.0]),
+            safe_clamped_range: Some([0.0, 10.0]),
+            default: serde_json::json!(5.0),
+            conditional_bounds: alloc::vec::Vec::new(),
+            represented_switch_options: None,
+            declared_options: None,
+            active_options: None,
+            clamp_warning: None,
+            calibration: None,
+            ui_hints: ControlUiHints::default(),
+            user_metadata: ctrl_um,
+        });
+        hdr.stem_user_metadata
+            .insert(String::from("s0"), serde_json::json!({"gain": 1.0}));
+
+        let mut slot = Cp1ContributorSlot::zero();
+        slot.lanes = 1;
+        slot.control_idx = 0;
+        slot.main_base[0][0] = 0.25;
+        slot.emb[0] = 1.0;
+        slot.v_base[0] = 0.1;
+
+        let arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+        let c_cp1 =
+            build_dnam_container_with_cp1(&mut hdr, &arena, &arena, false, &[slot]).unwrap();
+
+        let mut eng = DnamEngine::<ScalarBackend>::with_max_capacity();
+        assert!(matches!(
+            eng.reload_model_in_place(&c_cp1, Tier::Lite, 22_050),
+            Err(DnamError::InvalidSampleRate(22_050))
+        ));
+        eng.reload_model_in_place(&c_cp1, Tier::Lite, 48_000)
+            .unwrap();
+        assert_eq!(eng.control_bus.num_contributors, 1);
+
+        let mut tight = DnamEngine::<ScalarBackend>::with_max_capacity();
+        tight.control_bus.descriptors.clear();
+        assert!(matches!(
+            tight.reload_model_in_place(&c_cp1, Tier::Lite, 48_000),
+            Err(DnamError::BufferTooSmall {
+                expected: 1,
+                actual: 0,
+            })
+        ));
+
+        let mut owned =
+            DnamEngine::<ScalarBackend>::from_bytes_owned(&c_cp1, Tier::Lite, 48_000).unwrap();
+        owned
+            .reload_model_in_place_owned(&c_cp1, Tier::Lite, 48_000)
+            .unwrap();
+        let reloaded = owned.header().unwrap();
+        assert!(
+            reloaded.controls_schema[0]
+                .user_metadata
+                .contains_key("color")
+        );
+        assert!(reloaded.stem_user_metadata.contains_key("s0"));
+
+        let mut mlp_hdr = DnamJsonHeader::default_reference();
+        mlp_hdr.architecture = String::from("mlp");
+        let mlp_json = serde_json::to_vec(&mlp_hdr).unwrap();
+        let mlp_c = build_v3_open_dnam_container(
+            &mlp_json,
+            &[0u8; 64],
+            &[0u8; 64],
+            &[&arena[..crate::container::ARENA_OFFSET_LITE_END as usize]],
+            None,
+            0,
+        )
+        .unwrap();
+        assert!(matches!(
+            owned.reload_model_in_place_owned(&mlp_c, Tier::Lite, 48_000),
+            Err(DnamError::UnsupportedVersion { .. })
+        ));
     }
 }

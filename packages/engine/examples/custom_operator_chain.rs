@@ -1,7 +1,7 @@
 //! Example 5: Standalone `SONA` Zero-`FDIV` Operator Chain (`examples/custom_operator_chain.rs`).
 //!
 //! Demonstrates composing the standalone real-time `SONA` operators (`Op-T`, `Op-M`, `Op-N`)
-//! and Stage 0 `TptLr4Crossover` directly inside a caller-held [`FtzDazGuard`]:
+//! and I/O Router `TptLr4Crossover` directly inside a caller-held [`FtzDazGuard`]:
 //! - `TptLr4Crossover` (`200 Hz` Linkwitz-Riley 4th-order bass-mono / drive split, `ref[dsp.router.lr4-crossover]`)
 //! - `OpTDelayLine` + `HilbertSsbLattice10th` (`H1`) + `SubHarmonicTracker` (`T1`) (`ref[dsp.op-m.hilbert.lattice]`, `ref[dsp.op-m.tracker.toggle-sheet]`)
 //! - `Q0_192Phase` + `contractive_rotor_f32` (`ref[dsp.op-m.rotor.q0-192-lfo]`, `ref[dsp.op-m.rotor.contractive]`)
@@ -13,6 +13,7 @@
 //!   `cargo run -p dnam-engine --example custom_operator_chain`
 
 use dnam_engine::FtzDazGuard;
+use dnam_engine::graph::topology::TptLr4Crossover;
 use dnam_engine::math::spec_math::{Q0_192Phase, contractive_rotor_f32};
 use dnam_engine::math::{DefaultMathBackend, SimdVec4};
 use dnam_engine::operators::op_n::OpNBackend;
@@ -20,7 +21,6 @@ use dnam_engine::operators::{
     HilbertSsbLattice10th, KautzModalBank, OpTDelayLine, QuadratureHysteresis2D,
     SubHarmonicTracker, ZohBitcrusher, c2_wavefolder,
 };
-use dnam_engine::stages::topology::TptLr4Crossover;
 
 fn main() {
     let _audio_guard = FtzDazGuard::new();
@@ -47,7 +47,7 @@ fn main() {
     for n in 0..256 {
         let x = 0.35 * ((n as f32) * 0.09).sin();
 
-        // 1. Stage 0 200 Hz LR4 crossover split into low clean bypass + high drive path
+        // 1. I/O Router 200 Hz LR4 crossover split into low clean bypass + high drive path
         let (x_low, x_high) = lr4.step(x);
 
         // 2. Advance Q0.192 LFO phase and evaluate contractive rotor (c^2 + s^2 <= 1.0)

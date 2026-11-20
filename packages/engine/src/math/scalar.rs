@@ -345,6 +345,131 @@ mod tests {
         assert_eq!(ScalarBackend::crc32c_update(0, b"123456789"), 0xe306_9283);
     }
 
+    #[test]
+    fn test_scalar_vec4_kernel_vec4_bridge() {
+        type K = ScalarVec4;
+        let z = <K as dnam_kernels::KernelVec4>::zero();
+        assert_eq!(<K as dnam_kernels::KernelVec4>::to_array(z), [0.0; 4]);
+        let a = <K as dnam_kernels::KernelVec4>::from_array([1.0, -2.0, 3.0, -4.0]);
+        let b = <K as dnam_kernels::KernelVec4>::splat(2.0);
+        let p = <K as dnam_kernels::KernelVec4>::splat_pair(1.5, -0.5);
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(p),
+            [1.5, -0.5, 1.5, -0.5]
+        );
+        let mut stored = [0.0_f32; 4];
+        <K as dnam_kernels::KernelVec4>::store(a, &mut stored);
+        let reloaded = <K as dnam_kernels::KernelVec4>::load(&stored);
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(reloaded),
+            [1.0, -2.0, 3.0, -4.0]
+        );
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(<K as dnam_kernels::KernelVec4>::add(a, b)),
+            [3.0, 0.0, 5.0, -2.0]
+        );
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(<K as dnam_kernels::KernelVec4>::sub(a, b)),
+            [-1.0, -4.0, 1.0, -6.0]
+        );
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(<K as dnam_kernels::KernelVec4>::mul(a, b)),
+            [2.0, -4.0, 6.0, -8.0]
+        );
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(<K as dnam_kernels::KernelVec4>::fma(
+                a, b, b
+            )),
+            [5.0, 2.0, 7.0, 0.0]
+        );
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(<K as dnam_kernels::KernelVec4>::fms(
+                a, b, b
+            )),
+            [-3.0, -6.0, -1.0, -8.0]
+        );
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(
+                <K as dnam_kernels::KernelVec4>::fma_lane::<1>(a, b, a)
+            ),
+            [-3.0, -6.0, -1.0, -8.0]
+        );
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(
+                <K as dnam_kernels::KernelVec4>::mul_lane::<2>(b, a)
+            ),
+            [6.0; 4]
+        );
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(<K as dnam_kernels::KernelVec4>::max(a, b)),
+            [2.0, 2.0, 3.0, 2.0]
+        );
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(<K as dnam_kernels::KernelVec4>::min(a, b)),
+            [1.0, -2.0, 2.0, -4.0]
+        );
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(<K as dnam_kernels::KernelVec4>::abs(a)),
+            [1.0, 2.0, 3.0, 4.0]
+        );
+        assert!(<K as dnam_kernels::KernelVec4>::all_le(
+            <K as dnam_kernels::KernelVec4>::splat(-5.0),
+            a
+        ));
+        assert!(!<K as dnam_kernels::KernelVec4>::all_le(a, b));
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(
+                <K as dnam_kernels::KernelVec4>::pair_swap_neg(a)
+            ),
+            [2.0, 1.0, 4.0, 3.0]
+        );
+        let subn = <K as dnam_kernels::KernelVec4>::from_array([1.0e-40, -1.0e-40, 2.5, -3.5]);
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(
+                <K as dnam_kernels::KernelVec4>::flush_subnormal(subn)
+            ),
+            [0.0, 0.0, 2.5, -3.5]
+        );
+        let dirty =
+            <K as dnam_kernels::KernelVec4>::from_array([f32::NAN, f32::INFINITY, 1.0e-40, -2.5]);
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(
+                <K as dnam_kernels::KernelVec4>::flush_recursive_state(dirty)
+            ),
+            [0.0, 0.0, 0.0, -2.5]
+        );
+        assert_eq!(<K as dnam_kernels::KernelVec4>::horizontal_sum(a), -2.0);
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::horizontal_sum_pair(a, b),
+            (-2.0, 8.0)
+        );
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::dot(a, <K as dnam_kernels::KernelVec4>::splat(1.0)),
+            -2.0
+        );
+        let pos = <K as dnam_kernels::KernelVec4>::from_array([0.25, 1.0, 2.5, 8.0]);
+        assert!(
+            <K as dnam_kernels::KernelVec4>::to_array(
+                <K as dnam_kernels::KernelVec4>::rcp_pos_seed_bits(pos)
+            )[0]
+            .is_finite()
+        );
+        assert!(
+            <K as dnam_kernels::KernelVec4>::to_array(
+                <K as dnam_kernels::KernelVec4>::rsqrt_pos_seed_bits(pos)
+            )[1]
+            .is_finite()
+        );
+        assert_eq!(
+            <K as dnam_kernels::KernelVec4>::to_array(
+                <K as dnam_kernels::KernelVec4>::pow2_from_biased_int_bits(z)
+            ),
+            [1.0; 4]
+        );
+        assert_eq!(a.dup_low_pair().to_array(), [1.0, -2.0, 1.0, -2.0]);
+        assert_eq!(a.dup_high_pair().to_array(), [3.0, -4.0, 3.0, -4.0]);
+    }
+
     proptest! {
         #[test]
         fn prop_scalar_vec4_abs_min_max_match_lanes(

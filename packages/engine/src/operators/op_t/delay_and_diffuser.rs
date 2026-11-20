@@ -454,4 +454,39 @@ mod tests {
             prop_assert!((e_in - e_out).abs() < 5e-3);
         }
     }
+
+    #[test]
+    fn test_op_t_stereo_fractional_wraparound_crossfade_and_xfade_cache() {
+        let _audio = FtzDazGuard::new();
+        let mut dl = OpTDelayLine::<OP_T_LITE_RING_CAPACITY>::default();
+        dl.reset();
+        dl.set_target_delay_stereo(8.5, false);
+        dl.current_delay = 8.5;
+
+        // Exercise > HALF_CAPACITY frames so p_0 traverses contiguous and wraparound ring bounds.
+        for n in 0..(OpTDelayLine::<OP_T_LITE_RING_CAPACITY>::HALF_CAPACITY + 16) {
+            let l = 0.25 * (n as f32 * 0.05).sin();
+            let r = -0.3 * (n as f32 * 0.07).cos();
+            let (ol, or) = dl.step_stereo(l, r);
+            assert!(ol.is_finite() && or.is_finite());
+        }
+        assert_eq!(dl.saturation_flags, 0);
+
+        let (i_l, i_r) = dl.read_delay_stereo(10.0);
+        let (f_l, f_r) = dl.read_delay_stereo(10.5);
+        assert!(i_l.is_finite() && i_r.is_finite() && f_l.is_finite() && f_r.is_finite());
+
+        // Trigger stereo switch crossfade and mismatched xfade_len cache update.
+        dl.set_xfade_len(32);
+        dl.xfade_len = 48;
+        dl.set_target_delay_stereo(64.5, true);
+        assert!(dl.xfade_active);
+        for _ in 0..48 {
+            let (ol, or) = dl.step_stereo(0.1, -0.1);
+            assert!(ol.is_finite() && or.is_finite());
+        }
+        assert!(!dl.xfade_active);
+        assert_eq!(dl.cached_xfade_len, 48);
+        assert_eq!(dl.current_delay, 64.5);
+    }
 }

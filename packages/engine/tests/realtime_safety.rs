@@ -21,14 +21,14 @@ use dnam_engine::ffi::{
     dnam_engine_set_max_supported_tier, dnam_engine_set_maximize_tier_on_bounce,
     dnam_engine_set_offline_bounce, dnam_engine_set_tier,
 };
+use dnam_engine::graph::sona_core::SonaMatryoshkaModel;
+use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::host::DnamHostHandle;
 use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::memory::{AlignedBuffer, AlignedFp16Block, CacheLine64};
 use dnam_engine::schema::{
     ControlKind, ControlSchemaDef, ControlUiHints, DnamError, DnamJsonHeader, PresetDef,
 };
-use dnam_engine::stages::sona_core::SonaMatryoshkaModel;
-use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::types::DnamTelemetrySnapshot;
 use dnam_engine::{DnamAudioIo, DnamEngine, Tier};
 

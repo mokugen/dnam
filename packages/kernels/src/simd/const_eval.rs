@@ -37,9 +37,9 @@ pub struct SonaTierSpec {
     pub blocks: [usize; 4],
     /// Number of 4-mode `TPT-SVF` `Vec4` quads in the `SONA` core.
     pub svf_quads: usize,
-    /// Number of Stage III early-reflection FIR taps per stereo channel.
+    /// Number of cabinet early-reflection FIR taps per stereo channel.
     pub fir_taps: usize,
-    /// Number of Stage III shared conjugate Kautz modal pole pairs.
+    /// Number of cabinet shared conjugate Kautz modal pole pairs.
     pub kautz_pairs: usize,
     /// Number of `Op-T` transport delay lines (`M` lines = `4 * quads`).
     pub opt_lines: usize,
@@ -98,7 +98,7 @@ impl SonaTierSpec {
         self.lanes()
     }
 
-    /// Returns the number of Stage IV `Op-T` transport delay quads (`opt_lines >> 2`).
+    /// Returns the number of tank `Op-T` transport delay quads (`opt_lines >> 2`).
     #[inline(always)]
     #[must_use]
     pub const fn tank_quads(&self) -> usize {

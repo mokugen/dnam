@@ -2,7 +2,7 @@
 //!
 //! Benchmarks zero-copy `.dnam` container parsing, CRC32C verification, `validate_tensor_directory_slice`,
 //! `ZohRescaledParams::compute`, in-place hot-swap model reloading, 224-D structural hashing,
-//! Stage III gauge-invariant modal fingerprinting, and `HMAC-SHA256` watermark seed derivation.
+//! Cabinet gauge-invariant modal fingerprinting, and `HMAC-SHA256` watermark seed derivation.
 
 use std::collections::BTreeMap;
 use std::hint::black_box;
@@ -11,17 +11,17 @@ use dnam_engine::container::{
     ARENA_OFFSET_LITE_END, ARENA_OFFSET_ULTRA_END, DnamContainerView, ZohRescaledParams,
     build_dnam_container,
 };
+use dnam_engine::graph::sona_core::SonaMatryoshkaModel;
+use dnam_engine::graph::topology::validate_tensor_directory_slice;
+use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::memory::{AlignedBuffer, CacheLine64};
 use dnam_engine::provenance::security::{
     WatermarkSeedScope, derive_watermark_seed_hmac_sha256,
-    extract_stage3_tier_fingerprint_component,
+    extract_cabinet_tier_fingerprint_component,
 };
 use dnam_engine::provenance::{DefaultCryptoProvider, extract_structural_hash_224d};
 use dnam_engine::schema::{ControlKind, ControlSchemaDef, ControlUiHints, DnamJsonHeader};
-use dnam_engine::stages::sona_core::SonaMatryoshkaModel;
-use dnam_engine::stages::topology::validate_tensor_directory_slice;
-use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::{DnamEngine, Tier};
 use hotpath::criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
@@ -123,10 +123,10 @@ fn bench_provenance_and_watermark(c: &mut Criterion) {
 
     let fir_256b = [0u8; 256];
     let kautz_256b = [0u8; 256];
-    group.bench_function("extract_stage3_tier_fingerprint", |b| {
+    group.bench_function("extract_cabinet_tier_fingerprint", |b| {
         b.iter(|| {
             black_box(
-                extract_stage3_tier_fingerprint_component(
+                extract_cabinet_tier_fingerprint_component(
                     black_box(&fir_256b),
                     black_box(&kautz_256b),
                     black_box(8),

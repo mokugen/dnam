@@ -767,3 +767,77 @@ mod mutable_reference_tests {
         assert_eq!(&frame[16..], br#"{"x":1}"#);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provenance::Dme1HeaderWire;
+    use core::hint::black_box;
+
+    #[test]
+    fn test_v3_layout_wire_errors_dcrc_and_dme1_branches() {
+        assert!(matches!(
+            ContainerWireError::EncryptedArenaRequiresDeviceKey.into_dnam_error(),
+            DnamError::EncryptedArenaRequiresDeviceKey
+        ));
+        assert!(matches!(
+            ContainerWireError::InvalidSampleRate(44_000).into_dnam_error(),
+            DnamError::InvalidSampleRate(44_000)
+        ));
+        assert_eq!(align64_u64(black_box(u64::MAX)), None);
+
+        assert_eq!(parse_dcrc_record(b"ABCD").unwrap(), None);
+        assert!(parse_dcrc_record(b"DCRC\0\0\0\0").is_err());
+        let mut dcrc = DcrcAuthRecord {
+            crc_prefix: 1,
+            crc_tiers: [2, 3, 4, 5],
+            num_controls: 1,
+            flags_hint: 0,
+            tail_time_ms_bits: 0,
+        }
+        .to_bytes();
+        assert!(parse_dcrc_record(&dcrc).unwrap().is_some());
+        dcrc[63] = 1;
+        assert!(parse_dcrc_record(&dcrc).is_err());
+
+        assert!(
+            build_v3_dnam_container_with_profile(3, b"{}", b"", &[0; 32], &[&[0; 64]], None, 0)
+                .is_err()
+        );
+        assert!(build_v3_open_dnam_container(b"{}", b"", &[0; 32], &[&[0; 63]], None, 0).is_err());
+
+        let c = build_v3_open_dnam_container(b"{}", b"", &[0; 32], &[&[0; 64]], None, 0).unwrap();
+        assert!(validate_v3_dnam_layout_no_alloc(&c).is_ok());
+        assert!(validate_v3_dnam_layout_with_max_profile_no_alloc(&c, 3).is_err());
+        assert!(validate_v3_dnam_layout_no_alloc(&c[..192]).is_err());
+
+        for (off, patch) in [
+            (0usize, b"XXXX".as_slice()),
+            (184, &[1u8; 8][..]),
+            (80, U64::new(193).as_bytes()),
+            (104, &[0u8; 8][..]),
+            (128, U64::new(u64::MAX).as_bytes()),
+            (136, U64::new(1).as_bytes()),
+            (144, U64::new(64).as_bytes()),
+        ] {
+            let mut bad = c.clone();
+            bad[off..off + patch.len()].copy_from_slice(patch);
+            assert!(validate_v3_dnam_layout_no_alloc(&bad).is_err());
+        }
+
+        let mut dme1 = vec![0u8; 170];
+        let dme_hdr = Dme1HeaderWire::new(1, 1, 70).unwrap().to_bytes();
+        dme1[..20].copy_from_slice(&dme_hdr);
+        let sealed_c = build_v3_dnam_container_with_profile(
+            1,
+            b"{}",
+            b"",
+            &[0; 32],
+            &[&[0; 64]],
+            Some(&dme1),
+            0,
+        )
+        .unwrap();
+        assert!(validate_v3_dnam_layout_with_max_profile_no_alloc(&sealed_c, 1).is_ok());
+    }
+}

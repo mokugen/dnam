@@ -5,9 +5,9 @@ use zerocopy::FromBytes;
 use zerocopy::byteorder::little_endian::F32;
 
 use super::{STAGE3_KAUTZ_BLOCKS_PER_TIER, kautz_soa_byte_offset, max_tiers_for_arena_len};
+use crate::graph::weights::KautzSoaBlockWire;
 use crate::provenance::sha256::sha256_digest;
 use crate::schema::{DnamError, cold_sqrt_f64};
-use crate::stages::weights::KautzSoaBlockWire;
 
 /// Maximum Layer 2 pole-angle phase perturbation (`0.05 deg = 8.726646e-4 rad`, `0.00 dB` magnitude change).
 pub const PHASE_CODING_MAX_RAD: f32 = 8.726_646e-4;

@@ -1,6 +1,6 @@
-//! Canonical v2.0 Cryptographic Provenance (`DAU1` / `DAI1` / `DSA1`), `OemDeviceCertificate` V2,
+//! Canonical v3.0 Cryptographic Provenance (`DAU1` / `DAI1` / `DSA1`), `OemDeviceCertificate` V2,
 //! RFC 9180 HPKE + `ChaCha20-Poly1305` Record Framing, `DNSL` / `DNPL` / `DME1` Envelopes,
-//! License-Scoped Watermark Seed Derivation (`HMAC-SHA256`), Stage III Tier-Local Structural
+//! License-Scoped Watermark Seed Derivation (`HMAC-SHA256`), Cabinet Tier-Local Structural
 //! Fingerprinting, and `.dnam-prev` Preview Containment.
 //!
 //! Implements:
@@ -50,7 +50,7 @@ pub use watermark_and_preview::{
     compute_logical_metadata_sha256, compute_mutable_wrap_sha256,
     compute_preview_single_control_window, compute_watermark_profile_sha256,
     derive_watermark_seed_hmac_sha256, evaluate_anticlone_revocation_policy,
-    extract_stage3_tier_fingerprint_component, extract_storefront_metadata,
+    extract_cabinet_tier_fingerprint_component, extract_storefront_metadata,
     parse_dme1_decrypted_plaintext, validate_license_tier_and_royalty_splits,
     validate_preview_single_switch_options,
 };

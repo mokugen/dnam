@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 use dnam_engine::container::{
     ARENA_OFFSET_ULTRA_END, StructuredConditionalBound, build_dnam_container,
 };
+use dnam_engine::graph::sona_core::SonaMatryoshkaModel;
+use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::math::spec_math::saturation_flags::OUTSIDE_CERTIFIED_INPUT;
 use dnam_engine::memory::{AlignedBuffer, CacheLine64};
@@ -23,8 +25,6 @@ use dnam_engine::schema::{
     ControlCalibration, ControlCalibrationRole, ControlKind, ControlSchemaDef, ControlUiHints,
     DnamJsonHeader, PresetDef, TempoSubdivision,
 };
-use dnam_engine::stages::sona_core::SonaMatryoshkaModel;
-use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::{DnamEngine, DynamicDnamEngine, Tier};
 
 fn build_demo_dnam_container() -> AlignedBuffer<CacheLine64> {

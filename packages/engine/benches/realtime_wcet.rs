@@ -12,6 +12,11 @@ use dnam_engine::container::{
     ARENA_OFFSET_ULTRA_END, DnamContainerView, StructuredConditionalBound, build_dnam_container,
 };
 use dnam_engine::engine::EngineBackend;
+use dnam_engine::graph::sona_core::{
+    MAX_KAUTZ_POLES, MAX_SONA_GROUPS, MAX_SONA_TILES, SonaColdTierModel, SonaControlBusParams,
+    SonaHotSlab, SonaInstance, SonaMatryoshkaModel, tier_fir_segments, tier_kautz_banks,
+};
+use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::math::{DefaultMathBackend, ScalarBackend};
 use dnam_engine::memory::{AlignedBuffer, CacheLine64};
 use dnam_engine::provenance::DefaultCryptoProvider;
@@ -19,11 +24,6 @@ use dnam_engine::schema::{
     ControlCalibration, ControlCalibrationRole, ControlKind, ControlSchemaDef, ControlUiHints,
     DnamJsonHeader, PresetDef, TempoSubdivision,
 };
-use dnam_engine::stages::sona_core::{
-    MAX_KAUTZ_POLES, MAX_SONA_GROUPS, MAX_SONA_TILES, SonaColdTierModel, SonaControlBusParams,
-    SonaHotSlab, SonaInstance, SonaMatryoshkaModel, tier_fir_segments, tier_kautz_banks,
-};
-use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::{DnamEngine, Tier};
 use zerocopy::{FromBytes, byteorder::little_endian::F32};
 
@@ -96,13 +96,13 @@ fn make_bench_container() -> AlignedBuffer<CacheLine64> {
             conditional_bounds: vec![
                 StructuredConditionalBound {
                     when: vec![("mode".to_string(), "a".to_string())],
-                    min: Some(0.0),
+                    min: None,
                     max: Some(0.4),
                 },
                 StructuredConditionalBound {
                     when: vec![("mode".to_string(), "b".to_string())],
                     min: Some(0.6),
-                    max: Some(1.0),
+                    max: None,
                 },
             ],
             represented_switch_options: None,
@@ -413,7 +413,7 @@ fn main() {
         println!(
             " Real-Time WCET & Tail-Latency Jitter Audit (2,000 x 128-Sample Blocks = 2,666.67 us Budget)"
         );
-        println!(" Active Continuous Knob Modulation + Stage IV Tank Switch Crossfading");
+        println!(" Active Continuous Knob Modulation + Spatial Tank Switch Crossfading");
         println!(
             "=========================================================================================="
         );
@@ -542,6 +542,14 @@ fn bench_sona_row(tier: Tier, os2x: bool, mono_out: bool, label: &str) {
     let x_rt = budget_ns / ns_per_sample;
     let cpu_pct = (ns_per_sample / budget_ns) * 100.0;
     let hot_b = SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(tier, os2x);
+    let tier_ceiling = tier.expected_arena_bytes();
+    assert!(
+        hot_b <= tier_ceiling,
+        "ActiveHot {} B exceeded {} L1D ceiling {} B",
+        hot_b,
+        tier.as_str(),
+        tier_ceiling
+    );
     println!(
         "| {:<32} | {:>7} B | {:>10.2} ns | {:>10.1}x | {:>7.2}% |",
         label, hot_b, ns_per_sample, x_rt, cpu_pct

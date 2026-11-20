@@ -1,12 +1,12 @@
-//! Model-Declared Delay Histories, Stage III Separate 64B-Aligned Slices, and `CP1` Packed Control
+//! Model-Declared Delay Histories, Cabinet Separate 64B-Aligned Slices, and `CP1` Packed Control
 //! Projections (`ref[container.dnam.delay-histories]`, `ref[container.dnam.load-validation]`,
 //! `ref[container.dnam.cabinet-slices]`, `ref[container.dnam.cp1-profile]`).
 
-pub mod delay_and_stage3;
+pub mod delay_and_cabinet;
 
-pub use delay_and_stage3::{
+pub use delay_and_cabinet::{
     DeclaredDelayHistory, DelayHistoryEntry, parse_canonical_reference_samples,
-    validate_delay_histories, validate_delay_history_entries, validate_stage3_tier_slices,
+    validate_cabinet_tier_slices, validate_delay_histories, validate_delay_history_entries,
 };
 
 use alloc::string::ToString;
@@ -500,7 +500,7 @@ mod spec_tests {
         let valid_entries = vec![
             json!({
                 "id": "tank.quad0.line0",
-                "stage": "op_t_tank",
+                "owner": "spatial_tank",
                 "kind": "fractional",
                 "introduced_tier": "lite",
                 "sample_format": "fp16",
@@ -513,7 +513,7 @@ mod spec_tests {
             }),
             json!({
                 "id": "tank.ap.0",
-                "stage": "stage4_tank",
+                "owner": "spatial_tank",
                 "kind": "allpass",
                 "introduced_tier": "pro",
                 "sample_format": "f32",
@@ -524,7 +524,7 @@ mod spec_tests {
             }),
             json!({
                 "id": "pre.left",
-                "stage": "stage1_pre",
+                "owner": "crossbar",
                 "kind": "fractional",
                 "introduced_tier": "lite",
                 "sample_format": "fp16",
@@ -538,15 +538,16 @@ mod spec_tests {
         ];
         let parsed = validate_delay_histories(&valid_entries, 3).unwrap();
         assert_eq!(parsed.len(), 3);
-        assert_eq!(parsed[0].stage, "op_t_tank");
+        assert_eq!(parsed[0].owner, "spatial_tank");
         assert_eq!(parsed[1].sample_format, "f32");
+        assert_eq!(parsed[2].owner, "crossbar");
         assert_eq!(parsed[2].reference_samples_by_tier, [480, 480, 960, 960]);
         assert_eq!(parsed[1].reference_samples_by_tier, [0, 0, 149, 149]);
 
         // Unsupported sample_format ("f64") is rejected
         let bad_fmt = vec![json!({
             "id": "tank.bad_fmt",
-            "stage": "op_t_tank",
+            "owner": "spatial_tank",
             "kind": "fractional",
             "introduced_tier": "lite",
             "sample_format": "f64",
@@ -554,10 +555,31 @@ mod spec_tests {
         })];
         assert!(validate_delay_histories(&bad_fmt, 0).is_err());
 
+        // Legacy owner values / legacy "stage" key are rejected
+        let bad_legacy_key = vec![json!({
+            "id": "tank.legacy",
+            "stage": "op_t_tank",
+            "kind": "fractional",
+            "introduced_tier": "lite",
+            "sample_format": "fp16",
+            "reference_samples": { "lite": "64" }
+        })];
+        assert!(validate_delay_histories(&bad_legacy_key, 0).is_err());
+
+        let bad_legacy_owner = vec![json!({
+            "id": "tank.legacy_val",
+            "owner": "op_t_tank",
+            "kind": "fractional",
+            "introduced_tier": "lite",
+            "sample_format": "fp16",
+            "reference_samples": { "lite": "64" }
+        })];
+        assert!(validate_delay_histories(&bad_legacy_owner, 0).is_err());
+
         // Fractional delay < 4 is rejected
         let too_short = vec![json!({
             "id": "pre.left",
-            "stage": "stage1_pre",
+            "owner": "crossbar",
             "kind": "fractional",
             "introduced_tier": "lite",
             "sample_format": "fp16",
@@ -571,8 +593,8 @@ mod spec_tests {
     /// verify[container.dnam.cp1-profile]
     /// Verifies Stage III separate 64B-aligned slices and `CP1` packed control projection records.
     #[test]
-    fn test_stage3_slices_and_cp1_packed_projection_validation() {
-        // 1. Stage III slices across Lite, Full, Pro, Ultra:
+    fn test_cabinet_slices_and_cp1_packed_projection_validation() {
+        // 1. Cabinet slices across Lite, Full, Pro, Ultra:
         //    FIR [256, 128, 384, 256] B, Kautz [2, 1, 3, 2] * 128 B = [256, 128, 384, 256] B
         for (tier, fir_len, blocks) in [
             (0u8, 256usize, 2usize),
@@ -582,20 +604,28 @@ mod spec_tests {
         ] {
             let kautz_len = blocks * 128;
             let arena_bytes = vec![0u8; fir_len + kautz_len + 64];
-            validate_stage3_tier_slices(tier, &arena_bytes, 0, fir_len, fir_len, kautz_len)
+            validate_cabinet_tier_slices(tier, &arena_bytes, 0, fir_len, fir_len, kautz_len)
                 .unwrap();
             // Wrong FIR or Kautz length rejected
             assert!(
-                validate_stage3_tier_slices(tier, &arena_bytes, 0, fir_len / 2, fir_len, kautz_len)
-                    .is_err()
+                validate_cabinet_tier_slices(
+                    tier,
+                    &arena_bytes,
+                    0,
+                    fir_len / 2,
+                    fir_len,
+                    kautz_len
+                )
+                .is_err()
             );
             // Overlapping slices rejected
             assert!(
-                validate_stage3_tier_slices(tier, &arena_bytes, 0, fir_len, 64, kautz_len).is_err()
+                validate_cabinet_tier_slices(tier, &arena_bytes, 0, fir_len, 64, kautz_len)
+                    .is_err()
             );
             // Unaligned offset rejected
             assert!(
-                validate_stage3_tier_slices(
+                validate_cabinet_tier_slices(
                     tier,
                     &arena_bytes,
                     32,

@@ -591,4 +591,67 @@ mod tests {
             prop_assert!(out_r.iter().all(|x| x.is_finite()));
         }
     }
+
+    #[test]
+    fn test_process_stereo_to_mono_and_mid_bounce_swap_overrides() {
+        use crate::dynamic::DynamicDnamEngine;
+        use alloc::sync::Arc;
+        use core::sync::atomic::{AtomicBool, Ordering};
+
+        let container = build_process_test_container();
+        let host = DnamHostHandle::from_bytes_owned(&container, Tier::Lite, 48_000).unwrap();
+
+        let mut empty_l: [f32; 0] = [];
+        let mut empty_r: [f32; 0] = [];
+        host.process_stereo(&[], &[], &mut empty_l, &mut empty_r);
+        host.process_stereo_to_mono(&[], &[], &mut empty_l);
+        host.process_stereo_to_mono_chunked(&[], &[], &mut empty_l, None);
+
+        let in_l = vec![0.05_f32; 640];
+        let in_r = vec![-0.05_f32; 640];
+        let mut out_l = vec![0.0_f32; 640];
+        let mut out_r = vec![0.0_f32; 640];
+        host.process_stereo(&in_l, &in_r, &mut out_l, &mut out_r);
+        host.process_stereo_to_mono(&in_l, &in_r, &mut out_l);
+        host.process_stereo_to_mono_chunked(&in_l, &in_r, &mut out_l, Some(128));
+        assert!(out_l.iter().all(|x| x.is_finite()) && out_r.iter().all(|x| x.is_finite()));
+
+        let next_engine =
+            DynamicDnamEngine::from_bytes_owned(&container, Tier::Pro, 48_000).unwrap();
+        let host_b = host.clone();
+        let done = Arc::new(AtomicBool::new(false));
+        let done_b = Arc::clone(&done);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let barrier_b = Arc::clone(&barrier);
+        let handle = std::thread::spawn(move || {
+            let l_in = vec![0.02_f32; 65_536];
+            let r_in = vec![-0.02_f32; 65_536];
+            let mut l_out = vec![0.0_f32; 65_536];
+            let mut r_out = vec![0.0_f32; 65_536];
+            barrier_b.wait();
+            host_b.render_offline_bounce(&l_in, &r_in, &mut l_out, &mut r_out);
+            done_b.store(true, Ordering::Release);
+            assert!(l_out.iter().all(|x| x.is_finite()));
+        });
+        barrier.wait();
+        let mut spins = 0_usize;
+        while !done.load(Ordering::Acquire) && host.audio.try_lock().is_some() && spins < 200_000 {
+            spins += 1;
+            std::thread::yield_now();
+        }
+        for _ in 0..8 {
+            std::thread::yield_now();
+        }
+        {
+            let mut prod = host.producer.lock();
+            prod.producer.resync_from_engine(&next_engine);
+            let epoch = prod.producer.causal_epoch();
+            prod.swap_controller
+                .publish_engine_at_epoch(next_engine, epoch);
+            prod.publish_shadow_telemetry(&host.audio_telemetry_reader);
+        }
+        host.set_maximize_tier_on_bounce(false);
+        host.set_offline_bounce(false);
+        handle.join().unwrap();
+    }
 }

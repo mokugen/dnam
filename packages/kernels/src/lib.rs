@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+#![warn(unreachable_pub)]
 
 //! Shared `#![no_std]`, zero-dependency 32-bit `SONA` DSP, associative parallel-scan,
 //! modal/transport, and exact `i32` Ozaki kernels (`ref[sdk.rust.shared-nostd-kernels]`,
@@ -22,7 +23,7 @@ pub use modal_and_transport::{
     PhasorQ32Bank4, T1DcBlockerKernel, T1SubHarmonicKernel, algebraic_unit_rotor_f32,
     bspline_barberpole_3phase_f32, catmull_rom_hermite_f32, clamp_transport_delay_f32,
     coercive_loop_limit_vec4, compose_complex_modal_scan, compute_op_p_and_phasor_pair,
-    cubic_lagrange_weights_f32, eval_stage3_sweep_contraction_f32,
+    cubic_lagrange_weights_f32, eval_kautz_sweep_contraction_f32,
     hermite_hann_partition_of_unity_f32, read_barberpole_m3_f32, read_catmull_rom_f32,
     read_catmull_rom_fp16_u16, read_pitch_grain_m2_f32, step_kautz_quad_stereo8,
     step_kautz_quad_vec4, step_schroeder_allpass, step_schroeder_quad_vec4,

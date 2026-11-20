@@ -11,7 +11,7 @@
 //!    `sinf`, `cosf`, `tanf`, `expf`, `logf`, `powf`, `sqrtf`, or `f64` `libm` equivalents.
 //! 2. **Real-Time Loop Instruction & Call Audit (`REQ-6.2`, `REQ-6.3`):** Across all compiled
 //!    `DnamEngine<*>::process_block*`, `process_mono*`, `sona_process_block*`, `step_sona_group_stereo8*`,
-//!    `V3Stage0Hot::*`, `V3Stage3Hot::*`, `V3Stage4TankHot::*`, `SonaHotSlab::*`, `SonaInstance::*`,
+//!    `IoRouter::*`, `CrossbarHot::*`, `CabinetHot::*`, `SpatialTankHot::*`, `SonaHotSlab::*`, `SonaInstance::*`,
 //!    `step_control_tick_3khz*`, `DnamHostHandle::process_*`, and C-ABI `_dnam_engine_process_*` functions:
 //!    - Zero hardware floating-point or integer division/sqrt instructions (`fdiv`, `fsqrt`,
 //!      `udiv`, `sdiv` on `aarch64`; `divss`/`divps`/`divsd`/`divpd`/`vdiv*`,
@@ -203,10 +203,10 @@ fn is_realtime_root_symbol(sym: &str) -> bool {
         "DynamicDnamEngine",
         "DnamHostHandle",
         "ControlBus",
-        "Stage0Router",
-        "V3Stage0Hot",
-        "V3Stage3Hot",
-        "V3Stage4TankHot",
+        "IoRouter",
+        "CrossbarHot",
+        "CabinetHot",
+        "SpatialTankHot",
         "SonaHotSlab",
         "SonaInstance",
         "step_sona_group_stereo8",

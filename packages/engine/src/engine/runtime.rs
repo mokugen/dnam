@@ -105,17 +105,13 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         self.single_input = single_input;
         self.stereo_width = 1.0;
 
-        self.preallocate_cold_stage4_for(&view.preamble, active_tier);
+        self.preallocate_cold_tank_for(&view.preamble, active_tier);
         self.reconfigure_for_sample_rate_with_mode(sample_rate_hz, true)?;
         Ok(())
     }
 
     /// Pre-allocates Stage IV extended delay ring coldly outside RT / `reconfigure_*` call graphs.
-    pub(crate) fn preallocate_cold_stage4_for(
-        &mut self,
-        preamble: &DnamPreamble,
-        target_tier: Tier,
-    ) {
+    pub(crate) fn preallocate_cold_tank_for(&mut self, preamble: &DnamPreamble, target_tier: Tier) {
         let arena = self.arena_storage.as_bytes();
         let max_tier_idx = (Self::detect_max_tier(preamble, arena.len()) as usize).min(3);
         let declared_48k = self.header().map_or(0usize, |hdr| {
@@ -126,7 +122,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                 .unwrap_or(0)
         });
         let mono_out = !preamble.is_stereo_out();
-        let mat = crate::stages::weights::unpack_sona_matryoshka_from_arena(arena, mono_out);
+        let mat = crate::graph::weights::unpack_sona_matryoshka_from_arena(arena, mono_out);
         *self.cold_tiers = mat.to_four_tiers();
         let mut tier_max_req = 0usize;
         let mut needs_ext_or_diffuser = false;
@@ -137,7 +133,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             }
             for q in 0..aq {
                 let qp = m.stage4.effective_quad_params(q);
-                if qp.ext_format == crate::stages::stage4_tank::v3_fdn::Stage4ExtFormat::F32
+                if qp.ext_format == crate::graph::tank::fdn::TankExtFormat::F32
                     || qp.allpass_delays.iter().any(|&d| d > 0)
                 {
                     needs_ext_or_diffuser = true;
@@ -150,21 +146,21 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         }
         let max_ref = declared_48k.max(tier_max_req);
         let bounce_min = max_ref.saturating_mul(16).saturating_add(32).max(2_048);
-        if max_ref > crate::stages::stage4_tank::v3_fdn::V3_TANK_CAP
-            || bounce_min > crate::stages::stage4_tank::v3_fdn::V3_TANK_CAP
+        if max_ref > crate::graph::tank::fdn::V3_TANK_CAP
+            || bounce_min > crate::graph::tank::fdn::V3_TANK_CAP
             || needs_ext_or_diffuser
         {
             self.hot_core
-                .ensure_cold_stage4_cap(&self.cold_tiers[max_tier_idx].stage4, bounce_min);
+                .ensure_cold_tank_cap(&self.cold_tiers[max_tier_idx].stage4, bounce_min);
             self.bounce_scratch
                 .hot_core
-                .ensure_cold_stage4_cap(&self.cold_tiers[max_tier_idx].stage4, bounce_min);
+                .ensure_cold_tank_cap(&self.cold_tiers[max_tier_idx].stage4, bounce_min);
             let eff = (target_tier as usize).min(max_tier_idx);
             self.hot_core
-                .ensure_cold_stage4_cap(&self.cold_tiers[eff].stage4, bounce_min);
+                .ensure_cold_tank_cap(&self.cold_tiers[eff].stage4, bounce_min);
             self.bounce_scratch
                 .hot_core
-                .ensure_cold_stage4_cap(&self.cold_tiers[eff].stage4, bounce_min);
+                .ensure_cold_tank_cap(&self.cold_tiers[eff].stage4, bounce_min);
         }
     }
 
@@ -199,13 +195,13 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
     pub(crate) fn load_v3_hot_core_from_arena(&mut self, reset_state: bool) {
         let arena = self.arena_storage.as_bytes();
         let mono_out = !self.preamble.is_stereo_out();
-        let mat = crate::stages::weights::unpack_sona_matryoshka_from_arena(arena, mono_out);
+        let mat = crate::graph::weights::unpack_sona_matryoshka_from_arena(arena, mono_out);
         if arena.len() >= 64 {
             let mut has_s = false;
             let mut s_mat = [[0.0_f32; 4]; 4];
             for (r, row) in s_mat.iter_mut().enumerate() {
                 for (c, cell) in row.iter_mut().enumerate() {
-                    let v = crate::stages::weights::read_f32_le(arena, (r * 4 + c) * 4);
+                    let v = crate::graph::weights::read_f32_le(arena, (r * 4 + c) * 4);
                     if v.is_finite() {
                         *cell = v.clamp(-4.0, 4.0);
                         if v.abs() > 1.0e-12 {
@@ -215,7 +211,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                 }
             }
             if has_s {
-                self.stage0_router.set_scattering_matrix(s_mat);
+                self.io_router.set_scattering_matrix(s_mat);
             } else if mat
                 .stage0
                 .s_router
@@ -223,23 +219,22 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                 .flatten()
                 .any(|v| v.is_finite() && v.abs() > 1.0e-12)
             {
-                self.stage0_router
-                    .set_scattering_matrix(mat.stage0.s_router);
+                self.io_router.set_scattering_matrix(mat.stage0.s_router);
             } else {
-                self.stage0_router.s_matrix = crate::stages::Stage0Router::DEFAULT_S_MATRIX;
+                self.io_router.s_matrix = crate::graph::IoRouter::DEFAULT_S_MATRIX;
             }
         }
         if let Some(hdr) = self.header() {
-            self.stage0_router
-                .set_crossover_hz(hdr.stage0_router.sub_crossover_hz);
+            self.io_router
+                .set_crossover_hz(hdr.io_router.sub_crossover_hz);
         } else if let Some(flags) = self.reloaded_header_flags {
-            self.stage0_router.set_crossover_hz(flags.sub_crossover_hz);
+            self.io_router.set_crossover_hz(flags.sub_crossover_hz);
         }
-        self.stage0_router.reconfigure_sample_rate(&self.zoh);
+        self.io_router.reconfigure_sample_rate(&self.zoh);
 
         for t in 0..4 {
-            let trim_off = crate::stages::weights::ARENA0_TIER_GAIN_TRIM_OFFSET + t * 4;
-            let raw_trim = crate::stages::weights::read_f32_le(arena, trim_off);
+            let trim_off = crate::graph::weights::ARENA0_TIER_GAIN_TRIM_OFFSET + t * 4;
+            let raw_trim = crate::graph::weights::read_f32_le(arena, trim_off);
             self.cached_tier_gain_trim[t] = if (0.0625..=16.0).contains(&raw_trim) {
                 raw_trim
             } else {
@@ -249,12 +244,12 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
 
         *self.cold_tiers = mat.to_four_tiers();
         let eff = self.effective_tier() as usize;
-        let was_frozen = self.hot_core.stage4_freeze();
+        let was_frozen = self.hot_core.tank_freeze();
         if reset_state {
             self.hot_core.reload_in_place(&self.cold_tiers[eff]);
         } else {
             self.hot_core.switch_tier(&self.cold_tiers[eff]);
-            self.hot_core.set_stage4_freeze(was_frozen);
+            self.hot_core.set_tank_freeze(was_frozen);
         }
         let target_os2x = self.cold_tiers[eff].os2x && !self.offline_bounce;
         self.hot_core.reconfigure_with_zoh_mode(
@@ -264,13 +259,13 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
             self.offline_bounce,
         );
         self.hot_core.set_os2x(target_os2x);
-        self.hot_core.set_s0_s_router(self.stage0_router.s_matrix);
+        self.hot_core.set_s0_s_router(self.io_router.s_matrix);
     }
 
     pub(crate) fn training_zoh_poles(&self) -> (f32, f32, f32, u32) {
         let arena = self.arena_storage.as_bytes();
         let v_ac =
-            crate::stages::weights::read_f32_le(arena, crate::stages::weights::ARENA0_R_AC_OFFSET);
+            crate::graph::weights::read_f32_le(arena, crate::graph::weights::ARENA0_R_AC_OFFSET);
         let r_ac_tr = if v_ac > 0.9 && v_ac < 1.0 {
             v_ac
         } else {
@@ -278,9 +273,9 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         };
         let (hdr_dc, hdr_tau, hdr_xfade) = if let Some(h) = self.header() {
             (
-                h.stage4_tank.dc_blocker_pole,
-                h.stage4_tank.tzf_reference_tap_samples,
-                h.stage4_tank.switch_xfade_samples,
+                h.spatial_tank.dc_blocker_pole,
+                h.spatial_tank.tzf_reference_tap_samples,
+                h.spatial_tank.switch_xfade_samples,
             )
         } else if let Some(flags) = self.reloaded_header_flags {
             (
@@ -296,9 +291,9 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         } else {
             0.995
         };
-        let zero_op_t = crate::stages::weights::has_pipeline_flag(
+        let zero_op_t = crate::graph::weights::has_pipeline_flag(
             self.arena_storage.as_bytes(),
-            crate::stages::weights::PIPE_FLAG_ZERO_OP_T_PRE,
+            crate::graph::weights::PIPE_FLAG_ZERO_OP_T_PRE,
         );
         let tau_ref_tr = if zero_op_t {
             0.0
@@ -429,7 +424,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
         self.current_stage_params = self.control_bus.stage_targets;
         self.stage_ramp_deltas = [0.0; 16];
         self.hot_core.reset_to_dc_equilibrium();
-        self.stage0_router.reset();
+        self.io_router.reset();
         self.hot_core
             .snap_control_bus_with_z_stage(&self.current_stage_params, &self.control_bus.z_stage);
         let num_ctrls = self.control_bus.num_controls;
@@ -591,11 +586,11 @@ mod tests {
         assert_eq!(owned_engine.tempo_state.total_frames, 8);
         let (bpm_tap, _) = owned_engine.register_tap_tempo(None, true);
         assert!((20.0..=400.0).contains(&bpm_tap));
-        let d_before = owned_engine.stage0_router.return_aligner_l.delay_samples;
+        let d_before = owned_engine.io_router.return_aligner_l.delay_samples;
         assert!((d_before - 62.0).abs() < 1e-5);
         owned_engine.reset_to_dc_equilibrium();
         assert_eq!(
-            owned_engine.stage0_router.return_aligner_l.delay_samples,
+            owned_engine.io_router.return_aligner_l.delay_samples,
             d_before
         );
 
@@ -628,5 +623,107 @@ mod tests {
                 .reload_model_in_place_owned(&open_v3, Tier::Full, 48_000)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn test_init_from_view_stage4_zoh_and_reconfigure_edge_branches() {
+        use crate::container::wire::DelayHistoryEntry;
+        use crate::graph::weights::{
+            Arena0LiteWire, PIPE_FLAG_SONA, PIPE_FLAG_ZERO_OP_T_PRE, PIPE_MAGIC_HI,
+            SONA_CELL_MAGIC, V3_META_STAGE0_EXT,
+        };
+        use crate::provenance::OpenArenaCryptoProvider;
+        use crate::schema::{ControlKind, ControlSchemaDef, ControlUiHints};
+        use alloc::collections::BTreeMap;
+        use alloc::string::String;
+        use zerocopy::FromBytes;
+        use zerocopy::byteorder::little_endian::{F32, U32};
+
+        let mut hdr = DnamJsonHeader::default_reference();
+        hdr.controls_schema.push(ControlSchemaDef {
+            id: String::from("drive"),
+            name: String::from("Drive"),
+            kind: ControlKind::Range,
+            unit: None,
+            lobatto_degree: Some(1),
+            anchor_nodes_norm: Some(vec![0.0]),
+            declared_range: Some([0.0, 10.0]),
+            safe_clamped_range: Some([0.0, 10.0]),
+            default: serde_json::json!(5.0),
+            conditional_bounds: alloc::vec![],
+            represented_switch_options: None,
+            declared_options: None,
+            active_options: None,
+            clamp_warning: None,
+            calibration: None,
+            ui_hints: ControlUiHints::default(),
+            user_metadata: BTreeMap::new(),
+        });
+        hdr.delay_histories.push(DelayHistoryEntry {
+            id: String::from("tank.q0"),
+            owner: String::from("spatial_tank"),
+            kind: String::from("fractional"),
+            introduced_tier: String::from("ultra"),
+            sample_format: String::from("f32"),
+            reference_samples: [(String::from("ultra"), String::from("256"))]
+                .into_iter()
+                .collect(),
+        });
+        hdr.spatial_tank.dc_blocker_pole = 0.5;
+        hdr.spatial_tank.tzf_reference_tap_samples = 0.0;
+        hdr.control_bus.head_trust_region_radius = 0.0;
+
+        let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+        {
+            let (a0, _) = Arena0LiteWire::mut_from_prefix(&mut arena).unwrap();
+            a0.stage0.cell_phasors.cell_desc.magic = SONA_CELL_MAGIC;
+            a0.stage0.meta.pipeline_flags = U32::new(PIPE_MAGIC_HI | PIPE_FLAG_SONA);
+            a0.stage0.meta.v3_meta_flags = U32::new(V3_META_STAGE0_EXT);
+            a0.stage0.s_router[0][0] = F32::new(f32::NAN);
+            a0.stage4_lite.ext_format = U32::new(1);
+            a0.stage4_lite.allpass_delays[0] = U32::new(19);
+        }
+        let c = build_dnam_container(&mut hdr, &arena, &arena, false).unwrap();
+
+        let mut bad_view = DnamContainerView::from_bytes(&c, &OpenArenaCryptoProvider).unwrap();
+        bad_view.preamble.version_major = 2;
+        let mut e_bad = DnamEngine::<ScalarBackend>::new_empty(Tier::Lite);
+        assert!(matches!(
+            e_bad.init_from_view(bad_view, Tier::Lite, Tier::Ultra, 48_000),
+            Err(DnamError::UnsupportedVersion { major: 2, .. })
+        ));
+
+        let mut view_desc = DnamContainerView::from_bytes(&c, &OpenArenaCryptoProvider).unwrap();
+        view_desc.control_records.clear();
+        let mut e_desc = DnamEngine::<ScalarBackend>::new_empty(Tier::Lite);
+        e_desc
+            .init_from_view(view_desc, Tier::Lite, Tier::Ultra, 48_000)
+            .unwrap();
+        assert_eq!(e_desc.control_bus.num_controls, 1);
+
+        let mut view_comp = DnamContainerView::from_bytes(&c, &OpenArenaCryptoProvider).unwrap();
+        view_comp.control_records.clear();
+        view_comp.clamp_descriptors.clear();
+        let mut e_comp = DnamEngine::<ScalarBackend>::new_empty(Tier::Lite);
+        e_comp
+            .init_from_view(view_comp, Tier::Lite, Tier::Ultra, 48_000)
+            .unwrap();
+        assert_eq!(e_comp.control_bus.num_controls, 1);
+        e_comp.set_sample_rate(96_000).unwrap();
+
+        {
+            let (a0, _) = Arena0LiteWire::mut_from_prefix(&mut arena).unwrap();
+            a0.stage0.meta.pipeline_flags = U32::new(PIPE_MAGIC_HI | PIPE_FLAG_ZERO_OP_T_PRE);
+        }
+        let c_zop = build_dnam_container(&mut hdr, &arena, &arena, false).unwrap();
+        let e_zop = DnamEngine::<ScalarBackend>::from_bytes(&c_zop, Tier::Lite, 48_000).unwrap();
+        assert!(e_zop.training_zoh_poles().2.abs() < 1e-6);
+
+        let mut empty = DnamEngine::<ScalarBackend>::new_empty(Tier::Lite);
+        empty.header_active = false;
+        empty.reloaded_header_flags = None;
+        let _ = empty.training_zoh_poles();
+        empty.reconfigure_for_sample_rate_rt(48_000, true).unwrap();
+        empty.reconfigure_for_sample_rate_rt(48_000, false).unwrap();
     }
 }

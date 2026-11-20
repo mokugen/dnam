@@ -265,6 +265,116 @@ function checkTsModularFile(tsPath: string, violations: string[]): void {
   }
 }
 
+const ENGINE_LEGACY_PATHS: readonly string[] = [
+  "src/stages",
+  "src/stages.rs",
+  "src/graph/hot_core",
+  "src/graph/hot_core.rs",
+  "src/graph/stage3_cab",
+  "src/graph/stage3_cab.rs",
+  "src/graph/stage4_tank",
+  "src/graph/stage4_tank.rs",
+  "src/graph/router/v3_stage0",
+  "src/graph/router/v3_stage0.rs",
+  "src/graph/tank/v3_fdn",
+  "src/graph/tank/v3_fdn.rs",
+  "src/provenance/seal/v3_dnsl",
+  "src/provenance/seal/v3_dnsl.rs",
+  "src/control/bus/tick/tank_mod",
+  "src/control/bus/tick/tank_mod.rs",
+  "src/container/wire/slices_and_cp1/delay_and_stage3",
+  "src/container/wire/slices_and_cp1/delay_and_stage3.rs",
+  "src/graph/topology/router_and_head/stage4_and_laws",
+  "src/graph/topology/router_and_head/stage4_and_laws.rs",
+  "src/operators/reference/rail_crossing",
+  "src/operators/reference/rail_crossing.rs",
+  "src/schema/stages",
+  "src/schema/stages.rs",
+  "benches/stages_and_control.rs",
+];
+
+interface LegacyTokenRule {
+  label: string;
+  pattern: RegExp;
+}
+
+const ENGINE_LEGACY_TOKEN_RULES: readonly LegacyTokenRule[] = [
+  {
+    label: "src/stages module or path",
+    pattern: new RegExp(
+      [
+        "\\bsrc/stages\\b",
+        "\\b(?:crate|super|self|dnam_engine)::stages\\b",
+        "\\bstages::",
+        "\\bmod\\s+stages\\b",
+        "\\bstages\\.rs\\b",
+        "\\bstages/",
+      ].join("|"),
+    ),
+  },
+  {
+    label: "hot_core module or path",
+    pattern: /(?:\b(?:mod|use|pub\s+use)\s+[^;\n]*\bhot_core\b|hot_core(?:\.rs|::|\/))/,
+  },
+  { label: "stage3_cab", pattern: /\bstage3_cab\b/ },
+  { label: "stage4_tank", pattern: /\bstage4_tank\b/ },
+  { label: "v3_stage0", pattern: /\bv3_stage0\b/ },
+  { label: "v3_fdn", pattern: /\bv3_fdn\b/ },
+  { label: "v3_dnsl", pattern: /\bv3_dnsl\b/ },
+  { label: "tank_mod", pattern: /\btank_mod\b/ },
+  { label: "delay_and_stage3", pattern: /\bdelay_and_stage3\b/ },
+  { label: "stage4_and_laws", pattern: /\bstage4_and_laws\b/ },
+  {
+    label: "rail_crossing module or path",
+    pattern: new RegExp(
+      [
+        "\\b(?:mod|use|pub\\s+use)\\s+[^;\\n]*\\brail_crossing\\b",
+        "rail_crossing(?:\\.rs|::|/)",
+        "reference/rail_crossing\\b",
+      ].join("|"),
+    ),
+  },
+  {
+    label: "eval_adaa_cubic_c2_wavefolder_f64",
+    pattern: /\beval_adaa_cubic_c2_wavefolder_f64\b/,
+  },
+  { label: "avx2_tile_dot64_stereo", pattern: /\bavx2_tile_dot64_stereo\b/ },
+  { label: "V3HotCore", pattern: /\bV3HotCore\b/ },
+  { label: "V3CoreInstance", pattern: /\bV3CoreInstance\b/ },
+  { label: "V3ColdTierModel", pattern: /\bV3ColdTierModel\b/ },
+  { label: "V3MatryoshkaModel", pattern: /\bV3MatryoshkaModel\b/ },
+  { label: "V3TierReadout", pattern: /\bV3TierReadout\b/ },
+];
+
+const ENGINE_LEGACY_SCHEMA_KEY_RE = /"(?:stage0_router|stage3_cabinet|stage4_tank)"/;
+
+function collectEngineLineMatches(
+  filePath: string,
+  rules: readonly LegacyTokenRule[],
+  violations: string[],
+): void {
+  const lines = fs.readFileSync(filePath, "utf8").split("\n");
+  lines.forEach((line, idx) => {
+    for (const rule of rules) {
+      if (rule.pattern.test(line)) {
+        violations.push(`${relPath(filePath)}:${idx + 1}: legacy '${rule.label}' reference`);
+      }
+    }
+  });
+}
+
+function collectEngineSchemaKeyMatches(dirPath: string, violations: string[]): void {
+  for (const rsPath of walkFilesByExtensions(dirPath, new Set([".rs"]))) {
+    const lines = fs.readFileSync(rsPath, "utf8").split("\n");
+    lines.forEach((line, idx) => {
+      const match = ENGINE_LEGACY_SCHEMA_KEY_RE.exec(line);
+      if (match) {
+        violations.push(`${relPath(rsPath)}:${idx + 1}: legacy schema key ${match[0]}`);
+      }
+    });
+  }
+}
+
 describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () => {
   it("test_type_safety_unsafe_isolation_and_line_ceilings", () => {
     checkTsAndMjsTypeSafety();
@@ -326,7 +436,7 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
       path.join(PACKAGES_DIR, "engine", "src", "container"),
       path.join(PACKAGES_DIR, "engine", "src", "control"),
       path.join(PACKAGES_DIR, "engine", "src", "provenance"),
-      path.join(PACKAGES_DIR, "engine", "src", "stages"),
+      path.join(PACKAGES_DIR, "engine", "src", "graph"),
       path.join(PACKAGES_DIR, "engine", "src", "schema"),
       path.join(PACKAGES_DIR, "studio", "rust"),
     ]) {
@@ -386,7 +496,7 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
       path.join(PACKAGES_DIR, "kernels", "src"),
       path.join(PACKAGES_DIR, "engine", "src", "math"),
       path.join(PACKAGES_DIR, "engine", "src", "operators"),
-      path.join(PACKAGES_DIR, "engine", "src", "stages"),
+      path.join(PACKAGES_DIR, "engine", "src", "graph"),
       path.join(PACKAGES_DIR, "engine", "src", "control"),
       path.join(PACKAGES_DIR, "engine", "src", "container"),
       path.join(PACKAGES_DIR, "engine", "src", "provenance"),
@@ -400,5 +510,23 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
       );
       expect(hasProptest, `${relPath(dirPath)} missing proptest! suite`).toBe(true);
     }
+  });
+
+  it("test_engine_no_legacy_stage_or_v3_regressions", () => {
+    const engineDir = path.join(PACKAGES_DIR, "engine");
+    const violations: string[] = [];
+
+    for (const rel of ENGINE_LEGACY_PATHS) {
+      if (fs.existsSync(path.join(engineDir, rel))) {
+        violations.push(`packages/engine/${rel}: forbidden legacy path exists`);
+      }
+    }
+    for (const filePath of walkFilesByExtensions(engineDir, new Set([".rs", ".md", ".toml"]))) {
+      collectEngineLineMatches(filePath, ENGINE_LEGACY_TOKEN_RULES, violations);
+    }
+    for (const subDir of ["src", "tests"]) {
+      collectEngineSchemaKeyMatches(path.join(engineDir, subDir), violations);
+    }
+    expect(violations).toEqual([]);
   });
 });

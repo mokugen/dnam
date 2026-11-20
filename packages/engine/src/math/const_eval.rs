@@ -12,14 +12,14 @@ pub use dnam_kernels::simd::const_eval::*;
 /// (`docs/specs/dsp/op_n_paralru_and_polyadaa.md` §1.2).
 pub const IEEE754_F64_RSQRT_SEED: u64 = 0x5FE6_EB50_C7B5_37A9;
 
-/// Compile-time `5 Hz` Stage IV passband-normalized DC blocker pole at `48 kHz` (`0x3F7F_D51F`).
-pub const STAGE4_DC_BLOCKER_48K_F32: f32 = const_dc_blocker_pole_f32(5.0, 48_000.0);
+/// Compile-time `5 Hz` tank passband-normalized DC blocker pole at `48 kHz` (`0x3F7F_D51F`).
+pub const TANK_DC_BLOCKER_48K_F32: f32 = const_dc_blocker_pole_f32(5.0, 48_000.0);
 
 /// Compile-time largest positive `f32` bit pattern `<= 0.985` (`0x3F7C_28F5`).
-pub const STAGE4_MAX_V_CEIL_BITS_DERIVED: u32 = const_max_f32_bits_le(0.985);
+pub const TANK_MAX_V_CEIL_BITS_DERIVED: u32 = const_max_f32_bits_le(0.985);
 
 /// Compile-time largest positive `f32` bit pattern `<= 0.9990` (`0x3F7F_BE76`).
-pub const STAGE4_MAX_G_LIN_BITS_DERIVED: u32 = const_max_f32_bits_le(0.9990);
+pub const TANK_MAX_G_LIN_BITS_DERIVED: u32 = const_max_f32_bits_le(0.9990);
 
 /// Branch-free compile-time `|x|` for `f64`.
 #[inline]
@@ -192,11 +192,11 @@ pub const fn const_max_f32_bits_le(bound: f64) -> u32 {
 const TANH_R4: [f64; 4] = const_c1_clamped_tanh_coeffs(4.0);
 const _: () = assert!(IEEE754_F32_RCP_SEED == 0x7EF3_11C3);
 const _: () = assert!(const_f32_rcp_chebyshev_seed() == IEEE754_F32_RCP_SEED);
-const _: () = assert!(STAGE4_DC_BLOCKER_48K_F32.to_bits() == 0x3F7F_D51F);
-const _: () = assert!(STAGE4_DC_BLOCKER_48K_F32.to_bits() == DC_BLOCKER_5HZ_48K_F32.to_bits());
-const _: () = assert!(STAGE4_MAX_V_CEIL_BITS_DERIVED == 0x3F7C_28F5);
-const _: () = assert!(STAGE4_MAX_G_LIN_BITS_DERIVED == 0x3F7F_BE76);
-const _: () = assert!(STAGE4_MAX_G_LIN_BITS_DERIVED == MAX_LOOP_GAIN_F32.to_bits());
+const _: () = assert!(TANK_DC_BLOCKER_48K_F32.to_bits() == 0x3F7F_D51F);
+const _: () = assert!(TANK_DC_BLOCKER_48K_F32.to_bits() == DC_BLOCKER_5HZ_48K_F32.to_bits());
+const _: () = assert!(TANK_MAX_V_CEIL_BITS_DERIVED == 0x3F7C_28F5);
+const _: () = assert!(TANK_MAX_G_LIN_BITS_DERIVED == 0x3F7F_BE76);
+const _: () = assert!(TANK_MAX_G_LIN_BITS_DERIVED == MAX_LOOP_GAIN_F32.to_bits());
 const _: () = assert!(const_abs_f64(TANH_R4[0] - 61.0 / 600.0) < 1.0e-15);
 const _: () = assert!(const_abs_f64(TANH_R4[1] - 11.0 / 19_200.0) < 1.0e-15);
 const _: () = assert!(const_abs_f64(TANH_R4[2] - 87.0 / 200.0) < 1.0e-15);
@@ -204,6 +204,10 @@ const _: () = assert!(const_abs_f64(TANH_R4[3] - 47.0 / 3_840.0) < 1.0e-15);
 
 #[cfg(test)]
 mod tests {
+    use core::hint::black_box;
+
+    use proptest::prelude::*;
+
     use super::*;
 
     /// verify[repo.code.constant-eval-and-derivations]
@@ -241,5 +245,83 @@ mod tests {
         assert!((p_1 - 1.0).abs() < 1.0e-6);
         assert!(dp_1.abs() < 1.0e-5);
         assert!((p_half - core::f32::consts::FRAC_1_SQRT_2).abs() < 2.0e-3);
+    }
+
+    /// verify[repo.code.constant-eval-and-derivations]
+    #[test]
+    fn test_const_eval_runtime_tables_bounds_and_quadrants() {
+        assert_eq!(const_abs_f64(black_box(-0.0)).to_bits(), 0);
+        assert_eq!(const_abs_f64(black_box(-3.25)), 3.25);
+        assert_eq!(const_abs_f64(black_box(3.25)), 3.25);
+        assert_eq!(const_abs_f64(black_box(f64::NEG_INFINITY)), f64::INFINITY);
+
+        let sin_steps = black_box(build_inv_sin_steps());
+        let cos_steps = black_box(build_inv_cos_steps());
+        assert_eq!(sin_steps, INV_SIN_STEP);
+        assert_eq!(cos_steps, INV_COS_STEP);
+        assert_eq!(sin_steps[0], 0.0);
+        assert_eq!(cos_steps[0], 0.0);
+        for k in 1..=10 {
+            let expected_sin = 1.0 / ((2 * k * (2 * k + 1)) as f64);
+            let expected_cos = 1.0 / (((2 * k - 1) * (2 * k)) as f64);
+            assert!((sin_steps[k] - expected_sin).abs() < 1.0e-16);
+            assert!((cos_steps[k] - expected_cos).abs() < 1.0e-16);
+        }
+
+        let extremes = [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 1.0e16, -1.0e16];
+        for extreme in extremes {
+            assert_eq!(const_sin_cos_f64(black_box(extreme)), (0.0, 1.0));
+        }
+
+        for q in -8..=8 {
+            let angle = (q as f64) * core::f64::consts::FRAC_PI_2 + 0.19;
+            let (s, c) = const_sin_cos_f64(black_box(angle));
+            let (ref_s, ref_c) = angle.sin_cos();
+            assert!((s - ref_s).abs() < 1.0e-14);
+            assert!((c - ref_c).abs() < 1.0e-14);
+            assert!((const_sin_f64(black_box(angle)) - ref_s).abs() < 1.0e-14);
+            assert!((const_cos_f64(black_box(angle)) - ref_c).abs() < 1.0e-14);
+            assert!((const_tan_f64(black_box(angle)) - angle.tan()).abs() < 1.0e-13);
+        }
+
+        let pole_5 = const_dc_blocker_pole_f32(black_box(5.0), black_box(48_000.0));
+        let pole_10 = const_dc_blocker_pole_f32(black_box(10.0), black_box(48_000.0));
+        let pole_100 = const_dc_blocker_pole_f32(black_box(100.0), black_box(96_000.0));
+        assert_eq!(pole_5.to_bits(), 0x3F7F_D51F);
+        assert_eq!(pole_10.to_bits(), DC_BLOCKER_10HZ_48K_BITS);
+        let w100 = core::f64::consts::TAU * 100.0 / 96_000.0;
+        let expected_100 = ((w100.cos() / (1.0 + w100.sin())) as f32).to_bits();
+        assert_eq!(pole_100.to_bits(), expected_100);
+
+        assert_eq!(const_max_f32_bits_le(black_box(0.985)), 0x3F7C_28F5);
+        assert_eq!(const_max_f32_bits_le(black_box(0.9990)), 0x3F7F_BE76);
+        let bits_07 = const_max_f32_bits_le(black_box(0.7));
+        let bits_05 = const_max_f32_bits_le(black_box(0.5));
+        assert_eq!(bits_05, 0x3F00_0000);
+        assert!(f64::from(f32::from_bits(bits_07)) <= 0.7);
+        assert!(f64::from(f32::from_bits(bits_07 + 1)) > 0.7);
+    }
+
+    proptest! {
+        #[test]
+        fn prop_const_eval_trig_sqrt_and_f32_bound(
+            angle in -100.0_f64..100.0_f64,
+            radicand in 1.0e-12_f64..1.0e12_f64,
+            bound in 1.0e-4_f64..1.0_f64,
+        ) {
+            let (s, c) = const_sin_cos_f64(black_box(angle));
+            let (ref_s, ref_c) = angle.sin_cos();
+            prop_assert!((s - ref_s).abs() < 1.0e-13);
+            prop_assert!((c - ref_c).abs() < 1.0e-13);
+            prop_assert_eq!(const_abs_f64(black_box(-radicand)), radicand);
+
+            let root = const_sqrt_f64(black_box(radicand));
+            let ref_root = radicand.sqrt();
+            prop_assert!(((root - ref_root) / ref_root).abs() < 1.0e-14);
+
+            let bits = const_max_f32_bits_le(black_box(bound));
+            prop_assert!(f64::from(f32::from_bits(bits)) <= bound);
+            prop_assert!(f64::from(f32::from_bits(bits + 1)) > bound);
+        }
     }
 }

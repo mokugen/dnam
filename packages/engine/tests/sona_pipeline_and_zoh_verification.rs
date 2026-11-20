@@ -148,6 +148,14 @@ mod arch_spec_integration {
         cp1_contributor_record_bytes,
     };
     use dnam_engine::control::{ExactIntFactorAccumulator, control_stride_for_rate};
+    use dnam_engine::graph::weights::{
+        Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire,
+        pack_sona_matryoshka_to_arena,
+    };
+    use dnam_engine::graph::{
+        IoRouter, SonaColdTierModel, SonaHotSlab, SonaMatryoshkaModel, TptLr4Crossover,
+        WdwDryTapMode,
+    };
     use dnam_engine::math::{DefaultMathBackend, eval_monotone_log2_f32_bits};
     use dnam_engine::operators::op_n::OpNBackend;
     use dnam_engine::operators::{
@@ -157,14 +165,6 @@ mod arch_spec_integration {
     };
     use dnam_engine::provenance::{Dme1HeaderWire, DnplPreambleWire, DnslPreambleWire};
     use dnam_engine::schema::DnamJsonHeader;
-    use dnam_engine::stages::weights::{
-        Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire,
-        pack_sona_matryoshka_to_arena,
-    };
-    use dnam_engine::stages::{
-        SonaColdTierModel, SonaHotSlab, SonaMatryoshkaModel, Stage0Router, TptLr4Crossover,
-        WdwDryTapMode,
-    };
     use dnam_engine::{
         DnamEngine, DynamicDnamEngine, FtzDazGuard, OFFLINE_BOUNCE_PDC_SAMPLES,
         TOTAL_LITE_STATE_RAM_BYTES, Tier,
@@ -420,7 +420,7 @@ mod arch_spec_integration {
         kautz.set_pole(0, 0.99, 0.3, 0.05, 0.5, -0.2);
         assert!(kautz.step(0.5).is_finite());
 
-        let mut router = Stage0Router::new();
+        let mut router = IoRouter::new();
         let (sl, sr, dl, dr, _, _) = router.route_frame(0.5, -0.5, 0.2, -0.2);
         let mut lr4 = TptLr4Crossover::default();
         let (l4, h4) = lr4.step(dl);

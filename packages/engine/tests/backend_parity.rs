@@ -18,16 +18,16 @@
 
 use dnam_engine::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
 use dnam_engine::engine::EngineBackend;
+use dnam_engine::graph::sona_core::{
+    MAX_KAUTZ_POLES, MAX_SONA_GROUPS, MAX_SONA_TILES, MAX_TOTAL_SONA_LANES, SONA_FIR_MAX_TAPS,
+    SonaMatryoshkaModel, SonaTierReadout,
+};
+use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::math::{
     BackendKind, DefaultMathBackend, MathBackend, ScalarBackend, SimdF64Vec2, SimdVec4,
     TrainerMathBackend,
 };
 use dnam_engine::schema::DnamJsonHeader;
-use dnam_engine::stages::sona_core::{
-    MAX_KAUTZ_POLES, MAX_SONA_GROUPS, MAX_SONA_TILES, MAX_TOTAL_SONA_LANES, SONA_FIR_MAX_TAPS,
-    SonaMatryoshkaModel, SonaTierReadout,
-};
-use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::{DnamEngine, DynamicDnamEngine, Tier};
 
 fn build_parity_container() -> Vec<u8> {
@@ -363,8 +363,7 @@ fn exercise_math_backend<B: EngineBackend>() {
 
     let (d16_l, d16_r) = B::dot16_stereo(&mat, &mat, &mat, &mat);
     assert!((d16_l - 0.16).abs() < 1e-6 && (d16_r - 0.16).abs() < 1e-6);
-    let (d16_vl, d16_vr) =
-        dnam_engine::stages::dot16_stereo_vec4::<B::Vec4>(&mat, &mat, &mat, &mat);
+    let (d16_vl, d16_vr) = dnam_engine::graph::dot16_stereo_vec4::<B::Vec4>(&mat, &mat, &mat, &mat);
     assert!((d16_vl - 0.16).abs() < 1e-6 && (d16_vr - 0.16).abs() < 1e-6);
 
     let _ = <B as dnam_engine::operators::op_n::OpNBackend<B::Vec4>>::tanh_pade5_4ch(va);

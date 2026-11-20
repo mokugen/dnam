@@ -10,11 +10,11 @@
 //!   `cargo run -p dnam-engine --example embedded_zero_alloc`
 
 use dnam_engine::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
+use dnam_engine::graph::sona_core::SonaMatryoshkaModel;
+use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::memory::{AlignedBuffer, AlignedFp16Block, CacheLine64};
 use dnam_engine::schema::DnamJsonHeader;
-use dnam_engine::stages::sona_core::SonaMatryoshkaModel;
-use dnam_engine::stages::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::{DnamEngine, Tier};
 
 fn build_demo_model(name: &str, seed: u8) -> AlignedBuffer<CacheLine64> {

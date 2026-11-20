@@ -8,12 +8,12 @@ use dnam_kernels::fp16_to_f32;
 use zerocopy::FromBytes;
 use zerocopy::byteorder::little_endian::U16;
 
-use crate::schema::DnamError;
-use crate::stages::weights::{
+use crate::graph::weights::{
     ARENA_LITE_BYTES, KautzSoaBlockWire, STAGE3_KAUTZ_BLOCKS_PER_TIER, STAGE4_DELAY_BASES,
-    Stage4QuadWire, VARPRO_READOUT_BASES, VarProReadoutFullWire, VarProReadoutLiteWire,
+    TankQuadWire, VARPRO_READOUT_BASES, VarProReadoutFullWire, VarProReadoutLiteWire,
     VarProReadoutProWire, VarProReadoutUltraWire,
 };
+use crate::schema::DnamError;
 
 use super::watermark::{kautz_soa_byte_offset, max_tiers_for_arena_len};
 use super::{STRUCTURAL_HASH_DIM, STRUCTURAL_HASH_TIER_DIM};
@@ -30,7 +30,7 @@ pub(crate) fn quantize_pole_angle_1e2(theta: f64) -> f64 {
 /// - `[0..16]`: modal/Kautz invariant composite pole signatures $r_{\text{low},b,c} + 0.5\,\Delta r_{b,c} + 0.1\,\lfloor\theta_{0,b,c}\rceil_{10^{-2}}$,
 /// - `[16..32]`: gauge-invariant real products $I_{\text{real},b,c} = b_{\gamma,b,c} \cdot (c_{\text{real},L,b,c} + c_{\text{real},R,b,c})$,
 /// - `[32..48]`: gauge-invariant imaginary products $I_{\text{imag},b,c} = b_{\gamma,b,c} \cdot (c_{\text{imag},L,b,c} + c_{\text{imag},R,b,c})$,
-/// - `[48..52]`: 4 Stage IV Spatial Tank delay invariants for tier $t$,
+/// - `[48..52]`: 4 tank delay invariants for tier $t$,
 /// - `[52..56]`: 4 `VarPro` linear `fp16` `W_readout` energy invariants for tier $t$ (invariant under `sona_gauge` & `isometric_gauge`).
 ///
 /// Any stripped higher tier remains zero-filled, enabling exact prefix cosine similarity across tier-stripped containers.
@@ -77,9 +77,9 @@ pub fn extract_structural_hash_224d(arena: &[u8]) -> Result<[f64; STRUCTURAL_HAS
             }
         }
 
-        // 4 Stage IV Spatial Tank delay invariants for this tier (`u32` lengths in `4..=48_000`)
+        // 4 tank delay invariants for this tier (`u32` lengths in `4..=48_000`)
         if let Some(delay_tail) = arena.get(STAGE4_DELAY_BASES[tier]..)
-            && let Ok((s4, _)) = Stage4QuadWire::ref_from_prefix(delay_tail)
+            && let Ok((s4, _)) = TankQuadWire::ref_from_prefix(delay_tail)
         {
             for lane in 0..4 {
                 let bits = s4.delay_lengths[lane].get();
