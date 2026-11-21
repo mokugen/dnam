@@ -48,7 +48,7 @@ Singleton `STAT` (`chunk_id = 0`, 17,664..267,264 B up to `PROJ_STAT_BYTES_ULTRA
 
 Non-center stems retain compact fp32 `STMC` capsules whose solved 32-slot control targets and `stage_latent_*` sensitivities factor over the 3 kHz control basis $\boldsymbol{\psi}_s$.
 
-Kronecker reassembly and sufficient-statistic updates span both the base 16 rows of `W_ctrl` (`stage_targets[0..16]`) and, whenever `"CEXT"` is present, extended rows 16..31 (`stage_targets[16..32]`, including slot 16 `op_t_we_drive` and slot 30 `router_gate_thresh_delta`, plus Ultra `w_ctrl_ultra_ext`). Because all four tiers nest inside one fixed `STAT` layout, editing non-reference stems updates Lite through Ultra in a single invocation without per-tier jobs or capture-time tier resizing (REQ-3.1, REQ-5.3).
+Kronecker reassembly and sufficient-statistic updates span both the base 16 rows of `W_ctrl` (stage_targets[0..16]) and, whenever `"CEXT"` is present, extended rows 16..31 (stage_targets[16..32], including slot 16 `op_t_freeze_mix_delta`, slot 22 `op_t_dry_mix_mod`, and slot 30 `sense_vca_gain_delta`, plus Ultra `w_ctrl_ultra_ext`). Because all four tiers nest inside one fixed `STAT` layout, editing non-reference stems updates Lite through Ultra in a single invocation without per-tier jobs or capture-time tier resizing (REQ-3.1, REQ-5.3).
 
 #### Stationary Control-Setting Stem Records
 
@@ -62,7 +62,7 @@ They re-combine algebraically in host `f64` `uplo = 'U'` control-subspace Choles
 
 `r[train.resume.time-varying-records]`
 
-Dynamic sweep, commutator, and sustain-hold transition stems evaluate $\boldsymbol{\psi}_s[k]$ at the 3 kHz control stride over 2.0–2.5 s fp32 `INPC`/`STMC` capsules and `R <= 36` packed 16-byte trajectory window records (`ref[container.proj.stmc-capsule]`) without retaining multi-megabyte raw WAV files. Sustain-hold transitions update empirical slot 16 (`op_t_we_drive`) inside `"CEXT"` alongside time-varying operator trajectories.
+Dynamic sweep, commutator, and sustain-hold transition stems evaluate $\boldsymbol{\psi}_s[k]$ at the 3 kHz control stride over 2.0–2.5 s fp32 `INPC`/`STMC` capsules and `R <= 36` packed 16-byte trajectory window records (`ref[container.proj.stmc-capsule]`) without retaining multi-megabyte raw WAV files. Sustain-hold transitions update empirical slot 16 (`op_t_freeze_mix_delta`) inside `"CEXT"` alongside time-varying operator trajectories.
 
 ### 1.2 Two-Path Vault Editing & Dependency Digests
 
@@ -74,7 +74,7 @@ Vault mutations execute through either an incremental host fast-path or a full c
 
 | Execution Path | Trigger Condition | Execution Scope & Guarantees |
 | :--- | :--- | :--- |
-| Path 1 — Incremental Fast-Path (< 50 ms) | `extracted_physics` and StarCenter (`s = 0`) remain valid across stem addition, removal, replacement, or enablement changes | Freezes SONA core (`TPT-SVF`, `ParaLRU`, `PolyADAA1`) and fixed-dimension `uplo='U'` StarCenter `STAT` (0-ULP StarCenter invariance, REQ-4.2); fits added/edited stem `CP1` (inline or `"CP1\0"`), `U_int`, 16-row `W_ctrl` plus optional 1,280 B `"CEXT"` rows 16..31, 40 B `"TSYN"` rows, and `stage_latent_*` sensitivity tables in host `f64` while holding static base `W_ro,0` untouched for exact 0-ULP StarCenter invariance; runs 3-phase clamping (<= 3 inline `cond_rules` per descriptor) and updates `WGHT` wrapping compiled `.dnam-bin` |
+| Path 1 — Incremental Fast-Path (< 50 ms) | `extracted_physics` and StarCenter (`s = 0`) remain valid across stem addition, removal, replacement, or enablement changes | Freezes SONA core (`TPT-SVF`, `ParaLRU`, `PolyADAA1`) and fixed-dimension `uplo='U'` StarCenter `STAT` (0-ULP StarCenter invariance, REQ-4.2); fits added/edited stem `CP1` (inline or `"CP1\0"`), `U_int`, 16-row `W_ctrl` plus optional 1,280 B `"CEXT"` rows 16..31 (incl. continuous `op_t_freeze_mix_delta` & `sense_vca_gain_delta`), 40 B `"TSYN"` rows, `lfo_skew_fp16`, `ou_to_z_stage*_fp16`, and `stage_latent_*` sensitivity tables in host `f64` while holding static base `W_ro,0` untouched for exact 0-ULP StarCenter invariance; runs 3-phase clamping (<= 3 inline `cond_rules` per descriptor) and updates `WGHT` wrapping compiled `.dnam-bin` |
 | Path 2 — Full Re-Pool (Zero Raw Audio) | StarCenter is replaced or a new capture invalidates the upstream basis | Re-runs Solver Passes 1–5 over embedded `SPCM` stems or compact 2.0–2.5 s fp32 `INPC` + enabled `STMC` capsules (< 20 MB, REQ-3.3) via <= 15.5 KiB SRAM 32-bit WebGPU or deterministic CPU SIMD fallback without external WAVs, emitting updated `STAT` and `WGHT` (wrapping `.dnam-bin`) |
 
 #### Cryptographic Provenance & Dependency Invalidation

@@ -197,7 +197,7 @@ Entry `.d.ts` files emit `/// <reference lib="esnext.disposable" />` so downstre
 
 The exception-safe closure `engine.withBypass(options, fn)` wraps `fn` in a `try / finally` block so prior bypass state always restores on return or throw.
 
-Dedicated freeze scopes, capability flags, and special freeze calibration roles are absent from the TypeScript API. Captured hardware sustain or infinite-hold controls bind strictly as standard range or switch `Parameter` targets over continuous `Op-T` RAM `write_enable` (`WE`) and crossbar wet/dry balance.
+Dedicated freeze scopes, capability flags, and special freeze calibration roles are absent from the TypeScript API. Captured hardware sustain or infinite-hold controls bind strictly as standard range or switch `Parameter` targets over continuous `Op-T` `freeze_mix` recirculation and crossbar wet/dry balance.
 
 ### 2.6 WebAudio `AudioParam`-Aligned `Parameter`, `ParameterMap` & `ControlSpace`
 
@@ -305,8 +305,8 @@ Mirrored definitions cover header metadata, I/O capabilities, slimmable tier pro
 | Layer 0 `.dnam-bin` VM preamble (`"DNBN"` / `"DBRM"` / `"TSYN"`) | `DnamBinHeader`, `DnamBinRuntimeMeta`, `TempoSyncEntry` | Fixed-VM binary header, active-hot metadata, and tempo-sync calibration table |
 | Top-level header & `metadata` (`"3.0.0"`, `"sona"`, 48000 Hz, `"dnam" \| "preview"`) | `ModelHeader`, `ModelMetadata` | Discriminants (`"3.0.0"`, `"sona"`, 48000 Hz, `"dnam" \| "preview"`), identity, and attribution |
 | `io_config`, `capabilities`, `leveling`, `slimmable_tiers` | `IoConfig`, `ModelCapabilities`, `LevelingConfig`, `SlimmableTiersConfig`, `TierProfile` | Channel topology, capabilities (without dedicated freeze flags), auto-unity leveling, and per-tier arena profiles |
-| `io_router`, `cabinet`, `spatial_tank`, `control_bus` | `IoRouterConfig`, `CabinetKautzConfig`, `SpatialTankConfig`, `ControlBusConfig` | I/O Router, Cabinet Bank, Spatial Tank, and 3 kHz control bus configurations |
-| `delay_histories`, `tensor_directory`, `controls_schema`, `presets` | `DelayHistoryEntry`, `TensorSliceEntry`, `ParameterDescriptor`, `ParameterCalibration`, `ParameterUiHints`, `Preset` | Delay capacities, 64 B-aligned tensor slices, 10 calibration roles (with freeze-latch removed in favor of `Op-T` hold controls), macro controls, and factory presets |
+| `crossbar_and_sensory`, `modal_convolver`, `transport`, `linear_readout`, `control_bus` | `CrossbarSensoryConfig`, `ModalConvolverConfig`, `TransportConfig`, `LinearReadoutConfig`, `ControlBusConfig` | `SensoryQuad`, `ModalConvolver` (`ro_pole_48k` optional), `Transport`, `LinearReadout`, and 3 kHz control bus configurations |
+| `delay_histories`, `tensor_directory`, `controls_schema`, `presets` | `DelayHistoryEntry`, `TensorSliceEntry`, `ParameterDescriptor`, `ParameterCalibration`, `ParameterUiHints`, `Preset` | Delay capacities (`owner: "transport" \| "crossbar"`), 64 B-aligned tensor slices, 10 calibration roles, macro controls, and factory presets |
 | `metadata.signatures`, `authorized_devices`, `royalty_splits`, `distribution_policy`, `provenance` | `ModelSignatures`, `CreatorSignature`, `MarketplaceReceipt`, `AuthorizedDevice`, `RoyaltySplit`, `DistributionPolicy`, `DatasetProvenance`, `OemDeviceCertificate` | Cryptographic provenance, distribution policies, receipts, and OEM device certs |
 
 `decodeHeader(wireJson)` and `encodeHeader(header)` delegate validation and default population directly to the native schema validator ([Rust Implementation Specification](rust_sdk.md)), returning deeply frozen camelCase `ModelHeader` values or canonical snake_case wire JSON.
@@ -358,9 +358,9 @@ Both `verify` and `unseal` MUST fail closed (`"ERR_DNAM_PROVENANCE"`) whenever a
 | **Verification & Signing** | `verify`, `enforcePolicy`, `immutableHeaderSha256`, `signCreatorHeader`, `signMarketplaceReceipt`, `signDeviceCertificate`, `verifyDeviceCertificate` | `ref[sec.sig.prefix-delegation]`, `ref[sec.drm.oem-certificate]` |
 | **HPKE `.dnam-seal` (`DNSL`) & Envelopes** | `seal`, `unseal` (RFC 9180 HPKE `0x0020` / `0x0001` / `0x0003` + ChaCha20-Poly1305 AEAD), `encodeDau1`, `decodeDau1`, `buildDme1Header`, `parseDme1Plaintext` | `ref[sec.drm.dnsl-public-framing]`, `ref[sec.sig.dau1-envelope]` |
 | **Preview Containment (`.dnam-prev`)** | `computePreviewWindow`, `validatePreviewSwitchOptions`, plus DAW/hardware host rejection of `containerKind === "preview"` on load and hot-swap `reload` | `ref[sec.preview.containment]` |
-| **Buyer Watermarking & Structural Hash** | `applyGaugeWatermark` (Cabinet Kautz + `SO(4)` + 40-lane SONA sign-flip), `generateTardosCode`, `applyTardosWatermark` (7,680-coord partition with `2 * fp16_ulp(w)` floor), `scoreTardosWatermark`, `extractStructuralHash`, `structuralCosineSimilarity` | `ref[sec.watermark.reciprocal-gauge]`, `ref[sec.watermark.tardos-code]`, `ref[sec.anticlone.cabinet-fingerprint]` |
+| **Buyer Watermarking & Structural Hash** | `applyGaugeWatermark` (`ModalConvolver` Kautz + `SO(4)` + 40-lane `CoreQuad` sign-flip incl. cyclic `GLU`), `generateTardosCode`, `applyTardosWatermark` (5,807-coord Role B across 7,680-coord partition with `2 * fp16_ulp(w)` floor), `scoreTardosWatermark`, `extractStructuralHash`, `structuralCosineSimilarity` | `ref[sec.watermark.reciprocal-gauge]`, `ref[sec.watermark.tardos-code]`, `ref[sec.anticlone.cabinet-fingerprint]` |
 
-`applyTardosWatermark` mutates only linear Role B coordinates (`W_readout` and `W_mod` plus linear reserves) in place, leaving `"DBRM"`, `shared_controls`, `"TSYN"`, `"CEXT"`, crossbar, `Op-N[Pre]`, and nonlinear SONA core trajectories untouched.
+`applyTardosWatermark` mutates only linear Role B coordinates (`W_readout` and `W_mod` plus linear reserves) in place, leaving DBRM, `shared_controls`, TSYN, CEXT, crossbar, SensoryQuad, `ou_to_z_stage_ultra`, `Op-N[Pre]`, and nonlinear SONA core trajectories untouched.
 
 When emitting a signed or sealed buyer container carrying `dbin_prefix_bytes > 0` (`authKind === 1` or `.dnam-seal`), buyer issuance updates integrity digests over the watermarked arenas.
 
@@ -421,13 +421,13 @@ Throughput suites also profile `ControlSpace.clampNumericInto` (alongside `Contr
 
 The WebAssembly SIMD128 and shared portable math backends defined in the [Rust Implementation Specification](rust_sdk.md) (`ref[sdk.rust.explicit-simd-and-coverage]`, `ref[sdk.rust.shared-nostd-kernels]`) implement 4-lane SIMD128 floating-point, `fp16` packing, subnormal-flushing, and Newton–Raphson reciprocal primitives.
 
-Floating-point and SIMD lane layouts follow `ref[arch.fp.callback-env]` and `ref[arch.simd.lane-packing]`, pairing interleaved 8-lane stereo SIMD cascade kernels across all four SONA tiers ([1,1,1,1] at 1× Lite, [2,2,1,1] at 2× Full, [3,2,2,1] at 2× Pro, [4,3,2,1] at 2× Ultra; 4,544 / 7,552 / 11,200 / 14,656 B hot working sets inside 4,608 / 7,936 / 15,872 / 28,672 B L1D ceilings; 1–4 tank quads = 4–16 Spatial Tank lines) and the 3 kHz control bus.
+Floating-point and SIMD lane layouts follow `ref[arch.fp.callback-env]` and `ref[arch.simd.lane-packing]`, pairing interleaved 8-lane stereo SIMD cascade kernels across all four SONA tiers ([1,1,1,1] at 1× Lite, [2,2,1,1] at 2× Full, [3,2,2,1] at 2× Pro, [4,3,2,1] at 2× Ultra; 4,544 / 7,552 / 11,136 / 14,592 B hot working sets inside 4,608 / 7,936 / 15,872 / 28,672 B L1D ceilings; 1–4 `TransportQuad`s = 4–16 `Transport` lines) and the 3 kHz control bus.
 
 To preserve L1 instruction-cache locality and keep `dnam.wasm` compact (with 0 KB added for `.wgsl` shaders), the native audio-loop and JSON schema boundaries prevent cross-unit inlining and monomorphization bloat per the [Rust Implementation Specification](rust_sdk.md) (`ref[sdk.rust.c-abi-and-host-handle]`).
 
 At 48 kHz stereo (where a 128-frame WebAudio quantum equals 2,666.67 us), in-place `engine.process(input, { output })` on both N-API v10 and WASM SIMD128 (bounded or `SharedArrayBuffer` `WebAssembly.Memory`) must meet these budgets with zero JS heap allocations:
 
-| Target & Memory Mode | `lite` (`[1,1,1,1]` @ 1× / 1 tank quad / 32 FIR) | `full` (`[2,2,1,1]` @ 2× / 2 tank quads / 48 FIR) | `pro` (`[3,2,2,1]` @ 2× / 3 tank quads / 96 FIR) | `ultra` (`[4,3,2,1]` @ 2× / 4 tank quads / 128 FIR) | Real-Time Block Budget (128 Frames @ 48 kHz) |
+| Target & Memory Mode | `lite` (`[1,1,1,1]` @ 1× / 1 `TransportQuad` / 32 FIR) | `full` (`[2,2,1,1]` @ 2× / 2 `TransportQuad`s / 48 FIR) | `pro` (`[3,2,2,1]` @ 2× / 3 `TransportQuad`s / 96 FIR) | `ultra` (`[4,3,2,1]` @ 2× / 4 `TransportQuad`s / 128 FIR) | Real-Time Block Budget (128 Frames @ 48 kHz) |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Node.js 26 N-API v10 (`neon` / `avx2` / `sme`)** | In-place < 250 us | In-place < 250 us | In-place < 250 us | In-place < 250 us | < 250 us (> 10x real-time headroom, 0 JS allocs) |
 | **Node.js 26 / Chromium WASM SIMD128 (`bounded` / `shared`)** | In-place < 250 us | In-place < 250 us | In-place < 250 us | In-place < 250 us | < 250 us (> 10x real-time headroom, 0 JS allocs) |

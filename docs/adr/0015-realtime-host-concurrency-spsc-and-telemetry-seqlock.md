@@ -56,3 +56,4 @@ Wrapping `DynamicDnamEngine<'static>` inside a single coarse-grained `Mutex<Dyna
 ## Amendment Appendix
 
 - **2026-11-20T02:07:00-05:00:** Amended to decouple lock-free host and DRM shells from the `#![no_std]` DSP VM and unify hold actuation onto generic control trajectories (`ADR-0020`, `ADR-0022`).
+- **2026-11-20T23:02:00-05:00:** Amended to keep multi-port `4CM`/`WDW` patchbay routing, parallel alignment, and M/S output width inside the host shell so the DSP VM stays purely `2×2` (`ADR-0022`).

@@ -60,15 +60,15 @@ The VM crate (`dnam-vm`) compiles cleanly as `#![no_std]` with optional std and 
 
 | Borrowed `#![no_std]` / `!alloc` Surface | Stack / Caller-Owned Representation in `dnam-vm` |
 | :--- | :--- |
-| **Extended Cabinet FIR & Delay Tails** | `ColdBuf<'a, T>` on `CabinetHighSrFirExt<'a>`, `TankExtStorage::Borrowed*`, and `&'a mut [f32]` `PartitionedSchroederBank` |
+| **Extended `ModalConvolver` FIR & Delay Tails** | `ColdBuf<'a, T>` on `ConvolverHighSrFirExt<'a>`, `TransportExtStorage::Borrowed*`, and `&'a mut [f32]` `PartitionedSchroederBank` |
 | **Control Bus Parameters & Rules** | Inlined `SonaControlBusParams` inside `SonaColdTail<'a>` plus `ControlBusBacking<'a>` over caller-owned descriptor, contributor, and `CP1` overflow slices |
 | **Arena Slab Backing** | `ArenaStorage::Borrowed` slice bindings paired with fixed active-hot cache-line slabs |
 
-`dnam-vm` enforces zero JSON parsing, zero cryptography, and zero 64-bit trainer math, operating strictly as a pure-binary, continuous-4-lane runtime without clean-path crossovers or host freeze flags.
+`dnam-vm` enforces zero JSON parsing, zero cryptography, and zero 64-bit trainer math, operating strictly as a pure 2-in / 2-out binary DSP register machine (1→1, 2→1, 1→2, 2→2 across `SensoryQuad`, `CoreQuad`, `ModalConvolver`, `LinearReadout`, symmetric `TransportQuad`, and `ControlBus`) with zero clean-path crossovers, host freeze flags, or multi-port patchbay state.
 
 `SonaVm::open_dnam_bin` opens bare `.dnam-bin` (`"DNBN"`) images in under 50 ns via zero-copy `zerocopy` borrows.
 
-`dnam-engine` (`packages/engine`) wraps `SonaVm` over `extract_dnam_bin(bytes)` as the outer `.dnam`, `.dnam-seal`, and `.dnam-prev` shell, SPSC host, Ed25519 / ChaCha20 DRM layer, Tardos watermarker, and C-ABI boundary.
+`dnam-engine` (`packages/engine`) wraps `SonaVm` over `extract_dnam_bin(bytes)` as the outer Host-Shell 8-Port Patchbay (4CM/WDW, `S_router`, `ParallelAlignLine`, post-VM `ms_width`), .dnam / .dnam-seal / .dnam-prev shell, SPSC host, Ed25519 / ChaCha20 DRM layer, Tardos watermarker, and C-ABI boundary.
 
 It forbids dependencies on `dnam-train`, `dnam-capture`, `dnam-fixtures`, or trainer math backends, exposing zero clean-path crossovers, host freeze methods, or string heuristics.
 
@@ -114,8 +114,8 @@ All shared 32-bit SONA operator math lives in `dnam-kernels` under `packages/ker
 | Shared `dnam-kernels` Module | Normative 32-Bit Primitives & Traits | Target Compilation & Parity |
 | :--- | :--- | :--- |
 | **SIMD, Constants & Codecs (`simd`)** | `KernelVec4`, `GpuVec4`, `StereoVec8`, `const_eval` (`SonaTierSpec`, `LITE_SPEC`..`ULTRA_SPEC`), `OS2X` midpoint helpers, software `fp16` codecs, and subnormal flushing | Identical LLVM CPU vector and `spirv-unknown-naga-wgsl` lowering; zero `f64`/`u64` runtime ops |
-| **SONA Core & Scans (`sona_core`)** | Passive 2×2 TPT-SVF step/compose (`TptScanElem`, `TptAdjointElem`), ParaLRU step/scans (`LinearScanElem`), pure `f32` PolyADAA1 + branchless C² wavefolder + `Op-N[Pre]` + `KernelVec4::rcp_pos_quad_nr2` | Exact 0-ULP same-FMA-class CPU ParaLRU forward parity (8-lane stereo == interleaved 4-lane == lane-0 tile); <= 1.5 ULP/step FMA vs non-FMA CPU/WGSL parity |
-| **Modal & Transport (`modal_and_transport`)** | `KautzQuadState`, `ComplexModalScanElem`, `PhasorQ32Bank4`, orthogonal 4-lane `Op-T` + `WE` + WGSL-safe triangle fold (`((p as i32) >> 31) as u32`) + `coercive_loop_limit_vec4`, stereo 6-pair Elliptic `HilbertH1StereoKernel` (248 B stereo kernel used in `SonaLiteHotPrefix`), mono `HilbertH1Kernel`, `T1DcBlockerStereo` (24 B), and `T1SubHarmonicKernel` | Shared CPU and GPU physics evaluation (<= 1e-4 * max(1.0, peak) on 256-wide linear scans) |
+| **SONA Core & Scans (`sona_core`)** | `SensoryQuad`, passive 2×2 TPT-SVF step/compose (`TptScanElem`, `TptAdjointElem`), Selective-Duhem ParaLRU + `lru_stereo_link` (`LinearScanElem`), pure `f32` PolyADAA1 + branchless C² wavefolder + bounded cross-lane `GLU` + smooth raised-cosine/Fourier `Op-N[Pre]` + `KernelVec4::rcp_pos_quad_nr2` | Exact 0-ULP same-FMA-class CPU ParaLRU forward parity (8-lane stereo == interleaved 4-lane == lane-0 tile); <= 1.5 ULP/step FMA vs non-FMA CPU/WGSL parity |
+| **Modal & Transport (`modal_and_transport`)** | `KautzQuadState`, `ComplexModalScanElem`, `PhasorQ32Bank4`, orthogonal pure-wet 4-lane `Op-T` + continuous `freeze_mix` + WGSL-safe triangle fold (`((p as i32) >> 31) as u32`) + unified `sigma_sat` `coercive_loop_limit_vec4`, stereo 6-pair Elliptic `HilbertH1StereoKernel` (248 B stereo kernel in `SonaLiteHotPrefix`), mono `HilbertH1Kernel`, `T1DcBlockerStereo` (24 B), and 2-stage `rsqrt_pos_nr3` `T1SubHarmonicKernel` (28 B) | Shared CPU and GPU physics evaluation (<= 1e-4 * max(1.0, peak) on 256-wide linear scans) |
 | **Ozaki Integer Slices (`ozaki_i32`)** | `pow2_ceil_fp32`, `round_ties_even_f32`, `slice_f32_mantissa_i8x3`, `accum_ozaki_chunk_i32`, and host `reconstruct_ozaki_dot_f64` | Exact 0-ULP 32-bit `i32` Ozaki contraction parity across WebGPU drivers (REQ-4.2) |
 
 Under the Shared `#![no_std]` Kernels and Checked-In AOT WGSL pipeline, `tools/sona-shaders/` compiles `dnam-kernels` offline via `cargo-gpu` targeting `spirv-unknown-naga-wgsl` and checks in `naga`-validated `.wgsl` compute artifacts for `dnam-train`.
@@ -136,9 +136,9 @@ All parsing and serialization execute exclusively via safe `zerocopy` operations
 
 | Container / Protocol Domain | Canonical `zerocopy` Wire Structs | Normative Layout Specification |
 | :--- | :--- | :--- |
-| **Layer 0 `.dnam-bin` (`dnam-vm`)** | `DnamBinHeaderWire` (64 B `[0..64)` `"DNBN"`, `Unaligned`, `max_present_tier`, `flags`, `num_controls`, `tsyn_count`, `reference_sample_rate_hz`, `prefix_crc32c`, `arena0_offset`, `tier_end_offsets[4]`, `tier_arena_crc32c[4]`), `DnamBinRuntimeMetaWire` (64 B `[64..128)` `"DBRM"`, `Unaligned`, `shared_controls_{offset,len}`, `tsyn_{offset,len}`, `cext_{offset,len}`, `ext_ring_{pow2_frames,lines,format}`, `content_hash_prefix: [u8; 8]`, `cp1_overflow_bytes`), `TempoSyncEntryWire` (40 B, `Unaligned`, `PeriodMs`/`FrequencyHz` + Lobatto anchors + switch cond) | [dnam_binary_format.md §1](../containers/dnam_binary_format.md#1-hybrid-binary-container-wire-framing---50-ns-zero-json-hardware-fast-path) |
+| **Layer 0 `.dnam-bin` (`dnam-vm`)** | `DnamBinHeaderWire` (64 B `[0..64)` `"DNBN"`, `Unaligned`, `max_present_tier`, `flags`, `num_controls`, `tsyn_count`, `reference_sample_rate_hz`, `prefix_crc32c`, `arena0_offset`, `tier_end_offsets[4]`, `tier_arena_crc32c[4]`), `DnamBinRuntimeMetaWire` (64 B `[64..128)` `"DBRM"`, `Unaligned`, `shared_controls_{offset,len}`, `tsyn_{offset,len}`, `cext_{offset,len}`, `ext_ring_{pow2_frames,lines,format}`, `content_hash_prefix: [u8; 8]`, `cp1_overflow_bytes`, `ro_pole_48k` at bytes 44..48), `TempoSyncEntryWire` (40 B, `Unaligned`, `PeriodMs`/`FrequencyHz` + Lobatto anchors + switch cond) | [dnam_binary_format.md §1](../containers/dnam_binary_format.md#1-hybrid-binary-container-wire-framing---50-ns-zero-json-hardware-fast-path) |
 | **Layer 1 `.dnam` & Descriptors** | `DnamPreambleWire`, `DnamDirectoryWire` (`dbin_offset`, `dbin_prefix_bytes`, `shared_binary_length == 0` when `dbin_prefix_bytes > 0`), `Dmu1HeaderWire`, `Dme1HeaderWire`, `DmueFooterWire`, `DcrcAuthRecordWire` (`[32..36)` `crc_dbin_prefix`), `ControlClampDescriptorWire`, `ConditionalClampRuleWire` | [dnam_binary_format.md §1](../containers/dnam_binary_format.md#1-hybrid-binary-container-wire-framing---50-ns-zero-json-hardware-fast-path) |
-| **SONA Nested Arenas (0..3)** | `SonaCellDescWire`, `CrossbarWire` (`OpNPreBaseWire` 12 B at `[180..192)`: `{ gamma_bc, zoh_hold_depth = 1.0 - rho_zoh, beta_q }`), `Arena0LiteWire`..`Arena3UltraDeltaWire`, `CabinetFir16Wire`..`CabinetFir48Wire`, `KautzSoaBlockWire`, `TankQuadWire` (128 B, `align(1)`, `Unaligned`, `delay_samples[4]`, `ramp_spans_samples[4]`), `VarProReadoutLiteWire`..`VarProReadoutUltraWire`, `Arena0ControlBusWire`, `Arena3ControlBusWire` | [dnam_binary_format.md §2](../containers/dnam_binary_format.md#2-tier-prefix-hardware-loading) |
+| **SONA Nested Arenas (0..3)** | `SonaCellDescWire`, `CrossbarWire` (256 B with `SensoryQuad`, `crossbar_op_gains_fp16` at `[120..124)`, and `OpNPreBaseWire` 12 B at `[180..192)`), `CoreQuadWire` (192 B), `Arena0LiteWire`..`Arena3UltraDeltaWire`, `ConvolverFir16Wire`..`ConvolverFir48Wire`, `KautzSoaBlockWire`, `TransportQuadWire` (128 B, `align(1)`, `Unaligned`, `delay_samples[4]`, `ramp_spans_samples[4]`, `reserved_52_56`, `freeze_mix_fp16`, `sigma_knee_fp16 <= 0x3BE0`, `reserved_120_122`), `LinearReadoutLiteWire`..`LinearReadoutUltraWire`, `Arena0ControlBusWire` (`[16..32)` `{ lfo_skew_fp16, tank_dry_mix_fp16, reserved_ctrl_fp16, ou_to_z_stage_fp16 }`), `Arena3ControlBusWire` (`ou_to_z_stage_ultra_fp16[4]` at `[160..164]`) | [dnam_binary_format.md §2](../containers/dnam_binary_format.md#2-tier-prefix-hardware-loading) |
 | **`.dnam-seal` (`DNSL`) DRM** | `DnslPreambleWire`, `DnslDirectoryWire`, `DnplPreambleWire`, `InnerDirectoryWire`, `Dsa1ManifestHeaderWire`, `HpkeSlotWire`, `RecordDirEntryWire` | [provenance_and_enclave_drm.md §3](../security/provenance_and_enclave_drm.md#3-pillar-2-hardware-enclave--oem-drm-oemdevicecertificate-attestation--dnam-seal-dnsl-wrapper) |
 | **Layer 2 `.dnam-proj`, `DNWB` & WAV** | `DnamProjPreambleWire`, `ProjChunkDirEntryWire`, `CalbChunkWire`, `InpcCapsuleHeaderWire`, `StmcCapsuleHeaderWire`, `StmcTrajectoryWindowWire`, `ProjAuthRecordWire`, `DnwbHeader64BWire`, and WAV `RIFF`/`fmt `/`data` headers | [project_container_format.md §1–§3](../containers/project_container_format.md#1-front-loaded-cloud-ready-wire-framing--chunk-directory) |
 
@@ -160,7 +160,7 @@ Level 1 in `dnam-vm` defines 32-bit `SimdVec4`, `MathBackend`, and `Crc32cBacken
 
 Sibling `dnam-train` owns the offline 64-bit training traits (`TrainerMathBackend` and `Wide192Accum`), isolated out of runtime crates.
 
-Level 2 domain traits extend those primitives without upward dependencies via `CabinetBackend` and `GraphBackend` under `dnam-vm::graph`, plus `EngineBackend` in `dnam-engine`.
+Level 2 domain traits extend those primitives without upward dependencies via `ConvolverBackend` and `GraphBackend` under `dnam-vm::graph`, plus `EngineBackend` in `dnam-engine`.
 
 All eight ISA implementations compile into one single library per target architecture with lock-free cached runtime dispatch, gating `aarch64` `mrs` probing under `target_os = "linux"`, using `cpuid` plus `XGETBV` on x86_64, and falling back to compile-time `target_feature` on bare-metal `!std` targets.
 
@@ -176,31 +176,32 @@ To keep `SonaVm` working sets strictly inside the 64 KiB L1D limit across 14×/8
 
 | `SonaVm` Active-Hot Struct | Verified Footprint & Alignment | Contained Hot State & Causal Micro-Chunk Invariant |
 | :--- | :---: | :--- |
-| `SonaLiteHotPrefix` | 4,544 B (71 CL <= 4,608 B) | 14 × 4,544 = 63,616 B <= 65,536 B; stereo `HilbertH1StereoKernel` (248 B), `T1DcBlockerStereo` (24 B), `T1SubHarmonicKernel` (28 B), `OpNPreHotState` (24 B, `align(4)`), `ro_gains_fp16` (16 B), `carrier_basis_w_fp16` (24 B), lag-ordered FIR history (32 taps/ch, 256 B), `quad0` |
+| `SonaLiteHotPrefix` | 4,544 B (71 CL <= 4,608 B) | 14 × 4,544 = 63,616 B <= 65,536 B; `hp_lp_pole` + `hp_lp_state` (12 B ahead of `SensoryQuadHotState` 48 B `align(16)` = 0 alignment pad), `HilbertH1StereoKernel` (248 B), `T1DcBlockerStereo` (24 B), 2-stage `T1SubHarmonicKernel` (28 B), `OpNPreHotState` (28 B, `align(4)`), `CoreQuadHot`s, `ro_gains_fp16` (16 B), `carrier_basis_w_fp16` (24 B), `tank_dry_mix_fp16` (2 B), lag-ordered FIR history (32 taps/ch, 256 B), `quad0` (216 B) |
 | `SonaOs2xHot` | 256 B (4 CL, `align(64)`) | `SonaOversamplerParams` (32 B) + `SonaStereoOversampler2x` (144 B) + `op_p_prev_iq_lr` (16 B) + `op_p_prev_feat` (16 B) + 48 B pad for linear midpoint 2× interpolation |
-| `SonaFullHotDelta` | 2,752 B (cum 7,552 B <= 7,936 B) | Incremental lag-ordered FIR history taps 32..48 (128 B) + Full core/tiles/Kautz + `quad1` (224 B) |
-| `SonaProHotDelta` | 3,648 B (cum 11,200 B <= 15,872 B) | Incremental lag-ordered FIR history taps 48..96 (384 B) + Pro core/tiles/Kautz + `quad2` (224 B) |
-| `SonaUltraHotDelta` | 3,456 B (cum 14,656 B <= 28,672 B) | Incremental lag-ordered FIR history taps 96..128 (256 B) + Ultra core/tiles/Kautz + `quad3` (224 B) |
-| `TankQuadHotCompact` | 224 B (`#[repr(C, align(16))]`) | 64 B DF-I/damp/wet DC states + 32 B `delay_samples`/`ramp_spans_samples` + 56 B scalars incl. Family 4 `vca_env`/`vca_pole` + 72 B `we_hold_off`/Q16/`fp16`/non-colliding `flags: u8` (bit 0 = `QUAD_FLAG_WE_HOLD_ACTIVE`, bit 1 = `QUAD_FLAG_HAS_EXT`, bit 2 = `QUAD_FLAG_HOST_WRITE_LOCK`, bit 3 = `QUAD_FLAG_SCHROEDER_ENABLE`) |
+| `SonaFullHotDelta` | 2,752 B (cum 7,552 B <= 7,936 B) | Incremental lag-ordered FIR history taps 32..48 (128 B) + Full `CoreQuadHot`/tiles/`ModalConvolver`/Kautz + `quad1` (216 B) |
+| `SonaProHotDelta` | 3,584 B (cum 11,136 B <= 15,872 B) | Incremental lag-ordered FIR history taps 48..96 (384 B) + Pro `CoreQuadHot`/tiles/`ModalConvolver`/Kautz + `quad2` (216 B) |
+| `SonaUltraHotDelta` | 3,456 B (cum 14,592 B <= 28,672 B) | Incremental lag-ordered FIR history taps 96..128 (256 B) + Ultra `CoreQuadHot`/tiles/`ModalConvolver`/Kautz + `quad3` (216 B) |
+| `CoreQuadExtHot` & `CoreQuadReadoutHot` | 40 B/quad (`cold`) / 96 B/quad (`readout`) | `CoreQuadExtHot` holds Selective-Duhem + stereo-link + `GLU` + M/S input weights hoisted into `HoistedCoreChunk` via `from_slab` alongside `CoreQuadReadoutHot` |
+| `TransportQuadHotCompact` | 216 B (`#[repr(C, align(8))]`) | 64 B DF-I/damp/wet DC states + 32 B `delay_samples`/`ramp_spans_samples` + 48 B scalars + 72 B `we_hold_off`/Q16/`fp16` (`freeze_mix_fp16`, `sigma_sat_fp16 <= 0x3BE0`, `inv_sigma_23_fp16`)/`flags: u8` (`bit 0 = 0` reserved, `bit 1 = QUAD_FLAG_HAS_EXT`, `bit 2 = QUAD_FLAG_HOST_WRITE_LOCK`, `bit 3 = QUAD_FLAG_SCHROEDER_ENABLE`) |
 
 In `dnam-vm`, `ControlBus` expands `stage_targets` (plus `SonaColdTail.last_stage_targets`, `current_stage_params`, and `stage_ramp_deltas`) to `[f32; 32]`.
 
-Half-open slice `stage_targets[0..16]` (slots 0..=15) retains base stage targets, while `stage_targets[16..32]` (slots 16..=31) maps `"CEXT"` (defaulting to +0.0 when absent):
+Half-open slice `stage_targets[0..16]` (slots 0..=15) retains base stage targets, while `stage_targets[16..32]` (slots 16..=31) maps `"CEXT"` (defaulting to +0.0 when absent), all micro-ramped uniformly across frames:
 
 | `ControlBus` Slot | Target Field | Signal & Control Meaning |
 | :---: | :--- | :--- |
-| 0..=15 | Base stage targets (`svf_g_oct`..`crossbar_wet_mod`) | Core `TPT-SVF`, `PolyADAA1`, `ParaLRU`, Kautz, Tank, and crossbar wet blend |
-| 16 | `op_t_we_drive` | Direct write-enable drive (bypasses micro-ramping; snaps immediately) |
-| 17..=21 | `op_t_delay_scale_oct`, `op_t_ramp_rate_hz_delta`, `op_t_lfo_rate_hz_delta`, `op_t_lfo_depth_scale`, `op_t_damp_pole_delta` | Spatial Tank scale, crossfade ramp speed, LFO speed/depth, and damping pole |
-| 22..=25 | `op_t_dry_mix_mod`, `op_t_input_gain_mod`, `op_t_window_depth_delta`, `op_t_allpass_g_delta` | Tank wet/dry mix, input drive, pitch window depth, and Schroeder allpass feedback |
-| 26..=28 | `op_n_pre_{gamma_bc,zoh_hold,beta_q}_delta` | Pre-core bitcrusher wet blend, sample-and-hold depth, and log2 quantizer bit-depth |
-| 29..=31 | `op_p_phasor_rate_oct`, `router_gate_thresh_delta`, `reserved` | Crossbar quadrature carrier octave offset, gate threshold delta, and reserved (+0.0) |
+| 0..=15 | Base stage targets (`svf_g_oct`..`crossbar_wet_mod`) | `CoreQuad` `TPT-SVF`, `PolyADAA1`, `ParaLRU`, `ModalConvolver` Kautz, `Transport`, and crossbar wet blend |
+| 16 | `op_t_freeze_mix_delta` | Uniformly micro-ramped passive recirculation (`mu_freeze` in `[0.0, 1.0]`, pinned 1.0 by `QUAD_FLAG_HOST_WRITE_LOCK`) |
+| 17..=21 | `op_t_delay_scale_oct`, `op_t_ramp_rate_hz_delta`, `op_t_lfo_rate_hz_delta`, `op_t_lfo_depth_scale`, `op_t_damp_pole_delta` | `TransportQuad` delay scale, crossfade ramp speed, LFO speed/depth, and damping pole |
+| 22..=25 | `op_t_dry_mix_mod`, `op_t_input_gain_mod`, `op_t_window_depth_delta`, `op_t_allpass_g_delta` | Stage-level `tank_dry_mix` blend (`[-2.0, 2.0]`), quad input drive, pitch window depth, and Schroeder allpass feedback |
+| 26..=28 | `op_n_pre_{gamma_bc,zoh_hold,beta_q}_delta` | Pre-core bitcrusher wet blend, raised-cosine hold depth, and log2 Fourier staircase bit-depth |
+| 29..=31 | `op_p_phasor_rate_oct`, `sense_vca_gain_delta`, `reserved` | Crossbar quadrature carrier octave offset, `SensoryQuad` VCA gain delta (`[-1.0, +1.0]`), and reserved (+0.0) |
 
 `ControlBus` updates execute on every `K_ctrl` boundary whenever controls, tempo entries, internal modulators, dirty state, or analog drift are active.
 
-Slot 16 updates only bit 0 (`QUAD_FLAG_WE_HOLD_ACTIVE`) via Schmitt `(0.45, 0.55)` over `(1.0 + t[16]).clamp(0.0, 1.0)`, while `SonaVm::set_quad_write_enable` / `SonaHotSlab::set_op_t_write_enable` updates only bit 2 (`QUAD_FLAG_HOST_WRITE_LOCK`), locking delay RAM and Schroeder writes at 0-ULP whenever either bit is set without a 3 kHz overwrite race.
+Slot 16 micro-ramps uniformly into `mu_freeze = clamp(base_freeze_mix + t[16], 0.0, 1.0)`, while `SonaVm::set_quad_write_enable` / `SonaHotSlab::set_op_t_write_enable` updates only bit 2 (`QUAD_FLAG_HOST_WRITE_LOCK`), forcing `mu_freeze = 1.0` and locking delay RAM and Schroeder writes at 0-ULP without a 3 kHz overwrite race.
 
-Hot sub-block, frame-stepping, and control-tick entrypoints carry explicit `#[inline(never)]` markers to keep instruction caches compact (`SonaHotSlab::process_tick16_const`, `hoist_groups_and_readouts`, `step_frame_sona`, `step_frame_4x_sona`, `step_frame_4port_sona`, `step_control_tick_3khz`).
+Hot sub-block, frame-stepping, and control-tick entrypoints carry explicit `#[inline(never)]` markers inside dnam-vm to keep instruction caches compact (`SonaHotSlab::process_tick16_const`, `hoist_core_and_readouts`, `step_frame_sona`, `step_frame_4x_sona`, `step_control_tick_3khz`), while dnam-engine owns multi-port HostShellPatchbay 4CM/WDW routing and post-VM `ms_width`.
 
 Meanwhile `dnam-engine` isolates JSON header parsing (`DnamJsonHeader::from_json_slice`, `DnamJsonHeader::to_json_vec`) out of `dnam-vm`.
 
@@ -230,7 +231,7 @@ Source-level guardrails additionally forbid float `rem_euclid` and direct float 
 
 Host concurrency primitives under `dnam_engine::host` wrap `SonaVm` over `extract_dnam_bin(bytes)` to decouple real-time audio rendering from UI, MIDI, DAW plugin, and TypeScript worker threads in `#![forbid(unsafe_code)]` Rust (REQ-6.3, [ADR-0015](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md)).
 
-`dnam_engine::ffi` exposes a null-checked C-ABI surface over `DnamEngineHandle` and `DnamTelemetrySnapshot`. Hardware sustain and infinite-hold controls bind strictly through calibrated `ControlBus` targets (`op_t_we_drive` and crossbar wet/dry mix) without dedicated host freeze functions or special freeze enum variants.
+`dnam_engine::ffi` exposes a null-checked C-ABI surface over `DnamEngineHandle` and `DnamTelemetrySnapshot`. Hardware sustain and infinite-hold controls bind strictly through calibrated `ControlBus` targets (`op_t_freeze_mix_delta` and crossbar wet/dry mix) without dedicated host freeze functions or special freeze enum variants.
 
 | Host / C-ABI Component | Concrete Rust Contract & Real-Time Invariant |
 | :--- | :--- |

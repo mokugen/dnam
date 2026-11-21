@@ -32,23 +32,23 @@ Complementing Cryptographic Provenance and Hardware Enclave DRM ([provenance and
 
 `r[sec.watermark.reciprocal-gauge]`
 
-Mechanism A1 applies a buyer-specific reciprocal scaling gauge across all active shared Cabinet Bank Kautz blocks (`[2, 1, 3, 2]` Kautz SoA blocks across Lite, Full, Pro, and Ultra, yielding cumulative 8, 12, 24, and 32 pole pairs at byte ranges 1,664..1,920, 6,656..6,784, 12,928..13,312, and 22,784..23,040). Each pair applies a buyer multiplier $\eta_m = \kappa_m \in [0.5, 2.0]$ so the input gain and stereo residues cancel identically in exact arithmetic:
+Mechanism A1 applies a buyer-specific reciprocal scaling gauge across all active shared `ModalConvolver` Kautz blocks (`[2, 1, 3, 2]` Kautz SoA blocks across Lite, Full, Pro, and Ultra, yielding cumulative 8, 12, 24, and 32 pole pairs at byte ranges 1,664..1,920, 6,656..6,784, 12,928..13,312, and 22,784..23,040). Each pair applies a buyer multiplier $\eta_m = \kappa_m \in [0.5, 2.0]$ so the input gain and stereo residues cancel identically in exact arithmetic:
 
 $$b_{\gamma,m}^{(\text{buyer})} = \kappa_m b_{\gamma,m}^{(\text{master})}, \qquad c_{m,a}^{(\text{buyer})} = \frac{c_{m,a}^{(\text{master})}}{\kappa_m}, \qquad a \in \lbrace (\text{re},L), (\text{im},L), (\text{re},R), (\text{im},R) \rbrace$$
 
-Encoders set `SONA_META_CABINET_PREFIX_OVERRIDES` whenever any packed tier above Arena 0 differs from the previous tier on its shared Cabinet prefix (`fir`, `kautz_b_gamma`, or `kautz_c`).
+Encoders set `SONA_META_CONVOLVER_PREFIX_OVERRIDES` whenever any packed tier above Arena 0 differs from the previous tier on its shared `ModalConvolver` prefix (`fir`, `kautz_b_gamma`, or `kautz_c`).
 
-When `SONA_META_CABINET_PREFIX_OVERRIDES` is zero, decoders retain inherited `f32` Cabinet Early FIR and Kautz SoA weights within 1e-5 gauge invariance.
+When `SONA_META_CONVOLVER_PREFIX_OVERRIDES` is zero, decoders retain inherited `f32` `ModalConvolver` Early FIR and Kautz SoA weights within 1e-5 gauge invariance.
 
-When set to 1, decoders apply inverse $1/\kappa_m$ to Cabinet Prefix Override weights and consistent $\kappa_m$ or $1/\kappa_m$ scaling to VarPro Readout Kautz override slots within $\mathcal{O}(2^{-11})$ `fp16` equivalence:
+When set to 1, decoders apply inverse $1/\kappa_m$ to Convolver Prefix Override weights and consistent $\kappa_m$ or $1/\kappa_m$ scaling to `LinearReadout` Kautz override slots within $\mathcal{O}(2^{-11})$ `fp16` equivalence:
 
-| Retained Tier | Cabinet Prefix Override Range (`1 / kappa_m`) | VarPro Readout `w_ro_and_mods_fp16` Kautz Override Slots |
+| Retained Tier | Convolver Prefix Override Range (`1 / kappa_m`) | `LinearReadout` `w_ro_and_mods_fp16` Kautz Override Slots |
 | :--- | :--- | :--- |
 | Full (m in 0..4 / 0..8) | 6,912..7,104 | `[328..336]` (8 `b_gamma` × kappa_m), `[336..352]` (16 interleaved `kautz_c[4..8]` / kappa_m) |
 | Pro (m in 0..8 / 0..12) | 13,568..13,952 | `[424..436]` (12 `b_gamma` × kappa_m), `[436..452]` (16 interleaved `kautz_c[8..12]` / kappa_m) |
 | Ultra (m in 0..12 / 0..24) | 23,296..23,872 | `[584..608]` (24 `b_gamma` × kappa_m), `[608..656]` (48 interleaved `kautz_c[12..24]` / kappa_m) |
 
-Mechanism A2 derives a prefix-independent 40-lane sign vector $s \in \lbrace -1, +1 \rbrace^{40}$ across cumulative Matryoshka lane ranges `[0..16, 16..24, 24..32, 32..40]` (10 groups × 4 lanes) using SHA-256 over the buyer seed and owning tier index:
+Mechanism A2 derives a prefix-independent 40-lane sign vector $s \in \lbrace -1, +1 \rbrace^{40}$ across cumulative Matryoshka lane ranges `[0..16, 16..24, 24..32, 32..40]` (10 `CoreQuad` blocks × 4 lanes) using SHA-256 over the buyer seed and owning tier index:
 
 ```text
 For each tier t in 0..4 owning range [start_t .. end_t):
@@ -57,14 +57,14 @@ For each tier t in 0..4 owning range [start_t .. end_t):
     s[start_t + bit_idx] = +1.0 if ((digest_t[bit_idx >> 3] >> (bit_idx & 7)) & 1) == 1 else -1.0
 ```
 
-Encoders propagate signs via IEEE-754 sign-bit XOR (`^ 0x8000` on nonzero `fp16` magnitudes and negation on nonzero `f32`, leaving +0.0 untouched) across four wire regions. Because odd-symmetric `PolyADAA1` satisfies $g(-x) = -g(x)$ with $h_{\text{eq}} = +0.0$, `adaa_even` satisfies $g_e(-x) = +g_e(x)$, and 1D `ParaLRU` commutes with polarity conjugation when `rect_sign` flips, forward audio parity is algebraically 0.000000 ULP across Arena 0..3 and commutes losslessly with container tier stripping:
+Encoders propagate signs via IEEE-754 sign-bit XOR (^ 0x8000 on nonzero fp16 magnitudes and negation on nonzero f32, leaving +0.0 untouched) across four wire regions. Because odd-symmetric PolyADAA1 satisfies $g(-x) = -g(x)$ with $h_{\text{eq}} = +0.0$, `adaa_even` satisfies $g_e(-x) = +g_e(x)$, cyclic `glu_mix` cancels `(s[l] * s[(l+1)%4])`, and Selective-Duhem 1D ParaLRU commutes with polarity conjugation when `rect_sign` flips, forward audio parity stays algebraically 0.000000 ULP across Arena 0..3 and commutes losslessly with container tier stripping:
 
-| SONA Wire Target | Per-Arena Group / Tile Span | Sign-Flip Transformation |
+| SONA Wire Target | Per-Arena Quad / Tile Span | Sign-Flip Transformation |
 | :--- | :--- | :--- |
-| SONA Group Block | 4 / 2 / 2 / 2 groups in Arena 0..3 | Multiply `in_x_weight[l]`, `lru_bias_drive[l]`, and `rect_sign_fp16[l]` by `s[4*g + l]` |
+| `CoreQuad` Block | 4 / 2 / 2 / 2 quads in Arena 0..3 | Multiply `in_mid_weight_fp16[l]`, `in_side_weight_fp16[l]`, `lru_bias_drive_fp16[l]`, and `rect_sign_fp16[l]` by `s[4*g + l]`, and multiply `glu_mix_fp16[l]` by `s[4*g + l] * s[4*g + ((l + 1) & 3)]` |
 | Inter-Block Tile Pair | 3 / 10 / 10 / 12 tiles in Arena 0..3 | Multiply `w_odd_4x4[col][row]` by `s_dst * s_src`; multiply `w_even_4x4_fp16` and `w_lru_4x4_fp16` by `s_dst` |
-| Crossbar Coupling Weights | Arena 0 (groups 0..4, lanes 0..16) and Arena 1..3 (groups 0..6 / 0..8 / 0..10, lanes 0..24 / 0..32 / 0..40) | Multiply Lite VarPro Readout `stage_latent_mods_fp16[80..96]` (`op_p_to_group`), `w_ro_fp16[192..208]` (`phasor_to_group`), and SONA Crossbar Coupling matrices by `s[4*g + l]` |
-| VarPro Odd Linear Readout | 16 / 24 / 32 / 40 lanes in Arena 0..3 | Multiply terms `[0, 1, 6, 7]` of each 12-term lane row in Lite `w_ro_fp16[0..192]` and Full/Pro/Ultra `w_ro_and_mods_fp16` by `s[l]` |
+| Crossbar Coupling Weights | Arena 0 (quads 0..4, lanes 0..16) and Arena 1..3 (quads 0..6 / 0..8 / 0..10, lanes 0..24 / 0..32 / 0..40) | Multiply Lite `LinearReadout` `stage_latent_mods_fp16[80..96]` (`op_p_to_core`), `w_ro_fp16[192..208]` (`phasor_to_core`), and SONA Crossbar Coupling matrices by `s[4*g + l]` |
+| `LinearReadout` Odd Linear Readout | 16 / 24 / 32 / 40 lanes in Arena 0..3 | Multiply terms `[0, 1, 6, 7]` of each 12-term lane row in Lite `w_ro_fp16[0..192]` and Full/Pro/Ultra `w_ro_and_mods_fp16` by `s[l]` |
 
 #### Control Plane Isometric `SO(4)` Rotation & Layer 2 Spectral Pole-Angle Phase Coding
 
@@ -81,13 +81,13 @@ The control-plane `SO(4)` isometric gauge post-multiplies by $\mathbf{Q}_{\text{
 
 The rotation excludes `v_base` to preserve FM $0.5 \cdot ((\sum v_p z_p)^2 - \sum v_p^2 z_p^2)$ invariance. It also excludes `z_stage`, `u_int_base[r][4..8]`, `u_int_ultra` Block 0 elements 4..8 and Blocks 1..2, and `cp1_ultra`.
 
-Sensitivity tables dot strictly against unrotated `z_stage[0..D_s]` (`ctrl_basis_4` plus `z_stage_ultra`), never `z_head[0..4]`. This applies to Lite VarPro Readout `stage_latent_mods_fp16[0..80]`, Arena 3 Control Plane `stage_latent_ctrl_ultra_fp16[0..256]`, and Ultra SONA Core Delta `stage_latent_core_mods_fp16[0..1,024]`, achieving exact 0-ULP DSP invariance without altering `fp16` readout weights or interfering with Tardos scoring.
+Sensitivity tables dot strictly against unrotated `z_stage[0..D_s]` (`ctrl_basis_4` plus `z_stage_ultra`), never z_head[0..4]. This applies to Lite LinearReadout `stage_latent_mods_fp16[0..80]`, Arena 3 Control Plane `stage_latent_ctrl_ultra_fp16[0..160]` (where `[160..164]` holds `ou_to_z_stage_ultra_fp16`), and Ultra CoreQuad Delta `stage_latent_core_mods_fp16[0..1,024]`, achieving exact 0-ULP DSP invariance without altering fp16 readout weights or interfering with Tardos scoring.
 
 Layer 2 Kautz pole-angle phase coding perturbs pole angles within quantized 0.01 rad cells using a `[0.2, 0.8]` guard-band snap so quantized structural hashes remain 100% invariant:
 
 | Step | Formula / Wire Mapping | Guard-Band & Extraction Invariant |
 | :--- | :--- | :--- |
-| **1. Carrier Bit Derivation** | `digest = SHA-256("DNAM-WM-PHASE-V1:" \|\| buyer_seed[32] \|\| u8(tier))` | Across `tier in 0..max_tiers`, `blk in 0..CABINET_KAUTZ_BLOCKS_PER_TIER[tier]` (`[2, 1, 3, 2]`), and `lane in 0..4`: `chip_idx = blk * 4 + lane`, bit `(digest[(chip_idx / 8) & 31] >> (chip_idx & 7)) & 1` maps 1 to +1.0 and 0 to -1.0. |
+| **1. Carrier Bit Derivation** | `digest = SHA-256("DNAM-WM-PHASE-V1:" \|\| buyer_seed[32] \|\| u8(tier))` | Across `tier in 0..max_tiers`, `blk in 0..CONVOLVER_KAUTZ_BLOCKS_PER_TIER[tier]` (`[2, 1, 3, 2]`), and `lane in 0..4`: `chip_idx = blk * 4 + lane`, bit `(digest[(chip_idx / 8) & 31] >> (chip_idx & 7)) & 1` maps 1 to +1.0 and 0 to -1.0. |
 | **2. Guard-Band Snap (`[0.2, 0.8]`)** | `cell = theta / 0.01`, `base = floor(cell)`, `frac = cell - base` | Before perturbing `theta` (at `Kautz block offset(tier, blk) + (8 + lane) * 4` in `[1e-3, pi - 1e-3]`), snap `frac < 0.2` up to `(base + 0.2) * 0.01` and `frac > 0.8` down to `(base + 0.8) * 0.01`, clamped inside `[1e-3, pi - 1e-3]`. |
 | **3. Phase Perturbation** | `theta' = carrier_m + sign_bit * step_rad` (`0 <= step_rad <= 8.726646e-4 rad`, <= 0.05 deg) | Because `step_rad / 0.01 <= 0.0873 < 0.11`, marked angles stay in `[0.11, 0.89]` within the same 0.01 rad cell so `floor_1e2` stays 100% invariant with 0.00 dB pole-radius change. |
 | **4. Forensic Extraction** | `carrier_m = guard-band-snapped theta_m`, `diff = theta_s - carrier_m` | During arena and black-box phase-coding extraction, skip unmodified masters where `\|theta_s - theta_m\| <= 1e-6` (`y = 0`, keeping `score == 0.0`); else emit `y = sign(diff)` if `\|diff\| > 1e-6`, otherwise 0. |
@@ -96,7 +96,7 @@ Layer 2 Kautz pole-angle phase coding perturbs pole angles within quantized 0.01
 
 `r[sec.watermark.tardos-code]`
 
-Mechanism B embeds a Two-Seed Arcsine Tardos codeword (coordinates 0..7,680) partitioned strictly by cumulative tier bounds `TARDOS_TIER_INDEX_BOUNDS = [(0, 655), (655, 1_159), (1_159, 3_051), (3_051, 5_875)]`. The partition assigns 64 Role A prefix coordinates, 5,811 active linear and reserve Role B coordinates, and 1,805 unassigned tail coordinates (5,875..7,680 fixed at 0.0), deriving per-tier shared and buyer seeds via HMAC-SHA256 for each owning tier (`owning_tier = tier` encoded as a single `u8` byte).
+Mechanism B embeds a Two-Seed Arcsine Tardos codeword (coordinates 0..7,680) partitioned strictly by cumulative tier bounds `TARDOS_TIER_INDEX_BOUNDS = [(0, 655), (655, 1_159), (1_159, 3_051), (3_051, 5_871)]`. The partition assigns 64 Role A prefix coordinates, 5,807 active linear and reserve Role B coordinates, and 1,809 unassigned tail coordinates (5,871..7,680 fixed at 0.0), deriving per-tier shared and buyer seeds via HMAC-SHA256 for each owning tier (`owning_tier = tier` encoded as a single `u8` byte).
 
 For threshold calibration, let $c_{\text{eff}} = \max(c_{\max}, 1)$, cutoff $\tau = \mathrm{clamp}(1 / (300 c_{\text{eff}}^2), 10^{-6}, 0.25)$, $\tau' = \arcsin(\sqrt{\tau})$ evaluated via the 4-term small-angle series `x * (1 + x^2*(1/6 + x^2*(3/40 + 5/112 * x^2)))`, and $\text{span} = \pi/2 - 2\tau'$.
 
@@ -111,35 +111,35 @@ The exact disjoint 0..7,680 coordinate partition across Arena 0..3 is specified 
 | Tier / Byte Arena | Coordinate Range (0..7680) | Element Type | Target Arena Field & Byte Offsets (Arena 0..3) | Security Role & Strict Exclusions |
 | :--- | :---: | :---: | :--- | :--- |
 | Tier 0 (Arena 0) | 0..16 (16) | `f32le` | Arena 0 `w_ctrl[0][0..16]` (3,456..3,520) | Role A (`chip = 0.0`, `accusation_weight = 0.0`) |
-| Tier 0 (Arena 0) | 16..80 (64) | `f32le` | `fir_lite` (1,408..1,664) | Role B Cabinet Bank FIR taps |
-| Tier 0 (Arena 0) | 80..112 (32) | `f32le` | `kautz_lite[0..2].c_{re,im}_{l,r}` (1,728..1,792 and 1,856..1,920) | Role B Cabinet Kautz linear readouts (excludes `r_low`, `dr`, `theta`, `b_gamma`) |
-| Tier 0 (Arena 0) | 112..120 (8) | `f32le` | Lite Readout `pre_cab_*` / `direct_s2_*` gains (2,048..2,080) | Role B linear VarPro direct gains |
+| Tier 0 (Arena 0) | 16..80 (64) | `f32le` | `conv_fir_lite` (1,408..1,664) | Role B `ModalConvolver` FIR taps |
+| Tier 0 (Arena 0) | 80..112 (32) | `f32le` | `conv_kautz_lite[0..2].c_{re,im}_{l,r}` (1,728..1,792 and 1,856..1,920) | Role B `ModalConvolver` Kautz linear readouts (excludes `r_low`, `dr`, `theta`, `b_gamma`) |
+| Tier 0 (Arena 0) | 112..120 (8) | `f32le` | Lite `LinearReadout` `pre_conv_*` / `direct_s2_*` gains (2,048..2,080) | Role B linear direct gains |
 | Tier 0 (Arena 0) | 120..360 (240) | `f32le` | Arena 0 Control Plane `w_ctrl[1..16]` (3,520..4,480) | Role B linear control-plane `W_ctrl`; embedded unrotated before applying `Q_buyer` on `z_head[0..4]` columns 0..4, and rotated back by `Q_buyer^-1` on detection |
 | Tier 0 (Arena 0) | 360..383 (23) | `f32le` | Arena 0 `rho_head_and_ctrl_tail[1..24]` (4,484..4,576) | Role B Arena 0 spare control tail; excludes `[0]` (`trust_radius_mh` mirror at 4,480..4,484) and `[24..32]` (`opt_to_lr` at 4,576..4,608) |
-| Tier 0 (Arena 0) | 383..655 (272) | `fp16` | Lite Readout `stage_latent_mods_fp16[0..80]` (2,080..2,240) + `w_ro_fp16[0..192]` (2,272..2,656) | Role B linear `fp16` `W_mod` / `W_readout` over unrotated `z_stage[0..4]`; excludes `[80..96]` `op_p_to_group` and `[192..208]` `phasor_to_group` |
-| Tier 1 (Arena 1) | 655..671 (16) | `f32le` | Full Readout `prefix_override[0..16]` (6,912..6,976) | Role A (`chip = 0.0`, `accusation_weight = 0.0`) |
-| Tier 1 (Arena 1) | 671..751 (80) | `f32le` | `fir_full` (6,528..6,656, 32), `kautz_full.c_*` (6,720..6,784, 16), `prefix_override` tail (6,976..7,104, 32) | Role B Cabinet Full linear FIR / Kautz |
-| Tier 1 (Arena 1) | 751..1,159 (408) | `fp16` | Full Readout `w_ro_and_mods_fp16[0..328]` (7,104..7,760) & `[336..416]` (7,776..7,936) | Role B linear `fp16` `W_readout` / `W_mod` & tail (excludes `[328..336]` `kautz_b_gamma[0..8]`) |
-| Tier 2 (Arena 2) | 1,159..1,175 (16) | `f32le` | Pro Readout `prefix_override[0..16]` (13,568..13,632) | Role A (`chip = 0.0`, `accusation_weight = 0.0`) |
-| Tier 2 (Arena 2) | 1,175..2,103 (928) | `f32le` | Pro 2,688 B `reserve` (9,856..12,544, 672), `tank_pro[1]` 128 B `reserve` (32), `fir_pro` (12,544..12,928, 96), `kautz_pro.c_*` (48), `prefix_override` tail (13,632..13,952, 80) | Role B Pro 2,688 B and `tank_pro[1]` 128 B reserves plus Cabinet FIR / Kautz |
-| Tier 2 (Arena 2) | 2,103..3,051 (948) | `fp16` | Pro Readout `w_ro_and_mods_fp16[0..424]` (13,952..14,800) & `[436..960]` (14,824..15,872) | Role B linear `fp16` `W_readout` / `W_mod` & tail (excludes `[424..436]` `kautz_b_gamma[0..12]`) |
+| Tier 0 (Arena 0) | 383..655 (272) | `fp16` | Lite `LinearReadout` `stage_latent_mods_fp16[0..80]` (2,080..2,240) + `w_ro_fp16[0..192]` (2,272..2,656) | Role B linear `fp16` `W_mod` / `W_readout` over unrotated `z_stage[0..4]`; excludes `[80..96]` `op_p_to_core` and `[192..208]` `phasor_to_core` |
+| Tier 1 (Arena 1) | 655..671 (16) | `f32le` | Full `LinearReadout` `prefix_override[0..16]` (6,912..6,976) | Role A (`chip = 0.0`, `accusation_weight = 0.0`) |
+| Tier 1 (Arena 1) | 671..751 (80) | `f32le` | `conv_fir_full` (6,528..6,656, 32), `conv_kautz_full.c_*` (6,720..6,784, 16), `prefix_override` tail (6,976..7,104, 32) | Role B `ModalConvolver` Full linear FIR / Kautz |
+| Tier 1 (Arena 1) | 751..1,159 (408) | `fp16` | Full `LinearReadout` `w_ro_and_mods_fp16[0..328]` (7,104..7,760) & `[336..416]` (7,776..7,936) | Role B linear `fp16` `W_readout` / `W_mod` & tail (excludes `[328..336]` `kautz_b_gamma[0..8]`) |
+| Tier 2 (Arena 2) | 1,159..1,175 (16) | `f32le` | Pro `LinearReadout` `prefix_override[0..16]` (13,568..13,632) | Role A (`chip = 0.0`, `accusation_weight = 0.0`) |
+| Tier 2 (Arena 2) | 1,175..2,103 (928) | `f32le` | Pro 2,688 B `reserve` (9,856..12,544, 672), `transport_pro[1]` 128 B `reserve` (32), `conv_fir_pro` (12,544..12,928, 96), `conv_kautz_pro.c_*` (48), `prefix_override` tail (13,632..13,952, 80) | Role B Pro 2,688 B and `transport_pro[1]` 128 B reserves plus `ModalConvolver` FIR / Kautz |
+| Tier 2 (Arena 2) | 2,103..3,051 (948) | `fp16` | Pro `LinearReadout` `w_ro_and_mods_fp16[0..424]` (13,952..14,800) & `[436..960]` (14,824..15,872) | Role B linear `fp16` `W_readout` / `W_mod` & tail (excludes `[424..436]` `kautz_b_gamma[0..12]`) |
 | Tier 3 (Arena 3) | 3,051..3,067 (16) | `f32le` | Arena 3 `w_ctrl_ultra[0..4][0..4]` (26,880..26,944) | Role A (`chip = 0.0`, `accusation_weight = 0.0`) |
-| Tier 3 (Arena 3) | 3,067..4,139 (1,072) | `f32le` | Ultra Core `reserve` (20,096..22,528, 608), `tank_ultra[1]` `reserve` (32), `fir_ultra` (64), `kautz_ultra.c_*` (32), `prefix_override` (144), `w_ctrl_ultra[4..16][0..4]` (26,944..27,136, 48), Arena 3 Control Plane `reserve` (30,144..30,720, 144) | Role B Ultra linear `f32` & spare reserves |
-| Tier 3 (Arena 3) | 4,139..5,875 (1,736) | `fp16` | Ultra Readout `w_ro_and_mods_fp16[0..584, 608..1,504]` (1,480, 23,872..26,880), `stage_latent_ctrl_ultra_fp16[0..256]` (29,632..30,144) | Role B Ultra linear `fp16` `W_readout` / `W_mod` & `stage_latent_ctrl_ultra_fp16` (excludes `b_gamma`, `stage_latent_core_mods_fp16`, Crossbar, I/O Router, and nonlinear SONA core) |
-| Unassigned Tail | 5,875..7,680 (1,805) | 0.0 | Unassigned Tail (`chip = 0.0`, `accusation_weight = 0.0`) | Strictly unperturbed (0.0 chip & 0.0 accusation weight) |
+| Tier 3 (Arena 3) | 3,067..4,139 (1,072) | `f32le` | Ultra Core `reserve` (20,096..22,528, 608), `transport_ultra[1]` `reserve` (32), `conv_fir_ultra` (64), `conv_kautz_ultra.c_*` (32), `prefix_override` (144), `w_ctrl_ultra[4..16][0..4]` (26,944..27,136, 48), Arena 3 Control Plane `reserve` (30,144..30,720, 144) | Role B Ultra linear `f32` & spare reserves |
+| Tier 3 (Arena 3) | 4,139..5,871 (1,732) | `fp16` | Ultra `LinearReadout` `w_ro_and_mods_fp16[0..584, 608..1,504]` (1,480, 23,872..26,880), `stage_latent_ctrl_ultra_fp16[0..160, 164..256]` (252, 29,632..29,952 & 29,960..30,144) | Role B Ultra linear `fp16` `W_readout` / `W_mod` & `stage_latent_ctrl_ultra_fp16` (excludes `b_gamma`, `ou_to_z_stage_ultra_fp16[4]` at `[160..164]`, `stage_latent_core_mods_fp16`, `SensoryQuad`, Crossbar, and nonlinear SONA core) |
+| Unassigned Tail | 5,871..7,680 (1,809) | 0.0 | Unassigned Tail (`chip = 0.0`, `accusation_weight = 0.0`) | Strictly unperturbed (0.0 chip & 0.0 accusation weight) |
 
 All nonlinear trajectories, crossbar weights, control basis descriptors, and recursive poles remain strictly excluded from Tardos Role B perturbation:
 
 | Excluded Subsystem | Protected Wire Fields & Byte Ranges |
 | :--- | :--- |
-| **Crossbar, `Op-N[Pre]` & I/O Router** | Crossbar Block (0..256, including `Op-N[Pre]` at 180..192), all SONA Crossbar Coupling matrices, and Lite Readout crossbar aliases (`stage_latent_mods_fp16[80..96]`, `w_ro_fp16[192..208]`) |
-| **Nonlinear SONA Core & Spatial Tank** | All SONA Group Blocks, Inter-Block Tile Pairs, Ultra SONA Core Delta `stage_latent_core_mods_fp16[0..1,024]` (18,048..20,096), and active 128 B Spatial Tank quad blocks (`TANK_DELAY_BASES[0..4]`) |
-| **Control Plane & Kautz Poles** | Control scalars, `U_int`, `CP1` (Inline `CP1` Directory with `cp1_dir_count` in 0–8 inline in `cp1_base[576 B]` or `"CP1\0"` overflow), `trust_radius_mh` (2,720..2,724), `rho_head_and_ctrl_tail[0]` (4,480..4,484), `opt_to_lr[0..4][0..2]` (4,576..4,608), and Kautz pole fields (`r_low`, `dr`, `theta`, `b_gamma`, `kautz_b_gamma`) |
-| **`.dnam-bin` Prefix (`dbin_prefix`) & Framing** | Region 4 (0 B when `dbin_prefix_bytes > 0`), Region 5 `auth_extent`, embedded `dbin_prefix` (`[dbin_offset..tier_start)`: `"DNBN"`, `"DBRM"`, `shared_controls`, `"TSYN"`, `"CEXT"` 1,280 B), and unassigned tail 5,875..7,680 |
+| **Crossbar, `Op-N[Pre]` & `SensoryQuad`** | Crossbar & `SensoryQuad` Block (0..256, including `Op-N[Pre]` at 180..192 and `sense_*` at 0..64 / 88..120 / 240..256), all SONA Crossbar Coupling matrices, and Lite `LinearReadout` crossbar aliases (`stage_latent_mods_fp16[80..96]`, `w_ro_fp16[192..208]`) |
+| **Nonlinear SONA Core & `Transport`** | All `CoreQuad` Blocks, Inter-Block Tile Pairs, Ultra Core Delta `stage_latent_core_mods_fp16[0..1,024]` (18,048..20,096), and active 128 B `TransportQuad` blocks (`TRANSPORT_DELAY_BASES[0..4]`) |
+| **Control Plane & Kautz Poles** | Control scalars (`lfo_skew_fp16`, `tank_dry_mix_fp16`, `ou_to_z_stage_fp16`, `ou_to_z_stage_ultra_fp16` at `[160..164]`), `U_int`, `CP1` (Inline `CP1` Directory with `cp1_dir_count` in 0–8 inline in `cp1_base[576 B]` or `"CP1\0"` overflow), `trust_radius_mh` (2,720..2,724), `rho_head_and_ctrl_tail[0]` (4,480..4,484), `opt_to_lr[0..4][0..2]` (4,576..4,608), and Kautz pole fields (`r_low`, `dr`, `theta`, `b_gamma`, `kautz_b_gamma`) |
+| **`.dnam-bin` Prefix (`dbin_prefix`) & Framing** | Region 4 (0 B when `dbin_prefix_bytes > 0`), Region 5 `auth_extent`, embedded `dbin_prefix` (`[dbin_offset..tier_start)`: `"DNBN"`, `"DBRM"`, `shared_controls`, `"TSYN"`, `"CEXT"` 1,280 B), and unassigned tail 5,871..7,680 |
 
-When a container embeds a Layer 0 prefix (`dbin_prefix_bytes > 0`), Region 4 (`shared_extent`) MUST equal zero bytes (0 B) while `dbin_prefix` precedes `tier_start` (Arena 0..3). All 0..5,875 Tardos Role A and Role B coordinates reside strictly inside Arena 0..3, while 5,875..7,680 stays an unperturbed guard tail.
+When a container embeds a Layer 0 prefix (`dbin_prefix_bytes > 0`), Region 4 (`shared_extent`) MUST equal zero bytes (0 B) while `dbin_prefix` precedes `tier_start` (Arena 0..3). All 0..5,871 Tardos Role A and Role B coordinates reside strictly inside Arena 0..3, while 5,871..7,680 stays an unperturbed guard tail.
 
-Tardos watermark embedding and extraction operate strictly on Role B coordinates inside Arena 0..3, leaving `"DBRM"`, `shared_controls`, `"TSYN"`, `"CEXT"`, crossbar, `Op-N[Pre]`, and unassigned slots untouched.
+Tardos watermark embedding and extraction operate strictly on Role B coordinates inside Arena 0..3, leaving `"DBRM"`, `shared_controls`, `"TSYN"`, `"CEXT"`, crossbar, `SensoryQuad`, `Op-N[Pre]`, `ou_to_z_stage_ultra_fp16`, and unassigned slots untouched.
 
 When issuing a watermarked buyer container with `dbin_prefix_bytes > 0` (`auth_kind == 1` or `.dnam-seal`), buyer issuance MUST recompute layer-0 `tier_arena_crc32c` and `prefix_crc32c` digests over the buyer arenas.
 
@@ -155,7 +155,7 @@ This guarantees zero erasure under `f32 -> fp16` conversion and matched-filter c
 
 For scalar uniform embedding, $\epsilon_i = \epsilon$. For EMR-masked perceptual envelopes, encoders map each Role B coordinate `idx` inside tier `(start, end)` via `role_b_word = (idx - start) - 16`, `vec4_idx = role_b_word / 4`, and `lane = role_b_word % 4`.
 
-From that lane tuple, encoders compute `slot_32 = vec4_idx % 32`, `group_16 = slot_32 % 16`, and `feat_idx = tier * 64 + group_16 * 4 + lane` across 0..256, set $g_{\text{diag},i}$ to `gram_diag_256[feat_idx]`, and clamp $\epsilon_i$ to 0.0 on Role A and the 5,875..7,680 tail:
+From that lane tuple, encoders compute `slot_32 = vec4_idx % 32`, `group_16 = slot_32 % 16`, and `feat_idx = tier * 64 + group_16 * 4 + lane` across 0..256, set $g_{\text{diag},i}$ to `gram_diag_256[feat_idx]`, and clamp $\epsilon_i$ to 0.0 on Role A and the 5,871..7,680 tail:
 
 $$\epsilon_i = \mathrm{clamp}\left(\frac{\max(\min(\epsilon_{\text{mask},L}, \epsilon_{\text{mask},R}), 0)}{\sqrt{\max(g_{\text{diag},i}, 10^{-12})}}, 5 \times 10^{-5}, 2 \times 10^{-4}\right)$$
 
@@ -216,13 +216,13 @@ flowchart TD
 | **Gate 2: Structural Fingerprint** | < 1 ms | Compares retained-tier structural fingerprints and extracts buyer watermarks. A device is revoked from future licensing only when independent evidence identifies that device as the leak source (`REQ-8.6`); a watermark or transferred file alone never triggers blind hardware revocation. |
 | **Gate 3: Synthetic Probe** | < 5 ms | Renders a 2-second synthetic chirp probe in host SIMD to detect black-box re-captured clones. |
 
-### 2.1 Tier-Local Cabinet Fingerprint Component
+### 2.1 Tier-Local ModalConvolver Fingerprint Component
 
 `r[sec.anticlone.cabinet-fingerprint]`
 
 All structural parameter hashing and extraction MUST decode little-endian binary fields directly from their fixed byte offsets with strict bounds validation rather than assuming host endianness or unaligned pointer casts.
 
-For each retained tier, tier-local fingerprint extraction collects the incremental Cabinet Bank component of `15 * M_tier` dimensions from that tier's incremental L/R early FIR taps (`2 * K_fir` `f32le` taps) and 7 `f64` values per added shared Kautz pole pair ([cabinet slice layout](../containers/dnam_binary_format.md#24-tier-local-projection--cabinet-bank-slice-layout)). It canonicalizes -0.0 to +0.0 and fails closed on non-finite values:
+For each retained tier, tier-local fingerprint extraction collects the incremental `ModalConvolver` component of `15 * M_tier` dimensions from that tier's incremental L/R early FIR taps (`2 * K_fir` `f32le` taps) and 7 `f64` values per added shared Kautz pole pair ([convolver slice layout](../containers/dnam_binary_format.md#24-tier-local-projection--modalconvolver-slice-layout)). It canonicalizes -0.0 to +0.0 and fails closed on non-finite values:
 
 | Tier | Incremental `K_fir` (L/R Taps) | Added Kautz Pairs (`M_tier`) | Component Dim (`15 * M_tier`) | Cumulative Dim |
 | :--- | :---: | :---: | :---: | :---: |
@@ -244,8 +244,8 @@ The 224-D structural hash extractor emits a fixed 224-D (`56 * 4`) vector across
 | `[0..16]` | 16 | `r_low_{t,m} + 0.5 * dr_{t,m} + 0.1 * floor_1e2(theta_{0,t,m})` across tier `t` Kautz pairs, zero-padded to 16 |
 | `[16..32]` | 16 | `b_gamma_{t,m} * (c_re_L_{t,m} + c_re_R_{t,m})` across tier `t` Kautz pairs, zero-padded to 16 |
 | `[32..48]` | 16 | `b_gamma_{t,m} * (c_im_L_{t,m} + c_im_R_{t,m})` across tier `t` Kautz pairs, zero-padded to 16 |
-| `[48..52]` | 4 | Spatial Tank `delay_samples[0..4]` invariants (bytes 0..16 of each 128 B quad header at `TANK_DELAY_BASES[t]`), read as finite IEEE-754 binary32 `f32le` floats widened to binary64 (0.0 if non-finite) |
-| `[52..56]` | 4 | VarPro `fp16` `W_readout` segment squared norms (`sum(v^2)` over 4 equal segments of `[48, 72, 96, 120]` `u16` weights spanning `[192, 288, 384, 480]` `W_ro,0` entries of tier `t`) |
+| `[48..52]` | 4 | `TransportQuad` `delay_samples[0..4]` invariants (bytes 0..16 of each 128 B quad header at `TRANSPORT_DELAY_BASES[t]`), read as finite IEEE-754 binary32 `f32le` floats widened to binary64 (0.0 if non-finite) |
+| `[52..56]` | 4 | `LinearReadout` `fp16` `W_readout` segment squared norms (`sum(v^2)` over 4 equal segments of `[48, 72, 96, 120]` `u16` weights spanning `[192, 288, 384, 480]` `W_ro,0` entries of tier `t`) |
 
 Because `b_gamma * c_re` and `b_gamma * c_im` cancel the Mechanism A1 multiplier $\kappa_m$ in exact arithmetic—and the 224-D structural hash quantizes each Kautz pole angle $\theta_m$ onto a $10^{-2}\text{ rad}$ grid via `floor_1e2` inside the `[0.2, 0.8]` guard band—this 224-D vector stays invariant under reciprocal gauge watermarking, 40-lane sign flips, `SO(4)` rotations, Layer 2 phase coding, and black-box re-capture solver jitter.
 
@@ -280,7 +280,7 @@ flowchart TD
 | **1. Dedicated Preview Type & High-Tier Omission** | Sets `container_kind: "preview"` (`"architecture": "sona"`, v3.0) and physically omits Full, Pro, and Ultra arenas while retaining Arena 0 self-contained Lite controls. Non-browser DAW and hardware hosts MUST reject preview containers (`PreviewContainerRejected`) on both initial load and live model hot-swap. |
 | **2. Bounded Preview Controls & Fixed-Anchor Rank-r Containment** | Single control (`P = 1`): exposes a bounded continuous window `v in [v_0 - delta, v_0 + delta]` intersected with `[0, 1]` (`0 < delta <= 0.15`), or at most one additional observed safe switch option. Multiple controls (`P >= 2`): fixes a master-scoped anchor `a` and rank-r (`r < D_cont`) matrix `B`, permitting only `a + B t` across published previews while locking discrete switches. |
 | **3. Stateless On-Demand Generation (< 1 ms)** | Synthesizes `.dnam-prev` payloads at the CDN edge directly from the master's Arena 0 Lite prefix and Lite `.dnam-bin` prefix (`tier_end_offsets[0]`, Region 4 = 0 B) via keyless tier stripping with zero per-session storage multiplication. |
-| **4. Cascade-Fused Static Phase Dispersion** | Perturbs Cabinet Bank / Spatial Tank phase response (`|20 log10 |H_disp(e^{jw})|| <= 0.05 dB`, `tau_g^(demo)(w) != tau_g^(master)(w)`) while preserving stability bounds. |
+| **4. Cascade-Fused Static Phase Dispersion** | Perturbs `ModalConvolver` / `Transport` phase response (`|20 log10 |H_disp(e^{jw})|| <= 0.05 dB`, `tau_g^(demo)(w) != tau_g^(master)(w)`) while preserving stability bounds. |
 | **5. Dynamic Synthetic-Sweep & Impulse Input Guard** | Monitors 3 kHz crest factor and zero-crossing regularity (0 `FDIV`, 0 `FSQRT`), smoothly engaging phase flutter on synthetic probe stimuli while preserving natural musical playing. |
 | **6. Black-Box Acoustic Watermarking & Session Binding** | Embeds HMAC-keyed sparse micro-echoes (`y_wm[n] = y[n] + sum beta_i y[n - d_i]`, `|beta_i| <= 10^(-42/20)`, `d_i in [120, 800]` samples) alongside session lease metadata. |
 

@@ -105,7 +105,7 @@ The table below partitions every top-level JSON header region between the signed
 | `version`, `container_kind`, `architecture`, `sample_rate_train_hz` | **Yes (Signed)** | Locks v3.0 `"sona"` core architecture (`"3.0.0"`, `"sona"`) and reference sample rate (48000 Hz) |
 | `metadata.{name, author, description, license, created_at, input_reference_dbfs, provenance}` | **Yes (Signed)** | Locks creator attribution, license terms, and PCM dataset provenance |
 | `metadata.distribution_policy` (`allowed_protection_profiles`, `allowed_oem_vendors`) | **Yes (Signed)** | Locks permitted protection profiles and OEM hardware vendors or models |
-| `io_config`, `controls_schema`, `control_bus`, `io_router`, `cabinet`, `spatial_tank`, `delay_histories`, `tensor_directory`, `slimmable_tiers` | **Yes (Signed)** | Locks safety clamps, delay capacities, constant tier offsets, and calibration |
+| `io_config`, `controls_schema`, `control_bus`, `modal_convolver`, `transport`, `linear_readout`, `delay_histories`, `tensor_directory`, `slimmable_tiers` | **Yes (Signed)** | Locks safety clamps, delay capacities, constant tier offsets, and calibration |
 | `presets`, `user_metadata`, `control_user_metadata`, `stem_user_metadata` | **No (Mutable Suffix)** | Stored in the growable `DMU1` (`.dnam`) or `DME1` (`.dnam-seal`) + `DMUE` suffix |
 | `metadata.signatures` | **No (Auth Metadata / Envelopes)** | Excluded from `immutable_header_sha256`; serialized in Region 3 JSON on `DCRC`-backed `.dnam` files (Open and `DeviceAllowlisted`) and decrypted `DNPL` logical headers inside `.dnam-seal`, alongside binary `DAU1` / `DSA1` + `DAI1` envelopes |
 
@@ -498,7 +498,7 @@ The `DNPL` logical metadata prefix spans `logical_prefix = inner[192..plan_offse
 | 0..64 | Plaintext `DNPL` Inner Preamble | `magic = "DNPL"`, version 3.0, `protection_profile`, `auth_kind`, `buyer_max_tier`, `sample_rate_train_hz = 48000` |
 | 64..192 | Logical 128-byte Chunk Directory | Virtual plaintext `.dnam` offsets (`immutable_header_offset = 192`, `shared_binary_length == 0` when `dbin_prefix_bytes > 0`, `dbin_offset`, `dbin_prefix_bytes`, `tier_start`, `original_tier_ends[4]`, `reserved_tail` = 24 zero bytes) |
 | 192..`align64(192 + l_hdr_len)` | Canonical RFC 8785 JCS Immutable Header | Unencrypted `"architecture": "sona"`, `"version": "3.0.0"` JSON zero-padded to a 64 B boundary (`l_hdr_len = immutable_header_length`) |
-| `align64(192 + l_hdr_len)`..`logical_prefix_len` | Embedded `.dnam-bin` Register Prefix (`dbin_prefix`) | Verbatim 64 B-aligned `dbin_prefix` (0 B only in legacy empty-dbin fixtures; otherwise trailing length strictly equals `logical_dnam_dir.dbin_prefix_bytes` and inner `shared_record` `shared_bytes` is 0 B) |
+| `align64(192 + l_hdr_len)`..`logical_prefix_len` | Embedded `.dnam-bin` Register Prefix (`dbin_prefix`) | Verbatim 64 B-aligned `dbin_prefix` (0 B only in empty-dbin test fixtures; otherwise trailing length strictly equals `logical_dnam_dir.dbin_prefix_bytes` and inner `shared_record` `shared_bytes` is 0 B) |
 
 All offsets inside the `DNPL` header table are relative to `logical_prefix` and hashed into `logical_metadata_sha256`, whereas the Inner Directory holds ciphertext record offsets relative to the inner framing buffer.
 

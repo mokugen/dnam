@@ -45,7 +45,7 @@ All physical hardware captures and programmatic distillations enforce three devi
 | :--- | :--- |
 | Zero Control-Name or Topology Heuristics (REQ-1.6, REQ-1.9) | Excitation synthesis, lag alignment, and solver passes never inspect control labels (`"Gain"`, `"Mix"`, `"Drive"`), calibration role heuristics, UI hints, circuit templates, or device category tags; fixed 0-control snapshots and multi-pedal + amp + cab + stereo rack rigs run identically |
 | Multi-Rate & 5-Bit-Depth Lossless Staging (REQ-1.7, REQ-7.3) | Capture I/O decodes Int12 (left-justified in 16-bit containers), Int16, Int24, Int32, and unclipped IEEE-754 Float32 (`WAVE_FORMAT_IEEE_FLOAT`) via validated little-endian WAV headers, resampling 8..384 kHz captures onto the 48 kHz identification grid via zero-phase polyphase Kaiser-sinc filtering |
-| True-Stereo & Multi-Port Channel Preservation (REQ-7.2, REQ-7.4) | Mono (`1->1`), mono-to-stereo (`1->2`), stereo-to-mono (`2->1`), true-stereo (`2->2`), `4CM`, and `WDW` channel assignments remain intact without mono downmixing prior to I/O Router crossbar routing |
+| True-Stereo & Multi-Port Channel Preservation (REQ-7.2, REQ-7.4) | Mono (`1->1`), mono-to-stereo (`1->2`), stereo-to-mono (`2->1`), true-stereo (`2->2`), `4CM`, and `WDW` channel assignments remain intact without mono downmixing ahead of Host-Shell Patchbay / VM routing |
 
 ### 1.2 Two-Step Hardware Calibration & Clean 32-Bit Float Pad Staging
 
@@ -81,7 +81,7 @@ Before committing non-reference knob stems on physical hardware, the planner ver
 
 Sustain-hold state transitions are captured with zero control-name, string-matching, or calibration-role heuristics (REQ-1.6). Whenever physical hardware or a white-box `DNWB` runner (`HAS_FREEZE_WINDOW` bit 1<<2 or any general sustained-hold control axis across control trajectories) exhibits a write-hold transition, the planner records active-sustain entry while harmonic energy is present, held steady-state sustain under live play-over phrases, and release recovery.
 
-The identification solver lowers that write-hold trajectory purely from input/output signal telemetry into calibrated `ControlBus` slot 16 (`op_t_we_drive`), toggling bit 0 `WE_HOLD_ACTIVE` via Schmitt (0.45, 0.55) to drive `Op-T` `WE` RAM write lock (`ref[dsp.tank.captured-freeze]`). This keeps tank states bit-clean across 30 s tails without fp16 re-quantization hiss while play-over continues through the core—requiring zero dedicated host freeze APIs.
+The identification solver lowers that write-hold trajectory purely from input/output signal telemetry into uniformly micro-ramped `ControlBus` slot 16 (`op_t_freeze_mix_delta`), sweeping continuous passive `freeze_mix` (`mu_freeze in [0, 1]`) for 0-ULP hold at unity (`ref[dsp.tank.captured-freeze]`). This keeps `TransportQuad` states bit-clean across 30 s tails without fp16 re-quantization hiss while play-over continues through the core—requiring zero dedicated host freeze APIs.
 
 ### 1.4 Co-Designed Disjoint-Comb Excitation, Live Tail Extension & White-Box Distillation
 

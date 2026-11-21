@@ -24,7 +24,7 @@ This specification defines Op-M (Modal and Linear State-Space) along with the in
 1. Unconditionally passive 2×2 `ZDF` `TPT-SVF` associative scans inside the 4-block Matryoshka SONA core across 44.1–384 kHz.
 2. Top-of-Frame Causal Crossbar `Q0.32` quadrature phasors (0.05 Hz–20 kHz) and `Q0.192` contractive control rotors (`Op-M[Ctrl]`).
 3. Input-only `Op-P` analytic basis (6-section `H1` Hilbert all-pass lattice plus `T1` sub-harmonic tracker).
-4. Cabinet early FIR convolver and shared-pole Kautz bank hoisted across 16-frame sub-blocks.
+4. `ModalConvolver` early FIR filter and shared-pole Kautz bank hoisted across 16-frame sub-blocks.
 
 For requirements and architectural context, see [sona_architecture.md](../architecture/sona_architecture.md) and [REQ-1.2, REQ-1.3, REQ-2.5, REQ-6.2](../../requirements/system_goals_and_requirements.md). For mathematical derivations and counterexamples, see [ADR-0005](../../adr/0005-contractive-rotor-hilbert-and-t1-tracker.md) and [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md).
 
@@ -38,7 +38,7 @@ For requirements and architectural context, see [sona_architecture.md](../archit
 
 `r[dsp.op-m.recurrence.symplectic]`
 
-Inside the 4-block Matryoshka SONA core, resonant and crossover filter quads occupy 4, 6, 8, or 10 `svf_quads` across Lite, Full, Pro, and Ultra, yielding 16, 24, 32, or 40 scalar `TPT-SVF` modes (one quad per 4-lane core group). All modes execute as unconditionally passive 2×2 zero-delay-feedback trapezoidal state-variable filters with zero `FDIV`, `log`, or `exp` instructions in the audio loop.
+Inside the 4-block Matryoshka SONA core, resonant and crossover filter quads occupy 4, 6, 8, or 10 `svf_quads` across Lite, Full, Pro, and Ultra, yielding 16, 24, 32, or 40 scalar `TPT-SVF` modes (one quad per 4-lane `CoreQuad`). All modes execute as unconditionally passive 2×2 zero-delay-feedback trapezoidal state-variable filters with zero `FDIV`, `log`, or `exp` instructions in the audio loop.
 
 For a mode with cutoff frequency $f_c[n]$, prewarped ZOH tangent gain $g[n] = \tan(\pi f_c[n] / f_{s,\text{eff}}) > 0$, damping $k[n] = 1/Q[n] \ge 0$, $a_1 = 1 / (1 + g(g + k))$, $a_2 = g a_1$, and $a_3 = g a_2$, the nodal update and state transition follow:
 
@@ -49,7 +49,7 @@ $$\mathrm{LP}[n] = v_2[n], \qquad \mathrm{BP}[n] = v_1[n], \qquad \mathrm{HP}[n]
 
 Because $\Vert \mathbf{A}_{\text{tpt}}[n] \Vert_2 \le 1$, the discrete energy identity $(s_1'[n])^2 + (s_2'[n])^2 = s_1[n-1]^2 + s_2[n-1]^2 - 4 g[n] k[n] v_1[n]^2 \le s_1[n-1]^2 + s_2[n-1]^2$ holds for zero input $u[n] = 0$. Consequently, every matrix prefix product in a $2 \times 2$ Blelloch $O(\log_2 L)$ associative prefix scan (eight `f32` values per mode inside 16 KiB GPU workgroup shared SRAM) stays bounded in 32-bit float under arbitrary audio-rate modulation (`Q = 12` sweeps).
 
-Sample-rate adaptation prepares $g_{\text{host}} = \tan(\pi f_c / f_{s,\text{core}})$ or ZOH $\tan(\rho_{\text{core}}\arctan(g_{\text{ref}}))$ strictly via the math-library-free cold helpers of [router_and_crossbar_topology.md §9.1](router_and_crossbar_topology.md#91-causal-crossbar-core-tpt-svf-prewarping--kautz-modal-conversion), while 3 kHz and micro-chunk modulation scales $g_{\text{host}}$ via `exp2_clamped5(g_oct_lane)` without transcendental math or `FDIV`. Simultaneous `(LP, BP, HP, AP)` taps allow optimizer weights to express Linkwitz-Riley crossovers, interactive tone stacks, and multi-pole phasers without device-specific sub-circuits (`REQ-1.9`).
+Sample-rate adaptation prepares $g_{\text{host}} = \tan(\pi f_c / f_{s,\text{core}})$ or ZOH $\tan(\rho_{\text{core}}\arctan(g_{\text{ref}}))$ strictly via the math-library-free cold helpers of [router_and_crossbar_topology.md §9.1](router_and_crossbar_topology.md#91-causal-crossbar-sensoryquad-core-tpt-svf--kautz-conversion), while 3 kHz and micro-chunk modulation scales $g_{\text{host}}$ via `exp2_clamped5(g_oct_lane)` without transcendental math or `FDIV`. Simultaneous `(LP, BP, HP, AP)` taps allow optimizer weights to express Linkwitz-Riley crossovers, interactive tone stacks, and multi-pole phasers without device-specific sub-circuits (`REQ-1.9`).
 
 Dedicated 4-lane symplectic complex modal blocks update $z_c[n] = z_{\mathrm{re},c}[n] + i z_{\mathrm{im},c}[n] \in \mathbb{C}$ for lane $c \in \lbrace 0, 1, 2, 3 \rbrace$ using Cartesian products of radius and contractive unit rotation:
 
@@ -61,7 +61,7 @@ Expanded in real arithmetic, $z_{\mathrm{re},c}[n] = \alpha_{\mathrm{re},c}[n] z
 
 `r[dsp.op-m.recurrence.stereo-simd]`
 
-Both 4-mode `TPT-SVF` / symplectic modal blocks and cabinet 4-pair stereo Kautz slices (2, 3, 6, or 8 blocks across Lite..Ultra) step Left and Right channel states together in 4-lane or 8-lane stereo 32-bit SIMD registers. Shared coefficient vectors remain register-resident across all 16 frames of each sub-block, achieving 16× fewer L1D state loads/stores with 0-ULP parity ([ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)).
+Both 4-mode `TPT-SVF` / symplectic modal blocks and `ModalConvolver` 4-pair stereo Kautz slices (2, 3, 6, or 8 blocks across Lite..Ultra) step Left and Right channel states together in 4-lane or 8-lane stereo 32-bit SIMD registers. Shared coefficient vectors remain register-resident across all 16 frames of each sub-block, achieving 16× fewer L1D state loads/stores with 0-ULP parity ([ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)).
 
 ---
 
@@ -128,7 +128,7 @@ Cold/Rate Setup:
   if mag_bits == 0: mag = [0, 0, 0]; else mag = round_even((m * K) >> (64 - e))  // 5 x u64 product -> [u64; 3]
 
 Cold Init & reset():
-  lfo_phases_q192[j] = [0, 0, 0]; lfo_phasors[j] = [1.0, 0.0]; lfo_harmonics = [0.0; 8]
+  lfo_phases_q192[j] = [0, 0, 0]; lfo_phasors[j] = [1.0, 0.0]   // q2 resets to [1.0 + beta_0, 0.0, 1.0 + beta_1, 0.0] via lfo_skew_fp16
 
 Per K_ctrl Tick (Pure-32-Bit Rotor, Zero f64 VM Math):
   if mag_bits == 0: hold lfo_phases_q192[j]; (c, s) = lfo_phasors[j]
@@ -138,7 +138,7 @@ Per K_ctrl Tick (Pure-32-Bit Rotor, Zero f64 VM Math):
     angle = f32(q32 & 0x3FFF_FFFF) * (f32(pi / 2) * 2^-30)  // 0x30C9_0FDB in f32
     (c0, s0) = algebraic_unit_rotor_f32(angle)
     (c, s) = quad_rotate(quad, c0, s0); lfo_phasors[j] = flush([c, s])
-  t1 = c; two_x = 2.0 * t1; t2 = two_x * t1 - 1.0; t3 = two_x * t2 - t1; t4 = two_x * t3 - t2
+  q2[2*j] = c + beta_j * (2.0 * c * c - 1.0); q2[2*j + 1] = s   // beta_j = lfo_skew_fp16[j] in [-1.0, 1.0]
 ```
 
 At audio rate inside the Top-of-Frame crossbar, each `Q0.32` carrier computes `cycles = clamp(freq_hz * inv_sr, -0.49, +0.49)` and signed `inc_q32: i32 = round(cycles * 2^32)`. This signed formulation supports negative frequencies and arithmetic `inc_1x >> 1` at 2× `OS2X` ([router_and_crossbar_topology.md §4](router_and_crossbar_topology.md#4-top-of-frame-causal-operator-crossbar)).
@@ -184,7 +184,9 @@ Contractive ULP Guard (<= 2 iterations, unfused binary32 norm2 = (cos_out * cos_
 
 Arbitrary `f32` angles wrap into $[-\pi, \pi)$ via `k = floor((theta_rad + PI) * INV_TAU)` followed by `theta_rad - k * TAU` with zero `FDIV`, standard math library remainder calls, or loops.
 
-During 3 kHz cabinet modulation, retuning follows §4.3: immediate snaps set `last_oct`, `last_damp`, and `prev_oct` with slew inactive before running the restore-or-step update, regular ticks skip work when `oct_changed`, `damp_changed`, and `slew_active` are all false, and fast restore checks `|oct| <= 1e-7 && |damp| <= 1e-7 && |oct - prev_oct_used| <= 1e-7` so step jumps contract for one tick before restoring cached poles via `algebraic_unit_rotor_f32`.
+During 3 kHz ModalConvolver modulation, retuning follows §4.3: immediate snaps set `last_oct`, `last_damp`, and `prev_oct` with slew inactive before running the restore-or-step update, while regular ticks skip work when none of the change or slew flags are active.
+
+Fast restore checks `|oct| <= 1e-7 && |damp| <= 1e-7 && |oct - prev_oct_used| <= 1e-7` so step jumps contract for one tick before restoring cached poles via `algebraic_unit_rotor_f32`.
 
 Active ticks set `th_new = 0.0` when `th_host <= 1e-6` or clamp `th_host * freq_scale` inside `[1e-4, pi - 1e-4]`, contract `r_eff = min(r_damped, max(0.9950 - 0.15 * dtheta, 0.25))` when `dtheta > 1e-6`, and rescale orthonormal gains via §4.3 ([ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)).
 
@@ -273,26 +275,26 @@ $$s'[n-i] = s[n-i] + (\beta - \alpha)y[n-i], \qquad i \in \lbrace 1, 2 \rbrace$$
 
 ```mermaid
 flowchart LR
-    X["Router Stereo Input (x_L, x_R)"] --> DC["Stereo 5 Hz DC Blocker (24 B)"] --> H1["True Stereo H1 Lattice (248 B)"] --> Mid["Mid Analytic Pair 0.5*(i_L+i_R, q_L+q_R)"] --> Tracker["Mono Mid T1 Tracker (28 B):<br/>[sub1_cos, sub1_sin, sub1_sq, sub2_sq] * env_gate"]
+    X["Gated Input (g_in * x_L, g_in * x_R)"] --> DC["Stereo 5 Hz DC Blocker (24 B)"] --> H1["True Stereo H1 Lattice (248 B)"] --> Mid["Mid Analytic Pair 0.5*(i_L+i_R, q_L+q_R)"] --> Tracker["2-Stage Mid T1 Rotor (28 B, rsqrt_pos_nr3):<br/>[cos(th/2), sin(th/2), cos(th/4), sin(th/4)] * env_gate"]
     H1 -->|"carrier_basis_w_fp16 (24 B) * Q0.32"| Crossbar["Top-of-Frame Crossbar (+ 2x OS2X Midpoint Interp)"]
-    X --> Crossbar --> Core["4-Block Matryoshka SONA Core"]
-    Tracker -->|"op_p_to_group_fp16"| Crossbar
+    X --> Crossbar --> Core["4-Block CoreQuad Cascade"]
+    Tracker -->|"op_p_to_core_fp16"| Crossbar
 ```
 
-The input-only `Op-P` pipeline executes one identical stereo-input analytic chain across real-time audio execution and CPU training precomputation, separating the 24 B stereo 5 Hz `T1` DC blocker, 248 B true-stereo `H1` lattice, 24 B 3-basis carrier readout, and 28 B mono mid `T1` sub-harmonic tracker:
+The input-only `Op-P` pipeline executes one identical stereo-input analytic chain across real-time audio execution and CPU training precomputation, separating the 24 B stereo 5 Hz `T1` DC blocker, 248 B true-stereo `H1` lattice, 24 B 3-basis carrier readout, and 28 B mono mid 2-stage `T1` sub-harmonic rotor:
 
 | Pipeline Component | Placement, Footprint & Constants | Runtime & ZOH Rate Law |
 | :--- | :--- | :--- |
 | Stereo `T1` 5 Hz DC Blocker | 24 B stereo 5 Hz 1-pole blocker (`0x3F7F_D51F`, `0x3F7F_EA90`) conditioning L/R before `H1` | Scales `R_trk,eff` cleanly with `rho_sr`; zero duplicate post-`H1` blockers |
 | True Stereo `H1` Lattice | 248 B (48 B shared `alpha_i`/`alpha_q` + 200 B L/R TDF-II `z^-2` and `q_prev` states) | 15-rate `HILBERT-H1-ANCHORS` 128-bit ties-to-even interpolation over `[44,100 ..= 384,000]` Hz, endpoint-clamped; 0.0976 deg (< 0.10 deg) @ 48 kHz, <= 0.19 deg all 15 anchors, <= 0.34 deg across `[44.1, 96]` & `[176.4, 384]` kHz over 20 Hz–20 kHz, and <= 0.34 deg for `f >= 30 Hz` or <= 0.67 deg at 20 Hz near 136.2 kHz across bridged `(96, 176.4)` kHz |
 | 3-Basis Carrier & `OS2X` Block | 24 B `carrier_basis_w_fp16` (`[hi*p_cos, hq*p_sin, p_sin]`); 256 B common `OS2X` block | Halved `inc_1x >> 1` phasors per 2× sub-frame; linear midpoint interpolation of 1× `Op-P` |
-| Mono Mid `T1` Tracker | 28 B state evaluating on `(i_mid, q_mid) = 0.5 * (i_L + i_R, q_L + q_R)` | Emits `[sub1_cos, sub1_sin, sub1_sq, sub2_sq] * env_gate` to crossbar lanes 0..4 |
+| 2-Stage Mid `T1` Rotor | 28 B state (`prev_w1_re`, `prev_w1_im`, `sheet2`) evaluating on `0.5 * (i_L + i_R, q_L + q_R)` | Emits `env_gate * [cos(theta/2), sin(theta/2), cos(theta/4), sin(theta/4)]` to crossbar lanes 0..4 |
 
 The upstream 5 Hz DC blocker state update and ZOH rate law compute:
 
 $$d[n] = \alpha_{\mathrm{trk}}\big(x[n]-x[n-1]\big)+R_{\mathrm{trk}}d[n-1], \qquad R_{\mathrm{trk,eff}} = \mathrm{clamp}\big(R_{\mathrm{trk,ref}}^{\rho_{\text{sr}}},\ 0.0,\ r_{\max}\big), \qquad \alpha_{\mathrm{trk,eff}} = \frac{1 + R_{\mathrm{trk,eff}}}{2}$$
 
-Reference 5 Hz 160-bit midpoint anchors (`T1-COEFFICIENT-VECTORS` and `T1-MIDPOINT-SEARCH`) specify the normative cold-load selection law across both standalone DSP kernel and virtual-machine runtime initializers over continuous $44{,}100.0 \le f_{s,\mathrm{vm}} \le 384{,}000.0$ Hz. This unified `(first, last) = (0x00FF_D000, 0x00FF_FBFF)` bracket widens and supersedes any split `[44,100..96,000]` / `[176,400..384,000]` two-band bracket so bridged rates in `(96,000, 176,400)` Hz such as 128 kHz resolve cleanly via one monotone search.
+Reference 5 Hz 160-bit midpoint anchors (`T1-COEFFICIENT-VECTORS` and `T1-MIDPOINT-SEARCH`) specify the normative cold-load selection law across both standalone DSP kernel and virtual-machine runtime initializers over continuous $44{,}100.0 \le f_{s,\mathrm{vm}} \le 384{,}000.0$ Hz. This single monotone search spans the full `[44,100..384,000]` Hz band using unified bracket `(first, last) = (0x00FF_D000, 0x00FF_FBFF)`, resolving intermediate rates in `(96,000, 176,400)` Hz such as 128 kHz directly.
 
 Adjacent `f64` rates `0x40E77045FD955545` and `0x40E77045FD955546` double-round to `0x3F7FD520` under naive 64-bit power calls, whereas outward 160-bit bounds on $S(x) = -\frac{1}{2}\log(x) = \sum_{j=0}^{\infty} z^{2j+1}/(2j+1)$ with $z = (1-x)/(1+x)$ select the exact ties-to-even `f32` pole.
 
@@ -336,45 +338,43 @@ pole_bits = 0x3F00_0000 + lower - (1 << 23); gain_bits = 0x3F00_0000 + rounded_g
 
 ### 3.2 Bounded Analytic Envelope, 3-Regime Gate & Normalization
 
-#### 3.2.1 Three-Regime Gate & `NR2` Magnitude
+#### 3.2.1 Three-Regime Gate & Mandatory `NR3` Magnitude
 
 `r[dsp.op-m.tracker.envelope-norm]`
 
-After flushing subnormals and sanitizing non-finite inputs, the `T1` sub-harmonic tracker evaluates $r^2 = I_{\text{clean}}^2 + Q_{\text{clean}}^2$ directly in normal 32-bit `f32` with zero exponent-split pre-scaling and selects one of three regimes:
+After flushing subnormals and sanitizing non-finite inputs, the `T1` sub-harmonic rotor evaluates $r^2 = I_{\text{clean}}^2 + Q_{\text{clean}}^2$ directly in normal 32-bit `f32` with zero exponent-split pre-scaling and selects one of three regimes using **mandatory 3-step `rsqrt_pos_nr3`** normalization across `r2`, half-angle `h1`, and quarter-angle `h2`:
 
 | Regime | Entry Condition | State & Output Behavior |
 | :--- | :--- | :--- |
-| 1. `SILENCE` | Non-finite `r2` or `r2 < 1.0e-12` (`T1_SILENCE_SQUELCH_R2`) | Set `prev_valid = false`, update `prev_x = i_clean` (or 0.0 if non-finite), hold `(prev_q, sheet)` signs, emit `[0.0, 0.0, 0.0, 0.0]` |
-| 2. `VALID` | `r2 >= 1.0e-12` | Compute `inv_r` via 2-step Newton inverse square root of `r2`, unit phasor `u_re = clamp(i_clean * inv_r, -1.0, 1.0)`, `u_im = clamp(q_clean * inv_r, -1.0, 1.0)`, `env_gate = flush(r2 * inv_r)` |
-| 3. `HYSTERESIS` | `prev_valid`, `dot = p · u < 0`, `abs(det) <= 2^-18` (`BRANCH_CUT_CHORD_TOL`) | Suppress `sheet` toggling across near-origin antipodal crossings while updating unit phasor and envelope |
+| 1. `SILENCE` | Non-finite `r2` or `r2 < 1.0e-12` (`T1_SILENCE_SQUELCH_R2`) | Set `prev_valid = false`, hold `(sheet, sheet2, prev_w1_re, prev_w1_im)`, emit `[0.0, 0.0, 0.0, 0.0]` |
+| 2. `VALID` | `r2 >= 1.0e-12` | Compute `inv_r = rsqrt_pos_nr3(r2)`, unit phasor `u_re = clamp(i_clean * inv_r, -1.0, 1.0)`, `u_im = clamp(q_clean * inv_r, -1.0, 1.0)`, `env_gate = flush(r2 * inv_r)` |
+| 3. `HYSTERESIS` | `prev_valid`, `dot = p · u < 0`, `abs(det) <= 2^-18` (`BRANCH_CUT_CHORD_TOL`) | Suppress `sheet`/`sheet2` toggling across near-origin antipodal crossings while updating unit phasors and envelope |
 
 #### 3.2.2 True Stereo `H1` Lattice, Mid `T1` Batching & Pure-`f32` Branch-Cut Guard
 
 `r[dsp.op-m.tracker.stereo-batching]`
 
-True-stereo `H1` lattice stepping updates independent Left and Right quadrature delay histories across all 6 cascaded sections in 248 B of hot state, passing $(i_{\mathrm{mid}}, q_{\mathrm{mid}}) = 0.5(i_L + i_R, q_L + q_R)$ to the 28 B mono mid `T1` tracker. During 2× oversampling (`OS2X`), `Op-P` steps only once per host frame inside the 256 B common oversampler hot block and emits `(0.5 * (prev + curr))` followed by `curr` across the two sub-frames.
+True-stereo `H1` lattice stepping updates independent Left and Right quadrature delay histories across all 6 cascaded sections in 248 B of hot state, passing $(i_{\mathrm{mid}}, q_{\mathrm{mid}}) = 0.5(i_L + i_R, q_L + q_R)$ to the 28 B 2-stage mono mid `T1` rotor. During 2× oversampling (`OS2X`), `Op-P` steps only once per host frame inside the 256 B common oversampler hot block and emits `(0.5 * (prev + curr))` followed by `curr` across the two sub-frames.
 
-Paired downstream, the `T1` sub-harmonic tracker evaluates its pure 32-bit `f32` branch-cut guard and 2-step Newton inverse square root normalization with zero `f64` instructions across both mono and stereo L/R pairs ([ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)).
+Paired downstream, the `T1` sub-harmonic rotor evaluates its pure 32-bit `f32` branch-cut guard and 3-step `rsqrt_pos_nr3` inverse square root normalization across both stages with zero `f64` instructions across both mono and stereo L/R pairs ([ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)).
 
 ---
 
-### 3.3 Discrete Toggle, Half-Angle Sheet & 4-Channel Tracker Features
+### 3.3 2-Stage Algebraic Half/Quarter-Angle Rotor (`cos(theta/2)..sin(theta/4)`)
 
 `r[dsp.op-m.tracker.toggle-sheet]`
 
-Rising zero-crossings `E_1[n] = prev_valid && (I[n-1] <= 0.0 && I[n] > 0.0)` toggle discrete divider $q_1[n] = q_1[n-1](1 - 2E_1[n])$ (`f0/2` square) using unnormalized sign state so small signals never invent crossings, while $q_2[n]$ toggles on `-1 -> +1` transitions of $q_1$ (`f0/4` square).
+The 28 B `T1` sub-harmonic rotor stores `prev_w1_re`, `prev_w1_im`, and `sheet2` (`6 × f32 + bool`) and cascades two cancellation-free algebraic square-root stages $z \mapsto w_1 = z^{1/2}$ followed by $w_1 \mapsto w_2 = w_1^{1/2} = z^{1/4}$:
 
-Both `E_1[n]` and the Riemann branch-cut toggle require `prev_valid` to hold; `prev_valid` clears to false on `reset()`, non-finite input, or `r^2 < 1e-12` (`SILENCE`), and sets to true at the end of each valid step.
+**Half-Angle Root** evaluates $w_1 = (\cos(\theta/2), \sin(\theta/2))$. When `!prev_valid`, it initializes `prev_u = u` and skips half-angle branch-cut toggling; otherwise it toggles `sheet` iff `tracker_crosses_branch_cut_f32(prev_u, u)` holds (`dot >= 0 || |D| > 2^-18` with cross-axis crossing), computes `h1 = (1 + |u_re|)/2` and `rho1 = rsqrt_pos_nr3(max(h1, 1e-12))`, and forms cancellation-free `(sub1_cos, sub1_sin) = sheet * half_angle(u)`.
 
-When `prev_valid` holds for consecutive unit phasors $p, u$ with $D = p_{\mathrm{re}}u_{\mathrm{im}} - p_{\mathrm{im}}u_{\mathrm{re}}$, half-angle sign $s_{\mathrm{sheet}} \in \lbrace -1, +1 \rbrace$ flips when `p_im >= 0`, `u_im < 0`, and $D > 0$ or when `p_im < 0`, `u_im >= 0`, and $D < 0$, except under `HYSTERESIS` where $p \cdot u < 0$ and $|D| \le 2^{-18}$.
+**Quarter-Angle Root** evaluates $w_2 = (\cos(\theta/4), \sin(\theta/4))$. When `!prev_valid`, it initializes `(prev_w1_re, prev_w1_im) = (sub1_cos, sub1_sin)` directly without toggling sheet2; otherwise it toggles sheet2 iff `tracker_crosses_branch_cut_f32(prev_w1, w1)` holds, computes `h2 = (1 + |sub1_cos|)/2` and `rho2 = rsqrt_pos_nr3(max(h2, 1e-12))`, forms `(sub2_cos, sub2_sin) = sheet2 * half_angle(w1)`, and updates `prev_w1 = w1`.
 
-To avoid cancellation, the `T1` tracker sets $h = (1 + |u_{\mathrm{re}}|)/2$, computes $\rho$ as the 2-step Newton inverse square root of $\max(h, \varepsilon_{\text{half}})$ where $\varepsilon_{\text{half}} = 10^{-12}$ (`T1_HALF_ANGLE_EPS`), and forms $v_{\text{maj}} = \mathrm{clamp}(h\rho, 0, 1)$ and $v_{\text{min}} = \mathrm{clamp}(|u_{\mathrm{im}}| \cdot 0.5\rho, 0, 1)$. When $u_{\mathrm{re}} \ge 0$, $(c_1, |s_1|) = (v_{\text{maj}}, v_{\text{min}})$; otherwise $(c_1, |s_1|) = (v_{\text{min}}, v_{\text{maj}})$.
+**Smooth Quadrature Output** guarantees zero step aliasing by multiplying all four continuous quadrature channels by `env_gate = flush(r2 * inv_r)` (zero in `SILENCE`):
 
-Multiplying by `env_gate = flush(r2 * inv_r)` (or zero in `SILENCE`), where $\sigma_+(u_{\mathrm{im}}) = +1$ for $u_{\mathrm{im}} \ge 0$ and $-1$ for $u_{\mathrm{im}} < 0$, gives the four `Op-P` channels (`sub1_cos`, `sub1_sin`, `sub1_sq`, `sub2_sq`):
+$$\mathbf{feat}[0..4] = \mathrm{env-gate} \cdot \big[\cos(\theta/2), \sin(\theta/2), \cos(\theta/4), \sin(\theta/4)\big]$$
 
-$$w_{\cos} = \hat{A} s_{\mathrm{sheet}} c_1, \qquad w_{\sin} = \hat{A} s_{\mathrm{sheet}} \sigma_+(u_{\mathrm{im}}) |s_1|, \qquad w_{\mathrm{square}} = \hat{A} q_1, \qquad w_{\mathrm{quarter}} = \hat{A} q_2$$
-
-This 4-channel vector feeds Lite readout sensitivity array `stage_latent_mods_fp16[80..96]` (`op_p_to_group` across groups 0..4) or Full/Pro/Ultra tier crossbar `op_p_to_group_fp16` elementwise (0-ULP sign-flip compatible across lanes) and steps unconditionally every sample even when crossbar gains are zero ([router_and_crossbar_topology.md §8](router_and_crossbar_topology.md#8-direct-register-varpro-readout)).
+This 4-channel quadrature vector feeds Lite `LinearReadout` sensitivity array `stage_latent_mods_fp16[80..96]` (`op_p_to_core` across quads 0..4) or Full/Pro/Ultra tier crossbar `op_p_to_core_fp16` elementwise (0-ULP sign-flip compatible across lanes) and steps unconditionally every sample even when crossbar gains are zero ([router_and_crossbar_topology.md §8](router_and_crossbar_topology.md#8-direct-register-linearreadout)).
 
 ---
 
@@ -382,20 +382,20 @@ This 4-channel vector feeds Lite readout sensitivity array `stage_latent_mods_fp
 
 `r[dsp.op-m.tracker.training]`
 
-Because `Op-P` depends strictly on dry input $x[n]$, training pipelines precompute exact toggle, sheet, silence, and ambiguity trajectories on CPU in under 0.5 ms before uploading training batches to WebGPU or CPU VarPro.
+Because `Op-P` depends strictly on dry input $x[n]$, training pipelines precompute exact half-angle and quarter-angle trajectories on CPU in under 0.5 ms before uploading training batches to WebGPU or CPU VarPro.
 
 ---
 
 ## 4. Shared-Pole Kautz Modal Bank
 
-### 4.1 Cabinet Architecture & Tier Allocation
+### 4.1 `ModalConvolver` Architecture & Tier Allocation
 
 `r[dsp.op-m.kautz.tier-allocation]`
 
-The Cabinet Convolver and Shared-Pole Kautz Bank models speaker early reflections and resonant modal tails (`REQ-1.2`). Single lag-ordered L/R early FIR histories (`[x[n-1], x[n-2], ..., x[n-N]]`, replacing circular mirrored histories) allocate 32, 48, 96, or 128 taps/ch across Lite, Full, Pro, and Ultra, paired with $M_{\mathrm{kautz}} \in \lbrace 8, 12, 24, 32 \rbrace$ complex conjugate pole pairs (16, 24, 48, or 64 real poles) driven at reference onset $K_{\mathrm{tail}} = 16$ samples at 48 kHz:
+`ModalConvolver` (`modal_convolver`) models speaker early reflections and resonant modal tails (`REQ-1.2`). Single lag-ordered L/R early FIR histories (`[x[n-1], x[n-2], ..., x[n-N]]`) allocate 32, 48, 96, or 128 taps/ch across Lite, Full, Pro, and Ultra, paired with $M_{\mathrm{kautz}} \in \lbrace 8, 12, 24, 32 \rbrace$ complex conjugate pole pairs (16, 24, 48, or 64 real poles) driven at reference onset $K_{\mathrm{tail}} = 16$ samples at 48 kHz:
 
 $$s_{m,a}[n] = \lambda_m[n] s_{m,a}[n-1] + b_{\gamma,m} x_a[n - K_{\mathrm{tail}}], \qquad y_{\mathrm{tail},a}[n] = \sum_{m=1}^{M_{\mathrm{kautz}}} 2\mathrm{Re}\big(c_{m,a} s_{m,a}[n]\big)$$
-$$H_{\mathrm{cab},a}(z) = \sum_{k=0}^{K_{\mathrm{early}}-1} b_{\mathrm{early},a}[k] z^{-k} + z^{-K_{\mathrm{tail}}} \sum_{m=1}^{M_{\mathrm{kautz}}} \left(\frac{b_{\gamma,m} c_{m,a}}{1 - \lambda_m z^{-1}} + \frac{b_{\gamma,m} \overline{c_{m,a}}}{1 - \overline{\lambda_m} z^{-1}}\right), \qquad K_{\mathrm{tail}} = 16$$
+$$H_{\mathrm{conv},a}(z) = \sum_{k=0}^{K_{\mathrm{early}}-1} b_{\mathrm{early},a}[k] z^{-k} + z^{-K_{\mathrm{tail}}} \sum_{m=1}^{M_{\mathrm{kautz}}} \left(\frac{b_{\gamma,m} c_{m,a}}{1 - \lambda_m z^{-1}} + \frac{b_{\gamma,m} \overline{c_{m,a}}}{1 - \overline{\lambda_m} z^{-1}}\right), \qquad K_{\mathrm{tail}} = 16$$
 
 Container serialization and runtime execution intentionally use distinct SoA layouts. On disk, each serialized Kautz SoA block packs eight 4-lane little-endian `f32` vectors as `[r_low, dr, theta, b_gamma, c_re_l, c_im_l, c_re_r, c_im_r]` (128 B per block; 2, 3, 6, or 8 cumulative blocks across tiers = 256, 384, 768, or 1,024 B).
 
@@ -409,7 +409,7 @@ At runtime, each 16-byte-aligned 4-pair stereo Kautz bank expands a block into e
 
 ```text
 +---------------------------------------------------------------------------------------------------+
-| CABINET 64B-ALIGNED EARLY FIR, SERIALIZED KAUTZ (128 B/BLK) & RUNTIME BANK (176 B/BANK) SLICES    |
+| MODALCONVOLVER 64B-ALIGNED EARLY FIR, SERIALIZED KAUTZ (128 B/BLK) & RUNTIME BANK (176 B/BANK) SLICES |
 +---------------------------------------------------------------------------------------------------+
 |  Tier          | Cum. Early FIR (L/R Taps) | Serialized Kautz (8-Vec)   | Runtime Bank (11-Vec)   |
 |  Lite (Arena 0)| 32 taps/ch  ( 256 B taps) | 2 blks /  8 pairs ( 256 B) |  352 B (128 B state)    |
@@ -423,11 +423,11 @@ Across tiers, incremental slices add 2, 1, 3, and 2 serialized Kautz SoA blocks,
 
 ---
 
-### 4.2 Dual-Channel State & Per-Tier Prefix Override Replacement
+### 4.2 Dual-Channel State & Per-Tier Prefix Overrides
 
 `r[dsp.op-m.kautz.dual-state]`
 
-Both L/R FIR histories and L/R modal states step on every sample across all I/O topologies (`1 -> 1`, `2 -> 1`, `1 -> 2`, `2 -> 2`). Decoders apply **exact replacement semantics** over `[0..N_prefix]` when unpacking higher tiers rather than subtractive deltas, preventing cross-tier quantization drift:
+Both L/R FIR histories and L/R modal states step on every sample across all I/O topologies (`1 -> 1`, `2 -> 1`, `1 -> 2`, `2 -> 2`). Decoders apply **complete prefix override semantics** over `[0..N_prefix]` when unpacking higher tiers rather than subtractive deltas, preventing cross-tier quantization drift:
 
 | Override Record | Retained FIR Taps | Retained Kautz Residues & Delta Storage |
 | :--- | :---: | :--- |
@@ -486,7 +486,7 @@ Caching `host_inv_1mr2[m]` equal to $1 / \max(1 - r_{\mathrm{host},m}^2, 10^{-7}
 
 `r[dsp.op-m.kautz.rate-convert]`
 
-At rate ratio $\rho = 48000 / f_{s,\mathrm{eff}}$, cold setup clamps deserialized `(r_base_48k, th_base_48k)` into `[0.25, 0.9995] × [0, pi - 1e-4]` when $|\rho - 1| < 10^{-12}$. Otherwise, it pre-clamps $r_{\mathrm{pre}} = \mathrm{clamp}(r_{\mathrm{base,48k}}, 0.25, 0.9985)$ and $\theta_{\mathrm{pre}} = \mathrm{clamp}(\theta_{\mathrm{base,48k}}, 0, \pi - 10^{-3})$, evaluates `r_host = powf_f64(r_pre, rho)` and `th_host = clamp(rho * th_pre, 1e-4, pi - 1e-4)` per [router_and_crossbar_topology.md §9.1](router_and_crossbar_topology.md#91-causal-crossbar-core-tpt-svf-prewarping--kautz-modal-conversion), and post-clamps `host_poles[m]` to `[0.25, 0.9995] × [0, pi - 1e-4]`.
+At rate ratio $\rho = 48000 / f_{s,\mathrm{eff}}$, cold setup clamps deserialized `(r_base_48k, th_base_48k)` into `[0.25, 0.9995] × [0, pi - 1e-4]` when $|\rho - 1| < 10^{-12}$. Otherwise, it pre-clamps $r_{\mathrm{pre}} = \mathrm{clamp}(r_{\mathrm{base,48k}}, 0.25, 0.9985)$ and $\theta_{\mathrm{pre}} = \mathrm{clamp}(\theta_{\mathrm{base,48k}}, 0, \pi - 10^{-3})$, evaluates `r_host = powf_f64(r_pre, rho)` and `th_host = clamp(rho * th_pre, 1e-4, pi - 1e-4)` per [router_and_crossbar_topology.md §9.1](router_and_crossbar_topology.md#91-causal-crossbar-sensoryquad-core-tpt-svf--kautz-conversion), and post-clamps `host_poles[m]` to `[0.25, 0.9995] × [0, pi - 1e-4]`.
 
 Active poles initialize `host_b_gamma[m]` and `host_inv_1mr2[m]` with explicit `f64`/`f32` narrowing and math-library-free `sqrt_f64` and `rcp_nr6_f64`, while inactive poles with non-positive `r_base_48k` or `b_gamma_stored` force zero gain:
 
@@ -532,7 +532,7 @@ Here $r_{\mathrm{ceil}} = 0.9950$ during 3 kHz runtime retuning and $0.9995$ in 
 
 `r[dsp.op-m.kautz.pole-extraction]`
 
-Modal extraction first initializes cabinet eigenmode frequencies logarithmically across 40–4,500 Hz via OMP, then refines continuous Kautz radii and angles $(r_m, \theta_m)$ via `i32` Ozaki Gauss-Newton and `L-BFGS` polish beyond dictionary quantization (bESR delta under 0.01 dB/epoch). Shared pole dynamics pair with independent L/R residues $c_{m,L}, c_{m,R}$ while preserving lower-tier prefixes.
+Modal extraction first initializes acoustic eigenmode frequencies logarithmically across 40–4,500 Hz via OMP, then refines continuous Kautz radii and angles $(r_m, \theta_m)$ via `i32` Ozaki Gauss-Newton and `L-BFGS` polish beyond dictionary quantization (bESR delta under 0.01 dB/epoch). Shared pole dynamics pair with independent L/R residues $c_{m,L}, c_{m,R}$ while preserving lower-tier prefixes.
 
 ---
 
@@ -540,8 +540,6 @@ Modal extraction first initializes cabinet eigenmode frequencies logarithmically
 
 `r[dsp.op-m.ctrl.engine]`
 
-At every `K_ctrl` control boundary, `Op-M[Ctrl]` steps the two `Q0.192` control LFO accumulators via §1.2.4 (emitting `[t1_0 + 0.35 * t2_0, t1_1 + 0.35 * t2_1, lfo_phasors[0][0], lfo_phasors[0][1]]` into `q2`) and latches router envelopes into `env_states[0..4]` (`q3`).
+At every `K_ctrl` control boundary, Op-M[Ctrl] steps the two Q0.192 control LFO accumulators via §1.2.4, emitting skewed quadrature coordinates `q2 = [cos(phi_0) + beta_0 * (2*cos^2(phi_0) - 1), sin(phi_0), cos(phi_1) + beta_1 * (2*cos^2(phi_1) - 1), sin(phi_1)]` where beta_j is `lfo_skew_fp16[j]` in [-1.0, 1.0], and latches SensoryQuad ParaLRU envelopes `[e_0, e_1, e_2, e_3]` into `env_states[0..4]` (`q3`, zero-initialized when standalone).
 
-When running standalone without router detectors, `q3` falls back to Arena 0 `env_poles[3]` smoothing `audio_abs_energy` with `env_states[3] = max(0.0, env_states[2] - env_states[0])`.
-
-It then updates `stage_targets[0..32]` (including optional `CEXT` `op_p_phasor_rate_oct` at slot 29) and advances the `Q64`/`Q32` tempo-sync accumulator in dedicated state ([parametric_control_bus.md §1.1](parametric_control_bus.md#11-op-mctrl-3-khz-4-lane-symplectic-complex--ballistic-engine), [router_and_crossbar_topology.md §2.6](router_and_crossbar_topology.md#26-4-band-asymmetric-ballistic-envelope-bank--aux-key-detector)).
+It then updates `stage_targets[0..32]` (including optional `CEXT` `op_p_phasor_rate_oct` at slot 29 and `sense_vca_gain_delta` at slot 30) and advances the `Q64`/`Q32` tempo-sync accumulator in dedicated state ([parametric_control_bus.md §1.1](parametric_control_bus.md#11-op-mctrl-3-khz-4-lane-symplectic-complex--ballistic-engine), [router_and_crossbar_topology.md §2.6](router_and_crossbar_topology.md#26-sensoryquad-op-mnsense-sensing-bank--input-vca)).

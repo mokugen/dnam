@@ -50,9 +50,9 @@ The solver operates as a 100% black-box, fixed-shape asymptotic identifier (REQ-
 
 | Solver Property | Lite / Full / Pro / Ultra Nesting (Lite ⊂ Full ⊂ Pro ⊂ Ultra) |
 | :--- | :--- |
-| 4-Block Matryoshka Core | `[1,1,1,1]` / `[2,2,1,1]` / `[3,2,2,1]` / `[4,3,2,1]` (`svf_quads`: 4 / 6 / 8 / 10) |
-| Cabinet Early FIR & Kautz Pairs | 32 / 48 / 96 / 128 FIR taps per channel; 8 / 12 / 24 / 32 shared Kautz pole pairs |
-| Spatial Tank `Op-T` Quads | 1 / 2 / 3 / 4 `tank_quads` = 4 / 8 / 12 / 16 delay lines |
+| 4-Block Matryoshka Core | `[1,1,1,1]` / `[2,2,1,1]` / `[3,2,2,1]` / `[4,3,2,1]` (`CoreQuad`s: 4 / 6 / 8 / 10) |
+| `ModalConvolver` Early FIR & Kautz Pairs | 32 / 48 / 96 / 128 FIR taps per channel; 8 / 12 / 24 / 32 shared Kautz pole pairs |
+| `TransportQuad` (`Op-T`) Quads | 1 / 2 / 3 / 4 `transport_quads` = 4 / 8 / 12 / 16 delay lines |
 | Convergence Criterion | `BestUntilDiminishingReturns` (`|ΔbESR| < 0.01` dB/epoch, zero `ThresholdStop` early exit) over full 2.0–2.5 s (96,000–120,000 frames) fp32 capsules |
 
 Speed gained from ahead-of-time SPIR-V-to-shader compilation, <= 15,872 B (15.5 KiB) WebGPU SRAM scans, optional hardware subgroup reductions, and 64–128-seed screening is reinvested directly into finding higher-fidelity weights inside those locked fixed shapes (`ref[arch.tiers.maximize-quality-within-budget]`).
@@ -67,11 +67,11 @@ The identification solver executes sequentially across five deterministic passes
 
 `r[train.pipeline.physics-probe]`
 
-On the aligned StarCenter reference stem (`s = 0`), Pass 1 performs 100% data-driven physical identification with zero device names, control-name matching, or circuit templates (REQ-1.6, REQ-1.9). It computes multi-regime sub-sample delay and polarity alignment (`ref[train.capture.alignment.multi-regime]`) and precomputes the input-only `Op-P` basis once on the host CPU in < 0.5 ms prior to GPU buffer upload: the true stereo 6-pair Jacobi elliptic Hilbert `H1` lattice, 3-basis carrier, and mid-derived pure-binary32 `T1` sub-harmonic −1 and −2 octave tracker channels (2× OS midpoint-interpolated across Full..Ultra).
+On the aligned StarCenter reference stem (`s = 0`), Pass 1 performs 100% data-driven physical identification with zero device names, control-name matching, or circuit templates (REQ-1.6, REQ-1.9). It computes multi-regime sub-sample delay and polarity alignment (`ref[train.capture.alignment.multi-regime]`) and precomputes the input-only `Op-P` basis once on host CPU in < 0.5 ms prior to GPU buffer upload: the true stereo 6-pair Hilbert H1 lattice, 3-basis carrier, and mid-derived 2-stage `rsqrt_pos_nr3` T1 −1 and −2 octave tracker channels (2× OS midpoint-interpolated across Full..Ultra).
 
-Next, Pass 1 identifies shared conjugate Kautz modal poles $\lbrace (r_m, \theta_m) \rbrace$ (8 / 12 / 24 / 32 cumulative pairs across Lite..Ultra, with $r_m \le 0.9995$, `ref[dsp.op-m.kautz.pole-extraction]`) via 2-pass Kautz OMP and Steiglitz–McBride rational identification. It simultaneously estimates front-end continuous `Op-N[Pre]` parameters (`gamma_bc`, `zoh_hold_depth = 1.0 - rho_zoh` in [0.0, 0.9999] with zero-init safe bypass, and `beta_q`) solely from aligned dry/wet telemetry.
+Next, Pass 1 identifies shared conjugate Kautz modal poles $\lbrace (r_m, \theta_m) \rbrace$ (8 / 12 / 24 / 32 cumulative pairs across Lite..Ultra, with $r_m \le 0.9995$, `ref[dsp.op-m.kautz.pole-extraction]`) via 2-pass Kautz OMP and Steiglitz–McBride rational identification, alongside initial `SensoryQuad` parameters and continuous front-end `Op-N[Pre]` settings (`gamma_bc`, `zoh_hold_depth = 1.0 - rho_zoh` in [0.0, 0.9999] with zero-init safe bypass, and `beta_q`) solely from aligned dry/wet telemetry.
 
-Pass 1 also estimates causal `Op-T` echo and comb delays of $\tau \ge 5.0$ across 4-frame causal micro-chunks over 1 / 2 / 3 / 4 `tank_quads` (4 / 8 / 12 / 16 lines), Doppler grain pitch and shimmer rates with nonzero `ramp_rate_hz`, complementary grain phases, and boundary window clamping $\mu_{\text{win},k}$, plus staggered barberpole sweeps and 4-lane `Q0.32` quadrature phasor frequencies across 0.05 Hz–20 kHz.
+Pass 1 also estimates causal `Op-T` echo and comb delays of $\tau \ge 5.0$ across 4-frame causal micro-chunks over 1 / 2 / 3 / 4 symmetric pure-wet `TransportQuad`s (4 / 8 / 12 / 16 lines), Doppler grain pitch and shimmer rates with nonzero `ramp_rate_hz`, complementary grain phases, continuous `freeze_mix` and `tank_dry_mix`, unified `sigma_sat` ceiling (`<= 0.984375`), boundary window clamping $\mu_{\text{win},k}$, and 4-lane `Q0.32` quadrature phasor frequencies across 0.05 Hz–20 kHz.
 
 It enforces all intrinsic stability bounds upfront: $\Vert \mathbf{A}_{\text{tpt}} \Vert_2 \le 1$, `ParaLRU` $J_i \in (0, r_{\max}]$, $\tau \ge 5.0$, and coercive `Op-T` $\Vert G_{\text{loop}} \Vert < 1$ (`ref[train.audit.phase1.clamp-stability]`).
 
@@ -79,13 +79,13 @@ It enforces all intrinsic stability bounds upfront: $\Vert \mathbf{A}_{\text{tpt
 
 `r[train.pipeline.backbone-trajectory-opt]`
 
-Pass 2 jointly trains the fixed-shape 4-tier Matryoshka SONA core (Lite ⊂ Full ⊂ Pro ⊂ Ultra) on StarCenter plus extreme switch and gain corners when present. It begins by screening 64–128 Sobol and log-spaced spectral initializations in parallel across GPU workgroups or host SIMD lanes in < 30 ms to avoid single-basin local minima on stiff crossovers, envelope rectifiers, and nonlinear feedback paths (REQ-1.9).
+Pass 2 jointly trains the fixed-shape 4-tier Matryoshka SONA core (Lite ⊂ Full ⊂ Pro ⊂ Ultra) inside the pure 2×2 VM topology on StarCenter plus extreme switch and gain corners when present. It begins by screening 64–128 Sobol and log-spaced spectral initializations in parallel across GPU workgroups or host SIMD lanes in < 30 ms to avoid single-basin local minima on stiff crossovers, envelope rectifiers, and nonlinear feedback paths (REQ-1.9).
 
-Full-capsule optimization then executes directly over the 2.0–2.5 s (96,000–120,000 frames) fp32 timeline to capture 0.5–2.5 s B+ sag, optical dual-release, and spatial decay couplings simultaneously.
+Full-capsule optimization then executes directly over the 2.0–2.5 s (96,000–120,000 frames) fp32 timeline to capture `SensoryQuad` gating/sidechain coupling, 0.5–2.5 s B+ sag, magnetic Duhem hysteresis, optical dual-release, and spatial decay couplings simultaneously.
 
-Computation stays within the strict portable workgroup SRAM ceiling of at most 15,872 B (15.5 KiB), reserving at least 512 B of the 16,384 B baseline for GPU driver and subgroup scratch while pairing optional hardware subgroup optimizations with a clean subgroup-free fallback. Inside 15,360 B (15.0 KiB) forward and 14,848 B (14.5 KiB) adjoint budgets, persistent tiles run 4-block `TPT-SVF` exclusive 2×2 Blelloch prefix scans, lane-parallel in-SRAM `ParaLRU` updates, and `PolyADAA1` / $C^2$ wavefolder evaluation.
+Computation stays within the strict portable workgroup SRAM ceiling of at most 15,872 B (15.5 KiB), reserving at least 512 B of the 16,384 B baseline for GPU driver and subgroup scratch while pairing optional hardware subgroup optimizations with a clean subgroup-free fallback. Inside 15,360 B (15.0 KiB) forward and 14,848 B (14.5 KiB) adjoint budgets, persistent tiles run 4-block `TPT-SVF` exclusive 2×2 Blelloch prefix scans, 4-thread joint `(L, R)` Selective-Duhem + stereo-linked `ParaLRU` in-SRAM updates, and `PolyADAA1` / $C^2$ wavefolder / bounded `GLU` evaluation.
 
-To preserve exact long-tail sensitivity across both the core and spatial feedback loops, Pass 2 pairs 2-level cross-tile linear-recurrence and 2×2 TPT reverse-adjoint suffix scans (§3.2) with 256-sample tile activation checkpointing and exact recurrent `Op-T` forward/adjoint differentiation. Gradients propagate analytically through 4-tap Catmull-Rom cubic readers, branchless triangle-folded Hermite windows, partitioned Schroeder all-pass states, pitch-down loop-gain bounds, and dual-latch `WE` transitions.
+To preserve exact long-tail sensitivity across both the core and Op-T feedback loops, Pass 2 pairs 2-level cross-tile linear-recurrence and 2×2 TPT reverse-adjoint suffix scans (§3.2) with 256-sample tile activation checkpointing (`Slot 8` `feature_outputs` bound in adjoint for GLU), Selective-Duhem `BP_i` and `lru_stereo_link` pullback, C∞ Op-N[Pre] raised-cosine/Fourier gradients, and exact recurrent Op-T differentiation through Catmull-Rom cubic readers, Hermite windows, partitioned Schroeder all-pass states, unified `sigma_sat` limiters, and continuous `freeze_mix` recirculation.
 
 Trajectory optimization minimizes composable multi-objective perceptual losses combining offline 3-band Bezout `bESR`, 5-scale `MR-IIR` (`ref[qual.companion.mr-iir]`), Spectral Optimal Transport (`SpecOT`), multi-window Gabor magnitude, and instantaneous-frequency plus group-delay (`IF+GD`) phase coherence. The offline 3-band Bezout crossover exists purely inside this training loss metric, with zero runtime clean-path crossover inside the audio VM.
 
@@ -97,11 +97,11 @@ Optimization terminates strictly on `BestUntilDiminishingReturns` (`|ΔbESR| < 0
 
 `r[train.pipeline.nested-varpro-schur]`
 
-Pass 3 solves the causally nested Lite, Full, Pro, and Ultra direct-register VarPro readout subspace (`W_readout` `fp16` subspace plus `pre_cab` and `direct` stereo linear projections) and pre-nonlinear crossbar conditioning jointly in one run (REQ-5.1, REQ-5.2).
+Pass 3 solves the causally nested Lite, Full, Pro, and Ultra direct-register `LinearReadout` subspace (`W_ro,0` `fp16` subspace plus `pre_conv` and `direct_s2` stereo linear projections) and learned `"DBRM"` `ro_pole_48k` tilt/shelf basis jointly in one run alongside pre-nonlinear crossbar conditioning (REQ-5.1, REQ-5.2).
 
 Accumulated tier-prefix normal equations $\mathbf{G}_{1:D_T, 1:D_T} + \boldsymbol{\Lambda}_{D_T}$ are solved via IEEE-754 float64 Cholesky factorization and Schur-complement prefix re-balancing so Lite, Full, Pro, and Ultra each achieve optimal spectral balance without separate per-tier jobs.
 
-Normal equations are weighted across 4th-order Bezout LF/MF/HF bands (`ref[qual.besr.bezout-crossover]`), subject to 33-band 1/3-octave LTAS tilt bounds (`ref[qual.companion.ltas]`), while refining continuous Kautz poles and lag-ordered early FIR taps (32 / 48 / 96 / 128 taps), conditioning pre-nonlinear crossbar and `CP1`/`U_int` subspaces, and baking StarCenter readout statistics into `STAT` (`ref[container.proj.stat-uplo-u]`).
+Normal equations are weighted across 4th-order Bezout LF/MF/HF bands (`ref[qual.besr.bezout-crossover]`), subject to 33-band 1/3-octave LTAS tilt bounds (`ref[qual.companion.ltas]`), while refining continuous Kautz poles and lag-ordered `ModalConvolver` early FIR taps (32 / 48 / 96 / 128 taps), conditioning pre-nonlinear crossbar and `CP1`/`U_int` subspaces, and baking StarCenter readout statistics into `STAT` (`ref[container.proj.stat-uplo-u]`).
 
 ### 2.4 Pass 4 — Parametric Control-Bus & `CP1` Subspace Identification
 
@@ -111,9 +111,9 @@ Across multi-stem control schedules for $P \ge 1$, Pass 4 fits per-stem 3 kHz Pa
 
 These fits optimize CP1 contributor slices (`W_main`, `w_proj`, and `v`, adding `"CP1\0"` overflow streams when exceeding 8 slots or 576 B in `cp1_base`) alongside global Rank-4/8 `U_int` matrices.
 
-Each fit also solves all 16 base rows of `W_ctrl`, Ultra `W_ctrl_ultra`, and the optional 1,280 B `"CEXT"` dispatch matrix.
+Each fit also solves all 16 base rows of `W_ctrl`, Ultra `W_ctrl_ultra`, `lfo_skew_fp16`, `ou_to_z_stage*_fp16`, and the optional 1,280 B `"CEXT"` dispatch matrix.
 
-Extended dispatch rows 16..31 of `stage_targets[0..32]` include immediate-snap slot 16 (`op_t_we_drive`) identified empirically from sustain-hold stems without any dedicated freeze role heuristics, slot 30 (`router_gate_thresh_delta`), and 40 B `"TSYN"` physical PeriodMs/FrequencyHz tempo rows alongside TPT-SVF, ParaLRU, and crossbar targets (`ref[container.dnam.cp1-profile]`).
+Extended dispatch rows 16..31 of `stage_targets[0..32]` include uniformly micro-ramped slot 16 (`op_t_freeze_mix_delta`) identified empirically from sustain-hold stems without freeze-role heuristics, slot 22 stage `op_t_dry_mix_mod`, slot 30 (`sense_vca_gain_delta` in `[-1.0, +1.0]`), and 40 B `"TSYN"` physical PeriodMs/FrequencyHz tempo rows alongside TPT-SVF, ParaLRU, `Op-N[Pre]`, and crossbar targets (`ref[container.dnam.cp1-profile]`).
 
 Each stem uses Gauss–Lobatto interpolation anchored at StarCenter (Mode-0 locked for 0-ULP invariance) while running the non-stop 3-Phase Control-Space Audit across all 32 dispatch slots (`ref[train.audit.phase1.clamp-stability]`).
 
@@ -154,9 +154,9 @@ State updates use exact trapezoidal integrators $s_{\text{sub}}[n] = b_{\text{su
 
 Before emission, Pass 5 runs a ~25 ms deterministic host CPU pass using the reference CPU engine and 3-limb compensated binary64 summation over the certification timeline (REQ-4.2). This locks 0-ULP parity between GPU-accelerated and CPU-only solves while persisting `uplo='U'` `STAT` sufficient statistics for < 50 ms Path 1 Vault updates.
 
-Pass 5 then enforces adjacent-tier monotone non-regression (Lite <= Full <= Pro <= Ultra) and verifies intrinsic stability: $\Vert \mathbf{A}_{\text{tpt}} \Vert_2 \le 1$, `ParaLRU` $J_i \in (0, r_{\max}]$, causal `Op-T` $\tau \ge 5.0$ across crossbar micro-chunks or $\ge 4.0$ standalone with coercive $\Vert G_{\text{loop}} \Vert < 1$, `Op-N[Pre]` `zoh_hold_depth` inside [0.0, 0.9999], and `[STAB-ZERO-DC]` $b_{\text{head}} = 0.0$.
+Pass 5 then enforces adjacent-tier monotone non-regression (Lite <= Full <= Pro <= Ultra) and verifies intrinsic stability: $\Vert \mathbf{A}_{\text{tpt}} \Vert_2 \le 1$, `ParaLRU` $J_i \in (0, r_{\max}]$, causal `Op-T` $\tau \ge 5.0$ across crossbar micro-chunks or $\ge 4.0$ standalone with coercive $\Vert G_{\text{loop}} \Vert < 1$, `Op-N[Pre]` `zoh_hold_depth` inside [0.0, 0.9999], `ro_pole_48k` inside `[0.0, 0x3F7F_FFAC]`, and `[STAB-ZERO-DC]` $b_{\text{head}} = 0.0$.
 
-It calibrates <= 0.05 LU inter-tier `tier_gain_trim_lin` (REQ-5.4) and applies optional 0-ULP odd-symmetric SONA sign-flip, Cabinet Kautz, and EMR-masked Tardos watermarking strictly outside protected .dnam-bin prefixes, `"CEXT"`, and `Op-N[Pre]` fields (`ref[sec.watermark.reciprocal-gauge]`).
+It calibrates <= 0.05 LU inter-tier `tier_gain_trim_lin` (REQ-5.4) and applies optional 0-ULP odd-symmetric CoreQuad sign-flip (plus cyclic `glu_mix_fp16` parity), ModalConvolver Kautz, and EMR-masked Tardos watermarking strictly outside protected `.dnam-bin` prefixes, `"CEXT"`, SensoryQuad, `ou_to_z_stage_ultra_fp16`, and Op-N[Pre] fields (`ref[sec.watermark.reciprocal-gauge]`).
 
 Finally, Pass 5 certifies the 4-metric perceptual suite (bESR, MR-IIR, LTAS, SegESR) and compiles the pure-binary Layer-0 .dnam-bin image. The Layer-0 header prefix (`dbin_prefix`) spans `"DNBN"`, `"DBRM"`, `shared_controls`, `"TSYN"`, optional `"CEXT"`, and 64 B zero-padding ahead of Arena 0..3.
 
@@ -200,7 +200,7 @@ It splits mantissas using `DEKKER_SPLIT_F64 = 134_217_729.0` (with zero hardware
 
 ```mermaid
 flowchart LR
-    Kernels["Single-Source 32-Bit DSP Operators<br/>AOT SPIR-V-to-Shader, Ozaki (2^8,2^16,2^24), TPT-SVF, ParaLRU, PolyADAA1"] --> Shaders["32-Bit GPU Compute Kernels<br/>prescreen_population, fused_core_scan_256,<br/>adjoint_scan_256, gabor_bezout_grad, ozaki_gram_rhs_i32, inner_opt_step"]
+    Kernels["Single-Source 32-Bit DSP Operators<br/>AOT SPIR-V-to-Shader, Ozaki (2^8,2^16,2^24), SensoryQuad, TPT-SVF, Selective-Duhem ParaLRU, PolyADAA1 + GLU"] --> Shaders["32-Bit GPU Compute Kernels<br/>prescreen_population, fused_core_scan_256 (4-thread L/R),<br/>adjoint_scan_256 (+ Slot 8 feature_outputs), gabor_bezout_grad, ozaki_gram_rhs_i32, inner_opt_step"]
     Shaders --> Probe["< 1 ms Startup GPU Probes<br/>(i32 Ozaki Dot, Binary32 Ceil, >= 16 KiB Adapter Limit)"]
     Probe -->|"Pass"| GPU["32-Bit WebGPU Execution<br/><= 15.5 KiB SRAM Scans + 256x Checkpointing + i32 Ozaki"]
     Probe -->|"No Adapter / Fail"| CPU["Deterministic CPU SIMD Fallback<br/>(NEON/SVE2/SME/AVX2/128-bit SIMD < 64 MiB)"]
@@ -216,34 +216,34 @@ Before dispatching workgroups, GPU backends run < 1 ms startup probes verifying 
 
 If any probe fails, execution falls back transparently to the deterministic CPU SIMD solver.
 
-**Universal <= 15,872 B (15.5 KiB) Workgroup-SRAM Scans & 256× Checkpointing (REQ-4.3):** Each 256-thread workgroup processes one `(group, stem)` pair across 8 decoupled scalar lanes (4L + 4R) under the portable <= 15,872 B (15.5 KiB) workgroup shared-memory ceiling, reserving >= 512 B of the 16,384 B adapter baseline for GPU driver and optional subgroup scratch.
+**Universal <= 15,872 B (15.5 KiB) Workgroup-SRAM Scans & 256× Checkpointing (REQ-4.3):** Each 256-thread workgroup processes one `(CoreQuad, stem)` pair across 8 decoupled scalar lanes (4L + 4R) under the portable <= 15,872 B (15.5 KiB) workgroup shared-memory ceiling, reserving >= 512 B of the 16,384 B adapter baseline for GPU driver and optional subgroup scratch.
 
 This shrinks 16 stems × 2.5 s (1.92M frames) of activation tapes from ~780 MiB to ~3.1 MiB, keeping 16–32 inner m = 8 L-BFGS / Gauss–Newton steps GPU-resident with < 5 ms asynchronous host readback and zero blocking event-loop waits.
 
-In the forward kernel (`fused_core_scan_256`, 15,360 B = 15.0 KiB <= 15,872 B), dispatch runs once per cascade block (`block_idx` in 0..4) over grid `(groups_in_block, num_independent_windows, num_stems)`. Persistent workgroups iterate across tiles `tile_start .. tile_start + num_tiles` carrying `(s1, s2, v, adaa_prev)` in registers.
+In the forward kernel (`fused_core_scan_256`, 15,360 B = 15.0 KiB <= 15,872 B), dispatch runs once per cascade block (`block_idx` in 0..4) over grid `(quads_in_block, num_independent_windows, num_stems)`. Persistent workgroups iterate across tiles `tile_start .. tile_start + num_tiles` carrying `(s1, s2, v, adaa_prev)` in registers.
 
 All 256 threads run exclusive `(s_{1,t-1}, s_{2,t-1})` 2×2 `TPT-SVF` Blelloch scans (`scan_scratch`: `1,536 × f32` = 6,144 B) into `lane_buf` (`512 × f32[4]` = 8,192 B).
 
-Next, workgroup threads 0..8 (`local_invocation_index < 8`) execute the `ParaLRU` step in registers and overwrite `lane_buf` in-place with pre-activation `r_curr[t]` (zero-DC soft rectification, zero intra-tile barriers), while all 256 threads evaluate `PolyADAA1` and the `C^2` wavefolder using `aux_scratch` (`64 × f32[4]` = 1,024 B) and pad partial tail tiles with identity elements.
+Next, workgroup threads 0..4 (`local_invocation_index < 4`) execute Selective-Duhem ParaLRU and `lru_stereo_link` jointly across `(v_{L,i}, v_{R,i})` in registers across 1- or 2-lane passes over `(u_tone, BP)` inside scan_scratch (6,144 B, keeping total SRAM <= 15,872 B) before overwriting `lane_buf` with pre-activation `r_curr[t]` (+0.0 Zero-DC). All 256 threads then evaluate PolyADAA1, the $C^2$ wavefolder, and bounded cross-lane GLU (after `wavefolder_mix`, canonicalizing +0.0) using `aux_scratch` (1,024 B) and padding tail tiles with identity elements.
 
-In the backward kernel (`adjoint_scan_256`, 14,848 B = 14.5 KiB <= 15,872 B), exact 3-pass full-stem BPTT executes within one uniform binding layout selected by `pass_mode` in `{0, 1, 2}`, propagating gradients across both core states and recurrent `Op-T` paths.
+In the backward kernel (`adjoint_scan_256`, 14,848 B = 14.5 KiB <= 15,872 B), exact 3-pass full-stem BPTT executes within one uniform binding layout selected by `pass_mode` in {0, 1, 2}, propagating gradients across CoreQuad states (including `Slot 8` `feature_outputs` for zero-SRAM cross-lane GLU pullback, `lru_stereo_link` transpose, Selective-Duhem `BP_i` recomputation into `adj_s1, adj_s2, adj_g`, Op-N[Pre] 1-D affine/Fourier paths) and recurrent Op-T paths.
 
 Its 14.5 KiB SRAM budget partitions across `s_prev2` (4,096 B), `u_tone2` (2,048 B), `v_traj2` (2,048 B), `scan_scratch` (6,144 B), and `aux` (512 B).
 
-It indexes storage slot 7 (`tile_adj_boundaries`) at stride `16 × f32[4]` (256 B per stem, `g_local`, and tile), where lane channel `c` in 0..4 occupies `4 × f32[4]` at `slot = (((stem * groups_in_block + g_local) * num_tiles + tile) * 4 + c) * 4`:
+It indexes storage slot 7 (`tile_adj_boundaries`) at stride `16 × f32[4]` (256 B per stem, q_local, and tile), where lane channel c in 0..4 occupies `4 × f32[4]` at `slot = (((stem * quads_in_block + q_local) * num_tiles + tile) * 4 + c) * 4` while reading `Slot 8` (`feature_outputs`) for zero-SRAM cross-lane GLU adjoint pullback and recomputing Selective-Duhem `BP_i` and `lru_stereo_link` transposes in registers:
 
 | Slot 7 Offset | Element Type | `pass_mode = 0` Write & `pass_mode = 1` Suffix Resolution | `pass_mode = 2` Tile Pullback Role |
 | :--- | :--- | :--- | :--- |
 | `slot + 0` | `f32[4]` | 2×2 TPT adjoint transition matrix `(t00, t01, t10, t11)`; overwritten in-place during `pass_mode = 1` with `(adj_s1_L_out, adj_s2_L_out, adj_s1_R_out, adj_s2_R_out)` | Supplies resolved outgoing `(adj_s1_out, adj_s2_out)` boundary sensitivities |
 | `slot + 1` | `f32[4]` | 2×2 TPT adjoint injection vector `(g0_L, g1_L, g0_R, g1_R)` | Consumed during `pass_mode = 1` cross-tile suffix scan |
-| `slot + 2` | `f32[4]` | `ParaLRU` linear-scan element `(a_L, b_L, a_R, b_R)`; overwritten in-place during `pass_mode = 1` with `(adj_v_out_L, adj_v_out_R, 0, 0)` | Supplies resolved outgoing `adj_v_out` sensitivity |
+| `slot + 2` | `f32[4]` | Selective-Duhem `ParaLRU` linear-scan element `(a_L, b_L, a_R, b_R)`; overwritten in-place during `pass_mode = 1` with `(adj_v_out_L, adj_v_out_R, 0, 0)` | Supplies resolved outgoing `adj_v_out` sensitivity after `lru_stereo_link` transpose pullback |
 | `slot + 3` | `f32[4]` | `PolyADAA1` seam `(r_first_L, r_first_R, 0, 0)` written by `tile` | Read during `pass_mode = 2` by `tile` via `tile_adj_boundaries[slot + 16 + 3]` when `tile + 1 < num_tiles` for the `(r_curr[255], r_curr[256])` seam pullback |
 
 | Adjoint Pass Mode (`pass_mode`) | Dispatch Grid | Exact Execution Role (Zero Truncation Across 200 ms–2.5 s Poles) |
 | :--- | :--- | :--- |
-| 0 | `(groups_in_block, num_tiles, num_stems)` | Recomputes `v_traj` from `tile_checkpoints[tile]` in parallel; writes `slot + 0..3` summaries into `tile_adj_boundaries` |
-| 1 (< 0.05 ms) | `(groups_in_block, 1, num_stems)` | Executes level-2 `O(log2 num_tiles)` suffix scan in 256-tile scan blocks, overwriting `slot + 0` and `slot + 2` with outgoing boundary sensitivities |
-| 2 | `(groups_in_block, num_tiles, num_stems)` | Consumes resolved boundaries plus `tile + 1` seam, runs intra-tile `ParaLRU` and 2×2 TPT suffix scans in `scan_scratch`, and emits deterministic per-tile `param_grads` (zero `f32` atomics) |
+| 0 | `(quads_in_block, num_tiles, num_stems)` | Recomputes `v_traj` from `tile_checkpoints[tile]` in parallel; writes `slot + 0..3` summaries into `tile_adj_boundaries` |
+| 1 (< 0.05 ms) | `(quads_in_block, 1, num_stems)` | Executes level-2 `O(log2 num_tiles)` suffix scan in 256-tile scan blocks, overwriting `slot + 0` and `slot + 2` with outgoing boundary sensitivities |
+| 2 | `(quads_in_block, num_tiles, num_stems)` | Consumes resolved boundaries, `tile + 1` seam, and `Slot 8` `feature_outputs` for `GLU` pullback; runs Selective-Duhem `BP_i`, `ParaLRU`, and 2×2 TPT suffix scans in `scan_scratch`, emitting deterministic `param_grads` (zero `f32` atomics) |
 
 **Fast-Math-Immune (2^8, 2^16, 2^24) `i32` Ozaki Accumulator & 2-D Memory Planner (REQ-4.2, REQ-4.3):** Exact integer-sliced Ozaki accumulation uses dynamic power-of-two block scaling, returning `(1.0, 1.0)` on non-positive or non-finite chunk `max_abs`.
 
@@ -261,9 +261,9 @@ The 2-D `RESIDENT_BATCHED` / `STREAMED` memory planner tiles `time_block × stem
 
 | Compute Kernel | 256-Thread Workgroup Grid | Slot 0: 32-Byte Packed Uniforms | Storage Buffer Slots (`1..N`) |
 | :--- | :--- | :--- | :--- |
-| `prescreen_population` | `(num_seeds, num_tiles, num_stems)` | `PrescreenUniforms { num_seeds: u32, num_frames: u32, num_groups: u32, num_stems: u32, sample_rate_hz: f32, eps_floor: f32, _pad0: u32, _pad1: u32 }` | `Slot 1 (RO)`: `input_audio: f32[2][]`<br/>`Slot 2 (RO)`: `target_audio: f32[2][]`<br/>`Slot 3 (RO)`: `seed_params: f32[]`<br/>`Slot 4 (RW)`: `seed_losses: f32[]` |
-| `fused_core_scan_256` | `(groups_in_block, num_independent_windows, num_stems)` (1 dispatch per `block_idx` in 0..4) | `FusedScanUniforms { num_frames: u32, num_tiles: u32, num_groups: u32, num_stems: u32, tile_start: u32, soft_rect_eps: f32, tiny_crossing_eps: f32, block_idx: u32 }` | `Slot 1 (RO)`: `core_inputs: f32[4][]`<br/>`Slot 2 (RO)`: `group_params: f32[4][]`<br/>`Slot 3 (RW)`: `tile_checkpoints: f32[4][]`<br/>`Slot 4 (RW)`: `feature_outputs: f32[4][]` |
-| `adjoint_scan_256` | `(groups_in_block, num_tiles or 1, num_stems)` (`pass_mode` in `{0, 1, 2}` per `block_idx`) | `AdjointScanUniforms { num_frames: u32, num_tiles: u32, num_groups: u32, num_stems: u32, pass_mode: u32, soft_rect_eps: f32, tiny_crossing_eps: f32, block_idx: u32 }` | `Slot 1 (RO)`: `core_inputs: f32[4][]`<br/>`Slot 2 (RO)`: `group_params: f32[4][]`<br/>`Slot 3 (RO)`: `tile_checkpoints: f32[4][]`<br/>`Slot 4 (RO)`: `d_loss_d_features: f32[4][]`<br/>`Slot 5 (RW)`: `d_loss_d_inputs: f32[4][]`<br/>`Slot 6 (RW)`: `param_grads: f32[4][]`<br/>`Slot 7 (RW)`: `tile_adj_boundaries: f32[4][]` |
+| `prescreen_population` | `(num_seeds, num_tiles, num_stems)` | `PrescreenUniforms { num_seeds: u32, num_frames: u32, num_quads: u32, num_stems: u32, sample_rate_hz: f32, eps_floor: f32, _pad0: u32, _pad1: u32 }` | `Slot 1 (RO)`: `input_audio: f32[2][]`<br/>`Slot 2 (RO)`: `target_audio: f32[2][]`<br/>`Slot 3 (RO)`: `seed_params: f32[]`<br/>`Slot 4 (RW)`: `seed_losses: f32[]` |
+| `fused_core_scan_256` | `(quads_in_block, num_independent_windows, num_stems)` (1 dispatch per `block_idx` in 0..4) | `FusedScanUniforms { num_frames: u32, num_tiles: u32, num_quads: u32, num_stems: u32, tile_start: u32, soft_rect_eps: f32, tiny_crossing_eps: f32, block_idx: u32 }` | `Slot 1 (RO)`: `core_inputs: f32[4][]`<br/>`Slot 2 (RO)`: `quad_params: f32[4][]`<br/>`Slot 3 (RW)`: `tile_checkpoints: f32[4][]`<br/>`Slot 4 (RW)`: `feature_outputs: f32[4][]` |
+| `adjoint_scan_256` | `(quads_in_block, num_tiles or 1, num_stems)` (`pass_mode` in `{0, 1, 2}` per `block_idx`) | `AdjointScanUniforms { num_frames: u32, num_tiles: u32, num_quads: u32, num_stems: u32, pass_mode: u32, soft_rect_eps: f32, tiny_crossing_eps: f32, block_idx: u32 }` | `Slot 1 (RO)`: `core_inputs: f32[4][]`<br/>`Slot 2 (RO)`: `quad_params: f32[4][]`<br/>`Slot 3 (RO)`: `tile_checkpoints: f32[4][]`<br/>`Slot 4 (RO)`: `d_loss_d_features: f32[4][]`<br/>`Slot 5 (RW)`: `d_loss_d_inputs: f32[4][]`<br/>`Slot 6 (RW)`: `param_grads: f32[4][]`<br/>`Slot 7 (RW)`: `tile_adj_boundaries: f32[4][]`<br/>`Slot 8 (RO)`: `feature_outputs: f32[4][]` (`GLU` neighbor `adaa_odd` pullback, 0 B extra SRAM) |
 | `gabor_bezout_grad` | `(num_subbands_or_windows, num_stems, 1)` | `GaborBezoutUniforms { num_frames: u32, fft_size: u32, hop_size: u32, num_stems: u32, w_lf: f32, w_mf: f32, w_hf: f32, eps_noise: f32 }` | `Slot 1 (RO)`: `pred_audio: f32[2][]`<br/>`Slot 2 (RO)`: `target_audio: f32[2][]`<br/>`Slot 3 (RO)`: `bezout_taps: f32[4][]` (offline multi-band perceptual `bESR` training loss only; zero runtime clean crossover)<br/>`Slot 4 (RW)`: `d_loss_d_pred: f32[2][]`<br/>`Slot 5 (RW)`: `band_losses: f32[4][]` |
 | `ozaki_gram_rhs_i32` | `(num_col_tiles, ceil(num_frames / 1024), 1)` | `OzakiGramUniforms { num_frames: u32, feature_dim: u32, target_channels: u32, chunk_len: u32, num_chunks: u32, _pad0: u32, _pad1: u32, _pad2: u32 }` | `Slot 1 (RO)`: `features: f32[]`<br/>`Slot 2 (RO)`: `targets: f32[]`<br/>`Slot 3 (RO)`: `col_scales: f32[2][]`<br/>`Slot 4 (RW)`: `ozaki_buckets: i32[]` |
 | `inner_opt_step` | `(ceil(num_params / 256), 1, 1)` | `InnerOptUniforms { num_params: u32, history_m: u32, step_idx: u32, line_search_iter: u32, step_size: f32, damping_lambda: f32, min_bound_eps: f32, _pad: u32 }` | `Slot 1 (RW)`: `theta: f32[]`<br/>`Slot 2 (RO)`: `grad: f32[]`<br/>`Slot 3 (RO)`: `param_bounds: f32[2][]`<br/>`Slot 4 (RW)`: `lbfgs_s_y: f32[4][]`<br/>`Slot 5 (RW)`: `search_dir: f32[]` |
@@ -276,7 +276,7 @@ The 2-D `RESIDENT_BATCHED` / `STREAMED` memory planner tiles `time_block × stem
 
 `r[train.pipeline.isomorphism-parity]`
 
-Because the identification solver and runtime audio engine execute identical fixed-precision DSP operator formulations (shared-pole Kautz bank, TPT-SVF, ParaLRU, PolyADAA1, and Op-T), GPU and host solves agree across all modules.
+Because the identification solver and runtime audio engine execute identical fixed-precision DSP operator formulations (`SensoryQuad`, `ModalConvolver` FIR/Kautz bank, TPT-SVF, Selective-Duhem stereo-linked ParaLRU, PolyADAA1, wavefolder, `GLU`, smooth `Op-N[Pre]`, and pure-wet `Op-T`), GPU and host solves agree across all modules.
 
 Every GPU-accelerated solve concludes with a deterministic host CPU reference pass and 3-limb compensated binary64 summation, so exporting `WGHT` (wrapping `.dnam-bin`) from `.dnam-proj` reproduces the solver's predicted waveform to 0 ULP (`Oracle-01..03`, `bESR` <= -60 dB).
 
@@ -298,7 +298,7 @@ Host `f64` `uplo = 'U'` Cholesky factorization solves $\mathbf{G}_{\psi}$ over e
 
 The solve outputs `CP1` (`main_base` and `main_ultra`, inline or `"CP1\0"`), 4×8 `U_int`, `stage_latent_*` sensitivity tables, and 40 B `"TSYN"` tempo rows.
 
-It also resolves all 32 `stage_targets[0..32]` rows across 16-row `W_ctrl`, Ultra `W_ctrl_ultra`, and optional 1,280 B `"CEXT"` rows 16..31 including empirical slot 16 `op_t_we_drive` and slot 30 `router_gate_thresh_delta`.
+It also resolves all 32 `stage_targets[0..32]` rows across 16-row `W_ctrl`, Ultra `W_ctrl_ultra`, and optional 1,280 B `"CEXT"` rows 16..31 including empirical slot 16 `op_t_freeze_mix_delta`, slot 22 stage `op_t_dry_mix_mod`, and slot 30 `sense_vca_gain_delta`.
 
 ### 4.3 Four-Tier Signal-Chain Fixture Matrix & White-Box Runners
 
