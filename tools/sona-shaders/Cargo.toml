@@ -1,0 +1,56 @@
+[workspace]
+resolver = "3"
+members = ["."]
+exclude = ["crates/sona-shaders-gpu"]
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("spirv"))'] }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "deny"
+ptr_as_ptr = "deny"
+dbg_macro = "deny"
+todo = "deny"
+needless_range_loop = "allow"
+
+[package]
+name = "sona-shaders"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.100"
+license = "LicenseRef-DNAM-1.0.0"
+repository = "https://github.com/dnam-project/dnam"
+publish = false
+description = "Offline AOT SPIR-V-to-WGSL compiler, Naga validator, and shared ABI for SONA v3.0 WebGPU compute shaders"
+
+[lib]
+name = "sona_shaders"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sona-shaders-gen"
+path = "src/bin/sona_shaders_gen.rs"
+
+[dependencies]
+dnam-kernels = { path = "../../packages/kernels", default-features = false }
+cargo-gpu-install = "0.11.0"
+spirv-builder = { version = "0.11.0", default-features = false }
+naga = { version = "30.0.2", features = ["wgsl-in", "wgsl-out", "spv-in"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+anyhow = "1.0"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[dev-dependencies]
+wgpu = "30.0.2"
+pollster = "0.4"
+proptest = "1.6"
+
+[lints]
+workspace = true

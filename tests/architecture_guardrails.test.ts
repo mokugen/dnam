@@ -16,6 +16,7 @@
  * verify[sdk.rust.modular-layout-and-proptest]
  */
 
+import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { describe, expect, it } from "vitest";
@@ -32,6 +33,7 @@ import {
   SPECS_DIR,
   stripRustCommentsAndStrings,
   TESTS_DIR,
+  TOOLS_DIR,
   walkFilesByExtensions,
 } from "./test-support.js";
 
@@ -214,6 +216,108 @@ function checkCargoAndMoonBoundaries(): void {
   }
 }
 
+interface WgslManifestEntry {
+  name?: string;
+  wgsl_path?: string;
+  sha256?: string;
+  workgroup_sram_bytes?: number;
+}
+
+interface WgslManifestFile {
+  version?: number;
+  portable?: WgslManifestEntry[];
+  subgroups?: WgslManifestEntry[];
+}
+
+function checkSonaShadersArtifacts(): void {
+  const rootCargo = fs.readFileSync(path.join(REPO_ROOT, "Cargo.toml"), "utf8");
+  const wsSec = parseTomlSections(rootCargo).find((s) => s.header === "workspace");
+  expect(wsSec?.body ?? "").toMatch(/exclude\s*=\s*\[[^\]]*"tools\/sona-shaders"/);
+
+  const shaderToolDir = path.join(TOOLS_DIR, "sona-shaders");
+  expect(
+    fs.existsSync(path.join(shaderToolDir, "Cargo.lock")),
+    "tools/sona-shaders/Cargo.lock must be checked in",
+  ).toBe(true);
+  const topCargo = fs.readFileSync(path.join(shaderToolDir, "Cargo.toml"), "utf8");
+  expect(topCargo, "tools/sona-shaders/Cargo.toml missing isolated [workspace]").toMatch(
+    /^\s*\[workspace\]/m,
+  );
+  const gpuCargo = fs.readFileSync(
+    path.join(shaderToolDir, "crates", "sona-shaders-gpu", "Cargo.toml"),
+    "utf8",
+  );
+  expect(
+    gpuCargo,
+    "tools/sona-shaders/crates/sona-shaders-gpu/Cargo.toml missing isolated [workspace]",
+  ).toMatch(/^\s*\[workspace\]/m);
+
+  const forbiddenShaderDeps = /\b(?:dnam[-_]fixtures|ndarray|dialoguer|realfft|rustfft|nalgebra)\b/;
+  for (const cargoRel of ["Cargo.toml", path.join("crates", "sona-shaders-gpu", "Cargo.toml")]) {
+    const body = fs.readFileSync(path.join(shaderToolDir, cargoRel), "utf8");
+    expect(body, `tools/sona-shaders/${cargoRel} missing edition = "2024"`).toContain(
+      'edition = "2024"',
+    );
+    expect(body, `tools/sona-shaders/${cargoRel} missing publish = false`).toMatch(
+      /publish\s*=\s*false/,
+    );
+    expect(body, `tools/sona-shaders/${cargoRel} missing LicenseRef-DNAM-1.0.0`).toContain(
+      'license = "LicenseRef-DNAM-1.0.0"',
+    );
+    expect(body, `tools/sona-shaders/${cargoRel} has forbidden dep`).not.toMatch(
+      forbiddenShaderDeps,
+    );
+  }
+
+  const wgslDir = path.join(shaderToolDir, "wgsl");
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(wgslDir, "manifest.json"), "utf8"),
+  ) as WgslManifestFile;
+  expect(manifest.version).toBe(1);
+
+  const expectedKernels = [
+    "prescreen_population",
+    "fused_core_scan_256",
+    "adjoint_scan_256",
+    "gabor_bezout_grad",
+    "ozaki_gram_rhs_i32",
+    "inner_opt_step",
+  ].sort();
+
+  for (const entries of [manifest.portable, manifest.subgroups]) {
+    expect(Array.isArray(entries)).toBe(true);
+    const list = entries ?? [];
+    expect(list.map((entry) => entry.name ?? "").sort()).toEqual(expectedKernels);
+    for (const entry of list) {
+      const wgslRel = entry.wgsl_path ?? "";
+      const wgslPath = path.join(wgslDir, wgslRel);
+      expect(fs.existsSync(wgslPath), `Missing WGSL artifact ${relPath(wgslPath)}`).toBe(true);
+      const wgslBytes = fs.readFileSync(wgslPath);
+      const wgsl = wgslBytes.toString("utf8");
+      const actualSha = crypto.createHash("sha256").update(wgslBytes).digest("hex");
+      expect(entry.sha256, `${wgslRel} manifest sha256 mismatch`).toBe(actualSha);
+      expect(
+        entry.workgroup_sram_bytes,
+        `${wgslRel} workgroup_sram_bytes must fit <= 15,872 B`,
+      ).toBeGreaterThanOrEqual(0);
+      expect(
+        entry.workgroup_sram_bytes,
+        `${wgslRel} workgroup_sram_bytes must fit <= 15,872 B`,
+      ).toBeLessThanOrEqual(15_872);
+      expect(wgsl.trim().length, `${wgslRel} must be non-empty`).toBeGreaterThan(0);
+      expect(wgsl, `${wgslRel} missing @workgroup_size(256, 1, 1)`).toContain(
+        "@workgroup_size(256, 1, 1)",
+      );
+      expect(wgsl, `${wgslRel} contains forbidden 64/128-bit WGSL type`).not.toMatch(
+        /\b(?:f64|u64|i64|u128|i128)\b/,
+      );
+      expect(wgsl, `${wgslRel} contains forbidden continuing / break if`).not.toMatch(
+        /\bcontinuing\b|\bbreak\s+if\b/,
+      );
+    }
+  }
+}
+
 function collectTreeMatches(
   roots: readonly string[],
   exts: ReadonlySet<string>,
@@ -234,6 +338,7 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
   it("test_crate_manifest_boundaries_isolation_and_idea_imls", () => {
     checkFixturesManifestStrictness();
     checkCargoAndMoonBoundaries();
+    checkSonaShadersArtifacts();
     checkSeparateIdeaImlsForPackages();
 
     for (const cargoPath of [
@@ -323,7 +428,8 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
       `\\b(?:${["TO" + "DO", "FIX" + "ME", "X" + "XX", "HA" + "CK"].join("|")})\\b`,
     );
     const todoViolations: string[] = [];
-    for (const root of [DOCS_DIR, PACKAGES_DIR, TESTS_DIR, SCRIPTS_DIR]) {
+    const shaderToolDir = path.join(TOOLS_DIR, "sona-shaders");
+    for (const root of [DOCS_DIR, PACKAGES_DIR, shaderToolDir, TESTS_DIR, SCRIPTS_DIR]) {
       for (const filePath of walkFilesByExtensions(
         root,
         new Set([".md", ".rs", ".ts", ".tsx", ".mjs"]),
@@ -492,6 +598,10 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
         .readdirSync(PACKAGES_DIR, { withFileTypes: true })
         .filter((e) => e.isDirectory())
         .map((e) => path.join(PACKAGES_DIR, e.name, "moon.yml")),
+      ...fs
+        .readdirSync(TOOLS_DIR, { withFileTypes: true })
+        .filter((e) => e.isDirectory())
+        .map((e) => path.join(TOOLS_DIR, e.name, "moon.yml")),
     ];
     for (const mf of moonFiles) {
       if (fs.existsSync(mf)) {

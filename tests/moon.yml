@@ -154,6 +154,15 @@ tasks:
       - "/packages/**/*.rs"
       - "/packages/**/*.ts"
       - "/packages/**/*.tsx"
+      - "/tools/sona-shaders/Cargo.toml"
+      - "/tools/sona-shaders/Cargo.lock"
+      - "/tools/sona-shaders/moon.yml"
+      - "/tools/sona-shaders/AGENTS.md"
+      - "/tools/sona-shaders/src/**/*.rs"
+      - "/tools/sona-shaders/tests/**/*.rs"
+      - "/tools/sona-shaders/crates/sona-shaders-gpu/Cargo.toml"
+      - "/tools/sona-shaders/crates/sona-shaders-gpu/src/**/*.rs"
+      - "/tools/sona-shaders/wgsl/**/*"
       - "/**/*.py"
     options:
       runFromWorkspaceRoot: true

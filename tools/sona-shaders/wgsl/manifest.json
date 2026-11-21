@@ -1,0 +1,464 @@
+{
+  "version": 1,
+  "target": "spirv-unknown-naga-wgsl",
+  "portable": [
+    {
+      "name": "prescreen_population",
+      "wgsl_path": "prescreen_population.wgsl",
+      "sha256": "fc1333e7acb1cf86cab13c9845debb8c0bb50b7a0dbd32600a68ac46209df19d",
+      "workgroup_sram_bytes": 8192,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read_write"
+        }
+      ]
+    },
+    {
+      "name": "fused_core_scan_256",
+      "wgsl_path": "fused_core_scan_256.wgsl",
+      "sha256": "3e212d7574e87b588b7a72097754b64dd8e2a2c8c7f201c35369b9771476ff07",
+      "workgroup_sram_bytes": 15360,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read_write"
+        }
+      ]
+    },
+    {
+      "name": "adjoint_scan_256",
+      "wgsl_path": "adjoint_scan_256.wgsl",
+      "sha256": "36fe5559eef4db5cc2d2d2c1132bdb06d92e6cbd2800eb063ca81f52ab269d53",
+      "workgroup_sram_bytes": 14848,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 5,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 6,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 7,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 8,
+          "access": "storage_read"
+        }
+      ]
+    },
+    {
+      "name": "gabor_bezout_grad",
+      "wgsl_path": "gabor_bezout_grad.wgsl",
+      "sha256": "7c55daea7c70b25eb165ecb7f4d39bcd715c19686f430bfe4d91dd21d7502d8b",
+      "workgroup_sram_bytes": 11264,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 5,
+          "access": "storage_read_write"
+        }
+      ]
+    },
+    {
+      "name": "ozaki_gram_rhs_i32",
+      "wgsl_path": "ozaki_gram_rhs_i32.wgsl",
+      "sha256": "2f47a5cd8918c659c3205f2f5e5a83f24ccab1c708af375cc853d59ffa836e23",
+      "workgroup_sram_bytes": 5120,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read_write"
+        }
+      ]
+    },
+    {
+      "name": "inner_opt_step",
+      "wgsl_path": "inner_opt_step.wgsl",
+      "sha256": "c42ee3c9238e8b2bbf4c299f96c7abceac0be4f1c85619c30dd0c74974ba5d06",
+      "workgroup_sram_bytes": 2176,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 5,
+          "access": "storage_read_write"
+        }
+      ]
+    }
+  ],
+  "subgroups": [
+    {
+      "name": "prescreen_population",
+      "wgsl_path": "subgroups/prescreen_population.wgsl",
+      "sha256": "cabf86dab3fc9d2caafd5ef91039f9e5385c96b88b5146198cd777c22a435c40",
+      "workgroup_sram_bytes": 8192,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read_write"
+        }
+      ]
+    },
+    {
+      "name": "fused_core_scan_256",
+      "wgsl_path": "subgroups/fused_core_scan_256.wgsl",
+      "sha256": "3e212d7574e87b588b7a72097754b64dd8e2a2c8c7f201c35369b9771476ff07",
+      "workgroup_sram_bytes": 15360,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read_write"
+        }
+      ]
+    },
+    {
+      "name": "adjoint_scan_256",
+      "wgsl_path": "subgroups/adjoint_scan_256.wgsl",
+      "sha256": "43c4ea356baba0e5079348851244ddc88f60ac3ea61073f348e8bb01b8796f1f",
+      "workgroup_sram_bytes": 14848,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 5,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 6,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 7,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 8,
+          "access": "storage_read"
+        }
+      ]
+    },
+    {
+      "name": "gabor_bezout_grad",
+      "wgsl_path": "subgroups/gabor_bezout_grad.wgsl",
+      "sha256": "abe87dfecfafa379b4eca275f73f6f511a6d7eceeb811382148d2e9058033af6",
+      "workgroup_sram_bytes": 11264,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 5,
+          "access": "storage_read_write"
+        }
+      ]
+    },
+    {
+      "name": "ozaki_gram_rhs_i32",
+      "wgsl_path": "subgroups/ozaki_gram_rhs_i32.wgsl",
+      "sha256": "3f7245a298d56f9fa2f105478319049ad539c8e4f7bcd7d5bc1e5ef41510ad83",
+      "workgroup_sram_bytes": 5120,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read_write"
+        }
+      ]
+    },
+    {
+      "name": "inner_opt_step",
+      "wgsl_path": "subgroups/inner_opt_step.wgsl",
+      "sha256": "d44526b474753a9df5f2dec5ed65552d0f12bbc47b3d14f5a89d0708a3783d64",
+      "workgroup_sram_bytes": 2176,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 5,
+          "access": "storage_read_write"
+        }
+      ]
+    }
+  ]
+}

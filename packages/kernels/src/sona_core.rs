@@ -11,7 +11,9 @@ pub mod paralru;
 pub mod poly_adaa;
 pub mod tpt_svf;
 
-pub use core_quad::{CoreQuadParamsStereo4, couple_ms_input_stereo8, step_core_quad_stereo8};
+pub use core_quad::{
+    CoreQuadParamsStereo4, MIN_SAG_GAIN, couple_ms_input_stereo8, step_core_quad_stereo8,
+};
 pub use op_n_pre::{
     OP_N_PRE_BETA_BYPASS_EPS, OP_N_PRE_FULL_PASS_THRESH, OP_N_PRE_INV_TAU_F32, OP_N_PRE_MAX_BETA_Q,
     OP_N_PRE_MAX_ZOH_HOLD_DEPTH, OP_N_PRE_MIN_RHO_EFF, OP_N_PRE_QUANT_CLAMP_F32, OpNPreHoisted,
@@ -35,13 +37,14 @@ pub use paralru::{
     step_paralru_duhem_stereo8, step_paralru_duhem_vec4, step_paralru_stereo8, step_paralru_vec4,
 };
 pub use poly_adaa::{
-    QuadratureHysteresis2D, eval_c2_wavefolder_adaa_stereo8, eval_c2_wavefolder_adaa_vec4,
-    eval_poly_adaa1_odd_even_vec4, eval_poly_adaa1_quad_batched, eval_poly_adaa1_stereo8,
+    MAX_ADAA_ENDPOINT, QuadratureHysteresis2D, TINY_CROSSING_EPS, eval_c2_wavefolder_adaa_stereo8,
+    eval_c2_wavefolder_adaa_vec4, eval_poly_adaa1_odd_even_vec4, eval_poly_adaa1_quad_batched,
+    eval_poly_adaa1_stereo8,
 };
 pub use tpt_svf::{
-    TptAdjointElem, TptScanElem, TptSvfCoeffs4, TptSvfOutputs, apply_tpt_adjoint, apply_tpt_init,
-    compose_tpt_adjoint_scan, compose_tpt_scan, prewarp_tan_pi_f_over_fs_f32, step_tpt_svf_stereo8,
-    step_tpt_svf_vec4,
+    MIN_TPT_G, TptAdjointElem, TptScanElem, TptSvfCoeffs4, TptSvfOutputs, apply_tpt_adjoint,
+    apply_tpt_init, compose_tpt_adjoint_scan, compose_tpt_scan, prewarp_tan_pi_f_over_fs_f32,
+    step_tpt_svf_stereo8, step_tpt_svf_vec4,
 };
 
 /// Simultaneous 4-mode `TPT-SVF` + direct-feed tone mixing weights (`ref[dsp.op-n.core.tpt-tone-basis]`).

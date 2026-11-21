@@ -11,6 +11,11 @@ use super::poly_adaa::{self, eval_c2_wavefolder_adaa_stereo8, eval_poly_adaa1_st
 use super::tpt_svf::{TptSvfCoeffs4, step_tpt_svf_stereo8};
 use super::{SonaBlockOutputStereo8, SonaBlockStateStereo8, SonaToneWeights4};
 
+/// Minimum positive power-supply sag gain floor protecting the `PolyADAA1` linear drive path.
+pub const MIN_SAG_GAIN: f32 = 0.05;
+
+const _: () = assert!(MIN_SAG_GAIN > 0.0 && MIN_SAG_GAIN < 1.0);
+
 /// Complete parameter bundle for one SONA v3.0 4-lane stereo `CoreQuad`
 /// (`TPT-SVF -> Selective-Duhem ParaLRU + Stereo Link -> PolyADAA1 + C^2 Wavefolder -> GLU`,
 /// `ref[dsp.op-n.core.matryoshka-blocks]`).
@@ -85,7 +90,7 @@ pub fn step_core_quad_stereo8<S: StereoVec8>(
 
     let sag_gain = S::splat(1.0)
         .fms(S::broadcast_half(params.sag_depth), v_eff)
-        .max(S::splat(0.05));
+        .max(S::splat(MIN_SAG_GAIN));
     let r_curr = tone_in
         .mul(S::broadcast_half(params.adaa_drive))
         .mul(sag_gain)

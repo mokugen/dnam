@@ -27,6 +27,7 @@ import {
   stripRustCommentsAndStrings,
   stripRustCommentsOnly,
   TESTS_DIR,
+  TOOLS_DIR,
   walkFilesByExtensions,
 } from "./test-support.js";
 
@@ -38,6 +39,9 @@ const STRICT_FORBID_ROOTS = [
   "packages/studio/rust/main.rs",
   "packages/studio/build.rs",
   "packages/js/build.rs",
+  "tools/sona-shaders/src/lib.rs",
+  "tools/sona-shaders/src/bin/sona_shaders_gen.rs",
+  "tools/sona-shaders/crates/sona-shaders-gpu/src/lib.rs",
 ];
 
 function checkTsAndMjsTypeSafety(): void {
@@ -179,6 +183,12 @@ function checkRustUnsafeIsolation(): void {
       }
     }
   }
+  for (const p of walkFilesByExtensions(
+    path.join(TOOLS_DIR, "sona-shaders", "tests"),
+    new Set([".rs"]),
+  )) {
+    strictForbidSet.add(relPath(p));
+  }
   const strictForbidRe = /#\s*!\s*\[\s*forbid\s*\(\s*unsafe_code\s*\)\s*\]/;
   for (const strictRel of [...strictForbidSet].sort()) {
     const libPath = path.join(REPO_ROOT, strictRel);
@@ -195,11 +205,13 @@ function checkRustUnsafeIsolation(): void {
   const unsafeBlockRe = /\bunsafe\s*(?:\{|fn\b|impl\b|trait\b|extern\b)/;
   const unsafeViolations: string[] = [];
 
-  for (const safePkg of ["kernels", "fixtures", "capture", "studio"]) {
-    for (const rsFile of walkFilesByExtensions(
+  for (const safeRoot of [
+    ...["kernels", "fixtures", "capture", "studio"].map((safePkg) =>
       path.join(PACKAGES_DIR, safePkg),
-      new Set([".rs"]),
-    )) {
+    ),
+    path.join(TOOLS_DIR, "sona-shaders"),
+  ]) {
+    for (const rsFile of walkFilesByExtensions(safeRoot, new Set([".rs"]))) {
       const stripped = stripRustCommentsAndStrings(fs.readFileSync(rsFile, "utf8"));
       if (unsafeOverrideRe.test(stripped) || unsafeConstructRe.test(stripped)) {
         unsafeViolations.push(`${relPath(rsFile)}: contains forbidden unsafe construct`);
@@ -223,6 +235,7 @@ function checkPackageLineCeilings(): void {
     { dir: path.join(PACKAGES_DIR, "ui"), exts: new Set([".ts", ".tsx"]) },
     { dir: path.join(PACKAGES_DIR, "js"), exts: new Set([".rs", ".ts", ".tsx"]) },
     { dir: path.join(PACKAGES_DIR, "studio"), exts: new Set([".rs", ".ts", ".tsx"]) },
+    { dir: path.join(TOOLS_DIR, "sona-shaders"), exts: new Set([".rs"]) },
     { dir: TESTS_DIR, exts: new Set([".ts"]) },
     { dir: SCRIPTS_DIR, exts: new Set([".mjs"]) },
   ];
@@ -306,17 +319,19 @@ function checkRustModularFile(rsPath: string, violations: string[]): void {
   const base = path.basename(rsPath);
   const content = fs.readFileSync(rsPath, "utf8");
 
-  if (
-    /^packages\/[^/]+\/(?:src|rust)\//.test(rel) &&
-    !/^packages\/[^/]+\/(?:src|rust)\/bin\//.test(rel)
-  ) {
+  const prodSrcRe = /^(?:packages\/[^/]+|tools\/sona-shaders(?:\/crates\/[^/]+)?)\/(?:src|rust)\//;
+  const prodBinRe =
+    /^(?:packages\/[^/]+|tools\/sona-shaders(?:\/crates\/[^/]+)?)\/(?:src|rust)\/bin\//;
+  const pkgTestsRe = /^(?:packages\/[^/]+|tools\/sona-shaders(?:\/crates\/[^/]+)?)\/tests\//;
+
+  if (prodSrcRe.test(rel) && !prodBinRe.test(rel)) {
     if (isolatedTestRe.test(base) && !sharedHelpers.has(base)) {
       violations.push(`${rel}: isolated unit-test file in src/rust`);
     }
     const declMatch = externalModRe.exec(content);
     if (declMatch) violations.push(`${rel}: external unit-test mod '${declMatch[0].trim()}'`);
   }
-  if (/^packages\/[^/]+\/tests\//.test(rel) && base.endsWith("_coverage.rs")) {
+  if (pkgTestsRe.test(rel) && base.endsWith("_coverage.rs")) {
     violations.push(`${rel}: grab-bag '*_coverage.rs' integration test file`);
   }
   if (/\\n\\(?:\r?\n)/.test(content)) {
@@ -506,6 +521,16 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
     for (const rsPath of walkFilesByExtensions(vmSrcDir, new Set([".rs"]))) {
       scanBottomTestsAndTypes(rsPath, false, violations);
     }
+    const gpuShadersSrcDir = path.join(
+      TOOLS_DIR,
+      "sona-shaders",
+      "crates",
+      "sona-shaders-gpu",
+      "src",
+    );
+    for (const rsPath of walkFilesByExtensions(gpuShadersSrcDir, new Set([".rs"]))) {
+      scanBottomTestsAndTypes(rsPath, false, violations);
+    }
     expect(violations).toEqual([]);
   });
 
@@ -541,6 +566,7 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
       path.join(PACKAGES_DIR, "vm", "src", "control"),
       path.join(PACKAGES_DIR, "engine", "src"),
       path.join(PACKAGES_DIR, "studio", "rust"),
+      path.join(TOOLS_DIR, "sona-shaders", "src"),
     ]) {
       for (const rsPath of walkFilesByExtensions(safeDir, new Set([".rs"]))) {
         scanRustProdLines(rsPath, (sLine, _raw, ln) => {
@@ -552,14 +578,19 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
   });
 
   it("test_modular_decomposition_and_no_barrels_or_isolated_tests", () => {
-    const modRsFiles = walkFilesByExtensions(PACKAGES_DIR, new Set([".rs"]))
+    const shaderToolDir = path.join(TOOLS_DIR, "sona-shaders");
+    const rustRoots = [PACKAGES_DIR, shaderToolDir];
+    const modRsFiles = rustRoots
+      .flatMap((rootDir) => walkFilesByExtensions(rootDir, new Set([".rs"])))
       .filter((p) => path.basename(p) === "mod.rs")
       .map(relPath);
     expect(modRsFiles).toEqual([]);
 
     const violations: string[] = [];
-    for (const rsPath of walkFilesByExtensions(PACKAGES_DIR, new Set([".rs"]))) {
-      checkRustModularFile(rsPath, violations);
+    for (const rootDir of rustRoots) {
+      for (const rsPath of walkFilesByExtensions(rootDir, new Set([".rs"]))) {
+        checkRustModularFile(rsPath, violations);
+      }
     }
     for (const tsPath of walkFilesByExtensions(
       PACKAGES_DIR,
@@ -609,6 +640,7 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
       path.join(PACKAGES_DIR, "engine", "tests"),
       path.join(PACKAGES_DIR, "capture"),
       path.join(PACKAGES_DIR, "fixtures"),
+      path.join(TOOLS_DIR, "sona-shaders", "tests"),
     ]) {
       const hasProptest = walkFilesByExtensions(dirPath, new Set([".rs"])).some((f) =>
         fs.readFileSync(f, "utf8").includes("proptest!"),
@@ -654,11 +686,13 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
       });
     };
 
-    for (const filePath of walkFilesByExtensions(
-      PACKAGES_DIR,
-      new Set([".rs", ".ts", ".tsx", ".md"]),
-    )) {
-      checkFile(filePath);
+    for (const rootDir of [PACKAGES_DIR, path.join(TOOLS_DIR, "sona-shaders")]) {
+      for (const filePath of walkFilesByExtensions(
+        rootDir,
+        new Set([".rs", ".ts", ".tsx", ".md"]),
+      )) {
+        checkFile(filePath);
+      }
     }
     for (const filePath of walkFilesByExtensions(docsDir, new Set([".md"]))) {
       checkFile(filePath);

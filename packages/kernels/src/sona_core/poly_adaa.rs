@@ -13,12 +13,12 @@ pub use wavefolder::{
 
 pub(super) const ONE_THIRD: f32 = 1.0 / 3.0;
 pub(super) const ONE_FIFTH: f32 = 1.0 / 5.0;
-pub(super) const TINY_CROSSING_EPS: f32 = 1.0e-6;
-/// Pre-clamp endpoint bound ensuring `upper - lower <= 2 * MAX_ENDPOINT` never overflows to `+Inf`.
-const MAX_ENDPOINT: f32 = 1.0e18;
+pub const TINY_CROSSING_EPS: f32 = 1.0e-6;
+/// Pre-clamp endpoint bound ensuring `upper - lower <= 2 * MAX_ADAA_ENDPOINT` never overflows to `+Inf`.
+pub const MAX_ADAA_ENDPOINT: f32 = 1.0e18;
 
 const _: () = assert!(TINY_CROSSING_EPS > 0.0);
-const _: () = assert!(MAX_ENDPOINT > 1.0 && (2.0 * MAX_ENDPOINT).is_finite());
+const _: () = assert!(MAX_ADAA_ENDPOINT > 1.0 && (2.0 * MAX_ADAA_ENDPOINT).is_finite());
 
 /// Scrubs non-finite lanes (`NaN`/`±Inf` -> `+0.0`), clamps finite extremes to `[-1e18, 1e18]`,
 /// and canonicalizes `-0.0` to `+0.0` across 4 SIMD lanes.
@@ -26,8 +26,8 @@ const _: () = assert!(MAX_ENDPOINT > 1.0 && (2.0 * MAX_ENDPOINT).is_finite());
 pub(crate) fn scrub_endpoint_vec4<V: KernelVec4>(u: V) -> V {
     let zero = V::zero();
     let max_abs_finite = V::splat(f32::MAX);
-    let max_ep = V::splat(MAX_ENDPOINT);
-    let neg_max_ep = V::splat(-MAX_ENDPOINT);
+    let max_ep = V::splat(MAX_ADAA_ENDPOINT);
+    let neg_max_ep = V::splat(-MAX_ADAA_ENDPOINT);
     V::select_le(u.abs(), max_abs_finite, u, zero)
         .clamp(neg_max_ep, max_ep)
         .add(zero)
@@ -39,8 +39,8 @@ pub(crate) fn scrub_endpoint_vec4<V: KernelVec4>(u: V) -> V {
 pub(crate) fn scrub_endpoint_stereo8<S: StereoVec8>(u: S) -> S {
     let zero = S::zero();
     let max_abs_finite = S::splat(f32::MAX);
-    let max_ep = S::splat(MAX_ENDPOINT);
-    let neg_max_ep = S::splat(-MAX_ENDPOINT);
+    let max_ep = S::splat(MAX_ADAA_ENDPOINT);
+    let neg_max_ep = S::splat(-MAX_ADAA_ENDPOINT);
     S::select_le(u.abs(), max_abs_finite, u, zero)
         .clamp(neg_max_ep, max_ep)
         .add(zero)

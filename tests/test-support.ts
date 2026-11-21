@@ -14,6 +14,7 @@ export const SPECS_DIR = path.join(DOCS_DIR, "specs");
 export const ADR_DIR = path.join(DOCS_DIR, "adr");
 export const REQ_FILE = path.join(DOCS_DIR, "requirements", "system_goals_and_requirements.md");
 export const PACKAGES_DIR = path.join(REPO_ROOT, "packages");
+export const TOOLS_DIR = path.join(REPO_ROOT, "tools");
 export const TESTS_DIR = path.join(REPO_ROOT, "tests");
 export const SCRIPTS_DIR = path.join(REPO_ROOT, "scripts");
 
@@ -210,7 +211,9 @@ export function collectSourceRefTokens(): [string, string, number][] {
   const rootDocs = [path.join(REPO_ROOT, "AGENTS.md"), path.join(REPO_ROOT, "CONTRIBUTING.md")];
   for (const filePath of [
     ...rootDocs.filter((p) => fs.existsSync(p)),
-    ...[PACKAGES_DIR, DOCS_DIR, TESTS_DIR].flatMap((root) => walkFilesByExtensions(root, exts)),
+    ...[PACKAGES_DIR, TOOLS_DIR, DOCS_DIR, TESTS_DIR].flatMap((root) =>
+      walkFilesByExtensions(root, exts),
+    ),
   ]) {
     const rel = relPath(filePath);
     if (isGuardrailFile(filePath) || rel.startsWith(templateRel)) continue;
@@ -226,7 +229,7 @@ export function collectSourceRefTokens(): [string, string, number][] {
 
 export function collectTestVerifyTokens(): [string, string, number][] {
   const verifies: [string, string, number][] = [];
-  for (const root of [TESTS_DIR, PACKAGES_DIR]) {
+  for (const root of [TESTS_DIR, PACKAGES_DIR, TOOLS_DIR]) {
     for (const filePath of walkFilesByExtensions(root, new Set([".rs", ".ts", ".tsx"]))) {
       const lines = fs.readFileSync(filePath, "utf8").split("\n");
       for (let idx = 0; idx < lines.length; idx++) {

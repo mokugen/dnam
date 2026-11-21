@@ -2,6 +2,7 @@
 resolver = "3"
 members = ["packages/kernels", "packages/vm", "packages/engine", "packages/capture", "packages/fixtures", "packages/js", "packages/studio"]
 default-members = ["packages/kernels", "packages/vm", "packages/engine", "packages/capture", "packages/fixtures", "packages/studio"]
+exclude = ["tools/sona-shaders"]
 
 [workspace.package]
 version = "0.1.0"

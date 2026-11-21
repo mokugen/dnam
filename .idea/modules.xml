@@ -9,6 +9,7 @@
       <module fileurl="file://$PROJECT_DIR$/.idea/dnam-workspace.iml" filepath="$PROJECT_DIR$/.idea/dnam-workspace.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/engine.iml" filepath="$PROJECT_DIR$/.idea/engine.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/js.iml" filepath="$PROJECT_DIR$/.idea/js.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/sona-shaders.iml" filepath="$PROJECT_DIR$/.idea/sona-shaders.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/studio.iml" filepath="$PROJECT_DIR$/.idea/studio.iml" />
       <module fileurl="file://$PROJECT_DIR$/.idea/ui.iml" filepath="$PROJECT_DIR$/.idea/ui.iml" />
     </modules>

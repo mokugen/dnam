@@ -56,12 +56,19 @@ const _: () = assert!(SLICE0_SCALE_F32 * SLICE0_INV_F32 == 1.0);
 const _: () = assert!(SLICE1_SCALE_F32 * SLICE1_INV_F32 == 1.0);
 const _: () = assert!(SLICE2_SCALE_F32 == const_f32_pow2(24));
 
+/// Bit-level finiteness check avoiding `f32::is_finite()` (`self.abs() < f32::INFINITY`), whose
+/// `INFINITY` constant lowers to `OpConstant Inf` that Naga's SPIR-V validator rejects.
+#[inline(always)]
+const fn is_finite_f32_bits(x: f32) -> bool {
+    (x.to_bits() & IEEE754_F32_EXP_MASK) != IEEE754_F32_EXP_MASK
+}
+
 /// Division-free branchless IEEE-754 round-to-nearest-ties-to-even (`f32 -> i32`) guarded against
 /// non-finite values and clamped to `[-2^22, +2^22]` (`BIASED_INT_MAGIC_F32` exactness window).
 #[inline(always)]
 #[must_use]
 pub fn round_ties_even_f32(x: f32) -> i32 {
-    if !x.is_finite() {
+    if !is_finite_f32_bits(x) {
         return 0;
     }
     let clamped = x.clamp(-RNE_MAX_ABS_F32, RNE_MAX_ABS_F32);
@@ -99,12 +106,12 @@ pub fn pow2_ceil_fp32(max_abs: f32) -> (f32, f32) {
 #[inline(always)]
 #[must_use]
 pub fn slice_f32_mantissa_i8x3(val: f32, inv_scale: f32) -> [i32; 3] {
-    if !val.is_finite() || !inv_scale.is_finite() {
+    if !is_finite_f32_bits(val) || !is_finite_f32_bits(inv_scale) {
         return [0, 0, 0];
     }
     let val_clamped = val.clamp(-MAX_OZAKI_VAL_F32, MAX_OZAKI_VAL_F32);
     let v_raw = val_clamped * inv_scale;
-    if !v_raw.is_finite() {
+    if !is_finite_f32_bits(v_raw) {
         return [0, 0, 0];
     }
     let v = v_raw.clamp(-1.0, 1.0);

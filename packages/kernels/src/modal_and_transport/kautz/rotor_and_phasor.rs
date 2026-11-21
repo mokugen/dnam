@@ -7,9 +7,15 @@
 //! calls in runtime code (`ref[sdk.rust.shared-nostd-kernels]`).
 
 use crate::simd::{
-    BIASED_INT_MAGIC_F32, IEEE754_F32_ABS_MASK, KernelVec4, const_abs_f32, const_f32_pow2,
-    const_taylor_inv_fact_f32, flush_subnormal_f32_bits,
+    BIASED_INT_MAGIC_F32, IEEE754_F32_ABS_MASK, IEEE754_F32_EXP_MASK, KernelVec4, const_abs_f32,
+    const_f32_pow2, const_taylor_inv_fact_f32, flush_subnormal_f32_bits,
 };
+
+/// Bit-level finiteness check avoiding `f32::is_finite()` (`OpConstant Inf` fails Naga validation).
+#[inline(always)]
+const fn is_finite_f32_bits(x: f32) -> bool {
+    (x.to_bits() & IEEE754_F32_EXP_MASK) != IEEE754_F32_EXP_MASK
+}
 
 /// Exact `2^32` scale factor in `binary32` (`4_294_967_296.0`) for converting normalized
 /// frequency `cycles/sample` to `Q0.32` phase increments (`32-bit` integer wrap only).
@@ -68,21 +74,24 @@ const COS_C10: f32 = const_taylor_inv_fact_f32(10, true);
 const COS_C12: f32 = const_taylor_inv_fact_f32(12, false);
 const COS_C14: f32 = const_taylor_inv_fact_f32(14, true);
 
+/// Integer bit pattern of `BIASED_INT_MAGIC_F32` (`0x4B40_0000`) for fast-math-immune RNE
+/// extraction (`ref[dsp.op-m.rotor.quadrant-horner]`).
+const RNE_MAGIC_BITS: i32 = BIASED_INT_MAGIC_F32.to_bits() as i32;
+
 const _: () = assert!(BIASED_INT_MAGIC_F32.to_bits() == 0x4B40_0000);
+const _: () = assert!(RNE_MAGIC_BITS == 0x4B40_0000);
+const _: () = assert!(MAX_CODY_WAITE_RAD * INV_PIO2 < const_f32_pow2(22));
 const _: () = assert!(PIO2_1.to_bits() == 0x3FC9_0000);
 const _: () =
     assert!(const_abs_f32((PIO2_1 + PIO2_2 + PIO2_3) - core::f32::consts::FRAC_PI_2) < 1.0e-7);
 const _: () = assert!(const_abs_f32((HERMITE5_C1 - HERMITE5_C3 + HERMITE5_C5) - 1.0) < 1.0e-6);
 const _: () = assert!(COS_C2 == -0.5);
 
+/// Rounds `x` (`|x| <= 2^22 - 1`) to nearest-even `i32` via an integer bitcast barrier
+/// preventing GPU fast-math compilers from folding `(x + C) - C -> x`.
 #[inline(always)]
-fn round_ties_even_small_f32(x: f32) -> f32 {
-    let signed_magic = if x >= 0.0 {
-        BIASED_INT_MAGIC_F32
-    } else {
-        -BIASED_INT_MAGIC_F32
-    };
-    (x + signed_magic) - signed_magic
+fn round_ties_even_small_i32(x: f32) -> i32 {
+    ((x + BIASED_INT_MAGIC_F32).to_bits() as i32).wrapping_sub(RNE_MAGIC_BITS)
 }
 
 #[inline(always)]
@@ -131,13 +140,17 @@ fn freq_hz_to_q32_inc(freq_hz: f32, inv_sample_rate_hz: f32) -> u32 {
 #[inline(always)]
 #[must_use]
 pub fn algebraic_unit_rotor_f32(theta_rad: f32) -> (f32, f32) {
-    if !theta_rad.is_finite() || theta_rad == 0.0 || const_abs_f32(theta_rad) > MAX_CODY_WAITE_RAD {
+    if !is_finite_f32_bits(theta_rad)
+        || theta_rad == 0.0
+        || const_abs_f32(theta_rad) > MAX_CODY_WAITE_RAD
+    {
         return (1.0, 0.0);
     }
 
-    let q_f = round_ties_even_small_f32(theta_rad * INV_PIO2);
+    let q_i = round_ties_even_small_i32(theta_rad * INV_PIO2);
+    let q_f = q_i as f32;
     let r = ((theta_rad - q_f * PIO2_1) - q_f * PIO2_2) - q_f * PIO2_3;
-    if !r.is_finite() || const_abs_f32(r) > REDUCED_QUADRANT_GUARD_RAD {
+    if !is_finite_f32_bits(r) || const_abs_f32(r) > REDUCED_QUADRANT_GUARD_RAD {
         return (1.0, 0.0);
     }
 
@@ -150,7 +163,7 @@ pub fn algebraic_unit_rotor_f32(theta_rad: f32) -> (f32, f32) {
             + r2 * (COS_C6 + r2 * (COS_C8 + r2 * (COS_C10 + r2 * (COS_C12 + r2 * COS_C14)))));
     let cos_r = 1.0 + r2 * c_poly;
 
-    let quadrant = (q_f as i32) & 3;
+    let quadrant = q_i & 3;
     let (mut cos_out, mut sin_out) = match quadrant {
         0 => (cos_r, sin_r),
         1 => (-sin_r, cos_r),

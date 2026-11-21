@@ -130,6 +130,21 @@ pub const fn scrub_and_flush_f32_bits(value: f32) -> f32 {
     f32::from_bits(out_bits)
 }
 
+/// Scrubs `NaN`/`±Inf`, flushes subnormals, and canonicalizes `-0.0` (`0x8000_0000`) to
+/// bit-exact `+0.0` (`0x0000_0000`) via integer bitmasking (immune to GPU `+ 0.0` elision).
+#[inline(always)]
+#[must_use]
+pub const fn canonicalize_zero_f32_bits(value: f32) -> f32 {
+    let bits = value.to_bits();
+    let exp = bits & IEEE754_F32_EXP_MASK;
+    let out_bits = if exp == IEEE754_F32_EXP_MASK || exp == 0 {
+        0
+    } else {
+        bits
+    };
+    f32::from_bits(out_bits)
+}
+
 /// Level 1 Portable 4-Lane `f32` SIMD Register Abstraction (`f32x4` / `GpuVec4`).
 pub trait KernelVec4: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
     /// Broadcasts `val` across all 4 lanes.
@@ -616,6 +631,20 @@ mod tests {
         assert_eq!(
             dirty.flush_recursive_state().to_array().map(f32::to_bits),
             [0, 0x8000_0000, 0, 0]
+        );
+        assert_eq!(canonicalize_zero_f32_bits(-0.0).to_bits(), 0);
+        assert_eq!(canonicalize_zero_f32_bits(0.0).to_bits(), 0);
+        assert_eq!(
+            canonicalize_zero_f32_bits(f32::from_bits(0x8000_0001)).to_bits(),
+            0
+        );
+        assert_eq!(canonicalize_zero_f32_bits(f32::from_bits(1)).to_bits(), 0);
+        assert_eq!(canonicalize_zero_f32_bits(f32::NAN).to_bits(), 0);
+        assert_eq!(canonicalize_zero_f32_bits(f32::INFINITY).to_bits(), 0);
+        assert_eq!(canonicalize_zero_f32_bits(f32::NEG_INFINITY).to_bits(), 0);
+        assert_eq!(
+            canonicalize_zero_f32_bits(-1.5).to_bits(),
+            (-1.5_f32).to_bits()
         );
 
         let quad = DefaultTraitVec4::rcp_pos_quad_nr2([

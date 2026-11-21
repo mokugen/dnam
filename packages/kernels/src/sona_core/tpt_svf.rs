@@ -13,7 +13,7 @@ const OCTANT_SPLIT_RATIO: f32 = 0.25;
 /// Nyquist ratio `0.5` used for complementary co-function folding `0.5 - r`.
 const NYQUIST_RATIO: f32 = 0.5;
 /// Minimum positive tangent gain `g` for passive `TPT-SVF` coefficient derivation.
-const MIN_TPT_G: f32 = 1.0e-5;
+pub const MIN_TPT_G: f32 = 1.0e-5;
 
 // Compile-time degree-11/10 Maclaurin coefficients for `sin(x)` and `cos(x)` on `[0, pi/4]`
 // (`ref[repo.code.constant-eval-and-derivations]`; truncation error `< 2e-9` at `x = pi/4`).

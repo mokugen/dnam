@@ -1,0 +1,24 @@
+[workspace]
+
+[package]
+name = "sona-shaders-gpu"
+version = "0.1.0"
+edition = "2024"
+license = "LicenseRef-DNAM-1.0.0"
+repository = "https://github.com/dnam-project/dnam"
+publish = false
+description = "Single-source #![no_std] SPIR-V compute kernels for SONA v3.0 WebGPU training"
+
+[lib]
+crate-type = ["dylib", "rlib"]
+
+[features]
+default = []
+subgroups = []
+
+[dependencies]
+spirv-std = { version = "0.11.0", default-features = false, features = ["glam_0_34"] }
+dnam-kernels = { path = "../../../../packages/kernels", default-features = false }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_arch, values("spirv"))'] }

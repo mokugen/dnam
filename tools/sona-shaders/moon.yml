@@ -1,0 +1,170 @@
+$schema: "https://moonrepo.dev/schemas/project.json"
+
+id: "sona-shaders"
+language: "rust"
+layer: "tool"
+stack: "systems"
+tags:
+  - "rust"
+  - "webgpu"
+  - "shaders"
+
+project:
+  name: "sona-shaders"
+  description: "Offline AOT cargo-gpu SPIR-V-to-WGSL compiler, Naga validator, and ABI for SONA v3.0 compute kernels"
+
+dependsOn:
+  - "kernels"
+
+tasks:
+  format:
+    type: "run"
+    script: "cargo fmt --manifest-path tools/sona-shaders/Cargo.toml && cargo fmt --manifest-path tools/sona-shaders/crates/sona-shaders-gpu/Cargo.toml"
+    options:
+      cache: false
+      runFromWorkspaceRoot: true
+      runInCI: false
+    tags:
+      - "format"
+
+  format-check:
+    script: "cargo fmt --manifest-path tools/sona-shaders/Cargo.toml -- --check && cargo fmt --manifest-path tools/sona-shaders/crates/sona-shaders-gpu/Cargo.toml -- --check"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "crates/sona-shaders-gpu/Cargo.toml"
+      - "crates/sona-shaders-gpu/src/**/*"
+      - "/rustfmt.toml"
+    options:
+      runFromWorkspaceRoot: true
+    tags:
+      - "quality"
+      - "format"
+
+  lint:
+    command: "cargo"
+    args:
+      - "clippy"
+      - "--manifest-path"
+      - "tools/sona-shaders/Cargo.toml"
+      - "--all-targets"
+      - "--"
+      - "-D"
+      - "warnings"
+    inputs:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/rustfmt.toml"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+    options:
+      mutex: "cargo"
+      runFromWorkspaceRoot: true
+    tags:
+      - "quality"
+      - "lint"
+
+  typecheck:
+    command: "cargo"
+    args:
+      - "check"
+      - "--manifest-path"
+      - "tools/sona-shaders/Cargo.toml"
+      - "--all-targets"
+    inputs:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+    options:
+      mutex: "cargo"
+      runFromWorkspaceRoot: true
+    tags:
+      - "quality"
+      - "typecheck"
+
+  build:
+    type: "build"
+    command: "cargo"
+    args:
+      - "build"
+      - "--manifest-path"
+      - "tools/sona-shaders/Cargo.toml"
+      - "--release"
+    inputs:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**/*"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+    options:
+      mutex: "cargo"
+      runFromWorkspaceRoot: true
+    tags:
+      - "build"
+
+  test:
+    command: "cargo"
+    args:
+      - "test"
+      - "--manifest-path"
+      - "tools/sona-shaders/Cargo.toml"
+    inputs:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**/*"
+      - "tests/**/*"
+      - "wgsl/**/*"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+    options:
+      mutex: "cargo"
+      runFromWorkspaceRoot: true
+    tags:
+      - "test"
+
+  generate-wgsl:
+    type: "run"
+    command: "cargo"
+    args:
+      - "run"
+      - "--manifest-path"
+      - "tools/sona-shaders/Cargo.toml"
+      - "--bin"
+      - "sona-shaders-gen"
+      - "--"
+      - "build"
+    options:
+      cache: false
+      mutex: "cargo"
+      runFromWorkspaceRoot: true
+      runInCI: false
+
+  check-drift:
+    command: "cargo"
+    args:
+      - "run"
+      - "--manifest-path"
+      - "tools/sona-shaders/Cargo.toml"
+      - "--bin"
+      - "sona-shaders-gen"
+      - "--"
+      - "check-drift"
+    inputs:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "src/**/*"
+      - "crates/sona-shaders-gpu/**/*"
+      - "wgsl/**/*"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+    options:
+      mutex: "cargo"
+      runFromWorkspaceRoot: true
+    tags:
+      - "quality"
