@@ -6,7 +6,7 @@ pub mod simd_vec4;
 use dnam_kernels::{StereoVec8, scrub_and_flush_f32_bits};
 pub use simd_vec4::SimdVec4;
 
-use super::{BackendKind, algebraic_unit_rotor, f32_to_fp16, fp16_to_f32};
+use super::{BackendKind, IEEE754_F32_RSQRT_SEED, algebraic_unit_rotor, f32_to_fp16, fp16_to_f32};
 use crate::math::crc32c::Crc32cBackend;
 
 /// Flushes `f32` subnormals to signed zero without changing any other bit pattern.
@@ -27,28 +27,28 @@ pub fn flush_recursive_state_vec4<V: SimdVec4>(value: V) -> V {
     value.scrub_recursive_state()
 }
 
-/// Portable scalar 2-step Newton `rsqrt` (`0x5f37_59df - (v >> 1)`) for a positive `f32`.
+/// Portable scalar 2-step Newton `rsqrt` (`IEEE754_F32_RSQRT_SEED - (v >> 1)`) for a positive `f32`.
 #[inline(always)]
 pub fn rsqrt_nr2_scalar_f32(value: f32) -> f32 {
-    let mut est = f32::from_bits(0x5f37_59df - (value.to_bits() >> 1));
+    let mut est = f32::from_bits(IEEE754_F32_RSQRT_SEED - (value.to_bits() >> 1));
     let half_v = 0.5 * value;
     for _ in 0..2 {
-        let corr = 1.5 - (half_v * est) * est;
+        let corr = 1.5 - half_v * (est * est);
         est *= corr;
     }
     est
 }
 
-/// Portable scalar 2-step Newton `rsqrt` (`0x5f37_59df - (v >> 1)`) for a stereo pair `(v0, v1)`.
+/// Portable scalar 2-step Newton `rsqrt` (`IEEE754_F32_RSQRT_SEED - (v >> 1)`) for a stereo pair `(v0, v1)`.
 #[inline(always)]
 pub fn rsqrt_nr2_scalar_pair_f32(v0: f32, v1: f32) -> (f32, f32) {
-    let mut e0 = f32::from_bits(0x5f37_59df - (v0.to_bits() >> 1));
-    let mut e1 = f32::from_bits(0x5f37_59df - (v1.to_bits() >> 1));
+    let mut e0 = f32::from_bits(IEEE754_F32_RSQRT_SEED - (v0.to_bits() >> 1));
+    let mut e1 = f32::from_bits(IEEE754_F32_RSQRT_SEED - (v1.to_bits() >> 1));
     let hv0 = 0.5 * v0;
     let hv1 = 0.5 * v1;
     for _ in 0..2 {
-        let c0 = 1.5 - (hv0 * e0) * e0;
-        let c1 = 1.5 - (hv1 * e1) * e1;
+        let c0 = 1.5 - hv0 * (e0 * e0);
+        let c1 = 1.5 - hv1 * (e1 * e1);
         e0 *= c0;
         e1 *= c1;
     }
@@ -237,6 +237,38 @@ pub(crate) mod tests {
         assert_eq!(B::fp16x4_to_vec4(&fp16).to_array(), x);
         let fp16_arr = B::f32x4_to_fp16x4(&x);
         assert_eq!(B::fp16x4_to_f32x4(&fp16_arr), x);
+
+        let over = [65_504.0_f32, -65_504.0, 65_520.0, -100_000.0];
+        assert_eq!(
+            B::vec4_to_fp16x4(B::Vec4::from_array(over)),
+            [0x7BFF, 0xFBFF, 0x7BFF, 0xFBFF]
+        );
+        assert_eq!(B::f32x4_to_fp16x4(&over), [0x7BFF, 0xFBFF, 0x7BFF, 0xFBFF]);
+        let special = [
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7FC0_0000),
+            f32::from_bits(0x7F80_0001),
+        ];
+        assert_eq!(
+            B::vec4_to_fp16x4(B::Vec4::from_array(special)),
+            [0x7C00, 0xFC00, 0x7E00, 0x7C01]
+        );
+        {
+            let _ftz = crate::types::FtzDazGuard::new();
+            let sub = [
+                0.0_f32,
+                -0.0_f32,
+                f32::from_bits(0x3380_0000),
+                -f32::from_bits(0x387F_C000),
+            ];
+            let sub_h = B::vec4_to_fp16x4(B::Vec4::from_array(sub));
+            assert_eq!(sub_h, ScalarBackend::f32x4_to_fp16x4(&sub));
+            assert_eq!(
+                B::fp16x4_to_vec4(&sub_h).to_array().map(f32::to_bits),
+                sub.map(f32::to_bits)
+            );
+        }
         assert!((B::rsqrt_nr2_f32(4.0) - 0.5).abs() < 1.0e-5);
         let (ra, rb) = B::rsqrt_nr2_pair_f32(4.0, 9.0);
         assert!((ra - 0.5).abs() < 1.0e-5 && (rb - (1.0 / 3.0)).abs() < 1.0e-5);

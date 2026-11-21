@@ -16,8 +16,12 @@ extern crate alloc;
 pub mod bin;
 #[forbid(unsafe_code)]
 pub mod control;
+#[forbid(unsafe_code)]
+pub mod graph;
 pub mod math;
 pub mod types;
+#[forbid(unsafe_code)]
+pub mod vm;
 
 pub use bin::{
     Arena0ControlBusWire, Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire,
@@ -45,9 +49,49 @@ pub use control::{
     eval_uint_ultra_delta_3x4x8, invert_tsyn_lobatto_anchors, step_control_frame_default,
     step_control_tick_3khz_default, trust_clip_outward_4d,
 };
+pub use graph::{
+    Bounce4xOversampler, CABINET_FULL_DELTA_FIR_TAPS, CABINET_KAUTZ_ONSET_DELAY_48K,
+    CABINET_LITE_FIR_TAPS, CABINET_MAX_CHUNK_FRAMES, CABINET_MAX_FIR_TAPS,
+    CABINET_PRO_DELTA_FIR_TAPS, CABINET_SEG_TAPS, CABINET_ULTRA_DELTA_FIR_TAPS, CABINET_WORK_LEN,
+    CabinetBackend, CabinetFirHistorySlices, CabinetFirWeightSlices, CabinetHighSrFirExt,
+    CabinetHighSrMode, CrossbarFrame, DEFAULT_SIDECHAIN_LR4_HZ, EXT_FIR_STORAGE_F32_LEN,
+    FLAG_COLD_FIR_EXT, FLAG_CROSSBAR_ACTIVE, FLAG_MONO_OUT, FLAG_OS2X, FLAG_SINGLE_INPUT,
+    FLAG_WET_POLARITY_INV, FLAG_XFADE_ACTIVE, GraphBackend, HoistedCoreChunk, IoAlignmentMode,
+    IoRouter, IoSidechainDetectorBank, KautzColdSlewState, KautzPrefixOverride, KautzStereoBank4,
+    MAX_KAUTZ_BANKS, MAX_KAUTZ_PAIRS, OFFLINE_BOUNCE_PDC_SAMPLES, ParallelAlignLine,
+    PartitionedSchroederBank, QuadColdMeta, QuadEffectiveTargets, QuadHydrateConfig, QuadModSlots,
+    QuadRingMut, QuadStepResult, RouterGateConfig, SONA_BLOCK_GROUP_SLOTS,
+    SONA_GROUP_BLOCK_AND_LOCAL, SONA_INTERBLOCK_TILES, SONA_ULTRA_GROUP_TRAVERSAL_ORDER,
+    SonaColdTail, SonaFullHotDelta, SonaGroupHot, SonaGroupReadoutHot, SonaGroupReadoutRegs,
+    SonaHotSlab, SonaInterBlockTileHot, SonaLiteHotPrefix, SonaOs2xHot, SonaOversamplerParams,
+    SonaProHotDelta, SonaSlabBacking, SonaStereoOversampler2x, SonaUltraHotDelta,
+    TANK_INLINE_QUAD0_CAP, TANK_MAX_EXT_CAP, TANK_MAX_QUADS, TANK_MIN_EXT_CAP,
+    TIER_SWITCH_XFADE_SAMPLES, TankColdStorageSummary, TankExtRing, TankExtStorage,
+    TankQuadHotCompact, TankTopOfFrameResult, TierCrossbarSnapshot, WdwDryTapMode, ZohRateContext,
+    ballistic_alpha_f32, compute_schroeder_requirements, compute_tank_storage_requirements,
+    dot16_stereo_simd, eval_stereo_linked_aux_detector, eval_wdw_routing_outputs,
+    evaluate_matryoshka_groups, hoist_groups_and_readouts, hydrate_kautz_slice_and_zoh,
+    hydrate_slab_from_dnam_bin, latch_immediate_at_init_or_reset, latch_quad_nonslew_targets,
+    process_block_sona, process_cabinet_48k_chunk, process_tick16_const, required_ext_elements,
+    rescale_paralru_lane, reset_tank, reset_to_dc_equilibrium, retime_sample_rate,
+    retune_kautz_banks_3khz, round_sample_count_zoh, set_offline_bounce, set_op_t_write_enable,
+    step_control_tick_3khz, step_frame_4port_sona, step_frame_4x_sona, step_frame_sona,
+    step_tank_end_of_frame, step_tank_top_of_frame, switch_tier, tick_quad_3khz, tick_tank_3khz,
+    voltage_ms_decode, voltage_ms_encode,
+};
+#[cfg(feature = "alloc")]
+pub use graph::{SonaSlabOwnedBacking, hydrate_slab_owned};
 pub use math::{
     BackendKind, CpuSimdFeatures, CpuSimdLevel, Crc32cBackend, DefaultMathBackend, MathBackend,
     ScalarBackend, ScalarVec4, SimdVec4, crc32c, crc32c_slice, crc32c_software_slice,
     detect_cpu_simd, detect_cpu_simd_features, warm_simd_feature_caches,
 };
 pub use types::{CacheLine64, ColdBuf, ColdSlice, FtzDazGuard, SonaTier, Tier, VmError};
+#[cfg(feature = "alloc")]
+pub use vm::{DynamicSonaVm, SonaInstance};
+pub use vm::{
+    SonaTelemetrySnapshot, SonaVm, SonaVmBacking, sona_vm_clear_saturation_flags_default,
+    sona_vm_process_block_default, sona_vm_process_tick16_default,
+    sona_vm_set_live_analog_drift_enabled_default, sona_vm_step_control_tick_default,
+    sona_vm_step_frame_default,
+};

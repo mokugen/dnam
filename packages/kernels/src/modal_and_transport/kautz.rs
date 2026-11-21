@@ -40,7 +40,7 @@ pub fn eval_kautz_sweep_contraction_f32(radius: f32, delta_theta_rad: f32) -> f3
         KAUTZ_SWEEP_MIN_R
     };
     let abs_dtheta = if delta_theta_rad.is_finite() {
-        rotor_and_phasor::abs_f32(delta_theta_rad)
+        crate::simd::const_abs_f32(delta_theta_rad)
     } else {
         8.0
     };

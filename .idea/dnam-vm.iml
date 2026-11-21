@@ -4,6 +4,7 @@
     <content url="file://$MODULE_DIR$/packages/vm">
       <sourceFolder url="file://$MODULE_DIR$/packages/vm/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/packages/vm/tests" isTestSource="true" />
+      <sourceFolder url="file://$MODULE_DIR$/packages/vm/benches" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/packages/vm/target" />
     </content>
     <orderEntry type="inheritedJdk" />

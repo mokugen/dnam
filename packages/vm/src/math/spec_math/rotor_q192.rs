@@ -1,16 +1,29 @@
 //! Quadrant-reduced degree-13/14 Horner contractive rotor with adaptive 1–2 ULP norm guard
-//! and `Q0.192` fixed-point LFO phase accumulator (`ref[dsp.op-m.rotor.*]`).
+//! and `Q0.192` fixed-point LFO phase accumulator (`ref[dsp.op-m.rotor.contractive]`,
+//! `ref[dsp.op-m.rotor.ulp-guard]`, `ref[dsp.op-m.rotor.q0-192-lfo]`).
 
 use super::{round_f64_to_f32_bits, widen_f32_bits};
+use crate::math::{
+    IEEE754_F32_ABS_MASK, IEEE754_F32_IMPLICIT_BIT, IEEE754_F32_MANTISSA_BITS,
+    IEEE754_F32_MANTISSA_MASK, IEEE754_F32_MIN_SUBNORMAL_EXP,
+    IEEE754_F32_NORMAL_MANTISSA_EXP_OFFSET, IEEE754_F32_SIGN_MASK, const_abs_f32, const_abs_f64,
+    const_f32_pow2, const_inv_factorial_f64,
+};
 
 /// `pi` in IEEE-754 `f64` (`0x400921FB54442D18`).
-pub const PI_F64_BITS: u64 = 0x4009_21FB_5444_2D18;
+pub const PI_F64_BITS: u64 = core::f64::consts::PI.to_bits();
 /// `pi / 2` in IEEE-754 `f64` (`0x3FF921FB54442D18`).
-pub const HALF_PI_F64_BITS: u64 = 0x3FF9_21FB_5444_2D18;
+pub const HALF_PI_F64_BITS: u64 = core::f64::consts::FRAC_PI_2.to_bits();
 /// `pi / 4` in IEEE-754 `f64` (`0x3FE921FB54442D18`).
-pub const QUARTER_PI_F64_BITS: u64 = 0x3FE9_21FB_5444_2D18;
+pub const QUARTER_PI_F64_BITS: u64 = core::f64::consts::FRAC_PI_4.to_bits();
 /// Largest admissible `f32` angle magnitude strictly below `pi` (`0x40490FDA`).
-pub const MAX_ROTOR_ANGLE_F32_BITS: u32 = 0x4049_0FDA;
+pub const MAX_ROTOR_ANGLE_F32_BITS: u32 = core::f32::consts::PI.to_bits() - 1;
+/// Quarter-turn `Q0.32` remainder-to-radian scale factor `(pi / 2) * 2^-30` (`0x30C9_0FDB`).
+const Q32_QUARTER_TURN_RAD_SCALE_F32: f32 = core::f32::consts::FRAC_PI_2 * const_f32_pow2(-30);
+
+const _: () = assert!(PI_F64_BITS == 0x4009_21FB_5444_2D18);
+const _: () = assert!(MAX_ROTOR_ANGLE_F32_BITS == 0x4049_0FDA);
+const _: () = assert!(Q32_QUARTER_TURN_RAD_SCALE_F32.to_bits() == 0x30C9_0FDB);
 
 /// Applies the adaptive 1–2 ULP norm guard to `(c_bits, s_bits)`.
 #[inline(always)]
@@ -22,7 +35,7 @@ pub fn project_rotor_components_ulp_guard(
     if !active {
         return (c_bits, s_bits);
     }
-    let reduce_cosine = (c_bits & 0x7fff_ffff) >= (s_bits & 0x7fff_ffff);
+    let reduce_cosine = (c_bits & IEEE754_F32_ABS_MASK) >= (s_bits & IEEE754_F32_ABS_MASK);
     for _ in 0..2 {
         let c = widen_f32_bits(c_bits).unwrap_or(0.0);
         let s = widen_f32_bits(s_bits).unwrap_or(0.0);
@@ -41,12 +54,12 @@ pub fn project_rotor_components_ulp_guard(
 /// (cold/host `f64` reference utility per `op_m_modal_kautz.md §1.2.2-1.2.3`).
 #[inline(always)]
 pub fn contractive_rotor_f32_bits(theta_bits: u32) -> Option<(u32, u32)> {
-    let mag_bits = theta_bits & 0x7fff_ffff;
+    let mag_bits = theta_bits & IEEE754_F32_ABS_MASK;
     if mag_bits == 0 {
         return Some((1.0_f32.to_bits(), 0.0_f32.to_bits()));
     }
     let theta = widen_f32_bits(theta_bits)?;
-    let magnitude = theta.abs();
+    let magnitude = const_abs_f64(theta);
     let pi64 = f64::from_bits(PI_F64_BITS);
     let half_pi64 = f64::from_bits(HALF_PI_F64_BITS);
     let quarter_pi64 = f64::from_bits(QUARTER_PI_F64_BITS);
@@ -70,23 +83,25 @@ pub fn contractive_rotor_f32_bits(theta_bits: u32) -> Option<(u32, u32)> {
 
     let sine = reduced
         * (1.0
-            + sq * (-1.0 / 6.0
-                + sq * (1.0 / 120.0
-                    + sq * (-1.0 / 5040.0
-                        + sq * (1.0 / 362_880.0
-                            + sq * (-1.0 / 39_916_800.0 + sq * (1.0 / 6_227_020_800.0)))))));
+            + sq * (-const_inv_factorial_f64(3)
+                + sq * (const_inv_factorial_f64(5)
+                    + sq * (-const_inv_factorial_f64(7)
+                        + sq * (const_inv_factorial_f64(9)
+                            + sq * (-const_inv_factorial_f64(11)
+                                + sq * const_inv_factorial_f64(13)))))));
     let cosine = 1.0
-        + sq * (-0.5
-            + sq * (1.0 / 24.0
-                + sq * (-1.0 / 720.0
-                    + sq * (1.0 / 40_320.0
-                        + sq * (-1.0 / 3_628_800.0
-                            + sq * (1.0 / 479_001_600.0 - sq * (1.0 / 87_178_291_200.0)))))));
+        + sq * (-const_inv_factorial_f64(2)
+            + sq * (const_inv_factorial_f64(4)
+                + sq * (-const_inv_factorial_f64(6)
+                    + sq * (const_inv_factorial_f64(8)
+                        + sq * (-const_inv_factorial_f64(10)
+                            + sq * (const_inv_factorial_f64(12)
+                                - sq * const_inv_factorial_f64(14)))))));
 
     let quad_cos = if swapped { sine } else { cosine };
     let quad_sin = if swapped { cosine } else { sine };
     let res_cos_f64 = if reflected { -quad_cos } else { quad_cos };
-    let res_sin_f64 = if (theta_bits & 0x8000_0000) != 0 {
+    let res_sin_f64 = if (theta_bits & IEEE754_F32_SIGN_MASK) != 0 {
         -quad_sin
     } else {
         quad_sin
@@ -108,10 +123,10 @@ pub fn contractive_rotor_f32(theta: f32) -> Option<(f32, f32)> {
 /// zero-increment hold (`±0.0` preserved bit-for-bit, `ref[dsp.op-m.rotor.zero-hold]`).
 #[inline]
 pub fn step_lfo_phasor_zero_hold(re: f32, im: f32, theta: f32) -> Option<(f32, f32)> {
-    if (theta.to_bits() & 0x7fff_ffff) == 0 {
+    if (theta.to_bits() & IEEE754_F32_ABS_MASK) == 0 {
         return Some((re, im));
     }
-    if !theta.is_finite() || theta.abs() >= core::f32::consts::PI {
+    if !theta.is_finite() || const_abs_f32(theta) >= core::f32::consts::PI {
         return None;
     }
     let (c, s) = dnam_kernels::algebraic_unit_rotor_f32(theta);
@@ -187,20 +202,20 @@ impl Q0_192Phase {
 /// Computes the signed `Q0.192` increment `(negative, [u64; 3])` for `theta_bits` (`|theta| < pi`).
 pub fn q0_192_phase_increment_from_f32_bits(theta_bits: u32) -> Option<(bool, [u64; 3])> {
     let negative = (theta_bits >> 31) != 0;
-    let magnitude = theta_bits & 0x7fff_ffff;
+    let magnitude = theta_bits & IEEE754_F32_ABS_MASK;
     if magnitude > MAX_ROTOR_ANGLE_F32_BITS {
         return None;
     }
     if magnitude == 0 {
         return Some((false, [0, 0, 0]));
     }
-    let exponent = magnitude >> 23;
-    let mut mantissa = (magnitude & 0x007f_ffff) as u64;
+    let exponent = magnitude >> IEEE754_F32_MANTISSA_BITS;
+    let mut mantissa = (magnitude & IEEE754_F32_MANTISSA_MASK) as u64;
     let power: i32 = if exponent != 0 {
-        mantissa |= 1 << 23;
-        (exponent as i32) - 150
+        mantissa |= u64::from(IEEE754_F32_IMPLICIT_BIT);
+        (exponent as i32) - IEEE754_F32_NORMAL_MANTISSA_EXP_OFFSET
     } else {
-        -149
+        IEEE754_F32_MIN_SUBNORMAL_EXP
     };
 
     let mut prod = [0u64; 5];
@@ -265,8 +280,7 @@ pub fn q0_192_phase_increment_from_f32_bits(theta_bits: u32) -> Option<(bool, [u
 pub fn q32_phase_to_phasor(q32: u32) -> (f32, f32) {
     let quadrant = q32 >> 30;
     let remainder = q32 & 0x3fff_ffff;
-    let scale = f32::from_bits(0x30c9_0fdb);
-    let angle = (remainder as f32) * scale;
+    let angle = (remainder as f32) * Q32_QUARTER_TURN_RAD_SCALE_F32;
     let (c0, s0) = dnam_kernels::algebraic_unit_rotor_f32(angle);
     let (c, s) = match quadrant {
         0 => (c0, s0),
@@ -299,7 +313,7 @@ mod tests {
         assert!((stepped.0 - 0.25_f64.cos() as f32).abs() < 1e-6);
         assert!(contractive_rotor_f32(core::f32::consts::PI).is_none());
 
-        let theta = f32::from_bits((127 - 30) << 23);
+        let theta = crate::math::const_f32_pow2(-30);
         let mut phase = Q0_192Phase {
             words: [0, 0, 1u64 << 61],
         };

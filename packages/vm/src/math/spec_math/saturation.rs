@@ -1,6 +1,8 @@
 //! Operating-envelope sanitization (`±100.0` certified input, `±1e9` safety ceiling, `fp16`
 //! saturation) and telemetry flags (`ref[arch.fp.range-saturation]`).
 
+use crate::math::const_abs_f32;
+
 /// Error returned when a non-finite or out-of-domain floating-point bit pattern is rejected.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InvalidFloatInput;
@@ -28,7 +30,7 @@ pub const SAFETY_CEILING_F32: f32 = 1.0e9;
 pub const CERTIFIED_INPUT_ENVELOPE_MIN_F32: f32 = 100.0;
 
 /// Maximum finite `fp16` magnitude `65,504.0` (`0x7BFF`).
-pub const FP16_MAX_FINITE_F32: f32 = 65_504.0;
+pub const FP16_MAX_FINITE_F32: f32 = crate::math::FP16_FINITE_MAX_F32;
 
 /// Sanitizes and clamps an input sample against `certified_limit >= 100.0` and `±1e9`.
 #[inline]
@@ -38,10 +40,10 @@ pub fn sanitize_input_sample(x: f32, certified_limit: f32, flags: &mut u32) -> f
         return 0.0;
     }
     let cert = certified_limit.max(CERTIFIED_INPUT_ENVELOPE_MIN_F32);
-    if x.abs() > cert {
+    if const_abs_f32(x) > cert {
         *flags |= saturation_flags::OUTSIDE_CERTIFIED_INPUT;
     }
-    if x.abs() > SAFETY_CEILING_F32 {
+    if const_abs_f32(x) > SAFETY_CEILING_F32 {
         *flags |= saturation_flags::INPUT_SATURATED;
         return x.clamp(-SAFETY_CEILING_F32, SAFETY_CEILING_F32);
     }
@@ -55,7 +57,7 @@ pub fn sanitize_internal_sample(x: f32, flags: &mut u32) -> f32 {
         *flags |= saturation_flags::INVALID_NONFINITE;
         return 0.0;
     }
-    if x.abs() > SAFETY_CEILING_F32 {
+    if const_abs_f32(x) > SAFETY_CEILING_F32 {
         *flags |= saturation_flags::INTERNAL_SATURATED;
         return x.clamp(-SAFETY_CEILING_F32, SAFETY_CEILING_F32);
     }
@@ -69,7 +71,7 @@ pub fn sanitize_output_sample(x: f32, flags: &mut u32) -> f32 {
         *flags |= saturation_flags::INVALID_NONFINITE;
         return 0.0;
     }
-    if x.abs() > SAFETY_CEILING_F32 {
+    if const_abs_f32(x) > SAFETY_CEILING_F32 {
         *flags |= saturation_flags::OUTPUT_SATURATED;
         return x.clamp(-SAFETY_CEILING_F32, SAFETY_CEILING_F32);
     }
@@ -83,7 +85,7 @@ pub fn f32_to_fp16_with_telemetry(x: f32, flags: &mut u32) -> u16 {
         *flags |= saturation_flags::INVALID_NONFINITE;
         return 0;
     }
-    if x.abs() > FP16_MAX_FINITE_F32 {
+    if const_abs_f32(x) > FP16_MAX_FINITE_F32 {
         *flags |= saturation_flags::FP16_SATURATED;
     }
     crate::math::fp16::f32_to_fp16(x.clamp(-FP16_MAX_FINITE_F32, FP16_MAX_FINITE_F32))

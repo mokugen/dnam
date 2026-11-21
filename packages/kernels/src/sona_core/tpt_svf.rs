@@ -2,7 +2,7 @@
 //! `ref[dsp.op-n.core.stereo-simd]`), division-free pure-`f32` bilinear prewarping,
 //! and forward/adjoint `2x2` associative scan operators.
 
-use crate::simd::{GpuVec4, KernelVec4, StereoVec8};
+use crate::simd::{GpuVec4, KernelVec4, StereoVec8, const_taylor_inv_fact_f32};
 
 /// Minimum normalized cutoff ratio `f_c / f_s` accepted by `prewarp_tan_pi_f_over_fs_f32`.
 const MIN_PREWARP_RATIO: f32 = 1.0e-5;
@@ -17,17 +17,17 @@ const MIN_TPT_G: f32 = 1.0e-5;
 
 // Compile-time degree-11/10 Maclaurin coefficients for `sin(x)` and `cos(x)` on `[0, pi/4]`
 // (`ref[repo.code.constant-eval-and-derivations]`; truncation error `< 2e-9` at `x = pi/4`).
-const SIN_C1: f32 = -1.0 / 6.0;
-const SIN_C2: f32 = 1.0 / 120.0;
-const SIN_C3: f32 = -1.0 / 5_040.0;
-const SIN_C4: f32 = 1.0 / 362_880.0;
-const SIN_C5: f32 = -1.0 / 39_916_800.0;
+const SIN_C1: f32 = const_taylor_inv_fact_f32(3, true);
+const SIN_C2: f32 = const_taylor_inv_fact_f32(5, false);
+const SIN_C3: f32 = const_taylor_inv_fact_f32(7, true);
+const SIN_C4: f32 = const_taylor_inv_fact_f32(9, false);
+const SIN_C5: f32 = const_taylor_inv_fact_f32(11, true);
 
-const COS_C1: f32 = -0.5;
-const COS_C2: f32 = 1.0 / 24.0;
-const COS_C3: f32 = -1.0 / 720.0;
-const COS_C4: f32 = 1.0 / 40_320.0;
-const COS_C5: f32 = -1.0 / 3_628_800.0;
+const COS_C1: f32 = const_taylor_inv_fact_f32(2, true);
+const COS_C2: f32 = const_taylor_inv_fact_f32(4, false);
+const COS_C3: f32 = const_taylor_inv_fact_f32(6, true);
+const COS_C4: f32 = const_taylor_inv_fact_f32(8, false);
+const COS_C5: f32 = const_taylor_inv_fact_f32(10, true);
 
 const _: () = assert!(MIN_PREWARP_RATIO > 0.0 && MIN_PREWARP_RATIO < OCTANT_SPLIT_RATIO);
 const _: () = assert!(OCTANT_SPLIT_RATIO < MAX_PREWARP_RATIO && MAX_PREWARP_RATIO < NYQUIST_RATIO);

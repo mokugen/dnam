@@ -315,7 +315,7 @@ pub fn encode_dnam_bin_into_with_crc<C: Crc32cBackend>(
     hdr.write_to_prefix(&mut dst[0..64])
         .map_err(|_| VmError::InsufficientBackingCapacity)?;
 
-    let _ = DnamBinView::parse_with_crc::<C>(dst)?;
+    DnamBinView::parse_with_crc::<C>(dst)?;
     Ok(total_len)
 }
 

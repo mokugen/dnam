@@ -2,6 +2,10 @@
 //! `ref[dsp.op-n.ctrl.trust-clip]`).
 
 use super::ieee_bits::{f32_unbiased_exponent, round_f64_to_f32_bits, widen_f32_bits};
+use crate::math::{
+    IEEE754_F32_SIGN_MASK, IEEE754_F64_EXP_ALL_ONES, IEEE754_F64_EXP_BIAS,
+    IEEE754_F64_MANTISSA_BITS, const_f64_pow2,
+};
 
 /// Outward step (+1 ULP) on a strictly positive finite `f64` value.
 #[inline]
@@ -60,10 +64,11 @@ fn trust_clip_candidate<const D: usize>(
 #[inline]
 const fn inverse_sqrt_seed_f64(energy_upper: f64) -> f64 {
     let bits = energy_upper.to_bits();
-    let exponent = (((bits >> 52) & 0x7ff) as i32) - 1023;
+    let exponent = (((bits >> IEEE754_F64_MANTISSA_BITS) & (IEEE754_F64_EXP_ALL_ONES as u64))
+        as i32)
+        - IEEE754_F64_EXP_BIAS;
     let half_exp = (exponent + 2) >> 1;
-    let inv_bits = ((1023 - half_exp) as u64) << 52;
-    f64::from_bits(inv_bits)
+    const_f64_pow2(-half_exp)
 }
 
 /// Evaluates the 6-step Newton fast path for outward-checked trust clipping.
@@ -87,7 +92,7 @@ pub fn trust_clip_fast_candidate<const D: usize>(
         let sq = (energy_upper * inverse) * inverse;
         inverse *= 1.5 - 0.5 * sq;
     }
-    let guard = 1.0 - f64::from_bits((1023 - 20) << 52);
+    let guard = 1.0 - const_f64_pow2(-20);
     let scale = guard.min((radius * inverse) * guard);
     let (accepted, out) = trust_clip_candidate(&x, radius * radius, energy_upper, scale)?;
     Some((accepted, out, scale))
@@ -170,13 +175,13 @@ pub fn trust_clip_reference_bisection_bits<const D: usize>(
     let mut high = if high_exp >= 0 {
         1.0
     } else {
-        f64::from_bits(((high_exp + 1023) as u64) << 52)
+        const_f64_pow2(high_exp)
     };
     let initial_high = high;
     let mut low = 0.0_f64;
     let mut result = [0u32; D];
     for i in 0..D {
-        result[i] = values_bits[i] & 0x8000_0000;
+        result[i] = values_bits[i] & IEEE754_F32_SIGN_MASK;
     }
     for _ in 0..32 {
         let mid = (low + high) * 0.5;
@@ -218,13 +223,8 @@ fn trust_clip_outward_nd<const D: usize>(z: &mut [f32; D], rho_max: f32) {
         return;
     }
 
-    let in_bits: [u32; D] = core::array::from_fn(|i| {
-        if z[i].is_finite() {
-            z[i].to_bits()
-        } else {
-            0.0_f32.to_bits()
-        }
-    });
+    let in_bits: [u32; D] =
+        core::array::from_fn(|i| crate::math::sanitize_finite_f32(z[i]).to_bits());
     if let Some((out_bits, _, _)) =
         trust_clip_outward_checked_bits(&in_bits, rho_max.to_bits(), DEFAULT_TRUST_CLIP_EPS_BITS)
     {

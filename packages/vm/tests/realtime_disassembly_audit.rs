@@ -3,29 +3,29 @@
 //! - `verify[sdk.rust.realtime-disassembly-audit]`
 //! - `verify[arch.simd.zero-stall-lowering]`
 //!
-//! Disassembles the optimized `libdnam_vm.rlib` release artifact via `objdump -dr --demangle`
-//! and verifies:
-//! 1. **Crate-Wide `libm` Ban (`REQ-6.2`):** Zero external relocations to `_fmodf`, `_fmod`,
-//!    `sinf`, `cosf`, `tanf`, `expf`, `logf`, `powf`, `sqrtf`, or `f64` `libm` equivalents.
-//! 2. **Real-Time Loop Instruction & Call Audit (`REQ-6.2`, `REQ-6.3`):** Across all compiled
-//!    `step_control_frame_default`, `step_control_tick_3khz_default`, `bind_dnam_bin_prevalidated`,
-//!    `ControlBus::*`, `evaluate_static_cp1_latents`, `step_lfos_and_harmonics`, `evaluate_w_ctrl_32`,
-//!    and `ExactIntFactorAccumulator` transitive callees:
-//!    - Zero hardware floating-point or integer division/sqrt instructions (`fdiv`, `fsqrt`,
-//!      `udiv`, `sdiv` on `aarch64`; `div*`, `vdiv*`, `sqrt*`, `vsqrt*`, `idiv*` on `x86_64`).
-//!    - Zero calls to 128-bit software division (`__udivti3`, `__divti3`, `__umodti3`, `__modti3`),
-//!      heap allocation (`__rust_alloc*`, `__rust_dealloc`, `__rust_realloc`), or uncached OS
-//!      feature syscalls (`sysctlbyname`, `getauxval`, `detect_and_initialize`).
+//! Disassembles the optimized `libdnam_vm.rlib` and `libdnam_kernels-*.rlib` release artifacts
+//! via `objdump -dr --demangle` and verifies zero `libm` relocations crate-wide and zero
+//! `FDIV`/`FSQRT`/`IDIV`/`UDIV`/`SDIV`, `u128` software division, heap allocs, locks, or
+//! uncached feature probes across the transitive closure of every real-time root.
 
 #![forbid(unsafe_code)]
 
+mod realtime_disassembly_audit {
+    pub(crate) mod objdump_parser;
+}
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use dnam_vm::{
-    DefaultControlBus, bind_dnam_bin_prevalidated, step_control_frame_default,
-    step_control_tick_3khz_default,
+    DefaultControlBus, DefaultMathBackend, DynamicSonaVm, SonaTelemetrySnapshot, SonaVm, VmError,
+    bind_dnam_bin_prevalidated, sona_vm_clear_saturation_flags_default,
+    sona_vm_process_block_default, sona_vm_process_tick16_default,
+    sona_vm_set_live_analog_drift_enabled_default, sona_vm_step_control_tick_default,
+    sona_vm_step_frame_default, step_control_frame_default, step_control_tick_3khz_default,
+};
+use realtime_disassembly_audit::objdump_parser::{
+    AliasMap, FnDisasm, clean_reloc_target, collect_symbol_aliases, disassemble_rlib_into,
+    ensure_release_rlibs,
 };
 
 fn retain_vm_realtime_roots() {
@@ -35,80 +35,112 @@ fn retain_vm_realtime_roots() {
     core::hint::black_box::<fn(&mut DefaultControlBus<'_>, Option<[f32; 4]>, f32)>(
         step_control_tick_3khz_default,
     );
-    core::hint::black_box::<fn(&[u8]) -> Result<dnam_vm::DnamBinView<'_>, dnam_vm::VmError>>(
+    core::hint::black_box::<fn(&[u8]) -> Result<dnam_vm::DnamBinView<'_>, VmError>>(
         bind_dnam_bin_prevalidated,
     );
-}
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn current_target_triple() -> &'static str {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        "aarch64-apple-darwin"
-    }
-    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-    {
-        "x86_64-apple-darwin"
-    }
-    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    {
-        "aarch64-unknown-linux-gnu"
-    }
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    {
-        "x86_64-unknown-linux-gnu"
-    }
-}
-
-fn ensure_release_rlib() -> PathBuf {
-    let root = workspace_root();
-    let triple = current_target_triple();
-    let audit_target_dir = root.join("target").join("release-audit-vm");
-    let status = Command::new("cargo")
-        .current_dir(&root)
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env_remove("LLVM_PROFILE_FILE")
-        .env("CARGO_PROFILE_RELEASE_LTO", "false")
-        .env("CARGO_PROFILE_RELEASE_STRIP", "none")
-        .args([
-            "build",
-            "--package",
-            "dnam-vm",
-            "--release",
-            "--target",
-            triple,
-            "--target-dir",
-        ])
-        .arg(&audit_target_dir)
-        .status()
-        .expect("failed to invoke cargo build --release for VM disassembly audit");
-    assert!(status.success(), "cargo build --release failed");
-
-    let built = audit_target_dir
-        .join(triple)
-        .join("release")
-        .join("libdnam_vm.rlib");
-    assert!(
-        built.is_file(),
-        "expected release rlib at {}",
-        built.display()
+    core::hint::black_box::<
+        fn(
+            &mut SonaVm<'_, DefaultMathBackend>,
+            &[f32],
+            &[f32],
+            &mut [f32],
+            &mut [f32],
+        ) -> Result<(), VmError>,
+    >(sona_vm_process_block_default);
+    core::hint::black_box::<
+        fn(
+            &mut SonaVm<'_, DefaultMathBackend>,
+            &[f32; 16],
+            &[f32; 16],
+            &mut [f32; 16],
+            &mut [f32; 16],
+        ) -> Result<(), VmError>,
+    >(sona_vm_process_tick16_default);
+    core::hint::black_box::<
+        fn(&mut SonaVm<'_, DefaultMathBackend>, f32, f32) -> Result<(f32, f32), VmError>,
+    >(sona_vm_step_frame_default);
+    core::hint::black_box::<fn(&mut SonaVm<'_, DefaultMathBackend>)>(
+        sona_vm_step_control_tick_default,
     );
-    built
-}
-
-fn clean_reloc_target(raw: &str) -> &str {
-    let s = raw.trim_start_matches('_');
-    let s = s.split('@').next().unwrap_or(s);
-    let s = s.split('+').next().unwrap_or(s);
-    s.split('-').next().unwrap_or(s)
+    core::hint::black_box::<
+        fn(&mut DynamicSonaVm, &[f32], &[f32], &mut [f32], &mut [f32]) -> Result<(), VmError>,
+    >(DynamicSonaVm::process_block);
+    core::hint::black_box::<
+        fn(
+            &mut DynamicSonaVm,
+            &[f32; 16],
+            &[f32; 16],
+            &mut [f32; 16],
+            &mut [f32; 16],
+        ) -> Result<(), VmError>,
+    >(DynamicSonaVm::process_tick16_const);
+    core::hint::black_box::<fn(&mut DynamicSonaVm, f32, f32) -> Result<(f32, f32), VmError>>(
+        DynamicSonaVm::step_frame,
+    );
+    core::hint::black_box::<
+        fn(&mut DynamicSonaVm, [f32; 2], [f32; 2], bool) -> Result<([f32; 2], [f32; 2]), VmError>,
+    >(DynamicSonaVm::step_frame_4port);
+    core::hint::black_box::<fn(&mut DynamicSonaVm)>(DynamicSonaVm::step_control_tick_3khz);
+    core::hint::black_box::<fn(&mut DynamicSonaVm, bool)>(DynamicSonaVm::set_quad_write_enable);
+    core::hint::black_box::<fn(&mut DynamicSonaVm, bool)>(DynamicSonaVm::set_op_t_write_enable);
+    core::hint::black_box::<fn(&mut DynamicSonaVm, usize, f32) -> Result<(), VmError>>(
+        DynamicSonaVm::set_control_physical,
+    );
+    core::hint::black_box::<fn(&mut DynamicSonaVm, &[(usize, f32)]) -> Result<(), VmError>>(
+        DynamicSonaVm::set_controls_batch,
+    );
+    core::hint::black_box::<fn(&mut DynamicSonaVm, f32) -> usize>(DynamicSonaVm::apply_tempo_bpm);
+    core::hint::black_box::<fn(&mut DynamicSonaVm, dnam_vm::Tier) -> Result<(), VmError>>(
+        DynamicSonaVm::switch_tier,
+    );
+    core::hint::black_box::<fn(&mut DynamicSonaVm, bool) -> Result<(), VmError>>(
+        DynamicSonaVm::set_offline_bounce,
+    );
+    core::hint::black_box::<fn(&mut DynamicSonaVm, f32) -> Result<(), VmError>>(
+        DynamicSonaVm::retime_sample_rate,
+    );
+    core::hint::black_box::<fn(&mut DynamicSonaVm)>(DynamicSonaVm::reset);
+    core::hint::black_box::<fn(&mut DynamicSonaVm, f32)>(DynamicSonaVm::set_ms_width);
+    core::hint::black_box::<fn(&mut DynamicSonaVm, dnam_vm::WdwDryTapMode)>(
+        DynamicSonaVm::set_wdw_mode,
+    );
+    core::hint::black_box::<fn(&mut DynamicSonaVm, bool)>(DynamicSonaVm::set_wdw_enabled);
+    core::hint::black_box::<fn(&mut SonaVm<'_, DefaultMathBackend>, bool)>(
+        sona_vm_set_live_analog_drift_enabled_default,
+    );
+    core::hint::black_box::<fn(&mut SonaVm<'_, DefaultMathBackend>)>(
+        sona_vm_clear_saturation_flags_default,
+    );
+    core::hint::black_box::<fn(&mut DynamicSonaVm, bool)>(
+        DynamicSonaVm::set_live_analog_drift_enabled,
+    );
+    core::hint::black_box::<fn(&DynamicSonaVm) -> usize>(DynamicSonaVm::get_latency_samples);
+    core::hint::black_box::<fn(&DynamicSonaVm) -> u32>(DynamicSonaVm::saturation_flags);
+    core::hint::black_box::<fn(&mut DynamicSonaVm)>(DynamicSonaVm::clear_saturation_flags);
+    core::hint::black_box::<fn(&mut DynamicSonaVm, dnam_vm::IoAlignmentMode, f64, f64)>(
+        DynamicSonaVm::configure_return_alignment,
+    );
+    core::hint::black_box::<fn(&DynamicSonaVm) -> SonaTelemetrySnapshot>(DynamicSonaVm::telemetry);
+    core::hint::black_box::<fn(&mut SonaVm<'static, DefaultMathBackend>, bool)>(
+        SonaVm::<'static, DefaultMathBackend>::set_live_analog_drift_enabled,
+    );
+    core::hint::black_box::<fn(&mut SonaVm<'static, DefaultMathBackend>)>(
+        SonaVm::<'static, DefaultMathBackend>::clear_saturation_flags,
+    );
+    core::hint::black_box::<
+        fn(
+            &mut SonaVm<'static, DefaultMathBackend>,
+            [f32; 2],
+            [f32; 2],
+            bool,
+        ) -> Result<([f32; 2], [f32; 2]), VmError>,
+    >(SonaVm::<'static, DefaultMathBackend>::step_frame_4port);
+    core::hint::black_box::<fn(&mut SonaVm<'static, DefaultMathBackend>, bool)>(
+        SonaVm::<'static, DefaultMathBackend>::set_quad_write_enable,
+    );
+    core::hint::black_box::<fn(&mut SonaVm<'static, DefaultMathBackend>, bool)>(
+        SonaVm::<'static, DefaultMathBackend>::set_op_t_write_enable,
+    );
 }
 
 fn is_vm_realtime_root_symbol(sym: &str) -> bool {
@@ -116,6 +148,41 @@ fn is_vm_realtime_root_symbol(sym: &str) -> bool {
         "step_control_frame_default",
         "step_control_tick_3khz_default",
         "bind_dnam_bin_prevalidated",
+        "sona_vm_process_block_default",
+        "sona_vm_process_tick16_default",
+        "sona_vm_step_frame_default",
+        "sona_vm_step_control_tick_default",
+        "process_block_sona",
+        "process_tick16_const",
+        "step_frame_sona",
+        "step_frame_4x_sona",
+        "step_frame_4port_sona",
+        "eval_wdw_routing_outputs",
+        "latch_quad_nonslew_targets",
+        "switch_tier",
+        "retime_sample_rate",
+        "set_offline_bounce",
+        "reset_to_dc_equilibrium",
+        "hoist_groups_and_readouts",
+        "step_control_tick_3khz",
+        "set_op_t_write_enable",
+        "DynamicSonaVm>::process_block",
+        "DynamicSonaVm>::process_tick16_const",
+        "DynamicSonaVm>::step_frame",
+        "DynamicSonaVm>::step_frame_4port",
+        "DynamicSonaVm>::step_control_tick_3khz",
+        "DynamicSonaVm>::set_quad_write_enable",
+        "DynamicSonaVm>::set_op_t_write_enable",
+        "DynamicSonaVm>::set_control_physical",
+        "DynamicSonaVm>::set_controls_batch",
+        "DynamicSonaVm>::apply_tempo_bpm",
+        "DynamicSonaVm>::switch_tier",
+        "DynamicSonaVm>::set_offline_bounce",
+        "DynamicSonaVm>::retime_sample_rate",
+        "DynamicSonaVm>::reset",
+        "DynamicSonaVm>::set_ms_width",
+        "DynamicSonaVm>::set_wdw_mode",
+        "DynamicSonaVm>::set_wdw_enabled",
         "step_lfos_and_harmonics",
         "update_env_states",
         "evaluate_static_cp1_latents",
@@ -124,12 +191,54 @@ fn is_vm_realtime_root_symbol(sym: &str) -> bool {
         "prepare_micro_ramp_deltas",
         "advance_micro_ramp_frame",
         "q32_phase_to_phasor",
-        "eval_svf_g_modulated",
-        "eval_group_adaa_and_lru_effective",
-        "apply_ultra_core_mods_lane",
-        "update_op_t_we_hold_schmitt",
+        "latch_immediate_at_init_or_reset",
+        "sona_vm_set_live_analog_drift_enabled_default",
+        "sona_vm_clear_saturation_flags_default",
+        "DynamicSonaVm>::set_live_analog_drift_enabled",
+        "DynamicSonaVm>::get_latency_samples",
+        "DynamicSonaVm>::saturation_flags",
+        "DynamicSonaVm>::clear_saturation_flags",
+        "DynamicSonaVm>::configure_return_alignment",
+        "DynamicSonaVm>::telemetry",
     ];
-    EXACT_OR_SUBSTR_ROOTS.iter().any(|p| sym.contains(p))
+    if EXACT_OR_SUBSTR_ROOTS.iter().any(|p| sym.contains(p)) {
+        return true;
+    }
+
+    const RT_VM_AND_SLAB_METHODS: &[&str] = &[
+        "::process_block",
+        "::process_tick16_const",
+        "::step_frame",
+        "::step_frame_4port",
+        "::step_frame_4x",
+        "::step_control_tick_3khz",
+        "::set_control_physical",
+        "::set_controls_batch",
+        "::apply_tempo_bpm",
+        "::set_quad_write_enable",
+        "::set_op_t_write_enable",
+        "::set_ms_width",
+        "::switch_tier",
+        "::retime_sample_rate",
+        "::set_offline_bounce",
+        "::reset",
+        "::configure_return_alignment",
+        "::set_wdw_mode",
+        "::set_wdw_enabled",
+        "::set_live_analog_drift_enabled",
+        "::get_latency_samples",
+        "::saturation_flags",
+        "::clear_saturation_flags",
+        "::telemetry",
+    ];
+    let is_vm_or_slab = sym.contains("SonaVm<")
+        || sym.contains("SonaVm>::")
+        || sym.contains("SonaHotSlab<")
+        || sym.contains("SonaHotSlab>::");
+    is_vm_or_slab
+        && !sym.contains("drop_glue")
+        && !sym.contains("Drop>::drop")
+        && RT_VM_AND_SLAB_METHODS.iter().any(|m| sym.contains(m))
 }
 
 fn is_forbidden_rt_instruction(mnemonic: &str) -> bool {
@@ -164,6 +273,11 @@ fn is_forbidden_rt_instruction(mnemonic: &str) -> bool {
                 | "divl"
                 | "divq"
         )
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = mnemonic;
+        false
     }
 }
 
@@ -239,249 +353,21 @@ fn is_forbidden_rt_reloc(target: &str) -> bool {
         || clean.contains("OnceBox")
 }
 
-#[derive(Default)]
-struct FnDisasm {
-    demangled: String,
-    instructions: Vec<(String, String)>,
-    relocs: Vec<(String, String)>,
-    callees: BTreeSet<String>,
-}
-
-fn is_local_temp_label(sym: &str) -> bool {
-    sym.starts_with("ltmp") || sym.starts_with(".L")
-}
-
-fn parse_objdump_object_header(line: &str) -> Option<String> {
-    let ff = line.find("file format ")?;
-    let colon = line[..ff].rfind(':')?;
-    Some(line[..colon].trim().to_string())
-}
-
-fn parse_objdump_sym_table_line(line: &str) -> Option<(u64, &str, &str)> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let addr_tok = trimmed.split_whitespace().next()?;
-    if addr_tok.len() < 8 || !addr_tok.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let addr = u64::from_str_radix(addr_tok, 16).ok()?;
-    let mut cursor = trimmed[addr_tok.len()..].trim_start();
-    let mut is_func = false;
-    let section = loop {
-        let tok = cursor.split_whitespace().next()?;
-        if tok.starts_with("__") || tok.starts_with('.') || tok.starts_with('*') {
-            break tok;
-        }
-        if tok.contains('F') {
-            is_func = true;
-        }
-        cursor = cursor[tok.len()..].trim_start();
-    };
-    if !is_func || (!section.starts_with("__TEXT,__text") && !section.starts_with(".text")) {
-        return None;
-    }
-    let mut sym_tail = cursor[section.len()..].trim_start();
-    if let Some(first_tok) = sym_tail.split_whitespace().next()
-        && first_tok.len() >= 4
-        && first_tok.chars().all(|c| c.is_ascii_hexdigit())
-        && !sym_tail[first_tok.len()..].trim_start().is_empty()
-    {
-        sym_tail = sym_tail[first_tok.len()..].trim_start();
-    }
-    if sym_tail.is_empty() {
-        return None;
-    }
-    Some((addr, section, sym_tail))
-}
-
-fn collect_symbol_aliases(rlib: &Path) -> BTreeMap<(String, String, u64), Vec<(String, String)>> {
-    let sym_raw_out = Command::new("objdump")
-        .arg("-t")
-        .arg(rlib)
-        .output()
-        .expect("objdump -t");
-    let sym_dem_out = Command::new("objdump")
-        .args(["-t", "--demangle"])
-        .arg(rlib)
-        .output()
-        .expect("objdump -t --demangle");
-    assert!(sym_raw_out.status.success() && sym_dem_out.status.success());
-
-    let mut aliases: BTreeMap<(String, String, u64), Vec<(String, String)>> = BTreeMap::new();
-    let mut current_obj = String::new();
-    for (raw_line, dem_line) in String::from_utf8_lossy(&sym_raw_out.stdout)
-        .lines()
-        .zip(String::from_utf8_lossy(&sym_dem_out.stdout).lines())
-    {
-        if let Some(obj) = parse_objdump_object_header(raw_line) {
-            current_obj = obj;
-            continue;
-        }
-        if current_obj.is_empty() {
-            continue;
-        }
-        let Some((addr, sec, raw_sym)) = parse_objdump_sym_table_line(raw_line) else {
-            continue;
-        };
-        let clean_key = clean_reloc_target(raw_sym);
-        if is_local_temp_label(raw_sym) || clean_key.is_empty() || is_local_temp_label(clean_key) {
-            continue;
-        }
-        let dem_sym = parse_objdump_sym_table_line(dem_line)
-            .map(|(_, _, s)| s)
-            .unwrap_or(raw_sym);
-        let group = aliases
-            .entry((current_obj.clone(), sec.to_string(), addr))
-            .or_default();
-        if !group.iter().any(|(k, _)| k == clean_key) {
-            group.push((clean_key.to_string(), dem_sym.to_string()));
-        }
-    }
-    aliases
-}
-
 /// verify[sdk.rust.realtime-disassembly-audit]
 #[test]
 fn test_vm_release_disassembly_zero_pipeline_stalls_and_nondeterministic_calls() {
     retain_vm_realtime_roots();
-    let rlib = ensure_release_rlib();
-    let alias_groups = collect_symbol_aliases(&rlib);
-    let out_raw = Command::new("objdump")
-        .args(["-dr"])
-        .arg(&rlib)
-        .output()
-        .expect("objdump -dr");
-    let out_dem = Command::new("objdump")
-        .args(["-dr", "--demangle"])
-        .arg(&rlib)
-        .output()
-        .expect("objdump -dr --demangle");
-    assert!(out_raw.status.success() && out_dem.status.success());
-
-    let demangled_headers: Vec<String> = String::from_utf8_lossy(&out_dem.stdout)
-        .lines()
-        .filter_map(|raw_line| {
-            let line = raw_line.trim();
-            if line.ends_with(">:")
-                && let Some(open) = line.find('<')
-            {
-                Some(line[open + 1..line.len() - 2].to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
+    let Some([vm_rlib, kernels_rlib]) = ensure_release_rlibs() else {
+        return;
+    };
+    let mut alias_groups: AliasMap = BTreeMap::new();
+    collect_symbol_aliases("vm", &vm_rlib, &mut alias_groups);
+    collect_symbol_aliases("kernels", &kernels_rlib, &mut alias_groups);
 
     let mut fns: BTreeMap<String, FnDisasm> = BTreeMap::new();
     let mut blocks: BTreeMap<(String, String, u64), FnDisasm> = BTreeMap::new();
-    let (mut current_obj, mut current_section, mut current_fn) =
-        (String::new(), String::new(), String::new());
-    let mut current_block: Option<(String, String, u64)> = None;
-    let mut header_idx = 0usize;
-
-    for raw_line in String::from_utf8_lossy(&out_raw.stdout).lines() {
-        let line = raw_line.trim();
-        if let Some(obj) = parse_objdump_object_header(line) {
-            current_obj = obj;
-            current_section.clear();
-            current_block = None;
-            current_fn.clear();
-            continue;
-        }
-        if let Some(sec_rest) = line.strip_prefix("Disassembly of section ") {
-            current_section = sec_rest.trim_end_matches(':').trim().to_string();
-            current_block = None;
-            current_fn.clear();
-            continue;
-        }
-        if line.ends_with(">:")
-            && let Some(open) = line.find('<')
-        {
-            let addr_hex = line[..open].trim();
-            let raw_sym = &line[open + 1..line.len() - 2];
-            let clean_key = clean_reloc_target(raw_sym).to_string();
-            let demangled = demangled_headers
-                .get(header_idx)
-                .cloned()
-                .unwrap_or_else(|| clean_key.clone());
-            header_idx += 1;
-
-            current_block = (!current_obj.is_empty() && !current_section.is_empty())
-                .then(|| u64::from_str_radix(addr_hex, 16).ok())
-                .flatten()
-                .map(|addr| (current_obj.clone(), current_section.clone(), addr));
-            if let Some(loc) = &current_block {
-                blocks.entry(loc.clone()).or_default().demangled = demangled.clone();
-            }
-            if !is_local_temp_label(raw_sym) && !is_local_temp_label(&clean_key) {
-                current_fn = clean_key;
-                fns.entry(current_fn.clone()).or_default().demangled = demangled;
-            } else {
-                current_fn.clear();
-            }
-            continue;
-        }
-        if current_fn.is_empty() && current_block.is_none() {
-            continue;
-        }
-        if line.contains("RELOC") || line.contains("R_AARCH64") || line.contains("R_X86_64") {
-            if let Some(target) = line.split_whitespace().last() {
-                let callee_key = clean_reloc_target(target).to_string();
-                if let Some(loc) = &current_block {
-                    let blk = blocks.entry(loc.clone()).or_default();
-                    blk.relocs.push((target.to_string(), line.to_string()));
-                    if !is_local_temp_label(&callee_key) {
-                        blk.callees.insert(callee_key.clone());
-                    }
-                }
-                if !current_fn.is_empty() {
-                    let entry = fns.entry(current_fn.clone()).or_default();
-                    entry.relocs.push((target.to_string(), line.to_string()));
-                    if callee_key != current_fn && !is_local_temp_label(&callee_key) {
-                        entry.callees.insert(callee_key);
-                    }
-                }
-            }
-            continue;
-        }
-        let parts: Vec<&str> = line.split('\t').collect();
-        let insn_col_idx = usize::from(parts[0].trim_end().ends_with(':')) + 1;
-        if let Some(insn_col) = parts.get(insn_col_idx).map(|s| s.trim())
-            && let Some(mnemonic) = insn_col.split_whitespace().next()
-        {
-            let full_insn = parts[insn_col_idx..].join(" ");
-            let callee_base = if matches!(mnemonic, "bl" | "b" | "call" | "callq" | "jmp")
-                && let (Some(open), Some(close)) = (full_insn.find('<'), full_insn.rfind('>'))
-                && open + 1 < close
-            {
-                let base = clean_reloc_target(&full_insn[open + 1..close]);
-                (!is_local_temp_label(base)).then(|| base.to_string())
-            } else {
-                None
-            };
-            if let Some(loc) = &current_block {
-                let blk = blocks.entry(loc.clone()).or_default();
-                blk.instructions
-                    .push((mnemonic.to_string(), line.to_string()));
-                if let Some(base) = &callee_base {
-                    blk.callees.insert(base.clone());
-                }
-            }
-            if !current_fn.is_empty() {
-                let entry = fns.entry(current_fn.clone()).or_default();
-                entry
-                    .instructions
-                    .push((mnemonic.to_string(), line.to_string()));
-                if let Some(base) = callee_base
-                    && base != current_fn
-                {
-                    entry.callees.insert(base);
-                }
-            }
-        }
-    }
+    disassemble_rlib_into("vm", &vm_rlib, &mut fns, &mut blocks);
+    disassemble_rlib_into("kernels", &kernels_rlib, &mut fns, &mut blocks);
 
     for (loc, group) in &alias_groups {
         if let Some(block) = blocks.get(loc) {
@@ -526,16 +412,58 @@ fn test_vm_release_disassembly_zero_pipeline_stalls_and_nondeterministic_calls()
         "step_control_frame_default",
         "step_control_tick_3khz_default",
         "bind_dnam_bin_prevalidated",
+        "sona_vm_process_block_default",
+        "sona_vm_process_tick16_default",
+        "sona_vm_step_frame_default",
+        "sona_vm_step_control_tick_default",
+        "set_op_t_write_enable",
+        "step_control_tick_3khz",
+        "hoist_groups_and_readouts",
+        "DynamicSonaVm>::process_block",
+        "DynamicSonaVm>::process_tick16_const",
+        "DynamicSonaVm>::step_frame_4port",
+        "DynamicSonaVm>::step_control_tick_3khz",
+        "DynamicSonaVm>::set_quad_write_enable",
+        "DynamicSonaVm>::set_op_t_write_enable",
+        "DynamicSonaVm>::set_control_physical",
+        "DynamicSonaVm>::set_controls_batch",
+        "DynamicSonaVm>::apply_tempo_bpm",
+        "DynamicSonaVm>::switch_tier",
+        "DynamicSonaVm>::set_offline_bounce",
+        "DynamicSonaVm>::retime_sample_rate",
+        "DynamicSonaVm>::reset",
+        "DynamicSonaVm>::set_ms_width",
+        "DynamicSonaVm>::set_wdw_mode",
+        "DynamicSonaVm>::set_wdw_enabled",
+        "sona_vm_set_live_analog_drift_enabled_default",
+        "sona_vm_clear_saturation_flags_default",
+        "latch_immediate_at_init_or_reset",
+        "latch_quad_nonslew_targets",
+        "DynamicSonaVm>::set_live_analog_drift_enabled",
+        "DynamicSonaVm>::get_latency_samples",
+        "DynamicSonaVm>::saturation_flags",
+        "DynamicSonaVm>::clear_saturation_flags",
+        "DynamicSonaVm>::configure_return_alignment",
+        "DynamicSonaVm>::telemetry",
     ] {
         assert!(
             rt_closure
                 .iter()
                 .any(|k| fns.get(k).is_some_and(|i| i.demangled.contains(required))),
-            "Expected VM real-time root `{required}` in {}",
-            rlib.display()
+            "Expected VM real-time root `{required}` in {} / {}",
+            vm_rlib.display(),
+            kernels_rlib.display()
         );
     }
-    assert!(root_count >= 3 && rt_closure.len() > root_count);
+    assert!(
+        rt_closure.iter().any(|k| fns.get(k).is_some_and(|i| {
+            i.demangled.contains("DynamicSonaVm>::step_frame")
+                && !i.demangled.contains("step_frame_4port")
+        })),
+        "Expected distinct DynamicSonaVm>::step_frame root in {}",
+        vm_rlib.display()
+    );
+    assert!(root_count >= 10 && rt_closure.len() > root_count);
 
     let mut crate_reloc_violations = Vec::new();
     let mut rt_violations = Vec::new();

@@ -21,7 +21,7 @@ const ADAA_EVEN_D4_COEFF_F32: f32 = ADAA_EVEN_D4_COEFF_F64 as f32;
 const MAX_ROTOR_ANGLE_F32: f32 = f32::from_bits(crate::math::MAX_ROTOR_ANGLE_F32_BITS);
 const ROTOR_NR_THREE_HALVES_F32: f32 = 1.5;
 const ROTOR_NR_HALF_F32: f32 = 0.5;
-const LAGRANGE_INV_6_F64: f64 = 1.0 / 6.0;
+const LAGRANGE_INV_6_F64: f64 = crate::math::const_inv_factorial_f64(3);
 const LAGRANGE_HALF_F64: f64 = 0.5;
 
 const _: () = assert!(MAX_ROTOR_ANGLE_F32 < core::f32::consts::PI);

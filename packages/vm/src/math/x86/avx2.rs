@@ -11,12 +11,14 @@ use core::fmt;
 use core::sync::atomic::{AtomicU8, Ordering};
 
 pub use stereo8::Avx2Stereo8;
-use zerocopy::{FromBytes, IntoBytes};
+use zerocopy::IntoBytes;
 
 use super::sse2::Sse2Vec4;
 use super::sse42::X86Sse42Backend;
 use crate::math::crc32c::Crc32cBackend;
-use crate::math::{BackendKind, MathBackend, SimdVec4};
+use crate::math::{
+    BackendKind, FP16_FINITE_MAX_F32, MathBackend, SimdVec4, f32_to_fp16, fp16_to_f32,
+};
 
 const CACHE_UNSET: u8 = 0;
 const CACHE_UNSUPPORTED: u8 = 1;
@@ -46,29 +48,33 @@ fn probe_avx2_fma_support() -> bool {
     )) {
         return true;
     }
-    #[cfg(feature = "std")]
-    {
-        std::arch::is_x86_feature_detected!("avx2")
-            && std::arch::is_x86_feature_detected!("fma")
-            && std::arch::is_x86_feature_detected!("f16c")
+    // CPUID leaf 1 is a safe unprivileged read checking `FMA` (bit 12), `OSXSAVE` (bit 27),
+    // `AVX` (bit 28), and `F16C` (bit 29).
+    let leaf1 = __cpuid(1);
+    let req_ecx = (1 << 12) | (1 << 27) | (1 << 28) | (1 << 29);
+    if (leaf1.ecx & req_ecx) != req_ecx {
+        return false;
     }
-    #[cfg(not(feature = "std"))]
-    {
-        // Verify CPUID `FMA` (bit 12), `OSXSAVE` (bit 27), `AVX` (bit 28), `F16C` (bit 29).
-        // SAFETY: CPUID leaf 1 is an unprivileged read instruction guaranteed on all x86_64 CPUs.
-        let leaf1 = unsafe { __cpuid(1) };
-        let req_ecx = (1 << 12) | (1 << 27) | (1 << 28) | (1 << 29);
-        if (leaf1.ecx & req_ecx) != req_ecx {
-            return false;
-        }
-        // SAFETY: OSXSAVE (ECX bit 27) was just verified set above, so XGETBV(0) is valid and unprivileged.
-        let xcr0 = unsafe { _xgetbv(0) };
-        if (xcr0 & 0x6) != 0x6 {
-            return false;
-        }
-        // SAFETY: CPUID leaf 7 subleaf 0 is an unprivileged read instruction on x86_64.
-        let leaf7 = unsafe { __cpuid_count(7, 0) };
-        (leaf7.ebx & (1 << 5)) != 0
+    // SAFETY: OSXSAVE (ECX bit 27) was just verified set above, so XGETBV(0) is valid and unprivileged.
+    let xcr0 = unsafe { _xgetbv(0) };
+    if (xcr0 & 0x6) != 0x6 {
+        return false;
+    }
+    // CPUID leaf 7 subleaf 0 is a safe unprivileged read checking `AVX2` (EBX bit 5).
+    let leaf7 = __cpuid_count(7, 0);
+    (leaf7.ebx & (1 << 5)) != 0
+}
+
+#[inline(always)]
+fn is_avx2_fma_hot() -> bool {
+    if cfg!(all(
+        target_feature = "avx2",
+        target_feature = "fma",
+        target_feature = "f16c"
+    )) {
+        true
+    } else {
+        AVX2_FMA_SUPPORT_CACHE.load(Ordering::Relaxed) == CACHE_SUPPORTED
     }
 }
 
@@ -101,16 +107,35 @@ unsafe fn fms_m128_hw(acc: __m128, a: __m128, b: __m128) -> __m128 {
 #[target_feature(enable = "f16c")]
 #[inline]
 unsafe fn f32x4_to_fp16x4_hw(src: __m128) -> [u16; 4] {
-    let packed: __m128i = _mm_cvtps_ph(src, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+    let v = Sse2Vec4(src);
+    let lanes = dnam_kernels::KernelVec4::to_array(v);
+    if !lanes[0].is_finite()
+        || !lanes[1].is_finite()
+        || !lanes[2].is_finite()
+        || !lanes[3].is_finite()
+    {
+        return lanes.map(f32_to_fp16);
+    }
+    let clamped = v
+        .clamp(
+            Sse2Vec4::splat(-FP16_FINITE_MAX_F32),
+            Sse2Vec4::splat(FP16_FINITE_MAX_F32),
+        )
+        .0;
+    let packed: __m128i = _mm_cvtps_ph(clamped, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
     let mut out = [0_u16; 4];
-    _mm_storel_epi64(out.as_mut_ptr().cast::<__m128i>(), packed);
+    // SAFETY: `out` is a valid 8-byte stack `[u16; 4]` buffer for a 64-bit store.
+    unsafe {
+        _mm_storel_epi64(out.as_mut_ptr().cast::<__m128i>(), packed);
+    }
     out
 }
 
 #[target_feature(enable = "f16c")]
 #[inline]
 unsafe fn fp16x4_to_f32x4_hw(src: &[u16; 4]) -> __m128 {
-    let packed = _mm_loadl_epi64(src.as_bytes().as_ptr().cast::<__m128i>());
+    // SAFETY: `src` is a valid 8-byte `&[u16; 4]` slice for a 64-bit load.
+    let packed = unsafe { _mm_loadl_epi64(src.as_bytes().as_ptr().cast::<__m128i>()) };
     _mm_cvtph_ps(packed)
 }
 
@@ -157,8 +182,8 @@ impl SimdVec4 for Avx2FmaVec4 {
 
     #[inline(always)]
     fn fma(self, a: Self, b: Self) -> Self {
-        if X86Avx2FmaBackend::is_supported_cached() {
-            // SAFETY: `is_supported_cached()` verified hardware `FMA`.
+        if is_avx2_fma_hot() {
+            // SAFETY: `is_avx2_fma_hot()` verified pre-warmed hardware `FMA` support.
             Self(Sse2Vec4(unsafe { fma_m128_hw(self.0.0, a.0.0, b.0.0) }))
         } else {
             Self(self.0.fma(a.0, b.0))
@@ -167,8 +192,8 @@ impl SimdVec4 for Avx2FmaVec4 {
 
     #[inline(always)]
     fn fms(self, a: Self, b: Self) -> Self {
-        if X86Avx2FmaBackend::is_supported_cached() {
-            // SAFETY: `is_supported_cached()` verified hardware `FMA`.
+        if is_avx2_fma_hot() {
+            // SAFETY: `is_avx2_fma_hot()` verified pre-warmed hardware `FMA` support.
             Self(Sse2Vec4(unsafe { fms_m128_hw(self.0.0, a.0.0, b.0.0) }))
         } else {
             Self(self.0.fms(a.0, b.0))
@@ -395,22 +420,32 @@ impl MathBackend for X86Avx2FmaBackend {
 
     #[inline(always)]
     fn vec4_to_fp16x4(src: Self::Vec4) -> [u16; 4] {
-        if Self::is_supported_cached() {
-            // SAFETY: `is_supported_cached()` verified hardware `F16C`.
+        if is_avx2_fma_hot() {
+            // SAFETY: `is_avx2_fma_hot()` verified pre-warmed hardware `F16C` support.
             unsafe { f32x4_to_fp16x4_hw(src.0.0) }
         } else {
-            Self::f32x4_to_fp16x4(&src.to_array())
+            src.to_array().map(f32_to_fp16)
         }
     }
 
     #[inline(always)]
     fn fp16x4_to_vec4(src: &[u16; 4]) -> Self::Vec4 {
-        if Self::is_supported_cached() {
-            // SAFETY: `is_supported_cached()` verified hardware `F16C`.
-            Self::Vec4(Sse2Vec4(unsafe { fp16x4_to_f32x4_hw(src) }))
+        if is_avx2_fma_hot() {
+            // SAFETY: `is_avx2_fma_hot()` verified pre-warmed hardware `F16C` support.
+            Avx2FmaVec4(Sse2Vec4(unsafe { fp16x4_to_f32x4_hw(src) }))
         } else {
-            Self::Vec4::load(&Self::fp16x4_to_f32x4(src))
+            Self::Vec4::load(&src.map(fp16_to_f32))
         }
+    }
+
+    #[inline(always)]
+    fn f32x4_to_fp16x4(src: &[f32; 4]) -> [u16; 4] {
+        Self::vec4_to_fp16x4(Self::Vec4::load(src))
+    }
+
+    #[inline(always)]
+    fn fp16x4_to_f32x4(src: &[u16; 4]) -> [f32; 4] {
+        Self::fp16x4_to_vec4(src).to_array()
     }
 }
 
@@ -420,11 +455,13 @@ mod tests {
 
     #[test]
     fn test_avx2_fma_backend_identity_and_fp16() {
+        warm_avx2_fma_support_cache();
         assert_eq!(X86Avx2FmaBackend::NAME, "x86 AVX2");
         assert_eq!(X86Avx2FmaBackend::crc32c(b"123456789"), 0xE306_9283);
         let x = [1.0, -2.5, 0.25, 4.0];
         let v = Avx2FmaVec4::load(&x);
         let h = X86Avx2FmaBackend::vec4_to_fp16x4(v);
         assert_eq!(X86Avx2FmaBackend::fp16x4_to_vec4(&h).to_array(), x);
+        crate::math::backend::tests::verify_math_backend_ops::<X86Avx2FmaBackend>();
     }
 }

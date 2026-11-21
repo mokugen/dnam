@@ -2,7 +2,10 @@
 //! `CRC32C` (`0x1EDC6F41` / reflected `0x82F63B78`) acceleration.
 
 use core::arch::aarch64::{
-    __crc32cb, __crc32cd, vreinterpretq_f32_f64, vreinterpretq_f64_f32, vtrn1q_f32, vtrn1q_f64,
+    __crc32cb, __crc32cd, float32x4_t, uint16x4_t, vandq_u32, vceqq_u32, vdup_n_f32, vdup_n_s32,
+    vdupq_n_u32, vget_lane_f32, vld1_u16, vmaxvq_u32, vmul_f32, vreinterpret_f32_s32,
+    vreinterpret_s32_u32, vreinterpret_u32_f32, vreinterpretq_f32_f64, vreinterpretq_f64_f32,
+    vreinterpretq_u32_f32, vset_lane_f32, vshr_n_u32, vsub_f32, vsub_s32, vtrn1q_f32, vtrn1q_f64,
     vtrn2q_f32, vtrn2q_f64,
 };
 use core::sync::atomic::{AtomicU8, Ordering};
@@ -12,7 +15,9 @@ use zerocopy::byteorder::little_endian::U64;
 
 use super::{NeonStereo8, NeonVec4};
 use crate::math::crc32c::{Crc32cBackend, crc32c_software_slice};
-use crate::math::{BackendKind, MathBackend};
+use crate::math::{
+    BackendKind, FP16_FINITE_MAX_F32, IEEE754_F32_EXP_MASK, MathBackend, SimdVec4, f32_to_fp16,
+};
 
 const CACHE_UNSET: u8 = 0;
 const CACHE_UNSUPPORTED: u8 = 1;
@@ -134,6 +139,102 @@ impl MathBackend for NeonBackend {
             ]
         }
     }
+
+    #[inline(always)]
+    fn vec4_to_fp16x4(src: Self::Vec4) -> [u16; 4] {
+        // SAFETY: `aarch64` guarantees baseline NEON `fcvtn` and vector comparisons. When all
+        // lanes are finite, clamp to `[-65504.0, 65504.0]` for hardware `fcvtn` (`FPCR.FZ16 == 0`
+        // inside `FtzDazGuard`); non-finite lanes fall back to software encoding to preserve `sNaN`
+        // payloads per `op_n_paralru_and_polyadaa.md`.
+        unsafe {
+            let raw_bits = vreinterpretq_u32_f32(src.0);
+            let exp_mask = vdupq_n_u32(IEEE754_F32_EXP_MASK);
+            let is_nonfinite = vceqq_u32(vandq_u32(raw_bits, exp_mask), exp_mask);
+            if vmaxvq_u32(is_nonfinite) != 0 {
+                return src.to_array().map(f32_to_fp16);
+            }
+            let clamped = src.clamp(
+                NeonVec4::splat(-FP16_FINITE_MAX_F32),
+                NeonVec4::splat(FP16_FINITE_MAX_F32),
+            );
+            let raw_out: uint16x4_t;
+            core::arch::asm!(
+                "fcvtn {d:v}.4h, {v:v}.4s",
+                v = in(vreg) clamped.0,
+                d = lateout(vreg) raw_out,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            zerocopy::transmute!(raw_out)
+        }
+    }
+
+    #[inline(always)]
+    fn fp16x4_to_vec4(src: &[u16; 4]) -> Self::Vec4 {
+        // SAFETY: `aarch64` guarantees baseline NEON `fcvtl` and `&[u16; 4]` is 8 valid bytes.
+        unsafe {
+            let raw_in = vld1_u16(src.as_ptr());
+            let out_v: float32x4_t;
+            core::arch::asm!(
+                "fcvtl {v:v}.4s, {d:v}.4h",
+                d = in(vreg) raw_in,
+                v = lateout(vreg) out_v,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            NeonVec4(out_v)
+        }
+    }
+
+    #[inline(always)]
+    fn f32x4_to_fp16x4(src: &[f32; 4]) -> [u16; 4] {
+        Self::vec4_to_fp16x4(NeonVec4::load(src))
+    }
+
+    #[inline(always)]
+    fn fp16x4_to_f32x4(src: &[u16; 4]) -> [f32; 4] {
+        Self::fp16x4_to_vec4(src).to_array()
+    }
+
+    #[inline(always)]
+    fn rsqrt_nr2_f32(v0: f32) -> f32 {
+        // SAFETY: `aarch64` guarantees baseline 64-bit AdvSIMD NEON intrinsics.
+        unsafe {
+            let v = vdup_n_f32(v0);
+            let magic = vdup_n_s32(crate::math::IEEE754_F32_RSQRT_SEED as i32);
+            let half = vdup_n_f32(0.5);
+            let three_halves = vdup_n_f32(1.5);
+            let hv = vmul_f32(half, v);
+            let v_shr = vreinterpret_s32_u32(vshr_n_u32::<1>(vreinterpret_u32_f32(v)));
+            let mut est = vreinterpret_f32_s32(vsub_s32(magic, v_shr));
+            for _ in 0..2 {
+                est = vmul_f32(
+                    est,
+                    vsub_f32(three_halves, vmul_f32(hv, vmul_f32(est, est))),
+                );
+            }
+            vget_lane_f32::<0>(est)
+        }
+    }
+
+    #[inline(always)]
+    fn rsqrt_nr2_pair_f32(v0: f32, v1: f32) -> (f32, f32) {
+        // SAFETY: `aarch64` guarantees baseline 64-bit AdvSIMD NEON intrinsics.
+        unsafe {
+            let v = vset_lane_f32::<1>(v1, vdup_n_f32(v0));
+            let magic = vdup_n_s32(crate::math::IEEE754_F32_RSQRT_SEED as i32);
+            let half = vdup_n_f32(0.5);
+            let three_halves = vdup_n_f32(1.5);
+            let hv = vmul_f32(half, v);
+            let v_shr = vreinterpret_s32_u32(vshr_n_u32::<1>(vreinterpret_u32_f32(v)));
+            let mut est = vreinterpret_f32_s32(vsub_s32(magic, v_shr));
+            for _ in 0..2 {
+                est = vmul_f32(
+                    est,
+                    vsub_f32(three_halves, vmul_f32(hv, vmul_f32(est, est))),
+                );
+            }
+            (vget_lane_f32::<0>(est), vget_lane_f32::<1>(est))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -141,7 +242,6 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
-    use crate::math::SimdVec4;
 
     #[test]
     fn test_neon_crc32c_and_transpose_4x4() {

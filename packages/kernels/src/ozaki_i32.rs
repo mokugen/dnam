@@ -8,27 +8,34 @@
 //! [`OZAKI_MAX_CHUNK_LEN`] (`1024`) products strictly in `i32` registers before host `f64` diagonal
 //! reconstruction.
 
+use crate::simd::{
+    BIASED_INT_MAGIC_F32, IEEE754_F32_EXP_BIAS, IEEE754_F32_EXP_MASK, IEEE754_F32_MANTISSA_BITS,
+    IEEE754_F32_MANTISSA_MASK, IEEE754_F32_MIN_NORMAL_EXP, IEEE754_F32_SIGN_MASK, const_f32_pow2,
+};
+
 /// Maximum number of elements per `i32` Ozaki chunk (`1024`; worst-case `d2` sum
 /// `1024 * (256 * 128 + 128 * 128 + 128 * 256) = 83_886_080 <= i32::MAX`).
 pub const OZAKI_MAX_CHUNK_LEN: usize = 1024;
 
-/// IEEE-754 `1.5 * 2^23` (`12_582_912.0`) RNE integer rounding bias (`0x4B40_0000`).
-const RNE_MAGIC_F32: f32 = 1.5 * ((1_u32 << 23) as f32);
-const RNE_MAGIC_BITS: i32 = RNE_MAGIC_F32.to_bits() as i32;
+/// Integer bit pattern of `BIASED_INT_MAGIC_F32` (`0x4B40_0000`) for RNE extraction.
+const RNE_MAGIC_BITS: i32 = BIASED_INT_MAGIC_F32.to_bits() as i32;
 
 /// Maximum magnitude representable by the `1.5 * 2^23` biased-rounding window (`2^22`).
-const RNE_MAX_ABS_F32: f32 = (1_u32 << 22) as f32;
+const RNE_MAX_ABS_F32: f32 = const_f32_pow2((IEEE754_F32_MANTISSA_BITS - 1) as i32);
+
+/// Maximum normal unbiased magnitude exponent used to normalize Ozaki tiles (`126`).
+const MAX_OZAKI_EXP: u32 = (-IEEE754_F32_MIN_NORMAL_EXP) as u32;
 
 /// Maximum normal Ozaki scaling ceiling (`2^126`), keeping both `scale` and `inv_scale` normal
 /// `binary32` powers of two and preventing `scale^2` overflow in `f64` reconstruction.
-const MAX_OZAKI_VAL_F32: f32 = f32::from_bits(253 << 23);
+const MAX_OZAKI_VAL_F32: f32 = const_f32_pow2(MAX_OZAKI_EXP as i32);
 
 /// Slice multipliers and exact negative power-of-2 reconstruction weights (`2^8`, `2^16`, `2^24`).
-const SLICE0_SCALE_F32: f32 = (1_u32 << 8) as f32;
-const SLICE0_INV_F32: f32 = f32::from_bits((127 - 8) << 23);
-const SLICE1_SCALE_F32: f32 = (1_u32 << 16) as f32;
-const SLICE1_INV_F32: f32 = f32::from_bits((127 - 16) << 23);
-const SLICE2_SCALE_F32: f32 = (1_u32 << 24) as f32;
+const SLICE0_SCALE_F32: f32 = const_f32_pow2(8);
+const SLICE0_INV_F32: f32 = const_f32_pow2(-8);
+const SLICE1_SCALE_F32: f32 = const_f32_pow2(16);
+const SLICE1_INV_F32: f32 = const_f32_pow2(-16);
+const SLICE2_SCALE_F32: f32 = const_f32_pow2(24);
 
 const OZAKI_MAX_BUCKET_SUM_U32: u32 =
     (OZAKI_MAX_CHUNK_LEN as u32) * (256 * 128 + 128 * 128 + 128 * 256);
@@ -41,13 +48,16 @@ const _: () = assert!(3_u32 * (OZAKI_MAX_CHUNK_LEN as u32) * 256 * 128 <= i32::M
 const _: () = assert!(3_i64 * (OZAKI_MAX_CHUNK_LEN as i64) * 256 * 128 <= i32::MAX as i64);
 const _: () = assert!(RNE_MAGIC_BITS == 0x4B40_0000);
 const _: () = assert!(RNE_MAX_ABS_F32 == 4_194_304.0);
-const _: () = assert!(MAX_OZAKI_VAL_F32.to_bits() == (253 << 23));
+const _: () = assert!(
+    MAX_OZAKI_VAL_F32.to_bits()
+        == ((IEEE754_F32_EXP_BIAS + MAX_OZAKI_EXP) << IEEE754_F32_MANTISSA_BITS)
+);
 const _: () = assert!(SLICE0_SCALE_F32 * SLICE0_INV_F32 == 1.0);
 const _: () = assert!(SLICE1_SCALE_F32 * SLICE1_INV_F32 == 1.0);
-const _: () = assert!(SLICE2_SCALE_F32 == (1_u32 << 24) as f32);
+const _: () = assert!(SLICE2_SCALE_F32 == const_f32_pow2(24));
 
 /// Division-free branchless IEEE-754 round-to-nearest-ties-to-even (`f32 -> i32`) guarded against
-/// non-finite values and clamped to `[-2^22, +2^22]` (`RNE_MAGIC_F32` exactness window).
+/// non-finite values and clamped to `[-2^22, +2^22]` (`BIASED_INT_MAGIC_F32` exactness window).
 #[inline(always)]
 #[must_use]
 pub fn round_ties_even_f32(x: f32) -> i32 {
@@ -55,7 +65,7 @@ pub fn round_ties_even_f32(x: f32) -> i32 {
         return 0;
     }
     let clamped = x.clamp(-RNE_MAX_ABS_F32, RNE_MAX_ABS_F32);
-    (clamped + RNE_MAGIC_F32).to_bits() as i32 - RNE_MAGIC_BITS
+    (clamped + BIASED_INT_MAGIC_F32).to_bits() as i32 - RNE_MAGIC_BITS
 }
 
 /// Computes the smallest power-of-two ceiling `scale >= min(max_abs, 2^126)` and its exact
@@ -68,14 +78,16 @@ pub fn round_ties_even_f32(x: f32) -> i32 {
 #[must_use]
 pub fn pow2_ceil_fp32(max_abs: f32) -> (f32, f32) {
     let bits = max_abs.to_bits();
-    if (bits & 0x8000_0000) != 0 || bits == 0 || bits >= 0x7F80_0000 {
+    if (bits & IEEE754_F32_SIGN_MASK) != 0 || bits == 0 || bits >= IEEE754_F32_EXP_MASK {
         return (1.0, 1.0);
     }
     let clamped = max_abs.min(MAX_OZAKI_VAL_F32);
-    let ceil_bits = clamped.to_bits().wrapping_add(0x007F_FFFF) & 0x7F80_0000;
-    let e = (ceil_bits >> 23).clamp(1, 253);
-    let scale = f32::from_bits(e << 23);
-    let inv_scale = f32::from_bits((254 - e) << 23);
+    let ceil_bits =
+        clamped.to_bits().wrapping_add(IEEE754_F32_MANTISSA_MASK) & IEEE754_F32_EXP_MASK;
+    let max_exp = IEEE754_F32_EXP_BIAS + MAX_OZAKI_EXP;
+    let e = (ceil_bits >> IEEE754_F32_MANTISSA_BITS).clamp(1, max_exp);
+    let scale = f32::from_bits(e << IEEE754_F32_MANTISSA_BITS);
+    let inv_scale = f32::from_bits((2 * IEEE754_F32_EXP_BIAS - e) << IEEE754_F32_MANTISSA_BITS);
     (scale, inv_scale)
 }
 
@@ -136,17 +148,14 @@ pub fn accum_ozaki_chunk_i32(x: &[f32], y: &[f32], inv_scale_x: f32, inv_scale_y
 #[inline]
 #[must_use]
 pub fn reconstruct_ozaki_dot_f64(sums: &[i32; 6], scale_x: f32, scale_y: f32) -> f64 {
-    const fn pow2_neg_f64(shift: u32) -> f64 {
-        f64::from_bits((1023_u64 - (shift as u64)) << 52)
-    }
     if !scale_x.is_finite() || !scale_y.is_finite() {
         return 0.0;
     }
-    const W0: f64 = pow2_neg_f64(16);
-    const W1: f64 = pow2_neg_f64(24);
-    const W2: f64 = pow2_neg_f64(32);
-    const W3: f64 = pow2_neg_f64(40);
-    const W4: f64 = pow2_neg_f64(48);
+    const W0: f64 = const_f32_pow2(-16) as f64;
+    const W1: f64 = const_f32_pow2(-24) as f64;
+    const W2: f64 = const_f32_pow2(-32) as f64;
+    const W3: f64 = W1 * W0;
+    const W4: f64 = W1 * W1;
 
     let dot_norm = (sums[4] as f64) * W4
         + (sums[3] as f64) * W3

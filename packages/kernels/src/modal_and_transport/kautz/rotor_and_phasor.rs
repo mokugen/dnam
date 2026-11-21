@@ -6,24 +6,24 @@
 //! Strictly 32-bit, `#![no_std]`, zero `FDIV`/`FSQRT`/`UDIV`, zero 64-bit scalars, and zero `libm`
 //! calls in runtime code (`ref[sdk.rust.shared-nostd-kernels]`).
 
-use crate::simd::{KernelVec4, flush_subnormal_f32_bits};
-
-/// Compile-time biased integer rounding magic `1.5 * 2^23` (`0x4B40_0000`).
-const BIASED_INT_MAGIC_F32: f32 = 1.5 * ((1_u32 << 23) as f32);
+use crate::simd::{
+    BIASED_INT_MAGIC_F32, IEEE754_F32_ABS_MASK, KernelVec4, const_abs_f32, const_f32_pow2,
+    const_taylor_inv_fact_f32, flush_subnormal_f32_bits,
+};
 
 /// Exact `2^32` scale factor in `binary32` (`4_294_967_296.0`) for converting normalized
 /// frequency `cycles/sample` to `Q0.32` phase increments (`32-bit` integer wrap only).
-const TWO_POW_32_F32: f32 = f32::from_bits((127 + 32) << 23);
+const TWO_POW_32_F32: f32 = const_f32_pow2(32);
 
 /// Exact `2^-30` quarter-cycle scaling factor for `Q0.32` quadrant fractional extraction.
-const INV_TWO_POW_30_F32: f32 = f32::from_bits((127 - 30) << 23);
+const INV_TWO_POW_30_F32: f32 = const_f32_pow2(-30);
 
 /// Upper Nyquist-safe normalized frequency bound (`< 0.5 cycles/sample`) for `Q0.32` phasors
 /// (`0x3EFF_FFFE` = `0.4999999403953552`).
 const MAX_PHASOR_CYCLES_PER_SAMPLE: f32 = f32::from_bits(0x3EFF_FFFE);
 
 /// Exact `2^31` upper bound for `freq_hz_to_q32_inc` conversion (`0x4F00_0000`).
-const MAX_Q32_INC_F32: f32 = f32::from_bits((127 + 31) << 23);
+const MAX_Q32_INC_F32: f32 = const_f32_pow2(31);
 
 /// Cody-Waite `pi/2` high chunk (`0x3FC9_0000`: 16 trailing mantissa zero bits so `q * PIO2_1` is
 /// exact for `|q| <= 65_536`, `ref[dsp.op-m.rotor.quadrant-horner]`).
@@ -53,44 +53,27 @@ const HERMITE5_C3: f32 = crate::simd::HERMITE5_SIN_C3_F32;
 /// Degree-5 Hermite quarter-sine coefficient `c5 = pi / 2 - 1.5`.
 const HERMITE5_C5: f32 = crate::simd::HERMITE5_SIN_C5_F32;
 
-/// Compile-time Taylor inverse factorial `(-1)^neg / n!` computed purely in `f32`
-/// (`ref[repo.code.constant-eval-and-derivations]`).
-const fn taylor_inv_fact_f32(n: u32, negative: bool) -> f32 {
-    let mut fact = 1.0_f32;
-    let mut k = 2_u32;
-    while k <= n {
-        fact *= k as f32;
-        k += 1;
-    }
-    let mag = 1.0_f32 / fact;
-    if negative { -mag } else { mag }
-}
+const SIN_C3: f32 = const_taylor_inv_fact_f32(3, true);
+const SIN_C5: f32 = const_taylor_inv_fact_f32(5, false);
+const SIN_C7: f32 = const_taylor_inv_fact_f32(7, true);
+const SIN_C9: f32 = const_taylor_inv_fact_f32(9, false);
+const SIN_C11: f32 = const_taylor_inv_fact_f32(11, true);
+const SIN_C13: f32 = const_taylor_inv_fact_f32(13, false);
 
-const SIN_C3: f32 = taylor_inv_fact_f32(3, true);
-const SIN_C5: f32 = taylor_inv_fact_f32(5, false);
-const SIN_C7: f32 = taylor_inv_fact_f32(7, true);
-const SIN_C9: f32 = taylor_inv_fact_f32(9, false);
-const SIN_C11: f32 = taylor_inv_fact_f32(11, true);
-const SIN_C13: f32 = taylor_inv_fact_f32(13, false);
-
-const COS_C2: f32 = taylor_inv_fact_f32(2, true);
-const COS_C4: f32 = taylor_inv_fact_f32(4, false);
-const COS_C6: f32 = taylor_inv_fact_f32(6, true);
-const COS_C8: f32 = taylor_inv_fact_f32(8, false);
-const COS_C10: f32 = taylor_inv_fact_f32(10, true);
-const COS_C12: f32 = taylor_inv_fact_f32(12, false);
-const COS_C14: f32 = taylor_inv_fact_f32(14, true);
+const COS_C2: f32 = const_taylor_inv_fact_f32(2, true);
+const COS_C4: f32 = const_taylor_inv_fact_f32(4, false);
+const COS_C6: f32 = const_taylor_inv_fact_f32(6, true);
+const COS_C8: f32 = const_taylor_inv_fact_f32(8, false);
+const COS_C10: f32 = const_taylor_inv_fact_f32(10, true);
+const COS_C12: f32 = const_taylor_inv_fact_f32(12, false);
+const COS_C14: f32 = const_taylor_inv_fact_f32(14, true);
 
 const _: () = assert!(BIASED_INT_MAGIC_F32.to_bits() == 0x4B40_0000);
 const _: () = assert!(PIO2_1.to_bits() == 0x3FC9_0000);
-const _: () = assert!(abs_f32((PIO2_1 + PIO2_2 + PIO2_3) - core::f32::consts::FRAC_PI_2) < 1.0e-7);
-const _: () = assert!(abs_f32((HERMITE5_C1 - HERMITE5_C3 + HERMITE5_C5) - 1.0) < 1.0e-6);
+const _: () =
+    assert!(const_abs_f32((PIO2_1 + PIO2_2 + PIO2_3) - core::f32::consts::FRAC_PI_2) < 1.0e-7);
+const _: () = assert!(const_abs_f32((HERMITE5_C1 - HERMITE5_C3 + HERMITE5_C5) - 1.0) < 1.0e-6);
 const _: () = assert!(COS_C2 == -0.5);
-
-#[inline(always)]
-pub(super) const fn abs_f32(x: f32) -> f32 {
-    f32::from_bits(x.to_bits() & 0x7FFF_FFFF)
-}
 
 #[inline(always)]
 fn round_ties_even_small_f32(x: f32) -> f32 {
@@ -135,7 +118,7 @@ fn freq_hz_to_q32_inc(freq_hz: f32, inv_sample_rate_hz: f32) -> u32 {
     if !freq_hz.is_finite() || !inv_sample_rate_hz.is_finite() || inv_sample_rate_hz <= 0.0 {
         return 0;
     }
-    let abs_freq = abs_f32(freq_hz);
+    let abs_freq = const_abs_f32(freq_hz);
     let cycles = (abs_freq * inv_sample_rate_hz).clamp(0.0, MAX_PHASOR_CYCLES_PER_SAMPLE);
     let inc_f = cycles * TWO_POW_32_F32 + 0.5;
     (inc_f.clamp(0.0, MAX_Q32_INC_F32)) as u32
@@ -148,13 +131,13 @@ fn freq_hz_to_q32_inc(freq_hz: f32, inv_sample_rate_hz: f32) -> u32 {
 #[inline(always)]
 #[must_use]
 pub fn algebraic_unit_rotor_f32(theta_rad: f32) -> (f32, f32) {
-    if !theta_rad.is_finite() || theta_rad == 0.0 || abs_f32(theta_rad) > MAX_CODY_WAITE_RAD {
+    if !theta_rad.is_finite() || theta_rad == 0.0 || const_abs_f32(theta_rad) > MAX_CODY_WAITE_RAD {
         return (1.0, 0.0);
     }
 
     let q_f = round_ties_even_small_f32(theta_rad * INV_PIO2);
     let r = ((theta_rad - q_f * PIO2_1) - q_f * PIO2_2) - q_f * PIO2_3;
-    if !r.is_finite() || abs_f32(r) > REDUCED_QUADRANT_GUARD_RAD {
+    if !r.is_finite() || const_abs_f32(r) > REDUCED_QUADRANT_GUARD_RAD {
         return (1.0, 0.0);
     }
 
@@ -177,11 +160,11 @@ pub fn algebraic_unit_rotor_f32(theta_rad: f32) -> (f32, f32) {
 
     let mut c_bits = cos_out.to_bits();
     let mut s_bits = sin_out.to_bits();
-    let on_axis = (c_bits & 0x7FFF_FFFF) == 0 || (s_bits & 0x7FFF_FFFF) == 0;
+    let on_axis = (c_bits & IEEE754_F32_ABS_MASK) == 0 || (s_bits & IEEE754_F32_ABS_MASK) == 0;
     for _ in 0..2 {
         let norm2 = cos_out * cos_out + sin_out * sin_out;
         if norm2 > 1.0 || (!on_axis && norm2 == 1.0) {
-            if (c_bits & 0x7FFF_FFFF) >= (s_bits & 0x7FFF_FFFF) {
+            if (c_bits & IEEE754_F32_ABS_MASK) >= (s_bits & IEEE754_F32_ABS_MASK) {
                 c_bits -= 1;
                 cos_out = f32::from_bits(c_bits);
             } else {

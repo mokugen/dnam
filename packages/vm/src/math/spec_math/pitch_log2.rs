@@ -3,6 +3,11 @@
 
 use super::ieee_bits::{round_f64_to_f32_bits, widen_f32_bits};
 use super::saturation::InvalidFloatInput;
+use crate::math::{
+    IEEE754_F32_ABS_MASK, IEEE754_F32_EXP_ALL_ONES, IEEE754_F32_EXP_BIAS,
+    IEEE754_F32_MANTISSA_BITS, IEEE754_F32_MANTISSA_MASK, IEEE754_F32_MIN_SUBNORMAL_EXP,
+    IEEE754_F32_SIGN_MASK, const_abs_f64, const_f32_pow2, const_inv_factorial_f64,
+};
 
 /// Scale factor $\ln(2)/12$ in IEEE-754 `f64` (`0x3FAD9303FEA2F7EA`).
 pub const PITCH_LN2_OVER_12_F64_BITS: u64 = 0x3FAD_9303_FEA2_F7EA;
@@ -12,7 +17,7 @@ pub const PITCH_LN2_OVER_12_F64_BITS: u64 = 0x3FAD_9303_FEA2_F7EA;
 #[inline]
 pub fn eval_pitch_profile_f32(semitones: f32) -> Option<(f32, f32)> {
     let p = widen_f32_bits(semitones.to_bits())?;
-    if !p.is_finite() || p.abs() > 24.0 {
+    if !p.is_finite() || const_abs_f64(p) > 24.0 {
         return None;
     }
     if p == 0.0 {
@@ -21,20 +26,20 @@ pub fn eval_pitch_profile_f32(semitones: f32) -> Option<(f32, f32)> {
     let scale = f64::from_bits(PITCH_LN2_OVER_12_F64_BITS);
     let x = p * scale;
     const INV_FACT: [f64; 14] = [
-        1.0,
-        1.0 / 2.0,
-        1.0 / 6.0,
-        1.0 / 24.0,
-        1.0 / 120.0,
-        1.0 / 720.0,
-        1.0 / 5_040.0,
-        1.0 / 40_320.0,
-        1.0 / 362_880.0,
-        1.0 / 3_628_800.0,
-        1.0 / 39_916_800.0,
-        1.0 / 479_001_600.0,
-        1.0 / 6_227_020_800.0,
-        1.0 / 87_178_291_200.0,
+        const_inv_factorial_f64(1),
+        const_inv_factorial_f64(2),
+        const_inv_factorial_f64(3),
+        const_inv_factorial_f64(4),
+        const_inv_factorial_f64(5),
+        const_inv_factorial_f64(6),
+        const_inv_factorial_f64(7),
+        const_inv_factorial_f64(8),
+        const_inv_factorial_f64(9),
+        const_inv_factorial_f64(10),
+        const_inv_factorial_f64(11),
+        const_inv_factorial_f64(12),
+        const_inv_factorial_f64(13),
+        const_inv_factorial_f64(14),
     ];
     let mut poly = INV_FACT[13];
     let mut idx = 13;
@@ -83,25 +88,26 @@ pub enum Log2EnvelopeDecomp {
 /// Decomposes an `f32` bit pattern into `(exponent, 23-bit normalized fraction)`.
 #[inline]
 pub const fn decompose_positive_f32_bits(bits: u32) -> Log2EnvelopeDecomp {
-    let magnitude = bits & 0x7fff_ffff;
+    let magnitude = bits & IEEE754_F32_ABS_MASK;
     if magnitude == 0 {
         return Log2EnvelopeDecomp::ZeroSilent;
     }
-    let exponent_bits = (bits >> 23) & 0xff;
-    if (bits >> 31) != 0 || exponent_bits == 0xff {
+    let exponent_bits = (bits >> IEEE754_F32_MANTISSA_BITS) & IEEE754_F32_EXP_ALL_ONES;
+    if (bits & IEEE754_F32_SIGN_MASK) != 0 || exponent_bits == IEEE754_F32_EXP_ALL_ONES {
         return Log2EnvelopeDecomp::Invalid;
     }
-    let fraction = bits & 0x007f_ffff;
+    let fraction = bits & IEEE754_F32_MANTISSA_MASK;
     if exponent_bits != 0 {
         Log2EnvelopeDecomp::Positive {
-            exponent: (exponent_bits as i32) - 127,
+            exponent: (exponent_bits as i32) - (IEEE754_F32_EXP_BIAS as i32),
             fraction,
         }
     } else {
         let top_bit = 31 - fraction.leading_zeros();
-        let norm_frac = (fraction << (23 - top_bit)) & 0x007f_ffff;
+        let norm_frac =
+            (fraction << (IEEE754_F32_MANTISSA_BITS - top_bit)) & IEEE754_F32_MANTISSA_MASK;
         Log2EnvelopeDecomp::Positive {
-            exponent: (top_bit as i32) - 149,
+            exponent: (top_bit as i32) + IEEE754_F32_MIN_SUBNORMAL_EXP,
             fraction: norm_frac,
         }
     }
@@ -111,7 +117,7 @@ pub const fn decompose_positive_f32_bits(bits: u32) -> Log2EnvelopeDecomp {
 #[inline]
 pub fn lookup_log2_mantissa_f32(fraction: u32) -> f32 {
     let index = ((fraction >> 16) & 0x7f) as usize;
-    let alpha = ((fraction & 0xffff) as f32) * f32::from_bits(0x3780_0000);
+    let alpha = ((fraction & 0xffff) as f32) * const_f32_pow2(-16);
     let low = f32::from_bits(LOG2_MANTISSA_LUT_129_BITS[index]);
     let high = f32::from_bits(LOG2_MANTISSA_LUT_129_BITS[index + 1]);
     let d = high - low;

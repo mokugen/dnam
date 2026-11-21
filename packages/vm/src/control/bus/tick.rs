@@ -1,11 +1,13 @@
 //! `Op-N[Ctrl]` exact-integer static evaluation, four independent 4-D trust-region clips,
-//! and `Op-M[Ctrl]` `Q0.192` + envelope advancement (`ref[dsp.ctrl.op-n.*]`).
+//! and `Op-M[Ctrl]` `Q0.192` + envelope advancement (`ref[dsp.ctrl.op-n.engine]`,
+//! `ref[dsp.ctrl.op-n.trust-clip]`, `ref[dsp.ctrl.op-m.ballistic-lfo]`).
 
 use crate::control::cp1::{eval_uint_base_4x8, eval_uint_ultra_delta_3x4x8};
 use crate::control::exact_int::{ExactIntFactorAccumulator, ExactIntMainAccumulator};
 use crate::control::{ControlClampDescriptor, Cp1ContributorSlot};
 use crate::math::{
-    MAX_ROTOR_ANGLE_F32_BITS, Q0_192Phase, flush_subnormal_f32_bits, step_lfo_phasor_zero_hold,
+    IEEE754_F32_ABS_MASK, IEEE754_F32_SIGN_MASK, MAX_ROTOR_ANGLE_F32_BITS, Q0_192Phase,
+    const_abs_f32, flush_subnormal_f32_bits, sanitize_finite_f32, step_lfo_phasor_zero_hold,
     trust_clip_outward_4d,
 };
 
@@ -23,16 +25,7 @@ fn contributor_basis_and_scalar(
             (descriptors[p].eval_lobatto_basis(u_p), u_p)
         }
         1 => {
-            let def_opt = if descriptors[p].default_val.is_finite() {
-                let pos = if descriptors[p].default_val > 0.0 {
-                    descriptors[p].default_val
-                } else {
-                    0.0
-                };
-                ((pos + 0.5) as u8).min(15)
-            } else {
-                0
-            };
+            let def_opt = descriptors[p].default_switch_option();
             let active_opt = active_switches[p];
             let active = if slot.aux == 0xFF {
                 active_opt != def_opt
@@ -86,10 +79,7 @@ pub(crate) fn evaluate_static_cp1_latents(inp: StaticEvalInputs<'_>, out: Static
         let (lob, scalar) =
             contributor_basis_and_scalar(slot, inp.descriptors, inp.norm_vals, inp.active_switches);
         let lanes = usize::from(slot.lanes).min(3);
-        let has_emb = slot.emb.iter().any(|w| {
-            let abs_w = if *w >= 0.0 { *w } else { -*w };
-            abs_w > 1.0e-12
-        });
+        let has_emb = slot.emb.iter().any(|&w| const_abs_f32(w) > 1.0e-12);
         let z_c = if has_emb {
             ((slot.emb[0] * lob[0]) + (slot.emb[1] * lob[1])) + (slot.emb[2] * lob[2])
         } else {
@@ -100,22 +90,22 @@ pub(crate) fn evaluate_static_cp1_latents(inp: StaticEvalInputs<'_>, out: Static
             let lb = lob[l];
             for d in 0..8 {
                 let prod_b = slot.main_base[l][d] * lb;
-                let _ = main_base[d].add_f32_bits_rt(prod_b.to_bits());
+                main_base[d].add_f32_bits_rt(prod_b.to_bits());
                 if inp.is_ultra && slot.has_ultra {
                     let prod_u = slot.main_ultra[l][d] * lb;
-                    let _ = main_ultra[d].add_f32_bits_rt(prod_u.to_bits());
+                    main_ultra[d].add_f32_bits_rt(prod_u.to_bits());
                 }
             }
         }
         for f in 0..4 {
             let v_b = slot.v_base[f] * z_c;
-            let _ = out.exact_fm_base[f].update_contributor_rt(c_idx, v_b.to_bits());
+            out.exact_fm_base[f].update_contributor_rt(c_idx, v_b.to_bits());
             let v_u = if inp.is_ultra && slot.has_ultra {
                 slot.v_ultra[f] * z_c
             } else {
                 0.0
             };
-            let _ = out.exact_fm_ultra[f].update_contributor_rt(c_idx, v_u.to_bits());
+            out.exact_fm_ultra[f].update_contributor_rt(c_idx, v_u.to_bits());
         }
     }
 
@@ -194,10 +184,11 @@ pub(crate) fn step_lfos_and_harmonics(
     lfo_harmonics: &mut [f32; 8],
 ) -> [f32; 4] {
     for j in 0..2 {
-        let bits = lfo_dphi_host_bits[j] & 0x7FFF_FFFF;
+        let bits = lfo_dphi_host_bits[j] & IEEE754_F32_ABS_MASK;
         if bits != 0 {
             let raw_bits = lfo_dphi_host_bits[j];
-            let clamped_bits = (raw_bits & 0x8000_0000) | bits.min(MAX_ROTOR_ANGLE_F32_BITS);
+            let clamped_bits =
+                (raw_bits & IEEE754_F32_SIGN_MASK) | bits.min(MAX_ROTOR_ANGLE_F32_BITS);
             if lfo_phases_q192[j].step_angle_bits(clamped_bits).is_some() {
                 let (c, s) = lfo_phases_q192[j].to_phasor();
                 lfo_phasors[j] = [c, s];
@@ -238,16 +229,12 @@ pub(crate) fn update_env_states(
 ) {
     if let Some(ext) = router_envelopes {
         for i in 0..4 {
-            let v = if ext[i].is_finite() { ext[i] } else { 0.0 };
+            let v = sanitize_finite_f32(ext[i]);
             env_states[i] = flush_subnormal_f32_bits(v);
         }
         return;
     }
-    let a = if audio_abs_energy.is_finite() && audio_abs_energy >= 0.0 {
-        audio_abs_energy
-    } else {
-        0.0
-    };
+    let a = sanitize_finite_f32(audio_abs_energy).max(0.0);
     for b in 0..3 {
         let p = env_poles_host[b];
         env_states[b] = flush_subnormal_f32_bits(p * env_states[b] + (1.0 - p) * a);

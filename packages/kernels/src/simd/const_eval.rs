@@ -5,8 +5,134 @@
 //! `u128`, `i128`, or `libm` dependencies) so this module compiles identically on `#![no_std]` CPU
 //! targets and 32-bit `spirv-unknown-naga-wgsl` shaders.
 
+mod fixed_point;
+
+use fixed_point::{
+    ONE_Q60, U64Limb, div_fixed_q60, mul_q60, mul_u32_wide, mul_u64_u32_div_u32, pi_q60,
+};
+
 /// IEEE-754 `binary32` exponent bias (`127`).
 pub const IEEE754_F32_EXP_BIAS: u32 = 127;
+
+/// IEEE-754 `binary32` explicit fraction width (`23` bits).
+pub const IEEE754_F32_MANTISSA_BITS: u32 = 23;
+
+/// IEEE-754 `binary16` (`fp16`) exponent bias (`15`).
+pub const IEEE754_FP16_EXP_BIAS: u32 = 15;
+
+/// IEEE-754 `binary16` (`fp16`) explicit fraction width (`10` bits).
+pub const IEEE754_FP16_MANTISSA_BITS: u32 = 10;
+
+/// IEEE-754 `binary64` exponent bias (`1023`, stored as 32-bit `i32` for 32-bit `spirv` compatibility).
+pub const IEEE754_F64_EXP_BIAS: i32 = 1023;
+
+/// IEEE-754 `binary64` explicit fraction width (`52` bits).
+pub const IEEE754_F64_MANTISSA_BITS: u32 = 52;
+
+/// Minimum unbiased normal exponent for IEEE-754 `binary32` (`1 - 127 = -126`).
+pub const IEEE754_F32_MIN_NORMAL_EXP: i32 = 1 - (IEEE754_F32_EXP_BIAS as i32);
+
+/// Minimum unbiased subnormal LSB exponent for IEEE-754 `binary32` (`-126 - 23 = -149`).
+pub const IEEE754_F32_MIN_SUBNORMAL_EXP: i32 =
+    IEEE754_F32_MIN_NORMAL_EXP - (IEEE754_F32_MANTISSA_BITS as i32);
+
+/// Sum `E_bias + M_bits` (`127 + 23 = 150`) mapping biased normal exponents cleanly to scaled shifts.
+pub const IEEE754_F32_NORMAL_MANTISSA_EXP_OFFSET: i32 =
+    (IEEE754_F32_EXP_BIAS as i32) + (IEEE754_F32_MANTISSA_BITS as i32);
+
+/// IEEE-754 `binary32` explicit 23-bit mantissa mask (`0x007F_FFFF`).
+pub const IEEE754_F32_MANTISSA_MASK: u32 = (1_u32 << IEEE754_F32_MANTISSA_BITS) - 1;
+
+/// IEEE-754 `binary32` implicit leading significand bit (`2^23 == 0x0080_0000`).
+pub const IEEE754_F32_IMPLICIT_BIT: u32 = 1_u32 << IEEE754_F32_MANTISSA_BITS;
+
+/// IEEE-754 `binary32` total significand precision (`24` bits including implicit bit).
+pub const IEEE754_F32_SIGNIFICAND_BITS: u32 = IEEE754_F32_MANTISSA_BITS + 1;
+
+/// IEEE-754 `binary32` sign bit mask (`0x8000_0000`).
+pub const IEEE754_F32_SIGN_MASK: u32 = 1_u32 << 31;
+
+/// IEEE-754 `binary32` magnitude bitmask stripping the sign bit (`0x7FFF_FFFF`).
+pub const IEEE754_F32_ABS_MASK: u32 = !IEEE754_F32_SIGN_MASK;
+
+/// IEEE-754 `binary32` all-ones biased exponent field (`0xFF`, `2 * 127 + 1`).
+pub const IEEE754_F32_EXP_ALL_ONES: u32 = (2 * IEEE754_F32_EXP_BIAS) + 1;
+
+/// IEEE-754 `binary32` exponent bitmask (`0x7F80_0000`).
+pub const IEEE754_F32_EXP_MASK: u32 = IEEE754_F32_EXP_ALL_ONES << IEEE754_F32_MANTISSA_BITS;
+
+/// IEEE-754 `binary32` exact `1.0` bit pattern (`0x3F80_0000`).
+pub const IEEE754_F32_ONE_BITS: u32 = IEEE754_F32_EXP_BIAS << IEEE754_F32_MANTISSA_BITS;
+
+/// Mantissa right-shift converting IEEE-754 `binary32` fractions into `binary16` (`23 - 10 == 13`).
+pub const IEEE754_F32_TO_FP16_MANTISSA_SHIFT: u32 =
+    IEEE754_F32_MANTISSA_BITS - IEEE754_FP16_MANTISSA_BITS;
+
+/// IEEE-754 `binary16` (`fp16`) sign bit mask in lower 16 bits (`0x8000`).
+pub const IEEE754_FP16_SIGN_MASK: u32 = 1_u32 << 15;
+
+/// IEEE-754 `binary16` (`fp16`) magnitude mask in lower 16 bits (`0x7FFF`).
+pub const IEEE754_FP16_ABS_MASK: u32 = IEEE754_FP16_SIGN_MASK - 1;
+
+/// IEEE-754 `binary16` (`fp16`) explicit 10-bit mantissa mask (`0x03FF`).
+pub const IEEE754_FP16_MANTISSA_MASK: u32 = (1_u32 << IEEE754_FP16_MANTISSA_BITS) - 1;
+
+/// IEEE-754 `binary16` (`fp16`) all-ones biased exponent field (`0x1F == 31`).
+pub const IEEE754_FP16_EXP_ALL_ONES: u32 = (2 * IEEE754_FP16_EXP_BIAS) + 1;
+
+/// IEEE-754 `binary16` (`fp16`) infinity exponent bitmask (`0x7C00`).
+pub const IEEE754_FP16_EXP_MASK: u32 = IEEE754_FP16_EXP_ALL_ONES << IEEE754_FP16_MANTISSA_BITS;
+
+/// Maximum finite positive IEEE-754 `binary16` (`fp16`) bit pattern (`0x7BFF`).
+pub const IEEE754_FP16_MAX_FINITE_BITS: u32 = IEEE754_FP16_EXP_MASK - 1;
+
+/// Maximum normal biased exponent for IEEE-754 `binary64` (`2 * 1023 == 2046`, stored as `i32`).
+pub const IEEE754_F64_MAX_NORMAL_BIASED_EXP: i32 = 2 * IEEE754_F64_EXP_BIAS;
+
+/// IEEE-754 `binary64` all-ones 11-bit exponent field (`0x7FF`, stored as `u32` for `spirv`).
+pub const IEEE754_F64_EXP_ALL_ONES: u32 = (2 * IEEE754_F64_EXP_BIAS + 1) as u32;
+
+/// IEEE-754 `1.5 * 2^23` (`12_582_912.0`) magic integer-rounding bias (`0x4B40_0000`).
+pub const BIASED_INT_MAGIC_F32: f32 = 1.5 * ((1_u32 << IEEE754_F32_MANTISSA_BITS) as f32);
+
+/// Derives an IEEE-754 `binary32` exact power-of-two scalar `2^exp` (`exp in -126..=127`)
+/// purely via exponent bit shifting (`ref[repo.code.constant-eval-and-derivations]`).
+#[inline(always)]
+#[must_use]
+pub const fn const_f32_pow2(exp: i32) -> f32 {
+    let biased = (IEEE754_F32_EXP_BIAS as i32) + exp;
+    f32::from_bits((biased as u32) << IEEE754_F32_MANTISSA_BITS)
+}
+
+/// Exact-integer truncation boundary `2^23` (`8_388_608.0`) in IEEE-754 `binary32`.
+pub const F32_INT_EXACT_THRESHOLD: f32 = const_f32_pow2(IEEE754_F32_MANTISSA_BITS as i32);
+
+/// Maximum finite IEEE-754 `binary16` (`fp16`) magnitude `(2 - 2^-10) * 2^15 == 65,504.0`
+/// (`0x477F_E000` in `binary32`, `0x7BFF` in `fp16`).
+pub const FP16_FINITE_MAX_F32: f32 = (2.0 - const_f32_pow2(-(IEEE754_FP16_MANTISSA_BITS as i32)))
+    * const_f32_pow2(IEEE754_FP16_EXP_BIAS as i32);
+
+/// Branch-free compile-time `|x|` for `binary32` (`ref[sdk.rust.shared-nostd-kernels]`).
+#[inline(always)]
+#[must_use]
+pub const fn const_abs_f32(x: f32) -> f32 {
+    f32::from_bits(x.to_bits() & IEEE754_F32_ABS_MASK)
+}
+
+/// Compile-time Taylor inverse factorial `(-1)^neg / n!` evaluated strictly in 32-bit
+/// `f32`/`u32` arithmetic (`ref[repo.code.constant-eval-and-derivations]`).
+#[inline(always)]
+#[must_use]
+pub const fn const_taylor_inv_fact_f32(n: u32, negative: bool) -> f32 {
+    let mut fact = 1.0_f32;
+    let mut k = 2_u32;
+    while k <= n {
+        fact *= k as f32;
+        k += 1;
+    }
+    let mag = 1.0_f32 / fact;
+    if negative { -mag } else { mag }
+}
 
 /// Chebyshev minimax `binary32` positive reciprocal integer-sub seed
 /// `((2 * E_bias - 1) << 23) + round((2 * sqrt(6) - 4) * 2^23) == 0x7EF3_11C3`
@@ -118,224 +244,6 @@ pub const PRO_SPEC: SonaTierSpec = SonaTierSpec::new([3, 2, 2, 1], 96, 24, 3, 2)
 /// `Ultra` compile-time tier capacity profile (`[4, 3, 2, 1]`, `40` lanes @ `2x`, `10` SVF quads, `128` FIR, `32` Kautz).
 pub const ULTRA_SPEC: SonaTierSpec = SonaTierSpec::new([4, 3, 2, 1], 128, 32, 4, 2);
 
-// Pure `u32`-limb 64-bit unsigned fixed-point helpers (zero `u64`/`f64` for `spirv` cleanliness).
-
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-struct U64Limb {
-    hi: u32,
-    lo: u32,
-}
-
-impl U64Limb {
-    const ZERO: Self = Self { hi: 0, lo: 0 };
-
-    #[inline(always)]
-    const fn from_u32(v: u32) -> Self {
-        Self { hi: 0, lo: v }
-    }
-
-    #[inline(always)]
-    const fn add(self, rhs: Self) -> Self {
-        let (lo, carry) = self.lo.overflowing_add(rhs.lo);
-        let hi = self.hi.wrapping_add(rhs.hi).wrapping_add(carry as u32);
-        Self { hi, lo }
-    }
-
-    #[inline(always)]
-    const fn sub(self, rhs: Self) -> Self {
-        let (lo, borrow) = self.lo.overflowing_sub(rhs.lo);
-        let hi = self.hi.wrapping_sub(rhs.hi).wrapping_sub(borrow as u32);
-        Self { hi, lo }
-    }
-
-    #[inline(always)]
-    const fn ge(self, rhs: Self) -> bool {
-        self.hi > rhs.hi || (self.hi == rhs.hi && self.lo >= rhs.lo)
-    }
-
-    #[inline(always)]
-    const fn shl1(self) -> Self {
-        Self {
-            hi: (self.hi << 1) | (self.lo >> 31),
-            lo: self.lo << 1,
-        }
-    }
-
-    #[inline(always)]
-    const fn shl(self, shift: u32) -> Self {
-        if shift == 0 {
-            self
-        } else if shift < 32 {
-            Self {
-                hi: (self.hi << shift) | (self.lo >> (32 - shift)),
-                lo: self.lo << shift,
-            }
-        } else if shift < 64 {
-            Self {
-                hi: self.lo << (shift - 32),
-                lo: 0,
-            }
-        } else {
-            Self::ZERO
-        }
-    }
-
-    const fn div_rem(self, divisor: Self) -> (Self, Self) {
-        let mut q = Self::ZERO;
-        let mut r = Self::ZERO;
-        let mut i: u32 = 64;
-        while i > 0 {
-            i -= 1;
-            let bit = if i >= 32 {
-                (self.hi >> (i - 32)) & 1
-            } else {
-                (self.lo >> i) & 1
-            };
-            r = r.shl1();
-            r.lo |= bit;
-            if r.ge(divisor) {
-                r = r.sub(divisor);
-                if i >= 32 {
-                    q.hi |= 1_u32 << (i - 32);
-                } else {
-                    q.lo |= 1_u32 << i;
-                }
-            }
-        }
-        (q, r)
-    }
-}
-
-#[inline(always)]
-const fn mul_u32_wide(a: u32, b: u32) -> U64Limb {
-    let a_lo = a & 0xFFFF;
-    let a_hi = a >> 16;
-    let b_lo = b & 0xFFFF;
-    let b_hi = b >> 16;
-    let p00 = a_lo * b_lo;
-    let p01 = a_lo * b_hi;
-    let p10 = a_hi * b_lo;
-    let p11 = a_hi * b_hi;
-    let t0 = U64Limb { hi: 0, lo: p00 };
-    let t1 = U64Limb {
-        hi: p01 >> 16,
-        lo: p01 << 16,
-    };
-    let t2 = U64Limb {
-        hi: p10 >> 16,
-        lo: p10 << 16,
-    };
-    let t3 = U64Limb { hi: p11, lo: 0 };
-    t0.add(t1).add(t2).add(t3)
-}
-
-const fn add_wide_at(acc: &mut [u32; 4], idx: usize, val: U64Limb) {
-    let (s0, c0) = acc[idx].overflowing_add(val.lo);
-    acc[idx] = s0;
-    let (s1, c1) = acc[idx + 1].overflowing_add(val.hi);
-    let (s1b, c2) = s1.overflowing_add(c0 as u32);
-    acc[idx + 1] = s1b;
-    let mut carry = (c1 as u32) + (c2 as u32);
-    let mut k = idx + 2;
-    while carry != 0 && k < 4 {
-        let (sk, ck) = acc[k].overflowing_add(carry);
-        acc[k] = sk;
-        carry = ck as u32;
-        k += 1;
-    }
-}
-
-const fn mul_q60(a: U64Limb, b: U64Limb) -> U64Limb {
-    let mut acc = [0_u32; 4];
-    add_wide_at(&mut acc, 0, mul_u32_wide(a.lo, b.lo));
-    add_wide_at(&mut acc, 1, mul_u32_wide(a.lo, b.hi));
-    add_wide_at(&mut acc, 1, mul_u32_wide(a.hi, b.lo));
-    add_wide_at(&mut acc, 2, mul_u32_wide(a.hi, b.hi));
-    U64Limb {
-        hi: (acc[2] >> 28) | (acc[3] << 4),
-        lo: (acc[1] >> 28) | (acc[2] << 4),
-    }
-}
-
-const fn div_fixed_q60(num: U64Limb, den: U64Limb) -> U64Limb {
-    let mut q = U64Limb::ZERO;
-    let mut r = num;
-    let mut i: u32 = 60;
-    while i > 0 {
-        i -= 1;
-        r = r.shl1();
-        if r.ge(den) {
-            r = r.sub(den);
-            if i >= 32 {
-                q.hi |= 1_u32 << (i - 32);
-            } else {
-                q.lo |= 1_u32 << i;
-            }
-        }
-    }
-    q
-}
-
-const fn mul_u64_u32_div_u32(a: U64Limb, num: u32, den: u32) -> U64Limb {
-    let lo_prod = mul_u32_wide(a.lo, num);
-    let hi_prod = mul_u32_wide(a.hi, num);
-    let (mid, carry) = lo_prod.hi.overflowing_add(hi_prod.lo);
-    let top = hi_prod.hi.wrapping_add(carry as u32);
-    let words = [lo_prod.lo, mid, top];
-    let div_limb = U64Limb::from_u32(den);
-    let mut q = U64Limb::ZERO;
-    let mut r = U64Limb::ZERO;
-    let mut i: u32 = 96;
-    while i > 0 {
-        i -= 1;
-        let word_idx = (i >> 5) as usize;
-        let bit = (words[word_idx] >> (i & 31)) & 1;
-        r = r.shl1();
-        r.lo |= bit;
-        if r.ge(div_limb) {
-            r = r.sub(div_limb);
-            if i < 32 {
-                q.lo |= 1_u32 << i;
-            } else if i < 64 {
-                q.hi |= 1_u32 << (i - 32);
-            }
-        }
-    }
-    q
-}
-
-const ONE_Q60: U64Limb = U64Limb {
-    hi: 1_u32 << 28,
-    lo: 0,
-};
-
-const fn atan_inv_q60(x: u32) -> U64Limb {
-    let x2 = U64Limb::from_u32(x * x);
-    let mut term = ONE_Q60.div_rem(U64Limb::from_u32(x)).0;
-    let mut sum = term;
-    let mut k: u32 = 1;
-    while k <= 16 {
-        term = term.div_rem(x2).0;
-        let delta = term.div_rem(U64Limb::from_u32(2 * k + 1)).0;
-        if delta.hi == 0 && delta.lo == 0 {
-            break;
-        }
-        if (k & 1) == 1 {
-            sum = sum.sub(delta);
-        } else {
-            sum = sum.add(delta);
-        }
-        k += 1;
-    }
-    sum
-}
-
-const fn pi_q60() -> U64Limb {
-    let atan5 = atan_inv_q60(5);
-    let atan239 = atan_inv_q60(239);
-    atan5.shl(4).sub(atan239.shl(2))
-}
-
 /// Compile-time Chebyshev minimax `binary32` positive reciprocal integer-sub seed
 /// `((2 * E_bias - 1) << 23) + round((2 * sqrt(6) - 4) * 2^23) == 0x7EF3_11C3`
 /// computed via pure `u32` fixed-point integer square root (`24 * 2^58`).
@@ -358,28 +266,28 @@ pub const fn const_f32_rcp_chebyshev_seed() -> u32 {
     let four_q29 = 4_u32 << 29;
     let mant_q29 = res - four_q29;
     let mant_round = (mant_q29 + (1_u32 << 5)) >> 6;
-    ((2 * IEEE754_F32_EXP_BIAS - 1) << 23) + mant_round
+    ((2 * IEEE754_F32_EXP_BIAS - 1) << IEEE754_F32_MANTISSA_BITS) + mant_round
 }
 
 /// Compile-time largest positive `binary32` bit pattern `<= num / den` for `0 < num <= den`.
 #[must_use]
 pub const fn const_max_f32_bits_le_ratio(num: u32, den: u32) -> u32 {
     if den == 0 || num >= den {
-        return 0x3F80_0000;
+        return IEEE754_F32_ONE_BITS;
     }
     if num == 0 {
         return 0;
     }
     let den_64 = U64Limb::from_u32(den);
     let mut num_64 = U64Limb::from_u32(num);
-    let mut exp: u32 = 126;
+    let mut exp: u32 = IEEE754_F32_EXP_BIAS - 1;
     while !num_64.shl1().ge(den_64) && exp > 1 {
         num_64 = num_64.shl1();
         exp -= 1;
     }
-    let scaled = num_64.shl(24);
+    let scaled = num_64.shl(IEEE754_F32_SIGNIFICAND_BITS);
     let (q, _) = scaled.div_rem(den_64);
-    (exp << 23) + (q.lo - (1_u32 << 23))
+    (exp << IEEE754_F32_MANTISSA_BITS) + (q.lo - IEEE754_F32_IMPLICIT_BIT)
 }
 
 /// Compile-time passband-normalized DC blocker pole `R = cos(w) / (1 + sin(w))` in `binary32` bits,
@@ -387,7 +295,7 @@ pub const fn const_max_f32_bits_le_ratio(num: u32, den: u32) -> u32 {
 #[must_use]
 pub const fn const_dc_blocker_pole_bits(fc_hz: u32, fs_hz: u32) -> u32 {
     if fc_hz == 0 {
-        return 0x3F80_0000;
+        return IEEE754_F32_ONE_BITS;
     }
     if fs_hz == 0 || 4 * fc_hz >= fs_hz {
         return 0;
@@ -431,7 +339,7 @@ pub const fn const_dc_blocker_pole_bits(fc_hz: u32, fs_hz: u32) -> u32 {
         hi: 1_u32 << 27,
         lo: 0,
     };
-    let mut exp: u32 = 126;
+    let mut exp: u32 = IEEE754_F32_EXP_BIAS - 1;
     let mut val = r_q60;
     while !val.ge(half_q60) && exp > 1 {
         val = val.shl1();
@@ -443,11 +351,11 @@ pub const fn const_dc_blocker_pole_bits(fc_hz: u32, fs_hz: u32) -> u32 {
     if round_bit != 0 && (sticky || (sig & 1) != 0) {
         sig += 1;
     }
-    if sig >= (1_u32 << 24) {
+    if sig >= (1_u32 << IEEE754_F32_SIGNIFICAND_BITS) {
         sig >>= 1;
         exp += 1;
     }
-    (exp << 23) | (sig & 0x007F_FFFF)
+    (exp << IEEE754_F32_MANTISSA_BITS) | (sig & IEEE754_F32_MANTISSA_MASK)
 }
 
 const fn verify_tier_spec(
@@ -502,6 +410,38 @@ const _: () = assert!(verify_tier_spec(&ULTRA_SPEC, 10, 4, 128, 32, 2));
 const _: () = assert!(is_matryoshka_monotonic(&LITE_SPEC, &FULL_SPEC));
 const _: () = assert!(is_matryoshka_monotonic(&FULL_SPEC, &PRO_SPEC));
 const _: () = assert!(is_matryoshka_monotonic(&PRO_SPEC, &ULTRA_SPEC));
+const _: () = assert!(IEEE754_FP16_EXP_BIAS == 15);
+const _: () = assert!(IEEE754_F64_EXP_BIAS == 1023);
+const _: () = assert!(IEEE754_F32_MIN_NORMAL_EXP == -126);
+const _: () = assert!(IEEE754_F32_MIN_SUBNORMAL_EXP == -149);
+const _: () = assert!(IEEE754_F32_NORMAL_MANTISSA_EXP_OFFSET == 150);
+const _: () = assert!(F32_INT_EXACT_THRESHOLD == 8_388_608.0);
+const _: () = assert!(IEEE754_F32_ABS_MASK == 0x7FFF_FFFF);
+const _: () = assert!(IEEE754_F32_SIGN_MASK == 0x8000_0000);
+const _: () = assert!(IEEE754_F32_MANTISSA_MASK == 0x007F_FFFF);
+const _: () = assert!(IEEE754_F32_IMPLICIT_BIT == 0x0080_0000);
+const _: () = assert!(IEEE754_F32_SIGNIFICAND_BITS == 24);
+const _: () = assert!(IEEE754_F32_EXP_ALL_ONES == 0xFF);
+const _: () = assert!(IEEE754_F32_EXP_MASK == 0x7F80_0000);
+const _: () = assert!(IEEE754_F32_ONE_BITS == 0x3F80_0000);
+const _: () = assert!(IEEE754_F32_TO_FP16_MANTISSA_SHIFT == 13);
+const _: () = assert!(IEEE754_FP16_SIGN_MASK == 0x8000);
+const _: () = assert!(IEEE754_FP16_ABS_MASK == 0x7FFF);
+const _: () = assert!(IEEE754_FP16_MANTISSA_MASK == 0x03FF);
+const _: () = assert!(IEEE754_FP16_EXP_ALL_ONES == 0x1F);
+const _: () = assert!(IEEE754_FP16_EXP_MASK == 0x7C00);
+const _: () = assert!(IEEE754_FP16_MAX_FINITE_BITS == 0x7BFF);
+const _: () = assert!(IEEE754_F64_MAX_NORMAL_BIASED_EXP == 2046);
+const _: () = assert!(IEEE754_F64_EXP_ALL_ONES == 0x7FF);
+const _: () = assert!(BIASED_INT_MAGIC_F32.to_bits() == 0x4B40_0000);
+const _: () = assert!(FP16_FINITE_MAX_F32 == 65_504.0);
+const _: () = assert!(FP16_FINITE_MAX_F32.to_bits() == 0x477F_E000);
+const _: () = assert!(const_f32_pow2(-16) * const_f32_pow2(16) == 1.0);
+const _: () = assert!(const_abs_f32(-0.0).to_bits() == 0);
+const _: () = assert!(const_abs_f32(-2.5) == 2.5);
+const _: () = assert!(const_taylor_inv_fact_f32(0, false) == 1.0);
+const _: () = assert!(const_taylor_inv_fact_f32(2, true) == -0.5);
+const _: () = assert!(const_abs_f32(const_taylor_inv_fact_f32(3, false) - 1.0 / 6.0) < 1.0e-7);
 
 #[cfg(test)]
 mod tests {
@@ -518,6 +458,41 @@ mod tests {
     #[test]
     fn test_const_eval_seeds_poles_bounds_and_tiers() {
         assert_eq!(IEEE754_F32_EXP_BIAS, 127);
+        assert_eq!(IEEE754_F32_MANTISSA_BITS, 23);
+        assert_eq!(IEEE754_FP16_EXP_BIAS, 15);
+        assert_eq!(IEEE754_FP16_MANTISSA_BITS, 10);
+        assert_eq!(IEEE754_F64_EXP_BIAS, 1023);
+        assert_eq!(IEEE754_F64_MANTISSA_BITS, 52);
+        assert_eq!(IEEE754_F32_MIN_NORMAL_EXP, -126);
+        assert_eq!(IEEE754_F32_MIN_SUBNORMAL_EXP, -149);
+        assert_eq!(IEEE754_F32_NORMAL_MANTISSA_EXP_OFFSET, 150);
+        assert_eq!(F32_INT_EXACT_THRESHOLD, 8_388_608.0);
+        assert_eq!(IEEE754_F32_ABS_MASK, 0x7FFF_FFFF);
+        assert_eq!(IEEE754_F32_SIGN_MASK, 0x8000_0000);
+        assert_eq!(IEEE754_F32_MANTISSA_MASK, 0x007F_FFFF);
+        assert_eq!(IEEE754_F32_IMPLICIT_BIT, 0x0080_0000);
+        assert_eq!(IEEE754_F32_SIGNIFICAND_BITS, 24);
+        assert_eq!(IEEE754_F32_EXP_ALL_ONES, 0xFF);
+        assert_eq!(IEEE754_F32_EXP_MASK, 0x7F80_0000);
+        assert_eq!(IEEE754_F32_ONE_BITS, 0x3F80_0000);
+        assert_eq!(IEEE754_F32_TO_FP16_MANTISSA_SHIFT, 13);
+        assert_eq!(IEEE754_FP16_SIGN_MASK, 0x8000);
+        assert_eq!(IEEE754_FP16_ABS_MASK, 0x7FFF);
+        assert_eq!(IEEE754_FP16_MANTISSA_MASK, 0x03FF);
+        assert_eq!(IEEE754_FP16_EXP_ALL_ONES, 0x1F);
+        assert_eq!(IEEE754_FP16_EXP_MASK, 0x7C00);
+        assert_eq!(IEEE754_FP16_MAX_FINITE_BITS, 0x7BFF);
+        assert_eq!(IEEE754_F64_MAX_NORMAL_BIASED_EXP, 2046);
+        assert_eq!(IEEE754_F64_EXP_ALL_ONES, 0x7FF);
+        assert_eq!(BIASED_INT_MAGIC_F32.to_bits(), 0x4B40_0000);
+        assert_eq!(FP16_FINITE_MAX_F32, 65_504.0);
+        assert_eq!(const_f32_pow2(0), 1.0);
+        assert_eq!(const_f32_pow2(-8), 1.0 / 256.0);
+        assert_eq!(const_f32_pow2(15), 32_768.0);
+        assert_eq!(const_abs_f32(-3.25), 3.25);
+        assert_eq!(const_abs_f32(-0.0).to_bits(), 0);
+        assert_eq!(const_taylor_inv_fact_f32(4, false), 1.0_f32 / 24.0_f32);
+        assert_eq!(const_taylor_inv_fact_f32(2, true), -0.5_f32);
         assert_eq!(IEEE754_F32_RCP_SEED, 0x7EF3_11C3);
         assert_eq!(const_f32_rcp_chebyshev_seed(), 0x7EF3_11C3);
         assert_eq!(IEEE754_F32_RSQRT_SEED, 0x5F37_59DF);
@@ -545,24 +520,6 @@ mod tests {
         assert_eq!(const_max_f32_bits_le_ratio(1, 2), 0x3F00_0000);
         assert_eq!(const_max_f32_bits_le_ratio(1, 4), 0x3E80_0000);
         assert_eq!(const_max_f32_bits_le_ratio(1, 3), 0x3EAA_AAAA);
-
-        let limb_a = U64Limb {
-            hi: 1,
-            lo: 0xFFFF_FFFF,
-        };
-        let limb_b = U64Limb { hi: 0, lo: 2 };
-        let added = limb_a.add(limb_b);
-        assert_eq!(added, U64Limb { hi: 2, lo: 1 });
-        assert_eq!(added.sub(limb_b), limb_a);
-        assert!(added.ge(limb_a));
-        assert!(!limb_b.ge(limb_a));
-        assert_eq!(U64Limb::from_u32(1).shl(0), U64Limb::from_u32(1));
-        assert_eq!(U64Limb::from_u32(1).shl(32), U64Limb { hi: 1, lo: 0 });
-        assert_eq!(U64Limb::from_u32(1).shl(64), U64Limb::ZERO);
-
-        let mut wide = [u32::MAX, u32::MAX, u32::MAX, 0];
-        add_wide_at(&mut wide, 0, U64Limb::from_u32(1));
-        assert_eq!(wide, [0, 0, 0, 1]);
 
         assert_eq!(DC_BLOCKER_5HZ_48K_F32, 0.999_345_7_f32);
         assert!(verify_tier_spec(&LITE_SPEC, 4, 1, 32, 8, 1));

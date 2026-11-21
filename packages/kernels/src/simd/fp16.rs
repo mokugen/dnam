@@ -4,6 +4,20 @@
 //! Uses strictly `u32`/`i32` bit arithmetic with round-to-nearest-even (`RNE`), zero division,
 //! zero `u64`/`f64`, and finite clamping of `[65520.0, f32::MAX]` to `0x7BFF`/`0xFBFF`.
 
+use super::const_eval::{
+    IEEE754_F32_ABS_MASK, IEEE754_F32_EXP_ALL_ONES, IEEE754_F32_EXP_BIAS, IEEE754_F32_EXP_MASK,
+    IEEE754_F32_IMPLICIT_BIT, IEEE754_F32_MANTISSA_BITS, IEEE754_F32_MANTISSA_MASK,
+    IEEE754_F32_TO_FP16_MANTISSA_SHIFT, IEEE754_FP16_ABS_MASK, IEEE754_FP16_EXP_ALL_ONES,
+    IEEE754_FP16_EXP_BIAS, IEEE754_FP16_EXP_MASK, IEEE754_FP16_MANTISSA_BITS,
+    IEEE754_FP16_MANTISSA_MASK, IEEE754_FP16_MAX_FINITE_BITS, IEEE754_FP16_SIGN_MASK,
+};
+
+const FP16_RNE_ROUND_BIT_SHIFT: u32 = IEEE754_F32_TO_FP16_MANTISSA_SHIFT - 1;
+const FP16_RNE_STICKY_MASK: u32 = (1_u32 << FP16_RNE_ROUND_BIT_SHIFT) - 1;
+
+const _: () = assert!(FP16_RNE_ROUND_BIT_SHIFT == 12);
+const _: () = assert!(FP16_RNE_STICKY_MASK == 0x0FFF);
+
 /// Converts an `f32` to IEEE-754 `fp16` packed in the lower 16 bits of a `u32` (zero upper bits).
 ///
 /// Uses exact round-to-nearest-even across normal and subnormal `fp16` values, preserves `±0.0`,
@@ -13,33 +27,33 @@
 #[must_use]
 pub const fn f32_to_fp16_u32(val: f32) -> u32 {
     let bits = val.to_bits();
-    let sign = (bits >> 16) & 0x8000;
-    let abs_bits = bits & 0x7FFF_FFFF;
+    let sign = (bits >> 16) & IEEE754_FP16_SIGN_MASK;
+    let abs_bits = bits & IEEE754_F32_ABS_MASK;
     if abs_bits == 0 {
         return sign;
     }
-    let exp = ((bits >> 23) & 0xFF) as i32;
-    let mant = bits & 0x007F_FFFF;
+    let exp = ((bits >> IEEE754_F32_MANTISSA_BITS) & IEEE754_F32_EXP_ALL_ONES) as i32;
+    let mant = bits & IEEE754_F32_MANTISSA_MASK;
 
-    if exp == 255 {
+    if exp == (IEEE754_F32_EXP_ALL_ONES as i32) {
         if mant == 0 {
-            return sign | 0x7C00;
+            return sign | IEEE754_FP16_EXP_MASK;
         }
-        let payload = mant >> 13;
+        let payload = mant >> IEEE754_F32_TO_FP16_MANTISSA_SHIFT;
         let non_zero_payload = if payload != 0 { payload } else { 1 };
-        return sign | 0x7C00 | non_zero_payload;
+        return sign | IEEE754_FP16_EXP_MASK | non_zero_payload;
     }
 
-    let new_exp = exp - 127 + 15;
-    if new_exp >= 31 {
-        return sign | 0x7BFF;
+    let new_exp = exp - (IEEE754_F32_EXP_BIAS as i32) + (IEEE754_FP16_EXP_BIAS as i32);
+    if new_exp >= (IEEE754_FP16_EXP_ALL_ONES as i32) {
+        return sign | IEEE754_FP16_MAX_FINITE_BITS;
     }
     if new_exp <= 0 {
-        if new_exp < -10 {
+        if new_exp < -(IEEE754_FP16_MANTISSA_BITS as i32) {
             return sign;
         }
-        let m = mant | 0x0080_0000;
-        let shift = (14 - new_exp) as u32;
+        let m = mant | IEEE754_F32_IMPLICIT_BIT;
+        let shift = (((IEEE754_FP16_EXP_BIAS as i32) - 1) - new_exp) as u32;
         let half_mant = m >> shift;
         let round_bit = (m >> (shift - 1)) & 1;
         let sticky = (m & ((1_u32 << (shift - 1)) - 1)) != 0;
@@ -47,12 +61,16 @@ pub const fn f32_to_fp16_u32(val: f32) -> u32 {
         return sign | rounded;
     }
 
-    let round_bit = (mant >> 12) & 1;
-    let sticky = (mant & 0x0FFF) != 0;
-    let raw_mant = mant >> 13;
+    let round_bit = (mant >> FP16_RNE_ROUND_BIT_SHIFT) & 1;
+    let sticky = (mant & FP16_RNE_STICKY_MASK) != 0;
+    let raw_mant = mant >> IEEE754_F32_TO_FP16_MANTISSA_SHIFT;
     let half_mant = raw_mant + ((round_bit != 0 && (sticky || (raw_mant & 1) != 0)) as u32);
-    let combined = ((new_exp as u32) << 10) + half_mant;
-    let clamped = if combined > 0x7BFF { 0x7BFF } else { combined };
+    let combined = ((new_exp as u32) << IEEE754_FP16_MANTISSA_BITS) + half_mant;
+    let clamped = if combined > IEEE754_FP16_MAX_FINITE_BITS {
+        IEEE754_FP16_MAX_FINITE_BITS
+    } else {
+        combined
+    };
     sign | clamped
 }
 
@@ -61,25 +79,29 @@ pub const fn f32_to_fp16_u32(val: f32) -> u32 {
 #[must_use]
 pub const fn fp16_u32_to_f32(bits: u32) -> f32 {
     let b = bits & 0xFFFF;
-    let sign = (b & 0x8000) << 16;
-    if (b & 0x7FFF) == 0 {
+    let sign = (b & IEEE754_FP16_SIGN_MASK) << 16;
+    if (b & IEEE754_FP16_ABS_MASK) == 0 {
         return f32::from_bits(sign);
     }
-    let exp = (b >> 10) & 0x1F;
-    let mant = b & 0x03FF;
+    let exp = (b >> IEEE754_FP16_MANTISSA_BITS) & IEEE754_FP16_EXP_ALL_ONES;
+    let mant = b & IEEE754_FP16_MANTISSA_MASK;
 
     if exp == 0 {
         // Subnormal fp16 (`mant in 1..=0x03FF`): normalize using CLZ.
-        let shift = mant.leading_zeros() - 21;
-        let m = (mant << shift) & 0x03FF;
-        let e = 127_u32 - 14 - shift;
-        return f32::from_bits(sign | (e << 23) | (m << 13));
+        let shift = mant.leading_zeros() - (32 - 1 - IEEE754_FP16_MANTISSA_BITS);
+        let m = (mant << shift) & IEEE754_FP16_MANTISSA_MASK;
+        let e = IEEE754_F32_EXP_BIAS - (IEEE754_FP16_EXP_BIAS - 1) - shift;
+        return f32::from_bits(
+            sign | (e << IEEE754_F32_MANTISSA_BITS) | (m << IEEE754_F32_TO_FP16_MANTISSA_SHIFT),
+        );
     }
-    if exp == 31 {
-        return f32::from_bits(sign | 0x7F80_0000 | (mant << 13));
+    if exp == IEEE754_FP16_EXP_ALL_ONES {
+        return f32::from_bits(
+            sign | IEEE754_F32_EXP_MASK | (mant << IEEE754_F32_TO_FP16_MANTISSA_SHIFT),
+        );
     }
-    let f32_exp = (exp + 127 - 15) << 23;
-    f32::from_bits(sign | f32_exp | (mant << 13))
+    let f32_exp = (exp + IEEE754_F32_EXP_BIAS - IEEE754_FP16_EXP_BIAS) << IEEE754_F32_MANTISSA_BITS;
+    f32::from_bits(sign | f32_exp | (mant << IEEE754_F32_TO_FP16_MANTISSA_SHIFT))
 }
 
 /// Packs two `f32` values into a `u32` as `[lo_fp16, hi_fp16]` (`lo` in bits `0..16`, `hi` in `16..32`).
@@ -163,14 +185,14 @@ mod tests {
         assert_eq!(f32_to_fp16(-1.0e-12), 0x8000);
 
         // Subnormal RNE boundary checks: halfway 2^-25 ties to even (0), above rounds to 0x0001
-        let half_min_sub = f32::from_bits((127 - 25) << 23);
+        let half_min_sub = crate::simd::const_f32_pow2(-25);
         assert_eq!(f32_to_fp16(half_min_sub), 0x0000);
         assert_eq!(
             f32_to_fp16(f32::from_bits(half_min_sub.to_bits() + 1)),
             0x0001
         );
         // Subnormal-to-normal carry at 2^-14 - 2^-25 -> 0x0400
-        let carry_boundary = f32::from_bits((127 - 14) << 23) - half_min_sub;
+        let carry_boundary = crate::simd::const_f32_pow2(-14) - half_min_sub;
         assert_eq!(f32_to_fp16(carry_boundary), 0x0400);
 
         // Overflow clamping near max finite fp16 ([65520.0, f32::MAX])

@@ -2,7 +2,7 @@
 
 use dnam_kernels::InterleavedStereo8;
 
-use super::{BackendKind, MathBackend, SimdVec4};
+use super::{BackendKind, MathBackend, SimdVec4, const_abs_f32};
 use crate::math::crc32c::{Crc32cBackend, crc32c_software_slice};
 
 /// 16-byte SIMD-aligned 4-lane scalar vector (`#[repr(C, align(16))]`).
@@ -111,10 +111,10 @@ impl SimdVec4 for ScalarVec4 {
     #[inline(always)]
     fn abs(self) -> Self {
         Self([
-            self.0[0].abs(),
-            self.0[1].abs(),
-            self.0[2].abs(),
-            self.0[3].abs(),
+            const_abs_f32(self.0[0]),
+            const_abs_f32(self.0[1]),
+            const_abs_f32(self.0[2]),
+            const_abs_f32(self.0[3]),
         ])
     }
 

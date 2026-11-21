@@ -107,6 +107,36 @@ impl MathBackend for ArmSve2Backend {
             Sve2Vec4(cols[3]),
         ]
     }
+
+    #[inline(always)]
+    fn vec4_to_fp16x4(src: Self::Vec4) -> [u16; 4] {
+        NeonBackend::vec4_to_fp16x4(src.0)
+    }
+
+    #[inline(always)]
+    fn fp16x4_to_vec4(src: &[u16; 4]) -> Self::Vec4 {
+        Sve2Vec4(NeonBackend::fp16x4_to_vec4(src))
+    }
+
+    #[inline(always)]
+    fn f32x4_to_fp16x4(src: &[f32; 4]) -> [u16; 4] {
+        NeonBackend::f32x4_to_fp16x4(src)
+    }
+
+    #[inline(always)]
+    fn fp16x4_to_f32x4(src: &[u16; 4]) -> [f32; 4] {
+        NeonBackend::fp16x4_to_f32x4(src)
+    }
+
+    #[inline(always)]
+    fn rsqrt_nr2_f32(v0: f32) -> f32 {
+        NeonBackend::rsqrt_nr2_f32(v0)
+    }
+
+    #[inline(always)]
+    fn rsqrt_nr2_pair_f32(v0: f32, v1: f32) -> (f32, f32) {
+        NeonBackend::rsqrt_nr2_pair_f32(v0, v1)
+    }
 }
 
 #[cfg(test)]

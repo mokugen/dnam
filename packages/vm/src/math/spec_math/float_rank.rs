@@ -2,6 +2,10 @@
 //! (`ref[dsp.ctrl.range.normalize-clamp]`, `ref[dsp.ctrl.range.f32-rank-bounds]`).
 
 use super::{InvalidFloatInput, round_f64_to_f32_bits, widen_f32_bits};
+use crate::math::{
+    IEEE754_F32_ABS_MASK, IEEE754_F32_EXP_ALL_ONES, IEEE754_F32_EXP_BIAS, IEEE754_F32_EXP_MASK,
+    IEEE754_F32_IMPLICIT_BIT, IEEE754_F32_MANTISSA_BITS, IEEE754_F32_SIGN_MASK, const_abs_f64,
+};
 
 /// Normalizes a physical `f32` value `x` into `[-1.0, +1.0]` against declared `f32` endpoints
 /// `low < high` using `binary64` arithmetic without hardware `FDIV`.
@@ -26,12 +30,19 @@ pub fn normalize_declared_range_bits(
     Some(f32::from_bits(bits))
 }
 
-const F32_NEG_FIRST_KEY: u64 = 0x0080_0000;
-const F32_NEG_NORMAL_END_KEY: u64 = 0x7f7f_ffff;
-const F32_NEG_ZERO_KEY: u64 = 0x7fff_ffff;
-const F32_POS_ZERO_KEY: u64 = 0x8000_0000;
-const F32_POS_NORMAL_START_KEY: u64 = 0x8080_0000;
-const F32_NORMALS_PER_SIGN: u64 = 254 * (1 << 23);
+const F32_NEG_FIRST_KEY: u64 = IEEE754_F32_IMPLICIT_BIT as u64;
+const F32_NEG_NORMAL_END_KEY: u64 = (IEEE754_F32_EXP_MASK - 1) as u64;
+const F32_NEG_ZERO_KEY: u64 = IEEE754_F32_ABS_MASK as u64;
+const F32_POS_ZERO_KEY: u64 = IEEE754_F32_SIGN_MASK as u64;
+const F32_POS_NORMAL_START_KEY: u64 = (IEEE754_F32_SIGN_MASK | IEEE754_F32_IMPLICIT_BIT) as u64;
+const F32_NORMALS_PER_SIGN: u64 =
+    ((2 * IEEE754_F32_EXP_BIAS) as u64) * (IEEE754_F32_IMPLICIT_BIT as u64);
+
+const _: () = assert!(F32_NEG_FIRST_KEY == 0x0080_0000);
+const _: () = assert!(F32_NEG_NORMAL_END_KEY == 0x7F7F_FFFF);
+const _: () = assert!(F32_POS_ZERO_KEY == 0x8000_0000);
+const _: () = assert!(F32_POS_NORMAL_START_KEY == 0x8080_0000);
+const _: () = assert!(F32_NORMALS_PER_SIGN == 254 * (1 << 23));
 
 /// Returns total cardinality of admissible `f32` physical knob values (`4,278,190,079` vs `4,261,412,865`).
 #[inline]
@@ -39,7 +50,7 @@ pub const fn f32_coordinate_count(flush_subnormals: bool) -> u64 {
     if flush_subnormals {
         2 * F32_NORMALS_PER_SIGN + 1
     } else {
-        2 * 255 * (1 << 23) - 1
+        2 * (IEEE754_F32_EXP_ALL_ONES as u64) * (IEEE754_F32_IMPLICIT_BIT as u64) - 1
     }
 }
 
@@ -79,17 +90,18 @@ pub const fn f32_rank_of_bits(
     bits: u32,
     flush_subnormals: bool,
 ) -> Result<Option<u64>, InvalidFloatInput> {
-    if ((bits >> 23) & 0xff) == 0xff {
+    if ((bits >> IEEE754_F32_MANTISSA_BITS) & IEEE754_F32_EXP_ALL_ONES) == IEEE754_F32_EXP_ALL_ONES
+    {
         return Err(InvalidFloatInput);
     }
-    let magnitude = bits & 0x7fff_ffff;
+    let magnitude = bits & IEEE754_F32_ABS_MASK;
     let key = if magnitude == 0 {
         F32_POS_ZERO_KEY
     } else {
-        if flush_subnormals && magnitude < 0x0080_0000 {
+        if flush_subnormals && magnitude < IEEE754_F32_IMPLICIT_BIT {
             return Ok(None);
         }
-        if (bits & 0x8000_0000) != 0 {
+        if (bits & IEEE754_F32_SIGN_MASK) != 0 {
             (!bits) as u64
         } else {
             (bits as u64) ^ F32_POS_ZERO_KEY
@@ -178,15 +190,15 @@ pub fn f32_nearest_admissible_bits(
     let b1 = f32_bits_at_rank(idx1, flush_subnormals)?;
     let v0 = widen_f32_bits(b0)?;
     let v1 = widen_f32_bits(b1)?;
-    let d0 = (v0 - req_f64).abs();
-    let d1 = (v1 - req_f64).abs();
+    let d0 = const_abs_f64(v0 - req_f64);
+    let d1 = const_abs_f64(v1 - req_f64);
     if d0 < d1 {
         Some(b0)
     } else if d1 < d0 {
         Some(b1)
-    } else if v0.abs() < v1.abs() {
+    } else if const_abs_f64(v0) < const_abs_f64(v1) {
         Some(b0)
-    } else if v1.abs() < v0.abs() {
+    } else if const_abs_f64(v1) < const_abs_f64(v0) {
         Some(b1)
     } else if v0 <= v1 {
         Some(b0)

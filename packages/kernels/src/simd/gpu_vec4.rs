@@ -97,10 +97,10 @@ impl KernelVec4 for GpuVec4 {
     #[inline(always)]
     fn abs(self) -> Self {
         Self([
-            f32::from_bits(self.0[0].to_bits() & 0x7FFF_FFFF),
-            f32::from_bits(self.0[1].to_bits() & 0x7FFF_FFFF),
-            f32::from_bits(self.0[2].to_bits() & 0x7FFF_FFFF),
-            f32::from_bits(self.0[3].to_bits() & 0x7FFF_FFFF),
+            super::const_abs_f32(self.0[0]),
+            super::const_abs_f32(self.0[1]),
+            super::const_abs_f32(self.0[2]),
+            super::const_abs_f32(self.0[3]),
         ])
     }
 

@@ -1,9 +1,10 @@
 //! Pure-binary `"TSYN"` tempo synchronization, quadratic Lobatto inversion, `Q32` musical
-//! subdivision phase math, and division-free `Q64` host timebase increment (`ref[dsp.tempo.*]`).
+//! subdivision phase math, and division-free `Q64` host timebase increment (`ref[dsp.tempo.subdivisions]`,
+//! `ref[dsp.tempo.physical-inversion]`, `ref[dsp.tempo.q64-q32-phase]`).
 
 use crate::bin::TempoSyncEntryWire;
 use crate::control::ControlClampDescriptor;
-use crate::math::{floor_f64, rcp_nr6_f64, sqrt_f64};
+use crate::math::{clamp_finite_f32, const_abs_f64, floor_f64, rcp_nr6_f64, sqrt_f64};
 
 /// Canonical period ratios `(a_s, b_s)` (`r_sub = a_s / b_s`) across all 12 subdivisions
 /// (`1/2., 1/2, 1/2T, 1/4., 1/4, 1/4T, 1/8., 1/8, 1/8T, 1/16., 1/16, 1/16T`).
@@ -73,11 +74,7 @@ pub struct TempoSyncEvalResult {
 /// (`clamp(bpm, 20.0, 400.0)`), using zero `FDIV` and zero `libm` (`ref[dsp.tempo.subdivisions]`).
 #[inline]
 pub fn eval_tsyn_target_value(entry: &TempoSyncEntryWire, bpm: f32) -> f32 {
-    let bpm_safe = if bpm.is_finite() {
-        bpm.clamp(20.0, 400.0)
-    } else {
-        120.0
-    };
+    let bpm_safe = clamp_finite_f32(bpm, 20.0, 400.0, 120.0);
     let d_min = entry.declared_min.get();
     let d_max = entry.declared_max.get();
     let div_ratio = entry.div_ratio.get();
@@ -160,8 +157,8 @@ pub fn invert_tsyn_lobatto_anchors(anchors: [f32; 3], target: f32) -> f32 {
     }
     let c1 = 0.5 * (v_max - v_min);
     let c2 = 0.5 * (v_max + v_min) - v_mid;
-    let abs_c1 = if c1 >= 0.0 { c1 } else { -c1 };
-    let abs_c2 = if c2 >= 0.0 { c2 } else { -c2 };
+    let abs_c1 = const_abs_f64(c1);
+    let abs_c2 = const_abs_f64(c2);
     let scale_ref = if abs_c1 >= 1.0 { abs_c1 } else { 1.0 };
     if abs_c2 <= 1.0e-7 * scale_ref {
         if abs_c1 <= 1.0e-12 {
@@ -349,7 +346,7 @@ pub fn beat_pos_to_mod12_q32(beats: f64) -> (u8, u32) {
     };
     let r4 = ((signed as u64) & 3) as usize;
     let whole = CRT_MOD12[(r3 << 2) | r4];
-    let q32 = (frac * 4_294_967_296.0) as u64 as u32;
+    let q32 = (frac * crate::math::Q32_SCALE_F64) as u64 as u32;
     (whole, q32)
 }
 

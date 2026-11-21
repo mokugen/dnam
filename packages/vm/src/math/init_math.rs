@@ -3,12 +3,18 @@
 //! `prewarp_tan_pi_f_over_fs_f32`, `rescale_tpt_svf_g_zoh`, `rescale_real_pole_zoh`,
 //! `ref[dsp.zoh.op-m-poles]`).
 
+use super::const_eval::{
+    F32_INT_EXACT_THRESHOLD, F64_INT_EXACT_THRESHOLD, IEEE754_F64_EXP_ALL_ONES,
+    IEEE754_F64_EXP_BIAS, IEEE754_F64_MANTISSA_BITS, IEEE754_F64_MANTISSA_MASK,
+    IEEE754_F64_MAX_NORMAL_BIASED_EXP, IEEE754_F64_SIGN_MASK, clamp_finite_f32, const_abs_f32,
+    const_abs_f64, const_f64_pow2,
+};
 use super::kernels::algebraic_unit_rotor_f64;
 
 /// Pure `#![no_std]` floor for `f32`.
 #[inline(always)]
 pub fn floor_f32(x: f32) -> f32 {
-    if x.is_nan() || x.abs() >= 8_388_608.0 {
+    if x.is_nan() || const_abs_f32(x) >= F32_INT_EXACT_THRESHOLD {
         return x;
     }
     let i = x as i32;
@@ -19,7 +25,7 @@ pub fn floor_f32(x: f32) -> f32 {
 /// Pure `#![no_std]` floor for `f64`.
 #[inline(always)]
 pub fn floor_f64(x: f64) -> f64 {
-    if x.is_nan() || x.abs() >= 4_503_599_627_370_496.0 {
+    if x.is_nan() || const_abs_f64(x) >= F64_INT_EXACT_THRESHOLD {
         return x;
     }
     let i = x as i64;
@@ -73,10 +79,12 @@ pub fn round_half_away_f64(x: f64) -> f64 {
 #[inline]
 pub fn rcp_nr6_f64(d: f64) -> f64 {
     let bits = d.to_bits();
-    let sign = bits & (1_u64 << 63);
-    let exp = (((bits >> 52) & 0x7FF) as i32) - 1023;
-    let inv_exp = (1022 - exp).clamp(1, 2046) as u64;
-    let mut inv = f64::from_bits(sign | (inv_exp << 52));
+    let sign = bits & IEEE754_F64_SIGN_MASK;
+    let exp = (((bits >> IEEE754_F64_MANTISSA_BITS) & (IEEE754_F64_EXP_ALL_ONES as u64)) as i32)
+        - IEEE754_F64_EXP_BIAS;
+    let inv_exp =
+        (IEEE754_F64_EXP_BIAS - 1 - exp).clamp(1, IEEE754_F64_MAX_NORMAL_BIASED_EXP) as u64;
+    let mut inv = f64::from_bits(sign | (inv_exp << IEEE754_F64_MANTISSA_BITS));
     for _ in 0..6 {
         inv *= 2.0 - d * inv;
     }
@@ -106,10 +114,7 @@ pub fn sqrt_f64(x: f64) -> f64 {
         return f64::INFINITY;
     }
     let (scaled_x, scale_out) = if x < f64::MIN_POSITIVE {
-        (
-            x * 18_014_398_509_481_984.0,
-            f64::from_bits(0x3E40_0000_0000_0000),
-        )
+        (x * const_f64_pow2(54), const_f64_pow2(-27))
     } else {
         (x, 1.0)
     };
@@ -131,8 +136,12 @@ pub fn ln_f64(x: f64) -> f64 {
         return f64::NEG_INFINITY;
     }
     let bits = x.to_bits();
-    let exp = ((bits >> 52) & 0x7FF) as i64 - 1023;
-    let mut mant = f64::from_bits((bits & 0x000F_FFFF_FFFF_FFFF) | (1023u64 << 52));
+    let exp = ((bits >> IEEE754_F64_MANTISSA_BITS) & (IEEE754_F64_EXP_ALL_ONES as u64)) as i64
+        - i64::from(IEEE754_F64_EXP_BIAS);
+    let mut mant = f64::from_bits(
+        (bits & IEEE754_F64_MANTISSA_MASK)
+            | ((IEEE754_F64_EXP_BIAS as u64) << IEEE754_F64_MANTISSA_BITS),
+    );
     let mut k = exp;
     if mant > core::f64::consts::SQRT_2 {
         mant *= 0.5;
@@ -194,8 +203,7 @@ pub fn exp_f64(x: f64) -> f64 {
         term *= r * inv_i;
         sum += term;
     }
-    let scale_bits = ((k + 1023) as u64) << 52;
-    sum * f64::from_bits(scale_bits)
+    sum * const_f64_pow2(k as i32)
 }
 
 /// Pure `#![no_std]` power function $b^e$ in `f64` (cold ZOH rescaling, `0 FDIV`).
@@ -204,10 +212,10 @@ pub fn powf_f64(base: f64, exp: f64) -> f64 {
     if base <= 0.0 {
         return 0.0;
     }
-    if (exp - 1.0).abs() < 1.0e-15 {
+    if const_abs_f64(exp - 1.0) < 1.0e-15 {
         return base;
     }
-    if exp.abs() < 1.0e-15 {
+    if const_abs_f64(exp) < 1.0e-15 {
         return 1.0;
     }
     exp_f64(exp * ln_f64(base))
@@ -254,12 +262,8 @@ pub fn prewarp_tan_pi_f_over_fs_f32(r: f32) -> f32 {
 /// (`0 FDIV`, `ref[dsp.zoh.op-m-poles]`).
 #[inline]
 pub fn rescale_tpt_svf_g_zoh(g_ref: f32, rho_sr: f64) -> f32 {
-    let g_pos = if g_ref.is_finite() {
-        g_ref.clamp(1.0e-5, 64.0)
-    } else {
-        0.1
-    };
-    if (rho_sr - 1.0).abs() <= 1.0e-9 {
+    let g_pos = clamp_finite_f32(g_ref, 1.0e-5, 64.0, 0.1);
+    if const_abs_f64(rho_sr - 1.0) <= 1.0e-9 {
         return g_pos;
     }
     let r_eff = (cold_atan_pos_f64(f64::from(g_pos)) * core::f64::consts::FRAC_1_PI * rho_sr)
@@ -271,12 +275,8 @@ pub fn rescale_tpt_svf_g_zoh(g_ref: f32, rho_sr: f64) -> f32 {
 /// `ref[dsp.zoh.core-paralru]`).
 #[inline]
 pub fn rescale_real_pole_zoh(p: f32, rho: f64) -> f32 {
-    let p_clamped = if p.is_finite() {
-        p.clamp(1.0e-4, 0.999_995)
-    } else {
-        0.999_995
-    };
-    if (rho - 1.0).abs() < 1.0e-12 {
+    let p_clamped = clamp_finite_f32(p, 1.0e-4, 0.999_995, 0.999_995);
+    if const_abs_f64(rho - 1.0) < 1.0e-12 {
         return p_clamped;
     }
     (powf_f64(f64::from(p_clamped), rho) as f32).clamp(1.0e-4, 0.999_995)

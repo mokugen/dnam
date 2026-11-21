@@ -13,9 +13,18 @@ pub mod op_constants;
 pub mod stereo8;
 
 pub use const_eval::{
-    DC_BLOCKER_5HZ_48K_F32, DC_BLOCKER_10HZ_48K_BITS, FULL_SPEC, IEEE754_F32_EXP_BIAS,
-    IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED, LITE_SPEC, MAX_LOOP_GAIN_F32, MAX_PARALRU_R_F32,
-    PRO_SPEC, SonaTierSpec, ULTRA_SPEC,
+    BIASED_INT_MAGIC_F32, DC_BLOCKER_5HZ_48K_F32, DC_BLOCKER_10HZ_48K_BITS,
+    F32_INT_EXACT_THRESHOLD, FP16_FINITE_MAX_F32, FULL_SPEC, IEEE754_F32_ABS_MASK,
+    IEEE754_F32_EXP_ALL_ONES, IEEE754_F32_EXP_BIAS, IEEE754_F32_EXP_MASK, IEEE754_F32_IMPLICIT_BIT,
+    IEEE754_F32_MANTISSA_BITS, IEEE754_F32_MANTISSA_MASK, IEEE754_F32_MIN_NORMAL_EXP,
+    IEEE754_F32_MIN_SUBNORMAL_EXP, IEEE754_F32_NORMAL_MANTISSA_EXP_OFFSET, IEEE754_F32_ONE_BITS,
+    IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED, IEEE754_F32_SIGN_MASK,
+    IEEE754_F32_SIGNIFICAND_BITS, IEEE754_F32_TO_FP16_MANTISSA_SHIFT, IEEE754_F64_EXP_ALL_ONES,
+    IEEE754_F64_EXP_BIAS, IEEE754_F64_MANTISSA_BITS, IEEE754_F64_MAX_NORMAL_BIASED_EXP,
+    IEEE754_FP16_ABS_MASK, IEEE754_FP16_EXP_ALL_ONES, IEEE754_FP16_EXP_BIAS, IEEE754_FP16_EXP_MASK,
+    IEEE754_FP16_MANTISSA_BITS, IEEE754_FP16_MANTISSA_MASK, IEEE754_FP16_MAX_FINITE_BITS,
+    IEEE754_FP16_SIGN_MASK, LITE_SPEC, MAX_LOOP_GAIN_F32, MAX_PARALRU_R_F32, PRO_SPEC,
+    SonaTierSpec, ULTRA_SPEC, const_abs_f32, const_f32_pow2, const_taylor_inv_fact_f32,
 };
 pub use fp16::{
     f32_to_fp16, f32_to_fp16_u32, fp16_to_f32, fp16_u32_to_f32, pack_fp16x2_u32, unpack_fp16x2_u32,
@@ -24,13 +33,9 @@ pub use gpu_vec4::GpuVec4;
 pub use op_constants::{
     HERMITE5_SIN_C1_F32, HERMITE5_SIN_C3_F32, HERMITE5_SIN_C5_F32, Q32_INV_2POW31_F32,
     Q32_INV_2POW32_F32, TANK_MAX_G_LIN_BITS, TANK_MAX_G_LIN_F32, TANK_MAX_V_CEIL_BITS,
-    TANK_MAX_V_CEIL_F32, const_f32_pow2, exp2_clamped16_f32, os2x_midpoint_f32x4,
-    os2x_midpoint_vec4,
+    TANK_MAX_V_CEIL_F32, exp2_clamped16_f32, os2x_midpoint_f32x4, os2x_midpoint_vec4,
 };
 pub use stereo8::{InterleavedStereo8, StereoVec8};
-
-/// IEEE-754 `1.5 * 2^23` (`12_582_912.0`) magic integer-rounding bias (`0x4B40_0000`).
-pub(crate) const BIASED_INT_MAGIC_F32: f32 = 1.5 * ((1_u32 << 23) as f32);
 
 /// Chebyshev-economized degree-5 coefficients for `2^f` on `f in [-0.5, 0.5]` (`< 2.5e-7` error;
 /// `C1 = ln(2)`, `C2..C5` minimax-adjusted around `ln(2)^k / k!`,
@@ -39,11 +44,6 @@ pub(crate) const EXP2_C2: f32 = 0.240_221_09;
 pub(crate) const EXP2_C3: f32 = 0.055_504_11;
 pub(crate) const EXP2_C4: f32 = 0.009_675_892;
 pub(crate) const EXP2_C5: f32 = 0.001_333_355_8;
-
-#[inline(always)]
-const fn const_abs_f32(x: f32) -> f32 {
-    f32::from_bits(x.to_bits() & 0x7FFF_FFFF)
-}
 
 #[inline(always)]
 const fn const_exp2_poly_f32(f: f32) -> f32 {
@@ -82,7 +82,6 @@ const fn const_rsqrt_nr3_f32(d: f32) -> f32 {
     y2 * (1.5 - half_d * (y2 * y2))
 }
 
-const _: () = assert!(BIASED_INT_MAGIC_F32.to_bits() == 0x4B40_0000);
 const _: () = assert!(EXP2_C2 > 0.240 && EXP2_C2 < 0.241);
 const _: () = assert!(EXP2_C3 > 0.055 && EXP2_C3 < 0.056);
 const _: () = assert!(EXP2_C4 > 0.009 && EXP2_C4 < 0.010);
@@ -105,8 +104,8 @@ const _: () = assert!(const_abs_f32(3.0 * const_rsqrt_nr3_f32(9.0) - 1.0) < 1.0e
 #[must_use]
 pub const fn flush_subnormal_f32_bits(value: f32) -> f32 {
     let bits = value.to_bits();
-    let mask = if (bits & 0x7F80_0000) == 0 {
-        0x8000_0000
+    let mask = if (bits & IEEE754_F32_EXP_MASK) == 0 {
+        IEEE754_F32_SIGN_MASK
     } else {
         u32::MAX
     };
@@ -119,11 +118,11 @@ pub const fn flush_subnormal_f32_bits(value: f32) -> f32 {
 #[must_use]
 pub const fn scrub_and_flush_f32_bits(value: f32) -> f32 {
     let bits = value.to_bits();
-    let exp = bits & 0x7F80_0000;
-    let out_bits = if exp == 0x7F80_0000 {
+    let exp = bits & IEEE754_F32_EXP_MASK;
+    let out_bits = if exp == IEEE754_F32_EXP_MASK {
         0
     } else if exp == 0 {
-        bits & 0x8000_0000
+        bits & IEEE754_F32_SIGN_MASK
     } else {
         bits
     };
@@ -316,10 +315,18 @@ pub trait KernelVec4: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
     fn pow2_from_biased_int_bits(self) -> Self {
         let a = self.to_array();
         Self::from_array([
-            f32::from_bits(a[0].to_bits().wrapping_add(IEEE754_F32_EXP_BIAS) << 23),
-            f32::from_bits(a[1].to_bits().wrapping_add(IEEE754_F32_EXP_BIAS) << 23),
-            f32::from_bits(a[2].to_bits().wrapping_add(IEEE754_F32_EXP_BIAS) << 23),
-            f32::from_bits(a[3].to_bits().wrapping_add(IEEE754_F32_EXP_BIAS) << 23),
+            f32::from_bits(
+                a[0].to_bits().wrapping_add(IEEE754_F32_EXP_BIAS) << IEEE754_F32_MANTISSA_BITS,
+            ),
+            f32::from_bits(
+                a[1].to_bits().wrapping_add(IEEE754_F32_EXP_BIAS) << IEEE754_F32_MANTISSA_BITS,
+            ),
+            f32::from_bits(
+                a[2].to_bits().wrapping_add(IEEE754_F32_EXP_BIAS) << IEEE754_F32_MANTISSA_BITS,
+            ),
+            f32::from_bits(
+                a[3].to_bits().wrapping_add(IEEE754_F32_EXP_BIAS) << IEEE754_F32_MANTISSA_BITS,
+            ),
         ])
     }
 

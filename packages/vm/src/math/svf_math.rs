@@ -4,6 +4,7 @@
 
 use crate::math::{
     IEEE754_F32_RCP_SEED, MathBackend, ScalarVec4, SimdVec4, backend::rsqrt_nr2_scalar_f32,
+    const_inv_factorial_f64,
 };
 
 const SVF_MIN_FREQ_RATIO: f32 = 1.0e-5;
@@ -19,13 +20,7 @@ const RSQRT_MIN_DENOM_F32: f32 = 1.0e-12;
 const SOFTCLIP_INPUT_CLAMP_F32: f32 = 64.0;
 
 const fn alternating_inv_factorial_f32(n: u32, negative: bool) -> f32 {
-    let mut fact = 1.0_f64;
-    let mut k = 2_u32;
-    while k <= n {
-        fact *= k as f64;
-        k += 1;
-    }
-    let inv = 1.0_f64 / fact;
+    let inv = const_inv_factorial_f64(n);
     (if negative { -inv } else { inv }) as f32
 }
 

@@ -128,35 +128,43 @@ impl StereoVec8 for Avx2Stereo8 {
     }
 
     #[inline(always)]
-    fn horizontal_sum_pair(self) -> (f32, f32) {
+    fn rcp_pos_nr2(self) -> Self {
+        Self {
+            left: KernelVec4::rcp_pos_nr2(self.left),
+            right: KernelVec4::rcp_pos_nr2(self.right),
+        }
+    }
+
+    #[inline(always)]
+    fn rcp_pos_nr3(self) -> Self {
+        Self {
+            left: KernelVec4::rcp_pos_nr3(self.left),
+            right: KernelVec4::rcp_pos_nr3(self.right),
+        }
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_nr2(self) -> Self {
+        Self {
+            left: KernelVec4::rsqrt_pos_nr2(self.left),
+            right: KernelVec4::rsqrt_pos_nr2(self.right),
+        }
+    }
+
+    #[inline(always)]
+    fn rsqrt_pos_nr3(self) -> Self {
+        Self {
+            left: KernelVec4::rsqrt_pos_nr3(self.left),
+            right: KernelVec4::rsqrt_pos_nr3(self.right),
+        }
+    }
+
+    #[inline(always)]
+    fn horizontal_sum_lr(self) -> (f32, f32) {
         (
             KernelVec4::horizontal_sum(self.left),
             KernelVec4::horizontal_sum(self.right),
         )
-    }
-
-    #[inline(always)]
-    fn rcp_pos_seed_bits(self) -> Self {
-        Self {
-            left: KernelVec4::rcp_pos_seed_bits(self.left),
-            right: KernelVec4::rcp_pos_seed_bits(self.right),
-        }
-    }
-
-    #[inline(always)]
-    fn rsqrt_pos_seed_bits(self) -> Self {
-        Self {
-            left: KernelVec4::rsqrt_pos_seed_bits(self.left),
-            right: KernelVec4::rsqrt_pos_seed_bits(self.right),
-        }
-    }
-
-    #[inline(always)]
-    fn pow2_from_biased_int_bits(self) -> Self {
-        Self {
-            left: KernelVec4::pow2_from_biased_int_bits(self.left),
-            right: KernelVec4::pow2_from_biased_int_bits(self.right),
-        }
     }
 }
 
@@ -166,14 +174,21 @@ mod tests {
 
     #[test]
     fn test_avx2_stereo8_lr_roundtrip() {
+        crate::math::x86::warm_x86_feature_caches();
         let l = [1.0, 2.0, 3.0, 4.0];
         let r = [-1.0, -2.0, -3.0, -4.0];
         let s = Avx2Stereo8::load_lr(&l, &r);
-        assert_eq!(s.horizontal_sum_pair(), (10.0, -10.0));
+        assert_eq!(s.horizontal_sum_lr(), (10.0, -10.0));
         let mut out_l = [0.0; 4];
         let mut out_r = [0.0; 4];
         s.abs().store_lr(&mut out_l, &mut out_r);
         assert_eq!(out_l, [1.0, 2.0, 3.0, 4.0]);
         assert_eq!(out_r, [1.0, 2.0, 3.0, 4.0]);
+
+        let pos = Avx2Stereo8::splat_lr(4.0, 9.0);
+        pos.rcp_pos_nr2().store_lr(&mut out_l, &mut out_r);
+        assert!((out_l[0] - 0.25).abs() < 1.0e-5 && (out_r[0] - (1.0 / 9.0)).abs() < 1.0e-5);
+        pos.rsqrt_pos_nr3().store_lr(&mut out_l, &mut out_r);
+        assert!((out_l[0] - 0.5).abs() < 1.0e-6 && (out_r[0] - (1.0 / 3.0)).abs() < 1.0e-6);
     }
 }

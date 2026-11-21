@@ -24,8 +24,8 @@ use crate::control::exact_int::ExactIntFactorAccumulator;
 use crate::control::tempo::apply_tsyn_table;
 use crate::control::{ControlClampDescriptor, Cp1ContributorSlot};
 use crate::math::{
-    DefaultMathBackend, MAX_ROTOR_ANGLE_F32_BITS, MathBackend, Q0_192Phase, powf_f64, rcp_nr6_f64,
-    round_f64,
+    DefaultMathBackend, IEEE754_F32_ABS_MASK, MAX_ROTOR_ANGLE_F32_BITS, MathBackend, Q0_192Phase,
+    powf_f64, rcp_nr6_f64, round_f64,
 };
 use crate::types::{ColdBuf, ColdSlice, Tier, VmError};
 
@@ -219,7 +219,7 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
         let rho_ctrl = control_tick_ratio(sample_rate_hz, self.ref_sample_rate_hz);
         for i in 0..2 {
             let train = self.lfo_dphi_train[i];
-            if (train.to_bits() & 0x7FFF_FFFF) == 0 {
+            if (train.to_bits() & IEEE754_F32_ABS_MASK) == 0 {
                 self.lfo_dphi_host_bits[i] = 0;
             } else {
                 let scaled = (f64::from(train) * rho_ctrl) as f32;
@@ -238,7 +238,7 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
     }
 
     /// Re-times an in-flight control window cleanly upon an admissible host sample-rate change
-    /// (`r[dsp.ctrl.op-m.rate-retime]`).
+    /// (`ref[dsp.ctrl.op-m.rate-retime]`).
     pub fn retime_sample_rate(&mut self, new_sample_rate_hz: f32) {
         if !new_sample_rate_hz.is_finite() || new_sample_rate_hz <= 0.0 {
             return;
@@ -313,7 +313,7 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
         Ok(())
     }
 
-    /// Applies an atomic batch of `(ctrl_idx, physical_value)` updates (`r[dsp.ctrl.switch.conditional-batch]`).
+    /// Applies an atomic batch of `(ctrl_idx, physical_value)` updates (`ref[dsp.ctrl.switch.conditional-batch]`).
     pub fn set_controls_batch(&mut self, updates: &[(usize, f32)]) -> Result<(), VmError> {
         for &(idx, _) in updates {
             if idx >= self.num_controls {
@@ -371,6 +371,12 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
         ]
     }
 
+    /// Returns `true` when stochastic live OU analog drift is currently active.
+    #[inline]
+    pub const fn is_analog_drift_active(&self) -> bool {
+        self.live_analog_drift_enabled && !self.offline_bounce && self.sigma_drift > 0.0
+    }
+
     /// Returns `true` when any control, tempo row, internal modulator, or live drift requires 3 kHz ticking.
     #[inline]
     pub const fn should_tick(&self) -> bool {
@@ -378,7 +384,7 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
             || self.tsyn_count > 0
             || self.has_internal_modulators
             || self.is_dirty
-            || (self.live_analog_drift_enabled && !self.offline_bounce && self.sigma_drift > 0.0)
+            || self.is_analog_drift_active()
     }
 
     /// Re-evaluates static `CP1` + exact-integer FM + 4-D trust clips if `is_dirty`, clearing `is_dirty`.
@@ -424,6 +430,85 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
             self.z_stage_ultra = [0.0; 4];
         }
         self.is_dirty = false;
+    }
+
+    fn eval_current_dispatch_and_snap(&mut self) {
+        self.clamp_and_eval_static_if_dirty();
+        let q2_curr = [
+            self.lfo_harmonics[0] + 0.35 * self.lfo_harmonics[1],
+            self.lfo_harmonics[4] + 0.35 * self.lfo_harmonics[5],
+            self.lfo_phasors[0][0],
+            self.lfo_phasors[0][1],
+        ];
+        evaluate_w_ctrl_32::<B>(
+            DispatchInputs {
+                q16_head: &self.z_head,
+                q16_basis: &self.ctrl_basis_4,
+                q16_lfo: &q2_curr,
+                q16_env: &self.env_states,
+                qu: &self.z_stage_ultra,
+                is_ultra: self.tier == Tier::Ultra,
+                cext_present: self.cext_present,
+            },
+            DispatchMatrices {
+                w_ctrl: &self.w_ctrl,
+                w_ctrl_ultra: &self.w_ctrl_ultra,
+                w_ctrl_ext: &self.w_ctrl_ext,
+                w_ctrl_ultra_ext: &self.w_ctrl_ultra_ext,
+            },
+            &mut self.stage_targets,
+        );
+        if self.is_analog_drift_active() {
+            let drift_slots = [2_usize, 5, 10, 14];
+            let drift_weights = [1.0_f32, 1.0, 0.25, 0.25];
+            for (d, (&slot, &w)) in drift_slots.iter().zip(drift_weights.iter()).enumerate() {
+                self.stage_targets[slot] += w * self.ou_drift_state[d];
+            }
+        } else {
+            self.ou_drift_state = [0.0; 4];
+        }
+        self.current_stage_params = self.stage_targets;
+        self.prev_stage_targets = self.stage_targets;
+        self.stage_ramp_deltas = [0.0; STAGE_TARGET_SLOTS];
+    }
+
+    fn scrub_drift_if_disabled(&mut self, was_active: bool) -> bool {
+        let has_nonzero_ou = self.ou_drift_state.iter().any(|v| v.to_bits() != 0);
+        if !self.is_analog_drift_active() && (was_active || has_nonzero_ou) {
+            self.ou_drift_state = [0.0; 4];
+            self.eval_current_dispatch_and_snap();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Updates `live_analog_drift_enabled`, immediately zeroing stale OU drift and snapping
+    /// clean stage targets (without advancing LFOs, OU PRNG, or envelopes) when disabled.
+    pub fn set_live_analog_drift_enabled(&mut self, enabled: bool) -> bool {
+        let was_active = self.is_analog_drift_active();
+        self.live_analog_drift_enabled = enabled;
+        self.scrub_drift_if_disabled(was_active)
+    }
+
+    /// Updates `offline_bounce`, immediately zeroing stale OU drift and snapping clean stage
+    /// targets (without advancing LFOs, OU PRNG, or envelopes) when entering offline bounce.
+    pub fn set_offline_bounce(&mut self, offline: bool) -> bool {
+        let was_active = self.is_analog_drift_active();
+        self.offline_bounce = offline;
+        self.scrub_drift_if_disabled(was_active)
+    }
+
+    /// Evaluates dirty static `CP1` latents and `W_ctrl` + `"CEXT"` dispatch (or scrubs disabled
+    /// OU drift residue) and snaps `current_stage_params = stage_targets` without stepping LFOs,
+    /// OU PRNG, or envelopes.
+    pub fn eval_static_and_snap_if_dirty(&mut self) {
+        let drift_needs_scrub =
+            !self.is_analog_drift_active() && self.ou_drift_state.iter().any(|v| v.to_bits() != 0);
+        if !self.is_dirty && !drift_needs_scrub {
+            return;
+        }
+        self.eval_current_dispatch_and_snap();
     }
 
     /// Executes one `3 kHz` control-boundary update: optional static basis eval (only if `is_dirty`),

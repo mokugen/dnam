@@ -135,7 +135,7 @@ Per K_ctrl Tick (Pure-32-Bit Rotor, Zero f64 VM Math):
   else:
     advance lfo_phases_q192[j] modulo 2^192 by (-1 if negative else +1) * mag
     q32 = (lfo_phases_q192[j][2] >> 32) as u32; quad = q32 >> 30
-    angle = f32(q32 & 0x3FFF_FFFF) * f32_bits(0x30C9_0FDB)
+    angle = f32(q32 & 0x3FFF_FFFF) * (f32(pi / 2) * 2^-30)  // 0x30C9_0FDB in f32
     (c0, s0) = algebraic_unit_rotor_f32(angle)
     (c, s) = quad_rotate(quad, c0, s0); lfo_phasors[j] = flush([c, s])
   t1 = c; two_x = 2.0 * t1; t2 = two_x * t1 - 1.0; t3 = two_x * t2 - t1; t4 = two_x * t3 - t2

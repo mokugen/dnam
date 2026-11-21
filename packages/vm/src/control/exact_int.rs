@@ -3,7 +3,30 @@
 
 use core::cmp::Ordering;
 
+use crate::math::{
+    IEEE754_F32_ABS_MASK, IEEE754_F32_EXP_ALL_ONES, IEEE754_F32_EXP_BIAS, IEEE754_F32_IMPLICIT_BIT,
+    IEEE754_F32_MANTISSA_BITS, IEEE754_F32_MANTISSA_MASK, IEEE754_F32_MIN_SUBNORMAL_EXP,
+    IEEE754_F32_SIGNIFICAND_BITS,
+};
 use crate::types::VmError;
+
+const F32_MANTISSA_BITS_USIZE: usize = IEEE754_F32_MANTISSA_BITS as usize;
+const F32_SIGNIFICAND_MASK_U64: u64 = (1_u64 << IEEE754_F32_SIGNIFICAND_BITS) - 1;
+/// Exponent offset mapping exact 9-word integer bit positions (`2^-149`) to unbiased `f32` exponents.
+const LINEAR_ACCUM_EXP_OFFSET: i32 = -IEEE754_F32_MIN_SUBNORMAL_EXP;
+/// Exponent offset mapping exact 18-word interaction bit positions (`1/2 * 2^-298 == 2^-299`) to unbiased exponents.
+const INTERACTION_ACCUM_EXP_OFFSET: i32 = 2 * LINEAR_ACCUM_EXP_OFFSET + 1;
+/// Subnormal shift alignment mapping 18-word interaction sums into 24-bit rounded subnormal mantissas.
+const INTERACTION_SUBNORMAL_SHIFT: usize =
+    (INTERACTION_ACCUM_EXP_OFFSET - LINEAR_ACCUM_EXP_OFFSET) as usize;
+/// Highest-bit cutoff separating subnormal from normal 18-word interaction rounding.
+const INTERACTION_NORMAL_BIT_START: usize = INTERACTION_SUBNORMAL_SHIFT + F32_MANTISSA_BITS_USIZE;
+
+const _: () = assert!(F32_SIGNIFICAND_MASK_U64 == 0x00FF_FFFF);
+const _: () = assert!(LINEAR_ACCUM_EXP_OFFSET == 149);
+const _: () = assert!(INTERACTION_ACCUM_EXP_OFFSET == 299);
+const _: () = assert!(INTERACTION_SUBNORMAL_SHIFT == 150);
+const _: () = assert!(INTERACTION_NORMAL_BIT_START == 173);
 
 /// Number of `u32` limbs in an exact-integer linear sum `S` (`9 × 4 B = 36 B`).
 pub const EXACT_SUM_WORDS: usize = 9;
@@ -104,7 +127,7 @@ impl<const N: usize> ExactMagnitude<N> {
         }
         let low = u64::from(self.words[word]);
         let high = self.words.get(word + 1).map_or(0, |&v| u64::from(v));
-        let top = (((low | (high << 32)) >> (shift & 31)) & 0x00ff_ffff) as u32;
+        let top = (((low | (high << 32)) >> (shift & 31)) & F32_SIGNIFICAND_MASK_U64) as u32;
         if shift == 0 {
             return top;
         }
@@ -166,19 +189,25 @@ impl SignedExactInt<EXACT_SUM_WORDS> {
             return Some(0);
         };
         let sign = u32::from(self.negative) << 31;
-        if highest < 23 {
+        if highest < F32_MANTISSA_BITS_USIZE {
             return Some(sign | self.magnitude.words[0]);
         }
-        let mut rounded = self.magnitude.rounded_shift_24(highest - 23);
-        if rounded == (1 << 24) {
+        let mut rounded = self
+            .magnitude
+            .rounded_shift_24(highest - F32_MANTISSA_BITS_USIZE);
+        if rounded == (1 << IEEE754_F32_SIGNIFICAND_BITS) {
             rounded >>= 1;
             highest += 1;
         }
-        let exponent = (highest as i32) - 149;
-        if exponent > 127 {
+        let exponent = (highest as i32) - LINEAR_ACCUM_EXP_OFFSET;
+        let max_exp = IEEE754_F32_EXP_BIAS as i32;
+        if exponent > max_exp {
             return None;
         }
-        Some(sign | (((exponent + 127) as u32) << 23) | (rounded & 0x007f_ffff))
+        Some(
+            sign | (((exponent + max_exp) as u32) << IEEE754_F32_MANTISSA_BITS)
+                | (rounded & IEEE754_F32_MANTISSA_MASK),
+        )
     }
 }
 
@@ -189,34 +218,40 @@ impl SignedExactInt<EXACT_SQUARE_WORDS> {
             return Some(0);
         };
         let sign = u32::from(self.negative) << 31;
-        if highest < 173 {
-            return Some(sign | self.magnitude.rounded_shift_24(150));
+        if highest < INTERACTION_NORMAL_BIT_START {
+            return Some(sign | self.magnitude.rounded_shift_24(INTERACTION_SUBNORMAL_SHIFT));
         }
-        let mut rounded = self.magnitude.rounded_shift_24(highest - 23);
-        if rounded == (1 << 24) {
+        let mut rounded = self
+            .magnitude
+            .rounded_shift_24(highest - F32_MANTISSA_BITS_USIZE);
+        if rounded == (1 << IEEE754_F32_SIGNIFICAND_BITS) {
             rounded >>= 1;
             highest += 1;
         }
-        let exponent = (highest as i32) - 299;
-        if exponent > 127 {
+        let exponent = (highest as i32) - INTERACTION_ACCUM_EXP_OFFSET;
+        let max_exp = IEEE754_F32_EXP_BIAS as i32;
+        if exponent > max_exp {
             return None;
         }
-        Some(sign | (((exponent + 127) as u32) << 23) | (rounded & 0x007f_ffff))
+        Some(
+            sign | (((exponent + max_exp) as u32) << IEEE754_F32_MANTISSA_BITS)
+                | (rounded & IEEE754_F32_MANTISSA_MASK),
+        )
     }
 }
 
 #[inline]
 fn decode_f32_significand_shift(bits: u32) -> Option<(bool, u32, usize)> {
     let negative = (bits >> 31) != 0;
-    let exponent = (bits >> 23) & 0xff;
-    let fraction = bits & 0x007f_ffff;
-    if exponent == 0xff {
+    let exponent = (bits >> IEEE754_F32_MANTISSA_BITS) & IEEE754_F32_EXP_ALL_ONES;
+    let fraction = bits & IEEE754_F32_MANTISSA_MASK;
+    if exponent == IEEE754_F32_EXP_ALL_ONES {
         return None;
     }
     let (sig, shift) = if exponent == 0 {
         (fraction, 0usize)
     } else {
-        ((1 << 23) | fraction, (exponent - 1) as usize)
+        (IEEE754_F32_IMPLICIT_BIT | fraction, (exponent - 1) as usize)
     };
     Some((negative, sig, shift))
 }
@@ -350,7 +385,7 @@ impl ExactIntFactorAccumulator {
             return false;
         };
         let old_bits = self.previous_bits[index];
-        if old_bits == new_bits || ((old_bits & 0x7fff_ffff) == 0 && new_sig == 0) {
+        if old_bits == new_bits || ((old_bits & IEEE754_F32_ABS_MASK) == 0 && new_sig == 0) {
             self.previous_bits[index] = new_bits;
             return true;
         }

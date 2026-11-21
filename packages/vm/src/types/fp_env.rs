@@ -4,7 +4,7 @@
 #[inline(always)]
 const fn audio_fpcr(previous: u64) -> u64 {
     let fiz_if_ah = (previous >> 1) & 1;
-    (previous & !((0b11_u64 << 22) | 0x9f00)) | (1_u64 << 24) | fiz_if_ah
+    (previous & !((0b11_u64 << 22) | (1_u64 << 19) | 0x9f00)) | (1_u64 << 24) | fiz_if_ah
 }
 
 #[cfg(any(test, target_arch = "x86_64"))]
@@ -55,18 +55,18 @@ impl FtzDazGuard {
         #[cfg(target_arch = "x86_64")]
         {
             let mut prev_mxcsr: u32 = 0;
-            // SAFETY: Saves/updates caller SSE MXCSR control word on x86_64.
+            // SAFETY: `&raw mut prev_mxcsr` and `&raw const new_mxcsr` point to valid initialized stack `u32`s.
             unsafe {
                 core::arch::asm!(
                     "stmxcsr [{}]",
-                    in(reg) &mut prev_mxcsr,
+                    in(reg) &raw mut prev_mxcsr,
                     options(nostack, preserves_flags),
                 );
                 let new_mxcsr = audio_mxcsr(prev_mxcsr);
                 if new_mxcsr != prev_mxcsr {
                     core::arch::asm!(
                         "ldmxcsr [{}]",
-                        in(reg) &new_mxcsr,
+                        in(reg) &raw const new_mxcsr,
                         options(nostack, preserves_flags),
                     );
                 }
@@ -120,7 +120,7 @@ impl Drop for FtzDazGuard {
             unsafe {
                 core::arch::asm!(
                     "ldmxcsr [{}]",
-                    in(reg) &self.prev_mxcsr,
+                    in(reg) &raw const self.prev_mxcsr,
                     options(nostack, preserves_flags),
                 );
             }
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn test_audio_fp_control_bit_transforms() {
-        let fpcr_changed = (0b11_u64 << 22) | 0x9f00 | (1_u64 << 24) | 1;
+        let fpcr_changed = (0b11_u64 << 22) | (1_u64 << 19) | 0x9f00 | (1_u64 << 24) | 1;
         let fpcr_varied = fpcr_changed | 2;
         for preserved in [0, !fpcr_varied] {
             for traps in 0_u64..64 {
@@ -150,6 +150,7 @@ mod tests {
                             let active = audio_fpcr(host);
                             assert_eq!(active & 0x9f00, 0);
                             assert_eq!(active & (0b11 << 22), 0);
+                            assert_eq!(active & (1 << 19), 0);
                             assert_ne!(active & (1 << 24), 0);
                             assert_eq!(active & 1, u64::from(alternate != 0));
                             assert_eq!(active & !fpcr_changed, host & !fpcr_changed);
@@ -159,6 +160,7 @@ mod tests {
                 }
             }
         }
+        assert_eq!(audio_fpcr(1_u64 << 19) & (1_u64 << 19), 0);
 
         for masks in 0_u32..64 {
             for sticky in 0_u32..64 {
@@ -196,9 +198,9 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         {
             let mut value = 0_u32;
-            // SAFETY: Writes local stack MXCSR copy.
+            // SAFETY: `&raw mut value` points to an initialized local stack `u32`.
             unsafe {
-                core::arch::asm!("stmxcsr [{}]", in(reg) &mut value, options(nostack, preserves_flags));
+                core::arch::asm!("stmxcsr [{}]", in(reg) &raw mut value, options(nostack, preserves_flags));
             }
             u64::from(value)
         }
@@ -216,9 +218,9 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         {
             let value = value as u32;
-            // SAFETY: Restores valid MXCSR test state.
+            // SAFETY: `&raw const value` points to an initialized local `u32` MXCSR word.
             unsafe {
-                core::arch::asm!("ldmxcsr [{}]", in(reg) &value, options(nostack, preserves_flags));
+                core::arch::asm!("ldmxcsr [{}]", in(reg) &raw const value, options(nostack, preserves_flags));
             }
         }
     }
@@ -237,7 +239,8 @@ mod tests {
     fn expected_audio_fp_control(host: u64) -> u64 {
         #[cfg(target_arch = "aarch64")]
         {
-            let mut expected = (host & !((0b11_u64 << 22) | 0x9f00)) | (1_u64 << 24);
+            let mut expected =
+                (host & !((0b11_u64 << 22) | (1_u64 << 19) | 0x9f00)) | (1_u64 << 24);
             if host & 0b10 != 0 {
                 expected |= 0b01;
             }

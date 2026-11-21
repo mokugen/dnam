@@ -27,16 +27,9 @@ fn probe_sse42_support() -> bool {
     if cfg!(target_feature = "sse4.2") {
         return true;
     }
-    #[cfg(feature = "std")]
-    {
-        std::arch::is_x86_feature_detected!("sse4.2")
-    }
-    #[cfg(not(feature = "std"))]
-    {
-        // SAFETY: CPUID leaf 1 is an unprivileged read instruction guaranteed on all x86_64 CPUs.
-        let leaf = unsafe { __cpuid(1) };
-        (leaf.ecx & (1 << 20)) != 0
-    }
+    // CPUID leaf 1 is a safe unprivileged read instruction checking `SSE4.2` (ECX bit 20).
+    let leaf = __cpuid(1);
+    (leaf.ecx & (1 << 20)) != 0
 }
 
 /// Pre-warms the lock-free `x86_64` `SSE4.2` capability cache during cold startup.
@@ -354,8 +347,11 @@ mod tests {
 
     #[test]
     fn test_sse42_backend_identity_and_crc32c() {
+        warm_sse42_support_cache();
         assert_eq!(X86Sse42Backend::NAME, "x86 SSE4.2");
         assert_eq!(X86Sse42Backend::crc32c(b"123456789"), 0xE306_9283);
+        // CPUID leaf 0 is a safe unprivileged read instruction on all x86_64 CPUs.
         let _ = __cpuid(0);
+        crate::math::backend::tests::verify_math_backend_ops::<X86Sse42Backend>();
     }
 }

@@ -26,3 +26,7 @@ proptest.workspace = true
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "realtime_wcet"
+harness = false

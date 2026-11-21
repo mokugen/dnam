@@ -5,6 +5,24 @@
 //! Runtime lookup constants are pure `u32` / `f32` (`#![no_std]`); cold/host 128-bit rational
 //! interpolation is guarded behind `#[cfg(not(target_arch = "spirv"))]`.
 
+use crate::simd::{IEEE754_F32_EXP_ALL_ONES, IEEE754_F32_EXP_BIAS, IEEE754_F32_MANTISSA_BITS};
+#[cfg(not(target_arch = "spirv"))]
+use crate::simd::{
+    IEEE754_F32_IMPLICIT_BIT, IEEE754_F32_MANTISSA_MASK, IEEE754_F32_MIN_NORMAL_EXP,
+    IEEE754_F32_ONE_BITS, IEEE754_F64_EXP_ALL_ONES, IEEE754_F64_EXP_BIAS,
+    IEEE754_F64_MANTISSA_BITS,
+};
+
+const HILBERT_ANCHOR_MIN_NEG_EXP: u32 = 1;
+const HILBERT_ANCHOR_MAX_NEG_EXP: u32 = 4;
+/// Biased `f32` exponent lower bound across canonical `HILBERT-H1-ANCHORS` (`2^-4`, `127 - 4 == 123`).
+const HILBERT_ANCHOR_MIN_BIASED_EXP: u32 = IEEE754_F32_EXP_BIAS - HILBERT_ANCHOR_MAX_NEG_EXP;
+/// Biased `f32` exponent upper bound across canonical `HILBERT-H1-ANCHORS` (`< 1.0`, `127 - 1 == 126`).
+const HILBERT_ANCHOR_MAX_BIASED_EXP: u32 = IEEE754_F32_EXP_BIAS - HILBERT_ANCHOR_MIN_NEG_EXP;
+/// Fixed-point fractional precision (`23 + 4 == 27` bits) for exact 128-bit anchor arithmetic.
+#[cfg(not(target_arch = "spirv"))]
+const HILBERT_ANCHOR_Q_BITS: u32 = IEEE754_F32_MANTISSA_BITS + HILBERT_ANCHOR_MAX_NEG_EXP;
+
 /// Number of second-order all-pass stages per quadrature branch in `H1` lattices.
 pub const HILBERT_H1_STAGES: usize = 6;
 
@@ -327,10 +345,16 @@ const _: () = {
     while row < HILBERT_H1_ANCHOR_BITS.len() {
         let mut stage = 0;
         while stage < HILBERT_H1_STAGES {
-            let exp_i = (HILBERT_H1_ANCHOR_BITS[row].0[stage] >> 23) & 0xFF;
-            let exp_q = (HILBERT_H1_ANCHOR_BITS[row].1[stage] >> 23) & 0xFF;
-            assert!(exp_i >= 123 && exp_i <= 126);
-            assert!(exp_q >= 123 && exp_q <= 126);
+            let exp_i = (HILBERT_H1_ANCHOR_BITS[row].0[stage] >> IEEE754_F32_MANTISSA_BITS)
+                & IEEE754_F32_EXP_ALL_ONES;
+            let exp_q = (HILBERT_H1_ANCHOR_BITS[row].1[stage] >> IEEE754_F32_MANTISSA_BITS)
+                & IEEE754_F32_EXP_ALL_ONES;
+            assert!(
+                exp_i >= HILBERT_ANCHOR_MIN_BIASED_EXP && exp_i <= HILBERT_ANCHOR_MAX_BIASED_EXP
+            );
+            assert!(
+                exp_q >= HILBERT_ANCHOR_MIN_BIASED_EXP && exp_q <= HILBERT_ANCHOR_MAX_BIASED_EXP
+            );
             stage += 1;
         }
         row += 1;
@@ -339,36 +363,63 @@ const _: () = {
     assert!(HILBERT_ALPHA_Q[0] > 0.0 && HILBERT_ALPHA_Q[5] < 1.0);
 };
 
+/// Exact `u128` bit-shift Euclidean division (`0 UDIV`, `0 __udivti3` / `__umodti3`).
+#[cfg(not(target_arch = "spirv"))]
+#[inline]
+fn div_rem_u128_shift(num: u128, den: u128) -> (u128, u128) {
+    if den == 0 || num < den {
+        return (0, num);
+    }
+    let shift = den.leading_zeros().saturating_sub(num.leading_zeros());
+    let mut q = 0_u128;
+    let mut rem = num;
+    let mut i = shift + 1;
+    while i > 0 {
+        i -= 1;
+        let d_shifted = den << i;
+        if rem >= d_shifted {
+            rem -= d_shifted;
+            q |= 1_u128 << i;
+        }
+    }
+    (q, rem)
+}
+
 /// Host/cold-setup 128-bit exact rational `binary32` ties-to-even rounding of `n / d` (`0 < n < d`),
 /// returning the IEEE-754 `u32` bit pattern (`ref[dsp.op-m.hilbert.ties-to-even]`).
 #[cfg(not(target_arch = "spirv"))]
 fn round_ratio_u128_to_f32_bits(n: u128, d: u128) -> u32 {
+    const MAX_NORMAL_NEG_EXP: u32 = (-IEEE754_F32_MIN_NORMAL_EXP) as u32;
     if n == 0 {
         return 0;
     }
     if n >= d {
-        return 0x3F80_0000;
+        return IEEE754_F32_ONE_BITS;
     }
-    let mut e = 1_u32;
-    while (n << e) < d && e < 126 {
+    let n_bits = u128::BITS - n.leading_zeros();
+    let max_e = (u128::BITS - IEEE754_F32_MANTISSA_BITS)
+        .saturating_sub(n_bits)
+        .min(MAX_NORMAL_NEG_EXP);
+    let mut e = 1_u32.min(max_e);
+    while (n << e) < d && e < max_e {
         e += 1;
     }
-    let exp_f32 = 127 - e;
-    let num = n << (e + 23);
-    let q = num / d;
-    let rem = num % d;
+    let exp_f32 = IEEE754_F32_EXP_BIAS - e;
+    let num = n << (e + IEEE754_F32_MANTISSA_BITS);
+    let (q, rem) = div_rem_u128_shift(num, d);
     let two_rem = rem << 1;
     let round_up = two_rem > d || (two_rem == d && (q & 1) == 1);
     let m = (q as u32) + u32::from(round_up);
-    ((exp_f32 - 1) << 23) + m
+    ((exp_f32 - 1) << IEEE754_F32_MANTISSA_BITS) + m
 }
 
 #[cfg(not(target_arch = "spirv"))]
 #[inline(always)]
 fn anchor_bits_to_num27(bits: u32) -> u128 {
-    let exp = (bits >> 23) & 0xFF;
-    let sig = (1_u32 << 23) | (bits & 0x007F_FFFF);
-    u128::from(sig) << (exp - 123)
+    let exp = (bits >> IEEE754_F32_MANTISSA_BITS) & IEEE754_F32_EXP_ALL_ONES;
+    let sig = IEEE754_F32_IMPLICIT_BIT | (bits & IEEE754_F32_MANTISSA_MASK);
+    // `sig * 2^(exp - 127 - 23) == (sig << (exp - (IEEE754_F32_EXP_BIAS - 4))) * 2^-27`.
+    u128::from(sig) << (exp - HILBERT_ANCHOR_MIN_BIASED_EXP)
 }
 
 /// Computes exact `128-bit` rational ties-to-even interpolated `(alpha_i, alpha_q)` vectors over
@@ -399,9 +450,12 @@ pub fn interpolate_hilbert_h1_alphas_f64(
     }
 
     let bits = rate_hz.to_bits();
-    let e_bin = (((bits >> 52) & 0x7FF) as i32) - 1023;
-    let mant53 = (1_u64 << 52) | (bits & ((1_u64 << 52) - 1));
-    let exp_neg = (52 - e_bin) as u32;
+    let e_bin = (((bits >> IEEE754_F64_MANTISSA_BITS) & u64::from(IEEE754_F64_EXP_ALL_ONES))
+        as i32)
+        - IEEE754_F64_EXP_BIAS;
+    let mant53 =
+        (1_u64 << IEEE754_F64_MANTISSA_BITS) | (bits & ((1_u64 << IEEE754_F64_MANTISSA_BITS) - 1));
+    let exp_neg = ((IEEE754_F64_MANTISSA_BITS as i32) - e_bin) as u32;
     let tz = mant53.trailing_zeros().min(exp_neg);
     let r = u128::from(mant53 >> tz);
     let k = exp_neg - tz;
@@ -425,7 +479,7 @@ pub fn interpolate_hilbert_h1_alphas_f64(
                     bits_to_f32_array6(HILBERT_H1_ANCHOR_BITS[row + 1].1),
                 );
             }
-            let d = (h - l) << (k + 27);
+            let d = (h - l) << (k + HILBERT_ANCHOR_Q_BITS);
             let w_lo = h2k - r;
             let w_hi = r - l2k;
             let mut out_i = [0.0_f32; HILBERT_H1_STAGES];
@@ -510,6 +564,14 @@ mod tests {
         assert_eq!(
             round_ratio_u128_to_f32_bits(base_even + 3, 1_u128 << 25),
             0x3F00_0002
+        );
+        assert_eq!(div_rem_u128_shift(7, 0), (0, 7));
+        assert_eq!(div_rem_u128_shift(7, 9), (0, 7));
+        let large_n = (u128::MAX >> 5) - 17;
+        let large_d = 97_654_321_012_345_u128;
+        assert_eq!(
+            div_rem_u128_shift(large_n, large_d),
+            (large_n / large_d, large_n % large_d)
         );
     }
 

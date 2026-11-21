@@ -124,7 +124,10 @@ pub trait SimdVec4: Copy + Clone + Send + Sync + 'static {
     #[inline(always)]
     fn pow2_from_biased_int_bits(self) -> Self {
         Self::from_array(self.to_array().map(|x| {
-            f32::from_bits(x.to_bits().wrapping_add(crate::math::IEEE754_F32_EXP_BIAS) << 23)
+            f32::from_bits(
+                x.to_bits().wrapping_add(crate::math::IEEE754_F32_EXP_BIAS)
+                    << crate::math::IEEE754_F32_MANTISSA_BITS,
+            )
         }))
     }
 

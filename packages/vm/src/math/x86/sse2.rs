@@ -13,8 +13,9 @@ use core::fmt;
 
 use crate::math::crc32c::{Crc32cBackend, crc32c_software_slice};
 use crate::math::{
-    BackendKind, IEEE754_F32_EXP_BIAS, IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED, MathBackend,
-    SimdVec4,
+    BackendKind, IEEE754_F32_ABS_MASK, IEEE754_F32_EXP_BIAS, IEEE754_F32_EXP_MASK,
+    IEEE754_F32_IMPLICIT_BIT, IEEE754_F32_MANTISSA_BITS, IEEE754_F32_RCP_SEED,
+    IEEE754_F32_RSQRT_SEED, MathBackend, SimdVec4,
 };
 
 /// x86-64 architectural baseline `SSE2` 128-bit `f32` vector (`__m128`).
@@ -36,20 +37,17 @@ impl fmt::Debug for Sse2Vec4 {
 impl SimdVec4 for Sse2Vec4 {
     #[inline(always)]
     fn splat(val: f32) -> Self {
-        // SAFETY: `SSE2` is guaranteed on all `x86_64` CPUs.
-        Self(unsafe { _mm_set1_ps(val) })
+        Self(_mm_set1_ps(val))
     }
 
     #[inline(always)]
     fn dup_low_pair(self) -> Self {
-        // SAFETY: `SSE2` is baseline on `x86_64`.
-        Self(unsafe { _mm_movelh_ps(self.0, self.0) })
+        Self(_mm_movelh_ps(self.0, self.0))
     }
 
     #[inline(always)]
     fn dup_high_pair(self) -> Self {
-        // SAFETY: `SSE2` is baseline on `x86_64`.
-        Self(unsafe { _mm_movehl_ps(self.0, self.0) })
+        Self(_mm_movehl_ps(self.0, self.0))
     }
 
     #[inline(always)]
@@ -66,140 +64,118 @@ impl SimdVec4 for Sse2Vec4 {
 
     #[inline(always)]
     fn add(self, rhs: Self) -> Self {
-        // SAFETY: Baseline `SSE2` intrinsic.
-        Self(unsafe { _mm_add_ps(self.0, rhs.0) })
+        Self(_mm_add_ps(self.0, rhs.0))
     }
 
     #[inline(always)]
     fn sub(self, rhs: Self) -> Self {
-        // SAFETY: Baseline `SSE2` intrinsic.
-        Self(unsafe { _mm_sub_ps(self.0, rhs.0) })
+        Self(_mm_sub_ps(self.0, rhs.0))
     }
 
     #[inline(always)]
     fn mul(self, rhs: Self) -> Self {
-        // SAFETY: Baseline `SSE2` intrinsic.
-        Self(unsafe { _mm_mul_ps(self.0, rhs.0) })
+        Self(_mm_mul_ps(self.0, rhs.0))
     }
 
     #[inline(always)]
     fn fma(self, a: Self, b: Self) -> Self {
-        // SAFETY: `SSE2` computes unfused `self + a * b` reliably on baseline targets.
-        Self(unsafe { _mm_add_ps(self.0, _mm_mul_ps(a.0, b.0)) })
+        // `SSE2` baseline computes unfused `self + a * b`.
+        Self(_mm_add_ps(self.0, _mm_mul_ps(a.0, b.0)))
     }
 
     #[inline(always)]
     fn fms(self, a: Self, b: Self) -> Self {
-        // SAFETY: `SSE2` computes unfused `self - a * b` cleanly on baseline targets.
-        Self(unsafe { _mm_sub_ps(self.0, _mm_mul_ps(a.0, b.0)) })
+        // `SSE2` baseline computes unfused `self - a * b`.
+        Self(_mm_sub_ps(self.0, _mm_mul_ps(a.0, b.0)))
     }
 
     #[inline(always)]
     fn max(self, rhs: Self) -> Self {
-        // SAFETY: Baseline `SSE2` intrinsic.
-        Self(unsafe { _mm_max_ps(self.0, rhs.0) })
+        Self(_mm_max_ps(self.0, rhs.0))
     }
 
     #[inline(always)]
     fn min(self, rhs: Self) -> Self {
-        // SAFETY: Baseline `SSE2` intrinsic.
-        Self(unsafe { _mm_min_ps(self.0, rhs.0) })
+        Self(_mm_min_ps(self.0, rhs.0))
     }
 
     #[inline(always)]
     fn abs(self) -> Self {
-        // SAFETY: Clears the IEEE-754 sign bit across all 4 lanes via `SSE2` bitwise AND.
-        Self(unsafe {
-            _mm_castsi128_ps(_mm_and_si128(
-                _mm_castps_si128(self.0),
-                _mm_set1_epi32(0x7FFF_FFFF),
-            ))
-        })
+        // Clears the IEEE-754 sign bit across all 4 lanes via `SSE2` bitwise AND.
+        Self(_mm_castsi128_ps(_mm_and_si128(
+            _mm_castps_si128(self.0),
+            _mm_set1_epi32(IEEE754_F32_ABS_MASK as i32),
+        )))
     }
 
     #[inline(always)]
     fn pair_swap_neg(self) -> Self {
-        // SAFETY: `_mm_shuffle_ps::<0xB1>` swaps `[0,1,2,3] -> [1,0,3,2]` and XOR flips `[0,2]`.
-        Self(unsafe {
-            let swapped = _mm_shuffle_ps::<0xB1>(self.0, self.0);
-            _mm_xor_ps(swapped, _mm_set_ps(0.0, -0.0, 0.0, -0.0))
-        })
+        // `_mm_shuffle_ps::<0xB1>` swaps `[0,1,2,3] -> [1,0,3,2]` and XOR flips `[0,2]`.
+        let swapped = _mm_shuffle_ps::<0xB1>(self.0, self.0);
+        Self(_mm_xor_ps(swapped, _mm_set_ps(0.0, -0.0, 0.0, -0.0)))
     }
 
     #[inline(always)]
     fn flush_subnormal(self) -> Self {
-        // SAFETY: Signed `i32` comparison matches unsigned magnitude in `[0, 0x7FFF_FFFF]`.
-        Self(unsafe {
-            let bits = _mm_castps_si128(self.0);
-            let abs_bits = _mm_and_si128(bits, _mm_set1_epi32(0x7FFF_FFFF));
-            let is_sub = _mm_cmplt_epi32(abs_bits, _mm_set1_epi32(0x0080_0000));
-            let signed_zero = _mm_and_si128(bits, _mm_set1_epi32(i32::MIN));
-            _mm_castsi128_ps(_mm_or_si128(
-                _mm_and_si128(is_sub, signed_zero),
-                _mm_andnot_si128(is_sub, bits),
-            ))
-        })
+        // Signed `i32` comparison matches unsigned magnitude in `[0, IEEE754_F32_ABS_MASK]`.
+        let bits = _mm_castps_si128(self.0);
+        let abs_bits = _mm_and_si128(bits, _mm_set1_epi32(IEEE754_F32_ABS_MASK as i32));
+        let is_sub = _mm_cmplt_epi32(abs_bits, _mm_set1_epi32(IEEE754_F32_IMPLICIT_BIT as i32));
+        let signed_zero = _mm_and_si128(bits, _mm_set1_epi32(i32::MIN));
+        Self(_mm_castsi128_ps(_mm_or_si128(
+            _mm_and_si128(is_sub, signed_zero),
+            _mm_andnot_si128(is_sub, bits),
+        )))
     }
 
     #[inline(always)]
     fn scrub_recursive_state(self) -> Self {
-        // SAFETY: Scrubs `exp == 0xFF` (`NaN`/`±Inf`) to `+0.0` and subnormals to signed zero.
-        Self(unsafe {
-            let bits = _mm_castps_si128(self.0);
-            let abs_bits = _mm_and_si128(bits, _mm_set1_epi32(0x7FFF_FFFF));
-            let is_sub = _mm_cmplt_epi32(abs_bits, _mm_set1_epi32(0x0080_0000));
-            let signed_zero = _mm_and_si128(bits, _mm_set1_epi32(i32::MIN));
-            let flushed = _mm_or_si128(
-                _mm_and_si128(is_sub, signed_zero),
-                _mm_andnot_si128(is_sub, bits),
-            );
-            let is_finite = _mm_cmplt_epi32(abs_bits, _mm_set1_epi32(0x7F80_0000));
-            _mm_castsi128_ps(_mm_and_si128(flushed, is_finite))
-        })
+        // Scrubs `exp == 0xFF` (`NaN`/`±Inf`) to `+0.0` and subnormals to signed zero.
+        let bits = _mm_castps_si128(self.0);
+        let abs_bits = _mm_and_si128(bits, _mm_set1_epi32(IEEE754_F32_ABS_MASK as i32));
+        let is_sub = _mm_cmplt_epi32(abs_bits, _mm_set1_epi32(IEEE754_F32_IMPLICIT_BIT as i32));
+        let signed_zero = _mm_and_si128(bits, _mm_set1_epi32(i32::MIN));
+        let flushed = _mm_or_si128(
+            _mm_and_si128(is_sub, signed_zero),
+            _mm_andnot_si128(is_sub, bits),
+        );
+        let is_finite = _mm_cmplt_epi32(abs_bits, _mm_set1_epi32(IEEE754_F32_EXP_MASK as i32));
+        Self(_mm_castsi128_ps(_mm_and_si128(flushed, is_finite)))
     }
 
     #[inline(always)]
     fn horizontal_sum(self) -> f32 {
-        // SAFETY: Reduces in exact `(a0+a1)+(a2+a3)` tree order using baseline `SSE2`.
-        unsafe {
-            let swapped = _mm_shuffle_ps::<0xB1>(self.0, self.0);
-            let pair_sums = _mm_add_ps(self.0, swapped);
-            let hi = _mm_movehl_ps(pair_sums, pair_sums);
-            _mm_cvtss_f32(_mm_add_ss(pair_sums, hi))
-        }
+        // Reduces in exact `(a0+a1)+(a2+a3)` tree order using baseline `SSE2`.
+        let swapped = _mm_shuffle_ps::<0xB1>(self.0, self.0);
+        let pair_sums = _mm_add_ps(self.0, swapped);
+        let hi = _mm_movehl_ps(pair_sums, pair_sums);
+        _mm_cvtss_f32(_mm_add_ss(pair_sums, hi))
     }
 
     #[inline(always)]
     fn rcp_pos_seed_bits(self) -> Self {
-        // SAFETY: `SSE2` 32-bit integer lane subtraction.
-        Self(unsafe {
-            _mm_castsi128_ps(_mm_sub_epi32(
-                _mm_set1_epi32(IEEE754_F32_RCP_SEED as i32),
-                _mm_castps_si128(self.0),
-            ))
-        })
+        Self(_mm_castsi128_ps(_mm_sub_epi32(
+            _mm_set1_epi32(IEEE754_F32_RCP_SEED as i32),
+            _mm_castps_si128(self.0),
+        )))
     }
 
     #[inline(always)]
     fn rsqrt_pos_seed_bits(self) -> Self {
-        // SAFETY: `SSE2` 32-bit logical right shift + subtraction.
-        Self(unsafe {
-            _mm_castsi128_ps(_mm_sub_epi32(
-                _mm_set1_epi32(IEEE754_F32_RSQRT_SEED as i32),
-                _mm_srli_epi32::<1>(_mm_castps_si128(self.0)),
-            ))
-        })
+        Self(_mm_castsi128_ps(_mm_sub_epi32(
+            _mm_set1_epi32(IEEE754_F32_RSQRT_SEED as i32),
+            _mm_srli_epi32::<1>(_mm_castps_si128(self.0)),
+        )))
     }
 
     #[inline(always)]
     fn pow2_from_biased_int_bits(self) -> Self {
-        // SAFETY: `SSE2` 32-bit exponent bias addition + shift.
-        Self(unsafe {
-            _mm_castsi128_ps(_mm_slli_epi32::<23>(_mm_add_epi32(
-                _mm_castps_si128(self.0),
-                _mm_set1_epi32(IEEE754_F32_EXP_BIAS as i32),
-            )))
-        })
+        Self(_mm_castsi128_ps(_mm_slli_epi32::<
+            { IEEE754_F32_MANTISSA_BITS as i32 },
+        >(_mm_add_epi32(
+            _mm_castps_si128(self.0),
+            _mm_set1_epi32(IEEE754_F32_EXP_BIAS as i32),
+        ))))
     }
 
     #[inline(always)]
@@ -281,23 +257,21 @@ impl dnam_kernels::KernelVec4 for Sse2Vec4 {
 
     #[inline(always)]
     fn neg(self) -> Self {
-        // SAFETY: Flipping the IEEE-754 sign bit via `SSE2` XOR.
-        Self(unsafe { _mm_xor_ps(self.0, _mm_set1_ps(-0.0)) })
+        Self(_mm_xor_ps(self.0, _mm_set1_ps(-0.0)))
     }
 
     #[inline(always)]
     fn select_le(lhs: Self, rhs: Self, if_true: Self, if_false: Self) -> Self {
-        // SAFETY: `SSE2` mask select.
-        Self(unsafe {
-            let mask = _mm_cmple_ps(lhs.0, rhs.0);
-            _mm_or_ps(_mm_and_ps(mask, if_true.0), _mm_andnot_ps(mask, if_false.0))
-        })
+        let mask = _mm_cmple_ps(lhs.0, rhs.0);
+        Self(_mm_or_ps(
+            _mm_and_ps(mask, if_true.0),
+            _mm_andnot_ps(mask, if_false.0),
+        ))
     }
 
     #[inline(always)]
     fn all_le(self, rhs: Self) -> bool {
-        // SAFETY: `_mm_movemask_ps` produces `0b1111` iff all 4 lanes satisfy `<=`.
-        unsafe { _mm_movemask_ps(_mm_cmple_ps(self.0, rhs.0)) == 0b1111 }
+        _mm_movemask_ps(_mm_cmple_ps(self.0, rhs.0)) == 0b1111
     }
 
     #[inline(always)]
@@ -374,10 +348,7 @@ impl MathBackend for X86Sse2Backend {
         let mut b = r1.0;
         let mut c = r2.0;
         let mut d = r3.0;
-        // SAFETY: Standard `SSE2` `_MM_TRANSPOSE4_PS` register transpose.
-        unsafe {
-            core::arch::x86_64::_MM_TRANSPOSE4_PS(&mut a, &mut b, &mut c, &mut d);
-        }
+        core::arch::x86_64::_MM_TRANSPOSE4_PS(&mut a, &mut b, &mut c, &mut d);
         [Sse2Vec4(a), Sse2Vec4(b), Sse2Vec4(c), Sse2Vec4(d)]
     }
 }

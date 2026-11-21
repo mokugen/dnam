@@ -43,6 +43,7 @@ tasks:
       - "Cargo.toml"
       - "src/**/*"
       - "tests/**/*"
+      - "benches/**/*"
       - "/Cargo.toml"
     tags:
       - "quality"
@@ -62,6 +63,7 @@ tasks:
       - "Cargo.toml"
       - "src/**/*"
       - "tests/**/*"
+      - "benches/**/*"
       - "/Cargo.toml"
       - "/Cargo.lock"
     options:
@@ -81,6 +83,7 @@ tasks:
       - "Cargo.toml"
       - "src/**/*"
       - "tests/**/*"
+      - "benches/**/*"
       - "/Cargo.toml"
       - "/Cargo.lock"
     options:
@@ -149,3 +152,25 @@ tasks:
       runInCI: "skip"
     tags:
       - "coverage"
+
+  bench:
+    type: "run"
+    command: "cargo"
+    args:
+      - "bench"
+      - "--package"
+      - "dnam-vm"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "benches/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+    options:
+      cache: false
+      mutex: "cargo"
+      runInCI: false
+    tags:
+      - "bench"

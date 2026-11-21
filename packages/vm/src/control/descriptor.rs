@@ -2,7 +2,7 @@
 //! ([`ControlClampDescriptor`] and [`ConditionalClampRule`], `ref[dsp.ctrl.range.normalize-clamp]`).
 
 use crate::bin::{ConditionalClampRuleWire, ControlClampDescriptorWire};
-use crate::math::rcp_nr6_f64;
+use crate::math::{clamp_finite_f32, const_abs_f32, floor_f32, rcp_nr6_f64};
 
 /// Native representation of a switch-coupled conditional clamp rule (`8 B`).
 #[repr(C)]
@@ -296,6 +296,14 @@ impl ControlClampDescriptor {
         (eff_min, eff_max)
     }
 
+    /// Returns the rounded default discrete switch option index clamped inside `0..=15`.
+    #[inline]
+    #[must_use]
+    pub fn default_switch_option(&self) -> u8 {
+        let pos = clamp_finite_f32(self.default_val, 0.0, 15.0, 0.0);
+        (floor_f32(pos + 0.5) as u8).min(15)
+    }
+
     /// Clamps and normalizes `raw_physical_val` according to `ctrl_kind` and active switch options,
     /// returning `(clamped_physical, u_norm, was_clamped)`.
     pub fn clamp_and_normalize(
@@ -313,7 +321,7 @@ impl ControlClampDescriptor {
                 } else {
                     0.0
                 };
-                let rounded = crate::math::floor_f32(pos + 0.5);
+                let rounded = floor_f32(pos + 0.5);
                 if rounded < 16.0 {
                     let opt = rounded as u8;
                     let bit = 1_u16.wrapping_shl(u32::from(opt));
@@ -323,16 +331,7 @@ impl ControlClampDescriptor {
                     }
                 }
             }
-            let def_opt = if self.default_val.is_finite() {
-                let pos = if self.default_val > 0.0 {
-                    self.default_val
-                } else {
-                    0.0
-                };
-                (crate::math::floor_f32(pos + 0.5) as u8).min(15)
-            } else {
-                0
-            };
+            let def_opt = self.default_switch_option();
             let def_bit = 1_u16.checked_shl(u32::from(def_opt)).unwrap_or(0);
             let safe_opt = if (self.active_options_mask & def_bit) != 0 {
                 def_opt
@@ -347,20 +346,13 @@ impl ControlClampDescriptor {
 
         let (eff_min, eff_max) = self.effective_bounds(active_switch_options);
         let (clamped, was_clamped) = if !raw_physical_val.is_finite() {
-            let safe_def = if self.default_val.is_finite() {
-                self.default_val
-            } else {
-                eff_min
-            };
-            (safe_def.clamp(eff_min, eff_max), true)
+            (
+                clamp_finite_f32(self.default_val, eff_min, eff_max, eff_min),
+                true,
+            )
         } else {
             let c = raw_physical_val.clamp(eff_min, eff_max);
-            let diff = if c >= raw_physical_val {
-                c - raw_physical_val
-            } else {
-                raw_physical_val - c
-            };
-            (c, diff > 1.0e-6)
+            (c, const_abs_f32(c - raw_physical_val) > 1.0e-6)
         };
         let u_norm = (clamped * self.scale_norm + self.offset_norm).clamp(-1.0, 1.0);
         (clamped, u_norm, was_clamped)

@@ -1,7 +1,10 @@
 //! 32-slot `W_ctrl` + `"CEXT"` dispatch evaluation, `xorshift64*` OU analog drift,
-//! control stride/ratio helpers, and clamped linear micro-ramping (`ref[dsp.ctrl.dispatch.*]`).
+//! control stride/ratio helpers, and clamped linear micro-ramping (`ref[dsp.ctrl.dispatch.matrix]`,
+//! `ref[dsp.ctrl.dispatch.micro-ramp]`, `ref[dsp.ctrl.dispatch.sparse-and-active-ramps]`).
 
-use crate::math::{MathBackend, SimdVec4, flush_subnormal_f32_bits, rcp_nr6_f64, round_f64};
+use crate::math::{
+    MathBackend, SimdVec4, const_f32_pow2, flush_subnormal_f32_bits, rcp_nr6_f64, round_f64,
+};
 
 /// Total `3 kHz` control dispatch output slots (`0..16` base + `16..32` `"CEXT"`).
 pub const STAGE_TARGET_SLOTS: usize = 32;
@@ -153,7 +156,7 @@ pub(crate) fn step_ou_drift(
         x ^= x >> 27;
         *drift_prng_state = x;
         let rand_u32 = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32;
-        let xi = ((rand_u32 >> 8) as f32) * f32::from_bits(0x3400_0000) - 1.0;
+        let xi = ((rand_u32 >> 8) as f32) * const_f32_pow2(-23) - 1.0;
         let next = flush_subnormal_f32_bits(rho_drift_host * ou_drift_state[d] + scale * xi);
         ou_drift_state[d] = next;
         stage_targets[DRIFT_OU_SLOTS[d]] += DRIFT_OU_WEIGHTS[d] * next;

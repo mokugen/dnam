@@ -7,10 +7,15 @@
 //! Runtime execution paths are strictly `#![no_std]` 32-bit `f32`; the host/cold 160-bit search
 //! (`compute_t1_dc_blocker_coeffs_bits`) is guarded under `#[cfg(not(target_arch = "spirv"))]`.
 
-#[cfg(not(target_arch = "spirv"))]
-use crate::simd::IEEE754_F32_EXP_BIAS;
 use crate::simd::{
-    DC_BLOCKER_5HZ_48K_F32, GpuVec4, KernelVec4, MAX_PARALRU_R_F32, flush_subnormal_f32_bits,
+    DC_BLOCKER_5HZ_48K_F32, GpuVec4, KernelVec4, MAX_PARALRU_R_F32, const_abs_f32, const_f32_pow2,
+    flush_subnormal_f32_bits,
+};
+#[cfg(not(target_arch = "spirv"))]
+use crate::simd::{
+    IEEE754_F32_EXP_BIAS, IEEE754_F32_IMPLICIT_BIT, IEEE754_F32_MANTISSA_BITS,
+    IEEE754_F32_MANTISSA_MASK, IEEE754_F32_SIGNIFICAND_BITS, IEEE754_F64_EXP_ALL_ONES,
+    IEEE754_F64_EXP_BIAS, IEEE754_F64_MANTISSA_BITS,
 };
 
 /// Compile-time `48 kHz` `5 Hz` passband-normalized DC blocker gain `0.5 * (1 + R)`
@@ -26,16 +31,11 @@ const T1_HALF_ANGLE_EPS: f32 = 1.0e-12;
 
 /// Exact `binary32` `2^-18` tolerance for antipodal near-origin chord gating in
 /// [`tracker_crosses_branch_cut_f32`] (`ref[dsp.op-m.tracker.toggle-sheet]`).
-const BRANCH_CUT_CHORD_TOL: f32 = f32::from_bits((127 - 18) << 23);
+const BRANCH_CUT_CHORD_TOL: f32 = const_f32_pow2(-18);
 
 const _: () = assert!(DC_BLOCKER_5HZ_48K_F32.to_bits() == 0x3F7F_D51F);
 const _: () = assert!(DC_BLOCKER_5HZ_48K_GAIN_F32.to_bits() == 0x3F7F_EA90);
 const _: () = assert!(BRANCH_CUT_CHORD_TOL > 0.0 && BRANCH_CUT_CHORD_TOL < 1.0e-5);
-
-#[inline(always)]
-const fn abs_f32(x: f32) -> f32 {
-    f32::from_bits(x.to_bits() & 0x7FFF_FFFF)
-}
 
 #[inline(always)]
 fn clamp_t1_pole(dc_pole: f32) -> (f32, f32) {
@@ -108,14 +108,36 @@ impl U256Be {
     fn div_u64(self, divisor: u64) -> Self {
         let mut out = [0_u64; 4];
         let mut rem = 0_u128;
-        let d = u128::from(divisor);
         for idx in 0..4 {
             let cur = (rem << 64) | u128::from(self.limbs[idx]);
-            out[idx] = (cur / d) as u64;
-            rem = cur % d;
+            let (q, r) = div_rem_u128_by_u64_shift(cur, divisor);
+            out[idx] = q;
+            rem = r;
         }
         Self { limbs: out }
     }
+}
+
+#[cfg(not(target_arch = "spirv"))]
+#[inline]
+fn div_rem_u128_by_u64_shift(num: u128, den: u64) -> (u64, u128) {
+    let d = u128::from(den);
+    if d == 0 || num < d {
+        return (0, num);
+    }
+    let shift = d.leading_zeros().saturating_sub(num.leading_zeros());
+    let mut q = 0_u128;
+    let mut rem = num;
+    let mut i = shift + 1;
+    while i > 0 {
+        i -= 1;
+        let d_shifted = d << i;
+        if rem >= d_shifted {
+            rem -= d_shifted;
+            q |= 1_u128 << i;
+        }
+    }
+    (q as u64, rem)
 }
 
 #[cfg(not(target_arch = "spirv"))]
@@ -152,25 +174,33 @@ pub fn compute_t1_dc_blocker_coeffs_bits(rate_hz: f64) -> Option<(u32, u32)> {
     if !rate_hz.is_finite() || !(44_100.0..=384_000.0).contains(&rate_hz) {
         return None;
     }
+    const F64_MANT_BITS_I32: i32 = IEEE754_F64_MANTISSA_BITS as i32;
     let bits = rate_hz.to_bits();
-    let exp = (((bits >> 52) & 0x7FF) as i32) - 1023;
-    let mant = (1_u64 << 52) | (bits & ((1_u64 << 52) - 1));
-    let (rate_num, rate_den): (u64, u64) = if exp >= 52 {
-        (mant << ((exp - 52) as u32), 1)
+    let exp = (((bits >> IEEE754_F64_MANTISSA_BITS) & u64::from(IEEE754_F64_EXP_ALL_ONES)) as i32)
+        - IEEE754_F64_EXP_BIAS;
+    let mant =
+        (1_u64 << IEEE754_F64_MANTISSA_BITS) | (bits & ((1_u64 << IEEE754_F64_MANTISSA_BITS) - 1));
+    let (rate_num, rate_den): (u64, u64) = if exp >= F64_MANT_BITS_I32 {
+        (mant << ((exp - F64_MANT_BITS_I32) as u32), 1)
     } else {
-        let raw_k = (52 - exp) as u32;
+        let raw_k = (F64_MANT_BITS_I32 - exp) as u32;
         let tz = mant.trailing_zeros().min(raw_k);
         (mant >> tz, 1_u64 << (raw_k - tz))
     };
     let exponent_num = 48_000_u64 * rate_den;
-    let ref_mant24 = u64::from((1_u32 << 23) | (DC_BLOCKER_5HZ_48K_F32.to_bits() & 0x007F_FFFF));
-    let ref_bounds = atanh_bounds_160bit(ref_mant24, 1_u64 << 24);
+    let ref_mant24 = u64::from(
+        IEEE754_F32_IMPLICIT_BIT | (DC_BLOCKER_5HZ_48K_F32.to_bits() & IEEE754_F32_MANTISSA_MASK),
+    );
+    let ref_bounds = atanh_bounds_160bit(ref_mant24, 1_u64 << IEEE754_F32_SIGNIFICAND_BITS);
 
     let mut lower: u32 = 0x00FF_D000 + 1;
     let mut upper: u32 = 0x00FF_FBFF;
     while lower < upper {
         let candidate = (lower + upper) >> 1;
-        let mid_bounds = atanh_bounds_160bit(u64::from(2 * candidate + 1), 1_u64 << 25);
+        let mid_bounds = atanh_bounds_160bit(
+            u64::from(2 * candidate + 1),
+            1_u64 << (IEEE754_F32_SIGNIFICAND_BITS + 1),
+        );
         let lhs = mid_bounds.0.mul_u64(rate_num);
         let rhs = ref_bounds.1.mul_u64(exponent_num);
         if lhs > rhs {
@@ -180,14 +210,13 @@ pub fn compute_t1_dc_blocker_coeffs_bits(rate_hz: f64) -> Option<(u32, u32)> {
         }
     }
 
-    const F32_HALF_EXP_BITS: u32 = (IEEE754_F32_EXP_BIAS - 1) << 23;
-    const F32_IMPLICIT_MANT_BIT: u32 = 1_u32 << 23;
-    let pole_bits = F32_HALF_EXP_BITS + lower - F32_IMPLICIT_MANT_BIT;
-    let num_gain = (1_u32 << 24) + lower;
+    const F32_HALF_EXP_BITS: u32 = (IEEE754_F32_EXP_BIAS - 1) << IEEE754_F32_MANTISSA_BITS;
+    let pole_bits = F32_HALF_EXP_BITS + lower - IEEE754_F32_IMPLICIT_BIT;
+    let num_gain = (1_u32 << IEEE754_F32_SIGNIFICAND_BITS) + lower;
     let q = num_gain >> 1;
     let rem = num_gain & 1;
     let rounded_gain = q + u32::from(rem == 1 && (q & 1) != 0);
-    let gain_bits = F32_HALF_EXP_BITS + rounded_gain - F32_IMPLICIT_MANT_BIT;
+    let gain_bits = F32_HALF_EXP_BITS + rounded_gain - IEEE754_F32_IMPLICIT_BIT;
     Some((pole_bits, gain_bits))
 }
 
@@ -378,7 +407,7 @@ pub fn tracker_crosses_branch_cut_f32(
 ) -> bool {
     let dot = prev_re * cur_re + prev_im * cur_im;
     let det = prev_re * cur_im - prev_im * cur_re;
-    if dot < 0.0 && abs_f32(det) <= BRANCH_CUT_CHORD_TOL {
+    if dot < 0.0 && const_abs_f32(det) <= BRANCH_CUT_CHORD_TOL {
         return false;
     }
     (prev_im >= 0.0 && cur_im < 0.0 && det > 0.0) || (prev_im < 0.0 && cur_im >= 0.0 && det < 0.0)
@@ -470,10 +499,10 @@ impl T1SubHarmonicKernel {
             self.sheet = -self.sheet;
         }
 
-        let h = (0.5 * (1.0 + abs_f32(u_re))).max(T1_HALF_ANGLE_EPS);
+        let h = (0.5 * (1.0 + const_abs_f32(u_re))).max(T1_HALF_ANGLE_EPS);
         let rho_half = GpuVec4::splat(h).rsqrt_pos_nr2().to_array()[0];
         let v_maj = (h * rho_half).clamp(0.0, 1.0);
-        let v_min = (abs_f32(u_im) * (0.5 * rho_half)).clamp(0.0, 1.0);
+        let v_min = (const_abs_f32(u_im) * (0.5 * rho_half)).clamp(0.0, 1.0);
         let (c_1, abs_s_1) = if u_re >= 0.0 {
             (v_maj, v_min)
         } else {
@@ -649,6 +678,19 @@ mod tests {
             saw_neg_q2 |= q2 < 0.0;
         }
         assert!(saw_neg_sheet && saw_neg_q1 && saw_neg_q2);
+
+        // Verify shift-subtract U256Be::div_u64 across edge cases (zero, shift=64, primes).
+        let (q0, r0) = div_rem_u128_by_u64_shift(5, 0);
+        assert_eq!((q0, r0), (0, 5));
+        let num_edge = (3_u128 << 64) - 1;
+        let (q_edge, r_edge) = div_rem_u128_by_u64_shift(num_edge, 3);
+        assert_eq!((q_edge, r_edge), ((num_edge / 3) as u64, num_edge % 3));
+        let u = U256Be {
+            limbs: [2, u64::MAX, 0x1234_5678_9abc_def0, 0xfedc_ba98_7654_3210],
+        };
+        let divided = u.div_u64(3);
+        assert_eq!(divided.limbs[0], 0);
+        assert!(divided.limbs[1] > (u64::MAX / 3) * 2);
     }
 
     proptest! {

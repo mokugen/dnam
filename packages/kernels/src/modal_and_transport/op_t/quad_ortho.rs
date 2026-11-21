@@ -9,7 +9,7 @@
 use super::interp_and_window::valid_pow2_ring_len;
 use crate::simd::{
     DC_BLOCKER_5HZ_48K_F32, KernelVec4, MAX_LOOP_GAIN_F32, TANK_MAX_G_LIN_F32, TANK_MAX_V_CEIL_F32,
-    flush_subnormal_f32_bits, scrub_and_flush_f32_bits,
+    const_abs_f32, flush_subnormal_f32_bits, scrub_and_flush_f32_bits,
 };
 
 /// Spatial tank quad flag bit `0`: Schmitt-latched ControlBus Write-Enable hold (`op_t_we_drive`).
@@ -34,7 +34,7 @@ pub const WE_SCHMITT_HOLD_LOW_F32: f32 = 0.45;
 pub const WE_SCHMITT_RELEASE_HIGH_F32: f32 = 0.55;
 
 /// Maximum finite `fp16` magnitude `65,504.0` used to saturate tank loop writebacks.
-pub const FP16_FINITE_MAX_F32: f32 = 65_504.0;
+pub use crate::simd::FP16_FINITE_MAX_F32;
 
 /// Maximum bounded Schroeder all-pass feedback magnitude (`|g| <= 0.75`).
 const SCHROEDER_MAX_ABS_GAIN: f32 = 0.75;
@@ -404,8 +404,7 @@ pub fn step_op_t_ducking_vca_f32(
 ) -> (f32, f32) {
     let xl = scrub_and_flush_f32_bits(x_tank_lr.0);
     let xr = scrub_and_flush_f32_bits(x_tank_lr.1);
-    let x_sc = 0.5 * f32::from_bits(xl.to_bits() & 0x7FFF_FFFF)
-        + 0.5 * f32::from_bits(xr.to_bits() & 0x7FFF_FFFF);
+    let x_sc = 0.5 * const_abs_f32(xl) + 0.5 * const_abs_f32(xr);
     let p_vca = clamp_finite_range(vca_pole, 0.0, VCA_MAX_POLE_F32, 0.0);
     let att_cap = clamp_finite_range(attack_cap, 0.0, VCA_MAX_POLE_F32, 0.99);
     let env_prev = scrub_and_flush_f32_bits(*vca_env);

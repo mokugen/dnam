@@ -10,24 +10,25 @@ use crate::bin::DnamBinView;
 use crate::control::ControlClampDescriptor;
 use crate::control::cp1::{count_distinct_contributor_controls, decode_cp1_contributors};
 use crate::control::exact_int::ExactIntFactorAccumulator;
-use crate::math::{MathBackend, Q0_192Phase};
+use crate::math::{MathBackend, Q0_192Phase, clamp_finite_f32, const_abs_f32, sanitize_finite_f32};
 use crate::types::{Tier, VmError};
 
 #[inline]
 fn non_zero_f32_cols_8_16(m: &[[f32; 16]; 16]) -> bool {
     m.iter()
-        .any(|row| row[8..16].iter().any(|v| (v.to_bits() & 0x7FFF_FFFF) != 0))
+        .any(|row| row[8..16].iter().any(|&v| const_abs_f32(v) != 0.0))
 }
 
 impl<'a, B: MathBackend> ControlBus<'a, B> {
     /// Loads and initializes [`ControlBus`] from a validated [`DnamBinView`] without heap allocation
     /// (provided `backing` capacity meets `num_controls` and decoded `CP1` count).
     pub fn from_dnam_bin(
-        view: &DnamBinView<'a>,
+        view: &DnamBinView<'_>,
         tier: Tier,
         host_sample_rate_hz: f32,
         mut backing: ControlBusBacking<'a>,
     ) -> Result<Self, VmError> {
+        crate::math::warm_simd_feature_caches();
         if tier > view.retained_tier {
             return Err(VmError::InvalidTier);
         }
@@ -65,8 +66,7 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
         let mut u_int_base = [[0.0_f32; 8]; 4];
         for f in 0..4 {
             for d in 0..8 {
-                let val = a0_cb.u_int_base[f][d].get();
-                u_int_base[f][d] = if val.is_finite() { val } else { 0.0 };
+                u_int_base[f][d] = sanitize_finite_f32(a0_cb.u_int_base[f][d].get());
             }
         }
         let mut u_int_ultra = [[[0.0_f32; 8]; 4]; 3];
@@ -74,8 +74,7 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
             for b in 0..3 {
                 for f in 0..4 {
                     for d in 0..8 {
-                        let val = a3.u_int_ultra[b][f][d].get();
-                        u_int_ultra[b][f][d] = if val.is_finite() { val } else { 0.0 };
+                        u_int_ultra[b][f][d] = sanitize_finite_f32(a3.u_int_ultra[b][f][d].get());
                     }
                 }
             }
@@ -83,16 +82,14 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
         let mut w_ctrl = [[0.0_f32; 16]; 16];
         for r in 0..16 {
             for c in 0..16 {
-                let val = a0_cb.w_ctrl[r][c].get();
-                w_ctrl[r][c] = if val.is_finite() { val } else { 0.0 };
+                w_ctrl[r][c] = sanitize_finite_f32(a0_cb.w_ctrl[r][c].get());
             }
         }
         let mut w_ctrl_ultra = [[0.0_f32; 4]; 16];
         if let Some(a3) = a3_cb {
             for r in 0..16 {
                 for c in 0..4 {
-                    let val = a3.w_ctrl_ultra[r][c].get();
-                    w_ctrl_ultra[r][c] = if val.is_finite() { val } else { 0.0 };
+                    w_ctrl_ultra[r][c] = sanitize_finite_f32(a3.w_ctrl_ultra[r][c].get());
                 }
             }
         }
@@ -102,57 +99,47 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
         if let Some(cext) = view.cext {
             for r in 0..16 {
                 for c in 0..16 {
-                    let val = cext.w_ctrl_ext[r][c].get();
-                    w_ctrl_ext[r][c] = if val.is_finite() { val } else { 0.0 };
+                    w_ctrl_ext[r][c] = sanitize_finite_f32(cext.w_ctrl_ext[r][c].get());
                 }
                 if tier == Tier::Ultra {
                     for c in 0..4 {
-                        let val = cext.w_ctrl_ultra_ext[r][c].get();
-                        w_ctrl_ultra_ext[r][c] = if val.is_finite() { val } else { 0.0 };
+                        w_ctrl_ultra_ext[r][c] =
+                            sanitize_finite_f32(cext.w_ctrl_ultra_ext[r][c].get());
                     }
                 }
             }
         }
 
         let lfo_dphi_train = [
-            if a0_cb.lfo_dphi_train[0].get().is_finite() {
-                a0_cb.lfo_dphi_train[0]
-                    .get()
-                    .clamp(-core::f32::consts::PI, core::f32::consts::PI)
-            } else {
-                0.0
-            },
-            if a0_cb.lfo_dphi_train[1].get().is_finite() {
-                a0_cb.lfo_dphi_train[1]
-                    .get()
-                    .clamp(-core::f32::consts::PI, core::f32::consts::PI)
-            } else {
-                0.0
-            },
+            clamp_finite_f32(
+                a0_cb.lfo_dphi_train[0].get(),
+                -core::f32::consts::PI,
+                core::f32::consts::PI,
+                0.0,
+            ),
+            clamp_finite_f32(
+                a0_cb.lfo_dphi_train[1].get(),
+                -core::f32::consts::PI,
+                core::f32::consts::PI,
+                0.0,
+            ),
         ];
-        let sigma_drift = {
-            let s = a0_cb.sigma_drift.get();
-            if s.is_finite() {
-                s.clamp(0.0, 2.0)
-            } else {
-                0.0
-            }
-        };
+        let sigma_drift = clamp_finite_f32(a0_cb.sigma_drift.get(), 0.0, 2.0, 0.0);
         let rho_drift_train = {
             let r = a0_cb.rho_drift_train.get();
             if !r.is_finite() || r <= 0.0 {
                 0.999
             } else {
-                r.clamp(0.0, 0.9999)
+                r.min(0.9999)
             }
         };
         let env_poles_train = [0, 1, 2].map(|i| {
-            let p = a0_cb.env_poles[i].get();
-            if p.is_finite() {
-                p.clamp(0.0, 0.99995)
-            } else {
-                [0.95, 0.99, 0.998][i]
-            }
+            clamp_finite_f32(
+                a0_cb.env_poles[i].get(),
+                0.0,
+                0.99995,
+                [0.95, 0.99, 0.998][i],
+            )
         });
         let trust_radius_mh = {
             let tr = a0_cb.trust_radius_mh.get();
@@ -171,8 +158,8 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
             }
         };
         let ref_sr = view.header.reference_sample_rate_hz.get() as f32;
-        let has_internal_modulators = ((lfo_dphi_train[0].to_bits() & 0x7FFF_FFFF) != 0)
-            || ((lfo_dphi_train[1].to_bits() & 0x7FFF_FFFF) != 0)
+        let has_internal_modulators = (const_abs_f32(lfo_dphi_train[0]) != 0.0)
+            || (const_abs_f32(lfo_dphi_train[1]) != 0.0)
             || non_zero_f32_cols_8_16(&w_ctrl)
             || (cext_present && non_zero_f32_cols_8_16(&w_ctrl_ext));
 

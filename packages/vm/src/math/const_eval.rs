@@ -16,11 +16,68 @@ pub const TANK_MAX_V_CEIL_BITS_DERIVED: u32 = const_max_f32_bits_le(0.985);
 /// Compile-time largest positive `f32` bit pattern `<= 0.9990` (`0x3F7F_BE76`).
 pub const TANK_MAX_G_LIN_BITS_DERIVED: u32 = const_max_f32_bits_le(0.9990);
 
+/// Derives an IEEE-754 `binary64` exact power-of-two scalar `2^exp` (`exp in -1022..=1023`)
+/// purely via exponent bit shifting (`ref[repo.code.constant-eval-and-derivations]`).
+#[inline(always)]
+#[must_use]
+pub const fn const_f64_pow2(exp: i32) -> f64 {
+    let biased = IEEE754_F64_EXP_BIAS + exp;
+    f64::from_bits((biased as u64) << IEEE754_F64_MANTISSA_BITS)
+}
+
+/// Exact `binary64` `2^32` scale factor for converting `Hz` to `Q0.32` phase increments.
+pub const Q32_SCALE_F64: f64 = const_f64_pow2(32);
+
+/// Exact-integer truncation boundary `2^52` (`4_503_599_627_370_496.0`) in IEEE-754 `binary64`.
+pub const F64_INT_EXACT_THRESHOLD: f64 = const_f64_pow2(IEEE754_F64_MANTISSA_BITS as i32);
+
+/// IEEE-754 `binary64` sign bit mask (`1_u64 << 63`).
+pub const IEEE754_F64_SIGN_MASK: u64 = 1_u64 << 63;
+
+/// IEEE-754 `binary64` magnitude bitmask stripping the sign bit.
+pub const IEEE754_F64_ABS_MASK: u64 = !IEEE754_F64_SIGN_MASK;
+
+/// IEEE-754 `binary64` explicit 52-bit mantissa mask (`0x000F_FFFF_FFFF_FFFF`).
+pub const IEEE754_F64_MANTISSA_MASK: u64 = (1_u64 << IEEE754_F64_MANTISSA_BITS) - 1;
+
+/// IEEE-754 `binary64` implicit leading significand bit (`2^52`).
+pub const IEEE754_F64_IMPLICIT_BIT: u64 = 1_u64 << IEEE754_F64_MANTISSA_BITS;
+
 /// Branch-free compile-time `|x|` for `f64`.
-#[inline]
+#[inline(always)]
 #[must_use]
 pub const fn const_abs_f64(x: f64) -> f64 {
-    f64::from_bits(x.to_bits() & (u64::MAX >> 1))
+    f64::from_bits(x.to_bits() & IEEE754_F64_ABS_MASK)
+}
+
+/// Compile-time reciprocal factorial `1.0 / (n!)` in `binary64`.
+#[must_use]
+pub const fn const_inv_factorial_f64(n: u32) -> f64 {
+    let mut fact = 1.0_f64;
+    let mut k = 2_u32;
+    while k <= n {
+        fact *= k as f64;
+        k += 1;
+    }
+    1.0 / fact
+}
+
+/// Finite-guarded clamp in `[lo, hi]` returning `fallback` on `NaN` or `±Inf`.
+#[inline(always)]
+#[must_use]
+pub fn clamp_finite_f32(val: f32, lo: f32, hi: f32, fallback: f32) -> f32 {
+    if val.is_finite() {
+        val.clamp(lo, hi)
+    } else {
+        fallback
+    }
+}
+
+/// Replaces `NaN` or `±Inf` with `+0.0`, preserving finite values.
+#[inline(always)]
+#[must_use]
+pub fn sanitize_finite_f32(val: f32) -> f32 {
+    if val.is_finite() { val } else { 0.0 }
 }
 
 /// Compile-time `f64` square root via bit-seeded Newton–Raphson iteration (`< 1 ULP` for `x > 0`).
@@ -29,7 +86,7 @@ pub const fn const_sqrt_f64(x: f64) -> f64 {
     if x <= 0.0 || !x.is_finite() {
         return 0.0;
     }
-    let init_bits = (x.to_bits() >> 1) + (0x3FF0_0000_0000_0000_u64 >> 1);
+    let init_bits = (x.to_bits() >> 1) + (1.0_f64.to_bits() >> 1);
     let mut y = f64::from_bits(init_bits);
     let mut i = 0;
     while i < 8 {
@@ -189,6 +246,16 @@ const _: () = assert!(TANK_DC_BLOCKER_48K_F32.to_bits() == DC_BLOCKER_5HZ_48K_F3
 const _: () = assert!(TANK_MAX_V_CEIL_BITS_DERIVED == 0x3F7C_28F5);
 const _: () = assert!(TANK_MAX_G_LIN_BITS_DERIVED == 0x3F7F_BE76);
 const _: () = assert!(TANK_MAX_G_LIN_BITS_DERIVED == MAX_LOOP_GAIN_F32.to_bits());
+const _: () = assert!(const_abs_f32(-0.0).to_bits() == 0);
+const _: () = assert!(const_abs_f32(-2.5) == 2.5);
+const _: () = assert!(Q32_SCALE_F64 == 4_294_967_296.0);
+const _: () = assert!(F64_INT_EXACT_THRESHOLD == 4_503_599_627_370_496.0);
+const _: () = assert!(IEEE754_F64_SIGN_MASK == (1_u64 << 63));
+const _: () = assert!(IEEE754_F64_ABS_MASK == (u64::MAX >> 1));
+const _: () = assert!(IEEE754_F64_MANTISSA_MASK == 0x000F_FFFF_FFFF_FFFF);
+const _: () = assert!(IEEE754_F64_IMPLICIT_BIT == (1_u64 << 52));
+const _: () = assert!(const_f64_pow2(-20) * const_f64_pow2(20) == 1.0);
+const _: () = assert!(const_abs_f64(const_inv_factorial_f64(4) - 1.0 / 24.0) < 1.0e-15);
 const _: () = assert!(const_abs_f64(TANH_R4[0] - 61.0 / 600.0) < 1.0e-15);
 const _: () = assert!(const_abs_f64(TANH_R4[1] - 11.0 / 19_200.0) < 1.0e-15);
 const _: () = assert!(const_abs_f64(TANH_R4[2] - 87.0 / 200.0) < 1.0e-15);
@@ -234,6 +301,21 @@ mod tests {
         assert!((p_1 - 1.0).abs() < 1.0e-6);
         assert!(dp_1.abs() < 1.0e-5);
         assert!((p_half - core::f32::consts::FRAC_1_SQRT_2).abs() < 2.0e-3);
+        assert_eq!(const_abs_f32(black_box(-3.25)), 3.25);
+        assert_eq!(const_abs_f32(black_box(-0.0)).to_bits(), 0);
+        assert_eq!(const_f64_pow2(black_box(0)), 1.0);
+        assert_eq!(const_f64_pow2(black_box(-4)), 0.0625);
+        assert_eq!(const_f64_pow2(black_box(32)), Q32_SCALE_F64);
+        assert_eq!(F64_INT_EXACT_THRESHOLD, 4_503_599_627_370_496.0);
+        assert_eq!(IEEE754_F64_SIGN_MASK, 1_u64 << 63);
+        assert_eq!(IEEE754_F64_ABS_MASK, u64::MAX >> 1);
+        assert_eq!(IEEE754_F64_MANTISSA_MASK, 0x000F_FFFF_FFFF_FFFF);
+        assert_eq!(IEEE754_F64_IMPLICIT_BIT, 1_u64 << 52);
+        assert!((const_inv_factorial_f64(5) - (1.0 / 120.0)).abs() < 1.0e-15);
+        assert_eq!(clamp_finite_f32(f32::NAN, -1.0, 1.0, 0.25), 0.25);
+        assert_eq!(clamp_finite_f32(3.0, -1.0, 1.0, 0.25), 1.0);
+        assert_eq!(sanitize_finite_f32(f32::INFINITY), 0.0);
+        assert_eq!(sanitize_finite_f32(-1.5), -1.5);
         assert_eq!(const_abs_f64(black_box(-0.0)).to_bits(), 0);
         assert_eq!(const_sin_cos_f64(black_box(f64::NAN)), (0.0, 1.0));
         assert_eq!(const_max_f32_bits_le(black_box(0.5)), 0x3F00_0000);

@@ -9,12 +9,13 @@
 
 use crate::modal_and_transport::kautz::rotor_and_phasor::eval_q32_quadrature_f32;
 use crate::simd::{
-    GpuVec4, IEEE754_F32_RSQRT_SEED, KernelVec4, Q32_INV_2POW31_F32, Q32_INV_2POW32_F32,
-    TANK_MAX_G_LIN_F32, flush_subnormal_f32_bits, fp16_to_f32,
+    F32_INT_EXACT_THRESHOLD, GpuVec4, IEEE754_F32_RSQRT_SEED, KernelVec4, Q32_INV_2POW31_F32,
+    Q32_INV_2POW32_F32, TANK_MAX_G_LIN_F32, const_abs_f32, const_taylor_inv_fact_f32,
+    flush_subnormal_f32_bits, fp16_to_f32,
 };
 
 /// Exact compile-time reciprocal `1 / 6` for 4-point cubic Lagrange interpolation (`0 FDIV`).
-const INV_6: f32 = 1.0 / 6.0;
+const INV_6: f32 = const_taylor_inv_fact_f32(3, false);
 
 /// Exact compile-time reciprocal `1 / 3` for 3-phase barberpole windowing (`0 FDIV`).
 const INV_3: f32 = 1.0 / 3.0;
@@ -23,7 +24,7 @@ const INV_3: f32 = 1.0 / 3.0;
 const TWO_THIRDS: f32 = 2.0 / 3.0;
 
 /// Binary32 exact-integer threshold `2^23` (`8_388_608.0`).
-const INT_FLOOR_THRESHOLD_F32: f32 = 8_388_608.0;
+const INT_FLOOR_THRESHOLD_F32: f32 = F32_INT_EXACT_THRESHOLD;
 
 /// Minimum causal delay floor for standalone single-sample rings (`tau >= 4.0`).
 const MIN_CAUSAL_DELAY_SAMPLES: f32 = 4.0;
@@ -49,11 +50,6 @@ const _: () = assert!(TWO_THIRDS > 0.66 && TWO_THIRDS < 0.67);
 const _: () = assert!(MIN_CAUSAL_DELAY_SAMPLES == 4.0);
 
 #[inline(always)]
-const fn abs_f32(x: f32) -> f32 {
-    f32::from_bits(x.to_bits() & 0x7FFF_FFFF)
-}
-
-#[inline(always)]
 fn clamp_finite_unit(mu: f32) -> f32 {
     if mu.is_finite() {
         mu.clamp(0.0, 1.0)
@@ -67,7 +63,7 @@ fn floor_f32(x: f32) -> f32 {
     if !x.is_finite() {
         return 0.0;
     }
-    if abs_f32(x) >= INT_FLOOR_THRESHOLD_F32 {
+    if const_abs_f32(x) >= INT_FLOOR_THRESHOLD_F32 {
         return x;
     }
     let truncated = x as i32;
@@ -196,7 +192,7 @@ pub fn blend_catmull_rom_modulated_f32(
 #[must_use]
 pub fn compute_half_alpha_cubic_f32(g_loop_eff: f32) -> f32 {
     let mag = if g_loop_eff.is_finite() {
-        abs_f32(g_loop_eff).max(0.5)
+        const_abs_f32(g_loop_eff).max(0.5)
     } else {
         1.0
     };
@@ -307,12 +303,14 @@ pub fn eval_op_t_diagonal_window_vec4<V: KernelVec4>(phases_q32: [u32; 4], mu_wi
 #[must_use]
 pub fn compute_op_t_mu_win_f32(window_depth: f32, span_samples: f32, ramp_rate_hz: f32) -> f32 {
     let base = clamp_finite_unit(window_depth);
-    let abs_span =
-        if ramp_rate_hz.is_finite() && abs_f32(ramp_rate_hz) > 1.0e-6 && span_samples.is_finite() {
-            abs_f32(span_samples)
-        } else {
-            0.0
-        };
+    let abs_span = if ramp_rate_hz.is_finite()
+        && const_abs_f32(ramp_rate_hz) > 1.0e-6
+        && span_samples.is_finite()
+    {
+        const_abs_f32(span_samples)
+    } else {
+        0.0
+    };
     let click_guard =
         ((abs_span - BOUNDARY_CLICK_OFFSET_SAMPLES) * BOUNDARY_CLICK_SLOPE).clamp(0.0, 1.0);
     base.max(click_guard)
@@ -362,7 +360,7 @@ pub fn compute_op_t_pitch_down_g_loop_eff(
 #[must_use]
 pub fn hermite_hann_partition_of_unity_f32(phase: f32) -> [f32; 2] {
     let p = frac_unit_f32(phase);
-    let u = (1.0 - abs_f32(2.0 * p - 1.0)).clamp(0.0, 1.0);
+    let u = (1.0 - const_abs_f32(2.0 * p - 1.0)).clamp(0.0, 1.0);
     let w0 = u * u * (3.0 - 2.0 * u);
     [w0, 1.0 - w0]
 }

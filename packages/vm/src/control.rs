@@ -1,6 +1,7 @@
 //! Parametric `3 kHz` `ControlBus` (`#[forbid(unsafe_code)]`, `--no-default-features` `!alloc`-capable),
 //! conditional clamping, `CP1` projections, `9/18`-word exact-integer accumulators, `TSYN` tempo sync,
-//! and division-free micro-ramped `32`-slot modulation dispatch (`ref[dsp.ctrl.*]`, `ref[dsp.tempo.*]`).
+//! and division-free micro-ramped `32`-slot modulation dispatch (`ref[dsp.ctrl.op-m.ballistic-lfo]`,
+//! `ref[dsp.ctrl.dispatch.modulation-laws]`, `ref[dsp.tempo.subdivisions]`).
 
 pub mod bus;
 pub mod cp1;

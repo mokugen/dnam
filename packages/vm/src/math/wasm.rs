@@ -29,7 +29,9 @@ mod simd128_impl {
     use core::fmt;
 
     use crate::math::{
-        IEEE754_F32_EXP_BIAS, IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED, SimdVec4,
+        IEEE754_F32_ABS_MASK, IEEE754_F32_EXP_BIAS, IEEE754_F32_EXP_MASK, IEEE754_F32_IMPLICIT_BIT,
+        IEEE754_F32_MANTISSA_BITS, IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED,
+        IEEE754_F32_SIGN_MASK, SimdVec4,
     };
 
     /// WebAssembly `128-bit` `simd128` 4-lane `f32` vector register (`v128`).
@@ -104,19 +106,19 @@ mod simd128_impl {
 
         #[inline(always)]
         fn scrub_recursive_state(self) -> Self {
-            let abs_bits = v128_and(self.0, u32x4_splat(0x7FFF_FFFF));
-            let is_sub = u32x4_lt(abs_bits, u32x4_splat(0x0080_0000));
-            let signed_zero = v128_and(self.0, u32x4_splat(0x8000_0000));
+            let abs_bits = v128_and(self.0, u32x4_splat(IEEE754_F32_ABS_MASK));
+            let is_sub = u32x4_lt(abs_bits, u32x4_splat(IEEE754_F32_IMPLICIT_BIT));
+            let signed_zero = v128_and(self.0, u32x4_splat(IEEE754_F32_SIGN_MASK));
             let flushed = v128_bitselect(signed_zero, self.0, is_sub);
-            let non_finite = u32x4_ge(abs_bits, u32x4_splat(0x7F80_0000));
+            let non_finite = u32x4_ge(abs_bits, u32x4_splat(IEEE754_F32_EXP_MASK));
             Self(v128_andnot(flushed, non_finite))
         }
 
         #[inline(always)]
         fn flush_subnormal(self) -> Self {
-            let abs_bits = v128_and(self.0, u32x4_splat(0x7FFF_FFFF));
-            let is_sub = u32x4_lt(abs_bits, u32x4_splat(0x0080_0000));
-            let signed_zero = v128_and(self.0, u32x4_splat(0x8000_0000));
+            let abs_bits = v128_and(self.0, u32x4_splat(IEEE754_F32_ABS_MASK));
+            let is_sub = u32x4_lt(abs_bits, u32x4_splat(IEEE754_F32_IMPLICIT_BIT));
+            let signed_zero = v128_and(self.0, u32x4_splat(IEEE754_F32_SIGN_MASK));
             Self(v128_bitselect(signed_zero, self.0, is_sub))
         }
 
@@ -143,7 +145,7 @@ mod simd128_impl {
         fn pow2_from_biased_int_bits(self) -> Self {
             Self(i32x4_shl(
                 u32x4_add(self.0, u32x4_splat(IEEE754_F32_EXP_BIAS)),
-                23,
+                IEEE754_F32_MANTISSA_BITS,
             ))
         }
 

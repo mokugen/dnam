@@ -4,10 +4,10 @@
 pub mod backend;
 
 use core::arch::aarch64::{
-    float32x4_t, uint32x4_t, vabsq_f32, vaddq_f32, vaddq_u32, vaddvq_f32, vandq_u32, vbicq_u32,
-    vbslq_u32, vcgeq_u32, vcleq_f32, vcltq_u32, vdupq_laneq_f64, vdupq_n_f32, vdupq_n_u32,
-    veorq_u32, vfmaq_f32, vfmaq_laneq_f32, vfmsq_f32, vld1q_f32, vmaxq_f32, vminq_f32, vminvq_u32,
-    vmulq_f32, vmulq_laneq_f32, vnegq_f32, vreinterpretq_f32_f64, vreinterpretq_f32_u32,
+    float32x4_t, uint32x4_t, vabsq_f32, vaddq_f32, vaddq_u32, vandq_u32, vbicq_u32, vbslq_u32,
+    vcgeq_u32, vcleq_f32, vcltq_u32, vdupq_laneq_f64, vdupq_n_f32, vdupq_n_u32, veorq_u32,
+    vfmaq_f32, vfmaq_laneq_f32, vfmsq_f32, vld1q_f32, vmaxq_f32, vminq_f32, vminvq_u32, vmulq_f32,
+    vmulq_laneq_f32, vnegq_f32, vreinterpretq_f32_f64, vreinterpretq_f32_u32,
     vreinterpretq_f64_f32, vreinterpretq_u32_f32, vrev64q_f32, vshlq_n_u32, vshrq_n_u32, vst1q_f32,
     vsubq_f32, vsubq_u32,
 };
@@ -17,7 +17,11 @@ pub use backend::{
     NeonBackend, aarch64_crc32c_update, is_crc32_supported_cached, warm_crc32_support_cache,
 };
 
-use crate::math::{IEEE754_F32_EXP_BIAS, IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED, SimdVec4};
+use crate::math::{
+    IEEE754_F32_ABS_MASK, IEEE754_F32_EXP_BIAS, IEEE754_F32_EXP_MASK, IEEE754_F32_IMPLICIT_BIT,
+    IEEE754_F32_MANTISSA_BITS, IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED, IEEE754_F32_SIGN_MASK,
+    SimdVec4,
+};
 
 /// ARM64 128-bit NEON 4-lane `f32` vector register (`float32x4_t`).
 #[repr(transparent)]
@@ -42,7 +46,7 @@ impl fmt::Debug for NeonVec4 {
 fn sign_pair_flip_mask() -> uint32x4_t {
     // SAFETY: `vreinterpretq_u32_f32` and `vld1q_f32` load 4 aligned stack `u32` words as bits.
     unsafe {
-        let raw = [0x8000_0000_u32, 0, 0x8000_0000_u32, 0];
+        let raw = [IEEE754_F32_SIGN_MASK, 0, IEEE754_F32_SIGN_MASK, 0];
         core::arch::aarch64::vld1q_u32(raw.as_ptr())
     }
 }
@@ -170,9 +174,9 @@ impl SimdVec4 for NeonVec4 {
         // SAFETY: Bitwise IEEE-754 subnormal mask preserves sign bits and normal/NaN/Inf values.
         Self(unsafe {
             let bits = vreinterpretq_u32_f32(self.0);
-            let abs_bits = vandq_u32(bits, vdupq_n_u32(0x7FFF_FFFF));
-            let is_subnormal = vcltq_u32(abs_bits, vdupq_n_u32(0x0080_0000));
-            let signed_zero = vandq_u32(bits, vdupq_n_u32(0x8000_0000));
+            let abs_bits = vandq_u32(bits, vdupq_n_u32(IEEE754_F32_ABS_MASK));
+            let is_subnormal = vcltq_u32(abs_bits, vdupq_n_u32(IEEE754_F32_IMPLICIT_BIT));
+            let signed_zero = vandq_u32(bits, vdupq_n_u32(IEEE754_F32_SIGN_MASK));
             vreinterpretq_f32_u32(vbslq_u32(is_subnormal, signed_zero, bits))
         })
     }
@@ -182,11 +186,11 @@ impl SimdVec4 for NeonVec4 {
         // SAFETY: Clears non-finite (`exp == 0xFF`) lanes to `+0.0` and subnormals to signed zero.
         Self(unsafe {
             let bits = vreinterpretq_u32_f32(self.0);
-            let abs_bits = vandq_u32(bits, vdupq_n_u32(0x7FFF_FFFF));
-            let is_subnormal = vcltq_u32(abs_bits, vdupq_n_u32(0x0080_0000));
-            let signed_zero = vandq_u32(bits, vdupq_n_u32(0x8000_0000));
+            let abs_bits = vandq_u32(bits, vdupq_n_u32(IEEE754_F32_ABS_MASK));
+            let is_subnormal = vcltq_u32(abs_bits, vdupq_n_u32(IEEE754_F32_IMPLICIT_BIT));
+            let signed_zero = vandq_u32(bits, vdupq_n_u32(IEEE754_F32_SIGN_MASK));
             let flushed = vbslq_u32(is_subnormal, signed_zero, bits);
-            let non_finite = vcgeq_u32(abs_bits, vdupq_n_u32(0x7F80_0000));
+            let non_finite = vcgeq_u32(abs_bits, vdupq_n_u32(IEEE754_F32_EXP_MASK));
             vreinterpretq_f32_u32(vbicq_u32(flushed, non_finite))
         })
     }
@@ -240,10 +244,12 @@ impl SimdVec4 for NeonVec4 {
     fn pow2_from_biased_int_bits(self) -> Self {
         // SAFETY: Baseline AArch64 NEON integer exponent reconstruction.
         Self(unsafe {
-            vreinterpretq_f32_u32(vshlq_n_u32::<23>(vaddq_u32(
-                vreinterpretq_u32_f32(self.0),
-                vdupq_n_u32(IEEE754_F32_EXP_BIAS),
-            )))
+            vreinterpretq_f32_u32(vshlq_n_u32::<{ IEEE754_F32_MANTISSA_BITS as i32 }>(
+                vaddq_u32(
+                    vreinterpretq_u32_f32(self.0),
+                    vdupq_n_u32(IEEE754_F32_EXP_BIAS),
+                ),
+            ))
         })
     }
 
@@ -362,10 +368,7 @@ impl dnam_kernels::KernelVec4 for NeonVec4 {
 
     #[inline(always)]
     fn horizontal_sum(self) -> f32 {
-        let sum = <Self as SimdVec4>::horizontal_sum(self);
-        // Keep clippy/compiler quiet if vaddvq_f32 isn't directly invoked elsewhere.
-        let _ = vaddvq_f32;
-        sum
+        <Self as SimdVec4>::horizontal_sum(self)
     }
 
     #[inline(always)]

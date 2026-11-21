@@ -5,19 +5,12 @@
 //!
 //! Strictly 32-bit, `#![no_std]`, zero `FDIV`/`FSQRT`, zero 64-bit types, and zero `libm` calls.
 
-use super::const_eval::const_max_f32_bits_le_ratio;
+pub use super::const_eval::const_f32_pow2;
+use super::const_eval::{const_abs_f32, const_max_f32_bits_le_ratio};
 use super::{
-    BIASED_INT_MAGIC_F32, EXP2_C2, EXP2_C3, EXP2_C4, EXP2_C5, IEEE754_F32_EXP_BIAS, KernelVec4,
+    BIASED_INT_MAGIC_F32, EXP2_C2, EXP2_C3, EXP2_C4, EXP2_C5, IEEE754_F32_EXP_BIAS,
+    IEEE754_F32_MANTISSA_BITS, KernelVec4,
 };
-
-/// Derives an IEEE-754 `binary32` exact power-of-two scalar `2^exp` (`exp in -126..=127`)
-/// purely via exponent bit shifting (`ref[repo.code.constant-eval-and-derivations]`).
-#[inline(always)]
-#[must_use]
-pub const fn const_f32_pow2(exp: i32) -> f32 {
-    let biased = (IEEE754_F32_EXP_BIAS as i32) + exp;
-    f32::from_bits((biased as u32) << 23)
-}
 
 /// Bit pattern of `TANK_MAX_G_LIN_F32` (`<= 0.9990`, `0x3F7F_BE76`).
 pub const TANK_MAX_G_LIN_BITS: u32 = const_max_f32_bits_le_ratio(999, 1_000);
@@ -46,11 +39,6 @@ pub const HERMITE5_SIN_C3_F32: f32 = core::f32::consts::PI - 2.5;
 /// Degree-5 Hermite quarter-sine coefficient `c5 = pi / 2 - 1.5`.
 pub const HERMITE5_SIN_C5_F32: f32 = core::f32::consts::FRAC_PI_2 - 1.5;
 
-#[inline(always)]
-const fn const_abs_f32(x: f32) -> f32 {
-    f32::from_bits(x.to_bits() & 0x7FFF_FFFF)
-}
-
 const _: () = assert!(TANK_MAX_G_LIN_BITS == 0x3F7F_BE76);
 const _: () = assert!(TANK_MAX_G_LIN_F32 <= 0.9990);
 const _: () = assert!(TANK_MAX_V_CEIL_BITS == 0x3F7C_28F5);
@@ -70,7 +58,9 @@ pub(super) fn eval_exp2_clamped_scalar_f32(x: f32, lo: f32, hi: f32) -> f32 {
     let k_biased = xc + BIASED_INT_MAGIC_F32;
     let k = k_biased - BIASED_INT_MAGIC_F32;
     let f = xc - k;
-    let pow2_k = f32::from_bits(k_biased.to_bits().wrapping_add(IEEE754_F32_EXP_BIAS) << 23);
+    let pow2_k = f32::from_bits(
+        k_biased.to_bits().wrapping_add(IEEE754_F32_EXP_BIAS) << IEEE754_F32_MANTISSA_BITS,
+    );
     let poly = EXP2_C4 + EXP2_C5 * f;
     let poly = EXP2_C3 + poly * f;
     let poly = EXP2_C2 + poly * f;

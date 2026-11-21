@@ -2,12 +2,14 @@
 //! zero-mutation `REQ-5.6` stripping, `!alloc` vs `alloc` `ControlBus`, `"CP1\0"`, `"CEXT"`, `"TSYN"`,
 //! `SO(4)` `Q_buyer` gauge invariance, and `0-ULP` `StarCenter` equivalence.
 
+#![forbid(unsafe_code)]
+
 use std::hint::black_box;
 use std::time::Instant;
 
-use dnam_vm::control::bus::laws::{
-    eval_crossbar_wet_scale, eval_svf_g_modulated, update_op_t_we_hold_schmitt,
-};
+use dnam_kernels::{QUAD_FLAG_WE_HOLD_ACTIVE, update_we_schmitt_flag};
+use dnam_vm::control::bus::laws::{eval_crossbar_wet_scale, eval_op_t_we_eff, eval_svf_g_oct};
+use dnam_vm::math::exp2_signed_oct_f32;
 use dnam_vm::{
     Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, CextDispatchWire, ControlBus,
     ControlBusBacking, ControlClampDescriptor, Cp1ContributorSlot, Cp1StreamDirEntryWire,
@@ -421,10 +423,20 @@ fn test_starcenter_0ulp_sweeps_no_alloc_parity_and_so4_qbuyer_invariance() {
         (bus_alloc.current_stage_params[0] - prev_slot0).abs()
             < (bus_alloc.stage_targets[0] - prev_slot0).abs()
     );
-    let we_hold = update_op_t_we_hold_schmitt(bus_alloc.current_stage_params[16], false);
+    let we_hold = (update_we_schmitt_flag(0, eval_op_t_we_eff(bus_alloc.current_stage_params[16]))
+        & QUAD_FLAG_WE_HOLD_ACTIVE)
+        != 0;
     assert!(we_hold);
-    assert!(update_op_t_we_hold_schmitt(-0.50, true));
-    assert!(!update_op_t_we_hold_schmitt(-0.40, true));
+    assert_eq!(
+        update_we_schmitt_flag(QUAD_FLAG_WE_HOLD_ACTIVE, eval_op_t_we_eff(-0.50))
+            & QUAD_FLAG_WE_HOLD_ACTIVE,
+        QUAD_FLAG_WE_HOLD_ACTIVE
+    );
+    assert_eq!(
+        update_we_schmitt_flag(QUAD_FLAG_WE_HOLD_ACTIVE, eval_op_t_we_eff(-0.40))
+            & QUAD_FLAG_WE_HOLD_ACTIVE,
+        0
+    );
     assert_eq!(
         eval_crossbar_wet_scale(bus_alloc.current_stage_params[15]),
         1.0 + bus_alloc.current_stage_params[15]
@@ -470,16 +482,11 @@ fn test_starcenter_0ulp_sweeps_no_alloc_parity_and_so4_qbuyer_invariance() {
             bus_rot.z_stage()[i].to_bits()
         );
     }
-    let w_svf = [U16::new(dnam_vm::math::f32_to_fp16(0.25)); 8];
-    let (_, g_orig) = eval_svf_g_modulated(
-        0.5,
-        bus_orig.stage_targets[0],
-        &w_svf,
-        &bus_orig.z_stage(),
-        8,
-    );
-    let (_, g_rot) =
-        eval_svf_g_modulated(0.5, bus_rot.stage_targets[0], &w_svf, &bus_rot.z_stage(), 8);
+    let w_svf = [dnam_vm::math::f32_to_fp16(0.25); 8];
+    let oct_orig = eval_svf_g_oct(bus_orig.stage_targets[0], &w_svf, &bus_orig.z_stage(), 8);
+    let oct_rot = eval_svf_g_oct(bus_rot.stage_targets[0], &w_svf, &bus_rot.z_stage(), 8);
+    let g_orig = 0.5 * exp2_signed_oct_f32(oct_orig);
+    let g_rot = 0.5 * exp2_signed_oct_f32(oct_rot);
     assert!((g_orig - g_rot).abs() < 1.0e-5);
 }
 
