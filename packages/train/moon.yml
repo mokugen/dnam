@@ -1,0 +1,177 @@
+$schema: "https://moonrepo.dev/schemas/project.json"
+
+id: "train"
+language: "rust"
+layer: "library"
+stack: "systems"
+tags:
+  - "rust"
+  - "training"
+  - "simd"
+  - "webgpu"
+
+project:
+  name: "dnam-train"
+  description: "SONA v3.0 f64 SIMD, Wide192Accum, and CPU/wgpu compute training runners"
+
+dependsOn:
+  - "kernels"
+  - "vm"
+
+tasks:
+  format:
+    type: "run"
+    command: "cargo"
+    args:
+      - "fmt"
+      - "--package"
+      - "dnam-train"
+    options:
+      cache: false
+      runInCI: false
+    tags:
+      - "format"
+
+  format-check:
+    command: "cargo"
+    args:
+      - "fmt"
+      - "--package"
+      - "dnam-train"
+      - "--"
+      - "--check"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+    tags:
+      - "quality"
+      - "format"
+
+  lint:
+    command: "cargo"
+    args:
+      - "clippy"
+      - "--package"
+      - "dnam-train"
+      - "--all-targets"
+      - "--"
+      - "-D"
+      - "warnings"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
+      - "/tools/sona-shaders/wgsl/**/*"
+    options:
+      mutex: "cargo"
+    tags:
+      - "quality"
+      - "lint"
+
+  typecheck:
+    command: "cargo"
+    args:
+      - "check"
+      - "--package"
+      - "dnam-train"
+      - "--all-targets"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
+      - "/tools/sona-shaders/wgsl/**/*"
+    options:
+      mutex: "cargo"
+    tags:
+      - "quality"
+      - "typecheck"
+
+  build:
+    type: "build"
+    command: "cargo"
+    args:
+      - "build"
+      - "--package"
+      - "dnam-train"
+      - "--release"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
+      - "/tools/sona-shaders/wgsl/**/*"
+    options:
+      mutex: "cargo"
+    tags:
+      - "build"
+
+  test:
+    command: "cargo"
+    args:
+      - "test"
+      - "--package"
+      - "dnam-train"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
+      - "/tools/sona-shaders/wgsl/**/*"
+    options:
+      mutex: "cargo"
+    tags:
+      - "test"
+
+  coverage:
+    type: "run"
+    command: "pnpm"
+    args:
+      - "run"
+      - "rust-coverage"
+      - "--"
+      - "--package"
+      - "dnam-train"
+      - "--sources"
+      - "packages/train/src"
+    inputs:
+      - "Cargo.toml"
+      - "src/**/*"
+      - "tests/**/*"
+      - "/Cargo.toml"
+      - "/Cargo.lock"
+      - "/package.json"
+      - "/scripts/rust-coverage.mjs"
+      - "/packages/kernels/Cargo.toml"
+      - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
+      - "/tools/sona-shaders/wgsl/**/*"
+    options:
+      mutex: "cargo"
+      runFromWorkspaceRoot: true
+      runInCI: "skip"
+    tags:
+      - "coverage"

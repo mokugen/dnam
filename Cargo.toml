@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
-members = ["packages/kernels", "packages/vm", "packages/engine", "packages/capture", "packages/fixtures", "packages/js", "packages/studio"]
-default-members = ["packages/kernels", "packages/vm", "packages/engine", "packages/capture", "packages/fixtures", "packages/studio"]
+members = ["packages/kernels", "packages/vm", "packages/engine", "packages/train", "packages/capture", "packages/fixtures", "packages/js", "packages/studio"]
+default-members = ["packages/kernels", "packages/vm", "packages/engine", "packages/train", "packages/capture", "packages/fixtures", "packages/studio"]
 exclude = ["tools/sona-shaders"]
 
 [workspace.package]
@@ -17,6 +17,8 @@ dnam-vm = { path = "packages/vm", default-features = false }
 dnam-engine = { path = "packages/engine", default-features = true }
 dnam-capture = { path = "packages/capture", default-features = false }
 dnam-fixtures = { path = "packages/fixtures" }
+wgpu = "30.0.2"
+pollster = "0.4"
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
 cpal = "0.18"
@@ -80,6 +82,9 @@ opt-level = 3
 [profile.dev.package.dnam-engine]
 opt-level = 3
 
+[profile.dev.package.dnam-train]
+opt-level = 3
+
 [profile.dev.package.dnam-fixtures]
 opt-level = 3
 
@@ -98,6 +103,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.test.package.dnam-engine]
+opt-level = 3
+
+[profile.test.package.dnam-train]
 opt-level = 3
 
 [profile.test.package.dnam-fixtures]
@@ -121,6 +129,9 @@ opt-level = 3
 opt-level = 3
 
 [profile.cov.package.dnam-engine]
+opt-level = 3
+
+[profile.cov.package.dnam-train]
 opt-level = 3
 
 [profile.cov.package.dnam-fixtures]

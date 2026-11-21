@@ -1,0 +1,31 @@
+[package]
+name = "dnam-train"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+autobins = false
+description = "SONA v3.0 f64 SIMD TrainerMathBackend, Wide192Accum, 2-D VRAM planner, and deterministic CPU/wgpu training compute runners"
+
+[lib]
+name = "dnam_train"
+path = "src/lib.rs"
+
+[features]
+default = ["gpu-wgpu"]
+gpu-wgpu = ["dep:wgpu", "dep:pollster"]
+
+[dependencies]
+dnam-kernels.workspace = true
+dnam-vm = { workspace = true, features = ["std"] }
+zerocopy = { workspace = true, features = ["std"] }
+sha2.workspace = true
+wgpu = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

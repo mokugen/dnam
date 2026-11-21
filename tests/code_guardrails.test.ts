@@ -158,11 +158,43 @@ function collectEngineUnsafeViolations(
   }
 }
 
+function collectTrainUnsafeViolations(
+  unsafeOverrideRe: RegExp,
+  unsafeConstructRe: RegExp,
+  unsafeViolations: string[],
+): void {
+  for (const rsFile of walkFilesByExtensions(path.join(PACKAGES_DIR, "train"), new Set([".rs"]))) {
+    const rel = relPath(rsFile).split(path.sep).join("/");
+    const stripped = stripRustCommentsAndStrings(fs.readFileSync(rsFile, "utf8"));
+    const isAllowedUnsafeMod =
+      rel.startsWith("packages/train/src/math/aarch64/") ||
+      rel === "packages/train/src/math/aarch64.rs" ||
+      rel.startsWith("packages/train/src/math/x86/") ||
+      rel === "packages/train/src/math/x86.rs";
+    const isAllowedAllowAttr = isAllowedUnsafeMod || rel === "packages/train/src/math.rs";
+    if (!isAllowedUnsafeMod && unsafeConstructRe.test(stripped)) {
+      unsafeViolations.push(`${rel}: contains forbidden unsafe block or item`);
+    }
+    if (!isAllowedAllowAttr && unsafeOverrideRe.test(stripped)) {
+      unsafeViolations.push(`${rel}: contains forbidden unsafe_code override`);
+    }
+    if (rel === "packages/train/src/math.rs") {
+      const allowCount = (stripped.match(/\ballow\s*\(\s*unsafe_code\s*\)/g) ?? []).length;
+      if (allowCount > 2) {
+        unsafeViolations.push(
+          `${rel}: extra #[allow(unsafe_code)] outside aarch64/x86 module gates`,
+        );
+      }
+    }
+  }
+}
+
 function checkRustUnsafeIsolation(): void {
   const forbidOrDenyRe = /#\s*!\s*\[\s*(?:forbid|deny)\s*\(\s*unsafe_code\s*\)\s*\]/;
   for (const rustLibRel of [
     "packages/vm/src/lib.rs",
     "packages/engine/src/lib.rs",
+    "packages/train/src/lib.rs",
     "packages/js/rust/lib.rs",
   ]) {
     const libPath = path.join(REPO_ROOT, rustLibRel);
@@ -173,7 +205,7 @@ function checkRustUnsafeIsolation(): void {
   }
 
   const strictForbidSet = new Set<string>(STRICT_FORBID_ROOTS);
-  for (const safePkg of ["kernels", "fixtures", "capture", "studio"]) {
+  for (const safePkg of ["kernels", "fixtures", "capture", "studio", "train"]) {
     for (const subDir of ["src/bin", "rust/bin", "tests", "benches", "examples"]) {
       for (const p of walkFilesByExtensions(
         path.join(PACKAGES_DIR, safePkg, subDir),
@@ -221,6 +253,7 @@ function checkRustUnsafeIsolation(): void {
   collectJsUnsafeViolations(unsafeOverrideRe, unsafeConstructRe, unsafeBlockRe, unsafeViolations);
   collectVmUnsafeViolations(unsafeOverrideRe, unsafeConstructRe, unsafeViolations);
   collectEngineUnsafeViolations(unsafeOverrideRe, unsafeConstructRe, unsafeViolations);
+  collectTrainUnsafeViolations(unsafeOverrideRe, unsafeConstructRe, unsafeViolations);
   expect(unsafeViolations).toEqual([]);
 }
 
@@ -230,6 +263,7 @@ function checkPackageLineCeilings(): void {
     { dir: path.join(PACKAGES_DIR, "kernels"), exts: new Set([".rs"]) },
     { dir: path.join(PACKAGES_DIR, "vm"), exts: new Set([".rs"]) },
     { dir: path.join(PACKAGES_DIR, "engine"), exts: new Set([".rs"]) },
+    { dir: path.join(PACKAGES_DIR, "train"), exts: new Set([".rs"]) },
     { dir: path.join(PACKAGES_DIR, "fixtures"), exts: new Set([".rs"]) },
     { dir: path.join(PACKAGES_DIR, "capture"), exts: new Set([".rs"]) },
     { dir: path.join(PACKAGES_DIR, "ui"), exts: new Set([".ts", ".tsx"]) },
@@ -538,16 +572,21 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
     const engineSrcDir = path.join(PACKAGES_DIR, "engine", "src");
     const vmSrcDir = path.join(PACKAGES_DIR, "vm", "src");
     const kernelsSrcDir = path.join(PACKAGES_DIR, "kernels", "src");
+    const trainSrcDir = path.join(PACKAGES_DIR, "train", "src");
     const violations: string[] = [];
 
-    for (const srcDir of [engineSrcDir, vmSrcDir, kernelsSrcDir]) {
+    for (const srcDir of [engineSrcDir, vmSrcDir, kernelsSrcDir, trainSrcDir]) {
       for (const rsPath of walkFilesByExtensions(srcDir, new Set([".rs"]))) {
         if (fs.readFileSync(rsPath, "utf8").includes("coverage(off)")) {
           violations.push(`${relPath(rsPath)}: contains forbidden coverage(off)`);
         }
       }
     }
-    for (const simdDir of [path.join(vmSrcDir, "math"), path.join(kernelsSrcDir, "simd")]) {
+    for (const simdDir of [
+      path.join(vmSrcDir, "math"),
+      path.join(kernelsSrcDir, "simd"),
+      path.join(trainSrcDir, "math"),
+    ]) {
       for (const rsPath of walkFilesByExtensions(simdDir, new Set([".rs"]))) {
         if (fs.readFileSync(rsPath, "utf8").includes("macro_rules!")) {
           violations.push(`${relPath(rsPath)}: contains forbidden macro_rules! in SIMD modules`);
@@ -565,6 +604,7 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
       path.join(PACKAGES_DIR, "vm", "src", "bin"),
       path.join(PACKAGES_DIR, "vm", "src", "control"),
       path.join(PACKAGES_DIR, "engine", "src"),
+      path.join(PACKAGES_DIR, "train", "src"),
       path.join(PACKAGES_DIR, "studio", "rust"),
       path.join(TOOLS_DIR, "sona-shaders", "src"),
     ]) {
@@ -638,6 +678,9 @@ describe("DNAM Code Quality, Real-Time & Modular Decomposition Guardrails", () =
       path.join(PACKAGES_DIR, "engine", "src", "host"),
       path.join(PACKAGES_DIR, "engine", "src", "engine"),
       path.join(PACKAGES_DIR, "engine", "tests"),
+      path.join(PACKAGES_DIR, "train", "src", "math"),
+      path.join(PACKAGES_DIR, "train", "src", "cpu"),
+      path.join(PACKAGES_DIR, "train", "tests"),
       path.join(PACKAGES_DIR, "capture"),
       path.join(PACKAGES_DIR, "fixtures"),
       path.join(TOOLS_DIR, "sona-shaders", "tests"),

@@ -60,6 +60,7 @@ function checkFixturesManifestStrictness(): void {
   for (const bad of [
     "dnam-engine",
     "dnam-capture",
+    "dnam-train",
     "dnam-trainer",
     "dnam-studio",
     "dnam-js",
@@ -182,6 +183,44 @@ function checkCargoAndMoonBoundaries(): void {
     /^dependsOn:\s*(?:\[\s*"kernels"\s*,\s*"vm"\s*\]|\[\s*"vm"\s*,\s*"kernels"\s*\]|\n\s*-\s*"?kernels"?\s*\n\s*-\s*"?vm"?\s*)$/m,
   );
   expect(engineMoon).not.toMatch(/\b(?:fixtures|capture|train(?:er)?)\b/);
+
+  const trainCargo = fs.readFileSync(path.join(PACKAGES_DIR, "train", "Cargo.toml"), "utf8");
+  const trainDepsSec = parseTomlSections(trainCargo).find((s) => s.header === "dependencies");
+  const trainDepKeys = (trainDepsSec?.body ?? "")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("#"))
+    .map((line) => line.split(/[=.]/)[0]?.trim() ?? "")
+    .sort();
+  expect(
+    trainDepKeys,
+    "dnam-train must depend strictly on dnam-kernels, dnam-vm, pollster, sha2, wgpu, and zerocopy",
+  ).toEqual(["dnam-kernels", "dnam-vm", "pollster", "sha2", "wgpu", "zerocopy"]);
+  for (const forbiddenTrainDep of [
+    "dnam-engine",
+    "dnam-capture",
+    "dnam-fixtures",
+    "sona-shaders",
+    "serde",
+    "serde_json",
+    "ndarray",
+    "nalgebra",
+    "rustfft",
+    "realfft",
+    "clap",
+    "cpal",
+  ]) {
+    expect(
+      trainCargo,
+      `dnam-train Cargo.toml must not reference ${forbiddenTrainDep}`,
+    ).not.toContain(forbiddenTrainDep);
+  }
+  const trainMoon = fs.readFileSync(path.join(PACKAGES_DIR, "train", "moon.yml"), "utf8");
+  expect(trainMoon).toMatch(
+    /^dependsOn:\s*(?:\[\s*"kernels"\s*,\s*"vm"\s*\]|\[\s*"vm"\s*,\s*"kernels"\s*\]|\n\s*-\s*"?kernels"?\s*\n\s*-\s*"?vm"?\s*)$/m,
+  );
+  expect(trainMoon).not.toMatch(/\b(?:engine|capture|fixtures)\b/);
+  expect(trainMoon.replaceAll("/tools/sona-shaders/wgsl/**/*", "")).not.toMatch(/\bsona-shaders\b/);
 
   const captureCargo = fs.readFileSync(path.join(PACKAGES_DIR, "capture", "Cargo.toml"), "utf8");
   let foundFixturesDev = false;
@@ -344,7 +383,7 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
     for (const cargoPath of [
       path.join(REPO_ROOT, "Cargo.toml"),
       path.join(REPO_ROOT, "Cargo.lock"),
-      ...["kernels", "vm", "engine", "fixtures", "capture", "studio", "js"].map((pkg) =>
+      ...["kernels", "vm", "engine", "train", "fixtures", "capture", "studio", "js"].map((pkg) =>
         path.join(PACKAGES_DIR, pkg, "Cargo.toml"),
       ),
     ]) {
@@ -352,7 +391,7 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
       expect(text, `${relPath(cargoPath)} must not depend on ndarray`).not.toContain("ndarray");
       expect(text, `${relPath(cargoPath)} must not depend on dialoguer`).not.toContain("dialoguer");
     }
-    for (const pkg of ["kernels", "vm", "engine", "capture", "studio", "js"]) {
+    for (const pkg of ["kernels", "vm", "engine", "train", "capture", "studio", "js"]) {
       const text = fs.readFileSync(path.join(PACKAGES_DIR, pkg, "Cargo.toml"), "utf8");
       expect(text).not.toContain("realfft");
       expect(text).not.toContain("rustfft");
@@ -363,7 +402,7 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
     }
 
     const forbiddenFixturesRe =
-      /\b(?:Tier|DistillationTarget|internal_nodes|DnwbHeader64B|DNWB|dnam_engine|dnam_capture|dnam_trainer)\b/;
+      /\b(?:Tier|DistillationTarget|internal_nodes|DnwbHeader64B|DNWB|dnam_engine|dnam_capture|dnam_train|dnam_trainer)\b/;
     const fixturesLeaks: string[] = [];
     for (const rsFile of walkFilesByExtensions(
       path.join(PACKAGES_DIR, "fixtures"),
