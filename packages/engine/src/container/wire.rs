@@ -1,6 +1,6 @@
 //! Canonical v3.0 (`"sona"`) `.dnam` (`b"DNAM"`) Hybrid Binary Container Wire Framing,
 //! RFC 8785 JCS Header Projection, `DMU1`/`DMUE` Mutable Suffix, `CP1` Control Projections,
-//! Structured Conditional Selectors, and Delay History Declarations.
+//! `ModalConvolver` Slices, Structured Conditional Selectors, and Delay History Declarations.
 //!
 //! Implements:
 //! - `ref[container.dnam.formats]`, `ref[container.dnam.wire-framing]`,
@@ -24,6 +24,5 @@ pub use layout::*;
 pub(crate) use layout::{
     ContainerWireError, parse_dcrc_record_rt, validate_v3_dnam_layout_no_alloc_rt,
 };
-pub(crate) use slices_and_cp1::decode_cp1_shared_stream_into_slice_rt;
 pub use slices_and_cp1::*;
 pub use structs::*;

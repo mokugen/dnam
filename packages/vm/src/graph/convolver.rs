@@ -394,6 +394,8 @@ mod tests {
     use super::*;
     use crate::math::{DefaultMathBackend, ScalarBackend};
 
+    /// verify[dsp.cabinet.fir-kautz-bank]
+    /// verify[dsp.zoh.cabinet-fir-onset]
     #[test]
     fn test_convolver_48k_zero_ulp_chunk_parity_across_all_tiers_and_onset_16() {
         let mut wl = [0.0_f32; CONVOLVER_MAX_FIR_TAPS];

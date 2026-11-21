@@ -59,6 +59,66 @@ fn eval_symmetric_taps(hist: &[[f32; 2]], taps: &[f32]) -> [f32; 2] {
     acc
 }
 
+/// Zero-allocation 2-stage `4x -> 1x` linear-phase polyphase stereo decimator (`Bounce4xDecimator`).
+///
+/// Mirrors the decimation half of [`Bounce4xOversampler`] (`HB_4X_TAPS` + `stage2_align_z1` +
+/// `HB_2X_TAPS`) for exact phase and `12`-host-sample `PDC` parity across parallel audio/partition taps.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Bounce4xDecimator {
+    dn2_even_hist: [[f32; 2]; 6],
+    dn2_odd_delay: [[f32; 2]; 4],
+    stage2_align_z1: [f32; 2],
+    dn1_even_hist: [[f32; 2]; 10],
+    dn1_odd_delay: [[f32; 2]; 6],
+}
+
+impl Bounce4xDecimator {
+    /// Creates a zeroed [`Bounce4xDecimator`] at resting `+0.0` equilibrium.
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            dn2_even_hist: [[0.0; 2]; 6],
+            dn2_odd_delay: [[0.0; 2]; 4],
+            stage2_align_z1: [0.0; 2],
+            dn1_even_hist: [[0.0; 2]; 10],
+            dn1_odd_delay: [[0.0; 2]; 6],
+        }
+    }
+
+    /// Resets all decimation FIR delay lines to `+0.0`.
+    #[inline]
+    pub fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    /// Decimates four chronological `4x` stereo frames `w4x` back into one `1x` stereo frame.
+    #[inline(always)]
+    pub fn downsample_4x(&mut self, w4x: [[f32; 2]; 4]) -> [f32; 2] {
+        let mut v2x = [[0.0_f32; 2]; 2];
+        for (m, slot) in v2x.iter_mut().enumerate() {
+            push_shift_stereo(&mut self.dn2_even_hist, w4x[m * 2]);
+            push_shift_stereo(&mut self.dn2_odd_delay, w4x[m * 2 + 1]);
+            let filt2 = eval_symmetric_taps(&self.dn2_even_hist, &HB_4X_TAPS);
+            let odd2 = self.dn2_odd_delay[3];
+            let raw2 = [
+                flush_recursive_state_f32(0.5 * (filt2[0] + odd2[0])),
+                flush_recursive_state_f32(0.5 * (filt2[1] + odd2[1])),
+            ];
+            *slot = self.stage2_align_z1;
+            self.stage2_align_z1 = raw2;
+        }
+
+        push_shift_stereo(&mut self.dn1_even_hist, v2x[0]);
+        push_shift_stereo(&mut self.dn1_odd_delay, v2x[1]);
+        let filt1 = eval_symmetric_taps(&self.dn1_even_hist, &HB_2X_TAPS);
+        let odd1 = self.dn1_odd_delay[5];
+        [
+            flush_recursive_state_f32(0.5 * (filt1[0] + odd1[0])),
+            flush_recursive_state_f32(0.5 * (filt1[1] + odd1[1])),
+        ]
+    }
+}
+
 /// Zero-allocation 2-stage `4x` linear-phase polyphase stereo oversampler (`1x -> 4x` & `4x -> 1x`).
 ///
 /// Cascades the 19-tap `1x <-> 2x` (`K_1 = 5`) and 11-tap `2x <-> 4x` (`K_2 = 3`) symmetric
@@ -68,11 +128,7 @@ fn eval_symmetric_taps(hist: &[[f32; 2]], taps: &[f32]) -> [f32; 2] {
 pub struct Bounce4xOversampler {
     up1_hist: [[f32; 2]; 10],
     up2_hist: [[f32; 2]; 6],
-    dn2_even_hist: [[f32; 2]; 6],
-    dn2_odd_delay: [[f32; 2]; 4],
-    stage2_align_z1: [f32; 2],
-    dn1_even_hist: [[f32; 2]; 10],
-    dn1_odd_delay: [[f32; 2]; 6],
+    decim: Bounce4xDecimator,
 }
 
 impl Bounce4xOversampler {
@@ -82,18 +138,16 @@ impl Bounce4xOversampler {
         Self {
             up1_hist: [[0.0; 2]; 10],
             up2_hist: [[0.0; 2]; 6],
-            dn2_even_hist: [[0.0; 2]; 6],
-            dn2_odd_delay: [[0.0; 2]; 4],
-            stage2_align_z1: [0.0; 2],
-            dn1_even_hist: [[0.0; 2]; 10],
-            dn1_odd_delay: [[0.0; 2]; 6],
+            decim: Bounce4xDecimator::new(),
         }
     }
 
     /// Resets all FIR delay lines to `+0.0`.
     #[inline]
     pub fn reset(&mut self) {
-        *self = Self::new();
+        self.up1_hist = [[0.0; 2]; 10];
+        self.up2_hist = [[0.0; 2]; 6];
+        self.decim.reset();
     }
 
     /// Returns the exact host-sample linear-phase PDC (`12`).
@@ -124,28 +178,7 @@ impl Bounce4xOversampler {
     /// Decimates four chronological `4x` stereo frames `w4x` back into one `1x` stereo frame.
     #[inline(always)]
     pub fn downsample_4x(&mut self, w4x: [[f32; 2]; 4]) -> [f32; 2] {
-        let mut v2x = [[0.0_f32; 2]; 2];
-        for (m, slot) in v2x.iter_mut().enumerate() {
-            push_shift_stereo(&mut self.dn2_even_hist, w4x[m * 2]);
-            push_shift_stereo(&mut self.dn2_odd_delay, w4x[m * 2 + 1]);
-            let filt2 = eval_symmetric_taps(&self.dn2_even_hist, &HB_4X_TAPS);
-            let odd2 = self.dn2_odd_delay[3];
-            let raw2 = [
-                flush_recursive_state_f32(0.5 * (filt2[0] + odd2[0])),
-                flush_recursive_state_f32(0.5 * (filt2[1] + odd2[1])),
-            ];
-            *slot = self.stage2_align_z1;
-            self.stage2_align_z1 = raw2;
-        }
-
-        push_shift_stereo(&mut self.dn1_even_hist, v2x[0]);
-        push_shift_stereo(&mut self.dn1_odd_delay, v2x[1]);
-        let filt1 = eval_symmetric_taps(&self.dn1_even_hist, &HB_2X_TAPS);
-        let odd1 = self.dn1_odd_delay[5];
-        [
-            flush_recursive_state_f32(0.5 * (filt1[0] + odd1[0])),
-            flush_recursive_state_f32(0.5 * (filt1[1] + odd1[1])),
-        ]
+        self.decim.downsample_4x(w4x)
     }
 }
 
@@ -200,6 +233,36 @@ mod tests {
         }
         assert!((dc_last[0] - 0.75).abs() < 1.0e-6);
         assert!((dc_last[1] + 0.25).abs() < 1.0e-6);
+    }
+
+    #[test]
+    fn test_bounce4x_decimator_linearity_and_oversampler_parity() {
+        let mut os = Bounce4xOversampler::new();
+        let mut dec_sum = Bounce4xDecimator::new();
+        let mut dec_a = Bounce4xDecimator::new();
+        let mut dec_b = Bounce4xDecimator::new();
+
+        for n in 0..48 {
+            let t = n as f32;
+            let a = [[0.3 * (t * 0.13).sin(), -0.2 * (t * 0.19).cos()]; 4];
+            let b = [
+                [-0.15 * (t * 0.27).cos(), 0.25 * (t * 0.11).sin()],
+                [-0.12 * (t * 0.27).cos(), 0.21 * (t * 0.11).sin()],
+                [-0.08 * (t * 0.27).cos(), 0.17 * (t * 0.11).sin()],
+                [-0.05 * (t * 0.27).cos(), 0.13 * (t * 0.11).sin()],
+            ];
+            let sum_in = core::array::from_fn(|s| [a[s][0] + b[s][0], a[s][1] + b[s][1]]);
+            let out_os = os.downsample_4x(sum_in);
+            let out_sum = dec_sum.downsample_4x(sum_in);
+            let out_a = dec_a.downsample_4x(a);
+            let out_b = dec_b.downsample_4x(b);
+            assert_eq!(out_os.map(f32::to_bits), out_sum.map(f32::to_bits));
+            assert!(((out_a[0] + out_b[0]) - out_sum[0]).abs() < 1.0e-6);
+            assert!(((out_a[1] + out_b[1]) - out_sum[1]).abs() < 1.0e-6);
+        }
+
+        dec_a.reset();
+        assert_eq!(dec_a.downsample_4x([[0.0; 2]; 4]).map(f32::to_bits), [0, 0]);
     }
 
     proptest! {

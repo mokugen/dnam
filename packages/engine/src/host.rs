@@ -36,23 +36,22 @@ pub use swap::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
     use crate::dynamic::DynamicDnamEngine;
-    use crate::math::BackendKind;
     use crate::schema::{
         ControlCalibration, ControlCalibrationRole, ControlKind, ControlSchemaDef, ControlUiHints,
         DnamJsonHeader, PresetDef, TempoSubdivision,
     };
+    use crate::test_support::build_test_dnam_container;
     use crate::types::Tier;
     use alloc::collections::BTreeMap;
     use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
+    use dnam_vm::math::BackendKind;
     use proptest::prelude::*;
 
     fn build_test_container_with_controls() -> Vec<u8> {
         let mut header = DnamJsonHeader::default_reference();
-        header.io_config.capabilities.supports_freeze = true;
         header.controls_schema = vec![
             ControlSchemaDef {
                 id: String::from("gain"),
@@ -131,8 +130,7 @@ mod tests {
             controls: lead_controls,
             user_metadata: BTreeMap::new(),
         }];
-        let arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-        build_dnam_container(&mut header, &arena, &arena, false).unwrap()
+        build_test_dnam_container(&mut header, Tier::Ultra, false)
     }
 
     #[test]
@@ -213,7 +211,6 @@ mod tests {
         }
         let _ = producer.sync_tempo(144.0, Some(TempoSubdivision::Quarter), true);
         producer.set_tier(Tier::Pro);
-        producer.set_freeze(true);
         producer.set_control_immediate(0, 6.25);
         assert!(producer.overflow_latch_count() > 0);
 
@@ -222,7 +219,6 @@ mod tests {
         assert_eq!(producer.drained_causal_epoch(), producer.causal_epoch());
         assert_eq!(engine.tier(), producer.shadow().tier());
         assert_eq!(engine.bypass_state(), producer.shadow().bypass_state());
-        assert_eq!(engine.is_frozen(), producer.shadow().is_frozen());
         assert!((engine.current_bpm() - producer.shadow().current_bpm()).abs() < 1e-5);
         assert!((engine.stereo_width() - producer.shadow().stereo_width()).abs() < 1e-6);
         assert_eq!(
@@ -241,9 +237,8 @@ mod tests {
         // verify[dsp.ctrl.op-m.spsc-ingress]
         // verify[arch.telemetry.seqlock-publication]
         let mut header = DnamJsonHeader::default_reference();
-        header.spatial_tank.dc_blocker_pole = 0.985;
-        header.spatial_tank.tzf_reference_tap_samples = 48.0;
-        header.spatial_tank.switch_xfade_samples = 96;
+        header.transport.dc_blocker_pole = 0.985;
+        header.transport.switch_xfade_samples = 96;
         header.controls_schema = vec![ControlSchemaDef {
             id: String::from("gain"),
             name: String::from("Gain"),
@@ -263,8 +258,7 @@ mod tests {
             ui_hints: ControlUiHints::default(),
             user_metadata: BTreeMap::new(),
         }];
-        let arena = vec![0_u8; ARENA_OFFSET_ULTRA_END as usize];
-        let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+        let container = build_test_dnam_container(&mut header, Tier::Ultra, false);
 
         let host = DnamHostHandle::from_bytes_owned(&container, Tier::Lite, 48_000).unwrap();
         assert_eq!(host.num_controls(), 1);
@@ -360,7 +354,6 @@ mod tests {
                 let v = 1.5 + (i % 70) as f32 * 0.1;
                 host_ctrl.set_control_value(0, v);
                 host_ctrl.set_bypass(i % 5 == 0, true);
-                host_ctrl.set_freeze(i % 7 == 0);
                 host_ctrl.set_stereo_width(0.8 + (i % 10) as f32 * 0.1);
                 let elapsed = start.elapsed();
                 assert!(
@@ -375,7 +368,7 @@ mod tests {
             let reader = host_telem.telemetry_reader();
             for _ in 0..500 {
                 let rec = reader.read();
-                assert!(rec.snapshot.max_pole_radius > 0.0 && rec.snapshot.max_pole_radius <= 1.0);
+                assert!((0.0..=1.0).contains(&rec.snapshot.max_pole_radius));
                 assert!((0.0..=2.0).contains(&rec.stereo_width));
                 let merged = host_telem.telemetry_record();
                 assert_eq!(merged.sample_rate_hz, 48_000);
@@ -415,7 +408,7 @@ mod tests {
     proptest! {
         #[test]
         fn prop_spsc_shadow_and_engine_converge(
-            ops in proptest::collection::vec((0u8..8, -5.0f32..15.0f32), 1..100)
+            ops in proptest::collection::vec((0u8..7, -5.0f32..15.0f32), 1..100)
         ) {
             // verify[dsp.ctrl.op-m.spsc-ingress]
             // verify[arch.telemetry.seqlock-publication]
@@ -435,9 +428,8 @@ mod tests {
                     1 => producer.set_control_immediate(0, val),
                     2 => producer.set_control_immediate(1, (val.abs() as u32 % 4) as f32),
                     3 => producer.set_bypass(val > 0.0, val > 5.0),
-                    4 => producer.set_freeze(val > 2.0),
-                    5 => producer.set_stereo_width(val),
-                    6 => {
+                    4 => producer.set_stereo_width(val),
+                    5 => {
                         let _ = producer.sync_tempo(val.abs().clamp(30.0, 300.0), None, true);
                     }
                     _ => producer.reset_controls_to_defaults(),
@@ -451,7 +443,6 @@ mod tests {
                 producer.shadow().clamped_control_values()
             );
             prop_assert_eq!(engine.bypass_state(), producer.shadow().bypass_state());
-            prop_assert_eq!(engine.is_frozen(), producer.shadow().is_frozen());
             prop_assert!((engine.current_bpm() - producer.shadow().current_bpm()).abs() < 1e-5);
             prop_assert!((engine.stereo_width() - producer.shadow().stereo_width()).abs() < 1e-6);
         }

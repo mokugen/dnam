@@ -16,6 +16,14 @@ const USER_DICT_KEYS: &[&str] = &[
     "option_labels",
 ];
 
+const REJECTED_LEGACY_KEYS: &[&str] = &[
+    "io_router",
+    "sub_crossover_hz",
+    "supports_freeze",
+    "freeze_mutes_dry",
+    "freeze_latch",
+];
+
 fn is_skipped_optional_field(parent_key: Option<&str>, key: &str, v_in: &Value) -> bool {
     match (parent_key, key) {
         (None, "stems_registry" | "audit_report")
@@ -65,6 +73,11 @@ pub fn check_no_unknown_header_keys(
                 return Ok(());
             }
             for (k, v_in) in in_map {
+                if REJECTED_LEGACY_KEYS.contains(&k.as_str()) {
+                    return Err(DnamError::SchemaValidationError(alloc::format!(
+                        "Legacy v3 schema field '{k}' is rejected"
+                    )));
+                }
                 if let Some(v_norm) = norm_map.get(k) {
                     check_no_unknown_header_keys(v_in, v_norm, Some(k.as_str()))?;
                 } else if !is_skipped_optional_field(parent_key, k.as_str(), v_in) {
@@ -115,5 +128,14 @@ mod tests {
         });
         assert!(check_no_unknown_header_keys(&in_bad_curve, &norm_curve, None).is_err());
         assert!(check_no_unknown_header_keys(&norm_curve, &norm_curve, None).is_ok());
+    }
+
+    #[test]
+    fn test_rejected_legacy_keys_fail_closed() {
+        let norm = json!({});
+        for legacy_key in REJECTED_LEGACY_KEYS {
+            let input = json!({ (*legacy_key): true });
+            assert!(check_no_unknown_header_keys(&input, &norm, None).is_err());
+        }
     }
 }

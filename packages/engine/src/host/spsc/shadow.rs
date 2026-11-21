@@ -3,15 +3,16 @@
 
 use alloc::vec::Vec;
 
-use crate::container::ZohRescaledParams;
-use crate::control::{ControlClampDescriptor, TELEMETRY_CONTROL_SLOTS};
+use dnam_vm::ZohRateContext;
+use dnam_vm::control::ControlClampDescriptor;
+use dnam_vm::math::BackendKind;
+
 use crate::dynamic::DynamicDnamEngine;
-use crate::engine::{TempoSyncState, apply_calibrated_control_role};
+use crate::engine::{OFFLINE_BOUNCE_PDC_SAMPLES, TempoSyncState, apply_calibrated_control_role};
 use crate::host::telemetry::RawTelemetryRecord;
-use crate::math::BackendKind;
 use crate::provenance::VerificationStatus;
 use crate::schema::{DnamJsonHeader, DnamProtectionProfile};
-use crate::types::Tier;
+use crate::types::{TELEMETRY_CONTROL_SLOTS, Tier};
 
 use super::ring::{FallbackSnapshot, MAX_CONTROLS};
 
@@ -20,14 +21,15 @@ use super::ring::{FallbackSnapshot, MAX_CONTROLS};
 ///
 /// Mirrors the exact clamping, preset resolution, tempo-sync, and host configuration rules of
 /// [`DynamicDnamEngine`] so synchronous queries (`raw_control_values`, `clamped_control_values`,
-/// `active_tier`, `effective_tier`, `bypass_state`, `is_frozen`, `stereo_width`, `current_bpm`)
-/// immediately reflect newly accepted commands before the next audio block drains the SPSC ring.
+/// `active_tier`, `effective_tier`, `bypass_state`, `stereo_width`, `current_bpm`) immediately
+/// reflect newly accepted commands before the next audio block drains the SPSC ring.
 #[derive(Clone, Debug)]
 pub struct AcceptedStateShadow {
     pub(crate) num_controls: usize,
     pub(crate) descriptors: Vec<ControlClampDescriptor>,
     pub(crate) raw_values: Vec<f32>,
     pub(crate) clamped_values: Vec<f32>,
+    pub(crate) normalized_values: Vec<f32>,
     pub(crate) active_switch_options: Vec<u8>,
     pub(crate) immediate_bits: [u64; 4],
     pub(crate) active_clamp_mask: u16,
@@ -38,17 +40,15 @@ pub struct AcceptedStateShadow {
     pub(crate) backend_kind: BackendKind,
     pub(crate) stereo_out: bool,
     pub(crate) tail_time_ms: f32,
-    pub(crate) sample_rate_train_hz: u32,
+    pub(crate) ref_sample_rate_hz: f32,
+    pub(crate) tier_os2x: [bool; 4],
     pub(crate) sample_rate_hz: u32,
-    pub(crate) training_zoh_poles: (f32, f32, f32, u32),
-    pub(crate) zoh: ZohRescaledParams,
+    pub(crate) zoh: ZohRateContext,
     pub(crate) tier: Tier,
     pub(crate) max_available_tier: Tier,
     pub(crate) max_supported_tier: Tier,
     pub(crate) offline_bounce: bool,
     pub(crate) maximize_tier_on_bounce: bool,
-    pub(crate) supports_freeze: bool,
-    pub(crate) is_frozen: bool,
     pub(crate) bypassed: bool,
     pub(crate) trails_enabled: bool,
     pub(crate) stereo_width: f32,
@@ -63,6 +63,7 @@ impl AcceptedStateShadow {
         let descriptors = engine.control_descriptors().to_vec();
         let raw_values = engine.raw_control_values().to_vec();
         let clamped_values = engine.clamped_control_values().to_vec();
+        let mut normalized_values = alloc::vec![0.0_f32; num_controls];
         let mut active_switch_options = alloc::vec![0_u8; num_controls];
         for (p, desc) in descriptors.iter().enumerate() {
             if desc.ctrl_kind == 1 {
@@ -70,6 +71,15 @@ impl AcceptedStateShadow {
                 active_switch_options[p] = (c.max(0.0) + 0.5) as u8;
             }
         }
+        let mut clamped_copy = clamped_values.clone();
+        let _ = ControlClampDescriptor::clamp_and_normalize_all(
+            &descriptors,
+            num_controls,
+            &raw_values,
+            &mut clamped_copy,
+            &mut normalized_values,
+            &mut active_switch_options,
+        );
         let snap = engine.telemetry_snapshot();
         let (bypassed, trails_enabled) = engine.bypass_state();
         let mut tempo_state = TempoSyncState::new();
@@ -82,6 +92,7 @@ impl AcceptedStateShadow {
             descriptors,
             raw_values,
             clamped_values,
+            normalized_values,
             active_switch_options,
             immediate_bits: [0; 4],
             active_clamp_mask: snap.active_clamp_mask,
@@ -92,17 +103,15 @@ impl AcceptedStateShadow {
             backend_kind: engine.backend_kind(),
             stereo_out: engine.preamble().is_stereo_out(),
             tail_time_ms: engine.preamble().tail_time_ms,
-            sample_rate_train_hz: engine.preamble().sample_rate_train_hz,
+            ref_sample_rate_hz: engine.ref_sample_rate_hz(),
+            tier_os2x: engine.tier_os2x(),
             sample_rate_hz: engine.sample_rate_hz(),
-            training_zoh_poles: engine.training_zoh_poles(),
             zoh: *engine.zoh(),
             tier: engine.tier(),
             max_available_tier: engine.max_available_tier(),
             max_supported_tier: engine.max_supported_tier(),
             offline_bounce: engine.offline_bounce(),
             maximize_tier_on_bounce: engine.maximize_tier_on_bounce(),
-            supports_freeze: engine.supports_freeze(),
-            is_frozen: engine.is_frozen(),
             bypassed,
             trails_enabled,
             stereo_width: engine.stereo_width(),
@@ -112,11 +121,12 @@ impl AcceptedStateShadow {
     }
 
     pub(crate) fn recompute_clamped_values(&mut self) {
-        let clamp_mask = ControlClampDescriptor::clamp_all_controls(
+        let clamp_mask = ControlClampDescriptor::clamp_and_normalize_all(
             &self.descriptors,
             self.num_controls,
             &self.raw_values,
             &mut self.clamped_values,
+            &mut self.normalized_values,
             &mut self.active_switch_options,
         );
         self.active_clamp_mask = clamp_mask | self.tempo_clamp_mask;
@@ -132,8 +142,6 @@ impl AcceptedStateShadow {
             ctrl_idx,
             physical_value,
             &mut self.stereo_width,
-            &mut self.is_frozen,
-            self.supports_freeze,
         );
     }
 
@@ -213,10 +221,14 @@ impl AcceptedStateShadow {
         self.maximize_tier_on_bounce
     }
 
-    /// Returns the current Plugin Delay Compensation (`PDC`) latency in host samples (`0` or `12`).
+    /// Returns the current Plugin Delay Compensation (`PDC`) latency in host samples.
     #[inline]
     pub const fn latency_samples(&self) -> usize {
-        if self.offline_bounce { 12 } else { 0 }
+        if self.offline_bounce {
+            OFFLINE_BOUNCE_PDC_SAMPLES
+        } else {
+            0
+        }
     }
 
     /// Returns the active host sample rate in Hz.
@@ -225,22 +237,10 @@ impl AcceptedStateShadow {
         self.sample_rate_hz
     }
 
-    /// Returns the active [`ZohRescaledParams`].
+    /// Returns the active [`ZohRateContext`].
     #[inline]
-    pub const fn zoh(&self) -> &ZohRescaledParams {
+    pub const fn zoh(&self) -> &ZohRateContext {
         &self.zoh
-    }
-
-    /// Returns whether this model supports Unitary Spectral Freeze.
-    #[inline]
-    pub const fn supports_freeze(&self) -> bool {
-        self.supports_freeze
-    }
-
-    /// Returns whether Unitary Spectral Freeze is currently engaged.
-    #[inline]
-    pub const fn is_frozen(&self) -> bool {
-        self.is_frozen
     }
 
     /// Returns `(bypassed, trails_enabled)`.
@@ -289,19 +289,26 @@ impl AcceptedStateShadow {
     }
 
     /// Overlays the accepted control-plane state onto `base` (preserving real-time DSP fields
-    /// `z_head`, `env_states`, `lfo_harmonics`, `max_effective_loop_gain`, `overflow_or_saturation_flags`).
+    /// `z_head`, `env_states`, `lfo_harmonics`, `max_effective_loop_gain`, `saturation_flags`).
     #[inline]
     pub fn overlay_telemetry(
         &self,
         mut base: RawTelemetryRecord,
         causal_epoch: u64,
     ) -> RawTelemetryRecord {
-        base.snapshot.active_tier = self.effective_tier() as u8;
+        let eff = self.effective_tier();
+        base.snapshot.active_tier = eff as u8;
+        base.snapshot.max_available_tier = self.max_available_tier as u8;
+        base.snapshot.max_supported_tier = self.max_supported_tier as u8;
         base.snapshot.stereo_out = u8::from(self.stereo_out);
         base.snapshot.bypassed = u8::from(self.bypassed);
-        base.snapshot.is_frozen = u8::from(self.is_frozen);
+        base.snapshot.offline_bounce = u8::from(self.offline_bounce);
         base.snapshot.active_clamp_mask = self.active_clamp_mask;
-        base.snapshot.control_decimation_host = self.zoh.control_decimation_host as u16;
+        base.snapshot.control_decimation_host = self.zoh.k_ctrl as u16;
+        base.snapshot.latency_samples = self.latency_samples() as u32;
+        base.snapshot.sample_rate_hz = self.sample_rate_hz;
+        base.snapshot.stereo_width = self.stereo_width;
+        base.snapshot.tempo_bpm = self.current_bpm();
         base.snapshot.tail_time_ms = self.tail_time_ms;
         base.snapshot.clamped_controls = self.telemetry_clamped_controls();
         base.zoh = self.zoh;
@@ -316,7 +323,6 @@ impl AcceptedStateShadow {
         base.max_supported_tier = self.max_supported_tier;
         base.offline_bounce = self.offline_bounce;
         base.maximize_tier_on_bounce = self.maximize_tier_on_bounce;
-        base.supports_freeze = self.supports_freeze;
         base.trails_enabled = self.trails_enabled;
         base.causal_epoch = causal_epoch;
         base
@@ -352,7 +358,21 @@ impl AcceptedStateShadow {
         }
         self.tempo_clamp_mask = 0;
         self.recompute_clamped_values();
-        self.refresh_calibrated_control_effects(ctrl_idx, physical_value);
+        let is_switch = self
+            .descriptors
+            .get(ctrl_idx)
+            .is_some_and(|d| d.ctrl_kind == 1);
+        if is_switch {
+            let count = self.num_controls.min(self.clamped_values.len());
+            for idx in 0..count {
+                if idx != ctrl_idx {
+                    let val = self.clamped_values[idx];
+                    self.refresh_calibrated_control_effects(idx, val);
+                }
+            }
+        }
+        let clamped_val = self.clamped_values[ctrl_idx];
+        self.refresh_calibrated_control_effects(ctrl_idx, clamped_val);
     }
 
     pub(crate) fn reset_single_control(&mut self, ctrl_idx: usize) {
@@ -383,22 +403,11 @@ impl AcceptedStateShadow {
 
     pub(crate) fn reset_engine(&mut self) {
         self.tempo_state.reset();
-        self.is_frozen = false;
         let n = self.num_controls;
         for idx in 0..n {
-            let raw_val = self.raw_values[idx];
-            self.refresh_calibrated_control_effects(idx, raw_val);
+            let clamped_val = self.clamped_values[idx];
+            self.refresh_calibrated_control_effects(idx, clamped_val);
         }
-    }
-
-    #[inline]
-    pub(crate) fn set_freeze(&mut self, freeze: bool) {
-        self.is_frozen = freeze && self.supports_freeze;
-    }
-
-    #[inline]
-    pub(crate) fn set_freeze_amount(&mut self, alpha: f32) {
-        self.is_frozen = (alpha > 0.5) && self.supports_freeze;
     }
 
     pub(crate) fn to_fallback_snapshot(
@@ -421,7 +430,6 @@ impl AcceptedStateShadow {
             maximize_tier_on_bounce: self.maximize_tier_on_bounce,
             bypassed: self.bypassed,
             trails_enabled: self.trails_enabled,
-            is_frozen: self.is_frozen,
             stereo_width: self.stereo_width,
             host_mix: self.host_mix,
             current_bpm: self.tempo_state.current_bpm,
@@ -433,10 +441,10 @@ impl AcceptedStateShadow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
     use crate::schema::{
         ControlCalibration, ControlCalibrationRole, ControlKind, ControlSchemaDef, ControlUiHints,
     };
+    use crate::test_support::build_test_dnam_container;
     use alloc::collections::BTreeMap;
     use alloc::string::String;
     use alloc::vec;
@@ -444,7 +452,6 @@ mod tests {
 
     fn build_shadow_test_engine() -> DynamicDnamEngine<'static> {
         let mut header = DnamJsonHeader::default_reference();
-        header.io_config.capabilities.supports_freeze = true;
         let cond_bounds = vec![crate::container::wire::StructuredConditionalBound {
             when: vec![(String::from("mode"), String::from("Mono"))],
             min: None,
@@ -498,33 +505,8 @@ mod tests {
                 ui_hints: ControlUiHints::default(),
                 user_metadata: BTreeMap::new(),
             },
-            ControlSchemaDef {
-                id: String::from("freeze_sw"),
-                name: String::from("Freeze"),
-                kind: ControlKind::Switch,
-                unit: None,
-                lobatto_degree: None,
-                anchor_nodes_norm: None,
-                declared_range: None,
-                safe_clamped_range: None,
-                default: serde_json::json!("Off"),
-                conditional_bounds: Vec::new(),
-                represented_switch_options: None,
-                declared_options: Some(vec![String::from("Off"), String::from("On")]),
-                active_options: None,
-                clamp_warning: None,
-                calibration: Some(ControlCalibration {
-                    role: ControlCalibrationRole::FreezeLatch,
-                    lobatto_physical_anchors: None,
-                    conditional_physical_anchors: Vec::new(),
-                    tempo_sync_default_subdivision: None,
-                }),
-                ui_hints: ControlUiHints::default(),
-                user_metadata: BTreeMap::new(),
-            },
         ];
-        let arena = vec![0_u8; ARENA_OFFSET_ULTRA_END as usize];
-        let bytes = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+        let bytes = build_test_dnam_container(&mut header, Tier::Ultra, false);
         DynamicDnamEngine::from_bytes_owned_with_backend(
             &bytes,
             Tier::Lite,
@@ -541,10 +523,10 @@ mod tests {
         let engine = build_shadow_test_engine();
         let mut shadow = AcceptedStateShadow::from_engine(&engine);
 
-        assert_eq!(shadow.num_controls(), 3);
-        assert_eq!(shadow.control_descriptors().len(), 3);
-        assert_eq!(shadow.raw_control_values().len(), 3);
-        assert_eq!(shadow.clamped_control_values().len(), 3);
+        assert_eq!(shadow.num_controls(), 2);
+        assert_eq!(shadow.control_descriptors().len(), 2);
+        assert_eq!(shadow.raw_control_values().len(), 2);
+        assert_eq!(shadow.clamped_control_values().len(), 2);
         assert_eq!(shadow.tier(), Tier::Lite);
         assert_eq!(shadow.max_available_tier(), Tier::Ultra);
         assert_eq!(shadow.max_supported_tier(), Tier::Ultra);
@@ -554,8 +536,6 @@ mod tests {
         assert_eq!(shadow.latency_samples(), 0);
         assert_eq!(shadow.sample_rate_hz(), 48_000);
         let _ = shadow.zoh();
-        assert!(shadow.supports_freeze());
-        assert!(!shadow.is_frozen());
         assert_eq!(shadow.bypass_state(), (false, false));
         assert!((shadow.stereo_width() - 1.0).abs() < 1e-6);
         assert!((shadow.current_bpm() - 120.0).abs() < 1e-6);
@@ -575,26 +555,18 @@ mod tests {
         assert!((shadow.clamped_control_value(0).unwrap() - 6.0).abs() < 1e-6);
         assert_ne!(shadow.active_clamp_mask() & 1, 0);
 
-        // FreezeLatch switch role
-        shadow.apply_control_update(2, 1.0, true);
-        assert!(shadow.is_frozen());
-        shadow.set_freeze_amount(0.2);
-        assert!(!shadow.is_frozen());
-        shadow.set_freeze(true);
-        assert!(shadow.is_frozen());
-
         // Bounce effective tier & latency
         shadow.offline_bounce = true;
         shadow.maximize_tier_on_bounce = true;
         assert_eq!(shadow.effective_tier(), Tier::Ultra);
-        assert_eq!(shadow.latency_samples(), 12);
+        assert_eq!(shadow.latency_samples(), OFFLINE_BOUNCE_PDC_SAMPLES);
 
         // Overlay telemetry & fallback snapshot
         let base_rec = RawTelemetryRecord::from_engine(&engine, 1);
         let overlaid = shadow.overlay_telemetry(base_rec, 99);
         assert_eq!(overlaid.causal_epoch, 99);
         assert_eq!(overlaid.snapshot.active_tier, Tier::Ultra as u8);
-        assert_eq!(overlaid.latency_samples, 12);
+        assert_eq!(overlaid.latency_samples, OFFLINE_BOUNCE_PDC_SAMPLES);
 
         let fb = shadow.to_fallback_snapshot(77, true);
         assert_eq!(fb.epoch, 77);
@@ -615,7 +587,6 @@ mod tests {
         fn prop_shadow_clamping_matches_engine(
             gain in -5.0f32..15.0f32,
             mode_idx in 0u32..3,
-            freeze_idx in 0u32..2,
         ) {
             // verify[dsp.ctrl.op-m.spsc-ingress]
             let mut engine = build_shadow_test_engine();
@@ -627,12 +598,96 @@ mod tests {
             engine.set_control_value(0, gain);
             shadow.apply_control_update(0, gain, false);
 
-            engine.set_control_immediate(2, freeze_idx as f32);
-            shadow.apply_control_update(2, freeze_idx as f32, true);
-
             prop_assert_eq!(engine.clamped_control_values(), shadow.clamped_control_values());
-            prop_assert_eq!(engine.is_frozen(), shadow.is_frozen());
             prop_assert!((engine.stereo_width() - shadow.stereo_width()).abs() < 1e-6);
         }
+    }
+
+    #[test]
+    fn test_shadow_conditional_clamp_on_stereo_width_clamps_side_effect_and_reset_engine() {
+        let mut header = DnamJsonHeader::default_reference();
+        let cond_bounds = vec![crate::container::wire::StructuredConditionalBound {
+            when: vec![(String::from("gate"), String::from("Tight"))],
+            min: Some(0.25),
+            max: Some(0.75),
+        }];
+        header.controls_schema = vec![
+            ControlSchemaDef {
+                id: String::from("gate"),
+                name: String::from("Gate"),
+                kind: ControlKind::Switch,
+                unit: None,
+                lobatto_degree: None,
+                anchor_nodes_norm: None,
+                declared_range: None,
+                safe_clamped_range: None,
+                default: serde_json::json!("Open"),
+                conditional_bounds: Vec::new(),
+                represented_switch_options: None,
+                declared_options: Some(vec![String::from("Open"), String::from("Tight")]),
+                active_options: None,
+                clamp_warning: None,
+                calibration: None,
+                ui_hints: ControlUiHints::default(),
+                user_metadata: BTreeMap::new(),
+            },
+            ControlSchemaDef {
+                id: String::from("width"),
+                name: String::from("Width"),
+                kind: ControlKind::Range,
+                unit: None,
+                lobatto_degree: Some(2),
+                anchor_nodes_norm: Some(vec![0.0, -1.0, 1.0]),
+                declared_range: Some([0.0, 2.0]),
+                safe_clamped_range: Some([0.0, 2.0]),
+                default: serde_json::json!(1.0),
+                conditional_bounds: cond_bounds,
+                represented_switch_options: None,
+                declared_options: None,
+                active_options: None,
+                clamp_warning: None,
+                calibration: Some(ControlCalibration {
+                    role: ControlCalibrationRole::StereoWidth,
+                    lobatto_physical_anchors: Some([0.0, 1.0, 2.0]),
+                    conditional_physical_anchors: Vec::new(),
+                    tempo_sync_default_subdivision: None,
+                }),
+                ui_hints: ControlUiHints::default(),
+                user_metadata: BTreeMap::new(),
+            },
+        ];
+        let bytes = build_test_dnam_container(&mut header, Tier::Lite, false);
+        let mut engine = DynamicDnamEngine::from_bytes_owned_with_backend(
+            &bytes,
+            Tier::Lite,
+            48_000,
+            BackendKind::Scalar,
+        )
+        .unwrap();
+        let mut shadow = AcceptedStateShadow::from_engine(&engine);
+
+        engine.set_control_immediate(0, 1.0);
+        shadow.apply_control_update(0, 1.0, true);
+
+        engine.set_control_value(1, 1.8);
+        shadow.apply_control_update(1, 1.8, false);
+        assert!((shadow.clamped_control_value(1).unwrap() - 0.75).abs() < 1.0e-6);
+        assert!((shadow.stereo_width() - 0.75).abs() < 1.0e-6);
+        assert!((engine.stereo_width() - shadow.stereo_width()).abs() < 1.0e-6);
+
+        shadow.reset_engine();
+        assert!((shadow.stereo_width() - 0.75).abs() < 1.0e-6);
+
+        // Flipping switch Open -> Tight after StereoWidth was set to 1.8 clamps immediately.
+        engine.set_control_immediate(0, 0.0);
+        shadow.apply_control_update(0, 0.0, true);
+        engine.set_control_value(1, 1.8);
+        shadow.apply_control_update(1, 1.8, false);
+        assert!((shadow.stereo_width() - 1.8).abs() < 1.0e-6);
+
+        engine.set_control_immediate(0, 1.0);
+        shadow.apply_control_update(0, 1.0, true);
+        assert!((shadow.stereo_width() - 0.75).abs() < 1.0e-6);
+        assert!((engine.stereo_width() - shadow.stereo_width()).abs() < 1.0e-6);
     }
 }

@@ -39,6 +39,7 @@ pub use view::{DnamBinView, bind_dnam_bin_prevalidated, strip_dnam_bin_to_tier};
 mod tests {
     use super::*;
 
+    /// verify[container.dnam.tensor-directory]
     #[test]
     fn test_bin_module_constants_align_to_cache_lines() {
         for &size in &ARENA_TIER_BYTES {

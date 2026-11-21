@@ -3,34 +3,38 @@
 //! Uses a custom `#[global_allocator]` (`CountingAllocator`) to prove empirically that all
 //! real-time audio and control methods (`process_block`, `process_block_in_place`,
 //! `process_mono_to_stereo`, `process_mono`, `set_tier`, `set_control_value`,
-//! `reload_model_in_place`, `DnamHostHandle`, and C-ABI FFI) execute with **0 heap allocations**
-//! and **0 heap deallocations** (`verify[sdk.rust.c-abi-and-host-handle]`).
+//! `reload_model_in_place` over `.dnam` carrying embedded `dbin_prefix`, `PreviewGuardState`,
+//! `DnamHostHandle`, and C-ABI FFI) execute with **0 heap allocations** and **0 heap
+//! deallocations**.
+
+#[path = "sona_test_support/arena_builder.rs"]
+mod arena_builder;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use arena_builder::build_sona_container_from_header_options;
 use dnam_engine::container::{
-    ARENA_OFFSET_LITE_END, ARENA_OFFSET_ULTRA_END, build_dnam_container,
-    build_v3_open_dnam_container,
+    ARENA_OFFSET_LITE_END, V3ContainerBuildSpec, build_v3_dnam_container_with_dbin,
 };
 use dnam_engine::ffi::{
     dnam_engine_create_from_bytes, dnam_engine_destroy, dnam_engine_get_latency_samples,
     dnam_engine_get_telemetry, dnam_engine_process_block, dnam_engine_process_mono,
     dnam_engine_reset, dnam_engine_set_control_immediate, dnam_engine_set_control_value,
     dnam_engine_set_max_supported_tier, dnam_engine_set_maximize_tier_on_bounce,
-    dnam_engine_set_offline_bounce, dnam_engine_set_tier,
+    dnam_engine_set_offline_bounce, dnam_engine_set_sample_rate, dnam_engine_set_tier,
 };
-use dnam_engine::graph::sona_core::SonaMatryoshkaModel;
-use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
 use dnam_engine::host::DnamHostHandle;
-use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::memory::{AlignedBuffer, AlignedFp16Block, CacheLine64};
 use dnam_engine::schema::{
     ControlKind, ControlSchemaDef, ControlUiHints, DnamError, DnamJsonHeader, PresetDef,
 };
 use dnam_engine::types::DnamTelemetrySnapshot;
-use dnam_engine::{DnamAudioIo, DnamEngine, Tier};
+use dnam_engine::{DnamAudioIo, DnamEngine, DynamicDnamEngine, Tier, extract_dnam_bin};
+use dnam_vm::bin::DnamBinHeaderWire;
+use dnam_vm::math::DefaultMathBackend;
+use zerocopy::FromBytes;
 
 struct CountingAllocator;
 
@@ -71,7 +75,7 @@ fn current_dealloc_count() -> usize {
     DEALLOC_COUNT.load(Ordering::SeqCst)
 }
 
-fn make_test_container_with_kind(container_kind: &str) -> AlignedBuffer<CacheLine64> {
+fn make_test_container_with_kind(container_kind: &str) -> (AlignedBuffer<CacheLine64>, Vec<u8>) {
     let mut header = DnamJsonHeader::default_reference();
     header.container_kind = container_kind.to_string();
     header.metadata.name = "RT Safety Model".to_string();
@@ -104,39 +108,36 @@ fn make_test_container_with_kind(container_kind: &str) -> AlignedBuffer<CacheLin
         user_metadata: BTreeMap::new(),
     }];
 
-    let mut model = SonaMatryoshkaModel::dual_rate_default(false);
-    model.stage0.xo_low_gain = 1.0;
-    model.stage0.xo_high_gain = 1.0;
-    model.stage4.iter_mut().for_each(|s| {
-        s.g_loop = 0.72;
-        s.wet_mix = 0.25;
-    });
-    let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    pack_sona_matryoshka_to_arena(&model, &mut arena);
-    let vec_bytes = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+    let (_arena, dbin, vec_bytes) =
+        build_sona_container_from_header_options(&mut header, Tier::Ultra, false, false, true, &[]);
+    assert!(extract_dnam_bin(&vec_bytes).is_ok());
     let mut aligned = AlignedBuffer::<CacheLine64>::new_zeroed(vec_bytes.len() / 64);
     aligned.as_bytes_mut().copy_from_slice(&vec_bytes);
-    aligned
+    (aligned, dbin)
 }
 
+/// verify[dsp.ctrl.op-m.spsc-ingress]
+/// verify[arch.telemetry.seqlock-publication]
+/// verify[sdk.rust.c-abi-and-host-handle]
 #[test]
 fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader() {
-    let container_active = make_test_container_with_kind("dnam");
-    let container_small = make_test_container_with_kind("dnam");
-    let container_preview = make_test_container_with_kind("preview");
+    let (container_active, template_dbin) = make_test_container_with_kind("dnam");
+    let (container_small, _) = make_test_container_with_kind("dnam");
+    let (container_preview, _) = make_test_container_with_kind("preview");
 
-    // 1. Verify telemetry snapshot reports bypassed and is_frozen status flags
+    // 1. Verify telemetry snapshot reports bypassed and host_write_lock status flags
     let eng_check = DnamEngine::<DefaultMathBackend>::from_bytes(
         container_small.as_bytes(),
         Tier::Full,
         48_000,
     )
     .unwrap();
-    assert_eq!(eng_check.telemetry_snapshot().bypassed, 0);
-    assert_eq!(eng_check.telemetry_snapshot().is_frozen, 0);
+    let check_snap = eng_check.telemetry_snapshot();
+    assert_eq!(check_snap.bypassed, 0);
+    assert_eq!(check_snap.host_write_lock, 0);
 
-    // 2. Verify from_bytes_with_scratch borrows 64B-aligned Arena 0..3 when aligned (zero audio allocs).
-    let mut external_scratch = vec![AlignedFp16Block([0u16; 32]); 256]; // 1,024 frames * 8 lines / 32
+    // 2. Verify from_bytes_with_scratch and embedded .dnam-bin extraction
+    let mut external_scratch = vec![AlignedFp16Block([0u16; 32]); 256];
     let mut eng_embedded = DnamEngine::<DefaultMathBackend>::from_bytes_with_scratch(
         container_active.as_bytes(),
         &mut external_scratch,
@@ -147,7 +148,7 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
     assert!(eng_embedded.header().is_some());
 
     // 3. Verify all audio I/O topologies, multiport/bounce/router controls, tier switching,
-    //    control updates, tempo sync, preset load, and telemetry allocate 0 bytes!
+    //    control updates, write locks, tempo sync, preset load, and telemetry allocate 0 bytes!
     let in_l = [0.25_f32; 256];
     let in_r = [-0.25_f32; 256];
     let ret_l = [0.1_f32; 256];
@@ -159,6 +160,7 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
     let mut dry_c = [0.0_f32; 256];
 
     reset_alloc_counters();
+    let _ = extract_dnam_bin(container_active.as_bytes()).unwrap();
     eng_embedded.process_block(&in_l, &in_r, &mut out_l, &mut out_r);
     eng_embedded.process_stereo(&in_l, &in_r, &mut out_l, &mut out_r);
     eng_embedded.process_block_in_place(&mut out_l, &mut out_r);
@@ -191,8 +193,10 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
     eng_embedded.set_offline_bounce(false);
     eng_embedded.set_bypass(true, true);
     eng_embedded.set_bypass(false, false);
-    eng_embedded.set_freeze(true);
-    eng_embedded.set_freeze(false);
+    eng_embedded.set_quad_write_enable(true);
+    eng_embedded.set_quad_write_enable(false);
+    eng_embedded.set_op_t_write_enable(true);
+    eng_embedded.set_op_t_write_enable(false);
     eng_embedded.set_stereo_width(1.25);
     eng_embedded.set_stereo_width(1.0);
     eng_embedded.set_tier(Tier::Lite);
@@ -207,42 +211,51 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
     eng_embedded.reset_to_dc_equilibrium();
     eng_embedded.render_offline_bounce(&in_l, &in_r, &mut out_l, &mut out_r);
     let _snap = eng_embedded.telemetry_snapshot();
-    assert_eq!(
-        current_alloc_count(),
-        0,
-        "Real-time audio/control path allocated heap memory!"
-    );
-    assert_eq!(
-        current_dealloc_count(),
-        0,
-        "Real-time audio/control path deallocated heap memory!"
-    );
+    assert_eq!(current_alloc_count(), 0);
+    assert_eq!(current_dealloc_count(), 0);
+
+    // 3b. Verify PreviewGuardState + preview engine RT audio paths allocate/deallocate 0 bytes!
+    let mut prev_eng = DnamEngine::<DefaultMathBackend>::from_preview_bytes(
+        container_preview.as_bytes(),
+        Tier::Ultra,
+        48_000,
+    )
+    .unwrap();
+    assert!(prev_eng.is_preview_mode());
+    reset_alloc_counters();
+    prev_eng.process_block(&in_l, &in_r, &mut out_l, &mut out_r);
+    prev_eng.process_block_in_place(&mut out_l, &mut out_r);
+    prev_eng.reset_to_dc_equilibrium();
+    assert_eq!(current_alloc_count(), 0);
+    assert_eq!(current_dealloc_count(), 0);
 
     // 4. Verify reload_model_in_place (both valid hot-swap and error paths: bad magic, bad CRC,
-    //    bad DMUE/schema, invalid JSON, preview rejection) on both DnamEngine and DynamicDnamEngine
-    //    perform ZERO heap allocations and ZERO deallocations!
+    //    bad DMUE/schema, invalid JSON, PreviewContainerRejected) perform 0 allocs & 0 deallocs!
     let mut bad_crc_bytes = container_small.as_bytes().to_vec();
     bad_crc_bytes[192] ^= 0x01;
     let mut bad_schema_bytes = container_small.as_bytes().to_vec();
     let schema_last = bad_schema_bytes.len() - 1;
     bad_schema_bytes[schema_last] ^= 0x01;
+
+    let (hdr_wire, _) = DnamBinHeaderWire::read_from_prefix(&template_dbin).unwrap();
+    let arena0_off = hdr_wire.arena0_offset.get() as usize;
     let empty_lite_arena = vec![0u8; ARENA_OFFSET_LITE_END as usize];
-    let bad_json_container = build_v3_open_dnam_container(
-        br#"{"broken": "#,
-        &[0u8; 64],
-        &[0u8; 64],
-        &[empty_lite_arena.as_slice()],
-        None,
-        0,
-    )
+    let bad_json_container = build_v3_dnam_container_with_dbin(&V3ContainerBuildSpec {
+        protection_profile: 0,
+        header_bytes: br#"{"broken": "#,
+        shared_bytes: &[],
+        auth_bytes: &[0u8; 64],
+        dbin_prefix_bytes: &template_dbin[..arena0_off],
+        tier_slices: &[empty_lite_arena.as_slice()],
+        mutable_frame_bytes: None,
+        auth_kind: 0,
+    })
     .unwrap();
+
     let mut eng_pool = DnamEngine::<DefaultMathBackend>::with_max_capacity();
-    let mut dyn_pool = dnam_engine::DynamicDnamEngine::from_bytes(
-        container_active.as_bytes(),
-        Tier::Ultra,
-        48_000,
-    )
-    .unwrap();
+    let mut dyn_pool =
+        DynamicDnamEngine::from_bytes(container_active.as_bytes(), Tier::Ultra, 48_000).unwrap();
+
     reset_alloc_counters();
     eng_pool
         .reload_model_in_place(container_active.as_bytes(), Tier::Full, 48_000)
@@ -273,37 +286,36 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
     eng_pool.process_block_sidechain(&in_l, &in_r, &ret_l, &ret_r, &mut out_l, &mut out_r);
     eng_pool.set_bypass(true, true);
     eng_pool.set_bypass(false, false);
-    eng_pool.set_freeze(true);
-    eng_pool.set_freeze(false);
+    eng_pool.set_quad_write_enable(true);
+    eng_pool.set_quad_write_enable(false);
+    eng_pool.set_op_t_write_enable(true);
+    eng_pool.set_op_t_write_enable(false);
     eng_pool.set_stereo_width(1.5);
     eng_pool.set_stereo_width(1.0);
     eng_pool.render_offline_bounce(&in_l, &in_r, &mut out_l, &mut out_r);
     eng_pool
         .reload_model_in_place(container_small.as_bytes(), Tier::Lite, 48_000)
         .unwrap();
-    let bad_magic_err = eng_pool
-        .reload_model_in_place(&[0u8; 256], Tier::Lite, 48_000)
-        .unwrap_err();
-    assert!(matches!(bad_magic_err, DnamError::InvalidMagic(_)));
-    let bad_crc_err = eng_pool
-        .reload_model_in_place(&bad_crc_bytes, Tier::Lite, 48_000)
-        .unwrap_err();
-    assert!(matches!(bad_crc_err, DnamError::Crc32cMismatch { .. }));
-    let bad_schema_err = eng_pool
-        .reload_model_in_place(&bad_schema_bytes, Tier::Lite, 48_000)
-        .unwrap_err();
     assert!(matches!(
-        bad_schema_err,
-        DnamError::SchemaValidationError(_)
+        eng_pool.reload_model_in_place(&[0u8; 256], Tier::Lite, 48_000),
+        Err(DnamError::InvalidMagic(_))
     ));
-    let bad_json_err = eng_pool
-        .reload_model_in_place(&bad_json_container, Tier::Lite, 48_000)
-        .unwrap_err();
-    assert!(matches!(bad_json_err, DnamError::InvalidJsonHeader(_)));
-    let preview_err = eng_pool
-        .reload_model_in_place(container_preview.as_bytes(), Tier::Lite, 48_000)
-        .unwrap_err();
-    assert!(matches!(preview_err, DnamError::PreviewContainerRejected));
+    assert!(matches!(
+        eng_pool.reload_model_in_place(&bad_crc_bytes, Tier::Lite, 48_000),
+        Err(DnamError::Crc32cMismatch { .. })
+    ));
+    assert!(matches!(
+        eng_pool.reload_model_in_place(&bad_schema_bytes, Tier::Lite, 48_000),
+        Err(DnamError::SchemaValidationError(_))
+    ));
+    assert!(matches!(
+        eng_pool.reload_model_in_place(&bad_json_container, Tier::Lite, 48_000),
+        Err(DnamError::InvalidJsonHeader(_))
+    ));
+    assert!(matches!(
+        eng_pool.reload_model_in_place(container_preview.as_bytes(), Tier::Lite, 48_000),
+        Err(DnamError::PreviewContainerRejected)
+    ));
 
     dyn_pool
         .reload_model_in_place(container_small.as_bytes(), Tier::Lite, 48_000)
@@ -328,22 +340,11 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
         dyn_pool.reload_model_in_place(container_preview.as_bytes(), Tier::Lite, 48_000),
         Err(DnamError::PreviewContainerRejected)
     ));
-    assert_eq!(
-        current_alloc_count(),
-        0,
-        "reload_model_in_place or pool real-time paths allocated heap memory!"
-    );
-    assert_eq!(
-        current_dealloc_count(),
-        0,
-        "reload_model_in_place or pool real-time paths deallocated heap memory!"
-    );
+    assert_eq!(current_alloc_count(), 0);
+    assert_eq!(current_dealloc_count(), 0);
 
-    // 5. Verify SpscControlRing, TelemetryCell seqlock, and RealtimeEngineSwap perform ZERO heap allocations on the RT path!
-    // verify[dsp.ctrl.op-m.spsc-ingress]
-    // verify[arch.telemetry.seqlock-publication]
+    // 5. Verify SpscControlRing, TelemetryCell seqlock, and RealtimeEngineSwap execute with 0 RT allocs
     {
-        use dnam_engine::DynamicDnamEngine;
         use dnam_engine::host::{
             RawTelemetryRecord, realtime_engine_swap, spsc_control_channel, telemetry_channel,
         };
@@ -360,12 +361,9 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
         let (mut telem_writer, telem_reader) = telemetry_channel(initial_rec);
         let (mut swap_ctrl, mut swap_audio) = realtime_engine_swap(initial_engine);
 
-        // Stage a replacement engine on the non-RT controller side before resetting allocation counters
         swap_ctrl.publish_engine_at_epoch(staged_engine, 1);
 
         reset_alloc_counters();
-
-        // Producer-side control updates (Lane 1 coalescing + Lane 2 preset & tempo + Lane 3 overflow latch)
         producer.set_control_value(0, 7.5);
         producer.set_control_immediate(1, 1.0);
         producer.apply_preset("rt_preset").unwrap();
@@ -374,32 +372,19 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
             producer.set_bypass(i % 2 == 0, true);
         }
 
-        // Real-time audio-side poll_swap, SPSC drain_into, and Seqlock telemetry publication/read
         assert_eq!(swap_audio.poll_swap_epoch(), Some(1));
         let applied = consumer.drain_into(swap_audio.engine_mut());
         assert!(applied > 0);
         telem_writer.publish_from_engine(swap_audio.engine(), consumer.drained_causal_epoch());
         let snap = telem_reader.read();
         assert_eq!(snap.causal_epoch, producer.causal_epoch());
+        assert_eq!(current_alloc_count(), 0);
+        assert_eq!(current_dealloc_count(), 0);
 
-        assert_eq!(
-            current_alloc_count(),
-            0,
-            "SpscControlRing / TelemetryCell / RealtimeEngineSwap allocated heap memory on real-time path!"
-        );
-        assert_eq!(
-            current_dealloc_count(),
-            0,
-            "SpscControlRing / TelemetryCell / RealtimeEngineSwap deallocated heap memory on real-time path!"
-        );
-
-        // Reclaim retired engine on the non-RT controller side
         assert_eq!(swap_ctrl.reclaim_retired(), 1);
     }
 
-    // 5b. Verify DnamHostHandle real-time control, audio processing, and wait-free telemetry
-    //     execute with ZERO heap allocations and ZERO deallocations (pre-warmed HostMutex).
-    // verify[sdk.rust.c-abi-and-host-handle]
+    // 5b. Verify DnamHostHandle RT control, audio, and telemetry execute with 0 allocs & 0 deallocs
     {
         let host_handle =
             DnamHostHandle::from_bytes_owned(container_active.as_bytes(), Tier::Full, 48_000)
@@ -414,21 +399,11 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
         let host_snap = host_handle.telemetry_snapshot();
         let host_rec = host_handle.telemetry_record();
         assert_eq!(host_snap.active_tier, host_rec.snapshot.active_tier);
-        assert_eq!(
-            current_alloc_count(),
-            0,
-            "DnamHostHandle real-time path allocated heap memory!"
-        );
-        assert_eq!(
-            current_dealloc_count(),
-            0,
-            "DnamHostHandle real-time path deallocated heap memory!"
-        );
+        assert_eq!(current_alloc_count(), 0);
+        assert_eq!(current_dealloc_count(), 0);
     }
 
-    // 6. Verify C-ABI setters, reset, process_block (disjoint, in-place, crossed-channel),
-    //    process_mono (disjoint, in-place), get_latency_samples, and get_telemetry execute with
-    //    0 heap allocations and 0 deallocations.
+    // 6. Verify C-ABI setters, reset, process_block, process_mono, latency & telemetry = 0 allocs
     // SAFETY: Creates a valid owned handle before entering the zero-allocation window.
     let ffi_handle = unsafe {
         dnam_engine_create_from_bytes(
@@ -442,7 +417,7 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
     let mut ffi_snap: DnamTelemetrySnapshot = eng_embedded.telemetry_snapshot();
 
     reset_alloc_counters();
-    // SAFETY: `ffi_handle` is non-null from `dnam_engine_create_from_bytes` and buffers hold `in_l.len()` elements.
+    // SAFETY: `ffi_handle` is valid and slice pointers cover `in_l.len()` frames.
     unsafe {
         dnam_engine_set_tier(ffi_handle, Tier::Pro as u8);
         dnam_engine_set_max_supported_tier(ffi_handle, Tier::Ultra as u8);
@@ -451,6 +426,10 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
         dnam_engine_set_maximize_tier_on_bounce(ffi_handle, true);
         dnam_engine_set_control_value(ffi_handle, 0, 5.0);
         dnam_engine_set_control_immediate(ffi_handle, 0, 5.0);
+        assert_eq!(dnam_engine_set_sample_rate(ffi_handle, 96_000), 0);
+        assert_eq!(dnam_engine_set_sample_rate(ffi_handle, 192_000), 0);
+        assert_eq!(dnam_engine_set_sample_rate(ffi_handle, 22_050), -1);
+        assert_eq!(dnam_engine_set_sample_rate(ffi_handle, 48_000), 0);
         dnam_engine_reset(ffi_handle);
         dnam_engine_process_block(
             ffi_handle,
@@ -484,17 +463,9 @@ fn test_zero_heap_allocations_in_all_realtime_paths_and_embedded_scratch_loader(
         let _lat = dnam_engine_get_latency_samples(ffi_handle);
         dnam_engine_get_telemetry(ffi_handle, &mut ffi_snap);
     }
-    assert_eq!(
-        current_alloc_count(),
-        0,
-        "C-ABI real-time setters/reset/process/telemetry allocated heap memory!"
-    );
-    assert_eq!(
-        current_dealloc_count(),
-        0,
-        "C-ABI real-time setters/reset/process/telemetry deallocated heap memory!"
-    );
-    // SAFETY: Releases the handle originally allocated by `dnam_engine_create_from_bytes`.
+    assert_eq!(current_alloc_count(), 0);
+    assert_eq!(current_dealloc_count(), 0);
+    // SAFETY: Frees handle allocated by `dnam_engine_create_from_bytes`.
     unsafe {
         dnam_engine_destroy(ffi_handle);
     }

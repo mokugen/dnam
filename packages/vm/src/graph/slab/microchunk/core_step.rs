@@ -518,6 +518,8 @@ mod tests {
     use super::*;
     use crate::graph::slab::layout::SONA_CORE_QUAD_BLOCK_AND_LOCAL;
 
+    /// verify[dsp.head.lower-triangular]
+    /// verify[dsp.op-n.core.interblock-tiles]
     #[test]
     fn test_outgoing_tile_table_partition_exact() {
         let mut seen = [false; MAX_SONA_TILES];

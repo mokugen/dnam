@@ -1,4 +1,4 @@
-//! Dedicated Milestone M10b integration & operator parity tests for `dnam-vm`:
+//! SONA v3.0 operator parity & routing integration tests for `dnam-vm`:
 //! pure `2x2` channel routing (`1->1`, `2->1`, `1->2`, `2->2`), `SensoryQuad` VCA (`slot 30`),
 //! smooth `Op-N[Pre]` `zoh_hold_depth` & ZOH invariance, `ro_pole_48k` ZOH invariance, `CoreQuad`
 //! M/S coupling + Selective-Duhem + stereo-link + `GLU`, `T1SubHarmonicKernel` 2-stage rotor,
@@ -29,6 +29,9 @@ use super::helpers::{
     fp16_val, le_f32, make_core_quad, make_transport_quad, stereo_test_signal,
 };
 
+/// verify[dsp.head.direct-register-readout]
+/// verify[dsp.head.mid-side-factorization]
+/// verify[dsp.router.signal-flow]
 #[test]
 fn test_m10b_routing_modes_1x1_2x1_1x2_2x2_and_step_vs_block_0ulp_parity() {
     let mut a0 = DnamBinBuildInput::default_arena0_lite();
@@ -150,6 +153,11 @@ fn test_m10b_routing_modes_1x1_2x1_1x2_2x2_and_step_vs_block_0ulp_parity() {
     }
 }
 
+/// verify[dsp.op-t.ducking.vca]
+/// verify[dsp.router.ballistic-envelope-bank]
+/// verify[dsp.router.lr4-crossover]
+/// verify[dsp.router.modulation-bus]
+/// verify[dsp.zoh.router-detector]
 #[test]
 fn test_m10b_sensory_quad_vca_slot30_and_control_bus_envelope_loop() {
     let mut a0_pass = DnamBinBuildInput::default_arena0_lite();
@@ -217,6 +225,7 @@ fn test_m10b_sensory_quad_vca_slot30_and_control_bus_envelope_loop() {
     );
 }
 
+/// verify[dsp.op-n.bitcrusher.rate-transfer]
 #[test]
 fn test_m10b_op_n_pre_smooth_zoh_depth_and_sample_rate_invariance() {
     // 1) Continuous smooth transition across zoh_hold_depth in OpNPreHotState::step_stereo.
@@ -375,6 +384,8 @@ fn test_m10b_ro_pole_48k_zoh_sample_rate_invariance() {
     assert!(vm_max.slab().lite.hp_lp_pole <= MAX_PARALRU_R_F32);
 }
 
+/// verify[dsp.router.mid-side-input]
+/// verify[dsp.router.stereo-link-detector]
 #[test]
 fn test_m10b_core_quad_ms_coupling_duhem_stereo_link_and_glu_mix() {
     let mut base_a0 = DnamBinBuildInput::default_arena0_lite();
@@ -509,6 +520,8 @@ fn test_m10b_t1_subharmonic_rotor_28b_octave_harmonics() {
     assert_finite_non_silent(&ol, &or, "Op-P T1 octave harmonic pipeline");
 }
 
+/// verify[dsp.tank.captured-freeze]
+/// verify[dsp.tank.feedback-loop]
 #[test]
 fn test_m10b_op_t_sigma_sat_freeze_mix_dry_mix_and_immediate_write_lock() {
     let mut a0 = DnamBinBuildInput::default_arena0_lite();
@@ -750,6 +763,8 @@ fn test_m10b_op_t_sigma_sat_freeze_mix_dry_mix_and_immediate_write_lock() {
     );
 }
 
+/// verify[dsp.core.matryoshka-cascade]
+/// verify[dsp.head.tier-equivalence]
 #[test]
 fn test_m10b_tier_switching_monotonicity_and_bounded_rt_invariants() {
     assert_eq!(

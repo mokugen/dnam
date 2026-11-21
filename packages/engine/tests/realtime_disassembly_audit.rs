@@ -1,276 +1,174 @@
 //! Automated Release-Binary Disassembly Audit for Goal 6 (`REQ-6.2`, `REQ-6.3`).
 //!
-//! - `verify[sdk.rust.realtime-disassembly-audit]`
-//! - `verify[arch.simd.zero-stall-lowering]`
-//! - `verify[dsp.op-m.rotor.angle-wrap-and-retune]`
-//! - `verify[dsp.op-t.guard.incremental-counters]`
-//!
-//! Disassembles the optimized `libdnam_engine.rlib` release artifact via `objdump -dr --demangle`
-//! and verifies:
-//! 1. **Crate-Wide `libm` Ban (`REQ-6.2`):** Zero external relocations to `_fmodf`, `_fmod`,
+//! Disassembles `libdnam_engine.rlib`, `libdnam_vm-*.rlib`, and `libdnam_kernels-*.rlib`
+//! release artifacts via `objdump -dr --demangle` and verifies:
+//! 1. **Crate-Wide `libm` Ban (`REQ-6.2`):** Zero external relocations to `fmodf`, `fmod`,
 //!    `sinf`, `cosf`, `tanf`, `expf`, `logf`, `powf`, `sqrtf`, or `f64` `libm` equivalents.
-//! 2. **Real-Time Loop Instruction & Call Audit (`REQ-6.2`, `REQ-6.3`):** Across all compiled
-//!    `DnamEngine<*>::process_block*`, `process_mono*`, `sona_process_block*`, `step_sona_group_stereo8*`,
-//!    `IoRouter::*`, `CrossbarHot::*`, `CabinetHot::*`, `SpatialTankHot::*`, `SonaHotSlab::*`, `SonaInstance::*`,
-//!    `step_control_tick_3khz*`, `DnamHostHandle::process_*`, and C-ABI `_dnam_engine_process_*` functions:
-//!    - Zero hardware floating-point or integer division/sqrt instructions (`fdiv`, `fsqrt`,
-//!      `udiv`, `sdiv` on `aarch64`; `divss`/`divps`/`divsd`/`divpd`/`vdiv*`,
-//!      `sqrtss`/`sqrtps`/`sqrtsd`/`sqrtpd`/`vsqrt*`, `idiv*`, `divl`/`divq` on `x86_64`).
-//!    - Zero calls to 128-bit software division (`__udivti3`, `__divti3`, `__umodti3`, `__modti3`),
-//!      heap allocation (`__rust_alloc`, `__rust_dealloc`, `__rust_realloc`), or uncached OS
+//! 2. **Real-Time Loop Instruction & Call Audit (`REQ-6.2`, `REQ-6.3`):** Across all Layer 1
+//!    `DnamEngine`, `DynamicDnamEngine`, `HostShellPatchbay` (`ReturnAligner`, `ParallelAlignLine`),
+//!    `PreviewGuardState`, `DnamHostHandle`, C-ABI `dnam_engine_*`, `SonaVm`, `ControlBus`,
+//!    and `dnam_kernels` real-time entry points and their transitive call-graph closure:
+//!    - Zero hardware division/sqrt (`fdiv`/`fsqrt`/`udiv`/`sdiv` or x86 equivalents).
+//!    - Zero 128-bit software division (`__udivti3`/`__divti3`/`__umodti3`/`__modti3`),
+//!      heap allocation (`__rust_alloc`/`__rust_dealloc`/`__rust_realloc`), or uncached OS
 //!      feature syscalls (`sysctlbyname`, `getauxval`).
 
 #![forbid(unsafe_code)]
 
+#[path = "sona_test_support/objdump_parser.rs"]
+mod objdump_parser;
+
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-use std::process::Command;
 
-use dnam_engine::ffi::{
-    DnamEngineHandle, dnam_engine_process_mono, dnam_engine_reset,
-    dnam_engine_set_control_immediate, dnam_engine_set_control_value,
-    dnam_engine_set_offline_bounce, dnam_engine_set_tier,
+use objdump_parser::{
+    AliasMap, FnDisasm, clean_reloc_target, collect_symbol_aliases, disassemble_rlib_into,
+    ensure_release_rlibs, merge_folded_symbol_aliases,
 };
-use dnam_engine::host::DnamHostHandle;
-use dnam_engine::math::DefaultMathBackend;
-use dnam_engine::schema::DnamError;
-use dnam_engine::{DnamAudioIo, DnamEngine, DynamicDnamEngine, Tier};
 
-/// Instantiates generic `DnamEngine` and host/FFI real-time entry points and retains them
-/// via [`core::hint::black_box`] so the linker/compiler cannot strip their monomorphizations.
-fn retain_realtime_entry_points() {
-    type Eng = DnamEngine<'static, DefaultMathBackend>;
-    type Dyn = DynamicDnamEngine<'static>;
-    type Handle = DnamHostHandle;
-    type C4cmDyn = fn(
-        &mut Dyn,
-        &[f32],
-        &[f32],
-        &[f32],
-        &[f32],
-        &mut [f32],
-        &mut [f32],
-        &mut [f32],
-        &mut [f32],
-    );
-    type C4cmEng = fn(
-        &mut Eng,
-        &[f32],
-        &[f32],
-        &[f32],
-        &[f32],
-        &mut [f32],
-        &mut [f32],
-        &mut [f32],
-        &mut [f32],
-    );
-    type WdwDyn = fn(&mut Dyn, &[f32], &[f32], &mut [f32], &mut [f32], &mut [f32]);
-    type WdwEng = fn(&mut Eng, &[f32], &[f32], &mut [f32], &mut [f32], &mut [f32]);
-    type ScDyn = fn(&mut Dyn, &[f32], &[f32], &[f32], &[f32], &mut [f32], &mut [f32]);
-    type ScEng = fn(&mut Eng, &[f32], &[f32], &[f32], &[f32], &mut [f32], &mut [f32]);
-
-    core::hint::black_box::<fn(&mut Eng, bool)>(Eng::set_offline_bounce);
-    core::hint::black_box::<fn(&Handle, &[f32], &[f32], &mut [f32], &mut [f32], Option<bool>)>(
-        Handle::render_offline_bounce_with_options,
-    );
-    core::hint::black_box::<fn(&Handle, &[f32], &[f32], &mut [f32], &mut [f32])>(
-        Handle::process_block,
-    );
-    core::hint::black_box::<fn(&Handle, &mut [f32], &mut [f32])>(Handle::process_block_in_place);
-    core::hint::black_box::<fn(&Handle, &[f32], &mut [f32])>(Handle::process_mono);
-    core::hint::black_box::<fn(&mut Dyn, DnamAudioIo<'_>)>(Dyn::process_block_io);
-    core::hint::black_box::<C4cmDyn>(Dyn::process_block_4cm);
-    core::hint::black_box::<WdwDyn>(Dyn::process_block_wdw);
-    core::hint::black_box::<ScDyn>(Dyn::process_block_sidechain);
-    core::hint::black_box::<fn(&mut Dyn, &'static [u8], Tier, u32) -> Result<(), DnamError>>(
-        Dyn::reload_model_in_place,
-    );
-    core::hint::black_box::<fn(&mut Eng, DnamAudioIo<'_>)>(Eng::process_block_io);
-    core::hint::black_box::<C4cmEng>(Eng::process_block_4cm);
-    core::hint::black_box::<WdwEng>(Eng::process_block_wdw);
-    core::hint::black_box::<ScEng>(Eng::process_block_sidechain);
-    core::hint::black_box::<fn(&mut Eng, bool, bool)>(Eng::set_bypass);
-    core::hint::black_box::<fn(&mut Eng, bool)>(Eng::set_freeze);
-    core::hint::black_box::<fn(&mut Eng, f32)>(Eng::set_stereo_width);
-    core::hint::black_box::<fn(&mut Eng, &'static [u8], Tier, u32) -> Result<(), DnamError>>(
-        Eng::reload_model_in_place,
-    );
-    core::hint::black_box::<unsafe extern "C" fn(*mut DnamEngineHandle, bool)>(
-        dnam_engine_set_offline_bounce,
-    );
-    core::hint::black_box::<unsafe extern "C" fn(*mut DnamEngineHandle, u8)>(dnam_engine_set_tier);
-    core::hint::black_box::<unsafe extern "C" fn(*mut DnamEngineHandle, usize, f32)>(
-        dnam_engine_set_control_value,
-    );
-    core::hint::black_box::<unsafe extern "C" fn(*mut DnamEngineHandle, usize, f32)>(
-        dnam_engine_set_control_immediate,
-    );
-    core::hint::black_box::<unsafe extern "C" fn(*mut DnamEngineHandle, *const f32, *mut f32, usize)>(
-        dnam_engine_process_mono,
-    );
-    core::hint::black_box::<unsafe extern "C" fn(*mut DnamEngineHandle)>(dnam_engine_reset);
-}
-
-fn workspace_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root")
-        .to_path_buf()
-}
-
-fn current_target_triple() -> &'static str {
-    #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    {
-        "aarch64-apple-darwin"
-    }
-    #[cfg(all(target_arch = "x86_64", target_os = "macos"))]
-    {
-        "x86_64-apple-darwin"
-    }
-    #[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-    {
-        "aarch64-unknown-linux-gnu"
-    }
-    #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
-    {
-        "x86_64-unknown-linux-gnu"
-    }
-}
-
-fn rlib_matches_current_arch(rlib_path: &Path) -> bool {
-    if !rlib_path.is_file() {
-        return false;
-    }
-    let Ok(out) = Command::new("objdump").arg("-t").arg(rlib_path).output() else {
-        return false;
-    };
-    let text = String::from_utf8_lossy(&out.stdout);
-    if !text.contains("SonaHotSlab")
-        && !text.contains("SonaInstance")
-        && !text.contains("process_block")
-    {
-        return false;
-    }
-    #[cfg(target_arch = "aarch64")]
-    {
-        text.contains("arm64") || text.contains("aarch64")
-    }
-    #[cfg(target_arch = "x86_64")]
-    {
-        text.contains("x86-64") || text.contains("x86_64")
-    }
-}
-
-fn ensure_release_rlib() -> PathBuf {
-    let root = workspace_root();
-    let triple = current_target_triple();
-    let audit_target_dir = root.join("target").join("release-audit");
-    let status = Command::new("cargo")
-        .current_dir(&root)
-        .env_remove("RUSTFLAGS")
-        .env_remove("CARGO_ENCODED_RUSTFLAGS")
-        .env_remove("LLVM_PROFILE_FILE")
-        .args([
-            "build",
-            "--package",
-            "dnam-engine",
-            "--release",
-            "--target",
-            triple,
-            "--target-dir",
-        ])
-        .arg(&audit_target_dir)
-        .status()
-        .expect("failed to invoke cargo build --release for disassembly audit");
-    assert!(status.success(), "cargo build --release failed");
-
-    let built = audit_target_dir
-        .join(triple)
-        .join("release")
-        .join("libdnam_engine.rlib");
-    assert!(
-        rlib_matches_current_arch(&built),
-        "expected release rlib at {}",
-        built.display()
-    );
-    built
-}
+const RT_ROOT_EXACT_OR_SUBSTRS: &[&str] = &[
+    "DnamEngine<",
+    "::process_block",
+    "process_stereo_vm_block",
+    "DynamicDnamEngine>::",
+    "DnamHostHandle>::process_block_chunked",
+    "DnamHostHandle>::process_block_in_place_chunked",
+    "DnamHostHandle>::process_mono_chunked",
+    "DnamHostHandle>::render_offline_bounce_with_options",
+    "ParallelAlignLine>::configure",
+    "PreviewGuardState>::process_block_in_place",
+    "PreviewGuardState>::reset",
+    "ControlConsumer>::drain_into_tracking_bounce",
+    "dnam_engine_process_block",
+    "dnam_engine_process_mono",
+    "dnam_engine_set_sample_rate",
+    "dnam_engine_set_offline_bounce",
+    "dnam_engine_set_maximize_tier_on_bounce",
+    "dnam_engine_set_tier",
+    "dnam_engine_set_max_supported_tier",
+    "dnam_engine_set_control_value",
+    "dnam_engine_set_control_immediate",
+    "dnam_engine_get_latency_samples",
+    "dnam_engine_get_telemetry",
+    "dnam_engine_reset",
+    "sona_vm_process_block_default",
+    "sona_vm_step_frame_default",
+    "sona_vm_step_control_tick_default",
+    "step_frame_sona",
+    "step_frame_4x_sona",
+    "process_block_sona",
+    "DynamicSonaVm>::",
+    "ControlBus",
+    "step_control_tick_3khz_default",
+    "sona_graph_eval_core_quads_default",
+    "sona_graph_convolver_chunk_default",
+    "sona_graph_transport_top_default",
+    "sona_graph_transport_end_default",
+];
 
 fn is_realtime_root_symbol(sym: &str) -> bool {
-    const RT_OWNER_PATTERNS: &[&str] = &[
-        "DnamEngine",
-        "DynamicDnamEngine",
-        "DnamHostHandle",
-        "ControlBus",
-        "IoRouter",
-        "CrossbarHot",
-        "CabinetHot",
-        "SpatialTankHot",
-        "SonaHotSlab",
-        "SonaInstance",
-        "step_sona_group_stereo8",
-        "sona_process_block_default",
-        "sona_process_block_infallible_default",
-        "dnam_engine_process_block",
-        "dnam_engine_process_mono",
-        "dnam_engine_set_offline_bounce",
-        "dnam_engine_set_tier",
-        "dnam_engine_set_control_value",
-        "dnam_engine_set_control_immediate",
-        "dnam_engine_reset",
-    ];
-    const RT_METHOD_PATTERNS: &[&str] = &[
-        "::process_block",
-        "::process_block_in_place",
-        "::process_block_stereo",
-        "::process_block_infallible",
-        "::process_block_io",
-        "::process_block_4cm",
-        "::process_block_wdw",
-        "::process_block_sidechain",
-        "::step_4port_frame",
-        "::step_stereo",
-        "::step_subblock",
-        "::step_subblock_fast",
-        "::run_3khz_tick",
-        "::step_blocks",
-        "::reconfigure",
-        "step_sona_group_stereo8",
-        "sona_process_block_default",
-        "sona_process_block_infallible_default",
-        "::process_mono",
-        "::process_mono_to_stereo",
-        "::process_stereo",
-        "::process_stereo_to_mono",
-        "::step_control_tick_3khz",
-        "::tick_3khz",
-        "::tick_3khz_with_detectors",
-        "::kautz_formant",
-        "::set_offline_bounce",
-        "::render_offline_bounce_with_options",
-        "::set_bypass",
-        "::set_freeze",
-        "::set_stereo_width",
-        "::reload_model_in_place",
-        "dnam_engine_process_block",
-        "dnam_engine_process_mono",
-        "dnam_engine_set_offline_bounce",
-        "dnam_engine_set_tier",
-        "dnam_engine_set_control_value",
-        "dnam_engine_set_control_immediate",
-        "dnam_engine_reset",
-    ];
-    RT_OWNER_PATTERNS.iter().any(|p| sym.contains(p))
-        && RT_METHOD_PATTERNS.iter().any(|m| sym.contains(m))
-        && !sym.contains("reload_model_in_place_owned")
-}
-
-fn clean_reloc_target(raw: &str) -> &str {
-    let s = raw.trim_start_matches('_');
-    let s = s.split('@').next().unwrap_or(s);
-    let s = s.split('+').next().unwrap_or(s);
-    s.split('-').next().unwrap_or(s)
+    if sym.contains("reload_model_in_place_owned")
+        || sym.contains("drop_in_place")
+        || sym.contains("drop_glue")
+        || sym.contains("from_dnam_bin")
+        || sym.contains("with_headroom")
+        || sym.contains("open_with_backend")
+    {
+        return false;
+    }
+    let layer1_engine_method = (sym.contains("DnamEngine")
+        || sym.contains("DynamicDnamEngine>::")
+        || sym.contains("process_stereo_vm_block"))
+        && (sym.contains("::process_block")
+            || sym.contains("::process_mono")
+            || sym.contains("::process_stereo")
+            || sym.contains("process_stereo_vm_block")
+            || sym.contains("::step_frame")
+            || sym.contains("::set_tier")
+            || sym.contains("::set_max_supported_tier")
+            || sym.contains("::set_offline_bounce")
+            || sym.contains("::set_maximize_tier_on_bounce")
+            || sym.contains("::set_sample_rate_rt")
+            || sym.contains("::reconfigure_for_sample_rate_rt")
+            || sym.contains("::set_bypass")
+            || sym.contains("::set_routing_mode")
+            || sym.contains("::set_wdw_mode")
+            || sym.contains("::set_wdw_enabled")
+            || sym.contains("::configure_return_alignment")
+            || sym.contains("::configure_parallel_alignment")
+            || sym.contains("::set_quad_write_enable")
+            || sym.contains("::set_op_t_write_enable")
+            || sym.contains("::set_stereo_width")
+            || sym.contains("::set_control_value")
+            || sym.contains("::set_control_immediate")
+            || sym.contains("::reset_to_dc_equilibrium")
+            || sym.contains("::sync_tempo")
+            || sym.contains("::register_tap_tempo")
+            || sym.contains("::reload_model_in_place")
+            || sym.contains("::telemetry_snapshot")
+            || sym.contains("::render_offline_bounce"));
+    let patchbay_or_guard = sym.contains("HostShellPatchbay>::route_")
+        || sym.contains("HostShellPatchbay>::set_routing_mode")
+        || sym.contains("HostShellPatchbay>::set_wdw_mode")
+        || sym.contains("HostShellPatchbay>::set_wdw_enabled")
+        || sym.contains("HostShellPatchbay>::reconfigure_sample_rate")
+        || sym.contains("HostShellPatchbay>::configure_return_alignment")
+        || sym.contains("HostShellPatchbay>::configure_parallel_alignment")
+        || sym.contains("HostShellPatchbay>::reset")
+        || sym.contains("ParallelAlignLine>::configure")
+        || sym.contains("ParallelAlignLine>::step")
+        || sym.contains("ReturnAligner>::step")
+        || sym.contains("eval_wdw_routing_outputs")
+        || sym.contains("PreviewGuardState>::process_")
+        || sym.contains("PreviewGuardState>::reset")
+        || sym.contains("ControlConsumer>::drain_into_tracking_bounce");
+    let c_sym = sym.trim_start_matches('_');
+    let host_or_ffi = sym.contains("DnamHostHandle>::process_")
+        || sym.contains("DnamHostHandle>::render_offline_bounce")
+        || sym.contains("DnamHostHandle>::set_bypass")
+        || sym.contains("DnamHostHandle>::set_stereo_width")
+        || sym.contains("DnamHostHandle>::set_offline_bounce")
+        || sym.contains("DnamHostHandle>::set_tier")
+        || sym.contains("DnamHostHandle>::set_max_supported_tier")
+        || sym.contains("DnamHostHandle>::set_maximize_tier_on_bounce")
+        || sym.contains("DnamHostHandle>::set_control_value")
+        || sym.contains("DnamHostHandle>::set_control_immediate")
+        || sym.contains("DnamHostHandle>::reset_to_dc_equilibrium")
+        || sym.contains("DnamHostHandle>::sync_tempo")
+        || matches!(
+            c_sym,
+            "dnam_engine_process_block"
+                | "dnam_engine_process_mono"
+                | "dnam_engine_set_sample_rate"
+                | "dnam_engine_set_offline_bounce"
+                | "dnam_engine_set_maximize_tier_on_bounce"
+                | "dnam_engine_set_tier"
+                | "dnam_engine_set_max_supported_tier"
+                | "dnam_engine_set_control_value"
+                | "dnam_engine_set_control_immediate"
+                | "dnam_engine_get_latency_samples"
+                | "dnam_engine_get_telemetry"
+                | "dnam_engine_reset"
+        );
+    let vm_or_kernel = sym.contains("sona_vm_process_")
+        || sym.contains("sona_vm_step_")
+        || sym.contains("step_frame_sona")
+        || sym.contains("step_frame_4x_sona")
+        || sym.contains("process_block_sona")
+        || sym.contains("sona_graph_")
+        || (sym.contains("DynamicSonaVm>::")
+            && (sym.contains("::process_")
+                || sym.contains("::step_")
+                || sym.contains("::set_")
+                || sym.contains("::switch_tier")
+                || sym.contains("::reload_from_view_in_place")
+                || sym.contains("::reset")))
+        || (sym.contains("ControlBus")
+            && (sym.contains("::step_frame")
+                || sym.contains("::tick_control_boundary")
+                || sym.contains("::eval_")
+                || sym.contains("::reset")))
+        || sym.contains("step_control_tick_3khz");
+    layer1_engine_method || patchbay_or_guard || host_or_ffi || vm_or_kernel
 }
 
 fn is_forbidden_rt_instruction(mnemonic: &str) -> bool {
@@ -309,9 +207,8 @@ fn is_forbidden_rt_instruction(mnemonic: &str) -> bool {
 }
 
 fn is_forbidden_crate_wide_reloc(target: &str) -> bool {
-    let clean = clean_reloc_target(target);
     matches!(
-        clean,
+        clean_reloc_target(target),
         "fmodf"
             | "fmod"
             | "sinf"
@@ -391,336 +288,38 @@ fn is_forbidden_rt_reloc(target: &str) -> bool {
         || clean.contains("OnceBox")
 }
 
-#[derive(Default)]
-struct FnDisasm {
-    demangled: String,
-    instructions: Vec<(String, String)>,
-    relocs: Vec<(String, String)>,
-    callees: BTreeSet<String>,
-}
-
-fn is_local_temp_label(sym: &str) -> bool {
-    sym.starts_with("ltmp") || sym.starts_with(".L")
-}
-
-fn parse_objdump_object_header(line: &str) -> Option<String> {
-    let ff = line.find("file format ")?;
-    let colon = line[..ff].rfind(':')?;
-    Some(line[..colon].trim().to_string())
-}
-
-fn parse_objdump_sym_table_line(line: &str) -> Option<(u64, &str, &str)> {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let addr_tok = trimmed.split_whitespace().next()?;
-    if addr_tok.len() < 8 || !addr_tok.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-    let addr = u64::from_str_radix(addr_tok, 16).ok()?;
-    let mut cursor = trimmed[addr_tok.len()..].trim_start();
-    let mut is_func = false;
-    let section = loop {
-        let tok = cursor.split_whitespace().next()?;
-        if tok.starts_with("__") || tok.starts_with('.') || tok.starts_with('*') {
-            break tok;
-        }
-        if tok.contains('F') {
-            is_func = true;
-        }
-        cursor = cursor[tok.len()..].trim_start();
-    };
-    if !is_func || (!section.starts_with("__TEXT,__text") && !section.starts_with(".text")) {
-        return None;
-    }
-    let mut sym_tail = cursor[section.len()..].trim_start();
-    if let Some(first_tok) = sym_tail.split_whitespace().next()
-        && first_tok.len() >= 4
-        && first_tok.chars().all(|c| c.is_ascii_hexdigit())
-        && !sym_tail[first_tok.len()..].trim_start().is_empty()
-    {
-        sym_tail = sym_tail[first_tok.len()..].trim_start();
-    }
-    for vis in [".hidden", ".protected", ".internal"] {
-        if let Some(rest) = sym_tail.strip_prefix(vis)
-            && rest.chars().next().is_some_and(char::is_whitespace)
-        {
-            sym_tail = rest.trim_start();
-            break;
-        }
-    }
-    if sym_tail.is_empty() {
-        return None;
-    }
-    Some((addr, section, sym_tail))
-}
-
-fn collect_symbol_aliases(rlib: &Path) -> BTreeMap<(String, String, u64), Vec<(String, String)>> {
-    let sym_raw_out = Command::new("objdump")
-        .arg("-t")
-        .arg(rlib)
-        .output()
-        .expect("failed to execute objdump -t");
-    assert!(
-        sym_raw_out.status.success(),
-        "objdump -t failed on {}",
-        rlib.display()
-    );
-    let sym_dem_out = Command::new("objdump")
-        .args(["-t", "--demangle"])
-        .arg(rlib)
-        .output()
-        .expect("failed to execute objdump -t --demangle");
-    assert!(
-        sym_dem_out.status.success(),
-        "objdump -t --demangle failed on {}",
-        rlib.display()
-    );
-
-    let sym_raw_text = String::from_utf8_lossy(&sym_raw_out.stdout);
-    let sym_dem_text = String::from_utf8_lossy(&sym_dem_out.stdout);
-    let mut aliases: BTreeMap<(String, String, u64), Vec<(String, String)>> = BTreeMap::new();
-    let mut current_obj = String::new();
-
-    for (raw_line, dem_line) in sym_raw_text.lines().zip(sym_dem_text.lines()) {
-        if let Some(obj) = parse_objdump_object_header(raw_line) {
-            current_obj = obj;
-            continue;
-        }
-        if current_obj.is_empty() {
-            continue;
-        }
-        let Some((addr, sec, raw_sym)) = parse_objdump_sym_table_line(raw_line) else {
-            continue;
-        };
-        if is_local_temp_label(raw_sym) {
-            continue;
-        }
-        let clean_key = clean_reloc_target(raw_sym);
-        if clean_key.is_empty() || is_local_temp_label(clean_key) {
-            continue;
-        }
-        let dem_sym = parse_objdump_sym_table_line(dem_line)
-            .map(|(_, _, s)| s)
-            .unwrap_or(raw_sym);
-        let group = aliases
-            .entry((current_obj.clone(), sec.to_string(), addr))
-            .or_default();
-        if !group.iter().any(|(k, _)| k == clean_key) {
-            group.push((clean_key.to_string(), dem_sym.to_string()));
-        }
-    }
-    aliases
-}
-
+/// verify[sdk.rust.realtime-disassembly-audit]
+/// verify[arch.simd.zero-stall-lowering]
+/// verify[dsp.op-m.rotor.angle-wrap-and-retune]
+/// verify[dsp.op-t.guard.incremental-counters]
 /// verify[dsp.op-t.zero-fdiv]
 #[test]
 fn test_release_disassembly_zero_pipeline_stalls_and_nondeterministic_calls() {
-    retain_realtime_entry_points();
-    let rlib = ensure_release_rlib();
-    let alias_groups = collect_symbol_aliases(&rlib);
-    let out_raw = Command::new("objdump")
-        .args(["-dr"])
-        .arg(&rlib)
-        .output()
-        .expect("failed to execute objdump -dr");
-    assert!(
-        out_raw.status.success(),
-        "objdump -dr failed on {}",
-        rlib.display()
-    );
-    let text_raw = String::from_utf8_lossy(&out_raw.stdout);
+    let [engine_rlib, vm_rlib, kernels_rlib] = ensure_release_rlibs();
 
-    let out_demangled = Command::new("objdump")
-        .args(["-dr", "--demangle"])
-        .arg(&rlib)
-        .output()
-        .expect("failed to execute objdump -dr --demangle");
-    assert!(
-        out_demangled.status.success(),
-        "objdump -dr --demangle failed on {}",
-        rlib.display()
-    );
-    let text_demangled = String::from_utf8_lossy(&out_demangled.stdout);
-
-    let demangled_headers: Vec<String> = text_demangled
-        .lines()
-        .filter_map(|raw_line| {
-            let line = raw_line.trim();
-            if line.ends_with(">:")
-                && let Some(open) = line.find('<')
-            {
-                Some(line[open + 1..line.len() - 2].to_string())
-            } else {
-                None
-            }
-        })
-        .collect();
-
+    let mut alias_groups: AliasMap = BTreeMap::new();
     let mut fns: BTreeMap<String, FnDisasm> = BTreeMap::new();
-    let mut blocks: BTreeMap<(String, String, u64), FnDisasm> = BTreeMap::new();
-    let mut current_obj = String::new();
-    let mut current_section = String::new();
-    let mut current_block: Option<(String, String, u64)> = None;
-    let mut current_fn = String::new();
-    let mut header_idx = 0usize;
+    let mut blocks = BTreeMap::new();
+    for (tag, path) in [
+        ("engine", &engine_rlib),
+        ("vm", &vm_rlib),
+        ("kernels", &kernels_rlib),
+    ] {
+        collect_symbol_aliases(tag, path, &mut alias_groups);
+        disassemble_rlib_into(tag, path, &mut fns, &mut blocks);
+    }
+    merge_folded_symbol_aliases(&alias_groups, &blocks, &mut fns);
 
-    for raw_line in text_raw.lines() {
-        let line = raw_line.trim();
-        if let Some(obj) = parse_objdump_object_header(line) {
-            current_obj = obj;
-            current_section.clear();
-            current_block = None;
-            current_fn.clear();
-            continue;
-        }
-        if let Some(sec_rest) = line.strip_prefix("Disassembly of section ") {
-            current_section = sec_rest.trim_end_matches(':').trim().to_string();
-            current_block = None;
-            current_fn.clear();
-            continue;
-        }
-        if line.ends_with(">:")
-            && let Some(open) = line.find('<')
-        {
-            let addr_hex = line[..open].trim();
-            let raw_sym = &line[open + 1..line.len() - 2];
-            let clean_key = clean_reloc_target(raw_sym).to_string();
-            let demangled = demangled_headers
-                .get(header_idx)
-                .cloned()
-                .unwrap_or_else(|| clean_key.clone());
-            header_idx += 1;
-
-            current_block = if !current_obj.is_empty() && !current_section.is_empty() {
-                u64::from_str_radix(addr_hex, 16)
-                    .ok()
-                    .map(|addr| (current_obj.clone(), current_section.clone(), addr))
-            } else {
-                None
-            };
-            if let Some(loc) = &current_block {
-                blocks.entry(loc.clone()).or_default().demangled = demangled.clone();
-            }
-
-            if !is_local_temp_label(raw_sym) && !is_local_temp_label(&clean_key) {
-                current_fn = clean_key;
-                let entry = fns.entry(current_fn.clone()).or_default();
-                entry.demangled = demangled;
-            } else {
-                current_fn.clear();
-            }
-            continue;
-        }
-        if current_fn.is_empty() && current_block.is_none() {
-            continue;
-        }
-
-        if line.contains("RELOC") || line.contains("R_AARCH64") || line.contains("R_X86_64") {
-            if let Some(target) = line.split_whitespace().last() {
-                let callee_key = clean_reloc_target(target).to_string();
-                if let Some(loc) = &current_block {
-                    let blk = blocks.entry(loc.clone()).or_default();
-                    blk.relocs.push((target.to_string(), line.to_string()));
-                    if !is_local_temp_label(&callee_key) {
-                        blk.callees.insert(callee_key.clone());
-                    }
-                }
-                if !current_fn.is_empty() {
-                    let entry = fns.entry(current_fn.clone()).or_default();
-                    entry.relocs.push((target.to_string(), line.to_string()));
-                    if callee_key != current_fn && !is_local_temp_label(&callee_key) {
-                        entry.callees.insert(callee_key);
-                    }
-                }
-            }
-            continue;
-        }
-
-        let parts: Vec<&str> = line.split('\t').collect();
-        let insn_col_idx = usize::from(parts[0].trim_end().ends_with(':')) + 1;
-        if parts.len() > insn_col_idx {
-            let insn_col = parts[insn_col_idx].trim();
-            let mnemonic = insn_col.split_whitespace().next().unwrap_or("");
-            if !mnemonic.is_empty() {
-                let full_insn = parts[insn_col_idx..].join(" ");
-                let callee_base = if matches!(mnemonic, "bl" | "b" | "call" | "callq" | "jmp")
-                    && let (Some(open), Some(close)) = (full_insn.find('<'), full_insn.rfind('>'))
-                    && open + 1 < close
-                {
-                    let callee = &full_insn[open + 1..close];
-                    let base = clean_reloc_target(callee);
-                    (!is_local_temp_label(base)).then(|| base.to_string())
-                } else {
-                    None
-                };
-
-                if let Some(loc) = &current_block {
-                    let blk = blocks.entry(loc.clone()).or_default();
-                    blk.instructions
-                        .push((mnemonic.to_string(), line.to_string()));
-                    if let Some(base) = &callee_base {
-                        blk.callees.insert(base.clone());
-                    }
-                }
-                if !current_fn.is_empty() {
-                    let entry = fns.entry(current_fn.clone()).or_default();
-                    entry
-                        .instructions
-                        .push((mnemonic.to_string(), line.to_string()));
-                    if let Some(base) = callee_base
-                        && base != current_fn
-                    {
-                        entry.callees.insert(base);
-                    }
-                }
-            }
+    let mut raw_to_scoped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for key in fns.keys() {
+        if let Some((_, raw)) = key.split_once("::") {
+            raw_to_scoped
+                .entry(raw.to_string())
+                .or_default()
+                .push(key.clone());
         }
     }
 
-    // Propagate disassembled instructions, relocations, and callees across folded co-addressed
-    // Mach-O / ELF aliases so symbol folding or `<ltmp0>` headers never hide call-graph edges.
-    for (loc, group) in &alias_groups {
-        let mut merged_instructions = Vec::new();
-        let mut merged_relocs = Vec::new();
-        let mut merged_callees = BTreeSet::new();
-        if let Some(block) = blocks.get(loc) {
-            merged_instructions.extend(block.instructions.iter().cloned());
-            merged_relocs.extend(block.relocs.iter().cloned());
-            merged_callees.extend(block.callees.iter().cloned());
-        } else {
-            for (alias_key, _) in group {
-                if let Some(existing) = fns.get(alias_key) {
-                    merged_instructions.extend(existing.instructions.iter().cloned());
-                    merged_relocs.extend(existing.relocs.iter().cloned());
-                    merged_callees.extend(existing.callees.iter().cloned());
-                }
-            }
-        }
-        if merged_instructions.is_empty() && merged_relocs.is_empty() && merged_callees.is_empty() {
-            continue;
-        }
-        for (alias_key, alias_demangled) in group {
-            let entry = fns.entry(alias_key.clone()).or_default();
-            if entry.demangled.is_empty() {
-                entry.demangled = alias_demangled.clone();
-            }
-            if entry.instructions.is_empty() {
-                entry.instructions = merged_instructions.clone();
-            }
-            if entry.relocs.is_empty() {
-                entry.relocs = merged_relocs.clone();
-            }
-            for callee in &merged_callees {
-                if callee != alias_key {
-                    entry.callees.insert(callee.clone());
-                }
-            }
-        }
-    }
-
-    // Compute transitive call-graph closure from all real-time roots
     let mut rt_closure: BTreeSet<String> = fns
         .iter()
         .filter(|(_, info)| is_realtime_root_symbol(&info.demangled))
@@ -731,23 +330,169 @@ fn test_release_disassembly_zero_pipeline_stalls_and_nondeterministic_calls() {
     while let Some(sym) = worklist.pop() {
         if let Some(info) = fns.get(&sym) {
             for callee in &info.callees {
-                if let Some(callee_info) = fns.get(callee) {
-                    if is_prewarmed_host_mutex_init(&info.demangled, &callee_info.demangled)
-                        || is_prewarmed_host_mutex_init(&info.demangled, callee)
-                    {
-                        continue;
-                    }
-                    if rt_closure.insert(callee.clone()) {
-                        worklist.push(callee.clone());
+                if let Some(targets) = raw_to_scoped.get(callee) {
+                    for target_key in targets {
+                        if let Some(callee_info) = fns.get(target_key) {
+                            if is_prewarmed_host_mutex_init(&info.demangled, &callee_info.demangled)
+                                || is_prewarmed_host_mutex_init(&info.demangled, target_key)
+                            {
+                                continue;
+                            }
+                            if rt_closure.insert(target_key.clone()) {
+                                worklist.push(target_key.clone());
+                            }
+                        }
                     }
                 }
             }
         }
     }
 
+    for fn_key in &rt_closure {
+        if let Some(info) = fns.get(fn_key) {
+            assert!(
+                !info.instructions.is_empty(),
+                "Audited RT closure symbol `{}` (`{fn_key}`) had 0 disassembled instructions",
+                info.demangled
+            );
+        }
+    }
+
+    for pattern in RT_ROOT_EXACT_OR_SUBSTRS {
+        let found = rt_closure.iter().any(|k| {
+            fns.get(k)
+                .is_some_and(|i| i.demangled.contains(pattern) && !i.instructions.is_empty())
+        });
+        assert!(
+            found,
+            "Expected non-empty RT root matching `{pattern}` across engine/vm/kernels rlibs"
+        );
+    }
+
+    for required_sym in [
+        "dnam_engine_process_block",
+        "dnam_engine_process_mono",
+        "dnam_engine_set_sample_rate",
+        "dnam_engine_set_offline_bounce",
+        "dnam_engine_set_maximize_tier_on_bounce",
+        "dnam_engine_set_tier",
+        "dnam_engine_set_max_supported_tier",
+        "dnam_engine_set_control_value",
+        "dnam_engine_set_control_immediate",
+        "dnam_engine_get_latency_samples",
+        "dnam_engine_get_telemetry",
+        "dnam_engine_reset",
+        "DnamHostHandle>::process_block_chunked",
+        "DnamHostHandle>::process_block",
+        "DnamHostHandle>::process_block_in_place",
+        "DnamHostHandle>::process_stereo",
+        "DnamHostHandle>::process_stereo_to_mono",
+        "DnamHostHandle>::process_mono_to_stereo",
+        "DnamHostHandle>::process_mono",
+        "DnamHostHandle>::process_mono_in_place_chunked",
+        "DnamHostHandle>::process_mono_in_place",
+        "DnamHostHandle>::render_offline_bounce_with_options",
+        "DnamHostHandle>::set_tier",
+        "DnamHostHandle>::set_max_supported_tier",
+        "DnamHostHandle>::set_offline_bounce",
+        "DnamHostHandle>::set_maximize_tier_on_bounce",
+        "DnamHostHandle>::set_control_value",
+        "DnamHostHandle>::set_control_immediate",
+        "DnamHostHandle>::set_bypass",
+        "DnamHostHandle>::set_stereo_width",
+        "DnamHostHandle>::reset_to_dc_equilibrium",
+        "DnamHostHandle>::sync_tempo",
+        "ControlConsumer>::drain_into_tracking_bounce",
+        "DynamicDnamEngine>::process_block",
+        "DynamicDnamEngine>::process_block_in_place",
+        "DynamicDnamEngine>::process_stereo",
+        "DynamicDnamEngine>::process_stereo_to_mono",
+        "DynamicDnamEngine>::process_mono_to_stereo",
+        "DynamicDnamEngine>::process_mono",
+        "DynamicDnamEngine>::process_block_io",
+        "DynamicDnamEngine>::process_block_4cm",
+        "DynamicDnamEngine>::process_block_wdw",
+        "DynamicDnamEngine>::process_block_sidechain",
+        "DynamicDnamEngine>::step_frame_sona",
+        "DynamicDnamEngine>::set_tier",
+        "DynamicDnamEngine>::set_max_supported_tier",
+        "DynamicDnamEngine>::set_offline_bounce",
+        "DynamicDnamEngine>::set_maximize_tier_on_bounce",
+        "DynamicDnamEngine>::set_sample_rate_rt",
+        "DynamicDnamEngine>::set_control_value",
+        "DynamicDnamEngine>::set_control_immediate",
+        "DynamicDnamEngine>::reset_to_dc_equilibrium",
+        "DynamicDnamEngine>::set_bypass",
+        "DynamicDnamEngine>::set_stereo_width",
+        "DynamicDnamEngine>::set_routing_mode",
+        "DynamicDnamEngine>::set_wdw_mode",
+        "DynamicDnamEngine>::set_wdw_enabled",
+        "DynamicDnamEngine>::configure_return_alignment",
+        "DynamicDnamEngine>::configure_parallel_alignment",
+        "DynamicDnamEngine>::set_quad_write_enable",
+        "DynamicDnamEngine>::set_op_t_write_enable",
+        "DynamicDnamEngine>::sync_tempo",
+        "DynamicDnamEngine>::register_tap_tempo",
+        "DynamicDnamEngine>::reload_model_in_place",
+        "DynamicDnamEngine>::telemetry_snapshot",
+        "DynamicDnamEngine>::render_offline_bounce",
+        "step_frame_sona",
+        "step_frame_4port_sona",
+        "process_stereo_vm_block",
+        "set_bypass",
+        "set_quad_write_enable",
+        "set_op_t_write_enable",
+        "set_stereo_width",
+        "reload_model_in_place",
+        "HostShellPatchbay>::set_routing_mode",
+        "HostShellPatchbay>::reconfigure_sample_rate",
+        "HostShellPatchbay>::configure_return_alignment",
+        "HostShellPatchbay>::configure_parallel_alignment",
+        "ParallelAlignLine>::configure",
+        "PreviewGuardState>::process_block_in_place",
+    ] {
+        let found = rt_closure.iter().any(|k| {
+            k.starts_with("engine::")
+                && fns.get(k).is_some_and(|i| {
+                    i.demangled.contains(required_sym) && !i.instructions.is_empty()
+                })
+        });
+        assert!(
+            found,
+            "Expected non-empty Layer 1 (`engine::`) RT symbol `{required_sym}`"
+        );
+    }
+
+    for required_vm_sym in [
+        "sona_vm_process_block_default",
+        "sona_vm_step_frame_default",
+        "sona_vm_step_control_tick_default",
+        "step_frame_sona",
+        "step_frame_4x_sona",
+        "process_block_sona",
+        "sona_graph_eval_core_quads_default",
+        "sona_graph_convolver_chunk_default",
+        "sona_graph_transport_top_default",
+        "sona_graph_transport_end_default",
+        "sona_graph_sensory_step_default",
+        "sona_graph_op_n_pre_step_default",
+        "sona_graph_dispatch_transport_3khz_default",
+        "step_control_tick_3khz_default",
+    ] {
+        let found = rt_closure.iter().any(|k| {
+            k.starts_with("vm::")
+                && fns.get(k).is_some_and(|i| {
+                    i.demangled.contains(required_vm_sym) && !i.instructions.is_empty()
+                })
+        });
+        assert!(
+            found,
+            "Expected non-empty Layer 0 (`vm::`) RT symbol `{required_vm_sym}`"
+        );
+    }
+
     let mut crate_reloc_violations = Vec::new();
     let mut rt_violations = Vec::new();
-
     for (fn_key, info) in &fns {
         let fn_name = &info.demangled;
         for (target, line) in &info.relocs {
@@ -769,101 +514,24 @@ fn test_release_disassembly_zero_pipeline_stalls_and_nondeterministic_calls() {
         }
     }
 
-    let has_sona_root = rt_closure.iter().any(|k| {
-        fns.get(k).is_some_and(|info| {
-            info.demangled.contains("sona_process_block")
-                || info.demangled.contains("SonaHotSlab")
-                || info.demangled.contains("SonaInstance")
-                || info.demangled.contains("step_sona_group_stereo8")
-        })
-    });
-    for required_sym in [
-        "dnam_engine_process_block",
-        "dnam_engine_process_mono",
-        "dnam_engine_set_offline_bounce",
-        "dnam_engine_set_tier",
-        "dnam_engine_set_control_value",
-        "dnam_engine_set_control_immediate",
-        "dnam_engine_reset",
-        "set_offline_bounce",
-        "render_offline_bounce_with_options",
-        "set_bypass",
-        "set_freeze",
-        "set_stereo_width",
-    ] {
-        let found = rt_closure.iter().any(|k| {
-            fns.get(k)
-                .is_some_and(|info| info.demangled.contains(required_sym))
-        });
-        assert!(
-            found,
-            "Expected real-time root `{required_sym}` to be audited in {}",
-            rlib.display()
-        );
-    }
-    for (owner, method) in [
-        ("DynamicDnamEngine", "::process_block_io"),
-        ("DynamicDnamEngine", "::process_block_4cm"),
-        ("DynamicDnamEngine", "::process_block_wdw"),
-        ("DynamicDnamEngine", "::process_block_sidechain"),
-        ("DynamicDnamEngine", "::reload_model_in_place"),
-        ("DnamHostHandle", "::process_block"),
-        ("DnamHostHandle", "::process_block_in_place"),
-        ("DnamHostHandle", "::process_mono"),
-    ] {
-        let found = rt_closure.iter().any(|k| {
-            fns.get(k).is_some_and(|info| {
-                let d = &info.demangled;
-                if !d.contains(owner) {
-                    return false;
-                }
-                match (owner, method) {
-                    ("DynamicDnamEngine", "::reload_model_in_place") => {
-                        d.contains("::reload_model_in_place")
-                            && !d.contains("reload_model_in_place_owned")
-                    }
-                    ("DnamHostHandle", "::process_block") => {
-                        d.ends_with("::process_block") || d.contains("::process_block_chunked")
-                    }
-                    ("DnamHostHandle", "::process_block_in_place") => {
-                        d.ends_with("::process_block_in_place")
-                            || d.contains("::process_block_in_place_chunked")
-                    }
-                    ("DnamHostHandle", "::process_mono") => {
-                        d.ends_with("::process_mono") || d.contains("::process_mono_chunked")
-                    }
-                    _ => d.contains(method),
-                }
-            })
-        });
-        assert!(
-            found,
-            "Expected real-time entry point `{owner}{method}` to be audited in {}",
-            rlib.display()
-        );
-    }
     assert!(
-        has_sona_root,
-        "Expected SONA real-time roots to be present and audited in {}",
-        rlib.display()
-    );
-    assert!(
-        root_count >= 15 && rt_closure.len() > root_count,
-        "Expected >= 15 real-time root functions and non-empty transitive callees in {}, found {} roots and {} total in closure",
-        rlib.display(),
-        root_count,
+        root_count >= 20 && rt_closure.len() > root_count,
+        "Expected >= 20 real-time roots and transitive callees, got roots={root_count}, closure={}",
         rt_closure.len()
     );
     assert!(
         crate_reloc_violations.is_empty(),
-        "REQ-6.2 violation: forbidden libm/fmod relocations in {}:\n{}",
-        rlib.display(),
+        "REQ-6.2 forbidden libm relocations:\n{}",
         crate_reloc_violations.join("\n")
     );
     assert!(
         rt_violations.is_empty(),
-        "REQ-6.2 / REQ-6.3 violation: pipeline-stalling instructions or nondeterministic calls in {}:\n{}",
-        rlib.display(),
+        "REQ-6.2/6.3 RT instruction or nondeterministic call violations:\n{}",
         rt_violations.join("\n")
+    );
+    eprintln!(
+        "Disassembly audit verified: roots={root_count}, rt_closure={}, total_fns={}",
+        rt_closure.len(),
+        fns.len()
     );
 }

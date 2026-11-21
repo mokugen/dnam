@@ -288,6 +288,7 @@ mod tests {
     /// verify[dsp.op-m.kautz.dual-state]
     /// verify[dsp.op-m.kautz.coupled-form]
     /// verify[dsp.op-m.recurrence.stereo-simd]
+    /// verify[dsp.op-m.recurrence.symplectic]
     #[test]
     fn test_kautz_sweep_contraction_and_zero_ulp_parity() {
         assert_eq!(eval_kautz_sweep_contraction_f32(0.9995, 0.0), 0.9995);
@@ -494,6 +495,7 @@ mod tests {
             }
         }
 
+        /// verify[dsp.op-m.recurrence.symplectic]
         #[test]
         fn prop_complex_modal_scan_associativity(
             xs in prop::array::uniform4(-1.0_f32..1.0_f32),

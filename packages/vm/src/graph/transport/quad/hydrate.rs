@@ -254,6 +254,7 @@ mod tests {
     use zerocopy::FromZeros;
     use zerocopy::byteorder::little_endian::{F32, U16};
 
+    /// verify[dsp.zoh.op-t-delays]
     #[test]
     fn test_wire_hydration_sigma_sat_freeze_mix_and_zoh_bounds() {
         let mut w0 = TransportQuadWire::new_zeroed();

@@ -1,18 +1,19 @@
-//! Model-Declared Delay Histories, Cabinet Separate 64B-Aligned Slices, and `CP1` Packed Control
+//! Model-Declared Delay Histories, `ModalConvolver` Separate `64 B`-Aligned Slices, and `CP1` Packed Control
 //! Projections (`ref[container.dnam.delay-histories]`, `ref[container.dnam.load-validation]`,
 //! `ref[container.dnam.cabinet-slices]`, `ref[container.dnam.cp1-profile]`).
 
-pub mod delay_and_cabinet;
+pub mod delay_and_convolver;
 
-pub use delay_and_cabinet::{
+pub use delay_and_convolver::{
     DeclaredDelayHistory, DelayHistoryEntry, parse_canonical_reference_samples,
-    validate_cabinet_tier_slices, validate_delay_histories, validate_delay_history_entries,
+    validate_convolver_tier_slices, validate_delay_histories, validate_delay_history_entries,
 };
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
 use core::mem::{align_of, size_of};
 
+use dnam_vm::control::Cp1ContributorSlot;
 use zerocopy::byteorder::little_endian::{F32, U16};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
@@ -188,12 +189,12 @@ pub fn decode_cp1_contributor_stream(
 }
 
 /// Decodes a stream of packed `CP1` contributor records directly into a caller-supplied pre-allocated
-/// [`crate::control::Cp1ContributorSlot`] slice without heap allocation (`ref[container.dnam.cp1-profile]`).
+/// [`Cp1ContributorSlot`] slice without heap allocation (`ref[container.dnam.cp1-profile]`).
 pub fn decode_cp1_contributor_stream_into_slice(
     base_bytes: &[u8],
     ultra_delta_bytes: Option<&[u8]>,
     contributor_lanes: &[usize],
-    out_slots: &mut [crate::control::Cp1ContributorSlot],
+    out_slots: &mut [Cp1ContributorSlot],
 ) -> Result<usize, DnamError> {
     reject_if(
         contributor_lanes.len() > out_slots.len(),
@@ -231,10 +232,10 @@ pub fn decode_cp1_contributor_stream_into_slice(
         let b_rec = &base_words[b_word_off..b_word_off + b_words];
         b_word_off += b_words;
 
-        let mut slot = crate::control::Cp1ContributorSlot::zero();
+        let mut slot = Cp1ContributorSlot::zero();
         slot.lanes = lanes as u8;
         slot.control_idx = slot_idx as u16;
-        slot.option_idx = 0xFF;
+        slot.aux = 0xFF;
 
         for k in 0..lanes {
             for r in 0..8 {
@@ -270,7 +271,7 @@ pub fn decode_cp1_contributor_stream_into_slice(
 /// Zero-drop-glue (`Copy` error) `CP1\0` stream decoder for real-time container reloaders.
 pub(crate) fn decode_cp1_shared_stream_into_slice_rt(
     cp1_slice: &[u8],
-    out_slots: &mut [crate::control::Cp1ContributorSlot],
+    out_slots: &mut [Cp1ContributorSlot],
 ) -> Result<usize, ContainerWireError> {
     let Ok((hdr, after_hdr)) = Cp1StreamHeaderWire::ref_from_prefix(cp1_slice) else {
         return Ok(0);
@@ -335,17 +336,11 @@ pub(crate) fn decode_cp1_shared_stream_into_slice_rt(
         let b_slice = &base_bytes[b_off..b_off + b_len];
         b_off += b_len;
 
-        let mut slot = crate::control::Cp1ContributorSlot::zero();
+        let mut slot = Cp1ContributorSlot::zero();
         slot.lanes = lanes as u8;
         slot.ctrl_kind = ctrl_kind;
         slot.control_idx = control_idx;
-        if ctrl_kind == 2 {
-            slot.partner_control_id = aux as u16;
-            slot.option_idx = 0xFF;
-        } else {
-            slot.option_idx = aux;
-            slot.partner_control_id = 0;
-        }
+        slot.aux = aux;
         for k in 0..lanes {
             for r in 0..8 {
                 slot.main_base[k][r] = read_f32_at(b_slice, k * 8 + r)?;
@@ -381,20 +376,18 @@ pub(crate) fn decode_cp1_shared_stream_into_slice_rt(
 ///
 /// Framing: `b"CP1\0"` (`4 B`), `count: u16le` (`2 B`), `flags: u8` (`1 B`, bit 0 = `has_ultra`),
 /// `reserved: u8` (`1 B`), followed by `count * 4 B` contributor directory entries
-/// `(control_idx: u16le, lanes: u8, option_idx: u8)`, followed by packed `base_bytes` and optional `ultra_bytes`.
+/// `(control_idx: u16le, raw_kl: u8, aux: u8)`, followed by packed `base_bytes` and optional `ultra_bytes`.
 pub fn decode_cp1_shared_stream_into_slice(
     cp1_slice: &[u8],
-    out_slots: &mut [crate::control::Cp1ContributorSlot],
+    out_slots: &mut [Cp1ContributorSlot],
 ) -> Result<usize, DnamError> {
     decode_cp1_shared_stream_into_slice_rt(cp1_slice, out_slots)
         .map_err(ContainerWireError::into_dnam_error)
 }
 
-/// Encodes a slice of [`crate::control::Cp1ContributorSlot`] entries into a self-describing
+/// Encodes a slice of [`Cp1ContributorSlot`] entries into a self-describing
 /// `CP1\0` stream suitable for Region 4 `shared_extent` (`ref[container.dnam.cp1-profile]`).
-pub fn encode_cp1_shared_stream(
-    slots: &[crate::control::Cp1ContributorSlot],
-) -> Result<Vec<u8>, DnamError> {
+pub fn encode_cp1_shared_stream(slots: &[Cp1ContributorSlot]) -> Result<Vec<u8>, DnamError> {
     if slots.is_empty() {
         return Ok(Vec::new());
     }
@@ -428,15 +421,10 @@ pub fn encode_cp1_shared_stream(
     out.extend_from_slice(hdr.as_bytes());
     for slot in slots {
         let raw_kl = ((slot.ctrl_kind & 0x03) << 2) | (slot.lanes & 0x03);
-        let aux = if slot.ctrl_kind == 2 {
-            (slot.partner_control_id & 0xFF) as u8
-        } else {
-            slot.option_idx
-        };
         let entry = Cp1StreamDirEntryWire {
             control_idx: U16::new(slot.control_idx),
             raw_kl,
-            aux,
+            aux: slot.aux,
         };
         out.extend_from_slice(entry.as_bytes());
     }
@@ -499,8 +487,8 @@ mod spec_tests {
 
         let valid_entries = vec![
             json!({
-                "id": "tank.quad0.line0",
-                "owner": "spatial_tank",
+                "id": "transport.quad0.line0",
+                "owner": "transport",
                 "kind": "fractional",
                 "introduced_tier": "lite",
                 "sample_format": "fp16",
@@ -512,8 +500,8 @@ mod spec_tests {
                 }
             }),
             json!({
-                "id": "tank.ap.0",
-                "owner": "spatial_tank",
+                "id": "transport.ap.0",
+                "owner": "transport",
                 "kind": "allpass",
                 "introduced_tier": "pro",
                 "sample_format": "f32",
@@ -538,7 +526,7 @@ mod spec_tests {
         ];
         let parsed = validate_delay_histories(&valid_entries, 3).unwrap();
         assert_eq!(parsed.len(), 3);
-        assert_eq!(parsed[0].owner, "spatial_tank");
+        assert_eq!(parsed[0].owner, "transport");
         assert_eq!(parsed[1].sample_format, "f32");
         assert_eq!(parsed[2].owner, "crossbar");
         assert_eq!(parsed[2].reference_samples_by_tier, [480, 480, 960, 960]);
@@ -546,8 +534,8 @@ mod spec_tests {
 
         // Unsupported sample_format ("f64") is rejected
         let bad_fmt = vec![json!({
-            "id": "tank.bad_fmt",
-            "owner": "spatial_tank",
+            "id": "transport.bad_fmt",
+            "owner": "transport",
             "kind": "fractional",
             "introduced_tier": "lite",
             "sample_format": "f64",
@@ -566,15 +554,17 @@ mod spec_tests {
         })];
         assert!(validate_delay_histories(&bad_legacy_key, 0).is_err());
 
-        let bad_legacy_owner = vec![json!({
-            "id": "tank.legacy_val",
-            "owner": "op_t_tank",
-            "kind": "fractional",
-            "introduced_tier": "lite",
-            "sample_format": "fp16",
-            "reference_samples": { "lite": "64" }
-        })];
-        assert!(validate_delay_histories(&bad_legacy_owner, 0).is_err());
+        for legacy_owner in ["op_t_tank", "spatial_tank"] {
+            let bad_legacy_owner = vec![json!({
+                "id": "tank.legacy_val",
+                "owner": legacy_owner,
+                "kind": "fractional",
+                "introduced_tier": "lite",
+                "sample_format": "fp16",
+                "reference_samples": { "lite": "64" }
+            })];
+            assert!(validate_delay_histories(&bad_legacy_owner, 0).is_err());
+        }
 
         // Fractional delay < 4 is rejected
         let too_short = vec![json!({
@@ -591,10 +581,10 @@ mod spec_tests {
     /// verify[container.dnam.load-validation]
     /// verify[container.dnam.cabinet-slices]
     /// verify[container.dnam.cp1-profile]
-    /// Verifies Stage III separate 64B-aligned slices and `CP1` packed control projection records.
+    /// Verifies `ModalConvolver` separate `64 B`-aligned slices and `CP1` packed control projection records.
     #[test]
-    fn test_cabinet_slices_and_cp1_packed_projection_validation() {
-        // 1. Cabinet slices across Lite, Full, Pro, Ultra:
+    fn test_convolver_slices_and_cp1_packed_projection_validation() {
+        // 1. ModalConvolver slices across Lite, Full, Pro, Ultra:
         //    FIR [256, 128, 384, 256] B, Kautz [2, 1, 3, 2] * 128 B = [256, 128, 384, 256] B
         for (tier, fir_len, blocks) in [
             (0u8, 256usize, 2usize),
@@ -604,11 +594,11 @@ mod spec_tests {
         ] {
             let kautz_len = blocks * 128;
             let arena_bytes = vec![0u8; fir_len + kautz_len + 64];
-            validate_cabinet_tier_slices(tier, &arena_bytes, 0, fir_len, fir_len, kautz_len)
+            validate_convolver_tier_slices(tier, &arena_bytes, 0, fir_len, fir_len, kautz_len)
                 .unwrap();
             // Wrong FIR or Kautz length rejected
             assert!(
-                validate_cabinet_tier_slices(
+                validate_convolver_tier_slices(
                     tier,
                     &arena_bytes,
                     0,
@@ -620,12 +610,12 @@ mod spec_tests {
             );
             // Overlapping slices rejected
             assert!(
-                validate_cabinet_tier_slices(tier, &arena_bytes, 0, fir_len, 64, kautz_len)
+                validate_convolver_tier_slices(tier, &arena_bytes, 0, fir_len, 64, kautz_len)
                     .is_err()
             );
             // Unaligned offset rejected
             assert!(
-                validate_cabinet_tier_slices(
+                validate_convolver_tier_slices(
                     tier,
                     &arena_bytes,
                     32,
@@ -668,7 +658,7 @@ mod spec_tests {
         let decoded_no_ultra = decode_cp1_contributor_stream(&base_bytes, None, &lanes).unwrap();
         assert!(decoded_no_ultra[0].extra_factors.is_none());
 
-        let mut slots = [crate::control::Cp1ContributorSlot::zero(); 4];
+        let mut slots = [Cp1ContributorSlot::zero(); 4];
         let n_slots = decode_cp1_contributor_stream_into_slice(
             &base_bytes,
             Some(&ultra_bytes),
@@ -702,32 +692,32 @@ mod spec_tests {
         shared_stream.resize(8 + 8 + (124 + 52) + (112 + 48), 0);
         let n_shared = decode_cp1_shared_stream_into_slice(&shared_stream, &mut slots).unwrap();
         assert_eq!(n_shared, 2);
-        assert_eq!(slots[1].partner_control_id, 2);
+        assert_eq!(slots[1].aux, 2);
         assert_eq!(
             decode_cp1_shared_stream_into_slice(&[], &mut slots).unwrap(),
             0
         );
 
         assert!(encode_cp1_shared_stream(&[]).unwrap().is_empty());
-        let mut s0 = crate::control::Cp1ContributorSlot::zero();
+        let mut s0 = Cp1ContributorSlot::zero();
         s0.lanes = 2;
         s0.ctrl_kind = 0;
         s0.control_idx = 5;
-        s0.option_idx = 0xFF;
+        s0.aux = 0xFF;
         s0.main_base[0][0] = 0.75;
         s0.emb[1] = -0.25;
         s0.v_base[0] = 0.5;
         s0.main_ultra[1][3] = 0.125;
         s0.v_ultra[2] = -0.5;
         s0.has_ultra = true;
-        let mut s1 = crate::control::Cp1ContributorSlot::zero();
+        let mut s1 = Cp1ContributorSlot::zero();
         s1.lanes = 1;
         s1.ctrl_kind = 2;
         s1.control_idx = 6;
-        s1.partner_control_id = 7;
+        s1.aux = 7;
         s1.has_ultra = true;
         let encoded = encode_cp1_shared_stream(&[s0, s1]).unwrap();
-        let mut rt_slots = [crate::control::Cp1ContributorSlot::zero(); 4];
+        let mut rt_slots = [Cp1ContributorSlot::zero(); 4];
         let rt_n = decode_cp1_shared_stream_into_slice(&encoded, &mut rt_slots).unwrap();
         assert_eq!(rt_n, 2);
         assert_eq!(rt_slots[0].control_idx, 5);
@@ -735,7 +725,7 @@ mod spec_tests {
         assert_eq!(rt_slots[0].emb[1], -0.25);
         assert_eq!(rt_slots[0].main_ultra[1][3], 0.125);
         assert_eq!(rt_slots[1].ctrl_kind, 2);
-        assert_eq!(rt_slots[1].partner_control_id, 7);
+        assert_eq!(rt_slots[1].aux, 7);
 
         let mut bad_slot = s0;
         bad_slot.v_base[0] = f32::NAN;

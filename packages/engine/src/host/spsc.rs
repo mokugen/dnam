@@ -5,7 +5,7 @@
 //! - **Lane 1 (`spsc::ring`):** 32 atomic `u64` slots (`MAX_CONTROLS = 32`, plus overflow slots for
 //!   models up to 255 controls) packing `(epoch_u29, mode_u2, kind_u1, payload_u32)`.
 //! - **Lane 2 (`spsc::ring`):** Fixed 64-slot ring of `[AtomicU64; 2]` entries for discrete state
-//!   transitions (`ApplyPreset`, `SyncTempo`, `TapTempo`, `SetBypass`, `SetFreeze`, `SetTier`, etc.).
+//!   transitions (`ApplyPreset`, `SyncTempo`, `TapTempo`, `SetBypass`, `SetTier`, etc.).
 //! - **Lane 3 (`spsc::ring`):** Fixed `[AtomicU64; 20]` Seqlock latch so if more than 64 discrete
 //!   commands arrive before the audio thread ticks once, state coalesces without dropping commands
 //!   or blocking the producer.

@@ -4,30 +4,40 @@
 //! Because odd-symmetric `PolyADAA1` and optional `C^2` wavefolder satisfy $g(-x) = -g(x)$
 //! at analytical equilibrium $+0.0$, even-activation `adaa_even` satisfies $g_e(-x) = +g_e(x)$,
 //! and decoupled `1D` `ParaLRU` commutes with input polarity conjugation when `rect_sign` flips,
-//! flipping any active Matryoshka lane $i \in \{0,\dots,39\}$ by $s_i \in \{-1, +1\}$ across input
-//! weights, crossbar (`op_p_to_group`, `phasor_to_group`), inter-block `4x4` spatial tiles,
-//! `lru_bias_drive`, `rect_sign_fp16`, and `VarPro` linear `odd` readout weights preserves
-//! **bit-exact `0.000000 ULP`** audio parity across `Lite..Ultra` and `strip_container_to_tier`.
+//! flipping any active Matryoshka lane $i \in \{0,\dots,39\}$ by $s_i \in \{-1, +1\}$ across
+//! `in_mid_weight_fp16`, `in_side_weight_fp16`, `lru_bias_drive_fp16`, `rect_sign_fp16`,
+//! cyclic `glu_mix_fp16`, crossbar (`op_p_to_core`, `phasor_to_core`), inter-block `4x4`
+//! spatial tiles, and `LinearReadout` `odd` weights preserves **bit-exact `0.000000 ULP`**
+//! audio parity across `Lite..Ultra`.
 
 use zerocopy::FromBytes;
 use zerocopy::byteorder::little_endian::{F32, U16};
 
 use super::max_tiers_for_arena_len;
-use crate::graph::sona_core::model::SONA_INTERBLOCK_TILES;
-use crate::graph::weights::{
-    ARENA_FULL_BYTES, ARENA_LITE_BYTES, ARENA_PRO_BYTES, ARENA_ULTRA_BYTES, Arena0LiteWire,
-    Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, SonaCrossbarBlockWire,
-    SonaGroupWire, SonaInterBlockTilePairWire,
-};
 use crate::provenance::sha256::sha256_digest;
 use crate::schema::DnamError;
+use dnam_vm::bin::{
+    ARENA_TIER_BYTES, Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire,
+    Arena3UltraDeltaWire, CoreQuadWire, SonaCrossbarBlockWire, SonaInterBlockTilePairWire,
+};
+use dnam_vm::graph::SONA_INTERBLOCK_TILES;
+
+const ARENA_LITE_BYTES: usize = ARENA_TIER_BYTES[0];
+const ARENA_FULL_BYTES: usize = ARENA_TIER_BYTES[1];
+const ARENA_PRO_BYTES: usize = ARENA_TIER_BYTES[2];
+const ARENA_ULTRA_BYTES: usize = ARENA_TIER_BYTES[3];
 
 /// Cumulative Matryoshka active `SONA` hidden lanes per tier (`16 / 24 / 32 / 40`).
 pub const SONA_SIGN_LANES_PER_TIER: [usize; 4] = [16, 24, 32, 40];
-/// Maximum active Matryoshka `SONA` hidden lanes across Blocks `0..3` (`[4, 3, 2, 1]` groups × 4 = `40`).
+/// Maximum active Matryoshka `SONA` hidden lanes across `CoreQuad`s `0..10` (`40`).
 pub const SONA_TOTAL_LANES: usize = 40;
 
 const SIGN_BIT_FP16: u16 = 0x8000;
+const FP16_POS_ONE: u16 = dnam_kernels::f32_to_fp16(1.0);
+const FP16_NEG_ONE: u16 = dnam_kernels::f32_to_fp16(-1.0);
+
+const _: () = assert!(FP16_POS_ONE == 0x3C00);
+const _: () = assert!(FP16_NEG_ONE == 0xBC00);
 
 #[inline]
 fn flip_f32_wire(slot: &mut F32, sign: f32) {
@@ -49,12 +59,32 @@ fn flip_fp16_wire(slot: &mut U16, sign: f32) {
     }
 }
 
-fn flip_sona_group_wire(gw: &mut SonaGroupWire, global_g: usize, s: &[f32; SONA_TOTAL_LANES]) {
+/// Flips `rect_sign_fp16` consistently with `dnam_vm`'s `wire_decode.rs`
+/// (`v.is_finite() && v < 0.0` decodes to `-1.0`, and all else including `±0.0`/`±Inf`/`NaN`
+/// decodes to `+1.0`).
+#[inline]
+fn flip_rect_sign_fp16_wire(slot: &mut U16, sign: f32) {
+    if sign < 0.0 {
+        let bits = slot.get();
+        let v = dnam_kernels::fp16_to_f32(bits);
+        let flipped = if v.is_finite() && (bits & 0x7FFF) != 0 {
+            bits ^ SIGN_BIT_FP16
+        } else {
+            FP16_NEG_ONE
+        };
+        *slot = U16::new(flipped);
+    }
+}
+
+fn flip_core_quad_wire(qw: &mut CoreQuadWire, global_g: usize, s: &[f32; SONA_TOTAL_LANES]) {
     for l in 0..4 {
         let sign = s[global_g * 4 + l];
-        flip_f32_wire(&mut gw.in_x_weight[l], sign);
-        flip_f32_wire(&mut gw.lru_bias_drive[l], sign);
-        flip_fp16_wire(&mut gw.rect_sign_fp16[l], sign);
+        let sign_next = s[global_g * 4 + ((l + 1) & 3)];
+        flip_fp16_wire(&mut qw.in_mid_weight_fp16[l], sign);
+        flip_fp16_wire(&mut qw.in_side_weight_fp16[l], sign);
+        flip_fp16_wire(&mut qw.lru_bias_drive_fp16[l], sign);
+        flip_rect_sign_fp16_wire(&mut qw.rect_sign_fp16[l], sign);
+        flip_fp16_wire(&mut qw.glu_mix_fp16[l], sign * sign_next);
     }
 }
 
@@ -83,8 +113,8 @@ fn flip_crossbar_active_groups(
     for g in 0..active_groups {
         for l in 0..4 {
             let sign = s[g * 4 + l];
-            flip_fp16_wire(&mut cb.op_p_to_group_fp16[g][l], sign);
-            flip_fp16_wire(&mut cb.phasor_to_group_fp16[g][l], sign);
+            flip_fp16_wire(&mut cb.op_p_to_core_fp16[g][l], sign);
+            flip_fp16_wire(&mut cb.phasor_to_core_fp16[g][l], sign);
         }
     }
 }
@@ -122,9 +152,9 @@ pub fn derive_sona_sign_gauge_40(buyer_seed: &[u8; 32]) -> [f32; SONA_TOTAL_LANE
 }
 
 /// Applies the **`0-ULP` Odd-Symmetric `SONA` Hidden-Lane Sign-Flip Gauge** across all active
-/// Matryoshka `SonaGroupWire`, `SonaInterBlockTilePairWire`, `SonaCrossbarBlockWire`,
-/// and `VarPro` linear `odd` readout weights present in `arena`
-/// (`4,608 / 7,936 / 15,872 / 30,720 B`), commuting losslessly with `strip_container_to_tier(Lite..Ultra)`.
+/// Matryoshka [`CoreQuadWire`], [`SonaInterBlockTilePairWire`], [`SonaCrossbarBlockWire`],
+/// and `LinearReadout` `odd` weights present in `arena`
+/// (`4,608 / 7,936 / 15,872 / 30,720 B`), commuting losslessly with tier truncation (`Lite..Ultra`).
 pub fn apply_sona_sign_gauge_watermark(arena: &mut [u8], signs: &[f32]) -> Result<(), DnamError> {
     let max_tiers = max_tiers_for_arena_len(arena.len());
     if max_tiers == 0 {
@@ -148,7 +178,7 @@ pub fn apply_sona_sign_gauge_watermark(arena: &mut [u8], signs: &[f32]) -> Resul
 
     let actual_len = arena.len();
 
-    // 1. Arena 0 (`Lite`): groups 0..4, tiles 0..3, Lite crossbar slots, Lite readout odd weights
+    // 1. Arena 0 (`Lite`): core quads 0..4, tiles 0..3, Lite crossbar slots, Lite readout odd weights
     {
         let (a0, _) =
             Arena0LiteWire::mut_from_prefix(arena).map_err(|_| DnamError::BufferTooSmall {
@@ -156,23 +186,23 @@ pub fn apply_sona_sign_gauge_watermark(arena: &mut [u8], signs: &[f32]) -> Resul
                 actual: actual_len,
             })?;
         for g in 0..4 {
-            flip_sona_group_wire(&mut a0.sona_core.groups[g], g, &s);
+            flip_core_quad_wire(&mut a0.core_quads[g], g, &s);
             for l in 0..4 {
                 let sign = s[g * 4 + l];
                 flip_fp16_wire(
-                    &mut a0.readout_lite.stage_latent_mods_fp16[80 + g * 4 + l],
+                    &mut a0.linear_readout_lite.stage_latent_mods_fp16[80 + g * 4 + l],
                     sign,
                 );
-                flip_fp16_wire(&mut a0.readout_lite.w_ro_fp16[192 + g * 4 + l], sign);
+                flip_fp16_wire(&mut a0.linear_readout_lite.w_ro_fp16[192 + g * 4 + l], sign);
             }
         }
         for t in 0..3 {
-            flip_sona_tile_wire(&mut a0.sona_core.tiles[t], t, &s);
+            flip_sona_tile_wire(&mut a0.tiles[t], t, &s);
         }
-        flip_ro_odd_lanes(&mut a0.readout_lite.w_ro_fp16[..192], 16, &s);
+        flip_ro_odd_lanes(&mut a0.linear_readout_lite.w_ro_fp16[..192], 16, &s);
     }
 
-    // 2. Arena 1 (`Full`): groups 4..6, tiles 3..13, Full crossbar (0..6), Full readout (0..24)
+    // 2. Arena 1 (`Full`): core quads 4..6, tiles 3..13, Full crossbar (0..6), Full readout (0..24)
     if max_tiers >= 2 {
         let (a1, _) = Arena1FullDeltaWire::mut_from_prefix(&mut arena[ARENA_LITE_BYTES..])
             .map_err(|_| DnamError::BufferTooSmall {
@@ -180,20 +210,20 @@ pub fn apply_sona_sign_gauge_watermark(arena: &mut [u8], signs: &[f32]) -> Resul
                 actual: actual_len,
             })?;
         for i in 0..2 {
-            flip_sona_group_wire(&mut a1.sona_core_full.groups[i], 4 + i, &s);
+            flip_core_quad_wire(&mut a1.core_quads[i], 4 + i, &s);
         }
         for i in 0..10 {
-            flip_sona_tile_wire(&mut a1.sona_core_full.tiles[i], 3 + i, &s);
+            flip_sona_tile_wire(&mut a1.tiles[i], 3 + i, &s);
         }
-        flip_crossbar_active_groups(&mut a1.sona_core_full.crossbar, 6, &s);
+        flip_crossbar_active_groups(&mut a1.crossbar_full, 6, &s);
         flip_ro_odd_lanes(
-            &mut a1.varpro_readout_full.w_ro_and_mods_fp16[..288],
+            &mut a1.linear_readout_full.w_ro_and_mods_fp16[..288],
             24,
             &s,
         );
     }
 
-    // 3. Arena 2 (`Pro`): groups 6..8, tiles 13..23, Pro crossbar (0..8), Pro readout (0..32)
+    // 3. Arena 2 (`Pro`): core quads 6..8, tiles 13..23, Pro crossbar (0..8), Pro readout (0..32)
     if max_tiers >= 3 {
         let (a2, _) =
             Arena2ProDeltaWire::mut_from_prefix(&mut arena[ARENA_FULL_BYTES..]).map_err(|_| {
@@ -203,16 +233,16 @@ pub fn apply_sona_sign_gauge_watermark(arena: &mut [u8], signs: &[f32]) -> Resul
                 }
             })?;
         for i in 0..2 {
-            flip_sona_group_wire(&mut a2.sona_core_pro.groups[i], 6 + i, &s);
+            flip_core_quad_wire(&mut a2.core_quads[i], 6 + i, &s);
         }
         for i in 0..10 {
-            flip_sona_tile_wire(&mut a2.sona_core_pro.tiles[i], 13 + i, &s);
+            flip_sona_tile_wire(&mut a2.tiles[i], 13 + i, &s);
         }
-        flip_crossbar_active_groups(&mut a2.sona_core_pro.crossbar_pro, 8, &s);
-        flip_ro_odd_lanes(&mut a2.varpro_readout_pro.w_ro_and_mods_fp16[..384], 32, &s);
+        flip_crossbar_active_groups(&mut a2.crossbar_pro, 8, &s);
+        flip_ro_odd_lanes(&mut a2.linear_readout_pro.w_ro_and_mods_fp16[..384], 32, &s);
     }
 
-    // 4. Arena 3 (`Ultra`): groups 8..10, tiles 23..35, Ultra crossbar (0..10), Ultra readout (0..40)
+    // 4. Arena 3 (`Ultra`): core quads 8..10, tiles 23..35, Ultra crossbar (0..10), Ultra readout (0..40)
     if max_tiers >= 4 {
         let (a3, _) = Arena3UltraDeltaWire::mut_from_prefix(&mut arena[ARENA_PRO_BYTES..])
             .map_err(|_| DnamError::BufferTooSmall {
@@ -220,14 +250,14 @@ pub fn apply_sona_sign_gauge_watermark(arena: &mut [u8], signs: &[f32]) -> Resul
                 actual: actual_len,
             })?;
         for i in 0..2 {
-            flip_sona_group_wire(&mut a3.sona_core_ultra.groups[i], 8 + i, &s);
+            flip_core_quad_wire(&mut a3.core_quads[i], 8 + i, &s);
         }
         for i in 0..12 {
-            flip_sona_tile_wire(&mut a3.sona_core_ultra.tiles[i], 23 + i, &s);
+            flip_sona_tile_wire(&mut a3.tiles[i], 23 + i, &s);
         }
-        flip_crossbar_active_groups(&mut a3.sona_core_ultra.crossbar_ultra, 10, &s);
+        flip_crossbar_active_groups(&mut a3.crossbar_ultra, 10, &s);
         flip_ro_odd_lanes(
-            &mut a3.varpro_readout_ultra.w_ro_and_mods_fp16[..480],
+            &mut a3.linear_readout_ultra.w_ro_and_mods_fp16[..480],
             40,
             &s,
         );
@@ -239,100 +269,254 @@ pub fn apply_sona_sign_gauge_watermark(arena: &mut [u8], signs: &[f32]) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{build_dnam_container, strip_container_to_tier};
-    use crate::engine::DnamEngine;
-    use crate::graph::sona_core::model::SonaMatryoshkaModel;
-    use crate::graph::weights::pack_sona_matryoshka_to_arena;
-    use crate::math::DefaultMathBackend;
     use crate::provenance::{extract_structural_hash_224d, structural_cosine_similarity};
-    use crate::schema::{ControlKind, ControlSchemaDef, ControlUiHints, DnamJsonHeader};
-    use crate::types::Tier;
+    use dnam_kernels::f32_to_fp16;
+    use dnam_vm::SonaVm;
+    use dnam_vm::bin::{
+        ControlClampDescriptorWire, DNBN_FLAG_STEREO_OUT, DnamBinBuildInput, KautzSoaBlockWire,
+        TransportQuadWire, encode_dnam_bin,
+    };
+    use dnam_vm::types::Tier;
     use proptest::prelude::*;
+    use zerocopy::{FromZeros, IntoBytes};
+
+    fn populate_test_core_quad(qw: &mut CoreQuadWire, g: usize) {
+        for l in 0..4 {
+            let s = if ((g + l) & 1) == 0 { 1.0 } else { -1.0 };
+            qw.svf_g[l] = F32::new(0.14 + 0.02 * ((g + l) as f32));
+            qw.svf_k_fp16[l] = U16::new(f32_to_fp16(0.65));
+            qw.lru_alpha_rel[l] = F32::new(0.90);
+            qw.lru_alpha_atk[l] = F32::new(0.20);
+            qw.lru_kappa_fp16[l] = U16::new(f32_to_fp16(0.35));
+            qw.adaa_drive_fp16[l] = U16::new(f32_to_fp16(0.8 + 0.1 * (l as f32)));
+            qw.lru_bias_drive_fp16[l] = U16::new(f32_to_fp16(0.15 * s));
+            qw.tone_lp_fp16[l] = U16::new(f32_to_fp16(0.45));
+            qw.tone_bp_fp16[l] = U16::new(f32_to_fp16(0.25 * s));
+            qw.tone_dir_fp16[l] = U16::new(f32_to_fp16(0.30));
+            qw.sag_depth_fp16[l] = U16::new(f32_to_fp16(0.18));
+            qw.wavefolder_mix_fp16[l] =
+                U16::new(f32_to_fp16(if (l & 1) == 0 { 0.25 } else { 0.0 }));
+            qw.rect_sign_fp16[l] = U16::new(f32_to_fp16(s));
+            qw.in_mid_weight_fp16[l] = U16::new(f32_to_fp16((0.35 - 0.02 * (g as f32)) * s));
+            qw.in_side_weight_fp16[l] = U16::new(f32_to_fp16((0.12 - 0.01 * (g as f32)) * s));
+            qw.glu_mix_fp16[l] =
+                U16::new(f32_to_fp16(if (l & 1) == 0 { 0.35 * s } else { -0.25 * s }));
+        }
+    }
+
+    fn populate_test_tile(tw: &mut SonaInterBlockTilePairWire, ti: usize) {
+        for col in 0..4 {
+            for row in 0..4 {
+                let s = if ((ti + col + row) & 1) == 0 {
+                    1.0
+                } else {
+                    -1.0
+                };
+                tw.w_odd_4x4[col][row] = F32::new(0.08 * s * (1.0 + 0.1 * (row as f32)));
+                tw.w_even_4x4_fp16[col][row] = U16::new(f32_to_fp16(0.05 * s));
+                tw.w_lru_4x4_fp16[col][row] = U16::new(f32_to_fp16(0.04 * s));
+            }
+        }
+    }
+
+    fn populate_test_ro_lanes(w_ro: &mut [U16], lane_count: usize, tier_idx: usize) {
+        for l in 0..lane_count {
+            let s = if ((l + tier_idx) & 1) == 0 { 1.0 } else { -1.0 };
+            let base = l * 12;
+            w_ro[base] = U16::new(f32_to_fp16(0.08 * s * (1.0 + 0.02 * (l as f32))));
+            w_ro[base + 1] = U16::new(f32_to_fp16(0.05 * s));
+            w_ro[base + 2] = U16::new(f32_to_fp16(0.03 * s));
+            w_ro[base + 3] = U16::new(f32_to_fp16(0.02 * s));
+            w_ro[base + 6] = U16::new(f32_to_fp16(0.075 * s));
+            w_ro[base + 7] = U16::new(f32_to_fp16(0.045 * s));
+            w_ro[base + 8] = U16::new(f32_to_fp16(0.025 * s));
+            w_ro[base + 9] = U16::new(f32_to_fp16(0.015 * s));
+        }
+    }
+
+    fn populate_test_kautz(blk: &mut KautzSoaBlockWire) {
+        for l in 0..4 {
+            blk.r_low[l] = F32::new(0.90);
+            blk.dr[l] = F32::new(0.02);
+            blk.theta[l] = F32::new(0.25 + 0.1 * (l as f32));
+            blk.b_gamma[l] = F32::new(0.35);
+            blk.c_re_l[l] = F32::new(0.14);
+            blk.c_im_l[l] = F32::new(-0.08);
+            blk.c_re_r[l] = F32::new(0.12);
+            blk.c_im_r[l] = F32::new(-0.06);
+        }
+    }
+
+    fn populate_test_transport(tq: &mut TransportQuadWire) {
+        for l in 0..4 {
+            tq.delay_samples[l] = F32::new(128.0 + 32.0 * (l as f32));
+            tq.input_gains_fp16[l] = U16::new(f32_to_fp16(0.5));
+            tq.wet_tap_l_fp16[l] = U16::new(f32_to_fp16(0.3));
+            tq.wet_tap_r_fp16[l] = U16::new(f32_to_fp16(0.25));
+        }
+        tq.fb_psi_fp16 = U16::new(f32_to_fp16(0.2));
+        tq.sigma_knee_fp16 = U16::new(f32_to_fp16(0.9));
+    }
 
     fn build_rich_test_sona_arena() -> alloc::vec::Vec<u8> {
-        let mut model = SonaMatryoshkaModel::dual_rate_default(false);
-        for (g, grp) in model.groups.iter_mut().enumerate() {
+        let mut a0 = DnamBinBuildInput::default_arena0_lite();
+        a0.crossbar.crossbar_op_gains_fp16 =
+            [U16::new(f32_to_fp16(0.25)), U16::new(f32_to_fp16(0.15))];
+        a0.crossbar.phasor_freq_hz = [F32::new(1.5), F32::new(3.5), F32::new(6.0), F32::new(12.0)];
+        for g in 0..4 {
+            populate_test_core_quad(&mut a0.core_quads[g], g);
             for l in 0..4 {
                 let s = if ((g + l) & 1) == 0 { 1.0 } else { -1.0 };
-                grp.svf_g[l] = 0.14 + 0.02 * ((g + l) as f32);
-                grp.svf_k[l] = 0.65;
-                grp.lru_alpha_rel[l] = 0.90;
-                grp.lru_alpha_atk[l] = 0.20;
-                grp.lru_kappa[l] = 0.35;
-                grp.adaa_drive[l] = 0.8 + 0.1 * (l as f32);
-                grp.lru_bias_drive[l] = 0.15 * s;
-                grp.in_x_weight[l] = (0.35 - 0.02 * (g as f32)) * s;
-                grp.tone_lp[l] = 0.45;
-                grp.tone_bp[l] = 0.25 * s;
-                grp.tone_dir[l] = 0.30;
-                grp.sag_depth[l] = 0.18;
-                grp.wavefolder_mix[l] = if (l & 1) == 0 { 0.25 } else { 0.0 };
-                grp.rect_sign[l] = s;
+                a0.linear_readout_lite.stage_latent_mods_fp16[80 + g * 4 + l] =
+                    U16::new(f32_to_fp16(0.12 * s));
+                a0.linear_readout_lite.w_ro_fp16[192 + g * 4 + l] = U16::new(f32_to_fp16(0.09 * s));
             }
         }
-        for (ti, tile) in model.tiles.iter_mut().enumerate() {
-            for col in 0..4 {
-                for row in 0..4 {
-                    let s = if ((ti + col + row) & 1) == 0 {
-                        1.0
-                    } else {
-                        -1.0
-                    };
-                    tile.w_odd_4x4[col][row] = 0.08 * s * (1.0 + 0.1 * (row as f32));
-                    tile.w_even_4x4[col][row] = 0.05 * s;
-                    tile.w_lru_4x4[col][row] = 0.04 * s;
-                }
-            }
+        for t in 0..3 {
+            populate_test_tile(&mut a0.tiles[t], t);
         }
-        model.crossbar.op_p_crossbar_gain = 0.25;
-        model.crossbar.op_t_crossbar_gain = 0.15;
-        model.crossbar.phasor_freq_hz = [1.5, 3.5, 6.0, 12.0];
-        for g in 0..model.groups.len() {
+        for tap in 0..32 {
+            let v = if tap % 4 == 0 { 0.08 } else { 0.005 };
+            a0.conv_fir_lite.fir_l[tap] = F32::new(v);
+            a0.conv_fir_lite.fir_r[tap] = F32::new(v * 0.9);
+        }
+        for blk in &mut a0.conv_kautz_lite {
+            populate_test_kautz(blk);
+        }
+        populate_test_transport(&mut a0.transport_lite);
+        populate_test_ro_lanes(&mut a0.linear_readout_lite.w_ro_fp16[..192], 16, 0);
+
+        let mut a1 = Arena1FullDeltaWire::new_zeroed();
+        for i in 0..2 {
+            populate_test_core_quad(&mut a1.core_quads[i], 4 + i);
+        }
+        for i in 0..10 {
+            populate_test_tile(&mut a1.tiles[i], 3 + i);
+        }
+        for g in 0..6 {
             for l in 0..4 {
                 let s = if ((g + l) & 1) == 0 { 1.0 } else { -1.0 };
-                model.crossbar.op_p_to_group[g][l] = 0.12 * s;
-                model.crossbar.phasor_to_group[g][l] = 0.09 * s;
+                a1.crossbar_full.op_p_to_core_fp16[g][l] = U16::new(f32_to_fp16(0.12 * s));
+                a1.crossbar_full.phasor_to_core_fp16[g][l] = U16::new(f32_to_fp16(0.09 * s));
             }
         }
-        model.stage0.clean_sub_mix = 0.18;
-        model.stage0.xo_low_gain = 1.05;
-        model.stage0.xo_high_gain = 0.95;
-        model.ctrl.w_svf_g_oct[0] = 0.25;
-        model.ctrl.w_tank_psi[0] = 0.15;
-        model.ctrl.w_adaa_drive_scale[0][0] = 0.20;
-        for (tier_idx, ro) in model.readouts.iter_mut().enumerate() {
-            for ch in 0..2 {
-                for l in 0..SONA_TOTAL_LANES {
-                    let s = if ((ch + l + tier_idx) & 1) == 0 {
-                        1.0
-                    } else {
-                        -1.0
-                    };
-                    ro.pre_cab_w_odd[ch][l] = 0.08 * s * (1.0 + 0.02 * (l as f32));
-                    ro.pre_cab_w_even[ch][l] = 0.03 * s;
-                    ro.pre_cab_w_lru[ch][l] = 0.02 * s;
-                    ro.direct_w_odd[ch][l] = 0.05 * s;
-                    ro.direct_w_even[ch][l] = 0.025 * s;
-                    ro.direct_w_lru[ch][l] = 0.015 * s;
-                }
-            }
-            for tap in 0..128 {
-                ro.fir_l[tap] = if tap % 4 == 0 { 0.08 } else { 0.005 };
-                ro.fir_r[tap] = if tap % 4 == 0 { 0.075 } else { 0.004 };
-            }
-            for m in 0..32 {
-                ro.kautz_b_gamma[m] = 0.35;
-                ro.kautz_c_l[m] = (0.14, -0.08);
-                ro.kautz_c_r[m] = (0.12, -0.06);
+        populate_test_kautz(&mut a1.conv_kautz_full);
+        populate_test_transport(&mut a1.transport_full);
+        populate_test_ro_lanes(&mut a1.linear_readout_full.w_ro_and_mods_fp16[..288], 24, 1);
+
+        let mut a2 = Arena2ProDeltaWire::new_zeroed();
+        for i in 0..2 {
+            populate_test_core_quad(&mut a2.core_quads[i], 6 + i);
+        }
+        for i in 0..10 {
+            populate_test_tile(&mut a2.tiles[i], 13 + i);
+        }
+        for g in 0..8 {
+            for l in 0..4 {
+                let s = if ((g + l) & 1) == 0 { 1.0 } else { -1.0 };
+                a2.crossbar_pro.op_p_to_core_fp16[g][l] = U16::new(f32_to_fp16(0.11 * s));
+                a2.crossbar_pro.phasor_to_core_fp16[g][l] = U16::new(f32_to_fp16(0.08 * s));
             }
         }
-        for s4 in &mut model.stage4 {
-            s4.g_loop = 0.72;
-            s4.wet_mix = 0.22;
+        for blk in &mut a2.conv_kautz_pro {
+            populate_test_kautz(blk);
         }
-        let mut arena = alloc::vec![0u8; ARENA_ULTRA_BYTES];
-        pack_sona_matryoshka_to_arena(&model, &mut arena);
-        arena
+        populate_test_transport(&mut a2.transport_pro[0]);
+        populate_test_ro_lanes(&mut a2.linear_readout_pro.w_ro_and_mods_fp16[..384], 32, 2);
+
+        let mut a3 = Arena3UltraDeltaWire::new_zeroed();
+        for i in 0..2 {
+            populate_test_core_quad(&mut a3.core_quads[i], 8 + i);
+        }
+        for i in 0..12 {
+            populate_test_tile(&mut a3.tiles[i], 23 + i);
+        }
+        for g in 0..10 {
+            for l in 0..4 {
+                let s = if ((g + l) & 1) == 0 { 1.0 } else { -1.0 };
+                a3.crossbar_ultra.op_p_to_core_fp16[g][l] = U16::new(f32_to_fp16(0.10 * s));
+                a3.crossbar_ultra.phasor_to_core_fp16[g][l] = U16::new(f32_to_fp16(0.07 * s));
+            }
+        }
+        for blk in &mut a3.conv_kautz_ultra {
+            populate_test_kautz(blk);
+        }
+        populate_test_transport(&mut a3.transport_ultra[0]);
+        populate_test_ro_lanes(
+            &mut a3.linear_readout_ultra.w_ro_and_mods_fp16[..480],
+            40,
+            3,
+        );
+
+        let mut out = alloc::vec![0u8; ARENA_ULTRA_BYTES];
+        out[0..ARENA_LITE_BYTES].copy_from_slice(a0.as_bytes());
+        out[ARENA_LITE_BYTES..ARENA_FULL_BYTES].copy_from_slice(a1.as_bytes());
+        out[ARENA_FULL_BYTES..ARENA_PRO_BYTES].copy_from_slice(a2.as_bytes());
+        out[ARENA_PRO_BYTES..ARENA_ULTRA_BYTES].copy_from_slice(a3.as_bytes());
+        out
+    }
+
+    fn encode_dnam_bin_for_tier(
+        arena: &[u8],
+        tier: Tier,
+        with_control: bool,
+    ) -> alloc::vec::Vec<u8> {
+        let mut a0 = *Arena0LiteWire::ref_from_prefix(arena).unwrap().0;
+        let tier_mask = (1_u16 << (tier.index() + 1)) - 1;
+        a0.crossbar.cell_desc.tier_flags = U16::new(tier_mask);
+        let a1 = (tier >= Tier::Full).then(|| {
+            Arena1FullDeltaWire::ref_from_prefix(&arena[ARENA_LITE_BYTES..])
+                .unwrap()
+                .0
+        });
+        let a2 = (tier >= Tier::Pro).then(|| {
+            Arena2ProDeltaWire::ref_from_prefix(&arena[ARENA_FULL_BYTES..])
+                .unwrap()
+                .0
+        });
+        let a3 = (tier >= Tier::Ultra).then(|| {
+            Arena3UltraDeltaWire::ref_from_prefix(&arena[ARENA_PRO_BYTES..])
+                .unwrap()
+                .0
+        });
+
+        let mut ctrl = ControlClampDescriptorWire::new_zeroed();
+        ctrl.ctrl_kind = 0;
+        ctrl.lobatto_degree = 2;
+        ctrl.default_val = F32::new(5.0);
+        ctrl.safe_min_base = F32::new(0.0);
+        ctrl.safe_max_base = F32::new(10.0);
+        ctrl.scale_norm = F32::new(0.2);
+        ctrl.offset_norm = F32::new(-1.0);
+        ctrl.anchor_nodes_norm = [F32::new(0.0), F32::new(-1.0), F32::new(1.0)];
+        let ctrls = if with_control {
+            alloc::vec![ctrl]
+        } else {
+            alloc::vec::Vec::new()
+        };
+
+        let input = DnamBinBuildInput {
+            reference_sample_rate_hz: 48_000,
+            header_flags: DNBN_FLAG_STEREO_OUT,
+            ext_ring_pow2_frames: 0,
+            ext_ring_lines: 0,
+            ext_ring_format: 0,
+            declared_max_delay_48k: 4_096,
+            dc_blocker_pole_5hz: dnam_vm::math::TANK_DC_BLOCKER_48K_F32,
+            tail_time_ms: 250.0,
+            ro_pole_48k: 0.99,
+            switch_xfade_samples: 64,
+            content_hash_prefix: [1, 2, 3, 4, 5, 6, 7, 8],
+            controls: &ctrls,
+            cp1_overflow: &[],
+            tsyn: &[],
+            cext: None,
+            arena0: &a0,
+            arena1: a1,
+            arena2: a2,
+            arena3: a3,
+        };
+        encode_dnam_bin(&input).unwrap()
     }
 
     #[test]
@@ -349,49 +533,27 @@ mod tests {
         apply_sona_sign_gauge_watermark(&mut ultra_gauged, &signs_a).unwrap();
 
         let tiers = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra];
-        let mut hdr = DnamJsonHeader::default_reference();
-        hdr.controls_schema.push(ControlSchemaDef {
-            id: alloc::string::String::from("gain"),
-            name: alloc::string::String::from("Gain"),
-            kind: ControlKind::Range,
-            unit: None,
-            lobatto_degree: Some(2),
-            anchor_nodes_norm: Some(alloc::vec![0.0, -1.0, 1.0]),
-            declared_range: Some([0.0, 10.0]),
-            safe_clamped_range: Some([0.0, 10.0]),
-            default: serde_json::json!(5.0),
-            conditional_bounds: alloc::vec![],
-            declared_options: None,
-            active_options: None,
-            represented_switch_options: None,
-            clamp_warning: None,
-            ui_hints: ControlUiHints::default(),
-            calibration: None,
-            user_metadata: alloc::collections::BTreeMap::new(),
-        });
-        let master_container = build_dnam_container(&mut hdr, &master, &master, false).unwrap();
-        let gauged_container =
-            build_dnam_container(&mut hdr.clone(), &ultra_gauged, &ultra_gauged, false).unwrap();
-
         let hash_master = extract_structural_hash_224d(&master).unwrap();
         let hash_gauged = extract_structural_hash_224d(&ultra_gauged).unwrap();
         assert!((structural_cosine_similarity(&hash_master, &hash_gauged) - 1.0).abs() < 1e-12);
 
         for (t_idx, &tier) in tiers.iter().enumerate() {
-            let prefix_len = tier.expected_arena_bytes();
+            let prefix_len = ARENA_TIER_BYTES[t_idx];
             let mut sliced_then_gauged = master[..prefix_len].to_vec();
             let prefix_signs = &signs_a[..SONA_SIGN_LANES_PER_TIER[t_idx]];
             apply_sona_sign_gauge_watermark(&mut sliced_then_gauged, prefix_signs).unwrap();
             assert_eq!(sliced_then_gauged, ultra_gauged[..prefix_len]);
 
-            let stripped_m = strip_container_to_tier(&master_container, tier).unwrap();
-            let stripped_g = strip_container_to_tier(&gauged_container, tier).unwrap();
-            let mut em =
-                DnamEngine::<DefaultMathBackend>::from_bytes(&stripped_m, tier, 48_000).unwrap();
-            let mut eg =
-                DnamEngine::<DefaultMathBackend>::from_bytes(&stripped_g, tier, 48_000).unwrap();
-            em.set_control_value(0, 7.2);
-            eg.set_control_value(0, 7.2);
+            let bin_m = encode_dnam_bin_for_tier(&master, tier, true);
+            let bin_g = encode_dnam_bin_for_tier(&ultra_gauged, tier, true);
+            let mut vm_m =
+                SonaVm::<dnam_vm::math::ScalarBackend>::open_dnam_bin_owned(&bin_m, tier, 48_000.0)
+                    .unwrap();
+            let mut vm_g =
+                SonaVm::<dnam_vm::math::ScalarBackend>::open_dnam_bin_owned(&bin_g, tier, 48_000.0)
+                    .unwrap();
+            vm_m.set_control_physical(0, 7.2).unwrap();
+            vm_g.set_control_physical(0, 7.2).unwrap();
 
             let in_l: alloc::vec::Vec<f32> =
                 (0..128).map(|i| 0.35 * ((i as f32) * 0.13).sin()).collect();
@@ -399,8 +561,8 @@ mod tests {
                 (0..128).map(|i| 0.25 * ((i as f32) * 0.09).cos()).collect();
             let (mut ml, mut mr) = (alloc::vec![0.0_f32; 128], alloc::vec![0.0_f32; 128]);
             let (mut gl, mut gr) = (alloc::vec![0.0_f32; 128], alloc::vec![0.0_f32; 128]);
-            em.process_block(&in_l, &in_r, &mut ml, &mut mr);
-            eg.process_block(&in_l, &in_r, &mut gl, &mut gr);
+            vm_m.process_block(&in_l, &in_r, &mut ml, &mut mr).unwrap();
+            vm_g.process_block(&in_l, &in_r, &mut gl, &mut gr).unwrap();
 
             for i in 0..128 {
                 assert_eq!(
@@ -440,21 +602,142 @@ mod tests {
             let mut gauged = master.clone();
             apply_sona_sign_gauge_watermark(&mut gauged, &signs).unwrap();
 
-            let mut hdr = DnamJsonHeader::default_reference();
-            let mc = build_dnam_container(&mut hdr, &master, &master, false).unwrap();
-            let gc = build_dnam_container(&mut hdr.clone(), &gauged, &gauged, false).unwrap();
-            let mut em = DnamEngine::<DefaultMathBackend>::from_bytes(&mc, Tier::Ultra, 48_000).unwrap();
-            let mut eg = DnamEngine::<DefaultMathBackend>::from_bytes(&gc, Tier::Ultra, 48_000).unwrap();
+            let bin_m = encode_dnam_bin_for_tier(&master, Tier::Ultra, false);
+            let bin_g = encode_dnam_bin_for_tier(&gauged, Tier::Ultra, false);
+            let mut vm_m = SonaVm::<dnam_vm::math::ScalarBackend>::open_dnam_bin_owned(
+                &bin_m,
+                Tier::Ultra,
+                48_000.0,
+            )
+            .unwrap();
+            let mut vm_g = SonaVm::<dnam_vm::math::ScalarBackend>::open_dnam_bin_owned(
+                &bin_g,
+                Tier::Ultra,
+                48_000.0,
+            )
+            .unwrap();
 
             let in_l: alloc::vec::Vec<f32> = (0..64).map(|i| 0.4 * ((i as f32) * 0.17).sin()).collect();
             let in_r: alloc::vec::Vec<f32> = (0..64).map(|i| 0.3 * ((i as f32) * 0.11).cos()).collect();
             let (mut ml, mut mr) = (alloc::vec![0.0_f32; 64], alloc::vec![0.0_f32; 64]);
             let (mut gl, mut gr) = (alloc::vec![0.0_f32; 64], alloc::vec![0.0_f32; 64]);
-            em.process_block(&in_l, &in_r, &mut ml, &mut mr);
-            eg.process_block(&in_l, &in_r, &mut gl, &mut gr);
+            vm_m.process_block(&in_l, &in_r, &mut ml, &mut mr).unwrap();
+            vm_g.process_block(&in_l, &in_r, &mut gl, &mut gr).unwrap();
             for i in 0..64 {
                 prop_assert_eq!(ml[i].to_bits(), gl[i].to_bits());
                 prop_assert_eq!(mr[i].to_bits(), gr[i].to_bits());
+            }
+        }
+    }
+
+    fn populate_zero_rect_core_quad(qw: &mut CoreQuadWire, g: usize) {
+        for l in 0..4 {
+            qw.svf_g[l] = F32::new(0.16 + 0.03 * (l as f32));
+            qw.svf_k_fp16[l] = U16::new(f32_to_fp16(0.7));
+            qw.lru_alpha_rel[l] = F32::new(0.92);
+            qw.lru_alpha_atk[l] = F32::new(0.25);
+            qw.lru_kappa_fp16[l] = U16::new(f32_to_fp16(0.4));
+            qw.lru_duhem_gamma_fp16[l] = U16::new(f32_to_fp16(2.5));
+            qw.lru_signed_mix_fp16[l] = U16::new(f32_to_fp16(0.5));
+            qw.in_mid_weight_fp16[l] = U16::new(f32_to_fp16(0.35 - 0.02 * (g as f32)));
+            qw.adaa_drive_fp16[l] = U16::new(f32_to_fp16(1.2));
+            qw.sag_depth_fp16[l] = U16::new(f32_to_fp16(0.3));
+            qw.tone_dir_fp16[l] = U16::new(f32_to_fp16(0.6));
+            assert_eq!(qw.rect_sign_fp16[l].get(), 0x0000);
+        }
+    }
+
+    #[test]
+    fn test_sona_sign_gauge_zero_rect_sign_preserves_zero_ulp_across_tiers_and_double_flip() {
+        for bits in [0x0000_u16, 0x8000, 0x7C00, 0xFC00, 0x7E00] {
+            let mut slot = U16::new(bits);
+            flip_rect_sign_fp16_wire(&mut slot, -1.0);
+            assert_eq!(slot.get(), FP16_NEG_ONE);
+            flip_rect_sign_fp16_wire(&mut slot, -1.0);
+            assert_eq!(slot.get(), FP16_POS_ONE);
+            flip_rect_sign_fp16_wire(&mut slot, -1.0);
+            assert_eq!(slot.get(), FP16_NEG_ONE);
+        }
+
+        let mut a0 = DnamBinBuildInput::default_arena0_lite();
+        for g in 0..4 {
+            populate_zero_rect_core_quad(&mut a0.core_quads[g], g);
+        }
+        populate_test_ro_lanes(&mut a0.linear_readout_lite.w_ro_fp16[..192], 16, 0);
+
+        let mut a1 = Arena1FullDeltaWire::new_zeroed();
+        for i in 0..2 {
+            populate_zero_rect_core_quad(&mut a1.core_quads[i], 4 + i);
+        }
+        populate_test_ro_lanes(&mut a1.linear_readout_full.w_ro_and_mods_fp16[..288], 24, 1);
+
+        let mut a2 = Arena2ProDeltaWire::new_zeroed();
+        for i in 0..2 {
+            populate_zero_rect_core_quad(&mut a2.core_quads[i], 6 + i);
+        }
+        populate_test_ro_lanes(&mut a2.linear_readout_pro.w_ro_and_mods_fp16[..384], 32, 2);
+
+        let mut a3 = Arena3UltraDeltaWire::new_zeroed();
+        for i in 0..2 {
+            populate_zero_rect_core_quad(&mut a3.core_quads[i], 8 + i);
+        }
+        populate_test_ro_lanes(
+            &mut a3.linear_readout_ultra.w_ro_and_mods_fp16[..480],
+            40,
+            3,
+        );
+
+        let mut master = alloc::vec![0u8; ARENA_ULTRA_BYTES];
+        master[0..ARENA_LITE_BYTES].copy_from_slice(a0.as_bytes());
+        master[ARENA_LITE_BYTES..ARENA_FULL_BYTES].copy_from_slice(a1.as_bytes());
+        master[ARENA_FULL_BYTES..ARENA_PRO_BYTES].copy_from_slice(a2.as_bytes());
+        master[ARENA_PRO_BYTES..ARENA_ULTRA_BYTES].copy_from_slice(a3.as_bytes());
+
+        let signs = derive_sona_sign_gauge_40(&[0x5Cu8; 32]);
+        assert!(signs.iter().any(|&s| s < 0.0));
+
+        let mut flip1 = master.clone();
+        apply_sona_sign_gauge_watermark(&mut flip1, &signs).unwrap();
+        let mut flip2 = flip1.clone();
+        apply_sona_sign_gauge_watermark(&mut flip2, &signs).unwrap();
+
+        let (f1_a0, _) = Arena0LiteWire::ref_from_prefix(&flip1).unwrap();
+        let (f2_a0, _) = Arena0LiteWire::ref_from_prefix(&flip2).unwrap();
+        for l in 0..4 {
+            let expected1 = if signs[l] < 0.0 { FP16_NEG_ONE } else { 0x0000 };
+            let expected2 = if signs[l] < 0.0 { FP16_POS_ONE } else { 0x0000 };
+            assert_eq!(f1_a0.core_quads[0].rect_sign_fp16[l].get(), expected1);
+            assert_eq!(f2_a0.core_quads[0].rect_sign_fp16[l].get(), expected2);
+        }
+
+        let in_l: alloc::vec::Vec<f32> =
+            (0..64).map(|i| 0.35 * ((i as f32) * 0.13).sin()).collect();
+        let in_r: alloc::vec::Vec<f32> =
+            (0..64).map(|i| 0.25 * ((i as f32) * 0.09).cos()).collect();
+        for tier in [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra] {
+            let bin_m = encode_dnam_bin_for_tier(&master, tier, false);
+            let bin_1 = encode_dnam_bin_for_tier(&flip1, tier, false);
+            let bin_2 = encode_dnam_bin_for_tier(&flip2, tier, false);
+            let mut vm_m =
+                SonaVm::<dnam_vm::math::ScalarBackend>::open_dnam_bin_owned(&bin_m, tier, 48_000.0)
+                    .unwrap();
+            let mut vm_1 =
+                SonaVm::<dnam_vm::math::ScalarBackend>::open_dnam_bin_owned(&bin_1, tier, 48_000.0)
+                    .unwrap();
+            let mut vm_2 =
+                SonaVm::<dnam_vm::math::ScalarBackend>::open_dnam_bin_owned(&bin_2, tier, 48_000.0)
+                    .unwrap();
+            let (mut ml, mut mr) = (alloc::vec![0.0_f32; 64], alloc::vec![0.0_f32; 64]);
+            let (mut l1, mut r1) = (alloc::vec![0.0_f32; 64], alloc::vec![0.0_f32; 64]);
+            let (mut l2, mut r2) = (alloc::vec![0.0_f32; 64], alloc::vec![0.0_f32; 64]);
+            vm_m.process_block(&in_l, &in_r, &mut ml, &mut mr).unwrap();
+            vm_1.process_block(&in_l, &in_r, &mut l1, &mut r1).unwrap();
+            vm_2.process_block(&in_l, &in_r, &mut l2, &mut r2).unwrap();
+            for i in 0..64 {
+                assert_eq!(ml[i].to_bits(), l1[i].to_bits());
+                assert_eq!(mr[i].to_bits(), r1[i].to_bits());
+                assert_eq!(ml[i].to_bits(), l2[i].to_bits());
+                assert_eq!(mr[i].to_bits(), r2[i].to_bits());
             }
         }
     }

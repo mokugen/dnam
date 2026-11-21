@@ -135,12 +135,6 @@ pub(in crate::bin::view) fn validate_arena0_and_quads(
     if let Some(a3) = arena3 {
         any_ext_f32 |= validate_quad(&a3.transport_ultra[0])?;
         validate_crossbar_block_reserved(&a3.crossbar_ultra)?;
-        if !a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[164..256]
-            .iter()
-            .all(|v| v.get() == 0)
-        {
-            return Err(VmError::InvalidArenaHeader);
-        }
         for k in 0..8 {
             if !a3.stage_latent_core_mods_fp16[k * 128 + 120..k * 128 + 128]
                 .iter()
@@ -257,25 +251,28 @@ mod tests {
             .is_ok()
         );
 
-        let mut bad_a3 = a3;
-        bad_a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[164] = U16::new(1);
-        assert_eq!(
+        // `stage_latent_ctrl_ultra_fp16[164..256]` holds Tardos Role B carriers `5,779..5,871`
+        // (`ref[sec.watermark.tardos-code]`) and is ignored cleanly during VM tier hydration.
+        let mut a3_tardos_role_b = a3;
+        a3_tardos_role_b
+            .control_bus_ultra_delta
+            .stage_latent_ctrl_ultra_fp16[164] = U16::new(1);
+        assert!(
             validate_arena0_and_quads(ArenaValidationInput {
                 arena0: view.arena0,
                 arena1: Some(&a1),
                 arena2: Some(&a2),
-                arena3: Some(&bad_a3),
+                arena3: Some(&a3_tardos_role_b),
                 cp1_overflow_empty: true,
                 num_controls: 0,
                 max_present_tier: 3,
                 retained_tier: Tier::Ultra,
                 meta: view.runtime_meta,
             })
-            .unwrap_err(),
-            VmError::InvalidArenaHeader
+            .is_ok()
         );
 
-        bad_a3 = a3;
+        let mut bad_a3 = a3;
         bad_a3.stage_latent_core_mods_fp16[120] = U16::new(1);
         assert_eq!(
             validate_arena0_and_quads(ArenaValidationInput {

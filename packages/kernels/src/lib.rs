@@ -75,8 +75,8 @@ pub use sona_core::{
     OP_N_PRE_BETA_BYPASS_EPS, OP_N_PRE_FULL_PASS_THRESH, OP_N_PRE_INV_TAU_F32, OP_N_PRE_MAX_BETA_Q,
     OP_N_PRE_MAX_ZOH_HOLD_DEPTH, OP_N_PRE_MIN_RHO_EFF, OP_N_PRE_QUANT_CLAMP_F32, OpNPreHoisted,
     OpNPreHotState, ParaLruDuhemAdjointTrace, ParaLruDuhemForwardOut, ParaLruDuhemParams,
-    ParaLruDuhemTileGrads, ParaLruParams, ParaLruTileGrads, SOFT_RECT_EPS, SonaBlockOutputStereo8,
-    SonaBlockParamsStereo4, SonaBlockStateStereo8, SonaGroupParamsStereo4, SonaParaLruCoeffs4,
+    ParaLruDuhemTileGrads, ParaLruParams, ParaLruTileGrads, QuadratureHysteresis2D, SOFT_RECT_EPS,
+    SonaBlockOutputStereo8, SonaBlockParamsStereo4, SonaBlockStateStereo8, SonaParaLruCoeffs4,
     SonaParaLruDuhemCoeffs4, SonaToneWeights4, TptAdjointElem, TptScanElem, TptSvfCoeffs4,
     TptSvfOutputs, apply_linear_scan, apply_stereo_link_stereo8, apply_stereo_link_vec4_pair,
     apply_tpt_adjoint, apply_tpt_init, compose_linear_scan, compose_paralru_adjoint_scan,
@@ -91,5 +91,5 @@ pub use sona_core::{
     scan_linear_prefix_tile, soft_rect_zero_dc_f32, soft_rect_zero_dc_stereo8,
     soft_rect_zero_dc_vec4, step_core_quad_stereo8, step_paralru_duhem_stereo8,
     step_paralru_duhem_vec4, step_paralru_stereo8, step_paralru_vec4, step_sona_block_stereo8,
-    step_sona_group_stereo8, step_tpt_svf_stereo8, step_tpt_svf_vec4,
+    step_tpt_svf_stereo8, step_tpt_svf_vec4,
 };

@@ -9,11 +9,11 @@
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering, fence};
 
-use crate::container::ZohRescaledParams;
-use crate::control::TELEMETRY_CONTROL_SLOTS;
+use dnam_vm::ZohRateContext;
+use dnam_vm::math::BackendKind;
+
 use crate::dynamic::DynamicDnamEngine;
-use crate::math::BackendKind;
-use crate::types::{DnamTelemetrySnapshot, Tier};
+use crate::types::{DnamTelemetrySnapshot, TELEMETRY_CONTROL_SLOTS, Tier};
 
 /// Number of 64-bit atomic words used to store a [`RawTelemetryRecord`] inside [`TelemetryCell`].
 const TELEMETRY_WORDS: usize = 29;
@@ -21,10 +21,10 @@ const TELEMETRY_WORDS: usize = 29;
 /// Maximum wait-free Seqlock read retries before returning the latest snapshot (`ref[arch.telemetry.seqlock-publication]`).
 const MAX_SEQLOCK_READ_RETRIES: usize = 64;
 
-const FLAG_OFFLINE_BOUNCE: u8 = 1 << 0;
-const FLAG_MAXIMIZE_TIER_ON_BOUNCE: u8 = 1 << 1;
-const FLAG_SUPPORTS_FREEZE: u8 = 1 << 2;
-const FLAG_TRAILS_ENABLED: u8 = 1 << 3;
+const FLAG_MAXIMIZE_TIER_ON_BOUNCE: u8 = 1 << 0;
+const FLAG_TRAILS_ENABLED: u8 = 1 << 1;
+const FLAG_ZOH_OS2X: u8 = 1 << 2;
+const FLAG_ZOH_BOUNCE_4X: u8 = 1 << 3;
 
 #[inline]
 const fn backend_to_u8(kind: BackendKind) -> u8 {
@@ -63,10 +63,10 @@ const fn backend_from_u8(val: u8) -> BackendKind {
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RawTelemetryRecord {
-    /// Core C-ABI 160-byte telemetry snapshot (`z_head`, `env_states`, `lfo_harmonics`, `clamped_controls`).
+    /// Core C-ABI 184-byte telemetry snapshot (`z_head`, `env_states`, `lfo_harmonics`, `clamped_controls`).
     pub snapshot: DnamTelemetrySnapshot,
-    /// Active zero-order-hold sample-rate rescaling parameters.
-    pub zoh: ZohRescaledParams,
+    /// Active zero-order-hold dual-rate VM/core rescaling parameters.
+    pub zoh: ZohRateContext,
     /// Output Mid/Side stereo width $\alpha_{\text{width}} \in [0.0, 2.0]$.
     pub stereo_width: f32,
     /// Active host tempo in BPM.
@@ -89,8 +89,6 @@ pub struct RawTelemetryRecord {
     pub offline_bounce: bool,
     /// Whether offline bounce automatically promotes to `min(max_available_tier, max_supported_tier)`.
     pub maximize_tier_on_bounce: bool,
-    /// Whether the loaded model supports Unitary Spectral Freeze.
-    pub supports_freeze: bool,
     /// Whether bypass spillover trails are enabled.
     pub trails_enabled: bool,
     /// Monotonic causal control epoch reflected in this record.
@@ -116,7 +114,6 @@ impl RawTelemetryRecord {
             max_supported_tier: engine.max_supported_tier(),
             offline_bounce: engine.offline_bounce(),
             maximize_tier_on_bounce: engine.maximize_tier_on_bounce(),
-            supports_freeze: engine.supports_freeze(),
             trails_enabled,
             causal_epoch,
         }
@@ -149,119 +146,134 @@ impl RawTelemetryRecord {
     fn to_words(self) -> [u64; TELEMETRY_WORDS] {
         let mut w = [0_u64; TELEMETRY_WORDS];
         let s = &self.snapshot;
-        let hdr_lo = (s.active_tier as u32)
-            | ((s.stereo_out as u32) << 8)
-            | ((s.bypassed as u32) << 16)
-            | ((s.is_frozen as u32) << 24);
-        let hdr_hi = (s.active_clamp_mask as u32) | ((s.control_decimation_host as u32) << 16);
-        w[0] = Self::pack_u32_pair(hdr_lo, hdr_hi);
-        w[1] = Self::pack_f32_pair(s.max_op_n_drive, s.max_pole_radius);
-        w[2] = Self::pack_f32_pair(s.max_effective_loop_gain, s.tail_time_ms);
-        w[3] = Self::pack_f32_pair(s.z_head[0], s.z_head[1]);
-        w[4] = Self::pack_f32_pair(s.z_head[2], s.z_head[3]);
-        w[5] = Self::pack_f32_pair(s.env_states[0], s.env_states[1]);
-        w[6] = Self::pack_f32_pair(s.env_states[2], s.env_states[3]);
+        let b_lo = (s.active_tier as u32)
+            | ((s.max_available_tier as u32) << 8)
+            | ((s.max_supported_tier as u32) << 16)
+            | ((s.stereo_out as u32) << 24);
+        let b_hi = (s.bypassed as u32)
+            | ((s.offline_bounce as u32) << 8)
+            | ((s.host_write_lock as u32) << 16)
+            | ((s.verification_status as u32) << 24);
+        w[0] = Self::pack_u32_pair(b_lo, b_hi);
+        let mask_stride = (s.active_clamp_mask as u32) | ((s.control_decimation_host as u32) << 16);
+        w[1] = Self::pack_u32_pair(mask_stride, s.latency_samples);
+        w[2] = Self::pack_u32_pair(s.sample_rate_hz, s.saturation_flags);
+        w[3] = Self::pack_f32_pair(s.mix_dry_gain, s.mix_wet_gain);
+        w[4] = Self::pack_f32_pair(s.stereo_width, s.tempo_bpm);
+        w[5] = Self::pack_f32_pair(s.max_op_n_drive, s.max_pole_radius);
+        w[6] = Self::pack_f32_pair(s.max_effective_loop_gain, s.tail_time_ms);
+        w[7] = Self::pack_f32_pair(s.z_head[0], s.z_head[1]);
+        w[8] = Self::pack_f32_pair(s.z_head[2], s.z_head[3]);
+        w[9] = Self::pack_f32_pair(s.env_states[0], s.env_states[1]);
+        w[10] = Self::pack_f32_pair(s.env_states[2], s.env_states[3]);
         for i in 0..4 {
-            w[7 + i] = Self::pack_f32_pair(s.lfo_harmonics[i * 2], s.lfo_harmonics[i * 2 + 1]);
+            w[11 + i] = Self::pack_f32_pair(s.lfo_harmonics[i * 2], s.lfo_harmonics[i * 2 + 1]);
         }
         for i in 0..(TELEMETRY_CONTROL_SLOTS / 2) {
-            w[11 + i] =
+            w[15 + i] =
                 Self::pack_f32_pair(s.clamped_controls[i * 2], s.clamped_controls[i * 2 + 1]);
         }
-        w[19] = Self::pack_u32_pair(s.overflow_or_saturation_flags, self.sample_rate_hz);
-        w[20] = Self::pack_u32_pair(
-            self.zoh.sample_rate_host_hz,
-            self.zoh.switch_xfade_samples_host,
-        );
-        w[21] = self.zoh.rho_sr.to_bits();
-        w[22] = self.zoh.rho_ctrl.to_bits();
-        w[23] = self.zoh.control_decimation_host as u64;
-        w[24] = Self::pack_f32_pair(self.zoh.alpha_ramp_host, self.zoh.r_ac_host);
-        w[25] = Self::pack_f32_pair(self.zoh.r_dc_host, self.zoh.tau_ref_samples_host);
-        w[26] = Self::pack_f32_pair(self.stereo_width, self.current_bpm);
+        w[23] = self.zoh.rho_vm.to_bits();
+        w[24] = self.zoh.rho_core.to_bits();
+        w[25] = Self::pack_f32_pair(self.zoh.reference_rate_hz, self.zoh.host_rate_hz);
+        w[26] = self.zoh.f_s_vm.to_bits();
 
         let mut flags = 0_u8;
-        if self.offline_bounce {
-            flags |= FLAG_OFFLINE_BOUNCE;
-        }
         if self.maximize_tier_on_bounce {
             flags |= FLAG_MAXIMIZE_TIER_ON_BOUNCE;
-        }
-        if self.supports_freeze {
-            flags |= FLAG_SUPPORTS_FREEZE;
         }
         if self.trails_enabled {
             flags |= FLAG_TRAILS_ENABLED;
         }
-        let meta_lo = ((self.latency_samples.min(u16::MAX as usize)) as u32)
-            | ((self.num_controls as u32) << 16)
-            | ((backend_to_u8(self.backend_kind) as u32) << 24);
-        let meta_hi = (self.requested_tier as u32)
-            | ((self.max_available_tier as u32) << 8)
-            | ((self.max_supported_tier as u32) << 16)
+        if self.zoh.os2x_active {
+            flags |= FLAG_ZOH_OS2X;
+        }
+        if self.zoh.is_bounce_4x {
+            flags |= FLAG_ZOH_BOUNCE_4X;
+        }
+        let meta_hi = (self.num_controls as u32)
+            | ((backend_to_u8(self.backend_kind) as u32) << 8)
+            | ((self.requested_tier as u32) << 16)
             | ((flags as u32) << 24);
-        w[27] = Self::pack_u32_pair(meta_lo, meta_hi);
+        w[27] = Self::pack_u32_pair(self.zoh.k_ctrl.min(u32::MAX as usize) as u32, meta_hi);
         w[28] = self.causal_epoch;
         w
     }
 
     #[inline]
     fn from_words(w: &[u64; TELEMETRY_WORDS]) -> Self {
-        let (hdr_lo, hdr_hi) = Self::unpack_u32_pair(w[0]);
-        let active_tier = (hdr_lo & 0xFF) as u8;
-        let stereo_out = ((hdr_lo >> 8) & 0xFF) as u8;
-        let bypassed = ((hdr_lo >> 16) & 0xFF) as u8;
-        let is_frozen = ((hdr_lo >> 24) & 0xFF) as u8;
-        let active_clamp_mask = (hdr_hi & 0xFFFF) as u16;
-        let control_decimation_host = ((hdr_hi >> 16) & 0xFFFF) as u16;
+        let (b_lo, b_hi) = Self::unpack_u32_pair(w[0]);
+        let active_tier = (b_lo & 0xFF) as u8;
+        let max_available_tier_u8 = ((b_lo >> 8) & 0xFF) as u8;
+        let max_supported_tier_u8 = ((b_lo >> 16) & 0xFF) as u8;
+        let stereo_out = ((b_lo >> 24) & 0xFF) as u8;
+        let bypassed = (b_hi & 0xFF) as u8;
+        let offline_bounce_u8 = ((b_hi >> 8) & 0xFF) as u8;
+        let host_write_lock = ((b_hi >> 16) & 0xFF) as u8;
+        let verification_status = ((b_hi >> 24) & 0xFF) as u8;
 
-        let (max_op_n_drive, max_pole_radius) = Self::unpack_f32_pair(w[1]);
-        let (max_effective_loop_gain, tail_time_ms) = Self::unpack_f32_pair(w[2]);
-        let (z0, z1) = Self::unpack_f32_pair(w[3]);
-        let (z2, z3) = Self::unpack_f32_pair(w[4]);
-        let (e0, e1) = Self::unpack_f32_pair(w[5]);
-        let (e2, e3) = Self::unpack_f32_pair(w[6]);
+        let (mask_stride, latency_samples) = Self::unpack_u32_pair(w[1]);
+        let active_clamp_mask = (mask_stride & 0xFFFF) as u16;
+        let control_decimation_host = ((mask_stride >> 16) & 0xFFFF) as u16;
+        let (sample_rate_hz, saturation_flags) = Self::unpack_u32_pair(w[2]);
+
+        let (mix_dry_gain, mix_wet_gain) = Self::unpack_f32_pair(w[3]);
+        let (stereo_width, tempo_bpm) = Self::unpack_f32_pair(w[4]);
+        let (max_op_n_drive, max_pole_radius) = Self::unpack_f32_pair(w[5]);
+        let (max_effective_loop_gain, tail_time_ms) = Self::unpack_f32_pair(w[6]);
+        let (z0, z1) = Self::unpack_f32_pair(w[7]);
+        let (z2, z3) = Self::unpack_f32_pair(w[8]);
+        let (e0, e1) = Self::unpack_f32_pair(w[9]);
+        let (e2, e3) = Self::unpack_f32_pair(w[10]);
 
         let mut lfo_harmonics = [0.0_f32; 8];
         for i in 0..4 {
-            let (a, b) = Self::unpack_f32_pair(w[7 + i]);
+            let (a, b) = Self::unpack_f32_pair(w[11 + i]);
             lfo_harmonics[i * 2] = a;
             lfo_harmonics[i * 2 + 1] = b;
         }
         let mut clamped_controls = [0.0_f32; TELEMETRY_CONTROL_SLOTS];
         for i in 0..(TELEMETRY_CONTROL_SLOTS / 2) {
-            let (a, b) = Self::unpack_f32_pair(w[11 + i]);
+            let (a, b) = Self::unpack_f32_pair(w[15 + i]);
             clamped_controls[i * 2] = a;
             clamped_controls[i * 2 + 1] = b;
         }
-        let (overflow_or_saturation_flags, sample_rate_hz) = Self::unpack_u32_pair(w[19]);
-        let (sample_rate_host_hz, switch_xfade_samples_host) = Self::unpack_u32_pair(w[20]);
-        let rho_sr = f64::from_bits(w[21]);
-        let rho_ctrl = f64::from_bits(w[22]);
-        let k_ctrl_usize = w[23] as usize;
-        let (alpha_ramp_host, r_ac_host) = Self::unpack_f32_pair(w[24]);
-        let (r_dc_host, tau_ref_samples_host) = Self::unpack_f32_pair(w[25]);
-        let (stereo_width, current_bpm) = Self::unpack_f32_pair(w[26]);
-        let (meta_lo, meta_hi) = Self::unpack_u32_pair(w[27]);
+
+        let rho_vm = f64::from_bits(w[23]);
+        let rho_core = f64::from_bits(w[24]);
+        let (reference_rate_hz, host_rate_hz) = Self::unpack_f32_pair(w[25]);
+        let f_s_vm = f64::from_bits(w[26]);
+        let (k_ctrl_u32, meta_hi) = Self::unpack_u32_pair(w[27]);
         let causal_epoch = w[28];
 
-        let latency_u16 = (meta_lo & 0xFFFF) as usize;
-        let num_controls = ((meta_lo >> 16) & 0xFF) as u8;
-        let backend_kind = backend_from_u8(((meta_lo >> 24) & 0xFF) as u8);
-
-        let requested_tier = Tier::from_u8((meta_hi & 0xFF) as u8);
-        let max_available_tier = Tier::from_u8(((meta_hi >> 8) & 0xFF) as u8);
-        let max_supported_tier = Tier::from_u8(((meta_hi >> 16) & 0xFF) as u8);
+        let num_controls = (meta_hi & 0xFF) as u8;
+        let backend_kind = backend_from_u8(((meta_hi >> 8) & 0xFF) as u8);
+        let requested_tier = Tier::from_u8(((meta_hi >> 16) & 0xFF) as u8);
         let flags = ((meta_hi >> 24) & 0xFF) as u8;
+
+        let os2x_active = (flags & FLAG_ZOH_OS2X) != 0;
+        let is_bounce_4x = (flags & FLAG_ZOH_BOUNCE_4X) != 0;
+        let f_s_core = if os2x_active { 2.0 * f_s_vm } else { f_s_vm };
 
         Self {
             snapshot: DnamTelemetrySnapshot {
                 active_tier,
+                max_available_tier: max_available_tier_u8,
+                max_supported_tier: max_supported_tier_u8,
                 stereo_out,
                 bypassed,
-                is_frozen,
+                offline_bounce: offline_bounce_u8,
+                host_write_lock,
+                verification_status,
                 active_clamp_mask,
                 control_decimation_host,
+                latency_samples,
+                sample_rate_hz,
+                saturation_flags,
+                mix_dry_gain,
+                mix_wet_gain,
+                stereo_width,
+                tempo_bpm,
                 max_op_n_drive,
                 max_pole_radius,
                 max_effective_loop_gain,
@@ -270,31 +282,29 @@ impl RawTelemetryRecord {
                 env_states: [e0, e1, e2, e3],
                 lfo_harmonics,
                 clamped_controls,
-                overflow_or_saturation_flags,
             },
-            zoh: ZohRescaledParams {
-                sample_rate_host_hz,
-                rho_sr,
-                control_decimation_host: k_ctrl_usize,
-                rho_ctrl,
-                alpha_ramp_host,
-                r_ac_host,
-                r_dc_host,
-                tau_ref_samples_host,
-                switch_xfade_samples_host,
+            zoh: ZohRateContext {
+                reference_rate_hz,
+                host_rate_hz,
+                f_s_vm,
+                rho_vm,
+                os2x_active,
+                f_s_core,
+                rho_core,
+                k_ctrl: k_ctrl_u32 as usize,
+                is_bounce_4x,
             },
             stereo_width,
-            current_bpm,
-            latency_samples: latency_u16,
+            current_bpm: tempo_bpm,
+            latency_samples: latency_samples as usize,
             num_controls,
             backend_kind,
             sample_rate_hz,
             requested_tier,
-            max_available_tier,
-            max_supported_tier,
-            offline_bounce: (flags & FLAG_OFFLINE_BOUNCE) != 0,
+            max_available_tier: Tier::from_u8(max_available_tier_u8),
+            max_supported_tier: Tier::from_u8(max_supported_tier_u8),
+            offline_bounce: offline_bounce_u8 != 0,
             maximize_tier_on_bounce: (flags & FLAG_MAXIMIZE_TIER_ON_BOUNCE) != 0,
-            supports_freeze: (flags & FLAG_SUPPORTS_FREEZE) != 0,
             trails_enabled: (flags & FLAG_TRAILS_ENABLED) != 0,
             causal_epoch,
         }
@@ -431,20 +441,30 @@ pub fn telemetry_channel(initial: RawTelemetryRecord) -> (TelemetryWriter, Telem
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
     use crate::schema::DnamJsonHeader;
-    use alloc::vec;
+    use crate::test_support::build_test_dnam_container;
     use proptest::prelude::*;
 
     fn sample_record() -> RawTelemetryRecord {
         RawTelemetryRecord {
             snapshot: DnamTelemetrySnapshot {
                 active_tier: Tier::Pro as u8,
+                max_available_tier: Tier::Ultra as u8,
+                max_supported_tier: Tier::Pro as u8,
                 stereo_out: 1,
                 bypassed: 0,
-                is_frozen: 1,
+                offline_bounce: 1,
+                host_write_lock: 1,
+                verification_status: 2,
                 active_clamp_mask: 0x05A5,
                 control_decimation_host: 16,
+                latency_samples: 12,
+                sample_rate_hz: 96_000,
+                saturation_flags: 7,
+                mix_dry_gain: 0.25,
+                mix_wet_gain: 0.75,
+                stereo_width: 1.25,
+                tempo_bpm: 128.5,
                 max_op_n_drive: 3.5,
                 max_pole_radius: 0.995,
                 max_effective_loop_gain: 0.85,
@@ -456,19 +476,8 @@ mod tests {
                     1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0,
                     15.0, 16.0,
                 ],
-                overflow_or_saturation_flags: 7,
             },
-            zoh: ZohRescaledParams {
-                sample_rate_host_hz: 96_000,
-                rho_sr: 0.5,
-                control_decimation_host: 32,
-                rho_ctrl: 1.0,
-                alpha_ramp_host: 0.03125,
-                r_ac_host: 0.9975,
-                r_dc_host: 0.998,
-                tau_ref_samples_host: 64.0,
-                switch_xfade_samples_host: 128,
-            },
+            zoh: ZohRateContext::compute(48_000.0, 96_000.0, Tier::Pro, false, true).unwrap(),
             stereo_width: 1.25,
             current_bpm: 128.5,
             latency_samples: 12,
@@ -480,7 +489,6 @@ mod tests {
             max_supported_tier: Tier::Pro,
             offline_bounce: true,
             maximize_tier_on_bounce: true,
-            supports_freeze: true,
             trails_enabled: true,
             causal_epoch: 42,
         }
@@ -517,10 +525,10 @@ mod tests {
         assert_eq!(reader.read(), rec);
         assert_eq!(reader.read_snapshot(), rec.snapshot);
 
-        // Toggle all boolean flags false and publish
+        // Toggle boolean flags false and publish
         rec.offline_bounce = false;
+        rec.snapshot.offline_bounce = 0;
         rec.maximize_tier_on_bounce = false;
-        rec.supports_freeze = false;
         rec.trails_enabled = false;
         rec.causal_epoch = 99;
         writer.publish(rec);
@@ -529,8 +537,7 @@ mod tests {
 
         // Test publish_from_engine
         let mut header = DnamJsonHeader::default_reference();
-        let arena = vec![0_u8; ARENA_OFFSET_ULTRA_END as usize];
-        let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+        let container = build_test_dnam_container(&mut header, Tier::Ultra, false);
         let engine = DynamicDnamEngine::from_bytes_owned(&container, Tier::Lite, 48_000).unwrap();
         writer.publish_from_engine(&engine, 123);
         assert_eq!(reader.sequence(), 4);
@@ -558,7 +565,8 @@ mod tests {
             active_tier in 0u8..4,
             stereo_out in 0u8..2,
             bypassed in 0u8..2,
-            is_frozen in 0u8..2,
+            host_write_lock in 0u8..2,
+            verification_status in 0u8..3,
             active_clamp_mask in any::<u16>(),
             control_decimation_host in any::<u16>(),
             max_op_n_drive in -100.0f32..100.0f32,
@@ -567,9 +575,9 @@ mod tests {
             tail_time_ms in 0.0f32..10_000.0f32,
             stereo_width in 0.0f32..2.0f32,
             current_bpm in 20.0f32..300.0f32,
-            latency_samples in 0usize..1024,
+            latency_samples in 0u32..1024,
             num_controls in any::<u8>(),
-            backend_idx in 0u8..8,
+            backend_idx in 0u8..10,
             sample_rate_hz in 44_100u32..192_000u32,
             req_tier in 0u8..4,
             max_avail_tier in 0u8..4,
@@ -579,29 +587,51 @@ mod tests {
         ) {
             // verify[arch.telemetry.seqlock-publication]
             let mut rec = sample_record();
+            let offline_bounce = (flags_bits & 1) != 0;
+            let os2x_active = (flags_bits & 8) != 0;
+            let host_sr_hz = if offline_bounce {
+                sample_rate_hz.min(96_000)
+            } else {
+                sample_rate_hz
+            };
             rec.snapshot.active_tier = active_tier;
+            rec.snapshot.max_available_tier = max_avail_tier;
+            rec.snapshot.max_supported_tier = max_sup_tier;
             rec.snapshot.stereo_out = stereo_out;
             rec.snapshot.bypassed = bypassed;
-            rec.snapshot.is_frozen = is_frozen;
+            rec.snapshot.offline_bounce = u8::from(offline_bounce);
+            rec.snapshot.host_write_lock = host_write_lock;
+            rec.snapshot.verification_status = verification_status;
             rec.snapshot.active_clamp_mask = active_clamp_mask;
             rec.snapshot.control_decimation_host = control_decimation_host;
+            rec.snapshot.latency_samples = latency_samples;
+            rec.snapshot.sample_rate_hz = host_sr_hz;
+            rec.snapshot.stereo_width = stereo_width;
+            rec.snapshot.tempo_bpm = current_bpm;
             rec.snapshot.max_op_n_drive = max_op_n_drive;
             rec.snapshot.max_pole_radius = max_pole_radius;
             rec.snapshot.max_effective_loop_gain = max_effective_loop_gain;
             rec.snapshot.tail_time_ms = tail_time_ms;
+            rec.zoh = ZohRateContext::compute(
+                48_000.0,
+                host_sr_hz as f32,
+                Tier::from_u8(active_tier),
+                os2x_active,
+                offline_bounce,
+            )
+            .unwrap();
             rec.stereo_width = stereo_width;
             rec.current_bpm = current_bpm;
-            rec.latency_samples = latency_samples;
+            rec.latency_samples = latency_samples as usize;
             rec.num_controls = num_controls;
             rec.backend_kind = backend_from_u8(backend_idx);
-            rec.sample_rate_hz = sample_rate_hz;
+            rec.sample_rate_hz = host_sr_hz;
             rec.requested_tier = Tier::from_u8(req_tier);
             rec.max_available_tier = Tier::from_u8(max_avail_tier);
             rec.max_supported_tier = Tier::from_u8(max_sup_tier);
-            rec.offline_bounce = (flags_bits & 1) != 0;
+            rec.offline_bounce = offline_bounce;
             rec.maximize_tier_on_bounce = (flags_bits & 2) != 0;
-            rec.supports_freeze = (flags_bits & 4) != 0;
-            rec.trails_enabled = (flags_bits & 8) != 0;
+            rec.trails_enabled = (flags_bits & 4) != 0;
             rec.causal_epoch = causal_epoch;
 
             let words = rec.to_words();

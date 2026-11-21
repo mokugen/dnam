@@ -681,8 +681,12 @@ const _: () = assert!(
 mod tests {
     use super::*;
 
+    /// verify[dsp.head.direct-register-readout]
+    /// verify[dsp.head.lower-triangular]
+    /// verify[dsp.op-n.core.interblock-tiles]
     #[test]
     fn test_layout_prefix_topology_tile_count_and_duhem_params() {
+        assert_eq!(core::mem::size_of::<CoreQuadReadoutHot>(), 96);
         assert_eq!(
             SONA_ULTRA_QUAD_TRAVERSAL_ORDER,
             [0, 4, 6, 8, 1, 5, 9, 2, 7, 3]

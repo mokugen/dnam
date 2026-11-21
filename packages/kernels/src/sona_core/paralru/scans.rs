@@ -238,4 +238,92 @@ mod tests {
             prop_assert_eq!(part_end.to_bits(), full_fwd[valid_len - 1].to_bits());
         }
     }
+
+    /// verify[dsp.op-n.commuted.theorem1]
+    /// verify[dsp.op-n.commuted.causality]
+    /// verify[dsp.op-n.commuted.project-then-filter]
+    /// verify[dsp.op-n.commuted.dc-equilibrium]
+    #[test]
+    fn test_commuted_lti_theorem1_causality_project_then_filter_and_dc() {
+        const K: usize = 3;
+        const P: usize = 4;
+        const N: usize = 24;
+        let poles = [0.985_f32, 0.92, 0.78];
+        let weights = [
+            [0.4_f32, -0.2, 0.1, 0.3],
+            [-0.1, 0.5, 0.2, -0.4],
+            [0.3, 0.1, -0.5, 0.2],
+        ];
+        let u_seq: [[f32; P]; N] = core::array::from_fn(|n| {
+            let t = (n as f32) * 0.11;
+            [t.sin(), (2.0 * t).cos(), (0.5 * t).sin(), -0.3 * t.cos()]
+        });
+
+        let mut uncomm_s = [[0.0_f32; P]; K];
+        let mut y_uncomm = [0.0_f32; N];
+        for n in 0..N {
+            let mut sum = 0.0_f32;
+            for k in 0..K {
+                let r = poles[k];
+                let one_m = 1.0 - r;
+                for p in 0..P {
+                    uncomm_s[k][p] = r * uncomm_s[k][p] + one_m * u_seq[n][p];
+                    sum += uncomm_s[k][p] * weights[k][p];
+                }
+            }
+            y_uncomm[n] = sum;
+        }
+
+        // Commuted project-then-filter order via LinearScanElem prefix recurrence.
+        let mut y_comm = [0.0_f32; N];
+        for k in 0..K {
+            let r = poles[k];
+            let one_m = 1.0 - r;
+            let elems: [LinearScanElem; N] = core::array::from_fn(|n| {
+                let v_k = (0..P).map(|p| u_seq[n][p] * weights[k][p]).sum::<f32>();
+                LinearScanElem {
+                    a: r,
+                    b: one_m * v_k,
+                }
+            });
+            let scanned = scan_linear_prefix_tile(&elems);
+            for n in 0..N {
+                y_comm[n] += apply_linear_scan(scanned[n], 0.0);
+            }
+        }
+        for n in 0..N {
+            assert!((y_uncomm[n] - y_comm[n]).abs() < 1.0e-5, "n={n}");
+        }
+
+        // Strict causality: mutating future input indices n >= 10 leaves prefix n < 10 bit-identical.
+        let mut u_fut = u_seq;
+        for row in &mut u_fut[10..] {
+            *row = [12.0, -9.0, 5.0, -3.0];
+        }
+        let fut_elems: [LinearScanElem; N] = core::array::from_fn(|n| {
+            let v = (0..P).map(|p| u_fut[n][p] * weights[0][p]).sum::<f32>();
+            LinearScanElem {
+                a: poles[0],
+                b: (1.0 - poles[0]) * v,
+            }
+        });
+        let base_elems: [LinearScanElem; N] = core::array::from_fn(|n| {
+            let v = (0..P).map(|p| u_seq[n][p] * weights[0][p]).sum::<f32>();
+            LinearScanElem {
+                a: poles[0],
+                b: (1.0 - poles[0]) * v,
+            }
+        });
+        let s_fut = scan_linear_prefix_tile(&fut_elems);
+        let s_base = scan_linear_prefix_tile(&base_elems);
+        for n in 0..10 {
+            assert_eq!(s_fut[n].b.to_bits(), s_base[n].b.to_bits());
+        }
+
+        // Canonical +0.0 DC equilibrium under ±0.0 zero input.
+        let zero_in = [-0.0_f32; 8];
+        let (z_tile, z_end) = run_paralru_forward_tile(&zero_in, 0.0, 0.99, 0.5, 0.25);
+        assert_eq!(z_tile.map(f32::to_bits), [0; 8]);
+        assert_eq!(z_end.to_bits(), 0);
+    }
 }

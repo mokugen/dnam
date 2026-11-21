@@ -2,26 +2,24 @@
 
 use alloc::vec::Vec;
 
-use zerocopy::byteorder::little_endian::{U16, U32, U64};
+use zerocopy::byteorder::little_endian::{U32, U64};
 use zerocopy::{FromBytes, IntoBytes};
 
+use super::unsealed_dnam::{assemble_unsealed_open_dnam, extract_verified_logical_dbin_prefix};
 use super::{
     DSA1_MAGIC, Dsa1ManifestHeaderWire, MAX_SEAL_RECIPIENTS, UnsealedDnslInner, align64_usize,
-    extract_mutable_json_bytes, extract_section_slice, merge_mutable_fields, pad_to_64,
+    extract_section_slice, pad_to_64,
 };
-use crate::container::{
-    CONTAINER_VERSION_MAJOR, CONTAINER_VERSION_MINOR, DEFAULT_DMU1_TRAILER_CAPACITY, DNAM_MAGIC,
-    DmueFooterWire, DnamDirectoryWire, DnamPreambleWire, align64_u64, build_dmu1_mutable_frame,
-};
+use crate::container::{DmueFooterWire, DnamDirectoryWire, DnamPreambleWire, align64_u64};
 use crate::provenance::provider::CryptoProvider;
 use crate::provenance::security::{
     Dai1Envelope, Dme1HeaderWire, DnplPreambleWire, DnslDirectoryWire, DnslPreambleWire,
     InnerDirectoryWire, build_buyer_receipt_v1, build_creator_manifest_v1,
     build_hpke_slot_binding_v1, build_mutable_content_aad_v1, build_mutable_hpke_binding_v1,
-    build_outer_manifest_v1, build_plaintext_shared_v1, build_prewrap_plan_v1, build_record_aad_v1,
-    build_record_nonce_v1, compute_ciphertext_prefixes_v1, compute_creator_signed_manifest_sha256,
-    compute_encrypted_structural_metadata_sha256, compute_license_policy_sha256,
-    compute_logical_metadata_sha256, compute_mutable_wrap_sha256,
+    build_outer_manifest_v1, build_plaintext_shared_v1_with_dbin, build_prewrap_plan_v1,
+    build_record_aad_v1, build_record_nonce_v1, compute_ciphertext_prefixes_v1,
+    compute_creator_signed_manifest_sha256, compute_encrypted_structural_metadata_sha256,
+    compute_license_policy_sha256, compute_logical_metadata_sha256, compute_mutable_wrap_sha256,
     compute_outer_public_metadata_sha256, compute_plaintext_prefixes_v1,
     compute_record_context_sha256, compute_wrap_plan_sha256, parse_dme1_decrypted_plaintext,
     parse_hpke_slot_vector, parse_prefix_list, parse_recipient_key_ids, parse_record_directory,
@@ -46,6 +44,7 @@ struct VerifiedInnerDnpl {
     logical_dnam_dir: DnamDirectoryWire,
     header_json_bytes: Vec<u8>,
     shared_bytes: Vec<u8>,
+    dbin_prefix: Vec<u8>,
     arena_bytes: Vec<u8>,
     tier_ends: [usize; 4],
     dai1_bytes: Vec<u8>,
@@ -433,8 +432,13 @@ fn verify_and_decrypt_inner_dnpl<C: CryptoProvider>(
         ))?;
     let l_hdr_len = usize::try_from(logical_dnam_dir.immutable_header_length.get())
         .map_err(|_| DnamError::CryptoVerificationFailed("logical header length overflow"))?;
+    let l_hdr_end = 192usize
+        .checked_add(l_hdr_len)
+        .ok_or(DnamError::CryptoVerificationFailed(
+            "logical header end overflow",
+        ))?;
     let header_json_bytes = logical_prefix
-        .get(192..192 + l_hdr_len)
+        .get(192..l_hdr_end)
         .ok_or(DnamError::CryptoVerificationFailed(
             "truncated logical JSON header",
         ))?
@@ -558,10 +562,17 @@ fn verify_and_decrypt_inner_dnpl<C: CryptoProvider>(
     }
 
     let hdr_sha = sha256_digest(&header_json_bytes);
-    let shared_framing = build_plaintext_shared_v1(
+    let dbin_prefix = extract_verified_logical_dbin_prefix(
+        logical_prefix,
+        &logical_dnam_dir,
+        l_hdr_len,
+        &shared_bytes,
+    )?;
+    let shared_framing = build_plaintext_shared_v1_with_dbin(
         &logical_prefix[0..64],
         &logical_prefix[64..192],
         &shared_bytes,
+        &dbin_prefix,
     );
     let mut tier_slices: Vec<&[u8]> = Vec::with_capacity(retained_tier_idx + 1);
     let mut a_prev = 0usize;
@@ -612,6 +623,7 @@ fn verify_and_decrypt_inner_dnpl<C: CryptoProvider>(
         logical_dnam_dir,
         header_json_bytes,
         shared_bytes,
+        dbin_prefix,
         arena_bytes,
         tier_ends,
         dai1_bytes: dai1_slice.to_vec(),
@@ -703,6 +715,7 @@ pub fn unseal_dnsl_up_to_tier<C: CryptoProvider>(
         logical_dnam_dir: inner.logical_dnam_dir,
         header_json_bytes: inner.header_json_bytes,
         shared_bytes: inner.shared_bytes,
+        dbin_prefix: inner.dbin_prefix,
         auth_bytes: inner.dai1_bytes,
         arena_bytes: inner.arena_bytes,
         tier_ends: inner.tier_ends,
@@ -720,102 +733,5 @@ pub fn unseal_dnam_container<C: CryptoProvider>(
     crypto: &C,
 ) -> Result<Vec<u8>, DnamError> {
     let unsealed = unseal_dnsl_up_to_tier(sealed_bytes, crypto, Tier::Ultra)?;
-    let mut header = DnamJsonHeader::from_json_slice(&unsealed.header_json_bytes)
-        .map_err(|e| DnamError::InvalidJsonHeader(alloc::format!("{e}")))?;
-    if let Some(ref mut_val) = unsealed.mutable_json {
-        merge_mutable_fields(&mut header, mut_val)?;
-    }
-    let mut_json = extract_mutable_json_bytes(&header)?;
-    let dmu1 = build_dmu1_mutable_frame(&mut_json, DEFAULT_DMU1_TRAILER_CAPACITY)?;
-
-    let auth_len = 64usize;
-    let hdr_off = 192u64;
-    let hdr_len = unsealed.header_json_bytes.len() as u64;
-    let shared_off = align64_u64(hdr_off + hdr_len).ok_or(DnamError::CryptoVerificationFailed(
-        "DNSL unseal shared_off overflow",
-    ))?;
-    let shared_len = unsealed.shared_bytes.len() as u64;
-    let auth_off = align64_u64(shared_off + shared_len).ok_or(
-        DnamError::CryptoVerificationFailed("DNSL unseal auth_off overflow"),
-    )?;
-    let tier_start = align64_u64(auth_off + auth_len as u64).ok_or(
-        DnamError::CryptoVerificationFailed("DNSL unseal tier_start overflow"),
-    )?;
-    let mut tier_ends = [U64::new(0); 4];
-    for t in 0..=(unsealed.retained_tier as usize) {
-        tier_ends[t] = U64::new(tier_start + unsealed.tier_ends[t] as u64);
-    }
-    let preamble = DnamPreambleWire {
-        magic: DNAM_MAGIC,
-        version_major: U16::new(CONTAINER_VERSION_MAJOR),
-        version_minor: U16::new(CONTAINER_VERSION_MINOR),
-        protection_profile: 0,
-        auth_kind: 0,
-        maximum_tier: unsealed.retained_tier as u8,
-        reserved_flag: 0,
-        sample_rate_train_hz: U32::new(48_000),
-        reserved_pad: [0u8; 48],
-    };
-    let dir = DnamDirectoryWire {
-        immutable_header_offset: U64::new(hdr_off),
-        immutable_header_length: U64::new(hdr_len),
-        shared_binary_offset: U64::new(shared_off),
-        shared_binary_length: U64::new(shared_len),
-        authentication_envelope_offset: U64::new(auth_off),
-        authentication_envelope_length: U64::new(auth_len as u64),
-        reserved_offset: U64::new(0),
-        reserved_capacity: U64::new(0),
-        tier_start: U64::new(tier_start),
-        original_tier_ends: tier_ends,
-        reserved_tail: [0u8; 24],
-    };
-    let total_end = (tier_start as usize) + unsealed.arena_bytes.len();
-    let mut out = Vec::with_capacity(total_end + dmu1.len() + 16);
-    out.extend_from_slice(preamble.as_bytes());
-    out.extend_from_slice(dir.as_bytes());
-    out.extend_from_slice(&unsealed.header_json_bytes);
-    pad_to_64(&mut out);
-    out.extend_from_slice(&unsealed.shared_bytes);
-    pad_to_64(&mut out);
-    out.resize(out.len() + 64, 0);
-    let mut crc = 0_u32;
-    let mut crc_tiers = [0_u32; 4];
-    let mut prev_t = 0_usize;
-    for t in 0..=(unsealed.retained_tier as usize) {
-        let end_t = unsealed.tier_ends[t];
-        crc = crate::container::crc32c_update(crc, &unsealed.arena_bytes[prev_t..end_t]);
-        crc_tiers[t] = crc;
-        prev_t = end_t;
-    }
-    let last_crc = crc_tiers[unsealed.retained_tier as usize];
-    for slot in crc_tiers
-        .iter_mut()
-        .skip((unsealed.retained_tier as usize) + 1)
-    {
-        *slot = last_crc;
-    }
-    let mut flags_hint = 0_u16;
-    if header.io_config.output_mode != "mono" {
-        flags_hint |= crate::container::FLAG_STEREO_OUT;
-    }
-    if header.metadata.signatures.is_some() {
-        flags_hint |= crate::container::FLAG_HAS_SIGNATURES;
-    }
-    let dcrc = crate::container::DcrcAuthRecord {
-        crc_prefix: crate::container::crc32c_update(0, &out[..auth_off as usize]),
-        crc_tiers,
-        num_controls: header.controls_schema.len().min(u16::MAX as usize) as u16,
-        flags_hint,
-        tail_time_ms_bits: header.io_config.tail_time_ms.to_bits(),
-    };
-    out[auth_off as usize..auth_off as usize + 64].copy_from_slice(&dcrc.to_bytes());
-    out.extend_from_slice(&unsealed.arena_bytes);
-    out.extend_from_slice(&dmu1);
-    let dmue = DmueFooterWire {
-        magic: *b"DMUE",
-        frame_len: U64::new(dmu1.len() as u64),
-        reserved: U32::new(0),
-    };
-    out.extend_from_slice(dmue.as_bytes());
-    Ok(out)
+    assemble_unsealed_open_dnam(&unsealed)
 }

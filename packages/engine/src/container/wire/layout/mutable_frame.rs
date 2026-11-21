@@ -13,8 +13,8 @@ use zerocopy::{FromBytes, IntoBytes};
 use super::super::jcs::parse_strict_json_object_bytes;
 use super::super::structs::{DMU1_HEADER_SIZE, Dmu1HeaderWire};
 use super::ContainerWireError;
-use crate::math::crc32c;
 use crate::schema::{DnamError, SchemaOptionExt, reject_if};
+use dnam_vm::math::{crc32c, crc32c_slice};
 
 /// Builds a `DMU1` open mutable frame of total capacity `capacity >= 16 + payload.len()`
 /// (`ref[container.dnam.mutable-frame]`).
@@ -63,9 +63,9 @@ pub(crate) fn validate_dmu1_frame_rt(frame: &[u8]) -> Result<(), ContainerWireEr
             "non-zero DMU1 padding bytes",
         ));
     }
-    let c0 = crate::math::crc32c_slice(0, b"DMU1");
-    let c1 = crate::math::crc32c_slice(c0, hdr.json_len.as_bytes());
-    let calc_crc = crate::math::crc32c_slice(c1, payload);
+    let c0 = crc32c_slice(0, b"DMU1");
+    let c1 = crc32c_slice(c0, hdr.json_len.as_bytes());
+    let calc_crc = crc32c_slice(c1, payload);
     if stored_crc != calc_crc {
         return Err(ContainerWireError::Crc32cMismatch {
             region: "DMU1",

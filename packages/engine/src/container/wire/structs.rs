@@ -2,12 +2,12 @@
 //! directories, mutable frames, and `DCRC` records (`ref[sdk.rust.zerocopy-wire-structs]`,
 //! `ref[container.dnam.preamble-directory]`, `ref[container.dnam.mutable-frame]`).
 
-use core::mem::{align_of, size_of};
+use core::mem::{align_of, offset_of, size_of};
 
 use zerocopy::byteorder::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
-pub use crate::graph::weights::SonaCellDescWire;
+pub use dnam_vm::bin::SonaCellDescWire;
 
 /// Fixed 64-byte preamble size (`0..64`, `ref[container.dnam.preamble-directory]`).
 pub const V3_PREAMBLE_SIZE: usize = 64;
@@ -69,10 +69,10 @@ pub struct DnamDirectoryWire {
     pub authentication_envelope_offset: U64,
     /// Byte length of Region 5 authentication envelope.
     pub authentication_envelope_length: U64,
-    /// Reserved offset slot (must be `0`).
-    pub reserved_offset: U64,
-    /// Reserved capacity slot (must be `0`).
-    pub reserved_capacity: U64,
+    /// Optional `64 B`-aligned offset of embedded Layer 0 `.dnam-bin` prefix (`0` when absent).
+    pub dbin_offset: U64,
+    /// Byte length of embedded Layer 0 `.dnam-bin` prefix (`% 64 == 0`, `0` when absent).
+    pub dbin_prefix_bytes: U64,
     /// File offset where `Arena 0` begins (`64 B`-aligned).
     pub tier_start: U64,
     /// Cumulative original tier boundary offsets `[lite_end, full_end, pro_end, ultra_end]`.
@@ -83,6 +83,8 @@ pub struct DnamDirectoryWire {
 
 const _: () = assert!(size_of::<DnamDirectoryWire>() == V3_DIRECTORY_SIZE);
 const _: () = assert!(align_of::<DnamDirectoryWire>() == 1);
+const _: () = assert!(offset_of!(DnamDirectoryWire, dbin_offset) == 48);
+const _: () = assert!(offset_of!(DnamDirectoryWire, dbin_prefix_bytes) == 56);
 
 /// Fixed `16 B` `DMU1` mutable JSON frame header (`ref[container.dnam.mutable-frame]`).
 #[repr(C)]
@@ -136,12 +138,15 @@ pub struct DcrcAuthRecordWire {
     pub flags_hint: U16,
     /// `f32::to_bits()` of `io_config.tail_time_ms`.
     pub tail_time_ms_bits: U32,
-    /// Reserved zero-filled tail padding (`32 B`).
-    pub reserved_pad: [u8; 32],
+    /// Castagnoli `CRC-32C` over `[dbin_offset..tier_start)` when `dbin_prefix_bytes > 0` (`0` when absent).
+    pub crc_dbin_prefix: U32,
+    /// Reserved zero-filled tail padding (`28 B`).
+    pub reserved_pad: [u8; 28],
 }
 
 const _: () = assert!(size_of::<DcrcAuthRecordWire>() == DCRC_RECORD_SIZE);
 const _: () = assert!(align_of::<DcrcAuthRecordWire>() == 1);
+const _: () = assert!(offset_of!(DcrcAuthRecordWire, crc_dbin_prefix) == 32);
 
 const _: () = assert!(size_of::<SonaCellDescWire>() == 16);
 const _: () = assert!(align_of::<SonaCellDescWire>() == 1);
@@ -174,8 +179,8 @@ mod tests {
             shared_binary_length: U64::new(64),
             authentication_envelope_offset: U64::new(512),
             authentication_envelope_length: U64::new(64),
-            reserved_offset: U64::new(0),
-            reserved_capacity: U64::new(0),
+            dbin_offset: U64::new(0),
+            dbin_prefix_bytes: U64::new(0),
             tier_start: U64::new(576),
             original_tier_ends: [
                 U64::new(5_184),

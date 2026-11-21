@@ -1,9 +1,10 @@
-//! Non-blocking SPSC control, preset, tempo, bypass, freeze, and stereo-width delegation
+//! Non-blocking SPSC control, preset, tempo, bypass, and stereo-width delegation
 //! for [`DnamHostHandle`] (`ref[dsp.ctrl.op-m.spsc-ingress]`).
 
 use alloc::vec::Vec;
 
-use crate::control::ControlClampDescriptor;
+use dnam_vm::control::ControlClampDescriptor;
+
 use crate::schema::{DnamError, TempoSubdivision};
 
 use super::DnamHostHandle;
@@ -132,33 +133,6 @@ impl DnamHostHandle {
         prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
     }
 
-    /// Returns whether this model supports captured hardware freeze wait-free.
-    #[inline]
-    pub fn supports_freeze(&self) -> bool {
-        self.telemetry_record().supports_freeze
-    }
-
-    /// Returns `true` if Unitary Spectral Freeze is currently engaged wait-free.
-    #[inline]
-    pub fn is_frozen(&self) -> bool {
-        self.telemetry_record().snapshot.is_frozen != 0
-    }
-
-    /// Engages or disengages Unitary Spectral Freeze without blocking on an active audio block.
-    pub fn set_freeze(&self, freeze: bool) {
-        let mut prod = self.producer.lock();
-        prod.producer.set_freeze(freeze);
-        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-    }
-
-    /// Sets continuous Unitary Spectral Freeze amount $\alpha_{\text{freeze}} \in [0.0, 1.0]$
-    /// without blocking on an active audio block.
-    pub fn set_freeze_amount(&self, alpha: f32) {
-        let mut prod = self.producer.lock();
-        prod.producer.set_freeze_amount(alpha);
-        prod.publish_shadow_telemetry(&self.audio_telemetry_reader);
-    }
-
     /// Returns `(bypassed, trails_enabled)` wait-free.
     #[inline]
     pub fn bypass_state(&self) -> (bool, bool) {
@@ -254,11 +228,11 @@ impl DnamHostHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
     use crate::schema::{
         ControlCalibration, ControlCalibrationRole, ControlKind, ControlSchemaDef, ControlUiHints,
         DnamJsonHeader, PresetDef,
     };
+    use crate::test_support::build_test_dnam_container;
     use crate::types::Tier;
     use alloc::collections::BTreeMap;
     use alloc::string::String;
@@ -267,7 +241,6 @@ mod tests {
 
     fn build_controls_test_container() -> Vec<u8> {
         let mut header = DnamJsonHeader::default_reference();
-        header.io_config.capabilities.supports_freeze = true;
         header.controls_schema = vec![
             ControlSchemaDef {
                 id: String::from("gain"),
@@ -342,19 +315,17 @@ mod tests {
             controls: p1,
             user_metadata: BTreeMap::new(),
         }];
-        let arena = vec![0_u8; ARENA_OFFSET_ULTRA_END as usize];
-        build_dnam_container(&mut header, &arena, &arena, false).unwrap()
+        build_test_dnam_container(&mut header, Tier::Ultra, false)
     }
 
     #[test]
-    fn test_host_controls_presets_tempo_freeze_bypass_and_mix() {
+    fn test_host_controls_presets_tempo_bypass_and_mix() {
         // verify[dsp.ctrl.op-m.spsc-ingress]
         let container = build_controls_test_container();
         let host = DnamHostHandle::from_bytes_owned(&container, Tier::Lite, 48_000).unwrap();
 
         assert_eq!(host.num_controls(), 3);
         assert_eq!(host.control_descriptors().len(), 3);
-        assert!(host.supports_freeze());
 
         assert!((host.try_set_control_value(0, 7.5).unwrap() - 7.5).abs() < 1e-6);
         assert!(host.try_set_control_value(99, 1.0).is_err());
@@ -380,13 +351,6 @@ mod tests {
         host.reset_controls_to_defaults();
         assert!((host.clamped_control_value(0).unwrap() - 5.0).abs() < 1e-6);
         host.reset_to_dc_equilibrium();
-
-        host.set_freeze(true);
-        assert!(host.is_frozen());
-        host.set_freeze_amount(0.2);
-        assert!(!host.is_frozen());
-        host.set_freeze_amount(0.8);
-        assert!(host.is_frozen());
 
         host.set_bypass(true, true);
         assert_eq!(host.bypass_state(), (true, true));
@@ -416,7 +380,6 @@ mod tests {
             width in -1.0f32..3.0f32,
             bypassed in any::<bool>(),
             trails in any::<bool>(),
-            frozen in any::<bool>(),
         ) {
             // verify[dsp.ctrl.op-m.spsc-ingress]
             // verify[arch.telemetry.seqlock-publication]
@@ -426,14 +389,12 @@ mod tests {
             host.set_control_value(0, raw_gain);
             host.set_stereo_width(width);
             host.set_bypass(bypassed, trails);
-            host.set_freeze(frozen);
 
             let expected_gain = raw_gain.clamp(1.0, 9.0);
             let expected_width = width.clamp(0.0, 2.0);
             prop_assert!((host.clamped_control_value(0).unwrap() - expected_gain).abs() < 1e-6);
             prop_assert!((host.stereo_width() - expected_width).abs() < 1e-6);
             prop_assert_eq!(host.bypass_state(), (bypassed, trails));
-            prop_assert_eq!(host.is_frozen(), frozen);
         }
     }
 }

@@ -1,9 +1,12 @@
 //! Method dispatch and tests for [`DynamicDnamEngine`].
 
+use dnam_vm::ZohRateContext;
+use dnam_vm::control::ControlClampDescriptor;
+
 use super::DynamicDnamEngine;
-use crate::container::{DnamPreamble, ZohRescaledParams};
-use crate::control::ControlClampDescriptor;
-use crate::provenance::VerificationStatus;
+use crate::container::DnamPreamble;
+use crate::engine::{HostShellPatchbay, IoRoutingMode, ParallelAlignmentMode, WdwDryTapMode};
+use crate::provenance::{PreviewGuardState, VerificationStatus};
 use crate::schema::{DnamError, DnamJsonHeader, DnamProtectionProfile, TempoSubdivision};
 use crate::types::{DnamTelemetrySnapshot, Tier};
 
@@ -58,18 +61,17 @@ impl<'a> DynamicDnamEngine<'a> {
 
     /// Returns the active host sample rate in Hz.
     #[inline]
-    pub const fn sample_rate_hz(&self) -> u32 {
+    pub fn sample_rate_hz(&self) -> u32 {
         dispatch_engine!(self, e => e.sample_rate_hz())
     }
 
-    /// Returns the current [`ZohRescaledParams`] for the active host sample rate.
+    /// Returns the current [`ZohRateContext`] for the active host sample rate.
     #[inline]
-    pub const fn zoh(&self) -> &ZohRescaledParams {
+    pub fn zoh(&self) -> &ZohRateContext {
         dispatch_engine!(self, e => e.zoh())
     }
 
     /// Switches the active [`Tier`].
-    #[inline]
     pub fn set_tier(&mut self, tier: Tier) {
         dispatch_engine!(self, e => e.set_tier(tier))
     }
@@ -80,63 +82,59 @@ impl<'a> DynamicDnamEngine<'a> {
         dispatch_engine!(self, e => e.tier())
     }
 
-    /// Returns the highest [`Tier`] present in the loaded `.dnam` container.
+    /// Returns the highest tier present in the container.
     #[inline]
     pub const fn max_available_tier(&self) -> Tier {
         dispatch_engine!(self, e => e.max_available_tier())
     }
 
-    /// Returns the plugin/host ceiling [`Tier`] (`max_supported_tier`).
+    /// Returns the maximum tier permitted by the host.
     #[inline]
     pub const fn max_supported_tier(&self) -> Tier {
         dispatch_engine!(self, e => e.max_supported_tier())
     }
 
-    /// Sets the plugin/host ceiling [`Tier`] (`max_supported_tier`).
-    #[inline]
+    /// Sets the host ceiling [`Tier`].
     pub fn set_max_supported_tier(&mut self, max_tier: Tier) {
         dispatch_engine!(self, e => e.set_max_supported_tier(max_tier))
     }
 
-    /// Returns the effective [`Tier`] (`min(max_available_tier, max_supported_tier)` when
-    /// `offline_bounce && maximize_tier_on_bounce`, otherwise `self.tier()`).
+    /// Returns the currently active execution [`Tier`].
     #[inline]
     pub fn effective_tier(&self) -> Tier {
         dispatch_engine!(self, e => e.effective_tier())
     }
 
-    /// Returns `true` if Offline Bounce mode ($4\times$ linear-phase polyphase oversampling) is enabled.
+    /// Returns `true` when `4x` oversampled Offline Bounce mode is active.
     #[inline]
     pub const fn offline_bounce(&self) -> bool {
         dispatch_engine!(self, e => e.offline_bounce())
     }
 
-    /// Enables or disables Offline Bounce mode ($4\times$ linear-phase polyphase oversampling).
-    #[inline]
+    /// Enables or disables Offline Bounce mode (`4x` polyphase oversampling, `12`-sample PDC).
     pub fn set_offline_bounce(&mut self, enabled: bool) {
         dispatch_engine!(self, e => e.set_offline_bounce(enabled))
     }
 
-    /// Returns `true` if `maximize_tier_on_bounce` is enabled.
+    /// Returns whether Offline Bounce promotes execution to `min(max_available, max_supported)`.
     #[inline]
     pub const fn maximize_tier_on_bounce(&self) -> bool {
         dispatch_engine!(self, e => e.maximize_tier_on_bounce())
     }
 
-    /// Enables or disables automatic tier promotion during Offline Bounce.
-    #[inline]
+    /// Enables or disables automatic tier maximization during Offline Bounce.
     pub fn set_maximize_tier_on_bounce(&mut self, enabled: bool) {
         dispatch_engine!(self, e => e.set_maximize_tier_on_bounce(enabled))
     }
 
-    /// Returns the current Plugin Delay Compensation (`PDC`) latency in host samples (`0` or `12`).
+    /// Returns active PDC latency in host samples.
     #[inline]
     pub const fn latency_samples(&self) -> usize {
         dispatch_engine!(self, e => e.latency_samples())
     }
 
-    /// Renders a complete stereo buffer in Offline Bounce mode, automatically stripping the 12-sample PDC lead-in.
-    #[inline]
+    /// Renders a complete stereo buffer in isolated Offline Bounce mode, stripping the 12-sample
+    /// PDC lead-in while preserving live recursive state on `self`.
     pub fn render_offline_bounce(
         &mut self,
         left_in: &[f32],
@@ -147,87 +145,144 @@ impl<'a> DynamicDnamEngine<'a> {
         dispatch_engine!(self, e => e.render_offline_bounce(left_in, right_in, left_out, right_out))
     }
 
-    /// Rescales discrete-time parameters for a new host sample rate.
+    /// Reconfigures all ZOH parameters for a new host sample rate.
     #[inline]
     pub fn set_sample_rate(&mut self, sample_rate_hz: u32) -> Result<(), DnamError> {
         dispatch_engine!(self, e => e.set_sample_rate(sample_rate_hz))
     }
 
-    /// Sets a user control value with smooth $3\text{ kHz}$ anti-zipper interpolation.
-    #[inline]
+    /// Real-time zero-allocation sample-rate retiming returning `bool` (zero `DnamError` drop glue).
+    #[inline(never)]
+    pub(crate) fn set_sample_rate_rt(&mut self, sample_rate_hz: u32) -> bool {
+        dispatch_engine!(self, e => e.reconfigure_for_sample_rate_rt(sample_rate_hz).is_ok())
+    }
+
+    /// Schedules a smoothed physical control value change.
     pub fn set_control_value(&mut self, ctrl_idx: usize, value: f32) {
         dispatch_engine!(self, e => e.set_control_value(ctrl_idx, value))
     }
 
-    /// Sets a user control value and snaps immediately.
-    #[inline]
+    /// Sets a control value and updates static DSP parameters immediately.
     pub fn set_control_immediate(&mut self, ctrl_idx: usize, value: f32) {
         dispatch_engine!(self, e => e.set_control_immediate(ctrl_idx, value))
     }
 
-    /// Returns the number of user controls $P \in [0, 255]$.
+    /// Returns the number of controls in the loaded container.
     #[inline]
-    pub const fn num_controls(&self) -> usize {
+    pub fn num_controls(&self) -> usize {
         dispatch_engine!(self, e => e.num_controls())
     }
 
-    /// Returns the slice of raw user-requested physical control values (`len == num_controls`).
+    /// Returns raw user-requested physical control values.
     #[inline]
     pub fn raw_control_values(&self) -> &[f32] {
         dispatch_engine!(self, e => e.raw_control_values())
     }
 
-    /// Returns the slice of clamped physical control values (`len == num_controls`).
+    /// Returns clamped physical control values.
     #[inline]
     pub fn clamped_control_values(&self) -> &[f32] {
         dispatch_engine!(self, e => e.clamped_control_values())
     }
 
-    /// Returns the compiled 64-byte [`ControlClampDescriptor`] slice (`len == num_controls`).
+    /// Returns compiled control clamp descriptors.
     #[inline]
     pub fn control_descriptors(&self) -> &[ControlClampDescriptor] {
         dispatch_engine!(self, e => e.control_descriptors())
     }
 
-    /// Snaps all controls immediately back to their schema defaults and refreshes static state.
+    /// Snaps all controls back to schema defaults.
     #[inline]
     pub fn reset_controls_to_defaults(&mut self) {
         dispatch_engine!(self, e => e.reset_controls_to_defaults())
     }
 
-    /// Resets all states to their analytical DC resting equilibrium.
-    #[inline]
+    /// Resets recursive DSP state to exact DC equilibrium.
     pub fn reset_to_dc_equilibrium(&mut self) {
         dispatch_engine!(self, e => e.reset_to_dc_equilibrium())
     }
 
-    /// Returns whether this model supports captured hardware freeze (`supports_freeze == true` or
-    /// a `FreezeLatch`-calibrated control in `controls_schema`, `ref[dsp.tank.captured-freeze]`).
+    /// Returns whether storefront preview containment mode is active.
     #[inline]
-    pub fn supports_freeze(&self) -> bool {
-        dispatch_engine!(self, e => e.supports_freeze())
+    pub const fn is_preview_mode(&self) -> bool {
+        dispatch_engine!(self, e => e.is_preview_mode())
     }
 
-    /// Engages or disengages Unitary Spectral Freeze (`alpha = 1.0` vs `0.0`).
+    /// Returns an immutable view of [`PreviewGuardState`].
     #[inline]
-    pub fn set_freeze(&mut self, freeze: bool) {
-        dispatch_engine!(self, e => e.set_freeze(freeze))
+    pub const fn preview_guard(&self) -> &PreviewGuardState {
+        dispatch_engine!(self, e => e.preview_guard())
     }
 
-    /// Sets the continuous Unitary Spectral Freeze amount $\alpha_{\text{freeze}} \in [0.0, 1.0]$.
+    /// Returns an immutable view of [`HostShellPatchbay`].
     #[inline]
-    pub fn set_freeze_amount(&mut self, alpha: f32) {
-        dispatch_engine!(self, e => e.set_freeze_amount(alpha))
+    pub const fn patchbay(&self) -> &HostShellPatchbay {
+        dispatch_engine!(self, e => e.patchbay())
     }
 
-    /// Returns `true` if Unitary Spectral Freeze is currently engaged ($\alpha_{\text{freeze}} > 0.5$).
+    /// Returns a mutable view of [`HostShellPatchbay`].
     #[inline]
-    pub fn is_frozen(&self) -> bool {
-        dispatch_engine!(self, e => e.is_frozen())
+    pub fn patchbay_mut(&mut self) -> &mut HostShellPatchbay {
+        dispatch_engine!(self, e => e.patchbay_mut())
     }
 
-    /// Sets the bypass state (`bypassed`) and spillover trails mode (`trails`).
+    /// Selects the host shell multi-port routing mode.
+    pub fn set_routing_mode(&mut self, mode: IoRoutingMode) {
+        dispatch_engine!(self, e => e.set_routing_mode(mode))
+    }
+
+    /// Selects the WDW dry center tap mode.
+    #[inline(never)]
+    pub fn set_wdw_mode(&mut self, mode: WdwDryTapMode) {
+        dispatch_engine!(self, e => e.set_wdw_mode(mode))
+    }
+
+    /// Enables or disables WDW routing.
+    #[inline(never)]
+    pub fn set_wdw_enabled(&mut self, enabled: bool) {
+        dispatch_engine!(self, e => e.set_wdw_enabled(enabled))
+    }
+
+    /// Configures external FX return alignment delays in VM samples.
+    pub fn configure_return_alignment(&mut self, delay_l_samples: f32, delay_r_samples: f32) {
+        dispatch_engine!(self, e => e.configure_return_alignment(delay_l_samples, delay_r_samples))
+    }
+
+    /// Configures parallel-path Kaiser/Catmull-Rom alignment.
+    pub fn configure_parallel_alignment(
+        &mut self,
+        mode: ParallelAlignmentMode,
+        enabled: bool,
+        delta_l_48k: f32,
+        delta_r_48k: f32,
+    ) {
+        dispatch_engine!(self, e => e.configure_parallel_alignment(mode, enabled, delta_l_48k, delta_r_48k))
+    }
+
+    /// Sets or clears bit 2 (`QUAD_FLAG_HOST_WRITE_LOCK`) across all active `TransportQuad`s.
+    pub fn set_quad_write_enable(&mut self, locked: bool) {
+        dispatch_engine!(self, e => e.set_quad_write_enable(locked))
+    }
+
+    /// Sets or clears host-direct `Op-T` parameter lock.
+    pub fn set_op_t_write_enable(&mut self, locked: bool) {
+        dispatch_engine!(self, e => e.set_op_t_write_enable(locked))
+    }
+
+    /// Enables or disables live Ornstein–Uhlenbeck analog drift.
     #[inline]
+    pub fn set_live_analog_drift(&mut self, enabled: bool) {
+        dispatch_engine!(self, e => e.set_live_analog_drift(enabled))
+    }
+
+    /// Returns whether live Ornstein–Uhlenbeck analog drift is enabled.
+    #[inline]
+    pub fn live_analog_drift_enabled(&self) -> bool {
+        dispatch_engine!(self, e => e.live_analog_drift_enabled())
+    }
+
+    /// Sets bypass state and spillover trails behavior.
+    #[inline(never)]
     pub fn set_bypass(&mut self, bypassed: bool, trails: bool) {
         dispatch_engine!(self, e => e.set_bypass(bypassed, trails))
     }
@@ -238,19 +293,24 @@ impl<'a> DynamicDnamEngine<'a> {
         dispatch_engine!(self, e => e.bypass_state())
     }
 
-    /// Sets the output Mid/Side stereo width $\alpha_{\text{width}} \in [0.0, 2.0]$.
-    #[inline]
+    /// Sets post-VM M/S stereo width clamped to `[0.0, 2.0]`.
     pub fn set_stereo_width(&mut self, width: f32) {
         dispatch_engine!(self, e => e.set_stereo_width(width))
     }
 
-    /// Returns the output Mid/Side stereo width $\alpha_{\text{width}} \in [0.0, 2.0]$.
+    /// Alias matching [`HostShellPatchbay::set_ms_width`].
+    #[inline]
+    pub fn set_ms_width(&mut self, width: f32) {
+        dispatch_engine!(self, e => e.set_ms_width(width))
+    }
+
+    /// Returns the current M/S stereo width.
     #[inline]
     pub const fn stereo_width(&self) -> f32 {
         dispatch_engine!(self, e => e.stereo_width())
     }
 
-    /// Configures host dry/wet blend, output gain trim (dB), and automatic unity loudness leveling.
+    /// Configures host parallel blend, output gain, and auto-unity leveling.
     #[inline]
     pub fn configure_host_mix_and_leveling(
         &mut self,
@@ -267,32 +327,13 @@ impl<'a> DynamicDnamEngine<'a> {
         dispatch_engine!(self, e => e.current_bpm())
     }
 
-    /// Sets the active host tempo in BPM without modifying control values.
+    /// Sets host BPM without modifying control values.
     #[inline]
     pub fn set_bpm(&mut self, bpm: f32) {
         dispatch_engine!(self, e => e.set_bpm(bpm))
     }
 
-    /// Accumulates additional clamping bits into `active_clamp_mask`.
-    #[inline]
-    pub(crate) fn or_active_clamp_mask(&mut self, mask: u16) {
-        dispatch_engine!(self, e => e.or_active_clamp_mask(mask))
-    }
-
-    /// Returns `(r_ac_tr, r_dc_tr, tau_ref_tr, switch_xfade_tr)` for ZOH pole rescaling.
-    #[inline]
-    pub(crate) fn training_zoh_poles(&self) -> (f32, f32, f32, u32) {
-        dispatch_engine!(self, e => e.training_zoh_poles())
-    }
-
-    /// Returns the cumulative number of processed audio frames tracked for tap-tempo intervals.
-    #[inline]
-    pub(crate) const fn tempo_total_frames(&self) -> u64 {
-        dispatch_engine!(self, e => e.tempo_state.total_frames)
-    }
-
-    /// Synchronizes tempo-calibrated controls to `bpm` and optional `subdivision_override`.
-    #[inline]
+    /// Synchronizes all tempo-bound controls to `(bpm, subdivision_override, fold_octave)`.
     pub fn sync_tempo(
         &mut self,
         bpm: f32,
@@ -302,8 +343,7 @@ impl<'a> DynamicDnamEngine<'a> {
         dispatch_engine!(self, e => e.sync_tempo(bpm, subdivision_override, fold_octave))
     }
 
-    /// Registers a tap-tempo event at the current audio frame counter, updates BPM, and syncs controls.
-    #[inline]
+    /// Registers a tap-tempo event and updates synchronized controls.
     pub fn register_tap_tempo(
         &mut self,
         subdivision_override: Option<TempoSubdivision>,
@@ -312,32 +352,29 @@ impl<'a> DynamicDnamEngine<'a> {
         dispatch_engine!(self, e => e.register_tap_tempo(subdivision_override, fold_octave))
     }
 
-    /// Applies a named preset atomically (`ref[dsp.ctrl.switch.conditional-batch]`).
+    /// Applies a preset by string identifier.
     #[inline]
     pub fn apply_preset(&mut self, preset_id: &str) -> Result<(), DnamError> {
         dispatch_engine!(self, e => e.apply_preset(preset_id))
     }
 
-    /// Applies a preset by index without any heap allocations (`ref[dsp.ctrl.op-m.spsc-ingress]`).
+    /// Applies a preset by index without heap allocations.
     #[inline]
     pub fn apply_preset_by_index(&mut self, preset_index: usize) -> Result<(), DnamError> {
         dispatch_engine!(self, e => e.apply_preset_by_index(preset_index))
     }
 
-    /// Real-time preset application by index returning `bool` (zero `DnamError` heap allocation or drop glue).
     #[inline]
     pub(crate) fn apply_preset_by_index_rt(&mut self, preset_index: usize) -> bool {
         dispatch_engine!(self, e => e.apply_preset_by_index_rt(preset_index))
     }
 
-    /// Processes a stereo audio block in-place (`left_io`, `right_io`).
-    #[inline]
+    /// Processes stereo audio in-place (`0` heap allocations).
     pub fn process_block_in_place(&mut self, left_io: &mut [f32], right_io: &mut [f32]) {
         dispatch_engine!(self, e => e.process_block_in_place(left_io, right_io))
     }
 
-    /// Processes a stereo audio block (`Stereo -> Stereo`).
-    #[inline]
+    /// Processes a stereo audio block (`0` heap allocations).
     pub fn process_block(
         &mut self,
         left_in: &[f32],
@@ -349,7 +386,6 @@ impl<'a> DynamicDnamEngine<'a> {
     }
 
     /// Processes a stereo audio block (`Stereo -> Stereo`), matching `process_block`.
-    #[inline]
     pub fn process_stereo(
         &mut self,
         left_in: &[f32],
@@ -361,7 +397,6 @@ impl<'a> DynamicDnamEngine<'a> {
     }
 
     /// Processes a stereo audio block into mono (`Stereo -> Mono`).
-    #[inline]
     pub fn process_stereo_to_mono(
         &mut self,
         left_in: &[f32],
@@ -372,7 +407,6 @@ impl<'a> DynamicDnamEngine<'a> {
     }
 
     /// Processes a mono audio block into true stereo (`Mono -> Stereo`).
-    #[inline]
     pub fn process_mono_to_stereo(
         &mut self,
         mono_in: &[f32],
@@ -383,17 +417,16 @@ impl<'a> DynamicDnamEngine<'a> {
     }
 
     /// Processes a mono audio block (`Mono -> Mono`).
-    #[inline]
     pub fn process_mono(&mut self, mono_in: &[f32], mono_out: &mut [f32]) {
         dispatch_engine!(self, e => e.process_mono(mono_in, mono_out))
     }
 
-    /// Processes a multi-port audio block (`1-to-4` channel input/output topology).
+    /// Processes a multi-port audio block (`Stage 0` 8-port router contract).
     pub fn process_block_io(&mut self, io: crate::engine::DnamAudioIo<'_>) {
         dispatch_engine!(self, e => e.process_block_io(io))
     }
 
-    /// Processes a 4-Cable Method (`4CM`) block (`[inst_l, inst_r, ret_l, ret_r] -> [main_l, main_r, send_l, send_r]`).
+    /// Processes a 4-Cable Method (`4CM`) block.
     #[expect(
         clippy::too_many_arguments,
         reason = "4-Cable Method exposes explicit 4 stereo I/O port buffers"
@@ -409,12 +442,13 @@ impl<'a> DynamicDnamEngine<'a> {
         send_l: &mut [f32],
         send_r: &mut [f32],
     ) {
-        dispatch_engine!(self, e => e.process_block_4cm(
-            inst_l, inst_r, ret_l, ret_r, main_l, main_r, send_l, send_r
-        ))
+        dispatch_engine!(
+            self,
+            e => e.process_block_4cm(inst_l, inst_r, ret_l, ret_r, main_l, main_r, send_l, send_r)
+        )
     }
 
-    /// Processes a Wet/Dry/Wet (`WDW`) 3-output block (`[in_l, in_r] -> [wet_l, wet_r, dry_center]`).
+    /// Processes a Wet/Dry/Wet (`WDW`) 3-output block.
     pub fn process_block_wdw(
         &mut self,
         in_l: &[f32],
@@ -426,7 +460,7 @@ impl<'a> DynamicDnamEngine<'a> {
         dispatch_engine!(self, e => e.process_block_wdw(in_l, in_r, wet_l, wet_r, dry_center))
     }
 
-    /// Processes a sidechain / auxiliary return stereo block (`[main_l, main_r, aux_l, aux_r] -> [out_l, out_r]`).
+    /// Processes a sidechain / auxiliary return stereo block.
     pub fn process_block_sidechain(
         &mut self,
         main_l: &[f32],
@@ -436,10 +470,12 @@ impl<'a> DynamicDnamEngine<'a> {
         out_l: &mut [f32],
         out_r: &mut [f32],
     ) {
-        dispatch_engine!(
-            self,
-            e => e.process_block_sidechain(main_l, main_r, aux_l, aux_r, out_l, out_r)
-        )
+        dispatch_engine!(self, e => e.process_block_sidechain(main_l, main_r, aux_l, aux_r, out_l, out_r))
+    }
+
+    /// Low-level single-frame `SONA` stepping (`0 FDIV`, `0 FSQRT`).
+    pub fn step_frame_sona(&mut self, in_l: f32, in_r: f32, mono_only: bool) -> [f32; 2] {
+        dispatch_engine!(self, e => e.step_frame_sona(in_l, in_r, mono_only))
     }
 
     /// Hot-swaps a new canonical `v3.0` `"sona"` `.dnam` model in-place without heap allocations
@@ -466,37 +502,52 @@ impl<'a> DynamicDnamEngine<'a> {
     }
 
     /// Returns a lock-free [`DnamTelemetrySnapshot`].
-    #[inline]
     pub fn telemetry_snapshot(&self) -> DnamTelemetrySnapshot {
         dispatch_engine!(self, e => e.telemetry_snapshot())
+    }
+
+    #[inline]
+    pub(crate) fn tempo_total_frames(&self) -> u64 {
+        dispatch_engine!(self, e => e.tempo_total_frames())
+    }
+
+    #[inline]
+    pub(crate) fn tier_os2x(&self) -> [bool; 4] {
+        dispatch_engine!(self, e => e.tier_os2x())
+    }
+
+    #[inline]
+    pub(crate) fn ref_sample_rate_hz(&self) -> f32 {
+        dispatch_engine!(self, e => e.ref_sample_rate_hz())
+    }
+
+    #[cfg(any(test, feature = "std"))]
+    #[inline]
+    pub(crate) fn compute_zoh_for_mode(
+        &self,
+        sample_rate_hz: u32,
+        offline_bounce: bool,
+    ) -> ZohRateContext {
+        dispatch_engine!(self, e => e.compute_zoh_for_mode(sample_rate_hz, offline_bounce))
+    }
+
+    #[inline]
+    pub(crate) fn or_active_clamp_mask(&mut self, mask: u16) {
+        dispatch_engine!(self, e => e.or_active_clamp_mask(mask))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
-    use crate::math::BackendKind;
     use crate::schema::DnamJsonHeader;
+    use crate::test_support::build_test_dnam_container;
+    use dnam_vm::math::BackendKind;
 
     #[test]
     fn test_dynamic_dnam_engine_all_variants() {
         let mut header = DnamJsonHeader::default_reference();
-        let arena = alloc::vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-        // Verify unmodeled freeze (`supports_freeze == false`) is ignored
-        let no_freeze_container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
-        let mut no_freeze_eng = DynamicDnamEngine::from_bytes_with_backend(
-            &no_freeze_container,
-            Tier::Lite,
-            48_000,
-            BackendKind::Scalar,
-        )
-        .unwrap();
-        no_freeze_eng.set_freeze(true);
-        assert!(!no_freeze_eng.is_frozen());
-
-        header.io_config.capabilities.supports_freeze = true;
-        let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+        let container = build_test_dnam_container(&mut header, Tier::Ultra, true);
 
         let kinds = [
             BackendKind::Scalar,
@@ -518,10 +569,6 @@ mod tests {
             dyn_eng.set_sample_rate(44_100).unwrap();
             dyn_eng.set_control_value(0, 5.0);
             dyn_eng.set_control_immediate(0, 5.0);
-            dyn_eng.set_freeze(true);
-            assert!(dyn_eng.is_frozen());
-            dyn_eng.set_freeze_amount(0.0);
-            assert!(!dyn_eng.is_frozen());
             let _ = dyn_eng.protection_profile();
             let _ = dyn_eng.tier();
             let _ = dyn_eng.max_available_tier();
@@ -535,9 +582,8 @@ mod tests {
             dyn_eng.set_maximize_tier_on_bounce(true);
             assert!(dyn_eng.maximize_tier_on_bounce());
             assert_eq!(dyn_eng.effective_tier(), Tier::Lite);
-            assert!(dyn_eng.supports_freeze());
             assert_eq!(dyn_eng.sample_rate_hz(), 44_100);
-            assert_eq!(dyn_eng.zoh().sample_rate_host_hz, 44_100);
+            assert_eq!(dyn_eng.zoh().host_rate_hz, 44_100.0);
             let _ = dyn_eng.verification_status();
             let _ = dyn_eng.preamble();
             assert!(dyn_eng.header().is_some());
@@ -566,8 +612,27 @@ mod tests {
             let r_in = [-0.1f32; 32];
             let mut l_out = [0.0f32; 32];
             let mut r_out = [0.0f32; 32];
+            assert!(dyn_eng.set_sample_rate_rt(96_000));
+            assert!(!dyn_eng.set_sample_rate_rt(12_000));
+            assert!(dyn_eng.set_sample_rate_rt(48_000));
+            dyn_eng.set_routing_mode(IoRoutingMode::Stereo);
+            dyn_eng.set_wdw_mode(WdwDryTapMode::PreSpatialCore);
+            dyn_eng.set_wdw_enabled(false);
+            dyn_eng.configure_return_alignment(0.0, 0.0);
+            dyn_eng.configure_parallel_alignment(
+                ParallelAlignmentMode::FullBand64Tap,
+                false,
+                0.0,
+                0.0,
+            );
+            dyn_eng.set_quad_write_enable(false);
+            dyn_eng.set_op_t_write_enable(false);
+            let frame_y = dyn_eng.step_frame_sona(0.1, -0.1, false);
+            assert!(frame_y[0].is_finite() && frame_y[1].is_finite());
             dyn_eng.render_offline_bounce(&l_in, &r_in, &mut l_out, &mut r_out);
             dyn_eng.process_block(&l_in, &r_in, &mut l_out, &mut r_out);
+            dyn_eng.process_stereo(&l_in, &r_in, &mut l_out, &mut r_out);
+            dyn_eng.process_stereo_to_mono(&l_in, &r_in, &mut l_out);
             let mut l_ip = l_in;
             let mut r_ip = r_in;
             dyn_eng.process_block_in_place(&mut l_ip, &mut r_ip);
@@ -633,8 +698,7 @@ mod tests {
             in_sample in -1.0f32..=1.0f32,
         ) {
             let mut header = DnamJsonHeader::default_reference();
-            let arena = alloc::vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-            let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+            let container = build_test_dnam_container(&mut header, Tier::Ultra, true);
 
             let mut eng_oop = DynamicDnamEngine::from_bytes_with_backend(
                 &container,

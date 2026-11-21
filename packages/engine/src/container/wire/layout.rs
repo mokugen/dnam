@@ -5,8 +5,13 @@
 //! `ref[container.dnam.mutable-json]`, `ref[container.dnam.tier-prefix]`,
 //! `ref[container.dnam.sample-rate-anchor]`).
 
+mod directory;
 mod mutable_frame;
 
+pub(crate) use directory::{
+    ContainerWireError, parse_dcrc_record_rt, validate_v3_directory_extents_rt,
+};
+pub use directory::{DcrcAuthRecord, parse_dcrc_record};
 pub(crate) use mutable_frame::validate_dmu1_frame_rt;
 pub use mutable_frame::{
     build_dmu1_mutable_frame, parse_and_validate_dmu1_frame, validate_dme1_frame_no_alloc,
@@ -20,8 +25,8 @@ use zerocopy::byteorder::little_endian::{U16, U32, U64};
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::structs::{
-    DCRC_MAGIC, DCRC_RECORD_SIZE, DMU1_HEADER_SIZE, DMUE_FOOTER_SIZE, DcrcAuthRecordWire,
-    DmueFooterWire, DnamDirectoryWire, DnamPreambleWire, V3_HEADER_OFFSET, V3_PREAMBLE_SIZE,
+    DMUE_FOOTER_SIZE, DmueFooterWire, DnamDirectoryWire, DnamPreambleWire, V3_HEADER_OFFSET,
+    V3_PREAMBLE_SIZE,
 };
 use crate::container::{CONTAINER_VERSION_MAJOR, CONTAINER_VERSION_MINOR, DNAM_MAGIC};
 use crate::provenance::sha256_digest;
@@ -31,128 +36,6 @@ use crate::schema::{DnamError, SchemaOptionExt, reject_if};
 pub const DEFAULT_MAX_MUTABLE_CAPACITY: usize = 4_096;
 /// Default `DMU1` mutable frame capacity (`4,080 B`) so `DMU1 (4,080 B) + DMUE (16 B) == 4,096 B` (`% 64 == 0`).
 pub const DEFAULT_DMU1_TRAILER_CAPACITY: usize = DEFAULT_MAX_MUTABLE_CAPACITY - DMUE_FOOTER_SIZE;
-
-/// Allocation-free (`Copy`) container wire error avoiding `DnamError` `String` drop glue on RT paths.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ContainerWireError {
-    BufferTooSmall {
-        expected: usize,
-        actual: usize,
-    },
-    InvalidMagic([u8; 4]),
-    UnsupportedVersion {
-        major: u16,
-        minor: u16,
-    },
-    UnalignedOffset {
-        field: &'static str,
-        offset: u32,
-    },
-    Crc32cMismatch {
-        region: &'static str,
-        expected: u32,
-        computed: u32,
-    },
-    SchemaStatic(&'static str),
-    EncryptedArenaRequiresDeviceKey,
-    InvalidSampleRate(u32),
-}
-
-impl ContainerWireError {
-    #[cold]
-    #[inline(never)]
-    pub(crate) fn into_dnam_error(self) -> DnamError {
-        match self {
-            Self::BufferTooSmall { expected, actual } => {
-                DnamError::BufferTooSmall { expected, actual }
-            }
-            Self::InvalidMagic(m) => DnamError::InvalidMagic(m),
-            Self::UnsupportedVersion { major, minor } => {
-                DnamError::UnsupportedVersion { major, minor }
-            }
-            Self::UnalignedOffset { field, offset } => DnamError::UnalignedOffset { field, offset },
-            Self::Crc32cMismatch {
-                region,
-                expected,
-                computed,
-            } => DnamError::Crc32cMismatch {
-                region,
-                expected,
-                computed,
-            },
-            Self::SchemaStatic(msg) => {
-                DnamError::SchemaValidationError(alloc::string::String::from(msg))
-            }
-            Self::EncryptedArenaRequiresDeviceKey => DnamError::EncryptedArenaRequiresDeviceKey,
-            Self::InvalidSampleRate(sr) => DnamError::InvalidSampleRate(sr),
-        }
-    }
-}
-
-/// Local 64-byte Castagnoli `CRC32C` integrity record stored in `auth_extent` for non-`DAU1` v3 `.dnam` containers.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DcrcAuthRecord {
-    pub crc_prefix: u32,
-    pub crc_tiers: [u32; 4],
-    pub num_controls: u16,
-    pub flags_hint: u16,
-    pub tail_time_ms_bits: u32,
-}
-
-impl DcrcAuthRecord {
-    /// Serializes this 64-byte `DCRC` record into little-endian bytes via [`DcrcAuthRecordWire`].
-    #[inline]
-    pub fn to_bytes(&self) -> [u8; DCRC_RECORD_SIZE] {
-        let wire = DcrcAuthRecordWire {
-            magic: DCRC_MAGIC,
-            crc_prefix: U32::new(self.crc_prefix),
-            crc_tiers: [
-                U32::new(self.crc_tiers[0]),
-                U32::new(self.crc_tiers[1]),
-                U32::new(self.crc_tiers[2]),
-                U32::new(self.crc_tiers[3]),
-            ],
-            num_controls: U16::new(self.num_controls),
-            flags_hint: U16::new(self.flags_hint),
-            tail_time_ms_bits: U32::new(self.tail_time_ms_bits),
-            reserved_pad: [0u8; 32],
-        };
-        let mut out = [0u8; DCRC_RECORD_SIZE];
-        out.copy_from_slice(wire.as_bytes());
-        out
-    }
-}
-
-/// Zero-drop-glue (`Copy` error) `DCRC` record parser for real-time container reloaders.
-pub(crate) fn parse_dcrc_record_rt(
-    auth_slice: &[u8],
-) -> Result<Option<DcrcAuthRecord>, ContainerWireError> {
-    if auth_slice.len() < 4 || auth_slice[0..4] != DCRC_MAGIC {
-        return Ok(None);
-    }
-    let wire = DcrcAuthRecordWire::ref_from_bytes(auth_slice)
-        .map_err(|_| ContainerWireError::SchemaStatic("invalid DCRC auth record"))?;
-    if wire.reserved_pad.iter().any(|&b| b != 0) {
-        return Err(ContainerWireError::SchemaStatic("invalid DCRC auth record"));
-    }
-    Ok(Some(DcrcAuthRecord {
-        crc_prefix: wire.crc_prefix.get(),
-        crc_tiers: [
-            wire.crc_tiers[0].get(),
-            wire.crc_tiers[1].get(),
-            wire.crc_tiers[2].get(),
-            wire.crc_tiers[3].get(),
-        ],
-        num_controls: wire.num_controls.get(),
-        flags_hint: wire.flags_hint.get(),
-        tail_time_ms_bits: wire.tail_time_ms_bits.get(),
-    }))
-}
-
-/// Parses a `DCRC` local integrity record if `auth_slice` starts with `b"DCRC"`.
-pub fn parse_dcrc_record(auth_slice: &[u8]) -> Result<Option<DcrcAuthRecord>, DnamError> {
-    parse_dcrc_record_rt(auth_slice).map_err(ContainerWireError::into_dnam_error)
-}
 
 /// Domain-separated binary field encoder `F(label, value) = u32le(len(label)) || label || u64le(len(value)) || value`
 /// (`ref[container.dnam.wire-framing]`, `ref[sec.sig.prefix-delegation]`).
@@ -190,57 +73,88 @@ pub struct V3ContainerLayout {
     pub header_extent: (usize, usize),
     pub shared_extent: (usize, usize),
     pub auth_extent: (usize, usize),
+    pub dbin_extent: (usize, usize),
     pub tier_start: usize,
     pub tier_ends: [usize; 4],
     pub mutable_extent: (usize, usize),
 }
 
-/// Builds a canonical `v3.0` (`"sona"`) `.dnam` container (`magic = b"DNAM"`, `version = (3, 0)`)
-/// with an explicit `protection_profile` (`0 = Open`, `1 = DeviceAllowlisted`, `2 = EnclaveSealed`).
-pub fn build_v3_dnam_container_with_profile(
-    protection_profile: u8,
-    header_bytes: &[u8],
-    shared_bytes: &[u8],
-    auth_bytes: &[u8],
-    tier_slices: &[&[u8]],
-    mutable_frame_bytes: Option<&[u8]>,
-    auth_kind: u8,
+/// Parameters for building a canonical `v3.0` (`"sona"`) `.dnam` container with an optional
+/// verbatim embedded Layer 0 `.dnam-bin` prefix (`dbin_prefix_bytes`).
+#[derive(Clone, Copy, Debug)]
+pub struct V3ContainerBuildSpec<'a> {
+    pub protection_profile: u8,
+    pub header_bytes: &'a [u8],
+    pub shared_bytes: &'a [u8],
+    pub auth_bytes: &'a [u8],
+    pub dbin_prefix_bytes: &'a [u8],
+    pub tier_slices: &'a [&'a [u8]],
+    pub mutable_frame_bytes: Option<&'a [u8]>,
+    pub auth_kind: u8,
+}
+
+/// Builds a canonical `v3.0` (`"sona"`) `.dnam` container with an optional embedded Layer 0
+/// `.dnam-bin` prefix (`dbin_prefix_bytes`). When `dbin_prefix_bytes` is non-empty, `shared_bytes`
+/// must be empty and `[dbin_offset..tier_start)` holds the `64 B`-aligned verbatim prefix.
+pub fn build_v3_dnam_container_with_dbin(
+    spec: &V3ContainerBuildSpec<'_>,
 ) -> Result<Vec<u8>, DnamError> {
     reject_if(
-        protection_profile > 2
-            || header_bytes.is_empty()
-            || auth_bytes.is_empty()
-            || tier_slices.is_empty()
-            || tier_slices.len() > 4
-            || auth_kind > 1,
+        spec.protection_profile > 2
+            || spec.header_bytes.is_empty()
+            || spec.auth_bytes.is_empty()
+            || spec.tier_slices.is_empty()
+            || spec.tier_slices.len() > 4
+            || spec.auth_kind > 1,
         "invalid v3 container inputs",
     )?;
-    for slice in tier_slices {
+    if !spec.dbin_prefix_bytes.is_empty() {
+        reject_if(
+            !spec.shared_bytes.is_empty(),
+            "shared_bytes must be empty when dbin_prefix_bytes is provided",
+        )?;
+        reject_if(
+            !spec.dbin_prefix_bytes.len().is_multiple_of(64),
+            "dbin_prefix_bytes must be 64-byte aligned",
+        )?;
+    }
+    for slice in spec.tier_slices {
         reject_if(
             slice.is_empty() || !slice.len().is_multiple_of(64),
             "tier slice must be non-empty and 64-byte aligned",
         )?;
     }
     let header_offset = V3_HEADER_OFFSET as u64;
-    let header_len = header_bytes.len() as u64;
+    let header_len = spec.header_bytes.len() as u64;
     let shared_offset = header_offset
         .checked_add(header_len)
         .and_then(align64_u64)
         .or_schema_err("header extent overflow")?;
-    let shared_len = shared_bytes.len() as u64;
+    let shared_len = spec.shared_bytes.len() as u64;
     let auth_offset = shared_offset
         .checked_add(shared_len)
         .and_then(align64_u64)
         .or_schema_err("shared extent overflow")?;
-    let auth_len = auth_bytes.len() as u64;
-    let tier_start = auth_offset
+    let auth_len = spec.auth_bytes.len() as u64;
+    let auth_end = auth_offset
         .checked_add(auth_len)
-        .and_then(align64_u64)
         .or_schema_err("auth extent overflow")?;
+    let (dbin_offset, dbin_prefix_len, tier_start) = if spec.dbin_prefix_bytes.is_empty() {
+        let ts = align64_u64(auth_end).or_schema_err("auth extent overflow")?;
+        (0_u64, 0_u64, ts)
+    } else {
+        let doff = align64_u64(auth_end).or_schema_err("auth extent overflow")?;
+        let dlen = spec.dbin_prefix_bytes.len() as u64;
+        let ts = doff
+            .checked_add(dlen)
+            .and_then(align64_u64)
+            .or_schema_err("dbin prefix overflow")?;
+        (doff, dlen, ts)
+    };
 
     let mut ends = [0u64; 4];
     let mut cur_end = tier_start;
-    for (i, slice) in tier_slices.iter().enumerate() {
+    for (i, slice) in spec.tier_slices.iter().enumerate() {
         cur_end = cur_end
             .checked_add(slice.len() as u64)
             .or_schema_err("tier extent overflow")?;
@@ -253,9 +167,9 @@ pub fn build_v3_dnam_container_with_profile(
         magic: DNAM_MAGIC,
         version_major: U16::new(CONTAINER_VERSION_MAJOR),
         version_minor: U16::new(CONTAINER_VERSION_MINOR),
-        protection_profile,
-        auth_kind,
-        maximum_tier: (tier_slices.len() - 1) as u8,
+        protection_profile: spec.protection_profile,
+        auth_kind: spec.auth_kind,
+        maximum_tier: (spec.tier_slices.len() - 1) as u8,
         reserved_flag: 0,
         sample_rate_train_hz: U32::new(48_000),
         reserved_pad: [0u8; 48],
@@ -269,8 +183,8 @@ pub fn build_v3_dnam_container_with_profile(
         shared_binary_length: U64::new(shared_len),
         authentication_envelope_offset: U64::new(auth_offset),
         authentication_envelope_length: U64::new(auth_len),
-        reserved_offset: U64::new(0),
-        reserved_capacity: U64::new(0),
+        dbin_offset: U64::new(dbin_offset),
+        dbin_prefix_bytes: U64::new(dbin_prefix_len),
         tier_start: U64::new(tier_start),
         original_tier_ends: [
             U64::new(ends[0]),
@@ -282,22 +196,25 @@ pub fn build_v3_dnam_container_with_profile(
     };
     let _ = directory.write_to_prefix(&mut out[V3_PREAMBLE_SIZE..]);
 
-    // 3. Regions
     let h_off = header_offset as usize;
-    out[h_off..h_off + header_bytes.len()].copy_from_slice(header_bytes);
+    out[h_off..h_off + spec.header_bytes.len()].copy_from_slice(spec.header_bytes);
     let s_off = shared_offset as usize;
-    out[s_off..s_off + shared_bytes.len()].copy_from_slice(shared_bytes);
+    out[s_off..s_off + spec.shared_bytes.len()].copy_from_slice(spec.shared_bytes);
     let a_off = auth_offset as usize;
-    out[a_off..a_off + auth_bytes.len()].copy_from_slice(auth_bytes);
+    out[a_off..a_off + spec.auth_bytes.len()].copy_from_slice(spec.auth_bytes);
+    if !spec.dbin_prefix_bytes.is_empty() {
+        let d_off = dbin_offset as usize;
+        out[d_off..d_off + spec.dbin_prefix_bytes.len()].copy_from_slice(spec.dbin_prefix_bytes);
+    }
 
     let mut t_off = tier_start as usize;
-    for slice in tier_slices {
+    for slice in spec.tier_slices {
         out[t_off..t_off + slice.len()].copy_from_slice(slice);
         t_off += slice.len();
     }
 
     let default_dmu1;
-    let m_bytes = match mutable_frame_bytes {
+    let m_bytes = match spec.mutable_frame_bytes {
         Some(b) if !b.is_empty() => b,
         _ => {
             default_dmu1 = build_dmu1_mutable_frame(b"{}", 48)?;
@@ -306,6 +223,29 @@ pub fn build_v3_dnam_container_with_profile(
     };
     append_dmue_mutable_suffix(&mut out, m_bytes);
     Ok(out)
+}
+
+/// Builds a canonical `v3.0` (`"sona"`) `.dnam` container (`magic = b"DNAM"`, `version = (3, 0)`)
+/// with an explicit `protection_profile` (`0 = Open`, `1 = DeviceAllowlisted`, `2 = EnclaveSealed`).
+pub fn build_v3_dnam_container_with_profile(
+    protection_profile: u8,
+    header_bytes: &[u8],
+    shared_bytes: &[u8],
+    auth_bytes: &[u8],
+    tier_slices: &[&[u8]],
+    mutable_frame_bytes: Option<&[u8]>,
+    auth_kind: u8,
+) -> Result<Vec<u8>, DnamError> {
+    build_v3_dnam_container_with_dbin(&V3ContainerBuildSpec {
+        protection_profile,
+        header_bytes,
+        shared_bytes,
+        auth_bytes,
+        dbin_prefix_bytes: &[],
+        tier_slices,
+        mutable_frame_bytes,
+        auth_kind,
+    })
 }
 
 /// Builds a canonical `v3.0` (`"sona"`) Open `.dnam` container (`magic = b"DNAM"`, `version = (3, 0)`,
@@ -375,122 +315,24 @@ fn validate_v3_prefix_and_dir_rt(
         return Err(ContainerWireError::SchemaStatic("invalid preamble"));
     }
 
-    let dir = DnamDirectoryWire::ref_from_bytes(&data[V3_PREAMBLE_SIZE..V3_HEADER_OFFSET])
-        .map_err(|_| ContainerWireError::SchemaStatic("invalid directory"))?;
-    let header_offset = dir.immutable_header_offset.get();
-    let header_length = dir.immutable_header_length.get();
-    let shared_offset = dir.shared_binary_offset.get();
-    let shared_length = dir.shared_binary_length.get();
-    let auth_offset = dir.authentication_envelope_offset.get();
-    let auth_length = dir.authentication_envelope_length.get();
-    let reserved_offset = dir.reserved_offset.get();
-    let reserved_capacity = dir.reserved_capacity.get();
-    let tier_start = dir.tier_start.get();
-    let ends_u64 = dir.original_tier_ends.map(U64::get);
-
-    if dir.reserved_tail.iter().any(|&b| b != 0)
-        || reserved_offset != 0
-        || reserved_capacity != 0
-        || header_offset != (V3_HEADER_OFFSET as u64)
-        || header_length == 0
-    {
-        return Err(ContainerWireError::SchemaStatic("invalid directory"));
-    }
-
-    let header_end = header_offset
-        .checked_add(header_length)
-        .ok_or(ContainerWireError::SchemaStatic("header extent overflow"))?;
-    if header_end > (u32::MAX as u64) || Some(shared_offset) != align64_u64(header_end) {
-        return Err(ContainerWireError::SchemaStatic("invalid directory"));
-    }
-    let shared_end = shared_offset
-        .checked_add(shared_length)
-        .ok_or(ContainerWireError::SchemaStatic("shared extent overflow"))?;
-    if shared_end > (u32::MAX as u64)
-        || Some(auth_offset) != align64_u64(shared_end)
-        || auth_length == 0
-    {
-        return Err(ContainerWireError::SchemaStatic("invalid directory"));
-    }
-    let auth_end = auth_offset
-        .checked_add(auth_length)
-        .ok_or(ContainerWireError::SchemaStatic("auth extent overflow"))?;
-    if auth_end > (u32::MAX as u64)
-        || Some(tier_start) != align64_u64(auth_end)
-        || tier_start > (u32::MAX as u64)
-    {
-        return Err(ContainerWireError::SchemaStatic("invalid tier start"));
-    }
-
-    let mut previous = tier_start;
-    for (index, &end) in ends_u64.iter().enumerate() {
-        if index <= (maximum as usize) {
-            if end <= previous || !end.is_multiple_of(64) || end > (u32::MAX as u64) {
-                return Err(ContainerWireError::SchemaStatic("invalid tier end"));
-            }
-            previous = end;
-        } else if end != 0 {
-            return Err(ContainerWireError::SchemaStatic("unexpected tier end"));
-        }
-    }
-
-    if data.len() < V3_HEADER_OFFSET + DMUE_FOOTER_SIZE {
-        return Err(ContainerWireError::SchemaStatic("invalid mutable trailer"));
-    }
-    let footer = DmueFooterWire::ref_from_bytes(&data[data.len() - DMUE_FOOTER_SIZE..])
-        .map_err(|_| ContainerWireError::SchemaStatic("invalid mutable trailer"))?;
-    let mutable_capacity = footer.frame_len.get();
-    let footer_reserved = footer.reserved.get();
-    if &footer.magic != b"DMUE"
-        || footer_reserved != 0
-        || mutable_capacity < (DMU1_HEADER_SIZE as u64 + 2)
-        || mutable_capacity > (DEFAULT_MAX_MUTABLE_CAPACITY as u64)
-        || mutable_capacity > ((data.len() - DMUE_FOOTER_SIZE) as u64)
-    {
-        return Err(ContainerWireError::SchemaStatic("invalid mutable trailer"));
-    }
-    let mutable_offset = data.len() - DMUE_FOOTER_SIZE - (mutable_capacity as usize);
-    let mut retained_opt = None;
-    for (idx, &end) in ends_u64[..=(maximum as usize)].iter().enumerate() {
-        if end == (mutable_offset as u64) {
-            retained_opt = Some(idx as u8);
-            break;
-        }
-    }
-    let retained_tier =
-        retained_opt.ok_or(ContainerWireError::SchemaStatic("invalid retained end"))?;
-
-    for (start, end) in [
-        (header_end as usize, shared_offset as usize),
-        (shared_end as usize, auth_offset as usize),
-        (auth_end as usize, tier_start as usize),
-    ] {
-        if data[start..end].iter().any(|&b| b != 0) {
-            return Err(ContainerWireError::SchemaStatic("nonzero padding"));
-        }
-    }
-
+    let dir = validate_v3_directory_extents_rt(data, maximum)?;
     Ok((
         V3ContainerLayout {
             magic: preamble.magic,
             protection_profile: profile,
             auth_kind,
             maximum_tier: maximum,
-            retained_tier,
+            retained_tier: dir.retained_tier,
             sample_rate_train_hz: rate,
-            header_extent: (header_offset as usize, header_length as usize),
-            shared_extent: (shared_offset as usize, shared_length as usize),
-            auth_extent: (auth_offset as usize, auth_length as usize),
-            tier_start: tier_start as usize,
-            tier_ends: [
-                ends_u64[0] as usize,
-                ends_u64[1] as usize,
-                ends_u64[2] as usize,
-                ends_u64[3] as usize,
-            ],
-            mutable_extent: (mutable_offset, mutable_capacity as usize),
+            header_extent: dir.header_extent,
+            shared_extent: dir.shared_extent,
+            auth_extent: dir.auth_extent,
+            dbin_extent: dir.dbin_extent,
+            tier_start: dir.tier_start,
+            tier_ends: dir.tier_ends,
+            mutable_extent: dir.mutable_extent,
         },
-        mutable_offset,
+        dir.mutable_extent.0,
         data.len() - DMUE_FOOTER_SIZE,
     ))
 }
@@ -579,6 +421,13 @@ pub fn compute_v3_open_retained_prefix_sha256(
         "shared_model_binary",
         &data[s_off..s_off + s_len],
     ));
+    if layout.dbin_extent.1 > 0 {
+        let (d_off, d_len) = layout.dbin_extent;
+        shared.extend_from_slice(&encode_domain_field(
+            "dbin_prefix",
+            &data[d_off..d_off + d_len],
+        ));
+    }
 
     let mut transcript = Vec::new();
     transcript.extend_from_slice(&encode_domain_field("domain", domain));
@@ -599,7 +448,7 @@ pub fn compute_v3_open_retained_prefix_sha256(
 mod spec_tests {
     use super::*;
     use crate::container::{DNAM_MAGIC, DNSL_MAGIC};
-    use crate::math::crc32c;
+    use dnam_vm::math::crc32c;
 
     /// verify[container.dnam.formats]
     /// verify[container.dnam.wire-framing]
@@ -723,7 +572,7 @@ mod spec_tests {
 mod mutable_reference_tests {
     // Byte-level mutable-frame examples, not a production container parser.
 
-    use crate::math::crc32c;
+    use dnam_vm::math::crc32c;
     use zerocopy::{FromBytes, IntoBytes};
 
     #[test]
@@ -794,6 +643,7 @@ mod tests {
             num_controls: 1,
             flags_hint: 0,
             tail_time_ms_bits: 0,
+            crc_dbin_prefix: 0,
         }
         .to_bytes();
         assert!(parse_dcrc_record(&dcrc).unwrap().is_some());
@@ -805,6 +655,55 @@ mod tests {
                 .is_err()
         );
         assert!(build_v3_open_dnam_container(b"{}", b"", &[0; 32], &[&[0; 63]], None, 0).is_err());
+        assert!(
+            build_v3_dnam_container_with_dbin(&V3ContainerBuildSpec {
+                protection_profile: 0,
+                header_bytes: b"{}",
+                shared_bytes: &[0; 64],
+                auth_bytes: &[0; 32],
+                dbin_prefix_bytes: &[0; 128],
+                tier_slices: &[&[0; 64]],
+                mutable_frame_bytes: None,
+                auth_kind: 0,
+            })
+            .is_err()
+        );
+        assert!(
+            build_v3_dnam_container_with_dbin(&V3ContainerBuildSpec {
+                protection_profile: 0,
+                header_bytes: b"{}",
+                shared_bytes: b"",
+                auth_bytes: &[0; 32],
+                dbin_prefix_bytes: &[0; 127],
+                tier_slices: &[&[0; 64]],
+                mutable_frame_bytes: None,
+                auth_kind: 0,
+            })
+            .is_err()
+        );
+
+        let dbin_c = build_v3_dnam_container_with_dbin(&V3ContainerBuildSpec {
+            protection_profile: 0,
+            header_bytes: b"{}",
+            shared_bytes: b"",
+            auth_bytes: &[0; 32],
+            dbin_prefix_bytes: &[b'D'; 128],
+            tier_slices: &[&[0x11; 64], &[0x22; 64]],
+            mutable_frame_bytes: None,
+            auth_kind: 0,
+        })
+        .unwrap();
+        let dbin_layout = validate_v3_dnam_layout_no_alloc(&dbin_c).unwrap();
+        assert_eq!(dbin_layout.shared_extent.1, 0);
+        assert_eq!(dbin_layout.dbin_extent.1, 128);
+        assert_eq!(
+            dbin_layout.tier_start,
+            dbin_layout.dbin_extent.0 + dbin_layout.dbin_extent.1
+        );
+        // Setting shared_binary_length > 0 alongside dbin_prefix_bytes > 0 must fail closed
+        let mut bad_dual = dbin_c.clone();
+        bad_dual[64 + 24..64 + 32].copy_from_slice(U64::new(64).as_bytes());
+        assert!(validate_v3_dnam_layout_no_alloc(&bad_dual).is_err());
 
         let c = build_v3_open_dnam_container(b"{}", b"", &[0; 32], &[&[0; 64]], None, 0).unwrap();
         assert!(validate_v3_dnam_layout_no_alloc(&c).is_ok());
@@ -816,6 +715,7 @@ mod tests {
             (184, &[1u8; 8][..]),
             (80, U64::new(193).as_bytes()),
             (104, &[0u8; 8][..]),
+            (112, U64::new(256).as_bytes()), // non-zero dbin_offset with zero dbin_prefix_bytes
             (128, U64::new(u64::MAX).as_bytes()),
             (136, U64::new(1).as_bytes()),
             (144, U64::new(64).as_bytes()),

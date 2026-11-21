@@ -394,6 +394,7 @@ mod tests {
         buf
     }
 
+    /// verify[container.dnam.vm-binary]
     #[test]
     fn test_prefix_and_region_validation_error_variants() {
         let base = make_lite_bytes();
@@ -492,6 +493,7 @@ mod tests {
         );
     }
 
+    /// verify[container.dnam.vm-binary]
     #[test]
     fn test_descriptor_cp1_tsyn_and_arena_validation_errors() {
         let mut d = ControlClampDescriptorWire::new_zeroed();

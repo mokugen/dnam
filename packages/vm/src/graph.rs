@@ -16,7 +16,7 @@ pub mod zoh;
 pub use convolver::high_sr::{ConvolverHighSrFirExt, ConvolverHighSrMode, EXT_FIR_STORAGE_F32_LEN};
 pub use convolver::kautz::{
     KautzColdSlewState, KautzPrefixOverride, KautzStereoBank4, MAX_KAUTZ_BANKS, MAX_KAUTZ_PAIRS,
-    hydrate_kautz_slice_and_zoh, retune_kautz_banks_3khz,
+    hydrate_kautz_slice_and_zoh, init_log_octave_poles_h2_into, retune_kautz_banks_3khz,
 };
 pub use convolver::{
     CONVOLVER_FULL_DELTA_FIR_TAPS, CONVOLVER_KAUTZ_ONSET_DELAY_48K, CONVOLVER_LITE_FIR_TAPS,
@@ -26,8 +26,8 @@ pub use convolver::{
     process_convolver_48k_chunk,
 };
 pub use oversample::{
-    Bounce4xOversampler, OFFLINE_BOUNCE_PDC_SAMPLES, SonaOs2xHot, SonaOversamplerParams,
-    SonaStereoOversampler2x,
+    Bounce4xDecimator, Bounce4xOversampler, OFFLINE_BOUNCE_PDC_SAMPLES, SonaOs2xHot,
+    SonaOversamplerParams, SonaStereoOversampler2x,
 };
 pub use sensory::{SensoryQuadCold, SensoryQuadHot};
 pub use slab::{
@@ -46,7 +46,10 @@ pub use slab::{
     step_frame_4x_sona, step_frame_sona, switch_tier,
 };
 #[cfg(feature = "alloc")]
-pub use slab::{SonaSlabOwnedBacking, hydrate_slab_owned};
+pub use slab::{SonaSlabOwnedBacking, hydrate_slab_owned, hydrate_slab_owned_with_headroom};
+pub use slab::{VmReloadHeadroom, check_reload_slab_capacity, reload_slab_from_dnam_bin_in_place};
+#[cfg(feature = "alloc")]
+pub use transport::ExtRingAllocSpec;
 pub use transport::{
     PartitionedSchroederBank, QuadColdMeta, QuadEffectiveTargets, QuadHydrateConfig, QuadRingMut,
     QuadStepResult, QuadTopRead, TRANSPORT_ALLPASS_G_MAX, TRANSPORT_INLINE_QUAD0_CAP,

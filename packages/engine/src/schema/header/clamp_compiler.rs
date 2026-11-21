@@ -5,7 +5,8 @@ use alloc::string::ToString;
 use alloc::vec;
 use alloc::vec::Vec;
 
-use crate::control::{ConditionalClampRule, ControlClampDescriptor};
+use dnam_vm::control::{ConditionalClampRule, ControlClampDescriptor};
+
 use crate::schema::controls::{ControlKind, ControlSchemaDef};
 use crate::schema::error::{DnamError, reject_if};
 
@@ -179,7 +180,7 @@ fn compile_conditional_rules(
     controls_schema: &[ControlSchemaDef],
     ctrl: &ControlSchemaDef,
 ) -> Result<[ConditionalClampRule; 3], DnamError> {
-    let mut cond_rules = [ConditionalClampRule::empty(); 3];
+    let mut cond_rules = [ConditionalClampRule::default(); 3];
     let mut rule_idx = 0usize;
 
     for bound in &ctrl.conditional_bounds {
@@ -289,7 +290,7 @@ fn compile_switch_descriptor(ctrl: &ControlSchemaDef) -> Result<ControlClampDesc
         offset_norm: 0.0,
         anchor_nodes_norm: [0.0; 3],
         _reserved: 0,
-        cond_rules: [ConditionalClampRule::empty(); 3],
+        cond_rules: [ConditionalClampRule::default(); 3],
     })
 }
 

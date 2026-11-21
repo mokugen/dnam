@@ -320,6 +320,10 @@ mod tests {
     use super::*;
     use zerocopy::{FromZeros, IntoBytes};
 
+    /// verify[dsp.ctrl.accum.cp1-scaling]
+    /// verify[dsp.ctrl.ledger.memory-compute]
+    /// verify[dsp.ctrl.switch.option-contributors]
+    /// verify[dsp.op-n.ctrl.incremental-update]
     #[test]
     fn test_inline_cp1_decode_and_distinct_count() {
         let mut a0_cb = Arena0ControlBusWire::new_zeroed();

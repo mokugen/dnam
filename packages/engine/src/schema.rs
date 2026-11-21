@@ -3,7 +3,7 @@
 //! Parses and serializes the canonical `.dnam` UTF-8 JSON headers (`0x00C0..`)
 //! using `serde` and `serde_json` (`default-features = false, features = ["alloc"]`).
 //! Compiles human-readable `controls_schema` definitions into 64-byte binary
-//! [`crate::control::ControlClampDescriptor`] cache lines for zero-`FDIV`, zero-string-parsing
+//! [`dnam_vm::control::ControlClampDescriptor`] cache lines for zero-`FDIV`, zero-string-parsing
 //! $3\text{ kHz}$ execution.
 
 pub mod controls;
@@ -24,9 +24,9 @@ pub use error::{
     DnamError, SchemaOptionExt, cold_exp_f64, cold_ln_f64, cold_pow_f64, cold_sqrt_f64, reject_if,
 };
 pub use header::{
-    BlendMode, CabinetKautzConfig, ControlBusConfig, DelayHistoryEntry, DnamJsonHeader, IoConfig,
-    IoRouterConfig, LevelingConfig, LevelingMetric, ModelCapabilities, ModelMetadata,
-    SchemaVersion, SlimmableTiersConfig, SpatialTankConfig, TensorSliceEntry, TierProfile,
+    BlendMode, ControlBusConfig, DelayHistoryEntry, DnamJsonHeader, IoConfig, LevelingConfig,
+    LevelingMetric, LinearReadoutConfig, ModalConvolverConfig, ModelCapabilities, ModelMetadata,
+    SchemaVersion, SlimmableTiersConfig, TensorSliceEntry, TierProfile, TransportConfig,
     check_no_unknown_header_keys,
 };
 pub use signatures::{

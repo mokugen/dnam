@@ -91,6 +91,10 @@ mod tests {
     use crate::simd::{GpuVec4, InterleavedStereo8, KernelVec4};
     use proptest::prelude::*;
 
+    /// verify[dsp.crossbar.top-of-frame]
+    /// verify[dsp.op-t.diffuser.recurrence]
+    /// verify[dsp.op-t.window.m2-pitch]
+    /// verify[dsp.op-t.window.m3-barberpole]
     #[test]
     fn test_compute_op_p_and_phasor_pair_with_op_t_and_kautz_pipeline() {
         let mut dc_blocker = T1DcBlockerKernel::new();

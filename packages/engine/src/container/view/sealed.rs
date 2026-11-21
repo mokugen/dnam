@@ -28,7 +28,17 @@ impl<'a> DnamContainerView<'a> {
         allow_preview: bool,
         max_supported_tier: Tier,
     ) -> Result<Self, DnamError> {
-        crate::math::warm_simd_feature_caches();
+        Self::from_sealed_bytes_with_dbin(bytes, crypto, allow_preview, max_supported_tier)
+            .map(|(view, _)| view)
+    }
+
+    pub(crate) fn from_sealed_bytes_with_dbin<C: CryptoProvider>(
+        bytes: &'a [u8],
+        crypto: &C,
+        allow_preview: bool,
+        max_supported_tier: Tier,
+    ) -> Result<(Self, alloc::vec::Vec<u8>), DnamError> {
+        dnam_vm::math::warm_simd_feature_caches();
         let unsealed = unseal_dnsl_up_to_tier(bytes, crypto, max_supported_tier)?;
         let raw_val = parse_strict_json_object_bytes(&unsealed.header_json_bytes)?;
         let mut header: DnamJsonHeader = serde_json::from_value(raw_val)
@@ -65,8 +75,15 @@ impl<'a> DnamContainerView<'a> {
             }
         };
 
-        let (clamp_descriptors, cp1_contributors, control_records) =
-            decode_shared_controls_extent(&unsealed.shared_bytes, &header)?;
+        let (clamp_descriptors, cp1_contributors) = if !unsealed.dbin_prefix.is_empty() {
+            super::dbin::decode_controls_from_embedded_dbin(
+                &unsealed.dbin_prefix,
+                &unsealed.arena_bytes,
+                unsealed.retained_tier as u8,
+            )?
+        } else {
+            decode_shared_controls_extent(&unsealed.shared_bytes, &header)?
+        };
 
         let mut flags = FLAG_HAS_LITE | FLAG_HAS_SIGNATURES | FLAG_ENCRYPTED_ARENA;
         if unsealed.retained_tier >= Tier::Full {
@@ -121,17 +138,167 @@ impl<'a> DnamContainerView<'a> {
             _reserved: 0,
             tail_time_ms: header.io_config.tail_time_ms,
             header_crc32c: 0,
+            crc_dbin_prefix: 0,
+            dbin_offset: unsealed.logical_dnam_dir.dbin_offset.get(),
+            dbin_prefix_bytes: unsealed.logical_dnam_dir.dbin_prefix_bytes.get(),
         };
         let arena_storage = ArenaStorage::from_slice_owned(&unsealed.arena_bytes);
-        Ok(Self {
+        let assembled_dbin = if unsealed.dbin_prefix.is_empty() {
+            alloc::vec::Vec::new()
+        } else {
+            let mut buf = alloc::vec::Vec::with_capacity(
+                unsealed.dbin_prefix.len() + unsealed.arena_bytes.len(),
+            );
+            buf.extend_from_slice(&unsealed.dbin_prefix);
+            buf.extend_from_slice(&unsealed.arena_bytes);
+            buf
+        };
+        let view = Self {
             preamble,
             header,
             verification_status,
             protection_profile,
             clamp_descriptors,
             cp1_contributors,
-            control_records,
             arena_storage,
+        };
+        Ok((view, assembled_dbin))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(feature = "crypto")]
+    #[test]
+    fn test_sealed_hybrid_container_decodes_embedded_dbin_controls_and_cp1() {
+        use super::*;
+        use crate::container::{build_dnam_container_from_dnam_bin, encode_cp1_shared_stream};
+        use crate::provenance::{RustCryptoProvider, seal_dnam_container};
+        use crate::schema::{ControlKind, ControlSchemaDef, ControlUiHints};
+        use alloc::collections::BTreeMap;
+        use alloc::string::String;
+        use alloc::vec::Vec;
+        use dnam_vm::bin::{
+            Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire,
+            ControlClampDescriptorWire, DnamBinBuildInput, DnamBinView, encode_dnam_bin,
+        };
+        use dnam_vm::control::{ControlClampDescriptor, Cp1ContributorSlot};
+        use zerocopy::FromZeros;
+
+        let mut hdr = DnamJsonHeader::default_reference();
+        hdr.controls_schema.push(ControlSchemaDef {
+            id: String::from("drive"),
+            name: String::from("Drive"),
+            kind: ControlKind::Range,
+            unit: None,
+            lobatto_degree: Some(2),
+            anchor_nodes_norm: Some(alloc::vec![0.0, -1.0, 1.0]),
+            declared_range: Some([0.0, 10.0]),
+            safe_clamped_range: Some([0.0, 10.0]),
+            default: serde_json::json!(5.0),
+            conditional_bounds: Vec::new(),
+            represented_switch_options: None,
+            declared_options: None,
+            active_options: None,
+            clamp_warning: None,
+            ui_hints: ControlUiHints::default(),
+            calibration: None,
+            user_metadata: BTreeMap::new(),
+        });
+
+        let expected_descs = hdr.compile_clamp_descriptors().unwrap();
+        let wire_descs: Vec<ControlClampDescriptorWire> = expected_descs
+            .iter()
+            .map(ControlClampDescriptor::to_wire)
+            .collect();
+
+        let mut cp1_slot = Cp1ContributorSlot::zero();
+        cp1_slot.control_idx = 0;
+        cp1_slot.ctrl_kind = 0;
+        cp1_slot.lanes = 2;
+        cp1_slot.aux = 0xFF;
+        cp1_slot.has_ultra = true;
+        cp1_slot.main_base[0][0] = 0.45;
+        cp1_slot.main_base[1][1] = -0.35;
+        cp1_slot.emb[0] = 0.75;
+        cp1_slot.emb[1] = -0.25;
+        cp1_slot.v_base = [0.1, 0.2, 0.3, 0.4];
+        cp1_slot.main_ultra[0][0] = 0.05;
+        cp1_slot.v_ultra = [0.01, 0.02, 0.03, 0.04];
+        let cp1_overflow = encode_cp1_shared_stream(&[cp1_slot]).unwrap();
+
+        let mut a0 = DnamBinBuildInput::default_arena0_lite();
+        a0.crossbar.cell_desc.tier_flags = zerocopy::byteorder::little_endian::U16::new(0x000F);
+        let a1 = Arena1FullDeltaWire::new_zeroed();
+        let a2 = Arena2ProDeltaWire::new_zeroed();
+        let a3 = Arena3UltraDeltaWire::new_zeroed();
+        let dnam_bin = encode_dnam_bin(&DnamBinBuildInput {
+            reference_sample_rate_hz: 48_000,
+            header_flags: 0,
+            ext_ring_pow2_frames: 0,
+            ext_ring_lines: 0,
+            ext_ring_format: 0,
+            declared_max_delay_48k: 64,
+            dc_blocker_pole_5hz: dnam_vm::math::TANK_DC_BLOCKER_48K_F32,
+            tail_time_ms: 0.0,
+            ro_pole_48k: 0.99,
+            switch_xfade_samples: 64,
+            content_hash_prefix: [5; 8],
+            controls: &wire_descs,
+            cp1_overflow: &cp1_overflow,
+            tsyn: &[],
+            cext: None,
+            arena0: &a0,
+            arena1: Some(&a1),
+            arena2: Some(&a2),
+            arena3: Some(&a3),
         })
+        .unwrap();
+        let dbin_view = DnamBinView::parse(&dnam_bin).unwrap();
+        assert_eq!(dbin_view.control_descriptors.len(), 1);
+        assert_eq!(dbin_view.cp1_overflow, cp1_overflow.as_slice());
+
+        let hybrid = build_dnam_container_from_dnam_bin(&mut hdr, &dnam_bin).unwrap();
+
+        let oem_seed = [41u8; 32];
+        let oem_pk = RustCryptoProvider::ed25519_pubkey_from_seed(&oem_seed);
+        let dev_sk = [42u8; 32];
+        let dev_pk = RustCryptoProvider::x25519_pubkey_from_secret(&dev_sk);
+        let dev_id = "2122232425262728292a2b2c2d2e2f30";
+        let cert = RustCryptoProvider::sign_oem_device_certificate(
+            &oem_seed,
+            "darkglass",
+            "anagram",
+            dev_id,
+            &dev_pk,
+        )
+        .unwrap();
+        let mp_seed = [51u8; 32];
+        let mp_pk = RustCryptoProvider::ed25519_pubkey_from_seed(&mp_seed);
+        let crypto = RustCryptoProvider::new()
+            .with_device_key(dev_id, dev_sk)
+            .with_marketplace_pubkey(mp_pk);
+
+        let sealed = seal_dnam_container(
+            &hybrid,
+            &[cert],
+            &[("darkglass", oem_pk)],
+            &mp_seed,
+            &[52u8; 32],
+            &[54u8; 32],
+            &[53u8; 12],
+        )
+        .unwrap();
+
+        let view = DnamContainerView::from_bytes(&sealed, &crypto).unwrap();
+        assert_eq!(view.clamp_descriptors, expected_descs);
+        assert_eq!(view.cp1_contributors, alloc::vec![cp1_slot]);
+        assert!(view.preamble.dbin_prefix_bytes > 0);
+
+        let lite_view =
+            DnamContainerView::from_bytes_with_max_tier(&sealed, &crypto, Tier::Lite).unwrap();
+        assert_eq!(lite_view.preamble.highest_tier(), Tier::Lite);
+        assert_eq!(lite_view.clamp_descriptors, expected_descs);
+        assert_eq!(lite_view.cp1_contributors, alloc::vec![cp1_slot]);
     }
 }

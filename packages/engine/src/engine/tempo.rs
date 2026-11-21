@@ -80,7 +80,7 @@ impl TempoSyncState {
                     }
                 }
                 if count > 0 {
-                    let inv_sum = crate::math::newton6_reciprocal_f64(sum as f64) as f32;
+                    let inv_sum = dnam_vm::math::rcp_nr6_f64(sum as f64) as f32;
                     let bpm = 60.0 * (self.sample_rate_hz as f32) * (count as f32) * inv_sum;
                     self.current_bpm = bpm.clamp(20.0, 400.0);
                 }
@@ -217,17 +217,17 @@ mod tests {
         assert_eq!(tempo.last_tap_frame, None);
     }
 
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
     use crate::engine::DnamEngine;
-    use crate::math::ScalarBackend;
     use crate::provenance::VerificationStatus;
     use crate::schema::{
         BlendMode, ControlCalibration, ControlCalibrationRole, ControlKind, ControlSchemaDef,
         ControlUiHints, PresetDef,
     };
+    use crate::test_support::build_test_dnam_container;
     use crate::types::Tier;
     use alloc::collections::BTreeMap;
     use alloc::string::String;
+    use dnam_vm::math::ScalarBackend;
 
     #[test]
     fn test_dnam_engine_presets_and_reload_errors() {
@@ -283,14 +283,13 @@ mod tests {
             user_metadata: BTreeMap::new(),
         }];
 
-        let arena = alloc::vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-        let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+        let container = build_test_dnam_container(&mut header, Tier::Ultra, false);
 
         let mut engine =
             DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Ultra, 48_000).unwrap();
         assert_eq!(engine.tier(), Tier::Ultra);
         assert_eq!(engine.sample_rate_hz(), 48_000);
-        assert_eq!(engine.zoh().sample_rate_host_hz, 48_000);
+        assert_eq!(engine.zoh().host_rate_hz, 48_000.0);
         assert!(engine.header().is_some());
         assert_eq!(engine.preamble().num_controls, 2);
         assert_eq!(engine.verification_status(), &VerificationStatus::Unsigned);
@@ -453,14 +452,14 @@ mod tests {
             },
         ];
 
-        let arena = alloc::vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-        let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+        let container = build_test_dnam_container(&mut header, Tier::Ultra, true);
         let mut engine =
             DnamEngine::<ScalarBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
 
         engine.configure_host_mix_and_leveling(0.5, 0.0, true);
         assert!((engine.mix_dry_gain - 0.5).abs() < 1e-4);
-        assert!((engine.mix_wet_gain - (-1.0)).abs() < 1e-3);
+        assert!((engine.mix_wet_gain - 1.0).abs() < 1e-3);
+        assert!((engine.telemetry_snapshot().mix_wet_gain - (-1.0)).abs() < 1e-3);
         engine.configure_host_mix_and_leveling(0.5, 0.0, false);
 
         assert!((engine.stereo_width() - 1.0).abs() < 1e-6);

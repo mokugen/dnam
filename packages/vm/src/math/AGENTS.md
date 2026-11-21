@@ -1,6 +1,6 @@
 # `dnam-vm::math` — Multi-ISA `32-bit` SIMD & Cold ZOH Math Map
 
-Scoped discovery guide for [`src/math.rs`](../math.rs) (parent [`AGENTS.md`](../../AGENTS.md)). Strictly excludes `f64` `TrainerMathBackend` and cryptographic hashing.
+Scoped discovery guide for [`src/math.rs`](../math.rs) (parent [`AGENTS.md`](../../AGENTS.md)). Strictly excludes `f64` trainer backends and cryptographic hashing.
 
 | Module / File | Responsibility | Canonical Spec (SSOT) |
 | :--- | :--- | :--- |

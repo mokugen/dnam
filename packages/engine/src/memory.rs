@@ -10,31 +10,7 @@ use core::alloc::Allocator;
 use core::ops::{Deref, DerefMut};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// 64-byte L1D cache-line aligned byte block (`sizeof == 64`, `alignof == 64`).
-#[repr(C, align(64))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq, FromBytes, IntoBytes, Immutable, KnownLayout)]
-pub struct CacheLine64(pub [u8; 64]);
-
-impl Default for CacheLine64 {
-    #[inline]
-    fn default() -> Self {
-        Self([0u8; 64])
-    }
-}
-
-impl CacheLine64 {
-    /// Returns the 64-byte cache line as a slice of 16 `f32` values.
-    #[inline(always)]
-    pub fn as_f32_slice(&self) -> &[f32; 16] {
-        zerocopy::transmute_ref!(self)
-    }
-
-    /// Returns the 64-byte cache line as a mutable slice of 16 `f32` values.
-    #[inline(always)]
-    pub fn as_f32_slice_mut(&mut self) -> &mut [f32; 16] {
-        zerocopy::transmute_mut!(self)
-    }
-}
+pub use dnam_vm::CacheLine64;
 
 /// 64-byte L1D cache-line aligned `fp16` (`u16`) block of 32 samples (`sizeof == 64`, `alignof == 64`).
 #[repr(C, align(64))]
@@ -455,8 +431,10 @@ mod tests {
     fn test_cache_line_64_and_aligned_buffers() {
         let mut cl = CacheLine64::default();
         assert_eq!((&raw const cl as usize) % 64, 0);
-        cl.as_f32_slice_mut()[0] = 3.25;
-        assert_eq!(cl.as_f32_slice()[0], 3.25);
+        let cl_f32: &mut [f32; 16] = zerocopy::transmute_mut!(&mut cl);
+        cl_f32[0] = 3.25;
+        let cl_read: &[f32; 16] = zerocopy::transmute_ref!(&cl);
+        assert_eq!(cl_read[0], 3.25);
 
         let fp16_blk = AlignedFp16Block::default();
         assert_eq!(fp16_blk.0.len(), 32);
@@ -465,8 +443,10 @@ mod tests {
         assert_eq!(buf.len_blocks(), 4);
         assert!(!buf.is_empty());
         assert_eq!((buf.as_bytes().as_ptr() as usize) % 64, 0);
-        buf[0].as_f32_slice_mut()[1] = -1.5;
-        assert_eq!(buf[0].as_f32_slice()[1], -1.5);
+        let b0_mut: &mut [f32; 16] = zerocopy::transmute_mut!(&mut buf[0]);
+        b0_mut[1] = -1.5;
+        let b0_read: &[f32; 16] = zerocopy::transmute_ref!(&buf[0]);
+        assert_eq!(b0_read[1], -1.5);
     }
 
     #[test]

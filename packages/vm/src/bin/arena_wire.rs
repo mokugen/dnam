@@ -696,6 +696,7 @@ mod tests {
     use super::*;
     use zerocopy::FromZeros;
 
+    /// verify[container.dnam.tensor-directory]
     #[test]
     fn test_arena_wire_total_sizes_and_bases() {
         let a0 = Arena0LiteWire::new_zeroed();
@@ -706,6 +707,10 @@ mod tests {
         assert_eq!(a1.as_bytes().len(), 3_328);
         assert_eq!(a2.as_bytes().len(), 7_936);
         assert_eq!(a3.as_bytes().len(), 14_848);
+        assert_eq!(CONVOLVER_EARLY_FIR_BASES, [1_408, 6_528, 12_544, 22_528]);
+        assert_eq!(CONVOLVER_KAUTZ_BASES, [1_664, 6_656, 12_928, 22_784]);
+        assert_eq!(TRANSPORT_DELAY_BASES, [1_920, 6_784, 13_312, 23_040]);
+        assert_eq!(LINEAR_READOUT_BASES, [2_048, 6_912, 13_568, 23_296]);
         assert_eq!(CONVOLVER_KAUTZ_BLOCKS_PER_TIER, [2, 1, 3, 2]);
     }
 }

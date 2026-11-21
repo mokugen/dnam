@@ -373,6 +373,7 @@ mod tests {
         }
     }
 
+    /// verify[dsp.op-n.core.tpt-tone-basis]
     #[test]
     fn test_tpt_svf_zero_equilibrium_and_filter_identities() {
         let g = GpuVec4::from_array([0.05, 0.2, 1.0, 4.0]);

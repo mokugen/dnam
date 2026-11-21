@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Pure Rust #![no_std] + alloc, zero-audio-alloc real-time SIMD audio engine for Dynamic Neural Audio Modeler (DNAM)"
+description = "Pure Rust #![no_std] + alloc, zero-audio-alloc Layer 1 .dnam container shell, host patchbay, SPSC host, DRM/Tardos provenance, and C-ABI over dnam-vm"
 
 [lib]
 name = "dnam_engine"
@@ -14,7 +14,7 @@ bench = false
 
 [features]
 default = ["std", "crypto"]
-std = []
+std = ["dnam-vm/std"]
 crypto = [
     "dep:ed25519-dalek",
     "dep:x25519-dalek",
@@ -30,6 +30,7 @@ hotpath-cloud = ["hotpath", "hotpath/hotpath-cloud"]
 
 [dependencies]
 dnam-kernels.workspace = true
+dnam-vm = { workspace = true, features = ["alloc"] }
 serde = { workspace = true, default-features = false, features = ["alloc", "derive"] }
 serde_json = { workspace = true, default-features = false, features = ["alloc"] }
 zeroize = { workspace = true, default-features = false, features = ["alloc", "derive"] }
@@ -48,14 +49,6 @@ proptest.workspace = true
 
 [[bench]]
 name = "pipeline"
-harness = false
-
-[[bench]]
-name = "operators"
-harness = false
-
-[[bench]]
-name = "graph_and_control"
 harness = false
 
 [[bench]]

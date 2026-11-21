@@ -156,7 +156,7 @@ pub unsafe extern "C" fn dnam_engine_get_latency_samples(handle: *const DnamEngi
     }
 }
 
-/// Rescales discrete-time parameters for a new host sample rate $f_{s,\text{host}} \in [44100, 192000]\text{ Hz}$.
+/// Rescales discrete-time parameters for a new host sample rate $f_{s,\text{host}} \in [44100, 384000]\text{ Hz}$.
 /// Returns `0` on success or `-1` on invalid sample rate.
 ///
 /// # Safety
@@ -168,7 +168,7 @@ pub unsafe extern "C" fn dnam_engine_set_sample_rate(
 ) -> i32 {
     // SAFETY: Caller guarantees `handle` is either null or a valid pointer to `DnamEngineHandle`.
     if let Some(h) = unsafe { handle.as_mut() }
-        && h.engine.set_sample_rate(sample_rate_hz).is_ok()
+        && h.engine.set_sample_rate_rt(sample_rate_hz)
     {
         return 0;
     }
@@ -350,16 +350,13 @@ pub unsafe extern "C" fn dnam_engine_get_telemetry(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
     use crate::schema::DnamJsonHeader;
-    extern crate alloc;
-    use alloc::vec;
+    use crate::test_support::build_test_dnam_container;
 
     #[test]
     fn test_all_ffi_functions_and_null_safety() {
         let mut header = DnamJsonHeader::default_reference();
-        let arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-        let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+        let container = build_test_dnam_container(&mut header, Tier::Ultra, true);
 
         // SAFETY: Unit test exercises FFI C-ABI interface with both null and valid test pointers.
         unsafe {
@@ -510,6 +507,7 @@ mod tests {
             dnam_engine_reset(handle);
             assert_eq!(dnam_engine_set_sample_rate(handle, 48000), 0);
             assert_eq!(dnam_engine_set_sample_rate(handle, 192_000), 0);
+            assert_eq!(dnam_engine_set_sample_rate(handle, 384_000), 0);
             assert_eq!(dnam_engine_set_sample_rate(handle, 0), -1);
 
             // Valid container via dnam_engine_create_from_bytes + Debug formatting

@@ -137,13 +137,13 @@ impl core::error::Error for DnamError {}
 /// Pure `#![no_std]` natural logarithm $\ln(x)$ in `f64` for cold-init ZOH rescaling and UI skew.
 #[inline]
 pub fn cold_ln_f64(x: f64) -> f64 {
-    crate::math::ln_f64(x)
+    dnam_vm::math::ln_f64(x)
 }
 
 /// Pure `#![no_std]` exponential $\exp(y)$ in `f64` for cold-init ZOH rescaling and UI skew.
 #[inline]
 pub fn cold_exp_f64(y: f64) -> f64 {
-    crate::math::exp_f64(y)
+    dnam_vm::math::exp_f64(y)
 }
 
 /// Pure `#![no_std]` power function $a^b = \exp(b \ln(a))$ in `f64` for cold-init ZOH rescaling and UI skew.

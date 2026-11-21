@@ -504,6 +504,9 @@ mod tests {
         assert_eq!(catmull_rom_hermite_f32(1.0, 2.0, 3.0, 4.0, f32::NAN), 2.0);
     }
 
+    /// verify[dsp.op-t.window.m1-delay]
+    /// verify[dsp.op-t.window.m2-pitch]
+    /// verify[dsp.op-t.window.m3-barberpole]
     #[test]
     fn test_windows_readers_and_clamp_transport_delay() {
         assert_eq!(hermite_hann_partition_of_unity_f32(0.0), [0.0, 1.0]);
@@ -546,6 +549,7 @@ mod tests {
     /// verify[dsp.op-t.window.partition-of-unity]
     /// verify[dsp.op-t.reader.catmull-rom]
     /// verify[dsp.op-t.ring.q0-32-pointer]
+    /// verify[dsp.op-t.window.m2-pitch]
     #[test]
     fn test_ortho_q32_window_sin_pitch_down_and_half_alpha() {
         assert_eq!(wgsl_triangle_fold_q32(0), 0.0);

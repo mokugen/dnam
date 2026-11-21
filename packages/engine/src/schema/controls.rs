@@ -30,8 +30,6 @@ pub enum ControlCalibrationRole {
     StereoMode,
     /// Continuous stereo width spread control (`0.0 = Mono` to `1.0 = Full Stereo`).
     StereoWidth,
-    /// Spectral freeze latch / sustain hold switch or continuous freeze amount (`0.0 = Normal` to `1.0 = Infinite Freeze`).
-    FreezeLatch,
     /// Granular window length control calibrated in milliseconds (`10..500 ms`, supports MIDI tempo sync).
     GrainSizeMs,
     /// Granular / pitch-shifter / shimmer interval control calibrated in semitones (`-24..+24 st`).
@@ -45,6 +43,7 @@ pub type BorrowedTempoTarget<'a> = (Option<(&'a str, &'a str)>, f32, bool);
 
 /// Physical calibration and MIDI tempo-sync metadata for a single parametric control.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ControlCalibration {
     /// Physical semantic role of the control.
     pub role: ControlCalibrationRole,
@@ -109,7 +108,7 @@ impl ControlCalibration {
             if c1.abs() <= 1e-12 {
                 return (0.0, false);
             }
-            let inv_c1 = crate::math::newton6_reciprocal_f64(c1.abs()).copysign(c1);
+            let inv_c1 = dnam_vm::math::newton6_reciprocal_f64(c1.abs()).copysign(c1);
             let u = ((t - v_mid) * inv_c1).clamp(-1.0, 1.0) as f32;
             return (u, false);
         }
@@ -117,7 +116,7 @@ impl ControlCalibration {
         // Solve c2 * u^2 + c1 * u + (v_mid - t) = 0; select the root with same sign as c1
         let disc = (c1 * c1 - 4.0 * c2 * (v_mid - t)).max(0.0);
         let root_disc = cold_sqrt_f64(disc);
-        let inv_2c2 = crate::math::newton6_reciprocal_f64((2.0 * c2).abs()).copysign(c2);
+        let inv_2c2 = dnam_vm::math::newton6_reciprocal_f64((2.0 * c2).abs()).copysign(c2);
         let r1 = (-c1 + root_disc) * inv_2c2;
         let r2 = (-c1 - root_disc) * inv_2c2;
         let u = if (-1.0 - 1e-4..=1.0 + 1e-4).contains(&r1)
@@ -368,34 +367,6 @@ impl ControlCalibration {
             None
         }
     }
-
-    /// Maps a `FreezeLatch` switch option label (`"Off"` vs `"On"` / `"Freeze"` / `"Hold"`) to
-    /// freeze amount $\alpha_{\text{freeze}} \in [0.0, 1.0]$.
-    #[inline]
-    pub fn freeze_amount_for_option(&self, option_label: &str) -> Option<f32> {
-        if self.role != ControlCalibrationRole::FreezeLatch {
-            return None;
-        }
-        let lower = option_label.trim();
-        if lower.eq_ignore_ascii_case("off")
-            || lower.eq_ignore_ascii_case("false")
-            || lower.eq_ignore_ascii_case("normal")
-            || lower.eq_ignore_ascii_case("bypass")
-            || lower == "0"
-        {
-            Some(0.0)
-        } else if lower.eq_ignore_ascii_case("on")
-            || lower.eq_ignore_ascii_case("true")
-            || lower.eq_ignore_ascii_case("freeze")
-            || lower.eq_ignore_ascii_case("hold")
-            || lower.eq_ignore_ascii_case("latch")
-            || lower == "1"
-        {
-            Some(1.0)
-        } else {
-            None
-        }
-    }
 }
 
 /// Parametric control kind (`"range"` vs `"switch"`).
@@ -410,6 +381,7 @@ pub enum ControlKind {
 
 /// Schema definition for a single parametric control (`range` or `switch`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ControlSchemaDef {
     /// Machine-readable control identifier (e.g., `"gain"`, `"feedback"`, `"boost"`).
     pub id: String,
@@ -601,23 +573,7 @@ mod tests {
         assert_eq!(stereo_cal.stereo_width_for_option("Mono"), Some(0.0));
         assert_eq!(stereo_cal.stereo_width_for_option("Stereo"), Some(1.0));
         assert_eq!(stereo_cal.stereo_width_for_option("Invalid"), None);
-
-        // FreezeLatch switch mapping
-        let freeze_cal = ControlCalibration {
-            role: ControlCalibrationRole::FreezeLatch,
-            lobatto_physical_anchors: None,
-            conditional_physical_anchors: Vec::new(),
-            tempo_sync_default_subdivision: None,
-        };
-        for opt in ["Off", "false", "NORMAL", "bypass", "0"] {
-            assert_eq!(freeze_cal.freeze_amount_for_option(opt), Some(0.0));
-        }
-        for opt in ["On", "true", "FREEZE", "hold", "latch", "1"] {
-            assert_eq!(freeze_cal.freeze_amount_for_option(opt), Some(1.0));
-        }
-        assert_eq!(freeze_cal.freeze_amount_for_option("unknown"), None);
-        assert_eq!(stereo_cal.freeze_amount_for_option("on"), None);
-        assert_eq!(freeze_cal.stereo_width_for_option("mono"), None);
+        assert!(serde_json::from_str::<ControlCalibrationRole>("\"freeze_latch\"").is_err());
 
         // evaluate_lobatto_anchors & invert
         let anchors = [10.0, 50.0, 100.0];

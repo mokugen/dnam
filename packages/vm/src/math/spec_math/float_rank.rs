@@ -212,6 +212,8 @@ mod tests {
     use super::*;
     use crate::FtzDazGuard;
 
+    /// verify[dsp.ctrl.range.f32-rank-bounds]
+    /// verify[dsp.ctrl.range.normalize-clamp]
     #[test]
     fn test_declared_range_normalization_and_f32_rank_bounds() {
         let _guard = FtzDazGuard::new();

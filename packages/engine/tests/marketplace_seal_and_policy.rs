@@ -3,15 +3,18 @@
 //!
 //! Canonical Reference: `docs/specs/security/provenance_and_enclave_drm.md`.
 
+#![forbid(unsafe_code)]
+
+#[path = "sona_test_support/arena_builder.rs"]
+mod arena_builder;
+
 use std::collections::BTreeMap;
 
+use arena_builder::{build_sona_container_from_header_options, build_sona_header};
 use dnam_engine::container::{
-    ARENA_OFFSET_FULL_END, ARENA_OFFSET_ULTRA_END, DnamContainerView, DnamPreambleWire,
-    build_dnam_container,
+    ARENA_OFFSET_FULL_END, DnamContainerView, DnamPreambleWire, extract_dnam_bin,
+    validate_v3_dnam_layout_with_max_profile,
 };
-use dnam_engine::graph::sona_core::SonaMatryoshkaModel;
-use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
-use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::provenance::{
     DNSL_MAGIC, Dme1HeaderWire, DnslDirectoryWire, DnslPreambleWire, RustCryptoProvider,
     build_creator_signing_message, build_marketplace_receipt_signing_message,
@@ -19,24 +22,31 @@ use dnam_engine::provenance::{
     unseal_dnam_container, unseal_dnsl_up_to_tier, verify_oem_device_certificate,
 };
 use dnam_engine::schema::{
-    AuthorizedDevice, CreatorSignature, DistributionPolicy, DnamError, DnamJsonHeader,
-    DnamProtectionProfile, MarketplaceReceipt, ModelSignatures, PresetDef,
+    AuthorizedDevice, CreatorSignature, DistributionPolicy, DnamError, DnamProtectionProfile,
+    MarketplaceReceipt, ModelSignatures, PresetDef,
 };
 use dnam_engine::{DnamEngine, DynamicDnamEngine, Tier};
+use dnam_vm::bin::DnamBinView;
+use dnam_vm::math::DefaultMathBackend;
 use zerocopy::FromBytes;
 
 #[test]
 fn test_dnam_seal_dnsl_envelope_oem_certificate_and_distribution_policy() {
-    let mut header = DnamJsonHeader::default_reference();
-    let mut master_arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    let model = SonaMatryoshkaModel::dual_rate_default(false);
-    pack_sona_matryoshka_to_arena(&model, &mut master_arena);
-
-    // 1. Configure Creator-Signed DistributionPolicy restricting model to EnclaveSealed on Darkglass Anagram
+    let mut header = build_sona_header();
     header.metadata.distribution_policy = Some(DistributionPolicy {
         allowed_protection_profiles: vec![DnamProtectionProfile::EnclaveSealed],
         allowed_oem_vendors: vec!["darkglass:anagram_rk3582".to_string()],
     });
+
+    let (master_arena, _template_dbin, unsigned_inner) = build_sona_container_from_header_options(
+        &mut header.clone(),
+        Tier::Ultra,
+        false,
+        false,
+        true,
+        &[],
+    );
+    let _ = unsigned_inner;
 
     let creator_seed = [21u8; 32];
     let creator_pk = RustCryptoProvider::ed25519_pubkey_from_seed(&creator_seed);
@@ -64,14 +74,11 @@ fn test_dnam_seal_dnsl_envelope_oem_certificate_and_distribution_policy() {
         verify_oem_device_certificate(&cert_anagram, &oem_darkglass_pk, &RustCryptoProvider::new())
             .unwrap();
     assert_eq!(verified_x25519, dev_pubkey_x25519);
-
     assert!(
         verify_oem_device_certificate(&cert_anagram, &oem_other_pk, &RustCryptoProvider::new())
             .is_err()
     );
 
-    // 2. Sign inner .dnam with creator signature + marketplace receipt (`encryption_mode = "none"`,
-    //    wrapped exclusively inside canonical v3.0 `DNSL`/`DNPL` HPKE + AEAD records)
     let imm_sha = compute_immutable_header_sha256(&header).unwrap();
     let master_sha = sha256_digest(&master_arena);
     let creator_msg = build_creator_signing_message(&imm_sha, &master_sha);
@@ -114,16 +121,19 @@ fn test_dnam_seal_dnsl_envelope_oem_certificate_and_distribution_policy() {
         marketplace_receipt: Some(receipt),
     });
 
-    let inner_dnam_bytes =
-        build_dnam_container(&mut header, &master_arena, &master_arena, false).unwrap();
+    let (_, _, inner_dnam_bytes) =
+        build_sona_container_from_header_options(&mut header, Tier::Ultra, false, false, true, &[]);
+    let inner_layout = validate_v3_dnam_layout_with_max_profile(&inner_dnam_bytes, 1).unwrap();
+    assert!(inner_layout.dbin_extent.1 > 0);
+    let inner_dbin_prefix = inner_dnam_bytes
+        [inner_layout.dbin_extent.0..inner_layout.dbin_extent.0 + inner_layout.dbin_extent.1]
+        .to_vec();
 
-    // 3. Loading the unsealed inner .dnam directly must FAIL because DistributionPolicy requires EnclaveSealed!
     let crypto = RustCryptoProvider::new()
         .with_device_key(device_id_hash, dev_secret_x25519)
         .with_marketplace_pubkey(mp_pk);
     assert!(DnamContainerView::from_bytes(&inner_dnam_bytes, &crypto).is_err());
 
-    // 4. Attempting to seal for a different model ("darkglass:other_pedal") must FAIL DistributionPolicy!
     let cert_wrong_model = RustCryptoProvider::sign_oem_device_certificate(
         &oem_darkglass_seed,
         "darkglass",
@@ -149,7 +159,6 @@ fn test_dnam_seal_dnsl_envelope_oem_certificate_and_distribution_policy() {
         .is_err()
     );
 
-    // 5. Sealing for the authorized "darkglass:anagram_rk3582" certificate succeeds and produces 64B-aligned DNSL
     let sealed_bytes = seal_dnam_container(
         &inner_dnam_bytes,
         std::slice::from_ref(&cert_anagram),
@@ -167,21 +176,24 @@ fn test_dnam_seal_dnsl_envelope_oem_certificate_and_distribution_policy() {
     assert!(sealed_bytes.len() + 16_384 > inner_dnam_bytes.len());
     assert_eq!(core::mem::size_of::<Dme1HeaderWire>(), 20);
 
-    // 6. Unsealing verifies DAI1/DSA1 prefixes up to Tier::Full and recovers canonical v3.0 plaintext .dnam
     let unsealed_full = unseal_dnsl_up_to_tier(&sealed_bytes, &crypto, Tier::Full).unwrap();
     assert_eq!(unsealed_full.retained_tier, Tier::Full);
     assert_eq!(
         unsealed_full.arena_bytes.as_slice(),
         &master_arena[..ARENA_OFFSET_FULL_END as usize]
     );
+    assert_eq!(unsealed_full.dbin_prefix, inner_dbin_prefix);
+
     let unsealed_inner = unseal_dnam_container(&sealed_bytes, &crypto).unwrap();
     let (unsealed_preamble, _) = DnamPreambleWire::ref_from_prefix(&unsealed_inner).unwrap();
     assert_eq!(&unsealed_preamble.magic, b"DNAM");
     assert_eq!(unsealed_preamble.version_major.get(), 3);
+    let recovered_dbin = extract_dnam_bin(&unsealed_inner).unwrap();
+    let _ = DnamBinView::parse(recovered_dbin).unwrap();
+
     let unsealed_ultra = unseal_dnsl_up_to_tier(&sealed_bytes, &crypto, Tier::Ultra).unwrap();
     assert_eq!(unsealed_ultra.arena_bytes, master_arena);
 
-    // 7. DnamContainerView::from_bytes & DynamicDnamEngine load .dnam-seal directly and report EnclaveSealed
     let sealed_view = DnamContainerView::from_bytes(&sealed_bytes, &crypto).unwrap();
     assert_eq!(
         sealed_view.protection_profile,
@@ -210,7 +222,6 @@ fn test_dnam_seal_dnsl_envelope_oem_certificate_and_distribution_policy() {
     dyn_eng.process_block(&in_l, &in_r, &mut out_l, &mut out_r);
     assert!(out_l.iter().any(|&v| v.abs() > 1e-6));
 
-    // 8. Verify seal error branches (DNSL/DME1 wire parsing, unaligned inner, empty recipients, unknown OEM, fail-closed MP key, tampered seal)
     assert!(DnslPreambleWire::from_bytes(&[0u8; 32]).is_err());
     assert!(DnslDirectoryWire::from_bytes(&[0u8; 32]).is_err());
     assert!(Dme1HeaderWire::from_bytes(&[0u8; 16]).is_err());
@@ -272,7 +283,7 @@ fn test_dnam_seal_dnsl_envelope_oem_certificate_and_distribution_policy() {
 
 #[test]
 fn test_tier_capped_dnam_seal_with_dme1_trailer_preserves_presets_and_fails_closed() {
-    let mut header = DnamJsonHeader::default_reference();
+    let mut header = build_sona_header();
     header.presets = vec![PresetDef {
         id: "enclave_crunch".to_string(),
         name: "Enclave Crunch".to_string(),
@@ -285,11 +296,14 @@ fn test_tier_capped_dnam_seal_with_dme1_trailer_preserves_presets_and_fails_clos
         allowed_oem_vendors: vec!["darkglass:anagram_rk3582".to_string()],
     });
 
-    let mut master_arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    let mut model = SonaMatryoshkaModel::dual_rate_default(false);
-    model.readouts[1].direct_w_odd[0][0] = 0.25;
-    model.readouts[1].direct_w_odd[1][0] = 0.25;
-    pack_sona_matryoshka_to_arena(&model, &mut master_arena);
+    let (master_arena, _, _) = build_sona_container_from_header_options(
+        &mut header.clone(),
+        Tier::Ultra,
+        false,
+        false,
+        true,
+        &[],
+    );
 
     let creator_seed = [27u8; 32];
     let creator_pk = RustCryptoProvider::ed25519_pubkey_from_seed(&creator_seed);
@@ -352,8 +366,14 @@ fn test_tier_capped_dnam_seal_with_dme1_trailer_preserves_presets_and_fails_clos
         marketplace_receipt: Some(receipt),
     });
 
-    let inner_dnam_bytes =
-        build_dnam_container(&mut header, &master_arena, &master_arena, false).unwrap();
+    let (_, _, inner_dnam_bytes) = build_sona_container_from_header_options(
+        &mut header.clone(),
+        Tier::Ultra,
+        false,
+        false,
+        true,
+        &[],
+    );
     let sealed_bytes = seal_dnam_container(
         &inner_dnam_bytes,
         &[cert],
@@ -373,11 +393,10 @@ fn test_tier_capped_dnam_seal_with_dme1_trailer_preserves_presets_and_fails_clos
         .with_device_key(device_id_hash, dev_secret_x25519)
         .with_marketplace_pubkey(mp_pk);
 
-    // 1. Tier-capped unsealing (Tier::Full on unstripped Ultra .dnam-seal with no tier_arena_sha256)
-    //    must succeed and preserve decrypted DME1 presets.
     let unsealed_full = unseal_dnsl_up_to_tier(&sealed_bytes, &crypto, Tier::Full).unwrap();
     assert_eq!(unsealed_full.retained_tier, Tier::Full);
     assert!(unsealed_full.mutable_json.is_some());
+    assert!(!unsealed_full.dbin_prefix.is_empty());
 
     let view_full =
         DnamContainerView::from_bytes_with_max_tier(&sealed_bytes, &crypto, Tier::Full).unwrap();
@@ -389,8 +408,6 @@ fn test_tier_capped_dnam_seal_with_dme1_trailer_preserves_presets_and_fails_clos
     assert_eq!(view_full.header.presets.len(), 1);
     assert_eq!(view_full.header.presets[0].id, "enclave_crunch");
 
-    // 2. DnamEngine with enclave crypto decrypts DME1 presets at Tier::Full and processes audio,
-    //    while DnamEngine::from_bytes_with_max_tier (DefaultCryptoProvider without keys) fails closed.
     let mut eng_crypto = DnamEngine::<DefaultMathBackend>::from_bytes_with_crypto(
         &sealed_bytes,
         Tier::Full,
@@ -417,13 +434,17 @@ fn test_tier_capped_dnam_seal_with_dme1_trailer_preserves_presets_and_fails_clos
         DnamError::CryptoVerificationFailed(_)
     ));
 
-    // 3. Also verify DnamEngine::from_bytes_with_max_tier succeeds at Tier::Full on an open
-    //    unstripped Ultra .dnam with presets (no tier_arena_sha256) and preserves presets.
     let mut open_hdr = header;
     open_hdr.metadata.distribution_policy = None;
     open_hdr.metadata.signatures = None;
-    let open_ultra_bytes =
-        build_dnam_container(&mut open_hdr, &master_arena, &master_arena, false).unwrap();
+    let (_, _, open_ultra_bytes) = build_sona_container_from_header_options(
+        &mut open_hdr,
+        Tier::Ultra,
+        false,
+        false,
+        true,
+        &[],
+    );
     let mut eng_max_full = DnamEngine::<DefaultMathBackend>::from_bytes_with_max_tier(
         &open_ultra_bytes,
         Tier::Full,
@@ -434,7 +455,6 @@ fn test_tier_capped_dnam_seal_with_dme1_trailer_preserves_presets_and_fails_clos
     assert_eq!(eng_max_full.tier(), Tier::Full);
     eng_max_full.apply_preset("enclave_crunch").unwrap();
 
-    // 4. Truncating or tampering DME1 / DMUE on the tier-capped .dnam-seal must fail closed.
     let trunc_dmue = &sealed_bytes[..sealed_bytes.len() - 8];
     assert!(unseal_dnsl_up_to_tier(trunc_dmue, &crypto, Tier::Full).is_err());
     assert!(DnamContainerView::from_bytes_with_max_tier(trunc_dmue, &crypto, Tier::Full).is_err());

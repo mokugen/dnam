@@ -36,8 +36,8 @@ pub use oem_and_drm::{
 };
 pub use prefix_and_dau1::{
     Dai1Envelope, Dau1BuyerHeaderWire, Dau1CreatorPreambleWire, Dau1Envelope,
-    build_plaintext_shared_v1, compute_ciphertext_prefixes_v1, compute_plaintext_prefixes_v1,
-    encode_prefix_list, hmac_sha256, parse_prefix_list,
+    build_plaintext_shared_v1, build_plaintext_shared_v1_with_dbin, compute_ciphertext_prefixes_v1,
+    compute_plaintext_prefixes_v1, encode_prefix_list, hmac_sha256, parse_prefix_list,
 };
 pub use prefix_delegation_crypto::{
     build_buyer_receipt_v1, build_creator_manifest_v1, build_outer_manifest_v1,

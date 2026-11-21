@@ -257,6 +257,11 @@ pub(crate) fn compute_has_internal_modulators(
 mod tests {
     use super::*;
 
+    /// verify[dsp.ctrl.modulators.dynamic]
+    /// verify[dsp.ctrl.op-m.ballistic-lfo]
+    /// verify[dsp.ctrl.op-m.timing]
+    /// verify[dsp.ctrl.switch.conditional-batch]
+    /// verify[dsp.op-n.ctrl.chebyshev-lfo]
     #[test]
     fn test_skewed_lfo_sensory_latch_and_activity_flag() {
         let mut phases = [Q0_192Phase::ZERO; 2];

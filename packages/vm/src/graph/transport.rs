@@ -21,6 +21,8 @@ pub use quad::{
     QuadColdMeta, QuadEffectiveTargets, QuadHydrateConfig, QuadRingMut, QuadStepResult,
     QuadTopRead, TransportQuadHotCompact,
 };
+#[cfg(feature = "alloc")]
+pub use ring::ExtRingAllocSpec;
 pub use ring::{
     PartitionedSchroederBank, TRANSPORT_ALLPASS_G_MAX, TRANSPORT_INLINE_QUAD0_CAP,
     TRANSPORT_MAX_EXT_CAP, TRANSPORT_MIN_EXT_CAP, TRANSPORT_SCHROEDER_MAX_DELAY, TransportExtRing,
@@ -301,6 +303,8 @@ mod tests {
         w
     }
 
+    /// verify[dsp.op-t.ring.admission]
+    /// verify[dsp.op-t.ring.capacity]
     #[test]
     fn test_lite_inline_with_empty_ext_and_fail_closed_when_missing() {
         let w0 = make_quad_wire([53.0, 67.0, 79.0, 89.0], 0.0, 0);
@@ -367,6 +371,9 @@ mod tests {
         );
     }
 
+    /// verify[dsp.op-t.ring.branchless-wrap]
+    /// verify[dsp.tank.captured-freeze]
+    /// verify[dsp.tank.feedback-loop]
     #[test]
     fn test_multiquad_stage_dry_mix_psi_slew_freeze_release_and_reconfigure() {
         let mut w0 = make_quad_wire(

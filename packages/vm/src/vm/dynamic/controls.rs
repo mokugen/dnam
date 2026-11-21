@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+use crate::bin::DnamBinView;
 use crate::types::{Tier, VmError};
 
 use super::super::SonaTelemetrySnapshot;
@@ -122,6 +123,50 @@ impl DynamicSonaVm {
             Self::X86Avx2Fma(vm) => vm.set_op_t_write_enable(locked),
             #[cfg(target_arch = "wasm32")]
             Self::WasmSimd128(vm) => vm.set_op_t_write_enable(locked),
+        }
+    }
+
+    /// Reloads a new validated `.dnam-bin` model in-place with zero heap allocations and zero drops.
+    #[inline(never)]
+    pub fn reload_from_view_in_place(
+        &mut self,
+        view: &DnamBinView<'_>,
+        active_tier: Tier,
+        host_rate_hz: f32,
+        offline_bounce: bool,
+    ) -> Result<(), VmError> {
+        match self {
+            Self::Scalar(vm) => {
+                vm.reload_from_view_in_place(view, active_tier, host_rate_hz, offline_bounce)
+            }
+            #[cfg(target_arch = "aarch64")]
+            Self::ArmNeon(vm) => {
+                vm.reload_from_view_in_place(view, active_tier, host_rate_hz, offline_bounce)
+            }
+            #[cfg(target_arch = "aarch64")]
+            Self::ArmSve2(vm) => {
+                vm.reload_from_view_in_place(view, active_tier, host_rate_hz, offline_bounce)
+            }
+            #[cfg(target_arch = "aarch64")]
+            Self::ArmSme(vm) => {
+                vm.reload_from_view_in_place(view, active_tier, host_rate_hz, offline_bounce)
+            }
+            #[cfg(target_arch = "x86_64")]
+            Self::X86Sse2(vm) => {
+                vm.reload_from_view_in_place(view, active_tier, host_rate_hz, offline_bounce)
+            }
+            #[cfg(target_arch = "x86_64")]
+            Self::X86Sse42(vm) => {
+                vm.reload_from_view_in_place(view, active_tier, host_rate_hz, offline_bounce)
+            }
+            #[cfg(target_arch = "x86_64")]
+            Self::X86Avx2Fma(vm) => {
+                vm.reload_from_view_in_place(view, active_tier, host_rate_hz, offline_bounce)
+            }
+            #[cfg(target_arch = "wasm32")]
+            Self::WasmSimd128(vm) => {
+                vm.reload_from_view_in_place(view, active_tier, host_rate_hz, offline_bounce)
+            }
         }
     }
 
@@ -300,6 +345,29 @@ impl DynamicSonaVm {
             Self::X86Avx2Fma(vm) => vm.clear_saturation_flags(),
             #[cfg(target_arch = "wasm32")]
             Self::WasmSimd128(vm) => vm.clear_saturation_flags(),
+        }
+    }
+
+    /// Returns the latest frame's pre-spatial core `(L, R)` vs transport wet `(L, R)` partition.
+    #[inline(never)]
+    #[must_use]
+    pub fn last_wdw_partition(&self) -> ([f32; 2], [f32; 2]) {
+        match self {
+            Self::Scalar(vm) => vm.last_wdw_partition(),
+            #[cfg(target_arch = "aarch64")]
+            Self::ArmNeon(vm) => vm.last_wdw_partition(),
+            #[cfg(target_arch = "aarch64")]
+            Self::ArmSve2(vm) => vm.last_wdw_partition(),
+            #[cfg(target_arch = "aarch64")]
+            Self::ArmSme(vm) => vm.last_wdw_partition(),
+            #[cfg(target_arch = "x86_64")]
+            Self::X86Sse2(vm) => vm.last_wdw_partition(),
+            #[cfg(target_arch = "x86_64")]
+            Self::X86Sse42(vm) => vm.last_wdw_partition(),
+            #[cfg(target_arch = "x86_64")]
+            Self::X86Avx2Fma(vm) => vm.last_wdw_partition(),
+            #[cfg(target_arch = "wasm32")]
+            Self::WasmSimd128(vm) => vm.last_wdw_partition(),
         }
     }
 

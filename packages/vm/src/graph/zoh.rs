@@ -292,6 +292,8 @@ mod tests {
         assert!((bounce96.inv_f_s_core() * 384_000.0 - 1.0).abs() < 1.0e-12);
     }
 
+    /// verify[dsp.zoh.core-paralru]
+    /// verify[dsp.zoh.op-t-delays]
     #[test]
     fn test_paralru_ballistic_and_sample_count_zoh() {
         let (r0, a0, k0) = rescale_paralru_lane(0.99, 0.5, 0.4, 1.0);
@@ -331,6 +333,7 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(64))]
 
+        /// verify[dsp.zoh.core-paralru]
         #[test]
         fn prop_paralru_zoh_bounds_and_near_one_continuity(
             alpha_rel in 0.0_f32..=MAX_PARALRU_R_F32,

@@ -202,6 +202,8 @@ fn retime_with_bounce<B: GraphBackend>(
         let cold = slab.cold_mut();
         cold.offline_bounce = new_offline;
         cold.bounce4x.reset();
+        cold.bounce4x_core_decim.reset();
+        cold.bounce4x_wet_decim.reset();
         if let Some(bus) = cold.ctrl_bus.as_mut() {
             bus.set_offline_bounce(new_offline);
         }
@@ -349,13 +351,19 @@ pub fn reset_to_dc_equilibrium<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>) {
         cold.convolver_fir_ext.reset();
         cold.kautz_slew.reset_slew();
         cold.bounce4x.reset();
+        cold.bounce4x_core_decim.reset();
+        cold.bounce4x_wet_decim.reset();
         cold.rem_hist.reset();
         cold.xfade_rem = 0;
         cold.xfade_prev_out = [0.0; 2];
+        cold.xfade_prev_core = [0.0; 2];
+        cold.xfade_prev_wet = [0.0; 2];
         cold.last_in = [0.0; 2];
         cold.last_s2_dir = [0.0; 4];
         cold.last_op_p_iq_lr = [0.0; 4];
         cold.last_op_p_feat = [0.0; 4];
+        cold.last_core_lr = [0.0; 2];
+        cold.last_transport_wet_lr = [0.0; 2];
         cold.saturation_flags = 0;
         if let Some(bus) = cold.ctrl_bus.as_mut() {
             bus.reset();
@@ -407,6 +415,7 @@ mod tests {
     use super::*;
     use dnam_kernels::QUAD_FLAG_HOST_WRITE_LOCK;
 
+    /// verify[dsp.op-m.kautz.tier-allocation]
     #[test]
     fn test_lifecycle_constants_and_kautz_cum_banks() {
         assert_eq!(TIER_SWITCH_XFADE_SAMPLES, 48);

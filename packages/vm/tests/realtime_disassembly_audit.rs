@@ -19,18 +19,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use dnam_kernels::OpNPreHotState;
 use dnam_vm::{
     ControlBus, ConvolverFirHistorySlices, ConvolverFirWeightSlices, CrossbarFrame,
-    DefaultControlBus, DefaultMathBackend, DynamicSonaVm, HoistedCoreChunk, MathBackend,
-    PartitionedSchroederBank, QuadColdMeta, QuadEffectiveTargets, QuadTopRead, SensoryQuadCold,
-    SensoryQuadHot, SonaHotSlab, SonaTelemetrySnapshot, SonaVm, TRANSPORT_MAX_QUADS,
-    TransportExtRing, TransportModSlots, TransportQuadHotCompact, TransportStageState,
-    TransportTopOfFrameResult, VmError, bind_dnam_bin_prevalidated,
-    sona_graph_convolver_chunk_default, sona_graph_dispatch_transport_3khz_default,
-    sona_graph_eval_core_quads_default, sona_graph_op_n_pre_step_default,
-    sona_graph_sensory_step_default, sona_graph_transport_end_default,
-    sona_graph_transport_top_default, sona_vm_clear_saturation_flags_default,
-    sona_vm_process_block_default, sona_vm_process_tick16_default,
-    sona_vm_set_live_analog_drift_enabled_default, sona_vm_step_control_tick_default,
-    sona_vm_step_frame_default, step_control_frame_default, step_control_tick_3khz_default,
+    DefaultControlBus, DefaultMathBackend, DnamBinView, DynamicSonaVm, HoistedCoreChunk,
+    MathBackend, PartitionedSchroederBank, QuadColdMeta, QuadEffectiveTargets, QuadTopRead,
+    SensoryQuadCold, SensoryQuadHot, SonaHotSlab, SonaTelemetrySnapshot, SonaVm,
+    TRANSPORT_MAX_QUADS, Tier, TransportExtRing, TransportModSlots, TransportQuadHotCompact,
+    TransportStageState, TransportTopOfFrameResult, VmError, bind_dnam_bin_prevalidated,
+    reload_slab_from_dnam_bin_in_place, sona_graph_convolver_chunk_default,
+    sona_graph_dispatch_transport_3khz_default, sona_graph_eval_core_quads_default,
+    sona_graph_op_n_pre_step_default, sona_graph_sensory_step_default,
+    sona_graph_transport_end_default, sona_graph_transport_top_default,
+    sona_vm_clear_saturation_flags_default, sona_vm_process_block_default,
+    sona_vm_process_tick16_default, sona_vm_set_live_analog_drift_enabled_default,
+    sona_vm_step_control_tick_default, sona_vm_step_frame_default, step_control_frame_default,
+    step_control_tick_3khz_default,
 };
 use realtime_disassembly_audit::objdump_parser::{
     AliasMap, FnDisasm, clean_reloc_target, collect_symbol_aliases, disassemble_rlib_into,
@@ -192,6 +193,30 @@ fn retain_vm_realtime_roots() {
             &mut [QuadEffectiveTargets],
         ),
     >(sona_graph_dispatch_transport_3khz_default);
+    core::hint::black_box::<
+        fn(&mut DefaultControlBus<'static>, &DnamBinView<'_>, Tier, f32) -> Result<(), VmError>,
+    >(ControlBus::<'static, DefaultMathBackend>::reload_from_dnam_bin_in_place);
+    core::hint::black_box::<
+        fn(
+            &mut SonaHotSlab<'_, DefaultMathBackend>,
+            &DnamBinView<'_>,
+            Tier,
+            f32,
+            bool,
+        ) -> Result<(), VmError>,
+    >(reload_slab_from_dnam_bin_in_place::<DefaultMathBackend>);
+    core::hint::black_box::<
+        fn(
+            &mut SonaVm<'static, DefaultMathBackend>,
+            &DnamBinView<'_>,
+            Tier,
+            f32,
+            bool,
+        ) -> Result<(), VmError>,
+    >(SonaVm::<'static, DefaultMathBackend>::reload_from_view_in_place);
+    core::hint::black_box::<
+        fn(&mut DynamicSonaVm, &DnamBinView<'_>, Tier, f32, bool) -> Result<(), VmError>,
+    >(DynamicSonaVm::reload_from_view_in_place);
 }
 
 const EXACT_OR_SUBSTR_ROOTS: &[&str] = &[
@@ -573,6 +598,45 @@ fn test_vm_release_disassembly_zero_pipeline_stalls_and_nondeterministic_calls()
             }
         }
     }
+    let mut reload_closure: BTreeSet<String> = fns
+        .iter()
+        .filter(|(_, info)| {
+            info.demangled.contains("reload_from_dnam_bin_in_place")
+                || info
+                    .demangled
+                    .contains("reload_slab_from_dnam_bin_in_place")
+                || info.demangled.contains("reload_from_view_in_place")
+        })
+        .filter(|(_, info)| !info.demangled.contains("drop_glue"))
+        .map(|(k, _)| k.clone())
+        .collect();
+    let reload_root_count = reload_closure.len();
+    let mut reload_worklist: Vec<String> = reload_closure.iter().cloned().collect();
+    while let Some(sym) = reload_worklist.pop() {
+        if let Some(info) = fns.get(&sym) {
+            for callee in &info.callees {
+                if reload_closure.insert(callee.clone()) {
+                    reload_worklist.push(callee.clone());
+                }
+            }
+        }
+    }
+    assert!(reload_root_count >= 3 && !reload_closure.is_empty());
+    let mut reload_reloc_violations = Vec::new();
+    for fn_key in &reload_closure {
+        if let Some(info) = fns.get(fn_key) {
+            for (target, line) in &info.relocs {
+                if is_forbidden_rt_reloc(target) {
+                    reload_reloc_violations.push(format!("{}: {line}", info.demangled));
+                }
+            }
+        }
+    }
+    assert!(
+        reload_reloc_violations.is_empty(),
+        "Zero-alloc/zero-drop reload reloc violations:\n{}",
+        reload_reloc_violations.join("\n")
+    );
     assert!(
         crate_reloc_violations.is_empty(),
         "REQ-6.2 forbidden libm relocations:\n{}",

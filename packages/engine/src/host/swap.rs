@@ -261,16 +261,14 @@ pub fn realtime_engine_swap(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
     use crate::schema::DnamJsonHeader;
-    use alloc::vec;
+    use crate::test_support::build_test_dnam_container;
     use alloc::vec::Vec;
     use proptest::prelude::*;
 
     fn build_minimal_container() -> Vec<u8> {
         let mut header = DnamJsonHeader::default_reference();
-        let arena = vec![0_u8; ARENA_OFFSET_ULTRA_END as usize];
-        build_dnam_container(&mut header, &arena, &arena, false).unwrap()
+        build_test_dnam_container(&mut header, Tier::Ultra, false)
     }
 
     #[test]

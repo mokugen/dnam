@@ -12,6 +12,7 @@ repository = "https://github.com/dnam-project/dnam"
 
 [workspace.dependencies]
 dnam-kernels = { path = "packages/kernels", default-features = false }
+dnam-vm = { path = "packages/vm", default-features = false }
 dnam-engine = { path = "packages/engine", default-features = true }
 dnam-capture = { path = "packages/capture", default-features = false }
 dnam-fixtures = { path = "packages/fixtures" }

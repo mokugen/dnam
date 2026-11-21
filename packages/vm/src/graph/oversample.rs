@@ -9,7 +9,7 @@ pub mod bounce4x;
 
 use core::mem::{align_of, offset_of, size_of};
 
-pub use bounce4x::{Bounce4xOversampler, OFFLINE_BOUNCE_PDC_SAMPLES};
+pub use bounce4x::{Bounce4xDecimator, Bounce4xOversampler, OFFLINE_BOUNCE_PDC_SAMPLES};
 
 use crate::bin::{CrossbarWire, SONA_META_OS_EXT_PRESENT};
 use crate::math::{

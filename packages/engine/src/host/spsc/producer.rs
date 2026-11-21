@@ -5,7 +5,8 @@ use alloc::string::String;
 use alloc::sync::Arc;
 use core::sync::atomic::{Ordering, fence};
 
-use crate::container::ZohRescaledParams;
+use dnam_vm::ZohRateContext;
+
 use crate::dynamic::DynamicDnamEngine;
 use crate::engine::{TempoSyncState, resolve_preset_batch_by_id};
 use crate::schema::{DnamError, TempoSubdivision};
@@ -463,20 +464,6 @@ impl ControlProducer {
         self.push_lane2_or_latch(epoch, ControlCommand::SetBypass { bypassed, trails });
     }
 
-    /// Engages or disengages Unitary Spectral Freeze via Lane 2.
-    pub fn set_freeze(&mut self, freeze: bool) {
-        let epoch = self.allocate_epoch();
-        self.shadow.set_freeze(freeze);
-        self.push_lane2_or_latch(epoch, ControlCommand::SetFreeze { frozen: freeze });
-    }
-
-    /// Sets continuous Unitary Spectral Freeze amount $\alpha_{\text{freeze}} \in [0.0, 1.0]$ via Lane 2.
-    pub fn set_freeze_amount(&mut self, alpha: f32) {
-        let epoch = self.allocate_epoch();
-        self.shadow.set_freeze_amount(alpha);
-        self.push_lane2_or_latch(epoch, ControlCommand::SetFreezeAmount { alpha });
-    }
-
     /// Sets Mid/Side stereo width $\alpha_{\text{width}} \in [0.0, 2.0]$ via Lane 2.
     pub fn set_stereo_width(&mut self, width: f32) {
         let epoch = self.allocate_epoch();
@@ -537,16 +524,14 @@ impl ControlProducer {
         }
         let epoch = self.allocate_epoch();
         self.shadow.offline_bounce = enabled;
-        let oversample_factor = if enabled { 4 } else { 1 };
-        let (r_ac_tr, r_dc_tr, tau_ref_tr, switch_xfade_tr) = self.shadow.training_zoh_poles;
-        if let Some(new_zoh) = ZohRescaledParams::compute_oversampled_opt(
-            self.shadow.sample_rate_train_hz,
-            self.shadow.sample_rate_hz,
-            oversample_factor,
-            r_ac_tr,
-            r_dc_tr,
-            tau_ref_tr,
-            switch_xfade_tr,
+        let eff_tier = self.shadow.effective_tier();
+        let tier_os2x = self.shadow.tier_os2x[eff_tier as usize];
+        if let Ok(new_zoh) = ZohRateContext::compute(
+            self.shadow.ref_sample_rate_hz,
+            self.shadow.sample_rate_hz as f32,
+            eff_tier,
+            tier_os2x,
+            enabled,
         ) {
             self.shadow.zoh = new_zoh;
         }
@@ -564,21 +549,20 @@ impl ControlProducer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
     use crate::host::spsc::spsc_control_channel;
-    use crate::math::BackendKind;
     use crate::schema::{
         ControlCalibration, ControlCalibrationRole, ControlKind, ControlSchemaDef, ControlUiHints,
         DnamJsonHeader, PresetDef,
     };
+    use crate::test_support::build_test_dnam_container;
     use alloc::collections::BTreeMap;
     use alloc::vec;
     use alloc::vec::Vec;
+    use dnam_vm::math::BackendKind;
     use proptest::prelude::*;
 
     fn build_producer_test_container() -> Vec<u8> {
         let mut header = DnamJsonHeader::default_reference();
-        header.io_config.capabilities.supports_freeze = true;
         let cond_bounds = vec![crate::container::wire::StructuredConditionalBound {
             when: vec![(String::from("channel"), String::from("Clean"))],
             min: None,
@@ -658,8 +642,7 @@ mod tests {
             controls: p1,
             user_metadata: BTreeMap::new(),
         }];
-        let arena = vec![0_u8; ARENA_OFFSET_ULTRA_END as usize];
-        build_dnam_container(&mut header, &arena, &arena, false).unwrap()
+        build_test_dnam_container(&mut header, Tier::Ultra, false)
     }
 
     #[test]
@@ -723,8 +706,6 @@ mod tests {
         assert_eq!(cnt, 1);
 
         producer.set_bypass(true, true);
-        producer.set_freeze(true);
-        producer.set_freeze_amount(0.2);
         producer.set_stereo_width(1.5);
         producer.configure_host_mix_and_leveling(0.8, -1.0, true);
         producer.set_max_supported_tier(Tier::Full);

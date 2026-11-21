@@ -170,16 +170,16 @@ function checkCargoAndMoonBoundaries(): void {
   const engineCargo = fs.readFileSync(path.join(PACKAGES_DIR, "engine", "Cargo.toml"), "utf8");
   expect(engineCargo).not.toMatch(fixturesRefRe);
   expect(engineCargo).not.toMatch(
-    /dnam[-_](?:capture|trainer)|packages\/(?:capture|trainer)|\.\.\/(?:capture|trainer)/,
+    /dnam[-_](?:capture|train(?:er)?)|packages\/(?:capture|train(?:er)?)|\.\.\/(?:capture|train(?:er)?)/,
   );
   expect(fs.readFileSync(path.join(PACKAGES_DIR, "fixtures", "moon.yml"), "utf8")).toMatch(
     /^dependsOn:\s*\[\]\s*$/m,
   );
   const engineMoon = fs.readFileSync(path.join(PACKAGES_DIR, "engine", "moon.yml"), "utf8");
   expect(engineMoon).toMatch(
-    /^dependsOn:\s*(?:\[\]|\[\s*"kernels"\s*\]|\n\s*-\s*"?kernels"?\s*)$/m,
+    /^dependsOn:\s*(?:\[\s*"kernels"\s*,\s*"vm"\s*\]|\[\s*"vm"\s*,\s*"kernels"\s*\]|\n\s*-\s*"?kernels"?\s*\n\s*-\s*"?vm"?\s*)$/m,
   );
-  expect(engineMoon).not.toContain("fixtures");
+  expect(engineMoon).not.toMatch(/\b(?:fixtures|capture|train(?:er)?)\b/);
 
   const captureCargo = fs.readFileSync(path.join(PACKAGES_DIR, "capture", "Cargo.toml"), "utf8");
   let foundFixturesDev = false;
@@ -368,12 +368,18 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
       "utf8",
     );
     expect(constRuleText).toContain("ref[repo.code.constant-eval-and-derivations]");
-    const constEvalSrc = fs.readFileSync(
-      path.join(PACKAGES_DIR, "engine", "src", "math", "const_eval.rs"),
-      "utf8",
-    );
-    expect(constEvalSrc).toContain("pub const fn");
-    expect(constEvalSrc).toContain("const _: () = assert!(");
+    for (const constEvalPath of [
+      path.join(PACKAGES_DIR, "vm", "src", "math", "const_eval.rs"),
+      path.join(PACKAGES_DIR, "kernels", "src", "simd", "const_eval.rs"),
+    ]) {
+      const constEvalSrc = fs.readFileSync(constEvalPath, "utf8");
+      expect(constEvalSrc, `${relPath(constEvalPath)} missing pub const fn`).toContain(
+        "pub const fn",
+      );
+      expect(constEvalSrc, `${relPath(constEvalPath)} missing compile-time assert`).toContain(
+        "const _: () = assert!(",
+      );
+    }
     expect(
       fs.readFileSync(path.join(PACKAGES_DIR, "capture", "src", "solver", "progress.rs"), "utf8"),
     ).toContain("pub const PROGRESS_WIRE_BYTES: usize = PROGRESS_WIRE_WORDS * 4;");

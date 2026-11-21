@@ -125,7 +125,7 @@ impl TempoSubdivision {
     #[inline]
     pub fn delay_ms_at_bpm(self, bpm: f32) -> f32 {
         let safe_bpm = bpm.clamp(20.0, 400.0);
-        let inv_bpm = crate::math::newton6_reciprocal_f64(safe_bpm as f64);
+        let inv_bpm = dnam_vm::math::newton6_reciprocal_f64(safe_bpm as f64);
         ((60_000.0 * inv_bpm) as f32) * self.beat_multiplier()
     }
 
@@ -134,7 +134,7 @@ impl TempoSubdivision {
     pub fn lfo_hz_at_bpm(self, bpm: f32) -> f32 {
         let safe_bpm = bpm.clamp(20.0, 400.0);
         let denom = 60.0 * (self.beat_multiplier() as f64);
-        ((safe_bpm as f64) * crate::math::newton6_reciprocal_f64(denom)) as f32
+        ((safe_bpm as f64) * dnam_vm::math::newton6_reciprocal_f64(denom)) as f32
     }
 }
 

@@ -191,11 +191,39 @@ pub enum TransportExtStorage<'a> {
     F32(ColdBuf<'a, f32>),
 }
 
+/// Parameters for owned quad external delay ring headroom allocation (`feature = "alloc"`).
+#[cfg(feature = "alloc")]
+#[derive(Clone, Copy, Debug)]
+pub struct ExtRingAllocSpec {
+    /// Transport quad index (`0..=3`).
+    pub quad_idx: usize,
+    /// Minimum inverse oversample / sample-rate ratio used to size frame capacity.
+    pub rho_vm: f64,
+    /// Header-declared maximum `48 kHz` delay in samples.
+    pub declared_max_delay_48k: u32,
+    /// Minimum header external ring `pow2` frame count (`<= 19`).
+    pub ext_ring_pow2_frames: u8,
+    /// Active runtime frame capacity (`None` uses computed minimum).
+    pub active_cap: Option<usize>,
+    /// Pre-allocated reload headroom frames (`fp16[4]`).
+    pub min_fp16_frames: usize,
+    /// Pre-allocated reload headroom frames (`f32[4]`).
+    pub min_f32_frames: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExtStorageMode {
+    None,
+    Fp16,
+    F32,
+}
+
 /// External cold delay ring + 32-bit hold counters for a transport quad (`HAS_EXT != 0`).
 #[derive(Debug)]
 pub struct TransportExtRing<'a> {
-    /// Backing ring storage (`None`, `Fp16`, or `F32`).
-    pub storage: TransportExtStorage<'a>,
+    mode: ExtStorageMode,
+    fp16_buf: ColdBuf<'a, u16>,
+    f32_buf: ColdBuf<'a, f32>,
     /// Power-of-two frame capacity (`128..=524_288`).
     pub cap: usize,
     /// Bitmask `cap - 1` for division-free power-of-two wrap.
@@ -209,7 +237,9 @@ impl<'a> TransportExtRing<'a> {
     #[inline]
     pub const fn none() -> Self {
         Self {
-            storage: TransportExtStorage::None,
+            mode: ExtStorageMode::None,
+            fp16_buf: ColdBuf::Borrowed(&mut []),
+            f32_buf: ColdBuf::Borrowed(&mut []),
             cap: TRANSPORT_INLINE_QUAD0_CAP,
             mask: TRANSPORT_INLINE_QUAD0_CAP - 1,
             ext_we_hold_off: [0; 4],
@@ -225,7 +255,9 @@ impl<'a> TransportExtRing<'a> {
         }
         buf.as_mut_slice()[..req].fill(0);
         Ok(Self {
-            storage: TransportExtStorage::Fp16(buf),
+            mode: ExtStorageMode::Fp16,
+            fp16_buf: buf,
+            f32_buf: ColdBuf::Borrowed(&mut []),
             cap,
             mask: cap - 1,
             ext_we_hold_off: [0; 4],
@@ -241,11 +273,62 @@ impl<'a> TransportExtRing<'a> {
         }
         buf.as_mut_slice()[..req].fill(0.0);
         Ok(Self {
-            storage: TransportExtStorage::F32(buf),
+            mode: ExtStorageMode::F32,
+            fp16_buf: ColdBuf::Borrowed(&mut []),
+            f32_buf: buf,
             cap,
             mask: cap - 1,
             ext_we_hold_off: [0; 4],
         })
+    }
+
+    /// Binds `!alloc` borrowed `fp16` / `f32` slices, preserving both buffers in place for
+    /// zero-allocation reloads.
+    pub fn from_borrowed_parts(
+        fp16_slice: &'a mut [u16],
+        f32_slice: &'a mut [f32],
+        has_ext: bool,
+        want_f32: bool,
+        cap: usize,
+    ) -> Result<Self, VmError> {
+        if !has_ext {
+            return Ok(Self {
+                mode: ExtStorageMode::None,
+                fp16_buf: ColdBuf::borrowed(fp16_slice),
+                f32_buf: ColdBuf::borrowed(f32_slice),
+                cap: TRANSPORT_INLINE_QUAD0_CAP,
+                mask: TRANSPORT_INLINE_QUAD0_CAP - 1,
+                ext_we_hold_off: [0; 4],
+            });
+        }
+        let req = validated_ext_len(cap)?;
+        if want_f32 {
+            if f32_slice.len() < req {
+                return Err(VmError::InsufficientBackingCapacity);
+            }
+            f32_slice[..req].fill(0.0);
+            Ok(Self {
+                mode: ExtStorageMode::F32,
+                fp16_buf: ColdBuf::borrowed(fp16_slice),
+                f32_buf: ColdBuf::borrowed(f32_slice),
+                cap,
+                mask: cap - 1,
+                ext_we_hold_off: [0; 4],
+            })
+        } else {
+            if fp16_slice.len() < req {
+                return Err(VmError::InsufficientBackingCapacity);
+            }
+            fp16_slice[..req].fill(0);
+            Ok(Self {
+                mode: ExtStorageMode::Fp16,
+                fp16_buf: ColdBuf::borrowed(fp16_slice),
+                f32_buf: ColdBuf::borrowed(f32_slice),
+                cap,
+                mask: cap - 1,
+                ext_we_hold_off: [0; 4],
+            })
+        }
     }
 
     /// Allocates owned cold storage sized via [`compute_quad_ext_requirements`] (`feature = "alloc"`).
@@ -257,52 +340,175 @@ impl<'a> TransportExtRing<'a> {
         declared_max_delay_48k: u32,
         ext_ring_pow2_frames: u8,
     ) -> Result<Self, VmError> {
-        let (has_ext, cap) = compute_quad_ext_requirements(
+        Self::new_owned_with_headroom(
             quad,
-            quad_idx,
-            rho_vm,
-            declared_max_delay_48k,
-            ext_ring_pow2_frames,
-        );
-        if !has_ext {
-            Ok(Self::none())
-        } else if (quad.flags & TRANSPORT_FLAG_EXT_F32) != 0 {
-            Self::from_f32_buf(ColdBuf::Owned(vec![0.0_f32; cap * 4]), cap)
-        } else {
-            Self::from_fp16_buf(ColdBuf::Owned(vec![0_u16; cap * 4]), cap)
-        }
+            &ExtRingAllocSpec {
+                quad_idx,
+                rho_vm,
+                declared_max_delay_48k,
+                ext_ring_pow2_frames,
+                active_cap: None,
+                min_fp16_frames: 0,
+                min_f32_frames: 0,
+            },
+        )
     }
 
-    /// Returns `true` when external storage is allocated (`Fp16` or `F32`).
+    /// Allocates owned cold storage for a quad with optional reload headroom frames (`fp16` / `f32`).
+    #[cfg(feature = "alloc")]
+    pub fn new_owned_with_headroom(
+        quad: &TransportQuadWire,
+        spec: &ExtRingAllocSpec,
+    ) -> Result<Self, VmError> {
+        let (has_ext, cap_req) = compute_quad_ext_requirements(
+            quad,
+            spec.quad_idx,
+            spec.rho_vm,
+            spec.declared_max_delay_48k,
+            spec.ext_ring_pow2_frames,
+        );
+        let want_f32 = (quad.flags & TRANSPORT_FLAG_EXT_F32) != 0;
+        let run_cap = spec.active_cap.unwrap_or(cap_req);
+        let f32_frames = if has_ext && want_f32 {
+            cap_req.max(run_cap).max(spec.min_f32_frames)
+        } else {
+            spec.min_f32_frames
+        };
+        let fp16_frames = if has_ext && !want_f32 {
+            cap_req.max(run_cap).max(spec.min_fp16_frames)
+        } else {
+            spec.min_fp16_frames
+        };
+        if !has_ext && f32_frames == 0 && fp16_frames == 0 {
+            return Ok(Self::none());
+        }
+        let fp16_buf = if fp16_frames > 0 {
+            ColdBuf::Owned(vec![0_u16; fp16_frames * 4])
+        } else {
+            ColdBuf::Borrowed(&mut [])
+        };
+        let f32_buf = if f32_frames > 0 {
+            ColdBuf::Owned(vec![0.0_f32; f32_frames * 4])
+        } else {
+            ColdBuf::Borrowed(&mut [])
+        };
+        if !has_ext {
+            return Ok(Self {
+                mode: ExtStorageMode::None,
+                fp16_buf,
+                f32_buf,
+                cap: TRANSPORT_INLINE_QUAD0_CAP,
+                mask: TRANSPORT_INLINE_QUAD0_CAP - 1,
+                ext_we_hold_off: [0; 4],
+            });
+        }
+        let _ = validated_ext_len(run_cap)?;
+        let mode = if want_f32 {
+            ExtStorageMode::F32
+        } else {
+            ExtStorageMode::Fp16
+        };
+        Ok(Self {
+            mode,
+            fp16_buf,
+            f32_buf,
+            cap: run_cap,
+            mask: run_cap - 1,
+            ext_we_hold_off: [0; 4],
+        })
+    }
+
+    /// Returns `true` when external storage is active (`Fp16` or `F32`).
     #[inline]
     pub const fn is_external(&self) -> bool {
-        !matches!(self.storage, TransportExtStorage::None)
+        !matches!(self.mode, ExtStorageMode::None)
     }
 
     /// Returns `true` when external storage uses `32-bit` `f32` frames rather than `fp16` / none.
     #[inline(always)]
     #[must_use]
     pub const fn is_f32_storage(&self) -> bool {
-        matches!(self.storage, TransportExtStorage::F32(_))
+        matches!(self.mode, ExtStorageMode::F32)
     }
 
-    /// Returns allocated backing capacity in frames (`0` when [`TransportExtStorage::None`]).
+    /// Returns `(fp16_ptr, f32_ptr)` base addresses across active/dormant buffers (`0` if unbacked).
+    #[inline]
+    pub fn backing_storage_addrs(&self) -> (usize, usize) {
+        let fp16 = if self.fp16_buf.is_empty() {
+            0
+        } else {
+            self.fp16_buf.as_slice().as_ptr() as usize
+        };
+        let f32_addr = if self.f32_buf.is_empty() {
+            0
+        } else {
+            self.f32_buf.as_slice().as_ptr() as usize
+        };
+        (fp16, f32_addr)
+    }
+
+    /// Returns active backing capacity in frames (`0` when [`ExtStorageMode::None`]).
     #[inline]
     pub fn backing_frame_capacity(&self) -> usize {
-        match &self.storage {
-            TransportExtStorage::None => 0,
-            TransportExtStorage::Fp16(buf) => buf.len() >> 2,
-            TransportExtStorage::F32(buf) => buf.len() >> 2,
+        match self.mode {
+            ExtStorageMode::None => 0,
+            ExtStorageMode::Fp16 => self.fp16_buf.len() >> 2,
+            ExtStorageMode::F32 => self.f32_buf.len() >> 2,
         }
+    }
+
+    /// Returns available frame capacity for `want_f32` (`0` if unbacked for that format).
+    #[inline]
+    pub fn backing_frame_capacity_for(&self, want_f32: bool) -> usize {
+        if want_f32 {
+            self.f32_buf.len() >> 2
+        } else {
+            self.fp16_buf.len() >> 2
+        }
+    }
+
+    /// Deactivates active external mode while preserving backing buffers in place (`0` drops/allocs).
+    #[inline]
+    pub fn deactivate_preserving_storage(&mut self) {
+        self.mode = ExtStorageMode::None;
+        self.cap = TRANSPORT_INLINE_QUAD0_CAP;
+        self.mask = TRANSPORT_INLINE_QUAD0_CAP - 1;
+        self.ext_we_hold_off = [0; 4];
+    }
+
+    /// Reconfigures active external ring format and frame capacity in-place (`0` alloc, `0` drop).
+    pub fn reconfigure_for_reload(
+        &mut self,
+        has_ext: bool,
+        want_f32: bool,
+        new_cap: usize,
+    ) -> Result<(), VmError> {
+        if !has_ext {
+            self.deactivate_preserving_storage();
+            return Ok(());
+        }
+        let _ = validated_ext_len(new_cap)?;
+        if self.backing_frame_capacity_for(want_f32) < new_cap {
+            return Err(VmError::InsufficientBackingCapacity);
+        }
+        self.mode = if want_f32 {
+            ExtStorageMode::F32
+        } else {
+            ExtStorageMode::Fp16
+        };
+        self.cap = new_cap;
+        self.mask = new_cap - 1;
+        self.reset();
+        Ok(())
     }
 
     /// Validates backing capacity for `new_cap` frames, updates `cap`/`mask`, and zeroes state.
     pub fn reconfigure_cap(&mut self, new_cap: usize) -> Result<(), VmError> {
         let req = validated_ext_len(new_cap)?;
-        let has_cap = match &self.storage {
-            TransportExtStorage::None => false,
-            TransportExtStorage::Fp16(buf) => buf.len() >= req,
-            TransportExtStorage::F32(buf) => buf.len() >= req,
+        let has_cap = match self.mode {
+            ExtStorageMode::None => false,
+            ExtStorageMode::Fp16 => self.fp16_buf.len() >= req,
+            ExtStorageMode::F32 => self.f32_buf.len() >= req,
         };
         if !has_cap {
             return Err(VmError::InsufficientBackingCapacity);
@@ -313,19 +519,21 @@ impl<'a> TransportExtRing<'a> {
         Ok(())
     }
 
-    /// Clears ring contents and `ext_we_hold_off` while preserving capacity/format.
+    /// Clears active ring contents and `ext_we_hold_off` while preserving capacity/format.
     #[inline]
     pub fn reset(&mut self) {
         let req = self.cap * 4;
-        match &mut self.storage {
-            TransportExtStorage::None => {}
-            TransportExtStorage::Fp16(buf) => {
-                let len = buf.len().min(req);
-                buf.as_mut_slice()[..len].fill(0);
+        match self.mode {
+            ExtStorageMode::None => {}
+            ExtStorageMode::Fp16 => {
+                let s = self.fp16_buf.as_mut_slice();
+                let len = s.len().min(req);
+                s[..len].fill(0);
             }
-            TransportExtStorage::F32(buf) => {
-                let len = buf.len().min(req);
-                buf.as_mut_slice()[..len].fill(0.0);
+            ExtStorageMode::F32 => {
+                let s = self.f32_buf.as_mut_slice();
+                let len = s.len().min(req);
+                s[..len].fill(0.0);
             }
         }
         self.ext_we_hold_off = [0; 4];
@@ -335,15 +543,16 @@ impl<'a> TransportExtRing<'a> {
     #[inline(always)]
     pub fn read_lane_tap(&self, frame_idx: usize, lane: usize) -> f32 {
         let slot = ((frame_idx & self.mask) * 4) + (lane & 3);
-        match &self.storage {
-            TransportExtStorage::None => 0.0,
-            TransportExtStorage::Fp16(buf) => buf
+        match self.mode {
+            ExtStorageMode::None => 0.0,
+            ExtStorageMode::Fp16 => self
+                .fp16_buf
                 .as_slice()
                 .get(slot)
                 .copied()
                 .map(fp16_to_f32)
                 .unwrap_or(0.0),
-            TransportExtStorage::F32(buf) => buf.as_slice().get(slot).copied().unwrap_or(0.0),
+            ExtStorageMode::F32 => self.f32_buf.as_slice().get(slot).copied().unwrap_or(0.0),
         }
     }
 
@@ -362,10 +571,10 @@ impl<'a> TransportExtRing<'a> {
         let i1 = ((base & self.mask) * 4) + l;
         let i2 = ((base.wrapping_add(1) & self.mask) * 4) + l;
         let i3 = ((base.wrapping_add(2) & self.mask) * 4) + l;
-        match &self.storage {
-            TransportExtStorage::None => [0.0; 4],
-            TransportExtStorage::Fp16(buf) => {
-                let s = buf.as_slice();
+        match self.mode {
+            ExtStorageMode::None => [0.0; 4],
+            ExtStorageMode::Fp16 => {
+                let s = self.fp16_buf.as_slice();
                 let words = [
                     s.get(i0).copied().unwrap_or(0),
                     s.get(i1).copied().unwrap_or(0),
@@ -374,8 +583,8 @@ impl<'a> TransportExtRing<'a> {
                 ];
                 B::fp16x4_to_f32x4(&words)
             }
-            TransportExtStorage::F32(buf) => {
-                let s = buf.as_slice();
+            ExtStorageMode::F32 => {
+                let s = self.f32_buf.as_slice();
                 [
                     s.get(i0).copied().unwrap_or(0.0),
                     s.get(i1).copied().unwrap_or(0.0),
@@ -402,10 +611,10 @@ impl<'a> TransportExtRing<'a> {
     #[inline(always)]
     pub fn write_frame(&mut self, wr: u32, vals: [f32; 4]) -> bool {
         let base = ((wr as usize) & self.mask) * 4;
-        match &mut self.storage {
-            TransportExtStorage::None => false,
-            TransportExtStorage::Fp16(buf) => {
-                let s = buf.as_mut_slice();
+        match self.mode {
+            ExtStorageMode::None => false,
+            ExtStorageMode::Fp16 => {
+                let s = self.fp16_buf.as_mut_slice();
                 if base + 4 > s.len() {
                     return false;
                 }
@@ -417,8 +626,8 @@ impl<'a> TransportExtRing<'a> {
                 }
                 sat
             }
-            TransportExtStorage::F32(buf) => {
-                let s = buf.as_mut_slice();
+            ExtStorageMode::F32 => {
+                let s = self.f32_buf.as_mut_slice();
                 if base + 4 > s.len() {
                     return false;
                 }
@@ -456,6 +665,8 @@ mod tests {
         wire
     }
 
+    /// verify[dsp.op-t.ring.branchless-wrap]
+    /// verify[dsp.op-t.ring.capacity]
     #[test]
     fn test_quad_ext_sizing_boundaries_and_fail_closed() {
         let q0_inline = base_wire([53.0, 67.0, 79.0, 120.0], [0; 4], 0);
@@ -496,6 +707,8 @@ mod tests {
         );
     }
 
+    /// verify[dsp.op-t.guard.fp16-decay]
+    /// verify[dsp.op-t.ring.fp16-saturation]
     #[test]
     fn test_fp16_rtz_saturation_and_subnormal_decay_to_zero() {
         assert_eq!(f32_to_fp16_rtz_with_sat(65_504.0), (0x7BFF, false));

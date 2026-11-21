@@ -295,6 +295,7 @@ mod tests {
     use super::*;
     use crate::math::const_abs_f32;
 
+    /// verify[dsp.ctrl.dispatch.modulation-laws]
     #[test]
     fn test_transport_and_sensory_laws_bounds_and_freeze_taper() {
         // Opposite-sign pre-clamp (`tank_psi_delta` clamped to `[-pi, +pi]` before summing `base_psi`).

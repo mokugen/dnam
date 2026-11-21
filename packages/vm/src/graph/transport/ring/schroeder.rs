@@ -91,8 +91,28 @@ impl<'a> PartitionedSchroederBank<'a> {
         quad: &TransportQuadWire,
         rho_vm: f64,
     ) -> Result<Self, VmError> {
+        if (quad.flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) == 0 {
+            return Ok(Self {
+                buf,
+                cap_per_lane: 0,
+                mask: 0,
+                write_pos: 0,
+                delays: [0; 4],
+                allpass_g: [0.0; 4],
+            });
+        }
         let (delays, allpass_g, cap_per_lane, req_len) =
             compute_schroeder_requirements(quad, rho_vm);
+        if req_len == 0 || cap_per_lane == 0 {
+            return Ok(Self {
+                buf,
+                cap_per_lane: 0,
+                mask: 0,
+                write_pos: 0,
+                delays: [0; 4],
+                allpass_g: [0.0; 4],
+            });
+        }
         if buf.len() < req_len {
             return Err(VmError::InsufficientBackingCapacity);
         }
@@ -120,8 +140,37 @@ impl<'a> PartitionedSchroederBank<'a> {
     /// Allocates owned Schroeder storage sized for `(quad, rho_vm)` (`feature = "alloc"`).
     #[cfg(feature = "alloc")]
     pub fn new_owned_for_quad(quad: &TransportQuadWire, rho_vm: f64) -> Result<Self, VmError> {
-        let (_, _, _, req_len) = compute_schroeder_requirements(quad, rho_vm);
-        Self::from_cold_buf(ColdBuf::Owned(vec![0.0_f32; req_len]), quad, rho_vm)
+        Self::new_owned_with_capacity(0, quad, rho_vm)
+    }
+
+    /// Allocates owned Schroeder storage with at least `min_f32_len` headroom (`feature = "alloc"`).
+    #[cfg(feature = "alloc")]
+    pub fn new_owned_with_capacity(
+        min_f32_len: usize,
+        quad: &TransportQuadWire,
+        rho_vm: f64,
+    ) -> Result<Self, VmError> {
+        let req_len = if (quad.flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) == 0 {
+            0
+        } else {
+            compute_schroeder_requirements(quad, rho_vm).3
+        };
+        let cap = req_len.max(min_f32_len);
+        if cap == 0 {
+            Ok(Self::disabled())
+        } else {
+            Self::from_cold_buf(ColdBuf::Owned(vec![0.0_f32; cap]), quad, rho_vm)
+        }
+    }
+
+    /// Deactivates all-pass diffusion while preserving backing capacity for future reload (`0` drops).
+    #[inline]
+    pub fn deactivate_preserving_storage(&mut self) {
+        self.cap_per_lane = 0;
+        self.mask = 0;
+        self.write_pos = 0;
+        self.delays = [0; 4];
+        self.allpass_g = [0.0; 4];
     }
 
     /// Returns per-lane power-of-two ring capacity (`0` when disabled).
@@ -134,6 +183,16 @@ impl<'a> PartitionedSchroederBank<'a> {
     #[inline]
     pub fn backing_f32_capacity(&self) -> usize {
         self.buf.len()
+    }
+
+    /// Returns the cold buffer base address (`0` if empty) for reload pointer stability checks.
+    #[inline]
+    pub fn backing_storage_addr(&self) -> usize {
+        if self.buf.is_empty() {
+            0
+        } else {
+            self.buf.as_slice().as_ptr() as usize
+        }
     }
 
     /// Returns converted integer delays per lane (`0` means clean bypass on that lane).
@@ -173,6 +232,10 @@ impl<'a> PartitionedSchroederBank<'a> {
         }
         let (delays, allpass_g, cap_per_lane, req_len) =
             compute_schroeder_requirements(quad, rho_vm);
+        if req_len == 0 || cap_per_lane == 0 {
+            self.deactivate_preserving_storage();
+            return Ok(());
+        }
         if self.buf.len() < req_len {
             return Err(VmError::InsufficientBackingCapacity);
         }
@@ -250,6 +313,8 @@ mod tests {
         wire
     }
 
+    /// verify[dsp.op-t.diffuser.partition]
+    /// verify[dsp.op-t.diffuser.recurrence]
     #[test]
     fn test_schroeder_bypass_energy_preservation_and_fail_closed() {
         let q_mix = base_wire([53.0; 4], [0, 17, 0, 31], TRANSPORT_FLAG_SCHROEDER_ENABLE);

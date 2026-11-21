@@ -282,6 +282,8 @@ mod tests {
     use zerocopy::FromZeros;
     use zerocopy::byteorder::little_endian::{F32, U16};
 
+    /// verify[dsp.op-t.transition.dual-mode]
+    /// verify[dsp.op-t.window.m1-delay]
     #[test]
     fn test_tapered_ramp_spans_mu_freeze_blend_and_full_hold_freeze() {
         let mut inline_ring = [[0_u16; 4]; TRANSPORT_INLINE_QUAD0_CAP];

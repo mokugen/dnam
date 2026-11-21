@@ -6,6 +6,6 @@ Implements Layer 2 pole-angle phase coding and Layer 3 `Role A = 0` `EMR` Tardos
 
 | File | Responsibility | Canonical Spec (SSOT) |
 | :--- | :--- | :--- |
-| [`sona_gauge.rs`](sona_gauge.rs) | Layer 1 `0-ULP` 40-lane `SONA` (`TPT-SVF`/`ParaLRU`/`PolyADAA1`) sign-flip gauge | [`watermarking_and_marketplace.md`](../../../../../docs/specs/security/watermarking_and_marketplace.md) |
+| [`sona_gauge.rs`](sona_gauge.rs) | Layer 1 0-ULP 40-lane SONA (`TPT-SVF`/`ParaLRU`/`PolyADAA1`) sign-flip gauge | [`watermarking_and_marketplace.md`](../../../../../docs/specs/security/watermarking_and_marketplace.md) |
 | [`phase.rs`](phase.rs) | Layer 2 pole-angle phase coding and black-box `Z_phase` scoring | [`watermarking_and_marketplace.md`](../../../../../docs/specs/security/watermarking_and_marketplace.md) |
-| [`tardos.rs`](tardos.rs) ([`layout_7680.rs`](tardos/layout_7680.rs)) | Layer 3 two-seed `EMR` Tardos codebook, envelopes, and colluder scoring | [`watermarking_and_marketplace.md`](../../../../../docs/specs/security/watermarking_and_marketplace.md) |
+| [`tardos.rs`](tardos.rs) ([`layout_7680.rs`](tardos/layout_7680.rs), [`buyer_reframe.rs`](tardos/buyer_reframe.rs)) | Layer 3 two-seed `EMR` Tardos codebook (5,807 Role B slots), colluder scoring, and buyer `dbin_prefix` re-framing | [`watermarking_and_marketplace.md`](../../../../../docs/specs/security/watermarking_and_marketplace.md) |

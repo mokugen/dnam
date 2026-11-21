@@ -495,6 +495,7 @@ pub(super) fn populate_crossbar_and_core_quads<B: GraphBackend>(
 mod tests {
     use super::*;
 
+    /// verify[dsp.zoh.core-paralru]
     #[test]
     fn test_rescale_tpt_svf_and_op_n_pre_zoh_scaling() {
         assert_eq!(rescale_tpt_svf_g_zoh(0.25, 1.0), 0.25);

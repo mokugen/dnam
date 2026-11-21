@@ -191,6 +191,207 @@ pub(crate) fn ulp_distance_f64(a: f64, b: f64) -> u64 {
 }
 
 #[cfg(test)]
+pub(crate) fn build_test_dnam_bin(
+    max_tier: crate::types::Tier,
+    ref_sr_hz: u32,
+    header_flags: u16,
+    controls: &[dnam_vm::bin::ControlClampDescriptorWire],
+    tsyn: &[dnam_vm::bin::TempoSyncEntryWire],
+    passthrough: bool,
+) -> alloc::vec::Vec<u8> {
+    use dnam_vm::bin::{
+        Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, DnamBinBuildInput,
+        encode_dnam_bin,
+    };
+    use zerocopy::FromZeros;
+    use zerocopy::byteorder::little_endian::{F32, U16};
+
+    let mut a0 = DnamBinBuildInput::default_arena0_lite();
+    let tier_mask: u16 = match max_tier {
+        crate::types::Tier::Lite => 0x0001,
+        crate::types::Tier::Full => 0x0003,
+        crate::types::Tier::Pro => 0x0007,
+        crate::types::Tier::Ultra => 0x000F,
+    };
+    a0.crossbar.cell_desc.tier_flags = U16::new(tier_mask);
+    if passthrough {
+        a0.linear_readout_lite.direct_s2_u_gain = [F32::new(1.0), F32::new(1.0)];
+    }
+    let a1 = Arena1FullDeltaWire::new_zeroed();
+    let a2 = Arena2ProDeltaWire::new_zeroed();
+    let a3 = Arena3UltraDeltaWire::new_zeroed();
+    encode_dnam_bin(&DnamBinBuildInput {
+        reference_sample_rate_hz: ref_sr_hz,
+        header_flags,
+        ext_ring_pow2_frames: 0,
+        ext_ring_lines: 0,
+        ext_ring_format: 0,
+        declared_max_delay_48k: 128,
+        dc_blocker_pole_5hz: 0.995,
+        tail_time_ms: 0.0,
+        ro_pole_48k: 0.0,
+        switch_xfade_samples: 128,
+        content_hash_prefix: [0; 8],
+        controls,
+        cp1_overflow: &[],
+        tsyn,
+        cext: None,
+        arena0: &a0,
+        arena1: (max_tier >= crate::types::Tier::Full).then_some(&a1),
+        arena2: (max_tier >= crate::types::Tier::Pro).then_some(&a2),
+        arena3: (max_tier >= crate::types::Tier::Ultra).then_some(&a3),
+    })
+    .expect("valid test dnam-bin")
+}
+
+#[cfg(test)]
+pub(crate) fn build_test_dnam_container_with_arena0_and_dnbn_pol(
+    header: &mut crate::schema::DnamJsonHeader,
+    max_tier: crate::types::Tier,
+    mut a0: dnam_vm::bin::Arena0LiteWire,
+    dnbn_wet_pol_inv: bool,
+) -> alloc::vec::Vec<u8> {
+    use dnam_vm::bin::{
+        Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, DNBN_FLAG_AUTO_UNITY,
+        DNBN_FLAG_SINGLE_INPUT, DNBN_FLAG_STEREO_OUT, DNBN_FLAG_WET_POLARITY_INV,
+        DnamBinBuildInput, encode_dnam_bin,
+    };
+    use zerocopy::FromZeros;
+    use zerocopy::byteorder::little_endian::U16;
+
+    let descriptors = header
+        .compile_clamp_descriptors()
+        .expect("compile test descriptors");
+    let wire_ctrls: alloc::vec::Vec<_> = descriptors.iter().map(|d| d.to_wire()).collect();
+    let mut flags = 0u16;
+    if header.io_config.inputs == 1 {
+        flags |= DNBN_FLAG_SINGLE_INPUT;
+    }
+    if header.io_config.output_mode != "mono" {
+        flags |= DNBN_FLAG_STEREO_OUT;
+    }
+    if dnbn_wet_pol_inv {
+        flags |= DNBN_FLAG_WET_POLARITY_INV;
+    }
+    if header.io_config.leveling.auto_unity_enabled {
+        flags |= DNBN_FLAG_AUTO_UNITY;
+    }
+    let tier_mask: u16 = match max_tier {
+        crate::types::Tier::Lite => 0x0001,
+        crate::types::Tier::Full => 0x0003,
+        crate::types::Tier::Pro => 0x0007,
+        crate::types::Tier::Ultra => 0x000F,
+    };
+    a0.crossbar.cell_desc.tier_flags = U16::new(tier_mask);
+    let a1 = Arena1FullDeltaWire::new_zeroed();
+    let a2 = Arena2ProDeltaWire::new_zeroed();
+    let a3 = Arena3UltraDeltaWire::new_zeroed();
+    let dbin = encode_dnam_bin(&DnamBinBuildInput {
+        reference_sample_rate_hz: header.sample_rate_train_hz,
+        header_flags: flags,
+        ext_ring_pow2_frames: 0,
+        ext_ring_lines: 0,
+        ext_ring_format: 0,
+        declared_max_delay_48k: 128,
+        dc_blocker_pole_5hz: header.transport.dc_blocker_pole,
+        tail_time_ms: header.io_config.tail_time_ms,
+        ro_pole_48k: header.linear_readout.ro_pole_48k,
+        switch_xfade_samples: header.transport.switch_xfade_samples,
+        content_hash_prefix: [0; 8],
+        controls: &wire_ctrls,
+        cp1_overflow: &[],
+        tsyn: &[],
+        cext: None,
+        arena0: &a0,
+        arena1: (max_tier >= crate::types::Tier::Full).then_some(&a1),
+        arena2: (max_tier >= crate::types::Tier::Pro).then_some(&a2),
+        arena3: (max_tier >= crate::types::Tier::Ultra).then_some(&a3),
+    })
+    .expect("encode test dnam-bin");
+    crate::container::build_dnam_container_from_dnam_bin(header, &dbin)
+        .expect("build test dnam container")
+}
+
+#[cfg(test)]
+pub(crate) fn build_test_dnam_container_with_arena0(
+    header: &mut crate::schema::DnamJsonHeader,
+    max_tier: crate::types::Tier,
+    a0: dnam_vm::bin::Arena0LiteWire,
+) -> alloc::vec::Vec<u8> {
+    let pol = header.io_config.capabilities.wet_polarity_inverted;
+    build_test_dnam_container_with_arena0_and_dnbn_pol(header, max_tier, a0, pol)
+}
+
+#[cfg(test)]
+pub(crate) fn build_test_dnam_container(
+    header: &mut crate::schema::DnamJsonHeader,
+    max_tier: crate::types::Tier,
+    passthrough: bool,
+) -> alloc::vec::Vec<u8> {
+    use dnam_vm::bin::DnamBinBuildInput;
+    use zerocopy::byteorder::little_endian::F32;
+
+    let mut a0 = DnamBinBuildInput::default_arena0_lite();
+    if passthrough {
+        a0.linear_readout_lite.direct_s2_u_gain = [F32::new(1.0), F32::new(1.0)];
+    }
+    build_test_dnam_container_with_arena0(header, max_tier, a0)
+}
+
+#[cfg(test)]
+pub(crate) fn build_spatial_test_dnam_container_with_dnbn_polarity(
+    header: &mut crate::schema::DnamJsonHeader,
+    max_tier: crate::types::Tier,
+    dnbn_wet_pol_inv: bool,
+) -> alloc::vec::Vec<u8> {
+    use dnam_kernels::f32_to_fp16;
+    use dnam_vm::bin::DnamBinBuildInput;
+    use zerocopy::byteorder::little_endian::{F32, U16};
+
+    header.io_config.tail_time_ms = header.io_config.tail_time_ms.max(120.0);
+    if header.linear_readout.ro_pole_48k == 0.0 {
+        header.linear_readout.ro_pole_48k = 0.99;
+    }
+    let mut a0 = DnamBinBuildInput::default_arena0_lite();
+    a0.core_quads[0].in_mid_weight_fp16 = [0.6, 0.3, 0.0, 0.0].map(|v| U16::new(f32_to_fp16(v)));
+    a0.core_quads[0].in_side_weight_fp16 =
+        [0.25, -0.15, 0.0, 0.0].map(|v| U16::new(f32_to_fp16(v)));
+    a0.core_quads[0].svf_g = [0.28; 4].map(F32::new);
+    a0.core_quads[0].svf_k_fp16 = [U16::new(f32_to_fp16(0.707)); 4];
+    a0.core_quads[0].adaa_drive_fp16 = [U16::new(f32_to_fp16(1.2)); 4];
+    a0.core_quads[0].tone_lp_fp16 = [U16::new(f32_to_fp16(0.4)); 4];
+    a0.core_quads[0].tone_dir_fp16 = [U16::new(f32_to_fp16(0.8)); 4];
+    a0.core_quads[0].lru_alpha_rel = [0.2; 4].map(F32::new);
+    a0.core_quads[0].lru_alpha_atk = [0.9; 4].map(F32::new);
+    a0.core_quads[0].lru_kappa_fp16 = [U16::new(f32_to_fp16(0.25)); 4];
+    a0.conv_fir_lite.fir_l[0] = F32::new(0.75);
+    a0.conv_fir_lite.fir_r[0] = F32::new(0.65);
+    a0.conv_fir_lite.fir_l[1] = F32::new(0.15);
+    a0.conv_fir_lite.fir_r[1] = F32::new(-0.1);
+    a0.linear_readout_lite.direct_s2_u_gain = [F32::new(0.8), F32::new(0.7)];
+    a0.linear_readout_lite.w_ro_fp16[0] = U16::new(f32_to_fp16(0.4));
+    a0.linear_readout_lite.w_ro_fp16[1] = U16::new(f32_to_fp16(0.3));
+    a0.linear_readout_lite.w_ro_fp16[6] = U16::new(f32_to_fp16(0.5));
+    a0.linear_readout_lite.w_ro_fp16[7] = U16::new(f32_to_fp16(0.45));
+    a0.transport_lite.delay_samples = [4.0, 7.0, 11.0, 15.0].map(F32::new);
+    a0.transport_lite.g_loop = F32::new(0.55);
+    a0.transport_lite.input_gains_fp16 = [0.5, 0.35, -0.25, 0.3].map(|v| U16::new(f32_to_fp16(v)));
+    a0.transport_lite.wet_tap_l_fp16 = [0.4, -0.25, 0.3, 0.15].map(|v| U16::new(f32_to_fp16(v)));
+    a0.transport_lite.wet_tap_r_fp16 = [-0.25, 0.45, 0.15, 0.3].map(|v| U16::new(f32_to_fp16(v)));
+    a0.control_bus_lite.tank_dry_mix_fp16 = U16::new(f32_to_fp16(0.75));
+    build_test_dnam_container_with_arena0_and_dnbn_pol(header, max_tier, a0, dnbn_wet_pol_inv)
+}
+
+#[cfg(test)]
+pub(crate) fn build_spatial_test_dnam_container(
+    header: &mut crate::schema::DnamJsonHeader,
+    max_tier: crate::types::Tier,
+) -> alloc::vec::Vec<u8> {
+    let pol = header.io_config.capabilities.wet_polarity_inverted;
+    build_spatial_test_dnam_container_with_dnbn_polarity(header, max_tier, pol)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

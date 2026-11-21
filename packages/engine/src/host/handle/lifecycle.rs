@@ -3,12 +3,13 @@
 
 use alloc::sync::Arc;
 
-use crate::container::ZohRescaledParams;
+use dnam_vm::ZohRateContext;
+use dnam_vm::math::BackendKind;
+
 use crate::dynamic::DynamicDnamEngine;
 use crate::host::spsc::spsc_control_channel;
 use crate::host::swap::realtime_engine_swap;
 use crate::host::telemetry::{RawTelemetryRecord, TelemetryReader, telemetry_channel};
-use crate::math::BackendKind;
 use crate::provenance::VerificationStatus;
 use crate::schema::{DnamError, DnamProtectionProfile};
 use crate::types::{DnamTelemetrySnapshot, Tier};
@@ -96,8 +97,7 @@ impl DnamHostHandle {
             merged.snapshot.z_head = audio_rec.snapshot.z_head;
             merged.snapshot.env_states = audio_rec.snapshot.env_states;
             merged.snapshot.lfo_harmonics = audio_rec.snapshot.lfo_harmonics;
-            merged.snapshot.overflow_or_saturation_flags =
-                audio_rec.snapshot.overflow_or_saturation_flags;
+            merged.snapshot.saturation_flags = audio_rec.snapshot.saturation_flags;
             merged
         } else {
             audio_rec
@@ -210,9 +210,9 @@ impl DnamHostHandle {
         self.telemetry_record().sample_rate_hz
     }
 
-    /// Returns the active [`ZohRescaledParams`] wait-free.
+    /// Returns the active [`ZohRateContext`] wait-free.
     #[inline]
-    pub fn zoh(&self) -> ZohRescaledParams {
+    pub fn zoh(&self) -> ZohRateContext {
         self.telemetry_record().zoh
     }
 
@@ -271,16 +271,15 @@ impl DnamHostHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
+    use crate::engine::OFFLINE_BOUNCE_PDC_SAMPLES;
     use crate::schema::DnamJsonHeader;
-    use alloc::vec;
+    use crate::test_support::build_test_dnam_container;
     use alloc::vec::Vec;
     use proptest::prelude::*;
 
     fn build_lifecycle_container() -> Vec<u8> {
         let mut header = DnamJsonHeader::default_reference();
-        let arena = vec![0_u8; ARENA_OFFSET_ULTRA_END as usize];
-        build_dnam_container(&mut header, &arena, &arena, false).unwrap()
+        build_test_dnam_container(&mut header, Tier::Ultra, false)
     }
 
     #[test]
@@ -330,7 +329,7 @@ mod tests {
         host.set_maximize_tier_on_bounce(false);
         assert!(host.offline_bounce());
         assert!(!host.maximize_tier_on_bounce());
-        assert_eq!(host.latency_samples(), 12);
+        assert_eq!(host.latency_samples(), OFFLINE_BOUNCE_PDC_SAMPLES);
 
         host.set_sample_rate(96_000).unwrap();
         assert_eq!(host.sample_rate_hz(), 96_000);
@@ -384,7 +383,10 @@ mod tests {
             prop_assert_eq!(host.max_supported_tier(), max_sup);
             prop_assert_eq!(host.offline_bounce(), bounce);
             prop_assert_eq!(host.maximize_tier_on_bounce(), max_on_bounce);
-            prop_assert_eq!(host.latency_samples(), if bounce { 12 } else { 0 });
+            prop_assert_eq!(
+                host.latency_samples(),
+                if bounce { OFFLINE_BOUNCE_PDC_SAMPLES } else { 0 }
+            );
         }
     }
 }

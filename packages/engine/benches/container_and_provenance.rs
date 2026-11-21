@@ -1,57 +1,27 @@
-//! Container Framing, ZOH Rescaling & Provenance Criterion Benchmarks (`benches/container_and_provenance.rs`).
-//!
-//! Benchmarks zero-copy `.dnam` container parsing, CRC32C verification, `validate_tensor_directory_slice`,
-//! `ZohRescaledParams::compute`, in-place hot-swap model reloading, 224-D structural hashing,
-//! Cabinet gauge-invariant modal fingerprinting, and `HMAC-SHA256` watermark seed derivation.
+//! Container Framing, Embedded `.dnam-bin` Extraction, ZOH Rescaling & Provenance Criterion
+//! Benchmarks (`benches/container_and_provenance.rs`).
 
-use std::collections::BTreeMap;
+#[path = "../tests/sona_test_support/arena_builder.rs"]
+mod arena_builder;
+
 use std::hint::black_box;
 
-use dnam_engine::container::{
-    ARENA_OFFSET_LITE_END, ARENA_OFFSET_ULTRA_END, DnamContainerView, ZohRescaledParams,
-    build_dnam_container,
-};
-use dnam_engine::graph::sona_core::SonaMatryoshkaModel;
-use dnam_engine::graph::topology::validate_tensor_directory_slice;
-use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
-use dnam_engine::math::DefaultMathBackend;
+use arena_builder::build_sona_extended_container;
+use dnam_engine::container::DnamContainerView;
 use dnam_engine::memory::{AlignedBuffer, CacheLine64};
 use dnam_engine::provenance::security::{
     WatermarkSeedScope, derive_watermark_seed_hmac_sha256,
     extract_cabinet_tier_fingerprint_component,
 };
 use dnam_engine::provenance::{DefaultCryptoProvider, extract_structural_hash_224d};
-use dnam_engine::schema::{ControlKind, ControlSchemaDef, ControlUiHints, DnamJsonHeader};
-use dnam_engine::{DnamEngine, Tier};
+use dnam_engine::{DnamEngine, Tier, extract_dnam_bin};
+use dnam_vm::ZohRateContext;
+use dnam_vm::bin::DnamBinView;
+use dnam_vm::math::DefaultMathBackend;
 use hotpath::criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 fn make_bench_container() -> AlignedBuffer<CacheLine64> {
-    let mut header = DnamJsonHeader::default_reference();
-    header.metadata.name = "Container & Provenance Benchmark Model".to_string();
-    header.controls_schema = vec![ControlSchemaDef {
-        id: "gain".to_string(),
-        name: "Gain".to_string(),
-        kind: ControlKind::Range,
-        unit: Some("%".to_string()),
-        lobatto_degree: Some(2),
-        anchor_nodes_norm: Some(vec![0.0, -1.0, 1.0]),
-        declared_range: Some([0.0, 1.0]),
-        safe_clamped_range: Some([0.0, 1.0]),
-        default: serde_json::json!(0.5),
-        conditional_bounds: Vec::new(),
-        represented_switch_options: None,
-        declared_options: None,
-        active_options: None,
-        clamp_warning: None,
-        ui_hints: ControlUiHints::default(),
-        calibration: None,
-        user_metadata: BTreeMap::new(),
-    }];
-
-    let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    let model = SonaMatryoshkaModel::dual_rate_default(false);
-    pack_sona_matryoshka_to_arena(&model, &mut arena);
-    let raw = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+    let raw = build_sona_extended_container(false, false);
     let mut aligned = AlignedBuffer::<CacheLine64>::new_zeroed(raw.len() / 64);
     aligned.as_bytes_mut().copy_from_slice(&raw);
     aligned
@@ -71,29 +41,25 @@ fn bench_container_and_zoh(c: &mut Criterion) {
         });
     });
 
-    group.bench_function("validate_tensor_directory_slice", |b| {
+    group.bench_function("extract_and_bind_dnam_bin", |b| {
         b.iter(|| {
-            let valid = validate_tensor_directory_slice(
-                black_box(0),
-                black_box(4096),
-                black_box(ARENA_OFFSET_LITE_END as usize),
-            );
-            black_box(valid)
+            let dbin = extract_dnam_bin(black_box(container.as_bytes())).unwrap();
+            let bin_view = DnamBinView::bind_prevalidated(dbin).unwrap();
+            black_box(bin_view.retained_tier)
         });
     });
 
     group.bench_function("zoh_compute_96khz", |b| {
         b.iter(|| {
-            let rescaled = ZohRescaledParams::compute(
-                black_box(48_000),
-                black_box(96_000),
-                0.9993,
-                0.995,
-                64.0,
-                128,
+            let rescaled = ZohRateContext::compute(
+                black_box(48_000.0),
+                black_box(96_000.0),
+                Tier::Full,
+                true,
+                false,
             )
             .unwrap();
-            black_box(rescaled.r_dc_host)
+            black_box(rescaled.k_ctrl)
         });
     });
 

@@ -451,8 +451,16 @@ mod tests {
 
     use super::*;
 
+    /// verify[dsp.ctrl.accum.anova-fm]
+    /// verify[dsp.ctrl.accum.exact-int]
+    /// verify[dsp.ctrl.ledger.memory-compute]
+    /// verify[dsp.ctrl.op-n.engine]
+    /// verify[dsp.op-n.ctrl.fm-interaction]
+    /// verify[dsp.op-n.ctrl.incremental-update]
     #[test]
     fn test_exact_int_cancellation_and_order_invariance() {
+        assert_eq!(EXACT_SUM_WORDS, 9);
+        assert_eq!(EXACT_SQUARE_WORDS, 18);
         let mut a = ExactIntFactorAccumulator::new(4);
         let mut b = ExactIntFactorAccumulator::new(4);
         let pos = (1.0e18_f32).to_bits();
@@ -524,6 +532,7 @@ mod tests {
     }
 
     proptest! {
+        /// verify[dsp.ctrl.accum.exact-int]
         #[test]
         fn prop_exact_int_permutation_and_zero_return_invariant(
             v in prop::array::uniform4(-1.0e12_f32..1.0e12_f32),

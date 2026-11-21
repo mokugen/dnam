@@ -8,14 +8,14 @@ pub mod dynamic;
 use dnam_kernels::QUAD_FLAG_HOST_WRITE_LOCK;
 
 use crate::bin::DnamBinView;
-#[cfg(feature = "alloc")]
-use crate::graph::slab::hydrate_slab_owned;
 use crate::graph::slab::{
-    SonaHotSlab, SonaSlabBacking, hydrate_slab_from_dnam_bin, process_block_sona,
-    reset_to_dc_equilibrium, retime_sample_rate, set_offline_bounce, set_op_t_write_enable,
-    set_quad_write_enable, step_control_tick_3khz, step_frame_4x_sona, step_frame_sona,
-    switch_tier,
+    SonaHotSlab, SonaSlabBacking, check_reload_slab_capacity, hydrate_slab_from_dnam_bin,
+    process_block_sona, reload_slab_from_dnam_bin_in_place, reset_to_dc_equilibrium,
+    retime_sample_rate, set_offline_bounce, set_op_t_write_enable, set_quad_write_enable,
+    step_control_tick_3khz, step_frame_4x_sona, step_frame_sona, switch_tier,
 };
+#[cfg(feature = "alloc")]
+use crate::graph::slab::{VmReloadHeadroom, hydrate_slab_owned_with_headroom};
 use crate::graph::{Bounce4xOversampler, GraphBackend};
 use crate::math::{DefaultMathBackend, saturation_flags};
 use crate::types::{FtzDazGuard, Tier, VmError};
@@ -117,8 +117,92 @@ impl<'a, B: GraphBackend> SonaVm<'a, B> {
         host_rate_hz: f32,
         offline_bounce: bool,
     ) -> Result<SonaVm<'static, B>, VmError> {
-        let slab = hydrate_slab_owned(view, active_tier, host_rate_hz, offline_bounce)?;
+        Self::from_view_owned_with_headroom(
+            view,
+            active_tier,
+            host_rate_hz,
+            offline_bounce,
+            VmReloadHeadroom::zero(),
+        )
+    }
+
+    /// Parses, CRC-verifies, and heap-hydrates a `.dnam-bin` payload with pre-allocated reload
+    /// capacity headroom (`feature = "alloc"`).
+    #[cfg(feature = "alloc")]
+    pub fn open_dnam_bin_with_headroom_owned(
+        bytes: &[u8],
+        active_tier: Tier,
+        host_rate_hz: f32,
+        headroom: VmReloadHeadroom,
+    ) -> Result<SonaVm<'static, B>, VmError> {
+        let view = DnamBinView::parse(bytes)?;
+        SonaVm::<B>::from_view_owned_with_headroom(
+            &view,
+            active_tier,
+            host_rate_hz,
+            false,
+            headroom,
+        )
+    }
+
+    /// Heap-hydrates a [`SonaVm`] from `view` with explicit [`VmReloadHeadroom`] (`feature = "alloc"`).
+    #[cfg(feature = "alloc")]
+    pub fn from_view_owned_with_headroom(
+        view: &DnamBinView<'_>,
+        active_tier: Tier,
+        host_rate_hz: f32,
+        offline_bounce: bool,
+        headroom: VmReloadHeadroom,
+    ) -> Result<SonaVm<'static, B>, VmError> {
+        let slab = hydrate_slab_owned_with_headroom(
+            view,
+            active_tier,
+            host_rate_hz,
+            offline_bounce,
+            headroom,
+        )?;
         Ok(SonaVm { slab })
+    }
+
+    /// Validates backing capacities and wire parameters required for an in-place reload without
+    /// mutating any VM or slab state.
+    #[inline]
+    pub fn check_reload_capacity(
+        &self,
+        view: &DnamBinView<'_>,
+        active_tier: Tier,
+        host_rate_hz: f32,
+        offline_bounce: bool,
+    ) -> Result<(), VmError> {
+        check_reload_slab_capacity(&self.slab, view, active_tier, host_rate_hz, offline_bounce)
+    }
+
+    /// Returns the latest frame's pre-spatial core `[L, R]` vs transport wet `[L, R]` partition
+    /// (`core_lr[ch] + wet_lr[ch] ~= out[ch]`).
+    #[inline]
+    #[must_use]
+    pub fn last_wdw_partition(&self) -> ([f32; 2], [f32; 2]) {
+        let cold = self.slab.cold();
+        (cold.last_core_lr, cold.last_transport_wet_lr)
+    }
+
+    /// Reloads a new validated `.dnam-bin` model in-place with zero heap allocations and zero
+    /// deallocations (works on both `!alloc` borrowed slabs and owned headroom slabs).
+    #[inline(never)]
+    pub fn reload_from_view_in_place(
+        &mut self,
+        view: &DnamBinView<'_>,
+        active_tier: Tier,
+        host_rate_hz: f32,
+        offline_bounce: bool,
+    ) -> Result<(), VmError> {
+        reload_slab_from_dnam_bin_in_place(
+            &mut self.slab,
+            view,
+            active_tier,
+            host_rate_hz,
+            offline_bounce,
+        )
     }
 
     /// Processes a stereo audio block under hardware `FTZ`/`DAZ` + `RNE` protection (`#[inline(never)]`).
@@ -495,6 +579,277 @@ mod tests {
             )
             .unwrap();
             assert_eq!(pre_out, vm_owned.step_frame(0.1, -0.1).unwrap());
+        }
+    }
+
+    fn build_wdw_test_lite_bin(
+        header_flags: u16,
+        controls: &[crate::bin::ControlClampDescriptorWire],
+    ) -> ([u8; 128 + 4_608 + 512], usize) {
+        use crate::math::f32_to_fp16;
+        use zerocopy::byteorder::little_endian::{F32, U16};
+
+        let mut a0 = DnamBinBuildInput::default_arena0_lite();
+        a0.core_quads[0].in_mid_weight_fp16 =
+            [0.6, 0.3, 0.0, 0.0].map(|v| U16::new(f32_to_fp16(v)));
+        a0.core_quads[0].in_side_weight_fp16 =
+            [0.25, -0.15, 0.0, 0.0].map(|v| U16::new(f32_to_fp16(v)));
+        a0.core_quads[0].svf_g = [0.28; 4].map(F32::new);
+        a0.core_quads[0].svf_k_fp16 = [U16::new(f32_to_fp16(0.707)); 4];
+        a0.core_quads[0].adaa_drive_fp16 = [U16::new(f32_to_fp16(1.2)); 4];
+        a0.core_quads[0].tone_lp_fp16 = [U16::new(f32_to_fp16(0.4)); 4];
+        a0.core_quads[0].tone_dir_fp16 = [U16::new(f32_to_fp16(0.8)); 4];
+        a0.core_quads[0].lru_alpha_rel = [0.2; 4].map(F32::new);
+        a0.core_quads[0].lru_alpha_atk = [0.9; 4].map(F32::new);
+        a0.core_quads[0].lru_kappa_fp16 = [U16::new(f32_to_fp16(0.25)); 4];
+        a0.conv_fir_lite.fir_l[0] = F32::new(0.75);
+        a0.conv_fir_lite.fir_r[0] = F32::new(0.65);
+        a0.conv_fir_lite.fir_l[1] = F32::new(0.15);
+        a0.conv_fir_lite.fir_r[1] = F32::new(-0.1);
+        a0.linear_readout_lite.direct_s2_u_gain = [F32::new(0.8), F32::new(0.7)];
+        a0.linear_readout_lite.w_ro_fp16[0] = U16::new(f32_to_fp16(0.4));
+        a0.linear_readout_lite.w_ro_fp16[1] = U16::new(f32_to_fp16(0.3));
+        a0.linear_readout_lite.w_ro_fp16[6] = U16::new(f32_to_fp16(0.5));
+        a0.linear_readout_lite.w_ro_fp16[7] = U16::new(f32_to_fp16(0.45));
+        a0.transport_lite.delay_samples = [8.0, 11.0, 14.0, 19.0].map(F32::new);
+        a0.transport_lite.g_loop = F32::new(0.45);
+        a0.transport_lite.input_gains_fp16 =
+            [0.5, 0.35, -0.25, 0.3].map(|v| U16::new(f32_to_fp16(v)));
+        a0.transport_lite.wet_tap_l_fp16 =
+            [0.35, -0.2, 0.25, 0.15].map(|v| U16::new(f32_to_fp16(v)));
+        a0.transport_lite.wet_tap_r_fp16 =
+            [-0.2, 0.4, 0.15, 0.25].map(|v| U16::new(f32_to_fp16(v)));
+        a0.control_bus_lite.tank_dry_mix_fp16 = U16::new(f32_to_fp16(0.75));
+        let input = DnamBinBuildInput {
+            reference_sample_rate_hz: 48_000,
+            header_flags,
+            ext_ring_pow2_frames: 0,
+            ext_ring_lines: 0,
+            ext_ring_format: 0,
+            declared_max_delay_48k: 128,
+            dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
+            tail_time_ms: 100.0,
+            ro_pole_48k: 0.99,
+            switch_xfade_samples: 0,
+            content_hash_prefix: [7; 8],
+            controls,
+            cp1_overflow: &[],
+            tsyn: &[],
+            cext: None,
+            arena0: &a0,
+            arena1: None,
+            arena2: None,
+            arena3: None,
+        };
+        let mut buf = [0_u8; 128 + 4_608 + 512];
+        let n = encode_dnam_bin_into(&input, &mut buf).unwrap();
+        (buf, n)
+    }
+
+    #[test]
+    fn test_sona_vm_last_wdw_partition_1x_mono_and_4x_bounce() {
+        let (buf_st, n_st) = build_wdw_test_lite_bin(DNBN_FLAG_STEREO_OUT, &[]);
+        let (buf_mo, n_mo) = build_wdw_test_lite_bin(0, &[]);
+
+        // 1x stereo + process_block parity + reset.
+        let mut cold = [SonaColdTail::<DefaultMathBackend>::empty()];
+        let mut descs = [ControlClampDescriptor::empty(); 1];
+        let (mut raw, mut cl, mut norm, mut sw) = ([0.0; 1], [0.0; 1], [0.0; 1], [0; 1]);
+        let mut con = [Cp1ContributorSlot::zero(); 8];
+        let mut fir_ext = [0.0_f32; crate::graph::EXT_FIR_STORAGE_F32_LEN];
+        let ctrl = ControlBusBacking::from_slices(
+            &mut descs,
+            &mut raw,
+            &mut cl,
+            &mut norm,
+            &mut sw,
+            &mut con,
+            &[],
+        )
+        .unwrap();
+        let backing = SonaVmBacking {
+            control_bus: ctrl,
+            convolver_fir_ext: &mut fir_ext,
+            transport_ext_fp16: [&mut [], &mut [], &mut [], &mut []],
+            transport_ext_f32: [&mut [], &mut [], &mut [], &mut []],
+            transport_schroeder: [&mut [], &mut [], &mut [], &mut []],
+            cold_tail: &mut cold,
+        };
+        let mut vm = SonaVm::<DefaultMathBackend>::open_dnam_bin(
+            &buf_st[..n_st],
+            Tier::Lite,
+            48_000.0,
+            backing,
+        )
+        .unwrap();
+        assert_eq!(vm.last_wdw_partition(), ([0.0; 2], [0.0; 2]));
+
+        let (mut max_core, mut max_wet) = (0.0_f32, 0.0_f32);
+        for i in 0..40 {
+            let xl = 0.4 * ((i as f32) * 0.21).sin();
+            let xr = -0.3 * ((i as f32) * 0.17).cos();
+            let (ol, or) = vm.step_frame(xl, xr).unwrap();
+            let (core_lr, wet_lr) = vm.last_wdw_partition();
+            max_core = max_core.max(core_lr[0].abs()).max(core_lr[1].abs());
+            max_wet = max_wet.max(wet_lr[0].abs()).max(wet_lr[1].abs());
+            assert!(((core_lr[0] + wet_lr[0]) - ol).abs() < 1.0e-5);
+            assert!(((core_lr[1] + wet_lr[1]) - or).abs() < 1.0e-5);
+        }
+        assert!(max_core > 1.0e-2 && max_wet > 1.0e-3);
+
+        let in_l = [0.25_f32; 16];
+        let in_r = [-0.2_f32; 16];
+        let (mut out_l, mut out_r) = ([0.0_f32; 16], [0.0_f32; 16]);
+        vm.process_block(&in_l, &in_r, &mut out_l, &mut out_r)
+            .unwrap();
+        let (blk_core, blk_wet) = vm.last_wdw_partition();
+        assert!(((blk_core[0] + blk_wet[0]) - out_l[15]).abs() < 1.0e-5);
+        assert!(((blk_core[1] + blk_wet[1]) - out_r[15]).abs() < 1.0e-5);
+
+        vm.reset();
+        assert_eq!(vm.last_wdw_partition(), ([0.0; 2], [0.0; 2]));
+
+        // 4x offline bounce steady-state partition consistency.
+        vm.set_offline_bounce(true).unwrap();
+        let (mut last_out_l, mut last_out_r) = (0.0_f32, 0.0_f32);
+        for _ in 0..96 {
+            (last_out_l, last_out_r) = vm.step_frame(0.4, -0.25).unwrap();
+        }
+        let (bnc_core, bnc_wet) = vm.last_wdw_partition();
+        assert!(bnc_core[0].abs() > 1.0e-2 && bnc_wet[0].abs() > 1.0e-3);
+        assert!(((bnc_core[0] + bnc_wet[0]) - last_out_l).abs() < 1.0e-5);
+        assert!(((bnc_core[1] + bnc_wet[1]) - last_out_r).abs() < 1.0e-5);
+
+        // mono_out = true folding parity.
+        let view_mo = DnamBinView::parse(&buf_mo[..n_mo]).unwrap();
+        vm.reload_from_view_in_place(&view_mo, Tier::Lite, 48_000.0, false)
+            .unwrap();
+        let (mut mo_max_core, mut mo_max_wet) = (0.0_f32, 0.0_f32);
+        for i in 0..36 {
+            let (ol, or) = vm
+                .step_frame(0.45, -0.15 * ((i as f32) * 0.19).cos())
+                .unwrap();
+            let (core_lr, wet_lr) = vm.last_wdw_partition();
+            assert_eq!(ol.to_bits(), or.to_bits());
+            assert_eq!(core_lr[0].to_bits(), core_lr[1].to_bits());
+            assert_eq!(wet_lr[0].to_bits(), wet_lr[1].to_bits());
+            mo_max_core = mo_max_core.max(core_lr[0].abs());
+            mo_max_wet = mo_max_wet.max(wet_lr[0].abs());
+            assert!(((core_lr[0] + wet_lr[0]) - ol).abs() < 1.0e-5);
+        }
+        assert!(mo_max_core > 1.0e-2 && mo_max_wet > 1.0e-3);
+    }
+
+    #[test]
+    fn test_sona_vm_check_reload_capacity_fail_closed_and_non_mutating() {
+        let (buf_1, n_1) = build_wdw_test_lite_bin(DNBN_FLAG_STEREO_OUT, &[]);
+        let c2 = [
+            ControlClampDescriptor::range(0.0, 1.0, 0.5, 1, [0.0; 3]).to_wire(),
+            ControlClampDescriptor::range(0.0, 1.0, 0.25, 1, [0.0; 3]).to_wire(),
+        ];
+        let (buf_2, n_2) = build_wdw_test_lite_bin(DNBN_FLAG_STEREO_OUT, &c2);
+        let view_1 = DnamBinView::parse(&buf_1[..n_1]).unwrap();
+        let view_2 = DnamBinView::parse(&buf_2[..n_2]).unwrap();
+
+        let (mut cold_a, mut cold_b) = (
+            [SonaColdTail::<DefaultMathBackend>::empty()],
+            [SonaColdTail::<DefaultMathBackend>::empty()],
+        );
+        let (mut d_a, mut d_b) = (
+            [ControlClampDescriptor::empty(); 1],
+            [ControlClampDescriptor::empty(); 1],
+        );
+        let (mut r_a, mut c_a, mut n_a, mut s_a) = ([0.0; 1], [0.0; 1], [0.0; 1], [0; 1]);
+        let (mut r_b, mut c_b, mut n_b, mut s_b) = ([0.0; 1], [0.0; 1], [0.0; 1], [0; 1]);
+        let (mut con_a, mut con_b) = (
+            [Cp1ContributorSlot::zero(); 8],
+            [Cp1ContributorSlot::zero(); 8],
+        );
+        let ctrl_a = ControlBusBacking::from_slices(
+            &mut d_a,
+            &mut r_a,
+            &mut c_a,
+            &mut n_a,
+            &mut s_a,
+            &mut con_a,
+            &[],
+        )
+        .unwrap();
+        let ctrl_b = ControlBusBacking::from_slices(
+            &mut d_b,
+            &mut r_b,
+            &mut c_b,
+            &mut n_b,
+            &mut s_b,
+            &mut con_b,
+            &[],
+        )
+        .unwrap();
+        let mut vm_a = SonaVm::<DefaultMathBackend>::open_dnam_bin(
+            &buf_1[..n_1],
+            Tier::Lite,
+            48_000.0,
+            SonaVmBacking {
+                control_bus: ctrl_a,
+                convolver_fir_ext: &mut [],
+                transport_ext_fp16: [&mut [], &mut [], &mut [], &mut []],
+                transport_ext_f32: [&mut [], &mut [], &mut [], &mut []],
+                transport_schroeder: [&mut [], &mut [], &mut [], &mut []],
+                cold_tail: &mut cold_a,
+            },
+        )
+        .unwrap();
+        let mut vm_b = SonaVm::<DefaultMathBackend>::open_dnam_bin(
+            &buf_1[..n_1],
+            Tier::Lite,
+            48_000.0,
+            SonaVmBacking {
+                control_bus: ctrl_b,
+                convolver_fir_ext: &mut [],
+                transport_ext_fp16: [&mut [], &mut [], &mut [], &mut []],
+                transport_ext_f32: [&mut [], &mut [], &mut [], &mut []],
+                transport_schroeder: [&mut [], &mut [], &mut [], &mut []],
+                cold_tail: &mut cold_b,
+            },
+        )
+        .unwrap();
+
+        for i in 0..8 {
+            let x = 0.2 * ((i as f32) + 1.0) * 0.1;
+            let _ = vm_a.step_frame(x, -x).unwrap();
+            let _ = vm_b.step_frame(x, -x).unwrap();
+        }
+        let snap_before = vm_a.telemetry();
+        let part_before = vm_a.last_wdw_partition();
+
+        assert!(
+            vm_a.check_reload_capacity(&view_1, Tier::Lite, 48_000.0, false)
+                .is_ok()
+        );
+        assert_eq!(
+            vm_a.check_reload_capacity(&view_2, Tier::Lite, 48_000.0, false),
+            Err(VmError::InsufficientBackingCapacity)
+        );
+        assert_eq!(
+            vm_a.check_reload_capacity(&view_1, Tier::Lite, 96_000.0, false),
+            Err(VmError::InsufficientBackingCapacity)
+        );
+        assert_eq!(
+            vm_a.check_reload_capacity(&view_1, Tier::Ultra, 48_000.0, false),
+            Err(VmError::InvalidTier)
+        );
+        assert_eq!(
+            vm_a.check_reload_capacity(&view_1, Tier::Lite, 192_000.0, true),
+            Err(VmError::InvalidSampleRate)
+        );
+        assert_eq!(vm_a.telemetry(), snap_before);
+        assert_eq!(vm_a.last_wdw_partition(), part_before);
+
+        for i in 0..8 {
+            let x = 0.15 * ((i as f32) + 1.0) * 0.1;
+            let (al, ar) = vm_a.step_frame(x, -0.5 * x).unwrap();
+            let (bl, br) = vm_b.step_frame(x, -0.5 * x).unwrap();
+            assert_eq!((al.to_bits(), ar.to_bits()), (bl.to_bits(), br.to_bits()));
         }
     }
 }

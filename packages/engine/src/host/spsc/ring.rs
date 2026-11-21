@@ -18,7 +18,7 @@ pub const SPSC_RING_CAPACITY: usize = 64;
 pub(crate) const SPSC_RING_MASK: usize = SPSC_RING_CAPACITY - 1;
 pub(crate) const MAX_EPOCH_29: u32 = (1 << 29) - 2;
 pub(crate) const FALLBACK_WORDS: usize = 20;
-const TAG_RESET_ENGINE: u8 = 15;
+const TAG_RESET_ENGINE: u8 = 13;
 
 /// Parameter update interpolation mode for Lane 1 (`Slewed` vs `Immediate`).
 #[repr(u8)]
@@ -138,16 +138,6 @@ pub enum ControlCommand {
         /// Whether wet reverb/delay trails continue ringing while bypassed.
         trails: bool,
     },
-    /// Engages or disengages Unitary Spectral Freeze.
-    SetFreeze {
-        /// Whether freeze is engaged.
-        frozen: bool,
-    },
-    /// Sets continuous Unitary Spectral Freeze amount $\alpha_{\text{freeze}} \in [0.0, 1.0]$.
-    SetFreezeAmount {
-        /// Freeze blend factor (`> 0.5` engages freeze).
-        alpha: f32,
-    },
     /// Sets output Mid/Side stereo width $\alpha_{\text{width}} \in [0.0, 2.0]$.
     SetStereoWidth {
         /// Stereo width factor.
@@ -252,28 +242,26 @@ impl RingEntry {
             ControlCommand::SetBypass { bypassed, trails } => {
                 (4, u8::from(bypassed), u16::from(trails), 0.0, 0.0)
             }
-            ControlCommand::SetFreeze { frozen } => (5, u8::from(frozen), 0, 0.0, 0.0),
-            ControlCommand::SetFreezeAmount { alpha } => (6, 0, 0, alpha, 0.0),
-            ControlCommand::SetStereoWidth { width } => (7, 0, 0, width, 0.0),
+            ControlCommand::SetStereoWidth { width } => (5, 0, 0, width, 0.0),
             ControlCommand::ConfigureHostMix {
                 blend_wet,
                 output_gain_db,
                 apply_unity_leveling,
             } => (
-                8,
+                6,
                 u8::from(apply_unity_leveling),
                 0,
                 blend_wet,
                 output_gain_db,
             ),
-            ControlCommand::SetTier { tier } => (9, tier as u8, 0, 0.0, 0.0),
-            ControlCommand::SetMaxSupportedTier { tier } => (10, tier as u8, 0, 0.0, 0.0),
-            ControlCommand::SetOfflineBounce { enabled } => (11, u8::from(enabled), 0, 0.0, 0.0),
+            ControlCommand::SetTier { tier } => (7, tier as u8, 0, 0.0, 0.0),
+            ControlCommand::SetMaxSupportedTier { tier } => (8, tier as u8, 0, 0.0, 0.0),
+            ControlCommand::SetOfflineBounce { enabled } => (9, u8::from(enabled), 0, 0.0, 0.0),
             ControlCommand::SetMaximizeTierOnBounce { enabled } => {
-                (12, u8::from(enabled), 0, 0.0, 0.0)
+                (10, u8::from(enabled), 0, 0.0, 0.0)
             }
-            ControlCommand::ResetControl { index } => (13, 0, index, 0.0, 0.0),
-            ControlCommand::ResetAllControls => (14, 0, 0, 0.0, 0.0),
+            ControlCommand::ResetControl { index } => (11, 0, index, 0.0, 0.0),
+            ControlCommand::ResetAllControls => (12, 0, 0, 0.0, 0.0),
             ControlCommand::ResetEngine => (TAG_RESET_ENGINE, 0, 0, 0.0, 0.0),
         };
         let w0 = ((self.epoch as u64) << 32)
@@ -311,29 +299,25 @@ impl RingEntry {
                 bypassed: arg_u8 != 0,
                 trails: arg_u16 != 0,
             },
-            5 => ControlCommand::SetFreeze {
-                frozen: arg_u8 != 0,
-            },
-            6 => ControlCommand::SetFreezeAmount { alpha: f32_a },
-            7 => ControlCommand::SetStereoWidth { width: f32_a },
-            8 => ControlCommand::ConfigureHostMix {
+            5 => ControlCommand::SetStereoWidth { width: f32_a },
+            6 => ControlCommand::ConfigureHostMix {
                 blend_wet: f32_a,
                 output_gain_db: f32_b,
                 apply_unity_leveling: arg_u8 != 0,
             },
-            9 => ControlCommand::SetTier {
+            7 => ControlCommand::SetTier {
                 tier: Tier::from_u8(arg_u8),
             },
-            10 => ControlCommand::SetMaxSupportedTier {
+            8 => ControlCommand::SetMaxSupportedTier {
                 tier: Tier::from_u8(arg_u8),
             },
-            11 => ControlCommand::SetOfflineBounce {
+            9 => ControlCommand::SetOfflineBounce {
                 enabled: arg_u8 != 0,
             },
-            12 => ControlCommand::SetMaximizeTierOnBounce {
+            10 => ControlCommand::SetMaximizeTierOnBounce {
                 enabled: arg_u8 != 0,
             },
-            13 => ControlCommand::ResetControl { index: arg_u16 },
+            11 => ControlCommand::ResetControl { index: arg_u16 },
             TAG_RESET_ENGINE => ControlCommand::ResetEngine,
             _ => ControlCommand::ResetAllControls,
         };
@@ -373,9 +357,8 @@ const FB_FLAG_OFFLINE_BOUNCE: u16 = 1 << 1;
 const FB_FLAG_MAXIMIZE_ON_BOUNCE: u16 = 1 << 2;
 const FB_FLAG_BYPASSED: u16 = 1 << 3;
 const FB_FLAG_TRAILS: u16 = 1 << 4;
-const FB_FLAG_FROZEN: u16 = 1 << 5;
-const FB_FLAG_HAS_HOST_MIX: u16 = 1 << 6;
-const FB_FLAG_UNITY_LEVELING: u16 = 1 << 7;
+const FB_FLAG_HAS_HOST_MIX: u16 = 1 << 5;
+const FB_FLAG_UNITY_LEVELING: u16 = 1 << 6;
 
 /// Lane 3 overflow-proof full-state fallback snapshot (`FallbackLatch`).
 #[derive(Clone, Copy, Debug)]
@@ -402,8 +385,6 @@ pub struct FallbackSnapshot {
     pub bypassed: bool,
     /// Spillover trails flag.
     pub trails_enabled: bool,
-    /// Unitary Spectral Freeze flag.
-    pub is_frozen: bool,
     /// Stereo width in `[0.0, 2.0]`.
     pub stereo_width: f32,
     /// Optional host mix configuration `(blend_wet, output_gain_db, apply_unity_leveling)`.
@@ -437,9 +418,6 @@ impl FallbackSnapshot {
         }
         if self.trails_enabled {
             flags |= FB_FLAG_TRAILS;
-        }
-        if self.is_frozen {
-            flags |= FB_FLAG_FROZEN;
         }
         let (blend_wet, output_gain_db) = if let Some((bw, og, unity)) = self.host_mix {
             flags |= FB_FLAG_HAS_HOST_MIX;
@@ -503,7 +481,6 @@ impl FallbackSnapshot {
             maximize_tier_on_bounce: (flags & FB_FLAG_MAXIMIZE_ON_BOUNCE) != 0,
             bypassed: (flags & FB_FLAG_BYPASSED) != 0,
             trails_enabled: (flags & FB_FLAG_TRAILS) != 0,
-            is_frozen: (flags & FB_FLAG_FROZEN) != 0,
             stereo_width,
             host_mix,
             current_bpm,
@@ -675,8 +652,6 @@ mod tests {
                 bypassed: true,
                 trails: false,
             },
-            ControlCommand::SetFreeze { frozen: true },
-            ControlCommand::SetFreezeAmount { alpha: 0.75 },
             ControlCommand::SetStereoWidth { width: 1.4 },
             ControlCommand::ConfigureHostMix {
                 blend_wet: 0.8,
@@ -761,7 +736,6 @@ mod tests {
                 maximize_tier_on_bounce: (flags_bits & 4) != 0,
                 bypassed: (flags_bits & 8) != 0,
                 trails_enabled: (flags_bits & 16) != 0,
-                is_frozen: (flags_bits & 32) != 0,
                 stereo_width,
                 host_mix: if has_mix {
                     Some((blend_wet, output_gain_db, unity_lvl))
@@ -779,7 +753,6 @@ mod tests {
             prop_assert_eq!(fb_out.maximize_tier_on_bounce, fb.maximize_tier_on_bounce);
             prop_assert_eq!(fb_out.bypassed, fb.bypassed);
             prop_assert_eq!(fb_out.trails_enabled, fb.trails_enabled);
-            prop_assert_eq!(fb_out.is_frozen, fb.is_frozen);
             prop_assert_eq!(fb_out.host_mix, fb.host_mix);
             prop_assert_eq!(fb_out.tempo_clamp_mask, fb.tempo_clamp_mask);
         }

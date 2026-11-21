@@ -1,4 +1,4 @@
-//! Deterministic M10b fixture builders and `!alloc` stack runners for `dnam-vm` integration suites.
+//! Deterministic SONA v3.0 fixture builders and `!alloc` stack runners for `dnam-vm` integration suites.
 
 #![forbid(unsafe_code)]
 

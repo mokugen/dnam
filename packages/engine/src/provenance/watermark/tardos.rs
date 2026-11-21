@@ -4,16 +4,21 @@
 //!
 //! Canonical Reference: `docs/specs/security/watermarking_and_marketplace.md` (`ref[sec.watermark.tardos-code]`).
 
+pub(crate) mod buyer_reframe;
 pub(crate) mod layout_7680;
 
 use alloc::vec::Vec;
+use core::mem::offset_of;
 use core::ops::Deref;
 
 use dnam_kernels::{f32_to_fp16, fp16_to_f32};
+use dnam_vm::bin::{ARENA_TIER_BYTES, Arena0ControlBusWire, Arena0LiteWire};
 use zerocopy::byteorder::little_endian::{F32, U16, U32};
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::graph::weights::{ARENA_LITE_BYTES, Arena0ControlBusWire};
+const ARENA_LITE_BYTES: usize = ARENA_TIER_BYTES[0];
+const A0_CONTROL_BUS_OFFSET: usize = offset_of!(Arena0LiteWire, control_bus_lite);
+
 use crate::provenance::TARDOS_CASCADE_WEIGHTS;
 use crate::provenance::chacha20::chacha20_block_64b;
 use crate::provenance::security::{WatermarkSeedScope, derive_watermark_seed_hmac_sha256};
@@ -21,6 +26,9 @@ use crate::provenance::sha256::sha256_digest;
 use crate::schema::{DnamError, cold_sqrt_f64};
 
 use super::max_tiers_for_arena_len;
+pub use buyer_reframe::reframe_buyer_container_with_dbin;
+#[cfg(feature = "crypto")]
+pub use buyer_reframe::reframe_buyer_dau1_container_with_dbin;
 pub use layout_7680::{
     TARDOS_CASCADE_RANGES, TARDOS_ULTRA_RESERVE_RANGE, TARDOS_W_READOUT_FP16_RANGES,
 };
@@ -100,7 +108,7 @@ pub fn for_each_tardos_f32_offset_up_to<F: FnMut(usize, usize)>(
     count
 }
 
-/// Visits `(global_idx, byte_offset)` of all `3,364` linear `fp16` (`U16`) Role B carriers in `arena_len`.
+/// Visits `(global_idx, byte_offset)` of all `3,360` linear `fp16` (`U16`) Role B carriers in `arena_len`.
 pub fn for_each_tardos_fp16_offset_up_to<F: FnMut(usize, usize)>(
     arena_len: usize,
     mut f: F,
@@ -119,11 +127,11 @@ pub fn for_each_tardos_fp16_offset_up_to<F: FnMut(usize, usize)>(
     count
 }
 
-/// Maps a Role B global coordinate `global_idx` (`0..5,875`) to `(tier, slot_32, lane_4)`
-/// (`None` for the `64` Role A coordinates and `5,875..7,680` unassigned tail).
+/// Maps a Role B global coordinate `global_idx` (`0..5,871`) to `(tier, slot_32, lane_4)`
+/// (`None` for the `64` Role A coordinates and `5,871..7,680` unassigned tail).
 #[inline]
 pub const fn role_b_head_slot_for_index(global_idx: usize) -> Option<(usize, usize, usize)> {
-    if global_idx >= 5_875 || is_role_a_cascade_index(global_idx) {
+    if global_idx >= 5_871 || is_role_a_cascade_index(global_idx) {
         return None;
     }
     let mut i = 0;
@@ -142,7 +150,7 @@ pub const fn role_b_head_slot_for_index(global_idx: usize) -> Option<(usize, usi
 }
 
 /// Two-Seed Arcsine Tardos Traitor-Tracing Codebook (`7,680` coordinate view across `Arena 0..3`:
-/// `64` Role A zeroed + `5,811` Role B `F32`/`fp16` carriers + `1,805` unassigned `0.0` tail,
+/// `64` Role A zeroed + `5,807` Role B `F32`/`fp16` carriers + `1,809` unassigned `0.0` tail,
 /// `ref[sec.watermark.tardos-code]`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TardosCodebook7680 {
@@ -200,17 +208,20 @@ fn draw_uniform_01_from_chacha_stream(
     ((u as f64) + 0.5) * (1.0 / 4_294_967_296.0)
 }
 
-#[allow(clippy::too_many_arguments)]
+struct TardosTierGenParams<'a> {
+    shared_seed: &'a [u8; 32],
+    buyer_seed: &'a [u8; 32],
+    tau: f64,
+    tau_prime: f64,
+    span: f64,
+}
+
 fn populate_tardos_tier(
     chips: &mut [f32; TARDOS_CASCADE_WEIGHTS],
     accusation_weights: &mut [f32; TARDOS_CASCADE_WEIGHTS],
     start: usize,
     end: usize,
-    shared_seed: &[u8; 32],
-    buyer_seed: &[u8; 32],
-    tau: f64,
-    tau_prime: f64,
-    span: f64,
+    params: &TardosTierGenParams<'_>,
 ) {
     let mut shared_buf = [0u8; 64];
     let mut buyer_buf = [0u8; 64];
@@ -226,20 +237,20 @@ fn populate_tardos_tier(
             continue;
         }
         let u_i = draw_uniform_01_from_chacha_stream(
-            shared_seed,
+            params.shared_seed,
             &mut shared_buf,
             &mut shared_cursor,
             &mut shared_blk,
         );
         let v_ji = draw_uniform_01_from_chacha_stream(
-            buyer_seed,
+            params.buyer_seed,
             &mut buyer_buf,
             &mut buyer_cursor,
             &mut buyer_blk,
         );
-        let phi = tau_prime + span * u_i;
+        let phi = params.tau_prime + params.span * u_i;
         let s = cold_sin_half_pi_f64(phi);
-        let p_i = (s * s).clamp(tau, 1.0 - tau);
+        let p_i = (s * s).clamp(params.tau, 1.0 - params.tau);
 
         if v_ji < p_i {
             chips[idx] = 1.0;
@@ -277,17 +288,14 @@ pub fn generate_tardos_codebook_7680(
         let shared_seed = derive_watermark_seed_hmac_sha256(wm_key, &tier_scope, None)?;
         let buyer_seed =
             derive_watermark_seed_hmac_sha256(wm_key, &tier_scope, Some((license_id, buyer_id)))?;
-        populate_tardos_tier(
-            &mut chips,
-            &mut accusation_weights,
-            start,
-            end,
-            &shared_seed,
-            &buyer_seed,
+        let params = TardosTierGenParams {
+            shared_seed: &shared_seed,
+            buyer_seed: &buyer_seed,
             tau,
             tau_prime,
             span,
-        );
+        };
+        populate_tardos_tier(&mut chips, &mut accusation_weights, start, end, &params);
     }
 
     Ok(TardosCodebook7680 {
@@ -336,7 +344,7 @@ pub fn generate_tardos_code_7680(
 }
 
 /// Computes strictly positive coordinate-space `EMR`-masked perturbation envelopes
-/// $\epsilon_i \in [5 \times 10^{-5},\, 2 \times 10^{-4}]$ across all `5,811` Role B coordinates
+/// $\epsilon_i \in [5 \times 10^{-5},\, 2 \times 10^{-4}]$ across all `5,807` Role B coordinates
 /// (`0.0` on Role A and unassigned tail coordinates, `ref[sec.watermark.tardos-code]`).
 pub fn compute_emr_masked_tardos_envelopes(
     gram_diag_256: &[f64; 256],
@@ -446,7 +454,7 @@ pub fn score_tardos_w_readout_fp16(
 }
 
 /// Embeds **Layer 3 (Prefix-Composable Spread-Spectrum Tardos Watermark)** across all retained
-/// `5,811` Role B `F32` and `fp16` carriers (`Role A` untouched).
+/// `5,807` Role B `F32` and `fp16` carriers (`Role A` untouched).
 pub fn apply_tardos_watermark_7680(
     arena: &mut [u8],
     code: &[f32],
@@ -501,7 +509,7 @@ pub fn score_tardos_watermark_7680(
 }
 
 /// Computes the symmetric Škorić–Tardos Z-score ($\sigma$) of `suspect_arena` against `master_arena`,
-/// inverse-rotating `ctrl_base.w_ctrl[1..16][0..4]` by `Q_buyer^-1` when `q_buyer_4x4` is `Some`.
+/// inverse-rotating `control_bus_lite.w_ctrl[1..16][0..4]` by `Q_buyer^-1` when `q_buyer_4x4` is `Some`.
 pub fn score_tardos_watermark_7680_with_buyer_gauge(
     master_arena: &[u8],
     suspect_arena: &[u8],
@@ -514,11 +522,9 @@ pub fn score_tardos_watermark_7680_with_buyer_gauge(
     let mut active_y2 = 0.0_f64;
 
     let suspect_w_ctrl_opt = q_buyer_4x4.and_then(|_| {
-        Arena0ControlBusWire::ref_from_prefix(
-            suspect_arena.get(crate::graph::weights::ARENA0_CONTROL_BUS_AND_CLAMPS_OFFSET..)?,
-        )
-        .ok()
-        .map(|(cb, _)| cb.w_ctrl)
+        Arena0ControlBusWire::ref_from_prefix(suspect_arena.get(A0_CONTROL_BUS_OFFSET..)?)
+            .ok()
+            .map(|(cb, _)| cb.w_ctrl)
     });
 
     for_each_tardos_f32_offset_up_to(shared_len, |idx, byte_off| {
@@ -647,15 +653,15 @@ mod tests {
         assert_eq!(role_b_head_slot_for_index(655), None);
         assert_eq!(role_b_head_slot_for_index(1_159), None);
         assert_eq!(role_b_head_slot_for_index(3_051), None);
-        assert_eq!(role_b_head_slot_for_index(5_875), None);
+        assert_eq!(role_b_head_slot_for_index(5_871), None);
         assert!(role_b_head_slot_for_index(16).is_some());
         assert!(role_b_head_slot_for_index(383).is_some());
         assert!(role_b_head_slot_for_index(5_619).is_some());
 
         let codebook = generate_tardos_code_7680(&[0u8; 32], "model-x", "lic-y");
         assert_eq!(codebook.as_ref().len(), TARDOS_CASCADE_WEIGHTS);
-        // Verify 5,875..7,680 tail is strictly 0.0
-        for idx in 5_875..TARDOS_CASCADE_WEIGHTS {
+        // Verify 5,871..7,680 tail (and 29_952..29_960 ou_to_z_stage_ultra_fp16[4]) is strictly 0.0
+        for idx in 5_871..TARDOS_CASCADE_WEIGHTS {
             assert_eq!(codebook.chips[idx], 0.0);
             assert_eq!(codebook.accusation_weights[idx], 0.0);
         }

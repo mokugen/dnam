@@ -10,6 +10,57 @@ const ONE_SEVENTH: f32 = 1.0 / 7.0;
 const ONE_NINTH: f32 = 1.0 / 9.0;
 const TWENTY_EIGHT_THIRDS: f32 = 28.0 / 3.0;
 
+/// 2D Quadrature Phase-Space Hysteresis state (`ref[dsp.op-n.hysteresis.quadrature]`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct QuadratureHysteresis2D {
+    /// Previous real-axis quadrature sample `s_re[n - 1]`.
+    pub prev_s_re: f32,
+    /// Cross-axis memory coupling gain (default `0.15`).
+    pub kappa_quad: f32,
+}
+
+impl Default for QuadratureHysteresis2D {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QuadratureHysteresis2D {
+    /// Constructs a resting hysteresis cell initialized at zero (`kappa_quad = 0.15`).
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            prev_s_re: 0.0,
+            kappa_quad: 0.15,
+        }
+    }
+
+    /// Resets lagged quadrature memory to canonical zero equilibrium.
+    #[inline]
+    pub fn reset(&mut self) {
+        self.prev_s_re = 0.0;
+    }
+
+    /// Evaluates one frame of `h[n] = s_re[n] * (s_re[n] - s_re[n-1]) * diff_scale + kappa_quad * s_re[n] * s_im[n]`.
+    #[inline(always)]
+    pub fn step_with_rate(&mut self, s_re: f32, s_im: f32, diff_scale: f32) -> f32 {
+        let s_re_c = crate::simd::scrub_and_flush_f32_bits(s_re);
+        let s_im_c = crate::simd::scrub_and_flush_f32_bits(s_im);
+        let d_c = crate::simd::scrub_and_flush_f32_bits(diff_scale);
+        let delta_re = (s_re_c - self.prev_s_re) * d_c;
+        let hyst = s_re_c * delta_re + self.kappa_quad * s_re_c * s_im_c;
+        self.prev_s_re = s_re_c;
+        crate::simd::scrub_and_flush_f32_bits(hyst)
+    }
+
+    /// Evaluates at native `diff_scale = 1.0`.
+    #[inline(always)]
+    pub fn step(&mut self, s_re: f32, s_im: f32) -> f32 {
+        self.step_with_rate(s_re, s_im, 1.0)
+    }
+}
+
 #[inline(always)]
 fn eval_c2_wf_interior_vec4<V: KernelVec4>(m: V, m2: V, d2: V, max_abs: V) -> (V, V) {
     let zero = V::zero();
@@ -381,5 +432,20 @@ mod tests {
                 ier.to_array().map(f32::to_bits)
             );
         }
+    }
+
+    /// verify[dsp.op-n.hysteresis.quadrature]
+    #[test]
+    fn test_quadrature_hysteresis_2d_step_rate_and_zero_dc() {
+        let mut hyst = QuadratureHysteresis2D::default();
+        assert_eq!(hyst.kappa_quad, 0.15);
+        assert_eq!(hyst.step(-0.0, -0.0).to_bits(), 0);
+        let h1 = hyst.step(0.5, 0.2);
+        assert!((h1 - (0.5 * 0.5 + 0.15 * 0.5 * 0.2)).abs() < 1.0e-6);
+        let h2 = hyst.step(0.8, -0.1);
+        assert!((h2 - (0.8 * 0.3 + 0.15 * 0.8 * (-0.1))).abs() < 1.0e-6);
+        hyst.reset();
+        let h3 = hyst.step_with_rate(0.5, 0.2, 2.0);
+        assert!((h3 - (0.5 * 0.5 * 2.0 + 0.15 * 0.5 * 0.2)).abs() < 1.0e-6);
     }
 }

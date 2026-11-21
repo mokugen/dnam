@@ -789,7 +789,7 @@ describe("DNAM Documentation Registry, Rules, ADRs & Traceability Guardrails", (
   });
 
   it("test_spec_rules_verified_in_tests", () => {
-    const specFirstPendingVerifyRules: ReadonlySet<string> = new Set(["container.dnam.vm-binary"]);
+    const specFirstPendingVerifyRules: ReadonlySet<string> = new Set();
     const rules = collectSpecRules();
     const verifiedIds = new Set(collectTestVerifyTokens().map(([ruleId]) => ruleId));
     for (const pendingId of specFirstPendingVerifyRules) {

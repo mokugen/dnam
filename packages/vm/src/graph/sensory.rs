@@ -357,6 +357,7 @@ mod tests {
         const_tan_f64, f32_to_fp16, sqrt_f64,
     };
 
+    /// verify[dsp.router.lr4-crossover]
     #[test]
     fn test_sensory_quad_layout_and_zero_init_passthrough_0ulp() {
         assert_eq!(size_of::<SensoryQuadHot>(), 48);
@@ -387,6 +388,10 @@ mod tests {
         assert_eq!(yr_nan.to_bits(), 0.25_f32.to_bits());
     }
 
+    /// verify[dsp.op-t.ducking.vca]
+    /// verify[dsp.router.ballistic-envelope-bank]
+    /// verify[dsp.router.modulation-bus]
+    /// verify[dsp.zoh.router-detector]
     #[test]
     fn test_sensory_quad_excitation_vca_clamp_zoh_and_reset() {
         let mut cb = CrossbarWire::new_zeroed();

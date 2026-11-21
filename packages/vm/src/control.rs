@@ -14,8 +14,8 @@ pub use bus::dispatch::{
     control_tick_ratio,
 };
 pub use bus::{
-    ControlBus, ControlBusBacking, DefaultControlBus, step_control_frame_default,
-    step_control_tick_3khz_default,
+    ControlBus, ControlBusBacking, ControlTsynBacking, DefaultControlBus,
+    step_control_frame_default, step_control_tick_3khz_default,
 };
 pub use cp1::{
     Cp1ContributorSlot, count_distinct_contributor_controls, decode_cp1_contributors,
@@ -27,9 +27,11 @@ pub use exact_int::{
     MAX_EXACT_CONTRIBUTORS,
 };
 pub use tempo::{
-    CANONICAL_SUBDIVISION_RATIOS, TempoSyncEvalResult, TempoSyncMode, apply_tsyn_table,
-    eval_3node_calibration_f64, eval_tsyn_row_physical, eval_tsyn_target_value,
-    host_frame_q64_increment, invert_tsyn_lobatto_anchors, subdivision_phase_q32,
+    CANONICAL_SUBDIVISION_RATIOS, ClockTrackerState, OrderedClockPulseTracker, TempoSyncEvalResult,
+    TempoSyncMode, TransportJumpPolicy, apply_tsyn_table, eval_3node_calibration_f64,
+    eval_event_rate_aware_step, eval_tsyn_row_physical, eval_tsyn_target_value,
+    host_frame_q64_increment, invert_tsyn_lobatto_anchors, smooth_relock_q32_tick,
+    subdivision_phase_q32,
 };
 
 pub use crate::math::trust_clip_outward_4d;
@@ -38,6 +40,7 @@ pub use crate::math::trust_clip_outward_4d;
 mod tests {
     use super::*;
 
+    /// verify[dsp.zoh.ctrl-stride]
     #[test]
     fn test_control_stride_values_match_canonical_rates() {
         assert_eq!(control_stride_for_rate(44_100.0), 15);

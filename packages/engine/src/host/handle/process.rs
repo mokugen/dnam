@@ -1,7 +1,6 @@
 //! Sub-block audio rendering (`process_*`) and offline bounce (`render_offline_bounce*`)
 //! for [`DnamHostHandle`] (`ref[dsp.ctrl.op-m.spsc-ingress]`, `ref[arch.telemetry.seqlock-publication]`).
 
-use crate::container::ZohRescaledParams;
 use crate::engine::OFFLINE_BOUNCE_PDC_SAMPLES;
 use crate::host::telemetry::RawTelemetryRecord;
 
@@ -48,7 +47,6 @@ impl DnamHostHandle {
     }
 
     /// Processes a stereo audio block (`Stereo -> Stereo`).
-    #[inline]
     pub fn process_block(
         &self,
         left_in: &[f32],
@@ -92,13 +90,11 @@ impl DnamHostHandle {
 
     /// Processes a stereo audio block in-place (`left_io`, `right_io`), draining SPSC control
     /// updates and publishing telemetry at every sub-block boundary.
-    #[inline]
     pub fn process_block_in_place(&self, left_io: &mut [f32], right_io: &mut [f32]) {
         self.process_block_in_place_chunked(left_io, right_io, None);
     }
 
     /// Processes a stereo audio block (`Stereo -> Stereo`), matching `process_block`.
-    #[inline]
     pub fn process_stereo(
         &self,
         left_in: &[f32],
@@ -143,7 +139,6 @@ impl DnamHostHandle {
     }
 
     /// Processes a stereo audio block into mono (`Stereo -> Mono`).
-    #[inline]
     pub fn process_stereo_to_mono(&self, left_in: &[f32], right_in: &[f32], mono_out: &mut [f32]) {
         self.process_stereo_to_mono_chunked(left_in, right_in, mono_out, None);
     }
@@ -182,7 +177,6 @@ impl DnamHostHandle {
     }
 
     /// Processes a mono audio block into true stereo (`Mono -> Stereo`).
-    #[inline]
     pub fn process_mono_to_stereo(
         &self,
         mono_in: &[f32],
@@ -224,7 +218,6 @@ impl DnamHostHandle {
     }
 
     /// Processes a mono audio block (`Mono -> Mono`).
-    #[inline]
     pub fn process_mono(&self, mono_in: &[f32], mono_out: &mut [f32]) {
         self.process_mono_chunked(mono_in, mono_out, None);
     }
@@ -259,7 +252,6 @@ impl DnamHostHandle {
     }
 
     /// Processes a mono audio buffer in-place (`mono_io`).
-    #[inline]
     pub fn process_mono_in_place(&self, mono_io: &mut [f32]) {
         self.process_mono_in_place_chunked(mono_io, None);
     }
@@ -281,22 +273,8 @@ impl DnamHostHandle {
         let mut prev_max = audio_ctx.swap_audio.engine().maximize_tier_on_bounce();
         let mut prev_bounce = audio_ctx.swap_audio.engine().offline_bounce();
         let mut non_bounce_zoh = if prev_bounce {
-            let (r_ac_tr, r_dc_tr, tau_ref_tr, switch_xfade_tr) =
-                audio_ctx.swap_audio.engine().training_zoh_poles();
-            ZohRescaledParams::compute_oversampled_opt(
-                audio_ctx
-                    .swap_audio
-                    .engine()
-                    .preamble()
-                    .sample_rate_train_hz,
-                audio_ctx.swap_audio.engine().sample_rate_hz(),
-                1,
-                r_ac_tr,
-                r_dc_tr,
-                tau_ref_tr,
-                switch_xfade_tr,
-            )
-            .unwrap_or(*audio_ctx.swap_audio.engine().zoh())
+            let eng = audio_ctx.swap_audio.engine();
+            eng.compute_zoh_for_mode(eng.sample_rate_hz(), false)
         } else {
             *audio_ctx.swap_audio.engine().zoh()
         };
@@ -397,16 +375,17 @@ impl DnamHostHandle {
                     audio_ctx.consumer.drained_causal_epoch(),
                 );
                 rec.offline_bounce = cur_bounce;
+                rec.snapshot.offline_bounce = u8::from(cur_bounce);
                 rec.maximize_tier_on_bounce = cur_max;
                 rec.latency_samples = if cur_bounce {
                     OFFLINE_BOUNCE_PDC_SAMPLES
                 } else {
                     0
                 };
+                rec.snapshot.latency_samples = rec.latency_samples as u32;
                 if !cur_bounce {
                     rec.zoh = non_bounce_zoh;
-                    rec.snapshot.control_decimation_host =
-                        non_bounce_zoh.control_decimation_host as u16;
+                    rec.snapshot.control_decimation_host = non_bounce_zoh.k_ctrl as u16;
                 }
                 let eff_tier = if cur_bounce && cur_max {
                     rec.max_available_tier.min(rec.max_supported_tier)
@@ -459,8 +438,8 @@ impl DnamHostHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
     use crate::schema::DnamJsonHeader;
+    use crate::test_support::build_test_dnam_container;
     use crate::types::Tier;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -468,8 +447,7 @@ mod tests {
 
     fn build_process_test_container() -> Vec<u8> {
         let mut header = DnamJsonHeader::default_reference();
-        let arena = vec![0_u8; ARENA_OFFSET_ULTRA_END as usize];
-        build_dnam_container(&mut header, &arena, &arena, false).unwrap()
+        build_test_dnam_container(&mut header, Tier::Ultra, false)
     }
 
     #[test]

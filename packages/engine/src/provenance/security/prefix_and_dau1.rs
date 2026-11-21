@@ -129,6 +129,25 @@ pub fn build_plaintext_shared_v1(
     out
 }
 
+/// Builds `"DNAM-PLAINTEXT-SHARED-V1"` shared plaintext framing with an optional embedded
+/// Layer 0 `.dnam-bin` prefix (`ref[sec.sig.prefix-delegation]`).
+///
+/// When `dbin_prefix` is non-empty, `encode_domain_field("dbin_prefix", dbin_prefix)` is appended
+/// directly after `shared_model_binary` so both creator `L_master` and buyer `L_buyer` prefix
+/// digests commit to the exact `.dnam-bin` header & routing prefix bytes.
+pub fn build_plaintext_shared_v1_with_dbin(
+    preamble: &[u8],
+    directory: &[u8],
+    shared_binary: &[u8],
+    dbin_prefix: &[u8],
+) -> Vec<u8> {
+    let mut out = build_plaintext_shared_v1(preamble, directory, shared_binary);
+    if !dbin_prefix.is_empty() {
+        out.extend_from_slice(&encode_domain_field("dbin_prefix", dbin_prefix));
+    }
+    out
+}
+
 /// Computes the cumulative per-tier plaintext prefix digests under `domain`
 /// (`b"DNAM-MASTER-PREFIX-V1"` or `b"DNAM-BUYER-PREFIX-V1"`, `ref[sec.sig.prefix-delegation]`).
 pub fn compute_plaintext_prefixes_v1(
@@ -463,11 +482,11 @@ mod spec_tests {
     use crate::provenance::security::Dai1Envelope;
     use crate::provenance::{
         Dau1Envelope, WatermarkSeedScope, build_buyer_receipt_v1, build_creator_manifest_v1,
-        build_plaintext_shared_v1, build_record_nonce_v1, compute_ciphertext_prefixes_v1,
-        compute_creator_signed_manifest_sha256, compute_immutable_header_sha256,
-        compute_license_policy_sha256, compute_plaintext_prefixes_v1,
-        derive_watermark_seed_hmac_sha256, encode_prefix_list, enforce_distribution_policy,
-        parse_prefix_list,
+        build_plaintext_shared_v1, build_plaintext_shared_v1_with_dbin, build_record_nonce_v1,
+        compute_ciphertext_prefixes_v1, compute_creator_signed_manifest_sha256,
+        compute_immutable_header_sha256, compute_license_policy_sha256,
+        compute_plaintext_prefixes_v1, derive_watermark_seed_hmac_sha256, encode_prefix_list,
+        enforce_distribution_policy, parse_prefix_list,
     };
     use crate::schema::{DistributionPolicy, DnamJsonHeader, DnamProtectionProfile};
     use alloc::{string::ToString, vec, vec::Vec};
@@ -661,6 +680,11 @@ mod spec_tests {
                 Some((&[3u8; 16], &[4u8; 16])),
             ).unwrap();
             prop_assert_ne!(s_shared, s_buyer);
+
+            let empty_framed = build_plaintext_shared_v1_with_dbin(b"pre", b"dir", b"shr", &[]);
+            prop_assert_eq!(empty_framed, build_plaintext_shared_v1(b"pre", b"dir", b"shr"));
+            let dbin_framed = build_plaintext_shared_v1_with_dbin(b"pre", b"dir", &[], &[0xAB; 64]);
+            prop_assert_ne!(dbin_framed, build_plaintext_shared_v1(b"pre", b"dir", &[]));
         }
     }
 }

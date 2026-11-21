@@ -424,8 +424,14 @@ impl ControlClampDescriptor {
 mod tests {
     use super::*;
 
+    /// verify[dsp.ctrl.basis.lobatto]
+    /// verify[dsp.ctrl.ledger.memory-compute]
+    /// verify[dsp.ctrl.range.normalize-clamp]
+    /// verify[dsp.ctrl.switch.conditional-batch]
+    /// verify[dsp.op-n.ctrl.lobatto-basis]
     #[test]
     fn test_switch_before_range_conditional_clamping_and_lobatto() {
+        assert_eq!(core::mem::size_of::<ControlClampDescriptor>(), 64);
         let sw = ControlClampDescriptor::switch(3, 0b101, 0);
         let mut rng = ControlClampDescriptor::range(0.0, 10.0, 5.0, 3, [0.0, -1.0, 1.0]);
         rng.cond_rules[0] = ConditionalClampRule {

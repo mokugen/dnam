@@ -273,4 +273,96 @@ mod tests {
         bad_payload[last_record_byte] ^= 0xFF;
         assert!(unseal_dnam_container(&bad_payload, &crypto).is_err());
     }
+
+    #[cfg(feature = "crypto")]
+    #[test]
+    fn test_dnsl_seal_unseal_roundtrip_with_embedded_dbin_prefix() {
+        use crate::container::{
+            DnamContainerView, build_dnam_container_from_dnam_bin, extract_dnam_bin,
+        };
+        use crate::provenance::RustCryptoProvider;
+        use crate::types::Tier;
+        use dnam_vm::bin::{DnamBinBuildInput, DnamBinView, encode_dnam_bin};
+
+        let a0 = DnamBinBuildInput::default_arena0_lite();
+        let dnam_bin = encode_dnam_bin(&DnamBinBuildInput {
+            reference_sample_rate_hz: 48_000,
+            header_flags: 0,
+            ext_ring_pow2_frames: 0,
+            ext_ring_lines: 0,
+            ext_ring_format: 0,
+            declared_max_delay_48k: 64,
+            dc_blocker_pole_5hz: dnam_vm::math::TANK_DC_BLOCKER_48K_F32,
+            tail_time_ms: 0.0,
+            ro_pole_48k: 0.99,
+            switch_xfade_samples: 64,
+            content_hash_prefix: [9; 8],
+            controls: &[],
+            cp1_overflow: &[],
+            tsyn: &[],
+            cext: None,
+            arena0: &a0,
+            arena1: None,
+            arena2: None,
+            arena3: None,
+        })
+        .unwrap();
+        let mut hdr = DnamJsonHeader::default_reference();
+        let hybrid = build_dnam_container_from_dnam_bin(&mut hdr, &dnam_bin).unwrap();
+
+        let oem_seed = [31u8; 32];
+        let oem_pk = RustCryptoProvider::ed25519_pubkey_from_seed(&oem_seed);
+        let dev_sk = [32u8; 32];
+        let dev_pk = RustCryptoProvider::x25519_pubkey_from_secret(&dev_sk);
+        let dev_id = "1112131415161718191a1b1c1d1e1f20";
+        let cert = RustCryptoProvider::sign_oem_device_certificate(
+            &oem_seed,
+            "darkglass",
+            "anagram",
+            dev_id,
+            &dev_pk,
+        )
+        .unwrap();
+        let trusted = [("darkglass", oem_pk)];
+        let mp_seed = [11u8; 32];
+        let mp_pk = RustCryptoProvider::ed25519_pubkey_from_seed(&mp_seed);
+        let crypto = RustCryptoProvider::new()
+            .with_device_key(dev_id, dev_sk)
+            .with_marketplace_pubkey(mp_pk);
+
+        let sealed = seal_dnam_container(
+            &hybrid,
+            &[cert],
+            &trusted,
+            &mp_seed,
+            &[12u8; 32],
+            &[14u8; 32],
+            &[13u8; 12],
+        )
+        .unwrap();
+
+        let unsealed_inner = unseal_dnsl_up_to_tier(&sealed, &crypto, Tier::Lite).unwrap();
+        assert!(!unsealed_inner.dbin_prefix.is_empty());
+        assert!(unsealed_inner.shared_bytes.is_empty());
+        assert_eq!(
+            unsealed_inner.logical_dnam_dir.shared_binary_length.get(),
+            0
+        );
+        assert_eq!(
+            unsealed_inner.logical_dnam_dir.dbin_prefix_bytes.get() as usize,
+            unsealed_inner.dbin_prefix.len()
+        );
+
+        let unsealed_dnam = unseal_dnam_container(&sealed, &crypto).unwrap();
+        let extracted = extract_dnam_bin(&unsealed_dnam).unwrap();
+        assert_eq!(extracted, dnam_bin);
+        assert!(DnamBinView::parse(extracted).is_ok());
+
+        let view = DnamContainerView::from_bytes(&unsealed_dnam, &crypto).unwrap();
+        assert_ne!(view.preamble.crc_dbin_prefix, 0);
+        assert_eq!(
+            view.preamble.dbin_prefix_bytes,
+            unsealed_inner.dbin_prefix.len() as u64
+        );
+    }
 }

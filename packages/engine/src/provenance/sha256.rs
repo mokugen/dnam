@@ -81,7 +81,7 @@ const fn sha256_compress(state: &mut [u32; 8], block: &[u8; 64]) {
 fn compress_blocks(state: &mut [u32; 8], blocks: &[[u8; 64]]) {
     #[cfg(all(target_arch = "aarch64", target_feature = "sha2"))]
     {
-        crate::math::aarch64::neon::aarch64_sha256_compress(state, blocks, &SHA256_K);
+        super::sha256_hw::aarch64_sha256_compress(state, blocks, &SHA256_K);
     }
     #[cfg(not(all(target_arch = "aarch64", target_feature = "sha2")))]
     {

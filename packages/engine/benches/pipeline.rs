@@ -1,99 +1,22 @@
-//! End-to-End Pipeline Criterion Benchmarks (`benches/pipeline.rs`).
-//!
-//! Benchmarks `DnamEngine` block processing across slimmable tiers (`Lite`, `Full`, `Pro`, `Ultra`),
-//! math backends (`DefaultMathBackend`, `ScalarBackend`, `ArmSmeBackend`), I/O topologies,
-//! DAW buffer sizes (`32..512`), subnormal/denormal stress, and multi-instance track scaling.
+//! End-to-End Layer 1 `DnamEngine` Pipeline Criterion Benchmarks (`benches/pipeline.rs`).
 
-use std::collections::BTreeMap;
+#[path = "../tests/sona_test_support/arena_builder.rs"]
+mod arena_builder;
+
 use std::hint::black_box;
 
-use dnam_engine::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
+use arena_builder::build_sona_extended_container;
 use dnam_engine::engine::EngineBackend;
-use dnam_engine::graph::sona_core::{SonaControlBusParams, SonaMatryoshkaModel};
-use dnam_engine::graph::weights::pack_sona_matryoshka_to_arena;
-use dnam_engine::math::{DefaultMathBackend, ScalarBackend};
 use dnam_engine::memory::{AlignedBuffer, CacheLine64};
-use dnam_engine::schema::{ControlKind, ControlSchemaDef, ControlUiHints, DnamJsonHeader};
 use dnam_engine::{DnamEngine, Tier};
+use dnam_vm::math::{DefaultMathBackend, ScalarBackend};
 use hotpath::criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
     measurement::WallTime,
 };
-use zerocopy::{FromBytes, byteorder::little_endian::F32};
-
-fn populate_active_ctrl(ctrl: &mut SonaControlBusParams) {
-    ctrl.w_svf_g_oct[0] = 0.35;
-    ctrl.w_svf_k_delta[0] = 0.12;
-    ctrl.w_tank_psi[0] = 0.20;
-    ctrl.w_adaa_drive_scale[0][0] = 0.25;
-    ctrl.cp1_dir_count = 1;
-    ctrl.cp1_dir_flags = 0;
-    ctrl.cp1_dir_entries[0] = [0, 2, 0xFF];
-    if let Ok(base_words) = <[F32]>::mut_from_bytes(&mut ctrl.cp1_base) {
-        for l in 0..2_usize {
-            for d in 0..8 {
-                base_words[l * 8 + d] = F32::new(0.12 - 0.03 * (((l + d) % 4) as f32));
-            }
-            base_words[16 + l] = F32::new(0.25);
-        }
-        for d in 0..4 {
-            base_words[18 + d] = F32::new(0.20 + 0.02 * (d as f32));
-        }
-    }
-    if let Ok(ultra_words) = <[F32]>::mut_from_bytes(&mut ctrl.cp1_ultra) {
-        for l in 0..2_usize {
-            for d in 0..8 {
-                ultra_words[l * 8 + d] = F32::new(0.06);
-            }
-        }
-        for d in 0..4 {
-            ultra_words[16 + d] = F32::new(0.10);
-        }
-    }
-    for r in 0..4 {
-        for c in 0..8 {
-            ctrl.u_int_base[r][c] = 0.05;
-        }
-    }
-    for r in 0..16 {
-        for c in 0..16 {
-            ctrl.w_ctrl[r][c] = if c < 8 { 0.04 } else { 0.0 };
-        }
-    }
-}
 
 fn make_bench_container() -> AlignedBuffer<CacheLine64> {
-    let mut header = DnamJsonHeader::default_reference();
-    header.metadata.name = "Pipeline Benchmark Model".to_string();
-    header.controls_schema = vec![ControlSchemaDef {
-        id: "gain".to_string(),
-        name: "Gain".to_string(),
-        kind: ControlKind::Range,
-        unit: Some("%".to_string()),
-        lobatto_degree: Some(2),
-        anchor_nodes_norm: Some(vec![0.0, -1.0, 1.0]),
-        declared_range: Some([0.0, 1.0]),
-        safe_clamped_range: Some([0.0, 1.0]),
-        default: serde_json::json!(0.85),
-        conditional_bounds: Vec::new(),
-        represented_switch_options: None,
-        declared_options: None,
-        active_options: None,
-        clamp_warning: None,
-        ui_hints: ControlUiHints::default(),
-        calibration: None,
-        user_metadata: BTreeMap::new(),
-    }];
-
-    let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    let mut model = SonaMatryoshkaModel::dual_rate_default(false);
-    populate_active_ctrl(&mut model.ctrl);
-    for s4 in &mut model.stage4 {
-        s4.g_loop = 0.80;
-        s4.wet_mix = 0.15;
-    }
-    pack_sona_matryoshka_to_arena(&model, &mut arena);
-    let raw = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+    let raw = build_sona_extended_container(false, false);
     let mut aligned = AlignedBuffer::<CacheLine64>::new_zeroed(raw.len() / 64);
     aligned.as_bytes_mut().copy_from_slice(&raw);
     aligned
@@ -106,7 +29,7 @@ fn bench_tier_profile<B: EngineBackend>(
     profile_name: &str,
 ) {
     let mut engine = DnamEngine::<B>::from_bytes(container, tier, 48_000).unwrap();
-    engine.set_control_immediate(0, 0.85);
+    engine.set_control_immediate(0, 7.5);
     let in_l = [0.15_f32; 128];
     let in_r = [-0.15_f32; 128];
     let mut out_l = [0.0_f32; 128];
@@ -144,7 +67,7 @@ fn bench_process_block_tiers_and_backends(c: &mut Criterion) {
 
     #[cfg(target_arch = "aarch64")]
     {
-        use dnam_engine::math::ArmSmeBackend;
+        use dnam_vm::math::aarch64::ArmSmeBackend;
         bench_tier_profile::<ArmSmeBackend>(
             &mut group,
             container_full.as_bytes(),
@@ -209,7 +132,7 @@ fn bench_io_topologies_and_buffer_sizes(c: &mut Criterion) {
         buf_group.throughput(Throughput::Elements(frames as u64));
         buf_group.bench_with_input(BenchmarkId::from_parameter(frames), &frames, |b, &n| {
             b.iter(|| {
-                engine.set_control_value(0, black_box(0.65));
+                engine.set_control_value(0, black_box(6.5));
                 engine.process_block(
                     black_box(&in_l_max[..n]),
                     black_box(&in_r_max[..n]),

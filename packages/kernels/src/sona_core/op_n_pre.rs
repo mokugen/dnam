@@ -387,6 +387,7 @@ mod tests {
         assert!(ql.is_finite() && (ql - expected_l).abs() < 100.0);
     }
 
+    /// verify[dsp.op-n.bitcrusher.rate-transfer]
     /// verify[dsp.op-n.bitcrusher.zoh-phase]
     #[test]
     fn test_op_n_pre_raised_cosine_track_hold_at_48k_and_192k() {

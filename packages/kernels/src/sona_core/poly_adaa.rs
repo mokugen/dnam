@@ -7,7 +7,9 @@ pub mod wavefolder;
 
 use crate::simd::{KernelVec4, StereoVec8};
 
-pub use wavefolder::{eval_c2_wavefolder_adaa_stereo8, eval_c2_wavefolder_adaa_vec4};
+pub use wavefolder::{
+    QuadratureHysteresis2D, eval_c2_wavefolder_adaa_stereo8, eval_c2_wavefolder_adaa_vec4,
+};
 
 pub(super) const ONE_THIRD: f32 = 1.0 / 3.0;
 pub(super) const ONE_FIFTH: f32 = 1.0 / 5.0;
@@ -373,6 +375,10 @@ mod tests {
         }
     }
 
+    /// verify[dsp.op-n.polyadaa.bspline-ac]
+    /// verify[dsp.op-n.polyadaa.clamp]
+    /// verify[dsp.op-n.polyadaa.linear-residual]
+    /// verify[dsp.op-n.polyadaa.midpoint]
     #[test]
     fn test_poly_adaa1_exact_zero_signed_zero_nonfinite_and_known_values() {
         for z in [0.0_f32, -0.0_f32] {
@@ -432,6 +438,8 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 
+        /// verify[dsp.op-n.polyadaa.drive-bank]
+        /// verify[dsp.op-n.polyadaa.midpoint]
         #[test]
         fn prop_poly_adaa1_interior_matches_oracle_and_zero_ulp_symmetry(
             a0 in -1.0_f32..1.0_f32,
@@ -480,6 +488,8 @@ mod tests {
             }
         }
 
+        /// verify[dsp.op-n.polyadaa.clamp]
+        /// verify[dsp.op-n.polyadaa.rail-crossing]
         #[test]
         fn prop_poly_adaa1_extreme_rail_crossing_matches_oracle_and_zero_ulp_symmetry(
             a0 in -20.0_f32..20.0_f32,

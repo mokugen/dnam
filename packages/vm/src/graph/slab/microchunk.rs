@@ -152,10 +152,13 @@ fn step_transport_end_via_slab<B: GraphBackend>(
         scrub_and_flush_f32_bits(x_tank_lr.0),
         scrub_and_flush_f32_bits(x_tank_lr.1),
     );
-    Ok((
-        stage_dry_mix_eff * clean_xl + wet_scale * sum_l,
-        stage_dry_mix_eff * clean_xr + wet_scale * sum_r,
-    ))
+    let core_l = stage_dry_mix_eff * clean_xl;
+    let core_r = stage_dry_mix_eff * clean_xr;
+    let wet_l = wet_scale * sum_l;
+    let wet_r = wet_scale * sum_r;
+    cold.last_core_lr = [core_l, core_r];
+    cold.last_transport_wet_lr = [wet_l, wet_r];
+    Ok((core_l + wet_l, core_r + wet_r))
 }
 
 #[inline(always)]
@@ -273,18 +276,27 @@ fn step_convolver_frame<B: GraphBackend>(
 }
 
 #[inline(always)]
+fn fold_mono_lr(mono: bool, l: f32, r: f32) -> (f32, f32) {
+    if mono {
+        let m = 0.5 * (l + r);
+        (m, m)
+    } else {
+        (l, r)
+    }
+}
+
+#[inline(always)]
 fn finalize_frame_output<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
     tank_l: f32,
     tank_r: f32,
 ) -> (f32, f32) {
     let mono = slab.mono_out();
-    let (mut out_l, mut out_r) = if mono {
-        let m = 0.5 * (tank_l + tank_r);
-        (m, m)
-    } else {
-        (tank_l, tank_r)
-    };
+    let (mut out_l, mut out_r) = fold_mono_lr(mono, tank_l, tank_r);
+    let [raw_core_l, raw_core_r] = slab.cold().last_core_lr;
+    let [raw_wet_l, raw_wet_r] = slab.cold().last_transport_wet_lr;
+    let (mut core_l, mut core_r) = fold_mono_lr(mono, raw_core_l, raw_core_r);
+    let (mut wet_l, mut wet_r) = fold_mono_lr(mono, raw_wet_l, raw_wet_r);
 
     let rem = if slab.xfade_active() {
         slab.cold().xfade_rem
@@ -295,22 +307,34 @@ fn finalize_frame_output<B: GraphBackend>(
         let a = f32::from(rem) * INV_XFADE_LEN_F32;
         let one_m_a = 1.0 - a;
         let prev = slab.cold().xfade_prev_out;
-        if mono {
-            let prev_mid = 0.5 * (prev[0] + prev[1]);
-            out_l = prev_mid * a + out_l * one_m_a;
-            out_r = out_l;
-        } else {
-            out_l = prev[0] * a + out_l * one_m_a;
-            out_r = prev[1] * a + out_r * one_m_a;
-        }
+        let (prev_l, prev_r) = fold_mono_lr(mono, prev[0], prev[1]);
+        out_l = prev_l * a + out_l * one_m_a;
+        out_r = prev_r * a + out_r * one_m_a;
+
+        let prev_c = slab.cold().xfade_prev_core;
+        let (prev_cl, prev_cr) = fold_mono_lr(mono, prev_c[0], prev_c[1]);
+        core_l = prev_cl * a + core_l * one_m_a;
+        core_r = prev_cr * a + core_r * one_m_a;
+
+        let prev_w = slab.cold().xfade_prev_wet;
+        let (prev_wl, prev_wr) = fold_mono_lr(mono, prev_w[0], prev_w[1]);
+        wet_l = prev_wl * a + wet_l * one_m_a;
+        wet_r = prev_wr * a + wet_r * one_m_a;
+
         let next_rem = rem - 1;
         slab.cold_mut().xfade_rem = next_rem;
         if next_rem == 0 {
             slab.set_flag(FLAG_XFADE_ACTIVE, false);
-            slab.cold_mut().xfade_prev_out = [out_l, out_r];
+            let cold = slab.cold_mut();
+            cold.xfade_prev_out = [out_l, out_r];
+            cold.xfade_prev_core = [core_l, core_r];
+            cold.xfade_prev_wet = [wet_l, wet_r];
         }
     } else {
-        slab.cold_mut().xfade_prev_out = [out_l, out_r];
+        let cold = slab.cold_mut();
+        cold.xfade_prev_out = [out_l, out_r];
+        cold.xfade_prev_core = [core_l, core_r];
+        cold.xfade_prev_wet = [wet_l, wet_r];
     }
 
     let tier_idx = slab.lite.tier.index();
@@ -318,11 +342,24 @@ fn finalize_frame_output<B: GraphBackend>(
     let eff_trim = sign * slab.cold().tier_gain_trim[tier_idx];
     out_l *= eff_trim;
     out_r *= eff_trim;
+    core_l *= eff_trim;
+    core_r *= eff_trim;
+    wet_l *= eff_trim;
+    wet_r *= eff_trim;
 
     slab.lite.sample_tick = slab.lite.sample_tick.wrapping_add(1);
     let flags = &mut slab.cold.as_mut_slice()[0].saturation_flags;
     let clean_l = sanitize_output_sample(out_l, flags);
     let clean_r = sanitize_output_sample(out_r, flags);
+
+    let mut part_flags = 0_u32;
+    let clean_core_l = sanitize_output_sample(core_l, &mut part_flags);
+    let clean_core_r = sanitize_output_sample(core_r, &mut part_flags);
+    let clean_wet_l = sanitize_output_sample(wet_l, &mut part_flags);
+    let clean_wet_r = sanitize_output_sample(wet_r, &mut part_flags);
+    let cold = slab.cold_mut();
+    cold.last_core_lr = [clean_core_l, clean_core_r];
+    cold.last_transport_wet_lr = [clean_wet_l, clean_wet_r];
     (clean_l, clean_r)
 }
 
@@ -423,16 +460,33 @@ pub fn step_frame_4x_sona<B: GraphBackend>(
         .bounce4x
         .upsample_4x(clean_l, clean_r);
     let mut sub_out = [[0.0_f32; 2]; 4];
+    let mut sub_core = [[0.0_f32; 2]; 4];
+    let mut sub_wet = [[0.0_f32; 2]; 4];
     for (s, &[sl, sr]) in up4.iter().enumerate() {
         let (ol, or) = step_frame_sona(slab, sl, sr)?;
         sub_out[s] = [ol, or];
+        let cold = slab.cold();
+        sub_core[s] = cold.last_core_lr;
+        sub_wet[s] = cold.last_transport_wet_lr;
     }
-    let [dl, dr] = slab.cold.as_mut_slice()[0].bounce4x.downsample_4x(sub_out);
-    let flags = &mut slab.cold.as_mut_slice()[0].saturation_flags;
-    Ok((
-        sanitize_output_sample(dl, flags),
-        sanitize_output_sample(dr, flags),
-    ))
+    let cold = slab.cold_mut();
+    let [dl, dr] = cold.bounce4x.downsample_4x(sub_out);
+    let [d_core_l, d_core_r] = cold.bounce4x_core_decim.downsample_4x(sub_core);
+    let [d_wet_l, d_wet_r] = cold.bounce4x_wet_decim.downsample_4x(sub_wet);
+    let (out_l, out_r) = (
+        sanitize_output_sample(dl, &mut cold.saturation_flags),
+        sanitize_output_sample(dr, &mut cold.saturation_flags),
+    );
+    let mut part_flags = 0_u32;
+    cold.last_core_lr = [
+        sanitize_output_sample(d_core_l, &mut part_flags),
+        sanitize_output_sample(d_core_r, &mut part_flags),
+    ];
+    cold.last_transport_wet_lr = [
+        sanitize_output_sample(d_wet_l, &mut part_flags),
+        sanitize_output_sample(d_wet_r, &mut part_flags),
+    ];
+    Ok((out_l, out_r))
 }
 
 #[inline]

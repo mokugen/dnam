@@ -284,7 +284,7 @@ scope = "engine"
 
 [rules."container.dnam.vm-binary"]
 scope = "out-of-scope"
-reason = "Owned and verified by packages/vm (.dnam-bin) and packages/engine"
+reason = "Owned and verified by packages/vm (.dnam-bin)"
 
 [rules."container.dnam.wire-framing"]
 scope = "engine"
@@ -311,7 +311,8 @@ scope = "engine"
 scope = "engine"
 
 [rules."container.dnam.tensor-directory"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (.dnam-bin tensor arena directory)"
 
 [rules."container.dnam.cabinet-slices"]
 scope = "engine"
@@ -338,214 +339,278 @@ scope = "engine"
 # 6. DSP: Op-M Modal & Kautz (`docs/specs/dsp/op_m_modal_kautz.md`)
 # ==============================================================================
 [rules."dsp.op-m.recurrence.symplectic"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (4-lane symplectic modal recurrence)"
 
 [rules."dsp.op-m.rotor.contractive"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (contractive rotor)"
 
 [rules."dsp.op-m.rotor.zero-hold"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (zero-hold rotor phase gating)"
 
 [rules."dsp.op-m.rotor.quadrant-horner"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (quadrant-reduced Horner rotor)"
 
 [rules."dsp.op-m.rotor.ulp-guard"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (rotor 1-2 ULP contraction guard)"
 
 [rules."dsp.op-m.rotor.q0-192-lfo"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Q0.192 LFO phase accumulator)"
 
 [rules."dsp.op-m.init.log-octave-h2"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (log-octave H2 Kautz initialization)"
 
 [rules."dsp.op-m.hilbert.lattice"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (12-allpass Hilbert H1 lattice)"
 
 [rules."dsp.op-m.hilbert.h1-anchors"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (H1 Hilbert anchor coefficients)"
 
 [rules."dsp.op-m.hilbert.ties-to-even"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (H1 ties-to-even rounding)"
 
 [rules."dsp.op-m.hilbert.rate-remap"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (H1 sample-rate remapping)"
 
 [rules."dsp.op-m.tracker.t1-dc-blocker"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (T1 5 Hz upstream DC blocker)"
 
 [rules."dsp.op-m.tracker.envelope-norm"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (T1 envelope normalization)"
 
 [rules."dsp.op-m.tracker.toggle-sheet"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (T1 toggle-sheet sub-harmonic tracker)"
 
 [rules."dsp.op-m.tracker.training"]
 scope = "out-of-scope"
 reason = "Capture differentiable sub-harmonic tracker forward/surrogate pass owned by packages/capture"
 
 [rules."dsp.op-m.kautz.tier-allocation"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Kautz tier allocation)"
 
 [rules."dsp.op-m.kautz.dual-state"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Kautz dual-state recurrence)"
 
 [rules."dsp.op-m.kautz.radial-gate"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Kautz radial gate)"
 
 [rules."dsp.op-m.kautz.rate-convert"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Kautz sample-rate conversion)"
 
 [rules."dsp.op-m.kautz.coupled-form"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Kautz coupled-form filter)"
 
 [rules."dsp.op-m.kautz.sweep-contraction"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Kautz sweep contraction)"
 
 [rules."dsp.op-m.kautz.pole-extraction"]
 scope = "out-of-scope"
 reason = "Offline Steiglitz-McBride / Warped Kautz pole-extraction solver owned by packages/capture"
 
 [rules."dsp.op-m.ctrl.engine"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Op-M pole control slew)"
 
 # ==============================================================================
 # 7. DSP: Op-N ParaLRU & PolyADAA (`docs/specs/dsp/op_n_paralru_and_polyadaa.md`)
 # ==============================================================================
 [rules."dsp.op-n.polyadaa.clamp"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (PolyADAA1 input clamp)"
 
 [rules."dsp.op-n.polyadaa.midpoint"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (PolyADAA1 midpoint fallback)"
 
 [rules."dsp.op-n.polyadaa.rail-crossing"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (PolyADAA1 rail-crossing branch)"
 
 [rules."dsp.op-n.polyadaa.linear-residual"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (PolyADAA1 linear residual)"
 
 [rules."dsp.op-n.polyadaa.bspline-ac"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (PolyADAA1 B-spline AC kernel)"
 
 [rules."dsp.op-n.polyadaa.drive-bank"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (PolyADAA1 drive bank)"
 
 [rules."dsp.op-n.wavefolder.cubic-c2"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (C2 cubic wavefolder)"
 
 [rules."dsp.op-n.hysteresis.quadrature"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (quadrature hysteresis)"
 
 [rules."dsp.op-n.bitcrusher.quantizer"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Op-N[Pre] bitcrusher quantizer)"
 
 [rules."dsp.op-n.bitcrusher.zoh-phase"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Op-N[Pre] ZOH phase)"
 
 [rules."dsp.op-n.bitcrusher.rate-transfer"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels and packages/vm (bitcrusher rate transfer)"
 
 [rules."dsp.op-n.bitcrusher.surrogate"]
 scope = "out-of-scope"
 reason = "Capture 4-term Fourier surrogate for bitcrusher identification owned by packages/capture"
 
 [rules."dsp.op-n.commuted.theorem1"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (commuted ParaLRU Theorem 1)"
 
 [rules."dsp.op-n.commuted.causality"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (commuted ParaLRU causality)"
 
 [rules."dsp.op-n.commuted.project-then-filter"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (commuted ParaLRU project-then-filter)"
 
 [rules."dsp.op-n.commuted.dc-equilibrium"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (commuted ParaLRU DC equilibrium)"
 
 [rules."dsp.op-n.core.matryoshka-blocks"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Matryoshka block scans)"
 
 [rules."dsp.op-n.core.tpt-tone-basis"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (TPT-SVF tone basis)"
 
 [rules."dsp.op-n.core.interblock-tiles"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (inter-block tiles)"
 
 [rules."dsp.op-n.core.control-sensitivity"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (control sensitivity)"
 
 [rules."dsp.op-n.ctrl.incremental-update"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (incremental control update)"
 
 [rules."dsp.op-n.ctrl.lobatto-basis"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Lobatto control basis)"
 
 [rules."dsp.op-n.ctrl.chebyshev-lfo"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Chebyshev LFO control)"
 
 [rules."dsp.op-n.ctrl.fm-interaction"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ANOVA FM control interaction)"
 
 [rules."dsp.op-n.ctrl.trust-clip"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (trust-region control clip)"
 
 # ==============================================================================
 # 8. DSP: Op-T Transport (`docs/specs/dsp/op_t_transport.md`)
 # ==============================================================================
 [rules."dsp.op-t.ring.declaration"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Op-T ring declaration)"
 
 [rules."dsp.op-t.ring.capacity"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Op-T ring capacity)"
 
 [rules."dsp.op-t.ring.admission"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Op-T ring admission)"
 
 [rules."dsp.op-t.ring.branchless-wrap"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Op-T branchless wrap)"
 
 [rules."dsp.op-t.ring.q0-32-pointer"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Q0.32 fractional pointer)"
 
 [rules."dsp.op-t.ring.fp16-saturation"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (fp16 ring saturation)"
 
 [rules."dsp.op-t.reader.catmull-rom"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Catmull-Rom reader)"
 
 [rules."dsp.op-t.guard.bounded-history"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (bounded delay history guard)"
 
 [rules."dsp.op-t.guard.max-tree"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (max-tree delay bound guard)"
 
 [rules."dsp.op-t.guard.bibo-decay"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (BIBO decay guard)"
 
 [rules."dsp.op-t.guard.fp16-decay"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (fp16 decay guard)"
 
 [rules."dsp.op-t.transition.dual-mode"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (dual-mode slew/crossfade transition)"
 
 [rules."dsp.op-t.window.partition-of-unity"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Hermite-Hann partition of unity)"
 
 [rules."dsp.op-t.window.m1-delay"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels and packages/vm (M1 delay window)"
 
 [rules."dsp.op-t.window.m2-pitch"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (M2 pitch window)"
 
 [rules."dsp.op-t.window.m3-barberpole"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (M3 barberpole window)"
 
 [rules."dsp.op-t.diffuser.partition"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Schroeder diffuser partitioning)"
 
 [rules."dsp.op-t.diffuser.recurrence"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels and packages/vm (Schroeder diffuser recurrence)"
 
 [rules."dsp.op-t.ducking.vca"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (dynamic ducking VCA)"
 
 [rules."dsp.op-t.zero-fdiv"]
 scope = "engine"
@@ -554,95 +619,122 @@ scope = "engine"
 # 9. DSP: Parametric Control Bus (`docs/specs/dsp/parametric_control_bus.md`)
 # ==============================================================================
 [rules."dsp.ctrl.op-m.ballistic-lfo"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus ballistic LFO)"
 
 [rules."dsp.ctrl.op-m.rate-retime"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus sample-rate retiming)"
 
 [rules."dsp.ctrl.op-m.timing"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus 3 kHz timing)"
 
 [rules."dsp.ctrl.op-m.spsc-ingress"]
 scope = "engine"
 
 [rules."dsp.ctrl.op-n.engine"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus Op-N accumulator engine)"
 
 [rules."dsp.ctrl.op-n.trust-clip"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus Op-N trust clipping)"
 
 [rules."dsp.ctrl.range.normalize-clamp"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus range normalization and clamp)"
 
 [rules."dsp.ctrl.range.f32-rank-bounds"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus f32 rank bounds)"
 
 [rules."dsp.ctrl.basis.lobatto"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus Lobatto basis)"
 
 [rules."dsp.ctrl.accum.cp1-scaling"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus CP1 scaling)"
 
 [rules."dsp.ctrl.switch.option-contributors"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus switch option contributors)"
 
 [rules."dsp.ctrl.switch.conditional-batch"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus conditional switch batch)"
 
 [rules."dsp.ctrl.accum.anova-fm"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus ANOVA FM accumulator)"
 
 [rules."dsp.ctrl.accum.exact-int"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus exact-integer accumulator)"
 
 [rules."dsp.ctrl.modulators.dynamic"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus dynamic modulators)"
 
 [rules."dsp.ctrl.dispatch.matrix"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus W_ctrl dispatch matrix)"
 
 [rules."dsp.ctrl.dispatch.modulation-laws"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus modulation laws)"
 
 [rules."dsp.ctrl.dispatch.micro-ramp"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus micro-ramp interpolation)"
 
 [rules."dsp.ctrl.calib.variance-gating"]
 scope = "out-of-scope"
 reason = "Offline Control-Space Audit variance-based control locking owned by packages/capture"
 
 [rules."dsp.ctrl.math.pitch-profile"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus pitch profile math)"
 
 [rules."dsp.ctrl.math.log2-lut"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus log2 LUT)"
 
 [rules."dsp.ctrl.ledger.memory-compute"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus memory and compute ledger)"
 
 [rules."dsp.tempo.subdivisions"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (TempoSync subdivisions)"
 
 [rules."dsp.tempo.q64-q32-phase"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (TempoSync Q64/Q32 phase)"
 
 [rules."dsp.tempo.event-tracker"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (TempoSync event tracker)"
 
 [rules."dsp.tempo.physical-inversion"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (TempoSync physical inversion)"
 
 [rules."dsp.tempo.coprime-fdn"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (TempoSync coprime delay inversion)"
 
 [rules."dsp.tempo.transport-jump"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (TempoSync transport jump)"
 
 # ==============================================================================
 # 10. DSP: Router & Crossbar Topology (`docs/specs/dsp/router_and_crossbar_topology.md`)
 # ==============================================================================
 [rules."dsp.router.signal-flow"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (pure 2x2 SONA signal flow)"
 
 [rules."dsp.router.ports"]
 scope = "engine"
@@ -657,76 +749,99 @@ scope = "engine"
 scope = "engine"
 
 [rules."dsp.router.lr4-crossover"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Sensory LR4 crossover)"
 
 [rules."dsp.router.mid-side-input"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels and packages/vm (M/S input coupling)"
 
 [rules."dsp.head.mid-side-factorization"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (M/S head factorization)"
 
 [rules."dsp.router.topology-dispatch"]
 scope = "engine"
 
 [rules."dsp.router.stereo-link-detector"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels and packages/vm (stereo link detector)"
 
 [rules."dsp.router.ballistic-envelope-bank"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Sensory ballistic envelope bank)"
 
 [rules."dsp.crossbar.top-of-frame"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels and packages/vm (top-of-frame crossbar)"
 
 [rules."dsp.core.matryoshka-cascade"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Matryoshka core cascade)"
 
 [rules."dsp.cabinet.fir-kautz-bank"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Convolver FIR + Kautz bank)"
 
 [rules."dsp.tank.feedback-loop"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels and packages/vm (Transport feedback loop)"
 
 [rules."dsp.tank.captured-freeze"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels and packages/vm (Transport freeze/hold)"
 
 [rules."dsp.tank.dc-blocker"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Transport loop DC blocker)"
 
 [rules."dsp.tank.loop-saturator"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Transport loop cubic saturator)"
 
 [rules."dsp.tank.quiet-feedback-knee"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels (Transport quiet feedback knee)"
 
 [rules."dsp.head.direct-register-readout"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (direct-register readout)"
 
 [rules."dsp.head.tier-equivalence"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (tier equivalence)"
 
 [rules."dsp.head.lower-triangular"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (lower-triangular readout)"
 
 [rules."dsp.router.modulation-bus"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Sensory modulation bus)"
 
 [rules."dsp.zoh.op-m-poles"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ZOH Kautz poles)"
 
 [rules."dsp.zoh.router-detector"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ZOH sensory detector)"
 
 [rules."dsp.zoh.core-paralru"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ZOH CoreQuad ParaLRU)"
 
 [rules."dsp.zoh.op-t-delays"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ZOH Transport delays)"
 
 [rules."dsp.zoh.ctrl-stride"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ZOH control stride)"
 
 [rules."dsp.zoh.cabinet-fir-onset"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ZOH convolver FIR onset)"
 
 # ==============================================================================
 # 11. Security: Provenance & Enclave DRM (`docs/specs/security/provenance_and_enclave_drm.md`)
@@ -1097,7 +1212,8 @@ scope = "out-of-scope"
 reason = "Repository-wide modular decomposition, zero code-golfing, and co-located unit-test guardrail verified in tests/code_guardrails.test.ts"
 
 [rules."repo.code.constant-eval-and-derivations"]
-scope = "engine"
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels, packages/vm, and tests/architecture_guardrails.test.ts"
 
 [rules."repo.code.universal-black-box"]
 scope = "out-of-scope"

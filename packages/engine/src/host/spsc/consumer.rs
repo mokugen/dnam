@@ -387,7 +387,6 @@ impl ControlConsumer {
                 self.apply_lane1_entry(engine, idx, entry);
             }
         }
-        engine.set_freeze(fb.is_frozen);
         engine.set_stereo_width(fb.stereo_width);
         engine.or_active_clamp_mask(fb.tempo_clamp_mask);
     }
@@ -427,12 +426,6 @@ impl ControlConsumer {
             }
             ControlCommand::SetBypass { bypassed, trails } => {
                 engine.set_bypass(bypassed, trails);
-            }
-            ControlCommand::SetFreeze { frozen } => {
-                engine.set_freeze(frozen);
-            }
-            ControlCommand::SetFreezeAmount { alpha } => {
-                engine.set_freeze_amount(alpha);
             }
             ControlCommand::SetStereoWidth { width } => {
                 engine.set_stereo_width(width);
@@ -480,20 +473,19 @@ impl ControlConsumer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
     use crate::host::spsc::spsc_control_channel;
-    use crate::math::BackendKind;
     use crate::schema::{ControlKind, ControlSchemaDef, ControlUiHints, DnamJsonHeader};
+    use crate::test_support::build_test_dnam_container;
     use crate::types::Tier;
     use alloc::collections::BTreeMap;
     use alloc::string::String;
     use alloc::vec;
     use alloc::vec::Vec;
+    use dnam_vm::math::BackendKind;
     use proptest::prelude::*;
 
     fn build_consumer_test_container(num_controls: usize) -> Vec<u8> {
         let mut header = DnamJsonHeader::default_reference();
-        header.io_config.capabilities.supports_freeze = true;
         let mut controls = Vec::with_capacity(num_controls);
         for i in 0..num_controls {
             if i == 1 || i == 34 {
@@ -539,8 +531,7 @@ mod tests {
             }
         }
         header.controls_schema = controls;
-        let arena = vec![0_u8; ARENA_OFFSET_ULTRA_END as usize];
-        build_dnam_container(&mut header, &arena, &arena, false).unwrap()
+        build_test_dnam_container(&mut header, Tier::Ultra, false)
     }
 
     #[test]
@@ -632,7 +623,7 @@ mod tests {
 
         #[test]
         fn prop_consumer_drains_all_lanes_to_exact_shadow_parity(
-            ops in proptest::collection::vec((0u8..16, 0.0f32..10.0f32), 1..80)
+            ops in proptest::collection::vec((0u8..14, 0.0f32..10.0f32), 1..80)
         ) {
             // verify[dsp.ctrl.op-m.spsc-ingress]
             let container = build_consumer_test_container(36);
@@ -654,14 +645,12 @@ mod tests {
                     4 => producer.reset_controls_to_defaults(),
                     5 => producer.reset_to_dc_equilibrium(),
                     6 => producer.set_bypass(val > 5.0, val > 2.5),
-                    7 => producer.set_freeze(val > 5.0),
-                    8 => producer.set_freeze_amount(val * 0.1),
-                    9 => producer.set_stereo_width(val * 0.2),
-                    10 => producer.set_tier(Tier::from_u8((val as u8) % 4)),
-                    11 => producer.set_max_supported_tier(Tier::from_u8(((val as u8) % 3) + 1)),
-                    12 => producer.set_control_value(33, val),
-                    13 => producer.set_control_immediate(34, ((val as u32) % 2) as f32),
-                    14 => { let _ = producer.reset_control(33); }
+                    7 => producer.set_stereo_width(val * 0.2),
+                    8 => producer.set_tier(Tier::from_u8((val as u8) % 4)),
+                    9 => producer.set_max_supported_tier(Tier::from_u8(((val as u8) % 3) + 1)),
+                    10 => producer.set_control_value(33, val),
+                    11 => producer.set_control_immediate(34, ((val as u32) % 2) as f32),
+                    12 => { let _ = producer.reset_control(33); }
                     _ => {
                         producer.next_epoch_29 = crate::host::spsc::ring::MAX_EPOCH_29;
                         producer.set_control_value(35, val);
@@ -681,7 +670,6 @@ mod tests {
                 producer.shadow().max_supported_tier()
             );
             prop_assert_eq!(engine.bypass_state(), producer.shadow().bypass_state());
-            prop_assert_eq!(engine.is_frozen(), producer.shadow().is_frozen());
             prop_assert!((engine.stereo_width() - producer.shadow().stereo_width()).abs() < 1e-6);
         }
     }
@@ -780,7 +768,6 @@ mod tests {
             engine.bypass_state(),
             expected_shadow.shadow().bypass_state()
         );
-        assert_eq!(engine.is_frozen(), expected_shadow.shadow().is_frozen());
         assert!((engine.stereo_width() - expected_shadow.shadow().stereo_width()).abs() < 1e-6);
     }
 }

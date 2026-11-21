@@ -1,17 +1,20 @@
 //! Zero-copy canonical `v3.0` (`"sona"`) container view (`DnamContainerView`).
 
 pub mod auth;
+mod dbin;
 mod sealed;
+
+pub use dbin::extract_dnam_bin;
+pub(crate) use dbin::{extract_dnam_bin_rt, map_vm_error, map_vm_error_rt};
 
 use alloc::string::ToString;
 use alloc::vec::Vec;
 
+use dnam_vm::bin::ControlClampDescriptorWire;
+use dnam_vm::control::{ControlClampDescriptor, Cp1ContributorSlot};
 use zerocopy::FromBytes;
 use zerocopy::byteorder::little_endian::U16;
 
-use crate::control::{
-    ControlChannelRecord, ControlClampDescriptor, ControlLatentProjection, Cp1ContributorSlot,
-};
 use crate::memory::{AlignedBuffer, ArenaStorage, CacheLine64};
 use crate::provenance::{
     CryptoProvider, DNSL_MAGIC, VerificationStatus, chacha20_xor_arena_blocks, decode_hex_array,
@@ -33,12 +36,8 @@ use super::{
 
 const FORBIDDEN_DCRC_RESERVED_FLAG: u16 = 1 << 12;
 
-/// Decoded shared control descriptors, `CP1\0` contributor slots, and unified 128-byte control records.
-pub type SharedControlsExtent = (
-    Vec<ControlClampDescriptor>,
-    Vec<Cp1ContributorSlot>,
-    Vec<ControlChannelRecord>,
-);
+/// Decoded shared control descriptors and `CP1\0` contributor slots.
+pub type SharedControlsExtent = (Vec<ControlClampDescriptor>, Vec<Cp1ContributorSlot>);
 
 /// Decodes the shared controls extent (`ControlClampDescriptor[0..P]` + optional `CP1\0` stream)
 /// for a runtime `.dnam` header.
@@ -56,9 +55,13 @@ pub fn decode_shared_controls_extent(
             let mut descs = Vec::with_capacity(p_ctrls);
             for p in 0..p_ctrls {
                 let off = p * 64;
-                let mut desc_bytes = [0u8; 64];
-                desc_bytes.copy_from_slice(&shared_slice[off..off + 64]);
-                descs.push(ControlClampDescriptor::from_bytes(&desc_bytes));
+                let wire = ControlClampDescriptorWire::ref_from_bytes(&shared_slice[off..off + 64])
+                    .map_err(|_| {
+                        DnamError::SchemaValidationError(
+                            "invalid ControlClampDescriptorWire in shared_extent".to_string(),
+                        )
+                    })?;
+                descs.push(ControlClampDescriptor::from_wire(wire));
             }
             (descs, &shared_slice[desc_bytes_len..])
         } else {
@@ -73,22 +76,14 @@ pub fn decode_shared_controls_extent(
         cp1_contributors.resize(count, Cp1ContributorSlot::zero());
         decode_cp1_shared_stream_into_slice(cp1_slice, &mut cp1_contributors)?;
     }
-    let control_records = clamp_descriptors
-        .iter()
-        .copied()
-        .map(|clamp| ControlChannelRecord {
-            clamp,
-            projection: ControlLatentProjection::new(),
-        })
-        .collect();
-    Ok((clamp_descriptors, cp1_contributors, control_records))
+    Ok((clamp_descriptors, cp1_contributors))
 }
 
 /// Zero-copy or decrypted view over a validated canonical `v3.0` (`"sona"`) `.dnam` or
 /// `.dnam-seal` (`b"DNSL"`) container.
 #[derive(Debug)]
 pub struct DnamContainerView<'a> {
-    /// Logical 64-byte binary preamble summary.
+    /// Logical binary preamble summary (`128 B`).
     pub preamble: DnamPreamble,
     /// Parsed UTF-8 JSON header (`no_std` `serde` + `alloc`) with `DMU1` mutable fields merged.
     pub header: DnamJsonHeader,
@@ -96,12 +91,10 @@ pub struct DnamContainerView<'a> {
     pub verification_status: VerificationStatus,
     /// Resolved container protection profile (`Open`, `DeviceAllowlisted`, or `EnclaveSealed`).
     pub protection_profile: DnamProtectionProfile,
-    /// Compiled 64-byte `ControlClampDescriptor[0..P]` table from Region 4 `shared_extent`.
+    /// Compiled 64-byte `ControlClampDescriptor[0..P]` table from Region 4 `shared_extent` or embedded `.dnam-bin`.
     pub clamp_descriptors: Vec<ControlClampDescriptor>,
-    /// Decoded `CP1\0` variable-length contributor slots from Region 4 `shared_extent` (if present).
+    /// Decoded `CP1\0` variable-length contributor slots from Region 4 `shared_extent` or embedded `.dnam-bin` (if present).
     pub cp1_contributors: Vec<Cp1ContributorSlot>,
-    /// Unified 128-byte `ControlChannelRecord[0..P]` table derived from `clamp_descriptors`.
-    pub control_records: Vec<ControlChannelRecord>,
     /// 64-byte aligned tensor arena storage (`Borrowed` on aligned `mmap`, or `Owned` if decrypted/copied).
     pub arena_storage: ArenaStorage<'a>,
 }
@@ -156,11 +149,40 @@ impl<'a> DnamContainerView<'a> {
         allow_preview: bool,
         max_supported_tier: Tier,
     ) -> Result<Self, DnamError> {
-        crate::math::warm_simd_feature_caches();
+        dnam_vm::math::warm_simd_feature_caches();
         if bytes.len() >= 4 && bytes[0..4] == DNSL_MAGIC {
             return Self::from_sealed_bytes(bytes, crypto, allow_preview, max_supported_tier);
         }
         Self::from_inner_dnam_bytes(bytes, crypto, false, allow_preview, max_supported_tier)
+    }
+
+    pub(crate) fn from_bytes_with_dbin_options<C: CryptoProvider>(
+        bytes: &'a [u8],
+        crypto: &C,
+        allow_preview: bool,
+        max_supported_tier: Tier,
+    ) -> Result<(Self, alloc::borrow::Cow<'a, [u8]>), DnamError> {
+        dnam_vm::math::warm_simd_feature_caches();
+        if bytes.len() >= 4 && bytes[0..4] == DNSL_MAGIC {
+            let (view, assembled_dbin) = Self::from_sealed_bytes_with_dbin(
+                bytes,
+                crypto,
+                allow_preview,
+                max_supported_tier,
+            )?;
+            if assembled_dbin.is_empty() {
+                return Err(DnamError::SchemaValidationError(
+                    alloc::string::String::from(
+                        "sealed container does not carry an embedded .dnam-bin prefix",
+                    ),
+                ));
+            }
+            return Ok((view, alloc::borrow::Cow::Owned(assembled_dbin)));
+        }
+        let view =
+            Self::from_inner_dnam_bytes(bytes, crypto, false, allow_preview, max_supported_tier)?;
+        let dbin = dbin::extract_or_assemble_dnam_bin_cold(bytes, &view)?;
+        Ok((view, dbin))
     }
 
     fn from_inner_dnam_bytes<C: CryptoProvider>(
@@ -200,6 +222,21 @@ impl<'a> DnamContainerView<'a> {
                     expected: dcrc.crc_prefix,
                     computed: calc_prefix_crc,
                 });
+            }
+            if layout.dbin_extent.1 > 0 {
+                let calc_dbin_crc =
+                    crc32c_update(0, &bytes[layout.dbin_extent.0..layout.tier_start]);
+                if calc_dbin_crc != dcrc.crc_dbin_prefix {
+                    return Err(DnamError::Crc32cMismatch {
+                        region: "dbin_prefix",
+                        expected: dcrc.crc_dbin_prefix,
+                        computed: calc_dbin_crc,
+                    });
+                }
+            } else if dcrc.crc_dbin_prefix != 0 {
+                return Err(DnamError::SchemaValidationError(
+                    "non-zero crc_dbin_prefix when dbin_prefix_bytes == 0".to_string(),
+                ));
             }
             if (dcrc.flags_hint & FORBIDDEN_DCRC_RESERVED_FLAG) != 0 {
                 return Err(DnamError::SchemaValidationError(
@@ -316,19 +353,30 @@ impl<'a> DnamContainerView<'a> {
 
         let shared_slice =
             &bytes[layout.shared_extent.0..layout.shared_extent.0 + layout.shared_extent.1];
-        let (clamp_descriptors, cp1_contributors, control_records) =
-            decode_shared_controls_extent(shared_slice, &header)?;
+        let (clamp_descriptors, cp1_contributors) = if layout.dbin_extent.1 > 0 {
+            let dbin_prefix_slice =
+                &bytes[layout.dbin_extent.0..layout.dbin_extent.0 + layout.dbin_extent.1];
+            dbin::decode_controls_from_embedded_dbin(
+                dbin_prefix_slice,
+                plain_bytes,
+                retained_tier as u8,
+            )?
+        } else {
+            decode_shared_controls_extent(shared_slice, &header)?
+        };
 
         let verification_status = auth::verify_dau1_or_legacy_provenance(
-            bytes,
-            auth_slice,
-            json_slice,
-            shared_slice,
-            &layout,
-            &header,
-            preamble.has_signatures(),
-            retained_tier,
-            plain_bytes,
+            &auth::Dau1VerifyContext {
+                bytes,
+                auth_slice,
+                json_slice,
+                shared_slice,
+                layout: &layout,
+                header: &header,
+                preamble_has_signatures: preamble.has_signatures(),
+                retained_tier,
+                plain_bytes,
+            },
             crypto,
         )?;
 
@@ -350,13 +398,15 @@ impl<'a> DnamContainerView<'a> {
             protection_profile,
             clamp_descriptors,
             cp1_contributors,
-            control_records,
             arena_storage,
         })
     }
 }
 
-pub use super::builder::{build_dnam_container, update_header_in_place};
+pub use super::builder::{
+    build_dnam_container, build_dnam_container_from_dnam_bin, build_dnam_container_with_dbin,
+    update_header_in_place,
+};
 pub use super::strip::strip_container_to_tier;
 
 #[cfg(test)]
@@ -368,8 +418,8 @@ mod tests {
     use crate::container::validate_v3_open_dnam_layout;
     use crate::provenance::DefaultCryptoProvider;
     use crate::schema::{
-        CabinetKautzConfig, ControlBusConfig, DatasetProvenance, IoConfig, IoRouterConfig,
-        ModelMetadata, PresetDef, SlimmableTiersConfig, SpatialTankConfig, TierProfile,
+        ControlBusConfig, DatasetProvenance, IoConfig, LinearReadoutConfig, ModalConvolverConfig,
+        ModelMetadata, PresetDef, SlimmableTiersConfig, TierProfile, TransportConfig,
     };
     use alloc::collections::BTreeMap;
     use alloc::vec::Vec;
@@ -419,9 +469,9 @@ mod tests {
             controls_schema: Vec::new(),
             presets: Vec::new(),
             control_bus: ControlBusConfig::default(),
-            io_router: IoRouterConfig::default(),
-            cabinet: CabinetKautzConfig::default(),
-            spatial_tank: SpatialTankConfig::default(),
+            modal_convolver: ModalConvolverConfig::default(),
+            linear_readout: LinearReadoutConfig::default(),
+            transport: TransportConfig::default(),
             delay_histories: Vec::new(),
             tensor_directory: BTreeMap::new(),
         }

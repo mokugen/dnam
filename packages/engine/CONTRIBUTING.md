@@ -1,55 +1,56 @@
 # Contributing to `dnam-engine` (`packages/engine/`)
 
-This guide covers engineering, safety, testing, coverage, and benchmarking standards for **`dnam-engine`** ([`README.md`](README.md)), the `#![no_std]` + `alloc` Rust SIMD real-time audio engine at the heart of **DNAM**.
+This guide covers engineering, safety, testing, coverage, and benchmarking standards for **`dnam-engine`** ([`README.md`](README.md)), the `#![no_std]` + `alloc` Layer 1 `.dnam` shell, host patchbay, SPSC host, provenance, and C-ABI crate over [`dnam-vm`](../vm/README.md) and [`dnam-kernels`](../kernels/README.md).
 
 All contributions must also comply with the root [`CONTRIBUTING.md`](../../CONTRIBUTING.md) and [`CLA.md`](../../CLA.md) (`git commit -s`).
 
 ---
 
-## 1. Crate Architecture & Directory Layout
+## 1. Crate Architecture, Rule Scope & Directory Layout
 
 Consult [`AGENTS.md`](AGENTS.md) and the submodule `AGENTS.md` files for progressive-disclosure routing:
 
-- **`src/engine/` ([`src/engine/AGENTS.md`](src/engine/AGENTS.md)):** Top-level generic engine dispatcher, dual-rate (`48 kHz` / `3 kHz`) lifecycle, and 4-tier `SONA` Matryoshka SIMD hierarchy.
-- **`src/operators/` ([`src/operators/AGENTS.md`](src/operators/AGENTS.md)):** Op-T (Transport/Elastic Buffer), Op-M (Modal Bank/Kautz), and Op-N (`PolyADAA1`/Wavefolder/Bitcrusher backed by shared `#![no_std]` `packages/kernels` primitives).
-- **`src/graph/` ([`src/graph/AGENTS.md`](src/graph/AGENTS.md)):** I/O Router (`io_router` 8-Port Matrix Router), `SONA` `v3.0` `SonaHotSlab`/`SonaInstance` (`TPT-SVF` + `1D ParaLRU` + `PolyADAA1`), Cabinet Bank (`cabinet` `FIR` + `Kautz`), and Spatial Tank (`spatial_tank` `Op-T` tank).
-- **`src/control/` ([`src/control/AGENTS.md`](src/control/AGENTS.md)):** $3\text{ kHz}$ envelopes, 4-FMA + Newton LFO rotors, Node-Anchored Lobatto HDMR, Rank-4/8 FM, and 3-Phase control clamping.
-- **`src/container/` ([`src/container/AGENTS.md`](src/container/AGENTS.md)):** 64-byte `.dnam` preamble, `zerocopy` `v3.0` (`"sona"`) `DnamContainerView`, `DMU1`/`DMUE` mutable suffix framing, and Continuous-Time ZOH sample-rate rescaler (`44.1–384 kHz`). (`.dnam-proj` project containers and `uplo='U'` Gram packing live in `packages/capture/src/proj/`.)
-- **`src/provenance/` ([`src/provenance/AGENTS.md`](src/provenance/AGENTS.md)):** `DAU1` authentication envelopes, RFC 8785 JCS header digests, `Ed25519` prefix commitments, `OemDeviceCertificate` attestation, RFC 9180 HPKE & `DME1` encryption, Dual-Mechanism buyer watermarking, and `.dnam-prev` containment.
-- **`src/schema/` ([`src/schema/AGENTS.md`](src/schema/AGENTS.md)):** `#![no_std]` `serde` JSON header types, UI skew curves, and `DnamError`.
+- **`src/engine/` ([`src/engine/AGENTS.md`](src/engine/AGENTS.md)) & [`src/engine/patchbay/AGENTS.md`](src/engine/patchbay/AGENTS.md):** `DnamEngine<'a, B>` wrapper over `dnam_vm::SonaVm`, Layer 1 `HostShellPatchbay` (Stereo, Mono, `4CM`, `WDW`, DualAmp, return/parallel alignment, M-S width), presets, tempo sync, and offline bounce.
+- **`src/dynamic/` ([`src/dynamic/AGENTS.md`](src/dynamic/AGENTS.md)):** Runtime SIMD backend dispatch (`DynamicDnamEngine<'a>`) with zero per-sample branching.
+- **`src/host/` ([`src/host/AGENTS.md`](src/host/AGENTS.md)):** Lock-free 3-lane SPSC control ingress, `AcceptedStateShadow`, 64 B Seqlock telemetry, ping-pong model swap, and `DnamHostHandle`.
+- **`src/container/` ([`src/container/AGENTS.md`](src/container/AGENTS.md)):** 64 B `.dnam` preamble, `zerocopy` v3.0 `DnamContainerView`, `DMU1`/`DMUE` mutable suffix framing, prefix tier slimming, and zero-copy `.dnam-bin` extraction (`extract_dnam_bin`).
+- **`src/provenance/` ([`src/provenance/AGENTS.md`](src/provenance/AGENTS.md)):** `DAU1` authentication envelopes, RFC 8785 JCS header digests, Ed25519 prefix commitments, `OemDeviceCertificate` attestation, RFC 9180 HPKE + ChaCha20-Poly1305 `.dnam-seal` (`DNSL`), buyer watermarking, and `.dnam-prev` containment (`PreviewGuardState`).
+- **`src/schema/` ([`src/schema/AGENTS.md`](src/schema/AGENTS.md)):** `#![no_std]` `serde` JSON header types, UI skew curves, `ControlClampDescriptor` compilation, and `DnamError`.
+
+### Specification Rule Scope (`spec_scope.toml`)
+
+Every canonical `r[...]` rule across `docs/specs/` appears in [`spec_scope.toml`](spec_scope.toml) as either `scope = "engine"` (verified via `verify[...]` inside `packages/engine`) or `scope = "out-of-scope"` (with a non-empty `reason` naming `packages/vm`, `packages/kernels`, `packages/capture`, `packages/js`, or `tests/*.test.ts`). Layer 0 VM and kernel DSP rules remain `scope = "out-of-scope"` in `packages/engine` because `dnam-vm` and `dnam-kernels` own and verify them directly; `test_engine_spec_scope_manifest` enforces an exact 1:1 key set and verification parity.
 
 ### Test, Benchmark & Example Placement
 
-- **Unit & Property Tests (`#[cfg(test)] mod tests` / `mod spec_tests`):** Co-locate all module unit tests, specification verification suites (`verify[...]`), and `proptest!` suites inside the submodule they test (`src/math/spec_math.rs`, `src/container/wire.rs`, `src/provenance/security.rs`, `src/control/plane.rs`, `src/control/bus.rs`, `src/operators/{op_t,op_m,op_n,reference}.rs`, `src/graph/{topology,tank/fdn}.rs`).
-  - **Use `proptest!` Wherever Possible:** Every mathematical kernel, fixed-point accumulator, DSP operator (`Op-T`, `Op-M`, `Op-N`), graph recurrence, wire parser/serializer, and cryptographic framing helper must include `proptest!` property tests sweeping its full input domain (coupled with deterministic boundary/vector tests for exact IEEE-754 bit patterns). Keep `tests/` strictly for cross-cutting multi-subsystem integration tests (which should also use `proptest!` for end-to-end block/rate/tier sweeps).
-- **Integration Tests (`tests/`):** Keep `tests/` strictly for cross-cutting crate integration tests:
-  - [`tests/backend_parity.rs`](tests/backend_parity.rs): Backend and topology parity checks (`0.000000 ULP`) across `ScalarBackend`, `NeonBackend`, `ArmSve2Backend`, `ArmSmeBackend`, `X86Sse2Backend`, `X86Sse42Backend`, `X86Avx2FmaBackend`, and `WasmSimd128Backend`.
-  - [`tests/realtime_safety.rs`](tests/realtime_safety.rs): `TrackingAllocator` checks for zero-allocation real-time audio callbacks.
-  - [`tests/realtime_disassembly_audit.rs`](tests/realtime_disassembly_audit.rs): Automated release-binary `objdump -dr` disassembly and transitive call-graph audit verifying `0` `FDIV`, `FSQRT`, `IDIV`/`UDIV`/`SDIV`, `libm`/`fmodf`, heap allocator, or uncached OS syscall instructions (`ref[sdk.rust.realtime-disassembly-audit]`).
-  - [`tests/sona_pipeline_and_zoh_verification.rs`](tests/sona_pipeline_and_zoh_verification.rs), [`tests/sona_calibration_and_lifecycle.rs`](tests/sona_calibration_and_lifecycle.rs) & [`tests/sona_extended_pipeline.rs`](tests/sona_extended_pipeline.rs): End-to-end `SONA` `v3.0` pipeline (`Tests 8H, 8I`), ZOH multi-rate rescaling, `4x` offline bounce, calibration roles, `W_ctrl` modulation, `DAU1` signing, `zerocopy` wire contracts, shared `#![no_std]` `packages/kernels` verification, and multi-port (`4CM`/`WDW`/sidechain) integration.
-  - [`tests/marketplace_provenance_and_watermark.rs`](tests/marketplace_provenance_and_watermark.rs) & [`tests/marketplace_seal_and_policy.rs`](tests/marketplace_seal_and_policy.rs): End-to-end cryptographic provenance, `.dnam-seal` hardware enclave envelopes, and Dual-Mechanism buyer watermarking.
-  - [`tests/ffi_integration.rs`](tests/ffi_integration.rs): C-ABI lifecycle and null-pointer safety.
-- **Benchmarks (`benches/`):** Organize Criterion throughput and WCET latency benchmarks by subsystem across [`benches/pipeline.rs`](benches/pipeline.rs), [`benches/operators.rs`](benches/operators.rs), [`benches/graph_and_control.rs`](benches/graph_and_control.rs), [`benches/container_and_provenance.rs`](benches/container_and_provenance.rs), and [`benches/realtime_wcet.rs`](benches/realtime_wcet.rs).
-- **Examples (`examples/`):** Place runnable API demonstrations in [`examples/realtime_audio_block.rs`](examples/realtime_audio_block.rs), [`examples/embedded_zero_alloc.rs`](examples/embedded_zero_alloc.rs), [`examples/marketplace_provenance.rs`](examples/marketplace_provenance.rs), [`examples/container_slimming.rs`](examples/container_slimming.rs), [`examples/custom_operator_chain.rs`](examples/custom_operator_chain.rs), and [`examples/c_abi_host_integration.rs`](examples/c_abi_host_integration.rs).
+- **Unit & Property Tests (`#[cfg(test)] mod tests`):** Co-locate all module unit tests, specification verification suites (`verify[...]`), and `proptest!` suites inside the exact submodule they test (`src/container/`, `src/dynamic/`, `src/engine/`, `src/host/`, `src/provenance/`, `src/schema/`, `src/memory.rs`, `src/types.rs`).
+  - **Use `proptest!` Wherever Possible:** Sweep full input domains across wire parsers/serializers, alignment filters, SPSC/Seqlock concurrency primitives, schema clamp compilers, and cryptographic/watermarking helpers alongside deterministic boundary vector tests.
+- **Integration Tests (`tests/`):** Keep `tests/` strictly for cross-cutting crate integration suites:
+  - [`tests/backend_parity.rs`](tests/backend_parity.rs): Cross-ISA backend parity and multi-topology checks across `ScalarBackend`, AArch64 NEON/SVE2/SME, x86-64 SSE2/SSE4.2/AVX2+FMA, and WASM SIMD128.
+  - [`tests/realtime_safety.rs`](tests/realtime_safety.rs): `CountingAllocator` verification of zero heap allocations/deallocations across real-time audio callbacks, `DnamHostHandle`, and C-ABI FFI.
+  - [`tests/realtime_disassembly_audit.rs`](tests/realtime_disassembly_audit.rs): Automated release-binary `objdump -dr` disassembly and transitive call-graph audit verifying zero `FDIV`, `FSQRT`, `IDIV`/`UDIV`/`SDIV`, `libm`, allocator, or uncached OS syscall instructions (`ref[sdk.rust.realtime-disassembly-audit]`).
+  - [`tests/sona_tier_and_multiport_lifecycle.rs`](tests/sona_tier_and_multiport_lifecycle.rs): Tier equivalence, multi-port `4CM`/`WDW`/parallel alignment, reload containment, ZOH, and 4× bounce lifecycle checks.
+  - [`tests/marketplace_provenance_and_watermark.rs`](tests/marketplace_provenance_and_watermark.rs) & [`tests/marketplace_seal_and_policy.rs`](tests/marketplace_seal_and_policy.rs): End-to-end cryptographic provenance, `.dnam-seal` hardware enclave envelopes, and buyer watermarking.
+  - [`tests/ffi_integration.rs`](tests/ffi_integration.rs): C-ABI lifecycle and null-pointer safety across all 15 `dnam_engine_*` exports.
+- **Benchmarks (`benches/`):** Place throughput and WCET suites in [`benches/pipeline.rs`](benches/pipeline.rs), [`benches/container_and_provenance.rs`](benches/container_and_provenance.rs), and [`benches/realtime_wcet.rs`](benches/realtime_wcet.rs).
+- **Examples (`examples/`):** Place runnable API demonstrations in [`examples/realtime_audio_block.rs`](examples/realtime_audio_block.rs), [`examples/embedded_zero_alloc.rs`](examples/embedded_zero_alloc.rs), [`examples/marketplace_provenance.rs`](examples/marketplace_provenance.rs), [`examples/container_slimming.rs`](examples/container_slimming.rs), [`examples/c_abi_host_integration.rs`](examples/c_abi_host_integration.rs), and [`examples/custom_operator_chain.rs`](examples/custom_operator_chain.rs).
 
 ---
 
-## 2. Safety, `#![forbid(unsafe_code)]` & Real-Time Audio Invariants
+## 2. Safety, `unsafe` Isolation & Real-Time Audio Invariants
 
 1. **Strict `unsafe` Isolation & Safe-Rust-First Requirement (`ref[repo.code.type-safety-and-imports]`):**
-   - `src/lib.rs` enforces `#![deny(unsafe_code)]` and all algorithmic and concurrency submodules (`operators`, `graph`, `control`, `container`, `provenance`, `schema`, `engine`, `dynamic`, `host`) enforce `#[forbid(unsafe_code)]` (zero `#[allow(unsafe_code)]`).
-   - **Never use `#[allow(unsafe_code)]` out of convenience:** Always design lock-free rings, seqlocks, hot-swap handles, and DSP state borrowing using safe Rust primitives first (`core::sync::atomic::AtomicU64` word arrays, atomic slot indices with `try_lock()`, disjoint struct field borrows, `zerocopy::transmute!`, and declarative `#[repr(C)]` `zerocopy::byteorder::little_endian` wire structs deriving `FromBytes, IntoBytes, KnownLayout, Immutable` per `.agents/rules/zerocopy-wire-structs.md` with compile-time `size_of`/align assertions).
-   - `#[allow(unsafe_code)]` is permitted **only** when **(a)** it is strictly unavoidable at a hardware/OS intrinsic or C-ABI boundary (`src/math/{aarch64,x86}.rs` and `src/math/aarch64/{neon,sve2,sme}.rs` + `src/math/x86/{sse2,sse42,avx2}.rs`, `src/types.rs` `FTZ`/`DAZ` CSR guards, `src/memory.rs` 64-byte aligned allocation, and `src/ffi.rs` C-ABI entrypoints; `src/math/wasm.rs` is `#[forbid(unsafe_code)]`), or **(b)** Criterion benchmarks prove the safe Rust checker version incurs a high real-time performance penalty **and** the `unsafe` block is guaranteed sound with an explicit `// SAFETY:` proof.
+   - `src/lib.rs` enforces `#![deny(unsafe_code)]`, permitting `#[allow(unsafe_code)]` **only** on [`src/ffi.rs`](src/ffi.rs) (`pub mod ffi`) and [`src/provenance/sha256_hw.rs`](src/provenance/sha256_hw.rs) (`#[cfg(target_arch = "aarch64")]` hardware SHA2 intrinsics).
+   - All remaining submodules (`container`, `dynamic`, `engine`, `host`, `memory`, `schema`, `types`, and all safe `provenance` submodules) enforce `#[forbid(unsafe_code)]`.
+   - Design lock-free rings, seqlocks, hot-swap handles, and wire codecs using safe Rust primitives (`core::sync::atomic::AtomicU64`, disjoint borrows, and declarative `#[repr(C)]` `zerocopy` wire structs deriving `FromBytes, IntoBytes, KnownLayout, Immutable` per [`.agents/rules/zerocopy-wire-structs.md`](../../.agents/rules/zerocopy-wire-structs.md)).
 2. **Zero Audio-Thread Heap Allocations:**
-   - `process_block`, `process_block_in_place`, `process_mono_to_stereo`, `process_mono`, `set_tier`, `set_sample_rate`, `set_control_value`, `reset_to_dc_equilibrium`, `telemetry_snapshot`, `from_bytes_with_scratch`, and `reload_model_in_place` must never allocate or deallocate heap memory.
-3. **Zero `FSQRT`, `FDIV`, `IDIV`/`UDIV`/`SDIV`, `libm`, or Nondeterministic Calls in $48\text{ kHz}$ / $3\text{ kHz}$ Paths (`ref[arch.simd.zero-stall-lowering]`):**
-   - Never use floating-point division, square-root, integer division/modulo (`/` or `%` on runtime integers, `.is_multiple_of`), `f32::rem_euclid` (which lowers to `bl _fmodf`), transcendental `libm` calls, unbounded `while` loops, or uncached OS syscalls in real-time audio or control-bus loops; use `floor_f32((theta + PI) * INV_TAU)`, incremental `(block_idx, in_block_offset)` counters, cached reciprocals, `newton6_reciprocal_f64`, and `sqrt_f64`.
-4. **Submodule & SIMD Implementation Invariants (`ref[arch.simd.two-level-traits]`, `ref[sdk.rust.explicit-simd-and-coverage]`):**
-   - **`src/math` & Domain Backend Traits:** Keep `SimdVec4` and `MathBackend` (`Crc32cBackend`) in `src/math/` and define higher-level operator/graph traits (`OpMBackend`, `OpNBackend`, `OpTBackend`, `CabinetBackend`, `GraphBackend`, `EngineBackend`) inside their respective domain modules (`engine -> graph -> operators -> math`). Write explicit trait implementations per ISA (`aarch64/{neon,sve2,sme}`, `x86/{sse2,sse42,avx2}`, `wasm`, `scalar`) with zero `macro_rules!` SIMD boilerplate and zero `#[cfg_attr(coverage, coverage(off))]`. Use `zerocopy::transmute!` for `[f32; 4]` $\leftrightarrow$ SIMD register conversions and unfused `rsqrt_nr2_pair_f32` for `0.000000 ULP` cross-backend parity.
-   - **`src/graph` & `src/engine`:** Keep L1D-resident hot state strictly aligned to `64 B` cache lines (`SONA` target `SonaHotSlab` `<= 4.5 / 7.75 / 15.5 / 28.0 KiB` (`4,608 / 7,936 / 15,872 / 28,672 B`) inside `N × ActiveHot <= 64 KiB` L1D), with zero audio-thread heap allocations and double-mirrored FIR histories. Verify tier-local allocation and alignment against the [state audit](../../docs/specs/architecture/sona_architecture.md#23-state-ram-audit-lite-budget). Existing arithmetic constants are not measured budgets.
-   - **`src/control`:** Follow the [node-anchored control basis](../../docs/specs/dsp/parametric_control_bus.md#22-cardinality-bounded-node-anchored-newtonlobatto-basis). A normalized default is zero only when the physical default is the declared midpoint.
-   - **`src/container` & `src/schema`:** Validate checked bounds, alignment, tier-prefix integrity, and authenticated shared data against the [container format](../../docs/specs/containers/dnam_binary_format.md); do not assume fixed tier lengths or treat `CRC32C` as authentication. Keep `serde` / `serde_json` configured with `default-features = false, features = ["alloc"]`.
-   - **`src/provenance`:** Apply the exact versioned [immutable-header projection](../../docs/specs/security/provenance_and_enclave_drm.md#21-preset-safe-canonical-header-digest-rfc-8785-jcs); do not recursively exclude same-named fields. Mutable edits are constrained by the authenticated region and its capacity.
+   - `process_block`, `process_block_in_place`, `process_mono_to_stereo`, `process_mono`, `process_block_io`, `set_tier`, `set_sample_rate` (and C-ABI `dnam_engine_set_sample_rate`), `set_control_value`, `reset_to_dc_equilibrium`, `telemetry_snapshot`, and `reload_model_in_place` must never allocate or deallocate heap memory.
+3. **Zero `FSQRT`, `FDIV`, `IDIV`/`UDIV`/`SDIV`, `libm`, or Nondeterministic Calls in 48 kHz / 3 kHz Paths (`ref[arch.simd.zero-stall-lowering]`):**
+   - Never use floating-point division, square-root, integer division/modulo on runtime integers, `f32::rem_euclid`, `libm` calls, unbounded `while` loops, or uncached syscalls inside real-time patchbay, preview-guard, or audio-callback loops.
+4. **Module-Specific Invariants:**
+   - **`src/engine/`:** Keep `HostShellPatchbay` structurally isolated (`S_{ret->send} = 0`), clamp `ms_width` to `[0.0, 2.0]`, and derive `ParallelAlignLine` Kaiser-sinc taps at compile time via `dnam_vm::math::const_eval`.
+   - **`src/container/` & `src/schema/`:** Validate checked bounds, 64 B alignment, tier-prefix integrity, and authenticated shared extents against the [container format](../../docs/specs/containers/dnam_binary_format.md); keep `serde` / `serde_json` configured with `default-features = false, features = ["alloc"]`.
+   - **`src/provenance/`:** Apply the exact versioned [immutable-header projection](../../docs/specs/security/provenance_and_enclave_drm.md#21-preset-safe-canonical-header-digest-rfc-8785-jcs) without heuristic field exclusions; constrain mutable edits strictly to the authenticated extent and capacity.
 
 ---
 
@@ -78,16 +79,13 @@ HOTPATH_LIMIT=0 HOTPATH_CRITERION_ITERATIONS=500 \
   -- --test --exact "process_block_128/ARM64 NEON/ultra"
 ```
 
-Coverage is a floor, not a bug-free guarantee. Independently challenge the
-specification and implementation with boundary, differential, long-run,
-backend, integration, and target-hardware tests; inspect untested branches
-and platform-specific paths separately.
+Coverage is a floor, not a bug-free guarantee. Independently challenge the specification and implementation with boundary, differential, long-run, backend, integration, and target-hardware tests; inspect untested branches and platform-specific paths separately.
 
 ---
 
 ## 4. Pre-Commit Checklist for `packages/engine/`
 
-- [ ] Every new or modified module includes `proptest!` property-based tests (alongside exact boundary/vector tests) co-located in its source file (`#[cfg(test)]`), with `verify[...]` citations for all covered `r[...]` specification rules.
-- [ ] `moon check engine` passes all formatting, Clippy (`-D warnings`), build, and unit/`proptest`/integration tests (`tests/realtime_safety.rs` and `tests/backend_parity.rs`).
-- [ ] `moon run engine:coverage` confirms ≥ 95% coverage, including all newly added or modified functions and tier branches.
-- [ ] If any public API or FFI signature changed, `packages/js/rust/` bindings and scoped `AGENTS.md` files (`< 2,500 B`) are updated accordingly.
+- [ ] Every new or modified module includes `proptest!` property-based tests (alongside exact boundary/vector tests) co-located in its source file (`#[cfg(test)]`), with `verify[...]` citations matching [`spec_scope.toml`](spec_scope.toml).
+- [ ] `moon check engine` passes all formatting, Clippy (`-D warnings`), build, and unit/`proptest`/integration suites (`tests/realtime_safety.rs`, `tests/backend_parity.rs`, `tests/realtime_disassembly_audit.rs`).
+- [ ] `moon run engine:coverage` confirms ≥ 95% line coverage, including all newly added or modified functions and tier branches.
+- [ ] If any public API or C-ABI signature changed, `packages/js/rust/` bindings and scoped `AGENTS.md` files (< 2,500 B) are updated accordingly.

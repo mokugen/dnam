@@ -25,12 +25,11 @@ pub use super::io_and_tiers::{
 };
 pub use super::json_wire::TensorSliceEntry;
 pub use super::topology::{
-    CabinetKautzConfig, ControlBusConfig, IoRouterConfig, SpatialTankConfig,
+    ControlBusConfig, LinearReadoutConfig, ModalConvolverConfig, TransportConfig,
     default_allpass_delays, default_dc_pole, default_delay_storage, default_envelopes,
     default_fir_taps, default_fm_rank, default_interp, default_kautz_modals, default_lfo_harmonics,
-    default_lfos, default_loop_ceiling, default_modulation_bus_dim, default_router_ports,
-    default_sub_crossover_hz, default_switch_xfade, default_trust_radius, default_tzf_tap,
-    deserialize_allpass_delays,
+    default_lfos, default_loop_ceiling, default_modulation_bus_dim, default_ro_pole_48k,
+    default_switch_xfade, default_trust_radius, default_tzf_tap, deserialize_allpass_delays,
 };
 
 /// Semantic version (`major.minor.patch`) of the `.dnam` container schema.
@@ -169,6 +168,7 @@ const fn default_sample_rate() -> u32 {
 
 /// Top-level UTF-8 JSON header in Region 3 of a canonical `v3.0` `.dnam` container.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct DnamJsonHeader {
     /// Semantic version of the container schema (`"3.0.0"`).
     #[serde(default = "default_version")]
@@ -203,15 +203,15 @@ pub struct DnamJsonHeader {
     /// Control-Bus parameter definitions.
     #[serde(default)]
     pub control_bus: ControlBusConfig,
-    /// 8-Port I/O Matrix Router configuration (`io_router`).
+    /// Early FIR + Orthonormal Kautz Modal Bank convolver configuration (`modal_convolver`).
     #[serde(default)]
-    pub io_router: IoRouterConfig,
-    /// Early FIR + Orthonormal Kautz Modal Bank cabinet configuration (`cabinet`).
+    pub modal_convolver: ModalConvolverConfig,
+    /// Learned 48 kHz linear readout leak pole configuration (`linear_readout`).
     #[serde(default)]
-    pub cabinet: CabinetKautzConfig,
-    /// Spatial `Op-T` FDN Tank configuration (`spatial_tank`).
+    pub linear_readout: LinearReadoutConfig,
+    /// Symmetric coercive `Op-T` Transport configuration (`transport`).
     #[serde(default)]
-    pub spatial_tank: SpatialTankConfig,
+    pub transport: TransportConfig,
     /// Optional delay-history capacity declarations for non-RT BBD/FDN buffer pre-allocation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delay_histories: Vec<DelayHistoryEntry>,
@@ -329,9 +329,9 @@ impl DnamJsonHeader {
             controls_schema: Vec::new(),
             presets: Vec::new(),
             control_bus: ControlBusConfig::default(),
-            io_router: IoRouterConfig::default(),
-            cabinet: CabinetKautzConfig::default(),
-            spatial_tank: SpatialTankConfig::default(),
+            modal_convolver: ModalConvolverConfig::default(),
+            linear_readout: LinearReadoutConfig::default(),
+            transport: TransportConfig::default(),
             delay_histories: Vec::new(),
             tensor_directory: BTreeMap::new(),
         }
@@ -369,6 +369,13 @@ impl DnamJsonHeader {
         }
         if self.sample_rate_train_hz != 48_000 {
             return Err(DnamError::InvalidSampleRate(self.sample_rate_train_hz));
+        }
+        let ro_pole = self.linear_readout.ro_pole_48k;
+        if !ro_pole.is_finite() || !(0.0..=dnam_kernels::MAX_PARALRU_R_F32).contains(&ro_pole) {
+            return Err(DnamError::SchemaValidationError(alloc::format!(
+                "linear_readout.ro_pole_48k ({ro_pole}) must be finite and in [0.0, {}]",
+                dnam_kernels::MAX_PARALRU_R_F32
+            )));
         }
         if self.controls_schema.len() > u8::MAX as usize {
             return Err(DnamError::SchemaValidationError(
@@ -428,11 +435,11 @@ impl DnamJsonHeader {
     }
 
     /// Compiles `controls_schema` ($P \in [0, 255]$) into a vector of 64-byte binary
-    /// [`crate::control::ControlClampDescriptor`] records (`CL 0` of each 128-byte `ControlChannelRecord[p]`)
+    /// [`dnam_vm::control::ControlClampDescriptor`] records (`CL 0` of each 128-byte `ControlChannelRecord[p]`)
     /// used at $3\text{ kHz}$ with zero string parsing and zero `FDIV`.
     pub fn compile_clamp_descriptors(
         &self,
-    ) -> Result<Vec<crate::control::ControlClampDescriptor>, DnamError> {
+    ) -> Result<Vec<dnam_vm::control::ControlClampDescriptor>, DnamError> {
         clamp_compiler::compile_controls_schema_descriptors(&self.controls_schema)
     }
 
@@ -536,9 +543,9 @@ mod tests {
             },
             "io_config": {},
             "control_bus": {},
-            "io_router": {},
-            "cabinet": {},
-            "spatial_tank": {},
+            "modal_convolver": {},
+            "linear_readout": {},
+            "transport": {},
             "slimmable_tiers": {
                 "lite": { "channels": 16, "tank_lines": 4, "arena_end_byte_offset": 4608, "prefix_crc32c": 0 },
                 "full": { "channels": 24, "tank_lines": 8, "arena_end_byte_offset": 7936, "prefix_crc32c": 0 },
@@ -577,9 +584,20 @@ mod tests {
         assert_eq!(h.slimmable_tiers.lite.head_svd_rank, 4);
         assert_eq!(h.slimmable_tiers.pro.arena_end_byte_offset, 15_872);
         assert_eq!(h.control_bus.envelopes, 4);
-        assert_eq!(h.cabinet.fir_taps, 32);
-        assert_eq!(h.spatial_tank.dc_blocker_pole, 0.995);
+        assert_eq!(h.modal_convolver.fir_taps, 32);
+        assert_eq!(h.linear_readout.ro_pole_48k, 0.0);
+        assert_eq!(h.transport.dc_blocker_pole, 0.995);
         assert!(h.validate().is_ok());
+
+        h.linear_readout.ro_pole_48k = dnam_kernels::MAX_PARALRU_R_F32;
+        assert!(h.validate().is_ok());
+        h.linear_readout.ro_pole_48k = -0.01;
+        assert!(h.validate().is_err());
+        h.linear_readout.ro_pole_48k = 1.0;
+        assert!(h.validate().is_err());
+        h.linear_readout.ro_pole_48k = f32::NAN;
+        assert!(h.validate().is_err());
+        h.linear_readout.ro_pole_48k = 0.0;
 
         // Legacy v2 or non-"sona" architecture must fail fast with UnsupportedVersion.
         h.version = "2.0.0".to_string();
@@ -600,7 +618,7 @@ mod tests {
         let decl_default: DelayHistoryEntry = serde_json::from_str(
             r#"{
                 "id": "tank.quad0.line0",
-                "owner": "spatial_tank",
+                "owner": "transport",
                 "kind": "fractional",
                 "introduced_tier": "lite",
                 "sample_format": "fp16",
@@ -731,9 +749,11 @@ mod tests {
         );
         assert!(DnamJsonHeader::validate_and_normalize_json_str(&bad_unknown).is_err());
 
-        // Misplaced optional field ("shape" inside "cabinet" or "distribution_policy" at root) must fail
-        let bad_misplaced =
-            minimal_json.replace("\"cabinet\": {}", "\"cabinet\": {\"shape\": \"bad\"}");
+        // Misplaced optional field ("shape" inside "modal_convolver" or "distribution_policy" at root) must fail
+        let bad_misplaced = minimal_json.replace(
+            "\"modal_convolver\": {}",
+            "\"modal_convolver\": {\"shape\": \"bad\"}",
+        );
         assert!(DnamJsonHeader::validate_and_normalize_json_str(&bad_misplaced).is_err());
         let bad_root_opt = minimal_json.replace(
             "\"metadata\": {",
@@ -741,10 +761,35 @@ mod tests {
         );
         assert!(DnamJsonHeader::validate_and_normalize_json_str(&bad_root_opt).is_err());
 
+        // Legacy fields evicted from the canonical v3.0 SONA schema must fail closed.
+        for legacy_patch in [
+            ("\"metadata\": {", "\"io_router\": {}, \"metadata\": {"),
+            (
+                "\"metadata\": {",
+                "\"sub_crossover_hz\": 200.0, \"metadata\": {",
+            ),
+            (
+                "\"io_config\": {}",
+                "\"io_config\": {\"capabilities\": {\"supports_freeze\": true}}",
+            ),
+            (
+                "\"io_config\": {}",
+                "\"io_config\": {\"capabilities\": {\"freeze_mutes_dry\": true}}",
+            ),
+            (
+                "\"controls_schema\": [",
+                "\"controls_schema\": [{ \"id\": \"F\", \"name\": \"F\", \"type\": \"switch\", \"declared_options\": [\"off\", \"on\"], \"default\": \"off\", \"calibration\": { \"role\": \"freeze_latch\" } },",
+            ),
+        ] {
+            let legacy_json = minimal_json.replace(legacy_patch.0, legacy_patch.1);
+            assert!(DnamJsonHeader::from_json_str(&legacy_json).is_err());
+            assert!(DnamJsonHeader::validate_and_normalize_json_str(&legacy_json).is_err());
+        }
+
         // Explicit null on valid skip_serializing_if fields must succeed
         let ok_explicit_nulls = minimal_json.replace(
             "\"metadata\": {",
-            "\"stems_registry\": null, \"audit_report\": null, \"metadata\": {\"distribution_policy\": null,",
+            "\"delay_histories\": [], \"stem_user_metadata\": {}, \"metadata\": {\"distribution_policy\": null,",
         );
         assert!(DnamJsonHeader::validate_and_normalize_json_str(&ok_explicit_nulls).is_ok());
     }

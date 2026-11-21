@@ -1,4 +1,4 @@
-//! M10b-aligned integration contract tests: `384 kHz` live retiming, failure-atomic
+//! SONA v3.0 integration contract tests: `384 kHz` live retiming, failure-atomic
 //! `192 kHz` `4x` offline bounce rejection, unconditional `Op-P` + phasor stepping across tier
 //! transitions, `Op-T` 4-frame micro-ramp vs `3 kHz` `psi` slew cadence, dirty-control LFO/drift
 //! isolation, `HOST_WRITE_LOCK` tier sync, and OU drift scrub on disable or offline bounce.
@@ -9,14 +9,20 @@ use zerocopy::FromZeros;
 use zerocopy::byteorder::little_endian::{F32, U16, U32};
 
 use dnam_kernels::QUAD_FLAG_HOST_WRITE_LOCK;
-use dnam_vm::bin::{Arena1FullDeltaWire, DNBN_FLAG_STEREO_OUT, DnamBinBuildInput, encode_dnam_bin};
+use dnam_vm::bin::{
+    Arena1FullDeltaWire, Arena2ProDeltaWire, DNBN_FLAG_STEREO_OUT, DnamBinBuildInput,
+    encode_dnam_bin,
+};
 use dnam_vm::graph::ConvolverHighSrMode;
 use dnam_vm::math::{TANK_DC_BLOCKER_48K_F32, f32_to_fp16};
-use dnam_vm::{DefaultMathBackend, DynamicSonaVm, SonaVm, Tier, VmError};
+use dnam_vm::{
+    Bounce4xOversampler, DefaultMathBackend, DynamicSonaVm, OFFLINE_BOUNCE_PDC_SAMPLES, SonaVm,
+    TIER_SWITCH_XFADE_SAMPLES, Tier, VmError,
+};
 
 use super::helpers::{
-    assert_finite_non_silent, build_full_pipeline_ultra_fixture, fp16_arr, make_core_quad,
-    make_transport_quad, stereo_test_signal,
+    assert_finite_non_silent, build_full_pipeline_ultra_fixture, fp16_arr, fp16_val, le_f32,
+    make_core_quad, make_transport_quad, stereo_test_signal,
 };
 
 fn build_zero_crossbar_lite_full_fixture() -> Vec<u8> {
@@ -90,6 +96,7 @@ fn build_zero_crossbar_lite_full_fixture() -> Vec<u8> {
     .expect("encode zero-crossbar Lite+Full fixture")
 }
 
+/// verify[dsp.ctrl.op-m.rate-retime]
 #[test]
 fn test_retime_384k_and_failure_atomic_offline_bounce_192k() {
     let ultra = build_full_pipeline_ultra_fixture();
@@ -163,6 +170,7 @@ fn test_retime_384k_and_failure_atomic_offline_bounce_192k() {
     assert_eq!(dyn_fail.telemetry().latency_samples, 0);
 }
 
+/// verify[dsp.crossbar.top-of-frame]
 #[test]
 fn test_unconditional_opp_and_phasor_stepping_across_tier_switch() {
     let bin = build_zero_crossbar_lite_full_fixture();
@@ -295,6 +303,8 @@ fn test_opt_micro_ramp_4frame_latch_and_dirty_lfo_drift_invariance() {
     );
 }
 
+/// verify[dsp.ctrl.op-m.timing]
+/// verify[dsp.ctrl.switch.conditional-batch]
 #[test]
 fn test_mid_window_ctrl_dirty_waits_for_3khz_boundary_with_zero_ulp_chunk_parity() {
     let ultra = build_full_pipeline_ultra_fixture();
@@ -500,4 +510,309 @@ fn test_zero_control_ou_drift_scrubbed_cleanly_on_drift_disable_and_offline_boun
         bus_b.eff_z_stage().map(f32::to_bits),
         bus_b.z_stage().map(f32::to_bits)
     );
+}
+
+fn build_wdw_core_conv_transport_multi_tier_bin(stereo_out: bool) -> Vec<u8> {
+    let mut a0 = DnamBinBuildInput::default_arena0_lite();
+    a0.crossbar.cell_desc.tier_flags = U16::new(0x0007);
+    a0.crossbar.cell_desc.oversample_factor = U16::new(2);
+    let q_core = make_core_quad(0);
+    a0.core_quads = [q_core; 4];
+    a0.conv_fir_lite.fir_l[0] = F32::new(0.70);
+    a0.conv_fir_lite.fir_r[0] = F32::new(0.65);
+    a0.conv_fir_lite.fir_l[1] = F32::new(0.15);
+    a0.conv_fir_lite.fir_r[1] = F32::new(-0.10);
+    a0.linear_readout_lite.pre_conv_u_gain = le_f32([0.45, 0.40]);
+    a0.linear_readout_lite.direct_s2_u_gain = le_f32([0.75, 0.70]);
+    for lane in 0..16 {
+        a0.linear_readout_lite.w_ro_fp16[lane * 12] = fp16_val(0.12);
+        a0.linear_readout_lite.w_ro_fp16[lane * 12 + 1] = fp16_val(0.10);
+        a0.linear_readout_lite.w_ro_fp16[lane * 12 + 6] = fp16_val(0.18);
+        a0.linear_readout_lite.w_ro_fp16[lane * 12 + 7] = fp16_val(0.16);
+    }
+    a0.transport_lite.delay_samples = le_f32([12.0, 16.0, 20.0, 24.0]);
+    a0.transport_lite.g_loop = F32::new(0.7);
+    a0.transport_lite.r_dc = F32::new(TANK_DC_BLOCKER_48K_F32);
+    a0.transport_lite.damp_pole = F32::new(0.15);
+    a0.transport_lite.input_gains_fp16 = fp16_arr([0.5, 0.4, -0.35, 0.3]);
+    a0.transport_lite.wet_tap_l_fp16 = fp16_arr([0.4, -0.25, 0.3, 0.2]);
+    a0.transport_lite.wet_tap_r_fp16 = fp16_arr([-0.25, 0.45, 0.2, 0.3]);
+    a0.control_bus_lite.tank_dry_mix_fp16 = fp16_val(0.6);
+
+    let mut a1 = Arena1FullDeltaWire::new_zeroed();
+    a1.core_quads = [make_core_quad(4), make_core_quad(5)];
+    a1.conv_fir_full.fir_l[0] = F32::new(0.20);
+    a1.conv_fir_full.fir_r[0] = F32::new(0.18);
+    a1.transport_full = make_transport_quad(1);
+    a1.transport_full.g_loop = F32::new(0.7);
+    for l in 0..24 {
+        a1.linear_readout_full.w_ro_and_mods_fp16[l * 12] = fp16_val(0.08);
+        a1.linear_readout_full.w_ro_and_mods_fp16[l * 12 + 1] = fp16_val(0.07);
+        a1.linear_readout_full.w_ro_and_mods_fp16[l * 12 + 6] = fp16_val(0.12);
+        a1.linear_readout_full.w_ro_and_mods_fp16[l * 12 + 7] = fp16_val(0.11);
+    }
+    let tail1 = 24 * 12;
+    a1.linear_readout_full.w_ro_and_mods_fp16[tail1] = fp16_val(0.35);
+    a1.linear_readout_full.w_ro_and_mods_fp16[tail1 + 1] = fp16_val(0.32);
+    a1.linear_readout_full.w_ro_and_mods_fp16[tail1 + 4] = fp16_val(0.55);
+    a1.linear_readout_full.w_ro_and_mods_fp16[tail1 + 5] = fp16_val(0.50);
+
+    let mut a2 = Arena2ProDeltaWire::new_zeroed();
+    a2.core_quads = [make_core_quad(6), make_core_quad(7)];
+    a2.conv_fir_pro.fir_l[0] = F32::new(0.15);
+    a2.conv_fir_pro.fir_r[0] = F32::new(-0.12);
+    a2.transport_pro[0] = make_transport_quad(2);
+    a2.transport_pro[0].g_loop = F32::new(0.7);
+    a2.transport_pro[0].wet_tap_l_fp16 = fp16_arr([0.35, -0.2, 0.25, 0.15]);
+    a2.transport_pro[0].wet_tap_r_fp16 = fp16_arr([-0.2, 0.38, 0.15, 0.22]);
+    for l in 0..32 {
+        a2.linear_readout_pro.w_ro_and_mods_fp16[l * 12] = fp16_val(0.06);
+        a2.linear_readout_pro.w_ro_and_mods_fp16[l * 12 + 1] = fp16_val(0.05);
+        a2.linear_readout_pro.w_ro_and_mods_fp16[l * 12 + 6] = fp16_val(0.09);
+        a2.linear_readout_pro.w_ro_and_mods_fp16[l * 12 + 7] = fp16_val(0.08);
+    }
+    let tail2 = 32 * 12;
+    a2.linear_readout_pro.w_ro_and_mods_fp16[tail2] = fp16_val(0.30);
+    a2.linear_readout_pro.w_ro_and_mods_fp16[tail2 + 1] = fp16_val(0.28);
+    a2.linear_readout_pro.w_ro_and_mods_fp16[tail2 + 4] = fp16_val(0.45);
+    a2.linear_readout_pro.w_ro_and_mods_fp16[tail2 + 5] = fp16_val(0.42);
+
+    encode_dnam_bin(&DnamBinBuildInput {
+        reference_sample_rate_hz: 48_000,
+        header_flags: if stereo_out { DNBN_FLAG_STEREO_OUT } else { 0 },
+        ext_ring_pow2_frames: 10,
+        ext_ring_lines: 4,
+        ext_ring_format: 1,
+        declared_max_delay_48k: 128,
+        dc_blocker_pole_5hz: TANK_DC_BLOCKER_48K_F32,
+        tail_time_ms: 250.0,
+        ro_pole_48k: 0.99,
+        switch_xfade_samples: 48,
+        content_hash_prefix: [9; 8],
+        controls: &[],
+        cp1_overflow: &[],
+        tsyn: &[],
+        cext: None,
+        arena0: &a0,
+        arena1: Some(&a1),
+        arena2: Some(&a2),
+        arena3: None,
+    })
+    .expect("encode multi-tier WDW fixture")
+}
+
+#[test]
+fn test_wdw_partition_tier_switch_crossfade_parity() {
+    for &stereo_out in &[true, false] {
+        for &offline in &[false, true] {
+            let bin = build_wdw_core_conv_transport_multi_tier_bin(stereo_out);
+            let mut vm =
+                SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&bin, Tier::Lite, 48_000.0)
+                    .unwrap();
+            if offline {
+                vm.set_offline_bounce(true).unwrap();
+            }
+
+            let mut max_core = 0.0_f32;
+            let mut max_wet = 0.0_f32;
+            let mut last_out = [0.0_f32; 2];
+            let mut last_core = [0.0_f32; 2];
+            let mut last_wet = [0.0_f32; 2];
+
+            for n in 0..64 {
+                let ph = 2.0 * core::f32::consts::PI * (n as f32) / 48_000.0;
+                let in_l = 0.40 * (440.0 * ph).sin();
+                let in_r = -0.35 * (330.0 * ph).cos();
+                let (ol, or) = vm.step_frame(in_l, in_r).unwrap();
+                let (core_lr, wet_lr) = vm.last_wdw_partition();
+                assert!(((core_lr[0] + wet_lr[0]) - ol).abs() < 1.0e-5);
+                assert!(((core_lr[1] + wet_lr[1]) - or).abs() < 1.0e-5);
+                max_core = max_core.max(core_lr[0].abs()).max(core_lr[1].abs());
+                max_wet = max_wet.max(wet_lr[0].abs()).max(wet_lr[1].abs());
+                last_out = [ol, or];
+                last_core = core_lr;
+                last_wet = wet_lr;
+            }
+            assert!(max_core > 1.0e-2 && max_wet > 1.0e-3);
+
+            vm.switch_tier(Tier::Pro).unwrap();
+            assert!(vm.slab().xfade_active());
+            assert_eq!(vm.slab().cold().xfade_rem, TIER_SWITCH_XFADE_SAMPLES);
+
+            for k in 0..80 {
+                let n = 64 + k;
+                let ph = 2.0 * core::f32::consts::PI * (n as f32) / 48_000.0;
+                let in_l = 0.40 * (440.0 * ph).sin();
+                let in_r = -0.35 * (330.0 * ph).cos();
+                let (ol, or) = vm.step_frame(in_l, in_r).unwrap();
+                let (core_lr, wet_lr) = vm.last_wdw_partition();
+                assert!(
+                    ((core_lr[0] + wet_lr[0]) - ol).abs() < 1.0e-5,
+                    "stereo={stereo_out} offline={offline} k={k}: core={} wet={} out={ol}",
+                    core_lr[0],
+                    wet_lr[0]
+                );
+                assert!(
+                    ((core_lr[1] + wet_lr[1]) - or).abs() < 1.0e-5,
+                    "stereo={stereo_out} offline={offline} k={k}: core={} wet={} out={or}",
+                    core_lr[1],
+                    wet_lr[1]
+                );
+                if !stereo_out {
+                    assert_eq!(ol.to_bits(), or.to_bits());
+                    assert_eq!(core_lr[0].to_bits(), core_lr[1].to_bits());
+                    assert_eq!(wet_lr[0].to_bits(), wet_lr[1].to_bits());
+                }
+                if !offline {
+                    if k == 0 {
+                        assert!((ol - last_out[0]).abs() < 1.0e-5);
+                        assert!((or - last_out[1]).abs() < 1.0e-5);
+                        assert!((core_lr[0] - last_core[0]).abs() < 1.0e-5);
+                        assert!((wet_lr[0] - last_wet[0]).abs() < 1.0e-5);
+                    }
+                    if k < 47 {
+                        assert!(vm.slab().xfade_active());
+                    } else {
+                        assert!(!vm.slab().xfade_active());
+                    }
+                }
+                assert!((ol - last_out[0]).abs() < 0.25);
+                assert!((core_lr[0] - last_core[0]).abs() < 0.25);
+                assert!((wet_lr[0] - last_wet[0]).abs() < 0.25);
+                last_out = [ol, or];
+                last_core = core_lr;
+                last_wet = wet_lr;
+            }
+        }
+    }
+}
+
+#[test]
+fn test_wdw_partition_4x_bounce_dirac_pdc_and_sinusoid_parity() {
+    let bin = build_wdw_core_conv_transport_multi_tier_bin(true);
+    let mut vm =
+        SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&bin, Tier::Lite, 48_000.0).unwrap();
+    vm.set_offline_bounce(true).unwrap();
+    assert_eq!(vm.get_latency_samples(), OFFLINE_BOUNCE_PDC_SAMPLES);
+
+    let mut os_ref = Bounce4xOversampler::new();
+    let mut dirac_ref = [0.0_f32; 64];
+    let mut core_l_hist = [0.0_f32; 64];
+    let mut wet_l_hist = [0.0_f32; 64];
+
+    for n in 0..64 {
+        let (in_l, in_r) = if n == 0 {
+            (0.8_f32, -0.6_f32)
+        } else {
+            (0.0, 0.0)
+        };
+        let up_ref = os_ref.upsample_4x(in_l, in_r);
+        dirac_ref[n] = os_ref.downsample_4x(up_ref)[0];
+
+        let (ol, or) = vm.step_frame(in_l, in_r).unwrap();
+        let (core_lr, wet_lr) = vm.last_wdw_partition();
+        assert!(
+            ((core_lr[0] + wet_lr[0]) - ol).abs() < 1.0e-5,
+            "dirac L@{n}: core={} wet={} out={ol}",
+            core_lr[0],
+            wet_lr[0]
+        );
+        assert!(
+            ((core_lr[1] + wet_lr[1]) - or).abs() < 1.0e-5,
+            "dirac R@{n}: core={} wet={} out={or}",
+            core_lr[1],
+            wet_lr[1]
+        );
+        core_l_hist[n] = core_lr[0];
+        wet_l_hist[n] = wet_lr[0];
+    }
+
+    assert_eq!(core_l_hist[0].to_bits(), 0);
+    assert_eq!(wet_l_hist[0].to_bits(), 0);
+    let ref_peak_idx = dirac_ref
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+        .map(|(idx, _)| idx)
+        .unwrap();
+    assert_eq!(ref_peak_idx, OFFLINE_BOUNCE_PDC_SAMPLES);
+
+    let (core_peak_idx, core_peak) = core_l_hist
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+        .map(|(idx, &v)| (idx, v.abs()))
+        .unwrap();
+    assert!(core_peak > 1.0e-2, "core_peak={core_peak}");
+    assert!(
+        (11..=14).contains(&core_peak_idx),
+        "core peak must reflect 12-sample bounce PDC, got idx={core_peak_idx}"
+    );
+    let early_core_energy: f32 = core_l_hist[..6].iter().map(|v| v.abs()).sum();
+    assert!(early_core_energy < 0.05 * core_peak);
+
+    // Transport delay_samples >= 12 at 48 kHz + 12-sample bounce PDC -> zero wet energy before n = 12.
+    for (n, &w) in wet_l_hist.iter().enumerate().take(12) {
+        assert!(w.abs() < 1.0e-6, "unexpected early wet energy @{n}: {w}");
+    }
+    let (wet_peak_idx, wet_peak) = wet_l_hist
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
+        .map(|(idx, &v)| (idx, v.abs()))
+        .unwrap();
+    assert!(wet_peak > 1.0e-3, "wet_peak={wet_peak}");
+    assert!(
+        wet_peak_idx >= 22,
+        "wet peak must follow transport delay + 12-sample PDC, got idx={wet_peak_idx}"
+    );
+
+    // Reset clears bounce4x_core_decim and bounce4x_wet_decim cleanly, and sinusoid maintains parity.
+    vm.reset();
+    assert_eq!(vm.last_wdw_partition(), ([0.0; 2], [0.0; 2]));
+    assert_eq!(vm.step_frame(0.0, 0.0).unwrap(), (0.0, 0.0));
+    assert_eq!(vm.last_wdw_partition(), ([0.0; 2], [0.0; 2]));
+
+    let (mut max_core, mut max_wet) = (0.0_f32, 0.0_f32);
+    for n in 0..96 {
+        let ph = 2.0 * core::f32::consts::PI * (n as f32) / 48_000.0;
+        let in_l = 0.35 * (440.0 * ph).sin();
+        let in_r = -0.30 * (330.0 * ph).cos();
+        let (ol, or) = vm.step_frame(in_l, in_r).unwrap();
+        let (core_lr, wet_lr) = vm.last_wdw_partition();
+        assert!(
+            ((core_lr[0] + wet_lr[0]) - ol).abs() < 1.0e-5,
+            "sine L@{n}: core={} wet={} out={ol}",
+            core_lr[0],
+            wet_lr[0]
+        );
+        assert!(
+            ((core_lr[1] + wet_lr[1]) - or).abs() < 1.0e-5,
+            "sine R@{n}: core={} wet={} out={or}",
+            core_lr[1],
+            wet_lr[1]
+        );
+        max_core = max_core.max(core_lr[0].abs()).max(core_lr[1].abs());
+        max_wet = max_wet.max(wet_lr[0].abs()).max(wet_lr[1].abs());
+    }
+    assert!(max_core > 1.0e-2 && max_wet > 1.0e-2);
+
+    vm.set_offline_bounce(false).unwrap();
+    vm.set_offline_bounce(true).unwrap();
+    assert_eq!(vm.step_frame(0.0, 0.0).unwrap(), (0.0, 0.0));
+    assert_eq!(vm.last_wdw_partition(), ([0.0; 2], [0.0; 2]));
+
+    // Mid-crossfade in-place reload cleanly clears xfade_prev_* and bounce4x_*_decim.
+    let _ = vm.step_frame(0.5, -0.4).unwrap();
+    vm.switch_tier(Tier::Pro).unwrap();
+    let _ = vm.step_frame(0.25, -0.25).unwrap();
+    let view = dnam_vm::DnamBinView::parse(&bin).unwrap();
+    vm.reload_from_view_in_place(&view, Tier::Lite, 48_000.0, true)
+        .unwrap();
+    assert!(!vm.slab().xfade_active());
+    assert_eq!(vm.slab().cold().xfade_rem, 0);
+    assert_eq!(vm.slab().cold().xfade_prev_core, [0.0; 2]);
+    assert_eq!(vm.slab().cold().xfade_prev_wet, [0.0; 2]);
+    assert_eq!(vm.step_frame(0.0, 0.0).unwrap(), (0.0, 0.0));
+    assert_eq!(vm.last_wdw_partition(), ([0.0; 2], [0.0; 2]));
 }

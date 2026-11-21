@@ -4,7 +4,7 @@
 
 use crate::bin::TempoSyncEntryWire;
 use crate::control::ControlClampDescriptor;
-use crate::math::{clamp_finite_f32, const_abs_f64, floor_f64, rcp_nr6_f64, sqrt_f64};
+use crate::math::{clamp_finite_f32, const_abs_f64, exp_f64, floor_f64, rcp_nr6_f64, sqrt_f64};
 
 /// Canonical period ratios `(a_s, b_s)` (`r_sub = a_s / b_s`) across all 12 subdivisions
 /// (`1/2., 1/2, 1/2T, 1/4., 1/4, 1/4T, 1/8., 1/8, 1/8T, 1/16., 1/16, 1/16T`).
@@ -350,11 +350,131 @@ pub fn beat_pos_to_mod12_q32(beats: f64) -> (u8, u32) {
     (whole, q32)
 }
 
+/// Availability state of the ordered clock pulse tracker (`ref[dsp.tempo.event-tracker]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClockTrackerState {
+    Unavailable,
+    Candidate,
+    Holdover,
+}
+
+/// `!alloc` monotonic external clock pulse tracker rejecting out-of-order timestamps (`ref[dsp.tempo.event-tracker]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OrderedClockPulseTracker {
+    pub watermark: Option<u64>,
+    pub previous: Option<u64>,
+    pub last_period: Option<u64>,
+    pub state: ClockTrackerState,
+    pub received: usize,
+    pub unmeasurable: usize,
+}
+
+impl Default for OrderedClockPulseTracker {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl OrderedClockPulseTracker {
+    /// Constructs an unavailable clock tracker with zero pulse history.
+    #[inline]
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            watermark: None,
+            previous: None,
+            last_period: None,
+            state: ClockTrackerState::Unavailable,
+            received: 0,
+            unmeasurable: 0,
+        }
+    }
+
+    /// Transitions to [`ClockTrackerState::Holdover`] if a prior period exists, else [`ClockTrackerState::Unavailable`].
+    #[inline]
+    pub fn lose_timing(&mut self) {
+        self.previous = None;
+        self.state = if self.last_period.is_some() {
+            ClockTrackerState::Holdover
+        } else {
+            ClockTrackerState::Unavailable
+        };
+    }
+
+    /// Ingests a monotonic clock timestamp; rejects out-of-order/duplicate stamps cleanly.
+    pub fn pulse(&mut self, timestamp: u64) -> bool {
+        self.received += 1;
+        if let Some(wm) = self.watermark
+            && timestamp <= wm
+        {
+            self.unmeasurable += 1;
+            self.lose_timing();
+            return false;
+        }
+        self.watermark = Some(timestamp);
+        let Some(prev) = self.previous else {
+            self.previous = Some(timestamp);
+            return true;
+        };
+        self.last_period = Some(timestamp - prev);
+        self.previous = Some(timestamp);
+        self.state = ClockTrackerState::Candidate;
+        true
+    }
+}
+
+/// Evaluates one event-rate-aware exponential step `(period, hat_t)` (`0 FDIV`, `0 libm`,
+/// `ref[dsp.tempo.event-tracker]`).
+#[inline]
+pub fn eval_event_rate_aware_step(
+    prev_period_sec: f64,
+    prev_hat_sec: f64,
+    prev_t_sec: f64,
+    cur_t_sec: f64,
+    tau_sec: f64,
+) -> (f64, f64) {
+    let inv_tau = rcp_nr6_f64(tau_sec.max(1.0e-12));
+    let gain = 1.0 - exp_f64(-prev_period_sec * inv_tau);
+    let predicted = prev_hat_sec + prev_period_sec;
+    let next_hat = predicted + gain * (cur_t_sec - predicted);
+    let next_period = prev_period_sec + gain * ((cur_t_sec - prev_t_sec) - prev_period_sec);
+    (next_period, next_hat)
+}
+
+/// Transport in-play jump synchronization policy (`ref[dsp.tempo.transport-jump]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportJumpPolicy {
+    SmoothRelock,
+    ImmediatePhaseLock,
+}
+
+/// Applies one tick of `SmoothRelock` shortest-arc circular phase correction in `Q0.32` turns
+/// (negative tie-break at half-cycle `0x8000_0000`, `ref[dsp.tempo.transport-jump]`).
+#[inline]
+pub fn smooth_relock_q32_tick(
+    previous_q32: u32,
+    advance_q32: u32,
+    target_q32: u32,
+    max_correction_q32: u32,
+) -> u32 {
+    let predicted = previous_q32.wrapping_add(advance_q32);
+    let diff = target_q32.wrapping_sub(predicted) as i32;
+    let limit = (max_correction_q32.min(0x7FFF_FFFF)) as i32;
+    let corr = diff.clamp(-limit, limit);
+    predicted.wrapping_add(corr as u32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use zerocopy::byteorder::little_endian::{F32, U16, U32};
 
+    /// verify[dsp.tempo.subdivisions]
+    /// verify[dsp.tempo.q64-q32-phase]
+    /// verify[dsp.tempo.event-tracker]
+    /// verify[dsp.tempo.physical-inversion]
+    /// verify[dsp.tempo.coprime-fdn]
+    /// verify[dsp.tempo.transport-jump]
     #[test]
     fn test_tsyn_evaluation_inversion_and_q64_increment() {
         let entry = TempoSyncEntryWire {
@@ -437,5 +557,29 @@ mod tests {
                 (((b % 12) + 12) % 12) as u8
             );
         }
+
+        let mut tracker = OrderedClockPulseTracker::default();
+        assert_eq!(tracker.state, ClockTrackerState::Unavailable);
+        tracker.lose_timing();
+        assert_eq!(tracker.state, ClockTrackerState::Unavailable);
+        assert!(tracker.pulse(10));
+        assert!(tracker.pulse(20));
+        assert_eq!(tracker.state, ClockTrackerState::Candidate);
+        assert_eq!(tracker.last_period, Some(10));
+        tracker.lose_timing();
+        assert_eq!(tracker.state, ClockTrackerState::Holdover);
+        assert!(!tracker.pulse(15));
+        assert!(tracker.pulse(32));
+        let (p_next, hat_next) = eval_event_rate_aware_step(0.5, 0.0, 0.0, 0.5, 0.5);
+        assert!((p_next - 0.5).abs() < 1.0e-12 && (hat_next - 0.5).abs() < 1.0e-12);
+
+        assert_ne!(
+            TransportJumpPolicy::SmoothRelock,
+            TransportJumpPolicy::ImmediatePhaseLock
+        );
+        assert_eq!(
+            smooth_relock_q32_tick(0x4000_0000, 0, 0xC000_0000, 0x1000_0000),
+            0x3000_0000
+        );
     }
 }

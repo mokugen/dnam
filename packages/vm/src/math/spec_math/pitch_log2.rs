@@ -144,6 +144,8 @@ mod tests {
     use super::*;
     use crate::FtzDazGuard;
 
+    /// verify[dsp.ctrl.math.log2-lut]
+    /// verify[dsp.ctrl.math.pitch-profile]
     #[test]
     fn test_pitch_profile_and_monotone_log2_lut() {
         let _guard = FtzDazGuard::new();
@@ -174,6 +176,8 @@ mod tests {
     }
 
     proptest! {
+        /// verify[dsp.ctrl.math.log2-lut]
+        /// verify[dsp.ctrl.math.pitch-profile]
         #[test]
         fn prop_pitch_and_log2_accuracy(
             semitones in -24.0_f32..=24.0_f32,

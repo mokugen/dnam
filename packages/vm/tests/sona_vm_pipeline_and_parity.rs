@@ -1,4 +1,4 @@
-//! End-to-end M10b `dnam-vm` integration tests: 0-ULP chunk-split invariance, Matryoshka
+//! End-to-end SONA v3.0 `dnam-vm` integration tests: 0-ULP chunk-split invariance, Matryoshka
 //! prefix stripping & crossfade, cross-ISA parity, `SO(4)` `Q_buyer` gauge invariance, ZOH
 //! multi-rate Cases (a)-(d) + `4x` PDC, saturation telemetry, and `!alloc` execution.
 
@@ -73,6 +73,7 @@ fn run_chunk_schedule(
     (out_l, out_r)
 }
 
+/// verify[dsp.router.signal-flow]
 #[test]
 fn test_zero_ulp_chunk_split_invariance_48k_and_44k1_ultra() {
     assert_eq!(control_stride_for_rate(48_000.0), 16);
@@ -134,6 +135,9 @@ fn test_zero_ulp_chunk_split_invariance_48k_and_44k1_ultra() {
     }
 }
 
+/// verify[dsp.core.matryoshka-cascade]
+/// verify[dsp.head.lower-triangular]
+/// verify[dsp.head.tier-equivalence]
 #[test]
 fn test_matryoshka_tier_strip_prefix_equivalence_and_xfade() {
     let ultra = build_full_pipeline_ultra_fixture();
@@ -390,6 +394,9 @@ fn test_intra_block_so4_q_buyer_gauge_invariance() {
     );
 }
 
+/// verify[dsp.cabinet.fir-kautz-bank]
+/// verify[dsp.zoh.cabinet-fir-onset]
+/// verify[dsp.zoh.op-m-poles]
 #[test]
 fn test_multi_rate_zoh_cases_abcd_os2x_bypass_retime_and_4x_pdc() {
     let ultra = build_full_pipeline_ultra_fixture();

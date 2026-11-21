@@ -32,6 +32,7 @@ DNAM is organized as a multi-language workspace across `docs/`, `packages/*`, an
 | :--- | :--- | :--- | :--- |
 | **Specification Manual (`docs/`)** | `docs/` | [`docs/index.md`](docs/index.md) | [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) |
 | **Shared CPU/WebGPU Kernels (`dnam-kernels`)** | `packages/kernels/` | [`packages/kernels/AGENTS.md`](packages/kernels/AGENTS.md) | [`packages/kernels/CONTRIBUTING.md`](packages/kernels/CONTRIBUTING.md) |
+| **Pure 2×2 SONA VM (`dnam-vm`)** | `packages/vm/` | [`packages/vm/AGENTS.md`](packages/vm/AGENTS.md) | [`packages/vm/CONTRIBUTING.md`](packages/vm/CONTRIBUTING.md) |
 | **Rust SIMD Engine (`dnam-engine`)** | `packages/engine/` | [`packages/engine/AGENTS.md`](packages/engine/AGENTS.md) | [`packages/engine/CONTRIBUTING.md`](packages/engine/CONTRIBUTING.md) |
 | **TypeScript / WebAudio SDK (`@dnam-project/dnam`)** | `packages/js/` | [`packages/js/AGENTS.md`](packages/js/AGENTS.md) | [`packages/js/CONTRIBUTING.md`](packages/js/CONTRIBUTING.md) |
 | **Pure-Rust Capture, Solver & `.dnam-proj` (`dnam-capture`)** | `packages/capture/` | [`packages/capture/AGENTS.md`](packages/capture/AGENTS.md) | [`packages/capture/CONTRIBUTING.md`](packages/capture/CONTRIBUTING.md) |
@@ -40,7 +41,7 @@ DNAM is organized as a multi-language workspace across `docs/`, `packages/*`, an
 | **Desktop Studio (`@dnam-project/studio`)** | `packages/studio/` | [`packages/studio/AGENTS.md`](packages/studio/AGENTS.md) | [`packages/studio/CONTRIBUTING.md`](packages/studio/CONTRIBUTING.md) |
 | **Project Guardrail Suite (`dnam-tests`)** | `tests/` | [`tests/AGENTS.md`](tests/AGENTS.md) | [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) |
 
-*(Note: `packages/vm` (`dnam-vm`), `packages/train` (`dnam-train`), and `tools/sona-shaders` (AOT `cargo-gpu` `.wgsl` kernels compiled from `packages/kernels`) are scheduled for scaffolding across the 5-crate `SONA` `v3.0` cutover; see [`docs/adr/0020-modular-monorepo-and-dnam-proj-container.md`](docs/adr/0020-modular-monorepo-and-dnam-proj-container.md) and [`docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md).)*
+*(Note: `packages/train` (`dnam-train`) and `tools/sona-shaders` (AOT `cargo-gpu` `.wgsl` kernels compiled from `packages/kernels`) are scheduled for scaffolding across the 5-crate `SONA` `v3.0` cutover; see [`docs/adr/0020-modular-monorepo-and-dnam-proj-container.md`](docs/adr/0020-modular-monorepo-and-dnam-proj-container.md) and [`docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md).)*
 
 ---
 
@@ -81,6 +82,7 @@ moon run studio:test-e2e
 
 # Check a single project via moon
 moon check kernels
+moon check vm
 moon check engine
 moon check capture
 moon check fixtures
@@ -106,8 +108,8 @@ moon check tests
 5. **Safe-Rust-First, `zerocopy` Wire Structs & Strict `#[allow(unsafe_code)]` Discipline (`ref[repo.code.type-safety-and-imports]`):**
    - Never be lazy and reach for `#[allow(unsafe_code)]` or `unsafe` (`UnsafeCell`, `AtomicPtr`, raw pointer casts, or `get_unchecked`) when a 100% safe Rust design exists (such as `AtomicU64` word arrays for lock-free SPSC rings and seqlocks, ping-pong slot indices, disjoint struct field borrows, `zerocopy::transmute!`, or checked `napi` buffer views).
    - Use declarative `#[repr(C)]` `zerocopy::byteorder::little_endian::{U16, U32, U64, F32, F64}` structs deriving `FromBytes, IntoBytes, KnownLayout, Immutable` (`Unaligned` where slice-cast) with compile-time `size_of` / alignment assertions instead of manual byte-slicing (`from_le_bytes` / `to_le_bytes`) for `.dnam`, `.dnam-proj`, `DNWB`, and WAV headers (see `.agents/rules/zerocopy-wire-structs.md` and [`docs/specs/architecture/project_and_documentation_quality.md`](docs/specs/architecture/project_and_documentation_quality.md)).
-   - `#[allow(unsafe_code)]` may **only** be used when **(a)** it is strictly unavoidable at a hardware/OS intrinsic or C-ABI boundary (`packages/engine/src/{math,types,memory,ffi}.rs`), or **(b)** benchmarks prove that the safe Rust version causes a high performance impact on a real-time hot path **and** the `unsafe` version can be formally guaranteed sound with an explicit `// SAFETY:` proof.
-   - All language SDK and application Rust crates (`packages/js/rust/`, `packages/studio/rust/`, `packages/capture/`, `packages/fixtures/`) and all algorithmic/host modules in `packages/engine/src/` (`operators`, `stages`, `control`, `container`, `provenance`, `schema`, `engine`, `dynamic`, `host`)—as well as `#![no_std]` `packages/kernels` (`dnam-kernels`)—must remain 100% safe Rust with zero `#[allow(unsafe_code)]`.
+   - `#[allow(unsafe_code)]` may **only** be used when **(a)** it is strictly unavoidable at a hardware/OS intrinsic or C-ABI boundary (`packages/vm/src/{math/{aarch64,x86}.rs,types/fp_env.rs}` and `packages/engine/src/{ffi.rs,provenance/sha256_hw.rs}`), or **(b)** benchmarks prove that the safe Rust version causes a high performance impact on a real-time hot path **and** the `unsafe` version can be formally guaranteed sound with an explicit `// SAFETY:` proof.
+   - All application and fixture Rust crates (`packages/studio/rust/`, `packages/capture/`, `packages/fixtures/`), safe VM modules in `packages/vm/src/` (`bin`, `control`, `graph`, `vm`, and safe `math`/`types` submodules), all safe modules in `packages/engine/src/` (`container`, `dynamic`, `engine`, `host`, `memory`, `provenance` safe submodules, `schema`, `types`), `#![no_std]` `packages/kernels` (`dnam-kernels`), and `packages/js/rust/` (which permits only safe `#[unsafe(no_mangle)]` WASM exports) must remain 100% safe Rust with zero `unsafe` blocks.
 6. **Zero Duplicated Engine Logic in Language SDKs (`packages/js/`):**
    - Language SDKs (`@dnam-project/dnam`) and their FFI shims (`packages/js/rust/`) must **never** reimplement DSP math, ZOH rescaling, 3-Phase control clamping, Lobatto calibration inversion, schema validation, RFC 8785 JCS canonicalization, or provenance signature assembly in TypeScript (`ref[sdk.ts.runtime.dual-target-drivers]`).
    - Delegate 100% of domain logic to `dnam-engine` in Rust; keep SDK host-language layers strictly focused on idiomatic ergonomics, casing/type coercion, and zero-copy buffer/handle lifecycles.
@@ -134,7 +136,7 @@ DNAM enforces a **Progressive-Disclosure Documentation Architecture** and a **Si
    - Loaded into the agent context window on every turn.
    - Contains **only** the project summary, global `moon` + `mise` tooling rules, core cross-cutting invariants, and the top-level Progressive Disclosure & Codebase Discovery Map.
 2. **Tier 2 — Scoped Package & Subsystem `AGENTS.md` Files (`< 2,500` bytes each):**
-   - Located in package/test roots (e.g., [`packages/engine/AGENTS.md`](packages/engine/AGENTS.md), [`packages/capture/AGENTS.md`](packages/capture/AGENTS.md), [`packages/studio/AGENTS.md`](packages/studio/AGENTS.md), [`tests/AGENTS.md`](tests/AGENTS.md)) and multi-module subsystem directories (e.g., [`packages/engine/src/operators/AGENTS.md`](packages/engine/src/operators/AGENTS.md), [`packages/capture/src/solver/AGENTS.md`](packages/capture/src/solver/AGENTS.md)).
+   - Located in package/test roots (e.g., [`packages/vm/AGENTS.md`](packages/vm/AGENTS.md), [`packages/engine/AGENTS.md`](packages/engine/AGENTS.md), [`packages/capture/AGENTS.md`](packages/capture/AGENTS.md), [`packages/studio/AGENTS.md`](packages/studio/AGENTS.md), [`tests/AGENTS.md`](tests/AGENTS.md)) and multi-module subsystem directories (e.g., [`packages/vm/src/graph/AGENTS.md`](packages/vm/src/graph/AGENTS.md), [`packages/capture/src/solver/AGENTS.md`](packages/capture/src/solver/AGENTS.md)).
    - Act **strictly as routing tables** (`Module / File` $\to$ `Responsibility` $\to$ `Canonical Spec / Contributing Guide`).
 3. **Offloading Rule (Never Wordsmith `AGENTS.md` to Fit Byte Budgets):**
    - When an `AGENTS.md` file approaches its byte budget as new modules are added, **do not** try to compress or reword implementation details inside `AGENTS.md`. Instead, offload non-routing information to its canonical destination:
@@ -158,7 +160,7 @@ Never copy mathematical equations, stability tables, or JSON schemas into `AGENT
 | **`Op-N` `PolyADAA1`, `ParaLRU`, `C²` wavefolder, or DC resting equilibrium (`r[dsp.op-n.*]`)** | [`docs/specs/dsp/op_n_paralru_and_polyadaa.md`](docs/specs/dsp/op_n_paralru_and_polyadaa.md) |
 | **Op-M Modal Bank, symplectic recurrence, Kautz filter, or contractive rotor (`r[dsp.op-m.*]`)** | [`docs/specs/dsp/op_m_modal_kautz.md`](docs/specs/dsp/op_m_modal_kautz.md) |
 | **Op-T Transport, Catmull-Rom fractional delay, diffusers, or dynamic ducking (`r[dsp.op-t.*]`)** | [`docs/specs/dsp/op_t_transport.md`](docs/specs/dsp/op_t_transport.md) |
-| **8-Port I/O Router (`io_router`), dual return aligners, or `SONA` crossbar/core/cabinet/tank topology (`r[dsp.router.*]`, `r[dsp.crossbar.*]`, `r[dsp.core.*]`, `r[dsp.cabinet.*]`, `r[dsp.tank.*]`, `r[dsp.zoh.*]`)** | [`docs/specs/dsp/router_and_crossbar_topology.md`](docs/specs/dsp/router_and_crossbar_topology.md) |
+| **Host-Shell 8-Port Patchbay, `SensoryQuad`, or `SONA` crossbar/core/convolver/transport topology (`r[dsp.router.*]`, `r[dsp.crossbar.*]`, `r[dsp.core.*]`, `r[dsp.cabinet.*]`, `r[dsp.tank.*]`, `r[dsp.zoh.*]`)** | [`docs/specs/dsp/router_and_crossbar_topology.md`](docs/specs/dsp/router_and_crossbar_topology.md) |
 | **Parametric Control Bus, Lobatto HDMR, Rank-4/8 FM, Chebyshev LFO, or tempo sync (`r[dsp.ctrl.*]`, `r[dsp.tempo.*]`)** | [`docs/specs/dsp/parametric_control_bus.md`](docs/specs/dsp/parametric_control_bus.md) |
 | **`v3.0` `.dnam` / `.dnam-proj` 64B preamble, `zerocopy` wire layouts, JCS manifest, or `INPC`/`STMC` capsules (`r[container.*]`)** | [`docs/specs/containers/dnam_binary_format.md`](docs/specs/containers/dnam_binary_format.md), [`docs/specs/containers/project_container_format.md`](docs/specs/containers/project_container_format.md) |
 | **JCS SHA-256, `Ed25519` signatures, `.dnam-seal` (`DNSL`), or Buyer Watermarking (`r[sec.*]`)** | [`docs/specs/security/provenance_and_enclave_drm.md`](docs/specs/security/provenance_and_enclave_drm.md), [`docs/specs/security/watermarking_and_marketplace.md`](docs/specs/security/watermarking_and_marketplace.md) |

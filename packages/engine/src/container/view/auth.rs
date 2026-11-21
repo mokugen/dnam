@@ -48,19 +48,32 @@ pub(super) fn resolve_protection_profile_and_policy(
     Ok(protection_profile)
 }
 
-#[allow(clippy::too_many_arguments)]
+pub(super) struct Dau1VerifyContext<'a> {
+    pub(super) bytes: &'a [u8],
+    pub(super) auth_slice: &'a [u8],
+    pub(super) json_slice: &'a [u8],
+    pub(super) shared_slice: &'a [u8],
+    pub(super) layout: &'a V3ContainerLayout,
+    pub(super) header: &'a DnamJsonHeader,
+    pub(super) preamble_has_signatures: bool,
+    pub(super) retained_tier: Tier,
+    pub(super) plain_bytes: &'a [u8],
+}
+
 pub(super) fn verify_dau1_or_legacy_provenance<C: CryptoProvider>(
-    bytes: &[u8],
-    auth_slice: &[u8],
-    json_slice: &[u8],
-    shared_slice: &[u8],
-    layout: &V3ContainerLayout,
-    header: &DnamJsonHeader,
-    preamble_has_signatures: bool,
-    retained_tier: Tier,
-    plain_bytes: &[u8],
+    ctx: &Dau1VerifyContext<'_>,
     crypto: &C,
 ) -> Result<VerificationStatus, DnamError> {
+    let bytes = ctx.bytes;
+    let auth_slice = ctx.auth_slice;
+    let json_slice = ctx.json_slice;
+    let shared_slice = ctx.shared_slice;
+    let layout = ctx.layout;
+    let header = ctx.header;
+    let preamble_has_signatures = ctx.preamble_has_signatures;
+    let retained_tier = ctx.retained_tier;
+    let plain_bytes = ctx.plain_bytes;
+
     if !(auth_slice.starts_with(b"DAU1") || layout.auth_kind > 0) {
         return verify_container_provenance(header, preamble_has_signatures, plain_bytes, crypto);
     }
@@ -77,8 +90,16 @@ pub(super) fn verify_dau1_or_legacy_provenance<C: CryptoProvider>(
             "DAU1 auth_kind mismatch with preamble",
         ));
     }
-    let shared_framing =
+    let mut shared_framing =
         crate::provenance::build_plaintext_shared_v1(&bytes[0..64], &bytes[64..192], shared_slice);
+    if layout.dbin_extent.1 > 0 {
+        let dbin_prefix_slice =
+            &bytes[layout.dbin_extent.0..layout.dbin_extent.0 + layout.dbin_extent.1];
+        shared_framing.extend_from_slice(&crate::container::encode_domain_field(
+            "dbin_prefix",
+            dbin_prefix_slice,
+        ));
+    }
     let hdr_sha = crate::provenance::sha256_digest(json_slice);
     let mut tier_slices_vec = Vec::with_capacity((retained_tier as usize) + 1);
     let mut prev_t = layout.tier_start;
@@ -386,6 +407,7 @@ mod tests {
                 header_extent: (192, json.len()),
                 shared_extent: (256, 0),
                 auth_extent: (256, env_creator_bytes.len()),
+                dbin_extent: (0, 0),
                 tier_start: 256,
                 tier_ends: [320, 320, 320, 320],
                 mutable_extent: (320, 32),
@@ -393,15 +415,17 @@ mod tests {
             let crypto = DefaultCryptoProvider::default();
             assert!(
                 verify_dau1_or_legacy_provenance(
-                    &bytes,
-                    &env_creator_bytes,
-                    json,
-                    shared,
-                    &layout,
-                    &hdr,
-                    true,
-                    Tier::Lite,
-                    tier0,
+                    &Dau1VerifyContext {
+                        bytes: &bytes,
+                        auth_slice: &env_creator_bytes,
+                        json_slice: json,
+                        shared_slice: shared,
+                        layout: &layout,
+                        header: &hdr,
+                        preamble_has_signatures: true,
+                        retained_tier: Tier::Lite,
+                        plain_bytes: tier0,
+                    },
                     &crypto,
                 )
                 .is_err()
@@ -412,15 +436,17 @@ mod tests {
             layout.maximum_tier = 1;
             assert!(
                 verify_dau1_or_legacy_provenance(
-                    &bytes,
-                    &env_creator_bytes,
-                    json,
-                    shared,
-                    &layout,
-                    &hdr,
-                    true,
-                    Tier::Lite,
-                    tier0,
+                    &Dau1VerifyContext {
+                        bytes: &bytes,
+                        auth_slice: &env_creator_bytes,
+                        json_slice: json,
+                        shared_slice: shared,
+                        layout: &layout,
+                        header: &hdr,
+                        preamble_has_signatures: true,
+                        retained_tier: Tier::Lite,
+                        plain_bytes: tier0,
+                    },
                     &crypto,
                 )
                 .is_err()
@@ -441,15 +467,17 @@ mod tests {
             layout.maximum_tier = 1; // b_max (0) != maximum_tier (1)
             assert!(
                 verify_dau1_or_legacy_provenance(
-                    &bytes,
-                    &env_buyer_bytes,
-                    json,
-                    shared,
-                    &layout,
-                    &hdr,
-                    true,
-                    Tier::Lite,
-                    tier0,
+                    &Dau1VerifyContext {
+                        bytes: &bytes,
+                        auth_slice: &env_buyer_bytes,
+                        json_slice: json,
+                        shared_slice: shared,
+                        layout: &layout,
+                        header: &hdr,
+                        preamble_has_signatures: true,
+                        retained_tier: Tier::Lite,
+                        plain_bytes: tier0,
+                    },
                     &crypto,
                 )
                 .is_err()
@@ -458,15 +486,17 @@ mod tests {
             layout.maximum_tier = 0; // buyer_prefixes mismatch
             assert!(
                 verify_dau1_or_legacy_provenance(
-                    &bytes,
-                    &env_buyer_bytes,
-                    json,
-                    shared,
-                    &layout,
-                    &hdr,
-                    true,
-                    Tier::Lite,
-                    tier0,
+                    &Dau1VerifyContext {
+                        bytes: &bytes,
+                        auth_slice: &env_buyer_bytes,
+                        json_slice: json,
+                        shared_slice: shared,
+                        layout: &layout,
+                        header: &hdr,
+                        preamble_has_signatures: true,
+                        retained_tier: Tier::Lite,
+                        plain_bytes: tier0,
+                    },
                     &crypto,
                 )
                 .is_err()
@@ -571,6 +601,7 @@ mod tests {
                 header_extent: (192, json.len()),
                 shared_extent: (256, 0),
                 auth_extent: (256, env_bytes.len()),
+                dbin_extent: (0, 0),
                 tier_start: 256,
                 tier_ends: [320, 320, 320, 320],
                 mutable_extent: (320, 32),
@@ -579,15 +610,17 @@ mod tests {
             let wrong_crypto = RustCryptoProvider::new().with_marketplace_pubkey([0xBB; 32]);
             assert!(
                 verify_dau1_or_legacy_provenance(
-                    &bytes,
-                    &env_bytes,
-                    json,
-                    shared,
-                    &layout,
-                    &hdr,
-                    true,
-                    Tier::Lite,
-                    tier0,
+                    &Dau1VerifyContext {
+                        bytes: &bytes,
+                        auth_slice: &env_bytes,
+                        json_slice: json,
+                        shared_slice: shared,
+                        layout: &layout,
+                        header: &hdr,
+                        preamble_has_signatures: true,
+                        retained_tier: Tier::Lite,
+                        plain_bytes: tier0,
+                    },
                     &wrong_crypto,
                 )
                 .is_err()
@@ -596,15 +629,17 @@ mod tests {
             let right_crypto = RustCryptoProvider::new().with_marketplace_pubkey(mkt_pk);
             assert!(
                 verify_dau1_or_legacy_provenance(
-                    &bytes,
-                    &env_bytes,
-                    json,
-                    shared,
-                    &layout,
-                    &hdr,
-                    true,
-                    Tier::Lite,
-                    tier0,
+                    &Dau1VerifyContext {
+                        bytes: &bytes,
+                        auth_slice: &env_bytes,
+                        json_slice: json,
+                        shared_slice: shared,
+                        layout: &layout,
+                        header: &hdr,
+                        preamble_has_signatures: true,
+                        retained_tier: Tier::Lite,
+                        plain_bytes: tier0,
+                    },
                     &right_crypto,
                 )
                 .is_err()
@@ -613,15 +648,17 @@ mod tests {
             layout.maximum_tier = 0;
             assert!(
                 verify_dau1_or_legacy_provenance(
-                    &bytes,
-                    &env_bytes,
-                    json,
-                    shared,
-                    &layout,
-                    &hdr,
-                    true,
-                    Tier::Lite,
-                    tier0,
+                    &Dau1VerifyContext {
+                        bytes: &bytes,
+                        auth_slice: &env_bytes,
+                        json_slice: json,
+                        shared_slice: shared,
+                        layout: &layout,
+                        header: &hdr,
+                        preamble_has_signatures: true,
+                        retained_tier: Tier::Lite,
+                        plain_bytes: tier0,
+                    },
                     &right_crypto,
                 )
                 .is_err()

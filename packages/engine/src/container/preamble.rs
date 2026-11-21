@@ -1,18 +1,18 @@
-//! Canonical `v3.0` (`"sona"`) 64-byte binary preamble & 128-byte region directory view (`DnamPreamble`).
+//! Canonical `v3.0` (`"sona"`) preamble & 128-byte region directory view (`DnamPreamble`).
 
 use core::mem::{align_of, size_of};
 
-use zerocopy::byteorder::little_endian::{U16, U32, U64};
+use dnam_vm::bin::{ControlClampDescriptorWire, DnamBinHeaderWire};
+use dnam_vm::control::ControlClampDescriptor;
+use zerocopy::byteorder::little_endian::{U16, U32};
 use zerocopy::{FromBytes, IntoBytes};
 
-use crate::control::ControlClampDescriptor;
 use crate::schema::DnamError;
 use crate::types::Tier;
 
 use super::wire::{
-    CP1_MAGIC, ContainerWireError, DEFAULT_MAX_MUTABLE_CAPACITY, DMU1_HEADER_SIZE,
-    DMUE_FOOTER_SIZE, DmueFooterWire, DnamDirectoryWire, DnamPreambleWire, V3_HEADER_OFFSET,
-    V3_PREAMBLE_SIZE, align64_u64, parse_dcrc_record_rt,
+    CP1_MAGIC, ContainerWireError, DMU1_HEADER_SIZE, DMUE_FOOTER_SIZE, DnamPreambleWire,
+    V3_HEADER_OFFSET, V3_PREAMBLE_SIZE, parse_dcrc_record_rt, validate_v3_directory_extents_rt,
 };
 use super::{
     CONTAINER_VERSION_MAJOR, CONTAINER_VERSION_MINOR, DNAM_MAGIC, FLAG_ENCRYPTED_ARENA,
@@ -23,8 +23,8 @@ use super::{
 /// Minimum byte length of a valid `v3.0` `.dnam` container (`192 + 18 + 16 = 226 B`).
 const MIN_V3_CONTAINER_BYTES: usize = V3_HEADER_OFFSET + DMU1_HEADER_SIZE + 2 + DMUE_FOOTER_SIZE;
 
-/// Fixed 64-byte logical preamble descriptor (`#[repr(C, align(64))]`) summarizing a validated
-/// `v3.0` (`"sona"`) `.dnam` container without heap allocation.
+/// Logical preamble descriptor (`#[repr(C, align(64))]`) summarizing a validated
+/// `v3.0` (`"sona"`) `.dnam` container without heap allocation (`2` cache lines = `128 B`).
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DnamPreamble {
@@ -70,9 +70,15 @@ pub struct DnamPreamble {
     pub tail_time_ms: f32,
     /// Castagnoli `CRC32C` over `bytes[0..auth_offset]` when a `DCRC` record is present.
     pub header_crc32c: u32,
+    /// Castagnoli `CRC32C` over `[dbin_offset..tier_start)` when a `DCRC` record and `.dnam-bin` prefix are present.
+    pub crc_dbin_prefix: u32,
+    /// Optional `64 B`-aligned byte offset of the embedded Layer 0 `.dnam-bin` prefix (`0` when absent).
+    pub dbin_offset: u64,
+    /// Byte length of the embedded Layer 0 `.dnam-bin` prefix (`% 64 == 0`, `0` when absent).
+    pub dbin_prefix_bytes: u64,
 }
 
-const _: () = assert!(size_of::<DnamPreamble>() == 64);
+const _: () = assert!(size_of::<DnamPreamble>() == 128);
 const _: () = assert!(align_of::<DnamPreamble>() == 64);
 
 fn scan_shared_control_count(shared_slice: &[u8]) -> u16 {
@@ -85,9 +91,11 @@ fn scan_shared_control_count(shared_slice: &[u8]) -> u16 {
         if shared_slice[off..off + 4] == CP1_MAGIC {
             break;
         }
-        let mut chunk = [0u8; 64];
-        chunk.copy_from_slice(&shared_slice[off..off + 64]);
-        let desc = ControlClampDescriptor::from_bytes(&chunk);
+        let Ok(wire) = ControlClampDescriptorWire::ref_from_bytes(&shared_slice[off..off + 64])
+        else {
+            break;
+        };
+        let desc = ControlClampDescriptor::from_wire(wire);
         let populated = desc.ctrl_kind <= 1
             && (desc.safe_max_base > desc.safe_min_base
                 || desc.scale_norm != 0.0
@@ -147,106 +155,26 @@ impl DnamPreamble {
             return Err(ContainerWireError::SchemaStatic("invalid v3 preamble"));
         }
 
-        let dir = DnamDirectoryWire::ref_from_bytes(&bytes[V3_PREAMBLE_SIZE..V3_HEADER_OFFSET])
-            .map_err(|_| ContainerWireError::SchemaStatic("invalid v3 directory"))?;
-        let header_offset = dir.immutable_header_offset.get();
-        let header_length = dir.immutable_header_length.get();
-        let shared_offset = dir.shared_binary_offset.get();
-        let shared_length = dir.shared_binary_length.get();
-        let auth_offset = dir.authentication_envelope_offset.get();
-        let auth_length = dir.authentication_envelope_length.get();
-        let reserved_offset = dir.reserved_offset.get();
-        let reserved_capacity = dir.reserved_capacity.get();
-        let tier_start = dir.tier_start.get();
-        let ends_u64 = dir.original_tier_ends.map(U64::get);
-
-        if dir.reserved_tail.iter().any(|&b| b != 0)
-            || reserved_offset != 0
-            || reserved_capacity != 0
-            || header_offset != (V3_HEADER_OFFSET as u64)
-            || header_length == 0
-            || auth_length == 0
-        {
-            return Err(ContainerWireError::SchemaStatic("invalid v3 directory"));
-        }
-
-        let header_end = header_offset
-            .checked_add(header_length)
-            .ok_or(ContainerWireError::SchemaStatic("header extent overflow"))?;
-        let shared_end = shared_offset
-            .checked_add(shared_length)
-            .ok_or(ContainerWireError::SchemaStatic("shared extent overflow"))?;
-        let auth_end = auth_offset
-            .checked_add(auth_length)
-            .ok_or(ContainerWireError::SchemaStatic("auth extent overflow"))?;
-        if header_end > (u32::MAX as u64)
-            || shared_end > (u32::MAX as u64)
-            || auth_end > (u32::MAX as u64)
-            || tier_start > (u32::MAX as u64)
-            || Some(shared_offset) != align64_u64(header_end)
-            || Some(auth_offset) != align64_u64(shared_end)
-            || Some(tier_start) != align64_u64(auth_end)
-        {
-            return Err(ContainerWireError::SchemaStatic(
-                "invalid v3 directory alignment",
-            ));
-        }
-
-        let mut prev_end = tier_start;
-        for (idx, &end) in ends_u64.iter().enumerate() {
-            if idx <= (maximum as usize) {
-                if !end.is_multiple_of(64) {
-                    return Err(ContainerWireError::UnalignedOffset {
-                        field: "tier_ends",
-                        offset: end as u32,
-                    });
-                }
-                if end <= prev_end || end > (u32::MAX as u64) {
-                    return Err(ContainerWireError::SchemaStatic("invalid v3 tier end"));
-                }
-                prev_end = end;
-            } else if end != 0 {
-                return Err(ContainerWireError::SchemaStatic("unexpected v3 tier end"));
-            }
-        }
-
-        let footer = DmueFooterWire::ref_from_bytes(&bytes[bytes.len() - DMUE_FOOTER_SIZE..])
-            .map_err(|_| ContainerWireError::SchemaStatic("invalid v3 DMUE footer"))?;
-        let mutable_capacity = footer.frame_len.get();
-        let footer_reserved = footer.reserved.get();
-        if &footer.magic != b"DMUE"
-            || footer_reserved != 0
-            || mutable_capacity < (DMU1_HEADER_SIZE as u64 + 2)
-            || mutable_capacity > (DEFAULT_MAX_MUTABLE_CAPACITY as u64)
-            || mutable_capacity > ((bytes.len() - DMUE_FOOTER_SIZE) as u64)
-        {
-            return Err(ContainerWireError::SchemaStatic("invalid v3 DMUE footer"));
-        }
-        let mutable_offset = bytes.len() - DMUE_FOOTER_SIZE - (mutable_capacity as usize);
-        let retained_tier = ends_u64[..=(maximum as usize)]
-            .iter()
-            .position(|&end| end == (mutable_offset as u64))
-            .ok_or(ContainerWireError::SchemaStatic(
-                "invalid v3 retained tier boundary",
-            ))? as u8;
-
-        let retained_end = ends_u64[retained_tier as usize];
+        let dir = validate_v3_directory_extents_rt(bytes, maximum)?;
+        let retained_tier = dir.retained_tier;
+        let tier_start = dir.tier_start;
+        let retained_end = dir.tier_ends[retained_tier as usize];
         let tensor_arena_offset = tier_start as u32;
         let tensor_arena_byte_len = (retained_end - tier_start) as u32;
 
-        let rel0 = (ends_u64[0] - tier_start) as u32;
+        let rel0 = (dir.tier_ends[0] - tier_start) as u32;
         let rel1 = if maximum >= 1 {
-            (ends_u64[1] - tier_start) as u32
+            (dir.tier_ends[1] - tier_start) as u32
         } else {
             rel0
         };
         let rel2 = if maximum >= 2 {
-            (ends_u64[2] - tier_start) as u32
+            (dir.tier_ends[2] - tier_start) as u32
         } else {
             rel1
         };
         let rel3 = if maximum >= 3 {
-            (ends_u64[3] - tier_start) as u32
+            (dir.tier_ends[3] - tier_start) as u32
         } else {
             rel2
         };
@@ -270,26 +198,47 @@ impl DnamPreamble {
             flags |= FLAG_HAS_SIGNATURES;
         }
 
-        let shared_slice = &bytes[shared_offset as usize..shared_end as usize];
-        let auth_slice = &bytes[auth_offset as usize..auth_end as usize];
+        let shared_slice = &bytes[dir.shared_extent.0..dir.shared_extent.0 + dir.shared_extent.1];
+        let auth_slice = &bytes[dir.auth_extent.0..dir.auth_extent.0 + dir.auth_extent.1];
+        let dbin_slice = if dir.dbin_extent.1 > 0 {
+            &bytes[dir.dbin_extent.0..dir.dbin_extent.0 + dir.dbin_extent.1]
+        } else {
+            &[]
+        };
+
+        let fallback_num_controls = || -> u16 {
+            if !dbin_slice.is_empty() {
+                DnamBinHeaderWire::read_from_prefix(dbin_slice)
+                    .map_or(0, |(h, _)| h.num_controls.get())
+            } else {
+                scan_shared_control_count(shared_slice)
+            }
+        };
 
         let num_controls: u16;
         let mut tail_time_ms = 0.0f32;
         let mut header_crc32c = 0u32;
+        let mut crc_dbin_prefix = 0u32;
         let mut crc_tiers = [0u32; 4];
 
         if auth_slice.starts_with(b"DAU1") {
             flags |= FLAG_HAS_SIGNATURES;
-            num_controls = scan_shared_control_count(shared_slice);
+            num_controls = fallback_num_controls();
         } else if let Some(dcrc) = parse_dcrc_record_rt(auth_slice)? {
+            if dir.dbin_extent.1 == 0 && dcrc.crc_dbin_prefix != 0 {
+                return Err(ContainerWireError::SchemaStatic(
+                    "non-zero crc_dbin_prefix when dbin_prefix_bytes == 0",
+                ));
+            }
             let hint_mask = FLAG_STEREO_OUT | FLAG_ENCRYPTED_ARENA | FLAG_HAS_SIGNATURES;
             flags = (flags & !FLAG_STEREO_OUT) | (dcrc.flags_hint & hint_mask);
             num_controls = dcrc.num_controls;
             tail_time_ms = f32::from_bits(dcrc.tail_time_ms_bits);
             header_crc32c = dcrc.crc_prefix;
+            crc_dbin_prefix = dcrc.crc_dbin_prefix;
             crc_tiers = dcrc.crc_tiers;
         } else {
-            num_controls = scan_shared_control_count(shared_slice);
+            num_controls = fallback_num_controls();
         }
 
         Ok(Self {
@@ -299,7 +248,7 @@ impl DnamPreamble {
             flags,
             num_controls,
             sample_rate_train_hz,
-            json_header_byte_len: header_length as u32,
+            json_header_byte_len: dir.header_extent.1 as u32,
             tensor_arena_offset,
             tensor_arena_byte_len,
             arena_lite_end_cl: to_cl(rel0),
@@ -314,6 +263,9 @@ impl DnamPreamble {
             _reserved: 0,
             tail_time_ms,
             header_crc32c,
+            crc_dbin_prefix,
+            dbin_offset: dir.dbin_extent.0 as u64,
+            dbin_prefix_bytes: dir.dbin_extent.1 as u64,
         })
     }
 
@@ -423,7 +375,7 @@ impl DnamPreamble {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
+    use crate::container::{ARENA_OFFSET_ULTRA_END, DnamDirectoryWire, build_dnam_container};
     use crate::schema::DnamJsonHeader;
     use alloc::vec;
 
@@ -456,14 +408,28 @@ mod tests {
         let arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
         let mut container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
         let mut p = DnamPreamble::from_bytes(&container).unwrap();
+        assert_eq!(size_of::<DnamPreamble>(), 128);
+        assert_eq!(align_of::<DnamPreamble>(), 64);
         assert_eq!(p.version_major, 3);
         assert_eq!(p.version_minor, 0);
         assert_eq!(p.highest_tier(), Tier::Ultra);
+        assert_eq!(p.dbin_offset, 0);
+        assert_eq!(p.dbin_prefix_bytes, 0);
+        assert_eq!(p.crc_dbin_prefix, 0);
         assert_eq!(p.arena_lite_end_cl, 72);
         assert_eq!(p.arena_full_end_cl, 124);
         assert_eq!(p.arena_pro_end_cl, 248);
         assert_eq!(p.arena_ultra_end_cl, 480);
         assert_eq!(p.to_bytes()[0..4], DNAM_MAGIC);
+
+        // Non-zero crc_dbin_prefix when dbin_prefix_bytes == 0 must fail closed.
+        let mut bad_dcrc = container.clone();
+        let auth_off = DnamDirectoryWire::ref_from_bytes(&container[64..192])
+            .unwrap()
+            .authentication_envelope_offset
+            .get() as usize;
+        bad_dcrc[auth_off + 32..auth_off + 36].copy_from_slice(U32::new(1).as_bytes());
+        assert!(DnamPreamble::from_bytes(&bad_dcrc).is_err());
 
         p.arena_crc32c_lite = 11;
         p.arena_crc32c_full = 22;

@@ -397,6 +397,9 @@ mod tests {
     use crate::simd::{GpuVec4, fp16_to_f32};
     use proptest::prelude::*;
 
+    /// verify[dsp.op-t.guard.bibo-decay]
+    /// verify[dsp.tank.loop-saturator]
+    /// verify[dsp.tank.quiet-feedback-knee]
     #[test]
     fn test_schroeder_freeze_and_coercive_limiter() {
         assert_eq!(fp16_to_f32(0x7BFF), FP16_FINITE_MAX_F32);
@@ -442,6 +445,10 @@ mod tests {
 
     /// verify[dsp.op-t.ring.declaration]
     /// verify[dsp.op-t.guard.bounded-history]
+    /// verify[dsp.op-t.guard.max-tree]
+    /// verify[dsp.tank.captured-freeze]
+    /// verify[dsp.tank.dc-blocker]
+    /// verify[dsp.tank.feedback-loop]
     #[test]
     fn test_host_lock_sigma_sat_mu_freeze_and_wet_dc() {
         let mut ring = [3.0_f32; 8];
@@ -626,6 +633,8 @@ mod tests {
         assert!(wet_out.0.abs() < 1.0e-5 && wet_out.1.abs() < 1.0e-5);
     }
 
+    /// verify[dsp.tank.feedback-loop]
+    /// verify[dsp.tank.loop-saturator]
     #[test]
     fn test_feedback_extreme_inputs_zero_gain_and_poison_recovery() {
         // Extreme finite v_read = [f32::MAX, -f32::MAX, 1e20, -1e20] + 384 kHz ZOH r_dc (0.9999875):

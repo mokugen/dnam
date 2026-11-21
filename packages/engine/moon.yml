@@ -11,9 +11,9 @@ tags:
 
 project:
   name: "dnam-engine"
-  description: "Pure Rust #![no_std] + alloc, zero-audio-alloc real-time SIMD audio engine for DNAM"
+  description: "Pure Rust #![no_std] + alloc Layer 1 .dnam container shell, host patchbay, SPSC host, DRM, and C-ABI over dnam-vm"
 
-dependsOn: ["kernels"]
+dependsOn: ["kernels", "vm"]
 
 tasks:
   format:
@@ -68,6 +68,8 @@ tasks:
       - "/Cargo.lock"
       - "/packages/kernels/Cargo.toml"
       - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
     options:
       mutex: "cargo"
     tags:
@@ -91,6 +93,8 @@ tasks:
       - "/Cargo.lock"
       - "/packages/kernels/Cargo.toml"
       - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
     options:
       mutex: "cargo"
     tags:
@@ -112,6 +116,8 @@ tasks:
       - "/Cargo.lock"
       - "/packages/kernels/Cargo.toml"
       - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
     options:
       mutex: "cargo"
     tags:
@@ -132,6 +138,8 @@ tasks:
       - "/Cargo.lock"
       - "/packages/kernels/Cargo.toml"
       - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
     options:
       mutex: "cargo"
     tags:
@@ -155,6 +163,8 @@ tasks:
       - "/Cargo.lock"
       - "/packages/kernels/Cargo.toml"
       - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
     options:
       mutex: "cargo"
       runInCI: "skip"
@@ -171,7 +181,7 @@ tasks:
       - "--test"
       - "backend_parity"
       - "--test"
-      - "sona_extended_pipeline"
+      - "sona_tier_and_multiport_lifecycle"
     inputs:
       - "Cargo.toml"
       - "src/**/*"
@@ -180,6 +190,8 @@ tasks:
       - "/Cargo.lock"
       - "/packages/kernels/Cargo.toml"
       - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
     options:
       mutex: "cargo"
       runInCI: "skip"
@@ -207,6 +219,8 @@ tasks:
       - "/scripts/rust-coverage.mjs"
       - "/packages/kernels/Cargo.toml"
       - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
     options:
       mutex: "cargo"
       runFromWorkspaceRoot: true
@@ -229,6 +243,8 @@ tasks:
       - "/Cargo.lock"
       - "/packages/kernels/Cargo.toml"
       - "/packages/kernels/src/**/*"
+      - "/packages/vm/Cargo.toml"
+      - "/packages/vm/src/**/*"
     options:
       cache: false
       mutex: "cargo"

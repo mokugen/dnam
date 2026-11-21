@@ -6,6 +6,7 @@
 #[cfg(feature = "crypto")]
 pub mod seal_encode;
 pub mod seal_unseal;
+pub(crate) mod unsealed_dnam;
 
 #[cfg(feature = "crypto")]
 pub use seal_encode::seal_dnam_container;
@@ -51,6 +52,7 @@ pub struct UnsealedDnslInner {
     pub logical_dnam_dir: DnamDirectoryWire,
     pub header_json_bytes: Vec<u8>,
     pub shared_bytes: Vec<u8>,
+    pub dbin_prefix: Vec<u8>,
     pub auth_bytes: Vec<u8>,
     pub arena_bytes: Vec<u8>,
     pub tier_ends: [usize; 4],

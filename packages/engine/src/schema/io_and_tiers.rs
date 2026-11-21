@@ -44,6 +44,7 @@ pub enum BlendMode {
 
 /// Model-level physical capabilities (`IoConfig::capabilities`, covered by `immutable_header_sha256`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ModelCapabilities {
     /// Dry/Wet parallel blend configuration (`"none"`, `"host_parallel"`, or `"modeled_control"`).
     #[serde(default)]
@@ -60,13 +61,6 @@ pub struct ModelCapabilities {
     /// `true` if one or more controls in `controls_schema` carry `DelayTimeMs`, `GrainSizeMs`, or `LfoRateHz` calibration for MIDI tempo sync.
     #[serde(default)]
     pub tempo_sync_capable: bool,
-    /// `true` if unitary spectral freeze (`DnamEngine::set_freeze(true)` or `FreezeLatch` control) is supported.
-    #[serde(default)]
-    pub supports_freeze: bool,
-    /// `true` if engaging spectral freeze also mutes the live dry/Stage I signal path (stutter/hold replacement);
-    /// `false` (default) allows "Sound-on-Sound" playing over the frozen Stage IV pad.
-    #[serde(default)]
-    pub freeze_mutes_dry: bool,
 }
 
 impl Default for ModelCapabilities {
@@ -77,8 +71,6 @@ impl Default for ModelCapabilities {
             wet_polarity_inverted: false,
             supports_trails: false,
             tempo_sync_capable: false,
-            supports_freeze: false,
-            freeze_mutes_dry: false,
         }
     }
 }
@@ -96,6 +88,7 @@ pub enum LevelingMetric {
 
 /// Auto-unity gain leveling calibration anchored at the default control settings (`controls_schema[*].default`, $\mathbf{u} = \mathbf{0}$).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct LevelingConfig {
     /// Whether auto-unity leveling is enabled by default for this model.
     #[serde(default = "default_true")]
@@ -136,6 +129,7 @@ impl Default for LevelingConfig {
 
 /// Audio I/O topology, host PDC / tail configuration, model capabilities, and auto-unity leveling.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct IoConfig {
     /// Number of input channels (`1` or `2`).
     #[serde(default = "default_inputs")]
@@ -188,6 +182,7 @@ pub fn default_pro_tier_profile() -> TierProfile {
 
 /// Slimmable tier profiles (`lite`, `full`, `pro`, `ultra`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct SlimmableTiersConfig {
     /// `Lite` (`4,608 B`) tier profile.
     pub lite: TierProfile,
@@ -202,19 +197,20 @@ pub struct SlimmableTiersConfig {
 
 /// Metadata and prefix checksum for an individual slimmable tier.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct TierProfile {
     /// Dimension of the shared physical feature bus ($D_{\text{feat}} \in \{64, 128, 192, 256\}$).
     #[serde(default)]
     pub feature_bus_dim: u16,
     /// Active `SONA` core lanes ($C \in \{16, 24, 32, 40\}$).
     pub channels: u8,
-    /// Active Stage III direct SIMD early-reflection FIR taps ($M_{\text{early}} \in \{32, 48, 96, 128\}$).
+    /// Active `ModalConvolver` direct SIMD early-reflection FIR taps ($M_{\text{early}} \in \{32, 48, 96, 128\}$).
     #[serde(default)]
     pub early_fir_taps: u8,
-    /// Active Stage III Orthonormal Kautz modal bank pole pairs ($M_{\text{kautz}} \in \{8, 12, 24, 32\}$).
+    /// Active `ModalConvolver` orthonormal Kautz modal bank pole pairs ($M_{\text{kautz}} \in \{8, 12, 24, 32\}$).
     #[serde(default)]
     pub kautz_modes: u8,
-    /// Active Stage IV tank delay lines ($M \in \{4, 8, 12, 16\}$).
+    /// Active `Transport` delay lines ($M \in \{4, 8, 12, 16\}$).
     pub tank_lines: u8,
     /// SVD output head rank ($D_h \in \{4, 8\}$).
     #[serde(default = "default_head_svd_rank")]

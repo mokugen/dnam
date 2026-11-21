@@ -246,6 +246,8 @@ mod tests {
     use super::*;
     use crate::math::f32_to_fp16;
 
+    /// verify[dsp.ctrl.dispatch.modulation-laws]
+    /// verify[dsp.op-n.core.control-sensitivity]
     #[test]
     fn test_modulation_laws_finite_guards_stage_mods_and_a2_parity() {
         assert_eq!(eval_op_t_freeze_mix_eff(0.4, 0.2, false), 0.6);

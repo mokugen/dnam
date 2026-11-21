@@ -44,6 +44,40 @@ const _: () = assert!(KAUTZ_THETA_ZOH_MIN > 0.0 && KAUTZ_THETA_MAX < core::f32::
 const _: () = assert!(KAUTZ_THETA_ZOH_PRE_MAX < KAUTZ_THETA_MAX);
 const _: () = assert!(KAUTZ_SWEEP_CEIL <= KAUTZ_R_MAX);
 
+/// Initializes up to `out.len()` logarithmically spaced Kautz modal `(theta, gamma_h2)` pairs
+/// across `[f_min_hz, f_max_hz]` with $\mathcal{H}_2$ normalizer $\gamma = \sqrt{1 - r_{\text{high}}^2}$
+/// (`0 FDIV`, `0 libm`, `ref[dsp.op-m.init.log-octave-h2]`).
+pub fn init_log_octave_poles_h2_into(
+    out: &mut [(f32, f32)],
+    f_min_hz: f64,
+    f_max_hz: f64,
+    sample_rate_hz: f64,
+    r_high: f32,
+) -> usize {
+    if out.is_empty() || f_min_hz <= 0.0 || f_max_hz <= f_min_hz || sample_rate_hz <= 0.0 {
+        return 0;
+    }
+    let n = out.len();
+    let r_clamped = r_high.clamp(KAUTZ_R_MIN, KAUTZ_R_MAX);
+    let gamma = sqrt_f64((1.0 - f64::from(r_clamped) * f64::from(r_clamped)).max(0.0)) as f32;
+    let ratio = f_max_hz * rcp_nr6_f64(f_min_hz);
+    let inv_sr = rcp_nr6_f64(sample_rate_hz);
+    let inv_span = if n > 1 {
+        rcp_nr6_f64((n - 1) as f64)
+    } else {
+        0.0
+    };
+    for (m, slot) in out.iter_mut().enumerate() {
+        let t = (m as f64) * inv_span;
+        let freq_hz = f_min_hz * powf_f64(ratio, t);
+        let theta = (core::f64::consts::TAU * freq_hz * inv_sr)
+            .clamp(f64::from(KAUTZ_THETA_ZOH_MIN), f64::from(KAUTZ_THETA_MAX))
+            as f32;
+        *slot = (theta, gamma);
+    }
+    n
+}
+
 /// Runtime `16`-byte-aligned `4`-pair stereo shared-pole Kautz bank (`176 B`, `11 × [f32; 4]`,
 /// `ref[dsp.op-m.kautz.tier-allocation]`).
 #[repr(C, align(16))]
@@ -498,6 +532,10 @@ mod tests {
         }
     }
 
+    /// verify[dsp.op-m.kautz.radial-gate]
+    /// verify[dsp.op-m.kautz.rate-convert]
+    /// verify[dsp.op-m.kautz.tier-allocation]
+    /// verify[dsp.zoh.op-m-poles]
     #[test]
     fn test_kautz_hydration_inactive_sentinel_prefix_override_and_chunk_parity() {
         let blocks = [
@@ -569,6 +607,8 @@ mod tests {
         assert_eq!(b_seq[0].s_re_l, [0.0; 4]);
     }
 
+    /// verify[dsp.op-m.ctrl.engine]
+    /// verify[dsp.op-m.init.log-octave-h2]
     #[test]
     fn test_kautz_3khz_slew_contraction_settle_restore_and_snap() {
         let blocks = [make_wire_block(
@@ -625,5 +665,20 @@ mod tests {
             banks[0].b_gamma.map(f32::to_bits),
             baseline_bank.b_gamma.map(f32::to_bits)
         );
+
+        let mut poles = [(0.0_f32, 0.0_f32); 8];
+        assert_eq!(
+            init_log_octave_poles_h2_into(&mut [], 25.0, 16_000.0, 48_000.0, 0.99),
+            0
+        );
+        assert_eq!(
+            init_log_octave_poles_h2_into(&mut poles, 25.0, 16_000.0, 48_000.0, 0.99),
+            8
+        );
+        let exp_h2 = sqrt_f64(1.0 - 0.99_f64 * 0.99) as f32;
+        for w in poles.windows(2) {
+            assert!(w[1].0 > w[0].0);
+            assert!((w[0].1 - exp_h2).abs() < 1.0e-6);
+        }
     }
 }

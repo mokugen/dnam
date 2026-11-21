@@ -12,10 +12,11 @@ pub use ctrl_latch::{
     hoist_core_quads_and_readouts, latch_immediate_at_init_or_reset, step_control_tick_3khz,
 };
 #[cfg(feature = "alloc")]
-pub use hydrate::{SonaSlabOwnedBacking, hydrate_slab_owned};
+pub use hydrate::{SonaSlabOwnedBacking, hydrate_slab_owned, hydrate_slab_owned_with_headroom};
 pub use hydrate::{
-    hydrate_slab_from_dnam_bin, reset_to_dc_equilibrium, retime_sample_rate, set_offline_bounce,
-    set_op_t_write_enable, set_quad_write_enable, switch_tier,
+    VmReloadHeadroom, check_reload_slab_capacity, hydrate_slab_from_dnam_bin,
+    reload_slab_from_dnam_bin_in_place, reset_to_dc_equilibrium, retime_sample_rate,
+    set_offline_bounce, set_op_t_write_enable, set_quad_write_enable, switch_tier,
 };
 pub use layout::{
     CoreQuadExtCold, CoreQuadHot, CoreQuadModulation, CoreQuadReadoutHot, CoreQuadReadoutRegs,
@@ -172,6 +173,8 @@ mod tests {
         hydrate_slab_from_dnam_bin(&view, Tier::Lite, host_hz, false, backing).unwrap()
     }
 
+    /// verify[dsp.head.direct-register-readout]
+    /// verify[dsp.head.tier-equivalence]
     #[test]
     fn test_zero_ulp_chunk_invariance_starcenter_and_dual_latch_no_alloc() {
         assert_eq!(

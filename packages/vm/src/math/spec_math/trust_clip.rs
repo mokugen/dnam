@@ -255,6 +255,8 @@ mod tests {
     use super::*;
     use crate::FtzDazGuard;
 
+    /// verify[dsp.ctrl.op-n.trust-clip]
+    /// verify[dsp.op-n.ctrl.trust-clip]
     #[test]
     fn test_outward_checked_trust_region_clip_4d_and_8d() {
         let _guard = FtzDazGuard::new();
@@ -295,6 +297,8 @@ mod tests {
     }
 
     proptest! {
+        /// verify[dsp.ctrl.op-n.trust-clip]
+        /// verify[dsp.op-n.ctrl.trust-clip]
         #[test]
         fn prop_outward_trust_clip_strictly_bounded(
             v4 in prop::array::uniform4(-25.0_f32..25.0_f32),

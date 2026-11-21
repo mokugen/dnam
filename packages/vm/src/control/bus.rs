@@ -5,6 +5,8 @@ pub mod laws;
 mod load;
 mod tick;
 
+pub(crate) use load::required_cp1_contributors;
+
 #[cfg(feature = "alloc")]
 use alloc::vec;
 use core::marker::PhantomData;
@@ -27,7 +29,46 @@ use crate::math::{
     DefaultMathBackend, IEEE754_F32_ABS_MASK, MAX_ROTOR_ANGLE_F32_BITS, MathBackend, Q0_192Phase,
     powf_f64, rcp_nr6_f64, round_f64, sanitize_finite_f32,
 };
-use crate::types::{ColdBuf, ColdSlice, Tier, VmError};
+use crate::types::{ColdBuf, Tier, VmError};
+
+/// Backing storage for `"TSYN"` tempo-sync rows (`ReadOnly` for legacy `!alloc` slice binding,
+/// `Mutable` for in-place zero-alloc model reload and `alloc` capacity headroom).
+#[derive(Debug)]
+pub enum ControlTsynBacking<'a> {
+    /// Caller-borrowed immutable slice (`reload_from_dnam_bin_in_place` allows only empty TSYN).
+    ReadOnly(&'a [TempoSyncEntryWire]),
+    /// Mutable fixed-capacity buffer (`from_mut_slices` or `alloc` `new_owned*`).
+    Mutable(ColdBuf<'a, TempoSyncEntryWire>),
+}
+
+impl<'a> ControlTsynBacking<'a> {
+    /// Immutable view over the active backing TSYN slice.
+    #[inline]
+    pub fn as_slice(&self) -> &[TempoSyncEntryWire] {
+        match self {
+            Self::ReadOnly(s) => s,
+            Self::Mutable(b) => b.as_slice(),
+        }
+    }
+
+    /// Mutable view over the TSYN buffer when backed by mutable/owned storage.
+    #[inline]
+    pub fn as_mut_slice(&mut self) -> Option<&mut [TempoSyncEntryWire]> {
+        match self {
+            Self::ReadOnly(_) => None,
+            Self::Mutable(b) => Some(b.as_mut_slice()),
+        }
+    }
+
+    /// Writable TSYN row capacity (`0` when [`Self::ReadOnly`]).
+    #[inline]
+    pub fn writable_capacity(&self) -> usize {
+        match self {
+            Self::ReadOnly(_) => 0,
+            Self::Mutable(b) => b.len(),
+        }
+    }
+}
 
 /// Mutable backing buffers for [`ControlBus`], supporting both `--no-default-features`
 /// (`Borrowed`) and optional `alloc` (`Owned`) initialization.
@@ -45,8 +86,8 @@ pub struct ControlBusBacking<'a> {
     pub active_switch_options: ColdBuf<'a, u8>,
     /// Decoded `CP1` contributor slots (`len >= num_contributors`).
     pub contributors: ColdBuf<'a, Cp1ContributorSlot>,
-    /// Pure-binary `"TSYN"` tempo rows.
-    pub tsyn_entries: ColdSlice<'a, TempoSyncEntryWire>,
+    /// Pure-binary `"TSYN"` tempo rows (`ReadOnly` or fixed-capacity `Mutable`).
+    pub tsyn_entries: ControlTsynBacking<'a>,
 }
 
 impl<'a> ControlBusBacking<'a> {
@@ -67,19 +108,73 @@ impl<'a> ControlBusBacking<'a> {
             normalized_values: ColdBuf::borrowed(normalized_values),
             active_switch_options: ColdBuf::borrowed(active_switch_options),
             contributors: ColdBuf::borrowed(contributors),
-            tsyn_entries: ColdSlice::borrowed(tsyn_entries),
+            tsyn_entries: ControlTsynBacking::ReadOnly(tsyn_entries),
         })
     }
 
-    /// Allocates owned backing storage sized for `num_controls` and `max_contributors`.
+    /// Wraps caller-supplied mutable slices including mutable `TSYN` scratch storage (`!alloc` reload).
+    pub fn from_mut_slices(
+        descriptors: &'a mut [ControlClampDescriptor],
+        raw_values: &'a mut [f32],
+        clamped_values: &'a mut [f32],
+        normalized_values: &'a mut [f32],
+        active_switch_options: &'a mut [u8],
+        contributors: &'a mut [Cp1ContributorSlot],
+        tsyn_entries: &'a mut [TempoSyncEntryWire],
+    ) -> Result<Self, VmError> {
+        Ok(Self {
+            descriptors: ColdBuf::borrowed(descriptors),
+            raw_values: ColdBuf::borrowed(raw_values),
+            clamped_values: ColdBuf::borrowed(clamped_values),
+            normalized_values: ColdBuf::borrowed(normalized_values),
+            active_switch_options: ColdBuf::borrowed(active_switch_options),
+            contributors: ColdBuf::borrowed(contributors),
+            tsyn_entries: ControlTsynBacking::Mutable(ColdBuf::borrowed(tsyn_entries)),
+        })
+    }
+
+    /// Returns `(descriptors_ptr, cp1_ptr, tsyn_ptr)` for zero-reallocation pointer stability assertions.
+    #[inline]
+    pub fn backing_storage_addrs(&self) -> (usize, usize, usize) {
+        (
+            self.descriptors.as_slice().as_ptr() as usize,
+            self.contributors.as_slice().as_ptr() as usize,
+            self.tsyn_entries.as_slice().as_ptr() as usize,
+        )
+    }
+
+    /// Returns `(max_controls, max_contributors, writable_tsyn_capacity)` across backing slices.
+    #[inline]
+    pub fn capacity_limits(&self) -> (usize, usize, usize) {
+        let ctrl_cap = self
+            .descriptors
+            .len()
+            .min(self.raw_values.len())
+            .min(self.clamped_values.len())
+            .min(self.normalized_values.len())
+            .min(self.active_switch_options.len());
+        (
+            ctrl_cap,
+            self.contributors.len(),
+            self.tsyn_entries.writable_capacity(),
+        )
+    }
+
+    /// Allocates owned backing storage sized for at least `(min_controls, min_contributors, min_tsyn_entries)`.
     #[cfg(feature = "alloc")]
-    pub fn new_owned(
-        num_controls: usize,
-        max_contributors: usize,
-        tsyn: &[TempoSyncEntryWire],
+    pub fn new_owned_with_capacity(
+        min_controls: usize,
+        min_contributors: usize,
+        min_tsyn_entries: usize,
+        tsyn_init: &[TempoSyncEntryWire],
     ) -> Self {
-        let cap = num_controls.max(1);
-        let c_cap = max_contributors.max(8);
+        let cap = min_controls.max(1);
+        let c_cap = min_contributors.max(8);
+        let t_cap = min_tsyn_entries.max(tsyn_init.len());
+        let mut tsyn_vec = vec![<TempoSyncEntryWire as zerocopy::FromZeros>::new_zeroed(); t_cap];
+        if !tsyn_init.is_empty() {
+            tsyn_vec[..tsyn_init.len()].copy_from_slice(tsyn_init);
+        }
         Self {
             descriptors: ColdBuf::Owned(vec![ControlClampDescriptor::empty(); cap]),
             raw_values: ColdBuf::Owned(vec![0.0; cap]),
@@ -87,8 +182,18 @@ impl<'a> ControlBusBacking<'a> {
             normalized_values: ColdBuf::Owned(vec![0.0; cap]),
             active_switch_options: ColdBuf::Owned(vec![0; cap]),
             contributors: ColdBuf::Owned(vec![Cp1ContributorSlot::zero(); c_cap]),
-            tsyn_entries: ColdSlice::from_slice_owned(tsyn),
+            tsyn_entries: ControlTsynBacking::Mutable(ColdBuf::Owned(tsyn_vec)),
         }
+    }
+
+    /// Allocates owned backing storage sized for `num_controls`, `max_contributors`, and `tsyn`.
+    #[cfg(feature = "alloc")]
+    pub fn new_owned(
+        num_controls: usize,
+        max_contributors: usize,
+        tsyn: &[TempoSyncEntryWire],
+    ) -> Self {
+        Self::new_owned_with_capacity(num_controls, max_contributors, tsyn.len(), tsyn)
     }
 }
 
@@ -340,8 +445,10 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
             &mut self.backing.normalized_values[..n],
             &mut self.backing.active_switch_options[..n],
         );
+        let tsyn_all = self.backing.tsyn_entries.as_slice();
+        let tsyn_active = &tsyn_all[..self.tsyn_count.min(tsyn_all.len())];
         let updated = apply_tsyn_table(
-            self.backing.tsyn_entries.as_slice(),
+            tsyn_active,
             &self.backing.descriptors[..n],
             &self.backing.active_switch_options[..n],
             bpm,
@@ -603,6 +710,10 @@ mod tests {
     use super::*;
     use crate::bin::{DnamBinBuildInput, DnamBinView, encode_dnam_bin_into};
 
+    /// verify[dsp.ctrl.modulators.dynamic]
+    /// verify[dsp.ctrl.op-m.ballistic-lfo]
+    /// verify[dsp.ctrl.op-m.rate-retime]
+    /// verify[dsp.op-n.ctrl.chebyshev-lfo]
     #[test]
     fn test_control_bus_idle_ou_separation_skew_and_uniform_ramping() {
         let mut a0 = DnamBinBuildInput::default_arena0_lite();

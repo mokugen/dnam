@@ -247,6 +247,7 @@ mod tests {
     use super::*;
     use crate::math::const_abs_f32;
 
+    /// verify[dsp.op-t.transition.dual-mode]
     #[test]
     fn test_transport_mod_slots_extraction_and_hold_release_taper() {
         let mut t = [0.0_f32; 32];

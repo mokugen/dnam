@@ -212,9 +212,8 @@ pub fn extract_cabinet_tier_fingerprint_component(
     )?;
     let fir_words = <[F32]>::ref_from_bytes(early_fir_bytes)
         .map_err(|_| DnamError::SchemaValidationError("invalid FIR slice alignment".into()))?;
-    let kautz_blocks =
-        <[crate::graph::weights::KautzSoaBlockWire]>::ref_from_bytes(kautz_modal_bytes)
-            .map_err(|_| DnamError::SchemaValidationError("invalid Kautz slice length".into()))?;
+    let kautz_blocks = <[dnam_vm::bin::KautzSoaBlockWire]>::ref_from_bytes(kautz_modal_bytes)
+        .map_err(|_| DnamError::SchemaValidationError("invalid Kautz slice length".into()))?;
     let mut values = Vec::with_capacity(added_modes * 15);
     for word in fir_words {
         let v = f64::from(word.get());
@@ -461,10 +460,8 @@ mod spec_tests {
         let build_modal_block = |eta: f32| -> [u8; 128] {
             let mut blk = [0u8; 128];
             let (kw, _) =
-                <crate::graph::weights::KautzSoaBlockWire as zerocopy::FromBytes>::mut_from_prefix(
-                    &mut blk,
-                )
-                .unwrap();
+                <dnam_vm::bin::KautzSoaBlockWire as zerocopy::FromBytes>::mut_from_prefix(&mut blk)
+                    .unwrap();
             let set4 = |dst: &mut [zerocopy::byteorder::little_endian::F32; 4], src: [f32; 4]| {
                 for (d, s) in dst.iter_mut().zip(src) {
                     *d = zerocopy::byteorder::little_endian::F32::new(s);
@@ -527,7 +524,7 @@ mod spec_tests {
             for blk in 0..crate::provenance::STAGE3_KAUTZ_BLOCKS_PER_TIER[t] {
                 let base = kautz_soa_byte_offset(t, blk);
                 let (kw, _) = zerocopy::FromBytes::mut_from_prefix(&mut arena[base..]).unwrap();
-                let _: &mut crate::graph::weights::KautzSoaBlockWire = kw;
+                let _: &mut dnam_vm::bin::KautzSoaBlockWire = kw;
                 for l in 0..4 {
                     kw.r_low[l] = zerocopy::byteorder::little_endian::F32::new(0.9);
                     kw.b_gamma[l] = zerocopy::byteorder::little_endian::F32::new(0.5);

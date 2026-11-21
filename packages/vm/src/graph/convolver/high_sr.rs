@@ -141,6 +141,14 @@ impl<'a> ConvolverHighSrFirExt<'a> {
         self.storage_len()
     }
 
+    /// Returns the storage slice base address (`0` when empty) for reload pointer stability checks.
+    #[inline]
+    pub fn backing_storage_addr(&self) -> usize {
+        self.storage
+            .as_ref()
+            .map_or(0, |b| b.as_slice().as_ptr() as usize)
+    }
+
     #[inline(always)]
     fn storage_slice(&self) -> &[f32] {
         self.storage.as_ref().map_or(&[], ColdBuf::as_slice)
@@ -230,6 +238,20 @@ impl<'a> ConvolverHighSrFirExt<'a> {
         let hist_len = slice.len().min(EXT_DENSE_L_OFF);
         slice[..hist_len].fill(0.0);
         self.write_pos = 0;
+    }
+
+    /// Resets all FIR/resampler state and storage in-place for model reload (`0` alloc, `0` drop).
+    pub fn reset_for_reload(&mut self) {
+        self.storage_mut_slice().fill(0.0);
+        self.mode = ConvolverHighSrMode::Native48k;
+        self.active_base = 0;
+        self.out_len = 0;
+        self.onset_delay = ONSET_MIN_SAMPLES;
+        self.write_pos = 0;
+        self.case_b_b0 = [0.0; 2];
+        self.case_b_b1 = [0.0; 2];
+        self.tap1_diff = [0.0; 63];
+        self.bounce_taps = [BounceLagrangeTap::default(); MAX_CONVOLVER_BASE_TAPS];
     }
 
     /// Prepares off-`48 kHz` FIR taps and modal onset delay for `fir_l`/`fir_r` (`<= 128` taps).
@@ -484,6 +506,7 @@ mod tests {
         ext.step_frame(1.0, 1.0)
     }
 
+    /// verify[dsp.cabinet.fir-kautz-bank]
     #[test]
     fn test_first_tap_bits_required_len_and_fail_closed() {
         let sum_f32: f32 = GAIN_BOUNDED_FIRST_TAP_64_BITS
@@ -534,6 +557,7 @@ mod tests {
         );
     }
 
+    /// verify[dsp.zoh.cabinet-fir-onset]
     #[test]
     fn test_all_four_rate_cases_unit_dc_onset_and_reset() {
         let mut buf = [0.0_f32; EXT_FIR_STORAGE_F32_LEN];

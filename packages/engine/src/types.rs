@@ -1,153 +1,24 @@
-//! Core execution types (`Tier`, `FtzDazGuard`, and `DnamTelemetrySnapshot`).
+//! Core execution types (`Tier`, `FtzDazGuard`, `TELEMETRY_CONTROL_SLOTS`, and
+//! `DnamTelemetrySnapshot`).
 
-#[allow(unsafe_code)]
-mod fp_env;
+pub use dnam_vm::{FtzDazGuard, Tier};
 
-pub use fp_env::FtzDazGuard;
+/// Number of leading physical control slots mirrored into C-ABI telemetry snapshots (`16`).
+pub const TELEMETRY_CONTROL_SLOTS: usize = 16;
 
-use crate::control::TELEMETRY_CONTROL_SLOTS;
+const _: () = assert!(TELEMETRY_CONTROL_SLOTS == 16);
 
-/// Slimmable execution tier (`Lite`, `Full`, `Pro`, or `Ultra`).
-#[forbid(unsafe_code)]
-#[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Tier {
-    /// **`Lite` ($C=16$ channels, $M=4$ tank lines, $D_h=4$ SVD modes, `4,608 B` `Arena 0`):**
-    /// Mix-Ready / Live Grade (`72` cache lines).
-    Lite = 0,
-    /// **`Full` ($C=24$ channels, $M=8$ tank lines, $D_h=4$ SVD modes, `7,936 B` `Arena 0..1`):**
-    /// True Studio Quality (`124` cache lines).
-    Full = 1,
-    /// **`Pro` ($C=32$ channels, $M=12$ tank lines, $D_h=4$ SVD modes, `15,872 B` `Arena 0..2`):**
-    /// Mastering / Reference Grade (`248` cache lines).
-    Pro = 2,
-    /// **`Ultra` ($C=40$ channels, $M=16$ tank lines, $D_h=8$ SVD modes, `30,720 B` `Arena 0..3`):**
-    /// Unconstrained Workstation Max (`480` cache lines, Rank-8 FM + 16-line Householder/Givens tank).
-    Ultra = 3,
-}
-
-#[forbid(unsafe_code)]
-impl Tier {
-    /// Converts a raw `u8` (`0`, `1`, `2`, `3`) into a [`Tier`], clamping values $\ge 3$ to [`Tier::Ultra`].
-    #[inline]
-    pub const fn from_u8(val: u8) -> Self {
-        match val {
-            0 => Self::Lite,
-            1 => Self::Full,
-            2 => Self::Pro,
-            _ => Self::Ultra,
-        }
-    }
-
-    /// Returns the canonical lowercase string identifier (`"lite"`, `"full"`, `"pro"`, `"ultra"`).
-    #[inline]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Lite => "lite",
-            Self::Full => "full",
-            Self::Pro => "pro",
-            Self::Ultra => "ultra",
-        }
-    }
-
-    /// Parses a tier name (case-insensitive `"lite"`, `"full"`, `"pro"`, `"ultra"`).
-    #[inline]
-    pub fn from_str_name(s: &str) -> Option<Self> {
-        if s.eq_ignore_ascii_case("lite") {
-            Some(Self::Lite)
-        } else if s.eq_ignore_ascii_case("full") {
-            Some(Self::Full)
-        } else if s.eq_ignore_ascii_case("pro") {
-            Some(Self::Pro)
-        } else if s.eq_ignore_ascii_case("ultra") {
-            Some(Self::Ultra)
-        } else {
-            None
-        }
-    }
-
-    /// Returns the number of active `SONA` core channels ($C \in \{16, 24, 32, 40\}$).
-    #[inline]
-    pub const fn channels(self) -> usize {
-        match self {
-            Self::Lite => 16,
-            Self::Full => 24,
-            Self::Pro => 32,
-            Self::Ultra => 40,
-        }
-    }
-
-    /// Alias for `channels`.
-    #[inline]
-    pub const fn active_channels(self) -> usize {
-        self.channels()
-    }
-
-    /// Returns the number of 4-channel SIMD tier groups (`4`, `6`, `8`, or `10`).
-    #[inline]
-    pub const fn simd_groups(self) -> usize {
-        match self {
-            Self::Lite => 4,
-            Self::Full => 6,
-            Self::Pro => 8,
-            Self::Ultra => 10,
-        }
-    }
-
-    /// Returns the number of 4-line SIMD groups in Stage IV tank (`1` for `Lite`, `2` for `Full`, `3` for `Pro`, `4` for `Ultra`).
-    #[inline]
-    pub const fn tank_groups(self) -> usize {
-        match self {
-            Self::Lite => 1,
-            Self::Full => 2,
-            Self::Pro => 3,
-            Self::Ultra => 4,
-        }
-    }
-
-    /// Returns the number of active Stage IV tank delay lines ($M \in \{4, 8, 12, 16\}$).
-    #[inline]
-    pub const fn tank_lines(self) -> usize {
-        self.tank_groups() * 4
-    }
-
-    /// Returns the active SVD control subspace rank ($D_h = 4$ for `Lite`/`Full`/`Pro`, $D_h = 8$ for `Ultra`).
-    #[inline]
-    pub const fn svd_control_modes(self) -> usize {
-        match self {
-            Self::Lite | Self::Full | Self::Pro => 4,
-            Self::Ultra => 8,
-        }
-    }
-
-    /// Returns the active Factorization Machine (FM) interaction rank ($R = 4$ for `Lite`/`Full`/`Pro`, $R = 8$ for `Ultra`).
-    #[inline]
-    pub const fn fm_interaction_rank(self) -> usize {
-        match self {
-            Self::Lite | Self::Full | Self::Pro => 4,
-            Self::Ultra => 8,
-        }
-    }
-
-    /// Returns the cumulative `SONA` `v3.0` arena byte end offset (`4,608`, `7,936`, `15,872`, or `30,720`).
-    #[inline]
-    pub const fn expected_arena_bytes(self) -> usize {
-        match self {
-            Self::Lite => 4_608,
-            Self::Full => 7_936,
-            Self::Pro => 15_872,
-            Self::Ultra => 30_720,
-        }
-    }
-
-    /// Returns the cumulative number of 64-byte cache lines (`72`, `124`, `248`, or `480`).
-    #[inline]
-    pub const fn expected_cache_lines(self) -> usize {
-        self.expected_arena_bytes() / 64
+/// Maps a [`crate::provenance::VerificationStatus`] to its `u8` C-ABI code (`0`, `1`, `2`).
+#[inline]
+pub fn verification_status_code(status: &crate::provenance::VerificationStatus) -> u8 {
+    match status {
+        crate::provenance::VerificationStatus::Unsigned => 0,
+        crate::provenance::VerificationStatus::CreatorVerified { .. } => 1,
+        crate::provenance::VerificationStatus::MarketplaceVerified { .. } => 2,
     }
 }
 
-/// Lock-free, copyable `#[repr(C)]` telemetry snapshot for 60 fps UI visualizers
+/// Lock-free, copyable `#[repr(C)]` Layer 1 telemetry snapshot for 60 fps UI visualizers
 /// (`packages/ui`, `packages/studio`, and `packages/js`).
 #[forbid(unsafe_code)]
 #[repr(C)]
@@ -155,16 +26,38 @@ impl Tier {
 pub struct DnamTelemetrySnapshot {
     /// Active slimmable tier (`0 = Lite`, `1 = Full`, `2 = Pro`, `3 = Ultra`).
     pub active_tier: u8,
+    /// Highest retained tier available in the loaded container (`0..=3`).
+    pub max_available_tier: u8,
+    /// Host/CPU maximum supported tier ceiling (`0..=3`).
+    pub max_supported_tier: u8,
     /// `1` if stereo output head is active, `0` if mono output mode.
     pub stereo_out: u8,
     /// `1` if the engine is currently bypassed, `0` otherwise.
     pub bypassed: u8,
-    /// `1` if Stage IV infinite freeze is currently engaged, `0` otherwise.
-    pub is_frozen: u8,
+    /// `1` if `4x` offline bounce oversampling is active, `0` otherwise.
+    pub offline_bounce: u8,
+    /// `1` if host-direct crossbar / `Op-T` parameter lock is enabled, `0` otherwise.
+    pub host_write_lock: u8,
+    /// Provenance status code (`0 = Unsigned`, `1 = CreatorVerified`, `2 = MarketplaceVerified`).
+    pub verification_status: u8,
     /// Bitmask of controls currently clamped by `[CLAMP-RANGE]`, `[CLAMP-SWITCH]`, or `[CLAMP-STABILITY]`.
     pub active_clamp_mask: u16,
     /// Current host control-bus decimation stride $K_{\text{ctrl}}(f_{s,\text{host}})$.
     pub control_decimation_host: u16,
+    /// Active processing latency in host-rate samples.
+    pub latency_samples: u32,
+    /// Current host callback sample rate in Hz.
+    pub sample_rate_hz: u32,
+    /// Accumulated finite-precision overflow/saturation flags (`ref[arch.fp.range-saturation]`).
+    pub saturation_flags: u32,
+    /// Host shell parallel dry mix gain.
+    pub mix_dry_gain: f32,
+    /// Host shell parallel wet mix gain.
+    pub mix_wet_gain: f32,
+    /// Active Mid-Side stereo width multiplier (`[0.0, 2.0]`).
+    pub stereo_width: f32,
+    /// Current host tempo in BPM.
+    pub tempo_bpm: f32,
     /// Peak `Op-N` normalized drive $|u_c| \in [0, 1]$ in the latest block.
     pub max_op_n_drive: f32,
     /// Peak `Op-M` modal pole radius $r_c[n] \le 0.9995$ in the latest block.
@@ -181,11 +74,44 @@ pub struct DnamTelemetrySnapshot {
     pub lfo_harmonics: [f32; 8],
     /// Current clamped physical control values across the leading 16 C-ABI telemetry slots.
     pub clamped_controls: [f32; TELEMETRY_CONTROL_SLOTS],
-    /// Accumulated finite-precision overflow/saturation flags (`ref[arch.fp.range-saturation]`).
-    pub overflow_or_saturation_flags: u32,
 }
 
-#[forbid(unsafe_code)]
+const _: () = assert!(core::mem::size_of::<DnamTelemetrySnapshot>() == 184);
+const _: () = assert!(core::mem::align_of::<DnamTelemetrySnapshot>() == 4);
+
+impl Default for DnamTelemetrySnapshot {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            active_tier: Tier::Lite as u8,
+            max_available_tier: Tier::Lite as u8,
+            max_supported_tier: Tier::Ultra as u8,
+            stereo_out: 1,
+            bypassed: 0,
+            offline_bounce: 0,
+            host_write_lock: 0,
+            verification_status: 0,
+            active_clamp_mask: 0,
+            control_decimation_host: 16,
+            latency_samples: 0,
+            sample_rate_hz: 48_000,
+            saturation_flags: 0,
+            mix_dry_gain: 0.0,
+            mix_wet_gain: 1.0,
+            stereo_width: 1.0,
+            tempo_bpm: 120.0,
+            max_op_n_drive: 0.0,
+            max_pole_radius: 0.0,
+            max_effective_loop_gain: 0.0,
+            tail_time_ms: 0.0,
+            z_head: [0.0; 4],
+            env_states: [0.0; 4],
+            lfo_harmonics: [0.0; 8],
+            clamped_controls: [0.0; TELEMETRY_CONTROL_SLOTS],
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

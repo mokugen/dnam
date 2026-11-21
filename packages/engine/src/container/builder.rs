@@ -6,17 +6,19 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
-use zerocopy::FromBytes;
+use dnam_vm::bin::DnamBinView;
+use dnam_vm::control::Cp1ContributorSlot;
+use zerocopy::{FromBytes, IntoBytes};
 
-use crate::control::Cp1ContributorSlot;
 use crate::provenance::canonicalize_jcs_value;
 use crate::schema::{DnamError, DnamJsonHeader, SchemaOptionExt, SchemaVersion, reject_if};
 
 use super::wire::{
     DCRC_RECORD_SIZE, DEFAULT_DMU1_TRAILER_CAPACITY, DMU1_HEADER_SIZE, DcrcAuthRecord,
-    DnamDirectoryWire, V3_HEADER_OFFSET, V3_PREAMBLE_SIZE, build_dmu1_mutable_frame,
-    build_v3_dnam_container_with_profile, encode_cp1_shared_stream, parse_strict_json_object_bytes,
-    validate_mutable_json_schema, validate_v3_dnam_layout_with_max_profile,
+    DnamDirectoryWire, V3_HEADER_OFFSET, V3_PREAMBLE_SIZE, V3ContainerBuildSpec,
+    build_dmu1_mutable_frame, build_v3_dnam_container_with_dbin, encode_cp1_shared_stream,
+    parse_strict_json_object_bytes, validate_mutable_json_schema,
+    validate_v3_dnam_layout_with_max_profile,
 };
 use super::{
     ARENA_OFFSET_FULL_END, ARENA_OFFSET_LITE_END, ARENA_OFFSET_PRO_END, ARENA_OFFSET_ULTRA_END,
@@ -109,11 +111,12 @@ pub fn build_dnam_container(
     stored_arena_bytes: &[u8],
     encrypted_arena: bool,
 ) -> Result<Vec<u8>, DnamError> {
-    build_dnam_container_with_cp1(
+    build_dnam_container_inner(
         header,
         plaintext_arena_crc_source,
         stored_arena_bytes,
         encrypted_arena,
+        &[],
         &[],
     )
 }
@@ -126,6 +129,60 @@ pub fn build_dnam_container_with_cp1(
     stored_arena_bytes: &[u8],
     encrypted_arena: bool,
     cp1_slots: &[Cp1ContributorSlot],
+) -> Result<Vec<u8>, DnamError> {
+    build_dnam_container_inner(
+        header,
+        plaintext_arena_crc_source,
+        stored_arena_bytes,
+        encrypted_arena,
+        cp1_slots,
+        &[],
+    )
+}
+
+/// Builds a canonical `v3.0` (`"sona"`) `.dnam` hybrid container embedding a verbatim Layer 0
+/// `.dnam-bin` prefix (`dbin_prefix_bytes`) immediately after `auth_extent`, leaving Region 4 empty.
+pub fn build_dnam_container_with_dbin(
+    header: &mut DnamJsonHeader,
+    plaintext_arena_crc_source: &[u8],
+    stored_arena_bytes: &[u8],
+    dbin_prefix_bytes: &[u8],
+    encrypted_arena: bool,
+) -> Result<Vec<u8>, DnamError> {
+    reject_if(
+        dbin_prefix_bytes.is_empty() || !dbin_prefix_bytes.len().is_multiple_of(64),
+        "dbin_prefix_bytes must be non-empty and 64-byte aligned",
+    )?;
+    build_dnam_container_inner(
+        header,
+        plaintext_arena_crc_source,
+        stored_arena_bytes,
+        encrypted_arena,
+        &[],
+        dbin_prefix_bytes,
+    )
+}
+
+/// Builds a canonical `v3.0` (`"sona"`) Open hybrid `.dnam` container directly from a validated
+/// Layer 0 `.dnam-bin` byte buffer so `[dbin_offset..retained_tier_end]` is byte-identical to `dnam_bin_bytes`.
+pub fn build_dnam_container_from_dnam_bin(
+    header: &mut DnamJsonHeader,
+    dnam_bin_bytes: &[u8],
+) -> Result<Vec<u8>, DnamError> {
+    let view = DnamBinView::parse(dnam_bin_bytes).map_err(super::view::map_vm_error)?;
+    let arena0_off = view.header.arena0_offset.get() as usize;
+    let dbin_prefix = &dnam_bin_bytes[..arena0_off];
+    let arena_slice = &dnam_bin_bytes[arena0_off..];
+    build_dnam_container_with_dbin(header, arena_slice, arena_slice, dbin_prefix, false)
+}
+
+fn build_dnam_container_inner(
+    header: &mut DnamJsonHeader,
+    plaintext_arena_crc_source: &[u8],
+    stored_arena_bytes: &[u8],
+    encrypted_arena: bool,
+    cp1_slots: &[Cp1ContributorSlot],
+    dbin_prefix_bytes: &[u8],
 ) -> Result<Vec<u8>, DnamError> {
     let lite_end = ARENA_OFFSET_LITE_END as usize;
     let full_end = ARENA_OFFSET_FULL_END as usize;
@@ -224,12 +281,21 @@ pub fn build_dnam_container_with_cp1(
     let region3_bytes = region3_str.into_bytes();
 
     let compiled_descs = header.compile_clamp_descriptors()?;
-    let cp1_bytes = encode_cp1_shared_stream(cp1_slots)?;
-    let mut shared_bytes = Vec::with_capacity(compiled_descs.len() * 64 + cp1_bytes.len());
-    for desc in &compiled_descs {
-        shared_bytes.extend_from_slice(&desc.to_bytes());
-    }
-    shared_bytes.extend_from_slice(&cp1_bytes);
+    let shared_bytes = if dbin_prefix_bytes.is_empty() {
+        let cp1_bytes = encode_cp1_shared_stream(cp1_slots)?;
+        let mut buf = Vec::with_capacity(compiled_descs.len() * 64 + cp1_bytes.len());
+        for desc in &compiled_descs {
+            buf.extend_from_slice(desc.to_wire().as_bytes());
+        }
+        buf.extend_from_slice(&cp1_bytes);
+        buf
+    } else {
+        reject_if(
+            !cp1_slots.is_empty(),
+            "cp1_slots must be empty when embedding dbin_prefix_bytes",
+        )?;
+        Vec::new()
+    };
 
     let has_authorized_devices = header
         .metadata
@@ -251,27 +317,36 @@ pub fn build_dnam_container_with_cp1(
     }
 
     let placeholder_auth = [0u8; DCRC_RECORD_SIZE];
-    let mut container = build_v3_dnam_container_with_profile(
+    let mut container = build_v3_dnam_container_with_dbin(&V3ContainerBuildSpec {
         protection_profile,
-        &region3_bytes,
-        &shared_bytes,
-        &placeholder_auth,
-        &tier_slices,
-        Some(&dmu1_frame),
-        0,
-    )?;
+        header_bytes: &region3_bytes,
+        shared_bytes: &shared_bytes,
+        auth_bytes: &placeholder_auth,
+        dbin_prefix_bytes,
+        tier_slices: &tier_slices,
+        mutable_frame_bytes: Some(&dmu1_frame),
+        auth_kind: 0,
+    })?;
 
     let dir = DnamDirectoryWire::ref_from_bytes(&container[V3_PREAMBLE_SIZE..V3_HEADER_OFFSET])
         .ok()
         .or_schema_err("invalid v3 directory")?;
     let auth_offset = dir.authentication_envelope_offset.get() as usize;
     let crc_prefix = crc32c_update(0, &container[..auth_offset]);
+    let crc_dbin_prefix = if dbin_prefix_bytes.is_empty() {
+        0
+    } else {
+        let d_off = dir.dbin_offset.get() as usize;
+        let d_len = dir.dbin_prefix_bytes.get() as usize;
+        crc32c_update(0, &container[d_off..d_off + d_len])
+    };
     let dcrc = DcrcAuthRecord {
         crc_prefix,
         crc_tiers: [crc_lite, crc_full, crc_pro, crc_ultra],
         num_controls: header.controls_schema.len().min(u16::MAX as usize) as u16,
         flags_hint,
         tail_time_ms_bits: header.io_config.tail_time_ms.to_bits(),
+        crc_dbin_prefix,
     };
     container[auth_offset..auth_offset + DCRC_RECORD_SIZE].copy_from_slice(&dcrc.to_bytes());
 
@@ -462,5 +537,49 @@ mod tests {
             update_header_in_place(&mut container, &too_big),
             Err(DnamError::HeaderCapacityExceeded { .. })
         ));
+    }
+
+    #[test]
+    fn test_build_dnam_container_with_dbin_and_from_dnam_bin() {
+        use dnam_vm::bin::{DnamBinBuildInput, encode_dnam_bin};
+        let a0 = DnamBinBuildInput::default_arena0_lite();
+        let dnam_bin = encode_dnam_bin(&DnamBinBuildInput {
+            reference_sample_rate_hz: 48_000,
+            header_flags: 0,
+            ext_ring_pow2_frames: 0,
+            ext_ring_lines: 0,
+            ext_ring_format: 0,
+            declared_max_delay_48k: 64,
+            dc_blocker_pole_5hz: 0.995,
+            tail_time_ms: 0.0,
+            ro_pole_48k: 0.0,
+            switch_xfade_samples: 128,
+            content_hash_prefix: [0; 8],
+            controls: &[],
+            cp1_overflow: &[],
+            tsyn: &[],
+            cext: None,
+            arena0: &a0,
+            arena1: None,
+            arena2: None,
+            arena3: None,
+        })
+        .unwrap();
+        let mut hdr = DnamJsonHeader::default_reference();
+        let hybrid = build_dnam_container_from_dnam_bin(&mut hdr, &dnam_bin).unwrap();
+        let preamble = DnamPreamble::from_bytes(&hybrid).unwrap();
+        assert_eq!(preamble.dbin_prefix_bytes, 128);
+        assert_ne!(preamble.crc_dbin_prefix, 0);
+        assert_eq!(
+            crate::container::extract_dnam_bin(&hybrid).unwrap(),
+            dnam_bin.as_slice()
+        );
+        assert!(
+            build_dnam_container_with_dbin(&mut hdr, &[0; 4608], &[0; 4608], &[], false).is_err()
+        );
+        assert!(
+            build_dnam_container_with_dbin(&mut hdr, &[0; 4608], &[0; 4608], &[0; 65], false)
+                .is_err()
+        );
     }
 }

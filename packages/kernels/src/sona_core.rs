@@ -35,8 +35,8 @@ pub use paralru::{
     step_paralru_duhem_stereo8, step_paralru_duhem_vec4, step_paralru_stereo8, step_paralru_vec4,
 };
 pub use poly_adaa::{
-    eval_c2_wavefolder_adaa_stereo8, eval_c2_wavefolder_adaa_vec4, eval_poly_adaa1_odd_even_vec4,
-    eval_poly_adaa1_quad_batched, eval_poly_adaa1_stereo8,
+    QuadratureHysteresis2D, eval_c2_wavefolder_adaa_stereo8, eval_c2_wavefolder_adaa_vec4,
+    eval_poly_adaa1_odd_even_vec4, eval_poly_adaa1_quad_batched, eval_poly_adaa1_stereo8,
 };
 pub use tpt_svf::{
     TptAdjointElem, TptScanElem, TptSvfCoeffs4, TptSvfOutputs, apply_tpt_adjoint, apply_tpt_init,
@@ -116,25 +116,6 @@ pub struct SonaBlockParamsStereo4<V: KernelVec4> {
     pub adaa_drive: V,
 }
 
-/// Extended parameter bundle for one 4-lane stereo `SONA` core group with polarity conjugation,
-/// power-supply sag, `ParaLRU` asymmetric bias injection, and optional `C2` wavefolder blend.
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct SonaGroupParamsStereo4<V: KernelVec4> {
-    pub svf: TptSvfCoeffs4<V>,
-    pub tone: SonaToneWeights4<V>,
-    pub lru: SonaParaLruCoeffs4<V>,
-    /// Per-lane sign polarity (`+1.0` or `-1.0`); `rect_in = rect_sign * tone_in`.
-    pub rect_sign: V,
-    /// Power-supply sag depth modulated by `lru_state`.
-    pub sag_depth: V,
-    /// Linear pre-activation scale `(2/3) * d` for the sagged `PolyADAA1` path.
-    pub adaa_drive: V,
-    /// Bias scale injecting `lru_state` into the `PolyADAA1` pre-activation.
-    pub lru_bias_drive: V,
-    /// Non-negative blend `[0, 1]` between `PolyADAA1` odd output and `C2` wavefolder odd output.
-    pub wavefolder_mix: V,
-}
-
 /// Recursive stereo state for one 4-lane `SONA` core group (`S: StereoVec8`).
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct SonaBlockStateStereo8<S: StereoVec8> {
@@ -203,63 +184,6 @@ pub fn step_sona_block_stereo8<S: StereoVec8>(
     }
 }
 
-/// Executes one complete stereo `4`-lane `SONA` core group step (`TPT-SVF -> tone -> rect_sign
-/// ParaLRU -> power-supply sag -> bias-injected PolyADAA1 + optional C2 wavefolder`) in
-/// `StereoVec8` registers (`0 FDIV`, `0 FSQRT`, `0-ULP` sign-flip conjugation invariance).
-#[inline(always)]
-pub fn step_sona_group_stereo8<S: StereoVec8>(
-    u: S,
-    state: &mut SonaBlockStateStereo8<S>,
-    params: &SonaGroupParamsStereo4<S::Half>,
-) -> SonaBlockOutputStereo8<S> {
-    let svf_out = step_tpt_svf_stereo8(u, &mut state.svf_s1, &mut state.svf_s2, &params.svf);
-    let tone_in = svf_out
-        .lp
-        .mul(S::broadcast_half(params.tone.lp))
-        .fma(svf_out.bp, S::broadcast_half(params.tone.bp))
-        .fma(svf_out.hp, S::broadcast_half(params.tone.hp))
-        .fma(svf_out.ap, S::broadcast_half(params.tone.ap))
-        .fma(u, S::broadcast_half(params.tone.dir));
-
-    let rect_in = S::broadcast_half(params.rect_sign).mul(tone_in);
-    let lru_state = step_paralru_stereo8(
-        rect_in,
-        &mut state.lru_v,
-        params.lru.alpha_rel,
-        params.lru.alpha_atk,
-        params.lru.kappa,
-    );
-
-    let sag_gain = S::splat(1.0)
-        .fms(S::broadcast_half(params.sag_depth), lru_state)
-        .max(S::splat(0.05));
-    let r_curr = tone_in
-        .mul(S::broadcast_half(params.adaa_drive))
-        .mul(sag_gain)
-        .fma(S::broadcast_half(params.lru_bias_drive), lru_state);
-
-    let (mut adaa_odd, adaa_even) = eval_poly_adaa1_stereo8(state.adaa_prev, r_curr);
-    let wf_clamped = params
-        .wavefolder_mix
-        .clamp(S::Half::zero(), S::Half::splat(1.0));
-    if !wf_clamped.all_le(S::Half::zero()) {
-        let (wf_odd, _wf_even) = eval_c2_wavefolder_adaa_stereo8(state.adaa_prev, r_curr);
-        let wf_mix = S::broadcast_half(wf_clamped);
-        let one_minus_wf = S::splat(1.0).sub(wf_mix);
-        adaa_odd = adaa_odd
-            .mul(one_minus_wf)
-            .fma(wf_mix, wf_odd)
-            .add(S::zero());
-    }
-    state.adaa_prev = poly_adaa::scrub_endpoint_stereo8(r_curr);
-
-    SonaBlockOutputStereo8 {
-        lru_state,
-        adaa_odd,
-        adaa_even,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -267,6 +191,8 @@ mod tests {
     use super::*;
     use crate::simd::{GpuVec4, InterleavedStereo8};
 
+    /// verify[dsp.op-n.core.tpt-tone-basis]
+    /// verify[dsp.op-n.polyadaa.drive-bank]
     #[test]
     fn test_sona_block_zero_dc_equilibrium_and_dual_mono_parity() {
         let g = GpuVec4::from_array([
@@ -447,15 +373,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sona_group_zero_dc_wavefolder_and_bibo() {
+    fn test_core_quad_zero_dc_wavefolder_and_bibo() {
         let g = GpuVec4::from_array([
             prewarp_tan_pi_f_over_fs_f32(0.02),
             prewarp_tan_pi_f_over_fs_f32(0.08),
             prewarp_tan_pi_f_over_fs_f32(0.18),
             prewarp_tan_pi_f_over_fs_f32(0.32),
         ]);
-        let k = GpuVec4::from_array([0.5, 0.70710677, 1.0, 1.4]);
-        let base_params = SonaGroupParamsStereo4 {
+        let k = GpuVec4::from_array([0.5, 0.707_106_77, 1.0, 1.4]);
+        let base_params = CoreQuadParamsStereo4 {
             svf: TptSvfCoeffs4::from_gk(g, k),
             tone: SonaToneWeights4 {
                 lp: GpuVec4::from_array([0.4, 0.2, 0.1, 0.0]),
@@ -464,23 +390,28 @@ mod tests {
                 ap: GpuVec4::from_array([0.1, 0.0, 0.2, 0.1]),
                 dir: GpuVec4::from_array([0.2, 0.2, 0.2, 0.2]),
             },
-            lru: SonaParaLruCoeffs4::from_clamped(
+            lru: SonaParaLruDuhemCoeffs4::from_clamped(
                 GpuVec4::from_array([0.98, 0.94, 0.88, 0.75]),
                 GpuVec4::from_array([0.25, 0.4, 0.65, 0.8]),
                 GpuVec4::from_array([0.1, 0.3, 0.6, 0.9]),
+                GpuVec4::from_array([0.5, 1.5, 4.0, 8.0]),
+                GpuVec4::from_array([0.0, 0.25, 0.5, 1.0]),
+                GpuVec4::from_array([0.0, 0.3, 0.6, 1.0]),
             ),
+            two_svf_g: g.add(g),
             rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
             sag_depth: GpuVec4::from_array([0.0, 0.35, 0.65, 0.85]),
             adaa_drive: GpuVec4::from_array([0.8, 1.5, 2.5, 4.0]),
             lru_bias_drive: GpuVec4::from_array([0.0, 0.4, -0.5, 0.7]),
             wavefolder_mix: GpuVec4::zero(),
+            glu_mix: GpuVec4::zero(),
         };
 
         // Zero-DC resting equilibrium (`+0.0` bits across all channels and lanes, even for `-0.0` input).
         let mut zero_state = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
         for step in 0..128 {
             let z_in = if (step & 1) == 0 { 0.0 } else { -0.0 };
-            let out = step_sona_group_stereo8(
+            let out = step_core_quad_stereo8(
                 InterleavedStereo8::splat(z_in),
                 &mut zero_state,
                 &base_params,
@@ -499,19 +430,18 @@ mod tests {
             assert_eq!(prev_r.to_array().map(f32::to_bits), [0; 4]);
         }
 
-        // Verify wavefolder blend alters `adaa_odd` monotonically while preserving finite BIBO outputs.
+        // Verify wavefolder blend alters `adaa_odd` while leaving lane 0 (`mix == 0`) `0-ULP` identical.
         let mut wf_params = base_params;
         wf_params.wavefolder_mix = GpuVec4::from_array([0.0, 0.25, 0.75, 1.0]);
         let mut st_plain = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
         let mut st_wf = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
-        let mut max_lane0_diff = 0.0_f32;
         let mut max_lane3_diff = 0.0_f32;
         for n in 0..64 {
             let ul = ((n as f32) * 0.21).sin() * 1.4;
             let ur = ((n as f32) * 0.13).cos() * 1.1;
             let u = InterleavedStereo8::splat_lr(ul, ur);
-            let o_plain = step_sona_group_stereo8(u, &mut st_plain, &base_params);
-            let o_wf = step_sona_group_stereo8(u, &mut st_wf, &wf_params);
+            let o_plain = step_core_quad_stereo8(u, &mut st_plain, &base_params);
+            let o_wf = step_core_quad_stereo8(u, &mut st_wf, &wf_params);
             let (p_odd_l, p_odd_r) = o_plain.adaa_odd.into_lr();
             let (w_odd_l, w_odd_r) = o_wf.adaa_odd.into_lr();
             assert_eq!(
@@ -522,9 +452,14 @@ mod tests {
                 o_plain.adaa_even.into_lr().0.to_array().map(f32::to_bits),
                 o_wf.adaa_even.into_lr().0.to_array().map(f32::to_bits)
             );
-            max_lane0_diff = max_lane0_diff
-                .max((p_odd_l.to_array()[0] - w_odd_l.to_array()[0]).abs())
-                .max((p_odd_r.to_array()[0] - w_odd_r.to_array()[0]).abs());
+            assert_eq!(
+                p_odd_l.to_array()[0].to_bits(),
+                w_odd_l.to_array()[0].to_bits()
+            );
+            assert_eq!(
+                p_odd_r.to_array()[0].to_bits(),
+                w_odd_r.to_array()[0].to_bits()
+            );
             max_lane3_diff =
                 max_lane3_diff.max((p_odd_l.to_array()[3] - w_odd_l.to_array()[3]).abs());
             for lane in 0..4 {
@@ -534,40 +469,36 @@ mod tests {
                 assert!(w_odd_r.to_array()[lane].abs() <= 1.05);
             }
         }
-        assert!(max_lane0_diff < 1.0e-6);
         assert!(max_lane3_diff > 1.0e-2);
     }
 
     proptest! {
         #[test]
-        fn prop_sona_group_sign_flip_conjugation_zero_ulp(
+        fn prop_core_quad_dual_mono_stereo_link_and_glu_parity_zero_ulp(
             fc in 0.02_f32..0.35_f32,
             k_val in 0.35_f32..1.5_f32,
             alpha_rel in 0.5_f32..0.99_f32,
             alpha_atk in 0.05_f32..0.9_f32,
             kappa in 0.0_f32..1.0_f32,
+            gamma_duhem in 0.0_f32..8.0_f32,
+            signed_mix in 0.0_f32..1.0_f32,
             sag_depth in 0.0_f32..0.9_f32,
             adaa_drive in 0.2_f32..4.0_f32,
             lru_bias_drive in -1.2_f32..1.2_f32,
             wf_mix in prop_oneof![Just(0.0_f32), 0.01_f32..1.0_f32],
+            glu_vals in prop::array::uniform4(-3.5_f32..3.5_f32),
             rect_sign_bits in [any::<bool>(); 4],
-            conj_sign_bits in [any::<bool>(); 4],
-            stim_l in prop::collection::vec(
-                prop_oneof![-2.5_f32..-1.0e-3_f32, 1.0e-3_f32..2.5_f32],
-                8
-            ),
-            stim_r in prop::collection::vec(
+            stim in prop::collection::vec(
                 prop_oneof![-2.5_f32..-1.0e-3_f32, 1.0e-3_f32..2.5_f32],
                 8
             ),
         ) {
-            let g = GpuVec4::splat(prewarp_tan_pi_f_over_fs_f32(fc));
+            let g_s = prewarp_tan_pi_f_over_fs_f32(fc);
+            let g = GpuVec4::splat(g_s);
             let k = GpuVec4::splat(k_val);
             let rect_sign_arr = rect_sign_bits.map(|b| if b { 1.0_f32 } else { -1.0_f32 });
-            let conj_arr = conj_sign_bits.map(|b| if b { 1.0_f32 } else { -1.0_f32 });
-            let conj_v = GpuVec4::from_array(conj_arr);
 
-            let params = SonaGroupParamsStereo4 {
+            let params = CoreQuadParamsStereo4 {
                 svf: TptSvfCoeffs4::from_gk(g, k),
                 tone: SonaToneWeights4 {
                     lp: GpuVec4::splat(0.35),
@@ -576,58 +507,53 @@ mod tests {
                     ap: GpuVec4::splat(0.10),
                     dir: GpuVec4::splat(0.15),
                 },
-                lru: SonaParaLruCoeffs4::from_clamped(
+                lru: SonaParaLruDuhemCoeffs4::from_clamped(
                     GpuVec4::splat(alpha_rel),
                     GpuVec4::splat(alpha_atk),
                     GpuVec4::splat(kappa),
+                    GpuVec4::splat(gamma_duhem),
+                    GpuVec4::splat(signed_mix),
+                    GpuVec4::splat(1.0),
                 ),
+                two_svf_g: GpuVec4::splat(2.0 * g_s),
                 rect_sign: GpuVec4::from_array(rect_sign_arr),
                 sag_depth: GpuVec4::splat(sag_depth),
                 adaa_drive: GpuVec4::splat(adaa_drive),
                 lru_bias_drive: GpuVec4::splat(lru_bias_drive),
                 wavefolder_mix: GpuVec4::splat(wf_mix),
+                glu_mix: GpuVec4::from_array(glu_vals),
             };
-            let params_conj = SonaGroupParamsStereo4 {
-                rect_sign: params.rect_sign.mul(conj_v),
-                lru_bias_drive: params.lru_bias_drive.mul(conj_v),
+            let params_unlinked = CoreQuadParamsStereo4 {
+                lru: SonaParaLruDuhemCoeffs4::from_clamped(
+                    GpuVec4::splat(alpha_rel),
+                    GpuVec4::splat(alpha_atk),
+                    GpuVec4::splat(kappa),
+                    GpuVec4::splat(gamma_duhem),
+                    GpuVec4::splat(signed_mix),
+                    GpuVec4::zero(),
+                ),
                 ..params
             };
 
-            let mut st_orig = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
-            let mut st_conj = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+            let mut st_linked = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+            let mut st_unlinked = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+            for &x in &stim {
+                let u = InterleavedStereo8::splat_lr(x, x);
+                let out_l = step_core_quad_stereo8(u, &mut st_linked, &params);
+                let out_u = step_core_quad_stereo8(u, &mut st_unlinked, &params_unlinked);
 
-            for (&ul, &ur) in stim_l.iter().zip(stim_r.iter()) {
-                let u_orig = InterleavedStereo8::splat_lr(ul, ur);
-                let u_conj = InterleavedStereo8::from_lr(
-                    GpuVec4::splat(ul).mul(conj_v),
-                    GpuVec4::splat(ur).mul(conj_v),
-                );
-                let out_orig = step_sona_group_stereo8(u_orig, &mut st_orig, &params);
-                let out_conj = step_sona_group_stereo8(u_conj, &mut st_conj, &params_conj);
+                let (ll, lr) = out_l.lru_state.into_lr();
+                let (ol, or) = out_l.adaa_odd.into_lr();
+                let (el, er) = out_l.adaa_even.into_lr();
+                let (ul_lru, ur_lru) = out_u.lru_state.into_lr();
 
-                let (ol_lru, or_lru) = out_orig.lru_state.into_lr();
-                let (cl_lru, cr_lru) = out_conj.lru_state.into_lr();
-                let (ol_odd, or_odd) = out_orig.adaa_odd.into_lr();
-                let (cl_odd, cr_odd) = out_conj.adaa_odd.into_lr();
-                let (ol_even, or_even) = out_orig.adaa_even.into_lr();
-                let (cl_even, cr_even) = out_conj.adaa_even.into_lr();
-
-                prop_assert_eq!(cl_lru.to_array().map(f32::to_bits), ol_lru.to_array().map(f32::to_bits));
-                prop_assert_eq!(cr_lru.to_array().map(f32::to_bits), or_lru.to_array().map(f32::to_bits));
-                prop_assert_eq!(cl_even.to_array().map(f32::to_bits), ol_even.to_array().map(f32::to_bits));
-                prop_assert_eq!(cr_even.to_array().map(f32::to_bits), or_even.to_array().map(f32::to_bits));
-
-                let exp_odd_l = ol_odd.mul(conj_v).to_array();
-                let exp_odd_r = or_odd.mul(conj_v).to_array();
-                let got_odd_l = cl_odd.to_array();
-                let got_odd_r = cr_odd.to_array();
+                // Dual-mono symmetry: L == R to 0 ULP across both linked and unlinked CoreQuad paths.
+                prop_assert_eq!(ll.to_array().map(f32::to_bits), lr.to_array().map(f32::to_bits));
+                prop_assert_eq!(ol.to_array().map(f32::to_bits), or.to_array().map(f32::to_bits));
+                prop_assert_eq!(el.to_array().map(f32::to_bits), er.to_array().map(f32::to_bits));
                 for lane in 0..4 {
-                    if exp_odd_l[lane] != 0.0 || got_odd_l[lane] != 0.0 {
-                        prop_assert_eq!(got_odd_l[lane].to_bits(), exp_odd_l[lane].to_bits());
-                    }
-                    if exp_odd_r[lane] != 0.0 || got_odd_r[lane] != 0.0 {
-                        prop_assert_eq!(got_odd_r[lane].to_bits(), exp_odd_r[lane].to_bits());
-                    }
+                    prop_assert!((ll.to_array()[lane] - ul_lru.to_array()[lane]).abs() < 1.0e-5);
+                    prop_assert!((lr.to_array()[lane] - ur_lru.to_array()[lane]).abs() < 1.0e-5);
                 }
             }
         }

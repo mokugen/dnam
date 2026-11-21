@@ -16,7 +16,7 @@ use crate::graph::convolver::high_sr::ConvolverHighSrFirExt;
 use crate::graph::convolver::kautz::{
     KautzColdSlewState, KautzStereoBank4, MAX_KAUTZ_BANKS, MAX_KAUTZ_PAIRS,
 };
-use crate::graph::oversample::{Bounce4xOversampler, SonaOs2xHot};
+use crate::graph::oversample::{Bounce4xDecimator, Bounce4xOversampler, SonaOs2xHot};
 use crate::graph::sensory::SensoryQuadCold;
 use crate::graph::slab::microchunk::core_step::HoistedCoreChunk;
 use crate::graph::transport::ring::{PartitionedSchroederBank, TransportExtRing};
@@ -93,6 +93,8 @@ pub struct SonaColdTail<'a, B: GraphBackend> {
     pub transport_ext: [TransportExtRing<'a>; TRANSPORT_MAX_QUADS],
     pub transport_schroeder: [PartitionedSchroederBank<'a>; TRANSPORT_MAX_QUADS],
     pub bounce4x: Bounce4xOversampler,
+    pub bounce4x_core_decim: Bounce4xDecimator,
+    pub bounce4x_wet_decim: Bounce4xDecimator,
     pub wire_crossbar: CrossbarWire,
     pub wire_kautz: [KautzSoaBlockWire; MAX_KAUTZ_BANKS],
     pub wire_transport_quads: [TransportQuadWire; TRANSPORT_MAX_QUADS],
@@ -133,10 +135,14 @@ pub struct SonaColdTail<'a, B: GraphBackend> {
     pub rem_hist: HilbertH1RemapHistory,
     pub xfade_rem: u16,
     pub xfade_prev_out: [f32; 2],
+    pub xfade_prev_core: [f32; 2],
+    pub xfade_prev_wet: [f32; 2],
     pub last_in: [f32; 2],
     pub last_s2_dir: [f32; 4],
     pub last_op_p_iq_lr: [f32; 4],
     pub last_op_p_feat: [f32; 4],
+    pub last_core_lr: [f32; 2],
+    pub last_transport_wet_lr: [f32; 2],
     pub saturation_flags: u32,
     pub offline_bounce: bool,
     pub declared_max_delay_48k: u32,
@@ -172,6 +178,8 @@ impl<B: GraphBackend> SonaColdTail<'_, B> {
                 PartitionedSchroederBank::disabled(),
             ],
             bounce4x: Bounce4xOversampler::new(),
+            bounce4x_core_decim: Bounce4xDecimator::new(),
+            bounce4x_wet_decim: Bounce4xDecimator::new(),
             wire_crossbar: CrossbarWire::new_zeroed(),
             wire_kautz: [KautzSoaBlockWire::new_zeroed(); MAX_KAUTZ_BANKS],
             wire_transport_quads: [TransportQuadWire::new_zeroed(); TRANSPORT_MAX_QUADS],
@@ -212,10 +220,14 @@ impl<B: GraphBackend> SonaColdTail<'_, B> {
             rem_hist: HilbertH1RemapHistory::default(),
             xfade_rem: 0,
             xfade_prev_out: [0.0; 2],
+            xfade_prev_core: [0.0; 2],
+            xfade_prev_wet: [0.0; 2],
             last_in: [0.0; 2],
             last_s2_dir: [0.0; 4],
             last_op_p_iq_lr: [0.0; 4],
             last_op_p_feat: [0.0; 4],
+            last_core_lr: [0.0; 2],
+            last_transport_wet_lr: [0.0; 2],
             saturation_flags: 0,
             offline_bounce: false,
             declared_max_delay_48k: 4_096,
@@ -226,6 +238,74 @@ impl<B: GraphBackend> SonaColdTail<'_, B> {
             hoisted_core: HoistedCoreChunk::empty(),
             hoisted_core_valid: false,
         }
+    }
+
+    /// Resets all wire/runtime metadata fields while preserving allocated cold buffers (`0` drops).
+    pub(crate) fn reset_metadata_preserving_backing(&mut self) {
+        self.sensory_cold = SensoryQuadCold::zero();
+        self.kautz_slew = KautzColdSlewState::default();
+        self.transport_quad_meta = [QuadColdMeta::default(); TRANSPORT_MAX_QUADS];
+        self.transport_quad_eff = [QuadEffectiveTargets::default(); TRANSPORT_MAX_QUADS];
+        self.bounce4x = Bounce4xOversampler::new();
+        self.bounce4x_core_decim = Bounce4xDecimator::new();
+        self.bounce4x_wet_decim = Bounce4xDecimator::new();
+        self.wire_crossbar = CrossbarWire::new_zeroed();
+        self.wire_kautz = [KautzSoaBlockWire::new_zeroed(); MAX_KAUTZ_BANKS];
+        self.wire_transport_quads = [TransportQuadWire::new_zeroed(); TRANSPORT_MAX_QUADS];
+        self.base_core_quads = [CoreQuadHot::default(); MAX_CORE_QUADS];
+        self.base_core_ext = [CoreQuadExtCold::default(); MAX_CORE_QUADS];
+        self.tier_fir_l = [[0.0; 128]; 4];
+        self.tier_fir_r = [[0.0; 128]; 4];
+        self.tier_kautz_b_gamma = [[0.0; MAX_KAUTZ_PAIRS]; 4];
+        self.tier_kautz_c_l = [[(0.0, 0.0); MAX_KAUTZ_PAIRS]; 4];
+        self.tier_kautz_c_r = [[(0.0, 0.0); MAX_KAUTZ_PAIRS]; 4];
+        self.tier_crossbars = [TierCrossbarSnapshot::default(); 4];
+        self.base_phasor_freq_hz = [0.0; 4];
+        self.base_phasor_init_phase_q32 = [0; 4];
+        self.base_op_p_gain = 0.0;
+        self.base_op_t_gain = 0.0;
+        self.base_tank_dry_mix = 0.0;
+        self.ro_pole_48k = 0.0;
+        self.base_op_n_pre = OpNPreBaseWire::new_zeroed();
+        self.stage_latent_mods_fp16 = [0; 96];
+        self.stage_latent_ctrl_ultra_fp16 = [0; 256];
+        self.stage_latent_core_mods_fp16 = [0; 1_024];
+        self.tier_os2x = [false; 4];
+        self.tier_gain_trim = [1.0; 4];
+        self.core_mods_present = false;
+        self.core_mods_active = false;
+        self.meta_flags = 0;
+        self.max_present_tier = Tier::Lite;
+        self.retained_tier = Tier::Lite;
+        self.zoh = ZohRateContext::default();
+        self.latched_stage_params = [0.0; 32];
+        self.latched_z_stage = [0.0; 8];
+        self.lane_g_scale = [1.0; MAX_TOTAL_SONA_LANES];
+        self.lane_k_delta = [0.0; MAX_TOTAL_SONA_LANES];
+        self.lane_wf_delta = [0.0; MAX_TOTAL_SONA_LANES];
+        self.quad_adaa_scale = [1.0; MAX_CORE_QUADS];
+        self.quad_lru_bias = [0.0; MAX_CORE_QUADS];
+        self.op_n_pre_hoisted = OpNPreHoisted::bypass();
+        self.rem_hist = HilbertH1RemapHistory::default();
+        self.xfade_rem = 0;
+        self.xfade_prev_out = [0.0; 2];
+        self.xfade_prev_core = [0.0; 2];
+        self.xfade_prev_wet = [0.0; 2];
+        self.last_in = [0.0; 2];
+        self.last_s2_dir = [0.0; 4];
+        self.last_op_p_iq_lr = [0.0; 4];
+        self.last_op_p_feat = [0.0; 4];
+        self.last_core_lr = [0.0; 2];
+        self.last_transport_wet_lr = [0.0; 2];
+        self.saturation_flags = 0;
+        self.offline_bounce = false;
+        self.declared_max_delay_48k = 4_096;
+        self.ext_ring_pow2_frames = 0;
+        self.dc_blocker_pole_5hz = crate::math::TANK_DC_BLOCKER_48K_F32;
+        self.active_kautz_blocks = 2;
+        self.active_transport_quads = 1;
+        self.hoisted_core = HoistedCoreChunk::empty();
+        self.hoisted_core_valid = false;
     }
 }
 

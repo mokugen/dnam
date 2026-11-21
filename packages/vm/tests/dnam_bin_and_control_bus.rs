@@ -252,6 +252,7 @@ fn build_rich_ultra_fixture(
     encode_dnam_bin(&input).unwrap()
 }
 
+/// verify[container.dnam.vm-binary]
 #[test]
 fn test_ultra_roundtrip_strip_to_lite_bind_latency_and_fail_closed_corruption() {
     let a0 = DnamBinBuildInput::default_arena0_lite();
@@ -593,6 +594,7 @@ proptest! {
     }
 }
 
+/// verify[container.dnam.vm-binary]
 #[test]
 fn test_dnam_bin_parse_bind_and_strip_error_paths() {
     let bytes = build_rich_ultra_fixture(true, true, None);
@@ -670,6 +672,7 @@ fn test_dnam_bin_parse_bind_and_strip_error_paths() {
     let _ = view;
 }
 
+/// verify[dsp.ctrl.dispatch.modulation-laws]
 #[test]
 fn test_control_bus_m10b_skewed_lfo_ou_uniform_ramping_and_table4_bounds() {
     let mut a0 = DnamBinBuildInput::default_arena0_lite();

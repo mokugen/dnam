@@ -125,13 +125,16 @@ mod tests {
 
     use super::*;
     use crate::simd::{GpuVec4, InterleavedStereo8};
-    use crate::sona_core::paralru::{apply_stereo_link_vec4_pair, step_paralru_duhem_vec4};
+    use crate::sona_core::paralru::{
+        apply_stereo_link_vec4_pair, step_paralru_duhem_vec4, step_paralru_vec4,
+    };
     use crate::sona_core::poly_adaa::{
         eval_c2_wavefolder_adaa_vec4, eval_poly_adaa1_odd_even_vec4,
     };
     use crate::sona_core::tpt_svf::{prewarp_tan_pi_f_over_fs_f32, step_tpt_svf_vec4};
-    use crate::sona_core::{SonaGroupParamsStereo4, SonaParaLruCoeffs4, step_sona_group_stereo8};
 
+    /// verify[dsp.router.mid-side-input]
+    /// verify[dsp.router.stereo-link-detector]
     #[test]
     fn test_core_quad_zero_dc_ms_coupling_and_stereo_link_convergence() {
         let g = GpuVec4::from_array([
@@ -211,7 +214,7 @@ mod tests {
     }
 
     #[test]
-    fn test_core_quad_matches_vec4_and_sona_group_zero_ulp() {
+    fn test_core_quad_matches_vec4_zero_ulp_and_degenerates_cleanly() {
         let g = GpuVec4::from_array([
             prewarp_tan_pi_f_over_fs_f32(0.03),
             prewarp_tan_pi_f_over_fs_f32(0.09),
@@ -228,87 +231,152 @@ mod tests {
             dir: GpuVec4::from_array([0.2, 0.2, 0.2, 0.2]),
         };
 
-        let group_p = SonaGroupParamsStereo4 {
-            svf,
-            tone,
-            lru: SonaParaLruCoeffs4::from_clamped(
-                GpuVec4::from_array([0.97, 0.92, 0.85, 0.72]),
-                GpuVec4::from_array([0.2, 0.35, 0.6, 0.85]),
-                GpuVec4::from_array([0.1, 0.4, 0.7, 0.95]),
-            ),
-            rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
-            sag_depth: GpuVec4::from_array([0.0, 0.3, 0.6, 0.9]),
-            adaa_drive: GpuVec4::from_array([0.7, 1.4, 2.2, 3.5]),
-            lru_bias_drive: GpuVec4::from_array([0.1, -0.3, 0.5, -0.6]),
-            wavefolder_mix: GpuVec4::from_array([0.0, 0.25, 0.75, 1.0]),
-        };
-        let core_grp_p = CoreQuadParamsStereo4 {
+        let alpha_rel = GpuVec4::from_array([0.97, 0.92, 0.85, 0.72]);
+        let alpha_atk = GpuVec4::from_array([0.2, 0.35, 0.6, 0.85]);
+        let kappa = GpuVec4::from_array([0.1, 0.4, 0.7, 0.95]);
+        let core_deg_p = CoreQuadParamsStereo4 {
             svf,
             tone,
             lru: SonaParaLruDuhemCoeffs4::from_clamped(
-                group_p.lru.alpha_rel,
-                group_p.lru.alpha_atk,
-                group_p.lru.kappa,
+                alpha_rel,
+                alpha_atk,
+                kappa,
                 GpuVec4::zero(),
                 GpuVec4::zero(),
                 GpuVec4::zero(),
             ),
             two_svf_g: g.add(g),
-            rect_sign: group_p.rect_sign,
-            sag_depth: group_p.sag_depth,
-            adaa_drive: group_p.adaa_drive,
-            lru_bias_drive: group_p.lru_bias_drive,
-            wavefolder_mix: group_p.wavefolder_mix,
+            rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
+            sag_depth: GpuVec4::from_array([0.0, 0.3, 0.6, 0.9]),
+            adaa_drive: GpuVec4::from_array([0.7, 1.4, 2.2, 3.5]),
+            lru_bias_drive: GpuVec4::from_array([0.1, -0.3, 0.5, -0.6]),
+            wavefolder_mix: GpuVec4::from_array([0.0, 0.25, 0.75, 1.0]),
             glu_mix: GpuVec4::zero(),
         };
 
-        let mut st_grp = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
-        let mut st_core_grp = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+        // Zero Duhem, zero stereo link, zero GLU reduces to 1D ParaLRU + PolyADAA1 + C2 wavefolder at 0 ULP.
+        let mut st_core_deg = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+        let (mut d_s1_l, mut d_s2_l, mut d_v_l, mut d_p_l) = (
+            GpuVec4::zero(),
+            GpuVec4::zero(),
+            GpuVec4::zero(),
+            GpuVec4::zero(),
+        );
+        let (mut d_s1_r, mut d_s2_r, mut d_v_r, mut d_p_r) = (
+            GpuVec4::zero(),
+            GpuVec4::zero(),
+            GpuVec4::zero(),
+            GpuVec4::zero(),
+        );
         for n in 0..64 {
-            let u = InterleavedStereo8::splat_lr(
-                ((n as f32) * 0.19).sin() * 2.5,
-                ((n as f32) * 0.11).cos() * -1.8,
+            let xl = ((n as f32) * 0.19).sin() * 2.5;
+            let xr = ((n as f32) * 0.11).cos() * -1.8;
+            let ul_v = GpuVec4::splat(xl);
+            let ur_v = GpuVec4::splat(xr);
+            let o_core = step_core_quad_stereo8(
+                InterleavedStereo8::splat_lr(xl, xr),
+                &mut st_core_deg,
+                &core_deg_p,
             );
-            let o_grp = step_sona_group_stereo8(u, &mut st_grp, &group_p);
-            let o_core = step_core_quad_stereo8(u, &mut st_core_grp, &core_grp_p);
+
+            let svf_l = step_tpt_svf_vec4(ul_v, &mut d_s1_l, &mut d_s2_l, &core_deg_p.svf);
+            let svf_r = step_tpt_svf_vec4(ur_v, &mut d_s1_r, &mut d_s2_r, &core_deg_p.svf);
+            let tone_l = svf_l
+                .lp
+                .mul(tone.lp)
+                .fma(svf_l.bp, tone.bp)
+                .fma(svf_l.hp, tone.hp)
+                .fma(svf_l.ap, tone.ap)
+                .fma(ul_v, tone.dir);
+            let tone_r = svf_r
+                .lp
+                .mul(tone.lp)
+                .fma(svf_r.bp, tone.bp)
+                .fma(svf_r.hp, tone.hp)
+                .fma(svf_r.ap, tone.ap)
+                .fma(ur_v, tone.dir);
+            let lru_l = step_paralru_vec4(
+                core_deg_p.rect_sign.mul(tone_l),
+                &mut d_v_l,
+                alpha_rel,
+                alpha_atk,
+                kappa,
+            );
+            let lru_r = step_paralru_vec4(
+                core_deg_p.rect_sign.mul(tone_r),
+                &mut d_v_r,
+                alpha_rel,
+                alpha_atk,
+                kappa,
+            );
+            let sag_l = GpuVec4::splat(1.0)
+                .fms(core_deg_p.sag_depth, lru_l)
+                .max(GpuVec4::splat(0.05));
+            let sag_r = GpuVec4::splat(1.0)
+                .fms(core_deg_p.sag_depth, lru_r)
+                .max(GpuVec4::splat(0.05));
+            let rl = tone_l
+                .mul(core_deg_p.adaa_drive)
+                .mul(sag_l)
+                .fma(core_deg_p.lru_bias_drive, lru_l);
+            let rr = tone_r
+                .mul(core_deg_p.adaa_drive)
+                .mul(sag_r)
+                .fma(core_deg_p.lru_bias_drive, lru_r);
+            let (mut odd_l, even_l, np_l) = eval_poly_adaa1_odd_even_vec4(d_p_l, rl);
+            let (mut odd_r, even_r, np_r) = eval_poly_adaa1_odd_even_vec4(d_p_r, rr);
+            let (wfo_l, _) = eval_c2_wavefolder_adaa_vec4(d_p_l, rl);
+            let (wfo_r, _) = eval_c2_wavefolder_adaa_vec4(d_p_r, rr);
+            let omw = GpuVec4::splat(1.0).sub(core_deg_p.wavefolder_mix);
+            odd_l = odd_l
+                .mul(omw)
+                .fma(core_deg_p.wavefolder_mix, wfo_l)
+                .add(GpuVec4::zero());
+            odd_r = odd_r
+                .mul(omw)
+                .fma(core_deg_p.wavefolder_mix, wfo_r)
+                .add(GpuVec4::zero());
+            d_p_l = np_l;
+            d_p_r = np_r;
+
             assert_eq!(
                 o_core.lru_state.into_lr().0.to_array().map(f32::to_bits),
-                o_grp.lru_state.into_lr().0.to_array().map(f32::to_bits)
+                lru_l.to_array().map(f32::to_bits)
             );
             assert_eq!(
                 o_core.lru_state.into_lr().1.to_array().map(f32::to_bits),
-                o_grp.lru_state.into_lr().1.to_array().map(f32::to_bits)
+                lru_r.to_array().map(f32::to_bits)
             );
             assert_eq!(
                 o_core.adaa_odd.into_lr().0.to_array().map(f32::to_bits),
-                o_grp.adaa_odd.into_lr().0.to_array().map(f32::to_bits)
+                odd_l.to_array().map(f32::to_bits)
             );
             assert_eq!(
                 o_core.adaa_odd.into_lr().1.to_array().map(f32::to_bits),
-                o_grp.adaa_odd.into_lr().1.to_array().map(f32::to_bits)
+                odd_r.to_array().map(f32::to_bits)
             );
             assert_eq!(
                 o_core.adaa_even.into_lr().0.to_array().map(f32::to_bits),
-                o_grp.adaa_even.into_lr().0.to_array().map(f32::to_bits)
+                even_l.to_array().map(f32::to_bits)
             );
             assert_eq!(
                 o_core.adaa_even.into_lr().1.to_array().map(f32::to_bits),
-                o_grp.adaa_even.into_lr().1.to_array().map(f32::to_bits)
+                even_r.to_array().map(f32::to_bits)
             );
         }
 
         // GpuVec4 vs InterleavedStereo8<GpuVec4> 0-ULP parity with active Duhem, stereo link, wavefolder, and GLU.
         let active_p = CoreQuadParamsStereo4 {
             lru: SonaParaLruDuhemCoeffs4::from_clamped(
-                group_p.lru.alpha_rel,
-                group_p.lru.alpha_atk,
-                group_p.lru.kappa,
+                alpha_rel,
+                alpha_atk,
+                kappa,
                 GpuVec4::from_array([0.8, 2.5, 6.0, 12.0]),
                 GpuVec4::from_array([0.2, 0.5, 0.8, 1.0]),
                 GpuVec4::from_array([0.1, 0.4, 0.75, 1.0]),
             ),
             glu_mix: GpuVec4::from_array([1.2, -0.9, 2.5, -1.7]),
-            ..core_grp_p
+            ..core_deg_p
         };
         let mut st8 = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
         let (mut s1_l, mut s2_l, mut v_l, mut p_l) = (

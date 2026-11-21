@@ -226,6 +226,9 @@ pub(crate) fn advance_micro_ramp_frame<B: MathBackend>(
 mod tests {
     use super::*;
 
+    /// verify[dsp.ctrl.dispatch.matrix]
+    /// verify[dsp.ctrl.dispatch.micro-ramp]
+    /// verify[dsp.zoh.ctrl-stride]
     #[test]
     fn test_control_stride_ratio_and_uniform_32_slot_ramping() {
         assert_eq!(control_stride_for_rate(44_100.0), 15);

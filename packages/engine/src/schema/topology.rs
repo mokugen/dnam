@@ -27,6 +27,7 @@ pub const fn default_trust_radius() -> f32 {
 
 /// Control-Bus configuration (`control_bus`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
 pub struct ControlBusConfig {
     /// Number of envelope follower bands (`4`: Low, Mid, High, Aux Key).
     #[serde(default = "default_envelopes")]
@@ -61,37 +62,6 @@ impl Default for ControlBusConfig {
     }
 }
 
-pub const fn default_router_ports() -> u8 {
-    4
-}
-pub const fn default_sub_crossover_hz() -> f32 {
-    200.0
-}
-
-/// 8-Port I/O Router configuration (`io_router`).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct IoRouterConfig {
-    /// Number of matrix input ports (`4`).
-    #[serde(default = "default_router_ports")]
-    pub input_ports: u8,
-    /// Number of matrix output ports (`4`).
-    #[serde(default = "default_router_ports")]
-    pub output_ports: u8,
-    /// Clean sub crossover frequency in Hz (`200.0`).
-    #[serde(default = "default_sub_crossover_hz")]
-    pub sub_crossover_hz: f32,
-}
-
-impl Default for IoRouterConfig {
-    fn default() -> Self {
-        Self {
-            input_ports: 4,
-            output_ports: 4,
-            sub_crossover_hz: 200.0,
-        }
-    }
-}
-
 pub const fn default_fir_taps() -> u8 {
     32
 }
@@ -99,9 +69,10 @@ pub const fn default_kautz_modals() -> u8 {
     8
 }
 
-/// Early FIR + Orthonormal Kautz Modal Bank cabinet configuration (`cabinet`).
+/// Early FIR + Orthonormal Kautz Modal Bank convolver configuration (`modal_convolver`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct CabinetKautzConfig {
+#[serde(deny_unknown_fields)]
+pub struct ModalConvolverConfig {
     /// Number of direct early FIR taps per channel (`32, 48, 96, 128`).
     #[serde(default = "default_fir_taps")]
     pub fir_taps: u8,
@@ -110,11 +81,32 @@ pub struct CabinetKautzConfig {
     pub kautz_modals: u8,
 }
 
-impl Default for CabinetKautzConfig {
+impl Default for ModalConvolverConfig {
     fn default() -> Self {
         Self {
             fir_taps: default_fir_taps(),
             kautz_modals: default_kautz_modals(),
+        }
+    }
+}
+
+pub const fn default_ro_pole_48k() -> f32 {
+    0.0
+}
+
+/// Learned 48 kHz linear readout leak pole configuration (`linear_readout`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct LinearReadoutConfig {
+    /// Learned 48 kHz readout leak pole clamped to `[0.0, dnam_kernels::MAX_PARALRU_R_F32]` (`0.0` disables `hp_lp`).
+    #[serde(default = "default_ro_pole_48k")]
+    pub ro_pole_48k: f32,
+}
+
+impl Default for LinearReadoutConfig {
+    fn default() -> Self {
+        Self {
+            ro_pole_48k: default_ro_pole_48k(),
         }
     }
 }
@@ -161,9 +153,10 @@ pub const fn default_dc_pole() -> f32 {
 pub const fn default_loop_ceiling() -> f32 {
     0.985
 }
-/// Spatial `Op-T` FDN Tank configuration (`spatial_tank`).
+/// Symmetric coercive `Op-T` Transport configuration (`transport`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct SpatialTankConfig {
+#[serde(deny_unknown_fields)]
+pub struct TransportConfig {
     /// Delay buffer storage format (`"fp16"`).
     #[serde(default = "default_delay_storage")]
     pub delay_storage: String,
@@ -176,7 +169,7 @@ pub struct SpatialTankConfig {
     /// Raised-cosine switch crossfade window in samples (`128` at $48\text{ kHz}$).
     #[serde(default = "default_switch_xfade")]
     pub switch_xfade_samples: u16,
-    /// Coprime Schroeder all-pass delay lengths in samples (`4..16` tank lines across `Lite`/`Full`/`Pro`/`Ultra`).
+    /// Coprime Schroeder all-pass delay lengths in samples (`4..16` transport lines across `Lite`/`Full`/`Pro`/`Ultra`).
     #[serde(
         default = "default_allpass_delays",
         deserialize_with = "deserialize_allpass_delays"
@@ -190,7 +183,7 @@ pub struct SpatialTankConfig {
     pub loop_ceiling: f32,
 }
 
-impl Default for SpatialTankConfig {
+impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             delay_storage: default_delay_storage(),
@@ -209,22 +202,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_stage_configs_serde_and_defaults() {
+    fn test_subsystem_configs_serde_and_defaults() {
         let bus = ControlBusConfig::default();
         assert_eq!(bus.envelopes, 4);
         assert_eq!(bus.modulation_bus_dim, 16);
 
-        let router = IoRouterConfig::default();
-        assert_eq!(router.input_ports, 4);
-        assert_eq!(router.sub_crossover_hz, 200.0);
+        let convolver = ModalConvolverConfig::default();
+        assert_eq!(convolver.fir_taps, 32);
+        assert_eq!(convolver.kautz_modals, 8);
 
-        let cabinet = CabinetKautzConfig::default();
-        assert_eq!(cabinet.fir_taps, 32);
-        assert_eq!(cabinet.kautz_modals, 8);
+        let readout = LinearReadoutConfig::default();
+        assert_eq!(readout.ro_pole_48k, 0.0);
 
-        let tank = SpatialTankConfig::default();
-        assert_eq!(tank.delay_storage, "fp16");
-        assert_eq!(tank.tzf_reference_tap_samples, 64.0);
+        let transport = TransportConfig::default();
+        assert_eq!(transport.delay_storage, "fp16");
+        assert_eq!(transport.tzf_reference_tap_samples, 64.0);
+
+        // Unknown fields fail serde deserialization on all subsystem configs.
+        assert!(serde_json::from_str::<ModalConvolverConfig>(r#"{"shape":"bad"}"#).is_err());
+        assert!(serde_json::from_str::<LinearReadoutConfig>(r#"{"extra":0.5}"#).is_err());
+        assert!(serde_json::from_str::<TransportConfig>(r#"{"extra":1}"#).is_err());
 
         // Test allpass delays deserializer
         let json_8 = serde_json::json!([10, 20, 30, 40, 50, 60, 70, 80]);

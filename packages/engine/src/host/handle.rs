@@ -4,7 +4,7 @@
 //!
 //! Decomposed into focused submodules:
 //! - [`lifecycle`]: Initialization, hot-reload, sample-rate reconfiguration, and wait-free telemetry.
-//! - [`controls`]: Non-blocking SPSC control, preset, tempo, bypass, freeze, and stereo-width delegation.
+//! - [`controls`]: Non-blocking SPSC control, preset, tempo, bypass, and stereo-width delegation.
 //! - [`process`]: Sub-block audio rendering (`process_*`) and offline bounce (`render_offline_bounce*`).
 
 pub mod controls;

@@ -7,7 +7,7 @@ trigger: always_on
 These architectural rules are mandatory for every code and specification edit in DNAM (`ref[repo.code.constant-eval-and-derivations]`):
 
 1. **Derive Numerical Constants & Structural Layouts via Compile-Time Evaluation:**
-   - **Never hand-enter unexplained magic numbers or manually summed byte offsets.** Derive filter poles/gains, rational polynomial coefficients, IEEE-754 bit boundaries, normalized window/table weights, buffer strides, arena offsets, and packet layouts via pure compile-time expressions (`const fn` in `dnam_kernels::simd::const_eval` / `dnam_engine::math::const_eval` or module-local `const fn`, cumulative `const` arithmetic such as `PREV_OFFSET + PREV_BYTES`, and TypeScript symbolic constants imported or derived from canonical primitives).
+   - **Never hand-enter unexplained magic numbers or manually summed byte offsets.** Derive filter poles/gains, rational polynomial coefficients, IEEE-754 bit boundaries, normalized window/table weights, buffer strides, arena offsets, and packet layouts via pure compile-time expressions (`const fn` in `dnam_kernels::simd::const_eval` / `dnam_vm::math::const_eval` or module-local `const fn`, cumulative `const` arithmetic such as `PREV_OFFSET + PREV_BYTES`, and TypeScript symbolic constants imported or derived from canonical primitives).
    - **Enforce Algebraic & Layout Invariants at Compile Time:** Pair derived Rust constants, wire offsets, and table sizes with `const _: () = assert!(...)` assertions (verifying alignment, prefix monotonicity, IEEE-754 bounds, partition-of-unity sums, and total struct/arena footprints at compile time with zero runtime overhead).
 
 2. **Document Complex or Expensive Derivations in Canonical Specifications:**

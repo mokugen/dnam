@@ -21,7 +21,7 @@ use crate::provenance::security::{
     Dai1Envelope, Dau1Envelope, DnplPreambleWire, DnslDirectoryWire, DnslPreambleWire,
     HpkeSlotPair, InnerDirectoryWire, build_buyer_receipt_v1, build_creator_manifest_v1,
     build_dme1_header, build_hpke_slot_binding_v1, build_mutable_content_aad_v1,
-    build_mutable_hpke_binding_v1, build_outer_manifest_v1, build_plaintext_shared_v1,
+    build_mutable_hpke_binding_v1, build_outer_manifest_v1, build_plaintext_shared_v1_with_dbin,
     build_prewrap_plan_v1, build_record_aad_v1, build_record_nonce_v1,
     compute_ciphertext_prefixes_v1, compute_creator_signed_manifest_sha256,
     compute_encrypted_structural_metadata_sha256, compute_license_policy_sha256,
@@ -114,6 +114,7 @@ fn build_logical_dnpl_framing(
     header_slice: &[u8],
     shared_slice: &[u8],
     auth_slice: &[u8],
+    dbin_prefix_slice: &[u8],
     tier_slices: &[&[u8]],
     max_tier: u8,
 ) -> Result<LogicalDnplFraming, DnamError> {
@@ -129,9 +130,23 @@ fn build_logical_dnpl_framing(
         DnamError::CryptoVerificationFailed("logical offset overflow"),
     )?;
     let logical_auth_len = auth_slice.len() as u64;
-    let logical_tier_start = align64_u64(logical_auth_off + logical_auth_len).ok_or(
-        DnamError::CryptoVerificationFailed("logical offset overflow"),
-    )?;
+    let logical_dbin_len = dbin_prefix_slice.len() as u64;
+    let logical_dbin_off = if logical_dbin_len > 0 {
+        align64_u64(logical_auth_off + logical_auth_len).ok_or(
+            DnamError::CryptoVerificationFailed("logical dbin offset overflow"),
+        )?
+    } else {
+        0
+    };
+    let logical_tier_start = if logical_dbin_len > 0 {
+        align64_u64(logical_dbin_off + logical_dbin_len).ok_or(
+            DnamError::CryptoVerificationFailed("logical tier_start overflow"),
+        )?
+    } else {
+        align64_u64(logical_auth_off + logical_auth_len).ok_or(
+            DnamError::CryptoVerificationFailed("logical offset overflow"),
+        )?
+    };
     let mut logical_tier_ends = [U64::new(0); 4];
     let mut l_cur = logical_tier_start;
     for (t, t_slice) in tier_slices.iter().enumerate() {
@@ -145,21 +160,31 @@ fn build_logical_dnpl_framing(
         shared_binary_length: U64::new(logical_shared_len),
         authentication_envelope_offset: U64::new(logical_auth_off),
         authentication_envelope_length: U64::new(logical_auth_len),
-        reserved_offset: U64::new(0),
-        reserved_capacity: U64::new(0),
+        dbin_offset: U64::new(logical_dbin_off),
+        dbin_prefix_bytes: U64::new(logical_dbin_len),
         tier_start: U64::new(logical_tier_start),
         original_tier_ends: logical_tier_ends,
         reserved_tail: [0u8; 24],
     };
-    let mut logical_prefix = Vec::with_capacity(align64_usize(192 + header_slice.len()));
+    let mut logical_prefix = Vec::with_capacity(
+        align64_usize(192 + header_slice.len()) + align64_usize(dbin_prefix_slice.len()),
+    );
     logical_prefix.extend_from_slice(&dnpl_preamble_bytes);
     logical_prefix.extend_from_slice(logical_dir.as_bytes());
     logical_prefix.extend_from_slice(header_slice);
     pad_to_64(&mut logical_prefix);
+    if !dbin_prefix_slice.is_empty() {
+        logical_prefix.extend_from_slice(dbin_prefix_slice);
+        pad_to_64(&mut logical_prefix);
+    }
     let logical_meta_sha = compute_logical_metadata_sha256(&logical_prefix);
     let hdr_sha = sha256_digest(header_slice);
-    let shared_framing =
-        build_plaintext_shared_v1(&dnpl_preamble_bytes, logical_dir.as_bytes(), shared_slice);
+    let shared_framing = build_plaintext_shared_v1_with_dbin(
+        &dnpl_preamble_bytes,
+        logical_dir.as_bytes(),
+        shared_slice,
+        dbin_prefix_slice,
+    );
 
     Ok(LogicalDnplFraming {
         dnpl_preamble_bytes: dnpl_preamble_bytes.to_vec(),
@@ -657,6 +682,8 @@ pub fn seal_dnam_container(
         &inner_dnam_bytes[layout.shared_extent.0..layout.shared_extent.0 + layout.shared_extent.1];
     let auth_slice =
         &inner_dnam_bytes[layout.auth_extent.0..layout.auth_extent.0 + layout.auth_extent.1];
+    let dbin_prefix_slice =
+        &inner_dnam_bytes[layout.dbin_extent.0..layout.dbin_extent.0 + layout.dbin_extent.1];
     let mut tier_slices: Vec<&[u8]> = Vec::with_capacity(m_tiers);
     let mut prev_t = layout.tier_start;
     for t in 0..m_tiers {
@@ -700,6 +727,7 @@ pub fn seal_dnam_container(
         header_slice,
         shared_slice,
         auth_slice,
+        dbin_prefix_slice,
         &tier_slices,
         max_tier,
     )?;

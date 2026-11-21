@@ -10,5 +10,6 @@
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
     <orderEntry type="module" module-name="dnam-kernels" exported="" />
+    <orderEntry type="module" module-name="dnam-vm" exported="" />
   </component>
 </module>
