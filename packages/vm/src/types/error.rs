@@ -28,7 +28,7 @@ pub enum VmError {
     PrefixCrcMismatch,
     /// Castagnoli `CRC-32C` over `[arena0_offset..tier_end_offsets[t])` failed.
     TierArenaCrcMismatch,
-    /// Arena 0 `pipeline_flags`, `sona_meta_flags`, `SonaCellDescWire`, or active `TankQuadWire` reserved bits failed validation.
+    /// Arena 0 `pipeline_flags`, `sona_meta_flags`, `SonaCellDescWire`, or active `TransportQuadWire` reserved bits failed validation.
     InvalidArenaHeader,
     /// `ControlClampDescriptorWire` failed kind, bitmask, finite-bounds, or `cond_rules` validation.
     InvalidControlDescriptor,

@@ -48,7 +48,10 @@ pub struct ParaLruTileGrads<const N: usize> {
 
 /// In-place `O(log2 N)` Hillis-Steele doubling inclusive suffix scan (`step = 1, 2, 4, ... < N`).
 #[inline]
-fn parallel_suffix_scan<T: Copy, const N: usize>(elems: &mut [T; N], combine: impl Fn(T, T) -> T) {
+pub(super) fn parallel_suffix_scan<T: Copy, const N: usize>(
+    elems: &mut [T; N],
+    combine: impl Fn(T, T) -> T,
+) {
     let mut step = 1_usize;
     while step < N {
         let limit = N - step;

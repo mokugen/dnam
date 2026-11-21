@@ -413,18 +413,41 @@ pub fn tracker_crosses_branch_cut_f32(
     (prev_im >= 0.0 && cur_im < 0.0 && det > 0.0) || (prev_im < 0.0 && cur_im >= 0.0 && det < 0.0)
 }
 
-/// Pure 32-bit `T1` sub-harmonic tracker operating on `(i_clean, q_clean)` conditioned by upstream
-/// DC blocker -> `H1` (`ref[dsp.op-m.tracker.envelope-norm]`, `ref[dsp.op-m.tracker.toggle-sheet]`).
+/// Evaluates the cancellation-free principal half-angle `(cos(theta / 2), sin(theta / 2))` of a
+/// unit phasor `(re, im)` via mandatory 3-step `rsqrt_pos_nr3`
+/// (`ref[dsp.op-m.tracker.envelope-norm]`, `ref[dsp.op-m.tracker.toggle-sheet]`).
+#[inline(always)]
+fn cancellation_free_half_angle_nr3(re: f32, im: f32) -> (f32, f32) {
+    let h = (0.5 * (1.0 + const_abs_f32(re))).max(T1_HALF_ANGLE_EPS);
+    let rho_half = GpuVec4::splat(h).rsqrt_pos_nr3().to_array()[0];
+    let v_maj = (h * rho_half).clamp(0.0, 1.0);
+    let v_min = (const_abs_f32(im) * (0.5 * rho_half)).clamp(0.0, 1.0);
+    let (c, abs_s) = if re >= 0.0 {
+        (v_maj, v_min)
+    } else {
+        (v_min, v_maj)
+    };
+    let sigma_pos = if im >= 0.0 { 1.0_f32 } else { -1.0_f32 };
+    (c, sigma_pos * abs_s)
+}
+
+/// Exact `28 B` (`align(4)`) pure 32-bit 2-stage Riemann `T1` sub-harmonic rotor operating on
+/// `(i_in, q_in)` conditioned by upstream `5 Hz` DC blocker -> `H1`
+/// (`ref[dsp.op-m.tracker.envelope-norm]`, `ref[dsp.op-m.tracker.toggle-sheet]`).
+#[repr(C)]
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct T1SubHarmonicKernel {
-    prev_x: f32,
     prev_u_re: f32,
     prev_u_im: f32,
-    prev_q: f32,
-    prev_q2: f32,
     sheet: f32,
+    prev_w1_re: f32,
+    prev_w1_im: f32,
+    sheet2: f32,
     prev_valid: bool,
 }
+
+const _: () = assert!(core::mem::size_of::<T1SubHarmonicKernel>() == 28);
+const _: () = assert!(core::mem::align_of::<T1SubHarmonicKernel>() == 4);
 
 impl Default for T1SubHarmonicKernel {
     fn default() -> Self {
@@ -433,44 +456,42 @@ impl Default for T1SubHarmonicKernel {
 }
 
 impl T1SubHarmonicKernel {
-    /// Creates a new [`T1SubHarmonicKernel`] in clean startup state (`prev_q = +1`, `prev_q2 = +1`,
-    /// `sheet = +1`, `prev_valid = false`).
+    /// Creates a new [`T1SubHarmonicKernel`] in clean startup state (`prev_u = (1.0, 0.0)`,
+    /// `prev_w1 = (1.0, 0.0)`, `sheet = +1.0`, `sheet2 = +1.0`, `prev_valid = false`).
     #[inline(always)]
     #[must_use]
     pub const fn new() -> Self {
         Self {
-            prev_x: 0.0,
             prev_u_re: 1.0,
             prev_u_im: 0.0,
-            prev_q: 1.0,
-            prev_q2: 1.0,
             sheet: 1.0,
+            prev_w1_re: 1.0,
+            prev_w1_im: 0.0,
+            sheet2: 1.0,
             prev_valid: false,
         }
     }
 
-    /// Resets Riemann sheet, `-1/-2` octave divider latches, and phase continuity to startup
-    /// defaults.
+    /// Resets both Riemann sheets and phase continuity to startup defaults.
     #[inline(always)]
     pub fn reset(&mut self) {
         *self = Self::new();
     }
 
-    /// Returns the current `(q1_toggle, q2_toggle, sheet_sign, prev_valid)` state.
+    /// Returns the current `(sheet, sheet2, prev_w1_re, prev_valid)` state.
     #[inline(always)]
     #[must_use]
     pub const fn state(&self) -> (f32, f32, f32, bool) {
-        (self.prev_q, self.prev_q2, self.sheet, self.prev_valid)
+        (self.sheet, self.sheet2, self.prev_w1_re, self.prev_valid)
     }
 
-    /// Steps the `T1` sub-harmonic tracker on upstream `5 Hz` DC-blocked analytic `(i_in, q_in)`,
-    /// returning
-    /// `[sub1_cos * env_gate, sub1_sin * env_gate, sub1_sq * env_gate, sub2_sq * env_gate]`.
+    /// Steps the 2-stage `T1` sub-harmonic rotor on upstream `5 Hz` DC-blocked analytic
+    /// `(i_in, q_in)`, returning
+    /// `[sub1_cos * env_gate, sub1_sin * env_gate, sub2_cos * env_gate, sub2_sin * env_gate]`.
     #[inline(always)]
     pub fn step(&mut self, i_in: f32, q_in: f32) -> [f32; 4] {
         if !i_in.is_finite() || !q_in.is_finite() {
             self.prev_valid = false;
-            self.prev_x = 0.0;
             return [0.0; 4];
         }
         let i_clean = flush_subnormal_f32_bits(i_in);
@@ -478,50 +499,45 @@ impl T1SubHarmonicKernel {
         let r2 = i_clean * i_clean + q_clean * q_clean;
         if !r2.is_finite() || r2 < T1_SILENCE_SQUELCH_R2 {
             self.prev_valid = false;
-            self.prev_x = i_clean;
             return [0.0; 4];
         }
 
-        let inv_r = GpuVec4::splat(r2).rsqrt_pos_nr2().to_array()[0];
+        let inv_r = GpuVec4::splat(r2).rsqrt_pos_nr3().to_array()[0];
         let u_re = (i_clean * inv_r).clamp(-1.0, 1.0);
         let u_im = (q_clean * inv_r).clamp(-1.0, 1.0);
         let env_gate = flush_subnormal_f32_bits(r2 * inv_r);
 
-        if self.prev_valid && self.prev_x <= 0.0 && i_clean > 0.0 {
-            self.prev_q = -self.prev_q;
-            if self.prev_q > 0.0 {
-                self.prev_q2 = -self.prev_q2;
-            }
-        }
+        // Stage 1: z -> w1 = z^(1/2)
         if self.prev_valid
             && tracker_crosses_branch_cut_f32(self.prev_u_re, self.prev_u_im, u_re, u_im)
         {
             self.sheet = -self.sheet;
         }
+        let (c1, s1) = cancellation_free_half_angle_nr3(u_re, u_im);
+        let sub1_cos = self.sheet * c1;
+        let sub1_sin = self.sheet * s1;
 
-        let h = (0.5 * (1.0 + const_abs_f32(u_re))).max(T1_HALF_ANGLE_EPS);
-        let rho_half = GpuVec4::splat(h).rsqrt_pos_nr2().to_array()[0];
-        let v_maj = (h * rho_half).clamp(0.0, 1.0);
-        let v_min = (const_abs_f32(u_im) * (0.5 * rho_half)).clamp(0.0, 1.0);
-        let (c_1, abs_s_1) = if u_re >= 0.0 {
-            (v_maj, v_min)
-        } else {
-            (v_min, v_maj)
-        };
-        let sigma_pos = if u_im >= 0.0 { 1.0_f32 } else { -1.0_f32 };
-        let sub1_cos = self.sheet * c_1;
-        let sub1_sin = self.sheet * sigma_pos * abs_s_1;
+        // Stage 2: w1 -> w2 = w1^(1/2) = z^(1/4)
+        if self.prev_valid
+            && tracker_crosses_branch_cut_f32(self.prev_w1_re, self.prev_w1_im, sub1_cos, sub1_sin)
+        {
+            self.sheet2 = -self.sheet2;
+        }
+        let (c2, s2) = cancellation_free_half_angle_nr3(sub1_cos, sub1_sin);
+        let sub2_cos = self.sheet2 * c2;
+        let sub2_sin = self.sheet2 * s2;
 
-        self.prev_x = i_clean;
         self.prev_u_re = u_re;
         self.prev_u_im = u_im;
+        self.prev_w1_re = sub1_cos;
+        self.prev_w1_im = sub1_sin;
         self.prev_valid = true;
 
         [
-            flush_subnormal_f32_bits(sub1_cos * env_gate),
-            flush_subnormal_f32_bits(sub1_sin * env_gate),
-            flush_subnormal_f32_bits(self.prev_q * env_gate),
-            flush_subnormal_f32_bits(self.prev_q2 * env_gate),
+            flush_subnormal_f32_bits(sub1_cos * env_gate) + 0.0,
+            flush_subnormal_f32_bits(sub1_sin * env_gate) + 0.0,
+            flush_subnormal_f32_bits(sub2_cos * env_gate) + 0.0,
+            flush_subnormal_f32_bits(sub2_sin * env_gate) + 0.0,
         ]
     }
 }
@@ -632,52 +648,155 @@ mod tests {
         assert_eq!(st.prev_y, [0.0; 2]);
     }
 
+    fn assert_sweep_range(
+        t1: &mut T1SubHarmonicKernel,
+        amp: f64,
+        steps: usize,
+        indices: impl Iterator<Item = usize>,
+    ) -> u8 {
+        let mut prev_feat = [0.0_f32; 4];
+        let mut mask_sheets = 0_u8;
+        for (idx, n) in indices.enumerate() {
+            let theta = core::f64::consts::TAU * (n as f64) / (steps as f64);
+            let f = t1.step((amp * theta.cos()) as f32, (amp * theta.sin()) as f32);
+            let exp = [
+                (amp * (0.5 * theta).cos()) as f32,
+                (amp * (0.5 * theta).sin()) as f32,
+                (amp * (0.25 * theta).cos()) as f32,
+                (amp * (0.25 * theta).sin()) as f32,
+            ];
+            for k in 0..4 {
+                assert!(
+                    (f[k] - exp[k]).abs() < 1.0e-5,
+                    "n={n} k={k}: {} vs {}",
+                    f[k],
+                    exp[k]
+                );
+                if idx > 0 {
+                    assert!((f[k] - prev_feat[k]).abs() < 0.04, "jump n={n} k={k}");
+                }
+            }
+            prev_feat = f;
+            let (sheet, sheet2, _, valid) = t1.state();
+            assert!(valid);
+            mask_sheets |= match (sheet > 0.0, sheet2 > 0.0) {
+                (true, true) => 1,
+                (false, true) => 2,
+                (false, false) => 4,
+                (true, false) => 8,
+            };
+        }
+        mask_sheets
+    }
+
     /// verify[dsp.op-m.tracker.envelope-norm]
     /// verify[dsp.op-m.tracker.toggle-sheet]
     #[test]
     fn test_t1_subharmonic_kernel_4_features_gates_and_continuity() {
+        assert_eq!(core::mem::size_of::<T1SubHarmonicKernel>(), 28);
+        assert_eq!(core::mem::align_of::<T1SubHarmonicKernel>(), 4);
+
         let mut t1 = T1SubHarmonicKernel::default();
         assert_eq!(t1.state(), (1.0, 1.0, 1.0, false));
-        assert_eq!(t1.step(0.0, 0.0), [0.0; 4]);
-        assert_eq!(t1.step(1.0e-8, -1.0e-8), [0.0; 4]);
-        assert_eq!(t1.step(f32::NAN, f32::INFINITY), [0.0; 4]);
-        assert_eq!(t1.step(-1.0e20, 0.0), [0.0; 4]);
-        assert!(!t1.state().3);
+        for &(si, sq) in &[
+            (0.0_f32, 0.0_f32),
+            (-0.0, -0.0),
+            (1.0e-8, -1.0e-8),
+            (f32::NAN, f32::INFINITY),
+            (-1.0e20, 0.0),
+        ] {
+            assert_eq!(t1.step(si, sq).map(f32::to_bits), [0_u32; 4]);
+            assert!(!t1.state().3);
+        }
 
         let resume = t1.step(0.5, 0.0);
-        assert_eq!(t1.state(), (1.0, 1.0, 1.0, true));
-        assert!((resume[0] - 0.5).abs() < 1.0e-3 && resume[1].abs() < 1.0e-6);
-        assert!((resume[2] - 0.5).abs() < 1.0e-3 && (resume[3] - 0.5).abs() < 1.0e-3);
+        let st_resume = t1.state();
+        assert_eq!((st_resume.0, st_resume.1, st_resume.3), (1.0, 1.0, true));
+        assert!((st_resume.2 - 1.0).abs() < 1.0e-5);
+        assert!((resume[0] - 0.5).abs() < 1.0e-5 && resume[1].to_bits() == 0);
+        assert!((resume[2] - 0.5).abs() < 1.0e-5 && resume[3].to_bits() == 0);
 
         t1.reset();
         let at_pi = t1.step(-1.0, 0.0);
-        assert!(at_pi[0].abs() < 1.0e-6 && (at_pi[1] - 1.0).abs() < 2.0e-3);
+        assert_eq!(at_pi[0].to_bits(), 0);
+        assert!((at_pi[1] - 1.0).abs() < 1.0e-5);
+        assert!((at_pi[2] - core::f32::consts::FRAC_1_SQRT_2).abs() < 1.0e-5);
+        assert!((at_pi[3] - core::f32::consts::FRAC_1_SQRT_2).abs() < 1.0e-5);
 
         assert!(tracker_crosses_branch_cut_f32(-0.98, 0.2, -0.98, -0.2));
         assert!(tracker_crosses_branch_cut_f32(-0.98, -0.2, -0.98, 0.2));
         assert!(!tracker_crosses_branch_cut_f32(0.98, 0.2, 0.98, -0.2));
         assert!(!tracker_crosses_branch_cut_f32(0.0, 1.0, 0.0, -1.0));
+        assert!(!tracker_crosses_branch_cut_f32(-1.0, 1.0e-7, 1.0, -1.0e-7));
+        assert!(!tracker_crosses_branch_cut_f32(-1.0, 2.0e-6, 1.0, -1.0e-6));
+
+        // 4 full revolutions (8*pi rad), forward & reverse, aligned (128) and straddling (127) grids.
+        let amp = 0.75_f64;
+        for &steps in &[128_usize, 127_usize] {
+            let total = steps * 4;
+            t1.reset();
+            assert_eq!(assert_sweep_range(&mut t1, amp, steps, 0..=total), 0b1111);
+            t1.reset();
+            assert_eq!(
+                assert_sweep_range(&mut t1, amp, steps, (0..=total).rev()),
+                0b1111
+            );
+        }
+
+        // Antipodal HYSTERESIS chord gating (dot < 0, |det| <= 2^-18) holds (+1, +1) and (-1, -1).
+        t1.reset();
+        let _ = t1.step(-1.0, 1.0e-7);
+        let _ = t1.step(1.0, -2.0e-7);
+        assert_eq!((t1.state().0, t1.state().1), (1.0, 1.0));
 
         t1.reset();
-        let steps = 128;
-        let amp = 0.75_f64;
-        let (mut saw_neg_sheet, mut saw_neg_q1, mut saw_neg_q2) = (false, false, false);
-        for n in 0..(steps * 2) {
-            let theta = core::f64::consts::TAU * (n as f64) / (steps as f64);
-            let f = t1.step((amp * theta.cos()) as f32, (amp * theta.sin()) as f32);
-            let exp_cos = (amp * (0.5 * theta).cos()) as f32;
-            let exp_sin = (amp * (0.5 * theta).sin()) as f32;
-            assert!((f[0] - exp_cos).abs() < 2.0e-3);
-            assert!((f[1] - exp_sin).abs() < 2.0e-3);
-            assert!((f[2].abs() - (amp as f32)).abs() < 2.0e-3);
-            assert!((f[3].abs() - (amp as f32)).abs() < 2.0e-3);
-            let (q1, q2, sheet, valid) = t1.state();
-            assert!(valid);
-            saw_neg_sheet |= sheet < 0.0;
-            saw_neg_q1 |= q1 < 0.0;
-            saw_neg_q2 |= q2 < 0.0;
+        let _ = assert_sweep_range(&mut t1, amp, 128, 0..=160);
+        let saved = t1.state();
+        assert_eq!((saved.0, saved.1, saved.3), (-1.0, -1.0, true));
+        assert!(saved.2 < 0.0);
+
+        // SILENCE holds (sheet, sheet2, prev_w1_re), clears prev_valid, emits +0.0, resumes smoothly.
+        assert_eq!(t1.step(0.0, 0.0).map(f32::to_bits), [0_u32; 4]);
+        assert_eq!(t1.step(1.0e-8, -1.0e-8).map(f32::to_bits), [0_u32; 4]);
+        assert_eq!(t1.step(f32::NAN, 0.0).map(f32::to_bits), [0_u32; 4]);
+        assert_eq!(t1.state(), (saved.0, saved.1, saved.2, false));
+        let _ = assert_sweep_range(&mut t1, amp, 128, 161..=512);
+
+        // Canonical +0.0 bits when sheet == -1.0 multiplies zero cosine, plus (+1, -1) hysteresis.
+        t1.reset();
+        let _ = assert_sweep_range(&mut t1, amp, 128, 0..=160);
+        assert_eq!(t1.step(0.0, 0.0).map(f32::to_bits), [0_u32; 4]);
+        let neg_zero_guard = t1.step(-1.0, 0.0);
+        assert_eq!(neg_zero_guard[0].to_bits(), 0_u32);
+        assert!((neg_zero_guard[1] + 1.0).abs() < 1.0e-5);
+
+        t1.reset();
+        let _ = assert_sweep_range(&mut t1, amp, 128, 0..=288);
+        assert_eq!((t1.state().0, t1.state().1), (1.0, -1.0));
+        let _ = t1.step(-1.0, 1.0e-7);
+        let _ = t1.step(1.0, -2.0e-7);
+        assert_eq!((t1.state().0, t1.state().1), (1.0, -1.0));
+
+        // Extreme amplitudes [1e-5, 1e15] with rsqrt_pos_nr3 pure 32-bit f32 precision.
+        use core::f64::consts::{FRAC_PI_3, FRAC_PI_4};
+        for &extreme_amp in &[1.0e-5_f64, 1.0e-3, 1.0, 1.0e6, 1.0e12, 1.0e15] {
+            for &theta in &[0.0_f64, FRAC_PI_3, 3.0 * FRAC_PI_4, -2.0 * FRAC_PI_3] {
+                t1.reset();
+                let f = t1.step(
+                    (extreme_amp * theta.cos()) as f32,
+                    (extreme_amp * theta.sin()) as f32,
+                );
+                let exp = [
+                    extreme_amp * (0.5 * theta).cos(),
+                    extreme_amp * (0.5 * theta).sin(),
+                    extreme_amp * (0.25 * theta).cos(),
+                    extreme_amp * (0.25 * theta).sin(),
+                ];
+                for k in 0..4 {
+                    assert!((f64::from(f[k]) - exp[k]).abs() <= extreme_amp * 1.0e-5);
+                }
+            }
         }
-        assert!(saw_neg_sheet && saw_neg_q1 && saw_neg_q2);
 
         // Verify shift-subtract U256Be::div_u64 across edge cases (zero, shift=64, primes).
         let (q0, r0) = div_rem_u128_by_u64_shift(5, 0);
@@ -712,9 +831,56 @@ mod tests {
                     prop_assert!(lane.abs() <= env_ref * 1.01 + 1.0e-5);
                 }
                 let half_norm = f64::from(feat[0]).hypot(f64::from(feat[1])) as f32;
-                if feat[2] != 0.0 {
-                    prop_assert!((half_norm - env_ref).abs() <= env_ref * 1.0e-2 + 1.0e-5);
+                let quarter_norm = f64::from(feat[2]).hypot(f64::from(feat[3])) as f32;
+                if t1.state().3 {
+                    prop_assert!((half_norm - env_ref).abs() <= env_ref * 1.0e-5 + 1.0e-6);
+                    prop_assert!((quarter_norm - env_ref).abs() <= env_ref * 1.0e-5 + 1.0e-6);
+                } else {
+                    prop_assert_eq!(feat.map(f32::to_bits), [0_u32; 4]);
                 }
+            }
+        }
+
+        #[test]
+        fn prop_t1_subharmonic_nr3_extreme_amplitude_and_continuity(
+            log10_amp in -5.0_f64..=15.0_f64,
+            theta0 in -12.0_f64..=12.0_f64,
+            dtheta in -0.2_f64..=0.2_f64,
+        ) {
+            let amp = 10.0_f64.powf(log10_amp);
+            let mut t1 = T1SubHarmonicKernel::new();
+            let mut prev = [0.0_f32; 4];
+            for k in 0..8 {
+                let theta = theta0 + (k as f64) * dtheta;
+                let yi = (amp * theta.cos()) as f32;
+                let yq = (amp * theta.sin()) as f32;
+                let feat = t1.step(yi, yq);
+                let env_ref = f64::from(yi).hypot(f64::from(yq));
+                let half_norm = f64::from(feat[0]).hypot(f64::from(feat[1]));
+                let quarter_norm = f64::from(feat[2]).hypot(f64::from(feat[3]));
+                prop_assert!(t1.state().3);
+                prop_assert!((half_norm - env_ref).abs() <= env_ref * 1.0e-5);
+                prop_assert!((quarter_norm - env_ref).abs() <= env_ref * 1.0e-5);
+
+                // Sheet-invariant algebraic square-root reconstruction: w2^2 = env * w1, w1^2 = env * z.
+                let w1_sq_re = f64::from(feat[0]) * f64::from(feat[0])
+                    - f64::from(feat[1]) * f64::from(feat[1]);
+                let w1_sq_im = 2.0 * f64::from(feat[0]) * f64::from(feat[1]);
+                let w2_sq_re = f64::from(feat[2]) * f64::from(feat[2])
+                    - f64::from(feat[3]) * f64::from(feat[3]);
+                let w2_sq_im = 2.0 * f64::from(feat[2]) * f64::from(feat[3]);
+                prop_assert!((w1_sq_re - env_ref * f64::from(yi)).abs() <= env_ref * env_ref * 2.0e-5);
+                prop_assert!((w1_sq_im - env_ref * f64::from(yq)).abs() <= env_ref * env_ref * 2.0e-5);
+                prop_assert!((w2_sq_re - env_ref * f64::from(feat[0])).abs() <= env_ref * env_ref * 2.0e-5);
+                prop_assert!((w2_sq_im - env_ref * f64::from(feat[1])).abs() <= env_ref * env_ref * 2.0e-5);
+
+                if k > 0 {
+                    let step_bound = amp * (dtheta.abs() * 0.55) + amp * 1.0e-5;
+                    for lane in 0..4 {
+                        prop_assert!((f64::from(feat[lane]) - f64::from(prev[lane])).abs() <= step_bound);
+                    }
+                }
+                prev = feat;
             }
         }
     }

@@ -1,6 +1,6 @@
 //! `Op-N[Ctrl]` exact-integer static evaluation, four independent 4-D trust-region clips,
-//! and `Op-M[Ctrl]` `Q0.192` + envelope advancement (`ref[dsp.ctrl.op-n.engine]`,
-//! `ref[dsp.ctrl.op-n.trust-clip]`, `ref[dsp.ctrl.op-m.ballistic-lfo]`).
+//! and `Op-M[Ctrl]` skewed `Q0.192` LFO + `SensoryQuad` envelope latching (`ref[dsp.ctrl.op-n.engine]`,
+//! `ref[dsp.ctrl.op-n.trust-clip]`, `ref[dsp.ctrl.modulators.dynamic]`).
 
 use crate::control::cp1::{eval_uint_base_4x8, eval_uint_ultra_delta_3x4x8};
 use crate::control::exact_int::{ExactIntFactorAccumulator, ExactIntMainAccumulator};
@@ -174,14 +174,30 @@ pub(crate) fn evaluate_static_cp1_latents(inp: StaticEvalInputs<'_>, out: Static
     *out.ctrl_basis_4 = zs;
 }
 
-/// Advances both `Q0.192` LFOs and refreshes Chebyshev `[T_1, T_2, T_3, T_4]` harmonics
-/// + `q2 = [lfo0_mix, lfo1_mix, lfo0_cos, lfo0_sin]` (`ref[dsp.ctrl.modulators.dynamic]`).
+/// Evaluates Chebyshev-2 skewed LFO control vector
+/// `q2 = [c0 + beta0 * (2*c0^2 - 1), s0, c1 + beta1 * (2*c1^2 - 1), s1]`
+/// (`ref[dsp.ctrl.modulators.dynamic]`).
 #[inline]
-pub(crate) fn step_lfos_and_harmonics(
+pub(crate) fn eval_skewed_lfo_q2(lfo_phasors: &[[f32; 2]; 2], lfo_skew: &[f32; 2]) -> [f32; 4] {
+    let c0 = lfo_phasors[0][0];
+    let s0 = lfo_phasors[0][1];
+    let c1 = lfo_phasors[1][0];
+    let s1 = lfo_phasors[1][1];
+    [
+        c0 + lfo_skew[0] * (2.0 * c0 * c0 - 1.0),
+        s0,
+        c1 + lfo_skew[1] * (2.0 * c1 * c1 - 1.0),
+        s1,
+    ]
+}
+
+/// Advances both `Q0.192` LFOs and evaluates skewed `q2` (`ref[dsp.ctrl.modulators.dynamic]`).
+#[inline]
+pub(crate) fn step_lfos_and_skewed_q2(
     lfo_phases_q192: &mut [Q0_192Phase; 2],
     lfo_dphi_host_bits: &[u32; 2],
     lfo_phasors: &mut [[f32; 2]; 2],
-    lfo_harmonics: &mut [f32; 8],
+    lfo_skew: &[f32; 2],
 ) -> [f32; 4] {
     for j in 0..2 {
         let bits = lfo_dphi_host_bits[j] & IEEE754_F32_ABS_MASK;
@@ -201,46 +217,40 @@ pub(crate) fn step_lfos_and_harmonics(
                 }
             }
         }
-        let c = lfo_phasors[j][0];
-        let t1 = c;
-        let t2 = 2.0 * c * c - 1.0;
-        let t3 = 2.0 * c * t2 - t1;
-        let t4 = 2.0 * c * t3 - t2;
-        lfo_harmonics[j * 4] = t1;
-        lfo_harmonics[j * 4 + 1] = t2;
-        lfo_harmonics[j * 4 + 2] = t3;
-        lfo_harmonics[j * 4 + 3] = t4;
     }
-    [
-        lfo_harmonics[0] + 0.35 * lfo_harmonics[1],
-        lfo_harmonics[4] + 0.35 * lfo_harmonics[5],
-        lfo_phasors[0][0],
-        lfo_phasors[0][1],
-    ]
+    eval_skewed_lfo_q2(lfo_phasors, lfo_skew)
 }
 
-/// Updates 4-band `env_states[0..4]` from router detectors or standalone exponential ballistics.
+/// Latches 4-band `SensoryQuad` envelopes `env_states[0..4]` into `q3`, flushing non-finite,
+/// subnormal, and `-0.0` entries cleanly to `+0.0` (zero fallback envelope IIR).
 #[inline]
-pub(crate) fn update_env_states(
-    env_states: &mut [f32; 4],
-    env_poles_host: &[f32; 3],
-    router_envelopes: Option<[f32; 4]>,
-    audio_abs_energy: f32,
-) {
-    if let Some(ext) = router_envelopes {
-        for i in 0..4 {
-            let v = sanitize_finite_f32(ext[i]);
-            env_states[i] = flush_subnormal_f32_bits(v);
-        }
-        return;
+pub(crate) fn update_env_states(env_states: &mut [f32; 4], sensory_env: Option<[f32; 4]>) {
+    let raw = sensory_env.unwrap_or([0.0; 4]);
+    for i in 0..4 {
+        let v = flush_subnormal_f32_bits(sanitize_finite_f32(raw[i]));
+        env_states[i] = if v == 0.0 { 0.0 } else { v };
     }
-    let a = sanitize_finite_f32(audio_abs_energy).max(0.0);
-    for b in 0..3 {
-        let p = env_poles_host[b];
-        env_states[b] = flush_subnormal_f32_bits(p * env_states[b] + (1.0 - p) * a);
-    }
-    let diff = env_states[2] - env_states[0];
-    env_states[3] = flush_subnormal_f32_bits(if diff > 0.0 { diff } else { 0.0 });
+}
+
+/// Returns `true` when either LFO angular increment is non-zero or any dynamic dispatch column
+/// (`W_ctrl` / `W_ctrl_ext` columns `8..16` for `q2` and `q3`) has a non-zero weight.
+#[inline]
+pub(crate) fn compute_has_internal_modulators(
+    lfo_angle_bits: &[u32; 2],
+    w_ctrl: &[[f32; 16]; 16],
+    w_ctrl_ext: &[[f32; 16]; 16],
+    cext_present: bool,
+) -> bool {
+    let lfo_nonzero = ((lfo_angle_bits[0] & IEEE754_F32_ABS_MASK) != 0)
+        || ((lfo_angle_bits[1] & IEEE754_F32_ABS_MASK) != 0);
+    let row_has_dyn = |row: &[f32; 16]| {
+        row[8..16]
+            .iter()
+            .any(|v| (v.to_bits() & IEEE754_F32_ABS_MASK) != 0)
+    };
+    let w_dyn_nonzero = w_ctrl.iter().any(row_has_dyn)
+        || (cext_present && w_ctrl_ext[..15].iter().any(row_has_dyn));
+    lfo_nonzero || w_dyn_nonzero
 }
 
 #[cfg(test)]
@@ -248,36 +258,63 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_lfo_zero_hold_and_standalone_envelopes() {
+    fn test_skewed_lfo_sensory_latch_and_activity_flag() {
         let mut phases = [Q0_192Phase::ZERO; 2];
         let mut phasors = [[1.0, 0.0]; 2];
-        let mut harms = [0.0; 8];
-        let q2 = step_lfos_and_harmonics(&mut phases, &[0, 0], &mut phasors, &mut harms);
-        assert_eq!(q2[2], 1.0);
-        assert_eq!(q2[3], 0.0);
+        let q2_zero = step_lfos_and_skewed_q2(&mut phases, &[0, 0], &mut phasors, &[1.0, -1.0]);
+        assert_eq!(q2_zero, [2.0, 0.0, 0.0, 0.0]);
+        assert_eq!(
+            eval_skewed_lfo_q2(&[[0.0, 1.0], [0.0, -1.0]], &[1.0, -1.0]),
+            [-1.0, 1.0, 1.0, -1.0]
+        );
 
-        let mut env = [0.0_f32; 4];
-        update_env_states(&mut env, &[0.5, 0.75, 0.9], None, 1.0);
-        assert_eq!(env[0], 0.5);
-        assert_eq!(env[1], 0.25);
-        assert!((env[2] - 0.1).abs() < 1.0e-6);
-        assert_eq!(env[3], 0.0);
+        let mut env = [0.4_f32; 4];
+        update_env_states(&mut env, None);
+        assert_eq!(env.map(f32::to_bits), [0; 4]);
+
+        update_env_states(&mut env, Some([0.25, f32::NAN, -0.0, f32::from_bits(1)]));
+        assert_eq!(env[0], 0.25);
+        assert_eq!(env[1].to_bits(), 0);
+        assert_eq!(env[2].to_bits(), 0);
+        assert_eq!(env[3].to_bits(), 0);
 
         let neg_dphi = (-0.25_f32).to_bits();
-        let q2_neg = step_lfos_and_harmonics(&mut phases, &[neg_dphi, 0], &mut phasors, &mut harms);
-        assert!(q2_neg[3] < 0.0);
-
-        update_env_states(
-            &mut env,
-            &[0.5, 0.75, 0.9],
-            Some([0.25, f32::NAN, 0.5, -0.5]),
-            0.0,
+        let q2_neg =
+            step_lfos_and_skewed_q2(&mut phases, &[neg_dphi, 0], &mut phasors, &[0.5, 0.0]);
+        assert!(q2_neg[1] < 0.0);
+        let expected_c0 = phasors[0][0];
+        assert!(
+            (q2_neg[0] - (expected_c0 + 0.5 * (2.0 * expected_c0 * expected_c0 - 1.0))).abs()
+                < 1.0e-6
         );
-        assert_eq!(env, [0.25, 0.0, 0.5, -0.5]);
 
         let active_bits = [0.1_f32.to_bits(), (-0.05_f32).to_bits()];
-        let q2_act = step_lfos_and_harmonics(&mut phases, &active_bits, &mut phasors, &mut harms);
-        assert!(q2_act[2].abs() <= 1.0 && q2_act[3].abs() <= 1.0);
+        let q2_act =
+            step_lfos_and_skewed_q2(&mut phases, &active_bits, &mut phasors, &[-0.75, 0.75]);
+        assert!(phasors[0][0].abs() <= 1.0 && q2_act[1].abs() <= 1.0);
+        assert!(q2_act[0].abs() <= 1.75 && q2_act[2].abs() <= 1.75);
+
+        let mut w = [[0.0_f32; 16]; 16];
+        let mut w_ext = [[0.0_f32; 16]; 16];
+        w[0][0] = 1.0;
+        assert!(!compute_has_internal_modulators(
+            &[(-0.0_f32).to_bits(), 0],
+            &w,
+            &w_ext,
+            true,
+        ));
+        assert!(compute_has_internal_modulators(
+            &[(-0.05_f32).to_bits(), 0],
+            &w,
+            &w_ext,
+            false,
+        ));
+        w[3][12] = 0.25;
+        assert!(compute_has_internal_modulators(&[0, 0], &w, &w_ext, false));
+        w[3][12] = 0.0;
+        w_ext[2][14] = -0.1;
+        assert!(!compute_has_internal_modulators(&[0, 0], &w, &w_ext, false));
+        assert!(compute_has_internal_modulators(&[0, 0], &w, &w_ext, true));
 
         let descs = [
             ControlClampDescriptor::range(0.0, 1.0, 0.5, 3, [0.0, -0.5, 0.5]),

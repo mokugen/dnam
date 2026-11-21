@@ -1,21 +1,22 @@
-//! Arena `0..=3`, `SonaCrossbarBlockWire`, `TankQuadWire`, and inline `cp1_dir` validation helpers.
+//! Arena `0..=3`, `SonaCrossbarBlockWire`, `TransportQuadWire`, and inline `cp1_dir` validation helpers.
 
 use crate::bin::arena_wire::{
     Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, PIPE_MAGIC_MASK,
     PIPE_REQUIRED_SONA_MASK, SONA_META_CORE_MODS_PRESENT, SONA_META_RESERVED_MASK,
-    SonaCrossbarBlockWire, TANK_FLAG_EXT_F32, TANK_FLAG_SCHROEDER_ENABLE, TankQuadWire,
+    SonaCrossbarBlockWire, TRANSPORT_FLAG_EXT_F32, TRANSPORT_FLAG_SCHROEDER_ENABLE,
+    TransportQuadWire,
 };
 use crate::bin::header::{
     DNBN_VERSION_MAJOR, DNBN_VERSION_MINOR, DnamBinRuntimeMetaWire, SONA_CELL_MAGIC,
 };
 use crate::types::{Tier, VmError};
 
-fn validate_quad(quad: &TankQuadWire) -> Result<bool, VmError> {
-    let valid_mask = TANK_FLAG_SCHROEDER_ENABLE | TANK_FLAG_EXT_F32;
+fn validate_quad(quad: &TransportQuadWire) -> Result<bool, VmError> {
+    let valid_mask = TRANSPORT_FLAG_SCHROEDER_ENABLE | TRANSPORT_FLAG_EXT_F32;
     if (quad.flags & !valid_mask) != 0 || quad.reserved != 0 {
         return Err(VmError::InvalidArenaHeader);
     }
-    Ok((quad.flags & TANK_FLAG_EXT_F32) != 0)
+    Ok((quad.flags & TRANSPORT_FLAG_EXT_F32) != 0)
 }
 
 fn validate_crossbar_block_reserved(block: &SonaCrossbarBlockWire) -> Result<(), VmError> {
@@ -118,19 +119,23 @@ pub(in crate::bin::view) fn validate_arena0_and_quads(
         return Err(VmError::InvalidCp1Stream);
     }
 
-    let mut any_ext_f32 = validate_quad(&arena0.spatial_tank_lite)?;
+    if arena0.control_bus_lite.reserved_ctrl_fp16.get() != 0 {
+        return Err(VmError::InvalidArenaHeader);
+    }
+
+    let mut any_ext_f32 = validate_quad(&arena0.transport_lite)?;
     if let Some(a1) = arena1 {
-        any_ext_f32 |= validate_quad(&a1.spatial_tank_full)?;
+        any_ext_f32 |= validate_quad(&a1.transport_full)?;
         validate_crossbar_block_reserved(&a1.crossbar_full)?;
     }
     if let Some(a2) = arena2 {
-        any_ext_f32 |= validate_quad(&a2.spatial_tank_pro[0])?;
+        any_ext_f32 |= validate_quad(&a2.transport_pro[0])?;
         validate_crossbar_block_reserved(&a2.crossbar_pro)?;
     }
     if let Some(a3) = arena3 {
-        any_ext_f32 |= validate_quad(&a3.spatial_tank_ultra[0])?;
+        any_ext_f32 |= validate_quad(&a3.transport_ultra[0])?;
         validate_crossbar_block_reserved(&a3.crossbar_ultra)?;
-        if !a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[160..256]
+        if !a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[164..256]
             .iter()
             .all(|v| v.get() == 0)
         {
@@ -183,7 +188,7 @@ mod tests {
             declared_max_delay_48k: 4_096,
             dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
             tail_time_ms: 0.0,
-            r_ac_default: 0.99,
+            ro_pole_48k: 0.99,
             switch_xfade_samples: 0,
             content_hash_prefix: [0; 8],
             controls: &[],
@@ -217,8 +222,43 @@ mod tests {
             VmError::InvalidArenaHeader
         );
 
+        let mut bad_a0 = a0;
+        bad_a0.control_bus_lite.reserved_ctrl_fp16 = U16::new(1);
+        assert_eq!(
+            validate_arena0_and_quads(ArenaValidationInput {
+                arena0: &bad_a0,
+                arena1: None,
+                arena2: None,
+                arena3: None,
+                cp1_overflow_empty: true,
+                num_controls: 0,
+                max_present_tier: 0,
+                retained_tier: Tier::Lite,
+                meta: view.runtime_meta,
+            })
+            .unwrap_err(),
+            VmError::InvalidArenaHeader
+        );
+
+        let mut a3_ou = a3;
+        a3_ou.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[160] = U16::new(0x3C00);
+        assert!(
+            validate_arena0_and_quads(ArenaValidationInput {
+                arena0: view.arena0,
+                arena1: Some(&a1),
+                arena2: Some(&a2),
+                arena3: Some(&a3_ou),
+                cp1_overflow_empty: true,
+                num_controls: 0,
+                max_present_tier: 3,
+                retained_tier: Tier::Ultra,
+                meta: view.runtime_meta,
+            })
+            .is_ok()
+        );
+
         let mut bad_a3 = a3;
-        bad_a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[160] = U16::new(1);
+        bad_a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[164] = U16::new(1);
         assert_eq!(
             validate_arena0_and_quads(ArenaValidationInput {
                 arena0: view.arena0,

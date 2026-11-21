@@ -1,4 +1,4 @@
-//! Off-`48 kHz` Cabinet Lagrange difference kernels, `44.1 kHz` first-tap prototype,
+//! Off-`48 kHz` `ModalConvolver` Lagrange difference kernels, `44.1 kHz` first-tap prototype,
 //! `u64` shift-division resampler coefficients, and Catmull-Rom FIR resampling
 //! (`ref[dsp.zoh.cabinet-fir-onset]`, `#![forbid(unsafe_code)]`).
 
@@ -10,7 +10,7 @@ use crate::math::{
     const_inv_factorial_f64, floor_f64, rcp_nr6_f64,
 };
 
-use super::{MAX_CABINET_BASE_TAPS, STAGE3_EXT_FIR_CAP};
+use super::{MAX_CONVOLVER_BASE_TAPS, STAGE3_EXT_FIR_CAP};
 
 const INV_120_F64: f64 = const_inv_factorial_f64(5);
 const TWO_POW_NEG56_F64: f64 = const_f64_pow2(-56);
@@ -155,7 +155,7 @@ pub struct BounceLagrangeTap {
 /// bounce rate `fs_vm` using purely `u64` bit-shift long division (`0 UDIV`, `0 u128 /`, `0 FDIV`,
 /// `ref[dsp.zoh.cabinet-fir-onset]`).
 pub fn prepare_bounce_6point_u64(tap_k: usize, fs_vm: f64) -> BounceLagrangeTap {
-    if tap_k == 0 || tap_k >= MAX_CABINET_BASE_TAPS || !fs_vm.is_finite() || fs_vm <= 0.0 {
+    if tap_k == 0 || tap_k >= MAX_CONVOLVER_BASE_TAPS || !fs_vm.is_finite() || fs_vm <= 0.0 {
         return BounceLagrangeTap::default();
     }
     const F64_MANT_BITS_I32: i32 = IEEE754_F64_MANTISSA_BITS as i32;

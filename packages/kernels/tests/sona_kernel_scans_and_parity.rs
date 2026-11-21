@@ -7,15 +7,20 @@
 //! verify[train.pipeline.webgpu-scans-and-ozaki]
 
 use dnam_kernels::{
-    ComplexModalScanElem, FULL_SPEC, GpuVec4, HilbertH1Kernel, InterleavedStereo8, KautzQuadState,
-    KernelVec4, LITE_SPEC, PRO_SPEC, ParaLruParams, SonaBlockParamsStereo4, SonaBlockStateStereo8,
-    SonaParaLruCoeffs4, SonaToneWeights4, StereoVec8, T1DcBlockerKernel, T1SubHarmonicKernel,
-    TptScanElem, TptSvfCoeffs4, ULTRA_SPEC, accum_ozaki_chunk_i32, apply_tpt_init,
-    clamp_transport_delay_f32, compose_complex_modal_scan, compose_tpt_scan,
-    eval_poly_adaa1_odd_even_vec4, eval_poly_adaa1_stereo8, pow2_ceil_fp32,
-    prewarp_tan_pi_f_over_fs_f32, reconstruct_ozaki_dot_f64, run_paralru_adjoint_scan_tile,
-    run_paralru_forward_tile, step_kautz_quad_stereo8, step_kautz_quad_vec4, step_paralru_vec4,
-    step_sona_block_stereo8, step_tpt_svf_stereo8, step_tpt_svf_vec4,
+    ComplexModalScanElem, CoreQuadParamsStereo4, FULL_SPEC, GpuVec4, HilbertH1Kernel,
+    InterleavedStereo8, KautzQuadState, KernelVec4, LITE_SPEC, OpNPreHoisted, OpNPreHotState,
+    OpTFeedbackParams, OpTFeedbackState, PRO_SPEC, ParaLruDuhemAdjointTrace, ParaLruDuhemParams,
+    ParaLruParams, SonaBlockParamsStereo4, SonaBlockStateStereo8, SonaParaLruCoeffs4,
+    SonaParaLruDuhemCoeffs4, SonaToneWeights4, StereoVec8, T1DcBlockerKernel, T1SubHarmonicKernel,
+    TANK_MAX_SIGMA_SAT_F32, TptScanElem, TptSvfCoeffs4, ULTRA_SPEC, accum_ozaki_chunk_i32,
+    apply_tpt_init, clamp_transport_delay_f32, compose_complex_modal_scan, compose_tpt_scan,
+    couple_ms_input_stereo8, eval_poly_adaa1_odd_even_vec4, eval_poly_adaa1_stereo8,
+    pow2_ceil_fp32, prewarp_tan_pi_f_over_fs_f32, reconstruct_ozaki_dot_f64,
+    run_paralru_adjoint_scan_tile, run_paralru_duhem_adjoint_scan_tile,
+    run_paralru_duhem_forward_tile, run_paralru_forward_tile, step_core_quad_stereo8,
+    step_kautz_quad_stereo8, step_kautz_quad_vec4, step_op_t_feedback_vec4,
+    step_paralru_duhem_stereo8, step_paralru_vec4, step_sona_block_stereo8, step_tpt_svf_stereo8,
+    step_tpt_svf_vec4,
 };
 use proptest::prelude::*;
 
@@ -349,4 +354,116 @@ proptest! {
         let ozaki_bound = 64.0 * 2.1 * f64::from(sx) * f64::from(sy) * 2.0_f64.powi(-24) + 1.0e-12;
         prop_assert!((approx_f64 - exact_f64).abs() <= ozaki_bound);
     }
+}
+
+#[test]
+fn test_m10b_upgrades_cross_kernel_continuity_parity_and_invariants() {
+    assert_eq!(core::mem::size_of::<T1SubHarmonicKernel>(), 28);
+    assert_eq!(core::mem::size_of::<OpNPreHotState>(), 28);
+    assert_eq!(core::mem::size_of::<OpNPreHoisted>(), 24);
+
+    // 1. 2-stage Riemann T1 tracks 4pi and 8pi phase smoothly with zero step discontinuity.
+    let mut t1 = T1SubHarmonicKernel::new();
+    let mut prev = t1.step(1.0, 0.0);
+    for step_idx in 1..=256 {
+        let theta = core::f64::consts::TAU * (step_idx as f64) / 64.0;
+        let cur = t1.step(theta.cos() as f32, theta.sin() as f32);
+        for ch in 0..4 {
+            assert!((cur[ch] - prev[ch]).abs() < 0.08);
+        }
+        prev = cur;
+    }
+
+    // 2. Op-N[Pre] raised-cosine hold + smooth Fourier staircase emits finite bounded stereo.
+    let mut op_n_pre = OpNPreHotState::zero();
+    let op_n_hoisted = OpNPreHoisted::from_params(0.75, 0.8, 3.5, 1.0);
+    op_n_pre.apply_hoisted(op_n_hoisted);
+    let y0 = op_n_pre.step_stereo(0.4, -0.3, op_n_hoisted.d_scale, op_n_hoisted.delta_step);
+    let y1 = op_n_pre.step_stereo(0.4, -0.3, op_n_hoisted.d_scale, op_n_hoisted.delta_step);
+    assert!(y0.0.is_finite() && y0.1.is_finite());
+    assert!(y1.0.is_finite() && y1.1.is_finite());
+
+    // 3. Selective-Duhem ParaLRU forward tile matches sequential stereo8 + M/S + GLU CoreQuad.
+    let duhem = ParaLruDuhemParams::clamped(0.92, 0.25, 0.35, 1.4, 0.6, 0.3, 0.5);
+    let mut x_l = [0.0_f32; 8];
+    let mut x_r = [0.0_f32; 8];
+    let mut bp_l = [0.0_f32; 8];
+    let mut bp_r = [0.0_f32; 8];
+    for t in 0..8 {
+        x_l[t] = (t as f32) * 0.1 - 0.35;
+        x_r[t] = 0.25 - (t as f32) * 0.08;
+        bp_l[t] = x_l[t] * 0.4;
+        bp_r[t] = x_r[t] * 0.4;
+    }
+    let fwd = run_paralru_duhem_forward_tile::<8>([&x_l, &x_r], [&bp_l, &bp_r], [0.0, 0.0], duhem);
+    let mut lru_seq = InterleavedStereo8::<GpuVec4>::zero();
+    let coeffs_d: SonaParaLruDuhemCoeffs4<GpuVec4> = duhem.to_coeffs4();
+    for t in 0..8 {
+        let v_raw = step_paralru_duhem_stereo8(
+            InterleavedStereo8::from_lr(GpuVec4::splat(x_l[t]), GpuVec4::splat(x_r[t])),
+            InterleavedStereo8::from_lr(
+                GpuVec4::splat(bp_l[t] * 0.5),
+                GpuVec4::splat(bp_r[t] * 0.5),
+            ),
+            &mut lru_seq,
+            &coeffs_d,
+        );
+        let (vl, vr) =
+            dnam_kernels::apply_stereo_link_stereo8(v_raw, coeffs_d.stereo_link).into_lr();
+        assert_eq!(vl.to_array()[0].to_bits(), fwd.v_eff_traj_l[t].to_bits());
+        assert_eq!(vr.to_array()[0].to_bits(), fwd.v_eff_traj_r[t].to_bits());
+    }
+    let trace =
+        ParaLruDuhemAdjointTrace::from_forward([&x_l, &x_r], [&bp_l, &bp_r], [0.0, 0.0], &fwd);
+    let adj = run_paralru_duhem_adjoint_scan_tile::<8>(
+        &trace,
+        duhem,
+        [&[1.0; 8], &[-0.5; 8]],
+        [0.0, 0.0],
+    );
+    assert!(adj.adj_gamma_duhem.is_finite() && adj.adj_stereo_link.is_finite());
+
+    let core_params = CoreQuadParamsStereo4 {
+        svf: TptSvfCoeffs4::from_gk(GpuVec4::splat(0.25), GpuVec4::splat(0.7)),
+        tone: SonaToneWeights4::lp_only(),
+        lru: coeffs_d,
+        two_svf_g: GpuVec4::splat(0.5),
+        rect_sign: GpuVec4::splat(1.0),
+        sag_depth: GpuVec4::splat(0.2),
+        adaa_drive: GpuVec4::splat(1.5),
+        lru_bias_drive: GpuVec4::splat(0.1),
+        wavefolder_mix: GpuVec4::splat(0.3),
+        glu_mix: GpuVec4::splat(0.25),
+    };
+    let mut core_state = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+    let u_ms = couple_ms_input_stereo8(
+        InterleavedStereo8::zero(),
+        0.5,
+        -0.25,
+        GpuVec4::splat(0.6),
+        GpuVec4::splat(-0.4),
+    );
+    let core_out = step_core_quad_stereo8(u_ms, &mut core_state, &core_params);
+    assert!(core_out.adaa_odd.into_lr().0.to_array()[0].is_finite());
+
+    // 4. Op-T unified sigma_sat limiter + continuous mu_freeze writeback.
+    let fb_params = OpTFeedbackParams {
+        g_inj: GpuVec4::splat(0.5),
+        g_loop_eff: 0.9,
+        sigma_sat: TANK_MAX_SIGMA_SAT_F32,
+        inv_sigma_23: 2.0 / (3.0 * TANK_MAX_SIGMA_SAT_F32),
+        mu_freeze: 1.0,
+        cos_psi: 1.0,
+        sin_psi: 0.0,
+        damp_pole_eff: 0.25,
+        r_dc: 0.995,
+    };
+    let mut fb_state = OpTFeedbackState {
+        damp_state: GpuVec4::zero(),
+        dc_x_prev: GpuVec4::zero(),
+        dc_y_prev: GpuVec4::zero(),
+    };
+    let r_win = GpuVec4::from_array([0.25, -0.5, 0.75, -0.125]);
+    let w_frozen = step_op_t_feedback_vec4(r_win, r_win, (1.0, -1.0), &fb_params, &mut fb_state);
+    assert_eq!(w_frozen.to_array(), r_win.to_array());
 }

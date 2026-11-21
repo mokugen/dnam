@@ -1,37 +1,27 @@
-//! Orthogonal spatial-tank quad feedback, partitioned Schroeder diffusion, dual-latch
-//! Write-Enable (`WE`) holding, non-recirculating stereo wet DC blocker, and Family 4 ballistic
-//! ducking VCA (`ref[dsp.op-t.diffuser.recurrence]`, `ref[dsp.tank.loop-saturator]`,
-//! `ref[dsp.tank.quiet-feedback-knee]`, `ref[dsp.tank.captured-freeze]`,
-//! `ref[dsp.op-t.ducking.vca]`).
+//! Orthogonal `Op-T` transport-tank quad feedback, unified `sigma_sat` cubic loop saturation, continuous
+//! passive `freeze_mix` recirculation + host write-lock holding, partitioned Schroeder diffusion,
+//! and non-recirculating stereo wet DC blocker (`ref[dsp.op-t.diffuser.recurrence]`,
+//! `ref[dsp.op-t.guard.bounded-history]`, `ref[dsp.op-t.ring.declaration]`).
 //!
 //! Strictly 32-bit, `#![no_std]`, zero `FDIV`/`FSQRT`/`IDIV`/`libm`.
 
 use super::interp_and_window::valid_pow2_ring_len;
 use crate::simd::{
-    DC_BLOCKER_5HZ_48K_F32, KernelVec4, MAX_LOOP_GAIN_F32, TANK_MAX_G_LIN_F32, TANK_MAX_V_CEIL_F32,
-    const_abs_f32, flush_subnormal_f32_bits, scrub_and_flush_f32_bits,
+    DC_BLOCKER_5HZ_48K_F32, KernelVec4, MAX_LOOP_GAIN_F32, TANK_MAX_G_LIN_F32,
+    TANK_MAX_SIGMA_SAT_F32, TANK_MAX_V_CEIL_F32, flush_subnormal_f32_bits,
+    scrub_and_flush_f32_bits,
 };
 
-/// Spatial tank quad flag bit `0`: Schmitt-latched ControlBus Write-Enable hold (`op_t_we_drive`).
-pub const QUAD_FLAG_WE_HOLD_ACTIVE: u8 = 0x01;
-
-/// Spatial tank quad flag bit `1`: quad uses cold external delay storage rather than inline ring.
+/// Transport tank (`Op-T`) quad flag bit `1`: quad uses cold external delay storage rather than inline ring
+/// (`bit 0` is reserved `0`; `bits 4..7` are reserved `0`).
 pub const QUAD_FLAG_HAS_EXT: u8 = 0x02;
 
-/// Spatial tank quad flag bit `2`: host-owned lock bit freezing feedback & writes cleanly.
+/// Transport tank (`Op-T`) quad flag bit `2`: host-owned lock bit freezing feedback & writes cleanly
+/// (`bit 0` is reserved `0`).
 pub const QUAD_FLAG_HOST_WRITE_LOCK: u8 = 0x04;
 
-/// Spatial tank quad flag bit `3`: partitioned in-buffer Schroeder all-pass stage enabled.
+/// Transport tank (`Op-T`) quad flag bit `3`: partitioned in-buffer Schroeder all-pass stage enabled.
 pub const QUAD_FLAG_SCHROEDER_ENABLE: u8 = 0x08;
-
-/// Composite dual-latch Write-Enable hold mask (`WE_HOLD_ACTIVE | HOST_WRITE_LOCK == 0x05`).
-pub const QUAD_WE_LOCK_MASK: u8 = QUAD_FLAG_WE_HOLD_ACTIVE | QUAD_FLAG_HOST_WRITE_LOCK;
-
-/// Lower Schmitt trigger threshold (`we_eff < 0.45` sets [`QUAD_FLAG_WE_HOLD_ACTIVE`]).
-pub const WE_SCHMITT_HOLD_LOW_F32: f32 = 0.45;
-
-/// Upper Schmitt trigger threshold (`we_eff > 0.55` clears [`QUAD_FLAG_WE_HOLD_ACTIVE`]).
-pub const WE_SCHMITT_RELEASE_HIGH_F32: f32 = 0.55;
 
 /// Maximum finite `fp16` magnitude `65,504.0` used to saturate tank loop writebacks.
 pub use crate::simd::FP16_FINITE_MAX_F32;
@@ -45,22 +35,24 @@ const LOOP_LIMIT_MIN_SIGMA: f32 = 1.0e-4;
 /// Maximum coercive soft-limit ceiling keeping `sigma * inv_sigma` strictly finite.
 const LOOP_LIMIT_MAX_SIGMA: f32 = 1.0e12;
 
+/// Minimum unified tank loop saturator ceiling `sigma_sat` (`1e-3`).
+const MIN_SIGMA_SAT_F32: f32 = 1.0e-3;
+
 /// Compile-time `2 / 3` factor for unity-slope cubic saturators.
 const TWO_THIRDS: f32 = 2.0 / 3.0;
+
+/// Default cold-precomputed `2 / (3 * TANK_MAX_SIGMA_SAT_F32)` fallback for `inv_sigma_23`.
+const DEFAULT_INV_SIGMA_23_F32: f32 = 2.0 / (3.0 * TANK_MAX_SIGMA_SAT_F32);
+
+/// Defensive upper clamp on `inv_sigma_23` covering `fp16`-quantized `2 / (3 * 1e-3)` headroom.
+const MAX_INV_SIGMA_23_F32: f32 = TWO_THIRDS * 1.0e3 + 1.0;
 
 /// Tank cubic soft-knee linear & cubic coefficients (`1.5` and `0.5`).
 const LOOP_KNEE_THREE_HALVES: f32 = 1.5;
 const LOOP_KNEE_HALF: f32 = 0.5;
 
-/// Compile-time scaling factor `2 / (3 * V_ceil)` for `0.985` tank loop saturator (`0 FDIV` @ RT).
-const TANK_CEIL_NORM_SCALE_F32: f32 = 2.0 / (3.0 * TANK_MAX_V_CEIL_F32);
-
 /// Maximum runtime 1-pole HF damping pole inside the quad feedback matrix (`[0.0, 0.99995]`).
 const TANK_MAX_DAMP_POLE_F32: f32 = 0.999_95;
-
-/// Input magnitude clamp before `t = v * inv_sigma` in `step_op_t_feedback_vec4` so
-/// `denom = 1 + t^2 <= 1e36 < 0x7EF3_11C3` and `rcp_pos_nr2` never wraps on extreme finite floats.
-const KNEE_MAX_ABS_INPUT_F32: f32 = 1.0e14;
 
 /// Numeric safety ceiling for `g_inj`, `x_tank`, and feedback state vectors preventing `f32::MAX`
 /// overflow to `±Inf` (`<= 2.0 * 1e22 << f32::MAX`) while preserving exact `±65,504.0` saturation.
@@ -73,16 +65,16 @@ const TANK_MAX_STATE_ABS_F32: f32 = 1.0e24;
 const WET_DC_MIN_POLE_F32: f32 = 1.0e-4;
 const WET_DC_MAX_POLE_F32: f32 = 0.999_995;
 
-/// Family 4 VCA gain & release pole bounds (`[0.05, 2.0]` and `[0.0, 0.99999]`).
-const VCA_MAX_POLE_F32: f32 = 0.999_99;
-const VCA_MIN_SENS_F32: f32 = -8.0;
-const VCA_MAX_SENS_F32: f32 = 8.0;
-const VCA_MIN_GAIN_F32: f32 = 0.05;
-const VCA_MAX_GAIN_F32: f32 = 2.0;
-
 const _: () = assert!(SCHROEDER_MAX_ABS_GAIN < MAX_LOOP_GAIN_F32);
-const _: () = assert!(QUAD_WE_LOCK_MASK == 0x05);
-const _: () = assert!(WE_SCHMITT_HOLD_LOW_F32 < WE_SCHMITT_RELEASE_HIGH_F32);
+const _: () = assert!(MIN_SIGMA_SAT_F32 > 0.0 && MIN_SIGMA_SAT_F32 < TANK_MAX_SIGMA_SAT_F32);
+const _: () =
+    assert!(DEFAULT_INV_SIGMA_23_F32 > 0.6 && DEFAULT_INV_SIGMA_23_F32 < MAX_INV_SIGMA_23_F32);
+const _: () = assert!(
+    (DEFAULT_INV_SIGMA_23_F32 * 1.5 * TANK_MAX_SIGMA_SAT_F32 - 1.0) < 1.0e-6
+        && (DEFAULT_INV_SIGMA_23_F32 * 1.5 * TANK_MAX_SIGMA_SAT_F32 - 1.0) > -1.0e-6
+);
+const _: () =
+    assert!((QUAD_FLAG_HAS_EXT | QUAD_FLAG_HOST_WRITE_LOCK | QUAD_FLAG_SCHROEDER_ENABLE) == 0x0E);
 
 #[inline(always)]
 fn clamp_finite_range(x: f32, lo: f32, hi: f32, fallback: f32) -> f32 {
@@ -102,16 +94,22 @@ fn scrub_clamp_vec4<V: KernelVec4>(v: V, max_abs: f32) -> V {
     v.flush_recursive_state().clamp(limit.neg(), limit)
 }
 
-/// Shared cubic unity-slope saturator `ceil * clamp(x * norm_scale, -1, 1) * (1.5 - 0.5 * v^2)`
-/// clamped within `[-ceil, ceil]` (`ref[dsp.tank.loop-saturator]`).
+/// Shared cubic unity-slope saturator `gain_scale * v * (1.5 - 0.5 * v^2)` with
+/// `v = clamp(x * norm_scale, -1, 1)` clamped within `[-clamp_ceil, clamp_ceil]`
+/// (`ref[dsp.op-t.guard.bounded-history]`).
 #[inline(always)]
-fn cubic_soft_saturator_vec4<V: KernelVec4>(x: V, ceil: V, norm_scale: V) -> V {
+fn cubic_soft_saturator_vec4<V: KernelVec4>(
+    x: V,
+    gain_scale: V,
+    clamp_ceil: V,
+    norm_scale: V,
+) -> V {
     let v = x.mul(norm_scale).clamp(V::splat(-1.0), V::splat(1.0));
     let v2 = v.mul(v);
     let cubic = V::splat(LOOP_KNEE_THREE_HALVES)
         .fms(V::splat(LOOP_KNEE_HALF), v2)
         .mul(v);
-    ceil.mul(cubic).clamp(ceil.neg(), ceil)
+    gain_scale.mul(cubic).clamp(clamp_ceil.neg(), clamp_ceil)
 }
 
 /// Cohesive 4-lane tank feedback parameters for [`step_op_t_feedback_vec4`].
@@ -121,8 +119,12 @@ pub struct OpTFeedbackParams<V: KernelVec4> {
     pub g_inj: V,
     /// Pitch-down-protected effective loop gain clamped into `[0.0, TANK_MAX_G_LIN_F32]`.
     pub g_loop_eff: f32,
-    /// Precomputed reciprocal knee width `1 / sigma` (`sigma in [1e-3, 8.0]`).
-    pub inv_sigma: f32,
+    /// Unified loop saturator ceiling `sigma_sat` clamped into `[1e-3, TANK_MAX_SIGMA_SAT_F32]`.
+    pub sigma_sat: f32,
+    /// Cold-precomputed `2 / (3 * sigma_sat)` factor eliminating runtime `rcp_pos_nr2`.
+    pub inv_sigma_23: f32,
+    /// Continuous passive recirculation mix `mu_freeze` in `[0.0, 1.0]`.
+    pub mu_freeze: f32,
     /// Cached Givens rotation cosine `cos(psi)`.
     pub cos_psi: f32,
     /// Cached Givens rotation sine `sin(psi)`.
@@ -180,20 +182,6 @@ pub fn step_schroeder_quad_vec4<V: KernelVec4>(x: V, delayed: V, g: V) -> (V, V)
     (y, ring_write)
 }
 
-/// Updates only bit 0 (`QUAD_FLAG_WE_HOLD_ACTIVE`) via Schmitt hysteresis `(0.45, 0.55)` while
-/// preserving all other bits including `QUAD_FLAG_HOST_WRITE_LOCK` (`op_t_transport.md` §1.1.1).
-#[inline(always)]
-#[must_use]
-pub const fn update_we_schmitt_flag(flags: u8, we_eff: f32) -> u8 {
-    if we_eff < WE_SCHMITT_HOLD_LOW_F32 {
-        flags | QUAD_FLAG_WE_HOLD_ACTIVE
-    } else if we_eff > WE_SCHMITT_RELEASE_HIGH_F32 {
-        flags & !QUAD_FLAG_WE_HOLD_ACTIVE
-    } else {
-        flags
-    }
-}
-
 /// Advances one 32-bit `WE` hold offset counter branchlessly and returns `lag_k` in `[1, D_k]`:
 /// `lag = select(o < D, D - o, D)`, `o' = select(o + 1 >= D, 0, o + 1)`.
 #[inline(always)]
@@ -214,9 +202,8 @@ pub fn step_we_hold_lag_u16(offset: &mut u16, delay_rounded: u32) -> u32 {
     lag
 }
 
-/// Writes `val` to a power-of-two `f32` delay ring only when `(flags & QUAD_WE_LOCK_MASK) == 0`,
-/// guaranteeing exact `0-ULP` ring hold whenever either `WE_HOLD_ACTIVE` or `HOST_WRITE_LOCK` is
-/// latched (`ref[dsp.tank.captured-freeze]`).
+/// Writes `val` to a power-of-two `f32` delay ring only when `(flags & QUAD_FLAG_HOST_WRITE_LOCK) == 0`,
+/// guaranteeing exact `0-ULP` ring hold whenever host write lock is active (`ref[dsp.op-t.ring.declaration]`).
 #[inline(always)]
 pub fn write_ring_with_we_f32(
     ring: &mut [f32],
@@ -225,12 +212,12 @@ pub fn write_ring_with_we_f32(
     val: f32,
     flags: u8,
 ) {
-    if (flags & QUAD_WE_LOCK_MASK) == 0 && valid_pow2_ring_len(ring.len(), mask) {
+    if (flags & QUAD_FLAG_HOST_WRITE_LOCK) == 0 && valid_pow2_ring_len(ring.len(), mask) {
         ring[write_idx & mask] = flush_subnormal_f32_bits(val);
     }
 }
 
-/// Legacy boolean-freeze wrapper delegating to [`write_ring_with_we_f32`].
+/// Boolean-freeze wrapper delegating to [`write_ring_with_we_f32`].
 #[inline(always)]
 pub fn write_ring_with_freeze_f32(
     ring: &mut [f32],
@@ -244,7 +231,7 @@ pub fn write_ring_with_freeze_f32(
 }
 
 /// Applies the tank unity-slope cubic saturator and bounded loop gain (`||G_loop|| < 1.0`,
-/// `0 FDIV`, `ref[dsp.tank.loop-saturator]`, `ref[dsp.tank.quiet-feedback-knee]`).
+/// `0 FDIV`, `ref[dsp.op-t.guard.bounded-history]`).
 #[inline(always)]
 #[must_use]
 pub fn coercive_loop_limit_vec4<V: KernelVec4>(x: V, soft_limit: V, max_gain: V) -> V {
@@ -255,39 +242,47 @@ pub fn coercive_loop_limit_vec4<V: KernelVec4>(x: V, soft_limit: V, max_gain: V)
         V::splat(LOOP_LIMIT_MAX_SIGMA),
     );
     let inv_sigma = sigma.rcp_pos_nr3();
-    let sat = cubic_soft_saturator_vec4(x_finite, sigma, V::splat(TWO_THIRDS).mul(inv_sigma));
+    let sat =
+        cubic_soft_saturator_vec4(x_finite, sigma, sigma, V::splat(TWO_THIRDS).mul(inv_sigma));
     g.mul(sat).flush_subnormal()
 }
 
-/// Steps the orthogonal 4-lane spatial tank feedback loop:
-/// 0.85/0.15 `NR2` quiet-feedback knee -> `0.985` cubic saturator (`TANK_MAX_V_CEIL_F32`) ->
-/// pairwise 2×2 Givens `R_block2(psi)` -> 4×4 Householder `H_4(1)` + `g_inj * [x_L, x_R, x_L, x_R]`
-/// -> 1-pole HF damping -> DF-I loop DC blocker -> `±65,504.0` clamp (`op_t_transport.md` §1.1.1).
+/// Steps the orthogonal 4-lane `Op-T` transport tank feedback loop with zero `rcp`/`NR2` calls:
+/// unified `sigma_sat` cubic saturator (`TANK_MAX_V_CEIL_F32`) -> pairwise 2×2 Givens
+/// `R_block2(psi)` -> 4×4 Householder `H_4(1)` + `g_inj * [x_L, x_R, x_L, x_R]` -> 1-pole HF
+/// damping -> DF-I loop DC blocker -> continuous `mu_freeze` writeback blend -> `±65,504.0` clamp
+/// (`op_t_transport.md` §1.1.1).
 #[inline(always)]
 #[must_use]
 pub fn step_op_t_feedback_vec4<V: KernelVec4>(
     v_read: V,
+    r_win: V,
     x_tank_lr: (f32, f32),
     params: &OpTFeedbackParams<V>,
     state: &mut OpTFeedbackState<V>,
 ) -> V {
     let v_clean = v_read.flush_recursive_state();
-    let inv_sigma = clamp_finite_range(params.inv_sigma, 0.0, 1.0e4, 0.0);
-    let knee_limit = V::splat(KNEE_MAX_ABS_INPUT_F32);
-    let t = v_clean
-        .clamp(knee_limit.neg(), knee_limit)
-        .mul(V::splat(inv_sigma));
-    let denom = V::splat(1.0).fma(t, t);
-    let w_inv = denom.rcp_pos_nr2();
-    let gain_mod = V::splat(0.85).fma(V::splat(0.15), w_inv);
-    let g_eff = clamp_finite_range(params.g_loop_eff, 0.0, TANK_MAX_G_LIN_F32, 0.0);
-    let v_knee = v_clean.mul(V::splat(g_eff)).mul(gain_mod);
-
-    let v_loop = cubic_soft_saturator_vec4(
-        v_knee,
-        V::splat(TANK_MAX_V_CEIL_F32),
-        V::splat(TANK_CEIL_NORM_SCALE_F32),
+    let r_win_clean = scrub_clamp_vec4(r_win, TANK_MAX_STATE_ABS_F32);
+    let sigma_sat = clamp_finite_range(
+        params.sigma_sat,
+        MIN_SIGMA_SAT_F32,
+        TANK_MAX_SIGMA_SAT_F32,
+        TANK_MAX_SIGMA_SAT_F32,
     );
+    let inv_sigma_23 = clamp_finite_range(
+        params.inv_sigma_23,
+        0.0,
+        MAX_INV_SIGMA_23_F32,
+        DEFAULT_INV_SIGMA_23_F32,
+    );
+    let g_eff = clamp_finite_range(params.g_loop_eff, 0.0, TANK_MAX_G_LIN_F32, 0.0);
+    let v_loop = cubic_soft_saturator_vec4(
+        v_clean,
+        V::splat(g_eff * sigma_sat),
+        V::splat(TANK_MAX_V_CEIL_F32),
+        V::splat(inv_sigma_23),
+    );
+
     let va = v_loop.to_array();
     let rot_swap = V::from_array([-va[1], va[0], -va[3], va[2]]);
     let c = clamp_finite_range(params.cos_psi, -1.0, 1.0, 1.0);
@@ -335,8 +330,13 @@ pub fn step_op_t_feedback_vec4<V: KernelVec4>(
     state.dc_x_prev = v_damp;
     state.dc_y_prev = y_dc;
 
-    let limit = V::splat(FP16_FINITE_MAX_F32);
-    y_dc.clamp(limit.neg(), limit)
+    let mu = clamp_finite_range(params.mu_freeze, 0.0, 1.0, 0.0);
+    let w_ring = if mu == 0.0 {
+        y_dc
+    } else {
+        V::splat(1.0 - mu).mul(y_dc).fma(V::splat(mu), r_win_clean)
+    };
+    scrub_clamp_vec4(w_ring, FP16_FINITE_MAX_F32).add(V::zero())
 }
 
 #[inline(always)]
@@ -351,7 +351,7 @@ fn step_wet_dc_channel(pole: f32, alpha: f32, px: &mut f32, py: &mut f32, input:
 }
 
 /// Applies the 2×2 stereo wet Givens rotation `(cos_psi, sin_psi)` and steps the non-recirculating
-/// `5 Hz` stereo wet Direct-Form I DC blocker (`op_t_transport.md:165-171`).
+/// `5 Hz` stereo wet Direct-Form I DC blocker (`op_t_transport.md` §1.1.1).
 #[inline(always)]
 pub fn step_op_t_wet_dc_stereo_f32(
     y_raw_lr: (f32, f32),
@@ -389,43 +389,6 @@ pub fn step_op_t_wet_dc_stereo_f32(
         y_wet_r,
     );
     (out_l, out_r)
-}
-
-/// Steps the Family 4 ballistic 1-pole envelope ducking VCA on stereo `(y_wdc_l, y_wdc_r)`
-/// driven by sidechain `(x_tank_l, x_tank_r)` (`ref[dsp.op-t.ducking.vca]`).
-#[inline(always)]
-pub fn step_op_t_ducking_vca_f32(
-    y_lr: (f32, f32),
-    x_tank_lr: (f32, f32),
-    vca_pole: f32,
-    vca_sens: f32,
-    attack_cap: f32,
-    vca_env: &mut f32,
-) -> (f32, f32) {
-    let xl = scrub_and_flush_f32_bits(x_tank_lr.0);
-    let xr = scrub_and_flush_f32_bits(x_tank_lr.1);
-    let x_sc = 0.5 * const_abs_f32(xl) + 0.5 * const_abs_f32(xr);
-    let p_vca = clamp_finite_range(vca_pole, 0.0, VCA_MAX_POLE_F32, 0.0);
-    let att_cap = clamp_finite_range(attack_cap, 0.0, VCA_MAX_POLE_F32, 0.99);
-    let env_prev = scrub_and_flush_f32_bits(*vca_env);
-    let alpha = if x_sc > env_prev {
-        p_vca.min(att_cap)
-    } else {
-        p_vca
-    };
-    let env_next = scrub_and_flush_f32_bits(alpha * env_prev + (1.0 - alpha) * x_sc);
-    *vca_env = env_next;
-
-    let sens = clamp_finite_range(vca_sens, VCA_MIN_SENS_F32, VCA_MAX_SENS_F32, 0.0);
-    let g_vca = if sens == 0.0 {
-        1.0
-    } else {
-        (1.0 + sens * env_next).clamp(VCA_MIN_GAIN_F32, VCA_MAX_GAIN_F32)
-    };
-    (
-        flush_subnormal_f32_bits(y_lr.0 * g_vca),
-        flush_subnormal_f32_bits(y_lr.1 * g_vca),
-    )
 }
 
 #[cfg(test)]
@@ -477,24 +440,20 @@ mod tests {
         assert_eq!(limited[3], 0.0);
     }
 
-    /// verify[dsp.tank.captured-freeze]
-    /// verify[dsp.tank.loop-saturator]
-    /// verify[dsp.op-t.ducking.vca]
+    /// verify[dsp.op-t.ring.declaration]
+    /// verify[dsp.op-t.guard.bounded-history]
     #[test]
-    fn test_ortho_we_dual_latch_feedback_wet_dc_and_vca() {
-        // Schmitt dual-latch preserves HOST_WRITE_LOCK and other bits independently.
-        let base_flags = QUAD_FLAG_HAS_EXT | QUAD_FLAG_HOST_WRITE_LOCK | QUAD_FLAG_SCHROEDER_ENABLE;
-        assert_eq!(update_we_schmitt_flag(base_flags, 0.50), base_flags);
-        let latched = update_we_schmitt_flag(base_flags, 0.44);
-        assert_eq!(latched, base_flags | QUAD_FLAG_WE_HOLD_ACTIVE);
-        assert_eq!(update_we_schmitt_flag(latched, 0.50), latched);
-        assert_eq!(update_we_schmitt_flag(latched, 0.56), base_flags);
-        assert_eq!(update_we_schmitt_flag(latched, f32::NAN), latched);
-
+    fn test_host_lock_sigma_sat_mu_freeze_and_wet_dc() {
         let mut ring = [3.0_f32; 8];
-        write_ring_with_we_f32(&mut ring, 7, 2, -5.0, QUAD_FLAG_WE_HOLD_ACTIVE);
+        write_ring_with_we_f32(&mut ring, 7, 2, -5.0, QUAD_FLAG_HOST_WRITE_LOCK);
         assert_eq!(ring[2], 3.0);
-        write_ring_with_we_f32(&mut ring, 7, 2, -5.0, QUAD_FLAG_HAS_EXT);
+        write_ring_with_we_f32(
+            &mut ring,
+            7,
+            2,
+            -5.0,
+            QUAD_FLAG_HAS_EXT | QUAD_FLAG_SCHROEDER_ENABLE | 0x01,
+        );
         assert_eq!(ring[2], -5.0);
 
         let mut off16: u16 = 0;
@@ -504,11 +463,57 @@ mod tests {
         assert_eq!(step_we_hold_lag(&mut stale_off, 5), 5);
         assert_eq!(stale_off, 0);
 
+        // Unified sigma_sat saturator preserves small-signal slope g_eff and caps at g_eff * sigma_sat <= 0.985.
+        for sigma in [TANK_MAX_SIGMA_SAT_F32, 0.25] {
+            let g_eff = 0.85_f32;
+            let p_lim = OpTFeedbackParams {
+                g_inj: GpuVec4::zero(),
+                g_loop_eff: g_eff,
+                sigma_sat: sigma,
+                inv_sigma_23: 2.0 / (3.0 * sigma),
+                mu_freeze: 0.0,
+                cos_psi: 1.0,
+                sin_psi: 0.0,
+                damp_pole_eff: 0.0,
+                r_dc: DC_BLOCKER_5HZ_48K_F32,
+            };
+            let alpha_dc = 0.5 * (1.0 + p_lim.r_dc);
+            let mut st_small = OpTFeedbackState::default();
+            let y_small = step_op_t_feedback_vec4(
+                GpuVec4::from_array([1.0e-3, -1.0e-3, 1.0e-3, -1.0e-3]),
+                GpuVec4::zero(),
+                (0.0, 0.0),
+                &p_lim,
+                &mut st_small,
+            )
+            .to_array();
+            let slope = y_small[0] / (alpha_dc * 1.0e-3);
+            assert!(
+                (slope - g_eff).abs() < 1.0e-4,
+                "sigma={sigma} slope={slope}"
+            );
+
+            let mut st_sat = OpTFeedbackState::default();
+            let y_sat = step_op_t_feedback_vec4(
+                GpuVec4::from_array([100.0, -100.0, 100.0, -100.0]),
+                GpuVec4::zero(),
+                (0.0, 0.0),
+                &p_lim,
+                &mut st_sat,
+            )
+            .to_array();
+            let v_loop_sat = y_sat[0] / alpha_dc;
+            assert!((v_loop_sat - g_eff * sigma).abs() < 1.0e-6);
+            assert!(v_loop_sat <= TANK_MAX_V_CEIL_F32);
+        }
+
         // Feedback stability across 24,000 high-amplitude frames + DC blocking + zero HF damp passthrough.
         let params = OpTFeedbackParams {
             g_inj: GpuVec4::splat(0.5),
             g_loop_eff: TANK_MAX_G_LIN_F32,
-            inv_sigma: 1.0,
+            sigma_sat: TANK_MAX_SIGMA_SAT_F32,
+            inv_sigma_23: DEFAULT_INV_SIGMA_23_F32,
+            mu_freeze: 0.0,
             cos_psi: 0.6,
             sin_psi: 0.8,
             damp_pole_eff: 0.0,
@@ -517,7 +522,7 @@ mod tests {
         let mut fb_st = OpTFeedbackState::default();
         let mut acc = GpuVec4::zero();
         for _ in 0..24_000 {
-            acc = step_op_t_feedback_vec4(acc, (10.0, 10.0), &params, &mut fb_st);
+            acc = step_op_t_feedback_vec4(acc, GpuVec4::zero(), (10.0, 10.0), &params, &mut fb_st);
             for lane in acc.to_array() {
                 assert!(lane.is_finite() && lane.abs() <= FP16_FINITE_MAX_F32);
             }
@@ -529,7 +534,83 @@ mod tests {
             assert!((lane - 5.0).abs() < 1.0e-2, "damp_state = {lane}");
         }
 
-        // Wet DC rejects sustained constant offset and VCA bypasses at unity when sens == 0.0.
+        // Continuous mu_freeze writeback blend (1 - mu)*y_dc + mu*r_win + NaN/extreme scrubbing.
+        let r_win = GpuVec4::from_array([-0.5, 1.25, -4.0, 65_504.0]);
+        let mut st_mu0 = OpTFeedbackState::default();
+        let y0 = step_op_t_feedback_vec4(
+            GpuVec4::from_array([0.2, -0.3, 0.4, -0.1]),
+            GpuVec4::from_array([f32::MAX, f32::NAN, f32::INFINITY, -f32::MAX]),
+            (0.3, -0.2),
+            &params,
+            &mut st_mu0,
+        )
+        .to_array();
+        let mut st_nan = OpTFeedbackState::default();
+        let y_nan_mu = step_op_t_feedback_vec4(
+            GpuVec4::from_array([0.2, -0.3, 0.4, -0.1]),
+            r_win,
+            (0.3, -0.2),
+            &OpTFeedbackParams {
+                mu_freeze: f32::NAN,
+                ..params
+            },
+            &mut st_nan,
+        )
+        .to_array();
+        assert_eq!(y_nan_mu.map(f32::to_bits), y0.map(f32::to_bits));
+
+        let mut st_mu_mid = OpTFeedbackState::default();
+        let y_mid = step_op_t_feedback_vec4(
+            GpuVec4::from_array([0.2, -0.3, 0.4, -0.1]),
+            r_win,
+            (0.3, -0.2),
+            &OpTFeedbackParams {
+                mu_freeze: 0.25,
+                ..params
+            },
+            &mut st_mu_mid,
+        )
+        .to_array();
+        for (idx, lane) in y_mid.into_iter().enumerate() {
+            let exp = 0.75 * y0[idx] + 0.25 * r_win.to_array()[idx];
+            assert!(
+                (lane - exp).abs() < 1.0e-3,
+                "idx={idx} lane={lane} exp={exp}"
+            );
+        }
+
+        let mut st_mu1 = OpTFeedbackState::default();
+        let y_mu1 = step_op_t_feedback_vec4(
+            GpuVec4::from_array([0.2, -0.3, 0.4, -0.1]),
+            r_win,
+            (0.3, -0.2),
+            &OpTFeedbackParams {
+                mu_freeze: 1.5,
+                ..params
+            },
+            &mut st_mu1,
+        )
+        .to_array();
+        assert_eq!(y_mu1.map(f32::to_bits), r_win.to_array().map(f32::to_bits));
+
+        let mut st_scrub = OpTFeedbackState::default();
+        let y_scrub = step_op_t_feedback_vec4(
+            GpuVec4::splat(0.1),
+            GpuVec4::from_array([-0.0, f32::NAN, f32::MAX, -f32::MAX]),
+            (0.0, 0.0),
+            &OpTFeedbackParams {
+                mu_freeze: 1.0,
+                ..params
+            },
+            &mut st_scrub,
+        )
+        .to_array();
+        assert_eq!(y_scrub[0].to_bits(), 0);
+        assert_eq!(y_scrub[1].to_bits(), 0);
+        assert_eq!(y_scrub[2], FP16_FINITE_MAX_F32);
+        assert_eq!(y_scrub[3], -FP16_FINITE_MAX_F32);
+
+        // Wet DC rejects sustained constant offset cleanly.
         let (mut wx, mut wy) = ([0.0_f32; 2], [0.0_f32; 2]);
         let mut wet_out = (0.0, 0.0);
         for _ in 0..24_000 {
@@ -543,33 +624,18 @@ mod tests {
             );
         }
         assert!(wet_out.0.abs() < 1.0e-5 && wet_out.1.abs() < 1.0e-5);
+    }
 
-        let mut vca_env = 0.0_f32;
-        let unity =
-            step_op_t_ducking_vca_f32((-0.5, 0.25), (2.0, 2.0), 0.999, 0.0, 0.99, &mut vca_env);
-        assert_eq!(unity, (-0.5, 0.25));
-        assert!(vca_env > 0.0);
-        let ducked =
-            step_op_t_ducking_vca_f32((1.0, 1.0), (1.0, 1.0), 0.999, -8.0, 0.5, &mut vca_env);
-        assert!(ducked.0 >= VCA_MIN_GAIN_F32 && ducked.0 < 1.0);
-
-        // Sidechain with +/-f32::MAX avoids sum overflow and tracks high rather than flushing 0.0.
-        let _ = step_op_t_ducking_vca_f32(
-            (1.0, 1.0),
-            (f32::MAX, -f32::MAX),
-            0.5,
-            -1.0,
-            0.5,
-            &mut vca_env,
-        );
-        assert!(vca_env.is_finite() && vca_env > 1.0e30);
-
+    #[test]
+    fn test_feedback_extreme_inputs_zero_gain_and_poison_recovery() {
         // Extreme finite v_read = [f32::MAX, -f32::MAX, 1e20, -1e20] + 384 kHz ZOH r_dc (0.9999875):
         let extreme = GpuVec4::from_array([f32::MAX, -f32::MAX, 1.0e20, -1.0e20]);
         let params_hi = OpTFeedbackParams {
             g_inj: GpuVec4::zero(),
             g_loop_eff: TANK_MAX_G_LIN_F32,
-            inv_sigma: 1.0e4,
+            sigma_sat: 2.0,
+            inv_sigma_23: DEFAULT_INV_SIGMA_23_F32,
+            mu_freeze: 0.0,
             cos_psi: 1.0,
             sin_psi: 0.0,
             damp_pole_eff: 0.0,
@@ -577,8 +643,9 @@ mod tests {
         };
         let mut st_hi = OpTFeedbackState::default();
         let out_hi =
-            step_op_t_feedback_vec4(extreme, (0.0, 0.0), &params_hi, &mut st_hi).to_array();
-        let exp_abs = TANK_MAX_V_CEIL_F32 * (0.5 * (1.0 + 0.999_987_5));
+            step_op_t_feedback_vec4(extreme, GpuVec4::zero(), (0.0, 0.0), &params_hi, &mut st_hi)
+                .to_array();
+        let exp_abs = (TANK_MAX_G_LIN_F32 * TANK_MAX_SIGMA_SAT_F32) * (0.5 * (1.0 + 0.999_987_5));
         for (idx, exp) in [exp_abs, -exp_abs, exp_abs, -exp_abs]
             .into_iter()
             .enumerate()
@@ -590,23 +657,31 @@ mod tests {
             );
         }
 
-        // Zero feedback gain must emit 0.0 (never spurious -0.985 from rcp_pos_nr2 wrap/NaN).
+        // Zero feedback gain emits canonical +0.0 without spurious wrap/NaN.
         let params_zero = OpTFeedbackParams {
             g_loop_eff: 0.0,
             damp_pole_eff: 0.5,
             ..params_hi
         };
         let mut st_zero = OpTFeedbackState::default();
-        let out_zero =
-            step_op_t_feedback_vec4(extreme, (0.0, 0.0), &params_zero, &mut st_zero).to_array();
-        assert_eq!(out_zero, [0.0; 4]);
+        let out_zero = step_op_t_feedback_vec4(
+            extreme,
+            GpuVec4::from_array([f32::NAN, f32::MAX, -f32::INFINITY, -0.0]),
+            (0.0, 0.0),
+            &params_zero,
+            &mut st_zero,
+        )
+        .to_array();
+        assert_eq!(out_zero.map(f32::to_bits), [0; 4]);
 
-        // Injection `g_inj = 2.0` + consecutive `(±f32::MAX, ∓f32::MAX)` frames + unclamped Givens
+        // Injection `g_inj = 2.0` + consecutive `(±f32::MAX, ∓f32::MAX)` + unclamped Givens
         // saturate cleanly to `±65,504.0` instead of overflowing `±Inf` -> `0.0`.
         let params_inj = OpTFeedbackParams {
             g_inj: GpuVec4::splat(2.0),
             g_loop_eff: 0.0,
-            inv_sigma: 1.0,
+            sigma_sat: TANK_MAX_SIGMA_SAT_F32,
+            inv_sigma_23: DEFAULT_INV_SIGMA_23_F32,
+            mu_freeze: 0.0,
             cos_psi: f32::MAX,
             sin_psi: f32::NEG_INFINITY,
             damp_pole_eff: 0.0,
@@ -615,6 +690,7 @@ mod tests {
         let mut st_inj = OpTFeedbackState::default();
         let out_f0 = step_op_t_feedback_vec4(
             GpuVec4::splat(0.5),
+            GpuVec4::zero(),
             (f32::MAX, -f32::MAX),
             &params_inj,
             &mut st_inj,
@@ -624,6 +700,7 @@ mod tests {
         assert_eq!(out_f0, [f, -f, f, -f]);
         let out_f1 = step_op_t_feedback_vec4(
             GpuVec4::splat(0.5),
+            GpuVec4::zero(),
             (-f32::MAX, f32::MAX),
             &params_inj,
             &mut st_inj,
@@ -631,7 +708,7 @@ mod tests {
         .to_array();
         assert_eq!(out_f1, [-f, f, -f, f]);
 
-        // Poisoned state (`NaN`/`±Inf`/`±f32::MAX`) and `NaN` `g_inj` recover finite cleanly.
+        // Poisoned state (`NaN`/`±Inf`/`±f32::MAX`) and `NaN` fields recover finite cleanly.
         let mut st_poison = OpTFeedbackState {
             damp_state: GpuVec4::from_array([f32::NAN, f32::INFINITY, f32::MAX, -f32::MAX]),
             dc_x_prev: GpuVec4::from_array([f32::NAN, f32::NEG_INFINITY, f32::MAX, -f32::MAX]),
@@ -639,11 +716,15 @@ mod tests {
         };
         let params_poison = OpTFeedbackParams {
             g_inj: GpuVec4::from_array([f32::INFINITY, f32::NAN, 1.0, -1.0]),
+            sigma_sat: f32::NAN,
+            inv_sigma_23: f32::NAN,
+            mu_freeze: f32::NEG_INFINITY,
             damp_pole_eff: 0.5,
             ..params_hi
         };
         let out_poison = step_op_t_feedback_vec4(
             GpuVec4::splat(0.5),
+            GpuVec4::splat(f32::NAN),
             (1.0, -1.0),
             &params_poison,
             &mut st_poison,
@@ -672,6 +753,52 @@ mod tests {
                 prop_assert!(out[lane].is_finite());
                 prop_assert!(out[lane].abs() <= eff_gain * soft_limit + 1.0e-5);
                 prop_assert!(out[lane].abs() <= x[lane].abs() + 1.0e-6);
+            }
+        }
+
+        #[test]
+        fn prop_feedback_sigma_sat_and_mu_freeze_remain_bounded_and_convex(
+            v_read in prop::array::uniform4(-16.0_f32..16.0_f32),
+            r_win in prop::array::uniform4(-16.0_f32..16.0_f32),
+            x_l in -4.0_f32..4.0_f32,
+            x_r in -4.0_f32..4.0_f32,
+            sigma_sat in 1.0e-3_f32..TANK_MAX_SIGMA_SAT_F32,
+            g_loop in 0.0_f32..1.5_f32,
+            mu_freeze in 0.0_f32..1.0_f32,
+        ) {
+            let params0 = OpTFeedbackParams {
+                g_inj: GpuVec4::splat(0.5),
+                g_loop_eff: g_loop,
+                sigma_sat,
+                inv_sigma_23: 2.0 / (3.0 * sigma_sat),
+                mu_freeze: 0.0,
+                cos_psi: 0.8,
+                sin_psi: 0.6,
+                damp_pole_eff: 0.25,
+                r_dc: DC_BLOCKER_5HZ_48K_F32,
+            };
+            let mut st0 = OpTFeedbackState::default();
+            let mut stm = OpTFeedbackState::default();
+            let y0 = step_op_t_feedback_vec4(
+                GpuVec4::from_array(v_read),
+                GpuVec4::from_array(r_win),
+                (x_l, x_r),
+                &params0,
+                &mut st0,
+            )
+            .to_array();
+            let ym = step_op_t_feedback_vec4(
+                GpuVec4::from_array(v_read),
+                GpuVec4::from_array(r_win),
+                (x_l, x_r),
+                &OpTFeedbackParams { mu_freeze, ..params0 },
+                &mut stm,
+            )
+            .to_array();
+            for lane in 0..4 {
+                prop_assert!(ym[lane].is_finite() && ym[lane].abs() <= FP16_FINITE_MAX_F32);
+                let exp = (1.0 - mu_freeze) * y0[lane] + mu_freeze * r_win[lane];
+                prop_assert!((ym[lane] - exp).abs() < 1.0e-4);
             }
         }
     }

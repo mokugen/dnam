@@ -5,26 +5,34 @@
 //! - [`paralru`]: Contractive `1D` scalar `ParaLRU` step, zero-DC soft rectifier, exact forward tile, & `O(log2 N)` linear adjoint scan.
 //! - [`poly_adaa`]: Pure-`f32` divided-difference `PolyADAA1` and $C^2$ wavefolder kernels.
 
+pub mod core_quad;
 pub mod op_n_pre;
 pub mod paralru;
 pub mod poly_adaa;
 pub mod tpt_svf;
 
+pub use core_quad::{CoreQuadParamsStereo4, couple_ms_input_stereo8, step_core_quad_stereo8};
 pub use op_n_pre::{
-    OP_N_PRE_BETA_BYPASS_EPS, OP_N_PRE_FULL_PASS_THRESH, OP_N_PRE_MAX_BETA_Q,
+    OP_N_PRE_BETA_BYPASS_EPS, OP_N_PRE_FULL_PASS_THRESH, OP_N_PRE_INV_TAU_F32, OP_N_PRE_MAX_BETA_Q,
     OP_N_PRE_MAX_ZOH_HOLD_DEPTH, OP_N_PRE_MIN_RHO_EFF, OP_N_PRE_QUANT_CLAMP_F32, OpNPreHoisted,
     OpNPreHotState, compute_op_n_pre_inc_q32, quantize_nearest_step_f32,
+    quantize_smooth_fourier_f32,
 };
 
 use crate::simd::{KernelVec4, MAX_PARALRU_R_F32, StereoVec8};
 
 pub use paralru::{
-    LinearScanElem, ParaLruParams, ParaLruTileGrads, SOFT_RECT_EPS, apply_linear_scan,
-    compose_linear_scan, compose_paralru_adjoint_scan, paralru_adjoint_step_elem,
+    LinearScanElem, MAX_PARALRU_DUHEM_GAMMA_F32, MAX_PARALRU_TWO_SVF_G_F32, ONE_THIRD_F32,
+    ParaLruDuhemAdjointTrace, ParaLruDuhemForwardOut, ParaLruDuhemParams, ParaLruDuhemTileGrads,
+    ParaLruParams, ParaLruTileGrads, SOFT_RECT_EPS, SonaParaLruDuhemCoeffs4, apply_linear_scan,
+    apply_stereo_link_stereo8, apply_stereo_link_vec4_pair, compose_linear_scan,
+    compose_paralru_adjoint_scan, paralru_adjoint_step_elem, paralru_duhem_adjoint_step_elem,
     run_paralru_adjoint_scan_partial_tile, run_paralru_adjoint_scan_tile,
+    run_paralru_duhem_adjoint_scan_partial_tile, run_paralru_duhem_adjoint_scan_tile,
+    run_paralru_duhem_forward_partial_tile, run_paralru_duhem_forward_tile,
     run_paralru_forward_partial_tile, run_paralru_forward_tile, scan_linear_prefix_tile,
-    soft_rect_zero_dc_f32, soft_rect_zero_dc_stereo8, soft_rect_zero_dc_vec4, step_paralru_stereo8,
-    step_paralru_vec4,
+    soft_rect_zero_dc_f32, soft_rect_zero_dc_stereo8, soft_rect_zero_dc_vec4,
+    step_paralru_duhem_stereo8, step_paralru_duhem_vec4, step_paralru_stereo8, step_paralru_vec4,
 };
 pub use poly_adaa::{
     eval_c2_wavefolder_adaa_stereo8, eval_c2_wavefolder_adaa_vec4, eval_poly_adaa1_odd_even_vec4,

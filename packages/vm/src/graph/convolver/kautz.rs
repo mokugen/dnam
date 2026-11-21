@@ -1,7 +1,10 @@
-//! Cabinet shared-pole stereo Kautz modal bank (`176 B` [`KautzStereoBank4`]), `44.1–384 kHz`
-//! continuous-time ZOH hydration with exact prefix-override replacement, and `3 kHz` contractive
-//! slew retuning (`ref[dsp.op-m.kautz.tier-allocation]`, `ref[dsp.op-m.kautz.dual-state]`,
-//! `ref[dsp.op-m.kautz.radial-gate]`, `ref[dsp.op-m.kautz.rate-convert]`).
+//! `ModalConvolver` shared-pole stereo Kautz modal bank (`176 B` [`KautzStereoBank4`]),
+//! `44.1–384 kHz` continuous-time ZOH hydration with exact prefix-override replacement, and
+//! `3 kHz` contractive slew retuning (`ref[dsp.op-m.kautz.tier-allocation]`,
+//! `ref[dsp.op-m.kautz.dual-state]`, `ref[dsp.op-m.kautz.radial-gate]`,
+//! `ref[dsp.op-m.kautz.rate-convert]`).
+
+#![forbid(unsafe_code)]
 
 use core::mem::{align_of, size_of};
 
@@ -201,7 +204,7 @@ impl KautzColdSlewState {
     }
 }
 
-/// Optional exact-replacement Kautz prefix override slices unpacked from tier `VarProReadout`
+/// Optional exact-replacement Kautz prefix override slices unpacked from tier `LinearReadout`
 /// blocks (`ref[dsp.op-m.kautz.dual-state]`).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KautzPrefixOverride<'a> {

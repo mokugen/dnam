@@ -31,9 +31,11 @@ const TWO_POW_24_F32: f32 =
     f32::from_bits(((F32_EXP_BIAS + SUBNORMAL_PRESCALE_BITS) as u32) << F32_EXP_SHIFT);
 const TWO_POW_NEG_24_F32: f32 =
     f32::from_bits(((F32_EXP_BIAS - SUBNORMAL_PRESCALE_BITS) as u32) << F32_EXP_SHIFT);
+const BRANCH_CUT_CHORD_TOL: f32 = f32::from_bits(((F32_EXP_BIAS - 18) as u32) << F32_EXP_SHIFT);
 
 const _: () = assert!(T1_SILENCE_SQUELCH_R2 > 0.0);
 const _: () = assert!((TWO_POW_24_F32 * TWO_POW_NEG_24_F32 - 1.0).to_bits() == 0);
+const _: () = assert!(BRANCH_CUT_CHORD_TOL > 0.0 && BRANCH_CUT_CHORD_TOL < 1.0e-5);
 
 /// Discrete 1-bit zero-crossing toggle latch and Riemann sheet tracker (`T1`, Family 1,
 /// `ref[dsp.op-m.tracker.t1-dc-blocker]`, `ref[dsp.op-m.tracker.envelope-norm]`, `ref[dsp.op-m.tracker.toggle-sheet]`).
@@ -128,9 +130,14 @@ impl SubHarmonicTracker {
         let u_re = (x_clean * rho).clamp(-1.0, 1.0);
         let u_im = (h_clean * rho).clamp(-1.0, 1.0);
 
-        // Riemann branch cut tracking: branch flips when crossing negative real axis
+        // Riemann branch cut tracking: branch flips when crossing negative real axis outside
+        // the near-antipodal chord deadband (dot < 0 && |det| <= 2^-18).
+        let dot = self.prev_u_re * u_re + self.prev_u_im * u_im;
+        let det = self.prev_u_re * u_im - self.prev_u_im * u_re;
+        let antipodal_near_origin = dot < 0.0 && det.abs() <= BRANCH_CUT_CHORD_TOL;
         if ((self.prev_u_im >= 0.0 && u_im < 0.0) || (self.prev_u_im <= 0.0 && u_im > 0.0))
             && u_re < 0.0
+            && !antipodal_near_origin
         {
             self.sheet = -self.sheet;
         }
@@ -265,7 +272,7 @@ impl T1SubHarmonicTracker {
         self.dc_blocker.step(x)
     }
 
-    /// Returns `(q1_toggle, q2_toggle, sheet_sign, prev_valid)` from [`dnam_kernels::T1SubHarmonicKernel`].
+    /// Returns `(sheet, sheet2, prev_w1_re, prev_valid)` from [`dnam_kernels::T1SubHarmonicKernel`].
     #[inline(always)]
     pub const fn state(&self) -> (f32, f32, f32, bool) {
         self.kernel.state()
@@ -297,6 +304,8 @@ impl T1SubHarmonicTracker {
 mod tests {
     use super::*;
     use crate::FtzDazGuard;
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    use std::hint::black_box;
 
     #[test]
     fn test_subharmonic_tracker() {
@@ -367,7 +376,22 @@ mod tests {
                 "T1 mismatch at rate={rate}: got ({p_bits:#010x}, {g_bits:#010x})"
             );
         }
-        assert!(compute_t1_dc_blocker_coeffs_bits(100_000.0).is_none());
+        let (p_mid, g_mid) = compute_t1_dc_blocker_coeffs_bits(128_000.0).unwrap();
+        assert_eq!(
+            (p_mid, g_mid),
+            dnam_kernels::compute_t1_dc_blocker_coeffs_bits(128_000.0).unwrap()
+        );
+        assert!(f32::from_bits(p_mid) > 0.999 && f32::from_bits(g_mid) > 0.999);
+        assert!(compute_t1_dc_blocker_coeffs_bits(44_099.0).is_none());
+        assert!(compute_t1_dc_blocker_coeffs_bits(384_001.0).is_none());
+        let mut trk_mid = T1SubHarmonicTracker::new();
+        assert!(trk_mid.reconfigure_sample_rate(128_000.0).is_some());
+        assert!(trk_mid.step_dc_blocker(0.25).is_finite());
+        let mut ant = SubHarmonicTracker::default();
+        let _ = ant.step(1.0, 1.0e-7);
+        let s_before = ant.sheet;
+        let _ = ant.step(-1.0, -1.0e-7);
+        assert_eq!(ant.sheet, s_before);
 
         // 2. Exponent-split envelope normalization across quiet (2^-125) and loud (100.0) amplitudes
         for &amp in &[(-125.0_f64).exp2() as f32, 1.0e-30, 1.0e-12, 0.1, 100.0] {
@@ -403,20 +427,31 @@ mod tests {
         assert!(!trk.state().3);
 
         let f_axis = trk.step_analytic(0.0, 1.0);
-        assert!(trk.state().3 && f_axis[2] > 0.0);
+        assert!(trk.state().3 && (f_axis[0] - core::f32::consts::FRAC_1_SQRT_2).abs() < 1.0e-5);
+        assert!((f_axis[2] - (core::f64::consts::FRAC_PI_8).cos() as f32).abs() < 1.0e-5);
+        assert!((f_axis[3] - (core::f64::consts::FRAC_PI_8).sin() as f32).abs() < 1.0e-5);
         let f_rise = trk.step_analytic(1.0, 1.0);
-        assert!(f_rise[2] < 0.0); // q1 toggled +1 -> -1 on rising crossing
+        let env_rise = core::f64::consts::SQRT_2;
+        assert!(
+            (f_rise[0] - (env_rise * (core::f64::consts::FRAC_PI_8).cos()) as f32).abs() < 1.0e-5
+        );
+        assert!(
+            (f_rise[2] - (env_rise * (core::f64::consts::PI / 16.0).cos()) as f32).abs() < 1.0e-5
+        );
+        assert!(
+            (f_rise[3] - (env_rise * (core::f64::consts::PI / 16.0).sin()) as f32).abs() < 1.0e-5
+        );
 
         let d_out = dc.step(0.5);
         assert!(d_out.is_finite());
-        let mut legacy = SubHarmonicTracker::default();
+        let mut reference = SubHarmonicTracker::default();
         let mut ker = dnam_kernels::T1SubHarmonicKernel::new();
         let mut trk_l = T1SubHarmonicTracker::new();
         let mut trk_r = T1SubHarmonicTracker::new();
         for n in 0..32 {
             let angle = (n as f32) * 0.41;
             let (x, y) = (0.5 * angle.cos(), 0.5 * angle.sin());
-            let _ = legacy.step(x, y);
+            let _ = reference.step(x, y);
             let k_out = ker.step(x, y);
             assert!(k_out.iter().all(|v| v.is_finite()));
             let (sl, sr) =
@@ -463,13 +498,6 @@ mod tests {
         }
         assert!(saw_nonzero);
     }
-}
-
-#[cfg(test)]
-mod tracker_reference_tests {
-    use crate::FtzDazGuard;
-    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-    use std::hint::black_box;
 
     const RATE: usize = 48_000;
     const TONE_PERIOD: usize = 48;

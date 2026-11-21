@@ -5,18 +5,75 @@ use core::marker::PhantomData;
 use super::dispatch::{
     ANTI_ZIPPER_SNAP_EPS, DEFAULT_ANTI_ZIPPER_POLE, DEFAULT_DRIFT_PRNG_SEED, STAGE_TARGET_SLOTS,
 };
+use super::tick::compute_has_internal_modulators;
 use super::{ControlBus, ControlBusBacking};
-use crate::bin::DnamBinView;
+use crate::bin::{Arena0ControlBusWire, Arena3ControlBusWire, DnamBinView};
 use crate::control::ControlClampDescriptor;
 use crate::control::cp1::{count_distinct_contributor_controls, decode_cp1_contributors};
 use crate::control::exact_int::ExactIntFactorAccumulator;
-use crate::math::{MathBackend, Q0_192Phase, clamp_finite_f32, const_abs_f32, sanitize_finite_f32};
+use crate::math::{MathBackend, Q0_192Phase, clamp_finite_f32, fp16_to_f32, sanitize_finite_f32};
 use crate::types::{Tier, VmError};
 
+/// Base index of `ou_to_z_stage_ultra_fp16[4]` inside `stage_latent_ctrl_ultra_fp16[256]`.
+const OU_TO_Z_STAGE_ULTRA_OFFSET: usize = 160;
+
 #[inline]
-fn non_zero_f32_cols_8_16(m: &[[f32; 16]; 16]) -> bool {
-    m.iter()
-        .any(|row| row[8..16].iter().any(|&v| const_abs_f32(v) != 0.0))
+fn canonical_zero(v: f32) -> f32 {
+    if v == 0.0 { 0.0 } else { v }
+}
+
+/// Decodes `lfo_skew[0..2]` from `arena0.control_bus_lite.lfo_skew_fp16`, clamping finite values
+/// to `[-1.0, 1.0]` with `0.0` fallback (`ref[container.dnam.load-validation]`).
+#[inline]
+pub(crate) fn decode_lfo_skew(a0_cb: &Arena0ControlBusWire) -> [f32; 2] {
+    [0, 1].map(|j| {
+        canonical_zero(clamp_finite_f32(
+            fp16_to_f32(a0_cb.lfo_skew_fp16[j].get()),
+            -1.0,
+            1.0,
+            0.0,
+        ))
+    })
+}
+
+/// Decodes `base_tank_dry_mix` from `tank_dry_mix_fp16`: `0x0000 -> 0.0`, finite -> `[-2.0, 2.0]`,
+/// non-finite -> `1.0` (`ref[container.dnam.load-validation]`).
+#[inline]
+pub(crate) fn decode_tank_dry_mix(raw_fp16: u16) -> f32 {
+    if raw_fp16 == 0 {
+        0.0
+    } else {
+        canonical_zero(clamp_finite_f32(fp16_to_f32(raw_fp16), -2.0, 2.0, 1.0))
+    }
+}
+
+/// Decodes `ou_to_z_stage[0..8]` across Arena 0 `[0..4]` and optional Arena 3 `[4..8]`
+/// (`stage_latent_ctrl_ultra_fp16[160..164]`), clamping finite entries into `[-4.0, 4.0]`.
+#[inline]
+pub(crate) fn decode_ou_to_z_stage(
+    a0_cb: &Arena0ControlBusWire,
+    a3_cb: Option<&Arena3ControlBusWire>,
+) -> [f32; 8] {
+    let mut out = [0.0_f32; 8];
+    for k in 0..4 {
+        out[k] = canonical_zero(clamp_finite_f32(
+            fp16_to_f32(a0_cb.ou_to_z_stage_fp16[k].get()),
+            -4.0,
+            4.0,
+            0.0,
+        ));
+    }
+    if let Some(a3) = a3_cb {
+        for k in 0..4 {
+            out[4 + k] = canonical_zero(clamp_finite_f32(
+                fp16_to_f32(a3.stage_latent_ctrl_ultra_fp16[OU_TO_Z_STAGE_ULTRA_OFFSET + k].get()),
+                -4.0,
+                4.0,
+                0.0,
+            ));
+        }
+    }
+    out
 }
 
 impl<'a, B: MathBackend> ControlBus<'a, B> {
@@ -133,14 +190,9 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
                 r.min(0.9999)
             }
         };
-        let env_poles_train = [0, 1, 2].map(|i| {
-            clamp_finite_f32(
-                a0_cb.env_poles[i].get(),
-                0.0,
-                0.99995,
-                [0.95, 0.99, 0.998][i],
-            )
-        });
+        let lfo_skew = decode_lfo_skew(a0_cb);
+        let base_tank_dry_mix = decode_tank_dry_mix(a0_cb.tank_dry_mix_fp16.get());
+        let ou_to_z_stage = decode_ou_to_z_stage(a0_cb, a3_cb);
         let trust_radius_mh = {
             let tr = a0_cb.trust_radius_mh.get();
             if !tr.is_finite() || tr <= 0.0 {
@@ -158,10 +210,12 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
             }
         };
         let ref_sr = view.header.reference_sample_rate_hz.get() as f32;
-        let has_internal_modulators = (const_abs_f32(lfo_dphi_train[0]) != 0.0)
-            || (const_abs_f32(lfo_dphi_train[1]) != 0.0)
-            || non_zero_f32_cols_8_16(&w_ctrl)
-            || (cext_present && non_zero_f32_cols_8_16(&w_ctrl_ext));
+        let has_internal_modulators = compute_has_internal_modulators(
+            &[lfo_dphi_train[0].to_bits(), lfo_dphi_train[1].to_bits()],
+            &w_ctrl,
+            &w_ctrl_ext,
+            cext_present,
+        );
 
         let mut bus = Self {
             stage_targets: [0.0; STAGE_TARGET_SLOTS],
@@ -176,10 +230,10 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
             lfo_dphi_host_bits: [0; 2],
             lfo_dphi_train,
             lfo_phasors: [[1.0, 0.0]; 2],
-            lfo_harmonics: [0.0; 8],
-            env_poles_host: env_poles_train,
-            env_poles_train,
+            lfo_skew,
             env_states: [0.0; 4],
+            base_tank_dry_mix,
+            ou_to_z_stage,
             ou_drift_state: [0.0; 4],
             drift_prng_state: DEFAULT_DRIFT_PRNG_SEED,
             sigma_drift,
@@ -196,9 +250,7 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
                 48_000.0
             },
             ctrl_stride: 16,
-            inv_ctrl_stride: 1.0 / 16.0,
             ctrl_sub_counter: 0,
-            window_abs_acc: 0.0,
             num_controls,
             num_contributors,
             distinct_contributor_controls,
@@ -270,7 +322,7 @@ mod tests {
             declared_max_delay_48k: 4_096,
             dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
             tail_time_ms: 0.0,
-            r_ac_default: 0.99,
+            ro_pole_48k: 0.99,
             switch_xfade_samples: 0,
             content_hash_prefix: [0; 8],
             controls: &controls,
@@ -343,5 +395,111 @@ mod tests {
             .unwrap();
             assert_eq!(bus_owned.tier, Tier::Lite);
         }
+    }
+
+    #[test]
+    fn test_decode_m10b_lfo_skew_tank_dry_mix_and_ou_to_z_stage() {
+        use zerocopy::FromZeros;
+        use zerocopy::byteorder::little_endian::U16;
+
+        use crate::math::f32_to_fp16;
+
+        let mut a0_cb = Arena0ControlBusWire::new_zeroed();
+        a0_cb.lfo_skew_fp16 = [U16::new(f32_to_fp16(2.5)), U16::new(0x7E00)];
+        assert_eq!(decode_lfo_skew(&a0_cb), [1.0, 0.0]);
+        a0_cb.lfo_skew_fp16 = [U16::new(f32_to_fp16(-2.5)), U16::new(0x8000)];
+        assert_eq!(
+            decode_lfo_skew(&a0_cb).map(f32::to_bits),
+            [(-1.0_f32).to_bits(), 0]
+        );
+
+        assert_eq!(decode_tank_dry_mix(0x0000).to_bits(), 0);
+        assert_eq!(decode_tank_dry_mix(0x8000).to_bits(), 0);
+        assert_eq!(decode_tank_dry_mix(0x7E00), 1.0);
+        assert_eq!(decode_tank_dry_mix(0x7C00), 1.0);
+        assert_eq!(decode_tank_dry_mix(0xFC00), 1.0);
+        assert_eq!(decode_tank_dry_mix(f32_to_fp16(3.5)), 2.0);
+        assert_eq!(decode_tank_dry_mix(f32_to_fp16(-3.5)), -2.0);
+        assert_eq!(decode_tank_dry_mix(f32_to_fp16(0.75)), 0.75);
+
+        a0_cb.ou_to_z_stage_fp16 = [
+            U16::new(f32_to_fp16(6.0)),
+            U16::new(f32_to_fp16(-6.0)),
+            U16::new(f32_to_fp16(0.5)),
+            U16::new(0x7E00),
+        ];
+        assert_eq!(
+            decode_ou_to_z_stage(&a0_cb, None),
+            [4.0, -4.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
+
+        let mut a3_cb = Arena3ControlBusWire::new_zeroed();
+        a3_cb.stage_latent_ctrl_ultra_fp16[160] = U16::new(f32_to_fp16(1.5));
+        a3_cb.stage_latent_ctrl_ultra_fp16[161] = U16::new(f32_to_fp16(-5.0));
+        a3_cb.stage_latent_ctrl_ultra_fp16[162] = U16::new(0x7E00);
+        a3_cb.stage_latent_ctrl_ultra_fp16[163] = U16::new(f32_to_fp16(0.25));
+        assert_eq!(
+            decode_ou_to_z_stage(&a0_cb, Some(&a3_cb)),
+            [4.0, -4.0, 0.5, 0.0, 1.5, -4.0, 0.0, 0.25]
+        );
+
+        let mut a0_custom = DnamBinBuildInput::default_arena0_lite();
+        a0_custom.control_bus_lite.lfo_skew_fp16 =
+            [U16::new(f32_to_fp16(0.5)), U16::new(f32_to_fp16(-2.5))];
+        a0_custom.control_bus_lite.tank_dry_mix_fp16 = U16::new(0);
+        a0_custom.control_bus_lite.ou_to_z_stage_fp16 = [
+            U16::new(f32_to_fp16(1.25)),
+            U16::new(f32_to_fp16(-0.5)),
+            U16::new(f32_to_fp16(5.0)),
+            U16::new(0x7E00),
+        ];
+        let desc = ControlClampDescriptor::range(0.0, 1.0, 0.5, 1, [0.0; 3]).to_wire();
+        let controls = [desc];
+        let input = DnamBinBuildInput {
+            reference_sample_rate_hz: 48_000,
+            header_flags: 0,
+            ext_ring_pow2_frames: 0,
+            ext_ring_lines: 0,
+            ext_ring_format: 0,
+            declared_max_delay_48k: 4_096,
+            dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
+            tail_time_ms: 0.0,
+            ro_pole_48k: 0.99,
+            switch_xfade_samples: 0,
+            content_hash_prefix: [0; 8],
+            controls: &controls,
+            cp1_overflow: &[],
+            tsyn: &[],
+            cext: None,
+            arena0: &a0_custom,
+            arena1: None,
+            arena2: None,
+            arena3: None,
+        };
+        let mut buf = [0u8; 128 + 64 + 4_608];
+        encode_dnam_bin_into(&input, &mut buf).unwrap();
+        let view = DnamBinView::parse(&buf).unwrap();
+        let mut d = [ControlClampDescriptor::empty(); 1];
+        let mut r = [0.0; 1];
+        let mut c = [0.0; 1];
+        let mut n = [0.0; 1];
+        let mut s = [0u8; 1];
+        let mut slots = [crate::control::Cp1ContributorSlot::zero(); 8];
+        let backing =
+            ControlBusBacking::from_slices(&mut d, &mut r, &mut c, &mut n, &mut s, &mut slots, &[])
+                .unwrap();
+        let bus = ControlBus::<crate::math::DefaultMathBackend>::from_dnam_bin(
+            &view,
+            Tier::Lite,
+            48_000.0,
+            backing,
+        )
+        .unwrap();
+        assert_eq!(bus.lfo_skew, [0.5, -1.0]);
+        assert_eq!(bus.base_tank_dry_mix(), 0.0);
+        assert_eq!(
+            bus.ou_to_z_stage,
+            [1.25, -0.5, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+        );
     }
 }

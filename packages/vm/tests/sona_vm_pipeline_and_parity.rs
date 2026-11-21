@@ -1,42 +1,26 @@
-//! Comprehensive M9 `dnam-vm` integration tests: 0-ULP chunk-split invariance, Matryoshka
-//! prefix stripping & crossfade, dual-latch `WE` + slot-22 Quad-0 modulation, cross-ISA parity,
-//! `SO(4)` `Q_buyer` gauge invariance, ZOH multi-rate Cases (a)-(d) + `4x` PDC, 4-port isolation,
-//! saturation telemetry, and `!alloc` execution.
+//! End-to-end M10b `dnam-vm` integration tests: 0-ULP chunk-split invariance, Matryoshka
+//! prefix stripping & crossfade, cross-ISA parity, `SO(4)` `Q_buyer` gauge invariance, ZOH
+//! multi-rate Cases (a)-(d) + `4x` PDC, saturation telemetry, and `!alloc` execution.
 
 #![forbid(unsafe_code)]
 
 mod sona_vm_pipeline_and_parity {
     pub(crate) mod helpers;
+    pub(crate) mod m10b_contracts;
     pub(crate) mod m9_contracts;
 }
 
-use dnam_kernels::{QUAD_FLAG_HOST_WRITE_LOCK, QUAD_FLAG_WE_HOLD_ACTIVE};
-use dnam_vm::graph::CabinetHighSrMode;
+use dnam_vm::graph::ConvolverHighSrMode;
 use dnam_vm::math::{detect_best_backend, saturation_flags};
 use dnam_vm::{
-    BackendKind, DefaultMathBackend, DynamicSonaVm, IoAlignmentMode, OFFLINE_BOUNCE_PDC_SAMPLES,
-    ScalarBackend, SonaVm, TIER_SWITCH_XFADE_SAMPLES, Tier, WdwDryTapMode, control_stride_for_rate,
-    detect_cpu_simd_features, strip_dnam_bin_to_tier,
+    BackendKind, DefaultMathBackend, DynamicSonaVm, OFFLINE_BOUNCE_PDC_SAMPLES, ScalarBackend,
+    SonaVm, TIER_SWITCH_XFADE_SAMPLES, Tier, control_stride_for_rate, detect_cpu_simd_features,
+    strip_dnam_bin_to_tier,
 };
 use sona_vm_pipeline_and_parity::helpers::{
-    build_full_pipeline_ultra_fixture, build_so4_qbuyer_pair, run_no_alloc_lite, stereo_test_signal,
+    assert_finite_non_silent, build_full_pipeline_ultra_fixture, build_so4_qbuyer_pair,
+    run_no_alloc_lite, stereo_test_signal,
 };
-
-pub(crate) fn assert_finite_non_silent(l: &[f32], r: &[f32], label: &str) {
-    assert!(
-        l.iter().chain(r.iter()).all(|v| v.is_finite()),
-        "non-finite output in {label}"
-    );
-    let energy: f64 = l
-        .iter()
-        .chain(r.iter())
-        .map(|&v| f64::from(v) * f64::from(v))
-        .sum();
-    assert!(
-        energy > 1.0e-6,
-        "unexpectedly silent output in {label}: energy={energy}"
-    );
-}
 
 fn run_chunk_schedule(
     bin: &[u8],
@@ -202,97 +186,6 @@ fn test_matryoshka_tier_strip_prefix_equivalence_and_xfade() {
     }
 }
 
-#[test]
-fn test_dual_latch_we_hold_independence_and_slot22_quad0_only() {
-    let ultra = build_full_pipeline_ultra_fixture();
-    let mut vm =
-        SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&ultra, Tier::Ultra, 48_000.0).unwrap();
-    let (in_l, in_r) = stereo_test_signal(64, 3);
-    let (mut out_l, mut out_r) = ([0.0_f32; 64], [0.0_f32; 64]);
-
-    let initial = vm.telemetry();
-    assert!(!initial.we_hold_active && !initial.host_write_lock);
-
-    // Drive slot 16 (op_t_we_drive) below 0.45 via ctrl 1 = 0.0 -> trips bit 0 only.
-    vm.set_control_physical(1, 0.0).unwrap();
-    vm.process_block(&in_l[..32], &in_r[..32], &mut out_l[..32], &mut out_r[..32])
-        .unwrap();
-    assert_ne!(
-        vm.slab().lite.tank_quad0.flags & QUAD_FLAG_WE_HOLD_ACTIVE,
-        0
-    );
-    assert_eq!(
-        vm.slab().lite.tank_quad0.flags & QUAD_FLAG_HOST_WRITE_LOCK,
-        0
-    );
-    assert_ne!(
-        vm.slab().full_delta.tank_quad1.flags & QUAD_FLAG_WE_HOLD_ACTIVE,
-        0
-    );
-    assert!(vm.telemetry().we_hold_active && !vm.telemetry().host_write_lock);
-
-    // Latch host write lock (bit 2) independently; both bits are now active.
-    vm.set_quad_write_enable(true);
-    let both = QUAD_FLAG_WE_HOLD_ACTIVE | QUAD_FLAG_HOST_WRITE_LOCK;
-    assert_eq!(vm.slab().lite.tank_quad0.flags & both, both);
-    assert_eq!(vm.slab().ultra_delta.tank_quad3.flags & both, both);
-    assert!(vm.telemetry().we_hold_active && vm.telemetry().host_write_lock);
-
-    // Release slot 16 (> 0.55): bit 0 clears while bit 2 remains locked.
-    vm.set_control_physical(1, 1.0).unwrap();
-    vm.process_block(
-        &in_l[32..64],
-        &in_r[32..64],
-        &mut out_l[32..64],
-        &mut out_r[32..64],
-    )
-    .unwrap();
-    assert_eq!(
-        vm.slab().lite.tank_quad0.flags & QUAD_FLAG_WE_HOLD_ACTIVE,
-        0
-    );
-    assert_ne!(
-        vm.slab().lite.tank_quad0.flags & QUAD_FLAG_HOST_WRITE_LOCK,
-        0
-    );
-    assert!(!vm.telemetry().we_hold_active && vm.telemetry().host_write_lock);
-
-    // Re-latch bit 0 then call reset(): reset clears bit 0 while preserving bit 2.
-    vm.set_control_physical(1, 0.0).unwrap();
-    vm.process_block(&in_l[..32], &in_r[..32], &mut out_l[..32], &mut out_r[..32])
-        .unwrap();
-    assert!(vm.telemetry().we_hold_active && vm.telemetry().host_write_lock);
-    vm.reset();
-    assert!(!vm.telemetry().we_hold_active && vm.telemetry().host_write_lock);
-    assert_eq!(
-        vm.slab().lite.tank_quad0.flags & QUAD_FLAG_WE_HOLD_ACTIVE,
-        0
-    );
-    assert_ne!(
-        vm.slab().lite.tank_quad0.flags & QUAD_FLAG_HOST_WRITE_LOCK,
-        0
-    );
-    vm.set_quad_write_enable(false);
-    assert!(!vm.telemetry().host_write_lock);
-
-    // Verify slot 22 (op_t_dry_mix_mod via ctrl 2) modulates Quad 0 ONLY.
-    vm.set_control_physical(1, 1.0).unwrap();
-    vm.process_block(&in_l, &in_r, &mut out_l, &mut out_r)
-        .unwrap();
-    let dry_before: [f32; 4] =
-        core::array::from_fn(|q| vm.slab().cold().tank_quad_eff[q].dry_mix_eff);
-    vm.set_control_physical(2, 1.0).unwrap();
-    vm.process_block(&in_l, &in_r, &mut out_l, &mut out_r)
-        .unwrap();
-    let dry_after: [f32; 4] =
-        core::array::from_fn(|q| vm.slab().cold().tank_quad_eff[q].dry_mix_eff);
-
-    assert!(((dry_after[0] - dry_before[0]) - 0.50).abs() < 1.0e-3);
-    for q in 1..4 {
-        assert_eq!(dry_after[q].to_bits(), dry_before[q].to_bits());
-    }
-}
-
 fn push_unique_backend(kinds: &mut Vec<BackendKind>, kind: BackendKind) {
     if !kinds.contains(&kind) {
         kinds.push(kind);
@@ -391,7 +284,7 @@ fn test_cross_isa_scalar_vs_default_and_dynamic_parity() {
 }
 
 #[test]
-fn test_dynamic_and_sona_vm_lifecycle_router_and_batch_controls() {
+fn test_dynamic_and_sona_vm_lifecycle_and_batch_controls() {
     let ultra = build_full_pipeline_ultra_fixture();
     let (in_l, in_r) = stereo_test_signal(64, 9);
     let kinds = host_backend_kinds();
@@ -419,8 +312,7 @@ fn test_dynamic_and_sona_vm_lifecycle_router_and_batch_controls() {
         dyn_vm.set_quad_write_enable(true);
         assert!(dyn_vm.telemetry().host_write_lock);
         dyn_vm.set_quad_write_enable(false);
-        dyn_vm.set_ms_width(1.25);
-        dyn_vm.configure_return_alignment(IoAlignmentMode::LowLatency16Tap, 1.5, 2.25);
+        assert!(!dyn_vm.telemetry().host_write_lock);
         dyn_vm.set_offline_bounce(true).unwrap();
         dyn_vm.set_offline_bounce(false).unwrap();
         dyn_vm.switch_tier(Tier::Pro).unwrap();
@@ -444,16 +336,11 @@ fn test_dynamic_and_sona_vm_lifecycle_router_and_batch_controls() {
         let (sf_l, sf_r) = dyn_vm.step_frame(in_l[0], in_r[0]).unwrap();
         assert!(sf_l.is_finite() && sf_r.is_finite());
 
-        let (main_lr, send_lr) = dyn_vm
-            .step_frame_4port([in_l[1], in_r[1]], [0.05, -0.05], true)
-            .unwrap();
-        assert!(main_lr[0].is_finite() && send_lr[0].is_finite());
-
         dyn_vm.reset();
-        assert!(!dyn_vm.telemetry().we_hold_active);
+        assert!(!dyn_vm.telemetry().host_write_lock);
     }
 
-    // Exercise SonaVm batch, 3 kHz tick, lock, drift, 4-port, and slab_mut APIs.
+    // Exercise SonaVm batch, 3 kHz tick, lock, drift, and slab_mut APIs.
     let mut vm =
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&ultra, Tier::Ultra, 48_000.0).unwrap();
     vm.set_controls_batch(&[(0, 920.0), (1, 1.0), (2, 0.25)])
@@ -464,21 +351,9 @@ fn test_dynamic_and_sona_vm_lifecycle_router_and_batch_controls() {
     vm.set_op_t_write_enable(false);
     vm.set_live_analog_drift_enabled(false);
     vm.set_live_analog_drift_enabled(true);
-    vm.set_ms_width(1.1);
-    vm.configure_return_alignment(IoAlignmentMode::MinLatency4Tap, 1.25, 1.75);
-    let _ = vm.slab_mut().lite.tank_quad0.flags;
-    let (m_true, s_true) = vm
-        .step_frame_4port([in_l[0], in_r[0]], [0.04, -0.04], true)
-        .unwrap();
-    let (m_false, s_false) = vm
-        .step_frame_4port([in_l[1], in_r[1]], [0.0, 0.0], false)
-        .unwrap();
-    assert!(
-        m_true[0].is_finite()
-            && s_true[0].is_finite()
-            && m_false[1].is_finite()
-            && s_false[1].is_finite()
-    );
+    let _ = vm.slab_mut().lite.transport_quad0.flags;
+    let (sl, sr) = vm.step_frame(in_l[0], in_r[0]).unwrap();
+    assert!(sl.is_finite() && sr.is_finite());
     vm.clear_saturation_flags();
     assert_eq!(vm.saturation_flags(), 0);
 }
@@ -522,27 +397,31 @@ fn test_multi_rate_zoh_cases_abcd_os2x_bypass_retime_and_4x_pdc() {
     let (mut ol, mut or) = ([0.0_f32; 64], [0.0_f32; 64]);
 
     let rate_cases = [
-        (44_100.0_f32, CabinetHighSrMode::CaseB, true),
-        (48_000.0_f32, CabinetHighSrMode::Native48k, true),
-        (88_200.0_f32, CabinetHighSrMode::CaseD, true),
-        (96_000.0_f32, CabinetHighSrMode::CaseA { stride_q: 2 }, true),
-        (176_400.0_f32, CabinetHighSrMode::CaseD, true),
+        (44_100.0_f32, ConvolverHighSrMode::CaseB, true),
+        (48_000.0_f32, ConvolverHighSrMode::Native48k, true),
+        (88_200.0_f32, ConvolverHighSrMode::CaseD, true),
         (
-            192_000.0_f32,
-            CabinetHighSrMode::CaseA { stride_q: 4 },
+            96_000.0_f32,
+            ConvolverHighSrMode::CaseA { stride_q: 2 },
             true,
         ),
-        (220_500.0_f32, CabinetHighSrMode::CaseD, false),
+        (176_400.0_f32, ConvolverHighSrMode::CaseD, true),
+        (
+            192_000.0_f32,
+            ConvolverHighSrMode::CaseA { stride_q: 4 },
+            true,
+        ),
+        (220_500.0_f32, ConvolverHighSrMode::CaseD, false),
         (
             384_000.0_f32,
-            CabinetHighSrMode::CaseA { stride_q: 8 },
+            ConvolverHighSrMode::CaseA { stride_q: 8 },
             false,
         ),
     ];
     for (rate, exp_mode, exp_os2x) in rate_cases {
         let mut vm =
             SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&ultra, Tier::Ultra, rate).unwrap();
-        assert_eq!(vm.slab().cold().cabinet_fir_ext.mode(), exp_mode);
+        assert_eq!(vm.slab().cold().convolver_fir_ext.mode(), exp_mode);
         assert_eq!(vm.telemetry().os2x_active, exp_os2x);
         vm.process_block(&in_l, &in_r, &mut ol, &mut or).unwrap();
         assert_finite_non_silent(&ol, &or, &format!("open rate={rate}"));
@@ -553,8 +432,8 @@ fn test_multi_rate_zoh_cases_abcd_os2x_bypass_retime_and_4x_pdc() {
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&ultra, Tier::Ultra, 44_100.0).unwrap();
     vm_b44.set_offline_bounce(true).unwrap();
     assert_eq!(
-        vm_b44.slab().cold().cabinet_fir_ext.mode(),
-        CabinetHighSrMode::CaseC
+        vm_b44.slab().cold().convolver_fir_ext.mode(),
+        ConvolverHighSrMode::CaseC
     );
     assert!(!vm_b44.telemetry().os2x_active);
     assert_eq!(vm_b44.get_latency_samples(), OFFLINE_BOUNCE_PDC_SAMPLES);
@@ -568,7 +447,7 @@ fn test_multi_rate_zoh_cases_abcd_os2x_bypass_retime_and_4x_pdc() {
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&ultra, Tier::Ultra, 48_000.0).unwrap();
     for &(rate, exp_mode, exp_os2x) in &rate_cases {
         vm_live.retime_sample_rate(rate).unwrap();
-        assert_eq!(vm_live.slab().cold().cabinet_fir_ext.mode(), exp_mode);
+        assert_eq!(vm_live.slab().cold().convolver_fir_ext.mode(), exp_mode);
         assert_eq!(vm_live.telemetry().os2x_active, exp_os2x);
         vm_live
             .process_block(&in_l, &in_r, &mut ol, &mut or)
@@ -623,93 +502,70 @@ fn test_multi_rate_zoh_cases_abcd_os2x_bypass_retime_and_4x_pdc() {
 }
 
 #[test]
-fn test_4port_isolation_wdw_ms_width_saturation_and_no_alloc_vm() {
+fn test_saturation_telemetry_and_no_alloc_lite_parity() {
+    use dnam_vm::bin::{DNBN_FLAG_STEREO_OUT, DnamBinBuildInput, SONA_META_TRANSPORT_TAP_GAINS};
+    use dnam_vm::math::f32_to_fp16;
+    use sona_vm_pipeline_and_parity::helpers::{
+        encode_lite_fixture, make_core_quad, make_transport_quad,
+    };
+    use zerocopy::byteorder::little_endian::{F32, U16, U32};
+
     let ultra = build_full_pipeline_ultra_fixture();
     let (in_l, in_r) = stereo_test_signal(64, 7);
 
-    // 4-port Ret->Send isolation (wire had polluted Ret->Send weights).
-    let mut vm_no_ret =
+    let mut vm =
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&ultra, Tier::Ultra, 48_000.0).unwrap();
-    let mut vm_ret =
-        SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&ultra, Tier::Ultra, 48_000.0).unwrap();
-    assert_eq!(vm_no_ret.slab().cold().router.s_router[0][2..4], [0.0, 0.0]);
-    assert_eq!(vm_no_ret.slab().cold().router.s_router[1][2..4], [0.0, 0.0]);
-
-    vm_no_ret.configure_return_alignment(IoAlignmentMode::MinLatency4Tap, 2.5, 4.5);
-    vm_ret.configure_return_alignment(IoAlignmentMode::MinLatency4Tap, 2.5, 4.5);
-    let mut max_main_diff = 0.0_f32;
-    for i in 0..64 {
-        let (m0, s0) = vm_no_ret
-            .step_frame_4port([in_l[i], in_r[i]], [0.0, 0.0], false)
-            .unwrap();
-        let (m1, s1) = vm_ret
-            .step_frame_4port([in_l[i], in_r[i]], [0.95, -0.85], true)
-            .unwrap();
-        assert_eq!(s0[0].to_bits(), s1[0].to_bits());
-        assert_eq!(s0[1].to_bits(), s1[1].to_bits());
-        max_main_diff = max_main_diff
-            .max((m0[0] - m1[0]).abs())
-            .max((m0[1] - m1[1]).abs());
-    }
-    assert!(max_main_diff > 1.0e-3);
-
-    // WDW dry tap mode + M/S stereo width 0.0 -> L == R.
-    vm_no_ret.set_wdw_mode(WdwDryTapMode::DirectDry);
-    assert_eq!(
-        vm_no_ret.slab().cold().router.wdw_mode,
-        WdwDryTapMode::DirectDry
-    );
-    vm_no_ret.set_wdw_mode(WdwDryTapMode::PreSpatialCore);
-    assert_eq!(
-        vm_no_ret.slab().cold().router.wdw_mode,
-        WdwDryTapMode::PreSpatialCore
-    );
-    vm_no_ret.set_ms_width(0.0);
-    for i in 0..16 {
-        let (yl, yr) = vm_no_ret.step_frame(in_l[i], in_r[i]).unwrap();
-        assert_eq!(yl.to_bits(), yr.to_bits());
-    }
-    vm_no_ret.set_ms_width(1.0);
-    vm_no_ret.set_wdw_enabled(false);
-
-    // Saturation telemetry flags & clear_saturation_flags().
-    vm_no_ret.clear_saturation_flags();
-    assert_eq!(vm_no_ret.saturation_flags(), 0);
-    let _ = vm_no_ret.step_frame(f32::NAN, 0.1).unwrap();
+    vm.clear_saturation_flags();
+    assert_eq!(vm.saturation_flags(), 0);
+    let _ = vm.step_frame(f32::NAN, 0.1).unwrap();
     assert_ne!(
-        vm_no_ret.saturation_flags() & saturation_flags::INVALID_NONFINITE,
+        vm.saturation_flags() & saturation_flags::INVALID_NONFINITE,
         0
     );
-    vm_no_ret.clear_saturation_flags();
+    vm.clear_saturation_flags();
 
-    let _ = vm_no_ret.step_frame(200.0, -200.0).unwrap();
+    let _ = vm.step_frame(200.0, -200.0).unwrap();
     assert_ne!(
-        vm_no_ret.saturation_flags() & saturation_flags::OUTSIDE_CERTIFIED_INPUT,
+        vm.saturation_flags() & saturation_flags::OUTSIDE_CERTIFIED_INPUT,
         0
     );
-    vm_no_ret.clear_saturation_flags();
+    vm.clear_saturation_flags();
 
-    let _ = vm_no_ret.step_frame(2_000_000.0, 2_000_000.0).unwrap();
+    // Linear direct path (VCA weights 0) drives transport fp16 saturation and output ceiling clamp.
+    let mut a0_sat = DnamBinBuildInput::default_arena0_lite();
+    a0_sat.crossbar.sona_meta_flags = U32::new(SONA_META_TRANSPORT_TAP_GAINS);
+    a0_sat.crossbar.cell_desc.cell_flags = U32::new(SONA_META_TRANSPORT_TAP_GAINS);
+    a0_sat.core_quads[0] = make_core_quad(0);
+    a0_sat.conv_fir_lite.fir_l[0] = F32::new(1.0);
+    a0_sat.conv_fir_lite.fir_r[0] = F32::new(1.0);
+    a0_sat.linear_readout_lite.direct_s2_u_gain = [F32::new(2.0), F32::new(2.0)];
+    a0_sat.transport_lite = make_transport_quad(0);
+    a0_sat.control_bus_lite.tank_dry_mix_fp16 = U16::new(f32_to_fp16(1.0));
+    let sat_bin = encode_lite_fixture(&a0_sat, DNBN_FLAG_STEREO_OUT, 0.99, &[], None);
+    let mut vm_sat =
+        SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&sat_bin, Tier::Lite, 48_000.0).unwrap();
+
+    let _ = vm_sat.step_frame(2_000_000.0, 2_000_000.0).unwrap();
     assert_ne!(
-        vm_no_ret.saturation_flags() & saturation_flags::FP16_SATURATED,
+        vm_sat.saturation_flags() & saturation_flags::FP16_SATURATED,
         0
     );
     assert_eq!(
-        vm_no_ret.saturation_flags() & saturation_flags::INPUT_SATURATED,
+        vm_sat.saturation_flags() & saturation_flags::INPUT_SATURATED,
         0
     );
-    vm_no_ret.clear_saturation_flags();
+    vm_sat.clear_saturation_flags();
 
     for _ in 0..4 {
-        let (clamped_l, clamped_r) = vm_no_ret.step_frame(2.0e9, 2.0e9).unwrap();
+        let (clamped_l, clamped_r) = vm_sat.step_frame(2.0e9, 2.0e9).unwrap();
         assert!(clamped_l.abs() <= 1.0e9 && clamped_r.abs() <= 1.0e9);
     }
-    let flags = vm_no_ret.telemetry().saturation_flags;
+    let flags = vm_sat.telemetry().saturation_flags;
     assert_ne!(flags & saturation_flags::INPUT_SATURATED, 0);
     assert_ne!(flags & saturation_flags::OUTPUT_SATURATED, 0);
     assert_ne!(flags & saturation_flags::OUTSIDE_CERTIFIED_INPUT, 0);
-    vm_no_ret.clear_saturation_flags();
-    assert_eq!(vm_no_ret.saturation_flags(), 0);
+    vm_sat.clear_saturation_flags();
+    assert_eq!(vm_sat.saturation_flags(), 0);
 
     // !alloc stack-only Lite VM parity vs owned Lite VM.
     let lite_bytes = strip_dnam_bin_to_tier(&ultra, Tier::Lite).unwrap();

@@ -9,13 +9,13 @@ pub use super::const_eval::const_f32_pow2;
 use super::const_eval::{const_abs_f32, const_max_f32_bits_le_ratio};
 use super::{
     BIASED_INT_MAGIC_F32, EXP2_C2, EXP2_C3, EXP2_C4, EXP2_C5, IEEE754_F32_EXP_BIAS,
-    IEEE754_F32_MANTISSA_BITS, KernelVec4,
+    IEEE754_F32_MANTISSA_BITS, KernelVec4, f32_to_fp16, fp16_to_f32,
 };
 
 /// Bit pattern of `TANK_MAX_G_LIN_F32` (`<= 0.9990`, `0x3F7F_BE76`).
 pub const TANK_MAX_G_LIN_BITS: u32 = const_max_f32_bits_le_ratio(999, 1_000);
 
-/// Largest `binary32` spatial-tank loop gain `<= 0.9990` (`0x3F7F_BE76`).
+/// Largest `binary32` `Op-T` transport tank loop gain `<= 0.9990` (`0x3F7F_BE76`).
 pub const TANK_MAX_G_LIN_F32: f32 = f32::from_bits(TANK_MAX_G_LIN_BITS);
 
 /// Bit pattern of `TANK_MAX_V_CEIL_F32` (`<= 0.985`, `0x3F7C_28F5`).
@@ -23,6 +23,13 @@ pub const TANK_MAX_V_CEIL_BITS: u32 = const_max_f32_bits_le_ratio(985, 1_000);
 
 /// Largest `binary32` cubic feedback saturator ceiling `<= 0.985` (`0x3F7C_28F5`).
 pub const TANK_MAX_V_CEIL_F32: f32 = f32::from_bits(TANK_MAX_V_CEIL_BITS);
+
+/// Canonical half-precision unified `Op-T` loop saturator ceiling `63/64 = 0.984375` (`0x3BE0`,
+/// `op_t_transport.md §1.1.1`).
+pub const TANK_MAX_SIGMA_SAT_FP16: u16 = f32_to_fp16(63.0 / 64.0);
+
+/// Exact `binary32` representation (`0.984375_f32`) of [`TANK_MAX_SIGMA_SAT_FP16`].
+pub const TANK_MAX_SIGMA_SAT_F32: f32 = fp16_to_f32(TANK_MAX_SIGMA_SAT_FP16);
 
 /// Exact IEEE-754 `binary32` `2^-31` (`0x3000_0000`) for signed `Q0.32` triangle folding.
 pub const Q32_INV_2POW31_F32: f32 = const_f32_pow2(-31);
@@ -43,6 +50,9 @@ const _: () = assert!(TANK_MAX_G_LIN_BITS == 0x3F7F_BE76);
 const _: () = assert!(TANK_MAX_G_LIN_F32 <= 0.9990);
 const _: () = assert!(TANK_MAX_V_CEIL_BITS == 0x3F7C_28F5);
 const _: () = assert!(TANK_MAX_V_CEIL_F32 <= 0.985);
+const _: () = assert!(TANK_MAX_SIGMA_SAT_FP16 == 0x3BE0);
+const _: () = assert!(TANK_MAX_SIGMA_SAT_F32 == 0.984_375);
+const _: () = assert!(TANK_MAX_SIGMA_SAT_F32 < TANK_MAX_V_CEIL_F32);
 const _: () = assert!(Q32_INV_2POW31_F32.to_bits() == 0x3000_0000);
 const _: () = assert!(Q32_INV_2POW32_F32.to_bits() == 0x2F80_0000);
 const _: () = assert!(

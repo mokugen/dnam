@@ -4,44 +4,57 @@
 #![forbid(unsafe_code)]
 
 use dnam_kernels::{
-    QUAD_FLAG_HAS_EXT, compute_t1_dc_blocker_coeffs_clamped, halve_signed_q32_increments,
-    interpolate_hilbert_h1_alphas_f64,
+    QUAD_FLAG_HAS_EXT, compute_t1_dc_blocker_coeffs_clamped, interpolate_hilbert_h1_alphas_f64,
 };
 
-use crate::bin::arena_wire::TANK_FLAG_SCHROEDER_ENABLE;
-use crate::control::bus::laws::eval_phasor_eff_freq_hz;
+use crate::bin::{CONVOLVER_KAUTZ_BLOCKS_PER_TIER, TRANSPORT_FLAG_SCHROEDER_ENABLE};
+use crate::control::bus::laws::{
+    eval_op_t_freeze_mix_eff, eval_phasor_inc_core_q32, eval_phasor_inc_vm_q32,
+};
 use crate::graph::GraphBackend;
-use crate::graph::cabinet::high_sr::CabinetHighSrFirExt;
-use crate::graph::tank::{
-    QuadEffectiveTargets, QuadHydrateConfig, compute_quad_ext_requirements,
-    compute_schroeder_requirements,
+use crate::graph::convolver::high_sr::ConvolverHighSrFirExt;
+use crate::graph::convolver::kautz::MAX_KAUTZ_BANKS;
+use crate::graph::sensory::SensoryQuadCold;
+use crate::graph::transport::{
+    QuadEffectiveTargets, QuadHydrateConfig, TRANSPORT_MAX_QUADS, TransportModSlots,
+    compute_quad_ext_requirements, compute_schroeder_requirements, latch_quad_nonslew_targets,
 };
 use crate::graph::zoh::ZohRateContext;
 use crate::types::{Tier, VmError};
 
 use super::super::ctrl_latch::latch_immediate_at_init_or_reset;
 use super::super::layout::{
-    FLAG_COLD_FIR_EXT, FLAG_OS2X, FLAG_XFADE_ACTIVE, MAX_SONA_GROUPS, SonaHotSlab,
+    FLAG_COLD_FIR_EXT, FLAG_OS2X, FLAG_XFADE_ACTIVE, MAX_CORE_QUADS, SonaHotSlab,
     TIER_SWITCH_XFADE_SAMPLES,
 };
-use super::apply_tier::{apply_tier_weights_and_rescale, signed_phasor_inc_1x_with_inv};
+use super::apply_tier::apply_tier_weights_and_rescale;
+
+#[inline]
+const fn cum_kautz_banks(tier: Tier) -> usize {
+    let idx = tier.index();
+    let mut sum = 0_usize;
+    let mut i = 0_usize;
+    while i <= idx {
+        sum += CONVOLVER_KAUTZ_BLOCKS_PER_TIER[i];
+        i += 1;
+    }
+    sum
+}
 
 pub(super) fn setup_phasor_increments<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
     zoh: &ZohRateContext,
 ) {
     let inv_fs = zoh.inv_f_s_vm();
-    let mut inc_1x = [0_i32; 4];
-    for (i, dst) in inc_1x.iter_mut().enumerate() {
-        let f_eff = eval_phasor_eff_freq_hz(slab.cold().base_phasor_freq_hz[i], 0.0, zoh.f_s_vm);
-        *dst = signed_phasor_inc_1x_with_inv(f_eff, zoh.f_s_vm, inv_fs);
+    let fs_vm_f32 = zoh.f_s_vm as f32;
+    let os2x = zoh.os2x_active;
+    let base_freqs = slab.cold().base_phasor_freq_hz;
+    let mut inc_core = [0_u32; 4];
+    for (i, dst) in inc_core.iter_mut().enumerate() {
+        let inc_vm = eval_phasor_inc_vm_q32(base_freqs[i], 0.0, fs_vm_f32, inv_fs);
+        *dst = eval_phasor_inc_core_q32(inc_vm, os2x) as u32;
     }
-    let inc_core = if zoh.os2x_active {
-        halve_signed_q32_increments(inc_1x)
-    } else {
-        inc_1x
-    };
-    slab.lite.phasors.inc = inc_core.map(|v| v as u32);
+    slab.lite.phasors.inc = inc_core;
 }
 
 fn zero_inactive_tier_states<B: GraphBackend>(
@@ -49,16 +62,15 @@ fn zero_inactive_tier_states<B: GraphBackend>(
     from_tier: Tier,
     to_tier: Tier,
 ) {
-    let from_g = from_tier.simd_groups();
-    let to_g = to_tier.simd_groups();
-    if to_g > from_g {
-        for g in from_g..to_g {
-            *slab.state_mut(g) = dnam_kernels::SonaBlockStateStereo8::zero();
+    let from_q = from_tier.simd_groups();
+    let to_q = to_tier.simd_groups();
+    if to_q > from_q {
+        for q in from_q..to_q {
+            *slab.state_mut(q) = dnam_kernels::SonaBlockStateStereo8::zero();
         }
     }
-    let bank_counts = [2_usize, 3, 6, 8];
-    let from_b = bank_counts[from_tier.index()];
-    let to_b = bank_counts[to_tier.index()];
+    let from_b = cum_kautz_banks(from_tier);
+    let to_b = cum_kautz_banks(to_tier);
     if to_b > from_b {
         for b in from_b..to_b {
             slab.kautz_bank_mut(b).reset();
@@ -133,7 +145,7 @@ pub fn switch_tier<B: GraphBackend>(
             slab.cold().tier_fir_r[to_tier.index()],
         );
         let cold = slab.cold_mut();
-        cold.cabinet_fir_ext.prepare(
+        cold.convolver_fir_ext.prepare(
             &fl[..active_taps],
             &fr[..active_taps],
             zoh.f_s_vm,
@@ -157,28 +169,28 @@ fn retime_with_bounce<B: GraphBackend>(
     let ref_hz = slab.cold().zoh.reference_rate_hz;
     let zoh = ZohRateContext::compute(ref_hz, new_host_rate_hz, tier, tier_os2x, new_offline)?;
 
-    let req_fir_len = CabinetHighSrFirExt::required_f32_len(zoh.f_s_vm, new_offline);
-    if req_fir_len > slab.cold().cabinet_fir_ext.backing_f32_capacity() {
+    let req_fir_len = ConvolverHighSrFirExt::required_f32_len(zoh.f_s_vm, new_offline);
+    if req_fir_len > slab.cold().convolver_fir_ext.backing_f32_capacity() {
         return Err(VmError::InsufficientBackingCapacity);
     }
 
-    let wires = slab.cold().wire_tank_quads;
+    let wires = slab.cold().wire_transport_quads;
     let (decl_max, pow2, dc5) = (
         slab.cold().declared_max_delay_48k,
         slab.cold().ext_ring_pow2_frames,
         slab.cold().dc_blocker_pole_5hz,
     );
-    let active_q = slab.cold().retained_tier.index() + 1;
+    let retained_q = (slab.cold().retained_tier.index() + 1).min(TRANSPORT_MAX_QUADS);
     {
         let cold = slab.cold();
-        for (q, wire) in wires.iter().enumerate().take(active_q) {
+        for (q, wire) in wires.iter().enumerate().take(retained_q) {
             let (has_ext, cap) = compute_quad_ext_requirements(wire, q, zoh.rho_vm, decl_max, pow2);
-            if has_ext && cold.tank_ext[q].backing_frame_capacity() < cap {
+            if has_ext && cold.transport_ext[q].backing_frame_capacity() < cap {
                 return Err(VmError::InsufficientBackingCapacity);
             }
-            if (wire.flags & TANK_FLAG_SCHROEDER_ENABLE) != 0 {
+            if (wire.flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) != 0 {
                 let (_, _, _, sch_req) = compute_schroeder_requirements(wire, zoh.rho_vm);
-                if cold.tank_schroeder[q].backing_f32_capacity() < sch_req {
+                if cold.transport_schroeder[q].backing_f32_capacity() < sch_req {
                     return Err(VmError::InsufficientBackingCapacity);
                 }
             }
@@ -212,13 +224,13 @@ fn retime_with_bounce<B: GraphBackend>(
         let cb = slab.cold().wire_crossbar;
         let cold = slab.cold_mut();
         cold.zoh = zoh;
-        cold.router.reconfigure_sample_rate(&cb, &zoh);
+        cold.sensory_cold = SensoryQuadCold::from_crossbar_wire(&cb, zoh.rho_vm);
         if let Some(bus) = cold.ctrl_bus.as_mut() {
             bus.retime_sample_rate(zoh.f_s_vm as f32);
         }
         let active_taps = tier.early_fir_taps();
         let (fl, fr) = (cold.tier_fir_l[tier.index()], cold.tier_fir_r[tier.index()]);
-        cold.cabinet_fir_ext.prepare(
+        cold.convolver_fir_ext.prepare(
             &fl[..active_taps],
             &fr[..active_taps],
             zoh.f_s_vm,
@@ -229,7 +241,7 @@ fn retime_with_bounce<B: GraphBackend>(
     setup_phasor_increments(slab, &zoh);
     apply_tier_weights_and_rescale(slab, tier, &zoh)?;
 
-    for (q, wire) in wires.iter().enumerate().take(active_q) {
+    for (q, wire) in wires.iter().enumerate().take(retained_q) {
         let cfg = QuadHydrateConfig {
             quad_idx: q,
             fs_vm: zoh.f_s_vm,
@@ -238,9 +250,9 @@ fn retime_with_bounce<B: GraphBackend>(
             ext_ring_pow2_frames: pow2,
             dc_blocker_pole_5hz: dc5,
         };
-        let mut q_hot = *slab.quad_hot(q);
+        let mut q_hot = *slab.transport_quad_hot(q);
         let inline_opt = if q == 0 {
-            Some(&mut slab.lite.tank0_ring)
+            Some(&mut slab.lite.transport0_ring)
         } else {
             None
         };
@@ -249,25 +261,25 @@ fn retime_with_bounce<B: GraphBackend>(
             let meta_q = q_hot.reconfigure_sample_rate(
                 wire,
                 &cfg,
-                Some(&mut cold.tank_ext[q]),
+                Some(&mut cold.transport_ext[q]),
                 inline_opt,
-                Some(&mut cold.tank_schroeder[q]),
+                Some(&mut cold.transport_schroeder[q]),
             )?;
             if (q_hot.flags & QUAD_FLAG_HAS_EXT) != 0 {
-                cold.tank_ext[q].reconfigure_cap(meta_q.cap)?;
+                cold.transport_ext[q].reconfigure_cap(meta_q.cap)?;
             }
-            cold.tank_quad_meta[q] = meta_q;
-            cold.tank_quad_eff[q] = QuadEffectiveTargets::from_quad_and_meta(&q_hot, &meta_q);
+            cold.transport_quad_meta[q] = meta_q;
+            cold.transport_quad_eff[q] = QuadEffectiveTargets::from_quad_and_meta(&q_hot, &meta_q);
         }
-        *slab.quad_hot_mut(q) = q_hot;
+        *slab.transport_quad_hot_mut(q) = q_hot;
     }
 
     latch_immediate_at_init_or_reset(slab);
     Ok(())
 }
 
-/// Re-times all ZOH poles, Hilbert H1 sections (`remap_section_states_from_outputs`), `T1` DC
-/// blockers, Cabinet FIR, Kautz, Tank, Router, and `ControlBus` upon a host rate change.
+/// Re-times all ZOH poles, `SensoryQuad`, Hilbert H1 sections (`remap_section_states_from_outputs`),
+/// `T1` DC blockers, `ModalConvolver` FIR/Kautz, `Transport`, and `ControlBus` upon a host rate change.
 pub fn retime_sample_rate<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
     new_host_rate_hz: f32,
@@ -289,12 +301,12 @@ pub fn set_offline_bounce<B: GraphBackend>(
 }
 
 /// Restores deterministic resting zero-DC equilibrium while strictly preserving bit 2
-/// (`QUAD_FLAG_HOST_WRITE_LOCK`) across all spatial tank quads.
+/// (`QUAD_FLAG_HOST_WRITE_LOCK`) across all `TransportQuad`s.
 pub fn reset_to_dc_equilibrium<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>) {
-    for g in 0..MAX_SONA_GROUPS {
-        *slab.state_mut(g) = dnam_kernels::SonaBlockStateStereo8::zero();
+    for q in 0..MAX_CORE_QUADS {
+        *slab.state_mut(q) = dnam_kernels::SonaBlockStateStereo8::zero();
     }
-    for b in 0..8 {
+    for b in 0..MAX_KAUTZ_BANKS {
         slab.kautz_bank_mut(b).reset();
     }
     slab.lite.fir_hist_l.fill(0.0);
@@ -306,6 +318,7 @@ pub fn reset_to_dc_equilibrium<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>) {
     slab.ultra_delta.fir_hist_l_ultra.fill(0.0);
     slab.ultra_delta.fir_hist_r_ultra.fill(0.0);
     slab.os2x_hot.reset();
+    slab.lite.sensory_quad.reset();
     slab.lite.hilbert.reset();
     slab.lite.t1.reset();
     slab.lite.t1_dc.reset();
@@ -315,27 +328,25 @@ pub fn reset_to_dc_equilibrium<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>) {
     slab.lite.sample_tick = 0;
     slab.lite.phasors.phase = slab.cold().base_phasor_init_phase_q32;
     slab.set_flag(FLAG_XFADE_ACTIVE, false);
-    slab.lite.tank0_ring.fill([0; 4]);
+    slab.lite.transport0_ring.fill([0; 4]);
 
-    let active_q = slab.cold().retained_tier.index() + 1;
-    for q in 0..active_q {
-        let mut q_hot = *slab.quad_hot(q);
+    let retained_q = (slab.cold().retained_tier.index() + 1).min(TRANSPORT_MAX_QUADS);
+    for q in 0..retained_q {
+        let mut q_hot = *slab.transport_quad_hot(q);
         {
             let cold = slab.cold_mut();
             q_hot.reset(
-                Some(&mut cold.tank_ext[q]),
+                Some(&mut cold.transport_ext[q]),
                 None,
-                Some(&mut cold.tank_schroeder[q]),
+                Some(&mut cold.transport_schroeder[q]),
             );
         }
-        *slab.quad_hot_mut(q) = q_hot;
+        *slab.transport_quad_hot_mut(q) = q_hot;
     }
 
-    let (mut gate_env, mut gate_gain) = (0.0_f32, 1.0_f32);
     {
         let cold = slab.cold_mut();
-        cold.router.reset(&mut gate_env, &mut gate_gain);
-        cold.cabinet_fir_ext.reset();
+        cold.convolver_fir_ext.reset();
         cold.kautz_slew.reset_slew();
         cold.bounce4x.reset();
         cold.rem_hist.reset();
@@ -350,33 +361,63 @@ pub fn reset_to_dc_equilibrium<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>) {
             bus.reset();
         }
     }
-    slab.lite.gate_env = gate_env;
-    slab.lite.gate_gain = gate_gain;
     latch_immediate_at_init_or_reset(slab);
 }
 
-/// Sets or clears bit 2 (`QUAD_FLAG_HOST_WRITE_LOCK`) across all active tank quads without
-/// touching bit 0 (`QUAD_FLAG_WE_HOLD_ACTIVE`).
+/// Sets or clears bit 2 (`QUAD_FLAG_HOST_WRITE_LOCK`) across retained transport quads and
+/// immediately re-latches active `QuadEffectiveTargets` and `PartitionedSchroederBank` gains
+/// (`0-ULP` write lock / continuous freeze-hold coordination without control-boundary race).
 pub fn set_op_t_write_enable<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>, locked: bool) {
-    let retained_q =
-        (slab.cold().retained_tier.index() + 1).min(crate::graph::tank::TANK_MAX_QUADS);
+    let slots = TransportModSlots::from_targets_32(&slab.cold().latched_stage_params);
+    let active_q = slab.cold().active_transport_quads.min(TRANSPORT_MAX_QUADS);
+    let retained_q = (slab.cold().retained_tier.index() + 1).min(TRANSPORT_MAX_QUADS);
     for q in 0..retained_q {
-        let mut q_hot = *slab.quad_hot(q);
+        let mut q_hot = *slab.transport_quad_hot(q);
         {
             let cold = slab.cold_mut();
-            q_hot.set_host_write_lock(locked, Some(&mut cold.tank_ext[q]));
+            let meta = &cold.transport_quad_meta[q];
+            let mu_freeze_eff =
+                eval_op_t_freeze_mix_eff(meta.base_freeze_mix, slots.op_t_freeze_mix_delta, locked);
+            q_hot.set_host_write_lock(locked, cold.transport_ext.get_mut(q), mu_freeze_eff);
+            if q < active_q {
+                let eff = &mut cold.transport_quad_eff[q];
+                latch_quad_nonslew_targets(
+                    &mut q_hot,
+                    meta,
+                    &slots,
+                    cold.transport_ext.get_mut(q),
+                    cold.transport_schroeder.get_mut(q),
+                    eff,
+                );
+            }
         }
-        *slab.quad_hot_mut(q) = q_hot;
+        *slab.transport_quad_hot_mut(q) = q_hot;
     }
+}
+
+/// Alias matching `SonaVm::set_quad_write_enable`, updating `QUAD_FLAG_HOST_WRITE_LOCK` and
+/// immediately re-latching active transport targets.
+#[inline]
+pub fn set_quad_write_enable<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>, locked: bool) {
+    set_op_t_write_enable(slab, locked);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dnam_kernels::QUAD_FLAG_HOST_WRITE_LOCK;
 
     #[test]
-    fn test_lifecycle_constants_and_xfade_budget() {
+    fn test_lifecycle_constants_and_kautz_cum_banks() {
         assert_eq!(TIER_SWITCH_XFADE_SAMPLES, 48);
-        assert_eq!(MAX_SONA_GROUPS, 10);
+        assert_eq!(MAX_CORE_QUADS, 10);
+        assert_eq!(cum_kautz_banks(Tier::Lite), 2);
+        assert_eq!(cum_kautz_banks(Tier::Full), 3);
+        assert_eq!(cum_kautz_banks(Tier::Pro), 6);
+        assert_eq!(cum_kautz_banks(Tier::Ultra), 8);
+        assert_eq!(
+            QUAD_FLAG_HAS_EXT | QUAD_FLAG_HOST_WRITE_LOCK,
+            (1 << 1) | (1 << 2)
+        );
     }
 }

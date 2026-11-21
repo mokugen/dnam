@@ -10,16 +10,16 @@ use std::hint::black_box;
 use std::time::Instant;
 
 use dnam_vm::bin::{
-    PIPE_CANONICAL_V3_SONA, SONA_META_CORE_MODS_PRESENT, SONA_META_OS_EXT_PRESENT,
-    SONA_META_ROUTER_EXT, SONA_META_TANK_LFO, SONA_META_TANK_TAP_GAINS, TANK_FLAG_EXT_F32,
-    TANK_FLAG_SCHROEDER_ENABLE,
+    DNBN_FLAG_STEREO_OUT, PIPE_CANONICAL_V3_SONA, SONA_META_CORE_MODS_PRESENT,
+    SONA_META_OS_EXT_PRESENT, SONA_META_SENSORY_QUAD, SONA_META_TRANSPORT_LFO,
+    SONA_META_TRANSPORT_TAP_GAINS, TRANSPORT_FLAG_EXT_F32, TRANSPORT_FLAG_SCHROEDER_ENABLE,
 };
 use dnam_vm::math::{TANK_DC_BLOCKER_48K_F32, f32_to_fp16};
 use dnam_vm::{
     Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, CextDispatchWire,
-    ControlClampDescriptor, DefaultMathBackend, DnamBinBuildInput, DnamBinView, DynamicSonaVm,
-    FtzDazGuard, KautzSoaBlockWire, OpNPreBaseWire, SonaCrossbarBlockWire, SonaGroupWire,
-    SonaHotSlab, SonaInterBlockTilePairWire, TankQuadWire, Tier, encode_dnam_bin,
+    ControlClampDescriptor, CoreQuadWire, DefaultMathBackend, DnamBinBuildInput, DnamBinView,
+    DynamicSonaVm, FtzDazGuard, KautzSoaBlockWire, OpNPreBaseWire, SonaCrossbarBlockWire,
+    SonaHotSlab, SonaInterBlockTilePairWire, Tier, TransportQuadWire, encode_dnam_bin,
 };
 use zerocopy::byteorder::little_endian::{F32, U16, U32};
 use zerocopy::{FromZeros, IntoBytes};
@@ -36,18 +36,17 @@ fn fp16_val(v: f32) -> U16 {
     U16::new(f32_to_fp16(v))
 }
 
-fn make_group(g: usize) -> SonaGroupWire {
-    let s = 1.0 + 0.05 * (g as f32);
-    let rs = if (g & 1) == 0 { 1.0_f32 } else { -1.0_f32 };
-    SonaGroupWire {
+fn make_core_quad(q: usize) -> CoreQuadWire {
+    let s = 1.0 + 0.05 * (q as f32);
+    let rs = if (q & 1) == 0 { 1.0_f32 } else { -1.0_f32 };
+    CoreQuadWire {
         svf_g: le_f32([0.14 * s, 0.28 * s, 0.45 * s, 0.70 * s]),
-        svf_k: le_f32([0.70, 0.75, 0.80, 0.85]),
         lru_alpha_rel: le_f32([0.85, 0.87, 0.89, 0.91]),
         lru_alpha_atk: le_f32([0.20, 0.24, 0.28, 0.32]),
-        lru_kappa: le_f32([0.35, 0.40, 0.45, 0.50]),
-        adaa_drive: le_f32([0.30, 0.34, 0.28, 0.32]),
-        lru_bias_drive: le_f32([0.04 * rs, -0.03 * rs, 0.05 * rs, -0.02 * rs]),
-        in_x_weight: le_f32([0.22, -0.18, 0.24, -0.16]),
+        svf_k_fp16: fp16_arr([0.70, 0.75, 0.80, 0.85]),
+        lru_kappa_fp16: fp16_arr([0.35, 0.40, 0.45, 0.50]),
+        adaa_drive_fp16: fp16_arr([0.30, 0.34, 0.28, 0.32]),
+        lru_bias_drive_fp16: fp16_arr([0.04 * rs, -0.03 * rs, 0.05 * rs, -0.02 * rs]),
         tone_lp_fp16: fp16_arr([0.35, 0.30, 0.25, 0.20]),
         tone_bp_fp16: fp16_arr([0.20, 0.25, 0.20, 0.15]),
         tone_hp_fp16: fp16_arr([0.15, 0.15, 0.20, 0.25]),
@@ -56,6 +55,12 @@ fn make_group(g: usize) -> SonaGroupWire {
         sag_depth_fp16: fp16_arr([0.05; 4]),
         wavefolder_mix_fp16: fp16_arr([0.04; 4]),
         rect_sign_fp16: fp16_arr([rs, -rs, rs, -rs]),
+        in_mid_weight_fp16: fp16_arr([0.22, -0.18, 0.24, -0.16]),
+        in_side_weight_fp16: fp16_arr([0.06, -0.05, 0.05, -0.04]),
+        lru_stereo_link_fp16: fp16_arr([0.15; 4]),
+        lru_duhem_gamma_fp16: fp16_arr([0.50; 4]),
+        lru_signed_mix_fp16: fp16_arr([0.60; 4]),
+        glu_mix_fp16: fp16_arr([0.10, -0.08, 0.08, -0.06]),
     }
 }
 
@@ -72,10 +77,10 @@ fn make_tile(t: usize) -> SonaInterBlockTilePairWire {
 
 fn make_crossbar() -> SonaCrossbarBlockWire {
     let mut blk = SonaCrossbarBlockWire::new_zeroed();
-    for g in 0..10 {
+    for q in 0..10 {
         for l in 0..4 {
-            blk.op_p_to_group_fp16[g][l] = fp16_val(0.05);
-            blk.phasor_to_group_fp16[g][l] = fp16_val(-0.04);
+            blk.op_p_to_core_fp16[q][l] = fp16_val(0.05);
+            blk.phasor_to_core_fp16[q][l] = fp16_val(-0.04);
         }
     }
     for i in 0..16 {
@@ -98,9 +103,9 @@ fn make_kautz() -> KautzSoaBlockWire {
     }
 }
 
-fn make_quad(q: usize) -> TankQuadWire {
+fn make_quad(q: usize) -> TransportQuadWire {
     let base = 17.0 + 24.0 * (q as f32);
-    TankQuadWire {
+    TransportQuadWire {
         delay_samples: le_f32([base, base + 6.0, base + 12.0, base + 18.0]),
         ramp_spans_samples: le_f32([4.0, 5.0, 6.0, 7.0]),
         g_loop: F32::new(0.42),
@@ -108,7 +113,7 @@ fn make_quad(q: usize) -> TankQuadWire {
         damp_pole: F32::new(0.25),
         lfo_rate_hz: F32::new(1.5 + 0.3 * (q as f32)),
         ramp_rate_hz: F32::new(0.8),
-        vca_pole: F32::new(0.95),
+        reserved_52_56: F32::new(0.0),
         lfo_depths_fp16: fp16_arr([0.4; 4]),
         lfo_phase_off_q16: [
             U16::new(0),
@@ -131,21 +136,21 @@ fn make_quad(q: usize) -> TankQuadWire {
             fp16_arr([0.0; 4])
         },
         fb_psi_fp16: fp16_val(0.22),
-        sigma_knee_fp16: fp16_val(1.5),
-        dry_mix_fp16: fp16_val(0.25),
+        sigma_knee_fp16: fp16_val(0.85),
+        freeze_mix_fp16: fp16_val(0.10),
         window_depth_fp16: fp16_val(0.45),
-        vca_sens_fp16: fp16_val(0.15),
+        reserved_120_122: U16::new(0),
         allpass_delays: if q == 0 { [11, 17, 23, 31] } else { [0; 4] },
         flags: if q == 0 {
-            TANK_FLAG_SCHROEDER_ENABLE
+            TRANSPORT_FLAG_SCHROEDER_ENABLE
         } else {
-            TANK_FLAG_EXT_F32
+            TRANSPORT_FLAG_EXT_F32
         },
         reserved: 0,
     }
 }
 
-fn fill_ro(words: &mut [U16], lanes: usize) {
+fn fill_ro(words: &mut [U16], lanes: usize, write_tail_gains: bool) {
     let wc = lanes * 12;
     for l in 0..lanes {
         let b = l * 12;
@@ -158,20 +163,32 @@ fn fill_ro(words: &mut [U16], lanes: usize) {
         words[b + 10] = fp16_val(0.03);
         words[b + 11] = fp16_val(0.025);
     }
-    for i in 0..8 {
-        words[wc + i] = fp16_val(if i == 4 || i == 5 { 0.5 } else { 0.1 });
+    if write_tail_gains {
+        for i in 0..8 {
+            words[wc + i] = fp16_val(if i == 4 || i == 5 { 0.5 } else { 0.1 });
+        }
     }
 }
 
 fn build_bench_ultra_fixture() -> Vec<u8> {
     let mut a0 = DnamBinBuildInput::default_arena0_lite();
-    let meta = SONA_META_ROUTER_EXT
+    let meta = SONA_META_SENSORY_QUAD
         | SONA_META_OS_EXT_PRESENT
-        | SONA_META_TANK_TAP_GAINS
-        | SONA_META_TANK_LFO
+        | SONA_META_TRANSPORT_TAP_GAINS
+        | SONA_META_TRANSPORT_LFO
         | SONA_META_CORE_MODS_PRESENT;
     a0.crossbar.pipeline_flags = U32::new(PIPE_CANONICAL_V3_SONA);
     a0.crossbar.sona_meta_flags = U32::new(meta);
+    a0.crossbar.sense_svf_g = le_f32([0.08, 0.18, 0.35, 0.62]);
+    a0.crossbar.sense_lru_alpha_rel = le_f32([0.92, 0.94, 0.96, 0.97]);
+    a0.crossbar.sense_lru_alpha_atk = le_f32([0.20, 0.25, 0.30, 0.35]);
+    a0.crossbar.sense_in_l_fp16 = fp16_arr([0.5; 4]);
+    a0.crossbar.sense_in_r_fp16 = fp16_arr([0.5; 4]);
+    a0.crossbar.sense_tone_lp_fp16 = fp16_arr([0.6; 4]);
+    a0.crossbar.sense_tone_bp_fp16 = fp16_arr([0.3; 4]);
+    a0.crossbar.sense_tone_hp_fp16 = fp16_arr([0.2; 4]);
+    a0.crossbar.sense_vca_w_fp16 = fp16_arr([-0.10; 4]);
+    a0.crossbar.crossbar_op_gains_fp16 = fp16_arr([0.12, 0.08]);
     a0.crossbar.cell_desc.tier_flags = U16::new(0x000F);
     a0.crossbar.cell_desc.oversample_factor = U16::new(2);
     a0.crossbar.cell_desc.cell_flags = U32::new(meta);
@@ -182,17 +199,17 @@ fn build_bench_ultra_fixture() -> Vec<u8> {
         beta_q: F32::new(0.08),
     };
     a0.crossbar.phasor_freq_hz = le_f32([1.5, 3.0, 5.0, 7.0]);
-    a0.crossbar.gate_and_crossbar_fp16 =
-        fp16_arr([0.002, 0.0005, 500.0, 0.95, 0.1, 0.02, 0.15, 0.1]);
-    a0.groups = core::array::from_fn(make_group);
+    a0.core_quads = core::array::from_fn(make_core_quad);
     a0.tiles = core::array::from_fn(make_tile);
-    a0.cabinet_fir_lite.fir_l[0] = F32::new(0.5);
-    a0.cabinet_fir_lite.fir_r[0] = F32::new(0.5);
-    a0.cabinet_kautz_lite = [make_kautz(), make_kautz()];
-    a0.spatial_tank_lite = make_quad(0);
-    a0.varpro_readout_lite.direct_s2_u_gain = le_f32([0.5, 0.5]);
-    fill_ro(&mut a0.varpro_readout_lite.w_ro_fp16[..208], 16);
+    a0.conv_fir_lite.fir_l[0] = F32::new(0.5);
+    a0.conv_fir_lite.fir_r[0] = F32::new(0.5);
+    a0.conv_kautz_lite = [make_kautz(), make_kautz()];
+    a0.transport_lite = make_quad(0);
+    a0.linear_readout_lite.pre_conv_u_gain = le_f32([0.1, 0.1]);
+    a0.linear_readout_lite.direct_s2_u_gain = le_f32([0.5, 0.5]);
+    fill_ro(&mut a0.linear_readout_lite.w_ro_fp16[..192], 16, false);
     a0.control_bus_lite.lfo_dphi_train = le_f32([0.004, 0.008]);
+    a0.control_bus_lite.tank_dry_mix_fp16 = fp16_val(0.5);
     a0.control_bus_lite.cp1_dir.cp1_dir_count = U16::new(2);
     a0.control_bus_lite.cp1_dir.entries[0] = [0, 1, 0xFF];
     a0.control_bus_lite.cp1_dir.entries[1] = [1, 1, 0xFF];
@@ -215,23 +232,23 @@ fn build_bench_ultra_fixture() -> Vec<u8> {
     }
 
     let mut a1 = Arena1FullDeltaWire::new_zeroed();
-    a1.groups = [make_group(4), make_group(5)];
+    a1.core_quads = [make_core_quad(4), make_core_quad(5)];
     a1.tiles = core::array::from_fn(|t| make_tile(3 + t));
     a1.crossbar_full = make_crossbar();
-    a1.cabinet_kautz_full = make_kautz();
-    a1.spatial_tank_full = make_quad(1);
-    fill_ro(&mut a1.varpro_readout_full.w_ro_and_mods_fp16, 24);
+    a1.conv_kautz_full = make_kautz();
+    a1.transport_full = make_quad(1);
+    fill_ro(&mut a1.linear_readout_full.w_ro_and_mods_fp16, 24, true);
 
     let mut a2 = Arena2ProDeltaWire::new_zeroed();
-    a2.groups = [make_group(6), make_group(7)];
+    a2.core_quads = [make_core_quad(6), make_core_quad(7)];
     a2.tiles = core::array::from_fn(|t| make_tile(13 + t));
     a2.crossbar_pro = make_crossbar();
-    a2.cabinet_kautz_pro = [make_kautz(), make_kautz(), make_kautz()];
-    a2.spatial_tank_pro[0] = make_quad(2);
-    fill_ro(&mut a2.varpro_readout_pro.w_ro_and_mods_fp16, 32);
+    a2.conv_kautz_pro = [make_kautz(), make_kautz(), make_kautz()];
+    a2.transport_pro[0] = make_quad(2);
+    fill_ro(&mut a2.linear_readout_pro.w_ro_and_mods_fp16, 32, true);
 
     let mut a3 = Arena3UltraDeltaWire::new_zeroed();
-    a3.groups = [make_group(8), make_group(9)];
+    a3.core_quads = [make_core_quad(8), make_core_quad(9)];
     a3.tiles = core::array::from_fn(|t| make_tile(23 + t));
     a3.crossbar_ultra = make_crossbar();
     for k in 0..8 {
@@ -239,9 +256,9 @@ fn build_bench_ultra_fixture() -> Vec<u8> {
             a3.stage_latent_core_mods_fp16[k * 128 + col] = fp16_val(0.01);
         }
     }
-    a3.cabinet_kautz_ultra = [make_kautz(), make_kautz()];
-    a3.spatial_tank_ultra[0] = make_quad(3);
-    fill_ro(&mut a3.varpro_readout_ultra.w_ro_and_mods_fp16, 40);
+    a3.conv_kautz_ultra = [make_kautz(), make_kautz()];
+    a3.transport_ultra[0] = make_quad(3);
+    fill_ro(&mut a3.linear_readout_ultra.w_ro_and_mods_fp16, 40, true);
 
     for r in 0..16 {
         for c in 0..4 {
@@ -285,14 +302,14 @@ fn build_bench_ultra_fixture() -> Vec<u8> {
 
     encode_dnam_bin(&DnamBinBuildInput {
         reference_sample_rate_hz: 48_000,
-        header_flags: 0,
+        header_flags: DNBN_FLAG_STEREO_OUT,
         ext_ring_pow2_frames: 10,
         ext_ring_lines: 4,
         ext_ring_format: 1,
         declared_max_delay_48k: 200,
         dc_blocker_pole_5hz: TANK_DC_BLOCKER_48K_F32,
         tail_time_ms: 1_000.0,
-        r_ac_default: 0.995,
+        ro_pole_48k: 0.995,
         switch_xfade_samples: 64,
         content_hash_prefix: [1, 2, 3, 4, 5, 6, 7, 8],
         controls: &[c0, c1],
@@ -411,7 +428,7 @@ fn main() {
             SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Pro, true),
             SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Ultra, true),
         ],
-        [4_544, 7_552, 11_200, 14_656]
+        [4_544, 7_552, 11_136, 14_592]
     );
 
     let ultra_bytes = build_bench_ultra_fixture();
@@ -428,7 +445,7 @@ fn main() {
         "=========================================================================================="
     );
     println!(
-        " dnam-vm Real-Time WCET @ 48 kHz (Hot Bytes: Lite=4544, Full=7552, Pro=11200, Ultra=14656)"
+        " dnam-vm Real-Time WCET @ 48 kHz (Hot Bytes: Lite=4544, Full=7552, Pro=11136, Ultra=14592)"
     );
     println!(
         "=========================================================================================="

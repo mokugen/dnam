@@ -1,16 +1,15 @@
-//! Runtime control, `3 kHz` cadence, lifecycle, router, and telemetry methods on [`DynamicSonaVm`]
+//! Runtime control, `3 kHz` cadence, lifecycle, and telemetry methods on [`DynamicSonaVm`]
 //! (`#![forbid(unsafe_code)]`, `#[inline(never)]` RT audit roots).
 
 #![forbid(unsafe_code)]
 
-use crate::graph::{IoAlignmentMode, WdwDryTapMode};
 use crate::types::{Tier, VmError};
 
 use super::super::SonaTelemetrySnapshot;
 use super::DynamicSonaVm;
 
 impl DynamicSonaVm {
-    /// Executes one `3 kHz` boundary control tick (`Kautz`, `Tank`, `WE` Schmitt, and hoisting).
+    /// Executes one `3 kHz` boundary control tick (`Kautz`, `Transport`, and core hoisting).
     #[inline(never)]
     pub fn step_control_tick_3khz(&mut self) {
         match self {
@@ -98,7 +97,7 @@ impl DynamicSonaVm {
         }
     }
 
-    /// Sets or clears bit 2 (`QUAD_FLAG_HOST_WRITE_LOCK`) across retained tank quads.
+    /// Sets or clears bit 2 (`QUAD_FLAG_HOST_WRITE_LOCK`) across retained transport quads.
     #[inline(never)]
     pub fn set_quad_write_enable(&mut self, locked: bool) {
         self.set_op_t_write_enable(locked);
@@ -189,99 +188,6 @@ impl DynamicSonaVm {
             Self::X86Avx2Fma(vm) => vm.set_offline_bounce(offline),
             #[cfg(target_arch = "wasm32")]
             Self::WasmSimd128(vm) => vm.set_offline_bounce(offline),
-        }
-    }
-
-    /// Updates post-VM Mid/Side stereo width in `[0.0, 2.0]` (non-finite inputs record telemetry).
-    #[inline(never)]
-    pub fn set_ms_width(&mut self, width: f32) {
-        match self {
-            Self::Scalar(vm) => vm.set_ms_width(width),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmNeon(vm) => vm.set_ms_width(width),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmSve2(vm) => vm.set_ms_width(width),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmSme(vm) => vm.set_ms_width(width),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Sse2(vm) => vm.set_ms_width(width),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Sse42(vm) => vm.set_ms_width(width),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Avx2Fma(vm) => vm.set_ms_width(width),
-            #[cfg(target_arch = "wasm32")]
-            Self::WasmSimd128(vm) => vm.set_ms_width(width),
-        }
-    }
-
-    /// Configures 4-port FX return alignment filter (`IoAlignmentMode`, L/R delays).
-    #[inline(never)]
-    pub fn configure_return_alignment(
-        &mut self,
-        mode: IoAlignmentMode,
-        delay_l: f64,
-        delay_r: f64,
-    ) {
-        match self {
-            Self::Scalar(vm) => vm.configure_return_alignment(mode, delay_l, delay_r),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmNeon(vm) => vm.configure_return_alignment(mode, delay_l, delay_r),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmSve2(vm) => vm.configure_return_alignment(mode, delay_l, delay_r),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmSme(vm) => vm.configure_return_alignment(mode, delay_l, delay_r),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Sse2(vm) => vm.configure_return_alignment(mode, delay_l, delay_r),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Sse42(vm) => vm.configure_return_alignment(mode, delay_l, delay_r),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Avx2Fma(vm) => vm.configure_return_alignment(mode, delay_l, delay_r),
-            #[cfg(target_arch = "wasm32")]
-            Self::WasmSimd128(vm) => vm.configure_return_alignment(mode, delay_l, delay_r),
-        }
-    }
-
-    /// Selects the `WDW` center dry tap point and enables `WDW` 4-port output routing.
-    #[inline(never)]
-    pub fn set_wdw_mode(&mut self, mode: WdwDryTapMode) {
-        match self {
-            Self::Scalar(vm) => vm.set_wdw_mode(mode),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmNeon(vm) => vm.set_wdw_mode(mode),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmSve2(vm) => vm.set_wdw_mode(mode),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmSme(vm) => vm.set_wdw_mode(mode),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Sse2(vm) => vm.set_wdw_mode(mode),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Sse42(vm) => vm.set_wdw_mode(mode),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Avx2Fma(vm) => vm.set_wdw_mode(mode),
-            #[cfg(target_arch = "wasm32")]
-            Self::WasmSimd128(vm) => vm.set_wdw_mode(mode),
-        }
-    }
-
-    /// Enables or disables `WDW` 4-port center-dry / wet-only routing (`Port Out 1..3`).
-    #[inline(never)]
-    pub fn set_wdw_enabled(&mut self, enabled: bool) {
-        match self {
-            Self::Scalar(vm) => vm.set_wdw_enabled(enabled),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmNeon(vm) => vm.set_wdw_enabled(enabled),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmSve2(vm) => vm.set_wdw_enabled(enabled),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmSme(vm) => vm.set_wdw_enabled(enabled),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Sse2(vm) => vm.set_wdw_enabled(enabled),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Sse42(vm) => vm.set_wdw_enabled(enabled),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Avx2Fma(vm) => vm.set_wdw_enabled(enabled),
-            #[cfg(target_arch = "wasm32")]
-            Self::WasmSimd128(vm) => vm.set_wdw_enabled(enabled),
         }
     }
 

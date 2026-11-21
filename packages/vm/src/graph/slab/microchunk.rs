@@ -1,34 +1,34 @@
-//! Causal `4`-frame micro-chunking, `1`-frame peel, `2`-port / `4`-port / `4x` bounce frame
+//! Causal `4`-frame micro-chunking, `1`-frame peel, `2x2` pure stereo / `4x` bounce frame
 //! stepping, and `0-ULP` chunk-split invariant SONA block execution (`#![no_std]`, `#![forbid(unsafe_code)]`).
 
 #![forbid(unsafe_code)]
 
 pub mod core_step;
 
+use dnam_kernels::scrub_and_flush_f32_bits;
+
 use crate::graph::GraphBackend;
-use crate::graph::cabinet::kautz::KautzStereoBank4;
-use crate::graph::router::{eval_wdw_routing_outputs, voltage_ms_encode};
-use crate::graph::tank::{TANK_MAX_QUADS, resolve_quad_ring};
+use crate::graph::convolver::kautz::KautzStereoBank4;
+use crate::graph::transport::{QuadTopRead, TRANSPORT_MAX_QUADS, resolve_quad_ring};
 use crate::math::{
-    CERTIFIED_INPUT_ENVELOPE_MIN_F32, const_abs_f32, flush_recursive_state_f32, fp16_to_f32,
+    CERTIFIED_INPUT_ENVELOPE_MIN_F32, flush_recursive_state_f32, fp16_to_f32,
     sanitize_input_sample, sanitize_output_sample, saturation_flags,
 };
 use crate::types::{Tier, VmError};
 
-use super::ctrl_latch::{hoist_groups_and_readouts, step_control_tick_3khz};
+use super::ctrl_latch::{hoist_core_quads_and_readouts, step_control_tick_3khz};
 use super::layout::{FLAG_XFADE_ACTIVE, SonaHotSlab, TIER_SWITCH_XFADE_SAMPLES};
 use core_step::{step_core_subsample, step_op_p_1x};
 
-pub use core_step::evaluate_matryoshka_groups;
+pub use core_step::evaluate_matryoshka_core_quads;
 
 const INV_XFADE_LEN_F32: f32 = 1.0 / (TIER_SWITCH_XFADE_SAMPLES as f32);
 
 #[inline(always)]
-fn control_step_frame<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>, in_l: f32, in_r: f32) {
-    let abs_mean = 0.5 * (const_abs_f32(in_l) + const_abs_f32(in_r));
+fn control_step_frame<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>) {
     let tick_mod4 = (slab.lite.sample_tick & 3) == 0;
+    let det_env = slab.lite.sensory_quad.envelopes();
     let cold = &mut slab.cold.as_mut_slice()[0];
-    let det_env = cold.router.detector.envelopes();
     let mut need_3khz = false;
     let mut need_hoist = !cold.hoisted_core_valid;
 
@@ -38,9 +38,9 @@ fn control_step_frame<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>, in_l: f32,
         if active && was_zero {
             need_3khz = true;
         }
-        bus.step_frame(Some(det_env), abs_mean);
+        bus.step_frame(Some(det_env));
         if tick_mod4 || need_3khz {
-            let new_z = bus.z_stage();
+            let new_z = bus.eff_z_stage();
             let stage_changed = (0..32).any(|i| {
                 bus.current_stage_params[i].to_bits() != cold.latched_stage_params[i].to_bits()
             }) || (0..8)
@@ -56,24 +56,24 @@ fn control_step_frame<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>, in_l: f32,
     if need_3khz {
         step_control_tick_3khz(slab);
     } else if need_hoist {
-        hoist_groups_and_readouts(slab);
+        hoist_core_quads_and_readouts(slab);
     }
 }
 
 #[inline(always)]
 fn eval_op_t_crossbar_taps<B: GraphBackend>(
     slab: &SonaHotSlab<'_, B>,
-    v_reads: &[[f32; 4]; TANK_MAX_QUADS],
+    reads: &[QuadTopRead; TRANSPORT_MAX_QUADS],
     op_t_gain: f32,
 ) -> (f32, f32) {
     if op_t_gain == 0.0 {
         return (0.0, 0.0);
     }
-    let active_lines = slab.cold().active_tank_quads * 4;
+    let active_lines = slab.cold().active_transport_quads.min(TRANSPORT_MAX_QUADS) * 4;
     let mut acc_l = 0.0_f32;
     let mut acc_r = 0.0_f32;
     for idx in 0..active_lines {
-        let v = v_reads[idx >> 2][idx & 3];
+        let v = reads[idx >> 2].v_read[idx & 3];
         let [wl, wr] = slab.opt_to_lr_fp16(idx);
         acc_l += v * fp16_to_f32(wl);
         acc_r += v * fp16_to_f32(wr);
@@ -82,67 +82,80 @@ fn eval_op_t_crossbar_taps<B: GraphBackend>(
 }
 
 #[inline(always)]
-fn step_tank_top_via_slab<B: GraphBackend>(
+fn step_transport_top_via_slab<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
-) -> Result<[[f32; 4]; TANK_MAX_QUADS], VmError> {
+) -> Result<[QuadTopRead; TRANSPORT_MAX_QUADS], VmError> {
     let cold = &mut slab.cold.as_mut_slice()[0];
-    let active_q = cold.active_tank_quads.min(TANK_MAX_QUADS);
+    let active_q = cold.active_transport_quads.min(TRANSPORT_MAX_QUADS);
     let quad_refs = [
-        &mut slab.lite.tank_quad0,
-        &mut slab.full_delta.tank_quad1,
-        &mut slab.pro_delta.tank_quad2,
-        &mut slab.ultra_delta.tank_quad3,
+        &mut slab.lite.transport_quad0,
+        &mut slab.full_delta.transport_quad1,
+        &mut slab.pro_delta.transport_quad2,
+        &mut slab.ultra_delta.transport_quad3,
     ];
-    let mut v_reads = [[0.0_f32; 4]; TANK_MAX_QUADS];
+    let mut reads = [QuadTopRead::default(); TRANSPORT_MAX_QUADS];
     for q in 0..active_q {
         let ring = resolve_quad_ring(
             q,
             quad_refs[q].flags,
-            &mut slab.lite.tank0_ring,
-            &mut cold.tank_ext,
+            &mut slab.lite.transport0_ring,
+            &mut cold.transport_ext,
         )?;
-        v_reads[q] = quad_refs[q].read_top_of_frame_v_read::<B>(
+        reads[q] = quad_refs[q].read_top_of_frame_v_read::<B>(
             ring,
-            cold.tank_schroeder.get_mut(q),
-            &cold.tank_quad_eff[q],
+            cold.transport_schroeder.get_mut(q),
+            &cold.transport_quad_eff[q],
         );
     }
-    Ok(v_reads)
+    Ok(reads)
 }
 
 #[inline(always)]
-fn step_tank_end_via_slab<B: GraphBackend>(
+fn step_transport_end_via_slab<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
-    v_reads: &[[f32; 4]; TANK_MAX_QUADS],
+    reads: &[QuadTopRead; TRANSPORT_MAX_QUADS],
     x_tank_lr: (f32, f32),
 ) -> Result<(f32, f32), VmError> {
     let cold = &mut slab.cold.as_mut_slice()[0];
-    let active_q = cold.active_tank_quads.min(TANK_MAX_QUADS);
+    let active_q = cold.active_transport_quads.min(TRANSPORT_MAX_QUADS);
     let quad_refs = [
-        &mut slab.lite.tank_quad0,
-        &mut slab.full_delta.tank_quad1,
-        &mut slab.pro_delta.tank_quad2,
-        &mut slab.ultra_delta.tank_quad3,
+        &mut slab.lite.transport_quad0,
+        &mut slab.full_delta.transport_quad1,
+        &mut slab.pro_delta.transport_quad2,
+        &mut slab.ultra_delta.transport_quad3,
     ];
     let (mut sum_l, mut sum_r) = (0.0_f32, 0.0_f32);
     let mut sat = false;
     for q in 0..active_q {
-        let eff = &cold.tank_quad_eff[q];
-        let (yl, yr) = quad_refs[q].finish_post_cabinet_output::<B>(eff, v_reads[q], x_tank_lr);
+        let eff = &cold.transport_quad_eff[q];
+        let (yl, yr) = quad_refs[q].finish_post_convolver_output::<B>(eff, reads[q].v_read);
         sum_l += yl;
         sum_r += yr;
         let ring = resolve_quad_ring(
             q,
             quad_refs[q].flags,
-            &mut slab.lite.tank0_ring,
-            &mut cold.tank_ext,
+            &mut slab.lite.transport0_ring,
+            &mut cold.transport_ext,
         )?;
-        sat |= quad_refs[q].step_end_of_frame_write::<B>(ring, eff, v_reads[q], x_tank_lr);
+        sat |= quad_refs[q].step_end_of_frame_write::<B>(ring, eff, reads[q], x_tank_lr);
     }
+    let wet_scale = if active_q > 0 {
+        cold.transport_quad_eff[0].wet_scale
+    } else {
+        1.0
+    };
     if sat {
         cold.saturation_flags |= saturation_flags::FP16_SATURATED;
     }
-    Ok((sum_l, sum_r))
+    let stage_dry_mix_eff = fp16_to_f32(slab.lite.tank_dry_mix_eff_fp16);
+    let (clean_xl, clean_xr) = (
+        scrub_and_flush_f32_bits(x_tank_lr.0),
+        scrub_and_flush_f32_bits(x_tank_lr.1),
+    );
+    Ok((
+        stage_dry_mix_eff * clean_xl + wet_scale * sum_l,
+        stage_dry_mix_eff * clean_xr + wet_scale * sum_r,
+    ))
 }
 
 #[inline(always)]
@@ -178,7 +191,7 @@ fn accum_fir_segs<B: GraphBackend>(
 }
 
 #[inline(always)]
-fn step_cabinet_frame<B: GraphBackend>(
+fn step_convolver_frame<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
     pre_l: f32,
     pre_r: f32,
@@ -187,7 +200,7 @@ fn step_cabinet_frame<B: GraphBackend>(
     let cold_ext = slab.cold_fir_ext();
     let (early, onset) = if cold_ext {
         slab.cold.as_mut_slice()[0]
-            .cabinet_fir_ext
+            .convolver_fir_ext
             .step_frame(pre_l, pre_r)
     } else {
         let c_lite_l =
@@ -264,7 +277,7 @@ fn finalize_frame_output<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
     tank_l: f32,
     tank_r: f32,
-) -> (f32, f32, f32) {
+) -> (f32, f32) {
     let mono = slab.mono_out();
     let (mut out_l, mut out_r) = if mono {
         let m = 0.5 * (tank_l + tank_r);
@@ -310,33 +323,25 @@ fn finalize_frame_output<B: GraphBackend>(
     let flags = &mut slab.cold.as_mut_slice()[0].saturation_flags;
     let clean_l = sanitize_output_sample(out_l, flags);
     let clean_r = sanitize_output_sample(out_r, flags);
-    (clean_l, clean_r, eff_trim)
-}
-
-#[derive(Clone, Copy)]
-struct PostRouterFrame {
-    out_lr: (f32, f32),
-    x_tank: (f32, f32),
-    tank_lr: (f32, f32),
-    eff_trim: f32,
+    (clean_l, clean_r)
 }
 
 #[inline(always)]
-fn step_post_router_inner<B: GraphBackend>(
+fn step_post_sensory<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
-    ro_l: f32,
-    ro_r: f32,
-) -> Result<PostRouterFrame, VmError> {
-    let v_reads = step_tank_top_via_slab(slab)?;
-    let op_p_1x = step_op_p_1x(slab, ro_l, ro_r);
+    u_sense_l: f32,
+    u_sense_r: f32,
+) -> Result<(f32, f32), VmError> {
+    let reads = step_transport_top_via_slab(slab)?;
+    let op_p_1x = step_op_p_1x(slab, u_sense_l, u_sense_r);
     {
         let cold = slab.cold_mut();
         cold.last_op_p_iq_lr = op_p_1x.iq_lr;
         cold.last_op_p_feat = op_p_1x.feat;
     }
     let op_t_gain = slab.cold().hoisted_core.op_t_gain;
-    let (t_cb_l, t_cb_r) = eval_op_t_crossbar_taps(slab, &v_reads, op_t_gain);
-    let (s0_l, s0_r) = (ro_l + t_cb_l, ro_r + t_cb_r);
+    let (t_cb_l, t_cb_r) = eval_op_t_crossbar_taps(slab, &reads, op_t_gain);
+    let (s0_l, s0_r) = (u_sense_l + t_cb_l, u_sense_r + t_cb_r);
 
     let (d_scale, delta_step) = (
         slab.cold().op_n_pre_hoisted.d_scale,
@@ -365,28 +370,13 @@ fn step_post_router_inner<B: GraphBackend>(
     };
     slab.cold_mut().last_s2_dir = [pre_l, pre_r, dir_l, dir_r];
 
-    let (cab_l, cab_r) = step_cabinet_frame(slab, pre_l, pre_r);
-    let x_tank = (dir_l + cab_l, dir_r + cab_r);
-    let (tank_l, tank_r) = step_tank_end_via_slab(slab, &v_reads, x_tank)?;
-    let (out_l, out_r, eff_trim) = finalize_frame_output(slab, tank_l, tank_r);
-    Ok(PostRouterFrame {
-        out_lr: (out_l, out_r),
-        x_tank,
-        tank_lr: (tank_l, tank_r),
-        eff_trim,
-    })
+    let (conv_l, conv_r) = step_convolver_frame(slab, pre_l, pre_r);
+    let x_tank = (dir_l + conv_l, dir_r + conv_r);
+    let (tank_l, tank_r) = step_transport_end_via_slab(slab, &reads, x_tank)?;
+    Ok(finalize_frame_output(slab, tank_l, tank_r))
 }
 
-#[inline(always)]
-fn step_post_router<B: GraphBackend>(
-    slab: &mut SonaHotSlab<'_, B>,
-    ro_l: f32,
-    ro_r: f32,
-) -> Result<(f32, f32), VmError> {
-    Ok(step_post_router_inner(slab, ro_l, ro_r)?.out_lr)
-}
-
-/// Executes one complete `2`-port stereo host VM frame (`Steps 1..10`) with deterministic `0-ULP`
+/// Executes one complete `2x2` stereo host VM frame (`Steps 1..10`) with deterministic `0-ULP`
 /// invariance against [`process_microchunk_4`] and [`process_block_sona`].
 #[inline(never)]
 pub fn step_frame_sona<B: GraphBackend>(
@@ -394,6 +384,7 @@ pub fn step_frame_sona<B: GraphBackend>(
     in_l: f32,
     in_r: f32,
 ) -> Result<(f32, f32), VmError> {
+    let in_r = if slab.single_input() { in_l } else { in_r };
     let (clean_l, clean_r) = {
         let flags = &mut slab.cold.as_mut_slice()[0].saturation_flags;
         (
@@ -401,114 +392,16 @@ pub fn step_frame_sona<B: GraphBackend>(
             sanitize_input_sample(in_r, CERTIFIED_INPUT_ENVELOPE_MIN_F32, flags),
         )
     };
-    control_step_frame(slab, clean_l, clean_r);
+    control_step_frame(slab);
     let slot30 = slab.cold().latched_stage_params[30];
-    let (mut gate_env, mut gate_gain) = (slab.lite.gate_env, slab.lite.gate_gain);
-    let (ro_l, ro_r) = slab.cold.as_mut_slice()[0].router.step_2port(
+    let (u_l, u_r) = slab.cold.as_slice()[0].sensory_cold.step_frame::<B>(
+        &mut slab.lite.sensory_quad,
         clean_l,
         clean_r,
         slot30,
-        &mut gate_env,
-        &mut gate_gain,
     );
-    slab.lite.gate_env = gate_env;
-    slab.lite.gate_gain = gate_gain;
 
-    step_post_router(slab, ro_l, ro_r)
-}
-
-/// Executes one complete `4`-port stereo frame (`4CM`/`WDW`), returning `(main_lr, send_lr)`
-/// while strictly upholding `S_{ret->send} == 0`.
-#[inline(never)]
-pub fn step_frame_4port_sona<B: GraphBackend>(
-    slab: &mut SonaHotSlab<'_, B>,
-    inst_lr: [f32; 2],
-    ret_lr: [f32; 2],
-    has_return: bool,
-) -> Result<([f32; 2], [f32; 2]), VmError> {
-    let (inst_c, ret_c) = {
-        let flags = &mut slab.cold.as_mut_slice()[0].saturation_flags;
-        (
-            [
-                sanitize_input_sample(inst_lr[0], CERTIFIED_INPUT_ENVELOPE_MIN_F32, flags),
-                sanitize_input_sample(inst_lr[1], CERTIFIED_INPUT_ENVELOPE_MIN_F32, flags),
-            ],
-            [
-                sanitize_input_sample(ret_lr[0], CERTIFIED_INPUT_ENVELOPE_MIN_F32, flags),
-                sanitize_input_sample(ret_lr[1], CERTIFIED_INPUT_ENVELOPE_MIN_F32, flags),
-            ],
-        )
-    };
-    control_step_frame(slab, inst_c[0], inst_c[1]);
-    let slot30 = slab.cold().latched_stage_params[30];
-    let (mut gate_env, mut gate_gain) = (slab.lite.gate_env, slab.lite.gate_gain);
-    let (down_lr, send_lr, ret_aligned_lr) =
-        slab.cold.as_mut_slice()[0].router.step_4port_internal(
-            inst_c,
-            ret_c,
-            has_return,
-            slot30,
-            &mut gate_env,
-            &mut gate_gain,
-        );
-    slab.lite.gate_env = gate_env;
-    slab.lite.gate_gain = gate_gain;
-
-    let frame = step_post_router_inner(slab, down_lr[0], down_lr[1])?;
-    let (wdw_active, wdw_mode, mono_out, g_dry_sum) = {
-        let cold = slab.cold();
-        let active_q = cold.active_tank_quads.min(TANK_MAX_QUADS);
-        let mut dry_sum = 0.0_f32;
-        for q in 0..active_q {
-            dry_sum += cold.tank_quad_eff[q].dry_mix_eff;
-        }
-        (
-            cold.router.wdw_active,
-            cold.router.wdw_mode,
-            slab.mono_out(),
-            dry_sum,
-        )
-    };
-    let flags = &mut slab.cold.as_mut_slice()[0].saturation_flags;
-    if !wdw_active {
-        return Ok((
-            [frame.out_lr.0, frame.out_lr.1],
-            [
-                sanitize_output_sample(send_lr[0], flags),
-                sanitize_output_sample(send_lr[1], flags),
-            ],
-        ));
-    }
-
-    let core_mid = 0.5 * (frame.x_tank.0 + frame.x_tank.1) * frame.eff_trim;
-    let wet_l = (frame.tank_lr.0 - g_dry_sum * frame.x_tank.0) * frame.eff_trim;
-    let wet_r = (frame.tank_lr.1 - g_dry_sum * frame.x_tank.1) * frame.eff_trim;
-    let (wet_mid, wet_side) = voltage_ms_encode(wet_l, wet_r);
-    let direct_lr = if has_return { ret_aligned_lr } else { inst_c };
-    let (wdw_dry, mut wdw_wet_l, mut wdw_wet_r) = eval_wdw_routing_outputs(
-        wdw_mode,
-        core_mid,
-        wet_mid,
-        wet_side,
-        1.0,
-        direct_lr[0],
-        direct_lr[1],
-    );
-    if mono_out {
-        let m = 0.5 * (wdw_wet_l + wdw_wet_r);
-        wdw_wet_l = m;
-        wdw_wet_r = m;
-    }
-    Ok((
-        [
-            sanitize_output_sample(wdw_wet_l, flags),
-            sanitize_output_sample(wdw_wet_r, flags),
-        ],
-        [
-            sanitize_output_sample(send_lr[0], flags),
-            sanitize_output_sample(wdw_dry, flags),
-        ],
-    ))
+    step_post_sensory(slab, u_l, u_r)
 }
 
 /// Executes one host sample under deterministic `4x` offline bounce oversampling (`Bounce4xOversampler`).
@@ -518,6 +411,7 @@ pub fn step_frame_4x_sona<B: GraphBackend>(
     in_l: f32,
     in_r: f32,
 ) -> Result<(f32, f32), VmError> {
+    let in_r = if slab.single_input() { in_l } else { in_r };
     let (clean_l, clean_r) = {
         let flags = &mut slab.cold.as_mut_slice()[0].saturation_flags;
         (
@@ -549,49 +443,56 @@ fn process_microchunk_4<B: GraphBackend>(
     out_l: &mut [f32],
     out_r: &mut [f32],
 ) -> Result<(), VmError> {
-    let mut ro_lr = [[0.0_f32; 2]; 4];
+    let single_in = slab.single_input();
+    let mut u_sense_lr = [[0.0_f32; 2]; 4];
     let (cl0, cr0) = {
         let flags = &mut slab.cold.as_mut_slice()[0].saturation_flags;
         (
             sanitize_input_sample(in_l[0], CERTIFIED_INPUT_ENVELOPE_MIN_F32, flags),
-            sanitize_input_sample(in_r[0], CERTIFIED_INPUT_ENVELOPE_MIN_F32, flags),
+            sanitize_input_sample(
+                if single_in { in_l[0] } else { in_r[0] },
+                CERTIFIED_INPUT_ENVELOPE_MIN_F32,
+                flags,
+            ),
         )
     };
-    control_step_frame(slab, cl0, cr0);
+    control_step_frame(slab);
     let slot30 = slab.cold().latched_stage_params[30];
-    {
-        let (mut ge, mut gg) = (slab.lite.gate_env, slab.lite.gate_gain);
-        let (rl, rr) = slab.cold.as_mut_slice()[0]
-            .router
-            .step_2port(cl0, cr0, slot30, &mut ge, &mut gg);
-        slab.lite.gate_env = ge;
-        slab.lite.gate_gain = gg;
-        ro_lr[0] = [rl, rr];
-    }
+    let (u0_l, u0_r) = slab.cold.as_slice()[0].sensory_cold.step_frame::<B>(
+        &mut slab.lite.sensory_quad,
+        cl0,
+        cr0,
+        slot30,
+    );
+    u_sense_lr[0] = [u0_l, u0_r];
 
     for f in 1..4 {
         let (clf, crf) = {
             let flags = &mut slab.cold.as_mut_slice()[0].saturation_flags;
             (
                 sanitize_input_sample(in_l[f], CERTIFIED_INPUT_ENVELOPE_MIN_F32, flags),
-                sanitize_input_sample(in_r[f], CERTIFIED_INPUT_ENVELOPE_MIN_F32, flags),
+                sanitize_input_sample(
+                    if single_in { in_l[f] } else { in_r[f] },
+                    CERTIFIED_INPUT_ENVELOPE_MIN_F32,
+                    flags,
+                ),
             )
         };
-        let abs_f = 0.5 * (const_abs_f32(clf) + const_abs_f32(crf));
-        let cold = &mut slab.cold.as_mut_slice()[0];
-        let det_env = cold.router.detector.envelopes();
-        if let Some(bus) = cold.ctrl_bus.as_mut() {
-            bus.step_frame(Some(det_env), abs_f);
+        let det_env = slab.lite.sensory_quad.envelopes();
+        if let Some(bus) = slab.cold.as_mut_slice()[0].ctrl_bus.as_mut() {
+            bus.step_frame(Some(det_env));
         }
-        let (mut ge, mut gg) = (slab.lite.gate_env, slab.lite.gate_gain);
-        let (rl, rr) = cold.router.step_2port(clf, crf, slot30, &mut ge, &mut gg);
-        slab.lite.gate_env = ge;
-        slab.lite.gate_gain = gg;
-        ro_lr[f] = [rl, rr];
+        let (uf_l, uf_r) = slab.cold.as_slice()[0].sensory_cold.step_frame::<B>(
+            &mut slab.lite.sensory_quad,
+            clf,
+            crf,
+            slot30,
+        );
+        u_sense_lr[f] = [uf_l, uf_r];
     }
 
-    for (f, &[rl, rr]) in ro_lr.iter().enumerate() {
-        let (ol, or) = step_post_router(slab, rl, rr)?;
+    for (f, &[ul, ur]) in u_sense_lr.iter().enumerate() {
+        let (ol, or) = step_post_sensory(slab, ul, ur)?;
         out_l[f] = ol;
         out_r[f] = or;
     }
@@ -664,6 +565,6 @@ mod tests {
     #[test]
     fn test_xfade_reciprocal_constant_exact() {
         assert!((INV_XFADE_LEN_F32 * 48.0 - 1.0).abs() < 1.0e-7);
-        assert_eq!(TANK_MAX_QUADS, 4);
+        assert_eq!(TRANSPORT_MAX_QUADS, 4);
     }
 }

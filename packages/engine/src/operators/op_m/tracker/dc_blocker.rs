@@ -10,14 +10,8 @@ pub(crate) const T1_DC_BLOCKER_5HZ_48K_POLE: f32 = dnam_kernels::DC_BLOCKER_5HZ_
 /// (`0x3F7F_EA90`, `ref[dsp.op-m.tracker.t1-dc-blocker]`).
 pub(crate) const T1_DC_BLOCKER_5HZ_48K_GAIN: f32 = 0.5 * (1.0 + T1_DC_BLOCKER_5HZ_48K_POLE);
 
-/// 24-bit significand `(1 << 23) | frac(R_48k)` of [`T1_DC_BLOCKER_5HZ_48K_POLE`] for the 160-bit
-/// midpoint search (`0x00FF_D51F`).
-const T1_REF_POLE_MANTISSA_24: u64 =
-    ((1_u32 << 23) | (T1_DC_BLOCKER_5HZ_48K_POLE.to_bits() & 0x007F_FFFF)) as u64;
-
 const _: () = assert!(T1_DC_BLOCKER_5HZ_48K_POLE.to_bits() == 0x3F7F_D51F);
 const _: () = assert!(T1_DC_BLOCKER_5HZ_48K_GAIN.to_bits() == 0x3F7F_EA90);
-const _: () = assert!(T1_REF_POLE_MANTISSA_24 == 0x00FF_D51F);
 
 /// Shared `T1` `5 Hz` 1-pole DC blocker step scrubbing `NaN`/`±Inf` and flushing subnormals on all
 /// recursive state (`prev_x`, `prev_d`).
@@ -38,126 +32,12 @@ pub(crate) fn step_t1_dc_blocker_state(
     d
 }
 
-/// Outward 160-bit interval bounds on $\mathrm{atanh}((D - N) / (D + N)) \cdot 2^{160}$ using 8 terms
-/// (`ref[dsp.op-m.tracker.t1-dc-blocker]`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
-struct U256Be {
-    limbs: [u64; 4], // big-endian limbs for natural Ord comparison: limbs[0] = MSW, limbs[3] = LSW
-}
-
-impl U256Be {
-    const ZERO: Self = Self { limbs: [0; 4] };
-
-    fn add(self, rhs: Self) -> Self {
-        let mut out = [0u64; 4];
-        let mut carry = 0u128;
-        for i in (0..4).rev() {
-            let s = (self.limbs[i] as u128) + (rhs.limbs[i] as u128) + carry;
-            out[i] = s as u64;
-            carry = s >> 64;
-        }
-        Self { limbs: out }
-    }
-
-    fn add_u64(self, rhs: u64) -> Self {
-        self.add(Self {
-            limbs: [0, 0, 0, rhs],
-        })
-    }
-
-    fn mul_u64(self, rhs: u64) -> Self {
-        let mut out = [0u64; 4];
-        let mut carry = 0u128;
-        for i in (0..4).rev() {
-            let p = (self.limbs[i] as u128) * (rhs as u128) + carry;
-            out[i] = p as u64;
-            carry = p >> 64;
-        }
-        Self { limbs: out }
-    }
-
-    fn div_u64(self, divisor: u64) -> Self {
-        let mut out = [0u64; 4];
-        let mut rem = 0u128;
-        let d = divisor as u128;
-        for i in 0..4 {
-            let cur = (rem << 64) | (self.limbs[i] as u128);
-            out[i] = (cur / d) as u64;
-            rem = cur % d;
-        }
-        Self { limbs: out }
-    }
-}
-
-fn atanh_bounds_160bit(numerator: u64, denominator: u64) -> (U256Be, U256Be) {
-    let z_num = denominator - numerator;
-    let z_den = denominator + numerator;
-    // Start with (1 << 160) * z_num / z_den: (1 << 160) has bit 32 set in limbs[1]
-    let one_shl_160 = U256Be {
-        limbs: [0, 1u64 << 32, 0, 0],
-    };
-    let mut cur = one_shl_160.mul_u64(z_num).div_u64(z_den);
-    let z2_num = z_num * z_num;
-    let z2_den = z_den * z_den;
-    let mut lower = U256Be::ZERO;
-    for idx in 0..8u64 {
-        lower = lower.add(cur.div_u64(2 * idx + 1));
-        cur = cur.mul_u64(z2_num).div_u64(z2_den);
-    }
-    (lower, lower.add_u64(16))
-}
-
-/// Computes the `T1` tracker `5 Hz` DC blocker `(pole_bits, gain_bits)` at `rate_hz` (`44.1..96 kHz`
-/// or `176.4..384 kHz`) using the normative 160-bit midpoint binary search without `libm` calls
-/// (`ref[dsp.op-m.tracker.t1-dc-blocker]`).
+/// Computes the `T1` tracker `5 Hz` DC blocker `(pole_bits, gain_bits)` at `rate_hz` (`44.1..=384 kHz`)
+/// via [`dnam_kernels::compute_t1_dc_blocker_coeffs_bits`] using the unified 160-bit midpoint
+/// binary search without `libm` calls (`ref[dsp.op-m.tracker.t1-dc-blocker]`).
+#[inline]
 pub fn compute_t1_dc_blocker_coeffs_bits(rate_hz: f64) -> Option<(u32, u32)> {
-    if !rate_hz.is_finite() {
-        return None;
-    }
-    let (first, last) = if (44_100.0..=96_000.0).contains(&rate_hz) {
-        (0x00ff_d000u32, 0x00ff_ebffu32)
-    } else if (176_400.0..=384_000.0).contains(&rate_hz) {
-        (0x00ff_f400u32, 0x00ff_fbffu32)
-    } else {
-        return None;
-    };
-
-    // Express rate_hz = rate_num / rate_den in reduced integer form (rate_num < 2^53, rate_den <= 2^37)
-    let bits = rate_hz.to_bits();
-    let exp = (((bits >> 52) & 0x7ff) as i32) - 1023;
-    let mant = (1u64 << 52) | (bits & ((1u64 << 52) - 1));
-    let (rate_num, rate_den): (u64, u64) = if exp >= 52 {
-        (mant << ((exp - 52) as u32), 1)
-    } else {
-        let raw_k = (52 - exp) as u32;
-        let tz = mant.trailing_zeros().min(raw_k);
-        (mant >> tz, 1u64 << (raw_k - tz))
-    };
-    let exponent_num = 48_000u64 * rate_den;
-    let ref_bounds = atanh_bounds_160bit(T1_REF_POLE_MANTISSA_24, 1u64 << 24);
-
-    let mut lower = first + 1;
-    let mut upper = last;
-    while lower < upper {
-        let candidate = (lower + upper) / 2;
-        let mid_bounds = atanh_bounds_160bit((2 * candidate + 1) as u64, 1u64 << 25);
-        let lhs = mid_bounds.0.mul_u64(rate_num);
-        let rhs = ref_bounds.1.mul_u64(exponent_num);
-        if lhs > rhs {
-            lower = candidate + 1;
-        } else {
-            upper = candidate;
-        }
-    }
-    const F32_HALF_EXP_BITS: u32 = (dnam_kernels::IEEE754_F32_EXP_BIAS - 1) << 23;
-    const F32_IMPLICIT_MANTISSA_BIT: u32 = 1u32 << 23;
-    let pole_bits = F32_HALF_EXP_BITS + lower - F32_IMPLICIT_MANTISSA_BIT;
-    let num_gain = (1u32 << 24) + lower;
-    let q = num_gain / 2;
-    let r = num_gain % 2;
-    let rounded_gain = q + u32::from(r == 1 && (q & 1) != 0);
-    let gain_bits = F32_HALF_EXP_BITS + rounded_gain - F32_IMPLICIT_MANTISSA_BIT;
-    Some((pole_bits, gain_bits))
+    dnam_kernels::compute_t1_dc_blocker_coeffs_bits(rate_hz)
 }
 
 /// Tracker-only passband-normalized `5 Hz` one-pole DC blocker (`T1`, `ref[dsp.op-m.tracker.t1-dc-blocker]`).

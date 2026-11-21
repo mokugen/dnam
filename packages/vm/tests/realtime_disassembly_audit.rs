@@ -16,9 +16,18 @@ mod realtime_disassembly_audit {
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use dnam_kernels::OpNPreHotState;
 use dnam_vm::{
-    DefaultControlBus, DefaultMathBackend, DynamicSonaVm, SonaTelemetrySnapshot, SonaVm, VmError,
-    bind_dnam_bin_prevalidated, sona_vm_clear_saturation_flags_default,
+    ControlBus, ConvolverFirHistorySlices, ConvolverFirWeightSlices, CrossbarFrame,
+    DefaultControlBus, DefaultMathBackend, DynamicSonaVm, HoistedCoreChunk, MathBackend,
+    PartitionedSchroederBank, QuadColdMeta, QuadEffectiveTargets, QuadTopRead, SensoryQuadCold,
+    SensoryQuadHot, SonaHotSlab, SonaTelemetrySnapshot, SonaVm, TRANSPORT_MAX_QUADS,
+    TransportExtRing, TransportModSlots, TransportQuadHotCompact, TransportStageState,
+    TransportTopOfFrameResult, VmError, bind_dnam_bin_prevalidated,
+    sona_graph_convolver_chunk_default, sona_graph_dispatch_transport_3khz_default,
+    sona_graph_eval_core_quads_default, sona_graph_op_n_pre_step_default,
+    sona_graph_sensory_step_default, sona_graph_transport_end_default,
+    sona_graph_transport_top_default, sona_vm_clear_saturation_flags_default,
     sona_vm_process_block_default, sona_vm_process_tick16_default,
     sona_vm_set_live_analog_drift_enabled_default, sona_vm_step_control_tick_default,
     sona_vm_step_frame_default, step_control_frame_default, step_control_tick_3khz_default,
@@ -29,11 +38,17 @@ use realtime_disassembly_audit::objdump_parser::{
 };
 
 fn retain_vm_realtime_roots() {
-    core::hint::black_box::<fn(&mut DefaultControlBus<'_>, Option<[f32; 4]>, f32)>(
+    core::hint::black_box::<
+        for<'a> fn(&'a mut DefaultControlBus<'static>, Option<[f32; 4]>) -> Option<&'a [f32; 32]>,
+    >(ControlBus::<'static, DefaultMathBackend>::step_frame);
+    core::hint::black_box::<fn(&mut DefaultControlBus<'_>, Option<[f32; 4]>)>(
         step_control_frame_default,
     );
-    core::hint::black_box::<fn(&mut DefaultControlBus<'_>, Option<[f32; 4]>, f32)>(
+    core::hint::black_box::<fn(&mut DefaultControlBus<'_>, Option<[f32; 4]>)>(
         step_control_tick_3khz_default,
+    );
+    core::hint::black_box::<fn(&mut OpNPreHotState, f32, f32, f32, f32) -> (f32, f32)>(
+        OpNPreHotState::step_stereo,
     );
     core::hint::black_box::<fn(&[u8]) -> Result<dnam_vm::DnamBinView<'_>, VmError>>(
         bind_dnam_bin_prevalidated,
@@ -77,9 +92,6 @@ fn retain_vm_realtime_roots() {
     core::hint::black_box::<fn(&mut DynamicSonaVm, f32, f32) -> Result<(f32, f32), VmError>>(
         DynamicSonaVm::step_frame,
     );
-    core::hint::black_box::<
-        fn(&mut DynamicSonaVm, [f32; 2], [f32; 2], bool) -> Result<([f32; 2], [f32; 2]), VmError>,
-    >(DynamicSonaVm::step_frame_4port);
     core::hint::black_box::<fn(&mut DynamicSonaVm)>(DynamicSonaVm::step_control_tick_3khz);
     core::hint::black_box::<fn(&mut DynamicSonaVm, bool)>(DynamicSonaVm::set_quad_write_enable);
     core::hint::black_box::<fn(&mut DynamicSonaVm, bool)>(DynamicSonaVm::set_op_t_write_enable);
@@ -100,11 +112,6 @@ fn retain_vm_realtime_roots() {
         DynamicSonaVm::retime_sample_rate,
     );
     core::hint::black_box::<fn(&mut DynamicSonaVm)>(DynamicSonaVm::reset);
-    core::hint::black_box::<fn(&mut DynamicSonaVm, f32)>(DynamicSonaVm::set_ms_width);
-    core::hint::black_box::<fn(&mut DynamicSonaVm, dnam_vm::WdwDryTapMode)>(
-        DynamicSonaVm::set_wdw_mode,
-    );
-    core::hint::black_box::<fn(&mut DynamicSonaVm, bool)>(DynamicSonaVm::set_wdw_enabled);
     core::hint::black_box::<fn(&mut SonaVm<'_, DefaultMathBackend>, bool)>(
         sona_vm_set_live_analog_drift_enabled_default,
     );
@@ -117,9 +124,6 @@ fn retain_vm_realtime_roots() {
     core::hint::black_box::<fn(&DynamicSonaVm) -> usize>(DynamicSonaVm::get_latency_samples);
     core::hint::black_box::<fn(&DynamicSonaVm) -> u32>(DynamicSonaVm::saturation_flags);
     core::hint::black_box::<fn(&mut DynamicSonaVm)>(DynamicSonaVm::clear_saturation_flags);
-    core::hint::black_box::<fn(&mut DynamicSonaVm, dnam_vm::IoAlignmentMode, f64, f64)>(
-        DynamicSonaVm::configure_return_alignment,
-    );
     core::hint::black_box::<fn(&DynamicSonaVm) -> SonaTelemetrySnapshot>(DynamicSonaVm::telemetry);
     core::hint::black_box::<fn(&mut SonaVm<'static, DefaultMathBackend>, bool)>(
         SonaVm::<'static, DefaultMathBackend>::set_live_analog_drift_enabled,
@@ -127,80 +131,137 @@ fn retain_vm_realtime_roots() {
     core::hint::black_box::<fn(&mut SonaVm<'static, DefaultMathBackend>)>(
         SonaVm::<'static, DefaultMathBackend>::clear_saturation_flags,
     );
-    core::hint::black_box::<
-        fn(
-            &mut SonaVm<'static, DefaultMathBackend>,
-            [f32; 2],
-            [f32; 2],
-            bool,
-        ) -> Result<([f32; 2], [f32; 2]), VmError>,
-    >(SonaVm::<'static, DefaultMathBackend>::step_frame_4port);
     core::hint::black_box::<fn(&mut SonaVm<'static, DefaultMathBackend>, bool)>(
         SonaVm::<'static, DefaultMathBackend>::set_quad_write_enable,
     );
     core::hint::black_box::<fn(&mut SonaVm<'static, DefaultMathBackend>, bool)>(
         SonaVm::<'static, DefaultMathBackend>::set_op_t_write_enable,
     );
+    core::hint::black_box::<
+        fn(
+            &mut SonaHotSlab<'_, DefaultMathBackend>,
+            &HoistedCoreChunk<DefaultMathBackend>,
+            &CrossbarFrame<<DefaultMathBackend as MathBackend>::Vec4>,
+            (f32, f32),
+        ) -> ((f32, f32), (f32, f32)),
+    >(sona_graph_eval_core_quads_default);
+    core::hint::black_box::<
+        fn(
+            &mut ConvolverFirHistorySlices<'_>,
+            &ConvolverFirWeightSlices<'_>,
+            &[[f32; 2]; 4],
+            &mut [[f32; 2]; 4],
+            &mut [[f32; 2]; 4],
+        ),
+    >(sona_graph_convolver_chunk_default);
+    core::hint::black_box::<
+        fn(
+            &mut TransportStageState<'_, '_>,
+            &mut [PartitionedSchroederBank<'_>],
+            &[QuadEffectiveTargets],
+            (f32, f32),
+            f32,
+        ) -> Result<TransportTopOfFrameResult, VmError>,
+    >(sona_graph_transport_top_default);
+    core::hint::black_box::<
+        fn(
+            &mut TransportStageState<'_, '_>,
+            &[QuadEffectiveTargets],
+            &[QuadTopRead; TRANSPORT_MAX_QUADS],
+            (f32, f32),
+            f32,
+        ) -> Result<((f32, f32), bool), VmError>,
+    >(sona_graph_transport_end_default);
+    core::hint::black_box::<fn(&SensoryQuadCold, &mut SensoryQuadHot, f32, f32, f32) -> (f32, f32)>(
+        sona_graph_sensory_step_default,
+    );
+    core::hint::black_box::<fn(&SensoryQuadCold, &mut SensoryQuadHot, f32, f32, f32) -> (f32, f32)>(
+        SensoryQuadCold::step_frame::<DefaultMathBackend>,
+    );
+    core::hint::black_box::<fn(&mut OpNPreHotState, f32, f32, f32, f32) -> (f32, f32)>(
+        sona_graph_op_n_pre_step_default,
+    );
+    core::hint::black_box::<
+        fn(
+            &mut [TransportQuadHotCompact],
+            &[QuadColdMeta],
+            usize,
+            &TransportModSlots,
+            &mut [TransportExtRing<'_>],
+            &mut [PartitionedSchroederBank<'_>],
+            &mut [QuadEffectiveTargets],
+        ),
+    >(sona_graph_dispatch_transport_3khz_default);
 }
 
+const EXACT_OR_SUBSTR_ROOTS: &[&str] = &[
+    "step_control_frame_default",
+    "step_control_tick_3khz_default",
+    "ControlBus<dnam_vm::math::scalar::ScalarBackend>>::step_frame",
+    "tick_control_boundary",
+    "eval_static_and_snap_if_dirty",
+    "eval_current_dispatch_and_snap",
+    "scrub_drift_if_disabled",
+    "sona_graph_eval_core_quads_default",
+    "sona_graph_convolver_chunk_default",
+    "sona_graph_transport_top_default",
+    "sona_graph_transport_end_default",
+    "sona_graph_sensory_step_default",
+    "sona_graph_op_n_pre_step_default",
+    "sona_graph_dispatch_transport_3khz_default",
+    "ConvolverHighSrFirExt>::step_frame",
+    "bind_dnam_bin_prevalidated",
+    "sona_vm_process_block_default",
+    "sona_vm_process_tick16_default",
+    "sona_vm_step_frame_default",
+    "sona_vm_step_control_tick_default",
+    "process_block_sona",
+    "process_tick16_const",
+    "process_microchunk_4",
+    "step_frame_sona",
+    "step_frame_4x_sona",
+    "retune_kautz_banks_3khz",
+    "latch_quad_nonslew_targets",
+    "tick_quad_3khz",
+    "tick_transport_3khz",
+    "apply_transport_mod_slots",
+    "eval_block_and_group_adaa_lru",
+    "eval_global_stage_mods",
+    "eval_lane_core_mods",
+    "switch_tier",
+    "retime_sample_rate",
+    "set_offline_bounce",
+    "reset_to_dc_equilibrium",
+    "hoist_core_quads_and_readouts",
+    "step_control_tick_3khz",
+    "set_op_t_write_enable",
+    "DynamicSonaVm>::process_block",
+    "DynamicSonaVm>::process_tick16_const",
+    "DynamicSonaVm>::step_frame",
+    "DynamicSonaVm>::step_control_tick_3khz",
+    "DynamicSonaVm>::set_quad_write_enable",
+    "DynamicSonaVm>::set_op_t_write_enable",
+    "DynamicSonaVm>::set_control_physical",
+    "DynamicSonaVm>::set_controls_batch",
+    "DynamicSonaVm>::apply_tempo_bpm",
+    "DynamicSonaVm>::switch_tier",
+    "DynamicSonaVm>::set_offline_bounce",
+    "DynamicSonaVm>::retime_sample_rate",
+    "DynamicSonaVm>::reset",
+    "step_lfos_and_skewed_q2",
+    "evaluate_static_cp1_latents",
+    "step_ou_drift",
+    "latch_immediate_at_init_or_reset",
+    "sona_vm_set_live_analog_drift_enabled_default",
+    "sona_vm_clear_saturation_flags_default",
+    "DynamicSonaVm>::set_live_analog_drift_enabled",
+    "DynamicSonaVm>::get_latency_samples",
+    "DynamicSonaVm>::saturation_flags",
+    "DynamicSonaVm>::clear_saturation_flags",
+    "DynamicSonaVm>::telemetry",
+];
+
 fn is_vm_realtime_root_symbol(sym: &str) -> bool {
-    const EXACT_OR_SUBSTR_ROOTS: &[&str] = &[
-        "step_control_frame_default",
-        "step_control_tick_3khz_default",
-        "bind_dnam_bin_prevalidated",
-        "sona_vm_process_block_default",
-        "sona_vm_process_tick16_default",
-        "sona_vm_step_frame_default",
-        "sona_vm_step_control_tick_default",
-        "process_block_sona",
-        "process_tick16_const",
-        "step_frame_sona",
-        "step_frame_4x_sona",
-        "step_frame_4port_sona",
-        "eval_wdw_routing_outputs",
-        "latch_quad_nonslew_targets",
-        "switch_tier",
-        "retime_sample_rate",
-        "set_offline_bounce",
-        "reset_to_dc_equilibrium",
-        "hoist_groups_and_readouts",
-        "step_control_tick_3khz",
-        "set_op_t_write_enable",
-        "DynamicSonaVm>::process_block",
-        "DynamicSonaVm>::process_tick16_const",
-        "DynamicSonaVm>::step_frame",
-        "DynamicSonaVm>::step_frame_4port",
-        "DynamicSonaVm>::step_control_tick_3khz",
-        "DynamicSonaVm>::set_quad_write_enable",
-        "DynamicSonaVm>::set_op_t_write_enable",
-        "DynamicSonaVm>::set_control_physical",
-        "DynamicSonaVm>::set_controls_batch",
-        "DynamicSonaVm>::apply_tempo_bpm",
-        "DynamicSonaVm>::switch_tier",
-        "DynamicSonaVm>::set_offline_bounce",
-        "DynamicSonaVm>::retime_sample_rate",
-        "DynamicSonaVm>::reset",
-        "DynamicSonaVm>::set_ms_width",
-        "DynamicSonaVm>::set_wdw_mode",
-        "DynamicSonaVm>::set_wdw_enabled",
-        "step_lfos_and_harmonics",
-        "update_env_states",
-        "evaluate_static_cp1_latents",
-        "evaluate_w_ctrl_32",
-        "step_ou_drift",
-        "prepare_micro_ramp_deltas",
-        "advance_micro_ramp_frame",
-        "q32_phase_to_phasor",
-        "latch_immediate_at_init_or_reset",
-        "sona_vm_set_live_analog_drift_enabled_default",
-        "sona_vm_clear_saturation_flags_default",
-        "DynamicSonaVm>::set_live_analog_drift_enabled",
-        "DynamicSonaVm>::get_latency_samples",
-        "DynamicSonaVm>::saturation_flags",
-        "DynamicSonaVm>::clear_saturation_flags",
-        "DynamicSonaVm>::configure_return_alignment",
-        "DynamicSonaVm>::telemetry",
-    ];
     if EXACT_OR_SUBSTR_ROOTS.iter().any(|p| sym.contains(p)) {
         return true;
     }
@@ -209,22 +270,18 @@ fn is_vm_realtime_root_symbol(sym: &str) -> bool {
         "::process_block",
         "::process_tick16_const",
         "::step_frame",
-        "::step_frame_4port",
         "::step_frame_4x",
         "::step_control_tick_3khz",
+        "::tick_control_boundary",
         "::set_control_physical",
         "::set_controls_batch",
         "::apply_tempo_bpm",
         "::set_quad_write_enable",
         "::set_op_t_write_enable",
-        "::set_ms_width",
         "::switch_tier",
         "::retime_sample_rate",
         "::set_offline_bounce",
         "::reset",
-        "::configure_return_alignment",
-        "::set_wdw_mode",
-        "::set_wdw_enabled",
         "::set_live_analog_drift_enabled",
         "::get_latency_samples",
         "::saturation_flags",
@@ -234,7 +291,12 @@ fn is_vm_realtime_root_symbol(sym: &str) -> bool {
     let is_vm_or_slab = sym.contains("SonaVm<")
         || sym.contains("SonaVm>::")
         || sym.contains("SonaHotSlab<")
-        || sym.contains("SonaHotSlab>::");
+        || sym.contains("SonaHotSlab>::")
+        || sym.contains("SensoryQuadCold")
+        || sym.contains("CoreQuadHot")
+        || sym.contains("TransportQuadHotCompact")
+        || sym.contains("ControlBus<")
+        || sym.contains("ControlBus>::");
     is_vm_or_slab
         && !sym.contains("drop_glue")
         && !sym.contains("Drop>::drop")
@@ -408,20 +470,57 @@ fn test_vm_release_disassembly_zero_pipeline_stalls_and_nondeterministic_calls()
         }
     }
 
+    for &pat in EXACT_OR_SUBSTR_ROOTS {
+        assert!(
+            fns.values()
+                .any(|i| i.demangled.contains(pat) && !i.instructions.is_empty()),
+            "Non-vacuous disassembly audit failure: root pattern `{pat}` matched 0 non-empty symbols in {} / {}",
+            vm_rlib.display(),
+            kernels_rlib.display()
+        );
+    }
+
+    for fn_key in &rt_closure {
+        if let Some(info) = fns.get(fn_key) {
+            assert!(
+                !info.instructions.is_empty(),
+                "Expected non-empty instruction stream for real-time closure symbol `{}`",
+                info.demangled
+            );
+        }
+    }
+
     for required in [
         "step_control_frame_default",
         "step_control_tick_3khz_default",
+        "ControlBus<dnam_vm::math::scalar::ScalarBackend>>::step_frame",
+        "tick_control_boundary",
+        "sona_graph_eval_core_quads_default",
+        "sona_graph_convolver_chunk_default",
+        "sona_graph_transport_top_default",
+        "sona_graph_transport_end_default",
+        "sona_graph_sensory_step_default",
+        "sona_graph_op_n_pre_step_default",
+        "sona_graph_dispatch_transport_3khz_default",
+        "ConvolverHighSrFirExt>::step_frame",
         "bind_dnam_bin_prevalidated",
         "sona_vm_process_block_default",
         "sona_vm_process_tick16_default",
         "sona_vm_step_frame_default",
         "sona_vm_step_control_tick_default",
+        "process_block_sona",
+        "process_tick16_const",
+        "process_microchunk_4",
+        "step_frame_sona",
+        "step_frame_4x_sona",
+        "retune_kautz_banks_3khz",
         "set_op_t_write_enable",
         "step_control_tick_3khz",
-        "hoist_groups_and_readouts",
+        "hoist_core_quads_and_readouts",
+        "step_lfos_and_skewed_q2",
         "DynamicSonaVm>::process_block",
         "DynamicSonaVm>::process_tick16_const",
-        "DynamicSonaVm>::step_frame_4port",
+        "DynamicSonaVm>::step_frame",
         "DynamicSonaVm>::step_control_tick_3khz",
         "DynamicSonaVm>::set_quad_write_enable",
         "DynamicSonaVm>::set_op_t_write_enable",
@@ -432,9 +531,6 @@ fn test_vm_release_disassembly_zero_pipeline_stalls_and_nondeterministic_calls()
         "DynamicSonaVm>::set_offline_bounce",
         "DynamicSonaVm>::retime_sample_rate",
         "DynamicSonaVm>::reset",
-        "DynamicSonaVm>::set_ms_width",
-        "DynamicSonaVm>::set_wdw_mode",
-        "DynamicSonaVm>::set_wdw_enabled",
         "sona_vm_set_live_analog_drift_enabled_default",
         "sona_vm_clear_saturation_flags_default",
         "latch_immediate_at_init_or_reset",
@@ -443,26 +539,17 @@ fn test_vm_release_disassembly_zero_pipeline_stalls_and_nondeterministic_calls()
         "DynamicSonaVm>::get_latency_samples",
         "DynamicSonaVm>::saturation_flags",
         "DynamicSonaVm>::clear_saturation_flags",
-        "DynamicSonaVm>::configure_return_alignment",
         "DynamicSonaVm>::telemetry",
     ] {
         assert!(
-            rt_closure
-                .iter()
-                .any(|k| fns.get(k).is_some_and(|i| i.demangled.contains(required))),
-            "Expected VM real-time root `{required}` in {} / {}",
+            rt_closure.iter().any(|k| fns
+                .get(k)
+                .is_some_and(|i| i.demangled.contains(required) && !i.instructions.is_empty())),
+            "Expected non-empty VM real-time root `{required}` in {} / {}",
             vm_rlib.display(),
             kernels_rlib.display()
         );
     }
-    assert!(
-        rt_closure.iter().any(|k| fns.get(k).is_some_and(|i| {
-            i.demangled.contains("DynamicSonaVm>::step_frame")
-                && !i.demangled.contains("step_frame_4port")
-        })),
-        "Expected distinct DynamicSonaVm>::step_frame root in {}",
-        vm_rlib.display()
-    );
     assert!(root_count >= 10 && rt_closure.len() > root_count);
 
     let mut crate_reloc_violations = Vec::new();

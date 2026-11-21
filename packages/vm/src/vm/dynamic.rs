@@ -295,54 +295,26 @@ impl DynamicSonaVm {
             Self::WasmSimd128(vm) => vm.step_frame(in_l, in_r),
         }
     }
-
-    /// Steps one `4`-port (`4CM`/`WDW`) stereo frame.
-    #[inline(never)]
-    pub fn step_frame_4port(
-        &mut self,
-        inst_lr: [f32; 2],
-        ret_lr: [f32; 2],
-        has_return: bool,
-    ) -> Result<([f32; 2], [f32; 2]), VmError> {
-        match self {
-            Self::Scalar(vm) => vm.step_frame_4port(inst_lr, ret_lr, has_return),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmNeon(vm) => vm.step_frame_4port(inst_lr, ret_lr, has_return),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmSve2(vm) => vm.step_frame_4port(inst_lr, ret_lr, has_return),
-            #[cfg(target_arch = "aarch64")]
-            Self::ArmSme(vm) => vm.step_frame_4port(inst_lr, ret_lr, has_return),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Sse2(vm) => vm.step_frame_4port(inst_lr, ret_lr, has_return),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Sse42(vm) => vm.step_frame_4port(inst_lr, ret_lr, has_return),
-            #[cfg(target_arch = "x86_64")]
-            Self::X86Avx2Fma(vm) => vm.step_frame_4port(inst_lr, ret_lr, has_return),
-            #[cfg(target_arch = "wasm32")]
-            Self::WasmSimd128(vm) => vm.step_frame_4port(inst_lr, ret_lr, has_return),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bin::{DnamBinBuildInput, encode_dnam_bin_into};
-    use crate::graph::{IoAlignmentMode, WdwDryTapMode};
+    use crate::bin::{DNBN_FLAG_STEREO_OUT, DnamBinBuildInput, encode_dnam_bin_into};
 
     #[test]
     fn test_dynamic_sona_vm_scalar_vs_best_backend_zero_ulp_parity() {
         let a0 = DnamBinBuildInput::default_arena0_lite();
         let input = DnamBinBuildInput {
             reference_sample_rate_hz: 48_000,
-            header_flags: 0,
+            header_flags: DNBN_FLAG_STEREO_OUT,
             ext_ring_pow2_frames: 0,
             ext_ring_lines: 0,
             ext_ring_format: 0,
             declared_max_delay_48k: 128,
             dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
             tail_time_ms: 0.0,
-            r_ac_default: 0.99,
+            ro_pole_48k: 0.99,
             switch_xfade_samples: 0,
             content_hash_prefix: [0; 8],
             controls: &[],
@@ -399,14 +371,14 @@ mod tests {
             [crate::control::ControlClampDescriptor::range(0.0, 1.0, 0.5, 2, [0.0; 3]).to_wire()];
         let input = DnamBinBuildInput {
             reference_sample_rate_hz: 48_000,
-            header_flags: 0,
+            header_flags: DNBN_FLAG_STEREO_OUT,
             ext_ring_pow2_frames: 0,
             ext_ring_lines: 0,
             ext_ring_format: 0,
             declared_max_delay_48k: 128,
             dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
             tail_time_ms: 0.0,
-            r_ac_default: 0.99,
+            ro_pole_48k: 0.99,
             switch_xfade_samples: 0,
             content_hash_prefix: [0; 8],
             controls: &ctrl,
@@ -449,23 +421,19 @@ mod tests {
             vm.set_live_analog_drift_enabled(true);
             assert_eq!(vm.get_latency_samples(), 0);
             assert_eq!(vm.saturation_flags(), 0);
-            vm.set_ms_width(f32::NAN);
+            assert_eq!(vm.apply_tempo_bpm(f32::NAN), 0);
             assert_ne!(vm.saturation_flags(), 0);
             vm.clear_saturation_flags();
             assert_eq!(vm.saturation_flags(), 0);
-            vm.configure_return_alignment(IoAlignmentMode::MinLatency4Tap, 1.5, 1.5);
-            vm.set_wdw_mode(WdwDryTapMode::DirectDry);
-            vm.set_wdw_enabled(false);
             vm.set_quad_write_enable(true);
+            assert!(vm.telemetry().host_write_lock);
             vm.set_op_t_write_enable(false);
+            assert!(!vm.telemetry().host_write_lock);
             vm.set_control_physical(0, 0.8).unwrap();
             vm.set_controls_batch(&[(0, 0.4)]).unwrap();
             vm.step_control_tick_3khz();
             assert_eq!(vm.apply_tempo_bpm(120.0), 0);
             let _ = vm.step_frame(0.1, -0.1).unwrap();
-            let _ = vm
-                .step_frame_4port([0.1, -0.1], [0.05, -0.05], true)
-                .unwrap();
             vm.set_offline_bounce(true).unwrap();
             assert_eq!(vm.get_latency_samples(), 12);
             vm.set_offline_bounce(false).unwrap();

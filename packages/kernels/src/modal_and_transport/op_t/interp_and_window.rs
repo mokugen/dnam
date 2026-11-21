@@ -158,7 +158,7 @@ pub fn catmull_rom_hermite_f32(s_m1: f32, s_0: f32, s_1: f32, s_2: f32, mu: f32)
     flush_subnormal_f32_bits(((c3 * t + c2) * t + c1) * t + c0)
 }
 
-/// Passive-blended Catmull-Rom reader used inside modulated spatial tank loops
+/// Passive-blended Catmull-Rom reader used inside modulated `Op-T` transport tank loops
 /// (`r_raw = y_lin + half_alpha_cubic * mu * (1 - mu) * y_curv`,
 /// `ref[dsp.op-t.reader.catmull-rom]`).
 ///
@@ -186,11 +186,11 @@ pub fn blend_catmull_rom_modulated_f32(
     flush_subnormal_f32_bits(y_lin + ha * t * omt * y_curv)
 }
 
-/// Computes `half_alpha_cubic = 0.5 * clamp((0.9992 * recipNR2(max(|g_loop_eff|, 0.5)) - 1.0) * 4.0, 0.0, 1.0)`
+/// Computes `half_alpha_cubic = 0.5 * (1.0 - mu_freeze) * clamp((0.9992 * recipNR2(max(|g_loop_eff|, 0.5)) - 1.0) * 4.0, 0.0, 1.0)`
 /// without runtime `FDIV` (`ref[dsp.op-t.reader.catmull-rom]`).
 #[inline(always)]
 #[must_use]
-pub fn compute_half_alpha_cubic_f32(g_loop_eff: f32) -> f32 {
+pub fn compute_half_alpha_cubic_f32(g_loop_eff: f32, mu_freeze: f32) -> f32 {
     let mag = if g_loop_eff.is_finite() {
         const_abs_f32(g_loop_eff).max(0.5)
     } else {
@@ -198,7 +198,8 @@ pub fn compute_half_alpha_cubic_f32(g_loop_eff: f32) -> f32 {
     };
     let r_inv = GpuVec4::splat(mag).rcp_pos_nr2().to_array()[0];
     let alpha_cubic = ((0.9992 * r_inv - 1.0) * 4.0).clamp(0.0, 1.0);
-    0.5 * alpha_cubic
+    let mu = clamp_finite_unit(mu_freeze);
+    0.5 * (1.0 - mu) * alpha_cubic
 }
 
 /// Reads an `f32` power-of-two delay ring using causal 4-tap Catmull-Rom interpolation.
@@ -579,8 +580,13 @@ mod tests {
         assert!((g_down - expected_down).abs() < 1.0e-5, "g_down={g_down}");
 
         // half_alpha_cubic == 0.5 matches Catmull-Rom Hermite; 0.0 matches linear interpolation.
-        assert_eq!(compute_half_alpha_cubic_f32(0.5), 0.5);
-        assert!(compute_half_alpha_cubic_f32(1.0) < 1.0e-6);
+        assert_eq!(compute_half_alpha_cubic_f32(0.5, 0.0), 0.5);
+        assert_eq!(compute_half_alpha_cubic_f32(0.5, 0.5), 0.25);
+        assert_eq!(compute_half_alpha_cubic_f32(0.5, 1.0), 0.0);
+        assert_eq!(compute_half_alpha_cubic_f32(0.5, f32::NAN), 0.5);
+        assert_eq!(compute_half_alpha_cubic_f32(0.5, -0.25), 0.5);
+        assert_eq!(compute_half_alpha_cubic_f32(0.5, 1.5), 0.0);
+        assert!(compute_half_alpha_cubic_f32(1.0, 0.0) < 1.0e-6);
         let cr = catmull_rom_hermite_f32(-0.5, 0.25, 0.75, -0.25, 0.37);
         let bl = blend_catmull_rom_modulated_f32(-0.5, 0.25, 0.75, -0.25, 0.37, 0.5);
         assert!((cr - bl).abs() < 1.0e-6);

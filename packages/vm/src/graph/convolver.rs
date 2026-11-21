@@ -1,5 +1,8 @@
-//! Tier-partitioned `48 kHz` lag-ordered Cabinet early FIR + modal onset stage and submodules
-//! ([`kautz`], [`high_sr`]) (`ref[dsp.cabinet.mirrored-fir-simd]`, `ref[dsp.op-m.kautz.tier-allocation]`).
+//! Tier-partitioned `48 kHz` lag-ordered `ModalConvolver` early FIR + modal onset stage and
+//! submodules ([`kautz`], [`high_sr`]) (`ref[dsp.cabinet.mirrored-fir-simd]`,
+//! `ref[dsp.op-m.kautz.tier-allocation]`).
+
+#![forbid(unsafe_code)]
 
 pub mod high_sr;
 pub mod kautz;
@@ -7,51 +10,51 @@ pub mod kautz;
 use crate::math::{MathBackend, SimdVec4, flush_recursive_state_f32};
 
 /// Number of `f32` taps evaluated per SIMD 4x4 tile segment (`16`).
-pub const CABINET_SEG_TAPS: usize = 16;
+pub const CONVOLVER_SEG_TAPS: usize = 16;
 
 /// `Lite` tier cumulative `48 kHz` FIR length per channel (`32`).
-pub const CABINET_LITE_FIR_TAPS: usize = 32;
+pub const CONVOLVER_LITE_FIR_TAPS: usize = 32;
 
 /// `Full` delta tier additional `48 kHz` FIR taps per channel (`+16`, cumulative `48`).
-pub const CABINET_FULL_DELTA_FIR_TAPS: usize = 16;
+pub const CONVOLVER_FULL_DELTA_FIR_TAPS: usize = 16;
 
 /// `Pro` delta tier additional `48 kHz` FIR taps per channel (`+48`, cumulative `96`).
-pub const CABINET_PRO_DELTA_FIR_TAPS: usize = 48;
+pub const CONVOLVER_PRO_DELTA_FIR_TAPS: usize = 48;
 
 /// `Ultra` delta tier additional `48 kHz` FIR taps per channel (`+32`, cumulative `128`).
-pub const CABINET_ULTRA_DELTA_FIR_TAPS: usize = 32;
+pub const CONVOLVER_ULTRA_DELTA_FIR_TAPS: usize = 32;
 
 /// Maximum cumulative `48 kHz` early FIR taps per channel across all tiers (`128`).
-pub const CABINET_MAX_FIR_TAPS: usize = CABINET_LITE_FIR_TAPS
-    + CABINET_FULL_DELTA_FIR_TAPS
-    + CABINET_PRO_DELTA_FIR_TAPS
-    + CABINET_ULTRA_DELTA_FIR_TAPS;
+pub const CONVOLVER_MAX_FIR_TAPS: usize = CONVOLVER_LITE_FIR_TAPS
+    + CONVOLVER_FULL_DELTA_FIR_TAPS
+    + CONVOLVER_PRO_DELTA_FIR_TAPS
+    + CONVOLVER_ULTRA_DELTA_FIR_TAPS;
 
 /// Maximum causal micro-chunk length supported by the stack FIR work buffer (`4` samples).
-pub const CABINET_MAX_CHUNK_FRAMES: usize = 4;
+pub const CONVOLVER_MAX_CHUNK_FRAMES: usize = 4;
 
 /// Total stack scratch work-buffer elements per channel (`N_max + 4 = 132` floats = `528 B`).
-pub const CABINET_WORK_LEN: usize = CABINET_MAX_FIR_TAPS + CABINET_MAX_CHUNK_FRAMES;
+pub const CONVOLVER_WORK_LEN: usize = CONVOLVER_MAX_FIR_TAPS + CONVOLVER_MAX_CHUNK_FRAMES;
 
 /// Nominal `48 kHz` Kautz modal bank onset delay (`16` samples, `0.333 ms`).
-pub const CABINET_KAUTZ_ONSET_DELAY_48K: usize = 16;
+pub const CONVOLVER_KAUTZ_ONSET_DELAY_48K: usize = 16;
 
-const MAX_SEGMENTS: usize = CABINET_MAX_FIR_TAPS / CABINET_SEG_TAPS;
+const MAX_SEGMENTS: usize = CONVOLVER_MAX_FIR_TAPS / CONVOLVER_SEG_TAPS;
 
-const _: () = assert!(CABINET_MAX_FIR_TAPS == 128);
-const _: () = assert!(CABINET_WORK_LEN == 132);
+const _: () = assert!(CONVOLVER_MAX_FIR_TAPS == 128);
+const _: () = assert!(CONVOLVER_WORK_LEN == 132);
 const _: () = assert!(MAX_SEGMENTS == 8);
-const _: () = assert!(CABINET_SEG_TAPS.is_power_of_two());
-const _: () = assert!((CABINET_LITE_FIR_TAPS & (CABINET_SEG_TAPS - 1)) == 0);
-const _: () = assert!((CABINET_FULL_DELTA_FIR_TAPS & (CABINET_SEG_TAPS - 1)) == 0);
-const _: () = assert!((CABINET_PRO_DELTA_FIR_TAPS & (CABINET_SEG_TAPS - 1)) == 0);
-const _: () = assert!((CABINET_ULTRA_DELTA_FIR_TAPS & (CABINET_SEG_TAPS - 1)) == 0);
-const _: () = assert!(CABINET_KAUTZ_ONSET_DELAY_48K < CABINET_LITE_FIR_TAPS);
+const _: () = assert!(CONVOLVER_SEG_TAPS.is_power_of_two());
+const _: () = assert!((CONVOLVER_LITE_FIR_TAPS & (CONVOLVER_SEG_TAPS - 1)) == 0);
+const _: () = assert!((CONVOLVER_FULL_DELTA_FIR_TAPS & (CONVOLVER_SEG_TAPS - 1)) == 0);
+const _: () = assert!((CONVOLVER_PRO_DELTA_FIR_TAPS & (CONVOLVER_SEG_TAPS - 1)) == 0);
+const _: () = assert!((CONVOLVER_ULTRA_DELTA_FIR_TAPS & (CONVOLVER_SEG_TAPS - 1)) == 0);
+const _: () = assert!(CONVOLVER_KAUTZ_ONSET_DELAY_48K < CONVOLVER_LITE_FIR_TAPS);
 
 /// Mutable partitioned `48 kHz` stereo lag-ordered FIR delay history slices (`Lite` 32,
 /// `Full` +16, `Pro` +48, `Ultra` +32 taps/ch). Inactive upper tiers pass `&mut []`.
 #[derive(Debug)]
-pub struct CabinetFirHistorySlices<'a> {
+pub struct ConvolverFirHistorySlices<'a> {
     /// Required `Lite` tier left history (`>= 32` floats).
     pub lite_l: &'a mut [f32],
     /// Required `Lite` tier right history (`>= 32` floats).
@@ -70,7 +73,7 @@ pub struct CabinetFirHistorySlices<'a> {
     pub ultra_r: &'a mut [f32],
 }
 
-impl<'a> CabinetFirHistorySlices<'a> {
+impl<'a> ConvolverFirHistorySlices<'a> {
     /// Constructs a `Lite`-only history view (`32` taps/ch).
     #[inline]
     pub fn lite(lite_l: &'a mut [f32], lite_r: &'a mut [f32]) -> Self {
@@ -101,32 +104,32 @@ impl<'a> CabinetFirHistorySlices<'a> {
 
     #[inline]
     fn has_lite(&self) -> bool {
-        self.lite_l.len() >= CABINET_LITE_FIR_TAPS && self.lite_r.len() >= CABINET_LITE_FIR_TAPS
+        self.lite_l.len() >= CONVOLVER_LITE_FIR_TAPS && self.lite_r.len() >= CONVOLVER_LITE_FIR_TAPS
     }
 
     #[inline]
     fn has_full(&self) -> bool {
-        self.full_l.len() >= CABINET_FULL_DELTA_FIR_TAPS
-            && self.full_r.len() >= CABINET_FULL_DELTA_FIR_TAPS
+        self.full_l.len() >= CONVOLVER_FULL_DELTA_FIR_TAPS
+            && self.full_r.len() >= CONVOLVER_FULL_DELTA_FIR_TAPS
     }
 
     #[inline]
     fn has_pro(&self) -> bool {
-        self.pro_l.len() >= CABINET_PRO_DELTA_FIR_TAPS
-            && self.pro_r.len() >= CABINET_PRO_DELTA_FIR_TAPS
+        self.pro_l.len() >= CONVOLVER_PRO_DELTA_FIR_TAPS
+            && self.pro_r.len() >= CONVOLVER_PRO_DELTA_FIR_TAPS
     }
 
     #[inline]
     fn has_ultra(&self) -> bool {
-        self.ultra_l.len() >= CABINET_ULTRA_DELTA_FIR_TAPS
-            && self.ultra_r.len() >= CABINET_ULTRA_DELTA_FIR_TAPS
+        self.ultra_l.len() >= CONVOLVER_ULTRA_DELTA_FIR_TAPS
+            && self.ultra_r.len() >= CONVOLVER_ULTRA_DELTA_FIR_TAPS
     }
 }
 
 /// Immutable partitioned `48 kHz` stereo FIR tap weight slices (`Lite` 32, `Full` +16,
 /// `Pro` +48, `Ultra` +32 taps/ch). Inactive upper tiers pass `&[]`.
 #[derive(Clone, Copy, Debug)]
-pub struct CabinetFirWeightSlices<'a> {
+pub struct ConvolverFirWeightSlices<'a> {
     /// Required `Lite` tier left FIR coefficients (`>= 32` floats).
     pub lite_l: &'a [f32],
     /// Required `Lite` tier right FIR coefficients (`>= 32` floats).
@@ -145,7 +148,7 @@ pub struct CabinetFirWeightSlices<'a> {
     pub ultra_r: &'a [f32],
 }
 
-impl<'a> CabinetFirWeightSlices<'a> {
+impl<'a> ConvolverFirWeightSlices<'a> {
     /// Constructs a `Lite`-only weight view (`32` taps/ch).
     #[inline]
     pub const fn lite(lite_l: &'a [f32], lite_r: &'a [f32]) -> Self {
@@ -167,25 +170,25 @@ impl<'a> CabinetFirWeightSlices<'a> {
         if !self.has_lite() {
             return 0;
         }
-        let mut n = CABINET_LITE_FIR_TAPS;
+        let mut n = CONVOLVER_LITE_FIR_TAPS;
         if self.has_full() {
-            n += CABINET_FULL_DELTA_FIR_TAPS;
+            n += CONVOLVER_FULL_DELTA_FIR_TAPS;
             if self.has_pro() {
-                n += CABINET_PRO_DELTA_FIR_TAPS;
+                n += CONVOLVER_PRO_DELTA_FIR_TAPS;
                 if self.has_ultra() {
-                    n += CABINET_ULTRA_DELTA_FIR_TAPS;
+                    n += CONVOLVER_ULTRA_DELTA_FIR_TAPS;
                 }
             }
         }
         n
     }
 
-    /// Copies cumulative weights into flat `[f32; 128]` buffers (useful for `CabinetHighSrFirExt::prepare`),
+    /// Copies cumulative weights into flat `[f32; 128]` buffers (useful for `ConvolverHighSrFirExt::prepare`),
     /// returning the active tap count copied.
     pub fn copy_cumulative_weights(
         &self,
-        out_l: &mut [f32; CABINET_MAX_FIR_TAPS],
-        out_r: &mut [f32; CABINET_MAX_FIR_TAPS],
+        out_l: &mut [f32; CONVOLVER_MAX_FIR_TAPS],
+        out_r: &mut [f32; CONVOLVER_MAX_FIR_TAPS],
     ) -> usize {
         out_l.fill(0.0);
         out_r.fill(0.0);
@@ -211,25 +214,25 @@ impl<'a> CabinetFirWeightSlices<'a> {
 
     #[inline]
     fn has_lite(&self) -> bool {
-        self.lite_l.len() >= CABINET_LITE_FIR_TAPS && self.lite_r.len() >= CABINET_LITE_FIR_TAPS
+        self.lite_l.len() >= CONVOLVER_LITE_FIR_TAPS && self.lite_r.len() >= CONVOLVER_LITE_FIR_TAPS
     }
 
     #[inline]
     fn has_full(&self) -> bool {
-        self.full_l.len() >= CABINET_FULL_DELTA_FIR_TAPS
-            && self.full_r.len() >= CABINET_FULL_DELTA_FIR_TAPS
+        self.full_l.len() >= CONVOLVER_FULL_DELTA_FIR_TAPS
+            && self.full_r.len() >= CONVOLVER_FULL_DELTA_FIR_TAPS
     }
 
     #[inline]
     fn has_pro(&self) -> bool {
-        self.pro_l.len() >= CABINET_PRO_DELTA_FIR_TAPS
-            && self.pro_r.len() >= CABINET_PRO_DELTA_FIR_TAPS
+        self.pro_l.len() >= CONVOLVER_PRO_DELTA_FIR_TAPS
+            && self.pro_r.len() >= CONVOLVER_PRO_DELTA_FIR_TAPS
     }
 
     #[inline]
     fn has_ultra(&self) -> bool {
-        self.ultra_l.len() >= CABINET_ULTRA_DELTA_FIR_TAPS
-            && self.ultra_r.len() >= CABINET_ULTRA_DELTA_FIR_TAPS
+        self.ultra_l.len() >= CONVOLVER_ULTRA_DELTA_FIR_TAPS
+            && self.ultra_r.len() >= CONVOLVER_ULTRA_DELTA_FIR_TAPS
     }
 }
 
@@ -264,8 +267,8 @@ fn slice16_to_4x4(src: &[f32]) -> [[f32; 4]; 4] {
 
 #[inline]
 fn resolve_active_segments(
-    hist: &CabinetFirHistorySlices<'_>,
-    weights: &CabinetFirWeightSlices<'_>,
+    hist: &ConvolverFirHistorySlices<'_>,
+    weights: &ConvolverFirWeightSlices<'_>,
 ) -> usize {
     if !hist.has_lite() || !weights.has_lite() {
         return 0;
@@ -285,7 +288,7 @@ fn resolve_active_segments(
 
 #[inline]
 fn weight_segment_pair<'a>(
-    weights: &'a CabinetFirWeightSlices<'_>,
+    weights: &'a ConvolverFirWeightSlices<'_>,
     seg: usize,
 ) -> (&'a [f32], &'a [f32]) {
     match seg {
@@ -300,13 +303,13 @@ fn weight_segment_pair<'a>(
     }
 }
 
-/// Evaluates `C` (`1..=4`) frames of lag-ordered `48 kHz` Cabinet early FIR + `16`-sample modal
-/// onset into `early_out` and `onset_out`, updating partitioned lag-ordered histories with
+/// Evaluates `C` (`1..=4`) frames of lag-ordered `48 kHz` `ModalConvolver` early FIR + `16`-sample
+/// modal onset into `early_out` and `onset_out`, updating partitioned lag-ordered histories with
 /// `0-ULP` chunk parity (`C = 1 x 4 == C = 4`, `ref[dsp.cabinet.mirrored-fir-simd]`).
 #[inline]
-pub fn process_cabinet_48k_chunk<const C: usize, F>(
-    hist: &mut CabinetFirHistorySlices<'_>,
-    weights: &CabinetFirWeightSlices<'_>,
+pub fn process_convolver_48k_chunk<const C: usize, F>(
+    hist: &mut ConvolverFirHistorySlices<'_>,
+    weights: &ConvolverFirWeightSlices<'_>,
     inputs_lr: &[[f32; 2]; C],
     early_out: &mut [[f32; 2]; C],
     onset_out: &mut [[f32; 2]; C],
@@ -315,14 +318,14 @@ pub fn process_cabinet_48k_chunk<const C: usize, F>(
     F: Fn(&[[f32; 4]; 4], &[[f32; 4]; 4], &[[f32; 4]; 4], &[[f32; 4]; 4]) -> (f32, f32),
 {
     let num_segs = resolve_active_segments(hist, weights);
-    if C == 0 || C > CABINET_MAX_CHUNK_FRAMES || num_segs == 0 {
+    if C == 0 || C > CONVOLVER_MAX_CHUNK_FRAMES || num_segs == 0 {
         early_out.fill([0.0, 0.0]);
         onset_out.fill([0.0, 0.0]);
         return;
     }
 
-    let mut work_l = [0.0_f32; CABINET_WORK_LEN];
-    let mut work_r = [0.0_f32; CABINET_WORK_LEN];
+    let mut work_l = [0.0_f32; CONVOLVER_WORK_LEN];
+    let mut work_r = [0.0_f32; CONVOLVER_WORK_LEN];
 
     for s in 0..C {
         work_l[C - 1 - s] = flush_recursive_state_f32(inputs_lr[s][0]);
@@ -354,15 +357,15 @@ pub fn process_cabinet_48k_chunk<const C: usize, F>(
     for s in 0..C {
         let start = C - 1 - s;
         onset_out[s] = [
-            work_l[start + CABINET_KAUTZ_ONSET_DELAY_48K],
-            work_r[start + CABINET_KAUTZ_ONSET_DELAY_48K],
+            work_l[start + CONVOLVER_KAUTZ_ONSET_DELAY_48K],
+            work_r[start + CONVOLVER_KAUTZ_ONSET_DELAY_48K],
         ];
         let mut acc_l = 0.0_f32;
         let mut acc_r = 0.0_f32;
         for seg in 0..num_segs {
-            let off = start + seg * CABINET_SEG_TAPS;
-            let xl = slice16_to_4x4(&work_l[off..off + CABINET_SEG_TAPS]);
-            let xr = slice16_to_4x4(&work_r[off..off + CABINET_SEG_TAPS]);
+            let off = start + seg * CONVOLVER_SEG_TAPS;
+            let xl = slice16_to_4x4(&work_l[off..off + CONVOLVER_SEG_TAPS]);
+            let xr = slice16_to_4x4(&work_r[off..off + CONVOLVER_SEG_TAPS]);
             let (seg_l, seg_r) = dot16(&w_tiles_l[seg], &w_tiles_r[seg], &xl, &xr);
             acc_l += seg_l;
             acc_r += seg_r;
@@ -392,10 +395,10 @@ mod tests {
     use crate::math::{DefaultMathBackend, ScalarBackend};
 
     #[test]
-    fn test_cabinet_48k_zero_ulp_chunk_parity_across_all_tiers_and_onset_16() {
-        let mut wl = [0.0_f32; CABINET_MAX_FIR_TAPS];
-        let mut wr = [0.0_f32; CABINET_MAX_FIR_TAPS];
-        for i in 0..CABINET_MAX_FIR_TAPS {
+    fn test_convolver_48k_zero_ulp_chunk_parity_across_all_tiers_and_onset_16() {
+        let mut wl = [0.0_f32; CONVOLVER_MAX_FIR_TAPS];
+        let mut wr = [0.0_f32; CONVOLVER_MAX_FIR_TAPS];
+        for i in 0..CONVOLVER_MAX_FIR_TAPS {
             wl[i] = ((i as f32) + 1.0) * 0.003_75 * if i & 1 == 0 { 1.0 } else { -0.5 };
             wr[i] = ((i as f32) + 2.0) * 0.002_5 * if i % 3 == 0 { -1.0 } else { 0.75 };
         }
@@ -416,7 +419,7 @@ mod tests {
         });
 
         for tier_taps in [32_usize, 48, 96, 128] {
-            let weights = CabinetFirWeightSlices {
+            let weights = ConvolverFirWeightSlices {
                 lite_l: &wl[..32],
                 lite_r: &wr[..32],
                 full_l: if tier_taps >= 48 { &wl[32..48] } else { &[] },
@@ -444,14 +447,14 @@ mod tests {
                 l: &'a mut [f32; 128],
                 r: &'a mut [f32; 128],
                 tier_taps: usize,
-            ) -> CabinetFirHistorySlices<'a> {
+            ) -> ConvolverFirHistorySlices<'a> {
                 let (l_lite, l_rest) = l.split_at_mut(32);
                 let (l_full, l_rest2) = l_rest.split_at_mut(16);
                 let (l_pro, l_ultra) = l_rest2.split_at_mut(48);
                 let (r_lite, r_rest) = r.split_at_mut(32);
                 let (r_full, r_rest2) = r_rest.split_at_mut(16);
                 let (r_pro, r_ultra) = r_rest2.split_at_mut(48);
-                CabinetFirHistorySlices {
+                ConvolverFirHistorySlices {
                     lite_l: l_lite,
                     lite_r: r_lite,
                     full_l: if tier_taps >= 48 { l_full } else { &mut [] },
@@ -470,7 +473,7 @@ mod tests {
                 for i in 0..24 {
                     let mut e = [[0.0_f32; 2]; 1];
                     let mut o = [[0.0_f32; 2]; 1];
-                    process_cabinet_48k_chunk::<1, _>(
+                    process_convolver_48k_chunk::<1, _>(
                         &mut h1,
                         &weights,
                         &[inputs[i]],
@@ -497,7 +500,7 @@ mod tests {
                     ];
                     let mut e = [[0.0_f32; 2]; 4];
                     let mut o = [[0.0_f32; 2]; 4];
-                    process_cabinet_48k_chunk::<4, _>(
+                    process_convolver_48k_chunk::<4, _>(
                         &mut h4,
                         &weights,
                         &chunk_in,
@@ -524,8 +527,8 @@ mod tests {
 
         // Verify exact 16-sample onset delay with DefaultMathBackend on Lite impulse.
         let (mut hl, mut hr) = ([0.0_f32; 32], [0.0_f32; 32]);
-        let mut h = CabinetFirHistorySlices::lite(&mut hl, &mut hr);
-        let w = CabinetFirWeightSlices::lite(&wl[..32], &wr[..32]);
+        let mut h = ConvolverFirHistorySlices::lite(&mut hl, &mut hr);
+        let w = ConvolverFirWeightSlices::lite(&wl[..32], &wr[..32]);
         let mut impulse = [[0.0_f32; 2]; 20];
         impulse[0] = [1.0, -0.25];
         for n in 0..5 {
@@ -537,7 +540,7 @@ mod tests {
                 impulse[base + 3],
             ];
             let (mut eo, mut oo) = ([[0.0_f32; 2]; 4], [[0.0_f32; 2]; 4]);
-            process_cabinet_48k_chunk::<4, _>(
+            process_convolver_48k_chunk::<4, _>(
                 &mut h,
                 &w,
                 &cin,

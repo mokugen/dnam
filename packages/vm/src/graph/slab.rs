@@ -1,4 +1,4 @@
-//! Prefix-nested L1D hot execution slab (`4,544..14,656 B`), `!alloc` hydration, `3 kHz` control
+//! Prefix-nested L1D hot execution slab (`4,544..14,592 B`), `!alloc` hydration, `3 kHz` control
 //! latching, and `0-ULP` chunk-split invariant micro-chunking (`#![no_std]`, `#![forbid(unsafe_code)]`).
 
 #![forbid(unsafe_code)]
@@ -9,27 +9,29 @@ pub mod layout;
 pub mod microchunk;
 
 pub use ctrl_latch::{
-    hoist_groups_and_readouts, latch_immediate_at_init_or_reset, step_control_tick_3khz,
+    hoist_core_quads_and_readouts, latch_immediate_at_init_or_reset, step_control_tick_3khz,
 };
 #[cfg(feature = "alloc")]
 pub use hydrate::{SonaSlabOwnedBacking, hydrate_slab_owned};
 pub use hydrate::{
     hydrate_slab_from_dnam_bin, reset_to_dc_equilibrium, retime_sample_rate, set_offline_bounce,
-    set_op_t_write_enable, switch_tier,
+    set_op_t_write_enable, set_quad_write_enable, switch_tier,
 };
 pub use layout::{
+    CoreQuadExtCold, CoreQuadHot, CoreQuadModulation, CoreQuadReadoutHot, CoreQuadReadoutRegs,
     CrossbarFrame, FLAG_COLD_FIR_EXT, FLAG_CROSSBAR_ACTIVE, FLAG_MONO_OUT, FLAG_OS2X,
-    FLAG_SINGLE_INPUT, FLAG_WET_POLARITY_INV, FLAG_XFADE_ACTIVE, MAX_SONA_GROUPS, MAX_SONA_TILES,
-    MAX_TOTAL_SONA_LANES, NUM_SONA_BLOCKS, SONA_BLOCK_GROUP_SLOTS, SONA_GROUP_BLOCK_AND_LOCAL,
-    SONA_INTERBLOCK_TILES, SONA_ULTRA_GROUP_TRAVERSAL_ORDER, SonaColdTail, SonaFullHotDelta,
-    SonaGroupHot, SonaGroupReadoutHot, SonaGroupReadoutRegs, SonaHotSlab, SonaInterBlockTileHot,
-    SonaLiteHotPrefix, SonaProHotDelta, SonaSlabBacking, SonaUltraHotDelta,
-    TIER_SWITCH_XFADE_SAMPLES, TierCrossbarSnapshot,
+    FLAG_SINGLE_INPUT, FLAG_WET_POLARITY_INV, FLAG_XFADE_ACTIVE, MAX_CORE_QUADS, MAX_SONA_TILES,
+    MAX_TOTAL_SONA_LANES, NUM_SONA_BLOCKS, SONA_BLOCK_QUAD_SLOTS, SONA_CORE_QUAD_BLOCK_AND_LOCAL,
+    SONA_FULL_HOT_DELTA_BYTES, SONA_INTERBLOCK_TILES, SONA_LITE_HOT_BYTES, SONA_OS2X_HOT_BYTES,
+    SONA_PRO_HOT_DELTA_BYTES, SONA_ULTRA_HOT_DELTA_BYTES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER,
+    SonaColdTail, SonaFullHotDelta, SonaHotSlab, SonaInterBlockTileHot, SonaLiteHotPrefix,
+    SonaProHotDelta, SonaSlabBacking, SonaUltraHotDelta, TIER_SWITCH_XFADE_SAMPLES,
+    TierCrossbarSnapshot,
 };
 pub use microchunk::core_step::HoistedCoreChunk;
 pub use microchunk::{
-    evaluate_matryoshka_groups, process_block_sona, process_tick16_const, step_frame_4port_sona,
-    step_frame_4x_sona, step_frame_sona,
+    evaluate_matryoshka_core_quads, process_block_sona, process_tick16_const, step_frame_4x_sona,
+    step_frame_sona,
 };
 
 use crate::graph::GraphBackend;
@@ -66,42 +68,43 @@ mod tests {
     use super::*;
     #[cfg(feature = "alloc")]
     use crate::bin::{Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire};
-    use crate::bin::{DnamBinBuildInput, DnamBinView, encode_dnam_bin_into};
+    use crate::bin::{DNBN_FLAG_STEREO_OUT, DnamBinBuildInput, DnamBinView, encode_dnam_bin_into};
     use crate::control::{ControlBusBacking, ControlClampDescriptor, Cp1ContributorSlot};
     #[cfg(feature = "alloc")]
     use crate::math::ScalarBackend;
     use crate::math::{DefaultMathBackend, f32_to_fp16};
     use crate::types::Tier;
-    use dnam_kernels::{QUAD_FLAG_HOST_WRITE_LOCK, QUAD_FLAG_WE_HOLD_ACTIVE};
+    use dnam_kernels::QUAD_FLAG_HOST_WRITE_LOCK;
     #[cfg(feature = "alloc")]
     use zerocopy::FromZeros;
     use zerocopy::byteorder::little_endian::{F32, U16};
 
     fn make_lite_bin_bytes() -> ([u8; 128 + 4_608], usize) {
         let mut a0 = DnamBinBuildInput::default_arena0_lite();
-        a0.spatial_tank_lite.delay_samples = [12.0, 17.0, 23.0, 31.0].map(F32::new);
-        a0.spatial_tank_lite.g_loop = F32::new(0.4);
-        a0.spatial_tank_lite.dry_mix_fp16 = U16::new(f32_to_fp16(1.0));
-        a0.spatial_tank_lite.input_gains_fp16 = [0.25; 4].map(|v| U16::new(f32_to_fp16(v)));
-        a0.spatial_tank_lite.wet_tap_l_fp16 = [0.25; 4].map(|v| U16::new(f32_to_fp16(v)));
-        a0.spatial_tank_lite.wet_tap_r_fp16 = [0.25; 4].map(|v| U16::new(f32_to_fp16(v)));
-        a0.varpro_readout_lite.direct_s2_u_gain = [F32::new(1.0), F32::new(1.0)];
-        a0.groups[0].in_x_weight = [0.5, 0.25, 0.0, 0.0].map(F32::new);
-        a0.groups[0].svf_g = [0.2; 4].map(F32::new);
-        a0.groups[0].svf_k = [0.7; 4].map(F32::new);
-        a0.groups[0].tone_dir_fp16 = [U16::new(f32_to_fp16(1.0)); 4];
-        a0.varpro_readout_lite.w_ro_fp16[6] = U16::new(f32_to_fp16(0.5));
-        a0.varpro_readout_lite.w_ro_fp16[7] = U16::new(f32_to_fp16(0.5));
+        a0.transport_lite.delay_samples = [12.0, 17.0, 23.0, 31.0].map(F32::new);
+        a0.transport_lite.g_loop = F32::new(0.4);
+        a0.control_bus_lite.tank_dry_mix_fp16 = U16::new(f32_to_fp16(1.0));
+        a0.transport_lite.input_gains_fp16 = [0.25; 4].map(|v| U16::new(f32_to_fp16(v)));
+        a0.transport_lite.wet_tap_l_fp16 = [0.25; 4].map(|v| U16::new(f32_to_fp16(v)));
+        a0.transport_lite.wet_tap_r_fp16 = [0.25; 4].map(|v| U16::new(f32_to_fp16(v)));
+        a0.linear_readout_lite.direct_s2_u_gain = [F32::new(1.0), F32::new(1.0)];
+        a0.core_quads[0].in_mid_weight_fp16 =
+            [0.5, 0.25, 0.0, 0.0].map(|v| U16::new(f32_to_fp16(v)));
+        a0.core_quads[0].svf_g = [0.2; 4].map(F32::new);
+        a0.core_quads[0].svf_k_fp16 = [U16::new(f32_to_fp16(0.7)); 4];
+        a0.core_quads[0].tone_dir_fp16 = [U16::new(f32_to_fp16(1.0)); 4];
+        a0.linear_readout_lite.w_ro_fp16[6] = U16::new(f32_to_fp16(0.5));
+        a0.linear_readout_lite.w_ro_fp16[7] = U16::new(f32_to_fp16(0.5));
         let input = DnamBinBuildInput {
             reference_sample_rate_hz: 48_000,
-            header_flags: 0,
+            header_flags: DNBN_FLAG_STEREO_OUT,
             ext_ring_pow2_frames: 0,
             ext_ring_lines: 0,
             ext_ring_format: 0,
             declared_max_delay_48k: 128,
             dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
             tail_time_ms: 100.0,
-            r_ac_default: 0.99,
+            ro_pole_48k: 0.99,
             switch_xfade_samples: 0,
             content_hash_prefix: [0; 8],
             controls: &[],
@@ -160,10 +163,10 @@ mod tests {
         .unwrap();
         let backing = SonaSlabBacking {
             control_bus: ctrl,
-            cabinet_fir_ext: &mut [],
-            tank_ext_fp16: [&mut [], &mut [], &mut [], &mut []],
-            tank_ext_f32: [&mut [], &mut [], &mut [], &mut []],
-            tank_schroeder: [&mut [], &mut [], &mut [], &mut []],
+            convolver_fir_ext: &mut [],
+            transport_ext_fp16: [&mut [], &mut [], &mut [], &mut []],
+            transport_ext_f32: [&mut [], &mut [], &mut [], &mut []],
+            transport_schroeder: [&mut [], &mut [], &mut [], &mut []],
             cold_tail: &mut bufs.cold,
         };
         hydrate_slab_from_dnam_bin(&view, Tier::Lite, host_hz, false, backing).unwrap()
@@ -171,6 +174,16 @@ mod tests {
 
     #[test]
     fn test_zero_ulp_chunk_invariance_starcenter_and_dual_latch_no_alloc() {
+        assert_eq!(
+            [
+                SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Lite, false),
+                SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Lite, true),
+                SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Full, true),
+                SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Pro, true),
+                SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Ultra, true),
+            ],
+            [4_544, 4_800, 7_552, 11_136, 14_592]
+        );
         let (buf, n) = make_lite_bin_bytes();
         let bytes = &buf[..n];
         let mut in_l = [0.0_f32; 64];
@@ -193,12 +206,21 @@ mod tests {
                 let (zl, zr) = step_frame_sona(&mut slab, 0.0, 0.0).unwrap();
                 assert_eq!((zl.to_bits(), zr.to_bits()), (0, 0));
             }
-            slab.quad_hot_mut(0).flags |= QUAD_FLAG_WE_HOLD_ACTIVE;
-            set_op_t_write_enable(&mut slab, true);
-            assert_ne!(slab.quad_hot(0).flags & QUAD_FLAG_HOST_WRITE_LOCK, 0);
+            set_quad_write_enable(&mut slab, true);
+            assert_ne!(
+                slab.transport_quad_hot(0).flags & QUAD_FLAG_HOST_WRITE_LOCK,
+                0
+            );
             reset_to_dc_equilibrium(&mut slab);
-            assert_eq!(slab.quad_hot(0).flags & QUAD_FLAG_WE_HOLD_ACTIVE, 0);
-            assert_ne!(slab.quad_hot(0).flags & QUAD_FLAG_HOST_WRITE_LOCK, 0);
+            assert_ne!(
+                slab.transport_quad_hot(0).flags & QUAD_FLAG_HOST_WRITE_LOCK,
+                0
+            );
+            set_op_t_write_enable(&mut slab, false);
+            assert_eq!(
+                slab.transport_quad_hot(0).flags & QUAD_FLAG_HOST_WRITE_LOCK,
+                0
+            );
         }
 
         let (mut out_split_l, mut out_split_r) = ([0.0_f32; 64], [0.0_f32; 64]);
@@ -229,9 +251,9 @@ mod tests {
     fn test_owned_ultra_hydrate_tier_switch_and_44k1_invariance() {
         let mut a0 = DnamBinBuildInput::default_arena0_lite();
         a0.crossbar.cell_desc.tier_flags = U16::new(0x000F);
-        a0.spatial_tank_lite.delay_samples = [24.0, 31.0, 37.0, 43.0].map(F32::new);
-        a0.spatial_tank_lite.dry_mix_fp16 = U16::new(f32_to_fp16(1.0));
-        a0.varpro_readout_lite.direct_s2_u_gain = [F32::new(1.0), F32::new(1.0)];
+        a0.transport_lite.delay_samples = [24.0, 31.0, 37.0, 43.0].map(F32::new);
+        a0.control_bus_lite.tank_dry_mix_fp16 = U16::new(f32_to_fp16(1.0));
+        a0.linear_readout_lite.direct_s2_u_gain = [F32::new(1.0), F32::new(1.0)];
         let (a1, a2, a3) = (
             Arena1FullDeltaWire::new_zeroed(),
             Arena2ProDeltaWire::new_zeroed(),
@@ -239,14 +261,14 @@ mod tests {
         );
         let input = DnamBinBuildInput {
             reference_sample_rate_hz: 48_000,
-            header_flags: 0,
+            header_flags: DNBN_FLAG_STEREO_OUT,
             ext_ring_pow2_frames: 8,
             ext_ring_lines: 4,
             ext_ring_format: 0,
             declared_max_delay_48k: 128,
             dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
             tail_time_ms: 100.0,
-            r_ac_default: 0.99,
+            ro_pole_48k: 0.99,
             switch_xfade_samples: 48,
             content_hash_prefix: [0; 8],
             controls: &[],

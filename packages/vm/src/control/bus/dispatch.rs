@@ -15,11 +15,6 @@ pub const ANTI_ZIPPER_SNAP_EPS: f32 = 1.0e-7;
 /// Canonical `xorshift64*` PRNG initial seed for live OU drift (`ref[dsp.ctrl.dispatch.sparse-and-active-ramps]`).
 pub const DEFAULT_DRIFT_PRNG_SEED: u64 = 0x853C_49E6_748F_EA9B;
 
-/// `stage_targets` slots receiving OU analog drift (`2, 5 = block_adaa_oct`, `10 = kautz_oct`, `14 = tank_psi`).
-const DRIFT_OU_SLOTS: [usize; 4] = [2, 5, 10, 14];
-/// OU analog drift coupling weights per channel.
-const DRIFT_OU_WEIGHTS: [f32; 4] = [1.0, 1.0, 0.25, 0.25];
-
 /// Computes the control-bus decimation stride $K_{\text{ctrl}}(f_s) = \max(8, \mathrm{round}(f_s / 3000))$
 /// using precomputed `binary64` reciprocal multiplication (`0 FDIV`, `ref[dsp.ctrl.op-m.ballistic-lfo]`).
 #[inline]
@@ -123,13 +118,13 @@ pub(crate) fn evaluate_w_ctrl_32<B: MathBackend>(
             stage_targets[16 + r] = acc.horizontal_sum();
         }
     } else {
-        stage_targets[16..31].fill(0.0);
+        stage_targets[16..32].fill(0.0);
     }
     stage_targets[31] = 0.0;
 }
 
-/// Steps optional `xorshift64*` Ornstein–Uhlenbeck analog drift onto `stage_targets` slots
-/// `[2, 5, 10, 14]`, or resets drift state to `+0.0` when disabled.
+/// Steps optional `xorshift64*` Ornstein–Uhlenbeck analog drift state (`ou_drift_state[0..4]`)
+/// for projection onto `eff_z_stage`, or resets drift state to `+0.0` when disabled.
 #[inline]
 pub(crate) fn step_ou_drift(
     live_analog_drift_enabled: bool,
@@ -138,7 +133,6 @@ pub(crate) fn step_ou_drift(
     rho_drift_host: f32,
     drift_prng_state: &mut u64,
     ou_drift_state: &mut [f32; 4],
-    stage_targets: &mut [f32; STAGE_TARGET_SLOTS],
 ) {
     if !(live_analog_drift_enabled && !offline_bounce && sigma_drift > 0.0) {
         *ou_drift_state = [0.0; 4];
@@ -157,16 +151,15 @@ pub(crate) fn step_ou_drift(
         *drift_prng_state = x;
         let rand_u32 = (x.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u32;
         let xi = ((rand_u32 >> 8) as f32) * const_f32_pow2(-23) - 1.0;
-        let next = flush_subnormal_f32_bits(rho_drift_host * ou_drift_state[d] + scale * xi);
-        ou_drift_state[d] = next;
-        stage_targets[DRIFT_OU_SLOTS[d]] += DRIFT_OU_WEIGHTS[d] * next;
+        ou_drift_state[d] =
+            flush_subnormal_f32_bits(rho_drift_host * ou_drift_state[d] + scale * xi);
     }
 }
 
-/// Recomputes per-sample linear micro-ramp deltas across slots `0..15` & `17..30`, snapping
-/// slot `16` (`op_t_we_drive`) immediately (`delta[16] = 0.0`, `ref[dsp.ctrl.dispatch.micro-ramp]`).
+/// Recomputes per-sample linear micro-ramp deltas uniformly across all 32 slots (`0..32`,
+/// reserving `[31] == 0.0`, `ref[dsp.ctrl.dispatch.micro-ramp]`).
 #[inline]
-pub(crate) fn prepare_micro_ramp_deltas(
+pub(crate) fn prepare_micro_ramp_deltas<B: MathBackend>(
     stage_targets: &[f32; STAGE_TARGET_SLOTS],
     prev_stage_targets: &mut [f32; STAGE_TARGET_SLOTS],
     current_stage_params: &mut [f32; STAGE_TARGET_SLOTS],
@@ -174,23 +167,28 @@ pub(crate) fn prepare_micro_ramp_deltas(
     alpha_ramp: f32,
 ) {
     *prev_stage_targets = *current_stage_params;
-    for r in 0..16 {
-        stage_ramp_deltas[r] = (stage_targets[r] - prev_stage_targets[r]) * alpha_ramp;
-    }
-    stage_ramp_deltas[16] = 0.0;
-    current_stage_params[16] = stage_targets[16];
-    prev_stage_targets[16] = stage_targets[16];
-    for r in 17..31 {
-        stage_ramp_deltas[r] = (stage_targets[r] - prev_stage_targets[r]) * alpha_ramp;
+    let v_alpha = B::Vec4::splat(alpha_ramp);
+    let (target_quads, _) = stage_targets.as_chunks::<4>();
+    let (prev_quads, _) = prev_stage_targets.as_chunks::<4>();
+    let (delta_quads, _) = stage_ramp_deltas.as_chunks_mut::<4>();
+    for ((delta_q, target_q), prev_q) in delta_quads
+        .iter_mut()
+        .zip(target_quads.iter())
+        .zip(prev_quads.iter())
+    {
+        let target_v = B::Vec4::load(target_q);
+        let prev_v = B::Vec4::load(prev_q);
+        target_v.sub(prev_v).mul(v_alpha).store(delta_q);
     }
     stage_ramp_deltas[31] = 0.0;
     current_stage_params[31] = 0.0;
     prev_stage_targets[31] = 0.0;
 }
 
-/// Advances micro-ramps by one VM frame with bounded interval clamping (no overshoot) and final snap.
+/// Advances all 32 micro-ramps uniformly by one VM frame with bounded interval clamping
+/// (no overshoot) and final end-of-stride snap (`[31] == 0.0`).
 #[inline]
-pub(crate) fn advance_micro_ramp_frame(
+pub(crate) fn advance_micro_ramp_frame<B: MathBackend>(
     stage_targets: &[f32; STAGE_TARGET_SLOTS],
     prev_stage_targets: &[f32; STAGE_TARGET_SLOTS],
     current_stage_params: &mut [f32; STAGE_TARGET_SLOTS],
@@ -203,15 +201,23 @@ pub(crate) fn advance_micro_ramp_frame(
         current_stage_params[31] = 0.0;
         return;
     }
-    for r in 0..16 {
-        let lo = prev_stage_targets[r].min(stage_targets[r]);
-        let hi = prev_stage_targets[r].max(stage_targets[r]);
-        current_stage_params[r] = (current_stage_params[r] + stage_ramp_deltas[r]).clamp(lo, hi);
-    }
-    for r in 17..31 {
-        let lo = prev_stage_targets[r].min(stage_targets[r]);
-        let hi = prev_stage_targets[r].max(stage_targets[r]);
-        current_stage_params[r] = (current_stage_params[r] + stage_ramp_deltas[r]).clamp(lo, hi);
+    let (target_quads, _) = stage_targets.as_chunks::<4>();
+    let (prev_quads, _) = prev_stage_targets.as_chunks::<4>();
+    let (delta_quads, _) = stage_ramp_deltas.as_chunks::<4>();
+    let (cur_quads, _) = current_stage_params.as_chunks_mut::<4>();
+    for (((cur_q, target_q), prev_q), delta_q) in cur_quads
+        .iter_mut()
+        .zip(target_quads.iter())
+        .zip(prev_quads.iter())
+        .zip(delta_quads.iter())
+    {
+        let target_v = B::Vec4::load(target_q);
+        let prev_v = B::Vec4::load(prev_q);
+        let cur_v = B::Vec4::load(cur_q);
+        let delta_v = B::Vec4::load(delta_q);
+        let lo_v = prev_v.min(target_v);
+        let hi_v = prev_v.max(target_v);
+        cur_v.add(delta_v).clamp(lo_v, hi_v).store(cur_q);
     }
     current_stage_params[31] = 0.0;
 }
@@ -221,7 +227,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_control_stride_ratio_and_slot16_snap() {
+    fn test_control_stride_ratio_and_uniform_32_slot_ramping() {
         assert_eq!(control_stride_for_rate(44_100.0), 15);
         assert_eq!(control_stride_for_rate(48_000.0), 16);
         assert_eq!(control_stride_for_rate(96_000.0), 32);
@@ -231,16 +237,55 @@ mod tests {
         let mut targets = [0.0_f32; 32];
         targets[0] = 1.0;
         targets[16] = -0.6;
+        targets[30] = 0.8;
+        targets[31] = 99.0;
         let mut prev = [0.0_f32; 32];
         let mut cur = [0.0_f32; 32];
         let mut deltas = [0.0_f32; 32];
-        prepare_micro_ramp_deltas(&targets, &mut prev, &mut cur, &mut deltas, 0.0625);
-        assert_eq!(cur[16], -0.6);
-        assert_eq!(deltas[16], 0.0);
-        advance_micro_ramp_frame(&targets, &prev, &mut cur, &deltas, 0, 16);
+        prepare_micro_ramp_deltas::<crate::math::ScalarBackend>(
+            &targets,
+            &mut prev,
+            &mut cur,
+            &mut deltas,
+            0.0625,
+        );
+        assert_eq!(cur[16], 0.0);
+        assert!((deltas[16] - (-0.6 * 0.0625)).abs() < 1e-7);
+        assert!((deltas[30] - (0.8 * 0.0625)).abs() < 1e-7);
+        assert_eq!(deltas[31], 0.0);
+        assert_eq!(cur[31], 0.0);
+
+        advance_micro_ramp_frame::<crate::math::ScalarBackend>(
+            &targets, &prev, &mut cur, &deltas, 0, 16,
+        );
         assert!((cur[0] - 0.0625).abs() < 1e-6);
-        advance_micro_ramp_frame(&targets, &prev, &mut cur, &deltas, 15, 16);
+        assert!((cur[16] - (-0.0375)).abs() < 1e-6);
+        assert!((cur[30] - 0.05).abs() < 1e-6);
+        assert_eq!(cur[31], 0.0);
+
+        // Verify interval clamping prevents overshoot before end-of-stride snap.
+        let mut cur_clamp = [0.75_f32; 32];
+        let prev_clamp = [0.0_f32; 32];
+        let target_clamp = [0.8_f32; 32];
+        let deltas_clamp = [0.5_f32; 32];
+        advance_micro_ramp_frame::<crate::math::ScalarBackend>(
+            &target_clamp,
+            &prev_clamp,
+            &mut cur_clamp,
+            &deltas_clamp,
+            2,
+            16,
+        );
+        assert_eq!(cur_clamp[16], 0.8);
+        assert_eq!(cur_clamp[31], 0.0);
+
+        advance_micro_ramp_frame::<crate::math::ScalarBackend>(
+            &targets, &prev, &mut cur, &deltas, 15, 16,
+        );
         assert_eq!(cur[0], 1.0);
+        assert_eq!(cur[16], -0.6);
+        assert_eq!(cur[30], 0.8);
+        assert_eq!(cur[31], 0.0);
 
         let w = [[0.25_f32; 16]; 16];
         let wu = [[0.5_f32; 4]; 16];
@@ -267,11 +312,35 @@ mod tests {
         assert_eq!(out_t[16], 1.25);
         assert_eq!(out_t[31], 0.0);
 
+        evaluate_w_ctrl_32::<crate::math::ScalarBackend>(
+            DispatchInputs {
+                q16_head: &[1.0, 0.0, 0.0, 0.0],
+                q16_basis: &[0.0, 1.0, 0.0, 0.0],
+                q16_lfo: &[0.0, 0.0, 1.0, 0.0],
+                q16_env: &[0.0, 0.0, 0.0, 1.0],
+                qu: &[0.5, 0.0, 0.0, 0.0],
+                is_ultra: true,
+                cext_present: false,
+            },
+            DispatchMatrices {
+                w_ctrl: &w,
+                w_ctrl_ultra: &wu,
+                w_ctrl_ext: &w,
+                w_ctrl_ultra_ext: &wu,
+            },
+            &mut out_t,
+        );
+        assert_eq!(out_t[0], 1.25);
+        assert_eq!(&out_t[16..32], &[0.0; 16]);
+
         let mut prng = 0_u64;
         let mut drift = [0.0_f32; 4];
-        step_ou_drift(true, false, 0.1, 0.95, &mut prng, &mut drift, &mut out_t);
+        let before_targets = out_t;
+        step_ou_drift(true, false, 0.1, 0.95, &mut prng, &mut drift);
         assert_ne!(prng, 0);
-        step_ou_drift(true, true, 0.1, 0.95, &mut prng, &mut drift, &mut out_t);
+        assert_ne!(drift, [0.0; 4]);
+        assert_eq!(out_t, before_targets);
+        step_ou_drift(true, true, 0.1, 0.95, &mut prng, &mut drift);
         assert_eq!(drift, [0.0; 4]);
     }
 }

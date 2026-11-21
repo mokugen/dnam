@@ -5,21 +5,22 @@
 #[cfg(feature = "alloc")]
 use alloc::vec::Vec;
 
+use dnam_kernels::TANK_MAX_SIGMA_SAT_FP16;
 use zerocopy::{FromZeros, IntoBytes};
 
 use super::arena_wire::{
     Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire,
-    PIPE_CANONICAL_V3_SONA, SONA_META_OS_EXT_PRESENT, SONA_META_ROUTER_EXT, SONA_META_TANK_LFO,
-    SONA_META_TANK_TAP_GAINS, TANK_FLAG_EXT_F32,
+    PIPE_CANONICAL_V3_SONA, SONA_META_OS_EXT_PRESENT, SONA_META_SENSORY_QUAD,
+    SONA_META_TRANSPORT_LFO, SONA_META_TRANSPORT_TAP_GAINS, TRANSPORT_FLAG_EXT_F32,
 };
 use super::header::{
     ARENA_TIER_BYTES, CEXT_DISPATCH_BYTES, CextDispatchWire, ControlClampDescriptorWire,
-    DBRM_MAGIC, DNBN_FLAG_FREEZE_EVICTED_MASK, DNBN_FLAG_RESERVED_HI_MASK, DNBN_FLAG_STEREO_OUT,
-    DNBN_MAGIC, DNBN_VERSION_MAJOR, DNBN_VERSION_MINOR, DnamBinHeaderWire, DnamBinRuntimeMetaWire,
+    DBRM_MAGIC, DNBN_FLAG_FREEZE_EVICTED_MASK, DNBN_FLAG_RESERVED_HI_MASK, DNBN_MAGIC,
+    DNBN_VERSION_MAJOR, DNBN_VERSION_MINOR, DnamBinHeaderWire, DnamBinRuntimeMetaWire,
     MAX_NUM_CONTROLS, SONA_CELL_MAGIC, TSYN_ENTRY_BYTES, TempoSyncEntryWire, align64,
 };
 use super::view::DnamBinView;
-use crate::math::{Crc32cBackend, DefaultMathBackend};
+use crate::math::{Crc32cBackend, DefaultMathBackend, f32_to_fp16};
 use crate::types::{Tier, VmError};
 
 /// Allocation error alias returned by [`encode_dnam_bin`].
@@ -39,14 +40,14 @@ pub struct DnamBinBuildInput<'a> {
     pub ext_ring_lines: u8,
     /// External sample format (`0 = fp16`, `1 = f32`).
     pub ext_ring_format: u8,
-    /// Declared `48 kHz` max spatial tank delay (`<= 48_000`).
+    /// Declared `48 kHz` max `Op-T` transport tank delay (`<= 48_000`).
     pub declared_max_delay_48k: u32,
     /// `5 Hz` wet DC blocker pole (`48 kHz`).
     pub dc_blocker_pole_5hz: f32,
     /// Decay tail duration (`>= 0.0`).
     pub tail_time_ms: f32,
-    /// Default anti-creep AC pole (`[0.0, 1.0)`).
-    pub r_ac_default: f32,
+    /// Learned `48 kHz` `LinearReadout` leak pole (`[0.0, MAX_PARALRU_R_F32]`).
+    pub ro_pole_48k: f32,
     /// Switch crossfade samples.
     pub switch_xfade_samples: u16,
     /// First `8 B` of content SHA-256 hash prefix.
@@ -72,42 +73,33 @@ pub struct DnamBinBuildInput<'a> {
 impl DnamBinBuildInput<'_> {
     /// Creates a valid default Lite [`Arena0LiteWire`] carrying canonical `SONA v3.0` headers.
     pub fn default_arena0_lite() -> Arena0LiteWire {
+        use zerocopy::byteorder::little_endian::{F32, U16, U32};
+
         let mut a0 = Arena0LiteWire::new_zeroed();
         for i in 0..4 {
-            a0.crossbar.s_router[i][i] = zerocopy::byteorder::little_endian::F32::new(1.0);
-            a0.crossbar.tier_gain_trim[i] = zerocopy::byteorder::little_endian::F32::new(1.0);
+            a0.crossbar.sense_svf_g[i] = F32::new(0.25);
+            a0.crossbar.sense_svf_k_fp16[i] =
+                U16::new(f32_to_fp16(core::f32::consts::FRAC_1_SQRT_2));
+            a0.crossbar.tier_gain_trim[i] = F32::new(1.0);
         }
-        a0.crossbar.pipeline_flags =
-            zerocopy::byteorder::little_endian::U32::new(PIPE_CANONICAL_V3_SONA);
+        a0.crossbar.pipeline_flags = U32::new(PIPE_CANONICAL_V3_SONA);
         let meta_flags = SONA_META_OS_EXT_PRESENT
-            | SONA_META_ROUTER_EXT
-            | SONA_META_TANK_TAP_GAINS
-            | SONA_META_TANK_LFO;
-        a0.crossbar.sona_meta_flags = zerocopy::byteorder::little_endian::U32::new(meta_flags);
-        a0.crossbar.anti_zipper_ramp_scale = zerocopy::byteorder::little_endian::F32::new(0.0625);
-        a0.crossbar.router_gain = [
-            zerocopy::byteorder::little_endian::F32::new(1.0),
-            zerocopy::byteorder::little_endian::F32::new(1.0),
-        ];
-        a0.crossbar.router_mix_matrix[0][0] = zerocopy::byteorder::little_endian::F32::new(1.0);
-        a0.crossbar.router_mix_matrix[1][1] = zerocopy::byteorder::little_endian::F32::new(1.0);
+            | SONA_META_SENSORY_QUAD
+            | SONA_META_TRANSPORT_TAP_GAINS
+            | SONA_META_TRANSPORT_LFO;
+        a0.crossbar.sona_meta_flags = U32::new(meta_flags);
+        a0.crossbar.anti_zipper_ramp_scale = F32::new(0.0625);
         a0.crossbar.cell_desc.magic = SONA_CELL_MAGIC;
-        a0.crossbar.cell_desc.version_major =
-            zerocopy::byteorder::little_endian::U16::new(DNBN_VERSION_MAJOR);
-        a0.crossbar.cell_desc.tier_flags = zerocopy::byteorder::little_endian::U16::new(0x0001);
-        a0.crossbar.cell_desc.oversample_factor = zerocopy::byteorder::little_endian::U16::new(1);
-        a0.crossbar.cell_desc.cell_flags = zerocopy::byteorder::little_endian::U32::new(meta_flags);
-        a0.spatial_tank_lite.r_dc =
-            zerocopy::byteorder::little_endian::F32::new(crate::math::TANK_DC_BLOCKER_48K_F32);
-        a0.control_bus_lite.rho_drift_train = zerocopy::byteorder::little_endian::F32::new(0.999);
-        a0.control_bus_lite.env_poles = [
-            zerocopy::byteorder::little_endian::F32::new(0.95),
-            zerocopy::byteorder::little_endian::F32::new(0.99),
-            zerocopy::byteorder::little_endian::F32::new(0.998),
-        ];
-        a0.control_bus_lite.trust_radius_mh = zerocopy::byteorder::little_endian::F32::new(2.5);
-        a0.control_bus_lite.rho_head_and_ctrl_tail[0] =
-            zerocopy::byteorder::little_endian::F32::new(2.5);
+        a0.crossbar.cell_desc.version_major = U16::new(DNBN_VERSION_MAJOR);
+        a0.crossbar.cell_desc.tier_flags = U16::new(0x0001);
+        a0.crossbar.cell_desc.oversample_factor = U16::new(1);
+        a0.crossbar.cell_desc.cell_flags = U32::new(meta_flags);
+        a0.transport_lite.r_dc = F32::new(crate::math::TANK_DC_BLOCKER_48K_F32);
+        a0.transport_lite.sigma_knee_fp16 = U16::new(TANK_MAX_SIGMA_SAT_FP16);
+        a0.control_bus_lite.tank_dry_mix_fp16 = U16::new(f32_to_fp16(1.0));
+        a0.control_bus_lite.rho_drift_train = F32::new(0.999);
+        a0.control_bus_lite.trust_radius_mh = F32::new(2.5);
+        a0.control_bus_lite.rho_head_and_ctrl_tail[0] = F32::new(2.5);
         a0
     }
 }
@@ -190,7 +182,7 @@ pub fn encode_dnam_bin_into_with_crc<C: Crc32cBackend>(
 
     let max_idx = max_tier.index();
     let tier_mask = (1_u16 << (max_idx + 1)) - 1;
-    let flags = (input.header_flags & !0x000F) | tier_mask | DNBN_FLAG_STEREO_OUT;
+    let flags = (input.header_flags & !0x000F) | tier_mask;
     let sc_len = input.controls.len() * 64 + input.cp1_overflow.len();
     let tsyn_len = input.tsyn.len() * TSYN_ENTRY_BYTES;
     let cext_len = if input.cext.is_some() {
@@ -240,15 +232,15 @@ pub fn encode_dnam_bin_into_with_crc<C: Crc32cBackend>(
             .map_err(|_| VmError::InsufficientBackingCapacity)?;
     }
 
-    let mut any_ext = (input.arena0.spatial_tank_lite.flags & TANK_FLAG_EXT_F32) != 0;
+    let mut any_ext = (input.arena0.transport_lite.flags & TRANSPORT_FLAG_EXT_F32) != 0;
     if let Some(a1) = input.arena1 {
-        any_ext |= (a1.spatial_tank_full.flags & TANK_FLAG_EXT_F32) != 0;
+        any_ext |= (a1.transport_full.flags & TRANSPORT_FLAG_EXT_F32) != 0;
     }
     if let Some(a2) = input.arena2 {
-        any_ext |= (a2.spatial_tank_pro[0].flags & TANK_FLAG_EXT_F32) != 0;
+        any_ext |= (a2.transport_pro[0].flags & TRANSPORT_FLAG_EXT_F32) != 0;
     }
     if let Some(a3) = input.arena3 {
-        any_ext |= (a3.spatial_tank_ultra[0].flags & TANK_FLAG_EXT_F32) != 0;
+        any_ext |= (a3.transport_ultra[0].flags & TRANSPORT_FLAG_EXT_F32) != 0;
     }
 
     if input.ext_ring_format > 1 || (input.ext_ring_format == 1 && !any_ext) {
@@ -294,7 +286,7 @@ pub fn encode_dnam_bin_into_with_crc<C: Crc32cBackend>(
             input.dc_blocker_pole_5hz,
         ),
         tail_time_ms: zerocopy::byteorder::little_endian::F32::new(input.tail_time_ms),
-        r_ac_default: zerocopy::byteorder::little_endian::F32::new(input.r_ac_default),
+        ro_pole_48k: zerocopy::byteorder::little_endian::F32::new(input.ro_pole_48k),
         switch_xfade_samples: zerocopy::byteorder::little_endian::U16::new(
             input.switch_xfade_samples,
         ),
@@ -331,6 +323,9 @@ pub fn encode_dnam_bin(input: &DnamBinBuildInput<'_>) -> Result<Vec<u8>, DnamBin
 
 #[cfg(test)]
 mod tests {
+    use super::super::header::{
+        DNBN_FLAG_SINGLE_INPUT, DNBN_FLAG_STEREO_OUT, DNBN_FLAG_WET_POLARITY_INV,
+    };
     use super::*;
 
     #[test]
@@ -338,14 +333,14 @@ mod tests {
         let a0 = DnamBinBuildInput::default_arena0_lite();
         let input = DnamBinBuildInput {
             reference_sample_rate_hz: 48_000,
-            header_flags: 0,
+            header_flags: DNBN_FLAG_STEREO_OUT,
             ext_ring_pow2_frames: 0,
             ext_ring_lines: 0,
             ext_ring_format: 0,
             declared_max_delay_48k: 4_096,
             dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
             tail_time_ms: 500.0,
-            r_ac_default: 0.99,
+            ro_pole_48k: 0.99,
             switch_xfade_samples: 64,
             content_hash_prefix: [1, 2, 3, 4, 5, 6, 7, 8],
             controls: &[],
@@ -407,5 +402,49 @@ mod tests {
                 .retained_tier,
             Tier::Pro
         );
+    }
+
+    #[test]
+    fn test_encode_mono_out_preserves_bit9_zero_and_upper_flags() {
+        let a0 = DnamBinBuildInput::default_arena0_lite();
+        let base_input = DnamBinBuildInput {
+            reference_sample_rate_hz: 48_000,
+            header_flags: 0,
+            ext_ring_pow2_frames: 0,
+            ext_ring_lines: 0,
+            ext_ring_format: 0,
+            declared_max_delay_48k: 128,
+            dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
+            tail_time_ms: 0.0,
+            ro_pole_48k: 0.99,
+            switch_xfade_samples: 0,
+            content_hash_prefix: [0; 8],
+            controls: &[],
+            cp1_overflow: &[],
+            tsyn: &[],
+            cext: None,
+            arena0: &a0,
+            arena1: None,
+            arena2: None,
+            arena3: None,
+        };
+        let mut buf = [0u8; 128 + 4_608];
+
+        let n_2to1 = encode_dnam_bin_into(&base_input, &mut buf).unwrap();
+        let view_2to1 = DnamBinView::parse(&buf[..n_2to1]).unwrap();
+        assert_eq!(view_2to1.header.flags.get(), 0x0001);
+        assert_eq!(view_2to1.header.flags.get() & DNBN_FLAG_STEREO_OUT, 0);
+
+        let single_in_mono_out = DnamBinBuildInput {
+            header_flags: DNBN_FLAG_SINGLE_INPUT | DNBN_FLAG_WET_POLARITY_INV | 0x000E,
+            ..base_input
+        };
+        let n_1to1 = encode_dnam_bin_into(&single_in_mono_out, &mut buf).unwrap();
+        let view_1to1 = DnamBinView::parse(&buf[..n_1to1]).unwrap();
+        assert_eq!(
+            view_1to1.header.flags.get(),
+            DNBN_FLAG_SINGLE_INPUT | DNBN_FLAG_WET_POLARITY_INV | 0x0001
+        );
+        assert_eq!(view_1to1.header.flags.get() & DNBN_FLAG_STEREO_OUT, 0);
     }
 }

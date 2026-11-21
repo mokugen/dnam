@@ -1,20 +1,20 @@
-//! Gauge-invariant `z_stage` modulation sensitivity laws, Schmitt `(0.45, 0.55)` write-enable
-//! drive, Quad-0-only `dry_mix` rule, `Op-T` `Q32` phase increments, `Op-N[Pre]` clamps, and
-//! per-block/per-group/per-lane `ADAA` / `ParaLRU` / `TPT-SVF` scaling (`#![no_std]`,
-//! `#![forbid(unsafe_code)]`, `ref[dsp.ctrl.dispatch.modulation-laws]`).
+//! Gauge-invariant `eff_z_stage` modulation sensitivity laws, continuous passive `freeze_mix`
+//! and stage `tank_dry_mix` rules, `Op-T` `Q32` phase increments, `Op-N[Pre]` clamps, `SensoryQuad`
+//! VCA bias, `Op-P` phasors, and per-block / per-`CoreQuad` / per-lane `ADAA` / `ParaLRU` / `TPT-SVF`
+//! scaling (`#![no_std]`, `#![forbid(unsafe_code)]`, `ref[dsp.ctrl.dispatch.modulation-laws]`).
 
 #![forbid(unsafe_code)]
 
-mod tank_and_router;
+mod transport_and_sensory;
 
-pub use tank_and_router::*;
+pub use transport_and_sensory::*;
 
 use core::f32::consts::PI;
 
 use dnam_kernels::{OP_N_PRE_MAX_BETA_Q, OP_N_PRE_MAX_ZOH_HOLD_DEPTH, fp16_to_f32};
 
 use crate::graph::slab::layout::{
-    MAX_SONA_GROUPS, MAX_TOTAL_SONA_LANES, NUM_SONA_BLOCKS, SONA_GROUP_BLOCK_AND_LOCAL,
+    MAX_CORE_QUADS, MAX_TOTAL_SONA_LANES, NUM_SONA_BLOCKS, SONA_CORE_QUAD_BLOCK_AND_LOCAL,
 };
 use crate::math::{clamp_finite_f32, exp2_signed_oct_f32, sanitize_finite_f32};
 
@@ -122,17 +122,17 @@ pub fn eval_global_stage_mods(
     [g_oct, k_delta, k_oct, k_damp, psi_delta]
 }
 
-/// Evaluates per-block (`Lite`–`Pro`) or per-group (`Ultra`) `PolyADAA1` linear scale (`exp2`)
-/// and `ParaLRU` signed bias delta (`theta_lru`) from `stage_targets` + `z_stage`.
+/// Evaluates per-block (`Lite`–`Pro`) or per-`CoreQuad` (`Ultra`) `PolyADAA1` linear scale (`exp2`)
+/// and `ParaLRU` signed bias delta (`theta_lru`) from `stage_targets` + `eff_z_stage`.
 pub fn eval_block_and_group_adaa_lru(
     targets_and_z: (&[f32; 32], &[f32; 8]),
     lite_mods_fp16: &[u16; 96],
     ultra_ctrl_fp16: &[u16; 256],
     is_ultra: bool,
-    out_groups: (&mut [f32; MAX_SONA_GROUPS], &mut [f32; MAX_SONA_GROUPS]),
+    out_core_quads: (&mut [f32; MAX_CORE_QUADS], &mut [f32; MAX_CORE_QUADS]),
 ) {
     let (t, z) = targets_and_z;
-    let (group_adaa_scale, group_lru_bias) = out_groups;
+    let (quad_adaa_scale, quad_lru_bias) = out_core_quads;
     if !is_ultra {
         let mut block_adaa_scale = [1.0_f32; NUM_SONA_BLOCKS];
         let mut block_lru_bias = [0.0_f32; NUM_SONA_BLOCKS];
@@ -148,12 +148,12 @@ pub fn eval_block_and_group_adaa_lru(
             block_adaa_scale[b] = exp2_signed_oct_f32(th_a);
             block_lru_bias[b] = th_l;
         }
-        for (g, &(blk, _)) in SONA_GROUP_BLOCK_AND_LOCAL.iter().enumerate() {
-            group_adaa_scale[g] = block_adaa_scale[blk];
-            group_lru_bias[g] = block_lru_bias[blk];
+        for (g, &(blk, _)) in SONA_CORE_QUAD_BLOCK_AND_LOCAL.iter().enumerate() {
+            quad_adaa_scale[g] = block_adaa_scale[blk];
+            quad_lru_bias[g] = block_lru_bias[blk];
         }
     } else {
-        for (g, &(blk, _)) in SONA_GROUP_BLOCK_AND_LOCAL.iter().enumerate() {
+        for (g, &(blk, _)) in SONA_CORE_QUAD_BLOCK_AND_LOCAL.iter().enumerate() {
             let mut sum_a = 0.0_f32;
             let mut sum_l = 0.0_f32;
             for k in 0..8 {
@@ -162,8 +162,8 @@ pub fn eval_block_and_group_adaa_lru(
             }
             let th_a = clamp_finite_f32(t[2 + blk] + sum_a, -1.5, 1.5, 0.0);
             let th_l = clamp_finite_f32(t[6 + blk] + sum_l, -2.0, 2.0, 0.0);
-            group_adaa_scale[g] = exp2_signed_oct_f32(th_a);
-            group_lru_bias[g] = th_l;
+            quad_adaa_scale[g] = exp2_signed_oct_f32(th_a);
+            quad_lru_bias[g] = th_l;
         }
     }
 }
@@ -241,46 +241,17 @@ pub fn eval_op_n_pre_modulated(
     (gamma_bc, zoh_hold_depth, beta_q)
 }
 
-/// Evaluates Crossbar & Tank `wet_scale` (`clamp(1.0 + clamp(stage_targets[15], -1.0, 1.0), 0.0, 2.0)`).
-#[inline]
-pub fn eval_crossbar_wet_scale(stage_target_15: f32) -> f32 {
-    clamp_finite_f32(
-        1.0 + clamp_finite_f32(stage_target_15, -1.0, 1.0, 0.0),
-        0.0,
-        2.0,
-        1.0,
-    )
-}
-
-/// Evaluates clamped `Op-T` write-enable drive `we_eff = clamp(1.0 + slot[16], 0.0, 1.0)`.
-#[inline]
-pub fn eval_op_t_we_eff(stage_target_16: f32) -> f32 {
-    clamp_finite_f32(1.0 + sanitize_finite_f32(stage_target_16), 0.0, 1.0, 1.0)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::slab::SonaGroupHot;
-    use crate::math::{ScalarBackend, ScalarVec4, SimdVec4, f32_to_fp16};
-    use dnam_kernels::{QUAD_FLAG_WE_HOLD_ACTIVE, TANK_MAX_G_LIN_F32, update_we_schmitt_flag};
+    use crate::math::f32_to_fp16;
 
     #[test]
-    fn test_modulation_laws_finite_guards_schmitt_quad0_and_a2_parity() {
-        assert!(!eval_op_t_we_eff(0.0).is_nan());
-        let mut we_flags = update_we_schmitt_flag(0, eval_op_t_we_eff(0.0));
-        assert_eq!(we_flags & QUAD_FLAG_WE_HOLD_ACTIVE, 0);
-        we_flags = update_we_schmitt_flag(we_flags, eval_op_t_we_eff(-0.6));
-        assert_ne!(we_flags & QUAD_FLAG_WE_HOLD_ACTIVE, 0);
-        we_flags = update_we_schmitt_flag(we_flags, eval_op_t_we_eff(-0.5));
-        assert_ne!(we_flags & QUAD_FLAG_WE_HOLD_ACTIVE, 0);
-        we_flags = update_we_schmitt_flag(we_flags, eval_op_t_we_eff(-0.44));
-        assert_eq!(we_flags & QUAD_FLAG_WE_HOLD_ACTIVE, 0);
-        assert_eq!(eval_op_t_we_eff(f32::NAN), 1.0);
-
-        assert_eq!(eval_tank_dry_mix_for_quad(0, 0.5, 0.25), 0.75);
-        assert_eq!(eval_tank_dry_mix_for_quad(0, f32::NAN, 0.25), 1.0);
-        assert_eq!(eval_tank_dry_mix_for_quad(1, 0.5, 0.25), 0.5);
+    fn test_modulation_laws_finite_guards_stage_mods_and_a2_parity() {
+        assert_eq!(eval_op_t_freeze_mix_eff(0.4, 0.2, false), 0.6);
+        assert_eq!(eval_op_t_freeze_mix_eff(0.0, -0.5, true), 1.0);
+        assert_eq!(eval_transport_dry_mix_stage(0.5, 0.25), 0.75);
+        assert_eq!(eval_sensory_vca_bias_slot30(-1.5), -1.0);
 
         let mut lite_mods = [0_u16; 96];
         lite_mods[64] = f32_to_fp16(0.5);
@@ -288,7 +259,7 @@ mod tests {
         let mut st = [0.0_f32; 32];
         st[6] = 0.25;
         let zs = [1.0_f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        let (mut grp_a, mut grp_l) = ([1.0; MAX_SONA_GROUPS], [0.0; MAX_SONA_GROUPS]);
+        let (mut grp_a, mut grp_l) = ([1.0; MAX_CORE_QUADS], [0.0; MAX_CORE_QUADS]);
         eval_block_and_group_adaa_lru(
             (&st, &zs),
             &lite_mods,
@@ -296,23 +267,12 @@ mod tests {
             false,
             (&mut grp_a, &mut grp_l),
         );
-        let gh = SonaGroupHot {
-            adaa_drive_fp16: [f32_to_fp16(1.0); 4],
-            lru_bias_drive_fp16: [f32_to_fp16(0.2), f32_to_fp16(-0.2), 0, 0],
-            ..Default::default()
-        };
-        let p = gh.to_kernel_params_modulated::<ScalarBackend>(
-            ScalarVec4::splat(1.0),
-            ScalarVec4::zero(),
-            grp_a[0],
-            grp_l[0],
-            ScalarVec4::zero(),
-            0b0010,
-        );
-        assert_eq!(
-            p.lru_bias_drive.to_array()[1].to_bits(),
-            (-p.lru_bias_drive.to_array()[0]).to_bits()
-        );
+        assert_eq!(grp_l[0], 0.75);
+        // Mechanism A2 sign-flip parity: flipping both `b_lru_base` and `rect_sign` flips `b_lru_eff` at 0 ULP.
+        let (sign_pos, sign_neg) = (1.0_f32, -1.0_f32);
+        let b_pos = (0.2_f32 + sign_pos * grp_l[0]).clamp(-16.0, 16.0);
+        let b_neg = (-0.2_f32 + sign_neg * grp_l[0]).clamp(-16.0, 16.0);
+        assert_eq!(b_neg.to_bits(), (-b_pos).to_bits());
 
         let mut mods = [0_u16; 96];
         let mut t = [0.0_f32; 32];
@@ -331,22 +291,6 @@ mod tests {
         assert!((gmods[3] - 0.25).abs() < 1.0e-6);
         assert!((gmods[4] - 0.7).abs() < 1.0e-6);
         assert_eq!(stage_latent_dot_fp16(&[f32_to_fp16(f32::NAN)], &zs, 1), 0.0);
-
-        assert_eq!(eval_crossbar_wet_scale(0.5), 1.5);
-        assert_eq!(eval_crossbar_wet_scale(-2.0), 0.0);
-        assert_eq!(eval_crossbar_wet_scale(f32::NAN), 1.0);
-        assert!((eval_tank_g_loop(0.95, 0.5) - TANK_MAX_G_LIN_F32).abs() < 1.0e-7);
-        assert_eq!(eval_tank_g_loop(f32::INFINITY, 0.1), 0.0);
-
-        let inv_48k = 1.0 / 48_000.0;
-        let (r_eff, r_q32) = eval_tank_ramp_rate_and_inc_q32(2.0, -4.0, inv_48k);
-        assert_eq!(r_eff, -2.0);
-        assert!(r_q32 < 0);
-        assert_eq!(quantize_tank_ramp_inc_q32(f32::NAN, inv_48k), 0);
-        assert_eq!(eval_tank_lfo_inc_q32(0.0, 0.0, 1.0, inv_48k), 0);
-        assert_eq!(eval_tank_lfo_inc_q32(1.0, 0.0, 0.0, inv_48k), 0);
-        assert!(eval_tank_lfo_inc_q32(1.0, 0.5, 0.5, inv_48k) > 0);
-        assert_eq!(quantize_tank_lfo_inc_q32(1.0, f32::NAN, inv_48k), 0);
 
         st[26] = 0.25;
         st[27] = 2.0;

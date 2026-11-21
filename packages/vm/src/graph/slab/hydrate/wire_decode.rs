@@ -1,42 +1,80 @@
-//! Zero-copy wire decoders, `§2.3` non-finite sanitization, and `VarPro` / Cabinet prefix
-//! override builders (`#![no_std]`, `#![forbid(unsafe_code)]`).
+//! Zero-copy wire decoders, `§2.3` non-finite sanitization, and `LinearReadout` / `ModalConvolver`
+//! prefix override builders (`#![no_std]`, `#![forbid(unsafe_code)]`).
 
 #![forbid(unsafe_code)]
 
 use core::mem::{align_of, size_of};
 
-use crate::math::{
-    FP16_FINITE_MAX_F32, clamp_finite_f32, f32_to_fp16, fp16_to_f32, sanitize_finite_f32,
-};
-
-use dnam_kernels::{MAX_PARALRU_R_F32, algebraic_unit_rotor_f32};
+use dnam_kernels::{MAX_PARALRU_DUHEM_GAMMA_F32, MAX_PARALRU_R_F32, algebraic_unit_rotor_f32};
 use zerocopy::byteorder::little_endian::{F32, U16};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 use crate::bin::{
-    DnamBinView, SonaCrossbarBlockWire, SonaGroupWire, SonaInterBlockTilePairWire,
-    VarProReadoutFullWire, VarProReadoutLiteWire, VarProReadoutProWire, VarProReadoutUltraWire,
+    CONVOLVER_KAUTZ_BLOCKS_PER_TIER, CoreQuadWire, DnamBinView, LinearReadoutFullWire,
+    LinearReadoutLiteWire, LinearReadoutProWire, LinearReadoutUltraWire,
+    SONA_META_CONVOLVER_PREFIX_OVERRIDES, SONA_META_OS2X, SONA_META_TIER_OS_EXPLICIT,
+    SonaCrossbarBlockWire, SonaInterBlockTilePairWire,
 };
 use crate::graph::GraphBackend;
-use crate::types::VmError;
+use crate::math::{
+    FP16_FINITE_MAX_F32, clamp_finite_f32, f32_to_fp16, fp16_to_f32, sanitize_finite_f32,
+};
+use crate::types::{Tier, VmError};
 
 use super::super::layout::{
-    MAX_SONA_GROUPS, SonaColdTail, SonaGroupHot, SonaGroupReadoutHot, SonaHotSlab,
+    CoreQuadExtCold, CoreQuadHot, CoreQuadReadoutHot, MAX_CORE_QUADS, SonaColdTail, SonaHotSlab,
     SonaInterBlockTileHot, TierCrossbarSnapshot,
 };
 
-pub(super) const HEADER_FLAG_SINGLE_INPUT: u16 = 1 << 4;
-pub(super) const HEADER_FLAG_WET_POLARITY_INV: u16 = 1 << 7;
-pub(super) const HEADER_FLAG_STEREO_OUT: u16 = 1 << 9;
-
-pub(super) const META_OS2X: u32 = 1 << 4;
-pub(super) const META_TIER_OS_EXPLICIT: u32 = 1 << 6;
-pub(super) const META_CABINET_PREFIX_OVERRIDES: u32 = 1 << 7;
-pub(super) const META_OS_EXT_PRESENT: u32 = 1 << 8;
-pub(super) const META_CORE_MODS_PRESENT: u32 = 1 << 9;
-pub(super) const TANK_FLAG_EXT_F32: u8 = 1 << 1;
-
 const FP16_ABS_MAX: f32 = FP16_FINITE_MAX_F32;
+const READOUT_WEIGHTS_PER_LANE: usize = 12;
+const RO_GAINS_SCALAR_COUNT: usize = 8;
+const CORE_QUAD_LANES: usize = 4;
+const LITE_CORE_QUADS: usize = Tier::Lite.simd_groups();
+const LITE_CORE_LANES: usize = Tier::Lite.channels();
+const FULL_CORE_LANES: usize = Tier::Full.channels();
+const PRO_CORE_LANES: usize = Tier::Pro.channels();
+const ULTRA_CORE_LANES: usize = Tier::Ultra.channels();
+const LITE_W_RO_ELEMS: usize = LITE_CORE_LANES * READOUT_WEIGHTS_PER_LANE;
+const PHASOR_STEREO_COUNT: usize = 4;
+const CROSSBAR_OPT_TO_LR_LINES: usize = Tier::Ultra.tank_lines();
+const LITE_OPT_TO_LR_LINES: usize = Tier::Lite.tank_lines();
+const LITE_OPT_TO_LR_OFFSET: usize = 24;
+const STAGE_LATENT_DEFAULTS_LEN: usize = 8;
+const STAGE_LATENT_GLOBAL_MODS_LEN: usize = 5 * 8;
+const STAGE_LATENT_BLOCK_MOD_LEN: usize = 4 * 4;
+const STAGE_LATENT_OP_P_TO_CORE_OFFSET: usize =
+    STAGE_LATENT_DEFAULTS_LEN + STAGE_LATENT_GLOBAL_MODS_LEN + 2 * STAGE_LATENT_BLOCK_MOD_LEN;
+
+const fn w_ro_and_mods_override_offset(tier_lanes: usize) -> usize {
+    tier_lanes * READOUT_WEIGHTS_PER_LANE + RO_GAINS_SCALAR_COUNT
+}
+
+const FULL_OVERRIDE_OFFSET: usize = w_ro_and_mods_override_offset(FULL_CORE_LANES);
+const PRO_OVERRIDE_OFFSET: usize = w_ro_and_mods_override_offset(PRO_CORE_LANES);
+const ULTRA_OVERRIDE_OFFSET: usize = w_ro_and_mods_override_offset(ULTRA_CORE_LANES);
+
+const LITE_FIR_TAPS: usize = Tier::Lite.early_fir_taps();
+const FULL_FIR_TAPS: usize = Tier::Full.early_fir_taps();
+const PRO_FIR_TAPS: usize = Tier::Pro.early_fir_taps();
+const ULTRA_FIR_TAPS: usize = Tier::Ultra.early_fir_taps();
+const FULL_DELTA_FIR_TAPS: usize = FULL_FIR_TAPS - LITE_FIR_TAPS;
+const PRO_DELTA_FIR_TAPS: usize = PRO_FIR_TAPS - FULL_FIR_TAPS;
+const ULTRA_DELTA_FIR_TAPS: usize = ULTRA_FIR_TAPS - PRO_FIR_TAPS;
+
+const _: () = assert!(LITE_CORE_QUADS == 4);
+const _: () = assert!(LITE_CORE_LANES == 16);
+const _: () = assert!(FULL_CORE_LANES == 24);
+const _: () = assert!(PRO_CORE_LANES == 32);
+const _: () = assert!(ULTRA_CORE_LANES == 40);
+const _: () = assert!(LITE_W_RO_ELEMS == 192);
+const _: () = assert!(STAGE_LATENT_OP_P_TO_CORE_OFFSET == 80);
+const _: () = assert!(FULL_OVERRIDE_OFFSET == 296);
+const _: () = assert!(PRO_OVERRIDE_OFFSET == 392);
+const _: () = assert!(ULTRA_OVERRIDE_OFFSET == 488);
+const _: () = assert!(LITE_W_RO_ELEMS + LITE_CORE_QUADS * CORE_QUAD_LANES == 208);
+const _: () = assert!(LITE_FIR_TAPS == 32 && FULL_DELTA_FIR_TAPS == 16);
+const _: () = assert!(PRO_DELTA_FIR_TAPS == 48 && ULTRA_DELTA_FIR_TAPS == 32);
 
 #[repr(C)]
 #[derive(
@@ -102,7 +140,7 @@ pub(super) fn fp16_sanitized(bits: u16) -> u16 {
 }
 
 pub(super) fn compute_tier_os2x_flags(meta_flags: u32, oversample_factor: u16) -> [bool; 4] {
-    if (meta_flags & META_TIER_OS_EXPLICIT) != 0 {
+    if (meta_flags & SONA_META_TIER_OS_EXPLICIT) != 0 {
         [
             false,
             (meta_flags & (1 << 1)) != 0,
@@ -110,54 +148,63 @@ pub(super) fn compute_tier_os2x_flags(meta_flags: u32, oversample_factor: u16) -
             (meta_flags & (1 << 3)) != 0,
         ]
     } else {
-        let on = (meta_flags & META_OS2X) != 0 || oversample_factor >= 2;
+        let on = (meta_flags & SONA_META_OS2X) != 0 || oversample_factor >= 2;
         [false, on, on, on]
     }
 }
 
-pub(super) fn decode_group_wire(wire: &SonaGroupWire) -> (SonaGroupHot, u8) {
-    let mut g = SonaGroupHot::default();
+/// Decodes one `192 B` [`CoreQuadWire`] into (`144 B` [`CoreQuadHot`], `40 B` [`CoreQuadExtCold`],
+/// `4`-bit rectifier sign mask).
+pub(super) fn decode_core_quad_wire(wire: &CoreQuadWire) -> (CoreQuadHot, CoreQuadExtCold, u8) {
+    let mut quad = CoreQuadHot::default();
+    let mut ext = CoreQuadExtCold::default();
     let mut rect_bits = 0_u8;
     for l in 0..4 {
-        g.svf_g[l] = clamp_finite_f32(wire.svf_g[l].get(), 1.0e-5, 64.0, 0.25);
-        g.lru_alpha_rel[l] =
+        quad.svf_g[l] = clamp_finite_f32(wire.svf_g[l].get(), 1.0e-5, 64.0, 0.25);
+        quad.lru_alpha_rel[l] =
             clamp_finite_f32(wire.lru_alpha_rel[l].get(), 0.0, MAX_PARALRU_R_F32, 0.0);
-        g.lru_alpha_atk[l] = clamp_finite_f32(wire.lru_alpha_atk[l].get(), 0.0, 1.0, 0.0);
-        g.svf_k_fp16[l] = f32_to_fp16(clamp_finite_f32(
-            wire.svf_k[l].get(),
+        quad.lru_alpha_atk[l] = clamp_finite_f32(wire.lru_alpha_atk[l].get(), 0.0, 1.0, 0.0);
+        quad.svf_k_fp16[l] = clamp_finite_fp16(
+            wire.svf_k_fp16[l].get(),
             0.0,
             8.0,
             core::f32::consts::FRAC_1_SQRT_2,
-        ));
-        g.lru_kappa_fp16[l] = f32_to_fp16(clamp_finite_f32(wire.lru_kappa[l].get(), 0.0, 1.0, 0.0));
-        g.adaa_drive_fp16[l] =
-            f32_to_fp16(clamp_finite_f32(wire.adaa_drive[l].get(), -32.0, 32.0, 0.0));
-        g.lru_bias_drive_fp16[l] = f32_to_fp16(clamp_finite_f32(
-            wire.lru_bias_drive[l].get(),
-            -16.0,
-            16.0,
-            0.0,
-        ));
-        g.in_x_weight_fp16[l] = f32_to_fp16(clamp_finite_f32(
-            wire.in_x_weight[l].get(),
-            -16.0,
-            16.0,
-            0.0,
-        ));
-        g.tone_lp_fp16[l] = clamp_finite_fp16(wire.tone_lp_fp16[l].get(), -16.0, 16.0, 0.0);
-        g.tone_bp_fp16[l] = clamp_finite_fp16(wire.tone_bp_fp16[l].get(), -16.0, 16.0, 0.0);
-        g.tone_hp_fp16[l] = clamp_finite_fp16(wire.tone_hp_fp16[l].get(), -16.0, 16.0, 0.0);
-        g.tone_ap_fp16[l] = clamp_finite_fp16(wire.tone_ap_fp16[l].get(), -16.0, 16.0, 0.0);
-        g.tone_dir_fp16[l] = clamp_finite_fp16(wire.tone_dir_fp16[l].get(), -16.0, 16.0, 0.0);
-        g.sag_depth_fp16[l] = clamp_finite_fp16(wire.sag_depth_fp16[l].get(), -8.0, 8.0, 0.0);
-        g.wavefolder_mix_fp16[l] =
+        );
+        quad.lru_kappa_fp16[l] = clamp_finite_fp16(wire.lru_kappa_fp16[l].get(), 0.0, 1.0, 0.0);
+        quad.adaa_drive_fp16[l] =
+            clamp_finite_fp16(wire.adaa_drive_fp16[l].get(), -32.0, 32.0, 0.0);
+        quad.lru_bias_drive_fp16[l] =
+            clamp_finite_fp16(wire.lru_bias_drive_fp16[l].get(), -16.0, 16.0, 0.0);
+        quad.in_mid_weight_fp16[l] =
+            clamp_finite_fp16(wire.in_mid_weight_fp16[l].get(), -16.0, 16.0, 0.0);
+        quad.tone_lp_fp16[l] = clamp_finite_fp16(wire.tone_lp_fp16[l].get(), -16.0, 16.0, 0.0);
+        quad.tone_bp_fp16[l] = clamp_finite_fp16(wire.tone_bp_fp16[l].get(), -16.0, 16.0, 0.0);
+        quad.tone_hp_fp16[l] = clamp_finite_fp16(wire.tone_hp_fp16[l].get(), -16.0, 16.0, 0.0);
+        quad.tone_ap_fp16[l] = clamp_finite_fp16(wire.tone_ap_fp16[l].get(), -16.0, 16.0, 0.0);
+        quad.tone_dir_fp16[l] = clamp_finite_fp16(wire.tone_dir_fp16[l].get(), -16.0, 16.0, 0.0);
+        quad.sag_depth_fp16[l] = clamp_finite_fp16(wire.sag_depth_fp16[l].get(), -8.0, 8.0, 0.0);
+        quad.wavefolder_mix_fp16[l] =
             clamp_finite_fp16(wire.wavefolder_mix_fp16[l].get(), 0.0, 1.0, 0.0);
         let rs = fp16_to_f32(wire.rect_sign_fp16[l].get());
         if rs.is_finite() && rs < 0.0 {
             rect_bits |= 1 << l;
         }
+
+        ext.in_side_weight_fp16[l] =
+            clamp_finite_fp16(wire.in_side_weight_fp16[l].get(), -16.0, 16.0, 0.0);
+        ext.lru_stereo_link_fp16[l] =
+            clamp_finite_fp16(wire.lru_stereo_link_fp16[l].get(), 0.0, 1.0, 0.0);
+        ext.lru_duhem_gamma_fp16[l] = clamp_finite_fp16(
+            wire.lru_duhem_gamma_fp16[l].get(),
+            0.0,
+            MAX_PARALRU_DUHEM_GAMMA_F32,
+            0.0,
+        );
+        ext.lru_signed_mix_fp16[l] =
+            clamp_finite_fp16(wire.lru_signed_mix_fp16[l].get(), 0.0, 1.0, 0.0);
+        ext.glu_mix_fp16[l] = clamp_finite_fp16(wire.glu_mix_fp16[l].get(), -4.0, 4.0, 0.0);
     }
-    (g, rect_bits)
+    (quad, ext, rect_bits)
 }
 
 pub(super) fn decode_tile_wire(wire: &SonaInterBlockTilePairWire) -> SonaInterBlockTileHot {
@@ -177,24 +224,24 @@ pub(super) fn decode_tile_wire(wire: &SonaInterBlockTilePairWire) -> SonaInterBl
 fn unpack_w_ro_into(
     words: &[U16],
     num_lanes: usize,
-    dst: &mut [SonaGroupReadoutHot; MAX_SONA_GROUPS],
+    dst: &mut [CoreQuadReadoutHot; MAX_CORE_QUADS],
 ) {
     for l in 0..num_lanes {
-        let g = l >> 2;
+        let q = l >> 2;
         let k = l & 3;
-        let b = l * 12;
-        dst[g].pre_cab_odd_l_fp16[k] = fp16_sanitized(words[b].get());
-        dst[g].pre_cab_odd_r_fp16[k] = fp16_sanitized(words[b + 1].get());
-        dst[g].pre_cab_even_l_fp16[k] = fp16_sanitized(words[b + 2].get());
-        dst[g].pre_cab_even_r_fp16[k] = fp16_sanitized(words[b + 3].get());
-        dst[g].pre_cab_lru_l_fp16[k] = fp16_sanitized(words[b + 4].get());
-        dst[g].pre_cab_lru_r_fp16[k] = fp16_sanitized(words[b + 5].get());
-        dst[g].direct_odd_l_fp16[k] = fp16_sanitized(words[b + 6].get());
-        dst[g].direct_odd_r_fp16[k] = fp16_sanitized(words[b + 7].get());
-        dst[g].direct_even_l_fp16[k] = fp16_sanitized(words[b + 8].get());
-        dst[g].direct_even_r_fp16[k] = fp16_sanitized(words[b + 9].get());
-        dst[g].direct_lru_l_fp16[k] = fp16_sanitized(words[b + 10].get());
-        dst[g].direct_lru_r_fp16[k] = fp16_sanitized(words[b + 11].get());
+        let b = l * READOUT_WEIGHTS_PER_LANE;
+        dst[q].pre_conv_odd_l_fp16[k] = fp16_sanitized(words[b].get());
+        dst[q].pre_conv_odd_r_fp16[k] = fp16_sanitized(words[b + 1].get());
+        dst[q].pre_conv_even_l_fp16[k] = fp16_sanitized(words[b + 2].get());
+        dst[q].pre_conv_even_r_fp16[k] = fp16_sanitized(words[b + 3].get());
+        dst[q].pre_conv_lru_l_fp16[k] = fp16_sanitized(words[b + 4].get());
+        dst[q].pre_conv_lru_r_fp16[k] = fp16_sanitized(words[b + 5].get());
+        dst[q].direct_odd_l_fp16[k] = fp16_sanitized(words[b + 6].get());
+        dst[q].direct_odd_r_fp16[k] = fp16_sanitized(words[b + 7].get());
+        dst[q].direct_even_l_fp16[k] = fp16_sanitized(words[b + 8].get());
+        dst[q].direct_even_r_fp16[k] = fp16_sanitized(words[b + 9].get());
+        dst[q].direct_lru_l_fp16[k] = fp16_sanitized(words[b + 10].get());
+        dst[q].direct_lru_r_fp16[k] = fp16_sanitized(words[b + 11].get());
     }
 }
 
@@ -204,21 +251,21 @@ fn decode_crossbar_block_snapshot(
     num_lanes: usize,
 ) -> TierCrossbarSnapshot {
     let mut snap = TierCrossbarSnapshot::default();
-    for g in 0..MAX_SONA_GROUPS {
-        for l in 0..4 {
-            snap.op_p_to_group[g][l] =
-                clamp_finite_fp16(blk.op_p_to_group_fp16[g][l].get(), -8.0, 8.0, 0.0);
-            snap.phasor_to_group[g][l] =
-                clamp_finite_fp16(blk.phasor_to_group_fp16[g][l].get(), -8.0, 8.0, 0.0);
+    for q in 0..MAX_CORE_QUADS {
+        for l in 0..CORE_QUAD_LANES {
+            snap.op_p_to_core[q][l] =
+                clamp_finite_fp16(blk.op_p_to_core_fp16[q][l].get(), -8.0, 8.0, 0.0);
+            snap.phasor_to_core[q][l] =
+                clamp_finite_fp16(blk.phasor_to_core_fp16[q][l].get(), -8.0, 8.0, 0.0);
         }
     }
-    for idx in 0..16 {
+    for idx in 0..CROSSBAR_OPT_TO_LR_LINES {
         snap.opt_to_lr[idx] = [
             clamp_finite_fp16(blk.opt_to_lr_fp16[idx][0].get(), -4.0, 4.0, 0.0),
             clamp_finite_fp16(blk.opt_to_lr_fp16[idx][1].get(), -4.0, 4.0, 0.0),
         ];
     }
-    for l in 0..4 {
+    for l in 0..PHASOR_STEREO_COUNT {
         let th = clamp_finite_f32(
             fp16_to_f32(blk.phasor_stereo_phase_fp16[l].get()),
             -core::f32::consts::PI,
@@ -229,24 +276,24 @@ fn decode_crossbar_block_snapshot(
         snap.phasor_st_cos[l] = f32_to_fp16(c);
         snap.phasor_st_sin[l] = f32_to_fp16(s);
     }
-    let w_count = num_lanes * 12;
+    let w_count = num_lanes * READOUT_WEIGHTS_PER_LANE;
     unpack_w_ro_into(&w_ro_and_mods[..w_count], num_lanes, &mut snap.readouts);
-    for i in 0..8 {
+    for i in 0..RO_GAINS_SCALAR_COUNT {
         snap.ro_gains_fp16[i] = fp16_sanitized(w_ro_and_mods[w_count + i].get());
     }
     snap
 }
 
 fn decode_lite_crossbar_snapshot(
-    ro: &VarProReadoutLiteWire,
+    ro: &LinearReadoutLiteWire,
     rho_tail: &[F32; 32],
 ) -> TierCrossbarSnapshot {
     let mut snap = TierCrossbarSnapshot::default();
     let f_gains = [
-        ro.pre_cab_u_gain[0].get(),
-        ro.pre_cab_u_gain[1].get(),
-        ro.pre_cab_hp_gain[0].get(),
-        ro.pre_cab_hp_gain[1].get(),
+        ro.pre_conv_u_gain[0].get(),
+        ro.pre_conv_u_gain[1].get(),
+        ro.pre_conv_hp_gain[0].get(),
+        ro.pre_conv_hp_gain[1].get(),
         ro.direct_s2_u_gain[0].get(),
         ro.direct_s2_u_gain[1].get(),
         ro.direct_s2_hp_gain[0].get(),
@@ -255,29 +302,39 @@ fn decode_lite_crossbar_snapshot(
     for (i, &g) in f_gains.iter().enumerate() {
         snap.ro_gains_fp16[i] = f32_to_fp16(clamp_finite_f32(g, -FP16_ABS_MAX, FP16_ABS_MAX, 0.0));
     }
-    unpack_w_ro_into(&ro.w_ro_fp16[..192], 16, &mut snap.readouts);
-    for g in 0..4 {
-        for l in 0..4 {
-            snap.op_p_to_group[g][l] = clamp_finite_fp16(
-                ro.stage_latent_mods_fp16[80 + g * 4 + l].get(),
+    unpack_w_ro_into(
+        &ro.w_ro_fp16[..LITE_W_RO_ELEMS],
+        LITE_CORE_LANES,
+        &mut snap.readouts,
+    );
+    for q in 0..LITE_CORE_QUADS {
+        for l in 0..CORE_QUAD_LANES {
+            snap.op_p_to_core[q][l] = clamp_finite_fp16(
+                ro.stage_latent_mods_fp16
+                    [STAGE_LATENT_OP_P_TO_CORE_OFFSET + q * CORE_QUAD_LANES + l]
+                    .get(),
                 -8.0,
                 8.0,
                 0.0,
             );
-            snap.phasor_to_group[g][l] =
-                clamp_finite_fp16(ro.w_ro_fp16[192 + g * 4 + l].get(), -8.0, 8.0, 0.0);
+            snap.phasor_to_core[q][l] = clamp_finite_fp16(
+                ro.w_ro_fp16[LITE_W_RO_ELEMS + q * CORE_QUAD_LANES + l].get(),
+                -8.0,
+                8.0,
+                0.0,
+            );
         }
     }
-    for idx in 0..4 {
+    for idx in 0..LITE_OPT_TO_LR_LINES {
         snap.opt_to_lr[idx] = [
             f32_to_fp16(clamp_finite_f32(
-                rho_tail[24 + idx * 2].get(),
+                rho_tail[LITE_OPT_TO_LR_OFFSET + idx * 2].get(),
                 -4.0,
                 4.0,
                 0.0,
             )),
             f32_to_fp16(clamp_finite_f32(
-                rho_tail[24 + idx * 2 + 1].get(),
+                rho_tail[LITE_OPT_TO_LR_OFFSET + idx * 2 + 1].get(),
                 -4.0,
                 4.0,
                 0.0,
@@ -288,58 +345,55 @@ fn decode_lite_crossbar_snapshot(
 }
 
 fn copy_base_fir_and_kautz<B: GraphBackend>(view: &DnamBinView<'_>, slab: &mut SonaHotSlab<'_, B>) {
-    let mut base_fir_l = [0.0_f32; 128];
-    let mut base_fir_r = [0.0_f32; 128];
+    let mut base_fir_l = [0.0_f32; ULTRA_FIR_TAPS];
+    let mut base_fir_r = [0.0_f32; ULTRA_FIR_TAPS];
     let cold = slab.cold_mut();
-    for (i, tap) in view.arena0.cabinet_fir_lite.fir_l.iter().enumerate() {
+    for (i, tap) in view.arena0.conv_fir_lite.fir_l.iter().enumerate() {
         base_fir_l[i] = clamp_finite_f32(tap.get(), -16.0, 16.0, 0.0);
-        base_fir_r[i] = clamp_finite_f32(
-            view.arena0.cabinet_fir_lite.fir_r[i].get(),
-            -16.0,
-            16.0,
-            0.0,
-        );
+        base_fir_r[i] =
+            clamp_finite_f32(view.arena0.conv_fir_lite.fir_r[i].get(), -16.0, 16.0, 0.0);
     }
-    cold.wire_kautz[0] = view.arena0.cabinet_kautz_lite[0];
-    cold.wire_kautz[1] = view.arena0.cabinet_kautz_lite[1];
+    cold.wire_kautz[0] = view.arena0.conv_kautz_lite[0];
+    cold.wire_kautz[1] = view.arena0.conv_kautz_lite[1];
     if let Some(a1) = view.arena1 {
-        for i in 0..16 {
-            base_fir_l[32 + i] =
-                clamp_finite_f32(a1.cabinet_fir_full.fir_l[i].get(), -16.0, 16.0, 0.0);
-            base_fir_r[32 + i] =
-                clamp_finite_f32(a1.cabinet_fir_full.fir_r[i].get(), -16.0, 16.0, 0.0);
+        for i in 0..FULL_DELTA_FIR_TAPS {
+            base_fir_l[LITE_FIR_TAPS + i] =
+                clamp_finite_f32(a1.conv_fir_full.fir_l[i].get(), -16.0, 16.0, 0.0);
+            base_fir_r[LITE_FIR_TAPS + i] =
+                clamp_finite_f32(a1.conv_fir_full.fir_r[i].get(), -16.0, 16.0, 0.0);
         }
-        cold.wire_kautz[2] = a1.cabinet_kautz_full;
+        cold.wire_kautz[2] = a1.conv_kautz_full;
     }
     if let Some(a2) = view.arena2 {
-        for i in 0..48 {
-            base_fir_l[48 + i] =
-                clamp_finite_f32(a2.cabinet_fir_pro.fir_l[i].get(), -16.0, 16.0, 0.0);
-            base_fir_r[48 + i] =
-                clamp_finite_f32(a2.cabinet_fir_pro.fir_r[i].get(), -16.0, 16.0, 0.0);
+        for i in 0..PRO_DELTA_FIR_TAPS {
+            base_fir_l[FULL_FIR_TAPS + i] =
+                clamp_finite_f32(a2.conv_fir_pro.fir_l[i].get(), -16.0, 16.0, 0.0);
+            base_fir_r[FULL_FIR_TAPS + i] =
+                clamp_finite_f32(a2.conv_fir_pro.fir_r[i].get(), -16.0, 16.0, 0.0);
         }
-        for b in 0..3 {
-            cold.wire_kautz[3 + b] = a2.cabinet_kautz_pro[b];
+        for b in 0..CONVOLVER_KAUTZ_BLOCKS_PER_TIER[2] {
+            cold.wire_kautz[3 + b] = a2.conv_kautz_pro[b];
         }
     }
     if let Some(a3) = view.arena3 {
-        for i in 0..32 {
-            base_fir_l[96 + i] =
-                clamp_finite_f32(a3.cabinet_fir_ultra.fir_l[i].get(), -16.0, 16.0, 0.0);
-            base_fir_r[96 + i] =
-                clamp_finite_f32(a3.cabinet_fir_ultra.fir_r[i].get(), -16.0, 16.0, 0.0);
+        for i in 0..ULTRA_DELTA_FIR_TAPS {
+            base_fir_l[PRO_FIR_TAPS + i] =
+                clamp_finite_f32(a3.conv_fir_ultra.fir_l[i].get(), -16.0, 16.0, 0.0);
+            base_fir_r[PRO_FIR_TAPS + i] =
+                clamp_finite_f32(a3.conv_fir_ultra.fir_r[i].get(), -16.0, 16.0, 0.0);
         }
-        for b in 0..2 {
-            cold.wire_kautz[6 + b] = a3.cabinet_kautz_ultra[b];
+        for b in 0..CONVOLVER_KAUTZ_BLOCKS_PER_TIER[3] {
+            cold.wire_kautz[6 + b] = a3.conv_kautz_ultra[b];
         }
     }
-    let tap_counts = [32_usize, 48, 96, 128];
-    let bank_counts = [2_usize, 3, 6, 8];
+    let tap_counts = [LITE_FIR_TAPS, FULL_FIR_TAPS, PRO_FIR_TAPS, ULTRA_FIR_TAPS];
+    let mut cum_banks = 0_usize;
     for t in 0..=view.retained_tier.index() {
+        cum_banks += CONVOLVER_KAUTZ_BLOCKS_PER_TIER[t];
         let tc = tap_counts[t];
         cold.tier_fir_l[t][..tc].copy_from_slice(&base_fir_l[..tc]);
         cold.tier_fir_r[t][..tc].copy_from_slice(&base_fir_r[..tc]);
-        for b in 0..bank_counts[t] {
+        for b in 0..cum_banks {
             let blk = &cold.wire_kautz[b];
             for lane in 0..4 {
                 let m = b * 4 + lane;
@@ -416,17 +470,20 @@ pub(super) fn decode_readout_and_overrides<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
 ) -> Result<(), VmError> {
     copy_base_fir_and_kautz(view, slab);
-    let apply_ov = (slab.cold().meta_flags & META_CABINET_PREFIX_OVERRIDES) != 0;
+    let apply_ov = (slab.cold().meta_flags & SONA_META_CONVOLVER_PREFIX_OVERRIDES) != 0;
 
     let cold = slab.cold_mut();
     cold.tier_crossbars[0] = decode_lite_crossbar_snapshot(
-        &view.arena0.varpro_readout_lite,
+        &view.arena0.linear_readout_lite,
         &view.arena0.control_bus_lite.rho_head_and_ctrl_tail,
     );
     if let Some(a1) = view.arena1 {
-        let ro: &VarProReadoutFullWire = &a1.varpro_readout_full;
-        cold.tier_crossbars[1] =
-            decode_crossbar_block_snapshot(&a1.crossbar_full, &ro.w_ro_and_mods_fp16, 24);
+        let ro: &LinearReadoutFullWire = &a1.linear_readout_full;
+        cold.tier_crossbars[1] = decode_crossbar_block_snapshot(
+            &a1.crossbar_full,
+            &ro.w_ro_and_mods_fp16,
+            FULL_CORE_LANES,
+        );
         if apply_ov {
             let ov = PrefixOverrideFullWire::ref_from_bytes(&ro.prefix_override)
                 .map_err(|_| VmError::InvalidArenaHeader)?;
@@ -435,14 +492,17 @@ pub(super) fn decode_readout_and_overrides<B: GraphBackend>(
                 1,
                 (&ov.fir_l, &ov.fir_r),
                 (&ov.c_re_l, &ov.c_im_l, &ov.c_re_r, &ov.c_im_r),
-                &ro.w_ro_and_mods_fp16[296..],
+                &ro.w_ro_and_mods_fp16[FULL_OVERRIDE_OFFSET..],
             );
         }
     }
     if let Some(a2) = view.arena2 {
-        let ro: &VarProReadoutProWire = &a2.varpro_readout_pro;
-        cold.tier_crossbars[2] =
-            decode_crossbar_block_snapshot(&a2.crossbar_pro, &ro.w_ro_and_mods_fp16, 32);
+        let ro: &LinearReadoutProWire = &a2.linear_readout_pro;
+        cold.tier_crossbars[2] = decode_crossbar_block_snapshot(
+            &a2.crossbar_pro,
+            &ro.w_ro_and_mods_fp16,
+            PRO_CORE_LANES,
+        );
         if apply_ov {
             let ov = PrefixOverrideProWire::ref_from_bytes(&ro.prefix_override)
                 .map_err(|_| VmError::InvalidArenaHeader)?;
@@ -451,14 +511,17 @@ pub(super) fn decode_readout_and_overrides<B: GraphBackend>(
                 2,
                 (&ov.fir_l, &ov.fir_r),
                 (&ov.c_re_l, &ov.c_im_l, &ov.c_re_r, &ov.c_im_r),
-                &ro.w_ro_and_mods_fp16[392..],
+                &ro.w_ro_and_mods_fp16[PRO_OVERRIDE_OFFSET..],
             );
         }
     }
     if let Some(a3) = view.arena3 {
-        let ro: &VarProReadoutUltraWire = &a3.varpro_readout_ultra;
-        cold.tier_crossbars[3] =
-            decode_crossbar_block_snapshot(&a3.crossbar_ultra, &ro.w_ro_and_mods_fp16, 40);
+        let ro: &LinearReadoutUltraWire = &a3.linear_readout_ultra;
+        cold.tier_crossbars[3] = decode_crossbar_block_snapshot(
+            &a3.crossbar_ultra,
+            &ro.w_ro_and_mods_fp16,
+            ULTRA_CORE_LANES,
+        );
         if apply_ov {
             let ov = PrefixOverrideUltraWire::ref_from_bytes(&ro.prefix_override)
                 .map_err(|_| VmError::InvalidArenaHeader)?;
@@ -467,7 +530,7 @@ pub(super) fn decode_readout_and_overrides<B: GraphBackend>(
                 3,
                 (&ov.fir_l, &ov.fir_r),
                 (&ov.c_re_l, &ov.c_im_l, &ov.c_re_r, &ov.c_im_r),
-                &ro.w_ro_and_mods_fp16[488..],
+                &ro.w_ro_and_mods_fp16[ULTRA_OVERRIDE_OFFSET..],
             );
         }
     }
@@ -481,11 +544,11 @@ mod tests {
     #[test]
     fn test_compute_tier_os2x_flags_explicit_vs_global() {
         assert_eq!(
-            compute_tier_os2x_flags(META_TIER_OS_EXPLICIT | 0b1010, 1),
+            compute_tier_os2x_flags(SONA_META_TIER_OS_EXPLICIT | 0b1010, 1),
             [false, true, false, true]
         );
         assert_eq!(
-            compute_tier_os2x_flags(META_OS2X, 1),
+            compute_tier_os2x_flags(SONA_META_OS2X, 1),
             [false, true, true, true]
         );
         assert_eq!(compute_tier_os2x_flags(0, 1), [false, false, false, false]);
@@ -496,18 +559,32 @@ mod tests {
         use crate::math::ScalarBackend;
         use zerocopy::FromZeros;
 
-        let mut gw = SonaGroupWire::new_zeroed();
-        gw.svf_g[0] = F32::new(f32::NAN);
-        gw.lru_kappa[0] = F32::new(12.0);
-        gw.adaa_drive[0] = F32::new(-12.5);
-        gw.lru_bias_drive[0] = F32::new(-25.0);
-        gw.sag_depth_fp16[0] = U16::new(f32_to_fp16(-6.0));
-        let (hg, _) = decode_group_wire(&gw);
-        assert_eq!(hg.svf_g[0], 0.25);
-        assert_eq!(fp16_to_f32(hg.lru_kappa_fp16[0]), 1.0);
-        assert_eq!(fp16_to_f32(hg.adaa_drive_fp16[0]), -12.5);
-        assert_eq!(fp16_to_f32(hg.lru_bias_drive_fp16[0]), -16.0);
-        assert_eq!(fp16_to_f32(hg.sag_depth_fp16[0]), -6.0);
+        let mut cw = CoreQuadWire::new_zeroed();
+        cw.svf_g[0] = F32::new(f32::NAN);
+        cw.lru_kappa_fp16[0] = U16::new(f32_to_fp16(12.0));
+        cw.adaa_drive_fp16[0] = U16::new(f32_to_fp16(-12.5));
+        cw.lru_bias_drive_fp16[0] = U16::new(f32_to_fp16(-25.0));
+        cw.sag_depth_fp16[0] = U16::new(f32_to_fp16(-6.0));
+        cw.in_mid_weight_fp16[0] = U16::new(f32_to_fp16(20.0));
+        cw.in_side_weight_fp16[0] = U16::new(f32_to_fp16(-20.0));
+        cw.lru_stereo_link_fp16[0] = U16::new(f32_to_fp16(2.5));
+        cw.lru_duhem_gamma_fp16[0] = U16::new(f32_to_fp16(100.0));
+        cw.lru_signed_mix_fp16[0] = U16::new(f32_to_fp16(0.5));
+        cw.glu_mix_fp16[0] = U16::new(f32_to_fp16(-6.0));
+        cw.rect_sign_fp16[1] = U16::new(f32_to_fp16(-1.0));
+        let (hq, h_ext, rect_bits) = decode_core_quad_wire(&cw);
+        assert_eq!(rect_bits, 0b0010);
+        assert_eq!(hq.svf_g[0], 0.25);
+        assert_eq!(fp16_to_f32(hq.lru_kappa_fp16[0]), 1.0);
+        assert_eq!(fp16_to_f32(hq.adaa_drive_fp16[0]), -12.5);
+        assert_eq!(fp16_to_f32(hq.lru_bias_drive_fp16[0]), -16.0);
+        assert_eq!(fp16_to_f32(hq.sag_depth_fp16[0]), -6.0);
+        assert_eq!(fp16_to_f32(hq.in_mid_weight_fp16[0]), 16.0);
+        assert_eq!(fp16_to_f32(h_ext.in_side_weight_fp16[0]), -16.0);
+        assert_eq!(fp16_to_f32(h_ext.lru_stereo_link_fp16[0]), 1.0);
+        assert_eq!(fp16_to_f32(h_ext.lru_duhem_gamma_fp16[0]), 64.0);
+        assert_eq!(fp16_to_f32(h_ext.lru_signed_mix_fp16[0]), 0.5);
+        assert_eq!(fp16_to_f32(h_ext.glu_mix_fp16[0]), -4.0);
 
         let mut tw = SonaInterBlockTilePairWire::new_zeroed();
         tw.w_odd_4x4[0][0] = F32::new(-12.0);

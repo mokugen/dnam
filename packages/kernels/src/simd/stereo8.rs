@@ -51,6 +51,18 @@ pub trait StereoVec8: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
         r.store(right);
     }
 
+    /// Rotates the 4 lanes of each stereo half cyclically left by 1 (`[a[1], a[2], a[3], a[0]]`).
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        let (l, r) = self.into_lr();
+        let la = l.to_array();
+        let ra = r.to_array();
+        Self::from_lr(
+            Self::Half::from_array([la[1], la[2], la[3], la[0]]),
+            Self::Half::from_array([ra[1], ra[2], ra[3], ra[0]]),
+        )
+    }
+
     /// Broadcasts a single 4-lane vector `h` to both Left and Right halves.
     #[inline(always)]
     fn broadcast_half(h: Self::Half) -> Self {
@@ -461,6 +473,39 @@ mod tests {
         let mv = S8::fma_mat4x4_shared(S8::splat_lr(0.5, -0.5), &cols, x);
         assert_eq!(mv.into_lr().0.to_array(), [1.5, 4.5, 9.5, 16.5]);
         assert_eq!(mv.into_lr().1.to_array(), [-1.5, -4.5, -9.5, -16.5]);
+
+        let rot_src = S8::load_lr(&[10.0, -0.0, 30.0, -40.0], &[-1.5, 2.5, -3.5, 4.5]);
+        let rot1 = rot_src.rotate_left_1();
+        assert_eq!(
+            rot1.into_lr().0.to_array().map(f32::to_bits),
+            [
+                (-0.0_f32).to_bits(),
+                30.0_f32.to_bits(),
+                (-40.0_f32).to_bits(),
+                10.0_f32.to_bits(),
+            ]
+        );
+        assert_eq!(rot1.into_lr().1.to_array(), [2.5, -3.5, 4.5, -1.5]);
+        let rot4 = rot1.rotate_left_1().rotate_left_1().rotate_left_1();
+        assert_eq!(
+            rot4.into_lr().0.to_array().map(f32::to_bits),
+            rot_src.into_lr().0.to_array().map(f32::to_bits)
+        );
+        assert_eq!(
+            rot4.into_lr().1.to_array().map(f32::to_bits),
+            rot_src.into_lr().1.to_array().map(f32::to_bits)
+        );
+
+        let d_rot_src = DefaultTraitStereo8::from_lr(rot_src.left, rot_src.right);
+        let d_rot1 = d_rot_src.rotate_left_1();
+        assert_eq!(
+            d_rot1.into_lr().0.to_array().map(f32::to_bits),
+            rot1.into_lr().0.to_array().map(f32::to_bits)
+        );
+        assert_eq!(
+            d_rot1.into_lr().1.to_array().map(f32::to_bits),
+            rot1.into_lr().1.to_array().map(f32::to_bits)
+        );
     }
 
     proptest! {

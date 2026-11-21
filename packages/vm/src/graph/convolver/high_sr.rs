@@ -1,5 +1,5 @@
-//! Off-`48 kHz` Cabinet High-SR Early FIR and Modal Onset Extension (`ref[dsp.zoh.cabinet-fir-onset]`,
-//! `ref[dsp.cabinet.mirrored-fir-simd]`).
+//! Off-`48 kHz` `ModalConvolver` High-SR Early FIR and Modal Onset Extension
+//! (`ref[dsp.zoh.cabinet-fir-onset]`, `ref[dsp.cabinet.mirrored-fir-simd]`).
 //!
 //! Covers all four mutually exclusive rate domains across `44.1–384 kHz` (`Case (a)` exact
 //! `48 kHz * q` sparse stride, `Case (b)` live `1×` `44.1..<48 kHz` `64`-tap first-tap difference
@@ -30,7 +30,7 @@ pub const STAGE3_EXT_FIR_CAP: usize = 1_024;
 pub const STAGE3_EXT_FIR_MASK: usize = STAGE3_EXT_FIR_CAP - 1;
 
 /// Maximum cumulative `48 kHz` early FIR taps per channel (`Ultra`: `128`).
-pub const MAX_CABINET_BASE_TAPS: usize = 128;
+pub const MAX_CONVOLVER_BASE_TAPS: usize = 128;
 
 const EXT_HIST_STRIDE: usize = STAGE3_EXT_FIR_CAP * 2;
 const EXT_HIST_R_OFF: usize = EXT_HIST_STRIDE;
@@ -55,9 +55,9 @@ const ONSET_MAX_SAMPLES: usize = STAGE3_EXT_FIR_CAP - 1;
 const _: () = assert!(STAGE3_EXT_FIR_CAP.is_power_of_two());
 const _: () = assert!(EXT_FIR_STORAGE_F32_LEN == 6_144);
 
-/// Active sample-rate adaptation regime selected by [`CabinetHighSrFirExt`].
+/// Active sample-rate adaptation regime selected by [`ConvolverHighSrFirExt`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CabinetHighSrMode {
+pub enum ConvolverHighSrMode {
     /// Native `48,000 Hz` (`q = 1`), zero cold extension storage (`0` floats).
     Native48k,
     /// `Case (a)`: exact integer multiples `q * 48,000 Hz` (`q in {2, 4, 8}`).
@@ -74,34 +74,34 @@ pub enum CabinetHighSrMode {
 }
 
 #[inline]
-fn classify_rate_mode(fs_vm: f64, is_bounce_4x: bool) -> Result<CabinetHighSrMode, VmError> {
+fn classify_rate_mode(fs_vm: f64, is_bounce_4x: bool) -> Result<ConvolverHighSrMode, VmError> {
     if !fs_vm.is_finite() || fs_vm <= 0.0 {
         return Err(VmError::InvalidSampleRate);
     }
     for q in [1_usize, 2, 4, 8] {
         if const_abs_f64(fs_vm - (q as f64) * RATE_REF_48K_F64) <= 1.0e-6 {
             return Ok(if q == 1 && !is_bounce_4x {
-                CabinetHighSrMode::Native48k
+                ConvolverHighSrMode::Native48k
             } else {
-                CabinetHighSrMode::CaseA { stride_q: q }
+                ConvolverHighSrMode::CaseA { stride_q: q }
             });
         }
     }
     if !is_bounce_4x && (RATE_44K1_F64..RATE_REF_48K_F64).contains(&fs_vm) {
-        return Ok(CabinetHighSrMode::CaseB);
+        return Ok(ConvolverHighSrMode::CaseB);
     }
     if is_bounce_4x && (RATE_176K4_F64..=RATE_384K_F64).contains(&fs_vm) {
-        return Ok(CabinetHighSrMode::CaseC);
+        return Ok(ConvolverHighSrMode::CaseC);
     }
-    Ok(CabinetHighSrMode::CaseD)
+    Ok(ConvolverHighSrMode::CaseD)
 }
 
-/// Cold off-`48 kHz` Cabinet FIR & modal onset extension backed by [`ColdBuf<'a, f32>`]
+/// Cold off-`48 kHz` `ModalConvolver` FIR & modal onset extension backed by [`ColdBuf<'a, f32>`]
 /// (`0` floats at `48,000 Hz`, `6,144` floats off-`48 kHz`, `ref[dsp.zoh.cabinet-fir-onset]`).
 #[derive(Debug)]
-pub struct CabinetHighSrFirExt<'a> {
+pub struct ConvolverHighSrFirExt<'a> {
     storage: Option<ColdBuf<'a, f32>>,
-    mode: CabinetHighSrMode,
+    mode: ConvolverHighSrMode,
     active_base: usize,
     out_len: usize,
     onset_delay: usize,
@@ -109,16 +109,16 @@ pub struct CabinetHighSrFirExt<'a> {
     case_b_b0: [f32; 2],
     case_b_b1: [f32; 2],
     tap1_diff: [f32; 63],
-    bounce_taps: [BounceLagrangeTap; MAX_CABINET_BASE_TAPS],
+    bounce_taps: [BounceLagrangeTap; MAX_CONVOLVER_BASE_TAPS],
 }
 
-impl<'a> CabinetHighSrFirExt<'a> {
+impl<'a> ConvolverHighSrFirExt<'a> {
     /// Returns an empty `Native48k` stub with zero backing storage for `!alloc` initialization.
     #[must_use]
     pub fn empty() -> Self {
         Self {
             storage: None,
-            mode: CabinetHighSrMode::Native48k,
+            mode: ConvolverHighSrMode::Native48k,
             active_base: 0,
             out_len: 0,
             onset_delay: ONSET_MIN_SAMPLES,
@@ -126,7 +126,7 @@ impl<'a> CabinetHighSrFirExt<'a> {
             case_b_b0: [0.0; 2],
             case_b_b1: [0.0; 2],
             tap1_diff: [0.0; 63],
-            bounce_taps: [BounceLagrangeTap::default(); MAX_CABINET_BASE_TAPS],
+            bounce_taps: [BounceLagrangeTap::default(); MAX_CONVOLVER_BASE_TAPS],
         }
     }
 
@@ -183,7 +183,7 @@ impl<'a> CabinetHighSrFirExt<'a> {
             case_b_b0: [0.0; 2],
             case_b_b1: [0.0; 2],
             tap1_diff: [0.0; 63],
-            bounce_taps: [BounceLagrangeTap::default(); MAX_CABINET_BASE_TAPS],
+            bounce_taps: [BounceLagrangeTap::default(); MAX_CONVOLVER_BASE_TAPS],
         })
     }
 
@@ -205,9 +205,9 @@ impl<'a> CabinetHighSrFirExt<'a> {
         Self::from_cold_buf(ColdBuf::Owned(vec![0.0_f32; len]), fs_vm, is_bounce_4x)
     }
 
-    /// Returns the active [`CabinetHighSrMode`].
+    /// Returns the active [`ConvolverHighSrMode`].
     #[inline]
-    pub const fn mode(&self) -> CabinetHighSrMode {
+    pub const fn mode(&self) -> ConvolverHighSrMode {
         self.mode
     }
 
@@ -245,13 +245,13 @@ impl<'a> CabinetHighSrFirExt<'a> {
         if self.storage_len() < required {
             return Err(VmError::InsufficientBackingCapacity);
         }
-        let active = fir_l.len().min(fir_r.len()).min(MAX_CABINET_BASE_TAPS);
+        let active = fir_l.len().min(fir_r.len()).min(MAX_CONVOLVER_BASE_TAPS);
         self.mode = mode;
         self.active_base = active;
         self.case_b_b0 = [0.0; 2];
         self.case_b_b1 = [0.0; 2];
 
-        if matches!(mode, CabinetHighSrMode::Native48k) {
+        if matches!(mode, ConvolverHighSrMode::Native48k) {
             self.out_len = 0;
             self.onset_delay = 16;
             return Ok(());
@@ -264,22 +264,22 @@ impl<'a> CabinetHighSrFirExt<'a> {
         self.storage_mut_slice()[EXT_DENSE_L_OFF..EXT_DENSE_R_OFF + STAGE3_EXT_FIR_CAP].fill(0.0);
 
         match mode {
-            CabinetHighSrMode::CaseA { stride_q } => {
+            ConvolverHighSrMode::CaseA { stride_q } => {
                 self.onset_delay = (16 * stride_q).clamp(ONSET_MIN_SAMPLES, ONSET_MAX_SAMPLES);
                 self.prepare_case_a_or_c(fir_l, fir_r, active);
             }
-            CabinetHighSrMode::CaseB => {
+            ConvolverHighSrMode::CaseB => {
                 self.onset_delay = default_onset;
                 self.prepare_case_b(fir_l, fir_r, active, fs_vm, rho_vm);
             }
-            CabinetHighSrMode::CaseC => {
+            ConvolverHighSrMode::CaseC => {
                 self.onset_delay = default_onset;
                 self.prepare_case_a_or_c(fir_l, fir_r, active);
                 for k in 1..active {
                     self.bounce_taps[k] = prepare_bounce_6point_u64(k, fs_vm);
                 }
             }
-            CabinetHighSrMode::CaseD => {
+            ConvolverHighSrMode::CaseD => {
                 self.onset_delay = default_onset;
                 let out_len = (ceil_f64((active as f64) * fs_vm * INV_48000_F64) as usize)
                     .clamp(active, STAGE3_EXT_FIR_CAP);
@@ -294,7 +294,7 @@ impl<'a> CabinetHighSrFirExt<'a> {
                     rho_vm,
                 );
             }
-            CabinetHighSrMode::Native48k => {}
+            ConvolverHighSrMode::Native48k => {}
         }
         Ok(())
     }
@@ -351,7 +351,7 @@ impl<'a> CabinetHighSrFirExt<'a> {
     /// Steps one stereo frame `(x_l, x_r)` returning `((early_l, early_r), (onset_l, onset_r))`.
     #[inline]
     pub fn step_frame(&mut self, x_l: f32, x_r: f32) -> ((f32, f32), (f32, f32)) {
-        if matches!(self.mode, CabinetHighSrMode::Native48k)
+        if matches!(self.mode, ConvolverHighSrMode::Native48k)
             || self.storage_len() < EXT_FIR_STORAGE_F32_LEN
         {
             return ((0.0, 0.0), (0.0, 0.0));
@@ -374,13 +374,13 @@ impl<'a> CabinetHighSrFirExt<'a> {
         };
 
         let early = match self.mode {
-            CabinetHighSrMode::Native48k => (0.0, 0.0),
-            CabinetHighSrMode::CaseA { stride_q } => {
+            ConvolverHighSrMode::Native48k => (0.0, 0.0),
+            ConvolverHighSrMode::CaseA { stride_q } => {
                 step_dense_frame(self.storage_slice(), base, self.active_base, stride_q)
             }
-            CabinetHighSrMode::CaseB => self.step_case_b_frame(base),
-            CabinetHighSrMode::CaseC => self.step_case_c_frame(base),
-            CabinetHighSrMode::CaseD => {
+            ConvolverHighSrMode::CaseB => self.step_case_b_frame(base),
+            ConvolverHighSrMode::CaseC => self.step_case_c_frame(base),
+            ConvolverHighSrMode::CaseD => {
                 step_dense_frame(self.storage_slice(), base, self.out_len, 1)
             }
         };
@@ -448,7 +448,7 @@ fn resample_stereo_pair_catmull_rom(
     }
     let in_len = active + 1;
     for (fir, dense_off) in [(fir_lr[0], EXT_DENSE_L_OFF), (fir_lr[1], EXT_DENSE_R_OFF)] {
-        let mut padded = [0.0_f32; MAX_CABINET_BASE_TAPS + 1];
+        let mut padded = [0.0_f32; MAX_CONVOLVER_BASE_TAPS + 1];
         for k in tap_range.clone() {
             padded[k] = clamp_finite_f32(fir[k], -MAX_FIR_TAP_ABS, MAX_FIR_TAP_ABS, 0.0);
         }
@@ -477,7 +477,7 @@ mod tests {
     use super::*;
     use crate::math::const_abs_f32;
 
-    fn step_dc(ext: &mut CabinetHighSrFirExt<'_>, frames: usize) -> ((f32, f32), (f32, f32)) {
+    fn step_dc(ext: &mut ConvolverHighSrFirExt<'_>, frames: usize) -> ((f32, f32), (f32, f32)) {
         for _ in 0..frames {
             let _ = ext.step_frame(1.0, 1.0);
         }
@@ -490,29 +490,29 @@ mod tests {
             .iter()
             .fold(0.0_f32, |acc, &w| acc + f32::from_bits(w));
         assert_eq!(sum_f32.to_bits(), 0x3f80_0002);
-        assert_eq!(CabinetHighSrFirExt::required_f32_len(48_000.0, false), 0);
+        assert_eq!(ConvolverHighSrFirExt::required_f32_len(48_000.0, false), 0);
         assert_eq!(
-            CabinetHighSrFirExt::required_f32_len(44_100.0, false),
+            ConvolverHighSrFirExt::required_f32_len(44_100.0, false),
             6_144
         );
         assert_eq!(
-            CabinetHighSrFirExt::required_f32_len(192_000.0, true),
+            ConvolverHighSrFirExt::required_f32_len(192_000.0, true),
             6_144
         );
 
         let mut empty = [];
-        assert!(CabinetHighSrFirExt::from_slice(&mut empty, 48_000.0, false).is_ok());
+        assert!(ConvolverHighSrFirExt::from_slice(&mut empty, 48_000.0, false).is_ok());
         assert_eq!(
-            CabinetHighSrFirExt::from_slice(&mut empty, 96_000.0, false).unwrap_err(),
+            ConvolverHighSrFirExt::from_slice(&mut empty, 96_000.0, false).unwrap_err(),
             VmError::InsufficientBackingCapacity
         );
         let mut short = [0.0_f32; 6_143];
         assert_eq!(
-            CabinetHighSrFirExt::from_slice(&mut short, 44_100.0, false).unwrap_err(),
+            ConvolverHighSrFirExt::from_slice(&mut short, 44_100.0, false).unwrap_err(),
             VmError::InsufficientBackingCapacity
         );
         assert_eq!(
-            CabinetHighSrFirExt::from_slice(&mut short, -1.0, false).unwrap_err(),
+            ConvolverHighSrFirExt::from_slice(&mut short, -1.0, false).unwrap_err(),
             VmError::InvalidSampleRate
         );
     }
@@ -521,16 +521,16 @@ mod tests {
     #[test]
     fn test_owned_alloc_helper_matches_required_len() {
         assert_eq!(
-            CabinetHighSrFirExt::new_owned_for_rate(48_000.0, false)
+            ConvolverHighSrFirExt::new_owned_for_rate(48_000.0, false)
                 .unwrap()
                 .mode(),
-            CabinetHighSrMode::Native48k
+            ConvolverHighSrMode::Native48k
         );
         assert_eq!(
-            CabinetHighSrFirExt::new_owned_for_rate(96_000.0, false)
+            ConvolverHighSrFirExt::new_owned_for_rate(96_000.0, false)
                 .unwrap()
                 .mode(),
-            CabinetHighSrMode::CaseA { stride_q: 2 }
+            ConvolverHighSrMode::CaseA { stride_q: 2 }
         );
     }
 
@@ -541,11 +541,11 @@ mod tests {
         (fir_l[0], fir_l[1], fir_l[5], fir_r[1]) = (0.25, 0.50, 0.25, 1.0);
 
         // Case (a): 96 kHz (q = 2) -> sparse stride 2, onset = 32.
-        let mut ext_a = CabinetHighSrFirExt::from_slice(&mut buf, 96_000.0, false).unwrap();
+        let mut ext_a = ConvolverHighSrFirExt::from_slice(&mut buf, 96_000.0, false).unwrap();
         ext_a.prepare(&fir_l, &fir_r, 96_000.0, false).unwrap();
         assert_eq!(
             (ext_a.mode(), ext_a.onset_delay()),
-            (CabinetHighSrMode::CaseA { stride_q: 2 }, 32)
+            (ConvolverHighSrMode::CaseA { stride_q: 2 }, 32)
         );
         let mut onset_hit = false;
         for n in 0..40 {
@@ -562,13 +562,13 @@ mod tests {
         assert!(onset_hit);
 
         // Case (b): 44.1 kHz live 1x -> 0-ULP unit DC for tap-1 impulse and normalized sum.
-        let mut ext_b = CabinetHighSrFirExt::from_slice(&mut buf, 44_100.0, false).unwrap();
+        let mut ext_b = ConvolverHighSrFirExt::from_slice(&mut buf, 44_100.0, false).unwrap();
         let mut unit_tap1 = [0.0_f32; 32];
         unit_tap1[1] = 1.0;
         ext_b.prepare(&unit_tap1, &fir_l, 44_100.0, false).unwrap();
         assert_eq!(
             (ext_b.mode(), ext_b.onset_delay()),
-            (CabinetHighSrMode::CaseB, 15)
+            (ConvolverHighSrMode::CaseB, 15)
         );
         let ((dc_l, dc_r), (ol, _)) = step_dc(&mut ext_b, 96);
         assert_eq!((dc_l, ol), (1.0, 1.0));
@@ -580,21 +580,21 @@ mod tests {
         let t1 = prepare_bounce_6point_u64(1, 176_400.0);
         let t127 = prepare_bounce_6point_u64(127, 352_800.0);
         assert_eq!((t1.m, t1.anchor, t127.m, t127.anchor), (3, 3, 933, 2));
-        let mut ext_c = CabinetHighSrFirExt::from_slice(&mut buf, 176_400.0, true).unwrap();
+        let mut ext_c = ConvolverHighSrFirExt::from_slice(&mut buf, 176_400.0, true).unwrap();
         ext_c.prepare(&fir_l, &fir_r, 176_400.0, true).unwrap();
         assert_eq!(
             (ext_c.mode(), ext_c.onset_delay()),
-            (CabinetHighSrMode::CaseC, 59)
+            (ConvolverHighSrMode::CaseC, 59)
         );
         let ((dc_cl, dc_cr), _) = step_dc(&mut ext_c, 80);
         assert!(const_abs_f32(dc_cl - 1.0) < 1.0e-6 && const_abs_f32(dc_cr - 1.0) < 1.0e-6);
 
         // Case (d): 88.2 kHz -> out_len = 59, onset = 29, unit DC, chunk parity.
-        let mut ext_d = CabinetHighSrFirExt::from_slice(&mut buf, 88_200.0, false).unwrap();
+        let mut ext_d = ConvolverHighSrFirExt::from_slice(&mut buf, 88_200.0, false).unwrap();
         ext_d.prepare(&fir_l, &fir_r, 88_200.0, false).unwrap();
         assert_eq!(
             (ext_d.mode(), ext_d.out_len(), ext_d.onset_delay()),
-            (CabinetHighSrMode::CaseD, 59, 29)
+            (ConvolverHighSrMode::CaseD, 59, 29)
         );
         let (mut early_chk, mut onset_chk) = ([[0.0_f32; 2]; 4], [[0.0_f32; 2]; 4]);
         for _ in 0..20 {

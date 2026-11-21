@@ -15,8 +15,8 @@ use dispatch::{
     prepare_micro_ramp_deltas, step_ou_drift,
 };
 use tick::{
-    StaticEvalInputs, StaticEvalOutputs, evaluate_static_cp1_latents, step_lfos_and_harmonics,
-    update_env_states,
+    StaticEvalInputs, StaticEvalOutputs, compute_has_internal_modulators, eval_skewed_lfo_q2,
+    evaluate_static_cp1_latents, step_lfos_and_skewed_q2, update_env_states,
 };
 
 use crate::bin::TempoSyncEntryWire;
@@ -25,7 +25,7 @@ use crate::control::tempo::apply_tsyn_table;
 use crate::control::{ControlClampDescriptor, Cp1ContributorSlot};
 use crate::math::{
     DefaultMathBackend, IEEE754_F32_ABS_MASK, MAX_ROTOR_ANGLE_F32_BITS, MathBackend, Q0_192Phase,
-    powf_f64, rcp_nr6_f64, round_f64,
+    powf_f64, rcp_nr6_f64, round_f64, sanitize_finite_f32,
 };
 use crate::types::{ColdBuf, ColdSlice, Tier, VmError};
 
@@ -99,9 +99,9 @@ pub struct ControlBus<'a, B: MathBackend = DefaultMathBackend> {
     pub stage_targets: [f32; STAGE_TARGET_SLOTS],
     /// Previous `K_ctrl` boundary target snapshot.
     pub prev_stage_targets: [f32; STAGE_TARGET_SLOTS],
-    /// Per-VM-frame ramped stage parameters (`[16]` snaps immediately; `[31] == 0.0`).
+    /// Per-VM-frame ramped stage parameters across all 32 slots (`[31] == 0.0`).
     pub current_stage_params: [f32; STAGE_TARGET_SLOTS],
-    /// Per-VM-frame micro-ramp step delta (`[16] == 0.0`, `[31] == 0.0`).
+    /// Per-VM-frame uniform micro-ramp step delta (`[31] == 0.0`).
     pub stage_ramp_deltas: [f32; STAGE_TARGET_SLOTS],
     /// Base `SO(4)` gauge-covariant head coordinates `[0..4]`.
     pub z_head: [f32; 4],
@@ -119,14 +119,14 @@ pub struct ControlBus<'a, B: MathBackend = DefaultMathBackend> {
     pub lfo_dphi_train: [f32; 2],
     /// Unit phasor state `[[cos, sin]; 2]`.
     pub lfo_phasors: [[f32; 2]; 2],
-    /// Chebyshev harmonics `[T1..T4]` for LFO 0 and LFO 1.
-    pub lfo_harmonics: [f32; 8],
-    /// Host-rate ZOH-scaled standalone envelope poles `[0..3]`.
-    pub env_poles_host: [f32; 3],
-    /// Reference `3 kHz` standalone envelope poles `[0..3]`.
-    pub env_poles_train: [f32; 3],
-    /// Active 4-band envelope vector `[e_0, e_1, e_2, e_3]`.
+    /// Chebyshev-2 LFO skew parameters `[-1.0, 1.0]` for LFO 0 and LFO 1.
+    pub lfo_skew: [f32; 2],
+    /// Latched 4-band `SensoryQuad` envelope vector `[e_0, e_1, e_2, e_3]` (`q3`).
     pub env_states: [f32; 4],
+    /// Learned base `Op-T` tank dry mix (`[-2.0, 2.0]`).
+    pub base_tank_dry_mix: f32,
+    /// Projection weights mapping `ou_drift_state[k & 3]` onto `eff_z_stage[0..8]` (`[-4.0, 4.0]`).
+    pub ou_to_z_stage: [f32; 8],
     /// 4-channel OU analog drift state.
     pub ou_drift_state: [f32; 4],
     /// `xorshift64*` analog drift PRNG seed/state.
@@ -151,12 +151,8 @@ pub struct ControlBus<'a, B: MathBackend = DefaultMathBackend> {
     pub host_sample_rate_hz: f32,
     /// Decimation stride $K_{\text{ctrl}}(f_{s,\text{vm}}) \ge 8$.
     pub ctrl_stride: u32,
-    /// Precomputed reciprocal stride `1.0 / (ctrl_stride as f32)` for RT `step_frame`.
-    pub inv_ctrl_stride: f32,
     /// Sub-window frame counter `0..ctrl_stride`.
     pub ctrl_sub_counter: u32,
-    /// Running sum of `(0.5 * (|L| + |R|))` for standalone envelope mode.
-    window_abs_acc: f32,
     /// Active physical control count `P`.
     pub num_controls: usize,
     /// Active `CP1` contributor count.
@@ -215,7 +211,6 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
         let stride = control_stride_for_rate(sample_rate_hz);
         self.ctrl_stride = stride;
         let inv_stride = rcp_nr6_f64(f64::from(stride));
-        self.inv_ctrl_stride = inv_stride as f32;
         let rho_ctrl = control_tick_ratio(sample_rate_hz, self.ref_sample_rate_hz);
         for i in 0..2 {
             let train = self.lfo_dphi_train[i];
@@ -227,10 +222,12 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
                 self.lfo_dphi_host_bits[i] = scaled.clamp(-max_ang, max_ang).to_bits();
             }
         }
-        for b in 0..3 {
-            let p = self.env_poles_train[b];
-            self.env_poles_host[b] = (powf_f64(f64::from(p), rho_ctrl) as f32).clamp(0.0, 0.99995);
-        }
+        self.has_internal_modulators = compute_has_internal_modulators(
+            &self.lfo_dphi_host_bits,
+            &self.w_ctrl,
+            &self.w_ctrl_ext,
+            self.cext_present,
+        );
         self.rho_drift_host =
             (powf_f64(f64::from(self.rho_drift_train), rho_ctrl) as f32).clamp(0.0, 0.9999);
         let alpha = (f64::from(self.anti_zipper_scale) * 16.0 * inv_stride) as f32;
@@ -254,6 +251,28 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
         self.ctrl_sub_counter = k_new.saturating_sub(clamped_rem);
     }
 
+    #[inline]
+    fn eval_dispatch_with_q2(&mut self, q2: &[f32; 4]) {
+        evaluate_w_ctrl_32::<B>(
+            DispatchInputs {
+                q16_head: &self.z_head,
+                q16_basis: &self.ctrl_basis_4,
+                q16_lfo: q2,
+                q16_env: &self.env_states,
+                qu: &self.z_stage_ultra,
+                is_ultra: self.tier == Tier::Ultra,
+                cext_present: self.cext_present,
+            },
+            DispatchMatrices {
+                w_ctrl: &self.w_ctrl,
+                w_ctrl_ultra: &self.w_ctrl_ultra,
+                w_ctrl_ext: &self.w_ctrl_ext,
+                w_ctrl_ultra_ext: &self.w_ctrl_ultra_ext,
+            },
+            &mut self.stage_targets,
+        );
+    }
+
     /// Resets dynamic modulators, OU drift, exact accumulators, and snaps controls to defaults
     /// at resting zero equilibrium (`ref[dsp.ctrl.modulators.dynamic]`).
     pub fn reset(&mut self) {
@@ -269,35 +288,15 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
         }
         self.lfo_phases_q192 = [Q0_192Phase::ZERO; 2];
         self.lfo_phasors = [[1.0, 0.0]; 2];
-        self.lfo_harmonics = [0.0; 8];
         self.env_states = [0.0; 4];
         self.ou_drift_state = [0.0; 4];
         self.drift_prng_state = DEFAULT_DRIFT_PRNG_SEED;
         self.ctrl_sub_counter = 0;
-        self.window_abs_acc = 0.0;
         self.is_dirty = true;
 
         self.clamp_and_eval_static_if_dirty();
-        let q2_init = [0.0_f32, 0.0, 1.0, 0.0];
-        let q3_zero = [0.0_f32; 4];
-        evaluate_w_ctrl_32::<B>(
-            DispatchInputs {
-                q16_head: &self.z_head,
-                q16_basis: &self.ctrl_basis_4,
-                q16_lfo: &q2_init,
-                q16_env: &q3_zero,
-                qu: &self.z_stage_ultra,
-                is_ultra: self.tier == Tier::Ultra,
-                cext_present: self.cext_present,
-            },
-            DispatchMatrices {
-                w_ctrl: &self.w_ctrl,
-                w_ctrl_ultra: &self.w_ctrl_ultra,
-                w_ctrl_ext: &self.w_ctrl_ext,
-                w_ctrl_ultra_ext: &self.w_ctrl_ultra_ext,
-            },
-            &mut self.stage_targets,
-        );
+        let q2_init = [1.0 + self.lfo_skew[0], 0.0, 1.0 + self.lfo_skew[1], 0.0];
+        self.eval_dispatch_with_q2(&q2_init);
         self.current_stage_params = self.stage_targets;
         self.prev_stage_targets = self.stage_targets;
         self.stage_ramp_deltas = [0.0; STAGE_TARGET_SLOTS];
@@ -356,7 +355,7 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
         updated
     }
 
-    /// Returns the concatenated unrotated 8-D stage sensitivity vector `[ctrl_basis_4[0..4], z_stage_ultra[0..4]]`.
+    /// Returns the concatenated static 8-D stage sensitivity vector `[ctrl_basis_4[0..4], z_stage_ultra[0..4]]`.
     #[inline]
     pub const fn z_stage(&self) -> [f32; 8] {
         [
@@ -369,6 +368,42 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
             self.z_stage_ultra[2],
             self.z_stage_ultra[3],
         ]
+    }
+
+    /// Returns the decoded base `Op-T` tank dry mix (`[-2.0, 2.0]`).
+    #[inline]
+    pub const fn base_tank_dry_mix(&self) -> f32 {
+        self.base_tank_dry_mix
+    }
+
+    /// Returns the effective 8-D stage sensitivity vector (`static_z_stage + ou_to_z_stage * ou_drift_state[k & 3]`),
+    /// matching `z_stage()` at 0-ULP whenever stochastic OU drift is inactive (`ref[dsp.ctrl.modulators.dynamic]`).
+    #[inline]
+    pub fn eff_z_stage(&self) -> [f32; 8] {
+        let static_z = self.z_stage();
+        if !self.is_analog_drift_active() {
+            return static_z;
+        }
+        let mut out = [0.0_f32; 8];
+        for k in 0..8 {
+            out[k] = sanitize_finite_f32(
+                (0.0_f32 + sanitize_finite_f32(static_z[k]))
+                    + sanitize_finite_f32(self.ou_to_z_stage[k] * self.ou_drift_state[k & 3]),
+            );
+        }
+        out
+    }
+
+    /// Returns the current unsmoothed 32-slot `3 kHz` dispatch targets.
+    #[inline]
+    pub const fn stage_targets(&self) -> &[f32; STAGE_TARGET_SLOTS] {
+        &self.stage_targets
+    }
+
+    /// Returns the current micro-ramped 32-slot VM-frame stage parameters.
+    #[inline]
+    pub const fn current_stage_params(&self) -> &[f32; STAGE_TARGET_SLOTS] {
+        &self.current_stage_params
     }
 
     /// Returns `true` when stochastic live OU analog drift is currently active.
@@ -434,37 +469,9 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
 
     fn eval_current_dispatch_and_snap(&mut self) {
         self.clamp_and_eval_static_if_dirty();
-        let q2_curr = [
-            self.lfo_harmonics[0] + 0.35 * self.lfo_harmonics[1],
-            self.lfo_harmonics[4] + 0.35 * self.lfo_harmonics[5],
-            self.lfo_phasors[0][0],
-            self.lfo_phasors[0][1],
-        ];
-        evaluate_w_ctrl_32::<B>(
-            DispatchInputs {
-                q16_head: &self.z_head,
-                q16_basis: &self.ctrl_basis_4,
-                q16_lfo: &q2_curr,
-                q16_env: &self.env_states,
-                qu: &self.z_stage_ultra,
-                is_ultra: self.tier == Tier::Ultra,
-                cext_present: self.cext_present,
-            },
-            DispatchMatrices {
-                w_ctrl: &self.w_ctrl,
-                w_ctrl_ultra: &self.w_ctrl_ultra,
-                w_ctrl_ext: &self.w_ctrl_ext,
-                w_ctrl_ultra_ext: &self.w_ctrl_ultra_ext,
-            },
-            &mut self.stage_targets,
-        );
-        if self.is_analog_drift_active() {
-            let drift_slots = [2_usize, 5, 10, 14];
-            let drift_weights = [1.0_f32, 1.0, 0.25, 0.25];
-            for (d, (&slot, &w)) in drift_slots.iter().zip(drift_weights.iter()).enumerate() {
-                self.stage_targets[slot] += w * self.ou_drift_state[d];
-            }
-        } else {
+        let q2_curr = eval_skewed_lfo_q2(&self.lfo_phasors, &self.lfo_skew);
+        self.eval_dispatch_with_q2(&q2_curr);
+        if !self.is_analog_drift_active() {
             self.ou_drift_state = [0.0; 4];
         }
         self.current_stage_params = self.stage_targets;
@@ -512,47 +519,21 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
     }
 
     /// Executes one `3 kHz` control-boundary update: optional static basis eval (only if `is_dirty`),
-    /// `Q0.192` LFO step, envelope update, `W_ctrl` + `"CEXT"` dispatch, OU drift, and ramp setup
-    /// (with immediate snap on slot `16` `op_t_we_drive`).
-    pub fn tick_control_boundary(
-        &mut self,
-        router_envelopes: Option<[f32; 4]>,
-        audio_abs_energy: f32,
-    ) {
+    /// skewed `Q0.192` LFO step, `SensoryQuad` envelope latch, `W_ctrl` + `"CEXT"` dispatch,
+    /// `ou_drift_state` step (projected via [`Self::eff_z_stage`]), and uniform 32-slot ramp setup.
+    pub fn tick_control_boundary(&mut self, sensory_env: Option<[f32; 4]>) {
         if !self.should_tick() {
             return;
         }
         self.clamp_and_eval_static_if_dirty();
-        let q2 = step_lfos_and_harmonics(
+        let q2 = step_lfos_and_skewed_q2(
             &mut self.lfo_phases_q192,
             &self.lfo_dphi_host_bits,
             &mut self.lfo_phasors,
-            &mut self.lfo_harmonics,
+            &self.lfo_skew,
         );
-        update_env_states(
-            &mut self.env_states,
-            &self.env_poles_host,
-            router_envelopes,
-            audio_abs_energy,
-        );
-        evaluate_w_ctrl_32::<B>(
-            DispatchInputs {
-                q16_head: &self.z_head,
-                q16_basis: &self.ctrl_basis_4,
-                q16_lfo: &q2,
-                q16_env: &self.env_states,
-                qu: &self.z_stage_ultra,
-                is_ultra: self.tier == Tier::Ultra,
-                cext_present: self.cext_present,
-            },
-            DispatchMatrices {
-                w_ctrl: &self.w_ctrl,
-                w_ctrl_ultra: &self.w_ctrl_ultra,
-                w_ctrl_ext: &self.w_ctrl_ext,
-                w_ctrl_ultra_ext: &self.w_ctrl_ultra_ext,
-            },
-            &mut self.stage_targets,
-        );
+        update_env_states(&mut self.env_states, sensory_env);
+        self.eval_dispatch_with_q2(&q2);
         step_ou_drift(
             self.live_analog_drift_enabled,
             self.offline_bounce,
@@ -560,9 +541,8 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
             self.rho_drift_host,
             &mut self.drift_prng_state,
             &mut self.ou_drift_state,
-            &mut self.stage_targets,
         );
-        prepare_micro_ramp_deltas(
+        prepare_micro_ramp_deltas::<B>(
             &self.stage_targets,
             &mut self.prev_stage_targets,
             &mut self.current_stage_params,
@@ -571,19 +551,20 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
         );
     }
 
-    /// Advances the control bus by one VM audio frame with deterministic chunk-size invariance.
+    /// Advances the control bus by one VM audio frame, returning `Some(&current_stage_params)`
+    /// when ticking or `None` when completely idle (`!self.should_tick()`).
     #[inline]
-    pub fn step_frame(&mut self, router_envelopes: Option<[f32; 4]>, frame_abs_mean: f32) {
+    pub fn step_frame(
+        &mut self,
+        sensory_env: Option<[f32; 4]>,
+    ) -> Option<&[f32; STAGE_TARGET_SLOTS]> {
         if !self.should_tick() {
-            return;
+            return None;
         }
         if self.ctrl_sub_counter == 0 {
-            let energy = self.window_abs_acc * self.inv_ctrl_stride;
-            self.window_abs_acc = 0.0;
-            self.tick_control_boundary(router_envelopes, energy);
+            self.tick_control_boundary(sensory_env);
         }
-        self.window_abs_acc += frame_abs_mean;
-        advance_micro_ramp_frame(
+        advance_micro_ramp_frame::<B>(
             &self.stage_targets,
             &self.prev_stage_targets,
             &mut self.current_stage_params,
@@ -595,6 +576,7 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
         if self.ctrl_sub_counter >= self.ctrl_stride {
             self.ctrl_sub_counter = 0;
         }
+        Some(&self.current_stage_params)
     }
 }
 
@@ -603,22 +585,17 @@ pub type DefaultControlBus<'a> = ControlBus<'a, DefaultMathBackend>;
 
 /// Non-inlined real-time frame-step entrypoint for disassembly audit (`ref[sdk.rust.realtime-disassembly-audit]`).
 #[inline(never)]
-pub fn step_control_frame_default(
-    bus: &mut DefaultControlBus<'_>,
-    router_envelopes: Option<[f32; 4]>,
-    frame_abs_mean: f32,
-) {
-    bus.step_frame(router_envelopes, frame_abs_mean);
+pub fn step_control_frame_default(bus: &mut DefaultControlBus<'_>, sensory_env: Option<[f32; 4]>) {
+    let _ = bus.step_frame(sensory_env);
 }
 
 /// Non-inlined `3 kHz` boundary entrypoint for disassembly audit (`ref[sdk.rust.realtime-disassembly-audit]`).
 #[inline(never)]
 pub fn step_control_tick_3khz_default(
     bus: &mut DefaultControlBus<'_>,
-    router_envelopes: Option<[f32; 4]>,
-    audio_abs_energy: f32,
+    sensory_env: Option<[f32; 4]>,
 ) {
-    bus.tick_control_boundary(router_envelopes, audio_abs_energy);
+    bus.tick_control_boundary(sensory_env);
 }
 
 #[cfg(test)]
@@ -627,8 +604,12 @@ mod tests {
     use crate::bin::{DnamBinBuildInput, DnamBinView, encode_dnam_bin_into};
 
     #[test]
-    fn test_control_bus_zero_control_idle_identity_no_alloc() {
-        let a0 = DnamBinBuildInput::default_arena0_lite();
+    fn test_control_bus_idle_ou_separation_skew_and_uniform_ramping() {
+        let mut a0 = DnamBinBuildInput::default_arena0_lite();
+        a0.control_bus_lite.lfo_skew_fp16 = [
+            zerocopy::byteorder::little_endian::U16::new(crate::math::f32_to_fp16(0.5)),
+            zerocopy::byteorder::little_endian::U16::new(crate::math::f32_to_fp16(-0.25)),
+        ];
         let input = DnamBinBuildInput {
             reference_sample_rate_hz: 48_000,
             header_flags: 0,
@@ -638,7 +619,7 @@ mod tests {
             declared_max_delay_48k: 4_096,
             dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
             tail_time_ms: 0.0,
-            r_ac_default: 0.99,
+            ro_pole_48k: 0.99,
             switch_xfade_samples: 0,
             content_hash_prefix: [0; 8],
             controls: &[],
@@ -675,9 +656,9 @@ mod tests {
             ControlBus::from_dnam_bin(&view, Tier::Lite, 48_000.0, backing).unwrap();
         assert!(!bus.should_tick());
         for _ in 0..32 {
-            bus.step_frame(None, 0.25);
+            assert!(bus.step_frame(None).is_none());
         }
-        assert_eq!(bus.current_stage_params, [0.0; 32]);
+        assert_eq!(*bus.current_stage_params(), [0.0; 32]);
 
         struct NullSink;
         impl core::fmt::Write for NullSink {
@@ -701,26 +682,40 @@ mod tests {
         bus.retime_sample_rate(96_000.0);
         assert_eq!(bus.ctrl_stride, 32);
 
+        // Verify skewed Q0.192 reset q2 = [1 + skew0, 0, 1 + skew1, 0], direct sensory latch,
+        // OU separation (ou_to_z_stage -> eff_z_stage only, stage_targets untouched), and uniform slot-16 ramp.
+        bus.w_ctrl[0][8] = 1.0;
+        bus.w_ctrl[0][10] = 1.0;
+        bus.cext_present = true;
+        bus.w_ctrl_ext[0][12] = 2.0;
+        bus.has_internal_modulators = true;
+        bus.reset();
+        assert!((bus.stage_targets()[0] - ((1.0 + 0.5) + (1.0 - 0.25))).abs() < 1e-6);
+        assert_eq!(bus.current_stage_params()[16], 0.0);
+
         bus.live_analog_drift_enabled = true;
         bus.offline_bounce = false;
         bus.sigma_drift = 0.05;
-        step_control_tick_3khz_default(&mut bus, Some([0.1, 0.2, 0.3, 0.4]), 0.1);
-        step_control_frame_default(&mut bus, None, 0.05);
-        assert!(bus.should_tick());
-        bus.reset();
+        bus.ctrl_basis_4[0] = 0.5;
+        bus.ou_to_z_stage = [1.0, -0.5, 0.0, 0.0, 0.25, 0.0, 0.0, -1.0];
+        step_control_tick_3khz_default(&mut bus, Some([0.4, 0.2, 0.3, 0.4]));
+        assert_eq!(bus.env_states, [0.4, 0.2, 0.3, 0.4]);
+        assert_eq!(bus.stage_targets()[2], 0.0);
+        assert_eq!(bus.stage_targets()[14], 0.0);
+        assert!((bus.stage_targets()[16] - 0.8).abs() < 1e-6);
+        assert_ne!(bus.eff_z_stage(), bus.z_stage());
 
-        assert_eq!(bus.apply_tempo_bpm(120.0), 0);
-        assert!(
-            ControlBusBacking::from_slices(
-                &mut descs,
-                &mut raw,
-                &mut clamped,
-                &mut norm,
-                &mut sw,
-                &mut [],
-                &[],
-            )
-            .is_ok()
+        // Advance one frame: slot 16 micro-ramps smoothly instead of snapping immediately.
+        let frame0 = *bus.step_frame(Some([0.4, 0.2, 0.3, 0.4])).unwrap();
+        assert!(frame0[16] > 0.0 && frame0[16] < 0.8);
+
+        assert!(bus.set_offline_bounce(true));
+        assert_eq!(
+            bus.eff_z_stage().map(f32::to_bits),
+            bus.z_stage().map(f32::to_bits)
         );
+        bus.reset();
+        assert_eq!(bus.env_states.map(f32::to_bits), [0; 4]);
+        assert_eq!(bus.apply_tempo_bpm(120.0), 0);
     }
 }

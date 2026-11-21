@@ -12,58 +12,68 @@ use alloc::vec;
 #[cfg(feature = "alloc")]
 use core::marker::PhantomData;
 
+#[cfg(feature = "alloc")]
+use dnam_kernels::QUAD_FLAG_HAS_EXT;
 use dnam_kernels::{
-    HilbertH1StereoKernel, compute_t1_dc_blocker_coeffs_clamped, interpolate_hilbert_h1_alphas_f64,
+    HilbertH1StereoKernel, MAX_PARALRU_R_F32, compute_t1_dc_blocker_coeffs_clamped,
+    interpolate_hilbert_h1_alphas_f64,
 };
 #[cfg(feature = "alloc")]
 use zerocopy::FromBytes;
 
-use crate::bin::DnamBinView;
-use crate::bin::arena_wire::TANK_FLAG_SCHROEDER_ENABLE;
 #[cfg(feature = "alloc")]
-use crate::bin::{Cp1StreamHeaderWire, TankQuadWire};
+use crate::bin::{Cp1StreamHeaderWire, TransportQuadWire};
+use crate::bin::{DnamBinView, TRANSPORT_FLAG_EXT_F32, TRANSPORT_FLAG_SCHROEDER_ENABLE};
 use crate::control::ControlBus;
 #[cfg(feature = "alloc")]
 use crate::control::ControlBusBacking;
 use crate::graph::GraphBackend;
-use crate::graph::cabinet::high_sr::CabinetHighSrFirExt;
+use crate::graph::convolver::high_sr::ConvolverHighSrFirExt;
 #[cfg(feature = "alloc")]
-use crate::graph::cabinet::high_sr::EXT_FIR_STORAGE_F32_LEN;
+use crate::graph::convolver::high_sr::EXT_FIR_STORAGE_F32_LEN;
 use crate::graph::oversample::Bounce4xOversampler;
-use crate::graph::router::IoRouter;
-use crate::graph::tank::{
-    PartitionedSchroederBank, QuadEffectiveTargets, QuadHydrateConfig, TANK_MAX_QUADS, TankExtRing,
-    TankQuadHotCompact, compute_quad_ext_requirements, compute_schroeder_requirements,
+use crate::graph::sensory::SensoryQuadCold;
+use crate::graph::transport::{
+    PartitionedSchroederBank, QuadEffectiveTargets, QuadHydrateConfig, TRANSPORT_MAX_QUADS,
+    TransportExtRing, TransportQuadHotCompact, compute_quad_ext_requirements,
+    compute_schroeder_requirements,
 };
 use crate::graph::zoh::ZohRateContext;
+#[cfg(feature = "alloc")]
+use crate::math::rcp_nr6_f64;
+use crate::math::{clamp_finite_f32, f32_to_fp16};
 use crate::types::{ColdBuf, Tier, VmError};
 
 use super::ctrl_latch::latch_immediate_at_init_or_reset;
 use super::layout::{FLAG_COLD_FIR_EXT, FLAG_OS2X, SonaColdTail, SonaHotSlab, SonaSlabBacking};
-use apply_tier::{apply_tier_weights_and_rescale, populate_crossbar_and_groups};
+use apply_tier::{apply_tier_weights_and_rescale, populate_crossbar_and_core_quads};
 use lifecycle::setup_phasor_increments;
-use wire_decode::{TANK_FLAG_EXT_F32, decode_readout_and_overrides};
+use wire_decode::decode_readout_and_overrides;
 
 pub use lifecycle::{
     reset_to_dc_equilibrium, retime_sample_rate, set_offline_bounce, set_op_t_write_enable,
-    switch_tier,
+    set_quad_write_enable, switch_tier,
 };
 
-fn setup_tank_wire_slots<B: GraphBackend>(view: &DnamBinView<'_>, slab: &mut SonaHotSlab<'_, B>) {
-    let mut quads = [view.arena0.spatial_tank_lite; TANK_MAX_QUADS];
+fn setup_transport_wire_slots<B: GraphBackend>(
+    view: &DnamBinView<'_>,
+    slab: &mut SonaHotSlab<'_, B>,
+) {
+    let mut quads = [view.arena0.transport_lite; TRANSPORT_MAX_QUADS];
     if let Some(a1) = view.arena1 {
-        quads[1] = a1.spatial_tank_full;
+        quads[1] = a1.transport_full;
     }
     if let Some(a2) = view.arena2 {
-        quads[2] = a2.spatial_tank_pro[0];
+        quads[2] = a2.transport_pro[0];
     }
     if let Some(a3) = view.arena3 {
-        quads[3] = a3.spatial_tank_ultra[0];
+        quads[3] = a3.transport_ultra[0];
     }
-    slab.cold_mut().wire_tank_quads = quads;
-    slab.cold_mut().declared_max_delay_48k = view.runtime_meta.declared_max_delay_48k.get();
-    slab.cold_mut().ext_ring_pow2_frames = view.runtime_meta.ext_ring_pow2_frames;
-    slab.cold_mut().dc_blocker_pole_5hz = view.runtime_meta.dc_blocker_pole_5hz.get();
+    let cold = slab.cold_mut();
+    cold.wire_transport_quads = quads;
+    cold.declared_max_delay_48k = view.runtime_meta.declared_max_delay_48k.get();
+    cold.ext_ring_pow2_frames = view.runtime_meta.ext_ring_pow2_frames;
+    cold.dc_blocker_pole_5hz = view.runtime_meta.dc_blocker_pole_5hz.get();
 }
 
 fn prepare_common_cold<'a, B: GraphBackend>(
@@ -72,7 +82,7 @@ fn prepare_common_cold<'a, B: GraphBackend>(
     active_tier: Tier,
     zoh: &ZohRateContext,
     mut bus: ControlBus<'a, B>,
-    mut fir_ext: CabinetHighSrFirExt<'a>,
+    mut fir_ext: ConvolverHighSrFirExt<'a>,
 ) -> Result<(), VmError> {
     let offline = zoh.is_bounce_4x;
     bus.offline_bounce = offline;
@@ -84,7 +94,7 @@ fn prepare_common_cold<'a, B: GraphBackend>(
         offline,
     )?;
 
-    let use_cold_fir = CabinetHighSrFirExt::required_f32_len(zoh.f_s_vm, offline) > 0;
+    let use_cold_fir = ConvolverHighSrFirExt::required_f32_len(zoh.f_s_vm, offline) > 0;
     slab.set_flag(FLAG_COLD_FIR_EXT, use_cold_fir);
     slab.set_flag(FLAG_OS2X, zoh.os2x_active);
     slab.lite.tier = active_tier;
@@ -93,27 +103,38 @@ fn prepare_common_cold<'a, B: GraphBackend>(
     slab.lite.hilbert = HilbertH1StereoKernel::with_coeffs(ai, aq);
     let (dc_pole, _) = compute_t1_dc_blocker_coeffs_clamped(zoh.f_s_vm);
     slab.lite.t1_dc.set_pole(dc_pole);
+    slab.lite.sensory_quad.reset();
 
     let cb = slab.cold().wire_crossbar;
+    let base_tank_dry_mix = bus.base_tank_dry_mix();
+    let ro_pole_48k = clamp_finite_f32(
+        view.runtime_meta.ro_pole_48k.get(),
+        0.0,
+        MAX_PARALRU_R_F32,
+        0.0,
+    );
+    slab.lite.tank_dry_mix_eff_fp16 = f32_to_fp16(base_tank_dry_mix);
     let cold = slab.cold_mut();
     cold.max_present_tier = Tier::from_u8(view.header.max_present_tier);
     cold.retained_tier = view.retained_tier;
     cold.zoh = *zoh;
     cold.offline_bounce = offline;
+    cold.base_tank_dry_mix = base_tank_dry_mix;
+    cold.ro_pole_48k = ro_pole_48k;
     cold.ctrl_bus = Some(bus);
-    cold.cabinet_fir_ext = fir_ext;
-    cold.router = IoRouter::from_crossbar_wire(&cb, zoh);
+    cold.convolver_fir_ext = fir_ext;
+    cold.sensory_cold = SensoryQuadCold::from_crossbar_wire(&cb, zoh.rho_vm);
     cold.bounce4x = Bounce4xOversampler::new();
     setup_phasor_increments(slab, zoh);
     Ok(())
 }
 
-fn hydrate_tank_borrowed<'a, B: GraphBackend>(
+fn hydrate_transport_borrowed<'a, B: GraphBackend>(
     slab: &mut SonaHotSlab<'a, B>,
     zoh: &ZohRateContext,
-    ext_fp16: [&'a mut [u16]; TANK_MAX_QUADS],
-    ext_f32: [&'a mut [f32]; TANK_MAX_QUADS],
-    schroeder_bufs: [&'a mut [f32]; TANK_MAX_QUADS],
+    ext_fp16: [&'a mut [u16]; TRANSPORT_MAX_QUADS],
+    ext_f32: [&'a mut [f32]; TRANSPORT_MAX_QUADS],
+    schroeder_bufs: [&'a mut [f32]; TRANSPORT_MAX_QUADS],
 ) -> Result<(), VmError> {
     let [fp0, fp1, fp2, fp3] = ext_fp16;
     let [f32_0, f32_1, f32_2, f32_3] = ext_f32;
@@ -122,7 +143,7 @@ fn hydrate_tank_borrowed<'a, B: GraphBackend>(
     let f32_slots = [f32_0, f32_1, f32_2, f32_3];
     let sch_slots = [sch0, sch1, sch2, sch3];
 
-    let wires = slab.cold().wire_tank_quads;
+    let wires = slab.cold().wire_transport_quads;
     let (decl_max, pow2, dc5) = (
         slab.cold().declared_max_delay_48k,
         slab.cold().ext_ring_pow2_frames,
@@ -137,8 +158,8 @@ fn hydrate_tank_borrowed<'a, B: GraphBackend>(
         .enumerate()
     {
         if q >= active_q {
-            slab.cold_mut().tank_ext[q] = TankExtRing::none();
-            slab.cold_mut().tank_schroeder[q] = PartitionedSchroederBank::disabled();
+            slab.cold_mut().transport_ext[q] = TransportExtRing::none();
+            slab.cold_mut().transport_schroeder[q] = PartitionedSchroederBank::disabled();
             continue;
         }
         let cfg = QuadHydrateConfig {
@@ -149,24 +170,24 @@ fn hydrate_tank_borrowed<'a, B: GraphBackend>(
             ext_ring_pow2_frames: pow2,
             dc_blocker_pole_5hz: dc5,
         };
-        let (hot_q, meta_q) = TankQuadHotCompact::from_wire(&wires[q], &cfg)?;
-        *slab.quad_hot_mut(q) = hot_q;
-        slab.cold_mut().tank_quad_meta[q] = meta_q;
-        slab.cold_mut().tank_quad_eff[q] =
+        let (hot_q, meta_q) = TransportQuadHotCompact::from_wire(&wires[q], &cfg)?;
+        *slab.transport_quad_hot_mut(q) = hot_q;
+        slab.cold_mut().transport_quad_meta[q] = meta_q;
+        slab.cold_mut().transport_quad_eff[q] =
             QuadEffectiveTargets::from_quad_and_meta(&hot_q, &meta_q);
 
         let (has_ext, cap) =
             compute_quad_ext_requirements(&wires[q], q, zoh.rho_vm, decl_max, pow2);
-        slab.cold_mut().tank_ext[q] = if !has_ext {
-            TankExtRing::none()
-        } else if (wires[q].flags & TANK_FLAG_EXT_F32) != 0 {
-            TankExtRing::from_f32_buf(ColdBuf::borrowed(f32_s), cap)?
+        slab.cold_mut().transport_ext[q] = if !has_ext {
+            TransportExtRing::none()
+        } else if (wires[q].flags & TRANSPORT_FLAG_EXT_F32) != 0 {
+            TransportExtRing::from_f32_buf(ColdBuf::borrowed(f32_s), cap)?
         } else {
-            TankExtRing::from_fp16_buf(ColdBuf::borrowed(fp_s), cap)?
+            TransportExtRing::from_fp16_buf(ColdBuf::borrowed(fp_s), cap)?
         };
         let (_, _, _, sch_req) = compute_schroeder_requirements(&wires[q], zoh.rho_vm);
-        slab.cold_mut().tank_schroeder[q] =
-            if (wires[q].flags & TANK_FLAG_SCHROEDER_ENABLE) == 0 || sch_req == 0 {
+        slab.cold_mut().transport_schroeder[q] =
+            if (wires[q].flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) == 0 || sch_req == 0 {
                 PartitionedSchroederBank::disabled()
             } else {
                 PartitionedSchroederBank::from_slice(sch_s, &wires[q], zoh.rho_vm)?
@@ -193,27 +214,27 @@ pub fn hydrate_slab_from_dnam_bin<'a, B: GraphBackend>(
     backing.cold_tail[0] = SonaColdTail::empty();
     let mut slab = SonaHotSlab::empty_with_cold(ColdBuf::borrowed(backing.cold_tail));
 
-    populate_crossbar_and_groups(view, &mut slab);
+    populate_crossbar_and_core_quads(view, &mut slab);
     decode_readout_and_overrides(view, &mut slab)?;
-    setup_tank_wire_slots(view, &mut slab);
+    setup_transport_wire_slots(view, &mut slab);
 
     let tier_os2x = slab.cold().tier_os2x[active_tier.index()];
     let ref_hz = view.header.reference_sample_rate_hz.get() as f32;
     let zoh =
         ZohRateContext::compute(ref_hz, host_rate_hz, active_tier, tier_os2x, offline_bounce)?;
     let bus = ControlBus::from_dnam_bin(view, active_tier, zoh.f_s_vm as f32, backing.control_bus)?;
-    let fir_ext = if backing.cabinet_fir_ext.is_empty() {
-        CabinetHighSrFirExt::from_slice(&mut [], 48_000.0, false)?
+    let fir_ext = if backing.convolver_fir_ext.is_empty() {
+        ConvolverHighSrFirExt::from_slice(&mut [], 48_000.0, false)?
     } else {
-        CabinetHighSrFirExt::from_slice(backing.cabinet_fir_ext, zoh.f_s_vm, offline_bounce)?
+        ConvolverHighSrFirExt::from_slice(backing.convolver_fir_ext, zoh.f_s_vm, offline_bounce)?
     };
     prepare_common_cold(view, &mut slab, active_tier, &zoh, bus, fir_ext)?;
-    hydrate_tank_borrowed(
+    hydrate_transport_borrowed(
         &mut slab,
         &zoh,
-        backing.tank_ext_fp16,
-        backing.tank_ext_f32,
-        backing.tank_schroeder,
+        backing.transport_ext_fp16,
+        backing.transport_ext_f32,
+        backing.transport_schroeder,
     )?;
     apply_tier_weights_and_rescale(&mut slab, active_tier, &zoh)?;
     latch_immediate_at_init_or_reset(&mut slab);
@@ -241,9 +262,9 @@ pub fn hydrate_slab_owned<B: GraphBackend>(
     let cold_vec = vec![SonaColdTail::<B>::empty()];
     let mut slab = SonaHotSlab::empty_with_cold(ColdBuf::Owned(cold_vec));
 
-    populate_crossbar_and_groups(view, &mut slab);
+    populate_crossbar_and_core_quads(view, &mut slab);
     decode_readout_and_overrides(view, &mut slab)?;
-    setup_tank_wire_slots(view, &mut slab);
+    setup_transport_wire_slots(view, &mut slab);
 
     let tier_os2x = slab.cold().tier_os2x[active_tier.index()];
     let ref_hz = view.header.reference_sample_rate_hz.get() as f32;
@@ -266,26 +287,26 @@ pub fn hydrate_slab_owned<B: GraphBackend>(
         view.tsyn_entries,
     );
     let bus = ControlBus::from_dnam_bin(view, active_tier, zoh.f_s_vm as f32, ctrl_backing)?;
-    let fir_ext = CabinetHighSrFirExt::from_cold_buf(
+    let fir_ext = ConvolverHighSrFirExt::from_cold_buf(
         ColdBuf::Owned(vec![0.0_f32; EXT_FIR_STORAGE_F32_LEN]),
         zoh.f_s_vm,
         offline_bounce,
     )?;
     prepare_common_cold(view, &mut slab, active_tier, &zoh, bus, fir_ext)?;
 
-    let wires: [TankQuadWire; TANK_MAX_QUADS] = slab.cold().wire_tank_quads;
+    let wires: [TransportQuadWire; TRANSPORT_MAX_QUADS] = slab.cold().wire_transport_quads;
     let (decl_max, pow2, dc5) = (
         slab.cold().declared_max_delay_48k,
         slab.cold().ext_ring_pow2_frames,
         slab.cold().dc_blocker_pole_5hz,
     );
     let min_rho_384k =
-        f64::from(view.header.reference_sample_rate_hz.get()) * crate::math::rcp_nr6_f64(384_000.0);
+        f64::from(view.header.reference_sample_rate_hz.get()) * rcp_nr6_f64(384_000.0);
     let alloc_rho = zoh.rho_vm.min(min_rho_384k).min(0.125);
     for (q, wire) in wires.iter().enumerate() {
         if q > view.retained_tier.index() {
-            slab.cold_mut().tank_ext[q] = TankExtRing::none();
-            slab.cold_mut().tank_schroeder[q] = PartitionedSchroederBank::disabled();
+            slab.cold_mut().transport_ext[q] = TransportExtRing::none();
+            slab.cold_mut().transport_schroeder[q] = PartitionedSchroederBank::disabled();
             continue;
         }
         let cfg = QuadHydrateConfig {
@@ -296,19 +317,20 @@ pub fn hydrate_slab_owned<B: GraphBackend>(
             ext_ring_pow2_frames: pow2,
             dc_blocker_pole_5hz: dc5,
         };
-        let (hot_q, meta_q) = TankQuadHotCompact::from_wire(wire, &cfg)?;
-        *slab.quad_hot_mut(q) = hot_q;
-        slab.cold_mut().tank_quad_meta[q] = meta_q;
-        slab.cold_mut().tank_quad_eff[q] =
+        let (hot_q, meta_q) = TransportQuadHotCompact::from_wire(wire, &cfg)?;
+        *slab.transport_quad_hot_mut(q) = hot_q;
+        slab.cold_mut().transport_quad_meta[q] = meta_q;
+        slab.cold_mut().transport_quad_eff[q] =
             QuadEffectiveTargets::from_quad_and_meta(&hot_q, &meta_q);
-        let mut ext_ring = TankExtRing::new_owned_for_quad(wire, q, alloc_rho, decl_max, pow2)?;
-        if (hot_q.flags & dnam_kernels::QUAD_FLAG_HAS_EXT) != 0 {
+        let mut ext_ring =
+            TransportExtRing::new_owned_for_quad(wire, q, alloc_rho, decl_max, pow2)?;
+        if (hot_q.flags & QUAD_FLAG_HAS_EXT) != 0 {
             ext_ring.reconfigure_cap(meta_q.cap)?;
         }
-        slab.cold_mut().tank_ext[q] = ext_ring;
+        slab.cold_mut().transport_ext[q] = ext_ring;
         let (_, _, _, sch_req) = compute_schroeder_requirements(wire, alloc_rho);
-        slab.cold_mut().tank_schroeder[q] =
-            if (wire.flags & TANK_FLAG_SCHROEDER_ENABLE) == 0 || sch_req == 0 {
+        slab.cold_mut().transport_schroeder[q] =
+            if (wire.flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) == 0 || sch_req == 0 {
                 PartitionedSchroederBank::disabled()
             } else {
                 PartitionedSchroederBank::from_cold_buf(

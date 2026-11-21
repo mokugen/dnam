@@ -32,8 +32,9 @@ pub use fp16::{
 pub use gpu_vec4::GpuVec4;
 pub use op_constants::{
     HERMITE5_SIN_C1_F32, HERMITE5_SIN_C3_F32, HERMITE5_SIN_C5_F32, Q32_INV_2POW31_F32,
-    Q32_INV_2POW32_F32, TANK_MAX_G_LIN_BITS, TANK_MAX_G_LIN_F32, TANK_MAX_V_CEIL_BITS,
-    TANK_MAX_V_CEIL_F32, exp2_clamped16_f32, os2x_midpoint_f32x4, os2x_midpoint_vec4,
+    Q32_INV_2POW32_F32, TANK_MAX_G_LIN_BITS, TANK_MAX_G_LIN_F32, TANK_MAX_SIGMA_SAT_F32,
+    TANK_MAX_SIGMA_SAT_FP16, TANK_MAX_V_CEIL_BITS, TANK_MAX_V_CEIL_F32, exp2_clamped16_f32,
+    os2x_midpoint_f32x4, os2x_midpoint_vec4,
 };
 pub use stereo8::{InterleavedStereo8, StereoVec8};
 

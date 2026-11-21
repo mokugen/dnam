@@ -76,13 +76,7 @@ pub(super) fn validate_prefix_header(
     }
     let dc_pole = meta.dc_blocker_pole_5hz.get();
     let tail_ms = meta.tail_time_ms.get();
-    let r_ac = meta.r_ac_default.get();
-    if !dc_pole.is_finite()
-        || !tail_ms.is_finite()
-        || tail_ms < 0.0
-        || !r_ac.is_finite()
-        || !(0.0..1.0).contains(&r_ac)
-    {
+    if !dc_pole.is_finite() || !tail_ms.is_finite() || tail_ms < 0.0 {
         return Err(VmError::InvalidHeaderFlagsOrReserved);
     }
     let tsyn_count = header.tsyn_count.get() as usize;
@@ -363,7 +357,7 @@ pub(super) fn validate_tsyn_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bin::arena_wire::{SONA_META_RESERVED_MASK, TANK_FLAG_EXT_F32};
+    use crate::bin::arena_wire::{SONA_META_RESERVED_MASK, TRANSPORT_FLAG_EXT_F32};
     use crate::bin::header::{
         ConditionalClampRuleWire, Cp1StreamDirEntryWire, Cp1StreamHeaderWire,
     };
@@ -383,7 +377,7 @@ mod tests {
             declared_max_delay_48k: 4_096,
             dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
             tail_time_ms: 0.0,
-            r_ac_default: 0.99,
+            ro_pole_48k: 0.99,
             switch_xfade_samples: 0,
             content_hash_prefix: [0; 8],
             controls: &[],
@@ -455,11 +449,23 @@ mod tests {
             VmError::InvalidHeaderFlagsOrReserved
         );
         bad_meta = *meta;
-        bad_meta.r_ac_default = F32::new(1.0);
+        bad_meta.tail_time_ms = F32::new(-1.0);
         assert_eq!(
             validate_prefix_header(hdr, &bad_meta).unwrap_err(),
             VmError::InvalidHeaderFlagsOrReserved
         );
+        bad_meta = *meta;
+        bad_meta.dc_blocker_pole_5hz = F32::new(f32::NAN);
+        assert_eq!(
+            validate_prefix_header(hdr, &bad_meta).unwrap_err(),
+            VmError::InvalidHeaderFlagsOrReserved
+        );
+        // Out-of-range or non-finite ro_pole_48k passes header validation for Table 4 cold clamping.
+        for ro in [-0.5_f32, 1.0, f32::NAN, f32::INFINITY] {
+            let mut ro_meta = *meta;
+            ro_meta.ro_pole_48k = F32::new(ro);
+            assert!(validate_prefix_header(hdr, &ro_meta).is_ok());
+        }
 
         // Region layout errors: unaligned arena0, non-zero padding, bad cp1_overflow size.
         let mut unaligned_hdr = *hdr;
@@ -635,10 +641,10 @@ mod tests {
         bad_a0.crossbar.sona_meta_flags = U32::new(SONA_META_RESERVED_MASK);
         assert_eq!(check_lite_bad(&bad_a0), VmError::InvalidArenaHeader);
         bad_a0 = *view.arena0;
-        bad_a0.spatial_tank_lite.flags = 0x80;
+        bad_a0.transport_lite.flags = 0x80;
         assert_eq!(check_lite_bad(&bad_a0), VmError::InvalidArenaHeader);
         bad_a0 = *view.arena0;
-        bad_a0.spatial_tank_lite.flags = TANK_FLAG_EXT_F32;
+        bad_a0.transport_lite.flags = TRANSPORT_FLAG_EXT_F32;
         assert_eq!(check_lite_bad(&bad_a0), VmError::InvalidArenaHeader);
     }
 }

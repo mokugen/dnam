@@ -130,14 +130,14 @@ pub struct DnamBinRuntimeMetaWire {
     pub ext_ring_format: u8,
     /// Reserved byte (`0`).
     pub reserved0: u8,
-    /// Declared `48 kHz` spatial tank delay ceiling (`<= 48_000`).
+    /// Declared `48 kHz` `Op-T` transport tank delay ceiling (`<= 48_000`).
     pub declared_max_delay_48k: U32,
     /// `5 Hz` wet DC blocker pole (`48 kHz`).
     pub dc_blocker_pole_5hz: F32,
     /// Declared decay tail time in milliseconds (`>= 0.0`).
     pub tail_time_ms: F32,
-    /// Default anti-creep AC pole (`[0.0, 1.0)`).
-    pub r_ac_default: F32,
+    /// Learned `48 kHz` `LinearReadout` leak pole (`[0.0, MAX_PARALRU_R_F32]`).
+    pub ro_pole_48k: F32,
     /// Switch crossfade duration in samples.
     pub switch_xfade_samples: U16,
     /// Reserved conditional rule count (`0`; conditional rules live inline in descriptors).
@@ -153,6 +153,7 @@ const _: () = assert!(align_of::<DnamBinRuntimeMetaWire>() == 1);
 const _: () = assert!(offset_of!(DnamBinRuntimeMetaWire, shared_controls_offset) == 4);
 const _: () = assert!(offset_of!(DnamBinRuntimeMetaWire, ext_ring_pow2_frames) == 28);
 const _: () = assert!(offset_of!(DnamBinRuntimeMetaWire, declared_max_delay_48k) == 32);
+const _: () = assert!(offset_of!(DnamBinRuntimeMetaWire, ro_pole_48k) == 44);
 const _: () = assert!(offset_of!(DnamBinRuntimeMetaWire, cp1_overflow_bytes) == 60);
 
 /// Switch-coupled conditional clamp rule (`8 B` LE wire struct) embedded inside
