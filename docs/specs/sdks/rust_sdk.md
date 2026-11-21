@@ -124,15 +124,24 @@ Workgroup SRAM (`var<workgroup>`) is hard-capped at 15,872 B (15.5 KiB) to reser
 
 ---
 
-## 4. Declarative `zerocopy` Wire & `.dnam-bin` / `.dnam` Arena Structs
+## 4. Tiered Serialization & Declarative `zerocopy` Wire / Arena Structs
 
 `r[sdk.rust.zerocopy-wire-structs]`
 
-Every binary preamble, directory, `.dnam-bin` header, tier arena, descriptor, project vault chunk, IPC header, and audio file header uses declarative `#[repr(C)]` `zerocopy` little-endian structs under `#![forbid(unsafe_code)]` (REQ-8.8, [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)). Wire fields must use `zerocopy::byteorder::little_endian` scalar types or fixed `[u8; N]` arrays rather than untyped slices.
+DNAM partitions persistence, canonical manifests, cross-language RPCs, and internal Rust IPC across four normative serialization mechanisms ([ADR-0023](../../adr/0023-tiered-serialization-and-ipc-formats.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)):
 
-Every wire struct derives `FromBytes`, `IntoBytes`, `KnownLayout`, and `Immutable`, adding `Unaligned` wherever cast from arbitrary byte slices. Compile-time `core::mem::size_of`, `align_of`, and `offset_of!` assertions verify every struct's exact footprint and alignment.
+| Use Case in DNAM | Canonical Format / Crate | Normative Boundary Scope |
+| :--- | :--- | :--- |
+| **Fixed binary headers, descriptors, arenas & seqlocks** | **`zerocopy 0.8`** (`FromBytes` / `IntoBytes` + `little_endian::*`) | Fixed-layout `.dnam-bin`, `.dnam`, `.dnam-seal`, `.dnam-prev`, `.dnam-proj`, `Arena0..3`, `DNPR` lock-free telemetry packets, `DnwbHeader64BWire` sample frame preambles, and WAV headers (`#![forbid(unsafe_code)]`, `!alloc` compatible). |
+| **Container manifests & presets** | **`serde_json` + RFC 8785 JCS** | `.dnam` immutable JSON header, `DMU1`/`DME1` mutable presets and catalog metadata, and `.dnam-proj` RFC 8785 JCS project manifests for deterministic cryptographic hashing. |
+| **Binary RPC / APIs** | **`buffa` (Protobuf Editions)** | Schema-evolving binary service RPCs and cross-language structured protocol messages requiring forward/backward field evolution. |
+| **Closed, ephemeral `#![no_std]` Rust ↔ Rust IPC** | **`postcard`** (or **`zerocopy 0.8`** on latency/throughput hot paths) | Compact variable-length local control messages exchanged exclusively between coupled Rust endpoints built from the same workspace revision (e.g., `DNWB` white-box subprocess control handshakes); fixed `zerocopy 0.8` wire structs remain permitted whenever `postcard` cannot meet latency or throughput requirements (e.g., lock-free `DNPR` seqlocks, streaming `DnwbHeader64BWire` audio frames, or hot-path IPC buffers). |
 
-All parsing and serialization execute exclusively via safe `zerocopy` operations (`ref_from_bytes`, `read_from_prefix`, `write_to_prefix`, and `as_bytes`). Manual `from_le_bytes` or `to_le_bytes` byte-offset slicing is prohibited across wire, container, and arena modules.
+Every fixed-size binary preamble, directory, `.dnam-bin` header, tier arena, descriptor, project vault chunk, fixed IPC/seqlock frame header, and audio file header uses declarative `#[repr(C)]` `zerocopy` little-endian structs under `#![forbid(unsafe_code)]` (REQ-8.8, [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0023](../../adr/0023-tiered-serialization-and-ipc-formats.md)). Wire fields must use `zerocopy::byteorder::little_endian` scalar types or fixed `[u8; N]` arrays rather than untyped slices.
+
+Every fixed wire struct derives `FromBytes`, `IntoBytes`, `KnownLayout`, and `Immutable`, adding `Unaligned` wherever cast from arbitrary byte slices. Compile-time `core::mem::size_of`, `align_of`, and `offset_of!` assertions verify every struct's exact footprint and alignment.
+
+All parsing and serialization of fixed binary wire structs execute exclusively via safe `zerocopy` operations (`ref_from_bytes`, `read_from_prefix`, `write_to_prefix`, and `as_bytes`). Manual `from_le_bytes` or `to_le_bytes` byte-offset slicing is prohibited across wire, container, and arena modules.
 
 | Container / Protocol Domain | Canonical `zerocopy` Wire Structs | Normative Layout Specification |
 | :--- | :--- | :--- |
@@ -140,7 +149,7 @@ All parsing and serialization execute exclusively via safe `zerocopy` operations
 | **Layer 1 `.dnam` & Descriptors** | `DnamPreambleWire`, `DnamDirectoryWire` (`dbin_offset`, `dbin_prefix_bytes`, `shared_binary_length == 0` when `dbin_prefix_bytes > 0`), `Dmu1HeaderWire`, `Dme1HeaderWire`, `DmueFooterWire`, `DcrcAuthRecordWire` (`[32..36)` `crc_dbin_prefix`), `ControlClampDescriptorWire`, `ConditionalClampRuleWire` | [dnam_binary_format.md §1](../containers/dnam_binary_format.md#1-hybrid-binary-container-wire-framing---50-ns-zero-json-hardware-fast-path) |
 | **SONA Nested Arenas (0..3)** | `SonaCellDescWire`, `CrossbarWire` (256 B with `SensoryQuad`, `crossbar_op_gains_fp16` at `[120..124)`, and `OpNPreBaseWire` 12 B at `[180..192)`), `CoreQuadWire` (192 B), `Arena0LiteWire`..`Arena3UltraDeltaWire`, `ConvolverFir16Wire`..`ConvolverFir48Wire`, `KautzSoaBlockWire`, `TransportQuadWire` (128 B, `align(1)`, `Unaligned`, `delay_samples[4]`, `ramp_spans_samples[4]`, `reserved_52_56`, `freeze_mix_fp16`, `sigma_knee_fp16 <= 0x3BE0`, `reserved_120_122`), `LinearReadoutLiteWire`..`LinearReadoutUltraWire`, `Arena0ControlBusWire` (`[16..32)` `{ lfo_skew_fp16, tank_dry_mix_fp16, reserved_ctrl_fp16, ou_to_z_stage_fp16 }`), `Arena3ControlBusWire` (`ou_to_z_stage_ultra_fp16[4]` at `[160..164]`) | [dnam_binary_format.md §2](../containers/dnam_binary_format.md#2-tier-prefix-hardware-loading) |
 | **`.dnam-seal` (`DNSL`) DRM** | `DnslPreambleWire`, `DnslDirectoryWire`, `DnplPreambleWire`, `InnerDirectoryWire`, `Dsa1ManifestHeaderWire`, `HpkeSlotWire`, `RecordDirEntryWire` | [provenance_and_enclave_drm.md §3](../security/provenance_and_enclave_drm.md#3-pillar-2-hardware-enclave--oem-drm-oemdevicecertificate-attestation--dnam-seal-dnsl-wrapper) |
-| **Layer 2 `.dnam-proj`, `DNWB` & WAV** | `DnamProjPreambleWire`, `ProjChunkDirEntryWire`, `CalbChunkWire`, `InpcCapsuleHeaderWire`, `StmcCapsuleHeaderWire`, `StmcTrajectoryWindowWire`, `ProjAuthRecordWire`, `DnwbHeader64BWire`, and WAV `RIFF`/`fmt `/`data` headers | [project_container_format.md §1–§3](../containers/project_container_format.md#1-front-loaded-cloud-ready-wire-framing--chunk-directory) |
+| **Layer 2 `.dnam-proj`, `DNWB` & WAV** | `DnamProjPreambleWire`, `ProjChunkDirEntryWire`, `CalbChunkWire`, `InpcCapsuleHeaderWire`, `StmcCapsuleHeaderWire`, `StmcTrajectoryWindowWire`, `ProjAuthRecordWire`, `DnwbHeader64BWire`, `DnprProgressWire` (256 B seqlock telemetry), and WAV `RIFF`/`fmt `/`data` headers | [project_container_format.md §1–§3](../containers/project_container_format.md#1-front-loaded-cloud-ready-wire-framing--chunk-directory) |
 
 In `.dnam-bin`, `shared_controls` at `shared_controls_offset` packs `ControlClampDescriptorWire` (carrying up to 3 inline `ConditionalClampRuleWire` slots, failing closed above 3 rules) and optional `"CP1\0"` overflow bytes padded to 64 B.
 
