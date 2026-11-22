@@ -29,10 +29,10 @@ const fn binomial_u64(n: usize, k: usize) -> u64 {
 /// Compile-time derived degree-7 Bézout maximally flat smoothstep readout coefficients:
 /// $S_3(x) = 35 x^4 - 84 x^5 + 70 x^6 - 20 x^7$, where magnitude $|c_m| = \binom{7}{m+1} \binom{m}{3}$
 /// (`ref[repo.code.constant-eval-and-derivations]`).
-const BEZOUT7_C4: f64 = (binomial_u64(BEZOUT7_ORDER, 4) * binomial_u64(3, 3)) as f64;
-const BEZOUT7_C5: f64 = (binomial_u64(BEZOUT7_ORDER, 5) * binomial_u64(4, 3)) as f64;
-const BEZOUT7_C6: f64 = (binomial_u64(BEZOUT7_ORDER, 6) * binomial_u64(5, 3)) as f64;
-const BEZOUT7_C7: f64 = (binomial_u64(BEZOUT7_ORDER, 7) * binomial_u64(6, 3)) as f64;
+pub(crate) const BEZOUT7_C4: f64 = (binomial_u64(BEZOUT7_ORDER, 4) * binomial_u64(3, 3)) as f64;
+pub(crate) const BEZOUT7_C5: f64 = (binomial_u64(BEZOUT7_ORDER, 5) * binomial_u64(4, 3)) as f64;
+pub(crate) const BEZOUT7_C6: f64 = (binomial_u64(BEZOUT7_ORDER, 6) * binomial_u64(5, 3)) as f64;
+pub(crate) const BEZOUT7_C7: f64 = (binomial_u64(BEZOUT7_ORDER, 7) * binomial_u64(6, 3)) as f64;
 
 const _: () = assert!(BEZOUT7_C4 == 35.0);
 const _: () = assert!(BEZOUT7_C5 == 84.0);

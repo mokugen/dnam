@@ -19,7 +19,7 @@
 | Package / Domain | Scoped `AGENTS.md` & Contributing | Canonical Documentation (SSOT) |
 | :--- | :--- | :--- |
 | **Guardrails (`tests/`)** | [`README.md`](README.md), [`tests/AGENTS.md`](tests/AGENTS.md), [`CONTRIBUTING.md`](CONTRIBUTING.md), [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md) | [`index.md`](docs/index.md), [`project_and_documentation_quality.md`](docs/specs/architecture/project_and_documentation_quality.md) |
-| **Packages (`packages/`)** | [`packages/AGENTS.md`](packages/AGENTS.md) (`kernels`, `vm`, `engine`, `capture`, `js`, `ui`, `studio`, `fixtures`) | [`sona_architecture.md`](docs/specs/architecture/sona_architecture.md), [`rust_sdk.md`](docs/specs/sdks/rust_sdk.md), [`typescript_sdk.md`](docs/specs/sdks/typescript_sdk.md) |
+| **Packages (`packages/`)** | [`packages/AGENTS.md`](packages/AGENTS.md) (`kernels`, `vm`, `engine`, `train`, `capture`, `js`, `ui`, `studio`, `fixtures`) | [`sona_architecture.md`](docs/specs/architecture/sona_architecture.md), [`rust_sdk.md`](docs/specs/sdks/rust_sdk.md), [`typescript_sdk.md`](docs/specs/sdks/typescript_sdk.md) |
 
 ## 4. Maintaining `AGENTS.md` & Documentation
 

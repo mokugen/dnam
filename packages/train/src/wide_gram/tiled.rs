@@ -59,10 +59,11 @@ impl BlockBatchBuffer {
             let fa = fv.abs();
             f4[c] = fv;
             wf4[c] = w_eff * fv;
-            if fa > 0.0 {
+            if !fv.is_finite() {
+                self.has_extreme = true;
+            } else if fa > 0.0 {
                 let wfa = wf4[c].abs();
-                if !fv.is_finite()
-                    || !(FAST_ABS_LOWER..=FAST_ABS_UPPER).contains(&fa)
+                if !(FAST_ABS_LOWER..=FAST_ABS_UPPER).contains(&fa)
                     || !(FAST_ABS_LOWER..=FAST_ABS_UPPER).contains(&wfa)
                 {
                     self.has_extreme = true;
@@ -455,5 +456,13 @@ mod tests {
             7,
         );
         assert!((g_s7[uplo_u_index(0, 0)] - 100.0).abs() <= 1.0e-11);
+
+        // NaN entry flags has_extreme via wide path and skips non-finite product safely.
+        let mut nan_feats = vec![1.0_f32; 8];
+        nan_feats[2] = f32::NAN;
+        let (g_nan, _) =
+            contract_dim_gram_tiled_wide192(&nan_feats, &[[0.0; 2]; 2], &[1.0, 1.0], 4, 1);
+        assert!((g_nan[uplo_u_index(0, 0)] - 2.0).abs() <= 1.0e-12);
+        assert_eq!(g_nan[uplo_u_index(2, 2)], 1.0);
     }
 }

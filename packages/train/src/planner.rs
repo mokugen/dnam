@@ -213,6 +213,8 @@ fn offending_buffer_name(fp: &CoreScanBindingFootprints, cap: u64) -> (&'static 
         ("tile_checkpoints", fp.tile_checkpoints_bytes)
     } else if fp.quad_params_bytes > cap {
         ("quad_params", fp.quad_params_bytes)
+    } else if fp.adjoint_workspace_bytes > cap {
+        ("adjoint_workspace", fp.adjoint_workspace_bytes)
     } else {
         ("peak_total_workspace", fp.peak_total_bytes)
     }
@@ -414,8 +416,16 @@ mod tests {
                 Err(TrainError::InvalidDimensions { .. })
             ));
         }
-        // Cover offending_buffer_name branches (feature_outputs, core_inputs, tile_checkpoints, quad_params, peak_total)
-        let mut fp = evaluate_slice_footprints(small, 1, 16, ExecutionMode::Streamed);
+        // Cover offending_buffer_name branches (feature_outputs, core_inputs, tile_checkpoints, quad_params, adjoint_workspace, peak_total)
+        let mut fp = evaluate_slice_footprints(
+            CoreScanWorkload {
+                include_adjoint: true,
+                ..small
+            },
+            1,
+            16,
+            ExecutionMode::Streamed,
+        );
         assert_eq!(
             offending_buffer_name(&fp, fp.feature_outputs_bytes - 1).0,
             "feature_outputs"
@@ -434,6 +444,11 @@ mod tests {
         assert_eq!(
             offending_buffer_name(&fp, fp.quad_params_bytes - 1).0,
             "quad_params"
+        );
+        fp.quad_params_bytes = 0;
+        assert_eq!(
+            offending_buffer_name(&fp, fp.adjoint_workspace_bytes - 1).0,
+            "adjoint_workspace"
         );
         assert_eq!(
             offending_buffer_name(&fp, fp.peak_total_bytes).0,

@@ -420,6 +420,7 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
     for (const dir of [
       path.join(PACKAGES_DIR, "kernels"),
       path.join(PACKAGES_DIR, "vm"),
+      path.join(PACKAGES_DIR, "train"),
       path.join(PACKAGES_DIR, "capture", "src"),
       path.join(PACKAGES_DIR, "engine"),
       path.join(PACKAGES_DIR, "studio"),
@@ -615,6 +616,7 @@ describe("DNAM Monorepo Boundaries, Black-Box Purity & Tooling Guardrails", () =
     for (const spec of [
       { pkg: "kernels", crate: "dnam-kernels", sources: "packages/kernels/src" },
       { pkg: "vm", crate: "dnam-vm", sources: "packages/vm/src" },
+      { pkg: "train", crate: "dnam-train", sources: "packages/train/src" },
       { pkg: "engine", crate: "dnam-engine", sources: "packages/engine/src" },
       { pkg: "fixtures", crate: "dnam-fixtures", sources: "packages/fixtures/src" },
       { pkg: "capture", crate: "dnam-capture", sources: "packages/capture/src" },

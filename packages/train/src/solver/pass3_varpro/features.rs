@@ -1,0 +1,516 @@
+//! True-stereo Pass-3 VarPro feature matrix assembly across `Op-N[Pre]`, `1×` Lite and
+//! `1×`/`2×` `Full..Ultra` causal core cascades, FIR taps, ZOH-rescaled `ro_pole_48k`, and
+//! `tank_dry_mix * I + Op-T` filtering (`ref[train.pipeline.nested-varpro-schur]`).
+
+use crate::error::TrainError;
+use crate::runner::TrainRunner;
+
+use super::super::model::cascade::{
+    downsample_lane_2x_f64, run_causal_core_cascade_stereo, sanitize_unit_f64,
+    upsample_stereo_2x_f64,
+};
+use super::super::model::{NUM_FIR_TAPS_ULTRA, SonaModelF64, TierReadoutPrefixF64};
+use super::super::pass2_opt::{
+    eval_kautz_modal_channel_and_adjoint, eval_op_n_pre_and_adjoint,
+    eval_op_t_quad_stereo_and_adjoint,
+};
+
+/// True-stereo column-major post-warmup feature matrices and target vectors for Pass-3 VarPro.
+pub(super) struct StereoFeatureSet {
+    pub dims: [usize; 4],
+    pub active_fir_taps: usize,
+    pub pc_gain: [f64; 2],
+    pub raw_l_col0: Vec<f64>,
+    pub raw_r_col0: Vec<f64>,
+    pub raw_l_2x: Option<Vec<f64>>,
+    pub raw_r_2x: Option<Vec<f64>>,
+    pub feats_l_post: Vec<f32>,
+    pub feats_r_post: Vec<f32>,
+    pub tgts_l_post: Vec<f32>,
+    pub tgts_r_post: Vec<f32>,
+    pub lite_1x_l_post: Option<Vec<f32>>,
+    pub lite_1x_r_post: Option<Vec<f32>>,
+    pub lite_1x_tgts_l_post: Option<Vec<f32>>,
+    pub lite_1x_tgts_r_post: Option<Vec<f32>>,
+    pub lite_1x_raw_l: Vec<f64>,
+    pub lite_1x_raw_r: Vec<f64>,
+}
+
+/// Evaluates the scalar 1-pole high-pass branch `u[t] - lp(u; pole)[t]`.
+#[must_use]
+pub(super) fn eval_highpass_pole(sig: &[f64], pole: f64) -> Vec<f64> {
+    let mut hp = vec![0.0_f64; sig.len()];
+    if pole <= 0.0 || !pole.is_finite() {
+        return hp;
+    }
+    let p = pole.clamp(0.0, 0.999_995);
+    let one_m_p = 1.0 - p;
+    let mut lp = 0.0_f64;
+    for (i, &u) in sig.iter().enumerate() {
+        lp = p * lp + one_m_p * u;
+        hp[i] = u - lp;
+    }
+    hp
+}
+
+#[inline]
+pub(super) fn is_op_t_active(model: &SonaModelF64) -> bool {
+    let tq = &model.transport_quads[0];
+    tq.input_gains
+        .iter()
+        .chain(&tq.wet_tap_l)
+        .chain(&tq.wet_tap_r)
+        .any(|&v| v.abs() > 1.0e-9)
+}
+
+pub(super) fn apply_op_t_series_channel(
+    model: &SonaModelF64,
+    sig: &[f64],
+    is_right: bool,
+) -> Vec<f64> {
+    let dry = sanitize_unit_f64(model.tank_dry_mix, -2.0, 2.0, 1.0);
+    if !is_op_t_active(model) {
+        return sig.iter().map(|&v| dry * v).collect();
+    }
+    let zeros = vec![0.0_f64; sig.len()];
+    let (xl, xr) = if is_right {
+        (zeros.as_slice(), sig)
+    } else {
+        (sig, zeros.as_slice())
+    };
+    let (tl, tr, _) = eval_op_t_quad_stereo_and_adjoint(
+        xl,
+        xr,
+        &model.transport_quads[0],
+        model.sample_rate_hz,
+        None,
+    );
+    let wet = if is_right { &tr } else { &tl };
+    sig.iter().zip(wet).map(|(&s, &w)| dry * s + w).collect()
+}
+
+pub(super) fn apply_op_t_stereo(
+    model: &SonaModelF64,
+    sig_l: &[f64],
+    sig_r: &[f64],
+) -> (Vec<f64>, Vec<f64>) {
+    let dry = sanitize_unit_f64(model.tank_dry_mix, -2.0, 2.0, 1.0);
+    if !is_op_t_active(model) {
+        return (
+            sig_l.iter().map(|&v| dry * v).collect(),
+            sig_r.iter().map(|&v| dry * v).collect(),
+        );
+    }
+    let (tl, tr, _) = eval_op_t_quad_stereo_and_adjoint(
+        sig_l,
+        sig_r,
+        &model.transport_quads[0],
+        model.sample_rate_hz,
+        None,
+    );
+    let out_l = sig_l.iter().zip(&tl).map(|(&s, &w)| dry * s + w).collect();
+    let out_r = sig_r.iter().zip(&tr).map(|(&s, &w)| dry * s + w).collect();
+    (out_l, out_r)
+}
+
+fn subtract_modal_contributions(
+    model: &SonaModelF64,
+    ux_l: &[f64],
+    ux_r: &[f64],
+    target_l: &[f64],
+    target_r: &[f64],
+    pc_gain: [f64; 2],
+) -> (Vec<f64>, Vec<f64>) {
+    let n = ux_l
+        .len()
+        .min(ux_r.len())
+        .min(target_l.len())
+        .min(target_r.len());
+    let mut adj_l = target_l[..n].to_vec();
+    let mut adj_r = target_r[..n].to_vec();
+    let active_k = model.active_kautz_pairs.min(model.kautz.len());
+    if active_k > 0 {
+        let mut on_l = vec![0.0_f64; n];
+        let mut on_r = vec![0.0_f64; n];
+        for t in 16..n {
+            on_l[t] = pc_gain[0] * ux_l[t - 16];
+            on_r[t] = pc_gain[1] * ux_r[t - 16];
+        }
+        let (kl, _) = eval_kautz_modal_channel_and_adjoint(
+            &on_l,
+            &model.kautz[..active_k],
+            false,
+            None,
+            None,
+        );
+        let (kr, _) =
+            eval_kautz_modal_channel_and_adjoint(&on_r, &model.kautz[..active_k], true, None, None);
+        let (kl_eff, kr_eff) = apply_op_t_stereo(model, &kl, &kr);
+        for t in 0..n {
+            adj_l[t] -= kl_eff[t];
+            adj_r[t] -= kr_eff[t];
+        }
+    }
+    (adj_l, adj_r)
+}
+
+struct ExtractMatrixSpec<'a> {
+    ux_base: &'a [f64],
+    pc_chan: f64,
+    cascade_feats: &'a [[f32; 4]],
+    cascade_frames: usize,
+    is_2x: bool,
+    is_right: bool,
+    tier_dims: [usize; 4],
+    max_tier_idx: usize,
+    w: usize,
+    active_taps: usize,
+}
+
+fn extract_channel_tier_matrix(model: &SonaModelF64, spec: &ExtractMatrixSpec<'_>) -> Vec<f32> {
+    let n = spec.ux_base.len();
+    let m = n - spec.w;
+    let total_dim = spec.tier_dims[spec.max_tier_idx];
+    let op_t = is_op_t_active(model);
+    let (dec_p1, dec_c0) = (model.os_dec_c_prev1, model.os_dec_c0);
+    let mut feats_post = vec![0.0_f32; total_dim * m];
+
+    let mut write_col = |col_idx: usize, full_col: &[f64]| {
+        if col_idx >= total_dim {
+            return;
+        }
+        let filtered = if op_t || (model.tank_dry_mix - 1.0).abs() > 1.0e-12 {
+            apply_op_t_series_channel(model, full_col, spec.is_right)
+        } else {
+            full_col.to_vec()
+        };
+        for t in 0..m {
+            feats_post[col_idx * m + t] = filtered[spec.w + t] as f32;
+        }
+    };
+
+    write_col(0, spec.ux_base);
+    // Col 1 is populated cleanly during `ro_pole_48k` joint sweep.
+
+    let lite_fir = spec.active_taps.min(32);
+    let full_fir = spec.active_taps.saturating_sub(32).min(16);
+    let pro_fir = spec.active_taps.saturating_sub(48).min(48);
+    let ultra_fir = spec.active_taps.saturating_sub(96).min(32);
+    let tier_defs = [
+        (0..16_usize, 0..lite_fir),
+        (16..24_usize, 32..(32 + full_fir)),
+        (24..32_usize, 48..(48 + pro_fir)),
+        (32..40_usize, 96..(96 + ultra_fir)),
+    ];
+
+    let mut col = 2_usize;
+    let lr_off = usize::from(spec.is_right);
+    for (ti, (lane_range, fir_range)) in tier_defs.into_iter().enumerate() {
+        if ti > spec.max_tier_idx {
+            break;
+        }
+        for l in lane_range {
+            let q = l / 4;
+            let k = l % 4;
+            for sub_off in [2_usize, 4_usize, 0_usize] {
+                let raw_sig: Vec<f64> = if spec.is_2x {
+                    let s2x: Vec<f64> = (0..spec.cascade_frames)
+                        .map(|t| {
+                            f64::from(
+                                spec.cascade_feats
+                                    [(q * spec.cascade_frames + t) * 6 + sub_off + lr_off][k],
+                            )
+                        })
+                        .collect();
+                    downsample_lane_2x_f64(&s2x, dec_p1, dec_c0)
+                } else {
+                    (0..n)
+                        .map(|t| {
+                            f64::from(spec.cascade_feats[(q * n + t) * 6 + sub_off + lr_off][k])
+                        })
+                        .collect()
+                };
+                write_col(col, &raw_sig);
+                col += 1;
+            }
+        }
+        for k in fir_range {
+            let mut tap_col = vec![0.0_f64; n];
+            for t in k..n {
+                tap_col[t] = spec.pc_chan * spec.ux_base[t - k];
+            }
+            write_col(col, &tap_col);
+            col += 1;
+        }
+    }
+    feats_post
+}
+
+pub(super) fn build_pass3_feature_sets(
+    runner: &TrainRunner,
+    model: &mut SonaModelF64,
+    in_l: &[f64],
+    in_r: &[f64],
+    target_l: &[f64],
+    target_r: &[f64],
+    w: usize,
+) -> Result<StereoFeatureSet, TrainError> {
+    let n = in_l
+        .len()
+        .min(in_r.len())
+        .min(target_l.len())
+        .min(target_r.len());
+    let active_taps = model.active_fir_taps.min(NUM_FIR_TAPS_ULTRA);
+    let default_pc = |v: f64| -> f64 {
+        if v.is_finite() && v.abs() >= 1.0e-6 {
+            v.clamp(-8.0, 8.0)
+        } else {
+            1.0
+        }
+    };
+    let pc_gain = if active_taps > 0 || model.active_kautz_pairs > 0 {
+        [
+            default_pc(model.pre_conv_u_gain[0]),
+            default_pc(model.pre_conv_u_gain[1]),
+        ]
+    } else {
+        [0.0, 0.0]
+    };
+    model.pre_conv_u_gain = pc_gain;
+
+    let (ux_l, _, _) = eval_op_n_pre_and_adjoint(
+        &in_l[..n],
+        model.op_n_pre_gamma_bc,
+        model.op_n_pre_beta_q,
+        None,
+        None,
+    );
+    let (ux_r, _, _) = eval_op_n_pre_and_adjoint(
+        &in_r[..n],
+        model.op_n_pre_gamma_bc,
+        model.op_n_pre_beta_q,
+        None,
+        None,
+    );
+
+    let lite_fir = active_taps.min(32);
+    let full_fir = active_taps.saturating_sub(32).min(16);
+    let pro_fir = active_taps.saturating_sub(48).min(48);
+    let ultra_fir = active_taps.saturating_sub(96).min(32);
+    let d_lite = 2 + 16 * 3 + lite_fir;
+    let d_full = d_lite + 8 * 3 + full_fir;
+    let d_pro = d_full + 8 * 3 + pro_fir;
+    let d_ultra = d_pro + 8 * 3 + ultra_fir;
+    let dims = [d_lite, d_full, d_pro, d_ultra];
+
+    let tgts_post_fn = |adj: &[f64]| adj[w..n].iter().map(|&v| v as f32).collect::<Vec<f32>>();
+    let rho_1x = 48_000.0 / model.sample_rate_hz.max(8_000.0);
+
+    if model.oversample_upper_tiers_2x {
+        let cas_1x = run_causal_core_cascade_stereo(runner, model, &ux_l, &ux_r, 4, rho_1x, false)?;
+        let (adj_1x_l, adj_1x_r) =
+            subtract_modal_contributions(model, &ux_l, &ux_r, target_l, target_r, pc_gain);
+        let lite_1x_l_post = Some(extract_channel_tier_matrix(
+            model,
+            &ExtractMatrixSpec {
+                ux_base: &ux_l,
+                pc_chan: pc_gain[0],
+                cascade_feats: &cas_1x.feature_outputs,
+                cascade_frames: n,
+                is_2x: false,
+                is_right: false,
+                tier_dims: dims,
+                max_tier_idx: 0,
+                w,
+                active_taps,
+            },
+        ));
+        let lite_1x_r_post = Some(extract_channel_tier_matrix(
+            model,
+            &ExtractMatrixSpec {
+                ux_base: &ux_r,
+                pc_chan: pc_gain[1],
+                cascade_feats: &cas_1x.feature_outputs,
+                cascade_frames: n,
+                is_2x: false,
+                is_right: true,
+                tier_dims: dims,
+                max_tier_idx: 0,
+                w,
+                active_taps,
+            },
+        ));
+
+        let (up_l, up_r) = upsample_stereo_2x_f64(&ux_l, &ux_r, model.os_up_quad_coeff);
+        let dec_ux_l = downsample_lane_2x_f64(&up_l, model.os_dec_c_prev1, model.os_dec_c0);
+        let dec_ux_r = downsample_lane_2x_f64(&up_r, model.os_dec_c_prev1, model.os_dec_c0);
+        let (adj_tgt_l, adj_tgt_r) =
+            subtract_modal_contributions(model, &dec_ux_l, &dec_ux_r, target_l, target_r, pc_gain);
+
+        let rho_2x = 0.5 * rho_1x;
+        let cas_2x =
+            run_causal_core_cascade_stereo(runner, model, &up_l, &up_r, 10, rho_2x, false)?;
+        let feats_l_post = extract_channel_tier_matrix(
+            model,
+            &ExtractMatrixSpec {
+                ux_base: &dec_ux_l,
+                pc_chan: pc_gain[0],
+                cascade_feats: &cas_2x.feature_outputs,
+                cascade_frames: 2 * n,
+                is_2x: true,
+                is_right: false,
+                tier_dims: dims,
+                max_tier_idx: 3,
+                w,
+                active_taps,
+            },
+        );
+        let feats_r_post = extract_channel_tier_matrix(
+            model,
+            &ExtractMatrixSpec {
+                ux_base: &dec_ux_r,
+                pc_chan: pc_gain[1],
+                cascade_feats: &cas_2x.feature_outputs,
+                cascade_frames: 2 * n,
+                is_2x: true,
+                is_right: true,
+                tier_dims: dims,
+                max_tier_idx: 3,
+                w,
+                active_taps,
+            },
+        );
+        Ok(StereoFeatureSet {
+            dims,
+            active_fir_taps: active_taps,
+            pc_gain,
+            raw_l_col0: dec_ux_l,
+            raw_r_col0: dec_ux_r,
+            raw_l_2x: Some(up_l),
+            raw_r_2x: Some(up_r),
+            feats_l_post,
+            feats_r_post,
+            tgts_l_post: tgts_post_fn(&adj_tgt_l),
+            tgts_r_post: tgts_post_fn(&adj_tgt_r),
+            lite_1x_l_post,
+            lite_1x_r_post,
+            lite_1x_tgts_l_post: Some(tgts_post_fn(&adj_1x_l)),
+            lite_1x_tgts_r_post: Some(tgts_post_fn(&adj_1x_r)),
+            lite_1x_raw_l: ux_l,
+            lite_1x_raw_r: ux_r,
+        })
+    } else {
+        let (adj_tgt_l, adj_tgt_r) =
+            subtract_modal_contributions(model, &ux_l, &ux_r, target_l, target_r, pc_gain);
+        let cas = run_causal_core_cascade_stereo(runner, model, &ux_l, &ux_r, 10, rho_1x, false)?;
+        let feats_l_post = extract_channel_tier_matrix(
+            model,
+            &ExtractMatrixSpec {
+                ux_base: &ux_l,
+                pc_chan: pc_gain[0],
+                cascade_feats: &cas.feature_outputs,
+                cascade_frames: n,
+                is_2x: false,
+                is_right: false,
+                tier_dims: dims,
+                max_tier_idx: 3,
+                w,
+                active_taps,
+            },
+        );
+        let feats_r_post = extract_channel_tier_matrix(
+            model,
+            &ExtractMatrixSpec {
+                ux_base: &ux_r,
+                pc_chan: pc_gain[1],
+                cascade_feats: &cas.feature_outputs,
+                cascade_frames: n,
+                is_2x: false,
+                is_right: true,
+                tier_dims: dims,
+                max_tier_idx: 3,
+                w,
+                active_taps,
+            },
+        );
+        Ok(StereoFeatureSet {
+            dims,
+            active_fir_taps: active_taps,
+            pc_gain,
+            raw_l_col0: ux_l.clone(),
+            raw_r_col0: ux_r.clone(),
+            raw_l_2x: None,
+            raw_r_2x: None,
+            feats_l_post,
+            feats_r_post,
+            tgts_l_post: tgts_post_fn(&adj_tgt_l),
+            tgts_r_post: tgts_post_fn(&adj_tgt_r),
+            lite_1x_l_post: None,
+            lite_1x_r_post: None,
+            lite_1x_tgts_l_post: None,
+            lite_1x_tgts_r_post: None,
+            lite_1x_raw_l: ux_l,
+            lite_1x_raw_r: ux_r,
+        })
+    }
+}
+
+pub(super) fn unpack_weights_into_prefix(
+    weights_l: &[f64],
+    weights_r: &[f64],
+    active_taps: usize,
+    pc_gain: [f64; 2],
+    max_tier_idx: usize,
+    base_model: &SonaModelF64,
+) -> TierReadoutPrefixF64 {
+    let mut pfx = TierReadoutPrefixF64 {
+        pre_conv_u_gain: pc_gain,
+        pre_conv_hp_gain: base_model.pre_conv_hp_gain,
+        direct_s2_u_gain: [weights_l[0].clamp(-8.0, 8.0), weights_r[0].clamp(-8.0, 8.0)],
+        direct_s2_hp_gain: [weights_l[1].clamp(-8.0, 8.0), weights_r[1].clamp(-8.0, 8.0)],
+        ..TierReadoutPrefixF64::default()
+    };
+    for (k, kz) in base_model.kautz.iter().enumerate() {
+        pfx.kautz_b_gamma[k] = kz.b_gamma;
+        pfx.kautz_c_re_l[k] = kz.c_re_l;
+        pfx.kautz_c_im_l[k] = kz.c_im_l;
+        pfx.kautz_c_re_r[k] = kz.c_re_r;
+        pfx.kautz_c_im_r[k] = kz.c_im_r;
+    }
+    let tier_defs = [
+        (0..16_usize, 0..active_taps.min(32)),
+        (
+            16..24_usize,
+            32..(32 + active_taps.saturating_sub(32).min(16)),
+        ),
+        (
+            24..32_usize,
+            48..(48 + active_taps.saturating_sub(48).min(48)),
+        ),
+        (
+            32..40_usize,
+            96..(96 + active_taps.saturating_sub(96).min(32)),
+        ),
+    ];
+    let mut col = 2_usize;
+    for (ti, (lane_range, fir_range)) in tier_defs.into_iter().enumerate() {
+        if ti > max_tier_idx {
+            break;
+        }
+        for l in lane_range {
+            pfx.w_ro[l][6] = weights_l[col].clamp(-8.0, 8.0);
+            pfx.w_ro[l][7] = weights_r[col].clamp(-8.0, 8.0);
+            pfx.w_ro[l][8] = weights_l[col + 1].clamp(-8.0, 8.0);
+            pfx.w_ro[l][9] = weights_r[col + 1].clamp(-8.0, 8.0);
+            pfx.w_ro[l][10] = weights_l[col + 2].clamp(-8.0, 8.0);
+            pfx.w_ro[l][11] = weights_r[col + 2].clamp(-8.0, 8.0);
+            col += 3;
+        }
+        for k in fir_range {
+            pfx.fir_l[k] = weights_l[col].clamp(-8.0, 8.0);
+            pfx.fir_r[k] = weights_r[col].clamp(-8.0, 8.0);
+            col += 1;
+        }
+    }
+    pfx
+}

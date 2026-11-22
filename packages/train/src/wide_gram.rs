@@ -472,10 +472,15 @@ mod tests {
         assert!((c[3][0].to_f64() - expected_lo).abs() <= 1.0e-314);
         assert!((c[3][1].to_f64() - expected_lo).abs() <= 1.0e-314);
 
-        // Trigger add_three_way_extreme overflow-compensated normalization path (`wa` & `ab` > DEKKER_SAFE_MAX)
+        // Trigger add_three_way_extreme overflow-compensated normalization path (`wa` & `ab` outside safe range)
         let mut extreme = Wide192Accum::zero();
         extreme.add_triple_product(2.0_f64.powi(600), 2.0_f64.powi(600), 2.0_f64.powi(-700));
         assert!((extreme.to_f64() - 2.0_f64.powi(500)).abs() <= 2.0_f64.powi(450));
+
+        // Direct 3-way normalized exponent path: w*a and a*b both overflow DEKKER_SAFE_MAX without normalization.
+        let mut extreme_norm = Wide192Accum::zero();
+        extreme_norm.add_triple_product(2.0_f64.powi(-600), 2.0_f64.powi(-600), 2.0_f64.powi(700));
+        assert!((extreme_norm.to_f64() - 2.0_f64.powi(-500)).abs() <= 2.0_f64.powi(-540));
 
         // Short row zero-padding in hash_gram_input_v3 matches explicit trailing 0.0
         let h_short = hash_gram_input_v3(2, &[&[-0.0_f64]], &[1.0]);

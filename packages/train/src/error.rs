@@ -59,6 +59,36 @@ pub enum TrainError {
     GpuBufferMapFailed(&'static str),
     /// Forwarded `dnam-vm` error.
     Vm(VmError),
+    /// Matrix factorization encountered a non-positive pivot or singular diagonal.
+    SingularMatrix {
+        /// Matrix solve or factorization stage name.
+        context: &'static str,
+        /// Zero-based pivot index where positive definiteness failed.
+        pivot_index: usize,
+    },
+    /// Switch-conditioned corner bounds exceeded the 3-slot wire `cond_rules` budget.
+    ConditionalClampOverflow {
+        /// Zero-based target control index overflowing inline conditional rules.
+        control_index: usize,
+        /// Number of conditional rules required.
+        required_rules: usize,
+        /// Maximum conditional rules permitted in `ControlClampDescriptorWire`.
+        max_rules: usize,
+    },
+    /// Parametric control specification or range metadata was invalid.
+    InvalidControlSpec {
+        /// Control audit or CP1 fitter stage name.
+        context: &'static str,
+        /// Specific specification error detail.
+        detail: &'static str,
+    },
+    /// Post-training certification or Phase-1..3 safety audit invariant failed.
+    AuditViolation {
+        /// Failing certification or audit stage name.
+        context: &'static str,
+        /// Specific audit violation detail.
+        detail: &'static str,
+    },
 }
 
 impl fmt::Display for TrainError {
@@ -97,6 +127,27 @@ impl fmt::Display for TrainError {
             Self::GpuUnavailable(reason) => write!(f, "wgpu adapter unavailable: {reason}"),
             Self::GpuBufferMapFailed(reason) => write!(f, "wgpu staging map failed: {reason}"),
             Self::Vm(err) => write!(f, "vm error: {err}"),
+            Self::SingularMatrix {
+                context,
+                pivot_index,
+            } => write!(
+                f,
+                "{context}: non-positive-definite matrix at pivot {pivot_index}"
+            ),
+            Self::ConditionalClampOverflow {
+                control_index,
+                required_rules,
+                max_rules,
+            } => write!(
+                f,
+                "control {control_index}: requires {required_rules} conditional clamp rules (max {max_rules})"
+            ),
+            Self::InvalidControlSpec { context, detail } => {
+                write!(f, "{context}: invalid control spec: {detail}")
+            }
+            Self::AuditViolation { context, detail } => {
+                write!(f, "{context}: audit violation: {detail}")
+            }
         }
     }
 }
@@ -159,6 +210,35 @@ mod tests {
             ),
             (TrainError::GpuUnavailable("no adapter"), "no adapter"),
             (TrainError::GpuBufferMapFailed("cancelled"), "cancelled"),
+            (
+                TrainError::SingularMatrix {
+                    context: "cholesky",
+                    pivot_index: 3,
+                },
+                "pivot 3",
+            ),
+            (
+                TrainError::ConditionalClampOverflow {
+                    control_index: 2,
+                    required_rules: 4,
+                    max_rules: 3,
+                },
+                "requires 4 conditional clamp rules (max 3)",
+            ),
+            (
+                TrainError::InvalidControlSpec {
+                    context: "phase1",
+                    detail: "empty switch mask",
+                },
+                "empty switch mask",
+            ),
+            (
+                TrainError::AuditViolation {
+                    context: "phase3",
+                    detail: "non-monotone tier",
+                },
+                "non-monotone tier",
+            ),
         ];
         for (err, substr) in cases {
             let msg = err.to_string();
