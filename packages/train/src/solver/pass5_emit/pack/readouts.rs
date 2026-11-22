@@ -18,37 +18,61 @@ pub(super) const LITE_OPT_TO_LR_OFFSET: usize = 24;
 const STAGE_LATENT_OP_P_TO_CORE_OFFSET: usize = 8 + 5 * 8 + 2 * (4 * 4);
 const _: () = assert!(STAGE_LATENT_OP_P_TO_CORE_OFFSET == 80);
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
-struct PrefixOverrideFullEncodeWire {
-    fir_l: [F32; 16],
-    fir_r: [F32; 16],
-    c_re_l: [F32; 4],
-    c_im_l: [F32; 4],
-    c_re_r: [F32; 4],
-    c_im_r: [F32; 4],
+pub(in super::super) struct PrefixOverrideWireDecode;
+
+impl PrefixOverrideWireDecode {
+    pub(in super::super) fn full_from_bytes(bytes: &[u8]) -> Option<&PrefixOverrideFullEncodeWire> {
+        PrefixOverrideFullEncodeWire::ref_from_prefix(bytes)
+            .ok()
+            .map(|(v, _)| v)
+    }
+
+    pub(in super::super) fn pro_from_bytes(bytes: &[u8]) -> Option<&PrefixOverrideProEncodeWire> {
+        PrefixOverrideProEncodeWire::ref_from_prefix(bytes)
+            .ok()
+            .map(|(v, _)| v)
+    }
+
+    pub(in super::super) fn ultra_from_bytes(
+        bytes: &[u8],
+    ) -> Option<&PrefixOverrideUltraEncodeWire> {
+        PrefixOverrideUltraEncodeWire::ref_from_prefix(bytes)
+            .ok()
+            .map(|(v, _)| v)
+    }
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
-struct PrefixOverrideProEncodeWire {
-    fir_l: [F32; 32],
-    fir_r: [F32; 32],
-    c_re_l: [F32; 8],
-    c_im_l: [F32; 8],
-    c_re_r: [F32; 8],
-    c_im_r: [F32; 8],
+pub(in super::super) struct PrefixOverrideFullEncodeWire {
+    pub(in super::super) fir_l: [F32; 16],
+    pub(in super::super) fir_r: [F32; 16],
+    pub(in super::super) c_re_l: [F32; 4],
+    pub(in super::super) c_im_l: [F32; 4],
+    pub(in super::super) c_re_r: [F32; 4],
+    pub(in super::super) c_im_r: [F32; 4],
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
-struct PrefixOverrideUltraEncodeWire {
-    fir_l: [F32; 48],
-    fir_r: [F32; 48],
-    c_re_l: [F32; 12],
-    c_im_l: [F32; 12],
-    c_re_r: [F32; 12],
-    c_im_r: [F32; 12],
+pub(in super::super) struct PrefixOverrideProEncodeWire {
+    pub(in super::super) fir_l: [F32; 32],
+    pub(in super::super) fir_r: [F32; 32],
+    pub(in super::super) c_re_l: [F32; 8],
+    pub(in super::super) c_im_l: [F32; 8],
+    pub(in super::super) c_re_r: [F32; 8],
+    pub(in super::super) c_im_r: [F32; 8],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
+pub(in super::super) struct PrefixOverrideUltraEncodeWire {
+    pub(in super::super) fir_l: [F32; 48],
+    pub(in super::super) fir_r: [F32; 48],
+    pub(in super::super) c_re_l: [F32; 12],
+    pub(in super::super) c_im_l: [F32; 12],
+    pub(in super::super) c_re_r: [F32; 12],
+    pub(in super::super) c_im_r: [F32; 12],
 }
 
 const _: () = assert!(size_of::<PrefixOverrideFullEncodeWire>() == 192);

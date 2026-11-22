@@ -9,6 +9,9 @@
 
 use std::f64::consts::PI;
 
+use zerocopy::byteorder::little_endian::{F32, F64, U64};
+use zerocopy::{FromBytes, IntoBytes};
+
 use crate::solver::bezout_three_band_weights;
 use crate::{
     CORESET_FP32_FRAMES_PER_STEM, CORESET_FP32_MAX_FRAMES_PER_STEM,
@@ -87,8 +90,8 @@ fn splitmix64(state: &mut u64) -> u64 {
 #[inline]
 fn seed_to_u64(seed_256: &[u8; 256], stream_idx: usize) -> u64 {
     let off = (stream_idx * 8) % 248;
-    u64::from_le_bytes(seed_256[off..off + 8].try_into().unwrap_or([0; 8]))
-        ^ ((stream_idx as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93))
+    let word = U64::ref_from_bytes(&seed_256[off..off + 8]).map_or(0, |v| v.get());
+    word ^ ((stream_idx as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93))
 }
 
 /// Generates a deterministic `256 B` stimulus seed $\boldsymbol{\Xi}$ from a `u64` master seed.
@@ -96,8 +99,10 @@ fn seed_to_u64(seed_256: &[u8; 256], stream_idx: usize) -> u64 {
 pub fn deterministic_seed_256(master_seed: u64) -> [u8; 256] {
     let mut st = master_seed ^ 0x444E_414D_5345_4544; // "DNAMSEED"
     let mut out = [0u8; 256];
-    for chunk in out.as_chunks_mut::<8>().0 {
-        chunk.copy_from_slice(&splitmix64(&mut st).to_le_bytes());
+    let (words, _) = <[U64]>::mut_from_prefix_with_elems(&mut out, 32)
+        .expect("256 B holds 32 little-endian u64 words");
+    for dst in words {
+        *dst = U64::new(splitmix64(&mut st));
     }
     out
 }
@@ -153,7 +158,7 @@ pub fn synthesize_a2_dynamic_staircase(num_samples: usize, peak_fs: f64) -> Vec<
 }
 
 /// Synthesizes `A3`: `250 ms` (`12,000`-sample at `48 kHz`) continuous single-voice monophonic
-/// pitch glissando (`65 Hz -> 880 Hz`) with zero polyphonic beating (`Law 0.E` `OC-2` handoff).
+/// pitch glissando (`65 Hz -> 880 Hz`) with zero polyphonic beating (`Law 0.E` sub-harmonic handoff).
 #[must_use]
 pub fn synthesize_a3_monophonic_glissando(sample_rate_hz: u32, peak_fs: f64) -> Vec<f32> {
     if sample_rate_hz == 0 || !peak_fs.is_finite() || peak_fs <= 0.0 {
@@ -620,24 +625,24 @@ pub fn encode_coreset_fp32_with_frames(
         CORESET_FP32_MAX_FRAMES_PER_STEM,
     );
     let is_stereo = ch_r.is_some();
-    let mut out = Vec::with_capacity(n * if is_stereo { 8 } else { 4 });
+    let mut words = Vec::with_capacity(n * if is_stereo { 2 } else { 1 });
     for i in 0..n {
         let sl = ch_l
             .get(i)
             .copied()
             .filter(|v| v.is_finite())
             .unwrap_or(0.0);
-        out.extend_from_slice(&sl.to_le_bytes());
+        words.push(F32::new(sl));
         if let Some(r_slice) = ch_r {
             let sr = r_slice
                 .get(i)
                 .copied()
                 .filter(|v| v.is_finite())
                 .unwrap_or(0.0);
-            out.extend_from_slice(&sr.to_le_bytes());
+            words.push(F32::new(sr));
         }
     }
-    out
+    words.as_bytes().to_vec()
 }
 
 /// Encodes up to `96,000` frames (`2.0 s` at `48 kHz`) of mono (`384,000 B`) or stereo (`768,000 B`)
@@ -689,26 +694,27 @@ pub fn compute_stmc_psd_88_and_spectral_4096(
     }
 
     // 4x4 uplo='U' (10 f64s = 80 B) + total_power (8 B) = 88 B
-    let mut psd_88 = [0u8; 88];
+    let mut psd_words = [F64::new(0.0); 11];
     let mut cursor = 0usize;
     for j in 0..4 {
         for i in 0..=j {
-            let val = band_vec[i].sqrt() * band_vec[j].sqrt();
-            psd_88[cursor..cursor + 8].copy_from_slice(&val.to_le_bytes());
-            cursor += 8;
+            psd_words[cursor] = F64::new(band_vec[i].sqrt() * band_vec[j].sqrt());
+            cursor += 1;
         }
     }
-    psd_88[80..88].copy_from_slice(&total_power.to_le_bytes());
+    psd_words[10] = F64::new(total_power);
+    let mut psd_88 = [0u8; 88];
+    psd_88.copy_from_slice(psd_words.as_bytes());
 
     // 4,096 B = 1,024 f32 bins (downsampled 2:1 magnitude spectrum from 2,048 positive bins)
-    let mut spec_4096 = [0u8; 4_096];
-    for idx in 0..1_024 {
+    let mut spec_words = [F32::new(0.0); 1_024];
+    for (idx, dst) in spec_words.iter_mut().enumerate() {
         let b0 = idx * 2;
         let b1 = (b0 + 1).min(spec.len() - 1);
-        let mag = (0.5 * (spec[b0].abs() + spec[b1].abs()) * inv_n) as f32;
-        let off = idx * 4;
-        spec_4096[off..off + 4].copy_from_slice(&mag.to_le_bytes());
+        *dst = F32::new((0.5 * (spec[b0].abs() + spec[b1].abs()) * inv_n) as f32);
     }
+    let mut spec_4096 = [0u8; 4_096];
+    spec_4096.copy_from_slice(spec_words.as_bytes());
 
     (psd_88, spec_4096)
 }

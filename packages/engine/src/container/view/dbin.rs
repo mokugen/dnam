@@ -208,6 +208,27 @@ pub(super) fn decode_controls_from_embedded_dbin(
         let decoded =
             decode_cp1_shared_stream_into_slice(dbin_view.cp1_overflow, &mut cp1_contributors)?;
         cp1_contributors.truncate(decoded);
+    } else {
+        let count = usize::from(
+            dbin_view
+                .arena0
+                .control_bus_lite
+                .cp1_dir
+                .cp1_dir_count
+                .get(),
+        );
+        if count > 0 {
+            cp1_contributors.resize(count, Cp1ContributorSlot::zero());
+            let decoded = dnam_vm::control::cp1::decode_cp1_contributors(
+                &dbin_view.arena0.control_bus_lite,
+                dbin_view.arena3.map(|w| &w.control_bus_ultra_delta),
+                &[],
+                dbin_view.control_descriptors.len(),
+                &mut cp1_contributors,
+            )
+            .map_err(map_vm_error)?;
+            cp1_contributors.truncate(decoded);
+        }
     }
     Ok((clamp_descriptors, cp1_contributors))
 }
@@ -328,6 +349,54 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn test_inline_cp1_dir_decodes_into_container_view() {
+        use zerocopy::IntoBytes;
+        let mut a0 = DnamBinBuildInput::default_arena0_lite();
+        let mut a1 = Arena1FullDeltaWire::new_zeroed();
+        let mut a2 = Arena2ProDeltaWire::new_zeroed();
+        let mut a3 = Arena3UltraDeltaWire::new_zeroed();
+        a0.crossbar.cell_desc.tier_flags = zerocopy::byteorder::little_endian::U16::new(0x000F);
+        a0.control_bus_lite.cp1_dir.cp1_dir_count = zerocopy::byteorder::little_endian::U16::new(1);
+        a0.control_bus_lite.cp1_dir.entries[0] = [0, 3, 0xFF];
+        let mut w = [zerocopy::byteorder::little_endian::F32::new(0.0); 34];
+        w[0] = zerocopy::byteorder::little_endian::F32::new(0.25);
+        a0.control_bus_lite.cp1_base[..w.as_bytes().len()].copy_from_slice(w.as_bytes());
+        let ctrl = ControlClampDescriptor::range(0.0, 10.0, 5.0, 3, [0.0, -1.0, 1.0]).to_wire();
+        let dbin = encode_dnam_bin(&DnamBinBuildInput {
+            reference_sample_rate_hz: 48_000,
+            header_flags: 0,
+            ext_ring_pow2_frames: 0,
+            ext_ring_lines: 0,
+            ext_ring_format: 0,
+            declared_max_delay_48k: 64,
+            dc_blocker_pole_5hz: 0.995,
+            tail_time_ms: 10.0,
+            ro_pole_48k: 0.0,
+            switch_xfade_samples: 64,
+            content_hash_prefix: [5; 8],
+            controls: &[ctrl],
+            cp1_overflow: &[],
+            tsyn: &[],
+            cext: None,
+            arena0: &a0,
+            arena1: Some(&a1),
+            arena2: Some(&a2),
+            arena3: Some(&a3),
+        })
+        .unwrap();
+        let _ = (&mut a1, &mut a2, &mut a3);
+        let mut hdr = header_with_one_control(0.0);
+        hdr.controls_schema[0].lobatto_degree = Some(3);
+        let hybrid = build_dnam_container_from_dnam_bin(&mut hdr, &dbin).unwrap();
+        let view =
+            DnamContainerView::from_bytes(&hybrid, &DefaultCryptoProvider::default()).unwrap();
+        assert_eq!(view.cp1_contributors.len(), 1);
+        assert_eq!(view.cp1_contributors[0].control_idx, 0);
+        assert_eq!(view.cp1_contributors[0].lanes, 3);
+        assert_eq!(view.cp1_contributors[0].main_base[0][0], 0.25);
     }
 
     proptest! {

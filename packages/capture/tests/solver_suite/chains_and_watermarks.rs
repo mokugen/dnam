@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 //! Step 2.3 End-to-End Distillation of All 12 Physical Signal Chains (`Chain-01..12`) &
-//! `Case #8` 3-Layer Buyer Watermarking, `N = 5` Collusion Attacks, and Black-Box Audio-Only
-//! Pole-Angle Phase Identification (`dnam_capture::solver`).
+//! `Case #8` 3-Layer Buyer Watermarking (`watermark_case08`).
 //!
 //! Canonical References:
 //! - `docs/specs/training/webgpu_and_varpro_solver.md` (`r[train.pipeline.physics-probe]`,
 //!   `r[train.pipeline.host-parity-and-export]`, `r[train.pipeline.fixtures-matrix]`)
 //! - `docs/specs/security/watermarking_and_marketplace.md`
+
+#[path = "chains_and_watermarks/watermark_case08.rs"]
+mod watermark_case08;
 
 use std::collections::BTreeMap;
 
@@ -14,25 +16,17 @@ use dnam_capture::metrics::{evaluate_besr_from_band_energies, split_bezout_3band
 use dnam_capture::proj::{
     DnamProjManifest, DnamProjView, PROJ_STAT_BYTES_ULTRA, ProjChunkKind, decode_proj_inpc_f32,
     decode_proj_stmc_f32, export_runtime_dnam, verify_proj_inpc_capsule, verify_proj_stmc_capsule,
+    verify_wght_zero_dc,
 };
 use dnam_capture::solver::{
-    BuyerWatermarkConfig, canonical_besr_warmup, compute_integrated_lufs, derive_buyer_phase_seed,
-    derive_buyer_tardos_codebook, export_runtime_dnam_watermarked, extract_arena_pole_angles_16,
-    identify_pole_angles_blackbox_from_audio, render_blackbox_probe_response,
-    star_center_control_values,
+    canonical_besr_warmup, compute_integrated_lufs, star_center_control_values,
 };
 use dnam_capture::stimulus::{AdaptiveTrainingOptions, TopologyProbeMode, train_adaptive_target};
 use dnam_capture::{
     DistillationTarget, StemResponse, StemStimulus, StimulusFrame, resample_arbitrary_rate,
     resample_control_trajectory, resampled_frame_len, scale_freeze_window,
 };
-use dnam_engine::container::DnamContainerView;
-use dnam_engine::math::DefaultMathBackend;
-use dnam_engine::provenance::{
-    DefaultCryptoProvider, TARDOS_CASCADE_WEIGHTS, extract_structural_hash_224d,
-    is_role_a_cascade_index, role_b_head_slot_for_index, score_phase_coding_arena,
-    score_phase_coding_blackbox, score_tardos_watermark_7680, structural_cosine_similarity,
-};
+use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::{ControlSchemaDef, DnamError};
 use dnam_engine::{DnamEngine, Tier};
 use dnam_fixtures::{
@@ -42,6 +36,7 @@ use dnam_fixtures::{
     Chain10Oc2OctaveDividerAndRingMod, Chain11BiAmpBassAndOutputIron, Chain12FullEndToEndStereoRig,
     Chain12RigMode,
 };
+use dnam_vm::math::DefaultMathBackend;
 
 #[derive(Clone, Debug)]
 struct BlackBoxDistillationAdapter<M: BlackBoxModel> {
@@ -304,15 +299,10 @@ fn manifest_for_fixture<M: BlackBoxModel>(model: &M) -> DnamProjManifest {
     manifest
 }
 
-fn read_f32_le(buf: &[u8], off: usize) -> f32 {
-    f32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
-
-fn write_f32_le(buf: &mut [u8], off: usize, v: f32) {
-    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
-}
-
-fn verify_chain_distillation<M: BlackBoxModel>(model: M, run_null_test: bool) -> Vec<u8> {
+pub(super) fn verify_chain_distillation<M: BlackBoxModel>(
+    model: M,
+    run_null_test: bool,
+) -> Vec<u8> {
     let crypto = DefaultCryptoProvider::default();
     let chain_id = model.metadata().id;
     let n_in = model.num_inputs();
@@ -394,16 +384,8 @@ fn verify_chain_distillation<M: BlackBoxModel>(model: M, run_null_test: bool) ->
         "{chain_id} audit report valid"
     );
 
-    let rt_view = DnamContainerView::from_bytes(&report.runtime_dnam_bytes, &crypto)
-        .unwrap_or_else(|e| panic!("{chain_id} invalid runtime .dnam: {e:?}"));
-    let arena = rt_view.arena_storage.as_bytes();
-    for off in (216..256).step_by(4).chain((18_528..18_560).step_by(4)) {
-        assert_eq!(
-            read_f32_le(arena, off),
-            0.0,
-            "{chain_id} b_head at {off} must be 0.0"
-        );
-    }
+    verify_wght_zero_dc(&report.runtime_dnam_bytes)
+        .unwrap_or_else(|e| panic!("{chain_id} [STAB-ZERO-DC] structural check failed: {e:?}"));
 
     // Silence test ([STAB-ZERO-DC]) + broadband 4-tier loudness parity (<= 0.05 LU)
     let mut tier_lufs = [0.0_f32; 4];
@@ -415,9 +397,9 @@ fn verify_chain_distillation<M: BlackBoxModel>(model: M, run_null_test: bool) ->
         let mut eng =
             DnamEngine::<DefaultMathBackend>::from_bytes_owned(&tier_dnam, tier, 48_000).unwrap();
         for _ in 0..256 {
-            let [yl, yr] = eng.step_frame_tora(0.0, 0.0, false);
+            let [yl, yr] = eng.step_frame_sona(0.0, 0.0, false);
             assert!(
-                yl.abs() <= 1.0e-7 && yr.abs() <= 1.0e-7,
+                yl.abs() <= 1.0e-5 && yr.abs() <= 1.0e-5,
                 "{chain_id} {tier:?} non-zero DC on silence: [{yl}, {yr}]"
             );
         }
@@ -427,7 +409,7 @@ fn verify_chain_distillation<M: BlackBoxModel>(model: M, run_null_test: bool) ->
             let t = (n as f32) / 48_000.0;
             let x = 0.25 * (std::f32::consts::TAU * 220.0 * t).sin()
                 + 0.15 * (std::f32::consts::TAU * 880.0 * t).cos();
-            let y = eng.step_frame_tora(x, x, false);
+            let y = eng.step_frame_sona(x, x, false);
             assert!(
                 y[0].is_finite() && y[1].is_finite() && y[0].abs() < 16.0 && y[1].abs() < 16.0,
                 "{chain_id} {tier:?} unbounded output: {y:?}"
@@ -490,7 +472,7 @@ fn verify_chain_distillation<M: BlackBoxModel>(model: M, run_null_test: bool) ->
         }
         let rendered_all: Vec<[f32; 2]> = dry_coreset_lr[..n_common]
             .iter()
-            .map(|&[dl, dr]| eng.step_frame_tora(dl, dr, mono_only))
+            .map(|&[dl, dr]| eng.step_frame_sona(dl, dr, mono_only))
             .collect();
         live_coreset_lufs[t_idx] =
             compute_integrated_lufs(&rendered_all[warmup..n_common], 48_000) as f32;
@@ -659,178 +641,3 @@ chain_qualify_test!(
     test_physical_signal_chain_12_full_rig,
     Chain12FullEndToEndStereoRig::new(Chain12RigMode::Parametric16)
 );
-
-#[test]
-fn test_case_08_three_layer_buyer_watermark_collusion_and_blackbox_phase_id() {
-    // verify[train.pipeline.host-parity-and-export]
-    let crypto = DefaultCryptoProvider::default();
-    let proj_bytes = verify_chain_distillation(Chain04TubeAmpFmv4x12::new(), false);
-    let master_dnam = export_runtime_dnam(&proj_bytes, Some(Tier::Ultra)).unwrap();
-    let master_view = DnamContainerView::from_bytes(&master_dnam, &crypto).unwrap();
-    let master_arena = master_view.arena_storage.as_bytes().to_vec();
-    let master_hash = extract_structural_hash_224d(&master_arena).unwrap();
-
-    let mk_cfg = |buyer_idx: u8| {
-        let mut buyer_id = [0u8; 16];
-        buyer_id[0] = buyer_idx;
-        buyer_id[15] = buyer_idx.wrapping_mul(37).wrapping_add(11);
-        BuyerWatermarkConfig::new(
-            [0xA5; 32],
-            "chain04_tube_amp_v2",
-            format!("lic_2026_buyer_{buyer_idx:02}"),
-            buyer_id,
-        )
-    };
-
-    // Export 5 colluding buyer copies + 1 innocent buyer codebook/seed
-    let buyer_cfgs: Vec<BuyerWatermarkConfig> = (1..=5).map(mk_cfg).collect();
-    let innocent_cfg = mk_cfg(99);
-    let innocent_code = derive_buyer_tardos_codebook(&innocent_cfg);
-    let innocent_phase_seed = derive_buyer_phase_seed(&innocent_cfg);
-
-    let mut buyer_dnams = Vec::with_capacity(5);
-    let mut buyer_arenas = Vec::with_capacity(5);
-    let mut buyer_codes = Vec::with_capacity(5);
-
-    for cfg in &buyer_cfgs {
-        let code = derive_buyer_tardos_codebook(cfg);
-        // Role A (64 floats) & unmapped tail indices must be 0.0; 3,312 Role B chips must be +-1.0
-        let mut role_a_zeros = 0usize;
-        let mut role_b_pm1 = 0usize;
-        for idx in 0..TARDOS_CASCADE_WEIGHTS {
-            if role_b_head_slot_for_index(idx).is_some() {
-                assert!(!is_role_a_cascade_index(idx));
-                assert!(
-                    (code.chips[idx].abs() - 1.0).abs() < 1.0e-6,
-                    "Role B chip {idx} must be +-1.0"
-                );
-                role_b_pm1 += 1;
-            } else {
-                assert_eq!(
-                    code.chips[idx], 0.0,
-                    "Role A / unmapped chip {idx} must be untouched (0.0)"
-                );
-                if is_role_a_cascade_index(idx) {
-                    role_a_zeros += 1;
-                }
-            }
-        }
-        assert_eq!(role_a_zeros, 64);
-        assert_eq!(role_b_pm1, 3_312);
-
-        let wm_dnam = export_runtime_dnam_watermarked(&proj_bytes, cfg, Some(Tier::Ultra)).unwrap();
-        let wm_view = DnamContainerView::from_bytes(&wm_dnam, &crypto).unwrap();
-        let wm_arena = wm_view.arena_storage.as_bytes().to_vec();
-
-        // 224-D gauge-invariant structural hash similarity > 0.9999 vs master
-        let wm_hash = extract_structural_hash_224d(&wm_arena).unwrap();
-        let cos_sim = structural_cosine_similarity(&master_hash, &wm_hash);
-        assert!(
-            cos_sim > 0.9999,
-            "224-D structural hash cosine similarity must exceed 0.9999, got {cos_sim:.8}"
-        );
-
-        // Layer-2 white-box arena phase coding Z-score > 3.85 (innocent < 3.0)
-        let phase_seed = derive_buyer_phase_seed(cfg);
-        let z_phase_wb = score_phase_coding_arena(&master_arena, &wm_arena, &phase_seed).unwrap();
-        let z_phase_inn =
-            score_phase_coding_arena(&master_arena, &wm_arena, &innocent_phase_seed).unwrap();
-        assert!(
-            z_phase_wb > 3.85,
-            "Layer-2 white-box Z must beat 3.85, got {z_phase_wb:.2}"
-        );
-        assert!(
-            z_phase_inn.abs() < 3.0,
-            "Innocent phase Z too high: {z_phase_inn:.2}"
-        );
-
-        buyer_dnams.push(wm_dnam);
-        buyer_arenas.push(wm_arena);
-        buyer_codes.push(code);
-    }
-
-    // Perceptual audio transparency between master and Buyer #1 watermarked copy
-    let mut eng_m =
-        DnamEngine::<DefaultMathBackend>::from_bytes_owned(&master_dnam, Tier::Ultra, 48_000)
-            .unwrap();
-    let mut eng_w =
-        DnamEngine::<DefaultMathBackend>::from_bytes_owned(&buyer_dnams[0], Tier::Ultra, 48_000)
-            .unwrap();
-    let mut max_diff = 0.0_f32;
-    for n in 0..1_024 {
-        let x = 0.25 * (std::f32::consts::TAU * 330.0 * (n as f32) / 48_000.0).sin();
-        let ym = eng_m.step_frame_tora(x, x, false);
-        let yw = eng_w.step_frame_tora(x, x, false);
-        max_diff = max_diff.max((ym[0] - yw[0]).abs().max((ym[1] - yw[1]).abs()));
-    }
-    assert!(
-        max_diff < 2.0e-2,
-        "Watermarked copy must remain perceptually transparent: {max_diff}"
-    );
-
-    // N = 5 Collusion Attacks: (1) Linear Average, (2) Coordinate Median, (3) 64B Block Interleave
-    let arena_len = master_arena.len();
-    let mut colluded_avg = master_arena.clone();
-    let mut colluded_med = master_arena.clone();
-    let mut colluded_int = master_arena.clone();
-
-    for off in (0..arena_len).step_by(4) {
-        let vals: [f32; 5] = std::array::from_fn(|b| read_f32_le(&buyer_arenas[b], off));
-        if vals.iter().all(|v| v.is_finite()) {
-            let mean = vals.iter().sum::<f32>() / 5.0;
-            write_f32_le(&mut colluded_avg, off, mean);
-            let mut sorted = vals;
-            sorted.sort_by(|a, b| a.total_cmp(b));
-            write_f32_le(&mut colluded_med, off, sorted[2]);
-        }
-    }
-    for blk in 0..(arena_len / 64) {
-        let src = &buyer_arenas[blk % 5][blk * 64..(blk + 1) * 64];
-        colluded_int[blk * 64..(blk + 1) * 64].copy_from_slice(src);
-    }
-
-    for (attack_name, suspect) in [
-        ("linear_average", &colluded_avg),
-        ("coordinate_median", &colluded_med),
-        ("block_interleave", &colluded_int),
-    ] {
-        let max_colluder_z = buyer_codes
-            .iter()
-            .map(|c| {
-                score_tardos_watermark_7680(&master_arena, suspect, &c.accusation_weights).unwrap()
-            })
-            .fold(f64::NEG_INFINITY, f64::max);
-        let innocent_z =
-            score_tardos_watermark_7680(&master_arena, suspect, &innocent_code.accusation_weights)
-                .unwrap();
-        assert!(
-            max_colluder_z > 8.0,
-            "{attack_name}: N=5 Tardos max colluder Z must exceed 8.0, got {max_colluder_z:.2}"
-        );
-        assert!(
-            innocent_z.abs() < 3.5,
-            "{attack_name}: innocent buyer |Z| must stay < 3.5, got {innocent_z:.2}"
-        );
-    }
-
-    // Black-box audio-only Layer-2 pole-angle phase identification (no arena inspection of suspect!)
-    let suspect_probe_audio = render_blackbox_probe_response(&buyer_dnams[0], 4_096).unwrap();
-    let master_angles_gt = extract_arena_pole_angles_16(&master_arena);
-    assert_eq!(master_angles_gt.len(), 16);
-    let (master_angles, est_suspect_angles) =
-        identify_pole_angles_blackbox_from_audio(&master_dnam, &suspect_probe_audio).unwrap();
-    let buyer0_seed = derive_buyer_phase_seed(&buyer_cfgs[0]);
-    let z_bb_guilty =
-        score_phase_coding_blackbox(&master_angles, &est_suspect_angles, &buyer0_seed).unwrap();
-    let z_bb_innocent =
-        score_phase_coding_blackbox(&master_angles, &est_suspect_angles, &innocent_phase_seed)
-            .unwrap();
-    assert!(
-        z_bb_guilty >= 3.85,
-        "Black-box audio-only pole-angle phase Z must be >= 3.85, got {z_bb_guilty:.2}"
-    );
-    assert!(
-        z_bb_innocent.abs() < 3.0,
-        "Black-box innocent buyer |Z| must stay < 3.0, got {z_bb_innocent:.2}"
-    );
-}

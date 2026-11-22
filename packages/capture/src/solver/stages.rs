@@ -2,12 +2,12 @@
 //! Canonical Stage Helpers: Step-0 Variance Gating, 3-Phase Stability Bounds & `v3` Inline `CP1`
 //! Control Packing (`solver::stages`).
 
-use dnam_engine::control::{ControlClampDescriptor, Cp1ContributorSlot};
-use dnam_engine::schema::{DnamError, DnamJsonHeader};
-use dnam_engine::stages::weights::{
-    ARENA_LITE_BYTES, ARENA0_CP1_BASE_END, ARENA0_CP1_BASE_OFFSET, ARENA0_CP1_DIR_OFFSET,
-    ARENA3_CP1_ULTRA_END, ARENA3_CP1_ULTRA_OFFSET,
+use dnam_train::pack_cp1_slots_into_wire;
+use dnam_vm::bin::{
+    ARENA_TIER_BYTES, Arena0LiteWire, Arena3ControlBusWire, Arena3UltraDeltaWire, Cp1InlineDirWire,
 };
+use dnam_vm::control::Cp1ContributorSlot;
+use zerocopy::{FromBytes, FromZeros};
 
 /// Stability and clamping bounds enforced across Sweep 1 and Sweep 2 (`ref[train.audit.phase1.clamp-stability]`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -128,116 +128,61 @@ pub fn bitcrusher_smooth_surrogate(x: f64, step_delta: f64, homotopy_tau: f64) -
     x + tau * (hard_q - x)
 }
 
-#[inline]
-fn write_f32_le(buf: &mut [u8], off: usize, val: f32) {
-    if off + 4 <= buf.len() {
-        let clean = if val.is_finite() {
-            if val == 0.0 { 0.0 } else { val }
-        } else {
-            0.0
-        };
-        buf[off..off + 4].copy_from_slice(&clean.to_le_bytes());
-    }
-}
-
-/// Encodes `cp1_slots` into `v3` inline `CP1` (`Arena 0 [3,044..3,072, 3,200..3,520]` and
-/// `Arena 3 [21,760..23,872]`) when `1 <= cp1_slots.len() <= 8` and within `320 B` / `2,112 B`
-/// inline budgets, or zeroes `3,044..3,072` so Region-4 `CP1` handles arbitrary $P$ (`P = 16+`).
+/// Encodes `cp1_slots` into `v3` inline `CP1` (`Arena0ControlBusWire` `576 B` base /
+/// `Arena3ControlBusWire` `2,112 B` ultra) via `dnam_train::pack_cp1_slots_into_wire`,
+/// or zeroes inline `CP1` fields if invalid or overflowing inline budgets.
 pub fn write_inline_cp1_if_fits(arena: &mut [u8], cp1_slots: &[Cp1ContributorSlot]) {
-    if arena.len() >= ARENA_LITE_BYTES {
-        arena[ARENA0_CP1_DIR_OFFSET..ARENA0_CP1_DIR_OFFSET + 28].fill(0);
-        arena[ARENA0_CP1_BASE_OFFSET..ARENA0_CP1_BASE_END].fill(0);
-    }
-    if arena.len() >= ARENA3_CP1_ULTRA_END {
-        arena[ARENA3_CP1_ULTRA_OFFSET..ARENA3_CP1_ULTRA_END].fill(0);
-    }
-    if cp1_slots.is_empty() || cp1_slots.len() > 8 || arena.len() < ARENA_LITE_BYTES {
+    let arena_len = arena.len();
+    let has_ultra = arena_len >= ARENA_TIER_BYTES[3];
+    let (lite_buf, ultra_buf) = if has_ultra {
+        let (l, r) = arena.split_at_mut(ARENA_TIER_BYTES[2]);
+        (l, Some(r))
+    } else {
+        (arena, None)
+    };
+    let Ok((a0, _)) = Arena0LiteWire::mut_from_prefix(lite_buf) else {
         return;
-    }
-    if cp1_slots
-        .iter()
-        .any(|s| s.control_idx > 255 || !(1..=3).contains(&s.lanes))
-    {
-        return;
-    }
-    let base_cap = ARENA0_CP1_BASE_END - ARENA0_CP1_BASE_OFFSET;
-    let ultra_cap = ARENA3_CP1_ULTRA_END - ARENA3_CP1_ULTRA_OFFSET;
-    let total_base_bytes: usize = cp1_slots
-        .iter()
-        .map(|s| 4 * (9 * usize::from(s.lanes) + 4))
-        .sum();
-    let total_ultra_bytes: usize = cp1_slots
-        .iter()
-        .map(|s| 32 * usize::from(s.lanes) + 16)
-        .sum();
-    if total_base_bytes > base_cap || total_ultra_bytes > ultra_cap {
+    };
+    let a0_cb = &mut a0.control_bus_lite;
+    a0_cb.cp1_dir = Cp1InlineDirWire::new_zeroed();
+    a0_cb.cp1_base.fill(0);
+
+    let mut scratch_a3 = Arena3ControlBusWire::new_zeroed();
+    let a3_cb = ultra_buf
+        .and_then(|u| Arena3UltraDeltaWire::mut_from_prefix(u).ok())
+        .map(|(a3, _)| &mut a3.control_bus_ultra_delta)
+        .unwrap_or(&mut scratch_a3);
+    a3_cb.cp1_ultra.fill(0);
+
+    if cp1_slots.is_empty() {
         return;
     }
 
-    let count = cp1_slots.len() as u16;
-    arena[ARENA0_CP1_DIR_OFFSET..ARENA0_CP1_DIR_OFFSET + 2].copy_from_slice(&count.to_le_bytes());
-    arena[ARENA0_CP1_DIR_OFFSET + 2] = 0;
-    arena[ARENA0_CP1_DIR_OFFSET + 3] = 0;
-
-    let mut b_cursor = ARENA0_CP1_BASE_OFFSET;
-    let mut u_cursor = ARENA3_CP1_ULTRA_OFFSET;
-    let has_ultra = arena.len() >= ARENA3_CP1_ULTRA_END;
-
-    for (c, slot) in cp1_slots.iter().enumerate() {
-        let dir_off = ARENA0_CP1_DIR_OFFSET + 4 + c * 3;
-        arena[dir_off] = slot.control_idx as u8;
-        arena[dir_off + 1] = ((slot.ctrl_kind & 0x0F) << 4) | (slot.lanes & 0x0F);
-        arena[dir_off + 2] = if slot.ctrl_kind == 1 {
-            slot.option_idx
-        } else if slot.ctrl_kind == 2 {
-            slot.partner_control_id as u8
-        } else {
-            0
-        };
-
-        let l_cnt = usize::from(slot.lanes);
-        for row in slot.main_base.iter().take(l_cnt) {
-            for &val in row {
-                write_f32_le(arena, b_cursor, val);
-                b_cursor += 4;
+    let max_idx = cp1_slots
+        .iter()
+        .map(|s| {
+            let base = usize::from(s.control_idx);
+            if s.ctrl_kind == 2 {
+                base.max(usize::from(s.aux))
+            } else {
+                base
             }
-        }
-        for &val in slot.emb.iter().take(l_cnt) {
-            write_f32_le(arena, b_cursor, val);
-            b_cursor += 4;
-        }
-        for &val in &slot.v_base {
-            write_f32_le(arena, b_cursor, val);
-            b_cursor += 4;
-        }
-        if has_ultra {
-            for row in slot.main_ultra.iter().take(l_cnt) {
-                for &val in row {
-                    write_f32_le(arena, u_cursor, val);
-                    u_cursor += 4;
-                }
-            }
-            for &val in &slot.v_ultra {
-                write_f32_le(arena, u_cursor, val);
-                u_cursor += 4;
-            }
-        }
+        })
+        .max()
+        .unwrap_or(0);
+    let num_controls = max_idx + 1;
+
+    let packed = pack_cp1_slots_into_wire(cp1_slots, num_controls, has_ultra, a0_cb, a3_cb);
+    if !matches!(packed, Ok(ref overflow) if overflow.is_empty()) {
+        a0_cb.cp1_dir = Cp1InlineDirWire::new_zeroed();
+        a0_cb.cp1_base.fill(0);
+        a3_cb.cp1_ultra.fill(0);
     }
-}
-
-/// Validates and compiles `header.controls_schema` clamp descriptors (stored in `.dnam` Region 2B;
-/// never mutates `v3` `Arena 1` `V3ControlBusParams`).
-pub(crate) fn sync_clamp_descriptors_to_arena(
-    header: &DnamJsonHeader,
-    _arena: &mut [u8],
-) -> Result<Vec<ControlClampDescriptor>, DnamError> {
-    header.compile_clamp_descriptors()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dnam_engine::stages::weights::ARENA_ULTRA_BYTES;
     use proptest::prelude::*;
 
     #[test]
@@ -275,51 +220,49 @@ mod tests {
     #[test]
     fn test_v3_inline_cp1_budget_and_overflow_behavior() {
         let mut tiny_arena = vec![0u8; 256];
-        let s_ok = Cp1ContributorSlot {
-            lanes: 2,
+        let s_switch = Cp1ContributorSlot {
+            lanes: 1,
             ctrl_kind: 1,
-            option_idx: 2,
+            aux: 2,
             control_idx: 0,
             ..Cp1ContributorSlot::zero()
         };
         let s_pair = Cp1ContributorSlot {
             lanes: 3,
             ctrl_kind: 2,
-            partner_control_id: 1,
+            aux: 1,
             control_idx: 0,
             ..Cp1ContributorSlot::zero()
         };
-        write_inline_cp1_if_fits(&mut tiny_arena, &[s_ok]);
+        let s_range = Cp1ContributorSlot {
+            lanes: 3,
+            ctrl_kind: 0,
+            aux: 0xFF,
+            control_idx: 0,
+            ..Cp1ContributorSlot::zero()
+        };
+        write_inline_cp1_if_fits(&mut tiny_arena, &[s_switch]);
 
-        let mut ultra_arena = vec![0u8; ARENA_ULTRA_BYTES];
-        write_inline_cp1_if_fits(&mut ultra_arena, &[s_ok, s_pair]);
-        assert_eq!(
-            u16::from_le_bytes([
-                ultra_arena[ARENA0_CP1_DIR_OFFSET],
-                ultra_arena[ARENA0_CP1_DIR_OFFSET + 1]
-            ]),
-            2
-        );
-        let mut bad_slot = s_ok;
+        let mut ultra_arena = vec![0u8; ARENA_TIER_BYTES[3]];
+        write_inline_cp1_if_fits(&mut ultra_arena, &[s_switch, s_pair]);
+        let (a0, _) = Arena0LiteWire::ref_from_prefix(&ultra_arena).unwrap();
+        assert_eq!(a0.control_bus_lite.cp1_dir.cp1_dir_count.get(), 2);
+
+        let mut bad_slot = s_switch;
         bad_slot.lanes = 0;
         write_inline_cp1_if_fits(&mut ultra_arena, &[bad_slot]);
-        assert_eq!(
-            u16::from_le_bytes([
-                ultra_arena[ARENA0_CP1_DIR_OFFSET],
-                ultra_arena[ARENA0_CP1_DIR_OFFSET + 1]
-            ]),
-            0
-        );
-        // Exceed 320 B v3 inline base budget (`3 * 124 = 372 B > 320 B`) -> falls back to Region 4
-        write_inline_cp1_if_fits(&mut ultra_arena, &[s_pair; 3]);
-        assert_eq!(
-            u16::from_le_bytes([
-                ultra_arena[ARENA0_CP1_DIR_OFFSET],
-                ultra_arena[ARENA0_CP1_DIR_OFFSET + 1]
-            ]),
-            0
-        );
-        write_inline_cp1_if_fits(&mut ultra_arena, &[s_ok; 9]);
+        let (a0_bad, _) = Arena0LiteWire::ref_from_prefix(&ultra_arena).unwrap();
+        assert_eq!(a0_bad.control_bus_lite.cp1_dir.cp1_dir_count.get(), 0);
+
+        // Exceed 576 B inline base budget (`5 * 124 = 620 B > 576 B`) -> clears inline CP1 for Region-4 overflow
+        write_inline_cp1_if_fits(&mut ultra_arena, &[s_range; 5]);
+        let (a0_ovf, _) = Arena0LiteWire::ref_from_prefix(&ultra_arena).unwrap();
+        assert_eq!(a0_ovf.control_bus_lite.cp1_dir.cp1_dir_count.get(), 0);
+
+        // Exceed 8-slot inline directory limit -> clears inline CP1 for Region-4 overflow
+        write_inline_cp1_if_fits(&mut ultra_arena, &[s_switch; 9]);
+        let (a0_dir_ovf, _) = Arena0LiteWire::ref_from_prefix(&ultra_arena).unwrap();
+        assert_eq!(a0_dir_ovf.control_bus_lite.cp1_dir.cp1_dir_count.get(), 0);
     }
 
     proptest! {

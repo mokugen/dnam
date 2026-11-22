@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Integration and specification verification tests (`verify[...]`) for `dnam-capture`.
 
+use dnam_capture::audit::format_audit_prescription_report;
 use dnam_capture::metrics::{
     ArchetypeFamily, BESR_WORST_BAND_OFFSET_DB, IntervalAuditDecision, MultiRateSegEsrSlice,
     StemActivityClass, canonical_ltas_33_centers_hz, certify_4metric_signal_chain,
@@ -29,23 +30,28 @@ use dnam_capture::{
     CORESET_FP32_FRAMES_PER_STEM, CORESET_FP32_MONO_BYTES, CORESET_FP32_STEREO_BYTES,
     REFERENCE_SAMPLE_RATE_HZ, compute_gram_input_fingerprint, f32_to_fp16_bits, fp16_bits_to_f32,
 };
-use dnam_engine::container::{
-    ARENA_OFFSET_ULTRA_END, build_dnam_container, strip_container_to_tier,
-};
-use dnam_engine::control::{ExactIntFactorAccumulator, eval_newton_lobatto_basis_f64};
-use dnam_engine::math::DefaultMathBackend;
+use dnam_engine::container::{build_dnam_container_from_dnam_bin, strip_container_to_tier};
 use dnam_engine::provenance::{
-    PHASE_CODING_MAX_RAD, STAGE3_KAUTZ_BLOCKS_PER_TIER, apply_cascade_head_gauge,
-    apply_isometric_gauge_watermark, apply_phase_coding_watermark, apply_tardos_watermark_7680,
-    extract_stage3_tier_fingerprint_component, extract_structural_hash_224d,
-    generate_tardos_code_7680, is_role_a_cascade_index, kautz_soa_byte_offset,
+    PHASE_CODING_MAX_RAD, apply_cascade_head_gauge, apply_isometric_gauge_watermark,
+    apply_phase_coding_watermark, apply_sona_sign_gauge_watermark, apply_tardos_watermark_7680,
+    derive_sona_sign_gauge_40, extract_structural_hash_224d, for_each_tardos_f32_offset_up_to,
+    for_each_tardos_fp16_offset_up_to, generate_tardos_code_7680, is_role_a_cascade_index,
     role_b_head_slot_for_index, score_phase_coding_arena, score_tardos_watermark_7680,
     structural_cosine_similarity,
 };
 use dnam_engine::schema::DnamJsonHeader;
 use dnam_engine::{DnamAudioIo, DnamEngine, Tier};
+use dnam_kernels::{f32_to_fp16, fp16_to_f32};
+use dnam_train::{Pass5EmitConfig, SonaModelF64, encode_model_to_dnam_bin};
+use dnam_vm::bin::{
+    ARENA_TIER_BYTES, Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire,
+    Arena3UltraDeltaWire, DnamBinBuildInput, DnamBinView, encode_dnam_bin,
+};
+use dnam_vm::control::{ControlClampDescriptor, ExactIntFactorAccumulator};
+use dnam_vm::math::DefaultMathBackend;
 use proptest::prelude::*;
 use std::f64::consts::PI;
+use zerocopy::{FromBytes, IntoBytes};
 
 #[test]
 fn test_isomorphism_and_quality_besr_metrics() {
@@ -517,6 +523,7 @@ fn test_dsp_surrogates_capture_audit_and_five_stage_varpro_contracts() {
     // verify[train.audit.phase3.clamp-dynamic]
     // verify[train.audit.phase3.clamp-head-gain]
     // verify[train.audit.phase3.numeric-envelope]
+    // verify[train.audit.report.prescription]
     // verify[train.pipeline.topology]
     // verify[train.pipeline.physics-probe]
     // verify[train.pipeline.backbone-trajectory-opt]
@@ -542,6 +549,12 @@ fn test_dsp_surrogates_capture_audit_and_five_stage_varpro_contracts() {
     assert_eq!(g_lin, 0.9990);
     assert_eq!(a_diff, -0.75);
     assert_eq!(tau_m, 4.0);
+    let report = format_audit_prescription_report(
+        "amp",
+        &["[CLAMP-RANGE] 'gain': Clamped declared [0.0, 10.0] -> safe [2.0, 8.0]"],
+    );
+    assert!(report.contains("EXPORTED: amp.dnam | amp.dnam-proj"));
+    assert!(report.contains("Active Control Clamps Applied (1):"));
 
     assert!(!is_control_variance_active(&[0.5, 0.5, 0.5], 1.0e-4));
     assert!(is_control_variance_active(&[0.1, 0.5, 0.9], 1.0e-4));
@@ -571,53 +584,87 @@ fn test_dsp_surrogates_capture_audit_and_five_stage_varpro_contracts() {
     }
 }
 
+fn extract_arena_from_dbin(dbin: &[u8]) -> Vec<u8> {
+    let view = DnamBinView::parse(dbin).expect("parse dnam-bin");
+    let mut out = Vec::with_capacity(ARENA_TIER_BYTES[3]);
+    out.extend_from_slice(view.arena0.as_bytes());
+    out.extend_from_slice(view.arena1.expect("arena1").as_bytes());
+    out.extend_from_slice(view.arena2.expect("arena2").as_bytes());
+    out.extend_from_slice(view.arena3.expect("arena3").as_bytes());
+    out
+}
+
+fn wrap_v3_arena_into_dnam(
+    hdr: &mut DnamJsonHeader,
+    template_dbin: &[u8],
+    arena: &[u8],
+) -> Vec<u8> {
+    let view = DnamBinView::parse(template_dbin).expect("parse template dbin");
+    let a0 = Arena0LiteWire::ref_from_bytes(&arena[..ARENA_TIER_BYTES[0]]).unwrap();
+    let a1 = Arena1FullDeltaWire::ref_from_bytes(&arena[ARENA_TIER_BYTES[0]..ARENA_TIER_BYTES[1]])
+        .unwrap();
+    let a2 = Arena2ProDeltaWire::ref_from_bytes(&arena[ARENA_TIER_BYTES[1]..ARENA_TIER_BYTES[2]])
+        .unwrap();
+    let a3 = Arena3UltraDeltaWire::ref_from_bytes(&arena[ARENA_TIER_BYTES[2]..ARENA_TIER_BYTES[3]])
+        .unwrap();
+    let dbin = encode_dnam_bin(&DnamBinBuildInput {
+        reference_sample_rate_hz: view.header.reference_sample_rate_hz.get(),
+        header_flags: view.header.flags.get(),
+        ext_ring_pow2_frames: view.runtime_meta.ext_ring_pow2_frames,
+        ext_ring_lines: view.runtime_meta.ext_ring_lines,
+        ext_ring_format: view.runtime_meta.ext_ring_format,
+        declared_max_delay_48k: view.runtime_meta.declared_max_delay_48k.get(),
+        dc_blocker_pole_5hz: view.runtime_meta.dc_blocker_pole_5hz.get(),
+        tail_time_ms: view.runtime_meta.tail_time_ms.get(),
+        ro_pole_48k: view.runtime_meta.ro_pole_48k.get(),
+        switch_xfade_samples: view.runtime_meta.switch_xfade_samples.get(),
+        content_hash_prefix: view.runtime_meta.content_hash_prefix,
+        controls: &[],
+        cp1_overflow: &[],
+        tsyn: &[],
+        cext: None,
+        arena0: a0,
+        arena1: Some(a1),
+        arena2: Some(a2),
+        arena3: Some(a3),
+    })
+    .unwrap();
+    build_dnam_container_from_dnam_bin(hdr, &dbin).unwrap()
+}
+
 #[test]
 fn test_oracles_01_02_03_and_cases_08_09_19_engine_trainer_harnesses() {
     // verify[train.pipeline.fixtures-matrix]
     // 1. Oracle-01-256D-Schur-And-Gauge & Case #8 (ProvenanceWatermarkHarness)
     let mut header = DnamJsonHeader::default_reference();
-    let mut master_arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    master_arena[124..128].copy_from_slice(&0.9993_f32.to_le_bytes());
-
-    let readout_bases = [2_688_usize, 6_144_usize, 15_168_usize, 20_608_usize];
-    let readout_floats = [80_usize, 96, 112, 128];
-    for tier in 0..4 {
-        for blk in 0..STAGE3_KAUTZ_BLOCKS_PER_TIER[tier] {
-            let k_base = kautz_soa_byte_offset(tier, blk);
-            for lane in 0..4 {
-                master_arena[k_base + lane * 4..k_base + (lane + 1) * 4]
-                    .copy_from_slice(&0.90_f32.to_le_bytes());
-                master_arena[k_base + 16 + lane * 4..k_base + 16 + (lane + 1) * 4]
-                    .copy_from_slice(&0.04_f32.to_le_bytes());
-                master_arena[k_base + 32 + lane * 4..k_base + 32 + (lane + 1) * 4]
-                    .copy_from_slice(&(0.18_f32 + 0.09_f32 * ((tier + blk) as f32)).to_le_bytes());
-                master_arena[k_base + 48 + lane * 4..k_base + 48 + (lane + 1) * 4]
-                    .copy_from_slice(&0.35_f32.to_le_bytes());
-                master_arena[k_base + 64 + lane * 4..k_base + 64 + (lane + 1) * 4]
-                    .copy_from_slice(&0.25_f32.to_le_bytes());
-                master_arena[k_base + 96 + lane * 4..k_base + 96 + (lane + 1) * 4]
-                    .copy_from_slice(&0.20_f32.to_le_bytes());
-            }
-        }
-        let h_base = readout_bases[tier];
-        for i in 0..readout_floats[tier] {
-            let val = 0.03_f32 * (((i * 7 + tier * 3 + 1) % 11) as f32 - 5.0);
-            master_arena[h_base + i * 4..h_base + (i + 1) * 4].copy_from_slice(&val.to_le_bytes());
-        }
+    let mut model = SonaModelF64::new(48_000.0);
+    model.ro_pole_48k = 0.9993;
+    model.pre_conv_u_gain = [1.0, 1.0];
+    model.active_kautz_pairs = 32;
+    for (idx, kp) in model.kautz.iter_mut().enumerate() {
+        kp.r_low = 0.90;
+        kp.dr = 0.04;
+        kp.theta = 0.14 + 0.085 * (idx as f64);
+        kp.b_gamma = 0.35;
+        kp.c_re_l = 0.25;
+        kp.c_im_l = 0.12;
+        kp.c_re_r = 0.20;
+        kp.c_im_r = -0.08;
     }
-
+    for l in 0..4 {
+        model.core_quads[0].adaa_drive[l] = 0.75;
+        model.core_quads[0].in_mid_weight[l] = 0.25;
+        model.core_quads[0].tone_dir[l] = 1.0;
+        model.w_ro[l][6] = 0.15;
+        model.w_ro[l][7] = 0.15;
+    }
+    let master_dbin = encode_model_to_dnam_bin(&model, Pass5EmitConfig::default()).unwrap();
+    let master_arena = extract_arena_from_dbin(&master_dbin);
     let hash_master = extract_structural_hash_224d(&master_arena).unwrap();
-    let fp_master = extract_stage3_tier_fingerprint_component(
-        &master_arena[2_368..2_496],
-        &master_arena[2_496..2_624],
-        4,
-    )
-    .unwrap();
-    assert_eq!(fp_master.len(), 60);
 
-    // Apply dyadic Layer 1 gauge (Oracle-01: 0.000000 ULP audio invariance & fingerprint invariance)
+    // Apply dyadic Layer 1 gauge + SONA sign-flip gauge (Oracle-01: 0-ULP audio & fingerprint invariance)
     let mut gauged_arena = master_arena.clone();
-    let kappa_dyadic = [2.0_f32; 16];
+    let kappa_dyadic = [2.0_f32; 32];
     let q_ident = [
         [1.0_f32, 0.0, 0.0, 0.0],
         [0.0, 1.0, 0.0, 0.0],
@@ -625,25 +672,19 @@ fn test_oracles_01_02_03_and_cases_08_09_19_engine_trainer_harnesses() {
         [0.0, 0.0, 0.0, 1.0],
     ];
     apply_isometric_gauge_watermark(&mut gauged_arena, &kappa_dyadic, &q_ident).unwrap();
-
     let hash_gauged = extract_structural_hash_224d(&gauged_arena).unwrap();
     assert!(1.0 - structural_cosine_similarity(&hash_master, &hash_gauged) < 1.0e-12);
-    let fp_gauged = extract_stage3_tier_fingerprint_component(
-        &gauged_arena[2_368..2_496],
-        &gauged_arena[2_496..2_624],
-        4,
-    )
-    .unwrap();
-    assert_eq!(fp_master, fp_gauged);
+
+    let signs40 = derive_sona_sign_gauge_40(&[0x42_u8; 32]);
+    let mut sign_gauged_arena = master_arena.clone();
+    apply_sona_sign_gauge_watermark(&mut sign_gauged_arena, &signs40).unwrap();
 
     let mut role_b_arena = master_arena.clone();
     let role_b_dyadic = [[1.0_f32; 4]; 32]; // 1 + delta = 2.0
     apply_cascade_head_gauge(&mut role_b_arena, 0, &role_b_dyadic).unwrap();
 
-    let cont_master =
-        build_dnam_container(&mut header, &master_arena, &master_arena, false).unwrap();
-    let cont_gauged =
-        build_dnam_container(&mut header, &gauged_arena, &gauged_arena, false).unwrap();
+    let cont_master = wrap_v3_arena_into_dnam(&mut header, &master_dbin, &master_arena);
+    let cont_gauged = wrap_v3_arena_into_dnam(&mut header, &master_dbin, &sign_gauged_arena);
     let mut eng_m =
         DnamEngine::<DefaultMathBackend>::from_bytes(&cont_master, Tier::Ultra, 48_000).unwrap();
     let mut eng_g =
@@ -682,7 +723,7 @@ fn test_oracles_01_02_03_and_cases_08_09_19_engine_trainer_harnesses() {
             }
         }
         let mut p_arena = master_arena.clone();
-        apply_tardos_watermark_7680(&mut p_arena, &code.chips, 1.5e-4).unwrap();
+        apply_tardos_watermark_7680(&mut p_arena, &code.chips, 1.5e-3).unwrap();
         pirate_codes.push(code);
         pirate_arenas.push(p_arena);
     }
@@ -693,9 +734,9 @@ fn test_oracles_01_02_03_and_cases_08_09_19_engine_trainer_harnesses() {
         score_tardos_watermark_7680(&master_arena, &pirate_arenas[0], &innocent).unwrap();
     assert!(z_pirate > 15.0 && z_pirate > z_innocent + 10.0);
 
-    // Genuine N = 5 linear-averaging pirate collusion attack: average all 5 watermarked f32 arenas
+    // Genuine N = 5 linear-averaging pirate collusion attack across Tardos F32 & fp16 Role B carriers
     let mut colluded_arena = master_arena.clone();
-    for off in (0..colluded_arena.len()).step_by(4) {
+    for_each_tardos_f32_offset_up_to(colluded_arena.len(), |_idx, off| {
         let mut sum = 0.0_f64;
         for pa in &pirate_arenas {
             let val = f32::from_le_bytes([pa[off], pa[off + 1], pa[off + 2], pa[off + 3]]);
@@ -703,7 +744,16 @@ fn test_oracles_01_02_03_and_cases_08_09_19_engine_trainer_harnesses() {
         }
         let avg = (sum / (pirate_arenas.len() as f64)) as f32;
         colluded_arena[off..off + 4].copy_from_slice(&avg.to_le_bytes());
-    }
+    });
+    for_each_tardos_fp16_offset_up_to(colluded_arena.len(), |_idx, off| {
+        let mut sum = 0.0_f64;
+        for pa in &pirate_arenas {
+            let val = fp16_to_f32(u16::from_le_bytes([pa[off], pa[off + 1]]));
+            sum += f64::from(val);
+        }
+        let avg = f32_to_fp16((sum / (pirate_arenas.len() as f64)) as f32);
+        colluded_arena[off..off + 2].copy_from_slice(&avg.to_le_bytes());
+    });
     let z_colluded_innocent =
         score_tardos_watermark_7680(&master_arena, &colluded_arena, &innocent).unwrap();
     let mut max_colluder_z = f64::NEG_INFINITY;
@@ -724,8 +774,9 @@ fn test_oracles_01_02_03_and_cases_08_09_19_engine_trainer_harnesses() {
     // 2. Oracle-02-CP1-ArbitraryP-And-Hadamard-FM (P = 6 and P = 16 controls, StarCenter 0 ULP)
     for num_controls in [6usize, 16usize] {
         let mut acc = ExactIntFactorAccumulator::new(num_controls);
+        let desc = ControlClampDescriptor::range(0.0, 10.0, 5.0, 3, [0.0, -1.0, 1.0]);
         for p in 0..num_controls {
-            let b = eval_newton_lobatto_basis_f64(0.0, [0.0, -1.0, 1.0], 3);
+            let b = desc.eval_lobatto_basis(0.0);
             assert_eq!(b, [0.0, 0.0, 0.0]);
             assert!(acc.update_contributor_rt(p, 0));
         }
@@ -748,7 +799,7 @@ fn test_oracles_01_02_03_and_cases_08_09_19_engine_trainer_harnesses() {
 
     let mut proj_manifest = DnamProjManifest::default_reference();
     proj_manifest.base = header.clone();
-    proj_manifest.base.version = "2.0.0".to_string();
+    proj_manifest.base.version = "3.0.0".to_string();
     proj_manifest.base.container_kind = "dnam".to_string();
     let proj_bytes = build_dnam_proj_container_with_cp1(
         &mut proj_manifest,

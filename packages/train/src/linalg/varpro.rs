@@ -132,7 +132,7 @@ pub fn assemble_ozaki_normal_equations(
     }
 
     let chunks_per_batch =
-        ((MAX_WEBGPU_BINDING_BYTES as usize) / 4 / chunk_bytes.max(1)).clamp(1, 32);
+        ((MAX_WEBGPU_BINDING_BYTES as usize) / 4 / chunk_bytes.max(1)).clamp(1, 8);
     let batch_frames = chunks_per_batch * GPU_OZAKI_MAX_CHUNK_LEN;
     let mut gram_acc = vec![Wide192Accum::zero(); gram_len];
     let mut rhs_acc = vec![vec![Wide192Accum::zero(); target_channels]; feature_dim];

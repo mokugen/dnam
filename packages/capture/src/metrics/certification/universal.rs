@@ -14,8 +14,8 @@ use super::super::{
     evaluate_besr_from_band_energies, evaluate_ltas_33band_report, evaluate_noise_qualified_besr,
     split_bezout_3band_energies,
 };
+use super::PerceptualCertificationSummary;
 use super::scope::bezout_3band_balance_within_db;
-use super::{PerceptualCertificationSummary, TargetChannelCertCache};
 
 fn build_profile_noise_trace(profile: &TargetRepeatabilityProfile, len: usize) -> Option<Vec<f64>> {
     if !profile.noise_rms.is_finite() || profile.noise_rms <= 0.0 || len == 0 {
@@ -270,39 +270,6 @@ pub fn certify_holdout_universal(
     let bal_ok = env_ok
         && bezout_3band_balance_within_db(target, model, sample_rate_hz, warmup_samples, 1.75);
     (summary.besr_db, bal_ok)
-}
-
-impl TargetChannelCertCache {
-    /// Universal cached 4-metric evaluator parameterized by `profile` (`TargetRepeatabilityProfile`).
-    #[must_use]
-    pub fn certify_universal_with_prescreen(
-        &mut self,
-        tier: Tier,
-        model: &[f64],
-        profile: &TargetRepeatabilityProfile,
-        prev_ch: Option<&PerceptualCertificationSummary>,
-    ) -> PerceptualCertificationSummary {
-        let valid_slice = self.target.len() == model.len()
-            && self.warmup_samples < self.target.len()
-            && !self.target.is_empty();
-        let ltas_opt = if valid_slice {
-            self.ltas_cache.as_mut()
-        } else {
-            None
-        };
-        eval_universal_core(
-            tier,
-            &self.target,
-            model,
-            None,
-            profile,
-            self.sample_rate_hz,
-            self.warmup_samples,
-            ltas_opt,
-            self.mr_cache.as_ref(),
-            prev_ch,
-        )
-    }
 }
 
 #[cfg(test)]

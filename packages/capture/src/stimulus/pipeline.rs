@@ -8,20 +8,27 @@
 //!   `ref[train.capture.planner.freeze-transition]`, `ref[train.capture.invariants]`)
 //! - `docs/specs/training/iterative_resume_and_caching.md` (`ref[train.cache.proj-vault]`)
 
+mod causal_probe;
 mod fullband;
 mod stems;
 
+pub use causal_probe::{
+    build_v3_causal_probe_excitation, estimate_v3_causal_deadtime_and_polarity,
+};
+
 use std::collections::{BTreeMap, BTreeSet};
 
-use dnam_engine::schema::{ControlCalibrationRole, ControlKind, DnamError};
+use dnam_engine::schema::{ControlKind, DnamError};
 
 use crate::proj::bundle::{
-    ProjChunkInput, build_dnam_proj_container_with_cp1_and_compacted, export_runtime_dnam,
+    ProjChunkInput, build_dnam_proj_container_with_dnam_bin, export_runtime_dnam,
 };
 use crate::proj::capsules::CalbChunk64B;
 use crate::proj::directory::{ProjChunkKind, StmcTrajectoryWindow};
 use crate::proj::schema::DnamProjManifest;
-use crate::proj::vault::{initialize_backbone_arena_if_needed, solve_captures_batch_with_progress};
+use crate::proj::vault::{
+    initialize_backbone_dnam_bin_if_needed, solve_captures_batch_with_progress,
+};
 use crate::solver::{SolverOptions, TrainerProgressHandle, TrainingPhase, TrainingStatus};
 use crate::targets::{DistillationTarget, StemResponse};
 
@@ -31,7 +38,7 @@ use super::fft::{
     build_disjoint_comb_schedule, synthesize_cyclic_comb_frame,
 };
 use super::laws::{
-    HadamardLaw4dTracker, KnobAcousticClass, SweepExecutionMode, TopologyProbeMode,
+    HadamardLaw4dTracker, SweepExecutionMode, TopologyProbeMode,
     build_orthogonal_hadamard_diagonals, classify_knob_from_endpoint_probe,
     compute_hadamard_sfm_ratio, select_sweep_execution_mode,
 };
@@ -39,10 +46,7 @@ pub use super::null_test::{LiveNullTestReport, run_live_null_test_and_autopatch}
 use super::safeguards::CaptureWarning;
 use super::waveforms::deterministic_seed_256;
 use super::{AdaptiveStimulusController, StimulusConfig};
-use stems::{
-    capture_freeze_transition_stem_mode1, render_endpoint_probe_48k, run_single_closed_loop_stem,
-    spectral_tilt_from_stmc_4096,
-};
+use stems::{render_endpoint_probe_48k, run_single_closed_loop_stem, spectral_tilt_from_stmc_4096};
 
 /// Options controlling Mode-1 closed-loop adaptive capture and distillation (`train_adaptive_target`).
 #[derive(Debug, Clone)]
@@ -135,14 +139,9 @@ pub fn train_adaptive_target_with_progress(
             payload: calb.to_bytes().to_vec(),
         });
     }
-    let seeded_arena = initialize_backbone_arena_if_needed(None);
-    let mut proj_bytes = build_dnam_proj_container_with_cp1_and_compacted(
-        &mut manifest,
-        &init_chunks,
-        &seeded_arena,
-        &[],
-        false,
-    )?;
+    let seeded_dbin = initialize_backbone_dnam_bin_if_needed(None)?;
+    let mut proj_bytes =
+        build_dnam_proj_container_with_dnam_bin(&mut manifest, &init_chunks, &seeded_dbin)?;
 
     let seed_256 = deterministic_seed_256(0xACE5_2026_0001);
     let noise_floor_dbfs = options.calb.map_or(-100.0, |c| c.noise_floor_dbfs);
@@ -164,7 +163,7 @@ pub fn train_adaptive_target_with_progress(
         &[0.0; 64],
     );
     let mut probe_dry_l_48k = probe_comb.samples;
-    probe_dry_l_48k.resize(4 * ADAPTIVE_FRAME_SAMPLES, 0.0);
+    probe_dry_l_48k.resize(10 * ADAPTIVE_FRAME_SAMPLES, 0.0);
 
     let (star_probe_wet_l, star_probe_wet_r) = render_endpoint_probe_48k(
         target,
@@ -192,10 +191,10 @@ pub fn train_adaptive_target_with_progress(
             &base_ctrls,
         )?;
         let (lag_l, inv_l) =
-            fullband::estimate_v3_causal_deadtime_and_polarity(&causal_probe, &pw_l);
+            causal_probe::estimate_v3_causal_deadtime_and_polarity(&causal_probe, &pw_l);
         let (causal_lag, inv_r) = pw_r.as_deref().map_or((lag_l, inv_l), |r| {
             let (lag_r, pol_r) =
-                fullband::estimate_v3_causal_deadtime_and_polarity(&causal_probe, r);
+                causal_probe::estimate_v3_causal_deadtime_and_polarity(&causal_probe, r);
             (lag_l.min(lag_r), pol_r)
         });
         let ti_probe = fullband::build_time_invariance_probe_48k();
@@ -322,7 +321,7 @@ pub fn train_adaptive_target_with_progress(
         };
     let mut captured_specs = vec![star_spec];
 
-    // 2. Capture FreezeLatch transitions, 1D Range sweeps/stops & Switch options
+    // 2. Capture 1D Range sweeps/stops & Switch options via signal-measured probes
     let mut active_range_indices = Vec::new();
     let mut shape_spread_by_ctrl = vec![0.0_f64; manifest.base.controls_schema.len()];
     let controls_snapshot = manifest.base.controls_schema.clone();
@@ -331,23 +330,6 @@ pub fn train_adaptive_target_with_progress(
         (is_contiguous_96k || manifest.base.controls_schema.len() >= 4).then_some(8_192);
 
     for (p_idx, ctrl) in controls_snapshot.iter().enumerate() {
-        if ctrl
-            .calibration
-            .as_ref()
-            .is_some_and(|c| c.role == ControlCalibrationRole::FreezeLatch)
-        {
-            let freeze_spec = capture_freeze_transition_stem_mode1(
-                &manifest,
-                target,
-                p_idx,
-                options,
-                &seed_256,
-                &probe_sched.carrier_bins,
-                shared_align,
-            )?;
-            captured_specs.push(freeze_spec);
-        }
-
         match ctrl.kind {
             ControlKind::Range => {
                 active_range_indices.push(p_idx);
@@ -366,23 +348,12 @@ pub fn train_adaptive_target_with_progress(
                     options.topology_mode,
                     &probe_v,
                 )?;
-                let mut ep = classify_knob_from_endpoint_probe(
+                let ep = classify_knob_from_endpoint_probe(
                     &star_probe_wet_l,
                     &end_probe_wet,
                     ADAPTIVE_FRAME_SAMPLES,
                     &probe_sched,
                 );
-                if ctrl.calibration.as_ref().is_some_and(|c| {
-                    matches!(
-                        c.role,
-                        ControlCalibrationRole::DelayTimeMs
-                            | ControlCalibrationRole::GrainSizeMs
-                            | ControlCalibrationRole::LfoRateHz
-                    )
-                }) {
-                    ep.knob_class = KnobAcousticClass::ClassIIIPitchDelayTime;
-                    ep.delta_t_mem_ms = ep.delta_t_mem_ms.max(50.0);
-                }
                 let is_master = ep.is_master_volume_stage;
                 let probe_spread = ep.spectral_shape_spread;
                 let mode = select_sweep_execution_mode(

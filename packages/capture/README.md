@@ -1,8 +1,8 @@
 # `dnam-capture` — Pure-IO Capture, `.dnam-proj` (`DNPJ`) Container & `VarPro` Engine
 
-**`dnam-capture`** (`packages/capture/`) is the 100% safe-Rust (`#![forbid(unsafe_code)]`, `wasm32`-safe) pure IO-buffer capture, single-file `.dnam-proj` (`DNPJ`, `v3.0` `"sona"` `zerocopy` cutover in Phase 5) project container, and `SONA` (`32-bit WebGPU` + Host-`f64` `VarPro`) system-identification crate for **Dynamic Neural Audio Modeler (DNAM)**.
+**`dnam-capture`** (`packages/capture/`) is the 100% safe-Rust (`#![forbid(unsafe_code)]`, `wasm32`-safe) pure IO-buffer capture, single-file `.dnam-proj` (`DNPJ`, `v3.0` `"sona"` `zerocopy`) project container, and `SONA v3.0` orchestration crate for **Dynamic Neural Audio Modeler (DNAM)**.
 
-By linking [`dnam-engine`](../engine/README.md) directly (`engine <- capture` `[dependencies]`, `fixtures <- capture` `[dev-dependencies]`), `dnam-capture` executes the exact `#![no_std]` + `alloc` DSP operators (`Op-T`, `Op-M`, `Op-N`), `SONA` `v3.0` (`TPT-SVF` + `1D ParaLRU` + `PolyADAA1` + `Stage III FIR+Kautz`) + `32-bit WebGPU` / `VarPro` kernels (`Phases 4–5`), `3 kHz` Parametric Control Bus, and `.dnam` binary framing across native hosts (`wgpu` / CPU `DynamicTrainer`), Node.js `N-API`, Browser `WebWorker`s, and Cloudflare Workers (`ref[arch.isomorphism.two-sweep]`, [`sona_architecture.md`](../../docs/specs/architecture/sona_architecture.md), [`ADR-0020`](../../docs/adr/0020-modular-monorepo-and-dnam-proj-container.md), [`ADR-0022`](../../docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md)).
+By linking [`dnam-engine`](../engine/README.md), [`dnam-train`](../train/README.md), `dnam-vm`, and `dnam-kernels` directly, `dnam-capture` executes the exact `#![no_std]` + `alloc` DSP operators (`Op-T`, `Op-M`, `Op-N`), `SONA v3.0` (`TPT-SVF` + `1D ParaLRU` + `PolyADAA1` + `ModalConvolver` + `Op-T`), `32-bit WebGPU`/CPU adjoint + `VarPro` training kernels, `3 kHz` Parametric Control Bus, and `.dnam` / `.dnam-bin` framing across native hosts (`wgpu` / CPU SIMD), Node.js `N-API`, Browser `WebWorker`s, and Cloudflare Workers (`ref[arch.isomorphism.two-sweep]`, [`sona_architecture.md`](../../docs/specs/architecture/sona_architecture.md), [`ADR-0020`](../../docs/adr/0020-modular-monorepo-and-dnam-proj-container.md), [`ADR-0022`](../../docs/adr/0022-sona-state-space-operator-and-webgpu-architecture.md)).
 
 ---
 
@@ -67,8 +67,7 @@ packages/capture/
 ├── tests/
 │   ├── proj_suite.rs                # .dnam-proj Range, DAU1/AUTH & vault suites (proj_suite/*)
 │   ├── stimulus_and_align_suite.rs  # Stimulus, alignment, bit-depth & spec suites (stimulus_and_align_suite/*)
-│   ├── solver_suite.rs              # VarPro oracles, chains, adversaries & audit suites (solver_suite/*)
-│   └── qualification_matrix.rs      # Full 13x4 & v3 qualification (--ignored; run via capture:qualify)
+│   └── solver_suite.rs              # VarPro oracles, chains, adversaries & audit suites (solver_suite/*)
 └── benches/
     └── bench_capture.rs        # Criterion Cholesky, compact_to_capsules & export_runtime_dnam
 ```
@@ -84,6 +83,6 @@ moon check capture
 # Enforce >= 95% line coverage
 moon run capture:coverage
 
-# Run full multi-chain --release acoustic qualification matrices
+# Run ignored / extended qualification tests
 moon run capture:qualify
 ```

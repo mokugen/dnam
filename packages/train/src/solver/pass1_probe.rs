@@ -4,7 +4,11 @@
 //! `32/48/96/128`, stereo comb `Op-T` ID, and zero-init `Op-N[Pre]`,
 //! `ref[train.pipeline.physics-probe]`).
 
-use core::f64::consts::{PI, TAU};
+pub(crate) mod kautz_fit;
+
+pub use kautz_fit::synth_kautz_unit_mode;
+
+use core::f64::consts::TAU;
 
 use dnam_kernels::{HilbertH1StereoKernel, PhasorQ32Bank4, T1DcBlockerStereo, T1SubHarmonicKernel};
 
@@ -12,7 +16,12 @@ use crate::control::stability::MIN_DELAY_CROSSBAR_SAMP;
 use crate::error::TrainError;
 use crate::linalg::cholesky::solve_uplo_adaptive_ridge;
 
-use super::model::{KautzPairF64, NUM_FIR_TAPS_ULTRA, NUM_KAUTZ_PAIRS_ULTRA, SonaModelF64};
+use super::model::{NUM_FIR_TAPS_ULTRA, NUM_KAUTZ_PAIRS_ULTRA, SonaModelF64, TransportQuadF64};
+use super::pass2_opt::eval_op_t_quad_stereo_and_adjoint;
+use kautz_fit::{
+    KautzFitInputs, append_log_octave_h2_candidates, fit_early_fir_taps, fit_joint_kautz_bank,
+    residual_after_fir,
+};
 
 /// Summary returned by the `< 0.5 ms` CPU `Op-P` quadrature & pitch probe.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -299,7 +308,7 @@ pub fn steiglitz_mcbride_poles(
     }
     let in_e: f64 = input[..n].iter().map(|v| v * v).sum();
     let mut a = if in_e > 1.0e-12 {
-        let m = order.min(12);
+        let m = order.min(24);
         let mut cur_a = vec![0.0_f64; m];
         for _ in 0..iters.clamp(1, 6) {
             let xf = filter_all_pole_inverse(&input[..n], &cur_a);
@@ -352,7 +361,10 @@ pub fn steiglitz_mcbride_poles(
             continue;
         }
         let r = (re * re + im * im).sqrt().clamp(0.0, 0.9995);
-        let theta = im.abs().atan2(re).clamp(1.0e-4, PI - 1.0e-4);
+        let theta = im
+            .abs()
+            .atan2(re)
+            .clamp(1.0e-4, core::f64::consts::PI - 1.0e-4);
         if !pairs
             .iter()
             .any(|&(pr, pt)| (pr - r).abs() < 1.0e-3 && (pt - theta).abs() < 1.0e-3)
@@ -362,89 +374,6 @@ pub fn steiglitz_mcbride_poles(
     }
     pairs.sort_by(|x, y| y.0.total_cmp(&x.0));
     pairs
-}
-
-/// Evaluates one unit-excitation complex conjugate Kautz basis waveform `[0..n]` for `(r, theta)`.
-#[must_use]
-pub fn synth_kautz_unit_mode(r: f64, theta: f64, input: &[f64]) -> (Vec<f64>, Vec<f64>) {
-    let n = input.len();
-    let (mut out_re, mut out_im) = (vec![0.0_f64; n], vec![0.0_f64; n]);
-    let ar = r * theta.cos();
-    let ai = r * theta.sin();
-    let (mut sr, mut si) = (0.0_f64, 0.0_f64);
-    for t in 0..n {
-        let next_r = ar * sr - ai * si + input[t];
-        let next_i = ai * sr + ar * si;
-        sr = next_r;
-        si = next_i;
-        out_re[t] = sr;
-        out_im[t] = si;
-    }
-    (out_re, out_im)
-}
-
-fn solve_kautz_2x2(res: &[f64], mr: &[f64], mi: &[f64]) -> (f64, f64) {
-    let n = res.len().min(mr.len()).min(mi.len());
-    let (mut s_rr, mut s_ri, mut s_ii, mut r0, mut r1) =
-        (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
-    for t in 0..n {
-        let m_r = mr[t];
-        let m_i = mi[t];
-        let y = res[t];
-        s_rr += m_r * m_r;
-        s_ri += m_r * m_i;
-        s_ii += m_i * m_i;
-        r0 += y * m_r;
-        r1 -= y * m_i;
-    }
-    let g00 = 4.0 * s_rr + 1.0e-6;
-    let g01 = -4.0 * s_ri;
-    let g11 = 4.0 * s_ii + 1.0e-6;
-    let rhs0 = 2.0 * r0;
-    let rhs1 = 2.0 * r1;
-    let det = g00 * g11 - g01 * g01;
-    if !det.is_finite() || det <= 1.0e-18 {
-        return (0.0, 0.0);
-    }
-    let c_re = ((g11 * rhs0 - g01 * rhs1) / det).clamp(-8.0, 8.0);
-    let c_im = ((-g01 * rhs0 + g00 * rhs1) / det).clamp(-8.0, 8.0);
-    (c_re, c_im)
-}
-
-fn fit_early_fir_taps(input: &[f64], target: &[f64], num_taps: usize) -> [f64; NUM_FIR_TAPS_ULTRA] {
-    let mut taps = [0.0_f64; NUM_FIR_TAPS_ULTRA];
-    let p = num_taps.min(NUM_FIR_TAPS_ULTRA);
-    let n = input.len().min(target.len());
-    if p == 0 || n <= p {
-        return taps;
-    }
-    let packed = p * (p + 1) / 2;
-    let mut g_u = vec![0.0_f64; packed];
-    let mut rhs = vec![0.0_f64; p];
-    for c in 0..p {
-        let col_off = c * (c + 1) / 2;
-        for r in 0..=c {
-            let mut dot = 0.0_f64;
-            for t in p..n {
-                dot += input[t - r] * input[t - c];
-            }
-            if r == c {
-                dot += 1.0e-5;
-            }
-            g_u[col_off + r] = dot;
-        }
-        let mut rd = 0.0_f64;
-        for t in p..n {
-            rd += target[t] * input[t - c];
-        }
-        rhs[c] = rd;
-    }
-    if let Ok((sol, _)) = solve_uplo_adaptive_ridge(p, &g_u, &rhs, &[], None, 1.0e-5) {
-        for (i, &w) in sol.iter().enumerate() {
-            taps[i] = w.clamp(-8.0, 8.0);
-        }
-    }
-    taps
 }
 
 fn detect_transport_comb_delay(residual: &[f64], max_lag: usize) -> (f64, f64) {
@@ -534,126 +463,39 @@ pub fn run_pass1_probe(
     }
 
     let fir_n = max_fir_taps.clamp(32, NUM_FIR_TAPS_ULTRA);
-    model.fir_l = fit_early_fir_taps(&input_l[..n], &target_l[..n], fir_n);
-    model.fir_r = fit_early_fir_taps(&input_r[..n], &target_r[..n], fir_n);
-    model.active_fir_taps = fir_n;
-
-    let mut res_l = vec![0.0_f64; n];
-    let mut res_r = vec![0.0_f64; n];
-    for t in 0..n {
-        let (mut fl, mut fr) = (0.0_f64, 0.0_f64);
-        for k in 0..fir_n.min(t + 1) {
-            fl += model.fir_l[k] * input_l[t - k];
-            fr += model.fir_r[k] * input_r[t - k];
-        }
-        res_l[t] = target_l[t] - fl;
-        res_r[t] = target_r[t] - fr;
-    }
-
     let start = fir_n.min(n / 4);
     let tgt_l_e: f64 = target_l[start..n].iter().map(|v| v * v).sum::<f64>();
     let tgt_r_e: f64 = target_r[start..n].iter().map(|v| v * v).sum::<f64>();
     let tgt_tot_e = (tgt_l_e + tgt_r_e).max(1.0e-12);
-    let res_l_e: f64 = res_l[start..n].iter().map(|v| v * v).sum();
-    let res_r_e: f64 = res_r[start..n].iter().map(|v| v * v).sum();
 
-    let mut poles: Vec<(f64, f64)> = Vec::new();
-    if res_l_e > 1.0e-6 * tgt_tot_e {
-        poles.extend(steiglitz_mcbride_poles(
-            &input_l[start..n],
-            &res_l[start..n],
-            12,
-            4,
-        ));
-    }
-    if res_r_e > 1.0e-6 * tgt_tot_e {
-        for &(r, th) in &steiglitz_mcbride_poles(&input_r[start..n], &res_r[start..n], 12, 4) {
-            if !poles
-                .iter()
-                .any(|&(pr, pt)| (pr - r).abs() < 1.0e-3 && (pt - th).abs() < 1.0e-3)
-            {
-                poles.push((r, th));
-            }
-        }
-    }
-    poles.sort_by(|x, y| y.0.total_cmp(&x.0));
+    // Step 1: Detect genuine feedback/transport comb echoes (`tau >= 5.0` samples) against an
+    // initial full-length early FIR baseline and accept only when exact `Op-T` lowers residual MSE.
+    let tmp_fir_l = fit_early_fir_taps(&input_l[..n], &target_l[..n], fir_n);
+    let tmp_fir_r = fit_early_fir_taps(&input_r[..n], &target_r[..n], fir_n);
+    let res_fir_l = residual_after_fir(&input_l[..n], &target_l[..n], &tmp_fir_l, fir_n);
+    let res_fir_r = residual_after_fir(&input_r[..n], &target_r[..n], &tmp_fir_r, fir_n);
+    let res_fir_l_e: f64 = res_fir_l[start..n].iter().map(|v| v * v).sum();
+    let res_fir_r_e: f64 = res_fir_r[start..n].iter().map(|v| v * v).sum();
+    let res_fir_tot_e = res_fir_l_e + res_fir_r_e;
 
-    let k_limit = max_kautz_pairs.min(NUM_KAUTZ_PAIRS_ULTRA).min(poles.len());
-    let mut onset_l = vec![0.0_f64; n];
-    let mut onset_r = vec![0.0_f64; n];
-    if n > 16 {
-        onset_l[16..n].copy_from_slice(&input_l[..(n - 16)]);
-        onset_r[16..n].copy_from_slice(&input_r[..(n - 16)]);
-    }
-    let mut res_k_l = res_l.clone();
-    let mut res_k_r = res_r.clone();
-    let mut pair_idx = 0_usize;
-    for &(r, theta) in &poles {
-        if pair_idx >= k_limit {
-            break;
-        }
-        if r <= 0.0 || !r.is_finite() {
-            continue;
-        }
-        let r_eff = r.clamp(0.25, 0.9995);
-        let (mr_l, mi_l) = synth_kautz_unit_mode(r_eff, theta, &onset_l);
-        let (mr_r, mi_r) = synth_kautz_unit_mode(r_eff, theta, &onset_r);
-        let (c_re_l, c_im_l) =
-            solve_kautz_2x2(&res_k_l[start..n], &mr_l[start..n], &mi_l[start..n]);
-        let (c_re_r, c_im_r) =
-            solve_kautz_2x2(&res_k_r[start..n], &mr_r[start..n], &mi_r[start..n]);
-
-        let before_e: f64 = res_k_l[start..n]
-            .iter()
-            .zip(&res_k_r[start..n])
-            .map(|(a, b)| a * a + b * b)
-            .sum();
-        let mut new_e = 0.0_f64;
-        for t in start..n {
-            let dl = res_k_l[t] - 2.0 * (c_re_l * mr_l[t] - c_im_l * mi_l[t]);
-            let dr = res_k_r[t] - 2.0 * (c_re_r * mr_r[t] - c_im_r * mi_r[t]);
-            new_e += dl * dl + dr * dr;
-        }
-        if new_e < before_e * (1.0 - 1.0e-4) {
-            for t in 0..n {
-                res_k_l[t] -= 2.0 * (c_re_l * mr_l[t] - c_im_l * mi_l[t]);
-                res_k_r[t] -= 2.0 * (c_re_r * mr_r[t] - c_im_r * mi_r[t]);
-            }
-            model.kautz[pair_idx] = KautzPairF64 {
-                r_low: r_eff,
-                dr: 0.0,
-                theta,
-                b_gamma: 1.0,
-                c_re_l,
-                c_im_l,
-                c_re_r,
-                c_im_r,
-            };
-            pair_idx += 1;
-        }
-    }
-    model.active_kautz_pairs = pair_idx;
-
-    // Stereo transport comb & feedback detection (`tau >= 5.0` samples across both L and R).
-    let res_k_l_e: f64 = res_k_l[start..n].iter().map(|v| v * v).sum();
-    let res_k_r_e: f64 = res_k_r[start..n].iter().map(|v| v * v).sum();
-    let res_tot_e = res_k_l_e + res_k_r_e;
     let max_lag = ((n - start) / 2).min(4_096);
-    let (lag_l, rho_l) = if res_k_l_e > 1.0e-3 * tgt_tot_e {
-        detect_transport_comb_delay(&res_k_l[start..n], max_lag)
+    let (lag_l, rho_l) = if res_fir_l_e > 1.0e-3 * tgt_tot_e {
+        detect_transport_comb_delay(&res_fir_l[start..n], max_lag)
     } else {
         (0.0, 0.0)
     };
-    let (lag_r, rho_r) = if res_k_r_e > 1.0e-3 * tgt_tot_e {
-        detect_transport_comb_delay(&res_k_r[start..n], max_lag)
+    let (lag_r, rho_r) = if res_fir_r_e > 1.0e-3 * tgt_tot_e {
+        detect_transport_comb_delay(&res_fir_r[start..n], max_lag)
     } else {
         (0.0, 0.0)
     };
-    let (delay_samp, loop_g) = if rho_r > rho_l && lag_r >= MIN_DELAY_CROSSBAR_SAMP {
+    let (mut delay_samp, mut loop_g) = if rho_r > rho_l && lag_r >= MIN_DELAY_CROSSBAR_SAMP {
         (lag_r, rho_r)
     } else {
         (lag_l, rho_l)
     };
+    let mut tgt_no_opt_l = target_l[..n].to_vec();
+    let mut tgt_no_opt_r = target_r[..n].to_vec();
     if delay_samp >= MIN_DELAY_CROSSBAR_SAMP {
         let g_init = loop_g.clamp(0.0, 0.85);
         let delay_l = if lag_l >= MIN_DELAY_CROSSBAR_SAMP {
@@ -668,29 +510,136 @@ pub fn run_pass1_probe(
         };
         let d_l = (delay_l.round() as usize).min(n.saturating_sub(1));
         let d_r = (delay_r.round() as usize).min(n.saturating_sub(1));
-        let wl = estimate_comb_wet_tap(target_l, &res_k_l, start, d_l, g_init);
-        let wr = estimate_comb_wet_tap(target_r, &res_k_r, start, d_r, g_init);
-        let wl_init = if wl.abs() >= 0.05 {
+        let wl = estimate_comb_wet_tap(target_l, &res_fir_l, start, d_l, g_init);
+        let wr = estimate_comb_wet_tap(target_r, &res_fir_r, start, d_r, g_init);
+        let wl_init = if lag_l >= MIN_DELAY_CROSSBAR_SAMP && wl.abs() >= 0.05 {
             wl
-        } else if lag_l >= MIN_DELAY_CROSSBAR_SAMP {
-            0.35
         } else {
             0.0
         };
-        let wr_init = if wr.abs() >= 0.05 {
+        let wr_init = if lag_r >= MIN_DELAY_CROSSBAR_SAMP && wr.abs() >= 0.05 {
             wr
-        } else if lag_r >= MIN_DELAY_CROSSBAR_SAMP {
-            0.35
         } else {
             0.0
         };
-        model.transport_quads[0].delay_samples = [delay_l, delay_r, delay_l, delay_r];
-        model.transport_quads[0].g_loop = g_init;
-        model.transport_quads[0].input_gains = [0.5, 0.5, -0.5, -0.5];
-        model.transport_quads[0].wet_tap_l = [wl_init, 0.0, -wl_init, 0.0];
-        model.transport_quads[0].wet_tap_r = [0.0, wr_init, 0.0, -wr_init];
-        model.transport_quads[0].ext_f32 = delay_l > 120.0 || delay_r > 120.0;
+        let mut accepted = false;
+        if wl_init != 0.0 || wr_init != 0.0 {
+            let cand_tq = TransportQuadF64 {
+                delay_samples: [delay_l, delay_r, delay_l, delay_r],
+                g_loop: g_init,
+                input_gains: [0.5, 0.5, -0.5, -0.5],
+                wet_tap_l: [wl_init, 0.0, -wl_init, 0.0],
+                wet_tap_r: [0.0, wr_init, 0.0, -wr_init],
+                ext_f32: delay_l > 120.0 || delay_r > 120.0,
+                ..TransportQuadF64::default()
+            };
+            let base_l: Vec<f64> = (0..n).map(|t| target_l[t] - res_fir_l[t]).collect();
+            let base_r: Vec<f64> = (0..n).map(|t| target_r[t] - res_fir_r[t]).collect();
+            let (op_l, op_r, _) =
+                eval_op_t_quad_stereo_and_adjoint(&base_l, &base_r, &cand_tq, sample_rate_hz, None);
+            let with_op_t_e: f64 = (start..n)
+                .map(|t| {
+                    let dl = res_fir_l[t] - op_l[t];
+                    let dr = res_fir_r[t] - op_r[t];
+                    dl * dl + dr * dr
+                })
+                .sum();
+            if with_op_t_e < 0.85 * res_fir_tot_e {
+                model.transport_quads[0] = cand_tq;
+                for t in 0..n {
+                    tgt_no_opt_l[t] -= op_l[t];
+                    tgt_no_opt_r[t] -= op_r[t];
+                }
+                accepted = true;
+            }
+        }
+        if !accepted {
+            delay_samp = 0.0;
+            loop_g = 0.0;
+        }
     }
+
+    // Step 2: Fit a 16-tap onset FIR (`CONVOLVER_KAUTZ_ONSET_DELAY_48K = 16`) before extracting
+    // Kautz modal poles so `[16..128]` resonant tails are captured into the shared Kautz bank.
+    let fir_onset_n = fir_n.min(16);
+    let onset_fir_l = fit_early_fir_taps(&input_l[..n], &tgt_no_opt_l, fir_onset_n);
+    let onset_fir_r = fit_early_fir_taps(&input_r[..n], &tgt_no_opt_r, fir_onset_n);
+    let res_16_l = residual_after_fir(&input_l[..n], &tgt_no_opt_l, &onset_fir_l, fir_onset_n);
+    let res_16_r = residual_after_fir(&input_r[..n], &tgt_no_opt_r, &onset_fir_r, fir_onset_n);
+    let start16 = fir_onset_n.min(n / 4);
+    let res_16_l_e: f64 = res_16_l[start16..n].iter().map(|v| v * v).sum();
+    let res_16_r_e: f64 = res_16_r[start16..n].iter().map(|v| v * v).sum();
+    let res_16_tot_e = res_16_l_e + res_16_r_e;
+
+    let k_cap = max_kautz_pairs.min(NUM_KAUTZ_PAIRS_ULTRA);
+    let sm_end = n.min(start16 + 16_384);
+    let mut poles: Vec<(f64, f64)> = Vec::new();
+    if res_16_l_e > 1.0e-6 * tgt_tot_e && sm_end > start16 + 24 {
+        poles.extend(steiglitz_mcbride_poles(
+            &input_l[start16..sm_end],
+            &res_16_l[start16..sm_end],
+            16,
+            4,
+        ));
+    }
+    if res_16_r_e > 1.0e-6 * tgt_tot_e && sm_end > start16 + 24 {
+        for &(r, th) in
+            &steiglitz_mcbride_poles(&input_r[start16..sm_end], &res_16_r[start16..sm_end], 16, 4)
+        {
+            if !poles
+                .iter()
+                .any(|&(pr, pt)| (pr - r).abs() < 1.0e-3 && (pt - th).abs() < 1.0e-3)
+            {
+                poles.push((r, th));
+            }
+        }
+    }
+    poles.sort_by(|x, y| y.0.total_cmp(&x.0));
+    if res_16_tot_e > 1.0e-5 * tgt_tot_e {
+        append_log_octave_h2_candidates(&mut poles, sample_rate_hz, k_cap);
+    }
+
+    let (accepted_kautz, res_after_k_l, res_after_k_r) = fit_joint_kautz_bank(&KautzFitInputs {
+        candidates: &poles,
+        input_l: &input_l[..n],
+        input_r: &input_r[..n],
+        res_in_l: &res_16_l,
+        res_in_r: &res_16_r,
+        start: start16,
+        k_limit: k_cap,
+    });
+    let pair_idx = accepted_kautz.len().min(NUM_KAUTZ_PAIRS_ULTRA);
+    for (idx, pair) in accepted_kautz.into_iter().take(pair_idx).enumerate() {
+        model.kautz[idx] = pair;
+    }
+    model.active_kautz_pairs = pair_idx;
+
+    // Reconstruct `(tgt_no_opt - kautz_out)` for Step 3 final early FIR fitting.
+    let mut tgt_for_fir_l = vec![0.0_f64; n];
+    let mut tgt_for_fir_r = vec![0.0_f64; n];
+    for t in 0..n {
+        let mut fl_16 = 0.0_f64;
+        let mut fr_16 = 0.0_f64;
+        for k in 0..fir_onset_n.min(t + 1) {
+            fl_16 += onset_fir_l[k] * input_l[t - k];
+            fr_16 += onset_fir_r[k] * input_r[t - k];
+        }
+        tgt_for_fir_l[t] = res_after_k_l[t] + fl_16;
+        tgt_for_fir_r[t] = res_after_k_r[t] + fr_16;
+    }
+
+    // Step 3: Fit the full `fir_n`-tap early FIR on the post-Op-T, post-Kautz target.
+    model.fir_l = fit_early_fir_taps(&input_l[..n], &tgt_for_fir_l, fir_n);
+    model.fir_r = fit_early_fir_taps(&input_r[..n], &tgt_for_fir_r, fir_n);
+    model.active_fir_taps = fir_n;
+
+    let final_res_l = residual_after_fir(&input_l[..n], &tgt_for_fir_l, &model.fir_l, fir_n);
+    let final_res_r = residual_after_fir(&input_r[..n], &tgt_for_fir_r, &model.fir_r, fir_n);
+    let res_tot_e: f64 = final_res_l[start..n]
+        .iter()
+        .zip(&final_res_r[start..n])
+        .map(|(a, b)| a * a + b * b)
+        .sum();
 
     model.op_n_pre_gamma_bc = 0.0;
     model.op_n_pre_zoh_hold_depth = 0.0;

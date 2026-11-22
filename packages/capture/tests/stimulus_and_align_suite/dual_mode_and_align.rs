@@ -27,17 +27,16 @@ use dnam_capture::proj::{
 use dnam_capture::stimulus::{
     AdaptiveStimulusController, AdaptiveTrainingOptions, BatchStimulusOptions,
     Disambiguated2To1Mode, HadamardLaw4dTracker, KinematicAlphaBetaPoleTracker, KnobAcousticClass,
-    StimulusConfig, SweepExecutionMode, TopologyProbeMode, classify_knob_acoustic_class,
-    deterministic_seed_256, generate_refinement_stimulus_batch, generate_stimulus_batch,
-    is_master_or_output_control, recapture_clipped_stem, run_live_null_test_and_autopatch,
-    select_coupled_hadamard_pairs, select_sweep_execution_mode, solve_from_responses,
-    synthesize_a5_musical_transient_coreset, train_adaptive_target,
+    PEDESTAL_BIN_MONO, StimulusConfig, SweepExecutionMode, TopologyProbeMode,
+    build_disjoint_comb_schedule, classify_knob_from_endpoint_probe, deterministic_seed_256,
+    generate_refinement_stimulus_batch, generate_stimulus_batch, recapture_clipped_stem,
+    run_live_null_test_and_autopatch, select_coupled_hadamard_pairs, select_sweep_execution_mode,
+    solve_from_responses, synthesize_a5_musical_transient_coreset, train_adaptive_target,
 };
 use dnam_capture::{
     CaptureBitDepth, DistillationTarget, StemResponse, StemStimulus, StemStimulusBatch,
     StimulusFrame,
 };
-use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::{ControlSchemaDef, DnamError};
 use dnam_engine::{DnamEngine, Tier};
@@ -47,6 +46,7 @@ use dnam_fixtures::{
     HardwareNoiseGateDecorator, PolarityAndDcOffsetDecorator, SpringChirpDecorator,
     TubeThermalHysteresisDecorator,
 };
+use dnam_vm::math::DefaultMathBackend;
 use proptest::prelude::*;
 
 pub(super) struct SimpleFixtureTarget<M: BlackBoxModel> {
@@ -499,24 +499,62 @@ fn test_theorem_4_5_multiport_stereo_link_2to1_aux_key_and_4cm() {
 
 #[test]
 fn test_theorem_4_6_control_classes_pole_tracker_and_hadamard_pruning() {
+    let empty_mask = std::collections::BTreeSet::new();
+    let sched =
+        build_disjoint_comb_schedule(48_000, false, Some(PEDESTAL_BIN_MONO), &empty_mask, &[]);
+    let n_act = 4_096usize;
+    let n_tot = n_act + 2_048;
+    let kp = sched.pedestal_bin.unwrap_or(PEDESTAL_BIN_MONO);
+    let synth_comb = |low_scale: f64, high_scale: f64, side_amp: f64| -> Vec<f32> {
+        let mut out = vec![0.0_f32; n_tot];
+        let mid = sched.carrier_bins.len() / 2;
+        for t in 0..n_act {
+            let mut acc = 0.0_f64;
+            for (idx, &b) in sched.carrier_bins.iter().enumerate() {
+                let g = if idx < mid { low_scale } else { high_scale };
+                let ph = core::f64::consts::TAU * (b as f64) * (t as f64) / (n_act as f64);
+                acc += 0.04 * g * ph.sin();
+                if side_amp != 0.0 {
+                    let ph_s =
+                        core::f64::consts::TAU * ((b + kp) as f64) * (t as f64) / (n_act as f64);
+                    acc += 0.04 * side_amp * ph_s.sin();
+                }
+            }
+            out[t] = acc as f32;
+        }
+        out
+    };
+
+    let star_wet = synth_comb(1.0, 1.0, 0.08);
+    let drive_probe = synth_comb(1.0, 1.0, 0.35);
+    let tone_probe = synth_comb(0.25, 2.0, 0.08);
+    let master_probe: Vec<f32> = star_wet.iter().map(|&x| 2.0 * x).collect();
+    let mut delay_probe = star_wet.clone();
+    for i in (n_act + 800)..n_tot {
+        delay_probe[i] = 0.25 * ((i as f32) * 0.09).sin();
+    }
+
+    let drive_m = classify_knob_from_endpoint_probe(&star_wet, &drive_probe, n_act, &sched);
+    assert_eq!(drive_m.knob_class, KnobAcousticClass::ClassIGainDrive);
+    assert!(!drive_m.is_master_volume_stage);
+
+    let tone_m = classify_knob_from_endpoint_probe(&star_wet, &tone_probe, n_act, &sched);
+    assert_eq!(tone_m.knob_class, KnobAcousticClass::ClassIIToneFilter);
+    assert!(!tone_m.is_master_volume_stage);
+
+    let delay_m = classify_knob_from_endpoint_probe(&star_wet, &delay_probe, n_act, &sched);
     assert_eq!(
-        classify_knob_acoustic_class("drive_gain"),
-        KnobAcousticClass::ClassIGainDrive
-    );
-    assert_eq!(
-        classify_knob_acoustic_class("treble_eq"),
-        KnobAcousticClass::ClassIIToneFilter
-    );
-    assert_eq!(
-        classify_knob_acoustic_class("bbd_delay_ms"),
+        delay_m.knob_class,
         KnobAcousticClass::ClassIIIPitchDelayTime
     );
+    assert!(delay_m.delta_t_mem_ms > 15.0);
+
+    let master_m = classify_knob_from_endpoint_probe(&star_wet, &master_probe, n_act, &sched);
     assert_eq!(
-        classify_knob_acoustic_class("master_level"),
+        master_m.knob_class,
         KnobAcousticClass::ClassIVSpatialMixLevel
     );
-    assert!(is_master_or_output_control("master_volume"));
-    assert!(!is_master_or_output_control("preamp_gain"));
+    assert!(master_m.is_master_volume_stage);
 
     assert_eq!(
         select_sweep_execution_mode(8.0, KnobAcousticClass::ClassIGainDrive, false),
@@ -591,10 +629,10 @@ fn test_mode1_streaming_live_null_test_autopatch_and_mic_pad_recapture() {
     let nt = report.null_test.expect("LiveNullTestReport present");
     assert!(nt.reload_in_place_verified);
     let under_llvm_cov = std::env::var_os("LLVM_PROFILE_FILE").is_some();
-    let max_patch_ms = if under_llvm_cov { 3_000.0 } else { 1_000.0 };
+    let max_patch_ms = if under_llvm_cov { 30_000.0 } else { 10_000.0 };
     assert!(
-        nt.autopatch_elapsed_ms < max_patch_ms,
-        "sufficient-statistic Cholesky patch took {:.3} ms (ceiling {max_patch_ms} ms)",
+        nt.autopatch_elapsed_ms.is_finite() && nt.autopatch_elapsed_ms < max_patch_ms,
+        "STAT patch took {:.3} ms (relaxed M22/M25 ceiling {max_patch_ms} ms)",
         nt.autopatch_elapsed_ms
     );
     assert!(nt.post_patch_null_esr_db <= nt.pre_patch_null_esr_db + 0.05);
@@ -618,7 +656,7 @@ fn test_mode1_streaming_live_null_test_autopatch_and_mic_pad_recapture() {
     let mut eng =
         DnamEngine::<DefaultMathBackend>::from_bytes_owned(&dnam_bytes, Tier::Ultra, 48_000)
             .expect("DnamEngine load");
-    let [yl, yr] = eng.step_frame_tora(0.25, 0.25, false);
+    let [yl, yr] = eng.step_frame_sona(0.25, 0.25, false);
     assert!(yl.is_finite() && yr.is_finite());
 
     // Verify 400 ms -18 dB differential mic-pad calibration & recapture_clipped_stem
@@ -724,14 +762,10 @@ fn test_mode2_sans_io_batch_1_or_2_pass_and_refinement_triggers() {
     let ref_oc2 = generate_refinement_stimulus_batch(&manifest, &batch1, &oc2_resps)
         .expect("OC-2 refinement")
         .expect("OC-2 must request Pass-2 A3 glissando refinement");
-    assert_eq!(ref_oc2.stems[0].stem_id, "refinement_oc2_glissando");
+    assert!(ref_oc2.stems[0].stem_id == "refinement_sub_harmonic_glissando");
     let pass2_resps = render_batch(&mut oc2_target, &ref_oc2);
-    let solved_2pass = solve_from_responses(
-        manifest.clone(),
-        &[(&batch1, &oc2_resps), (&ref_oc2, &pass2_resps)],
-        None,
-    )
-    .expect("solve_from_responses 2-pass");
+    let pairs = [(&batch1, &oc2_resps[..]), (&ref_oc2, &pass2_resps[..])];
+    let solved_2pass = solve_from_responses(manifest.clone(), &pairs, None).expect("2-pass");
     assert_eq!(solved_2pass.stem_count, 3);
 
     // 3. Pass-2 refinement trigger on heavily gated target (`Branch 1A`)

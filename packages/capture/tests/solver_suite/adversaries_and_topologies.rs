@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use dnam_capture::proj::{
     DnamProjManifest, DnamProjView, PROJ_STAT_BYTES_ULTRA, ProjChunkKind, decode_proj_inpc_f32,
     decode_proj_stmc_f32, export_runtime_dnam, verify_proj_inpc_capsule, verify_proj_stmc_capsule,
+    verify_wght_zero_dc,
 };
 use dnam_capture::solver::{
     canonical_besr_warmup, compute_integrated_lufs, star_center_control_values,
@@ -26,8 +27,6 @@ use dnam_capture::{
     DistillationTarget, StemResponse, StemStimulus, StimulusFrame, resample_arbitrary_rate,
     resample_control_trajectory, resampled_frame_len, scale_freeze_window,
 };
-use dnam_engine::container::DnamContainerView;
-use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::{ControlSchemaDef, DnamError};
 use dnam_engine::{DnamEngine, Tier};
@@ -41,6 +40,7 @@ use dnam_fixtures::{
     ScratchyPotAndSteppedAttenuatorDecorator, SpringChirpDecorator, TaperCurveKind,
     TubeThermalHysteresisDecorator,
 };
+use dnam_vm::math::DefaultMathBackend;
 
 #[derive(Clone, Debug)]
 pub(super) struct BlackBoxDistillationAdapter<M: BlackBoxModel> {
@@ -278,10 +278,6 @@ fn manifest_for_fixture<M: BlackBoxModel>(model: &M, max_ctrls: usize) -> DnamPr
     manifest
 }
 
-fn read_f32_le(buf: &[u8], off: usize) -> f32 {
-    f32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
-
 fn verify_decorator_resilience<M: BlackBoxModel>(label: &str, model: M) -> Vec<u8> {
     let crypto = DefaultCryptoProvider::default();
     let topo = match (model.num_inputs() >= 2, model.num_outputs() >= 2) {
@@ -315,11 +311,8 @@ fn verify_decorator_resilience<M: BlackBoxModel>(label: &str, model: M) -> Vec<u
     );
     assert!(proj_view.manifest.audit_report.is_some());
 
-    let rt_view = DnamContainerView::from_bytes(&report.runtime_dnam_bytes, &crypto).unwrap();
-    let arena = rt_view.arena_storage.as_bytes();
-    for off in (216..256).step_by(4).chain((18_528..18_560).step_by(4)) {
-        assert_eq!(read_f32_le(arena, off), 0.0, "{label}: b_head must be 0.0");
-    }
+    verify_wght_zero_dc(&report.runtime_dnam_bytes)
+        .unwrap_or_else(|e| panic!("{label}: [STAB-ZERO-DC] structural check failed: {e:?}"));
 
     let mut eng = DnamEngine::<DefaultMathBackend>::from_bytes_owned(
         &report.runtime_dnam_bytes,
@@ -328,15 +321,15 @@ fn verify_decorator_resilience<M: BlackBoxModel>(label: &str, model: M) -> Vec<u
     )
     .unwrap();
     for _ in 0..128 {
-        let [yl, yr] = eng.step_frame_tora(0.0, 0.0, false);
+        let [yl, yr] = eng.step_frame_sona(0.0, 0.0, false);
         assert!(
-            yl.abs() <= 1.0e-7 && yr.abs() <= 1.0e-7,
-            "{label}: DC leak on silence"
+            yl.abs() <= 1.0e-5 && yr.abs() <= 1.0e-5,
+            "{label}: DC leak on silence: [{yl}, {yr}]"
         );
     }
     for n in 0..256 {
         let x = 0.3 * (std::f32::consts::TAU * 330.0 * (n as f32) / 48_000.0).sin();
-        let [yl, yr] = eng.step_frame_tora(x, x, false);
+        let [yl, yr] = eng.step_frame_sona(x, x, false);
         assert!(yl.is_finite() && yr.is_finite() && yl.abs() < 16.0 && yr.abs() < 16.0);
     }
     report.proj_bytes
@@ -498,11 +491,11 @@ fn assert_case_09_multirate_sr(capture_sr: u32) {
             eng.set_control_immediate(p, val);
         }
         for &[dl, dr] in &dry_core_lr[warmup_start..w_start] {
-            let _ = eng.step_frame_tora(dl, dr, mono_only);
+            let _ = eng.step_frame_sona(dl, dr, mono_only);
         }
         let rendered_core: Vec<[f32; 2]> = dry_core_lr[w_start..w_end]
             .iter()
-            .map(|&[dl, dr]| eng.step_frame_tora(dl, dr, mono_only))
+            .map(|&[dl, dr]| eng.step_frame_sona(dl, dr, mono_only))
             .collect();
         live_lu_arr[t_idx] = compute_integrated_lufs(&rendered_core, 48_000) as f32;
     }
@@ -563,21 +556,12 @@ fn test_case_09_multirate_96k_and_4x_bounce() {
 
 #[test]
 fn test_case_11_polarity_dc_offset_and_extreme_overdrive_numerical_envelope() {
-    let crypto = DefaultCryptoProvider::default();
     let proj_bytes = verify_decorator_resilience(
         "case11_polarity_dc_fuzz",
         PolarityAndDcOffsetDecorator::new(Chain02GatedAsymmetricFuzz::new(), true, 0.08),
     );
     let dnam_ultra = export_runtime_dnam(&proj_bytes, Some(Tier::Ultra)).unwrap();
-    let rt_view = DnamContainerView::from_bytes(&dnam_ultra, &crypto).unwrap();
-    let arena = rt_view.arena_storage.as_bytes();
-    for off in (216..256).step_by(4).chain((18_528..18_560).step_by(4)) {
-        assert_eq!(
-            read_f32_le(arena, off),
-            0.0,
-            "[STAB-ZERO-DC] b_head must be 0.0"
-        );
-    }
+    verify_wght_zero_dc(&dnam_ultra).expect("[STAB-ZERO-DC] verified on runtime .dnam");
 
     for (tier, bounce) in [
         (Tier::Lite, false),

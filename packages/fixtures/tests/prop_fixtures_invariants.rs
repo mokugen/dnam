@@ -3,8 +3,8 @@
 //! Unit tests for individual signal chains and hardware impairment decorators live
 //! inside their respective submodules (`src/chains/**`, `src/adversaries/**`).
 //! This integration suite verifies:
-//! 1. Individual per-control and per-switch non-zero sensitivity across all 12 ground-truth chains.
-//! 2. Resting zero-DC equilibrium (`inputs = 0 -> outputs = 0`) across all 12 chains.
+//! 1. Individual per-control and per-switch non-zero sensitivity across all 18 ground-truth chains.
+//! 2. Resting zero-DC equilibrium (`inputs = 0 -> outputs = 0`) across all 18 chains.
 //! 3. `0 ULP` `reset()` == `new()` == `Default::default()` determinism across all chains & decorators.
 //! 4. Stereo channel isolation (zero L/R crosstalk vs dual-mono) on stereo decorators.
 //! 5. Multi-sample-rate (`8 / 16 / 44.1 / 48 / 88.2 / 96 / 192 kHz`) & multi-bit-depth (`12 / 16 / 24 / 32-bit` PCM & `f32`)
@@ -19,7 +19,8 @@ use dnam_fixtures::{
     Chain06EnvelopeResonantSvf, Chain07StereoChorusAndRotary, Chain08LongBbdEchoAnd30sShimmer,
     Chain09La2aOpticalCompressor, Chain10Oc2OctaveDividerAndRingMod, Chain11BiAmpBassAndOutputIron,
     Chain12FullEndToEndStereoRig, Chain12RigMode, Chain13TriBandVcaCompressor,
-    Chain14TriBandCompDistortion, Chain15TubeAmpHeadDi, ConverterLoopbackDecorator,
+    Chain14TriBandCompDistortion, Chain15TubeAmpHeadDi, Chain16GranularPitchShimmer,
+    Chain17BarberpoleSweep, Chain18ZohQuantizerBitcrusher, ConverterLoopbackDecorator,
     DEFAULT_FIXTURE_SAMPLE_RATE_HZ, DigitalQuirksDecorator, FixtureBitDepth,
     GermaniumTempDriftDecorator, HardwareNoiseGateDecorator, HumanHandTrajectoryDecorator,
     IdleSquealDecorator, MainsHumAndNoiseFloorDecorator, MicrophoneCapsuleClipDecorator,
@@ -69,6 +70,9 @@ fn build_all_chains() -> Vec<Box<dyn BlackBoxModel>> {
         Box::new(Chain13TriBandVcaCompressor::new()),
         Box::new(Chain14TriBandCompDistortion::new()),
         Box::new(Chain15TubeAmpHeadDi::new()),
+        Box::new(Chain16GranularPitchShimmer::new()),
+        Box::new(Chain17BarberpoleSweep::new()),
+        Box::new(Chain18ZohQuantizerBitcrusher::new()),
     ]
 }
 
@@ -724,7 +728,7 @@ fn test_decorators_preserve_arbitrary_continuous_controls_above_16() {
     d_sq.process_frame(&[0.5], &mut out, &ctrls20, &[]);
     assert!((d_sq.inner.last_ctrl19 - 0.8).abs() < 1.0e-6);
 
-    // 4. Impulse-to-silence tail across all 12 chains and Polarity/Loopback decorators must emit zero IEEE-754 subnormals
+    // 4. Impulse-to-silence tail across all 18 chains and Polarity/Loopback decorators must emit zero IEEE-754 subnormals
     assert_eq!(
         PolarityAndDcOffsetDecorator::<Chain01SymmetricOd>::sanitize_sample(f32::MIN_POSITIVE),
         (f32::MIN_POSITIVE, false)

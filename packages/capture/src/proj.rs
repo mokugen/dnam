@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
-//! Single-File Cloud-Ready `.dnam-proj` (`DNPJ`, `v2.0`-Only) Project & Capture Vault Container (`dnam_capture::proj`).
+//! Single-File Cloud-Ready `.dnam-proj` (`DNPJ`, `v3.0`, `"sona"`) Project & Capture Vault Container (`dnam_capture::proj`).
 //!
 //! Unifies capture projects, stem capsules, sufficient statistics, and runtime `.dnam` weights
 //! inside a single `64 B`-aligned cloud-ready container featuring:
 //! - Front-loaded `64 B` Preamble + `64 B * N` Chunk Directory (`crc32c` + `sha256`) + RFC 8785 JCS
 //!   `DnamProjManifest` at byte `0` for `HTTP Range: bytes=0-65535` inspection (`parse_proj_manifest_range`).
 //! - `CALB`, `SPCM`, `INPC` (`384,640 B` / `768,640 B`), `STMC` (`388,800 B` / `772,800 B`), `STAT`
-//!   (`267,264 B` `StarCenter` `uplo='U'`), `WGHT` (`[STAB-ZERO-DC]` runtime `.dnam`), and `AUTH` chunks.
+//!   (`267,264 B` `StarCenter` `uplo='U'`), `WGHT` (`v3.0` `"sona"` `.dnam` wrapping `.dnam-bin`), and `AUTH` chunks.
 //! - `< 1 ms` `compact_to_capsules`, `< 0.2 ms` `export_runtime_dnam`, and Two-Path Capture Vault
 //!   editing (`add_capture`, `remove_capture`, `replace_capture`, `set_capture_enabled`).
 //!
@@ -20,9 +20,10 @@ pub mod vault;
 
 pub use bundle::{
     DnamProjView, ProjChunkInput, attach_proj_auth_signature, build_dnam_proj_container,
-    build_dnam_proj_container_with_cp1, build_dnam_proj_container_with_crypto, compact_to_capsules,
-    export_runtime_dnam, export_runtime_dnam_with_crypto, verify_arena_b_head_zero_dc,
-    zero_arena_b_head_dc_bias,
+    build_dnam_proj_container_with_cp1, build_dnam_proj_container_with_crypto,
+    build_dnam_proj_container_with_dnam_bin, compact_to_capsules, export_runtime_dnam,
+    export_runtime_dnam_bin, export_runtime_dnam_with_crypto, verify_dnam_bin_zero_dc,
+    verify_wght_zero_dc,
 };
 pub use directory::{
     CalbChunk64B, DnamProjPreamble, InpcCapsuleView, ParsedProjManifestRange, ProjAuthRecord,
@@ -54,8 +55,8 @@ pub const INPC_MAGIC: [u8; 4] = *b"INPC";
 /// Magic bytes for an `STMC` `StemCaptureRecord` capsule (`b"STMC"`).
 pub const STMC_MAGIC: [u8; 4] = *b"STMC";
 
-/// Canonical `.dnam-proj` major wire version (`2`).
-pub const PROJ_VERSION_MAJOR: u16 = 2;
+/// Canonical `.dnam-proj` major wire version (`3`).
+pub const PROJ_VERSION_MAJOR: u16 = 3;
 
 /// Canonical `.dnam-proj` minor wire version (`0`).
 pub const PROJ_VERSION_MINOR: u16 = 0;
@@ -105,7 +106,7 @@ pub const PROJ_FLAG_STEREO_OUT: u32 = 1 << 6;
 /// Bit 7: Project was compacted via [`compact_to_capsules`] (`0` `SPCM` chunks retained).
 pub const PROJ_FLAG_COMPACTED_CAPSULES: u32 = 1 << 7;
 
-/// Bitmask of all defined `PROJ_FLAG_*` bits in `v2.0`.
+/// Bitmask of all defined `PROJ_FLAG_*` bits in `v3.0`.
 pub const PROJ_FLAG_KNOWN_MASK: u32 = PROJ_FLAG_HAS_CALIBRATION
     | PROJ_FLAG_HAS_RAW_STEMS
     | PROJ_FLAG_HAS_CAPSULES
@@ -130,7 +131,7 @@ pub const STMC_FLAG_STEREO: u16 = 1 << 3;
 /// Bit 4: Wet return was polarity-inverted prior to alignment normalization.
 pub const STMC_FLAG_WET_POLARITY_INVERTED: u16 = 1 << 4;
 
-/// Bitmask of all defined `STMC_FLAG_*` bits in `v2.0`.
+/// Bitmask of all defined `STMC_FLAG_*` bits in `v3.0`.
 pub const STMC_FLAG_KNOWN_MASK: u16 = STMC_FLAG_ENABLED
     | STMC_FLAG_STAR_CENTER
     | STMC_FLAG_MODE_A_SWEEP
@@ -157,7 +158,7 @@ pub const PROJ_STAT_BYTES_ULTRA: usize = 267_264;
 #[inline]
 #[must_use]
 pub const fn uplo_u_packed_len(n_dim: usize) -> usize {
-    crate::solver::uplo_u_packed_len(n_dim)
+    dnam_train::uplo_u_packed_len(n_dim)
 }
 
 /// Packs a dense row-major symmetric `n_dim × n_dim` `f64` matrix into column-major `uplo='U'`
@@ -267,9 +268,12 @@ pub(crate) fn fp16_bits_to_f32(bits: u16) -> f32 {
 /// (clamping non-finite or out-of-range inputs to finite `binary16`).
 #[must_use]
 pub fn f32_to_fp16_rne_bytes(samples: &[f32]) -> Vec<u8> {
+    use zerocopy::IntoBytes;
+    use zerocopy::byteorder::little_endian::U16;
+
     let mut out = Vec::with_capacity(samples.len() * 2);
     for &s in samples {
-        out.extend_from_slice(&f32_to_fp16_rne_bits(s).to_le_bytes());
+        out.extend_from_slice(U16::new(f32_to_fp16_rne_bits(s)).as_bytes());
     }
     out
 }
@@ -277,11 +281,16 @@ pub fn f32_to_fp16_rne_bytes(samples: &[f32]) -> Vec<u8> {
 /// Decodes little-endian IEEE-754 `fp16` bytes into `f32` samples.
 #[must_use]
 pub fn fp16_bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
-    bytes
-        .as_chunks::<2>()
-        .0
+    use zerocopy::FromBytes;
+    use zerocopy::byteorder::little_endian::U16;
+
+    let even_len = bytes.len() & !1;
+    let Ok(pairs) = <[U16]>::ref_from_bytes(&bytes[..even_len]) else {
+        return Vec::new();
+    };
+    pairs
         .iter()
-        .map(|pair| fp16_bits_to_f32(u16::from_le_bytes(*pair)))
+        .map(|pair| fp16_bits_to_f32(pair.get()))
         .collect()
 }
 

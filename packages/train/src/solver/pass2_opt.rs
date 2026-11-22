@@ -117,7 +117,7 @@ pub fn generate_generic_sobol_seeds(num_seeds: usize, sr_hz: f64) -> Vec<f32> {
         let fc_hz = 40.0 * (12_000.0 / 40.0_f64).powf(u0);
         let fc_ratio = (fc_hz / sr).clamp(1.0e-4, 0.45) as f32;
         let q_val = (0.5 + 1.5 * u1) as f32;
-        let drive = (0.25 * (16.0_f64).powf(u2)) as f32;
+        let drive = (0.25 * (64.0_f64).powf(u2)) as f32;
         let rel = (0.85 + 0.145 * u3) as f32;
         let row: [f32; PRESCREEN_SEED_PARAM_STRIDE] = [
             fc_ratio,
@@ -142,12 +142,237 @@ pub fn generate_generic_sobol_seeds(num_seeds: usize, sr_hz: f64) -> Vec<f32> {
     seeds
 }
 
+struct OctaveQuadSpec {
+    freqs_hz: [f64; 4],
+    k_vals: [f64; 4],
+    tones: [[f64; 4]; 4],
+    lru_rel: [f64; 4],
+    lru_atk: [f64; 4],
+    lru_kap: [f64; 4],
+    sag: [f64; 4],
+    drive: [f64; 4],
+    bias_drive: [f64; 4],
+    wf_mix: [f64; 4],
+    glu: [f64; 4],
+    link: f64,
+}
+
+fn set_octave_quad(quad: &mut super::model::CoreQuadF64, sr_hz: f64, spec: &OctaveQuadSpec) {
+    quad.svf_g = spec.freqs_hz.map(|fc| {
+        (PI * (fc / sr_hz.max(8_000.0)).clamp(1.0e-4, 0.45))
+            .tan()
+            .clamp(f64::from(MIN_TPT_G), 64.0)
+    });
+    quad.svf_k = spec.k_vals;
+    quad.svf_k_nl = [0.0; 4];
+    quad.tone_lp = spec.tones[0];
+    quad.tone_bp = spec.tones[1];
+    quad.tone_hp = spec.tones[2];
+    quad.tone_ap = [0.0; 4];
+    quad.tone_dir = spec.tones[3];
+    quad.lru_alpha_rel = spec.lru_rel;
+    quad.lru_alpha_atk = spec.lru_atk;
+    quad.lru_kappa = spec.lru_kap;
+    quad.lru_duhem_gamma = [0.0; 4];
+    quad.lru_signed_mix = [0.0; 4];
+    quad.lru_stereo_link = [spec.link; 4];
+    quad.sag_depth = spec.sag;
+    quad.adaa_drive = spec.drive;
+    quad.lru_bias_drive = spec.bias_drive;
+    quad.wavefolder_mix = spec.wf_mix;
+    quad.glu_mix = spec.glu;
+    quad.in_mid_weight = [1.0; 4];
+    quad.in_side_weight = [1.0; 4];
+}
+
+/// Populates `core_quads[1..10]` and causal tier inter-block tiles with a strictly
+/// device-agnostic multi-scale TPT-SVF + Selective-Duhem ParaLRU + sag/ADAA basis so all 40 lanes
+/// across `[Lite..Ultra]` offer diverse spectral, dynamic, and nonlinear basis functions
+/// (`REQ-1.9`, `ref[dsp.op-n.core.matryoshka-blocks]`).
+fn init_universal_multiscale_core_quads(model: &mut SonaModelF64, sr_hz: f64) {
+    let bp_split = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ];
+    let bp_only = [[0.0; 4], [1.0; 4], [0.0; 4], [0.0; 4]];
+    let low_oct = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 1.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ];
+    let hi_oct = [
+        [0.0, 0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0, 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+        [0.0, 0.0, 0.0, 0.0],
+    ];
+    let broadband_asym = [
+        [0.25, 0.0, 0.0, 0.0],
+        [0.0, 0.25, 0.0, 0.0],
+        [0.0, 0.0, 0.25, 0.0],
+        [0.75, 0.75, 0.75, 1.0],
+    ];
+
+    let specs = [
+        OctaveQuadSpec {
+            freqs_hz: [85.0, 220.0, 550.0, 1_400.0],
+            k_vals: [1.414; 4],
+            tones: bp_split,
+            lru_rel: [0.996, 0.992, 0.985, 0.970],
+            lru_atk: [0.65, 0.45, 0.25, 0.15],
+            lru_kap: [0.4, 0.6, 0.8, 1.0],
+            sag: [0.45, 0.65, 0.80, 0.90],
+            drive: [0.8, 1.2, 1.8, 2.6],
+            bias_drive: [0.0, 0.15, -0.15, 0.30],
+            wf_mix: [0.0; 4],
+            glu: [0.0; 4],
+            link: 0.5,
+        },
+        OctaveQuadSpec {
+            freqs_hz: [320.0, 900.0, 2_400.0, 6_200.0],
+            k_vals: [1.414; 4],
+            tones: bp_split,
+            lru_rel: [0.994, 0.988, 0.975, 0.950],
+            lru_atk: [0.80, 0.60, 0.35, 0.20],
+            lru_kap: [0.5, 0.7, 0.9, 1.0],
+            sag: [0.60, 0.75, 0.85, 0.92],
+            drive: [1.2, 2.5, 5.0, 10.0],
+            bias_drive: [0.10, -0.20, 0.25, -0.35],
+            wf_mix: [0.0; 4],
+            glu: [0.0; 4],
+            link: 0.8,
+        },
+        OctaveQuadSpec {
+            freqs_hz: [120.0, 600.0, 2_000.0, 7_500.0],
+            k_vals: [1.0; 4],
+            tones: broadband_asym,
+            lru_rel: [0.995, 0.990, 0.980, 0.960],
+            lru_atk: [0.50, 0.35, 0.20, 0.10],
+            lru_kap: [0.3, 0.5, 0.7, 0.9],
+            sag: [0.25, 0.50, 0.75, 0.90],
+            drive: [1.5, 4.5, 12.0, 24.0],
+            bias_drive: [0.25, -0.25, 0.50, -0.50],
+            wf_mix: [0.0; 4],
+            glu: [0.2, -0.2, 0.35, -0.35],
+            link: 0.25,
+        },
+        OctaveQuadSpec {
+            freqs_hz: [70.0, 140.0, 280.0, 560.0],
+            k_vals: [0.87; 4],
+            tones: low_oct,
+            lru_rel: [0.9985, 0.997, 0.993, 0.986],
+            lru_atk: [0.75, 0.55, 0.35, 0.20],
+            lru_kap: [0.6, 0.75, 0.85, 1.0],
+            sag: [0.55, 0.75, 0.88, 0.95],
+            drive: [0.9, 1.6, 2.8, 4.5],
+            bias_drive: [0.0, 0.2, -0.2, 0.3],
+            wf_mix: [0.0; 4],
+            glu: [0.0; 4],
+            link: 1.0,
+        },
+        OctaveQuadSpec {
+            freqs_hz: [1_120.0, 2_240.0, 4_480.0, 8_960.0],
+            k_vals: [0.87; 4],
+            tones: hi_oct,
+            lru_rel: [0.9985, 0.997, 0.993, 0.986],
+            lru_atk: [0.75, 0.55, 0.35, 0.20],
+            lru_kap: [0.6, 0.75, 0.85, 1.0],
+            sag: [0.55, 0.75, 0.88, 0.95],
+            drive: [0.9, 1.8, 3.2, 5.2],
+            bias_drive: [-0.15, 0.2, -0.25, 0.3],
+            wf_mix: [0.0; 4],
+            glu: [0.0; 4],
+            link: 1.0,
+        },
+        OctaveQuadSpec {
+            freqs_hz: [100.0, 350.0, 1_000.0, 3_000.0],
+            k_vals: [0.62, 0.55, 0.55, 0.71],
+            tones: bp_only,
+            lru_rel: [0.995, 0.990, 0.980, 0.960],
+            lru_atk: [0.60, 0.40, 0.25, 0.15],
+            lru_kap: [0.4, 0.6, 0.8, 0.95],
+            sag: [0.30, 0.65, 0.85, 0.94],
+            drive: [1.2, 2.5, 5.0, 8.0],
+            bias_drive: [0.2, -0.3, 0.45, -0.55],
+            wf_mix: [0.0, 0.0, 0.15, 0.30],
+            glu: [0.3, -0.3, 0.5, -0.5],
+            link: 0.5,
+        },
+        OctaveQuadSpec {
+            freqs_hz: [180.0, 700.0, 2_200.0, 6_800.0],
+            k_vals: [1.18; 4],
+            tones: bp_split,
+            lru_rel: [0.997, 0.991, 0.978, 0.940],
+            lru_atk: [0.70, 0.50, 0.30, 0.15],
+            lru_kap: [0.5, 0.7, 0.85, 1.0],
+            sag: [0.50, 0.72, 0.88, 0.95],
+            drive: [1.0, 2.2, 4.2, 7.5],
+            bias_drive: [0.15, -0.25, 0.35, -0.45],
+            wf_mix: [0.0; 4],
+            glu: [0.0; 4],
+            link: 0.75,
+        },
+        OctaveQuadSpec {
+            freqs_hz: [65.0, 190.0, 480.0, 1_300.0],
+            k_vals: [0.83; 4],
+            tones: low_oct,
+            lru_rel: [0.9992, 0.996, 0.980, 0.920],
+            lru_atk: [0.85, 0.50, 0.25, 0.10],
+            lru_kap: [0.6, 0.8, 0.9, 1.0],
+            sag: [0.70, 0.85, 0.93, 0.95],
+            drive: [0.7, 2.2, 4.5, 9.0],
+            bias_drive: [0.35, -0.40, 0.60, -0.65],
+            wf_mix: [0.0, 0.1, 0.25, 0.45],
+            glu: [0.2, -0.25, 0.35, -0.4],
+            link: 1.0,
+        },
+        OctaveQuadSpec {
+            freqs_hz: [2_800.0, 5_200.0, 8_200.0, 11_500.0],
+            k_vals: [0.83; 4],
+            tones: hi_oct,
+            lru_rel: [0.9992, 0.996, 0.980, 0.920],
+            lru_atk: [0.85, 0.50, 0.25, 0.10],
+            lru_kap: [0.6, 0.8, 0.9, 1.0],
+            sag: [0.70, 0.85, 0.93, 0.95],
+            drive: [0.7, 2.2, 4.5, 9.0],
+            bias_drive: [-0.35, 0.40, -0.60, 0.65],
+            wf_mix: [0.0, 0.1, 0.25, 0.45],
+            glu: [-0.2, 0.25, -0.35, 0.4],
+            link: 1.0,
+        },
+    ];
+    for (idx, spec) in specs.iter().enumerate() {
+        set_octave_quad(&mut model.core_quads[idx + 1], sr_hz, spec);
+    }
+    model.core_quads[3].rect_sign = [1.0, -1.0, 1.0, -1.0];
+
+    // Causal multi-stage diagonal coupling across `SONA_INTERBLOCK_TILES` preserving tier prefixes:
+    // `(0,1)=0, (1,2)=1, (2,3)=2, (4,5)=5, (6,7)=18, (5,7)=21, (8,9)=28`.
+    for (tile_idx, gain) in [
+        (0_usize, 0.40_f64),
+        (1, 0.50),
+        (2, 0.55),
+        (5, 0.45),
+        (18, 0.50),
+        (21, 0.30),
+        (28, 0.55),
+    ] {
+        for lane in 0..4 {
+            model.tiles[tile_idx].w_odd_4x4[lane][lane] = gain;
+        }
+    }
+}
+
 fn select_and_unpack_prescreen_winner(
     model: &mut SonaModelF64,
     seed_table: &[f32],
     scores: &[f32],
     n_seeds: usize,
     n_frames: usize,
+    sample_rate_hz: f64,
 ) -> usize {
     let num_tiles = n_frames.div_ceil(TILE_FRAMES).max(1);
     let mut win_idx = 0_usize;
@@ -196,15 +421,16 @@ fn select_and_unpack_prescreen_winner(
     q0.sag_depth = [f64::from(s[13]); 4];
     q0.adaa_drive = [
         d0,
-        (0.5 * d0).clamp(0.25, 16.0),
-        (2.0 * d0).clamp(0.25, 16.0),
-        (4.0 * d0).clamp(0.25, 16.0),
+        (0.5 * d0).clamp(0.25, 30.0),
+        (2.0 * d0).clamp(0.25, 30.0),
+        (4.0 * d0).clamp(0.25, 30.0),
     ];
     q0.lru_bias_drive = [f64::from(s[15]); 4];
     if model.w_ro[0][6].abs() < 1.0e-9 && model.w_ro[0][7].abs() < 1.0e-9 {
         model.w_ro[0][6] = 0.25;
         model.w_ro[0][7] = 0.25;
     }
+    init_universal_multiscale_core_quads(model, sample_rate_hz);
     win_idx
 }
 
@@ -254,7 +480,14 @@ pub fn run_pass2_optimize(
         target_audio: &tgt_pairs,
         seed_params: &seed_table,
     })?;
-    let win_idx = select_and_unpack_prescreen_winner(model, &seed_table, &scores, n_seeds, n);
+    let win_idx = select_and_unpack_prescreen_winner(
+        model,
+        &seed_table,
+        &scores,
+        n_seeds,
+        n,
+        config.sample_rate_hz,
+    );
 
     let q_count = config.active_quads.clamp(1, 10);
     let layout = ThetaLayout {

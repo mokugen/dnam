@@ -59,7 +59,7 @@ pub enum CaptureWarning {
         /// Total count of DFT bins masked out of comb schedule and residual loss.
         masked_bin_count: usize,
     },
-    /// `Law 0.E`: Sub-harmonic flip-flop pitch-divider chatter (`OC-2`) detected; polyphonic multisine
+    /// `Law 0.E`: Sub-harmonic flip-flop pitch-divider chatter detected; polyphonic multisine
     /// capped at `2` frames (`192 ms`) and handed off to `A3` monophonic glissando + `A5` coreset.
     SubHarmonicDividerHandoff {
         /// Stem identifier.
@@ -120,7 +120,7 @@ pub struct SafeguardState {
     /// Cumulative multiplicative excitation scale (`<= 1.0`, `Law 0.D` & `Law 0.F`).
     pub excitation_gain_scale: f64,
     /// True when `Law 0.E` capped polyphonic multisine and handed off to `A3` glissando.
-    pub oc2_glissando_handoff: bool,
+    pub sub_harmonic_glissando_handoff: bool,
     /// Sub-frame quadrature weights `[w_-18dB, w_-6dB, w_0dB]` (`[1.0, 1.0, 0.0]` under `Law 0.F` Case B).
     pub law4c_subframe_weights: [f32; 3],
     /// Measured Frame-0 carrier complex magnitudes on identical schedule (`Law 0.A`).
@@ -157,7 +157,7 @@ impl SafeguardState {
             estimated_memory_ms: 2.0,
             squeal_mask_bins: BTreeSet::new(),
             excitation_gain_scale: 1.0,
-            oc2_glissando_handoff: false,
+            sub_harmonic_glissando_handoff: false,
             law4c_subframe_weights: [1.0, 1.0, 1.0],
             frame0_carrier_mags: None,
             frame0_transfer_ref: None,
@@ -479,10 +479,10 @@ pub fn evaluate_frame_safeguards(
     let (cur_lag, coh_sq) =
         estimate_carrier_phase_lag_samples(dry_win_l, &clean_win, &schedule.carrier_bins);
 
-    // --- Law 0.E: Sub-Harmonic Flip-Flop Divider (`OC-2`) Chatter Detector ---
+    // --- Law 0.E: Sub-Harmonic Flip-Flop Divider Chatter Detector ---
     // Evaluated prior to clock-slip replay so chaotic flip-flop zero-crossing phase chatter on Frame 0/1
     // hands off to `A3` monophonic glissando instead of falsely triggering USB clock-slip replay.
-    if frame_index <= 1 && !state.oc2_glissando_handoff {
+    if frame_index <= 1 && !state.sub_harmonic_glissando_handoff {
         let first_carr = schedule.carrier_bins.first().copied().unwrap_or(23);
         let ped = schedule.pedestal_bin.unwrap_or(0);
         // Bins 3..first_carr-2 excluding pedestal harmonics and 2nd/3rd-order Volterra difference
@@ -512,7 +512,7 @@ pub fn evaluate_frame_safeguards(
         if (sub_vs_total_db > -25.0 || (sub_vs_carr_db > -18.0 && coh_sq < 0.85))
             && total_spec_e * inv_n * inv_n > 1.0e-7
         {
-            state.oc2_glissando_handoff = true;
+            state.sub_harmonic_glissando_handoff = true;
             state
                 .warnings
                 .push(CaptureWarning::SubHarmonicDividerHandoff {
@@ -570,7 +570,7 @@ pub fn evaluate_frame_safeguards(
         .as_ref()
         .is_none_or(|(r0, _)| (dry_rms / r0.max(1.0e-9) - 1.0).abs() < 0.20);
 
-    if !state.oc2_glissando_handoff {
+    if !state.sub_harmonic_glissando_handoff {
         let phase_slip = same_rms_as_ref
             && state.prev_phase_lag_samples.is_some_and(|prev_lag| {
                 coh_sq >= 0.65
@@ -597,7 +597,7 @@ pub fn evaluate_frame_safeguards(
             };
         }
     }
-    if coh_sq >= 0.65 && !state.oc2_glissando_handoff && same_rms_as_ref {
+    if coh_sq >= 0.65 && !state.sub_harmonic_glissando_handoff && same_rms_as_ref {
         state.prev_phase_lag_samples = Some(cur_lag);
     }
 
@@ -677,7 +677,10 @@ pub fn evaluate_frame_safeguards(
             let (cm, pkm, prom_m) = carrier_transfer_centroid_and_peak(&cur_transfer);
             let centroid_shift_oct = (cm - c0).abs();
             let peak_bin_shift = pkm.abs_diff(pk0);
-            if prom0.max(prom_m) > 2.8 && (centroid_shift_oct > 0.06 || peak_bin_shift >= 34) {
+            // A sparse disjoint-comb grid (>= 34 DFT bins between adjacent carriers) samples
+            // a high-Q envelope-swept SVF resonance between adjacent teeth around ~2.5-4.0x
+            // local prominence; require > 2.2x (~6.8 dB) plus substantial level-driven centroid/peak shift.
+            if prom0.max(prom_m) > 2.2 && (centroid_shift_oct > 0.06 || peak_bin_shift >= 34) {
                 state.ltv_regime = LtvRegime::EnvelopeSvf;
                 ltv_metric = centroid_shift_oct as f32;
             }

@@ -1,10 +1,10 @@
-//! `15` `4x`-Oversampled Black-Box Physical Musical Signal-Chain Models (`Chain-01..15`),
+//! `18` Black-Box Physical Musical Signal-Chain Models (`Chain-01..18`),
 //! supporting configurable device sample rates (`8..192 kHz`) and bit depths
 //! (`Int12`, `Int16`, `Int24`, `Int32`, `Float32`), organized into category and per-chain submodules:
-//! - [`drives`]: [`Chain01SymmetricOd`], [`Chain02GatedAsymmetricFuzz`], [`Chain03ParallelCleanBlend`], [`Chain14TriBandCompDistortion`]
+//! - [`drives`]: [`Chain01SymmetricOd`], [`Chain02GatedAsymmetricFuzz`], [`Chain03ParallelCleanBlend`], [`Chain14TriBandCompDistortion`], [`Chain18ZohQuantizerBitcrusher`]
 //! - [`amps_and_cabs`]: [`Chain04TubeAmpFmv4x12`], [`Chain05PureLtiCabAndRoom`], [`Chain15TubeAmpHeadDi`]
-//! - [`mod_and_spatial`]: [`Chain06EnvelopeResonantSvf`], [`Chain07StereoChorusAndRotary`], [`Chain08LongBbdEchoAnd30sShimmer`]
-//! - [`dynamics_and_pitch`]: [`Chain09La2aOpticalCompressor`], [`Chain10Oc2OctaveDividerAndRingMod`], [`Chain13TriBandVcaCompressor`]
+//! - [`mod_and_spatial`]: [`Chain06EnvelopeResonantSvf`], [`Chain07StereoChorusAndRotary`], [`Chain08LongBbdEchoAnd30sShimmer`], [`Chain17BarberpoleSweep`]
+//! - [`dynamics_and_pitch`]: [`Chain09La2aOpticalCompressor`], [`Chain10Oc2OctaveDividerAndRingMod`], [`Chain13TriBandVcaCompressor`], [`Chain16GranularPitchShimmer`]
 //! - [`rigs`]: [`Chain11BiAmpBassAndOutputIron`], [`Chain12FullEndToEndStereoRig`]
 
 #![forbid(unsafe_code)]
@@ -18,14 +18,15 @@ pub mod rigs;
 pub use amps_and_cabs::{Chain04TubeAmpFmv4x12, Chain05PureLtiCabAndRoom, Chain15TubeAmpHeadDi};
 pub use drives::{
     Chain01SymmetricOd, Chain02GatedAsymmetricFuzz, Chain03ParallelCleanBlend,
-    Chain14TriBandCompDistortion,
+    Chain14TriBandCompDistortion, Chain18ZohQuantizerBitcrusher,
 };
 pub use dynamics_and_pitch::{
     Chain09La2aOpticalCompressor, Chain10Oc2OctaveDividerAndRingMod, Chain13TriBandVcaCompressor,
+    Chain16GranularPitchShimmer,
 };
 pub use mod_and_spatial::{
     CANONICAL_SUBDIVISION_RATIOS, Chain06EnvelopeResonantSvf, Chain07StereoChorusAndRotary,
-    Chain08LongBbdEchoAnd30sShimmer,
+    Chain08LongBbdEchoAnd30sShimmer, Chain17BarberpoleSweep,
 };
 pub use rigs::{Chain11BiAmpBassAndOutputIron, Chain12FullEndToEndStereoRig, Chain12RigMode};
 
@@ -173,6 +174,27 @@ pub(crate) fn flush_subnormal_f64(x: f64) -> f64 {
     if x.abs() < f64::MIN_POSITIVE { 0.0 } else { x }
 }
 
+/// 4-tap Catmull-Rom cubic fractional reader over a power-of-2 ring buffer (`delay_samp >= 2.0`).
+#[inline]
+pub(crate) fn catmull_rom_ring_read(ring: &[f64], wr_idx: usize, delay_samp: f64) -> f64 {
+    let len = ring.len();
+    let mask = len - 1;
+    let d_clamped = delay_samp.clamp(2.0, (len.saturating_sub(4)) as f64);
+    let pos = (wr_idx as f64) - d_clamped;
+    let i0 = pos.floor() as isize;
+    let mu = pos - (i0 as f64);
+    let idx = |off: isize| -> usize { ((i0 + off).rem_euclid(len as isize)) as usize & mask };
+    let ym1 = ring[idx(-1)];
+    let y0 = ring[idx(0)];
+    let yp1 = ring[idx(1)];
+    let yp2 = ring[idx(2)];
+    let c0 = y0;
+    let c1 = 0.5 * (yp1 - ym1);
+    let c2 = ym1 - 2.5 * y0 + 2.0 * yp1 - 0.5 * yp2;
+    let c3 = -0.5 * ym1 + 1.5 * y0 - 1.5 * yp1 + 0.5 * yp2;
+    flush_subnormal_f64(((c3 * mu + c2) * mu + c1) * mu + c0)
+}
+
 /// Phase-coherent 4th-order Linkwitz–Riley (`LR4`) TPT-SVF crossover splitting a signal into
 /// `(lp4, hp4)` whose direct sum `(lp4 + hp4)` maintains unity all-pass magnitude (`0.00 dB` ripple).
 #[derive(Clone, Copy, Debug, Default)]
@@ -255,7 +277,7 @@ fn step_butter8_svf_lp(x: f64, state: &mut [[f64; 2]; 4]) -> f64 {
 }
 
 /// Internal `4x`-oversampled Butterworth TPT SVF anti-imaging / anti-aliasing
-/// upsampler and decimator state used by all physical signal chains (`Chain-01..12`).
+/// upsampler and decimator state used by continuous-time physical signal chains (`Chain-01..18`).
 #[derive(Clone, Debug, Default)]
 pub struct Oversampler4xF64 {
     prev_in_l: f64,

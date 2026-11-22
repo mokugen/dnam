@@ -13,8 +13,7 @@ use dnam_capture::{
     StemStimulus, StimulusFrame, resample_arbitrary_rate, resample_control_trajectory,
     resampled_frame_len, scale_freeze_window,
 };
-use dnam_engine::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
-use dnam_engine::math::DefaultMathBackend;
+use dnam_engine::container::build_dnam_container_from_dnam_bin;
 use dnam_engine::schema::{DnamError, DnamJsonHeader};
 use dnam_engine::{DnamEngine, Tier};
 use dnam_fixtures::{
@@ -29,6 +28,8 @@ use dnam_fixtures::{
     PotTaperAndSwitchDecorator, ScratchyPotAndSteppedAttenuatorDecorator, SpringChirpDecorator,
     TaperCurveKind, TubeThermalHysteresisDecorator,
 };
+use dnam_train::{Pass5EmitConfig, SonaModelF64, encode_model_to_dnam_bin};
+use dnam_vm::math::DefaultMathBackend;
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
 
@@ -590,9 +591,10 @@ fn test_all_12_chains_14_decorators_trajectories_freeze_4ch_and_sidechain_key() 
 fn test_trainer_multi_sample_rate_and_5_bit_depth_device_certification() {
     // 1. Multi-sample-rate (44.1 / 48 / 88.2 / 96 / 192 kHz) across Fixtures, DnamEngine, SpiceRunner & FaustRunner
     let mut hdr = DnamJsonHeader::default_reference();
-    let mut arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    arena[124..128].copy_from_slice(&0.9993_f32.to_le_bytes());
-    let container = build_dnam_container(&mut hdr, &arena, &arena, false).unwrap();
+    let mut model = SonaModelF64::new(48_000.0);
+    model.ro_pole_48k = 0.9993;
+    let dbin = encode_model_to_dnam_bin(&model, Pass5EmitConfig::default()).unwrap();
+    let container = build_dnam_container_from_dnam_bin(&mut hdr, &dbin).unwrap();
     let mut dnam_target =
         DnamEngine::<DefaultMathBackend>::from_bytes(&container, Tier::Lite, 48_000).unwrap();
     let mut spice_target = SpiceRunner::new("multirate.cir", 5_000);

@@ -6,19 +6,33 @@ use super::cross_only::{contract_dim_cross_only_wide192, integral_stride_and_ste
 use super::{WIDE_GRAM_BATCH_FRAMES, Wide192Accum, uplo_u_index, uplo_u_packed_len};
 use crate::math::{TrainerMathBackend, TrainerTask, dispatch_trainer};
 
-const FAST_DYNAMIC_SPAN_RATIO: f64 = (1_u64 << 16) as f64;
+/// Half-mantissa quadratic `f64` boundary (`(2^26)^2 = 2^52 < 2^53`): catches adversarial
+/// multi-scale cancellations (`2^-28`, `2^-30`, `1e8 / 2^-30`) without falling back to scalar
+/// `Wide192Accum` on ordinary `f32` audio zero-crossings (`ref[train.gram.wide192]`,
+/// `ref[repo.code.constant-eval-and-derivations]`).
+const FAST_DYNAMIC_SPAN_RATIO: f64 = (1_u64 << 26) as f64;
 const FAST_ABS_UPPER: f64 = 1.0e40;
 const FAST_ABS_LOWER: f64 = 1.0e-40;
-const FAST_CANCEL_RATIO: f64 = 4.0;
+/// Cancellation tolerance (`2^12 = 4096`): by Higham's error bound over `<= 256` frames,
+/// `sum_abs_prod <= 4096 * |tile_val|` bounds relative rounding error below `2^8 * 2^-53 * 2^12 = 2^-33`
+/// while preserving `> 128x` headroom before adversarial cancellation thresholds (`ref[train.gram.wide192]`).
+const FAST_CANCEL_RATIO: f64 = (1_u64 << 12) as f64;
+
+const _: () = assert!(FAST_DYNAMIC_SPAN_RATIO == 67_108_864.0);
+const _: () = assert!(FAST_CANCEL_RATIO == 4_096.0);
+const _: () = assert!(FAST_ABS_LOWER > 0.0 && FAST_ABS_UPPER > FAST_ABS_LOWER);
 
 #[derive(Default)]
 struct BlockBatchBuffer {
     f: Vec<[f64; 4]>,
     wf: Vec<[f64; 4]>,
     raw_w: Vec<f64>,
-    sum_abs: [f64; 4],
+    sum_sq_f: [f64; 4],
+    sum_sq_wf: [f64; 4],
     max_abs: [f64; 4],
     min_nz_abs: [f64; 4],
+    max_w_abs: f64,
+    min_nz_w_abs: f64,
     has_extreme: bool,
 }
 
@@ -28,9 +42,12 @@ impl BlockBatchBuffer {
             f: Vec::with_capacity(cap),
             wf: Vec::with_capacity(cap),
             raw_w: Vec::with_capacity(cap),
-            sum_abs: [0.0; 4],
+            sum_sq_f: [0.0; 4],
+            sum_sq_wf: [0.0; 4],
             max_abs: [0.0; 4],
             min_nz_abs: [f64::INFINITY; 4],
+            max_w_abs: 0.0,
+            min_nz_w_abs: f64::INFINITY,
             has_extreme: false,
         }
     }
@@ -39,9 +56,12 @@ impl BlockBatchBuffer {
         self.f.clear();
         self.wf.clear();
         self.raw_w.clear();
-        self.sum_abs = [0.0; 4];
+        self.sum_sq_f = [0.0; 4];
+        self.sum_sq_wf = [0.0; 4];
         self.max_abs = [0.0; 4];
         self.min_nz_abs = [f64::INFINITY; 4];
+        self.max_w_abs = 0.0;
+        self.min_nz_w_abs = f64::INFINITY;
         self.has_extreme = false;
     }
 
@@ -53,22 +73,31 @@ impl BlockBatchBuffer {
             || (w_abs > 0.0 && !(FAST_ABS_LOWER..=FAST_ABS_UPPER).contains(&w_abs))
         {
             self.has_extreme = true;
+        } else if w_abs > 0.0 {
+            if w_abs > self.max_w_abs {
+                self.max_w_abs = w_abs;
+            }
+            if w_abs < self.min_nz_w_abs {
+                self.min_nz_w_abs = w_abs;
+            }
         }
         for c in 0..active_cols {
             let fv = f64::from(row[col_base + c]);
             let fa = fv.abs();
             f4[c] = fv;
-            wf4[c] = w_eff * fv;
+            let wfv = w_eff * fv;
+            wf4[c] = wfv;
             if !fv.is_finite() {
                 self.has_extreme = true;
             } else if fa > 0.0 {
-                let wfa = wf4[c].abs();
+                let wfa = wfv.abs();
                 if !(FAST_ABS_LOWER..=FAST_ABS_UPPER).contains(&fa)
-                    || !(FAST_ABS_LOWER..=FAST_ABS_UPPER).contains(&wfa)
+                    || (wfa > 0.0 && !(FAST_ABS_LOWER..=FAST_ABS_UPPER).contains(&wfa))
                 {
                     self.has_extreme = true;
                 }
-                self.sum_abs[c] += fa;
+                self.sum_sq_f[c] += fv * fv;
+                self.sum_sq_wf[c] += wfv * wfv;
                 if fa > self.max_abs[c] {
                     self.max_abs[c] = fa;
                 }
@@ -86,6 +115,8 @@ impl BlockBatchBuffer {
         self.has_extreme
             || (self.max_abs[c] > 0.0
                 && self.max_abs[c] > self.min_nz_abs[c] * FAST_DYNAMIC_SPAN_RATIO)
+            || (self.max_w_abs > 0.0
+                && self.max_w_abs > self.min_nz_w_abs * FAST_DYNAMIC_SPAN_RATIO)
     }
 }
 
@@ -162,20 +193,29 @@ fn merge_tile_cell(
 ) {
     let m = b_i.f.len().min(b_j.f.len());
     let is_wide_inputs = b_i.needs_wide_column(coord.li) || b_j.needs_wide_column(coord.lj);
-    let mut sum_abs_prod = 0.0_f64;
-    let needs_check = is_wide_inputs || !tile_val.is_finite();
-    if !needs_check {
+    if !is_wide_inputs && tile_val.is_finite() {
+        let thresh = tile_val.abs() * FAST_CANCEL_RATIO;
+        let cs_bound_sq = b_i.sum_sq_f[coord.li] * b_j.sum_sq_wf[coord.lj];
+        if cs_bound_sq <= thresh * thresh {
+            if tile_val != 0.0 {
+                gram[uplo_u_index(coord.gi, coord.gj)].add_f64(tile_val);
+            }
+            return;
+        }
+        let mut sum_abs_prod = 0.0_f64;
         for t in 0..m {
             sum_abs_prod += (b_i.f[t][coord.li] * b_j.wf[t][coord.lj]).abs();
         }
-    }
-    if needs_check || sum_abs_prod > tile_val.abs() * FAST_CANCEL_RATIO {
-        let idx = uplo_u_index(coord.gi, coord.gj);
-        for t in 0..m {
-            gram[idx].add_triple_product(b_j.raw_w[t], b_i.f[t][coord.li], b_j.f[t][coord.lj]);
+        if sum_abs_prod <= thresh {
+            if tile_val != 0.0 {
+                gram[uplo_u_index(coord.gi, coord.gj)].add_f64(tile_val);
+            }
+            return;
         }
-    } else {
-        gram[uplo_u_index(coord.gi, coord.gj)].add_f64(tile_val);
+    }
+    let idx = uplo_u_index(coord.gi, coord.gj);
+    for t in 0..m {
+        gram[idx].add_triple_product(b_j.raw_w[t], b_i.f[t][coord.li], b_j.f[t][coord.lj]);
     }
 }
 

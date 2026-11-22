@@ -374,9 +374,6 @@ where
             for t in 0..n {
                 dot += jac[r][t] * jac[c][t];
             }
-            if r == c {
-                dot += l2_reg.max(1.0e-6);
-            }
             g_u[col_off + r] = dot;
         }
         let mut rd = 0.0_f64;

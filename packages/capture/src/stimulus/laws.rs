@@ -82,52 +82,6 @@ pub enum SweepExecutionMode {
     ModeBStationaryStops,
 }
 
-/// Classifies a control identifier/label into [`KnobAcousticClass`] (`Theorem 4.6`).
-#[must_use]
-pub fn classify_knob_acoustic_class(control_id_or_name: &str) -> KnobAcousticClass {
-    let low = control_id_or_name.to_ascii_lowercase();
-    if low.contains("time")
-        || low.contains("delay")
-        || low.contains("rate")
-        || low.contains("speed")
-        || low.contains("pitch")
-    {
-        KnobAcousticClass::ClassIIIPitchDelayTime
-    } else if low.contains("bass")
-        || low.contains("mid")
-        || low.contains("treb")
-        || low.contains("tone")
-        || low.contains("pres")
-        || low.contains("cut")
-        || low.contains("freq")
-        || low.contains("wah")
-        || low.contains("res")
-    {
-        KnobAcousticClass::ClassIIToneFilter
-    } else if low.contains("master")
-        || low.contains("level")
-        || low.contains("vol")
-        || low.contains("output")
-        || low.starts_with("out_")
-        || low.ends_with("_out")
-        || low == "out"
-        || low.contains("mix")
-        || low.contains("blend")
-        || low.contains("decay")
-    {
-        KnobAcousticClass::ClassIVSpatialMixLevel
-    } else {
-        KnobAcousticClass::ClassIGainDrive
-    }
-}
-
-/// Returns `true` if `control_id_or_name` is an output/master volume stage (`Law 0.F` Case B).
-#[must_use]
-pub fn is_master_or_output_control(control_id_or_name: &str) -> bool {
-    let low = control_id_or_name.to_ascii_lowercase();
-    low.contains("master") || low.contains("output") || low.contains("out_level") || low == "level"
-}
-
 /// Signal-measured endpoint probe metrics for zero-heuristic control classification
 /// (`ref[train.capture.invariants]`, `Theorem 4.6`).
 #[derive(Debug, Clone, Copy, PartialEq)]

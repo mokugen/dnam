@@ -1,30 +1,27 @@
 #![forbid(unsafe_code)]
-//! `.dnam-proj` (`DNPJ`) Container View, Builder, `< 1 ms` Capsule Compaction,
-//! and `< 0.2 ms` Runtime `.dnam` Exporter (`proj::bundle`).
+//! `.dnam-proj` (`DNPJ`, `v3.0`) Container View, Builder, `< 1 ms` Capsule Compaction,
+//! and `< 0.2 ms` Runtime `.dnam` / `.dnam-bin` Exporter (`proj::bundle`).
 //!
 //! Canonical Reference: `docs/specs/containers/project_container_format.md`
 //! (`ref[container.proj.lifecycle-states]`, `ref[container.proj.wght-and-export]`).
 
-use dnam_engine::Tier;
+mod dbin;
+mod export;
+
+pub(crate) use dbin::{compile_arena_and_cp1_to_dnam_bin, sync_manifest_transport_delay_history};
+pub use dbin::{verify_dnam_bin_zero_dc, verify_wght_zero_dc};
+pub use export::{export_runtime_dnam, export_runtime_dnam_bin, export_runtime_dnam_with_crypto};
+
+use std::collections::BTreeMap;
+
 use dnam_engine::container::{
-    ARENA_OFFSET_LITE_END, ARENA_OFFSET_ULTRA_END, DEFAULT_DMU1_TRAILER_CAPACITY, DMU1_HEADER_SIZE,
-    DnamContainerView, align64_u64, append_dmue_mutable_suffix, build_dmu1_mutable_frame,
-    build_dnam_container_with_cp1, crc32c_compute, strip_container_to_tier, update_header_in_place,
-    validate_v2_dnam_layout_with_max_profile,
+    DnamContainerView, align64_u64, build_dnam_container_from_dnam_bin, crc32c_compute,
 };
-use dnam_engine::control::Cp1ContributorSlot;
-use dnam_engine::math::ScalarBackend;
 use dnam_engine::provenance::{
     CryptoProvider, DefaultCryptoProvider, enforce_distribution_policy, sha256_digest,
 };
-use dnam_engine::schema::header::DelayHistoryDecl;
-use dnam_engine::schema::{DnamError, DnamJsonHeader};
-use dnam_engine::stages::hot_core::V3CoreInstance;
-use dnam_engine::stages::stage4_tank::v3_fdn::{V3_TANK_CAP, V3_TANK_MAX_DECLARED_DELAY};
-use dnam_engine::stages::weights::{
-    PIPE_FLAG_V3_MATRYOSHKA, has_pipeline_flag, unpack_v3_matryoshka_from_arena,
-    unpack_v3_tier_from_arena,
-};
+use dnam_engine::schema::DnamError;
+use dnam_vm::control::Cp1ContributorSlot;
 
 use super::directory::{
     CalbChunk64B, DnamProjPreamble, ProjAuthRecord, ProjChunkDirEntry, ProjChunkKind,
@@ -34,9 +31,10 @@ use super::directory::{
 };
 use super::schema::DnamProjManifest;
 use super::{
-    DNPJ_MAGIC, PROJ_FLAG_COMPACTED_CAPSULES, PROJ_FLAG_HAS_AUTH, PROJ_FLAG_HAS_CALIBRATION,
-    PROJ_FLAG_HAS_CAPSULES, PROJ_FLAG_HAS_RAW_STEMS, PROJ_FLAG_HAS_STAT, PROJ_FLAG_HAS_WGHT,
-    PROJ_FLAG_STEREO_OUT, PROJ_PREAMBLE_SIZE, PROJ_VERSION_MAJOR, PROJ_VERSION_MINOR,
+    DNPJ_MAGIC, MAX_PROJ_CHUNKS, PROJ_FLAG_COMPACTED_CAPSULES, PROJ_FLAG_HAS_AUTH,
+    PROJ_FLAG_HAS_CALIBRATION, PROJ_FLAG_HAS_CAPSULES, PROJ_FLAG_HAS_RAW_STEMS, PROJ_FLAG_HAS_STAT,
+    PROJ_FLAG_HAS_WGHT, PROJ_FLAG_STEREO_OUT, PROJ_PREAMBLE_SIZE, PROJ_VERSION_MAJOR,
+    PROJ_VERSION_MINOR,
 };
 
 /// Input chunk specification passed to [`build_dnam_proj_container`].
@@ -60,110 +58,8 @@ pub(crate) struct VaultChunkInput {
 }
 
 type ValidatedWghtPair<'a> = (&'a [u8], DnamContainerView<'a>);
-/// Byte range inside `Arena 0` `ARENA0_META` reserved for the `[STAB-ZERO-DC]` guard slot.
-pub const ARENA0_ZERO_DC_GUARD_RANGE: core::ops::Range<usize> = 216..256;
 
-/// Byte range inside `Arena 3` `ARENA3_STAGE1_PRE` reserved for the `Ultra` `[STAB-ZERO-DC]` guard slot.
-pub const ARENA3_ZERO_DC_GUARD_RANGE: core::ops::Range<usize> = 18_528..18_560;
-
-/// Enforces `b_head = 0.0` / zeroed `[STAB-ZERO-DC]` guard slots in `v3` `Arena 0..3`
-/// (`216..256` for `Lite..Ultra` and `18_528..18_560` for `Ultra`).
-pub fn zero_arena_b_head_dc_bias(arena_bytes: &mut [u8]) {
-    if arena_bytes.len() >= ARENA0_ZERO_DC_GUARD_RANGE.end {
-        arena_bytes[ARENA0_ZERO_DC_GUARD_RANGE].fill(0);
-    }
-    if arena_bytes.len() >= ARENA_OFFSET_ULTRA_END as usize {
-        arena_bytes[ARENA3_ZERO_DC_GUARD_RANGE].fill(0);
-    }
-}
-
-/// Synchronizes `header.delay_histories` (`kind: "fdn"`) from unpacked `v3` Stage IV tank
-/// parameters in `arena` so engine cold loading pre-allocates extended delay rings without
-/// real-time heap allocations (`ref[dsp.op-t.ring.declaration]`).
-pub(crate) fn sync_manifest_stage4_delay_history(header: &mut DnamJsonHeader, arena: &[u8]) {
-    header.delay_histories.retain(|d| d.kind != "fdn");
-    if !has_pipeline_flag(arena, PIPE_FLAG_V3_MATRYOSHKA)
-        || arena.len() < ARENA_OFFSET_ULTRA_END as usize
-    {
-        return;
-    }
-    let mono_out = header.io_config.output_mode == "mono";
-    let model = unpack_v3_matryoshka_from_arena(arena, mono_out);
-    let max_req = model
-        .stage4
-        .iter()
-        .map(|t| {
-            let max_d = t.delay_lengths.iter().copied().max().unwrap_or(0);
-            let lfo_pad = (t.lfo_depth_samples.max(0.0).ceil() as usize).saturating_add(6);
-            max_d.saturating_add(lfo_pad)
-        })
-        .max()
-        .unwrap_or(0);
-    if max_req > V3_TANK_CAP {
-        header.delay_histories.push(DelayHistoryDecl {
-            kind: "fdn".to_string(),
-            max_samples_48k: max_req.min(V3_TANK_MAX_DECLARED_DELAY) as u32,
-        });
-    }
-}
-
-/// Verifies `[STAB-ZERO-DC]` holds across all retained tiers in `arena_bytes`: zeroed guard slots
-/// (`216..256`, plus `18_528..18_560` at `Ultra`) and resting DC residual `<= 1.0e-5` (`-100 dBFS`)
-/// when `PIPE_FLAG_V3_MATRYOSHKA` is present.
-pub fn verify_arena_b_head_zero_dc(arena_bytes: &[u8]) -> Result<(), DnamError> {
-    if arena_bytes.len() < ARENA_OFFSET_LITE_END as usize {
-        return Err(DnamError::BufferTooSmall {
-            expected: ARENA_OFFSET_LITE_END as usize,
-            actual: arena_bytes.len(),
-        });
-    }
-    if arena_bytes[ARENA0_ZERO_DC_GUARD_RANGE]
-        .iter()
-        .any(|&b| b != 0)
-    {
-        return Err(DnamError::SchemaValidationError(
-            "WGHT Arena 0 violates [STAB-ZERO-DC]: non-zero guard bytes in 216..256".to_string(),
-        ));
-    }
-    if arena_bytes.len() >= ARENA_OFFSET_ULTRA_END as usize
-        && arena_bytes[ARENA3_ZERO_DC_GUARD_RANGE]
-            .iter()
-            .any(|&b| b != 0)
-    {
-        return Err(DnamError::SchemaValidationError(
-            "WGHT Arena 3 violates [STAB-ZERO-DC]: non-zero guard bytes in 18528..18560"
-                .to_string(),
-        ));
-    }
-    if has_pipeline_flag(arena_bytes, PIPE_FLAG_V3_MATRYOSHKA) {
-        let check_tiers: &[Tier] = if arena_bytes.len() >= ARENA_OFFSET_ULTRA_END as usize {
-            &[Tier::Lite, Tier::Ultra]
-        } else {
-            &[Tier::Lite]
-        };
-        for &tier in check_tiers {
-            let cold = unpack_v3_tier_from_arena(arena_bytes, tier, false);
-            let mut inst = V3CoreInstance::<ScalarBackend>::from_cold_model(&cold);
-            inst.reset_to_dc_equilibrium();
-            for _ in 0..4 {
-                let y = inst.step_stereo(0.0, 0.0);
-                if !y[0].is_finite()
-                    || !y[1].is_finite()
-                    || y[0].abs() > 1.0e-5
-                    || y[1].abs() > 1.0e-5
-                {
-                    return Err(DnamError::SchemaValidationError(format!(
-                        "WGHT {tier:?} violates [STAB-ZERO-DC]: resting DC output ({:.2e}, {:.2e}) > 1e-5",
-                        y[0], y[1]
-                    )));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Zero-copy validated view over a canonical `v2.0` `.dnam-proj` (`DNPJ`) container (`r[container.proj.framing]`).
+/// Zero-copy validated view over a canonical `v3.0` (`.dnam-proj` / `"DNPJ"`) container (`r[container.proj.framing]`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DnamProjView<'a> {
     /// Validated `64 B` preamble.
@@ -180,21 +76,21 @@ pub struct DnamProjView<'a> {
 
 impl<'a> DnamProjView<'a> {
     /// Parses and cryptographically validates a `.dnam-proj` (`DNPJ`) container buffer.
-    pub fn from_bytes(bytes: &'a [u8], crypto: &dyn CryptoProvider) -> Result<Self, DnamError> {
+    pub fn from_bytes<C: CryptoProvider>(bytes: &'a [u8], crypto: &C) -> Result<Self, DnamError> {
         Self::from_bytes_inner(bytes, crypto, true)
     }
 
-    fn from_bytes_inner(
+    fn from_bytes_inner<C: CryptoProvider>(
         bytes: &'a [u8],
-        crypto: &dyn CryptoProvider,
+        crypto: &C,
         verify_chunk_digests: bool,
     ) -> Result<Self, DnamError> {
         Self::from_bytes_with_wght_view(bytes, crypto, verify_chunk_digests).map(|(v, _)| v)
     }
 
-    pub(crate) fn from_bytes_with_wght_view(
+    pub(crate) fn from_bytes_with_wght_view<C: CryptoProvider>(
         bytes: &'a [u8],
-        crypto: &dyn CryptoProvider,
+        crypto: &C,
         verify_chunk_digests: bool,
     ) -> Result<(Self, Option<ValidatedWghtPair<'a>>), DnamError> {
         let range = parse_proj_manifest_range(bytes)?;
@@ -229,7 +125,7 @@ impl<'a> DnamProjView<'a> {
         let mut has_stat = false;
         let mut wght_view_opt: Option<ValidatedWghtPair<'a>> = None;
         let mut auth_bytes_opt: Option<&'a [u8]> = None;
-        let mut stmc_flags_by_id = std::collections::BTreeMap::new();
+        let mut stmc_flags_by_id = BTreeMap::new();
 
         for entry in &range.directory {
             let start = entry.offset as usize;
@@ -293,9 +189,9 @@ impl<'a> DnamProjView<'a> {
                     has_stat = true;
                 }
                 ProjChunkKind::Wght => {
-                    let rt_view = DnamContainerView::from_bytes(payload, &crypto)?;
+                    let rt_view = DnamContainerView::from_bytes(payload, crypto)?;
                     if !rt_view.preamble.is_encrypted_arena() {
-                        verify_arena_b_head_zero_dc(rt_view.arena_storage.as_bytes())?;
+                        verify_wght_zero_dc(payload)?;
                     }
                     wght_view_opt = Some((payload, rt_view));
                 }
@@ -307,7 +203,6 @@ impl<'a> DnamProjView<'a> {
         }
 
         let has_wght = wght_view_opt.is_some();
-        // Verify lifecycle_flags consistency
         let fl = range.preamble.lifecycle_flags;
         let expected_flags_ok = ((fl & PROJ_FLAG_HAS_CALIBRATION != 0) == has_calb)
             && ((fl & PROJ_FLAG_HAS_RAW_STEMS != 0) == has_spcm)
@@ -328,7 +223,6 @@ impl<'a> DnamProjView<'a> {
             ));
         }
 
-        // Verify STMC <-> manifest.stems_registry bijection whenever STMC capsules exist
         if has_stmc {
             if !has_inpc {
                 return Err(DnamError::SchemaValidationError(
@@ -420,7 +314,7 @@ fn assemble_proj_bytes_with_digests(
     chunks: &[VaultChunkInput],
     compacted_flag: bool,
 ) -> Result<Vec<u8>, DnamError> {
-    if chunks.len() > super::MAX_PROJ_CHUNKS {
+    if chunks.len() > MAX_PROJ_CHUNKS {
         return Err(DnamError::SchemaValidationError(
             "too many chunks for .dnam-proj".to_string(),
         ));
@@ -521,7 +415,7 @@ fn assemble_proj_bytes_with_digests(
     Ok(out)
 }
 
-/// Builds and validates a canonical `v2.0` `.dnam-proj` (`DNPJ`) container from `manifest` and `chunks`.
+/// Builds and validates a canonical `v3.0` `.dnam-proj` (`DNPJ`) container from `manifest` and `chunks`.
 pub fn build_dnam_proj_container(
     manifest: &DnamProjManifest,
     chunks: &[ProjChunkInput],
@@ -529,19 +423,46 @@ pub fn build_dnam_proj_container(
     build_dnam_proj_container_with_crypto(manifest, chunks, &DefaultCryptoProvider::default())
 }
 
-/// Builds and validates a canonical `v2.0` `.dnam-proj` (`DNPJ`) container using a custom `crypto` provider.
-pub fn build_dnam_proj_container_with_crypto(
+/// Builds and validates a canonical `v3.0` `.dnam-proj` (`DNPJ`) container using a custom `crypto` provider.
+pub fn build_dnam_proj_container_with_crypto<C: CryptoProvider>(
     manifest: &DnamProjManifest,
     chunks: &[ProjChunkInput],
-    crypto: &dyn CryptoProvider,
+    crypto: &C,
 ) -> Result<Vec<u8>, DnamError> {
     let bytes = assemble_proj_bytes(manifest, chunks, false)?;
     let _ = DnamProjView::from_bytes(&bytes, crypto)?;
     Ok(bytes)
 }
 
-/// Builds a canonical `v2.0` `.dnam-proj` (`DNPJ`) container, automatically compiling `arena_0_to_3`
-/// and `cp1_contributors` into a `[STAB-ZERO-DC]`-verified `WGHT` chunk.
+/// Builds a canonical `v3.0` `.dnam-proj` (`DNPJ`) container embedding a compiled Layer 0 `.dnam-bin`
+/// inside its `WGHT` `.dnam` wrapper (`ref[container.proj.wght-and-export]`).
+pub fn build_dnam_proj_container_with_dnam_bin(
+    manifest: &mut DnamProjManifest,
+    non_wght_chunks: &[ProjChunkInput],
+    dnam_bin_bytes: &[u8],
+) -> Result<Vec<u8>, DnamError> {
+    verify_dnam_bin_zero_dc(dnam_bin_bytes)?;
+    sync_manifest_transport_delay_history(&mut manifest.base, dnam_bin_bytes);
+    let _ = manifest.base.compile_clamp_descriptors()?;
+    let wght_dnam = build_dnam_container_from_dnam_bin(&mut manifest.base, dnam_bin_bytes)?;
+    let mut all_chunks: Vec<ProjChunkInput> = non_wght_chunks
+        .iter()
+        .filter(|c| c.kind != ProjChunkKind::Wght)
+        .cloned()
+        .collect();
+    all_chunks.push(ProjChunkInput {
+        kind: ProjChunkKind::Wght,
+        chunk_id: 0,
+        payload: wght_dnam,
+    });
+    let crypto = DefaultCryptoProvider::default();
+    let bytes = assemble_proj_bytes(manifest, &all_chunks, false)?;
+    let _ = DnamProjView::from_bytes_inner(&bytes, &crypto, false)?;
+    Ok(bytes)
+}
+
+/// Builds a canonical `v3.0` `.dnam-proj` (`DNPJ`) container from `arena_0_to_3` (`4,608..30,720 B`)
+/// and `cp1_contributors`, compiling a Layer 0 `.dnam-bin` into the `[STAB-ZERO-DC]`-verified `WGHT` chunk.
 pub fn build_dnam_proj_container_with_cp1(
     manifest: &mut DnamProjManifest,
     non_wght_chunks: &[ProjChunkInput],
@@ -557,88 +478,20 @@ pub fn build_dnam_proj_container_with_cp1(
     )
 }
 
-fn grow_open_dnam_dmu1_suffix(
-    out_dnam: &mut Vec<u8>,
-    merged_hdr: &dnam_engine::schema::DnamJsonHeader,
-    crypto: &dyn CryptoProvider,
-) -> Result<(), DnamError> {
-    merged_hdr.validate()?;
-    let layout = validate_v2_dnam_layout_with_max_profile(out_dnam, 1)?;
-    let mut dmu_obj = serde_json::Map::new();
-    if !merged_hdr.presets.is_empty() {
-        dmu_obj.insert(
-            "presets".to_string(),
-            serde_json::to_value(&merged_hdr.presets)
-                .map_err(|e| DnamError::InvalidJsonHeader(e.to_string()))?,
-        );
-    }
-    if !merged_hdr.user_metadata.is_empty() {
-        dmu_obj.insert(
-            "user_metadata".to_string(),
-            serde_json::to_value(&merged_hdr.user_metadata)
-                .map_err(|e| DnamError::InvalidJsonHeader(e.to_string()))?,
-        );
-    }
-    let mut ctrl_um = serde_json::Map::new();
-    for ctrl in &merged_hdr.controls_schema {
-        if !ctrl.user_metadata.is_empty() {
-            ctrl_um.insert(
-                ctrl.id.clone(),
-                serde_json::to_value(&ctrl.user_metadata)
-                    .map_err(|e| DnamError::InvalidJsonHeader(e.to_string()))?,
-            );
-        }
-    }
-    if !ctrl_um.is_empty() {
-        dmu_obj.insert(
-            "control_user_metadata".to_string(),
-            serde_json::Value::Object(ctrl_um),
-        );
-    }
-    let payload_bytes = serde_json::to_vec(&serde_json::Value::Object(dmu_obj))
-        .map_err(|e| DnamError::InvalidJsonHeader(e.to_string()))?;
-    let required = DMU1_HEADER_SIZE + payload_bytes.len();
-    if required > DEFAULT_DMU1_TRAILER_CAPACITY {
-        return Err(DnamError::HeaderCapacityExceeded {
-            capacity: DEFAULT_DMU1_TRAILER_CAPACITY,
-            required,
-        });
-    }
-    let grown_cap = align64_u64((required + 16) as u64)
-        .and_then(|n| usize::try_from(n).ok())
-        .map(|n| (n - 16).min(DEFAULT_DMU1_TRAILER_CAPACITY))
-        .ok_or_else(|| {
-            DnamError::SchemaValidationError("DMU1 grown capacity overflow".to_string())
-        })?;
-    let dmu1 = build_dmu1_mutable_frame(&payload_bytes, grown_cap)?;
-    out_dnam.truncate(layout.mutable_extent.0);
-    append_dmue_mutable_suffix(out_dnam, &dmu1);
-    let _ = DnamContainerView::from_bytes(out_dnam, &crypto)?;
-    Ok(())
-}
-
-pub(crate) fn build_dnam_proj_container_from_vault(
+pub(crate) fn build_dnam_proj_container_from_vault_dbin(
     manifest: &mut DnamProjManifest,
     mut vault_chunks: Vec<VaultChunkInput>,
-    arena_0_to_3: &[u8],
-    cp1_contributors: &[Cp1ContributorSlot],
+    dnam_bin_bytes: &[u8],
     compacted_flag: bool,
 ) -> Result<Vec<u8>, DnamError> {
     enforce_distribution_policy(
         &manifest.base,
         dnam_engine::schema::DnamProtectionProfile::Open,
     )?;
-    let mut clean_arena = arena_0_to_3.to_vec();
-    zero_arena_b_head_dc_bias(&mut clean_arena);
-    sync_manifest_stage4_delay_history(&mut manifest.base, &clean_arena);
+    verify_dnam_bin_zero_dc(dnam_bin_bytes)?;
+    sync_manifest_transport_delay_history(&mut manifest.base, dnam_bin_bytes);
     let _ = manifest.base.compile_clamp_descriptors()?;
-    let wght_dnam = build_dnam_container_with_cp1(
-        &mut manifest.base,
-        &clean_arena,
-        &clean_arena,
-        false,
-        cp1_contributors,
-    )?;
+    let wght_dnam = build_dnam_container_from_dnam_bin(&mut manifest.base, dnam_bin_bytes)?;
     vault_chunks.retain(|c| c.kind != ProjChunkKind::Wght);
     vault_chunks.push(VaultChunkInput {
         kind: ProjChunkKind::Wght,
@@ -656,17 +509,11 @@ pub(crate) fn build_dnam_proj_container_with_cp1_and_compacted(
     cp1_contributors: &[Cp1ContributorSlot],
     compacted_flag: bool,
 ) -> Result<Vec<u8>, DnamError> {
-    let mut clean_arena = arena_0_to_3.to_vec();
-    zero_arena_b_head_dc_bias(&mut clean_arena);
-    sync_manifest_stage4_delay_history(&mut manifest.base, &clean_arena);
+    let dnam_bin = compile_arena_and_cp1_to_dnam_bin(manifest, arena_0_to_3, cp1_contributors)?;
+    verify_dnam_bin_zero_dc(&dnam_bin)?;
+    sync_manifest_transport_delay_history(&mut manifest.base, &dnam_bin);
     let _ = manifest.base.compile_clamp_descriptors()?;
-    let wght_dnam = build_dnam_container_with_cp1(
-        &mut manifest.base,
-        &clean_arena,
-        &clean_arena,
-        false,
-        cp1_contributors,
-    )?;
+    let wght_dnam = build_dnam_container_from_dnam_bin(&mut manifest.base, &dnam_bin)?;
     let mut all_chunks: Vec<ProjChunkInput> = non_wght_chunks
         .iter()
         .filter(|c| c.kind != ProjChunkKind::Wght)
@@ -683,14 +530,15 @@ pub(crate) fn build_dnam_proj_container_with_cp1_and_compacted(
     Ok(bytes)
 }
 
-/// Signs a `.dnam-proj` container with an `AUTH` (`"DNPJ-PROJECT-MANIFEST-V2"`) `Ed25519` chunk.
-pub fn attach_proj_auth_signature<F>(
+/// Signs a `.dnam-proj` container with an `AUTH` (`"DNPJ-PROJECT-MANIFEST-V3"`) `Ed25519` chunk.
+pub fn attach_proj_auth_signature<C, F>(
     proj_bytes: &[u8],
     signer_pubkey_ed25519: [u8; 32],
     sign_fn: F,
-    crypto: &dyn CryptoProvider,
+    crypto: &C,
 ) -> Result<Vec<u8>, DnamError>
 where
+    C: CryptoProvider,
     F: FnOnce(&[u8]) -> [u8; 64],
 {
     let view = DnamProjView::from_bytes(proj_bytes, crypto)?;
@@ -745,7 +593,6 @@ pub fn compact_to_capsules(proj_bytes: &[u8]) -> Result<Vec<u8>, DnamError> {
         } else if kind == ProjChunkKind::Stmc {
             has_stmc = true;
         }
-        // If SPCM chunks were stripped, drop any stale AUTH signature covering the uncompacted directory.
         if kind == ProjChunkKind::Auth && had_spcm {
             continue;
         }
@@ -761,7 +608,6 @@ pub fn compact_to_capsules(proj_bytes: &[u8]) -> Result<Vec<u8>, DnamError> {
         ));
     }
     if !had_spcm && view.auth_record.is_some() {
-        // Re-verify and return exact compacted bytes without invalidating existing AUTH
         let out = assemble_proj_bytes(&view.manifest, &retained, true)?;
         let _ = DnamProjView::from_bytes(&out, &crypto)?;
         return Ok(out);
@@ -773,85 +619,4 @@ pub fn compact_to_capsules(proj_bytes: &[u8]) -> Result<Vec<u8>, DnamError> {
     let out = assemble_proj_bytes(&view.manifest, &retained_no_auth, true)?;
     let _ = DnamProjView::from_bytes(&out, &crypto)?;
     Ok(out)
-}
-
-/// Exports a validated runtime `.dnam` (`DNAM`) container from the project's `WGHT` chunk in `< 0.2 ms`
-/// (`r[container.proj.wght]`).
-pub fn export_runtime_dnam(
-    proj_bytes: &[u8],
-    target_tier: Option<Tier>,
-) -> Result<Vec<u8>, DnamError> {
-    export_runtime_dnam_with_crypto(proj_bytes, target_tier, &DefaultCryptoProvider::default())
-}
-
-/// Exports a validated runtime `.dnam` (`DNAM`) container from `WGHT` using `crypto`, enforcing
-/// `[STAB-ZERO-DC]`, `DistributionPolicy`, and `DAU1` buyer tier-slimming rules (`r[container.proj.wght]`).
-pub fn export_runtime_dnam_with_crypto(
-    proj_bytes: &[u8],
-    target_tier: Option<Tier>,
-    crypto: &dyn CryptoProvider,
-) -> Result<Vec<u8>, DnamError> {
-    let (view, wght_pair_opt) = DnamProjView::from_bytes_with_wght_view(proj_bytes, crypto, true)?;
-    let Some((wght_bytes, rt_view)) = wght_pair_opt else {
-        return Err(DnamError::SchemaValidationError(
-            "cannot export runtime .dnam: project has no solved WGHT chunk".to_string(),
-        ));
-    };
-
-    enforce_distribution_policy(&rt_view.header, rt_view.protection_profile)?;
-
-    let mut out_dnam = wght_bytes.to_vec();
-    let ctrl_meta_differs = rt_view.header.controls_schema.len()
-        == view.manifest.base.controls_schema.len()
-        && rt_view
-            .header
-            .controls_schema
-            .iter()
-            .zip(&view.manifest.base.controls_schema)
-            .any(|(a, b)| a.id == b.id && a.user_metadata != b.user_metadata);
-    if rt_view.header.presets != view.manifest.base.presets
-        || rt_view.header.user_metadata != view.manifest.base.user_metadata
-        || ctrl_meta_differs
-    {
-        let mut merged_hdr = rt_view.header.clone();
-        merged_hdr.presets = view.manifest.base.presets.clone();
-        merged_hdr.user_metadata = view.manifest.base.user_metadata.clone();
-        if merged_hdr.controls_schema.len() == view.manifest.base.controls_schema.len() {
-            for (dst, src) in merged_hdr
-                .controls_schema
-                .iter_mut()
-                .zip(&view.manifest.base.controls_schema)
-            {
-                if dst.id == src.id {
-                    dst.user_metadata = src.user_metadata.clone();
-                }
-            }
-        }
-        match update_header_in_place(&mut out_dnam, &merged_hdr) {
-            Ok(()) => {}
-            Err(DnamError::HeaderCapacityExceeded { .. })
-                if !rt_view.preamble.is_encrypted_arena() =>
-            {
-                grow_open_dnam_dmu1_suffix(&mut out_dnam, &merged_hdr, crypto)?;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    if let Some(max_tier) = target_tier
-        && (max_tier as u8) < (rt_view.preamble.highest_tier() as u8)
-    {
-        if let Some(ref sigs) = rt_view.header.metadata.signatures
-            && let Some(ref rcpt) = sigs.marketplace_receipt
-            && rcpt.buyer_tier_arena_sha256.is_none()
-        {
-            return Err(DnamError::CryptoVerificationFailed(
-                "cannot strip buyer-signed WGHT without buyer_tier_arena_sha256",
-            ));
-        }
-        out_dnam = strip_container_to_tier(&out_dnam, max_tier)?;
-        let _ = DnamContainerView::from_bytes(&out_dnam, &crypto)?;
-    }
-
-    Ok(out_dnam)
 }

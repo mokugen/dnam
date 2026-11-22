@@ -4,12 +4,12 @@
 use dnam_capture::DistillationTarget;
 use dnam_capture::proj::DnamProjManifest;
 use dnam_capture::stimulus::{AdaptiveTrainingOptions, TopologyProbeMode, train_adaptive_target};
-use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::{DnamAudioIo, DnamEngine, Tier};
 use dnam_fixtures::{
     BlackBoxModel, Chain01SymmetricOd, Chain05PureLtiCabAndRoom, Chain07StereoChorusAndRotary,
     Chain09La2aOpticalCompressor, FixtureBitDepth, FixtureDeviceMetadata,
 };
+use dnam_vm::math::DefaultMathBackend;
 
 use super::adversaries_and_topologies::BlackBoxDistillationAdapter;
 

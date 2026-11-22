@@ -117,6 +117,44 @@ pub(crate) fn run_causal_core_cascade_stereo(
             continue;
         }
         let quad = model.core_quads[q].rescaled_for_rho(rho_core);
+        let in_mid: [f64; 4] =
+            core::array::from_fn(|d| sanitize_unit_f64(quad.in_mid_weight[d], -16.0, 16.0, 0.0));
+        let in_side: [f64; 4] =
+            core::array::from_fn(|d| sanitize_unit_f64(quad.in_side_weight[d], -16.0, 16.0, 0.0));
+        type IncomingTileStep = (usize, [[f64; 4]; 4], [[f64; 4]; 4], [[f64; 4]; 4]);
+        let incoming_tiles: Vec<IncomingTileStep> = SONA_INTERBLOCK_TILES[..active_tiles]
+            .iter()
+            .enumerate()
+            .filter_map(|(tile_idx, &(src_q, dst_q))| {
+                if dst_q != q || src_q >= q_count {
+                    return None;
+                }
+                debug_assert!(
+                    quad_done[src_q],
+                    "topological violation: src_q={src_q} -> dst_q={dst_q}"
+                );
+                let tile = &model.tiles[tile_idx];
+                let mut wo = [[0.0_f64; 4]; 4];
+                let mut we = [[0.0_f64; 4]; 4];
+                let mut wl = [[0.0_f64; 4]; 4];
+                let mut any_nonzero = false;
+                for s in 0..4 {
+                    for d in 0..4 {
+                        let o = sanitize_unit_f64(tile.w_odd_4x4[s][d], -8.0, 8.0, 0.0);
+                        let e = sanitize_unit_f64(tile.w_even_4x4[s][d], -8.0, 8.0, 0.0);
+                        let l = sanitize_unit_f64(tile.w_lru_4x4[s][d], -8.0, 8.0, 0.0);
+                        wo[s][d] = o;
+                        we[s][d] = e;
+                        wl[s][d] = l;
+                        if o != 0.0 || e != 0.0 || l != 0.0 {
+                            any_nonzero = true;
+                        }
+                    }
+                }
+                any_nonzero.then_some((src_q, wo, we, wl))
+            })
+            .collect();
+
         let mut quad_in = vec![[0.0_f32; 4]; n * 2];
         for t in 0..n {
             let ul = sanitize_unit_f64(ux_l[t], -1.0e6, 1.0e6, 0.0);
@@ -126,41 +164,27 @@ pub(crate) fn run_causal_core_cascade_stereo(
             let mut acc_l = [0.0_f64; 4];
             let mut acc_r = [0.0_f64; 4];
             for d in 0..4 {
-                let wm = sanitize_unit_f64(quad.in_mid_weight[d], -16.0, 16.0, 0.0);
-                let ws = sanitize_unit_f64(quad.in_side_weight[d], -16.0, 16.0, 0.0);
-                acc_l[d] = wm * mid + ws * side;
-                acc_r[d] = wm * mid - ws * side;
+                acc_l[d] = in_mid[d] * mid + in_side[d] * side;
+                acc_r[d] = in_mid[d] * mid - in_side[d] * side;
             }
-            for (tile_idx, &(src_q, dst_q)) in
-                SONA_INTERBLOCK_TILES[..active_tiles].iter().enumerate()
-            {
-                if dst_q == q && src_q < q_count {
-                    debug_assert!(
-                        quad_done[src_q],
-                        "topological violation: src_q={src_q} -> dst_q={dst_q}"
-                    );
-                    let fbase = (src_q * n + t) * 6;
-                    let v_eff_l = feature_outputs[fbase];
-                    let v_eff_r = feature_outputs[fbase + 1];
-                    let odd_l = feature_outputs[fbase + 2];
-                    let odd_r = feature_outputs[fbase + 3];
-                    let even_l = feature_outputs[fbase + 4];
-                    let even_r = feature_outputs[fbase + 5];
-                    let tile = &model.tiles[tile_idx];
-                    for s in 0..4 {
-                        let ol = f64::from(odd_l[s]);
-                        let or_ = f64::from(odd_r[s]);
-                        let el = f64::from(even_l[s]);
-                        let er = f64::from(even_r[s]);
-                        let vl = f64::from(v_eff_l[s]);
-                        let vr = f64::from(v_eff_r[s]);
-                        for d in 0..4 {
-                            let wo = sanitize_unit_f64(tile.w_odd_4x4[s][d], -8.0, 8.0, 0.0);
-                            let we = sanitize_unit_f64(tile.w_even_4x4[s][d], -8.0, 8.0, 0.0);
-                            let wl = sanitize_unit_f64(tile.w_lru_4x4[s][d], -8.0, 8.0, 0.0);
-                            acc_l[d] += wo * ol + we * el + wl * vl;
-                            acc_r[d] += wo * or_ + we * er + wl * vr;
-                        }
+            for &(src_q, ref wo, ref we, ref wl) in &incoming_tiles {
+                let fbase = (src_q * n + t) * 6;
+                let v_eff_l = feature_outputs[fbase];
+                let v_eff_r = feature_outputs[fbase + 1];
+                let odd_l = feature_outputs[fbase + 2];
+                let odd_r = feature_outputs[fbase + 3];
+                let even_l = feature_outputs[fbase + 4];
+                let even_r = feature_outputs[fbase + 5];
+                for s in 0..4 {
+                    let ol = f64::from(odd_l[s]);
+                    let or_ = f64::from(odd_r[s]);
+                    let el = f64::from(even_l[s]);
+                    let er = f64::from(even_r[s]);
+                    let vl = f64::from(v_eff_l[s]);
+                    let vr = f64::from(v_eff_r[s]);
+                    for d in 0..4 {
+                        acc_l[d] += wo[s][d] * ol + we[s][d] * el + wl[s][d] * vl;
+                        acc_r[d] += wo[s][d] * or_ + we[s][d] * er + wl[s][d] * vr;
                     }
                 }
             }

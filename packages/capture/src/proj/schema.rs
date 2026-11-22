@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Canonical `v2.0` `.dnam-proj` (`DNPJ`) RFC 8785 JCS Project Manifest Schema (`proj::schema`).
+//! Canonical `v3.0` `.dnam-proj` (`DNPJ`) RFC 8785 JCS Project Manifest Schema (`proj::schema`).
 //!
 //! Canonical Reference: `docs/specs/containers/project_container_format.md` (`ref[container.proj.jcs-manifest]`).
 
@@ -16,7 +16,7 @@ const fn default_true() -> bool {
 }
 
 fn default_proj_version() -> String {
-    "2.0.0".to_string()
+    SchemaVersion::V3_0_0.as_semver_string()
 }
 
 fn default_proj_container_kind() -> String {
@@ -193,17 +193,17 @@ pub struct SolverTelemetrySummary {
     pub tier_esr_db: [f32; 4],
 }
 
-/// Canonical Region 2 UTF-8 JCS Project Manifest for `.dnam-proj` (`DNPJ`, `version == "2.0.0"`).
+/// Canonical Region 2 UTF-8 JCS Project Manifest for `.dnam-proj` (`DNPJ`, `version == "3.0.0"`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct DnamProjManifest {
-    /// Semantic version of the `.dnam-proj` manifest schema (`"2.0.0"` only).
+    /// Semantic version of the `.dnam-proj` manifest schema (`"3.0.0"` only).
     #[serde(default = "default_proj_version")]
     pub version: String,
     /// Container discriminator (`"dnam-proj"` only).
     #[serde(default = "default_proj_container_kind")]
     pub container_kind: String,
-    /// Embedded runtime [`DnamJsonHeader`] (`base.container_kind == "dnam"`, `base.version == "2.0.0"`).
+    /// Embedded runtime [`DnamJsonHeader`] (`base.container_kind == "dnam"`, `base.version == "3.0.0"`, `base.architecture == "sona"`).
     pub base: DnamJsonHeader,
     /// Project identity and authoring notes.
     #[serde(default)]
@@ -230,20 +230,21 @@ fn is_valid_lower_hex_64(s: &str) -> bool {
 }
 
 impl DnamProjManifest {
-    /// Constructs a canonical `v2.0` reference [`DnamProjManifest`] for tests and new projects.
+    /// Constructs a canonical `v3.0` (`"sona"`) reference [`DnamProjManifest`] for tests and new projects.
     #[must_use]
     pub fn default_reference() -> Self {
         let mut base = DnamJsonHeader::default_reference();
-        base.version = "2.0.0".to_string();
+        base.version = SchemaVersion::V3_0_0.as_semver_string();
         base.container_kind = "dnam".to_string();
+        base.architecture = "sona".to_string();
         Self {
-            version: "2.0.0".to_string(),
+            version: SchemaVersion::V3_0_0.as_semver_string(),
             container_kind: "dnam-proj".to_string(),
             base,
             project_meta: ProjectMeta {
-                project_id: "proj_reference_v2".to_string(),
+                project_id: "proj_reference_v3".to_string(),
                 rig_notes: None,
-                updated_at: "2026-11-11T00:00:00Z".to_string(),
+                updated_at: "2026-11-22T00:00:00Z".to_string(),
             },
             rig_routing: RigRoutingConfig::default(),
             calibration_summary: None,
@@ -253,10 +254,10 @@ impl DnamProjManifest {
         }
     }
 
-    /// Validates all `v2.0`-only version, schema, routing, and stem registry invariants.
+    /// Validates all `v3.0`-only (`"sona"`) version, schema, routing, and stem registry invariants.
     pub fn validate(&self) -> Result<(), DnamError> {
         let ver = SchemaVersion::parse(&self.version)?;
-        if ver != SchemaVersion::V2_0_0 {
+        if ver != SchemaVersion::V3_0_0 {
             return Err(DnamError::UnsupportedVersion {
                 major: ver.major,
                 minor: ver.minor,
@@ -273,7 +274,7 @@ impl DnamProjManifest {
             ));
         }
         let base_ver = SchemaVersion::parse(&self.base.version)?;
-        if base_ver != SchemaVersion::V2_0_0 {
+        if base_ver != SchemaVersion::V3_0_0 || self.base.architecture != "sona" {
             return Err(DnamError::UnsupportedVersion {
                 major: base_ver.major,
                 minor: base_ver.minor,

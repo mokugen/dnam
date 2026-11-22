@@ -13,11 +13,11 @@ use dnam_capture::stimulus::{
     run_live_null_test_and_autopatch, solve_from_responses, train_adaptive_target,
 };
 use dnam_capture::{DistillationTarget, StemResponse, StemStimulus};
-use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::DnamError;
 use dnam_engine::{DnamEngine, Tier};
 use dnam_fixtures::Chain01SymmetricOd;
+use dnam_vm::math::DefaultMathBackend;
 
 fn mono_resp(stem_id: impl Into<String>, sample_rate_hz: u32, out_1: Vec<f32>) -> StemResponse {
     StemResponse {
@@ -70,7 +70,7 @@ impl DistillationTarget for StereoRightMismatchTarget {
             // Map 96 kHz stimulus index back to 48 kHz step rate cleanly when testing rig rate
             let il = stim.in_1[i];
             let ir = stim.in_2.as_ref().map_or(il, |r| r[i]);
-            let [ml, mr] = eng.step_frame_tora(il, ir, false);
+            let [ml, mr] = eng.step_frame_sona(il, ir, false);
             if self.nonstationary_flip {
                 // Orthogonal 12 kHz carrier unrelated to input feature bus so Cholesky patch degrades ESR!
                 let ortho = 0.45 * if i % 2 == 0 { 1.0_f32 } else { -1.0_f32 };

@@ -12,7 +12,6 @@ use crate::metrics::{TargetRepeatabilityProfile, build_repeatability_probe_strea
 use crate::proj::directory::StmcTrajectoryWindow;
 use crate::proj::vault::VaultCaptureSpec;
 use crate::resampler::{resample_arbitrary_rate_to_48k, resampled_frame_len};
-use crate::solver::v3_varpro;
 use crate::stimulus::laws::TopologyProbeMode;
 use crate::stimulus::physics_probe;
 use crate::stimulus::sealing::{
@@ -22,20 +21,15 @@ use crate::stimulus::sealing::{
 use crate::targets::{DistillationTarget, StemStimulus};
 use crate::{CORESET_FP32_FRAMES_PER_STEM, metrics};
 
-/// Returns the mono left channel of [`v3_varpro::build_v3_causal_probe_excitation`] at `48 kHz`.
+use super::causal_probe::build_v3_causal_probe_excitation;
+
+/// Returns the mono left channel of [`build_v3_causal_probe_excitation`] at `48 kHz`.
 #[must_use]
 pub(super) fn build_v3_causal_probe_excitation_48k() -> Vec<f32> {
-    v3_varpro::build_v3_causal_probe_excitation()
+    build_v3_causal_probe_excitation()
         .into_iter()
         .map(|lr| lr[0])
         .collect()
-}
-
-/// Estimates strictly causal deadtime in samples (`>= 0.0`) and polarity inversion from
-/// [`v3_varpro::estimate_v3_causal_deadtime_and_polarity`].
-#[must_use]
-pub(super) fn estimate_v3_causal_deadtime_and_polarity(dry: &[f32], wet: &[f32]) -> (f64, bool) {
-    v3_varpro::estimate_v3_causal_deadtime_and_polarity(dry, wet)
 }
 
 fn ac_rms_window(sig: &[f32], lo: usize, hi: usize) -> f64 {

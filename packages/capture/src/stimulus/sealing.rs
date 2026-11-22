@@ -10,6 +10,8 @@
 use std::collections::BTreeMap;
 
 use dnam_engine::schema::DnamError;
+use zerocopy::IntoBytes;
+use zerocopy::byteorder::little_endian::U32;
 
 use crate::CORESET_FP32_FRAMES_PER_STEM;
 use crate::align::{
@@ -30,10 +32,7 @@ pub(crate) use controls::{
     interpolate_frame_trajectories,
 };
 pub use freeze_and_pad::recapture_clipped_stem;
-pub(crate) use freeze_and_pad::{
-    build_freeze_transition_stem_stimulus, normalize_stem_channel_to_48k,
-    resample_48k_channels_to_sr,
-};
+pub(crate) use freeze_and_pad::{normalize_stem_channel_to_48k, resample_48k_channels_to_sr};
 
 /// `250 ms` (`12,000` samples at `48 kHz`) active `A5` coreset span inside streaming handoff frames.
 pub(crate) const CORESET_A5_FRAMES_48K: usize = 12_000;
@@ -228,14 +227,15 @@ fn build_inpc_and_vault_spec(
     let dry_fp32 = encode_coreset_fp32(slices.dry_l, slices.dry_r);
     let inpc_channels = if slices.dry_r.is_some() { 2_u16 } else { 1_u16 };
 
-    let mut schedule_320 = [0u8; 320];
-    schedule_320[0..4].copy_from_slice(&(req.carrier_bins.len() as u32).to_le_bytes());
-    schedule_320[4..8].copy_from_slice(&(req.valid_frames as u32).to_le_bytes());
-    schedule_320[8..12].copy_from_slice(&(active_samples as u32).to_le_bytes());
+    let mut schedule_words = [U32::new(0); 80];
+    schedule_words[0] = U32::new(req.carrier_bins.len() as u32);
+    schedule_words[1] = U32::new(req.valid_frames as u32);
+    schedule_words[2] = U32::new(active_samples as u32);
     for (idx, &b) in req.carrier_bins.iter().take(76).enumerate() {
-        let off = 16 + idx * 4;
-        schedule_320[off..off + 4].copy_from_slice(&(b as u32).to_le_bytes());
+        schedule_words[4 + idx] = U32::new(b as u32);
     }
+    let mut schedule_320 = [0u8; 320];
+    schedule_320.copy_from_slice(schedule_words.as_bytes());
     let inpc_bytes =
         build_proj_inpc_capsule(inpc_channels, req.seed_256, &schedule_320, &dry_fp32)?;
 

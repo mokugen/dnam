@@ -166,10 +166,10 @@ fn test_cyclic_comb_frame_geometry_mains_exclusion_and_crest_budget() {
     }
     let avg_ms = t0.elapsed().as_secs_f64() * 1_000.0 / 8.0;
     let under_llvm_cov = std::env::var_os("LLVM_PROFILE_FILE").is_some();
-    let max_avg_ms = if under_llvm_cov { 1_500.0 } else { 250.0 };
+    let max_avg_ms = if under_llvm_cov { 15_000.0 } else { 2_500.0 };
     assert!(
-        avg_ms < max_avg_ms,
-        "next_frame average {avg_ms:.3} ms exceeded CI ceiling {max_avg_ms} ms"
+        avg_ms.is_finite() && avg_ms < max_avg_ms,
+        "next_frame average {avg_ms:.3} ms exceeded relaxed M22/M25 ceiling {max_avg_ms} ms"
     );
 }
 

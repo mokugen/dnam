@@ -1,5 +1,5 @@
 //! `dnam-fixtures` — Pure-Rust Black-Box Ground-Truth Audio Signal-Chain Models
-//! (`Chain-01..12`, `FftCabinetIrModel`), Simulation Kernels ([`sim_kernels`]), Device/Control
+//! (`Chain-01..18`, `FftCabinetIrModel`), Simulation Kernels ([`sim_kernels`]), Device/Control
 //! Metadata (`sample_rate_hz`, `bit_depth`, controls, switches), and Impairment Decorators.
 
 #![forbid(unsafe_code)]
@@ -497,7 +497,8 @@ pub use chains::{
     Chain06EnvelopeResonantSvf, Chain07StereoChorusAndRotary, Chain08LongBbdEchoAnd30sShimmer,
     Chain09La2aOpticalCompressor, Chain10Oc2OctaveDividerAndRingMod, Chain11BiAmpBassAndOutputIron,
     Chain12FullEndToEndStereoRig, Chain12RigMode, Chain13TriBandVcaCompressor,
-    Chain14TriBandCompDistortion, Chain15TubeAmpHeadDi,
+    Chain14TriBandCompDistortion, Chain15TubeAmpHeadDi, Chain16GranularPitchShimmer,
+    Chain17BarberpoleSweep, Chain18ZohQuantizerBitcrusher,
 };
 pub use sim_kernels::{
     DiscreteStateSpace, FftCabinetIrModel, FftConvolver, ImplicitNodalClipper2Node,

@@ -477,7 +477,7 @@ impl<'a, B: EngineBackend> DnamEngine<'a, B> {
                 bus.backing.raw_values[i] = bus.backing.descriptors[i].default_val;
             }
             bus.is_dirty = true;
-            bus.clamp_and_eval_static_if_dirty();
+            bus.eval_static_and_snap_if_dirty();
         }
         self.extra_clamp_mask = 0;
         let n = self.num_controls();

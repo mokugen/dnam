@@ -2,33 +2,32 @@
 //! Sample-Rate Normalization, Freeze-Transition Stem Synthesis, and `400 ms` Differential
 //! Mic-Pad Clipped Stem Re-Capture (`stimulus::sealing::freeze_and_pad`).
 
-use std::collections::BTreeSet;
-
-use dnam_engine::schema::{ControlKind, DnamError};
+use dnam_engine::schema::DnamError;
+use zerocopy::FromBytes;
+use zerocopy::byteorder::little_endian::F32;
 
 use crate::align::{
     DifferentialPadCalibration, compute_pcm_sha256, measure_differential_pad_ratio,
     rescale_padded_stem,
 };
-use crate::proj::schema::DnamProjManifest;
 use crate::proj::vault::{VaultCaptureSpec, replace_capture};
 use crate::resampler::{
     resample_48k_to_arbitrary_rate, resample_arbitrary_rate_to_48k, resampled_frame_len,
 };
-use crate::targets::StemStimulus;
 use crate::{CORESET_FP32_FRAMES_PER_STEM, CORESET_FP32_MIN_FRAMES_PER_STEM};
 
-use super::super::laws::TopologyProbeMode;
+#[cfg(test)]
 use super::super::waveforms::{
-    ActivePrimitiveKind, compute_stmc_psd_88_and_spectral_4096, encode_coreset_fp32_with_frames,
-    synthesize_a5_musical_transient_coreset, synthesize_active_primitive_frame,
+    ActivePrimitiveKind, synthesize_a5_musical_transient_coreset, synthesize_active_primitive_frame,
 };
+use super::super::waveforms::{
+    compute_stmc_psd_88_and_spectral_4096, encode_coreset_fp32_with_frames,
+};
+#[cfg(test)]
 use super::super::{
     ADAPTIVE_FRAME_SAMPLES, ADC_PEAK_GOVERNOR_FS, PEDESTAL_BIN_MONO, build_disjoint_comb_schedule,
     synthesize_cyclic_comb_frame,
 };
-use super::controls::{control_declared_bounds, default_control_vector};
-use super::{CORESET_A5_FRAMES_48K, CORESET_WITH_SETTLE_48K};
 
 /// Resamples up to three `48 kHz` channels (`l`, optional `r`, optional `aux`) to `sr`.
 pub(crate) fn resample_48k_channels_to_sr(
@@ -62,13 +61,17 @@ pub(crate) fn normalize_stem_channel_to_48k(samples: &[f32], sr: u32) -> Vec<f32
     }
 }
 
+#[cfg(test)]
 fn build_freeze_trajectories(
-    manifest: &DnamProjManifest,
+    manifest: &crate::proj::schema::DnamProjManifest,
     freeze_ctrl_idx: usize,
     frame_len: usize,
     n_earliest: usize,
     n_latest: usize,
 ) -> (Vec<f32>, Vec<Vec<f32>>) {
+    use dnam_engine::schema::ControlKind;
+
+    use super::controls::{control_declared_bounds, default_control_vector};
     let base_ctrls = default_control_vector(manifest);
     let ctrl_def = &manifest.base.controls_schema[freeze_ctrl_idx];
     let (unfrozen_val, frozen_val) = match ctrl_def.kind {
@@ -101,13 +104,20 @@ fn build_freeze_trajectories(
 
 /// Synthesizes a timed `freeze_latch` sustain-entry -> live play-over -> release [`StemStimulus`]
 /// (`r[train.capture.planner.freeze-transition]`).
-pub(crate) fn build_freeze_transition_stem_stimulus(
-    manifest: &DnamProjManifest,
+#[cfg(test)]
+fn build_freeze_transition_stem_stimulus(
+    manifest: &crate::proj::schema::DnamProjManifest,
     freeze_ctrl_idx: usize,
     sample_rate_hz: u32,
-    topology_mode: TopologyProbeMode,
+    topology_mode: super::super::laws::TopologyProbeMode,
     seed_256: &[u8; 256],
-) -> StemStimulus {
+) -> crate::targets::StemStimulus {
+    use std::collections::BTreeSet;
+
+    use crate::targets::StemStimulus;
+
+    use super::{CORESET_A5_FRAMES_48K, CORESET_WITH_SETTLE_48K};
+    use crate::stimulus::laws::TopologyProbeMode;
     let empty_mask = BTreeSet::new();
     let sched_l =
         build_disjoint_comb_schedule(48_000, false, Some(PEDESTAL_BIN_MONO), &empty_mask, &[]);
@@ -229,13 +239,13 @@ pub fn recapture_clipped_stem(
     let frame_bytes = if is_stereo { 8 } else { 4 };
     let num_frames =
         (padded_capture.wet_coreset_fp32.len() / frame_bytes).max(CORESET_FP32_FRAMES_PER_STEM);
-    let decoded: Vec<f32> = padded_capture
-        .wet_coreset_fp32
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|w| f32::from_le_bytes(*w))
-        .collect();
+    let decoded: Vec<f32> = <[F32]>::ref_from_bytes(
+        &padded_capture.wet_coreset_fp32[..padded_capture.wet_coreset_fp32.len() & !3],
+    )
+    .map_err(|_| DnamError::SchemaValidationError("invalid STMC fp32 PCM slice".to_string()))?
+    .iter()
+    .map(|v| v.get())
+    .collect();
     let rescaled = rescale_padded_stem(&decoded, pad_cal.pad_gain_linear).map_err(|e| {
         DnamError::SchemaValidationError(format!("mic-pad stem rescale failed: {e}"))
     })?;
@@ -273,13 +283,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use dnam_engine::provenance::DefaultCryptoProvider;
-    use dnam_engine::schema::{ControlSchemaDef, ControlUiHints};
+    use dnam_engine::schema::{ControlKind, ControlSchemaDef, ControlUiHints};
     use serde_json::json;
 
     use crate::proj::bundle::{DnamProjView, build_dnam_proj_container};
     use crate::proj::directory::StmcTrajectoryWindow;
+    use crate::proj::schema::DnamProjManifest;
     use crate::proj::vault::add_capture_with_options;
     use crate::solver::SolverOptions;
+
+    use crate::stimulus::laws::TopologyProbeMode;
 
     use super::super::controls::build_controls_meta_map;
     use super::super::{StemSealRequest, seal_coresets_to_inpc_and_vault_with_override};
@@ -314,13 +327,13 @@ mod tests {
                 name: "Hold".to_string(),
                 kind: ControlKind::Switch,
                 unit: None,
+                represented_switch_options: None,
                 lobatto_degree: None,
                 anchor_nodes_norm: None,
                 declared_range: None,
                 safe_clamped_range: None,
                 default: json!("off"),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
                 declared_options: Some(vec!["off".to_string(), "on".to_string()]),
                 active_options: None,
                 clamp_warning: None,
@@ -333,13 +346,13 @@ mod tests {
                 name: "Depth".to_string(),
                 kind: ControlKind::Range,
                 unit: None,
+                represented_switch_options: None,
                 lobatto_degree: Some(2),
                 anchor_nodes_norm: None,
                 declared_range: Some([0.1, 0.9]),
                 safe_clamped_range: None,
                 default: json!(0.5),
-                conditional_min: BTreeMap::new(),
-                conditional_max: BTreeMap::new(),
+                conditional_bounds: Vec::new(),
                 declared_options: None,
                 active_options: None,
                 clamp_warning: None,

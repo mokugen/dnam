@@ -42,7 +42,9 @@ pub(super) struct Pass2ParamGrads {
     pub d_adaa: Vec<[f64; 4]>,
     pub d_svf_k_nl: Vec<[f64; 4]>,
     pub d_w_ro_direct: Vec<[[f64; 4]; 4]>, // [q][lane][6..10 -> 0..4]
+    pub d_w_ro_pre: Vec<[[f64; 4]; 4]>,    // [q][lane][0..4]
     pub d_direct_s2_u: [f64; 2],
+    pub d_pre_conv_u: [f64; 2],
     pub d_kautz: Vec<[f64; 6]>, // [r_low, theta, c_re_l, c_im_l, c_re_r, c_im_r]
     pub d_op_t: OpTQuadAdjointGrads,
 }
@@ -309,11 +311,15 @@ pub(super) fn assemble_pass2_gradients(
 
     // Readout linear weight gradients + initial CoreQuad feature adjoints.
     let mut d_w_ro_direct = vec![[[0.0_f64; 4]; 4]; q_opt];
+    let mut d_w_ro_pre = vec![[[0.0_f64; 4]; 4]; q_opt];
     let mut d_direct_s2_u = [0.0_f64; 2];
+    let mut d_pre_conv_u = [0.0_f64; 2];
     let mut gx_ux_l: Vec<f64> = (0..n)
         .map(|t| {
             d_direct_s2_u[0] += gx_l[t] * buf.ux_l[t];
             d_direct_s2_u[1] += gx_r[t] * buf.ux_r[t];
+            d_pre_conv_u[0] += gx_pre_l[t] * buf.ux_l[t];
+            d_pre_conv_u[1] += gx_pre_r[t] * buf.ux_r[t];
             model.direct_s2_u_gain[0] * gx_l[t] + model.pre_conv_u_gain[0] * gx_pre_l[t]
         })
         .collect();
@@ -338,6 +344,10 @@ pub(super) fn assemble_pass2_gradients(
                     d_w_ro_direct[q][k][1] += gr_t * f64::from(odd_r[k]);
                     d_w_ro_direct[q][k][2] += gl_t * f64::from(even_l[k]);
                     d_w_ro_direct[q][k][3] += gr_t * f64::from(even_r[k]);
+                    d_w_ro_pre[q][k][0] += pl_t * f64::from(odd_l[k]);
+                    d_w_ro_pre[q][k][1] += pr_t * f64::from(odd_r[k]);
+                    d_w_ro_pre[q][k][2] += pl_t * f64::from(even_l[k]);
+                    d_w_ro_pre[q][k][3] += pr_t * f64::from(even_r[k]);
                 }
                 d_feats[fbase][k] = (pl_t * r[4] + gl_t * r[10]) as f32;
                 d_feats[fbase + 1][k] = (pr_t * r[5] + gr_t * r[11]) as f32;
@@ -460,7 +470,9 @@ pub(super) fn assemble_pass2_gradients(
         d_adaa,
         d_svf_k_nl,
         d_w_ro_direct,
+        d_w_ro_pre,
         d_direct_s2_u,
+        d_pre_conv_u,
         d_kautz,
         d_op_t,
     })

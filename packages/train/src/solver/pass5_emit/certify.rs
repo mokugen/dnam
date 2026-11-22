@@ -29,6 +29,8 @@ pub(super) struct TierRenderBundle {
 pub(super) struct StereoCertBundle {
     pub tier_lufs: [f64; 4],
     pub tier_reports: [TierCertificationReport; 4],
+    pub rep_l: [TierCertificationReport; 4],
+    pub rep_r: [TierCertificationReport; 4],
     pub pair_monotone: [bool; 4],
 }
 
@@ -80,7 +82,7 @@ pub fn compute_itu_bs1770_lufs(sig_l: &[f64], sig_r: &[f64], sr_hz: f64, warmup:
     };
 
     let mean_pow = (k_filter(&sig_l[..n]) + k_filter(&sig_r[..n])).max(1.0e-18);
-    -0.691 + 10.0 * mean_pow.log10()
+    (-0.691 + 10.0 * mean_pow.log10()).max(-120.0)
 }
 
 pub(super) fn render_all_tiers(
@@ -356,9 +358,27 @@ pub(super) fn certify_all_tier_renders_stereo(
                 expected: 4,
                 actual: 0,
             })?;
+    let rep_l: [TierCertificationReport; 4] =
+        rep_l_vec
+            .try_into()
+            .map_err(|_| TrainError::InvalidDimensions {
+                context: "certify_all_tier_renders_stereo_l",
+                expected: 4,
+                actual: 0,
+            })?;
+    let rep_r: [TierCertificationReport; 4] =
+        rep_r_vec
+            .try_into()
+            .map_err(|_| TrainError::InvalidDimensions {
+                context: "certify_all_tier_renders_stereo_r",
+                expected: 4,
+                actual: 0,
+            })?;
     Ok(StereoCertBundle {
         tier_lufs,
         tier_reports,
+        rep_l,
+        rep_r,
         pair_monotone,
     })
 }
@@ -527,6 +547,10 @@ mod tests {
     #[test]
     fn test_head_gain_scale_across_overrides_and_empty_lufs_guard() {
         assert_eq!(compute_itu_bs1770_lufs(&[], &[], 48_000.0, 10), -120.0);
+        assert_eq!(
+            compute_itu_bs1770_lufs(&[0.0; 256], &[0.0; 256], 48_000.0, 32),
+            -120.0
+        );
         let mut model = SonaModelF64::new(48_000.0);
         model.pre_conv_u_gain = [0.6, 0.4];
         model.pre_conv_hp_gain = [0.25, -0.15];

@@ -1,19 +1,21 @@
 #![forbid(unsafe_code)]
-//! `v3` Analytical Variable-Projection (`VarPro`), `uplo='U'` Cholesky & Noise-Subtracted `B-ESR` Solver.
+//! `SONA v3.0` Capture Solver Orchestration & Canonical `dnam-train` / Bézout Re-exports.
 
-pub mod backends;
 pub mod progress;
 pub mod stage_a_probe;
 pub mod stage_b_backbone;
 pub mod stage_c_knobs;
 pub mod stage_d_audit;
 pub mod stages;
-pub mod v3_varpro;
-pub mod wide_gram;
 
-pub use backends::{
-    DefaultTrainerBackend, DynamicTrainer, GaborOperatorBackend, GramCholeskyBackend,
-    KautzCascadeBackend, ScalarTrainerBackend, TrainerBackend, TrainerTask,
+pub use crate::stimulus::pipeline::{
+    build_v3_causal_probe_excitation, estimate_v3_causal_deadtime_and_polarity,
+};
+pub use dnam_train::{
+    CpuRunner, Pass5EmitConfig, SonaModelF64, SonaSolveResult, SonaSolverConfig, SonaTrainDataset,
+    TrainRunner, Wide192Accum, accumulate_uplo_u_wide192, contract_256d_gram_tiled_wide192,
+    decode_dnam_bin_to_model, encode_model_to_dnam_bin, solve_sona_model, solve_uplo_u_cholesky,
+    solve_uplo_u_cholesky_2ch, uplo_u_index, uplo_u_packed_len,
 };
 pub use progress::{
     AtomicTrainerProgress, PROGRESS_MAGIC_DNPR, PROGRESS_WIRE_BYTES, PROGRESS_WIRE_WORDS,
@@ -24,8 +26,7 @@ pub use stage_a_probe::{
 };
 pub use stage_b_backbone::{
     StageBOutputs, StageBSolveConfig, WeightedStemRef, compute_v3_stat_chunk_bytes,
-    patch_v3_readouts_weighted_cholesky, serialize_v3_stat_chunk_ultra, solve_stage_b_backbone,
-    solve_stage_b_backbone_with_progress,
+    serialize_v3_stat_chunk_ultra, solve_stage_b_backbone, solve_stage_b_backbone_with_progress,
 };
 pub use stage_c_knobs::{
     StageCKnobsOutput, decode_coreset_lr, solve_stage_c_knobs, star_center_control_values,
@@ -33,18 +34,11 @@ pub use stage_c_knobs::{
 pub use stage_d_audit::{
     BuyerWatermarkConfig, StageDAuditOptions, StageDSolveOutput, compute_integrated_lufs,
     derive_buyer_gauge_params, derive_buyer_phase_seed, derive_buyer_tardos_codebook,
-    export_runtime_dnam_watermarked, extract_arena_pole_angles_16, extract_arena_pole_angles_34,
-    finalize_stage_d_and_audit, identify_pole_angles_blackbox_from_audio,
-    render_blackbox_probe_response,
+    export_runtime_dnam_watermarked, extract_arena_pole_angles_16, extract_arena_pole_angles_32,
+    extract_arena_pole_angles_34, finalize_stage_d_and_audit,
+    identify_pole_angles_blackbox_from_audio, render_blackbox_probe_response,
 };
 pub use stages::write_inline_cp1_if_fits;
-pub use v3_varpro::{
-    V3TrainDataset, V3TrainStem, build_v3_causal_probe_excitation,
-    estimate_v3_causal_deadtime_and_polarity, fit_v3_core_four_tiers,
-    fit_v3_core_four_tiers_with_backend, fit_v3_matryoshka, fit_v3_matryoshka_fast,
-    fit_v3_matryoshka_fast_with_backend, fit_v3_matryoshka_with_backend,
-};
-pub use wide_gram::{Wide192Accum, accumulate_uplo_u_wide192, contract_256d_gram_tiled_wide192};
 
 /// Quality vs. wall-clock stopping policy for the `v3` Matryoshka solver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -91,8 +85,8 @@ impl Default for SolverOptions {
 }
 
 impl SolverOptions {
-    /// Returns white-box oracle options that preserve an existing populated `28,672 B` physical
-    /// backbone (`Stage 0..IV` + `W_ctrl`) while solving linear readouts, `CP1`, `U_int`, `STAT`, and trims.
+    /// Returns white-box oracle options that preserve an existing populated `30,720 B` physical
+    /// `Arena0` backbone while solving linear readouts, `CP1`, `STAT`, and output trims.
     #[must_use]
     pub const fn preserve_backbone() -> Self {
         Self {
@@ -132,17 +126,6 @@ pub const fn tier_feature_dimension(tier: Tier) -> usize {
     }
 }
 
-/// Returns the packed upper-triangular length $N(N + 1)/2$ for a symmetric $N \times N$ Gram matrix
-/// (`ref[container.proj.stat-uplo-u]`), avoiding `dim * (dim + 1)` intermediate overflow on 32-bit targets.
-#[must_use]
-pub const fn uplo_u_packed_len(dim: usize) -> usize {
-    if dim.is_multiple_of(2) {
-        (dim / 2).saturating_mul(dim.saturating_add(1))
-    } else {
-        dim.saturating_mul(dim.div_ceil(2))
-    }
-}
-
 #[inline]
 const fn checked_uplo_u_packed_len(dim: usize) -> Option<usize> {
     if dim.is_multiple_of(2) {
@@ -152,18 +135,6 @@ const fn checked_uplo_u_packed_len(dim: usize) -> Option<usize> {
         }
     } else {
         dim.checked_mul(dim.div_ceil(2))
-    }
-}
-
-/// Maps upper-triangular coordinates `(i, j)` with `0 <= i <= j < dim` to their column-major
-/// `uplo='U'` packed index $i + j(j + 1)/2$.
-#[must_use]
-pub const fn uplo_u_index(i: usize, j: usize) -> usize {
-    debug_assert!(i <= j);
-    i + if j.is_multiple_of(2) {
-        (j / 2) * (j + 1)
-    } else {
-        j * j.div_ceil(2)
     }
 }
 
@@ -197,117 +168,6 @@ pub fn accumulate_uplo_u_gram_and_cross(
         cross_corr[j][0] += w_fj * target_lr[0];
         cross_corr[j][1] += w_fj * target_lr[1];
     }
-}
-
-pub(crate) fn factorize_uplo_u_cholesky(
-    dim: usize,
-    packed_gram: &[f64],
-    ridge_lambda: f64,
-) -> Result<Vec<f64>, &'static str> {
-    if Some(packed_gram.len()) != checked_uplo_u_packed_len(dim) {
-        return Err("packed_gram length mismatch");
-    }
-    if !ridge_lambda.is_finite() || ridge_lambda < 0.0 || !packed_gram.iter().all(|v| v.is_finite())
-    {
-        return Err("non-finite solver input");
-    }
-    let lambda = ridge_lambda.max(1.0e-12);
-    let mut r_upper = packed_gram.to_vec();
-    for j in 0..dim {
-        r_upper[uplo_u_index(j, j)] += lambda;
-    }
-
-    // Upper-triangular Cholesky: G + lambda*I = R^T R (4-way unrolled column dot products)
-    for j in 0..dim {
-        let col_j = uplo_u_index(0, j);
-        for i in 0..j {
-            let col_i = uplo_u_index(0, i);
-            let (ci_chunks, ci_rem) = r_upper[col_i..col_i + i].as_chunks::<4>();
-            let (cj_chunks, cj_rem) = r_upper[col_j..col_j + i].as_chunks::<4>();
-            let (mut d0, mut d1, mut d2, mut d3) = (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64);
-            for (a, b) in ci_chunks.iter().zip(cj_chunks) {
-                d0 += a[0] * b[0];
-                d1 += a[1] * b[1];
-                d2 += a[2] * b[2];
-                d3 += a[3] * b[3];
-            }
-            let mut dot = (d0 + d1) + (d2 + d3);
-            for (&r_ki, &r_kj) in ci_rem.iter().zip(cj_rem) {
-                dot += r_ki * r_kj;
-            }
-            r_upper[col_j + i] = (r_upper[col_j + i] - dot) / r_upper[col_i + i];
-        }
-        let mut diag = r_upper[col_j + j];
-        for &r_kj in &r_upper[col_j..col_j + j] {
-            diag -= r_kj * r_kj;
-        }
-        if !diag.is_finite() || diag <= 0.0 {
-            return Err("matrix is not positive definite");
-        }
-        r_upper[col_j + j] = diag.sqrt();
-    }
-    Ok(r_upper)
-}
-
-pub(crate) fn solve_factorized_uplo_u_2ch(
-    n: usize,
-    r_upper: &[f64],
-    cross_corr: &[[f64; 2]],
-) -> Result<Vec<[f64; 2]>, &'static str> {
-    if cross_corr.len() != n
-        || !cross_corr
-            .iter()
-            .all(|c| c[0].is_finite() && c[1].is_finite())
-    {
-        return Err("non-finite solver input");
-    }
-
-    // Forward substitution: R^T Y = C
-    let mut y = vec![[0.0_f64; 2]; n];
-    for i in 0..n {
-        let col_i = uplo_u_index(0, i);
-        let mut s0 = cross_corr[i][0];
-        let mut s1 = cross_corr[i][1];
-        for (&r_ki, yk) in r_upper[col_i..col_i + i].iter().zip(&y[..i]) {
-            s0 -= r_ki * yk[0];
-            s1 -= r_ki * yk[1];
-        }
-        let inv_diag = 1.0 / r_upper[col_i + i];
-        y[i][0] = s0 * inv_diag;
-        y[i][1] = s1 * inv_diag;
-    }
-
-    // Back substitution: R W = Y (column-sweep updates)
-    let mut w = y;
-    for k in (0..n).rev() {
-        let col_k = uplo_u_index(0, k);
-        let inv_diag = 1.0 / r_upper[col_k + k];
-        let wk0 = w[k][0] * inv_diag;
-        let wk1 = w[k][1] * inv_diag;
-        w[k] = [wk0, wk1];
-        for (wi, &r_ik) in w[..k].iter_mut().zip(&r_upper[col_k..col_k + k]) {
-            wi[0] -= r_ik * wk0;
-            wi[1] -= r_ik * wk1;
-        }
-    }
-
-    if !w.iter().all(|r| r[0].is_finite() && r[1].is_finite()) {
-        return Err("non-finite solver output");
-    }
-    Ok(w)
-}
-
-/// Solves the regularized symmetric positive-definite linear system
-/// $(\mathbf{G} + \lambda \mathbf{I}) \mathbf{W} = \mathbf{C}$ from a `uplo='U'` packed Gram matrix
-/// via Cholesky factorization (`ref[train.pipeline.backbone-trajectory-opt]`, `ref[train.resume.kronecker-reassembly]`).
-pub fn solve_uplo_u_cholesky_2ch(
-    packed_gram: &[f64],
-    cross_corr: &[[f64; 2]],
-    ridge_lambda: f64,
-) -> Result<Vec<[f64; 2]>, &'static str> {
-    let n = cross_corr.len();
-    let r_upper = factorize_uplo_u_cholesky(n, packed_gram, ridge_lambda)?;
-    solve_factorized_uplo_u_2ch(n, &r_upper, cross_corr)
 }
 
 #[inline]

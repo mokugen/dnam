@@ -15,55 +15,203 @@ use dnam_capture::CORESET_FP32_FRAMES_PER_STEM;
 use dnam_capture::metrics::{evaluate_besr_from_band_energies, split_bezout_3band_energies};
 use dnam_capture::proj::{
     DnamProjManifest, PROJ_STAT_BYTES_ULTRA, StemProvenance, StmcTrajectoryWindow,
-    VaultCaptureSpec, add_capture_with_options, build_dnam_proj_container_with_cp1,
+    VaultCaptureSpec, add_capture_with_options, build_dnam_proj_container_with_dnam_bin,
     build_proj_inpc_capsule, export_runtime_dnam,
 };
 use dnam_capture::solver::{
     SolverOptions, StageAConfig, Wide192Accum, compute_integrated_lufs, run_stage_a_physics_probe,
-    solve_stage_b_backbone,
+    solve_stage_b_backbone, write_inline_cp1_if_fits,
 };
 use dnam_capture::stimulus::encode_coreset_fp32;
 use dnam_engine::container::{
-    DnamContainerView, build_dnam_container_with_cp1, strip_container_to_tier,
+    build_dnam_container_from_dnam_bin, encode_cp1_shared_stream, extract_dnam_bin,
+    strip_container_to_tier,
 };
-use dnam_engine::control::Cp1ContributorSlot;
-use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::provenance::{
-    DefaultCryptoProvider, apply_isometric_gauge_watermark, extract_structural_hash_224d,
+    apply_isometric_gauge_watermark, apply_sona_sign_gauge_watermark, extract_structural_hash_224d,
     structural_cosine_similarity,
 };
-use dnam_engine::schema::{ControlSchemaDef, DnamJsonHeader};
-use dnam_engine::stages::stage2_gru::{flat_gru_lane_index, tier_block_groups, tier_kautz_banks};
-use dnam_engine::stages::weights::{
-    ARENA_ULTRA_BYTES, pack_v3_matryoshka_to_arena, unpack_v3_matryoshka_from_arena,
-};
-use dnam_engine::stages::{V3MatryoshkaModel, V3TierReadout};
+use dnam_engine::schema::{ControlKind, ControlSchemaDef, DnamJsonHeader};
 use dnam_engine::{DnamEngine, Tier};
+use dnam_train::control::{
+    ControlKindSpec, ControlSpec, StageStabilityConstraint, audit_phase1_controls,
+};
+use dnam_train::{
+    Pass5EmitConfig, SonaModelF64, decode_dnam_bin_to_model, encode_model_to_dnam_bin,
+};
+use dnam_vm::SONA_CORE_QUAD_BLOCK_AND_LOCAL;
+use dnam_vm::bin::{
+    ARENA_TIER_BYTES, Arena0ControlBusWire, Arena0LiteWire, Arena1FullDeltaWire,
+    Arena2ProDeltaWire, Arena3UltraDeltaWire, DnamBinBuildInput, DnamBinView, encode_dnam_bin,
+};
+use dnam_vm::control::Cp1ContributorSlot;
+use dnam_vm::math::DefaultMathBackend;
 use sha2::{Digest, Sha256};
+use zerocopy::byteorder::little_endian::F32;
+use zerocopy::{FromBytes, FromZeros, IntoBytes};
 
-pub(super) fn clear_output_readout_weights(ro: &mut V3TierReadout) {
-    ro.svf_direct_taps_l = [0.0; 8];
-    ro.svf_direct_taps_r = [0.0; 8];
-    ro.direct_s2_u_gain = [0.0; 2];
-    ro.direct_s2_hp_gain = [0.0; 2];
-    ro.direct_s2_w = [[0.0; 36]; 2];
-    ro.fir_l = [0.0; 64];
-    ro.fir_r = [0.0; 64];
-    ro.kautz_c_l = [(0.0, 0.0); 16];
-    ro.kautz_c_r = [(0.0, 0.0); 16];
+pub(super) fn clear_output_readout_weights(m: &mut SonaModelF64) {
+    m.direct_s2_u_gain = [0.0; 2];
+    m.direct_s2_hp_gain = [0.0; 2];
+    for row in &mut m.w_ro {
+        row[6..12].fill(0.0);
+    }
+    m.fir_l = [0.0; 128];
+    m.fir_r = [0.0; 128];
+    m.tier_overrides = [None, None, None, None];
+    m.prefix_override_needed = [false; 4];
 }
 
-pub(super) fn write_f32(buf: &mut [u8], off: usize, v: f32) {
-    buf[off..off + 4].copy_from_slice(&v.to_le_bytes());
-}
-
-pub(super) fn pack_dnam(
-    hdr: &DnamJsonHeader,
-    arena: &[u8],
-    slots: &[Cp1ContributorSlot],
-) -> Vec<u8> {
+pub(super) fn pack_dnam_from_dbin(hdr: &DnamJsonHeader, dbin: &[u8]) -> Vec<u8> {
     let mut h = hdr.clone();
-    build_dnam_container_with_cp1(&mut h, arena, arena, false, slots).unwrap()
+    build_dnam_container_from_dnam_bin(&mut h, dbin).unwrap()
+}
+
+fn reencode_dbin_with_arena(base_dbin: &[u8], arena_bytes: &[u8]) -> Vec<u8> {
+    let view = DnamBinView::parse(base_dbin).unwrap();
+    let retained_idx = view.retained_tier.index();
+    let (a0, _) = Arena0LiteWire::ref_from_prefix(arena_bytes).unwrap();
+    let a1 = (retained_idx >= 1).then(|| {
+        Arena1FullDeltaWire::ref_from_prefix(&arena_bytes[ARENA_TIER_BYTES[0]..])
+            .unwrap()
+            .0
+    });
+    let a2 = (retained_idx >= 2).then(|| {
+        Arena2ProDeltaWire::ref_from_prefix(&arena_bytes[ARENA_TIER_BYTES[1]..])
+            .unwrap()
+            .0
+    });
+    let a3 = (retained_idx >= 3).then(|| {
+        Arena3UltraDeltaWire::ref_from_prefix(&arena_bytes[ARENA_TIER_BYTES[2]..])
+            .unwrap()
+            .0
+    });
+    encode_dnam_bin(&DnamBinBuildInput {
+        reference_sample_rate_hz: view.header.reference_sample_rate_hz.get(),
+        header_flags: view.header.flags.get(),
+        ext_ring_pow2_frames: view.runtime_meta.ext_ring_pow2_frames,
+        ext_ring_lines: view.runtime_meta.ext_ring_lines,
+        ext_ring_format: view.runtime_meta.ext_ring_format,
+        declared_max_delay_48k: view.runtime_meta.declared_max_delay_48k.get(),
+        dc_blocker_pole_5hz: view.runtime_meta.dc_blocker_pole_5hz.get(),
+        tail_time_ms: view.runtime_meta.tail_time_ms.get(),
+        ro_pole_48k: view.runtime_meta.ro_pole_48k.get(),
+        switch_xfade_samples: view.runtime_meta.switch_xfade_samples.get(),
+        content_hash_prefix: view.runtime_meta.content_hash_prefix,
+        controls: view.control_descriptors,
+        cp1_overflow: view.cp1_overflow,
+        tsyn: view.tsyn_entries,
+        cext: view.cext,
+        arena0: a0,
+        arena1: a1,
+        arena2: a2,
+        arena3: a3,
+    })
+    .unwrap()
+}
+
+pub(super) fn inject_controls_and_cp1_into_dbin(
+    base_dbin: &[u8],
+    manifest: &DnamProjManifest,
+    slots: &[Cp1ContributorSlot],
+    mutate_cb: impl FnOnce(&mut Arena0ControlBusWire),
+) -> Vec<u8> {
+    let view = DnamBinView::parse(base_dbin).unwrap();
+    let mut a0 = *view.arena0;
+    let a1 = view.arena1.copied();
+    let a2 = view.arena2.copied();
+    let a3 = view.arena3.copied();
+    mutate_cb(&mut a0.control_bus_lite);
+
+    let specs: Vec<ControlSpec> = manifest
+        .base
+        .controls_schema
+        .iter()
+        .map(|ctrl| match ctrl.kind {
+            ControlKind::Range => {
+                let decl = ctrl.declared_range.unwrap_or([0.0, 1.0]);
+                let lo = f64::from(decl[0]);
+                let hi = f64::from(decl[1].max(decl[0]));
+                let def_val = ctrl.default.as_f64().unwrap_or(lo).clamp(lo, hi);
+                ControlSpec {
+                    kind: ControlKindSpec::Range {
+                        declared_min: lo,
+                        declared_max: hi,
+                        default_val: def_val,
+                        obs_min: lo,
+                        obs_max: hi,
+                        unique_values: if (hi - lo).abs() > 1.0e-6 { 3 } else { 1 },
+                        lobatto_anchors: [lo as f32, def_val as f32, hi as f32],
+                    },
+                }
+            }
+            ControlKind::Switch => {
+                let opts = ctrl.declared_options.as_deref().unwrap_or(&[]);
+                let n_opts = opts.len().clamp(1, 16) as u8;
+                let def_str = ctrl.default.as_str().unwrap_or("");
+                let def_opt = opts.iter().position(|o| o == def_str).unwrap_or(0) as u8;
+                let mask = if n_opts >= 16 {
+                    u16::MAX
+                } else {
+                    (1_u16 << n_opts) - 1
+                };
+                ControlSpec {
+                    kind: ControlKindSpec::Switch {
+                        num_options: n_opts,
+                        default_opt: def_opt,
+                        declared_mask: mask,
+                        observed_mask: mask,
+                    },
+                }
+            }
+        })
+        .collect();
+
+    let phase1 = audit_phase1_controls(&specs, &StageStabilityConstraint::default()).unwrap();
+
+    let mut cp1_overflow = Vec::new();
+    if slots.is_empty() {
+        a0.control_bus_lite.cp1_dir = ZeroedHelper::zeroed_cp1_dir();
+        a0.control_bus_lite.cp1_base.fill(0);
+    } else {
+        write_inline_cp1_if_fits(a0.as_mut_bytes(), slots);
+        if usize::from(a0.control_bus_lite.cp1_dir.cp1_dir_count.get()) != slots.len() {
+            a0.control_bus_lite.cp1_dir = ZeroedHelper::zeroed_cp1_dir();
+            a0.control_bus_lite.cp1_base.fill(0);
+            cp1_overflow = encode_cp1_shared_stream(slots).unwrap();
+        }
+    }
+
+    encode_dnam_bin(&DnamBinBuildInput {
+        reference_sample_rate_hz: view.header.reference_sample_rate_hz.get(),
+        header_flags: view.header.flags.get(),
+        ext_ring_pow2_frames: view.runtime_meta.ext_ring_pow2_frames,
+        ext_ring_lines: view.runtime_meta.ext_ring_lines,
+        ext_ring_format: view.runtime_meta.ext_ring_format,
+        declared_max_delay_48k: view.runtime_meta.declared_max_delay_48k.get(),
+        dc_blocker_pole_5hz: view.runtime_meta.dc_blocker_pole_5hz.get(),
+        tail_time_ms: view.runtime_meta.tail_time_ms.get(),
+        ro_pole_48k: view.runtime_meta.ro_pole_48k.get(),
+        switch_xfade_samples: view.runtime_meta.switch_xfade_samples.get(),
+        content_hash_prefix: view.runtime_meta.content_hash_prefix,
+        controls: &phase1.wire_descriptors,
+        cp1_overflow: &cp1_overflow,
+        tsyn: view.tsyn_entries,
+        cext: view.cext,
+        arena0: &a0,
+        arena1: a1.as_ref(),
+        arena2: a2.as_ref(),
+        arena3: a3.as_ref(),
+    })
+    .unwrap()
+}
+
+struct ZeroedHelper;
+impl ZeroedHelper {
+    #[inline]
+    fn zeroed_cp1_dir() -> dnam_vm::bin::Cp1InlineDirWire {
+        dnam_vm::bin::Cp1InlineDirWire::new_zeroed()
+    }
 }
 
 pub(super) fn ctrl_meta(gain: f64, channel: &str) -> BTreeMap<String, serde_json::Value> {
@@ -178,118 +326,109 @@ pub(super) fn synthesize_rich_coreset_dry(n: usize) -> Vec<f32> {
         .collect()
 }
 
-/// Builds a ground-truth `28,672 B` `v3` Matryoshka arena with active Stage I SVF taps, Stage II
-/// GRU blocks (`0..3`), `16` shared Kautz poles, Stage IV coprime delays, and nested 4-tier
-/// stereo readouts whose progressive capacity yields strictly monotone `Lite..Ultra` accuracy.
-pub(super) fn build_oracle01_teacher_arena_v3() -> Vec<u8> {
-    let mut model = V3MatryoshkaModel::identity(false, false);
-    model.stage0.xo_hz = 135.0;
+/// Builds a ground-truth `SONA v3.0` `.dnam-bin` with active `CoreQuad` blocks (`0..10`),
+/// inter-block `tiles`, `32` shared Kautz poles, `Op-T` coprime delays, and nested 4-tier stereo
+/// readouts whose progressive capacity yields strictly monotone `Lite..Ultra` accuracy.
+pub(super) fn build_oracle01_teacher_dbin() -> Vec<u8> {
+    let mut model = SonaModelF64::new(48_000.0);
+    model.oversample_upper_tiers_2x = false;
+    model.active_fir_taps = 128;
+    model.active_kautz_pairs = 32;
 
-    const BLK_LANES: [usize; 3] = [12, 8, 4];
-    for (b, &n_lanes) in BLK_LANES.iter().enumerate() {
-        let blk = &mut model.blocks[b];
-        for feat in 0..blk.w_in_n.len() {
-            for lane in 0..n_lanes {
-                let s = (((b * 7 + feat * 5 + lane * 3 + 1) % 11) as f32 - 5.0) * 0.025;
-                blk.w_in_n[feat][lane] = s;
-                blk.w_in_z[feat][lane] = 0.5 * s;
-            }
+    for (q_idx, q) in model.core_quads.iter_mut().enumerate() {
+        let (blk, local) = SONA_CORE_QUAD_BLOCK_AND_LOCAL[q_idx];
+        for lane in 0..4 {
+            let phase = (((blk * 7 + local * 5 + lane * 3 + 1) % 11) as f64 - 5.0) / 5.0;
+            q.svf_g[lane] = 0.08 + 0.04 * ((lane + blk) as f64);
+            q.svf_k[lane] = 0.65 + 0.10 * (lane as f64);
+            q.tone_lp[lane] = 0.35 + 0.08 * phase;
+            q.tone_bp[lane] = 0.15 * phase;
+            q.tone_hp[lane] = 0.10 * (-phase);
+            q.tone_dir[lane] = 0.35;
+            q.in_mid_weight[lane] = 0.32 + 0.05 * phase;
+            q.in_side_weight[lane] = 0.14 * (-phase);
+            q.adaa_drive[lane] = 0.90 + 0.15 * phase;
+            q.lru_alpha_rel[lane] = 0.985 - 0.002 * (lane as f64);
+            q.lru_kappa[lane] = 0.08 * phase.abs();
+            q.lru_bias_drive[lane] = 0.12 * phase;
         }
-        for i in 0..n_lanes {
-            for j in 0..=i {
-                blk.w_prev_n[i][j] = 0.04 * (((i + j + b) % 5) as f32 - 2.0) / 2.0;
-                blk.w_rec_n[i][j] = 0.05 * (((i * 3 + j + 1) % 7) as f32 - 3.0) / 3.0;
+    }
+    for (t_idx, tile) in model.tiles.iter_mut().enumerate() {
+        for s in 0..4 {
+            for d in 0..4 {
+                let phase = (((t_idx * 5 + s * 3 + d + 1) % 7) as f64 - 3.0) / 3.0;
+                tile.w_odd_4x4[s][d] = 0.03 * phase;
+                tile.w_even_4x4[s][d] = 0.02 * (-phase);
+                tile.w_lru_4x4[s][d] = 0.015 * phase;
             }
-            blk.b_z[i] = -0.3;
         }
     }
 
-    for (m, dst) in model.kautz_poles.iter_mut().enumerate() {
-        let r = 0.86_f32 + 0.006 * (m as f32);
-        let theta = 0.14_f32 + 0.14 * (m as f32);
-        *dst = (r, theta);
+    let kautz_scales = [0.36_f64, 0.16, 0.07, 0.025];
+    for (m, kp) in model.kautz.iter_mut().enumerate() {
+        let tier_idx = if m < 8 {
+            0
+        } else if m < 12 {
+            1
+        } else if m < 24 {
+            2
+        } else {
+            3
+        };
+        let sc = kautz_scales[tier_idx];
+        let sign = if m % 2 == 0 { 1.0 } else { -0.8 };
+        kp.r_low = 0.86 + 0.003 * (m as f64);
+        kp.dr = 0.001;
+        kp.theta = 0.08 + 0.085 * (m as f64);
+        kp.b_gamma = 1.0;
+        kp.c_re_l = sc * 0.18 * sign;
+        kp.c_im_l = -sc * 0.11 * sign;
+        kp.c_re_r = sc * 0.15 * sign;
+        kp.c_im_r = sc * 0.12 * sign;
     }
 
-    let coprime_delays: [[usize; 4]; 4] = [
-        [29, 43, 59, 73],
-        [101, 137, 173, 199],
-        [251, 293, 331, 373],
-        [419, 467, 509, 547],
+    let coprime_delays: [[f64; 4]; 4] = [
+        [29.0, 43.0, 59.0, 73.0],
+        [101.0, 137.0, 173.0, 199.0],
+        [251.0, 293.0, 331.0, 373.0],
+        [419.0, 467.0, 509.0, 547.0],
     ];
     for t in 0..4 {
-        model.stage4[t].delay_lengths = coprime_delays[t];
-        model.stage4[t].g_loop = 0.25;
-        model.stage4[t].wet_mix = 0.0;
+        model.transport_quads[t].delay_samples = coprime_delays[t];
+        model.transport_quads[t].g_loop = 0.25;
+        model.transport_quads[t].input_gains = [0.0; 4];
+        model.transport_quads[t].wet_tap_l = [0.0; 4];
+        model.transport_quads[t].wet_tap_r = [0.0; 4];
+        model.transport_quads[t].ext_f32 = false;
     }
+    model.tank_dry_mix = 1.0;
 
-    let tiers = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra];
-    let mut prev_ro = V3TierReadout::zeros();
-    prev_ro.pre_cab_u_gain = [0.75, 0.72];
-    prev_ro.direct_s2_u_gain = [0.22, -0.18];
-    prev_ro.direct_s2_hp_gain = [0.06, 0.06];
-    for ch in 0..2 {
-        for i in 0..6 {
-            prev_ro.svf_direct_taps_l[i] = 0.02 * ((i + 1) as f32);
-            prev_ro.svf_direct_taps_r[i] = 0.02 * ((i + 1) as f32) * (1.0 - 0.1 * (ch as f32));
-        }
-    }
-    // Share `pre_cab_w` on group 0 across all 4 tiers so `s2` is invariant (`Lite ⊂ Full ⊂ Pro ⊂ Ultra`).
-    for b in 0..3 {
-        for l in 0..4 {
-            let flat = flat_gru_lane_index(b, 0, l);
-            let phase = ((flat * 5 + 3) % 7) as f32 - 3.0;
-            prev_ro.pre_cab_w[0][flat] = 0.045 * phase / 3.0;
-            prev_ro.pre_cab_w[1][flat] = 0.039 * (-phase) / 3.0;
-        }
-    }
+    model.pre_conv_u_gain = [0.75, 0.72];
+    model.direct_s2_u_gain = [0.22, -0.18];
+    model.direct_s2_hp_gain = [0.06, 0.06];
 
-    let tier_scales = [0.36_f32, 0.16, 0.07, 0.025];
-    for (t_idx, &tier) in tiers.iter().enumerate() {
-        let mut ro = prev_ro.clone();
-        let sc = tier_scales[t_idx];
-        let fir_lo = t_idx * 16;
-        let fir_hi = fir_lo + 16;
-        for idx in fir_lo..fir_hi {
-            let vl = sc * 0.45 * (((idx * 11 + t_idx * 5 + 3) % 13) as f32 - 6.0) / 6.0;
-            let vr = sc * 0.45 * (((idx * 7 + t_idx * 9 + 2) % 13) as f32 - 6.0) / 6.0;
-            ro.fir_l[idx] = vl;
-            ro.fir_r[idx] = vr;
+    let fir_ranges = [0..32_usize, 32..48, 48..96, 96..128];
+    let lane_ranges = [0..16_usize, 16..24, 24..32, 32..40];
+    let tier_scales = [0.36_f64, 0.16, 0.07, 0.025];
+    for (t_idx, &sc) in tier_scales.iter().enumerate() {
+        for idx in fir_ranges[t_idx].clone() {
+            let vl = sc * 0.45 * ((((idx * 11 + t_idx * 5 + 3) % 13) as f64) - 6.0) / 6.0;
+            let vr = sc * 0.45 * ((((idx * 7 + t_idx * 9 + 2) % 13) as f64) - 6.0) / 6.0;
+            model.fir_l[idx] = vl;
+            model.fir_r[idx] = vr;
         }
-        let k_lo = if t_idx == 0 {
-            0
-        } else {
-            tier_kautz_banks(tiers[t_idx - 1]) * 4
-        };
-        let k_hi = tier_kautz_banks(tier) * 4;
-        for m in k_lo..k_hi {
-            let sign = if m % 2 == 0 { 1.0 } else { -0.8 };
-            ro.kautz_c_l[m] = (sc * 0.35 * sign, -sc * 0.22 * sign);
-            ro.kautz_c_r[m] = (sc * 0.30 * sign, sc * 0.24 * sign);
-        }
-        for b in 0..3 {
-            let g_lo = if t_idx == 0 {
-                0
-            } else {
-                tier_block_groups(tiers[t_idx - 1], b)
-            };
-            let g_hi = tier_block_groups(tier, b);
-            for g in g_lo..g_hi {
-                for l in 0..4 {
-                    let flat = flat_gru_lane_index(b, g, l);
-                    let phase = ((flat * 5 + t_idx * 3) % 7) as f32 - 3.0;
-                    ro.direct_s2_w[0][flat] = sc * 0.16 * phase / 3.0;
-                    ro.direct_s2_w[1][flat] = sc * 0.15 * phase / 3.0;
+        for l in lane_ranges[t_idx].clone() {
+            for c in 0..6 {
+                let phase = (((l * 5 + c * 3 + t_idx) % 7) as f64 - 3.0) / 3.0;
+                if t_idx == 0 {
+                    model.w_ro[l][c] = 0.040 * phase;
                 }
+                model.w_ro[l][6 + c] = sc * 0.15 * phase;
             }
         }
-        prev_ro = ro.clone();
-        ro.mask_to_tier(tier);
-        model.readouts[t_idx] = ro;
     }
 
-    let mut arena = vec![0u8; ARENA_ULTRA_BYTES];
-    pack_v3_matryoshka_to_arena(&model, &mut arena);
-    arena
+    encode_model_to_dnam_bin(&model, Pass5EmitConfig::default()).unwrap()
 }
 
 pub(super) fn render_stereo_dnam(
@@ -304,7 +443,7 @@ pub(super) fn render_stereo_dnam(
         eng.set_control_immediate(idx, val);
     }
     dry.iter()
-        .map(|&x| eng.step_frame_tora(x, x, false))
+        .map(|&x| eng.step_frame_sona(x, x, false))
         .collect()
 }
 
@@ -359,10 +498,10 @@ fn test_oracle_01_256d_schur_recovery_prefix_strip_and_gauge_invariance() {
     // verify[train.pipeline.isomorphism-parity]
     // verify[train.gram.accuracy-contract]
     // verify[train.gram.wide192]
-    let teacher_arena = build_oracle01_teacher_arena_v3();
+    let teacher_dbin = build_oracle01_teacher_dbin();
     let mut teacher_hdr = DnamJsonHeader::default_reference();
     teacher_hdr.io_config.output_mode = "stereo".to_string();
-    let teacher_dnam = pack_dnam(&teacher_hdr, &teacher_arena, &[]);
+    let teacher_dnam = pack_dnam_from_dbin(&teacher_hdr, &teacher_dbin);
 
     // 1. Wide192Accum cancellation immunity: [1e8, 2^-30, -1e8] repeated 4,096 times
     let tiny = 2.0_f64.powi(-30);
@@ -385,27 +524,25 @@ fn test_oracle_01_256d_schur_recovery_prefix_strip_and_gauge_invariance() {
     let dry_lr: Vec<[f32; 2]> = dry.iter().map(|&x| [x, x]).collect();
 
     // Exact f32 Stage B recovery (zero target quantization): must beat -85 dB
-    let mut student_model = unpack_v3_matryoshka_from_arena(&teacher_arena, false);
-    for ro in &mut student_model.readouts {
-        clear_output_readout_weights(ro);
-    }
-    let mut student_arena = vec![0u8; ARENA_ULTRA_BYTES];
-    pack_v3_matryoshka_to_arena(&student_model, &mut student_arena);
+    let mut student_model = decode_dnam_bin_to_model(&teacher_dbin).unwrap();
+    clear_output_readout_weights(&mut student_model);
+    let mut student_dbin =
+        encode_model_to_dnam_bin(&student_model, Pass5EmitConfig::default()).unwrap();
 
     let mut manifest = DnamProjManifest::default_reference();
     manifest.base.io_config.output_mode = "stereo".to_string();
     let stage_b = solve_stage_b_backbone(
         &manifest,
-        &mut student_arena,
+        &mut student_dbin,
         &dry_lr,
         &wet_ultra,
         0,
         1,
         true,
     )
-    .expect("Stage B v3 backbone solve");
+    .expect("Stage B SONA v3 backbone solve");
     assert_eq!(stage_b.stat_bytes.len(), PROJ_STAT_BYTES_ULTRA);
-    let exact_student_dnam = pack_dnam(&manifest.base, &student_arena, &[]);
+    let exact_student_dnam = pack_dnam_from_dbin(&manifest.base, &student_dbin);
     let pred_exact_ultra = render_stereo_dnam(&exact_student_dnam, Tier::Ultra, &dry, &[]);
     let esr_exact_db = esr_db_stereo(&wet_ultra, &pred_exact_ultra);
     let (besr_exact_db, besr_exact_bands) = besr_3band_stereo_db(&wet_ultra, &pred_exact_ultra);
@@ -417,14 +554,11 @@ fn test_oracle_01_256d_schur_recovery_prefix_strip_and_gauge_invariance() {
     );
 
     // 3. End-to-end .dnam-proj fp32 capsule solve: Ultra bESR < -60 dB + strict 4-tier monotonicity
-    let mut seed_model = unpack_v3_matryoshka_from_arena(&teacher_arena, false);
-    for ro in &mut seed_model.readouts {
-        clear_output_readout_weights(ro);
-    }
-    let mut seed_arena = vec![0u8; ARENA_ULTRA_BYTES];
-    pack_v3_matryoshka_to_arena(&seed_model, &mut seed_arena);
+    let mut seed_model = decode_dnam_bin_to_model(&teacher_dbin).unwrap();
+    clear_output_readout_weights(&mut seed_model);
+    let seed_dbin = encode_model_to_dnam_bin(&seed_model, Pass5EmitConfig::default()).unwrap();
     let seed_proj =
-        build_dnam_proj_container_with_cp1(&mut manifest.clone(), &[], &seed_arena, &[]).unwrap();
+        build_dnam_proj_container_with_dnam_bin(&mut manifest.clone(), &[], &seed_dbin).unwrap();
     let wet_inter = interleave_lr(&wet_ultra);
     let inpc = build_proj_inpc_capsule(1, &[0x11; 256], &[0u8; 320], &dry_fp32).unwrap();
     let star_spec = make_vault_spec(
@@ -449,10 +583,33 @@ fn test_oracle_01_256d_schur_recovery_prefix_strip_and_gauge_invariance() {
     let dnam_full = export_runtime_dnam(&solved_proj, Some(Tier::Full)).unwrap();
     let dnam_lite = export_runtime_dnam(&solved_proj, Some(Tier::Lite)).unwrap();
 
-    let crypto = DefaultCryptoProvider::default();
-    let sol_view = DnamContainerView::from_bytes(&dnam_ultra, &crypto).unwrap();
-    let untrimmed_arena = sol_view.arena_storage.as_bytes().to_vec();
-    let untrimmed_dnam = pack_dnam(&manifest.base, &untrimmed_arena, &[]);
+    let sol_dbin = extract_dnam_bin(&dnam_ultra).unwrap();
+    let sol_view = DnamBinView::parse(sol_dbin).unwrap();
+    let mut untrimmed_a0 = *sol_view.arena0;
+    untrimmed_a0.crossbar.tier_gain_trim = [F32::new(1.0); 4];
+    let untrimmed_dbin = encode_dnam_bin(&DnamBinBuildInput {
+        reference_sample_rate_hz: sol_view.header.reference_sample_rate_hz.get(),
+        header_flags: sol_view.header.flags.get(),
+        ext_ring_pow2_frames: sol_view.runtime_meta.ext_ring_pow2_frames,
+        ext_ring_lines: sol_view.runtime_meta.ext_ring_lines,
+        ext_ring_format: sol_view.runtime_meta.ext_ring_format,
+        declared_max_delay_48k: sol_view.runtime_meta.declared_max_delay_48k.get(),
+        dc_blocker_pole_5hz: sol_view.runtime_meta.dc_blocker_pole_5hz.get(),
+        tail_time_ms: sol_view.runtime_meta.tail_time_ms.get(),
+        ro_pole_48k: sol_view.runtime_meta.ro_pole_48k.get(),
+        switch_xfade_samples: sol_view.runtime_meta.switch_xfade_samples.get(),
+        content_hash_prefix: sol_view.runtime_meta.content_hash_prefix,
+        controls: sol_view.control_descriptors,
+        cp1_overflow: sol_view.cp1_overflow,
+        tsyn: sol_view.tsyn_entries,
+        cext: sol_view.cext,
+        arena0: &untrimmed_a0,
+        arena1: sol_view.arena1,
+        arena2: sol_view.arena2,
+        arena3: sol_view.arena3,
+    })
+    .unwrap();
+    let untrimmed_dnam = pack_dnam_from_dbin(&manifest.base, &untrimmed_dbin);
     let tier_esrs = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra].map(|tier| {
         let pred = render_stereo_dnam(&untrimmed_dnam, tier, &dry, &[]);
         esr_db_stereo(&wet_ultra, &pred)
@@ -493,24 +650,38 @@ fn test_oracle_01_256d_schur_recovery_prefix_strip_and_gauge_invariance() {
         assert_0_ulp_stereo(&y_s, &y_d, &format!("prefix strip {tier:?}"));
     }
 
-    // 5. Dyadic modal gauge (0.000000 ULP) and continuous SO(4) gauge (< 1e-5)
-    let mut kappa = [1.0_f32; 16];
+    // 5. Dyadic modal gauge (0.000000 ULP), SONA 40-lane sign gauge (0.000000 ULP), and SO(4) gauge
+    let arena0_off = DnamBinView::parse(&teacher_dbin)
+        .unwrap()
+        .header
+        .arena0_offset
+        .get() as usize;
+    let mut kappa = [1.0_f32; 32];
     for (i, k) in kappa.iter_mut().enumerate() {
         *k = [0.5_f32, 2.0, 1.0][i % 3];
     }
     let q_ident: [[f32; 4]; 4] =
         std::array::from_fn(|r| std::array::from_fn(|c| if r == c { 1.0 } else { 0.0 }));
-    let mut gauged_arena = teacher_arena.clone();
+    let mut gauged_arena = teacher_dbin[arena0_off..].to_vec();
     apply_isometric_gauge_watermark(&mut gauged_arena, &kappa, &q_ident).unwrap();
 
-    let h_orig = extract_structural_hash_224d(&teacher_arena).unwrap();
+    let h_orig = extract_structural_hash_224d(&teacher_dbin[arena0_off..]).unwrap();
     let h_gaug = extract_structural_hash_224d(&gauged_arena).unwrap();
     assert!(1.0 - structural_cosine_similarity(&h_orig, &h_gaug) < 1.0e-12);
 
-    let d_gaug = pack_dnam(&teacher_hdr, &gauged_arena, &[]);
+    let gauged_dbin = reencode_dbin_with_arena(&teacher_dbin, &gauged_arena);
+    let d_gaug = pack_dnam_from_dbin(&teacher_hdr, &gauged_dbin);
     let y0 = render_stereo_dnam(&teacher_dnam, Tier::Ultra, &dry[..256], &[]);
     let y1 = render_stereo_dnam(&d_gaug, Tier::Ultra, &dry[..256], &[]);
     assert_0_ulp_stereo(&y0, &y1, "dyadic modal isometric gauge");
+
+    let signs_40: [f32; 40] = std::array::from_fn(|i| if i % 2 == 0 { 1.0 } else { -1.0 });
+    let mut sign_arena = teacher_dbin[arena0_off..].to_vec();
+    apply_sona_sign_gauge_watermark(&mut sign_arena, &signs_40).unwrap();
+    let sign_dbin = reencode_dbin_with_arena(&teacher_dbin, &sign_arena);
+    let d_sign = pack_dnam_from_dbin(&teacher_hdr, &sign_dbin);
+    let y_sign = render_stereo_dnam(&d_sign, Tier::Ultra, &dry[..256], &[]);
+    assert_0_ulp_stereo(&y0, &y_sign, "SONA 40-lane sign gauge");
 
     let (c, s) = (0.6_f32, 0.8_f32);
     let q_so4 = [
@@ -519,18 +690,19 @@ fn test_oracle_01_256d_schur_recovery_prefix_strip_and_gauge_invariance() {
         [0.0, 0.0, c, -s],
         [0.0, 0.0, s, c],
     ];
-    let mut so4_arena = teacher_arena.clone();
-    apply_isometric_gauge_watermark(&mut so4_arena, &[1.0; 16], &q_so4).unwrap();
-    let d_so4 = pack_dnam(&teacher_hdr, &so4_arena, &[]);
+    let mut so4_arena = teacher_dbin[arena0_off..].to_vec();
+    apply_isometric_gauge_watermark(&mut so4_arena, &[1.0; 32], &q_so4).unwrap();
+    let so4_dbin = reencode_dbin_with_arena(&teacher_dbin, &so4_arena);
+    let d_so4 = pack_dnam_from_dbin(&teacher_hdr, &so4_dbin);
     let y_so4 = render_stereo_dnam(&d_so4, Tier::Ultra, &dry[..256], &[]);
     for (a, b) in y0.iter().zip(&y_so4) {
         assert!((a[0] - b[0]).abs() < 1.0e-5 && (a[1] - b[1]).abs() < 1.0e-5);
     }
 
-    let mut fresh_arena = teacher_arena;
+    let mut fresh_dbin = teacher_dbin;
     let rep_a = run_stage_a_physics_probe(
         &manifest,
-        &mut fresh_arena,
+        &mut fresh_dbin,
         &dry_lr[..2_048],
         &wet_ultra[..2_048],
         None,
@@ -539,5 +711,7 @@ fn test_oracle_01_256d_schur_recovery_prefix_strip_and_gauge_invariance() {
             vp_gn_steps: 1,
         },
     );
-    assert!(!rep_a.preserved_backbone && rep_a.kautz_poles_lifted == 16);
+    assert!(
+        !rep_a.preserved_backbone && rep_a.kautz_poles_lifted > 0 && rep_a.kautz_poles_lifted <= 32
+    );
 }

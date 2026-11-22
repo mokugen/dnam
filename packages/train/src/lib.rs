@@ -101,11 +101,12 @@ pub use solver::{
     Pass2OptConfig, Pass2OptReport, Pass3VarProReport, Pass5EmitConfig, Pass5EmitResult,
     ProgressMetrics, SonaModelF64, SonaSolveResult, SonaSolverConfig, SonaTrainDataset,
     StereoTrainingPairs, TierReadoutPrefixF64, TrainingPhase, TrainingStatus, TransportQuadF64,
-    compute_itu_bs1770_lufs, encode_model_to_dnam_bin, eval_kautz_modal_and_adjoint,
-    eval_op_n_pre_and_adjoint, eval_op_t_transport_and_adjoint, generate_generic_sobol_seeds,
-    quantize_kautz_pole_q8, quantize_ltas_error_q20_i8, run_cpu_op_p_probe, run_pass1_probe,
-    run_pass2_optimize, run_pass3_varpro_readout, run_pass5_emit_and_certify, solve_sona_model,
-    steiglitz_mcbride_poles, synth_kautz_unit_mode,
+    WeightedReadoutStem, compute_itu_bs1770_lufs, decode_dnam_bin_to_model,
+    encode_model_to_dnam_bin, eval_kautz_modal_and_adjoint, eval_op_n_pre_and_adjoint,
+    eval_op_t_transport_and_adjoint, extract_stat_256d_gram, generate_generic_sobol_seeds,
+    patch_model_readouts_weighted_cholesky, quantize_kautz_pole_q8, quantize_ltas_error_q20_i8,
+    run_cpu_op_p_probe, run_pass1_probe, run_pass2_optimize, run_pass3_varpro_readout,
+    run_pass5_emit_and_certify, solve_sona_model, steiglitz_mcbride_poles, synth_kautz_unit_mode,
 };
 pub use wide_gram::{
     WIDE_GRAM_BATCH_FRAMES, Wide192Accum, accumulate_uplo_u_wide192,

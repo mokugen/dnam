@@ -59,6 +59,18 @@ impl ThetaLayout {
         b.push(ParamBoundSpec::Box { lo: -8.0, hi: 8.0 });
         x.push(m.direct_s2_u_gain[1]);
         b.push(ParamBoundSpec::Box { lo: -8.0, hi: 8.0 });
+        x.push(m.pre_conv_u_gain[0]);
+        b.push(ParamBoundSpec::Box { lo: -4.0, hi: 4.0 });
+        x.push(m.pre_conv_u_gain[1]);
+        b.push(ParamBoundSpec::Box { lo: -4.0, hi: 4.0 });
+        for q in 0..self.q_opt {
+            for k in 0..4 {
+                for col in 0..4 {
+                    x.push(m.w_ro[q * 4 + k][col]);
+                    b.push(ParamBoundSpec::Box { lo: -4.0, hi: 4.0 });
+                }
+            }
+        }
 
         for k in 0..self.k_opt {
             let kp = &m.kautz[k];
@@ -152,7 +164,19 @@ impl ThetaLayout {
             clamp_finite(cand[p], -8.0, 8.0, 0.0),
             clamp_finite(cand[p + 1], -8.0, 8.0, 0.0),
         ];
-        p += 2;
+        m.pre_conv_u_gain = [
+            clamp_finite(cand[p + 2], -4.0, 4.0, 0.0),
+            clamp_finite(cand[p + 3], -4.0, 4.0, 0.0),
+        ];
+        p += 4;
+        for q in 0..self.q_opt {
+            for k in 0..4 {
+                for col in 0..4 {
+                    m.w_ro[q * 4 + k][col] = clamp_finite(cand[p], -4.0, 4.0, 0.0);
+                    p += 1;
+                }
+            }
+        }
 
         for k in 0..self.k_opt {
             let kp = &mut m.kautz[k];
@@ -214,7 +238,17 @@ impl ThetaLayout {
         }
         out[p] = grads.d_direct_s2_u[0];
         out[p + 1] = grads.d_direct_s2_u[1];
-        p += 2;
+        out[p + 2] = grads.d_pre_conv_u[0];
+        out[p + 3] = grads.d_pre_conv_u[1];
+        p += 4;
+        for q in 0..self.q_opt {
+            for k in 0..4 {
+                for c in 0..4 {
+                    out[p] = grads.d_w_ro_pre[q][k][c];
+                    p += 1;
+                }
+            }
+        }
 
         for k in 0..self.k_opt {
             out[p..p + 6].copy_from_slice(&grads.d_kautz[k]);
@@ -267,6 +301,10 @@ mod tests {
         model.w_ro[0][6..10].copy_from_slice(&[0.5, -0.3, 0.2, 0.15]);
         model.w_ro[1][6..10].copy_from_slice(&[0.35, 0.45, -0.15, 0.25]);
         model.w_ro[4][6..10].copy_from_slice(&[0.25, 0.25, 0.1, 0.1]);
+        model.active_fir_taps = 4;
+        model.fir_l[0] = 0.5;
+        model.fir_l[1] = 0.25;
+        model.fir_r[0] = 0.45;
         model.transport_quads[0].delay_samples = [7.25, 9.6, 12.4, 15.1];
         model.transport_quads[0].g_loop = 0.65;
         model.transport_quads[0].damp_pole = 0.3;
@@ -285,8 +323,9 @@ mod tests {
         };
         let (theta, bounds) = layout.pack(&model);
         assert_eq!(theta.len(), bounds.len());
-        // 2 (op_n_pre) + 2*20 (adaa+w_ro) + 4 (q=0 Block0 svf_k_nl; q=1 omitted) + 2 (direct_s2_u) + 15 (op_t incl scat_psi) = 63.
-        assert_eq!(theta.len(), 63);
+        // 2 (op_n_pre) + 2*20 (adaa+w_ro_direct) + 4 (Block0 svf_k_nl) + 2 (direct_s2_u)
+        // + 2 (pre_conv_u) + 2*16 (w_ro_pre) + 15 (op_t incl scat_psi) = 97.
+        assert_eq!(theta.len(), 97);
 
         let mut unpacked = model.clone();
         layout.unpack(&theta, &mut unpacked);
@@ -352,8 +391,13 @@ mod tests {
                 .total
         };
 
-        // Index 2 + 20 = 22 is Block 0 svf_k_nl[0]; index 2 + 40 + 4 + 2 + 4 + 2 = 54 is Op-T scat_psi.
-        for &(idx, eps) in &[(22_usize, 1.0e-4_f64), (54_usize, 1.0e-5_f64)] {
+        // Index 22: Block 0 svf_k_nl[0]; 48: pre_conv_u_gain[0]; 50: w_ro[0][0]; 88: Op-T scat_psi.
+        for &(idx, eps) in &[
+            (22_usize, 1.0e-4_f64),
+            (48_usize, 1.0e-4_f64),
+            (50_usize, 1.0e-4_f64),
+            (88_usize, 1.0e-5_f64),
+        ] {
             let fd = (eval_at(idx, eps) - eval_at(idx, -eps)) / (2.0 * eps);
             let tol = 3.0e-2 * fd.abs().max(1.0);
             assert!(

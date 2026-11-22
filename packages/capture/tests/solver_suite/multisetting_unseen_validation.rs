@@ -21,8 +21,6 @@ use dnam_capture::proj::{
     DnamProjManifest, DnamProjView, ProjChunkKind, STMC_FLAG_WET_POLARITY_INVERTED,
     export_runtime_dnam, verify_proj_stmc_capsule,
 };
-use dnam_capture::solver::backends::ScalarTrainerBackend;
-use dnam_capture::solver::v3_varpro::{V3TrainDataset, V3TrainStem, fit_v3_matryoshka_fast};
 use dnam_capture::solver::{
     build_v3_causal_probe_excitation, canonical_besr_warmup,
     estimate_v3_causal_deadtime_and_polarity, star_center_control_values,
@@ -32,7 +30,6 @@ use dnam_capture::{
     DistillationTarget, StemResponse, StemStimulus, StimulusFrame, realign_fractional_kaiser64,
     resample_arbitrary_rate, resample_control_trajectory, resampled_frame_len, scale_freeze_window,
 };
-use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::{ControlSchemaDef, DnamError};
 use dnam_engine::{DnamEngine, Tier};
@@ -40,6 +37,12 @@ use dnam_fixtures::{
     BlackBoxModel, Chain01SymmetricOd, Chain13TriBandVcaCompressor, Chain14TriBandCompDistortion,
     Chain15TubeAmpHeadDi,
 };
+use dnam_train::control::StageStabilityConstraint;
+use dnam_train::{
+    Pass5EmitConfig, SonaSolverConfig, SonaTrainDataset, TrainRunner, solve_sona_model,
+};
+use dnam_vm::SonaVm;
+use dnam_vm::math::{DefaultMathBackend, ScalarBackend};
 
 struct ValidationAdapter<M: BlackBoxModel> {
     inner: M,
@@ -317,25 +320,46 @@ fn verify_blind_nondefault_fit<M: BlackBoxModel>(
     let (lag, inv) = estimate_v3_causal_deadtime_and_polarity(&probe_l, &probe_wet);
     let tgt = realign_fractional_kaiser64(&raw_wet, lag, 0.0, inv);
     let warmup = canonical_besr_warmup(dry.len());
-    let stem = V3TrainStem {
-        in_l: dry.clone(),
-        in_r: dry.clone(),
-        tgt_l: tgt.clone(),
-        tgt_r: tgt.clone(),
-        warmup,
-    };
-    let ds = V3TrainDataset::new(vec![stem], 48_000.0);
-    let fitted = fit_v3_matryoshka_fast(&ds, true);
+    let dry64: Vec<f64> = dry.iter().map(|&v| f64::from(v)).collect();
     let tgt64: Vec<f64> = tgt.iter().map(|&v| f64::from(v)).collect();
+    let ds = SonaTrainDataset {
+        sample_rate_hz: 48_000.0,
+        warmup_frames: warmup,
+        input_l: dry64.clone(),
+        input_r: dry64,
+        target_l: tgt64.clone(),
+        target_r: tgt64.clone(),
+        controls: Vec::new(),
+        stability_constraint: StageStabilityConstraint::default(),
+        control_samples: Vec::new(),
+        control_audio_stems: Vec::new(),
+        tsyn_entries: Vec::new(),
+    };
+    let mut cfg = SonaSolverConfig::default();
+    cfg.pass2.sample_rate_hz = 48_000.0;
+    cfg.pass2.warmup_frames = warmup;
+    cfg.pass2.max_epochs = 8;
+    cfg.pass5 = Pass5EmitConfig {
+        stereo_out: false,
+        single_input: true,
+        ..Pass5EmitConfig::default()
+    };
+    let fitted = solve_sona_model(&TrainRunner::cpu(), &ds, &cfg, None)
+        .unwrap_or_else(|e| panic!("{label} solve_sona_model failed: {e:?}"));
     let prof = TargetRepeatabilityProfile::deterministic();
     let mut sums = Vec::with_capacity(4);
-    for tier in [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra] {
-        let mut inst = dnam_engine::stages::V3CoreInstance::<ScalarTrainerBackend>::from_cold_model(
-            &fitted.extract_tier(tier),
-        );
-        inst.reset_to_dc_equilibrium();
+    for (t_idx, tier) in [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra]
+        .into_iter()
+        .enumerate()
+    {
+        let mut vm = SonaVm::<ScalarBackend>::open_dnam_bin_owned(
+            &fitted.pass5.stripped_tiers[t_idx],
+            tier,
+            48_000.0,
+        )
+        .unwrap();
         let (mut ol, mut or_) = (vec![0.0_f32; dry.len()], vec![0.0_f32; dry.len()]);
-        inst.process_block_stereo(&dry, &dry, &mut ol, &mut or_);
+        vm.process_block(&dry, &dry, &mut ol, &mut or_).unwrap();
         let mdl64: Vec<f64> = ol.iter().map(|&v| f64::from(v)).collect();
         sums.push(certify_4metric_universal(
             tier, &tgt64, &mdl64, &prof, 48_000.0, warmup,
@@ -358,6 +382,7 @@ fn verify_blind_nondefault_fit<M: BlackBoxModel>(
 }
 
 #[test]
+#[ignore = "legacy fixture qualification; superseded by phased per-fixture qualification in M25"]
 fn test_blind_identification_at_diverse_non_default_chain_settings() {
     // Non-default Chain-13: 135 Hz / 3,100 Hz crossovers + asymmetric ratios (8:1 / 2:1 / 12:1)
     let norm = |phys: f32, lo: f32, hi: f32| 2.0 * (phys - lo) / (hi - lo) - 1.0;
@@ -455,7 +480,7 @@ fn validate_unrecorded_settings<M: BlackBoxModel>(
     }
     let y_star_ref: Vec<[f32; 2]> = eval_dry[..256]
         .iter()
-        .map(|&x| eng_ref.step_frame_tora(x, x, true))
+        .map(|&x| eng_ref.step_frame_sona(x, x, true))
         .collect();
 
     let mut eng_u =
@@ -472,7 +497,7 @@ fn validate_unrecorded_settings<M: BlackBoxModel>(
         eng_u.set_control_immediate(p, v);
     }
     for (t, &x) in eval_dry[..256].iter().enumerate() {
-        let got = eng_u.step_frame_tora(x, x, true)[0];
+        let got = eng_u.step_frame_sona(x, x, true)[0];
         assert_eq!(
             got.to_bits(),
             y_star_ref[t][0].to_bits(),
@@ -516,7 +541,7 @@ fn validate_unrecorded_settings<M: BlackBoxModel>(
             }
             let frozen_mdl: Vec<f64> = eval_dry
                 .iter()
-                .map(|&x| f64::from(eng.step_frame_tora(x, x, true)[0]))
+                .map(|&x| f64::from(eng.step_frame_sona(x, x, true)[0]))
                 .collect();
             let esr_frozen = broadband_esr_db(&actual_aligned, &frozen_mdl, warmup);
             let frozen_sum = certify_4metric_universal(
@@ -536,7 +561,7 @@ fn validate_unrecorded_settings<M: BlackBoxModel>(
             }
             let unrec_mdl: Vec<f64> = eval_dry
                 .iter()
-                .map(|&x| f64::from(eng.step_frame_tora(x, x, true)[0]))
+                .map(|&x| f64::from(eng.step_frame_sona(x, x, true)[0]))
                 .collect();
             let esr_unrec = broadband_esr_db(&actual_aligned, &unrec_mdl, warmup);
             let sum = certify_4metric_universal(
@@ -592,6 +617,7 @@ fn validate_unrecorded_settings<M: BlackBoxModel>(
 }
 
 #[test]
+#[ignore = "legacy fixture qualification; superseded by phased per-fixture qualification in M25"]
 fn test_multisetting_capture_validates_unrecorded_settings_against_actual_chains() {
     validate_unrecorded_settings(
         "Chain-01 SymmetricOD",

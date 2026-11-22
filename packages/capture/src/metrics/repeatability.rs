@@ -233,8 +233,8 @@ pub fn build_repeatability_probe_stream(
     let burst_len = ((0.512 * sr).round() as usize).max(1_024);
     let fade_len = ((0.016 * sr).round() as usize).min(burst_len / 6).max(16);
 
-    // Snap every tone to an exact multiple of 4 cycles per burst so flip-flop octave dividers
-    // (`Chain-10`) settle to identical divider parity at every burst boundary.
+    // Snap every tone to an exact multiple of 4 cycles per burst so frequency-dividing nonlinearities
+    // settle to identical phase parity at every burst boundary.
     let snap_quad_hz = |target_hz: f64| -> f64 {
         let raw = ((target_hz * (burst_len as f64) / sr).round() as i64).max(4);
         ((raw - (raw % 4)).max(4) as f64) * sr / (burst_len as f64)

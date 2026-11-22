@@ -385,8 +385,8 @@ fn render_engine_slice<B: EngineBackend>(
     }
 
     if spec.snap_initial_controls {
-        engine.set_freeze(false);
-        engine.control_bus.reset_to_defaults();
+        engine.set_op_t_write_enable(false);
+        engine.reset_controls_to_defaults();
         for idx in 0..engine.num_controls() {
             let init_v = spec
                 .control_trajectories
@@ -408,7 +408,7 @@ fn render_engine_slice<B: EngineBackend>(
 
     let mut out_1 = vec![0.0_f32; n];
     let mut out_2 = vec![0.0_f32; n];
-    let has_aux = spec.in_3.is_some() || spec.in_4.is_some() || engine.stage0_router.wdw_mode;
+    let has_aux = spec.in_3.is_some() || spec.in_4.is_some() || engine.patchbay().wdw_enabled;
     let mut out_3 = if has_aux {
         Some(vec![0.0_f32; n])
     } else {
@@ -424,7 +424,7 @@ fn render_engine_slice<B: EngineBackend>(
     if spec.control_trajectories.is_some() || active_fw.is_some() {
         for i in 0..n {
             if let Some([fs, fe]) = active_fw {
-                engine.set_freeze(i >= fs && i < fe);
+                engine.set_op_t_write_enable(i >= fs && i < fe);
             }
             if let Some(trajs) = spec.control_trajectories {
                 for (p, tr) in trajs.iter().enumerate() {
@@ -445,7 +445,7 @@ fn render_engine_slice<B: EngineBackend>(
             });
         }
         if active_fw.is_some() {
-            engine.set_freeze(false);
+            engine.set_op_t_write_enable(false);
         }
     } else {
         engine.process_block_io(DnamAudioIo {
@@ -473,9 +473,9 @@ fn render_engine_slice<B: EngineBackend>(
 
 impl<'a, B: EngineBackend> DistillationTarget for DnamEngine<'a, B> {
     fn reset_state(&mut self) {
-        self.control_bus.reset_to_defaults();
+        self.reset_controls_to_defaults();
         self.reset_to_dc_equilibrium();
-        self.set_freeze(false);
+        self.set_op_t_write_enable(false);
     }
 
     fn render_stem(&mut self, stimulus: &StemStimulus) -> Result<StemResponse, DnamError> {
@@ -585,9 +585,10 @@ impl<'a> DistillationTarget for DynamicDnamEngine<'a> {
 mod tests {
     use super::*;
     use dnam_engine::Tier;
-    use dnam_engine::container::{ARENA_OFFSET_ULTRA_END, build_dnam_container};
-    use dnam_engine::math::{BackendKind, ScalarBackend};
+    use dnam_engine::container::build_dnam_container_from_dnam_bin;
     use dnam_engine::schema::{ControlKind, ControlSchemaDef, ControlUiHints, DnamJsonHeader};
+    use dnam_train::{Pass5EmitConfig, Phase1ClampOutput, SonaModelF64, encode_model_to_dnam_bin};
+    use dnam_vm::math::{BackendKind, ScalarBackend};
 
     struct DummyTarget;
     impl DistillationTarget for DummyTarget {
@@ -613,13 +614,13 @@ mod tests {
             name: String::from("Gain"),
             kind: ControlKind::Range,
             unit: Some(String::from("dB")),
+            represented_switch_options: None,
             lobatto_degree: Some(2),
             anchor_nodes_norm: None,
             declared_range: Some([0.0, 10.0]),
             safe_clamped_range: Some([1.0, 9.0]),
             default: serde_json::json!(5.0),
-            conditional_min: BTreeMap::new(),
-            conditional_max: BTreeMap::new(),
+            conditional_bounds: Vec::new(),
             declared_options: None,
             active_options: None,
             clamp_warning: None,
@@ -627,9 +628,18 @@ mod tests {
             ui_hints: ControlUiHints::default(),
             user_metadata: BTreeMap::new(),
         }];
-        let arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-        header.io_config.capabilities.supports_freeze = true;
-        let container = build_dnam_container(&mut header, &arena, &arena, false).unwrap();
+        let descs = header.compile_clamp_descriptors().unwrap();
+        let wire_descs: Vec<_> = descs.iter().map(|d| d.to_wire()).collect();
+        let mut model = SonaModelF64::new(48_000.0);
+        model.control_audit = Some(Phase1ClampOutput {
+            wire_descriptors: wire_descs,
+            locked_controls: vec![false],
+            safe_ranges: vec![(1.0, 9.0)],
+            audited_corners: 0,
+            warnings: Vec::new(),
+        });
+        let dnam_bin = encode_model_to_dnam_bin(&model, Pass5EmitConfig::default()).unwrap();
+        let container = build_dnam_container_from_dnam_bin(&mut header, &dnam_bin).unwrap();
 
         let mut dummy = DummyTarget;
         dummy.reset_state();
@@ -786,17 +796,18 @@ mod tests {
         stream_out.extend(eng.render_frame(&f1).unwrap().out_1);
         assert_eq!(stream_out, batch_out.out_1);
 
-        // DynamicDnamEngine::reset_state clears freeze and restores control_bus defaults;
+        // DynamicDnamEngine::reset_state clears write-lock and restores control defaults;
         // render_stem snaps controls before equilibrating with zero cross-stem parameter bleed
-        eng.set_freeze(true);
+        eng.set_op_t_write_enable(true);
         eng.set_control_immediate(0, 9.0);
-        assert!(eng.is_frozen());
+        assert_ne!(eng.telemetry_snapshot().host_write_lock, 0);
         let mut dyn_eng = DynamicDnamEngine::Scalar(eng);
         DistillationTarget::reset_state(&mut dyn_eng);
         assert!(matches!(
             dyn_eng,
             DynamicDnamEngine::Scalar(ref e)
-                if !e.is_frozen() && (e.control_bus.raw_values[0] - 5.0).abs() < 1.0e-6
+                if e.telemetry_snapshot().host_write_lock == 0
+                    && (e.telemetry_snapshot().clamped_controls[0] - 5.0).abs() < 1.0e-6
         ));
 
         let mut fresh =
@@ -810,7 +821,10 @@ mod tests {
             let out_reused = reused.render_stem(&default_stem).unwrap();
             let out_fresh = fresh.render_stem(&default_stem).unwrap();
             assert_eq!(out_reused.out_1, out_fresh.out_1);
-            assert_eq!(reused.control_bus.raw_values, fresh.control_bus.raw_values);
+            assert_eq!(
+                reused.telemetry_snapshot().clamped_controls,
+                fresh.telemetry_snapshot().clamped_controls
+            );
         }
     }
 }

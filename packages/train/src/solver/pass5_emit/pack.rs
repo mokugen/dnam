@@ -2,7 +2,7 @@
 //! `.dnam-bin` serialization for Pass 5 (`ref[container.dnam.vm-binary]`).
 
 mod blocks;
-mod readouts;
+pub(super) mod readouts;
 
 pub(super) use blocks::sanitize_clamp_f32;
 

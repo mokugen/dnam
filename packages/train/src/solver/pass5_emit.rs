@@ -4,10 +4,13 @@
 //! `Wide192Accum` digest emission (`ref[train.pipeline.host-parity-and-export]`).
 
 pub mod certify;
+mod monotone;
 pub mod pack;
+pub mod unpack;
 
 pub use certify::{MAX_INTER_TIER_LU_DRIFT, compute_itu_bs1770_lufs};
 pub use pack::encode_model_to_dnam_bin;
+pub use unpack::decode_dnam_bin_to_model;
 
 use dnam_vm::Tier;
 use dnam_vm::bin::DnamBinView;
@@ -20,8 +23,9 @@ use crate::wide_gram::hash_gram_input_v3_f32;
 use super::model::SonaModelF64;
 use certify::{
     apply_full_quad_phase3_audit, calibrate_lufs_trims_from_renders,
-    certify_all_tier_renders_stereo, render_all_tiers, zero_tier_delta_weights,
+    certify_all_tier_renders_stereo, render_all_tiers,
 };
+use monotone::{MonotoneEvalCtx, MonotoneState, enforce_monotone_tiers_non_destructive};
 
 /// Configuration for Pass-5 `.dnam-bin` serialization, LUFS calibration, and final certification.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -99,16 +103,17 @@ pub fn run_pass5_emit_and_certify_with_digest(
     let sr_f32 = model.sample_rate_hz as f32;
 
     if config.calibrate_lufs_trims {
+        model.tier_gain_trim = [1.0; 4];
         let raw_bin = encode_model_to_dnam_bin(model, config)?;
         let _ = DnamBinView::parse(&raw_bin)?;
         let raw_bundle = render_all_tiers(&raw_bin, &in_l[..n], &in_r[..n], sr_f32)?;
         calibrate_lufs_trims_from_renders(model, &raw_bundle.renders, warmup);
     }
 
-    let mut final_bin = encode_model_to_dnam_bin(model, config)?;
+    let final_bin = encode_model_to_dnam_bin(model, config)?;
     let _ = DnamBinView::parse(&final_bin)?;
-    let mut final_bundle = render_all_tiers(&final_bin, &in_l[..n], &in_r[..n], sr_f32)?;
-    let mut cert = certify_all_tier_renders_stereo(
+    let final_bundle = render_all_tiers(&final_bin, &in_l[..n], &in_r[..n], sr_f32)?;
+    let cert = certify_all_tier_renders_stereo(
         &final_bundle.renders,
         &target_l[..n],
         &target_r[..n],
@@ -116,34 +121,27 @@ pub fn run_pass5_emit_and_certify_with_digest(
         warmup,
     )?;
 
-    for _pass in 0..4 {
-        let mut changed = false;
-        for t in 1..=3 {
-            if !cert.pair_monotone[t] {
-                zero_tier_delta_weights(model, t);
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-        model.tier_gain_trim = [1.0; 4];
-        if config.calibrate_lufs_trims {
-            let mid_bin = encode_model_to_dnam_bin(model, config)?;
-            let mid_bundle = render_all_tiers(&mid_bin, &in_l[..n], &in_r[..n], sr_f32)?;
-            calibrate_lufs_trims_from_renders(model, &mid_bundle.renders, warmup);
-        }
-        final_bin = encode_model_to_dnam_bin(model, config)?;
-        let _ = DnamBinView::parse(&final_bin)?;
-        final_bundle = render_all_tiers(&final_bin, &in_l[..n], &in_r[..n], sr_f32)?;
-        cert = certify_all_tier_renders_stereo(
-            &final_bundle.renders,
-            &target_l[..n],
-            &target_r[..n],
-            model.sample_rate_hz,
-            warmup,
-        )?;
-    }
+    let monotone_eval = MonotoneEvalCtx {
+        in_l: &in_l[..n],
+        in_r: &in_r[..n],
+        target_l: &target_l[..n],
+        target_r: &target_r[..n],
+        warmup,
+        config,
+    };
+    let MonotoneState {
+        final_bin,
+        final_bundle,
+        cert,
+    } = enforce_monotone_tiers_non_destructive(
+        model,
+        &monotone_eval,
+        MonotoneState {
+            final_bin,
+            final_bundle,
+            cert,
+        },
+    )?;
 
     let (stripped, vm_renders) = (final_bundle.stripped, final_bundle.renders);
     let rail_rep = run_phase2_rail_burst(&final_bin, Tier::Ultra, sr_f32, 1.0)?;

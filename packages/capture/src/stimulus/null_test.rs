@@ -7,23 +7,27 @@
 //! - `docs/specs/containers/project_container_format.md` (`ref[container.proj.stat-uplo-u]`)
 //! - `docs/specs/training/iterative_resume_and_caching.md` (`ref[train.cache.proj-vault]`)
 
-use dnam_engine::container::DnamContainerView;
-use dnam_engine::math::DefaultMathBackend;
+use dnam_engine::container::extract_dnam_bin;
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::DnamError;
-use dnam_engine::stages::weights::{
-    ARENA_ULTRA_BYTES, ARENA0_TIER_GAIN_TRIM_OFFSET, pack_v3_matryoshka_to_arena,
-    unpack_v3_matryoshka_from_arena,
-};
 use dnam_engine::{DnamEngine, Tier};
+use dnam_train::{
+    Pass5EmitConfig, TrainRunner, decode_dnam_bin_to_model, encode_model_to_dnam_bin,
+    patch_model_readouts_weighted_cholesky,
+};
+use dnam_vm::SonaVm;
+use dnam_vm::bin::{DnamBinView, strip_dnam_bin_to_tier};
+use dnam_vm::math::DefaultMathBackend;
+use zerocopy::byteorder::little_endian::F64;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::align::{estimate_multiregime_alignment, realign_fractional_kaiser64};
 use crate::metrics::{
     evaluate_besr_from_band_energies, evaluate_ltas_33band_report, try_split_bezout_3band_energies,
 };
 use crate::proj::bundle::{
-    DnamProjView, ProjChunkInput, build_dnam_proj_container_with_cp1_and_compacted,
-    export_runtime_dnam, zero_arena_b_head_dc_bias,
+    DnamProjView, ProjChunkInput, build_dnam_proj_container_with_dnam_bin, compact_to_capsules,
+    export_runtime_dnam, verify_dnam_bin_zero_dc,
 };
 use crate::proj::directory::{ProjChunkKind, verify_proj_inpc_capsule, verify_proj_stmc_capsule};
 use crate::proj::{PROJ_FLAG_COMPACTED_CAPSULES, PROJ_STAT_BYTES_ULTRA, STMC_FLAG_STEREO};
@@ -31,8 +35,8 @@ use crate::resampler::{
     resample_48k_to_arbitrary_rate, resample_arbitrary_rate_to_48k, resampled_frame_len,
 };
 use crate::solver::{
-    StageDAuditOptions, WeightedStemRef, compute_v3_stat_chunk_bytes, decode_coreset_lr,
-    finalize_stage_d_and_audit, patch_v3_readouts_weighted_cholesky,
+    StageDAuditOptions, canonical_besr_warmup, compute_integrated_lufs,
+    compute_v3_stat_chunk_bytes, decode_coreset_lr, finalize_stage_d_and_audit,
 };
 use crate::targets::{DistillationTarget, StemStimulus};
 
@@ -146,8 +150,7 @@ pub fn run_live_null_test_and_autopatch(
     let wght_slice = view.chunk_slice(ProjChunkKind::Wght, 0).ok_or_else(|| {
         DnamError::SchemaValidationError("missing WGHT chunk for live auto-patch".to_string())
     })?;
-    let rt_view = DnamContainerView::from_bytes(wght_slice, &crypto)?;
-    let init_arena = rt_view.arena_storage.as_bytes();
+    let init_dbin = extract_dnam_bin(wght_slice)?;
 
     let n_frames = dry_l_48k.len();
     let mut m_init_l = Vec::with_capacity(n_frames);
@@ -155,7 +158,7 @@ pub fn run_live_null_test_and_autopatch(
     for n in 0..n_frames {
         let il = dry_l_48k[n];
         let ir = dry_r_48k.as_ref().map_or(il, |r| r[n]);
-        let [ml, mr] = engine.step_frame_tora(il, ir, false);
+        let [ml, mr] = engine.step_frame_sona(il, ir, false);
         m_init_l.push(ml);
         m_init_r.push(mr);
     }
@@ -232,12 +235,10 @@ pub fn run_live_null_test_and_autopatch(
     }
 
     let timer = now_ms_token();
-    let mut arena_28k = init_arena.to_vec();
-    arena_28k.resize(ARENA_ULTRA_BYTES, 0);
-    let saved_trims: [f32; 4] = std::array::from_fn(|t| {
-        let off = ARENA0_TIER_GAIN_TRIM_OFFSET + t * 4;
-        f32::from_le_bytes(arena_28k[off..off + 4].try_into().unwrap())
-    });
+    let map_train_err =
+        |e: dnam_train::TrainError| DnamError::SchemaValidationError(format!("{e}"));
+    let mut model = decode_dnam_bin_to_model(init_dbin).map_err(map_train_err)?;
+    let saved_trims = model.tier_gain_trim;
 
     let verify_n = n_frames.min(8_192);
     let compacted = (view.preamble.lifecycle_flags & PROJ_FLAG_COMPACTED_CAPSULES) != 0;
@@ -247,6 +248,7 @@ pub fn run_live_null_test_and_autopatch(
         .as_ref()
         .map(|s| s.tier_esr_db);
     let mut post_coreset_esr: Option<[f32; 4]> = None;
+    let mut post_coreset_lufs: Option<[f64; 4]> = None;
     let mut updated_manifest = view.manifest.clone();
     let mono_out = updated_manifest.base.io_config.output_mode == "mono";
 
@@ -302,37 +304,117 @@ pub fn run_live_null_test_and_autopatch(
         star_core_pair = Some((dry_core_lr, star_wet_lr));
     }
 
-    let mut patch_stems: Vec<WeightedStemRef<'_>> = Vec::with_capacity(2);
+    type WeightedStemOwned = (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>, f64);
+    let mut owned_stems: Vec<WeightedStemOwned> = Vec::with_capacity(2);
+    let to_f64_channels = |frames: &[[f32; 2]]| -> (Vec<f64>, Vec<f64>) {
+        let mut l = Vec::with_capacity(frames.len());
+        let mut r = Vec::with_capacity(frames.len());
+        for &[vl, vr] in frames {
+            l.push(f64::from(vl));
+            r.push(f64::from(vr));
+        }
+        (l, r)
+    };
     if let Some((ref d_star, ref w_star)) = star_core_pair {
         let sn = d_star.len().min(w_star.len()).min(8_192);
         if sn > 64 {
-            patch_stems.push(WeightedStemRef {
-                dry_lr: &d_star[..sn],
-                wet_lr: &w_star[..sn],
-                weight: 1.0_f64,
-            });
+            let (dl, dr) = to_f64_channels(&d_star[..sn]);
+            let (wl, wr) = to_f64_channels(&w_star[..sn]);
+            owned_stems.push((dl, dr, wl, wr, 1.0_f64));
         }
     }
     let rig_drifted_pre = prev_coreset_esr.is_some_and(|prev| pre_esr_db > prev[3] + 6.0);
-    patch_stems.push(WeightedStemRef {
-        dry_lr: &live_dry,
-        wet_lr: &live_wet,
-        weight: if rig_drifted_pre { 2.5_f64 } else { 0.25_f64 },
-    });
-
-    let mut mat = unpack_v3_matryoshka_from_arena(&arena_28k, mono_out);
-    patch_v3_readouts_weighted_cholesky(&mut mat, &patch_stems);
-    pack_v3_matryoshka_to_arena(&mat, &mut arena_28k);
-    for (t, &trim) in saved_trims.iter().enumerate() {
-        let off = ARENA0_TIER_GAIN_TRIM_OFFSET + t * 4;
-        let clean = if trim.is_finite() && (0.0625..=16.0).contains(&trim) {
-            trim
-        } else {
-            1.0
-        };
-        arena_28k[off..off + 4].copy_from_slice(&clean.to_le_bytes());
+    {
+        let (dl, dr) = to_f64_channels(&live_dry);
+        let (wl, wr) = to_f64_channels(&live_wet);
+        owned_stems.push((
+            dl,
+            dr,
+            wl,
+            wr,
+            if rig_drifted_pre { 2.5_f64 } else { 0.25_f64 },
+        ));
     }
-    zero_arena_b_head_dc_bias(&mut arena_28k);
+    let stem_refs: Vec<dnam_train::WeightedReadoutStem<'_>> = owned_stems
+        .iter()
+        .map(|(dl, dr, wl, wr, w)| {
+            (
+                dl.as_slice(),
+                dr.as_slice(),
+                wl.as_slice(),
+                wr.as_slice(),
+                *w,
+            )
+        })
+        .collect();
+    patch_model_readouts_weighted_cholesky(&TrainRunner::cpu(), &mut model, &stem_refs, 64)
+        .map_err(map_train_err)?;
+    let emit_cfg = Pass5EmitConfig {
+        stereo_out: !mono_out,
+        single_input: !need_stereo_in && mono_out,
+        tail_time_ms: updated_manifest.base.io_config.tail_time_ms,
+        ..Pass5EmitConfig::default()
+    };
+    if let Some((ref d_star, ref w_star)) = star_core_pair
+        && d_star.len().min(w_star.len()) > 128
+    {
+        let sn = d_star.len().min(w_star.len());
+        let warmup_cal = canonical_besr_warmup(sn);
+        let keep_in_r = need_stereo_in || !mono_out;
+        let cal_in_l: Vec<f32> = d_star[..sn].iter().map(|lr| lr[0]).collect();
+        let cal_in_r: Vec<f32> = d_star[..sn]
+            .iter()
+            .map(|lr| if keep_in_r { lr[1] } else { lr[0] })
+            .collect();
+        model.tier_gain_trim = [1.0; 4];
+        let raw_dbin = encode_model_to_dnam_bin(&model, emit_cfg).map_err(map_train_err)?;
+        let raw_view = DnamBinView::parse(&raw_dbin)
+            .map_err(|e| DnamError::SchemaValidationError(format!("{e}")))?;
+        let max_t = raw_view.retained_tier;
+        let mut lufs = [-120.0_f64; 4];
+        for (t_idx, tier) in [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra]
+            .into_iter()
+            .enumerate()
+        {
+            let eff_tier = if tier.index() <= max_t.index() {
+                tier
+            } else {
+                max_t
+            };
+            let tier_slice = strip_dnam_bin_to_tier(&raw_dbin, eff_tier)
+                .map_err(|e| DnamError::SchemaValidationError(format!("{e}")))?;
+            let mut vm =
+                SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(tier_slice, eff_tier, 48_000.0)
+                    .map_err(|e| DnamError::SchemaValidationError(format!("{e}")))?;
+            let (mut ol, mut or) = (vec![0.0_f32; sn], vec![0.0_f32; sn]);
+            vm.process_block(&cal_in_l, &cal_in_r, &mut ol, &mut or)
+                .map_err(|e| DnamError::SchemaValidationError(format!("{e}")))?;
+            let post: Vec<[f32; 2]> = ol[warmup_cal..]
+                .iter()
+                .zip(&or[warmup_cal..])
+                .map(|(&l, &r)| [l, if mono_out { l } else { r }])
+                .collect();
+            lufs[t_idx] = compute_integrated_lufs(&post, 48_000);
+        }
+        if lufs[3] > -100.0 {
+            for t in 0..3 {
+                if lufs[t] > -100.0 {
+                    let delta_lu = (lufs[3] - lufs[t]).clamp(-12.0, 12.0);
+                    model.tier_gain_trim[t] = 10.0_f64.powf(delta_lu / 20.0).clamp(0.0625, 16.0);
+                }
+            }
+        }
+    } else {
+        for (t, &trim) in saved_trims.iter().enumerate() {
+            model.tier_gain_trim[t] = if trim.is_finite() && (0.0625..=16.0).contains(&trim) {
+                trim
+            } else {
+                1.0
+            };
+        }
+    }
+    let mut patched_dbin = encode_model_to_dnam_bin(&model, emit_cfg).map_err(map_train_err)?;
+    verify_dnam_bin_zero_dc(&patched_dbin)?;
     let patch_ms = elapsed_ms_since(timer);
 
     if let Some((ref dry_core_lr, ref star_wet_lr)) = star_core_pair {
@@ -342,7 +424,7 @@ pub fn run_live_null_test_and_autopatch(
             .map_or(0.0, |s| s.total_solve_ms);
         if let Ok(sd_out) = finalize_stage_d_and_audit(
             &mut updated_manifest,
-            &mut arena_28k,
+            &mut patched_dbin,
             dry_core_lr,
             Some(star_wet_lr),
             prev_coreset_esr,
@@ -350,37 +432,38 @@ pub fn run_live_null_test_and_autopatch(
             StageDAuditOptions::PATH1_HEAD_ONLY,
         ) {
             post_coreset_esr = Some(sd_out.tier_esr_db);
+            post_coreset_lufs = Some(sd_out.tier_lufs);
         }
     }
 
     let gamma_stat = 0.25_f64;
     let delta_stat_res =
-        compute_v3_stat_chunk_bytes(&arena_28k, mono_out, &live_dry, &live_wet, verify_n, 4);
+        compute_v3_stat_chunk_bytes(&patched_dbin, mono_out, &live_dry, &live_wet, verify_n, 4);
     let patched_stat_bytes = match (view.chunk_slice(ProjChunkKind::Stat, 0), delta_stat_res) {
         (Some(prev_stat), Ok(sb_bytes))
             if prev_stat.len() == PROJ_STAT_BYTES_ULTRA
                 && sb_bytes.len() == PROJ_STAT_BYTES_ULTRA =>
         {
-            let mut out = Vec::with_capacity(PROJ_STAT_BYTES_ULTRA);
-            for (p_ch, d_ch) in prev_stat
-                .as_chunks::<8>()
-                .0
+            let prev_words = <[F64]>::ref_from_bytes(prev_stat)
+                .map_err(|_| DnamError::SchemaValidationError("invalid STAT f64".to_string()))?;
+            let delta_words = <[F64]>::ref_from_bytes(&sb_bytes).map_err(|_| {
+                DnamError::SchemaValidationError("invalid delta STAT f64".to_string())
+            })?;
+            let sum_words: Vec<F64> = prev_words
                 .iter()
-                .zip(sb_bytes.as_chunks::<8>().0.iter())
-            {
-                let pv = f64::from_le_bytes(*p_ch);
-                let dv = f64::from_le_bytes(*d_ch);
-                let sum = pv + gamma_stat * dv;
-                let clean = if sum.is_finite() { sum } else { 0.0 };
-                out.extend_from_slice(&clean.to_le_bytes());
-            }
-            out
+                .zip(delta_words.iter())
+                .map(|(pv, dv)| {
+                    let sum = pv.get() + gamma_stat * dv.get();
+                    F64::new(if sum.is_finite() { sum } else { 0.0 })
+                })
+                .collect();
+            sum_words.as_bytes().to_vec()
         }
         (_, Ok(sb_bytes)) => sb_bytes,
         _ => star_core_pair
             .as_ref()
             .and_then(|(d, w)| {
-                compute_v3_stat_chunk_bytes(&arena_28k, mono_out, d, w, d.len().min(w.len()), 4)
+                compute_v3_stat_chunk_bytes(&patched_dbin, mono_out, d, w, d.len().min(w.len()), 4)
                     .ok()
             })
             .unwrap_or_else(|| vec![0u8; PROJ_STAT_BYTES_ULTRA]),
@@ -404,13 +487,13 @@ pub fn run_live_null_test_and_autopatch(
         }
     }
 
-    let patched_proj = build_dnam_proj_container_with_cp1_and_compacted(
-        &mut updated_manifest,
-        &new_chunks,
-        &arena_28k,
-        &rt_view.cp1_contributors,
-        compacted,
-    )?;
+    let raw_patched_proj =
+        build_dnam_proj_container_with_dnam_bin(&mut updated_manifest, &new_chunks, &patched_dbin)?;
+    let patched_proj = if compacted {
+        compact_to_capsules(&raw_patched_proj)?
+    } else {
+        raw_patched_proj
+    };
     let patched_dnam = export_runtime_dnam(&patched_proj, None)?;
 
     engine.reload_model_in_place_owned(&patched_dnam, Tier::Ultra, 48_000)?;
@@ -424,7 +507,7 @@ pub fn run_live_null_test_and_autopatch(
     for n in 0..n_frames {
         let il = dry_l_48k[n];
         let ir = dry_r_48k.as_ref().map_or(il, |r| r[n]);
-        let [ml, mr] = engine.step_frame_tora(il, ir, false);
+        let [ml, mr] = engine.step_frame_sona(il, ir, false);
         m_post_l.push(ml);
         m_post_r.push(mr);
         let tl = y_hw_l.get(n).copied().unwrap_or(0.0);
@@ -480,10 +563,9 @@ pub fn run_live_null_test_and_autopatch(
             (None, None) => None,
         }
     };
-    let oos_besr_ok = match (
-        eval_oos_besr(&m_init_l, &m_init_r),
-        eval_oos_besr(&m_post_l, &m_post_r),
-    ) {
+    let oos_besr_pre = eval_oos_besr(&m_init_l, &m_init_r);
+    let oos_besr_post = eval_oos_besr(&m_post_l, &m_post_r);
+    let oos_besr_ok = match (oos_besr_pre, oos_besr_post) {
         (Some(pre_b), Some(post_b)) => post_b <= pre_b + 0.02,
         _ => true,
     };
@@ -518,13 +600,14 @@ pub fn run_live_null_test_and_autopatch(
             (None, None) => None,
         }
     };
-    let oos_ltas_ok = match (
-        eval_oos_ltas(&m_init_l, &m_init_r),
-        eval_oos_ltas(&m_post_l, &m_post_r),
-    ) {
+    let oos_ltas_pre = eval_oos_ltas(&m_init_l, &m_init_r);
+    let oos_ltas_post = eval_oos_ltas(&m_post_l, &m_post_r);
+    let oos_ltas_ok = match (oos_ltas_pre, oos_ltas_post) {
         (Some(pre_l), Some(post_l)) => post_l <= pre_l + 0.03,
         _ => true,
     };
+    let coreset_lufs_ok = post_coreset_lufs
+        .is_none_or(|lufs| lufs[3] <= -100.0 || (0..3).all(|t| (lufs[t] - lufs[3]).abs() <= 0.05));
     let coreset_tiers_ok = match (prev_coreset_esr, post_coreset_esr) {
         (Some(prev), Some(post)) => {
             let finite_ok = post.iter().all(|e| e.is_finite());
@@ -534,9 +617,9 @@ pub fn run_live_null_test_and_autopatch(
                 && post[1] <= post[0] + 1.0e-2;
             let non_regressing =
                 (0..4).all(|t| post[t] <= prev[t] + 0.05 && (prev[t] >= 0.0 || post[t] < 0.0));
-            finite_ok && (rig_drifted || (mono && non_regressing))
+            coreset_lufs_ok && finite_ok && (rig_drifted || (mono && non_regressing))
         }
-        _ => true,
+        _ => coreset_lufs_ok,
     };
 
     if post_esr_db <= pre_esr_db && oos_besr_ok && oos_ltas_ok && coreset_tiers_ok {

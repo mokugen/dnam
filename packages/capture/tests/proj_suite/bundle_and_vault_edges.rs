@@ -11,9 +11,10 @@ use dnam_capture::proj::{
     add_capture, attach_proj_auth_signature, build_dnam_proj_container,
     build_dnam_proj_container_with_cp1, build_proj_inpc_capsule, compact_to_capsules,
     compute_proj_header_crc32c, export_runtime_dnam, parse_proj_manifest_range, remove_capture,
-    replace_capture, set_capture_enabled, verify_arena_b_head_zero_dc, zero_arena_b_head_dc_bias,
+    replace_capture, set_capture_enabled, verify_dnam_bin_zero_dc,
 };
 use dnam_capture::{CORESET_FP32_FRAMES_PER_STEM, CORESET_FP32_MONO_BYTES};
+use dnam_train::{Pass5EmitConfig, SonaModelF64, encode_model_to_dnam_bin};
 
 fn fp32_bytes(samples: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples.len() * 4);
@@ -23,7 +24,6 @@ fn fp32_bytes(samples: &[f32]) -> Vec<u8> {
     out
 }
 use dnam_engine::Tier;
-use dnam_engine::container::{ARENA_OFFSET_LITE_END, ARENA_OFFSET_ULTRA_END};
 use dnam_engine::provenance::{DefaultCryptoProvider, RustCryptoProvider};
 use dnam_engine::schema::{ControlSchemaDef, PresetDef};
 
@@ -184,18 +184,11 @@ fn test_proj_directory_bundle_auth_and_export_edges() {
         .is_err()
     );
 
-    assert!(verify_arena_b_head_zero_dc(&[0u8; 1024]).is_err());
-    let mut arena_lite = vec![0u8; ARENA_OFFSET_LITE_END as usize];
-    arena_lite[216] = 1;
-    assert!(verify_arena_b_head_zero_dc(&arena_lite).is_err());
-    zero_arena_b_head_dc_bias(&mut arena_lite);
-    assert!(verify_arena_b_head_zero_dc(&arena_lite).is_ok());
-
-    let mut arena_ultra = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    arena_ultra[18_528] = 1;
-    assert!(verify_arena_b_head_zero_dc(&arena_ultra).is_err());
-    zero_arena_b_head_dc_bias(&mut arena_ultra);
-    assert!(verify_arena_b_head_zero_dc(&arena_ultra).is_ok());
+    assert!(verify_dnam_bin_zero_dc(&[0u8; 1024]).is_err());
+    let ok_dbin =
+        encode_model_to_dnam_bin(&SonaModelF64::new(48_000.0), Pass5EmitConfig::default())
+            .expect("neutral dnam-bin");
+    assert!(verify_dnam_bin_zero_dc(&ok_dbin).is_ok());
 
     let seed = [0x42_u8; 32];
     let vk_bytes = RustCryptoProvider::ed25519_pubkey_from_seed(&seed);
@@ -212,7 +205,7 @@ fn test_proj_directory_bundle_auth_and_export_edges() {
                 v
             },
         }],
-        &arena_ultra,
+        &ok_dbin,
         &[],
     )
     .unwrap();
@@ -488,7 +481,7 @@ fn test_forged_header_crc_and_bijection_tamper_rejections() {
     let minimal_json = serde_json::json!({ "base": base_val }).to_string();
     let norm = DnamProjManifest::validate_and_normalize_json_str(&minimal_json).unwrap();
     assert!(norm.contains(r#""container_kind":"dnam-proj""#));
-    assert!(norm.contains(r#""version":"2.0.0""#));
+    assert!(norm.contains(r#""version":"3.0.0""#));
 
     let recompute_hdr_crc = |buf: &mut [u8]| {
         let pre = DnamProjPreamble::from_bytes(&buf[..64]).unwrap();

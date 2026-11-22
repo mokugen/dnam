@@ -45,8 +45,8 @@ pub use laws::{
     Disambiguated2To1Mode, EndpointProbeMetrics, ExcitationBranch, FeedbackLawsState,
     HadamardLaw4dTracker, KinematicAlphaBetaPoleTracker, KnobAcousticClass, PoleZoomRegime,
     SweepExecutionMode, TopologyProbeMode, build_orthogonal_hadamard_diagonals,
-    classify_knob_acoustic_class, classify_knob_from_endpoint_probe, compute_hadamard_sfm_ratio,
-    is_master_or_output_control, select_coupled_hadamard_pairs, select_sweep_execution_mode,
+    classify_knob_from_endpoint_probe, compute_hadamard_sfm_ratio, select_coupled_hadamard_pairs,
+    select_sweep_execution_mode,
 };
 pub use null_test::{LiveNullTestReport, run_live_null_test_and_autopatch};
 pub use pipeline::{
@@ -115,7 +115,7 @@ impl Default for StimulusConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControllerPhase {
     ActiveLearning,
-    Oc2Glissando { gliss_frame_idx: usize },
+    SubHarmonicGlissando { gliss_frame_idx: usize },
     Coreset { coreset_frame_idx: usize },
     DecayTail { tail_frame_idx: usize },
     Finished,
@@ -262,7 +262,7 @@ impl AdaptiveStimulusController {
             .max_frames
             .saturating_sub(self.laws.valid_frames);
         let rem_coreset = match self.phase {
-            ControllerPhase::ActiveLearning | ControllerPhase::Oc2Glissando { .. } => 3,
+            ControllerPhase::ActiveLearning | ControllerPhase::SubHarmonicGlissando { .. } => 3,
             ControllerPhase::Coreset { coreset_frame_idx } => {
                 3usize.saturating_sub(coreset_frame_idx)
             }
@@ -667,11 +667,11 @@ impl AdaptiveStimulusController {
                 }
                 self.consecutive_replays = 0;
 
-                // Law 0.E: OC-2 sub-harmonic divider handoff after <= 2 multisine frames
-                if self.safeguards.oc2_glissando_handoff {
+                // Law 0.E: Sub-harmonic divider handoff after <= 2 multisine frames
+                if self.safeguards.sub_harmonic_glissando_handoff {
                     let slice = self.glissando_buf_l[0..ADAPTIVE_FRAME_SAMPLES].to_vec();
                     let aux = self.aux_for_non_active_48k(&slice);
-                    self.phase = ControllerPhase::Oc2Glissando { gliss_frame_idx: 1 };
+                    self.phase = ControllerPhase::SubHarmonicGlissando { gliss_frame_idx: 1 };
                     return Some(self.build_stimulus_frame_from_48k(slice, None, aux));
                 }
 
@@ -741,14 +741,14 @@ impl AdaptiveStimulusController {
                 Some(self.build_stimulus_frame_from_48k(dl, dr, aux))
             }
 
-            ControllerPhase::Oc2Glissando { gliss_frame_idx } => {
+            ControllerPhase::SubHarmonicGlissando { gliss_frame_idx } => {
                 self.laws.valid_frames += 1;
                 if gliss_frame_idx < 3 {
                     let start = gliss_frame_idx * ADAPTIVE_FRAME_SAMPLES;
                     let slice =
                         self.glissando_buf_l[start..start + ADAPTIVE_FRAME_SAMPLES].to_vec();
                     let aux = self.aux_for_non_active_48k(&slice);
-                    self.phase = ControllerPhase::Oc2Glissando {
+                    self.phase = ControllerPhase::SubHarmonicGlissando {
                         gliss_frame_idx: gliss_frame_idx + 1,
                     };
                     Some(self.build_stimulus_frame_from_48k(slice, None, aux))

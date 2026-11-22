@@ -34,9 +34,6 @@ pub(super) fn solve_ols_ridge_uplo(
             for row in design {
                 acc += row[r] * row[c];
             }
-            if r == c {
-                acc += reg.max(1.0e-9);
-            }
             g_u[col_off + r] = acc;
         }
     }
@@ -174,6 +171,49 @@ pub(super) fn factor_dispatch_subspace<const R: usize>(
     (z_latents, w_disp)
 }
 
+pub(super) fn contributor_features_matrix(
+    slots: &[Cp1ContributorSlot],
+    norm_table: &[Vec<f64>],
+    descs: &[ControlClampDescriptor],
+    samples: &[Cp1ControlSample],
+) -> Vec<Vec<f64>> {
+    samples
+        .iter()
+        .enumerate()
+        .map(|(i, samp)| {
+            slots
+                .iter()
+                .map(|sl| {
+                    let c = usize::from(sl.control_idx);
+                    if sl.ctrl_kind == 0 {
+                        let u_p = norm_table[i][c] as f32;
+                        let lob = descs[c].eval_lobatto_basis(u_p);
+                        f64::from(sl.emb[0] * lob[0] + sl.emb[1] * lob[1] + sl.emb[2] * lob[2])
+                    } else if samp.switch_options.get(c).copied().unwrap_or(0) == sl.aux {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub(super) fn slot_cooccurrence_mask(phi: &[Vec<f64>], n_slots: usize) -> Vec<bool> {
+    (0..n_slots)
+        .map(|si| {
+            phi.iter().any(|row| {
+                row[si].abs() > 1.0e-9
+                    && row
+                        .iter()
+                        .enumerate()
+                        .any(|(sj, &v)| sj != si && v.abs() > 1.0e-9)
+            })
+        })
+        .collect()
+}
+
 pub(super) fn eval_fm_pairs_with_self_sub(
     slots: &[Cp1ContributorSlot],
     norm_table: &[Vec<f64>],
@@ -181,22 +221,14 @@ pub(super) fn eval_fm_pairs_with_self_sub(
     samples: &[Cp1ControlSample],
     use_ultra_v: bool,
 ) -> Vec<Vec<f64>> {
+    let phi = contributor_features_matrix(slots, norm_table, descs, samples);
     let n_obs = samples.len();
     let mut out = vec![vec![0.0_f64; RANK_BASE_FM]; n_obs];
-    for (i, samp) in samples.iter().enumerate() {
+    for (i, phi_row) in phi.iter().enumerate() {
         let mut sum_v = [0.0_f64; RANK_BASE_FM];
         let mut sum_v_sq = [0.0_f64; RANK_BASE_FM];
-        for sl in slots {
-            let c = usize::from(sl.control_idx);
-            let z_c = if sl.ctrl_kind == 0 {
-                let u_p = norm_table[i][c] as f32;
-                let lob = descs[c].eval_lobatto_basis(u_p);
-                f64::from(sl.emb[0] * lob[0] + sl.emb[1] * lob[1] + sl.emb[2] * lob[2])
-            } else if samp.switch_options.get(c).copied().unwrap_or(0) == sl.aux {
-                1.0
-            } else {
-                0.0
-            };
+        for (si, sl) in slots.iter().enumerate() {
+            let z_c = phi_row[si];
             let v_arr = if use_ultra_v { &sl.v_ultra } else { &sl.v_base };
             for f in 0..RANK_BASE_FM {
                 let term = f64::from(v_arr[f]) * z_c;
@@ -209,4 +241,187 @@ pub(super) fn eval_fm_pairs_with_self_sub(
         }
     }
     out
+}
+
+fn eval_fm_rss(fm: &[Vec<f64>], u: &[Vec<f64>], targets: &[Vec<f64>]) -> f64 {
+    let k_dim = targets.first().map_or(0, Vec::len);
+    let mut rss = 0.0_f64;
+    for (fm_row, tgt_row) in fm.iter().zip(targets) {
+        for (d, &tv) in tgt_row.iter().enumerate().take(k_dim) {
+            let mut pred = 0.0_f64;
+            for f in 0..RANK_BASE_FM {
+                pred += fm_row[f] * u.get(f).and_then(|r| r.get(d)).copied().unwrap_or(0.0);
+            }
+            let e = tv - pred;
+            rss += e * e;
+        }
+    }
+    rss
+}
+
+/// Refines Rank-4 FM slot factor weights (`v_base` or `v_ultra`) and readout `U` via alternating
+/// least squares with exact self-term-subtracted coordinate updates, guaranteeing monotone RSS
+/// reduction over the initial fixed `v` solve.
+pub(super) fn fit_fm_als_u_and_v(
+    slots: &mut [Cp1ContributorSlot],
+    norm_table: &[Vec<f64>],
+    descs: &[ControlClampDescriptor],
+    samples: &[Cp1ControlSample],
+    targets: &[Vec<f64>],
+    reg: f64,
+    use_ultra_v: bool,
+) -> (Vec<Vec<f64>>, Vec<Vec<f64>>) {
+    let n_slots = slots.len();
+    let phi = contributor_features_matrix(slots, norm_table, descs, samples);
+    let cooccurs = slot_cooccurrence_mask(&phi, n_slots);
+    for (sl, &co) in slots.iter_mut().zip(&cooccurs) {
+        if !co {
+            if use_ultra_v {
+                sl.v_ultra = [0.0; RANK_BASE_FM];
+            } else {
+                sl.v_base = [0.0; RANK_BASE_FM];
+            }
+        }
+    }
+    let fm_reg = reg.max(1.0e-5);
+    let v_reg = 1.0e-4_f64;
+    let init_fm = eval_fm_pairs_with_self_sub(slots, norm_table, descs, samples, use_ultra_v);
+    let init_u = solve_ols_ridge_uplo(&init_fm, targets, fm_reg);
+    let init_rss = eval_fm_rss(&init_fm, &init_u, targets);
+    if n_slots < 2 || samples.is_empty() || targets.is_empty() || targets[0].is_empty() {
+        return (init_fm, init_u);
+    }
+
+    let n_obs = samples.len();
+    let k_dim = targets[0].len();
+    let orig_v: Vec<[f32; RANK_BASE_FM]> = slots
+        .iter()
+        .map(|sl| if use_ultra_v { sl.v_ultra } else { sl.v_base })
+        .collect();
+    let mut v_work: Vec<[f64; RANK_BASE_FM]> = slots
+        .iter()
+        .enumerate()
+        .map(|(si, sl)| {
+            if !cooccurs[si] {
+                return [0.0; RANK_BASE_FM];
+            }
+            let arr = if use_ultra_v { &sl.v_ultra } else { &sl.v_base };
+            core::array::from_fn(|f| f64::from(arr[f]))
+        })
+        .collect();
+    let mut sum_v = vec![[0.0_f64; RANK_BASE_FM]; n_obs];
+    let mut fm_work = vec![vec![0.0_f64; RANK_BASE_FM]; n_obs];
+    let recompute_fm =
+        |vw: &[[f64; RANK_BASE_FM]], sv: &mut [[f64; RANK_BASE_FM]], fm_buf: &mut [Vec<f64>]| {
+            for i in 0..n_obs {
+                let mut s = [0.0_f64; RANK_BASE_FM];
+                let mut s2 = [0.0_f64; RANK_BASE_FM];
+                for si in 0..n_slots {
+                    let ph = phi[i][si];
+                    for f in 0..RANK_BASE_FM {
+                        let t = vw[si][f] * ph;
+                        s[f] += t;
+                        s2[f] += t * t;
+                    }
+                }
+                sv[i] = s;
+                for f in 0..RANK_BASE_FM {
+                    fm_buf[i][f] = 0.5 * (s[f] * s[f] - s2[f]);
+                }
+            }
+        };
+
+    recompute_fm(&v_work, &mut sum_v, &mut fm_work);
+    let mut err = vec![vec![0.0_f64; k_dim]; n_obs];
+
+    for _sweep in 0..6 {
+        let u = solve_ols_ridge_uplo(&fm_work, targets, fm_reg);
+        for i in 0..n_obs {
+            for d in 0..k_dim {
+                let mut pred = 0.0_f64;
+                for f in 0..RANK_BASE_FM {
+                    pred += fm_work[i][f] * u[f][d];
+                }
+                err[i][d] = targets[i][d] - pred;
+            }
+        }
+        for si in 0..n_slots {
+            if !cooccurs[si] {
+                continue;
+            }
+            for f in 0..RANK_BASE_FM {
+                let u_sq: f64 = u[f].iter().map(|&uv| uv * uv).sum();
+                if u_sq <= 1.0e-18 {
+                    continue;
+                }
+                let v_old = v_work[si][f];
+                let mut a_sq = 0.0_f64;
+                let mut b_dot = 0.0_f64;
+                for i in 0..n_obs {
+                    let ph = phi[i][si];
+                    if ph == 0.0 {
+                        continue;
+                    }
+                    let rest = sum_v[i][f] - v_old * ph;
+                    let ai = ph * rest;
+                    if ai == 0.0 {
+                        continue;
+                    }
+                    a_sq += ai * ai;
+                    let eu: f64 = (0..k_dim).map(|d| err[i][d] * u[f][d]).sum();
+                    b_dot += ai * eu;
+                }
+                let denom = a_sq * u_sq + v_reg;
+                if denom <= 1.0e-18 {
+                    continue;
+                }
+                let step = (b_dot - v_reg * v_old) / denom;
+                let v_new = (v_old + step).clamp(-4.0, 4.0);
+                let dv = v_new - v_old;
+                if dv.abs() <= 1.0e-12 {
+                    continue;
+                }
+                v_work[si][f] = v_new;
+                for i in 0..n_obs {
+                    let ph = phi[i][si];
+                    if ph == 0.0 {
+                        continue;
+                    }
+                    let rest = sum_v[i][f] - v_old * ph;
+                    let ai = ph * rest;
+                    sum_v[i][f] += dv * ph;
+                    fm_work[i][f] += dv * ai;
+                    for d in 0..k_dim {
+                        err[i][d] -= dv * ai * u[f][d];
+                    }
+                }
+            }
+        }
+        recompute_fm(&v_work, &mut sum_v, &mut fm_work);
+    }
+
+    let cand_v_f32: Vec<[f32; RANK_BASE_FM]> =
+        v_work.iter().map(|row| row.map(|x| x as f32)).collect();
+    for (sl, vf) in slots.iter_mut().zip(&cand_v_f32) {
+        if use_ultra_v {
+            sl.v_ultra = *vf;
+        } else {
+            sl.v_base = *vf;
+        }
+    }
+    let cand_fm = eval_fm_pairs_with_self_sub(slots, norm_table, descs, samples, use_ultra_v);
+    let cand_u = solve_ols_ridge_uplo(&cand_fm, targets, fm_reg);
+    let cand_rss = eval_fm_rss(&cand_fm, &cand_u, targets);
+    if cand_rss <= init_rss {
+        (cand_fm, cand_u)
+    } else {
+        for (sl, vf) in slots.iter_mut().zip(&orig_v) {
+            if use_ultra_v {
+                sl.v_ultra = *vf;
+            } else {
+                sl.v_base = *vf;
+            }
+        }
+        (init_fm, init_u)
+    }
 }

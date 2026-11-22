@@ -23,10 +23,13 @@ pub use pass2_opt::{
     eval_op_n_pre_and_adjoint, eval_op_t_transport_and_adjoint, generate_generic_sobol_seeds,
     run_pass2_optimize,
 };
-pub use pass3_varpro::{Pass3VarProReport, run_pass3_varpro_readout};
+pub use pass3_varpro::{
+    Pass3VarProReport, WeightedReadoutStem, extract_stat_256d_gram,
+    patch_model_readouts_weighted_cholesky, run_pass3_varpro_readout,
+};
 pub use pass5_emit::{
     MAX_INTER_TIER_LU_DRIFT, Pass5EmitConfig, Pass5EmitResult, compute_itu_bs1770_lufs,
-    encode_model_to_dnam_bin, run_pass5_emit_and_certify,
+    decode_dnam_bin_to_model, encode_model_to_dnam_bin, run_pass5_emit_and_certify,
 };
 pub use progress::{
     AtomicDnprProgress, DNPR_MAGIC, DnprProgressWire, PROGRESS_MAGIC_DNPR, ProgressMetrics,

@@ -11,8 +11,8 @@ use dnam_capture::proj::{
 use dnam_capture::whitebox::{DnwbCommand, FaustRunner, SpiceRunner, write_dnwb_stem_response};
 use dnam_capture::{DistillationTarget, StemResponse, StemStimulus, StimulusFrame};
 use dnam_engine::container::{
-    ARENA_OFFSET_LITE_END, DnamContainerView, build_dmu1_mutable_frame, build_dnam_container,
-    build_v2_open_dnam_container,
+    DnamContainerView, build_dmu1_mutable_frame, build_dnam_container_from_dnam_bin,
+    build_v3_open_dnam_container,
 };
 use dnam_engine::provenance::{
     Dau1Envelope, DefaultCryptoProvider, RustCryptoProvider, VerificationStatus,
@@ -24,6 +24,8 @@ use dnam_engine::schema::{
     ControlKind, ControlSchemaDef, ControlUiHints, DistributionPolicy, DnamError, DnamJsonHeader,
     DnamProtectionProfile, PresetDef,
 };
+use dnam_train::{Pass5EmitConfig, SonaModelF64, encode_model_to_dnam_bin};
+use dnam_vm::bin::ARENA_TIER_BYTES;
 use std::collections::BTreeMap;
 use std::f64::consts::PI;
 
@@ -49,7 +51,7 @@ fn test_proj_auth_signature_mutable_manifest_preservation_and_tamper_rejection()
     let pk = RustCryptoProvider::ed25519_pubkey_from_seed(&seed);
 
     let mut manifest = DnamProjManifest::default_reference();
-    let arena = vec![0u8; ARENA_OFFSET_LITE_END as usize];
+    let arena = super::test_support::neutral_arena_bytes(false);
     let unsigned_proj =
         build_dnam_proj_container_with_cp1(&mut manifest, &[], &arena, &[]).unwrap();
     let unsigned_view = DnamProjView::from_bytes(&unsigned_proj, &crypto).unwrap();
@@ -130,11 +132,11 @@ fn test_proj_auth_signature_mutable_manifest_preservation_and_tamper_rejection()
     ));
 
     // Tampering with WGHT payload while keeping old AUTH must also fail closed!
-    let mut forged_arena = arena;
-    forged_arena[124..128].copy_from_slice(&0.5_f32.to_le_bytes());
+    let mut forged_model = SonaModelF64::new(48_000.0);
+    forged_model.pre_conv_u_gain = [0.25, 0.25];
+    let forged_dbin = encode_model_to_dnam_bin(&forged_model, Pass5EmitConfig::default()).unwrap();
     let mut tmp_hdr = signed_view.manifest.base.clone();
-    let forged_wght =
-        build_dnam_container(&mut tmp_hdr, &forged_arena, &forged_arena, false).unwrap();
+    let forged_wght = build_dnam_container_from_dnam_bin(&mut tmp_hdr, &forged_dbin).unwrap();
     let forged_chunk_proj = build_dnam_proj_container_with_crypto_unchecked(
         &signed_view.manifest,
         &forged_wght,
@@ -183,7 +185,7 @@ fn build_dnam_proj_container_with_crypto_unchecked(
     dir_bytes.extend_from_slice(&e1.to_bytes());
     let mut pre = DnamProjPreamble {
         magic: dnam_capture::proj::DNPJ_MAGIC,
-        version_major: 2,
+        version_major: 3,
         version_minor: 0,
         lifecycle_flags: (1 << 4) | (1 << 5) | (1 << 6),
         chunk_count: 2,
@@ -218,9 +220,9 @@ fn test_v2_dau1_relocated_buyer_tier_distribution_policy_and_dmu1_schema_merges(
         declared_range: Some([0.0, 10.0]),
         safe_clamped_range: Some([0.0, 10.0]),
         default: serde_json::json!(5.0),
-        conditional_min: BTreeMap::new(),
-        conditional_max: BTreeMap::new(),
+        conditional_bounds: Vec::new(),
         declared_options: None,
+        represented_switch_options: None,
         active_options: None,
         clamp_warning: None,
         calibration: None,
@@ -246,13 +248,13 @@ fn test_v2_dau1_relocated_buyer_tier_distribution_policy_and_dmu1_schema_merges(
     shared_1ctrl[16..20].copy_from_slice(&1.0f32.to_le_bytes());
     shared_1ctrl[64..68].copy_from_slice(b"CP1\0");
 
-    let t0 = vec![0x11u8; 10_752];
-    let t1 = vec![0x22u8; 11_584];
-    let t2 = vec![0x33u8; 13_888];
-    let t3 = vec![0x44u8; 27_776];
+    let t0 = vec![0x11u8; ARENA_TIER_BYTES[0]];
+    let t1 = vec![0x22u8; ARENA_TIER_BYTES[1] - ARENA_TIER_BYTES[0]];
+    let t2 = vec![0x33u8; ARENA_TIER_BYTES[2] - ARENA_TIER_BYTES[1]];
+    let t3 = vec![0x44u8; ARENA_TIER_BYTES[3] - ARENA_TIER_BYTES[2]];
 
     let unsigned_dnam =
-        build_v2_open_dnam_container(&hdr_json, &shared_1ctrl, &[0u8; 64], &[&t0], None, 0)
+        build_v3_open_dnam_container(&hdr_json, &shared_1ctrl, &[0u8; 64], &[&t0], None, 0)
             .unwrap();
     let unsigned_view =
         DnamContainerView::from_bytes(&unsigned_dnam, &DefaultCryptoProvider::default()).unwrap();
@@ -263,14 +265,14 @@ fn test_v2_dau1_relocated_buyer_tier_distribution_policy_and_dmu1_schema_merges(
     assert!(!unsigned_view.preamble.has_signatures());
 
     let bad_ak1 =
-        build_v2_open_dnam_container(&hdr_json, &shared_1ctrl, &[0u8; 64], &[&t0], None, 1)
+        build_v3_open_dnam_container(&hdr_json, &shared_1ctrl, &[0u8; 64], &[&t0], None, 1)
             .unwrap();
     assert!(DnamContainerView::from_bytes(&bad_ak1, &DefaultCryptoProvider::default()).is_err());
 
     let mut tampered_dau1 = vec![0u8; 160];
     tampered_dau1[0..8].copy_from_slice(b"DAU1\x09\x00\x00\x00");
     let bad_dau1 =
-        build_v2_open_dnam_container(&hdr_json, &shared_1ctrl, &tampered_dau1, &[&t0], None, 0)
+        build_v3_open_dnam_container(&hdr_json, &shared_1ctrl, &tampered_dau1, &[&t0], None, 0)
             .unwrap();
     assert!(DnamContainerView::from_bytes(&bad_dau1, &DefaultCryptoProvider::default()).is_err());
 
@@ -280,7 +282,7 @@ fn test_v2_dau1_relocated_buyer_tier_distribution_policy_and_dmu1_schema_merges(
     let m_pk = RustCryptoProvider::ed25519_pubkey_from_seed(&m_seed);
     let hdr_sha = sha256_digest(&hdr_json);
 
-    let master_probe = build_v2_open_dnam_container(
+    let master_probe = build_v3_open_dnam_container(
         &hdr_json,
         &shared_1ctrl,
         &[0u8; 174],
@@ -316,7 +318,7 @@ fn test_v2_dau1_relocated_buyer_tier_distribution_policy_and_dmu1_schema_merges(
     }
     .to_bytes()
     .unwrap();
-    let buyer_probe = build_v2_open_dnam_container(
+    let buyer_probe = build_v3_open_dnam_container(
         &hdr_json,
         &shared_1ctrl,
         &probe_env_bytes,
@@ -357,7 +359,7 @@ fn test_v2_dau1_relocated_buyer_tier_distribution_policy_and_dmu1_schema_merges(
         128,
     )
     .unwrap();
-    let reloc_dnam = build_v2_open_dnam_container(
+    let reloc_dnam = build_v3_open_dnam_container(
         &hdr_json,
         &shared_1ctrl,
         &env_reloc.to_bytes().unwrap(),
@@ -388,7 +390,7 @@ fn test_v2_dau1_relocated_buyer_tier_distribution_policy_and_dmu1_schema_merges(
     ));
 
     let bad_dmu = build_dmu1_mutable_frame(br#"{"evil_unknown":1}"#, 48).unwrap();
-    let bad_dmu_dnam = build_v2_open_dnam_container(
+    let bad_dmu_dnam = build_v3_open_dnam_container(
         &hdr_json,
         &shared_1ctrl,
         &[0u8; 64],
@@ -404,7 +406,7 @@ fn test_v2_dau1_relocated_buyer_tier_distribution_policy_and_dmu1_schema_merges(
         allowed_protection_profiles: vec![DnamProtectionProfile::EnclaveSealed],
         allowed_oem_vendors: Vec::new(),
     });
-    let illegal_open_dnam = build_v2_open_dnam_container(
+    let illegal_open_dnam = build_v3_open_dnam_container(
         &enclave_hdr.to_json_vec().unwrap(),
         &shared_1ctrl,
         &[0u8; 64],

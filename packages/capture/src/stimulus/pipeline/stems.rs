@@ -4,24 +4,20 @@
 
 use std::collections::BTreeMap;
 
-use dnam_engine::schema::{ControlKind, DnamError};
+use dnam_engine::schema::DnamError;
+use zerocopy::FromBytes;
+use zerocopy::byteorder::little_endian::F32;
 
-use crate::proj::directory::StmcTrajectoryWindow;
-use crate::proj::schema::DnamProjManifest;
 use crate::proj::vault::VaultCaptureSpec;
 use crate::resampler::{resample_arbitrary_rate_to_48k, resampled_frame_len};
 use crate::targets::{DistillationTarget, StemResponse, StemStimulus};
 
-use super::super::batch::{
-    build_controls_meta_map, build_freeze_transition_stem_stimulus, resample_48k_channels_to_sr,
-};
+use super::super::batch::resample_48k_channels_to_sr;
 use super::super::fft::ADAPTIVE_FRAME_SAMPLES;
 use super::super::laws::TopologyProbeMode;
 use super::super::physics_probe;
 use super::super::safeguards::CaptureWarning;
-use super::super::sealing::{StemSealRequest, align_full_stem_and_seal_vault_with_override};
 use super::super::{AdaptiveStimulusController, StimulusConfig};
-use super::AdaptiveTrainingOptions;
 
 pub(super) type StarProbe<'a> = (&'a [f32], &'a [f32], Option<&'a [f32]>, &'a [usize]);
 pub(super) type ClosedLoopStemOut = (
@@ -34,13 +30,13 @@ pub(super) type ClosedLoopStemOut = (
 );
 
 pub(super) fn spectral_tilt_from_stmc_4096(spec_4096: &[u8; 4_096]) -> f64 {
+    let Ok(bins) = <[F32]>::ref_from_bytes(spec_4096) else {
+        return 0.0;
+    };
     let mut weighted_e = 0.0_f64;
     let mut total_e = 0.0_f64;
-    for i in 1..512 {
-        let off = i * 4;
-        let m = f64::from(f32::from_le_bytes(
-            spec_4096[off..off + 4].try_into().unwrap(),
-        ));
+    for (i, bin) in bins.iter().enumerate().take(512).skip(1) {
+        let m = f64::from(bin.get());
         let p = m * m;
         weighted_e += ((i as f64) / 32.0) * p;
         total_e += p;
@@ -157,94 +153,4 @@ pub(super) fn run_single_closed_loop_stem(
     }
     let tilt = spectral_tilt_from_stmc_4096(&spec.spectral_summary_4096);
     Ok((inpc, spec, warnings, tilt, lag, pol))
-}
-
-pub(super) fn capture_freeze_transition_stem_mode1(
-    manifest: &DnamProjManifest,
-    target: &mut dyn DistillationTarget,
-    freeze_ctrl_idx: usize,
-    options: &AdaptiveTrainingOptions,
-    seed_256: &[u8; 256],
-    carrier_bins: &[usize],
-    shared_align: Option<(f64, bool)>,
-) -> Result<VaultCaptureSpec, DnamError> {
-    let stim = build_freeze_transition_stem_stimulus(
-        manifest,
-        freeze_ctrl_idx,
-        options.sample_rate_hz,
-        options.topology_mode,
-        seed_256,
-    );
-    target.reset_state();
-    let resp = target.render_stem(&stim)?;
-
-    let to_48k = |ch: &[f32], sr: u32| -> Vec<f32> {
-        let csr = sr.clamp(8_000, 384_000);
-        if csr == 48_000 {
-            ch.to_vec()
-        } else {
-            let dst = resampled_frame_len(ch.len(), csr, 48_000);
-            resample_arbitrary_rate_to_48k(ch, csr, Some(dst))
-        }
-    };
-    let dry_48k_l = to_48k(&stim.in_1, stim.sample_rate_hz);
-    let dry_48k_r = stim.in_2.as_ref().map(|r| to_48k(r, stim.sample_rate_hz));
-    let wet_48k_l = to_48k(&resp.out_1, resp.sample_rate_hz);
-    let wet_48k_r = resp.out_2.as_ref().map(|r| to_48k(r, resp.sample_rate_hz));
-
-    let ctrl_def = &manifest.base.controls_schema[freeze_ctrl_idx];
-    let is_sw = ctrl_def.kind == ControlKind::Switch;
-    let mut sw_map = BTreeMap::new();
-    if is_sw && let Some(opt_name) = ctrl_def.declared_options.as_ref().and_then(|o| o.get(1)) {
-        sw_map.insert(freeze_ctrl_idx, opt_name.clone());
-    }
-    let meta = build_controls_meta_map(manifest, &stim.control_values, &sw_map);
-    let mut user_meta = BTreeMap::new();
-    if let Some([n0, n1]) = stim.freeze_transition_window {
-        user_meta.insert(
-            "freeze_transition_window".to_string(),
-            serde_json::json!([n0, n1]),
-        );
-    }
-    let hi_val = stim
-        .control_values
-        .get(freeze_ctrl_idx)
-        .copied()
-        .unwrap_or(1.0);
-    let windows = vec![
-        StmcTrajectoryWindow {
-            control_id: freeze_ctrl_idx as u16,
-            ctrl_kind: u8::from(is_sw),
-            active_opt: 0,
-            u_phys: 0.0,
-            window_weight: 1.0,
-            emr_velocity: 0.1,
-        },
-        StmcTrajectoryWindow {
-            control_id: freeze_ctrl_idx as u16,
-            ctrl_kind: u8::from(is_sw),
-            active_opt: u8::from(is_sw),
-            u_phys: hi_val,
-            window_weight: 1.0,
-            emr_velocity: 0.1,
-        },
-    ];
-    let (_, spec, _, _) = align_full_stem_and_seal_vault_with_override(
-        StemSealRequest {
-            stem_id: &stim.stem_id,
-            is_star_center: false,
-            seed_256,
-            carrier_bins,
-            valid_frames: 5,
-            dry_48k_l: &dry_48k_l,
-            dry_48k_r: dry_48k_r.as_deref(),
-            wet_48k_l: &wet_48k_l,
-            wet_48k_r: wet_48k_r.as_deref(),
-            windows,
-            controls_meta: meta,
-            user_metadata: user_meta,
-        },
-        shared_align,
-    )?;
-    Ok(spec)
 }

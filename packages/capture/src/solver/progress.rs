@@ -11,38 +11,26 @@ use core::sync::atomic::{AtomicU32, Ordering, fence};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
-use dnam_engine::Tier;
+use dnam_train::DnprProgressWire;
+use dnam_vm::Tier;
+use zerocopy::byteorder::little_endian::{F32, U32};
+use zerocopy::{FromBytes, IntoBytes};
 
 /// Magic word stored in `word[WORD_MAGIC]` (`15`) of every `256 B` (`DNPR`) progress packet.
-pub const PROGRESS_MAGIC_DNPR: u32 = u32::from_be_bytes(*b"DNPR");
+pub const PROGRESS_MAGIC_DNPR: u32 = dnam_train::PROGRESS_MAGIC_DNPR;
 
-/// Cumulative word offsets for the canonical `64`-word (`256 B`) `DNPR` seqlock packet layout.
+/// Seqlock sequence counter word index (`0`) inside [`DnprProgressWire`].
 const WORD_SEQ: usize = 0;
-const WORD_FLAGS: usize = WORD_SEQ + 1;
-const WORD_STEPS: usize = WORD_FLAGS + 1;
-const WORD_STAGE_STEPS: usize = WORD_STEPS + 1;
-const WORD_BEST_LOSS: usize = WORD_STAGE_STEPS + 1;
-const WORD_MR_IIR: usize = WORD_BEST_LOSS + 1;
-const WORD_VIS_META: usize = WORD_MR_IIR + 1;
-const WORD_TIER_BESR: usize = WORD_VIS_META + 1;
-const WORD_TIER_LTAS: usize = WORD_TIER_BESR + 4;
-const WORD_MAGIC: usize = WORD_TIER_LTAS + 4;
-const WORD_TARGET_WAVE_WORDS: usize = 64 / 4;
-const WORD_TARGET_WAVE: usize = WORD_MAGIC + 1;
-const WORD_MODEL_WAVE_WORDS: usize = 64 / 4;
-const WORD_MODEL_WAVE: usize = WORD_TARGET_WAVE + WORD_TARGET_WAVE_WORDS;
-const WORD_LTAS_ERR_WORDS: usize = 32 / 4;
-const WORD_LTAS_ERR: usize = WORD_MODEL_WAVE + WORD_MODEL_WAVE_WORDS;
-const WORD_KAUTZ_POLES_WORDS: usize = 16 / 2;
-const WORD_KAUTZ_POLES: usize = WORD_LTAS_ERR + WORD_LTAS_ERR_WORDS;
+/// Magic word index (`15`) inside [`DnprProgressWire`].
+const WORD_MAGIC: usize = 15;
 
 /// Number of little-endian `u32` words in the `DNPR` wire frame (`64 x 4 B = 256 B`).
-pub const PROGRESS_WIRE_WORDS: usize = WORD_KAUTZ_POLES + WORD_KAUTZ_POLES_WORDS;
+pub const PROGRESS_WIRE_WORDS: usize = 64;
 
 /// Total byte size of a serialized `DNPR` progress frame (`256 B`).
 pub const PROGRESS_WIRE_BYTES: usize = PROGRESS_WIRE_WORDS * 4;
 
-const _: () = assert!(WORD_MAGIC == 15);
+const _: () = assert!(core::mem::size_of::<DnprProgressWire>() == PROGRESS_WIRE_BYTES);
 const _: () = assert!(PROGRESS_WIRE_WORDS == 64);
 const _: () = assert!(PROGRESS_WIRE_BYTES == 256);
 
@@ -125,33 +113,6 @@ const fn code_to_tier(code: u8) -> Option<Tier> {
         3 => Some(Tier::Pro),
         4 => Some(Tier::Ultra),
         _ => None,
-    }
-}
-
-#[inline]
-fn pack_i8_words<const W: usize>(src: &[i8]) -> [u32; W] {
-    let mut out = [0_u32; W];
-    for (idx, word) in out.iter_mut().enumerate() {
-        let base = idx * 4;
-        *word = u32::from_le_bytes([
-            src[base] as u8,
-            src[base + 1] as u8,
-            src[base + 2] as u8,
-            src[base + 3] as u8,
-        ]);
-    }
-    out
-}
-
-#[inline]
-fn unpack_i8_words(words: &[u32], dst: &mut [i8]) {
-    for (idx, &word) in words.iter().enumerate() {
-        let bytes = word.to_le_bytes();
-        let base = idx * 4;
-        dst[base] = bytes[0] as i8;
-        dst[base + 1] = bytes[1] as i8;
-        dst[base + 2] = bytes[2] as i8;
-        dst[base + 3] = bytes[3] as i8;
     }
 }
 
@@ -242,144 +203,113 @@ impl TrainerProgressSnapshot {
         Some((1.0 - 10.0_f32.powf(active_esr / 20.0)).clamp(0.0, 1.0) * 100.0)
     }
 
-    /// Serializes this snapshot into the canonical `64`-word (`256 B`) `DNPR` layout with sequence `seq`.
+    /// Encodes this snapshot into a canonical `256 B` [`DnprProgressWire`] packet with `seq`.
     #[must_use]
-    pub fn to_words(&self, seq: u32) -> [u32; PROGRESS_WIRE_WORDS] {
-        let mut w = [0_u32; PROGRESS_WIRE_WORDS];
-        w[WORD_SEQ] = seq;
+    pub fn to_wire(&self, seq: u32) -> DnprProgressWire {
         let tier_code = u32::from(tier_to_code(self.active_tier));
         let perm = u32::from(self.progress_permille.min(1_000));
-        w[WORD_FLAGS] = u32::from(self.status as u8)
+        let packed_state = u32::from(self.status as u8)
             | (u32::from(self.phase as u8) << 8)
             | (tier_code << 16)
             | (perm << 20);
-        w[WORD_STEPS] = self.step.min(0xFFFF) | (self.total_steps.min(0xFFFF) << 16);
-        w[WORD_STAGE_STEPS] =
-            self.stage_step.min(0xFFFF) | (self.stage_total_steps.min(0xFFFF) << 16);
-        w[WORD_BEST_LOSS] = self.best_loss.to_bits();
-        w[WORD_MR_IIR] = self.mr_iir_loss.to_bits();
-        w[WORD_VIS_META] =
-            u32::from(self.clamped_controls) | (u32::from(u8::from(self.has_visual_frame)) << 16);
-        for t in 0..4 {
-            w[WORD_TIER_BESR + t] = self.tier_besr_db[t].to_bits();
-            w[WORD_TIER_LTAS + t] = self.tier_ltas_db[t].to_bits();
+        let mut kautz_poles_q8 = [[0_u8; 2]; 16];
+        for (dst, &(r_q, f_q)) in kautz_poles_q8.iter_mut().zip(self.kautz_poles_q8.iter()) {
+            *dst = [r_q, f_q];
         }
-        w[WORD_MAGIC] = PROGRESS_MAGIC_DNPR;
-        w[WORD_TARGET_WAVE..WORD_TARGET_WAVE + WORD_TARGET_WAVE_WORDS].copy_from_slice(
-            &pack_i8_words::<WORD_TARGET_WAVE_WORDS>(&self.target_wave_i8),
-        );
-        w[WORD_MODEL_WAVE..WORD_MODEL_WAVE + WORD_MODEL_WAVE_WORDS]
-            .copy_from_slice(&pack_i8_words::<WORD_MODEL_WAVE_WORDS>(&self.model_wave_i8));
-        w[WORD_LTAS_ERR..WORD_LTAS_ERR + WORD_LTAS_ERR_WORDS].copy_from_slice(&pack_i8_words::<
-            WORD_LTAS_ERR_WORDS,
-        >(
-            &self.ltas_error_q20_i8,
-        ));
-        for idx in 0..WORD_KAUTZ_POLES_WORDS {
-            let p0 = self.kautz_poles_q8[2 * idx];
-            let p1 = self.kautz_poles_q8[2 * idx + 1];
-            w[WORD_KAUTZ_POLES + idx] = u32::from_le_bytes([p0.0, p0.1, p1.0, p1.1]);
+        DnprProgressWire {
+            seq: U32::new(seq),
+            packed_state: U32::new(packed_state),
+            step_counters: U32::new(self.step.min(0xFFFF) | (self.total_steps.min(0xFFFF) << 16)),
+            stage_counters: U32::new(
+                self.stage_step.min(0xFFFF) | (self.stage_total_steps.min(0xFFFF) << 16),
+            ),
+            best_loss: F32::new(self.best_loss),
+            mr_iir: F32::new(self.mr_iir_loss),
+            clamped_and_vis: U32::new(
+                u32::from(self.clamped_controls)
+                    | (u32::from(u8::from(self.has_visual_frame)) << 16),
+            ),
+            tier_besr_db: self.tier_besr_db.map(F32::new),
+            tier_ltas_db: self.tier_ltas_db.map(F32::new),
+            magic: U32::new(PROGRESS_MAGIC_DNPR),
+            target_wave_i8: self.target_wave_i8,
+            model_wave_i8: self.model_wave_i8,
+            ltas_error_q20_i8: self.ltas_error_q20_i8,
+            kautz_poles_q8,
         }
-        w
     }
 
-    /// Parses a consistent (`seq & 1 == 0`) `64`-word `DNPR` frame, returning `(seq, snapshot)`.
+    /// Decodes a validated (`seq & 1 == 0`) `256 B` [`DnprProgressWire`] packet.
     #[must_use]
-    pub fn from_words(words: &[u32; PROGRESS_WIRE_WORDS]) -> Option<(u32, Self)> {
-        let seq = words[WORD_SEQ];
-        if (seq & 1) != 0 || words[WORD_MAGIC] != PROGRESS_MAGIC_DNPR {
+    pub fn from_wire(wire: &DnprProgressWire) -> Option<(u32, Self)> {
+        let seq = wire.seq.get();
+        if (seq & 1) != 0 || wire.magic.get() != PROGRESS_MAGIC_DNPR {
             return None;
         }
-        let w1 = words[WORD_FLAGS];
-        let status = TrainingStatus::from_code((w1 & 0xFF) as u8);
-        let phase = TrainingPhase::from_code(((w1 >> 8) & 0xFF) as u8);
-        let active_tier = code_to_tier(((w1 >> 16) & 0x0F) as u8);
-        let progress_permille = (((w1 >> 20) & 0x0FFF) as u16).min(1_000);
-
-        let w2 = words[WORD_STEPS];
-        let w3 = words[WORD_STAGE_STEPS];
-        let w6 = words[WORD_VIS_META];
-
-        let mut tier_besr_db = [0.0_f32; 4];
-        let mut tier_ltas_db = [0.0_f32; 4];
-        for t in 0..4 {
-            tier_besr_db[t] = f32::from_bits(words[WORD_TIER_BESR + t]);
-            tier_ltas_db[t] = f32::from_bits(words[WORD_TIER_LTAS + t]);
-        }
-
-        let mut target_wave_i8 = [0_i8; 64];
-        let mut model_wave_i8 = [0_i8; 64];
-        let mut ltas_error_q20_i8 = [0_i8; 32];
-        unpack_i8_words(
-            &words[WORD_TARGET_WAVE..WORD_TARGET_WAVE + WORD_TARGET_WAVE_WORDS],
-            &mut target_wave_i8,
-        );
-        unpack_i8_words(
-            &words[WORD_MODEL_WAVE..WORD_MODEL_WAVE + WORD_MODEL_WAVE_WORDS],
-            &mut model_wave_i8,
-        );
-        unpack_i8_words(
-            &words[WORD_LTAS_ERR..WORD_LTAS_ERR + WORD_LTAS_ERR_WORDS],
-            &mut ltas_error_q20_i8,
-        );
-
+        let w1 = wire.packed_state.get();
+        let w2 = wire.step_counters.get();
+        let w3 = wire.stage_counters.get();
+        let w6 = wire.clamped_and_vis.get();
         let mut kautz_poles_q8 = [(0_u8, 0_u8); 16];
-        for idx in 0..WORD_KAUTZ_POLES_WORDS {
-            let b = words[WORD_KAUTZ_POLES + idx].to_le_bytes();
-            kautz_poles_q8[2 * idx] = (b[0], b[1]);
-            kautz_poles_q8[2 * idx + 1] = (b[2], b[3]);
+        for (dst, &[r_q, f_q]) in kautz_poles_q8.iter_mut().zip(wire.kautz_poles_q8.iter()) {
+            *dst = (r_q, f_q);
         }
-
         Some((
             seq,
             Self {
-                status,
-                phase,
-                active_tier,
+                status: TrainingStatus::from_code((w1 & 0xFF) as u8),
+                phase: TrainingPhase::from_code(((w1 >> 8) & 0xFF) as u8),
+                active_tier: code_to_tier(((w1 >> 16) & 0x0F) as u8),
                 clamped_controls: (w6 & 0xFFFF) as u16,
                 has_visual_frame: ((w6 >> 16) & 1) != 0,
-                progress_permille,
+                progress_permille: (((w1 >> 20) & 0x0FFF) as u16).min(1_000),
                 step: w2 & 0xFFFF,
                 total_steps: (w2 >> 16) & 0xFFFF,
                 stage_step: w3 & 0xFFFF,
                 stage_total_steps: (w3 >> 16) & 0xFFFF,
-                best_loss: f32::from_bits(words[WORD_BEST_LOSS]),
-                mr_iir_loss: f32::from_bits(words[WORD_MR_IIR]),
-                tier_besr_db,
-                tier_ltas_db,
-                target_wave_i8,
-                model_wave_i8,
-                ltas_error_q20_i8,
+                best_loss: wire.best_loss.get(),
+                mr_iir_loss: wire.mr_iir.get(),
+                tier_besr_db: wire.tier_besr_db.map(F32::get),
+                tier_ltas_db: wire.tier_ltas_db.map(F32::get),
+                target_wave_i8: wire.target_wave_i8,
+                model_wave_i8: wire.model_wave_i8,
+                ltas_error_q20_i8: wire.ltas_error_q20_i8,
                 kautz_poles_q8,
             },
         ))
     }
 
+    /// Serializes this snapshot into the canonical `64`-word (`256 B`) `DNPR` layout with sequence `seq`.
+    #[must_use]
+    pub fn to_words(&self, seq: u32) -> [u32; PROGRESS_WIRE_WORDS] {
+        let wire = self.to_wire(seq);
+        let words_le = <[U32; PROGRESS_WIRE_WORDS]>::ref_from_bytes(wire.as_bytes())
+            .expect("256B DnprProgressWire converts cleanly to 64 u32le words");
+        words_le.map(U32::get)
+    }
+
+    /// Parses a consistent (`seq & 1 == 0`) `64`-word `DNPR` frame, returning `(seq, snapshot)`.
+    #[must_use]
+    pub fn from_words(words: &[u32; PROGRESS_WIRE_WORDS]) -> Option<(u32, Self)> {
+        let words_le = words.map(U32::new);
+        let wire = DnprProgressWire::ref_from_bytes(words_le.as_bytes()).ok()?;
+        Self::from_wire(wire)
+    }
+
     /// Serializes this snapshot into a little-endian `256 B` byte packet.
     #[must_use]
     pub fn to_bytes_256b(&self, seq: u32) -> [u8; PROGRESS_WIRE_BYTES] {
-        let words = self.to_words(seq);
+        let wire = self.to_wire(seq);
         let mut out = [0_u8; PROGRESS_WIRE_BYTES];
-        for (i, &word) in words.iter().enumerate() {
-            out[i * 4..(i + 1) * 4].copy_from_slice(&word.to_le_bytes());
-        }
+        out.copy_from_slice(wire.as_bytes());
         out
     }
 
     /// Parses a little-endian `256 B` `DNPR` packet if `seq` is even and magic matches.
     #[must_use]
     pub fn from_bytes_256b(bytes: &[u8; PROGRESS_WIRE_BYTES]) -> Option<(u32, Self)> {
-        let mut words = [0_u32; PROGRESS_WIRE_WORDS];
-        for (i, w) in words.iter_mut().enumerate() {
-            let base = i * 4;
-            *w = u32::from_le_bytes([
-                bytes[base],
-                bytes[base + 1],
-                bytes[base + 2],
-                bytes[base + 3],
-            ]);
-        }
-        Self::from_words(&words)
+        let wire = DnprProgressWire::ref_from_bytes(bytes).ok()?;
+        Self::from_wire(wire)
     }
 }
 
@@ -528,6 +458,8 @@ impl Default for CachedProgressState {
     }
 }
 
+pub type ProgressCallback = Arc<dyn Fn(&TrainerProgressSnapshot) + Send + Sync>;
+
 /// Optional hybrid progress sink (`AtomicTrainerProgress` seqlock + coarse-grained callback).
 ///
 /// When created with `TrainerProgressHandle::default()`, [`TrainerProgressHandle::is_active`]
@@ -535,7 +467,7 @@ impl Default for CachedProgressState {
 #[derive(Clone)]
 pub struct TrainerProgressHandle {
     slot: Option<Arc<AtomicTrainerProgress>>,
-    callback: Option<Arc<dyn Fn(&TrainerProgressSnapshot) + Send + Sync>>,
+    callback: Option<ProgressCallback>,
     subrange_permille: (u16, u16),
     cache: Option<Arc<Mutex<CachedProgressState>>>,
 }

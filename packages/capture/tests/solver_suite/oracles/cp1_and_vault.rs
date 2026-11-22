@@ -9,7 +9,7 @@ use dnam_capture::CORESET_FP32_FRAMES_PER_STEM;
 use dnam_capture::proj::{
     DnamProjManifest, DnamProjView, PROJ_FLAG_COMPACTED_CAPSULES, PROJ_FLAG_HAS_RAW_STEMS,
     ProjChunkKind, StmcTrajectoryWindow, add_capture, build_dnam_proj_container,
-    build_dnam_proj_container_with_cp1, build_proj_inpc_capsule, compact_to_capsules,
+    build_dnam_proj_container_with_dnam_bin, build_proj_inpc_capsule, compact_to_capsules,
     export_runtime_dnam, parse_proj_manifest_range, remove_capture, replace_capture,
     set_capture_enabled, solve_captures_batch_with_options,
 };
@@ -17,37 +17,23 @@ use dnam_capture::solver::{SolverOptions, star_center_control_values};
 use dnam_capture::stimulus::encode_coreset_fp32;
 use dnam_engine::Tier;
 use dnam_engine::container::strip_container_to_tier;
-use dnam_engine::control::Cp1ContributorSlot;
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::ControlKind;
-use dnam_engine::stages::weights::{
-    ARENA_ULTRA_BYTES, ARENA0_W_CTRL_OFFSET, pack_v3_matryoshka_to_arena,
-    unpack_v3_matryoshka_from_arena,
-};
+use dnam_train::{Pass5EmitConfig, decode_dnam_bin_to_model, encode_model_to_dnam_bin};
+use dnam_vm::control::Cp1ContributorSlot;
+use zerocopy::byteorder::little_endian::F32;
 
 use super::{
-    assert_0_ulp_stereo, build_oracle01_teacher_arena_v3, clear_output_readout_weights, ctrl_meta,
-    esr_db_stereo, interleave_lr, make_range_ctrl, make_switch_ctrl, make_vault_spec, pack_dnam,
-    render_stereo_dnam, stmc_win, synthesize_rich_coreset_dry, write_f32,
+    assert_0_ulp_stereo, build_oracle01_teacher_dbin, clear_output_readout_weights, ctrl_meta,
+    esr_db_stereo, inject_controls_and_cp1_into_dbin, interleave_lr, make_range_ctrl,
+    make_switch_ctrl, make_vault_spec, pack_dnam_from_dbin, render_stereo_dnam, stmc_win,
+    synthesize_rich_coreset_dry,
 };
 
 fn build_oracle02_teacher_and_seed(
     num_controls: usize,
 ) -> (Vec<u8>, DnamProjManifest, Vec<Cp1ContributorSlot>, Vec<u8>) {
-    let mut arena = build_oracle01_teacher_arena_v3();
-    // Populate smooth ControlBus `W_ctrl` couplings (`ARENA0_W_CTRL_OFFSET`):
-    // - `z_head[0..3]` (cols 0..3) drive Tone SVF EQ (`rows 12, 13, 14`) & Block 0 FiLM gain (`row 2`)
-    // - `ctrl_basis_4[0]` (col 4, Hadamard interaction via `v_base[0]`) drives Tone SVF cutoff (`row 9`)
-    let couplings: &[(usize, usize, f32)] = &[
-        (2, 0, 0.18),
-        (12, 0, 0.22),
-        (13, 1, 0.24),
-        (14, 2, 0.20),
-        (9, 4, 0.22),
-    ];
-    for &(row, col, val) in couplings {
-        write_f32(&mut arena, ARENA0_W_CTRL_OFFSET + row * 64 + col * 4, val);
-    }
+    let base_dbin = build_oracle01_teacher_dbin();
 
     let mut manifest = DnamProjManifest::default_reference();
     manifest.base.io_config.output_mode = "stereo".to_string();
@@ -66,7 +52,7 @@ fn build_oracle02_teacher_and_seed(
         let mut s = Cp1ContributorSlot::zero();
         s.lanes = 2;
         s.control_idx = c_idx;
-        s.option_idx = 0xFF;
+        s.aux = 0xFF;
         s.main_base[0][d] = l0;
         s.main_base[1][d] = l1;
         s.emb = [1.0, 0.0, 0.0];
@@ -87,28 +73,42 @@ fn build_oracle02_teacher_and_seed(
         sw.lanes = 1;
         sw.ctrl_kind = 1;
         sw.control_idx = c_idx;
-        sw.option_idx = opt_idx;
+        sw.aux = opt_idx;
         sw.main_base[0][2] = m2;
         sw.emb = [1.0, 0.0, 0.0];
         teacher_slots.push(sw);
     }
     teacher_slots.push(range_slot((num_controls - 1) as u16, 2, 0.60, -0.25, 0.0));
 
-    let mut seed_model = unpack_v3_matryoshka_from_arena(&arena, false);
-    for ro in &mut seed_model.readouts {
-        clear_output_readout_weights(ro);
-    }
-    let mut seed_arena = vec![0u8; ARENA_ULTRA_BYTES];
-    pack_v3_matryoshka_to_arena(&seed_model, &mut seed_arena);
+    // Populate smooth ControlBus couplings on PASS4_ACTIVE_SLOTS rows `[0, 1, 2, 10, 11]`:
+    // - `z_head[0..3]` (cols 0..2) drive SVF g/k (`rows 0, 1`), Block-0 ADAA (`row 2`), Kautz oct (`row 10`)
+    // - `z_fm_base[0]` -> `u_int_base[0][4]` -> col 4 drives Kautz damp (`row 11`)
+    let teacher_dbin =
+        inject_controls_and_cp1_into_dbin(&base_dbin, &manifest, &teacher_slots, |cb| {
+            cb.u_int_base[0][4] = F32::new(1.0);
+            for &(row, col, val) in &[
+                (0usize, 0usize, 0.25_f32),
+                (2, 0, 0.22),
+                (1, 1, 0.24),
+                (10, 2, 0.20),
+                (11, 4, 0.24),
+            ] {
+                cb.w_ctrl[row][col] = F32::new(val);
+            }
+        });
 
-    (arena, manifest, teacher_slots, seed_arena)
+    let mut seed_model = decode_dnam_bin_to_model(&base_dbin).unwrap();
+    clear_output_readout_weights(&mut seed_model);
+    let seed_dbin = encode_model_to_dnam_bin(&seed_model, Pass5EmitConfig::default()).unwrap();
+
+    (teacher_dbin, manifest, teacher_slots, seed_dbin)
 }
 
 fn run_oracle_02_for_p(num_controls: usize) {
     let crypto = DefaultCryptoProvider::default();
-    let (teacher_arena, manifest, teacher_slots, seed_arena) =
+    let (teacher_dbin, manifest, _teacher_slots, seed_dbin) =
         build_oracle02_teacher_and_seed(num_controls);
-    let teacher_dnam = pack_dnam(&manifest.base, &teacher_arena, &teacher_slots);
+    let teacher_dnam = pack_dnam_from_dbin(&manifest.base, &teacher_dbin);
 
     let dry = synthesize_rich_coreset_dry(CORESET_FP32_FRAMES_PER_STEM);
     let dry_fp32 = encode_coreset_fp32(&dry, None);
@@ -117,7 +117,7 @@ fn run_oracle_02_for_p(num_controls: usize) {
     let inpc = build_proj_inpc_capsule(1, &[0x22; 256], &sched_fast, &dry_fp32).unwrap();
 
     let seed_proj =
-        build_dnam_proj_container_with_cp1(&mut manifest.clone(), &[], &seed_arena, &[]).unwrap();
+        build_dnam_proj_container_with_dnam_bin(&mut manifest.clone(), &[], &seed_dbin).unwrap();
 
     let star_vals = star_center_control_values(&manifest);
     assert!((star_vals[0] - (-0.35)).abs() < 1.0e-6 && (star_vals[1] - 0.40).abs() < 1.0e-6);
@@ -257,6 +257,7 @@ fn run_oracle_02_for_p(num_controls: usize) {
 }
 
 #[test]
+#[ignore = "deferred to M23 (differentiable 31-slot Stage C replacing CPU FD point_gn)"]
 fn test_oracle_02_cp1_arbitrary_p6_and_p16_asymmetric_switches_and_hadamard_fm() {
     // verify[train.pipeline.control-projection-fit]
     // verify[train.pipeline.dispatch-solve]

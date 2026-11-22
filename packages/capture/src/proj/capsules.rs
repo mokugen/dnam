@@ -1,21 +1,66 @@
 #![forbid(unsafe_code)]
-//! Binary Builders & Verifiers for `.dnam-proj` (`DNPJ`) Payload Capsules (`proj::capsules`):
+//! Binary Builders & Verifiers for `.dnam-proj` (`DNPJ`, `v3.0`) Payload Capsules (`proj::capsules`):
 //! `CALB` (`64 B`), `INPC` (`2.0–2.5 s` `fp32`), `STMC` (`4,800 B` header + `2.0–2.5 s` `fp32`),
 //! and `STAT` (`uplo='U'` `StarCenter` sufficient statistics).
 //!
 //! Canonical Reference: `docs/specs/containers/project_container_format.md`
 //! (`ref[container.proj.inpc-capsule]`, `ref[container.proj.stmc-capsule]`, `ref[container.proj.stat-uplo-u]`).
 
-use crate::solver::uplo_u_index;
-use crate::{CORESET_FP32_MAX_FRAMES_PER_STEM, CORESET_FP32_MIN_FRAMES_PER_STEM};
+use core::mem::{align_of, offset_of, size_of};
+
 use dnam_engine::container::crc32c_compute;
 use dnam_engine::schema::DnamError;
+use dnam_train::uplo_u_index;
+use zerocopy::byteorder::little_endian::{F32, F64, U16, U32};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
+
+use crate::{CORESET_FP32_MAX_FRAMES_PER_STEM, CORESET_FP32_MIN_FRAMES_PER_STEM};
 
 use super::{
     INPC_MAGIC, PROJ_STAT_BYTES_FULL, PROJ_STAT_BYTES_LITE, PROJ_STAT_BYTES_PRO,
-    PROJ_STAT_BYTES_ULTRA, STMC_FLAG_ENABLED, STMC_FLAG_KNOWN_MASK, STMC_FLAG_STAR_CENTER,
-    STMC_FLAG_STEREO, STMC_MAGIC, STMC_MAX_TRAJECTORY_WINDOWS,
+    PROJ_STAT_BYTES_ULTRA, PROJ_VERSION_MAJOR, STMC_FLAG_ENABLED, STMC_FLAG_KNOWN_MASK,
+    STMC_FLAG_STAR_CENTER, STMC_FLAG_STEREO, STMC_MAGIC, STMC_MAX_TRAJECTORY_WINDOWS,
 };
+
+/// Declarative `64 B` wire struct for a `CALB` loopback calibration chunk.
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct CalbChunk64BWire {
+    /// Magic `"CALB"`.
+    pub magic: [u8; 4],
+    /// Wire format version (`3`).
+    pub version: U16,
+    /// Bit-depth code (`0..=4`).
+    pub bit_depth_code: u8,
+    /// Polarity inversion flag (`0` or `1`).
+    pub polarity_inverted: u8,
+    /// Device sample rate in Hz (`8000..=384000`).
+    pub sample_rate_device_hz: U32,
+    /// Reserved pad (`0`).
+    pub reserved_pad: [u8; 4],
+    /// Sub-sample loopback lag at `48 kHz`.
+    pub loopback_lag_samples: F64,
+    /// Signed linear loopback gain.
+    pub signed_gain: F64,
+    /// Reference input calibration level in dBFS.
+    pub input_reference_dbfs: F32,
+    /// Measured quiescent hardware noise floor in dBFS.
+    pub noise_floor_dbfs: F32,
+    /// Reserved tail (`0`).
+    pub reserved_tail: [u8; 20],
+    /// Castagnoli `CRC32C` over `bytes[0..60]`.
+    pub crc32c: U32,
+}
+
+const _: () = assert!(size_of::<CalbChunk64BWire>() == 64);
+const _: () = assert!(align_of::<CalbChunk64BWire>() == 1);
+const _: () = assert!(offset_of!(CalbChunk64BWire, sample_rate_device_hz) == 8);
+const _: () = assert!(offset_of!(CalbChunk64BWire, loopback_lag_samples) == 16);
+const _: () = assert!(offset_of!(CalbChunk64BWire, input_reference_dbfs) == 32);
+const _: () = assert!(offset_of!(CalbChunk64BWire, reserved_tail) == 40);
+const _: () = assert!(offset_of!(CalbChunk64BWire, crc32c) == 60);
 
 /// Fixed `64 B` `CALB` loopback calibration chunk (`r[container.proj.calb]`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -40,50 +85,57 @@ impl CalbChunk64B {
     /// Serializes this `CALB` record into an exact `64 B` little-endian array.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 64] {
+        let mut wire = CalbChunk64BWire {
+            magic: *b"CALB",
+            version: U16::new(PROJ_VERSION_MAJOR),
+            bit_depth_code: self.bit_depth_code,
+            polarity_inverted: u8::from(self.polarity_inverted),
+            sample_rate_device_hz: U32::new(self.sample_rate_device_hz),
+            reserved_pad: [0; 4],
+            loopback_lag_samples: F64::new(self.loopback_lag_samples),
+            signed_gain: F64::new(self.signed_gain),
+            input_reference_dbfs: F32::new(self.input_reference_dbfs),
+            noise_floor_dbfs: F32::new(self.noise_floor_dbfs),
+            reserved_tail: [0; 20],
+            crc32c: U32::new(0),
+        };
+        let crc = crc32c_compute(&wire.as_bytes()[0..60]);
+        wire.crc32c = U32::new(crc);
         let mut out = [0u8; 64];
-        out[0..4].copy_from_slice(b"CALB");
-        out[4..6].copy_from_slice(&2_u16.to_le_bytes());
-        out[6] = self.bit_depth_code;
-        out[7] = u8::from(self.polarity_inverted);
-        out[8..12].copy_from_slice(&self.sample_rate_device_hz.to_le_bytes());
-        out[16..24].copy_from_slice(&self.loopback_lag_samples.to_le_bytes());
-        out[24..32].copy_from_slice(&self.signed_gain.to_le_bytes());
-        out[32..36].copy_from_slice(&self.input_reference_dbfs.to_le_bytes());
-        out[36..40].copy_from_slice(&self.noise_floor_dbfs.to_le_bytes());
-        let body_crc = crc32c_compute(&out[0..60]);
-        out[60..64].copy_from_slice(&body_crc.to_le_bytes());
+        out.copy_from_slice(wire.as_bytes());
         out
     }
 
     /// Parses and validates a `64 B` `CALB` chunk.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DnamError> {
-        if bytes.len() != 64 {
+        let Ok(wire) = CalbChunk64BWire::ref_from_bytes(bytes) else {
             return Err(DnamError::BufferTooSmall {
                 expected: 64,
                 actual: bytes.len(),
             });
+        };
+        if &wire.magic != b"CALB" {
+            return Err(DnamError::InvalidMagic(wire.magic));
         }
-        if bytes[0..4] != *b"CALB" {
-            return Err(DnamError::InvalidMagic([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-            ]));
-        }
-        let ver = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if ver != 2 {
+        let ver = wire.version.get();
+        if ver != PROJ_VERSION_MAJOR {
             return Err(DnamError::UnsupportedVersion {
                 major: ver,
                 minor: 0,
             });
         }
-        let bit_depth_code = bytes[6];
-        let pol_byte = bytes[7];
-        if bit_depth_code > 4 || pol_byte > 1 || bytes[12..16] != [0; 4] || bytes[40..60] != [0; 20]
+        let bit_depth_code = wire.bit_depth_code;
+        let pol_byte = wire.polarity_inverted;
+        if bit_depth_code > 4
+            || pol_byte > 1
+            || wire.reserved_pad != [0; 4]
+            || wire.reserved_tail != [0; 20]
         {
             return Err(DnamError::SchemaValidationError(
                 "invalid CALB flags or non-zero reserved bytes".to_string(),
             ));
         }
-        let expected_crc = u32::from_le_bytes([bytes[60], bytes[61], bytes[62], bytes[63]]);
+        let expected_crc = wire.crc32c.get();
         let calc_crc = crc32c_compute(&bytes[0..60]);
         if calc_crc != expected_crc {
             return Err(DnamError::Crc32cMismatch {
@@ -92,14 +144,14 @@ impl CalbChunk64B {
                 computed: calc_crc,
             });
         }
-        let sample_rate_device_hz = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let sample_rate_device_hz = wire.sample_rate_device_hz.get();
         if !(8_000..=384_000).contains(&sample_rate_device_hz) {
             return Err(DnamError::InvalidSampleRate(sample_rate_device_hz));
         }
-        let loopback_lag_samples = f64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        let signed_gain = f64::from_le_bytes(bytes[24..32].try_into().unwrap());
-        let input_reference_dbfs = f32::from_le_bytes([bytes[32], bytes[33], bytes[34], bytes[35]]);
-        let noise_floor_dbfs = f32::from_le_bytes([bytes[36], bytes[37], bytes[38], bytes[39]]);
+        let loopback_lag_samples = wire.loopback_lag_samples.get();
+        let signed_gain = wire.signed_gain.get();
+        let input_reference_dbfs = wire.input_reference_dbfs.get();
+        let noise_floor_dbfs = wire.noise_floor_dbfs.get();
         if !loopback_lag_samples.is_finite()
             || !signed_gain.is_finite()
             || !input_reference_dbfs.is_finite()
@@ -121,16 +173,45 @@ impl CalbChunk64B {
     }
 }
 
+/// Declarative `64 B` wire header of an `INPC` dry stimulus capsule (`0..64`).
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct InpcHeader64BWire {
+    /// Magic `"INPC"`.
+    pub magic: [u8; 4],
+    /// Wire format version (`3`).
+    pub version: U16,
+    /// Channel count (`1` or `2`).
+    pub channels: U16,
+    /// Canonical sample rate (`48,000`).
+    pub sample_rate_hz: U32,
+    /// Coreset frame count (`96,000..=120,000`, divisible by `16`).
+    pub num_frames: U32,
+    /// Reserved zero tail (`40 B`).
+    pub reserved: [u8; 40],
+    /// Total capsule byte length (`640 + channels * num_frames * 4`).
+    pub rec_len: U32,
+    /// Castagnoli `CRC32C` over `bytes[64..rec_len]`.
+    pub crc32c: U32,
+}
+
+const _: () = assert!(size_of::<InpcHeader64BWire>() == 64);
+const _: () = assert!(align_of::<InpcHeader64BWire>() == 1);
+const _: () = assert!(offset_of!(InpcHeader64BWire, num_frames) == 12);
+const _: () = assert!(offset_of!(InpcHeader64BWire, rec_len) == 56);
+const _: () = assert!(offset_of!(InpcHeader64BWire, crc32c) == 60);
+
 fn verify_finite_fp32_stream(fp32_bytes: &[u8], label: &'static str) -> Result<(), DnamError> {
-    if !fp32_bytes.len().is_multiple_of(4) {
+    let Ok(words) = <[F32]>::ref_from_bytes(fp32_bytes) else {
         return Err(DnamError::SchemaValidationError(format!(
             "{label} fp32 payload length {} is not a multiple of 4 B",
             fp32_bytes.len()
         )));
-    }
-    for word in fp32_bytes.as_chunks::<4>().0 {
-        let val = f32::from_le_bytes(*word);
-        if !val.is_finite() {
+    };
+    for word in words {
+        if !word.get().is_finite() {
             return Err(DnamError::SchemaValidationError(format!(
                 "non-finite IEEE-754 binary32 sample in {label}"
             )));
@@ -164,12 +245,10 @@ fn validate_coreset_fp32_payload(
 }
 
 fn decode_fp32_interleaved(bytes: &[u8], is_stereo: bool) -> (Vec<f32>, Option<Vec<f32>>) {
-    let f32_vals: Vec<f32> = bytes
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|w| f32::from_le_bytes(*w))
-        .collect();
+    let aligned_len = bytes.len() & !3;
+    let f32_vals: Vec<f32> = <[F32]>::ref_from_bytes(&bytes[..aligned_len])
+        .map(|s| s.iter().map(|w| w.get()).collect())
+        .unwrap_or_default();
     if !is_stereo {
         return (f32_vals, None);
     }
@@ -222,49 +301,51 @@ pub fn build_proj_inpc_capsule(
 
     let rec_len = 640 + dry_coreset_fp32.len();
     let mut out = vec![0u8; rec_len];
-    out[0..4].copy_from_slice(&INPC_MAGIC);
-    out[4..6].copy_from_slice(&2_u16.to_le_bytes());
-    out[6..8].copy_from_slice(&channels.to_le_bytes());
-    out[8..12].copy_from_slice(&48_000_u32.to_le_bytes());
-    out[12..16].copy_from_slice(&(num_frames as u32).to_le_bytes());
-    out[56..60].copy_from_slice(&(rec_len as u32).to_le_bytes());
     out[64..320].copy_from_slice(seed_256);
     out[320..640].copy_from_slice(schedule_320);
     out[640..rec_len].copy_from_slice(dry_coreset_fp32);
     let crc = crc32c_compute(&out[64..rec_len]);
-    out[60..64].copy_from_slice(&crc.to_le_bytes());
+    let hdr = InpcHeader64BWire {
+        magic: INPC_MAGIC,
+        version: U16::new(PROJ_VERSION_MAJOR),
+        channels: U16::new(channels),
+        sample_rate_hz: U32::new(48_000),
+        num_frames: U32::new(num_frames as u32),
+        reserved: [0; 40],
+        rec_len: U32::new(rec_len as u32),
+        crc32c: U32::new(crc),
+    };
+    out[0..64].copy_from_slice(hdr.as_bytes());
     Ok(out)
 }
 
 /// Validates a `2.0–2.5 s` `fp32` `INPC` dry stimulus capsule (`r[container.proj.inpc-capsule]`).
 pub fn verify_proj_inpc_capsule(bytes: &[u8]) -> Result<InpcCapsuleView<'_>, DnamError> {
-    if bytes.len() < 64 {
+    let Ok((hdr, _)) = InpcHeader64BWire::ref_from_prefix(bytes) else {
         return Err(DnamError::BufferTooSmall {
             expected: 64,
             actual: bytes.len(),
         });
+    };
+    if hdr.magic != INPC_MAGIC {
+        return Err(DnamError::InvalidMagic(hdr.magic));
     }
-    if bytes[0..4] != INPC_MAGIC {
-        return Err(DnamError::InvalidMagic([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-        ]));
-    }
-    let ver = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if ver != 2 {
+    let ver = hdr.version.get();
+    if ver != PROJ_VERSION_MAJOR {
         return Err(DnamError::UnsupportedVersion {
             major: ver,
             minor: 0,
         });
     }
-    let channels = u16::from_le_bytes([bytes[6], bytes[7]]);
+    let channels = hdr.channels.get();
     if !matches!(channels, 1 | 2) {
         return Err(DnamError::SchemaValidationError(format!(
             "invalid INPC channels {channels}"
         )));
     }
-    let sample_rate_hz = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-    let num_frames = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-    if bytes[16..56].iter().any(|&b| b != 0) {
+    let sample_rate_hz = hdr.sample_rate_hz.get();
+    let num_frames = hdr.num_frames.get();
+    if hdr.reserved != [0; 40] {
         return Err(DnamError::SchemaValidationError(
             "non-zero reserved bytes in INPC[16..56]".to_string(),
         ));
@@ -279,7 +360,7 @@ pub fn verify_proj_inpc_capsule(bytes: &[u8]) -> Result<InpcCapsuleView<'_>, Dna
         ));
     }
     let expected_len = 640 + nf * usize::from(channels) * 4;
-    let rec_len = u32::from_le_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]) as usize;
+    let rec_len = hdr.rec_len.get() as usize;
     if rec_len != expected_len {
         return Err(DnamError::SchemaValidationError(
             "invalid INPC rec_len".to_string(),
@@ -291,7 +372,7 @@ pub fn verify_proj_inpc_capsule(bytes: &[u8]) -> Result<InpcCapsuleView<'_>, Dna
             actual: bytes.len(),
         });
     }
-    let expected_crc = u32::from_le_bytes([bytes[60], bytes[61], bytes[62], bytes[63]]);
+    let expected_crc = hdr.crc32c.get();
     let calc_crc = crc32c_compute(&bytes[64..rec_len]);
     if calc_crc != expected_crc {
         return Err(DnamError::Crc32cMismatch {
@@ -311,6 +392,32 @@ pub fn verify_proj_inpc_capsule(bytes: &[u8]) -> Result<InpcCapsuleView<'_>, Dna
         dry_coreset_fp32,
     })
 }
+
+/// Declarative `16 B` wire record for an `STMC` trajectory window.
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct StmcTrajectoryWindowWire {
+    /// Control index `p`.
+    pub control_id: U16,
+    /// Control kind (`0` = Range, `1` = Switch).
+    pub ctrl_kind: u8,
+    /// Active discrete switch option index.
+    pub active_opt: u8,
+    /// Physical control value in this window.
+    pub u_phys: F32,
+    /// Leverage / SNR quadrature weight `>= 0`.
+    pub window_weight: F32,
+    /// Measured EMR velocity metric.
+    pub emr_velocity: F32,
+}
+
+const _: () = assert!(size_of::<StmcTrajectoryWindowWire>() == 16);
+const _: () = assert!(align_of::<StmcTrajectoryWindowWire>() == 1);
+const _: () = assert!(offset_of!(StmcTrajectoryWindowWire, u_phys) == 4);
+const _: () = assert!(offset_of!(StmcTrajectoryWindowWire, window_weight) == 8);
+const _: () = assert!(offset_of!(StmcTrajectoryWindowWire, emr_velocity) == 12);
 
 /// Single `16 B` entry in the `576 B` (`R <= 36`) Windowed Control Trajectory Table of `STMC`.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -333,24 +440,33 @@ impl StmcTrajectoryWindow {
     /// Encodes this window into `16 B` little-endian.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 16] {
+        let wire = StmcTrajectoryWindowWire {
+            control_id: U16::new(self.control_id),
+            ctrl_kind: self.ctrl_kind,
+            active_opt: self.active_opt,
+            u_phys: F32::new(self.u_phys),
+            window_weight: F32::new(self.window_weight),
+            emr_velocity: F32::new(self.emr_velocity),
+        };
         let mut out = [0u8; 16];
-        out[0..2].copy_from_slice(&self.control_id.to_le_bytes());
-        out[2] = self.ctrl_kind;
-        out[3] = self.active_opt;
-        out[4..8].copy_from_slice(&self.u_phys.to_le_bytes());
-        out[8..12].copy_from_slice(&self.window_weight.to_le_bytes());
-        out[12..16].copy_from_slice(&self.emr_velocity.to_le_bytes());
+        out.copy_from_slice(wire.as_bytes());
         out
     }
 
     /// Decodes and validates a `16 B` trajectory window.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DnamError> {
-        let control_id = u16::from_le_bytes([bytes[0], bytes[1]]);
-        let ctrl_kind = bytes[2];
-        let active_opt = bytes[3];
-        let u_phys = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
-        let window_weight = f32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
-        let emr_velocity = f32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        let Ok(wire) = StmcTrajectoryWindowWire::ref_from_bytes(bytes) else {
+            return Err(DnamError::BufferTooSmall {
+                expected: 16,
+                actual: bytes.len(),
+            });
+        };
+        let control_id = wire.control_id.get();
+        let ctrl_kind = wire.ctrl_kind;
+        let active_opt = wire.active_opt;
+        let u_phys = wire.u_phys.get();
+        let window_weight = wire.window_weight.get();
+        let emr_velocity = wire.emr_velocity.get();
         if ctrl_kind > 1
             || !u_phys.is_finite()
             || !window_weight.is_finite()
@@ -372,7 +488,49 @@ impl StmcTrajectoryWindow {
     }
 }
 
-/// Validated view over a `28,800 B` (mono) or `52,800 B` (stereo) `STMC` `StemCaptureRecord` capsule.
+/// Declarative `128 B` wire header of an `STMC` stem capture capsule (`0..128`).
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct StmcHeader128BWire {
+    /// Magic `"STMC"`.
+    pub magic: [u8; 4],
+    /// Wire format version (`3`).
+    pub version: U16,
+    /// Numeric stem index.
+    pub stem_index: U16,
+    /// `STMC_FLAG_*` bitmask.
+    pub flags: U16,
+    /// Trajectory window count (`1..=36`).
+    pub n_windows: U16,
+    /// Input pad gain.
+    pub pad_gain_f32: F32,
+    /// Sub-sample alignment lag.
+    pub fractional_lag_samples_f32: F32,
+    /// `88 B` band-energy PSD summary (`10 × f64le` upper triangle + `total_power: f64le`).
+    pub band_psd_summary_88: [u8; 88],
+    /// Coreset frame count.
+    pub num_frames: U32,
+    /// Measured comb bin count.
+    pub n_comb_bins: U32,
+    /// Total capsule byte length.
+    pub rec_len: U32,
+    /// Castagnoli `CRC32C` over `bytes[128..rec_len]`.
+    pub body_crc32c: U32,
+    /// Reserved zero bytes (`0`).
+    pub reserved: [u8; 4],
+}
+
+const _: () = assert!(size_of::<StmcHeader128BWire>() == 128);
+const _: () = assert!(align_of::<StmcHeader128BWire>() == 1);
+const _: () = assert!(offset_of!(StmcHeader128BWire, flags) == 8);
+const _: () = assert!(offset_of!(StmcHeader128BWire, band_psd_summary_88) == 20);
+const _: () = assert!(offset_of!(StmcHeader128BWire, num_frames) == 108);
+const _: () = assert!(offset_of!(StmcHeader128BWire, body_crc32c) == 120);
+const _: () = assert!(offset_of!(StmcHeader128BWire, reserved) == 124);
+
+/// Validated view over a `STMC` `StemCaptureRecord` capsule.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StmcCapsuleView<'a> {
     /// Numeric stem index (`0..=65535`).
@@ -449,17 +607,6 @@ pub fn build_proj_stmc_capsule(
 
     let rec_len = 4_800 + wet_coreset_fp32.len();
     let mut out = vec![0u8; rec_len];
-    out[0..4].copy_from_slice(&STMC_MAGIC);
-    out[4..6].copy_from_slice(&2_u16.to_le_bytes());
-    out[6..8].copy_from_slice(&stem_index.to_le_bytes());
-    out[8..10].copy_from_slice(&flags.to_le_bytes());
-    out[10..12].copy_from_slice(&(windows.len() as u16).to_le_bytes());
-    out[12..16].copy_from_slice(&pad_gain_f32.to_le_bytes());
-    out[16..20].copy_from_slice(&fractional_lag_samples_f32.to_le_bytes());
-    out[20..108].copy_from_slice(band_psd_summary_88);
-    out[108..112].copy_from_slice(&(num_frames as u32).to_le_bytes());
-    out[112..116].copy_from_slice(&n_comb_bins.to_le_bytes());
-    out[116..120].copy_from_slice(&(rec_len as u32).to_le_bytes());
     for (idx, w) in windows.iter().enumerate() {
         let _ = StmcTrajectoryWindow::from_bytes(&w.to_bytes())?;
         let off = 128 + idx * 16;
@@ -468,7 +615,22 @@ pub fn build_proj_stmc_capsule(
     out[704..4_800].copy_from_slice(spectral_summary_4096);
     out[4_800..rec_len].copy_from_slice(wet_coreset_fp32);
     let body_crc = crc32c_compute(&out[128..rec_len]);
-    out[120..124].copy_from_slice(&body_crc.to_le_bytes());
+    let hdr = StmcHeader128BWire {
+        magic: STMC_MAGIC,
+        version: U16::new(PROJ_VERSION_MAJOR),
+        stem_index: U16::new(stem_index),
+        flags: U16::new(flags),
+        n_windows: U16::new(windows.len() as u16),
+        pad_gain_f32: F32::new(pad_gain_f32),
+        fractional_lag_samples_f32: F32::new(fractional_lag_samples_f32),
+        band_psd_summary_88: *band_psd_summary_88,
+        num_frames: U32::new(num_frames as u32),
+        n_comb_bins: U32::new(n_comb_bins),
+        rec_len: U32::new(rec_len as u32),
+        body_crc32c: U32::new(body_crc),
+        reserved: [0; 4],
+    };
+    out[0..128].copy_from_slice(hdr.as_bytes());
     Ok(out)
 }
 
@@ -483,7 +645,13 @@ pub fn set_stmc_capsule_enabled_flag(
     } else {
         view.flags & !STMC_FLAG_ENABLED
     };
-    stmc_bytes[8..10].copy_from_slice(&new_flags.to_le_bytes());
+    let stmc_bytes_len = stmc_bytes.len();
+    let (hdr, _) =
+        StmcHeader128BWire::mut_from_prefix(stmc_bytes).map_err(|_| DnamError::BufferTooSmall {
+            expected: 128,
+            actual: stmc_bytes_len,
+        })?;
+    hdr.flags = U16::new(new_flags);
     Ok(())
 }
 
@@ -498,55 +666,58 @@ pub fn set_stmc_capsule_star_center_flag(
     } else {
         view.flags & !STMC_FLAG_STAR_CENTER
     };
-    stmc_bytes[8..10].copy_from_slice(&new_flags.to_le_bytes());
+    let stmc_bytes_len = stmc_bytes.len();
+    let (hdr, _) =
+        StmcHeader128BWire::mut_from_prefix(stmc_bytes).map_err(|_| DnamError::BufferTooSmall {
+            expected: 128,
+            actual: stmc_bytes_len,
+        })?;
+    hdr.flags = U16::new(new_flags);
     Ok(())
 }
 
 /// Validates a `2.0–2.5 s` `fp32` `STMC` `StemCaptureRecord` capsule (`r[container.proj.stmc-capsule]`).
 pub fn verify_proj_stmc_capsule(bytes: &[u8]) -> Result<StmcCapsuleView<'_>, DnamError> {
-    if bytes.len() < 128 {
+    let Ok((hdr, _)) = StmcHeader128BWire::ref_from_prefix(bytes) else {
         return Err(DnamError::BufferTooSmall {
             expected: 128,
             actual: bytes.len(),
         });
+    };
+    if hdr.magic != STMC_MAGIC {
+        return Err(DnamError::InvalidMagic(hdr.magic));
     }
-    if bytes[0..4] != STMC_MAGIC {
-        return Err(DnamError::InvalidMagic([
-            bytes[0], bytes[1], bytes[2], bytes[3],
-        ]));
-    }
-    let ver = u16::from_le_bytes([bytes[4], bytes[5]]);
-    if ver != 2 {
+    let ver = hdr.version.get();
+    if ver != PROJ_VERSION_MAJOR {
         return Err(DnamError::UnsupportedVersion {
             major: ver,
             minor: 0,
         });
     }
-    let stem_index = u16::from_le_bytes([bytes[6], bytes[7]]);
-    let flags = u16::from_le_bytes([bytes[8], bytes[9]]);
+    let stem_index = hdr.stem_index.get();
+    let flags = hdr.flags.get();
     if (flags & !STMC_FLAG_KNOWN_MASK) != 0 {
         return Err(DnamError::SchemaValidationError(format!(
             "unknown STMC flags {flags:#06x}"
         )));
     }
-    let n_windows = u16::from_le_bytes([bytes[10], bytes[11]]) as usize;
+    let n_windows = hdr.n_windows.get() as usize;
     if n_windows == 0 || n_windows > STMC_MAX_TRAJECTORY_WINDOWS {
         return Err(DnamError::SchemaValidationError(format!(
             "invalid STMC n_trajectory_windows {n_windows}"
         )));
     }
-    let pad_gain_f32 = f32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-    let fractional_lag_samples_f32 =
-        f32::from_le_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let pad_gain_f32 = hdr.pad_gain_f32.get();
+    let fractional_lag_samples_f32 = hdr.fractional_lag_samples_f32.get();
     if !pad_gain_f32.is_finite() || !fractional_lag_samples_f32.is_finite() {
         return Err(DnamError::SchemaValidationError(
             "non-finite pad_gain_f32 or fractional_lag_samples_f32 in STMC".to_string(),
         ));
     }
-    let n_coreset_frames = u32::from_le_bytes([bytes[108], bytes[109], bytes[110], bytes[111]]);
-    let rec_len = u32::from_le_bytes([bytes[116], bytes[117], bytes[118], bytes[119]]) as usize;
-    let expected_crc = u32::from_le_bytes([bytes[120], bytes[121], bytes[122], bytes[123]]);
-    if bytes[124..128] != [0; 4] {
+    let n_coreset_frames = hdr.num_frames.get();
+    let rec_len = hdr.rec_len.get() as usize;
+    let expected_crc = hdr.body_crc32c.get();
+    if hdr.reserved != [0; 4] {
         return Err(DnamError::SchemaValidationError(
             "non-zero reserved bytes in STMC[124..128]".to_string(),
         ));
@@ -622,17 +793,21 @@ pub fn verify_proj_stat_uplo_u(bytes: &[u8]) -> Result<usize, DnamError> {
             )));
         }
     };
-    for elem in bytes.as_chunks::<8>().0 {
-        let val = f64::from_le_bytes(*elem);
-        if !val.is_finite() {
+    let Ok(words) = <[F64]>::ref_from_bytes(bytes) else {
+        return Err(DnamError::SchemaValidationError(
+            "STAT byte length is not a multiple of 8 B".to_string(),
+        ));
+    };
+    for elem in words {
+        if !elem.get().is_finite() {
             return Err(DnamError::SchemaValidationError(
                 "non-finite f64 element in STAT uplo='U' chunk".to_string(),
             ));
         }
     }
     for j in 0..dim {
-        let off = uplo_u_index(j, j) * 8;
-        let g_jj = f64::from_le_bytes(bytes[off..off + 8].try_into().unwrap());
+        let diag_idx = uplo_u_index(j, j);
+        let g_jj = words[diag_idx].get();
         if g_jj < 0.0 {
             return Err(DnamError::SchemaValidationError(format!(
                 "negative Gram diagonal G[{j},{j}] = {g_jj} in STAT uplo='U' chunk"

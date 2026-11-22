@@ -7,7 +7,7 @@ pub mod universal;
 pub use scope::certify_holdout_for_family;
 pub use universal::{certify_4metric_universal, certify_holdout_universal};
 
-use super::companion::{LtasTargetCache, MAX_METRIC_SAMPLE_RATE_HZ, MrIirTargetCache};
+use super::companion::LtasTargetCache;
 use super::{
     ArchetypeFamily, MAX_TIER_LOUDNESS_STEP_LU, MultiRateSegEsrSlice, ONE_DB_POWER_FACTOR,
     SIX_DB_POWER_FACTOR, StemActivityClass, TierQualityThresholds, compute_mr_iir_loss,
@@ -407,40 +407,6 @@ pub fn certify_4metric_with_bit_depth(
         sample_rate_hz,
         warmup_samples,
     )
-}
-
-/// Reusable per-channel certification evaluator caching target `MR-IIR` resonators and
-/// target `LTAS` Welch spectra (`noise = None`).
-#[derive(Clone)]
-pub(crate) struct TargetChannelCertCache {
-    target: Vec<f64>,
-    sample_rate_hz: f64,
-    warmup_samples: usize,
-    mr_cache: Option<MrIirTargetCache>,
-    ltas_cache: Option<LtasTargetCache>,
-}
-
-impl TargetChannelCertCache {
-    #[must_use]
-    pub(crate) fn new(target: &[f64], sample_rate_hz: f64, warmup_samples: usize) -> Self {
-        let mr_cache = MrIirTargetCache::new(target, sample_rate_hz, warmup_samples);
-        let ltas_cache = if (40_000.0..=MAX_METRIC_SAMPLE_RATE_HZ).contains(&sample_rate_hz)
-            && !target.is_empty()
-            && warmup_samples < target.len()
-            && target.iter().all(|v| v.is_finite())
-        {
-            LtasTargetCache::new(&target[warmup_samples..], sample_rate_hz, 20_000.0)
-        } else {
-            None
-        };
-        Self {
-            target: target.to_vec(),
-            sample_rate_hz,
-            warmup_samples,
-            mr_cache,
-            ltas_cache,
-        }
-    }
 }
 
 #[cfg(test)]

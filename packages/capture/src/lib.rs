@@ -40,10 +40,10 @@ pub use solver::{
     accumulate_uplo_u_wide192, canonical_besr_warmup, compute_integrated_lufs,
     contract_256d_gram_tiled_wide192, derive_buyer_gauge_params, derive_buyer_phase_seed,
     derive_buyer_tardos_codebook, export_runtime_dnam_watermarked, extract_arena_pole_angles_16,
-    extract_arena_pole_angles_34, finalize_stage_d_and_audit, has_populated_v3_backbone,
-    identify_pole_angles_blackbox_from_audio, render_blackbox_probe_response,
-    run_stage_a_physics_probe, serialize_v3_stat_chunk_ultra, solve_stage_b_backbone,
-    solve_stage_b_backbone_with_progress, solve_stage_c_knobs,
+    extract_arena_pole_angles_32, extract_arena_pole_angles_34, finalize_stage_d_and_audit,
+    has_populated_v3_backbone, identify_pole_angles_blackbox_from_audio,
+    render_blackbox_probe_response, run_stage_a_physics_probe, serialize_v3_stat_chunk_ultra,
+    solve_stage_b_backbone, solve_stage_b_backbone_with_progress, solve_stage_c_knobs,
 };
 pub use stimulus::{
     AdaptiveStimulusController, AdaptiveTrainingOptions, AdaptiveTrainingReport, BatchSolveReport,
@@ -89,15 +89,18 @@ pub fn parse_tier_name(name: &str) -> Result<Tier, String> {
     }
 }
 
-/// Computes the deterministic `DNAM-GRAM-INPUT-v2` SHA-256 fingerprint over ordered frames
+/// Computes the deterministic `DNAM-GRAM-INPUT-V3` SHA-256 fingerprint over ordered frames
 /// (`ref[container.proj.stat-uplo-u]`).
 #[must_use]
 pub fn compute_gram_input_fingerprint(feature_dim: u32, frames: &[(u64, f64, &[f64])]) -> [u8; 32] {
+    use zerocopy::IntoBytes;
+    use zerocopy::byteorder::little_endian::{F64, U32, U64};
+
     let expected_len = feature_dim as usize;
     let mut prev_frame_idx: Option<u64> = None;
     let mut hasher = Sha256::new();
-    hasher.update(b"DNAM-GRAM-INPUT-v2\0");
-    hasher.update(feature_dim.to_le_bytes());
+    hasher.update(b"DNAM-GRAM-INPUT-V3\0");
+    hasher.update(U32::new(feature_dim).as_bytes());
     hasher.update([2u8, 2u8]); // feature_type=2 (f64), weight_type=2 (f64)
     for (frame_idx, weight, row) in frames {
         assert_eq!(
@@ -119,19 +122,19 @@ pub fn compute_gram_input_fingerprint(feature_dim: u32, frames: &[(u64, f64, &[f
         prev_frame_idx = Some(*frame_idx);
         let canon_w = if *weight == 0.0 { 0.0_f64 } else { *weight };
         hasher.update([1u8]);
-        hasher.update(frame_idx.to_le_bytes());
-        hasher.update(canon_w.to_le_bytes());
+        hasher.update(U64::new(*frame_idx).as_bytes());
+        hasher.update(F64::new(canon_w).as_bytes());
         for &val in *row {
             assert!(
                 val.is_finite(),
                 "compute_gram_input_fingerprint requires finite feature values, got {val}"
             );
             let canon_v = if val == 0.0 { 0.0_f64 } else { val };
-            hasher.update(canon_v.to_le_bytes());
+            hasher.update(F64::new(canon_v).as_bytes());
         }
     }
     hasher.update([0u8]);
-    hasher.update((frames.len() as u64).to_le_bytes());
+    hasher.update(U64::new(frames.len() as u64).as_bytes());
     hasher.finalize().into()
 }
 

@@ -9,16 +9,18 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use dnam_capture::CORESET_FP32_FRAMES_PER_STEM;
 use dnam_capture::proj::{
     DnamProjManifest, ProjChunkInput, ProjChunkKind, StemProvenance, StmcTrajectoryWindow,
-    VaultCaptureSpec, add_capture, build_dnam_proj_container, build_dnam_proj_container_with_cp1,
-    build_proj_inpc_capsule, compact_to_capsules, export_runtime_dnam,
+    VaultCaptureSpec, add_capture, build_dnam_proj_container,
+    build_dnam_proj_container_with_dnam_bin, build_proj_inpc_capsule, compact_to_capsules,
+    export_runtime_dnam,
 };
 use dnam_capture::solver::{
-    accumulate_uplo_u_gram_and_cross, solve_uplo_u_cholesky_2ch, uplo_u_packed_len,
+    Pass5EmitConfig, SonaModelF64, accumulate_uplo_u_gram_and_cross, encode_model_to_dnam_bin,
+    solve_uplo_u_cholesky_2ch, uplo_u_packed_len,
 };
 use dnam_capture::stimulus::{AdaptiveStimulusController, StimulusConfig, encode_coreset_fp32};
 use dnam_capture::targets::StemResponse;
-use dnam_engine::stages::V3MatryoshkaModel;
-use dnam_engine::stages::weights::{ARENA_ULTRA_BYTES, pack_v3_matryoshka_to_arena};
+use zerocopy::IntoBytes;
+use zerocopy::byteorder::little_endian::U32;
 
 fn bench_uplo_u_cholesky_lite(c: &mut Criterion) {
     let n = 64usize;
@@ -93,19 +95,19 @@ fn bench_adaptive_stimulus_next_frame(c: &mut Criterion) {
 
 fn bench_dnam_proj_compact_and_export(c: &mut Criterion) {
     let mut manifest = DnamProjManifest::default_reference();
-    let mut arena = vec![0u8; ARENA_ULTRA_BYTES];
-    pack_v3_matryoshka_to_arena(&V3MatryoshkaModel::identity(false, false), &mut arena);
+    let dnam_bin =
+        encode_model_to_dnam_bin(&SonaModelF64::new(48_000.0), Pass5EmitConfig::default())
+            .expect("benchmark .dnam-bin build must succeed");
     let mut spcm = vec![0u8; 48_000 * 4];
     spcm[0..4].copy_from_slice(b"SPCM");
-    let proj_with_spcm = build_dnam_proj_container_with_cp1(
+    let proj_with_spcm = build_dnam_proj_container_with_dnam_bin(
         &mut manifest,
         &[ProjChunkInput {
             kind: ProjChunkKind::Spcm,
             chunk_id: 0,
             payload: spcm,
         }],
-        &arena,
-        &[],
+        &dnam_bin,
     )
     .expect("benchmark .dnam-proj build must succeed");
 
@@ -140,7 +142,7 @@ fn bench_5stage_proj_vault_solver(c: &mut Criterion) {
         .map(|i| 0.45 * ((i as f32) * 0.058).sin() + 0.25 * ((i as f32) * 0.19).cos())
         .collect();
     let mut schedule_320 = [0u8; 320];
-    schedule_320[8..12].copy_from_slice(&1_024_u32.to_le_bytes());
+    schedule_320[8..12].copy_from_slice(U32::new(1_024).as_bytes());
     let inpc = build_proj_inpc_capsule(
         1,
         &[0x11; 256],

@@ -9,3 +9,5 @@ mod bundle_and_vault_edges;
 mod dau1_security;
 #[path = "proj_suite/security.rs"]
 mod security;
+#[path = "proj_suite/test_support.rs"]
+mod test_support;

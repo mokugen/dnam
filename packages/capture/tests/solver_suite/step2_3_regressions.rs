@@ -9,39 +9,30 @@ use std::collections::BTreeMap;
 
 use dnam_capture::proj::{
     DnamProjManifest, DnamProjView, ProjChunkKind, StemProvenance, StmcTrajectoryWindow,
-    VaultCaptureSpec, add_capture, add_capture_with_options, build_dnam_proj_container_with_cp1,
-    build_proj_inpc_capsule, remove_capture_with_options, replace_capture_with_options,
-    set_capture_enabled_with_options,
+    VaultCaptureSpec, add_capture, add_capture_with_options,
+    build_dnam_proj_container_with_dnam_bin, build_proj_inpc_capsule, remove_capture_with_options,
+    replace_capture_with_options, set_capture_enabled_with_options,
 };
 use dnam_capture::solver::{
     SolverOptions, StageAConfig, contract_256d_gram_tiled_wide192, run_stage_a_physics_probe,
-    uplo_u_index, write_inline_cp1_if_fits,
+    uplo_u_index,
 };
 use dnam_capture::stimulus::encode_coreset_fp32;
 use dnam_capture::{CORESET_FP32_FRAMES_PER_STEM, DistillationTarget};
 use dnam_engine::container::{
-    DnamContainerView, build_dnam_container_with_cp1, strip_container_to_tier,
+    build_dnam_container_from_dnam_bin, extract_dnam_bin, strip_container_to_tier,
 };
-use dnam_engine::control::Cp1ContributorSlot;
-use dnam_engine::math::DefaultMathBackend;
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::{ControlSchemaDef, DnamJsonHeader};
-use dnam_engine::stages::weights::{
-    ARENA_ULTRA_BYTES, ARENA0_DIRECT_READOUT_OFFSET, ARENA0_TIER_GAIN_TRIM_OFFSET,
-    ARENA0_W_CTRL_OFFSET, ARENA1_DIRECT_READOUT_OFFSET, ARENA2_DIRECT_READOUT_OFFSET,
-    ARENA3_DIRECT_READOUT_OFFSET, ARENA3_UINT_ULTRA_OFFSET, ARENA3_W_CTRL_ULTRA_OFFSET,
-    pack_v3_matryoshka_to_arena,
-};
-use dnam_engine::stages::{V3MatryoshkaModel, V3TierReadout};
 use dnam_engine::{DnamEngine, Tier};
+use dnam_train::{Pass5EmitConfig, SonaModelF64, encode_model_to_dnam_bin};
+use dnam_vm::bin::{DnamBinBuildInput, DnamBinView, encode_dnam_bin};
+use dnam_vm::control::Cp1ContributorSlot;
+use dnam_vm::math::DefaultMathBackend;
+use zerocopy::IntoBytes;
+use zerocopy::byteorder::little_endian::F32;
 
-pub(super) fn write_f32(buf: &mut [u8], off: usize, val: f32) {
-    buf[off..off + 4].copy_from_slice(&val.to_le_bytes());
-}
-
-pub(super) fn read_f32(buf: &[u8], off: usize) -> f32 {
-    f32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
-}
+use super::oracles::inject_controls_and_cp1_into_dbin;
 
 pub(super) fn make_range_ctrl(id: &str, lo: f32, hi: f32, def: f32) -> ControlSchemaDef {
     serde_json::from_value(serde_json::json!({
@@ -231,50 +222,42 @@ fn test_engine_immediate_control_sync_reload_reset_and_tier_gain_trim() {
     hdr.io_config.output_mode = "stereo".to_string();
     hdr.controls_schema = vec![make_range_ctrl("drive", 0.0, 10.0, 0.0)];
 
-    let mut model = V3MatryoshkaModel::identity(false, false);
-    for b in 0..3 {
-        model.blocks[b].w_in_n[0][0] = 0.25;
-        model.blocks[b].w_in_n[1][0] = 0.20;
+    let mut model = SonaModelF64::new(48_000.0);
+    model.oversample_upper_tiers_2x = false;
+    for q in &mut model.core_quads[0..4] {
+        q.in_mid_weight = [0.6; 4];
+        q.adaa_drive = [1.2; 4];
+        q.tone_lp = [0.5; 4];
+        q.tone_dir = [0.5; 4];
     }
-    for (t_idx, &tier) in [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra]
-        .iter()
-        .enumerate()
-    {
-        let mut ro = V3TierReadout::zeros();
-        ro.pre_cab_u_gain = [0.40, 0.35];
-        ro.fir_l[0] = 0.12;
-        ro.fir_r[0] = 0.12;
-        ro.pre_cab_w[0][0] = 0.20;
-        ro.pre_cab_w[1][0] = 0.20;
-        ro.mask_to_tier(tier);
-        model.readouts[t_idx] = ro;
-    }
+    model.w_ro[0][6] = 0.45;
+    model.w_ro[0][7] = 0.45;
+    model.pre_conv_u_gain = [0.40, 0.35];
+    model.direct_s2_u_gain = [0.0, 0.0];
+    model.fir_l[0] = 0.12;
+    model.fir_r[0] = 0.12;
+    let trims = [2.0_f32, 0.5, 1.25, 1.0];
+    model.tier_gain_trim = trims.map(f64::from);
 
-    let mut arena_a = vec![0u8; ARENA_ULTRA_BYTES];
-    pack_v3_matryoshka_to_arena(&model, &mut arena_a);
-    // Rows 2 & 12 of unified W_ctrl (`ARENA0_W_CTRL_OFFSET`) map `z_head[0]` into Block 0 FiLM & Tone EQ
-    write_f32(&mut arena_a, ARENA0_W_CTRL_OFFSET + 2 * 64, 3.0);
-    write_f32(&mut arena_a, ARENA0_W_CTRL_OFFSET + 12 * 64, 3.0);
-
+    let base_dbin = encode_model_to_dnam_bin(&model, Pass5EmitConfig::default()).unwrap();
     let mut slot = Cp1ContributorSlot {
         lanes: 2,
         ctrl_kind: 0,
         control_idx: 0,
+        aux: 0xFF,
         ..Cp1ContributorSlot::zero()
     };
     slot.main_base[0][0] = 1.0;
     slot.emb[0] = 1.0;
     slot.v_base[0] = 1.0;
-    write_inline_cp1_if_fits(&mut arena_a, &[slot]);
 
-    let trims = [2.0_f32, 0.5, 1.25, 1.0];
-    for (t, &tr) in trims.iter().enumerate() {
-        write_f32(&mut arena_a, ARENA0_TIER_GAIN_TRIM_OFFSET + t * 4, tr);
-    }
-
-    let dnam_a =
-        build_dnam_container_with_cp1(&mut hdr.clone(), &arena_a, &arena_a, false, &[slot])
-            .unwrap();
+    let mut man_a = DnamProjManifest::default_reference();
+    man_a.base = hdr.clone();
+    let dbin_a = inject_controls_and_cp1_into_dbin(&base_dbin, &man_a, &[slot], |cb| {
+        cb.w_ctrl[0][0] = F32::new(2.0);
+        cb.w_ctrl[2][0] = F32::new(1.2);
+    });
+    let dnam_a = build_dnam_container_from_dnam_bin(&mut hdr.clone(), &dbin_a).unwrap();
 
     // 1. Pre-tick immediate sync (samples 0..4, well before sample 16's first 3 kHz control tick!)
     let mut eng_def =
@@ -282,7 +265,7 @@ fn test_engine_immediate_control_sync_reload_reset_and_tier_gain_trim() {
     eng_def.set_control_immediate(0, 0.0);
     let mut y_pre_def = [0.0_f32; 2];
     for _ in 0..4 {
-        y_pre_def = eng_def.step_frame_tora(0.35, 0.35, false);
+        y_pre_def = eng_def.step_frame_sona(0.35, 0.35, false);
     }
 
     let mut eng_hi =
@@ -290,7 +273,7 @@ fn test_engine_immediate_control_sync_reload_reset_and_tier_gain_trim() {
     eng_hi.set_control_immediate(0, 10.0);
     let mut y_pre_hi = [0.0_f32; 2];
     for _ in 0..4 {
-        y_pre_hi = eng_hi.step_frame_tora(0.35, 0.35, false);
+        y_pre_hi = eng_hi.step_frame_sona(0.35, 0.35, false);
     }
     assert!(
         (y_pre_hi[0] - y_pre_def[0]).abs() > 1.0e-3,
@@ -306,19 +289,19 @@ fn test_engine_immediate_control_sync_reload_reset_and_tier_gain_trim() {
         DnamEngine::<DefaultMathBackend>::from_bytes_owned(&dnam_a, Tier::Ultra, 48_000).unwrap();
     for _ in 0..4 {
         assert_eq!(
-            eng_reset.step_frame_tora(0.35, 0.35, false)[0].to_bits(),
-            eng_fresh_def.step_frame_tora(0.35, 0.35, false)[0].to_bits(),
+            eng_reset.step_frame_sona(0.35, 0.35, false)[0].to_bits(),
+            eng_fresh_def.step_frame_sona(0.35, 0.35, false)[0].to_bits(),
             "reset_controls_to_defaults must immediately clear pre-tick control state"
         );
     }
 
     // 2. reload_model_in_place must clear stale current_stage_params from eng_hi
-    let mut arena_b = arena_a.clone();
-    arena_b[ARENA0_W_CTRL_OFFSET..ARENA0_W_CTRL_OFFSET + 1_024].fill(0);
-    arena_b[ARENA3_W_CTRL_ULTRA_OFFSET..ARENA3_W_CTRL_ULTRA_OFFSET + 256].fill(0);
-    write_inline_cp1_if_fits(&mut arena_b, &[]);
-    let dnam_b =
-        build_dnam_container_with_cp1(&mut hdr.clone(), &arena_b, &arena_b, false, &[]).unwrap();
+    let dbin_b = inject_controls_and_cp1_into_dbin(&base_dbin, &man_a, &[], |cb| {
+        for row in &mut cb.w_ctrl {
+            row.fill(F32::new(0.0));
+        }
+    });
+    let dnam_b = build_dnam_container_from_dnam_bin(&mut hdr.clone(), &dbin_b).unwrap();
     eng_hi
         .reload_model_in_place(&dnam_b, Tier::Ultra, 48_000)
         .unwrap();
@@ -326,29 +309,40 @@ fn test_engine_immediate_control_sync_reload_reset_and_tier_gain_trim() {
         DnamEngine::<DefaultMathBackend>::from_bytes_owned(&dnam_b, Tier::Ultra, 48_000).unwrap();
     for _ in 0..4 {
         assert_eq!(
-            eng_hi.step_frame_tora(0.35, 0.35, false)[0].to_bits(),
-            eng_b_fresh.step_frame_tora(0.35, 0.35, false)[0].to_bits(),
+            eng_hi.step_frame_sona(0.35, 0.35, false)[0].to_bits(),
+            eng_b_fresh.step_frame_sona(0.35, 0.35, false)[0].to_bits(),
             "reload_model_in_place leaked stale current_stage_params during pre-tick window"
         );
     }
 
-    // 3. Verify ARENA0_TIER_GAIN_TRIM_OFFSET scales live 1x & 4x 2-port and 4CM outputs + 0 ULP stripping
-    let mut untrimmed_arena = arena_a.clone();
-    for t in 0..4 {
-        write_f32(
-            &mut untrimmed_arena,
-            ARENA0_TIER_GAIN_TRIM_OFFSET + t * 4,
-            1.0,
-        );
-    }
-    let dnam_untrimmed = build_dnam_container_with_cp1(
-        &mut hdr.clone(),
-        &untrimmed_arena,
-        &untrimmed_arena,
-        false,
-        &[slot],
-    )
+    // 3. Verify `tier_gain_trim` scales live 1x & 4x 2-port and 4CM outputs + 0 ULP stripping
+    let va = DnamBinView::parse(&dbin_a).unwrap();
+    let mut untrimmed_a0 = *va.arena0;
+    untrimmed_a0.crossbar.tier_gain_trim = [F32::new(1.0); 4];
+    let untrimmed_dbin = encode_dnam_bin(&DnamBinBuildInput {
+        reference_sample_rate_hz: va.header.reference_sample_rate_hz.get(),
+        header_flags: va.header.flags.get(),
+        ext_ring_pow2_frames: va.runtime_meta.ext_ring_pow2_frames,
+        ext_ring_lines: va.runtime_meta.ext_ring_lines,
+        ext_ring_format: va.runtime_meta.ext_ring_format,
+        declared_max_delay_48k: va.runtime_meta.declared_max_delay_48k.get(),
+        dc_blocker_pole_5hz: va.runtime_meta.dc_blocker_pole_5hz.get(),
+        tail_time_ms: va.runtime_meta.tail_time_ms.get(),
+        ro_pole_48k: va.runtime_meta.ro_pole_48k.get(),
+        switch_xfade_samples: va.runtime_meta.switch_xfade_samples.get(),
+        content_hash_prefix: va.runtime_meta.content_hash_prefix,
+        controls: va.control_descriptors,
+        cp1_overflow: va.cp1_overflow,
+        tsyn: va.tsyn_entries,
+        cext: va.cext,
+        arena0: &untrimmed_a0,
+        arena1: va.arena1,
+        arena2: va.arena2,
+        arena3: va.arena3,
+    })
     .unwrap();
+    let dnam_untrimmed =
+        build_dnam_container_from_dnam_bin(&mut hdr.clone(), &untrimmed_dbin).unwrap();
 
     for (t, (&tier, &tr)) in [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra]
         .iter()
@@ -360,8 +354,8 @@ fn test_engine_immediate_control_sync_reload_reset_and_tier_gain_trim() {
         let mut e_raw =
             DnamEngine::<DefaultMathBackend>::from_bytes_owned(&dnam_untrimmed, tier, 48_000)
                 .unwrap();
-        let yt = e_trim.step_frame_tora(0.25, 0.25, false);
-        let yr = e_raw.step_frame_tora(0.25, 0.25, false);
+        let yt = e_trim.step_frame_sona(0.25, 0.25, false);
+        let yr = e_raw.step_frame_sona(0.25, 0.25, false);
         assert!(
             (yt[0] - yr[0] * tr).abs() <= 1.0e-6,
             "tier {t} 1x trim mismatch: got {} vs expected {}",
@@ -401,8 +395,8 @@ fn test_engine_immediate_control_sync_reload_reset_and_tier_gain_trim() {
         DnamEngine::<DefaultMathBackend>::from_bytes_owned(&s_lite, Tier::Lite, 48_000).unwrap();
     for i in 0..64 {
         let x = 0.2 * ((i as f32) * 0.13).sin();
-        let a = e_direct_lite.step_frame_tora(x, x, false);
-        let b = e_strip_lite.step_frame_tora(x, x, false);
+        let a = e_direct_lite.step_frame_sona(x, x, false);
+        let b = e_strip_lite.step_frame_sona(x, x, false);
         assert_eq!(a[0].to_bits(), b[0].to_bits());
         assert_eq!(a[1].to_bits(), b[1].to_bits());
     }
@@ -416,13 +410,13 @@ fn test_vault_path1_stride_autodetect_w_ctrl_preservation_and_with_options_apis(
     let mut manifest = DnamProjManifest::default_reference();
     manifest.base.controls_schema = vec![make_range_ctrl("gain", 0.0, 10.0, 5.0)];
 
-    let mut seed_model = V3MatryoshkaModel::identity(false, true);
-    for b in 0..3 {
-        seed_model.blocks[b].w_in_n[0][0] = 0.25;
-        seed_model.blocks[b].w_in_n[1][0] = 0.20;
+    let mut seed_model = SonaModelF64::new(48_000.0);
+    seed_model.oversample_upper_tiers_2x = false;
+    for q in &mut seed_model.core_quads[0..4] {
+        q.in_mid_weight = [0.25; 4];
+        q.adaa_drive = [0.20; 4];
     }
-    let mut seed_arena = vec![0u8; ARENA_ULTRA_BYTES];
-    pack_v3_matryoshka_to_arena(&seed_model, &mut seed_arena);
+    let mut seed_dbin = encode_model_to_dnam_bin(&seed_model, Pass5EmitConfig::default()).unwrap();
     let dry: Vec<f32> = (0..CORESET_FP32_FRAMES_PER_STEM)
         .map(|i| 0.35 * ((i as f32) * 0.071).sin() + 0.2 * ((i as f32) * 0.19).cos())
         .collect();
@@ -431,17 +425,42 @@ fn test_vault_path1_stride_autodetect_w_ctrl_preservation_and_with_options_apis(
     let wet_lr: Vec<[f32; 2]> = wet_star.iter().map(|&y| [y, y]).collect();
     let _ = run_stage_a_physics_probe(
         &manifest,
-        &mut seed_arena,
+        &mut seed_dbin,
         &dry_lr,
         &wet_lr,
         None,
         StageAConfig::default(),
     );
-    write_f32(&mut seed_arena, ARENA0_W_CTRL_OFFSET + 32, 0.42);
-    write_f32(&mut seed_arena, ARENA3_UINT_ULTRA_OFFSET + 12, -0.31);
+    let vs = DnamBinView::parse(&seed_dbin).unwrap();
+    let mut a0_s = *vs.arena0;
+    let mut a3_s = *vs.arena3.unwrap();
+    a0_s.control_bus_lite.w_ctrl[0][8] = F32::new(0.42);
+    a3_s.control_bus_ultra_delta.u_int_ultra[0][0][3] = F32::new(-0.31);
+    let seed_dbin = encode_dnam_bin(&DnamBinBuildInput {
+        reference_sample_rate_hz: vs.header.reference_sample_rate_hz.get(),
+        header_flags: vs.header.flags.get(),
+        ext_ring_pow2_frames: vs.runtime_meta.ext_ring_pow2_frames,
+        ext_ring_lines: vs.runtime_meta.ext_ring_lines,
+        ext_ring_format: vs.runtime_meta.ext_ring_format,
+        declared_max_delay_48k: vs.runtime_meta.declared_max_delay_48k.get(),
+        dc_blocker_pole_5hz: vs.runtime_meta.dc_blocker_pole_5hz.get(),
+        tail_time_ms: vs.runtime_meta.tail_time_ms.get(),
+        ro_pole_48k: vs.runtime_meta.ro_pole_48k.get(),
+        switch_xfade_samples: vs.runtime_meta.switch_xfade_samples.get(),
+        content_hash_prefix: vs.runtime_meta.content_hash_prefix,
+        controls: vs.control_descriptors,
+        cp1_overflow: vs.cp1_overflow,
+        tsyn: vs.tsyn_entries,
+        cext: vs.cext,
+        arena0: &a0_s,
+        arena1: vs.arena1,
+        arena2: vs.arena2,
+        arena3: Some(&a3_s),
+    })
+    .unwrap();
 
     let seed_proj =
-        build_dnam_proj_container_with_cp1(&mut manifest.clone(), &[], &seed_arena, &[]).unwrap();
+        build_dnam_proj_container_with_dnam_bin(&mut manifest.clone(), &[], &seed_dbin).unwrap();
     let mut schedule_320 = [0u8; 320];
     schedule_320[8..12].copy_from_slice(&1_024_u32.to_le_bytes());
     let inpc = build_proj_inpc_capsule(
@@ -493,29 +512,32 @@ fn test_vault_path1_stride_autodetect_w_ctrl_preservation_and_with_options_apis(
 
     let v_p2 = DnamProjView::from_bytes(&proj_p2, &crypto).unwrap();
     let v_p1 = DnamProjView::from_bytes(&proj_p1, &crypto).unwrap();
-    let a_p2 =
-        DnamContainerView::from_bytes(v_p2.chunk_slice(ProjChunkKind::Wght, 0).unwrap(), &crypto)
-            .unwrap()
-            .arena_storage
-            .as_bytes()
-            .to_vec();
-    let a_p1 =
-        DnamContainerView::from_bytes(v_p1.chunk_slice(ProjChunkKind::Wght, 0).unwrap(), &crypto)
-            .unwrap()
-            .arena_storage
-            .as_bytes()
-            .to_vec();
+    let dbin_p2 = extract_dnam_bin(v_p2.chunk_slice(ProjChunkKind::Wght, 0).unwrap()).unwrap();
+    let dbin_p1 = extract_dnam_bin(v_p1.chunk_slice(ProjChunkKind::Wght, 0).unwrap()).unwrap();
+    let vp2 = DnamBinView::parse(dbin_p2).unwrap();
+    let vp1 = DnamBinView::parse(dbin_p1).unwrap();
 
-    assert_eq!(read_f32(&a_p1, ARENA0_W_CTRL_OFFSET + 32), 0.42);
-    assert_eq!(read_f32(&a_p1, ARENA3_UINT_ULTRA_OFFSET + 12), -0.31);
-    for &(hb, sz) in &[
-        (ARENA0_DIRECT_READOUT_OFFSET, 320usize),
-        (ARENA1_DIRECT_READOUT_OFFSET, 384),
-        (ARENA2_DIRECT_READOUT_OFFSET, 448),
-        (ARENA3_DIRECT_READOUT_OFFSET, 512),
-    ] {
-        assert_eq!(&a_p1[hb..hb + sz], &a_p2[hb..hb + sz]);
-    }
+    assert_eq!(vp1.arena0.control_bus_lite.w_ctrl[0][8].get(), 0.42);
+    assert_eq!(
+        vp1.arena3.unwrap().control_bus_ultra_delta.u_int_ultra[0][0][3].get(),
+        -0.31
+    );
+    assert_eq!(
+        vp1.arena0.linear_readout_lite.as_bytes(),
+        vp2.arena0.linear_readout_lite.as_bytes()
+    );
+    assert_eq!(
+        vp1.arena1.unwrap().linear_readout_full.as_bytes(),
+        vp2.arena1.unwrap().linear_readout_full.as_bytes()
+    );
+    assert_eq!(
+        vp1.arena2.unwrap().linear_readout_pro.as_bytes(),
+        vp2.arena2.unwrap().linear_readout_pro.as_bytes()
+    );
+    assert_eq!(
+        vp1.arena3.unwrap().linear_readout_ultra.as_bytes(),
+        vp2.arena3.unwrap().linear_readout_ultra.as_bytes()
+    );
 
     let proj_dis = set_capture_enabled_with_options(
         &proj_p1,

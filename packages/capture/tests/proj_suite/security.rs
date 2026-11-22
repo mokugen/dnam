@@ -32,18 +32,24 @@ fn fp32_bytes(samples: &[f32]) -> Vec<u8> {
     }
     out
 }
-use dnam_engine::Tier;
-use dnam_engine::container::{
-    ARENA_OFFSET_LITE_END, ARENA_OFFSET_ULTRA_END, DnamContainerView, build_dnam_container,
+use super::test_support::{
+    build_test_dnam_from_header, neutral_arena_bytes, try_encode_invalid_stability_dnam_bin,
 };
-use dnam_engine::control::Cp1ContributorSlot;
-use dnam_engine::math::DefaultMathBackend;
+use dnam_capture::proj::verify_dnam_bin_zero_dc;
+use dnam_engine::Tier;
+use dnam_engine::container::{DnamContainerView, build_dnam_container};
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::{
     ControlCalibration, ControlCalibrationRole, ControlSchemaDef, DistributionPolicy, DnamError,
     DnamJsonHeader, DnamProtectionProfile,
 };
+use dnam_vm::bin::{
+    ARENA_TIER_BYTES, Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire,
+};
+use dnam_vm::control::Cp1ContributorSlot;
+use dnam_vm::math::DefaultMathBackend;
 use std::collections::BTreeMap;
+use zerocopy::{FromBytes, IntoBytes};
 
 fn make_range_control(id: &str, min_v: f32, max_v: f32, def_v: f32) -> ControlSchemaDef {
     serde_json::from_value(serde_json::json!({
@@ -206,7 +212,7 @@ fn test_dnam_proj_lifecycle_range_parse_capsules_and_zero_dc_guards() {
 
     // 384 KB raw audio beyond 64 KB Range prefix!
     let spcm = make_spcm_chunk(&vec![0.125_f32; 96_000]);
-    let arena_64k = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
+    let arena_64k = neutral_arena_bytes(true);
 
     let mut manifest = DnamProjManifest::default_reference();
     manifest.base.controls_schema = vec![make_range_control("gain", 0.0, 10.0, 5.0)];
@@ -235,7 +241,7 @@ fn test_dnam_proj_lifecycle_range_parse_capsules_and_zero_dc_guards() {
     cp1_slot.lanes = 1;
     cp1_slot.ctrl_kind = 0;
     cp1_slot.control_idx = 0;
-    cp1_slot.option_idx = 0xFF;
+    cp1_slot.aux = 0xFF;
     cp1_slot.main_base[0] = [0.5; 8];
     cp1_slot.emb = [1.0, 0.0, 0.0];
 
@@ -314,13 +320,30 @@ fn test_dnam_proj_lifecycle_range_parse_capsules_and_zero_dc_guards() {
     bad_crc[65] ^= 0xFF;
     assert!(parse_proj_manifest_range(&bad_crc[..4096]).is_err());
 
-    // [STAB-ZERO-DC]: non-zero b_head in Arena 0 [216..256] or Arena 3 [18528..18560] must fail closed
-    for dc_off in [216usize, 18_528usize] {
-        let mut bad_arena = arena_64k.clone();
-        bad_arena[dc_off..dc_off + 4].copy_from_slice(&0.05_f32.to_le_bytes());
+    // [STAB-ZERO-DC]: valid driven SONA v3.0 weights strictly preserve resting Zero-DC equilibrium,
+    // while invalid linear-block svf_k_nl / corrupted or legacy non-DNBN WGHT fail closed
+    let mut driven_hdr = manifest.base.clone();
+    let driven_wght = build_test_dnam_from_header(&mut driven_hdr, true);
+    assert!(dnam_capture::proj::verify_wght_zero_dc(&driven_wght).is_ok());
+
+    for corrupt_lite in [true, false] {
+        assert!(try_encode_invalid_stability_dnam_bin(&manifest.base, corrupt_lite).is_err());
+    }
+    let mut bad_raw_dbin = dnam_engine::container::extract_dnam_bin(&driven_wght)
+        .unwrap()
+        .to_vec();
+    let last_dbin_idx = bad_raw_dbin.len() - 1;
+    bad_raw_dbin[last_dbin_idx] ^= 0x55;
+    assert!(verify_dnam_bin_zero_dc(&bad_raw_dbin).is_err());
+
+    let mut tampered_wght = driven_wght.clone();
+    let last_idx = tampered_wght.len() - 1;
+    tampered_wght[last_idx] ^= 0x55;
+    let legacy_wght = {
         let mut hdr_copy = manifest.base.clone();
-        let bad_wght_dnam =
-            build_dnam_container(&mut hdr_copy, &bad_arena, &bad_arena, false).unwrap();
+        build_dnam_container(&mut hdr_copy, &arena_64k, &arena_64k, false).unwrap()
+    };
+    for bad_wght_dnam in [tampered_wght, legacy_wght] {
         assert!(
             build_dnam_proj_container(
                 &manifest,
@@ -370,7 +393,7 @@ fn test_dnam_proj_lifecycle_range_parse_capsules_and_zero_dc_guards() {
         allowed_protection_profiles: vec![DnamProtectionProfile::EnclaveSealed],
         allowed_oem_vendors: Vec::new(),
     });
-    let lite_arena = vec![0u8; ARENA_OFFSET_LITE_END as usize];
+    let lite_arena = neutral_arena_bytes(false);
     assert!(build_dnam_proj_container_with_cp1(&mut enclave_man, &[], &lite_arena, &[]).is_err());
 }
 
@@ -478,14 +501,43 @@ fn test_two_path_capture_vault_editing_and_wav_subsample_alignment() {
         &crypto,
     )
     .unwrap();
-    // Extract Arena 0..3 Mode 0 + physical Stage I..IV backbone slices (excluding Stage C/D ControlBus & head regions)
-    const MODE0_BACKBONE_RANGES: [(usize, usize); 3] =
-        [(0, 3_008), (4_544, 21_120), (23_872, 28_672)];
     let s0_arena = wght_s0_rt.arena_storage.as_bytes();
-    let star_mode0_slices: Vec<Vec<u8>> = MODE0_BACKBONE_RANGES
-        .iter()
-        .map(|&(a, b)| s0_arena[a..b].to_vec())
-        .collect();
+    let (a0_s0, _) = Arena0LiteWire::ref_from_prefix(s0_arena).unwrap();
+    let (a1_s0, _) =
+        Arena1FullDeltaWire::ref_from_prefix(&s0_arena[ARENA_TIER_BYTES[0]..]).unwrap();
+    let (a2_s0, _) = Arena2ProDeltaWire::ref_from_prefix(&s0_arena[ARENA_TIER_BYTES[1]..]).unwrap();
+    let (a3_s0, _) =
+        Arena3UltraDeltaWire::ref_from_prefix(&s0_arena[ARENA_TIER_BYTES[2]..]).unwrap();
+    let star_mode0_slices: Vec<Vec<u8>> = vec![
+        a0_s0.crossbar.as_bytes().to_vec(),
+        a0_s0.core_quads.as_bytes().to_vec(),
+        a0_s0.tiles.as_bytes().to_vec(),
+        a0_s0.conv_fir_lite.as_bytes().to_vec(),
+        a0_s0.conv_kautz_lite.as_bytes().to_vec(),
+        a0_s0.transport_lite.as_bytes().to_vec(),
+        a0_s0.linear_readout_lite.as_bytes().to_vec(),
+        a1_s0.crossbar_full.as_bytes().to_vec(),
+        a1_s0.core_quads.as_bytes().to_vec(),
+        a1_s0.tiles.as_bytes().to_vec(),
+        a1_s0.conv_fir_full.as_bytes().to_vec(),
+        a1_s0.conv_kautz_full.as_bytes().to_vec(),
+        a1_s0.transport_full.as_bytes().to_vec(),
+        a1_s0.linear_readout_full.as_bytes().to_vec(),
+        a2_s0.crossbar_pro.as_bytes().to_vec(),
+        a2_s0.core_quads.as_bytes().to_vec(),
+        a2_s0.tiles.as_bytes().to_vec(),
+        a2_s0.conv_fir_pro.as_bytes().to_vec(),
+        a2_s0.conv_kautz_pro.as_bytes().to_vec(),
+        a2_s0.transport_pro.as_bytes().to_vec(),
+        a2_s0.linear_readout_pro.as_bytes().to_vec(),
+        a3_s0.crossbar_ultra.as_bytes().to_vec(),
+        a3_s0.core_quads.as_bytes().to_vec(),
+        a3_s0.tiles.as_bytes().to_vec(),
+        a3_s0.conv_fir_ultra.as_bytes().to_vec(),
+        a3_s0.conv_kautz_ultra.as_bytes().to_vec(),
+        a3_s0.transport_ultra.as_bytes().to_vec(),
+        a3_s0.linear_readout_ultra.as_bytes().to_vec(),
+    ];
     let stat_s0_bytes = view_s0
         .chunk_slice(ProjChunkKind::Stat, 0)
         .unwrap()
@@ -538,11 +590,50 @@ fn test_two_path_capture_vault_editing_and_wav_subsample_alignment() {
     )
     .unwrap();
     let s0_s1_arena = wght_s0_s1_rt.arena_storage.as_bytes();
-    for (&(a, b), expected_slice) in MODE0_BACKBONE_RANGES.iter().zip(&star_mode0_slices) {
+    let (a0_s1, _) = Arena0LiteWire::ref_from_prefix(s0_s1_arena).unwrap();
+    let (a1_s1, _) =
+        Arena1FullDeltaWire::ref_from_prefix(&s0_s1_arena[ARENA_TIER_BYTES[0]..]).unwrap();
+    let (a2_s1, _) =
+        Arena2ProDeltaWire::ref_from_prefix(&s0_s1_arena[ARENA_TIER_BYTES[1]..]).unwrap();
+    let (a3_s1, _) =
+        Arena3UltraDeltaWire::ref_from_prefix(&s0_s1_arena[ARENA_TIER_BYTES[2]..]).unwrap();
+    let after_slices: Vec<Vec<u8>> = vec![
+        a0_s1.crossbar.as_bytes().to_vec(),
+        a0_s1.core_quads.as_bytes().to_vec(),
+        a0_s1.tiles.as_bytes().to_vec(),
+        a0_s1.conv_fir_lite.as_bytes().to_vec(),
+        a0_s1.conv_kautz_lite.as_bytes().to_vec(),
+        a0_s1.transport_lite.as_bytes().to_vec(),
+        a0_s1.linear_readout_lite.as_bytes().to_vec(),
+        a1_s1.crossbar_full.as_bytes().to_vec(),
+        a1_s1.core_quads.as_bytes().to_vec(),
+        a1_s1.tiles.as_bytes().to_vec(),
+        a1_s1.conv_fir_full.as_bytes().to_vec(),
+        a1_s1.conv_kautz_full.as_bytes().to_vec(),
+        a1_s1.transport_full.as_bytes().to_vec(),
+        a1_s1.linear_readout_full.as_bytes().to_vec(),
+        a2_s1.crossbar_pro.as_bytes().to_vec(),
+        a2_s1.core_quads.as_bytes().to_vec(),
+        a2_s1.tiles.as_bytes().to_vec(),
+        a2_s1.conv_fir_pro.as_bytes().to_vec(),
+        a2_s1.conv_kautz_pro.as_bytes().to_vec(),
+        a2_s1.transport_pro.as_bytes().to_vec(),
+        a2_s1.linear_readout_pro.as_bytes().to_vec(),
+        a3_s1.crossbar_ultra.as_bytes().to_vec(),
+        a3_s1.core_quads.as_bytes().to_vec(),
+        a3_s1.tiles.as_bytes().to_vec(),
+        a3_s1.conv_fir_ultra.as_bytes().to_vec(),
+        a3_s1.conv_kautz_ultra.as_bytes().to_vec(),
+        a3_s1.transport_ultra.as_bytes().to_vec(),
+        a3_s1.linear_readout_ultra.as_bytes().to_vec(),
+    ];
+    for (idx, (actual_slice, expected_slice)) in
+        after_slices.iter().zip(&star_mode0_slices).enumerate()
+    {
         assert_eq!(
-            &s0_s1_arena[a..b],
+            actual_slice.as_slice(),
             expected_slice.as_slice(),
-            "Mode 0 / physical backbone slice [{a}..{b}] must remain 0.000000 ULP identical on Path 1 edit"
+            "Mode 0 / physical backbone slice #{idx} must remain 0.000000 ULP identical on Path 1 edit"
         );
     }
     assert_eq!(
@@ -550,7 +641,12 @@ fn test_two_path_capture_vault_editing_and_wav_subsample_alignment() {
         stat_s0_bytes.as_slice()
     );
     assert!(
-        s0_s1_arena[3_520..4_544].iter().any(|&b| b != 0),
+        a0_s1
+            .control_bus_lite
+            .w_ctrl
+            .as_bytes()
+            .iter()
+            .any(|&b| b != 0),
         "Stage C must populate non-zero W_ctrl weights for off_1"
     );
     assert_eq!(
@@ -714,18 +810,17 @@ fn test_decimator_pchip_interval_audit_and_freeze_latch_regressions() {
         IntervalAuditDecision::CertifiedFail
     );
 
-    // 4. FreezeLatch calibrated control preserved across render_stem with Some([0, 0]) freeze window
+    // 4. Calibrated control preserved across render_stem with freeze_transition_window
     let mut frz_hdr = DnamJsonHeader::default_reference();
-    frz_hdr.io_config.capabilities.supports_freeze = true;
+    frz_hdr.io_config.capabilities.supports_trails = true;
     frz_hdr.controls_schema = vec![make_range_control("gain", 0.0, 10.0, 5.0)];
     frz_hdr.controls_schema[0].calibration = Some(ControlCalibration {
-        role: ControlCalibrationRole::FreezeLatch,
+        role: ControlCalibrationRole::Mix,
         lobatto_physical_anchors: None,
-        conditional_physical_anchors: BTreeMap::new(),
+        conditional_physical_anchors: Vec::new(),
         tempo_sync_default_subdivision: None,
     });
-    let frz_arena = vec![0u8; ARENA_OFFSET_ULTRA_END as usize];
-    let frz_dnam = build_dnam_container(&mut frz_hdr, &frz_arena, &frz_arena, false).unwrap();
+    let frz_dnam = build_test_dnam_from_header(&mut frz_hdr, false);
     let frz_view = DnamContainerView::from_bytes(&frz_dnam, &crypto).unwrap();
     let mut frz_eng =
         dnam_engine::DnamEngine::<DefaultMathBackend>::from_bytes(&frz_dnam, Tier::Lite, 48_000)
@@ -744,6 +839,7 @@ fn test_decimator_pchip_interval_audit_and_freeze_latch_regressions() {
         control_trajectories: Some(vec![vec![max_c0; 16], vec![5.0; 16]]),
         freeze_transition_window: Some([0, 0]),
     };
-    let _ = frz_eng.render_stem(&frz_stim).unwrap();
-    assert!(frz_eng.is_frozen());
+    let frz_resp = frz_eng.render_stem(&frz_stim).unwrap();
+    assert_eq!(frz_resp.out_1.len(), 16);
+    assert!(frz_resp.out_1.iter().all(|v| v.is_finite()));
 }

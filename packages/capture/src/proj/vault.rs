@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
-//! Non-Destructive `.dnam-proj` (`DNPJ`) Capture Vault Editing (`proj::vault`):
+//! Non-Destructive `.dnam-proj` (`DNPJ`, `v3.0`) Capture Vault Editing (`proj::vault`):
 //! `add_capture`, `remove_capture`, `replace_capture`, `set_capture_enabled`,
 //! `solve_captures_batch_into_proj`, and Two-Path (`Path 1` `0-ULP` Incremental vs. `Path 2`
-//! Deterministic Full Re-Pool) `v3` 4-Stage Compositional Solve.
+//! Deterministic Full Re-Pool) `SONA v3.0` Solve.
 //!
 //! Canonical References:
 //! - `docs/specs/containers/project_container_format.md` (`ref[container.proj.lifecycle-states]`)
@@ -13,9 +13,12 @@ pub mod edit;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use dnam_engine::Tier;
 use dnam_engine::schema::DnamError;
-use dnam_engine::stages::V3MatryoshkaModel;
-use dnam_engine::stages::weights::{ARENA_ULTRA_BYTES, pack_v3_matryoshka_to_arena};
+use dnam_train::{Pass5EmitConfig, SonaModelF64, encode_model_to_dnam_bin};
+use dnam_vm::bin::DnamBinView;
+use zerocopy::FromBytes;
+use zerocopy::byteorder::little_endian::{U16, U32};
 
 use crate::CORESET_FP32_STEREO_BYTES;
 pub use crate::audit::{
@@ -28,12 +31,10 @@ use crate::solver::{
     solve_stage_c_knobs,
 };
 
-use super::bundle::{
-    VaultChunkInput, build_dnam_proj_container_from_vault, zero_arena_b_head_dc_bias,
-};
+use super::bundle::{VaultChunkInput, build_dnam_proj_container_from_vault_dbin};
 use super::directory::{
-    ProjChunkKind, StmcTrajectoryWindow, build_proj_stmc_capsule, verify_proj_inpc_capsule,
-    verify_proj_stmc_capsule,
+    InpcHeader64BWire, ProjChunkKind, StmcHeader128BWire, StmcTrajectoryWindow,
+    build_proj_stmc_capsule, verify_proj_inpc_capsule, verify_proj_stmc_capsule,
 };
 use super::schema::{DnamProjManifest, ExtractedPhysics, StemProvenance, StemRegistryEntry};
 use super::{
@@ -123,26 +124,20 @@ impl VaultCaptureSpec {
     }
 }
 
-/// Initializes a canonical `28,672 B` `v3` Matryoshka arena from `existing_arena` or resting identity.
-pub(crate) fn initialize_backbone_arena_if_needed(existing_arena: Option<&[u8]>) -> Vec<u8> {
-    if let Some(bytes) = existing_arena
-        && bytes.len() == ARENA_ULTRA_BYTES
-        && bytes.iter().any(|&b| b != 0)
+/// Initializes a canonical 4-tier `SONA v3.0` `.dnam-bin` (`Ultra = 30,720 B` arena) from
+/// `existing_dbin` or resting neutral identity.
+pub(crate) fn initialize_backbone_dnam_bin_if_needed(
+    existing_dbin: Option<&[u8]>,
+) -> Result<Vec<u8>, DnamError> {
+    if let Some(bytes) = existing_dbin
+        && let Ok(view) = DnamBinView::parse(bytes)
+        && view.retained_tier == Tier::Ultra
     {
-        return bytes.to_vec();
+        return Ok(bytes.to_vec());
     }
-    let mut arena = vec![0u8; ARENA_ULTRA_BYTES];
-    if let Some(bytes) = existing_arena
-        && bytes.iter().any(|&b| b != 0)
-    {
-        let copy_len = bytes.len().min(arena.len());
-        arena[..copy_len].copy_from_slice(&bytes[..copy_len]);
-    } else {
-        let model = V3MatryoshkaModel::identity(true, false);
-        pack_v3_matryoshka_to_arena(&model, &mut arena);
-    }
-    zero_arena_b_head_dc_bias(&mut arena);
-    arena
+    let model = SonaModelF64::new(48_000.0);
+    encode_model_to_dnam_bin(&model, Pass5EmitConfig::default())
+        .map_err(|e| DnamError::SchemaValidationError(format!("{e}")))
 }
 
 pub(super) type ChunkDigest = (u32, [u8; 32]);
@@ -155,7 +150,7 @@ pub(super) struct VaultState {
     pub stmc_by_id: BTreeMap<u32, Vec<u8>>,
     pub stmc_digests: BTreeMap<u32, ChunkDigest>,
     pub stat: Option<(Vec<u8>, Option<ChunkDigest>)>,
-    pub wght_arena: Option<Vec<u8>>,
+    pub wght_dnam_bin: Option<Vec<u8>>,
     pub compacted: bool,
 }
 
@@ -165,7 +160,10 @@ pub(super) fn parse_validated_stmc_windows(
     if stmc_buf.len() < 704 {
         return Ok(verify_proj_stmc_capsule(stmc_buf)?.windows);
     }
-    let n_windows = usize::from(u16::from_le_bytes([stmc_buf[10], stmc_buf[11]]));
+    let Ok((hdr, _)) = StmcHeader128BWire::ref_from_prefix(stmc_buf) else {
+        return Ok(verify_proj_stmc_capsule(stmc_buf)?.windows);
+    };
+    let n_windows = usize::from(hdr.n_windows.get());
     let mut windows = Vec::with_capacity(n_windows);
     for idx in 0..n_windows {
         let off = 128 + idx * 16;
@@ -254,8 +252,11 @@ pub(super) fn rebuild_vault_container_with_progress(
     progress: &TrainerProgressHandle,
 ) -> Result<Vec<u8>, DnamError> {
     let (inpc_bytes, inpc_digest) = inpc_entry;
-    let inpc_channels = if inpc_digest.is_some() && inpc_bytes.len() >= 640 {
-        usize::from(u16::from_le_bytes([inpc_bytes[6], inpc_bytes[7]]))
+    let inpc_channels = if inpc_digest.is_some()
+        && let Ok((hdr, _)) = InpcHeader64BWire::ref_from_prefix(&inpc_bytes)
+        && inpc_bytes.len() >= 640
+    {
+        usize::from(hdr.channels.get())
     } else {
         usize::from(verify_proj_inpc_capsule(&inpc_bytes)?.channels)
     };
@@ -266,7 +267,11 @@ pub(super) fn rebuild_vault_container_with_progress(
             if stmc_buf.len() < 4_800 {
                 let _ = verify_proj_stmc_capsule(stmc_buf)?;
             }
-            let cur_flags = u16::from_le_bytes([stmc_buf[8], stmc_buf[9]]);
+            let (hdr, _) =
+                StmcHeader128BWire::mut_from_prefix(stmc_buf.as_mut_slice()).map_err(|_| {
+                    DnamError::SchemaValidationError("truncated STMC header".to_string())
+                })?;
+            let cur_flags = hdr.flags.get();
             let mut new_flags = cur_flags;
             if stem.enabled {
                 new_flags |= STMC_FLAG_ENABLED;
@@ -279,7 +284,7 @@ pub(super) fn rebuild_vault_container_with_progress(
                 new_flags &= !STMC_FLAG_STAR_CENTER;
             }
             if new_flags != cur_flags {
-                stmc_buf[8..10].copy_from_slice(&new_flags.to_le_bytes());
+                hdr.flags = U16::new(new_flags);
                 state.stmc_digests.remove(&stem.chunk_id);
             }
             if stem.enabled {
@@ -289,12 +294,9 @@ pub(super) fn rebuild_vault_container_with_progress(
     }
     recompute_vault_phase1_audit_and_clamps_with_windows(&mut state.manifest, &enabled_windows);
 
-    let has_prior_wght = state.wght_arena.is_some();
-    let mut arena_28k = initialize_backbone_arena_if_needed(state.wght_arena.as_deref());
-    let _ = crate::solver::stages::sync_clamp_descriptors_to_arena(
-        &state.manifest.base,
-        &mut arena_28k,
-    )?;
+    let has_prior_wght = state.wght_dnam_bin.is_some();
+    let mut dnam_bin = initialize_backbone_dnam_bin_if_needed(state.wght_dnam_bin.as_deref())?;
+    let _ = state.manifest.base.compile_clamp_descriptors()?;
 
     let active_star = state
         .manifest
@@ -307,11 +309,10 @@ pub(super) fn rebuild_vault_container_with_progress(
         force_full_repool || !has_prior_wght || (active_star.is_some() != state.stat.is_some());
 
     let dry_lr = decode_coreset_lr(&inpc_bytes[640..], inpc_channels);
-    let hint_raw = if inpc_bytes.len() >= 332 {
-        u32::from_le_bytes(inpc_bytes[328..332].try_into().unwrap()) as usize
-    } else {
-        0
-    };
+    let hint_raw = inpc_bytes
+        .get(328..332)
+        .and_then(|s| U32::ref_from_bytes(s).ok())
+        .map_or(0_usize, |v| v.get() as usize);
     let active_frames = if hint_raw > 0 && hint_raw <= dry_lr.len() {
         hint_raw
     } else {
@@ -332,7 +333,8 @@ pub(super) fn rebuild_vault_container_with_progress(
         if let Some(ref star_entry) = active_star
             && let Some(star_stmc_bytes) = state.stmc_by_id.get(&star_entry.chunk_id)
         {
-            let star_flags = u16::from_le_bytes([star_stmc_bytes[8], star_stmc_bytes[9]]);
+            let star_flags = StmcHeader128BWire::ref_from_prefix(star_stmc_bytes)
+                .map_or(0, |(h, _)| h.flags.get());
             let wet_lr = decode_coreset_lr(
                 &star_stmc_bytes[4_800..],
                 if (star_flags & STMC_FLAG_STEREO) != 0 {
@@ -352,10 +354,10 @@ pub(super) fn rebuild_vault_container_with_progress(
                 [f32::NAN; 4],
             );
 
-            // Stage A: Physics Probe & Physical Prior Lifting
+            // Stage A: Physics Probe & Initial SONA Seeding
             let stage_a_rep = run_stage_a_physics_probe(
                 &state.manifest,
-                &mut arena_28k,
+                &mut dnam_bin,
                 &dry_lr[..eval_n],
                 &wet_lr[..eval_n],
                 spec_arr,
@@ -372,10 +374,10 @@ pub(super) fn rebuild_vault_container_with_progress(
                 }
             }
 
-            // Stage B: Joint 4-Tier Matryoshka Backbone & 256-D uplo='U' STAT Contraction
+            // Stage B: Joint 4-Tier SONA Backbone & 256-D uplo='U' STAT Contraction
             let stage_b = solve_stage_b_backbone_with_progress(
                 &state.manifest,
-                &mut arena_28k,
+                &mut dnam_bin,
                 &dry_lr,
                 &wet_lr,
                 active_frames,
@@ -394,14 +396,12 @@ pub(super) fn rebuild_vault_container_with_progress(
         } else {
             stat_out = None;
             if !options.stage_a.preserve_existing_backbone {
-                arena_28k = initialize_backbone_arena_if_needed(None);
-            } else {
-                zero_arena_b_head_dc_bias(&mut arena_28k);
+                dnam_bin = initialize_backbone_dnam_bin_if_needed(None)?;
             }
         }
     }
 
-    // Stage C: Parallel Multi-Knob & Switch Conditioning (`CP1` + `U_int` + `W_ctrl`)
+    // Stage C: Multi-Knob & Switch Conditioning (`CP1` + `CEXT` + `TSYN` + `W_ctrl` + `U_int`)
     emit_vault_phase(
         progress,
         TrainingPhase::StageCKnobs,
@@ -411,7 +411,7 @@ pub(super) fn rebuild_vault_container_with_progress(
     );
     let stage_c = solve_stage_c_knobs(
         &state.manifest,
-        &mut arena_28k,
+        &mut dnam_bin,
         &state.stmc_by_id,
         &dry_lr,
         active_frames,
@@ -419,7 +419,7 @@ pub(super) fn rebuild_vault_container_with_progress(
     )?;
     accum_solve_ms += stage_c.elapsed_ms;
 
-    // Stage D: 3-Phase Audit, LUFS Loudness Trims (on Path 2), and `[STAB-ZERO-DC]` Packing
+    // Stage D: 3-Phase Audit, LUFS Loudness Trims (on Path 2), and `[STAB-ZERO-DC]` Certification
     emit_vault_phase(
         progress,
         TrainingPhase::StageDAudit,
@@ -438,7 +438,7 @@ pub(super) fn rebuild_vault_container_with_progress(
         .map_or(active_end, |w| active_end.min(w.len()));
     let _stage_d = finalize_stage_d_and_audit(
         &mut state.manifest,
-        &mut arena_28k,
+        &mut dnam_bin,
         &dry_lr[..eval_end],
         star_wet_opt.as_deref().map(|w| &w[..eval_end]),
         fallback_esr,
@@ -492,11 +492,10 @@ pub(super) fn rebuild_vault_container_with_progress(
 
     let keep_compacted =
         state.compacted && state.spcm_by_id.is_empty() && !state.stmc_by_id.is_empty();
-    let built = build_dnam_proj_container_from_vault(
+    let built = build_dnam_proj_container_from_vault_dbin(
         &mut state.manifest,
         chunks,
-        &arena_28k,
-        &stage_c.cp1_slots,
+        &dnam_bin,
         keep_compacted,
     )?;
     let final_esr = state

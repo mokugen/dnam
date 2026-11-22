@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
-//! `64 B` `.dnam-proj` (`DNPJ`) Preamble, `64 B` Chunk Directory, Front-Loaded `HTTP Range`
+//! `64 B` `.dnam-proj` (`DNPJ`, `v3.0`) Preamble, `64 B` Chunk Directory, Front-Loaded `HTTP Range`
 //! Manifest Parser, and `AUTH` Provenance Verifier (`proj::directory`).
 //!
 //! Canonical Reference: `docs/specs/containers/project_container_format.md`
 //! (`ref[container.proj.preamble-and-directory]`, `ref[container.proj.auth-signature]`).
+
+use core::mem::{align_of, offset_of, size_of};
 
 use dnam_engine::container::{
     align64_u64, crc32c_update, encode_domain_field, parse_strict_json_object_bytes,
@@ -11,9 +13,12 @@ use dnam_engine::container::{
 };
 use dnam_engine::provenance::CryptoProvider;
 use dnam_engine::schema::{DnamError, check_no_unknown_header_keys};
+use zerocopy::byteorder::little_endian::{U16, U32, U64};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
 pub use super::capsules::{
-    CalbChunk64B, InpcCapsuleView, StmcCapsuleView, StmcTrajectoryWindow, build_proj_inpc_capsule,
+    CalbChunk64B, CalbChunk64BWire, InpcCapsuleView, InpcHeader64BWire, StmcCapsuleView,
+    StmcHeader128BWire, StmcTrajectoryWindow, StmcTrajectoryWindowWire, build_proj_inpc_capsule,
     build_proj_stmc_capsule, decode_proj_inpc_f32, decode_proj_stmc_f32,
     set_stmc_capsule_enabled_flag, set_stmc_capsule_star_center_flag, verify_proj_inpc_capsule,
     verify_proj_stat_uplo_u, verify_proj_stmc_capsule,
@@ -37,7 +42,7 @@ pub enum ProjChunkKind {
     Stmc,
     /// `b"STAT"`: `StarCenter` `uplo='U'` `G_0` + `C_0` sufficient statistics (`267,264 B` at `Ultra`).
     Stat,
-    /// `b"WGHT"`: Latest solved `v2.0` runtime `.dnam` weights (`< 0.2 ms` direct export).
+    /// `b"WGHT"`: Latest solved `v3.0` (`"sona"`) runtime `.dnam` weights (`< 0.2 ms` direct export).
     Wght,
     /// `b"AUTH"`: `128 B` `Ed25519` creator provenance & chunk-directory `sha256` attestation.
     Auth,
@@ -85,13 +90,49 @@ impl ProjChunkKind {
     }
 }
 
+/// Declarative `64 B` wire layout for Region 0 [`DnamProjPreamble`].
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct DnamProjPreambleWire {
+    /// Magic `"DNPJ"`.
+    pub magic: [u8; 4],
+    /// Major version (`3`).
+    pub version_major: U16,
+    /// Minor version (`0`).
+    pub version_minor: U16,
+    /// Lifecycle flags.
+    pub lifecycle_flags: U32,
+    /// TOC entry count.
+    pub chunk_count: U32,
+    /// Chunk directory byte offset (`64`).
+    pub chunk_dir_offset: U64,
+    /// JCS manifest offset (`64 + 64 * chunk_count`).
+    pub manifest_offset: U64,
+    /// JCS manifest unpadded UTF-8 byte length.
+    pub manifest_len: U64,
+    /// Castagnoli `CRC32C` over preamble `[0..40]` + dir + manifest JCS.
+    pub header_crc32c: U32,
+    /// Zeroed alignment tail (`20 B`).
+    pub reserved: [u8; 20],
+}
+
+const _: () = assert!(size_of::<DnamProjPreambleWire>() == PROJ_PREAMBLE_SIZE);
+const _: () = assert!(align_of::<DnamProjPreambleWire>() == 1);
+const _: () = assert!(offset_of!(DnamProjPreambleWire, chunk_dir_offset) == 16);
+const _: () = assert!(offset_of!(DnamProjPreambleWire, manifest_offset) == 24);
+const _: () = assert!(offset_of!(DnamProjPreambleWire, manifest_len) == 32);
+const _: () = assert!(offset_of!(DnamProjPreambleWire, header_crc32c) == 40);
+const _: () = assert!(offset_of!(DnamProjPreambleWire, reserved) == 44);
+
 /// Region 0 (`0x0000..0x0040`, `64 B`) binary preamble of a `.dnam-proj` (`DNPJ`) container.
 #[repr(C, align(64))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DnamProjPreamble {
     /// Magic bytes (`*b"DNPJ"`).
     pub magic: [u8; 4],
-    /// Major wire version (`2`).
+    /// Major wire version (`3`).
     pub version_major: u16,
     /// Minor wire version (`0`).
     pub version_minor: u16,
@@ -111,65 +152,65 @@ pub struct DnamProjPreamble {
     pub reserved: [u8; 20],
 }
 
-const _: () = assert!(core::mem::size_of::<DnamProjPreamble>() == 64);
+const _: () = assert!(size_of::<DnamProjPreamble>() == PROJ_PREAMBLE_SIZE);
 
 impl DnamProjPreamble {
     /// Serializes this preamble into an exact `64 B` little-endian array.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 64] {
+        let wire = DnamProjPreambleWire {
+            magic: self.magic,
+            version_major: U16::new(self.version_major),
+            version_minor: U16::new(self.version_minor),
+            lifecycle_flags: U32::new(self.lifecycle_flags),
+            chunk_count: U32::new(self.chunk_count),
+            chunk_dir_offset: U64::new(self.chunk_dir_offset),
+            manifest_offset: U64::new(self.manifest_offset),
+            manifest_len: U64::new(self.manifest_len),
+            header_crc32c: U32::new(self.header_crc32c),
+            reserved: self.reserved,
+        };
         let mut out = [0u8; 64];
-        out[0..4].copy_from_slice(&self.magic);
-        out[4..6].copy_from_slice(&self.version_major.to_le_bytes());
-        out[6..8].copy_from_slice(&self.version_minor.to_le_bytes());
-        out[8..12].copy_from_slice(&self.lifecycle_flags.to_le_bytes());
-        out[12..16].copy_from_slice(&self.chunk_count.to_le_bytes());
-        out[16..24].copy_from_slice(&self.chunk_dir_offset.to_le_bytes());
-        out[24..32].copy_from_slice(&self.manifest_offset.to_le_bytes());
-        out[32..40].copy_from_slice(&self.manifest_len.to_le_bytes());
-        out[40..44].copy_from_slice(&self.header_crc32c.to_le_bytes());
-        out[44..64].copy_from_slice(&self.reserved);
+        out.copy_from_slice(wire.as_bytes());
         out
     }
 
     /// Parses and validates a `64 B` [`DnamProjPreamble`] from `bytes[0..64]`.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DnamError> {
-        if bytes.len() < PROJ_PREAMBLE_SIZE {
+        let Ok((wire, _)) = DnamProjPreambleWire::ref_from_prefix(bytes) else {
             return Err(DnamError::BufferTooSmall {
                 expected: PROJ_PREAMBLE_SIZE,
                 actual: bytes.len(),
             });
+        };
+        if wire.magic != DNPJ_MAGIC {
+            return Err(DnamError::InvalidMagic(wire.magic));
         }
-        let magic = [bytes[0], bytes[1], bytes[2], bytes[3]];
-        if magic != DNPJ_MAGIC {
-            return Err(DnamError::InvalidMagic(magic));
-        }
-        let version_major = u16::from_le_bytes([bytes[4], bytes[5]]);
-        let version_minor = u16::from_le_bytes([bytes[6], bytes[7]]);
+        let version_major = wire.version_major.get();
+        let version_minor = wire.version_minor.get();
         if version_major != PROJ_VERSION_MAJOR || version_minor != PROJ_VERSION_MINOR {
             return Err(DnamError::UnsupportedVersion {
                 major: version_major,
                 minor: version_minor,
             });
         }
-        let lifecycle_flags = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let lifecycle_flags = wire.lifecycle_flags.get();
         if (lifecycle_flags & !PROJ_FLAG_KNOWN_MASK) != 0 {
             return Err(DnamError::SchemaValidationError(format!(
                 "unknown .dnam-proj lifecycle_flags {lifecycle_flags:#010x}"
             )));
         }
-        let chunk_count = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+        let chunk_count = wire.chunk_count.get();
         if (chunk_count as usize) > MAX_PROJ_CHUNKS {
             return Err(DnamError::SchemaValidationError(format!(
                 "chunk_count {chunk_count} exceeds MAX_PROJ_CHUNKS ({MAX_PROJ_CHUNKS})"
             )));
         }
-        let chunk_dir_offset = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        let manifest_offset = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
-        let manifest_len = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
-        let header_crc32c = u32::from_le_bytes([bytes[40], bytes[41], bytes[42], bytes[43]]);
-        let mut reserved = [0u8; 20];
-        reserved.copy_from_slice(&bytes[44..64]);
-        if reserved.iter().any(|&b| b != 0) {
+        let chunk_dir_offset = wire.chunk_dir_offset.get();
+        let manifest_offset = wire.manifest_offset.get();
+        let manifest_len = wire.manifest_len.get();
+        let header_crc32c = wire.header_crc32c.get();
+        if wire.reserved.iter().any(|&b| b != 0) {
             return Err(DnamError::SchemaValidationError(
                 "non-zero reserved bytes in DnamProjPreamble[44..64]".to_string(),
             ));
@@ -194,7 +235,7 @@ impl DnamProjPreamble {
             )));
         }
         Ok(Self {
-            magic,
+            magic: wire.magic,
             version_major,
             version_minor,
             lifecycle_flags,
@@ -203,7 +244,7 @@ impl DnamProjPreamble {
             manifest_offset,
             manifest_len,
             header_crc32c,
-            reserved,
+            reserved: wire.reserved,
         })
     }
 
@@ -220,6 +261,33 @@ impl DnamProjPreamble {
             .map_err(|_| DnamError::SchemaValidationError("manifest offset overflow".to_string()))
     }
 }
+
+/// Declarative `64 B` wire entry for Region 1 Chunk Directory.
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct ProjChunkDirEntryWire {
+    /// FourCC chunk tag.
+    pub fourcc: [u8; 4],
+    /// Chunk ID within FourCC (`0` for singletons, `stem_index` for `SPCM`/`STMC`).
+    pub chunk_id: U32,
+    /// Reserved chunk flags (`0`).
+    pub flags: U32,
+    /// Castagnoli `CRC32C` over chunk bytes.
+    pub crc32c: U32,
+    /// `64 B`-aligned file offset in Region 3.
+    pub offset: U64,
+    /// Unpadded payload length in bytes.
+    pub byte_len: U64,
+    /// Content-addressed SHA-256 digest of chunk payload.
+    pub sha256: [u8; 32],
+}
+
+const _: () = assert!(size_of::<ProjChunkDirEntryWire>() == 64);
+const _: () = assert!(align_of::<ProjChunkDirEntryWire>() == 1);
+const _: () = assert!(offset_of!(ProjChunkDirEntryWire, offset) == 16);
+const _: () = assert!(offset_of!(ProjChunkDirEntryWire, sha256) == 32);
 
 /// Single `64 B` entry in Region 1 Chunk Directory of a `.dnam-proj` (`DNPJ`) container.
 #[repr(C, align(64))]
@@ -241,7 +309,7 @@ pub struct ProjChunkDirEntry {
     pub sha256: [u8; 32],
 }
 
-const _: () = assert!(core::mem::size_of::<ProjChunkDirEntry>() == 64);
+const _: () = assert!(size_of::<ProjChunkDirEntry>() == 64);
 
 impl ProjChunkDirEntry {
     /// Returns the typed [`ProjChunkKind`] for this directory entry.
@@ -252,44 +320,46 @@ impl ProjChunkDirEntry {
     /// Serializes this entry into an exact `64 B` little-endian array.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; 64] {
+        let wire = ProjChunkDirEntryWire {
+            fourcc: self.fourcc,
+            chunk_id: U32::new(self.chunk_id),
+            flags: U32::new(self.flags),
+            crc32c: U32::new(self.crc32c),
+            offset: U64::new(self.offset),
+            byte_len: U64::new(self.byte_len),
+            sha256: self.sha256,
+        };
         let mut out = [0u8; 64];
-        out[0..4].copy_from_slice(&self.fourcc);
-        out[4..8].copy_from_slice(&self.chunk_id.to_le_bytes());
-        out[8..12].copy_from_slice(&self.flags.to_le_bytes());
-        out[12..16].copy_from_slice(&self.crc32c.to_le_bytes());
-        out[16..24].copy_from_slice(&self.offset.to_le_bytes());
-        out[24..32].copy_from_slice(&self.byte_len.to_le_bytes());
-        out[32..64].copy_from_slice(&self.sha256);
+        out.copy_from_slice(wire.as_bytes());
         out
     }
 
     /// Parses a `64 B` directory entry and validates FourCC & `64 B` offset alignment.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DnamError> {
-        if bytes.len() < 64 {
+        let Ok((wire, _)) = ProjChunkDirEntryWire::ref_from_prefix(bytes) else {
             return Err(DnamError::BufferTooSmall {
                 expected: 64,
                 actual: bytes.len(),
             });
-        }
-        let fourcc = [bytes[0], bytes[1], bytes[2], bytes[3]];
-        let kind = ProjChunkKind::from_fourcc(fourcc)?;
-        let chunk_id = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+        };
+        let kind = ProjChunkKind::from_fourcc(wire.fourcc)?;
+        let chunk_id = wire.chunk_id.get();
         if kind.is_singleton() && chunk_id != 0 {
             return Err(DnamError::SchemaValidationError(format!(
                 "singleton chunk {:?} must have chunk_id == 0, got {chunk_id}",
                 kind
             )));
         }
-        let flags = u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]);
+        let flags = wire.flags.get();
         if flags != 0 {
             return Err(DnamError::SchemaValidationError(format!(
                 "non-zero reserved directory entry flags {flags:#x} on {:?}",
                 kind
             )));
         }
-        let crc32c = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-        let offset = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-        let byte_len = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        let crc32c = wire.crc32c.get();
+        let offset = wire.offset.get();
+        let byte_len = wire.byte_len.get();
         if (offset & 0x3F) != 0 {
             return Err(DnamError::UnalignedOffset {
                 field: "chunk_dir.offset",
@@ -302,16 +372,14 @@ impl ProjChunkDirEntry {
                 kind
             )));
         }
-        let mut sha256 = [0u8; 32];
-        sha256.copy_from_slice(&bytes[32..64]);
         Ok(Self {
-            fourcc,
+            fourcc: wire.fourcc,
             chunk_id,
             flags,
             crc32c,
             offset,
             byte_len,
-            sha256,
+            sha256: wire.sha256,
         })
     }
 }
@@ -427,6 +495,50 @@ pub fn parse_proj_manifest_range(range_bytes: &[u8]) -> Result<ParsedProjManifes
     })
 }
 
+/// Declarative `128 B` wire layout for a `PROJ_AUTH_RECORD_BYTES` `AUTH` record.
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct ProjAuthRecordWire {
+    /// Magic `"AUTH"`.
+    pub magic: [u8; 4],
+    /// Wire version (`3`).
+    pub version: U16,
+    /// Reserved zeros (`26 B`).
+    pub reserved: [u8; 26],
+    /// Creator `Ed25519` public key (`32 B`).
+    pub signer_pubkey_ed25519: [u8; 32],
+    /// `Ed25519` signature (`64 B`).
+    pub signature_ed25519: [u8; 64],
+}
+
+const _: () = assert!(size_of::<ProjAuthRecordWire>() == PROJ_AUTH_RECORD_BYTES);
+const _: () = assert!(align_of::<ProjAuthRecordWire>() == 1);
+const _: () = assert!(offset_of!(ProjAuthRecordWire, signer_pubkey_ed25519) == 32);
+const _: () = assert!(offset_of!(ProjAuthRecordWire, signature_ed25519) == 64);
+
+/// Declarative `52 B` directory digest entry hashed in `"chunk_directory_v3"`.
+#[repr(C)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned,
+)]
+pub struct ProjAuthChunkDigestWire {
+    /// Chunk FourCC.
+    pub fourcc: [u8; 4],
+    /// Chunk identifier.
+    pub chunk_id: U32,
+    /// Entry flags.
+    pub flags: U32,
+    /// Payload length in bytes.
+    pub byte_len: U64,
+    /// Payload SHA-256 digest.
+    pub sha256: [u8; 32],
+}
+
+const _: () = assert!(size_of::<ProjAuthChunkDigestWire>() == 52);
+const _: () = assert!(align_of::<ProjAuthChunkDigestWire>() == 1);
+
 /// `128 B` `AUTH` creator provenance record (`r[container.proj.auth]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProjAuthRecord {
@@ -440,51 +552,49 @@ impl ProjAuthRecord {
     /// Serializes this `AUTH` record into an exact `128 B` (`2 × 64 B`) little-endian array.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; PROJ_AUTH_RECORD_BYTES] {
+        let wire = ProjAuthRecordWire {
+            magic: *b"AUTH",
+            version: U16::new(PROJ_VERSION_MAJOR),
+            reserved: [0; 26],
+            signer_pubkey_ed25519: self.signer_pubkey_ed25519,
+            signature_ed25519: self.signature_ed25519,
+        };
         let mut out = [0u8; PROJ_AUTH_RECORD_BYTES];
-        out[0..4].copy_from_slice(b"AUTH");
-        out[4..6].copy_from_slice(&2_u16.to_le_bytes());
-        out[32..64].copy_from_slice(&self.signer_pubkey_ed25519);
-        out[64..128].copy_from_slice(&self.signature_ed25519);
+        out.copy_from_slice(wire.as_bytes());
         out
     }
 
     /// Parses a `128 B` `AUTH` chunk.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, DnamError> {
-        if bytes.len() != PROJ_AUTH_RECORD_BYTES {
+        let Ok(wire) = ProjAuthRecordWire::ref_from_bytes(bytes) else {
             return Err(DnamError::BufferTooSmall {
                 expected: PROJ_AUTH_RECORD_BYTES,
                 actual: bytes.len(),
             });
+        };
+        if &wire.magic != b"AUTH" {
+            return Err(DnamError::InvalidMagic(wire.magic));
         }
-        if bytes[0..4] != *b"AUTH" {
-            return Err(DnamError::InvalidMagic([
-                bytes[0], bytes[1], bytes[2], bytes[3],
-            ]));
-        }
-        let ver = u16::from_le_bytes([bytes[4], bytes[5]]);
-        if ver != 2 {
+        let ver = wire.version.get();
+        if ver != PROJ_VERSION_MAJOR {
             return Err(DnamError::UnsupportedVersion {
                 major: ver,
                 minor: 0,
             });
         }
-        if bytes[6..32].iter().any(|&b| b != 0) {
+        if wire.reserved.iter().any(|&b| b != 0) {
             return Err(DnamError::SchemaValidationError(
                 "non-zero reserved bytes in AUTH[6..32]".to_string(),
             ));
         }
-        let mut signer_pubkey_ed25519 = [0u8; 32];
-        signer_pubkey_ed25519.copy_from_slice(&bytes[32..64]);
-        let mut signature_ed25519 = [0u8; 64];
-        signature_ed25519.copy_from_slice(&bytes[64..128]);
         Ok(Self {
-            signer_pubkey_ed25519,
-            signature_ed25519,
+            signer_pubkey_ed25519: wire.signer_pubkey_ed25519,
+            signature_ed25519: wire.signature_ed25519,
         })
     }
 }
 
-/// Builds the domain-separated `"DNPJ-PROJECT-MANIFEST-V2"` signing message binding the
+/// Builds the domain-separated `"DNPJ-PROJECT-MANIFEST-V3"` signing message binding the
 /// immutable JCS manifest SHA-256, creator `Ed25519` public key, and every non-`AUTH` chunk's
 /// `(fourcc, chunk_id, flags, byte_len, sha256)` tuple in Region 1 order.
 pub fn build_proj_auth_signing_message(
@@ -493,17 +603,20 @@ pub fn build_proj_auth_signing_message(
     non_auth_entries: &[ProjChunkDirEntry],
 ) -> Result<Vec<u8>, DnamError> {
     let immutable_sha = manifest.immutable_jcs_sha256()?;
-    let mut chunk_table = Vec::with_capacity(non_auth_entries.len() * 52);
-    chunk_table.extend_from_slice(&(non_auth_entries.len() as u32).to_le_bytes());
+    let mut chunk_table = Vec::with_capacity(4 + non_auth_entries.len() * 52);
+    chunk_table.extend_from_slice(U32::new(non_auth_entries.len() as u32).as_bytes());
     for entry in non_auth_entries {
-        chunk_table.extend_from_slice(&entry.fourcc);
-        chunk_table.extend_from_slice(&entry.chunk_id.to_le_bytes());
-        chunk_table.extend_from_slice(&entry.flags.to_le_bytes());
-        chunk_table.extend_from_slice(&entry.byte_len.to_le_bytes());
-        chunk_table.extend_from_slice(&entry.sha256);
+        let row = ProjAuthChunkDigestWire {
+            fourcc: entry.fourcc,
+            chunk_id: U32::new(entry.chunk_id),
+            flags: U32::new(entry.flags),
+            byte_len: U64::new(entry.byte_len),
+            sha256: entry.sha256,
+        };
+        chunk_table.extend_from_slice(row.as_bytes());
     }
     let mut msg = Vec::new();
-    msg.extend_from_slice(&encode_domain_field("domain", b"DNPJ-PROJECT-MANIFEST-V2"));
+    msg.extend_from_slice(&encode_domain_field("domain", b"DNPJ-PROJECT-MANIFEST-V3"));
     msg.extend_from_slice(&encode_domain_field(
         "signer_pubkey_ed25519",
         signer_pubkey_ed25519,
@@ -512,7 +625,7 @@ pub fn build_proj_auth_signing_message(
         "manifest_immutable_sha256",
         &immutable_sha,
     ));
-    msg.extend_from_slice(&encode_domain_field("chunk_directory_v2", &chunk_table));
+    msg.extend_from_slice(&encode_domain_field("chunk_directory_v3", &chunk_table));
     Ok(msg)
 }
 

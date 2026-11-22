@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use dnam_engine::container::StructuredConditionalBound;
 use dnam_engine::schema::{ControlKind, ControlSchemaDef};
 
 use crate::proj::capsules::StmcTrajectoryWindow;
@@ -10,22 +11,25 @@ use crate::proj::schema::{AuditReport, DnamProjManifest, StemRegistryEntry};
 
 use super::{audit_phase1_clamp_range, audit_phase1_clamp_switch};
 
-fn clamp_range_conditional_corners(
-    ctrl: &mut ControlSchemaDef,
+struct ConditionalCornerAudit<'a> {
     ctrl_idx: usize,
-    switch_ids: &[String],
-    enabled_stems: &[&StemRegistryEntry],
-    enabled_windows_by_stem: &BTreeMap<u32, Vec<StmcTrajectoryWindow>>,
+    switch_ids: &'a [String],
+    enabled_stems: &'a [&'a StemRegistryEntry],
+    enabled_windows_by_stem: &'a BTreeMap<u32, Vec<StmcTrajectoryWindow>>,
     safe_bounds: (f32, f32),
     default_clamped: f32,
+}
+
+fn clamp_range_conditional_corners(
+    ctrl: &mut ControlSchemaDef,
+    ctx: &ConditionalCornerAudit<'_>,
     phase1_tags: &mut BTreeSet<String>,
 ) {
-    let (safe_lo, safe_hi) = safe_bounds;
-    ctrl.conditional_min.clear();
-    ctrl.conditional_max.clear();
-    for sw_id in switch_ids {
+    let (safe_lo, safe_hi) = ctx.safe_bounds;
+    ctrl.conditional_bounds.clear();
+    for sw_id in ctx.switch_ids {
         let mut by_opt: BTreeMap<String, (f32, f32)> = BTreeMap::new();
-        for s in enabled_stems {
+        for s in ctx.enabled_stems {
             let Some(opt_str) = s.controls_meta.get(sw_id).and_then(|v| v.as_str()) else {
                 continue;
             };
@@ -35,9 +39,9 @@ fn clamp_range_conditional_corners(
             {
                 stem_vals.push((v_num as f32).clamp(safe_lo, safe_hi));
             }
-            if let Some(wins) = enabled_windows_by_stem.get(&s.chunk_id) {
+            if let Some(wins) = ctx.enabled_windows_by_stem.get(&s.chunk_id) {
                 for w in wins {
-                    if usize::from(w.control_id) == ctrl_idx
+                    if usize::from(w.control_id) == ctx.ctrl_idx
                         && w.ctrl_kind == 0
                         && w.window_weight > 0.0
                         && w.u_phys.is_finite()
@@ -49,10 +53,9 @@ fn clamp_range_conditional_corners(
             if stem_vals.is_empty() {
                 continue;
             }
-            let key = format!("{sw_id}={opt_str}");
             for vf in stem_vals {
                 by_opt
-                    .entry(key.clone())
+                    .entry(opt_str.to_string())
                     .and_modify(|(lo, hi)| {
                         *lo = lo.min(vf);
                         *hi = hi.max(vf);
@@ -60,16 +63,18 @@ fn clamp_range_conditional_corners(
                     .or_insert((vf, vf));
             }
         }
-        for (cond_key, (c_lo, c_hi)) in by_opt {
-            if (c_hi - c_lo).abs() <= 1.0e-4 && (c_lo - default_clamped).abs() <= 1.0e-4 {
+        for (opt_str, (c_lo, c_hi)) in by_opt {
+            if (c_hi - c_lo).abs() <= 1.0e-4 && (c_lo - ctx.default_clamped).abs() <= 1.0e-4 {
                 continue;
             }
-            if c_lo > safe_lo + 1.0e-4 {
-                ctrl.conditional_min.insert(cond_key.clone(), c_lo);
-                phase1_tags.insert("CLAMP-CORNER".to_string());
-            }
-            if c_hi < safe_hi - 1.0e-4 {
-                ctrl.conditional_max.insert(cond_key, c_hi);
+            let min_opt = (c_lo > safe_lo + 1.0e-4).then_some(f64::from(c_lo));
+            let max_opt = (c_hi < safe_hi - 1.0e-4).then_some(f64::from(c_hi));
+            if min_opt.is_some() || max_opt.is_some() {
+                ctrl.conditional_bounds.push(StructuredConditionalBound {
+                    when: vec![(sw_id.clone(), opt_str)],
+                    min: min_opt,
+                    max: max_opt,
+                });
                 phase1_tags.insert("CLAMP-CORNER".to_string());
             }
         }
@@ -125,16 +130,15 @@ fn audit_range_control(
     ctrl.safe_clamped_range = Some([safe_lo, safe_hi]);
     ctrl.lobatto_degree = Some(deg);
     let default_clamped = default_f32.clamp(safe_lo, safe_hi);
-    clamp_range_conditional_corners(
-        ctrl,
+    let corner_audit = ConditionalCornerAudit {
         ctrl_idx,
         switch_ids,
         enabled_stems,
         enabled_windows_by_stem,
-        (safe_lo, safe_hi),
+        safe_bounds: (safe_lo, safe_hi),
         default_clamped,
-        phase1_tags,
-    );
+    };
+    clamp_range_conditional_corners(ctrl, &corner_audit, phase1_tags);
 
     if clamped {
         phase1_tags.insert("CLAMP-RANGE".to_string());
@@ -423,8 +427,14 @@ mod tests {
         let switch_ctrl = &m.base.controls_schema[1];
         assert_eq!(range_ctrl.safe_clamped_range, Some([2.0, 8.0]));
         assert_eq!(range_ctrl.lobatto_degree, Some(3));
-        assert_eq!(range_ctrl.conditional_max.get("mode=clean"), Some(&3.5));
-        assert_eq!(range_ctrl.conditional_min.get("mode=crunch"), Some(&5.0));
+        assert!(range_ctrl.conditional_bounds.iter().any(|b| {
+            b.when == vec![("mode".to_string(), "clean".to_string())]
+                && b.max.is_some_and(|v| (v - 3.5).abs() < 1.0e-5)
+        }));
+        assert!(range_ctrl.conditional_bounds.iter().any(|b| {
+            b.when == vec![("mode".to_string(), "crunch".to_string())]
+                && b.min.is_some_and(|v| (v - 5.0).abs() < 1.0e-5)
+        }));
         assert_eq!(
             switch_ctrl.active_options.as_deref(),
             Some(
@@ -521,8 +531,7 @@ mod tests {
         let range_ctrl = &m.base.controls_schema[0];
         let switch_ctrl = &m.base.controls_schema[1];
         assert_eq!(range_ctrl.safe_clamped_range, Some([0.0, 10.0]));
-        assert!(range_ctrl.conditional_min.is_empty());
-        assert!(range_ctrl.conditional_max.is_empty());
+        assert!(range_ctrl.conditional_bounds.is_empty());
         assert!(
             switch_ctrl
                 .active_options

@@ -20,7 +20,9 @@ use dnam_engine::Tier;
 use dnam_engine::container::DnamContainerView;
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::{ControlSchemaDef, DnamError, PresetDef};
+use dnam_vm::bin::Arena0LiteWire;
 use std::collections::BTreeMap;
+use zerocopy::FromBytes;
 
 fn fp32_bytes(samples: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples.len() * 4);
@@ -89,11 +91,11 @@ fn test_stat_psd_diagonal_duplicate_json_keys_and_stmc_bijection_guards() {
     // 2. Strict JSON duplicate-key and UTF-8 BOM rejection in validate_and_normalize_json_str
     let base_json = serde_json::to_string(&DnamProjManifest::default_reference().base).unwrap();
     let dup_key_json = format!(
-        r#"{{"version":"2.0.0","version":"2.0.0","container_kind":"dnam-proj","base":{base_json}}}"#
+        r#"{{"version":"3.0.0","version":"3.0.0","container_kind":"dnam-proj","base":{base_json}}}"#
     );
     assert!(DnamProjManifest::validate_and_normalize_json_str(&dup_key_json).is_err());
     let bom_json = format!(
-        "\u{FEFF}{{\"version\":\"2.0.0\",\"container_kind\":\"dnam-proj\",\"base\":{base_json}}}"
+        "\u{FEFF}{{\"version\":\"3.0.0\",\"container_kind\":\"dnam-proj\",\"base\":{base_json}}}"
     );
     assert!(DnamProjManifest::validate_and_normalize_json_str(&bom_json).is_err());
 
@@ -537,10 +539,15 @@ fn test_compacted_star_center_mute_promote_and_all_muted() {
         &crypto,
     )
     .unwrap();
+    let (a0_muted, _) =
+        Arena0LiteWire::ref_from_prefix(wght_muted.arena_storage.as_bytes()).unwrap();
     assert!(
-        wght_muted.arena_storage.as_bytes()[3_520..4_544]
+        a0_muted
+            .control_bus_lite
+            .w_ctrl
             .iter()
-            .all(|&b| b == 0)
+            .flatten()
+            .all(|v| v.get() == 0.0)
     );
 
     // 3. Re-enabling "star_0" promotes it back to active StarCenter and restores STAT; then re-enable "sweep_1"
@@ -615,7 +622,7 @@ fn test_compacted_replace_capture_and_grown_dmu1_export() {
     //    suffix cleanly up to the 4 KB DMU1 ceiling (while rejecting > 4,080 B with HeaderCapacityExceeded)!
     let orig_wght = v_replaced.chunk_slice(ProjChunkKind::Wght, 0).unwrap();
     let orig_layout =
-        dnam_engine::container::validate_v2_dnam_layout_with_max_profile(orig_wght, 1).unwrap();
+        dnam_engine::container::validate_v3_dnam_layout_with_max_profile(orig_wght, 1).unwrap();
     let mut compact_wght = orig_wght[..orig_layout.mutable_extent.0].to_vec();
     let dmu_48 = dnam_engine::container::build_dmu1_mutable_frame(b"{}", 48).unwrap();
     dnam_engine::container::append_dmue_mutable_suffix(&mut compact_wght, &dmu_48);

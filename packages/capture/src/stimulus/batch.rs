@@ -10,15 +10,17 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use dnam_engine::schema::{ControlCalibrationRole, ControlKind, DnamError};
+use dnam_engine::schema::{ControlKind, DnamError};
 
 use crate::proj::bundle::{
-    ProjChunkInput, build_dnam_proj_container_with_cp1_and_compacted, export_runtime_dnam,
+    ProjChunkInput, build_dnam_proj_container_with_dnam_bin, export_runtime_dnam,
 };
 use crate::proj::capsules::CalbChunk64B;
 use crate::proj::directory::{ProjChunkKind, StmcTrajectoryWindow};
 use crate::proj::schema::DnamProjManifest;
-use crate::proj::vault::{initialize_backbone_arena_if_needed, solve_captures_batch_with_progress};
+use crate::proj::vault::{
+    initialize_backbone_dnam_bin_if_needed, solve_captures_batch_with_progress,
+};
 use crate::solver::{SolverOptions, TrainerProgressHandle, TrainingPhase, TrainingStatus};
 use crate::targets::{StemResponse, StemStimulus, StemStimulusBatch};
 
@@ -27,8 +29,8 @@ use super::safeguards::{CaptureWarning, SafeguardState, evaluate_frame_safeguard
 pub use super::sealing::recapture_clipped_stem;
 pub(crate) use super::sealing::{
     CORESET_A5_FRAMES_48K, CORESET_WITH_SETTLE_48K, align_full_stem_and_seal_vault_with_override,
-    build_controls_meta_map, build_freeze_transition_stem_stimulus, control_declared_bounds,
-    default_control_vector, normalize_stem_channel_to_48k, resample_48k_channels_to_sr,
+    build_controls_meta_map, control_declared_bounds, default_control_vector,
+    normalize_stem_channel_to_48k, resample_48k_channels_to_sr,
     seal_coresets_to_inpc_and_vault_with_override,
 };
 use super::waveforms::{
@@ -78,7 +80,7 @@ pub struct BatchSolveReport {
 }
 
 /// Mode 2 (Pass 1): Synthesizes a deterministic [`StemStimulusBatch`] (`StarCenter` + 1D sweeps/stops
-/// + discrete `Switch` options + timed `FreezeLatch` transitions) for offline/parallel runners.
+/// + discrete `Switch` options + explicit freeze-transition windows) for offline/parallel runners.
 pub fn generate_stimulus_batch(
     manifest: &DnamProjManifest,
     options: &BatchStimulusOptions,
@@ -211,32 +213,10 @@ pub fn generate_stimulus_batch(
     }];
 
     for (p_idx, ctrl) in manifest.base.controls_schema.iter().enumerate() {
-        let is_freeze_latch = ctrl
-            .calibration
-            .as_ref()
-            .is_some_and(|c| c.role == ControlCalibrationRole::FreezeLatch);
-        if is_freeze_latch {
-            stems.push(build_freeze_transition_stem_stimulus(
-                manifest,
-                p_idx,
-                sr,
-                options.topology_mode,
-                &seed_256,
-            ));
-        }
-
         match ctrl.kind {
             ControlKind::Range => {
                 let (lo, hi) = control_declared_bounds(ctrl);
-                let force_mode_b = options.prefer_mode_b
-                    || ctrl.calibration.as_ref().is_some_and(|c| {
-                        matches!(
-                            c.role,
-                            ControlCalibrationRole::DelayTimeMs
-                                | ControlCalibrationRole::GrainSizeMs
-                                | ControlCalibrationRole::LfoRateHz
-                        )
-                    });
+                let force_mode_b = options.prefer_mode_b;
                 if force_mode_b {
                     let span = (hi - lo).max(1e-6);
                     let mid_u = 0.5 * (lo + hi);
@@ -357,7 +337,7 @@ pub fn generate_refinement_stimulus_batch(
     coreset_l_48k.resize(CORESET_WITH_SETTLE_48K, 0.0);
 
     let default_ctrls = default_control_vector(manifest);
-    let mut oc2_ctrls: Option<Vec<f32>> = None;
+    let mut sub_harmonic_ctrls: Option<Vec<f32>> = None;
     let mut gate_ctrls: Option<Vec<f32>> = None;
     let mut clip_backoff: Option<(Vec<f32>, f64)> = None;
 
@@ -407,8 +387,8 @@ pub fn generate_refinement_stimulus_batch(
         } else {
             stim.control_values.clone()
         };
-        if sg.oc2_glissando_handoff && oc2_ctrls.is_none() {
-            oc2_ctrls = Some(ctrls.clone());
+        if sg.sub_harmonic_glissando_handoff && sub_harmonic_ctrls.is_none() {
+            sub_harmonic_ctrls = Some(ctrls.clone());
         }
         if out_rms < 1.0e-3 && gate_ctrls.is_none() {
             gate_ctrls = Some(ctrls.clone());
@@ -419,7 +399,7 @@ pub fn generate_refinement_stimulus_batch(
     }
 
     let mut ref_stems = Vec::new();
-    if let Some(ctrls) = oc2_ctrls {
+    if let Some(ctrls) = sub_harmonic_ctrls {
         let mut wave_48k = coreset_l_48k.clone();
         wave_48k.extend_from_slice(&synthesize_a3_monophonic_glissando(
             48_000,
@@ -427,7 +407,7 @@ pub fn generate_refinement_stimulus_batch(
         ));
         let (in_1, _, _) = resample_48k_channels_to_sr(sr, &wave_48k, None, None);
         ref_stems.push(StemStimulus {
-            stem_id: "refinement_oc2_glissando".to_string(),
+            stem_id: "refinement_sub_harmonic_glissando".to_string(),
             sample_rate_hz: sr,
             in_1,
             in_2: None,
@@ -510,14 +490,15 @@ fn infer_batch_stem_windows_and_switches(
             "freeze_transition_window".to_string(),
             serde_json::json!([n0, n1]),
         );
-        let freeze_p = manifest
-            .base
-            .controls_schema
-            .iter()
-            .position(|c| {
-                c.calibration
-                    .as_ref()
-                    .is_some_and(|cal| cal.role == ControlCalibrationRole::FreezeLatch)
+        let freeze_p = stim
+            .control_trajectories
+            .as_ref()
+            .and_then(|trajs| {
+                trajs.iter().position(|tr| {
+                    let first = tr.first().copied().unwrap_or(0.0);
+                    let last = tr.last().copied().unwrap_or(0.0);
+                    (last - first).abs() > 1.0e-3
+                })
             })
             .unwrap_or(0);
         let is_sw = manifest
@@ -692,14 +673,9 @@ pub fn solve_from_responses_with_progress(
             payload: c.to_bytes().to_vec(),
         });
     }
-    let seeded_arena = initialize_backbone_arena_if_needed(None);
-    let mut proj_bytes = build_dnam_proj_container_with_cp1_and_compacted(
-        &mut manifest,
-        &init_chunks,
-        &seeded_arena,
-        &[],
-        false,
-    )?;
+    let seeded_dbin = initialize_backbone_dnam_bin_if_needed(None)?;
+    let mut proj_bytes =
+        build_dnam_proj_container_with_dnam_bin(&mut manifest, &init_chunks, &seeded_dbin)?;
 
     let seed_256 = deterministic_seed_256(0xACE5_2026_BA7C);
     let empty_mask = BTreeSet::new();

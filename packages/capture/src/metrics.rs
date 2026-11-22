@@ -23,13 +23,13 @@ pub const MAX_TIER_LOUDNESS_STEP_LU: f64 = 0.05;
 /// DNAM enforces zero subjective carve-outs per `ref[qual.tiers.benchmark-matrix]`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ArchetypeFamily {
-    /// Clean / edge-of-breakup pedals & preamps (`Chain-01`, `Chain-03`, `Chain-05`, `Chain-09`).
+    /// Clean / edge-of-breakup pedals & preamps.
     CleanPedalPreamp,
-    /// Crunch / high-gain tube amps & bi-amp bass rigs (`Chain-04`, `Chain-06`, `Chain-11`).
+    /// Crunch / high-gain tube amps & bi-amp bass rigs.
     CrunchHighGainAmp,
-    /// Full rigs with modulation, BBD/tape delay, FDN shimmer, or stereo routing (`Chain-07`, `Chain-08`, `Chain-12`).
+    /// Full rigs with modulation, BBD/tape delay, FDN shimmer, or stereo routing.
     FullRigModDelayReverb,
-    /// Gated fuzz, analog octave dividers, and ring modulators (`Chain-02`, `Chain-10`).
+    /// Gated fuzz, analog octave dividers, and ring modulators.
     FuzzOctaveChaos,
 }
 
@@ -645,7 +645,21 @@ mod tests {
         assert_eq!(ch_reps.len(), 2);
         assert!(worst_2ch < -60.0);
 
-        // TierQualityThresholds + ArchetypeFamily helpers + NaN energy fail-closed guard
+        // TierQualityThresholds strict cross-tier monotonicity + ArchetypeFamily + NaN guard
+        let ths = [
+            TierQualityThresholds::for_tier(Tier::Lite),
+            TierQualityThresholds::for_tier(Tier::Full),
+            TierQualityThresholds::for_tier(Tier::Pro),
+            TierQualityThresholds::for_tier(Tier::Ultra),
+        ];
+        for pair in ths.windows(2) {
+            assert!(pair[1].composite_besr_db < pair[0].composite_besr_db);
+            assert!(pair[1].unseen_control_besr_db < pair[0].unseen_control_besr_db);
+            assert!(pair[1].max_ltas_db < pair[0].max_ltas_db);
+            for b in 0..3 {
+                assert!(pair[1].per_band_besr_db[b] < pair[0].per_band_besr_db[b]);
+            }
+        }
         for tier in [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra] {
             let (comp_db, unseen_db) = ArchetypeFamily::CrunchHighGainAmp.besr_thresholds_db(tier);
             let ltas_th = ArchetypeFamily::ltas_threshold_db(tier);

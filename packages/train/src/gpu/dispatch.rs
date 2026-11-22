@@ -140,6 +140,10 @@ pub(crate) fn submit_and_readback(
     encoder: wgpu::CommandEncoder,
     staging: Vec<(wgpu::Buffer, usize)>,
 ) -> Result<Vec<Vec<u8>>, TrainError> {
+    static GPU_SUBMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _gpu_guard = GPU_SUBMIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     queue.submit([encoder.finish()]);
     let _ = device.poll(wgpu::PollType::wait_indefinitely());
 

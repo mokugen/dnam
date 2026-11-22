@@ -15,6 +15,9 @@ use super::super::pass2_opt::{
     eval_op_t_quad_stereo_and_adjoint,
 };
 
+/// Shared conjugate Kautz pair capacity per tier `[Lite, Full, Pro, Ultra]`.
+pub(super) const TIER_KAUTZ_CAPS: [usize; 4] = [8, 12, 24, 32];
+
 /// True-stereo column-major post-warmup feature matrices and target vectors for Pass-3 VarPro.
 pub(super) struct StereoFeatureSet {
     pub dims: [usize; 4],
@@ -28,12 +31,35 @@ pub(super) struct StereoFeatureSet {
     pub feats_r_post: Vec<f32>,
     pub tgts_l_post: Vec<f32>,
     pub tgts_r_post: Vec<f32>,
+    /// Post-warmup targets with tier-specific `Lite/Full/Pro` Kautz counts `[8, 12, 24]` subtracted.
+    pub tier_tgts_l_prefix: [Vec<f32>; 3],
+    pub tier_tgts_r_prefix: [Vec<f32>; 3],
     pub lite_1x_l_post: Option<Vec<f32>>,
     pub lite_1x_r_post: Option<Vec<f32>>,
     pub lite_1x_tgts_l_post: Option<Vec<f32>>,
     pub lite_1x_tgts_r_post: Option<Vec<f32>>,
     pub lite_1x_raw_l: Vec<f64>,
     pub lite_1x_raw_r: Vec<f64>,
+}
+
+impl StereoFeatureSet {
+    #[inline]
+    pub(super) fn tier_tgts_l(&self, ti: usize) -> &[f32] {
+        if ti < 3 {
+            &self.tier_tgts_l_prefix[ti]
+        } else {
+            &self.tgts_l_post
+        }
+    }
+
+    #[inline]
+    pub(super) fn tier_tgts_r(&self, ti: usize) -> &[f32] {
+        if ti < 3 {
+            &self.tier_tgts_r_prefix[ti]
+        } else {
+            &self.tgts_r_post
+        }
+    }
 }
 
 /// Evaluates the scalar 1-pole high-pass branch `u[t] - lp(u; pole)[t]`.
@@ -113,50 +139,161 @@ pub(super) fn apply_op_t_stereo(
     (out_l, out_r)
 }
 
-fn subtract_modal_contributions(
+fn subtract_modal_contributions_per_tier(
     model: &SonaModelF64,
-    ux_l: &[f64],
-    ux_r: &[f64],
+    pre_conv_l: &[f64],
+    pre_conv_r: &[f64],
     target_l: &[f64],
     target_r: &[f64],
-    pc_gain: [f64; 2],
-) -> (Vec<f64>, Vec<f64>) {
-    let n = ux_l
+) -> ([Vec<f64>; 4], [Vec<f64>; 4]) {
+    let n = pre_conv_l
         .len()
-        .min(ux_r.len())
+        .min(pre_conv_r.len())
         .min(target_l.len())
         .min(target_r.len());
-    let mut adj_l = target_l[..n].to_vec();
-    let mut adj_r = target_r[..n].to_vec();
     let active_k = model.active_kautz_pairs.min(model.kautz.len());
-    if active_k > 0 {
-        let mut on_l = vec![0.0_f64; n];
-        let mut on_r = vec![0.0_f64; n];
-        for t in 16..n {
-            on_l[t] = pc_gain[0] * ux_l[t - 16];
-            on_r[t] = pc_gain[1] * ux_r[t - 16];
-        }
-        let (kl, _) = eval_kautz_modal_channel_and_adjoint(
-            &on_l,
-            &model.kautz[..active_k],
-            false,
-            None,
-            None,
+    if active_k == 0 {
+        let base_l = target_l[..n].to_vec();
+        let base_r = target_r[..n].to_vec();
+        return (
+            core::array::from_fn(|_| base_l.clone()),
+            core::array::from_fn(|_| base_r.clone()),
         );
-        let (kr, _) =
-            eval_kautz_modal_channel_and_adjoint(&on_r, &model.kautz[..active_k], true, None, None);
-        let (kl_eff, kr_eff) = apply_op_t_stereo(model, &kl, &kr);
-        for t in 0..n {
-            adj_l[t] -= kl_eff[t];
-            adj_r[t] -= kr_eff[t];
+    }
+
+    let mut on_l = vec![0.0_f64; n];
+    let mut on_r = vec![0.0_f64; n];
+    if n > 16 {
+        on_l[16..n].copy_from_slice(&pre_conv_l[..(n - 16)]);
+        on_r[16..n].copy_from_slice(&pre_conv_r[..(n - 16)]);
+    }
+
+    let mut raw_l = [
+        vec![0.0_f64; n],
+        vec![0.0_f64; n],
+        vec![0.0_f64; n],
+        vec![0.0_f64; n],
+    ];
+    let mut raw_r = [
+        vec![0.0_f64; n],
+        vec![0.0_f64; n],
+        vec![0.0_f64; n],
+        vec![0.0_f64; n],
+    ];
+    let mut prev_cap = 0_usize;
+    for ti in 0..4 {
+        let cur_cap = active_k.min(TIER_KAUTZ_CAPS[ti]);
+        if ti > 0 {
+            let (lo_l, hi_l) = raw_l.split_at_mut(ti);
+            hi_l[0].copy_from_slice(&lo_l[ti - 1]);
+            let (lo_r, hi_r) = raw_r.split_at_mut(ti);
+            hi_r[0].copy_from_slice(&lo_r[ti - 1]);
+        }
+        if cur_cap > prev_cap {
+            let (dl, _) = eval_kautz_modal_channel_and_adjoint(
+                &on_l,
+                &model.kautz[prev_cap..cur_cap],
+                false,
+                None,
+                None,
+            );
+            let (dr, _) = eval_kautz_modal_channel_and_adjoint(
+                &on_r,
+                &model.kautz[prev_cap..cur_cap],
+                true,
+                None,
+                None,
+            );
+            for t in 0..n {
+                raw_l[ti][t] += dl[t];
+                raw_r[ti][t] += dr[t];
+            }
+            prev_cap = cur_cap;
+        }
+    }
+
+    let mut adj_l: [Vec<f64>; 4] = core::array::from_fn(|_| target_l[..n].to_vec());
+    let mut adj_r: [Vec<f64>; 4] = core::array::from_fn(|_| target_r[..n].to_vec());
+    let caps = TIER_KAUTZ_CAPS.map(|c| active_k.min(c));
+    let mut last_eff: Option<(Vec<f64>, Vec<f64>)> = None;
+    for ti in 0..4 {
+        if ti == 0 || caps[ti] != caps[ti - 1] {
+            last_eff = Some(apply_op_t_stereo(model, &raw_l[ti], &raw_r[ti]));
+        }
+        if let Some((ref eff_l, ref eff_r)) = last_eff {
+            for t in 0..n {
+                adj_l[ti][t] -= eff_l[t];
+                adj_r[ti][t] -= eff_r[t];
+            }
         }
     }
     (adj_l, adj_r)
 }
 
+pub(super) fn build_pre_conv_bus(
+    model: &SonaModelF64,
+    u_l: &[f64],
+    u_r: &[f64],
+    cascade_feats: &[[f32; 4]],
+    active_quads: usize,
+    rho_core: f64,
+    is_2x: bool,
+) -> (Vec<f64>, Vec<f64>) {
+    let n_sub = u_l.len().min(u_r.len());
+    let (pc_l, pc_r) = (model.pre_conv_u_gain[0], model.pre_conv_u_gain[1]);
+    let (hp_gain_l, hp_gain_r) = (model.pre_conv_hp_gain[0], model.pre_conv_hp_gain[1]);
+    let ro_core = if model.ro_pole_48k > 0.0 && model.ro_pole_48k.is_finite() {
+        model.ro_pole_48k.powf(rho_core).clamp(0.0, 0.999_995)
+    } else {
+        0.0
+    };
+    let hp_l = eval_highpass_pole(&u_l[..n_sub], ro_core);
+    let hp_r = eval_highpass_pole(&u_r[..n_sub], ro_core);
+    let mut pre_l = vec![0.0_f64; n_sub];
+    let mut pre_r = vec![0.0_f64; n_sub];
+    let active_lanes = (active_quads * 4).min(40);
+    for t in 0..n_sub {
+        let mut bus_l = pc_l * u_l[t] + hp_gain_l * hp_l[t];
+        let mut bus_r = pc_r * u_r[t] + hp_gain_r * hp_r[t];
+        for l in 0..active_lanes {
+            let r = &model.w_ro[l];
+            if r[0] == 0.0
+                && r[1] == 0.0
+                && r[2] == 0.0
+                && r[3] == 0.0
+                && r[4] == 0.0
+                && r[5] == 0.0
+            {
+                continue;
+            }
+            let q = l / 4;
+            let k = l % 4;
+            let fbase = (q * n_sub + t) * 6;
+            let v_eff_l = f64::from(cascade_feats[fbase][k]);
+            let v_eff_r = f64::from(cascade_feats[fbase + 1][k]);
+            let odd_l = f64::from(cascade_feats[fbase + 2][k]);
+            let odd_r = f64::from(cascade_feats[fbase + 3][k]);
+            let even_l = f64::from(cascade_feats[fbase + 4][k]);
+            let even_r = f64::from(cascade_feats[fbase + 5][k]);
+            bus_l += r[0] * odd_l + r[2] * even_l + r[4] * v_eff_l;
+            bus_r += r[1] * odd_r + r[3] * even_r + r[5] * v_eff_r;
+        }
+        pre_l[t] = bus_l;
+        pre_r[t] = bus_r;
+    }
+    if is_2x {
+        (
+            downsample_lane_2x_f64(&pre_l, model.os_dec_c_prev1, model.os_dec_c0),
+            downsample_lane_2x_f64(&pre_r, model.os_dec_c_prev1, model.os_dec_c0),
+        )
+    } else {
+        (pre_l, pre_r)
+    }
+}
+
 struct ExtractMatrixSpec<'a> {
     ux_base: &'a [f64],
-    pc_chan: f64,
+    pre_conv_chan: &'a [f64],
     cascade_feats: &'a [[f32; 4]],
     cascade_frames: usize,
     is_2x: bool,
@@ -236,9 +373,7 @@ fn extract_channel_tier_matrix(model: &SonaModelF64, spec: &ExtractMatrixSpec<'_
         }
         for k in fir_range {
             let mut tap_col = vec![0.0_f64; n];
-            for t in k..n {
-                tap_col[t] = spec.pc_chan * spec.ux_base[t - k];
-            }
+            tap_col[k..n].copy_from_slice(&spec.pre_conv_chan[..(n - k)]);
             write_col(col, &tap_col);
             col += 1;
         }
@@ -279,7 +414,16 @@ pub(super) fn build_pass3_feature_sets(
             1.0
         }
     };
-    let pc_gain = if active_taps > 0 || model.active_kautz_pairs > 0 {
+    let any_w_ro_pre = model
+        .w_ro
+        .iter()
+        .any(|r| r[0..6].iter().any(|&v| v.abs() >= 1.0e-6));
+    let pc_gain = if any_w_ro_pre {
+        [
+            snap_pc_fp16(model.pre_conv_u_gain[0]),
+            snap_pc_fp16(model.pre_conv_u_gain[1]),
+        ]
+    } else if active_taps > 0 || model.active_kautz_pairs > 0 {
         [
             default_pc(model.pre_conv_u_gain[0]),
             default_pc(model.pre_conv_u_gain[1]),
@@ -323,13 +467,22 @@ pub(super) fn build_pass3_feature_sets(
 
     if model.oversample_upper_tiers_2x {
         let cas_1x = run_causal_core_cascade_stereo(runner, model, &ux_l, &ux_r, 4, rho_1x, false)?;
+        let (pre_1x_l, pre_1x_r) = build_pre_conv_bus(
+            model,
+            &ux_l,
+            &ux_r,
+            &cas_1x.feature_outputs,
+            4,
+            rho_1x,
+            false,
+        );
         let (adj_1x_l, adj_1x_r) =
-            subtract_modal_contributions(model, &ux_l, &ux_r, target_l, target_r, pc_gain);
+            subtract_modal_contributions_per_tier(model, &pre_1x_l, &pre_1x_r, target_l, target_r);
         let lite_1x_l_post = Some(extract_channel_tier_matrix(
             model,
             &ExtractMatrixSpec {
                 ux_base: &ux_l,
-                pc_chan: pc_gain[0],
+                pre_conv_chan: &pre_1x_l,
                 cascade_feats: &cas_1x.feature_outputs,
                 cascade_frames: n,
                 is_2x: false,
@@ -344,7 +497,7 @@ pub(super) fn build_pass3_feature_sets(
             model,
             &ExtractMatrixSpec {
                 ux_base: &ux_r,
-                pc_chan: pc_gain[1],
+                pre_conv_chan: &pre_1x_r,
                 cascade_feats: &cas_1x.feature_outputs,
                 cascade_frames: n,
                 is_2x: false,
@@ -359,17 +512,26 @@ pub(super) fn build_pass3_feature_sets(
         let (up_l, up_r) = upsample_stereo_2x_f64(&ux_l, &ux_r, model.os_up_quad_coeff);
         let dec_ux_l = downsample_lane_2x_f64(&up_l, model.os_dec_c_prev1, model.os_dec_c0);
         let dec_ux_r = downsample_lane_2x_f64(&up_r, model.os_dec_c_prev1, model.os_dec_c0);
-        let (adj_tgt_l, adj_tgt_r) =
-            subtract_modal_contributions(model, &dec_ux_l, &dec_ux_r, target_l, target_r, pc_gain);
-
         let rho_2x = 0.5 * rho_1x;
         let cas_2x =
             run_causal_core_cascade_stereo(runner, model, &up_l, &up_r, 10, rho_2x, false)?;
+        let (pre_2x_l, pre_2x_r) = build_pre_conv_bus(
+            model,
+            &up_l,
+            &up_r,
+            &cas_2x.feature_outputs,
+            10,
+            rho_2x,
+            true,
+        );
+        let (adj_tgt_l, adj_tgt_r) =
+            subtract_modal_contributions_per_tier(model, &pre_2x_l, &pre_2x_r, target_l, target_r);
+
         let feats_l_post = extract_channel_tier_matrix(
             model,
             &ExtractMatrixSpec {
                 ux_base: &dec_ux_l,
-                pc_chan: pc_gain[0],
+                pre_conv_chan: &pre_2x_l,
                 cascade_feats: &cas_2x.feature_outputs,
                 cascade_frames: 2 * n,
                 is_2x: true,
@@ -384,7 +546,7 @@ pub(super) fn build_pass3_feature_sets(
             model,
             &ExtractMatrixSpec {
                 ux_base: &dec_ux_r,
-                pc_chan: pc_gain[1],
+                pre_conv_chan: &pre_2x_r,
                 cascade_feats: &cas_2x.feature_outputs,
                 cascade_frames: 2 * n,
                 is_2x: true,
@@ -405,24 +567,36 @@ pub(super) fn build_pass3_feature_sets(
             raw_r_2x: Some(up_r),
             feats_l_post,
             feats_r_post,
-            tgts_l_post: tgts_post_fn(&adj_tgt_l),
-            tgts_r_post: tgts_post_fn(&adj_tgt_r),
+            tgts_l_post: tgts_post_fn(&adj_tgt_l[3]),
+            tgts_r_post: tgts_post_fn(&adj_tgt_r[3]),
+            tier_tgts_l_prefix: [
+                tgts_post_fn(&adj_1x_l[0]),
+                tgts_post_fn(&adj_tgt_l[1]),
+                tgts_post_fn(&adj_tgt_l[2]),
+            ],
+            tier_tgts_r_prefix: [
+                tgts_post_fn(&adj_1x_r[0]),
+                tgts_post_fn(&adj_tgt_r[1]),
+                tgts_post_fn(&adj_tgt_r[2]),
+            ],
             lite_1x_l_post,
             lite_1x_r_post,
-            lite_1x_tgts_l_post: Some(tgts_post_fn(&adj_1x_l)),
-            lite_1x_tgts_r_post: Some(tgts_post_fn(&adj_1x_r)),
+            lite_1x_tgts_l_post: Some(tgts_post_fn(&adj_1x_l[0])),
+            lite_1x_tgts_r_post: Some(tgts_post_fn(&adj_1x_r[0])),
             lite_1x_raw_l: ux_l,
             lite_1x_raw_r: ux_r,
         })
     } else {
-        let (adj_tgt_l, adj_tgt_r) =
-            subtract_modal_contributions(model, &ux_l, &ux_r, target_l, target_r, pc_gain);
         let cas = run_causal_core_cascade_stereo(runner, model, &ux_l, &ux_r, 10, rho_1x, false)?;
+        let (pre_l, pre_r) =
+            build_pre_conv_bus(model, &ux_l, &ux_r, &cas.feature_outputs, 10, rho_1x, false);
+        let (adj_tgt_l, adj_tgt_r) =
+            subtract_modal_contributions_per_tier(model, &pre_l, &pre_r, target_l, target_r);
         let feats_l_post = extract_channel_tier_matrix(
             model,
             &ExtractMatrixSpec {
                 ux_base: &ux_l,
-                pc_chan: pc_gain[0],
+                pre_conv_chan: &pre_l,
                 cascade_feats: &cas.feature_outputs,
                 cascade_frames: n,
                 is_2x: false,
@@ -437,7 +611,7 @@ pub(super) fn build_pass3_feature_sets(
             model,
             &ExtractMatrixSpec {
                 ux_base: &ux_r,
-                pc_chan: pc_gain[1],
+                pre_conv_chan: &pre_r,
                 cascade_feats: &cas.feature_outputs,
                 cascade_frames: n,
                 is_2x: false,
@@ -458,8 +632,18 @@ pub(super) fn build_pass3_feature_sets(
             raw_r_2x: None,
             feats_l_post,
             feats_r_post,
-            tgts_l_post: tgts_post_fn(&adj_tgt_l),
-            tgts_r_post: tgts_post_fn(&adj_tgt_r),
+            tgts_l_post: tgts_post_fn(&adj_tgt_l[3]),
+            tgts_r_post: tgts_post_fn(&adj_tgt_r[3]),
+            tier_tgts_l_prefix: [
+                tgts_post_fn(&adj_tgt_l[0]),
+                tgts_post_fn(&adj_tgt_l[1]),
+                tgts_post_fn(&adj_tgt_l[2]),
+            ],
+            tier_tgts_r_prefix: [
+                tgts_post_fn(&adj_tgt_r[0]),
+                tgts_post_fn(&adj_tgt_r[1]),
+                tgts_post_fn(&adj_tgt_r[2]),
+            ],
             lite_1x_l_post: None,
             lite_1x_r_post: None,
             lite_1x_tgts_l_post: None,
@@ -485,6 +669,9 @@ pub(super) fn unpack_weights_into_prefix(
         direct_s2_hp_gain: [weights_l[1].clamp(-8.0, 8.0), weights_r[1].clamp(-8.0, 8.0)],
         ..TierReadoutPrefixF64::default()
     };
+    for l in 0..40 {
+        pfx.w_ro[l][0..6].copy_from_slice(&base_model.w_ro[l][0..6]);
+    }
     for (k, kz) in base_model.kautz.iter().enumerate() {
         pfx.kautz_b_gamma[k] = kz.b_gamma;
         pfx.kautz_c_re_l[k] = kz.c_re_l;

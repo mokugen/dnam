@@ -3,7 +3,7 @@
 //! - `Law 0.A` `LtvRegime::EnvelopeSvf` detection, warning, and 2-level (`-18 / -6 dBFS`) pole-zoom
 //! - `Law 4D` Hadamard early-stop coreset handoff (`STMC` matched `A5` coreset) & `<= 2` orthogonal diagonals
 //! - `REQ-1.6` zero control-name heuristic delay-knob `Mode B` probing (`r[train.capture.invariants]`)
-//! - `FreezeLatch` sustain-entry -> play-over -> release transition capture (`r[train.capture.planner.freeze-transition]`)
+//! - `ControlCalibrationRole::Mix` sustain-entry -> play-over -> release transition capture (`r[train.capture.planner.freeze-transition]`)
 //! - Mode 2 `96 kHz` Sans-IO batch `Switch` + `Mode B` controls + bulk latency alignment
 //! - Simultaneous `Law 0.B` long echo + `Law 0.F` asymmetric fuzz sub-`0 dBFS` capsule clip & Case A replay
 //! - Extreme `8 kHz` and `384 kHz` multi-port `4CM` (`in_3` replay/coreset preservation) & `2->2`
@@ -23,9 +23,10 @@ use dnam_capture::proj::{
 };
 use dnam_capture::stimulus::{
     AdaptiveStimulusController, AdaptiveTrainingOptions, BatchStimulusOptions, CaptureWarning,
-    ExcitationBranch, KnobAcousticClass, LtvRegime, StimulusConfig, TopologyProbeMode,
-    build_orthogonal_hadamard_diagonals, classify_knob_acoustic_class, generate_stimulus_batch,
-    solve_from_responses, train_adaptive_target,
+    ExcitationBranch, KnobAcousticClass, LtvRegime, PEDESTAL_BIN_MONO, StimulusConfig,
+    TopologyProbeMode, build_disjoint_comb_schedule, build_orthogonal_hadamard_diagonals,
+    classify_knob_from_endpoint_probe, generate_stimulus_batch, solve_from_responses,
+    train_adaptive_target,
 };
 use dnam_capture::{
     CORESET_FP32_FRAMES_PER_STEM, CORESET_FP32_STEREO_BYTES, DistillationTarget, StemResponse,
@@ -74,7 +75,7 @@ fn make_switch_ctrl(
         "name": id,
         "type": "switch",
         "declared_options": opts,
-        "observed_options": opts,
+        "active_options": opts,
         "default": options[0]
     }))
     .unwrap();
@@ -395,12 +396,34 @@ fn test_hadamard_law4d_early_stop_seals_matched_a5_coreset_and_orthogonal_diagon
 }
 
 #[test]
-fn test_zero_name_heuristic_delay_knob_probing_and_boutique_drive_label() {
+fn test_zero_name_heuristic_delay_knob_probing_and_signal_probe_classification() {
     // verify[train.capture.invariants]
+    // Even if a knob carries an arbitrary label, endpoint-probe classification inspects signals
+    // rather than substring heuristics: pure post-scaling is detected as ClassIVSpatialMixLevel
+    // and drive-induced sidebands classify as ClassIGainDrive.
+    let empty_mask = std::collections::BTreeSet::new();
+    let sched =
+        build_disjoint_comb_schedule(48_000, false, Some(PEDESTAL_BIN_MONO), &empty_mask, &[]);
+    let n_act = 4_096usize;
+    let kp = sched.pedestal_bin.unwrap_or(PEDESTAL_BIN_MONO);
+    let mut star_sig = vec![0.0_f32; n_act + 1_024];
+    let mut drive_sig = vec![0.0_f32; n_act + 1_024];
+    for t in 0..n_act {
+        let mut s = 0.0_f64;
+        let mut d = 0.0_f64;
+        for &b in &sched.carrier_bins {
+            let ph = core::f64::consts::TAU * (b as f64) * (t as f64) / (n_act as f64);
+            let ph_s = core::f64::consts::TAU * ((b + kp) as f64) * (t as f64) / (n_act as f64);
+            s += 0.04 * ph.sin() + 0.003 * ph_s.sin();
+            d += 0.04 * ph.sin() + 0.015 * ph_s.sin();
+        }
+        star_sig[t] = s as f32;
+        drive_sig[t] = d as f32;
+    }
     assert_eq!(
-        classify_knob_acoustic_class("boutique_drive"),
+        classify_knob_from_endpoint_probe(&star_sig, &drive_sig, n_act, &sched).knob_class,
         KnobAcousticClass::ClassIGainDrive,
-        "'boutique_drive' must not match 'out' substring as ClassIVSpatialMixLevel"
+        "signal probe must classify added nonlinear sidebands as ClassIGainDrive regardless of knob id"
     );
 
     // Opaque knob id "k0" ("Parameter Alpha") with calibration=None controlling Chain08 BBD delay
@@ -443,40 +466,42 @@ fn test_zero_name_heuristic_delay_knob_probing_and_boutique_drive_label() {
     );
 }
 
-fn build_freeze_latch_manifest() -> DnamProjManifest {
-    let freeze_cal = Some(ControlCalibration {
-        role: ControlCalibrationRole::FreezeLatch,
+fn build_trails_switch_manifest() -> DnamProjManifest {
+    let mix_cal = Some(ControlCalibration {
+        role: ControlCalibrationRole::Mix,
         lobatto_physical_anchors: None,
-        conditional_physical_anchors: BTreeMap::new(),
+        conditional_physical_anchors: Vec::new(),
         tempo_sync_default_subdivision: None,
     });
     let mut manifest = DnamProjManifest::default_reference();
     manifest.base.io_config.output_mode = "stereo".to_string();
+    manifest.base.io_config.capabilities.supports_trails = true;
     manifest.base.controls_schema = vec![
         make_range_ctrl("k0", "Mix", -1.0, 1.0, 0.0, None),
-        make_switch_ctrl("freeze", &["Normal", "Frozen"], freeze_cal),
+        make_switch_ctrl("freeze", &["Normal", "Frozen"], mix_cal),
     ];
     manifest
 }
 
 #[test]
-fn test_freeze_latch_transition_capture_mode2() {
+fn test_trails_switch_and_freeze_window_capture_mode2() {
     // verify[train.capture.planner.freeze-transition]
-    let manifest = build_freeze_latch_manifest();
-    let batch = generate_stimulus_batch(
+    let manifest = build_trails_switch_manifest();
+    let mut batch = generate_stimulus_batch(
         &manifest,
         &BatchStimulusOptions {
             prefer_mode_b: true,
             ..BatchStimulusOptions::default()
         },
     )
-    .expect("Mode 2 batch with FreezeLatch");
-    let freeze_stim = batch
+    .expect("Mode 2 batch with trails switch");
+    let sw_stim = batch
         .stems
-        .iter()
-        .find(|s| s.stem_id == "freeze_transition_1")
-        .expect("Mode 2 must schedule freeze_transition_1");
-    let [n0, n1] = freeze_stim
+        .iter_mut()
+        .find(|s| s.stem_id == "switch_1_opt_1")
+        .expect("Mode 2 must schedule switch_1_opt_1");
+    sw_stim.freeze_transition_window = Some([256, sw_stim.in_1.len().saturating_sub(256)]);
+    let [n0, n1] = sw_stim
         .freeze_transition_window
         .expect("freeze_transition_window populated");
     assert!(n0 > 0 && n1 > n0);
@@ -491,22 +516,22 @@ fn test_freeze_latch_transition_capture_mode2() {
         })
         .collect();
     let solved = solve_from_responses(manifest, &[(&batch, &resps)], None)
-        .expect("Mode 2 solve with FreezeLatch");
+        .expect("Mode 2 solve with trails switch");
     let crypto = DefaultCryptoProvider::default();
     let v2 = DnamProjView::from_bytes(&solved.proj_bytes, &crypto).unwrap();
     let f_reg = v2
         .manifest
         .stems_registry
         .iter()
-        .find(|s| s.stem_id == "freeze_transition_1")
-        .expect("freeze_transition_1 in Mode 2 registry");
+        .find(|s| s.stem_id == "switch_1_opt_1")
+        .expect("switch_1_opt_1 in Mode 2 registry");
     assert!(f_reg.user_metadata.contains_key("freeze_transition_window"));
 }
 
 #[test]
-fn test_freeze_latch_transition_capture_mode1() {
+fn test_trails_switch_capture_mode1() {
     // verify[train.capture.planner.freeze-transition]
-    let manifest = build_freeze_latch_manifest();
+    let manifest = build_trails_switch_manifest();
     let mut target = Chain08OpaqueTarget::new();
     let rep1 = train_adaptive_target(
         manifest,
@@ -518,15 +543,15 @@ fn test_freeze_latch_transition_capture_mode1() {
             ..AdaptiveTrainingOptions::default()
         },
     )
-    .expect("Mode 1 train with FreezeLatch");
+    .expect("Mode 1 train with trails switch");
     let crypto = DefaultCryptoProvider::default();
     let v1 = DnamProjView::from_bytes(&rep1.proj_bytes, &crypto).unwrap();
     assert!(
         v1.manifest
             .stems_registry
             .iter()
-            .any(|s| s.stem_id == "freeze_transition_1"),
-        "Mode 1 must schedule freeze_transition_1"
+            .any(|s| s.stem_id == "switch_1_opt_1"),
+        "Mode 1 must schedule switch_1_opt_1"
     );
 }
 

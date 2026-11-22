@@ -4,20 +4,21 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use dnam_engine::container::extract_dnam_bin;
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::DnamError;
 
 use crate::audit::manifest::recompute_vault_phase1_audit_and_clamps;
 use crate::proj::DnamProjView;
 use crate::proj::PROJ_FLAG_COMPACTED_CAPSULES;
-use crate::proj::bundle::{VaultChunkInput, build_dnam_proj_container_from_vault};
+use crate::proj::bundle::{VaultChunkInput, build_dnam_proj_container_from_vault_dbin};
 use crate::proj::capsules::verify_proj_stmc_capsule;
 use crate::proj::directory::{ProjChunkKind, StmcTrajectoryWindow};
 use crate::proj::schema::{DnamProjManifest, StemRegistryEntry};
 use crate::solver::{SolverOptions, TrainerProgressHandle};
 
 use super::{
-    VaultCaptureSpec, VaultState, find_stem_pos, initialize_backbone_arena_if_needed,
+    VaultCaptureSpec, VaultState, find_stem_pos, initialize_backbone_dnam_bin_if_needed,
     parse_validated_stmc_windows, promote_first_enabled_star, rebuild_vault_container,
     rebuild_vault_container_with_progress,
 };
@@ -32,7 +33,8 @@ fn extract_vault_state(proj_bytes: &[u8]) -> Result<VaultState, DnamError> {
     let mut stmc_by_id = BTreeMap::new();
     let mut stmc_digests = BTreeMap::new();
     let mut stat = None;
-    let wght_arena = wght_pair_opt.map(|(_, rv)| rv.arena_storage.as_bytes().to_vec());
+    let wght_dnam_bin = wght_pair_opt
+        .and_then(|(wght_bytes, _)| extract_dnam_bin(wght_bytes).ok().map(|c| c.to_owned()));
 
     for (entry, &slice) in view.directory.iter().zip(&view.chunk_slices) {
         let dig = Some((entry.crc32c, entry.sha256));
@@ -59,7 +61,7 @@ fn extract_vault_state(proj_bytes: &[u8]) -> Result<VaultState, DnamError> {
         stmc_by_id,
         stmc_digests,
         stat,
-        wght_arena,
+        wght_dnam_bin,
         compacted,
     })
 }
@@ -325,12 +327,11 @@ pub fn remove_capture_with_options(
                 cached_digest: c_dig,
             });
         }
-        let arena_28k = initialize_backbone_arena_if_needed(None);
-        return build_dnam_proj_container_from_vault(
+        let dnam_bin = initialize_backbone_dnam_bin_if_needed(None)?;
+        return build_dnam_proj_container_from_vault_dbin(
             &mut state.manifest,
             chunks,
-            &arena_28k,
-            &[],
+            &dnam_bin,
             false,
         );
     }
