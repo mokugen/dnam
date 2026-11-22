@@ -261,9 +261,20 @@ pub(super) fn build_pass3_feature_sets(
         .min(target_l.len())
         .min(target_r.len());
     let active_taps = model.active_fir_taps.min(NUM_FIR_TAPS_ULTRA);
+    let snap_pc_fp16 = |v: f64| -> f64 {
+        let clamped = if v.is_finite() {
+            v.clamp(-8.0, 8.0)
+        } else {
+            0.0
+        };
+        let s = f64::from(dnam_kernels::fp16_to_f32(dnam_kernels::f32_to_fp16(
+            clamped as f32,
+        )));
+        if s == 0.0 { 0.0 } else { s }
+    };
     let default_pc = |v: f64| -> f64 {
         if v.is_finite() && v.abs() >= 1.0e-6 {
-            v.clamp(-8.0, 8.0)
+            snap_pc_fp16(v)
         } else {
             1.0
         }
@@ -277,6 +288,10 @@ pub(super) fn build_pass3_feature_sets(
         [0.0, 0.0]
     };
     model.pre_conv_u_gain = pc_gain;
+    model.pre_conv_hp_gain = [
+        snap_pc_fp16(model.pre_conv_hp_gain[0]),
+        snap_pc_fp16(model.pre_conv_hp_gain[1]),
+    ];
 
     let (ux_l, _, _) = eval_op_n_pre_and_adjoint(
         &in_l[..n],

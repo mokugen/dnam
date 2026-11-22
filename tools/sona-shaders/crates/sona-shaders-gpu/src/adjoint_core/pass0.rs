@@ -7,18 +7,20 @@
 
 use super::common::{eval_adaa_local_and_seam_pullback, recompute_tile_forward_lane};
 use super::pullback::{
-    build_tpt_adjoint_elem, eval_duhem_and_tone_pullback, eval_frame_duhem_terms_lr,
-    eval_sag_and_stereo_pullback,
+    build_tpt_adjoint_elem, build_tpt_phs_adjoint_elem, eval_duhem_and_tone_pullback,
+    eval_frame_duhem_terms_lr, eval_sag_and_stereo_pullback, phs_k_eff_loc_bar,
 };
 use crate::abi::{
     ADJOINT_SCAN_SCRATCH_FLOATS, ADJOINT_U_TONE2_VEC2S, ADJOINT_V_TRAJ2_VEC2S, AdjointScanUniforms,
     TILE_FRAMES,
 };
 use crate::core_math::{
-    CORE_INPUT_VEC4_STRIDE, MIN_SAG_GAIN, QUAD_PARAMS_VEC4_STRIDE, QuadLaneParams,
-    QuadParamsUnpacked, TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, eval_tone_scalar,
-    eval_tpt_svf_scalar, flush_zero, get_lane, linear_adjoint_reverse_suffix_256_lr, load_vec4,
-    step_duhem_stereo_scalar, store_vec4, sub_sat_usize, tpt_adjoint_reverse_suffix_256,
+    CORE_INPUT_VEC4_STRIDE, MIN_SAG_GAIN, PhsFrameTerms, QUAD_PARAMS_VEC4_STRIDE, QuadLaneParams,
+    QuadParamsUnpacked, TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_ADJ_LANE_VEC4_STRIDE,
+    TILE_CKPT_VEC4_STRIDE, eval_tone_scalar, eval_tpt_svf_phs_frame, eval_tpt_svf_scalar,
+    flush_zero, get_lane, linear_adjoint_reverse_suffix_256_lr, load_vec4,
+    step_duhem_stereo_scalar, step_tpt_svf_phs_scalar, store_vec4, sub_sat_usize,
+    tpt_adjoint_reverse_suffix_256,
 };
 use dnam_kernels::LinearScanElem;
 use spirv_std::glam::{Vec2, Vec4};
@@ -34,6 +36,7 @@ fn compute_next_tile_first_r(
     next_tile: usize,
     c: usize,
     lp: &QuadLaneParams,
+    is_phs: bool,
 ) -> (f32, f32) {
     let next_frame = next_tile * TILE_FRAMES;
     if next_frame >= num_frames {
@@ -51,9 +54,22 @@ fn compute_next_tile_first_r(
     let u_l = flush_zero(get_lane(load_vec4(core_inputs, in_base), c));
     let u_r = flush_zero(get_lane(load_vec4(core_inputs, in_base + 1), c));
 
-    let svf_c = lp.to_svf_coeffs();
-    let (lp_l, bp_l, hp_l, ap_l) = eval_tpt_svf_scalar(u_l, s1_l, s2_l, &svf_c);
-    let (lp_r, bp_r, hp_r, ap_r) = eval_tpt_svf_scalar(u_r, s1_r, s2_r, &svf_c);
+    let ((lp_l, bp_l, hp_l, ap_l), (lp_r, bp_r, hp_r, ap_r)) = if is_phs {
+        let mut s1_l_tmp = s1_l;
+        let mut s2_l_tmp = s2_l;
+        let mut s1_r_tmp = s1_r;
+        let mut s2_r_tmp = s2_r;
+        (
+            step_tpt_svf_phs_scalar(u_l, &mut s1_l_tmp, &mut s2_l_tmp, lp),
+            step_tpt_svf_phs_scalar(u_r, &mut s1_r_tmp, &mut s2_r_tmp, lp),
+        )
+    } else {
+        let svf_c = lp.to_svf_coeffs();
+        (
+            eval_tpt_svf_scalar(u_l, s1_l, s2_l, &svf_c),
+            eval_tpt_svf_scalar(u_r, s1_r, s2_r, &svf_c),
+        )
+    };
     let tone_l = eval_tone_scalar(lp_l, bp_l, hp_l, ap_l, u_l, lp);
     let tone_r = eval_tone_scalar(lp_r, bp_r, hp_r, ap_r, u_r, lp);
 
@@ -105,6 +121,7 @@ pub fn run_pass0(
     };
     let is_active = i < valid_len;
     let tiny_eps = uniforms.tiny_crossing_eps;
+    let is_phs = uniforms.block_idx == 0;
 
     let params = QuadParamsUnpacked::load(quad_params, q_global * QUAD_PARAMS_VEC4_STRIDE);
 
@@ -125,6 +142,7 @@ pub fn run_pass0(
             i,
             c,
             &lp,
+            is_phs,
         );
         let r_first_l = fwd.r_curr_l;
         let r_first_r = fwd.r_curr_r;
@@ -139,6 +157,7 @@ pub fn run_pass0(
                 tile + 1,
                 c,
                 &lp,
+                is_phs,
             )
         } else {
             (0.0, 0.0)
@@ -163,10 +182,20 @@ pub fn run_pass0(
         );
         let sag = eval_sag_and_stereo_pullback(&fwd, &nonlin, &lp, is_active);
 
-        let svf_c = lp.to_svf_coeffs();
         let sp = s_prev2[i];
-        let taps_l = eval_tpt_svf_scalar(fwd.u_l, sp.x, sp.y, &svf_c);
-        let taps_r = eval_tpt_svf_scalar(fwd.u_r, sp.z, sp.w, &svf_c);
+        let (phs_l, phs_r, taps_l, taps_r) = if is_phs {
+            let fl = eval_tpt_svf_phs_frame(fwd.u_l, sp.x, sp.y, &lp);
+            let fr = eval_tpt_svf_phs_frame(fwd.u_r, sp.z, sp.w, &lp);
+            (fl, fr, fl.taps, fr.taps)
+        } else {
+            let svf_c = lp.to_svf_coeffs();
+            (
+                PhsFrameTerms::zero(),
+                PhsFrameTerms::zero(),
+                eval_tpt_svf_scalar(fwd.u_l, sp.x, sp.y, &svf_c),
+                eval_tpt_svf_scalar(fwd.u_r, sp.z, sp.w, &svf_c),
+            )
+        };
         let (tl, tr) = eval_frame_duhem_terms_lr(v_traj2, &fwd, taps_l.1, taps_r.1, i, &lp);
 
         let lru_elem_l = if is_active {
@@ -199,14 +228,70 @@ pub fn run_pass0(
             0.0
         };
 
+        let (ke_l, two_ke_l, ke_r, two_ke_r) = if is_phs {
+            (
+                phs_l.k_eff,
+                phs_l.k_eff + phs_l.k_eff,
+                phs_r.k_eff,
+                phs_r.k_eff + phs_r.k_eff,
+            )
+        } else {
+            (lp.k, lp.two_k, lp.k, lp.two_k)
+        };
         let dt = eval_duhem_and_tone_pullback(
-            &fwd, &sag, &tl, &tr, lam_l, lam_r, taps_l, taps_r, &lp, is_active,
+            &fwd, &sag, &tl, &tr, lam_l, lam_r, taps_l, taps_r, ke_l, two_ke_l, ke_r, two_ke_r,
+            &lp, is_active,
         );
 
-        let tpt_elem_l =
-            build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_l, dt.adj_v2_l, is_active);
-        let tpt_elem_r =
-            build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_r, dt.adj_v2_r, is_active);
+        let (tpt_elem_l, tpt_elem_r) = if is_phs {
+            let k_loc_l = phs_k_eff_loc_bar(
+                phs_l.a2,
+                phs_l.a3,
+                taps_l.1,
+                dt.adj_hp_l,
+                dt.adj_ap_l,
+                dt.adj_v1_l,
+                dt.adj_v2_l,
+            );
+            let k_loc_r = phs_k_eff_loc_bar(
+                phs_r.a2,
+                phs_r.a3,
+                taps_r.1,
+                dt.adj_hp_r,
+                dt.adj_ap_r,
+                dt.adj_v1_r,
+                dt.adj_v2_r,
+            );
+            (
+                build_tpt_phs_adjoint_elem(
+                    phs_l.a1,
+                    phs_l.a2,
+                    phs_l.a3,
+                    taps_l.1,
+                    phs_l.gamma,
+                    dt.adj_v1_l,
+                    dt.adj_v2_l,
+                    k_loc_l,
+                    is_active,
+                ),
+                build_tpt_phs_adjoint_elem(
+                    phs_r.a1,
+                    phs_r.a2,
+                    phs_r.a3,
+                    taps_r.1,
+                    phs_r.gamma,
+                    dt.adj_v1_r,
+                    dt.adj_v2_r,
+                    k_loc_r,
+                    is_active,
+                ),
+            )
+        } else {
+            (
+                build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_l, dt.adj_v2_l, is_active),
+                build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_r, dt.adj_v2_r, is_active),
+            )
+        };
 
         let mut psi0_l = 0.0_f32;
         let mut psi1_l = 0.0_f32;
@@ -231,7 +316,8 @@ pub fn run_pass0(
         );
 
         if i == 0 && tile < num_tiles {
-            let slot = (q_global * num_tiles + tile) * TILE_ADJ_BOUNDARY_VEC4_STRIDE + c * 4;
+            let slot = (q_global * num_tiles + tile) * TILE_ADJ_BOUNDARY_VEC4_STRIDE
+                + c * TILE_ADJ_LANE_VEC4_STRIDE;
             store_vec4(
                 tile_adj_boundaries,
                 slot,
@@ -251,6 +337,11 @@ pub fn run_pass0(
                 tile_adj_boundaries,
                 slot + 3,
                 Vec4::new(r_first_l, r_first_r, 0.0, 0.0),
+            );
+            store_vec4(
+                tile_adj_boundaries,
+                slot + 4,
+                Vec4::new(sum_tpt_r.t00, sum_tpt_r.t01, sum_tpt_r.t10, sum_tpt_r.t11),
             );
         }
     }

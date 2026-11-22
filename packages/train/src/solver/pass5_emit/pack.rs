@@ -1,475 +1,36 @@
 //! `zerocopy 0.8` `Arena0..3`, `PrefixOverride*`, `SonaCrossbarBlockWire`, and
 //! `.dnam-bin` serialization for Pass 5 (`ref[container.dnam.vm-binary]`).
 
-use core::mem::{align_of, size_of};
+mod blocks;
+mod readouts;
 
-use dnam_kernels::{
-    MAX_PARALRU_DUHEM_GAMMA_F32, MAX_PARALRU_R_F32, MIN_TPT_G, TANK_MAX_G_LIN_F32, f32_to_fp16,
-    fp16_to_f32, pack_wf_mix_and_rect_sign_fp16,
-};
-use dnam_vm::DnamBinBuildInput;
+pub(super) use blocks::sanitize_clamp_f32;
+
+use dnam_kernels::MAX_PARALRU_R_F32;
 use dnam_vm::bin::{
     Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire,
-    ConvolverFir16Wire, ConvolverFir32Wire, ConvolverFir48Wire, CoreQuadWire,
-    DNBN_FLAG_SINGLE_INPUT, DNBN_FLAG_STEREO_OUT, KautzSoaBlockWire, LinearReadoutFullWire,
-    LinearReadoutLiteWire, LinearReadoutProWire, LinearReadoutUltraWire, PIPE_CANONICAL_V3_SONA,
-    SONA_CELL_MAGIC, SONA_META_CONVOLVER_PREFIX_OVERRIDES, SONA_META_OS_EXT_PRESENT,
-    SONA_META_OS2X, SONA_META_SENSORY_QUAD, SONA_META_TIER_OS_EXPLICIT, SONA_META_TRANSPORT_LFO,
-    SONA_META_TRANSPORT_TAP_GAINS, SonaCrossbarBlockWire, SonaInterBlockTilePairWire,
-    TRANSPORT_FLAG_EXT_F32, TransportQuadWire, encode_dnam_bin,
+    ConvolverFir16Wire, ConvolverFir32Wire, ConvolverFir48Wire, DNBN_FLAG_SINGLE_INPUT,
+    DNBN_FLAG_STEREO_OUT, PIPE_CANONICAL_V3_SONA, SONA_CELL_MAGIC,
+    SONA_META_CONVOLVER_PREFIX_OVERRIDES, SONA_META_OS_EXT_PRESENT, SONA_META_OS2X,
+    SONA_META_SENSORY_QUAD, SONA_META_TIER_OS_EXPLICIT, SONA_META_TRANSPORT_LFO,
+    SONA_META_TRANSPORT_TAP_GAINS, TRANSPORT_FLAG_EXT_F32, encode_dnam_bin,
 };
 use dnam_vm::math::TANK_DC_BLOCKER_48K_F32;
+use dnam_vm::{DnamBinBuildInput, SONA_CORE_QUAD_BLOCK_AND_LOCAL};
 use sha2::{Digest, Sha256};
 use zerocopy::byteorder::little_endian::{F32, U16, U32};
-use zerocopy::{FromBytes, FromZeros, Immutable, IntoBytes, KnownLayout, Unaligned};
+use zerocopy::{FromZeros, IntoBytes};
 
-use crate::control::stability::{MAX_RO_POLE_48K_F32, enforce_arena0_stability_invariants};
+use crate::control::stability::{MAX_RO_POLE_48K_F32, enforce_arena_block0_k_nl_and_clamp};
 use crate::error::TrainError;
 
-use super::super::model::{
-    CoreQuadF64, InterBlockTileF64, KautzPairF64, SonaModelF64, TierReadoutPrefixF64,
-    TransportQuadF64,
-};
+use super::super::model::{SonaModelF64, TransportQuadF64};
 use super::Pass5EmitConfig;
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
-struct PrefixOverrideFullEncodeWire {
-    fir_l: [F32; 16],
-    fir_r: [F32; 16],
-    c_re_l: [F32; 4],
-    c_im_l: [F32; 4],
-    c_re_r: [F32; 4],
-    c_im_r: [F32; 4],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
-struct PrefixOverrideProEncodeWire {
-    fir_l: [F32; 32],
-    fir_r: [F32; 32],
-    c_re_l: [F32; 8],
-    c_im_l: [F32; 8],
-    c_re_r: [F32; 8],
-    c_im_r: [F32; 8],
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, KnownLayout, Immutable, Unaligned)]
-struct PrefixOverrideUltraEncodeWire {
-    fir_l: [F32; 48],
-    fir_r: [F32; 48],
-    c_re_l: [F32; 12],
-    c_im_l: [F32; 12],
-    c_re_r: [F32; 12],
-    c_im_r: [F32; 12],
-}
-
-const _: () = assert!(size_of::<PrefixOverrideFullEncodeWire>() == 192);
-const _: () = assert!(align_of::<PrefixOverrideFullEncodeWire>() == 1);
-const _: () = assert!(size_of::<PrefixOverrideProEncodeWire>() == 384);
-const _: () = assert!(align_of::<PrefixOverrideProEncodeWire>() == 1);
-const _: () = assert!(size_of::<PrefixOverrideUltraEncodeWire>() == 576);
-const _: () = assert!(align_of::<PrefixOverrideUltraEncodeWire>() == 1);
-
-const LITE_OPT_TO_LR_OFFSET: usize = 24;
-const STAGE_LATENT_OP_P_TO_CORE_OFFSET: usize = 8 + 5 * 8 + 2 * (4 * 4);
-const _: () = assert!(STAGE_LATENT_OP_P_TO_CORE_OFFSET == 80);
-
-#[inline]
-pub(super) fn sanitize_clamp_f32(v: f64, lo: f32, hi: f32, fallback: f32) -> f32 {
-    if v.is_finite() {
-        (v as f32).clamp(lo, hi)
-    } else {
-        fallback
-    }
-}
-
-#[inline]
-fn fp16_clamped(v: f64, lo: f32, hi: f32, fallback: f32) -> U16 {
-    U16::new(f32_to_fp16(sanitize_clamp_f32(v, lo, hi, fallback)))
-}
-
-fn pack_core_quad_wire(q: &CoreQuadF64) -> CoreQuadWire {
-    let mut w = CoreQuadWire::new_zeroed();
-    for l in 0..4 {
-        w.svf_g[l] = F32::new(sanitize_clamp_f32(q.svf_g[l], MIN_TPT_G, 64.0, 0.125));
-        w.lru_alpha_rel[l] = F32::new(sanitize_clamp_f32(
-            q.lru_alpha_rel[l],
-            0.0,
-            MAX_PARALRU_R_F32,
-            0.995,
-        ));
-        w.lru_alpha_atk[l] = F32::new(sanitize_clamp_f32(q.lru_alpha_atk[l], 0.0, 1.0, 0.25));
-        w.svf_k_fp16[l] = fp16_clamped(q.svf_k[l], 0.0, 8.0, core::f32::consts::FRAC_1_SQRT_2);
-        w.lru_kappa_fp16[l] = fp16_clamped(q.lru_kappa[l], 0.0, 1.0, 0.0);
-        w.adaa_drive_fp16[l] = fp16_clamped(q.adaa_drive[l], -32.0, 32.0, 0.0);
-        w.lru_bias_drive_fp16[l] = fp16_clamped(q.lru_bias_drive[l], -16.0, 16.0, 0.0);
-        w.tone_lp_fp16[l] = fp16_clamped(q.tone_lp[l], -16.0, 16.0, 0.0);
-        w.tone_bp_fp16[l] = fp16_clamped(q.tone_bp[l], -16.0, 16.0, 0.0);
-        w.tone_hp_fp16[l] = fp16_clamped(q.tone_hp[l], -16.0, 16.0, 0.0);
-        w.tone_ap_fp16[l] = fp16_clamped(q.tone_ap[l], -16.0, 16.0, 0.0);
-        w.tone_dir_fp16[l] = fp16_clamped(q.tone_dir[l], -16.0, 16.0, 0.0);
-        w.sag_depth_fp16[l] = fp16_clamped(q.sag_depth[l], -8.0, 8.0, 0.0);
-        let wf = sanitize_clamp_f32(q.wavefolder_mix[l], 0.0, 1.0, 0.0);
-        let rs = if q.rect_sign[l].is_finite() && q.rect_sign[l] < 0.0 {
-            -1.0
-        } else {
-            1.0
-        };
-        w.wavefolder_mix_fp16[l] = U16::new(pack_wf_mix_and_rect_sign_fp16(wf, rs));
-        w.in_mid_weight_fp16[l] = fp16_clamped(q.in_mid_weight[l], -16.0, 16.0, 1.0);
-        w.in_side_weight_fp16[l] = fp16_clamped(q.in_side_weight[l], -16.0, 16.0, 1.0);
-        w.lru_stereo_link_fp16[l] = fp16_clamped(q.lru_stereo_link[l], 0.0, 1.0, 0.0);
-        w.lru_duhem_gamma_fp16[l] =
-            fp16_clamped(q.lru_duhem_gamma[l], 0.0, MAX_PARALRU_DUHEM_GAMMA_F32, 0.0);
-        w.lru_signed_mix_fp16[l] = fp16_clamped(q.lru_signed_mix[l], 0.0, 1.0, 0.0);
-        w.glu_mix_fp16[l] = fp16_clamped(q.glu_mix[l], -4.0, 4.0, 0.0);
-    }
-    w
-}
-
-fn pack_tile_wire(t: &InterBlockTileF64) -> SonaInterBlockTilePairWire {
-    let mut w = SonaInterBlockTilePairWire::new_zeroed();
-    for s in 0..4 {
-        for d in 0..4 {
-            w.w_odd_4x4[s][d] = F32::new(sanitize_clamp_f32(t.w_odd_4x4[s][d], -8.0, 8.0, 0.0));
-            w.w_even_4x4_fp16[s][d] = fp16_clamped(t.w_even_4x4[s][d], -8.0, 8.0, 0.0);
-            w.w_lru_4x4_fp16[s][d] = fp16_clamped(t.w_lru_4x4[s][d], -8.0, 8.0, 0.0);
-        }
-    }
-    w
-}
-
-fn pack_kautz_block(
-    pairs: &[KautzPairF64],
-    override_src: Option<&TierReadoutPrefixF64>,
-    base_pair_idx: usize,
-) -> KautzSoaBlockWire {
-    let mut b = KautzSoaBlockWire::new_zeroed();
-    for (i, p) in pairs.iter().take(4).enumerate() {
-        let r = sanitize_clamp_f32(p.r_low, 0.0, 0.9995, 0.0);
-        let dr = sanitize_clamp_f32(p.dr, 0.0, (0.9995 - r).max(0.0), 0.0);
-        let pair_idx = base_pair_idx + i;
-        let (bg, cl, cil, cr, cir) = if let Some(ov) = override_src {
-            (
-                ov.kautz_b_gamma[pair_idx],
-                ov.kautz_c_re_l[pair_idx],
-                ov.kautz_c_im_l[pair_idx],
-                ov.kautz_c_re_r[pair_idx],
-                ov.kautz_c_im_r[pair_idx],
-            )
-        } else {
-            (p.b_gamma, p.c_re_l, p.c_im_l, p.c_re_r, p.c_im_r)
-        };
-        b.r_low[i] = F32::new(r);
-        b.dr[i] = F32::new(dr);
-        b.theta[i] = F32::new(sanitize_clamp_f32(
-            p.theta,
-            0.0,
-            core::f32::consts::PI - 1.0e-4,
-            0.0,
-        ));
-        b.b_gamma[i] = F32::new(sanitize_clamp_f32(bg, 0.0, 8.0, 0.0));
-        b.c_re_l[i] = F32::new(sanitize_clamp_f32(cl, -8.0, 8.0, 0.0));
-        b.c_im_l[i] = F32::new(sanitize_clamp_f32(cil, -8.0, 8.0, 0.0));
-        b.c_re_r[i] = F32::new(sanitize_clamp_f32(cr, -8.0, 8.0, 0.0));
-        b.c_im_r[i] = F32::new(sanitize_clamp_f32(cir, -8.0, 8.0, 0.0));
-    }
-    b
-}
-
-fn pack_transport_quad_wire(t: &TransportQuadF64) -> TransportQuadWire {
-    let mut w = TransportQuadWire::new_zeroed();
-    let mut need_ext_f32 = t.ext_f32;
-    for i in 0..4 {
-        let d = sanitize_clamp_f32(t.delay_samples[i], 5.0, 48_000.0, 16.0);
-        if d > 120.0 {
-            need_ext_f32 = true;
-        }
-        w.delay_samples[i] = F32::new(d);
-        w.ramp_spans_samples[i] = F32::new(sanitize_clamp_f32(
-            t.ramp_spans_samples[i],
-            0.0,
-            48_000.0,
-            0.0,
-        ));
-        w.lfo_depths_fp16[i] = fp16_clamped(t.lfo_depths[i], 0.0, 512.0, 0.0);
-        w.input_gains_fp16[i] = fp16_clamped(t.input_gains[i], -2.0, 2.0, 0.0);
-        w.wet_tap_l_fp16[i] = fp16_clamped(t.wet_tap_l[i], -2.0, 2.0, 0.0);
-        w.wet_tap_r_fp16[i] = fp16_clamped(t.wet_tap_r[i], -2.0, 2.0, 0.0);
-        w.allpass_g_fp16[i] = fp16_clamped(t.allpass_g[i], -0.75, 0.75, 0.0);
-    }
-    w.allpass_delays = if t.schroeder_enable {
-        t.allpass_delays
-    } else {
-        [0; 4]
-    };
-    w.g_loop = F32::new(sanitize_clamp_f32(t.g_loop, 0.0, TANK_MAX_G_LIN_F32, 0.0));
-    w.r_dc = F32::new(TANK_DC_BLOCKER_48K_F32);
-    w.damp_pole = F32::new(sanitize_clamp_f32(t.damp_pole, 0.0, 0.9995, 0.0));
-    w.lfo_rate_hz = F32::new(sanitize_clamp_f32(t.lfo_rate_hz, 0.0, 16.0, 0.0));
-    w.ramp_rate_hz = F32::new(sanitize_clamp_f32(t.ramp_rate_hz, -16.0, 16.0, 0.0));
-    w.fb_psi_fp16 = fp16_clamped(t.fb_psi, -core::f32::consts::PI, core::f32::consts::PI, 0.0);
-    w.sigma_knee_fp16 = fp16_clamped(t.sigma_knee, 1.0e-3, 0.984_375, 0.984_375);
-    w.freeze_mix_fp16 = fp16_clamped(t.freeze_mix, 0.0, 1.0, 0.0);
-    w.window_depth_fp16 = fp16_clamped(t.window_depth, 0.0, 1.0, 0.0);
-    w.flags = if need_ext_f32 {
-        TRANSPORT_FLAG_EXT_F32
-    } else {
-        0
-    };
-    w
-}
-
-fn pack_crossbar_block_wire(model: &SonaModelF64) -> SonaCrossbarBlockWire {
-    let mut blk = SonaCrossbarBlockWire::new_zeroed();
-    for q in 0..10 {
-        for l in 0..4 {
-            blk.op_p_to_core_fp16[q][l] = fp16_clamped(model.op_p_to_core[q][l], -8.0, 8.0, 0.0);
-            blk.phasor_to_core_fp16[q][l] =
-                fp16_clamped(model.phasor_to_core[q][l], -8.0, 8.0, 0.0);
-        }
-    }
-    for s in 0..16 {
-        blk.opt_to_lr_fp16[s][0] = fp16_clamped(model.opt_to_lr[s][0], -4.0, 4.0, 0.0);
-        blk.opt_to_lr_fp16[s][1] = fp16_clamped(model.opt_to_lr[s][1], -4.0, 4.0, 0.0);
-    }
-    for k in 0..4 {
-        blk.phasor_stereo_phase_fp16[k] = fp16_clamped(
-            model.phasor_stereo_phase[k],
-            -core::f32::consts::PI,
-            core::f32::consts::PI,
-            0.0,
-        );
-    }
-    blk
-}
-
-fn write_w_ro_fp16(w_ro: &[[f64; 12]], dst: &mut [U16], lanes: usize) {
-    for l in 0..lanes {
-        let base = l * 12;
-        for col in 0..12 {
-            dst[base + col] = fp16_clamped(w_ro[l][col], -64.0, 64.0, 0.0);
-        }
-    }
-}
-
-fn write_scalar_ro_gains_fp16(
-    pre_u: [f64; 2],
-    pre_hp: [f64; 2],
-    dir_u: [f64; 2],
-    dir_hp: [f64; 2],
-    dst: &mut [U16],
-) {
-    let gains = [
-        pre_u[0], pre_u[1], pre_hp[0], pre_hp[1], dir_u[0], dir_u[1], dir_hp[0], dir_hp[1],
-    ];
-    for (i, &g) in gains.iter().enumerate() {
-        dst[i] = fp16_clamped(g, -64.0, 64.0, 0.0);
-    }
-}
-
-fn pack_kautz_b_and_c(
-    src: Option<&TierReadoutPrefixF64>,
-    model: &SonaModelF64,
-    pair_idx: usize,
-) -> (f64, f64, f64, f64, f64) {
-    if let Some(p) = src {
-        (
-            p.kautz_b_gamma[pair_idx],
-            p.kautz_c_re_l[pair_idx],
-            p.kautz_c_im_l[pair_idx],
-            p.kautz_c_re_r[pair_idx],
-            p.kautz_c_im_r[pair_idx],
-        )
-    } else {
-        let kp = &model.kautz[pair_idx];
-        (kp.b_gamma, kp.c_re_l, kp.c_im_l, kp.c_re_r, kp.c_im_r)
-    }
-}
-
-fn pack_tier_readouts(
-    model: &SonaModelF64,
-    emit_prefix_overrides: bool,
-    a0: &mut Arena0LiteWire,
-    a1: &mut Arena1FullDeltaWire,
-    a2: &mut Arena2ProDeltaWire,
-    a3: &mut Arena3UltraDeltaWire,
-) {
-    let snap_fp16 = |v: f64| F32::new(fp16_to_f32(fp16_clamped(v, -64.0, 64.0, 0.0).get()));
-    let lite_src = model.tier_overrides[0].as_deref();
-    let mut ro_lite = LinearReadoutLiteWire::new_zeroed();
-    ro_lite.pre_conv_u_gain = lite_src
-        .map_or(model.pre_conv_u_gain, |p| p.pre_conv_u_gain)
-        .map(snap_fp16);
-    ro_lite.pre_conv_hp_gain = lite_src
-        .map_or(model.pre_conv_hp_gain, |p| p.pre_conv_hp_gain)
-        .map(snap_fp16);
-    ro_lite.direct_s2_u_gain = lite_src
-        .map_or(model.direct_s2_u_gain, |p| p.direct_s2_u_gain)
-        .map(snap_fp16);
-    ro_lite.direct_s2_hp_gain = lite_src
-        .map_or(model.direct_s2_hp_gain, |p| p.direct_s2_hp_gain)
-        .map(snap_fp16);
-    let lite_w_ro = lite_src.map_or(&model.w_ro, |p| &p.w_ro);
-    write_w_ro_fp16(lite_w_ro, &mut ro_lite.w_ro_fp16[..192], 16);
-    for q in 0..4 {
-        for l in 0..4 {
-            ro_lite.stage_latent_mods_fp16[STAGE_LATENT_OP_P_TO_CORE_OFFSET + q * 4 + l] =
-                fp16_clamped(model.op_p_to_core[q][l], -8.0, 8.0, 0.0);
-            ro_lite.w_ro_fp16[192 + q * 4 + l] =
-                fp16_clamped(model.phasor_to_core[q][l], -8.0, 8.0, 0.0);
-        }
-    }
-    a0.linear_readout_lite = ro_lite;
-
-    // Tier 1: Full (prefix 16/4 + delta 16..32 FIR, b_gamma[0..8], c[4..8]).
-    let full_src = model.tier_overrides[1].as_deref();
-    let mut ro_full = LinearReadoutFullWire::new_zeroed();
-    write_w_ro_fp16(
-        full_src.map_or(&model.w_ro, |p| &p.w_ro),
-        &mut ro_full.w_ro_and_mods_fp16[..288],
-        24,
-    );
-    write_scalar_ro_gains_fp16(
-        full_src.map_or(model.pre_conv_u_gain, |p| p.pre_conv_u_gain),
-        full_src.map_or(model.pre_conv_hp_gain, |p| p.pre_conv_hp_gain),
-        full_src.map_or(model.direct_s2_u_gain, |p| p.direct_s2_u_gain),
-        full_src.map_or(model.direct_s2_hp_gain, |p| p.direct_s2_hp_gain),
-        &mut ro_full.w_ro_and_mods_fp16[288..296],
-    );
-    if emit_prefix_overrides {
-        let fir_l = full_src.map_or(&model.fir_l, |p| &p.fir_l);
-        let fir_r = full_src.map_or(&model.fir_r, |p| &p.fir_r);
-        let mut pfx = PrefixOverrideFullEncodeWire::new_zeroed();
-        for i in 0..16 {
-            pfx.fir_l[i] = F32::new(sanitize_clamp_f32(fir_l[i], -16.0, 16.0, 0.0));
-            pfx.fir_r[i] = F32::new(sanitize_clamp_f32(fir_r[i], -16.0, 16.0, 0.0));
-            ro_full.w_ro_and_mods_fp16[296 + i] = fp16_clamped(fir_l[16 + i], -16.0, 16.0, 0.0);
-            ro_full.w_ro_and_mods_fp16[312 + i] = fp16_clamped(fir_r[16 + i], -16.0, 16.0, 0.0);
-        }
-        for m in 0..4 {
-            let (_, cl, cil, cr, cir) = pack_kautz_b_and_c(full_src, model, m);
-            pfx.c_re_l[m] = F32::new(sanitize_clamp_f32(cl, -8.0, 8.0, 0.0));
-            pfx.c_im_l[m] = F32::new(sanitize_clamp_f32(cil, -8.0, 8.0, 0.0));
-            pfx.c_re_r[m] = F32::new(sanitize_clamp_f32(cr, -8.0, 8.0, 0.0));
-            pfx.c_im_r[m] = F32::new(sanitize_clamp_f32(cir, -8.0, 8.0, 0.0));
-        }
-        for m in 0..8 {
-            let (bg, _, _, _, _) = pack_kautz_b_and_c(full_src, model, m);
-            ro_full.w_ro_and_mods_fp16[328 + m] = fp16_clamped(bg, 0.0, 8.0, 0.0);
-        }
-        for idx in 0..4 {
-            let (_, cl, cil, cr, cir) = pack_kautz_b_and_c(full_src, model, 4 + idx);
-            let off = 336 + idx * 4;
-            ro_full.w_ro_and_mods_fp16[off] = fp16_clamped(cl, -8.0, 8.0, 0.0);
-            ro_full.w_ro_and_mods_fp16[off + 1] = fp16_clamped(cil, -8.0, 8.0, 0.0);
-            ro_full.w_ro_and_mods_fp16[off + 2] = fp16_clamped(cr, -8.0, 8.0, 0.0);
-            ro_full.w_ro_and_mods_fp16[off + 3] = fp16_clamped(cir, -8.0, 8.0, 0.0);
-        }
-        let _ = pfx.write_to_prefix(&mut ro_full.prefix_override);
-    }
-    a1.linear_readout_full = ro_full;
-
-    // Tier 2: Pro (prefix 32/8 + delta 32..48 FIR, b_gamma[0..12], c[8..12]).
-    let pro_src = model.tier_overrides[2].as_deref();
-    let mut ro_pro = LinearReadoutProWire::new_zeroed();
-    write_w_ro_fp16(
-        pro_src.map_or(&model.w_ro, |p| &p.w_ro),
-        &mut ro_pro.w_ro_and_mods_fp16[..384],
-        32,
-    );
-    write_scalar_ro_gains_fp16(
-        pro_src.map_or(model.pre_conv_u_gain, |p| p.pre_conv_u_gain),
-        pro_src.map_or(model.pre_conv_hp_gain, |p| p.pre_conv_hp_gain),
-        pro_src.map_or(model.direct_s2_u_gain, |p| p.direct_s2_u_gain),
-        pro_src.map_or(model.direct_s2_hp_gain, |p| p.direct_s2_hp_gain),
-        &mut ro_pro.w_ro_and_mods_fp16[384..392],
-    );
-    if emit_prefix_overrides {
-        let fir_l = pro_src.map_or(&model.fir_l, |p| &p.fir_l);
-        let fir_r = pro_src.map_or(&model.fir_r, |p| &p.fir_r);
-        let mut pfx = PrefixOverrideProEncodeWire::new_zeroed();
-        for i in 0..32 {
-            pfx.fir_l[i] = F32::new(sanitize_clamp_f32(fir_l[i], -16.0, 16.0, 0.0));
-            pfx.fir_r[i] = F32::new(sanitize_clamp_f32(fir_r[i], -16.0, 16.0, 0.0));
-        }
-        for i in 0..16 {
-            ro_pro.w_ro_and_mods_fp16[392 + i] = fp16_clamped(fir_l[32 + i], -16.0, 16.0, 0.0);
-            ro_pro.w_ro_and_mods_fp16[408 + i] = fp16_clamped(fir_r[32 + i], -16.0, 16.0, 0.0);
-        }
-        for m in 0..8 {
-            let (_, cl, cil, cr, cir) = pack_kautz_b_and_c(pro_src, model, m);
-            pfx.c_re_l[m] = F32::new(sanitize_clamp_f32(cl, -8.0, 8.0, 0.0));
-            pfx.c_im_l[m] = F32::new(sanitize_clamp_f32(cil, -8.0, 8.0, 0.0));
-            pfx.c_re_r[m] = F32::new(sanitize_clamp_f32(cr, -8.0, 8.0, 0.0));
-            pfx.c_im_r[m] = F32::new(sanitize_clamp_f32(cir, -8.0, 8.0, 0.0));
-        }
-        for m in 0..12 {
-            let (bg, _, _, _, _) = pack_kautz_b_and_c(pro_src, model, m);
-            ro_pro.w_ro_and_mods_fp16[424 + m] = fp16_clamped(bg, 0.0, 8.0, 0.0);
-        }
-        for idx in 0..4 {
-            let (_, cl, cil, cr, cir) = pack_kautz_b_and_c(pro_src, model, 8 + idx);
-            let off = 436 + idx * 4;
-            ro_pro.w_ro_and_mods_fp16[off] = fp16_clamped(cl, -8.0, 8.0, 0.0);
-            ro_pro.w_ro_and_mods_fp16[off + 1] = fp16_clamped(cil, -8.0, 8.0, 0.0);
-            ro_pro.w_ro_and_mods_fp16[off + 2] = fp16_clamped(cr, -8.0, 8.0, 0.0);
-            ro_pro.w_ro_and_mods_fp16[off + 3] = fp16_clamped(cir, -8.0, 8.0, 0.0);
-        }
-        let _ = pfx.write_to_prefix(&mut ro_pro.prefix_override);
-    }
-    a2.linear_readout_pro = ro_pro;
-
-    // Tier 3: Ultra (prefix 48/12 + delta 48..96 FIR, b_gamma[0..24], c[12..24]).
-    let ultra_src = model.tier_overrides[3].as_deref();
-    let mut ro_ultra = LinearReadoutUltraWire::new_zeroed();
-    write_w_ro_fp16(
-        ultra_src.map_or(&model.w_ro, |p| &p.w_ro),
-        &mut ro_ultra.w_ro_and_mods_fp16[..480],
-        40,
-    );
-    write_scalar_ro_gains_fp16(
-        ultra_src.map_or(model.pre_conv_u_gain, |p| p.pre_conv_u_gain),
-        ultra_src.map_or(model.pre_conv_hp_gain, |p| p.pre_conv_hp_gain),
-        ultra_src.map_or(model.direct_s2_u_gain, |p| p.direct_s2_u_gain),
-        ultra_src.map_or(model.direct_s2_hp_gain, |p| p.direct_s2_hp_gain),
-        &mut ro_ultra.w_ro_and_mods_fp16[480..488],
-    );
-    if emit_prefix_overrides {
-        let fir_l = ultra_src.map_or(&model.fir_l, |p| &p.fir_l);
-        let fir_r = ultra_src.map_or(&model.fir_r, |p| &p.fir_r);
-        let mut pfx = PrefixOverrideUltraEncodeWire::new_zeroed();
-        for i in 0..48 {
-            pfx.fir_l[i] = F32::new(sanitize_clamp_f32(fir_l[i], -16.0, 16.0, 0.0));
-            pfx.fir_r[i] = F32::new(sanitize_clamp_f32(fir_r[i], -16.0, 16.0, 0.0));
-            ro_ultra.w_ro_and_mods_fp16[488 + i] = fp16_clamped(fir_l[48 + i], -16.0, 16.0, 0.0);
-            ro_ultra.w_ro_and_mods_fp16[536 + i] = fp16_clamped(fir_r[48 + i], -16.0, 16.0, 0.0);
-        }
-        for m in 0..12 {
-            let (_, cl, cil, cr, cir) = pack_kautz_b_and_c(ultra_src, model, m);
-            pfx.c_re_l[m] = F32::new(sanitize_clamp_f32(cl, -8.0, 8.0, 0.0));
-            pfx.c_im_l[m] = F32::new(sanitize_clamp_f32(cil, -8.0, 8.0, 0.0));
-            pfx.c_re_r[m] = F32::new(sanitize_clamp_f32(cr, -8.0, 8.0, 0.0));
-            pfx.c_im_r[m] = F32::new(sanitize_clamp_f32(cir, -8.0, 8.0, 0.0));
-        }
-        for m in 0..24 {
-            let (bg, _, _, _, _) = pack_kautz_b_and_c(ultra_src, model, m);
-            ro_ultra.w_ro_and_mods_fp16[584 + m] = fp16_clamped(bg, 0.0, 8.0, 0.0);
-        }
-        for idx in 0..12 {
-            let (_, cl, cil, cr, cir) = pack_kautz_b_and_c(ultra_src, model, 12 + idx);
-            let off = 608 + idx * 4;
-            ro_ultra.w_ro_and_mods_fp16[off] = fp16_clamped(cl, -8.0, 8.0, 0.0);
-            ro_ultra.w_ro_and_mods_fp16[off + 1] = fp16_clamped(cil, -8.0, 8.0, 0.0);
-            ro_ultra.w_ro_and_mods_fp16[off + 2] = fp16_clamped(cr, -8.0, 8.0, 0.0);
-            ro_ultra.w_ro_and_mods_fp16[off + 3] = fp16_clamped(cir, -8.0, 8.0, 0.0);
-        }
-        let _ = pfx.write_to_prefix(&mut ro_ultra.prefix_override);
-    }
-    a3.linear_readout_ultra = ro_ultra;
-}
+use blocks::{
+    fp16_clamped, pack_core_quad_wire, pack_crossbar_block_wire, pack_kautz_block, pack_tile_wire,
+    pack_transport_quad_wire,
+};
+use readouts::{LITE_OPT_TO_LR_OFFSET, pack_tier_readouts};
 
 /// Serializes `model` into a validated 4-tier `.dnam-bin` payload (`ref[container.dnam.vm-binary]`).
 pub fn encode_model_to_dnam_bin(
@@ -582,12 +143,24 @@ pub fn encode_model_to_dnam_bin(
     a3.crossbar_ultra = xbar_blk;
 
     for q in 0..4 {
-        a0.core_quads[q] = pack_core_quad_wire(&model.core_quads[q]);
+        a0.core_quads[q] = pack_core_quad_wire(
+            &model.core_quads[q],
+            SONA_CORE_QUAD_BLOCK_AND_LOCAL[q].0 == 0,
+        );
     }
     for q in 0..2 {
-        a1.core_quads[q] = pack_core_quad_wire(&model.core_quads[4 + q]);
-        a2.core_quads[q] = pack_core_quad_wire(&model.core_quads[6 + q]);
-        a3.core_quads[q] = pack_core_quad_wire(&model.core_quads[8 + q]);
+        a1.core_quads[q] = pack_core_quad_wire(
+            &model.core_quads[4 + q],
+            SONA_CORE_QUAD_BLOCK_AND_LOCAL[4 + q].0 == 0,
+        );
+        a2.core_quads[q] = pack_core_quad_wire(
+            &model.core_quads[6 + q],
+            SONA_CORE_QUAD_BLOCK_AND_LOCAL[6 + q].0 == 0,
+        );
+        a3.core_quads[q] = pack_core_quad_wire(
+            &model.core_quads[8 + q],
+            SONA_CORE_QUAD_BLOCK_AND_LOCAL[8 + q].0 == 0,
+        );
     }
     for i in 0..3 {
         a0.tiles[i] = pack_tile_wire(&model.tiles[i]);
@@ -729,7 +302,13 @@ pub fn encode_model_to_dnam_bin(
     }
     a0.control_bus_lite.tank_dry_mix_fp16 = fp16_clamped(model.tank_dry_mix, -2.0, 2.0, 1.0);
     let mut ro_pole = sanitize_clamp_f32(model.ro_pole_48k, 0.0, MAX_RO_POLE_48K_F32, 0.0);
-    enforce_arena0_stability_invariants(&mut a0, &mut ro_pole);
+    enforce_arena_block0_k_nl_and_clamp(
+        &mut a0,
+        Some(&mut a1),
+        Some(&mut a2),
+        Some(&mut a3),
+        &mut ro_pole,
+    );
 
     let mut hasher = Sha256::new();
     hasher.update(b"DNAM-BIN-CONTENT-V3\0");
@@ -788,4 +367,66 @@ pub fn encode_model_to_dnam_bin(
         arena2: Some(&a2),
         arena3: Some(&a3),
     })?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dnam_kernels::{f32_to_fp16, fp16_to_f32};
+    use dnam_vm::bin::DnamBinView;
+    use dnam_vm::math::DefaultMathBackend;
+    use dnam_vm::{SonaVm, Tier};
+
+    #[test]
+    fn test_encode_model_roundtrips_block0_k_nl_and_scat_psi_through_vm() {
+        let mut model = SonaModelF64::new(48_000.0);
+        for q in 0..10 {
+            model.core_quads[q].svf_k_nl = [0.25 + 0.1 * (q as f64), 0.5, 1.0, 2.0];
+        }
+        for tq in &mut model.transport_quads {
+            tq.scat_psi = core::f64::consts::FRAC_PI_4;
+            tq.allpass_delays = [3, 5, 7, 11];
+        }
+        let bin = encode_model_to_dnam_bin(&model, Pass5EmitConfig::default()).unwrap();
+        let view = DnamBinView::parse(&bin).unwrap();
+        let a0 = view.arena0;
+        let a1 = view.arena1.unwrap();
+        let a2 = view.arena2.unwrap();
+        let a3 = view.arena3.unwrap();
+
+        // Block 0 quads {0, 4, 6, 8} keep clamped svf_k_nl_fp16; Blocks 1..=3 {1, 2, 3, 5, 7, 9} are zeroed.
+        assert_ne!(a0.core_quads[0].svf_k_nl_fp16.map(U16::get), [0; 4]);
+        for q_lin in 1..4 {
+            assert_eq!(a0.core_quads[q_lin].svf_k_nl_fp16.map(U16::get), [0; 4]);
+        }
+        assert_ne!(a1.core_quads[0].svf_k_nl_fp16.map(U16::get), [0; 4]);
+        assert_eq!(a1.core_quads[1].svf_k_nl_fp16.map(U16::get), [0; 4]);
+        assert_ne!(a2.core_quads[0].svf_k_nl_fp16.map(U16::get), [0; 4]);
+        assert_eq!(a2.core_quads[1].svf_k_nl_fp16.map(U16::get), [0; 4]);
+        assert_ne!(a3.core_quads[0].svf_k_nl_fp16.map(U16::get), [0; 4]);
+        assert_eq!(a3.core_quads[1].svf_k_nl_fp16.map(U16::get), [0; 4]);
+
+        let expected_scat = f32_to_fp16(core::f32::consts::FRAC_PI_4);
+        for tw in [
+            &a0.transport_lite,
+            &a1.transport_full,
+            &a2.transport_pro[0],
+            &a3.transport_ultra[0],
+        ] {
+            assert_eq!(tw.scat_psi_fp16.get(), expected_scat);
+            assert_eq!(tw.allpass_delays, [3, 5, 7, 11]);
+            assert_eq!(tw.flags & !TRANSPORT_FLAG_EXT_F32, 0);
+            assert!(
+                (fp16_to_f32(tw.scat_psi_fp16.get()) - core::f32::consts::FRAC_PI_4).abs() < 1.0e-3
+            );
+        }
+
+        let mut vm =
+            SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&bin, Tier::Ultra, 48_000.0).unwrap();
+        let mut out_l = [0.0_f32; 32];
+        let mut out_r = [0.0_f32; 32];
+        vm.process_block(&[0.0_f32; 32], &[0.0_f32; 32], &mut out_l, &mut out_r)
+            .unwrap();
+        assert!(out_l.iter().chain(&out_r).all(|v| v.to_bits() == 0));
+    }
 }

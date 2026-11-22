@@ -4,6 +4,8 @@
 //! both `portable` and `subgroups` variants of all six SONA v3.0 compute kernels
 //! (`ref[train.pipeline.webgpu-scans-and-ozaki]`, `ref[train.pipeline.isomorphism-parity]`).
 
+#[path = "wgpu_hardware_parity/block0_phs.rs"]
+mod block0_phs;
 #[path = "wgpu_hardware_parity/core_and_adjoint.rs"]
 mod core_and_adjoint;
 #[path = "wgpu_hardware_parity/gabor_and_opt.rs"]
@@ -46,6 +48,17 @@ fn test_wgpu_adjoint_scan_256_three_pass_finite_difference_parity() {
     };
     for variant in ctx.variants() {
         core_and_adjoint::verify_adjoint_scan_256_fd_parity(&ctx, variant);
+    }
+}
+
+/// verify[train.pipeline.webgpu-scans-and-ozaki]
+#[test]
+fn test_wgpu_block0_phs_core_and_adjoint_fd_parity() {
+    let Some(ctx) = init_gpu_context() else {
+        return;
+    };
+    for variant in ctx.variants() {
+        block0_phs::verify_block0_phs_core_and_adjoint_fd(&ctx, variant);
     }
 }
 

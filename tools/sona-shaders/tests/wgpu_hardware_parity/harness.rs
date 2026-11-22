@@ -277,6 +277,17 @@ pub fn build_core_quad_bundle(
     CoreQuadParamsStereo4<GpuVec4>,
     [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE],
 ) {
+    build_core_quad_bundle_with_k_nl(stem, quad, [0.0; 4])
+}
+
+pub fn build_core_quad_bundle_with_k_nl(
+    stem: usize,
+    quad: usize,
+    k_nl: [f32; 4],
+) -> (
+    CoreQuadParamsStereo4<GpuVec4>,
+    [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE],
+) {
     let f = (stem * 2 + quad) as f32;
     let fc = [
         0.02 + 0.015 * f,
@@ -312,6 +323,7 @@ pub fn build_core_quad_bundle(
     );
 
     let two_svf_g = g.add(g);
+    let svf_k_nl = GpuVec4::from_array(k_nl);
     let rect_sign = GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]);
     let sag_depth = GpuVec4::from_array([0.18, 0.32, 0.45, 0.22]);
     let adaa_drive = GpuVec4::from_array([1.15, 1.65, 2.10, 1.35]);
@@ -348,12 +360,14 @@ pub fn build_core_quad_bundle(
     packed[quad_param_slots::WAVEFOLDER_MIX] = wavefolder_mix.to_array();
     packed[quad_param_slots::GLU_MIX] = glu_mix.to_array();
     packed[quad_param_slots::SVF_G] = g.to_array();
+    packed[quad_param_slots::SVF_K_NL] = svf_k_nl.to_array();
 
     let cpu_params = CoreQuadParamsStereo4 {
         svf,
         tone,
         lru,
         two_svf_g,
+        svf_k_nl,
         rect_sign,
         sag_depth,
         adaa_drive,
@@ -389,6 +403,7 @@ pub fn cpu_params_from_packed(packed: &[[f32; 4]]) -> CoreQuadParamsStereo4<GpuV
         tone,
         lru,
         two_svf_g: g.add(g),
+        svf_k_nl: GpuVec4::from_array(packed[quad_param_slots::SVF_K_NL]),
         rect_sign: GpuVec4::from_array(packed[quad_param_slots::RECT_SIGN]),
         sag_depth: GpuVec4::from_array(packed[quad_param_slots::SAG_DEPTH]),
         adaa_drive: GpuVec4::from_array(packed[quad_param_slots::ADAA_DRIVE]),

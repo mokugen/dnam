@@ -3,12 +3,14 @@
 //! (`FIR + Kautz`), and 4-lane `Op-T` recurrent transport.
 
 use dnam_kernels::{SOFT_RECT_EPS, TINY_CROSSING_EPS};
-use dnam_vm::{SONA_INTERBLOCK_TILES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER};
+use dnam_vm::{
+    SONA_CORE_QUAD_BLOCK_AND_LOCAL, SONA_INTERBLOCK_TILES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER,
+};
 
 use crate::error::TrainError;
 use crate::gpu::abi::{
     AdjointScanUniforms, QUAD_PARAMS_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, TILE_FRAMES,
-    quad_param_slots::ADAA_DRIVE,
+    quad_param_slots::{ADAA_DRIVE, SVF_K_NL},
 };
 use crate::runner::{AdjointScanInput, TrainRunner, pack_core_quad_params};
 
@@ -38,6 +40,7 @@ pub(super) struct Pass2ParamGrads {
     pub d_gamma_bc: f64,
     pub d_beta_q: f64,
     pub d_adaa: Vec<[f64; 4]>,
+    pub d_svf_k_nl: Vec<[f64; 4]>,
     pub d_w_ro_direct: Vec<[[f64; 4]; 4]>, // [q][lane][6..10 -> 0..4]
     pub d_direct_s2_u: [f64; 2],
     pub d_kautz: Vec<[f64; 6]>, // [r_low, theta, c_re_l, c_im_l, c_re_r, c_im_r]
@@ -348,16 +351,18 @@ pub(super) fn assemble_pass2_gradients(
 
     // Reverse topological scan across CoreQuads & InterBlockTiles -> M/S input -> Op-N[Pre].
     let mut d_adaa = vec![[0.0_f64; 4]; q_opt];
+    let mut d_svf_k_nl = vec![[0.0_f64; 4]; q_opt];
     let rho_core = 48_000.0 / model.sample_rate_hz.max(8_000.0);
     let ckpt_per_quad = num_tiles * TILE_CKPT_VEC4_STRIDE;
     for &q in SONA_ULTRA_QUAD_TRAVERSAL_ORDER.iter().rev() {
         if q >= q_count {
             continue;
         }
+        let block_idx = SONA_CORE_QUAD_BLOCK_AND_LOCAL[q].0 as u32;
         let qp = pack_core_quad_params(
             &model.core_quads[q]
                 .rescaled_for_rho(rho_core)
-                .to_kernel_params(),
+                .to_kernel_params_for_block(block_idx),
         );
         let adj = runner.adjoint_scan_256(&AdjointScanInput {
             uniforms: AdjointScanUniforms {
@@ -368,7 +373,7 @@ pub(super) fn assemble_pass2_gradients(
                 pass_mode: 0,
                 soft_rect_eps: SOFT_RECT_EPS,
                 tiny_crossing_eps: TINY_CROSSING_EPS,
-                block_idx: 0,
+                block_idx,
             },
             core_inputs: &buf.cascade.core_inputs[(q * n * 2)..((q + 1) * n * 2)],
             quad_params: &qp,
@@ -382,6 +387,12 @@ pub(super) fn assemble_pass2_gradients(
                 let g = adj.param_grads[tile * QUAD_PARAMS_VEC4_STRIDE + ADAA_DRIVE];
                 for k in 0..4 {
                     d_adaa[q][k] += f64::from(g[k]);
+                }
+                if block_idx == 0 {
+                    let gk = adj.param_grads[tile * QUAD_PARAMS_VEC4_STRIDE + SVF_K_NL];
+                    for k in 0..4 {
+                        d_svf_k_nl[q][k] += f64::from(gk[k]);
+                    }
                 }
             }
         }
@@ -447,6 +458,7 @@ pub(super) fn assemble_pass2_gradients(
         d_gamma_bc: g_gl + g_gr,
         d_beta_q: g_bl + g_br,
         d_adaa,
+        d_svf_k_nl,
         d_w_ro_direct,
         d_direct_s2_u,
         d_kautz,

@@ -17,15 +17,15 @@ use dnam_train::{
     abi::{
         AdjointScanUniforms, CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, FusedScanUniforms,
         GaborBezoutUniforms, InnerOptUniforms, MAX_WORKGROUP_SRAM_BYTES, OZAKI_WORDS_PER_PAIR,
-        OzakiGramUniforms, PRESCREEN_SEED_PARAM_STRIDE, PrescreenUniforms, TILE_FRAMES,
-        quad_param_slots,
+        OzakiGramUniforms, PRESCREEN_SEED_PARAM_STRIDE, PrescreenUniforms, QUAD_PARAMS_VEC4_STRIDE,
+        TILE_FRAMES, quad_param_slots,
     },
     embedded_wgsl, pack_core_quad_params, plan_core_scan_execution, prepare_for_browser_webgpu,
     uplo_u_packed_len, verify_embedded_shader_digests,
 };
 use proptest::prelude::*;
 
-fn sample_quad_params(stem: usize, quad: usize) -> [[f32; 4]; 24] {
+fn sample_quad_params(stem: usize, quad: usize) -> [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE] {
     let f = (stem * 2 + quad) as f32;
     let fc = [0.03 + 0.01 * f, 0.08 + 0.01 * f, 0.17 + 0.01 * f, 0.29];
     let g = GpuVec4::from_array(fc.map(prewarp_tan_pi_f_over_fs_f32));
@@ -130,7 +130,7 @@ fn test_cpu_runner_all_six_kernels_end_to_end() {
     let num_quads = 2_usize;
     let num_stems = 2_usize;
     let total_q = num_quads * num_stems;
-    let mut quad_params = Vec::with_capacity(total_q * 24);
+    let mut quad_params = Vec::with_capacity(total_q * QUAD_PARAMS_VEC4_STRIDE);
     for s in 0..num_stems {
         for q in 0..num_quads {
             quad_params.extend_from_slice(&sample_quad_params(s, q));

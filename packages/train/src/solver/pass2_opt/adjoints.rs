@@ -469,7 +469,7 @@ mod tests {
             sigma_knee: 0.8,
             freeze_mix: 0.25,
             window_depth: 0.15,
-            schroeder_enable: true,
+            scat_psi: 0.35,
             ext_f32: false,
         };
         let (mut gxl, mut gxr) = (vec![0.0; 128], vec![0.0; 128]);
@@ -532,6 +532,15 @@ mod tests {
         assert_fd_close(
             "quad_wetr2",
             qg.d_wet_tap_r[2],
+            (eval_tq(&p) - eval_tq(&m)) / (2.0 * eps),
+        );
+        p = tq;
+        p.scat_psi += eps;
+        m = tq;
+        m.scat_psi -= eps;
+        assert_fd_close(
+            "quad_scat_psi",
+            qg.d_scat_psi,
             (eval_tq(&p) - eval_tq(&m)) / (2.0 * eps),
         );
     }

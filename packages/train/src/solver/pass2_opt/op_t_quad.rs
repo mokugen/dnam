@@ -3,6 +3,8 @@
 //! allpass diffusion, `sigma_sat` cubic feedback saturation, pairwise Givens + Householder `H_4`,
 //! `5 Hz` loop & wet DC blockers, and continuous `freeze_mix` (`ref[dsp.op-t.diffuser.recurrence]`).
 
+use core::f64::consts::PI;
+
 use dnam_kernels::{TANK_MAX_G_LIN_F32, TANK_MAX_V_CEIL_F32};
 
 use crate::control::stability::MIN_DELAY_CROSSBAR_SAMP;
@@ -18,12 +20,63 @@ pub struct OpTQuadAdjointGrads {
     pub d_g_loop: f64,
     /// Gradient wrt `damp_pole`.
     pub d_damp_pole: f64,
+    /// Gradient wrt `scat_psi`.
+    pub d_scat_psi: f64,
     /// Gradients wrt `input_gains[0..4]`.
     pub d_input_gains: [f64; 4],
     /// Gradients wrt `wet_tap_l[0..4]`.
     pub d_wet_tap_l: [f64; 4],
     /// Gradients wrt `wet_tap_r[0..4]`.
     pub d_wet_tap_r: [f64; 4],
+}
+
+#[inline(always)]
+fn j_even_f64(x: [f64; 4]) -> [f64; 4] {
+    [-x[1], x[0], -x[3], x[2]]
+}
+
+#[inline(always)]
+fn j_odd_f64(y: [f64; 4]) -> [f64; 4] {
+    [y[3], -y[2], y[1], -y[0]]
+}
+
+#[inline(always)]
+fn apply_so4_even_f64(x: [f64; 4], c: f64, s: f64) -> [f64; 4] {
+    let jx = j_even_f64(x);
+    [
+        c * x[0] + s * jx[0],
+        c * x[1] + s * jx[1],
+        c * x[2] + s * jx[2],
+        c * x[3] + s * jx[3],
+    ]
+}
+
+#[inline(always)]
+fn apply_so4_odd_f64(y: [f64; 4], c: f64, s: f64) -> [f64; 4] {
+    let jy = j_odd_f64(y);
+    [
+        c * y[0] + s * jy[0],
+        c * y[1] + s * jy[1],
+        c * y[2] + s * jy[2],
+        c * y[3] + s * jy[3],
+    ]
+}
+
+#[inline(always)]
+fn apply_so4_even_transpose_f64(g: [f64; 4], c: f64, s: f64) -> [f64; 4] {
+    apply_so4_even_f64(g, c, -s)
+}
+
+#[inline(always)]
+fn apply_so4_odd_transpose_f64(g: [f64; 4], c: f64, s: f64) -> [f64; 4] {
+    apply_so4_odd_f64(g, c, -s)
+}
+
+#[inline(always)]
+fn so4_theta_grad_f64(g_v_read: [f64; 4], v_read: [f64; 4], g_x1: [f64; 4], x1: [f64; 4]) -> f64 {
+    let jo = j_odd_f64(v_read);
+    let je = j_even_f64(x1);
+    (0..4).map(|k| g_v_read[k] * jo[k] + g_x1[k] * je[k]).sum()
 }
 
 #[inline]
@@ -122,6 +175,7 @@ struct QuadFrameHist {
     ap_write: Vec<[f64; 4]>,
     r_raw: Vec<[f64; 4]>,
     r_win: Vec<[f64; 4]>,
+    x1: Vec<[f64; 4]>,
     v_read: Vec<[f64; 4]>,
     v_fb: Vec<[f64; 4]>,
     v_damp: Vec<[f64; 4]>,
@@ -147,8 +201,8 @@ pub struct OpTQuadAdjointSlices<'a> {
 }
 
 /// Evaluates the full 4-lane stereo `Op-T` recurrent transport block (`[Catmull-Rom -> Window ->
-/// Schroeder -> sigma_sat -> Givens -> H_4 -> inj -> Damp -> 5Hz Loop DC -> freeze_mix -> wet
-/// Givens + 5Hz DC]`) and computes exact reverse-time BPTT adjoints.
+/// SO(4) R_even -> Schroeder -> SO(4) R_odd -> sigma_sat -> Givens -> H_4 -> inj -> Damp -> 5Hz
+/// Loop DC -> freeze_mix -> wet Givens + 5Hz DC]`) and computes exact reverse-time BPTT adjoints.
 pub fn eval_op_t_quad_stereo_and_adjoint(
     x_l: &[f64],
     x_r: &[f64],
@@ -172,6 +226,7 @@ pub fn eval_op_t_quad_stereo_and_adjoint(
 
     let g_eff = tq.g_loop.clamp(0.0, f64::from(TANK_MAX_G_LIN_F32));
     let mu_freeze = tq.freeze_mix.clamp(0.0, 1.0);
+    let full_hold = mu_freeze >= 1.0 - 1.0e-6;
     let sigma_sat = tq.sigma_knee.clamp(1.0e-3, 0.984_375);
     let inv_sigma_23 = 2.0 / (3.0 * sigma_sat);
     let dp = tq.damp_pole.clamp(0.0, 0.9995);
@@ -179,8 +234,19 @@ pub fn eval_op_t_quad_stereo_and_adjoint(
     let r_dc = tq.r_dc.clamp(0.0, 0.999_995);
     let alpha_dc = 0.5 * (1.0 + r_dc);
     let (sin_psi, cos_psi) = tq.fb_psi.sin_cos();
+    let scat_open = tq.scat_psi.is_finite() && tq.scat_psi.abs() <= PI;
+    let scat_clamped = if tq.scat_psi.is_finite() {
+        tq.scat_psi.clamp(-PI, PI)
+    } else {
+        0.0
+    };
+    let theta_eff = if full_hold {
+        0.0
+    } else {
+        (1.0 - mu_freeze) * scat_clamped
+    };
+    let (s_scat, c_scat) = theta_eff.sin_cos();
     let (half_alpha, d_half_dg) = half_alpha_cubic_and_deriv(g_eff, mu_freeze);
-    let sch_active = tq.schroeder_enable && mu_freeze < 1.0 - 1.0e-6;
     let ap_delays = tq.allpass_delays.map(usize::from);
     let ap_g = tq
         .allpass_g
@@ -191,6 +257,7 @@ pub fn eval_op_t_quad_stereo_and_adjoint(
         ap_write: vec![[0.0; 4]; n],
         r_raw: vec![[0.0; 4]; n],
         r_win: vec![[0.0; 4]; n],
+        x1: vec![[0.0; 4]; n],
         v_read: vec![[0.0; 4]; n],
         v_fb: vec![[0.0; 4]; n],
         v_damp: vec![[0.0; 4]; n],
@@ -209,7 +276,7 @@ pub fn eval_op_t_quad_stereo_and_adjoint(
     for t in 0..n {
         let mut r_raw_t = [0.0_f64; 4];
         let mut r_win_t = [0.0_f64; 4];
-        let mut v_read_t = [0.0_f64; 4];
+        let mut y1_t = [0.0_f64; 4];
         let mut v_loop_t = [0.0_f64; 4];
         for k in 0..4 {
             let dk = i_int[k];
@@ -240,20 +307,33 @@ pub fn eval_op_t_quad_stereo_and_adjoint(
             let w_k = eval_hermite_window_weight(t, k, tq, sample_rate_hz);
             hist.win[t][k] = w_k;
             r_win_t[k] = w_k * vr;
-
-            if sch_active && ap_delays[k] > 0 {
+        }
+        let x1_t = if full_hold {
+            r_win_t
+        } else {
+            apply_so4_even_f64(r_win_t, c_scat, s_scat)
+        };
+        for k in 0..4 {
+            if !full_hold && ap_delays[k] > 0 {
                 let d_ap = ap_delays[k];
                 let ap_del = if t >= d_ap {
                     hist.ap_write[t - d_ap][k]
                 } else {
                     0.0
                 };
-                let ap_w = r_win_t[k] - ap_g[k] * ap_del;
+                let ap_w = x1_t[k] - ap_g[k] * ap_del;
                 hist.ap_write[t][k] = ap_w;
-                v_read_t[k] = ap_del + ap_g[k] * ap_w;
+                y1_t[k] = ap_del + ap_g[k] * ap_w;
             } else {
-                v_read_t[k] = r_win_t[k];
+                y1_t[k] = x1_t[k];
             }
+        }
+        let v_read_t = if full_hold {
+            y1_t
+        } else {
+            apply_so4_odd_f64(y1_t, c_scat, s_scat)
+        };
+        for k in 0..4 {
             let (vl, dv, dg) =
                 cubic_soft_sat_and_deriv(v_read_t[k], g_eff * sigma_sat, inv_sigma_23);
             v_loop_t[k] = vl;
@@ -262,6 +342,7 @@ pub fn eval_op_t_quad_stereo_and_adjoint(
         }
         hist.r_raw[t] = r_raw_t;
         hist.r_win[t] = r_win_t;
+        hist.x1[t] = x1_t;
         hist.v_read[t] = v_read_t;
 
         let r_giv = [
@@ -313,6 +394,7 @@ pub fn eval_op_t_quad_stereo_and_adjoint(
         let mut adj_vd_next_dp = [0.0_f64; 4];
         let mut adj_out_wet_next = [0.0_f64; 2];
         let mut adj_raw_wet_next = [0.0_f64; 2];
+        let mut d_theta_eff = 0.0_f64;
 
         for t in (0..n).rev() {
             let d_yl = dl[t] + r_dc * adj_out_wet_next[0];
@@ -372,22 +454,41 @@ pub fn eval_op_t_quad_stereo_and_adjoint(
                 -sin_psi * a_rg[2] + cos_psi * a_rg[3],
             ];
 
+            let mut g_v_read_t = [0.0_f64; 4];
             for k in 0..4 {
                 grads.d_g_loop += a_vloop[k] * hist.d_loop_dg[t][k];
-                let d_vr = adj_vread[k] + a_vloop[k] * hist.d_loop_dv[t][k];
+                g_v_read_t[k] = adj_vread[k] + a_vloop[k] * hist.d_loop_dv[t][k];
+            }
 
-                let mut d_rwin = mu_freeze * adj_w[t][k];
-                if sch_active && ap_delays[k] > 0 {
-                    let d_ap_w = ap_g[k] * d_vr + adj_ap_w[t][k];
-                    d_rwin += d_ap_w;
+            let g_y1_t = if full_hold {
+                g_v_read_t
+            } else {
+                apply_so4_odd_transpose_f64(g_v_read_t, c_scat, s_scat)
+            };
+            let mut g_x1_t = [0.0_f64; 4];
+            for k in 0..4 {
+                if !full_hold && ap_delays[k] > 0 {
+                    let d_ap_w = ap_g[k] * g_y1_t[k] + adj_ap_w[t][k];
+                    g_x1_t[k] = d_ap_w;
                     let d_ap = ap_delays[k];
                     if t >= d_ap {
-                        adj_ap_w[t - d_ap][k] += d_vr - ap_g[k] * d_ap_w;
+                        adj_ap_w[t - d_ap][k] += g_y1_t[k] - ap_g[k] * d_ap_w;
                     }
                 } else {
-                    d_rwin += d_vr;
+                    g_x1_t[k] = g_y1_t[k];
                 }
+            }
+            if !full_hold {
+                d_theta_eff += so4_theta_grad_f64(g_v_read_t, hist.v_read[t], g_x1_t, hist.x1[t]);
+            }
+            let g_r_win_scat = if full_hold {
+                g_x1_t
+            } else {
+                apply_so4_even_transpose_f64(g_x1_t, c_scat, s_scat)
+            };
 
+            for k in 0..4 {
+                let d_rwin = mu_freeze * adj_w[t][k] + g_r_win_scat[k];
                 let d_rraw = d_rwin * hist.win[t][k];
                 grads.d_delay_samples[k] += d_rraw * hist.d_tau_vread[t][k];
                 grads.d_g_loop += d_rraw * hist.d_half_v[t][k] * d_half_dg;
@@ -416,7 +517,135 @@ pub fn eval_op_t_quad_stereo_and_adjoint(
                 }
             }
         }
+        grads.d_scat_psi = if !full_hold && scat_open {
+            (1.0 - mu_freeze) * d_theta_eff
+        } else {
+            0.0
+        };
     }
 
     (out_l, out_r, grads)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn eval_quad_loss(
+        x_l: &[f64],
+        x_r: &[f64],
+        tq: &TransportQuadF64,
+        w_l: &[f64],
+        w_r: &[f64],
+    ) -> f64 {
+        let (yl, yr, _) = eval_op_t_quad_stereo_and_adjoint(x_l, x_r, tq, 48_000.0, None);
+        yl.iter()
+            .zip(yr.iter())
+            .enumerate()
+            .map(|(i, (&a, &b))| a * w_l[i] + b * w_r[i])
+            .sum()
+    }
+
+    #[test]
+    fn test_op_t_quad_so4_scat_psi_bptt_and_full_hold_fd_parity() {
+        let n = 128_usize;
+        let x_l: Vec<f64> = (0..n).map(|i| 0.4 * ((i as f64) * 0.17).sin()).collect();
+        let x_r: Vec<f64> = (0..n)
+            .map(|i| 0.35 * ((i as f64) * 0.13 + 0.4).cos())
+            .collect();
+        let w_l: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.11).cos()).collect();
+        let w_r: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.09).sin()).collect();
+
+        for ap_delays in [[3, 5, 7, 11], [0, 0, 0, 0]] {
+            let tq = TransportQuadF64 {
+                delay_samples: [7.25, 9.6, 12.4, 15.1],
+                ramp_spans_samples: [0.0; 4],
+                g_loop: 0.72,
+                r_dc: 0.999,
+                damp_pole: 0.3,
+                lfo_rate_hz: 0.0,
+                ramp_rate_hz: 0.0,
+                lfo_depths: [0.0; 4],
+                input_gains: [0.6, 0.5, -0.4, 0.3],
+                wet_tap_l: [0.7, 0.2, -0.5, 0.1],
+                wet_tap_r: [0.15, -0.65, 0.25, 0.45],
+                allpass_g: [0.35, -0.25, 0.4, -0.3],
+                allpass_delays: ap_delays,
+                fb_psi: 0.4,
+                scat_psi: 0.55,
+                sigma_knee: 0.8,
+                freeze_mix: 0.25,
+                window_depth: 0.15,
+                ext_f32: false,
+            };
+            let (_, _, grads) = eval_op_t_quad_stereo_and_adjoint(
+                &x_l,
+                &x_r,
+                &tq,
+                48_000.0,
+                Some(OpTQuadAdjointSlices {
+                    d_out_l: &w_l,
+                    d_out_r: &w_r,
+                    grad_x_l: None,
+                    grad_x_r: None,
+                }),
+            );
+            let eps = 1.0e-6_f64;
+            let mut p = tq;
+            p.scat_psi += eps;
+            let mut m = tq;
+            m.scat_psi -= eps;
+            let fd = (eval_quad_loss(&x_l, &x_r, &p, &w_l, &w_r)
+                - eval_quad_loss(&x_l, &x_r, &m, &w_l, &w_r))
+                / (2.0 * eps);
+            assert!(
+                grads.d_scat_psi.abs() > 1.0e-3,
+                "expected nonzero d_scat_psi for ap_delays={ap_delays:?}"
+            );
+            assert!(
+                (grads.d_scat_psi - fd).abs() < 1.0e-5,
+                "scat_psi FD mismatch ap={ap_delays:?}: adj={} fd={}",
+                grads.d_scat_psi,
+                fd
+            );
+        }
+
+        // Full hold (mu_freeze = 1.0) freezes scattering and zeroes d_scat_psi.
+        let tq_hold = TransportQuadF64 {
+            delay_samples: [7.25, 9.6, 12.4, 15.1],
+            g_loop: 0.72,
+            r_dc: 0.999,
+            damp_pole: 0.3,
+            input_gains: [0.6, 0.5, -0.4, 0.3],
+            wet_tap_l: [0.7, 0.2, -0.5, 0.1],
+            wet_tap_r: [0.15, -0.65, 0.25, 0.45],
+            allpass_g: [0.35, -0.25, 0.4, -0.3],
+            allpass_delays: [3, 5, 7, 11],
+            fb_psi: 0.4,
+            scat_psi: 0.9,
+            sigma_knee: 0.8,
+            freeze_mix: 1.0,
+            window_depth: 0.0,
+            ..TransportQuadF64::default()
+        };
+        let (yl_h, yr_h, gh) = eval_op_t_quad_stereo_and_adjoint(
+            &x_l,
+            &x_r,
+            &tq_hold,
+            48_000.0,
+            Some(OpTQuadAdjointSlices {
+                d_out_l: &w_l,
+                d_out_r: &w_r,
+                grad_x_l: None,
+                grad_x_r: None,
+            }),
+        );
+        let mut tq_hold_z = tq_hold;
+        tq_hold_z.scat_psi = 0.0;
+        let (yl_hz, yr_hz, _) =
+            eval_op_t_quad_stereo_and_adjoint(&x_l, &x_r, &tq_hold_z, 48_000.0, None);
+        assert_eq!(yl_h, yl_hz);
+        assert_eq!(yr_h, yr_hz);
+        assert_eq!(gh.d_scat_psi, 0.0);
+    }
 }

@@ -11,12 +11,25 @@ use dnam_train::{
     PrescreenInput, ShaderVariant, TrainRunner, WgpuRunner,
     abi::{
         AdjointScanUniforms, FusedScanUniforms, GaborBezoutUniforms, InnerOptUniforms,
-        OzakiGramUniforms, PrescreenUniforms, quad_param_slots,
+        OzakiGramUniforms, PrescreenUniforms, QUAD_PARAMS_VEC4_STRIDE, quad_param_slots,
     },
     pack_core_quad_params, plan_core_scan_execution,
 };
 
-pub(crate) fn build_quad(stem: usize, quad: usize, zero_g: bool) -> [[f32; 4]; 24] {
+pub(crate) fn build_quad(
+    stem: usize,
+    quad: usize,
+    zero_g: bool,
+) -> [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE] {
+    build_quad_with_k_nl(stem, quad, [0.0; 4], zero_g)
+}
+
+pub(crate) fn build_quad_with_k_nl(
+    stem: usize,
+    quad: usize,
+    k_nl: [f32; 4],
+    zero_g: bool,
+) -> [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE] {
     let f = (stem * 2 + quad) as f32;
     let fc = [0.02 + 0.015 * f, 0.07 + 0.012 * f, 0.16 + 0.01 * f, 0.28];
     let g = GpuVec4::from_array(fc.map(prewarp_tan_pi_f_over_fs_f32));
@@ -39,7 +52,7 @@ pub(crate) fn build_quad(stem: usize, quad: usize, zero_g: bool) -> [[f32; 4]; 2
             GpuVec4::from_array([0.05, 0.25, 0.45, 0.65]),
         ),
         two_svf_g: g.add(g),
-        svf_k_nl: GpuVec4::zero(),
+        svf_k_nl: GpuVec4::from_array(k_nl),
         rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
         sag_depth: GpuVec4::from_array([0.18, 0.32, 0.45, 0.22]),
         adaa_drive: GpuVec4::from_array([1.15, 1.65, 2.10, 1.35]),

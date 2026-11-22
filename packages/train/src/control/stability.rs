@@ -8,8 +8,8 @@ use core::f64::consts::PI;
 mod rail_and_arena;
 
 pub use rail_and_arena::{
-    RailBurstReport, check_preact_occupancy, enforce_arena0_stability_invariants,
-    run_phase2_rail_burst,
+    RailBurstReport, check_preact_occupancy, enforce_arena_block0_k_nl_and_clamp,
+    enforce_arena0_stability_invariants, run_phase2_rail_burst,
 };
 
 use dnam_kernels::{

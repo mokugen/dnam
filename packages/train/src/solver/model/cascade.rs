@@ -2,7 +2,9 @@
 //! ZOH rate rescaling, and `2×` poly-quad oversampling/decimation matching `dnam-vm`
 //! (`ref[dsp.op-n.core.matryoshka-blocks]`, `ref[dsp.zoh.core-paralru]`).
 
-use dnam_vm::{SONA_INTERBLOCK_TILES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER};
+use dnam_vm::{
+    SONA_CORE_QUAD_BLOCK_AND_LOCAL, SONA_INTERBLOCK_TILES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER,
+};
 
 use crate::error::TrainError;
 use crate::gpu::abi::{FEATURE_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, TILE_FRAMES};
@@ -166,9 +168,18 @@ pub(crate) fn run_causal_core_cascade_stereo(
             quad_in[t * 2 + 1] = acc_r.map(|v| v as f32);
         }
 
-        let single_params = pack_core_quad_params(&quad.to_kernel_params());
-        let scan =
-            run_planned_core_scan(runner, n, 1, 1, write_checkpoints, &quad_in, &single_params)?;
+        let block_idx = SONA_CORE_QUAD_BLOCK_AND_LOCAL[q].0 as u32;
+        let single_params = pack_core_quad_params(&quad.to_kernel_params_for_block(block_idx));
+        let scan = run_planned_core_scan(
+            runner,
+            n,
+            1,
+            1,
+            write_checkpoints,
+            block_idx,
+            &quad_in,
+            &single_params,
+        )?;
         core_inputs[(q * n * 2)..((q + 1) * n * 2)].copy_from_slice(&quad_in);
         feature_outputs[(q * n * 6)..((q + 1) * n * 6)]
             .copy_from_slice(&scan.feature_outputs[..(n * 6)]);

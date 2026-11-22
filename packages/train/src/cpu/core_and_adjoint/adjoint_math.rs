@@ -2,6 +2,7 @@
 //! (`common`, `pullback`, `pass2`, and `adaa_deriv`) verbatim (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
 
 mod adaa_derivs;
+mod phs_svf;
 
 use adaa_derivs::{eval_adaa_wf_derivs, scrub_endpoint};
 use dnam_kernels::{
@@ -10,8 +11,9 @@ use dnam_kernels::{
     apply_stereo_link_vec4_pair, canonicalize_zero_f32_bits, soft_rect_zero_dc_f32,
     step_paralru_duhem_vec4, step_tpt_svf_vec4,
 };
+use phs_svf::{PhsFrameTerms, eval_phs_frame_terms, step_phs_tpt_reverse, step_tpt_svf_phs_scalar};
 
-use crate::gpu::abi::FEATURE_VEC4_STRIDE;
+use crate::gpu::abi::{FEATURE_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE};
 
 const IEEE_F32_EXP_MASK: u32 = 0x7f80_0000;
 
@@ -74,6 +76,7 @@ pub(super) struct LaneParams {
     pub wf_mix: f32,
     pub wf_open: bool,
     pub svf_g: f32,
+    pub svf_k_nl: f32,
     pub glu_mix_all: [f32; 4],
 }
 
@@ -122,6 +125,7 @@ impl LaneParams {
             wf_mix: clamp_nonneg_safe(wf_raw, 1.0),
             wf_open: is_finite_f32(wf_raw) && (0.0..=1.0).contains(&wf_raw),
             svf_g: svf_g_arr[c],
+            svf_k_nl: p.svf_k_nl.to_array()[c],
             glu_mix_all: p.glu_mix.to_array(),
         }
     }
@@ -184,6 +188,7 @@ pub(super) fn step_lane_forward(
     u_l: f32,
     u_r: f32,
     state: &mut [f32; 8],
+    is_phs: bool,
 ) -> FwdFrameState {
     let [
         s1_prev_l,
@@ -195,24 +200,42 @@ pub(super) fn step_lane_forward(
         r_prev_l,
         r_prev_r,
     ] = *state;
-    let mut s1_l = GpuVec4::splat(s1_prev_l);
-    let mut s2_l = GpuVec4::splat(s2_prev_l);
-    let svf_l = step_tpt_svf_vec4(GpuVec4::splat(u_l), &mut s1_l, &mut s2_l, svf_c);
-    let mut s1_r = GpuVec4::splat(s1_prev_r);
-    let mut s2_r = GpuVec4::splat(s2_prev_r);
-    let svf_r = step_tpt_svf_vec4(GpuVec4::splat(u_r), &mut s1_r, &mut s2_r, svf_c);
-    let taps_l = [
-        svf_l.lp.to_array()[0],
-        svf_l.bp.to_array()[0],
-        svf_l.hp.to_array()[0],
-        svf_l.ap.to_array()[0],
-    ];
-    let taps_r = [
-        svf_r.lp.to_array()[0],
-        svf_r.bp.to_array()[0],
-        svf_r.hp.to_array()[0],
-        svf_r.ap.to_array()[0],
-    ];
+    let (s1_next_l, s2_next_l, s1_next_r, s2_next_r, taps_l, taps_r) = if is_phs {
+        let mut s1_l = s1_prev_l;
+        let mut s2_l = s2_prev_l;
+        let tl = step_tpt_svf_phs_scalar(u_l, &mut s1_l, &mut s2_l, lp);
+        let mut s1_r = s1_prev_r;
+        let mut s2_r = s2_prev_r;
+        let tr = step_tpt_svf_phs_scalar(u_r, &mut s1_r, &mut s2_r, lp);
+        (s1_l, s2_l, s1_r, s2_r, tl, tr)
+    } else {
+        let mut s1_l = GpuVec4::splat(s1_prev_l);
+        let mut s2_l = GpuVec4::splat(s2_prev_l);
+        let svf_l = step_tpt_svf_vec4(GpuVec4::splat(u_l), &mut s1_l, &mut s2_l, svf_c);
+        let mut s1_r = GpuVec4::splat(s1_prev_r);
+        let mut s2_r = GpuVec4::splat(s2_prev_r);
+        let svf_r = step_tpt_svf_vec4(GpuVec4::splat(u_r), &mut s1_r, &mut s2_r, svf_c);
+        let tl = [
+            svf_l.lp.to_array()[0],
+            svf_l.bp.to_array()[0],
+            svf_l.hp.to_array()[0],
+            svf_l.ap.to_array()[0],
+        ];
+        let tr = [
+            svf_r.lp.to_array()[0],
+            svf_r.bp.to_array()[0],
+            svf_r.hp.to_array()[0],
+            svf_r.ap.to_array()[0],
+        ];
+        (
+            s1_l.to_array()[0],
+            s2_l.to_array()[0],
+            s1_r.to_array()[0],
+            s2_r.to_array()[0],
+            tl,
+            tr,
+        )
+    };
     let tone_l = (((taps_l[0] * lp.w_lp + taps_l[1] * lp.w_bp) + taps_l[2] * lp.w_hp)
         + taps_l[3] * lp.w_ap)
         + u_l * lp.w_dir;
@@ -245,10 +268,10 @@ pub(super) fn step_lane_forward(
     let r_curr_r = ((tone_r * lp.adaa_drive) * sag_r + lp.lru_bias_drive * v_eff_r) + 0.0;
 
     *state = [
-        s1_l.to_array()[0],
-        s2_l.to_array()[0],
-        s1_r.to_array()[0],
-        s2_r.to_array()[0],
+        s1_next_l,
+        s2_next_l,
+        s1_next_r,
+        s2_next_r,
         v_raw_l,
         v_raw_r,
         scrub_endpoint(r_curr_l),
@@ -343,6 +366,7 @@ fn eval_duhem_terms(u_rect: f32, bp: f32, v_prev: f32, lp: &LaneParams) -> Duhem
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 #[inline(always)]
 fn duhem_channel_grad(
     lam: f32,
@@ -351,8 +375,10 @@ fn duhem_channel_grad(
     tone: f32,
     u: f32,
     taps: [f32; 4],
+    k_eff: f32,
+    two_k_eff: f32,
     lp: &LaneParams,
-) -> (f32, f32, f32, [f32; 14]) {
+) -> (f32, f32, f32, f32, f32, [f32; 14]) {
     let adj_u_rect = lam * t.rho * t.phi_eta_prime;
     let adj_tone = adj_tone_from_r + adj_u_rect * lp.rect_sign;
     let phi_eta = if lp.signed_mix <= 0.0 {
@@ -394,7 +420,7 @@ fn duhem_channel_grad(
     let adj_hp = adj_tone * lp.w_hp;
     let adj_ap = adj_tone * lp.w_ap;
     let adj_u_nonrec = adj_tone * lp.w_dir + adj_hp + adj_ap;
-    let adj_v1 = adj_bp - lp.k * adj_hp - lp.two_k * adj_ap;
+    let adj_v1 = adj_bp - k_eff * adj_hp - two_k_eff * adj_ap;
     let adj_v2 = adj_lp - adj_hp;
     let grads = [
         g_rel,
@@ -412,7 +438,7 @@ fn duhem_channel_grad(
         -adj_hp * taps[1],
         -adj_ap * taps[1],
     ];
-    (adj_v1, adj_v2, adj_u_nonrec, grads)
+    (adj_v1, adj_v2, adj_u_nonrec, adj_hp, adj_ap, grads)
 }
 
 #[derive(Copy, Clone, Default)]
@@ -427,7 +453,7 @@ pub(super) struct ReverseCarry {
 
 #[derive(Copy, Clone, Default)]
 pub(super) struct TileGradAccum {
-    pub slots: [f32; 24],
+    pub slots: [f32; QUAD_PARAMS_VEC4_STRIDE],
 }
 
 /// Shared immutable trajectory slices and scalar coordinates for [`step_lane_reverse`].
@@ -448,6 +474,7 @@ pub(super) fn step_lane_reverse(
     frame: usize,
     carry: &mut ReverseCarry,
     acc: &mut TileGradAccum,
+    is_phs: bool,
 ) -> (f32, f32) {
     let c = ctx.c;
     let feat_base = (ctx.q_global * ctx.num_frames + frame) * FEATURE_VEC4_STRIDE;
@@ -533,27 +560,67 @@ pub(super) fn step_lane_reverse(
     carry.lam_after_l = tl.jac * lam_l;
     carry.lam_after_r = tr.jac * lam_r;
 
-    let (adj_v1_l, adj_v2_l, adj_u_nonrec_l, gl) = duhem_channel_grad(
+    let (phs_l, phs_r) = if is_phs {
+        (
+            eval_phs_frame_terms(fwd.u_l, fwd.s1_prev_l, fwd.s2_prev_l, lp),
+            eval_phs_frame_terms(fwd.u_r, fwd.s1_prev_r, fwd.s2_prev_r, lp),
+        )
+    } else {
+        (PhsFrameTerms::default(), PhsFrameTerms::default())
+    };
+    let (ke_l, two_ke_l, ke_r, two_ke_r) = if is_phs {
+        (
+            phs_l.k_eff,
+            2.0 * phs_l.k_eff,
+            phs_r.k_eff,
+            2.0 * phs_r.k_eff,
+        )
+    } else {
+        (lp.k, lp.two_k, lp.k, lp.two_k)
+    };
+    let (adj_v1_l, adj_v2_l, adj_u_nonrec_l, adj_hp_l, adj_ap_l, gl) = duhem_channel_grad(
         lam_l,
         &tl,
         adj_tone_r_l,
         fwd.tone_l,
         fwd.u_l,
         fwd.taps_l,
+        ke_l,
+        two_ke_l,
         lp,
     );
-    let (adj_v1_r, adj_v2_r, adj_u_nonrec_r, gr) = duhem_channel_grad(
+    let (adj_v1_r, adj_v2_r, adj_u_nonrec_r, adj_hp_r, adj_ap_r, gr) = duhem_channel_grad(
         lam_r,
         &tr,
         adj_tone_r_r,
         fwd.tone_r,
         fwd.u_r,
         fwd.taps_r,
+        ke_r,
+        two_ke_r,
         lp,
     );
     let grad_map = [10, 11, 12, 13, 14, 16, 17, 5, 6, 7, 8, 9, 3, 4];
-    for (idx, &slot) in grad_map.iter().enumerate() {
+    for (idx, &slot) in grad_map[..12].iter().enumerate() {
         acc.slots[slot] += gl[idx] + gr[idx];
+    }
+    if is_phs {
+        return step_phs_tpt_reverse(
+            fwd,
+            lp,
+            &phs_l,
+            &phs_r,
+            [adj_v1_l, adj_v1_r],
+            [adj_v2_l, adj_v2_r],
+            [adj_hp_l, adj_hp_r],
+            [adj_ap_l, adj_ap_r],
+            [adj_u_nonrec_l, adj_u_nonrec_r],
+            carry,
+            acc,
+        );
+    }
+    for (idx, &slot) in grad_map[12..].iter().enumerate() {
+        acc.slots[slot] += gl[12 + idx] + gr[12 + idx];
     }
 
     let tot_v1_l = adj_v1_l + 2.0 * carry.adj_s_out_l[0];
@@ -667,7 +734,7 @@ mod tests {
             c: 0,
             tiny_eps: 1.0e-6,
         };
-        let (du_l, du_r) = step_lane_reverse(&ctx, &fwd, &lp, 0, &mut carry, &mut acc);
+        let (du_l, du_r) = step_lane_reverse(&ctx, &fwd, &lp, 0, &mut carry, &mut acc, false);
         assert!(du_l.is_finite() && du_r.is_finite());
         assert_eq!(acc.slots[10], 0.0);
         assert_eq!(acc.slots[15], 0.0);

@@ -7,8 +7,8 @@
 
 use crate::abi::{ADJOINT_SCAN_SCRATCH_FLOATS, AdjointScanUniforms, TILE_FRAMES};
 use crate::core_math::{
-    TILE_ADJ_BOUNDARY_VEC4_STRIDE, linear_adjoint_reverse_suffix_256_lr, load_vec4, store_vec4,
-    tpt_adjoint_reverse_suffix_256,
+    TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_ADJ_LANE_VEC4_STRIDE, linear_adjoint_reverse_suffix_256_lr,
+    load_vec4, store_vec4, tpt_adjoint_reverse_suffix_256,
 };
 use dnam_kernels::{LinearScanElem, TptAdjointElem, apply_linear_scan, apply_tpt_adjoint};
 use spirv_std::glam::Vec4;
@@ -39,12 +39,14 @@ pub fn run_pass1(
             let b = (num_blocks - 1) - b_rev;
             let tile_idx = b * TILE_FRAMES + i;
             let in_range = tile_idx < num_tiles;
-            let slot = (q_global * num_tiles + tile_idx) * TILE_ADJ_BOUNDARY_VEC4_STRIDE + c * 4;
+            let slot = (q_global * num_tiles + tile_idx) * TILE_ADJ_BOUNDARY_VEC4_STRIDE
+                + c * TILE_ADJ_LANE_VEC4_STRIDE;
 
             let (lru_elem_l, lru_elem_r, tpt_elem_l, tpt_elem_r) = if in_range {
                 let s0 = load_vec4(tile_adj_boundaries, slot);
                 let s1 = load_vec4(tile_adj_boundaries, slot + 1);
                 let s2 = load_vec4(tile_adj_boundaries, slot + 2);
+                let s4 = load_vec4(tile_adj_boundaries, slot + 4);
                 (
                     LinearScanElem { a: s2.x, b: s2.y },
                     LinearScanElem { a: s2.z, b: s2.w },
@@ -57,10 +59,10 @@ pub fn run_pass1(
                         g1: s1.y,
                     },
                     TptAdjointElem {
-                        t00: s0.x,
-                        t01: s0.y,
-                        t10: s0.z,
-                        t11: s0.w,
+                        t00: s4.x,
+                        t01: s4.y,
+                        t10: s4.z,
+                        t11: s4.w,
                         g0: s1.z,
                         g1: s1.w,
                     },

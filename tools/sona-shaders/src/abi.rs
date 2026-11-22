@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! Shared `32 B` `zerocopy` uniform structs, `15,872 B` workgroup SRAM ceilings, and
-//! `CoreQuadParamsStereo4` `24 × Vec4` buffer layout strides (`ref[train.pipeline.webgpu-scans-and-ozaki]`,
+//! `CoreQuadParamsStereo4` `25 × Vec4` buffer layout strides (`ref[train.pipeline.webgpu-scans-and-ozaki]`,
 //! `ref[sdk.rust.zerocopy-wire-structs]`, `ref[repo.code.constant-eval-and-derivations]`).
 
 use core::mem::{align_of, offset_of, size_of};
@@ -63,13 +63,14 @@ pub const ADJOINT_CORE_SRAM_BYTES: usize = ADJOINT_S_PREV2_VEC4S * size_of::<[f3
     + ADJOINT_SCAN_SCRATCH_FLOATS * size_of::<f32>()
     + ADJOINT_AUX_FLOATS * size_of::<f32>();
 
-/// Slot indices (`0..24`) for the exact uncompressed `24 × [f32; 4]` packing of
+/// Slot indices (`0..25`) for the exact uncompressed `25 × [f32; 4]` packing of
 /// [`dnam_kernels::CoreQuadParamsStereo4`] per `(stem, quad)` in `quad_params` & `param_grads`:
 /// - `0..=4`: `svf.{a1, a2, a3, k, two_k}` (`5 × Vec4`)
 /// - `5..=9`: `tone.{lp, bp, hp, ap, dir}` (`5 × Vec4`)
 /// - `10..=15`: `lru.{alpha_rel, alpha_atk, kappa, gamma_duhem, signed_mix, stereo_link}` (`6 × Vec4`)
 /// - `16..=22`: `two_svf_g, rect_sign, sag_depth, adaa_drive, lru_bias_drive, wavefolder_mix, glu_mix` (`7 × Vec4`)
 /// - `23`: `svf_g` (`two_svf_g * 0.5` for `TPT-SVF` `g` / flux sensitivity, or `0.0` when reserved)
+/// - `24`: `svf_k_nl` (Block 0 PHS diode-bandpass damping `[0.0, 16.0]`; `0.0` on Blocks 1..3)
 pub mod quad_param_slots {
     pub const SVF_A1: usize = 0;
     pub const SVF_A2: usize = 1;
@@ -95,7 +96,8 @@ pub mod quad_param_slots {
     pub const WAVEFOLDER_MIX: usize = 21;
     pub const GLU_MIX: usize = 22;
     pub const SVF_G: usize = 23;
-    pub const TOTAL_SLOTS: usize = SVF_G + 1;
+    pub const SVF_K_NL: usize = 24;
+    pub const TOTAL_SLOTS: usize = SVF_K_NL + 1;
 }
 
 /// Number of `Vec4` (`f32[4]`) vectors per `(stem, quad, frame)` in `core_inputs` and `d_loss_d_inputs` (`L`, `R`).
@@ -112,9 +114,13 @@ pub const TILE_CKPT_VEC4_STRIDE: usize = 8;
 /// `(v_eff_L, v_eff_R, adaa_odd_L, adaa_odd_R, adaa_even_L, adaa_even_R)`.
 pub const FEATURE_VEC4_STRIDE: usize = 6;
 
+/// Number of `Vec4` summary vectors per lane channel `c in 0..4` in `tile_adj_boundaries`
+/// (`T_L`, `(g0_L, g1_L, g0_R, g1_R)`, `ParaLRU`, `ADAA seam`, `T_R`).
+pub const TILE_ADJ_LANE_VEC4_STRIDE: usize = 5;
+
 /// Number of `Vec4` vectors per `(stem, q_local, tile)` in `tile_adj_boundaries`
-/// (`4` lane channels × `4` summary `Vec4`s = `256 B`).
-pub const TILE_ADJ_BOUNDARY_VEC4_STRIDE: usize = 4 * 4;
+/// (`4` lane channels × `5` summary `Vec4`s = `320 B`).
+pub const TILE_ADJ_BOUNDARY_VEC4_STRIDE: usize = 4 * TILE_ADJ_LANE_VEC4_STRIDE;
 
 /// Number of `f32` scalars per seed in `prescreen_population`'s `seed_params`.
 pub const PRESCREEN_SEED_PARAM_STRIDE: usize = 16;
@@ -245,7 +251,7 @@ const _: () = assert!(GABOR_BEZOUT_SRAM_BYTES <= MAX_WORKGROUP_SRAM_BYTES as u32
 const _: () = assert!(OZAKI_GRAM_SRAM_BYTES <= MAX_WORKGROUP_SRAM_BYTES as u32);
 const _: () = assert!(INNER_OPT_SRAM_BYTES <= MAX_WORKGROUP_SRAM_BYTES as u32);
 const _: () = assert!(CORE_INPUT_VEC4_STRIDE == 2);
-const _: () = assert!(QUAD_PARAMS_VEC4_STRIDE == 24);
+const _: () = assert!(QUAD_PARAMS_VEC4_STRIDE == 25);
 const _: () = assert!(
     size_of::<CoreQuadParamsStereo4<GpuVec4>>()
         == (QUAD_PARAMS_VEC4_STRIDE - 1) * size_of::<[f32; 4]>()
@@ -254,7 +260,8 @@ const _: () = assert!(GPU_OZAKI_MAX_CHUNK_LEN == 1024);
 const _: () = assert!(GPU_SOFT_RECT_EPS > 0.0);
 const _: () = assert!(TILE_CKPT_VEC4_STRIDE == 8);
 const _: () = assert!(FEATURE_VEC4_STRIDE == 6);
-const _: () = assert!(TILE_ADJ_BOUNDARY_VEC4_STRIDE == 16);
+const _: () = assert!(TILE_ADJ_LANE_VEC4_STRIDE == 5);
+const _: () = assert!(TILE_ADJ_BOUNDARY_VEC4_STRIDE == 20);
 const _: () = assert!(PRESCREEN_SEED_PARAM_STRIDE == 16);
 const _: () = assert!(OZAKI_WORDS_PER_PAIR == 6);
 const _: () = assert!(LBFGS_MAX_HISTORY_M == 8);

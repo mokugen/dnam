@@ -6,6 +6,8 @@
 pub mod adjoints;
 mod eval;
 pub mod op_t_quad;
+mod qat_polish;
+mod theta;
 
 pub use adjoints::{
     eval_kautz_modal_and_adjoint, eval_kautz_modal_channel_and_adjoint, eval_op_n_pre_and_adjoint,
@@ -13,20 +15,22 @@ pub use adjoints::{
 };
 pub use op_t_quad::{OpTQuadAdjointGrads, OpTQuadAdjointSlices, eval_op_t_quad_stereo_and_adjoint};
 
-use core::f64::consts::PI;
-
-use dnam_kernels::{MIN_TPT_G, TANK_MAX_G_LIN_F32};
-use dnam_vm::Tier;
-
 use crate::error::TrainError;
 use crate::gpu::abi::{PRESCREEN_SEED_PARAM_STRIDE, PrescreenUniforms, TILE_FRAMES};
-use crate::linalg::lbfgs::{LbfgsConfig, ParamBoundSpec, TwoLoopLbfgs};
+use crate::linalg::lbfgs::{LbfgsConfig, TwoLoopLbfgs};
 use crate::losses::{CompositeLossConfig, CompositeLossEvaluator};
 use crate::runner::{PrescreenInput, TrainRunner};
 
-use super::model::{SonaModelF64, StereoTrainingPairs};
+use super::model::{SonaModelF64, StereoTrainingPairs, snap_non_readout_fp16};
 use super::progress::{AtomicDnprProgress, ProgressMetrics, TrainingPhase, TrainingStatus};
-use eval::{Pass2AdjInput, Pass2ParamGrads, assemble_pass2_gradients, eval_model_pass2_audio};
+use eval::{Pass2AdjInput, assemble_pass2_gradients, eval_model_pass2_audio};
+use qat_polish::run_pass2_ste_qat_polish;
+use theta::ThetaLayout;
+
+use core::f64::consts::PI;
+
+use dnam_kernels::MIN_TPT_G;
+use dnam_vm::Tier;
 
 /// Convergence delta in dB below which diminishing-returns patience increments (`0.01 dB/epoch`).
 pub const DIMINISHING_RETURNS_DELTA_DB: f64 = 0.01;
@@ -46,6 +50,8 @@ pub struct Pass2OptConfig {
     pub warmup_frames: usize,
     /// Active `CoreQuad` blocks updated during Pass 2 (`1..=10`).
     pub active_quads: usize,
+    /// Straight-Through Estimator `fp16` QAT Adam polish steps after L-BFGS (`0` disables).
+    pub qat_polish_steps: usize,
 }
 
 impl Default for Pass2OptConfig {
@@ -57,6 +63,7 @@ impl Default for Pass2OptConfig {
             sample_rate_hz: 48_000.0,
             warmup_frames: 64,
             active_quads: 4,
+            qat_polish_steps: 8,
         }
     }
 }
@@ -66,6 +73,10 @@ impl Default for Pass2OptConfig {
 pub struct Pass2OptReport {
     /// Total outer optimization epochs executed.
     pub epochs_run: usize,
+    /// Number of STE `fp16` QAT polish steps executed after L-BFGS.
+    pub qat_polish_steps_run: usize,
+    /// Quantized baseline composite loss immediately prior to STE QAT polish.
+    pub qat_baseline_loss: f64,
     /// Whether convergence stopped on diminishing returns (`|delta_bESR| < 0.01 dB/epoch`).
     pub converged_diminishing_returns: bool,
     /// Best retained approximate composite `bESR` in dB.
@@ -197,191 +208,6 @@ fn select_and_unpack_prescreen_winner(
     win_idx
 }
 
-struct ThetaLayout {
-    q_opt: usize,
-    k_opt: usize,
-    op_t_enabled: bool,
-    max_tau: f64,
-}
-
-impl ThetaLayout {
-    fn pack(&self, m: &SonaModelF64) -> (Vec<f64>, Vec<ParamBoundSpec>) {
-        let g_max = f64::from(TANK_MAX_G_LIN_F32);
-        let mut x = Vec::with_capacity(96);
-        let mut b = Vec::with_capacity(96);
-
-        x.push(m.op_n_pre_gamma_bc);
-        b.push(ParamBoundSpec::Box { lo: 0.0, hi: 1.0 });
-        x.push(m.op_n_pre_beta_q);
-        b.push(ParamBoundSpec::Box { lo: 0.0, hi: 16.0 });
-
-        for q in 0..self.q_opt {
-            for k in 0..4 {
-                x.push(m.core_quads[q].adaa_drive[k]);
-                b.push(ParamBoundSpec::Box {
-                    lo: -32.0,
-                    hi: 32.0,
-                });
-                for col in 6..10 {
-                    x.push(m.w_ro[q * 4 + k][col]);
-                    b.push(ParamBoundSpec::Box { lo: -8.0, hi: 8.0 });
-                }
-            }
-        }
-        x.push(m.direct_s2_u_gain[0]);
-        b.push(ParamBoundSpec::Box { lo: -8.0, hi: 8.0 });
-        x.push(m.direct_s2_u_gain[1]);
-        b.push(ParamBoundSpec::Box { lo: -8.0, hi: 8.0 });
-
-        for k in 0..self.k_opt {
-            let kp = &m.kautz[k];
-            x.push(kp.r_low);
-            b.push(ParamBoundSpec::Box {
-                lo: 0.25,
-                hi: 0.999,
-            });
-            x.push(kp.theta);
-            b.push(ParamBoundSpec::Box {
-                lo: 1.0e-4,
-                hi: PI - 1.0e-4,
-            });
-            x.push(kp.c_re_l);
-            b.push(ParamBoundSpec::Box { lo: -8.0, hi: 8.0 });
-            x.push(kp.c_im_l);
-            b.push(ParamBoundSpec::Box { lo: -8.0, hi: 8.0 });
-            x.push(kp.c_re_r);
-            b.push(ParamBoundSpec::Box { lo: -8.0, hi: 8.0 });
-            x.push(kp.c_im_r);
-            b.push(ParamBoundSpec::Box { lo: -8.0, hi: 8.0 });
-        }
-
-        if self.op_t_enabled {
-            let tq = &m.transport_quads[0];
-            for k in 0..4 {
-                x.push(tq.delay_samples[k]);
-                b.push(ParamBoundSpec::Box {
-                    lo: 5.0,
-                    hi: self.max_tau,
-                });
-            }
-            x.push(tq.g_loop);
-            b.push(ParamBoundSpec::Box { lo: 0.0, hi: g_max });
-            x.push(tq.damp_pole);
-            b.push(ParamBoundSpec::Box { lo: 0.0, hi: 0.999 });
-            for k in 0..4 {
-                x.push(tq.input_gains[k]);
-                b.push(ParamBoundSpec::Box { lo: -2.0, hi: 2.0 });
-            }
-            for &wt in &[
-                tq.wet_tap_l[0],
-                tq.wet_tap_l[2],
-                tq.wet_tap_r[1],
-                tq.wet_tap_r[3],
-            ] {
-                x.push(wt);
-                b.push(ParamBoundSpec::Box { lo: -2.0, hi: 2.0 });
-            }
-        }
-        (x, b)
-    }
-
-    fn unpack(&self, cand: &[f64], m: &mut SonaModelF64) {
-        let g_max = f64::from(TANK_MAX_G_LIN_F32);
-        let mut p = 0_usize;
-        m.op_n_pre_gamma_bc = cand[p].clamp(0.0, 1.0);
-        m.op_n_pre_beta_q = cand[p + 1].clamp(0.0, 16.0);
-        p += 2;
-
-        for q in 0..self.q_opt {
-            for k in 0..4 {
-                m.core_quads[q].adaa_drive[k] = cand[p].clamp(-32.0, 32.0);
-                p += 1;
-                for col in 6..10 {
-                    m.w_ro[q * 4 + k][col] = cand[p].clamp(-8.0, 8.0);
-                    p += 1;
-                }
-            }
-        }
-        m.direct_s2_u_gain = [cand[p].clamp(-8.0, 8.0), cand[p + 1].clamp(-8.0, 8.0)];
-        p += 2;
-
-        for k in 0..self.k_opt {
-            let kp = &mut m.kautz[k];
-            kp.r_low = cand[p].clamp(0.25, 0.999);
-            kp.dr = kp.dr.clamp(0.0, 0.9995 - kp.r_low);
-            kp.theta = cand[p + 1].clamp(1.0e-4, PI - 1.0e-4);
-            kp.c_re_l = cand[p + 2].clamp(-8.0, 8.0);
-            kp.c_im_l = cand[p + 3].clamp(-8.0, 8.0);
-            kp.c_re_r = cand[p + 4].clamp(-8.0, 8.0);
-            kp.c_im_r = cand[p + 5].clamp(-8.0, 8.0);
-            p += 6;
-        }
-
-        if self.op_t_enabled {
-            let tq = &mut m.transport_quads[0];
-            for k in 0..4 {
-                tq.delay_samples[k] = cand[p].clamp(5.0, self.max_tau);
-                p += 1;
-            }
-            tq.g_loop = cand[p].clamp(0.0, g_max);
-            tq.damp_pole = cand[p + 1].clamp(0.0, 0.999);
-            p += 2;
-            for k in 0..4 {
-                tq.input_gains[k] = cand[p].clamp(-2.0, 2.0);
-                p += 1;
-            }
-            tq.wet_tap_l[0] = cand[p].clamp(-2.0, 2.0);
-            tq.wet_tap_l[2] = cand[p + 1].clamp(-2.0, 2.0);
-            tq.wet_tap_r[1] = cand[p + 2].clamp(-2.0, 2.0);
-            tq.wet_tap_r[3] = cand[p + 3].clamp(-2.0, 2.0);
-        }
-        m.clamp_all_stability_bounds(true);
-    }
-
-    fn write_grad(&self, grads: &Pass2ParamGrads, out: &mut [f64]) {
-        let mut p = 0_usize;
-        out[p] = grads.d_gamma_bc;
-        out[p + 1] = grads.d_beta_q;
-        p += 2;
-
-        for q in 0..self.q_opt {
-            for k in 0..4 {
-                out[p] = grads.d_adaa[q][k];
-                p += 1;
-                for c in 0..4 {
-                    out[p] = grads.d_w_ro_direct[q][k][c];
-                    p += 1;
-                }
-            }
-        }
-        out[p] = grads.d_direct_s2_u[0];
-        out[p + 1] = grads.d_direct_s2_u[1];
-        p += 2;
-
-        for k in 0..self.k_opt {
-            out[p..p + 6].copy_from_slice(&grads.d_kautz[k]);
-            p += 6;
-        }
-        if self.op_t_enabled {
-            for k in 0..4 {
-                out[p] = grads.d_op_t.d_delay_samples[k];
-                p += 1;
-            }
-            out[p] = grads.d_op_t.d_g_loop;
-            out[p + 1] = grads.d_op_t.d_damp_pole;
-            p += 2;
-            for k in 0..4 {
-                out[p] = grads.d_op_t.d_input_gains[k];
-                p += 1;
-            }
-            out[p] = grads.d_op_t.d_wet_tap_l[0];
-            out[p + 1] = grads.d_op_t.d_wet_tap_l[2];
-            out[p + 2] = grads.d_op_t.d_wet_tap_r[1];
-            out[p + 3] = grads.d_op_t.d_wet_tap_r[3];
-        }
-    }
-}
-
 /// Runs Pass-2 Sobol prescreening + L-BFGS optimization across `Op-N[Pre]`, `CoreQuad` ADAA/readout,
 /// stereo Kautz resonators, and 4-lane `Op-T` strictly under `BestUntilDiminishingReturns`
 /// (`|delta_bESR| < 0.01 dB/epoch`).
@@ -432,7 +258,7 @@ pub fn run_pass2_optimize(
 
     let q_count = config.active_quads.clamp(1, 10);
     let layout = ThetaLayout {
-        q_opt: q_count.min(4),
+        q_opt: q_count,
         k_opt: model.active_kautz_pairs.min(8),
         op_t_enabled: model.transport_quads[0]
             .input_gains
@@ -536,6 +362,16 @@ pub fn run_pass2_optimize(
     })?;
 
     *model = best_model;
+    let (qat_polish_steps_run, qat_baseline_loss) = if config.qat_polish_steps > 0 {
+        let qat = run_pass2_ste_qat_polish(runner, model, pairs, &loss_eval, &layout, config)?;
+        best_loss = qat.best_loss;
+        best_besr_db = qat.best_besr_db;
+        (qat.steps_run, qat.baseline_loss)
+    } else {
+        snap_non_readout_fp16(model);
+        (0_usize, best_loss)
+    };
+
     #[cfg(not(target_arch = "wasm32"))]
     let elapsed_ms = start_instant.elapsed().as_millis() as u64;
     #[cfg(target_arch = "wasm32")]
@@ -543,6 +379,8 @@ pub fn run_pass2_optimize(
 
     Ok(Pass2OptReport {
         epochs_run: eval_grad_calls.saturating_sub(1),
+        qat_polish_steps_run,
+        qat_baseline_loss,
         converged_diminishing_returns: converged,
         best_besr_db,
         best_loss,
@@ -581,12 +419,77 @@ mod tests {
                 sample_rate_hz: 48_000.0,
                 warmup_frames: 32,
                 active_quads: 2,
+                qat_polish_steps: 4,
             },
             Some(&prog),
         )
         .unwrap();
         assert!(rep.winning_seed_index < 64);
         assert!(rep.best_loss.is_finite());
+        assert_eq!(rep.qat_polish_steps_run, 4);
+        assert!(rep.best_loss <= rep.qat_baseline_loss);
         assert_eq!(prog.snapshot().phase(), TrainingPhase::Pass2Backbone);
+
+        // Exercise active_quads > 4 (covering Block 0 quads {0, 4}) with qat_polish_steps=0
+        // (wire-snapped output) and qat_polish_steps=2 (monotone non-regression).
+        let mut model6_nosnap = SonaModelF64::new(48_000.0);
+        let rep6_0 = run_pass2_optimize(
+            &runner,
+            &mut model6_nosnap,
+            &StereoTrainingPairs {
+                in_l: &in_l,
+                in_r: &in_r,
+                target_l: &tgt_l,
+                target_r: &tgt_r,
+            },
+            Pass2OptConfig {
+                num_prescreen_seeds: 16,
+                max_epochs: 3,
+                diminishing_patience: 2,
+                sample_rate_hz: 48_000.0,
+                warmup_frames: 32,
+                active_quads: 6,
+                qat_polish_steps: 0,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(rep6_0.qat_polish_steps_run, 0);
+        let mut ref_snapped = model6_nosnap.clone();
+        snap_non_readout_fp16(&mut ref_snapped);
+        assert_eq!(
+            model6_nosnap.core_quads[4].adaa_drive,
+            ref_snapped.core_quads[4].adaa_drive
+        );
+        assert_eq!(
+            model6_nosnap.core_quads[4].svf_k_nl,
+            ref_snapped.core_quads[4].svf_k_nl
+        );
+        assert_eq!(model6_nosnap.core_quads[5].svf_k_nl, [0.0; 4]);
+
+        let mut model6_qat = SonaModelF64::new(48_000.0);
+        let rep6_2 = run_pass2_optimize(
+            &runner,
+            &mut model6_qat,
+            &StereoTrainingPairs {
+                in_l: &in_l,
+                in_r: &in_r,
+                target_l: &tgt_l,
+                target_r: &tgt_r,
+            },
+            Pass2OptConfig {
+                num_prescreen_seeds: 16,
+                max_epochs: 3,
+                diminishing_patience: 2,
+                sample_rate_hz: 48_000.0,
+                warmup_frames: 32,
+                active_quads: 6,
+                qat_polish_steps: 2,
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(rep6_2.qat_polish_steps_run, 2);
+        assert!(rep6_2.best_loss <= rep6_2.qat_baseline_loss);
     }
 }

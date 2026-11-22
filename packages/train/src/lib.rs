@@ -37,11 +37,11 @@ pub use control::{
     SonaCoreStabilityParams, StageStabilityConstraint, StageTargetBounds, SweepWindowSegment,
     TSYN_SUBDIV_QUARTER, audit_phase1_controls, audit_phase3_dynamic_and_head_gain,
     build_tsyn_entry_wire, build_tsyn_entry_wire_with_cond, check_preact_occupancy,
-    enforce_arena0_stability_invariants, eval_corner_barrier_loss_and_grad,
-    eval_stop_grad_corner_and_phys_barrier, evaluate_readout_spectral_magnitudes,
-    extract_sweep_window_midpoints, fit_and_pack_cp1, fit_and_pack_cp1_audited,
-    pack_cp1_slots_into_wire, render_vm_mono_probe, run_phase2_rail_burst,
-    solve_control_jacobian_32slot, solve_two_pass_four_band_wiener,
+    enforce_arena_block0_k_nl_and_clamp, enforce_arena0_stability_invariants,
+    eval_corner_barrier_loss_and_grad, eval_stop_grad_corner_and_phys_barrier,
+    evaluate_readout_spectral_magnitudes, extract_sweep_window_midpoints, fit_and_pack_cp1,
+    fit_and_pack_cp1_audited, pack_cp1_slots_into_wire, render_vm_mono_probe,
+    run_phase2_rail_burst, solve_control_jacobian_32slot, solve_two_pass_four_band_wiener,
 };
 pub use cpu::CpuRunner;
 pub use error::TrainError;

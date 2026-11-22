@@ -95,10 +95,10 @@ fn test_abi_uniform_sizes_sram_ceilings_and_browser_helper() {
     assert_eq!(MAX_WORKGROUP_SRAM_BYTES, 15_872);
     assert_eq!(FUSED_CORE_SRAM_BYTES, 15_360);
     assert_eq!(ADJOINT_CORE_SRAM_BYTES, 14_848);
-    assert_eq!(QUAD_PARAMS_VEC4_STRIDE, 24);
+    assert_eq!(QUAD_PARAMS_VEC4_STRIDE, 25);
     assert_eq!(TILE_CKPT_VEC4_STRIDE, 8);
     assert_eq!(FEATURE_VEC4_STRIDE, 6);
-    assert_eq!(TILE_ADJ_BOUNDARY_VEC4_STRIDE, 16);
+    assert_eq!(TILE_ADJ_BOUNDARY_VEC4_STRIDE, 20);
     assert_eq!(PRESCREEN_SEED_PARAM_STRIDE, 16);
     assert_eq!(OZAKI_WORDS_PER_PAIR, 6);
     assert_eq!(LBFGS_MAX_HISTORY_M, 8);

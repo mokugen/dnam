@@ -4,7 +4,7 @@ Isolated standalone Rust tool workspace compiling [`dnam-kernels`](../../package
 
 | Module / Path | Responsibility | Canonical Spec (SSOT) |
 | :--- | :--- | :--- |
-| [`src/abi.rs`](src/abi.rs) | 32 B `zerocopy` uniforms, SRAM ceilings, `24 × Vec4` `CoreQuad` parameter layout | [`webgpu_and_varpro_solver.md`](../../docs/specs/training/webgpu_and_varpro_solver.md) |
+| [`src/abi.rs`](src/abi.rs) | 32 B `zerocopy` uniforms, SRAM ceilings, `25 × Vec4` `CoreQuad` parameter layout | [`webgpu_and_varpro_solver.md`](../../docs/specs/training/webgpu_and_varpro_solver.md) |
 | [`src/manifest.rs`](src/manifest.rs) | 6-kernel registry, expected binding specs, `ShaderManifest`, `prepare_for_browser_webgpu` | [`webgpu_and_varpro_solver.md`](../../docs/specs/training/webgpu_and_varpro_solver.md) |
 | [`src/validate.rs`](src/validate.rs) | `naga` parse/validate, `<= 15,872 B` SRAM check, zero 64-bit check, ABI enforcement | [`webgpu_and_varpro_solver.md`](../../docs/specs/training/webgpu_and_varpro_solver.md) |
 | [`src/compiler.rs`](src/compiler.rs) | Portable + `subgroups` AOT build, SHA-256 manifest emission, `check_drift()` | [`rust_sdk.md`](../../docs/specs/sdks/rust_sdk.md) |

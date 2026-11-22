@@ -117,7 +117,7 @@ pub fn verify_fused_core_scan_256_parity_and_zero_dc(ctx: &GpuContext, variant: 
         tile_start: 0,
         soft_rect_eps: SOFT_RECT_EPS,
         tiny_crossing_eps: TINY_CROSSING_EPS,
-        block_idx: 0,
+        block_idx: 1,
     };
 
     let (out, _elapsed) = dispatch_kernel(
@@ -349,7 +349,7 @@ fn verify_adjoint_pass1_multiblock_fd(ctx: &GpuContext, variant: ShaderVariant) 
         tile_start: 0,
         soft_rect_eps: SOFT_RECT_EPS,
         tiny_crossing_eps: TINY_CROSSING_EPS,
-        block_idx: 0,
+        block_idx: 1,
     };
     let (fwd_out, _) = dispatch_kernel(
         ctx,
@@ -390,7 +390,7 @@ fn verify_adjoint_pass1_multiblock_fd(ctx: &GpuContext, variant: ShaderVariant) 
             pass_mode,
             soft_rect_eps: SOFT_RECT_EPS,
             tiny_crossing_eps: TINY_CROSSING_EPS,
-            block_idx: 0,
+            block_idx: 1,
         };
         let (out, _) = dispatch_kernel(
             ctx,
@@ -464,7 +464,7 @@ pub fn verify_adjoint_scan_256_fd_parity(ctx: &GpuContext, variant: ShaderVarian
         tile_start: 0,
         soft_rect_eps: SOFT_RECT_EPS,
         tiny_crossing_eps: TINY_CROSSING_EPS,
-        block_idx: 0,
+        block_idx: 1,
     };
     let (fwd_out, _) = dispatch_kernel(
         ctx,
@@ -511,7 +511,7 @@ pub fn verify_adjoint_scan_256_fd_parity(ctx: &GpuContext, variant: ShaderVarian
             pass_mode,
             soft_rect_eps: SOFT_RECT_EPS,
             tiny_crossing_eps: TINY_CROSSING_EPS,
-            block_idx: 0,
+            block_idx: 1,
         };
         let (out, _) = dispatch_kernel(
             ctx,
@@ -662,6 +662,11 @@ pub fn verify_adjoint_scan_256_fd_parity(ctx: &GpuContext, variant: ShaderVarian
                      got={g_gpu} fd={fd} tol={tol}"
                 );
             }
+        }
+        for tile in 0..NUM_TILES {
+            let p_idx = (q_global * NUM_TILES + tile) * QUAD_PARAMS_VEC4_STRIDE
+                + quad_param_slots::SVF_K_NL;
+            assert_eq!(got_pgrad[p_idx].map(f32::to_bits), [0; 4]);
         }
     }
 

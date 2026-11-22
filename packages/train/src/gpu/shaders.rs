@@ -351,7 +351,18 @@ mod tests {
                 detail: "missing portable or subgroups array section",
             })
         );
-        let tampered = MANIFEST_JSON.replacen("fc1333", "000000", 1);
+        let sha_key = "\"sha256\": \"";
+        let pre_sha_idx = MANIFEST_JSON
+            .find(sha_key)
+            .expect("manifest must contain prescreen_population sha256")
+            + sha_key.len();
+        let pre_sha6 = &MANIFEST_JSON[pre_sha_idx..pre_sha_idx + 6];
+        let replacement_hex = if pre_sha6 == "000000" {
+            "111111"
+        } else {
+            "000000"
+        };
+        let tampered = MANIFEST_JSON.replacen(pre_sha6, replacement_hex, 1);
         assert!(matches!(
             verify_manifest_digests(&tampered),
             Err(TrainError::ShaderManifestMismatch {
@@ -359,7 +370,7 @@ mod tests {
                 ..
             })
         ));
-        let bad_hex = MANIFEST_JSON.replacen("\"fc1333", "\"zzzzzz", 1);
+        let bad_hex = MANIFEST_JSON.replacen(&format!("\"{pre_sha6}"), "\"zzzzzz", 1);
         assert!(matches!(
             verify_manifest_digests(&bad_hex),
             Err(TrainError::KernelMismatch {

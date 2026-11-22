@@ -3,6 +3,7 @@
 //! & 33-band stereo `LTAS` Newton-KKT solver (`ref[train.pipeline.nested-varpro-schur]`).
 
 pub(crate) mod features;
+mod gram_snap;
 
 use crate::control::clamp::{MAX_GAIN_6DB_LIN, evaluate_readout_spectral_magnitudes};
 use crate::control::stability::MAX_RO_POLE_48K_F64;
@@ -21,6 +22,9 @@ use super::model::cascade::downsample_lane_2x_f64;
 use features::{
     StereoFeatureSet, apply_op_t_series_channel, build_pass3_feature_sets, eval_highpass_pole,
     unpack_weights_into_prefix,
+};
+use gram_snap::{
+    build_tier_fp16_col_bounds, snap_fp16_val, snap_weights_direct, snap_weights_gram_coordinate,
 };
 
 /// Canonical per-tier 33-band LTAS max tilt limits `[Lite, Full, Pro, Ultra]` in dB
@@ -258,6 +262,8 @@ struct ChannelSpectralCtx<'a> {
     tgts_post: &'a [f32],
     sr_hz: f64,
     ro_pole_48k: f64,
+    active_fir_taps: usize,
+    emit_prefix_overrides: bool,
 }
 
 fn refine_channel_tier_emr_and_ltas_kkt(
@@ -381,9 +387,42 @@ fn refine_channel_tier_emr_and_ltas_kkt(
         let kkt_tilt = eval_max_tilt_db(&kkt.weights);
         if kkt_mse <= best_mse * 1.5 && kkt_tilt < best_tilt {
             best_w = kkt.weights;
+            best_tilt = kkt_tilt;
         }
     }
-    best_w
+
+    let base_within_6db = within_6db(&best_w);
+    let fp16_bounds =
+        build_tier_fp16_col_bounds(tier_idx, ctx.active_fir_taps, ctx.emit_prefix_overrides);
+    let snapped = snap_weights_gram_coordinate(&best_w, gram_sub, 1.0e-5, &fp16_bounds);
+    let tilt_budget = best_tilt.max(TIER_LTAS_TILT_BUDGET_DB[tier_idx]) + 0.05;
+    if snapped.iter().all(|v| v.is_finite())
+        && (!base_within_6db || within_6db(&snapped))
+        && eval_max_tilt_db(&snapped) <= tilt_budget
+    {
+        return snapped;
+    }
+
+    let mut fallback = snap_weights_direct(&best_w, &fp16_bounds);
+    if base_within_6db && !within_6db(&fallback) {
+        let (b0, b1) = (fallback[0], fallback[1]);
+        for &scale_k in &[0.98_f64, 0.90, 0.75, 0.5, 0.0] {
+            let mags =
+                evaluate_readout_spectral_magnitudes(&[b0, b1], ctx.ro_pole_48k, ctx.sr_hz, 16);
+            let peak = mags.iter().copied().fold(0.0_f64, f64::max);
+            let adj = if peak > MAX_GAIN_6DB_LIN && peak.is_finite() {
+                scale_k * (MAX_GAIN_6DB_LIN / peak)
+            } else {
+                scale_k
+            };
+            fallback[0] = snap_fp16_val(b0 * adj, -8.0, 8.0);
+            fallback[1] = snap_fp16_val(b1 * adj, -8.0, 8.0);
+            if within_6db(&fallback) {
+                break;
+            }
+        }
+    }
+    fallback
 }
 
 /// Runs Pass-3 joint 4-tier causally nested `VarPro` readout identification across `Lite..Ultra`
@@ -502,6 +541,14 @@ pub fn run_pass3_varpro_readout(
         None
     };
 
+    for ti in 0..4 {
+        model.prefix_override_needed[ti] = (ti >= 1)
+            && (schur_l.prefix_override_needed[ti]
+                || schur_r.prefix_override_needed[ti]
+                || model.oversample_upper_tiers_2x);
+    }
+    let emit_prefix_overrides = model.prefix_override_needed[1..].iter().any(|&v| v);
+
     let mut tier_mse = [0.0_f64; 4];
     for (ti, &dim_t) in fset.dims.iter().enumerate() {
         let (wl_refined, wr_refined) = if ti == 0
@@ -524,6 +571,8 @@ pub fn run_pass3_varpro_readout(
                     tgts_post: tl,
                     sr_hz: model.sample_rate_hz,
                     ro_pole_48k: model.ro_pole_48k,
+                    active_fir_taps: fset.active_fir_taps,
+                    emit_prefix_overrides,
                 },
             );
             let wr_r = refine_channel_tier_emr_and_ltas_kkt(
@@ -537,6 +586,8 @@ pub fn run_pass3_varpro_readout(
                     tgts_post: tr,
                     sr_hz: model.sample_rate_hz,
                     ro_pole_48k: model.ro_pole_48k,
+                    active_fir_taps: fset.active_fir_taps,
+                    emit_prefix_overrides,
                 },
             );
             tier_mse[0] = 0.5
@@ -563,6 +614,8 @@ pub fn run_pass3_varpro_readout(
                     tgts_post: &fset.tgts_l_post,
                     sr_hz: model.sample_rate_hz,
                     ro_pole_48k: model.ro_pole_48k,
+                    active_fir_taps: fset.active_fir_taps,
+                    emit_prefix_overrides,
                 },
             );
             let wr_r = refine_channel_tier_emr_and_ltas_kkt(
@@ -576,6 +629,8 @@ pub fn run_pass3_varpro_readout(
                     tgts_post: &fset.tgts_r_post,
                     sr_hz: model.sample_rate_hz,
                     ro_pole_48k: model.ro_pole_48k,
+                    active_fir_taps: fset.active_fir_taps,
+                    emit_prefix_overrides,
                 },
             );
             tier_mse[ti] = 0.5
@@ -604,10 +659,6 @@ pub fn run_pass3_varpro_readout(
             model.fir_r = pfx.fir_r;
         }
         model.tier_overrides[ti] = Some(Box::new(pfx));
-        model.prefix_override_needed[ti] = (ti >= 1)
-            && (schur_l.prefix_override_needed[ti]
-                || schur_r.prefix_override_needed[ti]
-                || model.oversample_upper_tiers_2x);
     }
 
     let mut feats_row_major = vec![0.0_f32; m * total_dim];

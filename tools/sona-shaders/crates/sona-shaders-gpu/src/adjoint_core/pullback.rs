@@ -103,6 +103,10 @@ pub struct DuhemTonePullback {
     pub adj_v2_l: f32,
     pub adj_v1_r: f32,
     pub adj_v2_r: f32,
+    pub adj_hp_l: f32,
+    pub adj_ap_l: f32,
+    pub adj_hp_r: f32,
+    pub adj_ap_r: f32,
     pub adj_u_nonrec_l: f32,
     pub adj_u_nonrec_r: f32,
     pub g_alpha_rel: f32,
@@ -173,8 +177,10 @@ fn eval_channel_duhem_tone_grads(
     tone: f32,
     u: f32,
     svf_taps: (f32, f32, f32, f32),
+    k_eff: f32,
+    two_k_eff: f32,
     lp: &QuadLaneParams,
-) -> (f32, f32, f32, [f32; 14]) {
+) -> (f32, f32, f32, f32, f32, [f32; 14]) {
     let (f_lp, f_bp, f_hp, f_ap) = svf_taps;
     let adj_u_rect = lam * t.rho * t.phi_eta_prime;
     let adj_tone = adj_tone_from_r + adj_u_rect * lp.rect_sign;
@@ -225,7 +231,7 @@ fn eval_channel_duhem_tone_grads(
     let adj_ap = adj_tone * lp.w_ap;
     let adj_u_nonrec = adj_tone * lp.w_dir + adj_hp + adj_ap;
 
-    let adj_v1 = adj_bp - lp.k * adj_hp - lp.two_k * adj_ap;
+    let adj_v1 = adj_bp - k_eff * adj_hp - two_k_eff * adj_ap;
     let adj_v2 = adj_lp - adj_hp;
 
     let grads = [
@@ -244,7 +250,7 @@ fn eval_channel_duhem_tone_grads(
         -adj_hp * f_bp,
         -adj_ap * f_bp,
     ];
-    (adj_v1, adj_v2, adj_u_nonrec, grads)
+    (adj_v1, adj_v2, adj_u_nonrec, adj_hp, adj_ap, grads)
 }
 
 /// Pulls back `ParaLRU` `(lam_l, lam_r)` and `adj_tone_from_r` into `(adj_v1, adj_v2)` and
@@ -261,6 +267,10 @@ pub fn eval_duhem_and_tone_pullback(
     lam_r: f32,
     taps_l: (f32, f32, f32, f32),
     taps_r: (f32, f32, f32, f32),
+    k_eff_l: f32,
+    two_k_eff_l: f32,
+    k_eff_r: f32,
+    two_k_eff_r: f32,
     lp: &QuadLaneParams,
     is_active: bool,
 ) -> DuhemTonePullback {
@@ -270,6 +280,10 @@ pub fn eval_duhem_and_tone_pullback(
             adj_v2_l: 0.0,
             adj_v1_r: 0.0,
             adj_v2_r: 0.0,
+            adj_hp_l: 0.0,
+            adj_ap_l: 0.0,
+            adj_hp_r: 0.0,
+            adj_ap_r: 0.0,
             adj_u_nonrec_l: 0.0,
             adj_u_nonrec_r: 0.0,
             g_alpha_rel: 0.0,
@@ -289,30 +303,40 @@ pub fn eval_duhem_and_tone_pullback(
         };
     }
 
-    let (adj_v1_l, adj_v2_l, adj_u_nonrec_l, gl) = eval_channel_duhem_tone_grads(
-        lam_l,
-        tl,
-        sag.adj_tone_from_r_l,
-        fwd.tone_l,
-        fwd.u_l,
-        taps_l,
-        lp,
-    );
-    let (adj_v1_r, adj_v2_r, adj_u_nonrec_r, gr) = eval_channel_duhem_tone_grads(
-        lam_r,
-        tr,
-        sag.adj_tone_from_r_r,
-        fwd.tone_r,
-        fwd.u_r,
-        taps_r,
-        lp,
-    );
+    let (adj_v1_l, adj_v2_l, adj_u_nonrec_l, adj_hp_l, adj_ap_l, gl) =
+        eval_channel_duhem_tone_grads(
+            lam_l,
+            tl,
+            sag.adj_tone_from_r_l,
+            fwd.tone_l,
+            fwd.u_l,
+            taps_l,
+            k_eff_l,
+            two_k_eff_l,
+            lp,
+        );
+    let (adj_v1_r, adj_v2_r, adj_u_nonrec_r, adj_hp_r, adj_ap_r, gr) =
+        eval_channel_duhem_tone_grads(
+            lam_r,
+            tr,
+            sag.adj_tone_from_r_r,
+            fwd.tone_r,
+            fwd.u_r,
+            taps_r,
+            k_eff_r,
+            two_k_eff_r,
+            lp,
+        );
 
     DuhemTonePullback {
         adj_v1_l,
         adj_v2_l,
         adj_v1_r,
         adj_v2_r,
+        adj_hp_l,
+        adj_ap_l,
+        adj_hp_r,
+        adj_ap_r,
         adj_u_nonrec_l,
         adj_u_nonrec_r,
         g_alpha_rel: gl[0] + gr[0],
@@ -355,6 +379,54 @@ pub fn build_tpt_adjoint_elem(
         t10: -two_a2,
         t11: 1.0 - two_a3,
         g0: a1 * adj_v1 + a2 * adj_v2,
+        g1: -a2 * adj_v1 + (1.0 - a3) * adj_v2,
+    }
+}
+
+/// Local non-recursive sensitivity `k_eff_loc_bar` for Block 0 PHS `k_eff[n]`.
+#[inline(always)]
+#[must_use]
+pub fn phs_k_eff_loc_bar(
+    a2: f32,
+    a3: f32,
+    v1: f32,
+    adj_hp: f32,
+    adj_ap: f32,
+    adj_v1: f32,
+    adj_v2: f32,
+) -> f32 {
+    (-adj_hp - (adj_ap + adj_ap)) * v1 - v1 * (a2 * adj_v1 + a3 * adj_v2)
+}
+
+/// Builds the reverse `2x2` Block 0 PHS `TPT-SVF` transposed-Jacobian adjoint scan element
+/// pulling back `(adj_v1, adj_v2)` and `k_eff_loc_bar` onto `s_{t-1}`
+/// (`ref[dsp.op-n.core.tpt-tone-basis]`).
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+#[must_use]
+pub fn build_tpt_phs_adjoint_elem(
+    a1: f32,
+    a2: f32,
+    a3: f32,
+    v1: f32,
+    gamma: f32,
+    adj_v1: f32,
+    adj_v2: f32,
+    k_eff_loc_bar: f32,
+    is_active: bool,
+) -> TptAdjointElem {
+    if !is_active {
+        return TptAdjointElem::identity();
+    }
+    let two_a2 = a2 + a2;
+    let two_a3 = a3 + a3;
+    let v1_gamma = v1 * gamma;
+    TptAdjointElem {
+        t00: (a1 + a1 - 1.0) - two_a2 * v1_gamma,
+        t01: two_a2 - two_a3 * v1_gamma,
+        t10: -two_a2,
+        t11: 1.0 - two_a3,
+        g0: a1 * adj_v1 + a2 * adj_v2 + k_eff_loc_bar * gamma,
         g1: -a2 * adj_v1 + (1.0 - a3) * adj_v2,
     }
 }

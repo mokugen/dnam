@@ -20,8 +20,9 @@ pub use stability::{
     CORNER_BARRIER_FLOOR, MAX_RO_POLE_48K_F32, MAX_RO_POLE_48K_F64, MIN_DELAY_CROSSBAR_SAMP,
     MIN_DELAY_STANDALONE_SAMP, RAIL_BURST_FRAMES, RailBurstReport, SAT_OCCUPANCY_LIMIT,
     SonaCoreStabilityParams, StageTargetBounds, check_preact_occupancy,
-    enforce_arena0_stability_invariants, eval_corner_barrier_loss_and_grad,
-    eval_stop_grad_corner_and_phys_barrier, run_phase2_rail_burst,
+    enforce_arena_block0_k_nl_and_clamp, enforce_arena0_stability_invariants,
+    eval_corner_barrier_loss_and_grad, eval_stop_grad_corner_and_phys_barrier,
+    run_phase2_rail_burst,
 };
 pub use wiener::{
     ACTIVE_BAND_MIN_ENERGY_FRAC, BAND_PHASE_DECORR_RHO_MAX, FOUR_BAND_HI_HZ, FOUR_BAND_LO_HZ,

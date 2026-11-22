@@ -12,13 +12,12 @@ use crate::gpu::abi::{
     PRESCREEN_SEED_PARAM_STRIDE, PrescreenUniforms, QUAD_PARAMS_VEC4_STRIDE, quad_param_slots,
 };
 
-/// Packs a [`CoreQuadParamsStereo4`] into the canonical `24 × [f32; 4]` GPU/CPU uniform-stride block
-/// (including `SVF_G = two_svf_g * 0.5`).
+/// Packs a [`CoreQuadParamsStereo4`] into the canonical `25 × [f32; 4]` GPU/CPU uniform-stride block
+/// (including `SVF_G = two_svf_g * 0.5` and `SVF_K_NL`).
 #[must_use]
 pub fn pack_core_quad_params(
     params: &CoreQuadParamsStereo4<GpuVec4>,
 ) -> [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE] {
-    debug_assert_eq!(params.svf_k_nl.to_array(), [0.0; 4]);
     let g = params.two_svf_g.mul(GpuVec4::splat(0.5));
     let mut out = [[0.0_f32; 4]; QUAD_PARAMS_VEC4_STRIDE];
     out[quad_param_slots::SVF_A1] = params.svf.a1.to_array();
@@ -45,10 +44,11 @@ pub fn pack_core_quad_params(
     out[quad_param_slots::WAVEFOLDER_MIX] = params.wavefolder_mix.to_array();
     out[quad_param_slots::GLU_MIX] = params.glu_mix.to_array();
     out[quad_param_slots::SVF_G] = g.to_array();
+    out[quad_param_slots::SVF_K_NL] = params.svf_k_nl.to_array();
     out
 }
 
-/// Unpacks one `24 × [f32; 4]` quad parameter slice back into [`CoreQuadParamsStereo4<GpuVec4>`].
+/// Unpacks one `25 × [f32; 4]` quad parameter slice back into [`CoreQuadParamsStereo4<GpuVec4>`].
 pub fn unpack_core_quad_params(
     packed: &[[f32; 4]],
 ) -> Result<CoreQuadParamsStereo4<GpuVec4>, TrainError> {
@@ -86,7 +86,7 @@ pub fn unpack_core_quad_params(
         tone,
         lru,
         two_svf_g: GpuVec4::from_array(packed[quad_param_slots::TWO_SVF_G]),
-        svf_k_nl: GpuVec4::zero(),
+        svf_k_nl: GpuVec4::from_array(packed[quad_param_slots::SVF_K_NL]),
         rect_sign: GpuVec4::from_array(packed[quad_param_slots::RECT_SIGN]),
         sag_depth: GpuVec4::from_array(packed[quad_param_slots::SAG_DEPTH]),
         adaa_drive: GpuVec4::from_array(packed[quad_param_slots::ADAA_DRIVE]),
@@ -156,7 +156,7 @@ pub struct FusedCoreScanInput<'a> {
     pub uniforms: crate::gpu::abi::FusedScanUniforms,
     /// Interleaved `(L, R)` `Vec4` input frames (`total_q * num_frames * 2`).
     pub core_inputs: &'a [[f32; 4]],
-    /// Packed `24 × Vec4` parameters per `(stem, quad)` (`total_q * 24`).
+    /// Packed `25 × Vec4` parameters per `(stem, quad)` (`total_q * 25`).
     pub quad_params: &'a [[f32; 4]],
     /// Optional pre-seeded checkpoint table (`total_q * num_tiles * 8`) for `tile_start > 0` resume.
     pub initial_checkpoints: Option<&'a [[f32; 4]]>,
@@ -178,7 +178,7 @@ pub struct AdjointScanInput<'a> {
     pub uniforms: AdjointScanUniforms,
     /// Forward `core_inputs` (`total_q * num_frames * 2`).
     pub core_inputs: &'a [[f32; 4]],
-    /// Packed `24 × Vec4` parameters per `(stem, quad)` (`total_q * 24`).
+    /// Packed `25 × Vec4` parameters per `(stem, quad)` (`total_q * 25`).
     pub quad_params: &'a [[f32; 4]],
     /// Forward `tile_checkpoints` (`total_q * num_tiles * 8`).
     pub tile_checkpoints: &'a [[f32; 4]],
@@ -193,7 +193,7 @@ pub struct AdjointScanInput<'a> {
 pub struct AdjointScanOutput {
     /// Input gradients (`total_q * num_frames * 2`).
     pub d_loss_d_inputs: Vec<[f32; 4]>,
-    /// Per-tile parameter gradients (`total_q * num_tiles * 24`).
+    /// Per-tile parameter gradients (`total_q * num_tiles * 25`).
     pub param_grads: Vec<[f32; 4]>,
 }
 

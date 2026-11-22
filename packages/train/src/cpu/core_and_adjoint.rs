@@ -3,6 +3,9 @@
 //! (`ref[train.pipeline.webgpu-scans-and-ozaki]`, `ref[train.pipeline.isomorphism-parity]`).
 
 mod adjoint_math;
+mod streamed;
+
+pub use streamed::run_fused_core_scan_planned_cpu;
 
 use adjoint_math::{
     FwdFrameState, LaneParams, ReverseCarry, ReverseStepContext, TileGradAccum, flush_zero,
@@ -11,15 +14,14 @@ use adjoint_math::{
 use dnam_kernels::{
     CoreQuadParamsStereo4, GpuVec4, InterleavedStereo8, KernelVec4, MIN_TPT_G, SOFT_RECT_EPS,
     SonaBlockStateStereo8, StereoVec8, TINY_CROSSING_EPS, canonicalize_zero_f32_bits,
-    step_core_quad_stereo8,
+    step_core_quad_phs_stereo8, step_core_quad_stereo8,
 };
 
 use crate::error::TrainError;
 use crate::gpu::abi::{
-    CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, FusedScanUniforms, QUAD_PARAMS_VEC4_STRIDE,
-    TILE_CKPT_VEC4_STRIDE, TILE_FRAMES, quad_param_slots,
+    CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE,
+    TILE_FRAMES, quad_param_slots,
 };
-use crate::planner::{CoreScanPlan, ExecutionMode};
 use crate::runner::types::{
     AdjointScanInput, AdjointScanOutput, FusedCoreScanInput, FusedCoreScanOutput,
     unpack_core_quad_params,
@@ -137,6 +139,7 @@ pub fn run_fused_core_scan_cpu(
     let max_tiles = num_frames.div_ceil(TILE_FRAMES).min(num_tiles);
     let tile_start = (u.tile_start as usize).min(max_tiles);
     let resuming = tile_start > 0 && tile_start < num_tiles;
+    let is_phs = u.block_idx == 0;
 
     for q_global in 0..total_q {
         let mut state = if resuming {
@@ -156,7 +159,11 @@ pub fn run_fused_core_scan_cpu(
                     GpuVec4::from_array(input.core_inputs[in_idx].map(flush_zero)),
                     GpuVec4::from_array(input.core_inputs[in_idx + 1].map(flush_zero)),
                 );
-                let out = step_core_quad_stereo8(u_vec, &mut state, &params[q_global]);
+                let out = if is_phs {
+                    step_core_quad_phs_stereo8(u_vec, &mut state, &params[q_global])
+                } else {
+                    step_core_quad_stereo8(u_vec, &mut state, &params[q_global])
+                };
                 let (vl, vr) = out.lru_state.into_lr();
                 let (ol, or) = out.adaa_odd.into_lr();
                 let (el, er) = out.adaa_even.into_lr();
@@ -177,149 +184,64 @@ pub fn run_fused_core_scan_cpu(
 }
 
 /// Runs `fused_core_scan_256` under [`CoreScanPlan`], yielding `0-ULP` identical results between
-/// [`ExecutionMode::ResidentBatched`] and [`ExecutionMode::Streamed`].
-pub fn run_fused_core_scan_planned_cpu(
-    input: &FusedCoreScanInput<'_>,
-    plan: &CoreScanPlan,
-) -> Result<FusedCoreScanOutput, TrainError> {
-    if matches!(plan.mode, ExecutionMode::ResidentBatched) {
-        return run_fused_core_scan_cpu(input);
-    }
-    let u = &input.uniforms;
-    let num_frames = u.num_frames as usize;
-    let num_tiles = num_frames.div_ceil(TILE_FRAMES).max(1);
-    let num_quads = u.num_quads as usize;
-    let num_stems = u.num_stems as usize;
-    let total_q = num_quads * num_stems;
-    let mut tile_checkpoints = vec![[0.0_f32; 4]; total_q * num_tiles * TILE_CKPT_VEC4_STRIDE];
-    let mut feature_outputs = vec![[0.0_f32; 4]; total_q * num_frames * FEATURE_VEC4_STRIDE];
-
-    let stem_group = plan.stem_group.max(1);
-    let block_frames = plan.time_block_frames.max(TILE_FRAMES);
-
-    for stem_start in (0..num_stems).step_by(stem_group) {
-        let cur_stems = (num_stems - stem_start).min(stem_group);
-        let cur_q = cur_stems * num_quads;
-        let q_offset = stem_start * num_quads;
-        let sub_params = &input.quad_params
-            [q_offset * QUAD_PARAMS_VEC4_STRIDE..(q_offset + cur_q) * QUAD_PARAMS_VEC4_STRIDE];
-        let mut carry_ckpt = vec![[0.0_f32; 4]; cur_q * TILE_CKPT_VEC4_STRIDE];
-
-        let mut frame_start = 0_usize;
-        while frame_start < num_frames {
-            let chunk_frames = (num_frames - frame_start).min(block_frames);
-            let chunk_tiles = chunk_frames.div_ceil(TILE_FRAMES);
-            let has_prev = frame_start > 0;
-            let has_next = frame_start + chunk_frames < num_frames;
-            let lead_pad_frames = if has_prev { TILE_FRAMES } else { 0 };
-            let tail_pad_frames = if has_next { 1 } else { 0 };
-            let local_frames = lead_pad_frames + chunk_frames + tail_pad_frames;
-            let local_tiles =
-                (if has_prev { 1 } else { 0 }) + chunk_tiles + (if has_next { 1 } else { 0 });
-
-            let mut local_in = vec![[0.0_f32; 4]; cur_q * local_frames * CORE_INPUT_VEC4_STRIDE];
-            for ql in 0..cur_q {
-                let qg = q_offset + ql;
-                let dst_base = (ql * local_frames + lead_pad_frames) * CORE_INPUT_VEC4_STRIDE;
-                let src_base = (qg * num_frames + frame_start) * CORE_INPUT_VEC4_STRIDE;
-                let count = chunk_frames * CORE_INPUT_VEC4_STRIDE;
-                local_in[dst_base..dst_base + count]
-                    .copy_from_slice(&input.core_inputs[src_base..src_base + count]);
-            }
-
-            let mut init_ckpts = None;
-            let mut seed_storage = vec![[0.0_f32; 4]; cur_q * local_tiles * TILE_CKPT_VEC4_STRIDE];
-            if has_prev {
-                for ql in 0..cur_q {
-                    let dst = (ql * local_tiles + 1) * TILE_CKPT_VEC4_STRIDE;
-                    let src = ql * TILE_CKPT_VEC4_STRIDE;
-                    seed_storage[dst..dst + TILE_CKPT_VEC4_STRIDE]
-                        .copy_from_slice(&carry_ckpt[src..src + TILE_CKPT_VEC4_STRIDE]);
-                }
-                init_ckpts = Some(seed_storage.as_slice());
-            }
-
-            let local_u = FusedScanUniforms {
-                num_frames: local_frames as u32,
-                num_tiles: local_tiles as u32,
-                num_quads: num_quads as u32,
-                num_stems: cur_stems as u32,
-                tile_start: u32::from(has_prev),
-                soft_rect_eps: u.soft_rect_eps,
-                tiny_crossing_eps: u.tiny_crossing_eps,
-                block_idx: u.block_idx,
-            };
-            let local_out = run_fused_core_scan_cpu(&FusedCoreScanInput {
-                uniforms: local_u,
-                core_inputs: &local_in,
-                quad_params: sub_params,
-                initial_checkpoints: init_ckpts,
-            })?;
-
-            let tile_base = frame_start / TILE_FRAMES;
-            let local_tile_off = usize::from(has_prev);
-            for ql in 0..cur_q {
-                let qg = q_offset + ql;
-                let f_dst = (qg * num_frames + frame_start) * FEATURE_VEC4_STRIDE;
-                let f_src = (ql * local_frames + lead_pad_frames) * FEATURE_VEC4_STRIDE;
-                let f_cnt = chunk_frames * FEATURE_VEC4_STRIDE;
-                feature_outputs[f_dst..f_dst + f_cnt]
-                    .copy_from_slice(&local_out.feature_outputs[f_src..f_src + f_cnt]);
-
-                let c_dst = (qg * num_tiles + tile_base) * TILE_CKPT_VEC4_STRIDE;
-                let c_src = (ql * local_tiles + local_tile_off) * TILE_CKPT_VEC4_STRIDE;
-                let c_cnt = chunk_tiles * TILE_CKPT_VEC4_STRIDE;
-                tile_checkpoints[c_dst..c_dst + c_cnt]
-                    .copy_from_slice(&local_out.tile_checkpoints[c_src..c_src + c_cnt]);
-
-                if has_next {
-                    let exit_src =
-                        (ql * local_tiles + local_tile_off + chunk_tiles) * TILE_CKPT_VEC4_STRIDE;
-                    let carry_dst = ql * TILE_CKPT_VEC4_STRIDE;
-                    carry_ckpt[carry_dst..carry_dst + TILE_CKPT_VEC4_STRIDE].copy_from_slice(
-                        &local_out.tile_checkpoints[exit_src..exit_src + TILE_CKPT_VEC4_STRIDE],
-                    );
-                }
-            }
-            frame_start += chunk_frames;
-        }
-    }
-    Ok(FusedCoreScanOutput {
-        tile_checkpoints,
-        feature_outputs,
-    })
-}
-
 fn write_lane_param_grads(
     out_grads: &mut [[f32; 4]],
     pg_base: usize,
     c: usize,
     lp: &LaneParams,
     acc: &TileGradAccum,
+    is_phs: bool,
 ) {
-    for slot in 0..QUAD_PARAMS_VEC4_STRIDE - 1 {
+    for slot in 0..QUAD_PARAMS_VEC4_STRIDE {
         out_grads[pg_base + slot][c] = acc.slots[slot];
     }
-    let r0 = [acc.slots[0], acc.slots[1], acc.slots[2]];
-    let g_svf_k =
-        acc.slots[3] + 2.0 * acc.slots[4] - lp.a2 * (r0[0] * lp.a1 + r0[1] * lp.a2 + r0[2] * lp.a3);
-    out_grads[pg_base + quad_param_slots::SVF_K][c] = g_svf_k;
-    let g_svf_g = if lp.svf_g >= MIN_TPT_G {
-        let denom_g_term = 2.0 * lp.a2 + lp.k * lp.a1;
-        let da1_dg = -lp.a1 * denom_g_term;
-        let da2_dg = lp.a1 - lp.a2 * denom_g_term;
-        let da3_dg = (lp.a2 + lp.a2) - lp.a3 * denom_g_term;
-        r0[0] * da1_dg + r0[1] * da2_dg + r0[2] * da3_dg + 2.0 * acc.slots[16]
+    let (g_svf_k, g_svf_k_nl, g_svf_g) = if is_phs {
+        (
+            if lp.k >= 0.0 {
+                acc.slots[quad_param_slots::SVF_K]
+            } else {
+                0.0
+            },
+            if lp.svf_k_nl >= 0.0 {
+                acc.slots[quad_param_slots::SVF_K_NL]
+            } else {
+                0.0
+            },
+            if lp.svf_g >= MIN_TPT_G {
+                acc.slots[quad_param_slots::SVF_G] + 2.0 * acc.slots[quad_param_slots::TWO_SVF_G]
+            } else {
+                0.0
+            },
+        )
     } else {
-        0.0
+        let r0 = [acc.slots[0], acc.slots[1], acc.slots[2]];
+        let g_k = acc.slots[3] + 2.0 * acc.slots[4]
+            - lp.a2 * (r0[0] * lp.a1 + r0[1] * lp.a2 + r0[2] * lp.a3);
+        let g_g = if lp.svf_g >= MIN_TPT_G {
+            let denom_g_term = 2.0 * lp.a2 + lp.k * lp.a1;
+            let da1_dg = -lp.a1 * denom_g_term;
+            let da2_dg = lp.a1 - lp.a2 * denom_g_term;
+            let da3_dg = (lp.a2 + lp.a2) - lp.a3 * denom_g_term;
+            r0[0] * da1_dg
+                + r0[1] * da2_dg
+                + r0[2] * da3_dg
+                + 2.0 * acc.slots[quad_param_slots::TWO_SVF_G]
+        } else {
+            0.0
+        };
+        (g_k, 0.0, g_g)
     };
+    out_grads[pg_base + quad_param_slots::SVF_K][c] = g_svf_k;
     out_grads[pg_base + quad_param_slots::SVF_G][c] = g_svf_g;
+    out_grads[pg_base + quad_param_slots::SVF_K_NL][c] = g_svf_k_nl;
 }
 
 /// Deterministic CPU reference implementation of `adjoint_scan_256` across multi-tile
-/// trajectories (`SVF_K`, `SVF_G >= MIN_TPT_G`, cross-lane GLU, and `PolyADAA1` tile seams).
+/// trajectories (`Block 0` PHS + `Blocks 1..3` linear `TPT-SVF`, `SVF_K_NL`, `SVF_K`,
+/// `SVF_G >= MIN_TPT_G`, cross-lane GLU, and `PolyADAA1` tile seams).
 pub fn run_adjoint_scan_cpu(input: &AdjointScanInput<'_>) -> Result<AdjointScanOutput, TrainError> {
     let u = &input.uniforms;
+    let is_phs = u.block_idx == 0;
     let num_frames = u.num_frames as usize;
     let num_tiles = (u.num_tiles as usize).max(1);
     let total_q = (u.num_quads as usize) * (u.num_stems as usize);
@@ -391,7 +313,7 @@ pub fn run_adjoint_scan_cpu(input: &AdjointScanInput<'_>) -> Result<AdjointScanO
                     let u_l = flush_zero(input.core_inputs[in_base][c]);
                     let u_r = flush_zero(input.core_inputs[in_base + 1][c]);
                     tile_fwd[local_t] =
-                        step_lane_forward(&lp, &svf_c, &lru_c, u_l, u_r, &mut lane_state);
+                        step_lane_forward(&lp, &svf_c, &lru_c, u_l, u_r, &mut lane_state, is_phs);
                 }
 
                 let ctx = ReverseStepContext {
@@ -412,6 +334,7 @@ pub fn run_adjoint_scan_cpu(input: &AdjointScanInput<'_>) -> Result<AdjointScanO
                         frame,
                         &mut carry,
                         &mut acc,
+                        is_phs,
                     );
                     let out_base = (q_global * num_frames + frame) * CORE_INPUT_VEC4_STRIDE;
                     d_loss_d_inputs[out_base][c] = du_l;
@@ -419,7 +342,7 @@ pub fn run_adjoint_scan_cpu(input: &AdjointScanInput<'_>) -> Result<AdjointScanO
                 }
 
                 let pg_base = (q_global * num_tiles + tile) * QUAD_PARAMS_VEC4_STRIDE;
-                write_lane_param_grads(&mut param_grads, pg_base, c, &lp, &acc);
+                write_lane_param_grads(&mut param_grads, pg_base, c, &lp, &acc, is_phs);
             }
         }
     }
@@ -434,13 +357,21 @@ pub fn run_adjoint_scan_cpu(input: &AdjointScanInput<'_>) -> Result<AdjointScanO
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::planner::{CoreScanWorkload, MemoryBudgetProfile, plan_core_scan_execution};
+    use crate::gpu::abi::FusedScanUniforms;
+    use crate::planner::{
+        CoreScanWorkload, ExecutionMode, MemoryBudgetProfile, plan_core_scan_execution,
+    };
     use crate::runner::types::pack_core_quad_params;
     use dnam_kernels::{
         SonaParaLruDuhemCoeffs4, SonaToneWeights4, TptSvfCoeffs4, prewarp_tan_pi_f_over_fs_f32,
     };
 
-    fn make_test_quad(svf_g_zero: bool) -> (CoreQuadParamsStereo4<GpuVec4>, [[f32; 4]; 24]) {
+    fn make_test_quad(
+        svf_g_zero: bool,
+    ) -> (
+        CoreQuadParamsStereo4<GpuVec4>,
+        [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE],
+    ) {
         let g = GpuVec4::from_array([0.04, 0.10, 0.20, 0.34].map(prewarp_tan_pi_f_over_fs_f32));
         let k = GpuVec4::from_array([0.65, 0.85, 1.10, 1.40]);
         let params = CoreQuadParamsStereo4 {
@@ -644,6 +575,75 @@ mod tests {
         })
         .unwrap();
         assert_eq!(adj_zero.param_grads[quad_param_slots::SVF_G], [0.0; 4]);
+
+        // Verify non-zero block_idx masks SVF_K_NL in forward (0-ULP vs k_nl=0) and backward (exact 0).
+        let mut u_b1 = u;
+        u_b1.block_idx = 1;
+        let mut packed_b1 = packed;
+        packed_b1[quad_param_slots::SVF_K_NL] = [0.5; 4];
+        let fwd_b1_zero = run_fused_core_scan_cpu(&FusedCoreScanInput {
+            uniforms: u_b1,
+            core_inputs: &core_inputs,
+            quad_params: &packed,
+            initial_checkpoints: None,
+        })
+        .unwrap();
+        let fwd_b1_nz = run_fused_core_scan_cpu(&FusedCoreScanInput {
+            uniforms: u_b1,
+            core_inputs: &core_inputs,
+            quad_params: &packed_b1,
+            initial_checkpoints: None,
+        })
+        .unwrap();
+        assert_eq!(
+            fwd_b1_nz
+                .tile_checkpoints
+                .iter()
+                .map(|v| v.map(f32::to_bits))
+                .collect::<Vec<_>>(),
+            fwd_b1_zero
+                .tile_checkpoints
+                .iter()
+                .map(|v| v.map(f32::to_bits))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            fwd_b1_nz
+                .feature_outputs
+                .iter()
+                .map(|v| v.map(f32::to_bits))
+                .collect::<Vec<_>>(),
+            fwd_b1_zero
+                .feature_outputs
+                .iter()
+                .map(|v| v.map(f32::to_bits))
+                .collect::<Vec<_>>()
+        );
+        let adj_b1 = run_adjoint_scan_cpu(&AdjointScanInput {
+            uniforms: crate::gpu::abi::AdjointScanUniforms {
+                num_frames: num_frames as u32,
+                num_tiles: num_tiles as u32,
+                num_quads: 1,
+                num_stems: 1,
+                pass_mode: 2,
+                soft_rect_eps: SOFT_RECT_EPS,
+                tiny_crossing_eps: TINY_CROSSING_EPS,
+                block_idx: 1,
+            },
+            core_inputs: &core_inputs,
+            quad_params: &packed_b1,
+            tile_checkpoints: &fwd_b1_nz.tile_checkpoints,
+            d_loss_d_features: &d_loss,
+            feature_outputs: &fwd_b1_nz.feature_outputs,
+        })
+        .unwrap();
+        for tile in 0..num_tiles {
+            assert_eq!(
+                adj_b1.param_grads[tile * QUAD_PARAMS_VEC4_STRIDE + quad_param_slots::SVF_K_NL]
+                    .map(f32::to_bits),
+                [0; 4]
+            );
+        }
 
         // Cover ResidentBatched planned delegation and dimension error branches.
         let res_plan = plan_core_scan_execution(

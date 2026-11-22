@@ -38,7 +38,7 @@
     {
       "name": "fused_core_scan_256",
       "wgsl_path": "fused_core_scan_256.wgsl",
-      "sha256": "3e212d7574e87b588b7a72097754b64dd8e2a2c8c7f201c35369b9771476ff07",
+      "sha256": "73575ee47a1994aef5d09b0163881b01a83d2fc058f709673065499a262de9ee",
       "workgroup_sram_bytes": 15360,
       "bindings": [
         {
@@ -71,7 +71,7 @@
     {
       "name": "adjoint_scan_256",
       "wgsl_path": "adjoint_scan_256.wgsl",
-      "sha256": "36fe5559eef4db5cc2d2d2c1132bdb06d92e6cbd2800eb063ca81f52ab269d53",
+      "sha256": "8747c6fbcfa8f33c668550dcda1eb42158ba8a044abd13e3f8a0b46f8f99464d",
       "workgroup_sram_bytes": 14848,
       "bindings": [
         {
@@ -268,7 +268,7 @@
     {
       "name": "fused_core_scan_256",
       "wgsl_path": "subgroups/fused_core_scan_256.wgsl",
-      "sha256": "3e212d7574e87b588b7a72097754b64dd8e2a2c8c7f201c35369b9771476ff07",
+      "sha256": "73575ee47a1994aef5d09b0163881b01a83d2fc058f709673065499a262de9ee",
       "workgroup_sram_bytes": 15360,
       "bindings": [
         {
@@ -301,7 +301,7 @@
     {
       "name": "adjoint_scan_256",
       "wgsl_path": "subgroups/adjoint_scan_256.wgsl",
-      "sha256": "43c4ea356baba0e5079348851244ddc88f60ac3ea61073f348e8bb01b8796f1f",
+      "sha256": "3e894bcbbd524ad68c7e29b242978c4254cd7944daed48d6cb9cc8e613d65344",
       "workgroup_sram_bytes": 14848,
       "bindings": [
         {

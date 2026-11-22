@@ -20,8 +20,10 @@ pub const QUAD_PARAMS_VEC4_STRIDE: usize = param_slots::TOTAL_SLOTS;
 pub const TILE_CKPT_VEC4_STRIDE: usize = 8;
 /// Number of `Vec4` vectors per `(stem, q_local, frame)` in `feature_outputs` and `d_loss_d_features`.
 pub const FEATURE_VEC4_STRIDE: usize = 6;
-/// Number of `Vec4` vectors per `(stem, q_local, tile)` in `tile_adj_boundaries` (`4` lanes × `4` slots).
-pub const TILE_ADJ_BOUNDARY_VEC4_STRIDE: usize = 4 * 4;
+/// Number of `Vec4` summary vectors per lane channel `c in 0..4` in `tile_adj_boundaries`.
+pub const TILE_ADJ_LANE_VEC4_STRIDE: usize = 5;
+/// Number of `Vec4` vectors per `(stem, q_local, tile)` in `tile_adj_boundaries` (`4` lanes × `5` slots).
+pub const TILE_ADJ_BOUNDARY_VEC4_STRIDE: usize = 4 * TILE_ADJ_LANE_VEC4_STRIDE;
 /// Number of `f32` scalars per seed/quad entry in `seed_params`.
 pub const PRESCREEN_SEED_PARAM_STRIDE: usize = 16;
 /// Number of `i32` words stored per `(pair, chunk)` entry (`[d0, d1, d2, d3, d4, 0]`).
@@ -29,7 +31,7 @@ pub const OZAKI_WORDS_PER_PAIR: usize = 6;
 /// Maximum GPU-resident L-BFGS history window `m`.
 pub const LBFGS_MAX_HISTORY_M: usize = 8;
 
-/// Canonical `24`-slot indices matching `sona_shaders::abi::quad_param_slots`.
+/// Canonical `25`-slot indices matching `sona_shaders::abi::quad_param_slots`.
 pub mod param_slots {
     pub const SVF_A1: usize = 0;
     pub const SVF_A2: usize = 1;
@@ -55,7 +57,8 @@ pub mod param_slots {
     pub const WAVEFOLDER_MIX: usize = 21;
     pub const GLU_MIX: usize = 22;
     pub const SVF_G: usize = 23;
-    pub const TOTAL_SLOTS: usize = SVF_G + 1;
+    pub const SVF_K_NL: usize = 24;
+    pub const TOTAL_SLOTS: usize = SVF_K_NL + 1;
 }
 
 /// Forward workgroup SRAM partitioning (`15,360 B <= 15,872 B`).
@@ -157,10 +160,11 @@ pub struct InnerOptUniforms {
 const _: () = assert!(WORKGROUP_SIZE == 256 && TILE_FRAMES == 256);
 const _: () = assert!(MAX_WORKGROUP_SRAM_BYTES == 15_872);
 const _: () = assert!(CORE_INPUT_VEC4_STRIDE == 2);
-const _: () = assert!(QUAD_PARAMS_VEC4_STRIDE == 24);
+const _: () = assert!(QUAD_PARAMS_VEC4_STRIDE == 25);
 const _: () = assert!(TILE_CKPT_VEC4_STRIDE == 8);
 const _: () = assert!(FEATURE_VEC4_STRIDE == 6);
-const _: () = assert!(TILE_ADJ_BOUNDARY_VEC4_STRIDE == 16);
+const _: () = assert!(TILE_ADJ_LANE_VEC4_STRIDE == 5);
+const _: () = assert!(TILE_ADJ_BOUNDARY_VEC4_STRIDE == 20);
 const _: () = assert!(PRESCREEN_SEED_PARAM_STRIDE == 16);
 const _: () = assert!(OZAKI_WORDS_PER_PAIR == 6);
 const _: () = assert!(LBFGS_MAX_HISTORY_M == 8);

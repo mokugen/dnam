@@ -16,22 +16,23 @@ pub use scans::{
 use crate::abi::TILE_FRAMES;
 pub use crate::abi::{
     CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE,
-    TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, param_slots,
+    TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_ADJ_LANE_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, param_slots,
 };
 use dnam_kernels::{
     GpuVec4, IEEE754_F32_EXP_MASK, KernelVec4, MAX_PARALRU_DUHEM_GAMMA_F32, MAX_PARALRU_R_F32,
-    SOFT_RECT_EPS, SonaParaLruDuhemCoeffs4, TptSvfCoeffs4, apply_stereo_link_vec4_pair,
-    canonicalize_zero_f32_bits, step_paralru_duhem_vec4, step_tpt_svf_vec4,
+    MIN_TPT_G, SOFT_RECT_EPS, SVF_PHS_E_MAX, SonaParaLruDuhemCoeffs4, TptSvfCoeffs4,
+    apply_stereo_link_vec4_pair, canonicalize_zero_f32_bits, step_paralru_duhem_vec4,
+    step_tpt_svf_phs_vec4, step_tpt_svf_vec4,
 };
 pub use dnam_kernels::{MAX_ADAA_ENDPOINT, MIN_SAG_GAIN};
 use spirv_std::glam::Vec4;
 
 const _: () = assert!(TILE_FRAMES == 256);
 const _: () = assert!(CORE_INPUT_VEC4_STRIDE == 2);
-const _: () = assert!(QUAD_PARAMS_VEC4_STRIDE == param_slots::SVF_G + 1);
+const _: () = assert!(QUAD_PARAMS_VEC4_STRIDE == param_slots::SVF_K_NL + 1);
 const _: () = assert!(TILE_CKPT_VEC4_STRIDE == 8);
 const _: () = assert!(FEATURE_VEC4_STRIDE == 6);
-const _: () = assert!(TILE_ADJ_BOUNDARY_VEC4_STRIDE == 16);
+const _: () = assert!(TILE_ADJ_LANE_VEC4_STRIDE == 5 && TILE_ADJ_BOUNDARY_VEC4_STRIDE == 20);
 const _: () = assert!(MIN_SAG_GAIN > 0.0 && SOFT_RECT_EPS > 0.0);
 
 /// Converts a `glam::Vec4` to a `dnam_kernels::GpuVec4`.
@@ -175,7 +176,7 @@ pub fn clamp_nonneg_safe(x: f32, hi: f32) -> f32 {
     }
 }
 
-/// Complete unpacked `24 × Vec4` parameter bundle for one `(stem, quad)` `CoreQuad`.
+/// Complete unpacked `25 × Vec4` parameter bundle for one `(stem, quad)` `CoreQuad`.
 #[derive(Copy, Clone)]
 pub struct QuadParamsUnpacked {
     pub svf_a1: Vec4,
@@ -202,10 +203,11 @@ pub struct QuadParamsUnpacked {
     pub wavefolder_mix: Vec4,
     pub glu_mix: Vec4,
     pub svf_g: Vec4,
+    pub svf_k_nl: Vec4,
 }
 
 impl QuadParamsUnpacked {
-    /// Loads all `24` `Vec4` slots starting at `quad_params[q_base + 0..24]`.
+    /// Loads all `25` `Vec4` slots starting at `quad_params[q_base + 0..25]`.
     #[inline]
     #[must_use]
     pub fn load(quad_params: &[Vec4], q_base: usize) -> Self {
@@ -234,6 +236,7 @@ impl QuadParamsUnpacked {
             wavefolder_mix: load_vec4(quad_params, q_base + param_slots::WAVEFOLDER_MIX),
             glu_mix: load_vec4(quad_params, q_base + param_slots::GLU_MIX),
             svf_g: load_vec4(quad_params, q_base + param_slots::SVF_G),
+            svf_k_nl: load_vec4(quad_params, q_base + param_slots::SVF_K_NL),
         }
     }
 
@@ -284,6 +287,7 @@ impl QuadParamsUnpacked {
             wf_mix: clamp_nonneg_safe(wf_raw, 1.0),
             wf_open: is_finite_bits(wf_raw) && wf_raw >= 0.0 && wf_raw <= 1.0,
             svf_g: get_lane(self.svf_g, c),
+            svf_k_nl: get_lane(self.svf_k_nl, c),
         }
     }
 }
@@ -321,6 +325,7 @@ pub struct QuadLaneParams {
     pub wf_mix: f32,
     pub wf_open: bool,
     pub svf_g: f32,
+    pub svf_k_nl: f32,
 }
 
 impl QuadLaneParams {
@@ -371,6 +376,104 @@ pub fn eval_tpt_svf_scalar(
         out.hp.to_array()[0],
         out.ap.to_array()[0],
     )
+}
+
+/// Evaluates one scalar Block 0 Port-Hamiltonian (`PHS`) `TPT-SVF` step via
+/// `dnam_kernels::step_tpt_svf_phs_vec4`, updating `s1` and `s2` in place and returning
+/// `(lp, bp, hp, ap)`.
+#[inline(always)]
+#[must_use]
+pub fn step_tpt_svf_phs_scalar(
+    u: f32,
+    s1: &mut f32,
+    s2: &mut f32,
+    p: &QuadLaneParams,
+) -> (f32, f32, f32, f32) {
+    let mut s1_v = GpuVec4::splat(*s1);
+    let mut s2_v = GpuVec4::splat(*s2);
+    let out = step_tpt_svf_phs_vec4(
+        GpuVec4::splat(u),
+        &mut s1_v,
+        &mut s2_v,
+        GpuVec4::splat(p.two_svf_g * 0.5),
+        GpuVec4::splat(p.k),
+        GpuVec4::splat(p.svf_k_nl),
+    );
+    *s1 = s1_v.to_array()[0];
+    *s2 = s2_v.to_array()[0];
+    (
+        out.lp.to_array()[0],
+        out.bp.to_array()[0],
+        out.hp.to_array()[0],
+        out.ap.to_array()[0],
+    )
+}
+
+/// Per-frame scalar PHS coefficients and derivatives anchored at pre-step state `s1_prev`.
+#[derive(Copy, Clone)]
+pub struct PhsFrameTerms {
+    pub a1: f32,
+    pub a2: f32,
+    pub a3: f32,
+    pub k_eff: f32,
+    pub e: f32,
+    pub gamma: f32,
+    pub taps: (f32, f32, f32, f32),
+}
+
+impl PhsFrameTerms {
+    #[inline(always)]
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self {
+            a1: 0.0,
+            a2: 0.0,
+            a3: 0.0,
+            k_eff: 0.0,
+            e: 0.0,
+            gamma: 0.0,
+            taps: (0.0, 0.0, 0.0, 0.0),
+        }
+    }
+}
+
+/// Evaluates scalar Block 0 PHS coefficients `(a1, a2, a3, k_eff, e, gamma)` alongside exact
+/// `0-ULP` forward taps `(lp, bp, hp, ap)` from `step_tpt_svf_phs_scalar`.
+#[inline(always)]
+#[must_use]
+pub fn eval_tpt_svf_phs_frame(
+    u: f32,
+    s1_prev: f32,
+    s2_prev: f32,
+    lp: &QuadLaneParams,
+) -> PhsFrameTerms {
+    let g_safe = (lp.two_svf_g * 0.5).max(MIN_TPT_G);
+    let k_safe = lp.k.max(0.0);
+    let k_nl_safe = lp.svf_k_nl.max(0.0);
+    let s1_sq = s1_prev * s1_prev;
+    let e = s1_sq.min(SVF_PHS_E_MAX);
+    let gamma = if s1_sq < SVF_PHS_E_MAX {
+        (k_nl_safe + k_nl_safe) * s1_prev
+    } else {
+        0.0
+    };
+    let k_eff = k_safe + k_nl_safe * e;
+    let denom = 1.0 + g_safe * (g_safe + k_eff);
+    let a1 = GpuVec4::splat(denom).rcp_ge1_nr2().to_array()[0];
+    let a2 = g_safe * a1;
+    let a3 = g_safe * a2;
+    let mut s1_tmp = s1_prev;
+    let mut s2_tmp = s2_prev;
+    let taps = step_tpt_svf_phs_scalar(u, &mut s1_tmp, &mut s2_tmp, lp);
+    PhsFrameTerms {
+        a1,
+        a2,
+        a3,
+        k_eff,
+        e,
+        gamma,
+        taps,
+    }
 }
 
 /// Evaluates the linear 4-tap + direct tone mix matching `dnam_kernels::step_core_quad_stereo8`.
