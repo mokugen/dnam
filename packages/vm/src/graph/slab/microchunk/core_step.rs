@@ -7,7 +7,7 @@ use dnam_kernels::{
     CarrierBasisWeightsVec4, CoreQuadParamsStereo4, SonaBlockStateStereo8, SonaParaLruDuhemCoeffs4,
     SonaToneWeights4, StereoAnalyticQuadrature, StereoCarrierRotorVec4, StereoVec8, TptSvfCoeffs4,
     couple_ms_input_stereo8, eval_carrier_3basis_stereo_vec4, os2x_midpoint_f32x4,
-    step_core_quad_stereo8,
+    step_core_quad_phs_stereo8, step_core_quad_stereo8,
 };
 
 use crate::graph::GraphBackend;
@@ -103,6 +103,7 @@ fn zero_quad_params<B: GraphBackend>() -> CoreQuadParamsStereo4<B::Vec4> {
         },
         lru: SonaParaLruDuhemCoeffs4::from_clamped(z, z, z, z, z, z),
         two_svf_g: z,
+        svf_k_nl: z,
         rect_sign: B::Vec4::splat(1.0),
         sag_depth: z,
         adaa_drive: z,
@@ -318,6 +319,81 @@ impl HotTilesRef<'_> {
     }
 }
 
+struct CoreEvalCtx<'a, B: GraphBackend> {
+    tiles: &'a HotTilesRef<'a>,
+    hoisted: &'a HoistedCoreChunk<B>,
+    crossbar: &'a CrossbarFrame<B::Vec4>,
+    u_lr: (f32, f32),
+}
+
+struct CoreAccumulators<S> {
+    quad_in: [S; MAX_CORE_QUADS],
+    pre_conv: S,
+    direct: S,
+}
+
+#[inline(always)]
+fn eval_core_quad_step<B: GraphBackend, const BLOCK0_PHS: bool>(
+    q: usize,
+    states: &mut HotStatesMut<'_, B>,
+    ctx: &CoreEvalCtx<'_, B>,
+    acc: &mut CoreAccumulators<B::Stereo8>,
+) {
+    let reg = &ctx.hoisted.readouts[q];
+    let mut u_q = couple_ms_input_stereo8(
+        if BLOCK0_PHS {
+            B::Stereo8::zero()
+        } else {
+            acc.quad_in[q]
+        },
+        ctx.u_lr.0,
+        ctx.u_lr.1,
+        reg.in_mid_weight,
+        reg.in_side_weight,
+    );
+    if ctx.crossbar.active {
+        let op_p_vec_w = ctx.crossbar.op_p_vec.mul(reg.op_p_w);
+        let op_p_s8 = B::Stereo8::from_lr(op_p_vec_w, op_p_vec_w);
+        let car_s8 = B::Stereo8::from_lr(
+            ctx.crossbar.car_l.mul(reg.ph_w),
+            ctx.crossbar.car_r.mul(reg.ph_w),
+        );
+        u_q = u_q.add(op_p_s8.add(car_s8));
+    }
+
+    let out = if BLOCK0_PHS {
+        step_core_quad_phs_stereo8::<B::Stereo8>(u_q, states.state_mut(q), &ctx.hoisted.params[q])
+    } else {
+        step_core_quad_stereo8::<B::Stereo8>(u_q, states.state_mut(q), &ctx.hoisted.params[q])
+    };
+    acc.pre_conv = acc
+        .pre_conv
+        .fma(out.adaa_odd, reg.pre_conv_odd)
+        .fma(out.adaa_even, reg.pre_conv_even)
+        .fma(out.lru_state, reg.pre_conv_lru);
+    acc.direct = acc
+        .direct
+        .fma(out.adaa_odd, reg.direct_odd)
+        .fma(out.adaa_even, reg.direct_even)
+        .fma(out.lru_state, reg.direct_lru);
+
+    for &tile_raw in &SONA_SRC_OUTGOING_TILES[q] {
+        if tile_raw == TILE_EMPTY {
+            break;
+        }
+        let t_idx = usize::from(tile_raw);
+        if t_idx >= ctx.hoisted.num_tiles {
+            continue;
+        }
+        let dq = SONA_INTERBLOCK_TILES[t_idx].1;
+        let tile = ctx.tiles.tile_hot(t_idx);
+        let tile_acc =
+            B::Stereo8::fma_mat4x4_shared(acc.quad_in[dq], &tile.w_odd_4x4, out.adaa_odd);
+        let tile_acc = fma_fp16_tile::<B>(tile_acc, &tile.w_even_4x4_fp16, out.adaa_even);
+        acc.quad_in[dq] = fma_fp16_tile::<B>(tile_acc, &tile.w_lru_4x4_fp16, out.lru_state);
+    }
+}
+
 #[inline(always)]
 fn evaluate_matryoshka_core_quads_disjoint<B: GraphBackend>(
     states: &mut HotStatesMut<'_, B>,
@@ -326,59 +402,31 @@ fn evaluate_matryoshka_core_quads_disjoint<B: GraphBackend>(
     crossbar: &CrossbarFrame<B::Vec4>,
     u_lr: (f32, f32),
 ) -> ((f32, f32), (f32, f32)) {
-    let mut quad_in = [B::Stereo8::zero(); MAX_CORE_QUADS];
-    let mut pre_conv_acc = B::Stereo8::zero();
-    let mut direct_acc = B::Stereo8::zero();
+    let ctx = CoreEvalCtx {
+        tiles,
+        hoisted,
+        crossbar,
+        u_lr,
+    };
+    let mut acc = CoreAccumulators {
+        quad_in: [B::Stereo8::zero(); MAX_CORE_QUADS],
+        pre_conv: B::Stereo8::zero(),
+        direct: B::Stereo8::zero(),
+    };
 
-    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER {
-        if q >= hoisted.num_quads {
-            continue;
+    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[..4] {
+        if q < hoisted.num_quads {
+            eval_core_quad_step::<B, true>(q, states, &ctx, &mut acc);
         }
-        let reg = &hoisted.readouts[q];
-        let mut u_q = couple_ms_input_stereo8(
-            quad_in[q],
-            u_lr.0,
-            u_lr.1,
-            reg.in_mid_weight,
-            reg.in_side_weight,
-        );
-        if crossbar.active {
-            let op_p_vec_w = crossbar.op_p_vec.mul(reg.op_p_w);
-            let op_p_s8 = B::Stereo8::from_lr(op_p_vec_w, op_p_vec_w);
-            let car_s8 =
-                B::Stereo8::from_lr(crossbar.car_l.mul(reg.ph_w), crossbar.car_r.mul(reg.ph_w));
-            u_q = u_q.add(op_p_s8.add(car_s8));
-        }
-
-        let out =
-            step_core_quad_stereo8::<B::Stereo8>(u_q, states.state_mut(q), &hoisted.params[q]);
-        pre_conv_acc = pre_conv_acc
-            .fma(out.adaa_odd, reg.pre_conv_odd)
-            .fma(out.adaa_even, reg.pre_conv_even)
-            .fma(out.lru_state, reg.pre_conv_lru);
-        direct_acc = direct_acc
-            .fma(out.adaa_odd, reg.direct_odd)
-            .fma(out.adaa_even, reg.direct_even)
-            .fma(out.lru_state, reg.direct_lru);
-
-        for &tile_raw in &SONA_SRC_OUTGOING_TILES[q] {
-            if tile_raw == TILE_EMPTY {
-                break;
-            }
-            let t_idx = usize::from(tile_raw);
-            if t_idx >= hoisted.num_tiles {
-                continue;
-            }
-            let dq = SONA_INTERBLOCK_TILES[t_idx].1;
-            let tile = tiles.tile_hot(t_idx);
-            let acc = B::Stereo8::fma_mat4x4_shared(quad_in[dq], &tile.w_odd_4x4, out.adaa_odd);
-            let acc = fma_fp16_tile::<B>(acc, &tile.w_even_4x4_fp16, out.adaa_even);
-            quad_in[dq] = fma_fp16_tile::<B>(acc, &tile.w_lru_4x4_fp16, out.lru_state);
+    }
+    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[4..] {
+        if q < hoisted.num_quads {
+            eval_core_quad_step::<B, false>(q, states, &ctx, &mut acc);
         }
     }
 
-    let (pl, pr) = pre_conv_acc.into_lr();
-    let (dl, dr) = direct_acc.into_lr();
+    let (pl, pr) = acc.pre_conv.into_lr();
+    let (dl, dr) = acc.direct.into_lr();
     (pl.horizontal_sum_pair(pr), dl.horizontal_sum_pair(dr))
 }
 

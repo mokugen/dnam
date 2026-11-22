@@ -92,11 +92,13 @@ pub fn latch_quad_nonslew_targets(
     eff: &mut QuadEffectiveTargets,
 ) {
     let was_held = quad.is_full_hold(eff.mu_freeze);
-    let mu_freeze = eval_op_t_freeze_mix_eff(
-        meta.base_freeze_mix,
-        slots.op_t_freeze_mix_delta,
-        (quad.flags & QUAD_FLAG_HOST_WRITE_LOCK) != 0,
-    );
+    let mu_freeze_unlocked =
+        eval_op_t_freeze_mix_eff(meta.base_freeze_mix, slots.op_t_freeze_mix_delta, false);
+    let mu_freeze = if (quad.flags & QUAD_FLAG_HOST_WRITE_LOCK) != 0 {
+        1.0
+    } else {
+        mu_freeze_unlocked
+    };
     let now_held = quad.is_full_hold(mu_freeze);
     if was_held && !now_held {
         quad.clear_hold_offsets(ext_ring);
@@ -163,6 +165,8 @@ pub fn latch_quad_nonslew_targets(
     eff.mu_freeze = mu_freeze;
     eff.half_alpha_cubic = fp16_to_f32(quad.half_alpha_cubic_fp16);
     (eff.cos_psi, eff.sin_psi) = (quad.cos_psi, quad.sin_psi);
+    (eff.cos_scat, eff.sin_scat) =
+        algebraic_unit_rotor_f32((1.0 - mu_freeze_unlocked) * meta.base_scat_psi);
     eff.damp_pole_eff = quad.damp_pole;
     eff.wet_scale = eval_crossbar_wet_scale(slots.crossbar_wet_mod);
     eff.window_depth_eff = fp16_to_f32(quad.window_depth_fp16);

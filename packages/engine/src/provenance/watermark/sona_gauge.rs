@@ -1,14 +1,16 @@
-//! `0-ULP` Odd-Symmetric `SONA` (`PolyADAA1` / `ParaLRU`) Hidden-Lane Sign-Flip Buyer
+//! `0-ULP` Odd-Symmetric `SONA` (`PolyADAA1` / `ParaLRU` / `PHS`) Hidden-Lane Sign-Flip Buyer
 //! Watermarking (`ref[sec.watermark.reciprocal-gauge]`).
 //!
-//! Because odd-symmetric `PolyADAA1` and optional `C^2` wavefolder satisfy $g(-x) = -g(x)$
-//! at analytical equilibrium $+0.0$, even-activation `adaa_even` satisfies $g_e(-x) = +g_e(x)$,
-//! and decoupled `1D` `ParaLRU` commutes with input polarity conjugation when `rect_sign` flips,
-//! flipping any active Matryoshka lane $i \in \{0,\dots,39\}$ by $s_i \in \{-1, +1\}$ across
-//! `in_mid_weight_fp16`, `in_side_weight_fp16`, `lru_bias_drive_fp16`, `rect_sign_fp16`,
-//! cyclic `glu_mix_fp16`, crossbar (`op_p_to_core`, `phasor_to_core`), inter-block `4x4`
-//! spatial tiles, and `LinearReadout` `odd` weights preserves **bit-exact `0.000000 ULP`**
-//! audio parity across `Lite..Ultra`.
+//! Because odd-symmetric `PolyADAA1`, `PHS` (`i_L^3` is strictly odd so flipping hidden state
+//! polarity requires no change to `svf_k_nl_fp16`), and optional `C^2` wavefolder satisfy
+//! $g(-x) = -g(x)$ at analytical equilibrium $+0.0$, even-activation `adaa_even` satisfies
+//! $g_e(-x) = +g_e(x)$, and decoupled `1D` `ParaLRU` commutes with input polarity conjugation when
+//! `rect_sign` (bit 15 of `wavefolder_mix_fp16`) flips, flipping any active Matryoshka lane
+//! $i \in \{0,\dots,39\}$ by $s_i \in \{-1, +1\}$ across `in_mid_weight_fp16`,
+//! `in_side_weight_fp16`, `lru_bias_drive_fp16`, `wavefolder_mix_fp16` bit-15 `rect_sign`, cyclic
+//! `glu_mix_fp16`, crossbar (`op_p_to_core`, `phasor_to_core`), inter-block `4x4` spatial tiles,
+//! and `LinearReadout` `odd` weights preserves **bit-exact `0.000000 ULP`** audio parity across
+//! `Lite..Ultra`.
 
 use zerocopy::FromBytes;
 use zerocopy::byteorder::little_endian::{F32, U16};
@@ -33,11 +35,6 @@ pub const SONA_SIGN_LANES_PER_TIER: [usize; 4] = [16, 24, 32, 40];
 pub const SONA_TOTAL_LANES: usize = 40;
 
 const SIGN_BIT_FP16: u16 = 0x8000;
-const FP16_POS_ONE: u16 = dnam_kernels::f32_to_fp16(1.0);
-const FP16_NEG_ONE: u16 = dnam_kernels::f32_to_fp16(-1.0);
-
-const _: () = assert!(FP16_POS_ONE == 0x3C00);
-const _: () = assert!(FP16_NEG_ONE == 0xBC00);
 
 #[inline]
 fn flip_f32_wire(slot: &mut F32, sign: f32) {
@@ -59,20 +56,13 @@ fn flip_fp16_wire(slot: &mut U16, sign: f32) {
     }
 }
 
-/// Flips `rect_sign_fp16` consistently with `dnam_vm`'s `wire_decode.rs`
-/// (`v.is_finite() && v < 0.0` decodes to `-1.0`, and all else including `±0.0`/`±Inf`/`NaN`
-/// decodes to `+1.0`).
+/// Unconditionally toggles bit 15 (`rect_sign`) of `wavefolder_mix_fp16` (including
+/// `0x0000 <-> 0x8000`) when `sign < 0.0`, preserving zero-magnitude rectification conjugation at
+/// `0-ULP` without touching `svf_k_nl_fp16`.
 #[inline]
-fn flip_rect_sign_fp16_wire(slot: &mut U16, sign: f32) {
+fn flip_wavefolder_rect_sign_bit_fp16(slot: &mut U16, sign: f32) {
     if sign < 0.0 {
-        let bits = slot.get();
-        let v = dnam_kernels::fp16_to_f32(bits);
-        let flipped = if v.is_finite() && (bits & 0x7FFF) != 0 {
-            bits ^ SIGN_BIT_FP16
-        } else {
-            FP16_NEG_ONE
-        };
-        *slot = U16::new(flipped);
+        *slot = U16::new(slot.get() ^ SIGN_BIT_FP16);
     }
 }
 
@@ -83,7 +73,7 @@ fn flip_core_quad_wire(qw: &mut CoreQuadWire, global_g: usize, s: &[f32; SONA_TO
         flip_fp16_wire(&mut qw.in_mid_weight_fp16[l], sign);
         flip_fp16_wire(&mut qw.in_side_weight_fp16[l], sign);
         flip_fp16_wire(&mut qw.lru_bias_drive_fp16[l], sign);
-        flip_rect_sign_fp16_wire(&mut qw.rect_sign_fp16[l], sign);
+        flip_wavefolder_rect_sign_bit_fp16(&mut qw.wavefolder_mix_fp16[l], sign);
         flip_fp16_wire(&mut qw.glu_mix_fp16[l], sign * sign_next);
     }
 }
@@ -294,9 +284,12 @@ mod tests {
             qw.tone_bp_fp16[l] = U16::new(f32_to_fp16(0.25 * s));
             qw.tone_dir_fp16[l] = U16::new(f32_to_fp16(0.30));
             qw.sag_depth_fp16[l] = U16::new(f32_to_fp16(0.18));
+            let wf = if (l & 1) == 0 { 0.25 } else { 0.0 };
             qw.wavefolder_mix_fp16[l] =
-                U16::new(f32_to_fp16(if (l & 1) == 0 { 0.25 } else { 0.0 }));
-            qw.rect_sign_fp16[l] = U16::new(f32_to_fp16(s));
+                U16::new(dnam_kernels::pack_wf_mix_and_rect_sign_fp16(wf, s));
+            if matches!(g, 0 | 4 | 6 | 8) {
+                qw.svf_k_nl_fp16[l] = U16::new(f32_to_fp16(1.2 + 0.15 * (l as f32)));
+            }
             qw.in_mid_weight_fp16[l] = U16::new(f32_to_fp16((0.35 - 0.02 * (g as f32)) * s));
             qw.in_side_weight_fp16[l] = U16::new(f32_to_fp16((0.12 - 0.01 * (g as f32)) * s));
             qw.glu_mix_fp16[l] =
@@ -643,20 +636,23 @@ mod tests {
             qw.adaa_drive_fp16[l] = U16::new(f32_to_fp16(1.2));
             qw.sag_depth_fp16[l] = U16::new(f32_to_fp16(0.3));
             qw.tone_dir_fp16[l] = U16::new(f32_to_fp16(0.6));
-            assert_eq!(qw.rect_sign_fp16[l].get(), 0x0000);
+            if matches!(g, 0 | 4 | 6 | 8) {
+                qw.svf_k_nl_fp16[l] = U16::new(f32_to_fp16(1.5));
+            }
+            assert_eq!(qw.wavefolder_mix_fp16[l].get(), 0x0000);
         }
     }
 
     #[test]
     fn test_sona_sign_gauge_zero_rect_sign_preserves_zero_ulp_across_tiers_and_double_flip() {
-        for bits in [0x0000_u16, 0x8000, 0x7C00, 0xFC00, 0x7E00] {
+        for bits in [0x0000_u16, 0x8000, 0x3400, 0xB400] {
             let mut slot = U16::new(bits);
-            flip_rect_sign_fp16_wire(&mut slot, -1.0);
-            assert_eq!(slot.get(), FP16_NEG_ONE);
-            flip_rect_sign_fp16_wire(&mut slot, -1.0);
-            assert_eq!(slot.get(), FP16_POS_ONE);
-            flip_rect_sign_fp16_wire(&mut slot, -1.0);
-            assert_eq!(slot.get(), FP16_NEG_ONE);
+            flip_wavefolder_rect_sign_bit_fp16(&mut slot, -1.0);
+            assert_eq!(slot.get(), bits ^ SIGN_BIT_FP16);
+            flip_wavefolder_rect_sign_bit_fp16(&mut slot, -1.0);
+            assert_eq!(slot.get(), bits);
+            flip_wavefolder_rect_sign_bit_fp16(&mut slot, -1.0);
+            assert_eq!(slot.get(), bits ^ SIGN_BIT_FP16);
         }
 
         let mut a0 = DnamBinBuildInput::default_arena0_lite();
@@ -704,10 +700,15 @@ mod tests {
         let (f1_a0, _) = Arena0LiteWire::ref_from_prefix(&flip1).unwrap();
         let (f2_a0, _) = Arena0LiteWire::ref_from_prefix(&flip2).unwrap();
         for l in 0..4 {
-            let expected1 = if signs[l] < 0.0 { FP16_NEG_ONE } else { 0x0000 };
-            let expected2 = if signs[l] < 0.0 { FP16_POS_ONE } else { 0x0000 };
-            assert_eq!(f1_a0.core_quads[0].rect_sign_fp16[l].get(), expected1);
-            assert_eq!(f2_a0.core_quads[0].rect_sign_fp16[l].get(), expected2);
+            let expected1 = if signs[l] < 0.0 {
+                SIGN_BIT_FP16
+            } else {
+                0x0000
+            };
+            assert_eq!(f1_a0.core_quads[0].wavefolder_mix_fp16[l].get(), expected1);
+            assert_eq!(f2_a0.core_quads[0].wavefolder_mix_fp16[l].get(), 0x0000);
+            assert_eq!(f1_a0.core_quads[0].svf_k_nl_fp16[l].get(), f32_to_fp16(1.5));
+            assert_eq!(f2_a0.core_quads[0].svf_k_nl_fp16[l].get(), f32_to_fp16(1.5));
         }
 
         let in_l: alloc::vec::Vec<f32> =

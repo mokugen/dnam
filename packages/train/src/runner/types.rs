@@ -18,6 +18,7 @@ use crate::gpu::abi::{
 pub fn pack_core_quad_params(
     params: &CoreQuadParamsStereo4<GpuVec4>,
 ) -> [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE] {
+    debug_assert_eq!(params.svf_k_nl.to_array(), [0.0; 4]);
     let g = params.two_svf_g.mul(GpuVec4::splat(0.5));
     let mut out = [[0.0_f32; 4]; QUAD_PARAMS_VEC4_STRIDE];
     out[quad_param_slots::SVF_A1] = params.svf.a1.to_array();
@@ -85,6 +86,7 @@ pub fn unpack_core_quad_params(
         tone,
         lru,
         two_svf_g: GpuVec4::from_array(packed[quad_param_slots::TWO_SVF_G]),
+        svf_k_nl: GpuVec4::zero(),
         rect_sign: GpuVec4::from_array(packed[quad_param_slots::RECT_SIGN]),
         sag_depth: GpuVec4::from_array(packed[quad_param_slots::SAG_DEPTH]),
         adaa_drive: GpuVec4::from_array(packed[quad_param_slots::ADAA_DRIVE]),
@@ -301,6 +303,7 @@ mod tests {
                 GpuVec4::splat(0.20),
             ),
             two_svf_g: g.add(g),
+            svf_k_nl: GpuVec4::zero(),
             rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
             sag_depth: GpuVec4::splat(0.25),
             adaa_drive: GpuVec4::splat(1.5),

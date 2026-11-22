@@ -4,7 +4,7 @@
 
 #![forbid(unsafe_code)]
 
-use dnam_vm::bin::{TRANSPORT_FLAG_EXT_F32, TRANSPORT_FLAG_SCHROEDER_ENABLE};
+use dnam_vm::bin::TRANSPORT_FLAG_EXT_F32;
 use dnam_vm::math::{TANK_DC_BLOCKER_48K_F32, f32_to_fp16};
 use dnam_vm::{
     Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, ControlBusBacking,
@@ -109,11 +109,7 @@ fn build_ultra_ext_model(want_f32: bool, num_controls: usize, with_tsyn: bool) -
     a0.transport_lite.g_loop = F32::new(0.5);
     a0.transport_lite.allpass_delays = [0, 17, 23, 31];
     a0.transport_lite.allpass_g_fp16 = [U16::new(f32_to_fp16(0.4)); 4];
-    let mut t_flags = TRANSPORT_FLAG_SCHROEDER_ENABLE;
-    if want_f32 {
-        t_flags |= TRANSPORT_FLAG_EXT_F32;
-    }
-    a0.transport_lite.flags = t_flags;
+    a0.transport_lite.flags = if want_f32 { TRANSPORT_FLAG_EXT_F32 } else { 0 };
 
     let mut a1 = Arena1FullDeltaWire::new_zeroed();
     a1.transport_full = a0.transport_lite;

@@ -25,9 +25,7 @@ use super::layout::{
     FLAG_COLD_FIR_EXT, FLAG_OS2X, SonaColdTail, SonaFullHotDelta, SonaHotSlab, SonaLiteHotPrefix,
     SonaProHotDelta, SonaSlabBacking, SonaUltraHotDelta,
 };
-use crate::bin::{
-    DnamBinView, TRANSPORT_FLAG_EXT_F32, TRANSPORT_FLAG_SCHROEDER_ENABLE, TransportQuadWire,
-};
+use crate::bin::{DnamBinView, TRANSPORT_FLAG_EXT_F32, TransportQuadWire};
 use crate::control::ControlBus;
 #[cfg(feature = "alloc")]
 use crate::control::ControlBusBacking;
@@ -275,20 +273,19 @@ fn hydrate_transport_borrowed<'a, B: GraphBackend>(
         slab.cold_mut().transport_ext[q] =
             TransportExtRing::from_borrowed_parts(fp_s, f32_s, has_ext, want_f32, cap)?;
         let (_, _, _, sch_req) = compute_schroeder_requirements(&wires[q], zoh.rho_vm);
-        slab.cold_mut().transport_schroeder[q] =
-            if (wires[q].flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) == 0 || sch_req == 0 {
-                if sch_s.is_empty() {
-                    PartitionedSchroederBank::disabled()
-                } else {
-                    PartitionedSchroederBank::from_cold_buf(
-                        ColdBuf::borrowed(sch_s),
-                        &disabled_wire,
-                        1.0,
-                    )?
-                }
+        slab.cold_mut().transport_schroeder[q] = if sch_req == 0 {
+            if sch_s.is_empty() {
+                PartitionedSchroederBank::disabled()
             } else {
-                PartitionedSchroederBank::from_slice(sch_s, &wires[q], zoh.rho_vm)?
-            };
+                PartitionedSchroederBank::from_cold_buf(
+                    ColdBuf::borrowed(sch_s),
+                    &disabled_wire,
+                    1.0,
+                )?
+            }
+        } else {
+            PartitionedSchroederBank::from_slice(sch_s, &wires[q], zoh.rho_vm)?
+        };
     }
     Ok(())
 }
@@ -409,11 +406,9 @@ fn validate_reload_slab_capacity<B: GraphBackend>(
                 return Err(VmError::InsufficientBackingCapacity);
             }
         }
-        if (wire.flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) != 0 {
-            let (_, _, _, sch_req) = compute_schroeder_requirements(wire, zoh.rho_vm);
-            if sch_req > 0 && cold.transport_schroeder[q].backing_f32_capacity() < sch_req {
-                return Err(VmError::InsufficientBackingCapacity);
-            }
+        let (_, _, _, sch_req) = compute_schroeder_requirements(wire, zoh.rho_vm);
+        if sch_req > 0 && cold.transport_schroeder[q].backing_f32_capacity() < sch_req {
+            return Err(VmError::InsufficientBackingCapacity);
         }
     }
     Ok((zoh, wires))
@@ -497,11 +492,7 @@ pub fn reload_slab_from_dnam_bin_in_place<B: GraphBackend>(
         cold.transport_quad_meta[q] = meta_q;
         cold.transport_quad_eff[q] = QuadEffectiveTargets::from_quad_and_meta(&hot_q, &meta_q);
         cold.transport_ext[q].reconfigure_for_reload(has_ext, want_f32, cap)?;
-        if (wire.flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) == 0 {
-            cold.transport_schroeder[q].deactivate_preserving_storage();
-        } else {
-            cold.transport_schroeder[q].reconfigure_sample_rate(wire, zoh.rho_vm)?;
-        }
+        cold.transport_schroeder[q].reconfigure_sample_rate(wire, zoh.rho_vm)?;
     }
 
     apply_tier_weights_and_rescale(slab, active_tier, &zoh)?;
@@ -616,21 +607,13 @@ pub fn hydrate_slab_owned_with_headroom<B: GraphBackend>(
             },
         )?;
         slab.cold_mut().transport_ext[q] = ext_ring;
-        let sch_req_alloc = if (wire.flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) == 0 {
-            0
-        } else {
-            compute_schroeder_requirements(wire, alloc_rho).3
-        };
+        let sch_req_alloc = compute_schroeder_requirements(wire, alloc_rho).3;
         let mut sch = PartitionedSchroederBank::new_owned_with_capacity(
             sch_req_alloc.max(headroom.schroeder_f32_per_quad),
             wire,
             alloc_rho,
         )?;
-        if (wire.flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) == 0 {
-            sch.deactivate_preserving_storage();
-        } else {
-            sch.reconfigure_sample_rate(wire, zoh.rho_vm)?;
-        }
+        sch.reconfigure_sample_rate(wire, zoh.rho_vm)?;
         slab.cold_mut().transport_schroeder[q] = sch;
     }
 

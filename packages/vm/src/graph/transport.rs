@@ -9,7 +9,7 @@ pub mod ring;
 
 use dnam_kernels::{QUAD_FLAG_HAS_EXT, scrub_and_flush_f32_bits};
 
-use crate::bin::arena_wire::{TRANSPORT_FLAG_SCHROEDER_ENABLE, TransportQuadWire};
+use crate::bin::arena_wire::TransportQuadWire;
 use crate::math::MathBackend;
 use crate::types::VmError;
 
@@ -84,10 +84,8 @@ pub fn compute_transport_storage_requirements(
         );
         sum.ext_fp16_u16 += u16_len;
         sum.ext_f32 += f32_len;
-        if (wire.flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) != 0 {
-            let (_, _, _, sch_len) = compute_schroeder_requirements(wire, rho_vm);
-            sum.schroeder_f32 += sch_len;
-        }
+        let (_, _, _, sch_len) = compute_schroeder_requirements(wire, rho_vm);
+        sum.schroeder_f32 += sch_len;
     }
     sum
 }
@@ -376,11 +374,7 @@ mod tests {
     /// verify[dsp.tank.feedback-loop]
     #[test]
     fn test_multiquad_stage_dry_mix_psi_slew_freeze_release_and_reconfigure() {
-        let mut w0 = make_quad_wire(
-            [16.0, 20.0, 24.0, 28.0],
-            1.0,
-            TRANSPORT_FLAG_EXT_F32 | TRANSPORT_FLAG_SCHROEDER_ENABLE,
-        );
+        let mut w0 = make_quad_wire([16.0, 20.0, 24.0, 28.0], 1.0, TRANSPORT_FLAG_EXT_F32);
         w0.allpass_delays = [13, 0, 17, 0];
         w0.lfo_rate_hz = F32::new(2.0);
         w0.lfo_depths_fp16 = [4.0, 4.0, 0.0, 0.0].map(|v| U16::new(f32_to_fp16(v)));

@@ -7,6 +7,7 @@
 mod sona_vm_pipeline_and_parity {
     pub(crate) mod helpers;
     pub(crate) mod m10b_contracts;
+    pub(crate) mod m16_contracts;
     pub(crate) mod m9_contracts;
 }
 

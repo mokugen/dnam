@@ -2,10 +2,11 @@
 
 #![forbid(unsafe_code)]
 
+use dnam_kernels::pack_wf_mix_and_rect_sign_fp16;
 use dnam_vm::bin::{
     DNBN_FLAG_STEREO_OUT, PIPE_CANONICAL_V3_SONA, SONA_META_CORE_MODS_PRESENT,
     SONA_META_OS_EXT_PRESENT, SONA_META_SENSORY_QUAD, SONA_META_TRANSPORT_LFO,
-    SONA_META_TRANSPORT_TAP_GAINS, TRANSPORT_FLAG_EXT_F32, TRANSPORT_FLAG_SCHROEDER_ENABLE,
+    SONA_META_TRANSPORT_TAP_GAINS, TRANSPORT_FLAG_EXT_F32,
 };
 use dnam_vm::math::{TANK_DC_BLOCKER_48K_F32, f32_to_fp16};
 use dnam_vm::{
@@ -110,8 +111,17 @@ pub(crate) fn make_core_quad(q: usize) -> CoreQuadWire {
         tone_ap_fp16: fp16_arr([0.10, 0.12, 0.15, 0.18]),
         tone_dir_fp16: fp16_arr([0.20, 0.18, 0.20, 0.22]),
         sag_depth_fp16: fp16_arr([0.06, 0.05, 0.07, 0.04]),
-        wavefolder_mix_fp16: fp16_arr([0.04, 0.03, 0.05, 0.04]),
-        rect_sign_fp16: fp16_arr([rs, -rs, rs, -rs]),
+        wavefolder_mix_fp16: [
+            U16::new(pack_wf_mix_and_rect_sign_fp16(0.04, rs)),
+            U16::new(pack_wf_mix_and_rect_sign_fp16(0.03, -rs)),
+            U16::new(pack_wf_mix_and_rect_sign_fp16(0.05, rs)),
+            U16::new(pack_wf_mix_and_rect_sign_fp16(0.04, -rs)),
+        ],
+        svf_k_nl_fp16: if matches!(q, 0 | 4 | 6 | 8) {
+            fp16_arr([1.25, 0.85, 1.50, 0.60])
+        } else {
+            [U16::new(0); 4]
+        },
         in_mid_weight_fp16: fp16_arr([0.22, -0.18, 0.25, -0.15]),
         in_side_weight_fp16: fp16_arr([0.08, 0.06, -0.07, 0.05]),
         lru_stereo_link_fp16: fp16_arr([0.15, 0.20, 0.10, 0.25]),
@@ -216,11 +226,7 @@ pub(crate) fn make_transport_quad(q: usize) -> TransportQuadWire {
         [71.0, 79.0, 83.0, 89.0],
         [97.0, 101.0, 107.0, 113.0],
     ];
-    let flags = if q == 0 {
-        TRANSPORT_FLAG_SCHROEDER_ENABLE
-    } else {
-        TRANSPORT_FLAG_EXT_F32
-    };
+    let flags = if q == 0 { 0 } else { TRANSPORT_FLAG_EXT_F32 };
     TransportQuadWire {
         delay_samples: le_f32(DELAYS[q]),
         ramp_spans_samples: le_f32([4.0, 5.0, 6.0, 7.0]),
@@ -245,7 +251,7 @@ pub(crate) fn make_transport_quad(q: usize) -> TransportQuadWire {
         sigma_knee_fp16: fp16_val(0.85),
         freeze_mix_fp16: fp16_val(0.15 * (q as f32)),
         window_depth_fp16: fp16_val(0.45),
-        reserved_120_122: U16::new(0),
+        scat_psi_fp16: fp16_val(0.35 - 0.08 * (q as f32)),
         allpass_delays: if q == 0 { [11, 17, 23, 31] } else { [0; 4] },
         flags,
         reserved: 0,
@@ -679,7 +685,7 @@ impl GaugeWeights {
             quad.in_mid_weight_fp16 = fp16_arr(self.in_mid[q]);
             quad.tone_lp_fp16 = fp16_arr([0.5; 4]);
             quad.tone_dir_fp16 = fp16_arr([1.0; 4]);
-            quad.rect_sign_fp16 = fp16_arr([1.0; 4]);
+            quad.wavefolder_mix_fp16 = [U16::new(0); 4];
             a0.core_quads[q] = quad;
         }
         for t in 0..3 {

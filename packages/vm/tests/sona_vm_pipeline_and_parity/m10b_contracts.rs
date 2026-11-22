@@ -397,7 +397,7 @@ fn test_m10b_core_quad_ms_coupling_duhem_stereo_link_and_glu_mix() {
     q0.lru_kappa_fp16 = fp16_arr([0.5; 4]);
     q0.adaa_drive_fp16 = fp16_arr([1.5; 4]);
     q0.tone_dir_fp16 = fp16_arr([1.0; 4]);
-    q0.rect_sign_fp16 = fp16_arr([1.0; 4]);
+    q0.wavefolder_mix_fp16 = [U16::new(0); 4];
     q0.in_mid_weight_fp16 = fp16_arr([1.0; 4]);
     q0.in_side_weight_fp16 = fp16_arr([0.0; 4]);
     base_a0.core_quads[0] = q0;

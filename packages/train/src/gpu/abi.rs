@@ -330,9 +330,9 @@ const _: () = assert!(OZAKI_GRAM_SRAM_BYTES <= MAX_WORKGROUP_SRAM_BYTES as u32);
 const _: () = assert!(INNER_OPT_SRAM_BYTES <= MAX_WORKGROUP_SRAM_BYTES as u32);
 const _: () = assert!(CORE_INPUT_VEC4_STRIDE == 2);
 const _: () = assert!(QUAD_PARAMS_VEC4_STRIDE == 24);
+// Temporary M16 compile bridge: slot 23 stays `SVF_G` while `svf_k_nl` (zeroed on host) grows CoreQuadParamsStereo4 to 24 Vec4s until M17 bumps WGSL stride.
 const _: () = assert!(
-    size_of::<CoreQuadParamsStereo4<GpuVec4>>()
-        == (QUAD_PARAMS_VEC4_STRIDE - 1) * size_of::<[f32; 4]>()
+    size_of::<CoreQuadParamsStereo4<GpuVec4>>() == QUAD_PARAMS_VEC4_STRIDE * size_of::<[f32; 4]>()
 );
 const _: () = assert!(GPU_OZAKI_MAX_CHUNK_LEN == 1024);
 const _: () = assert!(GPU_SOFT_RECT_EPS > 0.0);

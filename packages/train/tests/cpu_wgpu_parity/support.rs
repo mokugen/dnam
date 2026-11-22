@@ -39,6 +39,7 @@ pub(crate) fn build_quad(stem: usize, quad: usize, zero_g: bool) -> [[f32; 4]; 2
             GpuVec4::from_array([0.05, 0.25, 0.45, 0.65]),
         ),
         two_svf_g: g.add(g),
+        svf_k_nl: GpuVec4::zero(),
         rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
         sag_depth: GpuVec4::from_array([0.18, 0.32, 0.45, 0.22]),
         adaa_drive: GpuVec4::from_array([1.15, 1.65, 2.10, 1.35]),

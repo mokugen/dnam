@@ -145,6 +145,7 @@ pub struct QuadColdMeta {
     pub base_ramp_rate_hz: f32,
     pub base_freeze_mix: f32,
     pub base_psi: f32,
+    pub base_scat_psi: f32,
     pub base_window_depth: f32,
     pub inv_fs_vm: f64,
     pub scale_inv_rho_vm: f32,
@@ -165,6 +166,7 @@ impl Default for QuadColdMeta {
             base_ramp_rate_hz: 0.0,
             base_freeze_mix: 0.0,
             base_psi: 0.0,
+            base_scat_psi: 0.0,
             base_window_depth: 0.0,
             inv_fs_vm: 1.0 / 48_000.0,
             scale_inv_rho_vm: 1.0,
@@ -191,6 +193,8 @@ pub struct QuadEffectiveTargets {
     pub half_alpha_cubic: f32,
     pub cos_psi: f32,
     pub sin_psi: f32,
+    pub cos_scat: f32,
+    pub sin_scat: f32,
     pub damp_pole_eff: f32,
     pub wet_scale: f32,
     pub window_depth_eff: f32,
@@ -237,6 +241,9 @@ impl QuadEffectiveTargets {
             lfo_depths_eff[k] *= taper;
             allpass_g_eff[k] *= taper;
         }
+        let mu_freeze_unlocked = clamp_finite_f32(meta.base_freeze_mix, 0.0, 1.0, 0.0);
+        let (cos_scat, sin_scat) =
+            algebraic_unit_rotor_f32((1.0 - mu_freeze_unlocked) * meta.base_scat_psi);
         Self {
             cap: meta.cap,
             scale_inv_rho_vm: meta.scale_inv_rho_vm,
@@ -250,6 +257,8 @@ impl QuadEffectiveTargets {
             half_alpha_cubic: compute_half_alpha_cubic_f32(g_loop_eff, mu_freeze),
             cos_psi: quad.cos_psi,
             sin_psi: quad.sin_psi,
+            cos_scat,
+            sin_scat,
             damp_pole_eff: quad.damp_pole,
             wet_scale: 1.0,
             window_depth_eff: fp16_to_f32(quad.window_depth_fp16),

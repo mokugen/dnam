@@ -7,7 +7,7 @@ use dnam_kernels::{
     QUAD_FLAG_HAS_EXT, compute_t1_dc_blocker_coeffs_clamped, interpolate_hilbert_h1_alphas_f64,
 };
 
-use crate::bin::{CONVOLVER_KAUTZ_BLOCKS_PER_TIER, TRANSPORT_FLAG_SCHROEDER_ENABLE};
+use crate::bin::CONVOLVER_KAUTZ_BLOCKS_PER_TIER;
 use crate::control::bus::laws::{
     eval_op_t_freeze_mix_eff, eval_phasor_inc_core_q32, eval_phasor_inc_vm_q32,
 };
@@ -188,11 +188,9 @@ fn retime_with_bounce<B: GraphBackend>(
             if has_ext && cold.transport_ext[q].backing_frame_capacity() < cap {
                 return Err(VmError::InsufficientBackingCapacity);
             }
-            if (wire.flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) != 0 {
-                let (_, _, _, sch_req) = compute_schroeder_requirements(wire, zoh.rho_vm);
-                if cold.transport_schroeder[q].backing_f32_capacity() < sch_req {
-                    return Err(VmError::InsufficientBackingCapacity);
-                }
+            let (_, _, _, sch_req) = compute_schroeder_requirements(wire, zoh.rho_vm);
+            if sch_req > 0 && cold.transport_schroeder[q].backing_f32_capacity() < sch_req {
+                return Err(VmError::InsufficientBackingCapacity);
             }
         }
     }

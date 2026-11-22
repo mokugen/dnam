@@ -60,9 +60,8 @@ pub const SONA_META_TRANSPORT_LFO: u32 = 1 << 20;
 /// Reserved `sona_meta_flags` / `cell_flags` bits (`5, 10..=15, 18..=19, 21..=31`).
 pub const SONA_META_RESERVED_MASK: u32 = (1 << 5) | 0xFC00 | (0b11 << 18) | 0xFFE0_0000;
 
-/// `TransportQuadWire::flags` bit 0: Schroeder diffuser stage enabled.
-pub const TRANSPORT_FLAG_SCHROEDER_ENABLE: u8 = 1 << 0;
-/// `TransportQuadWire::flags` bit 1: external ring uses `f32` (`1`) instead of `fp16` (`0`).
+/// `TransportQuadWire::flags` bit 1: external ring uses `f32` (`1`) instead of `fp16` (`0`)
+/// (`bit 0` and bits `2..=7` strictly reserved `0`).
 pub const TRANSPORT_FLAG_EXT_F32: u8 = 1 << 1;
 
 /// `Op-N[Pre]` base front-end record (`12 B` at Arena 0 offset `180..192`).
@@ -216,10 +215,10 @@ pub struct CoreQuadWire {
     pub tone_dir_fp16: [U16; 4],
     /// Sag supply coupling depths (`[-8.0, 8.0]`, `fp16`).
     pub sag_depth_fp16: [U16; 4],
-    /// Wavefolder wet mix (`[0.0, 1.0]`, `fp16`).
+    /// Wavefolder wet mix (`bits 0..=14` `[0.0, 1.0]`, `fp16`) and bit-15 `rect_sign` (`0 => +1`, `1 => -1`).
     pub wavefolder_mix_fp16: [U16; 4],
-    /// Mechanism A2 sign parity (`fp16`, decoded to `{-1.0, +1.0}`).
-    pub rect_sign_fp16: [U16; 4],
+    /// Block 0 linearly-implicit PHS nonlinear SVF damping `[0.0, 16.0]` (`0x0000` on Blocks 1..3).
+    pub svf_k_nl_fp16: [U16; 4],
     /// Direct Mid input coupling weights (`[-16.0, 16.0]`, `fp16`).
     pub in_mid_weight_fp16: [U16; 4],
     /// Direct Side input coupling weights (`[-16.0, 16.0]`, `fp16`).
@@ -237,6 +236,8 @@ pub struct CoreQuadWire {
 const _: () = assert!(size_of::<CoreQuadWire>() == 192);
 const _: () = assert!(align_of::<CoreQuadWire>() == 1);
 const _: () = assert!(offset_of!(CoreQuadWire, svf_k_fp16) == 48);
+const _: () = assert!(offset_of!(CoreQuadWire, wavefolder_mix_fp16) == 128);
+const _: () = assert!(offset_of!(CoreQuadWire, svf_k_nl_fp16) == 136);
 const _: () = assert!(offset_of!(CoreQuadWire, in_mid_weight_fp16) == 144);
 const _: () = assert!(offset_of!(CoreQuadWire, in_side_weight_fp16) == 152);
 const _: () = assert!(offset_of!(CoreQuadWire, lru_stereo_link_fp16) == 160);
@@ -391,11 +392,11 @@ pub struct TransportQuadWire {
     pub freeze_mix_fp16: U16,
     /// Time-stretcher Hann window depth (`fp16`, `[0.0, 1.0]`).
     pub window_depth_fp16: U16,
-    /// Reserved slot (`0`, ignored on decode).
-    pub reserved_120_122: U16,
-    /// Per-lane Schroeder all-pass integer delays (`<= 255` at `48 kHz`).
+    /// Base `SO(4)` paraunitary scattering angle in radians (`fp16`, `[-pi, +pi]`, default `0.0`).
+    pub scat_psi_fp16: U16,
+    /// Per-lane Schroeder all-pass integer delays (`<= 255` at `48 kHz`; `0` allocates `0 B` cold RAM).
     pub allpass_delays: [u8; 4],
-    /// Bit 0 = `schroeder_enable`, bit 1 = `ext_f32`, bits `2..=7` strictly `0`.
+    /// Bit `0` strictly `0` (reserved), bit `1` = `ext_f32`, bits `2..=7` strictly `0`.
     pub flags: u8,
     /// Reserved byte (`0`).
     pub reserved: u8,
@@ -407,7 +408,7 @@ const _: () = assert!(offset_of!(TransportQuadWire, reserved_52_56) == 52);
 const _: () = assert!(offset_of!(TransportQuadWire, lfo_depths_fp16) == 56);
 const _: () = assert!(offset_of!(TransportQuadWire, fb_psi_fp16) == 112);
 const _: () = assert!(offset_of!(TransportQuadWire, freeze_mix_fp16) == 116);
-const _: () = assert!(offset_of!(TransportQuadWire, reserved_120_122) == 120);
+const _: () = assert!(offset_of!(TransportQuadWire, scat_psi_fp16) == 120);
 const _: () = assert!(offset_of!(TransportQuadWire, allpass_delays) == 122);
 const _: () = assert!(offset_of!(TransportQuadWire, flags) == 126);
 

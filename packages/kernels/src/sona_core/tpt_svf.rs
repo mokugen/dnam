@@ -4,6 +4,9 @@
 
 use crate::simd::{GpuVec4, KernelVec4, StereoVec8, const_taylor_inv_fact_f32};
 
+pub mod phs;
+pub use phs::{MAX_SVF_K_NL, SVF_PHS_E_MAX, step_tpt_svf_phs_stereo8, step_tpt_svf_phs_vec4};
+
 /// Minimum normalized cutoff ratio `f_c / f_s` accepted by `prewarp_tan_pi_f_over_fs_f32`.
 const MIN_PREWARP_RATIO: f32 = 1.0e-5;
 /// Maximum normalized cutoff ratio `f_c / f_s` accepted by `prewarp_tan_pi_f_over_fs_f32`.

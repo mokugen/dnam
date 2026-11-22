@@ -3,10 +3,11 @@
 //! (`ref[dsp.op-t.reader.catmull-rom]`).
 
 use dnam_kernels::{
-    OpTFeedbackParams, OpTFeedbackState, Q32_INV_2POW32_F32, QUAD_FLAG_SCHROEDER_ENABLE,
-    blend_catmull_rom_modulated_f32, compute_op_t_mu_win_f32, eval_op_t_diagonal_window_vec4,
-    q32_smooth_sin_f32, scrub_and_flush_f32_bits, step_op_t_feedback_vec4,
-    step_op_t_wet_dc_stereo_f32, step_we_hold_lag, step_we_hold_lag_u16,
+    OpTFeedbackParams, OpTFeedbackState, Q32_INV_2POW32_F32, apply_so4_even_chunk4,
+    apply_so4_even_vec4, apply_so4_odd_chunk4, apply_so4_odd_vec4, blend_catmull_rom_modulated_f32,
+    compute_op_t_mu_win_f32, eval_op_t_diagonal_window_vec4, q32_smooth_sin_f32,
+    scrub_and_flush_f32_bits, step_op_t_feedback_vec4, step_op_t_wet_dc_stereo_f32,
+    step_we_hold_lag, step_we_hold_lag_u16,
 };
 
 use crate::math::{MathBackend, SimdVec4, clamp_finite_f32, const_abs_f32, floor_f32, fp16_to_f32};
@@ -97,12 +98,12 @@ impl TransportQuadHotCompact {
     }
 
     #[inline(always)]
-    fn read_active_v_read<B: MathBackend>(
+    fn read_active_r_win_at<B: MathBackend>(
         &mut self,
         ring: &QuadRingMut<'_, '_>,
-        schroeder: Option<&mut PartitionedSchroederBank<'_>>,
+        wr: u32,
         eff: &QuadEffectiveTargets,
-    ) -> (B::Vec4, B::Vec4) {
+    ) -> B::Vec4 {
         let cap = ring.cap();
         let (lfo_base, ramp_base) = (self.lfo_phase_q32, self.ramp_phase_q32);
         self.lfo_phase_q32 = lfo_base.wrapping_add(self.lfo_inc_q32);
@@ -129,7 +130,7 @@ impl TransportQuadHotCompact {
             let tau = clamp_finite_f32(tau_raw, 5.0, max_tau, 5.0);
             let d_floor = floor_f32(tau);
             let d_int = (d_floor as usize).clamp(5, cap - 2);
-            let taps = ring.read_catmull_rom_4::<B>(self.write_ptr, d_int, k);
+            let taps = ring.read_catmull_rom_4::<B>(wr, d_int, k);
             r_raw[k] = blend_catmull_rom_modulated_f32(
                 taps[0],
                 taps[1],
@@ -145,22 +146,28 @@ impl TransportQuadHotCompact {
             );
         }
         let win = eval_op_t_diagonal_window_vec4::<B::Vec4>(ramp_phs, B::Vec4::load(&mu_win));
-        let r_win = B::Vec4::load(&r_raw).mul(win);
-        let v_read = if (self.flags & QUAD_FLAG_SCHROEDER_ENABLE) != 0
-            && !self.is_full_hold(eff.mu_freeze)
-        {
-            if let Some(ap) = schroeder {
-                ap.step_vec4::<B>(r_win)
-            } else {
-                r_win
-            }
+        B::Vec4::load(&r_raw).mul(win)
+    }
+
+    #[inline(always)]
+    fn read_active_v_read<B: MathBackend>(
+        &mut self,
+        ring: &QuadRingMut<'_, '_>,
+        schroeder: Option<&mut PartitionedSchroederBank<'_>>,
+        eff: &QuadEffectiveTargets,
+    ) -> (B::Vec4, B::Vec4) {
+        let r_win = self.read_active_r_win_at::<B>(ring, self.write_ptr, eff);
+        let v_read = if let Some(ap) = schroeder {
+            ap.step_vec4::<B>(r_win, eff.cos_scat, eff.sin_scat)
         } else {
-            r_win
+            let x_clean = r_win.scrub_recursive_state();
+            let x1 = apply_so4_even_vec4(x_clean, eff.cos_scat, eff.sin_scat);
+            apply_so4_odd_vec4(x1, eff.cos_scat, eff.sin_scat)
         };
         (v_read, r_win)
     }
 
-    /// Top-of-Frame causal delay read + diagonal window + Schroeder (`(v_read, r_win)`).
+    /// Top-of-Frame causal delay read + diagonal window + fused `SO(4)` Schroeder (`(v_read, r_win)`).
     #[inline(always)]
     pub(crate) fn read_top_of_frame_v_read<B: MathBackend>(
         &mut self,
@@ -181,6 +188,65 @@ impl TransportQuadHotCompact {
                 r_win: r_win.to_array(),
             }
         }
+    }
+
+    /// Causal `4`-frame Top-of-Frame delay read + diagonal window + fused `SO(4)` Schroeder batch
+    /// matching four sequential [`Self::read_top_of_frame_v_read`] calls at `0-ULP` (called before
+    /// the four End-of-Frame writes since `d_int >= 5` avoids write-before-read overlap).
+    #[inline(always)]
+    pub(crate) fn read_top_of_frame_chunk4<B: MathBackend>(
+        &mut self,
+        mut ring: QuadRingMut<'_, '_>,
+        schroeder: Option<&mut PartitionedSchroederBank<'_>>,
+        eff: &QuadEffectiveTargets,
+    ) -> [QuadTopRead; 4] {
+        if self.is_full_hold(eff.mu_freeze) {
+            return core::array::from_fn(|_| {
+                let held_arr = self.read_held_v_read::<B>(&mut ring).to_array();
+                QuadTopRead {
+                    v_read: held_arr,
+                    r_win: held_arr,
+                }
+            });
+        }
+        let mask = (ring.cap() - 1) as u32;
+        let wr0 = self.write_ptr;
+        let r_win_4 = [
+            self.read_active_r_win_at::<B>(&ring, wr0, eff),
+            self.read_active_r_win_at::<B>(&ring, wr0.wrapping_sub(1) & mask, eff),
+            self.read_active_r_win_at::<B>(&ring, wr0.wrapping_sub(2) & mask, eff),
+            self.read_active_r_win_at::<B>(&ring, wr0.wrapping_sub(3) & mask, eff),
+        ];
+        let v_read_4 = if let Some(ap) = schroeder {
+            ap.step_chunk4::<B>(r_win_4, eff.cos_scat, eff.sin_scat)
+        } else {
+            let x_clean = [
+                r_win_4[0].scrub_recursive_state(),
+                r_win_4[1].scrub_recursive_state(),
+                r_win_4[2].scrub_recursive_state(),
+                r_win_4[3].scrub_recursive_state(),
+            ];
+            let x1 = apply_so4_even_chunk4(x_clean, eff.cos_scat, eff.sin_scat);
+            apply_so4_odd_chunk4(x1, eff.cos_scat, eff.sin_scat)
+        };
+        [
+            QuadTopRead {
+                v_read: v_read_4[0].to_array(),
+                r_win: r_win_4[0].to_array(),
+            },
+            QuadTopRead {
+                v_read: v_read_4[1].to_array(),
+                r_win: r_win_4[1].to_array(),
+            },
+            QuadTopRead {
+                v_read: v_read_4[2].to_array(),
+                r_win: r_win_4[2].to_array(),
+            },
+            QuadTopRead {
+                v_read: v_read_4[3].to_array(),
+                r_win: r_win_4[3].to_array(),
+            },
+        ]
     }
 
     /// Post-Convolver pure-wet tap projection + Givens rotation + 5 Hz wet DC blocker (Step 10).
@@ -277,7 +343,7 @@ impl TransportQuadHotCompact {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bin::arena_wire::{TRANSPORT_FLAG_SCHROEDER_ENABLE, TransportQuadWire};
+    use crate::bin::arena_wire::TransportQuadWire;
     use crate::math::{DefaultMathBackend, const_abs_f32, f32_to_fp16};
     use zerocopy::FromZeros;
     use zerocopy::byteorder::little_endian::{F32, U16};
@@ -293,7 +359,6 @@ mod tests {
         let mut ap_wire = TransportQuadWire::new_zeroed();
         ap_wire.allpass_delays = [7, 0, 0, 0];
         ap_wire.allpass_g_fp16 = [0.5, 0.0, 0.0, 0.0].map(|v| U16::new(f32_to_fp16(v)));
-        ap_wire.flags = TRANSPORT_FLAG_SCHROEDER_ENABLE;
         let mut ap_buf = [0.0_f32; 32];
         let mut ap = PartitionedSchroederBank::from_slice(&mut ap_buf, &ap_wire, 1.0).unwrap();
 
@@ -302,7 +367,6 @@ mod tests {
             ramp_spans_samples: [16.0; 4],
             ramp_inc_q32: 0x0100_0000,
             lfo_inc_q32: 0x0200_0000,
-            flags: QUAD_FLAG_SCHROEDER_ENABLE,
             wet_tap_l_fp16: [f32_to_fp16(0.25); 4],
             wet_tap_r_fp16: [f32_to_fp16(-0.25); 4],
             ..Default::default()

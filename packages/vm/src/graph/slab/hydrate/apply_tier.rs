@@ -415,7 +415,8 @@ pub(super) fn populate_crossbar_and_core_quads<B: GraphBackend>(
         quad_wires[PRO_QUAD_END..ULTRA_QUAD_END].copy_from_slice(&a3.core_quads);
     }
     for (q_idx, qw) in quad_wires.iter().enumerate() {
-        let (hot_q, ext_q, bits) = decode_core_quad_wire(qw);
+        let is_block0 = super::super::layout::SONA_CORE_QUAD_BLOCK_AND_LOCAL[q_idx].0 == 0;
+        let (hot_q, ext_q, bits) = decode_core_quad_wire(qw, is_block0);
         let cold_mut = slab.cold_mut();
         cold_mut.base_core_quads[q_idx] = hot_q;
         cold_mut.base_core_ext[q_idx] = ext_q;

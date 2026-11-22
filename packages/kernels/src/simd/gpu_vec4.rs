@@ -144,6 +144,21 @@ impl KernelVec4 for GpuVec4 {
     }
 
     #[inline(always)]
+    fn pair_swap_neg(self) -> Self {
+        Self([-self.0[1], self.0[0], -self.0[3], self.0[2]])
+    }
+
+    #[inline(always)]
+    fn odd_pair_swap_neg(self) -> Self {
+        Self([self.0[3], -self.0[2], self.0[1], -self.0[0]])
+    }
+
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        Self([self.0[1], self.0[2], self.0[3], self.0[0]])
+    }
+
+    #[inline(always)]
     fn flush_recursive_state(self) -> Self {
         Self([
             scrub_and_flush_f32_bits(self.0[0]),

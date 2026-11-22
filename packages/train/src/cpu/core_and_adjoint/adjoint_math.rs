@@ -619,6 +619,7 @@ mod tests {
                     GpuVec4::splat(0.0),
                 ),
                 two_svf_g: GpuVec4::splat(0.2),
+                svf_k_nl: GpuVec4::zero(),
                 rect_sign: GpuVec4::splat(1.0),
                 sag_depth: GpuVec4::splat(4.0),
                 adaa_drive: GpuVec4::splat(1.0),

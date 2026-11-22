@@ -214,6 +214,7 @@ pub(crate) mod tests {
         assert_eq!(B::crc32c(b"123456789"), 0xE306_9283);
         assert_eq!(B::crc32c_update(0, b"123456789"), 0xE306_9283);
         check_flush_subnormal::<B::Vec4>();
+        crate::math::backend::simd_vec4::tests::verify_all_simd_and_kernel_ops::<B::Vec4>();
         let cols = [
             [1.0, 0.0, 0.0, 0.0],
             [0.0, 2.0, 0.0, 0.0],

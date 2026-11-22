@@ -116,6 +116,19 @@ impl SimdVec4 for Sse2Vec4 {
     }
 
     #[inline(always)]
+    fn odd_pair_swap_neg(self) -> Self {
+        // `_mm_shuffle_ps::<0x1B>` reverses `[0,1,2,3] -> [3,2,1,0]` and XOR flips `[1,3]`.
+        let reversed = _mm_shuffle_ps::<0x1B>(self.0, self.0);
+        Self(_mm_xor_ps(reversed, _mm_set_ps(-0.0, 0.0, -0.0, 0.0)))
+    }
+
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        // `_mm_shuffle_ps::<0x39>` rotates `[0,1,2,3] -> [1,2,3,0]`.
+        Self(_mm_shuffle_ps::<0x39>(self.0, self.0))
+    }
+
+    #[inline(always)]
     fn flush_subnormal(self) -> Self {
         // Signed `i32` comparison matches unsigned magnitude in `[0, IEEE754_F32_ABS_MASK]`.
         let bits = _mm_castps_si128(self.0);
@@ -280,6 +293,16 @@ impl dnam_kernels::KernelVec4 for Sse2Vec4 {
     }
 
     #[inline(always)]
+    fn odd_pair_swap_neg(self) -> Self {
+        <Self as SimdVec4>::odd_pair_swap_neg(self)
+    }
+
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        <Self as SimdVec4>::rotate_left_1(self)
+    }
+
+    #[inline(always)]
     fn flush_subnormal(self) -> Self {
         <Self as SimdVec4>::flush_subnormal(self)
     }
@@ -361,8 +384,11 @@ mod tests {
     fn test_sse2_vec4_transpose_and_ops() {
         let a = Sse2Vec4::from_array([1.0, 2.0, 3.0, 4.0]);
         assert_eq!(a.pair_swap_neg().to_array(), [-2.0, 1.0, -4.0, 3.0]);
+        assert_eq!(a.odd_pair_swap_neg().to_array(), [4.0, -3.0, 2.0, -1.0]);
+        assert_eq!(a.rotate_left_1().to_array(), [2.0, 3.0, 4.0, 1.0]);
         assert_eq!(a.horizontal_sum(), 10.0);
         let cols = X86Sse2Backend::transpose_4x4(a, a, a, a);
         assert_eq!(cols[0].to_array(), [1.0; 4]);
+        crate::math::backend::simd_vec4::tests::verify_all_simd_and_kernel_ops::<Sse2Vec4>();
     }
 }

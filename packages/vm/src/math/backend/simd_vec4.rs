@@ -78,6 +78,20 @@ pub trait SimdVec4: Copy + Clone + Send + Sync + 'static {
         Self::from_array([-a[1], a[0], -a[3], a[2]])
     }
 
+    /// Reverses lane order across pairs and negates odd lanes (`[v3, -v2, v1, -v0]`).
+    #[inline(always)]
+    fn odd_pair_swap_neg(self) -> Self {
+        let a = self.to_array();
+        Self::from_array([a[3], -a[2], a[1], -a[0]])
+    }
+
+    /// Rotates all 4 lanes cyclically left by 1 (`[v1, v2, v3, v0]`).
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        let a = self.to_array();
+        Self::from_array([a[1], a[2], a[3], a[0]])
+    }
+
     /// Flushes subnormal lanes to signed zero without altering other bit patterns.
     #[inline(always)]
     fn flush_subnormal(self) -> Self {
@@ -385,6 +399,8 @@ pub(crate) mod tests {
         );
         assert_eq!(a.abs().to_array(), [1.5, 2.5, 3.5, 4.5]);
         assert_eq!(a.pair_swap_neg().to_array(), [2.5, 1.5, 4.5, 3.5]);
+        assert_eq!(a.odd_pair_swap_neg().to_array(), [-4.5, -3.5, -2.5, -1.5]);
+        assert_eq!(a.rotate_left_1().to_array(), [-2.5, 3.5, -4.5, 1.5]);
         assert_eq!(a.horizontal_sum_pair(b), (-2.0, 6.5));
         assert_eq!(a.dot(b), -21.25);
 
@@ -511,6 +527,14 @@ pub(crate) mod tests {
         assert_eq!(
             <V as KernelVec4>::pair_swap_neg(a).to_array(),
             [2.5, 1.5, 4.5, 3.5]
+        );
+        assert_eq!(
+            <V as KernelVec4>::odd_pair_swap_neg(a).to_array(),
+            [-4.5, -3.5, -2.5, -1.5]
+        );
+        assert_eq!(
+            <V as KernelVec4>::rotate_left_1(a).to_array(),
+            [-2.5, 3.5, -4.5, 1.5]
         );
         let dirty = <V as KernelVec4>::load(&[f32::from_bits(1), f32::NAN, f32::INFINITY, -2.5]);
         assert_eq!(

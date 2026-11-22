@@ -27,7 +27,8 @@ pub use const_eval::{
     SonaTierSpec, ULTRA_SPEC, const_abs_f32, const_f32_pow2, const_taylor_inv_fact_f32,
 };
 pub use fp16::{
-    f32_to_fp16, f32_to_fp16_u32, fp16_to_f32, fp16_u32_to_f32, pack_fp16x2_u32, unpack_fp16x2_u32,
+    f32_to_fp16, f32_to_fp16_u32, fp16_to_f32, fp16_u32_to_f32, pack_fp16x2_u32,
+    pack_wf_mix_and_rect_sign_fp16, unpack_fp16x2_u32, unpack_wf_mix_and_rect_sign_fp16,
 };
 pub use gpu_vec4::GpuVec4;
 pub use op_constants::{
@@ -261,6 +262,20 @@ pub trait KernelVec4: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
     fn pair_swap_neg(self) -> Self {
         let a = self.to_array();
         Self::from_array([-a[1], a[0], -a[3], a[2]])
+    }
+
+    /// Reverses lane order across outer/inner pairs and negates odd lanes (`[a[3], -a[2], a[1], -a[0]]`).
+    #[inline(always)]
+    fn odd_pair_swap_neg(self) -> Self {
+        let a = self.to_array();
+        Self::from_array([a[3], -a[2], a[1], -a[0]])
+    }
+
+    /// Rotates all 4 lanes cyclically left by 1 (`[a[1], a[2], a[3], a[0]]`).
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        let a = self.to_array();
+        Self::from_array([a[1], a[2], a[3], a[0]])
     }
 
     /// Flushes subnormal lanes to signed zero without changing normal/special bit patterns.
@@ -711,6 +726,14 @@ mod tests {
             prop_assert_eq!(
                 DefaultTraitVec4::from_array(exps).all_le(DefaultTraitVec4::from_array(rhs)),
                 GpuVec4::from_array(exps).all_le(GpuVec4::from_array(rhs))
+            );
+            prop_assert_eq!(
+                DefaultTraitVec4::from_array(exps).rotate_left_1().to_array(),
+                GpuVec4::from_array(exps).rotate_left_1().to_array()
+            );
+            prop_assert_eq!(
+                DefaultTraitVec4::from_array(exps).odd_pair_swap_neg().to_array(),
+                GpuVec4::from_array(exps).odd_pair_swap_neg().to_array()
             );
         }
     }

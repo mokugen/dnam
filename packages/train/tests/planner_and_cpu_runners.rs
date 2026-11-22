@@ -48,6 +48,7 @@ fn sample_quad_params(stem: usize, quad: usize) -> [[f32; 4]; 24] {
             GpuVec4::from_array([0.06, 0.24, 0.42, 0.60]),
         ),
         two_svf_g: g.add(g),
+        svf_k_nl: GpuVec4::zero(),
         rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
         sag_depth: GpuVec4::from_array([0.17, 0.31, 0.42, 0.20]),
         adaa_drive: GpuVec4::from_array([1.15, 1.60, 2.05, 1.32]),

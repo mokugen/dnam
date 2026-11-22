@@ -55,12 +55,7 @@ pub trait StereoVec8: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
     #[inline(always)]
     fn rotate_left_1(self) -> Self {
         let (l, r) = self.into_lr();
-        let la = l.to_array();
-        let ra = r.to_array();
-        Self::from_lr(
-            Self::Half::from_array([la[1], la[2], la[3], la[0]]),
-            Self::Half::from_array([ra[1], ra[2], ra[3], ra[0]]),
-        )
+        Self::from_lr(l.rotate_left_1(), r.rotate_left_1())
     }
 
     /// Broadcasts a single 4-lane vector `h` to both Left and Right halves.
@@ -122,6 +117,13 @@ pub trait StereoVec8: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
     fn flush_recursive_state(self) -> Self {
         let (l, r) = self.into_lr();
         Self::from_lr(l.flush_recursive_state(), r.flush_recursive_state())
+    }
+
+    /// Fast positive reciprocal `1.0 / self` (`self >= 1.0`) using seed + 2 NR steps.
+    #[inline(always)]
+    fn rcp_ge1_nr2(self) -> Self {
+        let (l, r) = self.into_lr();
+        Self::from_lr(l.rcp_ge1_nr2(), r.rcp_ge1_nr2())
     }
 
     /// Clamped positive reciprocal `1.0 / max(self, 1.0e-6)` using seed + 2 NR steps.
@@ -280,6 +282,22 @@ impl<V: KernelVec4> StereoVec8 for InterleavedStereo8<V> {
         Self {
             left: V::flush_recursive_state(self.left),
             right: V::flush_recursive_state(self.right),
+        }
+    }
+
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        Self {
+            left: self.left.rotate_left_1(),
+            right: self.right.rotate_left_1(),
+        }
+    }
+
+    #[inline(always)]
+    fn rcp_ge1_nr2(self) -> Self {
+        Self {
+            left: self.left.rcp_ge1_nr2(),
+            right: self.right.rcp_ge1_nr2(),
         }
     }
 
@@ -530,12 +548,20 @@ mod tests {
             prop_assert_eq!(sum_r, (r[0] + r[1]) + (r[2] + r[3]));
             let pos = v.abs().add(S8::splat(0.5));
             let inv = pos.rcp_pos_nr2();
+            let pos_ge1 = v.abs().add(S8::splat(1.0));
+            let inv_ge1 = pos_ge1.rcp_ge1_nr2();
+            let dv_ge1 = dv.abs().add(DefaultTraitStereo8::splat(1.0)).rcp_ge1_nr2();
+            prop_assert_eq!(inv_ge1.into_lr().0.to_array(), dv_ge1.into_lr().0.to_array());
+            prop_assert_eq!(inv_ge1.into_lr().1.to_array(), dv_ge1.into_lr().1.to_array());
             let (inv_l, inv_r) = inv.into_lr();
+            let (g1_l, g1_r) = inv_ge1.into_lr();
             for i in 0..4 {
                 let d_l = f64::from(l[i].abs() + 0.5);
                 let d_r = f64::from(r[i].abs() + 0.5);
                 prop_assert!((f64::from(inv_l.to_array()[i]) * d_l - 1.0).abs() < 1.0e-5);
                 prop_assert!((f64::from(inv_r.to_array()[i]) * d_r - 1.0).abs() < 1.0e-5);
+                prop_assert!((f64::from(g1_l.to_array()[i]) * f64::from(l[i].abs() + 1.0) - 1.0).abs() < 1.0e-5);
+                prop_assert!((f64::from(g1_r.to_array()[i]) * f64::from(r[i].abs() + 1.0) - 1.0).abs() < 1.0e-5);
             }
         }
     }

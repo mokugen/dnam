@@ -428,6 +428,7 @@ fn test_m10b_upgrades_cross_kernel_continuity_parity_and_invariants() {
         tone: SonaToneWeights4::lp_only(),
         lru: coeffs_d,
         two_svf_g: GpuVec4::splat(0.5),
+        svf_k_nl: GpuVec4::zero(),
         rect_sign: GpuVec4::splat(1.0),
         sag_depth: GpuVec4::splat(0.2),
         adaa_drive: GpuVec4::splat(1.5),
@@ -445,6 +446,14 @@ fn test_m10b_upgrades_cross_kernel_continuity_parity_and_invariants() {
     );
     let core_out = step_core_quad_stereo8(u_ms, &mut core_state, &core_params);
     assert!(core_out.adaa_odd.into_lr().0.to_array()[0].is_finite());
+
+    let mut phs_state = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+    let phs_params = CoreQuadParamsStereo4 {
+        svf_k_nl: GpuVec4::splat(4.0),
+        ..core_params
+    };
+    let phs_out = dnam_kernels::step_core_quad_phs_stereo8(u_ms, &mut phs_state, &phs_params);
+    assert!(phs_out.adaa_odd.into_lr().0.to_array()[0].is_finite());
 
     // 4. Op-T unified sigma_sat limiter + continuous mu_freeze writeback.
     let fb_params = OpTFeedbackParams {

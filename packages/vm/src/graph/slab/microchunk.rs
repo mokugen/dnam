@@ -111,6 +111,38 @@ fn step_transport_top_via_slab<B: GraphBackend>(
 }
 
 #[inline(always)]
+fn step_transport_top_chunk4_via_slab<B: GraphBackend>(
+    slab: &mut SonaHotSlab<'_, B>,
+) -> Result<[[QuadTopRead; TRANSPORT_MAX_QUADS]; 4], VmError> {
+    let cold = &mut slab.cold.as_mut_slice()[0];
+    let active_q = cold.active_transport_quads.min(TRANSPORT_MAX_QUADS);
+    let quad_refs = [
+        &mut slab.lite.transport_quad0,
+        &mut slab.full_delta.transport_quad1,
+        &mut slab.pro_delta.transport_quad2,
+        &mut slab.ultra_delta.transport_quad3,
+    ];
+    let mut reads_4 = [[QuadTopRead::default(); TRANSPORT_MAX_QUADS]; 4];
+    for q in 0..active_q {
+        let ring = resolve_quad_ring(
+            q,
+            quad_refs[q].flags,
+            &mut slab.lite.transport0_ring,
+            &mut cold.transport_ext,
+        )?;
+        let q_reads = quad_refs[q].read_top_of_frame_chunk4::<B>(
+            ring,
+            cold.transport_schroeder.get_mut(q),
+            &cold.transport_quad_eff[q],
+        );
+        for f in 0..4 {
+            reads_4[f][q] = q_reads[f];
+        }
+    }
+    Ok(reads_4)
+}
+
+#[inline(always)]
 fn step_transport_end_via_slab<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
     reads: &[QuadTopRead; TRANSPORT_MAX_QUADS],
@@ -364,12 +396,12 @@ fn finalize_frame_output<B: GraphBackend>(
 }
 
 #[inline(always)]
-fn step_post_sensory<B: GraphBackend>(
+fn step_post_sensory_with_reads<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
+    reads: &[QuadTopRead; TRANSPORT_MAX_QUADS],
     u_sense_l: f32,
     u_sense_r: f32,
 ) -> Result<(f32, f32), VmError> {
-    let reads = step_transport_top_via_slab(slab)?;
     let op_p_1x = step_op_p_1x(slab, u_sense_l, u_sense_r);
     {
         let cold = slab.cold_mut();
@@ -377,7 +409,7 @@ fn step_post_sensory<B: GraphBackend>(
         cold.last_op_p_feat = op_p_1x.feat;
     }
     let op_t_gain = slab.cold().hoisted_core.op_t_gain;
-    let (t_cb_l, t_cb_r) = eval_op_t_crossbar_taps(slab, &reads, op_t_gain);
+    let (t_cb_l, t_cb_r) = eval_op_t_crossbar_taps(slab, reads, op_t_gain);
     let (s0_l, s0_r) = (u_sense_l + t_cb_l, u_sense_r + t_cb_r);
 
     let (d_scale, delta_step) = (
@@ -409,8 +441,18 @@ fn step_post_sensory<B: GraphBackend>(
 
     let (conv_l, conv_r) = step_convolver_frame(slab, pre_l, pre_r);
     let x_tank = (dir_l + conv_l, dir_r + conv_r);
-    let (tank_l, tank_r) = step_transport_end_via_slab(slab, &reads, x_tank)?;
+    let (tank_l, tank_r) = step_transport_end_via_slab(slab, reads, x_tank)?;
     Ok(finalize_frame_output(slab, tank_l, tank_r))
+}
+
+#[inline(always)]
+fn step_post_sensory<B: GraphBackend>(
+    slab: &mut SonaHotSlab<'_, B>,
+    u_sense_l: f32,
+    u_sense_r: f32,
+) -> Result<(f32, f32), VmError> {
+    let reads = step_transport_top_via_slab(slab)?;
+    step_post_sensory_with_reads(slab, &reads, u_sense_l, u_sense_r)
 }
 
 /// Executes one complete `2x2` stereo host VM frame (`Steps 1..10`) with deterministic `0-ULP`
@@ -545,8 +587,9 @@ fn process_microchunk_4<B: GraphBackend>(
         u_sense_lr[f] = [uf_l, uf_r];
     }
 
+    let reads_4 = step_transport_top_chunk4_via_slab(slab)?;
     for (f, &[ul, ur]) in u_sense_lr.iter().enumerate() {
-        let (ol, or) = step_post_sensory(slab, ul, ur)?;
+        let (ol, or) = step_post_sensory_with_reads(slab, &reads_4[f], ul, ur)?;
         out_l[f] = ol;
         out_r[f] = or;
     }

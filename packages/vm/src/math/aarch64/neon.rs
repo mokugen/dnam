@@ -6,8 +6,8 @@ pub mod backend;
 use core::arch::aarch64::{
     float32x4_t, uint32x4_t, vabsq_f32, vaddq_f32, vaddq_u32, vandq_u32, vbicq_u32, vbslq_u32,
     vcgeq_u32, vcleq_f32, vcltq_u32, vdupq_laneq_f64, vdupq_n_f32, vdupq_n_u32, veorq_u32,
-    vfmaq_f32, vfmaq_laneq_f32, vfmsq_f32, vld1q_f32, vmaxq_f32, vminq_f32, vminvq_u32, vmulq_f32,
-    vmulq_laneq_f32, vnegq_f32, vreinterpretq_f32_f64, vreinterpretq_f32_u32,
+    vextq_f32, vfmaq_f32, vfmaq_laneq_f32, vfmsq_f32, vld1q_f32, vmaxq_f32, vminq_f32, vminvq_u32,
+    vmulq_f32, vmulq_laneq_f32, vnegq_f32, vreinterpretq_f32_f64, vreinterpretq_f32_u32,
     vreinterpretq_f64_f32, vreinterpretq_u32_f32, vrev64q_f32, vshlq_n_u32, vshrq_n_u32, vst1q_f32,
     vsubq_f32, vsubq_u32,
 };
@@ -44,9 +44,18 @@ impl fmt::Debug for NeonVec4 {
 
 #[inline(always)]
 fn sign_pair_flip_mask() -> uint32x4_t {
-    // SAFETY: `vreinterpretq_u32_f32` and `vld1q_f32` load 4 aligned stack `u32` words as bits.
+    // SAFETY: `vld1q_u32` loads 4 aligned stack `u32` sign-flip mask words.
     unsafe {
         let raw = [IEEE754_F32_SIGN_MASK, 0, IEEE754_F32_SIGN_MASK, 0];
+        core::arch::aarch64::vld1q_u32(raw.as_ptr())
+    }
+}
+
+#[inline(always)]
+fn odd_sign_pair_flip_mask() -> uint32x4_t {
+    // SAFETY: `vld1q_u32` loads 4 aligned stack `u32` sign-flip mask words for lanes `[1, 3]`.
+    unsafe {
+        let raw = [0, IEEE754_F32_SIGN_MASK, 0, IEEE754_F32_SIGN_MASK];
         core::arch::aarch64::vld1q_u32(raw.as_ptr())
     }
 }
@@ -167,6 +176,22 @@ impl SimdVec4 for NeonVec4 {
             let swapped = vreinterpretq_u32_f32(vrev64q_f32(self.0));
             vreinterpretq_f32_u32(veorq_u32(swapped, sign_pair_flip_mask()))
         })
+    }
+
+    #[inline(always)]
+    fn odd_pair_swap_neg(self) -> Self {
+        // SAFETY: `vrev64q_f32` + `vextq_f32::<2>` reverses `[0,1,2,3] -> [3,2,1,0]` and XOR flips `[1,3]`.
+        Self(unsafe {
+            let pair_swapped = vrev64q_f32(self.0);
+            let reversed = vreinterpretq_u32_f32(vextq_f32::<2>(pair_swapped, pair_swapped));
+            vreinterpretq_f32_u32(veorq_u32(reversed, odd_sign_pair_flip_mask()))
+        })
+    }
+
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        // SAFETY: `vextq_f32::<1>(x, x)` extracts `[x1, x2, x3, x0]` in a single NEON register op.
+        Self(unsafe { vextq_f32::<1>(self.0, self.0) })
     }
 
     #[inline(always)]
@@ -354,6 +379,16 @@ impl dnam_kernels::KernelVec4 for NeonVec4 {
     #[inline(always)]
     fn pair_swap_neg(self) -> Self {
         <Self as SimdVec4>::pair_swap_neg(self)
+    }
+
+    #[inline(always)]
+    fn odd_pair_swap_neg(self) -> Self {
+        <Self as SimdVec4>::odd_pair_swap_neg(self)
+    }
+
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        <Self as SimdVec4>::rotate_left_1(self)
     }
 
     #[inline(always)]

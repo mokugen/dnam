@@ -17,6 +17,7 @@ const FP16_RNE_STICKY_MASK: u32 = (1_u32 << FP16_RNE_ROUND_BIT_SHIFT) - 1;
 
 const _: () = assert!(FP16_RNE_ROUND_BIT_SHIFT == 12);
 const _: () = assert!(FP16_RNE_STICKY_MASK == 0x0FFF);
+const _: () = assert!(IEEE754_FP16_SIGN_MASK == 0x8000 && IEEE754_FP16_ABS_MASK == 0x7FFF);
 
 /// Converts an `f32` to IEEE-754 `fp16` packed in the lower 16 bits of a `u32` (zero upper bits).
 ///
@@ -135,6 +136,57 @@ pub const fn fp16_to_f32(bits: u16) -> f32 {
     fp16_u32_to_f32(bits as u32)
 }
 
+/// Packs unsigned `wavefolder_mix` (`[0.0, 1.0]`, non-finite fallback `0.0`) into bits `0..=14`
+/// and discrete `rect_sign` (`-1.0` when bit 15 `0x8000` is set, else `+1.0`) into bit 15.
+#[inline(always)]
+#[must_use]
+pub const fn pack_wf_mix_and_rect_sign_fp16(wf_mix: f32, rect_sign: f32) -> u16 {
+    let clamped = if wf_mix.is_finite() {
+        if wf_mix >= 1.0 {
+            1.0
+        } else if wf_mix <= 0.0 {
+            0.0
+        } else {
+            wf_mix
+        }
+    } else {
+        0.0
+    };
+    let mag_bits = f32_to_fp16(clamped) & (IEEE754_FP16_ABS_MASK as u16);
+    if rect_sign < 0.0 {
+        mag_bits | (IEEE754_FP16_SIGN_MASK as u16)
+    } else {
+        mag_bits
+    }
+}
+
+/// Unpacks `(wavefolder_mix, rect_sign)` from `wavefolder_mix_fp16`.
+///
+/// Extracts bit 15 (`0x8000`) before validating magnitude bits `0..=14` so `-0.0` (`0x8000`),
+/// `-Inf`, and `-NaN` preserve `rect_sign = -1.0` while non-finite magnitudes fall back to `0.0`.
+#[inline(always)]
+#[must_use]
+pub const fn unpack_wf_mix_and_rect_sign_fp16(raw: u16) -> (f32, f32) {
+    let rect_sign = if (raw & (IEEE754_FP16_SIGN_MASK as u16)) != 0 {
+        -1.0
+    } else {
+        1.0
+    };
+    let mag = fp16_to_f32(raw & (IEEE754_FP16_ABS_MASK as u16));
+    let wf_mix = if mag.is_finite() {
+        if mag >= 1.0 {
+            1.0
+        } else if mag <= 0.0 {
+            0.0
+        } else {
+            mag
+        }
+    } else {
+        0.0
+    };
+    (wf_mix, rect_sign)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +271,21 @@ mod tests {
         let packed = pack_fp16x2_u32(-1.5, 65520.0);
         let unpacked = unpack_fp16x2_u32(packed);
         assert_eq!(unpacked, [-1.5, 65504.0]);
+
+        // Bit-15 packed wavefolder_mix + rect_sign roundtrips including -0.0 / -Inf / -NaN
+        assert_eq!(pack_wf_mix_and_rect_sign_fp16(0.0, 1.0), 0x0000);
+        assert_eq!(pack_wf_mix_and_rect_sign_fp16(0.0, -1.0), 0x8000);
+        assert_eq!(unpack_wf_mix_and_rect_sign_fp16(0x0000), (0.0, 1.0));
+        assert_eq!(unpack_wf_mix_and_rect_sign_fp16(0x8000), (0.0, -1.0));
+        assert_eq!(unpack_wf_mix_and_rect_sign_fp16(0xFC00), (0.0, -1.0));
+        assert_eq!(unpack_wf_mix_and_rect_sign_fp16(0xFE01), (0.0, -1.0));
+        assert_eq!(unpack_wf_mix_and_rect_sign_fp16(0x7E01), (0.0, 1.0));
+        assert_eq!(unpack_wf_mix_and_rect_sign_fp16(0xBC00), (1.0, -1.0));
+        assert_eq!(
+            pack_wf_mix_and_rect_sign_fp16(0.5, 1.0) ^ 0x8000,
+            pack_wf_mix_and_rect_sign_fp16(0.5, -1.0)
+        );
+        assert_eq!(pack_wf_mix_and_rect_sign_fp16(f32::NAN, -1.0), 0x8000);
     }
 
     proptest! {

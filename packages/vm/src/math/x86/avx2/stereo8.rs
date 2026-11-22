@@ -128,6 +128,22 @@ impl StereoVec8 for Avx2Stereo8 {
     }
 
     #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        Self {
+            left: KernelVec4::rotate_left_1(self.left),
+            right: KernelVec4::rotate_left_1(self.right),
+        }
+    }
+
+    #[inline(always)]
+    fn rcp_ge1_nr2(self) -> Self {
+        Self {
+            left: KernelVec4::rcp_ge1_nr2(self.left),
+            right: KernelVec4::rcp_ge1_nr2(self.right),
+        }
+    }
+
+    #[inline(always)]
     fn rcp_pos_nr2(self) -> Self {
         Self {
             left: KernelVec4::rcp_pos_nr2(self.left),
@@ -188,6 +204,11 @@ mod tests {
         let pos = Avx2Stereo8::splat_lr(4.0, 9.0);
         pos.rcp_pos_nr2().store_lr(&mut out_l, &mut out_r);
         assert!((out_l[0] - 0.25).abs() < 1.0e-5 && (out_r[0] - (1.0 / 9.0)).abs() < 1.0e-5);
+        pos.rcp_ge1_nr2().store_lr(&mut out_l, &mut out_r);
+        assert!((out_l[0] - 0.25).abs() < 1.0e-5 && (out_r[0] - (1.0 / 9.0)).abs() < 1.0e-5);
+        s.rotate_left_1().store_lr(&mut out_l, &mut out_r);
+        assert_eq!(out_l, [2.0, 3.0, 4.0, 1.0]);
+        assert_eq!(out_r, [-2.0, -3.0, -4.0, -1.0]);
         pos.rsqrt_pos_nr3().store_lr(&mut out_l, &mut out_r);
         assert!((out_l[0] - 0.5).abs() < 1.0e-6 && (out_r[0] - (1.0 / 3.0)).abs() < 1.0e-6);
     }

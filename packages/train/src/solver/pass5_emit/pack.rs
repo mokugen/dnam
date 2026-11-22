@@ -5,7 +5,7 @@ use core::mem::{align_of, size_of};
 
 use dnam_kernels::{
     MAX_PARALRU_DUHEM_GAMMA_F32, MAX_PARALRU_R_F32, MIN_TPT_G, TANK_MAX_G_LIN_F32, f32_to_fp16,
-    fp16_to_f32,
+    fp16_to_f32, pack_wf_mix_and_rect_sign_fp16,
 };
 use dnam_vm::DnamBinBuildInput;
 use dnam_vm::bin::{
@@ -16,7 +16,7 @@ use dnam_vm::bin::{
     SONA_CELL_MAGIC, SONA_META_CONVOLVER_PREFIX_OVERRIDES, SONA_META_OS_EXT_PRESENT,
     SONA_META_OS2X, SONA_META_SENSORY_QUAD, SONA_META_TIER_OS_EXPLICIT, SONA_META_TRANSPORT_LFO,
     SONA_META_TRANSPORT_TAP_GAINS, SonaCrossbarBlockWire, SonaInterBlockTilePairWire,
-    TRANSPORT_FLAG_EXT_F32, TRANSPORT_FLAG_SCHROEDER_ENABLE, TransportQuadWire, encode_dnam_bin,
+    TRANSPORT_FLAG_EXT_F32, TransportQuadWire, encode_dnam_bin,
 };
 use dnam_vm::math::TANK_DC_BLOCKER_48K_F32;
 use sha2::{Digest, Sha256};
@@ -111,13 +111,13 @@ fn pack_core_quad_wire(q: &CoreQuadF64) -> CoreQuadWire {
         w.tone_ap_fp16[l] = fp16_clamped(q.tone_ap[l], -16.0, 16.0, 0.0);
         w.tone_dir_fp16[l] = fp16_clamped(q.tone_dir[l], -16.0, 16.0, 0.0);
         w.sag_depth_fp16[l] = fp16_clamped(q.sag_depth[l], -8.0, 8.0, 0.0);
-        w.wavefolder_mix_fp16[l] = fp16_clamped(q.wavefolder_mix[l], 0.0, 1.0, 0.0);
+        let wf = sanitize_clamp_f32(q.wavefolder_mix[l], 0.0, 1.0, 0.0);
         let rs = if q.rect_sign[l].is_finite() && q.rect_sign[l] < 0.0 {
             -1.0
         } else {
             1.0
         };
-        w.rect_sign_fp16[l] = U16::new(f32_to_fp16(rs));
+        w.wavefolder_mix_fp16[l] = U16::new(pack_wf_mix_and_rect_sign_fp16(wf, rs));
         w.in_mid_weight_fp16[l] = fp16_clamped(q.in_mid_weight[l], -16.0, 16.0, 1.0);
         w.in_side_weight_fp16[l] = fp16_clamped(q.in_side_weight[l], -16.0, 16.0, 1.0);
         w.lru_stereo_link_fp16[l] = fp16_clamped(q.lru_stereo_link[l], 0.0, 1.0, 0.0);
@@ -200,7 +200,11 @@ fn pack_transport_quad_wire(t: &TransportQuadF64) -> TransportQuadWire {
         w.wet_tap_r_fp16[i] = fp16_clamped(t.wet_tap_r[i], -2.0, 2.0, 0.0);
         w.allpass_g_fp16[i] = fp16_clamped(t.allpass_g[i], -0.75, 0.75, 0.0);
     }
-    w.allpass_delays = t.allpass_delays;
+    w.allpass_delays = if t.schroeder_enable {
+        t.allpass_delays
+    } else {
+        [0; 4]
+    };
     w.g_loop = F32::new(sanitize_clamp_f32(t.g_loop, 0.0, TANK_MAX_G_LIN_F32, 0.0));
     w.r_dc = F32::new(TANK_DC_BLOCKER_48K_F32);
     w.damp_pole = F32::new(sanitize_clamp_f32(t.damp_pole, 0.0, 0.9995, 0.0));
@@ -210,14 +214,11 @@ fn pack_transport_quad_wire(t: &TransportQuadF64) -> TransportQuadWire {
     w.sigma_knee_fp16 = fp16_clamped(t.sigma_knee, 1.0e-3, 0.984_375, 0.984_375);
     w.freeze_mix_fp16 = fp16_clamped(t.freeze_mix, 0.0, 1.0, 0.0);
     w.window_depth_fp16 = fp16_clamped(t.window_depth, 0.0, 1.0, 0.0);
-    let mut flags = 0_u8;
-    if t.schroeder_enable {
-        flags |= TRANSPORT_FLAG_SCHROEDER_ENABLE;
-    }
-    if need_ext_f32 {
-        flags |= TRANSPORT_FLAG_EXT_F32;
-    }
-    w.flags = flags;
+    w.flags = if need_ext_f32 {
+        TRANSPORT_FLAG_EXT_F32
+    } else {
+        0
+    };
     w
 }
 

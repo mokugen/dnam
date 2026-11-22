@@ -48,7 +48,8 @@ fn build_zero_crossbar_lite_full_fixture() -> Vec<u8> {
     quad.in_mid_weight_fp16 = fp16_arr([0.45, 0.35, 0.25, 0.15]);
     quad.tone_lp_fp16 = fp16_arr([0.5; 4]);
     quad.tone_dir_fp16 = fp16_arr([1.0; 4]);
-    quad.rect_sign_fp16 = fp16_arr([1.0; 4]);
+    quad.wavefolder_mix_fp16 = fp16_arr([0.04; 4]);
+    quad.svf_k_nl_fp16 = [U16::new(0); 4];
     a0.core_quads = [quad; 4];
 
     a0.conv_fir_lite.fir_l[0] = F32::new(0.8);
@@ -517,7 +518,9 @@ fn build_wdw_core_conv_transport_multi_tier_bin(stereo_out: bool) -> Vec<u8> {
     a0.crossbar.cell_desc.tier_flags = U16::new(0x0007);
     a0.crossbar.cell_desc.oversample_factor = U16::new(2);
     let q_core = make_core_quad(0);
-    a0.core_quads = [q_core; 4];
+    let mut q_linear = q_core;
+    q_linear.svf_k_nl_fp16 = [U16::new(0); 4];
+    a0.core_quads = [q_core, q_linear, q_linear, q_linear];
     a0.conv_fir_lite.fir_l[0] = F32::new(0.70);
     a0.conv_fir_lite.fir_r[0] = F32::new(0.65);
     a0.conv_fir_lite.fir_l[1] = F32::new(0.15);

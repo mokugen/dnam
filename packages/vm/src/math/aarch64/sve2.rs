@@ -100,6 +100,16 @@ impl SimdVec4 for Sve2Vec4 {
     }
 
     #[inline(always)]
+    fn odd_pair_swap_neg(self) -> Self {
+        Self(self.0.odd_pair_swap_neg())
+    }
+
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        Self(self.0.rotate_left_1())
+    }
+
+    #[inline(always)]
     fn flush_subnormal(self) -> Self {
         Self(self.0.flush_subnormal())
     }

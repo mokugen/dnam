@@ -8,8 +8,8 @@ use super::paralru::{
     SonaParaLruDuhemCoeffs4, apply_stereo_link_stereo8, step_paralru_duhem_stereo8,
 };
 use super::poly_adaa::{self, eval_c2_wavefolder_adaa_stereo8, eval_poly_adaa1_stereo8};
-use super::tpt_svf::{TptSvfCoeffs4, step_tpt_svf_stereo8};
-use super::{SonaBlockOutputStereo8, SonaBlockStateStereo8, SonaToneWeights4};
+use super::tpt_svf::{TptSvfCoeffs4, step_tpt_svf_phs_stereo8, step_tpt_svf_stereo8};
+use super::{SonaBlockOutputStereo8, SonaBlockStateStereo8, SonaToneWeights4, TptSvfOutputs};
 
 /// Minimum positive power-supply sag gain floor protecting the `PolyADAA1` linear drive path.
 pub const MIN_SAG_GAIN: f32 = 0.05;
@@ -26,6 +26,8 @@ pub struct CoreQuadParamsStereo4<V: KernelVec4> {
     pub lru: SonaParaLruDuhemCoeffs4<V>,
     /// Precomputed `2 * svf_g` (`[2e-5, 128.0]`) scaling `TPT-SVF` bandpass into Selective-Duhem flux.
     pub two_svf_g: V,
+    /// Nonlinear diode-bandpass PHS damping `[0.0, 16.0]` on Block 0 (`0.0` on Blocks 1..3).
+    pub svf_k_nl: V,
     /// Per-lane sign polarity (`+1.0` or `-1.0`); `rect_in = rect_sign * tone_in`.
     pub rect_sign: V,
     /// Power-supply sag depth modulated by `v_eff`.
@@ -64,17 +66,13 @@ pub fn couple_ms_input_stereo8<S: StereoVec8>(
     S::from_lr(out_l, out_r)
 }
 
-/// Executes one complete SONA v3.0 stereo `4`-lane `CoreQuad` step (`TPT-SVF -> tone -> rect_sign
-/// Selective-Duhem ParaLRU -> stereo link -> power-supply sag -> bias-injected PolyADAA1 + optional
-/// C^2 wavefolder -> bounded cross-lane GLU`) in `StereoVec8` registers (`0 FDIV`, `0 FSQRT`,
-/// `0-ULP` Mechanism A2 sign-flip conjugation invariance).
 #[inline(always)]
-pub fn step_core_quad_stereo8<S: StereoVec8>(
+fn step_core_quad_post_svf_stereo8<S: StereoVec8>(
     u: S,
+    svf_out: TptSvfOutputs<S>,
     state: &mut SonaBlockStateStereo8<S>,
     params: &CoreQuadParamsStereo4<S::Half>,
 ) -> SonaBlockOutputStereo8<S> {
-    let svf_out = step_tpt_svf_stereo8(u, &mut state.svf_s1, &mut state.svf_s2, &params.svf);
     let tone_in = svf_out
         .lp
         .mul(S::broadcast_half(params.tone.lp))
@@ -124,6 +122,41 @@ pub fn step_core_quad_stereo8<S: StereoVec8>(
     }
 }
 
+/// Executes one Blocks 1..3 passive linear `CoreQuad` step (`TPT-SVF -> tone -> rect_sign
+/// Selective-Duhem ParaLRU -> stereo link -> power-supply sag -> bias-injected PolyADAA1 + optional
+/// C^2 wavefolder -> bounded cross-lane GLU`) in `StereoVec8` registers (`0 FDIV`, `0 FSQRT`,
+/// `0-ULP` Mechanism A2 sign-flip conjugation invariance).
+#[inline(always)]
+pub fn step_core_quad_stereo8<S: StereoVec8>(
+    u: S,
+    state: &mut SonaBlockStateStereo8<S>,
+    params: &CoreQuadParamsStereo4<S::Half>,
+) -> SonaBlockOutputStereo8<S> {
+    let svf_out = step_tpt_svf_stereo8(u, &mut state.svf_s1, &mut state.svf_s2, &params.svf);
+    step_core_quad_post_svf_stereo8(u, svf_out, state, params)
+}
+
+/// Executes one Block 0 linearly-implicit Port-Hamiltonian (`PHS`) `CoreQuad` step (`k_eff = k +
+/// k_nl * min(s1^2, 64.0)`) in `StereoVec8` registers with `0-ULP` parity against
+/// [`step_core_quad_stereo8`] when `params.svf_k_nl == 0.0` (`ref[dsp.op-n.core.tpt-tone-basis]`).
+#[inline(always)]
+pub fn step_core_quad_phs_stereo8<S: StereoVec8>(
+    u: S,
+    state: &mut SonaBlockStateStereo8<S>,
+    params: &CoreQuadParamsStereo4<S::Half>,
+) -> SonaBlockOutputStereo8<S> {
+    let svf_g = params.two_svf_g.mul(S::Half::splat(0.5));
+    let svf_out = step_tpt_svf_phs_stereo8(
+        u,
+        &mut state.svf_s1,
+        &mut state.svf_s2,
+        svf_g,
+        params.svf.k,
+        params.svf_k_nl,
+    );
+    step_core_quad_post_svf_stereo8(u, svf_out, state, params)
+}
+
 #[cfg(test)]
 mod tests {
     use proptest::prelude::*;
@@ -167,6 +200,7 @@ mod tests {
                 GpuVec4::splat(1.0),
             ),
             two_svf_g: g.add(g),
+            svf_k_nl: GpuVec4::zero(),
             rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
             sag_depth: GpuVec4::from_array([0.0, 0.35, 0.65, 0.85]),
             adaa_drive: GpuVec4::from_array([0.8, 1.5, 2.5, 4.0]),
@@ -251,6 +285,7 @@ mod tests {
                 GpuVec4::zero(),
             ),
             two_svf_g: g.add(g),
+            svf_k_nl: GpuVec4::zero(),
             rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
             sag_depth: GpuVec4::from_array([0.0, 0.3, 0.6, 0.9]),
             adaa_drive: GpuVec4::from_array([0.7, 1.4, 2.2, 3.5]),
@@ -556,6 +591,7 @@ mod tests {
                     GpuVec4::splat(stereo_link),
                 ),
                 two_svf_g: GpuVec4::splat(2.0 * g_s),
+                svf_k_nl: GpuVec4::zero(),
                 rect_sign: GpuVec4::from_array(rect_arr),
                 sag_depth: GpuVec4::splat(sag_depth),
                 adaa_drive: GpuVec4::splat(adaa_drive),
@@ -608,6 +644,43 @@ mod tests {
                         prop_assert_eq!(got_odd_r[lane].to_bits(), exp_odd_r[lane].to_bits());
                     }
                 }
+            }
+
+            // PHS Block 0: k_nl == 0.0 matches linear 0-ULP; k_nl > 0.0 preserves Mechanism A2 0-ULP conjugation!
+            let params_phs = CoreQuadParamsStereo4 {
+                svf_k_nl: GpuVec4::splat(6.0),
+                ..params
+            };
+            let params_phs_conj = CoreQuadParamsStereo4 {
+                svf_k_nl: GpuVec4::splat(6.0),
+                ..params_conj
+            };
+            let mut st_p_orig = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+            let mut st_p_conj = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+            let mut st_p0 = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+            let mut st_lin0 = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+            for (&ul, &ur) in stim_l.iter().zip(stim_r.iter()) {
+                let u_o = couple_ms_input_stereo8(InterleavedStereo8::zero(), ul, ur, mid_w, side_w);
+                let u_c = couple_ms_input_stereo8(
+                    InterleavedStereo8::zero(),
+                    ul,
+                    ur,
+                    mid_w.mul(conj_v),
+                    side_w.mul(conj_v),
+                );
+                let o0_p = step_core_quad_phs_stereo8(u_o, &mut st_p0, &params);
+                let o0_l = step_core_quad_stereo8(u_o, &mut st_lin0, &params);
+                prop_assert_eq!(
+                    o0_p.adaa_even.into_lr().0.to_array().map(f32::to_bits),
+                    o0_l.adaa_even.into_lr().0.to_array().map(f32::to_bits)
+                );
+
+                let op_o = step_core_quad_phs_stereo8(u_o, &mut st_p_orig, &params_phs);
+                let op_c = step_core_quad_phs_stereo8(u_c, &mut st_p_conj, &params_phs_conj);
+                prop_assert_eq!(
+                    op_c.adaa_even.into_lr().0.to_array().map(f32::to_bits),
+                    op_o.adaa_even.into_lr().0.to_array().map(f32::to_bits)
+                );
             }
         }
     }

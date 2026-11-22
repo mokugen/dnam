@@ -257,6 +257,16 @@ impl dnam_kernels::KernelVec4 for ScalarVec4 {
     }
 
     #[inline(always)]
+    fn odd_pair_swap_neg(self) -> Self {
+        <Self as SimdVec4>::odd_pair_swap_neg(self)
+    }
+
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        <Self as SimdVec4>::rotate_left_1(self)
+    }
+
+    #[inline(always)]
     fn flush_subnormal(self) -> Self {
         <Self as SimdVec4>::flush_subnormal(self)
     }

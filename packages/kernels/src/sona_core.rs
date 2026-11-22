@@ -12,7 +12,8 @@ pub mod poly_adaa;
 pub mod tpt_svf;
 
 pub use core_quad::{
-    CoreQuadParamsStereo4, MIN_SAG_GAIN, couple_ms_input_stereo8, step_core_quad_stereo8,
+    CoreQuadParamsStereo4, MIN_SAG_GAIN, couple_ms_input_stereo8, step_core_quad_phs_stereo8,
+    step_core_quad_stereo8,
 };
 pub use op_n_pre::{
     OP_N_PRE_BETA_BYPASS_EPS, OP_N_PRE_FULL_PASS_THRESH, OP_N_PRE_INV_TAU_F32, OP_N_PRE_MAX_BETA_Q,
@@ -42,8 +43,9 @@ pub use poly_adaa::{
     eval_poly_adaa1_stereo8,
 };
 pub use tpt_svf::{
-    MIN_TPT_G, TptAdjointElem, TptScanElem, TptSvfCoeffs4, TptSvfOutputs, apply_tpt_adjoint,
-    apply_tpt_init, compose_tpt_adjoint_scan, compose_tpt_scan, prewarp_tan_pi_f_over_fs_f32,
+    MAX_SVF_K_NL, MIN_TPT_G, SVF_PHS_E_MAX, TptAdjointElem, TptScanElem, TptSvfCoeffs4,
+    TptSvfOutputs, apply_tpt_adjoint, apply_tpt_init, compose_tpt_adjoint_scan, compose_tpt_scan,
+    prewarp_tan_pi_f_over_fs_f32, step_tpt_svf_phs_stereo8, step_tpt_svf_phs_vec4,
     step_tpt_svf_stereo8, step_tpt_svf_vec4,
 };
 
@@ -402,6 +404,7 @@ mod tests {
                 GpuVec4::from_array([0.0, 0.3, 0.6, 1.0]),
             ),
             two_svf_g: g.add(g),
+            svf_k_nl: GpuVec4::zero(),
             rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
             sag_depth: GpuVec4::from_array([0.0, 0.35, 0.65, 0.85]),
             adaa_drive: GpuVec4::from_array([0.8, 1.5, 2.5, 4.0]),
@@ -519,6 +522,7 @@ mod tests {
                     GpuVec4::splat(1.0),
                 ),
                 two_svf_g: GpuVec4::splat(2.0 * g_s),
+                svf_k_nl: GpuVec4::zero(),
                 rect_sign: GpuVec4::from_array(rect_sign_arr),
                 sag_depth: GpuVec4::splat(sag_depth),
                 adaa_drive: GpuVec4::splat(adaa_drive),

@@ -4,12 +4,11 @@
 use core::f32::consts::PI;
 
 use dnam_kernels::{
-    QUAD_FLAG_HAS_EXT, QUAD_FLAG_HOST_WRITE_LOCK, QUAD_FLAG_SCHROEDER_ENABLE, TANK_MAX_G_LIN_F32,
-    TANK_MAX_SIGMA_SAT_F32, algebraic_unit_rotor_f32, compute_half_alpha_cubic_f32,
-    compute_op_t_pitch_down_g_loop_eff,
+    QUAD_FLAG_HAS_EXT, QUAD_FLAG_HOST_WRITE_LOCK, TANK_MAX_G_LIN_F32, TANK_MAX_SIGMA_SAT_F32,
+    algebraic_unit_rotor_f32, compute_half_alpha_cubic_f32, compute_op_t_pitch_down_g_loop_eff,
 };
 
-use crate::bin::arena_wire::{TRANSPORT_FLAG_SCHROEDER_ENABLE, TransportQuadWire};
+use crate::bin::arena_wire::TransportQuadWire;
 use crate::control::bus::laws::{quantize_transport_lfo_inc_q32, quantize_transport_ramp_inc_q32};
 use crate::math::{
     DC_BLOCKER_5HZ_48K_F32, clamp_finite_f32, const_abs_f64, f32_to_fp16, floor_f32, fp16_to_f32,
@@ -177,6 +176,7 @@ impl TransportQuadHotCompact {
         let freeze_q = fp16_to_f32(self.freeze_mix_fp16);
 
         let base_psi = clamp_finite_f32(fp16_to_f32(wire.fb_psi_fp16.get()), -PI, PI, 0.0);
+        let base_scat_psi = clamp_finite_f32(fp16_to_f32(wire.scat_psi_fp16.get()), -PI, PI, 0.0);
         self.base_psi_fp16 = f32_to_fp16(base_psi);
         self.current_psi = base_psi;
         (self.cos_psi, self.sin_psi) = algebraic_unit_rotor_f32(base_psi);
@@ -198,12 +198,7 @@ impl TransportQuadHotCompact {
         self.half_alpha_cubic_fp16 =
             f32_to_fp16(compute_half_alpha_cubic_f32(g_eff_cold, freeze_q));
 
-        self.flags = (if has_ext { QUAD_FLAG_HAS_EXT } else { 0 })
-            | (if (wire.flags & TRANSPORT_FLAG_SCHROEDER_ENABLE) != 0 {
-                QUAD_FLAG_SCHROEDER_ENABLE
-            } else {
-                0
-            });
+        self.flags = if has_ext { QUAD_FLAG_HAS_EXT } else { 0 };
         (self._pad8, self._pad16) = (0, 0);
         let (_, base_allpass_g, _, _) = compute_schroeder_requirements(wire, cfg.rho_vm);
 
@@ -216,6 +211,7 @@ impl TransportQuadHotCompact {
             base_ramp_rate_hz,
             base_freeze_mix: freeze_q,
             base_psi,
+            base_scat_psi,
             base_window_depth,
             inv_fs_vm,
             scale_inv_rho_vm: scale as f32,

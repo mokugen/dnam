@@ -19,7 +19,7 @@ pub use arena_wire::{
     SONA_META_OS_EXT_PRESENT, SONA_META_OS2X, SONA_META_RESERVED_MASK, SONA_META_SENSORY_QUAD,
     SONA_META_TIER_OS_EXPLICIT, SONA_META_TRANSPORT_LFO, SONA_META_TRANSPORT_TAP_GAINS,
     SonaCellDescWire, SonaCrossbarBlockWire, SonaInterBlockTilePairWire, TRANSPORT_DELAY_BASES,
-    TRANSPORT_FLAG_EXT_F32, TRANSPORT_FLAG_SCHROEDER_ENABLE, TransportQuadWire,
+    TRANSPORT_FLAG_EXT_F32, TransportQuadWire,
 };
 pub use builder::{DnamBinBuildInput, computed_dnam_bin_byte_len, encode_dnam_bin_into};
 #[cfg(feature = "alloc")]

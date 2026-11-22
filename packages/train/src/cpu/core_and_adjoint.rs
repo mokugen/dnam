@@ -461,6 +461,7 @@ mod tests {
                 GpuVec4::from_array([0.10, 0.25, 0.40, 0.55]),
             ),
             two_svf_g: g.add(g),
+            svf_k_nl: GpuVec4::zero(),
             rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
             sag_depth: GpuVec4::from_array([0.18, 0.28, 0.36, 0.22]),
             adaa_drive: GpuVec4::from_array([1.2, 1.5, 1.9, 1.3]),

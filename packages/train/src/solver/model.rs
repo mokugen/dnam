@@ -144,6 +144,7 @@ impl CoreQuadF64 {
                 ),
             },
             two_svf_g: g.mul(GpuVec4::splat(2.0)),
+            svf_k_nl: GpuVec4::zero(),
             rect_sign: GpuVec4::from_array(
                 self.rect_sign.map(|v| if v < 0.0 { -1.0 } else { 1.0 }),
             ),

@@ -14,6 +14,8 @@
 //! Run with:
 //!   `cargo run -p dnam-engine --example custom_operator_chain`
 
+#![forbid(unsafe_code)]
+
 use dnam_engine::engine::patchbay::IoRoutingMode;
 use dnam_engine::{FtzDazGuard, HostShellPatchbay};
 use dnam_kernels::{
@@ -54,6 +56,7 @@ fn main() {
             GpuVec4::splat(0.25),
         ),
         two_svf_g: svf_g.add(svf_g),
+        svf_k_nl: GpuVec4::zero(),
         rect_sign: GpuVec4::splat(1.0),
         sag_depth: GpuVec4::splat(0.1),
         adaa_drive: GpuVec4::splat(1.25),

@@ -13,15 +13,12 @@ use crate::simd::{
 };
 
 /// Transport tank (`Op-T`) quad flag bit `1`: quad uses cold external delay storage rather than inline ring
-/// (`bit 0` is reserved `0`; `bits 4..7` are reserved `0`).
+/// (`bit 0` is reserved `0`; `bits 3..7` are reserved `0`).
 pub const QUAD_FLAG_HAS_EXT: u8 = 0x02;
 
 /// Transport tank (`Op-T`) quad flag bit `2`: host-owned lock bit freezing feedback & writes cleanly
-/// (`bit 0` is reserved `0`).
+/// (`bit 0` is reserved `0`; `bits 3..7` are reserved `0`).
 pub const QUAD_FLAG_HOST_WRITE_LOCK: u8 = 0x04;
-
-/// Transport tank (`Op-T`) quad flag bit `3`: partitioned in-buffer Schroeder all-pass stage enabled.
-pub const QUAD_FLAG_SCHROEDER_ENABLE: u8 = 0x08;
 
 /// Maximum finite `fp16` magnitude `65,504.0` used to saturate tank loop writebacks.
 pub use crate::simd::FP16_FINITE_MAX_F32;
@@ -73,8 +70,7 @@ const _: () = assert!(
     (DEFAULT_INV_SIGMA_23_F32 * 1.5 * TANK_MAX_SIGMA_SAT_F32 - 1.0) < 1.0e-6
         && (DEFAULT_INV_SIGMA_23_F32 * 1.5 * TANK_MAX_SIGMA_SAT_F32 - 1.0) > -1.0e-6
 );
-const _: () =
-    assert!((QUAD_FLAG_HAS_EXT | QUAD_FLAG_HOST_WRITE_LOCK | QUAD_FLAG_SCHROEDER_ENABLE) == 0x0E);
+const _: () = assert!((QUAD_FLAG_HAS_EXT | QUAD_FLAG_HOST_WRITE_LOCK) == 0x06);
 
 #[inline(always)]
 fn clamp_finite_range(x: f32, lo: f32, hi: f32, fallback: f32) -> f32 {
@@ -283,19 +279,17 @@ pub fn step_op_t_feedback_vec4<V: KernelVec4>(
         V::splat(inv_sigma_23),
     );
 
-    let va = v_loop.to_array();
-    let rot_swap = V::from_array([-va[1], va[0], -va[3], va[2]]);
+    let rot_swap = v_loop.pair_swap_neg();
     let c = clamp_finite_range(params.cos_psi, -1.0, 1.0, 1.0);
     let s = clamp_finite_range(params.sin_psi, -1.0, 1.0, 0.0);
     let r_givens = v_loop.mul(V::splat(c)).fma(rot_swap, V::splat(s));
 
-    let ra = r_givens.to_array();
-    let half_sum = 0.5 * ((ra[0] + ra[1]) + (ra[2] + ra[3]));
+    let half_sum = 0.5 * r_givens.horizontal_sum();
     let h_out = r_givens.sub(V::splat(half_sum));
 
     let g_inj = scrub_clamp_vec4(params.g_inj, TANK_MAX_GINJ_ABS_F32);
     let x_quad = scrub_clamp_vec4(
-        V::from_array([x_tank_lr.0, x_tank_lr.1, x_tank_lr.0, x_tank_lr.1]),
+        V::splat_pair(x_tank_lr.0, x_tank_lr.1),
         TANK_MAX_INJECTED_ABS_F32,
     );
     let v_fb = h_out.fma(g_inj, x_quad);
@@ -454,13 +448,7 @@ mod tests {
         let mut ring = [3.0_f32; 8];
         write_ring_with_we_f32(&mut ring, 7, 2, -5.0, QUAD_FLAG_HOST_WRITE_LOCK);
         assert_eq!(ring[2], 3.0);
-        write_ring_with_we_f32(
-            &mut ring,
-            7,
-            2,
-            -5.0,
-            QUAD_FLAG_HAS_EXT | QUAD_FLAG_SCHROEDER_ENABLE | 0x01,
-        );
+        write_ring_with_we_f32(&mut ring, 7, 2, -5.0, QUAD_FLAG_HAS_EXT | 0x01);
         assert_eq!(ring[2], -5.0);
 
         let mut off16: u16 = 0;

@@ -23,8 +23,9 @@ pub const fn detect_wasm_backend() -> BackendKind {
 mod simd128_impl {
     use core::arch::wasm32::{
         f32x4, f32x4_abs, f32x4_add, f32x4_extract_lane, f32x4_le, f32x4_max, f32x4_min, f32x4_mul,
-        f32x4_neg, f32x4_splat, f32x4_sub, i32x4_shl, i32x4_splat, u32x4_add, u32x4_ge, u32x4_lt,
-        u32x4_shr, u32x4_splat, u32x4_sub, v128, v128_and, v128_andnot, v128_bitselect, v128_xor,
+        f32x4_neg, f32x4_splat, f32x4_sub, i32x4_shl, i32x4_shuffle, i32x4_splat, u32x4_add,
+        u32x4_ge, u32x4_lt, u32x4_shr, u32x4_splat, u32x4_sub, v128, v128_and, v128_andnot,
+        v128_bitselect, v128_xor,
     };
     use core::fmt;
 
@@ -112,6 +113,23 @@ mod simd128_impl {
             let flushed = v128_bitselect(signed_zero, self.0, is_sub);
             let non_finite = u32x4_ge(abs_bits, u32x4_splat(IEEE754_F32_EXP_MASK));
             Self(v128_andnot(flushed, non_finite))
+        }
+
+        #[inline(always)]
+        fn pair_swap_neg(self) -> Self {
+            let swapped = i32x4_shuffle::<1, 0, 3, 2>(self.0, self.0);
+            Self(v128_xor(swapped, f32x4(-0.0, 0.0, -0.0, 0.0)))
+        }
+
+        #[inline(always)]
+        fn odd_pair_swap_neg(self) -> Self {
+            let reversed = i32x4_shuffle::<3, 2, 1, 0>(self.0, self.0);
+            Self(v128_xor(reversed, f32x4(0.0, -0.0, 0.0, -0.0)))
+        }
+
+        #[inline(always)]
+        fn rotate_left_1(self) -> Self {
+            Self(i32x4_shuffle::<1, 2, 3, 0>(self.0, self.0))
         }
 
         #[inline(always)]
@@ -226,6 +244,21 @@ mod simd128_impl {
         }
 
         #[inline(always)]
+        fn pair_swap_neg(self) -> Self {
+            <Self as SimdVec4>::pair_swap_neg(self)
+        }
+
+        #[inline(always)]
+        fn odd_pair_swap_neg(self) -> Self {
+            <Self as SimdVec4>::odd_pair_swap_neg(self)
+        }
+
+        #[inline(always)]
+        fn rotate_left_1(self) -> Self {
+            <Self as SimdVec4>::rotate_left_1(self)
+        }
+
+        #[inline(always)]
         fn horizontal_sum(self) -> f32 {
             <Self as SimdVec4>::horizontal_sum(self)
         }
@@ -326,6 +359,21 @@ impl SimdVec4 for WasmVec4 {
     }
 
     #[inline(always)]
+    fn pair_swap_neg(self) -> Self {
+        Self(self.0.pair_swap_neg())
+    }
+
+    #[inline(always)]
+    fn odd_pair_swap_neg(self) -> Self {
+        Self(self.0.odd_pair_swap_neg())
+    }
+
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        Self(self.0.rotate_left_1())
+    }
+
+    #[inline(always)]
     fn scrub_recursive_state(self) -> Self {
         Self(self.0.scrub_recursive_state())
     }
@@ -411,6 +459,21 @@ impl dnam_kernels::KernelVec4 for WasmVec4 {
     #[inline(always)]
     fn abs(self) -> Self {
         <Self as SimdVec4>::abs(self)
+    }
+
+    #[inline(always)]
+    fn pair_swap_neg(self) -> Self {
+        <Self as SimdVec4>::pair_swap_neg(self)
+    }
+
+    #[inline(always)]
+    fn odd_pair_swap_neg(self) -> Self {
+        <Self as SimdVec4>::odd_pair_swap_neg(self)
+    }
+
+    #[inline(always)]
+    fn rotate_left_1(self) -> Self {
+        <Self as SimdVec4>::rotate_left_1(self)
     }
 
     #[inline(always)]

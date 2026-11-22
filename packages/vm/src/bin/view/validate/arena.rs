@@ -1,10 +1,9 @@
 //! Arena `0..=3`, `SonaCrossbarBlockWire`, `TransportQuadWire`, and inline `cp1_dir` validation helpers.
 
 use crate::bin::arena_wire::{
-    Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, PIPE_MAGIC_MASK,
-    PIPE_REQUIRED_SONA_MASK, SONA_META_CORE_MODS_PRESENT, SONA_META_RESERVED_MASK,
-    SonaCrossbarBlockWire, TRANSPORT_FLAG_EXT_F32, TRANSPORT_FLAG_SCHROEDER_ENABLE,
-    TransportQuadWire,
+    Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, CoreQuadWire,
+    PIPE_MAGIC_MASK, PIPE_REQUIRED_SONA_MASK, SONA_META_CORE_MODS_PRESENT, SONA_META_RESERVED_MASK,
+    SonaCrossbarBlockWire, TRANSPORT_FLAG_EXT_F32, TransportQuadWire,
 };
 use crate::bin::header::{
     DNBN_VERSION_MAJOR, DNBN_VERSION_MINOR, DnamBinRuntimeMetaWire, SONA_CELL_MAGIC,
@@ -12,11 +11,19 @@ use crate::bin::header::{
 use crate::types::{Tier, VmError};
 
 fn validate_quad(quad: &TransportQuadWire) -> Result<bool, VmError> {
-    let valid_mask = TRANSPORT_FLAG_SCHROEDER_ENABLE | TRANSPORT_FLAG_EXT_F32;
-    if (quad.flags & !valid_mask) != 0 || quad.reserved != 0 {
+    if (quad.flags & !TRANSPORT_FLAG_EXT_F32) != 0 || quad.reserved != 0 {
         return Err(VmError::InvalidArenaHeader);
     }
     Ok((quad.flags & TRANSPORT_FLAG_EXT_F32) != 0)
+}
+
+fn validate_linear_blocks_zero_k_nl(quads: &[CoreQuadWire]) -> Result<(), VmError> {
+    for quad in quads {
+        if !quad.svf_k_nl_fp16.iter().all(|v| v.get() == 0) {
+            return Err(VmError::InvalidArenaHeader);
+        }
+    }
+    Ok(())
 }
 
 fn validate_crossbar_block_reserved(block: &SonaCrossbarBlockWire) -> Result<(), VmError> {
@@ -123,16 +130,20 @@ pub(in crate::bin::view) fn validate_arena0_and_quads(
         return Err(VmError::InvalidArenaHeader);
     }
 
+    validate_linear_blocks_zero_k_nl(&arena0.core_quads[1..4])?;
     let mut any_ext_f32 = validate_quad(&arena0.transport_lite)?;
     if let Some(a1) = arena1 {
+        validate_linear_blocks_zero_k_nl(&a1.core_quads[1..2])?;
         any_ext_f32 |= validate_quad(&a1.transport_full)?;
         validate_crossbar_block_reserved(&a1.crossbar_full)?;
     }
     if let Some(a2) = arena2 {
+        validate_linear_blocks_zero_k_nl(&a2.core_quads[1..2])?;
         any_ext_f32 |= validate_quad(&a2.transport_pro[0])?;
         validate_crossbar_block_reserved(&a2.crossbar_pro)?;
     }
     if let Some(a3) = arena3 {
+        validate_linear_blocks_zero_k_nl(&a3.core_quads[1..2])?;
         any_ext_f32 |= validate_quad(&a3.transport_ultra[0])?;
         validate_crossbar_block_reserved(&a3.crossbar_ultra)?;
         for k in 0..8 {
@@ -326,5 +337,146 @@ mod tests {
             })
             .is_ok()
         );
+    }
+
+    #[test]
+    fn test_retired_transport_flag_bit0_and_linear_block_k_nl_fail_closed() {
+        let mut a0 = DnamBinBuildInput::default_arena0_lite();
+        a0.core_quads[0].svf_k_nl_fp16 = [U16::new(dnam_kernels::f32_to_fp16(4.0)); 4];
+        let mut a1 = Arena1FullDeltaWire::new_zeroed();
+        a1.core_quads[0].svf_k_nl_fp16 = [U16::new(dnam_kernels::f32_to_fp16(8.0)); 4];
+        let a2 = Arena2ProDeltaWire::new_zeroed();
+        let a3 = Arena3UltraDeltaWire::new_zeroed();
+        let mut a0_ultra = a0;
+        a0_ultra.crossbar.cell_desc.tier_flags = U16::new(0x000F);
+        let input = DnamBinBuildInput {
+            reference_sample_rate_hz: 48_000,
+            header_flags: 0,
+            ext_ring_pow2_frames: 0,
+            ext_ring_lines: 0,
+            ext_ring_format: 0,
+            declared_max_delay_48k: 4_096,
+            dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
+            tail_time_ms: 0.0,
+            ro_pole_48k: 0.99,
+            switch_xfade_samples: 0,
+            content_hash_prefix: [0; 8],
+            controls: &[],
+            cp1_overflow: &[],
+            tsyn: &[],
+            cext: None,
+            arena0: &a0_ultra,
+            arena1: Some(&a1),
+            arena2: Some(&a2),
+            arena3: Some(&a3),
+        };
+        let mut buf = [0_u8; 32_768];
+        let len = encode_dnam_bin_into(&input, &mut buf).unwrap();
+        let view = DnamBinView::parse(&buf[..len]).unwrap();
+
+        let mut bad_a0 = *view.arena0;
+        bad_a0.transport_lite.flags = 0x01;
+        assert_eq!(
+            validate_arena0_and_quads(ArenaValidationInput {
+                arena0: &bad_a0,
+                arena1: Some(&a1),
+                arena2: Some(&a2),
+                arena3: Some(&a3),
+                cp1_overflow_empty: true,
+                num_controls: 0,
+                max_present_tier: 3,
+                retained_tier: Tier::Ultra,
+                meta: view.runtime_meta,
+            })
+            .unwrap_err(),
+            VmError::InvalidArenaHeader
+        );
+
+        let mut bad_lin0 = *view.arena0;
+        bad_lin0.core_quads[1].svf_k_nl_fp16[0] = U16::new(0x8000);
+        assert_eq!(
+            validate_arena0_and_quads(ArenaValidationInput {
+                arena0: &bad_lin0,
+                arena1: Some(&a1),
+                arena2: Some(&a2),
+                arena3: Some(&a3),
+                cp1_overflow_empty: true,
+                num_controls: 0,
+                max_present_tier: 3,
+                retained_tier: Tier::Ultra,
+                meta: view.runtime_meta,
+            })
+            .unwrap_err(),
+            VmError::InvalidArenaHeader
+        );
+
+        for q in 1..4 {
+            let mut bad_q = *view.arena0;
+            bad_q.core_quads[q].svf_k_nl_fp16[q] = U16::new(if q == 1 { 0x8000 } else { 0x3C00 });
+            assert_eq!(
+                validate_arena0_and_quads(ArenaValidationInput {
+                    arena0: &bad_q,
+                    arena1: Some(&a1),
+                    arena2: Some(&a2),
+                    arena3: Some(&a3),
+                    cp1_overflow_empty: true,
+                    num_controls: 0,
+                    max_present_tier: 3,
+                    retained_tier: Tier::Ultra,
+                    meta: view.runtime_meta,
+                })
+                .unwrap_err(),
+                VmError::InvalidArenaHeader
+            );
+        }
+
+        for slot in 1..=3 {
+            for val in [0x3C00_u16, 0x8000_u16] {
+                let (mut b1, mut b2, mut b3) = (a1, a2, a3);
+                match slot {
+                    1 => b1.core_quads[1].svf_k_nl_fp16[2] = U16::new(val),
+                    2 => b2.core_quads[1].svf_k_nl_fp16[3] = U16::new(val),
+                    _ => b3.core_quads[1].svf_k_nl_fp16[1] = U16::new(val),
+                }
+                assert_eq!(
+                    validate_arena0_and_quads(ArenaValidationInput {
+                        arena0: view.arena0,
+                        arena1: Some(&b1),
+                        arena2: Some(&b2),
+                        arena3: Some(&b3),
+                        cp1_overflow_empty: true,
+                        num_controls: 0,
+                        max_present_tier: 3,
+                        retained_tier: Tier::Ultra,
+                        meta: view.runtime_meta,
+                    })
+                    .unwrap_err(),
+                    VmError::InvalidArenaHeader
+                );
+            }
+            for bad_flag in [0x01_u8, 0x04_u8] {
+                let (mut b1, mut b2, mut b3) = (a1, a2, a3);
+                match slot {
+                    1 => b1.transport_full.flags = bad_flag,
+                    2 => b2.transport_pro[0].flags = bad_flag,
+                    _ => b3.transport_ultra[0].flags = bad_flag,
+                }
+                assert_eq!(
+                    validate_arena0_and_quads(ArenaValidationInput {
+                        arena0: view.arena0,
+                        arena1: Some(&b1),
+                        arena2: Some(&b2),
+                        arena3: Some(&b3),
+                        cp1_overflow_empty: true,
+                        num_controls: 0,
+                        max_present_tier: 3,
+                        retained_tier: Tier::Ultra,
+                        meta: view.runtime_meta,
+                    })
+                    .unwrap_err(),
+                    VmError::InvalidArenaHeader
+                );
+            }
+        }
     }
 }

@@ -6,6 +6,7 @@
 
 pub mod interp_and_window;
 pub mod quad_ortho;
+pub mod scattering;
 
 pub use interp_and_window::{
     blend_catmull_rom_modulated_f32, bspline_barberpole_3phase_f32, catmull_rom_hermite_f32,
@@ -17,8 +18,12 @@ pub use interp_and_window::{
 };
 pub use quad_ortho::{
     FP16_FINITE_MAX_F32, OpTFeedbackParams, OpTFeedbackState, QUAD_FLAG_HAS_EXT,
-    QUAD_FLAG_HOST_WRITE_LOCK, QUAD_FLAG_SCHROEDER_ENABLE, coercive_loop_limit_vec4,
-    step_op_t_feedback_vec4, step_op_t_wet_dc_stereo_f32, step_schroeder_allpass,
-    step_schroeder_quad_vec4, step_we_hold_lag, step_we_hold_lag_u16, write_ring_with_freeze_f32,
-    write_ring_with_we_f32,
+    QUAD_FLAG_HOST_WRITE_LOCK, coercive_loop_limit_vec4, step_op_t_feedback_vec4,
+    step_op_t_wet_dc_stereo_f32, step_schroeder_allpass, step_schroeder_quad_vec4,
+    step_we_hold_lag, step_we_hold_lag_u16, write_ring_with_freeze_f32, write_ring_with_we_f32,
+};
+pub use scattering::{
+    apply_so4_even_chunk4, apply_so4_even_transpose_vec4, apply_so4_even_vec4,
+    apply_so4_odd_chunk4, apply_so4_odd_transpose_vec4, apply_so4_odd_vec4, is_so4_identity,
+    so4_theta_grad_vec4,
 };

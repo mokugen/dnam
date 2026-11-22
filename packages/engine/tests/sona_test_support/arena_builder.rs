@@ -14,7 +14,7 @@ use dnam_engine::schema::{
     ControlCalibration, ControlCalibrationRole, ControlKind, ControlSchemaDef, ControlUiHints,
     DnamJsonHeader, PresetDef, TempoSubdivision,
 };
-use dnam_kernels::{TANK_MAX_SIGMA_SAT_FP16, f32_to_fp16};
+use dnam_kernels::{TANK_MAX_SIGMA_SAT_FP16, f32_to_fp16, pack_wf_mix_and_rect_sign_fp16};
 use dnam_vm::bin::{
     ARENA_TIER_BYTES, Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire,
     Arena3UltraDeltaWire, CONVOLVER_KAUTZ_BLOCKS_PER_TIER, CextDispatchWire, DNBN_FLAG_AUTO_UNITY,
@@ -23,7 +23,7 @@ use dnam_vm::bin::{
     SONA_CELL_MAGIC, SONA_META_CORE_MODS_PRESENT, SONA_META_OS_EXT_PRESENT, SONA_META_OS2X,
     SONA_META_SENSORY_QUAD, SONA_META_TIER_OS_EXPLICIT, SONA_META_TRANSPORT_LFO,
     SONA_META_TRANSPORT_TAP_GAINS, SonaCrossbarBlockWire, SonaInterBlockTilePairWire,
-    TRANSPORT_FLAG_SCHROEDER_ENABLE, TempoSyncEntryWire, TransportQuadWire, encode_dnam_bin,
+    TempoSyncEntryWire, TransportQuadWire, encode_dnam_bin,
 };
 use dnam_vm::control::Cp1ContributorSlot;
 use zerocopy::byteorder::little_endian::{F32, U16, U32};
@@ -145,8 +145,8 @@ fn fill_core_quad(quad: &mut dnam_vm::bin::CoreQuadWire, g: usize, linear_s2: bo
         quad.tone_bp_fp16[l] = U16::new(f32_to_fp16(0.10));
         quad.tone_dir_fp16[l] = U16::new(f32_to_fp16(0.70));
         quad.sag_depth_fp16[l] = U16::new(f32_to_fp16(if linear_s2 { 0.0 } else { 0.20 }));
-        quad.wavefolder_mix_fp16[l] = U16::new(f32_to_fp16(if linear_s2 { 0.0 } else { 0.08 }));
-        quad.rect_sign_fp16[l] = U16::new(f32_to_fp16(1.0));
+        let wf = if linear_s2 { 0.0 } else { 0.08 };
+        quad.wavefolder_mix_fp16[l] = U16::new(pack_wf_mix_and_rect_sign_fp16(wf, 1.0));
         let in_w = if l == 0 {
             0.70 + 0.02 * (g as f32)
         } else {
@@ -207,7 +207,7 @@ fn fill_transport_quad(tq: &mut TransportQuadWire, tier_idx: usize, mute_s4_taps
     tq.lfo_rate_hz = F32::new(1.4 + 0.2 * (tier_idx as f32));
     tq.sigma_knee_fp16 = U16::new(TANK_MAX_SIGMA_SAT_FP16);
     tq.freeze_mix_fp16 = U16::new(f32_to_fp16(if mute_s4_taps { 0.0 } else { 0.25 }));
-    tq.flags = TRANSPORT_FLAG_SCHROEDER_ENABLE;
+    tq.flags = 0;
 }
 
 fn fill_crossbar_block(cb: &mut SonaCrossbarBlockWire, active_groups: usize, tf: f32) {

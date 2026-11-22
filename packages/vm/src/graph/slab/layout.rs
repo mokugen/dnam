@@ -8,7 +8,7 @@ pub mod cold;
 use core::mem::{align_of, offset_of, size_of};
 
 use dnam_kernels::{
-    CoreQuadParamsStereo4, HilbertH1StereoKernel, OpNPreHotState, PhasorQ32Bank4,
+    CoreQuadParamsStereo4, HilbertH1StereoKernel, MAX_SVF_K_NL, OpNPreHotState, PhasorQ32Bank4,
     SonaBlockStateStereo8, SonaParaLruDuhemCoeffs4, SonaToneWeights4, StereoVec8,
     T1DcBlockerStereo, T1SubHarmonicKernel, TptSvfCoeffs4,
 };
@@ -208,9 +208,9 @@ impl Default for CoreQuadHot {
     }
 }
 
-/// Compact `40 B` (`8 B`-aligned) cold extension per `CoreQuad` holding Selective-Duhem,
-/// stereo-link, Side M/S input coupling, and `GLU` cross-lane mix weights hoisted into
-/// [`CoreQuadParamsStereo4`] and [`CoreQuadReadoutRegs`].
+/// Compact `48 B` (`8 B`-aligned) cold extension per `CoreQuad` holding Selective-Duhem,
+/// stereo-link, Side M/S input coupling, Block 0 PHS `svf_k_nl_fp16`, and `GLU` mix weights
+/// hoisted into [`CoreQuadParamsStereo4`] and [`CoreQuadReadoutRegs`].
 #[repr(C, align(8))]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CoreQuadExtCold {
@@ -224,6 +224,8 @@ pub struct CoreQuadExtCold {
     pub lru_signed_mix_fp16: [u16; 4],
     /// Bounded cross-lane `GLU` bilinear coupling (`[-4.0, 4.0]`, `fp16`).
     pub glu_mix_fp16: [u16; 4],
+    /// Block 0 linearly-implicit PHS nonlinear SVF damping (`[0.0, 16.0]`, `fp16`; `0x0000` on Blocks 1..3).
+    pub svf_k_nl_fp16: [u16; 4],
 }
 
 impl CoreQuadExtCold {
@@ -317,6 +319,8 @@ impl CoreQuadHot {
                 B::fp16x4_to_vec4(&ext.lru_stereo_link_fp16),
             ),
             two_svf_g: g.add(g),
+            svf_k_nl: B::fp16x4_to_vec4(&ext.svf_k_nl_fp16)
+                .clamp(B::Vec4::zero(), B::Vec4::splat(MAX_SVF_K_NL)),
             rect_sign,
             sag_depth: B::fp16x4_to_vec4(&self.sag_depth_fp16),
             adaa_drive: B::fp16x4_to_vec4(&self.adaa_drive_fp16)
@@ -622,7 +626,7 @@ impl<B: GraphBackend> SonaUltraHotDelta<B> {
 }
 
 const _: () = assert!(size_of::<CoreQuadHot>() == 144 && align_of::<CoreQuadHot>() == 16);
-const _: () = assert!(size_of::<CoreQuadExtCold>() == 40 && align_of::<CoreQuadExtCold>() == 8);
+const _: () = assert!(size_of::<CoreQuadExtCold>() == 48 && align_of::<CoreQuadExtCold>() == 8);
 const _: () =
     assert!(size_of::<SonaInterBlockTileHot>() == 128 && align_of::<SonaInterBlockTileHot>() == 16);
 const _: () =
@@ -706,6 +710,7 @@ mod tests {
             q.lru_bias_drive_fp16[l] = f32_to_fp16(if l < 2 { -15.0 } else { 15.0 });
         }
         let ext = CoreQuadExtCold {
+            svf_k_nl_fp16: [0; 4],
             in_side_weight_fp16: [f32_to_fp16(0.5); 4],
             lru_stereo_link_fp16: [f32_to_fp16(0.25); 4],
             lru_duhem_gamma_fp16: [f32_to_fp16(12.0); 4],
