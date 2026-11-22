@@ -17,7 +17,7 @@ adrs:
 
 # Op-T: Universal Transport, Granular Windowing & All-Pass Diffusion Operator
 
-This specification defines Op-T (Transport), governing causal top-of-frame fractional delay reads (with $\tau_{\min} = 5.0$ samples across 4-frame crossbar/`TransportQuad` micro-chunks and $\tau[n] \ge 4.0$ on standalone single-sample rings), pitch-warped granular windows, barberpole phase sweeps, bounded-history coercive feedback loops, continuous passive `freeze_mix` + host `WE` RAM write lock, and partitioned Schroeder all-pass diffusion across Dynamic Neural Audio Modeler (DNAM) SONA v3.0 ([sona_architecture.md](../architecture/sona_architecture.md), [REQ-1.4, REQ-6.2](../../requirements/system_goals_and_requirements.md)).
+This specification defines Op-T (Transport), governing causal top-of-frame fractional delay reads (with $\tau_{\min} = 5.0$ samples across 4-frame crossbar/`TransportQuad` micro-chunks and $\tau[n] \ge 4.0$ on standalone single-sample rings), pitch-warped granular windows, barberpole phase sweeps, bounded-history coercive feedback loops, continuous passive `freeze_mix` + host `WE` RAM write lock, and fused `SO(4)` paraunitary Schroeder all-pass diffusion across Dynamic Neural Audio Modeler (DNAM) SONA v3.0 ([sona_architecture.md](../architecture/sona_architecture.md), [REQ-1.4, REQ-6.2](../../requirements/system_goals_and_requirements.md)).
 
 Every SONA Op-T read executes inside a single unified continuous 4-lane Top-of-Frame Causal Operator Crossbar pipeline before the 4-block Matryoshka core, while coercive loop writes update delay rings at frame end. This unified placement expresses pre-drive chorus, rotary modulation, and reverb-into-fuzz chains alongside post-core tape/BBD echoes, granular pitch shifters, barberpole sweeps, and shimmer holds strictly via learned weights ([ADR-0006](../../adr/0006-model-declared-delays-and-tank-feedback-guard.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)).
 
@@ -64,9 +64,9 @@ Each `TransportQuad` is serialized in the tier arena as a 128-byte little-endian
 | 16..32 | 16 | `f32le[4]` | `ramp_spans_samples[4]` | 48 kHz base ramp spans per lane (`f32` avoids `fp16` overflow at 384 kHz) |
 | 32..56 | 24 | 6 × `f32le` | `g_loop`, `r_dc`, `damp_pole`, `lfo_rate_hz`, `ramp_rate_hz`, `reserved_52_56` | Loop feedback, 5 Hz DC pole, HF damp pole, LFO/ramp rates, and reserved 0.0 at 52..56 |
 | 56..112 | 56 | 7 × `u16le[4]` | `lfo_depths_fp16[4]`, `lfo_phase_off_q16[4]`, `ramp_phase_off_q16[4]`, `input_gains_fp16[4]`, `wet_tap_l_fp16[4]`, `wet_tap_r_fp16[4]`, `allpass_g_fp16[4]` | Per-lane LFO depths/offsets, ramp phase offsets, injection gains, L/R wet tap gains, and Schroeder `allpass_g` in `[-0.75, 0.75]` |
-| 112..122 | 10 | 5 × `u16le` | `fb_psi_fp16`, `sigma_knee_fp16`, `freeze_mix_fp16`, `window_depth_fp16`, `reserved_120_122` | Givens rotation, unified loop limiter ceiling, passive `freeze_mix`, window depth, and reserved 0 |
+| 112..122 | 10 | 5 × `u16le` | `fb_psi_fp16`, `sigma_knee_fp16`, `freeze_mix_fp16`, `window_depth_fp16`, `scat_psi_fp16` | Givens rotation, unified loop limiter ceiling, passive `freeze_mix`, window depth, and `SO(4)` paraunitary scattering angle `[-pi, +pi]` (default 0.0) |
 | 122..126 | 4 | `u8[4]` | `allpass_delays[4]` | 48 kHz base Schroeder lengths <= 255; expanded into rate-scaled integer host buffers on load up to 16,384 samples at 384 kHz |
-| 126..127 | 1 | `u8` | `flags` | Bit 0 = `schroeder_enable`, bit 1 = `ext_f32` (`0 = fp16`, `1 = f32` ring precision for this quad; logical OR sets cold sizing `ext_ring_format`); bits 2..7 strictly 0 (zero discrete mode or freeze bits) |
+| 126..127 | 1 | `u8` | `flags` | Bit 0 = 0 reserved, bit 1 = `ext_f32` (`0 = fp16`, `1 = f32` ring precision for this quad; logical OR sets cold sizing `ext_ring_format`); bits 2..7 strictly 0 (zero discrete stage-bypass, mode, or freeze bits) |
 | 127..128 | 1 | `u8` | `_pad` | Reserved pad byte; must equal `0x00` |
 
 At runtime, each pure-wet active `TransportQuad` occupies a 216-byte 8-byte-aligned hot state block (bytes 0..216) inside the cache-locked working set using 2-state Direct-Form I DC blockers, precomputed `inv_sigma_23`, continuous `freeze_mix`, and host write-lock flags:
@@ -76,7 +76,7 @@ At runtime, each pure-wet active `TransportQuad` occupies a 216-byte 8-byte-alig
 | 0..64 | 64 | 16 × `f32` | `dc_x_prev[4]`, `dc_y_prev[4]`, `damp_state[4]`, `wet_dc_x[2]`, `wet_dc_y[2]` | 2-state Direct-Form I loop DC blockers, per-lane HF damp state, and stereo wet DC blockers |
 | 64..96 | 32 | 8 × `f32` | `delay_samples[4]`, `ramp_spans_samples[4]` | Effective-rate base delays and ramp spans |
 | 96..144 | 48 | 5 × 32-bit + 7 × `f32` | `write_ptr: u32`, `lfo_phase_q32: u32`, `lfo_inc_q32: u32`, `ramp_phase_q32: u32`, `ramp_inc_q32: i32`, `g_loop`, `r_dc`, `damp_pole`, `current_psi`, `cos_psi`, `sin_psi`, `wet_dc_pole` | Backward write cursor, LFO/ramp accumulators, loop/wet DC and damp poles, and cached Givens `(cos, sin)` |
-| 144..216 | 72 | `u16`/`u8` + pad | `we_hold_off[4]: u16` (inline hold offset; 32-bit counters in cold storage when `HAS_EXT`), `lfo_phase_off_q16[4]`, `ramp_phase_off_q16[4]`, `lfo_depths_fp16[4]`, `input_gains_fp16[4]`, `wet_tap_l_fp16[4]`, `wet_tap_r_fp16[4]`, 6 scalar `fp16` (`window_depth_fp16`, `freeze_mix_fp16`, `sigma_sat_fp16`, `inv_sigma_23_fp16`, `half_alpha_cubic_fp16`, `base_psi_fp16`), `flags: u8`, `_pad8: u8`, `_pad16: u16` | Hold offsets, per-lane Q16/`fp16` gains, scalar `fp16` params (`inv_sigma_23 = 2/(3*sigma_sat)`), and `flags` (`bit 0 = 0` reserved, `bit 1 = HAS_EXT`, `bit 2 = HOST_WRITE_LOCK`, `bit 3 = SCHROEDER_ENABLE`, bits 4..7 = 0) |
+| 144..216 | 72 | `u16`/`u8` + pad | `we_hold_off[4]: u16` (inline hold offset; 32-bit counters in cold storage when `HAS_EXT`), `lfo_phase_off_q16[4]`, `ramp_phase_off_q16[4]`, `lfo_depths_fp16[4]`, `input_gains_fp16[4]`, `wet_tap_l_fp16[4]`, `wet_tap_r_fp16[4]`, 6 scalar `fp16` (`window_depth_fp16`, `freeze_mix_fp16`, `sigma_sat_fp16`, `inv_sigma_23_fp16`, `half_alpha_cubic_fp16`, `base_psi_fp16`), `flags: u8`, `_pad8: u8`, `_pad16: u16` | Hold offsets, per-lane Q16/`fp16` gains, scalar `fp16` params (`inv_sigma_23 = 2/(3*sigma_sat)`), and `flags` (`bit 0 = 0` reserved, `bit 1 = HAS_EXT`, `bit 2 = HOST_WRITE_LOCK`, bits 3..7 = 0) |
 
 All active crossbar and `TransportQuad` blocks execute at `f_{s,vm}` (`rho_vm = 48_000.0 / f_{s,vm}`) and enforce the causal delay floor `tau_min = 5.0` samples (`delay_int >= 5`) at Top-of-Frame so 4-tap Catmull-Rom accesses remain at least 4 samples behind the newest frame in each 4-frame causal micro-chunk (`i_m1 = write_idx + 1 - delay_int <= write_idx - 4`). This preserves 0-ULP equivalence between 1-frame and 4-frame micro-chunk stepping (`ref[dsp.op-t.ring.q0-32-pointer]`), while standalone single-sample rings allow `tau >= 4.0`.
 
@@ -98,12 +98,13 @@ Active `TransportQuad` blocks rescale and clamp runtime parameters at cold load 
 | :--- | :--- | :--- |
 | `delay_samples[0..4]` | `[5.0, max_tau]` at `f_{s,vm}` (`[4.0, max_tau]` standalone) | ZOH-rescaled by `1 / rho_vm` from 48 kHz `[5.0, 48,000.0]`; `max_tau = cap - 3` if modulated else `cap - 2` |
 | `ramp_spans_samples[0..4]` | `[0.0, max_span]` samples | ZOH-rescaled by `1 / rho_vm` on cold load; `max_span = max(0.0, max_tau - 5.0)` |
-| `allpass_delays[0..4]` | `[0, 16,384]` samples | 48 kHz `u8 <= 255`; 0 bypasses that lane cleanly (`v_read,k = r_k`) even when `schroeder_enable == 1`; nonzero lengths expand via `max(1, round(D_48k / rho_vm))` |
+| `allpass_delays[0..4]` | `[0, 16,384]` samples | 48 kHz `u8 <= 255`; 0 sets `A_k` to unity with `y_1,k = x_1,k` and zero cold ring accesses while `R_even`/`R_odd` still run whenever not in full hold, with `[0; 4]` allocating 0 B cold ring RAM; nonzero lengths expand via `max(1, round(D_48k / rho_vm))` |
 | `allpass_g_fp16[0..4]` | `[-0.75, 0.75]` | Per-lane Schroeder all-pass coefficients tapered by `(1 - mu_freeze)` during feedback recirculation |
 | `g_loop` | `[0.0, MAX_LOOP_GAIN_F32]` | Clamped by `TANK_MAX_G_LIN_BITS` (`0x3F7F_BE76`, 0.9990) and pitch-down energy limit (§2) |
 | `sigma_knee_fp16` | `[1.0e-3, 0.984375]` (`0x3BE0`) | Unified loop saturator ceiling `sigma_sat` (non-finite fallback `0.984375 = 0x3BE0`) with cold `inv_sigma_23 = 2 / (3 * sigma_sat)` |
 | `freeze_mix_fp16` | `[0.0, 1.0]` | Base continuous passive recirculation mix (non-finite fallback 0.0); stage-level `tank_dry_mix_fp16` resides in Arena 0 Control Plane |
 | `base_psi_fp16` | `[-pi, pi]` rad | Base Givens angle; `target_psi = clamp(base_psi + tank_psi_delta, -pi, +pi)` (clamped, never wrapped mod `2*pi`), slewed `<= 0.25` rad/tick via `algebraic_unit_rotor_f32` |
+| `scat_psi_fp16` | `[-pi, pi]` rad | Base SO(4) paraunitary scattering angle with non-finite fallback 0.0 stored in cold quad metadata outside the 216-byte active-hot state block; evaluates effective angle `(1 - freeze_mix) * base_scat_psi` from unlocked continuous `freeze_mix = clamp(base_freeze_mix + t[16], 0.0, 1.0)` via `algebraic_unit_rotor_f32` into cached `(cos_scat, sin_scat)` on cold load, reset, and register latches `(sample_tick & 3) == 0 || ctrl_sub_counter == 0` during slot-16 ramps so releasing `HOST_WRITE_LOCK` never retains stale `(1.0, 0.0)` |
 | `input_gains_fp16[0..4]` | `[-2.0, 2.0]` | Per-lane input injection weights into 4-line Householder reflection |
 | `wet_tap_l_fp16`, `wet_tap_r_fp16` | `[-2.0, 2.0]` | Stereo per-lane L/R wet tap weights |
 | `r_dc` | `[0.95, 0.9999]` | Finite inputs clamp to `[0.95, 0.9999]` before ZOH `r_dc^rho_vm`; only non-finite inputs fall back to `0x3F7F_D51F` (5 Hz at 48 kHz) |
@@ -120,7 +121,7 @@ Calling quad hot-state `reset()` restores deterministic zero-state resting equil
 | `wet_dc_x`, `wet_dc_y` | 0 (`[0.0; 2]`) | Zeroes stereo non-recirculating wet DF-I DC blocker state |
 | `write_ptr`, `lfo_phase_q32`, `ramp_phase_q32` | 0 | Resets backward write cursor and LFO/ramp phase accumulators |
 | `current_psi` | `base_psi` | Snaps slewed Givens angle directly to `base_psi` |
-| `(cos_psi, sin_psi)` | `algebraic_unit_rotor_f32(base_psi)` | Recomputes cached Givens rotor directly from `base_psi` via pure-32-bit `algebraic_unit_rotor_f32` |
+| `(cos_psi, sin_psi)` | `algebraic_unit_rotor_f32(base_psi)` | Recomputes cached Givens rotor and cold effective `(cos_scat, sin_scat)` at `(1 - freeze_mix) * base_scat_psi` from unlocked continuous `freeze_mix = clamp(base_freeze_mix + t[16], 0.0, 1.0)` directly via pure-32-bit `algebraic_unit_rotor_f32` |
 | `we_hold_off` | `[0; 4]` | Clears inline/cold hold counters |
 | `flags` (`HOST_WRITE_LOCK`) | Preserved on `reset()` | Preserves bit 2 (`HOST_WRITE_LOCK`) on `reset()`; full VM re-init clears all lock bits |
 | Inline, External & Schroeder Rings | 0.0 | Zero-fills main delay ring and Schroeder all-pass buffer (`ap_wr = 0`) |
@@ -141,9 +142,17 @@ $$r_{\mathrm{inv}} = \mathrm{recipNR2}\big(\max(|g_{\mathrm{loop,eff}}|, 0.5)\bi
 $$y_{\mathrm{lin}} = (1 - \mu)s[0] + \mu s[1], \qquad y_{\mathrm{curv}} = (1 - \mu)\big(2s[0] - s[-1] - s[1]\big) + \mu\big(2s[1] - s[0] - s[2]\big)$$
 $$r_{\mathrm{raw},k}[n] = y_{\mathrm{lin}} + \alpha_{\mathrm{half}}[g, \mu_{\mathrm{freeze}}] \cdot \mu (1 - \mu) y_{\mathrm{curv}}$$
 
-The unified Top-of-Frame 4-lane pipeline then multiplies each lane by its continuous diagonal window gain $w_k \in [0, 1]$ (§2) and steps the four parallel per-lane Schroeder all-pass stages **before** tap weighting and loop feedback write across active Quads 0..3 (up to 4 quads × 4 lanes = 16 stages at Ultra, §3.1) with effective feedback coefficient $(1 - \mu_{\mathrm{freeze}}) a_{\mathrm{diff},k}$.
+The unified Top-of-Frame 4-lane pipeline then multiplies each lane by its continuous diagonal window gain $w_k \in [0, 1]$ (§2) and steps the fused `SO(4)` matrix Schroeder diffuser **before** tap weighting and loop feedback write across Quads 0..3 up to 16 stages at Ultra (§3.1):
 
-Each lane $k \in \lbrace 0, 1, 2, 3 \rbrace$ bypasses its Schroeder stage cleanly (`v_read,k = r_k`) whenever `schroeder_enable == 0`, freeze hold (`mu_freeze >= 1.0` or `HOST_WRITE_LOCK` bit 2 set) is active, or `allpass_delays[k] == 0` (even when `schroeder_enable == 1`).
+$$\mathbf{H}(z;\ \theta_{\mathrm{eff}}, \mathbf{a}, \mathbf{D}) = \mathbf{R}_{\mathrm{odd}}(\theta_{\mathrm{eff}}) \mathrm{diag}(A_0, A_1, A_2, A_3) \mathbf{R}_{\mathrm{even}}(\theta_{\mathrm{eff}})$$
+
+Here $\theta_{\mathrm{eff}} = (1 - \mu_{\mathrm{freeze}})\theta_{\mathrm{scat,base}}$ and each lane uses feedback $(1 - \mu_{\mathrm{freeze}}) a_{\mathrm{diff},k}$.
+
+Whenever not in full hold, the fused diffuser executes unconditionally from learned weights with zero discrete stage-bypass flags, producing automatic 0-ULP identity when `scat_psi == 0.0` and `allpass_delays == [0; 4]`.
+
+On full hold (`mu_freeze >= 1.0 - 1.0e-6` or bit 2 `HOST_WRITE_LOCK` set), the entire fused diffuser including `R_even` and `R_odd` bypasses cleanly (`v_read,k = r_win,k`), freezing the Schroeder buffer and `ap_wr` at 0 ULP.
+
+When active, any lane with zero `allpass_delays` evaluates $A_k(z) = 1$ with zero cold ring accesses while `R_even` and `R_odd` execute; when all four delays are 0, `H(z)` collapses to lossless memoryless `SO(4)` rotation, preserving 0-ULP identity at zero scattering angle.
 
 Feedback conditioning applies cold-precomputed `inv_sigma_23 = 2 / (3 * sigma_sat)` and `sigma_sat = clamp(sigma_knee, 1.0e-3, 0.984375)` (`TANK_MAX_SIGMA_SAT_FP16 = 0x3BE0`) in one unity-slope cubic saturator (`TANK_MAX_V_CEIL_BITS = 0x3F7C_28F5`, 0.985, zero loop `NR2` reciprocal) ahead of pairwise 2×2 Givens `R_block2(psi)` and unitary 4×4 Householder reflection $\mathbf{H}_4(\mathbf{1}) = \mathbf{I}_4 - 0.5\mathbf{1}\mathbf{1}^\top$ plus input injection.
 
@@ -178,17 +187,17 @@ For Givens angle updates, 3 kHz ticks form `target_psi = clamp(base_psi + tank_p
 
 Continuous passive `freeze_mix` (`mu_freeze = clamp(base_freeze_mix + t[16], 0.0, 1.0)` via uniformly micro-ramped slot 16 `op_t_freeze_mix_delta`, or forced to 1.0 whenever low-level host `HOST_WRITE_LOCK` bit 2 is set in `flags`) governs sound-on-sound recirculation vs 0-ULP ring hold without discrete Schmitt hysteresis.
 
-Across (0, 1), tapering `lfo_depths`, `ramp_spans`, `half_alpha_cubic`, and Schroeder `allpass_g` by `(1 - mu_freeze)` keeps writeback `w_ring = (1 - mu_freeze) * y_dc + mu_freeze * r_win` non-expansive across both fp16 and f32 rings. Whenever full hold engages (`mu_freeze >= 1.0 - 1.0e-6` or host write lock bit 2 set), phase increments halt while live input processing and wet readout (wet taps, Givens $\psi$, wet DC, stage dry mix) continue executing:
+Across (0, 1), tapering `lfo_depths`, `ramp_spans`, `half_alpha_cubic`, Schroeder `allpass_g`, and `scat_psi` by `(1 - mu_freeze)` keeps writeback `w_ring = (1 - mu_freeze) * y_dc + mu_freeze * r_win` non-expansive across both fp16 and f32 rings. Whenever full hold engages (`mu_freeze >= 1.0 - 1.0e-6` or host write lock bit 2 set), phase increments halt while live input processing and wet readout (wet taps, Givens $\psi$, wet DC, stage dry mix) continue executing:
 
 $$D_k = \mathrm{clamp}\big(\mathrm{round}(D_{\mathrm{delay}}[k]), 5, \mathtt{cap} - 2\big), \qquad \mathrm{lag}_k = \mathrm{select}(o_k < D_k, D_k - o_k, D_k), \qquad o_k' = \mathrm{select}(o_k + 1 \ge D_k, 0, o_k + 1)$$
 
 During full hold, each lane $k \in \lbrace 0, 1, 2, 3 \rbrace$ reads integer lag `(write_ptr + lag_k) & mask` using `o_k = we_hold_off[k]` at $w_k = 1.0$ (or cold 32-bit counters when `HAS_EXT` bit 1 is set) and advances $o_k'$ branchlessly. All four `we_hold_off` counters reset to 0 on `reset()` and on hold release.
 
-| Hold Condition (`mu_freeze == 1.0` or `HOST_WRITE_LOCK`) | Hold Behavior & Precision Invariant |
+| Hold Condition (`mu_freeze >= 1.0 - 1.0e-6` or `HOST_WRITE_LOCK`) | Hold Behavior & Precision Invariant |
 | :--- | :--- |
 | LFO & Ramp Phase Accumulators | `lfo_phase_q32` and `ramp_phase_q32` hold with zero increment |
 | Main Ring Read & Window | Reads `(write_ptr + lag_k) & mask` at `w_k = 1.0`; advances `we_hold_off[k]` branchlessly |
-| Schroeder All-Pass Diffuser | Bypasses Schroeder evaluation (`v_read,k = r_frozen,k`); Schroeder buffer and `ap_wr` freeze at 0-ULP |
+| `SO(4)` Schroeder All-Pass Diffuser | Bypasses fused `SO(4)` diffuser evaluation (`v_read,k = r_frozen,k`); lane-major SoA Schroeder buffer and `ap_wr` freeze at 0-ULP |
 | Feedback & Ring Writeback | Skips main ring `write_ptr` writes, loop feedback, HF damping (`damp_state`), and loop DC (`dc_x_prev`, `dc_y_prev`) |
 | Non-Recirculating Wet Readout | Continues `wet_tap_l/r`, Givens `psi`, wet DC blocker, and stage `g_dry_eff * x_tank` |
 
@@ -217,13 +226,13 @@ Standalone delay lines and compact transport quads implement complementary divis
 | Mode & Structure | Write Cursor Advance | Read Index Formula | Tap Offset `o` for `s[-1], s[0], s[1], s[2]` | Causal `D_int` Bounds |
 | :--- | :--- | :--- | :--- | :--- |
 | Forward-Wrap Standalone Delay | `w' = (w + 1) - (L & -[w + 1 == L])` | `i = w - D_int + o; r = i + (L & -[i < 0])` | `[+1, 0, -1, -2]` (newer +1, older -2) | `4 <= D_int <= L - 2` |
-| Backward-Wrap Transport Quad | `ring[wr] = sat_write(y_dc); wr' = (wr - 1) & mask` | `r = (wr + D_int + o) & mask` | `[-1, 0, +1, +2]` (newer -1, older +2) | `D_int in [5, cap - 2]` (`cap - 3` modulated) |
+| Backward-Wrap Transport Quad | `ring[wr] = sat_write(w_ring); wr' = (wr - 1) & mask` | `r = (wr + D_int + o) & mask` | `[-1, 0, +1, +2]` (newer -1, older +2) | `D_int in [5, cap - 2]` (`cap - 3` modulated) |
 
 For standalone delay lines with write cursor $0 \le w < L$, integer delay $4 \le d \le L - 2$, and tap offset $o \in \lbrace +1, 0, -1, -2 \rbrace$ yielding signed offset $i = w - d + o \in [-L, L)$:
 
 $$r = i + \big(L \mathbin{\mathrm{AND}} -[i < 0]\big), \qquad w' = (w + 1) - \big(L \mathbin{\mathrm{AND}} -[w + 1 = L]\big)$$
 
-In compact transport quads, the End-of-Frame write `ring[wr] = sat_write(y_dc)` executes strictly *before* decrementing `(wr - 1) & mask`, placing sample lag $k \ge 1$ at `(wr + k) & mask` (`mask = cap - 1`). Reading `(wr + D_int + o) & mask` inside `[5, cap - 3]` keeps every 4-tap Catmull-Rom load at least 4 samples behind the write cursor, preventing 4-frame micro-chunk collisions while unmodulated `D_int = cap - 2` forces zero fraction so tap `o = +2` carries zero weight.
+In compact transport quads, the End-of-Frame write `ring[wr] = sat_write(w_ring)` executes strictly *before* decrementing `(wr - 1) & mask`, placing sample lag $k \ge 1$ at `(wr + k) & mask` (`mask = cap - 1`). Reading `(wr + D_int + o) & mask` inside `[5, cap - 3]` keeps every 4-tap Catmull-Rom load at least 4 samples behind the write cursor, preventing 4-frame micro-chunk collisions while unmodulated `D_int = cap - 2` forces zero fraction so tap `o = +2` carries zero weight.
 
 #### 1.1.5 Integer-Plus-`Q0.32` Delay Pointer & Causal Reader Bounds
 
@@ -340,12 +349,12 @@ While a fade runs, its two endpoints stay frozen and newer accepted delay change
 
 `r[dsp.op-t.window.partition-of-unity]`
 
-Every Op-T `TransportQuad` executes one single Top-of-Frame 4-lane pipeline (`Catmull-Rom -> Diagonal Window w_k -> Unitary 4-Stage Schroeder`) continuously across all lanes without discrete mode selectors or conditional branching. Continuous parameterization spans static delays, chorus, TZF, passive `freeze_mix` overdub and `WE` RAM hold, dual- or quad-grain Hermite-Hann pitch/shimmer, and staggered barberpole sweeps seamlessly:
+Every Op-T `TransportQuad` executes one single Top-of-Frame 4-lane pipeline (`Catmull-Rom -> Diagonal Window w_k -> Fused SO(4) Paraunitary Schroeder Diffuser`) continuously across all lanes without discrete mode selectors or conditional branching. Continuous parameterization spans static delays, chorus, TZF, passive `freeze_mix` overdub and `WE` RAM hold, dual- or quad-grain Hermite-Hann pitch/shimmer, staggered barberpole sweeps, colorless paraunitary FIR FFM diffusion, and coupled dispersive spring diffusion seamlessly:
 
 ```mermaid
 flowchart LR
     Read["4-Lane Catmull-Rom Read (tau_min = 5.0)"] --> Fold["32-Bit Signed Tri Fold -> Hermite-Hann Diagonal w_k"]
-    Fold --> Sch["Unitary 4-Stage Schroeder Diffuser"]
+    Fold --> Sch["Fused SO(4) Paraunitary Schroeder Diffuser"]
     Sch --> Out["Pure-Wet Readout + Coercive Loop (freeze_mix & Host Lock Gated)"]
 ```
 
@@ -411,26 +420,55 @@ Here $B_2(t) = 0.5 t^2$ on $[0, 1)$, $B_2(t) = -t^2 + 3t - 1.5$ on $[1, 2)$, and
 
 ---
 
-## 3. Partitioned In-Buffer Schroeder All-Pass Diffusers
+## 3. Fused `SO(4)` Paraunitary Scattering & SoA Partitioned Schroeder All-Pass Diffusers
 
 ### 3.1 Memory Partitioning & Rate-Aware Capacity
 
 `r[dsp.op-t.diffuser.partition]`
 
-Per-lane tank diffusers execute as 4 parallel lanes before tap weighting and loop feedback write across Quads `0..P_Q` (1..4 quads, up to 16 partitioned per-lane Schroeder all-pass stages at Ultra, `|a_diff| <= 0.75`), while standalone all-pass diffusers use 8-length coprime reference cascades (§3.2) inside power-of-two or 64-byte-aligned segments with mask wrapping.
+Per-lane tank diffusers execute as a fused `SO(4)` paraunitary matrix all-pass operator $\mathbf{H}(z;\ \theta_{\mathrm{eff}}, \mathbf{a}, \mathbf{D})$ across Quads `0..P_Q` up to 16 stages at Ultra (`|a_diff| <= 0.75`, `scat_psi` in `[-pi, +pi]`) before tap weighting and loop write, while standalone diffusers use 8-length coprime reference cascades (§3.2).
 
-At effective VM rate $f_{s,\text{vm}}$, any lane with `allpass_delays[k] == 0` stays 0 and bypasses Schroeder diffusion cleanly (`v_read,k = r_k`) even when `schroeder_enable == 1`. Nonzero reference delays rescale via $D_{\text{ap},m}(f_{s,\text{vm}}) = \max(1, \mathrm{round}(D_{\text{ap},m}(48000) / \rho_{\text{vm}}))$ up to 16,384 samples ([router_and_crossbar_topology.md §9](router_and_crossbar_topology.md#9-continuous-time-zoh-rate-adaptation)); 223 samples at 48 kHz scale to 1,784 samples (3,584 B aligned `fp16`) at 384 kHz, while `allpass_g` tapers continuously by `(1 - mu_freeze)` during `TransportQuad` recirculation.
+Active `TransportQuad` diffusers store cold rings in lane-major Structure-of-Arrays layout `[lane * cap_per_lane + idx]` across `4 * cap_per_lane` 32-bit floats (`cap_per_lane` power-of-two `>= max_delay + 1` whenever nonzero delays exist, or 0 for 0 B cold ring RAM strictly when `allpass_delays == [0; 4]`).
 
-### 3.2 Reference-Length All-Pass Recurrence
+Under full hold (`mu_freeze >= 1.0 - 1.0e-6` or bit 2 `HOST_WRITE_LOCK`), execution bypasses `H(z)` cleanly (`v_read = r_win`); otherwise `H(z)` executes unconditionally purely from learned weights with zero discrete bypass flags.
+
+When active, any lane with zero `allpass_delays[k]` sets $A_k(z) = 1$ with zero cold ring accesses while surrounding Givens rotations run.
+
+Setting all four delays to 0 yields a lossless memoryless `SO(4)` rotation, preserving 0-ULP identity when $\theta_{\mathrm{eff}} = 0$.
+
+Nonzero reference delays rescale via $D_{\text{ap},m}(f_{s,\text{vm}}) = \max(1, \mathrm{round}(D_{\text{ap},m}(48000) / \rho_{\text{vm}}))$ up to 16,384 samples ([router_and_crossbar_topology.md §9](router_and_crossbar_topology.md#9-continuous-time-zoh-rate-adaptation)); 223 samples at 48 kHz scale to 1,784 samples at 384 kHz, while `allpass_g` and `scat_psi` taper continuously by `1 - mu_freeze`.
+
+During 4-frame causal micro-chunk stepping (`process_microchunk_4`), active execution when not in full hold (`!full_hold`) branches cleanly over three delay regimes matching 1-frame `step_vec4` at 0 ULP:
+
+| Active Delay Regime (`!full_hold`) | Execution & Ring Pointer Advance (`cap_per_lane` power of 2 or 0) |
+| :--- | :--- |
+| **`allpass_delays == [0; 4]` (`cap_per_lane == 0`)** | Apply `R_even(theta_eff)` then `R_odd(theta_eff)` across all 4 frames in registers with zero ring memory accesses and no `ap_wr` update, guarding `cap_per_lane > 0` before forming `mask = cap_per_lane - 1` |
+| **Nonzero `D_ap,k >= 4` (`cap_per_lane >= 8`)** | Execute 4-frame causal SoA `step_chunk4`: apply `R_even` via 4×4 SIMD transpose; per nonzero lane bind `r_idx = (ap_wr - D_k) & mask` and `write_pos = ap_wr`, load 16 B contiguously at `r_idx` if `r_idx + 4 <= cap_per_lane` else 2-piece wrap gather, step 4 recurrence frames, store 16 B contiguously at `write_pos` if `write_pos + 4 <= cap_per_lane` else 2-piece wrap store; apply `R_odd`, transpose back to frame-major, and advance `ap_wr' = (ap_wr + 4) & mask` |
+| **Any `1 <= D_ap,k < 4`** | Fallback to 4 sequential 1-frame `step_vec4` calls advancing `ap_wr' = (ap_wr + 1) & mask` per frame (0-ULP block-size invariant) |
+
+### 3.2 `SO(4)` Paraunitary Butterfly Algebra, Recurrence & Reverse-Time Adjoint
 
 `r[dsp.op-t.diffuser.recurrence]`
 
-The 48 kHz reference lengths `[19, 31, 47, 73, 103, 139, 179, 223]` are pairwise coprime; off-48 kHz rates keep the exact rounded lengths above instead of re-selecting nearby primes. Each line $m$ steps fixed converted delay $D_{\text{ap},m}$ and clamped coefficient $a_{\text{diff},m} \in [-0.75, +0.75]$:
+Using `algebraic_unit_rotor_f32` to evaluate $(c_s, s_s)$ at effective angle $\theta_{\mathrm{eff}} = (1 - \mu_{\mathrm{freeze}})\theta_{\mathrm{scat,base}}$, define orthogonal Givens generators $\mathbf{J}_{\mathrm{even}}(\mathbf{x}) = [-x_1,\ x_0,\ -x_3,\ x_2]^\top$ and $\mathbf{J}_{\mathrm{odd}}(\mathbf{y}) = [y_3,\ -y_2,\ y_1,\ -y_0]^\top$:
+
+$$\mathbf{x}_1 = \mathbf{R}_{\mathrm{even}}(\theta_{\mathrm{eff}})\ \mathbf{r}_{\mathrm{win}} = c_s \mathbf{r}_{\mathrm{win}} + s_s \mathbf{J}_{\mathrm{even}}(\mathbf{r}_{\mathrm{win}}), \qquad \mathbf{v}_{\mathrm{read}} = \mathbf{R}_{\mathrm{odd}}(\theta_{\mathrm{eff}})\ \mathbf{y}_1 = c_s \mathbf{y}_1 + s_s \mathbf{J}_{\mathrm{odd}}(\mathbf{y}_1)$$
+
+Product $\mathbf{Q}(\theta) = \mathbf{R}_{\mathrm{odd}}(\theta)\mathbf{R}_{\mathrm{even}}(\theta) \in SO(4)$ is the 4×4 orthogonal circulant matrix with first row $[c_s^2,\ -c_s s_s,\ s_s^2,\ c_s s_s]$ commuting with the 4×4 Householder reflection $\mathbf{H}_4(\mathbf{1})$, giving determinant $+1$ and unit spectral norm $\Vert \mathbf{H}(e^{j\omega}) \Vert_2 \equiv 1$ across all $a_k \in [-0.75, 0.75]$, $D_k \ge 0$, and $\theta \in [-\pi, \pi]$.
+
+It has period $\pi$ via $\mathbf{Q}(\theta + \pi) = \mathbf{Q}(\theta)$ with fundamental optimization domain $[-\pi/2, \pi/2]$, yields 0-ULP identity at $\theta = 0$, produces orthonormal $\pm 0.5$ Hadamard scattering at $\theta = \pi/4$, realizes a Schlecht–Dal Santo paraunitary FIR filter feedback matrix when `allpass_g == [0; 4]` with positive delays, and forms matrix-coupled dispersive chains when `allpass_g != 0` and $\theta \neq 0$.
+
+Between $\mathbf{x}_1$ and $\mathbf{y}_1$, the 48 kHz standalone reference lengths `[19, 31, 47, 73, 103, 139, 179, 223]` are pairwise coprime; off-48 kHz rates keep those exact rounded lengths. Each active lane $m$ with $D_{\text{ap},m} > 0$ steps converted delay $D_{\text{ap},m}$ and clamped coefficient $a_{\text{diff},m} \in [-0.75, +0.75]$ (tapered by `1 - mu_freeze` on active `TransportQuad`s):
 
 $$v_{\text{ap}, m}[n] = x_{\text{in}}[n] - a_{\text{diff}, m} u_{\text{ap}, m}[n - D_{\text{ap}, m}]$$
 $$y_{\text{ap}, m}[n] = a_{\text{diff}, m} v_{\text{ap}, m}[n] + u_{\text{ap}, m}[n - D_{\text{ap}, m}], \qquad u_{\text{ap}, m}[n] = v_{\text{ap}, m}[n]$$
 
-For fixed $a_{\text{diff}}$ and $D_{\text{ap}}$, $|H_{\text{ap}}(e^{i\omega})|^2 \equiv 1$ across all frequencies; for bounded $|x_{\text{in}}[n]| \le A$ and $|a_{\text{diff}}| \le 0.75$, impulse peak gain stays bounded by $1 + 2|a_{\text{diff}}| \le 2.5A$ and internal state by $\max(V_0, 4A)$.
+For reverse-time BPTT given $\mathbf{g}_{\mathrm{out}} = \nabla_{\mathbf{v}_{\mathrm{read}}}\mathcal{L}$, exact transposes use $\mathbf{R}_{\bullet}(-\theta_{\mathrm{eff}})$ with `(c_s, -s_s)` and contribute into both $\theta_{\mathrm{scat,base}}$ and the slot-16 $\mu_{\mathrm{freeze}}$ pullback whenever the diffuser is active:
+
+$$\mathbf{g}_{\mathbf{y}_1} = \mathbf{R}_{\mathrm{odd}}(-\theta_{\mathrm{eff}})\ \mathbf{g}_{\mathrm{out}}, \qquad \mathbf{g}_{\mathbf{r}_{\mathrm{win}}} = \mathbf{R}_{\mathrm{even}}(-\theta_{\mathrm{eff}})\ \mathbf{g}_{\mathbf{x}_1}$$
+$$\frac{\partial\mathcal{L}}{\partial\theta_{\mathrm{eff}}} = \mathbf{g}_{\mathrm{out}}^\top \mathbf{J}_{\mathrm{odd}}(\mathbf{v}_{\mathrm{read}}) + \mathbf{g}_{\mathbf{x}_1}^\top \mathbf{J}_{\mathrm{even}}(\mathbf{x}_1), \qquad \frac{\partial\mathcal{L}}{\partial\theta_{\mathrm{scat,base}}} \mathrel{+}= (1 - \mu_{\mathrm{freeze}})\frac{\partial\mathcal{L}}{\partial\theta_{\mathrm{eff}}}, \qquad \frac{\partial\mathcal{L}}{\partial\mu_{\mathrm{freeze}}} \mathrel{+}= -\theta_{\mathrm{scat,base}}\frac{\partial\mathcal{L}}{\partial\theta_{\mathrm{eff}}}$$
+
+Here $\mathbf{g}_{\mathbf{x}_1}$ and $\partial\mathcal{L}/\partial a_{\mathrm{diff},m}$ propagate backward through each lane's Schroeder all-pass recurrence. For fixed $a_{\text{diff}}$ and $D_{\text{ap}}$, $|H_{\text{ap}}(e^{i\omega})|^2 \equiv 1$ across all frequencies; for bounded $|x_{\text{in}}[n]| \le A$ and $|a_{\text{diff}}| \le 0.75$, impulse peak gain stays bounded by $1 + 2|a_{\text{diff}}| \le 2.5A$ and internal state by $\max(V_0, 4A)$.
 
 ---
 

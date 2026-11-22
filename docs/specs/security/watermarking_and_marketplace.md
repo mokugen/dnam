@@ -57,11 +57,13 @@ For each tier t in 0..4 owning range [start_t .. end_t):
     s[start_t + bit_idx] = +1.0 if ((digest_t[bit_idx >> 3] >> (bit_idx & 7)) & 1) == 1 else -1.0
 ```
 
-Encoders propagate signs via IEEE-754 sign-bit XOR (^ 0x8000 on nonzero fp16 magnitudes and negation on nonzero f32, leaving +0.0 untouched) across four wire regions. Because odd-symmetric PolyADAA1 satisfies $g(-x) = -g(x)$ with $h_{\text{eq}} = +0.0$, `adaa_even` satisfies $g_e(-x) = +g_e(x)$, cyclic `glu_mix` cancels `(s[l] * s[(l+1)%4])`, and Selective-Duhem 1D ParaLRU commutes with polarity conjugation when `rect_sign` flips, forward audio parity stays algebraically 0.000000 ULP across Arena 0..3 and commutes losslessly with container tier stripping:
+Encoders propagate signs across four wire regions via IEEE-754 sign-bit XOR (`^ 0x8000` on nonzero `fp16` magnitudes and negation on nonzero `f32`, leaving +0.0 untouched), paired with unconditional bit-15 XOR (`^ 0x8000`, including `0x0000 <-> 0x8000`) on `wavefolder_mix_fp16[l]` whenever `s[4*g + l] < 0.0` for `rect_sign`.
+
+Because odd-symmetric PolyADAA1 satisfies g(-x) = -g(x) with zero equilibrium +0.0, even channels preserve polarity, cyclic `glu_mix` cancels pair signs, Selective-Duhem ParaLRU commutes when `rect_sign` flips, and Block 0 PHS damping $k_{\mathrm{nl}}\min(s_1^2, E_{\max})$ is even-symmetric (`svf_k_nl_fp16` left untouched), forward audio parity stays 0.000000 ULP across Arena 0..3 and commutes losslessly with tier stripping:
 
 | SONA Wire Target | Per-Arena Quad / Tile Span | Sign-Flip Transformation |
 | :--- | :--- | :--- |
-| `CoreQuad` Block | 4 / 2 / 2 / 2 quads in Arena 0..3 | Multiply `in_mid_weight_fp16[l]`, `in_side_weight_fp16[l]`, `lru_bias_drive_fp16[l]`, and `rect_sign_fp16[l]` by `s[4*g + l]`, and multiply `glu_mix_fp16[l]` by `s[4*g + l] * s[4*g + ((l + 1) & 3)]` |
+| `CoreQuad` Block | 4 / 2 / 2 / 2 quads in Arena 0..3 | Multiply `in_mid_weight_fp16[l]`, `in_side_weight_fp16[l]`, and `lru_bias_drive_fp16[l]` by `s[4*g + l]` (nonzero sign-bit XOR); unconditionally XOR bit 15 (`^ 0x8000`, including `0x0000 <-> 0x8000`) on `wavefolder_mix_fp16[l]` whenever `s[4*g + l] < 0.0` (`rect_sign`); multiply `glu_mix_fp16[l]` by `s[4*g + l] * s[4*g + ((l + 1) & 3)]`; leave `svf_k_nl_fp16[l]` untouched |
 | Inter-Block Tile Pair | 3 / 10 / 10 / 12 tiles in Arena 0..3 | Multiply `w_odd_4x4[col][row]` by `s_dst * s_src`; multiply `w_even_4x4_fp16` and `w_lru_4x4_fp16` by `s_dst` |
 | Crossbar Coupling Weights | Arena 0 (quads 0..4, lanes 0..16) and Arena 1..3 (quads 0..6 / 0..8 / 0..10, lanes 0..24 / 0..32 / 0..40) | Multiply Lite `LinearReadout` `stage_latent_mods_fp16[80..96]` (`op_p_to_core`), `w_ro_fp16[192..208]` (`phasor_to_core`), and SONA Crossbar Coupling matrices by `s[4*g + l]` |
 | `LinearReadout` Odd Linear Readout | 16 / 24 / 32 / 40 lanes in Arena 0..3 | Multiply terms `[0, 1, 6, 7]` of each 12-term lane row in Lite `w_ro_fp16[0..192]` and Full/Pro/Ultra `w_ro_and_mods_fp16` by `s[l]` |

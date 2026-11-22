@@ -19,7 +19,7 @@ adrs:
 This specification defines Op-N (Nonlinear and Parallel State-Space) for Dynamic Neural Audio Modeler (DNAM) SONA v3.0 ([sona_architecture.md](../architecture/sona_architecture.md), [REQ-1.1, REQ-6.2](../../requirements/system_goals_and_requirements.md), [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)), covering four interlocking primitives:
 
 1. The 4-block Matryoshka SONA core across the four tier profiles with lower-triangular 4×4 inter-block mixing and 0-ULP parity across 8-lane and interleaved 4-lane SIMD execution.
-2. Decoupled 1-D scalar `ParaLRU` with exact in-SRAM forward tiles and $O(\log_2 N)$ affine inclusive reverse Blelloch suffix scans across 256-sample GPU tiles.
+2. Decoupled 1-D `ParaLRU` plus Block 0 linearly-implicit PHS and Blocks 1..3 linear `TPT-SVF` with 256-sample reverse Blelloch suffix scans.
 3. Pure `f32` divided-difference `PolyADAA1` and cubic $C^2$ wavefolder saturation with batched 2-step Newton rail-crossing correction and zero-DC equilibrium.
 4. Smooth raised-cosine ZOH & Fourier staircase quantization (`Op-N[Pre]`, Family 5) and `Op-N[Ctrl]` control-plane operators.
 
@@ -46,7 +46,7 @@ To guarantee 0.000000 ULP parity across same-FMA-class CPU backends (and across 
 
 At every recursive state write across `TPT-SVF`, `ParaLRU`, `Op-P` filters, Kautz banks, and `Op-T` diffusers, recursive state subnormal flushing clears IEEE-754 subnormals (`(bits & 0x7F80_0000) == 0`) via `bits & 0x8000_0000`, while zero-equilibrium nonlinear outputs emit canonical +0.0 (`0x0000_0000`).
 
-For division-free Newton-Raphson reciprocals (2-step, 3-step, >= 1.0 fast path, and batched 4-pair evaluation), inputs clamp at $d_{\text{safe}} = \max(d, 10^{-6})$ except when $d \ge 1.0$ holds structurally.
+For division-free Newton-Raphson reciprocals (`rcp_pos_nr2`, 3-step, >= 1.0 fast path `rcp_ge1_nr2`, and batched 4-pair evaluation), inputs clamp at $d_{\text{safe}} = \max(d, 10^{-6})$ except when $d \ge 1.0$ holds structurally under `rcp_ge1_nr2`.
 
 Letting `bits(x)` denote the 32-bit unsigned IEEE-754 bit pattern of `x`, seeding `y_0` from `0x7EF3_11C3 - bits(d_safe)` (`IEEE754_F32_RCP_SEED`) and running two FMA steps yields relative error below $3.5 \times 10^{-6}$, while three steps yield sub-1-ULP accuracy:
 
@@ -292,7 +292,9 @@ With decoupled 1-D `ParaLRU` recurrence $v_i[n] = \alpha_{\text{rel},i} v_i[n-1]
 
 `r[dsp.op-n.core.matryoshka-blocks]`
 
-SONA v3.0 models nonlinear preamps, magnetic hysteresis, stereo-linked bus compression, crossovers, and sweeps via a 4-block Matryoshka state-space core sorted across 10 logical 4-lane CoreQuads `[(0,0), (1,0), (2,0), (3,0), (0,1), (1,1), (0,2), (2,1), (0,3), (1,2)]` and 35 causal lower-triangular inter-block mixing tiles. Each CoreQuad chains M/S input coupling (`in_mid_weight_fp16`, `in_side_weight_fp16`), passive 2×2 TPT-SVF, Selective-Duhem stereo-linked 1-D ParaLRU, pure f32 PolyADAA1 plus C² wavefolder, and bounded cross-lane GLU across the four tier profiles:
+SONA v3.0 models nonlinear preamps, resonant diode filters, magnetic hysteresis, stereo-linked bus compression, crossovers, and sweeps via a 4-block Matryoshka state-space core sorted across 10 logical 4-lane CoreQuads `[(0,0), (1,0), (2,0), (3,0), (0,1), (1,1), (0,2), (2,1), (0,3), (1,2)]` and 35 causal lower-triangular inter-block mixing tiles.
+
+Each CoreQuad chains M/S input coupling (`in_mid_weight_fp16`, `in_side_weight_fp16`), passive 2×2 TPT-SVF (linearly-implicit PHS diode-bandpass saturation `svf_k_nl` on Block 0 and linear ZDF TPT-SVF on Blocks 1..3), Selective-Duhem stereo-linked ParaLRU, pure f32 PolyADAA1 plus C² wavefolder (`wavefolder_mix_fp16` with bit-15 `rect_sign`), and bounded GLU across the four tier profiles:
 
 | Tier Profile | `CoreQuad`s & Lanes | Inter-Block Tiles | Core Rate | `TPT-SVF` Quads / Modes | `ModalConvolver` (FIR / Kautz) | `TransportQuad`s (`Lines`) | Hot Working Budget |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -322,11 +324,15 @@ Because $J_i[n] \in [(1 - \rho_i[n])\alpha_{\text{rel},i}, \alpha_{\text{rel},i}
 
 WebGPU training runs joint 4-thread `(L, R)` in-SRAM stepping (<= 15.0 KiB, [webgpu_and_varpro_solver.md](../training/webgpu_and_varpro_solver.md)) so stereo linking $\lambda_i$ requires zero cross-workgroup sync and matches same-FMA-class CPU 4-lane execution at 0-ULP parity (<= 1.5 ULP/step across FMA vs non-FMA CPU/GPU targets).
 
-Each CoreQuad applies audio-rate stereo linking $v_{\mathrm{eff},c,i} = v_{c,i} + \lambda_i(v_{\mathrm{mid},i} - v_{c,i})$, where $v_{\mathrm{mid},i} = 0.5(v_{L,i} + v_{R,i})$ , right after updating `(v_L, v_R)`. Downstream `sag_gain = max(0.05, (1.0).fms(sag_depth, v_eff))` and `lru_bias_eff` consume `v_eff`, preserving 0° image drift at $\lambda_i = 1$ . Effective bias `b_lru_eff` (`b_lru_base = base_lru_bias_drive`) drives PolyADAA1 via `r_curr = ((tone_in * d_adaa_eff) * sag_gain).fma(b_lru_eff, v_eff)`, where $s_{\mathrm{rect}}$ denotes `rect_sign`:
+Each CoreQuad applies audio-rate stereo linking $v_{\mathrm{eff},c,i} = v_{c,i} + \lambda_i(v_{\mathrm{mid},i} - v_{c,i})$, where $v_{\mathrm{mid},i} = 0.5(v_{L,i} + v_{R,i})$ , right after updating `(v_L, v_R)`. Downstream sag gain `max(0.05, 1 - sag_depth * v_eff)` and bias `lru_bias_eff` consume `v_eff`, preserving 0° image drift at $\lambda_i = 1$ .
+
+Effective bias `b_lru_eff` (`b_lru_base = base_lru_bias_drive`) drives PolyADAA1 via `r_curr = ((tone_in * d_adaa_eff) * sag_gain).fma(b_lru_eff, v_eff)`, where $s_{\mathrm{rect}}$ denotes `rect_sign` decoded from bit 15 (`0x8000`) of `wavefolder_mix_fp16`:
 
 $$b_{\mathrm{lru,eff}} = \mathrm{clamp}\big(b_{\mathrm{lru,base}} + s_{\mathrm{rect}} \cdot \theta_{\mathrm{lru}}, -16.0, +16.0\big)$$
 
-Mechanism A2 watermarking flips `in_mid_weight`, `in_side_weight`, `b_lru_base`, and `rect_sign` by lane sign $s_l \in \lbrace -1, +1 \rbrace$ (keeping $|2 g \cdot \mathrm{BP}_l|$ and $\rho_l$ bit-identical and $v_l$ invariant at 0 ULP across $\eta \in [0, 1]$ ) and flips `glu_mix[l]` by $s_l \cdot s_{(l+1)\bmod 4}$, preserving 0-ULP forward audio equivalence across static and modulated states ([parametric_control_bus.md §3.1](parametric_control_bus.md#31-operator-parameter-dispatch-matrix--sensitivity-laws)).
+Mechanism A2 watermarking flips `in_mid_weight`, `in_side_weight`, and `b_lru_base` by lane sign $s_l \in \lbrace -1, +1 \rbrace$ and unconditionally XORs bit 15 (`^ 0x8000`, including 0x0000 <-> 0x8000) of `wavefolder_mix_fp16[l]` for `rect_sign` whenever $s_l = -1$.
+
+This keeps $|2 g \cdot \mathrm{BP}_l|$, $\rho_l$, and Block 0 PHS damping $k_{\mathrm{nl}} \min(s_{1,l}^2, E_{\max})$ even-symmetric (`svf_k_nl_fp16` untouched), preserves $v_l$ at 0 ULP across $\eta \in [0, 1]$, and flips `glu_mix[l]` by $s_l \cdot s_{(l+1)\bmod 4}$ across static and modulated states ([parametric_control_bus.md §3.1](parametric_control_bus.md#31-operator-parameter-dispatch-matrix--sensitivity-laws)).
 
 For backward gradients inside the reverse-time adjoint scan tile, recomputing `(v_L, v_R)` from checkpoints gives linear reverse-time scan elements `(J_i, J_i * adj_v[i])` over $N + 1$ inclusive suffix slots starting from sentinel `suffix[N] = (1.0, 0.0)`:
 
@@ -339,6 +345,7 @@ Because stereo linking transforms `(v_L, v_R) -> (v_eff,L, v_eff,R)` outside the
 $$\bar{v}_{c} \mathrel{+}= \big(1 - 0.5\lambda\big)\bar{v}_{\mathrm{eff},c} + 0.5\lambda\bar{v}_{\mathrm{eff},\bar{c}}, \qquad \lambda_i = \bar{v}_i + \mathtt{suffix}[i+1].a \cdot \bar{v}_{\text{out}} + \mathtt{suffix}[i+1].b$$
 $$\nabla_{\rho_i} L = \lambda_i \big(\phi_{\eta,i}(z_i) - \eta_i d_i\big), \qquad \nabla_{\mathrm{BP}_i} L \mathrel{+}= \nabla_{\rho_i} L \cdot \mathbf{1}_{\rho \in (0, 1)} \cdot 2 g_i \gamma_{\text{duhem},i} \mathrm{sign}(\mathrm{BP}_i)$$
 $$\nabla_{\alpha_{\text{rel}}} L = \sum_{i=0}^{N-1} \lambda_i v_{i-1}\Big((1 - \eta_i \rho_i) - \rho_i \kappa_i (1 - \eta_i)\phi_{\eta,i}'(z_i)\Big), \qquad \nabla_{\gamma_{\text{duhem}}} L = \sum_{i=0}^{N-1} \nabla_{\rho_i} L \cdot \mathbf{1}_{\rho \in (0, 1)} \cdot |2 g_i \mathrm{BP}_i|$$
+$$\nabla_{g} L \mathrel{+}= \sum_{i=0}^{N-1} \nabla_{\rho_i} L \cdot \mathbf{1}_{\rho \in (0, 1)} \cdot 2 \gamma_{\text{duhem},i} \lvert \mathrm{BP}_i \rvert$$
 
 ```text
 // Inclusive Reverse-Time Adjoint Suffix Scan Kernel (N + 1 Slots per Lane, Joint 4-Thread L/R Workgroup)
@@ -363,21 +370,47 @@ The ratio $(1 - a_{\text{atk}}^{\rho_{\text{sr}}}) / (1 - a_{\text{atk}})$ appro
 
 ---
 
-### 4.1 Passive 2×2 ZDF `TPT-SVF` Four-Filter Tone Basis & Associative Scans
+### 4.1 Passive & Block 0 Port-Hamiltonian 2×2 ZDF `TPT-SVF` Four-Filter Tone Basis & Associative Scans
 
 `r[dsp.op-n.core.tpt-tone-basis]`
 
-Each 2×2 ZDF `TPT-SVF` mode clamps $g \in [10^{-5}, 64.0]$ and $k \in [0.0, 8.0]$, where $f_c = (f_s/\pi)\arctan(g)$, evaluates division-free $a_1 = (1 + g(g + k))^{-1}$ via a 2-step Newton reciprocal for arguments $\ge 1$ (within 1 ULP of 3-step refinement), $a_2 = g a_1$, and $a_3 = g a_2$, and updates subnormal-flushed states $s_1, s_2$:
+Each 2×2 ZDF `TPT-SVF` mode clamps $g \in [10^{-5}, 64.0]$ with cutoff relation $f_c = (f_s/\pi)\arctan(g)$ and effective linear damping $k \in [0.0, 8.0]$ from clamped `svf_k_eff`. Block 0 `CoreQuad`s `{0, 4, 6, 8}` (count 1, 2, 3, or 4 across Lite..Ultra) apply rate-invariant nonlinear diode-bandpass damping $k_{\mathrm{nl}} \in [0.0, 16.0]$ added on top of $k$ without re-clamping $k_{\mathrm{eff}}[n]$ to 8.0, whereas Blocks 1..3 `{1, 2, 3, 5, 7, 9}` enforce zero `svf_k_nl_fp16` (`0x0000` fail-closed on wire).
 
-$$v_3 = u - s_2, \qquad v_1 = a_1 s_1 + a_2 v_3, \qquad v_2 = s_2 + a_2 s_1 + a_3 v_3$$
-$$\mathrm{bp} = v_1, \qquad \mathrm{lp} = v_2, \qquad \mathrm{hp} = u - k v_1 - v_2, \qquad \mathrm{ap} = u - 2 k v_1$$
+With compile-time derived energy bound `SVF_PHS_E_MAX` equal to $E_{\max} = 2^6 = 64.0$ and $a_1[n]$ evaluated from $D[n]$ via `rcp_ge1_nr2` (§1.2):
+
+$$E[n] = \min\big(s_1[n-1]^2,\ E_{\max}\big), \qquad k_{\mathrm{eff}}[n] = k + k_{\mathrm{nl}} \cdot E[n] \in [0.0,\ 1032.0]$$
+$$D[n] = 1 + g\big(g + k_{\mathrm{eff}}[n]\big) \in [1.0,\ 70145.0], \qquad a_2[n] = g a_1[n], \qquad a_3[n] = g a_2[n]$$
+
+With $k_{\mathrm{nl}} = 0$ (all Blocks 1..3 quads, and linear Block 0 quads), $k_{\mathrm{eff}}[n] \equiv k$ is sample-invariant: `(a1, a2, a3)` hoist per 3 kHz control tick on CPU via `rcp_ge1_nr2` (§1.2) and execute via $O(\log_2 N)$ exclusive 2×2 Blelloch scans on GPU.
+
+Across Block 0 using the frozen-state linearly-implicit Port-Hamiltonian trapezoidal step, each lane updates subnormal-flushed states $s_1, s_2$ without Newton iterations:
+
+$$v_3 = u - s_2, \qquad v_1 = a_1[n] s_1 + a_2[n] v_3, \qquad v_2 = s_2 + a_2[n] s_1 + a_3[n] v_3$$
+$$\mathrm{bp} = v_1, \qquad \mathrm{lp} = v_2, \qquad \mathrm{hp} = u - k_{\mathrm{eff}}[n] v_1 - v_2, \qquad \mathrm{ap} = u - 2 k_{\mathrm{eff}}[n] v_1$$
 $$s_1' = \mathrm{flush}(2 v_1 - s_1), \qquad s_2' = \mathrm{flush}(2 v_2 - s_2)$$
 
-Linear tap mix `y_tone` (`binary16` weights in [-16.0, 16.0]) evaluates left-to-right chained vector FMA `((((lp * w_lp).fma(bp, w_bp)).fma(hp, w_hp)).fma(ap, w_ap)).fma(u, w_dir)` where receiver-first `acc.fma(a, b) = fma(a, b, acc)`, lowering to hardware IEEE-754 FMA on FMA SIMD backends and `acc + (a * b)` on non-FMA scalar, WebAssembly SIMD128, and GPU compute targets (`<= 1.5` ULP/step per [sona_architecture.md §1.5.3](../architecture/sona_architecture.md#153-single-library-per-architecture-runtime-simd-dispatch--0000000-ulp-parity)) to discover arbitrary crossovers, tone stacks, and phasers solely via data (`REQ-1.9`). In matrix form $\mathbf{s}_{n+1} = \mathbf{A}_{\text{tpt}}\mathbf{s}_n + \mathbf{b}_{\text{tpt}} u_n$:
+At zero input $u = 0$, the discrete state energy satisfies $(s_1[n]^2 + s_2[n]^2) - (s_1[n-1]^2 + s_2[n-1]^2) = -4 g k_{\mathrm{eff}}[n] v_1[n]^2 \le 0$ for all $g > 0, k \ge 0, k_{\mathrm{nl}} \ge 0$. This guarantees unconditional BIBO stability, +0.0 Zero-DC equilibrium, and slow algebraic transient decay without autonomous limit cycles.
 
-$$(\mathbf{A}_{\text{tpt}})_{11} = 2 a_1 - 1, \quad (\mathbf{A}_{\text{tpt}})_{12} = -2 a_2, \quad (\mathbf{A}_{\text{tpt}})_{21} = 2 a_2, \quad (\mathbf{A}_{\text{tpt}})_{22} = 1 - 2 a_3, \quad b_1 = 2 a_2, \quad b_2 = 2 a_3, \quad \Vert \mathbf{A}_{\text{tpt}} \Vert_2 \le 1$$
+Linear tap mix `y_tone` (`binary16` weights in [-16.0, 16.0]) evaluates left-to-right chained vector FMA `((((lp * w_lp).fma(bp, w_bp)).fma(hp, w_hp)).fma(ap, w_ap)).fma(u, w_dir)`, lowering to hardware IEEE-754 FMA or non-FMA multiply-add (`<= 1.5` ULP/step per [sona_architecture.md §1.5.3](../architecture/sona_architecture.md#153-single-library-per-architecture-runtime-simd-dispatch--0000000-ulp-parity)) to discover arbitrary crossovers and diode-clamped tone stacks via data (`REQ-1.9`).
 
-Forward and backward WebGPU scans compose via $(\mathbf{A}_2, \mathbf{b}_2) \circ (\mathbf{A}_1, \mathbf{b}_1) = (\mathbf{A}_2 \mathbf{A}_1, \mathbf{A}_2 \mathbf{b}_1 + \mathbf{b}_2)$ and reverse transpose $(\mathbf{A}_1^\top, \mathbf{g}_1) \circ_{\text{rev}} (\mathbf{A}_2^\top, \mathbf{g}_2) = (\mathbf{A}_1^\top \mathbf{A}_2^\top, \mathbf{A}_1^\top \mathbf{g}_2 + \mathbf{g}_1)$.
+In matrix form on Blocks 1..3 where $\mathbf{s}_{n+1} = \mathbf{A}_{\text{tpt}}\mathbf{s}_n + \mathbf{b}_{\text{tpt}} u_n$, forward scans compose via $(\mathbf{A}_2, \mathbf{b}_2) \circ (\mathbf{A}_1, \mathbf{b}_1) = (\mathbf{A}_2 \mathbf{A}_1, \mathbf{A}_2 \mathbf{b}_1 + \mathbf{b}_2)$ with spectral norm bound $\Vert \mathbf{A}_{\text{tpt}} \Vert_2 \le 1$, where $(\mathbf{A}_{\text{tpt}})_{11} = 2a_1 - 1$, $(\mathbf{A}_{\text{tpt}})_{12} = -2a_2$, $(\mathbf{A}_{\text{tpt}})_{21} = 2a_2$, $(\mathbf{A}_{\text{tpt}})_{22} = 1 - 2a_3$, $b_1 = 2a_2$, and $b_2 = 2a_3$.
+
+Across all four blocks including Block 0 `svf_k_nl > 0`, discrete state sensitivity along a saved trajectory $(s_1[n-1], s_2[n-1], v_1[n])$ obeys an exact linear reverse-time $O(\log_2 N)$ parallel suffix scan with independent stereo transition matrices $\mathbf{T}_c[n] = \mathbf{J}_c[n]^\top$. Setting $\gamma[n] = (s_1[n-1]^2 < E_{\max}) \mathbin{?} 2 k_{\mathrm{nl}} s_1[n-1] : 0.0$ per channel defines Jacobian entries:
+
+$$J_{11} = (2a_1 - 1) - 2 a_2 v_1 \gamma, \qquad J_{12} = -2 a_2, \qquad J_{21} = 2 a_2 - 2 a_3 v_1 \gamma, \qquad J_{22} = 1 - 2 a_3$$
+$$\bar{v}_1 = \bar{y}_{\mathrm{bp,total}} - k_{\mathrm{eff}} \bar{y}_{\mathrm{hp}} - 2 k_{\mathrm{eff}} \bar{y}_{\mathrm{ap}}, \qquad \bar{v}_2 = \bar{y}_{\mathrm{lp}} - \bar{y}_{\mathrm{hp}}, \qquad \bar{k}_{\mathrm{eff,loc}} = (-\bar{y}_{\mathrm{hp}} - 2 \bar{y}_{\mathrm{ap}}) v_1 - v_1 (a_2 \bar{v}_1 + a_3 \bar{v}_2)$$
+$$g_0 = a_1 \bar{v}_1 + a_2 \bar{v}_2 + \bar{k}_{\mathrm{eff,loc}} \gamma, \qquad g_1 = -a_2 \bar{v}_1 + (1 - a_3) \bar{v}_2$$
+
+Reverse-time elements $(\mathbf{T}[n], \mathbf{g}[n])$ compose identically via $(\mathbf{T}_1, \mathbf{g}_1) \circ_{\text{rev}} (\mathbf{T}_2, \mathbf{g}_2) = (\mathbf{T}_1 \mathbf{T}_2, \mathbf{T}_1 \mathbf{g}_2 + \mathbf{g}_1)$ over $N + 1$ inclusive suffix slots anchored at $\mathtt{suffix}[N] = (\mathbf{I}_2, \mathbf{0})$ with $\mathtt{suffix}[n] = (\mathbf{T}[n], \mathbf{g}[n]) \circ_{\text{rev}} \mathtt{suffix}[n+1]$.
+
+Combined with incoming boundary adjoint $\boldsymbol{\psi}_{\text{out}}$ from tile + 1, per-frame sensitivity $\boldsymbol{\psi}[n] = (\psi_0[n], \psi_1[n])^\top = \mathtt{suffix}[n+1].\mathbf{T}\cdot \boldsymbol{\psi}_{\text{out}} + \mathtt{suffix}[n+1].\mathbf{g}$ and outgoing initial-state handoff $\boldsymbol{\psi}_{\text{init}} = \mathtt{suffix}[0].\mathbf{T}\cdot \boldsymbol{\psi}_{\text{out}} + \mathtt{suffix}[0].\mathbf{g}$ define $\tilde{v}_1 = \bar{v}_1 + 2\psi_0$ and $\tilde{v}_2 = \bar{v}_2 + 2\psi_1$.
+
+These give exact pullbacks $\bar{k}_{\mathrm{eff}}[n] = \bar{k}_{\mathrm{eff,loc}}[n] - 2 v_1 (a_2 \psi_0 + a_3 \psi_1)$ plus complete $\nabla_u\mathcal{L}[n]$ and $\nabla_g\mathcal{L}$:
+
+$$\nabla_k\mathcal{L} \mathrel{+}= \bar{k}_{\mathrm{eff}}[n], \qquad \nabla_{k_{\mathrm{nl}}}\mathcal{L} \mathrel{+}= \bar{k}_{\mathrm{eff}}[n]\ E[n], \qquad \nabla_u\mathcal{L}[n] \mathrel{+}= \bar{y}_{\mathrm{hp}} + \bar{y}_{\mathrm{ap}} + \bar{y}_{\mathrm{dir}} + a_2\tilde{v}_1 + a_3\tilde{v}_2$$
+$$\nabla_g\mathcal{L}\Big|_{\mathrm{tpt}} \mathrel{+}= \tilde{v}_2 v_1 + (a_1 \tilde{v}_1 + a_2 \tilde{v}_2)\big(v_3 - (2g + k_{\mathrm{eff}}[n])v_1\big)$$
+
+Because `a1`, `a2`, and `a3` vary per frame and stereo channel under Block 0 `svf_k_nl > 0`, reverse tiles evaluate this per-frame per-channel $\nabla_g\mathcal{L}|_{\mathrm{tpt}}$ directly alongside the Selective-Duhem flux-gate term ahead of workgroup reduction.
 
 ---
 
