@@ -17,8 +17,9 @@ use crate::gpu::abi::{
 use crate::runner::{AdjointScanInput, TrainRunner, pack_core_quad_params};
 
 use super::super::model::cascade::{
-    CascadeCrossbarSpec, CausalCascadeOutput, run_causal_core_cascade_with_crossbar,
-    sanitize_unit_f64,
+    CascadeCrossbarSpec, CausalCascadeOutput, downsample_lane_2x_adjoint_f64,
+    downsample_lane_2x_f64, run_causal_core_cascade_with_crossbar, sanitize_unit_f64,
+    upsample_lane_2x_adjoint_f64, upsample_stereo_2x_f64,
 };
 use super::super::model::{NUM_FIR_TAPS_ULTRA, SonaModelF64};
 use super::adjoints::{eval_kautz_modal_channel_and_adjoint, eval_ro_pole_hp_and_adjoint};
@@ -26,7 +27,10 @@ use super::causal_loop::{
     CausalLoopBuffers, assemble_causal_loop_adjoint, eval_causal_loop_forward,
     is_op_t_crossbar_coupled,
 };
-use super::crossbar::{CrossbarForwardTrace, assemble_crossbar_adjoint, eval_crossbar_forward};
+use super::crossbar::{
+    CrossbarForwardTrace, assemble_crossbar_adjoint, eval_crossbar_forward,
+    eval_crossbar_forward_os2x,
+};
 use super::op_n_pre::eval_op_n_pre_and_adjoint;
 use super::op_t_quad::{OpTQuadAdjointSlices, eval_op_t_bank_stereo_and_adjoint};
 use super::sensory::eval_sensory_quad_and_adjoint;
@@ -40,13 +44,16 @@ pub(super) use core_adj::Pass2FullGrads as Pass2ParamGrads;
 
 /// Forward intermediates cached during Pass-2 evaluation for exact reverse-time BPTT.
 pub(super) struct Pass2EvalBuffers {
+    pub os2x: bool,
     pub u_sense_l: Vec<f64>,
     pub u_sense_r: Vec<f64>,
     pub cb_trace: CrossbarForwardTrace,
     pub ux_l: Vec<f64>,
     pub ux_r: Vec<f64>,
-    pub ro_hp_l: Vec<f64>,
-    pub ro_hp_r: Vec<f64>,
+    pub core_ux_l: Vec<f64>,
+    pub core_ux_r: Vec<f64>,
+    pub core_ro_hp_l: Vec<f64>,
+    pub core_ro_hp_r: Vec<f64>,
     pub onset_pre_l: Vec<f64>,
     pub onset_pre_r: Vec<f64>,
     pub x_tank_l: Vec<f64>,
@@ -95,13 +102,16 @@ pub(super) fn eval_model_pass2_audio(
             cb_add_r: Vec::new(),
         };
         return Ok(Pass2EvalBuffers {
+            os2x: false,
             u_sense_l: Vec::new(),
             u_sense_r: Vec::new(),
             cb_trace: cb_dummy,
             ux_l: Vec::new(),
             ux_r: Vec::new(),
-            ro_hp_l: Vec::new(),
-            ro_hp_r: Vec::new(),
+            core_ux_l: Vec::new(),
+            core_ux_r: Vec::new(),
+            core_ro_hp_l: Vec::new(),
+            core_ro_hp_r: Vec::new(),
             onset_pre_l: Vec::new(),
             onset_pre_r: Vec::new(),
             x_tank_l: Vec::new(),
@@ -120,8 +130,12 @@ pub(super) fn eval_model_pass2_audio(
     let (u_sense_l, u_sense_r, _) =
         eval_sensory_quad_and_adjoint(model, &in_l[..n], &in_r[..n], None, None);
     let include_stereo_phase = q_count > 4;
-    let cb_trace =
-        eval_crossbar_forward(model, &u_sense_l, &u_sense_r, q_count, include_stereo_phase);
+    let os2x = model.oversample_upper_tiers_2x && q_count > 4;
+    let cb_trace = if os2x {
+        eval_crossbar_forward_os2x(model, &u_sense_l, &u_sense_r, q_count, include_stereo_phase)
+    } else {
+        eval_crossbar_forward(model, &u_sense_l, &u_sense_r, q_count, include_stereo_phase)
+    };
 
     let (ux_l, _) = eval_op_n_pre_and_adjoint(
         &u_sense_l,
@@ -142,9 +156,24 @@ pub(super) fn eval_model_pass2_audio(
         None,
     );
 
-    let rho_core = 48_000.0 / model.sample_rate_hz.max(8_000.0);
-    let (ro_hp_l, _) = eval_ro_pole_hp_and_adjoint(&ux_l, model.ro_pole_48k, rho_core, None, None);
-    let (ro_hp_r, _) = eval_ro_pole_hp_and_adjoint(&ux_r, model.ro_pole_48k, rho_core, None, None);
+    let (core_ux_l, core_ux_r) = if os2x {
+        upsample_stereo_2x_f64(&ux_l, &ux_r, model.os_up_quad_coeff)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    let (c_ux_l_ref, c_ux_r_ref): (&[f64], &[f64]) = if os2x {
+        (&core_ux_l, &core_ux_r)
+    } else {
+        (&ux_l, &ux_r)
+    };
+    let n_core = c_ux_l_ref.len();
+
+    let rho_1x = 48_000.0 / model.sample_rate_hz.max(8_000.0);
+    let rho_core = if os2x { 0.5 * rho_1x } else { rho_1x };
+    let (core_ro_hp_l, _) =
+        eval_ro_pole_hp_and_adjoint(c_ux_l_ref, model.ro_pole_48k, rho_core, None, None);
+    let (core_ro_hp_r, _) =
+        eval_ro_pole_hp_and_adjoint(c_ux_r_ref, model.ro_pole_48k, rho_core, None, None);
 
     let cb_add = cb_trace
         .active
@@ -152,8 +181,8 @@ pub(super) fn eval_model_pass2_audio(
     let cascade = run_causal_core_cascade_with_crossbar(
         runner,
         model,
-        &ux_l,
-        &ux_r,
+        c_ux_l_ref,
+        c_ux_r_ref,
         CascadeCrossbarSpec {
             active_quads: q_count,
             rho_core,
@@ -166,18 +195,18 @@ pub(super) fn eval_model_pass2_audio(
     let (pc_hp_l, pc_hp_r) = (model.pre_conv_hp_gain[0], model.pre_conv_hp_gain[1]);
     let (dir_l, dir_r) = (model.direct_s2_u_gain[0], model.direct_s2_u_gain[1]);
     let (dir_hp_l, dir_hp_r) = (model.direct_s2_hp_gain[0], model.direct_s2_hp_gain[1]);
-    let mut pre_conv_l = vec![0.0_f64; n];
-    let mut pre_conv_r = vec![0.0_f64; n];
-    let mut x_tank_l = vec![0.0_f64; n];
-    let mut x_tank_r = vec![0.0_f64; n];
+    let mut core_pre_l = vec![0.0_f64; n_core];
+    let mut core_pre_r = vec![0.0_f64; n_core];
+    let mut core_dir_l = vec![0.0_f64; n_core];
+    let mut core_dir_r = vec![0.0_f64; n_core];
 
-    for t in 0..n {
-        let mut bus_l = pc_l * ux_l[t] + pc_hp_l * ro_hp_l[t];
-        let mut bus_r = pc_r * ux_r[t] + pc_hp_r * ro_hp_r[t];
-        let mut tank_l = dir_l * ux_l[t] + dir_hp_l * ro_hp_l[t];
-        let mut tank_r = dir_r * ux_r[t] + dir_hp_r * ro_hp_r[t];
+    for t in 0..n_core {
+        let mut bus_l = pc_l * c_ux_l_ref[t] + pc_hp_l * core_ro_hp_l[t];
+        let mut bus_r = pc_r * c_ux_r_ref[t] + pc_hp_r * core_ro_hp_r[t];
+        let mut tank_l = dir_l * c_ux_l_ref[t] + dir_hp_l * core_ro_hp_l[t];
+        let mut tank_r = dir_r * c_ux_r_ref[t] + dir_hp_r * core_ro_hp_r[t];
         for q in 0..q_count {
-            let fbase = (q * n + t) * FEATURE_VEC4_STRIDE;
+            let fbase = (q * n_core + t) * FEATURE_VEC4_STRIDE;
             let v_eff_l = cascade.feature_outputs[fbase];
             let v_eff_r = cascade.feature_outputs[fbase + 1];
             let odd_l = cascade.feature_outputs[fbase + 2];
@@ -200,11 +229,22 @@ pub(super) fn eval_model_pass2_audio(
                     + r[11] * f64::from(v_eff_r[k]);
             }
         }
-        pre_conv_l[t] = bus_l;
-        pre_conv_r[t] = bus_r;
-        x_tank_l[t] = tank_l;
-        x_tank_r[t] = tank_r;
+        core_pre_l[t] = bus_l;
+        core_pre_r[t] = bus_r;
+        core_dir_l[t] = tank_l;
+        core_dir_r[t] = tank_r;
     }
+
+    let (pre_conv_l, pre_conv_r, mut x_tank_l, mut x_tank_r) = if os2x {
+        (
+            downsample_lane_2x_f64(&core_pre_l, model.os_dec_c_prev1, model.os_dec_c0),
+            downsample_lane_2x_f64(&core_pre_r, model.os_dec_c_prev1, model.os_dec_c0),
+            downsample_lane_2x_f64(&core_dir_l, model.os_dec_c_prev1, model.os_dec_c0),
+            downsample_lane_2x_f64(&core_dir_r, model.os_dec_c_prev1, model.os_dec_c0),
+        )
+    } else {
+        (core_pre_l, core_pre_r, core_dir_l, core_dir_r)
+    };
 
     let active_fir = model.active_fir_taps.min(NUM_FIR_TAPS_ULTRA);
     if active_fir > 0 {
@@ -261,13 +301,16 @@ pub(super) fn eval_model_pass2_audio(
     }
 
     Ok(Pass2EvalBuffers {
+        os2x,
         u_sense_l,
         u_sense_r,
         cb_trace,
         ux_l,
         ux_r,
-        ro_hp_l,
-        ro_hp_r,
+        core_ux_l,
+        core_ux_r,
+        core_ro_hp_l,
+        core_ro_hp_r,
         onset_pre_l,
         onset_pre_r,
         x_tank_l,
@@ -309,8 +352,11 @@ pub(super) fn assemble_pass2_gradients(
     }
 
     let n = buf.ux_l.len();
-    let q_count = if n > 0 {
-        (buf.cascade.feature_outputs.len() / (n * FEATURE_VEC4_STRIDE)).clamp(1, 10)
+    let c_ux_l_ref: &[f64] = if buf.os2x { &buf.core_ux_l } else { &buf.ux_l };
+    let c_ux_r_ref: &[f64] = if buf.os2x { &buf.core_ux_r } else { &buf.ux_r };
+    let n_core = c_ux_l_ref.len();
+    let q_count = if n_core > 0 {
+        (buf.cascade.feature_outputs.len() / (n_core * FEATURE_VEC4_STRIDE)).clamp(1, 10)
     } else {
         q_opt.clamp(1, 10)
     };
@@ -322,7 +368,7 @@ pub(super) fn assemble_pass2_gradients(
         return Ok(grads);
     }
 
-    let num_tiles = n.div_ceil(TILE_FRAMES);
+    let num_tiles = n_core.div_ceil(TILE_FRAMES);
     let dry_mix = sanitize_unit_f64(model.tank_dry_mix, -2.0, 2.0, 1.0);
     if model.tank_dry_mix.is_finite() && model.tank_dry_mix.abs() < 2.0 {
         for t in 0..n {
@@ -394,34 +440,45 @@ pub(super) fn assemble_pass2_gradients(
         }
     }
 
-    let mut d_hp_l = vec![0.0_f64; n];
-    let mut d_hp_r = vec![0.0_f64; n];
-    let mut gx_ux_l = vec![0.0_f64; n];
-    let mut gx_ux_r = vec![0.0_f64; n];
-    for t in 0..n {
-        let (gl_t, gr_t) = (gx_l[t], gx_r[t]);
-        let (pl_t, pr_t) = (gx_pre_l[t], gx_pre_r[t]);
-        grads.d_direct_s2_u[0] += gl_t * buf.ux_l[t];
-        grads.d_direct_s2_u[1] += gr_t * buf.ux_r[t];
-        grads.d_direct_s2_hp[0] += gl_t * buf.ro_hp_l[t];
-        grads.d_direct_s2_hp[1] += gr_t * buf.ro_hp_r[t];
-        grads.d_pre_conv_u[0] += pl_t * buf.ux_l[t];
-        grads.d_pre_conv_u[1] += pr_t * buf.ux_r[t];
-        grads.d_pre_conv_hp[0] += pl_t * buf.ro_hp_l[t];
-        grads.d_pre_conv_hp[1] += pr_t * buf.ro_hp_r[t];
+    let (g_core_dir_l, g_core_dir_r, g_core_pre_l, g_core_pre_r) = if buf.os2x {
+        (
+            downsample_lane_2x_adjoint_f64(&gx_l, model.os_dec_c_prev1, model.os_dec_c0),
+            downsample_lane_2x_adjoint_f64(&gx_r, model.os_dec_c_prev1, model.os_dec_c0),
+            downsample_lane_2x_adjoint_f64(&gx_pre_l, model.os_dec_c_prev1, model.os_dec_c0),
+            downsample_lane_2x_adjoint_f64(&gx_pre_r, model.os_dec_c_prev1, model.os_dec_c0),
+        )
+    } else {
+        (gx_l, gx_r, gx_pre_l, gx_pre_r)
+    };
 
-        gx_ux_l[t] = model.direct_s2_u_gain[0] * gl_t + model.pre_conv_u_gain[0] * pl_t;
-        gx_ux_r[t] = model.direct_s2_u_gain[1] * gr_t + model.pre_conv_u_gain[1] * pr_t;
+    let mut d_hp_l = vec![0.0_f64; n_core];
+    let mut d_hp_r = vec![0.0_f64; n_core];
+    let mut g_core_ux_l = vec![0.0_f64; n_core];
+    let mut g_core_ux_r = vec![0.0_f64; n_core];
+    for t in 0..n_core {
+        let (gl_t, gr_t) = (g_core_dir_l[t], g_core_dir_r[t]);
+        let (pl_t, pr_t) = (g_core_pre_l[t], g_core_pre_r[t]);
+        grads.d_direct_s2_u[0] += gl_t * c_ux_l_ref[t];
+        grads.d_direct_s2_u[1] += gr_t * c_ux_r_ref[t];
+        grads.d_direct_s2_hp[0] += gl_t * buf.core_ro_hp_l[t];
+        grads.d_direct_s2_hp[1] += gr_t * buf.core_ro_hp_r[t];
+        grads.d_pre_conv_u[0] += pl_t * c_ux_l_ref[t];
+        grads.d_pre_conv_u[1] += pr_t * c_ux_r_ref[t];
+        grads.d_pre_conv_hp[0] += pl_t * buf.core_ro_hp_l[t];
+        grads.d_pre_conv_hp[1] += pr_t * buf.core_ro_hp_r[t];
+
+        g_core_ux_l[t] = model.direct_s2_u_gain[0] * gl_t + model.pre_conv_u_gain[0] * pl_t;
+        g_core_ux_r[t] = model.direct_s2_u_gain[1] * gr_t + model.pre_conv_u_gain[1] * pr_t;
         d_hp_l[t] = model.direct_s2_hp_gain[0] * gl_t + model.pre_conv_hp_gain[0] * pl_t;
         d_hp_r[t] = model.direct_s2_hp_gain[1] * gr_t + model.pre_conv_hp_gain[1] * pr_t;
     }
 
-    let mut d_feats = vec![[0.0_f32; 4]; q_count * n * FEATURE_VEC4_STRIDE];
+    let mut d_feats = vec![[0.0_f32; 4]; q_count * n_core * FEATURE_VEC4_STRIDE];
     for q in 0..q_count {
-        for t in 0..n {
-            let fbase = (q * n + t) * FEATURE_VEC4_STRIDE;
-            let (gl_t, gr_t) = (gx_l[t], gx_r[t]);
-            let (pl_t, pr_t) = (gx_pre_l[t], gx_pre_r[t]);
+        for t in 0..n_core {
+            let fbase = (q * n_core + t) * FEATURE_VEC4_STRIDE;
+            let (gl_t, gr_t) = (g_core_dir_l[t], g_core_dir_r[t]);
+            let (pl_t, pr_t) = (g_core_pre_l[t], g_core_pre_r[t]);
             let v_eff_l = buf.cascade.feature_outputs[fbase];
             let v_eff_r = buf.cascade.feature_outputs[fbase + 1];
             let odd_l = buf.cascade.feature_outputs[fbase + 2];
@@ -455,15 +512,16 @@ pub(super) fn assemble_pass2_gradients(
         }
     }
 
-    let rho_core = 48_000.0 / model.sample_rate_hz.max(8_000.0);
+    let rho_1x = 48_000.0 / model.sample_rate_hz.max(8_000.0);
+    let rho_core = if buf.os2x { 0.5 * rho_1x } else { rho_1x };
     let ckpt_per_quad = num_tiles * TILE_CKPT_VEC4_STRIDE;
     let mut d_cb_l = if buf.cb_trace.active {
-        vec![[0.0_f64; 4]; q_count * n]
+        vec![[0.0_f64; 4]; q_count * n_core]
     } else {
         Vec::new()
     };
     let mut d_cb_r = if buf.cb_trace.active {
-        vec![[0.0_f64; 4]; q_count * n]
+        vec![[0.0_f64; 4]; q_count * n_core]
     } else {
         Vec::new()
     };
@@ -480,7 +538,7 @@ pub(super) fn assemble_pass2_gradients(
         );
         let adj = runner.adjoint_scan_256(&AdjointScanInput {
             uniforms: AdjointScanUniforms {
-                num_frames: n as u32,
+                num_frames: n_core as u32,
                 num_tiles: num_tiles as u32,
                 num_quads: 1,
                 num_stems: 1,
@@ -489,14 +547,14 @@ pub(super) fn assemble_pass2_gradients(
                 tiny_crossing_eps: TINY_CROSSING_EPS,
                 block_idx,
             },
-            core_inputs: &buf.cascade.core_inputs[(q * n * 2)..((q + 1) * n * 2)],
+            core_inputs: &buf.cascade.core_inputs[(q * n_core * 2)..((q + 1) * n_core * 2)],
             quad_params: &qp,
             tile_checkpoints: &buf.cascade.tile_checkpoints
                 [(q * ckpt_per_quad)..((q + 1) * ckpt_per_quad)],
             d_loss_d_features: &d_feats
-                [(q * n * FEATURE_VEC4_STRIDE)..((q + 1) * n * FEATURE_VEC4_STRIDE)],
+                [(q * n_core * FEATURE_VEC4_STRIDE)..((q + 1) * n_core * FEATURE_VEC4_STRIDE)],
             feature_outputs: &buf.cascade.feature_outputs
-                [(q * n * FEATURE_VEC4_STRIDE)..((q + 1) * n * FEATURE_VEC4_STRIDE)],
+                [(q * n_core * FEATURE_VEC4_STRIDE)..((q + 1) * n_core * FEATURE_VEC4_STRIDE)],
         })?;
         for tile in 0..num_tiles {
             add_tile_param_grads_to_quad(
@@ -509,7 +567,7 @@ pub(super) fn assemble_pass2_gradients(
         }
         finalize_core_quad_zoh(&model.core_quads[q], rho_core, &mut grads.core_quads[q]);
 
-        for t in 0..n {
+        for t in 0..n_core {
             let gin_l = adj.d_loss_d_inputs[t * 2];
             let gin_r = adj.d_loss_d_inputs[t * 2 + 1];
             let cb_opt = if buf.cb_trace.active {
@@ -522,11 +580,11 @@ pub(super) fn assemble_pass2_gradients(
                     model,
                     q,
                     t,
-                    n,
+                    n: n_core,
                     q_count,
                     active_tiles: active_tiles_topo,
-                    ux_l_t: buf.ux_l[t],
-                    ux_r_t: buf.ux_r[t],
+                    ux_l_t: c_ux_l_ref[t],
+                    ux_r_t: c_ux_r_ref[t],
                     feature_outputs: &buf.cascade.feature_outputs,
                 },
                 gin_l,
@@ -538,26 +596,35 @@ pub(super) fn assemble_pass2_gradients(
                     d_cb_opt: cb_opt,
                 },
             );
-            gx_ux_l[t] += add_l;
-            gx_ux_r[t] += add_r;
+            g_core_ux_l[t] += add_l;
+            g_core_ux_r[t] += add_r;
         }
     }
 
     let (_, d_ro_l) = eval_ro_pole_hp_and_adjoint(
-        &buf.ux_l,
+        c_ux_l_ref,
         model.ro_pole_48k,
         rho_core,
         Some(&d_hp_l),
-        Some(&mut gx_ux_l),
+        Some(&mut g_core_ux_l),
     );
     let (_, d_ro_r) = eval_ro_pole_hp_and_adjoint(
-        &buf.ux_r,
+        c_ux_r_ref,
         model.ro_pole_48k,
         rho_core,
         Some(&d_hp_r),
-        Some(&mut gx_ux_r),
+        Some(&mut g_core_ux_r),
     );
     grads.d_ro_pole_48k = d_ro_l + d_ro_r;
+
+    let (gx_ux_l, gx_ux_r) = if buf.os2x {
+        (
+            upsample_lane_2x_adjoint_f64(&g_core_ux_l, model.os_up_quad_coeff),
+            upsample_lane_2x_adjoint_f64(&g_core_ux_r, model.os_up_quad_coeff),
+        )
+    } else {
+        (g_core_ux_l, g_core_ux_r)
+    };
 
     let mut d_s0_l = vec![0.0_f64; n];
     let mut d_s0_r = vec![0.0_f64; n];
@@ -608,4 +675,171 @@ pub(super) fn assemble_pass2_gradients(
     grads.sensory = sense_grads;
 
     Ok(grads)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::solver::model::snap_model_fp16;
+    use crate::solver::pass5_emit::{Pass5EmitConfig, encode_model_to_dnam_bin};
+    use dnam_vm::{SonaVm, Tier, bin::DnamBinView, math::DefaultMathBackend};
+
+    #[test]
+    fn test_pass2_os2x_vm_parity_all_tiers_and_central_fd_q6() {
+        let runner = TrainRunner::cpu();
+        let n = 128_usize;
+        let sr = 48_000.0_f64;
+        let in_l: Vec<f64> = (0..n).map(|t| 0.42 * ((t as f64) * 0.075).sin()).collect();
+        let in_r: Vec<f64> = (0..n).map(|t| 0.36 * ((t as f64) * 0.125).cos()).collect();
+        let in_l32: Vec<f32> = in_l.iter().map(|&v| v as f32).collect();
+        let in_r32: Vec<f32> = in_r.iter().map(|&v| v as f32).collect();
+
+        let mut model = SonaModelF64::new(sr);
+        model.oversample_upper_tiers_2x = true;
+        model.sense_in_l = [0.6, -0.3, 0.2, 0.1];
+        model.sense_in_r = [-0.2, 0.65, 0.15, -0.25];
+        model.sense_vca_w = [1.1, -0.7, 0.5, 0.3];
+        model.crossbar_op_gains = [0.55, 0.0];
+        model.phasor_freq_hz = [110.0, -230.0, 410.0, -780.0];
+        model.phasor_stereo_phase = [0.2, -0.3, 0.15, -0.1];
+        model.carrier_basis_w[0] = [0.4, -0.25, 0.18, 0.12];
+        model.op_p_to_core[0] = [0.25, -0.15, 0.1, 0.08];
+        model.op_p_to_core[5] = [-0.18, 0.22, 0.12, -0.05];
+        model.phasor_to_core[0] = [0.22, 0.15, -0.12, 0.1];
+        model.phasor_to_core[5] = [0.16, -0.2, 0.14, 0.08];
+        model.op_n_pre_gamma_bc = 0.35;
+        model.ro_pole_48k = 0.92;
+        model.direct_s2_u_gain = [0.5, 0.45];
+        model.direct_s2_hp_gain = [0.15, 0.12];
+        model.pre_conv_u_gain = [0.22, 0.18];
+        model.pre_conv_hp_gain = [0.08, -0.06];
+        model.active_fir_taps = 4;
+        model.fir_l[0] = 0.28;
+        model.fir_l[1] = -0.09;
+        model.fir_r[0] = 0.25;
+        model.fir_r[1] = -0.07;
+        model.active_kautz_pairs = 4;
+        model.kautz[0].r_low = 0.7;
+        model.kautz[0].theta = 0.42;
+        model.kautz[0].b_gamma = 0.6;
+        model.kautz[0].c_re_l = 0.15;
+        model.kautz[0].c_re_r = 0.14;
+        for q in 0..10 {
+            model.core_quads[q].adaa_drive = [1.3, 0.9, 1.1, 0.8];
+            model.w_ro[q * 4][6] = 0.12;
+            model.w_ro[q * 4][7] = 0.11;
+            model.w_ro[q * 4][0] = 0.09;
+            model.w_ro[q * 4][1] = 0.08;
+        }
+        model.tiles[0].w_odd_4x4[0][0] = 0.25;
+        model.tiles[4].w_odd_4x4[0][0] = 0.22;
+        model.tiles[14].w_odd_4x4[0][0] = 0.18;
+        model.tiles[24].w_odd_4x4[0][0] = 0.15;
+        snap_model_fp16(&mut model);
+
+        let bin = encode_model_to_dnam_bin(
+            &model,
+            Pass5EmitConfig {
+                stereo_out: true,
+                single_input: false,
+                ..Pass5EmitConfig::default()
+            },
+        )
+        .unwrap();
+        let view = DnamBinView::parse(&bin).unwrap();
+        for (tier, q_count) in [
+            (Tier::Lite, 4),
+            (Tier::Full, 6),
+            (Tier::Pro, 8),
+            (Tier::Ultra, 10),
+        ] {
+            let mut vm =
+                SonaVm::<DefaultMathBackend>::from_view_owned(&view, tier, sr as f32, false)
+                    .unwrap();
+            let (mut vm_l, mut vm_r) = (vec![0.0_f32; n], vec![0.0_f32; n]);
+            vm.process_block(&in_l32, &in_r32, &mut vm_l, &mut vm_r)
+                .unwrap();
+            let buf = eval_model_pass2_audio(&runner, &model, &in_l, &in_r, q_count).unwrap();
+            assert_eq!(buf.os2x, q_count > 4);
+            let (mut sig_sq, mut err_sq) = (0.0_f64, 0.0_f64);
+            for t in 16..n {
+                let (vl, vr) = (f64::from(vm_l[t]), f64::from(vm_r[t]));
+                sig_sq += vl * vl + vr * vr;
+                err_sq += (buf.pred_l[t] - vl).powi(2) + (buf.pred_r[t] - vr).powi(2);
+            }
+            let err_db = 10.0 * (err_sq / sig_sq.max(1.0e-18)).max(1.0e-16).log10();
+            assert!(err_db < -60.0, "tier {tier:?} VM parity err={err_db} dB");
+        }
+
+        // Central-FD gradient parity for open-loop 2x at q_count = 6 across all stages.
+        let gl: Vec<f64> = (0..n).map(|t| ((t as f64) * 0.21).cos()).collect();
+        let gr: Vec<f64> = (0..n).map(|t| ((t as f64) * 0.17).sin()).collect();
+        let buf = eval_model_pass2_audio(&runner, &model, &in_l, &in_r, 6).unwrap();
+        let grads = assemble_pass2_gradients(
+            &runner,
+            &Pass2AdjInput {
+                model: &model,
+                in_l: &in_l,
+                in_r: &in_r,
+                buf: &buf,
+                gl: &gl,
+                gr: &gr,
+                q_opt: 6,
+                k_opt: 4,
+            },
+        )
+        .unwrap();
+        let eval_fn = |m: &SonaModelF64| -> f64 {
+            let b = eval_model_pass2_audio(&runner, m, &in_l, &in_r, 6).unwrap();
+            b.pred_l.iter().zip(&gl).map(|(x, g)| x * g).sum::<f64>()
+                + b.pred_r.iter().zip(&gr).map(|(x, g)| x * g).sum::<f64>()
+        };
+        let eps = 1.0e-5_f64;
+        type FdCheck = (&'static str, f64, fn(&mut SonaModelF64, f64));
+        let checks: [FdCheck; 7] = [
+            ("sense_vca_w[0]", grads.sensory.d_vca_w[0], |m, d| {
+                m.sense_vca_w[0] += d
+            }),
+            ("op_n_pre_gamma_bc", grads.op_n_pre.d_gamma_bc, |m, d| {
+                m.op_n_pre_gamma_bc += d
+            }),
+            (
+                "phasor_freq_hz[1]",
+                grads.crossbar.d_phasor_freq_hz[1],
+                |m, d| m.phasor_freq_hz[1] += d,
+            ),
+            ("ro_pole_48k", grads.d_ro_pole_48k, |m, d| {
+                m.ro_pole_48k += d
+            }),
+            ("w_ro[20][6]", grads.d_w_ro[20][6], |m, d| {
+                m.w_ro[20][6] += d
+            }),
+            (
+                "tiles[4].odd[0][0]",
+                grads.tiles[4].w_odd_4x4[0][0],
+                |m, d| m.tiles[4].w_odd_4x4[0][0] += d,
+            ),
+            (
+                "core_quads[5].adaa[0]",
+                grads.core_quads[5].adaa_drive[0],
+                |m, d| m.core_quads[5].adaa_drive[0] += d,
+            ),
+        ];
+        for (name, ana, mut_fn) in checks {
+            let (mut mp, mut mm) = (model.clone(), model.clone());
+            mut_fn(&mut mp, eps);
+            mut_fn(&mut mm, -eps);
+            let fd = (eval_fn(&mp) - eval_fn(&mm)) / (2.0 * eps);
+            let tol = if name.contains("core_quads") || name.contains("sense_vca") {
+                2.0e-2
+            } else {
+                1.0e-4
+            };
+            let scale = ana.abs().max(fd.abs()).max(1.0e-3);
+            assert!(
+                (ana - fd).abs() < tol * scale,
+                "os2x {name}: ana={ana} fd={fd}"
+            );
+        }
+    }
 }

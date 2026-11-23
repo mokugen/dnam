@@ -14,7 +14,9 @@ use crate::gpu::abi::{FEATURE_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, TILE_FRAMES};
 use super::super::super::model::cascade::sanitize_unit_f64;
 use super::super::super::model::{NUM_FIR_TAPS_ULTRA, SonaModelF64};
 use super::super::adjoints::{KautzChannelStepper, RoPoleResolved};
-use super::super::crossbar::{eval_crossbar_forward, step_opt_crossbar_taps_and_adjoint};
+use super::super::crossbar::{
+    eval_crossbar_forward, eval_crossbar_forward_os2x, step_opt_crossbar_taps_and_adjoint,
+};
 use super::super::eval::core_adj::{
     active_opt_quads_for_core_quads, active_tiles_for_quads, collect_incoming_tiles,
 };
@@ -23,6 +25,7 @@ use super::super::op_t_quad::forward::{OpTQuadStepState, OpTResolvedParams};
 use super::super::op_t_quad::is_op_t_quad_active;
 use super::super::sensory::eval_sensory_quad_and_adjoint;
 use super::CausalLoopBuffers;
+use super::os2x::{Os2xDecimator, Os2xUpsampler};
 
 /// Evaluates the full frame-interleaved forward graph matching `dnam-vm`.
 pub(crate) fn eval_causal_loop_forward(
@@ -34,6 +37,8 @@ pub(crate) fn eval_causal_loop_forward(
 ) -> CausalLoopBuffers {
     let n = in_l.len().min(in_r.len());
     let q_count = active_quads.clamp(1, 10);
+    let os2x = model.oversample_upper_tiers_2x && q_count > 4;
+    let n_core = if os2x { 2 * n } else { n };
     let active_opt_quads = active_opt_quads_for_core_quads(q_count);
     let active_tiles = active_tiles_for_quads(q_count);
     let include_stereo_phase = q_count > 4;
@@ -42,12 +47,16 @@ pub(crate) fn eval_causal_loop_forward(
     } else {
         48_000.0
     };
-    let rho_core = 48_000.0 / sr.max(8_000.0);
+    let rho_1x = 48_000.0 / sr.max(8_000.0);
+    let rho_core = if os2x { 0.5 * rho_1x } else { rho_1x };
 
     let (u_sense_l, u_sense_r, _) =
         eval_sensory_quad_and_adjoint(model, &in_l[..n], &in_r[..n], None, None);
-    let cb_trace =
-        eval_crossbar_forward(model, &u_sense_l, &u_sense_r, q_count, include_stereo_phase);
+    let cb_trace = if os2x {
+        eval_crossbar_forward_os2x(model, &u_sense_l, &u_sense_r, q_count, include_stereo_phase)
+    } else {
+        eval_crossbar_forward(model, &u_sense_l, &u_sense_r, q_count, include_stereo_phase)
+    };
 
     let op_t_gain_raw = model.crossbar_op_gains[1];
     let op_t_gain = if op_t_gain_raw.is_finite() {
@@ -116,19 +125,19 @@ pub(crate) fn eval_causal_loop_forward(
     let mut quad_states: Vec<SonaBlockStateStereo8<InterleavedStereo8<GpuVec4>>> =
         vec![SonaBlockStateStereo8::zero(); q_count];
 
-    let num_tiles = n.div_ceil(TILE_FRAMES);
+    let num_tiles = n_core.div_ceil(TILE_FRAMES);
     let ckpt_per_quad = if record_trace {
         num_tiles * TILE_CKPT_VEC4_STRIDE
     } else {
         0
     };
     let mut core_inputs = if record_trace {
-        vec![[0.0_f32; 4]; q_count * n * 2]
+        vec![[0.0_f32; 4]; q_count * n_core * 2]
     } else {
         Vec::new()
     };
     let mut tile_checkpoints = vec![[0.0_f32; 4]; q_count * ckpt_per_quad];
-    let mut feature_outputs = vec![[0.0_f32; 4]; q_count * n * FEATURE_VEC4_STRIDE];
+    let mut feature_outputs = vec![[0.0_f32; 4]; q_count * n_core * FEATURE_VEC4_STRIDE];
 
     let mut kautz_l = KautzChannelStepper::new(
         &model.kautz[..active_k],
@@ -147,6 +156,9 @@ pub(crate) fn eval_causal_loop_forward(
     let mut s0_r = Vec::with_capacity(if record_trace { n } else { 0 });
     let mut ux_l = Vec::with_capacity(n);
     let mut ux_r = Vec::with_capacity(n);
+    let cap_core = if record_trace && os2x { n_core } else { 0 };
+    let mut core_ux_l = Vec::with_capacity(cap_core);
+    let mut core_ux_r = Vec::with_capacity(cap_core);
     let mut pre_conv_l = vec![0.0_f64; n];
     let mut pre_conv_r = vec![0.0_f64; n];
     let mut onset_pre_l = vec![0.0_f64; n];
@@ -155,18 +167,21 @@ pub(crate) fn eval_causal_loop_forward(
     let mut x_tank_r = vec![0.0_f64; n];
 
     let cap_t = if record_trace { n } else { 0 };
+    let cap_ro = if record_trace { n_core } else { 0 };
     let mut op_n_held_l = Vec::with_capacity(cap_t);
     let mut op_n_held_r = Vec::with_capacity(cap_t);
     let mut op_n_gclk_l = Vec::with_capacity(cap_t);
     let mut op_n_dg_l = Vec::with_capacity(cap_t);
     let mut op_n_gclk_r = Vec::with_capacity(cap_t);
     let mut op_n_dg_r = Vec::with_capacity(cap_t);
-    let mut ro_lp_l = Vec::with_capacity(cap_t);
-    let mut ro_lp_r = Vec::with_capacity(cap_t);
+    let mut ro_lp_l = Vec::with_capacity(cap_ro);
+    let mut ro_lp_r = Vec::with_capacity(cap_ro);
     let mut v_reads_hist = Vec::with_capacity(cap_t);
 
     let (mut op_n_prev_l, mut op_n_prev_r) = (0.0_f64, 0.0_f64);
     let (mut ro_prev_l, mut ro_prev_r) = (0.0_f64, 0.0_f64);
+    let mut os_up = Os2xUpsampler::new(model.os_up_quad_coeff);
+    let mut os_dec = Os2xDecimator::new(model.os_dec_c_prev1, model.os_dec_c0);
 
     let (pc_l, pc_r) = (model.pre_conv_u_gain[0], model.pre_conv_u_gain[1]);
     let (pc_hp_l, pc_hp_r) = (model.pre_conv_hp_gain[0], model.pre_conv_hp_gain[1]);
@@ -196,11 +211,8 @@ pub(crate) fn eval_causal_loop_forward(
             op_n_resolved.step_forward_frame(t, s0l_t, &mut op_n_prev_l);
         let (uxr_t, h_r, gclk_r, dg_r) =
             op_n_resolved.step_forward_frame(t, s0r_t, &mut op_n_prev_r);
-        let (hpl_t, lpl_t) = ro_resolved.step_forward_frame(uxl_t, &mut ro_prev_l);
-        let (hpr_t, lpr_t) = ro_resolved.step_forward_frame(uxr_t, &mut ro_prev_r);
         ux_l.push(uxl_t);
         ux_r.push(uxr_t);
-
         if record_trace {
             s0_l.push(s0l_t);
             s0_r.push(s0r_t);
@@ -210,104 +222,133 @@ pub(crate) fn eval_causal_loop_forward(
             op_n_dg_l.push(dg_l);
             op_n_gclk_r.push(gclk_r);
             op_n_dg_r.push(dg_r);
-            ro_lp_l.push(lpl_t);
-            ro_lp_r.push(lpr_t);
             v_reads_hist.push(v_reads);
-            if t % TILE_FRAMES == 0 {
-                let tile = t / TILE_FRAMES;
-                for q in 0..q_count {
-                    write_checkpoint(&mut tile_checkpoints, q, num_tiles, tile, &quad_states[q]);
-                }
-            }
         }
 
-        let ul_s = sanitize_unit_f64(uxl_t, -1.0e6, 1.0e6, 0.0);
-        let ur_s = sanitize_unit_f64(uxr_t, -1.0e6, 1.0e6, 0.0);
-        let mid = 0.5 * (ul_s + ur_s);
-        let side = 0.5 * (ul_s - ur_s);
-
-        let mut bus_l = pc_l * uxl_t + pc_hp_l * hpl_t;
-        let mut bus_r = pc_r * uxr_t + pc_hp_r * hpr_t;
-        let mut tank_l = dir_l * uxl_t + dir_hp_l * hpl_t;
-        let mut tank_r = dir_r * uxr_t + dir_hp_r * hpr_t;
-
-        for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER {
-            if q >= q_count {
-                continue;
+        let mut step_core_subframe = |sub_t: usize, cuxl: f64, cuxr: f64| -> [f64; 4] {
+            if record_trace && os2x {
+                core_ux_l.push(cuxl);
+                core_ux_r.push(cuxr);
             }
-            let cb_idx = q * n + t;
-            let mut acc_l = [0.0_f64; 4];
-            let mut acc_r = [0.0_f64; 4];
-            for d in 0..4 {
-                acc_l[d] =
-                    in_mids[q][d] * mid + in_sides[q][d] * side + cb_trace.cb_add_l[cb_idx][d];
-                acc_r[d] =
-                    in_mids[q][d] * mid - in_sides[q][d] * side + cb_trace.cb_add_r[cb_idx][d];
-            }
-            for inc in &incoming_per_q[q] {
-                let fbase = (inc.src_q * n + t) * FEATURE_VEC4_STRIDE;
-                let vl = feature_outputs[fbase];
-                let vr = feature_outputs[fbase + 1];
-                let ol = feature_outputs[fbase + 2];
-                let or_ = feature_outputs[fbase + 3];
-                let el = feature_outputs[fbase + 4];
-                let er = feature_outputs[fbase + 5];
-                for s in 0..4 {
-                    let (ol_s, or_s) = (f64::from(ol[s]), f64::from(or_[s]));
-                    let (el_s, er_s) = (f64::from(el[s]), f64::from(er[s]));
-                    let (vl_s, vr_s) = (f64::from(vl[s]), f64::from(vr[s]));
-                    for d in 0..4 {
-                        acc_l[d] += inc.wo[s][d] * ol_s + inc.we[s][d] * el_s + inc.wl[s][d] * vl_s;
-                        acc_r[d] += inc.wo[s][d] * or_s + inc.we[s][d] * er_s + inc.wl[s][d] * vr_s;
+            let (hpl_t, lpl_t) = ro_resolved.step_forward_frame(cuxl, &mut ro_prev_l);
+            let (hpr_t, lpr_t) = ro_resolved.step_forward_frame(cuxr, &mut ro_prev_r);
+            if record_trace {
+                ro_lp_l.push(lpl_t);
+                ro_lp_r.push(lpr_t);
+                if sub_t.is_multiple_of(TILE_FRAMES) {
+                    let tile = sub_t / TILE_FRAMES;
+                    for q in 0..q_count {
+                        write_checkpoint(
+                            &mut tile_checkpoints,
+                            q,
+                            num_tiles,
+                            tile,
+                            &quad_states[q],
+                        );
                     }
                 }
             }
-            let in_l_f32 = acc_l.map(|v| v as f32);
-            let in_r_f32 = acc_r.map(|v| v as f32);
-            if record_trace {
-                let in_idx = (q * n + t) * 2;
-                core_inputs[in_idx] = in_l_f32;
-                core_inputs[in_idx + 1] = in_r_f32;
+
+            let ul_s = sanitize_unit_f64(cuxl, -1.0e6, 1.0e6, 0.0);
+            let ur_s = sanitize_unit_f64(cuxr, -1.0e6, 1.0e6, 0.0);
+            let mid = 0.5 * (ul_s + ur_s);
+            let side = 0.5 * (ul_s - ur_s);
+
+            let mut sub_bus_l = pc_l * cuxl + pc_hp_l * hpl_t;
+            let mut sub_bus_r = pc_r * cuxr + pc_hp_r * hpr_t;
+            let mut sub_tank_l = dir_l * cuxl + dir_hp_l * hpl_t;
+            let mut sub_tank_r = dir_r * cuxr + dir_hp_r * hpr_t;
+
+            for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER {
+                if q >= q_count {
+                    continue;
+                }
+                let cb_idx = q * n_core + sub_t;
+                let mut acc_l = [0.0_f64; 4];
+                let mut acc_r = [0.0_f64; 4];
+                for d in 0..4 {
+                    acc_l[d] =
+                        in_mids[q][d] * mid + in_sides[q][d] * side + cb_trace.cb_add_l[cb_idx][d];
+                    acc_r[d] =
+                        in_mids[q][d] * mid - in_sides[q][d] * side + cb_trace.cb_add_r[cb_idx][d];
+                }
+                for inc in &incoming_per_q[q] {
+                    let fbase = (inc.src_q * n_core + sub_t) * FEATURE_VEC4_STRIDE;
+                    let vl = feature_outputs[fbase];
+                    let vr = feature_outputs[fbase + 1];
+                    let ol = feature_outputs[fbase + 2];
+                    let or_ = feature_outputs[fbase + 3];
+                    let el = feature_outputs[fbase + 4];
+                    let er = feature_outputs[fbase + 5];
+                    for s in 0..4 {
+                        let (ol_s, or_s) = (f64::from(ol[s]), f64::from(or_[s]));
+                        let (el_s, er_s) = (f64::from(el[s]), f64::from(er[s]));
+                        let (vl_s, vr_s) = (f64::from(vl[s]), f64::from(vr[s]));
+                        for d in 0..4 {
+                            acc_l[d] +=
+                                inc.wo[s][d] * ol_s + inc.we[s][d] * el_s + inc.wl[s][d] * vl_s;
+                            acc_r[d] +=
+                                inc.wo[s][d] * or_s + inc.we[s][d] * er_s + inc.wl[s][d] * vr_s;
+                        }
+                    }
+                }
+                let in_l_f32 = acc_l.map(|v| v as f32);
+                let in_r_f32 = acc_r.map(|v| v as f32);
+                if record_trace {
+                    let in_idx = (q * n_core + sub_t) * 2;
+                    core_inputs[in_idx] = in_l_f32;
+                    core_inputs[in_idx + 1] = in_r_f32;
+                }
+                let u_vec = InterleavedStereo8::from_lr(
+                    GpuVec4::from_array(in_l_f32.map(flush_zero)),
+                    GpuVec4::from_array(in_r_f32.map(flush_zero)),
+                );
+                let is_phs = SONA_CORE_QUAD_BLOCK_AND_LOCAL[q].0 == 0;
+                let out = if is_phs {
+                    step_core_quad_phs_stereo8(u_vec, &mut quad_states[q], &kparams[q])
+                } else {
+                    step_core_quad_stereo8(u_vec, &mut quad_states[q], &kparams[q])
+                };
+                let (vl, vr) = out.lru_state.into_lr();
+                let (ol, or_) = out.adaa_odd.into_lr();
+                let (el, er) = out.adaa_even.into_lr();
+                let (vl_a, vr_a) = (canon_vec4(vl), canon_vec4(vr));
+                let (ol_a, or_a) = (canon_vec4(ol), canon_vec4(or_));
+                let (el_a, er_a) = (canon_vec4(el), canon_vec4(er));
+                let fbase = (q * n_core + sub_t) * FEATURE_VEC4_STRIDE;
+                feature_outputs[fbase] = vl_a;
+                feature_outputs[fbase + 1] = vr_a;
+                feature_outputs[fbase + 2] = ol_a;
+                feature_outputs[fbase + 3] = or_a;
+                feature_outputs[fbase + 4] = el_a;
+                feature_outputs[fbase + 5] = er_a;
+                for k in 0..4 {
+                    let r = &model.w_ro[q * 4 + k];
+                    sub_bus_l += r[0] * f64::from(ol_a[k])
+                        + r[2] * f64::from(el_a[k])
+                        + r[4] * f64::from(vl_a[k]);
+                    sub_bus_r += r[1] * f64::from(or_a[k])
+                        + r[3] * f64::from(er_a[k])
+                        + r[5] * f64::from(vr_a[k]);
+                    sub_tank_l += r[6] * f64::from(ol_a[k])
+                        + r[8] * f64::from(el_a[k])
+                        + r[10] * f64::from(vl_a[k]);
+                    sub_tank_r += r[7] * f64::from(or_a[k])
+                        + r[9] * f64::from(er_a[k])
+                        + r[11] * f64::from(vr_a[k]);
+                }
             }
-            let u_vec = InterleavedStereo8::from_lr(
-                GpuVec4::from_array(in_l_f32.map(flush_zero)),
-                GpuVec4::from_array(in_r_f32.map(flush_zero)),
-            );
-            let is_phs = SONA_CORE_QUAD_BLOCK_AND_LOCAL[q].0 == 0;
-            let out = if is_phs {
-                step_core_quad_phs_stereo8(u_vec, &mut quad_states[q], &kparams[q])
-            } else {
-                step_core_quad_stereo8(u_vec, &mut quad_states[q], &kparams[q])
-            };
-            let (vl, vr) = out.lru_state.into_lr();
-            let (ol, or_) = out.adaa_odd.into_lr();
-            let (el, er) = out.adaa_even.into_lr();
-            let (vl_a, vr_a) = (canon_vec4(vl), canon_vec4(vr));
-            let (ol_a, or_a) = (canon_vec4(ol), canon_vec4(or_));
-            let (el_a, er_a) = (canon_vec4(el), canon_vec4(er));
-            let fbase = (q * n + t) * FEATURE_VEC4_STRIDE;
-            feature_outputs[fbase] = vl_a;
-            feature_outputs[fbase + 1] = vr_a;
-            feature_outputs[fbase + 2] = ol_a;
-            feature_outputs[fbase + 3] = or_a;
-            feature_outputs[fbase + 4] = el_a;
-            feature_outputs[fbase + 5] = er_a;
-            for k in 0..4 {
-                let r = &model.w_ro[q * 4 + k];
-                bus_l += r[0] * f64::from(ol_a[k])
-                    + r[2] * f64::from(el_a[k])
-                    + r[4] * f64::from(vl_a[k]);
-                bus_r += r[1] * f64::from(or_a[k])
-                    + r[3] * f64::from(er_a[k])
-                    + r[5] * f64::from(vr_a[k]);
-                tank_l += r[6] * f64::from(ol_a[k])
-                    + r[8] * f64::from(el_a[k])
-                    + r[10] * f64::from(vl_a[k]);
-                tank_r += r[7] * f64::from(or_a[k])
-                    + r[9] * f64::from(er_a[k])
-                    + r[11] * f64::from(vr_a[k]);
-            }
-        }
+            [sub_bus_l, sub_bus_r, sub_tank_l, sub_tank_r]
+        };
+
+        let [bus_l, bus_r, mut tank_l, mut tank_r] = if os2x {
+            let (u0, u1) = os_up.step(uxl_t, uxr_t);
+            let y0 = step_core_subframe(2 * t, u0[0], u0[1]);
+            let y1 = step_core_subframe(2 * t + 1, u1[0], u1[1]);
+            os_dec.step(y0, y1)
+        } else {
+            step_core_subframe(t, uxl_t, uxr_t)
+        };
 
         pre_conv_l[t] = bus_l;
         pre_conv_r[t] = bus_r;
@@ -339,6 +380,7 @@ pub(crate) fn eval_causal_loop_forward(
 
     CausalLoopBuffers {
         q_count,
+        os2x,
         active_opt_quads,
         active_k,
         active_fir,
@@ -353,6 +395,8 @@ pub(crate) fn eval_causal_loop_forward(
         s0_r,
         ux_l,
         ux_r,
+        core_ux_l,
+        core_ux_r,
         onset_pre_l,
         onset_pre_r,
         x_tank_l,

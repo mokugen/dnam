@@ -10,6 +10,7 @@ use super::fft::{
 };
 
 const PHASOR_EPS: f64 = 1.0e-6;
+const _: () = assert!(PHASOR_EPS > 0.0 && PHASOR_EPS < 1.0e-3);
 
 #[derive(Clone, Debug)]
 struct StftFrameGrid {
@@ -146,6 +147,18 @@ impl SpecOtTargetCache {
         sample_rate_hz: f64,
         fft_size: usize,
     ) -> Result<Self, TrainError> {
+        Self::new_with_noise(target, None, warmup, sample_rate_hz, fft_size)
+    }
+
+    /// Precomputes normalized target power CDF and noise-floor SNR-attenuated log-frequency
+    /// transport weights (`ref[qual.eval.thermal-hiss]`).
+    pub fn new_with_noise(
+        target: &[f64],
+        noise: Option<&[f64]>,
+        warmup: usize,
+        sample_rate_hz: f64,
+        fft_size: usize,
+    ) -> Result<Self, TrainError> {
         let grid =
             StftFrameGrid::new(target.len(), warmup, sample_rate_hz, fft_size, fft_size / 2)?;
         if grid.starts.is_empty() {
@@ -155,19 +168,26 @@ impl SpecOtTargetCache {
                 actual: target.len(),
             });
         }
+        let noise_frames = noise
+            .filter(|ns| {
+                ns.len() >= target.len() && ns[..target.len()].iter().all(|v| v.is_finite())
+            })
+            .map(|ns| grid.forward_frames(&ns[..target.len()]));
         let (re, im) = grid.forward_frames(target);
         let m_cnt = re.len() as f64;
         let k_len = grid.k_hi - grid.k_lo;
+        let mut p_raw = vec![0.0_f64; k_len];
         let mut p = vec![0.0_f64; k_len];
         let mut z = 0.0_f64;
         for (idx, k) in (grid.k_lo..grid.k_hi).enumerate() {
-            let mean_p = re
+            let raw_p = re
                 .iter()
                 .zip(&im)
                 .map(|(r, i)| r[k] * r[k] + i[k] * i[k])
                 .sum::<f64>()
-                / m_cnt
-                + 1.0e-15;
+                / m_cnt;
+            p_raw[idx] = raw_p;
+            let mean_p = raw_p + 1.0e-15;
             p[idx] = mean_p;
             z += mean_p;
         }
@@ -178,7 +198,21 @@ impl SpecOtTargetCache {
             cdf[idx] = run;
         }
         let bin_weights: Vec<f64> = (grid.k_lo..grid.k_hi)
-            .map(|k| (((k + 1) as f64) / (k as f64)).ln())
+            .enumerate()
+            .map(|(idx, k)| {
+                let w_log = (((k + 1) as f64) / (k as f64)).ln();
+                if let Some((ref nr, ref ni)) = noise_frames {
+                    let np = nr
+                        .iter()
+                        .zip(ni)
+                        .map(|(r, i)| r[k] * r[k] + i[k] * i[k])
+                        .sum::<f64>()
+                        / m_cnt;
+                    w_log * super::noise_floor::snr_weight(p_raw[idx], np)
+                } else {
+                    w_log
+                }
+            })
             .collect();
         Ok(Self {
             grid,
@@ -328,6 +362,18 @@ impl IfGdTargetCache {
         sample_rate_hz: f64,
         fft_size: usize,
     ) -> Result<Self, TrainError> {
+        Self::new_with_noise(target, None, warmup, sample_rate_hz, fft_size)
+    }
+
+    /// Precomputes normalized `IF+GD` phasors with cell weights attenuated by local noise-floor SNR
+    /// (`ref[qual.eval.thermal-hiss]`).
+    pub fn new_with_noise(
+        target: &[f64],
+        noise: Option<&[f64]>,
+        warmup: usize,
+        sample_rate_hz: f64,
+        fft_size: usize,
+    ) -> Result<Self, TrainError> {
         let grid =
             StftFrameGrid::new(target.len(), warmup, sample_rate_hz, fft_size, fft_size / 4)?;
         if grid.starts.len() < 2 {
@@ -337,6 +383,11 @@ impl IfGdTargetCache {
                 actual: target.len(),
             });
         }
+        let noise_frames = noise
+            .filter(|ns| {
+                ns.len() >= target.len() && ns[..target.len()].iter().all(|v| v.is_finite())
+            })
+            .map(|ns| grid.forward_frames(&ns[..target.len()]));
         let (re, im) = grid.forward_frames(target);
         let m_cnt = re.len();
         let k_len = grid.k_hi - grid.k_lo;
@@ -351,11 +402,21 @@ impl IfGdTargetCache {
         for m in 0..m_cnt {
             for (ki, k) in (grid.k_lo..grid.k_hi).enumerate() {
                 let idx = m * k_len + ki;
-                let e0 = (re[m][k] * re[m][k] + im[m][k] * im[m][k]).sqrt();
+                let e0_sq = re[m][k] * re[m][k] + im[m][k] * im[m][k];
+                let e0 = e0_sq.sqrt();
+                let np0 = noise_frames
+                    .as_ref()
+                    .map_or(0.0, |(nr, ni)| nr[m][k] * nr[m][k] + ni[m][k] * ni[m][k]);
                 if m > 0 {
                     let (u, v) = unit_phasor_diff(re[m][k], im[m][k], re[m - 1][k], im[m - 1][k]);
-                    let w =
-                        e0.min((re[m - 1][k] * re[m - 1][k] + im[m - 1][k] * im[m - 1][k]).sqrt());
+                    let e1_sq = re[m - 1][k] * re[m - 1][k] + im[m - 1][k] * im[m - 1][k];
+                    let snr = if let Some((ref nr, ref ni)) = noise_frames {
+                        let np1 = nr[m - 1][k] * nr[m - 1][k] + ni[m - 1][k] * ni[m - 1][k];
+                        super::noise_floor::snr_weight(e0_sq.min(e1_sq), np0.max(np1))
+                    } else {
+                        1.0
+                    };
+                    let w = e0.min(e1_sq.sqrt()) * snr;
                     if_u[idx] = u;
                     if_v[idx] = v;
                     if_w[idx] = w;
@@ -363,8 +424,14 @@ impl IfGdTargetCache {
                 }
                 if ki > 0 {
                     let (u, v) = unit_phasor_diff(re[m][k], im[m][k], re[m][k - 1], im[m][k - 1]);
-                    let w =
-                        e0.min((re[m][k - 1] * re[m][k - 1] + im[m][k - 1] * im[m][k - 1]).sqrt());
+                    let e1_sq = re[m][k - 1] * re[m][k - 1] + im[m][k - 1] * im[m][k - 1];
+                    let snr = if let Some((ref nr, ref ni)) = noise_frames {
+                        let np1 = nr[m][k - 1] * nr[m][k - 1] + ni[m][k - 1] * ni[m][k - 1];
+                        super::noise_floor::snr_weight(e0_sq.min(e1_sq), np0.max(np1))
+                    } else {
+                        1.0
+                    };
+                    let w = e0.min(e1_sq.sqrt()) * snr;
                     gd_u[idx] = u;
                     gd_v[idx] = v;
                     gd_w[idx] = w;
@@ -513,5 +580,27 @@ mod tests {
                 gi[idx]
             );
         }
+
+        // Repeatability noise-weighted SpecOT and IF+GD caches preserve exact central-FD gradients.
+        let noise: Vec<f64> = (0..n).map(|i| 0.03 * ((i as f64) * 0.51).sin()).collect();
+        let sot_n =
+            SpecOtTargetCache::new_with_noise(&target, Some(&noise), 64, 48_000.0, 256).unwrap();
+        let ifgd_n =
+            IfGdTargetCache::new_with_noise(&target, Some(&noise), 64, 48_000.0, 256).unwrap();
+        let (mut gsn, mut gin) = (vec![0.0_f64; n], vec![0.0_f64; n]);
+        let _ = eval_spec_ot_loss_and_adjoint(&sot_n, &pred, Some(&mut gsn));
+        let _ = eval_if_gd_loss_and_adjoint(&ifgd_n, &pred, Some(&mut gin));
+        let mut pp = pred.clone();
+        let mut pm = pred.clone();
+        pp[512] += eps;
+        pm[512] -= eps;
+        let fd_sn = (eval_spec_ot_loss_and_adjoint(&sot_n, &pp, None)
+            - eval_spec_ot_loss_and_adjoint(&sot_n, &pm, None))
+            / (2.0 * eps);
+        let fd_in = (eval_if_gd_loss_and_adjoint(&ifgd_n, &pp, None)
+            - eval_if_gd_loss_and_adjoint(&ifgd_n, &pm, None))
+            / (2.0 * eps);
+        assert!((gsn[512] - fd_sn).abs() <= 1.0e-5 * gsn[512].abs().max(1.0e-4));
+        assert!((gin[512] - fd_in).abs() <= 1.0e-5 * gin[512].abs().max(1.0e-4));
     }
 }

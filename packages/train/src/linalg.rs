@@ -1,24 +1,28 @@
 //! High-precision `f64` linear algebra, dense `uplo='U'` Cholesky, Schur/EMR/LTAS-KKT
-//! VarPro solvers, and bounded two-loop / whitened L-BFGS optimizers.
+//! VarPro solvers, shared coordinate transforms, `AdamW` + `PCGrad`, `L-SSBroyden`, and L-BFGS.
 
+pub mod adamw;
 pub mod cholesky;
+pub mod coords;
 pub mod lbfgs;
 pub mod spectral_kkt;
+pub mod ssbroyden;
 pub mod varpro;
 
+pub use adamw::{AdamWConfig, AdamWState, apply_arena_scoped_pcgrad, cosine_lr_with_warmup};
 pub use cholesky::{
     MIN_CHOLESKY_RIDGE, PcgRefinementSpec, checked_uplo_u_packed_len, factorize_uplo_u_cholesky,
     refine_cholesky_lsq_pcg_f64, solve_factorized_uplo_u, solve_factorized_uplo_u_2ch,
     solve_uplo_adaptive_ridge, solve_uplo_norm_bounded, solve_uplo_u_cholesky,
     solve_uplo_u_cholesky_2ch, symv_uplo_u,
 };
-pub use lbfgs::{
-    LbfgsConfig, LbfgsResult, ParamBoundSpec, TwoLoopLbfgs, WhitenedLbfgs, step_runner_inner_opt,
-};
+pub use coords::{OptResult, ParamBoundSpec, ScaledCoordSpace};
+pub use lbfgs::{LbfgsConfig, LbfgsResult, TwoLoopLbfgs, WhitenedLbfgs, step_runner_inner_opt};
 pub use spectral_kkt::{
     EmrMmConfig, EmrMmResult, EmrSpectralProblem, LtasKktConfig, LtasKktResult,
     solve_emr_mm_cholesky, solve_ltas_newton_kkt,
 };
+pub use ssbroyden::{SsBroydenConfig, SsBroydenState};
 pub use varpro::{
     NestedTierPrefixResult, assemble_ozaki_normal_equations, solve_nested_tier_prefix_schur,
 };

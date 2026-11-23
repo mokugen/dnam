@@ -7,9 +7,12 @@ use core::f64::consts::PI;
 mod metrics;
 
 pub use metrics::{
-    BesrIntervalBounds, BesrIntervalDecision, BesrJointIntervalBounds, compute_seg_esr_channel_db,
-    eval_seg_esr_loss_and_adjoint, evaluate_joint_interval_besr, evaluate_uncertain_floor_besr,
+    BesrIntervalBounds, BesrIntervalDecision, BesrJointIntervalBounds, SegEsrTargetCache,
+    compute_seg_esr_channel_db, eval_seg_esr_cached_and_adjoint, eval_seg_esr_loss_and_adjoint,
+    evaluate_joint_interval_besr, evaluate_uncertain_floor_besr,
 };
+
+use super::noise_floor::{smooth_excess_sq, snr_weight};
 
 use crate::math::trainer::{BEZOUT7_C4, BEZOUT7_C5, BEZOUT7_C6, BEZOUT7_C7};
 
@@ -89,6 +92,20 @@ pub struct Bezout7FilterBank {
     pub r2: f64,
     /// `1 - r2`.
     pub omr2: f64,
+}
+
+/// Band normalization, repeatability noise floor, and warmup specification for
+/// [`Bezout7FilterBank::eval_besr_loss_and_adjoint_with_noise`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BesrLossSpec {
+    /// Target band energies `[LF, MF, HF]`.
+    pub target_band_energies: [f64; 3],
+    /// Optional measured noise-floor band energies `[LF, MF, HF]`.
+    pub noise_band_energies: Option<[f64; 3]>,
+    /// Additive stability floor per band (`[1e-6; 3]` typical).
+    pub eps_floor: [f64; 3],
+    /// Post-warmup exclusion frame count.
+    pub warmup: usize,
 }
 
 impl Bezout7FilterBank {
@@ -202,23 +219,57 @@ impl Bezout7FilterBank {
         warmup: usize,
         grad_opt: Option<&mut [f64]>,
     ) -> f64 {
+        self.eval_besr_loss_and_adjoint_with_noise(
+            pred,
+            target,
+            BesrLossSpec {
+                target_band_energies,
+                noise_band_energies: None,
+                eps_floor,
+                warmup,
+            },
+            grad_opt,
+        )
+    }
+
+    /// Evaluates differentiable `bESR` with optional repeatability noise-floor SNR weighting and
+    /// smooth excess softplus gating (`ref[qual.eval.thermal-hiss]`), matching
+    /// [`Self::eval_besr_loss_and_adjoint`] identically when `spec.noise_band_energies` is `None`.
+    pub fn eval_besr_loss_and_adjoint_with_noise(
+        &self,
+        pred: &[f64],
+        target: &[f64],
+        spec: BesrLossSpec,
+        grad_opt: Option<&mut [f64]>,
+    ) -> f64 {
+        let BesrLossSpec {
+            target_band_energies,
+            noise_band_energies,
+            eps_floor,
+            warmup,
+        } = spec;
         let n = pred.len().min(target.len());
         let err: Vec<f64> = (0..n).map(|t| pred[t] - target[t]).collect();
         let mut bands = [Vec::new(), Vec::new(), Vec::new()];
         let err_e = self.split_3band_and_energies(&err, warmup.min(n), &mut bands);
 
-        let inv_denom = [
-            1.0 / (3.0 * (target_band_energies[0] + eps_floor[0]).max(1.0e-18)),
-            1.0 / (3.0 * (target_band_energies[1] + eps_floor[1]).max(1.0e-18)),
-            1.0 / (3.0 * (target_band_energies[2] + eps_floor[2]).max(1.0e-18)),
-        ];
-        let loss = err_e[0] * inv_denom[0] + err_e[1] * inv_denom[1] + err_e[2] * inv_denom[2];
+        let mut loss = 0.0_f64;
+        let mut band_scale = [0.0_f64; 3];
+        for b in 0..3 {
+            let w_snr =
+                noise_band_energies.map_or(1.0, |fb| snr_weight(target_band_energies[b], fb[b]));
+            let (e_eff, d_e) =
+                noise_band_energies.map_or((err_e[b], 1.0), |fb| smooth_excess_sq(err_e[b], fb[b]));
+            let inv_denom = 1.0 / (3.0 * (target_band_energies[b] + eps_floor[b]).max(1.0e-18));
+            loss += w_snr * e_eff * inv_denom;
+            band_scale[b] = 2.0 * w_snr * d_e * inv_denom;
+        }
 
         if let Some(grad) = grad_opt {
             let w0 = warmup.min(n);
             let mut d_bands = [vec![0.0_f64; n], vec![0.0_f64; n], vec![0.0_f64; n]];
             for b in 0..3 {
-                let s = 2.0 * inv_denom[b];
+                let s = band_scale[b];
                 for t in w0..n {
                     d_bands[b][t] = s * bands[b][t];
                 }
@@ -440,6 +491,24 @@ mod tests {
         };
         let nq = evaluate_noise_qualified_besr(&q_rep, [-23.0, -20.0, -15.0], -18.0);
         assert!(nq.qualified_bands[0] && nq.passes);
+
+        // Noisy bESR smooth excess softplus matches central FD.
+        let spec_bn = BesrLossSpec {
+            target_band_energies: target_e,
+            noise_band_energies: Some([0.25, 0.1, 0.05]),
+            eps_floor: [1.0e-6; 3],
+            warmup: 128,
+        };
+        let mut g_bn = vec![0.0_f64; n];
+        let _ =
+            bank.eval_besr_loss_and_adjoint_with_noise(&pred, &target, spec_bn, Some(&mut g_bn));
+        let (mut pp, mut pm) = (pred.clone(), pred.clone());
+        pp[300] += eps;
+        pm[300] -= eps;
+        let fd_bn = (bank.eval_besr_loss_and_adjoint_with_noise(&pp, &target, spec_bn, None)
+            - bank.eval_besr_loss_and_adjoint_with_noise(&pm, &target, spec_bn, None))
+            / (2.0 * eps);
+        assert!((g_bn[300] - fd_bn).abs() <= 1.0e-5 * g_bn[300].abs().max(1.0e-4));
     }
 
     #[test]

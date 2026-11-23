@@ -22,7 +22,7 @@ pub use pass1_probe::{
 pub use pass2_opt::{
     DIMINISHING_RETURNS_DELTA_DB, OpNPreGrads, Pass2OptConfig, Pass2OptReport,
     eval_kautz_modal_and_adjoint, eval_op_n_pre_and_adjoint, eval_op_t_transport_and_adjoint,
-    generate_generic_sobol_seeds, run_pass2_optimize,
+    generate_generic_sobol_seeds, run_pass2_optimize, run_pass2_optimize_with_noise,
 };
 pub use pass3_varpro::{
     Pass3VarProReport, WeightedReadoutStem, extract_stat_256d_gram,

@@ -1,12 +1,12 @@
-//! Line-search-free Straight-Through Estimator (`STE`) quantization-aware `Adam` polish evaluating
-//! loss and adjoints at exact wire-quantized `binary16` / `binary32` parameters while updating `f64`
-//! shadow weights under strict monotone non-regression (`ref[train.pipeline.backbone-trajectory-opt]`).
-
-use core::f64::consts::PI;
+//! Conditioned `u`-space Straight-Through Estimator (`STE`) quantization-aware `AdamW` polish
+//! evaluating loss and adjoints at exact wire-quantized `binary16` / `binary32` parameters while
+//! updating scaled `u`-space shadow weights under strict monotone non-regression
+//! (`ref[train.pipeline.backbone-trajectory-opt]`).
 
 use crate::error::TrainError;
-use crate::linalg::lbfgs::ParamBoundSpec;
-use crate::losses::CompositeLossEvaluator;
+use crate::linalg::adamw::{AdamWConfig, AdamWState, cosine_lr_with_warmup};
+use crate::linalg::coords::ScaledCoordSpace;
+use crate::losses::{CompositeLossEvaluator, CompositeLossWeights};
 use crate::runner::TrainRunner;
 
 use super::super::model::{
@@ -23,32 +23,25 @@ pub(super) struct QatPolishOutcome {
     pub best_besr_db: f64,
 }
 
-#[inline]
-fn clamp_param(v: f64, bound: &ParamBoundSpec) -> f64 {
-    if v.is_finite() {
-        bound.project_physical(v)
-    } else {
-        bound.default_midpoint()
-    }
-}
-
 /// Refines `model` from the Pass-2 continuous optimum using `config.qat_polish_steps`
-/// line-search-free `STE` `Adam` updates over the wire-quantized forward/adjoint graph.
+/// line-search-free `STE` `AdamW` updates in conditioned `u`-space over the wire-quantized
+/// forward/adjoint graph under `weights`.
 ///
-/// Always returns a model with wire-snapped parameters whose loss is `<= baseline_loss` (or leaves
-/// `model` untouched when `config.qat_polish_steps == 0`).
+/// Always returns a wire-snapped model with `best_loss <= baseline_loss` (or leaves `model`
+/// untouched when `config.qat_polish_steps == 0`).
 pub(super) fn run_pass2_ste_qat_polish(
     runner: &TrainRunner,
     model: &mut SonaModelF64,
     pairs: &StereoTrainingPairs<'_>,
     loss_eval: &CompositeLossEvaluator,
+    weights: CompositeLossWeights,
     layout: &ThetaLayout,
     config: Pass2OptConfig,
 ) -> Result<QatPolishOutcome, TrainError> {
     let steps = config.qat_polish_steps;
     let n = pairs.aligned_len();
     let (in_l, in_r) = (&pairs.in_l[..n], &pairs.in_r[..n]);
-    let q_count = config.active_quads.clamp(1, 10);
+    let q_count = layout.q_opt.clamp(1, 10);
 
     let mut baseline_model = model.clone();
     snap_model_fp16(&mut baseline_model);
@@ -56,20 +49,27 @@ pub(super) fn run_pass2_ste_qat_polish(
     let mut gl = vec![0.0_f64; n];
     let mut gr = vec![0.0_f64; n];
     let base_bd = if steps > 0 {
-        loss_eval.eval_and_adjoint(
+        loss_eval.eval_and_adjoint_with_weights(
             &base_buf.pred_l,
             &base_buf.pred_r,
+            weights,
             Some(&mut gl),
             Some(&mut gr),
         )?
     } else {
-        loss_eval.eval_and_adjoint(&base_buf.pred_l, &base_buf.pred_r, None, None)?
+        loss_eval.eval_and_adjoint_with_weights(
+            &base_buf.pred_l,
+            &base_buf.pred_r,
+            weights,
+            None,
+            None,
+        )?
     };
     let baseline_loss = base_bd.total;
     let mut best_loss = baseline_loss;
     let mut best_besr_db = 10.0 * base_bd.besr.max(1.0e-12).log10();
 
-    if steps == 0 || !layout.is_fp16_wire.iter().any(|&is_fp16| is_fp16) {
+    if steps == 0 || !layout.is_fp16_wire.iter().any(|&is_fp16| is_fp16) || layout.dim() == 0 {
         return Ok(QatPolishOutcome {
             steps_run: 0,
             baseline_loss,
@@ -78,23 +78,37 @@ pub(super) fn run_pass2_ste_qat_polish(
         });
     }
 
-    let (mut theta_shadow, bounds) = layout.pack(model);
+    let (init_shadow, bounds) = layout.pack(model);
     let dim = layout.dim();
-    debug_assert_eq!(layout.is_fp16_wire.len(), dim);
-    debug_assert_eq!(theta_shadow.len(), dim);
+    let scales = layout.coord_scales(n);
+    let (space, mut u_shadow) = ScaledCoordSpace::new(
+        "run_pass2_ste_qat_polish",
+        &init_shadow,
+        &bounds,
+        Some(&scales),
+    )?;
+    let mut x_shadow = vec![0.0_f64; dim];
+    let mut jac_shadow = vec![0.0_f64; dim];
+    space.decode(&u_shadow, &mut x_shadow, &mut jac_shadow);
+
     let mut best_model = baseline_model.clone();
     let mut work_model = baseline_model;
-    let mut m_vec = vec![0.0_f64; dim];
-    let mut v_vec = vec![0.0_f64; dim];
-    let mut grad_vec = vec![0.0_f64; dim];
-
-    let beta1 = 0.9_f64;
-    let beta2 = 0.999_f64;
-    let eps = 1.0e-8_f64;
-    let base_lr = 1.0e-3_f64;
-
     let mut current_buf = base_buf;
     let mut current_model = work_model.clone();
+    let mut gx = vec![0.0_f64; dim];
+    let mut gu = vec![0.0_f64; dim];
+    let mut adamw = AdamWState::new(dim);
+    let adamw_cfg = AdamWConfig {
+        lr_max: 1.0e-3,
+        lr_min: 5.0e-5,
+        warmup_steps: 0,
+        beta1: 0.9,
+        beta2: 0.999,
+        eps: 1.0e-8,
+        weight_decay: 0.0,
+        grad_clip_norm: 10.0,
+    };
+
     for step in 0..steps {
         let grads = assemble_pass2_gradients(
             runner,
@@ -109,51 +123,38 @@ pub(super) fn run_pass2_ste_qat_polish(
                 k_opt: layout.k_opt,
             },
         )?;
-        grad_vec.fill(0.0);
-        layout.write_grad(&grads, &mut grad_vec);
+        gx.fill(0.0);
+        layout.write_grad(&grads, &mut gx);
+        space.pullback_grad(&gx, &jac_shadow, &mut gu);
 
-        let t_num = (step + 1) as f64;
-        let cos_decay = 0.5 * (1.0 + (PI * (step as f64) / (steps as f64)).cos());
-        let lr = base_lr * cos_decay.max(0.05);
-        let bias_corr1 = 1.0 - beta1.powf(t_num);
-        let bias_corr2 = 1.0 - beta2.powf(t_num);
-
-        for idx in 0..dim {
-            let g = if grad_vec[idx].is_finite() {
-                grad_vec[idx]
-            } else {
-                0.0
-            };
-            m_vec[idx] = beta1 * m_vec[idx] + (1.0 - beta1) * g;
-            v_vec[idx] = beta2 * v_vec[idx] + (1.0 - beta2) * g * g;
-            let m_hat = m_vec[idx] / bias_corr1;
-            let v_hat = v_vec[idx] / bias_corr2;
-            let step_lr = if layout.zoh_hold_depth_idx == Some(idx) {
-                lr / (n.max(1) as f64)
-            } else {
-                lr
-            };
-            theta_shadow[idx] = clamp_param(
-                theta_shadow[idx] - step_lr * m_hat / (v_hat.sqrt() + eps),
-                &bounds[idx],
-            );
-        }
+        let lr = cosine_lr_with_warmup(step, steps, &adamw_cfg);
+        adamw.step_u(&mut u_shadow, &mut gu, lr, &adamw_cfg, Some(space.scales()));
+        space.decode(&u_shadow, &mut x_shadow, &mut jac_shadow);
 
         work_model.clone_from(model);
-        layout.unpack(&theta_shadow, &mut work_model);
+        layout.unpack(&x_shadow, &mut work_model);
         snap_model_fp16(&mut work_model);
         let next_buf = eval_model_pass2_audio(runner, &work_model, in_l, in_r, q_count)?;
-        gl.fill(0.0);
-        gr.fill(0.0);
-        let bd = if step + 1 < steps {
-            loss_eval.eval_and_adjoint(
+
+        let need_grad = step + 1 < steps;
+        let bd = if need_grad {
+            gl.fill(0.0);
+            gr.fill(0.0);
+            loss_eval.eval_and_adjoint_with_weights(
                 &next_buf.pred_l,
                 &next_buf.pred_r,
+                weights,
                 Some(&mut gl),
                 Some(&mut gr),
             )?
         } else {
-            loss_eval.eval_and_adjoint(&next_buf.pred_l, &next_buf.pred_r, None, None)?
+            loss_eval.eval_and_adjoint_with_weights(
+                &next_buf.pred_l,
+                &next_buf.pred_r,
+                weights,
+                None,
+                None,
+            )?
         };
         if bd.total.is_finite() && bd.total < best_loss {
             best_loss = bd.total;
@@ -200,11 +201,11 @@ mod tests {
         .unwrap();
 
         let mut base = SonaModelF64::new(48_000.0);
-        base.core_quads[0].svf_k_nl = [0.234567, 0.0, 0.0, 0.0];
-        base.core_quads[0].adaa_drive = [1.234567, 0.5, 0.25, 0.1];
+        base.core_quads[0].svf_k_nl = [0.234_567, 0.0, 0.0, 0.0];
+        base.core_quads[0].adaa_drive = [1.234_567, 0.5, 0.25, 0.1];
         base.core_quads[0].tone_dir = [0.5, 0.0, 0.0, 0.0];
-        base.w_ro[0][6] = 0.612345;
-        base.direct_s2_u_gain = [0.212345, 0.212345];
+        base.w_ro[0][6] = 0.612_345;
+        base.direct_s2_u_gain = [0.212_345, 0.212_345];
 
         let layout = ThetaLayout::for_pass2_joint(&base, 2, 128.0);
         let pairs = StereoTrainingPairs {
@@ -213,8 +214,8 @@ mod tests {
             target_l: &tgt_l,
             target_r: &tgt_r,
         };
+        let w = CompositeLossWeights::homotopy_at(1.0);
 
-        // 1. qat_polish_steps == 0 is a no-op on model parameters.
         let mut m_noop = base.clone();
         let cfg0 = Pass2OptConfig {
             active_quads: 2,
@@ -222,21 +223,21 @@ mod tests {
             ..Pass2OptConfig::default()
         };
         let out0 =
-            run_pass2_ste_qat_polish(&runner, &mut m_noop, &pairs, &loss_eval, &layout, cfg0)
+            run_pass2_ste_qat_polish(&runner, &mut m_noop, &pairs, &loss_eval, w, &layout, cfg0)
                 .unwrap();
         assert_eq!(out0.steps_run, 0);
         assert_eq!(m_noop.w_ro[0], base.w_ro[0]);
         assert_eq!(m_noop.core_quads, base.core_quads);
 
-        // 2. qat_polish_steps > 0 never regresses past snapped baseline and produces fp16-idempotent model.
         let mut m_qat = base;
         let cfg4 = Pass2OptConfig {
             active_quads: 2,
             qat_polish_steps: 4,
             ..Pass2OptConfig::default()
         };
-        let out4 = run_pass2_ste_qat_polish(&runner, &mut m_qat, &pairs, &loss_eval, &layout, cfg4)
-            .unwrap();
+        let out4 =
+            run_pass2_ste_qat_polish(&runner, &mut m_qat, &pairs, &loss_eval, w, &layout, cfg4)
+                .unwrap();
         assert_eq!(out4.steps_run, 4);
         assert!(
             out4.best_loss <= out4.baseline_loss,

@@ -3,6 +3,8 @@
 //! bijection, `.dnam-bin` wire precision mask (`binary16` vs `binary32`), and gradient slot
 //! (`ref[train.pipeline.backbone-trajectory-opt]`).
 
+mod arena;
+
 use core::f64::consts::PI;
 
 use dnam_kernels::{
@@ -324,30 +326,40 @@ impl ThetaEntry {
             }
         };
         match self.kind {
-            ParamKind::CoreSvfG(q, l) => g.core_quads[q].svf_g[l],
-            ParamKind::CoreSvfK(q, l) => g.core_quads[q].svf_k[l],
-            ParamKind::CoreSvfKNl(q, l) => g.core_quads[q].svf_k_nl[l],
-            ParamKind::CoreToneLp(q, l) => g.core_quads[q].tone_lp[l],
-            ParamKind::CoreToneBp(q, l) => g.core_quads[q].tone_bp[l],
-            ParamKind::CoreToneHp(q, l) => g.core_quads[q].tone_hp[l],
-            ParamKind::CoreToneAp(q, l) => g.core_quads[q].tone_ap[l],
-            ParamKind::CoreToneDir(q, l) => g.core_quads[q].tone_dir[l],
-            ParamKind::CoreLruRel(q, l) => g.core_quads[q].lru_alpha_rel[l],
-            ParamKind::CoreLruAtk(q, l) => g.core_quads[q].lru_alpha_atk[l],
-            ParamKind::CoreLruKap(q, l) => g.core_quads[q].lru_kappa[l],
-            ParamKind::CoreLruDuhem(q, l) => g.core_quads[q].lru_duhem_gamma[l],
-            ParamKind::CoreLruSignedMix(q, l) => g.core_quads[q].lru_signed_mix[l],
-            ParamKind::CoreLruStereoLink(q, l) => g.core_quads[q].lru_stereo_link[l],
-            ParamKind::CoreSagDepth(q, l) => g.core_quads[q].sag_depth[l],
-            ParamKind::CoreAdaaDrive(q, l) => g.core_quads[q].adaa_drive[l],
-            ParamKind::CoreLruBias(q, l) => g.core_quads[q].lru_bias_drive[l],
-            ParamKind::CoreWavefolder(q, l) => g.core_quads[q].wavefolder_mix[l],
-            ParamKind::CoreGluMix(q, l) => g.core_quads[q].glu_mix[l],
-            ParamKind::CoreInMid(q, l) => g.core_quads[q].in_mid_weight[l],
-            ParamKind::CoreInSide(q, l) => g.core_quads[q].in_side_weight[l],
-            ParamKind::TileOdd(t, s, d) => g.tiles[t].w_odd_4x4[s][d],
-            ParamKind::TileEven(t, s, d) => g.tiles[t].w_even_4x4[s][d],
-            ParamKind::TileLru(t, s, d) => g.tiles[t].w_lru_4x4[s][d],
+            ParamKind::CoreSvfG(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.svf_g[l]),
+            ParamKind::CoreSvfK(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.svf_k[l]),
+            ParamKind::CoreSvfKNl(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.svf_k_nl[l]),
+            ParamKind::CoreToneLp(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.tone_lp[l]),
+            ParamKind::CoreToneBp(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.tone_bp[l]),
+            ParamKind::CoreToneHp(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.tone_hp[l]),
+            ParamKind::CoreToneAp(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.tone_ap[l]),
+            ParamKind::CoreToneDir(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.tone_dir[l]),
+            ParamKind::CoreLruRel(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.lru_alpha_rel[l]),
+            ParamKind::CoreLruAtk(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.lru_alpha_atk[l]),
+            ParamKind::CoreLruKap(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.lru_kappa[l]),
+            ParamKind::CoreLruDuhem(q, l) => {
+                g.core_quads.get(q).map_or(0.0, |c| c.lru_duhem_gamma[l])
+            }
+            ParamKind::CoreLruSignedMix(q, l) => {
+                g.core_quads.get(q).map_or(0.0, |c| c.lru_signed_mix[l])
+            }
+            ParamKind::CoreLruStereoLink(q, l) => {
+                g.core_quads.get(q).map_or(0.0, |c| c.lru_stereo_link[l])
+            }
+            ParamKind::CoreSagDepth(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.sag_depth[l]),
+            ParamKind::CoreAdaaDrive(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.adaa_drive[l]),
+            ParamKind::CoreLruBias(q, l) => {
+                g.core_quads.get(q).map_or(0.0, |c| c.lru_bias_drive[l])
+            }
+            ParamKind::CoreWavefolder(q, l) => {
+                g.core_quads.get(q).map_or(0.0, |c| c.wavefolder_mix[l])
+            }
+            ParamKind::CoreGluMix(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.glu_mix[l]),
+            ParamKind::CoreInMid(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.in_mid_weight[l]),
+            ParamKind::CoreInSide(q, l) => g.core_quads.get(q).map_or(0.0, |c| c.in_side_weight[l]),
+            ParamKind::TileOdd(t, s, d) => g.tiles.get(t).map_or(0.0, |tl| tl.w_odd_4x4[s][d]),
+            ParamKind::TileEven(t, s, d) => g.tiles.get(t).map_or(0.0, |tl| tl.w_even_4x4[s][d]),
+            ParamKind::TileLru(t, s, d) => g.tiles.get(t).map_or(0.0, |tl| tl.w_lru_4x4[s][d]),
             ParamKind::SenseSvfG(l) => g.sensory.d_svf_g[l],
             ParamKind::SenseLruRel(l) => g.sensory.d_lru_rel[l],
             ParamKind::SenseLruAtk(l) => g.sensory.d_lru_atk[l],
@@ -391,7 +403,7 @@ impl ThetaEntry {
             ParamKind::OpTWetTapL(q, l) => g.op_t[q].d_wet_tap_l[l],
             ParamKind::OpTWetTapR(q, l) => g.op_t[q].d_wet_tap_r[l],
             ParamKind::TankDryMix => g.d_tank_dry_mix,
-            ParamKind::WReadout(row, col) => g.d_w_ro[row][col],
+            ParamKind::WReadout(row, col) => g.d_w_ro.get(row).map_or(0.0, |r| r[col]),
             ParamKind::DirectS2U(c) => g.d_direct_s2_u[c],
             ParamKind::DirectS2Hp(c) => g.d_direct_s2_hp[c],
             ParamKind::PreConvU(c) => g.d_pre_conv_u[c],
@@ -703,25 +715,53 @@ pub(super) fn append_nonlinear_entries(
         entries.push(ThetaEntry::fp16(ParamKind::OpTWindowDepth(q), unit_box));
         entries.push(ThetaEntry::fp16(ParamKind::OpTScatPsi(q), angle_box));
     }
-    if include_extras {
+    if include_extras && active_opt_quads > 0 {
         entries.push(ThetaEntry::fp16(ParamKind::TankDryMix, tap_box));
     }
     zoh_hold_depth_idx
 }
 
-/// Appends active linear readout parameters (`w_ro`, `direct_s2`, `pre_conv`, Kautz residues)
-/// used during M20 joint Pass-2 optimization.
-pub(super) fn append_joint_readout_entries(
-    entries: &mut Vec<ThetaEntry>,
-    q_count: usize,
-    k_count: usize,
-) {
-    let ro_box = ParamBoundSpec::Box { lo: -8.0, hi: 8.0 };
+/// Appends bilinear pre-convolver coupling parameters (`w_ro[..][0..6]`, `pre_conv_u_gain`,
+/// `pre_conv_hp_gain`) so nonlinear `CoreQuad` features feed into `ModalConvolver` natively
+/// (`ref[train.pipeline.backbone-trajectory-opt]`).
+pub(super) fn append_pre_conv_entries(entries: &mut Vec<ThetaEntry>, q_count: usize) {
     let pre_box = ParamBoundSpec::Box { lo: -4.0, hi: 4.0 };
     for row in 0..(q_count * 4) {
         for col in 0..6 {
             entries.push(ThetaEntry::fp16(ParamKind::WReadout(row, col), pre_box));
         }
+    }
+    for c in 0..2 {
+        entries.push(ThetaEntry::fp16(ParamKind::PreConvU(c), pre_box));
+        entries.push(ThetaEntry::fp16(ParamKind::PreConvHp(c), pre_box));
+    }
+}
+
+/// Appends tier-invariant bilinear pre-convolver coupling limited to shared `Lite` lanes (`0..16`,
+/// `w_ro[0..16][0..6]`) and `pre_conv_u_gain`, keeping upper-tier `pre_conv` buses aligned between
+/// `Pass 3` and `SonaVm` without unmodeled `PreConvHp` leakage (`ref[train.pipeline.backbone-trajectory-opt]`).
+pub(super) fn append_shared_pre_conv_entries(entries: &mut Vec<ThetaEntry>, q_count: usize) {
+    let pre_box = ParamBoundSpec::Box { lo: -4.0, hi: 4.0 };
+    let shared_rows = q_count.min(4) * 4;
+    for row in 0..shared_rows {
+        for col in 0..6 {
+            entries.push(ThetaEntry::fp16(ParamKind::WReadout(row, col), pre_box));
+        }
+    }
+    for c in 0..2 {
+        entries.push(ThetaEntry::fp16(ParamKind::PreConvU(c), pre_box));
+    }
+}
+
+/// Appends strictly linear post-cascade direct readout parameters (`w_ro[..][6..12]`,
+/// `direct_s2_u_gain`, `direct_s2_hp_gain`, and Kautz modal output residues).
+pub(super) fn append_direct_readout_entries(
+    entries: &mut Vec<ThetaEntry>,
+    q_count: usize,
+    k_count: usize,
+) {
+    let ro_box = ParamBoundSpec::Box { lo: -8.0, hi: 8.0 };
+    for row in 0..(q_count * 4) {
         for col in 6..12 {
             entries.push(ThetaEntry::fp16(ParamKind::WReadout(row, col), ro_box));
         }
@@ -729,8 +769,6 @@ pub(super) fn append_joint_readout_entries(
     for c in 0..2 {
         entries.push(ThetaEntry::fp16(ParamKind::DirectS2U(c), ro_box));
         entries.push(ThetaEntry::fp16(ParamKind::DirectS2Hp(c), ro_box));
-        entries.push(ThetaEntry::fp16(ParamKind::PreConvU(c), pre_box));
-        entries.push(ThetaEntry::fp16(ParamKind::PreConvHp(c), pre_box));
     }
     for k in 0..k_count {
         entries.push(ThetaEntry::f32(ParamKind::KautzCReL(k), ro_box));
@@ -738,4 +776,26 @@ pub(super) fn append_joint_readout_entries(
         entries.push(ThetaEntry::f32(ParamKind::KautzCReR(k), ro_box));
         entries.push(ThetaEntry::f32(ParamKind::KautzCImR(k), ro_box));
     }
+}
+
+/// Appends active linear readout parameters (`w_ro`, `direct_s2`, `pre_conv`, Kautz residues)
+/// used during full-subspace FD parity verification.
+pub(super) fn append_joint_readout_entries(
+    entries: &mut Vec<ThetaEntry>,
+    q_count: usize,
+    k_count: usize,
+) {
+    append_pre_conv_entries(entries, q_count);
+    append_direct_readout_entries(entries, q_count, k_count);
+}
+
+/// Appends tier-invariant `Lite`-shared `pre_conv` coupling together with active linear post-cascade
+/// readouts for Phase-2D STE `QAT` and `Op-T`-coupled Pass-2 trajectories.
+pub(super) fn append_qat_readout_entries(
+    entries: &mut Vec<ThetaEntry>,
+    q_count: usize,
+    k_count: usize,
+) {
+    append_shared_pre_conv_entries(entries, q_count);
+    append_direct_readout_entries(entries, q_count, k_count);
 }

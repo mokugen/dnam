@@ -2,7 +2,7 @@
 //! loss (`L2Huber`, `HingeMaxDb`, `LogSumExpMinimax`), ultrasonic `[20 kHz, fs/2]` hinge, and
 //! exact reverse-mode FFT adjoints (`ref[qual.companion.ltas]`).
 
-use core::f64::consts::LN_10;
+mod mode_eval;
 
 use crate::error::TrainError;
 
@@ -11,11 +11,13 @@ use super::fft::{
     PairedFftWorkspace, Radix2FftPlan, build_hann_window, compute_welch_seg_starts,
     paired_real_backward_adjoint, paired_real_forward_spectra,
 };
+use super::noise_floor::snr_weight;
+use mode_eval::{eval_ltas_mode_terms, nyquist_hinge_loss_and_deriv};
 
 type WelchPowerResult = ([f64; 33], f64, Vec<(Vec<f64>, Vec<f64>)>);
 
 const NYQ_STOPBAND_TAG: u8 = 33;
-const DB_PER_LN: f64 = 10.0 / LN_10;
+const _: () = assert!(NYQ_STOPBAND_TAG == 33);
 
 /// Single frequency interval in the canonical 33-band base-10 1/3-octave LTAS partition.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -163,6 +165,8 @@ pub struct Welch33TargetCache {
     pub leak_floor: f64,
     /// Numerical positivity floor for `log` evaluation.
     pub floor: f64,
+    /// Per-band SNR attenuation weight `W_snr` (`1.0` when noise floor unavailable).
+    pub band_snr_w: [f64; 33],
     /// FFT plan.
     plan: Radix2FftPlan,
 }
@@ -170,6 +174,17 @@ pub struct Welch33TargetCache {
 impl Welch33TargetCache {
     /// Builds a Welch 33-band LTAS target summary on `target[warmup..]`.
     pub fn new(target: &[f64], warmup: usize, sample_rate_hz: f64) -> Result<Self, TrainError> {
+        Self::new_with_noise(target, None, warmup, sample_rate_hz)
+    }
+
+    /// Builds a Welch 33-band LTAS target summary alongside optional noise-floor SNR band
+    /// weights (`ref[qual.eval.thermal-hiss]`).
+    pub fn new_with_noise(
+        target: &[f64],
+        noise: Option<&[f64]>,
+        warmup: usize,
+        sample_rate_hz: f64,
+    ) -> Result<Self, TrainError> {
         if !(8_000.0..=1_536_000.0).contains(&sample_rate_hz) || target.len() <= warmup {
             return Err(TrainError::InvalidDimensions {
                 context: "Welch33TargetCache::new",
@@ -178,6 +193,15 @@ impl Welch33TargetCache {
             });
         }
         let len = target.len();
+        if let Some(ns) = noise
+            && (ns.len() < len || !ns[..len].iter().all(|v| v.is_finite()))
+        {
+            return Err(TrainError::InvalidDimensions {
+                context: "Welch33TargetCache::new_with_noise",
+                expected: len,
+                actual: ns.len(),
+            });
+        }
         let len_post = len - warmup;
         let max_freq_hz = if sample_rate_hz >= 40_000.0 {
             20_000.0
@@ -212,6 +236,7 @@ impl Welch33TargetCache {
             peak_p: 0.0,
             leak_floor: 0.0,
             floor: 1.0e-24,
+            band_snr_w: [1.0; 33],
             plan,
         };
         let (bp, np, _) = cache.accumulate_signal_powers(target, false);
@@ -228,6 +253,12 @@ impl Welch33TargetCache {
             }
         }
         cache.floor = (peak_p * 1.0e-15).max(1.0e-24);
+        if let Some(ns) = noise {
+            let (noise_bp, _, _) = cache.accumulate_signal_powers(&ns[..len], false);
+            for b in 0..33 {
+                cache.band_snr_w[b] = snr_weight(bp[b], noise_bp[b]);
+            }
+        }
         Ok(cache)
     }
 
@@ -448,43 +479,40 @@ pub fn compute_ltas_channel(
     }
 }
 
-#[inline]
-fn c2_hinge(u: f64, scale: f64, width: f64) -> (f64, f64) {
-    if u <= 0.0 {
+/// Evaluates differentiable 33-band Welch LTAS and ultrasonic `[20 kHz, fs/2]` hinge in a single
+/// fused Welch forward + adjoint FFT pass, accumulating `w_ltas * d_ltas + w_nyquist * d_nyquist`
+/// into `grad_opt` and returning `(unweighted_ltas, unweighted_nyquist)`.
+pub fn eval_ltas_and_nyquist_fused(
+    cache: &Welch33TargetCache,
+    pred: &[f64],
+    mode: LtasLossMode,
+    w_ltas: f64,
+    w_nyquist: f64,
+    grad_opt: Option<&mut [f64]>,
+) -> (f64, f64) {
+    if pred.len() != cache.len || cache.seg_starts.is_empty() || (w_ltas <= 0.0 && w_nyquist <= 0.0)
+    {
         return (0.0, 0.0);
     }
-    let c = 0.25 * width * width;
-    let u2 = u * u;
-    let d = u2 + c;
-    (scale * u2 * u / d, scale * u2 * (u2 + 3.0 * c) / (d * d))
-}
-
-#[inline]
-fn pseudo_huber(s: f64, delta: f64) -> (f64, f64) {
-    let r = s / delta;
-    let root = (1.0 + r * r).sqrt();
-    (delta * delta * (root - 1.0), s / root)
-}
-
-#[inline]
-fn nyquist_hinge_loss_and_deriv(cache: &Welch33TargetCache, nyq_p: f64, weight: f64) -> (f64, f64) {
-    if weight <= 0.0 {
-        return (0.0, 0.0);
+    let need_grad = grad_opt.is_some();
+    let (band_p, nyq_p, win_specs) = cache.accumulate_signal_powers(pred, need_grad);
+    let (ltas_loss, mut d_band) = if w_ltas > 0.0 {
+        eval_ltas_mode_terms(cache, &band_p, mode, need_grad)
+    } else {
+        (0.0, [0.0; 33])
+    };
+    let (nyq_loss, d_nyq) = if w_nyquist > 0.0 {
+        nyquist_hinge_loss_and_deriv(cache, nyq_p, 1.0)
+    } else {
+        (0.0, 0.0)
+    };
+    if let Some(grad) = grad_opt {
+        for d in &mut d_band {
+            *d *= w_ltas.max(0.0);
+        }
+        backprop_welch33_adjoint(cache, &win_specs, &d_band, w_nyquist.max(0.0) * d_nyq, grad);
     }
-    let hf_ref = cache
-        .tgt_nyq_p
-        .max(0.5 * cache.tgt_band_p[32])
-        .max(0.25 * cache.tgt_band_p[31]);
-    let tot_tgt = cache.tgt_band_p.iter().sum::<f64>().max(cache.floor);
-    let nyq_ceil = (2.2 * hf_ref + 2.0e-3 * tot_tgt).max(cache.floor);
-    if nyq_p <= nyq_ceil {
-        return (0.0, 0.0);
-    }
-    let u_db = DB_PER_LN * (nyq_p / nyq_ceil).ln();
-    (
-        weight * 2.0 * u_db * u_db,
-        weight * 4.0 * u_db * DB_PER_LN / nyq_p,
-    )
+    (ltas_loss, nyq_loss)
 }
 
 /// Evaluates differentiable 33-band Welch LTAS loss (+ optional ultrasonic `[20 kHz, fs/2]` hinge)
@@ -496,112 +524,9 @@ pub fn eval_ltas_loss_and_adjoint(
     nyquist_hinge_weight: f64,
     grad_opt: Option<&mut [f64]>,
 ) -> f64 {
-    if pred.len() != cache.len || cache.seg_starts.is_empty() {
-        return 0.0;
-    }
-    let need_grad = grad_opt.is_some();
-    let (band_p, nyq_p, win_specs) = cache.accumulate_signal_powers(pred, need_grad);
-    let mut d_band = [0.0_f64; 33];
-    let inv_act = 1.0 / (cache.active_count.max(1) as f64);
-
-    let mut loss = match mode {
-        LtasLossMode::LogSumExpMinimax { beta, goal_db } => {
-            let b_eff = beta.max(1.0);
-            let mut errs = [0.0_f64; 33];
-            let mut max_db = 0.0_f64;
-            let mut mean_sq = 0.0_f64;
-            for b in 0..33 {
-                if cache.active[b] {
-                    let e = DB_PER_LN
-                        * ((band_p[b] + cache.floor).ln()
-                            - (cache.tgt_band_p[b] + cache.floor).ln());
-                    errs[b] = e;
-                    max_db = max_db.max(e.abs());
-                    mean_sq += inv_act * e * e;
-                }
-            }
-            let z0 = (-b_eff * max_db).exp();
-            let (mut wp, mut wn, mut excess) = ([0.0_f64; 33], [0.0_f64; 33], 0.0_f64);
-            for b in 0..33 {
-                if cache.active[b] {
-                    wp[b] = (b_eff * (errs[b] - max_db)).exp();
-                    wn[b] = (b_eff * (-errs[b] - max_db)).exp();
-                    excess += (wp[b] - z0) + (wn[b] - z0);
-                }
-            }
-            let denom = (z0 + excess).max(1.0e-30);
-            let f_lse = (max_db + denom.ln() / b_eff).max(0.0);
-            let (sp, dsp) = if goal_db > 0.0 {
-                let u = f_lse - goal_db;
-                let r = (u * u + 1.0e-6).sqrt();
-                (0.5 * (u + r), 0.5 * (1.0 + u / r))
-            } else {
-                (f_lse, 1.0)
-            };
-            if need_grad {
-                let sl = if f_lse > 0.0 {
-                    2.0 * sp * dsp + 0.5 * f_lse
-                } else {
-                    0.0
-                };
-                for b in 0..33 {
-                    if cache.active[b] {
-                        let pb = band_p[b] + cache.floor;
-                        d_band[b] = (sl * (wp[b] - wn[b]) / denom + 0.5 * inv_act * errs[b])
-                            * DB_PER_LN
-                            / pb;
-                    }
-                }
-            }
-            sp * sp + 0.25 * f_lse * f_lse + 0.25 * mean_sq
-        }
-        LtasLossMode::HingeMaxDb(tmax) => {
-            let mut acc = 0.0_f64;
-            let tau = (0.72 * tmax).max(0.015);
-            let tw = (0.22 * tmax).max(0.010);
-            let eps = 0.003_f64;
-            for b in 0..33 {
-                if !cache.active[b] {
-                    continue;
-                }
-                let pb = band_p[b] + cache.floor;
-                let e = DB_PER_LN * (pb.ln() - (cache.tgt_band_p[b] + cache.floor).ln());
-                let root = (e * e + eps * eps).sqrt();
-                let u = (root - eps) - tau;
-                let (hv, hd) = pseudo_huber(e, 1.5);
-                let (gv, gd) = c2_hinge(u, 1.5, tw);
-                acc += 0.10 * inv_act * hv + 2.0 * gv;
-                if need_grad {
-                    d_band[b] = (0.10 * inv_act * hd + 2.0 * gd * (e / root)) * DB_PER_LN / pb;
-                }
-            }
-            acc
-        }
-        LtasLossMode::L2Huber => {
-            let mut acc = 0.0_f64;
-            for b in 0..33 {
-                if !cache.active[b] {
-                    continue;
-                }
-                let pb = band_p[b] + cache.floor;
-                let e = DB_PER_LN * (pb.ln() - (cache.tgt_band_p[b] + cache.floor).ln());
-                let (hv, hd) = pseudo_huber(e, 2.0);
-                acc += 2.0 * inv_act * hv;
-                if need_grad {
-                    d_band[b] = 2.0 * inv_act * hd * DB_PER_LN / pb;
-                }
-            }
-            acc
-        }
-    };
-
-    let (nyq_loss, d_nyq) = nyquist_hinge_loss_and_deriv(cache, nyq_p, nyquist_hinge_weight);
-    loss += nyq_loss;
-
-    if let Some(grad) = grad_opt {
-        backprop_welch33_adjoint(cache, &win_specs, &d_band, d_nyq, grad);
-    }
-    loss
+    let w_nyq = nyquist_hinge_weight.max(0.0);
+    let (ltas_l, nyq_l) = eval_ltas_and_nyquist_fused(cache, pred, mode, 1.0, w_nyq, grad_opt);
+    ltas_l + w_nyq * nyq_l
 }
 
 /// Evaluates purely the ultrasonic `[20 kHz, fs/2]` excess-energy stopband hinge and its FFT adjoint.
@@ -611,16 +536,13 @@ pub fn eval_nyquist_hinge_and_adjoint(
     weight: f64,
     grad_opt: Option<&mut [f64]>,
 ) -> f64 {
-    if pred.len() != cache.len || cache.seg_starts.is_empty() || weight <= 0.0 {
+    let w = weight.max(0.0);
+    if w <= 0.0 {
         return 0.0;
     }
-    let need_grad = grad_opt.is_some();
-    let (_, nyq_p, win_specs) = cache.accumulate_signal_powers(pred, need_grad);
-    let (loss, d_nyq) = nyquist_hinge_loss_and_deriv(cache, nyq_p, weight);
-    if let Some(grad) = grad_opt {
-        backprop_welch33_adjoint(cache, &win_specs, &[0.0; 33], d_nyq, grad);
-    }
-    loss
+    let (_, nyq_l) =
+        eval_ltas_and_nyquist_fused(cache, pred, LtasLossMode::L2Huber, 0.0, w, grad_opt);
+    w * nyq_l
 }
 
 fn backprop_welch33_adjoint(
@@ -799,6 +721,56 @@ mod tests {
             (nyq_g[500] - fd_nyq).abs() <= 1.0e-5 * nyq_g[500].abs().max(1.0e-4),
             "nyq ana={} fd={fd_nyq}",
             nyq_g[500]
+        );
+
+        // Noisy fused LTAS + UltrasonicHinge matches separate weighted grads and central FD.
+        let noise_cache =
+            Welch33TargetCache::new_with_noise(&target, Some(&loud_noise), 64, sr).unwrap();
+        let mut gf = vec![0.0_f64; n];
+        let (vl, vn) = eval_ltas_and_nyquist_fused(
+            &noise_cache,
+            &pred,
+            LtasLossMode::LogSumExpMinimax {
+                beta: 4.0,
+                goal_db: 0.2,
+            },
+            0.1,
+            0.25,
+            Some(&mut gf),
+        );
+        let comb = 0.1 * vl + 0.25 * vn;
+        assert!(comb.is_finite());
+        pp = pred.clone();
+        pm = pred.clone();
+        pp[500] += eps;
+        pm[500] -= eps;
+        let (vp_l, vp_n) = eval_ltas_and_nyquist_fused(
+            &noise_cache,
+            &pp,
+            LtasLossMode::LogSumExpMinimax {
+                beta: 4.0,
+                goal_db: 0.2,
+            },
+            0.1,
+            0.25,
+            None,
+        );
+        let (vm_l, vm_n) = eval_ltas_and_nyquist_fused(
+            &noise_cache,
+            &pm,
+            LtasLossMode::LogSumExpMinimax {
+                beta: 4.0,
+                goal_db: 0.2,
+            },
+            0.1,
+            0.25,
+            None,
+        );
+        let fd_fused = ((0.1 * vp_l + 0.25 * vp_n) - (0.1 * vm_l + 0.25 * vm_n)) / (2.0 * eps);
+        assert!(
+            (gf[500] - fd_fused).abs() <= 1.0e-5 * gf[500].abs().max(1.0e-4),
+            "fused noisy ana={} fd={fd_fused}",
+            gf[500]
         );
     }
 }

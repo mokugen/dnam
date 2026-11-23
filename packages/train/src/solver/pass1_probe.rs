@@ -16,7 +16,10 @@ pub use telemetry_init::{OpPProbeSummary, Pass1PhysicsHint, run_cpu_op_p_probe};
 
 use crate::error::TrainError;
 
-use super::model::{NUM_FIR_TAPS_ULTRA, NUM_KAUTZ_PAIRS_ULTRA, SonaModelF64};
+use super::model::{
+    NUM_FIR_TAPS_ULTRA, NUM_KAUTZ_PAIRS_ULTRA, NUM_TRANSPORT_QUADS_ULTRA, SonaModelF64,
+    TransportQuadF64,
+};
 use fir_toeplitz::{fit_early_fir_taps, residual_after_fir};
 use kautz_fit::{
     KautzFitInputs, append_log_octave_h2_candidates, fit_joint_kautz_bank, poles_too_close,
@@ -142,8 +145,8 @@ pub fn run_pass1_probe_with_hint(
             hint,
         },
     );
-    let delay_samp = op_t_out.dominant_delay_samples;
-    let loop_g = op_t_out.estimated_loop_gain;
+    let mut delay_samp = op_t_out.dominant_delay_samples;
+    let mut loop_g = op_t_out.estimated_loop_gain;
     let tgt_no_opt_l = op_t_out.tgt_no_opt_l;
     let tgt_no_opt_r = op_t_out.tgt_no_opt_r;
 
@@ -224,6 +227,14 @@ pub fn run_pass1_probe_with_hint(
         .zip(&final_res_r[start..n])
         .map(|(a, b)| a * a + b * b)
         .sum();
+    if op_t_out.incoherent_echo_only_soft_seed
+        && res_tot_e < 0.03 * tgt_tot_e
+        && res_tot_e < 0.5 * res_fir_tot_e
+    {
+        model.transport_quads = [TransportQuadF64::default(); NUM_TRANSPORT_QUADS_ULTRA];
+        delay_samp = 0.0;
+        loop_g = 0.0;
+    }
 
     model.pre_conv_u_gain = if model.active_fir_taps > 0 || model.active_kautz_pairs > 0 {
         [1.0, 1.0]
@@ -348,6 +359,99 @@ mod tests {
             rep_r.estimated_loop_gain > 0.35,
             "g={}",
             rep_r.estimated_loop_gain
+        );
+
+        // Steep narrowband pure-LTI filter (`450..800 Hz` cascaded poles) must release any
+        // incoherent `Op-T` boundary seed once `FIR + Kautz` solves the linear tail (`< 0.03`).
+        let n_bp = 8_192_usize;
+        let mut bp_in = vec![0.0_f64; n_bp];
+        let mut rng = 0x1357_2468_9ACE_BDF0_u64;
+        for (i, dst) in bp_in.iter_mut().enumerate() {
+            rng = rng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let white = ((rng >> 33) as f64) / ((1_u64 << 31) as f64) - 1.0;
+            let t = (i as f64) / sr;
+            let tone = 0.35 * (TAU * 550.0 * t).sin() + 0.25 * (TAU * 700.0 * t).cos();
+            *dst = 0.45 * white + tone + if i == 64 { 0.7 } else { 0.0 };
+        }
+        let r_hp450 = (-TAU * 450.0 / sr).exp();
+        let r_lp800 = (-TAU * 800.0 / sr).exp();
+        let (mut s_hp, mut s_lp) = ([0.0_f64; 8], [0.0_f64; 8]);
+        let mut bp_tgt = vec![0.0_f64; n_bp];
+        for (i, &x) in bp_in.iter().enumerate() {
+            let mut v = x;
+            for st in &mut s_hp {
+                let lp = (1.0 - r_hp450) * v + r_hp450 * *st;
+                *st = lp;
+                v -= lp;
+            }
+            for st in &mut s_lp {
+                *st = (1.0 - r_lp800) * v + r_lp800 * *st;
+                v = *st;
+            }
+            bp_tgt[i] = 3.5 * v;
+        }
+        let (rep_bp, mdl_bp) =
+            run_pass1_probe(&bp_in, &bp_in, &bp_tgt, &bp_tgt, sr, 128, 32).unwrap();
+        assert_eq!(rep_bp.dominant_transport_delay_samples, 0.0);
+        assert_eq!(rep_bp.estimated_loop_gain, 0.0);
+        assert!(mdl_bp.transport_quads.iter().all(|tq| tq.g_loop == 0.0));
+        assert!(
+            rep_bp.initial_esr_lin < 0.03,
+            "steep LTI bandpass esr={}",
+            rep_bp.initial_esr_lin
+        );
+
+        let bad_hint = Pass1PhysicsHint {
+            delay_ms: Some(0.0),
+            rt60_s: Some(f64::NAN),
+            modulation_rate_hz: Some(-1.0),
+            ..Pass1PhysicsHint::default()
+        };
+        let res_bp_h = run_pass1_probe_with_hint(
+            &bp_in,
+            &bp_in,
+            &bp_tgt,
+            &bp_tgt,
+            Pass1ProbeConfig {
+                sample_rate_hz: sr,
+                max_fir_taps: 128,
+                max_kautz_pairs: 32,
+                hint: Some(&bad_hint),
+            },
+        )
+        .unwrap();
+        assert_eq!(res_bp_h.report.estimated_loop_gain, 0.0);
+
+        // Subtle unhinted late feedforward echo (`-17 dB`, lag 220 > 128 FIR taps, white dry input
+        // so `dry_rho < 0.35` and `crisp_rho < 0.25`) must NOT have Op-T wiped because Kautz does
+        // not attenuate its post-FIR residual (`res_tot_e >= 0.5 * res_fir_tot_e`).
+        let mut echo_in = vec![0.0_f64; n_bp];
+        let mut erng = 0x2468_ACE0_1357_9BDF_u64;
+        for dst in &mut echo_in {
+            erng = erng
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *dst = 0.5 * (((erng >> 33) as f64) / ((1_u64 << 31) as f64) - 1.0);
+        }
+        let echo_tgt: Vec<f64> = (0..n_bp)
+            .map(|i| {
+                echo_in[i]
+                    + if i >= 220 {
+                        0.14 * echo_in[i - 220]
+                    } else {
+                        0.0
+                    }
+            })
+            .collect();
+        let (rep_echo, mdl_echo) =
+            run_pass1_probe(&echo_in, &echo_in, &echo_tgt, &echo_tgt, sr, 128, 32).unwrap();
+        assert!(
+            rep_echo.estimated_loop_gain > 0.0
+                && mdl_echo.transport_quads.iter().any(|tq| tq.g_loop > 0.0),
+            "subtle late echo must keep Op-T seeded (g={})",
+            rep_echo.estimated_loop_gain
         );
     }
 }

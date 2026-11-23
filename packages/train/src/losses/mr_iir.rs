@@ -3,11 +3,21 @@
 
 use core::f64::consts::PI;
 
+use super::noise_floor::{smooth_excess_sq, snr_weight};
+
 const SCALES: [usize; 5] = [256, 512, 1024, 2048, 4096];
 const NUM_PROBES: usize = 32;
 const PROBE_GROUPS: usize = NUM_PROBES / 4;
 const RMS_SMOOTH_EPS: f64 = 1.0e-30;
 const LOG_SMOOTH_EPS: f64 = 1.0e-6;
+const _: () = assert!(
+    SCALES[0] == 256
+        && SCALES[4] == 4096
+        && NUM_PROBES == 32
+        && PROBE_GROUPS * 4 == NUM_PROBES
+        && RMS_SMOOTH_EPS > 0.0
+        && LOG_SMOOTH_EPS > 0.0
+);
 
 #[derive(Clone, Debug)]
 struct ScaleTarget {
@@ -28,6 +38,7 @@ struct ScaleTarget {
 pub struct MrIirTargetCache {
     warmup: usize,
     t_sel: usize,
+    has_noise: bool,
     scales: Vec<ScaleTarget>,
 }
 
@@ -237,6 +248,7 @@ impl MrIirTargetCache {
         Some(Self {
             warmup,
             t_sel,
+            has_noise: noise.is_some(),
             scales,
         })
     }
@@ -453,13 +465,20 @@ pub fn eval_mr_iir_loss_and_adjoint(
                     let em = (cp_ps[cp_we][l] - cp_ps[cp_ws][l]).max(0.0);
                     let rms_m = ((em + RMS_SMOOTH_EPS) * scale.inv_win_len).sqrt();
                     let diff = rms_m - a_t;
-                    sc_num_sq += diff * diff;
+                    let (w_snr, (e_eff, d_e)) = if cache.has_noise {
+                        let sn = scale.win_sigma_n[g][w][l];
+                        let en = sn * sn;
+                        (snr_weight(a_t * a_t, en), smooth_excess_sq(diff * diff, en))
+                    } else {
+                        (1.0, (diff * diff, 1.0))
+                    };
+                    sc_num_sq += w_snr * e_eff;
                     let (dm_v, dm_g) = if a_t > 1.0e-18 {
                         let u = (rms_m / a_t).ln();
                         let r_u = (u * u + LOG_SMOOTH_EPS).sqrt();
                         (
-                            r_u - LOG_SMOOTH_EPS.sqrt(),
-                            (u / r_u) * scale.inv_win_len
+                            w_snr * (r_u - LOG_SMOOTH_EPS.sqrt()),
+                            w_snr * (u / r_u) * scale.inv_win_len
                                 / (2.0 * rms_m * rms_m * scale.cell_count),
                         )
                     } else {
@@ -467,7 +486,7 @@ pub fn eval_mr_iir_loss_and_adjoint(
                     };
                     mag_sum += dm_v;
                     if need_grad {
-                        d_sc[row_idx][l] = diff * scale.inv_win_len / (2.0 * rms_m);
+                        d_sc[row_idx][l] = (w_snr * d_e * diff) * scale.inv_win_len / (2.0 * rms_m);
                         d_mag[row_idx][l] = dm_g;
                     }
                 }
@@ -559,6 +578,26 @@ mod tests {
                 (grad[idx] - fd).abs() <= 1.0e-5 * grad[idx].abs().max(1.0e-4),
                 "MR-IIR idx={idx} ana={} fd={fd}",
                 grad[idx]
+            );
+        }
+
+        // Noise-floor SNR weighting + smooth excess softplus matches central FD cleanly.
+        let noise_cache = MrIirTargetCache::new(&target, Some(&hiss), 64, 48_000.0).unwrap();
+        let mut grad_n = vec![0.0_f64; n];
+        let val_n = eval_mr_iir_loss_and_adjoint(&noise_cache, &pred, Some(&mut grad_n));
+        assert!(val_n.is_finite() && val_n > 0.0);
+        for idx in [128, 350] {
+            let mut pp = pred.clone();
+            let mut pm = pred.clone();
+            pp[idx] += eps;
+            pm[idx] -= eps;
+            let fd_n = (eval_mr_iir_loss_and_adjoint(&noise_cache, &pp, None)
+                - eval_mr_iir_loss_and_adjoint(&noise_cache, &pm, None))
+                / (2.0 * eps);
+            assert!(
+                (grad_n[idx] - fd_n).abs() <= 1.0e-5 * grad_n[idx].abs().max(1.0e-4),
+                "MR-IIR noisy idx={idx} ana={} fd={fd_n}",
+                grad_n[idx]
             );
         }
     }

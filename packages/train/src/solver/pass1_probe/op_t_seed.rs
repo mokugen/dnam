@@ -2,17 +2,18 @@
 //! symmetric pure-wet `TransportQuad`s (`>= 5.0` samples, zero lockout on diffuse reverbs or
 //! subtle chorus, silent target guard) (`ref[train.pipeline.physics-probe]`).
 
+mod peaks;
+
 use crate::control::stability::MIN_DELAY_CROSSBAR_SAMP;
-use crate::losses::Radix2FftPlan;
 
 use super::super::model::TransportQuadF64;
 use super::super::pass2_opt::op_t_quad::{
     eval_op_t_bank_stereo_and_adjoint, eval_op_t_quad_stereo_and_adjoint,
 };
 use super::telemetry_init::Pass1PhysicsHint;
+use peaks::{GCC_WIN_CAP, GccPeakStats, detect_gcc_phat_cepstrum_peaks};
 
 const OPT_MAX_QUADS: usize = 4;
-const GCC_WIN_CAP: usize = 16_384;
 const _: () = assert!(OPT_MAX_QUADS == 4);
 const _: () = assert!(GCC_WIN_CAP.is_power_of_two());
 
@@ -20,6 +21,7 @@ const _: () = assert!(GCC_WIN_CAP.is_power_of_two());
 pub(super) struct OpTSeedOutcome {
     pub dominant_delay_samples: f64,
     pub estimated_loop_gain: f64,
+    pub incoherent_echo_only_soft_seed: bool,
     pub tgt_no_opt_l: Vec<f64>,
     pub tgt_no_opt_r: Vec<f64>,
 }
@@ -48,223 +50,6 @@ fn normalized_res_autocorr_peak(residual: &[f64], max_lag: usize) -> (f64, f64) 
         }
     }
     (best_lag as f64, best_rho)
-}
-
-fn chunk_env_mod_stats(
-    in_l: &[f64],
-    in_r: &[f64],
-    res_l: &[f64],
-    res_r: &[f64],
-    start: usize,
-    win_n: usize,
-) -> (f64, f64) {
-    let chunk = 64_usize.min(win_n / 4).max(8);
-    let mut dry_env = Vec::new();
-    let mut res_env = Vec::new();
-    let mut s_pos = start;
-    while s_pos + chunk <= start + win_n {
-        let d_rms = (in_l[s_pos..s_pos + chunk]
-            .iter()
-            .zip(&in_r[s_pos..s_pos + chunk])
-            .map(|(a, b)| a * a + b * b)
-            .sum::<f64>()
-            / (2.0 * (chunk as f64)))
-            .sqrt();
-        let r_rms = (res_l[s_pos..s_pos + chunk]
-            .iter()
-            .zip(&res_r[s_pos..s_pos + chunk])
-            .map(|(a, b)| a * a + b * b)
-            .sum::<f64>()
-            / (2.0 * (chunk as f64)))
-            .sqrt();
-        dry_env.push(d_rms);
-        res_env.push(r_rms);
-        s_pos += chunk;
-    }
-    if dry_env.is_empty() {
-        return (0.0, 0.0);
-    }
-    let inv_m = 1.0 / (dry_env.len() as f64);
-    let dry_mean = dry_env.iter().sum::<f64>() * inv_m;
-    let res_mean = res_env.iter().sum::<f64>() * inv_m;
-    let (mut dry_var, mut res_var, mut cov) = (0.0_f64, 0.0_f64, 0.0_f64);
-    for (&d, &r) in dry_env.iter().zip(&res_env) {
-        let dd = d - dry_mean;
-        let dr = r - res_mean;
-        dry_var += dd * dd;
-        res_var += dr * dr;
-        cov += dd * dr;
-    }
-    let dry_std = (dry_var * inv_m).sqrt();
-    let res_std = (res_var * inv_m).sqrt();
-    let excess_mod_cv =
-        (res_std / res_mean.max(1.0e-12) - dry_std / dry_mean.max(1.0e-12)).max(0.0);
-    let env_corr = if dry_std > 1.0e-6 * dry_mean.max(1.0e-12) && res_std > 1.0e-12 {
-        ((cov * inv_m) / (dry_std * res_std)).clamp(-1.0, 1.0)
-    } else {
-        0.0
-    };
-    (excess_mod_cv, env_corr)
-}
-
-struct GccPeakStats {
-    peaks: Vec<(f64, f64)>,
-    phat_z: f64,
-    dry_rho_at_top_lag: f64,
-    excess_mod_cv: f64,
-    env_corr: f64,
-    hf_ratio: f64,
-}
-
-/// Computes FFT GCC-PHAT + power-envelope cepstrum delay candidates `>= 5.0` samples along with
-/// MAD-calibrated peak Z-score, dry autocorrelation at `top_lag`, and excess envelope modulation CV.
-fn detect_gcc_phat_cepstrum_peaks(
-    in_l: &[f64],
-    in_r: &[f64],
-    res_l: &[f64],
-    res_r: &[f64],
-    start: usize,
-    max_lag: usize,
-) -> GccPeakStats {
-    let n = in_l.len().min(in_r.len()).min(res_l.len()).min(res_r.len());
-    let win_n = n.saturating_sub(start).min(GCC_WIN_CAP);
-    let lag_lo = MIN_DELAY_CROSSBAR_SAMP as usize;
-    let lag_hi = max_lag.min(win_n / 2).max(lag_lo);
-    if win_n < lag_lo + 16 {
-        return GccPeakStats {
-            peaks: Vec::new(),
-            phat_z: 0.0,
-            dry_rho_at_top_lag: 0.0,
-            excess_mod_cv: 0.0,
-            env_corr: 0.0,
-            hf_ratio: 0.0,
-        };
-    }
-
-    let l_fft = (2 * win_n).next_power_of_two();
-    let Ok(plan) = Radix2FftPlan::new(l_fft) else {
-        return GccPeakStats {
-            peaks: Vec::new(),
-            phat_z: 0.0,
-            dry_rho_at_top_lag: 0.0,
-            excess_mod_cv: 0.0,
-            env_corr: 0.0,
-            hf_ratio: 0.0,
-        };
-    };
-
-    let dry_mono: Vec<f64> = (0..win_n)
-        .map(|t| 0.5 * (in_l[start + t] + in_r[start + t]))
-        .collect();
-    let res_mono: Vec<f64> = (0..win_n)
-        .map(|t| 0.5 * (res_l[start + t] + res_r[start + t]))
-        .collect();
-    let xm_mean = dry_mono.iter().sum::<f64>() / (win_n as f64);
-    let ym_mean = res_mono.iter().sum::<f64>() / (win_n as f64);
-
-    let mut xr = vec![0.0_f64; l_fft];
-    let mut xi = vec![0.0_f64; l_fft];
-    let mut yr = vec![0.0_f64; l_fft];
-    let mut yi = vec![0.0_f64; l_fft];
-    for t in 0..win_n {
-        xr[t] = dry_mono[t] - xm_mean;
-        yr[t] = res_mono[t] - ym_mean;
-    }
-    plan.fft_in_place(&mut xr, &mut xi);
-    plan.fft_in_place(&mut yr, &mut yi);
-
-    let mut avg_p = 0.0_f64;
-    let mut phat_re = vec![0.0_f64; l_fft];
-    let mut phat_im = vec![0.0_f64; l_fft];
-    let mut cep_re = vec![0.0_f64; l_fft];
-    let mut cep_im = vec![0.0_f64; l_fft];
-    for k in 0..l_fft {
-        let cr = yr[k] * xr[k] + yi[k] * xi[k];
-        let ci = yi[k] * xr[k] - yr[k] * xi[k];
-        let mag = cr.hypot(ci);
-        avg_p += mag;
-        let pyr = yr[k] * yr[k] + yi[k] * yi[k];
-        cep_re[k] = (pyr + 1.0e-12).ln();
-        phat_re[k] = cr;
-        phat_im[k] = ci;
-    }
-    let reg = 1.0e-3 * (avg_p / (l_fft as f64)).max(1.0e-12);
-    for k in 0..l_fft {
-        let den = phat_re[k].hypot(phat_im[k]) + reg;
-        phat_re[k] /= den;
-        phat_im[k] /= den;
-    }
-    plan.ifft_in_place(&mut phat_re, &mut phat_im);
-    plan.ifft_in_place(&mut cep_re, &mut cep_im);
-
-    let (excess_mod_cv, env_corr) = chunk_env_mod_stats(in_l, in_r, res_l, res_r, start, win_n);
-
-    let (mut hf_res, mut tot_res) = (0.0_f64, 0.0_f64);
-    for k in 1..(l_fft / 2) {
-        let p = yr[k] * yr[k] + yi[k] * yi[k];
-        tot_res += p;
-        if k > l_fft / 4 {
-            hf_res += p;
-        }
-    }
-    let hf_ratio = hf_res / tot_res.max(1.0e-12);
-
-    let mut phat_mags = Vec::with_capacity(lag_hi - lag_lo + 1);
-    let mut scored = Vec::with_capacity(lag_hi - lag_lo + 1);
-    let mut top_p = 0.0_f64;
-    let mut top_lag = lag_lo;
-    for lag in lag_lo..=lag_hi {
-        let p_mag = phat_re[lag].abs();
-        if p_mag.is_finite() {
-            phat_mags.push(p_mag);
-            if p_mag > top_p {
-                top_p = p_mag;
-                top_lag = lag;
-            }
-        }
-        let score = p_mag + 0.35 * cep_re[lag].abs();
-        if score.is_finite() {
-            scored.push((lag as f64, score));
-        }
-    }
-    phat_mags.sort_by(f64::total_cmp);
-    let phat_z = if let Some(&med_p) = phat_mags.get(phat_mags.len() / 2) {
-        let sigma_mad = (med_p / 0.674_489_75).max(1.0e-12);
-        top_p / sigma_mad
-    } else {
-        0.0
-    };
-    let dry_e0: f64 = dry_mono
-        .iter()
-        .map(|&v| {
-            let d = v - xm_mean;
-            d * d
-        })
-        .sum::<f64>()
-        .max(1.0e-12);
-    let dry_lag_dot: f64 = (top_lag..win_n)
-        .map(|t| (dry_mono[t] - xm_mean) * (dry_mono[t - top_lag] - xm_mean))
-        .sum();
-    let dry_rho_at_top_lag = dry_lag_dot.abs() / dry_e0;
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-
-    let mut peaks: Vec<(f64, f64)> = Vec::new();
-    for (lag, sc) in scored {
-        if peaks.iter().all(|&(pl, _)| (pl - lag).abs() >= 3.0) {
-            peaks.push((lag, sc));
-            if peaks.len() >= 16 {
-                break;
-            }
-        }
-    }
-    GccPeakStats {
-        peaks,
-        phat_z,
-        dry_rho_at_top_lag,
-        excess_mod_cv,
-        env_corr,
-        hf_ratio,
-    }
 }
 
 fn estimate_comb_wet_tap(
@@ -340,6 +125,7 @@ pub(super) fn seed_soft_op_t_quads(
         return OpTSeedOutcome {
             dominant_delay_samples: 0.0,
             estimated_loop_gain: 0.0,
+            incoherent_echo_only_soft_seed: false,
             tgt_no_opt_l,
             tgt_no_opt_r,
         };
@@ -422,6 +208,7 @@ pub(super) fn seed_soft_op_t_quads(
                 return OpTSeedOutcome {
                     dominant_delay_samples: crisp_lag,
                     estimated_loop_gain: g_init,
+                    incoherent_echo_only_soft_seed: false,
                     tgt_no_opt_l,
                     tgt_no_opt_r,
                 };
@@ -434,17 +221,28 @@ pub(super) fn seed_soft_op_t_quads(
     // tail, or explicit Stage-A physics hint so memoryless waveshaping never triggers Op-T tanks.
     let GccPeakStats {
         peaks,
+        top_lag,
         phat_z,
         dry_rho_at_top_lag,
+        res_xy_rho_at_top_lag,
         excess_mod_cv,
         env_corr,
         hf_ratio,
     } = detect_gcc_phat_cepstrum_peaks(input_l, input_r, res_fir_l, res_fir_r, start, max_lag);
     let res_frac = (res_fir_tot_e / tgt_tot_e).clamp(0.0, 1.0);
+    let pos_hint = |opt: Option<f64>| opt.filter(|&v| v.is_finite() && v > 0.0);
     let has_hint = hint
-        .and_then(|h| h.delay_ms.or(h.rt60_s).or(h.modulation_rate_hz))
+        .and_then(|h| {
+            pos_hint(h.delay_ms)
+                .or_else(|| pos_hint(h.rt60_s))
+                .or_else(|| pos_hint(h.modulation_rate_hz))
+        })
         .is_some();
-    let has_echo_prominence = phat_z >= 6.5 && dry_rho_at_top_lag < 0.35 && res_frac >= 1.0e-3;
+    let has_echo_prominence = top_lag >= 32
+        && phat_z >= 6.5
+        && dry_rho_at_top_lag < 0.35
+        && res_xy_rho_at_top_lag >= 0.12
+        && res_frac >= 1.0e-3;
     let has_mod_transport = excess_mod_cv > 0.18 && env_corr < 0.65 && res_frac >= 5.0e-4;
     let has_decay_tail = if n >= start + 256 {
         let mid = start + (n - start) / 2;
@@ -472,6 +270,7 @@ pub(super) fn seed_soft_op_t_quads(
         return OpTSeedOutcome {
             dominant_delay_samples: 0.0,
             estimated_loop_gain: 0.0,
+            incoherent_echo_only_soft_seed: false,
             tgt_no_opt_l,
             tgt_no_opt_r,
         };
@@ -555,7 +354,11 @@ pub(super) fn seed_soft_op_t_quads(
         tq.damp_pole = (0.18 + 0.25 * (1.0 - hf_ratio.clamp(0.0, 1.0))).clamp(0.05, 0.75);
         tq.input_gains = [0.25, 0.25, -0.25, -0.25];
         tq.wet_tap_l = [sign, 0.5 * sign, -sign, -0.5 * sign];
-        tq.wet_tap_r = [0.5 * sign, -sign, -0.5 * sign, sign];
+        tq.wet_tap_r = if hint.and_then(|h| h.has_stereo_width) == Some(false) {
+            tq.wet_tap_l
+        } else {
+            [0.5 * sign, -sign, -0.5 * sign, sign]
+        };
         tq.allpass_delays = [7, 13, 19, 29];
         tq.allpass_g = [0.22, -0.18, 0.16, -0.12];
         tq.scat_psi = sign * 0.20;
@@ -604,6 +407,17 @@ pub(super) fn seed_soft_op_t_quads(
     }
 
     let coherent = alpha_ls.abs() >= 0.01 && err_after < 0.92 * res_eval_e;
+    let allow_incoherent_soft_seed =
+        has_echo_prominence || has_decay_tail || hint_rt60.is_some() || mod_detected;
+    if !coherent && !allow_incoherent_soft_seed {
+        return OpTSeedOutcome {
+            dominant_delay_samples: 0.0,
+            estimated_loop_gain: 0.0,
+            incoherent_echo_only_soft_seed: false,
+            tgt_no_opt_l,
+            tgt_no_opt_r,
+        };
+    }
     let tap_scale = if coherent { alpha_ls } else { 0.005 };
     for tq in &mut cand_quads {
         for v in &mut tq.wet_tap_l {
@@ -632,6 +446,7 @@ pub(super) fn seed_soft_op_t_quads(
     OpTSeedOutcome {
         dominant_delay_samples: delays[0],
         estimated_loop_gain: soft_g,
+        incoherent_echo_only_soft_seed: !coherent && !has_decay_tail && !mod_detected && !has_hint,
         tgt_no_opt_l,
         tgt_no_opt_r,
     }
@@ -819,5 +634,124 @@ mod tests {
         assert_eq!(out_step.estimated_loop_gain, 0.0);
         assert_eq!(mdl_step.transport_quads[0].g_loop, 0.0);
         assert_eq!(mdl_step.transport_quads[0].lfo_rate_hz, 0.0);
+
+        // 6. Nonlinear waveshaper + 16-sample-delayed resonant FIR/cabinet (no Op-T) must NOT lock Op-T.
+        let mut x_zc = vec![0.0_f64; n];
+        let mut s6 = 0x517C_C1B7_2722_0A95_u64;
+        for v in &mut x_zc {
+            s6 = s6
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *v = ((s6 >> 32) as f64) / ((1_u64 << 32) as f64) - 0.5;
+        }
+        let mut shaper_y = vec![0.0_f64; n];
+        let mut lin_y = vec![0.0_f64; n];
+        for t in 16..n {
+            let nl = 0.7 * (2.5 * x_zc[t - 16]).tanh();
+            let lin = 0.7 * 2.5 * x_zc[t - 16];
+            shaper_y[t] = 0.45 * nl + 0.55 * shaper_y[t - 1] - 0.15 * x_zc[t.saturating_sub(24)];
+            lin_y[t] = 0.45 * lin + 0.55 * lin_y[t - 1] - 0.15 * x_zc[t.saturating_sub(24)];
+        }
+        let d_lin: f64 = lin_y[64..]
+            .iter()
+            .zip(&shaper_y[64..])
+            .map(|(a, b)| a * b)
+            .sum::<f64>()
+            / lin_y[64..].iter().map(|a| a * a).sum::<f64>().max(1.0e-12);
+        let shaper_res: Vec<f64> = shaper_y
+            .iter()
+            .zip(&lin_y)
+            .map(|(&y, &lv)| y - d_lin * lv)
+            .collect();
+        let shaper_tot_e: f64 = 2.0 * shaper_y[64..].iter().map(|v| v * v).sum::<f64>();
+        let shaper_res_e: f64 = 2.0 * shaper_res[64..].iter().map(|v| v * v).sum::<f64>();
+        let mut mdl_cab = SonaModelF64::new(sr);
+        let out_cab = seed_soft_op_t_quads(
+            &mut mdl_cab,
+            &OpTSeedInput {
+                input_l: &x_zc,
+                input_r: &x_zc,
+                target_l: &shaper_y,
+                target_r: &shaper_y,
+                res_fir_l: &shaper_res,
+                res_fir_r: &shaper_res,
+                start: 64,
+                tgt_tot_e: shaper_tot_e,
+                res_fir_tot_e: shaper_res_e,
+                sample_rate_hz: sr,
+                hint: None,
+            },
+        );
+        assert_eq!(out_cab.estimated_loop_gain, 0.0);
+        assert_eq!(mdl_cab.transport_quads[0].g_loop, 0.0);
+        assert_eq!(mdl_cab.transport_quads[0].lfo_rate_hz, 0.0);
+
+        // Case 7: Nonlinear shaper + 16-sample-delayed resonant cabinet with mono physics hint
+        // (delay_ms: Some(3.5), has_stereo_width: Some(false)) must not falsely lock Op-T.
+        let mut mdl_res_cab = SonaModelF64::new(sr);
+        let n_c7 = 8192_usize;
+        let mut in_c7 = vec![0.0_f64; n_c7];
+        let mut rng_c7 = 0x9e37_79b9_7f4a_7c15_u64;
+        for (t, dst) in in_c7.iter_mut().enumerate() {
+            rng_c7 = rng_c7
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let noise = ((rng_c7 >> 32) as f64) / (u32::MAX as f64) * 2.0 - 1.0;
+            let amp = 0.25
+                + 0.75
+                    * (2.0 * std::f64::consts::PI * 2.0 * t as f64 / sr)
+                        .sin()
+                        .abs();
+            *dst = 0.6 * amp * noise;
+        }
+        let mut tgt_c7 = vec![0.0_f64; n_c7];
+        let mut ring_c7 = [0.0_f64; 32];
+        let (mut st_re, mut st_im) = (0.0_f64, 0.0_f64);
+        let r_pole = 0.96_f64;
+        let th_pole = 0.18_f64;
+        let b_g = (1.0 - r_pole * r_pole).sqrt();
+        let (cr_p, st_p) = (th_pole.cos(), th_pole.sin());
+        for t in 0..n_c7 {
+            let nl = (1.8 * in_c7[t]).tanh();
+            let delayed = ring_c7[(t + 16) & 31];
+            ring_c7[t & 31] = nl;
+            let next_re = r_pole * (cr_p * st_re - st_p * st_im) + b_g * delayed;
+            let next_im = r_pole * (st_p * st_re + cr_p * st_im);
+            (st_re, st_im) = (next_re, next_im);
+            tgt_c7[t] = 0.35 * nl + 0.45 * next_re;
+        }
+        let mut res_c7 = vec![0.0_f64; n_c7];
+        let (mut tot_c7, mut res_e_c7) = (0.0_f64, 0.0_f64);
+        for t in 0..n_c7 {
+            // Simulate FIR-cancelled fundamental leaving higher-order shaper + delayed cabinet residue.
+            res_c7[t] = tgt_c7[t] - 0.55 * in_c7[t];
+            if t >= 64 {
+                tot_c7 += 2.0 * tgt_c7[t] * tgt_c7[t];
+                res_e_c7 += 2.0 * res_c7[t] * res_c7[t];
+            }
+        }
+        let out_c7 = seed_soft_op_t_quads(
+            &mut mdl_res_cab,
+            &OpTSeedInput {
+                input_l: &in_c7,
+                input_r: &in_c7,
+                target_l: &tgt_c7,
+                target_r: &tgt_c7,
+                res_fir_l: &res_c7,
+                res_fir_r: &res_c7,
+                start: 64,
+                tgt_tot_e: tot_c7,
+                res_fir_tot_e: res_e_c7,
+                sample_rate_hz: sr,
+                hint: Some(&Pass1PhysicsHint {
+                    delay_ms: Some(3.5),
+                    has_stereo_width: Some(false),
+                    ..Default::default()
+                }),
+            },
+        );
+        assert_eq!(out_c7.estimated_loop_gain, 0.0);
+        assert_eq!(mdl_res_cab.transport_quads[0].g_loop, 0.0);
+        assert_eq!(mdl_res_cab.transport_quads[0].lfo_rate_hz, 0.0);
     }
 }

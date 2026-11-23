@@ -232,6 +232,13 @@ impl KautzChannelStepper {
         }
         y_t
     }
+
+    /// Returns recorded `(sr_hist, si_hist)` trajectories packed as `[t * m + k]`.
+    #[inline]
+    #[must_use]
+    pub(super) fn state_history(&self) -> (&[f64], &[f64]) {
+        (&self.sr_hist, &self.si_hist)
+    }
 }
 
 /// Reverse-time frame-by-frame adjoint accumulator paired with [`KautzChannelStepper`].

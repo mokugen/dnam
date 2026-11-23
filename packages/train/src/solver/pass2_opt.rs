@@ -1,17 +1,21 @@
-//! Pass-2 generic Sobol prescreening + WebGPU/CPU 256-tile planned adjoint trajectory optimization
-//! (`BestUntilDiminishingReturns`, exact FD-verified adjoints for `Op-N[Pre]` Fourier surrogate,
-//! stereo continuous Kautz `(r_m, theta_m)` modal poles, and 4-lane `Op-T` recurrent transport,
-//! `ref[train.pipeline.backbone-trajectory-opt]`).
+//! Pass-2 generic Sobol prescreening + hybrid `AdamW` / `VarPro` / `L-SSBroyden` / `STE QAT`
+//! trajectory optimization (`BestUntilDiminishingReturns`, exact FD-verified adjoints for
+//! `Op-N[Pre]` Fourier surrogate, stereo continuous Kautz `(r_m, theta_m)` modal poles, and
+//! 4-lane `Op-T` recurrent transport, `ref[train.pipeline.backbone-trajectory-opt]`).
 
 pub mod adjoints;
 mod causal_loop;
 pub(crate) mod crossbar;
 mod eval;
+mod hybrid;
+mod matryoshka;
 pub(crate) mod op_n_pre;
 pub mod op_t_quad;
+mod prescreen;
 mod qat_polish;
 pub(crate) mod sensory;
 mod theta;
+mod varpro_sync;
 mod zoh_jacobian;
 
 pub use adjoints::{
@@ -20,23 +24,14 @@ pub use adjoints::{
 };
 pub use op_n_pre::{OpNPreGrads, eval_op_n_pre_and_adjoint};
 pub use op_t_quad::{OpTQuadAdjointGrads, OpTQuadAdjointSlices, eval_op_t_quad_stereo_and_adjoint};
+pub use prescreen::generate_generic_sobol_seeds;
 
 use crate::error::TrainError;
-use crate::gpu::abi::{PRESCREEN_SEED_PARAM_STRIDE, PrescreenUniforms, TILE_FRAMES};
-use crate::linalg::lbfgs::{LbfgsConfig, TwoLoopLbfgs};
-use crate::losses::{CompositeLossConfig, CompositeLossEvaluator};
-use crate::runner::{PrescreenInput, TrainRunner};
+use crate::runner::TrainRunner;
 
-use super::model::{SonaModelF64, StereoTrainingPairs, snap_non_readout_fp16};
-use super::progress::{AtomicDnprProgress, ProgressMetrics, TrainingPhase, TrainingStatus};
-use eval::{Pass2AdjInput, assemble_pass2_gradients, eval_model_pass2_audio};
-use qat_polish::run_pass2_ste_qat_polish;
-use theta::ThetaLayout;
-
-use core::f64::consts::PI;
-
-use dnam_kernels::MIN_TPT_G;
-use dnam_vm::Tier;
+use super::model::{SonaModelF64, StereoTrainingPairs};
+use super::progress::AtomicDnprProgress;
+use hybrid::run_hybrid_pass2_optimize;
 
 /// Convergence delta in dB below which diminishing-returns patience increments (`0.01 dB/epoch`).
 pub const DIMINISHING_RETURNS_DELTA_DB: f64 = 0.01;
@@ -46,6 +41,8 @@ pub const DIMINISHING_RETURNS_DELTA_DB: f64 = 0.01;
 pub struct Pass2OptConfig {
     /// Generic Sobol/log-spaced prescreen seed count (`64..=128`).
     pub num_prescreen_seeds: usize,
+    /// Starting index offset into the quasi-random Sobol sequence for multi-seed exploration.
+    pub prescreen_seed_offset: usize,
     /// Maximum outer optimization epochs (`BestUntilDiminishingReturns`).
     pub max_epochs: usize,
     /// Consecutive epochs with `|delta_bESR| < 0.01 dB` triggering clean convergence.
@@ -56,20 +53,93 @@ pub struct Pass2OptConfig {
     pub warmup_frames: usize,
     /// Active `CoreQuad` blocks updated during Pass 2 (`1..=10`).
     pub active_quads: usize,
-    /// Straight-Through Estimator `fp16` QAT Adam polish steps after L-BFGS (`0` disables).
+    /// Straight-Through Estimator `fp16` QAT AdamW polish steps after Phase 2C (`0` disables).
     pub qat_polish_steps: usize,
+    /// Phase-2A diverse prescreen basins retained (`1..=8`).
+    pub top_k_seeds: usize,
+    /// Phase-2B chunked TBPTT `AdamW` step budget across progressive stages.
+    pub adamw_steps: usize,
+    /// Phase-2B chunk length in `48 kHz` frames (`2,048..=4,096` typical).
+    pub chunk_frames: usize,
+    /// Periodic host `uplo='U'` VarPro readout refresh interval in Phase-2B steps.
+    pub varpro_refresh_interval: usize,
+    /// Enables progressive `4 -> 6 -> 8 -> 10` expansion and joint 4-tier Matryoshka loss.
+    pub use_progressive_matryoshka: bool,
+    /// Enables Arena-Scoped Deterministic `PCGrad` during Phase-2B `AdamW` updates (never Phase 2C).
+    pub use_pcgrad: bool,
+    /// Phase-2C `L-SSBroyden` quasi-Newton steps per streamed block (`4..=25`).
+    pub ssbroyden_block_iters: usize,
+    /// Phase-2C `L-SSBroyden` secant history memory (`16..=32`).
+    pub ssbroyden_history_m: usize,
 }
 
 impl Default for Pass2OptConfig {
     fn default() -> Self {
         Self {
             num_prescreen_seeds: 64,
+            prescreen_seed_offset: 0,
             max_epochs: 16,
             diminishing_patience: 4,
             sample_rate_hz: 48_000.0,
             warmup_frames: 64,
             active_quads: 4,
             qat_polish_steps: 8,
+            top_k_seeds: 4,
+            adamw_steps: 40,
+            chunk_frames: 4_096,
+            varpro_refresh_interval: 15,
+            use_progressive_matryoshka: true,
+            use_pcgrad: true,
+            ssbroyden_block_iters: 16,
+            ssbroyden_history_m: 24,
+        }
+    }
+}
+
+impl Pass2OptConfig {
+    /// Full desktop 4-tier Matryoshka + `PCGrad` + `L-SSBroyden` + STE `fp16` QAT configuration.
+    #[must_use]
+    pub const fn desktop_full(sample_rate_hz: f64, warmup_frames: usize) -> Self {
+        Self {
+            num_prescreen_seeds: 128,
+            prescreen_seed_offset: 0,
+            max_epochs: 12,
+            diminishing_patience: 3,
+            sample_rate_hz,
+            warmup_frames,
+            active_quads: 10,
+            qat_polish_steps: 8,
+            top_k_seeds: 8,
+            adamw_steps: 36,
+            chunk_frames: 2_048,
+            varpro_refresh_interval: 18,
+            use_progressive_matryoshka: true,
+            use_pcgrad: true,
+            ssbroyden_block_iters: 12,
+            ssbroyden_history_m: 24,
+        }
+    }
+
+    /// Compact browser/WebGPU or `ThresholdStop` 4-tier Matryoshka configuration.
+    #[must_use]
+    pub const fn browser_webgpu(sample_rate_hz: f64, warmup_frames: usize) -> Self {
+        Self {
+            num_prescreen_seeds: 64,
+            prescreen_seed_offset: 0,
+            max_epochs: 12,
+            diminishing_patience: 2,
+            sample_rate_hz,
+            warmup_frames,
+            active_quads: 10,
+            qat_polish_steps: 8,
+            top_k_seeds: 4,
+            adamw_steps: 32,
+            chunk_frames: 2_048,
+            varpro_refresh_interval: 16,
+            use_progressive_matryoshka: true,
+            use_pcgrad: true,
+            ssbroyden_block_iters: 12,
+            ssbroyden_history_m: 16,
         }
     }
 }
@@ -79,7 +149,7 @@ impl Default for Pass2OptConfig {
 pub struct Pass2OptReport {
     /// Total outer optimization epochs executed.
     pub epochs_run: usize,
-    /// Number of STE `fp16` QAT polish steps executed after L-BFGS.
+    /// Number of STE `fp16` QAT polish steps executed after Phase 2C.
     pub qat_polish_steps_run: usize,
     /// Quantized baseline composite loss immediately prior to STE QAT polish.
     pub qat_baseline_loss: f64,
@@ -95,353 +165,8 @@ pub struct Pass2OptReport {
     pub elapsed_ms: u64,
 }
 
-#[inline]
-fn van_der_corput(mut idx: usize, base: usize) -> f64 {
-    let mut f = 1.0_f64;
-    let mut r = 0.0_f64;
-    while idx > 0 {
-        f /= base as f64;
-        r += f * ((idx % base) as f64);
-        idx /= base;
-    }
-    r
-}
-
-/// Generates `64..=128` pure black-box Sobol + log-spaced generic initial parameter seeds across
-/// audio bandwidth `[40 Hz, 12 kHz]` matching the 16-slot `prescreen_population` ABI
-/// (`[fc_ratio, q_val, w_lp/bp/hp/dir, lru_*, rect_sign, sag_depth, adaa_drive, lru_bias_drive]`).
-#[must_use]
-pub fn generate_generic_sobol_seeds(num_seeds: usize, sr_hz: f64) -> Vec<f32> {
-    let count = num_seeds.clamp(1, 128);
-    let sr = sr_hz.max(8_000.0);
-    let mut seeds = Vec::with_capacity(count * PRESCREEN_SEED_PARAM_STRIDE);
-    for i in 0..count {
-        let u0 = van_der_corput(i + 1, 2);
-        let u1 = van_der_corput(i + 1, 3);
-        let u2 = van_der_corput(i + 1, 5);
-        let u3 = van_der_corput(i + 1, 7);
-        let fc_hz = 40.0 * (12_000.0 / 40.0_f64).powf(u0);
-        let fc_ratio = (fc_hz / sr).clamp(1.0e-4, 0.45) as f32;
-        let q_val = (0.5 + 1.5 * u1) as f32;
-        let drive = (0.25 * (64.0_f64).powf(u2)) as f32;
-        let rel = (0.85 + 0.145 * u3) as f32;
-        let row: [f32; PRESCREEN_SEED_PARAM_STRIDE] = [
-            fc_ratio,
-            q_val,
-            0.25,
-            0.25 + 0.5 * (u1 as f32),
-            0.15,
-            0.5 - (u2 as f32),
-            rel,
-            0.25,
-            0.1 * ((u3 - 0.5).abs() as f32),
-            0.0,
-            0.0,
-            0.1 * (u1 as f32),
-            if (i & 1) == 0 { 1.0 } else { -1.0 },
-            0.05 * (u0 as f32),
-            drive,
-            0.0,
-        ];
-        seeds.extend_from_slice(&row);
-    }
-    seeds
-}
-
-struct OctaveQuadSpec {
-    freqs_hz: [f64; 4],
-    k_vals: [f64; 4],
-    tones: [[f64; 4]; 4],
-    lru_rel: [f64; 4],
-    lru_atk: [f64; 4],
-    lru_kap: [f64; 4],
-    sag: [f64; 4],
-    drive: [f64; 4],
-    bias_drive: [f64; 4],
-    wf_mix: [f64; 4],
-    glu: [f64; 4],
-    link: f64,
-}
-
-fn set_octave_quad(quad: &mut super::model::CoreQuadF64, sr_hz: f64, spec: &OctaveQuadSpec) {
-    quad.svf_g = spec.freqs_hz.map(|fc| {
-        (PI * (fc / sr_hz.max(8_000.0)).clamp(1.0e-4, 0.45))
-            .tan()
-            .clamp(f64::from(MIN_TPT_G), 64.0)
-    });
-    quad.svf_k = spec.k_vals;
-    quad.svf_k_nl = [0.0; 4];
-    quad.tone_lp = spec.tones[0];
-    quad.tone_bp = spec.tones[1];
-    quad.tone_hp = spec.tones[2];
-    quad.tone_ap = [0.0; 4];
-    quad.tone_dir = spec.tones[3];
-    quad.lru_alpha_rel = spec.lru_rel;
-    quad.lru_alpha_atk = spec.lru_atk;
-    quad.lru_kappa = spec.lru_kap;
-    quad.lru_duhem_gamma = [0.0; 4];
-    quad.lru_signed_mix = [0.0; 4];
-    quad.lru_stereo_link = [spec.link; 4];
-    quad.sag_depth = spec.sag;
-    quad.adaa_drive = spec.drive;
-    quad.lru_bias_drive = spec.bias_drive;
-    quad.wavefolder_mix = spec.wf_mix;
-    quad.glu_mix = spec.glu;
-    quad.in_mid_weight = [1.0; 4];
-    quad.in_side_weight = [1.0; 4];
-}
-
-/// Populates `core_quads[1..10]` and causal tier inter-block tiles with a strictly
-/// device-agnostic multi-scale TPT-SVF + Selective-Duhem ParaLRU + sag/ADAA basis so all 40 lanes
-/// across `[Lite..Ultra]` offer diverse spectral, dynamic, and nonlinear basis functions
-/// (`REQ-1.9`, `ref[dsp.op-n.core.matryoshka-blocks]`).
-fn init_universal_multiscale_core_quads(model: &mut SonaModelF64, sr_hz: f64) {
-    let bp_split = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-        [0.0, 0.0, 0.0, 0.0],
-    ];
-    let bp_only = [[0.0; 4], [1.0; 4], [0.0; 4], [0.0; 4]];
-    let low_oct = [
-        [1.0, 0.0, 0.0, 0.0],
-        [0.0, 1.0, 1.0, 1.0],
-        [0.0, 0.0, 0.0, 0.0],
-        [0.0, 0.0, 0.0, 0.0],
-    ];
-    let hi_oct = [
-        [0.0, 0.0, 0.0, 0.0],
-        [1.0, 1.0, 1.0, 0.0],
-        [0.0, 0.0, 0.0, 1.0],
-        [0.0, 0.0, 0.0, 0.0],
-    ];
-    let broadband_asym = [
-        [0.25, 0.0, 0.0, 0.0],
-        [0.0, 0.25, 0.0, 0.0],
-        [0.0, 0.0, 0.25, 0.0],
-        [0.75, 0.75, 0.75, 1.0],
-    ];
-
-    let specs = [
-        OctaveQuadSpec {
-            freqs_hz: [85.0, 220.0, 550.0, 1_400.0],
-            k_vals: [1.414; 4],
-            tones: bp_split,
-            lru_rel: [0.996, 0.992, 0.985, 0.970],
-            lru_atk: [0.65, 0.45, 0.25, 0.15],
-            lru_kap: [0.4, 0.6, 0.8, 1.0],
-            sag: [0.45, 0.65, 0.80, 0.90],
-            drive: [0.8, 1.2, 1.8, 2.6],
-            bias_drive: [0.0, 0.15, -0.15, 0.30],
-            wf_mix: [0.0; 4],
-            glu: [0.0; 4],
-            link: 0.5,
-        },
-        OctaveQuadSpec {
-            freqs_hz: [320.0, 900.0, 2_400.0, 6_200.0],
-            k_vals: [1.414; 4],
-            tones: bp_split,
-            lru_rel: [0.994, 0.988, 0.975, 0.950],
-            lru_atk: [0.80, 0.60, 0.35, 0.20],
-            lru_kap: [0.5, 0.7, 0.9, 1.0],
-            sag: [0.60, 0.75, 0.85, 0.92],
-            drive: [1.2, 2.5, 5.0, 10.0],
-            bias_drive: [0.10, -0.20, 0.25, -0.35],
-            wf_mix: [0.0; 4],
-            glu: [0.0; 4],
-            link: 0.8,
-        },
-        OctaveQuadSpec {
-            freqs_hz: [120.0, 600.0, 2_000.0, 7_500.0],
-            k_vals: [1.0; 4],
-            tones: broadband_asym,
-            lru_rel: [0.995, 0.990, 0.980, 0.960],
-            lru_atk: [0.50, 0.35, 0.20, 0.10],
-            lru_kap: [0.3, 0.5, 0.7, 0.9],
-            sag: [0.25, 0.50, 0.75, 0.90],
-            drive: [1.5, 4.5, 12.0, 24.0],
-            bias_drive: [0.25, -0.25, 0.50, -0.50],
-            wf_mix: [0.0; 4],
-            glu: [0.2, -0.2, 0.35, -0.35],
-            link: 0.25,
-        },
-        OctaveQuadSpec {
-            freqs_hz: [70.0, 140.0, 280.0, 560.0],
-            k_vals: [0.87; 4],
-            tones: low_oct,
-            lru_rel: [0.9985, 0.997, 0.993, 0.986],
-            lru_atk: [0.75, 0.55, 0.35, 0.20],
-            lru_kap: [0.6, 0.75, 0.85, 1.0],
-            sag: [0.55, 0.75, 0.88, 0.95],
-            drive: [0.9, 1.6, 2.8, 4.5],
-            bias_drive: [0.0, 0.2, -0.2, 0.3],
-            wf_mix: [0.0; 4],
-            glu: [0.0; 4],
-            link: 1.0,
-        },
-        OctaveQuadSpec {
-            freqs_hz: [1_120.0, 2_240.0, 4_480.0, 8_960.0],
-            k_vals: [0.87; 4],
-            tones: hi_oct,
-            lru_rel: [0.9985, 0.997, 0.993, 0.986],
-            lru_atk: [0.75, 0.55, 0.35, 0.20],
-            lru_kap: [0.6, 0.75, 0.85, 1.0],
-            sag: [0.55, 0.75, 0.88, 0.95],
-            drive: [0.9, 1.8, 3.2, 5.2],
-            bias_drive: [-0.15, 0.2, -0.25, 0.3],
-            wf_mix: [0.0; 4],
-            glu: [0.0; 4],
-            link: 1.0,
-        },
-        OctaveQuadSpec {
-            freqs_hz: [100.0, 350.0, 1_000.0, 3_000.0],
-            k_vals: [0.62, 0.55, 0.55, 0.71],
-            tones: bp_only,
-            lru_rel: [0.995, 0.990, 0.980, 0.960],
-            lru_atk: [0.60, 0.40, 0.25, 0.15],
-            lru_kap: [0.4, 0.6, 0.8, 0.95],
-            sag: [0.30, 0.65, 0.85, 0.94],
-            drive: [1.2, 2.5, 5.0, 8.0],
-            bias_drive: [0.2, -0.3, 0.45, -0.55],
-            wf_mix: [0.0, 0.0, 0.15, 0.30],
-            glu: [0.3, -0.3, 0.5, -0.5],
-            link: 0.5,
-        },
-        OctaveQuadSpec {
-            freqs_hz: [180.0, 700.0, 2_200.0, 6_800.0],
-            k_vals: [1.18; 4],
-            tones: bp_split,
-            lru_rel: [0.997, 0.991, 0.978, 0.940],
-            lru_atk: [0.70, 0.50, 0.30, 0.15],
-            lru_kap: [0.5, 0.7, 0.85, 1.0],
-            sag: [0.50, 0.72, 0.88, 0.95],
-            drive: [1.0, 2.2, 4.2, 7.5],
-            bias_drive: [0.15, -0.25, 0.35, -0.45],
-            wf_mix: [0.0; 4],
-            glu: [0.0; 4],
-            link: 0.75,
-        },
-        OctaveQuadSpec {
-            freqs_hz: [65.0, 190.0, 480.0, 1_300.0],
-            k_vals: [0.83; 4],
-            tones: low_oct,
-            lru_rel: [0.9992, 0.996, 0.980, 0.920],
-            lru_atk: [0.85, 0.50, 0.25, 0.10],
-            lru_kap: [0.6, 0.8, 0.9, 1.0],
-            sag: [0.70, 0.85, 0.93, 0.95],
-            drive: [0.7, 2.2, 4.5, 9.0],
-            bias_drive: [0.35, -0.40, 0.60, -0.65],
-            wf_mix: [0.0, 0.1, 0.25, 0.45],
-            glu: [0.2, -0.25, 0.35, -0.4],
-            link: 1.0,
-        },
-        OctaveQuadSpec {
-            freqs_hz: [2_800.0, 5_200.0, 8_200.0, 11_500.0],
-            k_vals: [0.83; 4],
-            tones: hi_oct,
-            lru_rel: [0.9992, 0.996, 0.980, 0.920],
-            lru_atk: [0.85, 0.50, 0.25, 0.10],
-            lru_kap: [0.6, 0.8, 0.9, 1.0],
-            sag: [0.70, 0.85, 0.93, 0.95],
-            drive: [0.7, 2.2, 4.5, 9.0],
-            bias_drive: [-0.35, 0.40, -0.60, 0.65],
-            wf_mix: [0.0, 0.1, 0.25, 0.45],
-            glu: [-0.2, 0.25, -0.35, 0.4],
-            link: 1.0,
-        },
-    ];
-    for (idx, spec) in specs.iter().enumerate() {
-        set_octave_quad(&mut model.core_quads[idx + 1], sr_hz, spec);
-    }
-    if model.core_quads[3].rect_sign.iter().all(|&v| v > 0.0) {
-        model.core_quads[3].rect_sign = [1.0, -1.0, 1.0, -1.0];
-    }
-
-    // Causal multi-stage diagonal coupling across `SONA_INTERBLOCK_TILES` preserving tier prefixes:
-    // `(0,1)=0, (1,2)=1, (2,3)=2, (4,5)=5, (6,7)=18, (5,7)=21, (8,9)=28`.
-    for (tile_idx, gain) in [
-        (0_usize, 0.40_f64),
-        (1, 0.50),
-        (2, 0.55),
-        (5, 0.45),
-        (18, 0.50),
-        (21, 0.30),
-        (28, 0.55),
-    ] {
-        for lane in 0..4 {
-            model.tiles[tile_idx].w_odd_4x4[lane][lane] = gain;
-        }
-    }
-}
-
-fn select_and_unpack_prescreen_winner(
-    model: &mut SonaModelF64,
-    seed_table: &[f32],
-    scores: &[f32],
-    n_seeds: usize,
-    n_frames: usize,
-    sample_rate_hz: f64,
-) -> usize {
-    let num_tiles = n_frames.div_ceil(TILE_FRAMES).max(1);
-    let mut win_idx = 0_usize;
-    let mut best_score = f64::INFINITY;
-    for s in 0..n_seeds {
-        let mut sum = 0.0_f64;
-        let mut cnt = 0_usize;
-        for tile in 0..num_tiles {
-            if let Some(&val) = scores.get(s * num_tiles + tile)
-                && val.is_finite()
-            {
-                sum += f64::from(val);
-                cnt += 1;
-            }
-        }
-        if cnt > 0 {
-            let avg = sum / (cnt as f64);
-            if avg < best_score {
-                best_score = avg;
-                win_idx = s;
-            }
-        }
-    }
-
-    let s = &seed_table
-        [win_idx * PRESCREEN_SEED_PARAM_STRIDE..(win_idx + 1) * PRESCREEN_SEED_PARAM_STRIDE];
-    let fc_ratio = f64::from(s[0]).clamp(1.0e-4, 0.45);
-    let q_val = f64::from(s[1]).max(0.1);
-    let g_val = (PI * fc_ratio).tan().clamp(f64::from(MIN_TPT_G), 64.0);
-    let k_val = (1.0 / q_val).clamp(0.0, 8.0);
-    let d0 = f64::from(s[14]).clamp(0.25, 16.0);
-    let q0 = &mut model.core_quads[0];
-    q0.svf_g = [g_val; 4];
-    q0.svf_k = [k_val; 4];
-    q0.tone_lp = [f64::from(s[2]); 4];
-    q0.tone_bp = [f64::from(s[3]); 4];
-    q0.tone_hp = [f64::from(s[4]); 4];
-    q0.tone_dir = [f64::from(s[5]); 4];
-    q0.lru_alpha_rel = [f64::from(s[6]); 4];
-    q0.lru_alpha_atk = [f64::from(s[7]); 4];
-    q0.lru_kappa = [f64::from(s[8]); 4];
-    q0.lru_duhem_gamma = [f64::from(s[9]); 4];
-    q0.lru_signed_mix = [f64::from(s[10]); 4];
-    q0.lru_stereo_link = [f64::from(s[11]); 4];
-    if q0.rect_sign.iter().all(|&v| v >= 0.0) {
-        q0.rect_sign = [if s[12] < 0.0 { -1.0 } else { 1.0 }; 4];
-    }
-    q0.sag_depth = [f64::from(s[13]); 4];
-    q0.adaa_drive = [
-        d0,
-        (0.5 * d0).clamp(0.25, 30.0),
-        (2.0 * d0).clamp(0.25, 30.0),
-        (4.0 * d0).clamp(0.25, 30.0),
-    ];
-    q0.lru_bias_drive = [f64::from(s[15]); 4];
-    init_universal_multiscale_core_quads(model, sample_rate_hz);
-    win_idx
-}
-
-/// Runs Pass-2 Sobol prescreening + L-BFGS optimization across `Op-N[Pre]`, `CoreQuad` ADAA/readout,
-/// stereo Kautz resonators, and 4-lane `Op-T` strictly under `BestUntilDiminishingReturns`
+/// Runs Pass-2 Sobol prescreening + 4-phase hybrid (`AdamW`/`VarPro` -> `L-SSBroyden` ->
+/// `u`-space STE `fp16` QAT) optimization under `BestUntilDiminishingReturns`
 /// (`|delta_bESR| < 0.01 dB/epoch`).
 pub fn run_pass2_optimize(
     runner: &TrainRunner,
@@ -450,191 +175,23 @@ pub fn run_pass2_optimize(
     config: Pass2OptConfig,
     progress: Option<&AtomicDnprProgress>,
 ) -> Result<Pass2OptReport, TrainError> {
+    run_pass2_optimize_with_noise(runner, model, pairs, None, config, progress)
+}
+
+/// Noise-floor-aware variant of [`run_pass2_optimize`] propagating target repeatability floors
+/// `(noise_l, noise_r)` through Phase 2A–2D loss evaluators (`ref[qual.eval.thermal-hiss]`).
+pub fn run_pass2_optimize_with_noise(
+    runner: &TrainRunner,
+    model: &mut SonaModelF64,
+    pairs: &StereoTrainingPairs<'_>,
+    noise_pair: Option<(&[f64], &[f64])>,
+    config: Pass2OptConfig,
+    progress: Option<&AtomicDnprProgress>,
+) -> Result<Pass2OptReport, TrainError> {
     #[cfg(not(target_arch = "wasm32"))]
     let start_instant = std::time::Instant::now();
 
-    let n = pairs.aligned_len();
-    let (in_l, in_r, target_l, target_r) = (pairs.in_l, pairs.in_r, pairs.target_l, pairs.target_r);
-    let loss_eval = CompositeLossEvaluator::new(
-        &target_l[..n],
-        &target_r[..n],
-        CompositeLossConfig {
-            sample_rate_hz: config.sample_rate_hz,
-            warmup_frames: config.warmup_frames.min(n / 4),
-            ..CompositeLossConfig::default()
-        },
-    )?;
-
-    let has_pass1_modal = model.active_fir_taps > 0 || model.active_kautz_pairs > 0;
-    let w_ro0_was_zero = model.w_ro[0][6].abs() < 1.0e-9 && model.w_ro[0][7].abs() < 1.0e-9;
-
-    let n_seeds = config.num_prescreen_seeds.clamp(1, 128);
-    let seed_table = generate_generic_sobol_seeds(n_seeds, config.sample_rate_hz);
-    let in_pairs: Vec<[f32; 2]> = (0..n).map(|t| [in_l[t] as f32, in_r[t] as f32]).collect();
-    let tgt_pairs: Vec<[f32; 2]> = (0..n)
-        .map(|t| [target_l[t] as f32, target_r[t] as f32])
-        .collect();
-    let scores = runner.prescreen_population(&PrescreenInput {
-        uniforms: PrescreenUniforms {
-            num_seeds: n_seeds as u32,
-            num_frames: n as u32,
-            num_quads: 1,
-            num_stems: 1,
-            sample_rate_hz: config.sample_rate_hz as f32,
-            eps_floor: 1.0e-5,
-            _pad0: 0,
-            _pad1: 0,
-        },
-        input_audio: &in_pairs,
-        target_audio: &tgt_pairs,
-        seed_params: &seed_table,
-    })?;
-    let win_idx = select_and_unpack_prescreen_winner(
-        model,
-        &seed_table,
-        &scores,
-        n_seeds,
-        n,
-        config.sample_rate_hz,
-    );
-
-    let q_count = config.active_quads.clamp(1, 10);
-    let mut best_model = model.clone();
-    let mut best_loss = f64::INFINITY;
-    let mut best_besr_db = 0.0_f64;
-    let mut base_besr_lin = f64::INFINITY;
-    if has_pass1_modal && w_ro0_was_zero {
-        let base_buf = eval_model_pass2_audio(runner, model, &in_l[..n], &in_r[..n], q_count)?;
-        let base_bd = loss_eval.eval_and_adjoint(&base_buf.pred_l, &base_buf.pred_r, None, None)?;
-        if base_bd.total.is_finite() {
-            best_loss = base_bd.total;
-            best_besr_db = 10.0 * base_bd.besr.max(1.0e-12).log10();
-            base_besr_lin = base_bd.besr;
-            best_model = model.clone();
-        }
-    }
-    if w_ro0_was_zero {
-        let init_w = if has_pass1_modal && base_besr_lin < 0.08 {
-            0.02
-        } else {
-            0.25
-        };
-        model.w_ro[0][6] = init_w;
-        model.w_ro[0][7] = init_w;
-    }
-
-    let max_tau = ((n / 2).min(4_096) as f64).max(8.0);
-    let layout = ThetaLayout::for_pass2_joint(model, q_count, max_tau);
-    let (theta_init, bounds) = layout.pack(model);
-    let mut coord_scales = vec![1.0_f64; theta_init.len()];
-    if let Some(z_idx) = layout.zoh_hold_depth_idx {
-        coord_scales[z_idx] = n.max(1) as f64;
-    }
-    let lbfgs = TwoLoopLbfgs::new(LbfgsConfig {
-        max_iters: config.max_epochs.max(1),
-        history_m: 8,
-        patience: config.max_epochs.max(1) + 2,
-        max_step_norm: 0.75,
-        ..LbfgsConfig::default()
-    });
-    let mut work_model = model.clone();
-    let mut prev_besr_db = f64::INFINITY;
-    let mut streak = 0_usize;
-    let mut eval_grad_calls = 0_usize;
-    let mut converged = false;
-    let mut gl = vec![0.0_f64; n];
-    let mut gr = vec![0.0_f64; n];
-
-    lbfgs.minimize_scaled(
-        &theta_init,
-        &bounds,
-        Some(&coord_scales),
-        |cand, grad_opt| {
-            layout.unpack(cand, &mut work_model);
-            let eval_buf =
-                eval_model_pass2_audio(runner, &work_model, &in_l[..n], &in_r[..n], q_count)?;
-            let Some(grad_theta) = grad_opt else {
-                return Ok(loss_eval
-                    .eval_and_adjoint(&eval_buf.pred_l, &eval_buf.pred_r, None, None)?
-                    .total);
-            };
-
-            eval_grad_calls += 1;
-            gl.fill(0.0);
-            gr.fill(0.0);
-            let bd = loss_eval.eval_and_adjoint(
-                &eval_buf.pred_l,
-                &eval_buf.pred_r,
-                Some(&mut gl),
-                Some(&mut gr),
-            )?;
-            let besr_db = 10.0 * bd.besr.max(1.0e-12).log10();
-            if bd.total < best_loss {
-                best_loss = bd.total;
-                best_besr_db = besr_db;
-                best_model = work_model.clone();
-            }
-            if eval_grad_calls >= 2 {
-                let step_num = eval_grad_calls - 1;
-                if prev_besr_db.is_finite()
-                    && (prev_besr_db - besr_db).abs() < DIMINISHING_RETURNS_DELTA_DB
-                {
-                    streak += 1;
-                } else {
-                    streak = 0;
-                }
-                if let Some(p) = progress {
-                    let perm = ((step_num * 500) / config.max_epochs.max(1)).min(500) as u16;
-                    p.publish_metrics(&ProgressMetrics {
-                        status: TrainingStatus::Running,
-                        phase: TrainingPhase::Pass2Backbone,
-                        active_tier: Some(Tier::Ultra),
-                        progress_permille: perm,
-                        step: step_num as u32,
-                        total_steps: config.max_epochs as u32,
-                        stage_step: step_num as u32,
-                        stage_total_steps: config.max_epochs as u32,
-                        best_loss,
-                        mr_iir: bd.mr_iir,
-                        ..ProgressMetrics::default()
-                    });
-                }
-                if streak >= config.diminishing_patience {
-                    converged = true;
-                    grad_theta.fill(0.0);
-                    return Ok(bd.total);
-                }
-            }
-            prev_besr_db = besr_db;
-
-            let grads = assemble_pass2_gradients(
-                runner,
-                &Pass2AdjInput {
-                    model: &work_model,
-                    in_l: &in_l[..n],
-                    in_r: &in_r[..n],
-                    buf: &eval_buf,
-                    gl: &gl,
-                    gr: &gr,
-                    q_opt: layout.q_opt,
-                    k_opt: layout.k_opt,
-                },
-            )?;
-            layout.write_grad(&grads, grad_theta);
-            Ok(bd.total)
-        },
-    )?;
-
-    *model = best_model;
-    let (qat_polish_steps_run, qat_baseline_loss) = if config.qat_polish_steps > 0 {
-        let qat = run_pass2_ste_qat_polish(runner, model, pairs, &loss_eval, &layout, config)?;
-        best_loss = qat.best_loss;
-        best_besr_db = qat.best_besr_db;
-        (qat.steps_run, qat.baseline_loss)
-    } else {
-        snap_non_readout_fp16(model);
-        (0_usize, best_loss)
-    };
+    let out = run_hybrid_pass2_optimize(runner, model, *pairs, noise_pair, config, progress)?;
 
     #[cfg(not(target_arch = "wasm32"))]
     let elapsed_ms = start_instant.elapsed().as_millis() as u64;
@@ -642,13 +199,13 @@ pub fn run_pass2_optimize(
     let elapsed_ms = 0_u64;
 
     Ok(Pass2OptReport {
-        epochs_run: eval_grad_calls.saturating_sub(1),
-        qat_polish_steps_run,
-        qat_baseline_loss,
-        converged_diminishing_returns: converged,
-        best_besr_db,
-        best_loss,
-        winning_seed_index: win_idx,
+        epochs_run: out.epochs_run,
+        qat_polish_steps_run: out.qat_polish_steps_run,
+        qat_baseline_loss: out.qat_baseline_loss,
+        converged_diminishing_returns: out.converged_diminishing_returns,
+        best_besr_db: out.best_besr_db,
+        best_loss: out.best_loss,
+        winning_seed_index: out.winning_seed_index,
         elapsed_ms,
     })
 }
@@ -656,6 +213,9 @@ pub fn run_pass2_optimize(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::losses::canonical_ltas_33_centers_hz;
+    use crate::solver::model::snap_non_readout_fp16;
+    use crate::solver::progress::TrainingPhase;
 
     #[test]
     fn test_pass2_optimize_runs_sobol_prescreen_and_converges() {
@@ -684,6 +244,7 @@ mod tests {
                 warmup_frames: 32,
                 active_quads: 2,
                 qat_polish_steps: 4,
+                ..Pass2OptConfig::default()
             },
             Some(&prog),
         )
@@ -714,6 +275,7 @@ mod tests {
                 warmup_frames: 32,
                 active_quads: 6,
                 qat_polish_steps: 0,
+                ..Pass2OptConfig::default()
             },
             None,
         )
@@ -749,6 +311,7 @@ mod tests {
                 warmup_frames: 32,
                 active_quads: 6,
                 qat_polish_steps: 2,
+                ..Pass2OptConfig::default()
             },
             None,
         )
@@ -790,6 +353,7 @@ mod tests {
                 warmup_frames: 32,
                 active_quads: 4,
                 qat_polish_steps: 2,
+                ..Pass2OptConfig::default()
             },
             None,
         )
@@ -800,5 +364,80 @@ mod tests {
             vca_dot > -0.5,
             "unexpected negative sense_vca_w sum={vca_dot}"
         );
+    }
+
+    #[test]
+    fn test_pass2_hybrid_multitier_matryoshka_and_noise_floor_converges() {
+        let runner = TrainRunner::cpu();
+        let n = 1_024_usize;
+        let centers = canonical_ltas_33_centers_hz();
+        let make_sig = |phase: f64| -> Vec<f64> {
+            (0..n)
+                .map(|t| {
+                    let sec = (t as f64) / 48_000.0;
+                    centers
+                        .iter()
+                        .enumerate()
+                        .map(|(b, &fc)| {
+                            0.025
+                                * (core::f64::consts::TAU * fc * sec + phase + 0.37 * (b as f64))
+                                    .sin()
+                        })
+                        .sum()
+                })
+                .collect()
+        };
+        let in_l = make_sig(0.0);
+        let in_r = make_sig(0.7);
+        let tgt_l: Vec<f64> = in_l.iter().map(|&v| 0.72 * v + 0.14 * v * v * v).collect();
+        let tgt_r: Vec<f64> = in_r.iter().map(|&v| 0.64 * v - 0.12 * v * v * v).collect();
+        let noise_l = vec![1.0e-4_f64; n];
+        let noise_r = vec![1.0e-4_f64; n];
+
+        let mut model = SonaModelF64::new(48_000.0);
+        let cfg = Pass2OptConfig {
+            num_prescreen_seeds: 16,
+            prescreen_seed_offset: 0,
+            max_epochs: 6,
+            diminishing_patience: 2,
+            sample_rate_hz: 48_000.0,
+            warmup_frames: 32,
+            active_quads: 10,
+            qat_polish_steps: 2,
+            top_k_seeds: 2,
+            adamw_steps: 8,
+            chunk_frames: 512,
+            varpro_refresh_interval: 4,
+            use_progressive_matryoshka: true,
+            use_pcgrad: true,
+            ssbroyden_block_iters: 4,
+            ssbroyden_history_m: 16,
+        };
+        let rep = run_pass2_optimize_with_noise(
+            &runner,
+            &mut model,
+            &StereoTrainingPairs {
+                in_l: &in_l,
+                in_r: &in_r,
+                target_l: &tgt_l,
+                target_r: &tgt_r,
+            },
+            Some((&noise_l, &noise_r)),
+            cfg,
+            None,
+        )
+        .unwrap();
+        assert!(rep.best_loss.is_finite());
+        assert!(rep.best_loss <= rep.qat_baseline_loss);
+        assert!(
+            rep.best_besr_db < -15.0,
+            "multi-tier Matryoshka should fit cleanly: besr_db={}",
+            rep.best_besr_db
+        );
+        let desktop_cfg = Pass2OptConfig::desktop_full(48_000.0, 64);
+        assert_eq!(desktop_cfg.active_quads, 10);
+        assert_eq!(desktop_cfg.top_k_seeds, 8);
+        let browser_cfg = Pass2OptConfig::browser_webgpu(48_000.0, 64);
+        assert_eq!(browser_cfg.chunk_frames, 2_048);
     }
 }

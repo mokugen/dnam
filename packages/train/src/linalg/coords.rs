@@ -1,5 +1,34 @@
-//! Smooth unconstrained coordinate bijections ([`ParamBoundSpec`]) with exact chain-rule
-//! derivatives and saturation protection (`ref[train.pipeline.backbone-trajectory-opt]`).
+//! Smooth unconstrained coordinate bijections ([`ParamBoundSpec`]), symmetric coordinate scaling
+//! ([`ScaledCoordSpace`]), and shared SIMD vector reductions (`ref[train.pipeline.backbone-trajectory-opt]`).
+
+use crate::error::TrainError;
+use crate::math::{DynamicTrainer, TrainerMathBackend, TrainerTask};
+
+/// Shared optimization result returned by bounded `f64` optimizers (`L-BFGS`, `AdamW`, `L-SSBroyden`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OptResult {
+    /// Best physical parameter vector observed across initial evaluation and accepted steps.
+    pub best_params: Vec<f64>,
+    /// Minimum objective value achieved at `best_params`.
+    pub best_loss: f64,
+    /// Number of accepted outer iterations completed.
+    pub iters_run: usize,
+    /// Number of objective/gradient evaluations performed.
+    pub evals: usize,
+}
+
+/// Computes `a . b` via the detected `f64` SIMD [`TrainerMathBackend`].
+#[inline]
+#[must_use]
+pub(crate) fn dot_simd(a: &[f64], b: &[f64]) -> f64 {
+    struct DotTask<'a>(&'a [f64], &'a [f64]);
+    impl TrainerTask<f64> for DotTask<'_> {
+        fn run<B: TrainerMathBackend>(self) -> f64 {
+            B::dot_f64(self.0, self.1)
+        }
+    }
+    DynamicTrainer::detect().dispatch(DotTask(a, b))
+}
 
 /// Constraint mapping between a constrained physical scalar and unconstrained R.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -46,20 +75,24 @@ pub enum ParamBoundSpec {
     },
 }
 
+/// Canonical saturation boundary in unscaled unconstrained `u`-space.
+pub(crate) const U_SATURATION_LIMIT: f64 = 24.0;
+const _: () = assert!(U_SATURATION_LIMIT > 10.0 && U_SATURATION_LIMIT <= 32.0);
+
 #[inline]
 fn sanitize_u(u: f64) -> (f64, bool) {
     if !u.is_finite() {
         let clamped = if u.is_nan() {
             0.0
         } else if u.is_sign_positive() {
-            24.0
+            U_SATURATION_LIMIT
         } else {
-            -24.0
+            -U_SATURATION_LIMIT
         };
         return (clamped, true);
     }
-    let saturated = u.abs() > 24.0;
-    (u.clamp(-24.0, 24.0), saturated)
+    let saturated = u.abs() > U_SATURATION_LIMIT;
+    (u.clamp(-U_SATURATION_LIMIT, U_SATURATION_LIMIT), saturated)
 }
 
 impl ParamBoundSpec {
@@ -229,6 +262,119 @@ impl ParamBoundSpec {
     }
 }
 
+/// Symmetrically scaled unconstrained coordinate codec `u_i = s_i * u_raw,i` shared by `L-BFGS`,
+/// `AdamW`, and `L-SSBroyden` (`d(loss)/du_i = d(loss)/dx_i * (dx_i/du_raw,i / s_i)`).
+#[derive(Clone, Debug)]
+pub struct ScaledCoordSpace<'a> {
+    bounds: &'a [ParamBoundSpec],
+    eff_scales: Vec<f64>,
+}
+
+impl<'a> ScaledCoordSpace<'a> {
+    /// Validates coordinate dimensions and finite initialization, returning `(space, init_u)`.
+    pub fn new(
+        context: &'static str,
+        init_physical: &[f64],
+        bounds: &'a [ParamBoundSpec],
+        coord_scales: Option<&[f64]>,
+    ) -> Result<(Self, Vec<f64>), TrainError> {
+        let dim = init_physical.len();
+        if dim != bounds.len() {
+            return Err(TrainError::InvalidDimensions {
+                context,
+                expected: dim,
+                actual: bounds.len(),
+            });
+        }
+        if let Some(scales) = coord_scales
+            && scales.len() != dim
+        {
+            return Err(TrainError::InvalidDimensions {
+                context,
+                expected: dim,
+                actual: scales.len(),
+            });
+        }
+        if dim == 0 {
+            return Err(TrainError::InvalidDimensions {
+                context,
+                expected: 1,
+                actual: 0,
+            });
+        }
+        if !init_physical.iter().all(|v| v.is_finite()) {
+            return Err(TrainError::NonFiniteInput { context });
+        }
+        let eff_scales: Vec<f64> = match coord_scales {
+            Some(scales) => scales
+                .iter()
+                .map(|&s| if s.is_finite() && s > 0.0 { s } else { 1.0 })
+                .collect(),
+            None => vec![1.0_f64; dim],
+        };
+        let init_u = init_physical
+            .iter()
+            .zip(bounds)
+            .zip(&eff_scales)
+            .map(|((&p, &b), &s)| b.to_unconstrained(p) * s)
+            .collect();
+        Ok((Self { bounds, eff_scales }, init_u))
+    }
+
+    /// Returns parameter vector dimensionality.
+    #[inline]
+    #[must_use]
+    pub fn dim(&self) -> usize {
+        self.bounds.len()
+    }
+
+    /// Returns the effective coordinate scaling factors `s_i > 0.0`.
+    #[inline]
+    #[must_use]
+    pub fn scales(&self) -> &[f64] {
+        &self.eff_scales
+    }
+
+    /// Encodes a physical vector `physical` into scaled unconstrained `u_out`.
+    #[inline]
+    pub fn encode(&self, physical: &[f64], u_out: &mut [f64]) {
+        for (((dst, &p), &b), &s) in u_out
+            .iter_mut()
+            .zip(physical)
+            .zip(self.bounds)
+            .zip(&self.eff_scales)
+        {
+            *dst = b.to_unconstrained(p) * s;
+        }
+    }
+
+    /// Decodes scaled unconstrained `u` to physical parameters `x_out` and scaled Jacobians `jac_out`.
+    #[inline]
+    pub fn decode(&self, u: &[f64], x_out: &mut [f64], jac_out: &mut [f64]) {
+        for (i, ((&ui, &b), &s)) in u.iter().zip(self.bounds).zip(&self.eff_scales).enumerate() {
+            let (xi, ji) = b.to_physical_and_deriv(ui / s);
+            x_out[i] = xi;
+            jac_out[i] = ji / s;
+        }
+    }
+
+    /// Pulls physical gradient `grad_x` back into scaled unconstrained gradient `grad_u_out`.
+    #[inline]
+    pub fn pullback_grad(&self, grad_x: &[f64], jac: &[f64], grad_u_out: &mut [f64]) {
+        for ((dst, &gx), &j) in grad_u_out.iter_mut().zip(grad_x).zip(jac) {
+            *dst = gx * j;
+        }
+    }
+
+    /// Populates diagonal Hessian preconditioning `h0_out = 1 / clamp(j^2, 1, 1e12)`.
+    #[inline]
+    pub fn diag_h0_from_jac(jac: &[f64], h0_out: &mut [f64]) {
+        for (dst, &j) in h0_out.iter_mut().zip(jac) {
+            *dst = 1.0 / (j * j).clamp(1.0, 1.0e12);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,7 +446,6 @@ mod tests {
             assert!((spec.project_physical(v2) - v2).abs() <= 1.0e-12);
         }
 
-        // ComplementLog must be strictly increasing across u in [-12, 12].
         let cl = ParamBoundSpec::ComplementLog {
             lo_c: 5.0e-4,
             hi_c: 0.75,
@@ -317,8 +462,6 @@ mod tests {
             prev_r = r;
         }
 
-        // Verify extreme |u| = 15 for AsinhBoxSym has zero cancellation error in derivative.
-        // Use eps = 1e-4 so f64 subtraction near |v| = 23,520 doesn't amplify ULP roundoff.
         let sym = ParamBoundSpec::AsinhBoxSym {
             scale: 10.0,
             limit: 23_520.0,
@@ -334,7 +477,6 @@ mod tests {
             );
         }
 
-        // Saturation, NaN safety, and snap_zero_edge contract.
         assert_eq!(ParamBoundSpec::Free.project_physical(f64::NAN), 0.0);
         assert_eq!(
             ParamBoundSpec::Box { lo: -1.0, hi: 2.0 }
@@ -372,5 +514,27 @@ mod tests {
         assert_eq!(zero_edge.snap_zero_edge(1.0e-3), 1.0e-3);
         assert_eq!(nonzero_floor.snap_zero_edge(5.0e-8), 5.0e-8);
         assert_eq!(nonzero_floor.snap_zero_edge(0.25), 0.25);
+
+        let scales = [1.0, 50.0];
+        let b = [
+            ParamBoundSpec::Free,
+            ParamBoundSpec::Box { lo: 0.0, hi: 1.0 },
+        ];
+        let (sp, mut u_vec) =
+            ScaledCoordSpace::new("test", &[0.2, 0.75], &b, Some(&scales)).unwrap();
+        assert_eq!(sp.dim(), 2);
+        let (mut x_out, mut jac_out, mut gu) = ([0.0; 2], [0.0; 2], [0.0; 2]);
+        sp.decode(&u_vec, &mut x_out, &mut jac_out);
+        assert!((x_out[0] - 0.2).abs() < 1.0e-12);
+        assert!((x_out[1] - 0.75).abs() < 1.0e-7);
+        sp.pullback_grad(&[2.0, 3.0], &jac_out, &mut gu);
+        assert!((gu[0] - 2.0).abs() < 1.0e-12);
+        assert!((gu[1] - 3.0 * jac_out[1]).abs() < 1.0e-12);
+        sp.encode(&[0.5, 0.25], &mut u_vec);
+        sp.decode(&u_vec, &mut x_out, &mut jac_out);
+        assert!((x_out[1] - 0.25).abs() < 1.0e-7);
+        assert!(ScaledCoordSpace::new("bad", &[0.0], &b, None).is_err());
+        assert!(ScaledCoordSpace::new("nan", &[f64::NAN, 0.5], &b, None).is_err());
+        assert!(ScaledCoordSpace::new("empty", &[], &[], None).is_err());
     }
 }

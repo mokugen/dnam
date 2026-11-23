@@ -1,17 +1,17 @@
-//! Smooth unconstrained parameter codecs, two-loop bounded L-BFGS (`m <= 10`),
-//! Cholesky-whitened L-BFGS (`WhitenedLbfgs`), and GPU/CPU `TrainRunner::inner_opt_step` bridge
-//! (`ref[train.pipeline.backbone-trajectory-opt]`).
+//! Two-loop bounded L-BFGS (`m <= 10`), Cholesky-whitened L-BFGS (`WhitenedLbfgs`),
+//! and GPU/CPU `TrainRunner::inner_opt_step` bridge (`ref[train.pipeline.backbone-trajectory-opt]`).
 
-mod bounds;
-
-pub use bounds::ParamBoundSpec;
+pub use super::coords::ParamBoundSpec;
 
 use crate::error::TrainError;
 use crate::gpu::abi::InnerOptUniforms;
-use crate::math::{DynamicTrainer, TrainerMathBackend, TrainerTask};
 use crate::runner::{InnerOptInput, TrainRunner};
 
 use super::cholesky::factorize_uplo_u_cholesky;
+use super::coords::{OptResult, ScaledCoordSpace, dot_simd};
+
+/// Alias to the shared [`OptResult`] returned by [`TwoLoopLbfgs::minimize`] / [`WhitenedLbfgs::minimize`].
+pub type LbfgsResult = OptResult;
 
 /// Configuration for [`TwoLoopLbfgs`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,29 +44,6 @@ impl Default for LbfgsConfig {
             max_step_norm: 8.0,
         }
     }
-}
-
-/// Result returned by [`TwoLoopLbfgs::minimize`] or [`WhitenedLbfgs::minimize`].
-#[derive(Clone, Debug, PartialEq)]
-pub struct LbfgsResult {
-    /// Best parameter vector observed across initial evaluation and accepted steps.
-    pub best_params: Vec<f64>,
-    /// Minimum objective value achieved at `best_params`.
-    pub best_loss: f64,
-    /// Number of accepted outer iterations completed.
-    pub iters_run: usize,
-    /// Number of objective+gradient evaluations performed.
-    pub evals: usize,
-}
-
-fn dot_simd(a: &[f64], b: &[f64]) -> f64 {
-    struct DotTask<'a>(&'a [f64], &'a [f64]);
-    impl TrainerTask<f64> for DotTask<'_> {
-        fn run<B: TrainerMathBackend>(self) -> f64 {
-            B::dot_f64(self.0, self.1)
-        }
-    }
-    DynamicTrainer::detect().dispatch(DotTask(a, b))
 }
 
 fn compute_two_loop_dir(
@@ -155,69 +132,19 @@ impl TwoLoopLbfgs {
     where
         F: FnMut(&[f64], Option<&mut [f64]>) -> Result<f64, TrainError>,
     {
-        let dim = init_physical.len();
-        if dim != bounds.len() {
-            return Err(TrainError::InvalidDimensions {
-                context: "TwoLoopLbfgs::minimize(bounds)",
-                expected: dim,
-                actual: bounds.len(),
-            });
-        }
-        if let Some(scales) = coord_scales
-            && scales.len() != dim
-        {
-            return Err(TrainError::InvalidDimensions {
-                context: "TwoLoopLbfgs::minimize(coord_scales)",
-                expected: dim,
-                actual: scales.len(),
-            });
-        }
-        if dim == 0 {
-            return Err(TrainError::InvalidDimensions {
-                context: "TwoLoopLbfgs::minimize(dim)",
-                expected: 1,
-                actual: 0,
-            });
-        }
-        if !init_physical.iter().all(|v| v.is_finite()) {
-            return Err(TrainError::NonFiniteInput {
-                context: "TwoLoopLbfgs::minimize(init_physical)",
-            });
-        }
-
-        let eff_scales: Vec<f64> = match coord_scales {
-            Some(scales) => scales
-                .iter()
-                .map(|&s| if s.is_finite() && s > 0.0 { s } else { 1.0 })
-                .collect(),
-            None => vec![1.0_f64; dim],
-        };
+        let (space, mut u) = ScaledCoordSpace::new(
+            "TwoLoopLbfgs::minimize",
+            init_physical,
+            bounds,
+            coord_scales,
+        )?;
+        let dim = space.dim();
         let m_cap = self.config.history_m.clamp(1, 10);
-        let mut u: Vec<f64> = init_physical
-            .iter()
-            .zip(bounds)
-            .zip(&eff_scales)
-            .map(|((&p, &b), &s)| b.to_unconstrained(p) * s)
-            .collect();
         let mut x = vec![0.0_f64; dim];
         let mut dxd_u = vec![0.0_f64; dim];
-        let decode_all = |u_vec: &[f64], x_out: &mut [f64], jac_out: &mut [f64]| {
-            for i in 0..dim {
-                let s = eff_scales[i];
-                let (xi, ji) = bounds[i].to_physical_and_deriv(u_vec[i] / s);
-                x_out[i] = xi;
-                jac_out[i] = ji / s;
-            }
-        };
-
-        decode_all(&u, &mut x, &mut dxd_u);
-        let update_h0 = |jac: &[f64], h0: &mut [f64]| {
-            for (dst, &j) in h0.iter_mut().zip(jac) {
-                *dst = 1.0 / (j * j).clamp(1.0, 1.0e12);
-            }
-        };
+        space.decode(&u, &mut x, &mut dxd_u);
         let mut h0_diag = vec![1.0_f64; dim];
-        update_h0(&dxd_u, &mut h0_diag);
+        ScaledCoordSpace::diag_h0_from_jac(&dxd_u, &mut h0_diag);
 
         let mut grad_x = vec![0.0_f64; dim];
         let mut loss = eval(&x, Some(&mut grad_x))?;
@@ -226,7 +153,8 @@ impl TwoLoopLbfgs {
                 context: "TwoLoopLbfgs::minimize(init_eval)",
             });
         }
-        let mut grad_u: Vec<f64> = grad_x.iter().zip(&dxd_u).map(|(g, j)| g * j).collect();
+        let mut grad_u = vec![0.0_f64; dim];
+        space.pullback_grad(&grad_x, &dxd_u, &mut grad_u);
 
         let mut best_params = x.clone();
         let mut best_loss = loss;
@@ -266,7 +194,7 @@ impl TwoLoopLbfgs {
                 for j in 0..dim {
                     cand_u[j] = u[j] + step * dir[j];
                 }
-                decode_all(&cand_u, &mut cand_x, &mut cand_jac);
+                space.decode(&cand_u, &mut cand_x, &mut cand_jac);
                 evals += 1;
                 if let Ok(l_trial) = eval(&cand_x, None)
                     && l_trial.is_finite()
@@ -279,8 +207,8 @@ impl TwoLoopLbfgs {
                         && cand_gx.iter().all(|v| v.is_finite())
                     {
                         let prev_loss = loss;
-                        let cand_gu: Vec<f64> =
-                            cand_gx.iter().zip(&cand_jac).map(|(g, j)| g * j).collect();
+                        let mut cand_gu = vec![0.0_f64; dim];
+                        space.pullback_grad(&cand_gx, &cand_jac, &mut cand_gu);
                         let s: Vec<f64> = cand_u.iter().zip(&u).map(|(a, b)| a - b).collect();
                         let y: Vec<f64> = cand_gu.iter().zip(&grad_u).map(|(a, b)| a - b).collect();
                         let sy = dot_simd(&s, &y);
@@ -298,7 +226,7 @@ impl TwoLoopLbfgs {
                         }
                         u.copy_from_slice(&cand_u);
                         dxd_u.copy_from_slice(&cand_jac);
-                        update_h0(&dxd_u, &mut h0_diag);
+                        ScaledCoordSpace::diag_h0_from_jac(&dxd_u, &mut h0_diag);
                         grad_u = cand_gu;
                         loss = l_full;
                         iters_run += 1;

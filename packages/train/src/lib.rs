@@ -52,28 +52,33 @@ pub use gpu::{
 #[cfg(feature = "gpu-wgpu")]
 pub use gpu::{WgpuContext, WgpuRunner};
 pub use linalg::{
-    EmrMmConfig, EmrMmResult, EmrSpectralProblem, LbfgsConfig, LbfgsResult, LtasKktConfig,
-    LtasKktResult, MIN_CHOLESKY_RIDGE, NestedTierPrefixResult, ParamBoundSpec, TwoLoopLbfgs,
-    WhitenedLbfgs, assemble_ozaki_normal_equations, checked_uplo_u_packed_len,
-    factorize_uplo_u_cholesky, solve_emr_mm_cholesky, solve_factorized_uplo_u,
-    solve_factorized_uplo_u_2ch, solve_ltas_newton_kkt, solve_nested_tier_prefix_schur,
-    solve_uplo_adaptive_ridge, solve_uplo_norm_bounded, solve_uplo_u_cholesky,
-    solve_uplo_u_cholesky_2ch, step_runner_inner_opt, symv_uplo_u,
+    AdamWConfig, AdamWState, EmrMmConfig, EmrMmResult, EmrSpectralProblem, LbfgsConfig,
+    LbfgsResult, LtasKktConfig, LtasKktResult, MIN_CHOLESKY_RIDGE, NestedTierPrefixResult,
+    OptResult, ParamBoundSpec, ScaledCoordSpace, SsBroydenConfig, SsBroydenState, TwoLoopLbfgs,
+    WhitenedLbfgs, apply_arena_scoped_pcgrad, assemble_ozaki_normal_equations,
+    checked_uplo_u_packed_len, cosine_lr_with_warmup, factorize_uplo_u_cholesky,
+    solve_emr_mm_cholesky, solve_factorized_uplo_u, solve_factorized_uplo_u_2ch,
+    solve_ltas_newton_kkt, solve_nested_tier_prefix_schur, solve_uplo_adaptive_ridge,
+    solve_uplo_norm_bounded, solve_uplo_u_cholesky, solve_uplo_u_cholesky_2ch,
+    step_runner_inner_opt, symv_uplo_u,
 };
 pub use losses::{
     AnalyticGaborBank, BESR_WORST_BAND_OFFSET_DB, BesrChannelReport, BesrIntervalBounds,
-    BesrIntervalDecision, BesrJointIntervalBounds, Bezout7FilterBank, CompositeLossBreakdown,
-    CompositeLossConfig, CompositeLossEvaluator, GaborBandKernel, GaborTargetCache,
-    IfGdTargetCache, K_GABOR, LtasChannelReport, LtasInterval, LtasLossMode, MrIirTargetCache,
-    NoiseQualification, ONE_DB_POWER_FACTOR, Radix2FftPlan, SpecOtTargetCache,
+    BesrIntervalDecision, BesrJointIntervalBounds, BesrLossSpec, Bezout7FilterBank,
+    CompositeLossBreakdown, CompositeLossConfig, CompositeLossEvaluator, CompositeLossWeights,
+    EXCESS_TAU_FRAC, EXCESS_TAU_MIN, GaborBandKernel, GaborTargetCache, IfGdTargetCache, K_GABOR,
+    LtasChannelReport, LtasInterval, LtasLossMode, MrIirTargetCache, NoiseQualification,
+    ONE_DB_POWER_FACTOR, Radix2FftPlan, SNR_EPS, SegEsrTargetCache, SpecOtTargetCache,
     TierCertificationReport, TierQualityFloors, Welch33TargetCache, build_hann_window,
     canonical_ltas_33_centers_hz, canonical_ltas_33_intervals_hz, certify_tier_audio,
     check_adjacent_tier_monotone, compute_besr_channel, compute_ltas_channel,
     compute_mr_iir_channel, compute_seg_esr_channel_db, compute_welch_seg_starts,
-    eval_gabor_loss_and_adjoint, eval_if_gd_loss_and_adjoint, eval_ltas_loss_and_adjoint,
-    eval_mr_iir_loss_and_adjoint, eval_nyquist_hinge_and_adjoint, eval_runner_gabor_bezout_bridge,
+    eval_gabor_loss_and_adjoint, eval_if_gd_loss_and_adjoint, eval_ltas_and_nyquist_fused,
+    eval_ltas_loss_and_adjoint, eval_mr_iir_loss_and_adjoint, eval_nyquist_hinge_and_adjoint,
+    eval_runner_gabor_bezout_bridge, eval_seg_esr_cached_and_adjoint,
     eval_seg_esr_loss_and_adjoint, eval_spec_ot_loss_and_adjoint, evaluate_joint_interval_besr,
     evaluate_noise_qualified_besr, evaluate_uncertain_floor_besr, is_tier_pair_monotone,
+    smooth_excess_sq, snr_weight,
 };
 pub use math::{
     BackendKind, CpuSimdFeatures, CpuSimdLevel, DefaultMathBackend, DynamicTrainer, MathBackend,
@@ -106,8 +111,9 @@ pub use solver::{
     eval_op_n_pre_and_adjoint, eval_op_t_transport_and_adjoint, extract_stat_256d_gram,
     generate_generic_sobol_seeds, patch_model_readouts_weighted_cholesky, quantize_kautz_pole_q8,
     quantize_ltas_error_q20_i8, run_cpu_op_p_probe, run_pass1_probe, run_pass1_probe_with_hint,
-    run_pass2_optimize, run_pass3_varpro_readout, run_pass5_emit_and_certify, solve_sona_model,
-    solve_sona_model_with_pass1, steiglitz_mcbride_poles, synth_kautz_unit_mode,
+    run_pass2_optimize, run_pass2_optimize_with_noise, run_pass3_varpro_readout,
+    run_pass5_emit_and_certify, solve_sona_model, solve_sona_model_with_pass1,
+    steiglitz_mcbride_poles, synth_kautz_unit_mode,
 };
 pub use wide_gram::{
     WIDE_GRAM_BATCH_FRAMES, Wide192Accum, accumulate_uplo_u_wide192,

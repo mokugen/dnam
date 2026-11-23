@@ -12,6 +12,7 @@ use super::ltas::canonical_ltas_33_centers_hz;
 
 /// Number of canonical 1/3-octave Gabor bands.
 pub const K_GABOR: usize = 33;
+const _: () = assert!(K_GABOR == 33);
 
 /// Constant-$Q$ quadrature Hann-windowed Gabor kernel for one 1/3-octave band.
 #[derive(Clone, Debug)]
@@ -185,6 +186,8 @@ pub struct GaborTargetCache {
     active_bands: usize,
     mean_band_pow: f64,
     n_frames: [usize; K_GABOR],
+    band_snr_w: [f64; K_GABOR],
+    band_noise_p: [f64; K_GABOR],
     tgt_re: Vec<Vec<f64>>,
     tgt_im: Vec<Vec<f64>>,
     tgt_env: Vec<Vec<f64>>,
@@ -194,9 +197,25 @@ impl GaborTargetCache {
     /// Precomputes constant-$Q$ Gabor wavelet envelopes across `tgt[warmup..]`.
     #[must_use]
     pub fn new(tgt: &[f64], warmup: usize, bank: &AnalyticGaborBank) -> Self {
+        Self::new_with_noise(tgt, None, warmup, bank)
+    }
+
+    /// Precomputes constant-$Q$ Gabor wavelet envelopes alongside per-band repeatability
+    /// noise-floor weights and smoothing floors (`ref[qual.eval.thermal-hiss]`).
+    #[must_use]
+    pub fn new_with_noise(
+        tgt: &[f64],
+        noise: Option<&[f64]>,
+        warmup: usize,
+        bank: &AnalyticGaborBank,
+    ) -> Self {
         let len = tgt.len();
         let w = warmup.min(len);
+        let noise_valid =
+            noise.filter(|ns| ns.len() >= len && ns[..len].iter().all(|v| v.is_finite()));
         let mut n_frames = [0_usize; K_GABOR];
+        let mut band_snr_w = [1.0_f64; K_GABOR];
+        let mut band_noise_p = [0.0_f64; K_GABOR];
         let mut tgt_re = vec![Vec::new(); K_GABOR];
         let mut tgt_im = vec![Vec::new(); K_GABOR];
         let mut tgt_env = vec![Vec::new(); K_GABOR];
@@ -220,7 +239,21 @@ impl GaborTargetCache {
                 sum_p += p;
                 env[m] = (p + 1.0e-18).sqrt();
             }
-            pow_acc += sum_p / (m_cnt as f64);
+            let mean_tgt_p = sum_p / (m_cnt as f64);
+            pow_acc += mean_tgt_p;
+            if let Some(ns) = noise_valid {
+                let mut nre = vec![0.0_f64; m_cnt];
+                let mut nim = vec![0.0_f64; m_cnt];
+                spec.project_slice(&ns[..len], w, &mut nre, &mut nim);
+                let n_pow = nre
+                    .iter()
+                    .zip(&nim)
+                    .map(|(a, c)| a * a + c * c)
+                    .sum::<f64>()
+                    / (m_cnt as f64);
+                band_noise_p[b] = n_pow;
+                band_snr_w[b] = super::noise_floor::snr_weight(mean_tgt_p, n_pow);
+            }
             tgt_re[b] = re;
             tgt_im[b] = im;
             tgt_env[b] = env;
@@ -232,6 +265,8 @@ impl GaborTargetCache {
             active_bands,
             mean_band_pow,
             n_frames,
+            band_snr_w,
+            band_noise_p,
             tgt_re,
             tgt_im,
             tgt_env,
@@ -261,6 +296,8 @@ pub fn eval_gabor_loss_and_adjoint(
         let mut im = vec![0.0_f64; m_cnt];
         spec.project_slice(pred, cache.warmup, &mut re, &mut im);
         let inv_m = norm_band / (m_cnt as f64);
+        let w_b = cache.band_snr_w[b] * inv_m;
+        let n_floor = cache.band_noise_p[b];
         let mut d_re = vec![0.0_f64; m_cnt];
         let mut d_im = vec![0.0_f64; m_cnt];
         for m in 0..m_cnt {
@@ -268,11 +305,14 @@ pub fn eval_gabor_loss_and_adjoint(
             let diff_e = e_hat - cache.tgt_env[b][m];
             let dr = re[m] - cache.tgt_re[b][m];
             let di = im[m] - cache.tgt_im[b][m];
-            loss += inv_m * (diff_e * diff_e + 0.25 * (dr * dr + di * di));
+            let res_sq = diff_e * diff_e + 0.25 * (dr * dr + di * di);
+            let (e_eff, d_e) = super::noise_floor::smooth_excess_sq(res_sq, n_floor);
+            loss += w_b * e_eff;
             if grad_opt.is_some() {
-                let s_env = 2.0 * inv_m * diff_e / e_hat;
-                d_re[m] = s_env * re[m] + 0.5 * inv_m * dr;
-                d_im[m] = s_env * im[m] + 0.5 * inv_m * di;
+                let s_scale = w_b * d_e;
+                let s_env = 2.0 * s_scale * diff_e / e_hat;
+                d_re[m] = s_env * re[m] + 0.5 * s_scale * dr;
+                d_im[m] = s_env * im[m] + 0.5 * s_scale * di;
             }
         }
         if let Some(grad) = grad_opt.as_deref_mut() {
@@ -359,5 +399,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(br.band_losses.len(), 1);
+
+        // Noisy Gabor cache reduces pure-noise weight and preserves exact FD parity.
+        let noise: Vec<f64> = (0..n).map(|i| 0.02 * ((i as f64) * 0.43).cos()).collect();
+        let noisy_gab = GaborTargetCache::new_with_noise(&target, Some(&noise), 64, &bank);
+        let mut g_noisy = vec![0.0_f64; n];
+        let v_noisy = eval_gabor_loss_and_adjoint(&bank, &noisy_gab, &pred, Some(&mut g_noisy));
+        assert!(v_noisy.is_finite());
+        let mut pp = pred.clone();
+        let mut pm = pred.clone();
+        pp[512] += eps;
+        pm[512] -= eps;
+        let fd_noisy = (eval_gabor_loss_and_adjoint(&bank, &noisy_gab, &pp, None)
+            - eval_gabor_loss_and_adjoint(&bank, &noisy_gab, &pm, None))
+            / (2.0 * eps);
+        assert!(
+            (g_noisy[512] - fd_noisy).abs() <= 1.0e-5 * g_noisy[512].abs().max(1.0e-4),
+            "Gabor noisy idx=512 ana={} fd={fd_noisy}",
+            g_noisy[512]
+        );
     }
 }

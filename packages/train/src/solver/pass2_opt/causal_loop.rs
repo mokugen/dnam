@@ -4,6 +4,7 @@
 
 mod adjoint;
 mod forward;
+mod os2x;
 
 pub(crate) use adjoint::assemble_causal_loop_adjoint;
 pub(crate) use forward::eval_causal_loop_forward;
@@ -19,6 +20,7 @@ use super::op_t_quad::is_op_t_quad_active;
 /// Cached per-frame intermediates from [`eval_causal_loop_forward`] for exact reverse BPTT.
 pub(crate) struct CausalLoopBuffers {
     pub q_count: usize,
+    pub os2x: bool,
     pub active_opt_quads: usize,
     pub active_k: usize,
     pub active_fir: usize,
@@ -33,6 +35,8 @@ pub(crate) struct CausalLoopBuffers {
     pub s0_r: Vec<f64>,
     pub ux_l: Vec<f64>,
     pub ux_r: Vec<f64>,
+    pub core_ux_l: Vec<f64>,
+    pub core_ux_r: Vec<f64>,
     pub onset_pre_l: Vec<f64>,
     pub onset_pre_r: Vec<f64>,
     pub x_tank_l: Vec<f64>,
@@ -524,5 +528,152 @@ mod tests {
             (ana_b - fd_b).abs() < 1.0e-4 * ana_b.abs().max(fd_b.abs()).max(1.0e-3),
             "ana={ana_b} fd={fd_b}"
         );
+    }
+
+    #[test]
+    fn test_causal_loop_os2x_vm_parity_and_central_fd_q6() {
+        use crate::solver::model::snap_model_fp16;
+        use crate::solver::pass5_emit::{Pass5EmitConfig, encode_model_to_dnam_bin};
+        use dnam_vm::{SonaVm, Tier, bin::DnamBinView, math::DefaultMathBackend};
+
+        let n = 128_usize;
+        let sr = 48_000.0_f64;
+        let in_l: Vec<f64> = (0..n).map(|t| 0.4 * ((t as f64) * 0.08).sin()).collect();
+        let in_r: Vec<f64> = (0..n).map(|t| 0.35 * ((t as f64) * 0.13).cos()).collect();
+        let gl: Vec<f64> = (0..n).map(|t| ((t as f64) * 0.17).cos()).collect();
+        let gr: Vec<f64> = (0..n).map(|t| ((t as f64) * 0.19).sin()).collect();
+
+        let mut model = base_coupled_model(sr);
+        model.oversample_upper_tiers_2x = true;
+        model.active_fir_taps = 4;
+        model.fir_l[0] = 0.25;
+        model.fir_l[1] = -0.08;
+        model.fir_r[0] = 0.22;
+        model.fir_r[1] = -0.06;
+        model.active_kautz_pairs = 2;
+        model.kautz[0].r_low = 0.72;
+        model.kautz[0].theta = 0.4;
+        model.kautz[0].b_gamma = 0.5;
+        model.kautz[0].c_re_l = 0.2;
+        model.kautz[0].c_re_r = 0.18;
+        model.core_quads[4].adaa_drive = [1.4, 1.1, 0.9, 0.7];
+        model.core_quads[5].svf_g = [0.45, 0.65, 0.85, 1.1];
+        model.tiles[4].w_odd_4x4[0][0] = 0.25;
+        model.w_ro[20][6] = 0.14;
+        model.w_ro[20][7] = 0.12;
+        model.w_ro[20][0] = 0.11;
+        model.w_ro[20][1] = 0.09;
+        model.phasor_stereo_phase = [0.2, -0.3, 0.15, -0.25];
+        snap_model_fp16(&mut model);
+
+        // Check pre-Pass-3 2x VM parity on Tier::Full (6 quads, 12 Kautz / clipped active).
+        let bin = encode_model_to_dnam_bin(
+            &model,
+            Pass5EmitConfig {
+                stereo_out: true,
+                single_input: false,
+                ..Pass5EmitConfig::default()
+            },
+        )
+        .unwrap();
+        let view = DnamBinView::parse(&bin).unwrap();
+        let mut vm =
+            SonaVm::<DefaultMathBackend>::from_view_owned(&view, Tier::Full, sr as f32, false)
+                .unwrap();
+        let in_l32: Vec<f32> = in_l.iter().map(|&v| v as f32).collect();
+        let in_r32: Vec<f32> = in_r.iter().map(|&v| v as f32).collect();
+        let (mut vm_l, mut vm_r) = (vec![0.0_f32; n], vec![0.0_f32; n]);
+        vm.process_block(&in_l32, &in_r32, &mut vm_l, &mut vm_r)
+            .unwrap();
+
+        let buf = eval_causal_loop_forward(&model, &in_l, &in_r, 6, true);
+        assert!(buf.os2x);
+        assert_eq!(buf.core_ux_l.len(), 2 * n);
+        let (mut sig_sq, mut err_sq) = (0.0_f64, 0.0_f64);
+        for t in 16..n {
+            let (vl, vr) = (f64::from(vm_l[t]), f64::from(vm_r[t]));
+            sig_sq += vl * vl + vr * vr;
+            err_sq += (buf.pred_l[t] - vl).powi(2) + (buf.pred_r[t] - vr).powi(2);
+        }
+        let err_db = 10.0 * (err_sq / sig_sq.max(1.0e-18)).max(1.0e-16).log10();
+        assert!(
+            err_db < -60.0,
+            "2x Full closed-loop VM mismatch {err_db} dB"
+        );
+
+        // 1) Pure-f64 2x upsample/decimate/ro_pole/Op-T/Op-N[Pre] closed-loop FD parity to < 1e-7.
+        let mut p64 = model.clone();
+        p64.w_ro = [[0.0; 12]; 40];
+        p64.direct_s2_u_gain = [0.65, 0.55];
+        p64.pre_conv_u_gain = [0.35, 0.25];
+        p64.opt_to_lr[0] = [0.85, -0.55];
+        let b64 = eval_causal_loop_forward(&p64, &in_l, &in_r, 6, true);
+        let g64 = assemble_causal_loop_adjoint(&p64, &in_l, &in_r, &b64, &gl, &gr);
+        let eval_m = |m: &SonaModelF64| -> f64 {
+            let b = eval_causal_loop_forward(m, &in_l, &in_r, 6, false);
+            b.pred_l.iter().zip(&gl).map(|(x, g)| x * g).sum::<f64>()
+                + b.pred_r.iter().zip(&gr).map(|(x, g)| x * g).sum::<f64>()
+        };
+        let eps64 = 1.0e-6_f64;
+        for (name, ana, mut_fn) in [
+            (
+                "f64 opt_to_lr[0][0]",
+                g64.crossbar.d_opt_to_lr[0][0],
+                (|m, d| m.opt_to_lr[0][0] += d) as fn(&mut SonaModelF64, f64),
+            ),
+            ("f64 ro_pole_48k", g64.d_ro_pole_48k, |m, d| {
+                m.ro_pole_48k += d
+            }),
+            ("f64 op_n_pre_gamma_bc", g64.op_n_pre.d_gamma_bc, |m, d| {
+                m.op_n_pre_gamma_bc += d
+            }),
+        ] {
+            let (mut mp, mut mm) = (p64.clone(), p64.clone());
+            mut_fn(&mut mp, eps64);
+            mut_fn(&mut mm, -eps64);
+            let fd = (eval_m(&mp) - eval_m(&mm)) / (2.0 * eps64);
+            assert!(
+                (ana - fd).abs() < 1.0e-5 * ana.abs().max(fd.abs()).max(1.0e-3),
+                "os2x {name}: ana={ana} fd={fd}"
+            );
+        }
+
+        // 2) Full mixed f32/f64 Central-FD parity across q_count=6 (2x) matching line-346 eps.
+        let grad = assemble_causal_loop_adjoint(&model, &in_l, &in_r, &buf, &gl, &gr);
+        let eps = 2.0e-3_f64;
+        type FdCheck = (&'static str, f64, fn(&mut SonaModelF64, f64));
+        let checks: [FdCheck; 6] = [
+            (
+                "opt_to_lr[0][0]",
+                grad.crossbar.d_opt_to_lr[0][0],
+                |m, d| m.opt_to_lr[0][0] += d,
+            ),
+            ("op_n_pre_gamma_bc", grad.op_n_pre.d_gamma_bc, |m, d| {
+                m.op_n_pre_gamma_bc += d
+            }),
+            ("ro_pole_48k", grad.d_ro_pole_48k, |m, d| m.ro_pole_48k += d),
+            ("w_ro[20][6]", grad.d_w_ro[20][6], |m, d| m.w_ro[20][6] += d),
+            (
+                "tiles[4].odd[0][0]",
+                grad.tiles[4].w_odd_4x4[0][0],
+                |m, d| m.tiles[4].w_odd_4x4[0][0] += d,
+            ),
+            (
+                "core_quads[5].adaa[0]",
+                grad.core_quads[5].adaa_drive[0],
+                |m, d| m.core_quads[5].adaa_drive[0] += d,
+            ),
+        ];
+        for (name, ana, mut_fn) in checks {
+            let (mut mp, mut mm) = (model.clone(), model.clone());
+            mut_fn(&mut mp, eps);
+            mut_fn(&mut mm, -eps);
+            let fd = (eval_m(&mp) - eval_m(&mm)) / (2.0 * eps);
+            let scale = ana.abs().max(fd.abs()).max(0.25);
+            assert!(
+                (ana - fd).abs() < 2.0e-2 * scale,
+                "os2x closed-loop {name}: ana={ana} fd={fd}"
+            );
+        }
     }
 }

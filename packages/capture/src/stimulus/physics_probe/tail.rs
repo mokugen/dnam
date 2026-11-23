@@ -107,7 +107,9 @@ pub(super) fn analyze_decay_tail(input: &DecayTailInput<'_>) -> TailDecayStats {
         } else {
             0.0
         };
-    (s.lfo_hz, s.lfo_depth) = estimate_lfo_modulation(&env_l);
+    if tail_energy_ratio > 0.005 {
+        (s.lfo_hz, s.lfo_depth) = estimate_lfo_modulation(&env_l);
+    }
     if env_r.len() == env_l.len() && env_l.len() > 80 {
         let (ds, ts) = (15..env_l.len().min(500)).fold((0.0_f64, 0.0_f64), |(d, t), m| {
             (d + (env_l[m] - env_r[m]).abs(), t + env_l[m] + env_r[m])
@@ -411,5 +413,27 @@ mod tests {
         assert!((short_ms - 7.5).abs() < 0.5);
         assert!(short_gain > 0.1);
         assert!((chorus_hz - 2.4).abs() < 0.3);
+
+        // Sub--46 dB (`tail_energy_ratio <= 0.005`) oscillating tail noise must NOT trigger LFO detection.
+        let mut faint_osc = vec![0.0_f32; n_tail];
+        for (i, dst) in faint_osc.iter_mut().enumerate() {
+            let env = 0.5 + 0.45 * (2.0 * std::f32::consts::PI * 2.5 * (i as f32) / 48_000.0).sin();
+            *dst = 2.0e-4 * env * if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let comb_hi = vec![0.3_f32; n_comb];
+        let faint_stats = analyze_decay_tail(&DecayTailInput {
+            cs_dry_l: &comb_hi,
+            cs_wet_l: &comb_hi,
+            cs_wet_r: None,
+            comb_dry: &comb_hi,
+            comb_wet_l: &comb_hi,
+            comb_wet_r: None,
+            tail_wet_l: &faint_osc,
+            tail_wet_r: None,
+            comb_hf_ratio: 0.2,
+        });
+        assert!(faint_stats.tail_energy_ratio <= 0.005);
+        assert_eq!(faint_stats.lfo_hz, 0.0);
+        assert_eq!(faint_stats.lfo_depth, 0.0);
     }
 }

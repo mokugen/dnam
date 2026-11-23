@@ -261,20 +261,17 @@ pub fn compute_v3_stat_chunk_bytes(
 
 fn select_pass2_config(quality_mode: SolverQualityMode, warmup: usize) -> Pass2OptConfig {
     match quality_mode {
-        SolverQualityMode::BestUntilDiminishingReturns => Pass2OptConfig {
-            sample_rate_hz: 48_000.0,
-            warmup_frames: warmup,
-            ..Pass2OptConfig::default()
-        },
+        SolverQualityMode::BestUntilDiminishingReturns => {
+            Pass2OptConfig::desktop_full(48_000.0, warmup)
+        }
         SolverQualityMode::ThresholdStop {
             max_polish_iters, ..
         } => Pass2OptConfig {
-            sample_rate_hz: 48_000.0,
-            warmup_frames: warmup,
             max_epochs: max_polish_iters.clamp(2, 16),
+            adamw_steps: (max_polish_iters * 2).clamp(4, 24),
             diminishing_patience: 2,
             qat_polish_steps: 2,
-            ..Pass2OptConfig::default()
+            ..Pass2OptConfig::browser_webgpu(48_000.0, warmup)
         },
     }
 }

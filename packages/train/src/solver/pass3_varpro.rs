@@ -195,6 +195,7 @@ fn run_pass3_varpro_readout_inner(
     let m = n - w;
 
     model.ro_pole_48k = 0.0;
+    model.pre_conv_hp_gain = [0.0, 0.0];
     let mut fset = build_pass3_feature_sets(
         runner,
         model,

@@ -4,6 +4,7 @@
 
 use crate::error::TrainError;
 
+use super::super::noise_floor::{smooth_excess_sq, snr_weight};
 use super::{Bezout7FilterBank, esr_ratio, linear_to_db};
 
 /// Decision under uncertain or interval noise/signal bounds (`ref[qual.besr.uncertain-floor]`).
@@ -306,6 +307,136 @@ pub fn compute_seg_esr_channel_db(
     }
 }
 
+#[derive(Clone, Debug)]
+struct SegEsrFrameTarget {
+    start: usize,
+    end: usize,
+    wf: f64,
+    ey: [f64; 3],
+    denom: [f64; 3],
+    f_env: [f64; 3],
+    snr_w: [f64; 3],
+}
+
+/// Precomputed 20 ms 3-band Bézout envelope targets (`SegESR`) with optional repeatability noise-floor
+/// weights (`ref[qual.companion.seg-esr]`, `ref[qual.eval.thermal-hiss]`).
+#[derive(Clone, Debug)]
+pub struct SegEsrTargetCache {
+    len: usize,
+    frames: Vec<SegEsrFrameTarget>,
+}
+
+impl SegEsrTargetCache {
+    /// Precomputes 20 ms 3-band target RMS envelopes and optional noise-floor SNR weights.
+    pub fn new(
+        target: &[f64],
+        noise: Option<&[f64]>,
+        bank: &Bezout7FilterBank,
+        sample_rate_hz: f64,
+        warmup: usize,
+    ) -> Result<Self, TrainError> {
+        let n = target.len();
+        if n <= warmup
+            || sample_rate_hz < 8_000.0
+            || !sample_rate_hz.is_finite()
+            || !target.iter().all(|v| v.is_finite())
+        {
+            return Err(TrainError::InvalidDimensions {
+                context: "SegEsrTargetCache::new",
+                expected: warmup + 1,
+                actual: n,
+            });
+        }
+        if let Some(ns) = noise
+            && (ns.len() < n || !ns[..n].iter().all(|v| v.is_finite()))
+        {
+            return Err(TrainError::InvalidDimensions {
+                context: "SegEsrTargetCache::new(noise)",
+                expected: n,
+                actual: ns.len(),
+            });
+        }
+        let y_b = bank.split_3band(target);
+        let n_b = noise.map(|ns| bank.split_3band(&ns[..n]));
+        let full_len = (sample_rate_hz / 50.0).round().max(1.0) as usize;
+        let total_dur = ((n - warmup) as f64) / sample_rate_hz;
+        let mut frames = Vec::with_capacity((n - warmup).div_ceil(full_len));
+
+        let mut start = warmup;
+        while start < n {
+            let end = (start + full_len).min(n);
+            let wf = ((end - start) as f64 / sample_rate_hz) / (3.0 * total_dur);
+            let mut ey = [0.0_f64; 3];
+            let mut denom = [0.0_f64; 3];
+            let mut f_env = [0.0_f64; 3];
+            let mut snr_w = [1.0_f64; 3];
+            for b in 0..3 {
+                let ey_sq: f64 = y_b[b][start..end].iter().map(|v| v * v).sum();
+                ey[b] = (ey_sq + 1.0e-18).sqrt();
+                denom[b] = ey_sq + 1.0e-12;
+                let fe = n_b
+                    .as_ref()
+                    .map_or(0.0, |nb| nb[b][start..end].iter().map(|v| v * v).sum());
+                f_env[b] = fe;
+                if fe > 0.0 {
+                    snr_w[b] = snr_weight(ey_sq, fe);
+                }
+            }
+            frames.push(SegEsrFrameTarget {
+                start,
+                end,
+                wf,
+                ey,
+                denom,
+                f_env,
+                snr_w,
+            });
+            start = end;
+        }
+        Ok(Self { len: n, frames })
+    }
+}
+
+/// Evaluates cached differentiable 20 ms `SegESR` envelope loss using [`SegEsrTargetCache`] and
+/// accumulates exact adjoint `dL/dy_hat` into `grad_opt`.
+pub fn eval_seg_esr_cached_and_adjoint(
+    cache: &SegEsrTargetCache,
+    bank: &Bezout7FilterBank,
+    pred: &[f64],
+    grad_opt: Option<&mut [f64]>,
+) -> f64 {
+    let n = cache.len.min(pred.len());
+    if n < cache.len || cache.frames.is_empty() {
+        return 0.0;
+    }
+    let yh_b = bank.split_3band(&pred[..n]);
+    let mut loss = 0.0_f64;
+    let mut d_bands = grad_opt
+        .is_some()
+        .then(|| [vec![0.0_f64; n], vec![0.0_f64; n], vec![0.0_f64; n]]);
+
+    for frame in &cache.frames {
+        for b in 0..3 {
+            let ep_sq: f64 = yh_b[b][frame.start..frame.end].iter().map(|v| v * v).sum();
+            let ep = (ep_sq + 1.0e-18).sqrt();
+            let diff = ep - frame.ey[b];
+            let (e_eff, d_e) = smooth_excess_sq(diff * diff, frame.f_env[b]);
+            let w_b = frame.wf * frame.snr_w[b];
+            loss += w_b * e_eff / frame.denom[b];
+            if let Some(ref mut db) = d_bands {
+                let scale = w_b * (2.0 * d_e * diff / (ep * frame.denom[b]));
+                for t in frame.start..frame.end {
+                    db[b][t] = scale * yh_b[b][t];
+                }
+            }
+        }
+    }
+    if let (Some(grad), Some(db)) = (grad_opt, d_bands.as_ref()) {
+        bank.accum_3band_adjoint(db, &mut grad[..n]);
+    }
+    loss
+}
+
 /// Evaluates differentiable `SegESR` envelope loss and accumulates exact adjoint `dL/dy_hat`.
 pub fn eval_seg_esr_loss_and_adjoint(
     pred: &[f64],
@@ -319,40 +450,10 @@ pub fn eval_seg_esr_loss_and_adjoint(
         return 0.0;
     }
     let bank = Bezout7FilterBank::new(sample_rate_hz);
-    let y_b = bank.split_3band(&target[..n]);
-    let yh_b = bank.split_3band(&pred[..n]);
-    let full_len = (sample_rate_hz / 50.0).round().max(1.0) as usize;
-    let total_dur = ((n - warmup) as f64) / sample_rate_hz;
-    let mut loss = 0.0_f64;
-    let mut d_bands = grad_opt
-        .is_some()
-        .then(|| [vec![0.0_f64; n], vec![0.0_f64; n], vec![0.0_f64; n]]);
-
-    let mut start = warmup;
-    while start < n {
-        let end = (start + full_len).min(n);
-        let wf = ((end - start) as f64 / sample_rate_hz) / (3.0 * total_dur);
-        for b in 0..3 {
-            let ey_sq: f64 = y_b[b][start..end].iter().map(|v| v * v).sum();
-            let ep_sq: f64 = yh_b[b][start..end].iter().map(|v| v * v).sum();
-            let ey = (ey_sq + 1.0e-18).sqrt();
-            let ep = (ep_sq + 1.0e-18).sqrt();
-            let diff = ep - ey;
-            let denom = ey_sq + 1.0e-12;
-            loss += wf * diff * diff / denom;
-            if let Some(ref mut db) = d_bands {
-                let scale = wf * (2.0 * diff / (ep * denom));
-                for t in start..end {
-                    db[b][t] = scale * yh_b[b][t];
-                }
-            }
-        }
-        start = end;
+    match SegEsrTargetCache::new(&target[..n], None, &bank, sample_rate_hz, warmup) {
+        Ok(cache) => eval_seg_esr_cached_and_adjoint(&cache, &bank, &pred[..n], grad_opt),
+        Err(_) => 0.0,
     }
-    if let (Some(grad), Some(db)) = (grad_opt, d_bands.as_ref()) {
-        bank.accum_3band_adjoint(db, &mut grad[..n]);
-    }
-    loss
 }
 
 #[cfg(test)]
@@ -547,5 +648,20 @@ mod tests {
         )
         .unwrap();
         assert_eq!(j_pass_box.decision, BesrIntervalDecision::GuaranteedPass);
+
+        // Noisy cached SegESR matches central FD accurately.
+        let bank = Bezout7FilterBank::new(48_000.0);
+        let noise_s: Vec<f64> = (0..n).map(|t| 0.02 * ((t as f64) * 0.41).sin()).collect();
+        let seg_cache =
+            SegEsrTargetCache::new(&target, Some(&noise_s), &bank, 48_000.0, 128).unwrap();
+        let mut g_sn = vec![0.0_f64; n];
+        let _ = eval_seg_esr_cached_and_adjoint(&seg_cache, &bank, &pred, Some(&mut g_sn));
+        let (mut pp, mut pm) = (pred.clone(), pred.clone());
+        pp[500] += eps;
+        pm[500] -= eps;
+        let fd_sn = (eval_seg_esr_cached_and_adjoint(&seg_cache, &bank, &pp, None)
+            - eval_seg_esr_cached_and_adjoint(&seg_cache, &bank, &pm, None))
+            / (2.0 * eps);
+        assert!((g_sn[500] - fd_sn).abs() <= 1.0e-5 * g_sn[500].abs().max(1.0e-4));
     }
 }

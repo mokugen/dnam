@@ -81,6 +81,50 @@ pub(crate) fn downsample_lane_2x_f64(sig_2x: &[f64], dec_c_prev1: f64, dec_c0: f
     out
 }
 
+/// Exact linear adjoint (transpose) of `upsample_stereo_2x_f64` for a single channel: maps `2x`
+/// core sensitivities (`len = 2 * n`) back to `1x` post-`Op-N[Pre]` sensitivities (`len = n`).
+#[must_use]
+pub(crate) fn upsample_lane_2x_adjoint_f64(d_sig_2x: &[f64], up_quad_coeff: f64) -> Vec<f64> {
+    let coeff = sanitize_unit_f64(up_quad_coeff, -0.20, 0.05, -0.125);
+    let n = d_sig_2x.len() / 2;
+    let mut out = vec![0.0_f64; n];
+    for t in 0..n {
+        let d0 = d_sig_2x[2 * t];
+        let d1 = d_sig_2x[2 * t + 1];
+        out[t] += d1 + (0.5 + coeff) * d0;
+        if t >= 1 {
+            out[t - 1] += (0.5 - 2.0 * coeff) * d0;
+        }
+        if t >= 2 {
+            out[t - 2] += coeff * d0;
+        }
+    }
+    out
+}
+
+/// Exact linear adjoint (transpose) of [`downsample_lane_2x_f64`]: maps `1x` core readout/bus
+/// sensitivities (`len = n`) back to `2x` sub-sample sensitivities (`len = 2 * n`).
+#[must_use]
+pub(crate) fn downsample_lane_2x_adjoint_f64(
+    d_sig_1x: &[f64],
+    dec_c_prev1: f64,
+    dec_c0: f64,
+) -> Vec<f64> {
+    let c_p1 = sanitize_unit_f64(dec_c_prev1, 0.0, 0.28, 0.15);
+    let c0 = sanitize_unit_f64(dec_c0, 0.0, 0.55, 0.50);
+    let c1 = 1.0 - c_p1 - c0;
+    let n = d_sig_1x.len();
+    let mut out = vec![0.0_f64; n * 2];
+    for (t, &d) in d_sig_1x.iter().enumerate() {
+        out[2 * t] += c0 * d;
+        out[2 * t + 1] += c1 * d;
+        if t >= 1 {
+            out[2 * (t - 1) + 1] += c_p1 * d;
+        }
+    }
+    out
+}
+
 /// Evaluates active `CoreQuad` blocks in canonical `SONA_ULTRA_QUAD_TRAVERSAL_ORDER` with
 /// M/S input coupling, causal `SONA_INTERBLOCK_TILES`, and ZOH rescaling at `rho_core`.
 #[cfg(test)]
@@ -294,5 +338,23 @@ mod tests {
         let dec = downsample_lane_2x_f64(&up_l, 0.15, 0.50);
         assert_eq!(dec.len(), 64);
         assert!(dec.iter().all(|v| v.is_finite()));
+
+        // Adjoint dot-product identities `<A x, y> == <x, A^T y>` to machine precision.
+        let y_2x: Vec<f64> = (0..128)
+            .map(|i| 0.4 * ((i as f64) * 0.23).cos() - 0.15 * ((i as f64) * 0.07).sin())
+            .collect();
+        let adj_up = upsample_lane_2x_adjoint_f64(&y_2x, -0.125);
+        let lhs_up: f64 = up_l.iter().zip(&y_2x).map(|(a, b)| a * b).sum();
+        let rhs_up: f64 = x_l.iter().zip(&adj_up).map(|(a, b)| a * b).sum();
+        assert!((lhs_up - rhs_up).abs() < 1.0e-13, "up {lhs_up} vs {rhs_up}");
+
+        let dec_x = downsample_lane_2x_f64(&y_2x, 0.15, 0.50);
+        let adj_dec = downsample_lane_2x_adjoint_f64(&x_r, 0.15, 0.50);
+        let lhs_dec: f64 = dec_x.iter().zip(&x_r).map(|(a, b)| a * b).sum();
+        let rhs_dec: f64 = y_2x.iter().zip(&adj_dec).map(|(a, b)| a * b).sum();
+        assert!(
+            (lhs_dec - rhs_dec).abs() < 1.0e-13,
+            "dec {lhs_dec} vs {rhs_dec}"
+        );
     }
 }

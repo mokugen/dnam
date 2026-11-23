@@ -196,39 +196,66 @@ fn test_3phase_audit_ultra_modes_5_to_8_stage1_stage4_and_head_only_mode() {
     assert!(full_v.arena0.linear_readout_lite.direct_s2_u_gain[0].get() < 10.0);
 }
 
+const SIMPLE_TANH_MODE_COUNT: usize = 24;
+
+const fn build_simple_tanh_modes() -> [(f32, f32, f32); SIMPLE_TANH_MODE_COUNT] {
+    let mut modes = [(0.0_f32, 0.0_f32, 0.0_f32); SIMPLE_TANH_MODE_COUNT];
+    let mut i = 0_usize;
+    while i < SIMPLE_TANH_MODE_COUNT {
+        let u = (i as f32) / ((SIMPLE_TANH_MODE_COUNT - 1) as f32);
+        let r = 0.970_f32 - 0.018_f32 * u;
+        let th = 0.080_f32 + 0.090_f32 * (i as f32);
+        let mag = 0.22_f32 - 0.04_f32 * u;
+        let c_re = if (i & 1) == 0 { mag } else { -mag };
+        modes[i] = (r, th, c_re);
+        i += 1;
+    }
+    modes
+}
+
+const SIMPLE_TANH_MODES: [(f32, f32, f32); SIMPLE_TANH_MODE_COUNT] = build_simple_tanh_modes();
+const _: () = {
+    let mut i = 0_usize;
+    while i < SIMPLE_TANH_MODE_COUNT {
+        let (r, th, c_re) = SIMPLE_TANH_MODES[i];
+        assert!(r >= 0.85 && r < 0.99);
+        assert!(th > 0.04 && th < 2.8);
+        assert!(c_re != 0.0);
+        if i > 0 {
+            assert!(th > SIMPLE_TANH_MODES[i - 1].1);
+        }
+        i += 1;
+    }
+};
+
 #[derive(Clone)]
 struct SimpleTanhTarget {
     gain: f32,
-    biquads: [[f32; 2]; 8],
+    biquads: [[f32; 2]; SIMPLE_TANH_MODE_COUNT],
+    ring: [f32; 32],
+    ring_pos: usize,
 }
 
 impl DistillationTarget for SimpleTanhTarget {
     fn reset_state(&mut self) {
-        self.biquads = [[0.0; 2]; 8];
+        self.biquads = [[0.0; 2]; SIMPLE_TANH_MODE_COUNT];
+        self.ring = [0.0; 32];
+        self.ring_pos = 0;
     }
 
     fn render_stem(&mut self, stim: &StemStimulus) -> Result<StemResponse, DnamError> {
-        const MODES: [(f32, f32, f32); 8] = [
-            (0.945, 0.08, 0.18),
-            (0.938, 0.19, -0.16),
-            (0.930, 0.34, 0.15),
-            (0.922, 0.55, -0.14),
-            (0.912, 0.84, 0.13),
-            (0.902, 1.22, -0.12),
-            (0.892, 1.72, 0.11),
-            (0.882, 2.32, -0.10),
-        ];
         let g = stim.control_values.first().copied().unwrap_or(5.0) * 0.35 + self.gain;
         let mut out_1 = Vec::with_capacity(stim.in_1.len());
-        let mut ring = [0.0_f32; 32];
-        for (wpos, &x) in stim.in_1.iter().enumerate() {
+        for &x in &stim.in_1 {
             let nl = (g * x).tanh();
-            let delayed = ring[(wpos + 16) & 31];
-            ring[wpos & 31] = nl;
-            // Multi-mode resonant cabinet beyond the 16-sample onset delay so all 16 Stage III
+            let wpos = self.ring_pos;
+            let delayed = self.ring[(wpos + 16) & 31];
+            self.ring[wpos] = nl;
+            self.ring_pos = (wpos + 1) & 31;
+            // Multi-mode resonant cabinet beyond the 16-sample onset delay so all 24 Stage III
             // Kautz poles carry non-trivial phase residues well above the -45 dBFS noise floor.
             let mut res = 0.0_f32;
-            for (m_idx, &(r, th, c_re)) in MODES.iter().enumerate() {
+            for (m_idx, &(r, th, c_re)) in SIMPLE_TANH_MODES.iter().enumerate() {
                 let b_g = (1.0 - r * r).sqrt();
                 let (st, cr) = (th.sin(), th.cos());
                 let prev_re = self.biquads[m_idx][0];
@@ -253,7 +280,6 @@ impl DistillationTarget for SimpleTanhTarget {
 }
 
 #[test]
-#[ignore = "deferred to M21 (Matryoshka PCGrad preserving Ultra Kautz poles without post-hoc wiping)"]
 fn test_live_null_test_autopatch_with_role_b_gauge_and_noisy_blackbox_phase_id() {
     // verify[train.pipeline.host-parity-and-export]
     let crypto = DefaultCryptoProvider::default();
@@ -261,7 +287,9 @@ fn test_live_null_test_autopatch_with_role_b_gauge_and_noisy_blackbox_phase_id()
     manifest.base.controls_schema = vec![make_range_ctrl("drive", 0.0, 10.0, 6.0)];
     let mut target = SimpleTanhTarget {
         gain: 0.4,
-        biquads: [[0.0; 2]; 8],
+        biquads: [[0.0; 2]; SIMPLE_TANH_MODE_COUNT],
+        ring: [0.0; 32],
+        ring_pos: 0,
     };
     let opts = AdaptiveTrainingOptions {
         sample_rate_hz: 48_000,
