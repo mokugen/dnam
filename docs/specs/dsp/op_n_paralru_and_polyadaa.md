@@ -478,7 +478,7 @@ The readout tier block stores one static base matrix `W_ro,0` (sized 16×12, 24�
 
 | Modulation Reference | Scope & Canonical Definition |
 | :--- | :--- |
-| Sensitivity Laws (SSOT) | `stage_targets[0..32]` (0..15 base + 16..31 optional `"CEXT"`), `stage_latent_mods_fp16[0..80]`, Ultra `stage_latent_ctrl_ultra_fp16[0..256]`, and `SONA_META_CORE_MODS_PRESENT`-gated `stage_latent_core_mods_fp16[0..1024]` ([parametric_control_bus.md §3.1](parametric_control_bus.md#31-operator-parameter-dispatch-matrix--sensitivity-laws)) |
+| Sensitivity Laws (SSOT) | `stage_targets[0..32]` (0..16 base + 16..31 active `"CEXT"`, slot 31 fixed +0.0), `stage_latent_mods_fp16[0..80]`, Ultra `stage_latent_ctrl_ultra_fp16[0..256]`, and `SONA_META_CORE_MODS_PRESENT`-gated `stage_latent_core_mods_fp16[0..1024]` ([parametric_control_bus.md §3.1](parametric_control_bus.md#31-operator-parameter-dispatch-matrix--sensitivity-laws)) |
 | Container Layout | 64-byte-aligned binary arena field offsets, alignment, and tier sizes ([dnam_binary_format.md](../containers/dnam_binary_format.md)) |
 
 ---

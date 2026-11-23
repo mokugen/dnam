@@ -96,7 +96,7 @@ flowchart LR
     subgraph TopCrossbar ["1. Top-of-Frame Causal Crossbar (Pure 2x2 VM Input)"]
         Sense["SensoryQuad Op-M/N[Sense] (4x TPT-SVF + ParaLRU)<br/>(Populates q3 + Smooth Linear VCA g_in; Zero LR4/Gate)"]
         OpP["Input-Only Op-P + Smooth Op-N[Pre] Basis<br/>(Stereo H1 + 2-Stage T1 + Raised-Cosine ZOH & Fourier Q)"]
-        Phasors["4x Q0.32 Quadrature Phasors<br/>(0.05 Hz - 20 kHz LFO & Ring-Mod Carriers)"]
+        Phasors["4x Q0.32 Quadrature Phasors<br/>(Signed +/- 0.49 f_s, typ. 0.05 Hz - 20 kHz Carriers)"]
         OpTRead["Causal Op-T Ring Reads (tau_min = 5.0)<br/>(4-Frame Micro-Chunks, Orthogonal 4-Lane, a in 2/4)"]
     end
 
@@ -164,7 +164,7 @@ sequenceDiagram
 
     Bus->>Bus: Init/reset zeros dyn modulators & env_states, sets q2 skew identity, snaps current_stage_params
     Bus->>Bus: Frame 0+ run tick_3khz() strictly when ctrl_sub_counter == 0 (Kautz prev_oct, current_psi, targets)
-    Bus->>Audio: Compute per-frame micro-ramp delta[r] uniformly for all slots r in 0..32 (incl. slot 16)
+    Bus->>Audio: Compute per-frame micro-ramp delta[r] uniformly for all 32 slots 0..32 (slot 31 = +0.0, incl. slot 16 & 30)
 
     loop Per VM frame at f_s,vm (4-frame chunk if (sample_tick & 3) == 0 && rem_frames >= 4 && rem_tick >= 4, else 1-frame peel)
         Audio->>Audio: Step current_stage_params by 1*delta[r], latch registers if (sample_tick & 3) == 0 or ctrl_sub_counter == 0
@@ -182,7 +182,7 @@ lfo_phases_q192 = [[0; 3]; 2],  lfo_phasors = [[1.0, 0.0], [1.0, 0.0]],  env_sta
 ctrl_sub_counter = 0,  sample_tick = 0,  current_stage_params = stage_targets,  deltas = [0.0; 32]
 ```
 
-At frame 0 and every subsequent boundary with `ctrl_sub_counter == 0` across every sample rate including 44.1 kHz (`K_ctrl = 15`), `ControlBus` runs `tick_3khz()`, computing uniform per-frame linear slopes `delta[r]` across all 32 slots (0..32), including Slot 16 (`freeze_mix_drive`) and Slot 30 (`sense_vca_gain_delta`).
+At frame 0 and every subsequent boundary with `ctrl_sub_counter == 0` across every sample rate including 44.1 kHz (`K_ctrl = 15`), `ControlBus` runs `tick_3khz()`, computing uniform per-frame linear slopes `delta[r]` across all 32 ramped channels (0..32, with active dispatch spanning 31 slots 0..31, slot 31 fixed +0.0, including Slot 16 `freeze_mix_drive` and Slot 30 `sense_vca_gain_delta`).
 
 Every VM frame advances `current_stage_params[r]` by `delta[r]` clamped to its previous/target bounds and snaps at `ctrl_sub_counter + 1 >= K_ctrl`. Recursive slews—Kautz `prev_oct` and Op-T `current_psi`—update strictly when `ctrl_sub_counter == 0`, while continuous `freeze_mix` ramps smoothly across frames unless pinned to 1.0 by a host write lock.
 
@@ -194,7 +194,7 @@ Next, 4-lane Q0.32 crossbar phasors step at $f_{s,\mathrm{core}}$ while `OS2X` w
 
 `ModalConvolver` processes `pre_conv` at $f_{s,\mathrm{vm}}$, while symmetric pure-wet Transport quads mix with stage-level `tank_dry_mix_eff` ahead of `mono_out`, 48-frame linear tier crossfade, polarity-signed `eff_trim`, and ±1.0e9 VM safety clamping, leaving multi-port 4CM/WDW, parallel alignment, and M/S output width to the outer host shell.
 
-Across all tiers, each tier's `LinearReadout` section stores one static base readout matrix `W_ro,0` (16×12 in Lite, 24×12 in Full, 32×12 in Pro, and 40×12 in Ultra). At 3 kHz control boundaries, latent modulation drives `stage_targets[0..32]` (core slots 0..15 plus optional extended `CEXT` slots 16..31 defaulting to +0.0), `stage_latent_mods` (96 half-precision entries), `stage_latent_ctrl_ultra` (256 entries, less Arena 3 `ou_to_z_stage_ultra_fp16`), and optional `stage_latent_core_mods` (1,024 entries).
+Across all tiers, each tier's `LinearReadout` section stores one static base readout matrix `W_ro,0` (16×12 in Lite, 24×12 in Full, 32×12 in Pro, and 40×12 in Ultra). At 3 kHz control boundaries, latent modulation drives active dispatch slots `stage_targets[0..31]` (core slots 0..16 plus optional extended `CEXT` slots 16..31; slot 31 fixed +0.0), `stage_latent_mods` (96 half-precision entries), `stage_latent_ctrl_ultra` (256 entries, less Arena 3 `ou_to_z_stage_ultra_fp16`), and optional `stage_latent_core_mods` (1,024 entries).
 
 All `stage_latent_*` sensitivity tables index strictly the unrotated operator latent slice `z_stage` (4-D in Lite through Pro; 8-D in Ultra) rather than `z_head`.
 
@@ -345,6 +345,10 @@ All 35 Lower-Triangular (src_group, dst_group) Tiles Ordered Strictly by Tier In
   23..35 (Ultra,+12): (0,9), (4,9), (6,9), (8,1), (8,5), (8,9), (8,2), (8,7), (8,3), (9,2), (9,7), (9,3)
 ```
 
+Arena 1 through Arena 3 each carry a 256-byte full-replacement crossbar coupling block (`op_p_to_core`, `phasor_to_core`, `opt_to_lr`, and `phasor_stereo_phase`), enabling per-tier crossbar conditioning while Lite fixes `phasor_stereo_phase` at 0.0.
+
+Across all four tiers, ModalConvolver uses 32 / 48 / 96 / 128 lag-ordered early FIR taps per channel; base, prefix, and delta FIR/Kautz poles remain binary32 on wire whereas Full..Ultra PrefixOverride intermediate FIR bands (taps 16..32, 32..48, 48..96) and Kautz `b_gamma` / `c` override bands pack as IEEE-754 binary16.
+
 #### 1.5.2 Portable SIMD Abstraction & Shared Kernel Layering
 
 `r[arch.simd.two-level-traits]`
@@ -408,7 +412,7 @@ All four tiers use fixed compile-time capacities tuned to stay inside the 64 KiB
 
 Arena 0 (4,608 B = 72 CL) is 100% self-contained: it carries 1×-calibrated 48 kHz Lite base weights, SensoryQuad and Top-of-Frame crossbar with 4× Q0.32 phasors, Op-P and Op-N[Pre] config, 32 ModalConvolver FIR taps + 8 Kautz pairs, Quad 0 Op-T TransportQuad (128 B compact wire record), self-contained control tables (control clamp descriptors, `CP1`, `U_int`, `W_ctrl` with LFO skew, stage `tank_dry_mix`, and `ou_to_z_stage`), and the static base half-precision LinearReadout matrix.
 
-Stripping a container to Lite reads Arena 0 directly without touching Arena 1..3 (`REQ-5.6`), while 3 kHz modulation drives continuously micro-ramped `stage_targets[0..32]` (core slots 0..15 plus optional `CEXT` slots 16..31) alongside `z_stage`-indexed sensitivity tables, keeping buyer `SO(4)` gauge `Q_buyer` on `z_head` invariant.
+Stripping a container to Lite reads Arena 0 directly without touching Arena 1..3 (`REQ-5.6`), while 3 kHz modulation drives continuously micro-ramped `stage_targets[0..32]` (base slots 0..16 plus optional `CEXT` slots 16..31, slot 31 fixed +0.0) alongside `z_stage`-indexed sensitivity tables, keeping buyer `SO(4)` gauge `Q_buyer` on `z_head` invariant.
 
 Arena 1..3 hold 2×-OS-calibrated incremental deltas for Full, Pro, and Ultra, with analytical continuous-time ZOH adapting any model cleanly across 44.1–384 kHz. Each `TransportQuad` delta occupies 128 B cleanly padded inside its tier cache lines, and the Pro delta preserves the 15,872 B Pro cumulative wire ceiling alongside the Role B linear Tardos carrier slots (`0x00` unwatermarked).
 
@@ -667,7 +671,7 @@ flowchart TD
 | Family | Hardware Archetypes | SONA Operator & Crossbar Mapping | Core Zero-FDIV Audio-Rate Formulation | Differentiable GPU/CPU Surrogate | Acceptance Criterion |
 | :--- | :--- | :--- | :--- | :--- | :--- |
 | **Family 1: Bistables & PLL Synths** | Boss OC-2, Mu-Tron Octave Divider, Schumann PLL | Crossbar Op-P (2-stage T1 Rotor) → `CoreQuad`s | Stereo-mid T1 5 Hz DC blocker, 32-bit branch-cut guard, cancellation-free `rsqrt_pos_nr3` half/quarter-angle quadratures | Precomputable dry-input Op-P pass (< 0.5 ms) + smooth continuous rotor tracking | Sub-octave frequency/amplitude tracking and zero DC offset |
-| **Family 2: Carrier Mod & Hilbert SSB** | Moog MF-102 Ring Mod, Bode 735 Frequency Shifter | Crossbar Stereo Op-P (`H1`, 3-basis) + 4× `Q0.32` Phasors | Stereo 6-pair Jacobi elliptic H1 (< 0.10° at 48 kHz; <= 0.19° at 15 anchors; <= 0.34° across [44.1, 96] & [176.4, 384] kHz and `f >= 30 Hz` in (96, 176.4) kHz; <= 0.67° at 20 Hz near 136.2 kHz) + 3-basis `[hi*cos, hq*sin, sin]` + `Q0.32` quadrature | Phase-insensitive demodulated STFT loss + analytical `Q0.32` carrier | SSB rejection ≥ 42.0 dB across 100 Hz–10 kHz, clean audio-rate Ring Mod |
+| **Family 2: Carrier Mod & Hilbert SSB** | Moog MF-102 Ring Mod, Bode 735 Frequency Shifter | Crossbar Stereo Op-P (`H1`, 3-basis) + 4× `Q0.32` Phasors | Stereo 6-pair Jacobi elliptic H1 (< 0.10° at 48 kHz; <= 0.19° at 15 anchors; <= 0.34° across [44.1, 96] & [176.4, 384] kHz and `f >= 30 Hz` in (96, 176.4) kHz; <= 0.67° at 20 Hz near 136.2 kHz) + 3-basis `[hi*cos, hq*sin, sin]` + `Q0.32` quadrature | Phase-insensitive MR-IIR / 33-band Gabor / SpecOT / IF+GD loss + analytical `Q0.32` carrier | SSB rejection ≥ 42.0 dB across 100 Hz–10 kHz, clean audio-rate Ring Mod |
 | **Family 3: Polyphonic & Scale Pitch Shifters** | Eventide H3000, DigiTech Whammy, EHX POG | Orthogonal 4-lane Op-T `TransportQuad`s (`tau_min = 5.0`) | Centered Hermite-Hann windows (`window_depth`, 32-bit GPU-safe tri fold), 4-tap Catmull-Rom, boundary clamp, unified `sigma_sat` limiter & `freeze_mix` | Continuous Softmax Diatonic Scale Quantizer + Catmull-Rom `∂d/∂μ` | Pitched chord THD+N ≤ -68 dB and click-free sweep transitions |
 | **Family 4: Hysteretic Dynamics & Ducking** | Boss NS-2, SG-1 Slow Gear, UREI 1176LN, SPL Transient, TC 2290 | `SensoryQuad` + Selective-Duhem ParaLRU + 3 kHz bus + `freeze_mix` | Learned 4-lane sensing (`e_k -> q3`, VCA `g_in`), Selective-Duhem `gamma_duhem`/`eta`, stereo link `lambda_i`, continuous `freeze_mix` overdub/hold | Exact L/R in-SRAM step + `O(log₂ N)` reverse adjoint (incl. `adj_rho -> adj_BP`, `lambda_i`, zero BPTT truncation) | Silence noise floor reduction ≥ 72 dB; zero gate chatter |
 | **Family 5: Bitcrushers & ZOH Reducers** | E-mu SP-1200, WMD Geiger Counter | Crossbar `Op-N[Pre]` + `CoreQuad`s (`PolyADAA1`, Wavefolder, `GLU`) | Raised-cosine track-and-hold (`g_clk`, 28 B state) + smooth Fourier staircase (`q32_smooth_sin`) + `PolyADAA1` + `C²` wavefolder + bounded `GLU` | Exact C∞ Fourier & 1-D affine raised-cosine track-and-hold gradients (zero STE) | Smooth frequency-aliased folddown and full-rate/fractional latch parity |
@@ -684,7 +688,7 @@ Analog archetypes include the Boss OC-2, Mu-Tron Octave Divider, and Schumann PL
 
 `r[arch.families.f2-hilbert-ssb]`
 
-Analog archetypes include the Moog MF-102 Ring Modulator and Bode 735 Frequency Shifter built around 4-quadrant multipliers and dual 90° dome networks. SONA pairs a stereo 6-pair Jacobi elliptic H1 lattice and 3-basis carrier `[hi*cos, hq*sin, sin]` with 4-lane `Q0.32` quadrature phasors (0.05 Hz–20 kHz), capturing rotary sweeps, SSB shifts, and ring modulation per [op_m_modal_kautz.md §2](../dsp/op_m_modal_kautz.md#2-family-2-hilbert-ssb-lattice--carrier-modulation).
+Analog archetypes include the Moog MF-102 Ring Modulator and Bode 735 Frequency Shifter built around 4-quadrant multipliers and dual 90° dome networks. SONA pairs a stereo 6-pair Jacobi elliptic H1 lattice and 3-basis carrier `[hi*cos, hq*sin, sin]` with 4-lane signed `Q0.32` quadrature phasors (`[-0.49 f_s, +0.49 f_s]`, typical 0.05 Hz–20 kHz magnitudes), capturing rotary sweeps, SSB shifts, and ring modulation per [op_m_modal_kautz.md §2](../dsp/op_m_modal_kautz.md#2-family-2-hilbert-ssb-lattice--carrier-modulation).
 
 Via 15-rate anchor interpolation across 20 Hz–20 kHz, H1 quadrature error is < 0.10 deg (0.0976 deg) at 48 kHz, <= 0.19 deg across all 15 table anchors, and <= 0.34 deg across [44.1, 96] and [176.4, 384] kHz as well as for `f >= 30 Hz` in the bridged (96, 176.4) kHz transition band, with <= 0.67 deg worst-case at 20 Hz near 136.2 kHz.
 
@@ -746,11 +750,13 @@ Every parameter packs directly into fixed-capacity 64-byte-aligned `.dnam-bin` A
 
 `r[arch.isomorphism.two-sweep]`
 
-The Split-Precision 32-Bit WebGPU and 64-Bit Host VarPro Pipeline in [webgpu_and_varpro_solver.md](../training/webgpu_and_varpro_solver.md) runs five solver passes: Physics Probe (< 1 ms GPU probes, < 0.5 ms Op-P prepass, OMP Kautz, and Op-T lag/LFO ID) followed by Capsule Optimization across 64–128 Sobol black-box seeds and 96k–120k sample capsules.
+The Split-Precision 32-Bit WebGPU and 64-Bit Host VarPro Pipeline ([webgpu_and_varpro_solver.md](../training/webgpu_and_varpro_solver.md)) executes five passes: Pass 1 runs once over the full active coreset (or 8.0–12.0 s StarCenter `SPCM`) via O(N log N) Toeplitz FIR, 0.9992-seeded Kautz OMP, and soft GCC-PHAT/cepstrum Op-T seeding alongside Op-P precomputation.
 
-Optimization uses 15.5 KiB SRAM 256× checkpointed joint 4-thread L/R scans, 3 × 8-bit signed integer Ozaki contractions, continuous Kautz/Op-T (`scat_psi`) polish until |ΔbESR| < 0.01 dB/epoch, and a short non-line-search STE fp16 QAT polish plus permanent non-readout fp16 snap ahead of VarPro within ≤ 128 MiB storage bindings, < 256 MiB browser, < 64 MiB WASM CPU, and ≤ 4–8 GiB native ceilings.
+Pass 2 optimizes the full nonlinear subspace via Phase 2A projection-invariant Sobol Top-K, Phase 2B chunked TBPTT AdamW under a cosine MR-IIR / 33-band Gabor / SpecOT / 20 ms SegESR / bESR / IF+GD / LTAS / UltrasonicHinge homotopy plus repeatability SNR weighting, Phase 2C 16,384-frame streamed L-SSBroyden, and Phase 2D wire-precision-aware STE binary16 QAT with progressive expansion and arena-scoped PCGrad.
 
-The remaining passes execute Nested VarPro/Schur (64-bit host MM-Cholesky solving `W_ro` plus `ro_pole_48k` sweep, 33-band LTAS KKT, Schur prefix re-balancing, and Gram-domain fp16 readout coordinate rounding), Control-Bus/CP1 subspace fitting, and a ~25 ms deterministic CPU reference evaluation with exact wide integer accumulation, audit, and watermarking (`REQ-1.5`, `REQ-4.1`–`REQ-4.3`).
+Execution runs inside persistent `GpuTrainArena` allocations using 15,360 B forward sequential 2×128 sub-tile scans (4 lanes concurrently) and 14,848 B backward per-lane 256-wide Hillis-Steele associative suffix scans across parallel tile workgroups, `tile_mix_fwd_adj`, and 2D split-64 Ozaki reductions (<= 1.2 MiB Ultra readback) within <= 128 MiB storage bindings and < 256 MiB browser worker caps.
+
+Passes 3–5 then run binary64 Nested VarPro/Schur with binary16 readout coordinate rounding, continuous 3 kHz `u(t)` Control Bus + `stage_latent_*` subspace identification paired with deterministic < 10 ms `PANAMA` corner recommendation, and a ~25 ms deterministic CPU reference pass for exact 0-ULP export (`REQ-1.5`, `REQ-4.1`–`REQ-4.3`).
 
 ### 5.4 Non-Stop 3-Phase Audit Wiring
 
@@ -791,7 +797,7 @@ Execution-ordered cache-locked working sets (4,544 / 7,552 / 11,136 / 14,592 B a
 | Goal ID | Requirement Domain | SONA v3.0 Architectural Realization | Canonical Specifications |
 | :--- | :--- | :--- | :--- |
 | **`REQ-1`** | **Model Classes & Accuracy** | Top-of-Frame Crossbar (`SensoryQuad`, stereo Op-P, smooth Op-N[Pre], 4× `Q0.32`, Op-T `τ_min = 5.0`) + 4-Block `CoreQuad`s + `ModalConvolver` (`modal_convolver`) + `LinearReadout` (`ro_pole_48k`) + `Transport` (`transport`, `‖G_loop‖ < 1`). | [op_t_transport.md](../dsp/op_t_transport.md), [op_m_modal_kautz.md](../dsp/op_m_modal_kautz.md), [op_n_paralru_and_polyadaa.md](../dsp/op_n_paralru_and_polyadaa.md) |
-| **`REQ-1.5`** | **Full-Rig Multi-Control Modeling** | Self-contained Arena 0 CP1 + uniformly micro-ramped `stage_targets[0..32]` (base slots 0..15 plus optional `CEXT` 16..31, `freeze_mix` slot 16, `sense_vca` slot 30, `lfo_skew_fp16`, `ou_to_z_stage_fp16`) + 3 kHz dispatch. | [parametric_control_bus.md](../dsp/parametric_control_bus.md), [webgpu_and_varpro_solver.md](../training/webgpu_and_varpro_solver.md) |
+| **`REQ-1.5`** | **Full-Rig Multi-Control Modeling** | Self-contained Arena 0 CP1 + uniformly micro-ramped `stage_targets[0..32]` (base slots 0..16 plus optional `CEXT` 16..31 with slot 31 fixed +0.0, `freeze_mix` slot 16, `sense_vca` slot 30, `lfo_skew_fp16`, `ou_to_z_stage_fp16`) + 3 kHz dispatch. | [parametric_control_bus.md](../dsp/parametric_control_bus.md), [webgpu_and_varpro_solver.md](../training/webgpu_and_varpro_solver.md) |
 | **`REQ-1.9`** | **Universal Black-Box Runtime & Solver** | Fixed unconditional tier basis parameterized strictly by learned weights (`ref[arch.pillars.universal-black-box]`, `ref[repo.code.universal-black-box]`), zero white-box sub-circuits, zero bypass flags, and 64–128-seed data-driven ID. | [sona_architecture.md §1.1](#11-four-foundational-pillars-of-sona), [project_and_documentation_quality.md §1](project_and_documentation_quality.md#1-static-type-safety--package-import-boundaries) |
 | **`REQ-2`** | **Quality, Control Bus & Tempo Sync** | Per-output noise-adjusted bESR, MR-IIR, 33-band LTAS, SegESR (§4 floors surpassed to `∣ΔbESR∣ < 0.01 dB/epoch` per `ref[qual.tiers.floors-not-stopping-criteria]`), and non-stop 3-phase clamping. | [psychoacoustic_quality_and_tiers.md](psychoacoustic_quality_and_tiers.md), [control_space_audit.md](../training/control_space_audit.md) |
 | **`REQ-2.5`** | **MIDI / Host Tempo Sync** | 20–400 BPM `Q64`/`Q32` physical `PeriodMs`/`FrequencyHz` tempo tracking (`TSYN` 40 B rows + 3 Lobatto anchors, unconditional 3 kHz cadence). | [parametric_control_bus.md §7](../dsp/parametric_control_bus.md#7-host-midi-and-tap-tempo-synchronization-req-25) |

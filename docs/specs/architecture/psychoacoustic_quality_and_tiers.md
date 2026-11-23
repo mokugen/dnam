@@ -159,6 +159,8 @@ At $f_s = 48\text{ kHz}$, an uncompensated converter clock drift or USB stream s
 
 Deterministic models must not memorize random analog thermal noise. Apply the per-output, per-band qualification in §1.3 whenever a measured target-to-floor ratio lies below the tier's required band SNR and the residual remains within 1.0 dB of that floor. A qualifying band satisfies its band requirement and contributes zero to composite acceptance while remaining visible in the reported raw score.
 
+During Pass 2 gradient optimization ([webgpu_and_varpro_solver.md §2.2](../training/webgpu_and_varpro_solver.md#22-pass-2--population-screening--full-subspace-trajectory-optimization)) across the canonical MR-IIR, 33-band Gabor, SpecOT, 20 ms SegESR, bESR, IF+GD, LTAS, and UltrasonicHinge objectives, fixed target energy $E_{b,c}$ and measured noise floor $F_{b,c}$ define the band SNR weight $W^{\mathrm{snr}}_{b,c} = \max(0, E_{b,c} - F_{b,c}) / (E_{b,c} + \epsilon_{\mathrm{snr}})$ with $\epsilon_{\mathrm{snr}} = 10^{-12}$, paired with $C^\infty$ smooth excess residual $\tilde{e}_{b,c}^2 = \tau \ln\big(1 + \exp((\Vert y_{b,c} - \hat{y}_{b,c} \Vert_2^2 - F_{b,c}) / \tau)\big)$ where $\tau = \max(0.05 F_{b,c}, 10^{-12})$.
+
 ### 2.3 Universal Label-Free Quality Scope
 
 `r[qual.eval.metric-scope]`

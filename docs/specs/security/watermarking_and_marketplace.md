@@ -81,9 +81,13 @@ The control-plane `SO(4)` isometric gauge post-multiplies by $\mathbf{Q}_{\text{
 | Arena 3 Control Plane `u_int_ultra[0][r][0..4]` | 27,136..27,520 (`f32le[3][4][8]`); Block 0 at `27,136 + r * 32` | Rotate strictly Block 0 elements `c` in 0..4 (16 B) feeding `z_head[0..4]`; leave Block 0 elements 4..8 and Blocks 1..2 (27,264..27,520) feeding `z_raw[8..16]` untouched |
 | Arena 0 Control Plane `w_ctrl[0..16][0..4]` | 3,456..4,480 (16 × 16 matrix) | Rotate strictly columns 0..4 (`q0 = z_head[0..4]`) across rows 0..16 |
 
-The rotation excludes `v_base` to preserve FM $0.5 \cdot ((\sum v_p z_p)^2 - \sum v_p^2 z_p^2)$ invariance. It also excludes `z_stage`, `u_int_base[r][4..8]`, `u_int_ultra` Block 0 elements 4..8 and Blocks 1..2, and `cp1_ultra`.
+The rotation excludes `v_base` to preserve FM $0.5 \cdot ((\sum v_p z_p)^2 - \sum v_p^2 z_p^2)$ invariance, as well as `z_stage`, `u_int_base[r][4..8]`, `u_int_ultra` Block 0 elements 4..8 and Blocks 1..2, and `cp1_ultra`.
 
-Sensitivity tables dot strictly against unrotated `z_stage[0..D_s]` (`ctrl_basis_4` plus `z_stage_ultra`), never z_head[0..4]. This applies to Lite LinearReadout `stage_latent_mods_fp16[0..80]`, Arena 3 Control Plane `stage_latent_ctrl_ultra_fp16[0..160]` (where `[160..164]` holds `ou_to_z_stage_ultra_fp16`), and Ultra CoreQuad Delta `stage_latent_core_mods_fp16[0..1,024]`, achieving exact 0-ULP DSP invariance without altering fp16 readout weights or interfering with Tardos scoring.
+Likewise, columns 0..4 of CEXT (`w_ctrl_ext[0..16][0..16]`) remain +0.0 so extended slots 16..31 (indices 16 through 30, with slot 31 fixed +0.0) depend strictly on unrotated latents, LFO, and envelope inputs with byte-identical `dbin_prefix` and 0-ULP SO(4) invariance.
+
+Sensitivity tables dot strictly against unrotated stage latents (`ctrl_basis_4` plus Arena 3 stage latents), never rotated head channels 0..4.
+
+This covers Lite LinearReadout `stage_latent_mods_fp16[0..80]`, Arena 3 Control Plane `stage_latent_ctrl_ultra_fp16[0..160]` (adjacent `ou_to_z_stage_ultra_fp16[4]` at `[160..164]` stays excluded from Tardos Role B), and Ultra CoreQuad Delta `stage_latent_core_mods_fp16[0..1,024]` at 0-ULP DSP invariance without altering Tardos scoring.
 
 Layer 2 Kautz pole-angle phase coding perturbs pole angles within quantized 0.01 rad cells using a `[0.2, 0.8]` guard-band snap so quantized structural hashes remain 100% invariant:
 
@@ -118,7 +122,7 @@ The exact disjoint 0..7,680 coordinate partition across Arena 0..3 is specified 
 | Tier 0 (Arena 0) | 112..120 (8) | `f32le` | Lite `LinearReadout` `pre_conv_*` / `direct_s2_*` gains (2,048..2,080) | Role B linear direct gains |
 | Tier 0 (Arena 0) | 120..360 (240) | `f32le` | Arena 0 Control Plane `w_ctrl[1..16]` (3,520..4,480) | Role B linear control-plane `W_ctrl`; embedded unrotated before applying `Q_buyer` on `z_head[0..4]` columns 0..4, and rotated back by `Q_buyer^-1` on detection |
 | Tier 0 (Arena 0) | 360..383 (23) | `f32le` | Arena 0 `rho_head_and_ctrl_tail[1..24]` (4,484..4,576) | Role B Arena 0 spare control tail; excludes `[0]` (`trust_radius_mh` mirror at 4,480..4,484) and `[24..32]` (`opt_to_lr` at 4,576..4,608) |
-| Tier 0 (Arena 0) | 383..655 (272) | `fp16` | Lite `LinearReadout` `stage_latent_mods_fp16[0..80]` (2,080..2,240) + `w_ro_fp16[0..192]` (2,272..2,656) | Role B linear `fp16` `W_mod` / `W_readout` over unrotated `z_stage[0..4]`; excludes `[80..96]` `op_p_to_core` and `[192..208]` `phasor_to_core` |
+| Tier 0 (Arena 0) | 383..655 (272) | `fp16` | Lite `LinearReadout` `stage_latent_mods_fp16[0..80]` (2,080..2,240) + `w_ro_fp16[0..192]` (2,272..2,656) | Role B linear `fp16` `W_mod` / `W_readout` over unrotated `z_stage[0..4]`; masks `[0..8]` `default_knobs` and active `[48..80]`; excludes `[80..96]` `op_p_to_core` and `[192..208]` `phasor_to_core` |
 | Tier 1 (Arena 1) | 655..671 (16) | `f32le` | Full `LinearReadout` `prefix_override[0..16]` (6,912..6,976) | Role A (`chip = 0.0`, `accusation_weight = 0.0`) |
 | Tier 1 (Arena 1) | 671..751 (80) | `f32le` | `conv_fir_full` (6,528..6,656, 32), `conv_kautz_full.c_*` (6,720..6,784, 16), `prefix_override` tail (6,976..7,104, 32) | Role B `ModalConvolver` Full linear FIR / Kautz |
 | Tier 1 (Arena 1) | 751..1,159 (408) | `fp16` | Full `LinearReadout` `w_ro_and_mods_fp16[0..328]` (7,104..7,760) & `[336..416]` (7,776..7,936) | Role B linear `fp16` `W_readout` / `W_mod` & tail (excludes `[328..336]` `kautz_b_gamma[0..8]`) |
@@ -153,7 +157,11 @@ Every linear `fp16` Role B coordinate $i$ with master weight $w_i$ MUST therefor
 
 $$\Delta_i = \max\big(\epsilon_i, 2 \cdot \text{ulp}_{16}(w_i)\big), \qquad W_{\text{ro},i}^{(\text{buyer})} = \text{rn}_{16}\left(w_i + \Delta_i c_i^{(\text{buyer})}\right)$$
 
-This guarantees zero erasure under `f32 -> fp16` conversion and matched-filter collusion scores giving $Z \gg 8.5$ across 4..16-buyer linear averaging and container tier stripping down to Lite. For `f32` coordinates, encoders apply $W_i^{(\text{buyer})} = W_i^{(\text{master})} + \epsilon_i c_i^{(\text{buyer})}$ with Role A coordinates strictly zeroed at $c_i = 0$.
+Buyer issuance always masks `stage_latent_mods_fp16[0..8]` (`default_knobs`, Tardos coordinates 383..391, setting `c_i = 0.0` and `A_{ji} = 0.0`) and likewise masks coordinates carrying active nonzero master weights (`|w_i| >= 1e-4`) inside `stage_latent_mods_fp16[48..80]` (431..463) or `stage_latent_ctrl_ultra_fp16[0..160]` (5,619..5,779).
+
+The remaining > 2,200 linear readout and zero-tail Role B carriers absorb Tardos perturbation so the `2 * ulp_16(w_i)` floor never alters default knobs or injects audible off-center drift.
+
+This preserves non-erasure under binary32-to-binary16 rounding and matched-filter collusion scores giving $Z \gg 8.5$ across 4..16-buyer linear averaging and container tier stripping down to Lite. For `f32` coordinates, encoders apply $W_i^{(\text{buyer})} = W_i^{(\text{master})} + \epsilon_i c_i^{(\text{buyer})}$ with Role A coordinates strictly zeroed at $c_i = 0$.
 
 For scalar uniform embedding, $\epsilon_i = \epsilon$. For EMR-masked perceptual envelopes, encoders map each Role B coordinate `idx` inside tier `(start, end)` via `role_b_word = (idx - start) - 16`, `vec4_idx = role_b_word / 4`, and `lane = role_b_word % 4`.
 

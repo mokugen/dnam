@@ -22,7 +22,7 @@ adrs:
 This specification defines Op-M (Modal and Linear State-Space) along with the input-only Op-P analytic basis for Dynamic Neural Audio Modeler (DNAM) SONA v3.0. Op-M governs four coupled subsystems across real-time execution and GPU training:
 
 1. Unconditionally passive 2×2 `ZDF` `TPT-SVF` associative scans inside the 4-block Matryoshka SONA core across 44.1–384 kHz.
-2. Top-of-Frame Causal Crossbar `Q0.32` quadrature phasors (0.05 Hz–20 kHz) and `Q0.192` contractive control rotors (`Op-M[Ctrl]`).
+2. Top-of-Frame Causal Crossbar signed `Q0.32` quadrature phasors (spanning `[-0.49 f_s, +0.49 f_s]`, typical audible magnitudes 0.05 Hz–20 kHz) and `Q0.192` contractive control rotors (`Op-M[Ctrl]`).
 3. Input-only `Op-P` analytic basis (6-section `H1` Hilbert all-pass lattice plus `T1` sub-harmonic tracker).
 4. `ModalConvolver` early FIR filter and shared-pole Kautz bank hoisted across 16-frame sub-blocks.
 
@@ -69,7 +69,7 @@ Both 4-mode `TPT-SVF` / symplectic modal blocks and `ModalConvolver` 4-pair ster
 
 `r[dsp.op-m.rotor.contractive]`
 
-To guarantee $|u_{\mathrm{rot}, c}| \le 1.0$ in IEEE-754 `f32` without standard math library calls, `FDIV`, or `FSQRT`, control angles in $(-\pi, \pi)$ are evaluated via quadrant-reduced Taylor polynomials and adaptive ULP contraction, while Top-of-Frame quadrature carriers use 4-lane `Q0.32` accumulators across 0.05 Hz–20 kHz.
+To guarantee $|u_{\mathrm{rot}, c}| \le 1.0$ in IEEE-754 `f32` without standard math library calls, `FDIV`, or `FSQRT`, control angles in $(-\pi, \pi)$ are evaluated via quadrant-reduced Taylor polynomials and adaptive ULP contraction, while Top-of-Frame quadrature carriers use 4-lane signed `Q0.32` accumulators across `[-0.49 f_s, +0.49 f_s]` (typical audible magnitudes 0.05 Hz–20 kHz).
 
 ```text
 +---------------------------------------------------------------------------------------------------+
@@ -112,7 +112,7 @@ In the host `f64` rotor utility, after rounding outputs to `f32` $(c, s)$, the r
 | Rotor Kernel | Phase Representation | Frequency Range & Precision |
 | :--- | :--- | :--- |
 | `Op-M[Ctrl]` `Q0.192` LFO | Modulo 2^192 signed accumulator via `3 × u64` limbs | Prevents rounding stalls down to 2^-30 rad/tick |
-| 4-Lane `Q0.32` Crossbar Phasors | 4 wrapping `u32` phase accumulators (`i32` crossbar increments) | 0.05 Hz–20 kHz carriers with `c^2 + s^2` = 1 ± 1e-4 |
+| 4-Lane `Q0.32` Crossbar Phasors | 4 wrapping `u32` phase accumulators (`i32` crossbar increments) | Signed `[-0.49 f_s, +0.49 f_s]` (typical 0.05 Hz–20 kHz) carriers with `c^2 + s^2` = 1 ± 1e-4 |
 | Pure-32-Bit Algebraic Unit Rotor | 3-part Cody-Waite `pi/2` reduction within 65,536 rad (`algebraic_unit_rotor_f32`) | Pure `f32` degree-13/14 Taylor + 2-ULP guard for VM runtime, 3 kHz & cold-load paths |
 
 Cold setup converts finite `lfo_dphi_train[j]` in `[-pi, +pi]` (zeroing non-finite values) in `binary64`, computing `dphi_host` clamped to magnitude `0x4049_0FDA` (largest binary32 value below pi):

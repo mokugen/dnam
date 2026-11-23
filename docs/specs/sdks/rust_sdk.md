@@ -74,9 +74,11 @@ It forbids dependencies on `dnam-train`, `dnam-capture`, `dnam-fixtures`, or tra
 
 `dnam-train` sits as an independent sibling to `dnam-engine`, depending on `dnam-kernels`, `dnam-vm`, and optional `wgpu`.
 
-It owns `TrainerMathBackend`, CPU and checked-in AOT `.wgsl` forward/adjoint runners, VarPro / L-BFGS / CP1 solvers, 3-phase register clamping, and `.dnam-bin` emission without depending on `dnam-engine` or `dnam-fixtures`.
+It owns `TrainerMathBackend`, persistent `GpuTrainArena` pooling, CPU and checked-in `.wgsl` forward/adjoint runners, and `.dnam-bin` emission without depending on `dnam-engine` or `dnam-fixtures`.
 
-`dnam-capture` executes solely over pure in-memory audio and container buffers without Python, PyTorch, CUDA, `clap`, `cpal`, or external linear-algebra dependencies (REQ-1.6, REQ-1.9, [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md)).
+Training solves run full-subspace AdamW, L-SSBroyden (m = 16..32, < 64 MiB WASM CPU worker), VarPro, and CP1 fitting with 3-phase register clamping.
+
+Sibling `dnam-capture` executes solely over pure in-memory audio and container buffers without Python, PyTorch, CUDA, clap, cpal, or external linear-algebra dependencies (`REQ-1.6`, `REQ-1.9`, [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md)), passing full-coreset `Pass1ProbeResult` physics once across passes without duplicate probing.
 
 Ground-truth fixtures (`dnam-fixtures`) remain confined to `[dev-dependencies]` and never appear in `dnam-kernels`, `dnam-vm`, `dnam-engine`, `dnam-train`, or non-test capture sources (`ref[repo.code.universal-black-box]`).
 
@@ -118,9 +120,13 @@ All shared 32-bit SONA operator math lives in `dnam-kernels` under `packages/ker
 | **Modal & Transport (`modal_and_transport`)** | `KautzQuadState`, `ComplexModalScanElem`, `PhasorQ32Bank4`, orthogonal pure-wet 4-lane `Op-T` + continuous `freeze_mix` + WGSL-safe triangle fold (`((p as i32) >> 31) as u32`) + unified `sigma_sat` `coercive_loop_limit_vec4` + fused `SO(4)` `R_odd`/`R_even` scattering rotor primitives, stereo 6-pair Elliptic `HilbertH1StereoKernel` (248 B stereo kernel in `SonaLiteHotPrefix`), mono `HilbertH1Kernel`, `T1DcBlockerStereo` (24 B), and 2-stage `rsqrt_pos_nr3` `T1SubHarmonicKernel` (28 B) | Shared CPU and GPU physics evaluation (<= 1e-4 * max(1.0, peak) on 256-wide linear scans; 0-ULP `process(1) == process(4) == process(16)`) |
 | **Ozaki Integer Slices (`ozaki_i32`)** | `pow2_ceil_fp32`, `round_ties_even_f32`, `slice_f32_mantissa_i8x3`, `accum_ozaki_chunk_i32`, and host `reconstruct_ozaki_dot_f64` | Exact 0-ULP 32-bit `i32` Ozaki contraction parity across WebGPU drivers (REQ-4.2) |
 
-Under the Shared `#![no_std]` Kernels and Checked-In AOT WGSL pipeline, `tools/sona-shaders/` compiles `dnam-kernels` offline via `cargo-gpu` targeting `spirv-unknown-naga-wgsl` and checks in `naga`-validated `.wgsl` compute artifacts for `dnam-train`.
+Under the Shared no_std Kernels and Checked-In AOT WGSL pipeline, `tools/sona-shaders/` compiles `dnam-kernels` offline via `cargo-gpu` targeting `spirv-unknown-naga-wgsl` and checks in validated `.wgsl` artifacts for `dnam-train`.
 
-Workgroup SRAM (`var<workgroup>`) is hard-capped at 15,872 B (15.5 KiB) to reserve at least 512 B for driver scratch, while default workspace builds stay on stable Rust with zero shader bytes added to `dnam.wasm`.
+The AOT WGSL shader suite defines seven compute kernels: `prescreen_population`, `fused_core_scan_256`, `adjoint_scan_256`, `tile_mix_fwd_adj`, `gabor_bezout_grad`, `ozaki_gram_rhs_i32`, and `inner_opt_step`.
+
+Workgroup SRAM (`var<workgroup>`) is capped at 15,872 B (15.5 KiB) to reserve at least 512 B for driver scratch: forward `fused_core_scan_256` (15,360 B) steps two sequential 128-frame sub-tiles concurrently across 4 lanes in lane-major scalar shared storage, while backward `adjoint_scan_256` (14,848 B) launches parallel tile workgroups stepping per-lane 256-wide Hillis-Steele suffix scans.
+
+Persistent `GpuTrainArena` pooling runs 16,384-frame streamed 2× time-blocks via double-buffered `(RW)` `exit_adj_boundary` (<= 128 MiB binding, < 256 MiB browser / < 512 MiB desktop) alongside `(1, num_candidates, 1)` `inner_opt_step` (`m <= 32`) and 2D split-64 Ozaki reductions (<= 1.2 MiB Ultra readback, 0 KB shader bloat in `dnam.wasm`).
 
 ---
 

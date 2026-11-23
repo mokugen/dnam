@@ -163,8 +163,20 @@ The manifest slice at `[manifest_offset .. manifest_offset + manifest_len)` stor
 | :--- | :--- | :--- |
 | Envelope & Nested `base` Header | `version = "3.0.0"`, `container_kind = "dnam-proj"`, `base` (v3.0 JSON header with `base.container_kind = "dnam"`, `base.architecture = "sona"`) | Shares the exact validated v3.0 `"sona"` JSON header schema (`ref[container.dnam.jcs-header-schema]`). |
 | `project_meta`, `rig_routing` & `calibration_summary` | `project_meta.{project_id, rig_notes, updated_at}`, `rig_routing.{sample_rate_device_hz, bit_depth, input_channels, output_channels, reamp_send_channel}`, `calibration_summary` | Tracks project identity, native hardware rate (8..384 kHz), bit depth (`int12`, `int16`, `int24`, `int32`, `float32`), and 64-byte `CALB` v3 telemetry. |
-| `stems_registry` | Ordered `StemRegistryEntry` list (`stem_id`, `chunk_id`, `enabled`, `is_star_center`, `controls_meta`, `provenance`, `user_metadata`, `extracted_physics`) | Binds each stem's `chunk_id` (`u16` `STMC` `stem_index`), SHA-256 dry/wet `<f4` PCM provenance, and `DNAM-GRAM-INPUT-V3` fingerprint (REQ-3.2). |
-| `audit_report` & `solver_telemetry` | `audit_report` (`AuditReport`), `solver_telemetry.{active_stem_count, total_solve_ms, tier_esr_db}` | Persists Phase-1 control-space audit clamps and 4-tier ESR certification metrics across incremental vault edits. |
+| `stems_registry` | Ordered `StemRegistryEntry` list (`stem_id`, `chunk_id`, `enabled`, `is_star_center`, `controls_meta`, `provenance`, `user_metadata`, `extracted_physics`) | Binds each stem's `chunk_id` (`u16` `STMC` `stem_index`), SHA-256 dry/wet `<f4` PCM provenance, and `DNAM-GRAM-INPUT-V3` fingerprint (REQ-3.2); optional `extracted_physics` carries the 12 physical descriptor fields defined below under strict unknown-key rejection. |
+| `audit_report` & `solver_telemetry` | `audit_report` (`AuditReport`), `solver_telemetry.{active_stem_count, total_solve_ms, tier_esr_db}` | Persists Phase-1 control-space audit clamps, deterministic `[PANAMA]` corner recommendations inside `audit_report.prescriptions` (zero manifest key additions), and 4-tier ESR certification metrics across incremental vault edits. |
+
+Under `stems_registry[*].extracted_physics`, strict JCS schema decoding retains `delays_ms`, `lfo_freqs_hz`, and `decay_gains_lin` (number arrays, empty default), `detected_grain_size_ms` and `detected_pitch_shift_semitones` (numbers, 0.0 default), and adds seven optional defaulting capture fields:
+
+| `extracted_physics` Optional Field | JSON Wire Type & Omission Default | Clean-Room Semantics |
+| :--- | :--- | :--- |
+| `bla_mag_33_db` | Number array of 33 elements when non-empty (empty array when omitted) | Best Linear Approximation 1/3-octave magnitude profile in dB |
+| `even_dist_ratio_db` | Number (0.0 default when omitted) | Broadband even-order distortion ratio relative to fundamental in dB |
+| `odd_dist_ratio_db` | Number (0.0 default when omitted) | Broadband odd-order distortion ratio relative to fundamental in dB |
+| `noise_var_33_lin` | Number array of 33 non-negative elements when non-empty (empty default) | Law 0.A-gated 1/3-octave repeatability noise variance in linear power |
+| `edc_t60_s` | Non-negative number (0.0 default when omitted) | Schroeder Energy Decay Curve 60 dB reverberation time in seconds |
+| `law0a_ltv_flag` | Boolean (`false` default when omitted) | True when Law 0.A detects time-varying modulation across Regime 1 periods |
+| `coreset_regime_offsets` | 5-element integer array (`[0,0,0,0,0]` default) | Monotonic sample boundaries `[0, r2_start, r3_start, r4_start, total_frames]` |
 
 ### 1.3 Lifecycle States, Capsule Compaction & Cloud Range Sync
 
@@ -176,9 +188,9 @@ Trained and signed containers add `HAS_STAT`, `HAS_WGHT`, and `HAS_AUTH` to trac
 
 | Lifecycle State | Embedded Chunks | Key Behavioral Invariant |
 | :--- | :--- | :--- |
-| Active Capture | `CALB` + `SPCM` + `INPC`/`STMC` | Retains lossless raw `SPCM` stems alongside extracted `INPC`/`STMC` capsules during active recording |
+| Active Capture | `CALB` + `SPCM` + `INPC`/`STMC` | Retains lossless raw `SPCM` stems (spanning full 8.0–12.0 s StarCenter 4-regime sequences for Pass 1 physics identification) alongside extracted condensed `INPC`/`STMC` capsules |
 | Trained Full Project | `+ STAT + WGHT` (+ optional `AUTH`) | Embeds `StarCenter` `uplo='U'` sufficient statistics (`STAT`) and certified 4-tier v3.0 `.dnam` weights (`WGHT`, wrapping the compiled `.dnam-bin` `"DNBN"` register program) |
-| Capsule Compaction | Strips `SPCM`, keeps `INPC`/`STMC`/`STAT`/`WGHT` | Requires `INPC`/`STMC` whenever `stems_registry` is non-empty; preserves `PROJ_FLAG_COMPACTED_CAPSULES` across capsule edits and shrinks multi-stem projects to 0.8–2.5 MB for full re-pooling and export (REQ-3.1, REQ-3.3) |
+| Capsule Compaction | Strips `SPCM`, keeps `INPC`/`STMC`/`STAT`/`WGHT` | Requires condensed `INPC`/`STMC` whenever `stems_registry` is non-empty; preserves `PROJ_FLAG_COMPACTED_CAPSULES` across capsule edits and shrinks 16-stem stereo captures to <= 16.4 MB of capsules (~16.7 MB / <= 16.0 MiB full `.dnam-proj` with `STAT` and `WGHT`, under < 20 MB REQ-3.3) |
 
 ---
 
@@ -188,7 +200,7 @@ Trained and signed containers add `HAS_STAT`, `HAS_WGHT`, and `HAS_AUTH` to trac
 
 `r[container.proj.inpc-capsule]`
 
-The `INPC` chunk (`chunk_id = 0`) stores the shared 2.0–2.5 s (96,000–120,000 frames at 48 kHz, `num_frames % 16 == 0`) full-bandwidth (20 Hz–20 kHz) fp32 dry excitation capsule inside a 64 B-aligned record. Mono capsules occupy 384,640–480,640 B and stereo capsules occupy 768,640–960,640 B, preserving 18–20 kHz air and multi-second envelopes inside multi-stem `.dnam-proj` vaults under 20 MB (REQ-3.3).
+The `INPC` chunk (`chunk_id = 0`) stores the shared 2.0–2.5 s (96,000–120,000 frames at 48 kHz, `num_frames % 16 == 0`, canonically a condensed 2.5 s / 120,000-frame 4-regime coreset) full-bandwidth (20 Hz–20 kHz) fp32 dry excitation capsule inside a 64 B-aligned record. Mono capsules occupy 384,640–480,640 B and stereo capsules occupy 768,640–960,640 B, preserving 18–20 kHz air and multi-second envelopes inside multi-stem `.dnam-proj` vaults under 20 MB (REQ-3.3), while full 8.0–12.0 s active `StarCenter` captures live strictly in transient `SPCM` ahead of compaction.
 
 | Offset | Bytes | LE Wire Type | Field Name | Clean-Room Invariant |
 | :---: | :---: | :--- | :--- | :--- |
@@ -212,7 +224,7 @@ Relative bytes 0..16 of `schedule_320` hold four `u32le` header fields (`num_car
 
 `r[container.proj.stmc-capsule]`
 
-Each stem `s` in `stems_registry` owns a dedicated `STMC` chunk (`chunk_id == stem_index`) of 64 B-aligned size. Mono captures occupy 388,800–484,800 B and stereo captures occupy 772,800–964,800 B, keeping compacted multi-stem projects strictly under 20 MB per REQ-3.3.
+Each stem s in `stems_registry` owns a dedicated STMC chunk (`chunk_id == stem_index`) of 64 B-aligned size covering 96,000–120,000 frames (2.0–2.5 s). Mono captures occupy 388,800–484,800 B and stereo captures occupy 772,800–964,800 B, keeping compacted 16-stem stereo projects under 20 MB per REQ-3.3. Loaders determine channel count strictly from the STMC `STEREO` flag (`1<<3`) and INPC `channels` field, never inferring channel count from byte length.
 
 | Offset | Bytes | LE Wire Type | Field Name | Clean-Room Invariant |
 | :---: | :---: | :--- | :--- | :--- |
@@ -232,6 +244,10 @@ Each stem `s` in `stems_registry` owns a dedicated `STMC` chunk (`chunk_id == st
 | 128..704 | 576 | `36 × 16 B records` | `windows` | `R` trajectory window records (16 B each: +0..2 `control_id: u16le`, +2 `ctrl_kind: u8`, +3 `active_opt: u8`, +4..8 `u_phys: f32le`, +8..12 `window_weight: f32le >= 0`, +12..16 `emr_velocity: f32le`); unused tail `128+16*R..704` must be `0x00` |
 | 704..4,800 | 4,096 | `u8[4,096]` | `spectral_summary_4096` | 1,024 × `f32le` averaged 2:1 DFT magnitude bins (`0.5 * (\|X[2k]\| + \|X[2k+1]\|) * (2 / 4,096)`) |
 | 4,800..rec_len | `4 * C * N` | `f32le[C * N]` | `wet_coreset_fp32` | Finite aligned full-bandwidth wet response for Path 2 GPU/CPU re-pooling without raw WAVs |
+
+For continuous `MODE_A_SWEEP` capsules decoded into per-tick trajectories (`N_active = STMC.num_frames`), filter out `window_weight <= 0.0`; controls with `M_c == 0` remaining records hold their `controls_meta` value (or control default if omitted), and `M_c == 1` controls stay constant across all frames.
+
+All controls with `M_c >= 2` place ordered knots uniformly via $t_j = \lfloor j (N_{\mathrm{active}} - 1) / (M_c - 1) \rfloor$ without altering the 16-byte layout: continuous sweeps interpolate between adjacent knots, whereas discrete switches (`ctrl_kind == 1`) read `active_opt` (ignoring `u_phys`) piecewise-constantly using integer `midpoint = floor((t_j + t_{j+1}) / 2)` (frames t < midpoint use knot j, and t >= midpoint use knot j + 1).
 
 Inside `[20..108)`, `band_psd_summary_88` stores 10 `f64le` upper-triangle entries `(i <= j)` equal to `sqrt(band_power[i]) * sqrt(band_power[j])` in relative bytes 0..80, followed by `total_power` (`f64le`) in relative bytes 80..88.
 

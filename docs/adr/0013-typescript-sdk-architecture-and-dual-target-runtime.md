@@ -22,7 +22,7 @@ requirements:
 
 # ADR-0013: Idiomatic TypeScript 7 SDK Architecture, Dual-Target N-API + WASM SIMD128 Runtime & WebAudio Parameter Semantics
 
-This record documents the architectural and ergonomic design decisions for **`@dnam-project/dnam`** (`packages/js/`), the idiomatic TypeScript 7 SDK wrapping `packages/vm/`, `packages/engine/`, `packages/capture/`, and planned target crate `packages/train/` across Node.js 26 LTS (`N-API v10`), WebAssembly `SIMD128` / WebAudio `AudioWorklet`, and browser `navigator.gpu` WebGPU, specified normatively in [`../specs/sdks/typescript_sdk.md`](../specs/sdks/typescript_sdk.md).
+This record documents the architectural and ergonomic design decisions for **`@dnam-project/dnam`** (`packages/js/`), the idiomatic TypeScript 7 SDK wrapping `packages/vm/`, `packages/engine/`, `packages/capture/`, and `packages/train/` across Node.js 26 LTS (`N-API v10`), WebAssembly `SIMD128` / WebAudio `AudioWorklet`, and browser `navigator.gpu` WebGPU, specified normatively in [`../specs/sdks/typescript_sdk.md`](../specs/sdks/typescript_sdk.md).
 
 ---
 

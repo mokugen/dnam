@@ -75,13 +75,13 @@ The capture planner locks `Mode-0` at the declared StarCenter reference stem (`s
 
 Before committing non-reference knob stems on physical hardware, the planner verifies mechanical return repeatability back to StarCenter against the reference residual envelope (`ACOUSTIC_NULL_HOMING_MAX_DB = 0.05` dB and pre-stem thermal or sag drift `THERMAL_RECOVERY_MAX_DB <= 0.15` dB). This gate isolates potentiometer backlash or thermal drift from true parametric control variation (REQ-1.7).
 
-#### Freeze-Transition Capture
+#### Sustain-Hold and Write-Enable Transition Capture
 
 `r[train.capture.planner.freeze-transition]`
 
-Sustain-hold state transitions are captured with zero control-name, string-matching, or calibration-role heuristics (REQ-1.6). Whenever physical hardware or a white-box `DNWB` runner (`HAS_FREEZE_WINDOW` bit 1<<2 or any general sustained-hold control axis across control trajectories) exhibits a write-hold transition, the planner records active-sustain entry while harmonic energy is present, held steady-state sustain under live play-over phrases, and release recovery.
+Sustain-hold state transitions are captured with zero control-name, string-matching, or calibration-role heuristics (REQ-1.6). Whenever physical hardware or a white-box `DNWB` simulator (`HAS_FREEZE_WINDOW` bit `1<<2` or any general sustained-hold control axis across control trajectories) exhibits a write-enable (`WE`) hold transition, the planner records active-sustain entry while harmonic energy is present, held steady-state sustain under live play-over phrases, and release recovery.
 
-The identification solver lowers that write-hold trajectory purely from input/output signal telemetry into uniformly micro-ramped `ControlBus` slot 16 (`op_t_freeze_mix_delta`), sweeping continuous passive `freeze_mix` (`mu_freeze in [0, 1]`) for 0-ULP hold at unity (`ref[dsp.tank.captured-freeze]`). This keeps `TransportQuad` states bit-clean across 30 s tails without fp16 re-quantization hiss while play-over continues through the core—requiring zero dedicated host freeze APIs.
+The identification solver lowers that write-hold trajectory purely from input/output signal telemetry into uniformly micro-ramped slot 16 (`op_t_freeze_mix_delta`), sweeping continuous passive `freeze_mix` (`mu_freeze` in `[0, 1]`) for 0-ULP hold at unity (`ref[dsp.tank.captured-freeze]`). This keeps `TransportQuad` states bit-clean across 30 s tails without quantization hiss while play-over continues through the core—requiring zero dedicated host freeze APIs.
 
 ### 1.4 Co-Designed Disjoint-Comb Excitation, Live Tail Extension & White-Box Distillation
 
@@ -89,9 +89,22 @@ The identification solver lowers that write-hold trajectory purely from input/ou
 
 `r[train.capture.excitation.codesigned]`
 
-Capture synthesizes a deterministic, crest-factor-controlled excitation combining odd-bin disjoint harmonic combs (leaving unexcited even harmonic bins open to isolate even-order intermodulation sidebands), swept exponential/logarithmic chirps, multi-level dynamic step envelopes (−48 dBFS to 0 dBFS), a deterministic 500 ms Musical Transient Coreset (capturing musical transient attacks and decay tails), and full-bandwidth (20 Hz–20 kHz) 32-bit float content spanning all 33 canonical LTAS bands.
+Hardware capture pairs an open-loop Two-Tier Schoukens–Pintelon 4-regime fullband excitation with the closed-loop 96 ms (4,608-sample) feedback-adaptive disjoint-comb safeguard loop (`Laws 0.A–0.F` and `Laws 1–3`, [ADR-0016](../../adr/0016-codesigned-disjoint-comb-stimulus-and-null-homing-capture.md), REQ-1.6).
 
-This excitation separates linear FRF pedestals from intermodulation sidebands and archives the shared 2.0–2.5 s (96,000–120,000 frames at 48 kHz) fp32 capsule in `INPC` (`ref[container.proj.inpc-capsule]`, [ADR-0016](../../adr/0016-codesigned-disjoint-comb-stimulus-and-null-homing-capture.md), REQ-1.6).
+During active StarCenter capture (s = 0), capture streams a full 8.0–12.0 s (384,000–576,000 frames at 48 kHz) 4-regime waveform into transient `SPCM` storage to identify the Best Linear Approximation (`BLA`) and separate even/odd nonlinear distortions (`bla_mag_33_db`, `even_dist_ratio_db`, `odd_dist_ratio_db`).
+
+It simultaneously estimates Law 0.A-gated noise variance and Energy Decay Curve reverberation times, persisting `noise_var_33_lin`, `edc_t60_s`, and `law0a_ltv_flag` inside manifest `extracted_physics` (`ref[container.proj.jcs-manifest]`).
+
+Upon capsule compaction (`ref[container.proj.inpc-capsule]`), raw `SPCM` is stripped and `INPC`/`STMC` retain a 2.0–2.5 s (96,000–120,000-frame, canonically 2.5 s / 120,000 frames) Condensed 4-Regime Coreset indexed by five-entry `extracted_physics.coreset_regime_offsets` (`[0, r2_start, r3_start, r4_start, total_frames]`) verified against dry envelope onset (`16,384 + 36,000 + 24,000 + 19,616` = 96,000 at 2.0 s; `32,768 + 40,800 + 26,400 + 20,032` = 120,000 at 2.5 s) under the < 20 MB budget (REQ-3.3):
+
+| Excitation Regime | Active 8–12 s `SPCM` & 2.0–2.5 s Coreset Structure | Physical Identification & Hardware Safeguard Rules |
+| :--- | :--- | :--- |
+| **Regime 1: Odd-Random Multisine** | `P >= 3` identical periods of 16,384 or 32,768 samples in `SPCM` (`CF <= 1.8`, Period 0 dropped); condensed packs 1 × 32,768 or 2 × 16,384 settled samples (1 × 16,384 at 2.0 s) | Extracts `BLA`, even/odd distortion at unexcited bins, and `Law 0.A`-gated variance; comparing Period 1 response energy `E_y1` against one-period `CALB` quiescent energy `E_calb = N_per * 10^(noise_floor_dbfs / 10)` (`N_per` = 16,384 or 32,768), falls back to `CALB` quiescent floor + unexcited guard bins (`law0a_ltv_flag = true`) when maximum normalized period mismatch across settled periods `p >= 2` vs Period 1 exceeds `max(0.01, 8 * E_calb / max(E_y1, 1e-12))` or period coherence < 0.90, excluding `Law 0.C` mains & squeal bins |
+| **Regime 2: Dynamic Staircase + Decay Gaps** | Multi-level bursts (-42 / -24 / -12 / -1.5 dBFS) interleaved with 250–350 ms silent decay gaps (40,800 samples at 2.5 s; 36,000 at 2.0 s) | Peak level capped at -1.5 dBFS (0.841 FS) by `Law 0.D` ADC peak governor and `0.80 * A_rail` `Law 0.F` capsule governor; measures `EDC` decay tails and `Op-N` compression/gate ballistics |
+| **Regime 3: Monophonic Chirp + IMD Sweep** | Gapless monophonic logarithmic chirp (`Law 0.E`) paired with chromatic/dissonant multi-tone IMD sweeps (26,400 samples at 2.5 s; 24,000 at 2.0 s) | Separates broadband phase dispersion and intermodulation while monophonic chirp satisfies `Law 0.E` sub-harmonic divider chatter immunity |
+| **Regime 4: Topology-Branched Contrast** | 20,032 samples at 2.5 s (19,616 at 2.0 s); branched across all `REQ-7.4` topologies (`1->1`, `1->2`, `2->2`, `2->1`, and `4CM`/`WDW`) | `1->1` excites mono dynamic/transient bursts; `1->2` drives mono bursts probing L/R panning & decorrelation; `2->2` (`TrueStereo2To2`) excites L-only, R-only, Mid, Side & Hard-Pan + Witness; `2->1` (`DualInToMono2To1`) excites Key-Silent/Loud/Burst vs Audio-Mid/Steady; `4CM`/`WDW` branches per routed VM port pair |
+
+When recording or probing live hardware stems dynamically, the deterministic 96 ms disjoint-comb loop preserves odd-bin harmonic separation (`k_p = 8`, `dk >= 34`), sub-millisecond crest-factor lookahead, and the 500 ms Musical Transient Coreset alongside `INPC` PRNG seeds.
 
 #### Automatic Live Decay-Tail Extension
 
@@ -111,16 +124,20 @@ External circuit or DSP simulator processes connected over a little-endian binar
 
 `r[train.capture.alignment.multi-regime]`
 
-Given dry excitation $x[n]$ and recorded wet return $y[n]$ after subtracting loopback offset $\hat{\tau}_{\text{loop}}$, multi-regime sub-sample alignment classifies the physical return across four alignment regimes and solves sub-sample lag $\Delta\tau$, clock drift in ppm (`clock_drift_ppm * 1e-6` clamped to `[-0.05, 0.05]`), and linear converter gain $\hat{g}$:
+Given dry excitation $x[n]$ and recorded wet return $y[n]$ after subtracting loopback offset $\hat{\tau}_{\text{loop}}$, hybrid multi-regime alignment executes a strict three-step causal-preserving refinement solving integer/polarity onset, signed sub-sample lag correction $\Delta\tau \in [-1.5, +1.5]$, clock drift in ppm, and linear converter gain $\hat{g}$:
 
 | Alignment Regime | Activation Condition | Peak Selection & Estimator |
 | :--- | :--- | :--- |
 | `CleanLinear` | Broadband linear coherence `gamma_lin >= 0.35`, positive peak | Normalized waveform cross-correlation peak |
 | `PolarityInverted` | Broadband linear coherence `gamma_lin >= 0.35`, negative peak | Signed normalized cross-correlation peak (`\|R[k*]\|`, sign restored on `g_hat`) |
-| `DispersiveAllPass` | Broadband linear coherence `gamma_lin >= 0.35`, dispersed phase | Causal HF wavefront correlation lock |
-| `NonlinearEnvelopeFallback` | Hard clipping or octave division pushes `gamma_lin < 0.35` | True stereo 6-pair Jacobi elliptic `H1` Hilbert envelope cross-correlation |
+| `DispersiveAllPass` | Broadband linear coherence `gamma_lin >= 0.35`, dispersed phase | Coarse causal wavefront lock bounded ahead of signed parabolic sub-sample refinement |
+| `NonlinearEnvelopeFallback` | Hard clipping or octave division pushes `gamma_lin < 0.35` | Stereo 6-pair Jacobi elliptic H1 Hilbert envelope cross-correlation |
 
-Alignment first evaluates normalized cross-correlation (or the true stereo `H1` elliptic Hilbert envelope fallback) over the causal search window and fits a 3-point parabolic vertex around the correlation magnitude peak $k^\star$:
-$$\delta = \frac{\lvert R[k^\star - 1] \rvert - \lvert R[k^\star + 1] \rvert}{2\big(\lvert R[k^\star - 1] \rvert - 2 \lvert R[k^\star] \rvert + \lvert R[k^\star + 1] \rvert\big)} \in [-0.5, +0.5], \qquad \hat{\tau} = k^\star + \delta$$
+First, the coarse causal wavefront probe determines earliest envelope/wavefront onset $\tau_{\text{coarse}}$ and polarity, preventing dispersive all-pass group delay from pulling alignment past causal impulse arrival. Next, 3-point parabolic vertex interpolation around magnitude peak $k^\star$ solves $\delta \in [-0.5, +0.5]$ inside $\Delta\tau = \mathrm{clamp}(k^\star + \delta - \tau_{\text{coarse}}, -1.5, +1.5)$ (setting $\delta = 0.0$ on flat plateaus where the denominator magnitude <= 1e-12), yielding aligned lag $\hat{\tau} = \max(0.0, \tau_{\text{coarse}} + \Delta\tau)$ :
+$$\delta = \frac{\lvert R[k^\star - 1] \rvert - \lvert R[k^\star + 1] \rvert}{2\big(\lvert R[k^\star - 1] \rvert - 2 \lvert R[k^\star] \rvert + \lvert R[k^\star + 1] \rvert\big)} \in [-0.5, +0.5], \qquad \hat{\tau} = \max\big(0.0, \tau_{\text{coarse}} + \mathrm{clamp}(k^\star + \delta - \tau_{\text{coarse}}, -1.5, +1.5)\big)$$
 
-Finally, fractional resampling maps the wet stem onto the zero-phase `INPC` grid using a 64-tap (`RADIUS = 32`) partition-of-unity Kaiser-sinc filter with $\beta = 8.6$ and 512-phase linear table interpolation when compensating clock skew. This aligns dry-to-wet causal wavefronts consistently with the 4-frame causal micro-chunk latency floor of $\tau \ge 5.0$ crossbar or $\ge 4.0$ standalone, achieving better than 0.02-sample accuracy at 48 kHz (`ref[qual.eval.jitter-floor]`).
+Finally, 64-tap (`RADIUS = 32`) partition-of-unity Kaiser-sinc resampling with Kaiser shape parameter $\beta = 8.6$ and 512-phase linear interpolation aligns fractional delay onto the zero-phase `INPC` grid.
+
+Dynamic ppm clock-drift compensation estimates leading and trailing fractional lags (`l_early`, `l_late`) over `[0..N/4)` and `[3N/4..N)` for N >= 24,000 samples using energy-weighted centroids (`c_early`, `c_late`), computing `ppm = 1e6 * (l_late - l_early) / max(c_late - c_early, 1000.0)`.
+
+Polyphase drift resampling (1.0 < |ppm| <= 250.0) runs strictly when Law 0.A confirms `TimeInvariant` (`law0a_ltv_flag == false`) and both quarter coherences meet 0.75, achieving < 0.02-sample accuracy at 48 kHz (`ref[qual.eval.jitter-floor]`).

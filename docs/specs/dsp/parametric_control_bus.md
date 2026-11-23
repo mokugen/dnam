@@ -301,14 +301,16 @@ Every tier evaluates all 16 base rows `r in 0..16` via `W_ctrl[r][0..16]` uncond
 
 $$\theta_{\text{op}}^{\text{Lite..Pro}}[r] = \sum_{c=0}^{15} W_{\text{ctrl}}[r][c] q_{16}[c], \qquad \theta_{\text{op}}^{\text{Ultra}}[r] = \theta_{\text{op}}^{\text{Lite..Pro}}[r] + \sum_{c=0}^{3} W_{\text{ctrl,ultra}}[r][c] q_{u}[c] \qquad (r \in \lbrace 0, \dots, 15 \rbrace)$$
 
-When the optional unwatermarked 1,280 B `"CEXT"` extension is present (`w_ctrl_ext[16][16]` = 1,024 B plus `w_ctrl_ultra_ext[16][4]` = 256 B; [dnam_binary_format.md §1.4](../containers/dnam_binary_format.md#14-bare-deterministic-vm-binary-container-dnam-bin--dnbn)), rows `r in 16..32` read `w_ctrl_ext[r - 16][0..16]` and `w_ctrl_ultra_ext[r - 16][0..4]` over $\mathbf{q}_{16}$ and `qu`, defaulting strictly to +0.0 when absent:
+When the optional unwatermarked 1,280 B `"CEXT"` extension is present (`w_ctrl_ext[16][16]` = 1,024 B plus `w_ctrl_ultra_ext[16][4]` = 256 B; [dnam_binary_format.md §1.4](../containers/dnam_binary_format.md#14-bare-deterministic-vm-binary-container-dnam-bin--dnbn)), active extended slots `r` in 16..31 (`r in {16, ..., 30}`, with row 15 / slot 31 fixed at +0.0) read `w_ctrl_ext[r - 16][0..16]` and `w_ctrl_ultra_ext[r - 16][0..4]` over $\mathbf{q}_{16}$ and `qu`, defaulting strictly to +0.0 when absent:
 
-$$\theta_{\text{op}}^{\text{Lite..Pro}}[r] = \sum_{c=0}^{15} w_{\text{ctrl,ext}}[r - 16][c] q_{16}[c], \qquad \theta_{\text{op}}^{\text{Ultra}}[r] = \theta_{\text{op}}^{\text{Lite..Pro}}[r] + \sum_{c=0}^{3} w_{\text{ctrl,ultra,ext}}[r - 16][c] q_{u}[c] \qquad (r \in \lbrace 16, \dots, 31 \rbrace)$$
+$$\theta_{\text{op}}^{\text{Lite..Pro}}[r] = \sum_{c=0}^{15} w_{\text{ctrl,ext}}[r - 16][c] q_{16}[c], \qquad \theta_{\text{op}}^{\text{Ultra}}[r] = \theta_{\text{op}}^{\text{Lite..Pro}}[r] + \sum_{c=0}^{3} w_{\text{ctrl,ultra,ext}}[r - 16][c] q_{u}[c] \qquad (r \in \lbrace 16, \dots, 30 \rbrace)$$
+
+To preserve 0-ULP SO(4) buyer-watermark gauge invariance without modifying immutable CEXT weights inside embedded binary container prefixes, columns 0..4 (`z_head[0..4]`) of `w_ctrl_ext[0..16][0..16]` remain fixed at +0.0. Extended slots 16..31 (indices 16 through 30) thus depend exclusively on unrotated `ctrl_basis_4[0..4]`, LFO, envelope, and `z_stage_ultra[0..4]`, while row 15 (slot 31) stays +0.0. Static Op-T `scat_psi` has no Control Bus slot; slot 14 (`tank_psi_delta`) modulates feedback Givens angle `fb_psi`, and slot 30 modulates `sense_vca_gain_delta` in [-1.0, +1.0].
 
 Non-recursive send safety is enforced structurally by $S_{\text{ret}\to\text{send}} = 0$ in the host-shell patchbay, while all 32 slots in `stage_targets[0..32]` read from the unified $\mathbf{q}_{16}$ vector and micro-ramp uniformly on every VM frame ([§3.2](#32-division-free-linear-micro-ramping)).
 
 ```text
-// Exact 4-Lane SIMD Evaluation of W_ctrl Rows r in 0..16 and "CEXT" Rows r in 16..32
+// Exact 4-Lane SIMD Evaluation of W_ctrl Rows r in 0..16 and "CEXT" Rows r in 16..31 (Slot 31 = +0.0)
 // q16 = [q0 = z_head[0..4], q1 = ctrl_basis_4[0..4], q2 = lfo[0..4], q3 = env_states[0..4]], qu = z_stage_ultra[0..4]
 v = (w_q2 * q2).fma(w_q3, q3)
 if any_nonzero(q0) || any_nonzero(q1): v = v.fma(w_q0, q0).fma(w_q1, q1)
@@ -324,23 +326,23 @@ stage_targets[r] = (v[0] + v[1]) + (v[2] + v[3])   // unfused balanced pair redu
 | `stage_targets[6..10]` | Core `ParaLRU` | `block_lru_bias[0..4]` in `[-2.0, +2.0]` bias offsets across cascade blocks 0..3 |
 | `stage_targets[10]` | `ModalConvolver` Kautz Bank | `kautz_oct_delta` in `[-1.5, +1.5]` octaves shifting modal angles |
 | `stage_targets[11]` | `ModalConvolver` Kautz Bank | `kautz_damp_delta` in `[-1.5, +1.5]` modulating radial gate and damping |
-| `stage_targets[12]` | `Transport` (`Op-T`) | `tank_delay_mod` given in 48 kHz samples, rescaled by `1 / rho_vm` into VM frames inside `[5.0, max_tau]` |
-| `stage_targets[13]` | `Transport` (`Op-T`) | `tank_gain_mod` added to `base_g[q]`, clamped to `[0.0, 0x3F7F_BE76]` (`TANK_MAX_G_LIN_BITS`) |
+| `stage_targets[12]` | `Transport` (`Op-T`) | `tank_delay_mod` given in 48 kHz samples (`StageTargetBounds` `[-(48,000 - max(min_base_delay, delay_floor)), +48,000]`, lower bound capped <= -1.0), rescaled by `1 / rho_vm` into VM frames inside `[5.0, max_tau]` |
+| `stage_targets[13]` | `Transport` (`Op-T`) | `tank_gain_mod` (`StageTargetBounds` `[-1.0, +0.9990]`) added to `base_g[q]`, clamped to `[0.0, 0x3F7F_BE76]` (`TANK_MAX_G_LIN_BITS`) |
 | `stage_targets[14]` | `Transport` (`Op-T`) | `tank_psi_delta` in `[-pi, +pi]` rad modulating Givens angle |
 | `stage_targets[15]` | Crossbar & `Transport` Wet | `crossbar_wet_mod` in `[-1.0, +1.0]` forming `wet_scale = clamp(1.0 + mod, 0.0, 2.0)` |
-| `stage_targets[16]` | `Op-T` Freeze Mix (`"CEXT"`) | `op_t_freeze_mix_delta`: uniformly micro-ramped; `mu_freeze = clamp(base_freeze_mix[q] + t[16], 0.0, 1.0)` across `q in 0..P_Q` |
+| `stage_targets[16]` | `Op-T` Freeze Mix (`"CEXT"`) | `op_t_freeze_mix_delta` (`StageTargetBounds` `[-1.0, +1.0]`): uniformly micro-ramped; `mu_freeze = clamp(base_freeze_mix[q] + t[16], 0.0, 1.0)` across `q in 0..P_Q` |
 | `stage_targets[17]` | `Op-T` Delay Scale (`"CEXT"`) | `op_t_delay_scale_oct` in `[-3.0, +3.0]` octaves scaling nominal quad delays |
-| `stage_targets[18]` | `Op-T` Ramp Rate (`"CEXT"`) | `op_t_ramp_rate_hz_delta` offsetting quad `ramp_rate_hz` across `q in 0..P_Q` |
-| `stage_targets[19]` | `Op-T` LFO Rate (`"CEXT"`) | `op_t_lfo_rate_hz_delta` offsetting quad `lfo_rate_hz` inside `[0.0, 16.0]` Hz across `q in 0..P_Q` |
-| `stage_targets[20]` | `Op-T` LFO Depth (`"CEXT"`) | `op_t_lfo_depth_scale` scaling quad `lfo_depths_fp16` within headroom across `q in 0..P_Q` |
-| `stage_targets[21]` | `Op-T` Damp Pole (`"CEXT"`) | `op_t_damp_pole_delta` offsetting ZOH-scaled `damp_pole_zoh` inside `[0.0, 0.99995]` across `q in 0..P_Q` |
+| `stage_targets[18]` | `Op-T` Ramp Rate (`"CEXT"`) | `op_t_ramp_rate_hz_delta` in `[-16.0, +16.0]` Hz offsetting quad `ramp_rate_hz` across `q in 0..P_Q` |
+| `stage_targets[19]` | `Op-T` LFO Rate (`"CEXT"`) | `op_t_lfo_rate_hz_delta` (`StageTargetBounds` `[-16.0, +16.0]`) offsetting quad `lfo_rate_hz` inside effective `[0.0, 16.0]` Hz across `q in 0..P_Q` |
+| `stage_targets[20]` | `Op-T` LFO Depth (`"CEXT"`) | `op_t_lfo_depth_scale` in `[-4.0, +4.0]` octaves scaling quad `lfo_depths_fp16` via `2^t[20]` within headroom across `q in 0..P_Q` |
+| `stage_targets[21]` | `Op-T` Damp Pole (`"CEXT"`) | `op_t_damp_pole_delta` (`StageTargetBounds` `[-1.0, +0.99995]`) offsetting ZOH-scaled `damp_pole_zoh` inside `[0.0, 0.99995]` across `q in 0..P_Q` |
 | `stage_targets[22]` | `Transport` Stage Dry Mix (`"CEXT"`) | `op_t_dry_mix_mod` modulating stage-level `tank_dry_mix_eff` inside `[-2.0, 2.0]` identically across tiers |
-| `stage_targets[23]` | `Op-T` Input Gain (`"CEXT"`) | `op_t_input_gain_mod` scaling quad `input_gains_fp16` |
-| `stage_targets[24]` | `Op-T` Window Depth (`"CEXT"`) | `op_t_window_depth_delta` offsetting quad `window_depth` inside `[0.0, 1.0]` |
-| `stage_targets[25]` | `Op-T` Schroeder Gain (`"CEXT"`) | `op_t_allpass_g_delta` offsetting per-lane `allpass_g` inside `[-0.75, 0.75]` ahead of `(1 - mu_freeze)` taper |
-| `stage_targets[26]` | `Op-N[Pre]` Blend (`"CEXT"`) | `op_n_pre_gamma_bc_delta` offsetting `Op-N[Pre]` wet bitcrush blend `gamma_bc` inside `[0.0, 1.0]` |
-| `stage_targets[27]` | `Op-N[Pre]` ZOH Hold (`"CEXT"`) | `op_n_pre_zoh_hold_delta` offsetting `zoh_hold_depth` inside `[0.0, 0.9999]` |
-| `stage_targets[28]` | `Op-N[Pre]` Quantizer (`"CEXT"`) | `op_n_pre_beta_q_delta` offsetting `Op-N[Pre]` log2 quantizer bit-depth `beta_q` inside `[0.0, 16.0]` |
+| `stage_targets[23]` | `Op-T` Input Gain (`"CEXT"`) | `op_t_input_gain_mod` in `[-4.0, +4.0]` octaves scaling quad `input_gains_fp16` via `2^t[23]` |
+| `stage_targets[24]` | `Op-T` Window Depth (`"CEXT"`) | `op_t_window_depth_delta` (`StageTargetBounds` `[-1.0, +1.0]`) offsetting quad `window_depth` inside effective `[0.0, 1.0]` |
+| `stage_targets[25]` | `Op-T` Schroeder Gain (`"CEXT"`) | `op_t_allpass_g_delta` (`StageTargetBounds` `[-0.75, +0.75]`) offsetting per-lane `allpass_g` inside `[-0.75, 0.75]` ahead of `(1 - mu_freeze)` taper |
+| `stage_targets[26]` | `Op-N[Pre]` Blend (`"CEXT"`) | `op_n_pre_gamma_bc_delta` (`StageTargetBounds` `[-1.0, +1.0]`) offsetting `Op-N[Pre]` wet bitcrush blend `gamma_bc` inside `[0.0, 1.0]` |
+| `stage_targets[27]` | `Op-N[Pre]` ZOH Hold (`"CEXT"`) | `op_n_pre_zoh_hold_delta` (`StageTargetBounds` `[-1.0, +0.9999]`) offsetting `zoh_hold_depth` inside `[0.0, 0.9999]` |
+| `stage_targets[28]` | `Op-N[Pre]` Quantizer (`"CEXT"`) | `op_n_pre_beta_q_delta` (`StageTargetBounds` `[-16.0, +16.0]`) offsetting `Op-N[Pre]` log2 quantizer bit-depth `beta_q` inside `[0.0, 16.0]` |
 | `stage_targets[29]` | Crossbar Phasors (`"CEXT"`) | `op_p_phasor_rate_oct` in `[-4.0, +4.0]` octaves scaling 4× `Q0.32` carrier frequencies |
 | `stage_targets[30]` | `SensoryQuad` VCA (`"CEXT"`) | `sense_vca_gain_delta` in `[-1.0, +1.0]` offsetting `g_in` threshold bias |
 | `stage_targets[31]` | Reserved (`"CEXT"`) | Reserved slot; always +0.0 |
@@ -349,7 +351,7 @@ stage_targets[r] = (v[0] + v[1]) + (v[2] + v[3])   // unfused balanced pair redu
 
 `r[dsp.ctrl.dispatch.modulation-laws]`
 
-At 3 kHz ticks, the control bus updates all 32 targets (0..16 base plus 16..32 `"CEXT"`) without division, square roots, or static-mode 48 kHz MACs while keeping `SO(4)` buyer-watermark invariance. Specifically, `Q_buyer` rotates only `z_head[0..4]`, whereas runtime `eff_z_stage[0..D_s] = static_z_stage[0..D_s] + w_ou * ou_drift_state` (spanning unrotated `ctrl_basis_4[0..4]` plus `z_stage_ultra[0..4]`) remains completely unrotated.
+At 3 kHz ticks, the control bus updates all 32 targets (0..16 base plus 16..31 active `"CEXT"`, slot 31 fixed +0.0) without division, square roots, or static-mode 48 kHz MACs while keeping `SO(4)` buyer-watermark invariance. Specifically, `Q_buyer` rotates only `z_head[0..4]`, whereas runtime `eff_z_stage[0..D_s] = static_z_stage[0..D_s] + w_ou * ou_drift_state` (spanning unrotated `ctrl_basis_4[0..4]` plus `z_stage_ultra[0..4]`) remains completely unrotated.
 
 Each tier `LinearReadout` block (paired with its `ModalConvolver` Prefix Override record) stores one static `fp16` base matrix `W_ro,0` (16×12 to 40×12 across tiers) unpacked directly into `pre_conv` and `direct_s2` stereo accumulators, while all `stage_latent_*` tables index unrotated `eff_z_stage`.
 
@@ -399,7 +401,13 @@ $$b_{\mathrm{lru,eff}} = \mathrm{clamp}\big(b_{\mathrm{lru,base}} + s_{\mathrm{r
 
 Because Mechanism A2 watermarking flips `b_lru_base` and unconditionally XORs bit 15 of `wavefolder_mix_fp16` (`s_rect`, including 0x0000 <-> 0x8000) whenever lane sign $s = -1$ while dynamic `theta_lru` (`eff_z_stage`-derived) stays unflipped, multiplying only `theta_lru` by `rect_sign` guarantees $b_{\mathrm{lru,eff}}' = s \cdot b_{\mathrm{lru,eff}}$ and $r_{\mathrm{curr}}' = s \cdot r_{\mathrm{curr}}$ at 0 ULP across static and modulated states ([op_n_paralru_and_polyadaa.md §1.1](op_n_paralru_and_polyadaa.md#11-pre-activation-clamping-core-sag-scaling--standalone-reference), [§4](op_n_paralru_and_polyadaa.md#4-4-block-matryoshka-corequad-stack-tpt-svf-selective-duhem-paralru-polyadaa1--glu)).
 
-When `SONA_META_CORE_MODS_PRESENT` (`0x0000_0200`) is active on Ultra, the Arena 3 Ultra core delta field `stage_latent_core_mods_fp16[0..1024]` (`[8][128]` row-major, columns 120..128 reserved `0x0000`) adds per-lane deltas across lanes `l = 0..40`.
+When `SONA_META_CORE_MODS_PRESENT` (`0x0000_0200`, mirrored identically in both `sona_meta_flags` and `cell_flags`) is active on Ultra, the Tardos-excluded Arena 3 core delta field `stage_latent_core_mods_fp16[0..1024]` (`[8][128]` row-major, columns 120..128 strictly `0x0000`, active entries bounded in [-4.0, +4.0]) provides the primary per-lane shift table across lanes 0..40 without colliding with Tardos Role B or `SO(4)` watermarks.
+
+Conversely, `stage_latent_mods_fp16[8..48]` remains zero because global oct/damp/psi shifts are expressed in binary32 `W_ctrl` and `W_ctrl_ultra`.
+
+Control-bus optimization leaves `stage_latent_mods_fp16[0..8]` (default knobs), `stage_latent_mods_fp16[80..96]` (`op_p_to_core`), and `stage_latent_ctrl_ultra_fp16[160..164]` (`ou_to_z_stage_ultra_fp16`) untouched with reserved `[164..256]` zeroed.
+
+Active nonzero weights in per-block `stage_latent_mods_fp16[48..80]` or per-CoreQuad `stage_latent_ctrl_ultra_fp16[0..160]` coordinate with Tardos carrier masking ([watermarking_and_marketplace.md §1.2](../security/watermarking_and_marketplace.md#12-mechanism-b--two-seed-arcsine-7680-coordinate-tardos-codebook--fp16-ulp-survival-floor)).
 
 For each lane `l`, `g_oct_lane[l] = clamp(svf_g_oct + sum_k core_mods[k][l]*eff_z_stage[k], -3.0, +3.0)` scales `svf_g[l]` by `exp2_clamped5(g_oct_lane[l])` inside [1e-5, 64.0], and `svf_k_eff[l] = clamp(svf_k[l] + svf_k_delta + sum_k core_mods[k][40+l]*eff_z_stage[k], 0.0, 8.0)`.
 
@@ -431,7 +439,7 @@ Hot `CoreQuad`, crossbar, `Op-N[Pre]`, and Op-T registers latch `(current_stage_
 
 During modulation evaluation, the control bus always accumulates dynamic blocks $\mathbf{q}_2, \mathbf{q}_3$ and skips $\mathbf{q}_0, \mathbf{q}_1$ FMA accumulation whenever `z_head` and `ctrl_basis_4` are all exact zeros. It likewise skips `W_ctrl_ultra` and `w_ctrl_ultra_ext` when Ultra is inactive or `z_stage_ultra` is all exact zeros.
 
-When `cext_len == 0`, `"CEXT"` rows 16..32 are skipped cleanly (leaving `stage_targets[16..32] == +0.0`). Active evaluation micro-ramps all 32 channels across eight 4-lane 32-bit float SIMD vectors ([ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)) and updates optional OU analog drift via `xorshift64*`:
+When `cext_len == 0`, active `"CEXT"` slots 16..31 (indices 16 through 30) are skipped cleanly (leaving `stage_targets[16..32] == +0.0`, with slot 31 always fixed at +0.0). Active evaluation micro-ramps all 32 channels across eight 4-lane 32-bit float SIMD vectors ([ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)) and updates optional OU analog drift via `xorshift64*`:
 
 ```text
 seed = 0x853C_49E6_748F_EA9B when drift_prng_state == 0
@@ -449,7 +457,7 @@ Strictly when `live_analog_drift_enabled && !offline_bounce && sigma_drift > 0.0
 
 `r[dsp.ctrl.calib.variance-gating]`
 
-Before Epoch 1, optimal-transport sorting aligns delay times $\tau_{0,m}$ and modal frequencies across captures to avoid double-echo crossfading, while physical variance gating locks $u_p \to \tau_{0,m}$ and $u_p \to f_{\text{lfo},j}$ weights to 0.0 whenever stem variance falls below 0.2 samples, using threshold $\tau_{\text{var}} = 0.5$, before downstream dispatch. Calibration remains 100% heuristic-free without inspecting English control names (REQ-1.6, REQ-1.9), allowing sustained hardware actuators to calibrate directly onto `stage_targets[16]` (`op_t_freeze_mix_delta`) without special freeze control roles:
+Before Epoch 1, optimal-transport sorting aligns delay times $\tau_{0,m}$ and modal frequencies across captures to avoid double-echo crossfading, while physical variance gating zeroes slot 12 (`tank_delay_mod`) targets across all Pass-4 sample rows whenever their population variance falls below 0.2 samples² (`(1 / N_samp) * sum_k (t_12(u_k) - mean_12)^2 < 0.2`) before downstream dispatch. Calibration remains 100% heuristic-free without inspecting English control names (REQ-1.6, REQ-1.9), allowing sustained hardware actuators to calibrate directly onto `stage_targets[16]` (`op_t_freeze_mix_delta`) without special freeze control roles:
 
 | Calibration Role (`role`) | Control Type | Physical & Audit Behavior |
 | :--- | :---: | :--- |

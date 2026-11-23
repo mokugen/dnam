@@ -176,7 +176,7 @@ Crossbar `SONA_META_SENSORY_QUAD` (bit 17) decodes all `SensoryQuad` wire fields
 
 $$\mathbf{q}_{16}[k] = \big[\mathbf{q}_0^\top,\ \mathbf{q}_1^\top,\ \mathbf{q}_2^\top,\ \mathbf{q}_3^\top\big]^\top \in \mathbb{R}^{16}$$
 
-Every tier evaluates base rows 0..15 of the 16×16 matrix `W_ctrl` unconditionally over `[q0 = z_head[0..4], q1 = ctrl_basis_4[0..4], q2 = skewed quadrature LFOs, q3 = env_states[0..4]]` (plus `qu = z_stage_ultra[0..4]` through 16×4 `W_ctrl_ultra` in Arena 3 on Ultra), and evaluates optional unwatermarked `"CEXT"` rows 16..31 when present (defaulting to +0.0 otherwise).
+Every tier evaluates base rows 0..16 (slots 0 through 15) of the 16×16 matrix `W_ctrl` unconditionally over `[q0 = z_head[0..4], q1 = ctrl_basis_4[0..4], q2 = skewed quadrature LFOs, q3 = env_states[0..4]]` (plus `qu = z_stage_ultra[0..4]` through 16×4 `W_ctrl_ultra` in Arena 3 on Ultra), and evaluates optional unwatermarked `"CEXT"` active extended slots 16..31 (slots 16 through 30; row 15 / slot 31 and columns 0..4 fixed at +0.0, defaulting to +0.0 otherwise).
 
 Optional Ornstein-Uhlenbeck drift projects through learned `ou_to_z_stage_fp16[4]` (and Arena 3 `ou_to_z_stage_ultra_fp16[4]` at `stage_latent_ctrl_ultra_fp16[160..164]`) directly into runtime `eff_z_stage = static_z_stage + w_ou * ou_drift_state` whenever `live_analog_drift_enabled && !offline_bounce`.
 
@@ -243,7 +243,7 @@ Crossbar bytes 124..128 store `anti_zipper_ramp_scale` as the 48 kHz reference p
 | `SensoryQuad` (`Op-M/N[Sense]`) | 48 B hot `SensoryQuad` state | Learned 4-lane `TPT-SVF` + full-wave `ParaLRU` feeding `ControlBus` `q3` + uniform input VCA `g_in` (0° stereo shift) |
 | `Op-T[Crossbar]` (`tau_min = 5.0`) | Inline `fp16` Quad 0 (1,024 B) + 216 B hot state + cold ext buffers | Unified 4-lane delay, chorus, TZF, `freeze_mix` overdub/hold, ±24 st Hermite-Hann grains, and barberpole sweeps at `f_{s,vm}` |
 | `Op-P` (`Hilbert` + 3-Basis + 2-Stage `T1`) | True-stereo `H1` (248 B) + stereo 5 Hz `T1` DC (24 B) + 2-stage mid `T1` (28 B) + 24 B 3-basis | < 0.10 deg (0.0976 deg) at 48 kHz; <= 0.19 deg at 15 anchors; <= 0.34 deg in [44.1, 96] & [176.4, 384] kHz and `f >= 30 Hz` in (96, 176.4) kHz (<= 0.67 deg at 20 Hz near 136.2 kHz); SSB/carrier, cancellation-free `rsqrt_pos_nr3` T1, and 2× `OS2X` midpoint interp |
-| 4× `Q0.32` Quadrature Phasors | 4-lane `u32` phase + Hermite-5 sin/cos (0.05 Hz–20 kHz) | Chorus/rotary LFOs, tempo sync (`REQ-2.5`), AM/ring-mod carriers (`inc_core = inc_vm >> 1` under `OS2X` else `inc_vm`; slot 29 oct mod) |
+| 4× `Q0.32` Quadrature Phasors | 4-lane `u32` phase + Hermite-5 sin/cos (`[-0.49 * fs, +0.49 * fs]`) | Chorus/rotary LFOs, tempo sync (`REQ-2.5`), AM/ring-mod carriers (`inc_core = inc_vm >> 1` under `OS2X` else `inc_vm`; slot 29 oct mod) |
 | Smooth `Op-N[Pre]` (Front-End) | 12 B wire (`Crossbar[180..192)`) + 28 B hot state (0 64-bit RT ints) | Raised-cosine track-and-hold -> `gamma_bc <= 0` bypass -> smooth Fourier staircase (`q32_smooth_sin`) -> wet blend at `f_{s,vm}` ahead of `OS2X` |
 
 On every VM frame at $f_{s,\mathrm{vm}}$, the Top-of-Frame Crossbar executes sequentially before OS2X and the 4-block CoreQuad stack. First SensoryQuad steps on `(x_L, x_R)` to compute `e[0..4]` and scaled `(x_g,L, x_g,R) = g_in * (x_L, x_R)`; next Op-T reads causal delays $v_{\mathrm{read}}$ with $\tau_{\min} = 5.0$ VM frames and stereo Op-P steps on `(x_g,L, x_g,R)`.
@@ -401,7 +401,7 @@ On each quadrant $u \in [0, 1]$, the unique odd polynomial $P(u) = c_1 u - c_3 u
 
 `r[dsp.tank.captured-freeze]`
 
-Sustained hold transitions captured in training stems ([capture_and_alignment.md §1.3](../training/capture_and_alignment.md#freeze-transition-capture)) calibrate naturally onto uniformly micro-ramped `ControlBus` slot 16 (`op_t_freeze_mix_delta`), while unobserved actuator ranges or options clamp via non-stop 3-phase auditing ([control_space_audit.md](../training/control_space_audit.md)) with zero dedicated container freeze flags and zero host freeze APIs.
+Sustained hold transitions captured in training stems ([capture_and_alignment.md §1.3](../training/capture_and_alignment.md#sustain-hold-and-write-enable-transition-capture)) calibrate naturally onto uniformly micro-ramped `ControlBus` slot 16 (`op_t_freeze_mix_delta`), while unobserved actuator ranges or options clamp via non-stop 3-phase auditing ([control_space_audit.md](../training/control_space_audit.md)) with zero dedicated container freeze flags and zero host freeze APIs.
 
 Each quad forms effective recirculation ratio `mu_freeze = clamp(base_freeze_mix[q] + t[16], 0.0, 1.0)` (forced to 1.0 whenever host `QUAD_FLAG_HOST_WRITE_LOCK` bit 2 is set), tapers `half_alpha_cubic`, `lfo_depths`, `ramp_spans`, Schroeder `allpass_g`, and `scat_psi` by 1 - mu_freeze, and writes passive blend w_ring = (1 - mu_freeze) * y_dc + mu_freeze * r_win into both fp16 and f32 rings. At mu_freeze >= 1.0 - 1.0e-6, `we_hold_off` holds ring addresses bit-for-bit at 0 ULP with zero re-quantization hiss while Crossbar, CoreQuads, ModalConvolver, and non-recirculating readouts continue processing live audio.
 

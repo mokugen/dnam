@@ -309,8 +309,8 @@ Retained tier `T` on load or zero-mutation `REQ-5.6` truncation is uniquely dete
 | `TSYN` 12..20 | 8 | `2 × f32le` | `div_ratio`, `bpm_factor` | Precomputed rational subdivision ratio and scaling factor (both finite and > 0.0; fail closed otherwise) |
 | `TSYN` 20..32 | 12 | `f32le[3]` | `lobatto_anchors` | Physical anchor values `[v_min, v_mid, v_max]` for zero-JSON tempo inversion (all three finite; fails closed otherwise; multi-row per conditional rule) |
 | `TSYN` 32..40 | 8 | `2 × f32le` | `declared_min`, `declared_max` | Finite declared physical control interval (`declared_min <= declared_max`; fails closed otherwise) |
-| `CEXT` 0..1,024 | 1,024 | `f32le[16][16]` | `w_ctrl_ext` | Unwatermarked 3 kHz extended dispatch weights mapping `q16` to `stage_targets[16..32]` |
-| `CEXT` 1,024..1,280 | 256 | `f32le[16][4]` | `w_ctrl_ultra_ext` | Ultra 3 kHz extended dispatch delta mapping `qu` to `stage_targets[16..32]` (defaults to +0.0 when `cext_len == 0`) |
+| `CEXT` 0..1,024 | 1,024 | `f32le[16][16]` | `w_ctrl_ext` | Unwatermarked 3 kHz extended dispatch weights mapping `q16` to `stage_targets[16..31]`; cols 0..4 (`z_head[0..4]`) and row 15 (`stage_targets[31]`) fixed at +0.0 for SO(4) gauge invariance with immutable `dbin_prefix` |
+| `CEXT` 1,024..1,280 | 256 | `f32le[16][4]` | `w_ctrl_ultra_ext` | Ultra 3 kHz extended dispatch delta mapping `qu` to `stage_targets[16..31]` with row 15 fixed at +0.0 (defaults to +0.0 when `cext_len == 0`) |
 
 ---
 

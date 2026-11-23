@@ -32,7 +32,7 @@ adrs:
 
 # TypeScript SDK (`@dnam-project/dnam`): Idiomatic TypeScript 7 Interface, Dual-Target N-API v10 + WASM SIMD128 Runtime, WebGPU Trainer & WebAudio Contract
 
-This specification defines the normative architecture, feature-module layout, TypeScript 7 typing and Biome hygiene rules, dual-target N-API v10 plus WebAssembly SIMD128 runtime invariants, planned browser WebGPU trainer driver, WebAudio `AudioWorklet` bridge, and native behavioral parity contracts for `@dnam-project/dnam` ([JavaScript SDK README](../../../packages/js/README.md)).
+This specification defines the normative architecture, feature-module layout, TypeScript 7 typing and Biome hygiene rules, dual-target N-API v10 plus WebAssembly SIMD128 runtime invariants, browser WebGPU trainer driver, WebAudio `AudioWorklet` bridge, and native behavioral parity contracts for `@dnam-project/dnam` ([JavaScript SDK README](../../../packages/js/README.md)).
 
 The TypeScript SDK consumes the native runtime engine and shared mathematical kernels defined in the [Rust Implementation Specification](rust_sdk.md) for SONA v3.0 ([SONA architecture](../architecture/sona_architecture.md)). Design rationales and concurrency trade-offs appear in [`ADR-0013`](../../adr/0013-typescript-sdk-architecture-and-dual-target-runtime.md), [`ADR-0015`](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md), and [`ADR-0022`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md).
 
@@ -57,7 +57,7 @@ flowchart LR
         Prov["provenance/: verify, sign, seal/unseal, dau1, preview, watermark"]
         Dsp["dsp/: SONA Reference Kernels (transport, modal, tpt-svf, paralru, polyadaa, control-bus, mixing)"]
         Web["web-audio/: DnamAudioNode, AudioWorkletProcessor, SAB + Atomics"]
-        Gpu["trainer/ (Planned M16): Browser navigator.gpu .wgsl Driver (<= 128 MiB, < 256 MiB) + WasmSimd128 Fallback"]
+        Gpu["trainer/: Browser navigator.gpu .wgsl Driver (<= 128 MiB, < 256 MiB) + WasmSimd128 Fallback"]
         Int["internal/native/: NativeDriver, NapiDriver, WasmDriver (Private)"]
     end
 
@@ -75,11 +75,11 @@ flowchart LR
 
 Implemented TypeScript domains under `packages/js/src/` cover container loading in `model/`, inference in `engine/`, parameter clamping in `parameters/`, tempo math in `tempo/`, and JSON schemas in `schema/`.
 
-Supporting domains provide provenance workflows in `provenance/`, DSP kernels in `dsp/`, Worklet bindings in `web-audio/`, and private driver plumbing in `internal/`. The `trainer/` directory is a planned M16 internal module for browser `navigator.gpu` WebGPU training rather than a shipped public subpath.
+Supporting domains provide provenance workflows in `provenance/`, DSP kernels in `dsp/`, Worklet bindings in `web-audio/`, and private driver plumbing in `internal/`. The `trainer/` directory is an internal module for browser `navigator.gpu` WebGPU training rather than a shipped public subpath.
 
 All intra-package and test imports route directly to concrete leaf modules with explicit ESM `.js` extensions (`../schema/header.js`, `../model/preamble.js`, `../engine/engine.js`).
 
-Non-exported internal folders (`model/`, `engine/`, `internal/native/{napi,wasm}/`, and planned M16 `trainer/`) forbid `index.ts` barrels.
+Non-exported internal folders (`model/`, `engine/`, `internal/native/{napi,wasm}/`, and `trainer/`) forbid `index.ts` barrels.
 
 Large drivers and domain modules across TypeScript packages decompose hierarchically under a 900-line ceiling (`ref[repo.code.modular-decomposition-and-tests]`), adhering to the 4-tier TypeScript testing layout below while native bindings follow the [Rust Implementation Specification](rust_sdk.md) (`ref[sdk.rust.modular-layout-and-proptest]`, `ref[sdk.rust.safe-rust-and-boundaries]`):
 
@@ -96,7 +96,7 @@ The `src/internal/` tree is strictly private. Neither `NativeDriver` nor any raw
 
 `r[sdk.ts.layout.curated-exports]`
 
-Downstream consumers import exclusively from the 11 subpath entrypoints declared under `"exports"` in `packages/js/package.json`. Planned M16 `trainer/` code is not a public `@dnam-project/dnam/trainer` subpath export; it remains an internal/M16 module unless added explicitly to `"exports"` and guardrail allowlists:
+Downstream consumers import exclusively from the 11 subpath entrypoints declared under `"exports"` in `packages/js/package.json`. The internal `trainer/` module is not a public `@dnam-project/dnam/trainer` subpath export unless added explicitly to `"exports"` and guardrail allowlists:
 
 | Public Subpath | Entrypoint / Asset | Primary Exports |
 | :--- | :--- | :--- |
@@ -126,13 +126,13 @@ Zero `any` types, `@ts-ignore` or `@ts-expect-error` suppressions, or non-null a
 
 Internal imports enforce a strict acyclic feature hierarchy from low-level primitives up to host adapters, rooted at `errors.ts` and `types.ts` into `schema/`, `internal/`, and `model/`.
 
-Above the container layer, `parameters/` and `tempo/` feed `engine/`, which in turn serves `web-audio/` and planned M16 `trainer/`.
+Above the container layer, `parameters/` and `tempo/` feed `engine/`, which in turn serves `web-audio/` and `trainer/`.
 
 Adjacent feature domains stay narrow: `provenance/` depends on `model/`, while `dsp/` depends solely on `internal/` and `errors.ts`.
 
 `@dnam-project/dnam` declares zero runtime npm dependencies (`"dependencies"` is omitted).
 
-Browser-safe modules (`src/browser.ts`, `src/internal/native/wasm.ts`, `src/internal/native/wasm/**/*.ts`, `src/schema/**/*.ts`, `src/web-audio/**/*.ts`, and planned `src/trainer/**/*.ts`) must never import `node:*` built-in modules.
+Browser-safe modules (`src/browser.ts`, `src/internal/native/wasm.ts`, `src/internal/native/wasm/**/*.ts`, `src/schema/**/*.ts`, `src/web-audio/**/*.ts`, and `src/trainer/**/*.ts`) must never import `node:*` built-in modules.
 
 Worklet runtime modules `src/web-audio/processor.ts` and `src/web-audio/shared-state.ts` remain completely self-contained for `AudioWorkletGlobalScope`.
 
@@ -242,7 +242,7 @@ Every native runtime error maps exhaustively from the native engine error taxono
 
 All DSP, ZOH rescaling (`ref[dsp.zoh.ctrl-stride]`), 3-Phase control clamping, Lobatto calibration inversion, preset loading, tempo sync, and v3.0 `"sona"` header validation execute in compiled native code via the unified runtime seam.
 
-RFC 8785 JCS canonicalization, immutable-header projection (`ref[sec.jcs.immutable-header-digest]`), and creator or marketplace tier-prefix signing (`ref[sec.sig.prefix-delegation]`) likewise execute natively. The TypeScript layer handles only idiomatic API ergonomics, camelCase/snake_case key translation, input coercion, planned M16 WebGPU `.wgsl` dispatch orchestration (§4.5), and handle lifecycle management.
+RFC 8785 JCS canonicalization, immutable-header projection (`ref[sec.jcs.immutable-header-digest]`), and creator or marketplace tier-prefix signing (`ref[sec.sig.prefix-delegation]`) likewise execute natively. The TypeScript layer handles only idiomatic API ergonomics, camelCase/snake_case key translation, input coercion, WebGPU `.wgsl` dispatch orchestration (§4.5), and handle lifecycle management.
 
 Both `NapiDriver` and `WasmDriver` implement the exact same `NativeDriver` interface declared in `src/internal/native/driver.ts`.
 
@@ -394,12 +394,12 @@ End-to-end Worklet rendering is verified in headless Chromium (`OfflineAudioCont
 
 When `crossOriginIsolated === true`, parameter updates, transport commands, and telemetry snapshots flow across a lock-free `SharedArrayBuffer` (`Int32Array` / `Float32Array` + `Atomics`) with zero allocations on the audio thread. When `crossOriginIsolated === false`, the bridge falls back transparently to `MessagePort`.
 
-The planned M16 browser `navigator.gpu` trainer driver (`src/trainer/`, internal to `@dnam-project/dnam`) accelerates SONA v3.0 capture training in background Web Workers (`REQ-4.1`, `REQ-4.2`, `REQ-4.3`, `ref[train.pipeline.webgpu-scans-and-ozaki]`):
+The browser `navigator.gpu` trainer driver (`src/trainer/`, internal to `@dnam-project/dnam`) accelerates SONA v3.0 capture training in background Web Workers (REQ-4.1, REQ-4.2, REQ-4.3, `ref[train.pipeline.webgpu-scans-and-ozaki]`):
 
 | Browser Trainer Component | Normative Resource & Shader Contract |
 | :--- | :--- |
-| **Checked-In AOT `.wgsl` Pipelines** | Compiles `naga`-validated `.wgsl` files (`prescreen_population.wgsl`, `fused_core_scan_256.wgsl`, `adjoint_scan_256.wgsl`, `gabor_bezout_grad.wgsl`, `ozaki_gram_rhs_i32.wgsl`, `inner_opt_step.wgsl`) via `device.createShaderModule` with 0 KB added to `dnam.wasm`. |
-| **Startup Probes & Memory Planner** | Runs < 1 ms startup WGSL numerics probes (`i32` Ozaki dot exactness, `pow2_ceil_fp32`, >= 16 KiB workgroup SRAM), enforces <= 128 MiB per storage binding and < 256 MiB total browser worker memory (256× checkpointing, 2-D `RESIDENT_BATCHED`/`STREAMED` planner, ~132 KiB `mapAsync` Ozaki readbacks to host WASM `f64` VarPro), and falls back to the WebAssembly SIMD128 CPU trainer path (< 64 MiB worker cap) when `navigator.gpu` is absent or fails probes. |
+| **Checked-In AOT `.wgsl` Pipelines** | Compiles the seven AOT `naga`-validated `.wgsl` compute kernels (`prescreen_population.wgsl`, `fused_core_scan_256.wgsl`, `adjoint_scan_256.wgsl`, `tile_mix_fwd_adj.wgsl`, `gabor_bezout_grad.wgsl`, `ozaki_gram_rhs_i32.wgsl`, `inner_opt_step.wgsl`) via `device.createShaderModule` with 0 KB added to `dnam.wasm`. |
+| **Startup Probes, Persistent Arena & Time-Block Streaming** | Runs < 1 ms startup WGSL numerics probes (`i32` Ozaki dot exactness, `pow2_ceil_fp32`, >= 16 KiB workgroup SRAM), executes persistent GpuTrainArena pooling paired with 16,384-frame 2× time-block streamed full-batch BPTT paired with `exit_adj_boundary` (<= 128 MiB per storage binding, < 256 MiB total browser worker memory, <= 1.2 MiB `mapAsync` split-64 Ozaki readbacks to host WASM float64 VarPro), and falls back to the WebAssembly SIMD128 CPU trainer path (< 64 MiB worker cap) when `navigator.gpu` is absent or fails probes. |
 
 ### 4.6 Profiling Methodology & Real-Time FFI Overhead Budgets
 
