@@ -4,15 +4,21 @@
 //! `ref[train.pipeline.backbone-trajectory-opt]`).
 
 pub mod adjoints;
+mod causal_loop;
+pub(crate) mod crossbar;
 mod eval;
+pub(crate) mod op_n_pre;
 pub mod op_t_quad;
 mod qat_polish;
+pub(crate) mod sensory;
 mod theta;
+mod zoh_jacobian;
 
 pub use adjoints::{
-    eval_kautz_modal_and_adjoint, eval_kautz_modal_channel_and_adjoint, eval_op_n_pre_and_adjoint,
+    eval_kautz_modal_and_adjoint, eval_kautz_modal_channel_and_adjoint,
     eval_op_t_transport_and_adjoint,
 };
+pub use op_n_pre::{OpNPreGrads, eval_op_n_pre_and_adjoint};
 pub use op_t_quad::{OpTQuadAdjointGrads, OpTQuadAdjointSlices, eval_op_t_quad_stereo_and_adjoint};
 
 use crate::error::TrainError;
@@ -132,7 +138,7 @@ pub fn generate_generic_sobol_seeds(num_seeds: usize, sr_hz: f64) -> Vec<f32> {
             0.0,
             0.0,
             0.1 * (u1 as f32),
-            1.0,
+            if (i & 1) == 0 { 1.0 } else { -1.0 },
             0.05 * (u0 as f32),
             drive,
             0.0,
@@ -347,7 +353,9 @@ fn init_universal_multiscale_core_quads(model: &mut SonaModelF64, sr_hz: f64) {
     for (idx, spec) in specs.iter().enumerate() {
         set_octave_quad(&mut model.core_quads[idx + 1], sr_hz, spec);
     }
-    model.core_quads[3].rect_sign = [1.0, -1.0, 1.0, -1.0];
+    if model.core_quads[3].rect_sign.iter().all(|&v| v > 0.0) {
+        model.core_quads[3].rect_sign = [1.0, -1.0, 1.0, -1.0];
+    }
 
     // Causal multi-stage diagonal coupling across `SONA_INTERBLOCK_TILES` preserving tier prefixes:
     // `(0,1)=0, (1,2)=1, (2,3)=2, (4,5)=5, (6,7)=18, (5,7)=21, (8,9)=28`.
@@ -417,7 +425,9 @@ fn select_and_unpack_prescreen_winner(
     q0.lru_duhem_gamma = [f64::from(s[9]); 4];
     q0.lru_signed_mix = [f64::from(s[10]); 4];
     q0.lru_stereo_link = [f64::from(s[11]); 4];
-    q0.rect_sign = [if s[12] < 0.0 { -1.0 } else { 1.0 }; 4];
+    if q0.rect_sign.iter().all(|&v| v >= 0.0) {
+        q0.rect_sign = [if s[12] < 0.0 { -1.0 } else { 1.0 }; 4];
+    }
     q0.sag_depth = [f64::from(s[13]); 4];
     q0.adaa_drive = [
         d0,
@@ -426,10 +436,6 @@ fn select_and_unpack_prescreen_winner(
         (4.0 * d0).clamp(0.25, 30.0),
     ];
     q0.lru_bias_drive = [f64::from(s[15]); 4];
-    if model.w_ro[0][6].abs() < 1.0e-9 && model.w_ro[0][7].abs() < 1.0e-9 {
-        model.w_ro[0][6] = 0.25;
-        model.w_ro[0][7] = 0.25;
-    }
     init_universal_multiscale_core_quads(model, sample_rate_hz);
     win_idx
 }
@@ -458,6 +464,9 @@ pub fn run_pass2_optimize(
             ..CompositeLossConfig::default()
         },
     )?;
+
+    let has_pass1_modal = model.active_fir_taps > 0 || model.active_kautz_pairs > 0;
+    let w_ro0_was_zero = model.w_ro[0][6].abs() < 1.0e-9 && model.w_ro[0][7].abs() < 1.0e-9;
 
     let n_seeds = config.num_prescreen_seeds.clamp(1, 128);
     let seed_table = generate_generic_sobol_seeds(n_seeds, config.sample_rate_hz);
@@ -490,28 +499,45 @@ pub fn run_pass2_optimize(
     );
 
     let q_count = config.active_quads.clamp(1, 10);
-    let layout = ThetaLayout {
-        q_opt: q_count,
-        k_opt: model.active_kautz_pairs.min(8),
-        op_t_enabled: model.transport_quads[0]
-            .input_gains
-            .iter()
-            .chain(&model.transport_quads[0].wet_tap_l)
-            .chain(&model.transport_quads[0].wet_tap_r)
-            .any(|&v| v.abs() > 1.0e-9),
-        max_tau: ((n / 2).min(4_096) as f64).max(8.0),
-    };
+    let mut best_model = model.clone();
+    let mut best_loss = f64::INFINITY;
+    let mut best_besr_db = 0.0_f64;
+    let mut base_besr_lin = f64::INFINITY;
+    if has_pass1_modal && w_ro0_was_zero {
+        let base_buf = eval_model_pass2_audio(runner, model, &in_l[..n], &in_r[..n], q_count)?;
+        let base_bd = loss_eval.eval_and_adjoint(&base_buf.pred_l, &base_buf.pred_r, None, None)?;
+        if base_bd.total.is_finite() {
+            best_loss = base_bd.total;
+            best_besr_db = 10.0 * base_bd.besr.max(1.0e-12).log10();
+            base_besr_lin = base_bd.besr;
+            best_model = model.clone();
+        }
+    }
+    if w_ro0_was_zero {
+        let init_w = if has_pass1_modal && base_besr_lin < 0.08 {
+            0.02
+        } else {
+            0.25
+        };
+        model.w_ro[0][6] = init_w;
+        model.w_ro[0][7] = init_w;
+    }
+
+    let max_tau = ((n / 2).min(4_096) as f64).max(8.0);
+    let layout = ThetaLayout::for_pass2_joint(model, q_count, max_tau);
     let (theta_init, bounds) = layout.pack(model);
+    let mut coord_scales = vec![1.0_f64; theta_init.len()];
+    if let Some(z_idx) = layout.zoh_hold_depth_idx {
+        coord_scales[z_idx] = n.max(1) as f64;
+    }
     let lbfgs = TwoLoopLbfgs::new(LbfgsConfig {
         max_iters: config.max_epochs.max(1),
         history_m: 8,
         patience: config.max_epochs.max(1) + 2,
+        max_step_norm: 0.75,
         ..LbfgsConfig::default()
     });
     let mut work_model = model.clone();
-    let mut best_model = model.clone();
-    let mut best_loss = f64::INFINITY;
-    let mut best_besr_db = 0.0_f64;
     let mut prev_besr_db = f64::INFINITY;
     let mut streak = 0_usize;
     let mut eval_grad_calls = 0_usize;
@@ -519,80 +545,85 @@ pub fn run_pass2_optimize(
     let mut gl = vec![0.0_f64; n];
     let mut gr = vec![0.0_f64; n];
 
-    lbfgs.minimize(&theta_init, &bounds, |cand, grad_opt| {
-        layout.unpack(cand, &mut work_model);
-        let eval_buf =
-            eval_model_pass2_audio(runner, &work_model, &in_l[..n], &in_r[..n], q_count)?;
-        let Some(grad_theta) = grad_opt else {
-            return Ok(loss_eval
-                .eval_and_adjoint(&eval_buf.pred_l, &eval_buf.pred_r, None, None)?
-                .total);
-        };
+    lbfgs.minimize_scaled(
+        &theta_init,
+        &bounds,
+        Some(&coord_scales),
+        |cand, grad_opt| {
+            layout.unpack(cand, &mut work_model);
+            let eval_buf =
+                eval_model_pass2_audio(runner, &work_model, &in_l[..n], &in_r[..n], q_count)?;
+            let Some(grad_theta) = grad_opt else {
+                return Ok(loss_eval
+                    .eval_and_adjoint(&eval_buf.pred_l, &eval_buf.pred_r, None, None)?
+                    .total);
+            };
 
-        eval_grad_calls += 1;
-        gl.fill(0.0);
-        gr.fill(0.0);
-        let bd = loss_eval.eval_and_adjoint(
-            &eval_buf.pred_l,
-            &eval_buf.pred_r,
-            Some(&mut gl),
-            Some(&mut gr),
-        )?;
-        let besr_db = 10.0 * bd.besr.max(1.0e-12).log10();
-        if bd.total < best_loss {
-            best_loss = bd.total;
-            best_besr_db = besr_db;
-            best_model = work_model.clone();
-        }
-        if eval_grad_calls >= 2 {
-            let step_num = eval_grad_calls - 1;
-            if prev_besr_db.is_finite()
-                && (prev_besr_db - besr_db).abs() < DIMINISHING_RETURNS_DELTA_DB
-            {
-                streak += 1;
-            } else {
-                streak = 0;
+            eval_grad_calls += 1;
+            gl.fill(0.0);
+            gr.fill(0.0);
+            let bd = loss_eval.eval_and_adjoint(
+                &eval_buf.pred_l,
+                &eval_buf.pred_r,
+                Some(&mut gl),
+                Some(&mut gr),
+            )?;
+            let besr_db = 10.0 * bd.besr.max(1.0e-12).log10();
+            if bd.total < best_loss {
+                best_loss = bd.total;
+                best_besr_db = besr_db;
+                best_model = work_model.clone();
             }
-            if let Some(p) = progress {
-                let perm = ((step_num * 500) / config.max_epochs.max(1)).min(500) as u16;
-                p.publish_metrics(&ProgressMetrics {
-                    status: TrainingStatus::Running,
-                    phase: TrainingPhase::Pass2Backbone,
-                    active_tier: Some(Tier::Ultra),
-                    progress_permille: perm,
-                    step: step_num as u32,
-                    total_steps: config.max_epochs as u32,
-                    stage_step: step_num as u32,
-                    stage_total_steps: config.max_epochs as u32,
-                    best_loss,
-                    mr_iir: bd.mr_iir,
-                    ..ProgressMetrics::default()
-                });
+            if eval_grad_calls >= 2 {
+                let step_num = eval_grad_calls - 1;
+                if prev_besr_db.is_finite()
+                    && (prev_besr_db - besr_db).abs() < DIMINISHING_RETURNS_DELTA_DB
+                {
+                    streak += 1;
+                } else {
+                    streak = 0;
+                }
+                if let Some(p) = progress {
+                    let perm = ((step_num * 500) / config.max_epochs.max(1)).min(500) as u16;
+                    p.publish_metrics(&ProgressMetrics {
+                        status: TrainingStatus::Running,
+                        phase: TrainingPhase::Pass2Backbone,
+                        active_tier: Some(Tier::Ultra),
+                        progress_permille: perm,
+                        step: step_num as u32,
+                        total_steps: config.max_epochs as u32,
+                        stage_step: step_num as u32,
+                        stage_total_steps: config.max_epochs as u32,
+                        best_loss,
+                        mr_iir: bd.mr_iir,
+                        ..ProgressMetrics::default()
+                    });
+                }
+                if streak >= config.diminishing_patience {
+                    converged = true;
+                    grad_theta.fill(0.0);
+                    return Ok(bd.total);
+                }
             }
-            if streak >= config.diminishing_patience {
-                converged = true;
-                grad_theta.fill(0.0);
-                return Ok(bd.total);
-            }
-        }
-        prev_besr_db = besr_db;
+            prev_besr_db = besr_db;
 
-        let grads = assemble_pass2_gradients(
-            runner,
-            &Pass2AdjInput {
-                model: &work_model,
-                in_l: &in_l[..n],
-                in_r: &in_r[..n],
-                buf: &eval_buf,
-                gl: &gl,
-                gr: &gr,
-                q_opt: layout.q_opt,
-                k_opt: layout.k_opt,
-            },
-        )?;
-        layout.write_grad(&grads, grad_theta);
-        Ok(bd.total)
-    })?;
+            let grads = assemble_pass2_gradients(
+                runner,
+                &Pass2AdjInput {
+                    model: &work_model,
+                    in_l: &in_l[..n],
+                    in_r: &in_r[..n],
+                    buf: &eval_buf,
+                    gl: &gl,
+                    gr: &gr,
+                    q_opt: layout.q_opt,
+                    k_opt: layout.k_opt,
+                },
+            )?;
+            layout.write_grad(&grads, grad_theta);
+            Ok(bd.total)
+        },
+    )?;
 
     *model = best_model;
     let (qat_polish_steps_run, qat_baseline_loss) = if config.qat_polish_steps > 0 {
@@ -724,5 +755,50 @@ mod tests {
         .unwrap();
         assert_eq!(rep6_2.qat_polish_steps_run, 2);
         assert!(rep6_2.best_loss <= rep6_2.qat_baseline_loss);
+
+        // Pass-1-seeded pure linear FIR target must preserve baseline accuracy without muting VCA.
+        let mut fir_model = SonaModelF64::new(48_000.0);
+        fir_model.direct_s2_u_gain = [0.0, 0.0];
+        fir_model.active_fir_taps = 2;
+        fir_model.fir_l[0] = 0.6;
+        fir_model.fir_l[1] = -0.25;
+        fir_model.fir_r[0] = 0.5;
+        fir_model.fir_r[1] = 0.2;
+        fir_model.pre_conv_u_gain = [1.0, 1.0];
+        let mut fir_tgt_l = vec![0.0_f64; n];
+        let mut fir_tgt_r = vec![0.0_f64; n];
+        for t in 0..n {
+            let xl_prev = if t > 0 { in_l[t - 1] } else { 0.0 };
+            let xr_prev = if t > 0 { in_r[t - 1] } else { 0.0 };
+            fir_tgt_l[t] = 0.6 * in_l[t] - 0.25 * xl_prev;
+            fir_tgt_r[t] = 0.5 * in_r[t] + 0.2 * xr_prev;
+        }
+        let fir_rep = run_pass2_optimize(
+            &runner,
+            &mut fir_model,
+            &StereoTrainingPairs {
+                in_l: &in_l,
+                in_r: &in_r,
+                target_l: &fir_tgt_l,
+                target_r: &fir_tgt_r,
+            },
+            Pass2OptConfig {
+                num_prescreen_seeds: 16,
+                max_epochs: 6,
+                diminishing_patience: 3,
+                sample_rate_hz: 48_000.0,
+                warmup_frames: 32,
+                active_quads: 4,
+                qat_polish_steps: 2,
+            },
+            None,
+        )
+        .unwrap();
+        assert!(fir_rep.best_loss < 0.05, "best_loss={}", fir_rep.best_loss);
+        let vca_dot: f64 = fir_model.sense_vca_w.iter().sum();
+        assert!(
+            vca_dot > -0.5,
+            "unexpected negative sense_vca_w sum={vca_dot}"
+        );
     }
 }

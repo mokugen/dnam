@@ -83,6 +83,7 @@ pub(crate) fn downsample_lane_2x_f64(sig_2x: &[f64], dec_c_prev1: f64, dec_c0: f
 
 /// Evaluates active `CoreQuad` blocks in canonical `SONA_ULTRA_QUAD_TRAVERSAL_ORDER` with
 /// M/S input coupling, causal `SONA_INTERBLOCK_TILES`, and ZOH rescaling at `rho_core`.
+#[cfg(test)]
 pub(crate) fn run_causal_core_cascade_stereo(
     runner: &TrainRunner,
     model: &SonaModelF64,
@@ -92,6 +93,47 @@ pub(crate) fn run_causal_core_cascade_stereo(
     rho_core: f64,
     write_checkpoints: bool,
 ) -> Result<CausalCascadeOutput, TrainError> {
+    run_causal_core_cascade_with_crossbar(
+        runner,
+        model,
+        ux_l,
+        ux_r,
+        CascadeCrossbarSpec {
+            active_quads,
+            rho_core,
+            write_checkpoints,
+            crossbar_add: None,
+        },
+    )
+}
+
+/// Borrowed per-frame `(cb_add_l, cb_add_r)` crossbar injections indexed as `[q * n + t][lane]`.
+pub(crate) type CrossbarInjection<'a> = (&'a [[f64; 4]], &'a [[f64; 4]]);
+
+/// Execution configuration passed to [`run_causal_core_cascade_with_crossbar`].
+#[derive(Clone, Copy)]
+pub(crate) struct CascadeCrossbarSpec<'a> {
+    pub active_quads: usize,
+    pub rho_core: f64,
+    pub write_checkpoints: bool,
+    pub crossbar_add: Option<CrossbarInjection<'a>>,
+}
+
+/// Evaluates active `CoreQuad` blocks with optional precomputed per-quad `Crossbar` injections
+/// `(cb_add_l, cb_add_r)` indexed as `[q * n + t][lane]`.
+pub(crate) fn run_causal_core_cascade_with_crossbar(
+    runner: &TrainRunner,
+    model: &SonaModelF64,
+    ux_l: &[f64],
+    ux_r: &[f64],
+    spec: CascadeCrossbarSpec<'_>,
+) -> Result<CausalCascadeOutput, TrainError> {
+    let CascadeCrossbarSpec {
+        active_quads,
+        rho_core,
+        write_checkpoints,
+        crossbar_add,
+    } = spec;
     let n = ux_l.len().min(ux_r.len());
     let q_count = active_quads.clamp(1, super::NUM_CORE_QUADS_ULTRA);
     let active_tiles = match q_count {
@@ -161,11 +203,18 @@ pub(crate) fn run_causal_core_cascade_stereo(
             let ur = sanitize_unit_f64(ux_r[t], -1.0e6, 1.0e6, 0.0);
             let mid = 0.5 * (ul + ur);
             let side = 0.5 * (ul - ur);
+            let cb_idx = q * n + t;
+            let (cb_l, cb_r) = match crossbar_add {
+                Some((cl, cr)) if cb_idx < cl.len() && cb_idx < cr.len() => {
+                    (cl[cb_idx], cr[cb_idx])
+                }
+                _ => ([0.0; 4], [0.0; 4]),
+            };
             let mut acc_l = [0.0_f64; 4];
             let mut acc_r = [0.0_f64; 4];
             for d in 0..4 {
-                acc_l[d] = in_mid[d] * mid + in_side[d] * side;
-                acc_r[d] = in_mid[d] * mid - in_side[d] * side;
+                acc_l[d] = in_mid[d] * mid + in_side[d] * side + cb_l[d];
+                acc_r[d] = in_mid[d] * mid - in_side[d] * side + cb_r[d];
             }
             for &(src_q, ref wo, ref we, ref wl) in &incoming_tiles {
                 let fbase = (src_q * n + t) * 6;

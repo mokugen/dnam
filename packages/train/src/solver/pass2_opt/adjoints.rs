@@ -1,77 +1,318 @@
-//! Differentiable forward and exact reverse-time adjoint evaluators for `Op-N[Pre]` Fourier
-//! surrogate, stereo complex conjugate Kautz modal banks, and `Op-T` recurrent transport
-//! (`ref[train.pipeline.backbone-trajectory-opt]`).
+//! Differentiable forward and exact reverse-time adjoint evaluators for stereo complex conjugate
+//! Kautz modal banks, `LinearReadout` leak-pole HP (`ro_pole_48k`), and legacy 1-lane `Op-T`
+//! helpers (`ref[train.pipeline.backbone-trajectory-opt]`).
 
-use core::f64::consts::{LN_2, TAU};
-
-use dnam_kernels::{OP_N_PRE_MAX_BETA_Q, OP_N_PRE_QUANT_CLAMP_F32, TANK_MAX_G_LIN_F32};
+use dnam_kernels::TANK_MAX_G_LIN_F32;
 use dnam_vm::math::TANK_DC_BLOCKER_48K_F32;
 
-use crate::control::stability::MIN_DELAY_CROSSBAR_SAMP;
+use crate::control::stability::{MAX_RO_POLE_48K_F64, MIN_DELAY_CROSSBAR_SAMP};
 
 use super::super::model::KautzPairF64;
 use super::op_t_quad::{
     blend_catmull_rom_with_derivs, cubic_soft_sat_and_deriv, half_alpha_cubic_and_deriv,
 };
 
-/// Hard safety limit enforcing smooth Fourier `Op-N[Pre]` input clipping.
-const OP_N_CLIP_F64: f64 = OP_N_PRE_QUANT_CLAMP_F32 as f64;
 /// Minimum active Kautz pole radius enforced by `dnam-vm` runtime hydration.
 const KAUTZ_R_MIN: f64 = 0.25;
 /// Maximum stable Kautz pole radius enforced by `dnam-vm` runtime hydration.
 const KAUTZ_R_MAX: f64 = 0.9995;
 
-const _: () = assert!(OP_N_CLIP_F64 > 0.0);
 const _: () = assert!(KAUTZ_R_MIN > 0.0 && KAUTZ_R_MIN < KAUTZ_R_MAX && KAUTZ_R_MAX < 1.0);
 
-/// Differentiable $C^\infty$ Fourier smooth quantizer surrogate consistent with
-/// `dnam_kernels::quantize_smooth_fourier_f32`:
-/// `y[t] = (1 - gamma) * x[t] + gamma * (x_c - (step / 2pi) * sin(2pi * d_scale * x_c))`.
-pub fn eval_op_n_pre_and_adjoint(
-    x: &[f64],
-    gamma_bc: f64,
-    beta_q: f64,
-    d_out_opt: Option<&[f64]>,
-    grad_x_opt: Option<&mut [f64]>,
-) -> (Vec<f64>, f64, f64) {
-    let gamma = gamma_bc.clamp(0.0, 1.0);
-    let beta = beta_q.clamp(0.0, f64::from(OP_N_PRE_MAX_BETA_Q));
-    let d_scale = beta.exp2();
-    let step = 1.0 / d_scale;
-    let inv_tau = 1.0 / TAU;
+/// Pre-resolved ZOH `LinearReadout` leak pole `p = ro_pole_48k^rho_core` and sensitivity `dp/dro`.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct RoPoleResolved {
+    pub p: f64,
+    pub one_m_p: f64,
+    pub dp_dro: f64,
+}
 
-    let mut y = vec![0.0_f64; x.len()];
-    let mut g_gamma = 0.0_f64;
-    let mut g_beta = 0.0_f64;
-
-    for (t, &xt) in x.iter().enumerate() {
-        let xc = xt.clamp(-OP_N_CLIP_F64, OP_N_CLIP_F64);
-        let phase = TAU * d_scale * xc;
-        let (s, c) = phase.sin_cos();
-        let q_term = xc - (step * inv_tau) * s;
-        let yt = (1.0 - gamma) * xt + gamma * q_term;
-        y[t] = yt;
-
-        if let Some(d_out) = d_out_opt {
-            let dy = d_out[t];
-            g_gamma += dy * (q_term - xt);
-            let dq_dbeta = LN_2 * ((step * inv_tau) * s - xc * c);
-            g_beta += dy * gamma * dq_dbeta;
-        }
-    }
-    if let (Some(d_out), Some(gx)) = (d_out_opt, grad_x_opt) {
-        for t in 0..x.len() {
-            let xt = x[t];
-            let xc = xt.clamp(-OP_N_CLIP_F64, OP_N_CLIP_F64);
-            let dq_dx = if xt.abs() <= OP_N_CLIP_F64 {
-                1.0 - (TAU * d_scale * xc).cos()
+impl RoPoleResolved {
+    #[must_use]
+    pub(super) fn new(ro_pole_48k: f64, rho_core: f64) -> Self {
+        let rho = if rho_core.is_finite() && rho_core > 0.0 {
+            rho_core.clamp(0.125, 8.0)
+        } else {
+            1.0
+        };
+        let ro_clamped = if ro_pole_48k.is_finite() && ro_pole_48k > 0.0 {
+            ro_pole_48k.clamp(0.0, MAX_RO_POLE_48K_F64)
+        } else {
+            0.0
+        };
+        let (p, dp_dro) = if ro_clamped <= 0.0 {
+            (
+                0.0,
+                if ro_pole_48k.is_finite() && ro_pole_48k >= 0.0 && (rho - 1.0).abs() <= 1.0e-12 {
+                    1.0
+                } else {
+                    0.0
+                },
+            )
+        } else {
+            let p_eff = ro_clamped.powf(rho).clamp(0.0, MAX_RO_POLE_48K_F64);
+            let dp = if ro_pole_48k < MAX_RO_POLE_48K_F64 {
+                rho * ro_clamped.powf(rho - 1.0)
             } else {
                 0.0
             };
-            gx[t] += d_out[t] * ((1.0 - gamma) + gamma * dq_dx);
+            (p_eff, dp)
+        };
+        Self {
+            p,
+            one_m_p: 1.0 - p,
+            dp_dro,
         }
     }
-    (y, g_gamma, g_beta)
+
+    #[inline]
+    pub(super) fn step_forward_frame(self, u_t: f64, lp_prev: &mut f64) -> (f64, f64) {
+        let lp_t = self.p * *lp_prev + self.one_m_p * u_t;
+        *lp_prev = lp_t;
+        (u_t - lp_t, lp_t)
+    }
+
+    #[inline]
+    pub(super) fn step_reverse_frame(
+        self,
+        dy: f64,
+        u_t: f64,
+        lp_prev: f64,
+        adj_lp_next: &mut f64,
+        d_p_acc: &mut f64,
+    ) -> f64 {
+        let adj_lp = -dy + self.p * *adj_lp_next;
+        *d_p_acc += adj_lp * (lp_prev - u_t);
+        *adj_lp_next = adj_lp;
+        dy + self.one_m_p * adj_lp
+    }
+}
+
+/// Evaluates the 1-pole `LinearReadout` leak high-pass `hp[t] = u[t] - lp[t]` for ZOH-scaled
+/// `p = ro_pole_48k^rho_core` matching `SonaVm`'s `step_core_subsample` and returns
+/// `(hp, d_loss/d_ro_pole_48k)` while accumulating into `grad_u_opt`.
+pub(super) fn eval_ro_pole_hp_and_adjoint(
+    u: &[f64],
+    ro_pole_48k: f64,
+    rho_core: f64,
+    d_out_opt: Option<&[f64]>,
+    mut grad_u_opt: Option<&mut [f64]>,
+) -> (Vec<f64>, f64) {
+    let n = u.len();
+    if n == 0 {
+        return (Vec::new(), 0.0);
+    }
+    let resolved = RoPoleResolved::new(ro_pole_48k, rho_core);
+    let mut hp = vec![0.0_f64; n];
+    let mut lp_hist = if d_out_opt.is_some() {
+        Vec::with_capacity(n)
+    } else {
+        Vec::new()
+    };
+    let mut lp_prev = 0.0_f64;
+    for (t, &ut) in u.iter().enumerate() {
+        let (hp_t, lp_t) = resolved.step_forward_frame(ut, &mut lp_prev);
+        hp[t] = hp_t;
+        if d_out_opt.is_some() {
+            lp_hist.push(lp_t);
+        }
+    }
+
+    let mut d_p = 0.0_f64;
+    if let Some(d_out) = d_out_opt {
+        let mut adj_lp_next = 0.0_f64;
+        for t in (0..n).rev() {
+            let lp_p = if t > 0 { lp_hist[t - 1] } else { 0.0 };
+            let gu_t =
+                resolved.step_reverse_frame(d_out[t], u[t], lp_p, &mut adj_lp_next, &mut d_p);
+            if let Some(gu) = grad_u_opt.as_deref_mut() {
+                gu[t] += gu_t;
+            }
+        }
+    }
+    (hp, d_p * resolved.dp_dro)
+}
+
+#[derive(Clone, Copy)]
+struct KautzResolvedPair {
+    active: bool,
+    r: f64,
+    st: f64,
+    ct: f64,
+    ar: f64,
+    ai: f64,
+    bg: f64,
+    c_re: f64,
+    c_im: f64,
+}
+
+impl KautzResolvedPair {
+    fn new(pair: &KautzPairF64, is_right: bool) -> Self {
+        let r_raw = pair.r_low + 0.5 * pair.dr;
+        if !r_raw.is_finite() || r_raw <= 0.0 || !pair.b_gamma.is_finite() || pair.b_gamma <= 0.0 {
+            return Self {
+                active: false,
+                r: 0.0,
+                st: 0.0,
+                ct: 1.0,
+                ar: 0.0,
+                ai: 0.0,
+                bg: 0.0,
+                c_re: 0.0,
+                c_im: 0.0,
+            };
+        }
+        let r = r_raw.clamp(KAUTZ_R_MIN, KAUTZ_R_MAX);
+        let (st, ct) = pair.theta.sin_cos();
+        let (c_re, c_im) = if is_right {
+            (pair.c_re_r, pair.c_im_r)
+        } else {
+            (pair.c_re_l, pair.c_im_l)
+        };
+        Self {
+            active: true,
+            r,
+            st,
+            ct,
+            ar: r * ct,
+            ai: r * st,
+            bg: pair.b_gamma,
+            c_re,
+            c_im,
+        }
+    }
+}
+
+/// Stateful per-frame Kautz modal channel evaluator with optional state trajectory recording.
+pub(super) struct KautzChannelStepper {
+    pairs: Vec<KautzResolvedPair>,
+    sr: Vec<f64>,
+    si: Vec<f64>,
+    sr_hist: Vec<f64>,
+    si_hist: Vec<f64>,
+}
+
+impl KautzChannelStepper {
+    #[must_use]
+    pub(super) fn new(pairs: &[KautzPairF64], is_right: bool, cap_frames: usize) -> Self {
+        let m = pairs.len();
+        let resolved = pairs
+            .iter()
+            .map(|p| KautzResolvedPair::new(p, is_right))
+            .collect();
+        Self {
+            pairs: resolved,
+            sr: vec![0.0_f64; m],
+            si: vec![0.0_f64; m],
+            sr_hist: Vec::with_capacity(cap_frames * m),
+            si_hist: Vec::with_capacity(cap_frames * m),
+        }
+    }
+
+    #[inline]
+    pub(super) fn step_forward_frame(&mut self, u_t: f64, record_trace: bool) -> f64 {
+        let mut y_t = 0.0_f64;
+        for (k, p) in self.pairs.iter().enumerate() {
+            if !p.active {
+                if record_trace {
+                    self.sr_hist.push(0.0);
+                    self.si_hist.push(0.0);
+                }
+                continue;
+            }
+            let nr = p.ar * self.sr[k] - p.ai * self.si[k] + p.bg * u_t;
+            let ni = p.ai * self.sr[k] + p.ar * self.si[k];
+            self.sr[k] = nr;
+            self.si[k] = ni;
+            if record_trace {
+                self.sr_hist.push(nr);
+                self.si_hist.push(ni);
+            }
+            y_t += 2.0 * (p.c_re * nr - p.c_im * ni);
+        }
+        y_t
+    }
+}
+
+/// Reverse-time frame-by-frame adjoint accumulator paired with [`KautzChannelStepper`].
+pub(super) struct KautzChannelReverseState {
+    lam_r: Vec<f64>,
+    lam_i: Vec<f64>,
+    d_ar: Vec<f64>,
+    d_ai: Vec<f64>,
+    d_bg: Vec<f64>,
+    d_cre: Vec<f64>,
+    d_cim: Vec<f64>,
+}
+
+impl KautzChannelReverseState {
+    #[must_use]
+    pub(super) fn new(m: usize) -> Self {
+        Self {
+            lam_r: vec![0.0_f64; m],
+            lam_i: vec![0.0_f64; m],
+            d_ar: vec![0.0_f64; m],
+            d_ai: vec![0.0_f64; m],
+            d_bg: vec![0.0_f64; m],
+            d_cre: vec![0.0_f64; m],
+            d_cim: vec![0.0_f64; m],
+        }
+    }
+
+    #[inline]
+    pub(super) fn step_reverse_frame(
+        &mut self,
+        fwd: &KautzChannelStepper,
+        t: usize,
+        u_t: f64,
+        d_out_t: f64,
+    ) -> f64 {
+        let m = fwd.pairs.len();
+        let dt2 = 2.0 * d_out_t;
+        let mut gu_t = 0.0_f64;
+        let cur_base = t * m;
+        for (k, p) in fwd.pairs.iter().enumerate() {
+            if !p.active {
+                continue;
+            }
+            let cur_r = fwd.sr_hist[cur_base + k];
+            let cur_i = fwd.si_hist[cur_base + k];
+            let (prev_r, prev_i) = if t > 0 {
+                let prev_base = (t - 1) * m;
+                (fwd.sr_hist[prev_base + k], fwd.si_hist[prev_base + k])
+            } else {
+                (0.0, 0.0)
+            };
+            self.d_cre[k] += dt2 * cur_r;
+            self.d_cim[k] -= dt2 * cur_i;
+            let adj_r = dt2 * p.c_re + self.lam_r[k];
+            let adj_i = -dt2 * p.c_im + self.lam_i[k];
+            gu_t += p.bg * adj_r;
+            self.d_bg[k] += adj_r * u_t;
+            self.d_ar[k] += adj_r * prev_r + adj_i * prev_i;
+            self.d_ai[k] += adj_i * prev_r - adj_r * prev_i;
+            self.lam_r[k] = p.ar * adj_r + p.ai * adj_i;
+            self.lam_i[k] = -p.ai * adj_r + p.ar * adj_i;
+        }
+        gu_t
+    }
+
+    #[must_use]
+    pub(super) fn finalize(&self, fwd: &KautzChannelStepper) -> Vec<[f64; 5]> {
+        fwd.pairs
+            .iter()
+            .enumerate()
+            .map(|(k, p)| {
+                if !p.active {
+                    [0.0; 5]
+                } else {
+                    let d_r = self.d_ar[k] * p.ct + self.d_ai[k] * p.st;
+                    let d_theta = -self.d_ar[k] * p.r * p.st + self.d_ai[k] * p.r * p.ct;
+                    [d_r, d_theta, self.d_bg[k], self.d_cre[k], self.d_cim[k]]
+                }
+            })
+            .collect()
+    }
 }
 
 /// Evaluates one stereo channel (`is_right = false -> L`, `true -> R`) of complex conjugate Kautz
@@ -82,89 +323,28 @@ pub fn eval_kautz_modal_channel_and_adjoint(
     pairs: &[KautzPairF64],
     is_right: bool,
     d_out_opt: Option<&[f64]>,
-    grad_u_opt: Option<&mut [f64]>,
+    mut grad_u_opt: Option<&mut [f64]>,
 ) -> (Vec<f64>, Vec<[f64; 5]>) {
     let n = u.len();
     let m = pairs.len();
+    let record = d_out_opt.is_some();
+    let mut stepper = KautzChannelStepper::new(pairs, is_right, if record { n } else { 0 });
     let mut y = vec![0.0_f64; n];
-    let mut sr_hist = vec![vec![0.0_f64; n]; m];
-    let mut si_hist = vec![vec![0.0_f64; n]; m];
-
-    for (k, pair) in pairs.iter().enumerate() {
-        let r_raw = pair.r_low + 0.5 * pair.dr;
-        if !r_raw.is_finite() || r_raw <= 0.0 || !pair.b_gamma.is_finite() || pair.b_gamma <= 0.0 {
-            continue;
-        }
-        let r = r_raw.clamp(KAUTZ_R_MIN, KAUTZ_R_MAX);
-        let (st, ct) = pair.theta.sin_cos();
-        let (ar, ai) = (r * ct, r * st);
-        let bg = pair.b_gamma;
-        let (c_re, c_im) = if is_right {
-            (pair.c_re_r, pair.c_im_r)
-        } else {
-            (pair.c_re_l, pair.c_im_l)
-        };
-        let (mut sr, mut si) = (0.0_f64, 0.0_f64);
-        for t in 0..n {
-            let nr = ar * sr - ai * si + bg * u[t];
-            let ni = ai * sr + ar * si;
-            sr = nr;
-            si = ni;
-            sr_hist[k][t] = sr;
-            si_hist[k][t] = si;
-            y[t] += 2.0 * (c_re * sr - c_im * si);
-        }
+    for t in 0..n {
+        y[t] = stepper.step_forward_frame(u[t], record);
     }
 
-    let mut pair_grads = vec![[0.0_f64; 5]; m];
-    if let Some(d_out) = d_out_opt {
-        let mut gu_local = vec![0.0_f64; n];
-        for (k, pair) in pairs.iter().enumerate() {
-            let r_raw = pair.r_low + 0.5 * pair.dr;
-            if !r_raw.is_finite()
-                || r_raw <= 0.0
-                || !pair.b_gamma.is_finite()
-                || pair.b_gamma <= 0.0
-            {
-                continue;
-            }
-            let r = r_raw.clamp(KAUTZ_R_MIN, KAUTZ_R_MAX);
-            let (st, ct) = pair.theta.sin_cos();
-            let (ar, ai) = (r * ct, r * st);
-            let (c_re, c_im) = if is_right {
-                (pair.c_re_r, pair.c_im_r)
-            } else {
-                (pair.c_re_l, pair.c_im_l)
-            };
-            let (mut lam_r, mut lam_i) = (0.0_f64, 0.0_f64);
-            let (mut d_ar, mut d_ai, mut d_bg, mut d_cre, mut d_cim) = (0.0, 0.0, 0.0, 0.0, 0.0);
-
-            for t in (0..n).rev() {
-                let dt2 = 2.0 * d_out[t];
-                d_cre += dt2 * sr_hist[k][t];
-                d_cim -= dt2 * si_hist[k][t];
-                let adj_r = dt2 * c_re + lam_r;
-                let adj_i = -dt2 * c_im + lam_i;
-                gu_local[t] += pair.b_gamma * adj_r;
-                d_bg += adj_r * u[t];
-                let prev_r = if t > 0 { sr_hist[k][t - 1] } else { 0.0 };
-                let prev_i = if t > 0 { si_hist[k][t - 1] } else { 0.0 };
-                d_ar += adj_r * prev_r + adj_i * prev_i;
-                d_ai += adj_i * prev_r - adj_r * prev_i;
-                lam_r = ar * adj_r + ai * adj_i;
-                lam_i = -ai * adj_r + ar * adj_i;
-            }
-            let d_r = d_ar * ct + d_ai * st;
-            let d_theta = -d_ar * r * st + d_ai * r * ct;
-            pair_grads[k] = [d_r, d_theta, d_bg, d_cre, d_cim];
-        }
-        if let Some(gu) = grad_u_opt {
-            for (dst, src) in gu.iter_mut().zip(&gu_local) {
-                *dst += *src;
-            }
+    let Some(d_out) = d_out_opt else {
+        return (y, vec![[0.0_f64; 5]; m]);
+    };
+    let mut rev = KautzChannelReverseState::new(m);
+    for t in (0..n).rev() {
+        let gu_t = rev.step_reverse_frame(&stepper, t, u[t], d_out[t]);
+        if let Some(gu) = grad_u_opt.as_deref_mut() {
+            gu[t] += gu_t;
         }
     }
-    (y, pair_grads)
+    (y, rev.finalize(&stepper))
 }
 
 /// Evaluates the Left-channel complex conjugate Kautz modal bank via [`eval_kautz_modal_channel_and_adjoint`].
@@ -348,35 +528,25 @@ mod tests {
                 + yr.iter().zip(&d_out_r).map(|(a, b)| a * b).sum::<f64>()
         };
 
-        // 1. Op-N[Pre] FD parity.
-        let mut gx = vec![0.0_f64; 128];
-        let (_, gg, gb) = eval_op_n_pre_and_adjoint(&x, 0.65, 2.5, Some(&d_out), Some(&mut gx));
-        let (mut xp, mut xm) = (x.clone(), x.clone());
-        xp[37] += eps;
-        xm[37] -= eps;
-        assert_fd_close(
-            "op_n_x",
-            gx[37],
-            (obj(&eval_op_n_pre_and_adjoint(&xp, 0.65, 2.5, None, None).0)
-                - obj(&eval_op_n_pre_and_adjoint(&xm, 0.65, 2.5, None, None).0))
-                / (2.0 * eps),
-        );
-        assert_fd_close(
-            "op_n_gamma",
-            gg,
-            (obj(&eval_op_n_pre_and_adjoint(&x, 0.65 + eps, 2.5, None, None).0)
-                - obj(&eval_op_n_pre_and_adjoint(&x, 0.65 - eps, 2.5, None, None).0))
-                / (2.0 * eps),
-        );
-        assert_fd_close(
-            "op_n_beta",
-            gb,
-            (obj(&eval_op_n_pre_and_adjoint(&x, 0.65, 2.5 + eps, None, None).0)
-                - obj(&eval_op_n_pre_and_adjoint(&x, 0.65, 2.5 - eps, None, None).0))
-                / (2.0 * eps),
-        );
+        // 1. ro_pole_48k ZOH highpass FD parity at 48 kHz and 96 kHz (`rho = 1.0, 0.5`).
+        for &(ro, rho) in &[(0.92, 1.0), (0.85, 0.5)] {
+            let mut gu_hp = vec![0.0_f64; 128];
+            let (_, d_ro) =
+                eval_ro_pole_hp_and_adjoint(&x, ro, rho, Some(&d_out), Some(&mut gu_hp));
+            let fd_ro = (obj(&eval_ro_pole_hp_and_adjoint(&x, ro + eps, rho, None, None).0)
+                - obj(&eval_ro_pole_hp_and_adjoint(&x, ro - eps, rho, None, None).0))
+                / (2.0 * eps);
+            assert_fd_close("ro_pole_48k", d_ro, fd_ro);
+            let (mut up, mut um) = (x.clone(), x.clone());
+            up[31] += eps;
+            um[31] -= eps;
+            let fd_u31 = (obj(&eval_ro_pole_hp_and_adjoint(&up, ro, rho, None, None).0)
+                - obj(&eval_ro_pole_hp_and_adjoint(&um, ro, rho, None, None).0))
+                / (2.0 * eps);
+            assert_fd_close("ro_hp_u31", gu_hp[31], fd_u31);
+        }
 
-        // 2. Kautz Right-channel (c_re_r, c_im_r, r, theta, b_gamma) FD parity.
+        // 2. Kautz Right-channel (c_re_r, c_im_r, r_low, theta, b_gamma) FD parity.
         let pairs = [KautzPairF64 {
             r_low: 0.88,
             dr: 0.04,
@@ -391,6 +561,34 @@ mod tests {
         let (_, kr_grads) =
             eval_kautz_modal_channel_and_adjoint(&x_r, &pairs, true, Some(&d_out_r), Some(&mut gu));
         let obj_r = |yv: &[f64]| yv.iter().zip(&d_out_r).map(|(a, b)| a * b).sum::<f64>();
+        for (label, idx, bump) in [
+            ("kautz_r_low", 0_usize, 0_usize),
+            ("kautz_theta", 1, 1),
+            ("kautz_b_gamma", 2, 2),
+        ] {
+            let (mut pp, mut pm) = (pairs, pairs);
+            match bump {
+                0 => {
+                    pp[0].r_low += eps;
+                    pm[0].r_low -= eps;
+                }
+                1 => {
+                    pp[0].theta += eps;
+                    pm[0].theta -= eps;
+                }
+                _ => {
+                    pp[0].b_gamma += eps;
+                    pm[0].b_gamma -= eps;
+                }
+            }
+            assert_fd_close(
+                label,
+                kr_grads[0][idx],
+                (obj_r(&eval_kautz_modal_channel_and_adjoint(&x_r, &pp, true, None, None).0)
+                    - obj_r(&eval_kautz_modal_channel_and_adjoint(&x_r, &pm, true, None, None).0))
+                    / (2.0 * eps),
+            );
+        }
         let mut p_cr = pairs;
         p_cr[0].c_re_r += eps;
         let mut p_cm = pairs;
@@ -471,6 +669,7 @@ mod tests {
             window_depth: 0.15,
             scat_psi: 0.35,
             ext_f32: false,
+            ..TransportQuadF64::default()
         };
         let (mut gxl, mut gxr) = (vec![0.0; 128], vec![0.0; 128]);
         let (_, _, qg) = eval_op_t_quad_stereo_and_adjoint(

@@ -1,6 +1,10 @@
 //! Upper-triangular (`uplo='U'`) packed IEEE-754 `f64` Cholesky factorization and
 //! regularized trust-region solvers (`ref[container.proj.stat-uplo-u]`, `ref[train.pipeline.nested-varpro-schur]`).
 
+pub mod pcg_refine;
+
+pub use pcg_refine::{PcgRefinementSpec, refine_cholesky_lsq_pcg_f64};
+
 use crate::error::TrainError;
 use crate::wide_gram::{uplo_u_index, uplo_u_packed_len};
 

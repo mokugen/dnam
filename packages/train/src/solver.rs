@@ -15,13 +15,14 @@ pub use model::{
     StereoTrainingPairs, TierReadoutPrefixF64, TransportQuadF64,
 };
 pub use pass1_probe::{
-    OpPProbeSummary, Pass1ProbeReport, run_cpu_op_p_probe, run_pass1_probe,
-    steiglitz_mcbride_poles, synth_kautz_unit_mode,
+    OpPProbeSummary, Pass1PhysicsHint, Pass1ProbeConfig, Pass1ProbeReport, Pass1ProbeResult,
+    run_cpu_op_p_probe, run_pass1_probe, run_pass1_probe_with_hint, steiglitz_mcbride_poles,
+    synth_kautz_unit_mode,
 };
 pub use pass2_opt::{
-    DIMINISHING_RETURNS_DELTA_DB, Pass2OptConfig, Pass2OptReport, eval_kautz_modal_and_adjoint,
-    eval_op_n_pre_and_adjoint, eval_op_t_transport_and_adjoint, generate_generic_sobol_seeds,
-    run_pass2_optimize,
+    DIMINISHING_RETURNS_DELTA_DB, OpNPreGrads, Pass2OptConfig, Pass2OptReport,
+    eval_kautz_modal_and_adjoint, eval_op_n_pre_and_adjoint, eval_op_t_transport_and_adjoint,
+    generate_generic_sobol_seeds, run_pass2_optimize,
 };
 pub use pass3_varpro::{
     Pass3VarProReport, WeightedReadoutStem, extract_stat_256d_gram,
@@ -152,6 +153,19 @@ pub fn solve_sona_model(
     config: &SonaSolverConfig,
     progress: Option<&AtomicDnprProgress>,
 ) -> Result<SonaSolveResult, TrainError> {
+    solve_sona_model_with_pass1(runner, dataset, config, progress, None)
+}
+
+/// Executes the complete 5-pass `SONA v3.0` solver reusing an already-computed [`Pass1ProbeResult`]
+/// when supplied (Stage A -> Stage B handoff), eliminating duplicate Pass 1 execution
+/// (`ref[train.pipeline.physics-probe]`).
+pub fn solve_sona_model_with_pass1(
+    runner: &TrainRunner,
+    dataset: &SonaTrainDataset,
+    config: &SonaSolverConfig,
+    progress: Option<&AtomicDnprProgress>,
+    precomputed_pass1: Option<Pass1ProbeResult>,
+) -> Result<SonaSolveResult, TrainError> {
     let n = dataset
         .input_l
         .len()
@@ -178,16 +192,20 @@ pub fn solve_sona_model(
         )?)
     };
 
-    // Pass 1: `< 0.5 ms` CPU `Op-P` probe + Steiglitz–McBride / FIR / Kautz / Op-T init.
-    let (pass1, mut model) = run_pass1_probe(
-        &dataset.input_l[..n],
-        &dataset.input_r[..n],
-        &dataset.target_l[..n],
-        &dataset.target_r[..n],
-        dataset.sample_rate_hz,
-        config.max_fir_taps,
-        config.max_kautz_pairs,
-    )?;
+    // Pass 1: `< 0.5 ms` CPU `Op-P` probe + Steiglitz-McBride / FIR / Kautz / Op-T init (reused if passed).
+    let (pass1, mut model) = if let Some(p1) = precomputed_pass1 {
+        (p1.report, p1.model)
+    } else {
+        run_pass1_probe(
+            &dataset.input_l[..n],
+            &dataset.input_r[..n],
+            &dataset.target_l[..n],
+            &dataset.target_r[..n],
+            dataset.sample_rate_hz,
+            config.max_fir_taps,
+            config.max_kautz_pairs,
+        )?
+    };
     model.stability_constraint = dataset.stability_constraint.clone();
 
     // Pass 2: Generic Sobol prescreening + planned core scan + L-BFGS trajectory opt.

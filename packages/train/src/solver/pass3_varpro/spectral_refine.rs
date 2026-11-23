@@ -12,7 +12,8 @@ use crate::losses::canonical_ltas_33_centers_hz;
 use crate::wide_gram::{uplo_u_index, uplo_u_packed_len};
 
 use super::gram_snap::{
-    build_tier_fp16_col_bounds, snap_fp16_val, snap_weights_direct, snap_weights_gram_coordinate,
+    ColWireSpec, build_tier_col_wire_specs, snap_fp16_val, snap_weights_direct,
+    snap_weights_gram_coordinate,
 };
 
 /// Canonical per-tier 33-band LTAS max tilt limits `[Lite, Full, Pro, Ultra]` in dB
@@ -22,6 +23,9 @@ const TIER_LTAS_TILT_BUDGET_DB: [f64; 4] = [0.75, 0.35, 0.15, 0.10];
 /// Safe pre-snap magnitude ceiling leaving headroom inside the `[-8.0, +8.0]` readout wire range.
 const MAX_READOUT_ABS_BEFORE_SNAP: f64 = 7.5;
 const MAX_CANDIDATE_ABS_BEFORE_SNAP: f64 = 7.8;
+/// Maximum BIBO l1 gain norm across linear readout + FIR columns (`ref[train.audit.phase2.clamp-rail]`).
+const MAX_READOUT_L1_NORM: f64 = 48.0;
+const _: () = assert!(MAX_READOUT_L1_NORM > 0.0 && MAX_READOUT_L1_NORM < 100.0);
 
 pub(super) struct ChannelSpectralCtx<'a> {
     pub gram: &'a [f64],
@@ -110,14 +114,18 @@ pub(super) fn within_6db_and_bounds(
     {
         return false;
     }
+    let l1_norm: f64 = weights.iter().map(|v| v.abs()).sum();
+    if !l1_norm.is_finite() || l1_norm > MAX_READOUT_L1_NORM {
+        return false;
+    }
     let mags =
         evaluate_readout_spectral_magnitudes(&[weights[0], weights[1]], ro_pole_48k, sr_hz, 16);
     mags.iter().all(|&v| v.is_finite() && v <= MAX_GAIN_6DB_LIN)
 }
 
 /// Solves a prefix sub-system `(gram[..packed(dim)], rhs[..dim])` with escalating trace-scaled
-/// ridge `[1e-5 .. 1.0] * mean_diag` until weights remain well-conditioned inside `[-7.5, +7.5]`
-/// and respect the `+6 dB` head-gain limit.
+/// ridge `[1e-5 .. 1e4] * mean_diag` until weights remain well-conditioned inside `[-7.5, +7.5]`,
+/// respect the BIBO `l1` norm ceiling, and respect the `+6 dB` head-gain limit.
 pub(super) fn solve_bounded_uplo_u(
     gram: &[f64],
     rhs: &[f64],
@@ -131,7 +139,9 @@ pub(super) fn solve_bounded_uplo_u(
     let mut last_sol = vec![0.0_f64; dim];
     let mut last_ridge = trace_scaled_ridge(g_sub, dim, 1.0e-5);
 
-    for &rel in &[1.0e-5_f64, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0] {
+    for &rel in &[
+        1.0e-5_f64, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0, 10.0, 100.0, 1.0e3, 1.0e4,
+    ] {
         let ridge = trace_scaled_ridge(g_sub, dim, rel);
         if let Ok(sol) = solve_uplo_u_cholesky(g_sub, r_sub, ridge) {
             last_ridge = ridge;
@@ -142,14 +152,118 @@ pub(super) fn solve_bounded_uplo_u(
         }
     }
 
+    let mut max_abs = 0.0_f64;
+    let mut l1_norm = 0.0_f64;
     for v in &mut last_sol {
-        *v = if v.is_finite() {
-            v.clamp(-MAX_READOUT_ABS_BEFORE_SNAP, MAX_READOUT_ABS_BEFORE_SNAP)
+        if !v.is_finite() {
+            *v = 0.0;
         } else {
-            0.0
-        };
+            let av = v.abs();
+            max_abs = max_abs.max(av);
+            l1_norm += av;
+        }
+    }
+    let scale = (MAX_READOUT_ABS_BEFORE_SNAP / max_abs.max(1.0e-12))
+        .min(MAX_READOUT_L1_NORM / l1_norm.max(1.0e-12))
+        .min(1.0);
+    for v in &mut last_sol {
+        *v *= scale;
     }
     Ok((last_sol, last_ridge))
+}
+
+struct KktResnapCtx<'a> {
+    ctx: &'a ChannelSpectralCtx<'a>,
+    tier_idx: usize,
+    dim: usize,
+    n_act: usize,
+    gram_sub: &'a [f64],
+    rhs_sub: &'a [f64],
+    act_rows: &'a [f64],
+    act_amps: &'a [f64],
+    act_re: &'a [f64],
+    act_im: &'a [f64],
+    lambda_diag: &'a [f64],
+    col_specs: &'a [ColWireSpec],
+    best_mse: f64,
+    tilt_budget: f64,
+    base_within_6db: bool,
+}
+
+fn eval_act_max_tilt_db(
+    w: &[f64],
+    act_re: &[f64],
+    act_im: &[f64],
+    act_amps: &[f64],
+    dim: usize,
+) -> f64 {
+    let mut mx = 0.0_f64;
+    for (b_loc, &t_amp_raw) in act_amps.iter().enumerate() {
+        let (mut pr, mut pi) = (0.0_f64, 0.0_f64);
+        for (col, &wc) in w.iter().enumerate().take(dim) {
+            pr += wc * act_re[b_loc * dim + col];
+            pi += wc * act_im[b_loc * dim + col];
+        }
+        let p_amp = (pr * pr + pi * pi).sqrt().max(1.0e-12);
+        let t_amp = t_amp_raw.max(1.0e-9);
+        mx = mx.max((20.0 * (p_amp / t_amp).log10()).abs());
+    }
+    mx
+}
+
+fn try_damped_kkt_resnap(
+    p: &KktResnapCtx<'_>,
+    snap_tilt: f64,
+    fallback_tilt: f64,
+) -> Option<Vec<f64>> {
+    let ridge = p.ctx.used_ridge.max(1.0e-5);
+    let target_tilt = (TIER_LTAS_TILT_BUDGET_DB[p.tier_idx] * 0.85).max(0.05);
+    let kkt2 = solve_ltas_newton_kkt(
+        p.dim,
+        p.n_act,
+        p.gram_sub,
+        p.rhs_sub,
+        p.act_rows,
+        p.act_amps,
+        LtasKktConfig {
+            ridge,
+            max_outer_iters: 6,
+            max_tilt_db: target_tilt,
+            penalty_rho: 4.0,
+        },
+    )
+    .ok()?;
+    if !kkt2.weights.iter().all(|v| v.is_finite())
+        || !within_6db_and_bounds(
+            &kkt2.weights,
+            p.ctx.ro_pole_48k,
+            p.ctx.sr_hz,
+            MAX_CANDIDATE_ABS_BEFORE_SNAP,
+        )
+    {
+        return None;
+    }
+    let resnapped =
+        snap_weights_gram_coordinate(&kkt2.weights, p.gram_sub, p.lambda_diag, p.col_specs);
+    let within = !p.base_within_6db
+        || within_6db_and_bounds(
+            &resnapped,
+            p.ctx.ro_pole_48k,
+            p.ctx.sr_hz,
+            MAX_CANDIDATE_ABS_BEFORE_SNAP,
+        );
+    if !resnapped.iter().all(|v| v.is_finite()) || !within {
+        return None;
+    }
+    let resnap_tilt = eval_act_max_tilt_db(&resnapped, p.act_re, p.act_im, p.act_amps, p.dim);
+    let resnap_mse = compute_channel_mse(&resnapped, p.ctx.feats_post, p.ctx.tgts_post, p.dim);
+    if (resnap_tilt <= p.tilt_budget || resnap_tilt < snap_tilt.min(fallback_tilt))
+        && resnap_mse <= p.best_mse * 1.5 + 1.0e-12
+    {
+        Some(resnapped)
+    } else {
+        None
+    }
 }
 
 /// Applies stopband-safe EMR `MM-Cholesky`, active-band 33-band `LTAS` KKT refinement, and
@@ -359,9 +473,9 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
     }
 
     let base_within_6db = within_6db(&best_w);
-    let fp16_bounds =
-        build_tier_fp16_col_bounds(tier_idx, ctx.active_fir_taps, ctx.emit_prefix_overrides);
-    let mut fallback = snap_weights_direct(&best_w, &fp16_bounds);
+    let col_specs =
+        build_tier_col_wire_specs(tier_idx, ctx.active_fir_taps, ctx.emit_prefix_overrides);
+    let mut fallback = snap_weights_direct(&best_w, &col_specs);
     if base_within_6db && !within_6db(&fallback) {
         let (b0, b1) = (fallback[0], fallback[1]);
         for &scale_k in &[0.98_f64, 0.90, 0.75, 0.5, 0.0] {
@@ -379,10 +493,19 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
                 break;
             }
         }
+        if !within_6db(&fallback) {
+            for &scale_all in &[0.98_f64, 0.90, 0.75, 0.5, 0.25, 0.0] {
+                let scaled: Vec<f64> = best_w.iter().map(|&v| v * scale_all).collect();
+                fallback = snap_weights_direct(&scaled, &col_specs);
+                if within_6db(&fallback) {
+                    break;
+                }
+            }
+        }
     }
 
-    let snapped =
-        snap_weights_gram_coordinate(&best_w, gram_sub, ctx.used_ridge.max(1.0e-5), &fp16_bounds);
+    let lambda_diag = vec![ctx.used_ridge.max(1.0e-5); dim];
+    let snapped = snap_weights_gram_coordinate(&best_w, gram_sub, &lambda_diag, &col_specs);
     let tilt_budget = best_tilt.max(TIER_LTAS_TILT_BUDGET_DB[tier_idx]) + 0.05;
     if snapped.iter().all(|v| v.is_finite()) && (!base_within_6db || within_6db(&snapped)) {
         let snap_mse = compute_channel_mse(&snapped, ctx.feats_post, ctx.tgts_post, dim);
@@ -394,7 +517,174 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
         {
             return snapped;
         }
+        if n_act >= 2 && snap_tilt > tilt_budget {
+            let fallback_tilt = eval_max_tilt_db(&fallback);
+            let resnap_ctx = KktResnapCtx {
+                ctx,
+                tier_idx,
+                dim,
+                n_act,
+                gram_sub,
+                rhs_sub,
+                act_rows: &act_rows,
+                act_amps: &act_amps,
+                act_re: &act_re,
+                act_im: &act_im,
+                lambda_diag: &lambda_diag,
+                col_specs: &col_specs,
+                best_mse,
+                tilt_budget,
+                base_within_6db,
+            };
+            if let Some(resnapped) = try_damped_kkt_resnap(&resnap_ctx, snap_tilt, fallback_tilt) {
+                return resnapped;
+            }
+        }
     }
 
     fallback
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::linalg::varpro::assemble_ozaki_normal_equations;
+    use crate::runner::TrainRunner;
+
+    #[test]
+    fn test_post_snap_damped_kkt_resnap_and_budget_guards() {
+        // Construct a correlated multi-tone system where Ultra column-0/2 quantization can perturb
+        // 33-band tilt above TIER_LTAS_TILT_BUDGET_DB[3] = 0.10 dB, exercising damped KKT resnap
+        // and verifying the output stays finite, +6 dB safe, and tilt-controlled.
+        let m = 512_usize;
+        let dim = 250_usize; // 2 + 40*3 + 128 FIR at Ultra
+        let sr = 48_000.0_f64;
+        let runner = TrainRunner::cpu();
+        let mut feats = vec![0.0_f32; dim * m];
+        let mut tgts = vec![0.0_f32; m];
+        for t in 0..m {
+            let th = core::f64::consts::TAU * (t as f64) / sr;
+            let s_low = (th * 125.0).sin() + 0.6 * (th * 500.0).cos();
+            let s_hi = (th * 2_500.0).sin() + 0.5 * (th * 6_300.0).cos();
+            let f0 = (0.5 * s_low + 0.05 * s_hi) as f32;
+            let f1 = (0.04 * s_low + 0.45 * s_hi) as f32;
+            feats[t] = f0;
+            feats[m + t] = f1;
+            for c in 2..dim {
+                feats[c * m + t] = if t >= (c % 8) {
+                    0.02 * feats[(c % 2) * m + (t - (c % 8))]
+                } else {
+                    0.0
+                };
+            }
+            // Target slightly beyond +0.10 dB tilt if col 0 snaps away from exact continuous solve.
+            tgts[t] = (1.800_7 * f64::from(f0) - 0.900_6 * f64::from(f1)) as f32;
+        }
+        let (gram, rhs_v) =
+            assemble_ozaki_normal_equations(&runner, &feats, &tgts, m, dim, 1, false).unwrap();
+        let rhs: Vec<f64> = rhs_v.into_iter().map(|v| v[0]).collect();
+
+        // Feed intentionally slightly skewed base_weights whose snap creates tilt overshoot so the
+        // refinement loop exercises EMR, LTAS KKT, and post-snap damped KKT re-projection cleanly.
+        let mut skewed = vec![0.0_f64; dim];
+        skewed[0] = 1.92;
+        skewed[1] = -0.82;
+        let ctx = ChannelSpectralCtx {
+            gram: &gram,
+            rhs: &rhs,
+            feats_post: &feats,
+            tgts_post: &tgts,
+            sr_hz: sr,
+            ro_pole_48k: 0.0,
+            active_fir_taps: 128,
+            emit_prefix_overrides: true,
+            used_ridge: 1.0e-5,
+        };
+        let refined = refine_channel_tier_emr_and_ltas_kkt(&skewed, dim, 3, &ctx);
+        assert_eq!(refined.len(), dim);
+        assert!(refined.iter().all(|v| v.is_finite()));
+        assert!(within_6db_and_bounds(&refined, 0.0, sr, 8.0));
+
+        // Direct smoke test of `try_damped_kkt_resnap`: accepts finite +6 dB-safe tilt-improving
+        // re-snap when within MSE budget, and rejects impossible MSE or non-finite inputs.
+        let col_specs = build_tier_col_wire_specs(3, 128, true);
+        let lambda_diag = vec![1.0e-5; dim];
+        let act_rows = vec![1.0_f64; 2 * dim];
+        let act_re = act_rows.clone();
+        let act_im = vec![0.0_f64; 2 * dim];
+        let act_amps = vec![1.0_f64; 2];
+        let mut p_test = KktResnapCtx {
+            ctx: &ctx,
+            tier_idx: 3,
+            dim,
+            n_act: 2,
+            gram_sub: &gram,
+            rhs_sub: &rhs,
+            act_rows: &act_rows,
+            act_amps: &act_amps,
+            act_re: &act_re,
+            act_im: &act_im,
+            lambda_diag: &lambda_diag,
+            col_specs: &col_specs,
+            best_mse: 1.0,
+            tilt_budget: 0.15,
+            base_within_6db: true,
+        };
+        let accepted = try_damped_kkt_resnap(&p_test, 5.0, 5.0)
+            .expect("expected valid damped KKT resnap within MSE budget");
+        assert!(within_6db_and_bounds(&accepted, 0.0, sr, 8.0));
+
+        p_test.best_mse = 1.0e-18;
+        assert!(try_damped_kkt_resnap(&p_test, 5.0, 5.0).is_none());
+
+        let rhs_nan = vec![f64::NAN; dim];
+        p_test.best_mse = 1.0;
+        p_test.rhs_sub = &rhs_nan;
+        assert!(try_damped_kkt_resnap(&p_test, 5.0, 5.0).is_none());
+    }
+
+    #[test]
+    fn test_solve_bounded_uplo_u_enforces_l1_norm_and_bibo_uniform_scaling() {
+        let dim = 32_usize;
+        let sr = 48_000.0_f64;
+        let mut gram = vec![0.0_f64; uplo_u_packed_len(dim)];
+        let mut rhs = vec![0.0_f64; dim];
+        // Collinear features whose unregularized inverse produces huge +/- coefficients.
+        for t in 0..64 {
+            let base = ((t as f64) * 0.13).sin();
+            let row: Vec<f64> = (0..dim)
+                .map(|c| base + 1.0e-3 * (((t * 7 + c * 3) % 11) as f64 - 5.0))
+                .collect();
+            let tgt = 0.4 * base + 2.0 * (((t % 2) as f64) - 0.5);
+            for c in 0..dim {
+                rhs[c] += row[c] * tgt;
+                for r in 0..=c {
+                    gram[uplo_u_index(r, c)] += row[r] * row[c];
+                }
+            }
+        }
+        let (sol, _) = solve_bounded_uplo_u(&gram, &rhs, dim, 0.0, sr).unwrap();
+        let l1: f64 = sol.iter().map(|v| v.abs()).sum();
+        assert!(
+            within_6db_and_bounds(&sol, 0.0, sr, MAX_READOUT_ABS_BEFORE_SNAP),
+            "collinear solve must satisfy BIBO bounds: l1={l1}"
+        );
+        assert!(l1 <= MAX_READOUT_L1_NORM + 1.0e-9);
+
+        // Extreme RHS forcing uniform scaling fallback preserves finite l1 <= MAX_READOUT_L1_NORM.
+        let tiny_gram: Vec<f64> = (0..dim)
+            .flat_map(|c| (0..=c).map(move |r| if r == c { 1.0e-6 } else { 0.0 }))
+            .collect();
+        let huge_rhs: Vec<f64> = (0..dim)
+            .map(|c| if c % 2 == 0 { 10.0 } else { -10.0 })
+            .collect();
+        let (fallback_sol, _) = solve_bounded_uplo_u(&tiny_gram, &huge_rhs, dim, 0.0, sr).unwrap();
+        let fb_l1: f64 = fallback_sol.iter().map(|v| v.abs()).sum();
+        assert!(
+            fallback_sol
+                .iter()
+                .all(|v| v.is_finite() && v.abs() <= MAX_READOUT_ABS_BEFORE_SNAP + 1.0e-9)
+        );
+        assert!(fb_l1 <= MAX_READOUT_L1_NORM + 1.0e-9, "fb_l1={fb_l1}");
+    }
 }

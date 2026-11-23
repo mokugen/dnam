@@ -7,7 +7,7 @@ use dnam_engine::schema::DnamError;
 use dnam_train::solver::StereoTrainingPairs;
 use dnam_train::solver::pass2_opt::Pass2OptConfig;
 use dnam_train::{
-    SonaModelF64, TrainRunner, WeightedReadoutStem, decode_dnam_bin_to_model,
+    Pass1ProbeResult, SonaModelF64, TrainRunner, WeightedReadoutStem, decode_dnam_bin_to_model,
     extract_stat_256d_gram, patch_model_readouts_weighted_cholesky, run_pass1_probe,
     run_pass2_optimize, run_pass3_varpro_readout, uplo_u_packed_len,
 };
@@ -43,6 +43,7 @@ pub struct WeightedStemRef<'a> {
 
 const FULLBAND_BODY_LEN: usize = 72_000;
 const ALL_TIERS: [Tier; 4] = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra];
+const _: () = assert!(FULLBAND_BODY_LEN == 72_000 && ALL_TIERS.len() == 4);
 
 /// Output summary and `uplo='U'` sufficient statistics from [`solve_stage_b_backbone`].
 #[derive(Debug, Clone)]
@@ -340,6 +341,17 @@ pub fn solve_stage_b_backbone(
     )
 }
 
+/// Arguments controlling [`solve_stage_b_backbone_with_pass1`].
+#[derive(Debug, Clone)]
+pub struct StageBBackboneSpec {
+    /// Optional non-zero prefix frame limit (`0` = use all aligned frames).
+    pub active_frames_hint: usize,
+    /// Backbone solve configuration (`gram_frame_stride`, `quality_mode`, etc.).
+    pub config: StageBSolveConfig,
+    /// Optional precomputed Stage A [`Pass1ProbeResult`] reused without re-probing.
+    pub precomputed_pass1: Option<Pass1ProbeResult>,
+}
+
 /// Variant of [`solve_stage_b_backbone`] accepting [`StageBSolveConfig`] and a hybrid
 /// [`TrainerProgressHandle`] (`AtomicTrainerProgress` seqlock + coarse callback).
 pub fn solve_stage_b_backbone_with_progress(
@@ -351,6 +363,35 @@ pub fn solve_stage_b_backbone_with_progress(
     config: StageBSolveConfig,
     progress: &TrainerProgressHandle,
 ) -> Result<StageBOutputs, DnamError> {
+    solve_stage_b_backbone_with_pass1(
+        manifest,
+        dnam_bin,
+        dry_lr,
+        wet_lr,
+        StageBBackboneSpec {
+            active_frames_hint,
+            config,
+            precomputed_pass1: None,
+        },
+        progress,
+    )
+}
+
+/// Variant of [`solve_stage_b_backbone_with_progress`] accepting [`StageBBackboneSpec`] (with an
+/// optional Stage A [`Pass1ProbeResult`]) so Stage B never repeats Pass 1 physics/pole probing.
+pub fn solve_stage_b_backbone_with_pass1(
+    manifest: &DnamProjManifest,
+    dnam_bin: &mut Vec<u8>,
+    dry_lr: &[[f32; 2]],
+    wet_lr: &[[f32; 2]],
+    spec: StageBBackboneSpec,
+    progress: &TrainerProgressHandle,
+) -> Result<StageBOutputs, DnamError> {
+    let StageBBackboneSpec {
+        active_frames_hint,
+        config,
+        precomputed_pass1,
+    } = spec;
     validate_ultra_dnam_bin(dnam_bin)?;
     let timer = now_ms_token();
     let mono_out = manifest.base.io_config.output_mode == "mono";
@@ -411,8 +452,13 @@ pub fn solve_stage_b_backbone_with_progress(
                 verify_dnam_bin_zero_dc(dnam_bin)?;
             }
         } else {
-            let (_p1, mut model) = run_pass1_probe(&in_l, &in_r, &tgt_l, &tgt_r, 48_000.0, 128, 32)
-                .map_err(map_stage_err)?;
+            let mut model = if let Some(p1) = precomputed_pass1 {
+                p1.model
+            } else {
+                run_pass1_probe(&in_l, &in_r, &tgt_l, &tgt_r, 48_000.0, 128, 32)
+                    .map_err(map_stage_err)?
+                    .1
+            };
             emit_stage_b_milestone(progress, &model, dry_lr, &anchor, 250, 1);
 
             let pairs = StereoTrainingPairs {

@@ -3,7 +3,7 @@
 
 use dnam_kernels::{
     MAX_PARALRU_DUHEM_GAMMA_F32, MAX_PARALRU_R_F32, MAX_SVF_K_NL, MIN_TPT_G, TANK_MAX_G_LIN_F32,
-    f32_to_fp16, pack_wf_mix_and_rect_sign_fp16,
+    f32_to_fp16, fp16_to_f32, pack_wf_mix_and_rect_sign_fp16,
 };
 use dnam_vm::bin::{
     CoreQuadWire, KautzSoaBlockWire, SonaCrossbarBlockWire, SonaInterBlockTilePairWire,
@@ -100,8 +100,22 @@ pub(super) fn pack_kautz_block(
 ) -> KautzSoaBlockWire {
     let mut b = KautzSoaBlockWire::new_zeroed();
     for (i, p) in pairs.iter().take(4).enumerate() {
-        let r = sanitize_clamp_f32(p.r_low, 0.0, 0.9995, 0.0);
-        let dr = sanitize_clamp_f32(p.dr, 0.0, (0.9995 - r).max(0.0), 0.0);
+        let dr_pos = if p.dr.is_finite() && p.dr > 0.0 {
+            p.dr
+        } else {
+            0.0
+        };
+        let r_raw = if p.r_low.is_finite() {
+            p.r_low + 0.5 * dr_pos
+        } else {
+            0.0
+        };
+        let r = if !r_raw.is_finite() || r_raw <= 0.0 {
+            0.0
+        } else {
+            sanitize_clamp_f32(r_raw, 0.25, 0.9995, 0.25)
+        };
+        let dr = 0.0_f32;
         let pair_idx = base_pair_idx + i;
         let (bg, cl, cil, cr, cir) = if let Some(ov) = override_src {
             (
@@ -156,9 +170,16 @@ pub(super) fn pack_transport_quad_wire(t: &TransportQuadF64) -> TransportQuadWir
     }
     w.allpass_delays = t.allpass_delays;
     w.g_loop = F32::new(sanitize_clamp_f32(t.g_loop, 0.0, TANK_MAX_G_LIN_F32, 0.0));
-    w.r_dc = F32::new(TANK_DC_BLOCKER_48K_F32);
+    w.r_dc = F32::new(sanitize_clamp_f32(
+        t.r_dc,
+        0.95,
+        0.9999,
+        TANK_DC_BLOCKER_48K_F32,
+    ));
     w.damp_pole = F32::new(sanitize_clamp_f32(t.damp_pole, 0.0, 0.9995, 0.0));
     w.lfo_rate_hz = F32::new(sanitize_clamp_f32(t.lfo_rate_hz, 0.0, 16.0, 0.0));
+    w.lfo_phase_off_q16 = t.lfo_phase_off_q16.map(U16::new);
+    w.ramp_phase_off_q16 = t.ramp_phase_off_q16.map(U16::new);
     w.ramp_rate_hz = F32::new(sanitize_clamp_f32(t.ramp_rate_hz, -16.0, 16.0, 0.0));
     w.fb_psi_fp16 = fp16_clamped(t.fb_psi, -core::f32::consts::PI, core::f32::consts::PI, 0.0);
     w.scat_psi_fp16 = fp16_clamped(
@@ -168,7 +189,11 @@ pub(super) fn pack_transport_quad_wire(t: &TransportQuadF64) -> TransportQuadWir
         0.0,
     );
     w.sigma_knee_fp16 = fp16_clamped(t.sigma_knee, 1.0e-3, 0.984_375, 0.984_375);
-    w.freeze_mix_fp16 = fp16_clamped(t.freeze_mix, 0.0, 1.0, 0.0);
+    let mut fm_bits = fp16_clamped(t.freeze_mix, 0.0, 0.999, 0.0).get();
+    if fp16_to_f32(fm_bits) > 0.999 {
+        fm_bits = fm_bits.saturating_sub(1);
+    }
+    w.freeze_mix_fp16 = U16::new(fm_bits);
     w.window_depth_fp16 = fp16_clamped(t.window_depth, 0.0, 1.0, 0.0);
     w.flags = if need_ext_f32 {
         TRANSPORT_FLAG_EXT_F32

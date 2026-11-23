@@ -47,6 +47,8 @@ pub struct SonaModelF64 {
     pub crossbar_op_gains: [f64; 2],
     /// Top-of-frame `Q0.32` phasor frequencies in Hz `[4]`.
     pub phasor_freq_hz: [f64; 4],
+    /// Initial `Q0.32` phasor carrier phases `[4]`.
+    pub phasor_init_phase_q32: [u32; 4],
     /// Carrier 3-basis projection weights `[3][4]`.
     pub carrier_basis_w: [[f64; 4]; 3],
     /// Direct pre-convolver linear input residual bypass `[L, R]`.
@@ -147,6 +149,7 @@ impl SonaModelF64 {
             op_n_pre_beta_q: 0.0,
             crossbar_op_gains: [0.0; 2],
             phasor_freq_hz: [0.0; 4],
+            phasor_init_phase_q32: [0; 4],
             carrier_basis_w: [[0.0; 4]; 3],
             pre_conv_u_gain: [0.0; 2],
             pre_conv_hp_gain: [0.0; 2],

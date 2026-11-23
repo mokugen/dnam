@@ -23,7 +23,7 @@ pub(super) const fn is_finite_f32(x: f32) -> bool {
 }
 
 #[inline(always)]
-pub(super) const fn flush_zero(x: f32) -> f32 {
+pub(crate) const fn flush_zero(x: f32) -> f32 {
     canonicalize_zero_f32_bits(x)
 }
 
@@ -45,7 +45,7 @@ pub(super) fn clamp_nonneg_safe(x: f32, hi: f32) -> f32 {
 }
 
 #[derive(Copy, Clone)]
-pub(super) struct LaneParams {
+pub(crate) struct LaneParams {
     pub a1: f32,
     pub a2: f32,
     pub a3: f32,
@@ -81,7 +81,7 @@ pub(super) struct LaneParams {
 }
 
 impl LaneParams {
-    pub(super) fn extract(
+    pub(crate) fn extract(
         p: &CoreQuadParamsStereo4<GpuVec4>,
         svf_g_arr: [f32; 4],
         c: usize,
@@ -130,7 +130,7 @@ impl LaneParams {
         }
     }
 
-    pub(super) fn svf_coeffs(&self) -> TptSvfCoeffs4<GpuVec4> {
+    pub(crate) fn svf_coeffs(&self) -> TptSvfCoeffs4<GpuVec4> {
         TptSvfCoeffs4 {
             a1: GpuVec4::splat(self.a1),
             a2: GpuVec4::splat(self.a2),
@@ -140,7 +140,7 @@ impl LaneParams {
         }
     }
 
-    pub(super) fn lru_coeffs(&self) -> SonaParaLruDuhemCoeffs4<GpuVec4> {
+    pub(crate) fn lru_coeffs(&self) -> SonaParaLruDuhemCoeffs4<GpuVec4> {
         SonaParaLruDuhemCoeffs4 {
             alpha_rel: GpuVec4::splat(self.alpha_rel),
             alpha_atk: GpuVec4::splat(self.alpha_atk),
@@ -153,7 +153,7 @@ impl LaneParams {
 }
 
 #[derive(Copy, Clone, Default)]
-pub(super) struct FwdFrameState {
+pub(crate) struct FwdFrameState {
     pub u_l: f32,
     pub u_r: f32,
     pub s1_prev_l: f32,
@@ -181,7 +181,7 @@ pub(super) struct FwdFrameState {
 }
 
 #[inline(always)]
-pub(super) fn step_lane_forward(
+pub(crate) fn step_lane_forward(
     lp: &LaneParams,
     svf_c: &TptSvfCoeffs4<GpuVec4>,
     lru_c: &SonaParaLruDuhemCoeffs4<GpuVec4>,
@@ -442,7 +442,7 @@ fn duhem_channel_grad(
 }
 
 #[derive(Copy, Clone, Default)]
-pub(super) struct ReverseCarry {
+pub(crate) struct ReverseCarry {
     pub adj_r_next_l: f32,
     pub adj_r_next_r: f32,
     pub lam_after_l: f32,
@@ -452,12 +452,12 @@ pub(super) struct ReverseCarry {
 }
 
 #[derive(Copy, Clone, Default)]
-pub(super) struct TileGradAccum {
+pub(crate) struct TileGradAccum {
     pub slots: [f32; QUAD_PARAMS_VEC4_STRIDE],
 }
 
 /// Shared immutable trajectory slices and scalar coordinates for [`step_lane_reverse`].
-pub(super) struct ReverseStepContext<'a> {
+pub(crate) struct ReverseStepContext<'a> {
     pub d_loss_d_features: &'a [[f32; 4]],
     pub feature_outputs: &'a [[f32; 4]],
     pub q_global: usize,
@@ -467,7 +467,7 @@ pub(super) struct ReverseStepContext<'a> {
 }
 
 /// Executes one reverse BPTT frame at `(q_global, frame)` on lane `c`, returning `(du_l, du_r)`.
-pub(super) fn step_lane_reverse(
+pub(crate) fn step_lane_reverse(
     ctx: &ReverseStepContext<'_>,
     fwd: &FwdFrameState,
     lp: &LaneParams,

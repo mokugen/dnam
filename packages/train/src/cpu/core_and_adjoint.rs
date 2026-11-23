@@ -7,7 +7,7 @@ mod streamed;
 
 pub use streamed::run_fused_core_scan_planned_cpu;
 
-use adjoint_math::{
+pub(crate) use adjoint_math::{
     FwdFrameState, LaneParams, ReverseCarry, ReverseStepContext, TileGradAccum, flush_zero,
     step_lane_forward, step_lane_reverse,
 };
@@ -28,11 +28,11 @@ use crate::runner::types::{
 };
 
 #[inline(always)]
-fn canon_vec4(v: GpuVec4) -> [f32; 4] {
+pub(crate) fn canon_vec4(v: GpuVec4) -> [f32; 4] {
     v.to_array().map(canonicalize_zero_f32_bits)
 }
 
-fn read_checkpoint(
+pub(crate) fn read_checkpoint(
     ckpts: &[[f32; 4]],
     q_global: usize,
     num_tiles: usize,
@@ -59,7 +59,7 @@ fn read_checkpoint(
     }
 }
 
-fn write_checkpoint(
+pub(crate) fn write_checkpoint(
     ckpts: &mut [[f32; 4]],
     q_global: usize,
     num_tiles: usize,
@@ -184,7 +184,7 @@ pub fn run_fused_core_scan_cpu(
 }
 
 /// Runs `fused_core_scan_256` under [`CoreScanPlan`], yielding `0-ULP` identical results between
-fn write_lane_param_grads(
+pub(crate) fn write_lane_param_grads(
     out_grads: &mut [[f32; 4]],
     pg_base: usize,
     c: usize,

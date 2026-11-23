@@ -115,6 +115,16 @@ fn clamp_prefix_f64(pfx: &mut TierReadoutPrefixF64) {
     }
 }
 
+#[inline]
+fn fold_kautz_r_low_with_dr(r_low: f64, dr: f64) -> f64 {
+    let dr_pos = if dr.is_finite() && dr > 0.0 { dr } else { 0.0 };
+    if r_low.is_finite() {
+        r_low + 0.5 * dr_pos
+    } else {
+        0.0
+    }
+}
+
 /// Enforces all canonical Table-4 bounds across `SonaModelF64` (including Block 0 `svf_k_nl` and
 /// zeroed `svf_k_nl` on Blocks 1..3, plus `Op-T` `scat_psi`).
 pub(super) fn clamp_model_stability_bounds(model: &mut SonaModelF64, crossbar_coupled: bool) {
@@ -129,9 +139,62 @@ pub(super) fn clamp_model_stability_bounds(model: &mut SonaModelF64, crossbar_co
     for t in &mut model.tier_gain_trim {
         *t = sanitize_clamp(*t, 0.0625, 16.0, 1.0);
     }
+    for tile in &mut model.tiles {
+        for s in 0..4 {
+            for d in 0..4 {
+                tile.w_odd_4x4[s][d] = sanitize_clamp(tile.w_odd_4x4[s][d], -8.0, 8.0, 0.0);
+                tile.w_even_4x4[s][d] = sanitize_clamp(tile.w_even_4x4[s][d], -8.0, 8.0, 0.0);
+                tile.w_lru_4x4[s][d] = sanitize_clamp(tile.w_lru_4x4[s][d], -8.0, 8.0, 0.0);
+            }
+        }
+    }
     for (q_idx, q) in model.core_quads.iter_mut().enumerate() {
         let is_block0 = SONA_CORE_QUAD_BLOCK_AND_LOCAL[q_idx].0 == 0;
         clamp_core_quad_f64(q, is_block0);
+    }
+    let g_lo = f64::from(MIN_TPT_G);
+    let r_hi = f64::from(MAX_PARALRU_R_F32);
+    let sr = sanitize_clamp(model.sample_rate_hz, 44_100.0, 96_000.0, 48_000.0);
+    let phasor_lim = 0.49 * sr;
+    for i in 0..4 {
+        model.sense_svf_g[i] = sanitize_clamp(model.sense_svf_g[i], g_lo, 64.0, 0.25);
+        model.sense_lru_rel[i] = sanitize_clamp(model.sense_lru_rel[i], 0.0, r_hi, 0.995);
+        model.sense_lru_atk[i] = sanitize_clamp(model.sense_lru_atk[i], 0.0, 1.0, 0.25);
+        model.sense_svf_k[i] = sanitize_clamp(
+            model.sense_svf_k[i],
+            0.0,
+            8.0,
+            core::f64::consts::FRAC_1_SQRT_2,
+        );
+        model.sense_lru_kappa[i] = sanitize_clamp(model.sense_lru_kappa[i], 0.0, 1.0, 0.0);
+        model.sense_vca_w[i] = sanitize_clamp(model.sense_vca_w[i], -512.0, 512.0, 0.0);
+        model.sense_in_l[i] = sanitize_clamp(model.sense_in_l[i], -4.0, 4.0, 0.5);
+        model.sense_in_r[i] = sanitize_clamp(model.sense_in_r[i], -4.0, 4.0, 0.5);
+        model.sense_tone_lp[i] = sanitize_clamp(model.sense_tone_lp[i], -16.0, 16.0, 1.0);
+        model.sense_tone_bp[i] = sanitize_clamp(model.sense_tone_bp[i], -16.0, 16.0, 0.0);
+        model.sense_tone_hp[i] = sanitize_clamp(model.sense_tone_hp[i], -16.0, 16.0, 0.0);
+        model.phasor_freq_hz[i] =
+            sanitize_clamp(model.phasor_freq_hz[i], -phasor_lim, phasor_lim, 0.0);
+        model.phasor_stereo_phase[i] = sanitize_clamp(model.phasor_stereo_phase[i], -PI, PI, 0.0);
+    }
+    for g in &mut model.crossbar_op_gains {
+        *g = sanitize_clamp(*g, -4.0, 4.0, 0.0);
+    }
+    for row in &mut model.carrier_basis_w {
+        for cell in row {
+            *cell = sanitize_clamp(*cell, -8.0, 8.0, 0.0);
+        }
+    }
+    for q in 0..10 {
+        for l in 0..4 {
+            model.op_p_to_core[q][l] = sanitize_clamp(model.op_p_to_core[q][l], -8.0, 8.0, 0.0);
+            model.phasor_to_core[q][l] = sanitize_clamp(model.phasor_to_core[q][l], -8.0, 8.0, 0.0);
+        }
+    }
+    for row in &mut model.opt_to_lr {
+        for cell in row {
+            *cell = sanitize_clamp(*cell, -4.0, 4.0, 0.0);
+        }
     }
     for c in 0..2 {
         model.pre_conv_u_gain[c] = sanitize_clamp(model.pre_conv_u_gain[c], -64.0, 64.0, 0.0);
@@ -156,25 +219,38 @@ pub(super) fn clamp_model_stability_bounds(model: &mut SonaModelF64, crossbar_co
         4.0
     };
     let g_loop_max = f64::from(TANK_MAX_G_LIN_F32);
+    let r_dc_fallback = f64::from(TANK_DC_BLOCKER_48K_F32);
     for tq in &mut model.transport_quads {
-        for d in &mut tq.delay_samples {
-            *d = sanitize_clamp(*d, tau_floor, 48_000.0, tau_floor);
-        }
-        for lfo in &mut tq.lfo_depths {
-            *lfo = sanitize_clamp(*lfo, 0.0, 512.0, 0.0);
+        for k in 0..4 {
+            tq.delay_samples[k] =
+                sanitize_clamp(tq.delay_samples[k], tau_floor, 48_000.0, tau_floor);
+            tq.ramp_spans_samples[k] = sanitize_clamp(tq.ramp_spans_samples[k], 0.0, 48_000.0, 0.0);
+            tq.lfo_depths[k] = sanitize_clamp(tq.lfo_depths[k], 0.0, 512.0, 0.0);
+            tq.input_gains[k] = sanitize_clamp(tq.input_gains[k], -2.0, 2.0, 0.0);
+            tq.wet_tap_l[k] = sanitize_clamp(tq.wet_tap_l[k], -2.0, 2.0, 0.0);
+            tq.wet_tap_r[k] = sanitize_clamp(tq.wet_tap_r[k], -2.0, 2.0, 0.0);
+            tq.allpass_g[k] = sanitize_clamp(tq.allpass_g[k], -0.75, 0.75, 0.0);
         }
         tq.g_loop = sanitize_clamp(tq.g_loop, 0.0, g_loop_max, 0.0);
+        tq.r_dc = sanitize_clamp(tq.r_dc, 0.95, 0.9999, r_dc_fallback);
         tq.damp_pole = sanitize_clamp(tq.damp_pole, 0.0, 0.9995, 0.0);
+        tq.lfo_rate_hz = sanitize_clamp(tq.lfo_rate_hz, 0.0, 16.0, 0.0);
+        tq.ramp_rate_hz = sanitize_clamp(tq.ramp_rate_hz, -16.0, 16.0, 0.0);
         tq.fb_psi = sanitize_clamp(tq.fb_psi, -PI, PI, 0.0);
         tq.scat_psi = sanitize_clamp(tq.scat_psi, -PI, PI, 0.0);
         tq.sigma_knee = sanitize_clamp(tq.sigma_knee, 1.0e-3, 0.984_375, 0.984_375);
-        tq.freeze_mix = sanitize_clamp(tq.freeze_mix, 0.0, 1.0, 0.0);
+        tq.freeze_mix = sanitize_clamp(tq.freeze_mix, 0.0, 0.999, 0.0);
         tq.window_depth = sanitize_clamp(tq.window_depth, 0.0, 1.0, 0.0);
     }
     let theta_max = f64::from(core::f32::consts::PI - 1.0e-4);
     for k in &mut model.kautz {
-        k.r_low = sanitize_clamp(k.r_low, 0.0, 0.9995, 0.0);
-        k.dr = sanitize_clamp(k.dr, 0.0, 0.9995 - k.r_low, 0.0);
+        let r_raw = fold_kautz_r_low_with_dr(k.r_low, k.dr);
+        k.r_low = if !r_raw.is_finite() || r_raw <= 0.0 {
+            0.0
+        } else {
+            r_raw.clamp(0.25, 0.9995)
+        };
+        k.dr = 0.0;
         k.theta = sanitize_clamp(k.theta, 0.0, theta_max, 0.0);
         k.b_gamma = sanitize_clamp(k.b_gamma, 0.0, 8.0, 0.0);
         k.c_re_l = sanitize_clamp(k.c_re_l, -8.0, 8.0, 0.0);
@@ -270,7 +346,7 @@ pub fn snap_non_readout_fp16(model: &mut SonaModelF64) {
             tq.allpass_g[k] = snap_fp16(tq.allpass_g[k], -0.75, 0.75, 0.0);
         }
         tq.g_loop = snap_f32(tq.g_loop, 0.0, TANK_MAX_G_LIN_F32, 0.0);
-        tq.r_dc = f64::from(TANK_DC_BLOCKER_48K_F32);
+        tq.r_dc = snap_f32(tq.r_dc, 0.95, 0.9999, TANK_DC_BLOCKER_48K_F32);
         tq.damp_pole = snap_f32(tq.damp_pole, 0.0, 0.9995, 0.0);
         tq.lfo_rate_hz = snap_f32(tq.lfo_rate_hz, 0.0, 16.0, 0.0);
         tq.ramp_rate_hz = snap_f32(tq.ramp_rate_hz, -16.0, 16.0, 0.0);
@@ -283,10 +359,18 @@ pub fn snap_non_readout_fp16(model: &mut SonaModelF64) {
         };
         let sk_bits = f32_to_fp16(sk_clamped).min(TANK_MAX_SIGMA_SAT_FP16);
         tq.sigma_knee = f64::from(fp16_to_f32(sk_bits));
-        tq.freeze_mix = snap_fp16(tq.freeze_mix, 0.0, 1.0, 0.0);
+        let fm_clamped = sanitize_clamp(tq.freeze_mix, 0.0, 0.999, 0.0) as f32;
+        let mut fm_bits = f32_to_fp16(if fm_clamped == 0.0 { 0.0 } else { fm_clamped });
+        if fp16_to_f32(fm_bits) > 0.999 {
+            fm_bits = fm_bits.saturating_sub(1);
+        }
+        let fm_snapped = fp16_to_f32(fm_bits);
+        tq.freeze_mix = f64::from(if fm_snapped == 0.0 { 0.0 } else { fm_snapped });
         tq.window_depth = snap_fp16(tq.window_depth, 0.0, 1.0, 0.0);
     }
 
+    let phasor_lim_f32 =
+        0.49 * (sanitize_clamp(model.sample_rate_hz, 44_100.0, 96_000.0, 48_000.0) as f32);
     for i in 0..4 {
         model.sense_svf_g[i] = snap_f32(model.sense_svf_g[i], MIN_TPT_G, 64.0, 0.25);
         model.sense_lru_rel[i] = snap_f32(model.sense_lru_rel[i], 0.0, r_hi, 0.995);
@@ -300,7 +384,12 @@ pub fn snap_non_readout_fp16(model: &mut SonaModelF64) {
         model.sense_tone_bp[i] = snap_fp16(model.sense_tone_bp[i], -16.0, 16.0, 0.0);
         model.sense_tone_hp[i] = snap_fp16(model.sense_tone_hp[i], -16.0, 16.0, 0.0);
         model.tier_gain_trim[i] = snap_f32(model.tier_gain_trim[i], 0.0625, 16.0, 1.0);
-        model.phasor_freq_hz[i] = snap_f32(model.phasor_freq_hz[i], 0.0, 20_000.0, 0.0);
+        model.phasor_freq_hz[i] = snap_f32(
+            model.phasor_freq_hz[i],
+            -phasor_lim_f32,
+            phasor_lim_f32,
+            0.0,
+        );
         model.phasor_stereo_phase[i] =
             snap_fp16(model.phasor_stereo_phase[i], -pi_f32, pi_f32, 0.0);
     }
@@ -352,18 +441,14 @@ pub fn snap_model_fp16(model: &mut SonaModelF64) {
     }
     let theta_hi = core::f32::consts::PI - 1.0e-4;
     for kp in &mut model.kautz {
-        let r = if kp.r_low.is_finite() {
-            (kp.r_low as f32).clamp(0.0, 0.9995)
-        } else {
+        let r_raw = fold_kautz_r_low_with_dr(kp.r_low, kp.dr);
+        let r = if !r_raw.is_finite() || r_raw <= 0.0 {
             0.0
-        };
-        let dr = if kp.dr.is_finite() {
-            (kp.dr as f32).clamp(0.0, (0.9995 - r).max(0.0))
         } else {
-            0.0
+            (r_raw as f32).clamp(0.25, 0.9995)
         };
         kp.r_low = f64::from(r);
-        kp.dr = f64::from(dr);
+        kp.dr = 0.0;
         kp.theta = snap_f32(kp.theta, 0.0, theta_hi, 0.0);
         kp.b_gamma = snap_f32(kp.b_gamma, 0.0, 8.0, 0.0);
         kp.c_re_l = snap_f32(kp.c_re_l, -8.0, 8.0, 0.0);
@@ -413,5 +498,30 @@ mod tests {
         assert_eq!(model.transport_quads, after_first.transport_quads);
         assert_eq!(model.w_ro, after_first.w_ro);
         assert_eq!(model.direct_s2_u_gain, after_first.direct_s2_u_gain);
+
+        let mut mod_m = SonaModelF64::new(48_000.0);
+        mod_m.phasor_freq_hz = [-1_250.0, -30_000.0, 420.0, 30_000.0];
+        mod_m.transport_quads[0].r_dc = 0.985;
+        mod_m.transport_quads[0].freeze_mix = 1.0;
+        mod_m.kautz[0].r_low = 0.10;
+        mod_m.kautz[0].dr = 0.12;
+        mod_m.kautz[1].r_low = 0.0;
+        mod_m.kautz[2].r_low = 0.86;
+        mod_m.kautz[2].dr = 0.002;
+        mod_m.sense_vca_w = [999.0, -999.0, f64::NAN, 12.0];
+        mod_m.tiles[0].w_odd_4x4[0][0] = 16.0;
+        snap_model_fp16(&mut mod_m);
+        assert_eq!(mod_m.phasor_freq_hz[0], -1_250.0);
+        assert!((mod_m.phasor_freq_hz[1] - (-0.49 * 48_000.0)).abs() < 1.0e-2);
+        assert!((mod_m.transport_quads[0].r_dc - 0.985).abs() < 1.0e-6);
+        assert!(mod_m.transport_quads[0].freeze_mix <= 0.999);
+        assert_eq!(mod_m.kautz[0].r_low, 0.25);
+        assert_eq!(mod_m.kautz[0].dr, 0.0);
+        assert_eq!(mod_m.kautz[1].r_low, 0.0);
+        assert_eq!(mod_m.kautz[2].r_low, f64::from(0.861_f32));
+        assert_eq!(mod_m.kautz[2].dr, 0.0);
+        assert_eq!(mod_m.sense_vca_w[0], 512.0);
+        assert_eq!(mod_m.sense_vca_w[1], -512.0);
+        assert_eq!(mod_m.tiles[0].w_odd_4x4[0][0], 8.0);
     }
 }

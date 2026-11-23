@@ -6,7 +6,7 @@ pub(super) mod readouts;
 
 pub(super) use blocks::sanitize_clamp_f32;
 
-use dnam_kernels::MAX_PARALRU_R_F32;
+use dnam_kernels::{MAX_PARALRU_R_F32, fp16_to_f32};
 use dnam_vm::bin::{
     Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire,
     ConvolverFir16Wire, ConvolverFir32Wire, ConvolverFir48Wire, DNBN_FLAG_SINGLE_INPUT,
@@ -78,6 +78,8 @@ pub fn encode_model_to_dnam_bin(
     });
     a0.crossbar.cell_desc.cell_flags = U32::new(meta_flags);
 
+    let phasor_lim_f32 =
+        0.49 * sanitize_clamp_f32(model.sample_rate_hz, 44_100.0, 96_000.0, 48_000.0);
     for i in 0..4 {
         a0.crossbar.sense_svf_g[i] =
             F32::new(sanitize_clamp_f32(model.sense_svf_g[i], 1.0e-5, 64.0, 0.25));
@@ -110,10 +112,11 @@ pub fn encode_model_to_dnam_bin(
         ));
         a0.crossbar.phasor_freq_hz[i] = F32::new(sanitize_clamp_f32(
             model.phasor_freq_hz[i],
-            0.0,
-            20_000.0,
+            -phasor_lim_f32,
+            phasor_lim_f32,
             0.0,
         ));
+        a0.crossbar.phasor_init_phase_q32[i] = U32::new(model.phasor_init_phase_q32[i]);
     }
     a0.crossbar.crossbar_op_gains_fp16 = [
         fp16_clamped(model.crossbar_op_gains[0], -4.0, 4.0, 0.0),
@@ -295,10 +298,11 @@ pub fn encode_model_to_dnam_bin(
         a0.control_bus_lite.rho_head_and_ctrl_tail[0] = F32::new(2.5);
     }
     for idx in 0..4 {
-        a0.control_bus_lite.rho_head_and_ctrl_tail[LITE_OPT_TO_LR_OFFSET + idx * 2] =
-            F32::new(sanitize_clamp_f32(model.opt_to_lr[idx][0], -4.0, 4.0, 0.0));
+        let l_q = fp16_to_f32(fp16_clamped(model.opt_to_lr[idx][0], -4.0, 4.0, 0.0).get());
+        let r_q = fp16_to_f32(fp16_clamped(model.opt_to_lr[idx][1], -4.0, 4.0, 0.0).get());
+        a0.control_bus_lite.rho_head_and_ctrl_tail[LITE_OPT_TO_LR_OFFSET + idx * 2] = F32::new(l_q);
         a0.control_bus_lite.rho_head_and_ctrl_tail[LITE_OPT_TO_LR_OFFSET + idx * 2 + 1] =
-            F32::new(sanitize_clamp_f32(model.opt_to_lr[idx][1], -4.0, 4.0, 0.0));
+            F32::new(r_q);
     }
     a0.control_bus_lite.tank_dry_mix_fp16 = fp16_clamped(model.tank_dry_mix, -2.0, 2.0, 1.0);
     let mut ro_pole = sanitize_clamp_f32(model.ro_pole_48k, 0.0, MAX_RO_POLE_48K_F32, 0.0);

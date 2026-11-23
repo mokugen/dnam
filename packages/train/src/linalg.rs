@@ -7,9 +7,10 @@ pub mod spectral_kkt;
 pub mod varpro;
 
 pub use cholesky::{
-    MIN_CHOLESKY_RIDGE, checked_uplo_u_packed_len, factorize_uplo_u_cholesky,
-    solve_factorized_uplo_u, solve_factorized_uplo_u_2ch, solve_uplo_adaptive_ridge,
-    solve_uplo_norm_bounded, solve_uplo_u_cholesky, solve_uplo_u_cholesky_2ch, symv_uplo_u,
+    MIN_CHOLESKY_RIDGE, PcgRefinementSpec, checked_uplo_u_packed_len, factorize_uplo_u_cholesky,
+    refine_cholesky_lsq_pcg_f64, solve_factorized_uplo_u, solve_factorized_uplo_u_2ch,
+    solve_uplo_adaptive_ridge, solve_uplo_norm_bounded, solve_uplo_u_cholesky,
+    solve_uplo_u_cholesky_2ch, symv_uplo_u,
 };
 pub use lbfgs::{
     LbfgsConfig, LbfgsResult, ParamBoundSpec, TwoLoopLbfgs, WhitenedLbfgs, step_runner_inner_opt,

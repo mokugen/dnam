@@ -1,61 +1,29 @@
 //! SSOT `STAT` `256 × 256` `uplo='U'` sufficient-statistics extraction and multi-stem
 //! weighted Cholesky readout patching over `SonaModelF64` (`ref[train.pipeline.nested-varpro-schur]`).
 
-use dnam_kernels::{f32_to_fp16, fp16_to_f32};
+mod solve;
 
 use crate::error::TrainError;
-use crate::linalg::cholesky::solve_uplo_u_cholesky;
 use crate::linalg::varpro::assemble_ozaki_normal_equations;
 use crate::runner::{ActiveComputeBackend, TrainRunner};
-use crate::wide_gram::{contract_256d_gram_tiled_wide192, uplo_u_index, uplo_u_packed_len};
+use crate::wide_gram::{contract_256d_gram_tiled_wide192, uplo_u_packed_len};
 
-use super::super::model::{SonaModelF64, StereoTrainingPairs, TierReadoutPrefixF64};
+use super::super::model::{SonaModelF64, StereoTrainingPairs};
 use super::eval_hp_post_for_ro;
-use super::features::{TIER_KAUTZ_CAPS, build_pass3_feature_sets, unpack_weights_into_prefix};
-use super::gram_snap::{build_tier_fp16_col_bounds, snap_weights_gram_coordinate};
+use super::features::{
+    StereoFeatureSet, TIER_KAUTZ_CAPS, build_pass3_feature_sets, has_higher_tier_wet_op_t,
+    has_upper_tier_wet_op_t, unpack_weights_into_prefix,
+};
+use super::gram_snap::{build_tier_col_wire_specs, snap_weights_gram_coordinate};
+use solve::{
+    OzakiStemChannel, StereoOzakiRefineCtx, compute_col_rhs_f64, eval_quad_error_channel,
+    pack_existing_weights_for_tier, refine_stereo_ozaki_if_single_stem,
+    snap_prefix_readout_weights, solve_anchored_uplo_u,
+};
 
 /// Borrowed stereo stem tuple `(in_l, in_r, target_l, target_r, weight)` passed to
 /// [`patch_model_readouts_weighted_cholesky`].
 pub type WeightedReadoutStem<'a> = (&'a [f64], &'a [f64], &'a [f64], &'a [f64], f64);
-
-#[inline]
-fn snap_ro_fp16(v: f64) -> f64 {
-    let x = if v.is_finite() {
-        (v as f32).clamp(-64.0, 64.0)
-    } else {
-        0.0
-    };
-    let s = fp16_to_f32(f32_to_fp16(if x == 0.0 { 0.0 } else { x }));
-    f64::from(if s == 0.0 { 0.0 } else { s })
-}
-
-#[inline]
-fn snap_fir_f32(v: f64) -> f64 {
-    let x = if v.is_finite() {
-        (v as f32).clamp(-16.0, 16.0)
-    } else {
-        0.0
-    };
-    f64::from(if x == 0.0 { 0.0 } else { x })
-}
-
-fn snap_prefix_readout_weights(pfx: &mut TierReadoutPrefixF64) {
-    for c in 0..2 {
-        pfx.pre_conv_u_gain[c] = snap_ro_fp16(pfx.pre_conv_u_gain[c]);
-        pfx.pre_conv_hp_gain[c] = snap_ro_fp16(pfx.pre_conv_hp_gain[c]);
-        pfx.direct_s2_u_gain[c] = snap_ro_fp16(pfx.direct_s2_u_gain[c]);
-        pfx.direct_s2_hp_gain[c] = snap_ro_fp16(pfx.direct_s2_hp_gain[c]);
-    }
-    for row in &mut pfx.w_ro {
-        for cell in row {
-            *cell = snap_ro_fp16(*cell);
-        }
-    }
-    for i in 0..pfx.fir_l.len() {
-        pfx.fir_l[i] = snap_fir_f32(pfx.fir_l[i]);
-        pfx.fir_r[i] = snap_fir_f32(pfx.fir_r[i]);
-    }
-}
 
 /// Contracts the `256 × 256` `uplo='U'` Gram matrix (`32,896` scalars) and stereo cross vector
 /// (`[[f64; 2]; 256]`) over `model`'s post-warmup Pass-3 feature bus
@@ -105,6 +73,7 @@ pub fn extract_stat_256d_gram(
         m_tmp.ro_pole_48k,
         w,
         false,
+        4,
     );
     fset.feats_l_post[m..(2 * m)].copy_from_slice(&hp_l);
 
@@ -208,165 +177,29 @@ fn assemble_stereo_gram_rhs(
     })
 }
 
-fn pack_existing_weights_for_tier(
-    model: &SonaModelF64,
-    active_taps: usize,
-    max_tier_idx: usize,
-) -> (Vec<f64>, Vec<f64>, Vec<bool>) {
-    let pfx_opt = model.tier_overrides[max_tier_idx].as_deref();
-    let dir_u = pfx_opt.map_or(model.direct_s2_u_gain, |p| p.direct_s2_u_gain);
-    let dir_hp = pfx_opt.map_or(model.direct_s2_hp_gain, |p| p.direct_s2_hp_gain);
-    let w_ro = pfx_opt.map_or(&model.w_ro, |p| &p.w_ro);
-    let fir_l = pfx_opt.map_or(&model.fir_l, |p| &p.fir_l);
-    let fir_r = pfx_opt.map_or(&model.fir_r, |p| &p.fir_r);
-
-    let mut wl = vec![dir_u[0], dir_hp[0]];
-    let mut wr = vec![dir_u[1], dir_hp[1]];
-    let mut is_broadband_col = vec![true, true];
-    let tier_defs = [
-        (0..16_usize, 0..active_taps.min(32)),
-        (
-            16..24_usize,
-            32..(32 + active_taps.saturating_sub(32).min(16)),
-        ),
-        (
-            24..32_usize,
-            48..(48 + active_taps.saturating_sub(48).min(48)),
-        ),
-        (
-            32..40_usize,
-            96..(96 + active_taps.saturating_sub(96).min(32)),
-        ),
-    ];
-    for (ti, (lane_range, fir_range)) in tier_defs.into_iter().enumerate() {
-        if ti > max_tier_idx {
-            break;
-        }
-        for l in lane_range {
-            wl.push(w_ro[l][6]);
-            wr.push(w_ro[l][7]);
-            wl.push(w_ro[l][8]);
-            wr.push(w_ro[l][9]);
-            wl.push(w_ro[l][10]);
-            wr.push(w_ro[l][11]);
-            is_broadband_col.extend_from_slice(&[false, false, false]);
-        }
-        for k in fir_range {
-            wl.push(fir_l[k]);
-            wr.push(fir_r[k]);
-            is_broadband_col.push(ti == 0 && k == 0);
-        }
+fn accumulate_weighted_stereo_gram_rhs(
+    acc: &mut Option<StereoGramRhs>,
+    add: &StereoGramRhs,
+    weight: f64,
+) {
+    let buf = acc.get_or_insert_with(|| StereoGramRhs {
+        gram_l: vec![0.0; add.gram_l.len()],
+        rhs_l: vec![0.0; add.rhs_l.len()],
+        gram_r: vec![0.0; add.gram_r.len()],
+        rhs_r: vec![0.0; add.rhs_r.len()],
+    });
+    for (dst, &val) in buf.gram_l.iter_mut().zip(&add.gram_l) {
+        *dst += weight * val;
     }
-    (wl, wr, is_broadband_col)
-}
-
-fn solve_anchored_uplo_u(
-    gram: &[f64],
-    rhs: &[f64],
-    anchor: &[f64],
-    is_broadband_col: &[bool],
-    dim: usize,
-) -> Result<(Vec<f64>, f64), TrainError> {
-    let mut trace = 0.0_f64;
-    for j in 0..dim {
-        trace += gram[uplo_u_index(j, j)].max(0.0);
+    for (dst, &val) in buf.rhs_l.iter_mut().zip(&add.rhs_l) {
+        *dst += weight * val;
     }
-    let mean_diag = (trace / (dim.max(1) as f64)).max(1.0e-12);
-    let zero_anchor = anchor.iter().take(dim).all(|&v| v == 0.0);
-    let (anchor_lam_broadband, anchor_lam_detail) = if zero_anchor {
-        (0.0, 0.0)
-    } else {
-        (1.0e-5 * mean_diag, 5.0e-2 * mean_diag)
-    };
-    let schedule: &[f64] = if zero_anchor {
-        &[1.0e-12, 1.0e-9, 1.0e-6, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0]
-    } else {
-        &[1.0e-6, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0]
-    };
-
-    let mut r_anchored = rhs[..dim].to_vec();
-    if !zero_anchor {
-        for (j, &w0) in anchor.iter().enumerate().take(dim) {
-            let col_lam = if is_broadband_col.get(j).copied().unwrap_or(false) {
-                anchor_lam_broadband
-            } else {
-                anchor_lam_detail
-            };
-            r_anchored[j] += col_lam * w0;
-        }
+    for (dst, &val) in buf.gram_r.iter_mut().zip(&add.gram_r) {
+        *dst += weight * val;
     }
-
-    let mut last_sol = vec![0.0_f64; dim];
-    let mut last_ridge = (anchor_lam_broadband + schedule[0] * mean_diag).max(1.0e-16);
-    let mut g_work = vec![0.0_f64; gram.len()];
-
-    for &rel in schedule {
-        g_work.copy_from_slice(gram);
-        let diag_reg = (rel * mean_diag).max(1.0e-15);
-        for j in 0..dim {
-            let col_lam = if zero_anchor {
-                0.0
-            } else if is_broadband_col.get(j).copied().unwrap_or(false) {
-                anchor_lam_broadband
-            } else {
-                anchor_lam_detail
-            };
-            g_work[uplo_u_index(j, j)] += col_lam + diag_reg;
-        }
-        let chol_ridge = (0.01 * rel * mean_diag).max(1.0e-16);
-        if let Ok(sol) = solve_uplo_u_cholesky(&g_work, &r_anchored, chol_ridge)
-            && sol.iter().all(|v| v.is_finite())
-        {
-            last_sol = sol;
-            last_ridge = anchor_lam_broadband + diag_reg + chol_ridge;
-            let bounds_ok = last_sol.iter().all(|&v| v.abs() <= 7.5);
-            let delta_ok = zero_anchor
-                || last_sol
-                    .iter()
-                    .zip(anchor.iter())
-                    .take(dim)
-                    .all(|(&s, &a)| (s - a).abs() <= 2.5);
-            if bounds_ok && delta_ok {
-                return Ok((last_sol, last_ridge));
-            }
-        }
+    for (dst, &val) in buf.rhs_r.iter_mut().zip(&add.rhs_r) {
+        *dst += weight * val;
     }
-
-    for v in &mut last_sol {
-        *v = if v.is_finite() {
-            v.clamp(-7.5, 7.5)
-        } else {
-            0.0
-        };
-    }
-    Ok((last_sol, last_ridge))
-}
-
-fn eval_quad_error_channel(w: &[f64], gram_sub: &[f64], rhs_sub: &[f64], y_sq: f64) -> f64 {
-    let dim = rhs_sub.len().min(w.len());
-    let mut quad = 0.0_f64;
-    let mut dot_rhs = 0.0_f64;
-    for j in 0..dim {
-        let wj = w[j];
-        dot_rhs += wj * rhs_sub[j];
-        quad += wj * wj * gram_sub[uplo_u_index(j, j)];
-        for i in 0..j {
-            quad += 2.0 * w[i] * wj * gram_sub[uplo_u_index(i, j)];
-        }
-    }
-    (y_sq - 2.0 * dot_rhs + quad).max(0.0)
-}
-
-fn compute_col_rhs_f64(feats_post: &[f32], tgts: &[f32], m: usize, dim: usize) -> Vec<f64> {
-    (0..dim)
-        .map(|c| {
-            feats_post[c * m..(c + 1) * m]
-                .iter()
-                .zip(tgts)
-                .map(|(&f, &y)| f64::from(f) * f64::from(y))
-                .sum::<f64>()
-        })
-        .collect()
 }
 
 /// Solves a fast weighted multi-stem `uplo='U'` Cholesky readout patch across all 4 nested tiers
@@ -377,6 +210,20 @@ pub fn patch_model_readouts_weighted_cholesky(
     stems: &[WeightedReadoutStem<'_>],
     warmup: usize,
 ) -> Result<(), TrainError> {
+    let force_wide192 = matches!(
+        runner.active_backend(),
+        ActiveComputeBackend::CpuSimd { .. }
+    );
+    patch_model_readouts_weighted_cholesky_inner(runner, model, stems, warmup, force_wide192)
+}
+
+fn patch_model_readouts_weighted_cholesky_inner(
+    runner: &TrainRunner,
+    model: &mut SonaModelF64,
+    stems: &[WeightedReadoutStem<'_>],
+    warmup: usize,
+    force_wide192: bool,
+) -> Result<(), TrainError> {
     if stems.is_empty() {
         return Err(TrainError::InvalidDimensions {
             context: "patch_model_readouts_weighted_cholesky",
@@ -385,10 +232,6 @@ pub fn patch_model_readouts_weighted_cholesky(
         });
     }
 
-    let force_wide192 = matches!(
-        runner.active_backend(),
-        ActiveComputeBackend::CpuSimd { .. }
-    );
     let active_k = model.active_kautz_pairs.min(model.kautz.len());
     let mut total_dims: Option<[usize; 4]> = None;
     let mut active_fir_taps = 0_usize;
@@ -399,10 +242,9 @@ pub fn patch_model_readouts_weighted_cholesky(
     let mut rhs_r_acc = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut y_sq_l_acc = [0.0_f64; 4];
     let mut y_sq_r_acc = [0.0_f64; 4];
-    let mut gram_l_1x_acc: Option<Vec<f64>> = None;
-    let mut rhs_l_1x_acc: Option<Vec<f64>> = None;
-    let mut gram_r_1x_acc: Option<Vec<f64>> = None;
-    let mut rhs_r_1x_acc: Option<Vec<f64>> = None;
+    let mut lite_1x_acc: Option<StereoGramRhs> = None;
+    let mut tier_opt_acc: [Option<StereoGramRhs>; 3] = [None, None, None];
+    let mut single_stem_fset: Option<(StereoFeatureSet, f64, usize)> = None;
     let mut used_stems = 0_usize;
 
     for &(in_l, in_r, tgt_l, tgt_r, weight) in stems {
@@ -431,6 +273,7 @@ pub fn patch_model_readouts_weighted_cholesky(
             model.ro_pole_48k,
             w,
             false,
+            4,
         );
         let hp_r = eval_hp_post_for_ro(
             model,
@@ -439,6 +282,7 @@ pub fn patch_model_readouts_weighted_cholesky(
             model.ro_pole_48k,
             w,
             true,
+            4,
         );
         fset.feats_l_post[m..(2 * m)].copy_from_slice(&hp_l);
         fset.feats_r_post[m..(2 * m)].copy_from_slice(&hp_r);
@@ -487,7 +331,8 @@ pub fn patch_model_readouts_weighted_cholesky(
             y_sq_l_acc[ti] += weight * e_yl;
             y_sq_r_acc[ti] += weight * e_yr;
 
-            if ti == 3 || active_k <= TIER_KAUTZ_CAPS[ti] {
+            if ti == 3 || (active_k <= TIER_KAUTZ_CAPS[ti] && !has_higher_tier_wet_op_t(model, ti))
+            {
                 for (dst, &val) in rhs_l_acc[ti].iter_mut().zip(&rl_v[..dim_t]) {
                     *dst += weight * val;
                 }
@@ -520,17 +365,20 @@ pub fn patch_model_readouts_weighted_cholesky(
                 model.ro_pole_48k,
                 w,
                 false,
+                1,
             );
-            let h1_r =
-                eval_hp_post_for_ro(model, &fset.lite_1x_raw_r, None, model.ro_pole_48k, w, true);
+            let h1_r = eval_hp_post_for_ro(
+                model,
+                &fset.lite_1x_raw_r,
+                None,
+                model.ro_pole_48k,
+                w,
+                true,
+                1,
+            );
             fl[m..(2 * m)].copy_from_slice(&h1_l);
             fr[m..(2 * m)].copy_from_slice(&h1_r);
-            let StereoGramRhs {
-                gram_l: g1l,
-                rhs_l: r1l,
-                gram_r: g1r,
-                rhs_r: r1r,
-            } = assemble_stereo_gram_rhs(
+            let step_1x = assemble_stereo_gram_rhs(
                 runner,
                 &StereoGramFeatures {
                     feats_l: fl,
@@ -542,25 +390,57 @@ pub fn patch_model_readouts_weighted_cholesky(
                     force_wide192,
                 },
             )?;
-            let gl1_buf = gram_l_1x_acc.get_or_insert_with(|| vec![0.0; g1l.len()]);
-            let rl1_buf = rhs_l_1x_acc.get_or_insert_with(|| vec![0.0; d0]);
-            let gr1_buf = gram_r_1x_acc.get_or_insert_with(|| vec![0.0; g1r.len()]);
-            let rr1_buf = rhs_r_1x_acc.get_or_insert_with(|| vec![0.0; d0]);
-            for (dst, &val) in gl1_buf.iter_mut().zip(&g1l) {
-                *dst += weight * val;
-            }
-            for (dst, &val) in rl1_buf.iter_mut().zip(&r1l) {
-                *dst += weight * val;
-            }
-            for (dst, &val) in gr1_buf.iter_mut().zip(&g1r) {
-                *dst += weight * val;
-            }
-            for (dst, &val) in rr1_buf.iter_mut().zip(&r1r) {
-                *dst += weight * val;
+            accumulate_weighted_stereo_gram_rhs(&mut lite_1x_acc, &step_1x, weight);
+        }
+
+        for ti in 0..3 {
+            let dim_t = fset.dims[ti];
+            let (raw_l_2x, raw_r_2x) = (fset.raw_l_2x.as_deref(), fset.raw_r_2x.as_deref());
+            if let Some((ref mut fl_t, ref mut fr_t)) = fset.tier_opt_feats_post[ti] {
+                let ht_l = eval_hp_post_for_ro(
+                    model,
+                    &fset.raw_l_col0,
+                    raw_l_2x,
+                    model.ro_pole_48k,
+                    w,
+                    false,
+                    ti + 1,
+                );
+                let ht_r = eval_hp_post_for_ro(
+                    model,
+                    &fset.raw_r_col0,
+                    raw_r_2x,
+                    model.ro_pole_48k,
+                    w,
+                    true,
+                    ti + 1,
+                );
+                fl_t[m..(2 * m)].copy_from_slice(&ht_l);
+                fr_t[m..(2 * m)].copy_from_slice(&ht_r);
+                let step_opt = assemble_stereo_gram_rhs(
+                    runner,
+                    &StereoGramFeatures {
+                        feats_l: fl_t,
+                        feats_r: fr_t,
+                        tgts_l: &fset.tier_tgts_l_prefix[ti],
+                        tgts_r: &fset.tier_tgts_r_prefix[ti],
+                        num_frames: m,
+                        dim: dim_t,
+                        force_wide192,
+                    },
+                )?;
+                accumulate_weighted_stereo_gram_rhs(&mut tier_opt_acc[ti], &step_opt, weight);
             }
         }
 
         used_stems += 1;
+        if !force_wide192 {
+            single_stem_fset = if used_stems == 1 {
+                Some((fset, weight, m))
+            } else {
+                None
+            };
+        }
     }
 
     let Some(dims) = total_dims else {
@@ -571,20 +451,52 @@ pub fn patch_model_readouts_weighted_cholesky(
         });
     };
 
-    if !model.oversample_upper_tiers_2x {
+    let has_upper_opt = has_upper_tier_wet_op_t(model);
+    if !model.oversample_upper_tiers_2x && !has_upper_opt {
         let d_ultra = dims[3];
         let (w0_l, w0_r, is_broadband) = pack_existing_weights_for_tier(model, active_fir_taps, 3);
         let zero_anchor_u = w0_l.iter().chain(&w0_r).all(|&v| v == 0.0);
         if zero_anchor_u {
-            let (wl_u, ridge_l) =
+            let mut sol_l =
                 solve_anchored_uplo_u(&gram_l_acc, &rhs_l_acc[3], &w0_l, &is_broadband, d_ultra)?;
-            let (wr_u, ridge_r) =
+            let mut sol_r =
                 solve_anchored_uplo_u(&gram_r_acc, &rhs_r_acc[3], &w0_r, &is_broadband, d_ultra)?;
-            let fp16_bounds_nested = build_tier_fp16_col_bounds(3, active_fir_taps, false);
-            let wl_snap =
-                snap_weights_gram_coordinate(&wl_u, &gram_l_acc, ridge_l, &fp16_bounds_nested);
-            let wr_snap =
-                snap_weights_gram_coordinate(&wr_u, &gram_r_acc, ridge_r, &fp16_bounds_nested);
+            if let Some((ref fset, sw, sm)) = single_stem_fset {
+                refine_stereo_ozaki_if_single_stem(
+                    &mut sol_l,
+                    &mut sol_r,
+                    &StereoOzakiRefineCtx {
+                        left: OzakiStemChannel {
+                            feats: &fset.feats_l_post,
+                            tgts: &fset.tgts_l_post,
+                            num_frames: sm,
+                            weight: sw,
+                        },
+                        right: OzakiStemChannel {
+                            feats: &fset.feats_r_post,
+                            tgts: &fset.tgts_r_post,
+                            num_frames: sm,
+                            weight: sw,
+                        },
+                        w0_l: &w0_l,
+                        w0_r: &w0_r,
+                        dim: d_ultra,
+                    },
+                );
+            }
+            let col_specs_nested = build_tier_col_wire_specs(3, active_fir_taps, false);
+            let wl_snap = snap_weights_gram_coordinate(
+                &sol_l.sol,
+                &gram_l_acc,
+                &sol_l.lambda_diag,
+                &col_specs_nested,
+            );
+            let wr_snap = snap_weights_gram_coordinate(
+                &sol_r.sol,
+                &gram_r_acc,
+                &sol_r.lambda_diag,
+                &col_specs_nested,
+            );
 
             let err_nested: [f64; 4] = core::array::from_fn(|ti| {
                 let dt = dims[ti];
@@ -633,18 +545,34 @@ pub fn patch_model_readouts_weighted_cholesky(
     for (ti, &dim_t) in dims.iter().enumerate() {
         let packed_len = uplo_u_packed_len(dim_t);
         let (w0_l, w0_r, is_broadband) = pack_existing_weights_for_tier(model, active_fir_taps, ti);
-        let ((wl, ridge_l), (wr, ridge_r), gl_use, gr_use) = if ti == 0
-            && let (Some(g1l), Some(r1l), Some(g1r), Some(r1r)) = (
-                gram_l_1x_acc.as_deref(),
-                rhs_l_1x_acc.as_deref(),
-                gram_r_1x_acc.as_deref(),
-                rhs_r_1x_acc.as_deref(),
-            ) {
+        let use_1x = ti == 0 && lite_1x_acc.is_some();
+        let use_tier_opt = !use_1x && ti < 3 && tier_opt_acc[ti].is_some();
+        let (mut sol_l, mut sol_r, gl_use, gr_use) = if use_1x && let Some(ref acc_1x) = lite_1x_acc
+        {
             (
-                solve_anchored_uplo_u(g1l, r1l, &w0_l, &is_broadband, dim_t)?,
-                solve_anchored_uplo_u(g1r, r1r, &w0_r, &is_broadband, dim_t)?,
-                g1l,
-                g1r,
+                solve_anchored_uplo_u(&acc_1x.gram_l, &acc_1x.rhs_l, &w0_l, &is_broadband, dim_t)?,
+                solve_anchored_uplo_u(&acc_1x.gram_r, &acc_1x.rhs_r, &w0_r, &is_broadband, dim_t)?,
+                acc_1x.gram_l.as_slice(),
+                acc_1x.gram_r.as_slice(),
+            )
+        } else if use_tier_opt && let Some(ref acc_opt) = tier_opt_acc[ti] {
+            (
+                solve_anchored_uplo_u(
+                    &acc_opt.gram_l,
+                    &acc_opt.rhs_l,
+                    &w0_l,
+                    &is_broadband,
+                    dim_t,
+                )?,
+                solve_anchored_uplo_u(
+                    &acc_opt.gram_r,
+                    &acc_opt.rhs_r,
+                    &w0_r,
+                    &is_broadband,
+                    dim_t,
+                )?,
+                acc_opt.gram_l.as_slice(),
+                acc_opt.gram_r.as_slice(),
             )
         } else {
             (
@@ -666,9 +594,58 @@ pub fn patch_model_readouts_weighted_cholesky(
                 &gram_r_acc[..packed_len],
             )
         };
-        let fp16_bounds = build_tier_fp16_col_bounds(ti, active_fir_taps, true);
-        let wl_snap = snap_weights_gram_coordinate(&wl, gl_use, ridge_l, &fp16_bounds);
-        let wr_snap = snap_weights_gram_coordinate(&wr, gr_use, ridge_r, &fp16_bounds);
+        if let Some((ref fset, sw, sm)) = single_stem_fset {
+            let (fl, tl, fr, tr) = if use_1x
+                && let (Some(f1l), Some(t1l), Some(f1r), Some(t1r)) = (
+                    fset.lite_1x_l_post.as_deref(),
+                    fset.lite_1x_tgts_l_post.as_deref(),
+                    fset.lite_1x_r_post.as_deref(),
+                    fset.lite_1x_tgts_r_post.as_deref(),
+                ) {
+                (f1l, t1l, f1r, t1r)
+            } else if use_tier_opt && let Some((ref fl_t, ref fr_t)) = fset.tier_opt_feats_post[ti]
+            {
+                (
+                    fl_t.as_slice(),
+                    fset.tier_tgts_l(ti),
+                    fr_t.as_slice(),
+                    fset.tier_tgts_r(ti),
+                )
+            } else {
+                (
+                    fset.feats_l_post.as_slice(),
+                    fset.tier_tgts_l(ti),
+                    fset.feats_r_post.as_slice(),
+                    fset.tier_tgts_r(ti),
+                )
+            };
+            refine_stereo_ozaki_if_single_stem(
+                &mut sol_l,
+                &mut sol_r,
+                &StereoOzakiRefineCtx {
+                    left: OzakiStemChannel {
+                        feats: fl,
+                        tgts: tl,
+                        num_frames: sm,
+                        weight: sw,
+                    },
+                    right: OzakiStemChannel {
+                        feats: fr,
+                        tgts: tr,
+                        num_frames: sm,
+                        weight: sw,
+                    },
+                    w0_l: &w0_l,
+                    w0_r: &w0_r,
+                    dim: dim_t,
+                },
+            );
+        }
+        let col_specs = build_tier_col_wire_specs(ti, active_fir_taps, true);
+        let wl_snap =
+            snap_weights_gram_coordinate(&sol_l.sol, gl_use, &sol_l.lambda_diag, &col_specs);
+        let wr_snap =
+            snap_weights_gram_coordinate(&sol_r.sol, gr_use, &sol_r.lambda_diag, &col_specs);
         let mut pfx =
             unpack_weights_into_prefix(&wl_snap, &wr_snap, active_fir_taps, pc_gain, ti, model);
         snap_prefix_readout_weights(&mut pfx);
@@ -685,7 +662,7 @@ pub fn patch_model_readouts_weighted_cholesky(
         }
         model.tier_overrides[ti] = Some(Box::new(pfx));
     }
-    if model.oversample_upper_tiers_2x || dims[3] > dims[0] {
+    if model.oversample_upper_tiers_2x || dims[3] > dims[0] || has_upper_opt {
         model.prefix_override_needed = [false, true, true, true];
     }
 
@@ -799,5 +776,120 @@ mod tests {
                 err2 / sig2.max(1.0e-12)
             );
         }
+    }
+
+    #[test]
+    fn test_patch_ozaki_pcg_true_stereo_multi_quad_and_multistem_paths() {
+        let runner = TrainRunner::cpu();
+        let n = 512_usize;
+        let xl: Vec<f64> = (0..n)
+            .map(|t| 0.30 * (core::f64::consts::TAU * 220.0 * (t as f64) / 48_000.0).sin())
+            .collect();
+        let xr: Vec<f64> = (0..n)
+            .map(|t| 0.25 * (core::f64::consts::TAU * 370.0 * (t as f64) / 48_000.0).cos())
+            .collect();
+        let tl: Vec<f64> = xl.iter().map(|&v| 0.65 * v).collect();
+        let tr: Vec<f64> = xr.iter().map(|&v| -0.45 * v).collect();
+
+        // 1. True-stereo + multi-quad wet Op-T + active_k = 16 via CPU Ozaki (`force_wide192 = false`).
+        let mut m1 = SonaModelF64::new(48_000.0);
+        m1.oversample_upper_tiers_2x = false;
+        m1.active_kautz_pairs = 16;
+        for k in 0..16 {
+            m1.kautz[k].r_low = 0.85;
+            m1.kautz[k].theta = 0.1 + 0.08 * (k as f64);
+            m1.kautz[k].b_gamma = 0.2;
+        }
+        for q in 0..2 {
+            m1.transport_quads[q].input_gains = [0.25; 4];
+            m1.transport_quads[q].wet_tap_l = [0.15, 0.0, 0.0, 0.0];
+            m1.transport_quads[q].wet_tap_r = [0.0, 0.15, 0.0, 0.0];
+        }
+        patch_model_readouts_weighted_cholesky_inner(
+            &runner,
+            &mut m1,
+            &[(&xl, &xr, &tl, &tr, 1.0)],
+            32,
+            false,
+        )
+        .unwrap();
+        assert_eq!(m1.prefix_override_needed, [false, true, true, true]);
+        assert!(m1.tier_overrides.iter().all(Option::is_some));
+
+        // 2. 2x oversampled Ozaki + single-stem PCG path (`use_1x = true`), plus multi-stem + degenerate skips.
+        let mut m2 = SonaModelF64::new(48_000.0);
+        m2.oversample_upper_tiers_2x = true;
+        patch_model_readouts_weighted_cholesky_inner(
+            &runner,
+            &mut m2,
+            &[(&xl, &xr, &tl, &tr, 1.0)],
+            32,
+            false,
+        )
+        .unwrap();
+        assert!((m2.direct_s2_u_gain[0] - 0.65).abs() < 0.1);
+
+        let mut m3 = SonaModelF64::new(48_000.0);
+        m3.oversample_upper_tiers_2x = false;
+        patch_model_readouts_weighted_cholesky_inner(
+            &runner,
+            &mut m3,
+            &[
+                (&xl, &xr, &tl, &tr, 0.0), // skipped: non-positive weight
+                (&xl[..32], &xr[..32], &tl[..32], &tr[..32], 1.0), // skipped: m < 32
+                (&xl, &xr, &tl, &tr, 0.5),
+                (&xl, &xr, &tl, &tr, 0.5),
+            ],
+            32,
+            false,
+        )
+        .unwrap();
+        assert!((m3.direct_s2_u_gain[0] - 0.65).abs() < 0.05);
+        assert!(
+            patch_model_readouts_weighted_cholesky_inner(
+                &runner,
+                &mut m3,
+                &[(&xl, &xr, &tl, &tr, 0.0)],
+                32,
+                false,
+            )
+            .is_err()
+        );
+
+        // 3. Single-stem 1x zero-anchor Ozaki nested shortcut (mono features), then non-zero-anchor fallback.
+        let xm: Vec<f64> = (0..n)
+            .map(|t| (((t * 1_664_525 + 1_013_904_223) % 997) as f64 / 997.0) - 0.5)
+            .collect();
+        let tl_n: Vec<f64> = (0..n)
+            .map(|t| {
+                0.4 * xm[t]
+                    + if t >= 36 { 0.25 * xm[t - 36] } else { 0.0 }
+                    + if t >= 56 { 0.20 * xm[t - 56] } else { 0.0 }
+                    + if t >= 100 { 0.15 * xm[t - 100] } else { 0.0 }
+            })
+            .collect();
+        let mut m4 = SonaModelF64::new(48_000.0);
+        m4.oversample_upper_tiers_2x = false;
+        m4.direct_s2_u_gain = [0.0, 0.0];
+        m4.active_fir_taps = 128;
+        patch_model_readouts_weighted_cholesky_inner(
+            &runner,
+            &mut m4,
+            &[(&xm, &xm, &tl_n, &tl_n, 1.0)],
+            32,
+            false,
+        )
+        .unwrap();
+        assert_eq!(m4.prefix_override_needed, [false; 4]);
+        assert!(m4.fir_l[36].abs() > 0.15);
+        patch_model_readouts_weighted_cholesky_inner(
+            &runner,
+            &mut m4,
+            &[(&xm, &xm, &tl_n, &tl_n, 1.0)],
+            32,
+            false,
+        )
+        .unwrap();
+        assert!(m4.tier_overrides[3].is_some());
     }
 }

@@ -6,14 +6,16 @@ use dnam_kernels::{f32_to_fp16, fp16_to_f32};
 use crate::error::TrainError;
 use crate::runner::TrainRunner;
 
-use super::super::model::cascade::{run_causal_core_cascade_stereo, upsample_stereo_2x_f64};
+use super::super::model::cascade::{
+    CascadeCrossbarSpec, run_causal_core_cascade_with_crossbar, upsample_stereo_2x_f64,
+};
 use super::super::model::{KautzPairF64, NUM_KAUTZ_PAIRS_ULTRA, SonaModelF64};
 use super::super::pass1_probe::kautz_fit::{
     KautzFitInputs, append_log_octave_h2_candidates, fit_early_fir_taps, fit_joint_kautz_bank,
     residual_after_fir,
 };
-use super::super::pass2_opt::eval_op_n_pre_and_adjoint;
-use super::features::build_pre_conv_bus;
+use super::super::pass2_opt::crossbar::{eval_crossbar_forward, eval_crossbar_forward_os2x};
+use super::features::{build_pre_conv_bus, eval_pass3_frontend_1x};
 use super::{
     Pass3InnerOutcome, Pass3VarProReport, StereoVarProPairs,
     run_pass3_varpro_readout_with_os2x_fallback,
@@ -99,22 +101,23 @@ pub(super) fn maybe_refine_with_pre_conv_projection(
         return Ok(cur_report);
     }
 
-    let (ux_l, _, _) = eval_op_n_pre_and_adjoint(
-        &in_l[..n],
-        cand.op_n_pre_gamma_bc,
-        cand.op_n_pre_beta_q,
-        None,
-        None,
-    );
-    let (ux_r, _, _) = eval_op_n_pre_and_adjoint(
-        &in_r[..n],
-        cand.op_n_pre_gamma_bc,
-        cand.op_n_pre_beta_q,
-        None,
-        None,
-    );
+    let (u_sense_l, u_sense_r, ux_l, ux_r) = eval_pass3_frontend_1x(&cand, &in_l[..n], &in_r[..n]);
     let rho_1x = 48_000.0 / cand.sample_rate_hz.max(8_000.0);
-    let cas_1x = run_causal_core_cascade_stereo(runner, &cand, &ux_l, &ux_r, 4, rho_1x, false)?;
+    let cb_1x = eval_crossbar_forward(&cand, &u_sense_l, &u_sense_r, 4, false);
+    let cas_1x = run_causal_core_cascade_with_crossbar(
+        runner,
+        &cand,
+        &ux_l,
+        &ux_r,
+        CascadeCrossbarSpec {
+            active_quads: 4,
+            rho_core: rho_1x,
+            write_checkpoints: false,
+            crossbar_add: cb_1x
+                .active
+                .then_some((cb_1x.cb_add_l.as_slice(), cb_1x.cb_add_r.as_slice())),
+        },
+    )?;
     cand.pre_conv_u_gain = [0.0, 0.0];
     let saved_pc_hp = cand.pre_conv_hp_gain;
     cand.pre_conv_hp_gain = [0.0, 0.0];
@@ -138,8 +141,21 @@ pub(super) fn maybe_refine_with_pre_conv_projection(
         if cand.oversample_upper_tiers_2x {
             let (up_l, up_r) = upsample_stereo_2x_f64(&ux_l, &ux_r, cand.os_up_quad_coeff);
             let rho_2x = 0.5 * rho_1x;
-            let cas_2x =
-                run_causal_core_cascade_stereo(runner, &cand, &up_l, &up_r, 10, rho_2x, false)?;
+            let cb_2x = eval_crossbar_forward_os2x(&cand, &u_sense_l, &u_sense_r, 10, true);
+            let cas_2x = run_causal_core_cascade_with_crossbar(
+                runner,
+                &cand,
+                &up_l,
+                &up_r,
+                CascadeCrossbarSpec {
+                    active_quads: 10,
+                    rho_core: rho_2x,
+                    write_checkpoints: false,
+                    crossbar_add: cb_2x
+                        .active
+                        .then_some((cb_2x.cb_add_l.as_slice(), cb_2x.cb_add_r.as_slice())),
+                },
+            )?;
             (up_l, up_r, cas_2x.feature_outputs, 10_usize, rho_2x, true)
         } else {
             (

@@ -5,6 +5,7 @@
 pub(crate) mod features;
 mod gram_snap;
 mod pre_conv_proj;
+mod ro_sweep;
 mod spectral_refine;
 mod stat_and_patch;
 
@@ -12,23 +13,23 @@ pub use stat_and_patch::{
     WeightedReadoutStem, extract_stat_256d_gram, patch_model_readouts_weighted_cholesky,
 };
 
-use crate::control::clamp::{MAX_GAIN_6DB_LIN, evaluate_readout_spectral_magnitudes};
 use crate::control::stability::MAX_RO_POLE_48K_F64;
 use crate::error::TrainError;
-use crate::linalg::cholesky::solve_uplo_u_cholesky;
 use crate::linalg::varpro::assemble_ozaki_normal_equations;
 use crate::runner::{ActiveComputeBackend, TrainRunner};
-use crate::wide_gram::{hash_gram_input_v3_f32, uplo_u_index};
+use crate::wide_gram::hash_gram_input_v3_f32;
 
 use super::model::SonaModelF64;
 use super::model::cascade::downsample_lane_2x_f64;
+use super::pass2_opt::op_t_quad::has_wet_op_t_output;
 use features::{
-    StereoFeatureSet, TIER_KAUTZ_CAPS, apply_op_t_series_channel, build_pass3_feature_sets,
-    eval_highpass_pole, unpack_weights_into_prefix,
+    TIER_KAUTZ_CAPS, apply_op_t_series_channel_bank, build_pass3_feature_sets, eval_highpass_pole,
+    has_higher_tier_wet_op_t, unpack_weights_into_prefix,
 };
+use ro_sweep::{build_per_tier_rhs, sweep_ro_pole_48k_joint_stereo};
 use spectral_refine::{
     ChannelSpectralCtx, compute_channel_hf_mse, compute_channel_mse,
-    refine_channel_tier_emr_and_ltas_kkt, solve_bounded_uplo_u, trace_scaled_ridge,
+    refine_channel_tier_emr_and_ltas_kkt, solve_bounded_uplo_u,
 };
 
 /// Result returned by Pass-3 nested 4-tier `VarPro` readout identification.
@@ -51,6 +52,7 @@ fn eval_hp_post_for_ro(
     ro_48k: f64,
     w: usize,
     is_right: bool,
+    active_opt: usize,
 ) -> Vec<f32> {
     let n = raw_1x.len();
     let m = n - w;
@@ -59,220 +61,102 @@ fn eval_hp_post_for_ro(
     }
     let rho_base = 48_000.0 / model.sample_rate_hz.max(8_000.0);
     let hp_sig = if let Some(r2x) = raw_2x {
-        let ro_2x = ro_48k.powf(0.5 * rho_base).clamp(0.0, 0.999_995);
+        let ro_2x = ro_48k.powf(0.5 * rho_base).clamp(0.0, MAX_RO_POLE_48K_F64);
         let hp_2x = eval_highpass_pole(r2x, ro_2x);
         downsample_lane_2x_f64(&hp_2x, model.os_dec_c_prev1, model.os_dec_c0)
     } else {
-        let ro_1x = ro_48k.powf(rho_base).clamp(0.0, 0.999_995);
+        let ro_1x = ro_48k.powf(rho_base).clamp(0.0, MAX_RO_POLE_48K_F64);
         eval_highpass_pole(raw_1x, ro_1x)
     };
-    let eff = apply_op_t_series_channel(model, &hp_sig, is_right);
+    let eff = apply_op_t_series_channel_bank(model, &hp_sig, is_right, active_opt);
     eff[w..n].iter().map(|&v| v as f32).collect()
 }
 
-fn patch_col1_gram_and_rhs(
-    base_gram: &[f64],
-    base_rhs: &[f64],
-    feats_post: &[f32],
-    tgts_post: &[f32],
-    hp_post: &[f32],
-    dim: usize,
-) -> (Vec<f64>, Vec<f64>) {
-    let m = tgts_post.len();
-    let mut g = base_gram.to_vec();
-    let mut r = base_rhs.to_vec();
-    g[uplo_u_index(0, 1)] = hp_post
-        .iter()
-        .zip(&feats_post[0..m])
-        .map(|(&h, &f)| f64::from(h) * f64::from(f))
-        .sum();
-    g[uplo_u_index(1, 1)] = hp_post
-        .iter()
-        .map(|&h| {
-            let hf = f64::from(h);
-            hf * hf
-        })
-        .sum();
-    for c in 2..dim {
-        let col_slice = &feats_post[c * m..(c + 1) * m];
-        g[uplo_u_index(1, c)] = hp_post
-            .iter()
-            .zip(col_slice)
-            .map(|(&h, &f)| f64::from(h) * f64::from(f))
-            .sum();
-    }
-    r[1] = hp_post
-        .iter()
-        .zip(tgts_post)
-        .map(|(&h, &y)| f64::from(h) * f64::from(y))
-        .sum();
-    (g, r)
+struct TierOptChannelSol {
+    gl: Vec<f64>,
+    rl: Vec<f64>,
+    wl: Vec<f64>,
+    rl_ridge: f64,
+    gr: Vec<f64>,
+    rr: Vec<f64>,
+    wr: Vec<f64>,
+    rr_ridge: f64,
 }
 
-struct SweepStereoResult {
-    best_ro: f64,
-    best_gram_l: Vec<f64>,
-    best_rhs_l: Vec<f64>,
-    best_hp_l: Vec<f32>,
-    best_gram_r: Vec<f64>,
-    best_rhs_r: Vec<f64>,
-    best_hp_r: Vec<f32>,
-}
-
-fn sweep_ro_pole_48k_joint_stereo(
-    model: &SonaModelF64,
-    fset: &StereoFeatureSet,
-    base_gram_l: &[f64],
-    base_rhs_l: &[f64],
-    base_gram_r: &[f64],
-    base_rhs_r: &[f64],
+struct TierOptSolveInputs<'a> {
+    fl: &'a mut [f32],
+    fr: &'a mut [f32],
+    tl: &'a [f32],
+    tr: &'a [f32],
+    raw_l: &'a [f64],
+    raw_r: &'a [f64],
+    raw_l_2x: Option<&'a [f64]>,
+    raw_r_2x: Option<&'a [f64]>,
+    dim_t: usize,
+    active_opt: usize,
     w: usize,
-) -> SweepStereoResult {
-    let dim = fset.dims[3];
-    let m = fset.tgts_l_post.len();
-    let candidates = [0.0, 0.5, 0.8, 0.92, 0.97, 0.992, MAX_RO_POLE_48K_F64];
-
-    let mut best_ro = 0.0_f64;
-    let mut best_err = f64::INFINITY;
-    let mut err_zero = f64::INFINITY;
-    let mut best_gram_l = base_gram_l.to_vec();
-    let mut best_rhs_l = base_rhs_l.to_vec();
-    let mut best_gram_r = base_gram_r.to_vec();
-    let mut best_rhs_r = base_rhs_r.to_vec();
-    let mut best_hp_l = vec![0.0_f32; m];
-    let mut best_hp_r = vec![0.0_f32; m];
-
-    for &ro in &candidates {
-        let hp_l = eval_hp_post_for_ro(
-            model,
-            &fset.raw_l_col0,
-            fset.raw_l_2x.as_deref(),
-            ro,
-            w,
-            false,
-        );
-        let hp_r = eval_hp_post_for_ro(
-            model,
-            &fset.raw_r_col0,
-            fset.raw_r_2x.as_deref(),
-            ro,
-            w,
-            true,
-        );
-        let (gl, rl) = patch_col1_gram_and_rhs(
-            base_gram_l,
-            base_rhs_l,
-            &fset.feats_l_post,
-            &fset.tgts_l_post,
-            &hp_l,
-            dim,
-        );
-        let (gr, rr) = patch_col1_gram_and_rhs(
-            base_gram_r,
-            base_rhs_r,
-            &fset.feats_r_post,
-            &fset.tgts_r_post,
-            &hp_r,
-            dim,
-        );
-        let ridge_l = trace_scaled_ridge(&gl, dim, 1.0e-5);
-        let ridge_r = trace_scaled_ridge(&gr, dim, 1.0e-5);
-        let (Ok(wl), Ok(wr)) = (
-            solve_uplo_u_cholesky(&gl, &rl, ridge_l),
-            solve_uplo_u_cholesky(&gr, &rr, ridge_r),
-        ) else {
-            continue;
-        };
-        if ro > 0.0 {
-            let fir0_off = 2 + 16 * 3;
-            let fir0_l = if fset.active_fir_taps > 0 {
-                wl.get(fir0_off).copied().unwrap_or(0.0)
-            } else {
-                0.0
-            };
-            let fir0_r = if fset.active_fir_taps > 0 {
-                wr.get(fir0_off).copied().unwrap_or(0.0)
-            } else {
-                0.0
-            };
-            let mags_l = evaluate_readout_spectral_magnitudes(
-                &[wl[0] + fir0_l, wl[1]],
-                ro,
-                model.sample_rate_hz,
-                16,
-            );
-            let mags_r = evaluate_readout_spectral_magnitudes(
-                &[wr[0] + fir0_r, wr[1]],
-                ro,
-                model.sample_rate_hz,
-                16,
-            );
-            if mags_l.iter().chain(&mags_r).any(|&v| v > MAX_GAIN_6DB_LIN) {
-                continue;
-            }
-        }
-        let mut fl_tmp = fset.feats_l_post.clone();
-        fl_tmp[m..(2 * m)].copy_from_slice(&hp_l);
-        let mut fr_tmp = fset.feats_r_post.clone();
-        fr_tmp[m..(2 * m)].copy_from_slice(&hp_r);
-        let err = compute_channel_mse(&wl, &fl_tmp, &fset.tgts_l_post, dim)
-            + compute_channel_mse(&wr, &fr_tmp, &fset.tgts_r_post, dim);
-        if ro == 0.0 {
-            err_zero = err;
-        }
-        if (ro == 0.0 && err < best_err) || (ro > 0.0 && err < err_zero * 0.98 && err < best_err) {
-            best_err = err;
-            best_ro = ro;
-            best_gram_l = gl;
-            best_rhs_l = rl;
-            best_hp_l = hp_l;
-            best_gram_r = gr;
-            best_rhs_r = rr;
-            best_hp_r = hp_r;
-        }
-    }
-
-    SweepStereoResult {
-        best_ro,
-        best_gram_l,
-        best_rhs_l,
-        best_hp_l,
-        best_gram_r,
-        best_rhs_r,
-        best_hp_r,
-    }
+    force_wide192: bool,
 }
 
-/// Computes per-tier RHS `feats^T y` vectors over post-warmup targets when `active_k` exceeds a
-/// lower tier's Kautz pair cap; otherwise reuses the Ultra RHS prefix.
-fn build_per_tier_rhs(
-    feats_post: &[f32],
-    fset: &StereoFeatureSet,
-    ultra_rhs: &[f64],
-    active_k: usize,
-    is_right: bool,
-) -> [Vec<f64>; 4] {
-    let m = fset.tgts_l_post.len();
-    core::array::from_fn(|ti| {
-        let dim_t = fset.dims[ti];
-        if ti == 3 || active_k <= TIER_KAUTZ_CAPS[ti] {
-            ultra_rhs[..dim_t].to_vec()
-        } else {
-            let tgts = if is_right {
-                fset.tier_tgts_r(ti)
-            } else {
-                fset.tier_tgts_l(ti)
-            };
-            (0..dim_t)
-                .map(|c| {
-                    let col = &feats_post[c * m..(c + 1) * m];
-                    col.iter()
-                        .zip(tgts)
-                        .map(|(&f, &y)| f64::from(f) * f64::from(y))
-                        .sum::<f64>()
-                })
-                .collect()
-        }
+fn solve_tier_opt_channel_sol(
+    runner: &TrainRunner,
+    model: &SonaModelF64,
+    inp: TierOptSolveInputs<'_>,
+) -> Result<TierOptChannelSol, TrainError> {
+    let m = inp.tl.len();
+    let hp_l = eval_hp_post_for_ro(
+        model,
+        inp.raw_l,
+        inp.raw_l_2x,
+        model.ro_pole_48k,
+        inp.w,
+        false,
+        inp.active_opt,
+    );
+    let hp_r = eval_hp_post_for_ro(
+        model,
+        inp.raw_r,
+        inp.raw_r_2x,
+        model.ro_pole_48k,
+        inp.w,
+        true,
+        inp.active_opt,
+    );
+    inp.fl[m..(2 * m)].copy_from_slice(&hp_l);
+    inp.fr[m..(2 * m)].copy_from_slice(&hp_r);
+    let (gl, rl_v) = assemble_ozaki_normal_equations(
+        runner,
+        inp.fl,
+        inp.tl,
+        m,
+        inp.dim_t,
+        1,
+        inp.force_wide192,
+    )?;
+    let (gr, rr_v) = assemble_ozaki_normal_equations(
+        runner,
+        inp.fr,
+        inp.tr,
+        m,
+        inp.dim_t,
+        1,
+        inp.force_wide192,
+    )?;
+    let rl: Vec<f64> = rl_v.into_iter().map(|v| v[0]).collect();
+    let rr: Vec<f64> = rr_v.into_iter().map(|v| v[0]).collect();
+    let (wl, rl_ridge) =
+        solve_bounded_uplo_u(&gl, &rl, inp.dim_t, model.ro_pole_48k, model.sample_rate_hz)?;
+    let (wr, rr_ridge) =
+        solve_bounded_uplo_u(&gr, &rr, inp.dim_t, model.ro_pole_48k, model.sample_rate_hz)?;
+    Ok(TierOptChannelSol {
+        gl,
+        rl,
+        wl,
+        rl_ridge,
+        gr,
+        rr,
+        wr,
+        rr_ridge,
     })
 }
 
@@ -355,14 +239,21 @@ fn run_pass3_varpro_readout_inner(
 
     let active_k = model.active_kautz_pairs.min(model.kautz.len());
     let rhs_l_tiers = build_per_tier_rhs(
+        model,
         &fset.feats_l_post,
         &fset,
         &sweep.best_rhs_l,
         active_k,
         false,
     );
-    let rhs_r_tiers =
-        build_per_tier_rhs(&fset.feats_r_post, &fset, &sweep.best_rhs_r, active_k, true);
+    let rhs_r_tiers = build_per_tier_rhs(
+        model,
+        &fset.feats_r_post,
+        &fset,
+        &sweep.best_rhs_r,
+        active_k,
+        true,
+    );
 
     // Solve `1x` Lite independently whenever `oversample_upper_tiers_2x` is enabled.
     let lite_1x_sol = if let (Some(fl), Some(fr), Some(tl), Some(tr)) = (
@@ -371,67 +262,88 @@ fn run_pass3_varpro_readout_inner(
         fset.lite_1x_tgts_l_post.as_ref(),
         fset.lite_1x_tgts_r_post.as_ref(),
     ) {
-        let d_lite = fset.dims[0];
-        let hp_l = eval_hp_post_for_ro(
+        Some(solve_tier_opt_channel_sol(
+            runner,
             model,
-            &fset.lite_1x_raw_l,
-            None,
-            model.ro_pole_48k,
-            w,
-            false,
-        );
-        let hp_r =
-            eval_hp_post_for_ro(model, &fset.lite_1x_raw_r, None, model.ro_pole_48k, w, true);
-        fl[m..(2 * m)].copy_from_slice(&hp_l);
-        fr[m..(2 * m)].copy_from_slice(&hp_r);
-        let (gl_1x, rl_1x_v) =
-            assemble_ozaki_normal_equations(runner, fl, tl, m, d_lite, 1, force_wide192)?;
-        let (gr_1x, rr_1x_v) =
-            assemble_ozaki_normal_equations(runner, fr, tr, m, d_lite, 1, force_wide192)?;
-        let rl_1x: Vec<f64> = rl_1x_v.into_iter().map(|v| v[0]).collect();
-        let rr_1x: Vec<f64> = rr_1x_v.into_iter().map(|v| v[0]).collect();
-        let (wl_1x, rl_ridge) = solve_bounded_uplo_u(
-            &gl_1x,
-            &rl_1x,
-            d_lite,
-            model.ro_pole_48k,
-            model.sample_rate_hz,
-        )?;
-        let (wr_1x, rr_ridge) = solve_bounded_uplo_u(
-            &gr_1x,
-            &rr_1x,
-            d_lite,
-            model.ro_pole_48k,
-            model.sample_rate_hz,
-        )?;
-        Some((gl_1x, rl_1x, wl_1x, rl_ridge, gr_1x, rr_1x, wr_1x, rr_ridge))
+            TierOptSolveInputs {
+                fl,
+                fr,
+                tl,
+                tr,
+                raw_l: &fset.lite_1x_raw_l,
+                raw_r: &fset.lite_1x_raw_r,
+                raw_l_2x: None,
+                raw_r_2x: None,
+                dim_t: fset.dims[0],
+                active_opt: 1,
+                w,
+                force_wide192,
+            },
+        )?)
     } else {
         None
     };
+
+    // Solve lower tiers `[Lite, Full, Pro]` with their exact `active_opt = ti + 1` features
+    // whenever any higher transport quad has wet `Op-T` output.
+    let mut tier_opt_sol: [Option<TierOptChannelSol>; 3] = [None, None, None];
+    for (ti, slot) in tier_opt_sol.iter_mut().enumerate() {
+        if let Some((fl_t, fr_t)) = fset.tier_opt_feats_post[ti].as_mut() {
+            let tl = &fset.tier_tgts_l_prefix[ti][..];
+            let tr = &fset.tier_tgts_r_prefix[ti][..];
+            *slot = Some(solve_tier_opt_channel_sol(
+                runner,
+                model,
+                TierOptSolveInputs {
+                    fl: fl_t,
+                    fr: fr_t,
+                    tl,
+                    tr,
+                    raw_l: &fset.raw_l_col0,
+                    raw_r: &fset.raw_r_col0,
+                    raw_l_2x: fset.raw_l_2x.as_deref(),
+                    raw_r_2x: fset.raw_r_2x.as_deref(),
+                    dim_t: fset.dims[ti],
+                    active_opt: ti + 1,
+                    w,
+                    force_wide192,
+                },
+            )?);
+        }
+    }
 
     let mut wl_tiers = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut wr_tiers = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut ridge_l_tiers = [1.0e-5_f64; 4];
     let mut ridge_r_tiers = [1.0e-5_f64; 4];
     for (ti, &dim_t) in fset.dims.iter().enumerate() {
-        let (wl, rdl) = solve_bounded_uplo_u(
-            &sweep.best_gram_l,
-            &rhs_l_tiers[ti],
-            dim_t,
-            model.ro_pole_48k,
-            model.sample_rate_hz,
-        )?;
-        let (wr, rdr) = solve_bounded_uplo_u(
-            &sweep.best_gram_r,
-            &rhs_r_tiers[ti],
-            dim_t,
-            model.ro_pole_48k,
-            model.sample_rate_hz,
-        )?;
-        wl_tiers[ti] = wl;
-        wr_tiers[ti] = wr;
-        ridge_l_tiers[ti] = rdl;
-        ridge_r_tiers[ti] = rdr;
+        if ti < 3
+            && let Some(ref ts) = tier_opt_sol[ti]
+        {
+            wl_tiers[ti] = ts.wl.clone();
+            wr_tiers[ti] = ts.wr.clone();
+            ridge_l_tiers[ti] = ts.rl_ridge;
+            ridge_r_tiers[ti] = ts.rr_ridge;
+        } else {
+            let (wl, rdl) = solve_bounded_uplo_u(
+                &sweep.best_gram_l,
+                &rhs_l_tiers[ti],
+                dim_t,
+                model.ro_pole_48k,
+                model.sample_rate_hz,
+            )?;
+            let (wr, rdr) = solve_bounded_uplo_u(
+                &sweep.best_gram_r,
+                &rhs_r_tiers[ti],
+                dim_t,
+                model.ro_pole_48k,
+                model.sample_rate_hz,
+            )?;
+            wl_tiers[ti] = wl;
+            wr_tiers[ti] = wr;
+            ridge_l_tiers[ti] = rdl;
+            ridge_r_tiers[ti] = rdr;
+        }
     }
 
     for ti in 0..4 {
@@ -453,6 +365,8 @@ fn run_pass3_varpro_readout_inner(
             .fold(1.0_f64, f64::max);
         model.prefix_override_needed[ti] = model.oversample_upper_tiers_2x
             || active_k > TIER_KAUTZ_CAPS[ti - 1]
+            || has_higher_tier_wet_op_t(model, ti)
+            || has_wet_op_t_output(&model.transport_quads[ti])
             || diff_l.max(diff_r) > 1.0e-3 * norm_t;
     }
     let emit_prefix_overrides = model.prefix_override_needed[1..].iter().any(|&v| v);
@@ -460,107 +374,115 @@ fn run_pass3_varpro_readout_inner(
     let mut tier_mse = [0.0_f64; 4];
     let mut tier_hf_mse = [0.0_f64; 2];
     for (ti, &dim_t) in fset.dims.iter().enumerate() {
-        let (wl_refined, wr_refined) = if ti == 0
-            && let Some((
-                ref gl_1x,
-                ref rl_1x,
-                ref wl_1x,
-                rl_ridge,
-                ref gr_1x,
-                ref rr_1x,
-                ref wr_1x,
-                rr_ridge,
-            )) = lite_1x_sol
+        let (
+            wl_init,
+            gl_ref,
+            rl_ref,
+            rl_ridge,
+            fl_ref,
+            tl_ref,
+            wr_init,
+            gr_ref,
+            rr_ref,
+            rr_ridge,
+            fr_ref,
+            tr_ref,
+        ) = if ti == 0
+            && let Some(ref s1x) = lite_1x_sol
             && let (Some(fl), Some(fr), Some(tl), Some(tr)) = (
                 fset.lite_1x_l_post.as_deref(),
                 fset.lite_1x_r_post.as_deref(),
                 fset.lite_1x_tgts_l_post.as_deref(),
                 fset.lite_1x_tgts_r_post.as_deref(),
             ) {
-            let wl_r = refine_channel_tier_emr_and_ltas_kkt(
-                wl_1x,
-                dim_t,
-                0,
-                &ChannelSpectralCtx {
-                    gram: gl_1x,
-                    rhs: rl_1x,
-                    feats_post: fl,
-                    tgts_post: tl,
-                    sr_hz: model.sample_rate_hz,
-                    ro_pole_48k: model.ro_pole_48k,
-                    active_fir_taps: fset.active_fir_taps,
-                    emit_prefix_overrides,
-                    used_ridge: rl_ridge,
-                },
-            );
-            let wr_r = refine_channel_tier_emr_and_ltas_kkt(
-                wr_1x,
-                dim_t,
-                0,
-                &ChannelSpectralCtx {
-                    gram: gr_1x,
-                    rhs: rr_1x,
-                    feats_post: fr,
-                    tgts_post: tr,
-                    sr_hz: model.sample_rate_hz,
-                    ro_pole_48k: model.ro_pole_48k,
-                    active_fir_taps: fset.active_fir_taps,
-                    emit_prefix_overrides,
-                    used_ridge: rr_ridge,
-                },
-            );
-            tier_mse[0] = 0.5
-                * (compute_channel_mse(&wl_r, fl, tl, dim_t)
-                    + compute_channel_mse(&wr_r, fr, tr, dim_t));
-            tier_hf_mse[0] = 0.5
-                * (compute_channel_hf_mse(&wl_r, fl, tl, dim_t)
-                    + compute_channel_hf_mse(&wr_r, fr, tr, dim_t));
-            (wl_r, wr_r)
+            (
+                &s1x.wl[..],
+                &s1x.gl[..],
+                &s1x.rl[..],
+                s1x.rl_ridge,
+                fl,
+                tl,
+                &s1x.wr[..],
+                &s1x.gr[..],
+                &s1x.rr[..],
+                s1x.rr_ridge,
+                fr,
+                tr,
+            )
+        } else if ti < 3
+            && let Some(ref ts) = tier_opt_sol[ti]
+            && let Some((ref fl_t, ref fr_t)) = fset.tier_opt_feats_post[ti]
+        {
+            (
+                &ts.wl[..],
+                &ts.gl[..],
+                &ts.rl[..],
+                ts.rl_ridge,
+                &fl_t[..],
+                fset.tier_tgts_l(ti),
+                &ts.wr[..],
+                &ts.gr[..],
+                &ts.rr[..],
+                ts.rr_ridge,
+                &fr_t[..],
+                fset.tier_tgts_r(ti),
+            )
         } else {
-            let tl = fset.tier_tgts_l(ti);
-            let tr = fset.tier_tgts_r(ti);
-            let wl_r = refine_channel_tier_emr_and_ltas_kkt(
-                &wl_tiers[ti],
-                dim_t,
-                ti,
-                &ChannelSpectralCtx {
-                    gram: &sweep.best_gram_l,
-                    rhs: &rhs_l_tiers[ti],
-                    feats_post: &fset.feats_l_post,
-                    tgts_post: tl,
-                    sr_hz: model.sample_rate_hz,
-                    ro_pole_48k: model.ro_pole_48k,
-                    active_fir_taps: fset.active_fir_taps,
-                    emit_prefix_overrides,
-                    used_ridge: ridge_l_tiers[ti],
-                },
-            );
-            let wr_r = refine_channel_tier_emr_and_ltas_kkt(
-                &wr_tiers[ti],
-                dim_t,
-                ti,
-                &ChannelSpectralCtx {
-                    gram: &sweep.best_gram_r,
-                    rhs: &rhs_r_tiers[ti],
-                    feats_post: &fset.feats_r_post,
-                    tgts_post: tr,
-                    sr_hz: model.sample_rate_hz,
-                    ro_pole_48k: model.ro_pole_48k,
-                    active_fir_taps: fset.active_fir_taps,
-                    emit_prefix_overrides,
-                    used_ridge: ridge_r_tiers[ti],
-                },
-            );
-            tier_mse[ti] = 0.5
-                * (compute_channel_mse(&wl_r, &fset.feats_l_post, tl, dim_t)
-                    + compute_channel_mse(&wr_r, &fset.feats_r_post, tr, dim_t));
-            if ti <= 1 {
-                tier_hf_mse[ti] = 0.5
-                    * (compute_channel_hf_mse(&wl_r, &fset.feats_l_post, tl, dim_t)
-                        + compute_channel_hf_mse(&wr_r, &fset.feats_r_post, tr, dim_t));
-            }
-            (wl_r, wr_r)
+            (
+                &wl_tiers[ti][..],
+                &sweep.best_gram_l[..],
+                &rhs_l_tiers[ti][..],
+                ridge_l_tiers[ti],
+                &fset.feats_l_post[..],
+                fset.tier_tgts_l(ti),
+                &wr_tiers[ti][..],
+                &sweep.best_gram_r[..],
+                &rhs_r_tiers[ti][..],
+                ridge_r_tiers[ti],
+                &fset.feats_r_post[..],
+                fset.tier_tgts_r(ti),
+            )
         };
+        let wl_refined = refine_channel_tier_emr_and_ltas_kkt(
+            wl_init,
+            dim_t,
+            ti,
+            &ChannelSpectralCtx {
+                gram: gl_ref,
+                rhs: rl_ref,
+                feats_post: fl_ref,
+                tgts_post: tl_ref,
+                sr_hz: model.sample_rate_hz,
+                ro_pole_48k: model.ro_pole_48k,
+                active_fir_taps: fset.active_fir_taps,
+                emit_prefix_overrides,
+                used_ridge: rl_ridge,
+            },
+        );
+        let wr_refined = refine_channel_tier_emr_and_ltas_kkt(
+            wr_init,
+            dim_t,
+            ti,
+            &ChannelSpectralCtx {
+                gram: gr_ref,
+                rhs: rr_ref,
+                feats_post: fr_ref,
+                tgts_post: tr_ref,
+                sr_hz: model.sample_rate_hz,
+                ro_pole_48k: model.ro_pole_48k,
+                active_fir_taps: fset.active_fir_taps,
+                emit_prefix_overrides,
+                used_ridge: rr_ridge,
+            },
+        );
+        tier_mse[ti] = 0.5
+            * (compute_channel_mse(&wl_refined, fl_ref, tl_ref, dim_t)
+                + compute_channel_mse(&wr_refined, fr_ref, tr_ref, dim_t));
+        if ti <= 1 {
+            tier_hf_mse[ti] = 0.5
+                * (compute_channel_hf_mse(&wl_refined, fl_ref, tl_ref, dim_t)
+                    + compute_channel_hf_mse(&wr_refined, fr_ref, tr_ref, dim_t));
+        }
 
         let pfx = unpack_weights_into_prefix(
             &wl_refined,
@@ -821,5 +743,76 @@ mod tests {
         assert!(
             rep_2x.prefix_overrides[1] && rep_2x.prefix_overrides[2] && rep_2x.prefix_overrides[3]
         );
+    }
+
+    #[test]
+    fn test_pass3_multi_quad_wet_op_t_per_tier_parity_with_vm() {
+        use crate::solver::pass5_emit::{Pass5EmitConfig, encode_model_to_dnam_bin};
+        use dnam_vm::math::DefaultMathBackend;
+        use dnam_vm::{SonaVm, Tier};
+
+        let runner = TrainRunner::cpu();
+        let n = 1_024_usize;
+        let sr = 48_000.0_f64;
+        let in_l: Vec<f64> = (0..n)
+            .map(|t| 0.35 * (core::f64::consts::TAU * 330.0 * (t as f64) / sr).sin())
+            .collect();
+        let in_r: Vec<f64> = (0..n)
+            .map(|t| 0.30 * (core::f64::consts::TAU * 490.0 * (t as f64) / sr).cos())
+            .collect();
+
+        let mut teacher = SonaModelF64::new(sr);
+        teacher.oversample_upper_tiers_2x = false;
+        teacher.active_fir_taps = 32;
+        teacher.direct_s2_u_gain = [0.65, -0.45];
+        teacher.transport_quads[0].delay_samples = [19.0, 29.0, 37.0, 43.0];
+        teacher.transport_quads[0].input_gains = [0.4, -0.25, 0.2, 0.15];
+        teacher.transport_quads[0].wet_tap_l = [0.35, 0.0, 0.2, 0.0];
+        teacher.transport_quads[0].wet_tap_r = [0.0, -0.3, 0.0, 0.25];
+        teacher.transport_quads[1].delay_samples = [53.0, 61.0, 71.0, 79.0];
+        teacher.transport_quads[1].input_gains = [0.3, 0.3, -0.2, 0.2];
+        teacher.transport_quads[1].wet_tap_l = [0.3, 0.0, -0.15, 0.0];
+        teacher.transport_quads[1].wet_tap_r = [0.0, 0.2, 0.0, 0.35];
+        teacher.tank_dry_mix = 1.0;
+
+        // Synthesize teacher target via Lite (1 quad) -> notice Ultra differs due to quad[1]!
+        let teacher_bin = encode_model_to_dnam_bin(&teacher, Pass5EmitConfig::default()).unwrap();
+        let mut vm_lite =
+            SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&teacher_bin, Tier::Lite, sr as f32)
+                .unwrap();
+        let x32_l: Vec<f32> = in_l.iter().map(|&v| v as f32).collect();
+        let x32_r: Vec<f32> = in_r.iter().map(|&v| v as f32).collect();
+        let (mut lite_l, mut lite_r) = (vec![0.0_f32; n], vec![0.0_f32; n]);
+        vm_lite
+            .process_block(&x32_l, &x32_r, &mut lite_l, &mut lite_r)
+            .unwrap();
+
+        let tgt_l: Vec<f64> = lite_l.iter().map(|&v| f64::from(v)).collect();
+        let tgt_r: Vec<f64> = lite_r.iter().map(|&v| f64::from(v)).collect();
+
+        let mut student = teacher.clone();
+        student.direct_s2_u_gain = [0.0; 2];
+        let rep = run_pass3_varpro_readout(&runner, &mut student, &in_l, &in_r, &tgt_l, &tgt_r, 64)
+            .unwrap();
+        assert!(rep.tier_mse[0] < 1.0e-5, "lite mse={}", rep.tier_mse[0]);
+        assert!(rep.prefix_overrides[1]);
+
+        let student_bin = encode_model_to_dnam_bin(&student, Pass5EmitConfig::default()).unwrap();
+        let mut vm_stu_lite =
+            SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&student_bin, Tier::Lite, sr as f32)
+                .unwrap();
+        let (mut sl, mut sr_out) = (vec![0.0_f32; n], vec![0.0_f32; n]);
+        vm_stu_lite
+            .process_block(&x32_l, &x32_r, &mut sl, &mut sr_out)
+            .unwrap();
+        let err: f64 = (128..n)
+            .map(|t| {
+                (f64::from(lite_l[t] - sl[t])).powi(2) + (f64::from(lite_r[t] - sr_out[t])).powi(2)
+            })
+            .sum::<f64>();
+        let sig: f64 = (128..n)
+            .map(|t| f64::from(lite_l[t]).powi(2) + f64::from(lite_r[t]).powi(2))
+            .sum::<f64>();
+        assert!(err / sig.max(1.0e-12) < 1.0e-5, "nesr={}", err / sig);
     }
 }

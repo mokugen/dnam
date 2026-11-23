@@ -1,7 +1,7 @@
 //! Reverse decoder converting validated Layer 0 `.dnam-bin` (`"DNBN"`) wire payloads back into
 //! [`SonaModelF64`] (`ref[container.dnam.vm-binary]`, `ref[container.dnam.tier-prefix]`).
 
-use dnam_kernels::{fp16_to_f32, unpack_wf_mix_and_rect_sign_fp16};
+use dnam_kernels::{f32_to_fp16, fp16_to_f32, unpack_wf_mix_and_rect_sign_fp16};
 use dnam_vm::bin::{
     Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, CoreQuadWire,
     DnamBinView, KautzSoaBlockWire, SONA_META_CONVOLVER_PREFIX_OVERRIDES, SONA_META_OS2X,
@@ -107,6 +107,12 @@ fn unpack_transport_quad(w: &TransportQuadWire) -> TransportQuadF64 {
     t.damp_pole = f64::from(w.damp_pole.get());
     t.lfo_rate_hz = f64::from(w.lfo_rate_hz.get());
     t.ramp_rate_hz = f64::from(w.ramp_rate_hz.get());
+    t.lfo_phase_off_q16 = w
+        .lfo_phase_off_q16
+        .map(zerocopy::byteorder::little_endian::U16::get);
+    t.ramp_phase_off_q16 = w
+        .ramp_phase_off_q16
+        .map(zerocopy::byteorder::little_endian::U16::get);
     t.fb_psi = fp16_f64(w.fb_psi_fp16.get());
     t.scat_psi = fp16_f64(w.scat_psi_fp16.get());
     t.sigma_knee = fp16_f64(w.sigma_knee_fp16.get());
@@ -346,6 +352,7 @@ pub fn decode_dnam_bin_to_model(dnam_bin: &[u8]) -> Result<SonaModelF64, TrainEr
         model.sense_tone_hp[i] = fp16_f64(a0.crossbar.sense_tone_hp_fp16[i].get());
         model.tier_gain_trim[i] = f64::from(a0.crossbar.tier_gain_trim[i].get());
         model.phasor_freq_hz[i] = f64::from(a0.crossbar.phasor_freq_hz[i].get());
+        model.phasor_init_phase_q32[i] = a0.crossbar.phasor_init_phase_q32[i].get();
     }
     model.crossbar_op_gains = [
         fp16_f64(a0.crossbar.crossbar_op_gains_fp16[0].get()),
@@ -369,8 +376,12 @@ pub fn decode_dnam_bin_to_model(dnam_bin: &[u8]) -> Result<SonaModelF64, TrainEr
                 fp16_f64(a0.linear_readout_lite.w_ro_fp16[192 + q * 4 + l].get());
         }
         model.opt_to_lr[q] = [
-            f64::from(a0.control_bus_lite.rho_head_and_ctrl_tail[24 + q * 2].get()),
-            f64::from(a0.control_bus_lite.rho_head_and_ctrl_tail[24 + q * 2 + 1].get()),
+            f64::from(fp16_to_f32(f32_to_fp16(
+                a0.control_bus_lite.rho_head_and_ctrl_tail[24 + q * 2].get(),
+            ))),
+            f64::from(fp16_to_f32(f32_to_fp16(
+                a0.control_bus_lite.rho_head_and_ctrl_tail[24 + q * 2 + 1].get(),
+            ))),
         ];
     }
     for i in 0..3 {
@@ -579,7 +590,13 @@ mod tests {
         model.kautz[0].b_gamma = 0.5;
         model.kautz[0].c_re_l = 0.25;
         model.transport_quads[0].scat_psi = 0.5;
+        model.transport_quads[0].r_dc = 0.985;
+        model.transport_quads[0].lfo_phase_off_q16 = [0, 16_384, 32_768, 49_152];
+        model.transport_quads[0].ramp_phase_off_q16 = [0, 32_768, 16_384, 49_152];
         model.transport_quads[0].allpass_delays = [3, 5, 7, 11];
+        model.phasor_freq_hz = [-1_200.0, 3.5, -0.5, 440.0];
+        model.phasor_init_phase_q32 = [0x1234_5678, 0x9ABC_DEF0, 0x4000_0000, 0x8000_0000];
+        model.opt_to_lr[0] = [0.333_333, -0.125];
         model.prefix_override_needed = [false, true, true, true];
         model.tier_overrides[0] = Some(Box::new(TierReadoutPrefixF64 {
             direct_s2_u_gain: [0.55, -0.35],
@@ -593,6 +610,22 @@ mod tests {
         assert_eq!(decoded.core_quads[0].rect_sign, [-1.0, 1.0, -1.0, 1.0]);
         assert!((decoded.fir_l[0] - 0.25).abs() < 1.0e-6);
         assert!((decoded.kautz[0].r_low - 0.72).abs() < 1.0e-6);
+        assert_eq!(decoded.phasor_freq_hz, [-1_200.0, 3.5, -0.5, 440.0]);
+        assert_eq!(
+            decoded.phasor_init_phase_q32,
+            [0x1234_5678, 0x9ABC_DEF0, 0x4000_0000, 0x8000_0000]
+        );
+        assert!((decoded.transport_quads[0].r_dc - 0.985).abs() < 1.0e-6);
+        assert_eq!(
+            decoded.transport_quads[0].lfo_phase_off_q16,
+            [0, 16_384, 32_768, 49_152]
+        );
+        assert_eq!(
+            decoded.transport_quads[0].ramp_phase_off_q16,
+            [0, 32_768, 16_384, 49_152]
+        );
+        let opt0_fp16 = f64::from(fp16_to_f32(f32_to_fp16(0.333_333)));
+        assert_eq!(decoded.opt_to_lr[0][0], opt0_fp16);
 
         let bin2 = encode_model_to_dnam_bin(&decoded, Pass5EmitConfig::default()).unwrap();
         assert_eq!(bin1, bin2);

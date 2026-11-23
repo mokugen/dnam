@@ -2,119 +2,16 @@
 //! Cholesky-whitened L-BFGS (`WhitenedLbfgs`), and GPU/CPU `TrainRunner::inner_opt_step` bridge
 //! (`ref[train.pipeline.backbone-trajectory-opt]`).
 
+mod bounds;
+
+pub use bounds::ParamBoundSpec;
+
 use crate::error::TrainError;
 use crate::gpu::abi::InnerOptUniforms;
 use crate::math::{DynamicTrainer, TrainerMathBackend, TrainerTask};
 use crate::runner::{InnerOptInput, TrainRunner};
 
 use super::cholesky::factorize_uplo_u_cholesky;
-
-/// Constraint mapping between a constrained physical scalar and unconstrained R.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum ParamBoundSpec {
-    /// Unconstrained scalar parameter.
-    Free,
-    /// Closed box `[lo, hi]` mapped smoothly via logit/sigmoid.
-    Box {
-        /// Strict lower bound.
-        lo: f64,
-        /// Strict upper bound.
-        hi: f64,
-    },
-    /// Positive log-scaled box `[lo, hi]` mapped smoothly in log space.
-    LogBox {
-        /// Positive lower bound (`> 0.0`).
-        lo: f64,
-        /// Positive upper bound (`> lo`).
-        hi: f64,
-    },
-    /// Complement `1.0 - c` with `c in [lo_c, hi_c]` mapped in log space (pole radius near `1.0`).
-    ComplementLog {
-        /// Positive lower bound on `1.0 - x`.
-        lo_c: f64,
-        /// Positive upper bound on `1.0 - x`.
-        hi_c: f64,
-    },
-}
-
-impl ParamBoundSpec {
-    /// Encodes a physical parameter `v` into an unconstrained coordinate `u`.
-    #[inline]
-    #[must_use]
-    pub fn to_unconstrained(self, v: f64) -> f64 {
-        match self {
-            Self::Free => v,
-            Self::Box { lo, hi } => {
-                let span = (hi - lo).max(1.0e-12);
-                let vc = v.clamp(lo + 1.0e-7 * span, hi - 1.0e-7 * span);
-                let p = ((vc - lo) / span).clamp(1.0e-7, 1.0 - 1.0e-7);
-                (p / (1.0 - p)).ln()
-            }
-            Self::LogBox { lo, hi } => {
-                let (la, lb) = (lo.max(1.0e-15).ln(), hi.max(lo * 1.000_001).ln());
-                let vc = v.clamp(lo * (1.0 + 1.0e-7), hi * (1.0 - 1.0e-7));
-                let p = ((vc.ln() - la) / (lb - la).max(1.0e-12)).clamp(1.0e-7, 1.0 - 1.0e-7);
-                (p / (1.0 - p)).ln()
-            }
-            Self::ComplementLog { lo_c, hi_c } => {
-                Self::LogBox { lo: lo_c, hi: hi_c }.to_unconstrained(1.0 - v)
-            }
-        }
-    }
-
-    /// Decodes unconstrained `u` to `(physical, d(physical)/du)`.
-    #[inline]
-    #[must_use]
-    pub fn to_physical_and_deriv(self, u: f64) -> (f64, f64) {
-        match self {
-            Self::Free => (u, 1.0),
-            Self::Box { lo, hi } => {
-                let saturated = !u.is_finite() || u.abs() > 24.0;
-                let uc = u.clamp(-24.0, 24.0);
-                let s = 1.0 / (1.0 + (-uc).exp());
-                let span = hi - lo;
-                let deriv = if saturated { 0.0 } else { span * s * (1.0 - s) };
-                (lo + span * s, deriv)
-            }
-            Self::LogBox { lo, hi } => {
-                let saturated = !u.is_finite() || u.abs() > 24.0;
-                let uc = u.clamp(-24.0, 24.0);
-                let s = 1.0 / (1.0 + (-uc).exp());
-                let (la, lb) = (lo.max(1.0e-15).ln(), hi.max(lo * 1.000_001).ln());
-                let lspan = lb - la;
-                let v = (la + lspan * s).exp();
-                let deriv = if saturated {
-                    0.0
-                } else {
-                    v * lspan * s * (1.0 - s)
-                };
-                (v, deriv)
-            }
-            Self::ComplementLog { lo_c, hi_c } => {
-                let (c, dc) = Self::LogBox { lo: lo_c, hi: hi_c }.to_physical_and_deriv(u);
-                (1.0 - c, if dc == 0.0 { 0.0 } else { -dc })
-            }
-        }
-    }
-
-    /// Hard-projects a scalar cleanly inside the spec domain.
-    #[inline]
-    #[must_use]
-    pub fn project_physical(self, v: f64) -> f64 {
-        match self {
-            Self::Free => {
-                if v.is_finite() {
-                    v
-                } else {
-                    0.0
-                }
-            }
-            Self::Box { lo, hi } => v.clamp(lo, hi),
-            Self::LogBox { lo, hi } => v.clamp(lo, hi),
-            Self::ComplementLog { lo_c, hi_c } => v.clamp(1.0 - hi_c, 1.0 - lo_c),
-        }
-    }
-}
 
 /// Configuration for [`TwoLoopLbfgs`].
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -174,17 +71,21 @@ fn dot_simd(a: &[f64], b: &[f64]) -> f64 {
 
 fn compute_two_loop_dir(
     grad: &[f64],
+    h0_diag: &[f64],
     s_hist: &[Vec<f64>],
     y_hist: &[Vec<f64>],
     rho_hist: &[f64],
     dir: &mut [f64],
 ) {
-    for (d, &g) in dir.iter_mut().zip(grad) {
-        *d = -g;
-    }
     let m = s_hist.len();
     if m == 0 {
+        for ((d, &g), &h0) in dir.iter_mut().zip(grad).zip(h0_diag) {
+            *d = -h0 * g;
+        }
         return;
+    }
+    for (d, &g) in dir.iter_mut().zip(grad) {
+        *d = -g;
     }
     let mut alpha = vec![0.0_f64; m];
     for i in (0..m).rev() {
@@ -194,10 +95,15 @@ fn compute_two_loop_dir(
         }
     }
     if let (Some(sl), Some(yl)) = (s_hist.last(), y_hist.last()) {
-        let yy = dot_simd(yl, yl).max(1.0e-18);
-        let scale = (dot_simd(sl, yl) / yy).clamp(1.0e-8, 1.0e6);
-        for dj in dir.iter_mut() {
-            *dj *= scale;
+        let y_h0_y = yl
+            .iter()
+            .zip(h0_diag)
+            .map(|(&y, &h0)| h0 * y * y)
+            .sum::<f64>()
+            .max(1.0e-18);
+        let scale = (dot_simd(sl, yl) / y_h0_y).clamp(1.0e-8, 1.0e6);
+        for (dj, &h0) in dir.iter_mut().zip(h0_diag) {
+            *dj *= scale * h0;
         }
     }
     for i in 0..m {
@@ -228,6 +134,22 @@ impl TwoLoopLbfgs {
         &self,
         init_physical: &[f64],
         bounds: &[ParamBoundSpec],
+        eval: F,
+    ) -> Result<LbfgsResult, TrainError>
+    where
+        F: FnMut(&[f64], Option<&mut [f64]>) -> Result<f64, TrainError>,
+    {
+        self.minimize_scaled(init_physical, bounds, None, eval)
+    }
+
+    /// Variant of [`Self::minimize`] applying symmetric coordinate scaling `u_i = s_i * u_raw,i`
+    /// (`d(loss)/du_i = d(loss)/dx_i * (dx_i/du_raw,i / s_i)`) so steep parameters remain
+    /// symmetrically preconditioned without breaking Armijo descent or BFGS secant symmetry.
+    pub fn minimize_scaled<F>(
+        &self,
+        init_physical: &[f64],
+        bounds: &[ParamBoundSpec],
+        coord_scales: Option<&[f64]>,
         mut eval: F,
     ) -> Result<LbfgsResult, TrainError>
     where
@@ -239,6 +161,15 @@ impl TwoLoopLbfgs {
                 context: "TwoLoopLbfgs::minimize(bounds)",
                 expected: dim,
                 actual: bounds.len(),
+            });
+        }
+        if let Some(scales) = coord_scales
+            && scales.len() != dim
+        {
+            return Err(TrainError::InvalidDimensions {
+                context: "TwoLoopLbfgs::minimize(coord_scales)",
+                expected: dim,
+                actual: scales.len(),
             });
         }
         if dim == 0 {
@@ -254,23 +185,40 @@ impl TwoLoopLbfgs {
             });
         }
 
+        let eff_scales: Vec<f64> = match coord_scales {
+            Some(scales) => scales
+                .iter()
+                .map(|&s| if s.is_finite() && s > 0.0 { s } else { 1.0 })
+                .collect(),
+            None => vec![1.0_f64; dim],
+        };
         let m_cap = self.config.history_m.clamp(1, 10);
         let mut u: Vec<f64> = init_physical
             .iter()
             .zip(bounds)
-            .map(|(&p, &b)| b.to_unconstrained(p))
+            .zip(&eff_scales)
+            .map(|((&p, &b), &s)| b.to_unconstrained(p) * s)
             .collect();
         let mut x = vec![0.0_f64; dim];
         let mut dxd_u = vec![0.0_f64; dim];
         let decode_all = |u_vec: &[f64], x_out: &mut [f64], jac_out: &mut [f64]| {
             for i in 0..dim {
-                let (xi, ji) = bounds[i].to_physical_and_deriv(u_vec[i]);
+                let s = eff_scales[i];
+                let (xi, ji) = bounds[i].to_physical_and_deriv(u_vec[i] / s);
                 x_out[i] = xi;
-                jac_out[i] = ji;
+                jac_out[i] = ji / s;
             }
         };
 
         decode_all(&u, &mut x, &mut dxd_u);
+        let update_h0 = |jac: &[f64], h0: &mut [f64]| {
+            for (dst, &j) in h0.iter_mut().zip(jac) {
+                *dst = 1.0 / (j * j).clamp(1.0, 1.0e12);
+            }
+        };
+        let mut h0_diag = vec![1.0_f64; dim];
+        update_h0(&dxd_u, &mut h0_diag);
+
         let mut grad_x = vec![0.0_f64; dim];
         let mut loss = eval(&x, Some(&mut grad_x))?;
         if !loss.is_finite() || !grad_x.iter().all(|v| v.is_finite()) {
@@ -296,14 +244,14 @@ impl TwoLoopLbfgs {
         let mut small_streak = 0_usize;
 
         for _ in 0..self.config.max_iters {
-            compute_two_loop_dir(&grad_u, &s_hist, &y_hist, &rho_hist, &mut dir);
+            compute_two_loop_dir(&grad_u, &h0_diag, &s_hist, &y_hist, &rho_hist, &mut dir);
             let mut g_dot_d = dot_simd(&grad_u, &dir);
             if !g_dot_d.is_finite() || g_dot_d >= -1.0e-18 {
                 s_hist.clear();
                 y_hist.clear();
                 rho_hist.clear();
-                for (d, &g) in dir.iter_mut().zip(&grad_u) {
-                    *d = -g;
+                for ((d, &g), &h0) in dir.iter_mut().zip(&grad_u).zip(&h0_diag) {
+                    *d = -h0 * g;
                 }
                 g_dot_d = dot_simd(&grad_u, &dir);
                 if !g_dot_d.is_finite() || g_dot_d >= -1.0e-18 {
@@ -349,6 +297,8 @@ impl TwoLoopLbfgs {
                             rho_hist.push(1.0 / sy);
                         }
                         u.copy_from_slice(&cand_u);
+                        dxd_u.copy_from_slice(&cand_jac);
+                        update_h0(&dxd_u, &mut h0_diag);
                         grad_u = cand_gu;
                         loss = l_full;
                         iters_run += 1;
@@ -530,55 +480,6 @@ mod tests {
     use crate::wide_gram::{uplo_u_index, uplo_u_packed_len};
 
     #[test]
-    fn test_param_bound_codec_roundtrip_and_fd_jacobian() {
-        let specs = [
-            (ParamBoundSpec::Free, -1.75),
-            (ParamBoundSpec::Box { lo: -2.0, hi: 3.5 }, 0.85),
-            (
-                ParamBoundSpec::LogBox {
-                    lo: 1.0e-4,
-                    hi: 10.0,
-                },
-                0.025,
-            ),
-            (
-                ParamBoundSpec::ComplementLog {
-                    lo_c: 5.0e-4,
-                    hi_c: 0.75,
-                },
-                0.985,
-            ),
-        ];
-        for (spec, v) in specs {
-            let u = spec.to_unconstrained(v);
-            let (v2, dv_du) = spec.to_physical_and_deriv(u);
-            assert!((v2 - v).abs() <= 1.0e-9, "v={v} v2={v2}");
-            let eps = 1.0e-6;
-            let fd = (spec.to_physical_and_deriv(u + eps).0
-                - spec.to_physical_and_deriv(u - eps).0)
-                / (2.0 * eps);
-            assert!(
-                (dv_du - fd).abs() <= 1.0e-7 * dv_du.abs().max(1.0),
-                "dv_du={dv_du} fd={fd}"
-            );
-            assert!((spec.project_physical(v2) - v2).abs() <= 1.0e-12);
-        }
-        assert_eq!(ParamBoundSpec::Free.project_physical(f64::NAN), 0.0);
-        assert_eq!(
-            ParamBoundSpec::Box { lo: -1.0, hi: 2.0 }
-                .to_physical_and_deriv(30.0)
-                .1,
-            0.0
-        );
-        assert_eq!(
-            ParamBoundSpec::LogBox { lo: 0.1, hi: 10.0 }
-                .to_physical_and_deriv(-30.0)
-                .1,
-            0.0
-        );
-    }
-
-    #[test]
     fn test_whitened_lbfgs_undersized_gram_and_backtracking_none_contract() {
         assert!(matches!(
             WhitenedLbfgs::from_uplo_u(3, &[1.0; 2], &[0.0; 3], 1.0e-6),
@@ -700,5 +601,107 @@ mod tests {
         )
         .unwrap();
         assert!(th.iter().all(|v| v.is_finite() && *v < 0.4));
+    }
+
+    #[test]
+    fn test_diagonal_h0_balances_multi_decade_bijection_steps() {
+        let bounds = [
+            ParamBoundSpec::AsinhBoxSym {
+                scale: 4.0,
+                limit: 512.0,
+            },
+            ParamBoundSpec::AsinhBoxSym {
+                scale: 10.0,
+                limit: 23_520.0,
+            },
+            ParamBoundSpec::Box { lo: 0.0, hi: 1.0 },
+        ];
+        let x0 = [0.0, 0.0, 0.5];
+        let target = [0.5, -1.5, 0.3];
+
+        // Verify iter-0 H0 diagonal scaling prevents >100x physical step amplification on wide bounds.
+        let jac0: Vec<f64> = x0
+            .iter()
+            .zip(&bounds)
+            .map(|(&p, &b)| b.to_physical_and_deriv(b.to_unconstrained(p)).1)
+            .collect();
+        let h0_diag: Vec<f64> = jac0
+            .iter()
+            .map(|&j| 1.0 / (j * j).clamp(1.0, 1.0e12))
+            .collect();
+        let gx0: Vec<f64> = x0.iter().zip(&target).map(|(x, t)| x - t).collect();
+        let gu0: Vec<f64> = gx0.iter().zip(&jac0).map(|(g, j)| g * j).collect();
+        let mut dir0 = [0.0_f64; 3];
+        compute_two_loop_dir(&gu0, &h0_diag, &[], &[], &[], &mut dir0);
+        // Physical step delta_x_j = jac0[j] * dir0[j] should equal -gx0[j] for wide-scale coords.
+        assert!(((jac0[0] * dir0[0]) + gx0[0]).abs() < 1.0e-12);
+        assert!(((jac0[1] * dir0[1]) + gx0[1]).abs() < 1.0e-12);
+
+        let opt = TwoLoopLbfgs::new(LbfgsConfig {
+            max_iters: 24,
+            max_step_norm: 1.0,
+            ..LbfgsConfig::default()
+        });
+        let res = opt
+            .minimize(&x0, &bounds, |x, g_opt| {
+                let d0 = x[0] - target[0];
+                let d1 = x[1] - target[1];
+                let d2 = x[2] - target[2];
+                if let Some(g) = g_opt {
+                    g[0] = d0;
+                    g[1] = d1;
+                    g[2] = d2;
+                }
+                Ok(0.5 * (d0 * d0 + d1 * d1 + d2 * d2))
+            })
+            .unwrap();
+        assert!(res.best_loss < 1.0e-10, "best_loss={}", res.best_loss);
+        for (a, b) in res.best_params.iter().zip(&target) {
+            assert!((a - b).abs() < 1.0e-4);
+        }
+    }
+
+    #[test]
+    fn test_minimize_scaled_preserves_armijo_and_spd_secant_on_coupled_quadratic() {
+        // Minimize 0.5 * [x0 - t0, x1 - t1]^T [[2, 0.5], [0.5, 2]] [x0 - t0, x1 - t1]
+        // with extreme scale disparity [1.0, 100.0].
+        let bounds = [ParamBoundSpec::Free, ParamBoundSpec::Free];
+        let scales = [1.0_f64, 100.0_f64];
+        let target = [0.75_f64, -0.025_f64];
+        let x0 = [-0.5_f64, 0.5_f64];
+        let opt = TwoLoopLbfgs::new(LbfgsConfig {
+            max_iters: 48,
+            max_step_norm: 2.0,
+            ..LbfgsConfig::default()
+        });
+        assert!(
+            opt.minimize_scaled(&x0, &bounds, Some(&[1.0]), |_, _| Ok(0.0))
+                .is_err()
+        );
+
+        let mut losses = Vec::new();
+        let res = opt
+            .minimize_scaled(&x0, &bounds, Some(&scales), |x, g_opt| {
+                let d0 = x[0] - target[0];
+                let d1 = x[1] - target[1];
+                let g0 = 2.0 * d0 + 0.5 * d1;
+                let g1 = 0.5 * d0 + 2.0 * d1;
+                let loss = 0.5 * (d0 * g0 + d1 * g1);
+                if let Some(g) = g_opt {
+                    g[0] = g0;
+                    g[1] = g1;
+                    losses.push(loss);
+                }
+                Ok(loss)
+            })
+            .unwrap();
+        assert!(
+            res.best_loss < 1.0e-12,
+            "scaled best_loss={}",
+            res.best_loss
+        );
+        assert!(losses.windows(2).all(|w| w[1] <= w[0] + 1.0e-14));
+        assert!((res.best_params[0] - target[0]).abs() < 1.0e-6);
+        assert!((res.best_params[1] - target[1]).abs() < 1.0e-6);
     }
 }

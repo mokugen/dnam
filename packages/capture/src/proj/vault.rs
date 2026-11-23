@@ -25,10 +25,10 @@ pub use crate::audit::{
     recompute_vault_phase1_audit_and_clamps, recompute_vault_phase1_audit_and_clamps_with_windows,
 };
 use crate::solver::{
-    SolverOptions, StageBSolveConfig, StageDAuditOptions, TrainerProgressHandle,
-    TrainerProgressSnapshot, TrainingPhase, TrainingStatus, decode_coreset_lr,
-    finalize_stage_d_and_audit, run_stage_a_physics_probe, solve_stage_b_backbone_with_progress,
-    solve_stage_c_knobs,
+    SolverOptions, StageBBackboneSpec, StageBSolveConfig, StageDAuditOptions,
+    TrainerProgressHandle, TrainerProgressSnapshot, TrainingPhase, TrainingStatus,
+    decode_coreset_lr, finalize_stage_d_and_audit, run_stage_a_physics_probe_with_result,
+    solve_stage_b_backbone_with_pass1, solve_stage_c_knobs,
 };
 
 use super::bundle::{VaultChunkInput, build_dnam_proj_container_from_vault_dbin};
@@ -354,8 +354,8 @@ pub(super) fn rebuild_vault_container_with_progress(
                 [f32::NAN; 4],
             );
 
-            // Stage A: Physics Probe & Initial SONA Seeding
-            let stage_a_rep = run_stage_a_physics_probe(
+            // Stage A: Physics Probe & Initial SONA Seeding (passed directly to Stage B)
+            let (stage_a_rep, pass1_res) = run_stage_a_physics_probe_with_result(
                 &state.manifest,
                 &mut dnam_bin,
                 &dry_lr[..eval_n],
@@ -375,17 +375,20 @@ pub(super) fn rebuild_vault_container_with_progress(
             }
 
             // Stage B: Joint 4-Tier SONA Backbone & 256-D uplo='U' STAT Contraction
-            let stage_b = solve_stage_b_backbone_with_progress(
+            let stage_b = solve_stage_b_backbone_with_pass1(
                 &state.manifest,
                 &mut dnam_bin,
                 &dry_lr,
                 &wet_lr,
-                active_frames,
-                StageBSolveConfig {
-                    gram_frame_stride: options.gram_frame_stride,
-                    preserve_existing_backbone: stage_a_rep.preserved_backbone,
-                    quality_mode: options.quality_mode,
-                    rep_profiles: options.rep_profiles,
+                StageBBackboneSpec {
+                    active_frames_hint: active_frames,
+                    config: StageBSolveConfig {
+                        gram_frame_stride: options.gram_frame_stride,
+                        preserve_existing_backbone: stage_a_rep.preserved_backbone,
+                        quality_mode: options.quality_mode,
+                        rep_profiles: options.rep_profiles,
+                    },
+                    precomputed_pass1: pass1_res,
                 },
                 &progress.subrange(120, 760),
             )?;

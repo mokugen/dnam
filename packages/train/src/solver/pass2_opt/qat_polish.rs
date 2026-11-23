@@ -25,17 +25,10 @@ pub(super) struct QatPolishOutcome {
 
 #[inline]
 fn clamp_param(v: f64, bound: &ParamBoundSpec) -> f64 {
-    if !v.is_finite() {
-        return match *bound {
-            ParamBoundSpec::Free => 0.0,
-            ParamBoundSpec::Box { lo, hi } | ParamBoundSpec::LogBox { lo, hi } => 0.5 * (lo + hi),
-            ParamBoundSpec::ComplementLog { lo_c, hi_c } => 1.0 - 0.5 * (lo_c + hi_c),
-        };
-    }
-    match *bound {
-        ParamBoundSpec::Free => v,
-        ParamBoundSpec::Box { lo, hi } | ParamBoundSpec::LogBox { lo, hi } => v.clamp(lo, hi),
-        ParamBoundSpec::ComplementLog { lo_c, hi_c } => v.clamp(1.0 - hi_c, 1.0 - lo_c),
+    if v.is_finite() {
+        bound.project_physical(v)
+    } else {
+        bound.default_midpoint()
     }
 }
 
@@ -76,7 +69,7 @@ pub(super) fn run_pass2_ste_qat_polish(
     let mut best_loss = baseline_loss;
     let mut best_besr_db = 10.0 * base_bd.besr.max(1.0e-12).log10();
 
-    if steps == 0 {
+    if steps == 0 || !layout.is_fp16_wire.iter().any(|&is_fp16| is_fp16) {
         return Ok(QatPolishOutcome {
             steps_run: 0,
             baseline_loss,
@@ -86,7 +79,9 @@ pub(super) fn run_pass2_ste_qat_polish(
     }
 
     let (mut theta_shadow, bounds) = layout.pack(model);
-    let dim = theta_shadow.len();
+    let dim = layout.dim();
+    debug_assert_eq!(layout.is_fp16_wire.len(), dim);
+    debug_assert_eq!(theta_shadow.len(), dim);
     let mut best_model = baseline_model.clone();
     let mut work_model = baseline_model;
     let mut m_vec = vec![0.0_f64; dim];
@@ -133,8 +128,13 @@ pub(super) fn run_pass2_ste_qat_polish(
             v_vec[idx] = beta2 * v_vec[idx] + (1.0 - beta2) * g * g;
             let m_hat = m_vec[idx] / bias_corr1;
             let v_hat = v_vec[idx] / bias_corr2;
+            let step_lr = if layout.zoh_hold_depth_idx == Some(idx) {
+                lr / (n.max(1) as f64)
+            } else {
+                lr
+            };
             theta_shadow[idx] = clamp_param(
-                theta_shadow[idx] - lr * m_hat / (v_hat.sqrt() + eps),
+                theta_shadow[idx] - step_lr * m_hat / (v_hat.sqrt() + eps),
                 &bounds[idx],
             );
         }
@@ -206,12 +206,7 @@ mod tests {
         base.w_ro[0][6] = 0.612345;
         base.direct_s2_u_gain = [0.212345, 0.212345];
 
-        let layout = ThetaLayout {
-            q_opt: 2,
-            k_opt: 0,
-            op_t_enabled: false,
-            max_tau: 128.0,
-        };
+        let layout = ThetaLayout::for_pass2_joint(&base, 2, 128.0);
         let pairs = StereoTrainingPairs {
             in_l: &in_l,
             in_r: &in_r,

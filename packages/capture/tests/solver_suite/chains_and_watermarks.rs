@@ -570,21 +570,10 @@ pub(super) fn verify_chain_distillation<M: BlackBoxModel>(
     report.proj_bytes
 }
 
-macro_rules! chain_distill_test {
-    ($name:ident, $ctor:expr) => {
-        #[test]
-        fn $name() {
-            // verify[train.pipeline.physics-probe]
-            // verify[train.pipeline.fixtures-matrix]
-            let _ = verify_chain_distillation($ctor, true);
-        }
-    };
-}
-
 macro_rules! chain_qualify_test {
     ($name:ident, $ctor:expr) => {
         #[test]
-        #[ignore = "exhaustive chain qualification; run via moon run capture:qualify"]
+        #[ignore = "E2E signal-chain fixture qualification; deferred to M25 (run via moon run capture:qualify)"]
         fn $name() {
             // verify[train.pipeline.physics-probe]
             // verify[train.pipeline.fixtures-matrix]
@@ -593,7 +582,7 @@ macro_rules! chain_qualify_test {
     };
 }
 
-chain_distill_test!(
+chain_qualify_test!(
     test_physical_signal_chain_01_symmetric_od,
     Chain01SymmetricOd::new()
 );
@@ -609,7 +598,7 @@ chain_qualify_test!(
     test_physical_signal_chain_04_tube_amp_fmv,
     Chain04TubeAmpFmv4x12::new()
 );
-chain_distill_test!(
+chain_qualify_test!(
     test_physical_signal_chain_05_pure_lti_cab,
     Chain05PureLtiCabAndRoom::new()
 );

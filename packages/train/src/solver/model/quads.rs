@@ -362,6 +362,10 @@ pub struct TransportQuadF64 {
     pub lfo_rate_hz: f64,
     /// Pitch/grain ramp rate in Hz (`[-16.0, 16.0]`).
     pub ramp_rate_hz: f64,
+    /// Per-lane LFO initial phase offsets (`Q0.16`, upper 16 bits of `Q0.32`).
+    pub lfo_phase_off_q16: [u16; 4],
+    /// Per-lane grain/ramp initial phase offsets (`Q0.16`, upper 16 bits of `Q0.32`).
+    pub ramp_phase_off_q16: [u16; 4],
     /// Per-lane LFO modulation depths in samples.
     pub lfo_depths: [f64; 4],
     /// Per-lane quad input weights.
@@ -398,6 +402,8 @@ impl Default for TransportQuadF64 {
             damp_pole: 0.0,
             lfo_rate_hz: 0.0,
             ramp_rate_hz: 0.0,
+            lfo_phase_off_q16: [0; 4],
+            ramp_phase_off_q16: [0; 4],
             lfo_depths: [0.0; 4],
             input_gains: [0.0; 4],
             wet_tap_l: [0.0; 4],

@@ -22,11 +22,13 @@ pub use progress::{
     TrainerProgressHandle, TrainerProgressSnapshot, TrainingPhase, TrainingStatus,
 };
 pub use stage_a_probe::{
-    StageAConfig, StageAReport, has_populated_v3_backbone, run_stage_a_physics_probe,
+    StageAConfig, StageAReport, has_populated_v3_backbone, pass1_hint_from_manifest,
+    run_stage_a_physics_probe, run_stage_a_physics_probe_with_result,
 };
 pub use stage_b_backbone::{
-    StageBOutputs, StageBSolveConfig, WeightedStemRef, compute_v3_stat_chunk_bytes,
-    serialize_v3_stat_chunk_ultra, solve_stage_b_backbone, solve_stage_b_backbone_with_progress,
+    StageBBackboneSpec, StageBOutputs, StageBSolveConfig, WeightedStemRef,
+    compute_v3_stat_chunk_bytes, serialize_v3_stat_chunk_ultra, solve_stage_b_backbone,
+    solve_stage_b_backbone_with_pass1, solve_stage_b_backbone_with_progress,
 };
 pub use stage_c_knobs::{
     StageCKnobsOutput, decode_coreset_lr, solve_stage_c_knobs, star_center_control_values,

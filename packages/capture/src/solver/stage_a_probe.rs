@@ -7,8 +7,9 @@
 
 use dnam_engine::schema::DnamError;
 use dnam_train::{
-    Pass5EmitConfig, SonaModelF64, decode_dnam_bin_to_model, encode_model_to_dnam_bin,
-    run_pass1_probe, run_phase2_rail_burst,
+    Pass1PhysicsHint, Pass1ProbeConfig, Pass1ProbeResult, Pass5EmitConfig, SonaModelF64,
+    decode_dnam_bin_to_model, encode_model_to_dnam_bin, run_pass1_probe_with_hint,
+    run_phase2_rail_burst,
 };
 use dnam_vm::Tier;
 use dnam_vm::bin::{DNBN_FLAG_STEREO_OUT, DnamBinView};
@@ -195,15 +196,103 @@ pub(crate) fn encode_with_preserved_controls(
     encode_model_to_dnam_bin(model, emit_cfg).map_err(map_stage_err)
 }
 
-/// Runs Stage A (`Physics Probe` & Anchor Seeding) on `SONA v3.0` `.dnam-bin` (`ref[train.pipeline.physics-probe]`).
-pub fn run_stage_a_physics_probe(
+/// Builds a 100% data-driven [`Pass1PhysicsHint`] strictly from numeric scalar descriptors on
+/// `manifest.stems_registry` (`extracted_physics` and `user_metadata["phys_*"]`) without any
+/// device, brand, or control-name heuristics (`REQ-1.6`, `REQ-1.9`).
+#[must_use]
+pub fn pass1_hint_from_manifest(manifest: &DnamProjManifest) -> Pass1PhysicsHint {
+    let mut hint = Pass1PhysicsHint {
+        has_stereo_width: Some(manifest.base.io_config.output_mode != "mono"),
+        ..Pass1PhysicsHint::default()
+    };
+    let stem_opt = manifest
+        .stems_registry
+        .iter()
+        .find(|s| s.enabled && s.is_star_center)
+        .or_else(|| manifest.stems_registry.iter().find(|s| s.enabled));
+    let Some(stem) = stem_opt else {
+        return hint;
+    };
+    if let Some(ref ep) = stem.extracted_physics {
+        if let Some(&d) = ep.delays_ms.iter().find(|&&v| v.is_finite() && v > 0.0) {
+            hint.delay_ms = Some(f64::from(d));
+            if let Some(&g) = ep
+                .decay_gains_lin
+                .iter()
+                .find(|&&v| v.is_finite() && v > 1.0e-4 && v < 0.9999)
+            {
+                let rt60 = -3.0 * (f64::from(d) * 1.0e-3) / f64::from(g).log10();
+                if rt60.is_finite() && rt60 > 0.0 {
+                    hint.rt60_s = Some(rt60);
+                }
+            }
+        }
+        if let Some(&r) = ep.lfo_freqs_hz.iter().find(|&&v| v.is_finite() && v > 0.0) {
+            hint.modulation_rate_hz = Some(f64::from(r));
+        }
+    }
+    let read_f64 = |key: &str| stem.user_metadata.get(key).and_then(|v| v.as_f64());
+    if let Some(v) = read_f64("phys_rt60_s") {
+        hint.rt60_s = Some(v);
+    } else if let Some(v_ms) = read_f64("phys_rt60_ms").filter(|v| v.is_finite() && *v > 0.0) {
+        hint.rt60_s = Some(v_ms * 1.0e-3);
+    }
+    if let Some(v) = read_f64("phys_delay_ms") {
+        hint.delay_ms = Some(v);
+    } else if let Some(v) = read_f64("phys_short_delay_ms").filter(|v| v.is_finite() && *v > 0.0) {
+        hint.delay_ms = Some(v);
+    }
+    let odd_harm = read_f64("phys_odd_harm").filter(|v| v.is_finite());
+    let even_harm = read_f64("phys_even_harm").filter(|v| v.is_finite());
+    if let Some(v) = read_f64("phys_thd_ratio") {
+        hint.thd_ratio = Some(v);
+    } else if odd_harm.is_some() || even_harm.is_some() {
+        let thd = odd_harm.unwrap_or(0.0).max(0.0) + even_harm.unwrap_or(0.0).max(0.0);
+        hint.thd_ratio = Some(thd);
+    }
+    if let Some(v) = read_f64("phys_even_odd_asymmetry") {
+        hint.even_odd_asymmetry = Some(v);
+    } else if odd_harm.is_some() || even_harm.is_some() {
+        let odd = odd_harm.unwrap_or(0.0).max(0.0);
+        let even = even_harm.unwrap_or(0.0).max(0.0);
+        let denom = odd.abs() + even.abs();
+        hint.even_odd_asymmetry = Some(if denom > 1.0e-9 {
+            ((even - odd) / denom).clamp(-1.0, 1.0)
+        } else {
+            0.0
+        });
+    }
+    if let Some(v) = read_f64("phys_modulation_rate_hz") {
+        hint.modulation_rate_hz = Some(v);
+    } else if let Some(v) = read_f64("phys_lfo_hz").filter(|v| v.is_finite() && *v > 0.0) {
+        hint.modulation_rate_hz = Some(v);
+    }
+    if let Some(v) = read_f64("phys_noise_floor_db") {
+        hint.noise_floor_db = Some(v);
+    }
+    if let Some(v) = stem
+        .user_metadata
+        .get("phys_has_stereo_width")
+        .and_then(|v| v.as_bool())
+    {
+        hint.has_stereo_width = Some(v);
+    } else if let Some(stereo_diff) = read_f64("phys_stereo_diff").filter(|v| v.is_finite()) {
+        hint.has_stereo_width = Some(stereo_diff > 0.05);
+    }
+    hint
+}
+
+/// Runs Stage A (`Physics Probe` & Anchor Seeding) on `SONA v3.0` `.dnam-bin`, returning both
+/// [`StageAReport`] and the live [`Pass1ProbeResult`] for direct Stage B reuse
+/// (`ref[train.pipeline.physics-probe]`).
+pub fn run_stage_a_physics_probe_with_result(
     manifest: &DnamProjManifest,
     dnam_bin: &mut Vec<u8>,
     dry_lr: &[[f32; 2]],
     wet_lr: &[[f32; 2]],
     spectral_summary_4096: Option<&[u8; 4_096]>,
     config: StageAConfig,
-) -> StageAReport {
+) -> (StageAReport, Option<Pass1ProbeResult>) {
     let timer = now_ms_token();
     let mono_out = manifest.base.io_config.output_mode == "mono";
     let dual_in = manifest.base.io_config.inputs >= 2;
@@ -214,18 +303,22 @@ pub fn run_stage_a_physics_probe(
             decode_dnam_bin_to_model(dnam_bin).unwrap_or_else(|_| SonaModelF64::new(48_000.0));
         let fir_e: f64 = model.fir_l.iter().map(|&v| v * v).sum();
         let warn = check_rail_warning(dnam_bin, "preserved backbone");
-        return StageAReport {
-            elapsed_ms: elapsed_ms_since(timer),
-            preserved_backbone: true,
-            crossover_hz,
-            early_fir_energy: fir_e,
-            kautz_poles_lifted: model.active_kautz_pairs,
-            phase2_rail_warning: warn,
-        };
+        return (
+            StageAReport {
+                elapsed_ms: elapsed_ms_since(timer),
+                preserved_backbone: true,
+                crossover_hz,
+                early_fir_energy: fir_e,
+                kautz_poles_lifted: model.active_kautz_pairs,
+                phase2_rail_warning: warn,
+            },
+            None,
+        );
     }
 
-    let n_fit = dry_lr.len().min(wet_lr.len()).min(12_000);
-    let mut model = if n_fit >= 64 {
+    let hint = pass1_hint_from_manifest(manifest);
+    let n_fit = dry_lr.len().min(wet_lr.len());
+    let mut pass1_res = if n_fit >= 64 {
         let in_l: Vec<f64> = dry_lr[..n_fit].iter().map(|lr| f64::from(lr[0])).collect();
         let in_r: Vec<f64> = dry_lr[..n_fit]
             .iter()
@@ -236,9 +329,25 @@ pub fn run_stage_a_physics_probe(
             .iter()
             .map(|lr| f64::from(if mono_out { lr[0] } else { lr[1] }))
             .collect();
-        run_pass1_probe(&in_l, &in_r, &tgt_l, &tgt_r, 48_000.0, 128, 32)
-            .map(|(_rep, m)| m)
-            .unwrap_or_else(|_| SonaModelF64::new(48_000.0))
+        run_pass1_probe_with_hint(
+            &in_l,
+            &in_r,
+            &tgt_l,
+            &tgt_r,
+            Pass1ProbeConfig {
+                sample_rate_hz: 48_000.0,
+                max_fir_taps: 128,
+                max_kautz_pairs: 32,
+                hint: Some(&hint),
+            },
+        )
+        .ok()
+    } else {
+        None
+    };
+
+    let mut fallback_model = if let Some(ref mut res) = pass1_res {
+        res.model.clone()
     } else {
         let mut m = SonaModelF64::new(48_000.0);
         m.active_fir_taps = 1;
@@ -247,21 +356,50 @@ pub fn run_stage_a_physics_probe(
         m
     };
 
-    if let Ok(encoded) = encode_with_preserved_controls(&mut model, dnam_bin, mono_out, dual_in) {
+    if let Ok(encoded) =
+        encode_with_preserved_controls(&mut fallback_model, dnam_bin, mono_out, dual_in)
+    {
         *dnam_bin = encoded;
     }
+    if let Some(ref mut res) = pass1_res {
+        res.model.control_audit = fallback_model.control_audit.clone();
+        res.model.control_bus = fallback_model.control_bus.clone();
+    }
     let _ = verify_dnam_bin_zero_dc(dnam_bin);
-    let fir_e: f64 = model.fir_l.iter().map(|&v| v * v).sum();
+    let fir_e: f64 = fallback_model.fir_l.iter().map(|&v| v * v).sum();
     let warn = check_rail_warning(dnam_bin, "Stage A probe");
 
-    StageAReport {
-        elapsed_ms: elapsed_ms_since(timer),
-        preserved_backbone: false,
-        crossover_hz,
-        early_fir_energy: fir_e,
-        kautz_poles_lifted: model.active_kautz_pairs,
-        phase2_rail_warning: warn,
-    }
+    (
+        StageAReport {
+            elapsed_ms: elapsed_ms_since(timer),
+            preserved_backbone: false,
+            crossover_hz,
+            early_fir_energy: fir_e,
+            kautz_poles_lifted: fallback_model.active_kautz_pairs,
+            phase2_rail_warning: warn,
+        },
+        pass1_res,
+    )
+}
+
+/// Runs Stage A (`Physics Probe` & Anchor Seeding) on `SONA v3.0` `.dnam-bin` (`ref[train.pipeline.physics-probe]`).
+pub fn run_stage_a_physics_probe(
+    manifest: &DnamProjManifest,
+    dnam_bin: &mut Vec<u8>,
+    dry_lr: &[[f32; 2]],
+    wet_lr: &[[f32; 2]],
+    spectral_summary_4096: Option<&[u8; 4_096]>,
+    config: StageAConfig,
+) -> StageAReport {
+    run_stage_a_physics_probe_with_result(
+        manifest,
+        dnam_bin,
+        dry_lr,
+        wet_lr,
+        spectral_summary_4096,
+        config,
+    )
+    .0
 }
 
 #[cfg(test)]
@@ -316,6 +454,134 @@ mod tests {
             StageAConfig::default(),
         );
         assert!(rep_pres.preserved_backbone);
+
+        // Full-length probing (> 12,000 frames) + Pass1ProbeResult handoff + manifest hints.
+        let n_long = 16_000_usize;
+        let dry_long: Vec<[f32; 2]> = (0..n_long)
+            .map(|i| {
+                let v = if i == 13_000 {
+                    0.9_f32
+                } else {
+                    0.05 * ((i as f32) * 0.13).sin()
+                };
+                [v, v]
+            })
+            .collect();
+        let mut wet_long = vec![[0.0_f32; 2]; n_long];
+        for t in 0..n_long {
+            wet_long[t][0] = 0.5 * dry_long[t][0]
+                + if t >= 200 {
+                    0.4 * dry_long[t - 200][0]
+                } else {
+                    0.0
+                };
+            wet_long[t][1] = 0.5 * dry_long[t][1]
+                + if t >= 200 {
+                    0.4 * dry_long[t - 200][1]
+                } else {
+                    0.0
+                };
+        }
+        let mut bin_long = initialize_backbone_dnam_bin_if_needed(None).expect("neutral");
+        let (rep_long, res_opt) = run_stage_a_physics_probe_with_result(
+            &manifest,
+            &mut bin_long,
+            &dry_long,
+            &wet_long,
+            None,
+            StageAConfig {
+                preserve_existing_backbone: false,
+                vp_gn_steps: 1,
+            },
+        );
+        assert!(!rep_long.preserved_backbone);
+        assert!(res_opt.is_some());
         blank.clear();
+    }
+
+    #[test]
+    fn test_pass1_hint_from_manifest_consumes_extract_star_physics_metadata_keys() {
+        use crate::stimulus::physics_probe::extract_star_physics_from_audio;
+
+        let n = 8_192_usize;
+        let sr = 48_000.0_f32;
+        let mut dry_l = vec![0.0_f32; n];
+        let mut wet_l = vec![0.0_f32; n];
+        let mut wet_r = vec![0.0_f32; n];
+        for t in 0..n {
+            let ph = 2.0 * core::f32::consts::PI * 220.0 * (t as f32) / sr;
+            dry_l[t] = 0.4 * ph.sin();
+            let d = if t >= 240 { dry_l[t - 240] } else { 0.0 };
+            wet_l[t] = 0.7 * dry_l[t] + 0.15 * dry_l[t] * dry_l[t] + 0.35 * d;
+            wet_r[t] = 0.7 * dry_l[t] + 0.15 * dry_l[t] * dry_l[t] - 0.30 * d;
+        }
+        let analysis = extract_star_physics_from_audio(
+            &dry_l,
+            Some(&dry_l),
+            &wet_l,
+            Some(&wet_r),
+            &dry_l,
+            &wet_l,
+            Some(&wet_r),
+            &wet_l,
+            Some(&wet_r),
+            &[8, 16, 32],
+        );
+
+        let mut manifest = DnamProjManifest::default_reference();
+        manifest
+            .stems_registry
+            .push(crate::proj::schema::StemRegistryEntry {
+                stem_id: "star_center".to_string(),
+                chunk_id: 1,
+                enabled: true,
+                is_star_center: true,
+                controls_meta: Default::default(),
+                provenance: crate::proj::schema::StemProvenance {
+                    input_pcm_sha256: "0".repeat(64),
+                    target_pcm_sha256: "0".repeat(64),
+                    num_frames: n as u64,
+                },
+                user_metadata: analysis.metadata.clone(),
+                extracted_physics: Some(analysis.extracted.clone()),
+            });
+        let raw_hint = pass1_hint_from_manifest(&manifest);
+        assert!(raw_hint.thd_ratio.is_some());
+        assert!(raw_hint.even_odd_asymmetry.is_some());
+        assert!(raw_hint.has_stereo_width.is_some());
+
+        {
+            let stem = manifest.stems_registry.first_mut().expect("star stem");
+            stem.user_metadata
+                .insert("phys_rt60_ms".to_string(), serde_json::json!(420.0));
+            stem.user_metadata
+                .insert("phys_short_delay_ms".to_string(), serde_json::json!(6.5));
+            stem.user_metadata
+                .insert("phys_lfo_hz".to_string(), serde_json::json!(1.25));
+            stem.user_metadata
+                .insert("phys_odd_harm".to_string(), serde_json::json!(0.05));
+            stem.user_metadata
+                .insert("phys_even_harm".to_string(), serde_json::json!(0.15));
+            stem.user_metadata
+                .insert("phys_stereo_diff".to_string(), serde_json::json!(0.02));
+        }
+
+        let hint = pass1_hint_from_manifest(&manifest);
+        assert!((hint.rt60_s.expect("rt60_s") - 0.42).abs() < 1.0e-6);
+        assert!((hint.delay_ms.expect("delay_ms") - 6.5).abs() < 1.0e-6);
+        assert!((hint.thd_ratio.expect("thd_ratio") - 0.20).abs() < 1.0e-6);
+        assert!((hint.even_odd_asymmetry.expect("asym") - 0.5).abs() < 1.0e-6);
+        assert!((hint.modulation_rate_hz.expect("mod_hz") - 1.25).abs() < 1.0e-6);
+        assert_eq!(hint.has_stereo_width, Some(false));
+
+        // Direct override keys take precedence over raw physics extractor keys.
+        let stem = manifest.stems_registry.first_mut().expect("star stem");
+        stem.user_metadata
+            .insert("phys_rt60_s".to_string(), serde_json::json!(1.3));
+        stem.user_metadata
+            .insert("phys_has_stereo_width".to_string(), serde_json::json!(true));
+        let overridden = pass1_hint_from_manifest(&manifest);
+        assert!((overridden.rt60_s.expect("override rt60") - 1.3).abs() < 1.0e-6);
+        assert_eq!(overridden.has_stereo_width, Some(true));
     }
 }
