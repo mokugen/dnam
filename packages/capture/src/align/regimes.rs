@@ -1,10 +1,15 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs, missing_debug_implementations)]
 //! 4-Regime Sub-Sample / Clock-Skew Alignment (`CleanLinear`, `PolarityInverted`,
 //! `DispersiveAllPass`, `NonlinearEnvelopeFallback`) and `64`-Tap Kaiser-Sinc Fractional
 //! Realignment (`align::regimes`).
 //!
 //! Canonical Reference: `docs/specs/training/capture_and_alignment.md`
 //! (`ref[train.capture.alignment.multi-regime]`, `ref[train.capture.invariants]`).
+
+mod hilbert_env;
+mod hybrid_parabolic;
+mod ppm_drift;
 
 use std::f64::consts::PI;
 
@@ -16,7 +21,18 @@ pub use super::calibration::{
     evaluate_thermal_recovery_gate, generate_calb_loopback_stimulus, generate_mic_pad_probe_400ms,
     measure_differential_pad_ratio, rescale_padded_stem,
 };
+pub use hybrid_parabolic::{
+    HYBRID_SUBSAMPLE_MAX_DELTA, PARABOLIC_PLATEAU_EPS, constrain_subsample_around_coarse,
+    parabolic_peak_offset,
+};
+pub use ppm_drift::{
+    PPM_DEADBAND_MIN, PPM_MAX_ABS, PPM_MIN_SAMPLES, PPM_QUARTER_MIN_COHERENCE, PpmDriftEstimate,
+    estimate_ppm_clock_drift,
+};
+
 use super::{AlignError, estimate_subsample_lag_and_gain};
+use hilbert_env::compute_analytic_envelopes_stereo_pair;
+use hybrid_parabolic::refine_fractional_lag_hybrid;
 
 /// Detected physical signal-path regime during sub-sample alignment
 /// (`ref[train.capture.alignment.multi-regime]`).
@@ -29,7 +45,7 @@ pub enum AlignmentRegime {
     /// Dispersive phase/all-pass response (crossover, wah, spring) locked to causal HF wavefront.
     DispersiveAllPass,
     /// Suppressed fundamental linear coherence ($\gamma_{\text{lin}} < 0.35$ from hard fuzz, rectifier,
-    /// or octave divider) locked via broadband analytic Hilbert envelope cross-correlation.
+    /// or octave divider) locked via stereo Jacobi elliptic `H1` Hilbert envelope cross-correlation.
     NonlinearEnvelopeFallback,
 }
 
@@ -47,7 +63,7 @@ pub struct MultiRegimeAlignment {
     pub polarity_inverted: bool,
     /// Normalized broadband linear coherence $\gamma_{\text{lin}} \in [0.0, 1.0]$.
     pub linear_coherence: f64,
-    /// Estimated sample-clock skew / drift in parts-per-million (`ppm`).
+    /// Estimated sample-clock skew / drift in parts-per-million (`ppm`, zeroed when gated off).
     pub clock_drift_ppm: f64,
 }
 
@@ -175,86 +191,6 @@ pub fn realign_fractional_kaiser64(
     out
 }
 
-fn compute_analytic_envelope_zero_mean(sig: &[f32]) -> Vec<f32> {
-    let n = sig.len();
-    if n == 0 {
-        return Vec::new();
-    }
-    let mean = sig.iter().map(|&x| f64::from(x)).sum::<f64>() / (n as f64);
-    let centered: Vec<f64> = sig.iter().map(|&x| f64::from(x) - mean).collect();
-    let mut env = Vec::with_capacity(n);
-    let mut env_sum = 0.0_f64;
-    for i in 0..n {
-        let x0 = centered[i];
-        let xm1 = if i >= 1 { centered[i - 1] } else { 0.0 };
-        let xp1 = if i + 1 < n { centered[i + 1] } else { 0.0 };
-        let xm3 = if i >= 3 { centered[i - 3] } else { 0.0 };
-        let xp3 = if i + 3 < n { centered[i + 3] } else { 0.0 };
-        let hilb = core::f64::consts::FRAC_2_PI * (xm1 - xp1) + (0.9 / (1.5 * PI)) * (xm3 - xp3);
-        let mag = x0.hypot(hilb);
-        env_sum += mag;
-        env.push(mag);
-    }
-    let env_mean = env_sum / (n as f64);
-    env.into_iter().map(|e| (e - env_mean) as f32).collect()
-}
-
-fn normalized_corr_at_fractional_lag(dry: &[f32], wet: &[f32], lag: f64) -> (f64, f64) {
-    let shifted = realign_fractional_kaiser64(wet, lag, 0.0, false);
-    let n = dry.len().min(shifted.len());
-    let margin = ((lag.abs().ceil() as usize) + 34).min(n / 4);
-    let start = margin;
-    let end = n.saturating_sub(margin).max(start);
-    let (slice_d, slice_w) = if end > start + 8 {
-        (&dry[start..end], &shifted[start..end])
-    } else {
-        (&dry[..n], &shifted[..n])
-    };
-    let mut dot = 0.0_f64;
-    let mut ex = 0.0_f64;
-    let mut ey = 0.0_f64;
-    for (&d, &w) in slice_d.iter().zip(slice_w) {
-        let d64 = f64::from(d);
-        let w64 = f64::from(w);
-        dot += d64 * w64;
-        ex += d64 * d64;
-        ey += w64 * w64;
-    }
-    let denom = (ex * ey).sqrt().max(1.0e-30);
-    let gain = if ex > 1.0e-30 { dot / ex } else { 0.0 };
-    (dot / denom, gain)
-}
-
-fn refine_fractional_lag_golden(dry: &[f32], wet: &[f32], init_lag: f64) -> (f64, f64, f64) {
-    let mut a = init_lag - 0.65;
-    let mut b = init_lag + 0.65;
-    let inv_phi = 0.618_033_988_749_894_9_f64;
-    let inv_phi2 = 1.0 - inv_phi;
-    let mut c = a + inv_phi2 * (b - a);
-    let mut d = a + inv_phi * (b - a);
-    let mut fc = normalized_corr_at_fractional_lag(dry, wet, c).0.abs();
-    let mut fd = normalized_corr_at_fractional_lag(dry, wet, d).0.abs();
-
-    for _ in 0..20 {
-        if fc >= fd {
-            b = d;
-            d = c;
-            fd = fc;
-            c = a + inv_phi2 * (b - a);
-            fc = normalized_corr_at_fractional_lag(dry, wet, c).0.abs();
-        } else {
-            a = c;
-            c = d;
-            fc = fd;
-            d = a + inv_phi * (b - a);
-            fd = normalized_corr_at_fractional_lag(dry, wet, d).0.abs();
-        }
-    }
-    let best_lag = 0.5 * (a + b);
-    let (signed_coh, signed_gain) = normalized_corr_at_fractional_lag(dry, wet, best_lag);
-    (best_lag, signed_coh, signed_gain)
-}
-
 fn estimate_leading_edge_polarity(dry: &[f32], wet: &[f32], lag_int: isize) -> bool {
     let peak_dry = dry.iter().fold(0.0_f32, |acc, &x| acc.max(x.abs()));
     if peak_dry <= 1.0e-6 {
@@ -301,14 +237,92 @@ fn eighth_diff_wavefront(sig: &[f32]) -> Vec<f32> {
         .collect()
 }
 
+fn detect_dispersive_wavefront(
+    dry: &[f32],
+    wet: &[f32],
+    lin_lag: f64,
+    lin_coherence: f64,
+    lin_gain: f64,
+    max_lag_samples: usize,
+    tau_coarse_opt: Option<f64>,
+) -> Option<(f64, f64, bool)> {
+    if dry.len() < 256 {
+        return None;
+    }
+    let hf_dry_full = eighth_diff_wavefront(dry);
+    let hf_wet_full = eighth_diff_wavefront(wet);
+    let hf_dry = &hf_dry_full[64..hf_dry_full.len() - 64];
+    let hf_wet = &hf_wet_full[64..hf_wet_full.len() - 64];
+    let dry_e: f64 = dry[64..dry.len() - 64]
+        .iter()
+        .map(|&x| f64::from(x) * f64::from(x))
+        .sum();
+    let hf_dry_e: f64 = hf_dry.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+    if hf_dry_e > 1.0e-10 * dry_e.max(1.0e-24) {
+        let search_span = max_lag_samples.max((lin_lag.abs() as usize) + 16);
+        if let Ok(hc) = estimate_subsample_lag_and_gain(hf_dry, hf_wet, search_span) {
+            let (hf_lag, hf_coh, hf_gain) =
+                refine_fractional_lag_hybrid(hf_dry, hf_wet, hc.total_lag_samples, None);
+            let hf_abs = hf_coh.abs();
+            let strong_disp = (lin_coherence >= 0.35 && hf_abs >= 0.55 && (lin_lag - hf_lag) > 3.5)
+                || (lin_coherence < 0.35 && hf_abs >= 0.30 && hf_abs > lin_coherence + 0.12);
+            if strong_disp {
+                let inv = if lin_coherence >= 0.50 {
+                    lin_gain < 0.0
+                } else {
+                    hf_coh < 0.0
+                };
+                let eff_gain = if lin_coherence >= 0.35 {
+                    lin_gain
+                } else {
+                    hf_gain
+                };
+                let guarded_lag = tau_coarse_opt.map_or(hf_lag, |tc| {
+                    constrain_subsample_around_coarse(hf_lag, 0.0, tc)
+                });
+                return Some((guarded_lag, eff_gain, inv));
+            }
+        }
+    }
+    if lin_coherence >= 0.35 && lin_lag > 4.0 {
+        let hp_dry_full = second_diff_hp_wavefront(dry);
+        let hp_wet_full = second_diff_hp_wavefront(wet);
+        let hp_dry = &hp_dry_full[64..hp_dry_full.len() - 64];
+        let hp_wet = &hp_wet_full[64..hp_wet_full.len() - 64];
+        let hp_dry_e: f64 = hp_dry.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
+        if hp_dry_e > 1.0e-8 * dry_e.max(1.0e-24) {
+            let search_span = max_lag_samples.max((lin_lag.abs() as usize) + 16);
+            if let Ok(hc2) = estimate_subsample_lag_and_gain(hp_dry, hp_wet, search_span) {
+                let (hp_lag, hp_coh, _) =
+                    refine_fractional_lag_hybrid(hp_dry, hp_wet, hc2.total_lag_samples, None);
+                if hp_coh.abs() >= 0.36 && hp_lag >= -1.0 && (lin_lag - hp_lag) > 3.5 {
+                    let inv = if lin_coherence >= 0.50 {
+                        lin_gain < 0.0
+                    } else {
+                        hp_coh < 0.0
+                    };
+                    let guarded_lag = tau_coarse_opt.map_or(hp_lag, |tc| {
+                        constrain_subsample_around_coarse(hp_lag, 0.0, tc)
+                    });
+                    return Some((guarded_lag, lin_gain, inv));
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Estimates sub-sample latency, signed gain, polarity, physical regime (`CleanLinear`,
-/// `PolarityInverted`, `DispersiveAllPass`, or `NonlinearEnvelopeFallback`), and linear clock
-/// drift (`ppm`) (`ref[train.capture.alignment.multi-regime]`).
-pub fn estimate_multiregime_alignment(
+/// `PolarityInverted`, `DispersiveAllPass`, or `NonlinearEnvelopeFallback`), and `Law 0.A`-gated
+/// linear clock drift (`ppm`) with optional causal onset anchor `tau_coarse_opt` (`Delta_tau in
+/// [-1.5, +1.5]`) (`ref[train.capture.alignment.multi-regime]`).
+pub fn estimate_hybrid_multiregime_alignment(
     dry: &[f32],
     wet: &[f32],
     sample_rate_hz: u32,
     max_lag_samples: usize,
+    tau_coarse_opt: Option<f64>,
+    law0a_ltv_flag: bool,
 ) -> Result<MultiRegimeAlignment, AlignError> {
     if sample_rate_hz == 0 {
         return Err(AlignError::InvalidAlignmentInput(
@@ -325,6 +339,7 @@ pub fn estimate_multiregime_alignment(
             "dry and wet must contain finite samples".to_string(),
         ));
     }
+    let tau_coarse_opt = tau_coarse_opt.filter(|v| v.is_finite());
     let inv_len = 1.0 / (dry.len() as f64);
     let mean_d = dry.iter().map(|&x| f64::from(x)).sum::<f64>() * inv_len;
     let mean_w = wet.iter().map(|&x| f64::from(x)).sum::<f64>() * inv_len;
@@ -340,97 +355,46 @@ pub fn estimate_multiregime_alignment(
     let wet = wet_centered.as_slice();
 
     let coarse = estimate_subsample_lag_and_gain(dry, wet, max_lag_samples)?;
-    let (lin_lag, signed_coh, lin_gain) =
-        refine_fractional_lag_golden(dry, wet, coarse.total_lag_samples);
+    let (unconstrained_lag, signed_coh, lin_gain) =
+        refine_fractional_lag_hybrid(dry, wet, coarse.total_lag_samples, None);
     let lin_coherence = signed_coh.abs().clamp(0.0, 1.0);
 
-    // Evaluate interior Nyquist-band 8th-difference causal wavefront BEFORE linear/envelope
-    // classification: on bass-heavy musical stimuli (`A5`), a 16-stage all-pass cascade can retain
-    // high LF linear coherence (~0.97 at tau_LF ~ +68 samples) while the causal HF wavefront
-    // arrives ~62 samples earlier (`lin_lag - hf_lag > 4.0`). Trimming 64 boundary samples
-    // eliminates step-edge transients from finite-window fractional delay filters.
-    let mut dispersive_hit: Option<(f64, f64, bool)> = None;
-    if dry.len() >= 256 {
-        let hf_dry_full = eighth_diff_wavefront(dry);
-        let hf_wet_full = eighth_diff_wavefront(wet);
-        let hf_dry = &hf_dry_full[64..hf_dry_full.len() - 64];
-        let hf_wet = &hf_wet_full[64..hf_wet_full.len() - 64];
-        let dry_e: f64 = dry[64..dry.len() - 64]
-            .iter()
-            .map(|&x| f64::from(x) * f64::from(x))
-            .sum();
-        let hf_dry_e: f64 = hf_dry.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
-        if hf_dry_e > 1.0e-10 * dry_e.max(1.0e-24) {
-            let search_span = max_lag_samples.max((lin_lag.abs() as usize) + 16);
-            if let Ok(hc) = estimate_subsample_lag_and_gain(hf_dry, hf_wet, search_span) {
-                let (hf_lag, hf_coh, hf_gain) =
-                    refine_fractional_lag_golden(hf_dry, hf_wet, hc.total_lag_samples);
-                let hf_abs = hf_coh.abs();
-                let strong_disp = (lin_coherence >= 0.35
-                    && hf_abs >= 0.55
-                    && (lin_lag - hf_lag) > 3.5)
-                    || (lin_coherence < 0.35 && hf_abs >= 0.30 && hf_abs > lin_coherence + 0.12);
-                if strong_disp {
-                    let inv = if lin_coherence >= 0.50 {
-                        lin_gain < 0.0
-                    } else {
-                        hf_coh < 0.0
-                    };
-                    let eff_gain = if lin_coherence >= 0.35 {
-                        lin_gain
-                    } else {
-                        hf_gain
-                    };
-                    dispersive_hit = Some((hf_lag, eff_gain, inv));
-                }
-            }
-        }
-        if dispersive_hit.is_none() && lin_coherence >= 0.35 && lin_lag > 4.0 {
-            let hp_dry_full = second_diff_hp_wavefront(dry);
-            let hp_wet_full = second_diff_hp_wavefront(wet);
-            let hp_dry = &hp_dry_full[64..hp_dry_full.len() - 64];
-            let hp_wet = &hp_wet_full[64..hp_wet_full.len() - 64];
-            let hp_dry_e: f64 = hp_dry.iter().map(|&x| f64::from(x) * f64::from(x)).sum();
-            if hp_dry_e > 1.0e-8 * dry_e.max(1.0e-24) {
-                let search_span = max_lag_samples.max((lin_lag.abs() as usize) + 16);
-                if let Ok(hc2) = estimate_subsample_lag_and_gain(hp_dry, hp_wet, search_span) {
-                    let (hp_lag, hp_coh, _) =
-                        refine_fractional_lag_golden(hp_dry, hp_wet, hc2.total_lag_samples);
-                    if hp_coh.abs() >= 0.36 && hp_lag >= -1.0 && (lin_lag - hp_lag) > 3.5 {
-                        let inv = if lin_coherence >= 0.50 {
-                            lin_gain < 0.0
-                        } else {
-                            hp_coh < 0.0
-                        };
-                        dispersive_hit = Some((hp_lag, lin_gain, inv));
-                    }
-                }
-            }
-        }
-    }
+    let dispersive_hit = detect_dispersive_wavefront(
+        dry,
+        wet,
+        unconstrained_lag,
+        lin_coherence,
+        lin_gain,
+        max_lag_samples,
+        tau_coarse_opt,
+    );
 
     let (regime, chosen_lag, chosen_gain, polarity_inverted) =
         if let Some((hf_lag, eff_gain, inv)) = dispersive_hit {
             (AlignmentRegime::DispersiveAllPass, hf_lag, eff_gain, inv)
         } else if lin_coherence < 0.35 {
-            let env_dry = compute_analytic_envelope_zero_mean(dry);
-            let env_wet = compute_analytic_envelope_zero_mean(wet);
+            let (env_dry, env_wet) =
+                compute_analytic_envelopes_stereo_pair(dry, wet, sample_rate_hz);
+            let guarded_init = tau_coarse_opt.map_or(unconstrained_lag, |tc| {
+                constrain_subsample_around_coarse(unconstrained_lag, 0.0, tc)
+            });
             let (env_lag, env_coh) =
                 match estimate_subsample_lag_and_gain(&env_dry, &env_wet, max_lag_samples) {
                     Ok(env_est) => {
-                        let (elag, ecoh, _) = refine_fractional_lag_golden(
+                        let (elag, ecoh, _) = refine_fractional_lag_hybrid(
                             &env_dry,
                             &env_wet,
                             env_est.total_lag_samples,
+                            tau_coarse_opt,
                         );
                         (elag, ecoh.abs())
                     }
-                    Err(_) => (lin_lag, 0.0),
+                    Err(_) => (guarded_init, 0.0),
                 };
             let use_lag = if env_coh > lin_coherence {
                 env_lag
             } else {
-                lin_lag
+                guarded_init
             };
             let rms_dry = dry
                 .iter()
@@ -458,65 +422,270 @@ pub fn estimate_multiregime_alignment(
                 if inv { -mag_gain } else { mag_gain },
                 inv,
             )
-        } else if lin_gain < 0.0 {
-            (AlignmentRegime::PolarityInverted, lin_lag, lin_gain, true)
         } else {
-            (AlignmentRegime::CleanLinear, lin_lag, lin_gain, false)
+            let (final_lag, final_gain) = if let Some(tc) = tau_coarse_opt {
+                let (glag, _, ggain) =
+                    refine_fractional_lag_hybrid(dry, wet, coarse.total_lag_samples, Some(tc));
+                (glag, ggain)
+            } else {
+                (unconstrained_lag, lin_gain)
+            };
+            if final_gain < 0.0 {
+                (
+                    AlignmentRegime::PolarityInverted,
+                    final_lag,
+                    final_gain,
+                    true,
+                )
+            } else {
+                (AlignmentRegime::CleanLinear, final_lag, final_gain, false)
+            }
         };
 
-    let mut clock_drift_ppm = 0.0_f64;
-    if dry.len() >= 24_000 {
-        let seg_len = dry.len() / 4;
-        let late_start = dry.len() - seg_len;
-        let mut e_early = 0.0_f64;
-        let mut n_early_num = 0.0_f64;
-        for (i, &x) in dry[..seg_len].iter().enumerate() {
-            let p = f64::from(x) * f64::from(x);
-            e_early += p;
-            n_early_num += (i as f64) * p;
-        }
-        let mut e_late = 0.0_f64;
-        let mut n_late_num = 0.0_f64;
-        for (i, &x) in dry[late_start..].iter().enumerate() {
-            let p = f64::from(x) * f64::from(x);
-            e_late += p;
-            n_late_num += ((late_start + i) as f64) * p;
-        }
-        if e_early > 1.0e-5 && e_late > 1.0e-5 {
-            let search = max_lag_samples.min(seg_len / 3);
-            if let (Ok(c_early), Ok(c_late)) = (
-                estimate_subsample_lag_and_gain(&dry[..seg_len], &wet[..seg_len], search),
-                estimate_subsample_lag_and_gain(&dry[late_start..], &wet[late_start..], search),
-            ) {
-                let (l_early, coh_e, _) = refine_fractional_lag_golden(
-                    &dry[..seg_len],
-                    &wet[..seg_len],
-                    c_early.total_lag_samples,
-                );
-                let (l_late, coh_l, _) = refine_fractional_lag_golden(
-                    &dry[late_start..],
-                    &wet[late_start..],
-                    c_late.total_lag_samples,
-                );
-                if coh_e.abs() >= 0.40 && coh_l.abs() >= 0.40 {
-                    let centroid_early = n_early_num / e_early;
-                    let centroid_late = n_late_num / e_late;
-                    let span = (centroid_late - centroid_early).max(1_000.0);
-                    let ppm = ((l_late - l_early) / span) * 1.0e6;
-                    if ppm.abs() <= 5_000.0 {
-                        clock_drift_ppm = ppm;
-                    }
+    let ppm_est = estimate_ppm_clock_drift(dry, wet, max_lag_samples, law0a_ltv_flag);
+    let (final_lag, final_gain, final_inv, final_regime, final_lin_coh, final_ppm) =
+        if ppm_est.gated_applied {
+            let wet_unskewed = realign_fractional_kaiser64(wet, 0.0, ppm_est.applied_ppm, false);
+            if regime == AlignmentRegime::DispersiveAllPass {
+                let re_est = estimate_subsample_lag_and_gain(dry, &wet_unskewed, max_lag_samples)
+                    .ok()
+                    .and_then(|cu| {
+                        let (ulag, ucoh, ug) = refine_fractional_lag_hybrid(
+                            dry,
+                            &wet_unskewed,
+                            cu.total_lag_samples,
+                            None,
+                        );
+                        detect_dispersive_wavefront(
+                            dry,
+                            &wet_unskewed,
+                            ulag,
+                            ucoh.abs().clamp(0.0, 1.0),
+                            ug,
+                            max_lag_samples,
+                            tau_coarse_opt,
+                        )
+                    });
+                if let Some((dlag, dgain, dinv)) = re_est {
+                    (
+                        dlag,
+                        dgain,
+                        dinv,
+                        AlignmentRegime::DispersiveAllPass,
+                        lin_coherence,
+                        ppm_est.applied_ppm,
+                    )
+                } else {
+                    (
+                        chosen_lag,
+                        chosen_gain,
+                        polarity_inverted,
+                        regime,
+                        lin_coherence,
+                        0.0,
+                    )
+                }
+            } else {
+                let seed_lag = tau_coarse_opt.map_or(ppm_est.lag_at_zero_samples, |tc| {
+                    constrain_subsample_around_coarse(ppm_est.lag_at_zero_samples, 0.0, tc)
+                });
+                let (ref_lag, ref_coh, ref_gain) =
+                    refine_fractional_lag_hybrid(dry, &wet_unskewed, seed_lag, tau_coarse_opt);
+                if ref_coh.abs() >= 0.35 {
+                    let inv = ref_gain < 0.0;
+                    let prom_regime = if inv {
+                        AlignmentRegime::PolarityInverted
+                    } else {
+                        AlignmentRegime::CleanLinear
+                    };
+                    (
+                        ref_lag,
+                        ref_gain,
+                        inv,
+                        prom_regime,
+                        lin_coherence.max(ref_coh.abs().clamp(0.0, 1.0)),
+                        ppm_est.applied_ppm,
+                    )
+                } else {
+                    (
+                        chosen_lag,
+                        chosen_gain,
+                        polarity_inverted,
+                        regime,
+                        lin_coherence,
+                        0.0,
+                    )
                 }
             }
-        }
-    }
+        } else {
+            (
+                chosen_lag,
+                chosen_gain,
+                polarity_inverted,
+                regime,
+                lin_coherence,
+                0.0,
+            )
+        };
 
     Ok(MultiRegimeAlignment {
-        regime,
-        total_lag_samples: chosen_lag,
-        signed_gain: chosen_gain,
-        polarity_inverted,
-        linear_coherence: lin_coherence,
-        clock_drift_ppm,
+        regime: final_regime,
+        total_lag_samples: final_lag,
+        signed_gain: final_gain,
+        polarity_inverted: final_inv,
+        linear_coherence: final_lin_coh,
+        clock_drift_ppm: final_ppm,
     })
+}
+
+/// Estimates sub-sample latency, signed gain, polarity, physical regime, and `Law 0.A`-compliant
+/// linear clock drift (`ppm`) with unconstrained causal search (`ref[train.capture.alignment.multi-regime]`).
+pub fn estimate_multiregime_alignment(
+    dry: &[f32],
+    wet: &[f32],
+    sample_rate_hz: u32,
+    max_lag_samples: usize,
+) -> Result<MultiRegimeAlignment, AlignError> {
+    estimate_hybrid_multiregime_alignment(dry, wet, sample_rate_hz, max_lag_samples, None, false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_hybrid_multiregime_alignment_tau_coarse_guard_and_ltv_ppm_blocking() {
+        let seed = [0x93_u8; 256];
+        let (dry, _) = crate::stimulus::waveforms::synthesize_a5_musical_transient_coreset(
+            &seed, 48_000, 1, 48_000,
+        );
+        let wet = realign_fractional_kaiser64(&dry, -37.38, -45.0, true);
+
+        let lti = estimate_hybrid_multiregime_alignment(&dry, &wet, 48_000, 256, Some(37.0), false)
+            .unwrap();
+        assert_eq!(lti.regime, AlignmentRegime::PolarityInverted);
+        assert!(lti.polarity_inverted);
+        assert!(
+            (lti.total_lag_samples - 37.38).abs() < 0.02,
+            "expected lag 37.38 +/- 0.02, got {} (ppm={})",
+            lti.total_lag_samples,
+            lti.clock_drift_ppm
+        );
+        assert!(
+            (lti.clock_drift_ppm - 45.0).abs() < 4.0,
+            "expected ~45 ppm, got {}",
+            lti.clock_drift_ppm
+        );
+        let aligned = realign_fractional_kaiser64(
+            &wet,
+            lti.total_lag_samples,
+            lti.clock_drift_ppm,
+            lti.polarity_inverted,
+        );
+        let (res_e, _, _) =
+            refine_fractional_lag_hybrid(&dry[..12_000], &aligned[..12_000], 0.0, None);
+        let (res_l, _, _) =
+            refine_fractional_lag_hybrid(&dry[36_000..], &aligned[36_000..], 0.0, None);
+        assert!(res_e.abs() < 0.02, "leading residual lag {res_e}");
+        assert!(res_l.abs() < 0.02, "trailing residual lag {res_l}");
+
+        let ltv = estimate_hybrid_multiregime_alignment(&dry, &wet, 48_000, 256, Some(37.0), true)
+            .unwrap();
+        assert_eq!(ltv.clock_drift_ppm, 0.0);
+
+        // Full-wave rectifier (`|x|` / `x^2`) on full broadband multi-phrase coreset destroys linear
+        // fundamental coherence (< 0.35), triggering Jacobi H1 stereo Hilbert envelope fallback.
+        let (dry_24k, _) = crate::stimulus::waveforms::synthesize_a5_musical_transient_coreset(
+            &seed, 24_000, 1, 48_000,
+        );
+        let wet_nl: Vec<f32> = realign_fractional_kaiser64(&dry_24k, -37.38, 0.0, false)
+            .into_iter()
+            .map(|x| x.abs())
+            .collect();
+        let nl = estimate_hybrid_multiregime_alignment(
+            &dry_24k,
+            &wet_nl,
+            48_000,
+            256,
+            Some(37.0),
+            false,
+        )
+        .unwrap();
+        assert_eq!(nl.regime, AlignmentRegime::NonlinearEnvelopeFallback);
+        assert!(
+            (nl.total_lag_samples - 37.38).abs() <= 1.5,
+            "expected envelope lag ~37.38, got {}",
+            nl.total_lag_samples
+        );
+    }
+
+    #[test]
+    fn test_align_regimes_guards_dispersive_hp_and_ppm_reanchor_paths() {
+        assert!(realign_fractional_kaiser64(&[], 5.0, 0.0, false).is_empty());
+        assert_eq!(
+            realign_fractional_kaiser64(&[1.0, f32::NAN], 0.0, 0.0, true),
+            vec![-1.0, 0.0]
+        );
+        assert!(!estimate_leading_edge_polarity(&[0.0; 16], &[1.0; 16], 0));
+        let hp = second_diff_hp_wavefront(&[0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(hp.len(), 4);
+        assert!(
+            detect_dispersive_wavefront(&[0.0; 32], &[0.0; 32], 0.0, 1.0, 1.0, 32, None).is_none()
+        );
+
+        let d8 = [0.0_f32; 8];
+        assert!(estimate_hybrid_multiregime_alignment(&d8, &d8, 0, 8, None, false).is_err());
+        assert!(
+            estimate_hybrid_multiregime_alignment(&d8[..4], &d8[..4], 48_000, 8, None, false)
+                .is_err()
+        );
+        let mut d_nan = [0.0_f32; 16];
+        d_nan[3] = f32::NAN;
+        assert!(
+            estimate_hybrid_multiregime_alignment(&d_nan, &[0.0; 16], 48_000, 8, None, false)
+                .is_err()
+        );
+
+        // Construct dispersive all-pass chain (low-band delayed +40 samples via cascaded APF)
+        // with +40 ppm drift so `detect_dispersive_wavefront` triggers `DispersiveAllPass` and PPM re-anchor.
+        let n = 48_000usize;
+        let mut dry = vec![0.0_f32; n];
+        for (i, s) in dry.iter_mut().enumerate().take(n - 1_024).skip(512) {
+            let t = (i as f64) / 48_000.0;
+            *s = (0.3 * (std::f64::consts::TAU * 90.0 * t).sin()
+                + 0.25
+                    * (if i == 2_000 || i == 24_000 || i == 40_000 {
+                        1.0
+                    } else {
+                        0.0
+                    })) as f32;
+        }
+        let mut apf = Vec::with_capacity(n);
+        let (mut z1, mut z2) = (0.0_f64, 0.0_f64);
+        let a = 0.85_f64;
+        for &x in &dry {
+            let y1 = -a * f64::from(x) + z1;
+            z1 = f64::from(x) + a * y1;
+            let y2 = -a * y1 + z2;
+            z2 = y1 + a * y2;
+            apf.push((0.3 * f64::from(x) + 0.7 * y2) as f32);
+        }
+        let wet_disp = realign_fractional_kaiser64(&apf, -18.2, -40.0, false);
+        let est_disp =
+            estimate_hybrid_multiregime_alignment(&dry, &wet_disp, 48_000, 256, None, false)
+                .unwrap();
+        assert!(est_disp.total_lag_samples.is_finite());
+
+        // Weakly coherent shifted sine across short length hits low-coherence `applied_ppm == 0.0`.
+        let short_d: Vec<f32> = (0..1_024)
+            .map(|i| 0.2 * ((i as f32) * 0.11).sin())
+            .collect();
+        let short_w: Vec<f32> = (0..1_024)
+            .map(|i| 0.05 * ((i as f32) * 0.37).sin())
+            .collect();
+        let low =
+            estimate_hybrid_multiregime_alignment(&short_d, &short_w, 48_000, 64, None, false)
+                .unwrap();
+        assert_eq!(low.clock_drift_ppm, 0.0);
+    }
 }

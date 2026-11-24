@@ -345,6 +345,7 @@ fn mk_stereo_vault_spec(
         stem_id: id.to_string(),
         enabled: true,
         is_star_center: star,
+        is_stereo: true,
         pad_gain_f32: 1.0,
         fractional_lag_samples_f32: 0.0,
         band_psd_summary_88: [0u8; 88],

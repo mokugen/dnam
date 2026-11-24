@@ -283,6 +283,7 @@ pub(super) fn make_vault_spec(
         stem_id: stem_id.to_string(),
         is_star_center,
         enabled: true,
+        is_stereo: true,
         controls_meta: meta,
         pad_gain_f32: 1.0,
         fractional_lag_samples_f32: 0.0,

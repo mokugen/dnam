@@ -399,4 +399,57 @@ mod tests {
         bad_nodes_wire.extend_from_slice(&wire[64..]);
         assert!(read_dnwb_stem_response(&mut Cursor::new(bad_nodes_wire)).is_err());
     }
+
+    #[test]
+    fn test_structured_and_postcard_response_edge_guards() {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(String::from("node_b"), vec![0.1, -0.1, 0.2]);
+        let resp = StemResponse {
+            stem_id: String::from("stem_struct_4ch"),
+            sample_rate_hz: 48_000,
+            out_1: vec![0.1, -0.2, 0.3],
+            out_2: Some(vec![0.2, -0.1, 0.0]),
+            out_3: Some(vec![-0.1, 0.2, 0.1]),
+            out_4: Some(vec![0.0, 0.1, -0.3]),
+            internal_nodes: nodes,
+        };
+        let mut wire = Vec::new();
+        let hdr = write_dnwb_stem_response(&mut wire, DnwbCommand::RenderStem, &resp).unwrap();
+        let (_, decoded) = read_dnwb_stem_response(&mut Cursor::new(&wire)).unwrap();
+        assert_eq!(decoded, resp);
+
+        // Write validation guards.
+        let mut bad = resp.clone();
+        bad.out_2 = Some(vec![0.0; 2]);
+        assert!(write_dnwb_stem_response(&mut Vec::new(), DnwbCommand::RenderStem, &bad).is_err());
+        bad.out_2 = Some(vec![f32::NAN; 3]);
+        assert!(write_dnwb_stem_response(&mut Vec::new(), DnwbCommand::RenderStem, &bad).is_err());
+        bad.out_2 = None;
+        bad.stem_id = "x".repeat(u16::MAX as usize + 1);
+        assert!(write_dnwb_stem_response(&mut Vec::new(), DnwbCommand::RenderStem, &bad).is_err());
+
+        // Read validation & truncation guards.
+        for bad_flags in [
+            hdr.flags & !DNWB_FLAG_STRUCTURED_V1,
+            hdr.flags | (1 << 7),
+            DNWB_FLAG_STRUCTURED_V1 | (0b0010 << DNWB_CHANNEL_MASK_SHIFT),
+        ] {
+            let mut h_bad = hdr;
+            if bad_flags & 0x0f00 == (0b0010 << DNWB_CHANNEL_MASK_SHIFT) {
+                h_bad.num_output_channels = 1;
+            }
+            h_bad.flags = bad_flags;
+            let mut buf = h_bad.to_bytes().to_vec();
+            buf.extend_from_slice(&wire[64..]);
+            assert!(read_dnwb_stem_response(&mut Cursor::new(&buf)).is_err());
+        }
+
+        let mut h_extra = hdr;
+        h_extra.payload_byte_len += 4;
+        let mut extra = h_extra.to_bytes().to_vec();
+        extra.extend_from_slice(&wire[64..]);
+        extra.extend_from_slice(&[0u8; 4]);
+        assert!(read_dnwb_stem_response(&mut Cursor::new(&extra)).is_err());
+        assert!(read_dnwb_stem_response(&mut Cursor::new(&wire[..wire.len() - 4])).is_err());
+    }
 }

@@ -1,27 +1,36 @@
 #![forbid(unsafe_code)]
-//! `2.0 s` (`96,000`-frame) Full-Bandwidth (`20 Hz–20 kHz`) Identification Excitation & Causal
-//! Black-Box Deadtime/Polarity Probe (`stimulus::pipeline::fullband`).
+#![warn(missing_docs, missing_debug_implementations)]
+//! Full-Bandwidth `2.0–2.5 s` (`96,000–120,000`-frame) `Schoukens–Pintelon` Stem Rendering,
+//! Hybrid Alignment Sealing, Repeatability Profiling & Causal Probe Bridge (`stimulus::pipeline::fullband`).
 
 use std::collections::BTreeMap;
-use std::f64::consts::{PI, TAU};
 
 use dnam_engine::schema::DnamError;
 
 use crate::align::realign_fractional_kaiser64;
 use crate::metrics::{TargetRepeatabilityProfile, build_repeatability_probe_stream};
 use crate::proj::directory::StmcTrajectoryWindow;
+use crate::proj::schema::ExtractedPhysics;
 use crate::proj::vault::VaultCaptureSpec;
 use crate::resampler::{resample_arbitrary_rate_to_48k, resampled_frame_len};
 use crate::stimulus::laws::TopologyProbeMode;
 use crate::stimulus::physics_probe;
 use crate::stimulus::sealing::{
-    StemSealRequest, resample_48k_channels_to_sr,
-    seal_coresets_to_inpc_and_vault_with_stereo_override,
+    SharedStemAlignment, StemSealRequest, resample_48k_channels_to_sr,
+    seal_coresets_to_inpc_and_vault_with_full_align,
 };
 use crate::targets::{DistillationTarget, StemStimulus};
-use crate::{CORESET_FP32_FRAMES_PER_STEM, metrics};
 
-use super::causal_probe::build_v3_causal_probe_excitation;
+use crate::stimulus::pipeline::causal_probe::build_v3_causal_probe_excitation;
+use crate::stimulus::pipeline::schoukens::{
+    OddRandomMultisinePlan, Regime2DecayInput, SchoukensAnalysisConfig,
+    analyze_schoukens_pintelon_physics,
+};
+
+mod causal_guard;
+mod star_schoukens;
+
+pub(super) use star_schoukens::{StarCenterCaptureRequest, capture_fullband_star_center_schoukens};
 
 /// Returns the mono left channel of [`build_v3_causal_probe_excitation`] at `48 kHz`.
 #[must_use]
@@ -32,359 +41,44 @@ pub(super) fn build_v3_causal_probe_excitation_48k() -> Vec<f32> {
         .collect()
 }
 
-fn ac_rms_window(sig: &[f32], lo: usize, hi: usize) -> f64 {
-    let hi_c = hi.min(sig.len());
-    if hi_c <= lo {
-        return 0.0;
-    }
-    let count = (hi_c - lo) as f64;
-    let mean = sig[lo..hi_c].iter().map(|&v| f64::from(v)).sum::<f64>() / count;
-    let var = sig[lo..hi_c]
-        .iter()
-        .map(|&v| {
-            let d = f64::from(v) - mean;
-            d * d
-        })
-        .sum::<f64>()
-        / count;
-    var.sqrt()
-}
-
-const TI_PERIOD_SAMPLES: usize = 1_024;
-const TI_ACTIVE_PERIODS: usize = 16;
-const TI_ACTIVE_SAMPLES: usize = TI_PERIOD_SAMPLES * TI_ACTIVE_PERIODS;
-const TI_FADE_SAMPLES: usize = 256;
-const TI_ORBIT_LEN: usize = 2 * TI_PERIOD_SAMPLES;
-const TI_ORBIT_A_START: usize = 11 * TI_PERIOD_SAMPLES;
-const TI_ORBIT_B_START: usize = TI_ORBIT_A_START + TI_ORBIT_LEN;
-const TI_TAIL_OFFSET_SAMPLES: usize = 5_120; // 106.67 ms > max dry/cab decay
-const TI_TAIL_START_SAMPLES: usize = TI_ACTIVE_SAMPLES + TI_TAIL_OFFSET_SAMPLES;
-const TI_TOTAL_SAMPLES: usize = 24_576;
-const TI_HARMONICS: [usize; 8] = [4, 8, 12, 20, 32, 52, 84, 136];
-const _: () = assert!(
-    TI_FADE_SAMPLES < TI_ORBIT_A_START
-        && TI_ORBIT_B_START + TI_ORBIT_LEN <= TI_ACTIVE_SAMPLES - TI_FADE_SAMPLES
-        && TI_TAIL_START_SAMPLES < TI_TOTAL_SAMPLES
-);
-
-/// Synthesizes a `24,576`-sample (`512 ms @ 48 kHz`) periodic time-invariance and sustained-tail
-/// probe: `16` exact `1,024`-sample harmonic periods (with `256`-sample raised-cosine fades) followed
-/// by an `8,192`-sample (`170.7 ms`) silent tail `[16_384..24_576)`.
-///
-/// Every harmonic is a multiple of `4`, so deterministic nonlinear, `Op-P` sub-octave (`f0/2`,
-/// `f0/4`), dynamic, and LTI systems converge onto an exact `2,048`-sample periodic orbit before
-/// `[11_264..15_360)`, whereas time-varying modulation (chorus/rotary/LFO) breaks periodicity and
-/// long echo/FDN tails exceed `106 ms` inside `[21_504..24_576)`.
-#[must_use]
-pub(super) fn build_time_invariance_probe_48k() -> Vec<f32> {
-    let mut one_period = [0.0_f64; TI_PERIOD_SAMPLES];
-    let mut peak = 1.0e-12_f64;
-    for (i, slot) in one_period.iter_mut().enumerate() {
-        let mut s = 0.0_f64;
-        for (idx, &k) in TI_HARMONICS.iter().enumerate() {
-            let phase = (idx as f64) * std::f64::consts::GOLDEN_RATIO;
-            let amp = 1.0 / ((k as f64).sqrt());
-            s += amp * (TAU * (k as f64) * (i as f64) / (TI_PERIOD_SAMPLES as f64) + phase).cos();
-        }
-        peak = peak.max(s.abs());
-        *slot = s;
-    }
-    let scale = 0.25 / peak;
-    let mut out = vec![0.0_f32; TI_TOTAL_SAMPLES];
-    for (i, slot) in out[..TI_ACTIVE_SAMPLES].iter_mut().enumerate() {
-        let env = if i < TI_FADE_SAMPLES {
-            0.5 * (1.0 - (PI * (i as f64) / (TI_FADE_SAMPLES as f64)).cos())
-        } else if i + TI_FADE_SAMPLES >= TI_ACTIVE_SAMPLES {
-            let rem = TI_ACTIVE_SAMPLES - 1 - i;
-            0.5 * (1.0 - (PI * (rem as f64) / (TI_FADE_SAMPLES as f64)).cos())
-        } else {
-            1.0
-        };
-        *slot = (env * scale * one_period[i % TI_PERIOD_SAMPLES]) as f32;
-    }
-    out
-}
-
-fn periodic_orbit_breaks_in_channel(wet: &[f32]) -> bool {
-    if wet.len() < TI_ORBIT_B_START + TI_ORBIT_LEN {
-        return false;
-    }
-    let a = &wet[TI_ORBIT_A_START..TI_ORBIT_B_START];
-    let b = &wet[TI_ORBIT_B_START..TI_ORBIT_B_START + TI_ORBIT_LEN];
-    let n_f = TI_ORBIT_LEN as f64;
-    let mean_a = a.iter().map(|&v| f64::from(v)).sum::<f64>() / n_f;
-    let mean_b = b.iter().map(|&v| f64::from(v)).sum::<f64>() / n_f;
-    let (mut e_a, mut e_b, mut dot) = (0.0_f64, 0.0_f64, 0.0_f64);
-    for (&va, &vb) in a.iter().zip(b) {
-        let da = f64::from(va) - mean_a;
-        let db = f64::from(vb) - mean_b;
-        e_a += da * da;
-        e_b += db * db;
-        dot += da * db;
-    }
-    if e_a <= 1.0e-10 || e_b <= 1.0e-10 {
-        return false;
-    }
-    // Optimal scalar gain absorbs ultra-slow envelope drift while exposing phase/delay modulation.
-    let alpha = (dot / e_a).clamp(0.5, 2.0);
-    let mut res_e = 0.0_f64;
-    for (&va, &vb) in a.iter().zip(b) {
-        let da = f64::from(va) - mean_a;
-        let db = f64::from(vb) - mean_b;
-        let d = db - alpha * da;
-        res_e += d * d;
-    }
-    (res_e / e_b) > 0.015
-}
-
-fn channel_requires_contiguous_96k(wet: &[f32]) -> bool {
-    let rms_act = ac_rms_window(wet, TI_ORBIT_A_START, TI_ORBIT_B_START + TI_ORBIT_LEN);
-    let rms_tail = ac_rms_window(wet, TI_TAIL_START_SAMPLES, TI_TOTAL_SAMPLES);
-    if rms_act > 1.0e-5 && rms_tail > 0.020 * rms_act {
-        return true;
-    }
-    periodic_orbit_breaks_in_channel(wet)
-}
-
-/// Detects sustained FDN/echo tails (`> 106 ms`) or time-varying modulated delay lines from the
-/// periodic time-invariance probe so `StarCenter` captures a full contiguous `96,000`-sample
-/// multisine without sweep reset.
-#[must_use]
-pub(super) fn probe_requires_contiguous_96k_fullband(
-    ti_wet_l: &[f32],
-    ti_wet_r: Option<&[f32]>,
-) -> bool {
-    channel_requires_contiguous_96k(ti_wet_l)
-        || ti_wet_r.is_some_and(channel_requires_contiguous_96k)
-}
-
-/// Synthesizes a `96,000`-frame (`2.0 s @ 48 kHz`) full-bandwidth (`20 Hz–20 kHz`) identification
-/// excitation covering all `33` `1/3`-octave `LTAS` bands, musical transients, dynamic levels,
-/// and a `24,000`-sample logarithmic `20 Hz–20 kHz` sweep (`[0..72_000)` multi-regime + `[72_000..96_000)` sweep).
-#[cfg(test)]
-#[must_use]
-pub(super) fn build_fullband_identification_coreset_48k(
-    seed_256: &[u8; 256],
-    stereo: bool,
-    aux_key_mode: bool,
-    clamp_dac: bool,
-) -> (Vec<f32>, Option<Vec<f32>>) {
-    build_fullband_identification_coreset_48k_opts(seed_256, stereo, aux_key_mode, clamp_dac, false)
-}
-
-/// Option-parameterized variant of [`build_fullband_identification_coreset_48k`] supporting
-/// contiguous `96,000`-sample multisine capture for incoherent modulation / echo / FDN targets.
-#[must_use]
-pub(super) fn build_fullband_identification_coreset_48k_opts(
-    seed_256: &[u8; 256],
-    stereo: bool,
-    aux_key_mode: bool,
-    clamp_dac: bool,
-    contiguous_96k: bool,
-) -> (Vec<f32>, Option<Vec<f32>>) {
-    let n = CORESET_FP32_FRAMES_PER_STEM;
-    let sr = 48_000.0_f64;
-    let body_len = if contiguous_96k {
-        n
+/// Resamples a rendered target response slice from `resp_sr` back onto the canonical `48 kHz` grid.
+pub(super) fn normalize_response_to_48k(ch: &[f32], resp_sr: u32) -> Vec<f32> {
+    let clamped = resp_sr.clamp(8_000, 384_000);
+    if clamped == 48_000 {
+        ch.to_vec()
     } else {
-        72_000usize.min(n)
-    };
-    let centers = metrics::canonical_ltas_33_centers_hz();
-    let weights: [f64; 33] =
-        std::array::from_fn(|k| 1.0 / (1.0 + (centers[k] / 2_400.0).powi(2)).sqrt());
-    let norm = weights
-        .iter()
-        .map(|w| w * w)
-        .sum::<f64>()
-        .sqrt()
-        .max(1.0e-12);
-    let scale = 0.52 / norm;
-    let seed_phases: [f64; 33] = std::array::from_fn(|k| {
-        let base = ((k as f64 + 1.0) * std::f64::consts::GOLDEN_RATIO).fract() * TAU;
-        let tweak = (f64::from(seed_256[k % seed_256.len()]) / 255.0 - 0.5) * 0.25;
-        base + tweak
-    });
-
-    let mut dry_l = vec![0.0_f32; n];
-    let mut dry_r = stereo.then(|| vec![0.0_f32; n]);
-    let settle_samples = if contiguous_96k {
-        0
-    } else {
-        1_024usize.min(body_len / 8)
-    };
-    let active_body = body_len.saturating_sub(settle_samples);
-
-    // Part 1 [0..70_976) (or contiguous [0..96_000)): pink-weighted 33-band excitation
-    for i in 0..active_body {
-        let t = (i as f64) / sr;
-        let fade_in = if i < 128 {
-            0.5 * (1.0 - (PI * (i as f64) / 128.0).cos())
-        } else {
-            1.0
-        };
-        let fade_out = if !contiguous_96k && i + 64 >= active_body {
-            let rem = active_body - 1 - i;
-            0.5 * (1.0 - (PI * (rem as f64) / 64.0).cos())
-        } else {
-            1.0
-        };
-        let env = fade_in
-            * fade_out
-            * (0.45 + 0.55 * (-((i % 2_400) as f64) / 800.0).exp())
-            * (0.72 + 0.28 * (TAU * 2.3 * t).sin());
-        let mut sl = 0.0_f64;
-        let mut sr_sum = 0.0_f64;
-        for (k, &fc) in centers.iter().enumerate() {
-            let arg = TAU * fc * t;
-            let phi_l = seed_phases[k];
-            sl += weights[k] * (arg + phi_l).cos();
-            if stereo {
-                let phi_r = phi_l + 0.29 * ((k & 3) as f64 + 0.5);
-                sr_sum += weights[k] * (arg + phi_r).cos();
-            }
-        }
-        let dl_raw = env * scale * sl;
-        dry_l[i] = if clamp_dac || aux_key_mode {
-            dl_raw.clamp(-0.90, 0.90) as f32
-        } else {
-            dl_raw as f32
-        };
-        if let Some(dr) = dry_r.as_mut() {
-            if aux_key_mode {
-                dr[i] = if i >= 57_000 {
-                    let scale_mod = 0.65 + 0.35 * (0.5 + 0.5 * (TAU * 1.9 * t).sin());
-                    ((scale_mod * 0.96) * (dry_l[i] as f64)).clamp(-0.90, 0.90) as f32
-                } else {
-                    let raw_env_r = if i < 2_600 {
-                        (0.88 + 0.17 * fade_in).clamp(0.04, 1.05)
-                    } else if i < 4_400 || (40_000..57_000).contains(&i) {
-                        0.04
-                    } else if i < 22_000 {
-                        let swell_r = 0.5 - 0.5 * (TAU * 3.1 * t).cos();
-                        let trans_r = (-(((i - 4_400) % 2_000) as f64) / 550.0).exp();
-                        (0.16 + 0.42 * (0.55 * swell_r + 0.45 * trans_r)).clamp(0.16, 0.58)
-                    } else {
-                        let trans_r = (-(((i - 22_000) % 2_400) as f64) / 800.0).exp();
-                        let pulse_r = 0.5 - 0.5 * (TAU * 2.3 * t + 0.4).cos();
-                        (0.62 + 0.43 * (0.50 * pulse_r + 0.50 * trans_r)).clamp(0.62, 1.05)
-                    };
-                    let env_r = fade_in * fade_out * raw_env_r;
-                    (env_r * scale * sr_sum).clamp(-0.90, 0.90) as f32
-                };
-            } else {
-                let dr_raw = env * scale * sr_sum;
-                dr[i] = if clamp_dac {
-                    dr_raw.clamp(-0.90, 0.90) as f32
-                } else {
-                    dr_raw as f32
-                };
-            }
-        }
+        let dst = resampled_frame_len(ch.len(), clamped, 48_000);
+        resample_arbitrary_rate_to_48k(ch, clamped, Some(dst))
     }
-
-    // Part 2 [72_000..96_000): modulated logarithmic 20 Hz -> 20 kHz identification sweep
-    let sweep_start = body_len;
-    let sweep_len = n.saturating_sub(sweep_start);
-    let mut phase = 0.0_f64;
-    let f0 = 20.0_f64;
-    let ratio = (20_000.0_f64 / f0).ln();
-    for i in 0..sweep_len {
-        let frac = (i as f64) / (sweep_len.max(1) as f64);
-        let t = (i as f64) / sr;
-        let freq = f0 * (ratio * frac).exp();
-        phase += TAU * freq / sr;
-        let fade_in = if i < 64 {
-            0.5 * (1.0 - (PI * (i as f64) / 64.0).cos())
-        } else {
-            1.0
-        };
-        let fade_out = if i + 64 >= sweep_len {
-            let rem = sweep_len - 1 - i;
-            0.5 * (1.0 - (PI * (rem as f64) / 64.0).cos())
-        } else {
-            1.0
-        };
-        let pick_decay = (-((i % 1_600) as f64) / 480.0).exp();
-        let swell = (0.5 - 0.5 * (TAU * 1.6 * t).cos()).powf(1.4);
-        let amp = fade_in * fade_out * (0.03 + 0.39 * swell * (0.25 + 0.75 * pick_decay));
-        let bass_mod_raw = 0.28 * (TAU * 98.0 * t + 0.3 * (TAU * 2.1 * t).sin()).sin();
-        let mod_gate = if i < 6_144 {
-            0.0
-        } else if i < 6_400 {
-            0.5 * (1.0 - (PI * ((i - 6_144) as f64) / 256.0).cos())
-        } else {
-            1.0
-        };
-        let bass_mod = mod_gate * bass_mod_raw;
-        dry_l[sweep_start + i] = (amp * (0.72 * phase.sin() + bass_mod)).clamp(-0.90, 0.90) as f32;
-        if let Some(dr) = dry_r.as_mut() {
-            let amp_r = if aux_key_mode {
-                let raw_r = if (7_200..13_200).contains(&i) {
-                    0.04
-                } else if (13_200..18_600).contains(&i) {
-                    let swell_r = 0.5 - 0.5 * (TAU * 2.1 * t).cos();
-                    let trans_r = (-((i % 1_800) as f64) / 450.0).exp();
-                    (0.18 + 0.37 * (0.50 * swell_r + 0.50 * trans_r)).clamp(0.18, 0.55)
-                } else {
-                    let swell_r = 0.5 + 0.5 * (TAU * 1.45 * t + 0.6).cos();
-                    let trans_r = (-(((i + 600) % 2_100) as f64) / 500.0).exp();
-                    (0.55 + 0.45 * (0.55 * swell_r + 0.45 * trans_r)).clamp(0.45, 1.00)
-                };
-                fade_in * fade_out * raw_r
-            } else {
-                amp
-            };
-            let val_r = amp_r * (0.70 * (phase + 0.08).sin() + 0.95 * bass_mod);
-            dr[sweep_start + i] = val_r.clamp(-0.90, 0.90) as f32;
-        }
-    }
-
-    (dry_l, dry_r)
 }
 
-/// Parameters describing a full-bandwidth (`96,000`-frame) identification render & seal request.
-pub(super) struct FullbandStemRequest<'a> {
+/// Input stem buffers and control sweeps for [`render_stem_48k`].
+#[derive(Debug)]
+pub(super) struct StemRenderRequest<'a> {
     pub stem_id: &'a str,
     pub sample_rate_hz: u32,
     pub topology_mode: TopologyProbeMode,
-    pub seed_256: &'a [u8; 256],
-    pub carrier_bins: &'a [usize],
-    pub valid_frames: usize,
-    pub full_dry_l_48k: &'a [f32],
-    pub full_dry_r_48k: Option<&'a [f32]>,
+    pub dry_l_48k: &'a [f32],
+    pub dry_r_48k: Option<&'a [f32]>,
+    pub aux_in_3_48k: Option<&'a [f32]>,
     pub ctrl_start: &'a [f32],
     pub ctrl_end: Option<&'a [f32]>,
-    pub is_star_center: bool,
-    pub windows: Vec<StmcTrajectoryWindow>,
-    pub controls_meta: BTreeMap<String, serde_json::Value>,
-    pub user_metadata: BTreeMap<String, serde_json::Value>,
-    pub shared_align: (f64, bool, bool),
-    pub compact_render_frames_48k: Option<usize>,
 }
 
-/// Renders a shared `full_dry` identification stem (or compact leading slice for stationary Stage C
-/// stops/switches) through `target` and seals `INPC` + `VaultCaptureSpec` under causal alignment.
-pub(super) fn render_and_seal_fullband_stem(
+/// Renders a canonical `48 kHz` multi-channel stem through `target` (resampling cleanly to/from
+/// `sample_rate_hz`) and returns `(wet_l_48k, Option<wet_r_48k>)`.
+pub(super) fn render_stem_48k(
     target: &mut dyn DistillationTarget,
-    mut req: FullbandStemRequest<'_>,
-) -> Result<(Vec<u8>, VaultCaptureSpec), DnamError> {
+    req: StemRenderRequest<'_>,
+) -> Result<(Vec<f32>, Option<Vec<f32>>), DnamError> {
     let sr = req.sample_rate_hz.clamp(8_000, 384_000);
     let need_aux = matches!(
         req.topology_mode,
         TopologyProbeMode::FourCableMethod4Cm | TopologyProbeMode::DualInToMono2To1
     );
-    let render_len_48k =
-        req.compact_render_frames_48k
-            .map_or(req.full_dry_l_48k.len(), |compact_n| {
-                let pad = (req.shared_align.0.ceil().max(0.0) as usize) + 128;
-                (compact_n + pad).clamp(1_024, req.full_dry_l_48k.len())
-            });
-    let dry_l_render = &req.full_dry_l_48k[..render_len_48k];
-    let dry_r_render = req
-        .full_dry_r_48k
-        .map(|r| &r[..render_len_48k.min(r.len())]);
-    let aux_48k = need_aux.then_some(dry_l_render);
-    let (in_1, in_2, in_3) = resample_48k_channels_to_sr(sr, dry_l_render, dry_r_render, aux_48k);
+    let fallback_aux = need_aux.then_some(req.dry_l_48k);
+    let eff_aux = req.aux_in_3_48k.or(fallback_aux);
+    let (in_1, in_2, in_3) = resample_48k_channels_to_sr(sr, req.dry_l_48k, req.dry_r_48k, eff_aux);
 
     let trajs = req.ctrl_end.map(|end_c| {
         let len = in_1.len().max(1);
@@ -419,42 +113,193 @@ pub(super) fn render_and_seal_fullband_stem(
     };
     target.reset_state();
     let resp = target.render_stem(&stim)?;
-    let resp_sr = resp.sample_rate_hz.clamp(8_000, 384_000);
-    let to_48k = |ch: &[f32]| -> Vec<f32> {
-        if resp_sr == 48_000 {
-            ch.to_vec()
-        } else {
-            let dst = resampled_frame_len(ch.len(), resp_sr, 48_000);
-            resample_arbitrary_rate_to_48k(ch, resp_sr, Some(dst))
-        }
-    };
-    let wet_l_48k = to_48k(&resp.out_1);
-    let wet_r_48k = resp.out_2.as_deref().map(to_48k);
+    let wet_l_48k = normalize_response_to_48k(&resp.out_1, resp.sample_rate_hz);
+    let wet_r_48k = resp
+        .out_2
+        .as_deref()
+        .map(|o2| normalize_response_to_48k(o2, resp.sample_rate_hz));
+    Ok((wet_l_48k, wet_r_48k))
+}
 
-    let star_phys = if req.is_star_center {
-        let probe_len = 13_824.min(req.full_dry_l_48k.len()).min(wet_l_48k.len());
-        let comb_len = 4_608.min(probe_len);
-        let phys = physics_probe::extract_star_physics_from_audio(
-            &req.full_dry_l_48k[..probe_len],
-            req.full_dry_r_48k.map(|r| &r[..probe_len.min(r.len())]),
-            &wet_l_48k[..probe_len],
-            wet_r_48k.as_deref().map(|r| &r[..probe_len.min(r.len())]),
-            &req.full_dry_l_48k[..comb_len],
-            &wet_l_48k[..comb_len],
-            wet_r_48k.as_deref().map(|r| &r[..comb_len.min(r.len())]),
-            &wet_l_48k[wet_l_48k.len().saturating_sub(4_608)..],
-            wet_r_48k
-                .as_deref()
-                .map(|r| &r[r.len().saturating_sub(4_608)..]),
-            req.carrier_bins,
-        );
-        req.user_metadata.extend(phys.metadata);
-        Some(phys.extracted)
+/// Parameters describing a full-bandwidth (`96,000–120,000`-frame) stem seal request.
+#[derive(Debug)]
+pub(super) struct FullbandStemRequest<'a> {
+    pub stem_id: &'a str,
+    pub sample_rate_hz: u32,
+    pub topology_mode: TopologyProbeMode,
+    pub seed_256: &'a [u8; 256],
+    pub carrier_bins: &'a [usize],
+    pub valid_frames: usize,
+    pub full_dry_l_48k: &'a [f32],
+    pub full_dry_r_48k: Option<&'a [f32]>,
+    pub aux_in_3_48k: Option<&'a [f32]>,
+    pub ctrl_start: &'a [f32],
+    pub ctrl_end: Option<&'a [f32]>,
+    pub is_star_center: bool,
+    pub windows: Vec<StmcTrajectoryWindow>,
+    pub controls_meta: BTreeMap<String, serde_json::Value>,
+    pub user_metadata: BTreeMap<String, serde_json::Value>,
+    pub shared_align: SharedStemAlignment,
+    pub optional_spcm: Option<Vec<u8>>,
+    pub pre_extracted_physics: Option<(ExtractedPhysics, BTreeMap<String, serde_json::Value>)>,
+    pub pre_rendered_aligned_wet: Option<(Vec<f32>, Option<Vec<f32>>)>,
+}
+
+/// Input slices for [`compute_star_schoukens_physics`].
+#[derive(Debug)]
+pub(super) struct StarPhysicsInputs<'a> {
+    pub plan: &'a OddRandomMultisinePlan,
+    pub r1_dry_period_l: &'a [f32],
+    pub r1_settled_periods_l: &'a [&'a [f32]],
+    pub r1_settled_periods_r: Option<&'a [&'a [f32]]>,
+    pub aligned_wet_r2_l: &'a [f32],
+    pub aligned_wet_r2_r: Option<&'a [f32]>,
+    pub r2_gap_ranges: &'a [(usize, usize)],
+    pub coreset_dry_l: &'a [f32],
+    pub coreset_dry_r: Option<&'a [f32]>,
+    pub coreset_wet_l: &'a [f32],
+    pub coreset_wet_r: Option<&'a [f32]>,
+    pub probe_comb_dry_l: &'a [f32],
+    pub probe_comb_wet_l: &'a [f32],
+    pub probe_comb_wet_r: Option<&'a [f32]>,
+    pub probe_carrier_bins: &'a [usize],
+    pub coreset_regime_offsets: [u32; 5],
+    pub calb_noise_floor_dbfs: f32,
+}
+
+/// Computes merged `ExtractedPhysics` + `user_metadata` combining comb/echo probe telemetry and
+/// `Schoukens–Pintelon` (`BLA`, even/odd distortion, `Law 0.A` variance, `EDC` $T_{60}$, offsets).
+pub(super) fn compute_star_schoukens_physics(
+    inputs: StarPhysicsInputs<'_>,
+) -> (ExtractedPhysics, BTreeMap<String, serde_json::Value>) {
+    let coreset_probe_len = 13_824
+        .min(inputs.coreset_dry_l.len())
+        .min(inputs.coreset_wet_l.len());
+    let comb_len = 4_608
+        .min(inputs.probe_comb_dry_l.len())
+        .min(inputs.probe_comb_wet_l.len());
+    let tail_start = inputs.r2_gap_ranges.last().map_or(
+        inputs.probe_comb_wet_l.len().saturating_sub(4_608),
+        |&(gs, ge)| {
+            if ge.saturating_sub(gs) >= 4_608 && ge <= inputs.aligned_wet_r2_l.len() {
+                gs
+            } else {
+                inputs.probe_comb_wet_l.len().saturating_sub(4_608)
+            }
+        },
+    );
+    let (tail_l, tail_r) = if let Some(&(gs, ge)) = inputs.r2_gap_ranges.last()
+        && ge.saturating_sub(gs) >= 4_608
+        && ge <= inputs.aligned_wet_r2_l.len()
+    {
+        (
+            &inputs.aligned_wet_r2_l[tail_start..tail_start + 4_608],
+            inputs
+                .aligned_wet_r2_r
+                .filter(|r| tail_start + 4_608 <= r.len())
+                .map(|r| &r[tail_start..tail_start + 4_608])
+                .or_else(|| {
+                    inputs
+                        .probe_comb_wet_r
+                        .map(|r| &r[r.len().saturating_sub(4_608)..])
+                }),
+        )
     } else {
-        None
+        (
+            &inputs.probe_comb_wet_l[inputs.probe_comb_wet_l.len().saturating_sub(4_608)..],
+            inputs
+                .probe_comb_wet_r
+                .map(|r| &r[r.len().saturating_sub(4_608)..]),
+        )
     };
 
-    let (inpc, mut spec, _, _) = seal_coresets_to_inpc_and_vault_with_stereo_override(
+    let mut base = physics_probe::extract_star_physics_from_audio(
+        &inputs.coreset_dry_l[..coreset_probe_len],
+        inputs
+            .coreset_dry_r
+            .map(|r| &r[..coreset_probe_len.min(r.len())]),
+        &inputs.coreset_wet_l[..coreset_probe_len],
+        inputs
+            .coreset_wet_r
+            .map(|r| &r[..coreset_probe_len.min(r.len())]),
+        &inputs.probe_comb_dry_l[..comb_len],
+        &inputs.probe_comb_wet_l[..comb_len],
+        inputs.probe_comb_wet_r.map(|r| &r[..comb_len.min(r.len())]),
+        tail_l,
+        tail_r,
+        inputs.probe_carrier_bins,
+    );
+
+    let sp = analyze_schoukens_pintelon_physics(
+        inputs.plan,
+        inputs.r1_dry_period_l,
+        inputs.r1_settled_periods_l,
+        inputs.r1_settled_periods_r,
+        Regime2DecayInput {
+            wet_l: inputs.aligned_wet_r2_l,
+            wet_r: inputs.aligned_wet_r2_r,
+            gap_ranges: inputs.r2_gap_ranges,
+        },
+        SchoukensAnalysisConfig {
+            calb_noise_floor_dbfs: inputs.calb_noise_floor_dbfs,
+            coreset_regime_offsets: inputs.coreset_regime_offsets,
+        },
+    );
+    sp.apply_to_extracted_physics(&mut base.extracted);
+    if !sp.edc_t60_s.is_finite() || sp.edc_t60_s == 0.0 {
+        base.extracted.edc_t60_s = 0.0;
+    } else {
+        base.metadata.insert(
+            "phys_rt60_s".to_string(),
+            serde_json::json!(f64::from(sp.edc_t60_s)),
+        );
+    }
+    (base.extracted, base.metadata)
+}
+
+/// Renders a shared `full_dry` coreset through `target` (or seals pre-rendered condensed `SPCM`
+/// slices) and seals `INPC` + `VaultCaptureSpec` under full hybrid lag + PPM alignment.
+pub(super) fn render_and_seal_fullband_stem(
+    target: &mut dyn DistillationTarget,
+    mut req: FullbandStemRequest<'_>,
+) -> Result<(Vec<u8>, VaultCaptureSpec), DnamError> {
+    let used_pre_rendered = req.pre_rendered_aligned_wet.is_some();
+    let (wet_l_48k, wet_r_48k, eff_align) =
+        if let Some((al_l, al_r)) = req.pre_rendered_aligned_wet.take() {
+            (
+                al_l,
+                al_r,
+                SharedStemAlignment {
+                    lag_samples: 0.0,
+                    clock_drift_ppm: 0.0,
+                    invert_l: false,
+                    invert_r: false,
+                },
+            )
+        } else {
+            let (wl, wr) = render_stem_48k(
+                target,
+                StemRenderRequest {
+                    stem_id: req.stem_id,
+                    sample_rate_hz: req.sample_rate_hz,
+                    topology_mode: req.topology_mode,
+                    dry_l_48k: req.full_dry_l_48k,
+                    dry_r_48k: req.full_dry_r_48k,
+                    aux_in_3_48k: req.aux_in_3_48k,
+                    ctrl_start: req.ctrl_start,
+                    ctrl_end: req.ctrl_end,
+                },
+            )?;
+            (wl, wr, req.shared_align)
+        };
+
+    let mut extracted_opt = None;
+    if let Some((ep, meta)) = req.pre_extracted_physics.take() {
+        req.user_metadata.extend(meta);
+        extracted_opt = Some(ep);
+    }
+
+    let (inpc, mut spec, _, _) = seal_coresets_to_inpc_and_vault_with_full_align(
         StemSealRequest {
             stem_id: req.stem_id,
             is_star_center: req.is_star_center,
@@ -469,10 +314,20 @@ pub(super) fn render_and_seal_fullband_stem(
             controls_meta: req.controls_meta,
             user_metadata: req.user_metadata,
         },
-        Some(req.shared_align),
+        Some(eff_align),
     )?;
-    if let Some(ext) = star_phys {
+    if used_pre_rendered {
+        spec.fractional_lag_samples_f32 = req.shared_align.lag_samples as f32;
+        if req.shared_align.invert_l {
+            spec.user_metadata
+                .insert("wet_polarity_inverted".to_string(), serde_json::json!(true));
+        }
+    }
+    if let Some(ext) = extracted_opt {
         spec.extracted_physics = Some(ext);
+    }
+    if req.optional_spcm.is_some() {
+        spec.optional_spcm = req.optional_spcm;
     }
     Ok((inpc, spec))
 }
@@ -484,7 +339,7 @@ pub(super) fn probe_target_repeatability_profiles(
     sample_rate_hz: u32,
     topology_mode: TopologyProbeMode,
     control_values: &[f32],
-    shared_align: (f64, bool, bool),
+    shared_align: SharedStemAlignment,
 ) -> Result<[TargetRepeatabilityProfile; 2], DnamError> {
     let sr = sample_rate_hz.clamp(8_000, 384_000);
     let (rep_dry, rep_windows, rep_late_w) = build_repeatability_probe_stream(48_000.0);
@@ -494,45 +349,35 @@ pub(super) fn probe_target_repeatability_profiles(
         topology_mode,
         TopologyProbeMode::TrueStereo2To2 | TopologyProbeMode::DualInToMono2To1
     );
-    let need_aux = matches!(
-        topology_mode,
-        TopologyProbeMode::FourCableMethod4Cm | TopologyProbeMode::DualInToMono2To1
+    let (wet_l_48k, wet_r_48k) = render_stem_48k(
+        target,
+        StemRenderRequest {
+            stem_id: "repeatability_probe",
+            sample_rate_hz: sr,
+            topology_mode,
+            dry_l_48k: &dry_l,
+            dry_r_48k: need_stereo.then_some(dry_r.as_slice()),
+            aux_in_3_48k: None,
+            ctrl_start: control_values,
+            ctrl_end: None,
+        },
+    )?;
+    let al_l = realign_fractional_kaiser64(
+        &wet_l_48k,
+        shared_align.lag_samples,
+        shared_align.clock_drift_ppm,
+        shared_align.invert_l,
     );
-    let (in_1, in_2, in_3) = resample_48k_channels_to_sr(
-        sr,
-        &dry_l,
-        need_stereo.then_some(dry_r.as_slice()),
-        need_aux.then_some(dry_l.as_slice()),
-    );
-
-    target.reset_state();
-    let resp = target.render_stem(&StemStimulus {
-        stem_id: "repeatability_probe".to_string(),
-        sample_rate_hz: sr,
-        in_1,
-        in_2,
-        in_3,
-        in_4: None,
-        control_values: control_values.to_vec(),
-        control_trajectories: None,
-        freeze_transition_window: None,
-    })?;
-    let resp_sr = resp.sample_rate_hz.clamp(8_000, 384_000);
-    let to_48k = |ch: &[f32]| -> Vec<f32> {
-        if resp_sr == 48_000 {
-            ch.to_vec()
-        } else {
-            let dst = resampled_frame_len(ch.len(), resp_sr, 48_000);
-            resample_arbitrary_rate_to_48k(ch, resp_sr, Some(dst))
-        }
-    };
-    let (causal_lag, inv_l, inv_r) = shared_align;
-    let al_l = realign_fractional_kaiser64(&to_48k(&resp.out_1), causal_lag, 0.0, inv_l);
     let wl: Vec<f64> = al_l.iter().map(|&v| f64::from(v)).collect();
     let prof_l =
         TargetRepeatabilityProfile::from_probe_response(&wl, &rep_windows, rep_late_w, 48_000.0);
-    let prof_r = resp.out_2.as_deref().map_or(prof_l, |o2| {
-        let al_r = realign_fractional_kaiser64(&to_48k(o2), causal_lag, 0.0, inv_r);
+    let prof_r = wet_r_48k.as_deref().map_or(prof_l, |o2| {
+        let al_r = realign_fractional_kaiser64(
+            o2,
+            shared_align.lag_samples,
+            shared_align.clock_drift_ppm,
+            shared_align.invert_r,
+        );
         let wr: Vec<f64> = al_r.iter().map(|&v| f64::from(v)).collect();
         TargetRepeatabilityProfile::from_probe_response(&wr, &rep_windows, rep_late_w, 48_000.0)
     });
@@ -541,49 +386,223 @@ pub(super) fn probe_target_repeatability_profiles(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::*;
+    use crate::proj::capsules::{decode_proj_inpc_f32, decode_proj_stmc_f32};
+    use crate::proj::directory::{verify_proj_inpc_capsule, verify_proj_stmc_capsule};
+    use crate::stimulus::pipeline::schoukens::{
+        SCHOUKENS_CORESET_25S_OFFSETS, build_schoukens_pintelon_coreset_48k,
+    };
+    use crate::targets::StemResponse;
+
+    struct PassTarget;
+    impl DistillationTarget for PassTarget {
+        fn reset_state(&mut self) {}
+        fn render_stem(&mut self, s: &StemStimulus) -> Result<StemResponse, DnamError> {
+            Ok(StemResponse {
+                stem_id: s.stem_id.clone(),
+                sample_rate_hz: s.sample_rate_hz,
+                out_1: s.in_1.clone(),
+                out_2: None,
+                out_3: None,
+                out_4: None,
+                internal_nodes: BTreeMap::new(),
+            })
+        }
+    }
 
     #[test]
-    fn test_probe_requires_contiguous_96k_fullband_flags_tail_and_lfo() {
-        let ti_dry = build_time_invariance_probe_48k();
-        let seed = [0x42_u8; 256];
+    fn test_fullband_render_and_seal_120k_schoukens_with_ppm_and_aux() {
+        let seed = [0x61_u8; 256];
+        let exc = build_schoukens_pintelon_coreset_48k(
+            &seed,
+            TopologyProbeMode::Mono1To1,
+            120_000,
+            &BTreeSet::new(),
+        );
+        let mut target = PassTarget;
+        let win = vec![StmcTrajectoryWindow {
+            control_id: 0,
+            ctrl_kind: 0,
+            active_opt: 0,
+            u_phys: 0.0,
+            window_weight: 1.0,
+            emr_velocity: 0.0,
+        }];
+        let align = SharedStemAlignment {
+            lag_samples: 0.0,
+            clock_drift_ppm: 0.0,
+            invert_l: false,
+            invert_r: false,
+        };
+        let (inpc, spec) = render_and_seal_fullband_stem(
+            &mut target,
+            FullbandStemRequest {
+                stem_id: "star_120k",
+                sample_rate_hz: 48_000,
+                topology_mode: TopologyProbeMode::Mono1To1,
+                seed_256: &seed,
+                carrier_bins: &[23, 57],
+                valid_frames: 6,
+                full_dry_l_48k: &exc.dry_l,
+                full_dry_r_48k: None,
+                aux_in_3_48k: None,
+                ctrl_start: &[],
+                ctrl_end: None,
+                is_star_center: true,
+                windows: win,
+                controls_meta: BTreeMap::new(),
+                user_metadata: BTreeMap::new(),
+                shared_align: align,
+                optional_spcm: None,
+                pre_extracted_physics: None,
+                pre_rendered_aligned_wet: None,
+            },
+        )
+        .unwrap();
+        let inpc_view = verify_proj_inpc_capsule(&inpc).unwrap();
+        assert_eq!(inpc_view.num_frames, 120_000);
+        let (dl, _) = decode_proj_inpc_f32(&inpc_view);
+        assert_eq!(dl.len(), SCHOUKENS_CORESET_25S_OFFSETS[4] as usize);
 
-        // Deterministic static waveshaper + short 350-sample reflection -> standard [70_976 + sweep] path.
-        let mut static_ti_wet = vec![0.0_f32; ti_dry.len()];
-        for (i, slot) in static_ti_wet.iter_mut().enumerate() {
-            let early = if i >= 350 { ti_dry[i - 350] } else { 0.0 };
-            let shaped = (3.5 * f64::from(ti_dry[i])).tanh() as f32;
-            *slot = 0.7 * shaped + 0.3 * early;
-        }
-        assert!(!probe_requires_contiguous_96k_fullband(
-            &static_ti_wet,
-            None
-        ));
+        let stmc_bytes = {
+            let mut f = crate::proj::STMC_FLAG_ENABLED | crate::proj::STMC_FLAG_STAR_CENTER;
+            if spec.is_stereo {
+                f |= crate::proj::STMC_FLAG_STEREO;
+            }
+            crate::proj::capsules::build_proj_stmc_capsule(
+                0,
+                f,
+                spec.pad_gain_f32,
+                spec.fractional_lag_samples_f32,
+                &spec.band_psd_summary_88,
+                spec.n_comb_bins,
+                &spec.windows,
+                &spec.spectral_summary_4096,
+                &spec.wet_coreset_fp32,
+            )
+            .unwrap()
+        };
+        let stmc_view = verify_proj_stmc_capsule(&stmc_bytes).unwrap();
+        let (wl, _) = decode_proj_stmc_f32(&stmc_view);
+        assert_eq!(wl.len(), 120_000);
+    }
 
-        // Sustained FDN / BBD tail past 106 ms ([21_504..24_576)) -> contiguous 96k coreset.
-        let mut tail_ti_wet = static_ti_wet.clone();
-        for (i, slot) in tail_ti_wet[TI_TAIL_START_SAMPLES..TI_TOTAL_SAMPLES]
-            .iter_mut()
-            .enumerate()
-        {
-            *slot = 0.05 * ((i as f32) * 0.11).sin();
-        }
-        assert!(probe_requires_contiguous_96k_fullband(&tail_ti_wet, None));
+    #[test]
+    fn test_fullband_96k_ctrl_end_4cm_and_short_r2_r_guard() {
+        let seed = [0x62_u8; 256];
+        let exc = build_schoukens_pintelon_coreset_48k(
+            &seed,
+            TopologyProbeMode::FourCableMethod4Cm,
+            96_000,
+            &BTreeSet::new(),
+        );
+        let mut target = PassTarget;
+        let win = vec![StmcTrajectoryWindow {
+            control_id: 0,
+            ctrl_kind: 0,
+            active_opt: 0,
+            u_phys: 0.25,
+            window_weight: 1.0,
+            emr_velocity: 0.5,
+        }];
+        let align = SharedStemAlignment {
+            lag_samples: 0.0,
+            clock_drift_ppm: 12.0,
+            invert_l: false,
+            invert_r: false,
+        };
+        let (inpc, spec) = render_and_seal_fullband_stem(
+            &mut target,
+            FullbandStemRequest {
+                stem_id: "sweep_4cm_96k",
+                sample_rate_hz: 96_000,
+                topology_mode: TopologyProbeMode::FourCableMethod4Cm,
+                seed_256: &seed,
+                carrier_bins: &[23, 57],
+                valid_frames: 6,
+                full_dry_l_48k: &exc.dry_l,
+                full_dry_r_48k: exc.dry_r.as_deref(),
+                aux_in_3_48k: exc.aux_in_3.as_deref(),
+                ctrl_start: &[0.25],
+                ctrl_end: Some(&[0.75]),
+                is_star_center: false,
+                windows: win.clone(),
+                controls_meta: BTreeMap::new(),
+                user_metadata: BTreeMap::new(),
+                shared_align: align,
+                optional_spcm: None,
+                pre_extracted_physics: None,
+                pre_rendered_aligned_wet: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(verify_proj_inpc_capsule(&inpc).unwrap().num_frames, 96_000);
+        assert_eq!(spec.stem_id, "sweep_4cm_96k");
 
-        // Modulated chorus lag shift breaking 2048-sample periodic orbit -> contiguous 96k coreset.
-        let mut mod_ti_wet = vec![0.0_f32; ti_dry.len()];
-        for (i, slot) in mod_ti_wet.iter_mut().enumerate() {
-            let t = (i as f64) / 48_000.0;
-            let lag = (400.0 + 35.0 * (TAU * 2.0 * t).sin()).round() as usize;
-            let wet = if i >= lag { ti_dry[i - lag] } else { 0.0 };
-            *slot = 0.55 * ti_dry[i] + 0.45 * wet;
-        }
-        assert!(probe_requires_contiguous_96k_fullband(&mod_ti_wet, None));
-
-        let (ctg_l, _) =
-            build_fullband_identification_coreset_48k_opts(&seed, false, false, false, true);
-        let (std_l, _) = build_fullband_identification_coreset_48k(&seed, false, false, false);
-        assert!(ctg_l[71_100..71_900].iter().any(|&v| v.abs() > 1.0e-3));
-        assert!(std_l[71_100..71_900].iter().all(|&v| v.abs() <= 1.0e-6));
+        // Exercise `compute_star_schoukens_physics` short `aligned_wet_r2_r` tail bounds guard
+        // plus `pre_extracted_physics`, `pre_rendered_aligned_wet`, and `optional_spcm` paths.
+        let plan = crate::stimulus::pipeline::schoukens::build_odd_random_multisine_plan(
+            &seed,
+            &BTreeSet::new(),
+        );
+        let r1 = &exc.dry_l[..16_384];
+        let r2 = &exc.dry_l[..12_000];
+        let pre_phys = compute_star_schoukens_physics(StarPhysicsInputs {
+            plan: &plan,
+            r1_dry_period_l: r1,
+            r1_settled_periods_l: &[r1],
+            r1_settled_periods_r: None,
+            aligned_wet_r2_l: r2,
+            aligned_wet_r2_r: Some(&r2[..100]),
+            r2_gap_ranges: &[(5_000, 10_000)],
+            coreset_dry_l: &exc.dry_l[..13_824],
+            coreset_dry_r: None,
+            coreset_wet_l: &exc.dry_l[..13_824],
+            coreset_wet_r: None,
+            probe_comb_dry_l: &exc.dry_l[..4_608],
+            probe_comb_wet_l: &exc.dry_l[..4_608],
+            probe_comb_wet_r: Some(&exc.dry_l[..4_608]),
+            probe_carrier_bins: &[23, 57],
+            coreset_regime_offsets:
+                crate::stimulus::pipeline::schoukens::SCHOUKENS_CORESET_20S_OFFSETS,
+            calb_noise_floor_dbfs: -100.0,
+        });
+        let (_, spec_short_r) = render_and_seal_fullband_stem(
+            &mut target,
+            FullbandStemRequest {
+                stem_id: "pre_short_r",
+                sample_rate_hz: 48_000,
+                topology_mode: TopologyProbeMode::MonoToStereo1To2,
+                seed_256: &seed,
+                carrier_bins: &[23, 57],
+                valid_frames: 6,
+                full_dry_l_48k: &exc.dry_l,
+                full_dry_r_48k: None,
+                aux_in_3_48k: None,
+                ctrl_start: &[],
+                ctrl_end: None,
+                is_star_center: true,
+                windows: win,
+                controls_meta: BTreeMap::new(),
+                user_metadata: BTreeMap::new(),
+                shared_align: SharedStemAlignment {
+                    lag_samples: 1.5,
+                    clock_drift_ppm: 0.0,
+                    invert_l: true,
+                    invert_r: false,
+                },
+                optional_spcm: Some(vec![0_u8; 64]),
+                pre_extracted_physics: Some(pre_phys),
+                pre_rendered_aligned_wet: Some((exc.dry_l.clone(), Some(exc.dry_l.clone()))),
+            },
+        )
+        .unwrap();
+        assert!(spec_short_r.extracted_physics.is_some());
+        assert_eq!(
+            spec_short_r.user_metadata.get("wet_polarity_inverted"),
+            Some(&serde_json::json!(true))
+        );
     }
 }

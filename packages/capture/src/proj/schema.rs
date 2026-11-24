@@ -134,6 +134,27 @@ pub struct ExtractedPhysics {
     /// Detected pitch shift interval in semitones (`0.0` if none).
     #[serde(default)]
     pub detected_pitch_shift_semitones: f32,
+    /// Best Linear Approximation 1/3-octave magnitude profile (`33` bands, dB; empty if omitted).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bla_mag_33_db: Vec<f32>,
+    /// Broadband even-order distortion ratio relative to fundamental (dB).
+    #[serde(default)]
+    pub even_dist_ratio_db: f32,
+    /// Broadband odd-order distortion ratio relative to fundamental (dB).
+    #[serde(default)]
+    pub odd_dist_ratio_db: f32,
+    /// `Law 0.A`-gated 1/3-octave repeatability noise variance (`33` non-negative values, linear power).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub noise_var_33_lin: Vec<f32>,
+    /// Schroeder Energy Decay Curve `60 dB` reverberation time in seconds (`>= 0.0`).
+    #[serde(default)]
+    pub edc_t60_s: f32,
+    /// True when `Law 0.A` detected time-varying modulation across `Regime 1` periods.
+    #[serde(default)]
+    pub law0a_ltv_flag: bool,
+    /// Monotonic coreset regime sample boundaries `[0, r2_start, r3_start, r4_start, total_frames]`.
+    #[serde(default)]
+    pub coreset_regime_offsets: [u32; 5],
 }
 
 /// Per-capture entry in `manifest.stems_registry` (`r[container.proj.manifest]`).
@@ -227,6 +248,35 @@ pub struct DnamProjManifest {
 
 fn is_valid_lower_hex_64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+fn validate_extracted_physics(stem_id: &str, ep: &ExtractedPhysics) -> Result<(), DnamError> {
+    let scalar_bad = !ep.detected_grain_size_ms.is_finite()
+        || !ep.detected_pitch_shift_semitones.is_finite()
+        || !ep.even_dist_ratio_db.is_finite()
+        || !ep.odd_dist_ratio_db.is_finite()
+        || !ep.edc_t60_s.is_finite()
+        || ep.edc_t60_s < 0.0;
+    let vec_bad = ep.delays_ms.iter().any(|v| !v.is_finite())
+        || ep.lfo_freqs_hz.iter().any(|v| !v.is_finite())
+        || ep.decay_gains_lin.iter().any(|v| !v.is_finite());
+    let bla_bad = !ep.bla_mag_33_db.is_empty()
+        && (ep.bla_mag_33_db.len() != 33 || ep.bla_mag_33_db.iter().any(|v| !v.is_finite()));
+    let noise_bad = !ep.noise_var_33_lin.is_empty()
+        && (ep.noise_var_33_lin.len() != 33
+            || ep
+                .noise_var_33_lin
+                .iter()
+                .any(|v| !v.is_finite() || *v < 0.0));
+    let o = ep.coreset_regime_offsets;
+    let offsets_bad =
+        o != [0; 5] && (o[0] != 0 || o[0] > o[1] || o[1] > o[2] || o[2] > o[3] || o[3] > o[4]);
+    if scalar_bad || vec_bad || bla_bad || noise_bad || offsets_bad {
+        return Err(DnamError::SchemaValidationError(format!(
+            "invalid extracted_physics fields on stem '{stem_id}'"
+        )));
+    }
+    Ok(())
 }
 
 impl DnamProjManifest {
@@ -349,6 +399,9 @@ impl DnamProjManifest {
                     stem.stem_id
                 )));
             }
+            if let Some(ref ep) = stem.extracted_physics {
+                validate_extracted_physics(&stem.stem_id, ep)?;
+            }
         }
         if star_count > 1 {
             return Err(DnamError::SchemaValidationError(
@@ -452,5 +505,77 @@ mod tests {
         .expect("minimal stem defaults");
         assert!(stem.enabled);
         assert!(!stem.is_star_center);
+    }
+
+    #[test]
+    fn test_extracted_physics_seven_fields_defaults_roundtrip_and_validation() {
+        let legacy: ExtractedPhysics = serde_json::from_str(
+            r#"{"delays_ms":[12.5],"lfo_freqs_hz":[],"decay_gains_lin":[0.5],"detected_grain_size_ms":0.0,"detected_pitch_shift_semitones":0.0}"#,
+        )
+        .expect("legacy 5-field JSON must deserialize with 7 defaults");
+        assert!(legacy.bla_mag_33_db.is_empty());
+        assert_eq!(legacy.even_dist_ratio_db, 0.0);
+        assert_eq!(legacy.odd_dist_ratio_db, 0.0);
+        assert!(legacy.noise_var_33_lin.is_empty());
+        assert_eq!(legacy.edc_t60_s, 0.0);
+        assert!(!legacy.law0a_ltv_flag);
+        assert_eq!(legacy.coreset_regime_offsets, [0; 5]);
+
+        assert!(
+            serde_json::from_str::<ExtractedPhysics>(r#"{"unknown_key":1}"#).is_err(),
+            "deny_unknown_fields must stay enforced"
+        );
+
+        let full = ExtractedPhysics {
+            delays_ms: vec![12.5],
+            lfo_freqs_hz: vec![0.75],
+            decay_gains_lin: vec![0.4],
+            detected_grain_size_ms: 0.0,
+            detected_pitch_shift_semitones: 0.0,
+            bla_mag_33_db: vec![-3.0; 33],
+            even_dist_ratio_db: -44.5,
+            odd_dist_ratio_db: -28.0,
+            noise_var_33_lin: vec![1.0e-7; 33],
+            edc_t60_s: 0.42,
+            law0a_ltv_flag: true,
+            coreset_regime_offsets: [0, 32_768, 73_568, 99_968, 120_000],
+        };
+        let rt: ExtractedPhysics =
+            serde_json::from_str(&serde_json::to_string(&full).unwrap()).unwrap();
+        assert_eq!(rt, full);
+
+        let mut manifest = DnamProjManifest::default_reference();
+        manifest.stems_registry.push(StemRegistryEntry {
+            stem_id: "star".to_string(),
+            chunk_id: 0,
+            enabled: true,
+            is_star_center: true,
+            controls_meta: BTreeMap::new(),
+            provenance: StemProvenance {
+                input_pcm_sha256: "a".repeat(64),
+                target_pcm_sha256: "b".repeat(64),
+                num_frames: 120_000,
+            },
+            user_metadata: BTreeMap::new(),
+            extracted_physics: Some(full.clone()),
+        });
+        assert!(manifest.validate().is_ok());
+
+        let check_bad = |mutate: &dyn Fn(&mut ExtractedPhysics)| {
+            let mut bad_m = manifest.clone();
+            let ep = bad_m.stems_registry[0].extracted_physics.as_mut().unwrap();
+            *ep = full.clone();
+            mutate(ep);
+            assert!(bad_m.validate().is_err());
+        };
+        check_bad(&|ep| ep.bla_mag_33_db = vec![0.0; 32]);
+        check_bad(&|ep| ep.bla_mag_33_db[5] = f32::NAN);
+        check_bad(&|ep| ep.noise_var_33_lin = vec![1.0e-6; 10]);
+        check_bad(&|ep| ep.noise_var_33_lin[0] = -1.0e-6);
+        check_bad(&|ep| ep.edc_t60_s = -0.1);
+        check_bad(&|ep| ep.even_dist_ratio_db = f32::INFINITY);
+        check_bad(&|ep| ep.odd_dist_ratio_db = f32::NEG_INFINITY);
+        check_bad(&|ep| ep.coreset_regime_offsets = [1, 10, 20, 30, 40]);
+        check_bad(&|ep| ep.coreset_regime_offsets = [0, 50, 40, 80, 96_000]);
     }
 }

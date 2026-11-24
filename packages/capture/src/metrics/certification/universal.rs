@@ -322,4 +322,71 @@ mod tests {
             certify_holdout_universal(Tier::Ultra, &tgt, &mod_mdl, &prof_inc, sr, 128);
         assert!(hold_inc_ok);
     }
+
+    #[test]
+    fn test_universal_caches_noise_prescreen_and_holdout_branches() {
+        let sr = 48_000.0;
+        let n = 12_000;
+        let tgt: Vec<f64> = (0..n)
+            .map(|i| 0.2 * (2.0 * PI * 400.0 * (i as f64) / sr).sin())
+            .collect();
+        let good: Vec<f64> = tgt.iter().map(|&v| v * 0.999).collect();
+        let prof_noisy = TargetRepeatabilityProfile::deterministic().with_noise_rms(1.0e-5);
+
+        let mut ltas_cache = LtasTargetCache::new(&tgt[128..], sr, 20_000.0).unwrap();
+        let mr_cache = MrIirTargetCache::new(&tgt, sr, 128).unwrap();
+        let base_s = certify_4metric_universal(Tier::Pro, &tgt, &good, &prof_noisy, sr, 128);
+        let cached_s = eval_universal_core(
+            Tier::Pro,
+            &tgt,
+            &good,
+            None,
+            &prof_noisy,
+            sr,
+            128,
+            Some(&mut ltas_cache),
+            Some(&mr_cache),
+            Some(&base_s),
+        );
+        assert!(cached_s.mr_iir.is_finite());
+
+        // Prescreen rejection when `prev_ch` strictly outperforms candidate (`raw_besr_db` worse).
+        let mut strict_prev = base_s.clone();
+        strict_prev.raw_besr_db = -120.0;
+        let mut ltas_cache2 = LtasTargetCache::new(&tgt[128..], sr, 20_000.0).unwrap();
+        let rej_s = eval_universal_core(
+            Tier::Pro,
+            &tgt,
+            &good,
+            None,
+            &prof_noisy,
+            sr,
+            128,
+            Some(&mut ltas_cache2),
+            Some(&mr_cache),
+            Some(&strict_prev),
+        );
+        assert!(!rej_s.passes_target && rej_s.mr_iir == strict_prev.mr_iir + 1.0);
+
+        // Invalid `band_inc_ratio` and mismatched slice fail cleanly.
+        let mut bad_prof = TargetRepeatabilityProfile::deterministic();
+        bad_prof.band_inc_ratio = [f64::NAN; 3];
+        let bad_s = certify_4metric_universal(Tier::Lite, &tgt, &good, &bad_prof, sr, 128);
+        assert!(!bad_s.passes_target);
+
+        let (_, hold_invalid) =
+            certify_holdout_universal(Tier::Lite, &tgt, &good[..n - 10], &prof_noisy, sr, 128);
+        assert!(!hold_invalid);
+
+        // Incoherent holdout where `passes_hard_ceiling` fails exercises `env_ok && balance_within_db`.
+        let scaled_bad: Vec<f64> = tgt.iter().map(|&v| v * 0.5).collect();
+        let prof_inc_hold = TargetRepeatabilityProfile {
+            band_inc_ratio: [0.05, 0.05, 0.05],
+            env_inc_ratio: [0.0, 0.0, 0.0],
+            noise_rms: 0.0,
+        };
+        let (_, hold_fail_bal) =
+            certify_holdout_universal(Tier::Ultra, &tgt, &scaled_bad, &prof_inc_hold, sr, 128);
+        assert!(!hold_fail_bal);
+    }
 }

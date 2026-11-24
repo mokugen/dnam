@@ -156,6 +156,7 @@ fn bench_5stage_proj_vault_solver(c: &mut Criterion) {
             stem_id: id.to_string(),
             is_star_center: is_star,
             enabled: true,
+            is_stereo: false,
             pad_gain_f32: 1.0,
             fractional_lag_samples_f32: 0.0,
             controls_meta: BTreeMap::from([("gain".to_string(), serde_json::json!(f64::from(g)))]),

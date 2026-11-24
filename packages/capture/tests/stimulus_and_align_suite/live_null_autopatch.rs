@@ -212,14 +212,12 @@ fn test_mode1_streaming_prefer_mode_b_stationary_stops() {
         manifest_b,
         &mut target,
         &AdaptiveTrainingOptions {
-            sample_rate_hz: 48_000,
-            topology_mode: TopologyProbeMode::Mono1To1,
-            fixed_duration: false,
             prefer_mode_b: true,
             max_frames_per_stem: 2,
             run_live_null_test: false,
             null_test_autopatch_threshold_db: -60.0,
             calb: Some(super::dual_mode_and_align::sample_calb()),
+            ..AdaptiveTrainingOptions::default()
         },
     )
     .expect("Mode 1 prefer_mode_b");

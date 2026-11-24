@@ -213,6 +213,10 @@ pub fn pass1_hint_from_manifest(manifest: &DnamProjManifest) -> Pass1PhysicsHint
     let Some(stem) = stem_opt else {
         return hint;
     };
+    let has_schoukens = stem
+        .extracted_physics
+        .as_ref()
+        .is_some_and(|ep| ep.bla_mag_33_db.len() == 33);
     if let Some(ref ep) = stem.extracted_physics {
         if let Some(&d) = ep.delays_ms.iter().find(|&&v| v.is_finite() && v > 0.0) {
             hint.delay_ms = Some(f64::from(d));
@@ -230,11 +234,54 @@ pub fn pass1_hint_from_manifest(manifest: &DnamProjManifest) -> Pass1PhysicsHint
         if let Some(&r) = ep.lfo_freqs_hz.iter().find(|&&v| v.is_finite() && v > 0.0) {
             hint.modulation_rate_hz = Some(f64::from(r));
         }
+        if ep.edc_t60_s.is_finite() {
+            if ep.edc_t60_s > 0.0 {
+                hint.rt60_s = Some(f64::from(ep.edc_t60_s));
+            } else if has_schoukens {
+                hint.rt60_s = None;
+            }
+        }
+        if ep.bla_mag_33_db.len() == 33 {
+            let even_amp = if ep.even_dist_ratio_db.is_finite() {
+                10.0_f64.powf(f64::from(ep.even_dist_ratio_db) / 20.0)
+            } else {
+                0.0
+            };
+            let odd_amp = if ep.odd_dist_ratio_db.is_finite() {
+                10.0_f64.powf(f64::from(ep.odd_dist_ratio_db) / 20.0)
+            } else {
+                0.0
+            };
+            let thd = even_amp.hypot(odd_amp);
+            if thd.is_finite() {
+                hint.thd_ratio = Some(thd);
+            }
+            let sum_eo = even_amp + odd_amp;
+            hint.even_odd_asymmetry = Some(if sum_eo > 1.0e-9 {
+                ((even_amp - odd_amp) / sum_eo).clamp(-1.0, 1.0)
+            } else {
+                0.0
+            });
+        }
+        if !ep.noise_var_33_lin.is_empty() {
+            let total_var: f64 = ep
+                .noise_var_33_lin
+                .iter()
+                .filter(|v| v.is_finite() && **v >= 0.0)
+                .map(|&v| f64::from(v))
+                .sum();
+            hint.noise_floor_db = Some((10.0 * total_var.max(1.0e-18).log10()).clamp(-140.0, 0.0));
+        }
+        if ep.law0a_ltv_flag && hint.modulation_rate_hz.is_none() {
+            hint.modulation_rate_hz = Some(1.0);
+        }
     }
     let read_f64 = |key: &str| stem.user_metadata.get(key).and_then(|v| v.as_f64());
     if let Some(v) = read_f64("phys_rt60_s") {
         hint.rt60_s = Some(v);
-    } else if let Some(v_ms) = read_f64("phys_rt60_ms").filter(|v| v.is_finite() && *v > 0.0) {
+    } else if !has_schoukens
+        && let Some(v_ms) = read_f64("phys_rt60_ms").filter(|v| v.is_finite() && *v > 0.0)
+    {
         hint.rt60_s = Some(v_ms * 1.0e-3);
     }
     if let Some(v) = read_f64("phys_delay_ms") {
@@ -246,13 +293,13 @@ pub fn pass1_hint_from_manifest(manifest: &DnamProjManifest) -> Pass1PhysicsHint
     let even_harm = read_f64("phys_even_harm").filter(|v| v.is_finite());
     if let Some(v) = read_f64("phys_thd_ratio") {
         hint.thd_ratio = Some(v);
-    } else if odd_harm.is_some() || even_harm.is_some() {
+    } else if !has_schoukens && (odd_harm.is_some() || even_harm.is_some()) {
         let thd = odd_harm.unwrap_or(0.0).max(0.0) + even_harm.unwrap_or(0.0).max(0.0);
         hint.thd_ratio = Some(thd);
     }
     if let Some(v) = read_f64("phys_even_odd_asymmetry") {
         hint.even_odd_asymmetry = Some(v);
-    } else if odd_harm.is_some() || even_harm.is_some() {
+    } else if !has_schoukens && (odd_harm.is_some() || even_harm.is_some()) {
         let odd = odd_harm.unwrap_or(0.0).max(0.0);
         let even = even_harm.unwrap_or(0.0).max(0.0);
         let denom = odd.abs() + even.abs();
@@ -583,5 +630,52 @@ mod tests {
         let overridden = pass1_hint_from_manifest(&manifest);
         assert!((overridden.rt60_s.expect("override rt60") - 1.3).abs() < 1.0e-6);
         assert_eq!(overridden.has_stereo_width, Some(true));
+    }
+
+    #[test]
+    fn test_pass1_hint_from_manifest_consumes_schoukens_extracted_physics_fields() {
+        let mut manifest = DnamProjManifest::default_reference();
+        let mut stale_meta = std::collections::BTreeMap::new();
+        stale_meta.insert("phys_odd_harm".to_string(), serde_json::json!(0.9));
+        stale_meta.insert("phys_even_harm".to_string(), serde_json::json!(0.9));
+        stale_meta.insert("phys_rt60_ms".to_string(), serde_json::json!(450.0));
+        manifest
+            .stems_registry
+            .push(crate::proj::schema::StemRegistryEntry {
+                stem_id: "star_center".to_string(),
+                chunk_id: 0,
+                enabled: true,
+                is_star_center: true,
+                controls_meta: Default::default(),
+                provenance: crate::proj::schema::StemProvenance {
+                    input_pcm_sha256: "0".repeat(64),
+                    target_pcm_sha256: "0".repeat(64),
+                    num_frames: 120_000,
+                },
+                user_metadata: stale_meta,
+                extracted_physics: Some(crate::proj::schema::ExtractedPhysics {
+                    bla_mag_33_db: vec![-3.0; 33],
+                    even_dist_ratio_db: -20.0, // 0.10
+                    odd_dist_ratio_db: -40.0,  // 0.01
+                    noise_var_33_lin: vec![1.0e-6 / 33.0; 33],
+                    edc_t60_s: 1.45,
+                    law0a_ltv_flag: true,
+                    coreset_regime_offsets: [0, 32_768, 73_568, 99_968, 120_000],
+                    ..Default::default()
+                }),
+            });
+        let hint = pass1_hint_from_manifest(&manifest);
+        assert!((hint.rt60_s.unwrap() - 1.45).abs() < 1.0e-5);
+        assert!((hint.thd_ratio.unwrap() - 0.10_f64.hypot(0.01)).abs() < 1.0e-6);
+        assert!(hint.even_odd_asymmetry.unwrap() > 0.8);
+        assert!((hint.noise_floor_db.unwrap() + 60.0).abs() < 0.05);
+        assert_eq!(hint.modulation_rate_hz, Some(1.0));
+        // Dry Schoukens target (edc_t60_s = 0.0) must NOT inherit legacy phys_rt60_ms.
+        manifest.stems_registry[0]
+            .extracted_physics
+            .as_mut()
+            .unwrap()
+            .edc_t60_s = 0.0;
+        assert!(pass1_hint_from_manifest(&manifest).rt60_s.is_none());
     }
 }

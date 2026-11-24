@@ -128,6 +128,7 @@ pub(crate) fn extract_star_physics_from_audio(
         decay_gains_lin: tail_stats.decay_gains.iter().map(|&v| r3(v)).collect(),
         detected_grain_size_ms: r3(detected_grain_ms),
         detected_pitch_shift_semitones: r3(detected_pitch),
+        ..ExtractedPhysics::default()
     };
 
     for &(k, v) in &[
@@ -613,5 +614,91 @@ fn analyze_coreset_dynamics(dry: &[f32], wet: &[f32]) -> CoresetDynStats {
         gate_ratio: (quiet_med / mid_med.max(loud_med)).clamp(0.0, 2.0),
         comp_ratio: (loud_med / mid_med).clamp(0.0, 2.0),
         env_bright_shift: (loud_b / quiet_b).clamp(0.1, 10.0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_physics_probe_short_lags_stereo_comb_dynamics_and_insert_guards() {
+        let mut meta = BTreeMap::new();
+        insert_f64(&mut meta, "nan_key", f64::NAN);
+        insert_f64(&mut meta, "neg_zero", -1.0e-9);
+        assert_eq!(meta["nan_key"], serde_json::json!(0.0));
+        assert_eq!(meta["neg_zero"], serde_json::json!(0.0));
+
+        assert_eq!(estimate_best_lag(&[0.0; 100], &[0.0; 100], 64), 0);
+        assert_eq!(compute_windowed_coherence(&[0.1; 128], &[0.1; 128]), 0.0);
+        assert_eq!(
+            compute_windowed_coherence(&vec![0.0; 2_048], &vec![0.0; 2_048]),
+            0.0
+        );
+
+        let a = [0.2_f32; 8];
+        let b = [0.3_f32; 8];
+        assert_eq!(aligned_slices(&a, &b, -3).0.len(), 5);
+        assert_eq!(aligned_slices(&a, &b, 3).1.len(), 5);
+        assert_eq!(aligned_slices(&a, &b, 99).0.len(), 8);
+
+        assert_eq!(
+            compute_stereo_diff_ratio(
+                &[0.0; 64],
+                Some(&[0.0; 64]),
+                &[0.0; 64],
+                None,
+                &[0.0; 64],
+                None
+            ),
+            0.0
+        );
+        let l: Vec<f32> = (0..256).map(|i| 0.2 * ((i as f32) * 0.1).sin()).collect();
+        let r: Vec<f32> = (0..256)
+            .map(|i| 0.2 * ((i as f32) * 0.1 + 0.8).sin())
+            .collect();
+        assert!(compute_stereo_diff_ratio(&l, Some(&r), &l, Some(&r), &l, Some(&r)) > 0.0);
+
+        let short_comb = analyze_comb_spectrum(&[0.0; 64], &[0.0; 64], &[8]);
+        assert_eq!(short_comb.pre_lpf_hz, 20_000.0);
+        let short_dyn = analyze_coreset_dynamics(&[0.1; 128], &[0.1; 128]);
+        assert_eq!(short_dyn.gate_ratio, 1.0);
+
+        // Multi-level coreset bursts exercise loud/mid/quiet dynamic buckets; periodic comb exercises
+        // subharmonic, HPF/LPF transfer slope, and ring-mod sideband estimation.
+        let mut dry = vec![0.0_f32; ADAPTIVE_FRAME_SAMPLES];
+        let mut wet = vec![0.0_f32; ADAPTIVE_FRAME_SAMPLES];
+        let bins = [23_usize, 57, 131];
+        for i in 0..ADAPTIVE_FRAME_SAMPLES {
+            let amp = if i < 1_024 {
+                0.015
+            } else if i < 2_048 {
+                0.06
+            } else {
+                0.22
+            };
+            let phase = 2.0 * std::f64::consts::PI * (i as f64) / (CYCLIC_WINDOW_SAMPLES as f64);
+            let mut d = 0.0_f64;
+            for &b in &bins {
+                d += amp * 0.35 * (b as f64 * phase).sin();
+            }
+            dry[i] = d as f32;
+            let rm = 1.0 + 0.35 * (7.0 * phase).sin();
+            wet[i] = (0.8 * d * rm + 0.08 * (10.0 * phase).sin()) as f32;
+        }
+        let res = extract_star_physics_from_audio(
+            &dry,
+            Some(&dry),
+            &wet,
+            Some(&wet),
+            &dry,
+            &wet,
+            Some(&wet),
+            &wet[..1_024],
+            None,
+            &bins,
+        );
+        assert!(res.metadata.contains_key("phys_coherence"));
+        assert!(res.metadata.contains_key("phys_sideband_ratio"));
     }
 }

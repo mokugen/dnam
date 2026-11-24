@@ -41,9 +41,8 @@ pub struct WeightedStemRef<'a> {
     pub weight: f64,
 }
 
-const FULLBAND_BODY_LEN: usize = 72_000;
 const ALL_TIERS: [Tier; 4] = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra];
-const _: () = assert!(FULLBAND_BODY_LEN == 72_000 && ALL_TIERS.len() == 4);
+const _: () = assert!(ALL_TIERS.len() == 4);
 
 /// Output summary and `uplo='U'` sufficient statistics from [`solve_stage_b_backbone`].
 #[derive(Debug, Clone)]
@@ -399,21 +398,8 @@ pub fn solve_stage_b_backbone_with_pass1(
     } else {
         active_frames_hint.min(avail)
     };
-    let has_sweep = active_samples >= 76_096
-        && dry_lr[71_100..71_900]
-            .iter()
-            .all(|&[l, r]| l.abs() <= 1.0e-4 && r.abs() <= 1.0e-4)
-        && dry_lr[FULLBAND_BODY_LEN..active_samples]
-            .iter()
-            .any(|&[l, r]| l.abs() > 1.0e-4 || r.abs() > 1.0e-4);
-    let eval_len = if has_sweep {
-        dry_lr[..FULLBAND_BODY_LEN]
-            .iter()
-            .rposition(|&[l, r]| l.abs() > 1.0e-6 || r.abs() > 1.0e-6)
-            .map_or(FULLBAND_BODY_LEN, |idx| (idx + 1).min(FULLBAND_BODY_LEN))
-    } else {
-        active_samples
-    };
+    let eval_len =
+        crate::solver::resolve_eval_active_len(manifest, dry_lr, Some(wet_lr), active_samples);
 
     let runner = TrainRunner::auto_detect();
     let warmup = canonical_besr_warmup(active_samples).min(active_samples.saturating_sub(1));
@@ -600,6 +586,70 @@ mod tests {
             out_pres.prefix_esr_db[3] < -12.0,
             "got {:?}",
             out_pres.prefix_esr_db
+        );
+    }
+
+    #[test]
+    fn test_stage_b_stat_nan_progress_and_short_guards() {
+        let mut bad_gram = vec![0.0; uplo_u_packed_len(256)];
+        bad_gram[0] = f64::NAN;
+        let stat = serialize_v3_stat_chunk_ultra(&bad_gram, &[[f64::INFINITY, -2.0]; 256]);
+        assert_eq!(verify_proj_stat_uplo_u(&stat).unwrap(), 256);
+
+        let dnam_bin = initialize_backbone_dnam_bin_if_needed(None).expect("neutral dnam-bin");
+        assert_eq!(
+            eval_tier_esr_db(&dnam_bin, Tier::Lite, true, false, &[], &[]).unwrap(),
+            0.0
+        );
+        let z = [[0.0_f32; 2]; 128];
+        let nz = [[0.25_f32; 2]; 2_048];
+        assert_eq!(
+            eval_tier_esr_db(&dnam_bin, Tier::Lite, true, false, &z, &z).unwrap(),
+            -120.0
+        );
+        assert_eq!(
+            eval_tier_esr_db(&dnam_bin, Tier::Lite, false, true, &z, &nz[..128]).unwrap(),
+            0.0
+        );
+
+        let short_stat =
+            compute_v3_stat_chunk_bytes(&dnam_bin, true, &z[..1], &z[..1], 1, 1).unwrap();
+        assert_eq!(verify_proj_stat_uplo_u(&short_stat).unwrap(), 256);
+        let ok_stat = compute_v3_stat_chunk_bytes(&dnam_bin, false, &nz, &nz, 2_048, 4).unwrap();
+        assert_eq!(verify_proj_stat_uplo_u(&ok_stat).unwrap(), 256);
+
+        let full_cfg = select_pass2_config(SolverQualityMode::BestUntilDiminishingReturns, 64);
+        assert!(full_cfg.max_epochs >= 2);
+        let manifest = DnamProjManifest::default_reference();
+        let cb_calls = std::sync::Arc::new(std::sync::Mutex::new(0usize));
+        let prog = TrainerProgressHandle::from_callback({
+            let cb_calls = std::sync::Arc::clone(&cb_calls);
+            move |_| *cb_calls.lock().unwrap() += 1
+        });
+        let mut bin_mut = dnam_bin;
+        let out_short = solve_stage_b_backbone_with_progress(
+            &manifest,
+            &mut bin_mut,
+            &nz[..1],
+            &nz[..1],
+            1,
+            StageBSolveConfig::default(),
+            &prog,
+        )
+        .unwrap();
+        assert_eq!(out_short.stat_bytes.len(), PROJ_STAT_BYTES_ULTRA);
+        assert_eq!(*cb_calls.lock().unwrap(), 1);
+        assert!(
+            solve_stage_b_backbone_with_progress(
+                &manifest,
+                &mut bin_mut,
+                &nz[..8],
+                &nz[..8],
+                8,
+                StageBSolveConfig::default(),
+                &prog,
+            )
+            .is_err()
         );
     }
 }

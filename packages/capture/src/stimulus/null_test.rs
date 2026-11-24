@@ -649,3 +649,79 @@ pub fn run_live_null_test_and_autopatch(
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proj::bundle::build_dnam_proj_container;
+    use crate::proj::schema::DnamProjManifest;
+    use crate::targets::StemResponse;
+    use std::collections::BTreeMap;
+
+    struct MockNullTarget {
+        stereo: bool,
+        orthogonal: bool,
+    }
+
+    impl DistillationTarget for MockNullTarget {
+        fn reset_state(&mut self) {}
+        fn render_stem(&mut self, stimulus: &StemStimulus) -> Result<StemResponse, DnamError> {
+            let n = stimulus.in_1.len();
+            let (out_1, out_2) = if self.orthogonal {
+                let mut l = vec![0.0_f32; n];
+                let mut r = vec![0.0_f32; n];
+                for i in 0..n {
+                    let s = 0.25 * ((i as f32) * 0.09).sin();
+                    l[i] = s;
+                    r[i] = -s;
+                }
+                (l, self.stereo.then_some(r))
+            } else {
+                (vec![0.0_f32; n], self.stereo.then(|| vec![0.0_f32; n]))
+            };
+            Ok(StemResponse {
+                stem_id: stimulus.stem_id.clone(),
+                sample_rate_hz: stimulus.sample_rate_hz,
+                out_1,
+                out_2,
+                out_3: None,
+                out_4: None,
+                internal_nodes: BTreeMap::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn test_live_null_test_edges_missing_wght_fast_pass_and_resampling() {
+        let mut tgt_silent = MockNullTarget {
+            stereo: false,
+            orthogonal: false,
+        };
+        let empty_proj =
+            build_dnam_proj_container(&DnamProjManifest::default_reference(), &[]).unwrap();
+        assert!(run_live_null_test_and_autopatch(&empty_proj, &mut tgt_silent, -10.0).is_err());
+
+        let dnam_bin = encode_model_to_dnam_bin(
+            &dnam_train::SonaModelF64::new(48_000.0),
+            Pass5EmitConfig::default(),
+        )
+        .unwrap();
+        let mut m = DnamProjManifest::default_reference();
+        m.rig_routing.sample_rate_device_hz = 44_100;
+        let proj = build_dnam_proj_container_with_dnam_bin(&mut m, &[], &dnam_bin).unwrap();
+
+        // Silent target yields -120 dB pre-ESR <= -10 dB -> skips autopatch cleanly.
+        let (_, _, rep_fast) =
+            run_live_null_test_and_autopatch(&proj, &mut tgt_silent, -10.0).unwrap();
+        assert!(!rep_fast.autopatch_applied && rep_fast.reload_in_place_verified);
+
+        // Non-zero 44.1 kHz stereo mock triggers resampling, Cholesky attempt, and safe rollback/apply.
+        let mut tgt_stereo = MockNullTarget {
+            stereo: true,
+            orthogonal: true,
+        };
+        let (_, _, rep_patch) =
+            run_live_null_test_and_autopatch(&proj, &mut tgt_stereo, -120.0).unwrap();
+        assert!(rep_patch.reload_in_place_verified && rep_patch.pre_patch_null_esr_db.is_finite());
+    }
+}

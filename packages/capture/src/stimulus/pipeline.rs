@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![warn(missing_docs, missing_debug_implementations)]
 //! Mode 1 Closed-Loop Streaming Distillation (`train_adaptive_target`), Signal-Measured
 //! Endpoint Probing (`REQ-1.6`), and Freeze-Transition Capture (`stimulus::pipeline`).
 //!
@@ -10,7 +11,9 @@
 
 mod causal_probe;
 mod fullband;
+pub mod schoukens;
 mod stems;
+mod sweeps;
 
 pub use causal_probe::{
     build_v3_causal_probe_excitation, estimate_v3_causal_deadtime_and_polarity,
@@ -18,35 +21,36 @@ pub use causal_probe::{
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use dnam_engine::schema::{ControlKind, DnamError};
+use dnam_engine::schema::DnamError;
 
 use crate::proj::bundle::{
     ProjChunkInput, build_dnam_proj_container_with_dnam_bin, export_runtime_dnam,
 };
 use crate::proj::capsules::CalbChunk64B;
-use crate::proj::directory::{ProjChunkKind, StmcTrajectoryWindow};
+use crate::proj::directory::ProjChunkKind;
 use crate::proj::schema::DnamProjManifest;
 use crate::proj::vault::{
     initialize_backbone_dnam_bin_if_needed, solve_captures_batch_with_progress,
 };
 use crate::solver::{SolverOptions, TrainerProgressHandle, TrainingPhase, TrainingStatus};
-use crate::targets::{DistillationTarget, StemResponse};
+use crate::targets::DistillationTarget;
 
-use super::batch::{build_controls_meta_map, control_declared_bounds, default_control_vector};
+use super::StimulusConfig;
+use super::batch::{build_controls_meta_map, default_control_vector};
 use super::fft::{
-    ADAPTIVE_FRAME_SAMPLES, ADC_PEAK_GOVERNOR_FS, CYCLIC_WINDOW_SAMPLES, PEDESTAL_BIN_MONO,
-    build_disjoint_comb_schedule, synthesize_cyclic_comb_frame,
+    ADAPTIVE_FRAME_SAMPLES, ADC_PEAK_GOVERNOR_FS, PEDESTAL_BIN_MONO, build_disjoint_comb_schedule,
+    synthesize_cyclic_comb_frame,
 };
-use super::laws::{
-    HadamardLaw4dTracker, SweepExecutionMode, TopologyProbeMode,
-    build_orthogonal_hadamard_diagonals, classify_knob_from_endpoint_probe,
-    compute_hadamard_sfm_ratio, select_sweep_execution_mode,
-};
+use super::laws::TopologyProbeMode;
 pub use super::null_test::{LiveNullTestReport, run_live_null_test_and_autopatch};
 use super::safeguards::CaptureWarning;
+use super::sealing::SharedStemAlignment;
 use super::waveforms::deterministic_seed_256;
-use super::{AdaptiveStimulusController, StimulusConfig};
-use stems::{render_endpoint_probe_48k, run_single_closed_loop_stem, spectral_tilt_from_stmc_4096};
+use crate::CORESET_FP32_CANONICAL_25S_FRAMES;
+use stems::{render_endpoint_probe_48k, run_single_closed_loop_stem};
+use sweeps::{
+    SweepCaptureContext, capture_hadamard_diagonal_stems, capture_range_and_switch_stems,
+};
 
 /// Options controlling Mode-1 closed-loop adaptive capture and distillation (`train_adaptive_target`).
 #[derive(Debug, Clone)]
@@ -67,6 +71,10 @@ pub struct AdaptiveTrainingOptions {
     pub null_test_autopatch_threshold_db: f32,
     /// Optional Phase-0 `CALB` loopback calibration chunk to embed in `.dnam-proj`.
     pub calb: Option<CalbChunk64B>,
+    /// Capture full Tier-1 `9.0 s` (`432,000`-frame) `SPCM` on `StarCenter` ahead of compaction (`default = false`).
+    pub use_spcm_tier1: bool,
+    /// Condensed coreset frame length (`96_000..=120_000`, `% 16 == 0`; `default = 120_000` / `2.5 s`).
+    pub coreset_frames_48k: usize,
 }
 
 impl Default for AdaptiveTrainingOptions {
@@ -80,6 +88,8 @@ impl Default for AdaptiveTrainingOptions {
             run_live_null_test: true,
             null_test_autopatch_threshold_db: -36.0,
             calb: None,
+            use_spcm_tier1: false,
+            coreset_frames_48k: CORESET_FP32_CANONICAL_25S_FRAMES,
         }
     }
 }
@@ -176,576 +186,121 @@ pub fn train_adaptive_target_with_progress(
     // 1. Capture StarCenter (s = 0)
     progress.emit_phase(TrainingStatus::Running, TrainingPhase::Capture, 20);
     let use_fullband = options.max_frames_per_stem >= 6;
-    let need_stereo_dry = matches!(
-        options.topology_mode,
-        TopologyProbeMode::TrueStereo2To2 | TopologyProbeMode::DualInToMono2To1
-    );
-    let aux_key_mode = matches!(options.topology_mode, TopologyProbeMode::DualInToMono2To1);
-    let fullband_probe = if use_fullband {
-        let causal_probe = fullband::build_v3_causal_probe_excitation_48k();
-        let (pw_l, pw_r) = render_endpoint_probe_48k(
-            target,
-            &causal_probe,
-            options.sample_rate_hz,
-            options.topology_mode,
-            &base_ctrls,
-        )?;
-        let (lag_l, inv_l) =
-            causal_probe::estimate_v3_causal_deadtime_and_polarity(&causal_probe, &pw_l);
-        let (causal_lag, inv_r) = pw_r.as_deref().map_or((lag_l, inv_l), |r| {
-            let (lag_r, pol_r) =
-                causal_probe::estimate_v3_causal_deadtime_and_polarity(&causal_probe, r);
-            (lag_l.min(lag_r), pol_r)
-        });
-        let ti_probe = fullband::build_time_invariance_probe_48k();
-        let (ti_wet_l, ti_wet_r) = render_endpoint_probe_48k(
-            target,
-            &ti_probe,
-            options.sample_rate_hz,
-            options.topology_mode,
-            &base_ctrls,
-        )?;
-        let contiguous_96k =
-            fullband::probe_requires_contiguous_96k_fullband(&ti_wet_l, ti_wet_r.as_deref());
-        let rep_profiles = if contiguous_96k {
-            Some(fullband::probe_target_repeatability_profiles(
-                target,
-                options.sample_rate_hz,
-                options.topology_mode,
-                &base_ctrls,
-                (causal_lag, inv_l, inv_r),
-            )?)
-        } else {
-            None
-        };
-        let dry_pair = fullband::build_fullband_identification_coreset_48k_opts(
-            &seed_256,
-            need_stereo_dry,
-            aux_key_mode,
-            options.calb.is_some(),
-            contiguous_96k,
-        );
-        Some((
-            (causal_lag, inv_l, inv_r),
-            dry_pair,
-            contiguous_96k,
-            rep_profiles,
-        ))
-    } else {
-        None
-    };
-
     let star_meta = build_controls_meta_map(&manifest, &base_ctrls, &empty_switches);
-    let (full_dry_pair, align_stereo_opt, is_contiguous_96k, rep_profiles) = match fullband_probe {
-        Some((align_stereo, dry_pair, c96, rep_p)) => {
-            (Some(dry_pair), Some(align_stereo), c96, rep_p)
-        }
-        None => (None, None, false, None),
-    };
-    let (inpc_bytes, star_spec, star_tilt, shared_align_stereo, shared_align) =
-        if let (Some((fb_l, fb_r)), Some(align_stereo)) = (&full_dry_pair, align_stereo_opt) {
-            let (causal_lag, inv_l, _) = align_stereo;
-            let star_windows = vec![StmcTrajectoryWindow {
-                control_id: 0,
-                ctrl_kind: 0,
-                active_opt: 0,
-                u_phys: base_ctrls.first().copied().unwrap_or(0.0),
-                window_weight: 1.0,
-                emr_velocity: 0.0,
-            }];
-            let (fb_inpc, fb_spec) = fullband::render_and_seal_fullband_stem(
-                target,
-                fullband::FullbandStemRequest {
-                    stem_id: "star_center",
-                    sample_rate_hz: options.sample_rate_hz,
-                    topology_mode: options.topology_mode,
-                    seed_256: &seed_256,
-                    carrier_bins: &probe_sched.carrier_bins,
-                    valid_frames: options.max_frames_per_stem.max(6),
-                    full_dry_l_48k: fb_l,
-                    full_dry_r_48k: fb_r.as_deref(),
-                    ctrl_start: &base_ctrls,
-                    ctrl_end: None,
-                    is_star_center: true,
-                    windows: star_windows,
-                    controls_meta: star_meta,
-                    user_metadata: BTreeMap::new(),
-                    shared_align: align_stereo,
-                    compact_render_frames_48k: None,
-                },
-            )?;
-            let tilt = spectral_tilt_from_stmc_4096(&fb_spec.spectral_summary_4096);
-            (
-                fb_inpc,
-                fb_spec,
-                tilt,
-                align_stereo,
-                Some((causal_lag, inv_l)),
-            )
-        } else {
-            let star_cfg = StimulusConfig {
-                stem_id: "star_center".to_string(),
+    let (
+        full_dry_pair,
+        full_dry_aux,
+        inpc_bytes,
+        star_spec,
+        star_tilt,
+        shared_align_stereo,
+        shared_align,
+        rep_profiles,
+    ) = if use_fullband {
+        let star_cap = fullband::capture_fullband_star_center_schoukens(
+            target,
+            fullband::StarCenterCaptureRequest {
                 sample_rate_hz: options.sample_rate_hz,
                 topology_mode: options.topology_mode,
-                control_values: base_ctrls.clone(),
-                sweep_end_control_values: None,
-                active_control_id: 0,
-                is_master_volume_sweep: false,
-                fixed_duration: options.fixed_duration,
-                max_frames: options.max_frames_per_stem.max(6),
-                max_tail_frames: 3,
-                noise_floor_dbfs,
-                seed_256,
-            };
-            let (bytes, spec, warns, tilt, star_lag, star_pol) = run_single_closed_loop_stem(
-                target,
-                star_cfg,
-                true,
+                seed_256: &seed_256,
+                carrier_bins: &probe_sched.carrier_bins,
+                valid_frames: options.max_frames_per_stem.max(6),
+                base_ctrls: &base_ctrls,
                 star_meta,
-                None,
-                Some((
-                    &probe_dry_l_48k,
-                    &star_probe_wet_l,
-                    star_probe_wet_r.as_deref(),
-                    &probe_sched.carrier_bins,
-                )),
-            )?;
-            all_warnings.extend(warns);
-            (
-                bytes,
-                spec,
-                tilt,
-                (star_lag, star_pol, star_pol),
-                Some((star_lag, star_pol)),
-            )
+                probe_comb_dry_l: &probe_dry_l_48k,
+                probe_comb_wet_l: &star_probe_wet_l,
+                probe_comb_wet_r: star_probe_wet_r.as_deref(),
+                use_spcm_tier1: options.use_spcm_tier1,
+                coreset_frames_48k: options.coreset_frames_48k,
+                calb_noise_floor_dbfs: noise_floor_dbfs,
+            },
+        )?;
+        let sa = star_cap.shared_align_stereo;
+        (
+            Some((star_cap.dry_l_48k, star_cap.dry_r_48k)),
+            star_cap.aux_in_3_48k,
+            star_cap.inpc_bytes,
+            star_cap.star_spec,
+            star_cap.star_tilt,
+            sa,
+            Some((sa.lag_samples, sa.invert_l)),
+            star_cap.rep_profiles,
+        )
+    } else {
+        let star_cfg = StimulusConfig {
+            stem_id: "star_center".to_string(),
+            sample_rate_hz: options.sample_rate_hz,
+            topology_mode: options.topology_mode,
+            control_values: base_ctrls.clone(),
+            sweep_end_control_values: None,
+            active_control_id: 0,
+            is_master_volume_sweep: false,
+            fixed_duration: options.fixed_duration,
+            max_frames: options.max_frames_per_stem.max(6),
+            max_tail_frames: 3,
+            noise_floor_dbfs,
+            seed_256,
         };
+        let (bytes, spec, warns, tilt, star_lag, star_pol) = run_single_closed_loop_stem(
+            target,
+            star_cfg,
+            true,
+            star_meta,
+            None,
+            Some((
+                &probe_dry_l_48k,
+                &star_probe_wet_l,
+                star_probe_wet_r.as_deref(),
+                &probe_sched.carrier_bins,
+            )),
+        )?;
+        all_warnings.extend(warns);
+        (
+            None,
+            None,
+            bytes,
+            spec,
+            tilt,
+            SharedStemAlignment {
+                lag_samples: star_lag,
+                clock_drift_ppm: 0.0,
+                invert_l: star_pol,
+                invert_r: star_pol,
+            },
+            Some((star_lag, star_pol)),
+            None,
+        )
+    };
     let mut captured_specs = vec![star_spec];
 
-    // 2. Capture 1D Range sweeps/stops & Switch options via signal-measured probes
-    let mut active_range_indices = Vec::new();
-    let mut shape_spread_by_ctrl = vec![0.0_f64; manifest.base.controls_schema.len()];
-    let controls_snapshot = manifest.base.controls_schema.clone();
-
-    let compact_many_knobs =
-        (is_contiguous_96k || manifest.base.controls_schema.len() >= 4).then_some(8_192);
-
-    for (p_idx, ctrl) in controls_snapshot.iter().enumerate() {
-        match ctrl.kind {
-            ControlKind::Range => {
-                active_range_indices.push(p_idx);
-                let (lo, hi) = control_declared_bounds(ctrl);
-                let probe_u = if (lo - base_ctrls[p_idx]).abs() >= (hi - base_ctrls[p_idx]).abs() {
-                    lo
-                } else {
-                    hi
-                };
-                let mut probe_v = base_ctrls.clone();
-                probe_v[p_idx] = probe_u;
-                let (end_probe_wet, _) = render_endpoint_probe_48k(
-                    target,
-                    &probe_dry_l_48k,
-                    options.sample_rate_hz,
-                    options.topology_mode,
-                    &probe_v,
-                )?;
-                let ep = classify_knob_from_endpoint_probe(
-                    &star_probe_wet_l,
-                    &end_probe_wet,
-                    ADAPTIVE_FRAME_SAMPLES,
-                    &probe_sched,
-                );
-                let is_master = ep.is_master_volume_stage;
-                let probe_spread = ep.spectral_shape_spread;
-                let mode = select_sweep_execution_mode(
-                    ep.delta_t_mem_ms,
-                    ep.knob_class,
-                    options.prefer_mode_b,
-                );
-
-                if mode == SweepExecutionMode::ModeAContinuousSweep {
-                    let mut start_v = base_ctrls.clone();
-                    let mut end_v = base_ctrls.clone();
-                    start_v[p_idx] = lo;
-                    end_v[p_idx] = hi;
-                    let meta = build_controls_meta_map(&manifest, &end_v, &empty_switches);
-                    let sweep_windows = vec![
-                        StmcTrajectoryWindow {
-                            control_id: p_idx as u16,
-                            ctrl_kind: 0,
-                            active_opt: 0,
-                            u_phys: lo,
-                            window_weight: 1.0,
-                            emr_velocity: 0.1,
-                        },
-                        StmcTrajectoryWindow {
-                            control_id: p_idx as u16,
-                            ctrl_kind: 0,
-                            active_opt: 0,
-                            u_phys: hi,
-                            window_weight: 1.0,
-                            emr_velocity: 0.1,
-                        },
-                    ];
-                    let (spec, tilt) = if let Some((ref fb_l, ref fb_r)) = full_dry_pair {
-                        let (_, fb_spec) = fullband::render_and_seal_fullband_stem(
-                            target,
-                            fullband::FullbandStemRequest {
-                                stem_id: &format!("sweep_ctrl_{p_idx}"),
-                                sample_rate_hz: options.sample_rate_hz,
-                                topology_mode: options.topology_mode,
-                                seed_256: &seed_256,
-                                carrier_bins: &probe_sched.carrier_bins,
-                                valid_frames: options.max_frames_per_stem.max(6),
-                                full_dry_l_48k: fb_l,
-                                full_dry_r_48k: fb_r.as_deref(),
-                                ctrl_start: &start_v,
-                                ctrl_end: Some(&end_v),
-                                is_star_center: false,
-                                windows: sweep_windows,
-                                controls_meta: meta,
-                                user_metadata: BTreeMap::new(),
-                                shared_align: shared_align_stereo,
-                                compact_render_frames_48k: compact_many_knobs,
-                            },
-                        )?;
-                        let fb_tilt = spectral_tilt_from_stmc_4096(&fb_spec.spectral_summary_4096);
-                        (fb_spec, fb_tilt)
-                    } else {
-                        let cfg = StimulusConfig {
-                            stem_id: format!("sweep_ctrl_{p_idx}"),
-                            sample_rate_hz: options.sample_rate_hz,
-                            topology_mode: options.topology_mode,
-                            control_values: start_v,
-                            sweep_end_control_values: Some(end_v),
-                            active_control_id: p_idx as u16,
-                            is_master_volume_sweep: is_master,
-                            fixed_duration: options.fixed_duration,
-                            max_frames: options.max_frames_per_stem.max(6),
-                            max_tail_frames: 2,
-                            noise_floor_dbfs,
-                            seed_256,
-                        };
-                        let (_, mut cl_spec, warns, cl_tilt, _, _) = run_single_closed_loop_stem(
-                            target,
-                            cfg,
-                            false,
-                            meta,
-                            shared_align,
-                            None,
-                        )?;
-                        if cl_spec.windows.len() < 2 {
-                            cl_spec.windows = sweep_windows;
-                        } else {
-                            cl_spec.windows[0].u_phys = lo;
-                            if let Some(last_w) = cl_spec.windows.last_mut() {
-                                last_w.u_phys = hi;
-                            }
-                        }
-                        all_warnings.extend(warns);
-                        (cl_spec, cl_tilt)
-                    };
-                    shape_spread_by_ctrl[p_idx] = (tilt - star_tilt).abs().max(probe_spread);
-                    captured_specs.push(spec);
-                } else {
-                    let mut tilts = Vec::new();
-                    let span = (hi - lo).max(1e-6);
-                    let mid_u = 0.5 * (lo + hi);
-                    let stops = if (base_ctrls[p_idx] - lo).abs() < 0.08 * span {
-                        [mid_u, hi]
-                    } else if (base_ctrls[p_idx] - hi).abs() < 0.08 * span {
-                        [lo, mid_u]
-                    } else {
-                        [lo, hi]
-                    };
-                    for (s_idx, &stop_u) in stops.iter().enumerate() {
-                        let mut v = base_ctrls.clone();
-                        v[p_idx] = stop_u;
-                        let meta = build_controls_meta_map(&manifest, &v, &empty_switches);
-                        let (spec, tilt) = if let Some((ref fb_l, ref fb_r)) = full_dry_pair {
-                            let stop_windows = vec![StmcTrajectoryWindow {
-                                control_id: p_idx as u16,
-                                ctrl_kind: 0,
-                                active_opt: 0,
-                                u_phys: stop_u,
-                                window_weight: 1.0,
-                                emr_velocity: 0.0,
-                            }];
-                            let (_, fb_spec) = fullband::render_and_seal_fullband_stem(
-                                target,
-                                fullband::FullbandStemRequest {
-                                    stem_id: &format!("stop_ctrl_{p_idx}_{s_idx}"),
-                                    sample_rate_hz: options.sample_rate_hz,
-                                    topology_mode: options.topology_mode,
-                                    seed_256: &seed_256,
-                                    carrier_bins: &probe_sched.carrier_bins,
-                                    valid_frames: 8,
-                                    full_dry_l_48k: fb_l,
-                                    full_dry_r_48k: fb_r.as_deref(),
-                                    ctrl_start: &v,
-                                    ctrl_end: None,
-                                    is_star_center: false,
-                                    windows: stop_windows,
-                                    controls_meta: meta,
-                                    user_metadata: BTreeMap::new(),
-                                    shared_align: shared_align_stereo,
-                                    compact_render_frames_48k: Some(8_192),
-                                },
-                            )?;
-                            let fb_tilt =
-                                spectral_tilt_from_stmc_4096(&fb_spec.spectral_summary_4096);
-                            (fb_spec, fb_tilt)
-                        } else {
-                            let cfg = StimulusConfig {
-                                stem_id: format!("stop_ctrl_{p_idx}_{s_idx}"),
-                                sample_rate_hz: options.sample_rate_hz,
-                                topology_mode: options.topology_mode,
-                                control_values: v,
-                                sweep_end_control_values: None,
-                                active_control_id: p_idx as u16,
-                                is_master_volume_sweep: is_master,
-                                fixed_duration: options.fixed_duration,
-                                max_frames: 8,
-                                max_tail_frames: 2,
-                                noise_floor_dbfs,
-                                seed_256,
-                            };
-                            let (_, cl_spec, warns, cl_tilt, _, _) = run_single_closed_loop_stem(
-                                target,
-                                cfg,
-                                false,
-                                meta,
-                                shared_align,
-                                None,
-                            )?;
-                            all_warnings.extend(warns);
-                            (cl_spec, cl_tilt)
-                        };
-                        tilts.push(tilt);
-                        captured_specs.push(spec);
-                    }
-                    shape_spread_by_ctrl[p_idx] =
-                        (tilts[tilts.len() - 1] - tilts[0]).abs().max(probe_spread);
-                }
-            }
-            ControlKind::Switch => {
-                let opts = ctrl.declared_options.clone().unwrap_or_default();
-                let def_opt =
-                    (base_ctrls[p_idx].round() as usize).min(opts.len().saturating_sub(1));
-                for (opt_idx, opt_name) in opts.iter().enumerate() {
-                    if opt_idx == def_opt {
-                        continue;
-                    }
-                    let mut sw_map = BTreeMap::new();
-                    sw_map.insert(p_idx, opt_name.clone());
-                    let mut sw_ctrls = base_ctrls.clone();
-                    sw_ctrls[p_idx] = opt_idx as f32;
-                    let meta = build_controls_meta_map(&manifest, &sw_ctrls, &sw_map);
-                    let sw_windows = vec![StmcTrajectoryWindow {
-                        control_id: p_idx as u16,
-                        ctrl_kind: 1,
-                        active_opt: opt_idx as u8,
-                        u_phys: opt_idx as f32,
-                        window_weight: 1.0,
-                        emr_velocity: 0.0,
-                    }];
-                    let spec = if let Some((ref fb_l, ref fb_r)) = full_dry_pair {
-                        let (_, fb_spec) = fullband::render_and_seal_fullband_stem(
-                            target,
-                            fullband::FullbandStemRequest {
-                                stem_id: &format!("switch_{p_idx}_opt_{opt_idx}"),
-                                sample_rate_hz: options.sample_rate_hz,
-                                topology_mode: options.topology_mode,
-                                seed_256: &seed_256,
-                                carrier_bins: &probe_sched.carrier_bins,
-                                valid_frames: 6,
-                                full_dry_l_48k: fb_l,
-                                full_dry_r_48k: fb_r.as_deref(),
-                                ctrl_start: &sw_ctrls,
-                                ctrl_end: None,
-                                is_star_center: false,
-                                windows: sw_windows,
-                                controls_meta: meta,
-                                user_metadata: BTreeMap::new(),
-                                shared_align: shared_align_stereo,
-                                compact_render_frames_48k: Some(8_192),
-                            },
-                        )?;
-                        fb_spec
-                    } else {
-                        let cfg = StimulusConfig {
-                            stem_id: format!("switch_{p_idx}_opt_{opt_idx}"),
-                            sample_rate_hz: options.sample_rate_hz,
-                            topology_mode: options.topology_mode,
-                            control_values: sw_ctrls,
-                            sweep_end_control_values: None,
-                            active_control_id: p_idx as u16,
-                            is_master_volume_sweep: false,
-                            fixed_duration: options.fixed_duration,
-                            max_frames: 6,
-                            max_tail_frames: 2,
-                            noise_floor_dbfs,
-                            seed_256,
-                        };
-                        let (_, mut cl_spec, warns, _, _, _) = run_single_closed_loop_stem(
-                            target,
-                            cfg,
-                            false,
-                            meta,
-                            shared_align,
-                            None,
-                        )?;
-                        cl_spec.windows = sw_windows;
-                        all_warnings.extend(warns);
-                        cl_spec
-                    };
-                    captured_specs.push(spec);
-                }
-            }
-        }
-    }
-
-    // 3. Law 4D Commutator-Pruned Orthogonal Hadamard Diagonals (`<= 2` diagonals, ADR-0016 §3.1)
-    let total_possible_pairs = if active_range_indices.len() >= 2 {
-        (active_range_indices.len() * (active_range_indices.len() - 1)) / 2
-    } else {
-        0
+    // 2. Capture 1D Range sweeps/stops & Switch options + Law 4D Hadamard diagonals via `sweeps`.
+    let sweep_ctx = SweepCaptureContext {
+        manifest: &manifest,
+        options,
+        base_ctrls: &base_ctrls,
+        seed_256: &seed_256,
+        probe_sched: &probe_sched,
+        probe_dry_l_48k: &probe_dry_l_48k,
+        star_probe_wet_l: &star_probe_wet_l,
+        full_dry_pair: &full_dry_pair,
+        full_dry_aux: &full_dry_aux,
+        shared_align_stereo,
+        shared_align,
+        star_tilt,
+        noise_floor_dbfs,
     };
-    let orth_diags =
-        build_orthogonal_hadamard_diagonals(&active_range_indices, &shape_spread_by_ctrl);
-    let pruned_count = total_possible_pairs.saturating_sub(orth_diags.len());
-    let mut hadamard_run = 0usize;
+    let sweep_out = capture_range_and_switch_stems(target, &sweep_ctx)?;
+    all_warnings.extend(sweep_out.warnings);
+    captured_specs.extend(sweep_out.specs);
 
-    for (diag_idx, signs) in orth_diags.iter().enumerate() {
-        let mut v0 = base_ctrls.clone();
-        let mut v1 = base_ctrls.clone();
-        let first_p = signs.first().map_or(0, |&(p, _)| p);
-        for &(p, sign) in signs {
-            let (lo, hi) = control_declared_bounds(&controls_snapshot[p]);
-            if sign >= 0.0 {
-                v0[p] = lo;
-                v1[p] = hi;
-            } else {
-                v0[p] = hi;
-                v1[p] = lo;
-            }
-        }
-
-        let meta = build_controls_meta_map(&manifest, &v1, &empty_switches);
-        let had_windows: Vec<StmcTrajectoryWindow> = signs
-            .iter()
-            .flat_map(|&(p, _)| {
-                [
-                    StmcTrajectoryWindow {
-                        control_id: p as u16,
-                        ctrl_kind: 0,
-                        active_opt: 0,
-                        u_phys: v0[p],
-                        window_weight: 1.0,
-                        emr_velocity: 0.1,
-                    },
-                    StmcTrajectoryWindow {
-                        control_id: p as u16,
-                        ctrl_kind: 0,
-                        active_opt: 0,
-                        u_phys: v1[p],
-                        window_weight: 1.0,
-                        emr_velocity: 0.1,
-                    },
-                ]
-            })
-            .collect();
-        let spec = if options.fixed_duration
-            && let Some((ref fb_l, ref fb_r)) = full_dry_pair
-        {
-            let (_, fb_spec) = fullband::render_and_seal_fullband_stem(
-                target,
-                fullband::FullbandStemRequest {
-                    stem_id: &format!("hadamard_diag_{diag_idx}"),
-                    sample_rate_hz: options.sample_rate_hz,
-                    topology_mode: options.topology_mode,
-                    seed_256: &seed_256,
-                    carrier_bins: &probe_sched.carrier_bins,
-                    valid_frames: options.max_frames_per_stem.max(12),
-                    full_dry_l_48k: fb_l,
-                    full_dry_r_48k: fb_r.as_deref(),
-                    ctrl_start: &v0,
-                    ctrl_end: Some(&v1),
-                    is_star_center: false,
-                    windows: had_windows,
-                    controls_meta: meta,
-                    user_metadata: BTreeMap::new(),
-                    shared_align: shared_align_stereo,
-                    compact_render_frames_48k: compact_many_knobs,
-                },
-            )?;
-            fb_spec
-        } else {
-            target.reset_state();
-            let mut ctrl = AdaptiveStimulusController::new(StimulusConfig {
-                stem_id: format!("hadamard_diag_{diag_idx}"),
-                sample_rate_hz: options.sample_rate_hz,
-                topology_mode: options.topology_mode,
-                control_values: v0.clone(),
-                sweep_end_control_values: Some(v1.clone()),
-                active_control_id: first_p as u16,
-                is_master_volume_sweep: false,
-                fixed_duration: options.fixed_duration,
-                max_frames: options.max_frames_per_stem.max(12),
-                max_tail_frames: 1,
-                noise_floor_dbfs,
-                seed_256,
-            });
-            let mut law4d = HadamardLaw4dTracker::default();
-            let mut sfm_hist: [Option<Vec<f64>>; 2] = [None, None];
-            let mut last_resp: Option<StemResponse> = None;
-            while let Some(frame) = ctrl.next_frame(last_resp.as_ref()) {
-                if ctrl.is_entering_coreset() {
-                    target.reset_state();
-                }
-                let r = target.render_frame(&frame)?;
-                if ctrl.is_in_active_learning() && !options.fixed_duration {
-                    let (wl_48k, _) = ctrl.normalize_wet_to_48k(&r);
-                    let wet_win = &wl_48k[wl_48k.len().saturating_sub(CYCLIC_WINDOW_SAMPLES)..];
-                    let sfm = compute_hadamard_sfm_ratio(wet_win, ctrl.schedule_l(), &mut sfm_hist);
-                    if law4d.observe_frame(sfm) {
-                        ctrl.request_coreset_handoff();
-                    }
-                }
-                last_resp = Some(r);
-            }
-            all_warnings.extend_from_slice(ctrl.warnings());
-            let (_, mut cl_spec, _, _) =
-                ctrl.seal_inpc_and_vault_spec_with_shared_align(false, meta.clone(), shared_align)?;
-            cl_spec.windows.clone_from(&had_windows);
-            if let Some((ref fb_l, ref fb_r)) = full_dry_pair {
-                let (_, fb_spec) = fullband::render_and_seal_fullband_stem(
-                    target,
-                    fullband::FullbandStemRequest {
-                        stem_id: &format!("hadamard_diag_{diag_idx}"),
-                        sample_rate_hz: options.sample_rate_hz,
-                        topology_mode: options.topology_mode,
-                        seed_256: &seed_256,
-                        carrier_bins: &probe_sched.carrier_bins,
-                        valid_frames: options.max_frames_per_stem.max(12),
-                        full_dry_l_48k: fb_l,
-                        full_dry_r_48k: fb_r.as_deref(),
-                        ctrl_start: &v0,
-                        ctrl_end: Some(&v1),
-                        is_star_center: false,
-                        windows: had_windows,
-                        controls_meta: meta,
-                        user_metadata: cl_spec.user_metadata.clone(),
-                        shared_align: shared_align_stereo,
-                        compact_render_frames_48k: compact_many_knobs,
-                    },
-                )?;
-                cl_spec = fb_spec;
-            }
-            cl_spec
-        };
-        captured_specs.push(spec);
-        hadamard_run += 1;
-    }
+    let (had_specs, had_warns, hadamard_run, pruned_count) = capture_hadamard_diagonal_stems(
+        target,
+        &sweep_ctx,
+        &sweep_out.active_range_indices,
+        &sweep_out.shape_spread_by_ctrl,
+    )?;
+    all_warnings.extend(had_warns);
+    captured_specs.extend(had_specs);
 
     let stem_count = captured_specs.len();
     progress.emit_phase(TrainingStatus::Running, TrainingPhase::Capture, 380);
@@ -785,4 +340,40 @@ pub fn train_adaptive_target_with_progress(
         hadamard_diagonals_run: hadamard_run,
         hadamard_diagonals_pruned: pruned_count,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::targets::{StemResponse, StemStimulus};
+    use std::collections::BTreeMap;
+
+    struct DummyTarget;
+    impl DistillationTarget for DummyTarget {
+        fn reset_state(&mut self) {}
+        fn render_stem(&mut self, s: &StemStimulus) -> Result<StemResponse, DnamError> {
+            Ok(StemResponse {
+                stem_id: s.stem_id.clone(),
+                sample_rate_hz: s.sample_rate_hz,
+                out_1: s.in_1.clone(),
+                out_2: None,
+                out_3: None,
+                out_4: None,
+                internal_nodes: BTreeMap::new(),
+            })
+        }
+    }
+
+    #[test]
+    fn test_train_adaptive_target_rejects_invalid_sample_rate() {
+        let mut target = DummyTarget;
+        let opts = AdaptiveTrainingOptions {
+            sample_rate_hz: 4_000,
+            ..Default::default()
+        };
+        assert!(matches!(
+            train_adaptive_target(DnamProjManifest::default_reference(), &mut target, &opts),
+            Err(DnamError::InvalidSampleRate(4_000))
+        ));
+    }
 }

@@ -107,6 +107,60 @@ impl SolverOptions {
 
 use dnam_engine::Tier;
 
+/// Resolves the active evaluation frame length for Stage B and Stage D from `StarCenter`
+/// `extracted_physics.coreset_regime_offsets[4]` when present and valid, else trims any trailing
+/// silent zero-pad from short coresets while keeping `<= available_frames` (`ref[train.capture.excitation.codesigned]`).
+#[must_use]
+pub fn resolve_eval_active_len(
+    manifest: &crate::proj::schema::DnamProjManifest,
+    dry_lr: &[[f32; 2]],
+    wet_lr: Option<&[[f32; 2]]>,
+    available_frames: usize,
+) -> usize {
+    let avail = available_frames
+        .min(dry_lr.len())
+        .min(wet_lr.map_or(dry_lr.len(), |w| w.len()));
+    if avail == 0 {
+        return 0;
+    }
+    if let Some(star) = manifest
+        .stems_registry
+        .iter()
+        .find(|s| s.enabled && s.is_star_center)
+        && let Some(ref ep) = star.extracted_physics
+    {
+        let o = ep.coreset_regime_offsets;
+        let valid = o[4] > 0
+            && o[0] == 0
+            && o[0] <= o[1]
+            && o[1] <= o[2]
+            && o[2] <= o[3]
+            && o[3] <= o[4]
+            && (o[4] as usize) <= avail;
+        if valid {
+            return o[4] as usize;
+        }
+    }
+    let last_active_dry = dry_lr[..avail]
+        .iter()
+        .rposition(|&[l, r]| l.abs() > 1.0e-6 || r.abs() > 1.0e-6)
+        .map_or(avail, |idx| (idx + 1).min(avail));
+    let min_eval = canonical_besr_warmup(avail).saturating_add(64);
+    let tail_wet_silent = wet_lr.is_none_or(|wet| {
+        wet[last_active_dry..avail]
+            .iter()
+            .all(|&[l, r]| l.abs() <= 1.0e-4 && r.abs() <= 1.0e-4)
+    });
+    if avail.saturating_sub(last_active_dry) >= avail / 2
+        && last_active_dry > min_eval
+        && tail_wet_silent
+    {
+        last_active_dry
+    } else {
+        avail
+    }
+}
+
 /// Computes canonical post-warmup offset matching Stage D certification gates (`512` on `>= 2,048` frames).
 #[must_use]
 pub const fn canonical_besr_warmup(n_frames: usize) -> usize {
@@ -272,6 +326,40 @@ mod tests {
         assert!(compute_noise_subtracted_besr(1.0e-15, 0.0, 0.0).is_infinite());
         assert!(compute_noise_subtracted_besr(-1.0, 1.0, 0.0).is_infinite());
         assert!((compute_noise_subtracted_besr(0.011, 0.999, 0.001) - 0.01).abs() <= 1.0e-15);
+
+        // resolve_eval_active_len respects coreset_regime_offsets and trailing zero-pad trimming.
+        let mut manifest = crate::proj::schema::DnamProjManifest::default_reference();
+        let active = vec![[0.25_f32, -0.25_f32]; 2_000];
+        let mut dry_padded = active.clone();
+        dry_padded.resize(8_000, [0.0, 0.0]);
+        let wet_padded = dry_padded.clone();
+        assert_eq!(
+            resolve_eval_active_len(&manifest, &dry_padded, Some(&wet_padded), 8_000),
+            2_000
+        );
+        manifest
+            .stems_registry
+            .push(crate::proj::schema::StemRegistryEntry {
+                stem_id: "star_center".to_string(),
+                chunk_id: 0,
+                enabled: true,
+                is_star_center: true,
+                controls_meta: Default::default(),
+                provenance: crate::proj::schema::StemProvenance {
+                    input_pcm_sha256: "0".repeat(64),
+                    target_pcm_sha256: "0".repeat(64),
+                    num_frames: 6_400,
+                },
+                user_metadata: Default::default(),
+                extracted_physics: Some(crate::proj::schema::ExtractedPhysics {
+                    coreset_regime_offsets: [0, 1_600, 3_200, 4_800, 6_400],
+                    ..Default::default()
+                }),
+            });
+        assert_eq!(
+            resolve_eval_active_len(&manifest, &dry_padded, Some(&wet_padded), 8_000),
+            6_400
+        );
     }
 
     proptest! {

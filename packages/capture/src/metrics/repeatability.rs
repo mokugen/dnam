@@ -367,4 +367,76 @@ mod tests {
         let empty = TargetRepeatabilityProfile::from_probe_response(&[], &windows, late_w, sr);
         assert_eq!(empty, TargetRepeatabilityProfile::deterministic());
     }
+
+    #[test]
+    fn test_repeatability_edge_paths_and_constructors() {
+        assert_eq!(
+            TargetRepeatabilityProfile::default(),
+            TargetRepeatabilityProfile::deterministic()
+        );
+        let noisy = TargetRepeatabilityProfile::deterministic().with_noise_rms(0.01);
+        assert_eq!(noisy.noise_rms, 0.01);
+        assert_eq!(noisy.with_noise_rms(f64::NAN).noise_rms, 0.0);
+        assert_eq!(noisy.with_noise_rms(-1.0).noise_rms, 0.0);
+
+        let sr = 48_000.0;
+        let short = [0.1_f64; 32];
+        assert_eq!(
+            TargetRepeatabilityProfile::from_incoherent_stem_xy(&short, &short, sr, 64),
+            TargetRepeatabilityProfile::deterministic()
+        );
+        let tone: Vec<f64> = (0..2_048)
+            .map(|i| 0.2 * (2.0 * std::f64::consts::PI * 1_000.0 * (i as f64) / sr).sin())
+            .collect();
+        let inc_xy = TargetRepeatabilityProfile::from_incoherent_stem_xy(&tone, &tone, sr, 128);
+        assert_eq!(inc_xy.band_inc_ratio, [1.0; 3]);
+        assert_eq!(inc_xy.env_inc_ratio, [0.25; 3]);
+
+        // 8 kHz stream skips ultrasonic tones safely and returns finite samples.
+        let (stream_8k, win_8k, _) = build_repeatability_probe_stream(8_000.0);
+        assert_eq!(win_8k.len(), 6);
+        assert!(
+            stream_8k
+                .iter()
+                .all(|lr| lr[0].is_finite() && lr[1].is_finite())
+        );
+
+        // `from_probe_response` invalid rates, NaNs, short/OOB windows, and sustained tail floor.
+        let dummy = vec![0.0_f64; 1_000];
+        let w3 = [[0, 100], [120, 220], [240, 340]];
+        assert_eq!(
+            TargetRepeatabilityProfile::from_probe_response(&dummy, &w3, [400, 700], 4_000.0),
+            TargetRepeatabilityProfile::deterministic()
+        );
+        assert_eq!(
+            TargetRepeatabilityProfile::from_probe_response(&[0.0, f64::NAN], &w3, [0, 1], sr),
+            TargetRepeatabilityProfile::deterministic()
+        );
+        assert_eq!(
+            TargetRepeatabilityProfile::from_probe_response(&dummy, &w3[..2], [400, 700], sr),
+            TargetRepeatabilityProfile::deterministic()
+        );
+        assert_eq!(
+            TargetRepeatabilityProfile::from_probe_response(
+                &dummy,
+                &[[0, 2_000], w3[1], w3[2]],
+                [400, 700],
+                sr
+            ),
+            TargetRepeatabilityProfile::deterministic()
+        );
+
+        let mut tail_resp = vec![0.0_f64; 3_000];
+        for (i, s) in tail_resp.iter_mut().enumerate() {
+            let env = if i >= 400 { 0.04 } else { 0.4 };
+            *s = env * (2.0 * std::f64::consts::PI * 500.0 * (i as f64) / sr).sin();
+        }
+        let prof_tail = TargetRepeatabilityProfile::from_probe_response(
+            &tail_resp,
+            &[[0, 300], [320, 620], [640, 940]],
+            [1_000, 2_200],
+            sr,
+        );
+        assert!(prof_tail.band_inc_ratio.iter().all(|&r| r > 0.0));
+    }
 }

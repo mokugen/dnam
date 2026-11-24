@@ -20,7 +20,6 @@ use dnam_vm::bin::DnamBinView;
 use zerocopy::FromBytes;
 use zerocopy::byteorder::little_endian::{U16, U32};
 
-use crate::CORESET_FP32_STEREO_BYTES;
 pub use crate::audit::{
     recompute_vault_phase1_audit_and_clamps, recompute_vault_phase1_audit_and_clamps_with_windows,
 };
@@ -58,6 +57,8 @@ pub struct VaultCaptureSpec {
     pub is_star_center: bool,
     /// Initial enable state (`true` = active in solve & Phase-1 audit).
     pub enabled: bool,
+    /// True if wet audio in `wet_coreset_fp32` is interleaved stereo (`2` channels).
+    pub is_stereo: bool,
     /// Input pad linear gain applied during capture (`1.0` default).
     pub pad_gain_f32: f32,
     /// Sub-sample alignment lag in samples at `48 kHz`.
@@ -78,7 +79,7 @@ pub struct VaultCaptureSpec {
     pub n_comb_bins: u32,
     /// `4,096 B` spectral, sideband, and ballistic summary block.
     pub spectral_summary_4096: [u8; 4_096],
-    /// Full-bandwidth `fp32` (`<f4`) wet coreset bytes (`384,000 B` mono or `768,000 B` stereo at `2.0 s`).
+    /// Full-bandwidth `fp32` (`<f4`) wet coreset bytes (`384,000–480,000 B` mono or `768,000–960,000 B` stereo at `2.0–2.5 s`).
     pub wet_coreset_fp32: Vec<u8>,
     /// Optional raw `SPCM` chunk (`b"SPCM"` header + aligned PCM samples).
     pub optional_spcm: Option<Vec<u8>>,
@@ -96,10 +97,7 @@ impl VaultCaptureSpec {
         if self.windows.len() > 1 {
             flags |= STMC_FLAG_MODE_A_SWEEP;
         }
-        let is_stereo = self.wet_coreset_fp32.len() >= CORESET_FP32_STEREO_BYTES
-            || (self.provenance.num_frames > 0
-                && self.wet_coreset_fp32.len() == (self.provenance.num_frames as usize) * 8);
-        if is_stereo {
+        if self.is_stereo {
             flags |= STMC_FLAG_STEREO;
         }
         if self

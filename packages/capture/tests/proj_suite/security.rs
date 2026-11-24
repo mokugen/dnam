@@ -234,6 +234,7 @@ fn test_dnam_proj_lifecycle_range_parse_capsules_and_zero_dc_guards() {
             decay_gains_lin: Vec::new(),
             detected_grain_size_ms: 0.0,
             detected_pitch_shift_semitones: 0.0,
+            ..ExtractedPhysics::default()
         }),
     }];
 
@@ -462,6 +463,7 @@ fn test_two_path_capture_vault_editing_and_wav_subsample_alignment() {
             stem_id: String::from("star_0"),
             is_star_center: true,
             enabled: true,
+            is_stereo: false,
             pad_gain_f32: 1.0,
             fractional_lag_samples_f32: 0.0,
             controls_meta: BTreeMap::from([
@@ -560,6 +562,7 @@ fn test_two_path_capture_vault_editing_and_wav_subsample_alignment() {
             stem_id: String::from("off_1"),
             is_star_center: false,
             enabled: true,
+            is_stereo: false,
             pad_gain_f32: 1.0,
             fractional_lag_samples_f32: 0.0,
             controls_meta: BTreeMap::from([
@@ -696,6 +699,7 @@ fn test_two_path_capture_vault_editing_and_wav_subsample_alignment() {
             stem_id: String::from("star_0"),
             is_star_center: true,
             enabled: true,
+            is_stereo: false,
             pad_gain_f32: 1.0,
             fractional_lag_samples_f32: 0.0,
             controls_meta: BTreeMap::from([

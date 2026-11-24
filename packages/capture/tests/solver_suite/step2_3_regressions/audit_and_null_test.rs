@@ -292,14 +292,12 @@ fn test_live_null_test_autopatch_with_role_b_gauge_and_noisy_blackbox_phase_id()
         ring_pos: 0,
     };
     let opts = AdaptiveTrainingOptions {
-        sample_rate_hz: 48_000,
-        topology_mode: TopologyProbeMode::Mono1To1,
         fixed_duration: true,
         prefer_mode_b: true,
         max_frames_per_stem: 2,
         run_live_null_test: false,
         null_test_autopatch_threshold_db: -42.0,
-        calb: None,
+        ..AdaptiveTrainingOptions::default()
     };
     let trained = train_adaptive_target(manifest, &mut target, &opts).unwrap();
 
@@ -450,14 +448,12 @@ fn test_tier4_whitebox_faust_runner_varpro_distillation() {
         .collect();
 
     let opts_mono = AdaptiveTrainingOptions {
-        sample_rate_hz: 48_000,
-        topology_mode: TopologyProbeMode::Mono1To1,
         fixed_duration: true,
         prefer_mode_b: true,
         max_frames_per_stem: 2,
         run_live_null_test: false,
         null_test_autopatch_threshold_db: -42.0,
-        calb: None,
+        ..AdaptiveTrainingOptions::default()
     };
     let rep_faust = train_adaptive_target(m_faust, &mut faust, &opts_mono).unwrap();
     verify_whitebox_exported_audio("faust", &rep_faust.proj_bytes);
@@ -473,14 +469,13 @@ fn test_tier4_whitebox_spice_runner_varpro_distillation() {
     m_spice.base.io_config.output_mode = "stereo".to_string();
     m_spice.base.controls_schema = vec![make_range_ctrl("drive", 0.0, 1.0, 0.5)];
     let opts_stereo = AdaptiveTrainingOptions {
-        sample_rate_hz: 48_000,
         topology_mode: TopologyProbeMode::TrueStereo2To2,
         fixed_duration: true,
         prefer_mode_b: true,
         max_frames_per_stem: 2,
         run_live_null_test: false,
         null_test_autopatch_threshold_db: -42.0,
-        calb: None,
+        ..AdaptiveTrainingOptions::default()
     };
     let rep_spice = train_adaptive_target(m_spice, &mut spice, &opts_stereo).unwrap();
     verify_whitebox_exported_audio("spice", &rep_spice.proj_bytes);

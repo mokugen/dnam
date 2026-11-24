@@ -313,4 +313,53 @@ mod tests {
         let sum_series: f64 = series[0][256..].iter().map(|v| v * v).sum();
         assert!((sum_series - full_tl.0[0]).abs() < 1.0e-10);
     }
+
+    #[test]
+    fn test_bezout_const_eval_runtime_and_invalid_guards() {
+        use core::hint::black_box;
+
+        assert_eq!(const_abs_f64(black_box(-2.5)), 2.5);
+        assert_eq!(const_abs_f64(black_box(3.5)), 3.5);
+        assert!((const_ln_f64_near_unity(black_box(2.0)) - 2.0_f64.ln()).abs() < 1.0e-13);
+        assert!((const_exp_f64(black_box(0.5)) - 0.5_f64.exp()).abs() < 1.0e-13);
+        assert_eq!(black_box(const_bezout7_lp_coeffs()), BEZOUT7_LP_COEFFS);
+
+        let w = eval_bezout_3band_weights(1_000.0);
+        assert!((w[0] + w[1] + w[2] - 1.0).abs() < 1.0e-13);
+        assert_eq!(
+            eval_bezout_3band_complex(f64::NAN, 100.0),
+            eval_bezout_3band_complex(0.0, 48_000.0)
+        );
+
+        assert!(split_bezout_3band_series(&[], 48_000.0).is_none());
+        assert!(split_bezout_3band_series(&[1.0; 8], 4_000.0).is_none());
+        assert!(split_bezout_3band_series(&[0.0, f64::NAN], 48_000.0).is_none());
+
+        let sig = vec![0.1_f64; 64];
+        let noise = vec![1.0e-4_f64; 64];
+        for (t, m, n_opt, fs, wm) in [
+            (&[][..], &sig[..], None, 48_000.0, 0),
+            (&sig[..], &sig[..32], None, 48_000.0, 0),
+            (&sig[..], &sig[..], None, 2_000.0, 0),
+            (&sig[..], &sig[..], None, 48_000.0, 64),
+            (&[f64::NAN; 4], &[0.0; 4], None, 48_000.0, 0),
+            (&[0.0; 4], &[f64::INFINITY; 4], None, 48_000.0, 0),
+            (&sig[..], &sig[..], Some(&noise[..16]), 48_000.0, 4),
+            (
+                &sig[..],
+                &sig[..],
+                Some(&vec![f64::NAN; 64][..]),
+                48_000.0,
+                4,
+            ),
+        ] {
+            let (s, e, n) = split_bezout_3band_energies(t, m, n_opt, fs, wm);
+            assert!(s[0].is_nan() && e[0].is_nan() && n[0].is_nan());
+        }
+
+        let (s_ok, e_ok, n_ok) =
+            try_split_bezout_3band_energies(&sig, &vec![0.09_f64; 64], Some(&noise), 48_000.0, 8)
+                .unwrap();
+        assert!(s_ok[0] > 0.0 && e_ok[0] > 0.0 && n_ok[0] > 0.0);
+    }
 }

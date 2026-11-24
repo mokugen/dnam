@@ -648,3 +648,130 @@ pub(super) fn read_dnwb_stimulus_request_dyn(
         switches,
     ))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn mk_stim(len: usize, with_all_opts: bool) -> StemStimulus {
+        let ch = |scale: f32| -> Vec<f32> { (0..len).map(|i| scale * (i as f32 + 1.0)).collect() };
+        StemStimulus {
+            stem_id: String::from("stem_w"),
+            sample_rate_hz: 48_000,
+            in_1: ch(0.1),
+            in_2: with_all_opts.then(|| ch(0.2)),
+            in_3: with_all_opts.then(|| ch(0.3)),
+            in_4: with_all_opts.then(|| ch(0.4)),
+            control_values: vec![0.25, 0.75],
+            control_trajectories: with_all_opts.then(|| vec![ch(0.05), ch(0.15)]),
+            freeze_transition_window: with_all_opts.then_some([1, len]),
+        }
+    }
+
+    #[test]
+    fn test_wire_helpers_roundtrips_and_validation_errors() {
+        assert!(checked_add_usize(usize::MAX, 1).is_err());
+        assert!(checked_mul_usize(usize::MAX, 2).is_err());
+        assert!(ensure_finite_f32_slice(&[0.0, f32::NAN], "f").is_err());
+        assert!(read_f32_vec(&[0u8; 3], &mut 0, 1).is_err());
+        let nan_bytes = F32::new(f32::INFINITY).as_bytes().to_vec();
+        assert!(read_f32_vec(&nan_bytes, &mut 0, 1).is_err());
+
+        for use_pc in [false, true] {
+            let stim = mk_stim(4, true);
+            let mut wire = Vec::new();
+            let hdr = write_dnwb_stimulus_request_dyn(
+                &mut wire,
+                DnwbCommand::RenderStem,
+                &stim,
+                &[1, 0],
+                use_pc,
+            )
+            .unwrap();
+            assert_eq!(hdr.num_input_channels, 4);
+            let (_, dec, dec_sw) = read_dnwb_stimulus_request_dyn(&mut Cursor::new(&wire)).unwrap();
+            assert_eq!(dec, stim);
+            assert_eq!(dec_sw, vec![1, 0]);
+        }
+
+        // Legacy (unstructured) mask resolution for 0..=4 channels and rejection paths.
+        let base_hdr = DnwbHeader64B {
+            magic: DNWB_MAGIC,
+            version: DNWB_VERSION,
+            command: DnwbCommand::Reset,
+            sample_rate_hz: 48_000,
+            num_frames: 0,
+            num_input_channels: 0,
+            num_output_channels: 0,
+            num_controls: 0,
+            num_switches: 0,
+            num_internal_nodes: 0,
+            flags: 0,
+            payload_byte_len: 0,
+        };
+        for (n_ch, frames, mask) in [(0, 0, 0), (1, 2, 1), (2, 2, 3), (3, 2, 7), (4, 2, 15)] {
+            let mut h = base_hdr;
+            h.num_input_channels = n_ch;
+            h.num_frames = frames;
+            assert_eq!(resolve_input_channel_mask(&h).unwrap(), mask);
+        }
+        let mut h_bad = base_hdr;
+        h_bad.num_input_channels = 5;
+        assert!(resolve_input_channel_mask(&h_bad).is_err());
+        h_bad.num_input_channels = 1;
+        h_bad.flags = 1 << DNWB_CHANNEL_MASK_SHIFT;
+        assert!(resolve_input_channel_mask(&h_bad).is_err());
+        h_bad.flags = DNWB_FLAG_STRUCTURED_V1 | (0b0010 << DNWB_CHANNEL_MASK_SHIFT);
+        assert!(resolve_input_channel_mask(&h_bad).is_err());
+        h_bad.flags = DNWB_FLAG_STRUCTURED_V1;
+        assert!(resolve_input_channel_mask(&h_bad).is_err());
+
+        // Write validation error matrix.
+        let mut bad = mk_stim(4, false);
+        bad.stem_id = "s".repeat(u16::MAX as usize + 1);
+        assert!(validate_request_channels_and_trajectories(&bad, &[]).is_err());
+        bad.stem_id = String::from("ok");
+        assert!(validate_request_channels_and_trajectories(&bad, &vec![0; 70_000]).is_err());
+        bad.in_2 = Some(vec![0.0; 2]);
+        assert!(validate_request_channels_and_trajectories(&bad, &[]).is_err());
+        bad.in_2 = None;
+        bad.control_trajectories = Some(vec![vec![0.0; 4]]);
+        assert!(validate_request_channels_and_trajectories(&bad, &[]).is_err());
+        bad.control_trajectories = Some(vec![vec![0.0; 2], vec![0.0; 4]]);
+        assert!(validate_request_channels_and_trajectories(&bad, &[]).is_err());
+        bad.control_trajectories = None;
+        bad.freeze_transition_window = Some([3, 1]);
+        assert!(validate_request_channels_and_trajectories(&bad, &[]).is_err());
+
+        // Wire corruption / framing rejection matrix.
+        let mut ok_wire = Vec::new();
+        let ok_hdr = write_dnwb_stimulus_request_dyn(
+            &mut ok_wire,
+            DnwbCommand::RenderStem,
+            &mk_stim(2, true),
+            &[1],
+            false,
+        )
+        .unwrap();
+        let mut h_unk = ok_hdr;
+        h_unk.flags |= 1 << 7;
+        let mut pkt = h_unk.to_bytes().to_vec();
+        pkt.extend_from_slice(&ok_wire[64..]);
+        assert!(read_dnwb_stimulus_request_dyn(&mut Cursor::new(&pkt)).is_err());
+        h_unk.flags = DNWB_FLAG_POSTCARD_CTRL | (0x0f << DNWB_CHANNEL_MASK_SHIFT);
+        pkt[..64].copy_from_slice(&h_unk.to_bytes());
+        assert!(read_dnwb_stimulus_request_dyn(&mut Cursor::new(&pkt)).is_err());
+
+        let mut extra = ok_wire.clone();
+        extra.extend_from_slice(&[0u8; 4]);
+        let mut h_extra = ok_hdr;
+        h_extra.payload_byte_len += 4;
+        extra[..64].copy_from_slice(&h_extra.to_bytes());
+        assert!(read_dnwb_stimulus_request_dyn(&mut Cursor::new(&extra)).is_err());
+        assert!(
+            read_dnwb_stimulus_request_dyn(&mut Cursor::new(&ok_wire[..ok_wire.len() - 4]))
+                .is_err()
+        );
+    }
+}

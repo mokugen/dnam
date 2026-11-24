@@ -509,3 +509,144 @@ pub fn set_capture_enabled_with_options(
 
     rebuild_vault_container(state, inpc_bytes, force_full_repool, Some(touched), options)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CORESET_FP32_FRAMES_PER_STEM;
+    use crate::proj::bundle::{ProjChunkInput, build_dnam_proj_container_with_dnam_bin};
+    use crate::proj::directory::{StmcTrajectoryWindow, build_proj_inpc_capsule};
+    use crate::proj::schema::StemProvenance;
+    use crate::proj::vault::VaultCaptureSpec;
+    use zerocopy::IntoBytes;
+    use zerocopy::byteorder::little_endian::F32;
+
+    fn mk_spec(id: &str, star: bool, wet: Vec<u8>, spcm: Option<Vec<u8>>) -> VaultCaptureSpec {
+        let sha = "0".repeat(64);
+        VaultCaptureSpec {
+            stem_id: id.to_string(),
+            enabled: true,
+            is_star_center: star,
+            is_stereo: false,
+            pad_gain_f32: 1.0,
+            fractional_lag_samples_f32: 0.0,
+            band_psd_summary_88: [0; 88],
+            n_comb_bins: 0,
+            windows: vec![StmcTrajectoryWindow {
+                control_id: 0,
+                ctrl_kind: 0,
+                active_opt: 0,
+                u_phys: 0.5,
+                window_weight: 1.0,
+                emr_velocity: 0.0,
+            }],
+            spectral_summary_4096: [0; 4_096],
+            wet_coreset_fp32: wet,
+            controls_meta: BTreeMap::new(),
+            provenance: StemProvenance {
+                input_pcm_sha256: sha.clone(),
+                target_pcm_sha256: sha,
+                num_frames: CORESET_FP32_FRAMES_PER_STEM as u64,
+            },
+            user_metadata: BTreeMap::new(),
+            extracted_physics: None,
+            optional_spcm: spcm,
+        }
+    }
+
+    #[test]
+    fn test_vault_edit_validation_guards_and_remove_last_stem() {
+        let wet_fp32: Vec<u8> = vec![F32::new(0.0); CORESET_FP32_FRAMES_PER_STEM]
+            .as_bytes()
+            .to_vec();
+        let mut sched = [0x44_u8; 320];
+        sched[8..12].copy_from_slice(&1_024_u32.to_le_bytes());
+        let inpc = build_proj_inpc_capsule(1, &[0x11; 256], &sched, &wet_fp32).unwrap();
+        let dnam_bin = initialize_backbone_dnam_bin_if_needed(None).unwrap();
+
+        let mut manifest_empty = DnamProjManifest::default_reference();
+        manifest_empty.base.io_config.output_mode = "mono".into();
+        let empty_proj =
+            build_dnam_proj_container_with_dnam_bin(&mut manifest_empty, &[], &dnam_bin).unwrap();
+
+        // Empty batch returns identical bytes; missing INPC / missing stem fail cleanly.
+        assert_eq!(
+            solve_captures_batch_into_proj(&empty_proj, Vec::new(), None).unwrap(),
+            empty_proj
+        );
+        let spec0 = mk_spec("s0", true, wet_fp32.clone(), None);
+        assert!(add_capture(&empty_proj, spec0.clone(), None).is_err());
+        assert!(solve_captures_batch_into_proj(&empty_proj, vec![spec0.clone()], None).is_err());
+        assert!(remove_capture(&empty_proj, "missing").is_err());
+        assert!(replace_capture(&empty_proj, "missing", spec0.clone()).is_err());
+        assert!(set_capture_enabled(&empty_proj, "missing", false).is_err());
+
+        // Single-stem seeded project tests duplicate stem_id, missing INPC/STMC, invalid SPCM, and remove_capture emptying.
+        let mut manifest_1 = manifest_empty.clone();
+        manifest_1.stems_registry.push(StemRegistryEntry {
+            stem_id: "s0".into(),
+            chunk_id: 0,
+            enabled: true,
+            is_star_center: true,
+            controls_meta: BTreeMap::new(),
+            provenance: spec0.provenance.clone(),
+            user_metadata: BTreeMap::new(),
+            extracted_physics: None,
+        });
+        let mut spcm0 = vec![0_u8; 64];
+        spcm0[..4].copy_from_slice(b"SPCM");
+        let proj_no_inpc = build_dnam_proj_container_with_dnam_bin(
+            &mut manifest_1.clone(),
+            &[ProjChunkInput {
+                kind: ProjChunkKind::Spcm,
+                chunk_id: 0,
+                payload: spcm0,
+            }],
+            &dnam_bin,
+        )
+        .unwrap();
+        assert!(replace_capture(&proj_no_inpc, "s0", spec0.clone()).is_err());
+        assert!(set_capture_enabled(&proj_no_inpc, "s0", false).is_err());
+
+        let stmc0 = spec0.to_stmc_bytes(0).unwrap();
+        let proj_1 = build_dnam_proj_container_with_dnam_bin(
+            &mut manifest_1,
+            &[
+                ProjChunkInput {
+                    kind: ProjChunkKind::Inpc,
+                    chunk_id: 0,
+                    payload: inpc.clone(),
+                },
+                ProjChunkInput {
+                    kind: ProjChunkKind::Stmc,
+                    chunk_id: 0,
+                    payload: stmc0,
+                },
+            ],
+            &dnam_bin,
+        )
+        .unwrap();
+        assert!(add_capture(&proj_1, spec0.clone(), None).is_err());
+        assert!(
+            add_capture(
+                &proj_1,
+                mk_spec("s1", false, wet_fp32.clone(), Some(b"BAD!".to_vec())),
+                None,
+            )
+            .is_err()
+        );
+        assert!(
+            replace_capture(
+                &proj_1,
+                "s0",
+                mk_spec("s0", true, wet_fp32, Some(b"BAD!".to_vec())),
+            )
+            .is_err()
+        );
+
+        let proj_emptied = remove_capture(&proj_1, "s0").unwrap();
+        let v_empty =
+            DnamProjView::from_bytes(&proj_emptied, &DefaultCryptoProvider::default()).unwrap();
+        assert!(v_empty.manifest.stems_registry.is_empty());
+    }
+}

@@ -613,14 +613,10 @@ fn test_mode1_streaming_live_null_test_autopatch_and_mic_pad_recapture() {
 
     let mut target = SimpleFixtureTarget::new(Chain01SymmetricOd::new());
     let opts = AdaptiveTrainingOptions {
-        sample_rate_hz: 48_000,
-        topology_mode: TopologyProbeMode::Mono1To1,
-        fixed_duration: false,
-        prefer_mode_b: false,
         max_frames_per_stem: 2,
-        run_live_null_test: true,
         null_test_autopatch_threshold_db: -60.0, // Force incremental STAT auto-patch path!
         calb: Some(sample_calb()),
+        ..AdaptiveTrainingOptions::default()
     };
 
     let report = train_adaptive_target(manifest.clone(), &mut target, &opts)

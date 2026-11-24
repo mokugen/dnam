@@ -29,8 +29,7 @@ use dnam_capture::stimulus::{
     train_adaptive_target,
 };
 use dnam_capture::{
-    CORESET_FP32_FRAMES_PER_STEM, CORESET_FP32_STEREO_BYTES, DistillationTarget, StemResponse,
-    StemStimulus, StimulusFrame,
+    CORESET_FP32_STEREO_BYTES, DistillationTarget, StemResponse, StemStimulus, StimulusFrame,
 };
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::{
@@ -370,7 +369,16 @@ fn test_hadamard_law4d_early_stop_seals_matched_a5_coreset_and_orthogonal_diagon
     )
     .expect("valid hadamard STMC");
     let (wet_96k, _) = decode_proj_stmc_f32(&stmc);
-    assert_eq!(wet_96k.len(), CORESET_FP32_FRAMES_PER_STEM);
+    assert!(
+        (dnam_capture::CORESET_FP32_MIN_FRAMES_PER_STEM
+            ..=dnam_capture::CORESET_FP32_MAX_FRAMES_PER_STEM)
+            .contains(&wet_96k.len())
+            && wet_96k.len().is_multiple_of(16)
+            && wet_96k.len() == dry_96k.len(),
+        "unexpected coreset len {} (dry={})",
+        wet_96k.len(),
+        dry_96k.len()
+    );
 
     // At c0 = c1, SeparableTwoKnobTarget reduces to (0.30 + 0.55*c)*x (scaled identity on A5!);
     // across the diagonal, wet_96k must strongly correlate with INPC dry_96k (would be ~0.0 if comb

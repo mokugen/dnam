@@ -9,18 +9,6 @@ use dnam_train::extract_sweep_window_midpoints;
 use crate::proj::directory::StmcTrajectoryWindow;
 use crate::stimulus::sealing::CORESET_A5_FRAMES_48K;
 
-const FULLBAND_BODY_SAMPLES: usize = 72_000;
-const FULLBAND_SETTLE_GAP_SAMPLES: usize = 1_024;
-const FULLBAND_ACTIVE_BODY_END: usize = FULLBAND_BODY_SAMPLES - FULLBAND_SETTLE_GAP_SAMPLES;
-const FULLBAND_GAP_PROBE_START: usize = FULLBAND_ACTIVE_BODY_END + 124;
-const FULLBAND_GAP_PROBE_END: usize = FULLBAND_BODY_SAMPLES - 100;
-const FULLBAND_CHIRP_MIN_BOUND: usize = FULLBAND_BODY_SAMPLES + 4_096;
-const _: () = assert!(
-    FULLBAND_ACTIVE_BODY_END < FULLBAND_GAP_PROBE_START
-        && FULLBAND_GAP_PROBE_START < FULLBAND_GAP_PROBE_END
-        && FULLBAND_GAP_PROBE_END < FULLBAND_CHIRP_MIN_BOUND
-);
-
 /// Extracted sweep interior window `[start_frame .. start_frame + len]` paired with its midpoint
 /// physical control vector.
 #[derive(Clone, Debug, PartialEq)]
@@ -41,7 +29,7 @@ pub(super) struct SweepStemInputs<'a> {
 
 /// Extracts `2..=4` evenly spaced interior windows from a `Mode A` 1D or `Hadamard` sweep stem,
 /// delegating RMS activity segmentation to `dnam_train::extract_sweep_window_midpoints` and
-/// labeling each window with its midpoint physical control vector.
+/// evaluating each window's physical controls via [`eval_sweep_schedule_at_frame`].
 pub(super) fn extract_sweep_windows_for_stem(
     inputs: &SweepStemInputs<'_>,
     has_multiknob_pairs: &mut Vec<(usize, usize)>,
@@ -59,93 +47,76 @@ pub(super) fn extract_sweep_windows_for_stem(
         return false;
     }
 
-    let mut first_val: BTreeMap<usize, f32> = BTreeMap::new();
-    let mut last_val: BTreeMap<usize, f32> = BTreeMap::new();
+    let mut bounds: BTreeMap<usize, (f32, f32, bool)> = BTreeMap::new();
     for w in windows {
-        if w.ctrl_kind == 0 {
-            let p = usize::from(w.control_id);
-            if p < base_meta_ctrls.len() {
-                first_val.entry(p).or_insert(w.u_phys);
-                last_val.insert(p, w.u_phys);
-            }
+        if !w.window_weight.is_finite() || w.window_weight <= 0.0 {
+            continue;
         }
+        let p = usize::from(w.control_id);
+        if p >= base_meta_ctrls.len() {
+            continue;
+        }
+        let (v, is_cont) = match w.ctrl_kind {
+            1 => (f32::from(w.active_opt), false),
+            0 if w.u_phys.is_finite() => (w.u_phys, true),
+            _ => continue,
+        };
+        bounds
+            .entry(p)
+            .and_modify(|(lo, hi, has_cont)| {
+                *lo = lo.min(v);
+                *hi = hi.max(v);
+                *has_cont |= is_cont;
+            })
+            .or_insert((v, v, is_cont));
     }
 
-    let swept_ids: Vec<usize> = first_val
-        .iter()
-        .filter_map(|(&p, &u0)| {
-            let u1 = last_val.get(&p).copied().unwrap_or(u0);
-            ((u1 - u0).abs() > 1.0e-4).then_some(p)
-        })
-        .collect();
-    if swept_ids.is_empty() {
+    let any_swept = bounds.values().any(|&(lo, hi, _)| (hi - lo) > 1.0e-4);
+    if !any_swept {
         return false;
     }
 
-    if swept_ids.len() == 2 {
-        has_multiknob_pairs.push((swept_ids[0], swept_ids[1]));
-    }
-
-    let mut c_start = base_meta_ctrls.to_vec();
-    let mut c_end = base_meta_ctrls.to_vec();
-    for &p in &swept_ids {
-        c_start[p] = first_val[&p];
-        c_end[p] = last_val[&p];
+    let continuous_swept_ids: Vec<usize> = bounds
+        .iter()
+        .filter_map(|(&p, &(lo, hi, is_cont))| (is_cont && (hi - lo) > 1.0e-4).then_some(p))
+        .collect();
+    if continuous_swept_ids.len() == 2 {
+        has_multiknob_pairs.push((continuous_swept_ids[0], continuous_swept_ids[1]));
     }
 
     let wet_bound = n_active.min(wet_lr.len()).min(dry_lr.len());
-    let has_chirp_gap = wet_bound >= FULLBAND_CHIRP_MIN_BOUND
-        && dry_lr[FULLBAND_GAP_PROBE_START..FULLBAND_GAP_PROBE_END]
-            .iter()
-            .all(|&[l, r]| l.abs() <= 1.0e-4 && r.abs() <= 1.0e-4);
-    if !has_chirp_gap && wet_bound <= CORESET_A5_FRAMES_48K && swept_ids.len() > 2 {
-        // Non-stationary 4-phrase CORESET_A5 cannot separate 3+ simultaneously slewing controls
-        // across bass-only Q1/Q2 vs Q3/Q4; consume the stem without corrupting 1D Lobatto stops.
+    if wet_bound <= CORESET_A5_FRAMES_48K && continuous_swept_ids.len() > 2 {
+        // Non-stationary 4-phrase CORESET_A5 cannot separate 3+ simultaneously slewing continuous
+        // controls across bass-only Q1/Q2 vs Q3/Q4; consume the stem cleanly.
         return true;
     }
 
-    let body_cap = if has_chirp_gap {
-        FULLBAND_ACTIVE_BODY_END.min(wet_bound)
-    } else {
-        wet_bound
-    };
+    let sched = build_mode_a_sweep_schedule(windows, base_meta_ctrls);
+    let body_cap = wet_bound;
     let dry_mono: Vec<f64> = dry_lr[..body_cap]
         .iter()
         .map(|&[l, r]| 0.5 * (f64::from(l) + f64::from(r)))
         .collect();
     let hop = (n_fit / 4).max(64).min(body_cap.max(64));
     let rms_segs = extract_sweep_window_midpoints(&dry_mono, hop, 1.0e-5);
+    let traj_len = wet_bound;
 
-    let active_wet_end = wet_lr[..body_cap]
+    let valid_segs: Vec<_> = rms_segs
         .iter()
-        .rposition(|&[l, r]| l.abs() > 1.0e-7 || r.abs() > 1.0e-7)
-        .map_or(body_cap, |idx| idx + 1)
-        .max(n_fit)
-        .min(body_cap);
-    let traj_len = if !has_chirp_gap && wet_bound <= CORESET_A5_FRAMES_48K {
-        wet_bound
-    } else {
-        active_wet_end
-    };
-
-    if rms_segs.len() >= 2
-        && rms_segs
-            .iter()
-            .all(|s| (s.end_frame - s.start_frame) >= n_fit)
-    {
-        for seg in rms_segs.iter().take(4) {
+        .filter(|s| s.end_frame.saturating_sub(s.start_frame) >= n_fit)
+        .collect();
+    if rms_segs.len() >= 2 && valid_segs.len() == rms_segs.len() {
+        let k_pick = valid_segs.len().min(4);
+        for idx in 0..k_pick {
+            let seg_idx = (idx * (valid_segs.len() - 1)) / (k_pick - 1);
+            let seg = valid_segs[seg_idx];
             let off_w = seg
                 .midpoint_frame
                 .saturating_sub(n_fit / 2)
                 .clamp(seg.start_frame, seg.end_frame - n_fit);
-            let frac = ((seg.midpoint_frame as f32) / (traj_len.max(1) as f32)).clamp(0.0, 1.0);
-            let mut cw = base_meta_ctrls.to_vec();
-            for &p in &swept_ids {
-                cw[p] = c_start[p] + frac * (c_end[p] - c_start[p]);
-            }
             out_windows.push(ExtractedSweepWindow {
                 start_frame: off_w,
-                phys_controls: cw,
+                phys_controls: eval_sweep_schedule_at_frame(&sched, seg.midpoint_frame, traj_len),
             });
         }
         return true;
@@ -156,7 +127,7 @@ pub(super) fn extract_sweep_windows_for_stem(
         .map_or(body_cap, |s| s.end_frame)
         .max(n_fit)
         .min(body_cap);
-    let win_bound = active_dry_end.min(active_wet_end).max(n_fit);
+    let win_bound = active_dry_end.max(n_fit);
     let span = win_bound.saturating_sub(n_fit);
     let n_wins = (win_bound / n_fit).clamp(2, 4);
 
@@ -166,15 +137,10 @@ pub(super) fn extract_sweep_windows_for_stem(
         } else {
             (w_idx * span) / (n_wins - 1)
         };
-        let mid_sample = (off_w as f32) + 0.5 * (n_fit as f32);
-        let frac = (mid_sample / (traj_len.max(1) as f32)).clamp(0.0, 1.0);
-        let mut cw = base_meta_ctrls.to_vec();
-        for &p in &swept_ids {
-            cw[p] = c_start[p] + frac * (c_end[p] - c_start[p]);
-        }
+        let mid_frame = (off_w + n_fit / 2).min(traj_len.saturating_sub(1));
         out_windows.push(ExtractedSweepWindow {
             start_frame: off_w,
-            phys_controls: cw,
+            phys_controls: eval_sweep_schedule_at_frame(&sched, mid_frame, traj_len),
         });
     }
 
@@ -236,34 +202,45 @@ pub(super) fn build_mode_a_sweep_schedule(
     }
 }
 
-/// Evaluates `u(frame_idx)` linearly interpolated across uniform knot positions over `[0..n_active)`.
+/// Evaluates `u(frame_idx)` across exact integer knot positions
+/// `t_j = floor(j * (n_active - 1) / (M_c - 1))`, interpolating continuous `ctrl_kind == 0`
+/// controls linearly over `[t_j, t_{j+1}]` and flipping discrete `ctrl_kind == 1` switches
+/// piecewise-constantly at integer `midpoint = floor((t_j + t_{j+1}) / 2)` (`t < midpoint => j`,
+/// `t >= midpoint => j + 1`) (`ref[container.proj.stmc-capsule]`).
 #[must_use]
 pub(super) fn eval_sweep_schedule_at_frame(
     sched: &ModeASweepSchedule,
     frame_idx: usize,
     n_active: usize,
 ) -> Vec<f32> {
-    let u_frac = if n_active <= 1 {
-        0.0_f64
-    } else {
-        (frame_idx.min(n_active - 1) as f64) / ((n_active - 1) as f64)
-    };
+    let last = n_active.saturating_sub(1);
+    let t = frame_idx.min(last);
     sched
         .per_ctrl_knots
         .iter()
         .enumerate()
         .map(|(p, knots)| {
-            if knots.len() <= 1 {
-                knots.first().copied().unwrap_or(0.0)
+            let m = knots.len();
+            if m == 0 {
+                0.0
+            } else if m == 1 || last == 0 {
+                knots[0]
             } else {
-                let pos = u_frac * ((knots.len() - 1) as f64);
+                let knot_t = |j: usize| -> usize { (j * last) / (m - 1) };
+                let mut j = 0_usize;
+                while j + 1 < m - 1 && t >= knot_t(j + 1) {
+                    j += 1;
+                }
+                let t_j = knot_t(j);
+                let t_next = knot_t(j + 1);
                 if sched.per_ctrl_is_switch[p] {
-                    knots[(pos.round() as usize).min(knots.len() - 1)]
+                    let midpoint = (t_j + t_next) / 2;
+                    if t < midpoint { knots[j] } else { knots[j + 1] }
+                } else if t_next <= t_j {
+                    knots[j + 1]
                 } else {
-                    let k0 = (pos.floor() as usize).min(knots.len() - 1);
-                    let k1 = (k0 + 1).min(knots.len() - 1);
-                    let alpha = (pos - (k0 as f64)).clamp(0.0, 1.0);
-                    (f64::from(knots[k0]) + alpha * (f64::from(knots[k1]) - f64::from(knots[k0])))
+                    let alpha = ((t - t_j) as f64 / (t_next - t_j) as f64).clamp(0.0, 1.0);
+                    (f64::from(knots[j]) + alpha * (f64::from(knots[j + 1]) - f64::from(knots[j])))
                         as f32
                 }
             }
@@ -368,13 +345,15 @@ mod tests {
         ));
         assert_eq!(pairs, vec![(0, 1)]);
         assert_eq!(extracted.len(), 4);
+        let expected_w0 = (-1.0 + 2.0 * (512.0 / 4_095.0)) as f32;
+        let expected_w3 = (-1.0 + 2.0 * (3_584.0 / 4_095.0)) as f32;
         assert!(
-            (extracted[0].phys_controls[0] - (-0.75)).abs() < 1.0e-4
-                && (extracted[0].phys_controls[1] - 0.75).abs() < 1.0e-4
+            (extracted[0].phys_controls[0] - expected_w0).abs() < 1.0e-5
+                && (extracted[0].phys_controls[1] + expected_w0).abs() < 1.0e-5
         );
         assert!(
-            (extracted[3].phys_controls[0] - 0.75).abs() < 1.0e-4
-                && (extracted[3].phys_controls[1] - (-0.75)).abs() < 1.0e-4
+            (extracted[3].phys_controls[0] - expected_w3).abs() < 1.0e-5
+                && (extracted[3].phys_controls[1] + expected_w3).abs() < 1.0e-5
         );
 
         // 1D sweep extracts 4 windows without registering pairs
@@ -442,32 +421,142 @@ mod tests {
     }
 
     #[test]
-    fn test_mode_a_sweep_schedule_synchronous_m_max_and_3khz_interpolation() {
+    fn test_mode_a_sweep_schedule_exact_integer_knots_switch_midpoint_and_even_burst_selection() {
         let mut w_zero = mk_win(0, 99.0);
         w_zero.window_weight = 0.0;
+        let sw0 = StmcTrajectoryWindow {
+            control_id: 2,
+            ctrl_kind: 1,
+            active_opt: 0,
+            u_phys: 99.0,
+            window_weight: 1.0,
+            emr_velocity: 0.0,
+        };
+        let sw1 = StmcTrajectoryWindow {
+            active_opt: 1,
+            ..sw0
+        };
+        let sw2 = StmcTrajectoryWindow {
+            active_opt: 2,
+            ..sw0
+        };
         let wins = vec![
             w_zero,
             mk_win(0, -1.0),
             mk_win(0, 0.0),
             mk_win(0, 1.0),
             mk_win(1, 0.75),
+            sw0,
+            sw1,
+            sw2,
         ];
-        let sched = build_mode_a_sweep_schedule(&wins, &[0.0, 0.25, -0.5]);
+        let sched = build_mode_a_sweep_schedule(&wins, &[0.0, 0.25, 0.0]);
         assert_eq!(sched.m_max, 3);
         assert_eq!(sched.per_ctrl_knots[0], vec![-1.0, 0.0, 1.0]);
         assert_eq!(sched.per_ctrl_knots[1], vec![0.75]);
-        assert_eq!(sched.per_ctrl_knots[2], vec![-0.5]);
+        assert_eq!(sched.per_ctrl_knots[2], vec![0.0, 1.0, 2.0]);
 
         let sync = sample_synchronous_m_max_controls(&sched, 97);
         assert_eq!(sync.len(), 3);
-        assert_eq!(sync[0], (0, vec![-1.0, 0.75, -0.5]));
-        assert_eq!(sync[1], (1, vec![0.0, 0.75, -0.5]));
-        assert_eq!(sync[2], (2, vec![1.0, 0.75, -0.5]));
+        assert_eq!(sync[0], (0, vec![-1.0, 0.75, 0.0]));
+        assert_eq!(sync[1], (1, vec![0.0, 0.75, 1.0]));
+        assert_eq!(sync[2], (2, vec![1.0, 0.75, 2.0]));
+
+        // Switch boundaries for N_active = 97, M_c = 3 => t_0 = 0, t_1 = 48, t_2 = 96
+        // Interval [0, 48] midpoint = 24; interval [48, 96] midpoint = 72
+        assert_eq!(eval_sweep_schedule_at_frame(&sched, 23, 97)[2], 0.0);
+        assert_eq!(eval_sweep_schedule_at_frame(&sched, 24, 97)[2], 1.0);
+        assert_eq!(eval_sweep_schedule_at_frame(&sched, 48, 97)[2], 1.0);
+        assert_eq!(eval_sweep_schedule_at_frame(&sched, 71, 97)[2], 1.0);
+        assert_eq!(eval_sweep_schedule_at_frame(&sched, 72, 97)[2], 2.0);
+        assert_eq!(eval_sweep_schedule_at_frame(&sched, 96, 97)[2], 2.0);
 
         let traj = build_3khz_control_trajectory(&sched, 48);
         assert_eq!(traj.len(), 3);
         assert_eq!(traj[0][0], -1.0);
         assert!(traj[1][0] > -1.0 && traj[1][0] < 0.0);
         assert!(traj[2][0] > 0.0 && traj[2][0] < 1.0);
+
+        // Evenly spaced burst selection across 6 separated active bursts
+        let n_seg = 1_600_usize;
+        let stride = 2_400_usize;
+        let total = 6 * stride;
+        let mut dry_gapped = vec![[0.0_f32; 2]; total];
+        for b in 0..6 {
+            for k in 0..n_seg {
+                let s = 0.25 * (TAU * 220.0 * (k as f64) / 48_000.0).sin() as f32;
+                dry_gapped[b * stride + k] = [s, s];
+            }
+        }
+        let mut g_pairs = Vec::new();
+        let mut g_out = Vec::new();
+        assert!(extract_sweep_windows_for_stem(
+            &SweepStemInputs {
+                dry_lr: &dry_gapped,
+                wet_lr: &dry_gapped,
+                n_fit: 512,
+                n_active: total,
+                windows: &[mk_win(0, 0.0), mk_win(0, 1.0)],
+                base_meta_ctrls: &[0.0],
+            },
+            &mut g_pairs,
+            &mut g_out,
+        ));
+        assert_eq!(g_out.len(), 4);
+        assert!(g_out[0].start_frame < stride);
+        assert!(g_out[3].start_frame >= 5 * stride);
+
+        // Switch-only Mode A round-trip sweep (0 -> 1 -> 0) and 2-range + 1-switch coreset stem
+        let sw_only = [0_u8, 1, 0].map(|opt| StmcTrajectoryWindow {
+            control_id: 2,
+            ctrl_kind: 1,
+            active_opt: opt,
+            u_phys: f32::from(opt),
+            window_weight: 1.0,
+            emr_velocity: 0.0,
+        });
+        let (mut sw_pairs, mut sw_out) = (Vec::new(), Vec::new());
+        assert!(extract_sweep_windows_for_stem(
+            &SweepStemInputs {
+                dry_lr: &dry_gapped,
+                wet_lr: &dry_gapped,
+                n_fit: 512,
+                n_active: total,
+                windows: &sw_only,
+                base_meta_ctrls: &[0.0, 0.0, 0.0],
+            },
+            &mut sw_pairs,
+            &mut sw_out,
+        ));
+        assert!(sw_pairs.is_empty() && !sw_out.is_empty());
+
+        let mixed = [
+            mk_win(0, 0.0),
+            mk_win(0, 1.0),
+            mk_win(1, -1.0),
+            mk_win(1, 1.0),
+            sw_only[0],
+            sw_only[1],
+            StmcTrajectoryWindow {
+                active_opt: 2,
+                u_phys: 2.0,
+                ..sw_only[2]
+            },
+        ];
+        let (mut mx_pairs, mut mx_out) = (Vec::new(), Vec::new());
+        assert!(extract_sweep_windows_for_stem(
+            &SweepStemInputs {
+                dry_lr: &dry_gapped,
+                wet_lr: &dry_gapped,
+                n_fit: 512,
+                n_active: total,
+                windows: &mixed,
+                base_meta_ctrls: &[0.0, 0.0, 0.0],
+            },
+            &mut mx_pairs,
+            &mut mx_out,
+        ));
+        assert_eq!(mx_pairs, vec![(0, 1)]);
+        assert!(!mx_out.is_empty());
     }
 }

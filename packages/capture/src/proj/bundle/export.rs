@@ -211,3 +211,117 @@ pub fn export_runtime_dnam_with_crypto<C: CryptoProvider>(
 
     Ok(out_dnam)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        ProjChunkInput, build_dnam_proj_container, build_dnam_proj_container_with_dnam_bin,
+    };
+    use super::*;
+    use crate::proj::schema::{StemProvenance, StemRegistryEntry};
+    use dnam_engine::schema::{ControlSchemaDef, PresetDef};
+    use dnam_train::{Pass5EmitConfig, SonaModelF64, encode_model_to_dnam_bin};
+
+    #[test]
+    fn test_export_runtime_dnam_and_bin_metadata_growth_and_errors() {
+        let mut manifest = DnamProjManifest::default_reference();
+        let no_wght_proj = build_dnam_proj_container(&manifest, &[]).unwrap();
+        assert!(export_runtime_dnam(&no_wght_proj, None).is_err());
+        assert!(export_runtime_dnam_bin(&no_wght_proj, None).is_err());
+
+        let ctrl: ControlSchemaDef = serde_json::from_value(serde_json::json!({
+            "id": "gain",
+            "name": "Gain",
+            "type": "range",
+            "lobatto_degree": 2,
+            "declared_range": [0.0, 1.0],
+            "safe_clamped_range": [0.0, 1.0],
+            "default": 0.5
+        }))
+        .unwrap();
+        manifest.base.controls_schema = vec![ctrl];
+        let dbin =
+            encode_model_to_dnam_bin(&SonaModelF64::new(48_000.0), Pass5EmitConfig::default())
+                .unwrap();
+        let proj = build_dnam_proj_container_with_dnam_bin(&mut manifest, &[], &dbin).unwrap();
+
+        let bin_full = export_runtime_dnam_bin(&proj, None).unwrap();
+        let bin_lite = export_runtime_dnam_bin(&proj, Some(Tier::Lite)).unwrap();
+        assert_eq!(
+            DnamBinView::parse(&bin_lite).unwrap().retained_tier,
+            Tier::Lite
+        );
+        assert!(bin_lite.len() <= bin_full.len());
+
+        // Trigger metadata diff merge (`presets`, `user_metadata`, `controls_schema`, `stems_registry`)
+        // plus DMU1 suffix growth within DEFAULT_DMU1_TRAILER_CAPACITY.
+        let crypto = DefaultCryptoProvider::default();
+        let v = DnamProjView::from_bytes(&proj, &crypto).unwrap();
+        let wght = v.chunk_slice(ProjChunkKind::Wght, 0).unwrap().to_vec();
+        let mut m2 = v.manifest.clone();
+        m2.base.presets.push(PresetDef {
+            id: "clean".into(),
+            name: "Clean".into(),
+            description: None,
+            controls: BTreeMap::new(),
+            user_metadata: BTreeMap::new(),
+        });
+        m2.base.controls_schema[0]
+            .user_metadata
+            .insert("hint".into(), serde_json::json!("bright"));
+        m2.stems_registry.push(StemRegistryEntry {
+            stem_id: "s0".into(),
+            chunk_id: 1,
+            enabled: true,
+            is_star_center: true,
+            controls_meta: BTreeMap::new(),
+            provenance: StemProvenance {
+                input_pcm_sha256: "a".repeat(64),
+                target_pcm_sha256: "b".repeat(64),
+                num_frames: 48_000,
+            },
+            user_metadata: BTreeMap::from([(String::from("take"), serde_json::json!(1))]),
+            extracted_physics: None,
+        });
+        m2.base.user_metadata.insert(
+            "notes".into(),
+            serde_json::json!("x".repeat(DEFAULT_DMU1_TRAILER_CAPACITY / 2)),
+        );
+        let mut spcm = vec![0_u8; 64];
+        spcm[..4].copy_from_slice(b"SPCM");
+        let chunks = vec![
+            ProjChunkInput {
+                kind: ProjChunkKind::Wght,
+                chunk_id: 0,
+                payload: wght.clone(),
+            },
+            ProjChunkInput {
+                kind: ProjChunkKind::Spcm,
+                chunk_id: 1,
+                payload: spcm.clone(),
+            },
+        ];
+        let proj_grow = build_dnam_proj_container(&m2, &chunks).unwrap();
+        let dnam_lite = export_runtime_dnam(&proj_grow, Some(Tier::Lite)).unwrap();
+        let rt_view = DnamContainerView::from_bytes(&dnam_lite, &crypto).unwrap();
+        assert_eq!(rt_view.preamble.highest_tier(), Tier::Lite);
+        assert_eq!(rt_view.header.presets.len(), 1);
+        assert!(rt_view.header.stem_user_metadata.contains_key("s0"));
+        assert!(
+            rt_view.header.controls_schema[0]
+                .user_metadata
+                .contains_key("hint")
+        );
+
+        // Exceeding DEFAULT_DMU1_TRAILER_CAPACITY returns HeaderCapacityExceeded.
+        m2.base.user_metadata.insert(
+            "notes".into(),
+            serde_json::json!("x".repeat(DEFAULT_DMU1_TRAILER_CAPACITY + 64)),
+        );
+        let proj_too_big = build_dnam_proj_container(&m2, &chunks).unwrap();
+        assert!(matches!(
+            export_runtime_dnam(&proj_too_big, None),
+            Err(DnamError::HeaderCapacityExceeded { .. })
+        ));
+    }
+}

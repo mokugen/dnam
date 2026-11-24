@@ -570,4 +570,117 @@ mod tests {
         let ar = manifest.audit_report.as_ref().unwrap();
         assert!(ar.phase3_clamps.iter().any(|t| t == "CLAMP-DYNAMIC"));
     }
+
+    #[test]
+    fn test_violation_slots_fp16_sanitize_and_contract_all_paths() {
+        assert_eq!(checked_tiers(Tier::Lite), vec![Tier::Lite]);
+        assert_eq!(checked_tiers(Tier::Ultra), vec![Tier::Lite, Tier::Ultra]);
+
+        let mut fp16_words = [U16::new(0x7FFF), U16::new(f32_to_fp16(2.0)), U16::new(0)];
+        assert!(scale_fp16_slice(&mut fp16_words, 0.5));
+        assert_eq!(fp16_words[0].get(), 0);
+        assert!(zero_reserved_u16_slice(&mut [U16::new(42), U16::new(0)]));
+        assert!(!zero_reserved_u16_slice(&mut [U16::new(0)]));
+
+        let all = [
+            DynamicCornerViolation::RawStageTargetBound {
+                slot: 31,
+                value: 0.0,
+                lo: 0.0,
+                hi: 0.0,
+            },
+            DynamicCornerViolation::RawStageTargetBound {
+                slot: 5,
+                value: 2.0,
+                lo: 0.0,
+                hi: 1.0,
+            },
+            DynamicCornerViolation::KautzPoleRadius {
+                mode_index: 0,
+                r_eff: 1.0,
+                max_allowed: 0.9995,
+            },
+            DynamicCornerViolation::TransportDampPole {
+                quad_index: 0,
+                damp_eff: 1.0,
+                max_allowed: 0.99995,
+            },
+            DynamicCornerViolation::TransportDelayFloor {
+                quad_index: 0,
+                lane: 0,
+                tau_min: 1.0,
+                tau_floor: 5.0,
+            },
+            DynamicCornerViolation::TransportLoopGain {
+                quad_index: 0,
+                g_lo: 0.0,
+                g_hi: 1.1,
+                max_allowed: 0.999,
+            },
+            DynamicCornerViolation::TransportAllpassGain {
+                quad_index: 0,
+                lane: 0,
+                abs_max: 0.9,
+                max_allowed: 0.75,
+            },
+            DynamicCornerViolation::OpNPreZohHoldDepth {
+                zoh_lo: 0.0,
+                zoh_hi: 1.2,
+                max_allowed: 0.9999,
+            },
+            DynamicCornerViolation::PhasorRateOctave {
+                abs_max: 5.0,
+                max_allowed: 4.0,
+            },
+            DynamicCornerViolation::SensoryVcaGainDelta {
+                abs_max: 2.0,
+                max_allowed: 1.0,
+            },
+            DynamicCornerViolation::StageLatentTableBound {
+                table: "stage_latent_mods_fp16",
+                index: 0,
+                value: 8.0,
+            },
+            DynamicCornerViolation::TransportSigmaKnee {
+                quad_index: 0,
+                bits: 0x3C00,
+                max_bits: 0x3BE0,
+            },
+        ];
+        let slots = collect_violation_slots(&all);
+        assert!(
+            slots.sanitize_cext && slots.scale_global_stage_latent && slots.scale_all_stage_latent
+        );
+
+        let base_bin = initialize_backbone_dnam_bin_if_needed(None).unwrap();
+        let v0 = DnamBinView::parse(&base_bin).unwrap();
+        let mut a0 = *v0.arena0;
+        a0.control_bus_lite.w_ctrl[0][12] = F32::new(1.5);
+        let a3 = *v0.arena3.unwrap();
+        let mut cext = CextDispatchWire {
+            w_ctrl_ext: [[F32::new(0.0); 16]; 16],
+            w_ctrl_ultra_ext: [[F32::new(0.0); 4]; 16],
+        };
+        cext.w_ctrl_ext[0][12] = F32::new(1.5);
+        cext.w_ctrl_ext[15][12] = F32::new(1.5);
+        let mut dbin = encode_single_knob_test_bin(&v0, &a0, &a3, &cext);
+        assert!(contract_dynamic_violation_slots(&mut dbin, &slots, 0, &[0.0; 32], 0.5).unwrap());
+        assert!(contract_all_control_excursions(&mut dbin, 0.5).unwrap());
+        let after_c = DnamBinView::parse(&dbin).unwrap();
+        assert!(after_c.cext.unwrap().w_ctrl_ext[15][12].get().abs() < 1e-6);
+        assert!(after_c.arena0.control_bus_lite.w_ctrl[0][12].get().abs() < 1.5);
+
+        let mut manifest = DnamProjManifest::default_reference();
+        audit_dynamic_corners_and_zero_dc(&mut manifest, &mut dbin, false).unwrap();
+        assert!(
+            !contract_dynamic_violation_slots(
+                &mut dbin,
+                &ViolationSlots::default(),
+                0,
+                &[0.0; 32],
+                0.5
+            )
+            .unwrap()
+        );
+    }
 }

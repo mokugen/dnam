@@ -13,16 +13,19 @@ use dnam_engine::schema::DnamError;
 use zerocopy::IntoBytes;
 use zerocopy::byteorder::little_endian::U32;
 
-use crate::CORESET_FP32_FRAMES_PER_STEM;
 use crate::align::{
-    compute_pcm_sha256, estimate_multiregime_alignment, realign_fractional_kaiser64,
+    compute_pcm_sha256, estimate_hybrid_multiregime_alignment, realign_fractional_kaiser64,
 };
 use crate::proj::capsules::build_proj_inpc_capsule;
 use crate::proj::directory::StmcTrajectoryWindow;
 use crate::proj::vault::VaultCaptureSpec;
+use crate::{
+    CORESET_FP32_FRAMES_PER_STEM, CORESET_FP32_MAX_FRAMES_PER_STEM,
+    CORESET_FP32_MIN_FRAMES_PER_STEM,
+};
 
 use super::ADAPTIVE_FRAME_SAMPLES;
-use super::waveforms::{compute_stmc_psd_88_and_spectral_4096, encode_coreset_fp32};
+use super::waveforms::{compute_stmc_psd_88_and_spectral_4096, encode_coreset_fp32_with_frames};
 
 pub(crate) mod controls;
 pub(crate) mod freeze_and_pad;
@@ -54,6 +57,15 @@ pub(crate) struct StemSealRequest<'a> {
     pub windows: Vec<StmcTrajectoryWindow>,
     pub controls_meta: BTreeMap<String, serde_json::Value>,
     pub user_metadata: BTreeMap<String, serde_json::Value>,
+}
+
+/// Shared sub-sample, clock-drift (`ppm`), and independent L/R polarity alignment parameters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct SharedStemAlignment {
+    pub lag_samples: f64,
+    pub clock_drift_ppm: f64,
+    pub invert_l: bool,
+    pub invert_r: bool,
 }
 
 struct AlignedCoresetSlices<'a> {
@@ -186,15 +198,21 @@ pub(crate) fn estimate_causal_bulk_alignment(dry_48k: &[f32], wet_48k: &[f32]) -
         estimate_quiet_tail_peak(dry_48k, wet_centered, n, settle_start, first_dry_active);
     let causal_gap = estimate_causal_onset_gap(dry_48k, wet_centered, quiet_peak);
 
-    let (raw_lag, raw_inv_pol, _lin_coh) =
-        match estimate_multiregime_alignment(&dry_48k[..n], wet_centered, 48_000, 1_024) {
-            Ok(al) => (
-                al.total_lag_samples,
-                al.polarity_inverted,
-                al.linear_coherence,
-            ),
-            Err(_) => (0.0, false, 0.0),
-        };
+    let (raw_lag, raw_inv_pol, _lin_coh) = match estimate_hybrid_multiregime_alignment(
+        &dry_48k[..n],
+        wet_centered,
+        48_000,
+        1_024,
+        None,
+        false,
+    ) {
+        Ok(al) => (
+            al.total_lag_samples,
+            al.polarity_inverted,
+            al.linear_coherence,
+        ),
+        Err(_) => (0.0, false, 0.0),
+    };
     // Keep genuine converter deadtime aligned while blocking minimum-phase cabinet/oversampler
     // group delay from shifting causality before `t = 0`.
     let upper = causal_gap + 1.0;
@@ -223,8 +241,13 @@ fn build_inpc_and_vault_spec(
     mut req: StemSealRequest<'_>,
     slices: &AlignedCoresetSlices<'_>,
 ) -> Result<(Vec<u8>, VaultCaptureSpec, f64, bool), DnamError> {
-    let active_samples = slices.dry_l.len().min(CORESET_FP32_FRAMES_PER_STEM);
-    let dry_fp32 = encode_coreset_fp32(slices.dry_l, slices.dry_r);
+    let canonical_frames = if slices.dry_l.len() >= CORESET_FP32_MIN_FRAMES_PER_STEM {
+        (slices.dry_l.len().min(CORESET_FP32_MAX_FRAMES_PER_STEM)) & !15
+    } else {
+        CORESET_FP32_FRAMES_PER_STEM
+    };
+    let active_samples = slices.dry_l.len().min(canonical_frames);
+    let dry_fp32 = encode_coreset_fp32_with_frames(canonical_frames, slices.dry_l, slices.dry_r);
     let inpc_channels = if slices.dry_r.is_some() { 2_u16 } else { 1_u16 };
 
     let mut schedule_words = [U32::new(0); 80];
@@ -239,13 +262,13 @@ fn build_inpc_and_vault_spec(
     let inpc_bytes =
         build_proj_inpc_capsule(inpc_channels, req.seed_256, &schedule_320, &dry_fp32)?;
 
-    let wet_fp32 = encode_coreset_fp32(slices.wet_l, slices.wet_r);
+    let wet_fp32 = encode_coreset_fp32_with_frames(canonical_frames, slices.wet_l, slices.wet_r);
     let (psd_88, spec_4096) = compute_stmc_psd_88_and_spectral_4096(slices.wet_l, slices.wet_r);
 
     let provenance = crate::proj::schema::StemProvenance {
         input_pcm_sha256: compute_pcm_sha256(slices.dry_l),
         target_pcm_sha256: compute_pcm_sha256(
-            &slices.wet_l[..slices.wet_l.len().min(CORESET_FP32_FRAMES_PER_STEM)],
+            &slices.wet_l[..slices.wet_l.len().min(canonical_frames)],
         ),
         num_frames: active_samples as u64,
     };
@@ -258,6 +281,7 @@ fn build_inpc_and_vault_spec(
         stem_id: req.stem_id.to_string(),
         is_star_center: req.is_star_center,
         enabled: true,
+        is_stereo: slices.wet_r.is_some(),
         pad_gain_f32: 1.0,
         fractional_lag_samples_f32: slices.lag_samples as f32,
         controls_meta: req.controls_meta,
@@ -274,14 +298,14 @@ fn build_inpc_and_vault_spec(
     Ok((inpc_bytes, spec, slices.lag_samples, slices.inv_pol))
 }
 
-/// Seals `2.0 s` (`96,000`-frame canonical `fp32`, zero-padded if shorter) dry/wet coresets into
-/// `(INPC, VaultCaptureSpec)` with optional shared causal lag and independent stereo polarities.
-pub(crate) fn seal_coresets_to_inpc_and_vault_with_stereo_override(
+/// Seals `2.0–2.5 s` (`96,000–120,000`-frame `fp32`) dry/wet coresets into `(INPC, VaultCaptureSpec)`
+/// with optional full sub-sample lag, `ppm` clock drift, and independent stereo polarities.
+pub(crate) fn seal_coresets_to_inpc_and_vault_with_full_align(
     req: StemSealRequest<'_>,
-    shared_align: Option<(f64, bool, bool)>,
+    shared_align: Option<SharedStemAlignment>,
 ) -> Result<(Vec<u8>, VaultCaptureSpec, f64, bool), DnamError> {
-    let take_frames = if req.dry_48k_l.len() >= CORESET_FP32_FRAMES_PER_STEM {
-        CORESET_FP32_FRAMES_PER_STEM
+    let take_frames = if req.dry_48k_l.len() >= CORESET_FP32_MIN_FRAMES_PER_STEM {
+        (req.dry_48k_l.len().min(CORESET_FP32_MAX_FRAMES_PER_STEM)) & !15
     } else {
         req.dry_48k_l.len().min(CORESET_A5_FRAMES_48K)
     };
@@ -289,16 +313,25 @@ pub(crate) fn seal_coresets_to_inpc_and_vault_with_stereo_override(
     let dry_r = req.dry_48k_r.map(|r| &r[..r.len().min(take_frames)]);
     let dry_ref = &req.dry_48k_l[..req.wet_48k_l.len().min(req.dry_48k_l.len())];
     let wet_ref = &req.wet_48k_l[..dry_ref.len()];
-    let (lag_samples, inv_pol_l, inv_pol_r) = shared_align.unwrap_or_else(|| {
+    let align = shared_align.unwrap_or_else(|| {
         let (lag, pol, _) = estimate_causal_bulk_alignment(dry_ref, wet_ref);
-        (lag, pol, pol)
+        SharedStemAlignment {
+            lag_samples: lag,
+            clock_drift_ppm: 0.0,
+            invert_l: pol,
+            invert_r: pol,
+        }
     });
 
-    let aligned_wet_l = realign_fractional_kaiser64(req.wet_48k_l, lag_samples, 0.0, inv_pol_l);
-    let aligned_wet_r = req
-        .wet_48k_r
-        .filter(|r| !r.is_empty())
-        .map(|r| realign_fractional_kaiser64(r, lag_samples, 0.0, inv_pol_r));
+    let aligned_wet_l = realign_fractional_kaiser64(
+        req.wet_48k_l,
+        align.lag_samples,
+        align.clock_drift_ppm,
+        align.invert_l,
+    );
+    let aligned_wet_r = req.wet_48k_r.filter(|r| !r.is_empty()).map(|r| {
+        realign_fractional_kaiser64(r, align.lag_samples, align.clock_drift_ppm, align.invert_r)
+    });
 
     let wet_take_l = aligned_wet_l.len().min(take_frames);
     let slices = AlignedCoresetSlices {
@@ -308,13 +341,30 @@ pub(crate) fn seal_coresets_to_inpc_and_vault_with_stereo_override(
         wet_r: aligned_wet_r
             .as_deref()
             .map(|r| &r[..r.len().min(take_frames)]),
-        lag_samples,
-        inv_pol: inv_pol_l,
+        lag_samples: align.lag_samples,
+        inv_pol: align.invert_l,
     };
     build_inpc_and_vault_spec(req, &slices)
 }
 
-/// Seals `2.0 s` (`96,000`-frame canonical `fp32`, zero-padded if shorter) dry/wet coresets into
+/// Seals `2.0–2.5 s` (`96,000–120,000`-frame `fp32`, zero-padded if shorter) dry/wet coresets into
+/// `(INPC, VaultCaptureSpec)` with optional shared causal lag and independent stereo polarities.
+pub(crate) fn seal_coresets_to_inpc_and_vault_with_stereo_override(
+    req: StemSealRequest<'_>,
+    shared_align: Option<(f64, bool, bool)>,
+) -> Result<(Vec<u8>, VaultCaptureSpec, f64, bool), DnamError> {
+    seal_coresets_to_inpc_and_vault_with_full_align(
+        req,
+        shared_align.map(|(lag, inv_l, inv_r)| SharedStemAlignment {
+            lag_samples: lag,
+            clock_drift_ppm: 0.0,
+            invert_l: inv_l,
+            invert_r: inv_r,
+        }),
+    )
+}
+
+/// Seals `2.0–2.5 s` (`96,000–120,000`-frame `fp32`, zero-padded if shorter) dry/wet coresets into
 /// `(INPC, VaultCaptureSpec)` with optional shared alignment override.
 pub(crate) fn seal_coresets_to_inpc_and_vault_with_override(
     req: StemSealRequest<'_>,
@@ -327,12 +377,9 @@ pub(crate) fn seal_coresets_to_inpc_and_vault_with_override(
 }
 
 fn locate_coreset_align_span(dry_48k_l: &[f32]) -> (usize, usize, usize) {
-    if dry_48k_l.len() >= CORESET_FP32_FRAMES_PER_STEM {
-        return (
-            0,
-            dry_48k_l.len().min(CORESET_WITH_SETTLE_48K),
-            CORESET_FP32_FRAMES_PER_STEM,
-        );
+    if dry_48k_l.len() >= CORESET_FP32_MIN_FRAMES_PER_STEM {
+        let frames = (dry_48k_l.len().min(CORESET_FP32_MAX_FRAMES_PER_STEM)) & !15;
+        return (0, dry_48k_l.len().min(CORESET_WITH_SETTLE_48K), frames);
     }
     const RING_GUARD: usize = 128;
     let has_leading_coreset = dry_48k_l.len() >= CORESET_WITH_SETTLE_48K + ADAPTIVE_FRAME_SAMPLES

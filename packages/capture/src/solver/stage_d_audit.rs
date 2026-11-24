@@ -294,33 +294,7 @@ pub fn finalize_stage_d_and_audit_with_panama_rows(
     let mono_out = manifest.base.io_config.output_mode == "mono";
     let dual_in = manifest.base.io_config.inputs >= 2;
     let raw_n_eval = star_wet_lr.map_or(dry_lr.len(), |w| dry_lr.len().min(w.len()));
-    let has_sweep = raw_n_eval >= 76_096
-        && dry_lr[71_100..71_900]
-            .iter()
-            .all(|&[l, r]| l.abs() <= 1.0e-4 && r.abs() <= 1.0e-4)
-        && dry_lr[72_000..raw_n_eval]
-            .iter()
-            .any(|&[l, r]| l.abs() > 1.0e-4 || r.abs() > 1.0e-4);
-    let body_cap = if has_sweep { 72_000 } else { raw_n_eval };
-    let last_active_dry = dry_lr[..body_cap]
-        .iter()
-        .rposition(|&[l, r]| l.abs() > 1.0e-6 || r.abs() > 1.0e-6)
-        .map_or(body_cap, |idx| (idx + 1).min(body_cap));
-    let min_eval = canonical_besr_warmup(body_cap).saturating_add(64);
-    let tail_wet_silent = star_wet_lr.is_none_or(|wet| {
-        wet[last_active_dry..body_cap]
-            .iter()
-            .all(|&[l, r]| l.abs() <= 1.0e-4 && r.abs() <= 1.0e-4)
-    });
-    let n_eval = if has_sweep
-        || (body_cap.saturating_sub(last_active_dry) >= body_cap / 2
-            && last_active_dry > min_eval
-            && tail_wet_silent)
-    {
-        last_active_dry
-    } else {
-        body_cap
-    };
+    let n_eval = crate::solver::resolve_eval_active_len(manifest, dry_lr, star_wet_lr, raw_n_eval);
     let warmup = canonical_besr_warmup(n_eval).min(n_eval.saturating_sub(1));
 
     let mut tier_lufs = [-120.0_f64; 4];
@@ -360,24 +334,8 @@ pub fn finalize_stage_d_and_audit_with_panama_rows(
         for (t, rep) in res.tier_reports.iter().enumerate() {
             tier_esr_db[t] = rep.besr_db as f32;
         }
-        let body_warmup = canonical_besr_warmup(body_cap).min(body_cap.saturating_sub(1));
-        if n_eval < body_cap && !has_sweep && body_cap > body_warmup + 8 {
-            eval_tiers_via_vm(
-                dnam_bin,
-                &VmEvalInputs {
-                    dry_lr,
-                    star_wet_lr,
-                    len: body_cap,
-                    warmup: body_warmup,
-                    mono_out,
-                    dual_in,
-                },
-                &mut tier_lufs,
-                &mut tier_esr_db,
-            )?;
-        }
     } else {
-        let eval_len = if has_sweep { n_eval } else { body_cap };
+        let eval_len = n_eval;
         let eval_warmup = canonical_besr_warmup(eval_len).min(eval_len.saturating_sub(1));
         if eval_len > eval_warmup + 8 {
             eval_tiers_via_vm(
@@ -491,5 +449,66 @@ mod tests {
         )
         .expect("stage d path 1 should succeed");
         assert_eq!(head_only.tier_esr_db, [-20.0; 4]);
+    }
+
+    #[test]
+    fn test_stage_d_helpers_mono_vm_eval_and_invalid_bin() {
+        assert!(compute_integrated_lufs(&[[f32::NAN, f32::INFINITY]; 16], 4_000).is_finite());
+        assert_eq!(
+            eval_rendered_esr_db(&[0.1; 4], &[0.1; 4], &[[0.1; 2]; 4], true, 8),
+            0.0
+        );
+        assert_eq!(
+            eval_rendered_esr_db(&[0.0; 16], &[0.0; 16], &[[0.0; 2]; 16], false, 4),
+            -120.0
+        );
+        assert_eq!(
+            eval_rendered_esr_db(&[0.2; 16], &[0.2; 16], &[[0.0; 2]; 16], true, 4),
+            0.0
+        );
+        assert_eq!(
+            eval_tier_3band_besr_db(&[0.0; 16], &[0.0; 16], &[[0.0; 2]; 16], true, 12),
+            -120.0
+        );
+
+        let mut manifest = DnamProjManifest::default_reference();
+        assert!(
+            finalize_stage_d_and_audit(
+                &mut manifest,
+                &mut vec![0u8; 8],
+                &[],
+                None,
+                None,
+                0.0,
+                StageDAuditOptions::PATH1_HEAD_ONLY,
+            )
+            .is_err()
+        );
+
+        let mut dnam_bin = initialize_backbone_dnam_bin_if_needed(None).expect("neutral dnam-bin");
+        manifest.base.io_config.output_mode = String::from("mono");
+        let n = 4_096usize;
+        let dry: Vec<[f32; 2]> = (0..n)
+            .map(|i| {
+                let t = (i as f64) / 48_000.0;
+                let s = (0.12 * (TAU * 120.0 * t).sin()
+                    + 0.12 * (TAU * 997.0 * t).sin()
+                    + 0.12 * (TAU * 5_500.0 * t).sin()) as f32;
+                [s, s]
+            })
+            .collect();
+        let wet: Vec<[f32; 2]> = dry.iter().map(|&[l, r]| [0.999 * l, 0.999 * r]).collect();
+        let out = finalize_stage_d_and_audit(
+            &mut manifest,
+            &mut dnam_bin,
+            &dry,
+            Some(&wet),
+            None,
+            1.0,
+            StageDAuditOptions::PATH1_HEAD_ONLY,
+        )
+        .unwrap();
+        assert!(out.tier_esr_db.iter().all(|v| v.is_finite()));
+        assert!(manifest.solver_telemetry.as_ref().unwrap().total_solve_ms >= 1.0);
     }
 }

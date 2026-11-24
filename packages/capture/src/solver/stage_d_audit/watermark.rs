@@ -774,4 +774,42 @@ mod tests {
         .unwrap();
         assert!(z > 15.0, "expected Tardos Z > 15, got {z}");
     }
+
+    #[test]
+    fn test_watermark_helpers_zero_ids_short_inputs_and_tier_strip() {
+        assert_eq!(non_zero_16(&[0; 16])[0], 1);
+        let zero_cfg = BuyerWatermarkConfig::new([0; 32], "m_z", "l_z", [0; 16]);
+        let (kappa, q) = derive_buyer_gauge_params(&zero_cfg);
+        assert_eq!(kappa.len(), 32);
+        assert!(q[0].iter().map(|v| v * v).sum::<f32>() > 0.99);
+        assert!(
+            derive_buyer_tardos_codebook(&zero_cfg)
+                .accusation_weights
+                .len()
+                == 7680
+        );
+
+        assert!(extract_arena_pole_angles_16(&[0; 8]).is_empty());
+        assert!(extract_arena_pole_angles_34(b"DNBNbad").is_empty());
+        assert_eq!(extract_gram_diag_256(None)[0], 1.0);
+        assert_eq!(extract_gram_diag_256(Some(&[0; 8]))[0], 1.0);
+        let packed = vec![0_u8; uplo_u_packed_len(256) * 8];
+        assert_eq!(extract_gram_diag_256(Some(&packed))[0], 1.0);
+
+        assert!((snap_pole_angle_guard_band(0.021) - 0.022).abs() < 1e-4);
+        assert!((snap_pole_angle_guard_band(0.029) - 0.028).abs() < 1e-4);
+        assert!((snap_pole_angle_guard_band(0.025) - 0.025).abs() < 1e-6);
+
+        let dnam_bin =
+            encode_model_to_dnam_bin(&SonaModelF64::new(48_000.0), Pass5EmitConfig::default())
+                .unwrap();
+        let mut manifest = DnamProjManifest::default_reference();
+        let proj = build_dnam_proj_container_with_dnam_bin(&mut manifest, &[], &dnam_bin).unwrap();
+        let lite_wm = export_runtime_dnam_watermarked(&proj, &zero_cfg, Some(Tier::Lite)).unwrap();
+        let view =
+            DnamContainerView::from_bytes(&lite_wm, &DefaultCryptoProvider::default()).unwrap();
+        assert_eq!(view.preamble.highest_tier(), Tier::Lite);
+        let (orig, est) = identify_pole_angles_blackbox_from_audio(&lite_wm, &[]).unwrap();
+        assert_eq!(orig, est);
+    }
 }

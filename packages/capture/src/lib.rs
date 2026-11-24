@@ -20,12 +20,14 @@ pub mod whitebox;
 
 pub use align::{
     AlignmentRegime, DifferentialPadCalibration, LoopbackCalibrationReport, MultiRegimeAlignment,
-    NullHomingReport, ThermalRecoveryReport, WavData, calibrate_loopback_calb, compute_pcm_sha256,
-    decode_wav_bytes, encode_wav_12bit, encode_wav_16bit, encode_wav_24bit, encode_wav_32bit_float,
-    encode_wav_32bit_int, encode_wav_with_bit_depth, estimate_multiregime_alignment,
-    estimate_subsample_lag_and_gain, evaluate_acoustic_null_homing, evaluate_live_decay_tail,
-    evaluate_thermal_recovery_gate, generate_calb_loopback_stimulus, generate_mic_pad_probe_400ms,
-    measure_differential_pad_ratio, realign_fractional_kaiser64, rescale_padded_stem,
+    NullHomingReport, PpmDriftEstimate, ThermalRecoveryReport, WavData, calibrate_loopback_calb,
+    compute_pcm_sha256, decode_wav_bytes, encode_wav_12bit, encode_wav_16bit, encode_wav_24bit,
+    encode_wav_32bit_float, encode_wav_32bit_int, encode_wav_with_bit_depth,
+    estimate_hybrid_multiregime_alignment, estimate_multiregime_alignment,
+    estimate_ppm_clock_drift, estimate_subsample_lag_and_gain, evaluate_acoustic_null_homing,
+    evaluate_live_decay_tail, evaluate_thermal_recovery_gate, generate_calb_loopback_stimulus,
+    generate_mic_pad_probe_400ms, measure_differential_pad_ratio, realign_fractional_kaiser64,
+    rescale_padded_stem,
 };
 pub use resampler::{
     CANONICAL_TRAINER_SAMPLE_RATE_HZ, resample_48k_to_arbitrary_rate, resample_arbitrary_rate,
@@ -45,6 +47,19 @@ pub use solver::{
     has_populated_v3_backbone, identify_pole_angles_blackbox_from_audio,
     render_blackbox_probe_response, run_stage_a_physics_probe, serialize_v3_stat_chunk_ultra,
     solve_stage_b_backbone, solve_stage_b_backbone_with_progress, solve_stage_c_knobs,
+};
+pub use stimulus::pipeline::schoukens::{
+    LAW0A_MIN_PERIOD_COHERENCE, LAW0A_REL_MISMATCH_FLOOR, OddRandomMultisinePlan,
+    Regime2DecayInput, SCHOUKENS_CORESET_20S_OFFSETS, SCHOUKENS_CORESET_25S_OFFSETS,
+    SCHOUKENS_PEAK_CEILING_FS, SCHOUKENS_R1_MAX_CREST_FACTOR_LIN, SCHOUKENS_R1_PERIOD_SAMPLES,
+    SCHOUKENS_R1_SPCM_PERIODS, SCHOUKENS_SPCM_CANONICAL_FRAMES, SCHOUKENS_SPCM_REGIME_OFFSETS,
+    SchoukensAnalysisConfig, SchoukensExcitation, SchoukensPhysicsResult, SpcmHeader64BWire,
+    analyze_schoukens_pintelon_physics, build_odd_random_multisine_plan,
+    build_schoukens_pintelon_coreset_48k, build_schoukens_pintelon_spcm_48k,
+    compute_schroeder_edc_t60_s, condense_spcm_to_coreset, condense_spcm_to_coreset_for_topology,
+    coreset_offsets_for_frames, encode_spcm_chunk, regime2_gap_ranges,
+    synthesize_odd_random_multisine_period, synthesize_regime2_staircase_and_gaps,
+    synthesize_regime3_chirp_and_imd, synthesize_regime4_topology_contrast,
 };
 pub use stimulus::{
     AdaptiveStimulusController, AdaptiveTrainingOptions, AdaptiveTrainingReport, BatchSolveReport,
@@ -69,6 +84,9 @@ pub const CORESET_FP32_MIN_FRAMES_PER_STEM: usize = 96_000;
 
 /// Maximum canonical `2.5 s` `fp32` (`<f4`) coreset length (`120,000` frames at `48 kHz`).
 pub const CORESET_FP32_MAX_FRAMES_PER_STEM: usize = 120_000;
+
+/// Canonical `2.5 s` condensed 4-regime `Schoukens–Pintelon` coreset length (`120,000` frames at `48 kHz`).
+pub const CORESET_FP32_CANONICAL_25S_FRAMES: usize = CORESET_FP32_MAX_FRAMES_PER_STEM;
 
 /// Canonical `2.0 s` full-bandwidth `fp32` coreset window length (`96,000` frames at `48 kHz`, `ref[container.proj.inpc-capsule]`).
 pub const CORESET_FP32_FRAMES_PER_STEM: usize = 96_000;

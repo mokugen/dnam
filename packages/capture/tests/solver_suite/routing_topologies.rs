@@ -81,14 +81,12 @@ fn distill_topology_bytes(
         manifest,
         model_box,
         &AdaptiveTrainingOptions {
-            sample_rate_hz: 48_000,
             topology_mode: topo,
             fixed_duration: true,
             prefer_mode_b: true,
             max_frames_per_stem: 1,
             run_live_null_test: false,
-            null_test_autopatch_threshold_db: -36.0,
-            calb: None,
+            ..AdaptiveTrainingOptions::default()
         },
     )
     .unwrap()

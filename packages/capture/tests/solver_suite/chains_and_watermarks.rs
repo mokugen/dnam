@@ -316,14 +316,13 @@ pub(super) fn verify_chain_distillation<M: BlackBoxModel>(
     let manifest = manifest_for_fixture(&model);
     let mut adapter = BlackBoxDistillationAdapter::from_model(model);
     let opts = AdaptiveTrainingOptions {
-        sample_rate_hz: 48_000,
         topology_mode: topo,
         fixed_duration: true,
         prefer_mode_b: true,
         max_frames_per_stem: 2,
         run_live_null_test: run_null_test,
         null_test_autopatch_threshold_db: -42.0,
-        calb: None,
+        ..AdaptiveTrainingOptions::default()
     };
     let report = train_adaptive_target(manifest, &mut adapter, &opts)
         .unwrap_or_else(|e| panic!("{chain_id} train_adaptive_target failed: {e:?}"));

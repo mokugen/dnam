@@ -556,4 +556,125 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn test_session_read_eof_interrupted_and_live_worker_protocol_edges() {
+        struct FlakyReader(u8);
+        impl Read for FlakyReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0 {
+                    0 => {
+                        self.0 = 1;
+                        Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+                    }
+                    1 => Ok(0),
+                    _ => Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
+                }
+            }
+        }
+        assert_eq!(read_first_byte_or_eof(&mut FlakyReader(0)).unwrap(), None);
+        assert!(read_first_byte_or_eof(&mut FlakyReader(2)).is_err());
+
+        #[cfg(unix)]
+        {
+            let mut ok_wire = Vec::new();
+            super::super::write_dnwb_stem_response(
+                &mut ok_wire,
+                DnwbCommand::RenderStem,
+                &StemResponse {
+                    stem_id: String::from("ok"),
+                    sample_rate_hz: 48_000,
+                    out_1: vec![0.1, -0.1],
+                    out_2: None,
+                    out_3: None,
+                    out_4: None,
+                    internal_nodes: std::collections::BTreeMap::new(),
+                },
+            )
+            .unwrap();
+            let ok_oct: String = ok_wire.iter().map(|b| format!("\\{:03o}", b)).collect();
+            let stim = StemStimulus {
+                stem_id: String::from("s"),
+                sample_rate_hz: 48_000,
+                in_1: vec![0.0, 0.0],
+                in_2: None,
+                in_3: None,
+                in_4: None,
+                control_values: Vec::new(),
+                control_trajectories: None,
+                freeze_transition_window: None,
+            };
+            let mut sess = DnwbWorkerSession::new();
+            let cmd = vec![
+                String::from("sh"),
+                String::from("-c"),
+                format!("head -c 64 >/dev/null; printf '{ok_oct}'; sleep 0.2"),
+            ];
+            let resp = sess
+                .execute(
+                    &cmd,
+                    DnwbCommand::RenderStem,
+                    &stim,
+                    &[],
+                    Duration::from_millis(500),
+                )
+                .unwrap();
+            assert_eq!(resp.out_1, vec![0.1, -0.1]);
+            assert!(sess.is_live());
+            sess.reset_if_live(&[String::from("false")], &[], Duration::from_millis(200));
+            assert!(!sess.is_live());
+
+            // Command opcode mismatch and non-empty Reset payload both fail closed.
+            let err_wrong_cmd = sess.execute(
+                &[
+                    String::from("sh"),
+                    String::from("-c"),
+                    format!("head -c 64 >/dev/null; printf '{ok_oct}'"),
+                ],
+                DnwbCommand::RenderFrame,
+                &stim,
+                &[],
+                Duration::from_millis(500),
+            );
+            assert!(matches!(
+                err_wrong_cmd,
+                Err(DnwbError::InvalidStimulusLayout(_))
+            ));
+
+            let mut reset_bad_wire = Vec::new();
+            super::super::write_dnwb_stem_response(
+                &mut reset_bad_wire,
+                DnwbCommand::Reset,
+                &StemResponse {
+                    stem_id: String::from("rst"),
+                    sample_rate_hz: 48_000,
+                    out_1: vec![0.5],
+                    out_2: None,
+                    out_3: None,
+                    out_4: None,
+                    internal_nodes: std::collections::BTreeMap::new(),
+                },
+            )
+            .unwrap();
+            let rst_oct: String = reset_bad_wire
+                .iter()
+                .map(|b| format!("\\{:03o}", b))
+                .collect();
+            let err_rst = sess.execute(
+                &[
+                    String::from("sh"),
+                    String::from("-c"),
+                    format!("head -c 64 >/dev/null; printf '{rst_oct}'"),
+                ],
+                DnwbCommand::Reset,
+                &StemStimulus {
+                    in_1: Vec::new(),
+                    ..stim
+                },
+                &[],
+                Duration::from_millis(500),
+            );
+            assert!(matches!(err_rst, Err(DnwbError::InvalidStimulusLayout(_))));
+        }
+    }
 }

@@ -25,7 +25,7 @@ use dnam_capture::solver::{
     build_v3_causal_probe_excitation, canonical_besr_warmup,
     estimate_v3_causal_deadtime_and_polarity, star_center_control_values,
 };
-use dnam_capture::stimulus::{AdaptiveTrainingOptions, TopologyProbeMode, train_adaptive_target};
+use dnam_capture::stimulus::{AdaptiveTrainingOptions, train_adaptive_target};
 use dnam_capture::{
     DistillationTarget, StemResponse, StemStimulus, StimulusFrame, realign_fractional_kaiser64,
     resample_arbitrary_rate, resample_control_trajectory, resampled_frame_len, scale_freeze_window,
@@ -435,14 +435,12 @@ fn validate_unrecorded_settings<M: BlackBoxModel>(
     let manifest = manifest_for_model(&model, "MultiSetting");
     let mut adapter = ValidationAdapter::from_model(model);
     let opts = AdaptiveTrainingOptions {
-        sample_rate_hz: 48_000,
-        topology_mode: TopologyProbeMode::Mono1To1,
         fixed_duration: true,
         prefer_mode_b: true,
         max_frames_per_stem: 2,
         run_live_null_test: false,
         null_test_autopatch_threshold_db: -42.0,
-        calb: None,
+        ..AdaptiveTrainingOptions::default()
     };
     let report = train_adaptive_target(manifest.clone(), &mut adapter, &opts)
         .unwrap_or_else(|e| panic!("{label} train_adaptive_target failed: {e:?}"));

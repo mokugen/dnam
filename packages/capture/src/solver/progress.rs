@@ -771,4 +771,56 @@ mod tests {
         slot.reset();
         assert_eq!(slot.poll().status, TrainingStatus::Idle);
     }
+
+    #[test]
+    fn test_progress_enum_fallbacks_handles_and_odd_seqlock() {
+        for c in 0..=5_u8 {
+            let _ = (
+                TrainingStatus::from_code(c),
+                TrainingPhase::from_code(c * 2),
+                code_to_tier(c),
+            );
+        }
+        assert_eq!(TrainingStatus::from_code(99), TrainingStatus::Idle);
+        assert_eq!(TrainingPhase::from_code(99), TrainingPhase::Idle);
+        assert_eq!(code_to_tier(99), None);
+
+        let mut s = TrainerProgressSnapshot::default();
+        assert!(s.tone_match_percent().is_none() && (s.progress_fraction() - 0.0).abs() < 1.0e-6);
+        s.best_loss = 0.01;
+        assert!(s.tone_match_percent().is_some());
+        s.tier_besr_db = [-20.0, f32::NAN, f32::NAN, f32::NAN];
+        assert!(s.tone_match_percent().is_some());
+
+        let mut bad_wire = s.to_wire(0);
+        bad_wire.magic = U32::new(0x1234);
+        assert!(TrainerProgressSnapshot::from_wire(&bad_wire).is_none());
+
+        let inactive = TrainerProgressHandle::default();
+        assert!(!inactive.is_active() && !format!("{inactive:?}").is_empty());
+        inactive.emit(&s);
+        inactive.emit_phase(TrainingStatus::Running, TrainingPhase::Capture, 100);
+        assert!(!inactive.subrange(0, 500).is_active());
+
+        let slot = Arc::new(AtomicTrainerProgress::default());
+        let slot_h = TrainerProgressHandle::from_slot(Arc::clone(&slot));
+        let cb_hits = Arc::new(StdMutex::new(0_usize));
+        let cb_h = TrainerProgressHandle::from_callback({
+            let cb_hits = Arc::clone(&cb_hits);
+            move |_| *cb_hits.lock().unwrap() += 1
+        });
+        s.has_visual_frame = true;
+        s.status = TrainingStatus::Running;
+        slot_h.emit(&s);
+        cb_h.emit(&s);
+        // Second emit without visual frame / NaN metrics exercises cache carry-forward & Idle reset.
+        slot_h.emit_phase(TrainingStatus::Idle, TrainingPhase::Idle, 0);
+        slot_h.emit_phase(TrainingStatus::Failed, TrainingPhase::Failed, 500);
+        cb_h.emit_phase(TrainingStatus::Completed, TrainingPhase::Completed, 1_000);
+        assert_eq!(*cb_hits.lock().unwrap(), 2);
+
+        // Force odd seqlock sequence to verify `read_consistent_words` spin-loop fallback.
+        slot.words[WORD_SEQ].store(3, Ordering::Release);
+        assert_eq!(slot.poll().status, TrainingStatus::Idle);
+    }
 }

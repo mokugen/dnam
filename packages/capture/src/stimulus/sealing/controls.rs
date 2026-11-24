@@ -124,9 +124,10 @@ pub(crate) struct TrajectoryInterpSpec<'a> {
     pub frame_len: usize,
 }
 
-fn populate_coreset_knot_windows(
+pub(crate) fn populate_coreset_knot_windows_with_kinds(
     start_vals: &[f32],
     end_vals: &[f32],
+    is_switch: Option<&[bool]>,
     window_weight: f32,
     trajectory_windows: &mut Vec<StmcTrajectoryWindow>,
 ) {
@@ -146,16 +147,48 @@ fn populate_coreset_knot_windows(
         for &p in &swept_indices {
             let v0 = start_vals[p];
             let v1 = end_vals[p];
-            trajectory_windows.push(StmcTrajectoryWindow {
-                control_id: p as u16,
-                ctrl_kind: 0,
-                active_opt: 0,
-                u_phys: v0 + (v1 - v0) * frac,
-                window_weight,
-                emr_velocity: 1.0 / (knots as f32),
-            });
+            let sw = is_switch.is_some_and(|flags| flags.get(p).copied().unwrap_or(false));
+            if sw {
+                let opt = if k < knots / 2 {
+                    v0.round().max(0.0) as u8
+                } else {
+                    v1.round().max(0.0) as u8
+                };
+                trajectory_windows.push(StmcTrajectoryWindow {
+                    control_id: p as u16,
+                    ctrl_kind: 1,
+                    active_opt: opt,
+                    u_phys: 0.0,
+                    window_weight,
+                    emr_velocity: 0.0,
+                });
+            } else {
+                trajectory_windows.push(StmcTrajectoryWindow {
+                    control_id: p as u16,
+                    ctrl_kind: 0,
+                    active_opt: 0,
+                    u_phys: v0 + (v1 - v0) * frac,
+                    window_weight,
+                    emr_velocity: 1.0 / (knots as f32),
+                });
+            }
         }
     }
+}
+
+fn populate_coreset_knot_windows(
+    start_vals: &[f32],
+    end_vals: &[f32],
+    window_weight: f32,
+    trajectory_windows: &mut Vec<StmcTrajectoryWindow>,
+) {
+    populate_coreset_knot_windows_with_kinds(
+        start_vals,
+        end_vals,
+        None,
+        window_weight,
+        trajectory_windows,
+    );
 }
 
 /// Linearly interpolates frame-level control trajectories and appends observed `STMC` windows.
@@ -182,14 +215,14 @@ pub(crate) fn interpolate_frame_trajectories(
 
     let mut trajs = Vec::with_capacity(end_vals.len());
     let mut moved_any = false;
-    let n_len = spec.frame_len.max(1);
+    let denom = spec.frame_len.saturating_sub(1).max(1);
     for (p, (&v0, &v1)) in spec.start_vals.iter().zip(end_vals).enumerate() {
         let s0 = v0 + (v1 - v0) * spec.t0;
         let s1 = v0 + (v1 - v0) * spec.t1;
         cur_ctrls[p] = s0;
         trajs.push(
             (0..spec.frame_len)
-                .map(|i| s0 + (s1 - s0) * (i as f32 / n_len as f32))
+                .map(|i| s0 + (s1 - s0) * (i as f32 / denom as f32))
                 .collect(),
         );
         if !spec.is_coreset && (v1 - v0).abs() > 1.0e-5 && trajectory_windows.len() < 36 {
@@ -412,5 +445,42 @@ mod tests {
         );
         assert_eq!(wins.len(), 8);
         assert_eq!(wins.last().unwrap().control_id, 1);
+
+        // Switch kind emission via `populate_coreset_knot_windows_with_kinds` & exact endpoint `frame_len - 1`
+        let mut sw_wins = Vec::new();
+        populate_coreset_knot_windows_with_kinds(
+            &[0.0, 0.0],
+            &[1.0, 2.0],
+            Some(&[false, true]),
+            1.0,
+            &mut sw_wins,
+        );
+        let switch_recs: Vec<_> = sw_wins.iter().filter(|w| w.control_id == 1).collect();
+        assert!(switch_recs.len() >= 2);
+        assert!(
+            switch_recs
+                .iter()
+                .all(|w| w.ctrl_kind == 1 && w.u_phys == 0.0)
+        );
+        assert_eq!(switch_recs.first().unwrap().active_opt, 0);
+        assert_eq!(switch_recs.last().unwrap().active_opt, 2);
+
+        let mut end_wins = Vec::new();
+        let (_, end_trajs) = interpolate_frame_trajectories(
+            &TrajectoryInterpSpec {
+                start_vals: &[0.0],
+                end_vals_opt: Some(&[1.0]),
+                active_control_id: 0,
+                window_weight: 1.0,
+                t0: 0.0,
+                t1: 1.0,
+                reset_coreset_knots: false,
+                is_coreset: true,
+                frame_len: 5,
+            },
+            &mut end_wins,
+        );
+        let tr = &end_trajs.unwrap()[0];
+        assert!((tr[4] - 1.0).abs() < 1.0e-6);
     }
 }

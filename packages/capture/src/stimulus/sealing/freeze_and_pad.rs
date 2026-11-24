@@ -2,6 +2,7 @@
 //! Sample-Rate Normalization, Freeze-Transition Stem Synthesis, and `400 ms` Differential
 //! Mic-Pad Clipped Stem Re-Capture (`stimulus::sealing::freeze_and_pad`).
 
+use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::DnamError;
 use zerocopy::FromBytes;
 use zerocopy::byteorder::little_endian::F32;
@@ -10,11 +11,14 @@ use crate::align::{
     DifferentialPadCalibration, compute_pcm_sha256, measure_differential_pad_ratio,
     rescale_padded_stem,
 };
+use crate::proj::STMC_FLAG_STEREO;
+use crate::proj::bundle::DnamProjView;
+use crate::proj::directory::{ProjChunkKind, verify_proj_stmc_capsule};
 use crate::proj::vault::{VaultCaptureSpec, replace_capture};
 use crate::resampler::{
     resample_48k_to_arbitrary_rate, resample_arbitrary_rate_to_48k, resampled_frame_len,
 };
-use crate::{CORESET_FP32_FRAMES_PER_STEM, CORESET_FP32_MIN_FRAMES_PER_STEM};
+use crate::{CORESET_FP32_MAX_FRAMES_PER_STEM, CORESET_FP32_MIN_FRAMES_PER_STEM};
 
 #[cfg(test)]
 use super::super::waveforms::{
@@ -235,17 +239,66 @@ pub fn recapture_clipped_stem(
                 DnamError::SchemaValidationError(format!("mic-pad probe calibration failed: {e}"))
             })?;
 
-    let is_stereo = padded_capture.wet_coreset_fp32.len() >= CORESET_FP32_MIN_FRAMES_PER_STEM * 8;
+    let crypto = DefaultCryptoProvider::default();
+    let proj_view = DnamProjView::from_bytes(proj_bytes, &crypto)?;
+    let existing_entry = proj_view
+        .manifest
+        .stems_registry
+        .iter()
+        .find(|s| s.stem_id == stem_id)
+        .ok_or_else(|| {
+            DnamError::SchemaValidationError(format!(
+                "stem_id '{stem_id}' not found in stems_registry for recapture"
+            ))
+        })?;
+    let stmc_bytes = proj_view
+        .chunk_slice(ProjChunkKind::Stmc, existing_entry.chunk_id)
+        .ok_or_else(|| {
+            DnamError::SchemaValidationError(format!(
+                "missing STMC chunk {} for stem '{stem_id}'",
+                existing_entry.chunk_id
+            ))
+        })?;
+    let stmc_view = verify_proj_stmc_capsule(stmc_bytes)?;
+    let is_stereo = (stmc_view.flags & STMC_FLAG_STEREO) != 0;
+    if padded_capture.is_stereo != is_stereo {
+        return Err(DnamError::SchemaValidationError(format!(
+            "STMC_FLAG_STEREO mismatch on stem '{stem_id}': expected is_stereo={is_stereo}, got {}",
+            padded_capture.is_stereo
+        )));
+    }
     let frame_bytes = if is_stereo { 8 } else { 4 };
-    let num_frames =
-        (padded_capture.wet_coreset_fp32.len() / frame_bytes).max(CORESET_FP32_FRAMES_PER_STEM);
-    let decoded: Vec<f32> = <[F32]>::ref_from_bytes(
-        &padded_capture.wet_coreset_fp32[..padded_capture.wet_coreset_fp32.len() & !3],
-    )
-    .map_err(|_| DnamError::SchemaValidationError("invalid STMC fp32 PCM slice".to_string()))?
-    .iter()
-    .map(|v| v.get())
-    .collect();
+    if padded_capture.wet_coreset_fp32.is_empty()
+        || !padded_capture
+            .wet_coreset_fp32
+            .len()
+            .is_multiple_of(frame_bytes)
+    {
+        return Err(DnamError::SchemaValidationError(
+            "invalid STMC fp32 PCM payload alignment".to_string(),
+        ));
+    }
+    let payload_frames = padded_capture.wet_coreset_fp32.len() / frame_bytes;
+    if !(CORESET_FP32_MIN_FRAMES_PER_STEM..=CORESET_FP32_MAX_FRAMES_PER_STEM)
+        .contains(&payload_frames)
+        || !payload_frames.is_multiple_of(16)
+    {
+        return Err(DnamError::SchemaValidationError(format!(
+            "invalid coreset frame count {payload_frames} (must be in {CORESET_FP32_MIN_FRAMES_PER_STEM}..={CORESET_FP32_MAX_FRAMES_PER_STEM} and multiple of 16)"
+        )));
+    }
+    let existing_frames = stmc_view.wet_coreset_fp32.len() / frame_bytes;
+    if existing_frames > 0 && payload_frames != existing_frames {
+        return Err(DnamError::SchemaValidationError(format!(
+            "coreset frame count mismatch on stem '{stem_id}': expected {existing_frames}, got {payload_frames}"
+        )));
+    }
+    let num_frames = payload_frames;
+    let decoded: Vec<f32> = <[F32]>::ref_from_bytes(&padded_capture.wet_coreset_fp32)
+        .map_err(|_| DnamError::SchemaValidationError("invalid STMC fp32 PCM slice".to_string()))?
+        .iter()
+        .map(|v| v.get())
+        .collect();
     let rescaled = rescale_padded_stem(&decoded, pad_cal.pad_gain_linear).map_err(|e| {
         DnamError::SchemaValidationError(format!("mic-pad stem rescale failed: {e}"))
     })?;
@@ -282,11 +335,10 @@ pub fn recapture_clipped_stem(
 mod tests {
     use std::collections::BTreeMap;
 
-    use dnam_engine::provenance::DefaultCryptoProvider;
     use dnam_engine::schema::{ControlKind, ControlSchemaDef, ControlUiHints};
     use serde_json::json;
 
-    use crate::proj::bundle::{DnamProjView, build_dnam_proj_container};
+    use crate::proj::bundle::build_dnam_proj_container;
     use crate::proj::directory::StmcTrajectoryWindow;
     use crate::proj::schema::DnamProjManifest;
     use crate::proj::vault::add_capture_with_options;
@@ -497,5 +549,146 @@ mod tests {
         assert!((cal_st.pad_gain_linear - 0.316_227_76).abs() < 1.0e-3);
         let view_st = DnamProjView::from_bytes(&re_st, &crypto).unwrap();
         assert_eq!(view_st.manifest.stems_registry[0].stem_id, "clip_stem");
+    }
+
+    #[test]
+    fn test_recapture_clipped_stem_25s_stereo_and_flag_mismatch() {
+        use crate::proj::directory::build_proj_inpc_capsule;
+
+        let manifest = DnamProjManifest::default_reference();
+        let crypto = DefaultCryptoProvider::default();
+        let seed = [0x5Cu8; 256];
+        let (probe_unpadded, _) = synthesize_a5_musical_transient_coreset(&seed, 19_200, 1, 48_000);
+        let probe_padded: Vec<f32> = probe_unpadded.iter().map(|&v| v * 0.316_227_76).collect();
+
+        let n_25s = CORESET_FP32_MAX_FRAMES_PER_STEM;
+        let (dry_25s_l, dry_25s_r_opt) =
+            synthesize_a5_musical_transient_coreset(&seed, 12_000, 2, 48_000);
+        let dry_25s_r = dry_25s_r_opt.unwrap();
+        let padded_25s_l: Vec<f32> = dry_25s_l.iter().map(|&v| v * 0.316_227_76).collect();
+        let padded_25s_r: Vec<f32> = dry_25s_r.iter().map(|&v| v * 0.316_227_76).collect();
+
+        let mut sched_25s = [0_u8; 320];
+        sched_25s[8..12].copy_from_slice(&(12_000_u32).to_le_bytes());
+        let inpc_25s = build_proj_inpc_capsule(
+            2,
+            &seed,
+            &sched_25s,
+            &encode_coreset_fp32_with_frames(n_25s, &dry_25s_l, Some(&dry_25s_r)),
+        )
+        .unwrap();
+        let empty_25s = build_dnam_proj_container(&manifest, &[]).unwrap();
+        let star_spec = spec_for_recapture_25s("star_0", true, n_25s, &dry_25s_l, Some(&dry_25s_r));
+        let proj_star = add_capture_with_options(
+            &empty_25s,
+            star_spec,
+            Some(&inpc_25s),
+            SolverOptions::preserve_backbone(),
+        )
+        .unwrap();
+        let mut clip_init =
+            spec_for_recapture_25s("clip_stem", false, n_25s, &dry_25s_l, Some(&dry_25s_r));
+        clip_init.windows[0].u_phys = 0.8;
+        clip_init.controls_meta = build_controls_meta_map(&manifest, &[0.8], &BTreeMap::new());
+        let proj_25s = add_capture_with_options(
+            &proj_star,
+            clip_init,
+            None,
+            SolverOptions::preserve_backbone(),
+        )
+        .unwrap();
+
+        let bad_flag_spec = spec_for_recapture_25s(
+            "clip_stem",
+            false,
+            CORESET_FP32_MIN_FRAMES_PER_STEM,
+            &probe_unpadded,
+            None,
+        );
+        assert!(
+            recapture_clipped_stem(
+                &proj_25s,
+                "clip_stem",
+                &probe_unpadded,
+                &probe_padded,
+                bad_flag_spec,
+            )
+            .is_err()
+        );
+
+        let mut cap_25s_padded = spec_for_recapture_25s(
+            "clip_stem",
+            false,
+            n_25s,
+            &padded_25s_l,
+            Some(&padded_25s_r),
+        );
+        cap_25s_padded.windows[0].u_phys = 0.8;
+        cap_25s_padded.controls_meta = build_controls_meta_map(&manifest, &[0.8], &BTreeMap::new());
+        let (re_25s, cal_25s) = recapture_clipped_stem(
+            &proj_25s,
+            "clip_stem",
+            &probe_unpadded,
+            &probe_padded,
+            cap_25s_padded,
+        )
+        .unwrap();
+        assert!((cal_25s.pad_gain_linear - 0.316_227_76).abs() < 1.0e-3);
+        let view_25s = DnamProjView::from_bytes(&re_25s, &crypto).unwrap();
+        let clip_entry = view_25s
+            .manifest
+            .stems_registry
+            .iter()
+            .find(|s| s.stem_id == "clip_stem")
+            .unwrap();
+        let stmc_25s = verify_proj_stmc_capsule(
+            view_25s
+                .chunk_slice(ProjChunkKind::Stmc, clip_entry.chunk_id)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stmc_25s.wet_coreset_fp32.len() / 8, n_25s);
+        assert_ne!(stmc_25s.flags & STMC_FLAG_STEREO, 0);
+    }
+
+    fn spec_for_recapture_25s(
+        stem_id: &str,
+        is_star_center: bool,
+        num_frames: usize,
+        l: &[f32],
+        r: Option<&[f32]>,
+    ) -> VaultCaptureSpec {
+        let manifest = DnamProjManifest::default_reference();
+        let meta = build_controls_meta_map(&manifest, &[0.5], &BTreeMap::new());
+        let (psd, spec4k) = compute_stmc_psd_88_and_spectral_4096(l, r);
+        VaultCaptureSpec {
+            stem_id: stem_id.to_string(),
+            is_star_center,
+            enabled: true,
+            is_stereo: r.is_some(),
+            pad_gain_f32: 1.0,
+            fractional_lag_samples_f32: 0.0,
+            controls_meta: meta,
+            provenance: crate::proj::schema::StemProvenance {
+                input_pcm_sha256: compute_pcm_sha256(l),
+                target_pcm_sha256: compute_pcm_sha256(l),
+                num_frames: num_frames as u64,
+            },
+            user_metadata: BTreeMap::new(),
+            extracted_physics: None,
+            windows: vec![StmcTrajectoryWindow {
+                control_id: 0,
+                ctrl_kind: 0,
+                active_opt: 0,
+                u_phys: 0.5,
+                window_weight: 1.0,
+                emr_velocity: 0.0,
+            }],
+            band_psd_summary_88: psd,
+            n_comb_bins: 2,
+            spectral_summary_4096: spec4k,
+            wet_coreset_fp32: encode_coreset_fp32_with_frames(num_frames, l, r),
+            optional_spcm: None,
+        }
     }
 }
