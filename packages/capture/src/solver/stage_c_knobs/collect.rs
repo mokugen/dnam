@@ -7,14 +7,17 @@ use std::collections::BTreeMap;
 use dnam_train::control::{ControlKindSpec, ControlSpec, Cp1ControlSample};
 use dnam_vm::control::STAGE_TARGET_SLOTS;
 
-use super::sweep_windows::{SweepStemInputs, extract_sweep_windows_for_stem};
+use super::sweep_windows::{
+    ModeASweepSchedule, SweepStemInputs, build_mode_a_sweep_schedule,
+    extract_sweep_windows_for_stem,
+};
 use super::{
     A5_ACTIVE_BURST_END, A5_STATIONARY_FIT_LEN, A5_STATIONARY_OFFSET, decode_coreset_lr,
     parse_stem_control_values,
 };
-use crate::proj::STMC_FLAG_STEREO;
 use crate::proj::capsules::{StmcTrajectoryWindow, verify_proj_stmc_capsule};
 use crate::proj::schema::DnamProjManifest;
+use crate::proj::{STMC_FLAG_MODE_A_SWEEP, STMC_FLAG_STEREO};
 
 /// Pending Stage C control point sliced from an enabled capture stem (`Mode A` sweep or static).
 pub(super) struct PendingPoint {
@@ -24,11 +27,19 @@ pub(super) struct PendingPoint {
     pub(super) phys_controls: Vec<f32>,
 }
 
+/// Full active trajectory metadata for an enabled `MODE_A_SWEEP` stem (`ref[train.pipeline.control-projection-fit]`).
+pub(super) struct ModeASweepStem {
+    pub(super) n_active: usize,
+    pub(super) wet_lr: Vec<[f32; 2]>,
+    pub(super) schedule: ModeASweepSchedule,
+}
+
 /// Aggregated observations extracted across all enabled stems in `manifest`.
 pub(super) struct CollectedStageCPoints {
     pub(super) observed_points: Vec<Vec<f32>>,
     pub(super) pending: Vec<PendingPoint>,
     pub(super) parsed_windows: Vec<Vec<StmcTrajectoryWindow>>,
+    pub(super) mode_a_sweeps: Vec<ModeASweepStem>,
 }
 
 /// Collects trajectory windows and pending fit points across all enabled stems (`star_center`
@@ -55,6 +66,7 @@ pub(super) fn collect_stage_c_points(
     let mut observed_points = Vec::new();
     let mut pending = Vec::new();
     let mut parsed_windows: Vec<Vec<StmcTrajectoryWindow>> = Vec::new();
+    let mut mode_a_sweeps = Vec::new();
 
     for stem in manifest.stems_registry.iter().filter(|s| s.enabled) {
         let Some(stmc_raw) = stmc_by_id.get(&stem.chunk_id) else {
@@ -71,6 +83,21 @@ pub(super) fn collect_stage_c_points(
         let wet_lr = decode_coreset_lr(stmc_view.wet_coreset_fp32, ch);
         let base_meta_ctrls = parse_stem_control_values(manifest, &stem.controls_meta, base_ctrls);
         parsed_windows.push(stmc_view.windows.clone());
+
+        if (stmc_view.flags & STMC_FLAG_MODE_A_SWEEP) != 0
+            && !dry_lr.is_empty()
+            && !wet_lr.is_empty()
+        {
+            let schedule = build_mode_a_sweep_schedule(&stmc_view.windows, &base_meta_ctrls);
+            if schedule.m_max >= 2 {
+                let sweep_n = n_active.min(wet_lr.len()).min(dry_lr.len());
+                mode_a_sweeps.push(ModeASweepStem {
+                    n_active: sweep_n,
+                    wet_lr: wet_lr[..sweep_n].to_vec(),
+                    schedule,
+                });
+            }
+        }
 
         let mut pairs = Vec::new();
         let mut extracted = Vec::new();
@@ -133,6 +160,7 @@ pub(super) fn collect_stage_c_points(
         observed_points,
         pending,
         parsed_windows,
+        mode_a_sweeps,
     }
 }
 

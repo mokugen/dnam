@@ -25,10 +25,10 @@ pub use crate::audit::{
     recompute_vault_phase1_audit_and_clamps, recompute_vault_phase1_audit_and_clamps_with_windows,
 };
 use crate::solver::{
-    SolverOptions, StageBBackboneSpec, StageBSolveConfig, StageDAuditOptions,
+    SolverOptions, StageBBackboneSpec, StageBSolveConfig, StageDAuditOptions, StageDFinalizeInputs,
     TrainerProgressHandle, TrainerProgressSnapshot, TrainingPhase, TrainingStatus,
-    decode_coreset_lr, finalize_stage_d_and_audit, run_stage_a_physics_probe_with_result,
-    solve_stage_b_backbone_with_pass1, solve_stage_c_knobs,
+    decode_coreset_lr, finalize_stage_d_and_audit_with_panama_rows,
+    run_stage_a_physics_probe_with_result, solve_stage_b_backbone_with_pass1, solve_stage_c_knobs,
 };
 
 use super::bundle::{VaultChunkInput, build_dnam_proj_container_from_vault_dbin};
@@ -329,6 +329,10 @@ pub(super) fn rebuild_vault_container_with_progress(
     let mut accum_solve_ms = 0.0_f32;
     let _ = touched_controls;
 
+    if need_path2 && options.clear_dynamic_w_ctrl {
+        crate::solver::stage_c_knobs::clear_dnam_bin_control_bus_state(&mut dnam_bin)?;
+    }
+
     if need_path2 {
         if let Some(ref star_entry) = active_star
             && let Some(star_stmc_bytes) = state.stmc_by_id.get(&star_entry.chunk_id)
@@ -439,14 +443,17 @@ pub(super) fn rebuild_vault_container_with_progress(
     let eval_end = star_wet_opt
         .as_deref()
         .map_or(active_end, |w| active_end.min(w.len()));
-    let _stage_d = finalize_stage_d_and_audit(
+    let _stage_d = finalize_stage_d_and_audit_with_panama_rows(
         &mut state.manifest,
         &mut dnam_bin,
-        &dry_lr[..eval_end],
-        star_wet_opt.as_deref().map(|w| &w[..eval_end]),
-        fallback_esr,
-        accum_solve_ms,
-        audit_opts,
+        StageDFinalizeInputs {
+            dry_lr: &dry_lr[..eval_end],
+            star_wet_lr: star_wet_opt.as_deref().map(|w| &w[..eval_end]),
+            fallback_esr,
+            prior_solve_ms: accum_solve_ms,
+            audit_opts,
+            panama_sample_rows: &stage_c.panama_sample_rows,
+        },
     )?;
 
     let mut chunks = Vec::new();

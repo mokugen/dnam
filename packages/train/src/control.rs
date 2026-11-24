@@ -1,20 +1,40 @@
-//! Control-space safety auditing (`Phase 1..3`), Lobatto `CP1` ANOVA + Rank-4/8 FM regression,
+//! Control-space safety auditing (`Phase 1..3`), 31-slot batched `ControlBus` adjoints,
+//! deterministic `PANAMA` corner recommender, Lobatto `CP1` ANOVA + Rank-4/8 FM regression,
 //! inline / `"CP1\0"` serialization, and Two-Pass 4-Band Wiener recovery.
 
+pub mod adjoint;
 pub mod clamp;
 pub mod cp1;
+pub mod panama;
 pub mod stability;
 pub mod wiener;
 
+pub use adjoint::{
+    HoistedStageTargets, StageTargetAndLatentGrads, StageTargetEvalContext, StageTargetEvalResult,
+    StageTargetSolveConfig, StageTargetSolveInput, StageTargetSolveReport,
+    eval_control_trajectory_3khz_vm, eval_stage_targets_loss_and_grad,
+    hoist_stage_targets_onto_model, solve_point_stage_targets_adjoint,
+};
 pub use clamp::{
-    ControlKindSpec, ControlSpec, MAX_GAIN_6DB_LIN, MAX_GAIN_IDEMPOTENT, Phase1ClampOutput,
-    Phase3AuditInput, Phase3AuditReport, StageStabilityConstraint, audit_phase1_controls,
-    audit_phase3_dynamic_and_head_gain, evaluate_readout_spectral_magnitudes,
+    ControlKindSpec, ControlSpec, DYNAMIC_ALLPASS_G_MAX, DYNAMIC_DAMP_POLE_MAX, DYNAMIC_G_LOOP_MAX,
+    DYNAMIC_KAUTZ_R_MAX, DynamicCornerAuditReport, DynamicCornerViolation, ExtremeCornerDcReport,
+    MAX_GAIN_6DB_LIN, MAX_GAIN_IDEMPOTENT, Phase1ClampOutput, Phase3AuditInput, Phase3AuditReport,
+    StageStabilityConstraint, ZERO_DC_CORNER_FRAMES, ZERO_DC_CORNER_MAX_ABS, audit_phase1_controls,
+    audit_phase3_dynamic_and_head_gain, check_corner_dynamic_stability,
+    compute_dynamic_excursion_bounds_32, eval_static_control_bus_targets,
+    evaluate_readout_spectral_magnitudes, verify_extreme_corners_zero_dc_256,
 };
 pub use cp1::{
     CP1_DELAY_VARIANCE_GATE_SAMPLES2, Cp1ControlSample, Cp1FitConfig, Cp1WireBundle,
     TSYN_SUBDIV_QUARTER, build_tsyn_entry_wire, build_tsyn_entry_wire_with_cond, fit_and_pack_cp1,
     fit_and_pack_cp1_audited, pack_cp1_slots_into_wire,
+};
+pub use panama::{
+    PANAMA_COND_BOUND_TOL, PANAMA_DELTA_TOL, PANAMA_ENSEMBLE_SIZE, PANAMA_EXCLUSION_DINF,
+    PANAMA_FULL_GRID_MAX_PVAR, PANAMA_GAMMA_LEV, PANAMA_LAMBDA_CP1, PANAMA_LAMBDA_MULTS,
+    PANAMA_MAX_RECOMMENDATIONS, PANAMA_MIN_SIGMA2, PANAMA_TOP_TRIPLES_COUNT, PanamaControlDesc,
+    PanamaControlKind, PanamaCornerScore, PanamaInput, PanamaOutput, PanamaSampleRow,
+    compute_stems_key_sha256, recommend_panama_corners,
 };
 pub use stability::{
     CORNER_BARRIER_FLOOR, MAX_RO_POLE_48K_F32, MAX_RO_POLE_48K_F64, MIN_DELAY_CROSSBAR_SAMP,
@@ -22,13 +42,13 @@ pub use stability::{
     SonaCoreStabilityParams, StageTargetBounds, check_preact_occupancy,
     enforce_arena_block0_k_nl_and_clamp, enforce_arena0_stability_invariants,
     eval_corner_barrier_loss_and_grad, eval_stop_grad_corner_and_phys_barrier,
-    run_phase2_rail_burst,
+    run_phase2_rail_burst, run_phase2_rail_burst_reuse,
 };
 pub use wiener::{
     ACTIVE_BAND_MIN_ENERGY_FRAC, BAND_PHASE_DECORR_RHO_MAX, FOUR_BAND_HI_HZ, FOUR_BAND_LO_HZ,
     FOUR_BAND_RMS_MATCH_WEIGHT, FourBandTptBank, FourBandWienerResult, SweepWindowSegment,
-    extract_sweep_window_midpoints, render_vm_mono_probe, solve_control_jacobian_32slot,
-    solve_two_pass_four_band_wiener,
+    extract_sweep_window_midpoints, render_vm_mono_probe, render_vm_mono_probe_reuse,
+    solve_control_jacobian_32slot, solve_two_pass_four_band_wiener,
 };
 
 #[cfg(test)]

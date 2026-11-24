@@ -90,16 +90,19 @@ pub use watermark::reframe_buyer_dau1_container_with_dbin;
 pub use watermark::{
     PHASE_CODING_MAX_RAD, SONA_SIGN_LANES_PER_TIER, SONA_TOTAL_LANES, STAGE3_EARLY_FIR_BASES,
     STAGE3_KAUTZ_BASES, STAGE3_KAUTZ_BLOCKS_PER_TIER, STAGE3_KAUTZ_TIER_CHANNEL_BASE,
-    TARDOS_CASCADE_RANGES, TARDOS_ULTRA_RESERVE_RANGE, TARDOS_W_READOUT_FP16_RANGES,
+    TARDOS_ACTIVE_LATENT_MASK_THRESH, TARDOS_CASCADE_RANGES, TARDOS_DEFAULT_KNOBS_END,
+    TARDOS_DEFAULT_KNOBS_START, TARDOS_GLOBAL_LATENT_MODS_END, TARDOS_GLOBAL_LATENT_MODS_START,
+    TARDOS_LITE_LATENT_MODS_END, TARDOS_LITE_LATENT_MODS_START, TARDOS_ULTRA_LATENT_MODS_END,
+    TARDOS_ULTRA_LATENT_MODS_START, TARDOS_ULTRA_RESERVE_RANGE, TARDOS_W_READOUT_FP16_RANGES,
     TardosCodebook7680, apply_cascade_head_gauge, apply_isometric_gauge_shared_cp1_stream,
     apply_isometric_gauge_watermark, apply_phase_coding_watermark, apply_sona_sign_gauge_watermark,
     apply_tardos_w_readout_fp16, apply_tardos_watermark_7680,
     apply_tardos_watermark_7680_envelopes, compute_emr_masked_tardos_envelopes,
     derive_sona_sign_gauge_40, extract_structural_hash_224d, for_each_tardos_f32_offset_up_to,
     for_each_tardos_fp16_offset_up_to, generate_tardos_code_7680, generate_tardos_codebook_7680,
-    is_role_a_cascade_index, kautz_soa_byte_offset, reframe_buyer_container_with_dbin,
-    role_b_head_slot_for_index, score_phase_coding_arena, score_phase_coding_blackbox,
-    score_tardos_w_readout_fp16, score_tardos_watermark_7680,
+    is_role_a_cascade_index, kautz_soa_byte_offset, mask_tardos_stage_latent_active_coords,
+    reframe_buyer_container_with_dbin, role_b_head_slot_for_index, score_phase_coding_arena,
+    score_phase_coding_blackbox, score_tardos_w_readout_fp16, score_tardos_watermark_7680,
     score_tardos_watermark_7680_with_buyer_gauge, structural_cosine_similarity,
 };
 

@@ -34,11 +34,12 @@ pub use stage_c_knobs::{
     StageCKnobsOutput, decode_coreset_lr, solve_stage_c_knobs, star_center_control_values,
 };
 pub use stage_d_audit::{
-    BuyerWatermarkConfig, StageDAuditOptions, StageDSolveOutput, compute_integrated_lufs,
-    derive_buyer_gauge_params, derive_buyer_phase_seed, derive_buyer_tardos_codebook,
-    export_runtime_dnam_watermarked, extract_arena_pole_angles_16, extract_arena_pole_angles_32,
-    extract_arena_pole_angles_34, finalize_stage_d_and_audit,
-    identify_pole_angles_blackbox_from_audio, render_blackbox_probe_response,
+    BuyerWatermarkConfig, StageDAuditOptions, StageDFinalizeInputs, StageDSolveOutput,
+    compute_integrated_lufs, derive_buyer_gauge_params, derive_buyer_phase_seed,
+    derive_buyer_tardos_codebook, export_runtime_dnam_watermarked, extract_arena_pole_angles_16,
+    extract_arena_pole_angles_32, extract_arena_pole_angles_34, finalize_stage_d_and_audit,
+    finalize_stage_d_and_audit_with_panama_rows, identify_pole_angles_blackbox_from_audio,
+    render_blackbox_probe_response,
 };
 pub use stages::write_inline_cp1_if_fits;
 

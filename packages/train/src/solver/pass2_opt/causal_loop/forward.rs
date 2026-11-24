@@ -69,6 +69,10 @@ pub(crate) fn eval_causal_loop_forward(
         core::array::from_fn(|i| model.opt_to_lr[i].map(|v| sanitize_unit_f64(v, -4.0, 4.0, 0.0)));
     let dry_mix = sanitize_unit_f64(model.tank_dry_mix, -2.0, 2.0, 1.0);
     let dry_mix_open = model.tank_dry_mix.is_finite() && model.tank_dry_mix.abs() < 2.0;
+    let wet_scale = sanitize_unit_f64(model.op_t_wet_scale, 0.0, 2.0, 1.0);
+    let wet_scale_open = model.op_t_wet_scale.is_finite()
+        && model.op_t_wet_scale >= 0.0
+        && model.op_t_wet_scale < 2.0;
 
     let op_n_resolved = OpNPreResolved::new(
         model.op_n_pre_gamma_bc,
@@ -152,6 +156,8 @@ pub(crate) fn eval_causal_loop_forward(
 
     let mut pred_l = vec![0.0_f64; n];
     let mut pred_r = vec![0.0_f64; n];
+    let mut op_t_wet_l = vec![0.0_f64; if record_trace { n } else { 0 }];
+    let mut op_t_wet_r = vec![0.0_f64; if record_trace { n } else { 0 }];
     let mut s0_l = Vec::with_capacity(if record_trace { n } else { 0 });
     let mut s0_r = Vec::with_capacity(if record_trace { n } else { 0 });
     let mut ux_l = Vec::with_capacity(n);
@@ -365,17 +371,20 @@ pub(crate) fn eval_causal_loop_forward(
 
         x_tank_l[t] = tank_l;
         x_tank_r[t] = tank_r;
-        let mut yl = dry_mix * tank_l;
-        let mut yr = dry_mix * tank_r;
+        let (mut wet_l, mut wet_r) = (0.0_f64, 0.0_f64);
         for q_opt in 0..active_opt_quads {
             if let (Some(st), Some(top)) = (opt_fwd[q_opt].as_mut(), tops[q_opt].as_ref()) {
                 let (ql, qr) = st.step_end_of_frame_write(top, tank_l, tank_r);
-                yl += ql;
-                yr += qr;
+                wet_l += ql;
+                wet_r += qr;
             }
         }
-        pred_l[t] = yl;
-        pred_r[t] = yr;
+        if record_trace {
+            op_t_wet_l[t] = wet_l;
+            op_t_wet_r[t] = wet_r;
+        }
+        pred_l[t] = dry_mix * tank_l + wet_scale * wet_l;
+        pred_r[t] = dry_mix * tank_r + wet_scale * wet_r;
     }
 
     CausalLoopBuffers {
@@ -388,9 +397,13 @@ pub(crate) fn eval_causal_loop_forward(
         op_t_gain_open,
         dry_mix,
         dry_mix_open,
+        wet_scale,
+        wet_scale_open,
         rho_core,
         pred_l,
         pred_r,
+        op_t_wet_l,
+        op_t_wet_r,
         s0_l,
         s0_r,
         ux_l,

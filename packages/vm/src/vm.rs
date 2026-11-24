@@ -4,6 +4,7 @@
 
 #[cfg(feature = "alloc")]
 pub mod dynamic;
+mod stage_latch;
 
 use dnam_kernels::QUAD_FLAG_HOST_WRITE_LOCK;
 

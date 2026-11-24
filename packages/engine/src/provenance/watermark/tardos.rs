@@ -6,6 +6,7 @@
 
 pub(crate) mod buyer_reframe;
 pub(crate) mod layout_7680;
+pub(crate) mod masking;
 
 use alloc::vec::Vec;
 use core::mem::offset_of;
@@ -33,6 +34,12 @@ pub use layout_7680::{
     TARDOS_CASCADE_RANGES, TARDOS_ULTRA_RESERVE_RANGE, TARDOS_W_READOUT_FP16_RANGES,
 };
 pub(crate) use layout_7680::{TARDOS_F32_SPANS, TARDOS_FP16_SPANS, TARDOS_TIER_INDEX_BOUNDS};
+pub use masking::{
+    TARDOS_ACTIVE_LATENT_MASK_THRESH, TARDOS_DEFAULT_KNOBS_END, TARDOS_DEFAULT_KNOBS_START,
+    TARDOS_GLOBAL_LATENT_MODS_END, TARDOS_GLOBAL_LATENT_MODS_START, TARDOS_LITE_LATENT_MODS_END,
+    TARDOS_LITE_LATENT_MODS_START, TARDOS_ULTRA_LATENT_MODS_END, TARDOS_ULTRA_LATENT_MODS_START,
+    mask_tardos_stage_latent_active_coords,
+};
 
 const FP16_MAX_FINITE: f32 = 65_504.0;
 

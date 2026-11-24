@@ -2,7 +2,8 @@
 //! (`ref[train.pipeline.host-parity-and-export]`, `ref[qual.tiers.benchmark-matrix]`).
 
 use dnam_kernels::{f32_to_fp16, fp16_to_f32};
-use dnam_vm::bin::DnamBinView;
+use dnam_vm::Tier;
+use dnam_vm::bin::{DnamBinView, strip_dnam_bin_to_tier};
 
 use crate::error::TrainError;
 use crate::losses::TierCertificationReport;
@@ -12,10 +13,13 @@ use super::super::super::model::{
 };
 use super::super::Pass5EmitConfig;
 use super::super::certify::{
-    MAX_INTER_TIER_LU_DRIFT, StereoCertBundle, TierRenderBundle, calibrate_lufs_trims_from_renders,
-    certify_all_tier_renders_stereo, render_all_tiers,
+    MAX_INTER_TIER_LU_DRIFT, StereoCertBundle, StereoRender, TierRenderBundle,
+    calibrate_lufs_trims_from_renders, certify_all_tier_renders_stereo, certify_single_tier_stereo,
+    compute_itu_bs1770_lufs, recompute_pair_monotone, render_all_tiers, render_single_tier,
 };
 use super::super::pack::encode_model_to_dnam_bin;
+
+pub(super) const TIERS: [Tier; 4] = [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra];
 
 pub(super) const TIER_LANES: [usize; 4] = [16, 24, 32, 40];
 pub(super) const TIER_FIRS: [usize; 4] = [32, 48, 96, 128];
@@ -462,10 +466,228 @@ fn channel_pair_deficit(lo: &TierCertificationReport, hi: &TierCertificationRepo
     def
 }
 
+pub(super) struct DirtyEvalResult {
+    pub final_bin: Vec<u8>,
+    pub dirty_renders: [Option<StereoRender>; 4],
+    pub cert: StereoCertBundle,
+}
+
+pub(super) fn re_eval_dirty(
+    model: &mut SonaModelF64,
+    eval: &MonotoneEvalCtx<'_>,
+    prev: &MonotoneState,
+    dirty_mask: u8,
+) -> Result<DirtyEvalResult, TrainError> {
+    let eff_mask = if (dirty_mask & (1 << 3)) != 0 && eval.config.calibrate_lufs_trims {
+        0b1111_u8
+    } else {
+        dirty_mask & 0b1111_u8
+    };
+    if eff_mask == 0 {
+        return Ok(DirtyEvalResult {
+            final_bin: prev.final_bin.clone(),
+            dirty_renders: Default::default(),
+            cert: prev.cert.clone(),
+        });
+    }
+
+    let MonotoneEvalCtx {
+        in_l,
+        in_r,
+        target_l,
+        target_r,
+        warmup,
+        config,
+    } = *eval;
+    let sr_f64 = model.sample_rate_hz;
+    let sr_f32 = sr_f64 as f32;
+    let n = in_l.len().min(in_r.len());
+    let in_l32: Vec<f32> = in_l[..n].iter().map(|&v| v as f32).collect();
+    let in_r32: Vec<f32> = in_r[..n].iter().map(|&v| v as f32).collect();
+
+    if config.calibrate_lufs_trims {
+        for (k, trim) in model.tier_gain_trim.iter_mut().enumerate() {
+            if (eff_mask & (1_u8 << k)) != 0 {
+                *trim = 1.0;
+            }
+        }
+        let mid_bin = encode_model_to_dnam_bin(model, config)?;
+        let lufs_ultra = if (eff_mask & (1_u8 << 3)) != 0 {
+            let (_, render_u) =
+                render_single_tier(&mid_bin, Tier::Ultra, &in_l32, &in_r32, sr_f32)?;
+            compute_itu_bs1770_lufs(&render_u.0, &render_u.1, sr_f64, warmup)
+        } else {
+            prev.cert.tier_lufs[3]
+        };
+        if lufs_ultra > -100.0 {
+            for k in 0..3 {
+                if (eff_mask & (1_u8 << k)) == 0 {
+                    continue;
+                }
+                let (_, render_k) =
+                    render_single_tier(&mid_bin, TIERS[k], &in_l32, &in_r32, sr_f32)?;
+                let lufs_k = compute_itu_bs1770_lufs(&render_k.0, &render_k.1, sr_f64, warmup);
+                if lufs_k > -100.0 {
+                    let delta_lu = (lufs_ultra - lufs_k).clamp(-12.0, 12.0);
+                    model.tier_gain_trim[k] = 10.0_f64.powf(delta_lu / 20.0).clamp(0.0625, 16.0);
+                }
+            }
+        }
+    }
+
+    let final_bin = encode_model_to_dnam_bin(model, config)?;
+    let _ = DnamBinView::parse(&final_bin)?;
+
+    let mut cert = prev.cert.clone();
+    let mut dirty_renders: [Option<(Vec<f64>, Vec<f64>)>; 4] = Default::default();
+    for k in 0..4 {
+        if (eff_mask & (1_u8 << k)) == 0 {
+            continue;
+        }
+        let (_, render) = render_single_tier(&final_bin, TIERS[k], &in_l32, &in_r32, sr_f32)?;
+        let (lufs, worst, rep_l, rep_r) =
+            certify_single_tier_stereo(TIERS[k], &render, target_l, target_r, sr_f64, warmup)?;
+        cert.tier_lufs[k] = lufs;
+        cert.tier_reports[k] = worst;
+        cert.rep_l[k] = rep_l;
+        cert.rep_r[k] = rep_r;
+        dirty_renders[k] = Some(render);
+    }
+    cert.pair_monotone = recompute_pair_monotone(&cert.rep_l, &cert.rep_r);
+
+    Ok(DirtyEvalResult {
+        final_bin,
+        dirty_renders,
+        cert,
+    })
+}
+
+pub(super) fn commit_dirty_eval(
+    state: &mut MonotoneState,
+    mut res: DirtyEvalResult,
+) -> Result<(), TrainError> {
+    for (k, slot) in state.final_bundle.stripped.iter_mut().enumerate() {
+        *slot = strip_dnam_bin_to_tier(&res.final_bin, TIERS[k])?.to_vec();
+    }
+    for (k, dst) in state.final_bundle.renders.iter_mut().enumerate() {
+        if let Some(render) = res.dirty_renders[k].take() {
+            *dst = render;
+        }
+    }
+    state.final_bin = res.final_bin;
+    state.cert = res.cert;
+    Ok(())
+}
+
 pub(super) fn pair_deficit_score(cert: &StereoCertBundle, t: usize) -> f64 {
     if t == 0 || t > 3 {
         return 0.0;
     }
     channel_pair_deficit(&cert.rep_l[t - 1], &cert.rep_l[t])
         + channel_pair_deficit(&cert.rep_r[t - 1], &cert.rep_r[t])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_re_eval_dirty_matches_full_re_eval_zero_ulp() {
+        let n = 512_usize;
+        let sr = 48_000.0_f64;
+        let in_l: Vec<f64> = (0..n)
+            .map(|i| 0.30 * ((i as f64) * 0.09).sin() + 0.14 * ((i as f64) * 0.27).cos())
+            .collect();
+        let in_r: Vec<f64> = (0..n)
+            .map(|i| 0.26 * ((i as f64) * 0.11).cos() - 0.12 * ((i as f64) * 0.23).sin())
+            .collect();
+        let tgt_l: Vec<f64> = in_l.iter().map(|&x| 0.55 * x + 0.1 * x * x * x).collect();
+        let tgt_r: Vec<f64> = in_r.iter().map(|&x| 0.48 * x).collect();
+
+        let mut base = SonaModelF64::new(sr);
+        base.oversample_upper_tiers_2x = false;
+        base.active_fir_taps = 64;
+        base.active_kautz_pairs = 16;
+        base.pre_conv_u_gain = [0.6, 0.55];
+        base.direct_s2_u_gain = [0.45, 0.40];
+        base.fir_l[10] = 0.08;
+        base.fir_r[20] = -0.07;
+        for q in 0..8 {
+            base.core_quads[q].in_mid_weight = [0.25; 4];
+            base.w_ro[q * 4][6] = 0.05;
+        }
+        for k in 0..16 {
+            base.kautz[k].r_low = 0.85;
+            base.kautz[k].theta = 0.08 + 0.11 * (k as f64);
+            base.kautz[k].b_gamma = 0.45;
+            base.kautz[k].c_re_l = 0.03;
+            base.kautz[k].c_re_r = -0.025;
+        }
+        materialize_tier_overrides(&mut base);
+        let cfg = Pass5EmitConfig::default();
+        let eval = MonotoneEvalCtx {
+            in_l: &in_l,
+            in_r: &in_r,
+            target_l: &tgt_l,
+            target_r: &tgt_r,
+            warmup: 64,
+            config: cfg,
+        };
+        let (init_bin, init_bdl, init_cert) =
+            re_eval(&mut base, &in_l, &in_r, &tgt_l, &tgt_r, 64, cfg).unwrap();
+        let mut state = MonotoneState {
+            final_bin: init_bin,
+            final_bundle: init_bdl,
+            cert: init_cert,
+        };
+
+        for dirty_mask in [0b0001_u8, 0b0010_u8, 0b0011_u8] {
+            let mut m_dirty = base.clone();
+            if (dirty_mask & 0b0001) != 0
+                && let Some(ref mut ov0) = m_dirty.tier_overrides[0]
+            {
+                ov0.fir_l[10] += 0.12;
+                ov0.direct_s2_u_gain[0] -= 0.15;
+                ov0.kautz_c_re_l[0] += 0.05;
+                ov0.w_ro[0][6] *= 0.5;
+            }
+            if (dirty_mask & 0b0010) != 0
+                && let Some(ref mut ov1) = m_dirty.tier_overrides[1]
+            {
+                ov1.fir_r[20] -= 0.09;
+                ov1.kautz_c_im_r[2] += 0.04;
+                ov1.w_ro[4][6] *= 0.4;
+            }
+            let mut m_full = m_dirty.clone();
+            let (full_bin, full_bdl, full_cert) =
+                re_eval(&mut m_full, &in_l, &in_r, &tgt_l, &tgt_r, 64, cfg).unwrap();
+            let res = re_eval_dirty(&mut m_dirty, &eval, &state, dirty_mask).unwrap();
+            let mut dirty_state = MonotoneState {
+                final_bin: state.final_bin.clone(),
+                final_bundle: TierRenderBundle {
+                    stripped: state.final_bundle.stripped.clone(),
+                    renders: state.final_bundle.renders.clone(),
+                },
+                cert: state.cert.clone(),
+            };
+            commit_dirty_eval(&mut dirty_state, res).unwrap();
+
+            assert_eq!(dirty_state.final_bin, full_bin);
+            assert_eq!(dirty_state.cert.pair_monotone, full_cert.pair_monotone);
+            for k in 0..4 {
+                assert_eq!(
+                    dirty_state.cert.tier_lufs[k].to_bits(),
+                    full_cert.tier_lufs[k].to_bits()
+                );
+                assert_eq!(
+                    dirty_state.cert.tier_reports[k].besr_db.to_bits(),
+                    full_cert.tier_reports[k].besr_db.to_bits()
+                );
+                assert_eq!(dirty_state.final_bundle.stripped[k], full_bdl.stripped[k]);
+                assert_eq!(dirty_state.final_bundle.renders[k], full_bdl.renders[k]);
+            }
+            base = m_dirty;
+            state = dirty_state;
+        }
+    }
 }

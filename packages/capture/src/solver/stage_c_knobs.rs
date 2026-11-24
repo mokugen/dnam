@@ -7,32 +7,38 @@
 //! - `docs/specs/dsp/parametric_control_bus.md` (`ref[dsp.ctrl.accum.cp1-scaling]`, `ref[dsp.ctrl.accum.anova-fm]`)
 
 mod collect;
+mod panama_rows;
 mod point_gn;
 mod sweep_windows;
+mod wire_patch;
+
+pub(crate) use wire_patch::clear_dnam_bin_control_bus_state;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use dnam_engine::schema::{ControlKind, DnamError};
 use dnam_train::control::{
-    ControlKindSpec, ControlSpec, Cp1FitConfig, Cp1WireBundle, FourBandTptBank,
-    StageStabilityConstraint, audit_phase1_controls, enforce_arena0_stability_invariants,
-    fit_and_pack_cp1_audited,
+    ControlKindSpec, ControlSpec, Cp1FitConfig, FourBandTptBank, PanamaSampleRow,
+    StageStabilityConstraint, StageTargetBounds, audit_phase1_controls, fit_and_pack_cp1_audited,
 };
-use dnam_vm::Tier;
-use dnam_vm::bin::{DnamBinBuildInput, DnamBinView, encode_dnam_bin, strip_dnam_bin_to_tier};
-use dnam_vm::control::cp1::decode_cp1_contributors;
-use dnam_vm::control::{Cp1ContributorSlot, MAX_EXACT_CONTRIBUTORS};
+use dnam_train::{TrainRunner, decode_dnam_bin_to_model};
+use dnam_vm::bin::{DnamBinView, strip_dnam_bin_to_tier};
+use dnam_vm::control::Cp1ContributorSlot;
+use dnam_vm::math::DefaultMathBackend;
+use dnam_vm::{SonaVm, Tier};
+use zerocopy::FromBytes;
 use zerocopy::byteorder::little_endian::F32;
-use zerocopy::{FromBytes, FromZeros};
 
 use self::collect::{collect_stage_c_points, ensure_star_center_anchor};
-use self::point_gn::{PointSolveInputs, solve_point_cp1_sample};
+use self::panama_rows::{
+    build_panama_sample_rows_from_fitted_bus, eval_mode_a_sweep_3khz_trajectory_mse,
+};
+use self::point_gn::{PointSolveInputs, PointSolveVms, solve_point_cp1_sample};
+use self::wire_patch::{extract_view_delay_and_g_loop, patch_dnam_bin_control_bus};
 use crate::proj::capsules::StmcTrajectoryWindow;
 use crate::proj::schema::DnamProjManifest;
-use crate::proj::verify_dnam_bin_zero_dc;
 use crate::stimulus::sealing::CORESET_A5_FRAMES_48K;
 
-const PASS4_ACTIVE_SLOTS: [usize; 14] = [0, 1, 2, 3, 4, 5, 6, 10, 11, 13, 15, 22, 26, 30];
 pub(super) const A5_STATIONARY_FIT_LEN: usize = 4_096;
 pub(super) const A5_ACTIVE_BURST_END: usize =
     (3 * CORESET_A5_FRAMES_48K) / 4 + ((CORESET_A5_FRAMES_48K / 4) * 55) / 100;
@@ -47,6 +53,9 @@ pub struct StageCKnobsOutput {
     pub elapsed_ms: f32,
     /// Ordered `CP1` contributor records written inline or in the `"CP1\0"` overflow stream.
     pub cp1_slots: Vec<Cp1ContributorSlot>,
+    /// Fitted Pass-4 static `ControlBus` sample rows across stationary and `MODE_A_SWEEP` stems,
+    /// sorted ascending by `(stem_id, window_idx)` for Stage D `PANAMA` corner recommendation.
+    pub panama_sample_rows: Vec<PanamaSampleRow>,
 }
 
 #[inline]
@@ -306,119 +315,9 @@ fn build_control_specs_from_observations(
         .collect()
 }
 
-fn patch_dnam_bin_control_bus(
-    dnam_bin: &mut Vec<u8>,
-    phase1: Option<&dnam_train::control::Phase1ClampOutput>,
-    bundle_opt: Option<&Cp1WireBundle>,
-    clear_dynamic_w_ctrl: bool,
-) -> Result<Vec<Cp1ContributorSlot>, DnamError> {
-    let view = DnamBinView::parse(dnam_bin).map_err(map_stage_err)?;
-    let mut a0 = *view.arena0;
-    let a1 = view.arena1.copied();
-    let a2 = view.arena2.copied();
-    let mut a3 = view.arena3.copied();
-    let mut ro_pole = view.runtime_meta.ro_pole_48k.get();
-
-    if clear_dynamic_w_ctrl {
-        a0.control_bus_lite.u_int_base = [[F32::new(0.0); 8]; 4];
-        a0.control_bus_lite.w_ctrl = [[F32::new(0.0); 16]; 16];
-        a0.control_bus_lite.cp1_dir = ZeroedHelper::zeroed_cp1_dir();
-        a0.control_bus_lite.cp1_base.fill(0);
-        if let Some(ref mut a3w) = a3 {
-            a3w.control_bus_ultra_delta.w_ctrl_ultra = [[F32::new(0.0); 4]; 16];
-            a3w.control_bus_ultra_delta.u_int_ultra = [[[F32::new(0.0); 8]; 4]; 3];
-            a3w.control_bus_ultra_delta.cp1_ultra.fill(0);
-        }
-    }
-
-    if let Some(bundle) = bundle_opt {
-        a0.control_bus_lite.trust_radius_mh = bundle.arena0_cb.trust_radius_mh;
-        a0.control_bus_lite.cp1_dir = bundle.arena0_cb.cp1_dir;
-        a0.control_bus_lite.u_int_base = bundle.arena0_cb.u_int_base;
-        a0.control_bus_lite.cp1_base = bundle.arena0_cb.cp1_base;
-        for r in 0..16 {
-            for c in 0..8 {
-                a0.control_bus_lite.w_ctrl[r][c] = bundle.arena0_cb.w_ctrl[r][c];
-            }
-        }
-        if let Some(ref mut a3w) = a3 {
-            a3w.control_bus_ultra_delta.w_ctrl_ultra = bundle.arena3_cb.w_ctrl_ultra;
-            let has_non_zero_ultra_uint = bundle
-                .arena3_cb
-                .u_int_ultra
-                .iter()
-                .flatten()
-                .flatten()
-                .any(|v| v.get() != 0.0);
-            if clear_dynamic_w_ctrl || has_non_zero_ultra_uint {
-                a3w.control_bus_ultra_delta.u_int_ultra = bundle.arena3_cb.u_int_ultra;
-            }
-            a3w.control_bus_ultra_delta.cp1_ultra = bundle.arena3_cb.cp1_ultra;
-        }
-    }
-
-    enforce_arena0_stability_invariants(&mut a0, &mut ro_pole);
-
-    let wire_descs: &[dnam_vm::bin::ControlClampDescriptorWire] =
-        phase1.map_or(view.control_descriptors, |p| p.wire_descriptors.as_slice());
-    let cp1_overflow = bundle_opt.map_or(&[][..], |b| b.cp1_overflow.as_slice());
-    let tsyn = bundle_opt.map_or(view.tsyn_entries, |b| b.tsyn.as_slice());
-    let cext = if clear_dynamic_w_ctrl && bundle_opt.is_none() {
-        None
-    } else {
-        bundle_opt.and_then(|b| b.cext.as_ref()).or(view.cext)
-    };
-
-    let reencoded = encode_dnam_bin(&DnamBinBuildInput {
-        reference_sample_rate_hz: view.header.reference_sample_rate_hz.get(),
-        header_flags: view.header.flags.get(),
-        ext_ring_pow2_frames: view.runtime_meta.ext_ring_pow2_frames,
-        ext_ring_lines: view.runtime_meta.ext_ring_lines,
-        ext_ring_format: view.runtime_meta.ext_ring_format,
-        declared_max_delay_48k: view.runtime_meta.declared_max_delay_48k.get(),
-        dc_blocker_pole_5hz: view.runtime_meta.dc_blocker_pole_5hz.get(),
-        tail_time_ms: view.runtime_meta.tail_time_ms.get(),
-        ro_pole_48k: ro_pole,
-        switch_xfade_samples: view.runtime_meta.switch_xfade_samples.get(),
-        content_hash_prefix: view.runtime_meta.content_hash_prefix,
-        controls: wire_descs,
-        cp1_overflow,
-        tsyn,
-        cext,
-        arena0: &a0,
-        arena1: a1.as_ref(),
-        arena2: a2.as_ref(),
-        arena3: a3.as_ref(),
-    })
-    .map_err(map_stage_err)?;
-    *dnam_bin = reencoded;
-    verify_dnam_bin_zero_dc(dnam_bin)?;
-
-    let post = DnamBinView::parse(dnam_bin).map_err(map_stage_err)?;
-    let n_ctrl = usize::from(post.header.num_controls.get());
-    let mut decoded = vec![Cp1ContributorSlot::zero(); MAX_EXACT_CONTRIBUTORS];
-    let count = decode_cp1_contributors(
-        &post.arena0.control_bus_lite,
-        post.arena3.map(|w| &w.control_bus_ultra_delta),
-        post.cp1_overflow,
-        n_ctrl,
-        &mut decoded,
-    )
-    .map_err(map_stage_err)?;
-    decoded.truncate(count);
-    Ok(decoded)
-}
-
-struct ZeroedHelper;
-impl ZeroedHelper {
-    #[inline]
-    fn zeroed_cp1_dir() -> dnam_vm::bin::Cp1InlineDirWire {
-        dnam_vm::bin::Cp1InlineDirWire::new_zeroed()
-    }
-}
-
-/// Runs Stage C (`Parallel Multi-Knob & Switch Conditioning`), solving `CP1`, `"CEXT"`, `U_int`,
-/// and `W_ctrl` while guaranteeing bit-exact `0-ULP` invariance at `StarCenter` (`REQ-4.2`).
+/// Runs Stage C (`Parallel Multi-Knob & Switch Conditioning`), solving all `31` active dispatch
+/// slots, `CP1`, `"CEXT"`, `U_int`, `W_ctrl`, and Pass-4 `PANAMA` sample rows while guaranteeing
+/// bit-exact `0-ULP` invariance at `StarCenter` (`REQ-4.2`).
 pub fn solve_stage_c_knobs(
     manifest: &DnamProjManifest,
     dnam_bin: &mut Vec<u8>,
@@ -432,6 +331,8 @@ pub fn solve_stage_c_knobs(
         actual: dnam_bin.len(),
     })?;
     let max_tier = view.retained_tier;
+    let tsyn_existing = view.tsyn_entries.to_vec();
+    let (min_base_delay, max_g_loop) = extract_view_delay_and_g_loop(&view, max_tier);
     let timer = now_ms_token();
 
     if manifest.base.controls_schema.is_empty() {
@@ -439,6 +340,7 @@ pub fn solve_stage_c_knobs(
         return Ok(StageCKnobsOutput {
             elapsed_ms: elapsed_ms_since(timer),
             cp1_slots: slots,
+            panama_sample_rows: Vec::new(),
         });
     }
 
@@ -458,39 +360,94 @@ pub fn solve_stage_c_knobs(
         &collected.observed_points,
         &win_refs,
     );
-    let phase1 = audit_phase1_controls(&specs, &StageStabilityConstraint::default())
-        .map_err(map_stage_err)?;
+    let stab = StageStabilityConstraint {
+        base_tau: min_base_delay,
+        base_g_lin: max_g_loop,
+        crossbar_coupled: true,
+        ..StageStabilityConstraint::default()
+    };
+    let mut phase1 = audit_phase1_controls(&specs, &stab).map_err(map_stage_err)?;
+    if let Ok(schema_descs) = manifest.base.compile_clamp_descriptors() {
+        for (dst, src) in phase1.wire_descriptors.iter_mut().zip(&schema_descs) {
+            if dst.cond_rules.iter().all(|r| r.rule_op == 0) {
+                dst.cond_rules = src.to_wire().cond_rules;
+            }
+        }
+    }
 
     if collected.pending.is_empty() || dry_lr.is_empty() {
         let slots =
             patch_dnam_bin_control_bus(dnam_bin, Some(&phase1), None, clear_dynamic_w_ctrl)?;
+        let panama_sample_rows = build_panama_sample_rows_from_fitted_bus(
+            manifest,
+            dnam_bin,
+            stmc_by_id,
+            active_frames_hint,
+        )?;
         return Ok(StageCKnobsOutput {
             elapsed_ms: elapsed_ms_since(timer),
             cp1_slots: slots,
+            panama_sample_rows,
         });
     }
 
-    let ultra_slice = strip_dnam_bin_to_tier(dnam_bin, max_tier).map_err(map_stage_err)?;
-    let lite_slice = strip_dnam_bin_to_tier(dnam_bin, Tier::Lite).map_err(map_stage_err)?;
-    let bank = FourBandTptBank::new(48_000.0);
     let mono_out = manifest.base.io_config.output_mode == "mono";
+    let dual_in = manifest.base.io_config.inputs >= 2;
+    let single_in = mono_out && !dual_in;
+    let bounds = StageTargetBounds::canonical(true, min_base_delay);
+    let bank = FourBandTptBank::new(48_000.0);
+    // Single-stem <= 2,048-frame Stage C adjoint steps run on CPU to avoid global WgpuRunner arena
+    // lock & Metal readback serialization across concurrent captures and test threads.
+    let runner = TrainRunner::cpu();
 
     let mut samples = Vec::with_capacity(collected.pending.len() + 1);
-    for pt in collected.pending {
-        let dry_slice = &dry_lr[pt.dry_off..pt.dry_off + pt.len];
-        let sample = solve_point_cp1_sample(PointSolveInputs {
-            dnam_bin,
-            ultra_slice,
-            lite_slice,
+    {
+        let ultra_slice = strip_dnam_bin_to_tier(dnam_bin, max_tier).map_err(map_stage_err)?;
+        let lite_slice = strip_dnam_bin_to_tier(dnam_bin, Tier::Lite).map_err(map_stage_err)?;
+        let base_ultra = decode_dnam_bin_to_model(ultra_slice).map_err(map_stage_err)?;
+        let base_lite = decode_dnam_bin_to_model(lite_slice).map_err(map_stage_err)?;
+        let ultra_view = DnamBinView::parse(ultra_slice).map_err(map_stage_err)?;
+        let lite_view = DnamBinView::parse(lite_slice).map_err(map_stage_err)?;
+        let mut vm_ultra = SonaVm::<DefaultMathBackend>::from_view_owned(
+            &ultra_view,
             max_tier,
-            mono_out,
-            dry_win: dry_slice,
-            wet_win: &pt.wet_lr,
-            phys_controls: pt.phys_controls,
-            specs: &specs,
-            bank: &bank,
-        })?;
-        samples.push(sample);
+            48_000.0,
+            single_in,
+        )
+        .map_err(map_stage_err)?;
+        let mut vm_lite = SonaVm::<DefaultMathBackend>::from_view_owned(
+            &lite_view,
+            Tier::Lite,
+            48_000.0,
+            single_in,
+        )
+        .map_err(map_stage_err)?;
+
+        let mut vms = PointSolveVms {
+            vm_ultra: &mut vm_ultra,
+            vm_lite: &mut vm_lite,
+        };
+        for pt in collected.pending {
+            let dry_slice = &dry_lr[pt.dry_off..pt.dry_off + pt.len];
+            let sample = solve_point_cp1_sample(
+                PointSolveInputs {
+                    runner: &runner,
+                    base_ultra: &base_ultra,
+                    base_lite: &base_lite,
+                    bounds: &bounds,
+                    max_tier,
+                    mono_out,
+                    dual_in,
+                    dry_win: dry_slice,
+                    wet_win: &pt.wet_lr,
+                    phys_controls: pt.phys_controls,
+                    specs: &specs,
+                    bank: &bank,
+                },
+                &mut vms,
+            )?;
+            samples.push(sample);
+        }
     }
     ensure_star_center_anchor(manifest, &base_ctrls, &specs, &mut samples);
 
@@ -502,7 +459,7 @@ pub fn solve_stage_c_knobs(
             ..Default::default()
         };
         Some(
-            fit_and_pack_cp1_audited(&specs, &phase1, &samples, view.tsyn_entries, cfg)
+            fit_and_pack_cp1_audited(&specs, &phase1, &samples, &tsyn_existing, cfg)
                 .map_err(map_stage_err)?,
         )
     };
@@ -514,9 +471,36 @@ pub fn solve_stage_c_knobs(
         clear_dynamic_w_ctrl,
     )?;
 
+    if !collected.mode_a_sweeps.is_empty() && !dry_lr.is_empty() {
+        let post_view = DnamBinView::parse(dnam_bin).map_err(map_stage_err)?;
+        let mut vm_sweep = SonaVm::<DefaultMathBackend>::from_view_owned(
+            &post_view, max_tier, 48_000.0, single_in,
+        )
+        .map_err(map_stage_err)?;
+        for sweep in &collected.mode_a_sweeps {
+            let _ = eval_mode_a_sweep_3khz_trajectory_mse(
+                dnam_bin,
+                &mut vm_sweep,
+                max_tier,
+                dry_lr,
+                sweep,
+                mono_out,
+                dual_in,
+            )?;
+        }
+    }
+
+    let panama_sample_rows = build_panama_sample_rows_from_fitted_bus(
+        manifest,
+        dnam_bin,
+        stmc_by_id,
+        active_frames_hint,
+    )?;
+
     Ok(StageCKnobsOutput {
         elapsed_ms: elapsed_ms_since(timer),
         cp1_slots: slots,
+        panama_sample_rows,
     })
 }
 
@@ -681,6 +665,8 @@ mod tests {
         let sc = solve_stage_c_knobs(&manifest, &mut dnam_bin, &stmc_by_id, &dry, n, true)
             .expect("stage c should succeed");
         assert_eq!(sc.cp1_slots.len(), 2);
+        assert_eq!(sc.panama_sample_rows.len(), 3);
+        assert_eq!(sc.panama_sample_rows[0].stem_id, "boost_sw");
 
         let mut hdr_after = manifest.base.clone();
         let dnam_after = build_dnam_container_from_dnam_bin(&mut hdr_after, &dnam_bin).unwrap();

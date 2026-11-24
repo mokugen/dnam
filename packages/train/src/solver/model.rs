@@ -5,6 +5,7 @@
 pub(crate) mod cascade;
 mod clamp_and_quant;
 mod quads;
+pub mod stage_latent;
 
 pub use clamp_and_quant::{snap_model_fp16, snap_non_readout_fp16};
 pub use quads::{
@@ -12,6 +13,7 @@ pub use quads::{
     NUM_INTER_BLOCK_TILES_ULTRA, NUM_KAUTZ_PAIRS_ULTRA, NUM_TRANSPORT_QUADS_ULTRA,
     TierReadoutPrefixF64, TransportQuadF64,
 };
+pub use stage_latent::SonaStageLatentModsF64;
 
 use dnam_vm::SONA_CORE_QUAD_BLOCK_AND_LOCAL;
 
@@ -122,6 +124,13 @@ pub struct SonaModelF64 {
     pub tier_overrides: [Option<Box<TierReadoutPrefixF64>>; 4],
     /// Per-tier flags indicating whether `SONA_META_CONVOLVER_PREFIX_OVERRIDES` is needed.
     pub prefix_override_needed: [bool; 4],
+    /// Trainable `stage_latent_mods_fp16`, `stage_latent_ctrl_ultra_fp16`, and
+    /// `SONA_META_CORE_MODS_PRESENT` `stage_latent_core_mods_fp16` sensitivity tables.
+    pub stage_latent_mods: SonaStageLatentModsF64,
+    /// Runtime-only `SensoryQuad` slot-30 threshold bias (`[-1.0, 1.0]`, not wire-serialized).
+    pub sense_vca_bias: f64,
+    /// Runtime-only `Op-T` slot-15 wet scaling (`[0.0, 2.0]`, `1.0` default, not wire-serialized).
+    pub op_t_wet_scale: f64,
 }
 
 impl Default for SonaModelF64 {
@@ -184,6 +193,9 @@ impl SonaModelF64 {
             os_dec_c0: 0.50,
             tier_overrides: [None, None, None, None],
             prefix_override_needed: [false; 4],
+            stage_latent_mods: SonaStageLatentModsF64::default(),
+            sense_vca_bias: 0.0,
+            op_t_wet_scale: 1.0,
         }
     }
 

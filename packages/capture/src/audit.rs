@@ -25,6 +25,11 @@ use dnam_vm::bin::{
 use zerocopy::FromBytes;
 use zerocopy::byteorder::little_endian::{F32, U16};
 
+pub mod dynamic_and_panama;
+
+pub use dynamic_and_panama::{
+    append_panama_prescriptions, audit_dynamic_corners_and_zero_dc, build_extreme_valid_corners,
+};
 pub use manifest::{
     recompute_vault_phase1_audit_and_clamps, recompute_vault_phase1_audit_and_clamps_with_windows,
 };
@@ -168,6 +173,15 @@ pub fn clamp_head_spectral_gain_linear(peak_gain_linear: f32) -> (f32, bool) {
 /// Formats a consolidated post-training audit & stem prescription banner (`ref[train.audit.report.prescription]`).
 #[must_use]
 pub fn format_audit_prescription_report(model_name: &str, clamp_lines: &[&str]) -> String {
+    let mut clamps = Vec::new();
+    let mut panama = Vec::new();
+    for &line in clamp_lines {
+        if line.starts_with("[PANAMA]") {
+            panama.push(line);
+        } else {
+            clamps.push(line);
+        }
+    }
     let mut out = String::new();
     out.push_str(
         "================================================================================\n",
@@ -180,10 +194,19 @@ pub fn format_audit_prescription_report(model_name: &str, clamp_lines: &[&str]) 
     );
     out.push_str(&format!(
         "Active Control Clamps Applied ({}):\n",
-        clamp_lines.len()
+        clamps.len()
     ));
-    for (idx, line) in clamp_lines.iter().enumerate() {
+    for (idx, line) in clamps.iter().enumerate() {
         out.push_str(&format!("  {}. {line}\n", idx + 1));
+    }
+    if !panama.is_empty() {
+        out.push_str(&format!(
+            "\nPANAMA Corner Recommendations ({}):\n",
+            panama.len()
+        ));
+        for (idx, line) in panama.iter().enumerate() {
+            out.push_str(&format!("  {}. {line}\n", idx + 1));
+        }
     }
     out.push_str(
         "================================================================================\n",
@@ -696,10 +719,15 @@ mod tests {
 
         let report = format_audit_prescription_report(
             "model",
-            &["[CLAMP-RANGE] 'gain': Clamped declared [0.0, 10.0] -> safe [2.0, 8.0]"],
+            &[
+                "[CLAMP-RANGE] 'gain': Clamped declared [0.0, 10.0] -> safe [2.0, 8.0]",
+                "[PANAMA] Corner (gain=5.0000) (sigma2=0.1234)",
+            ],
         );
         assert!(report.contains("DNAM TRAINING COMPLETE"));
         assert!(report.contains("Active Control Clamps Applied (1):"));
+        assert!(report.contains("PANAMA Corner Recommendations (1):"));
+        assert!(report.contains("[PANAMA] Corner (gain=5.0000) (sigma2=0.1234)"));
 
         let b_safe = compute_phase2_corner_barrier_loss(0.95, 0.85, 0.4, 32.0);
         let b_edge = compute_phase2_corner_barrier_loss(0.9994, 0.9989, 0.749, 4.01);

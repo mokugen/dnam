@@ -3,6 +3,8 @@
 //! (`ref[dsp.ctrl.accum.anova-fm]`, `ref[dsp.ctrl.dispatch.matrix]`,
 //! `ref[dsp.ctrl.calib.variance-gating]`).
 
+mod ultra;
+
 use dnam_vm::bin::{
     Arena0ControlBusWire, Arena3ControlBusWire, CextDispatchWire, ControlClampDescriptorWire,
     TempoSyncEntryWire,
@@ -20,14 +22,14 @@ use super::super::clamp::{
     audit_phase1_controls,
 };
 use super::subspace::{
-    ACTIVE_DISPATCH_SLOTS, RANK_BASE_FM, RANK_STATIC_LATENT, RANK_ULTRA_LATENT,
-    contributor_features_matrix, factor_dispatch_subspace, fit_fm_als_u_and_v,
-    slot_cooccurrence_mask, solve_ols_ridge_uplo,
+    ACTIVE_DISPATCH_SLOTS, RANK_BASE_FM, RANK_STATIC_LATENT, contributor_features_matrix,
+    factor_gauge_invariant_dispatch_subspace, fit_fm_als_u_and_v, slot_cooccurrence_mask,
+    solve_ols_ridge_uplo,
 };
 use super::wire::pack_cp1_slots_into_wire;
 use super::{Cp1ControlSample, Cp1FitConfig, Cp1WireBundle};
+use ultra::{UltraFitInputs, UltraFitOutputs, fit_ultra_dispatch_and_fm};
 
-const UINT_ULTRA_BLOCKS: usize = 3;
 const DELAY_LFO_GATE_SLOTS: [usize; 1] = [12];
 
 fn eval_descriptor_norm(desc: &ControlClampDescriptor, val: f32) -> f64 {
@@ -85,135 +87,6 @@ fn build_cp1_slots(
         }
     }
     (slots, distinct_controls)
-}
-
-struct UltraFitInputs<'a> {
-    basis_cols: &'a [(usize, usize)],
-    design_main: &'a [Vec<f64>],
-    norm_table: &'a [Vec<f64>],
-    descs: &'a [ControlClampDescriptor],
-    samples: &'a [Cp1ControlSample],
-    target_31: &'a [Vec<f64>],
-    target_u_delta_31: &'a [Vec<f64>],
-    z_base_target: &'a [Vec<f64>],
-    z_base_hat: &'a [[f64; 8]],
-    fm_pair_base: Option<&'a [Vec<f64>]>,
-    config: Cp1FitConfig,
-    a0_cb: &'a Arena0ControlBusWire,
-}
-
-struct UltraFitOutputs<'a> {
-    slots: &'a mut [Cp1ContributorSlot],
-    a3_cb: &'a mut Arena3ControlBusWire,
-    cext_wire: &'a mut CextDispatchWire,
-    need_cext: &'a mut bool,
-}
-
-fn fit_ultra_dispatch_and_fm(inp: &UltraFitInputs<'_>, out: &mut UltraFitOutputs<'_>) {
-    let n_obs = inp.samples.len();
-    let mut target_u_res = vec![vec![0.0_f64; ACTIVE_DISPATCH_SLOTS]; n_obs];
-    for i in 0..n_obs {
-        for r in 0..ACTIVE_DISPATCH_SLOTS {
-            let mut base_pred = 0.0_f64;
-            for c in 0..RANK_STATIC_LATENT {
-                let w = if r < 16 {
-                    inp.a0_cb.w_ctrl[r][c].get()
-                } else {
-                    out.cext_wire.w_ctrl_ext[r - 16][c].get()
-                };
-                base_pred += inp.z_base_hat[i][c] * f64::from(w);
-            }
-            target_u_res[i][r] = (inp.target_31[i][r] + inp.target_u_delta_31[i][r]) - base_pred;
-        }
-    }
-
-    let (z_u4_target, w_ultra_31) =
-        factor_dispatch_subspace::<RANK_ULTRA_LATENT>(&target_u_res, inp.config.trust_radius_mh);
-    let mut z_u8_target = vec![vec![0.0_f64; 8]; n_obs];
-    for i in 0..n_obs {
-        z_u8_target[i][4..8].copy_from_slice(&z_u4_target[i]);
-    }
-
-    let w_u = solve_ols_ridge_uplo(inp.design_main, &z_u8_target, inp.config.l2_reg);
-    for (col, &(si, l)) in inp.basis_cols.iter().enumerate() {
-        if let Some(row) = w_u.get(col) {
-            for d in 0..8 {
-                out.slots[si].main_ultra[l][d] = row[d] as f32;
-            }
-        }
-    }
-
-    if let Some(fm_base) = inp.fm_pair_base {
-        let mut z_u8_res = vec![vec![0.0_f64; 8]; n_obs];
-        let mut z_base_res = vec![vec![0.0_f64; 8]; n_obs];
-        let mut z_joint_target = Vec::with_capacity(n_obs);
-        for i in 0..n_obs {
-            for d in 0..8 {
-                let mut u_lin = 0.0_f64;
-                for (col, &(si, l)) in inp.basis_cols.iter().enumerate() {
-                    u_lin += inp.design_main[i][col] * f64::from(out.slots[si].main_ultra[l][d]);
-                }
-                z_u8_res[i][d] = z_u8_target[i][d] - u_lin;
-                z_base_res[i][d] = inp.z_base_target[i][d] - inp.z_base_hat[i][d];
-            }
-            let mut row = Vec::with_capacity(12);
-            row.extend_from_slice(&z_base_res[i]);
-            row.extend_from_slice(&z_u8_res[i][4..8]);
-            z_joint_target.push(row);
-        }
-        let (fm_ultra, _) = fit_fm_als_u_and_v(
-            out.slots,
-            inp.norm_table,
-            inp.descs,
-            inp.samples,
-            &z_joint_target,
-            inp.config.l2_reg,
-            true,
-        );
-        let mut fm_joint = Vec::with_capacity(n_obs);
-        for i in 0..n_obs {
-            let mut row = Vec::with_capacity(2 * RANK_BASE_FM);
-            row.extend_from_slice(&fm_base[i]);
-            row.extend_from_slice(&fm_ultra[i]);
-            fm_joint.push(row);
-        }
-
-        let fm_reg = inp.config.l2_reg.max(1.0e-5);
-        let u0_fit = solve_ols_ridge_uplo(&fm_ultra, &z_base_res, fm_reg);
-        let u12_fit = solve_ols_ridge_uplo(&fm_joint, &z_u8_res, fm_reg);
-        let _ = UINT_ULTRA_BLOCKS;
-        for f in 0..RANK_BASE_FM {
-            if let Some(r0) = u0_fit.get(f) {
-                for d in 0..8 {
-                    out.a3_cb.u_int_ultra[0][f][d] = F32::new(r0[d] as f32);
-                }
-            }
-            if let Some(r1) = u12_fit.get(f) {
-                for d in 0..8 {
-                    out.a3_cb.u_int_ultra[1][f][d] = F32::new(r1[d] as f32);
-                }
-            }
-            if let Some(r2) = u12_fit.get(RANK_BASE_FM + f) {
-                for d in 0..8 {
-                    out.a3_cb.u_int_ultra[2][f][d] = F32::new(r2[d] as f32);
-                }
-            }
-        }
-    }
-
-    for (s_idx, row) in w_ultra_31.iter().enumerate() {
-        for c in 0..RANK_ULTRA_LATENT {
-            let w = row[c] as f32;
-            if s_idx < 16 {
-                out.a3_cb.w_ctrl_ultra[s_idx][c] = F32::new(w);
-            } else {
-                if w.abs() > 1.0e-7 {
-                    *out.need_cext = true;
-                }
-                out.cext_wire.w_ctrl_ultra_ext[s_idx - 16][c] = F32::new(w);
-            }
-        }
-    }
 }
 
 fn fit_and_pack_cp1_inner(
@@ -354,7 +227,7 @@ fn fit_and_pack_cp1_inner(
     }
 
     let (z_base_target_arr, w_static) =
-        factor_dispatch_subspace::<RANK_STATIC_LATENT>(&target_31, config.trust_radius_mh);
+        factor_gauge_invariant_dispatch_subspace(&target_31, config.trust_radius_mh);
     let z_base_target: Vec<Vec<f64>> = z_base_target_arr.iter().map(|r| r.to_vec()).collect();
 
     let mut a0_cb = Arena0ControlBusWire::new_zeroed();
@@ -439,7 +312,7 @@ fn fit_and_pack_cp1_inner(
             let w = row[c] as f32;
             if s_idx < 16 {
                 a0_cb.w_ctrl[s_idx][c] = F32::new(w);
-            } else {
+            } else if c >= 4 {
                 if w.abs() > 1.0e-7 {
                     need_cext = true;
                 }
@@ -447,6 +320,10 @@ fn fit_and_pack_cp1_inner(
             }
         }
     }
+    for row in &mut cext_wire.w_ctrl_ext {
+        row[..4].fill(F32::new(0.0));
+    }
+    cext_wire.w_ctrl_ext[15].fill(F32::new(0.0));
 
     if config.fit_ultra {
         let inp = UltraFitInputs {
@@ -816,5 +693,171 @@ mod tests {
             "simultaneous unobserved switches slot[2]={} vs expected={expected_slot2}",
             bus.stage_targets[2]
         );
+    }
+
+    #[test]
+    fn test_cext_cols04_zero_and_so4_rotation_invariance() {
+        let specs: Vec<ControlSpec> = (0..3).map(|_| make_range_spec(-1.0, 1.0)).collect();
+        let mut samps = Vec::new();
+        for a in [-1.0_f32, 0.0, 1.0] {
+            for b in [-1.0_f32, 0.0, 1.0] {
+                for c in [-1.0_f32, 0.0, 1.0] {
+                    let mut st = [0.0_f64; STAGE_TARGET_SLOTS];
+                    st[0] = 0.4 * f64::from(a) + 0.15 * f64::from(a * b);
+                    st[1] = -0.3 * f64::from(b);
+                    st[2] = 0.25 * f64::from(c);
+                    st[16] = 0.5 * f64::from(a);
+                    st[18] = -0.6 * f64::from(b) + 0.2 * f64::from(a * c);
+                    st[22] = 0.35 * f64::from(c);
+                    st[30] = 0.45 * f64::from(a) - 0.25 * f64::from(c);
+                    st[31] = 12.0; // must be ignored/zeroed
+                    samps.push(Cp1ControlSample {
+                        phys_controls: vec![a, b, c],
+                        switch_options: vec![0; 3],
+                        stage_targets_base: st,
+                        stage_targets_ultra_delta: None,
+                    });
+                }
+            }
+        }
+        let phase1 = audit_phase1_controls(&specs, &StageStabilityConstraint::default()).unwrap();
+        let res = fit_and_pack_cp1_audited(&specs, &phase1, &samps, &[], Cp1FitConfig::default())
+            .unwrap();
+        let cext = res.cext.expect("cext present");
+        for r in 0..16 {
+            for col in 0..4 {
+                assert_eq!(cext.w_ctrl_ext[r][col].get(), 0.0);
+            }
+        }
+        assert!(cext.w_ctrl_ext[15].iter().all(|v| v.get() == 0.0));
+        assert!(cext.w_ctrl_ultra_ext[15].iter().all(|v| v.get() == 0.0));
+
+        // Rotate z_head[0..4] in Arena0 without touching `"CEXT"` -> stage_targets[0..32] invariant!
+        let make_bin = |cb: &Arena0ControlBusWire, a3_cb: &Arena3ControlBusWire| {
+            let mut a0 = DnamBinBuildInput::default_arena0_lite();
+            a0.crossbar.cell_desc.tier_flags = zerocopy::byteorder::little_endian::U16::new(0x000F);
+            a0.control_bus_lite = *cb;
+            a0.control_bus_lite.tank_dry_mix_fp16 =
+                zerocopy::byteorder::little_endian::U16::new(dnam_kernels::f32_to_fp16(1.0));
+            let a1 = dnam_vm::bin::Arena1FullDeltaWire::new_zeroed();
+            let a2 = dnam_vm::bin::Arena2ProDeltaWire::new_zeroed();
+            let mut a3 = dnam_vm::bin::Arena3UltraDeltaWire::new_zeroed();
+            a3.control_bus_ultra_delta = *a3_cb;
+            encode_dnam_bin(&DnamBinBuildInput {
+                reference_sample_rate_hz: 48_000,
+                header_flags: 0,
+                ext_ring_pow2_frames: 0,
+                ext_ring_lines: 0,
+                ext_ring_format: 0,
+                declared_max_delay_48k: 4_096,
+                dc_blocker_pole_5hz: TANK_DC_BLOCKER_48K_F32,
+                tail_time_ms: 40.0,
+                ro_pole_48k: 0.9,
+                switch_xfade_samples: 64,
+                content_hash_prefix: [9; 8],
+                controls: &phase1.wire_descriptors,
+                cp1_overflow: &res.cp1_overflow,
+                tsyn: &res.tsyn,
+                cext: Some(&cext),
+                arena0: &a0,
+                arena1: Some(&a1),
+                arena2: Some(&a2),
+                arena3: Some(&a3),
+            })
+            .unwrap()
+        };
+
+        let bin_unrot = make_bin(&res.arena0_cb, &res.arena3_cb);
+        let view_unrot = DnamBinView::parse(&bin_unrot).unwrap();
+        let mut bus_unrot = ControlBus::<DefaultMathBackend>::from_dnam_bin_owned(
+            &view_unrot,
+            Tier::Lite,
+            48_000.0,
+        )
+        .unwrap();
+
+        // Construct orthogonal SO(4) rotation Q (product of two Givens rotations).
+        let (s1, c1) = 0.6_f32.sin_cos();
+        let (s2, c2) = (-0.8_f32).sin_cos();
+        let q = [
+            [c1, -s1, 0.0, 0.0],
+            [s1, c1, 0.0, 0.0],
+            [0.0, 0.0, c2, -s2],
+            [0.0, 0.0, s2, c2],
+        ];
+        let mut decoded_slots = [Cp1ContributorSlot::zero(); 8];
+        let m = decode_cp1_contributors(
+            &res.arena0_cb,
+            Some(&res.arena3_cb),
+            &res.cp1_overflow,
+            specs.len(),
+            &mut decoded_slots,
+        )
+        .unwrap();
+        for sl in &mut decoded_slots[..m] {
+            for lane in 0..usize::from(sl.lanes) {
+                let x = [
+                    sl.main_base[lane][0],
+                    sl.main_base[lane][1],
+                    sl.main_base[lane][2],
+                    sl.main_base[lane][3],
+                ];
+                for r in 0..4 {
+                    sl.main_base[lane][r] = (0..4).map(|k| q[r][k] * x[k]).sum();
+                }
+            }
+        }
+        let mut rot_a0 = res.arena0_cb;
+        let mut rot_a3 = res.arena3_cb;
+        let _ = pack_cp1_slots_into_wire(
+            &decoded_slots[..m],
+            specs.len(),
+            true,
+            &mut rot_a0,
+            &mut rot_a3,
+        )
+        .unwrap();
+        for f in 0..4 {
+            let x = [
+                res.arena0_cb.u_int_base[f][0].get(),
+                res.arena0_cb.u_int_base[f][1].get(),
+                res.arena0_cb.u_int_base[f][2].get(),
+                res.arena0_cb.u_int_base[f][3].get(),
+            ];
+            for r in 0..4 {
+                rot_a0.u_int_base[f][r] = F32::new((0..4).map(|k| q[r][k] * x[k]).sum());
+            }
+        }
+        for row in 0..16 {
+            let x = [
+                res.arena0_cb.w_ctrl[row][0].get(),
+                res.arena0_cb.w_ctrl[row][1].get(),
+                res.arena0_cb.w_ctrl[row][2].get(),
+                res.arena0_cb.w_ctrl[row][3].get(),
+            ];
+            for r in 0..4 {
+                rot_a0.w_ctrl[row][r] = F32::new((0..4).map(|k| q[r][k] * x[k]).sum());
+            }
+        }
+        let bin_rot = make_bin(&rot_a0, &rot_a3);
+        let view_rot = DnamBinView::parse(&bin_rot).unwrap();
+        let mut bus_rot =
+            ControlBus::<DefaultMathBackend>::from_dnam_bin_owned(&view_rot, Tier::Lite, 48_000.0)
+                .unwrap();
+
+        for (c, &v) in [0.8_f32, -0.7, 0.65].iter().enumerate() {
+            bus_unrot.set_control_physical(c, v).unwrap();
+            bus_rot.set_control_physical(c, v).unwrap();
+        }
+        bus_unrot.eval_static_and_snap_if_dirty();
+        bus_rot.eval_static_and_snap_if_dirty();
+        for s in 0..STAGE_TARGET_SLOTS {
+            assert!(
+                (bus_unrot.stage_targets[s] - bus_rot.stage_targets[s]).abs() < 1.0e-5,
+                "slot {s}: {} vs {}",
+                bus_unrot.stage_targets[s],
+                bus_rot.stage_targets[s]
+            );
+        }
     }
 }

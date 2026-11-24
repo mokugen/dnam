@@ -18,7 +18,7 @@ use dnam_engine::provenance::{
     apply_phase_coding_watermark, apply_sona_sign_gauge_watermark,
     apply_tardos_watermark_7680_envelopes, compute_emr_masked_tardos_envelopes,
     derive_sona_sign_gauge_40, derive_watermark_seed_hmac_sha256, generate_tardos_codebook_7680,
-    kautz_soa_byte_offset, sha256_digest,
+    kautz_soa_byte_offset, mask_tardos_stage_latent_active_coords, sha256_digest,
 };
 use dnam_engine::schema::DnamError;
 use dnam_engine::{DnamEngine, Tier};
@@ -347,11 +347,13 @@ pub fn export_runtime_dnam_watermarked(
 
     apply_phase_coding_watermark(&mut arena, &phase_seed, PHASE_CODING_MAX_RAD)?;
 
-    let codebook = derive_buyer_tardos_codebook(cfg);
+    let mut codebook = derive_buyer_tardos_codebook(cfg);
     let gram_diag_256 = extract_gram_diag_256(proj_view.chunk_slice(ProjChunkKind::Stat, 0));
     let mut envelopes: [f32; TARDOS_CASCADE_WEIGHTS] =
         compute_emr_masked_tardos_envelopes(&gram_diag_256, [1.0e-5, 1.0e-5]);
     mask_nonoverlapping_layer3_envelopes(&mut envelopes);
+    let master_arena = assemble_arena_bytes_from_view(&bin_view);
+    mask_tardos_stage_latent_active_coords(&master_arena, &mut codebook, Some(&mut envelopes));
     apply_tardos_watermark_7680_envelopes(&mut arena, &codebook.chips, &envelopes)?;
 
     let wm_dbin = reencode_dbin_with_mutated_arena_and_cp1(&bin_view, &arena, &cp1_overflow)?;
@@ -682,5 +684,94 @@ mod tests {
             z_inn_noisy.abs() < 3.0,
             "expected noisy innocent |Z| < 3, got {z_inn_noisy}"
         );
+    }
+
+    #[test]
+    fn test_watermarked_export_masks_active_stage_latent_knobs_and_preserves_cext() {
+        use dnam_kernels::f32_to_fp16;
+        use dnam_vm::bin::CextDispatchWire;
+        use zerocopy::byteorder::little_endian::U16;
+
+        let mut model = SonaModelF64::new(48_000.0);
+        model.pre_conv_u_gain = [1.0, 1.0];
+        model.active_kautz_pairs = 32;
+        for m in 0..32 {
+            model.kautz[m].r_low = 0.90;
+            model.kautz[m].theta = 0.085 + 0.090 * (m as f64);
+            model.kautz[m].b_gamma = 1.0;
+            model.kautz[m].c_re_l = 0.18;
+            model.kautz[m].c_re_r = 0.18;
+        }
+        let base = encode_model_to_dnam_bin(&model, Pass5EmitConfig::default()).expect("encode");
+        let bv = DnamBinView::parse(&base).unwrap();
+        let mut a0 = *bv.arena0;
+        let mut a3 = *bv.arena3.unwrap();
+        let val = U16::new(f32_to_fp16(0.125));
+        a0.linear_readout_lite.stage_latent_mods_fp16[0..8].fill(val);
+        a0.linear_readout_lite.stage_latent_mods_fp16[48..80].fill(val);
+        a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[0..160].fill(val);
+        let mut cext = CextDispatchWire {
+            w_ctrl_ext: [[F32::new(0.0); 16]; 16],
+            w_ctrl_ultra_ext: [[F32::new(0.0); 4]; 16],
+        };
+        cext.w_ctrl_ext[0][4] = F32::new(0.25);
+        cext.w_ctrl_ultra_ext[1][2] = F32::new(-0.125);
+        let dnam_bin = encode_dnam_bin(&DnamBinBuildInput {
+            reference_sample_rate_hz: bv.header.reference_sample_rate_hz.get(),
+            header_flags: bv.header.flags.get(),
+            ext_ring_pow2_frames: bv.runtime_meta.ext_ring_pow2_frames,
+            ext_ring_lines: bv.runtime_meta.ext_ring_lines,
+            ext_ring_format: bv.runtime_meta.ext_ring_format,
+            declared_max_delay_48k: bv.runtime_meta.declared_max_delay_48k.get(),
+            dc_blocker_pole_5hz: bv.runtime_meta.dc_blocker_pole_5hz.get(),
+            tail_time_ms: bv.runtime_meta.tail_time_ms.get(),
+            ro_pole_48k: bv.runtime_meta.ro_pole_48k.get(),
+            switch_xfade_samples: bv.runtime_meta.switch_xfade_samples.get(),
+            content_hash_prefix: bv.runtime_meta.content_hash_prefix,
+            controls: bv.control_descriptors,
+            cp1_overflow: bv.cp1_overflow,
+            tsyn: bv.tsyn_entries,
+            cext: Some(&cext),
+            arena0: &a0,
+            arena1: bv.arena1,
+            arena2: bv.arena2,
+            arena3: Some(&a3),
+        })
+        .unwrap();
+
+        let mut manifest = DnamProjManifest::default_reference();
+        let proj = build_dnam_proj_container_with_dnam_bin(&mut manifest, &[], &dnam_bin).unwrap();
+        let cfg = BuyerWatermarkConfig::new([0x42; 32], "test_v3", "lic_02", [0x22; 16]);
+        let wm_dnam = export_runtime_dnam_watermarked(&proj, &cfg, Some(Tier::Ultra)).unwrap();
+        let master_dnam = export_runtime_dnam(&proj, Some(Tier::Ultra)).unwrap();
+        let mv = DnamBinView::parse(extract_dnam_bin(&master_dnam).unwrap()).unwrap();
+        let wv = DnamBinView::parse(extract_dnam_bin(&wm_dnam).unwrap()).unwrap();
+        assert_eq!(
+            wv.arena0.linear_readout_lite.stage_latent_mods_fp16[0..8],
+            mv.arena0.linear_readout_lite.stage_latent_mods_fp16[0..8]
+        );
+        assert_eq!(
+            wv.arena0.linear_readout_lite.stage_latent_mods_fp16[48..80],
+            mv.arena0.linear_readout_lite.stage_latent_mods_fp16[48..80]
+        );
+        assert_eq!(
+            wv.arena3
+                .unwrap()
+                .control_bus_ultra_delta
+                .stage_latent_ctrl_ultra_fp16[0..160],
+            mv.arena3
+                .unwrap()
+                .control_bus_ultra_delta
+                .stage_latent_ctrl_ultra_fp16[0..160]
+        );
+        assert_eq!(wv.cext.map(|c| c.as_bytes()), Some(cext.as_bytes()));
+        let code = derive_buyer_tardos_codebook(&cfg);
+        let z = score_tardos_watermark_7680(
+            &assemble_arena_bytes_from_view(&mv),
+            &assemble_arena_bytes_from_view(&wv),
+            &code.accusation_weights,
+        )
+        .unwrap();
+        assert!(z > 15.0, "expected Tardos Z > 15, got {z}");
     }
 }

@@ -407,6 +407,21 @@ pub fn render_vm_mono_probe(
     Ok(out_l.into_iter().map(f64::from).collect())
 }
 
+/// Resets and renders one deterministic mono probe on a persistent `SonaVm` using explicit
+/// latched `stage_targets` (`slot 31` forced `0.0`) and `z_stage` with zero `.dnam-bin` re-parsing.
+pub fn render_vm_mono_probe_reuse(
+    vm: &mut SonaVm<'_, DefaultMathBackend>,
+    stage_targets: &[f32; STAGE_TARGET_SLOTS],
+    z_stage: &[f32; 8],
+    input: &[f32],
+) -> Result<Vec<f64>, TrainError> {
+    vm.reset_with_latched_stage_targets(stage_targets, z_stage);
+    let n = input.len();
+    let (mut out_l, mut out_r) = (vec![0.0_f32; n], vec![0.0_f32; n]);
+    vm.process_block(input, input, &mut out_l, &mut out_r)?;
+    Ok(out_l.into_iter().map(f64::from).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -497,6 +512,16 @@ mod tests {
         .unwrap();
         let vm_out = render_vm_mono_probe(&bin, Tier::Lite, 48_000.0, &[0.25; 64]).unwrap();
         assert_eq!(vm_out.len(), 64);
+        let mut vm_reuse =
+            SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&bin, Tier::Lite, 48_000.0).unwrap();
+        let vm_out2 = render_vm_mono_probe_reuse(
+            &mut vm_reuse,
+            &[0.0; STAGE_TARGET_SLOTS],
+            &[0.0; 8],
+            &[0.25; 64],
+        )
+        .unwrap();
+        assert_eq!(vm_out, vm_out2);
 
         let true_s = [0.4_f64, -0.25_f64];
         let tgt: Vec<f64> = (0..64)

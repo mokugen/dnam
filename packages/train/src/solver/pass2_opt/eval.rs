@@ -38,28 +38,30 @@ use core_adj::{
     add_wave_tile_weight_grads, backprop_local_core_input_frame, finalize_core_quad_zoh,
 };
 
-pub(super) use core_adj::Pass2FullGrads as Pass2ParamGrads;
+pub(crate) use core_adj::Pass2FullGrads as Pass2ParamGrads;
 
 /// Forward intermediates cached during Pass-2 evaluation for exact reverse-time BPTT.
-pub(super) struct Pass2EvalBuffers {
-    pub os2x: bool,
-    pub u_sense_l: Vec<f64>,
-    pub u_sense_r: Vec<f64>,
-    pub cb_trace: CrossbarForwardTrace,
-    pub ux_l: Vec<f64>,
-    pub ux_r: Vec<f64>,
-    pub core_ux_l: Vec<f64>,
-    pub core_ux_r: Vec<f64>,
-    pub core_ro_hp_l: Vec<f64>,
-    pub core_ro_hp_r: Vec<f64>,
-    pub onset_pre_l: Vec<f64>,
-    pub onset_pre_r: Vec<f64>,
-    pub x_tank_l: Vec<f64>,
-    pub x_tank_r: Vec<f64>,
-    pub pred_l: Vec<f64>,
-    pub pred_r: Vec<f64>,
-    pub cascade: CausalCascadeOutput,
-    pub causal_loop: Option<CausalLoopBuffers>,
+pub(crate) struct Pass2EvalBuffers {
+    pub(super) os2x: bool,
+    pub(super) u_sense_l: Vec<f64>,
+    pub(super) u_sense_r: Vec<f64>,
+    pub(super) cb_trace: CrossbarForwardTrace,
+    pub(super) ux_l: Vec<f64>,
+    pub(super) ux_r: Vec<f64>,
+    pub(super) core_ux_l: Vec<f64>,
+    pub(super) core_ux_r: Vec<f64>,
+    pub(super) core_ro_hp_l: Vec<f64>,
+    pub(super) core_ro_hp_r: Vec<f64>,
+    pub(super) onset_pre_l: Vec<f64>,
+    pub(super) onset_pre_r: Vec<f64>,
+    pub(super) x_tank_l: Vec<f64>,
+    pub(super) x_tank_r: Vec<f64>,
+    pub(super) op_t_wet_l: Vec<f64>,
+    pub(super) op_t_wet_r: Vec<f64>,
+    pub(crate) pred_l: Vec<f64>,
+    pub(crate) pred_r: Vec<f64>,
+    pub(super) cascade: CausalCascadeOutput,
+    pub(super) causal_loop: Option<CausalLoopBuffers>,
 }
 
 #[inline]
@@ -71,7 +73,7 @@ fn delay16_slice(sig: &[f64]) -> Vec<f64> {
     out
 }
 
-pub(super) fn eval_model_pass2_audio(
+pub(crate) fn eval_model_pass2_audio(
     runner: &TrainRunner,
     model: &SonaModelF64,
     in_l: &[f64],
@@ -114,6 +116,8 @@ pub(super) fn eval_model_pass2_audio(
             onset_pre_r: Vec::new(),
             x_tank_l: Vec::new(),
             x_tank_r: Vec::new(),
+            op_t_wet_l: Vec::new(),
+            op_t_wet_r: Vec::new(),
             pred_l: cl.pred_l.clone(),
             pred_r: cl.pred_r.clone(),
             cascade: CausalCascadeOutput {
@@ -282,10 +286,11 @@ pub(super) fn eval_model_pass2_audio(
     }
 
     let dry_mix = sanitize_unit_f64(model.tank_dry_mix, -2.0, 2.0, 1.0);
+    let wet_scale = sanitize_unit_f64(model.op_t_wet_scale, 0.0, 2.0, 1.0);
     let mut pred_l: Vec<f64> = x_tank_l.iter().map(|&v| dry_mix * v).collect();
     let mut pred_r: Vec<f64> = x_tank_r.iter().map(|&v| dry_mix * v).collect();
     let active_opt = active_opt_quads_for_core_quads(q_count);
-    let (tl, tr, _) = eval_op_t_bank_stereo_and_adjoint(
+    let (op_t_wet_l, op_t_wet_r, _) = eval_op_t_bank_stereo_and_adjoint(
         &x_tank_l,
         &x_tank_r,
         &model.transport_quads,
@@ -294,8 +299,8 @@ pub(super) fn eval_model_pass2_audio(
         None,
     );
     for t in 0..n {
-        pred_l[t] += tl[t];
-        pred_r[t] += tr[t];
+        pred_l[t] += wet_scale * op_t_wet_l[t];
+        pred_r[t] += wet_scale * op_t_wet_r[t];
     }
 
     Ok(Pass2EvalBuffers {
@@ -313,6 +318,8 @@ pub(super) fn eval_model_pass2_audio(
         onset_pre_r,
         x_tank_l,
         x_tank_r,
+        op_t_wet_l,
+        op_t_wet_r,
         pred_l,
         pred_r,
         cascade,
@@ -320,7 +327,7 @@ pub(super) fn eval_model_pass2_audio(
     })
 }
 
-pub(super) struct Pass2AdjInput<'a> {
+pub(crate) struct Pass2AdjInput<'a> {
     pub model: &'a SonaModelF64,
     pub in_l: &'a [f64],
     pub in_r: &'a [f64],
@@ -331,7 +338,7 @@ pub(super) struct Pass2AdjInput<'a> {
     pub k_opt: usize,
 }
 
-pub(super) fn assemble_pass2_gradients(
+pub(crate) fn assemble_pass2_gradients(
     runner: &TrainRunner,
     inp: &Pass2AdjInput<'_>,
 ) -> Result<Pass2ParamGrads, TrainError> {
@@ -368,14 +375,23 @@ pub(super) fn assemble_pass2_gradients(
 
     let num_tiles = n_core.div_ceil(TILE_FRAMES);
     let dry_mix = sanitize_unit_f64(model.tank_dry_mix, -2.0, 2.0, 1.0);
+    let wet_scale = sanitize_unit_f64(model.op_t_wet_scale, 0.0, 2.0, 1.0);
     if model.tank_dry_mix.is_finite() && model.tank_dry_mix.abs() < 2.0 {
         for t in 0..n {
             grads.d_tank_dry_mix += gl[t] * buf.x_tank_l[t] + gr[t] * buf.x_tank_r[t];
         }
     }
+    if model.op_t_wet_scale.is_finite() && model.op_t_wet_scale >= 0.0 && model.op_t_wet_scale < 2.0
+    {
+        for t in 0..n {
+            grads.d_op_t_wet_scale += gl[t] * buf.op_t_wet_l[t] + gr[t] * buf.op_t_wet_r[t];
+        }
+    }
 
     let mut gx_l: Vec<f64> = gl.iter().map(|&v| dry_mix * v).collect();
     let mut gx_r: Vec<f64> = gr.iter().map(|&v| dry_mix * v).collect();
+    let gl_wet: Vec<f64> = gl.iter().map(|&v| wet_scale * v).collect();
+    let gr_wet: Vec<f64> = gr.iter().map(|&v| wet_scale * v).collect();
     let (_, _, d_op_t) = eval_op_t_bank_stereo_and_adjoint(
         &buf.x_tank_l,
         &buf.x_tank_r,
@@ -383,8 +399,8 @@ pub(super) fn assemble_pass2_gradients(
         active_opt,
         model.sample_rate_hz,
         Some(OpTQuadAdjointSlices {
-            d_out_l: gl,
-            d_out_r: gr,
+            d_out_l: &gl_wet,
+            d_out_r: &gr_wet,
             grad_x_l: Some(&mut gx_l),
             grad_x_r: Some(&mut gx_r),
         }),

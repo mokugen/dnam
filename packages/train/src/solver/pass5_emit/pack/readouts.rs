@@ -151,6 +151,9 @@ pub(super) fn pack_tier_readouts(
         .map(snap_fp16);
     let lite_w_ro = lite_src.map_or(&model.w_ro, |p| &p.w_ro);
     write_w_ro_fp16(lite_w_ro, &mut ro_lite.w_ro_fp16[..192], 16);
+    model
+        .stage_latent_mods
+        .pack_lite_into_wire(&mut ro_lite.stage_latent_mods_fp16);
     for q in 0..4 {
         for l in 0..4 {
             ro_lite.stage_latent_mods_fp16[STAGE_LATENT_OP_P_TO_CORE_OFFSET + q * 4 + l] =

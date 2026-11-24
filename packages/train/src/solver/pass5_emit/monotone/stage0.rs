@@ -4,9 +4,9 @@
 use super::super::super::model::{SonaModelF64, TierReadoutPrefixF64};
 use super::super::certify::{StereoCertBundle, TierRenderBundle};
 use super::helpers::{
-    MonotoneEvalCtx, blend_w_ro_and_direct_only, damp_w_ro_and_direct_only,
-    materialize_w_ro_only_overrides, others_intact, re_eval, strict_besr_preserved,
-    tier_lufs_and_trim_ok,
+    MonotoneEvalCtx, MonotoneState, blend_w_ro_and_direct_only, commit_dirty_eval,
+    damp_w_ro_and_direct_only, materialize_w_ro_only_overrides, others_intact, re_eval,
+    re_eval_dirty, strict_besr_preserved, tier_lufs_and_trim_ok,
 };
 
 pub(super) fn try_stage_0_fp32_w_ro_only(
@@ -28,20 +28,25 @@ pub(super) fn try_stage_0_fp32_w_ro_only(
     }
     let mut cand = model.clone();
     materialize_w_ro_only_overrides(&mut cand);
-    let Ok((mut c_bin, mut c_bdl, mut c_cert)) =
+    let Ok((c_bin, c_bdl, c_cert)) =
         re_eval(&mut cand, in_l, in_r, target_l, target_r, warmup, config)
     else {
         return None;
     };
-    if c_cert.pair_monotone[1..].iter().all(|&m| m)
-        && c_cert.tier_reports[3].besr_db <= cert.tier_reports[3].besr_db + 0.1
-        && tier_lufs_and_trim_ok(&cand, orig_trims, &c_cert, config, 0..=2, true)
+    let mut c_state = MonotoneState {
+        final_bin: c_bin,
+        final_bundle: c_bdl,
+        cert: c_cert,
+    };
+    if c_state.cert.pair_monotone[1..].iter().all(|&m| m)
+        && c_state.cert.tier_reports[3].besr_db <= cert.tier_reports[3].besr_db + 0.1
+        && tier_lufs_and_trim_ok(&cand, orig_trims, &c_state.cert, config, 0..=2, true)
     {
         *model = cand;
-        return Some((c_bin, c_bdl, c_cert));
+        return Some((c_state.final_bin, c_state.final_bundle, c_state.cert));
     }
 
-    let init_besr: [f64; 4] = core::array::from_fn(|t| c_cert.tier_reports[t].besr_db);
+    let init_besr: [f64; 4] = core::array::from_fn(|t| c_state.cert.tier_reports[t].besr_db);
     let init_ovs: [TierReadoutPrefixF64; 4] = core::array::from_fn(|t| {
         cand.tier_overrides[t]
             .as_deref()
@@ -50,7 +55,7 @@ pub(super) fn try_stage_0_fp32_w_ro_only(
     });
 
     for t in 1..=3 {
-        if c_cert.pair_monotone[t] {
+        if c_state.cert.pair_monotone[t] {
             continue;
         }
         let hi_src = cand.tier_overrides[t]
@@ -61,29 +66,27 @@ pub(super) fn try_stage_0_fp32_w_ro_only(
             .as_deref()
             .cloned()
             .unwrap_or_else(|| init_ovs[t - 1].clone());
-        let strictly_better = c_cert.tier_reports[t].besr_db < c_cert.tier_reports[t - 1].besr_db;
+        let strictly_better =
+            c_state.cert.tier_reports[t].besr_db < c_state.cert.tier_reports[t - 1].besr_db;
         for &alpha in &[0.95, 0.88, 0.78, 0.65, 0.50] {
             let mut m_try = cand.clone();
             if let Some(ref mut dst) = m_try.tier_overrides[t] {
                 blend_w_ro_and_direct_only(dst, &hi_src, &lo_src, alpha);
             }
-            let Ok((b, bdl, c)) =
-                re_eval(&mut m_try, in_l, in_r, target_l, target_r, warmup, config)
-            else {
+            let Ok(res) = re_eval_dirty(&mut m_try, eval, &c_state, 1_u8 << t) else {
                 continue;
             };
+            let c = &res.cert;
             let acc_ok = !strictly_better
                 || (c.tier_reports[t].besr_db <= init_besr[t] + 0.5
                     && c.tier_reports[t].besr_db < c.tier_reports[t - 1].besr_db);
             if c.pair_monotone[t]
-                && others_intact(&c_cert, &c, t)
+                && others_intact(&c_state.cert, c, t)
                 && acc_ok
-                && tier_lufs_and_trim_ok(&m_try, orig_trims, &c, config, t..=t, true)
+                && tier_lufs_and_trim_ok(&m_try, orig_trims, c, config, t..=t, true)
+                && commit_dirty_eval(&mut c_state, res).is_ok()
             {
                 cand = m_try;
-                c_bin = b;
-                c_bdl = bdl;
-                c_cert = c;
                 break;
             }
         }
@@ -93,7 +96,7 @@ pub(super) fn try_stage_0_fp32_w_ro_only(
     const W_RO_FULL_BETAS: [f64; 9] = [0.95, 0.90, 0.82, 0.72, 0.60, 0.45, 0.30, 0.15, 0.0];
     const W_RO_COORD_BETAS: [f64; 8] = [0.92, 0.85, 0.75, 0.60, 0.45, 0.30, 0.15, 0.0];
     for t in 1..=3 {
-        if c_cert.pair_monotone[t] {
+        if c_state.cert.pair_monotone[t] {
             continue;
         }
         let mut repaired = false;
@@ -110,28 +113,25 @@ pub(super) fn try_stage_0_fp32_w_ro_only(
                 if let Some(ref mut dst) = m_try.tier_overrides[t - 1] {
                     damp_w_ro_and_direct_only(dst, t - 1, beta, detail_only);
                 }
-                let Ok((b, bdl, c)) =
-                    re_eval(&mut m_try, in_l, in_r, target_l, target_r, warmup, config)
-                else {
+                let Ok(res) = re_eval_dirty(&mut m_try, eval, &c_state, 1_u8 << (t - 1)) else {
                     continue;
                 };
+                let c = &res.cert;
                 if c.pair_monotone[t]
-                    && others_intact(&c_cert, &c, t)
-                    && strict_besr_preserved(&init_besr, &c, t)
-                    && (t == 1 || strict_besr_preserved(&init_besr, &c, t - 1))
+                    && others_intact(&c_state.cert, c, t)
+                    && strict_besr_preserved(&init_besr, c, t)
+                    && (t == 1 || strict_besr_preserved(&init_besr, c, t - 1))
                     && tier_lufs_and_trim_ok(
                         &m_try,
                         orig_trims,
-                        &c,
+                        c,
                         config,
                         (t - 1)..=(t - 1),
                         strict_env,
                     )
+                    && commit_dirty_eval(&mut c_state, res).is_ok()
                 {
                     cand = m_try;
-                    c_bin = b;
-                    c_bdl = bdl;
-                    c_cert = c;
                     repaired = true;
                     break;
                 }
@@ -140,8 +140,9 @@ pub(super) fn try_stage_0_fp32_w_ro_only(
     }
 
     for t in 2..=3 {
-        if c_cert.pair_monotone[t]
-            || c_cert.tier_reports[t].besr_db >= c_cert.tier_reports[t - 1].besr_db + 1.5
+        if c_state.cert.pair_monotone[t]
+            || c_state.cert.tier_reports[t].besr_db
+                >= c_state.cert.tier_reports[t - 1].besr_db + 1.5
         {
             continue;
         }
@@ -158,31 +159,21 @@ pub(super) fn try_stage_0_fp32_w_ro_only(
                         damp_w_ro_and_direct_only(dst, k, scale, detail_only);
                     }
                 }
-                let Ok((b, bdl, c)) =
-                    re_eval(&mut m_try, in_l, in_r, target_l, target_r, warmup, config)
-                else {
+                let Ok(res) = re_eval_dirty(&mut m_try, eval, &c_state, (1_u8 << t) - 1) else {
                     continue;
                 };
+                let c = &res.cert;
                 let prefix_monotone = c.pair_monotone[1..=t].iter().all(|&m| m);
                 let upper_ok =
-                    ((t + 1)..=3).all(|u| !c_cert.pair_monotone[u] || c.pair_monotone[u]);
-                let strict_ok = (1..=t).all(|k| strict_besr_preserved(&init_besr, &c, k));
+                    ((t + 1)..=3).all(|u| !c_state.cert.pair_monotone[u] || c.pair_monotone[u]);
+                let strict_ok = (1..=t).all(|k| strict_besr_preserved(&init_besr, c, k));
                 if prefix_monotone
                     && upper_ok
                     && strict_ok
-                    && tier_lufs_and_trim_ok(
-                        &m_try,
-                        orig_trims,
-                        &c,
-                        config,
-                        0..=(t - 1),
-                        strict_env,
-                    )
+                    && tier_lufs_and_trim_ok(&m_try, orig_trims, c, config, 0..=(t - 1), strict_env)
+                    && commit_dirty_eval(&mut c_state, res).is_ok()
                 {
                     cand = m_try;
-                    c_bin = b;
-                    c_bdl = bdl;
-                    c_cert = c;
                     repaired = true;
                     break;
                 }
@@ -190,12 +181,12 @@ pub(super) fn try_stage_0_fp32_w_ro_only(
         }
     }
 
-    if c_cert.pair_monotone[1..].iter().all(|&m| m)
-        && c_cert.tier_reports[3].besr_db <= cert.tier_reports[3].besr_db + 0.1
-        && tier_lufs_and_trim_ok(&cand, orig_trims, &c_cert, config, 0..=2, false)
+    if c_state.cert.pair_monotone[1..].iter().all(|&m| m)
+        && c_state.cert.tier_reports[3].besr_db <= cert.tier_reports[3].besr_db + 0.1
+        && tier_lufs_and_trim_ok(&cand, orig_trims, &c_state.cert, config, 0..=2, false)
     {
         *model = cand;
-        return Some((c_bin, c_bdl, c_cert));
+        return Some((c_state.final_bin, c_state.final_bundle, c_state.cert));
     }
     None
 }

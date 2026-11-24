@@ -10,6 +10,7 @@ use dnam_vm::bin::{
     DNBN_FLAG_STEREO_OUT, DnamBinView, KautzSoaBlockWire, SonaCrossbarBlockWire,
     TRANSPORT_FLAG_EXT_F32, TransportQuadWire,
 };
+use dnam_vm::control::STAGE_TARGET_SLOTS;
 use dnam_vm::math::{DefaultMathBackend, TANK_DC_BLOCKER_48K_F32};
 use dnam_vm::{SonaVm, Tier};
 use zerocopy::byteorder::little_endian::{F32, U16};
@@ -216,33 +217,34 @@ pub struct RailBurstReport {
 }
 
 /// Runs the normative Phase-2 `[CLAMP-RAIL]` 2,048-sample differential stereo `[+x[n], -x[n]]`
-/// stability burst through `dnam_vm::SonaVm` on `tier` without gradient tracking
-/// (`ref[train.audit.phase2.clamp-rail]`).
-pub fn run_phase2_rail_burst(
-    dnam_bin: &[u8],
-    tier: Tier,
-    sample_rate_hz: f32,
+/// stability burst on an existing persistent `SonaVm` without reallocating or re-parsing
+/// `.dnam-bin` (`ref[train.audit.phase2.clamp-rail]`).
+pub fn run_phase2_rail_burst_reuse(
+    vm: &mut SonaVm<'_, DefaultMathBackend>,
+    is_stereo: bool,
     d_corner: f64,
+    stage_targets: Option<&[f32; STAGE_TARGET_SLOTS]>,
 ) -> Result<RailBurstReport, TrainError> {
-    let view = DnamBinView::parse(dnam_bin)?;
-    let is_stereo = (view.header.flags.get() & DNBN_FLAG_STEREO_OUT) != 0;
     let eff_drive = if d_corner.is_finite() {
         d_corner.clamp(0.1, 64.0)
     } else {
         1.0
     };
     let mut stim = [0.0_f32; RAIL_BURST_FRAMES];
-    for n in 0..RAIL_BURST_FRAMES {
+    for (n, dst) in stim.iter_mut().enumerate() {
         let nf = n as f64;
-        stim[n] = (0.85
+        *dst = (0.85
             * eff_drive
             * ((RAIL_STIM_OMEGA_A * nf).sin() + 0.35 * (RAIL_STIM_OMEGA_B * nf).cos()))
             as f32;
     }
 
-    let eval_polarity = |sign_r: f32| -> Result<(usize, f32, bool), TrainError> {
-        let mut vm =
-            SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(dnam_bin, tier, sample_rate_hz)?;
+    let mut eval_polarity = |sign_r: f32| -> Result<(usize, f32, bool), TrainError> {
+        if let Some(st) = stage_targets {
+            vm.reset_with_latched_stage_targets(st, &[0.0; 8]);
+        } else {
+            vm.reset_and_set_controls_immediate(&[])?;
+        }
         let mut in_r = [0.0_f32; RAIL_BURST_FRAMES];
         for (dst, &s) in in_r.iter_mut().zip(&stim) {
             *dst = sign_r * s;
@@ -301,6 +303,21 @@ pub fn run_phase2_rail_burst(
         flagged,
         safe_scale,
     })
+}
+
+/// Runs the normative Phase-2 `[CLAMP-RAIL]` 2,048-sample differential stereo `[+x[n], -x[n]]`
+/// stability burst through `dnam_vm::SonaVm` on `tier` without gradient tracking
+/// (`ref[train.audit.phase2.clamp-rail]`).
+pub fn run_phase2_rail_burst(
+    dnam_bin: &[u8],
+    tier: Tier,
+    sample_rate_hz: f32,
+    d_corner: f64,
+) -> Result<RailBurstReport, TrainError> {
+    let view = DnamBinView::parse(dnam_bin)?;
+    let is_stereo = (view.header.flags.get() & DNBN_FLAG_STEREO_OUT) != 0;
+    let mut vm = SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(dnam_bin, tier, sample_rate_hz)?;
+    run_phase2_rail_burst_reuse(&mut vm, is_stereo, d_corner, None)
 }
 
 /// Evaluates whether a scalar pre-activation trajectory stayed strictly below the

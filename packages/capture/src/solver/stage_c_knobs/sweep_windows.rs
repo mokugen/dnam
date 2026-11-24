@@ -181,6 +181,136 @@ pub(super) fn extract_sweep_windows_for_stem(
     true
 }
 
+/// Decoded uniform-knot continuous control schedule for an enabled `MODE_A_SWEEP` stem
+/// (`ref[train.pipeline.dispatch-solve]`, `ref[container.proj.stmc-capsule]`).
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct ModeASweepSchedule {
+    /// Maximum positive-weight record count `M_max = max_c M_c >= 1` across controls.
+    pub(super) m_max: usize,
+    /// Ordered positive-weight physical/option knots per schema control (`len == P`).
+    pub(super) per_ctrl_knots: Vec<Vec<f32>>,
+    /// True iff positive-weight records on control `p` represent discrete switch indices.
+    pub(super) per_ctrl_is_switch: Vec<bool>,
+}
+
+/// Decodes positive-weight `STMC` trajectory records per control `c in 0..P`, holding controls
+/// with `<= 1` positive-weight records static at `base_meta_ctrls[c]`.
+#[must_use]
+pub(super) fn build_mode_a_sweep_schedule(
+    windows: &[StmcTrajectoryWindow],
+    base_meta_ctrls: &[f32],
+) -> ModeASweepSchedule {
+    let p_count = base_meta_ctrls.len();
+    let mut per_ctrl_knots: Vec<Vec<f32>> = vec![Vec::new(); p_count];
+    let mut per_ctrl_is_switch = vec![false; p_count];
+
+    for w in windows {
+        let p = usize::from(w.control_id);
+        if p >= p_count || !w.window_weight.is_finite() || w.window_weight <= 0.0 {
+            continue;
+        }
+        if w.ctrl_kind == 1 {
+            per_ctrl_is_switch[p] = true;
+            per_ctrl_knots[p].push(f32::from(w.active_opt));
+        } else if w.ctrl_kind == 0 && w.u_phys.is_finite() {
+            per_ctrl_knots[p].push(w.u_phys);
+        }
+    }
+
+    for (p, knots) in per_ctrl_knots.iter_mut().enumerate() {
+        if knots.is_empty() {
+            let v = base_meta_ctrls[p];
+            knots.push(if v.is_finite() { v } else { 0.0 });
+        }
+    }
+    let m_max = per_ctrl_knots
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    ModeASweepSchedule {
+        m_max,
+        per_ctrl_knots,
+        per_ctrl_is_switch,
+    }
+}
+
+/// Evaluates `u(frame_idx)` linearly interpolated across uniform knot positions over `[0..n_active)`.
+#[must_use]
+pub(super) fn eval_sweep_schedule_at_frame(
+    sched: &ModeASweepSchedule,
+    frame_idx: usize,
+    n_active: usize,
+) -> Vec<f32> {
+    let u_frac = if n_active <= 1 {
+        0.0_f64
+    } else {
+        (frame_idx.min(n_active - 1) as f64) / ((n_active - 1) as f64)
+    };
+    sched
+        .per_ctrl_knots
+        .iter()
+        .enumerate()
+        .map(|(p, knots)| {
+            if knots.len() <= 1 {
+                knots.first().copied().unwrap_or(0.0)
+            } else {
+                let pos = u_frac * ((knots.len() - 1) as f64);
+                if sched.per_ctrl_is_switch[p] {
+                    knots[(pos.round() as usize).min(knots.len() - 1)]
+                } else {
+                    let k0 = (pos.floor() as usize).min(knots.len() - 1);
+                    let k1 = (k0 + 1).min(knots.len() - 1);
+                    let alpha = (pos - (k0 as f64)).clamp(0.0, 1.0);
+                    (f64::from(knots[k0]) + alpha * (f64::from(knots[k1]) - f64::from(knots[k0])))
+                        as f32
+                }
+            }
+        })
+        .collect()
+}
+
+/// Samples canonical `M_max` synchronous Pass-4 rows (`window_idx = 0..M_max`) at
+/// `t_k = 0` when `M_max == 1` else `floor(window_idx * (N_active - 1) / (M_max - 1))`.
+#[must_use]
+pub(super) fn sample_synchronous_m_max_controls(
+    sched: &ModeASweepSchedule,
+    n_active: usize,
+) -> Vec<(usize, Vec<f32>)> {
+    let m_max = sched.m_max.max(1);
+    let mut rows = Vec::with_capacity(m_max);
+    for window_idx in 0..m_max {
+        let t_k = if m_max == 1 || n_active <= 1 {
+            0
+        } else {
+            (window_idx * (n_active - 1)) / (m_max - 1)
+        };
+        rows.push((
+            window_idx,
+            eval_sweep_schedule_at_frame(sched, t_k, n_active),
+        ));
+    }
+    rows
+}
+
+/// Decodes a continuous `3 kHz` (`16`-sample tick) physical control trajectory `u(t)` across
+/// `[0..n_frames)`.
+#[must_use]
+pub(super) fn build_3khz_control_trajectory(
+    sched: &ModeASweepSchedule,
+    n_frames: usize,
+) -> Vec<Vec<f32>> {
+    let n_ticks = n_frames.div_ceil(16).max(1);
+    let last_frame = n_frames.saturating_sub(1);
+    let mut traj = Vec::with_capacity(n_ticks);
+    for tick in 0..n_ticks {
+        let frame_idx = (tick * 16).min(last_frame);
+        traj.push(eval_sweep_schedule_at_frame(sched, frame_idx, n_frames));
+    }
+    traj
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +439,35 @@ mod tests {
             &mut extracted_3d,
         ));
         assert_eq!(extracted_3d.len(), 4);
+    }
+
+    #[test]
+    fn test_mode_a_sweep_schedule_synchronous_m_max_and_3khz_interpolation() {
+        let mut w_zero = mk_win(0, 99.0);
+        w_zero.window_weight = 0.0;
+        let wins = vec![
+            w_zero,
+            mk_win(0, -1.0),
+            mk_win(0, 0.0),
+            mk_win(0, 1.0),
+            mk_win(1, 0.75),
+        ];
+        let sched = build_mode_a_sweep_schedule(&wins, &[0.0, 0.25, -0.5]);
+        assert_eq!(sched.m_max, 3);
+        assert_eq!(sched.per_ctrl_knots[0], vec![-1.0, 0.0, 1.0]);
+        assert_eq!(sched.per_ctrl_knots[1], vec![0.75]);
+        assert_eq!(sched.per_ctrl_knots[2], vec![-0.5]);
+
+        let sync = sample_synchronous_m_max_controls(&sched, 97);
+        assert_eq!(sync.len(), 3);
+        assert_eq!(sync[0], (0, vec![-1.0, 0.75, -0.5]));
+        assert_eq!(sync[1], (1, vec![0.0, 0.75, -0.5]));
+        assert_eq!(sync[2], (2, vec![1.0, 0.75, -0.5]));
+
+        let traj = build_3khz_control_trajectory(&sched, 48);
+        assert_eq!(traj.len(), 3);
+        assert_eq!(traj[0][0], -1.0);
+        assert!(traj[1][0] > -1.0 && traj[1][0] < 0.0);
+        assert!(traj[2][0] > 0.0 && traj[2][0] < 1.0);
     }
 }

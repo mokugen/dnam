@@ -11,8 +11,8 @@ use dnam_vm::bin::{
     Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire,
     ConvolverFir16Wire, ConvolverFir32Wire, ConvolverFir48Wire, DNBN_FLAG_SINGLE_INPUT,
     DNBN_FLAG_STEREO_OUT, PIPE_CANONICAL_V3_SONA, SONA_CELL_MAGIC,
-    SONA_META_CONVOLVER_PREFIX_OVERRIDES, SONA_META_OS_EXT_PRESENT, SONA_META_OS2X,
-    SONA_META_SENSORY_QUAD, SONA_META_TIER_OS_EXPLICIT, SONA_META_TRANSPORT_LFO,
+    SONA_META_CONVOLVER_PREFIX_OVERRIDES, SONA_META_CORE_MODS_PRESENT, SONA_META_OS_EXT_PRESENT,
+    SONA_META_OS2X, SONA_META_SENSORY_QUAD, SONA_META_TIER_OS_EXPLICIT, SONA_META_TRANSPORT_LFO,
     SONA_META_TRANSPORT_TAP_GAINS, TRANSPORT_FLAG_EXT_F32, encode_dnam_bin,
 };
 use dnam_vm::math::TANK_DC_BLOCKER_48K_F32;
@@ -53,6 +53,9 @@ pub fn encode_model_to_dnam_bin(
     }
     if emit_prefix_overrides {
         meta_flags |= SONA_META_CONVOLVER_PREFIX_OVERRIDES;
+    }
+    if model.stage_latent_mods.has_active_core_mods() {
+        meta_flags |= SONA_META_CORE_MODS_PRESENT;
     }
 
     a0.crossbar.pipeline_flags = U32::new(PIPE_CANONICAL_V3_SONA);
@@ -297,6 +300,9 @@ pub fn encode_model_to_dnam_bin(
         a0.control_bus_lite.trust_radius_mh = F32::new(2.5);
         a0.control_bus_lite.rho_head_and_ctrl_tail[0] = F32::new(2.5);
     }
+    model
+        .stage_latent_mods
+        .pack_ultra_into_arena3(&mut a3, model.control_bus.is_some());
     for idx in 0..4 {
         let l_q = fp16_to_f32(fp16_clamped(model.opt_to_lr[idx][0], -4.0, 4.0, 0.0).get());
         let r_q = fp16_to_f32(fp16_clamped(model.opt_to_lr[idx][1], -4.0, 4.0, 0.0).get());

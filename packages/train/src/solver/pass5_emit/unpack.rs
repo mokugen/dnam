@@ -14,8 +14,8 @@ use crate::control::cp1::Cp1WireBundle;
 use crate::error::TrainError;
 
 use super::super::model::{
-    CoreQuadF64, InterBlockTileF64, KautzPairF64, SonaModelF64, TierReadoutPrefixF64,
-    TransportQuadF64,
+    CoreQuadF64, InterBlockTileF64, KautzPairF64, SonaModelF64, SonaStageLatentModsF64,
+    TierReadoutPrefixF64, TransportQuadF64,
 };
 use super::pack::readouts::PrefixOverrideWireDecode;
 
@@ -508,6 +508,8 @@ pub fn decode_dnam_bin_to_model(dnam_bin: &[u8]) -> Result<SonaModelF64, TrainEr
         })
         .map_or(0, |idx| idx + 1);
 
+    model.stage_latent_mods = SonaStageLatentModsF64::decode_from_wires(a0, view.arena3);
+
     if !view.control_descriptors.is_empty() {
         model.control_audit = Some(Phase1ClampOutput {
             wire_descriptors: view.control_descriptors.to_vec(),
@@ -537,7 +539,24 @@ pub fn decode_dnam_bin_to_model(dnam_bin: &[u8]) -> Result<SonaModelF64, TrainEr
         || !view.tsyn_entries.is_empty()
         || view.cext.is_some()
         || cb.w_ctrl.iter().flatten().any(|v| v.get() != 0.0)
-        || cb.u_int_base.iter().flatten().any(|v| v.get() != 0.0);
+        || cb.u_int_base.iter().flatten().any(|v| v.get() != 0.0)
+        || cb.lfo_dphi_train.iter().any(|v| v.get() != 0.0)
+        || cb.lfo_skew_fp16.iter().any(|v| v.get() != 0)
+        || cb.ou_to_z_stage_fp16.iter().any(|v| v.get() != 0)
+        || cb.sigma_drift.get() != 0.0
+        || view.arena3.is_some_and(|a3_w| {
+            let a3_cb = &a3_w.control_bus_ultra_delta;
+            a3_cb.w_ctrl_ultra.iter().flatten().any(|v| v.get() != 0.0)
+                || a3_cb
+                    .u_int_ultra
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .any(|v| v.get() != 0.0)
+                || a3_cb.stage_latent_ctrl_ultra_fp16[..164]
+                    .iter()
+                    .any(|v| v.get() != 0)
+        });
     if has_cb {
         model.control_bus = Some(Cp1WireBundle {
             arena0_cb: *cb,
@@ -647,5 +666,97 @@ mod tests {
         let stripped_lite = dnam_vm::bin::strip_dnam_bin_to_tier(&bin1, Tier::Lite).unwrap();
         let dec_lite = decode_dnam_bin_to_model(stripped_lite).unwrap();
         assert!((dec_lite.direct_s2_u_gain[0] - 0.55).abs() < 1.0e-2);
+    }
+
+    #[test]
+    fn test_stage_latent_mods_control_bus_and_cext_zero_ulp_roundtrip() {
+        use dnam_vm::bin::{
+            Arena0ControlBusWire, Arena3ControlBusWire, CextDispatchWire,
+            SONA_META_CORE_MODS_PRESENT,
+        };
+        use zerocopy::byteorder::little_endian::{F32, U16};
+
+        let mut model = SonaModelF64::new(48_000.0);
+        model.tank_dry_mix = 0.75;
+        model.opt_to_lr[0] = [0.25, -0.125];
+        model.stage_latent_mods.default_knobs_fp16 = [
+            f32_to_fp16(0.5),
+            f32_to_fp16(0.25),
+            0,
+            0,
+            0,
+            0,
+            0,
+            f32_to_fp16(0.75),
+        ];
+        model.stage_latent_mods.global_stage_mods[0][0] = 0.5;
+        model.stage_latent_mods.global_stage_mods[3][7] = -1.25;
+        model.stage_latent_mods.block_adaa_scale_lite[2][1] = 1.125;
+        model.stage_latent_mods.block_lru_bias_lite[1][3] = -0.75;
+        model.stage_latent_mods.group_adaa_scale_ultra[6][9] = 0.875;
+        model.stage_latent_mods.group_lru_bias_ultra[7][4] = -1.5;
+        model.stage_latent_mods.ou_to_z_stage_ultra = [0.25, -0.5, 0.75, -1.0];
+        let mut core_mods = Box::new([[0.0_f32; 120]; 8]);
+        core_mods[0][0] = 0.5;
+        core_mods[4][41] = -0.25;
+        core_mods[7][119] = 1.25;
+        model.stage_latent_mods.core_mods_ultra = Some(core_mods);
+
+        let mut a0_cb = Arena0ControlBusWire::new_zeroed();
+        a0_cb.lfo_dphi_train = [F32::new(0.0125), F32::new(0.03125)];
+        a0_cb.sigma_drift = F32::new(0.05);
+        a0_cb.rho_drift_train = F32::new(0.995);
+        a0_cb.lfo_skew_fp16 = [U16::new(f32_to_fp16(0.25)), U16::new(f32_to_fp16(-0.5))];
+        a0_cb.ou_to_z_stage_fp16 = [
+            U16::new(f32_to_fp16(0.125)),
+            U16::new(f32_to_fp16(-0.25)),
+            0.into(),
+            0.into(),
+        ];
+        a0_cb.trust_radius_mh = F32::new(2.5);
+        a0_cb.rho_head_and_ctrl_tail[0] = F32::new(2.5);
+        a0_cb.w_ctrl[0][8] = F32::new(0.375);
+        a0_cb.w_ctrl[13][15] = F32::new(-0.0625);
+
+        let mut a3_cb = Arena3ControlBusWire::new_zeroed();
+        a3_cb.w_ctrl_ultra[2][3] = F32::new(0.1875);
+
+        let mut cext = CextDispatchWire::new_zeroed();
+        cext.w_ctrl_ext[0][4] = F32::new(0.25);
+        cext.w_ctrl_ext[6][10] = F32::new(-0.5);
+
+        model.control_bus = Some(Cp1WireBundle {
+            arena0_cb: a0_cb,
+            arena3_cb: a3_cb,
+            cext: Some(cext),
+            tsyn: Vec::new(),
+            cp1_overflow: Vec::new(),
+            contributor_count: 0,
+            distinct_controls: 0,
+        });
+
+        let bin1 = encode_model_to_dnam_bin(&model, Pass5EmitConfig::default()).unwrap();
+        let view1 = DnamBinView::parse(&bin1).unwrap();
+        assert_ne!(
+            view1.arena0.crossbar.sona_meta_flags.get() & SONA_META_CORE_MODS_PRESENT,
+            0
+        );
+        assert!(view1.cext.is_some());
+
+        let decoded = decode_dnam_bin_to_model(&bin1).unwrap();
+        assert_eq!(decoded.stage_latent_mods, model.stage_latent_mods);
+        let dec_cb = decoded.control_bus.as_ref().expect("control_bus decoded");
+        assert_eq!(dec_cb.arena0_cb.lfo_dphi_train, a0_cb.lfo_dphi_train);
+        assert_eq!(dec_cb.arena0_cb.lfo_skew_fp16, a0_cb.lfo_skew_fp16);
+        assert_eq!(
+            dec_cb.arena0_cb.ou_to_z_stage_fp16,
+            a0_cb.ou_to_z_stage_fp16
+        );
+        assert_eq!(dec_cb.arena0_cb.w_ctrl[0][8].get(), 0.375);
+        assert_eq!(dec_cb.arena3_cb.w_ctrl_ultra[2][3].get(), 0.1875);
+        assert_eq!(dec_cb.cext.unwrap().w_ctrl_ext[6][10].get(), -0.5);
+
+        let bin2 = encode_model_to_dnam_bin(&decoded, Pass5EmitConfig::default()).unwrap();
+        assert_eq!(bin1, bin2);
     }
 }

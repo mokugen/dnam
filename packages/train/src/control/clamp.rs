@@ -1,12 +1,20 @@
 //! Phase-1 (`[CLAMP-RANGE]`, `[CLAMP-SWITCH]`, `[CLAMP-STABILITY]`) and Phase-3
 //! (`[CLAMP-DYNAMIC]`, `[CLAMP-HEAD-GAIN]`, `[NUMERIC-ENVELOPE]`) control-space auditing
-//! (`ref[train.audit.phase1.clamp-range]`, `ref[train.audit.phase3.clamp-head-gain]`, `docs/specs/training/control_space_audit.md`).
+//! (`ref[train.audit.phase1.clamp-range]`, `ref[train.audit.phase3.clamp-dynamic]`,
+//! `ref[train.audit.phase3.clamp-head-gain]`, `docs/specs/training/control_space_audit.md`).
 
+pub mod dynamic;
 mod phase1;
 mod phase3;
 
 use dnam_vm::bin::ControlClampDescriptorWire;
 
+pub use dynamic::{
+    DYNAMIC_ALLPASS_G_MAX, DYNAMIC_DAMP_POLE_MAX, DYNAMIC_G_LOOP_MAX, DYNAMIC_KAUTZ_R_MAX,
+    DynamicCornerAuditReport, DynamicCornerViolation, ExtremeCornerDcReport, ZERO_DC_CORNER_FRAMES,
+    ZERO_DC_CORNER_MAX_ABS, check_corner_dynamic_stability, compute_dynamic_excursion_bounds_32,
+    eval_static_control_bus_targets, verify_extreme_corners_zero_dc_256,
+};
 pub use phase1::audit_phase1_controls;
 pub use phase3::{audit_phase3_dynamic_and_head_gain, evaluate_readout_spectral_magnitudes};
 

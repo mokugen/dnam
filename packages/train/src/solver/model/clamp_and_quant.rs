@@ -263,6 +263,9 @@ pub(super) fn clamp_model_stability_bounds(model: &mut SonaModelF64, crossbar_co
             clamp_prefix_f64(pfx);
         }
     }
+    model.stage_latent_mods.clamp_bounds();
+    model.sense_vca_bias = sanitize_clamp(model.sense_vca_bias, -1.0, 1.0, 0.0);
+    model.op_t_wet_scale = sanitize_clamp(model.op_t_wet_scale, 0.0, 2.0, 1.0);
 }
 
 /// Snaps all non-readout parameters across `CoreQuad`, `InterBlockTile`, `Op-N[Pre]`, `Op-T`,

@@ -58,50 +58,38 @@ pub(super) fn solve_ols_ridge_uplo(
     weights
 }
 
-/// Factors `[N x 31]` target matrix via deterministic deflated symmetric power iteration into
-/// latent coordinates `Z[N x R]` (bounded to `0.4 * trust_radius_mh`) and dispatch weights `W[31 x R]`.
-pub(super) fn factor_dispatch_subspace<const R: usize>(
-    targets: &[Vec<f64>],
-    trust_radius_mh: f32,
-) -> (Vec<[f64; R]>, [[f64; R]; ACTIVE_DISPATCH_SLOTS]) {
-    let n_obs = targets.len();
-    let mut gram = [[0.0_f64; ACTIVE_DISPATCH_SLOTS]; ACTIVE_DISPATCH_SLOTS];
-    for row in targets {
-        for j in 0..ACTIVE_DISPATCH_SLOTS {
-            let rj = row[j];
-            if rj == 0.0 {
-                continue;
-            }
-            for i in 0..=j {
-                let prod = row[i] * rj;
-                gram[i][j] += prod;
-                if i != j {
-                    gram[j][i] += prod;
-                }
-            }
-        }
-    }
+const BASE_DISPATCH_SLOTS: usize = 16;
+const EXT_DISPATCH_SLOTS: usize = ACTIVE_DISPATCH_SLOTS - BASE_DISPATCH_SLOTS;
 
-    let mut work_gram = gram;
-    let mut basis = [[0.0_f64; ACTIVE_DISPATCH_SLOTS]; R];
-    for k in 0..R {
+const _: () = assert!(EXT_DISPATCH_SLOTS == 15);
+
+/// Extracts up to `max_rank` orthonormal eigenvectors from symmetric PSD `gram` (`m x m`) via
+/// deterministic deflated symmetric power iteration.
+fn extract_top_gram_eigenvectors(gram: &[Vec<f64>], max_rank: usize) -> Vec<Vec<f64>> {
+    let m = gram.len();
+    if m == 0 || max_rank == 0 {
+        return Vec::new();
+    }
+    let mut work_gram = gram.to_vec();
+    let mut basis: Vec<Vec<f64>> = Vec::with_capacity(max_rank.min(m));
+    for k in 0..max_rank.min(m) {
         let mut best_col = 0_usize;
         let mut best_diag = 0.0_f64;
-        for c in 0..ACTIVE_DISPATCH_SLOTS {
-            if work_gram[c][c] > best_diag {
-                best_diag = work_gram[c][c];
+        for (c, row) in work_gram.iter().enumerate() {
+            if row[c] > best_diag {
+                best_diag = row[c];
                 best_col = c;
             }
         }
         if best_diag <= 1.0e-18 {
             break;
         }
-        let mut v = work_gram[best_col];
-        for _iter in 0..20 {
-            let mut next = [0.0_f64; ACTIVE_DISPATCH_SLOTS];
-            for r in 0..ACTIVE_DISPATCH_SLOTS {
+        let mut v = work_gram[best_col].clone();
+        for _iter in 0..48 {
+            let mut next = vec![0.0_f64; m];
+            for r in 0..m {
                 let mut acc = 0.0_f64;
-                for c in 0..ACTIVE_DISPATCH_SLOTS {
+                for c in 0..m {
                     acc += work_gram[r][c] * v[c];
                 }
                 next[r] = acc;
@@ -114,11 +102,17 @@ pub(super) fn factor_dispatch_subspace<const R: usize>(
             }
             let norm = next.iter().map(|x| x * x).sum::<f64>().sqrt();
             if norm <= 1.0e-15 {
-                v = [0.0; ACTIVE_DISPATCH_SLOTS];
+                v.fill(0.0);
                 break;
             }
+            let mut max_diff = 0.0_f64;
             for (dst, val) in v.iter_mut().zip(next) {
-                *dst = val / norm;
+                let unit = val / norm;
+                max_diff = max_diff.max((*dst - unit).abs());
+                *dst = unit;
+            }
+            if max_diff <= 1.0e-13 {
+                break;
             }
         }
         let v_norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
@@ -128,29 +122,62 @@ pub(super) fn factor_dispatch_subspace<const R: usize>(
         for dst in &mut v {
             *dst /= v_norm;
         }
-        basis[k] = v;
 
-        let mut cv = [0.0_f64; ACTIVE_DISPATCH_SLOTS];
-        for r in 0..ACTIVE_DISPATCH_SLOTS {
+        let mut cv = vec![0.0_f64; m];
+        for r in 0..m {
             cv[r] = work_gram[r].iter().zip(&v).map(|(g, x)| g * x).sum();
         }
         let lambda: f64 = v.iter().zip(&cv).map(|(a, b)| a * b).sum();
-        for r in 0..ACTIVE_DISPATCH_SLOTS {
-            for c in 0..ACTIVE_DISPATCH_SLOTS {
+        for r in 0..m {
+            for c in 0..m {
                 work_gram[r][c] -= lambda * v[r] * v[c];
             }
         }
+        basis.push(v);
     }
+    basis
+}
+
+#[inline]
+fn accum_symmetric_gram(rows: &[Vec<f64>], col_offset: usize, ncols: usize) -> Vec<Vec<f64>> {
+    let mut gram = vec![vec![0.0_f64; ncols]; ncols];
+    for row in rows {
+        for j in 0..ncols {
+            let rj = row[col_offset + j];
+            if rj == 0.0 {
+                continue;
+            }
+            for i in 0..=j {
+                let prod = row[col_offset + i] * rj;
+                gram[i][j] += prod;
+                if i != j {
+                    gram[j][i] += prod;
+                }
+            }
+        }
+    }
+    gram
+}
+
+/// Factors `[N x 31]` target matrix via deterministic deflated symmetric power iteration into
+/// latent coordinates `Z[N x R]` (bounded to `0.4 * trust_radius_mh`) and dispatch weights `W[31 x R]`.
+pub(super) fn factor_dispatch_subspace<const R: usize>(
+    targets: &[Vec<f64>],
+    trust_radius_mh: f32,
+) -> (Vec<[f64; R]>, [[f64; R]; ACTIVE_DISPATCH_SLOTS]) {
+    let n_obs = targets.len();
+    let gram = accum_symmetric_gram(targets, 0, ACTIVE_DISPATCH_SLOTS);
+    let basis = extract_top_gram_eigenvectors(&gram, R);
 
     let z_cap = 0.4 * f64::from(trust_radius_mh).max(0.25);
     let mut z_latents = vec![[0.0_f64; R]; n_obs];
     let mut w_disp = [[0.0_f64; R]; ACTIVE_DISPATCH_SLOTS];
-    for k in 0..R {
+    for (k, eigvec) in basis.iter().enumerate() {
         let mut max_abs = 0.0_f64;
         for (i, row) in targets.iter().enumerate() {
             let dot: f64 = row[..ACTIVE_DISPATCH_SLOTS]
                 .iter()
-                .zip(&basis[k])
+                .zip(eigvec)
                 .map(|(a, b)| a * b)
                 .sum();
             z_latents[i][k] = dot;
@@ -165,9 +192,107 @@ pub(super) fn factor_dispatch_subspace<const R: usize>(
             z_row[k] /= scale;
         }
         for s_idx in 0..ACTIVE_DISPATCH_SLOTS {
-            w_disp[s_idx][k] = basis[k][s_idx] * scale;
+            w_disp[s_idx][k] = eigvec[s_idx] * scale;
         }
     }
+    (z_latents, w_disp)
+}
+
+/// Factors `[N x 31]` targets preserving `0-ULP` `SO(4)` buyer-watermark gauge invariance:
+/// columns `0..4` (`z_head`) hold strictly zero weights on extended slots `16..31` (`w_disp[16..31][0..4] == 0.0`),
+/// while unrotated `ctrl_basis_4` columns `4..8` carry up to `4` `"CEXT"` subspace directions plus any
+/// remaining base-slot directions (`ref[dsp.ctrl.dispatch.matrix]`, `ref[sec.watermark.orthogonal-gauge]`).
+pub(super) fn factor_gauge_invariant_dispatch_subspace(
+    targets: &[Vec<f64>],
+    trust_radius_mh: f32,
+) -> (
+    Vec<[f64; RANK_STATIC_LATENT]>,
+    [[f64; RANK_STATIC_LATENT]; ACTIVE_DISPATCH_SLOTS],
+) {
+    let n_obs = targets.len();
+    let z_cap = 0.4 * f64::from(trust_radius_mh).max(0.25);
+    let mut z_latents = vec![[0.0_f64; RANK_STATIC_LATENT]; n_obs];
+    let mut w_disp = [[0.0_f64; RANK_STATIC_LATENT]; ACTIVE_DISPATCH_SLOTS];
+    if n_obs == 0 {
+        return (z_latents, w_disp);
+    }
+
+    let g_ext = accum_symmetric_gram(targets, BASE_DISPATCH_SLOTS, EXT_DISPATCH_SLOTS);
+    let ext_basis = extract_top_gram_eigenvectors(&g_ext, 4);
+    let r_ext = ext_basis.len().min(4);
+
+    let mut rem_base: Vec<Vec<f64>> = targets
+        .iter()
+        .map(|row| row[..BASE_DISPATCH_SLOTS].to_vec())
+        .collect();
+
+    for (k, eigvec) in ext_basis.iter().take(r_ext).enumerate() {
+        let col = 4 + k;
+        let mut max_abs = 0.0_f64;
+        for (i, row) in targets.iter().enumerate() {
+            let dot: f64 = row[BASE_DISPATCH_SLOTS..ACTIVE_DISPATCH_SLOTS]
+                .iter()
+                .zip(eigvec)
+                .map(|(a, b)| a * b)
+                .sum();
+            z_latents[i][col] = dot;
+            max_abs = max_abs.max(dot.abs());
+        }
+        let scale = if max_abs > 1.0e-12 {
+            max_abs / z_cap
+        } else {
+            1.0
+        };
+        let mut z_norm_sq = 0.0_f64;
+        for z_row in &mut z_latents {
+            z_row[col] /= scale;
+            z_norm_sq += z_row[col] * z_row[col];
+        }
+        for j in 0..EXT_DISPATCH_SLOTS {
+            w_disp[BASE_DISPATCH_SLOTS + j][col] = eigvec[j] * scale;
+        }
+        if z_norm_sq > 1.0e-18 {
+            for r in 0..BASE_DISPATCH_SLOTS {
+                let mut dot_r = 0.0_f64;
+                for i in 0..n_obs {
+                    dot_r += rem_base[i][r] * z_latents[i][col];
+                }
+                let alpha = dot_r / z_norm_sq;
+                w_disp[r][col] = alpha;
+                for i in 0..n_obs {
+                    rem_base[i][r] -= alpha * z_latents[i][col];
+                }
+            }
+        }
+    }
+
+    let rem_rank = RANK_STATIC_LATENT.saturating_sub(r_ext);
+    let g_base = accum_symmetric_gram(&rem_base, 0, BASE_DISPATCH_SLOTS);
+    let base_basis = extract_top_gram_eigenvectors(&g_base, rem_rank);
+    for (idx, eigvec) in base_basis.iter().enumerate() {
+        let col = if idx < 4 { idx } else { 4 + r_ext + (idx - 4) };
+        if col >= RANK_STATIC_LATENT {
+            continue;
+        }
+        let mut max_abs = 0.0_f64;
+        for (i, row) in rem_base.iter().enumerate() {
+            let dot: f64 = row.iter().zip(eigvec).map(|(a, b)| a * b).sum();
+            z_latents[i][col] = dot;
+            max_abs = max_abs.max(dot.abs());
+        }
+        let scale = if max_abs > 1.0e-12 {
+            max_abs / z_cap
+        } else {
+            1.0
+        };
+        for z_row in &mut z_latents {
+            z_row[col] /= scale;
+        }
+        for r in 0..BASE_DISPATCH_SLOTS {
+            w_disp[r][col] = eigvec[r] * scale;
+        }
+    }
+
     (z_latents, w_disp)
 }
 
@@ -423,5 +548,68 @@ pub(super) fn fit_fm_als_u_and_v(
             }
         }
         (init_fm, init_u)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gauge_invariant_dispatch_subspace_keeps_cext_cols04_zero_and_full_rank() {
+        // Case 1: Independent rank-4 CEXT (16..31) + rank-4 base (0..16) -> zero reconstruction error.
+        let mut t_joint = Vec::new();
+        for i in 0..24 {
+            let mut row = vec![0.0_f64; ACTIVE_DISPATCH_SLOTS];
+            for k in 0..4 {
+                let a = (((i * (k + 1)) % 9) as f64 - 4.0) * 0.25;
+                let b = (((i * (k + 5)) % 7) as f64 - 3.0) * 0.2;
+                row[k] = a + 0.5 * b;
+                row[4 + k] = -0.3 * a;
+                row[16 + k] = b;
+                row[20 + k] = 0.4 * b;
+            }
+            t_joint.push(row);
+        }
+        let (z, w) = factor_gauge_invariant_dispatch_subspace(&t_joint, 2.5);
+        for row in &w[16..] {
+            assert_eq!(&row[..4], &[0.0; 4]);
+        }
+        for (i, row) in t_joint.iter().enumerate() {
+            for r in 0..ACTIVE_DISPATCH_SLOTS {
+                let pred: f64 = (0..RANK_STATIC_LATENT).map(|c| z[i][c] * w[r][c]).sum();
+                assert!(
+                    (pred - row[r]).abs() < 1.0e-8,
+                    "i={i} r={r}: {pred} vs {}",
+                    row[r]
+                );
+            }
+        }
+
+        // Case 2: Zero CEXT -> base uses all 8 columns (0 rank loss).
+        let mut t_base_only = Vec::new();
+        for i in 0..24 {
+            let mut row = vec![0.0_f64; ACTIVE_DISPATCH_SLOTS];
+            for k in 0..8 {
+                let f = ((i as f64 + 1.0) * (k as f64 + 1.0) * 0.37).sin();
+                row[k] = f;
+                row[8 + k] = 0.5 * f;
+            }
+            t_base_only.push(row);
+        }
+        let (zb, wb) = factor_gauge_invariant_dispatch_subspace(&t_base_only, 2.5);
+        for row in &wb[16..] {
+            assert_eq!(*row, [0.0; RANK_STATIC_LATENT]);
+        }
+        for (i, row) in t_base_only.iter().enumerate() {
+            for r in 0..16 {
+                let pred: f64 = (0..RANK_STATIC_LATENT).map(|c| zb[i][c] * wb[r][c]).sum();
+                assert!(
+                    (pred - row[r]).abs() < 1.0e-8,
+                    "rank-8 base i={i} r={r}: {pred} vs {}",
+                    row[r]
+                );
+            }
+        }
     }
 }

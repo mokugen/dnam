@@ -6,7 +6,7 @@
 pub mod adjoints;
 mod causal_loop;
 pub(crate) mod crossbar;
-mod eval;
+pub(crate) mod eval;
 mod hybrid;
 mod matryoshka;
 pub(crate) mod op_n_pre;
@@ -22,6 +22,7 @@ pub use adjoints::{
     eval_kautz_modal_and_adjoint, eval_kautz_modal_channel_and_adjoint,
     eval_op_t_transport_and_adjoint,
 };
+pub(crate) use causal_loop::is_op_t_crossbar_coupled;
 pub use op_n_pre::{OpNPreGrads, eval_op_n_pre_and_adjoint};
 pub use op_t_quad::{OpTQuadAdjointGrads, OpTQuadAdjointSlices, eval_op_t_quad_stereo_and_adjoint};
 pub use prescreen::generate_generic_sobol_seeds;

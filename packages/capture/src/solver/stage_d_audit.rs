@@ -245,17 +245,39 @@ fn eval_tiers_via_vm(
     Ok(())
 }
 
-/// Finalizes Stage D (`3-Phase Audit`, `LUFS` trim calibration on Path 2, transport delay history
-/// synchronization, and `[STAB-ZERO-DC]` verification) (`ref[train.pipeline.host-parity-and-export]`).
-pub fn finalize_stage_d_and_audit(
+/// Input slices and options for [`finalize_stage_d_and_audit_with_panama_rows`].
+#[derive(Clone, Copy, Debug)]
+pub struct StageDFinalizeInputs<'a> {
+    /// Aligned dry reference frames `[L, R]`.
+    pub dry_lr: &'a [[f32; 2]],
+    /// Optional aligned `StarCenter` target wet frames `[L, R]` (required for `Path 2` trims).
+    pub star_wet_lr: Option<&'a [[f32; 2]]>,
+    /// Fallback per-tier `bESR` values when no audio evaluation window is supplied.
+    pub fallback_esr: Option<[f32; 4]>,
+    /// Prior Stage A/B/C cumulative solver wall time in milliseconds.
+    pub prior_solve_ms: f32,
+    /// Stage D audit mode (`PATH2_FULL` vs `PATH1_HEAD_ONLY`).
+    pub audit_opts: StageDAuditOptions,
+    /// Pass-4 solved stationary & synchronous `MODE_A_SWEEP` sample rows for `PANAMA`.
+    pub panama_sample_rows: &'a [dnam_train::PanamaSampleRow],
+}
+
+/// Finalizes Stage D (`3-Phase Audit`, `LUFS` trim calibration on Path 2, closed-form
+/// `[CLAMP-DYNAMIC]` + 256-frame extreme-corner `[STAB-ZERO-DC]` certification, `< 10 ms` `PANAMA`
+/// corner recommendations, transport delay history synchronization, and zero-DC check)
+/// (`ref[train.pipeline.host-parity-and-export]`, `ref[train.audit.report.prescription]`).
+pub fn finalize_stage_d_and_audit_with_panama_rows(
     manifest: &mut DnamProjManifest,
     dnam_bin: &mut Vec<u8>,
-    dry_lr: &[[f32; 2]],
-    star_wet_lr: Option<&[[f32; 2]]>,
-    fallback_esr: Option<[f32; 4]>,
-    prior_solve_ms: f32,
-    audit_opts: StageDAuditOptions,
+    inputs: StageDFinalizeInputs<'_>,
 ) -> Result<StageDSolveOutput, DnamError> {
+    let dry_lr = inputs.dry_lr;
+    let star_wet_lr = inputs.star_wet_lr;
+    let fallback_esr = inputs.fallback_esr;
+    let prior_solve_ms = inputs.prior_solve_ms;
+    let audit_opts = inputs.audit_opts;
+    let panama_sample_rows = inputs.panama_sample_rows;
+
     let view_pre = DnamBinView::parse(dnam_bin).map_err(|_| DnamError::BufferTooSmall {
         expected: 128,
         actual: dnam_bin.len(),
@@ -374,6 +396,12 @@ pub fn finalize_stage_d_and_audit(
         }
     }
 
+    crate::audit::audit_dynamic_corners_and_zero_dc(
+        manifest,
+        dnam_bin,
+        audit_opts.full_backbone_audit,
+    )?;
+    let _ = crate::audit::append_panama_prescriptions(manifest, dnam_bin, panama_sample_rows)?;
     sync_manifest_transport_delay_history(&mut manifest.base, dnam_bin);
     verify_dnam_bin_zero_dc(dnam_bin)?;
 
@@ -390,6 +418,31 @@ pub fn finalize_stage_d_and_audit(
         tier_esr_db,
         tier_lufs,
     })
+}
+
+/// Finalizes Stage D (`3-Phase Audit`, `LUFS` trim calibration on Path 2, transport delay history
+/// synchronization, and `[STAB-ZERO-DC]` verification) (`ref[train.pipeline.host-parity-and-export]`).
+pub fn finalize_stage_d_and_audit(
+    manifest: &mut DnamProjManifest,
+    dnam_bin: &mut Vec<u8>,
+    dry_lr: &[[f32; 2]],
+    star_wet_lr: Option<&[[f32; 2]]>,
+    fallback_esr: Option<[f32; 4]>,
+    prior_solve_ms: f32,
+    audit_opts: StageDAuditOptions,
+) -> Result<StageDSolveOutput, DnamError> {
+    finalize_stage_d_and_audit_with_panama_rows(
+        manifest,
+        dnam_bin,
+        StageDFinalizeInputs {
+            dry_lr,
+            star_wet_lr,
+            fallback_esr,
+            prior_solve_ms,
+            audit_opts,
+            panama_sample_rows: &[],
+        },
+    )
 }
 
 #[cfg(test)]

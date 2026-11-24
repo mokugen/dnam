@@ -257,7 +257,6 @@ fn run_oracle_02_for_p(num_controls: usize) {
 }
 
 #[test]
-#[ignore = "deferred to M23 (differentiable 31-slot Stage C replacing CPU FD point_gn)"]
 fn test_oracle_02_cp1_arbitrary_p6_and_p16_asymmetric_switches_and_hadamard_fm() {
     // verify[train.pipeline.control-projection-fit]
     // verify[train.pipeline.dispatch-solve]

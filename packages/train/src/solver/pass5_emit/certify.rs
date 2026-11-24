@@ -21,11 +21,14 @@ use super::super::model::{InterBlockTileF64, SonaModelF64, TierReadoutPrefixF64}
 /// Maximum inter-tier integrated loudness drift (`0.05 LU`, `REQ-5.4`).
 pub const MAX_INTER_TIER_LU_DRIFT: f64 = 0.05;
 
+pub(super) type StereoRender = (Vec<f64>, Vec<f64>);
+
 pub(super) struct TierRenderBundle {
     pub stripped: [Vec<u8>; 4],
-    pub renders: [(Vec<f64>, Vec<f64>); 4],
+    pub renders: [StereoRender; 4],
 }
 
+#[derive(Clone)]
 pub(super) struct StereoCertBundle {
     pub tier_lufs: [f64; 4],
     pub tier_reports: [TierCertificationReport; 4],
@@ -85,6 +88,28 @@ pub fn compute_itu_bs1770_lufs(sig_l: &[f64], sig_r: &[f64], sr_hz: f64, warmup:
     (-0.691 + 10.0 * mean_pow.log10()).max(-120.0)
 }
 
+/// Renders one stripped tier (`Lite..Ultra`) through `SonaVm` and returns `(stripped_bin, (out_l, out_r))`.
+pub(super) fn render_single_tier(
+    dnam_bin: &[u8],
+    tier: Tier,
+    in_l32: &[f32],
+    in_r32: &[f32],
+    sr_hz: f32,
+) -> Result<(Vec<u8>, StereoRender), TrainError> {
+    let n = in_l32.len().min(in_r32.len());
+    let slice = strip_dnam_bin_to_tier(dnam_bin, tier)?;
+    let mut vm = SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(slice, tier, sr_hz)?;
+    let (mut ol, mut or) = (vec![0.0_f32; n], vec![0.0_f32; n]);
+    vm.process_block(&in_l32[..n], &in_r32[..n], &mut ol, &mut or)?;
+    Ok((
+        slice.to_vec(),
+        (
+            ol.into_iter().map(f64::from).collect(),
+            or.into_iter().map(f64::from).collect(),
+        ),
+    ))
+}
+
 pub(super) fn render_all_tiers(
     dnam_bin: &[u8],
     in_l: &[f64],
@@ -99,15 +124,9 @@ pub(super) fn render_all_tiers(
     let mut renders: [(Vec<f64>, Vec<f64>); 4] = Default::default();
 
     for (i, &tier) in tiers.iter().enumerate() {
-        let slice = strip_dnam_bin_to_tier(dnam_bin, tier)?;
-        stripped[i] = slice.to_vec();
-        let mut vm = SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(slice, tier, sr_hz)?;
-        let (mut ol, mut or) = (vec![0.0_f32; n], vec![0.0_f32; n]);
-        vm.process_block(&in_l32, &in_r32, &mut ol, &mut or)?;
-        renders[i] = (
-            ol.into_iter().map(f64::from).collect(),
-            or.into_iter().map(f64::from).collect(),
-        );
+        let (slice, render) = render_single_tier(dnam_bin, tier, &in_l32, &in_r32, sr_hz)?;
+        stripped[i] = slice;
+        renders[i] = render;
     }
     Ok(TierRenderBundle { stripped, renders })
 }
@@ -307,6 +326,46 @@ fn worst_stereo_report(
     }
 }
 
+pub(super) fn certify_single_tier_stereo(
+    tier: Tier,
+    render: &(Vec<f64>, Vec<f64>),
+    target_l: &[f64],
+    target_r: &[f64],
+    sr_hz: f64,
+    warmup: usize,
+) -> Result<
+    (
+        f64,
+        TierCertificationReport,
+        TierCertificationReport,
+        TierCertificationReport,
+    ),
+    TrainError,
+> {
+    let n = target_l.len().min(target_r.len());
+    let lufs = compute_itu_bs1770_lufs(&render.0, &render.1, sr_hz, warmup);
+    let rep_l = certify_tier_audio(tier, &render.0, &target_l[..n], None, sr_hz, warmup)?;
+    let rep_r = if render.0 == render.1 && target_l[..n] == target_r[..n] {
+        rep_l
+    } else {
+        certify_tier_audio(tier, &render.1, &target_r[..n], None, sr_hz, warmup)?
+    };
+    Ok((lufs, worst_stereo_report(rep_l, rep_r), rep_l, rep_r))
+}
+
+#[must_use]
+pub(super) fn recompute_pair_monotone(
+    rep_l: &[TierCertificationReport; 4],
+    rep_r: &[TierCertificationReport; 4],
+) -> [bool; 4] {
+    let mut pair_monotone = [true; 4];
+    for i in 1..4 {
+        pair_monotone[i] = is_tier_pair_monotone(&rep_l[i - 1], &rep_l[i])
+            && is_tier_pair_monotone(&rep_r[i - 1], &rep_r[i]);
+    }
+    pair_monotone
+}
+
 pub(super) fn certify_all_tier_renders_stereo(
     renders: &[(Vec<f64>, Vec<f64>); 4],
     target_l: &[f64],
@@ -314,42 +373,22 @@ pub(super) fn certify_all_tier_renders_stereo(
     sr_hz: f64,
     warmup: usize,
 ) -> Result<StereoCertBundle, TrainError> {
-    let n = target_l.len().min(target_r.len());
     let mut tier_lufs = [0.0_f64; 4];
+    let mut combined = Vec::with_capacity(4);
     let mut rep_l_vec = Vec::with_capacity(4);
     let mut rep_r_vec = Vec::with_capacity(4);
     for (i, tier) in [Tier::Lite, Tier::Full, Tier::Pro, Tier::Ultra]
         .into_iter()
         .enumerate()
     {
-        tier_lufs[i] = compute_itu_bs1770_lufs(&renders[i].0, &renders[i].1, sr_hz, warmup);
-        rep_l_vec.push(certify_tier_audio(
-            tier,
-            &renders[i].0,
-            &target_l[..n],
-            None,
-            sr_hz,
-            warmup,
-        )?);
-        rep_r_vec.push(certify_tier_audio(
-            tier,
-            &renders[i].1,
-            &target_r[..n],
-            None,
-            sr_hz,
-            warmup,
-        )?);
+        let (lufs, worst, rep_l, rep_r) =
+            certify_single_tier_stereo(tier, &renders[i], target_l, target_r, sr_hz, warmup)?;
+        tier_lufs[i] = lufs;
+        combined.push(worst);
+        rep_l_vec.push(rep_l);
+        rep_r_vec.push(rep_r);
     }
 
-    let mut pair_monotone = [true; 4];
-    let mut combined = Vec::with_capacity(4);
-    for i in 0..4 {
-        combined.push(worst_stereo_report(rep_l_vec[i], rep_r_vec[i]));
-        if i >= 1 {
-            pair_monotone[i] = is_tier_pair_monotone(&rep_l_vec[i - 1], &rep_l_vec[i])
-                && is_tier_pair_monotone(&rep_r_vec[i - 1], &rep_r_vec[i]);
-        }
-    }
     let tier_reports: [TierCertificationReport; 4] =
         combined
             .try_into()
@@ -374,6 +413,7 @@ pub(super) fn certify_all_tier_renders_stereo(
                 expected: 4,
                 actual: 0,
             })?;
+    let pair_monotone = recompute_pair_monotone(&rep_l, &rep_r);
     Ok(StereoCertBundle {
         tier_lufs,
         tier_reports,

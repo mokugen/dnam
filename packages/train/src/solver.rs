@@ -12,7 +12,7 @@ pub mod progress;
 pub use model::{
     CoreQuadF64, InterBlockTileF64, KautzPairF64, NUM_CORE_QUADS_ULTRA, NUM_FIR_TAPS_ULTRA,
     NUM_INTER_BLOCK_TILES_ULTRA, NUM_KAUTZ_PAIRS_ULTRA, NUM_TRANSPORT_QUADS_ULTRA, SonaModelF64,
-    StereoTrainingPairs, TierReadoutPrefixF64, TransportQuadF64,
+    SonaStageLatentModsF64, StereoTrainingPairs, TierReadoutPrefixF64, TransportQuadF64,
 };
 pub use pass1_probe::{
     OpPProbeSummary, Pass1PhysicsHint, Pass1ProbeConfig, Pass1ProbeReport, Pass1ProbeResult,
@@ -41,15 +41,17 @@ use dnam_vm::control::STAGE_TARGET_SLOTS;
 use dnam_vm::math::DefaultMathBackend;
 use dnam_vm::{SonaVm, Tier};
 
+use crate::control::adjoint::{
+    StageTargetSolveConfig, StageTargetSolveInput, solve_point_stage_targets_adjoint,
+};
 use crate::control::clamp::{
     ControlSpec, Phase1ClampOutput, StageStabilityConstraint, audit_phase1_controls,
 };
 use crate::control::cp1::{
     Cp1ControlSample, Cp1FitConfig, Cp1WireBundle, fit_and_pack_cp1_audited,
 };
-use crate::control::wiener::{
-    FourBandTptBank, solve_control_jacobian_32slot, solve_two_pass_four_band_wiener,
-};
+use crate::control::stability::StageTargetBounds;
+use crate::control::wiener::{FourBandTptBank, solve_two_pass_four_band_wiener};
 use crate::error::TrainError;
 use crate::losses::Welch33TargetCache;
 use crate::runner::TrainRunner;
@@ -244,6 +246,7 @@ pub fn solve_sona_model_with_pass1(
 
     let control_bus = if let Some(ref p1) = phase1_audit {
         let wiener_samps = synthesize_wiener_control_samples(
+            runner,
             &model,
             &dataset.control_audio_stems,
             warmup,
@@ -367,48 +370,46 @@ pub fn solve_sona_model_with_pass1(
     })
 }
 
-const PASS4_ACTIVE_SLOTS: [usize; 11] = [0, 1, 2, 6, 10, 11, 13, 15, 22, 26, 30];
+const PASS4_ACTIVE_SLOTS: [usize; STAGE_TARGET_SLOTS - 1] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30,
+];
 
-struct Pass4StemProbeCtx<'a> {
-    dnam_bin: &'a [u8],
-    sample_rate_hz: f64,
-}
+type StarVmRenderChannels = (Vec<f64>, Vec<f64>, Vec<f64>);
 
-fn render_star_with_stage_targets(
-    ctx: &Pass4StemProbeCtx<'_>,
-    tier: Tier,
+fn render_star_with_persistent_vm(
+    vm: &mut SonaVm<'_, DefaultMathBackend>,
     in_l: &[f64],
     in_r: &[f64],
     st32: &[f64; STAGE_TARGET_SLOTS],
-) -> Result<Vec<f64>, TrainError> {
-    let sliced = dnam_vm::bin::strip_dnam_bin_to_tier(ctx.dnam_bin, tier)?;
-    let mut vm =
-        SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(sliced, tier, ctx.sample_rate_hz as f32)?;
+) -> Result<StarVmRenderChannels, TrainError> {
     let mut st32_f32 = [0.0_f32; STAGE_TARGET_SLOTS];
-    for (dst, &src) in st32_f32.iter_mut().zip(st32) {
+    for (dst, &src) in st32_f32[..STAGE_TARGET_SLOTS - 1]
+        .iter_mut()
+        .zip(&st32[..STAGE_TARGET_SLOTS - 1])
+    {
         *dst = if src.is_finite() { src as f32 } else { 0.0 };
     }
-    {
-        let cold = vm.slab_mut().cold_mut();
-        cold.ctrl_bus = None;
-        cold.latched_stage_params = st32_f32;
-    }
-    vm.step_control_tick_3khz();
+    vm.reset_with_latched_stage_targets(&st32_f32, &[0.0; 8]);
 
     let n = in_l.len().min(in_r.len());
     let in_l32: Vec<f32> = in_l[..n].iter().map(|&v| v as f32).collect();
     let in_r32: Vec<f32> = in_r[..n].iter().map(|&v| v as f32).collect();
-    let mut out_l = vec![0.0_f32; n];
-    let mut out_r = vec![0.0_f32; n];
-    vm.process_block(&in_l32, &in_r32, &mut out_l, &mut out_r)?;
-    Ok(out_l
-        .into_iter()
-        .zip(out_r)
-        .map(|(l, r)| 0.5 * (f64::from(l) + f64::from(r)))
-        .collect())
+    let mut out_l32 = vec![0.0_f32; n];
+    let mut out_r32 = vec![0.0_f32; n];
+    vm.process_block(&in_l32, &in_r32, &mut out_l32, &mut out_r32)?;
+    let out_l: Vec<f64> = out_l32.into_iter().map(f64::from).collect();
+    let out_r: Vec<f64> = out_r32.into_iter().map(f64::from).collect();
+    let mono: Vec<f64> = out_l
+        .iter()
+        .zip(&out_r)
+        .map(|(&l, &r)| 0.5 * (l + r))
+        .collect();
+    Ok((mono, out_l, out_r))
 }
 
 fn synthesize_wiener_control_samples(
+    runner: &TrainRunner,
     model: &SonaModelF64,
     stems: &[ControlAudioStem],
     warmup: usize,
@@ -418,11 +419,38 @@ fn synthesize_wiener_control_samples(
         return Ok(Vec::new());
     }
     let star_bin = encode_model_to_dnam_bin(model, pass5_cfg)?;
-    let ctx = Pass4StemProbeCtx {
-        dnam_bin: &star_bin,
-        sample_rate_hz: model.sample_rate_hz,
-    };
+    let sliced_u = dnam_vm::bin::strip_dnam_bin_to_tier(&star_bin, Tier::Ultra)?;
+    let sliced_l = dnam_vm::bin::strip_dnam_bin_to_tier(&star_bin, Tier::Lite)?;
+    let mut vm_u = SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(
+        sliced_u,
+        Tier::Ultra,
+        model.sample_rate_hz as f32,
+    )?;
+    let mut vm_l = SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(
+        sliced_l,
+        Tier::Lite,
+        model.sample_rate_hz as f32,
+    )?;
+
     let bank = FourBandTptBank::new(model.sample_rate_hz);
+    let min_tau =
+        model.transport_quads[0]
+            .delay_samples
+            .iter()
+            .copied()
+            .fold(
+                48_000.0_f64,
+                |a, v| if v.is_finite() { a.min(v) } else { a },
+            );
+    let coupled = pass2_opt::is_op_t_crossbar_coupled(model, 10);
+    let bounds = StageTargetBounds::canonical(coupled, min_tau);
+    let solve_cfg = StageTargetSolveConfig {
+        active_slots: PASS4_ACTIVE_SLOTS.to_vec(),
+        tier: Tier::Ultra,
+        warmup_frames: warmup,
+        vm_micro_polish_iters: 1,
+        ..StageTargetSolveConfig::default()
+    };
     let zero_st = [0.0_f64; STAGE_TARGET_SLOTS];
     let mut out = Vec::with_capacity(stems.len());
 
@@ -445,44 +473,64 @@ fn synthesize_wiener_control_samples(
             .collect();
         let in_l = &stem.input_l[..m];
         let in_r = &stem.input_r[..m];
-        let y_star_u = render_star_with_stage_targets(&ctx, Tier::Ultra, in_l, in_r, &zero_st)?;
-        let y_star_l = render_star_with_stage_targets(&ctx, Tier::Lite, in_l, in_r, &zero_st)?;
+        let (y_star_u, _, _) = render_star_with_persistent_vm(&mut vm_u, in_l, in_r, &zero_st)?;
+        let (y_star_l, _, _) = render_star_with_persistent_vm(&mut vm_l, in_l, in_r, &zero_st)?;
 
-        let st_pass1 = solve_control_jacobian_32slot(
-            &tgt_m,
-            &zero_st,
-            &PASS4_ACTIVE_SLOTS,
-            1.0e-2,
-            1.0e-2,
-            |st| render_star_with_stage_targets(&ctx, Tier::Ultra, in_l, in_r, st),
+        let rep1 = solve_point_stage_targets_adjoint(
+            &StageTargetSolveInput {
+                runner,
+                base: model,
+                in_l,
+                in_r,
+                target_l: &stem.target_l[..m],
+                target_r: &stem.target_r[..m],
+                init_targets: &zero_st,
+                z_stage: &[0.0; 8],
+                bounds: &bounds,
+            },
+            &solve_cfg,
+            Some(&mut vm_u),
         )?;
-        let y_mdl_u = render_star_with_stage_targets(&ctx, Tier::Ultra, in_l, in_r, &st_pass1)?;
-        let y_mdl_l = render_star_with_stage_targets(&ctx, Tier::Lite, in_l, in_r, &st_pass1)?;
+        let st_pass1 = rep1.stage_targets;
+        let (y_mdl_u, y_mdl_ul, y_mdl_ur) =
+            render_star_with_persistent_vm(&mut vm_u, in_l, in_r, &st_pass1)?;
+        let (y_mdl_l, _, _) = render_star_with_persistent_vm(&mut vm_l, in_l, in_r, &st_pass1)?;
 
         let wr = solve_two_pass_four_band_wiener(
             &bank, &tgt_m, &y_star_u, &y_star_l, &y_mdl_u, &y_mdl_l, warmup,
         )?;
         let mut st_final = st_pass1;
         if wr.pass2_triggered {
-            let bands = bank.split_4bands(&y_mdl_u);
-            let mut tgt_w = vec![0.0_f64; m];
+            let bands_l = bank.split_4bands(&y_mdl_ul);
+            let bands_r = bank.split_4bands(&y_mdl_ur);
+            let mut tgt_wl = vec![0.0_f64; m];
+            let mut tgt_wr = vec![0.0_f64; m];
             for t in 0..m {
-                let boosted = (0..4)
-                    .map(|b| wr.wiener_band_gains[b] * bands[b][t])
-                    .sum::<f64>();
-                tgt_w[t] = 0.5 * tgt_m[t] + 0.5 * boosted;
+                let bl: f64 = (0..4)
+                    .map(|b| wr.wiener_band_gains[b] * bands_l[b][t])
+                    .sum();
+                let br: f64 = (0..4)
+                    .map(|b| wr.wiener_band_gains[b] * bands_r[b][t])
+                    .sum();
+                tgt_wl[t] = 0.5 * stem.target_l[t] + 0.5 * bl;
+                tgt_wr[t] = 0.5 * stem.target_r[t] + 0.5 * br;
             }
-            let delta2 = solve_control_jacobian_32slot(
-                &tgt_w,
-                &st_pass1,
-                &PASS4_ACTIVE_SLOTS,
-                1.0e-2,
-                2.0e-2,
-                |st| render_star_with_stage_targets(&ctx, Tier::Ultra, in_l, in_r, st),
+            let rep2 = solve_point_stage_targets_adjoint(
+                &StageTargetSolveInput {
+                    runner,
+                    base: model,
+                    in_l,
+                    in_r,
+                    target_l: &tgt_wl,
+                    target_r: &tgt_wr,
+                    init_targets: &st_pass1,
+                    z_stage: &[0.0; 8],
+                    bounds: &bounds,
+                },
+                &solve_cfg,
+                Some(&mut vm_u),
             )?;
-            for s in PASS4_ACTIVE_SLOTS {
-                st_final[s] = (st_pass1[s] + delta2[s]).clamp(-3.0, 3.0);
-            }
+            st_final = rep2.stage_targets;
         }
 
         out.push(Cp1ControlSample {

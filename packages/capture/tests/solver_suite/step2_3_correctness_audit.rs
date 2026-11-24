@@ -295,7 +295,6 @@ fn test_wide192_subnormal_extreme_exponent_and_half_ulp_tie_round_to_odd() {
 }
 
 #[test]
-#[ignore = "deferred to M23 (differentiable Stage C & repool replacing legacy FD loop)"]
 fn test_non_centered_star_control_and_dynamic_w_ctrl_isomorphism_and_repool() {
     // verify[train.pipeline.isomorphism-parity]
     let mut manifest = DnamProjManifest::default_reference();

@@ -41,14 +41,17 @@ pub use sona_gauge::{
 #[cfg(feature = "crypto")]
 pub use tardos::reframe_buyer_dau1_container_with_dbin;
 pub use tardos::{
-    TARDOS_CASCADE_RANGES, TARDOS_ULTRA_RESERVE_RANGE, TARDOS_W_READOUT_FP16_RANGES,
+    TARDOS_ACTIVE_LATENT_MASK_THRESH, TARDOS_CASCADE_RANGES, TARDOS_DEFAULT_KNOBS_END,
+    TARDOS_DEFAULT_KNOBS_START, TARDOS_GLOBAL_LATENT_MODS_END, TARDOS_GLOBAL_LATENT_MODS_START,
+    TARDOS_LITE_LATENT_MODS_END, TARDOS_LITE_LATENT_MODS_START, TARDOS_ULTRA_LATENT_MODS_END,
+    TARDOS_ULTRA_LATENT_MODS_START, TARDOS_ULTRA_RESERVE_RANGE, TARDOS_W_READOUT_FP16_RANGES,
     TardosCodebook7680, apply_cascade_head_gauge, apply_tardos_w_readout_fp16,
     apply_tardos_watermark_7680, apply_tardos_watermark_7680_envelopes,
     compute_emr_masked_tardos_envelopes, for_each_tardos_f32_offset_up_to,
     for_each_tardos_fp16_offset_up_to, generate_tardos_code_7680, generate_tardos_codebook_7680,
-    is_role_a_cascade_index, reframe_buyer_container_with_dbin, role_b_head_slot_for_index,
-    score_tardos_w_readout_fp16, score_tardos_watermark_7680,
-    score_tardos_watermark_7680_with_buyer_gauge,
+    is_role_a_cascade_index, mask_tardos_stage_latent_active_coords,
+    reframe_buyer_container_with_dbin, role_b_head_slot_for_index, score_tardos_w_readout_fp16,
+    score_tardos_watermark_7680, score_tardos_watermark_7680_with_buyer_gauge,
 };
 
 pub use super::fingerprint::{extract_structural_hash_224d, structural_cosine_similarity};

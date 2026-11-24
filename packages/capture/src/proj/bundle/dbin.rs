@@ -6,13 +6,17 @@ use std::collections::BTreeMap;
 
 use dnam_engine::Tier;
 use dnam_engine::container::{encode_cp1_shared_stream, extract_dnam_bin};
-use dnam_engine::schema::{DelayHistoryEntry, DnamError, DnamJsonHeader};
+use dnam_engine::schema::{
+    ControlCalibrationRole, ControlKind, DelayHistoryEntry, DnamError, DnamJsonHeader,
+    TempoSubdivision,
+};
 use dnam_kernels::{MAX_PARALRU_R_F32, fp16_to_f32};
 use dnam_vm::SonaVm;
 use dnam_vm::bin::{
     ARENA_TIER_BYTES, Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire,
-    Arena3UltraDeltaWire, DNBN_FLAG_SINGLE_INPUT, DNBN_FLAG_STEREO_OUT, DnamBinBuildInput,
-    DnamBinView, TRANSPORT_FLAG_EXT_F32, TransportQuadWire, encode_dnam_bin,
+    Arena3UltraDeltaWire, CextDispatchWire, DNBN_FLAG_SINGLE_INPUT, DNBN_FLAG_STEREO_OUT,
+    DnamBinBuildInput, DnamBinView, TRANSPORT_FLAG_EXT_F32, TempoSyncEntryWire, TransportQuadWire,
+    encode_dnam_bin,
 };
 use dnam_vm::control::Cp1ContributorSlot;
 use dnam_vm::math::DefaultMathBackend;
@@ -29,9 +33,21 @@ pub(super) fn map_vm_err(err: impl core::fmt::Display) -> DnamError {
 fn quad_max_samples_48k(quad: &TransportQuadWire) -> u64 {
     let mut max_req = 0_u64;
     for lane in 0..4 {
-        let d = quad.delay_samples[lane].get().max(0.0);
-        let depth = fp16_to_f32(quad.lfo_depths_fp16[lane].get()).abs();
-        let req = (d + depth).ceil().max(4.0) as u64 + 6;
+        let d = quad.delay_samples[lane].get();
+        let delay = if d.is_finite() { d.max(0.0) } else { 0.0 };
+        let span = quad.ramp_spans_samples[lane].get();
+        let half_span = if span.is_finite() {
+            0.5 * span.abs()
+        } else {
+            0.0
+        };
+        let depth_raw = fp16_to_f32(quad.lfo_depths_fp16[lane].get());
+        let depth = if depth_raw.is_finite() {
+            depth_raw.abs()
+        } else {
+            0.0
+        };
+        let req = (delay + half_span + depth).ceil().max(4.0) as u64 + 6;
         max_req = max_req.max(req);
     }
     max_req
@@ -112,12 +128,77 @@ pub fn verify_wght_zero_dc(wght_dnam: &[u8]) -> Result<(), DnamError> {
     verify_dnam_bin_zero_dc(dbin)
 }
 
+/// Compiles `"TSYN"` tempo-sync entries declared on `manifest.base.controls_schema` calibration blocks.
+pub(crate) fn compile_tsyn_entries_from_schema(
+    manifest: &DnamProjManifest,
+) -> Vec<TempoSyncEntryWire> {
+    let mut rows = Vec::new();
+    for (ctrl_idx, ctrl) in manifest.base.controls_schema.iter().enumerate() {
+        if ctrl.kind != ControlKind::Range {
+            continue;
+        }
+        let Some(ref cal) = ctrl.calibration else {
+            continue;
+        };
+        let Some(subdiv) = cal.tempo_sync_default_subdivision else {
+            continue;
+        };
+        let is_freq_hz = match cal.role {
+            ControlCalibrationRole::DelayTimeMs | ControlCalibrationRole::GrainSizeMs => false,
+            ControlCalibrationRole::LfoRateHz => true,
+            _ => continue,
+        };
+        let subdiv_idx = TempoSubdivision::ALL
+            .iter()
+            .position(|&s| s == subdiv)
+            .unwrap_or(dnam_train::TSYN_SUBDIV_QUARTER as usize) as u8;
+        let div_ratio = subdiv.beat_multiplier();
+        let decl = ctrl.declared_range.unwrap_or([0.0, 1.0]);
+        let d_min = decl[0];
+        let d_max = decl[1].max(d_min);
+        let default_anchors =
+            cal.lobatto_physical_anchors
+                .unwrap_or([d_min, 0.5 * (d_min + d_max), d_max]);
+        if let Ok(row) = dnam_train::build_tsyn_entry_wire_with_cond(
+            ctrl_idx as u16,
+            is_freq_hz,
+            (subdiv_idx, None),
+            (div_ratio, 1.0),
+            default_anchors,
+            (d_min, d_max),
+            false,
+        ) {
+            rows.push(row);
+        }
+    }
+    rows
+}
+
 /// Compiles raw `SONA v3.0` `Arena 0..3` bytes (`4,608 / 7,936 / 15,872 / 30,720 B`) and `CP1`
 /// slots into a validated Layer 0 `.dnam-bin` (`"DNBN"`) image (or returns a pre-encoded `.dnam-bin`).
 pub(crate) fn compile_arena_and_cp1_to_dnam_bin(
     manifest: &DnamProjManifest,
     arena_or_dbin: &[u8],
     cp1_contributors: &[Cp1ContributorSlot],
+) -> Result<Vec<u8>, DnamError> {
+    let tsyn = compile_tsyn_entries_from_schema(manifest);
+    compile_arena_and_cp1_with_ext_to_dnam_bin(
+        manifest,
+        arena_or_dbin,
+        cp1_contributors,
+        &tsyn,
+        None,
+    )
+}
+
+/// Compiles raw `SONA v3.0` `Arena 0..3` bytes, `CP1` slots, optional `"TSYN"` tempo rows, and
+/// optional `"CEXT"` dispatch matrix into a validated Layer 0 `.dnam-bin` (`"DNBN"`) image.
+pub(crate) fn compile_arena_and_cp1_with_ext_to_dnam_bin(
+    manifest: &DnamProjManifest,
+    arena_or_dbin: &[u8],
+    cp1_contributors: &[Cp1ContributorSlot],
+    tsyn: &[TempoSyncEntryWire],
+    cext: Option<&CextDispatchWire>,
 ) -> Result<Vec<u8>, DnamError> {
     if arena_or_dbin.len() >= 4 && &arena_or_dbin[0..4] == b"DNBN" {
         let _ = DnamBinView::parse(arena_or_dbin).map_err(map_vm_err)?;
@@ -251,12 +332,112 @@ pub(crate) fn compile_arena_and_cp1_to_dnam_bin(
         content_hash_prefix: prefix8,
         controls: &wire_descs,
         cp1_overflow: &cp1_overflow,
-        tsyn: &[],
-        cext: None,
+        tsyn,
+        cext,
         arena0: a0,
         arena1: a1,
         arena2: a2,
         arena3: a3,
     })
     .map_err(map_vm_err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dnam_kernels::f32_to_fp16;
+    use zerocopy::FromZeros;
+    use zerocopy::byteorder::little_endian::{F32, U16};
+
+    #[test]
+    fn test_quad_max_samples_and_compile_with_tsyn_cext_roundtrip() {
+        let mut a0 = DnamBinBuildInput::default_arena0_lite();
+        a0.transport_lite.delay_samples = [F32::new(80.0); 4];
+        a0.transport_lite.ramp_spans_samples = [
+            F32::new(100.0),
+            F32::new(20.0),
+            F32::new(0.0),
+            F32::new(0.0),
+        ];
+        a0.transport_lite.lfo_depths_fp16 = [
+            U16::new(f32_to_fp16(12.0)),
+            U16::new(0),
+            U16::new(0),
+            U16::new(0),
+        ];
+        // 80 + 0.5*100 + 12 = 142 => +6 = 148 samples (exceeds 128 without ramp span!).
+        assert_eq!(quad_max_samples_48k(&a0.transport_lite), 148);
+
+        let mut manifest = DnamProjManifest::default_reference();
+        manifest.base.controls_schema = vec![
+            serde_json::from_value(serde_json::json!({
+                "id": "delay_ms",
+                "name": "Delay",
+                "type": "range",
+                "declared_range": [20.0, 2000.0],
+                "default": 250.0,
+                "calibration": {
+                    "role": "delay_time_ms",
+                    "lobatto_physical_anchors": [20.0, 250.0, 2000.0],
+                    "tempo_sync_default_subdivision": "1/4"
+                }
+            }))
+            .expect("range schema parses"),
+        ];
+        let schema_tsyn = compile_tsyn_entries_from_schema(&manifest);
+        assert_eq!(schema_tsyn.len(), 1);
+        assert_eq!(schema_tsyn[0].bpm_factor.get(), 1.0);
+
+        let tsyn_row = dnam_train::build_tsyn_entry_wire(
+            0,
+            false,
+            1.0,
+            1.0,
+            [20.0, 250.0, 2_000.0],
+            (20.0, 2_000.0),
+            true,
+        )
+        .expect("tsyn row builds");
+        let mut cext = CextDispatchWire::new_zeroed();
+        cext.w_ctrl_ext[0][4] = F32::new(0.25);
+        cext.w_ctrl_ext[6][10] = F32::new(-0.5);
+
+        let dbin = compile_arena_and_cp1_with_ext_to_dnam_bin(
+            &manifest,
+            a0.as_bytes(),
+            &[],
+            &[tsyn_row],
+            Some(&cext),
+        )
+        .expect("compile with tsyn + cext should succeed");
+
+        let dbin_schema_tsyn = compile_arena_and_cp1_to_dnam_bin(&manifest, a0.as_bytes(), &[])
+            .expect("compile with schema tsyn should succeed");
+        assert_eq!(
+            DnamBinView::parse(&dbin_schema_tsyn)
+                .unwrap()
+                .tsyn_entries
+                .len(),
+            1
+        );
+
+        let view = DnamBinView::parse(&dbin).unwrap();
+        assert_eq!(view.runtime_meta.ext_ring_pow2_frames, 8);
+        assert_eq!(view.tsyn_entries.len(), 1);
+        assert_eq!(view.tsyn_entries[0].ctrl_idx.get(), 0);
+        let parsed_cext = view.cext.expect("cext preserved");
+        assert_eq!(parsed_cext.w_ctrl_ext[0][4].get(), 0.25);
+        assert_eq!(parsed_cext.w_ctrl_ext[6][10].get(), -0.5);
+
+        let mut hdr = manifest.base.clone();
+        sync_manifest_transport_delay_history(&mut hdr, &dbin);
+        assert_eq!(hdr.delay_histories.len(), 1);
+        assert_eq!(
+            hdr.delay_histories[0]
+                .reference_samples
+                .get("lite")
+                .map(String::as_str),
+            Some("148")
+        );
+    }
 }

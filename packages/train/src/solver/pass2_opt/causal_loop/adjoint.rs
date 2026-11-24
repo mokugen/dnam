@@ -314,8 +314,14 @@ pub(crate) fn assemble_causal_loop_adjoint(
             if buf.dry_mix_open {
                 core_ctx.grads.d_tank_dry_mix += gl[t] * buf.x_tank_l[t] + gr[t] * buf.x_tank_r[t];
             }
+            if buf.wet_scale_open {
+                core_ctx.grads.d_op_t_wet_scale +=
+                    gl[t] * buf.op_t_wet_l[t] + gr[t] * buf.op_t_wet_r[t];
+            }
             let mut g_tank_l = buf.dry_mix * gl[t];
             let mut g_tank_r = buf.dry_mix * gr[t];
+            let gl_wet_t = buf.wet_scale * gl[t];
+            let gr_wet_t = buf.wet_scale * gr[t];
 
             let mut d_vr_end = [[0.0_f64; 4]; 4];
             let mut d_rwin_freeze = [[0.0_f64; 4]; 4];
@@ -328,8 +334,8 @@ pub(crate) fn assemble_causal_loop_adjoint(
                         t,
                         buf.x_tank_l[t],
                         buf.x_tank_r[t],
-                        gl[t],
-                        gr[t],
+                        gl_wet_t,
+                        gr_wet_t,
                     );
                     d_vr_end[q_opt] = vr_e;
                     d_rwin_freeze[q_opt] = rwf;

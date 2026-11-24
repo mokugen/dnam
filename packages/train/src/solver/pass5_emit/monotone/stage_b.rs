@@ -4,8 +4,8 @@
 use super::super::super::model::SonaModelF64;
 use super::helpers::{
     MonotoneEvalCtx, MonotoneState, RepairBaseline, blend_override_toward,
-    blur_lower_tier_override, damp_lower_tier_detail, damp_lower_tier_override, re_eval,
-    strict_besr_preserved, tier_lufs_and_trim_ok,
+    blur_lower_tier_override, commit_dirty_eval, damp_lower_tier_detail, damp_lower_tier_override,
+    others_intact, re_eval_dirty, strict_besr_preserved, tier_lufs_and_trim_ok,
 };
 
 pub(super) fn try_stage_b_bottom_up(
@@ -13,18 +13,8 @@ pub(super) fn try_stage_b_bottom_up(
     eval: &MonotoneEvalCtx<'_>,
     base: &RepairBaseline<'_>,
     state: &mut MonotoneState,
-) {
-    let MonotoneEvalCtx {
-        in_l,
-        in_r,
-        target_l,
-        target_r,
-        warmup,
-        config,
-    } = *eval;
-    let final_bin = &mut state.final_bin;
-    let final_bundle = &mut state.final_bundle;
-    let cert = &mut state.cert;
+) -> bool {
+    let MonotoneEvalCtx { config, .. } = *eval;
     const BETAS_BLEND: [f64; 11] = [
         0.97, 0.94, 0.90, 0.85, 0.78, 0.70, 0.60, 0.45, 0.30, 0.15, 0.0,
     ];
@@ -36,10 +26,15 @@ pub(super) fn try_stage_b_bottom_up(
     ];
     const BETAS_COORD: [f64; 10] = [0.92, 0.85, 0.78, 0.70, 0.60, 0.45, 0.30, 0.18, 0.08, 0.0];
     const GAMMAS_BLUR: [f64; 8] = [0.04, 0.10, 0.20, 0.35, 0.50, 0.65, 0.80, 0.92];
+    let mut any_changed = false;
 
     for t in 1..=3 {
-        if cert.pair_monotone[t]
-            || cert.tier_reports[t].besr_db >= cert.tier_reports[t - 1].besr_db + 1.5
+        let ultra_beats_prev = t < 3
+            && state.cert.tier_reports[3].besr_db < state.cert.tier_reports[t - 1].besr_db - 1.0;
+        if state.cert.pair_monotone[t]
+            || (!ultra_beats_prev
+                && state.cert.tier_reports[t].besr_db
+                    >= state.cert.tier_reports[t - 1].besr_db + 1.5)
         {
             continue;
         }
@@ -60,34 +55,26 @@ pub(super) fn try_stage_b_bottom_up(
                 if let Some(ref mut dst) = cand_model.tier_overrides[t - 1] {
                     blend_override_toward(dst, &lo_cur, &prev_lo, beta);
                 }
-                let Ok((b, bdl, c)) = re_eval(
-                    &mut cand_model,
-                    in_l,
-                    in_r,
-                    target_l,
-                    target_r,
-                    warmup,
-                    config,
-                ) else {
+                let Ok(res) = re_eval_dirty(&mut cand_model, eval, state, 1_u8 << (t - 1)) else {
                     continue;
                 };
+                let c = &res.cert;
                 if c.pair_monotone[t]
-                    && super::helpers::others_intact(cert, &c, t)
-                    && strict_besr_preserved(base.besr, &c, t)
-                    && strict_besr_preserved(base.besr, &c, t - 1)
+                    && others_intact(&state.cert, c, t)
+                    && strict_besr_preserved(base.besr, c, t)
+                    && strict_besr_preserved(base.besr, c, t - 1)
                     && tier_lufs_and_trim_ok(
                         &cand_model,
                         base.trims,
-                        &c,
+                        c,
                         config,
                         (t - 1)..=(t - 1),
                         true,
                     )
+                    && commit_dirty_eval(state, res).is_ok()
                 {
                     *model = cand_model;
-                    *final_bin = b;
-                    *final_bundle = bdl;
-                    *cert = c;
+                    any_changed = true;
                     repaired = true;
                     break;
                 }
@@ -112,34 +99,27 @@ pub(super) fn try_stage_b_bottom_up(
                             damp_lower_tier_override(dst, t - 1, beta);
                         }
                     }
-                    let Ok((b, bdl, c)) = re_eval(
-                        &mut cand_model,
-                        in_l,
-                        in_r,
-                        target_l,
-                        target_r,
-                        warmup,
-                        config,
-                    ) else {
+                    let Ok(res) = re_eval_dirty(&mut cand_model, eval, state, 1_u8 << (t - 1))
+                    else {
                         continue;
                     };
+                    let c = &res.cert;
                     if c.pair_monotone[t]
-                        && super::helpers::others_intact(cert, &c, t)
-                        && strict_besr_preserved(base.besr, &c, t)
-                        && (t == 1 || strict_besr_preserved(base.besr, &c, t - 1))
+                        && others_intact(&state.cert, c, t)
+                        && strict_besr_preserved(base.besr, c, t)
+                        && (t == 1 || strict_besr_preserved(base.besr, c, t - 1))
                         && tier_lufs_and_trim_ok(
                             &cand_model,
                             base.trims,
-                            &c,
+                            c,
                             config,
                             (t - 1)..=(t - 1),
                             strict_env,
                         )
+                        && commit_dirty_eval(state, res).is_ok()
                     {
                         *model = cand_model;
-                        *final_bin = b;
-                        *final_bundle = bdl;
-                        *cert = c;
+                        any_changed = true;
                         repaired = true;
                         break;
                     }
@@ -165,37 +145,30 @@ pub(super) fn try_stage_b_bottom_up(
                             }
                         }
                     }
-                    let Ok((b, bdl, c)) = re_eval(
-                        &mut cand_model,
-                        in_l,
-                        in_r,
-                        target_l,
-                        target_r,
-                        warmup,
-                        config,
-                    ) else {
+                    let Ok(res) = re_eval_dirty(&mut cand_model, eval, state, (1_u8 << t) - 1)
+                    else {
                         continue;
                     };
+                    let c = &res.cert;
                     let prefix_monotone = c.pair_monotone[1..=t].iter().all(|&m| m);
                     let upper_ok =
-                        ((t + 1)..=3).all(|u| !cert.pair_monotone[u] || c.pair_monotone[u]);
-                    let strict_ok = (1..=t).all(|k| strict_besr_preserved(base.besr, &c, k));
+                        ((t + 1)..=3).all(|u| !state.cert.pair_monotone[u] || c.pair_monotone[u]);
+                    let strict_ok = (1..=t).all(|k| strict_besr_preserved(base.besr, c, k));
                     if prefix_monotone
                         && upper_ok
                         && strict_ok
                         && tier_lufs_and_trim_ok(
                             &cand_model,
                             base.trims,
-                            &c,
+                            c,
                             config,
                             0..=(t - 1),
                             strict_env,
                         )
+                        && commit_dirty_eval(state, res).is_ok()
                     {
                         *model = cand_model;
-                        *final_bin = b;
-                        *final_bundle = bdl;
-                        *cert = c;
+                        any_changed = true;
                         repaired = true;
                         break;
                     }
@@ -214,39 +187,26 @@ pub(super) fn try_stage_b_bottom_up(
                         blur_lower_tier_override(dst, k, gamma_k);
                     }
                 }
-                let Ok((b, bdl, c)) = re_eval(
-                    &mut cand_model,
-                    in_l,
-                    in_r,
-                    target_l,
-                    target_r,
-                    warmup,
-                    config,
-                ) else {
+                let Ok(res) = re_eval_dirty(&mut cand_model, eval, state, (1_u8 << t) - 1) else {
                     continue;
                 };
+                let c = &res.cert;
                 let prefix_monotone = c.pair_monotone[1..=t].iter().all(|&m| m);
-                let upper_ok = ((t + 1)..=3).all(|u| !cert.pair_monotone[u] || c.pair_monotone[u]);
-                let strict_ok = (1..=t).all(|k| strict_besr_preserved(base.besr, &c, k));
+                let upper_ok =
+                    ((t + 1)..=3).all(|u| !state.cert.pair_monotone[u] || c.pair_monotone[u]);
+                let strict_ok = (1..=t).all(|k| strict_besr_preserved(base.besr, c, k));
                 if prefix_monotone
                     && upper_ok
                     && strict_ok
-                    && tier_lufs_and_trim_ok(
-                        &cand_model,
-                        base.trims,
-                        &c,
-                        config,
-                        0..=(t - 1),
-                        false,
-                    )
+                    && tier_lufs_and_trim_ok(&cand_model, base.trims, c, config, 0..=(t - 1), false)
+                    && commit_dirty_eval(state, res).is_ok()
                 {
                     *model = cand_model;
-                    *final_bin = b;
-                    *final_bundle = bdl;
-                    *cert = c;
+                    any_changed = true;
                     break;
                 }
             }
         }
     }
+    any_changed
 }

@@ -19,7 +19,8 @@ const SENSE_TONE_LIMIT: f64 = 16.0;
 /// Maximum `SensoryQuad` VCA projection weight magnitude.
 const SENSE_VCA_LIMIT: f64 = 512.0;
 
-/// Exact `44`-parameter gradients for `SensoryQuad` matching [`SonaModelF64`]'s `sense_*` fields.
+/// Exact `45`-parameter gradients for `SensoryQuad` matching [`SonaModelF64`]'s `sense_*` fields
+/// plus runtime slot-30 `sense_vca_bias`.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct SensoryQuadGrads {
     pub d_in_l: [f64; 4],
@@ -33,6 +34,7 @@ pub(crate) struct SensoryQuadGrads {
     pub d_lru_atk: [f64; 4],
     pub d_lru_kappa: [f64; 4],
     pub d_vca_w: [f64; 4],
+    pub d_vca_bias: f64,
 }
 
 #[inline(always)]
@@ -231,8 +233,10 @@ pub(crate) fn eval_sensory_quad_and_adjoint(
     };
     let rho = (48_000.0 / sr).clamp(0.125, 8.0);
     let lanes: [LaneCoeff; 4] = core::array::from_fn(|l| LaneCoeff::from_model(model, l, rho));
+    let vca_bias = clamp_finite(model.sense_vca_bias, -1.0, 1.0, 0.0);
+    let vca_bias_open = model.sense_vca_bias.is_finite() && model.sense_vca_bias.abs() < 1.0;
 
-    let is_bypass = lanes.iter().all(|c| c.vca_w == 0.0);
+    let is_bypass = lanes.iter().all(|c| c.vca_w == 0.0) && vca_bias == 0.0;
     let need_adj = d_out_opt.is_some();
     if is_bypass && !need_adj {
         return (
@@ -315,7 +319,7 @@ pub(crate) fn eval_sensory_quad_and_adjoint(
                 env_hist[t][l] = e_new;
             }
         }
-        let g_raw = 1.0 + vca_dot;
+        let g_raw = 1.0 + vca_bias + vca_dot;
         let g_in = g_raw.clamp(0.0, 2.0);
         out_l[t] = g_in * xl;
         out_r[t] = g_in * xr;
@@ -341,6 +345,9 @@ pub(crate) fn eval_sensory_quad_and_adjoint(
             let g_open = g_raw > 0.0 && g_raw < 2.0;
             let d_g_in = gl[t] * xl + gr[t] * xr;
             let d_g_raw = if g_open { d_g_in } else { 0.0 };
+            if vca_bias_open {
+                grads.d_vca_bias += d_g_raw;
+            }
 
             let mut d_xl = g_in * gl[t];
             let mut d_xr = g_in * gr[t];
@@ -473,6 +480,7 @@ mod tests {
         m.sense_lru_atk = [0.15, 0.28, 0.42, 0.58];
         m.sense_lru_kappa = [0.12, 0.24, 0.36, 0.48];
         m.sense_vca_w = [0.45, -0.35, 0.28, -0.22];
+        m.sense_vca_bias = 0.125;
         m
     }
 
@@ -529,7 +537,7 @@ mod tests {
                 &mut vm_hot,
                 in_l[t] as f32,
                 in_r[t] as f32,
-                0.0,
+                m96.sense_vca_bias as f32,
             );
             assert!(
                 (f64::from(vl) - sl[t]).abs() < 2.0e-5,
@@ -650,6 +658,13 @@ mod tests {
                 (g_in_l[39] - fd_x).abs() < 1.0e-4 * scale,
                 "rate={rate} in_l[39]: ana={} fd={fd_x}",
                 g_in_l[39]
+            );
+            let fd_bias = fd_field(|x, _, v| x.sense_vca_bias = v, m.sense_vca_bias, 0);
+            let bias_scale = g.d_vca_bias.abs().max(fd_bias.abs()).max(1.0e-3);
+            assert!(
+                (g.d_vca_bias - fd_bias).abs() < 1.0e-4 * bias_scale,
+                "rate={rate} sense_vca_bias: ana={} fd={fd_bias}",
+                g.d_vca_bias
             );
         }
     }
