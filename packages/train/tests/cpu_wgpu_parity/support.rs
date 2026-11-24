@@ -10,11 +10,14 @@ use dnam_train::{
     FusedCoreScanOutput, GaborBezoutInput, InnerOptInput, MemoryBudgetProfile, OzakiGramInput,
     PrescreenInput, ShaderVariant, TrainRunner, WgpuRunner,
     abi::{
-        AdjointScanUniforms, FusedScanUniforms, GaborBezoutUniforms, InnerOptUniforms,
-        OzakiGramUniforms, PrescreenUniforms, QUAD_PARAMS_VEC4_STRIDE, quad_param_slots,
+        AdjointScanUniforms, CORE_INPUT_VEC4_STRIDE, FusedScanUniforms, GaborBezoutUniforms,
+        INNER_OPT_MODE_LSSBROYDEN, InnerOptUniforms, OZAKI_PAIR_TILE_ROWS_DEFAULT,
+        OzakiGramUniforms, PrescreenUniforms, QUAD_PARAMS_VEC4_STRIDE, TILE_DESC_VEC4_STRIDE,
+        quad_param_slots,
     },
-    pack_core_quad_params, plan_core_scan_execution,
+    pack_core_quad_params, pack_tile_descriptor, plan_core_scan_execution,
 };
+use dnam_vm::{SONA_CORE_QUAD_BLOCK_AND_LOCAL, SONA_INTERBLOCK_TILES};
 
 pub(crate) fn build_quad(
     stem: usize,
@@ -122,6 +125,7 @@ pub(crate) fn verify_auto_detect_and_wgpu_validation_guards(
         tile_checkpoints: &fwd_cpu.tile_checkpoints,
         d_loss_d_features: d_loss,
         feature_outputs: &fwd_cpu.feature_outputs,
+        exit_adj_boundary: None,
     };
     let res_plan = plan_core_scan_execution(
         CoreScanWorkload {
@@ -186,15 +190,16 @@ pub(crate) fn verify_auto_detect_and_wgpu_validation_guards(
                 num_params: 4,
                 history_m: 1,
                 step_idx: 0,
-                line_search_iter: 0,
+                mode_flags: INNER_OPT_MODE_LSSBROYDEN,
                 step_size: 0.2,
                 damping_lambda: 1.0e-4,
                 min_bound_eps: 1.0e-4,
-                _pad: 0,
+                grad_clip_norm: 0.0,
             },
+            num_candidates: 1,
             theta: &[0.2; 4],
             grad: &[0.1; 4],
-            param_bounds: &[[-1.0, 1.0]; 4],
+            param_bounds: &[[-1.0, 1.0, 1.0, 0.0]; 4],
             lbfgs_s_y: &[[0.0; 4]; 8],
             search_dir: &[0.0; 4],
         })
@@ -210,9 +215,9 @@ pub(crate) fn verify_auto_detect_and_wgpu_validation_guards(
                         target_channels: 0,
                         chunk_len: 1024,
                         num_chunks: 1,
-                        _pad0: 0,
-                        _pad1: 0,
-                        _pad2: 0,
+                        pair_tile_rows: OZAKI_PAIR_TILE_ROWS_DEFAULT,
+                        reduce_pass: 0,
+                        _pad: 0,
                     },
                     features: &[1.0; 4],
                     targets: &[],
@@ -306,9 +311,9 @@ pub(crate) fn verify_auto_detect_and_wgpu_validation_guards(
                 target_channels: 0,
                 chunk_len: 1024,
                 num_chunks: 1,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
+                pair_tile_rows: OZAKI_PAIR_TILE_ROWS_DEFAULT,
+                reduce_pass: 0,
+                _pad: 0,
             },
             features: &[],
             targets: &[],
@@ -325,9 +330,9 @@ pub(crate) fn verify_auto_detect_and_wgpu_validation_guards(
                 target_channels: 0,
                 chunk_len: 1024,
                 num_chunks: 1,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
+                pair_tile_rows: OZAKI_PAIR_TILE_ROWS_DEFAULT,
+                reduce_pass: 0,
+                _pad: 0,
             },
             features: &[1.0; 8],
             targets: &[],
@@ -342,12 +347,13 @@ pub(crate) fn verify_auto_detect_and_wgpu_validation_guards(
                 num_params: 0,
                 history_m: 1,
                 step_idx: 0,
-                line_search_iter: 0,
+                mode_flags: INNER_OPT_MODE_LSSBROYDEN,
                 step_size: 0.1,
                 damping_lambda: 1.0e-4,
                 min_bound_eps: 1.0e-4,
-                _pad: 0,
+                grad_clip_norm: 0.0,
             },
+            num_candidates: 1,
             theta: &[],
             grad: &[],
             param_bounds: &[],
@@ -356,4 +362,73 @@ pub(crate) fn verify_auto_detect_and_wgpu_validation_guards(
         })
         .is_err()
     );
+}
+
+pub(crate) fn build_wave_descriptors(active_tiles: usize, gain: f32) -> Vec<[f32; 4]> {
+    let mut out = Vec::with_capacity(active_tiles * TILE_DESC_VEC4_STRIDE);
+    for (tile_idx, &(src_q, dst_q)) in SONA_INTERBLOCK_TILES[..active_tiles].iter().enumerate() {
+        let s_blk = SONA_CORE_QUAD_BLOCK_AND_LOCAL[src_q].0 as u32;
+        let d_blk = SONA_CORE_QUAD_BLOCK_AND_LOCAL[dst_q].0 as u32;
+        let mut wo = [[0.0_f32; 4]; 4];
+        let mut we = [[0.0_f32; 4]; 4];
+        let mut wl = [[0.0_f32; 4]; 4];
+        for s in 0..4 {
+            for d in 0..4 {
+                let p = ((tile_idx * 16 + s * 4 + d) as f32) * 0.37;
+                wo[s][d] = gain * p.sin();
+                we[s][d] = 0.8 * gain * p.cos();
+                wl[s][d] = 0.6 * gain * (0.7 * p).sin();
+            }
+        }
+        out.extend_from_slice(&pack_tile_descriptor(
+            src_q as u32,
+            dst_q as u32,
+            s_blk,
+            d_blk,
+            &wo,
+            &we,
+            &wl,
+        ));
+    }
+    out
+}
+
+pub(crate) fn fill_core_inputs(total_q: usize, num_frames: usize, scale: f32) -> Vec<[f32; 4]> {
+    let mut out = vec![[0.0_f32; 4]; total_q * num_frames * CORE_INPUT_VEC4_STRIDE];
+    for t in 0..(total_q * num_frames) {
+        let ph = (t as f32) * 0.053;
+        out[t * 2] = [
+            scale * ph.sin(),
+            scale * 0.8 * (1.3 * ph).cos(),
+            scale * 0.6 * (0.7 * ph).sin(),
+            scale * 0.45 * (1.1 * ph + 0.4).cos(),
+        ];
+        out[t * 2 + 1] = [
+            scale * 0.75 * ph.cos(),
+            -scale * 0.65 * ph.sin(),
+            scale * 0.5 * (0.85 * ph + 0.25).sin(),
+            -scale * 0.35 * (0.9 * ph).cos(),
+        ];
+    }
+    out
+}
+
+pub(crate) fn assert_vec4_close(a: &[[f32; 4]], b: &[[f32; 4]], rel_tol: f32, ctx: &str) {
+    assert_eq!(a.len(), b.len(), "{ctx} length mismatch");
+    let peak = a
+        .iter()
+        .chain(b.iter())
+        .flat_map(|v| v.iter().copied())
+        .fold(1.0_f32, |m, x| m.max(x.abs()));
+    let tol = rel_tol * peak;
+    for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
+        for c in 0..4 {
+            assert!(
+                va[c].is_finite() && vb[c].is_finite() && (va[c] - vb[c]).abs() <= tol,
+                "{ctx} idx={i} lane={c}: a={} b={} tol={tol}",
+                va[c],
+                vb[c]
+            );
+        }
+    }
 }

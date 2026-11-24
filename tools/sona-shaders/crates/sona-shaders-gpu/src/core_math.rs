@@ -9,8 +9,9 @@ pub mod scans;
 
 pub use adaa_deriv::{DuhemStepTerms, eval_adaa_and_wf_with_derivs, eval_duhem_step_terms};
 pub use scans::{
-    linear_adjoint_reverse_suffix_256_lr, reduce_batch6_in_scratch, reduce_sum_256_in_aux,
-    tpt_adjoint_reverse_suffix_256, tpt_exclusive_scan_256, wg_barrier,
+    linear_adjoint_reverse_suffix_256_lr, linear_forward_exclusive_scan_128_pair,
+    reduce_batch6_in_scratch, reduce_sum_256_in_aux, tpt_adjoint_reverse_suffix_256,
+    tpt_exclusive_scan_128_pair, tpt_exclusive_scan_256, wg_barrier,
 };
 
 use crate::abi::TILE_FRAMES;
@@ -32,7 +33,7 @@ const _: () = assert!(CORE_INPUT_VEC4_STRIDE == 2);
 const _: () = assert!(QUAD_PARAMS_VEC4_STRIDE == param_slots::SVF_K_NL + 1);
 const _: () = assert!(TILE_CKPT_VEC4_STRIDE == 8);
 const _: () = assert!(FEATURE_VEC4_STRIDE == 6);
-const _: () = assert!(TILE_ADJ_LANE_VEC4_STRIDE == 5 && TILE_ADJ_BOUNDARY_VEC4_STRIDE == 20);
+const _: () = assert!(TILE_ADJ_LANE_VEC4_STRIDE == 6 && TILE_ADJ_BOUNDARY_VEC4_STRIDE == 24);
 const _: () = assert!(MIN_SAG_GAIN > 0.0 && SOFT_RECT_EPS > 0.0);
 
 /// Converts a `glam::Vec4` to a `dnam_kernels::GpuVec4`.

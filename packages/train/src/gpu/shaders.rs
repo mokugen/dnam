@@ -6,7 +6,7 @@ use sha2::{Digest, Sha256};
 
 use super::abi::{
     ADJOINT_CORE_SRAM_BYTES, FUSED_CORE_SRAM_BYTES, GABOR_BEZOUT_SRAM_BYTES, INNER_OPT_SRAM_BYTES,
-    MAX_WORKGROUP_SRAM_BYTES, OZAKI_GRAM_SRAM_BYTES, PRESCREEN_SRAM_BYTES,
+    MAX_WORKGROUP_SRAM_BYTES, OZAKI_GRAM_SRAM_BYTES, PRESCREEN_SRAM_BYTES, TILE_MIX_SRAM_BYTES,
 };
 use crate::error::TrainError;
 
@@ -19,6 +19,8 @@ const PORTABLE_FUSED_CORE: &str =
     include_str!("../../../../tools/sona-shaders/wgsl/fused_core_scan_256.wgsl");
 const PORTABLE_ADJOINT: &str =
     include_str!("../../../../tools/sona-shaders/wgsl/adjoint_scan_256.wgsl");
+const PORTABLE_TILE_MIX: &str =
+    include_str!("../../../../tools/sona-shaders/wgsl/tile_mix_fwd_adj.wgsl");
 const PORTABLE_GABOR: &str =
     include_str!("../../../../tools/sona-shaders/wgsl/gabor_bezout_grad.wgsl");
 const PORTABLE_OZAKI: &str =
@@ -32,6 +34,8 @@ const SUBGROUPS_FUSED_CORE: &str =
     include_str!("../../../../tools/sona-shaders/wgsl/subgroups/fused_core_scan_256.wgsl");
 const SUBGROUPS_ADJOINT: &str =
     include_str!("../../../../tools/sona-shaders/wgsl/subgroups/adjoint_scan_256.wgsl");
+const SUBGROUPS_TILE_MIX: &str =
+    include_str!("../../../../tools/sona-shaders/wgsl/subgroups/tile_mix_fwd_adj.wgsl");
 const SUBGROUPS_GABOR: &str =
     include_str!("../../../../tools/sona-shaders/wgsl/subgroups/gabor_bezout_grad.wgsl");
 const SUBGROUPS_OZAKI: &str =
@@ -39,7 +43,7 @@ const SUBGROUPS_OZAKI: &str =
 const SUBGROUPS_INNER_OPT: &str =
     include_str!("../../../../tools/sona-shaders/wgsl/subgroups/inner_opt_step.wgsl");
 
-/// Identifier for the 6 canonical 32-bit GPU/CPU compute kernels.
+/// Identifier for the 7 canonical 32-bit GPU/CPU compute kernels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum KernelId {
     /// Seed population prescreening (`8,192 B` SRAM).
@@ -48,20 +52,23 @@ pub enum KernelId {
     FusedCoreScan256,
     /// 3-pass multi-tile reverse BPTT adjoint scan (`14,848 B` SRAM).
     AdjointScan256,
+    /// Wave-level inter-block DAG forward mix, pullback, and weight grad reduction (`2,048 B` SRAM).
+    TileMixFwdAdj,
     /// Multi-band Bézout FIR (`fft_size == 0`) or radix-2 Gabor FFT (`fft_size > 0`) loss & grad (`11,264 B` SRAM).
     GaborBezoutGrad,
     /// Integer `i32` Ozaki `(2^8, 2^16, 2^24)` Gram and RHS contraction (`5,120 B` SRAM).
     OzakiGramRhsI32,
-    /// Single-workgroup `(1, 1, 1)` bounded `m <= 8` L-BFGS inner step (`2,176 B` SRAM).
+    /// Multi-candidate `(1, num_candidates, 1)` strided AdamW / L-SSBroyden / STE-fp16 inner step (`2,560 B` SRAM).
     InnerOptStep,
 }
 
 impl KernelId {
-    /// Ordered slice of all 6 canonical compute kernels.
-    pub const ALL: [Self; 6] = [
+    /// Ordered slice of all 7 canonical compute kernels.
+    pub const ALL: [Self; 7] = [
         Self::PrescreenPopulation,
         Self::FusedCoreScan256,
         Self::AdjointScan256,
+        Self::TileMixFwdAdj,
         Self::GaborBezoutGrad,
         Self::OzakiGramRhsI32,
         Self::InnerOptStep,
@@ -75,6 +82,7 @@ impl KernelId {
             Self::PrescreenPopulation => "prescreen_population",
             Self::FusedCoreScan256 => "fused_core_scan_256",
             Self::AdjointScan256 => "adjoint_scan_256",
+            Self::TileMixFwdAdj => "tile_mix_fwd_adj",
             Self::GaborBezoutGrad => "gabor_bezout_grad",
             Self::OzakiGramRhsI32 => "ozaki_gram_rhs_i32",
             Self::InnerOptStep => "inner_opt_step",
@@ -89,6 +97,7 @@ impl KernelId {
             Self::PrescreenPopulation => PRESCREEN_SRAM_BYTES as usize,
             Self::FusedCoreScan256 => FUSED_CORE_SRAM_BYTES,
             Self::AdjointScan256 => ADJOINT_CORE_SRAM_BYTES,
+            Self::TileMixFwdAdj => TILE_MIX_SRAM_BYTES as usize,
             Self::GaborBezoutGrad => GABOR_BEZOUT_SRAM_BYTES as usize,
             Self::OzakiGramRhsI32 => OZAKI_GRAM_SRAM_BYTES as usize,
             Self::InnerOptStep => INNER_OPT_SRAM_BYTES as usize,
@@ -125,12 +134,14 @@ pub const fn embedded_wgsl(id: KernelId, variant: ShaderVariant) -> &'static str
         (ShaderVariant::Portable, KernelId::PrescreenPopulation) => PORTABLE_PRESCREEN,
         (ShaderVariant::Portable, KernelId::FusedCoreScan256) => PORTABLE_FUSED_CORE,
         (ShaderVariant::Portable, KernelId::AdjointScan256) => PORTABLE_ADJOINT,
+        (ShaderVariant::Portable, KernelId::TileMixFwdAdj) => PORTABLE_TILE_MIX,
         (ShaderVariant::Portable, KernelId::GaborBezoutGrad) => PORTABLE_GABOR,
         (ShaderVariant::Portable, KernelId::OzakiGramRhsI32) => PORTABLE_OZAKI,
         (ShaderVariant::Portable, KernelId::InnerOptStep) => PORTABLE_INNER_OPT,
         (ShaderVariant::Subgroups, KernelId::PrescreenPopulation) => SUBGROUPS_PRESCREEN,
         (ShaderVariant::Subgroups, KernelId::FusedCoreScan256) => SUBGROUPS_FUSED_CORE,
         (ShaderVariant::Subgroups, KernelId::AdjointScan256) => SUBGROUPS_ADJOINT,
+        (ShaderVariant::Subgroups, KernelId::TileMixFwdAdj) => SUBGROUPS_TILE_MIX,
         (ShaderVariant::Subgroups, KernelId::GaborBezoutGrad) => SUBGROUPS_GABOR,
         (ShaderVariant::Subgroups, KernelId::OzakiGramRhsI32) => SUBGROUPS_OZAKI,
         (ShaderVariant::Subgroups, KernelId::InnerOptStep) => SUBGROUPS_INNER_OPT,
@@ -257,7 +268,7 @@ fn split_entry_objects(section: &str) -> Vec<&str> {
     out
 }
 
-/// Verifies all 12 embedded `.wgsl` shader sources against the given `manifest_json` string
+/// Verifies all 14 embedded `.wgsl` shader sources against the given `manifest_json` string
 /// (`sha2::Sha256` digest equality and `workgroup_sram_bytes <= 15,872 B`).
 pub fn verify_manifest_digests(manifest_json: &str) -> Result<(), TrainError> {
     for variant in [ShaderVariant::Portable, ShaderVariant::Subgroups] {
@@ -313,7 +324,7 @@ pub fn verify_manifest_digests(manifest_json: &str) -> Result<(), TrainError> {
     Ok(())
 }
 
-/// Verifies all 12 embedded `.wgsl` shaders against the checked-in `tools/sona-shaders/wgsl/manifest.json`.
+/// Verifies all 14 embedded `.wgsl` shaders against the checked-in `tools/sona-shaders/wgsl/manifest.json`.
 pub fn verify_embedded_shader_digests() -> Result<(), TrainError> {
     verify_manifest_digests(MANIFEST_JSON)
 }

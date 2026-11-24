@@ -7,7 +7,7 @@
 
 use super::harness::{
     GpuContext, ShaderVariant, as_byte_slice, build_core_quad_bundle_with_k_nl,
-    cpu_params_from_packed, dispatch_kernel, read_vec4_vec,
+    cpu_params_from_packed, dispatch_adjoint_3pass, dispatch_kernel, read_vec4_vec,
 };
 use dnam_kernels::{
     CoreQuadParamsStereo4, GpuVec4, InterleavedStereo8, KernelVec4, SOFT_RECT_EPS,
@@ -15,16 +15,17 @@ use dnam_kernels::{
     prewarp_tan_pi_f_over_fs_f32, step_core_quad_phs_stereo8, step_core_quad_stereo8,
 };
 use sona_shaders::abi::{
-    AdjointScanUniforms, CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, FusedScanUniforms,
-    QUAD_PARAMS_VEC4_STRIDE, TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE,
-    quad_param_slots,
+    CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, FUSED_FLAG_FIXED_POINT_SCAN, FusedScanUniforms,
+    QUAD_PARAMS_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, quad_param_slots, resolve_quad_idx,
 };
 use sona_shaders::manifest::KernelId;
 use zerocopy::IntoBytes;
 
 const NUM_FRAMES: usize = 600;
 const NUM_TILES: usize = 3;
-const NUM_QUADS: usize = 2;
+const NUM_QUADS: usize = 6;
+const WAVE0_WG_X: usize = 2;
+const WAVE0_QUADS: [usize; WAVE0_WG_X] = [0, 4];
 const NUM_STEMS: usize = 1;
 const TOTAL_Q: usize = NUM_QUADS * NUM_STEMS;
 
@@ -55,11 +56,19 @@ fn make_asymmetric_phs_inputs(num_frames: usize) -> Vec<[f32; 4]> {
 }
 
 fn build_phs_quad_bundles() -> (Vec<CoreQuadParamsStereo4<GpuVec4>>, Vec<[f32; 4]>) {
-    let k_nl_sets = [[0.02_f32, 0.45, 1.10, 3.25], [0.0_f32, 0.35, 0.85, 2.10]];
+    let k_nl_sets = [
+        [0.02_f32, 0.45, 1.10, 3.25],
+        [0.0_f32; 4],
+        [0.0_f32; 4],
+        [0.0_f32; 4],
+        [0.0_f32, 0.35, 0.85, 2.10],
+        [0.0_f32; 4],
+    ];
     let mut cpu_params = Vec::with_capacity(TOTAL_Q);
     let mut packed_params = Vec::with_capacity(TOTAL_Q * QUAD_PARAMS_VEC4_STRIDE);
     for (q, k_nl) in k_nl_sets.into_iter().enumerate() {
-        let (mut cpu_p, mut gpu_p) = build_core_quad_bundle_with_k_nl(0, q, k_nl);
+        let profile_idx = if q == 4 { 1 } else { q % 4 };
+        let (mut cpu_p, mut gpu_p) = build_core_quad_bundle_with_k_nl(0, profile_idx, k_nl);
         if q == 0 {
             let mut g_arr = gpu_p[quad_param_slots::SVF_G];
             g_arr[0] = prewarp_tan_pi_f_over_fs_f32(0.04);
@@ -132,7 +141,7 @@ fn verify_k_nl_zero_linear_parity(ctx: &GpuContext, variant: ShaderVariant, inpu
     let single_in = &inputs[..NUM_FRAMES * CORE_INPUT_VEC4_STRIDE];
     let ckpt_init = vec![[0.0_f32; 4]; NUM_TILES * TILE_CKPT_VEC4_STRIDE];
     let feat_init = vec![[0.0_f32; 4]; NUM_FRAMES * FEATURE_VEC4_STRIDE];
-    let mut u0 = FusedScanUniforms {
+    let u0 = FusedScanUniforms {
         num_frames: NUM_FRAMES as u32,
         num_tiles: NUM_TILES as u32,
         num_quads: 1,
@@ -155,18 +164,29 @@ fn verify_k_nl_zero_linear_parity(ctx: &GpuContext, variant: ShaderVariant, inpu
             (true, as_byte_slice(&feat_init)),
         ],
     );
-    u0.block_idx = 1;
+    let dual_in = [single_in, single_in].concat();
+    let u1 = FusedScanUniforms {
+        num_quads: 2,
+        block_idx: 1,
+        ..u0
+    };
     let (out_lin, _) = dispatch_kernel(
         ctx,
         KernelId::FusedCoreScan256,
         variant,
         (1, 1, 1),
-        u0.as_bytes(),
+        u1.as_bytes(),
         &[
-            (false, as_byte_slice(single_in)),
-            (false, as_byte_slice(&packed_zero)),
-            (true, as_byte_slice(&ckpt_init)),
-            (true, as_byte_slice(&feat_init)),
+            (false, as_byte_slice(&dual_in)),
+            (false, as_byte_slice(&[packed_zero, packed_zero].concat())),
+            (
+                true,
+                as_byte_slice(&vec![[0.0_f32; 4]; 2 * NUM_TILES * TILE_CKPT_VEC4_STRIDE]),
+            ),
+            (
+                true,
+                as_byte_slice(&vec![[0.0_f32; 4]; 2 * NUM_FRAMES * FEATURE_VEC4_STRIDE]),
+            ),
         ],
     );
     let (_, packed_nz) = build_core_quad_bundle_with_k_nl(0, 0, [0.45, 1.10, 2.50, 4.00]);
@@ -175,61 +195,49 @@ fn verify_k_nl_zero_linear_parity(ctx: &GpuContext, variant: ShaderVariant, inpu
         KernelId::FusedCoreScan256,
         variant,
         (1, 1, 1),
-        u0.as_bytes(),
+        u1.as_bytes(),
         &[
-            (false, as_byte_slice(single_in)),
-            (false, as_byte_slice(&packed_nz)),
-            (true, as_byte_slice(&ckpt_init)),
-            (true, as_byte_slice(&feat_init)),
+            (false, as_byte_slice(&dual_in)),
+            (false, as_byte_slice(&[packed_nz, packed_nz].concat())),
+            (
+                true,
+                as_byte_slice(&vec![[0.0_f32; 4]; 2 * NUM_TILES * TILE_CKPT_VEC4_STRIDE]),
+            ),
+            (
+                true,
+                as_byte_slice(&vec![[0.0_f32; 4]; 2 * NUM_FRAMES * FEATURE_VEC4_STRIDE]),
+            ),
         ],
     );
     assert_eq!(out_lin_nz[0], out_lin[0]);
     assert_eq!(out_lin_nz[1], out_lin[1]);
-    let d_loss_lin = vec![[0.1_f32; 4]; NUM_FRAMES * FEATURE_VEC4_STRIDE];
-    let mut du_lin = vec![0_u8; single_in.len() * 16];
-    let mut pg_lin = vec![0_u8; NUM_TILES * QUAD_PARAMS_VEC4_STRIDE * 16];
-    let mut bd_lin = vec![0_u8; NUM_TILES * TILE_ADJ_BOUNDARY_VEC4_STRIDE * 16];
-    for (pass_mode, wg_y) in [(0_u32, NUM_TILES as u32), (1, 1), (2, NUM_TILES as u32)] {
-        let ua = AdjointScanUniforms {
-            num_frames: NUM_FRAMES as u32,
-            num_tiles: NUM_TILES as u32,
-            num_quads: 1,
-            num_stems: 1,
-            pass_mode,
-            soft_rect_eps: SOFT_RECT_EPS,
-            tiny_crossing_eps: TINY_CROSSING_EPS,
-            block_idx: 1,
-        };
-        let (o, _) = dispatch_kernel(
-            ctx,
-            KernelId::AdjointScan256,
-            variant,
-            (1, wg_y, 1),
-            ua.as_bytes(),
-            &[
-                (false, as_byte_slice(single_in)),
-                (false, as_byte_slice(&packed_nz)),
-                (false, &out_lin_nz[0]),
-                (false, as_byte_slice(&d_loss_lin)),
-                (true, &du_lin),
-                (true, &pg_lin),
-                (true, &bd_lin),
-                (false, &out_lin_nz[1]),
-            ],
-        );
-        du_lin = o[0].clone();
-        pg_lin = o[1].clone();
-        bd_lin = o[2].clone();
-    }
-    let pg_lin_v = read_vec4_vec(&pg_lin);
+    let d_loss_lin = vec![[0.1_f32; 4]; 2 * NUM_FRAMES * FEATURE_VEC4_STRIDE];
+    let pg_lin_v = dispatch_adjoint_3pass(
+        ctx,
+        variant,
+        NUM_FRAMES,
+        NUM_TILES,
+        2,
+        1,
+        1,
+        1,
+        SOFT_RECT_EPS,
+        TINY_CROSSING_EPS,
+        as_byte_slice(&dual_in),
+        as_byte_slice(&[packed_nz, packed_nz].concat()),
+        &out_lin_nz[0],
+        as_byte_slice(&d_loss_lin),
+        &out_lin_nz[1],
+        None,
+    )
+    .param_grads;
     for tile in 0..NUM_TILES {
-        assert_eq!(
-            pg_lin_v[tile * QUAD_PARAMS_VEC4_STRIDE + quad_param_slots::SVF_K_NL].map(f32::to_bits),
-            [0; 4]
-        );
+        let idx = (NUM_TILES + tile) * QUAD_PARAMS_VEC4_STRIDE + quad_param_slots::SVF_K_NL;
+        assert_eq!(pg_lin_v[idx].map(f32::to_bits), [0; 4]);
     }
     let feats_phs = read_vec4_vec(&out_phs[1]);
-    let feats_lin = read_vec4_vec(&out_lin[1]);
+    let feats_lin_all = read_vec4_vec(&out_lin[1]);
+    let feats_lin = &feats_lin_all[NUM_FRAMES * FEATURE_VEC4_STRIDE..];
     let mut state_phs = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
     let mut state_lin = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
     let cpu_zero = cpu_params_from_packed(&packed_zero);
@@ -291,7 +299,7 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
         ctx,
         KernelId::FusedCoreScan256,
         variant,
-        (NUM_QUADS as u32, 1, NUM_STEMS as u32),
+        (WAVE0_WG_X as u32, 1, NUM_STEMS as u32),
         fwd_uniforms.as_bytes(),
         &[
             (false, as_byte_slice(&core_inputs)),
@@ -304,7 +312,8 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
     let gpu_feats = read_vec4_vec(&fwd_out[1]);
 
     // Check forward parity against step_core_quad_phs_stereo8 and Zero-DC at block_idx = 0.
-    for q_global in 0..TOTAL_Q {
+    for (ql, &q_global) in WAVE0_QUADS.iter().enumerate() {
+        assert_eq!(resolve_quad_idx(0, ql, NUM_QUADS), q_global);
         let mut state = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
         let mut cpu_feats = Vec::with_capacity(NUM_FRAMES * FEATURE_VEC4_STRIDE);
         let mut peak = 1.0_f32;
@@ -349,13 +358,101 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
         }
     }
 
+    // Verify FUSED_FLAG_FIXED_POINT_SCAN Passive Picard (Block 0) + Damped-DEER (Block 0 & Block 1) <= 1e-6 parity.
+    let mut fp_u0 = fwd_uniforms;
+    fp_u0.block_idx = FUSED_FLAG_FIXED_POINT_SCAN;
+    let (fp_out0, _) = dispatch_kernel(
+        ctx,
+        KernelId::FusedCoreScan256,
+        variant,
+        (WAVE0_WG_X as u32, 1, NUM_STEMS as u32),
+        fp_u0.as_bytes(),
+        &[
+            (false, as_byte_slice(&core_inputs)),
+            (false, as_byte_slice(&quad_params_packed)),
+            (true, as_byte_slice(&ckpt_init)),
+            (true, as_byte_slice(&feat_init)),
+        ],
+    );
+    let fp_feats0 = read_vec4_vec(&fp_out0[1]);
+    for &q_global in &WAVE0_QUADS {
+        for t in 0..NUM_FRAMES {
+            for slot in 0..FEATURE_VEC4_STRIDE {
+                let idx = (q_global * NUM_FRAMES + t) * FEATURE_VEC4_STRIDE + slot;
+                for lane in 0..4 {
+                    let ref_val = fp_feats0[idx][lane];
+                    let got_val = gpu_feats[idx][lane];
+                    let diff = (ref_val - got_val).abs();
+                    let tol = 1.0e-5 * ref_val.abs().max(got_val.abs()).max(1.0);
+                    assert!(
+                        diff <= tol,
+                        "Fixed-point PHS/DEER ({label}) mismatch q={q_global} t={t} slot={slot} lane={lane}: diff={diff} tol={tol}"
+                    );
+                }
+            }
+        }
+    }
+    let lin_seq_u = FusedScanUniforms {
+        block_idx: 1,
+        ..fwd_uniforms
+    };
+    let (lin_seq_out, _) = dispatch_kernel(
+        ctx,
+        KernelId::FusedCoreScan256,
+        variant,
+        (2, 1, NUM_STEMS as u32),
+        lin_seq_u.as_bytes(),
+        &[
+            (false, as_byte_slice(&core_inputs)),
+            (false, as_byte_slice(&quad_params_packed)),
+            (true, as_byte_slice(&ckpt_init)),
+            (true, as_byte_slice(&feat_init)),
+        ],
+    );
+    let lin_fp_u = FusedScanUniforms {
+        block_idx: 1 | FUSED_FLAG_FIXED_POINT_SCAN,
+        ..fwd_uniforms
+    };
+    let (lin_fp_out, _) = dispatch_kernel(
+        ctx,
+        KernelId::FusedCoreScan256,
+        variant,
+        (2, 1, NUM_STEMS as u32),
+        lin_fp_u.as_bytes(),
+        &[
+            (false, as_byte_slice(&core_inputs)),
+            (false, as_byte_slice(&quad_params_packed)),
+            (true, as_byte_slice(&ckpt_init)),
+            (true, as_byte_slice(&feat_init)),
+        ],
+    );
+    let lin_seq_f = read_vec4_vec(&lin_seq_out[1]);
+    let lin_fp_f = read_vec4_vec(&lin_fp_out[1]);
+    for q_global in [1_usize, 5] {
+        for t in 0..NUM_FRAMES {
+            for slot in 0..FEATURE_VEC4_STRIDE {
+                let idx = (q_global * NUM_FRAMES + t) * FEATURE_VEC4_STRIDE + slot;
+                for lane in 0..4 {
+                    let ref_val = lin_fp_f[idx][lane];
+                    let got_val = lin_seq_f[idx][lane];
+                    let diff = (ref_val - got_val).abs();
+                    let tol = 1.0e-5 * ref_val.abs().max(got_val.abs()).max(1.0);
+                    assert!(
+                        diff <= tol,
+                        "Fixed-point Linear Damped-DEER ({label}) mismatch q={q_global} t={t} slot={slot} lane={lane}: diff={diff} tol={tol}"
+                    );
+                }
+            }
+        }
+    }
+
     // Zero-DC canonical +0.0 verification on block_idx = 0 with nonzero svf_k_nl.
     let neg_zero_in = vec![[-0.0_f32; 4]; core_inputs.len()];
     let (zero_out, _) = dispatch_kernel(
         ctx,
         KernelId::FusedCoreScan256,
         variant,
-        (NUM_QUADS as u32, 1, NUM_STEMS as u32),
+        (WAVE0_WG_X as u32, 1, NUM_STEMS as u32),
         fwd_uniforms.as_bytes(),
         &[
             (false, as_byte_slice(&neg_zero_in)),
@@ -377,7 +474,7 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
         ctx,
         KernelId::FusedCoreScan256,
         variant,
-        (NUM_QUADS as u32, 1, NUM_STEMS as u32),
+        (WAVE0_WG_X as u32, 1, NUM_STEMS as u32),
         resume_u.as_bytes(),
         &[
             (false, as_byte_slice(&core_inputs)),
@@ -387,7 +484,7 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
         ],
     );
     let res_feats = read_vec4_vec(&res_out[1]);
-    for q_global in 0..TOTAL_Q {
+    for &q_global in &WAVE0_QUADS {
         for t in 256..NUM_FRAMES {
             for slot in 0..FEATURE_VEC4_STRIDE {
                 let idx = (q_global * NUM_FRAMES + t) * FEATURE_VEC4_STRIDE + slot;
@@ -422,53 +519,39 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
         "PHS test must exercise both saturated and unsaturated E[n] regimes"
     );
 
-    let mut du_buf = vec![0_u8; core_inputs.len() * 16];
-    let mut pgrad_buf = vec![0_u8; TOTAL_Q * NUM_TILES * QUAD_PARAMS_VEC4_STRIDE * 16];
-    let mut adj_bound_buf = vec![0_u8; TOTAL_Q * NUM_TILES * TILE_ADJ_BOUNDARY_VEC4_STRIDE * 16];
-    for (pass_mode, wg_y) in [(0_u32, NUM_TILES as u32), (1, 1), (2, NUM_TILES as u32)] {
-        let u = AdjointScanUniforms {
-            num_frames: NUM_FRAMES as u32,
-            num_tiles: NUM_TILES as u32,
-            num_quads: NUM_QUADS as u32,
-            num_stems: NUM_STEMS as u32,
-            pass_mode,
-            soft_rect_eps: SOFT_RECT_EPS,
-            tiny_crossing_eps: TINY_CROSSING_EPS,
-            block_idx: 0,
-        };
-        let (out, _) = dispatch_kernel(
-            ctx,
-            KernelId::AdjointScan256,
-            variant,
-            (NUM_QUADS as u32, wg_y, NUM_STEMS as u32),
-            u.as_bytes(),
-            &[
-                (false, as_byte_slice(&core_inputs)),
-                (false, as_byte_slice(&quad_params_packed)),
-                (false, &fwd_out[0]),
-                (false, as_byte_slice(&d_loss_d_features)),
-                (true, &du_buf),
-                (true, &pgrad_buf),
-                (true, &adj_bound_buf),
-                (false, &fwd_out[1]),
-            ],
-        );
-        du_buf = out[0].clone();
-        pgrad_buf = out[1].clone();
-        adj_bound_buf = out[2].clone();
-    }
+    let phs_adj = dispatch_adjoint_3pass(
+        ctx,
+        variant,
+        NUM_FRAMES,
+        NUM_TILES,
+        NUM_QUADS,
+        NUM_STEMS,
+        WAVE0_WG_X,
+        0,
+        SOFT_RECT_EPS,
+        TINY_CROSSING_EPS,
+        as_byte_slice(&core_inputs),
+        as_byte_slice(&quad_params_packed),
+        &fwd_out[0],
+        as_byte_slice(&d_loss_d_features),
+        &fwd_out[1],
+        None,
+    );
+    let got_du = phs_adj.du;
+    let got_pgrad = phs_adj.param_grads;
 
-    let got_du = read_vec4_vec(&du_buf);
-    let got_pgrad = read_vec4_vec(&pgrad_buf);
-
-    for q_global in 0..TOTAL_Q {
+    for &q_global in &WAVE0_QUADS {
         for &t in &[0_usize, 19, 254, 255, 256, 257, 510, 511, 512, 598, 599] {
             for ch in 0..CORE_INPUT_VEC4_STRIDE {
                 let idx = (q_global * NUM_FRAMES + t) * CORE_INPUT_VEC4_STRIDE + ch;
                 for lane in [0_usize, 1, 2, 3] {
                     // Scale step to drive amplitude: high-drive lane 0 avoids f32 FD cancellation; lower-drive lanes avoid |bp|=0 Duhem kinks.
                     let eps_u = if ch == 0 && lane == 0 {
-                        4.0e-3_f32
+                        if quad_params_cpu[q_global].svf_k_nl.to_array()[lane] == 0.0 {
+                            1.0e-2_f32
+                        } else {
+                            4.0e-3_f32
+                        }
                     } else {
                         1.0e-3_f32
                     };
@@ -514,7 +597,7 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
         (quad_param_slots::ADAA_DRIVE, 2.0e-3, 2.0e-3),
         (quad_param_slots::GLU_MIX, 2.0e-3, 2.0e-3),
     ];
-    for q_global in 0..TOTAL_Q {
+    for &q_global in &WAVE0_QUADS {
         let base_slice = &quad_params_packed
             [q_global * QUAD_PARAMS_VEC4_STRIDE..(q_global + 1) * QUAD_PARAMS_VEC4_STRIDE];
         for zero_slot in [

@@ -13,12 +13,14 @@ mod inner_opt;
 mod ozaki_gram;
 mod prescreen;
 mod reduce;
+mod tile_mix;
 
 use abi::{
     ADJOINT_AUX_FLOATS, ADJOINT_S_PREV2_VEC4S, ADJOINT_SCAN_SCRATCH_FLOATS, ADJOINT_U_TONE2_VEC2S,
-    ADJOINT_V_TRAJ2_VEC2S, AdjointScanUniforms, FORWARD_AUX_SCRATCH_FLOATS, FORWARD_LANE_BUF_VEC4S,
-    FORWARD_SCAN_SCRATCH_FLOATS, FusedScanUniforms, GaborBezoutUniforms, InnerOptUniforms,
-    OzakiGramUniforms, PrescreenUniforms,
+    ADJOINT_V_TRAJ2_VEC2S, AdjointScanUniforms, FORWARD_AUX_SCRATCH_FLOATS,
+    FORWARD_LANE_BUF_FLOATS, FORWARD_SCAN_SCRATCH_FLOATS, FusedScanUniforms, GaborBezoutUniforms,
+    InnerOptUniforms, OzakiGramUniforms, PrescreenUniforms, TILE_MIX_REDUCE_A_FLOATS,
+    TILE_MIX_REDUCE_B_FLOATS, TileMixUniforms,
 };
 use adjoint_core::adjoint_scan_256_impl;
 use fused_core::fused_core_scan_256_impl;
@@ -36,6 +38,7 @@ use prescreen::{
 };
 use spirv_std::glam::{UVec3, Vec2, Vec4};
 use spirv_std::spirv;
+use tile_mix::tile_mix_fwd_adj_impl;
 
 #[cfg(not(all(target_arch = "spirv", feature = "subgroups")))]
 #[allow(clippy::too_many_arguments)]
@@ -99,7 +102,7 @@ pub fn prescreen_population(
 }
 
 /// Forward `CoreQuad` tile scan (`fused_core_scan_256`). Both `portable` and `subgroups` builds
-/// intentionally emit identical Blelloch `tpt_exclusive_scan_256` code with zero subgroup scalar reductions.
+/// share identical workgroup-barrier sub-tile scans inside `15,360 B` SRAM.
 #[allow(clippy::too_many_arguments)]
 #[spirv(compute(threads(256, 1, 1)))]
 pub fn fused_core_scan_256(
@@ -112,7 +115,7 @@ pub fn fused_core_scan_256(
     #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] tile_checkpoints: &mut [Vec4],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] feature_outputs: &mut [Vec4],
     #[spirv(workgroup)] scan_scratch: &mut [f32; FORWARD_SCAN_SCRATCH_FLOATS],
-    #[spirv(workgroup)] lane_buf: &mut [Vec4; FORWARD_LANE_BUF_VEC4S],
+    #[spirv(workgroup)] lane_buf: &mut [f32; FORWARD_LANE_BUF_FLOATS],
     #[spirv(workgroup)] aux_scratch: &mut [f32; FORWARD_AUX_SCRATCH_FLOATS],
 ) {
     fused_core_scan_256_impl(
@@ -225,6 +228,69 @@ pub fn adjoint_scan_256(
 #[cfg(not(all(target_arch = "spirv", feature = "subgroups")))]
 #[allow(clippy::too_many_arguments)]
 #[spirv(compute(threads(256, 1, 1)))]
+pub fn tile_mix_fwd_adj(
+    #[spirv(workgroup_id)] wg_id: UVec3,
+    #[spirv(local_invocation_index)] lid: u32,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] uniforms: &TileMixUniforms,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)]
+    block_inputs_or_d_loss_d_inputs: &mut [Vec4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] tile_descriptors: &[Vec4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] feature_outputs: &[Vec4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] tile_weight_grads: &mut [f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] d_loss_d_features: &mut [Vec4],
+    #[spirv(workgroup)] reduce_a: &mut [f32; TILE_MIX_REDUCE_A_FLOATS],
+    #[spirv(workgroup)] reduce_b: &mut [f32; TILE_MIX_REDUCE_B_FLOATS],
+) {
+    tile_mix_fwd_adj_impl(
+        wg_id,
+        lid,
+        0,
+        uniforms,
+        block_inputs_or_d_loss_d_inputs,
+        tile_descriptors,
+        feature_outputs,
+        tile_weight_grads,
+        d_loss_d_features,
+        reduce_a,
+        reduce_b,
+    );
+}
+
+#[cfg(all(target_arch = "spirv", feature = "subgroups"))]
+#[allow(clippy::too_many_arguments)]
+#[spirv(compute(threads(256, 1, 1)))]
+pub fn tile_mix_fwd_adj(
+    #[spirv(workgroup_id)] wg_id: UVec3,
+    #[spirv(local_invocation_index)] lid: u32,
+    #[spirv(subgroup_local_invocation_id)] sg_lid: u32,
+    #[spirv(uniform, descriptor_set = 0, binding = 0)] uniforms: &TileMixUniforms,
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)]
+    block_inputs_or_d_loss_d_inputs: &mut [Vec4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] tile_descriptors: &[Vec4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] feature_outputs: &[Vec4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] tile_weight_grads: &mut [f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] d_loss_d_features: &mut [Vec4],
+    #[spirv(workgroup)] reduce_a: &mut [f32; TILE_MIX_REDUCE_A_FLOATS],
+    #[spirv(workgroup)] reduce_b: &mut [f32; TILE_MIX_REDUCE_B_FLOATS],
+) {
+    tile_mix_fwd_adj_impl(
+        wg_id,
+        lid,
+        sg_lid,
+        uniforms,
+        block_inputs_or_d_loss_d_inputs,
+        tile_descriptors,
+        feature_outputs,
+        tile_weight_grads,
+        d_loss_d_features,
+        reduce_a,
+        reduce_b,
+    );
+}
+
+#[cfg(not(all(target_arch = "spirv", feature = "subgroups")))]
+#[allow(clippy::too_many_arguments)]
+#[spirv(compute(threads(256, 1, 1)))]
 pub fn gabor_bezout_grad(
     #[spirv(workgroup_id)] wg_id: UVec3,
     #[spirv(local_invocation_index)] lid: u32,
@@ -351,10 +417,10 @@ pub fn inner_opt_step(
     #[spirv(workgroup_id)] wg_id: UVec3,
     #[spirv(local_invocation_index)] lid: u32,
     #[spirv(uniform, descriptor_set = 0, binding = 0)] uniforms: &InnerOptUniforms,
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] theta: &mut [f32],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] grad: &[f32],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] param_bounds: &[Vec2],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] lbfgs_s_y: &mut [Vec4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] theta_candidates: &mut [f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] grad_candidates: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] param_bounds_and_ste_mask: &[Vec4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] adamw_m_v_or_lbfgs: &mut [Vec4],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] search_dir: &mut [f32],
     #[spirv(workgroup)] scratch_q: &mut [f32; INNER_OPT_Q_FLOATS],
     #[spirv(workgroup)] dot_scratch: &mut [f32; INNER_OPT_DOT_FLOATS],
@@ -365,10 +431,10 @@ pub fn inner_opt_step(
         lid,
         0,
         uniforms,
-        theta,
-        grad,
-        param_bounds,
-        lbfgs_s_y,
+        theta_candidates,
+        grad_candidates,
+        param_bounds_and_ste_mask,
+        adamw_m_v_or_lbfgs,
         search_dir,
         scratch_q,
         dot_scratch,
@@ -384,10 +450,10 @@ pub fn inner_opt_step(
     #[spirv(local_invocation_index)] lid: u32,
     #[spirv(subgroup_local_invocation_id)] sg_lid: u32,
     #[spirv(uniform, descriptor_set = 0, binding = 0)] uniforms: &InnerOptUniforms,
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] theta: &mut [f32],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] grad: &[f32],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] param_bounds: &[Vec2],
-    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] lbfgs_s_y: &mut [Vec4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 1)] theta_candidates: &mut [f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 2)] grad_candidates: &[f32],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 3)] param_bounds_and_ste_mask: &[Vec4],
+    #[spirv(storage_buffer, descriptor_set = 0, binding = 4)] adamw_m_v_or_lbfgs: &mut [Vec4],
     #[spirv(storage_buffer, descriptor_set = 0, binding = 5)] search_dir: &mut [f32],
     #[spirv(workgroup)] scratch_q: &mut [f32; INNER_OPT_Q_FLOATS],
     #[spirv(workgroup)] dot_scratch: &mut [f32; INNER_OPT_DOT_FLOATS],
@@ -398,10 +464,10 @@ pub fn inner_opt_step(
         lid,
         sg_lid,
         uniforms,
-        theta,
-        grad,
-        param_bounds,
-        lbfgs_s_y,
+        theta_candidates,
+        grad_candidates,
+        param_bounds_and_ste_mask,
+        adamw_m_v_or_lbfgs,
         search_dir,
         scratch_q,
         dot_scratch,

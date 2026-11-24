@@ -2,24 +2,31 @@
 
 //! Persistent `256`-frame forward scan kernel (`fused_core_scan_256_impl`) executing
 //! `TPT-SVF -> Selective-Duhem ParaLRU + Stereo Link -> Sag -> PolyADAA1 + C^2 Wavefolder -> GLU`
-//! strictly inside `15,360 B` (`15.0 KiB`) workgroup SRAM (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
+//! strictly inside `15,360 B` (`15.0 KiB`) workgroup SRAM across `2 × 128` sequential sub-tiles
+//! (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
+
+pub mod fixed_point;
 
 use crate::abi::{
-    FORWARD_AUX_SCRATCH_FLOATS, FORWARD_LANE_BUF_VEC4S, FORWARD_SCAN_SCRATCH_FLOATS,
-    FusedScanUniforms, TILE_FRAMES,
+    BLOCK_IDX_DIRECT_LINEAR, CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE,
+    FORWARD_AUX_SCRATCH_FLOATS, FORWARD_LANE_BUF_FLOATS, FORWARD_SCAN_SCRATCH_FLOATS,
+    FUSED_FLAG_FIXED_POINT_SCAN, FusedScanUniforms, QUAD_PARAMS_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE,
+    TILE_FRAMES, resolve_quad_idx,
 };
 use crate::core_math::{
-    CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, MIN_SAG_GAIN, QUAD_PARAMS_VEC4_STRIDE,
-    QuadLaneParams, QuadParamsUnpacked, TILE_CKPT_VEC4_STRIDE, clamp_nonneg_safe, div_ceil_divfree,
-    eval_tone_scalar, eval_tpt_svf_scalar, flush_zero, get_lane, gpu_to_vec4, load_vec4,
-    scrub_endpoint, set_lane, step_duhem_stereo_scalar, step_tpt_svf_phs_scalar, store_vec4,
-    sub_sat_usize, tpt_exclusive_scan_256, vec4_to_gpu, wg_barrier,
+    MIN_SAG_GAIN, QuadParamsUnpacked, clamp_nonneg_safe, div_ceil_divfree, eval_tone_scalar,
+    eval_tpt_svf_scalar, flush_zero, get_lane, gpu_to_vec4, load_vec4, scrub_endpoint,
+    step_duhem_stereo_scalar, step_tpt_svf_phs_scalar, store_vec4, sub_sat_usize,
+    tpt_exclusive_scan_128_pair, vec4_to_gpu, wg_barrier,
 };
 use dnam_kernels::{
-    GpuVec4, InterleavedStereo8, KernelVec4, SonaBlockStateStereo8, StereoVec8, TptScanElem,
-    eval_c2_wavefolder_adaa_vec4, eval_poly_adaa1_odd_even_vec4,
+    GpuVec4, InterleavedStereo8, KernelVec4, StereoVec8, TptScanElem, eval_c2_wavefolder_adaa_vec4,
+    eval_poly_adaa1_odd_even_vec4,
 };
+use fixed_point::{lane_slot, run_duhem_damped_deer_subtile_lane, run_phs_passive_picard_subtile};
 use spirv_std::glam::{UVec3, Vec4};
+
+const SUBTILE_FRAMES: usize = TILE_FRAMES / 2;
 
 #[inline(always)]
 fn canonicalize_vec4_zero(v: Vec4) -> Vec4 {
@@ -42,134 +49,119 @@ fn scrub_vec4_endpoints(v: Vec4) -> GpuVec4 {
 }
 
 #[inline(always)]
-fn read_tile_checkpoint(
+fn load_ckpt_to_aux(
     tile_checkpoints: &[Vec4],
-    q_global: usize,
+    q_tier: usize,
     ckpt_tiles: usize,
     tile: usize,
-) -> SonaBlockStateStereo8<InterleavedStereo8<GpuVec4>> {
-    let ckpt_base = (q_global * ckpt_tiles + tile) * TILE_CKPT_VEC4_STRIDE;
-    let s1_l = vec4_to_gpu(canonicalize_vec4_zero(load_vec4(
-        tile_checkpoints,
-        ckpt_base,
-    )));
-    let s1_r = vec4_to_gpu(canonicalize_vec4_zero(load_vec4(
-        tile_checkpoints,
-        ckpt_base + 1,
-    )));
-    let s2_l = vec4_to_gpu(canonicalize_vec4_zero(load_vec4(
-        tile_checkpoints,
-        ckpt_base + 2,
-    )));
-    let s2_r = vec4_to_gpu(canonicalize_vec4_zero(load_vec4(
-        tile_checkpoints,
-        ckpt_base + 3,
-    )));
-    let v_l = vec4_to_gpu(canonicalize_vec4_zero(load_vec4(
-        tile_checkpoints,
-        ckpt_base + 4,
-    )));
-    let v_r = vec4_to_gpu(canonicalize_vec4_zero(load_vec4(
-        tile_checkpoints,
-        ckpt_base + 5,
-    )));
-    let ap_l = scrub_vec4_endpoints(load_vec4(tile_checkpoints, ckpt_base + 6));
-    let ap_r = scrub_vec4_endpoints(load_vec4(tile_checkpoints, ckpt_base + 7));
-    SonaBlockStateStereo8 {
-        svf_s1: InterleavedStereo8::from_lr(s1_l, s1_r),
-        svf_s2: InterleavedStereo8::from_lr(s2_l, s2_r),
-        lru_v: InterleavedStereo8::from_lr(v_l, v_r),
-        adaa_prev: InterleavedStereo8::from_lr(ap_l, ap_r),
+    aux_scratch: &mut [f32; FORWARD_AUX_SCRATCH_FLOATS],
+) {
+    let ckpt_base = (q_tier * ckpt_tiles + tile) * TILE_CKPT_VEC4_STRIDE;
+    let s1_l = canonicalize_vec4_zero(load_vec4(tile_checkpoints, ckpt_base)).to_array();
+    let s1_r = canonicalize_vec4_zero(load_vec4(tile_checkpoints, ckpt_base + 1)).to_array();
+    let s2_l = canonicalize_vec4_zero(load_vec4(tile_checkpoints, ckpt_base + 2)).to_array();
+    let s2_r = canonicalize_vec4_zero(load_vec4(tile_checkpoints, ckpt_base + 3)).to_array();
+    let v_l = canonicalize_vec4_zero(load_vec4(tile_checkpoints, ckpt_base + 4)).to_array();
+    let v_r = canonicalize_vec4_zero(load_vec4(tile_checkpoints, ckpt_base + 5)).to_array();
+    let ap_l = scrub_vec4_endpoints(load_vec4(tile_checkpoints, ckpt_base + 6)).to_array();
+    let ap_r = scrub_vec4_endpoints(load_vec4(tile_checkpoints, ckpt_base + 7)).to_array();
+    for c in 0..4 {
+        aux_scratch[c] = s1_l[c];
+        aux_scratch[4 + c] = s2_l[c];
+        aux_scratch[8 + c] = s1_r[c];
+        aux_scratch[12 + c] = s2_r[c];
+        aux_scratch[16 + c] = v_l[c];
+        aux_scratch[20 + c] = v_r[c];
+        aux_scratch[24 + c] = ap_l[c];
+        aux_scratch[28 + c] = ap_r[c];
     }
 }
 
 #[inline(always)]
-fn write_tile_checkpoint(
+fn store_aux_to_ckpt(
     tile_checkpoints: &mut [Vec4],
-    q_global: usize,
+    q_tier: usize,
     ckpt_tiles: usize,
     tile: usize,
-    state: &SonaBlockStateStereo8<InterleavedStereo8<GpuVec4>>,
+    aux_scratch: &[f32; FORWARD_AUX_SCRATCH_FLOATS],
 ) {
-    let ckpt_base = (q_global * ckpt_tiles + tile) * TILE_CKPT_VEC4_STRIDE;
-    let (s1_l, s1_r) = state.svf_s1.into_lr();
-    let (s2_l, s2_r) = state.svf_s2.into_lr();
-    let (v_l, v_r) = state.lru_v.into_lr();
-    let (ap_l, ap_r) = state.adaa_prev.into_lr();
-
-    store_vec4(
-        tile_checkpoints,
-        ckpt_base,
-        canonicalize_vec4_zero(gpu_to_vec4(s1_l)),
+    let ckpt_base = (q_tier * ckpt_tiles + tile) * TILE_CKPT_VEC4_STRIDE;
+    let s1_l = Vec4::new(
+        aux_scratch[0],
+        aux_scratch[1],
+        aux_scratch[2],
+        aux_scratch[3],
     );
+    let s2_l = Vec4::new(
+        aux_scratch[4],
+        aux_scratch[5],
+        aux_scratch[6],
+        aux_scratch[7],
+    );
+    let s1_r = Vec4::new(
+        aux_scratch[8],
+        aux_scratch[9],
+        aux_scratch[10],
+        aux_scratch[11],
+    );
+    let s2_r = Vec4::new(
+        aux_scratch[12],
+        aux_scratch[13],
+        aux_scratch[14],
+        aux_scratch[15],
+    );
+    let v_l = Vec4::new(
+        aux_scratch[16],
+        aux_scratch[17],
+        aux_scratch[18],
+        aux_scratch[19],
+    );
+    let v_r = Vec4::new(
+        aux_scratch[20],
+        aux_scratch[21],
+        aux_scratch[22],
+        aux_scratch[23],
+    );
+    let ap_l = Vec4::new(
+        aux_scratch[24],
+        aux_scratch[25],
+        aux_scratch[26],
+        aux_scratch[27],
+    );
+    let ap_r = Vec4::new(
+        aux_scratch[28],
+        aux_scratch[29],
+        aux_scratch[30],
+        aux_scratch[31],
+    );
+    store_vec4(tile_checkpoints, ckpt_base, canonicalize_vec4_zero(s1_l));
     store_vec4(
         tile_checkpoints,
         ckpt_base + 1,
-        canonicalize_vec4_zero(gpu_to_vec4(s1_r)),
+        canonicalize_vec4_zero(s1_r),
     );
     store_vec4(
         tile_checkpoints,
         ckpt_base + 2,
-        canonicalize_vec4_zero(gpu_to_vec4(s2_l)),
+        canonicalize_vec4_zero(s2_l),
     );
     store_vec4(
         tile_checkpoints,
         ckpt_base + 3,
-        canonicalize_vec4_zero(gpu_to_vec4(s2_r)),
+        canonicalize_vec4_zero(s2_r),
     );
-    store_vec4(
-        tile_checkpoints,
-        ckpt_base + 4,
-        canonicalize_vec4_zero(gpu_to_vec4(v_l)),
-    );
-    store_vec4(
-        tile_checkpoints,
-        ckpt_base + 5,
-        canonicalize_vec4_zero(gpu_to_vec4(v_r)),
-    );
+    store_vec4(tile_checkpoints, ckpt_base + 4, canonicalize_vec4_zero(v_l));
+    store_vec4(tile_checkpoints, ckpt_base + 5, canonicalize_vec4_zero(v_r));
     store_vec4(
         tile_checkpoints,
         ckpt_base + 6,
-        canonicalize_vec4_zero(gpu_to_vec4(ap_l)),
+        canonicalize_vec4_zero(ap_l),
     );
     store_vec4(
         tile_checkpoints,
         ckpt_base + 7,
-        canonicalize_vec4_zero(gpu_to_vec4(ap_r)),
+        canonicalize_vec4_zero(ap_r),
     );
-}
-
-#[inline]
-fn step_tile_duhem_on_thread0(
-    scan_scratch: &mut [f32; FORWARD_SCAN_SCRATCH_FLOATS],
-    valid_len: usize,
-    v_init_l: f32,
-    v_init_r: f32,
-    lp: &QuadLaneParams,
-) -> (f32, f32) {
-    let lru_coeffs = lp.to_lru_coeffs();
-    let mut vl = v_init_l;
-    let mut vr = v_init_r;
-    for t in 0..valid_len {
-        let i = t & 255;
-        let tone_l = scan_scratch[i];
-        let bp_l = scan_scratch[TILE_FRAMES + i];
-        let tone_r = scan_scratch[2 * TILE_FRAMES + i];
-        let bp_r = scan_scratch[3 * TILE_FRAMES + i];
-        let (_rl, _rr, eff_l, eff_r) = step_duhem_stereo_scalar(
-            tone_l,
-            tone_r,
-            bp_l,
-            bp_r,
-            &mut vl,
-            &mut vr,
-            lp,
-            &lru_coeffs,
-        );
-        scan_scratch[4 * TILE_FRAMES + i] = eff_l;
-        scan_scratch[5 * TILE_FRAMES + i] = eff_r;
-    }
-    (vl, vr)
 }
 
 #[inline(always)]
@@ -200,12 +192,7 @@ fn eval_lane_block_outputs(
     (odd_l, odd_r, even_l_out, even_r_out)
 }
 
-/// Executes the persistent forward `CoreQuad` tile scan (`fused_core_scan_256`) over
-/// `tile_start .. num_tiles` (or the per-window slice when `num_wg.y > 1`), preserving exact
-/// `0-ULP` parity with `dnam_kernels::step_core_quad_stereo8` inside `15,360 B` SRAM.
-///
-/// Both `portable` and `subgroups` builds share this Blelloch `tpt_exclusive_scan_256` kernel
-/// because the forward scan performs no `subgroup_f_add` workgroup scalar reductions.
+/// Executes the persistent wave-mapped `2 × 128` sub-tile forward `CoreQuad` scan (`15,360 B` SRAM).
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn fused_core_scan_256_impl(
@@ -219,18 +206,29 @@ pub fn fused_core_scan_256_impl(
     tile_checkpoints: &mut [Vec4],
     feature_outputs: &mut [Vec4],
     scan_scratch: &mut [f32; FORWARD_SCAN_SCRATCH_FLOATS],
-    lane_buf: &mut [Vec4; FORWARD_LANE_BUF_VEC4S],
+    lane_buf: &mut [f32; FORWARD_LANE_BUF_FLOATS],
     aux_scratch: &mut [f32; FORWARD_AUX_SCRATCH_FLOATS],
 ) {
     let _ = gid;
     let lid = (lid_u32 as usize) & 255;
+    let t128 = lid & 127;
+    let is_r128 = (lid >> 7) != 0;
 
-    let quads_in_block = (num_wg.x as usize).max(1);
     let q_local = wg_id.x as usize;
     let win_idx = wg_id.y as usize;
     let num_windows = (num_wg.y as usize).max(1);
     let stem = wg_id.z as usize;
-    let q_global = stem * quads_in_block + q_local;
+
+    let num_quads = (uniforms.num_quads as usize).max(1);
+    let quad_idx = resolve_quad_idx(uniforms.block_idx, q_local, num_quads);
+    if quad_idx >= num_quads {
+        return;
+    }
+    let q_tier = stem * num_quads + quad_idx;
+
+    let is_direct = uniforms.block_idx == BLOCK_IDX_DIRECT_LINEAR;
+    let use_fixed_point = !is_direct && (uniforms.block_idx & FUSED_FLAG_FIXED_POINT_SCAN) != 0;
+    let is_phs = !is_direct && (uniforms.block_idx & 0x3) == 0;
 
     let num_frames = uniforms.num_frames as usize;
     let total_tiles = if num_frames > 0 {
@@ -252,8 +250,7 @@ pub fn fused_core_scan_256_impl(
         (begin, end)
     };
 
-    let is_phs = uniforms.block_idx == 0;
-    let q_base = q_global * QUAD_PARAMS_VEC4_STRIDE;
+    let q_base = q_tier * QUAD_PARAMS_VEC4_STRIDE;
     let params = QuadParamsUnpacked::load(quad_params, q_base);
     let wf_mix_g = GpuVec4::from_array([
         clamp_nonneg_safe(params.wavefolder_mix.x, 1.0),
@@ -264,290 +261,279 @@ pub fn fused_core_scan_256_impl(
     let glu_mix_g = vec4_to_gpu(params.glu_mix);
 
     let resuming_from_ckpt = num_windows <= 1 && tile_start > 0 && tile_start < ckpt_tiles;
-    let mut state = if resuming_from_ckpt {
-        read_tile_checkpoint(tile_checkpoints, q_global, ckpt_tiles, tile_start)
-    } else {
-        SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero()
-    };
+    if lid == 0 {
+        if resuming_from_ckpt {
+            load_ckpt_to_aux(
+                tile_checkpoints,
+                q_tier,
+                ckpt_tiles,
+                tile_start,
+                aux_scratch,
+            );
+        } else {
+            for k in 0..32 {
+                aux_scratch[k] = 0.0;
+            }
+        }
+    }
+    wg_barrier();
 
     for tile in t_begin..t_end {
         let tile_frame_base = tile * TILE_FRAMES;
-        let valid_len = sub_sat_usize(num_frames, tile_frame_base).min(TILE_FRAMES);
-        let frame = tile_frame_base + lid;
-        let is_active = lid < valid_len;
-
         if lid == 0 && !(resuming_from_ckpt && tile == tile_start) {
-            write_tile_checkpoint(tile_checkpoints, q_global, ckpt_tiles, tile, &state);
-        }
-
-        lane_buf[lid] = Vec4::ZERO;
-        lane_buf[TILE_FRAMES + lid] = Vec4::ZERO;
-
-        let in_base = (q_global * num_frames + frame) * CORE_INPUT_VEC4_STRIDE;
-        let (in_l, in_r) = if is_active {
-            (
-                load_vec4(core_inputs, in_base),
-                load_vec4(core_inputs, in_base + 1),
-            )
-        } else {
-            (Vec4::ZERO, Vec4::ZERO)
-        };
-
-        let mut my_veff_l = [0.0_f32; 4];
-        let mut my_veff_r = [0.0_f32; 4];
-        let (s1_cur_l, s1_cur_r) = state.svf_s1.into_lr();
-        let (s2_cur_l, s2_cur_r) = state.svf_s2.into_lr();
-        let mut s1_end_l_arr = [0.0_f32; 4];
-        let mut s1_end_r_arr = [0.0_f32; 4];
-        let mut s2_end_l_arr = [0.0_f32; 4];
-        let mut s2_end_r_arr = [0.0_f32; 4];
-
-        for c in 0..4 {
-            let lp = params.lane(c);
-            let u_l = if is_active {
-                flush_zero(get_lane(in_l, c))
-            } else {
-                0.0
-            };
-            let u_r = if is_active {
-                flush_zero(get_lane(in_r, c))
-            } else {
-                0.0
-            };
-
-            let (tone_l_saved, tone_r) = if is_phs {
-                scan_scratch[4 * TILE_FRAMES + lid] = u_l;
-                scan_scratch[5 * TILE_FRAMES + lid] = u_r;
-                wg_barrier();
-                if lid == 0 {
-                    let mut s1_l = s1_cur_l.to_array()[c & 3];
-                    let mut s2_l = s2_cur_l.to_array()[c & 3];
-                    for t in 0..valid_len {
-                        let ti = t & 255;
-                        let u = scan_scratch[4 * TILE_FRAMES + ti];
-                        let (lp_l, bp_l, hp_l, ap_l) =
-                            step_tpt_svf_phs_scalar(u, &mut s1_l, &mut s2_l, &lp);
-                        scan_scratch[ti] = eval_tone_scalar(lp_l, bp_l, hp_l, ap_l, u, &lp);
-                        scan_scratch[TILE_FRAMES + ti] = bp_l;
-                    }
-                    aux_scratch[0] = s1_l;
-                    aux_scratch[1] = s2_l;
-                }
-                if lid == 1 {
-                    let mut s1_r = s1_cur_r.to_array()[c & 3];
-                    let mut s2_r = s2_cur_r.to_array()[c & 3];
-                    for t in 0..valid_len {
-                        let ti = t & 255;
-                        let u = scan_scratch[5 * TILE_FRAMES + ti];
-                        let (lp_r, bp_r, hp_r, ap_r) =
-                            step_tpt_svf_phs_scalar(u, &mut s1_r, &mut s2_r, &lp);
-                        scan_scratch[2 * TILE_FRAMES + ti] =
-                            eval_tone_scalar(lp_r, bp_r, hp_r, ap_r, u, &lp);
-                        scan_scratch[3 * TILE_FRAMES + ti] = bp_r;
-                    }
-                    aux_scratch[2] = s1_r;
-                    aux_scratch[3] = s2_r;
-                }
-                wg_barrier();
-                s1_end_l_arr[c & 3] = aux_scratch[0];
-                s2_end_l_arr[c & 3] = aux_scratch[1];
-                s1_end_r_arr[c & 3] = aux_scratch[2];
-                s2_end_r_arr[c & 3] = aux_scratch[3];
-                let tl_saved = if is_active {
-                    scan_scratch[lid]
-                } else {
-                    scan_scratch[lid] = 0.0;
-                    scan_scratch[TILE_FRAMES + lid] = 0.0;
-                    scan_scratch[2 * TILE_FRAMES + lid] = 0.0;
-                    scan_scratch[3 * TILE_FRAMES + lid] = 0.0;
-                    0.0
-                };
-                let tr_saved = if is_active {
-                    scan_scratch[2 * TILE_FRAMES + lid]
-                } else {
-                    0.0
-                };
-                scan_scratch[4 * TILE_FRAMES + lid] = 0.0;
-                scan_scratch[5 * TILE_FRAMES + lid] = 0.0;
-                wg_barrier();
-                (tl_saved, tr_saved)
-            } else {
-                let svf_c = lp.to_svf_coeffs();
-                let elem_l = if is_active {
-                    TptScanElem::from_step(lp.a1, lp.a2, lp.a3, u_l)
-                } else {
-                    TptScanElem::identity()
-                };
-                let mut s1_prev_l = 0.0_f32;
-                let mut s2_prev_l = 0.0_f32;
-                let s_end_l = tpt_exclusive_scan_256(
-                    scan_scratch,
-                    lid,
-                    valid_len,
-                    elem_l,
-                    [s1_cur_l.to_array()[c & 3], s2_cur_l.to_array()[c & 3]],
-                    &mut s1_prev_l,
-                    &mut s2_prev_l,
-                );
-                s1_end_l_arr[c & 3] = s_end_l[0];
-                s2_end_l_arr[c & 3] = s_end_l[1];
-                let (lp_l, bp_l, hp_l, ap_l) =
-                    eval_tpt_svf_scalar(u_l, s1_prev_l, s2_prev_l, &svf_c);
-                let tone_l = eval_tone_scalar(lp_l, bp_l, hp_l, ap_l, u_l, &lp);
-                aux_scratch[lid] = tone_l;
-                set_lane(&mut lane_buf[lid], c, bp_l);
-
-                let elem_r = if is_active {
-                    TptScanElem::from_step(lp.a1, lp.a2, lp.a3, u_r)
-                } else {
-                    TptScanElem::identity()
-                };
-                let mut s1_prev_r = 0.0_f32;
-                let mut s2_prev_r = 0.0_f32;
-                let s_end_r = tpt_exclusive_scan_256(
-                    scan_scratch,
-                    lid,
-                    valid_len,
-                    elem_r,
-                    [s1_cur_r.to_array()[c & 3], s2_cur_r.to_array()[c & 3]],
-                    &mut s1_prev_r,
-                    &mut s2_prev_r,
-                );
-                s1_end_r_arr[c & 3] = s_end_r[0];
-                s2_end_r_arr[c & 3] = s_end_r[1];
-                let (lp_r, bp_r, hp_r, ap_r) =
-                    eval_tpt_svf_scalar(u_r, s1_prev_r, s2_prev_r, &svf_c);
-                let tone_r = eval_tone_scalar(lp_r, bp_r, hp_r, ap_r, u_r, &lp);
-
-                let tl_saved = aux_scratch[lid];
-                let bp_l_saved = get_lane(lane_buf[lid], c);
-                scan_scratch[lid] = tl_saved;
-                scan_scratch[TILE_FRAMES + lid] = bp_l_saved;
-                scan_scratch[2 * TILE_FRAMES + lid] = tone_r;
-                scan_scratch[3 * TILE_FRAMES + lid] = bp_r;
-                scan_scratch[4 * TILE_FRAMES + lid] = 0.0;
-                scan_scratch[5 * TILE_FRAMES + lid] = 0.0;
-                wg_barrier();
-                (tl_saved, tone_r)
-            };
-
-            if lid == 0 {
-                let (vl_cur, vr_cur) = state.lru_v.into_lr();
-                let mut vl_arr = vl_cur.to_array();
-                let mut vr_arr = vr_cur.to_array();
-                let (vl_end, vr_end) = step_tile_duhem_on_thread0(
-                    scan_scratch,
-                    valid_len,
-                    vl_arr[c & 3],
-                    vr_arr[c & 3],
-                    &lp,
-                );
-                vl_arr[c & 3] = vl_end;
-                vr_arr[c & 3] = vr_end;
-                state.lru_v = InterleavedStereo8::from_lr(
-                    GpuVec4::from_array(vl_arr),
-                    GpuVec4::from_array(vr_arr),
-                );
-            }
-            wg_barrier();
-
-            let ve_l = if is_active {
-                scan_scratch[4 * TILE_FRAMES + lid]
-            } else {
-                0.0
-            };
-            let ve_r = if is_active {
-                scan_scratch[5 * TILE_FRAMES + lid]
-            } else {
-                0.0
-            };
-            my_veff_l[c & 3] = ve_l;
-            my_veff_r[c & 3] = ve_r;
-
-            let sag_l = (1.0 - lp.sag_depth * ve_l).max(MIN_SAG_GAIN);
-            let sag_r = (1.0 - lp.sag_depth * ve_r).max(MIN_SAG_GAIN);
-            let r_curr_l = if is_active {
-                flush_zero((tone_l_saved * lp.adaa_drive) * sag_l + lp.lru_bias_drive * ve_l)
-            } else {
-                0.0
-            };
-            let r_curr_r = if is_active {
-                flush_zero((tone_r * lp.adaa_drive) * sag_r + lp.lru_bias_drive * ve_r)
-            } else {
-                0.0
-            };
-            set_lane(&mut lane_buf[lid], c, r_curr_l);
-            set_lane(&mut lane_buf[TILE_FRAMES + lid], c, r_curr_r);
-            wg_barrier();
-        }
-
-        state.svf_s1 = InterleavedStereo8::from_lr(
-            GpuVec4::from_array(s1_end_l_arr).flush_recursive_state(),
-            GpuVec4::from_array(s1_end_r_arr).flush_recursive_state(),
-        );
-        state.svf_s2 = InterleavedStereo8::from_lr(
-            GpuVec4::from_array(s2_end_l_arr).flush_recursive_state(),
-            GpuVec4::from_array(s2_end_r_arr).flush_recursive_state(),
-        );
-
-        let r_curr_l_g = vec4_to_gpu(lane_buf[lid]);
-        let r_curr_r_g = vec4_to_gpu(lane_buf[TILE_FRAMES + lid]);
-        let (adaa_prev_l, adaa_prev_r) = state.adaa_prev.into_lr();
-        let (r_prev_l_g, r_prev_r_g) = if lid == 0 {
-            (adaa_prev_l, adaa_prev_r)
-        } else {
-            let prev_idx = (lid - 1) & 255;
-            (
-                vec4_to_gpu(lane_buf[prev_idx]),
-                vec4_to_gpu(lane_buf[TILE_FRAMES + prev_idx]),
-            )
-        };
-
-        let (odd_l, odd_r, even_l_out, even_r_out) = eval_lane_block_outputs(
-            r_prev_l_g, r_curr_l_g, r_prev_r_g, r_curr_r_g, wf_mix_g, glu_mix_g,
-        );
-
-        if is_active {
-            let feat_base = (q_global * num_frames + frame) * FEATURE_VEC4_STRIDE;
-            store_vec4(
-                feature_outputs,
-                feat_base,
-                canonicalize_vec4_zero(Vec4::from(my_veff_l)),
-            );
-            store_vec4(
-                feature_outputs,
-                feat_base + 1,
-                canonicalize_vec4_zero(Vec4::from(my_veff_r)),
-            );
-            store_vec4(
-                feature_outputs,
-                feat_base + 2,
-                canonicalize_vec4_zero(gpu_to_vec4(odd_l)),
-            );
-            store_vec4(
-                feature_outputs,
-                feat_base + 3,
-                canonicalize_vec4_zero(gpu_to_vec4(odd_r)),
-            );
-            store_vec4(
-                feature_outputs,
-                feat_base + 4,
-                canonicalize_vec4_zero(gpu_to_vec4(even_l_out)),
-            );
-            store_vec4(
-                feature_outputs,
-                feat_base + 5,
-                canonicalize_vec4_zero(gpu_to_vec4(even_r_out)),
-            );
-        }
-
-        if valid_len > 0 {
-            let last_idx = (valid_len - 1) & 255;
-            state.adaa_prev = InterleavedStereo8::from_lr(
-                scrub_vec4_endpoints(lane_buf[last_idx]),
-                scrub_vec4_endpoints(lane_buf[TILE_FRAMES + last_idx]),
-            );
+            store_aux_to_ckpt(tile_checkpoints, q_tier, ckpt_tiles, tile, aux_scratch);
         }
         wg_barrier();
+
+        for sub in 0..2 {
+            let sub_frame_base = tile_frame_base + sub * SUBTILE_FRAMES;
+            let sub_valid_len = sub_sat_usize(num_frames, sub_frame_base).min(SUBTILE_FRAMES);
+            if sub_valid_len > 0 {
+                let active128 = t128 < sub_valid_len;
+                let frame = sub_frame_base + t128;
+                let in_base = (q_tier * num_frames + frame) * CORE_INPUT_VEC4_STRIDE;
+                let (in_l, in_r) = if active128 {
+                    (
+                        load_vec4(core_inputs, in_base),
+                        load_vec4(core_inputs, in_base + 1),
+                    )
+                } else {
+                    (Vec4::ZERO, Vec4::ZERO)
+                };
+
+                // Stage 1: TPT-SVF across 4 lanes (`tone`, `bp` written to `lane_buf[0..2048]`).
+                if is_phs {
+                    if !use_fixed_point {
+                        if lid < SUBTILE_FRAMES {
+                            let u_l_vec = if active128 { in_l } else { Vec4::ZERO };
+                            let u_r_vec = if active128 { in_r } else { Vec4::ZERO };
+                            for c in 0..4 {
+                                scan_scratch[(c * 2) * SUBTILE_FRAMES + t128] =
+                                    flush_zero(get_lane(u_l_vec, c));
+                                scan_scratch[(c * 2 + 1) * SUBTILE_FRAMES + t128] =
+                                    flush_zero(get_lane(u_r_vec, c));
+                            }
+                        }
+                        wg_barrier();
+                        if lid < 8 {
+                            let c = lid >> 1;
+                            let is_r = (lid & 1) != 0;
+                            let lp = params.lane(c);
+                            let s1_idx = if is_r { 8 + c } else { c };
+                            let s2_idx = if is_r { 12 + c } else { 4 + c };
+                            let mut s1 = aux_scratch[s1_idx];
+                            let mut s2 = aux_scratch[s2_idx];
+                            let u_base = (c * 2 + (lid & 1)) * SUBTILE_FRAMES;
+                            let tone_f = if is_r { 2 } else { 0 };
+                            for k in 0..sub_valid_len {
+                                let ti = k & 127;
+                                let u = scan_scratch[u_base + ti];
+                                let (lp_s, bp_s, hp_s, ap_s) =
+                                    step_tpt_svf_phs_scalar(u, &mut s1, &mut s2, &lp);
+                                lane_buf[lane_slot(c, tone_f, ti)] =
+                                    eval_tone_scalar(lp_s, bp_s, hp_s, ap_s, u, &lp);
+                                lane_buf[lane_slot(c, tone_f + 1, ti)] = bp_s;
+                            }
+                            aux_scratch[s1_idx] = flush_zero(s1);
+                            aux_scratch[s2_idx] = flush_zero(s2);
+                        }
+                        wg_barrier();
+                    } else {
+                        for c in 0..4 {
+                            let lp = params.lane(c);
+                            let u_my = if active128 {
+                                flush_zero(get_lane(if is_r128 { in_r } else { in_l }, c))
+                            } else {
+                                0.0
+                            };
+                            run_phs_passive_picard_subtile(
+                                lid,
+                                sub_valid_len,
+                                c,
+                                u_my,
+                                &lp,
+                                scan_scratch,
+                                lane_buf,
+                                aux_scratch,
+                            );
+                        }
+                    }
+                } else {
+                    for c in 0..4 {
+                        let lp = params.lane(c);
+                        let svf_c = lp.to_svf_coeffs();
+                        let u_my = if active128 {
+                            flush_zero(get_lane(if is_r128 { in_r } else { in_l }, c))
+                        } else {
+                            0.0
+                        };
+                        let elem = if active128 {
+                            TptScanElem::from_step(lp.a1, lp.a2, lp.a3, u_my)
+                        } else {
+                            TptScanElem::identity()
+                        };
+                        let s1_idx = if is_r128 { 8 + c } else { c };
+                        let s2_idx = if is_r128 { 12 + c } else { 4 + c };
+                        let mut s1_prev = 0.0_f32;
+                        let mut s2_prev = 0.0_f32;
+                        let s_end = tpt_exclusive_scan_128_pair(
+                            scan_scratch,
+                            lid,
+                            sub_valid_len,
+                            elem,
+                            [aux_scratch[s1_idx], aux_scratch[s2_idx]],
+                            &mut s1_prev,
+                            &mut s2_prev,
+                        );
+                        if active128 {
+                            let (lp_s, bp_s, hp_s, ap_s) =
+                                eval_tpt_svf_scalar(u_my, s1_prev, s2_prev, &svf_c);
+                            let tone_s = eval_tone_scalar(lp_s, bp_s, hp_s, ap_s, u_my, &lp);
+                            let tone_f = if is_r128 { 2 } else { 0 };
+                            lane_buf[lane_slot(c, tone_f, t128)] = tone_s;
+                            lane_buf[lane_slot(c, tone_f + 1, t128)] = bp_s;
+                        }
+                        if lid == 0 {
+                            aux_scratch[c] = flush_zero(s_end[0]);
+                            aux_scratch[4 + c] = flush_zero(s_end[1]);
+                        }
+                        if lid == SUBTILE_FRAMES {
+                            aux_scratch[8 + c] = flush_zero(s_end[0]);
+                            aux_scratch[12 + c] = flush_zero(s_end[1]);
+                        }
+                        wg_barrier();
+                    }
+                }
+
+                // Stage 2: Selective-Duhem ParaLRU + stereo link (`4` concurrent lanes or DEER),
+                // saving `(v_eff_L, v_eff_R)` in dead `bp` slots `lane_slot(c, 1/3, t)` (`tone` kept).
+                if !use_fixed_point {
+                    if lid < 4 {
+                        let c = lid;
+                        let lp = params.lane(c);
+                        let lru_c = lp.to_lru_coeffs();
+                        let mut vl = aux_scratch[16 + c];
+                        let mut vr = aux_scratch[20 + c];
+                        for k in 0..sub_valid_len {
+                            let ti = k & 127;
+                            let tl = lane_buf[lane_slot(c, 0, ti)];
+                            let bl = lane_buf[lane_slot(c, 1, ti)];
+                            let tr = lane_buf[lane_slot(c, 2, ti)];
+                            let br = lane_buf[lane_slot(c, 3, ti)];
+                            let (_rl, _rr, eff_l, eff_r) = step_duhem_stereo_scalar(
+                                tl, tr, bl, br, &mut vl, &mut vr, &lp, &lru_c,
+                            );
+                            lane_buf[lane_slot(c, 1, ti)] = eff_l;
+                            lane_buf[lane_slot(c, 3, ti)] = eff_r;
+                        }
+                        aux_scratch[16 + c] = flush_zero(vl);
+                        aux_scratch[20 + c] = flush_zero(vr);
+                    }
+                    wg_barrier();
+                } else {
+                    for c in 0..4 {
+                        let lp = params.lane(c);
+                        run_duhem_damped_deer_subtile_lane(
+                            lid,
+                            sub_valid_len,
+                            c,
+                            &lp,
+                            scan_scratch,
+                            lane_buf,
+                            aux_scratch,
+                        );
+                    }
+                }
+
+                // Stage 3: Sag + r_curr (`scan_scratch[0..1024]`) -> PolyADAA1 + Wavefolder + GLU.
+                let mut my_veff_l = [0.0_f32; 4];
+                let mut my_veff_r = [0.0_f32; 4];
+                let mut my_r_l = [0.0_f32; 4];
+                let mut my_r_r = [0.0_f32; 4];
+                if lid < SUBTILE_FRAMES && active128 {
+                    for c in 0..4 {
+                        let lp = params.lane(c);
+                        let tl = lane_buf[lane_slot(c, 0, t128)];
+                        let vel = lane_buf[lane_slot(c, 1, t128)];
+                        let tr = lane_buf[lane_slot(c, 2, t128)];
+                        let ver = lane_buf[lane_slot(c, 3, t128)];
+                        my_veff_l[c] = vel;
+                        my_veff_r[c] = ver;
+                        let sag_l = (1.0 - lp.sag_depth * vel).max(MIN_SAG_GAIN);
+                        let sag_r = (1.0 - lp.sag_depth * ver).max(MIN_SAG_GAIN);
+                        let rl = flush_zero((tl * lp.adaa_drive) * sag_l + lp.lru_bias_drive * vel);
+                        let rr = flush_zero((tr * lp.adaa_drive) * sag_r + lp.lru_bias_drive * ver);
+                        my_r_l[c] = rl;
+                        my_r_r[c] = rr;
+                        scan_scratch[c * SUBTILE_FRAMES + t128] = rl;
+                        scan_scratch[(4 + c) * SUBTILE_FRAMES + t128] = rr;
+                    }
+                }
+                wg_barrier();
+
+                if lid < SUBTILE_FRAMES && active128 {
+                    let mut rp_l = [0.0_f32; 4];
+                    let mut rp_r = [0.0_f32; 4];
+                    if t128 == 0 {
+                        for c in 0..4 {
+                            rp_l[c] = aux_scratch[24 + c];
+                            rp_r[c] = aux_scratch[28 + c];
+                        }
+                    } else {
+                        let prev = t128 - 1;
+                        for c in 0..4 {
+                            rp_l[c] = scan_scratch[c * SUBTILE_FRAMES + prev];
+                            rp_r[c] = scan_scratch[(4 + c) * SUBTILE_FRAMES + prev];
+                        }
+                    }
+                    let (odd_l, odd_r, even_l_out, even_r_out) = eval_lane_block_outputs(
+                        GpuVec4::from_array(rp_l),
+                        GpuVec4::from_array(my_r_l),
+                        GpuVec4::from_array(rp_r),
+                        GpuVec4::from_array(my_r_r),
+                        wf_mix_g,
+                        glu_mix_g,
+                    );
+                    let feat_base = (q_tier * num_frames + frame) * FEATURE_VEC4_STRIDE;
+                    store_vec4(
+                        feature_outputs,
+                        feat_base,
+                        canonicalize_vec4_zero(Vec4::from(my_veff_l)),
+                    );
+                    store_vec4(
+                        feature_outputs,
+                        feat_base + 1,
+                        canonicalize_vec4_zero(Vec4::from(my_veff_r)),
+                    );
+                    store_vec4(
+                        feature_outputs,
+                        feat_base + 2,
+                        canonicalize_vec4_zero(gpu_to_vec4(odd_l)),
+                    );
+                    store_vec4(
+                        feature_outputs,
+                        feat_base + 3,
+                        canonicalize_vec4_zero(gpu_to_vec4(odd_r)),
+                    );
+                    store_vec4(
+                        feature_outputs,
+                        feat_base + 4,
+                        canonicalize_vec4_zero(gpu_to_vec4(even_l_out)),
+                    );
+                    store_vec4(
+                        feature_outputs,
+                        feat_base + 5,
+                        canonicalize_vec4_zero(gpu_to_vec4(even_r_out)),
+                    );
+                    if t128 + 1 == sub_valid_len {
+                        for c in 0..4 {
+                            aux_scratch[24 + c] = scrub_endpoint(my_r_l[c]);
+                            aux_scratch[28 + c] = scrub_endpoint(my_r_r[c]);
+                        }
+                    }
+                }
+                wg_barrier();
+            }
+        }
     }
 }

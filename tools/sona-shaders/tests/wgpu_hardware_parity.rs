@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! End-to-end real `wgpu` Metal/hardware execution parity and finite-difference verification across
-//! both `portable` and `subgroups` variants of all six SONA v3.0 compute kernels
+//! both `portable` and `subgroups` variants of all seven SONA v3.0 compute kernels
 //! (`ref[train.pipeline.webgpu-scans-and-ozaki]`, `ref[train.pipeline.isomorphism-parity]`).
 
 #[path = "wgpu_hardware_parity/block0_phs.rs"]
@@ -14,6 +14,10 @@ mod gabor_and_opt;
 mod harness;
 #[path = "wgpu_hardware_parity/ozaki_and_prescreen.rs"]
 mod ozaki_and_prescreen;
+#[path = "wgpu_hardware_parity/tile_mix.rs"]
+mod tile_mix;
+#[path = "wgpu_hardware_parity/wave_and_streamed.rs"]
+mod wave_and_streamed;
 
 use harness::init_gpu_context;
 
@@ -92,5 +96,16 @@ fn test_wgpu_inner_opt_step_lbfgs_and_bounds() {
     };
     for variant in ctx.variants() {
         gabor_and_opt::verify_inner_opt_step_lbfgs_and_bounds(&ctx, variant);
+    }
+}
+
+/// verify[train.pipeline.webgpu-scans-and-ozaki]
+#[test]
+fn test_wgpu_tile_mix_fwd_adj_ultra_dag_parity_and_determinism() {
+    let Some(ctx) = init_gpu_context() else {
+        return;
+    };
+    for variant in ctx.variants() {
+        tile_mix::verify_tile_mix_ultra_dag_parity(&ctx, variant);
     }
 }

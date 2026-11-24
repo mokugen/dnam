@@ -6,9 +6,13 @@ use core::mem::size_of;
 
 use crate::error::TrainError;
 use crate::gpu::abi::{
-    CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE,
-    TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, TILE_FRAMES,
+    CORE_INPUT_VEC4_STRIDE, EXIT_ADJ_BOUNDARY_VEC4_STRIDE, FEATURE_VEC4_STRIDE,
+    QUAD_PARAMS_VEC4_STRIDE, TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, TILE_FRAMES,
 };
+
+/// Maximum frames per chunk in wave-batched `run_wave_core_cascade` / `run_wave_core_adjoint`
+/// (`64` tiles = `16,384` frames; keeps Ultra 10-quad `feature_outputs` `<= 15.0 MiB` <= `128 MiB`).
+pub const WAVE_STREAMING_MAX_FRAMES: usize = 64 * TILE_FRAMES;
 
 /// Strict WebGPU storage buffer single-binding cap (`128 MiB`).
 pub const MAX_WEBGPU_BINDING_BYTES: u64 = 128 * 1024 * 1024;
@@ -28,6 +32,10 @@ pub const STREAMED_CKPT_EXTRA_TILES: usize = 2;
 const VEC4_BYTES: u64 = size_of::<[f32; 4]>() as u64;
 
 const _: () = assert!(TILE_FRAMES == 256);
+const _: () = assert!(WAVE_STREAMING_MAX_FRAMES == 16_384);
+const _: () = assert!(
+    10 * WAVE_STREAMING_MAX_FRAMES * FEATURE_VEC4_STRIDE * size_of::<[f32; 4]>() == 15_728_640
+);
 const _: () = assert!(STREAMED_CKPT_EXTRA_TILES == 2);
 const _: () = assert!(MAX_WEBGPU_BINDING_BYTES == 134_217_728);
 const _: () = assert!(CPU_WASM_BUDGET_BYTES < BROWSER_WEBGPU_BUDGET_BYTES);
@@ -169,14 +177,18 @@ fn evaluate_slice_footprints(
             .saturating_mul(time_tiles)
             .saturating_mul(TILE_ADJ_BOUNDARY_VEC4_STRIDE as u64)
             .saturating_mul(VEC4_BYTES);
+        let exit_bounds = total_q
+            .saturating_mul(EXIT_ADJ_BOUNDARY_VEC4_STRIDE as u64)
+            .saturating_mul(VEC4_BYTES);
+        let slot7_bounds = adj_bounds.saturating_add(exit_bounds);
         let total = feature_outputs_bytes
             .saturating_add(core_inputs_bytes)
             .saturating_add(param_grads)
-            .saturating_add(adj_bounds);
+            .saturating_add(slot7_bounds);
         let m = feature_outputs_bytes
             .max(core_inputs_bytes)
             .max(param_grads)
-            .max(adj_bounds);
+            .max(slot7_bounds);
         (total, m)
     } else {
         (0, 0)

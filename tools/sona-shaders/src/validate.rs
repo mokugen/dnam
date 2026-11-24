@@ -3,7 +3,7 @@
 //! Naga WGSL parser, validator, SRAM budget analyzer, 64-bit type guard, and ABI verifier
 //! (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
 
-use crate::abi::MAX_WORKGROUP_SRAM_BYTES;
+use crate::abi::{MAX_WEBGPU_STORAGE_BUFFERS_PER_STAGE, MAX_WORKGROUP_SRAM_BYTES};
 use crate::manifest::{BindingAccess, BindingRecord, ExpectedKernelSpec};
 use anyhow::{Context as _, bail, ensure};
 use naga::proc::Layouter;
@@ -255,6 +255,21 @@ pub fn validate_kernel_wgsl(
             access: actual_access,
         });
     }
+
+    let storage_count = binding_records
+        .iter()
+        .filter(|b| {
+            matches!(
+                b.access,
+                BindingAccess::StorageRead | BindingAccess::StorageReadWrite
+            )
+        })
+        .count();
+    ensure!(
+        storage_count <= MAX_WEBGPU_STORAGE_BUFFERS_PER_STAGE,
+        "'{}' declares {storage_count} storage buffers (> W3C WebGPU baseline limit {MAX_WEBGPU_STORAGE_BUFFERS_PER_STAGE})",
+        spec.entry_point
+    );
 
     Ok(ValidatedShader {
         workgroup_sram_bytes,

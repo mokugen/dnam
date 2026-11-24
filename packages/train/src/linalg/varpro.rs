@@ -4,16 +4,13 @@
 use dnam_kernels::pow2_ceil_fp32;
 
 use crate::error::TrainError;
-use crate::gpu::abi::{GPU_OZAKI_MAX_CHUNK_LEN, OZAKI_WORDS_PER_PAIR, OzakiGramUniforms};
-use crate::planner::MAX_WEBGPU_BINDING_BYTES;
-use crate::runner::{OzakiGramInput, TrainRunner};
+use crate::runner::TrainRunner;
 use crate::wide_gram::{
     Wide192Accum, contract_dim_gram_tiled_wide192, uplo_u_index, uplo_u_packed_len,
 };
 
 use super::cholesky::{factorize_uplo_u_cholesky_exact_no_ridge, solve_factorized_uplo_u_2ch};
 
-const MAX_WEBGPU_WORKGROUP_X: usize = 65_535;
 const OZAKI_MAX_FEATURE_DIM: usize = 1024;
 
 fn assemble_via_wide192(
@@ -113,13 +110,7 @@ pub fn assemble_ozaki_normal_equations(
         });
     }
 
-    let gram_len = uplo_u_packed_len(feature_dim);
-    let active_pairs = gram_len + feature_dim * target_channels;
-    let chunk_bytes = active_pairs * OZAKI_WORDS_PER_PAIR * 4;
-    let can_use_ozaki = !force_wide192
-        && feature_dim <= OZAKI_MAX_FEATURE_DIM
-        && active_pairs <= MAX_WEBGPU_WORKGROUP_X
-        && (chunk_bytes as u64) <= MAX_WEBGPU_BINDING_BYTES / 4;
+    let can_use_ozaki = !force_wide192 && feature_dim <= OZAKI_MAX_FEATURE_DIM;
 
     if !can_use_ozaki {
         return Ok(assemble_via_wide192(
@@ -131,76 +122,29 @@ pub fn assemble_ozaki_normal_equations(
         ));
     }
 
-    let chunks_per_batch =
-        ((MAX_WEBGPU_BINDING_BYTES as usize) / 4 / chunk_bytes.max(1)).clamp(1, 8);
-    let batch_frames = chunks_per_batch * GPU_OZAKI_MAX_CHUNK_LEN;
-    let mut gram_acc = vec![Wide192Accum::zero(); gram_len];
-    let mut rhs_acc = vec![vec![Wide192Accum::zero(); target_channels]; feature_dim];
-
-    let mut frame_start = 0_usize;
-    while frame_start < num_frames {
-        let seg_len = (num_frames - frame_start).min(batch_frames);
-        let seg_chunks = seg_len.div_ceil(GPU_OZAKI_MAX_CHUNK_LEN);
-        let mut seg_feats = vec![0.0_f32; feature_dim * seg_len];
-        let mut seg_tgts = vec![0.0_f32; target_channels * seg_len];
-        let mut col_scales = vec![[0.0_f32; 2]; feature_dim + target_channels];
-
-        for c in 0..feature_dim {
-            let src = &features_col_major
-                [c * num_frames + frame_start..c * num_frames + frame_start + seg_len];
-            seg_feats[c * seg_len..(c + 1) * seg_len].copy_from_slice(src);
-            let max_abs = src.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
-            let (s, inv) = pow2_ceil_fp32(max_abs);
-            col_scales[c] = [s, inv];
-        }
-        for ch in 0..target_channels {
-            let src = &targets_col_major
-                [ch * num_frames + frame_start..ch * num_frames + frame_start + seg_len];
-            seg_tgts[ch * seg_len..(ch + 1) * seg_len].copy_from_slice(src);
-            let max_abs = src.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
-            let (s, inv) = pow2_ceil_fp32(max_abs);
-            col_scales[feature_dim + ch] = [s, inv];
-        }
-
-        let oz = runner.ozaki_gram_rhs_i32(&OzakiGramInput {
-            uniforms: OzakiGramUniforms {
-                num_frames: seg_len as u32,
-                feature_dim: feature_dim as u32,
-                target_channels: target_channels as u32,
-                chunk_len: GPU_OZAKI_MAX_CHUNK_LEN as u32,
-                num_chunks: seg_chunks as u32,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
-            },
-            features: &seg_feats,
-            targets: &seg_tgts,
-            col_scales: &col_scales,
-            seed_buckets: None,
-        })?;
-        let (g_seg, r_seg) = runner.reconstruct_ozaki_gram_rhs_f64(
-            &oz,
-            feature_dim,
-            target_channels,
-            &col_scales,
-        )?;
-        for (acc, &v) in gram_acc.iter_mut().zip(&g_seg) {
-            acc.add_f64(v);
-        }
-        for (r_row_acc, r_row) in rhs_acc.iter_mut().zip(&r_seg) {
-            for (acc, &v) in r_row_acc.iter_mut().zip(r_row) {
-                acc.add_f64(v);
-            }
-        }
-        frame_start += seg_len;
+    let mut col_scales = vec![[0.0_f32; 2]; feature_dim + target_channels];
+    for c in 0..feature_dim {
+        let col = &features_col_major[c * num_frames..(c + 1) * num_frames];
+        let max_abs = col.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+        let (s, inv) = pow2_ceil_fp32(max_abs);
+        col_scales[c] = [s, inv];
+    }
+    for ch in 0..target_channels {
+        let col = &targets_col_major[ch * num_frames..(ch + 1) * num_frames];
+        let max_abs = col.iter().fold(0.0_f32, |m, v| m.max(v.abs()));
+        let (s, inv) = pow2_ceil_fp32(max_abs);
+        col_scales[feature_dim + ch] = [s, inv];
     }
 
-    let gram = gram_acc.iter().map(Wide192Accum::to_f64).collect();
-    let rhs = rhs_acc
-        .iter()
-        .map(|row| row.iter().map(Wide192Accum::to_f64).collect())
-        .collect();
-    Ok((gram, rhs))
+    let split64 = runner.ozaki_gram_rhs_split64(
+        features_col_major,
+        targets_col_major,
+        num_frames,
+        feature_dim,
+        target_channels,
+        &col_scales,
+    )?;
+    runner.reconstruct_ozaki_split64_f64(&split64, feature_dim, target_channels, &col_scales)
 }
 
 /// Output of nested 4-tier Schur-complement prefix VarPro (`ref[train.pipeline.nested-varpro-schur]`).

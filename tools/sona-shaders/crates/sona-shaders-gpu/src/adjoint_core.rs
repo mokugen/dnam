@@ -1,7 +1,9 @@
 #![forbid(unsafe_code)]
 
 //! Exact 3-pass `256`-wide reverse-BPTT adjoint kernel (`adjoint_scan_256_impl`) executing
-//! inside `14,848 B` (`14.5 KiB`) workgroup SRAM across `pass_mode` `0`, `1`, and `2`
+//! inside `14,848 B` (`14.5 KiB`) workgroup SRAM across `pass_mode` `0`, `1`, and `2`,
+//! supporting wave-based `BLOCK_QUAD_SLOTS` addressing, cross-operator `k_vs` injection in
+//! `Slot 7`, and double-buffered cross-block wave boundaries packed in `Slot 7`'s leading header
 //! (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
 
 pub mod common;
@@ -12,12 +14,13 @@ pub mod pullback;
 
 use crate::abi::{
     ADJOINT_AUX_FLOATS, ADJOINT_S_PREV2_VEC4S, ADJOINT_SCAN_SCRATCH_FLOATS, ADJOINT_U_TONE2_VEC2S,
-    ADJOINT_V_TRAJ2_VEC2S, AdjointScanUniforms,
+    ADJOINT_V_TRAJ2_VEC2S, AdjointScanUniforms, BLOCK_IDX_DIRECT_LINEAR,
+    EXIT_ADJ_BOUNDARY_VEC4_STRIDE, resolve_quad_idx,
 };
 use spirv_std::glam::{UVec3, Vec2, Vec4};
 
 /// Executes one pass (`pass_mode` in `{0, 1, 2}`) of the exact `adjoint_scan_256` BPTT kernel
-/// inside `14,848 B` SRAM with zero `f32` atomics and zero truncation across tiles.
+/// inside `14,848 B` SRAM with zero `f32` atomics and zero truncation across tiles or blocks.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn adjoint_scan_256_impl(
@@ -47,13 +50,24 @@ pub fn adjoint_scan_256_impl(
     let q_local = wg_id.x as usize;
     let tile = wg_id.y as usize;
     let stem = wg_id.z as usize;
-    let q_global = stem * quads_in_block + q_local;
-    let num_stems = (num_wg.z as usize).max(uniforms.num_stems as usize).max(1);
-    let total_q = quads_in_block * num_stems;
+    let num_quads = (uniforms.num_quads as usize).max(1);
+    let quad_idx = resolve_quad_idx(uniforms.block_idx, q_local, num_quads);
+    if quad_idx >= num_quads {
+        return;
+    }
+
+    let num_stems = (uniforms.num_stems as usize).max(1);
+    let tile_base = num_stems * quads_in_block * EXIT_ADJ_BOUNDARY_VEC4_STRIDE;
+    let q_tier = stem * num_quads + quad_idx;
+    let q_wave = stem * quads_in_block + q_local;
+    let is_phs = uniforms.block_idx != BLOCK_IDX_DIRECT_LINEAR && (uniforms.block_idx & 0x3) == 0;
 
     match uniforms.pass_mode {
         0 => pass0::run_pass0(
-            q_global,
+            q_tier,
+            q_wave,
+            tile_base,
+            is_phs,
             tile,
             lid,
             uniforms,
@@ -68,10 +82,19 @@ pub fn adjoint_scan_256_impl(
             v_traj2,
             scan_scratch,
         ),
-        1 => pass1::run_pass1(q_global, lid, uniforms, tile_adj_boundaries, scan_scratch),
+        1 => pass1::run_pass1(
+            q_wave,
+            tile_base,
+            lid,
+            uniforms,
+            tile_adj_boundaries,
+            scan_scratch,
+        ),
         _ => pass2::run_pass2(
-            q_global,
-            total_q,
+            q_tier,
+            q_wave,
+            tile_base,
+            is_phs,
             tile,
             lid,
             sg_lid,

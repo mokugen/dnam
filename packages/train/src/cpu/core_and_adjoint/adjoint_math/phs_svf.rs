@@ -281,6 +281,7 @@ mod tests {
             tile_checkpoints: &fwd.tile_checkpoints,
             d_loss_d_features: &d_loss,
             feature_outputs: &fwd.feature_outputs,
+            exit_adj_boundary: None,
         })
         .unwrap();
 
@@ -344,6 +345,7 @@ mod tests {
             tile_checkpoints: &fwd_lin.tile_checkpoints,
             d_loss_d_features: &d_loss,
             feature_outputs: &fwd_lin.feature_outputs,
+            exit_adj_boundary: None,
         })
         .unwrap();
         for tile in 0..num_tiles {

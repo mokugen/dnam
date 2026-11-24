@@ -8,7 +8,9 @@ use core::fmt;
 pub use types::{
     AdjointScanInput, AdjointScanOutput, FusedCoreScanInput, FusedCoreScanOutput, GaborBezoutInput,
     GaborBezoutOutput, InnerOptInput, InnerOptOutput, OzakiGramInput, OzakiGramOutput,
-    PrescreenInput, pack_core_quad_params, unpack_core_quad_params,
+    OzakiSplit64Output, PrescreenInput, TileMixInput, TileMixOutput, WaveCoreAdjointInput,
+    WaveCoreAdjointOutput, WaveCoreCascadeInput, WaveCoreCascadeOutput, pack_core_quad_params,
+    pack_tile_descriptor, unpack_core_quad_params,
 };
 
 use crate::cpu::CpuRunner;
@@ -38,8 +40,8 @@ pub enum ActiveComputeBackend {
     },
 }
 
-/// Unified compute runner dispatching all 6 32-bit SONA kernels transparently across
-/// `wgpu 30.0.2` hardware adapters and deterministic CPU SIMD (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
+/// Unified compute runner dispatching all 7 32-bit SONA kernels + wave-batched cascades transparently
+/// across `wgpu 30.0.2` hardware adapters and deterministic CPU SIMD (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
 pub enum TrainRunner {
     /// Deterministic host CPU runner.
     Cpu(CpuRunner),
@@ -59,12 +61,13 @@ impl fmt::Debug for TrainRunner {
 }
 
 impl TrainRunner {
-    /// Probes native `wgpu` (`Subgroups` -> `Portable`, `< 1 ms` startup probes) and falls back
-    /// transparently to [`CpuRunner::detect`] when no qualifying GPU adapter is available.
+    /// Probes native `wgpu` (`Subgroups` -> `Portable`, `< 1 ms` startup probes) using the
+    /// process-wide cached [`WgpuRunner`] / `GpuTrainArena`, and falls back transparently to
+    /// [`CpuRunner::detect`] when no qualifying GPU adapter is available.
     #[must_use]
     pub fn auto_detect() -> Self {
         #[cfg(feature = "gpu-wgpu")]
-        if let Ok(gpu) = WgpuRunner::try_new() {
+        if let Ok(gpu) = WgpuRunner::try_shared() {
             return Self::Wgpu(gpu);
         }
         Self::Cpu(CpuRunner::detect())
@@ -139,6 +142,39 @@ impl TrainRunner {
         }
     }
 
+    /// Evaluates `tile_mix_fwd_adj` on the active compute backend.
+    pub fn tile_mix_fwd_adj(&self, input: &TileMixInput<'_>) -> Result<TileMixOutput, TrainError> {
+        match self {
+            Self::Cpu(cpu) => cpu.tile_mix_fwd_adj(input),
+            #[cfg(feature = "gpu-wgpu")]
+            Self::Wgpu(gpu) => gpu.tile_mix_fwd_adj(input),
+        }
+    }
+
+    /// Executes wave-batched forward cascade (`Waves 0..=3` + `tile_mix(0)`) on the active backend.
+    pub fn run_wave_core_cascade(
+        &self,
+        input: &WaveCoreCascadeInput<'_>,
+    ) -> Result<WaveCoreCascadeOutput, TrainError> {
+        match self {
+            Self::Cpu(cpu) => cpu.run_wave_core_cascade(input),
+            #[cfg(feature = "gpu-wgpu")]
+            Self::Wgpu(gpu) => gpu.run_wave_core_cascade(input),
+        }
+    }
+
+    /// Executes wave-batched reverse BPTT (`Waves 3..=0` + `tile_mix(1,2,3)`) on the active backend.
+    pub fn run_wave_core_adjoint(
+        &self,
+        input: &WaveCoreAdjointInput<'_>,
+    ) -> Result<WaveCoreAdjointOutput, TrainError> {
+        match self {
+            Self::Cpu(cpu) => cpu.run_wave_core_adjoint(input),
+            #[cfg(feature = "gpu-wgpu")]
+            Self::Wgpu(gpu) => gpu.run_wave_core_adjoint(input),
+        }
+    }
+
     /// Evaluates `gabor_bezout_grad` (`Mode A` or `Mode B`) on the active compute backend.
     pub fn gabor_bezout_grad(
         &self,
@@ -163,6 +199,37 @@ impl TrainRunner {
         }
     }
 
+    /// Executes 2-pass batched split-64 `ozaki_gram_rhs_i32` (`<= 1.2 MiB` Ultra readback).
+    pub fn ozaki_gram_rhs_split64(
+        &self,
+        features_col_major: &[f32],
+        targets_col_major: &[f32],
+        num_frames: usize,
+        feature_dim: usize,
+        target_channels: usize,
+        col_scales: &[[f32; 2]],
+    ) -> Result<OzakiSplit64Output, TrainError> {
+        match self {
+            Self::Cpu(cpu) => cpu.ozaki_gram_rhs_split64(
+                features_col_major,
+                targets_col_major,
+                num_frames,
+                feature_dim,
+                target_channels,
+                col_scales,
+            ),
+            #[cfg(feature = "gpu-wgpu")]
+            Self::Wgpu(gpu) => gpu.ozaki_gram_rhs_split64(
+                features_col_major,
+                targets_col_major,
+                num_frames,
+                feature_dim,
+                target_channels,
+                col_scales,
+            ),
+        }
+    }
+
     /// Reconstructs column-major packed `uplo='U'` `f64` Gram matrix and RHS vectors on host.
     pub fn reconstruct_ozaki_gram_rhs_f64(
         &self,
@@ -179,7 +246,23 @@ impl TrainRunner {
         )
     }
 
-    /// Evaluates bounded `m <= 8` L-BFGS `inner_opt_step` on the active compute backend.
+    /// Reconstructs `0-ULP` `f64` Gram matrix (`uplo='U'`) and RHS vectors from split-64 limbs.
+    pub fn reconstruct_ozaki_split64_f64(
+        &self,
+        output: &OzakiSplit64Output,
+        feature_dim: usize,
+        target_channels: usize,
+        col_scales: &[[f32; 2]],
+    ) -> Result<(Vec<f64>, Vec<Vec<f64>>), TrainError> {
+        CpuRunner::detect().reconstruct_ozaki_split64_f64(
+            output,
+            feature_dim,
+            target_channels,
+            col_scales,
+        )
+    }
+
+    /// Evaluates multi-candidate `(1, num_candidates, 1)` `inner_opt_step` on the active backend.
     pub fn inner_opt_step(&self, input: &InnerOptInput<'_>) -> Result<InnerOptOutput, TrainError> {
         match self {
             Self::Cpu(cpu) => cpu.inner_opt_step(input),
@@ -192,7 +275,10 @@ impl TrainRunner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gpu::abi::OzakiGramUniforms;
+    use crate::gpu::abi::{
+        COORD_TRANSFORM_FREE, INNER_OPT_MODE_LSSBROYDEN, OZAKI_PAIR_TILE_ROWS_DEFAULT,
+        OzakiGramUniforms,
+    };
 
     #[test]
     fn test_train_runner_cpu_and_auto_detect_dispatch() {
@@ -213,9 +299,9 @@ mod tests {
                     target_channels: 0,
                     chunk_len: 1024,
                     num_chunks: 1,
-                    _pad0: 0,
-                    _pad1: 0,
-                    _pad2: 0,
+                    pair_tile_rows: OZAKI_PAIR_TILE_ROWS_DEFAULT,
+                    reduce_pass: 0,
+                    _pad: 0,
                 },
                 features: &feats,
                 targets: &[],
@@ -227,6 +313,13 @@ mod tests {
             .reconstruct_ozaki_gram_rhs_f64(&out, 2, 0, &scales)
             .unwrap();
         assert!((g[0] - 4.0).abs() <= 1.0e-5);
+        let s64 = auto
+            .ozaki_gram_rhs_split64(&feats, &[], 4, 2, 0, &scales)
+            .unwrap();
+        let (g_s64, _) = auto
+            .reconstruct_ozaki_split64_f64(&s64, 2, 0, &scales)
+            .unwrap();
+        assert_eq!(g_s64, g);
 
         // Exercise all TrainRunner dispatch arms cleanly on CPU backend.
         let mut p_in = [0.0_f32; 32];
@@ -342,6 +435,7 @@ mod tests {
                 tile_checkpoints: &fwd.tile_checkpoints,
                 d_loss_d_features: &d_loss,
                 feature_outputs: &fwd.feature_outputs,
+                exit_adj_boundary: None,
             })
             .unwrap();
         assert_eq!(adj.d_loss_d_inputs.len(), 32);
@@ -369,15 +463,16 @@ mod tests {
                     num_params: 4,
                     history_m: 2,
                     step_idx: 0,
-                    line_search_iter: 0,
+                    mode_flags: INNER_OPT_MODE_LSSBROYDEN,
                     step_size: 0.2,
                     damping_lambda: 1.0e-4,
                     min_bound_eps: 1.0e-4,
-                    _pad: 0,
+                    grad_clip_norm: 0.0,
                 },
+                num_candidates: 1,
                 theta: &[0.5; 4],
                 grad: &[0.1; 4],
-                param_bounds: &[[-1.0, 1.0]; 4],
+                param_bounds: &[[-1.0, 1.0, 1.0, f32::from_bits(COORD_TRANSFORM_FREE)]; 4],
                 lbfgs_s_y: &[[0.0; 4]; 12],
                 search_dir: &[0.0; 4],
             })
@@ -391,9 +486,9 @@ mod tests {
                     target_channels: 0,
                     chunk_len: 1024,
                     num_chunks: 1,
-                    _pad0: 0,
-                    _pad1: 0,
-                    _pad2: 0,
+                    pair_tile_rows: OZAKI_PAIR_TILE_ROWS_DEFAULT,
+                    reduce_pass: 0,
+                    _pad: 0,
                 },
                 features: &feats,
                 targets: &[],

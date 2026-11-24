@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 //! Integration suite for the 2-D memory planner (`MemoryBudgetProfile`), embedded WGSL manifest
 //! SHA-256 verification, browser `enable subgroups;` transform, and deterministic [`CpuRunner`]
-//! across all 6 compute kernels (`verify[train.pipeline.webgpu-scans-and-ozaki]`,
+//! across all 7 compute kernels (`verify[train.pipeline.webgpu-scans-and-ozaki]`,
 //! `verify[train.pipeline.isomorphism-parity]`).
 
 use dnam_kernels::{
@@ -13,15 +13,17 @@ use dnam_train::{
     CoreScanWorkload, CpuRunner, DESKTOP_CAPSULE_BUDGET_BYTES, ExecutionMode, FusedCoreScanInput,
     GaborBezoutInput, InnerOptInput, KernelId, MAX_WEBGPU_BINDING_BYTES, MemoryBudgetProfile,
     OzakiGramInput, PrescreenInput, STREAMED_CKPT_EXTRA_TILES, STREAMING_HOST_DEFAULT_BUDGET_BYTES,
-    STREAMING_HOST_MAX_TENSOR_BYTES, ShaderVariant, TrainError, TrainRunner,
+    STREAMING_HOST_MAX_TENSOR_BYTES, ShaderVariant, TileMixInput, TrainError, TrainRunner,
     abi::{
-        AdjointScanUniforms, CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, FusedScanUniforms,
-        GaborBezoutUniforms, InnerOptUniforms, MAX_WORKGROUP_SRAM_BYTES, OZAKI_WORDS_PER_PAIR,
-        OzakiGramUniforms, PRESCREEN_SEED_PARAM_STRIDE, PrescreenUniforms, QUAD_PARAMS_VEC4_STRIDE,
-        TILE_FRAMES, quad_param_slots,
+        AdjointScanUniforms, BLOCK_WAVE_ALL, CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE,
+        FusedScanUniforms, GaborBezoutUniforms, INNER_OPT_MODE_LSSBROYDEN, InnerOptUniforms,
+        MAX_WORKGROUP_SRAM_BYTES, OZAKI_PAIR_TILE_ROWS_DEFAULT, OZAKI_SPLIT64_WORDS_PER_PAIR,
+        OZAKI_WORDS_PER_PAIR, OzakiGramUniforms, PRESCREEN_SEED_PARAM_STRIDE, PrescreenUniforms,
+        QUAD_PARAMS_VEC4_STRIDE, TILE_FRAMES, TILE_MIX_DIR_FORWARD, TILE_WEIGHT_GRAD_FLOATS,
+        TileMixUniforms, quad_param_slots,
     },
-    embedded_wgsl, pack_core_quad_params, plan_core_scan_execution, prepare_for_browser_webgpu,
-    uplo_u_packed_len, verify_embedded_shader_digests,
+    embedded_wgsl, pack_core_quad_params, pack_tile_descriptor, plan_core_scan_execution,
+    prepare_for_browser_webgpu, uplo_u_packed_len, verify_embedded_shader_digests,
 };
 use proptest::prelude::*;
 
@@ -215,6 +217,7 @@ fn test_cpu_runner_all_six_kernels_end_to_end() {
             tile_checkpoints: &res.tile_checkpoints,
             d_loss_d_features: &d_loss,
             feature_outputs: &res.feature_outputs,
+            exit_adj_boundary: None,
         })
         .unwrap();
     assert_eq!(adj.d_loss_d_inputs.len(), core_inputs.len());
@@ -223,6 +226,29 @@ fn test_cpu_runner_all_six_kernels_end_to_end() {
             .iter()
             .any(|x| *x != 0.0)
     );
+
+    let w_tile = [[0.1_f32, -0.05, 0.02, 0.01]; 4];
+    let tile_desc = pack_tile_descriptor(0, 1, 0, 1, &w_tile, &w_tile, &w_tile);
+    let mix = runner
+        .tile_mix_fwd_adj(&TileMixInput {
+            uniforms: TileMixUniforms {
+                num_frames: num_frames as u32,
+                num_tiles: num_tiles as u32,
+                num_active_tiles: 1,
+                dir_mode: TILE_MIX_DIR_FORWARD,
+                num_stems: num_stems as u32,
+                block_wave: BLOCK_WAVE_ALL,
+                num_quads: num_quads as u32,
+                _pad1: 0,
+            },
+            block_inputs_or_d_loss_d_inputs: &core_inputs,
+            tile_descriptors: &tile_desc,
+            feature_outputs: &res.feature_outputs,
+            tile_weight_grads: &[0.0_f32; TILE_WEIGHT_GRAD_FLOATS],
+            d_loss_d_features: &d_loss,
+        })
+        .unwrap();
+    assert_eq!(mix.block_inputs_or_d_loss_d_inputs.len(), core_inputs.len());
 
     // Prescreen, Gabor Mode A & B, Ozaki, and InnerOpt
     let audio_len = 256_usize;
@@ -288,9 +314,9 @@ fn test_cpu_runner_all_six_kernels_end_to_end() {
                 target_channels: 0,
                 chunk_len: 1024,
                 num_chunks: 1,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
+                pair_tile_rows: OZAKI_PAIR_TILE_ROWS_DEFAULT,
+                reduce_pass: 0,
+                _pad: 0,
             },
             features: &feats,
             targets: &[],
@@ -298,9 +324,10 @@ fn test_cpu_runner_all_six_kernels_end_to_end() {
             seed_buckets: None,
         })
         .unwrap();
+    let pairs = uplo_u_packed_len(3);
     assert_eq!(
         oz.ozaki_buckets.len(),
-        uplo_u_packed_len(3) * OZAKI_WORDS_PER_PAIR
+        pairs * (OZAKI_SPLIT64_WORDS_PER_PAIR + OZAKI_WORDS_PER_PAIR)
     );
 
     let opt = runner
@@ -309,15 +336,16 @@ fn test_cpu_runner_all_six_kernels_end_to_end() {
                 num_params: 4,
                 history_m: 4,
                 step_idx: 0,
-                line_search_iter: 0,
+                mode_flags: INNER_OPT_MODE_LSSBROYDEN,
                 step_size: 0.5,
                 damping_lambda: 1.0e-4,
                 min_bound_eps: 1.0e-4,
-                _pad: 0,
+                grad_clip_norm: 0.0,
             },
+            num_candidates: 1,
             theta: &[1.0, 2.0, -1.5, 0.5],
             grad: &[0.5, 1.0, -0.5, 0.25],
-            param_bounds: &[[-3.0, 3.0]; 4],
+            param_bounds: &[[-3.0, 3.0, 1.0, 0.0]; 4],
             lbfgs_s_y: &[[0.0; 4]; 20],
             search_dir: &[0.0; 4],
         })

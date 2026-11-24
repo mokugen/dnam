@@ -6,12 +6,15 @@
 use proptest::prelude::*;
 use sha2::{Digest, Sha256};
 use sona_shaders::abi::{
-    ADJOINT_CORE_SRAM_BYTES, AdjointScanUniforms, FEATURE_VEC4_STRIDE, FUSED_CORE_SRAM_BYTES,
-    FusedScanUniforms, GABOR_BEZOUT_SRAM_BYTES, GaborBezoutUniforms, INNER_OPT_SRAM_BYTES,
-    InnerOptUniforms, LBFGS_MAX_HISTORY_M, MAX_WORKGROUP_SRAM_BYTES, OZAKI_GRAM_SRAM_BYTES,
-    OZAKI_WORDS_PER_PAIR, OzakiGramUniforms, PRESCREEN_SEED_PARAM_STRIDE, PRESCREEN_SRAM_BYTES,
-    PrescreenUniforms, QUAD_PARAMS_VEC4_STRIDE, TILE_ADJ_BOUNDARY_VEC4_STRIDE,
-    TILE_CKPT_VEC4_STRIDE, TILE_FRAMES, UNIFORM_STRUCT_BYTES, WORKGROUP_SIZE,
+    ADJOINT_CORE_SRAM_BYTES, AdjointScanUniforms, EXIT_ADJ_BOUNDARY_VEC4_STRIDE,
+    FEATURE_VEC4_STRIDE, FUSED_CORE_SRAM_BYTES, FusedScanUniforms, GABOR_BEZOUT_SRAM_BYTES,
+    GaborBezoutUniforms, INNER_OPT_SRAM_BYTES, InnerOptUniforms, LBFGS_MAX_HISTORY_M,
+    LSSBROYDEN_MAX_HISTORY_M, MAX_WEBGPU_STORAGE_BUFFERS_PER_STAGE, MAX_WORKGROUP_SRAM_BYTES,
+    OZAKI_GRAM_SRAM_BYTES, OZAKI_SPLIT64_WORDS_PER_PAIR, OZAKI_WORDS_PER_PAIR, OzakiGramUniforms,
+    PRESCREEN_SEED_PARAM_STRIDE, PRESCREEN_SRAM_BYTES, PrescreenUniforms, QUAD_PARAMS_VEC4_STRIDE,
+    TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, TILE_DESC_VEC4_STRIDE, TILE_FRAMES,
+    TILE_MIX_SRAM_BYTES, TILE_WEIGHT_GRAD_FLOATS, TileMixUniforms, UNIFORM_STRUCT_BYTES,
+    WORKGROUP_SIZE,
 };
 use sona_shaders::compiler::ShaderPaths;
 use sona_shaders::manifest::{
@@ -37,6 +40,7 @@ fn expected_sram_bytes(id: KernelId) -> u32 {
         KernelId::PrescreenPopulation => PRESCREEN_SRAM_BYTES,
         KernelId::FusedCoreScan256 => FUSED_CORE_SRAM_BYTES as u32,
         KernelId::AdjointScan256 => ADJOINT_CORE_SRAM_BYTES as u32,
+        KernelId::TileMixFwdAdj => TILE_MIX_SRAM_BYTES,
         KernelId::GaborBezoutGrad => GABOR_BEZOUT_SRAM_BYTES,
         KernelId::OzakiGramRhsI32 => OZAKI_GRAM_SRAM_BYTES,
         KernelId::InnerOptStep => INNER_OPT_SRAM_BYTES,
@@ -65,6 +69,11 @@ fn verify_artifact_records(
             "{} must not emit continuing/break if constructs",
             rec.wgsl_path
         );
+        assert!(
+            !wgsl.contains("infinity") && !wgsl.contains("inf)"),
+            "{} must not contain infinity literals",
+            rec.wgsl_path
+        );
         for forbidden in ["f64", "u64", "i64"] {
             assert!(
                 !wgsl.contains(forbidden),
@@ -83,6 +92,12 @@ fn verify_artifact_records(
         assert_eq!(rec.workgroup_sram_bytes, validated.workgroup_sram_bytes);
         assert_eq!(rec.workgroup_sram_bytes, expected_sram_bytes(spec.id));
         assert_eq!(rec.bindings, validated.bindings);
+        let storage_bindings = validated
+            .bindings
+            .iter()
+            .filter(|b| !matches!(b.access, sona_shaders::manifest::BindingAccess::Uniform))
+            .count();
+        assert!(storage_bindings <= MAX_WEBGPU_STORAGE_BUFFERS_PER_STAGE);
         assert!(rec.workgroup_sram_bytes <= MAX_WORKGROUP_SRAM_BYTES as u32);
     }
 }
@@ -95,13 +110,19 @@ fn test_abi_uniform_sizes_sram_ceilings_and_browser_helper() {
     assert_eq!(MAX_WORKGROUP_SRAM_BYTES, 15_872);
     assert_eq!(FUSED_CORE_SRAM_BYTES, 15_360);
     assert_eq!(ADJOINT_CORE_SRAM_BYTES, 14_848);
+    assert_eq!(TILE_MIX_SRAM_BYTES, 2_048);
     assert_eq!(QUAD_PARAMS_VEC4_STRIDE, 25);
     assert_eq!(TILE_CKPT_VEC4_STRIDE, 8);
     assert_eq!(FEATURE_VEC4_STRIDE, 6);
-    assert_eq!(TILE_ADJ_BOUNDARY_VEC4_STRIDE, 20);
+    assert_eq!(TILE_ADJ_BOUNDARY_VEC4_STRIDE, 24);
+    assert_eq!(EXIT_ADJ_BOUNDARY_VEC4_STRIDE, 16);
+    assert_eq!(TILE_DESC_VEC4_STRIDE, 13);
+    assert_eq!(TILE_WEIGHT_GRAD_FLOATS, 48);
     assert_eq!(PRESCREEN_SEED_PARAM_STRIDE, 16);
     assert_eq!(OZAKI_WORDS_PER_PAIR, 6);
-    assert_eq!(LBFGS_MAX_HISTORY_M, 8);
+    assert_eq!(OZAKI_SPLIT64_WORDS_PER_PAIR, 4);
+    assert_eq!(LSSBROYDEN_MAX_HISTORY_M, 32);
+    assert_eq!(LBFGS_MAX_HISTORY_M, 32);
 
     let raw = "@compute @workgroup_size(256, 1, 1)\nfn main() {}\n";
     assert_eq!(prepare_for_browser_webgpu(raw, false), raw);
@@ -241,6 +262,16 @@ proptest! {
             tiny_crossing_eps: f,
             block_idx: h,
         })?;
+        check_uniform_zerocopy_roundtrip(&TileMixUniforms {
+            num_frames: a,
+            num_tiles: b,
+            num_active_tiles: c,
+            dir_mode: d,
+            num_stems: g,
+            block_wave: h,
+            num_quads: e.to_bits(),
+            _pad1: f.to_bits(),
+        })?;
         check_uniform_zerocopy_roundtrip(&GaborBezoutUniforms {
             num_frames: a,
             fft_size: b,
@@ -257,19 +288,19 @@ proptest! {
             target_channels: c,
             chunk_len: d,
             num_chunks: g,
-            _pad0: h,
-            _pad1: e.to_bits(),
-            _pad2: f.to_bits(),
+            pair_tile_rows: h,
+            reduce_pass: e.to_bits(),
+            _pad: f.to_bits(),
         })?;
         check_uniform_zerocopy_roundtrip(&InnerOptUniforms {
             num_params: a,
             history_m: b,
             step_idx: c,
-            line_search_iter: d,
+            mode_flags: d,
             step_size: e,
             damping_lambda: f,
             min_bound_eps: f32::from_bits(g),
-            _pad: h,
+            grad_clip_norm: f32::from_bits(h),
         })?;
     }
 }

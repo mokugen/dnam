@@ -2,15 +2,15 @@
 //! ZOH rate rescaling, and `2×` poly-quad oversampling/decimation matching `dnam-vm`
 //! (`ref[dsp.op-n.core.matryoshka-blocks]`, `ref[dsp.zoh.core-paralru]`).
 
-use dnam_vm::{
-    SONA_CORE_QUAD_BLOCK_AND_LOCAL, SONA_INTERBLOCK_TILES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER,
-};
+use dnam_kernels::{SOFT_RECT_EPS, TINY_CROSSING_EPS};
+use dnam_vm::{SONA_CORE_QUAD_BLOCK_AND_LOCAL, SONA_INTERBLOCK_TILES};
 
 use crate::error::TrainError;
-use crate::gpu::abi::{FEATURE_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, TILE_FRAMES};
+use crate::gpu::abi::{CORE_INPUT_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE, TILE_DESC_VEC4_STRIDE};
+use crate::runner::types::{WaveCoreCascadeInput, pack_tile_descriptor};
 use crate::runner::{TrainRunner, pack_core_quad_params};
 
-use super::{SonaModelF64, run_planned_core_scan};
+use super::SonaModelF64;
 
 /// Output returned by [`run_causal_core_cascade_stereo`].
 #[derive(Clone, Debug)]
@@ -163,8 +163,61 @@ pub(crate) struct CascadeCrossbarSpec<'a> {
     pub crossbar_add: Option<CrossbarInjection<'a>>,
 }
 
+/// Packs ZOH-rescaled `CoreQuad` parameters (`q_count * 25`) and active causal
+/// `SONA_INTERBLOCK_TILES` descriptors (`active_tiles * 13`) for wave-batched GPU/CPU cascade and
+/// adjoint execution.
+pub(crate) fn pack_wave_quads_and_tiles(
+    model: &SonaModelF64,
+    q_count: usize,
+    active_tiles: usize,
+    rho_core: f64,
+) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
+    let mut quad_params = Vec::with_capacity(q_count * QUAD_PARAMS_VEC4_STRIDE);
+    for q in 0..q_count {
+        let block_idx = SONA_CORE_QUAD_BLOCK_AND_LOCAL[q].0 as u32;
+        let quad = model.core_quads[q].rescaled_for_rho(rho_core);
+        quad_params.extend_from_slice(&pack_core_quad_params(
+            &quad.to_kernel_params_for_block(block_idx),
+        ));
+    }
+
+    let mut tile_descriptors = Vec::with_capacity(active_tiles * TILE_DESC_VEC4_STRIDE);
+    for (tile_idx, &(src_q, dst_q)) in SONA_INTERBLOCK_TILES[..active_tiles].iter().enumerate() {
+        let src_block = SONA_CORE_QUAD_BLOCK_AND_LOCAL[src_q].0 as u32;
+        let dst_block = SONA_CORE_QUAD_BLOCK_AND_LOCAL[dst_q].0 as u32;
+        let (wo, we, wl) = if src_q < q_count && dst_q < q_count {
+            let tile = &model.tiles[tile_idx];
+            let mut wo = [[0.0_f32; 4]; 4];
+            let mut we = [[0.0_f32; 4]; 4];
+            let mut wl = [[0.0_f32; 4]; 4];
+            for s in 0..4 {
+                for d in 0..4 {
+                    wo[s][d] = sanitize_unit_f64(tile.w_odd_4x4[s][d], -8.0, 8.0, 0.0) as f32;
+                    we[s][d] = sanitize_unit_f64(tile.w_even_4x4[s][d], -8.0, 8.0, 0.0) as f32;
+                    wl[s][d] = sanitize_unit_f64(tile.w_lru_4x4[s][d], -8.0, 8.0, 0.0) as f32;
+                }
+            }
+            (wo, we, wl)
+        } else {
+            ([[0.0; 4]; 4], [[0.0; 4]; 4], [[0.0; 4]; 4])
+        };
+        tile_descriptors.extend_from_slice(&pack_tile_descriptor(
+            src_q as u32,
+            dst_q as u32,
+            src_block,
+            dst_block,
+            &wo,
+            &we,
+            &wl,
+        ));
+    }
+
+    (quad_params, tile_descriptors)
+}
+
 /// Evaluates active `CoreQuad` blocks with optional precomputed per-quad `Crossbar` injections
-/// `(cb_add_l, cb_add_r)` indexed as `[q * n + t][lane]`.
+/// `(cb_add_l, cb_add_r)` indexed as `[q * n + t][lane]` via wave-batched `Waves 0..=3` +
+/// `tile_mix_fwd_adj(0)` execution.
 pub(crate) fn run_causal_core_cascade_with_crossbar(
     runner: &TrainRunner,
     model: &SonaModelF64,
@@ -179,6 +232,13 @@ pub(crate) fn run_causal_core_cascade_with_crossbar(
         crossbar_add,
     } = spec;
     let n = ux_l.len().min(ux_r.len());
+    if n == 0 {
+        return Ok(CausalCascadeOutput {
+            core_inputs: Vec::new(),
+            tile_checkpoints: Vec::new(),
+            feature_outputs: Vec::new(),
+        });
+    }
     let q_count = active_quads.clamp(1, super::NUM_CORE_QUADS_ULTRA);
     let active_tiles = match q_count {
         0..=4 => 3_usize,
@@ -186,62 +246,14 @@ pub(crate) fn run_causal_core_cascade_with_crossbar(
         7..=8 => 23_usize,
         _ => 35_usize,
     };
-    let num_tiles = n.div_ceil(TILE_FRAMES);
 
-    let mut core_inputs = vec![[0.0_f32; 4]; q_count * n * 2];
-    let mut feature_outputs = vec![[0.0_f32; 4]; q_count * n * FEATURE_VEC4_STRIDE];
-    let ckpt_per_quad = if write_checkpoints {
-        num_tiles * TILE_CKPT_VEC4_STRIDE
-    } else {
-        0
-    };
-    let mut tile_checkpoints = vec![[0.0_f32; 4]; q_count * ckpt_per_quad];
-    let mut quad_done = [false; super::NUM_CORE_QUADS_ULTRA];
-
-    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER {
-        if q >= q_count {
-            continue;
-        }
-        let quad = model.core_quads[q].rescaled_for_rho(rho_core);
+    let mut base_core_inputs = vec![[0.0_f32; 4]; q_count * n * CORE_INPUT_VEC4_STRIDE];
+    for q in 0..q_count {
+        let quad = &model.core_quads[q];
         let in_mid: [f64; 4] =
             core::array::from_fn(|d| sanitize_unit_f64(quad.in_mid_weight[d], -16.0, 16.0, 0.0));
         let in_side: [f64; 4] =
             core::array::from_fn(|d| sanitize_unit_f64(quad.in_side_weight[d], -16.0, 16.0, 0.0));
-        type IncomingTileStep = (usize, [[f64; 4]; 4], [[f64; 4]; 4], [[f64; 4]; 4]);
-        let incoming_tiles: Vec<IncomingTileStep> = SONA_INTERBLOCK_TILES[..active_tiles]
-            .iter()
-            .enumerate()
-            .filter_map(|(tile_idx, &(src_q, dst_q))| {
-                if dst_q != q || src_q >= q_count {
-                    return None;
-                }
-                debug_assert!(
-                    quad_done[src_q],
-                    "topological violation: src_q={src_q} -> dst_q={dst_q}"
-                );
-                let tile = &model.tiles[tile_idx];
-                let mut wo = [[0.0_f64; 4]; 4];
-                let mut we = [[0.0_f64; 4]; 4];
-                let mut wl = [[0.0_f64; 4]; 4];
-                let mut any_nonzero = false;
-                for s in 0..4 {
-                    for d in 0..4 {
-                        let o = sanitize_unit_f64(tile.w_odd_4x4[s][d], -8.0, 8.0, 0.0);
-                        let e = sanitize_unit_f64(tile.w_even_4x4[s][d], -8.0, 8.0, 0.0);
-                        let l = sanitize_unit_f64(tile.w_lru_4x4[s][d], -8.0, 8.0, 0.0);
-                        wo[s][d] = o;
-                        we[s][d] = e;
-                        wl[s][d] = l;
-                        if o != 0.0 || e != 0.0 || l != 0.0 {
-                            any_nonzero = true;
-                        }
-                    }
-                }
-                any_nonzero.then_some((src_q, wo, we, wl))
-            })
-            .collect();
-
-        let mut quad_in = vec![[0.0_f32; 4]; n * 2];
         for t in 0..n {
             let ul = sanitize_unit_f64(ux_l[t], -1.0e6, 1.0e6, 0.0);
             let ur = sanitize_unit_f64(ux_r[t], -1.0e6, 1.0e6, 0.0);
@@ -254,63 +266,38 @@ pub(crate) fn run_causal_core_cascade_with_crossbar(
                 }
                 _ => ([0.0; 4], [0.0; 4]),
             };
-            let mut acc_l = [0.0_f64; 4];
-            let mut acc_r = [0.0_f64; 4];
+            let mut acc_l = [0.0_f32; 4];
+            let mut acc_r = [0.0_f32; 4];
             for d in 0..4 {
-                acc_l[d] = in_mid[d] * mid + in_side[d] * side + cb_l[d];
-                acc_r[d] = in_mid[d] * mid - in_side[d] * side + cb_r[d];
+                acc_l[d] = (in_mid[d] * mid + in_side[d] * side + cb_l[d]) as f32;
+                acc_r[d] = (in_mid[d] * mid - in_side[d] * side + cb_r[d]) as f32;
             }
-            for &(src_q, ref wo, ref we, ref wl) in &incoming_tiles {
-                let fbase = (src_q * n + t) * 6;
-                let v_eff_l = feature_outputs[fbase];
-                let v_eff_r = feature_outputs[fbase + 1];
-                let odd_l = feature_outputs[fbase + 2];
-                let odd_r = feature_outputs[fbase + 3];
-                let even_l = feature_outputs[fbase + 4];
-                let even_r = feature_outputs[fbase + 5];
-                for s in 0..4 {
-                    let ol = f64::from(odd_l[s]);
-                    let or_ = f64::from(odd_r[s]);
-                    let el = f64::from(even_l[s]);
-                    let er = f64::from(even_r[s]);
-                    let vl = f64::from(v_eff_l[s]);
-                    let vr = f64::from(v_eff_r[s]);
-                    for d in 0..4 {
-                        acc_l[d] += wo[s][d] * ol + we[s][d] * el + wl[s][d] * vl;
-                        acc_r[d] += wo[s][d] * or_ + we[s][d] * er + wl[s][d] * vr;
-                    }
-                }
-            }
-            quad_in[t * 2] = acc_l.map(|v| v as f32);
-            quad_in[t * 2 + 1] = acc_r.map(|v| v as f32);
+            let base = (q * n + t) * CORE_INPUT_VEC4_STRIDE;
+            base_core_inputs[base] = acc_l;
+            base_core_inputs[base + 1] = acc_r;
         }
-
-        let block_idx = SONA_CORE_QUAD_BLOCK_AND_LOCAL[q].0 as u32;
-        let single_params = pack_core_quad_params(&quad.to_kernel_params_for_block(block_idx));
-        let scan = run_planned_core_scan(
-            runner,
-            n,
-            1,
-            1,
-            write_checkpoints,
-            block_idx,
-            &quad_in,
-            &single_params,
-        )?;
-        core_inputs[(q * n * 2)..((q + 1) * n * 2)].copy_from_slice(&quad_in);
-        feature_outputs[(q * n * 6)..((q + 1) * n * 6)]
-            .copy_from_slice(&scan.feature_outputs[..(n * 6)]);
-        if write_checkpoints && !scan.tile_checkpoints.is_empty() {
-            tile_checkpoints[(q * ckpt_per_quad)..((q + 1) * ckpt_per_quad)]
-                .copy_from_slice(&scan.tile_checkpoints[..ckpt_per_quad]);
-        }
-        quad_done[q] = true;
     }
 
+    let (quad_params, tile_descriptors) =
+        pack_wave_quads_and_tiles(model, q_count, active_tiles, rho_core);
+    let wave = runner.run_wave_core_cascade(&WaveCoreCascadeInput {
+        num_frames: n,
+        num_quads: q_count,
+        num_stems: 1,
+        active_tiles,
+        write_checkpoints,
+        fixed_point_scan: false,
+        soft_rect_eps: SOFT_RECT_EPS,
+        tiny_crossing_eps: TINY_CROSSING_EPS,
+        base_core_inputs: &base_core_inputs,
+        quad_params: &quad_params,
+        tile_descriptors: &tile_descriptors,
+    })?;
+
     Ok(CausalCascadeOutput {
-        core_inputs,
-        tile_checkpoints,
-        feature_outputs,
+        core_inputs: wave.core_inputs,
+        tile_checkpoints: wave.tile_checkpoints,
+        feature_outputs: wave.feature_outputs,
     })
 }
 

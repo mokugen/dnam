@@ -55,6 +55,8 @@ pub struct GluPullback {
 pub struct LocalNonlinPullback {
     pub adj_r_l: f32,
     pub adj_r_r: f32,
+    pub adj_r_prev_l: f32,
+    pub adj_r_prev_r: f32,
     pub adj_veff_feat_l: f32,
     pub adj_veff_feat_r: f32,
     pub grad_glu_mix: f32,
@@ -365,6 +367,7 @@ pub fn eval_adaa_local_and_seam_pullback(
     lp: &QuadLaneParams,
     tiny_eps: f32,
     r_next_seam: (f32, f32),
+    exit_adj_r_prev_seam: (f32, f32),
 ) -> LocalNonlinPullback {
     let i = lid & 255;
     let is_active = i < valid_len;
@@ -460,12 +463,17 @@ pub fn eval_adaa_local_and_seam_pullback(
                 * next_glu.adj_odd_wf_r
                 + dr_seam.d_even_da * next_glu.adj_even_r;
         }
+    } else if tile + 1 == num_tiles && valid_len > 0 && i + 1 == valid_len {
+        adj_r_l += exit_adj_r_prev_seam.0;
+        adj_r_r += exit_adj_r_prev_seam.1;
     }
     wg_barrier();
 
     LocalNonlinPullback {
         adj_r_l,
         adj_r_r,
+        adj_r_prev_l,
+        adj_r_prev_r,
         adj_veff_feat_l: glu.adj_veff_feat_l,
         adj_veff_feat_r: glu.adj_veff_feat_r,
         grad_glu_mix: glu.grad_glu_mix,

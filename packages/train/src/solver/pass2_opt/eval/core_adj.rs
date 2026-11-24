@@ -5,7 +5,7 @@
 use dnam_kernels::{MAX_SVF_K_NL, MIN_TPT_G};
 use dnam_vm::{SONA_INTERBLOCK_TILES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER};
 
-use crate::gpu::abi::{FEATURE_VEC4_STRIDE, quad_param_slots};
+use crate::gpu::abi::{FEATURE_VEC4_STRIDE, TILE_WEIGHT_GRAD_FLOATS, quad_param_slots};
 
 use super::super::super::model::cascade::sanitize_unit_f64;
 use super::super::super::model::{CoreQuadF64, SonaModelF64};
@@ -271,31 +271,57 @@ pub(crate) struct CoreInputBackpropOut<'a> {
     pub d_cb_opt: Option<CrossbarGradMut<'a>>,
 }
 
+/// Accumulates deterministic wave-reduced `InterBlockTile` weight gradients (`48` floats per tile:
+/// `[w_odd_4x4, w_even_4x4, w_lru_4x4]`) into `d_tiles`, honoring the `[-8.0, 8.0]` clamp boundaries.
+pub(crate) fn add_wave_tile_weight_grads(
+    model: &SonaModelF64,
+    q_count: usize,
+    active_tiles: usize,
+    flat_grads: &[f32],
+    d_tiles: &mut [Pass2TileGrads],
+) {
+    for (tile_idx, &(src_q, dst_q)) in SONA_INTERBLOCK_TILES[..active_tiles].iter().enumerate() {
+        if src_q >= q_count || dst_q >= q_count || tile_idx >= d_tiles.len() {
+            continue;
+        }
+        let base = tile_idx * TILE_WEIGHT_GRAD_FLOATS;
+        if base + TILE_WEIGHT_GRAD_FLOATS > flat_grads.len() {
+            break;
+        }
+        let tile = &model.tiles[tile_idx];
+        let dt = &mut d_tiles[tile_idx];
+        for s in 0..4 {
+            for d in 0..4 {
+                let idx = s * 4 + d;
+                if tile.w_odd_4x4[s][d].is_finite() && tile.w_odd_4x4[s][d].abs() < 8.0 {
+                    dt.w_odd_4x4[s][d] += f64::from(flat_grads[base + idx]);
+                }
+                if tile.w_even_4x4[s][d].is_finite() && tile.w_even_4x4[s][d].abs() < 8.0 {
+                    dt.w_even_4x4[s][d] += f64::from(flat_grads[base + 16 + idx]);
+                }
+                if tile.w_lru_4x4[s][d].is_finite() && tile.w_lru_4x4[s][d].abs() < 8.0 {
+                    dt.w_lru_4x4[s][d] += f64::from(flat_grads[base + 32 + idx]);
+                }
+            }
+        }
+    }
+}
+
 /// Propagates single-frame input adjoints `(gin_l, gin_r)` of quad `q` back into M/S input weights
-/// & `(gx_ux_l, gx_ux_r)`, optional `Crossbar` `d_cb_l/r`, and upstream `InterBlockTile`s / `d_feats`.
-pub(crate) fn backprop_core_input_frame(
-    ctx: &CoreInputBackpropCtx<'_>,
+/// & `(gx_ux_l, gx_ux_r)` and optional `Crossbar` `d_cb_l/r`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn backprop_local_core_input_frame(
+    model: &SonaModelF64,
+    q: usize,
+    t: usize,
+    n: usize,
+    ux_l_t: f64,
+    ux_r_t: f64,
     gin_l: [f32; 4],
     gin_r: [f32; 4],
-    out: CoreInputBackpropOut<'_>,
+    d_quad: &mut Pass2CoreQuadGrads,
+    mut d_cb_opt: Option<CrossbarGradMut<'_>>,
 ) -> (f64, f64) {
-    let CoreInputBackpropCtx {
-        model,
-        q,
-        t,
-        n,
-        q_count,
-        active_tiles,
-        ux_l_t,
-        ux_r_t,
-        feature_outputs,
-    } = *ctx;
-    let CoreInputBackpropOut {
-        d_feats,
-        d_quad,
-        d_tiles,
-        mut d_cb_opt,
-    } = out;
     let mid = 0.5 * sanitize_unit_f64(ux_l_t + ux_r_t, -2.0e6, 2.0e6, 0.0);
     let side = 0.5 * sanitize_unit_f64(ux_l_t - ux_r_t, -2.0e6, 2.0e6, 0.0);
     let mut g_ux_l = 0.0_f64;
@@ -324,6 +350,38 @@ pub(crate) fn backprop_core_input_frame(
             d_cb_r[cb_idx][d] += gr_d;
         }
     }
+
+    (g_ux_l, g_ux_r)
+}
+
+/// Propagates single-frame input adjoints `(gin_l, gin_r)` of quad `q` back into M/S input weights
+/// & `(gx_ux_l, gx_ux_r)`, optional `Crossbar` `d_cb_l/r`, and upstream `InterBlockTile`s / `d_feats`.
+pub(crate) fn backprop_core_input_frame(
+    ctx: &CoreInputBackpropCtx<'_>,
+    gin_l: [f32; 4],
+    gin_r: [f32; 4],
+    out: CoreInputBackpropOut<'_>,
+) -> (f64, f64) {
+    let CoreInputBackpropCtx {
+        model,
+        q,
+        t,
+        n,
+        q_count,
+        active_tiles,
+        ux_l_t,
+        ux_r_t,
+        feature_outputs,
+    } = *ctx;
+    let CoreInputBackpropOut {
+        d_feats,
+        d_quad,
+        d_tiles,
+        d_cb_opt,
+    } = out;
+    let (g_ux_l, g_ux_r) = backprop_local_core_input_frame(
+        model, q, t, n, ux_l_t, ux_r_t, gin_l, gin_r, d_quad, d_cb_opt,
+    );
 
     for (tile_idx, &(src_q, dst_q)) in SONA_INTERBLOCK_TILES[..active_tiles].iter().enumerate() {
         if dst_q != q || src_q >= q_count {

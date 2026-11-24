@@ -378,18 +378,19 @@ impl WhitenedLbfgs {
     }
 }
 
-/// Bridges an iterative polish loop to `TrainRunner::inner_opt_step` (`m <= 8`).
+/// Bridges an iterative polish loop to `TrainRunner::inner_opt_step` (`m <= 32`).
 pub fn step_runner_inner_opt(
     runner: &TrainRunner,
     uniforms: InnerOptUniforms,
     theta: &mut Vec<f32>,
     grad: &[f32],
-    param_bounds: &[[f32; 2]],
+    param_bounds: &[[f32; 4]],
     lbfgs_s_y: &mut Vec<[f32; 4]>,
     search_dir: &mut Vec<f32>,
 ) -> Result<(), TrainError> {
     let out = runner.inner_opt_step(&InnerOptInput {
         uniforms,
+        num_candidates: 1,
         theta,
         grad,
         param_bounds,
@@ -405,6 +406,7 @@ pub fn step_runner_inner_opt(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gpu::abi::{COORD_TRANSFORM_FREE, INNER_OPT_MODE_LSSBROYDEN};
     use crate::wide_gram::{uplo_u_index, uplo_u_packed_len};
 
     #[test]
@@ -506,7 +508,7 @@ mod tests {
         let runner = TrainRunner::cpu();
         let mut th = vec![0.4_f32; 4];
         let grad = [0.1_f32; 4];
-        let bnd = [[-1.0_f32, 1.0]; 4];
+        let bnd = [[-1.0_f32, 1.0, 1.0, f32::from_bits(COORD_TRANSFORM_FREE)]; 4];
         let mut sy = vec![[0.0_f32; 4]; 12];
         let mut sdir = vec![0.0_f32; 4];
         step_runner_inner_opt(
@@ -515,11 +517,11 @@ mod tests {
                 num_params: 4,
                 history_m: 2,
                 step_idx: 0,
-                line_search_iter: 0,
+                mode_flags: INNER_OPT_MODE_LSSBROYDEN,
                 step_size: 0.2,
                 damping_lambda: 1.0e-4,
                 min_bound_eps: 1.0e-4,
-                _pad: 0,
+                grad_clip_norm: 0.0,
             },
             &mut th,
             &grad,

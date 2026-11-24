@@ -22,6 +22,23 @@ pub struct SagStereoPullback {
     pub g_stereo_link: f32,
 }
 
+impl SagStereoPullback {
+    #[inline(always)]
+    #[must_use]
+    pub const fn zero() -> Self {
+        Self {
+            adj_tone_from_r_l: 0.0,
+            adj_tone_from_r_r: 0.0,
+            adj_v_raw_l: 0.0,
+            adj_v_raw_r: 0.0,
+            g_sag_depth: 0.0,
+            g_adaa_drive: 0.0,
+            g_lru_bias_drive: 0.0,
+            g_stereo_link: 0.0,
+        }
+    }
+}
+
 /// Pulls back `adj_r` and `adj_veff_feat` through `Sag -> Stereo-Link` to `tone` and `v_raw`.
 #[inline]
 #[must_use]

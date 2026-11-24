@@ -5,7 +5,7 @@
     {
       "name": "prescreen_population",
       "wgsl_path": "prescreen_population.wgsl",
-      "sha256": "fc1333e7acb1cf86cab13c9845debb8c0bb50b7a0dbd32600a68ac46209df19d",
+      "sha256": "7a8680419939d829ea68edaf6b5c3ca04a4bcd5a0df8d6bbbac4f9a7ae08642b",
       "workgroup_sram_bytes": 8192,
       "bindings": [
         {
@@ -38,7 +38,7 @@
     {
       "name": "fused_core_scan_256",
       "wgsl_path": "fused_core_scan_256.wgsl",
-      "sha256": "73575ee47a1994aef5d09b0163881b01a83d2fc058f709673065499a262de9ee",
+      "sha256": "7f32fd3d14b56243c74d3cbbafcc2ef00257ed40981e27ef7162ec2277e090d5",
       "workgroup_sram_bytes": 15360,
       "bindings": [
         {
@@ -71,7 +71,7 @@
     {
       "name": "adjoint_scan_256",
       "wgsl_path": "adjoint_scan_256.wgsl",
-      "sha256": "8747c6fbcfa8f33c668550dcda1eb42158ba8a044abd13e3f8a0b46f8f99464d",
+      "sha256": "e9e8474fdbddfb28473a105ebf994ca41ab740c9ed8e01aee47afdd7b6425231",
       "workgroup_sram_bytes": 14848,
       "bindings": [
         {
@@ -122,9 +122,47 @@
       ]
     },
     {
+      "name": "tile_mix_fwd_adj",
+      "wgsl_path": "tile_mix_fwd_adj.wgsl",
+      "sha256": "7561d974c0cca55015bed260cb0dd88812309c5bfda9ef9b75de2e3f6d02da7f",
+      "workgroup_sram_bytes": 2048,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 5,
+          "access": "storage_read_write"
+        }
+      ]
+    },
+    {
       "name": "gabor_bezout_grad",
       "wgsl_path": "gabor_bezout_grad.wgsl",
-      "sha256": "7c55daea7c70b25eb165ecb7f4d39bcd715c19686f430bfe4d91dd21d7502d8b",
+      "sha256": "fa3576baefa08f9d2b7947b6e74042dee7c5c15818fdb7f047ecd45d5d63bdde",
       "workgroup_sram_bytes": 11264,
       "bindings": [
         {
@@ -162,7 +200,7 @@
     {
       "name": "ozaki_gram_rhs_i32",
       "wgsl_path": "ozaki_gram_rhs_i32.wgsl",
-      "sha256": "2f47a5cd8918c659c3205f2f5e5a83f24ccab1c708af375cc853d59ffa836e23",
+      "sha256": "531d3d5540d7cdd80389be1672c4ea1a8bccc0e4a77c01444c1defa07b29ba47",
       "workgroup_sram_bytes": 5120,
       "bindings": [
         {
@@ -195,8 +233,8 @@
     {
       "name": "inner_opt_step",
       "wgsl_path": "inner_opt_step.wgsl",
-      "sha256": "c42ee3c9238e8b2bbf4c299f96c7abceac0be4f1c85619c30dd0c74974ba5d06",
-      "workgroup_sram_bytes": 2176,
+      "sha256": "e4510abd73d9ad059461ad9e5c00d36d59813993d4f6e8a5b8bc921ccfef0b4b",
+      "workgroup_sram_bytes": 2560,
       "bindings": [
         {
           "group": 0,
@@ -235,7 +273,7 @@
     {
       "name": "prescreen_population",
       "wgsl_path": "subgroups/prescreen_population.wgsl",
-      "sha256": "cabf86dab3fc9d2caafd5ef91039f9e5385c96b88b5146198cd777c22a435c40",
+      "sha256": "7e9f5e37829dbfb117217ea778d0bbf6ebba7a5704a36099a0832badcecc34d7",
       "workgroup_sram_bytes": 8192,
       "bindings": [
         {
@@ -268,7 +306,7 @@
     {
       "name": "fused_core_scan_256",
       "wgsl_path": "subgroups/fused_core_scan_256.wgsl",
-      "sha256": "73575ee47a1994aef5d09b0163881b01a83d2fc058f709673065499a262de9ee",
+      "sha256": "7f32fd3d14b56243c74d3cbbafcc2ef00257ed40981e27ef7162ec2277e090d5",
       "workgroup_sram_bytes": 15360,
       "bindings": [
         {
@@ -301,7 +339,7 @@
     {
       "name": "adjoint_scan_256",
       "wgsl_path": "subgroups/adjoint_scan_256.wgsl",
-      "sha256": "3e894bcbbd524ad68c7e29b242978c4254cd7944daed48d6cb9cc8e613d65344",
+      "sha256": "594a1b1cf9f261df59644cb469dcd04c0e5309318e6cfae376b9f9e6ce014488",
       "workgroup_sram_bytes": 14848,
       "bindings": [
         {
@@ -352,9 +390,47 @@
       ]
     },
     {
+      "name": "tile_mix_fwd_adj",
+      "wgsl_path": "subgroups/tile_mix_fwd_adj.wgsl",
+      "sha256": "e463d16b92afc2414711b233b1ee60bc7074546f0deba47cf328db9411889af9",
+      "workgroup_sram_bytes": 2048,
+      "bindings": [
+        {
+          "group": 0,
+          "binding": 0,
+          "access": "uniform"
+        },
+        {
+          "group": 0,
+          "binding": 1,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 2,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 3,
+          "access": "storage_read"
+        },
+        {
+          "group": 0,
+          "binding": 4,
+          "access": "storage_read_write"
+        },
+        {
+          "group": 0,
+          "binding": 5,
+          "access": "storage_read_write"
+        }
+      ]
+    },
+    {
       "name": "gabor_bezout_grad",
       "wgsl_path": "subgroups/gabor_bezout_grad.wgsl",
-      "sha256": "abe87dfecfafa379b4eca275f73f6f511a6d7eceeb811382148d2e9058033af6",
+      "sha256": "8b03d4346b9bd53fa0fa248324235ab9109b95785faa1b5e28137d439cdd0e32",
       "workgroup_sram_bytes": 11264,
       "bindings": [
         {
@@ -392,7 +468,7 @@
     {
       "name": "ozaki_gram_rhs_i32",
       "wgsl_path": "subgroups/ozaki_gram_rhs_i32.wgsl",
-      "sha256": "3f7245a298d56f9fa2f105478319049ad539c8e4f7bcd7d5bc1e5ef41510ad83",
+      "sha256": "bcf6dc1ca3e12f11c53b43ae00fc51ed798801749a8e2e40f71d3248a97623c8",
       "workgroup_sram_bytes": 5120,
       "bindings": [
         {
@@ -425,8 +501,8 @@
     {
       "name": "inner_opt_step",
       "wgsl_path": "subgroups/inner_opt_step.wgsl",
-      "sha256": "d44526b474753a9df5f2dec5ed65552d0f12bbc47b3d14f5a89d0708a3783d64",
-      "workgroup_sram_bytes": 2176,
+      "sha256": "49060d88c81a7236c404827dce03618098d8338cca2711d64cb63b1b282d5e74",
+      "workgroup_sram_bytes": 2560,
       "bindings": [
         {
           "group": 0,

@@ -7,19 +7,18 @@ pub(super) mod core_adj;
 
 use dnam_kernels::{SOFT_RECT_EPS, TINY_CROSSING_EPS};
 use dnam_vm::SONA_CORE_QUAD_BLOCK_AND_LOCAL;
-use dnam_vm::SONA_ULTRA_QUAD_TRAVERSAL_ORDER;
 
 use crate::error::TrainError;
 use crate::gpu::abi::{
-    AdjointScanUniforms, FEATURE_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE,
-    TILE_FRAMES,
+    CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE, TILE_FRAMES,
 };
-use crate::runner::{AdjointScanInput, TrainRunner, pack_core_quad_params};
+use crate::runner::TrainRunner;
+use crate::runner::types::WaveCoreAdjointInput;
 
 use super::super::model::cascade::{
     CascadeCrossbarSpec, CausalCascadeOutput, downsample_lane_2x_adjoint_f64,
-    downsample_lane_2x_f64, run_causal_core_cascade_with_crossbar, sanitize_unit_f64,
-    upsample_lane_2x_adjoint_f64, upsample_stereo_2x_f64,
+    downsample_lane_2x_f64, pack_wave_quads_and_tiles, run_causal_core_cascade_with_crossbar,
+    sanitize_unit_f64, upsample_lane_2x_adjoint_f64, upsample_stereo_2x_f64,
 };
 use super::super::model::{NUM_FIR_TAPS_ULTRA, SonaModelF64};
 use super::adjoints::{eval_kautz_modal_channel_and_adjoint, eval_ro_pole_hp_and_adjoint};
@@ -35,9 +34,8 @@ use super::op_n_pre::eval_op_n_pre_and_adjoint;
 use super::op_t_quad::{OpTQuadAdjointSlices, eval_op_t_bank_stereo_and_adjoint};
 use super::sensory::eval_sensory_quad_and_adjoint;
 use core_adj::{
-    CoreInputBackpropCtx, CoreInputBackpropOut, active_opt_quads_for_core_quads,
-    active_tiles_for_quads, add_tile_param_grads_to_quad, backprop_core_input_frame,
-    finalize_core_quad_zoh,
+    active_opt_quads_for_core_quads, active_tiles_for_quads, add_tile_param_grads_to_quad,
+    add_wave_tile_weight_grads, backprop_local_core_input_frame, finalize_core_quad_zoh,
 };
 
 pub(super) use core_adj::Pass2FullGrads as Pass2ParamGrads;
@@ -514,7 +512,6 @@ pub(super) fn assemble_pass2_gradients(
 
     let rho_1x = 48_000.0 / model.sample_rate_hz.max(8_000.0);
     let rho_core = if buf.os2x { 0.5 * rho_1x } else { rho_1x };
-    let ckpt_per_quad = num_tiles * TILE_CKPT_VEC4_STRIDE;
     let mut d_cb_l = if buf.cb_trace.active {
         vec![[0.0_f64; 4]; q_count * n_core]
     } else {
@@ -526,75 +523,63 @@ pub(super) fn assemble_pass2_gradients(
         Vec::new()
     };
 
-    for &q in SONA_ULTRA_QUAD_TRAVERSAL_ORDER.iter().rev() {
-        if q >= q_count {
-            continue;
-        }
+    let (quad_params, tile_descriptors) =
+        pack_wave_quads_and_tiles(model, q_count, active_tiles_topo, rho_core);
+    let wave_adj = runner.run_wave_core_adjoint(&WaveCoreAdjointInput {
+        num_frames: n_core,
+        num_quads: q_count,
+        num_stems: 1,
+        active_tiles: active_tiles_topo,
+        soft_rect_eps: SOFT_RECT_EPS,
+        tiny_crossing_eps: TINY_CROSSING_EPS,
+        core_inputs: &buf.cascade.core_inputs,
+        quad_params: &quad_params,
+        tile_checkpoints: &buf.cascade.tile_checkpoints,
+        d_loss_d_features: &d_feats,
+        feature_outputs: &buf.cascade.feature_outputs,
+        tile_descriptors: &tile_descriptors,
+    })?;
+    add_wave_tile_weight_grads(
+        model,
+        q_count,
+        active_tiles_topo,
+        &wave_adj.tile_weight_grads,
+        &mut grads.tiles,
+    );
+
+    for q in 0..q_count {
         let block_idx = SONA_CORE_QUAD_BLOCK_AND_LOCAL[q].0 as u32;
-        let qp = pack_core_quad_params(
-            &model.core_quads[q]
-                .rescaled_for_rho(rho_core)
-                .to_kernel_params_for_block(block_idx),
-        );
-        let adj = runner.adjoint_scan_256(&AdjointScanInput {
-            uniforms: AdjointScanUniforms {
-                num_frames: n_core as u32,
-                num_tiles: num_tiles as u32,
-                num_quads: 1,
-                num_stems: 1,
-                pass_mode: 0,
-                soft_rect_eps: SOFT_RECT_EPS,
-                tiny_crossing_eps: TINY_CROSSING_EPS,
-                block_idx,
-            },
-            core_inputs: &buf.cascade.core_inputs[(q * n_core * 2)..((q + 1) * n_core * 2)],
-            quad_params: &qp,
-            tile_checkpoints: &buf.cascade.tile_checkpoints
-                [(q * ckpt_per_quad)..((q + 1) * ckpt_per_quad)],
-            d_loss_d_features: &d_feats
-                [(q * n_core * FEATURE_VEC4_STRIDE)..((q + 1) * n_core * FEATURE_VEC4_STRIDE)],
-            feature_outputs: &buf.cascade.feature_outputs
-                [(q * n_core * FEATURE_VEC4_STRIDE)..((q + 1) * n_core * FEATURE_VEC4_STRIDE)],
-        })?;
         for tile in 0..num_tiles {
             add_tile_param_grads_to_quad(
                 &model.core_quads[q],
                 block_idx,
-                &adj.param_grads,
-                tile * QUAD_PARAMS_VEC4_STRIDE,
+                &wave_adj.param_grads,
+                (q * num_tiles + tile) * QUAD_PARAMS_VEC4_STRIDE,
                 &mut grads.core_quads[q],
             );
         }
         finalize_core_quad_zoh(&model.core_quads[q], rho_core, &mut grads.core_quads[q]);
 
         for t in 0..n_core {
-            let gin_l = adj.d_loss_d_inputs[t * 2];
-            let gin_r = adj.d_loss_d_inputs[t * 2 + 1];
+            let in_idx = (q * n_core + t) * CORE_INPUT_VEC4_STRIDE;
+            let gin_l = wave_adj.d_loss_d_inputs[in_idx];
+            let gin_r = wave_adj.d_loss_d_inputs[in_idx + 1];
             let cb_opt = if buf.cb_trace.active {
                 Some((d_cb_l.as_mut_slice(), d_cb_r.as_mut_slice()))
             } else {
                 None
             };
-            let (add_l, add_r) = backprop_core_input_frame(
-                &CoreInputBackpropCtx {
-                    model,
-                    q,
-                    t,
-                    n: n_core,
-                    q_count,
-                    active_tiles: active_tiles_topo,
-                    ux_l_t: c_ux_l_ref[t],
-                    ux_r_t: c_ux_r_ref[t],
-                    feature_outputs: &buf.cascade.feature_outputs,
-                },
+            let (add_l, add_r) = backprop_local_core_input_frame(
+                model,
+                q,
+                t,
+                n_core,
+                c_ux_l_ref[t],
+                c_ux_r_ref[t],
                 gin_l,
                 gin_r,
-                CoreInputBackpropOut {
-                    d_feats: &mut d_feats,
-                    d_quad: &mut grads.core_quads[q],
-                    d_tiles: &mut grads.tiles,
-                    d_cb_opt: cb_opt,
-                },
+                &mut grads.core_quads[q],
+                cb_opt,
             );
             g_core_ux_l[t] += add_l;
             g_core_ux_r[t] += add_r;
@@ -826,10 +811,15 @@ mod tests {
             ),
         ];
         for (name, ana, mut_fn) in checks {
+            let step_eps = if name.contains("tiles") {
+                1.0e-3_f64
+            } else {
+                eps
+            };
             let (mut mp, mut mm) = (model.clone(), model.clone());
-            mut_fn(&mut mp, eps);
-            mut_fn(&mut mm, -eps);
-            let fd = (eval_fn(&mp) - eval_fn(&mm)) / (2.0 * eps);
+            mut_fn(&mut mp, step_eps);
+            mut_fn(&mut mm, -step_eps);
+            let fd = (eval_fn(&mp) - eval_fn(&mm)) / (2.0 * step_eps);
             let tol = if name.contains("core_quads") || name.contains("sense_vca") {
                 2.0e-2
             } else {

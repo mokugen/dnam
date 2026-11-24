@@ -1,22 +1,4 @@
-struct type_7_ {
-    member: array<vec2<f32>>,
-}
-
-struct type_11_ {
-    member: array<vec4<f32>>,
-}
-
-struct type_22_ {
-    member: u32,
-    member_1_: u32,
-}
-
-struct type_27_ {
-    member: f32,
-    member_1_: f32,
-}
-
-struct type_29_ {
+struct type_5_ {
     member: u32,
     member_1_: u32,
     member_2_: u32,
@@ -27,8 +9,26 @@ struct type_29_ {
     member_7_: f32,
 }
 
+struct type_6_ {
+    member: type_5_,
+}
+
+struct type_10_ {
+    member: array<vec4<f32>>,
+}
+
+struct type_20_ {
+    member: u32,
+    member_1_: u32,
+}
+
+struct type_27_ {
+    member: f32,
+    member_1_: f32,
+}
+
 struct type_30_ {
-    member: type_29_,
+    member: array<vec2<f32>>,
 }
 
 struct type_32_ {
@@ -44,17 +44,17 @@ struct type_33_ {
 var<private> wg_id_1_: vec3<u32>;
 var<private> lid_1_: u32;
 @group(0) @binding(0) 
-var<uniform> uniforms: type_30_;
+var<uniform> uniforms: type_6_;
 @group(0) @binding(1) 
-var<storage> pred_audio: type_7_;
+var<storage> pred_audio: type_30_;
 @group(0) @binding(2) 
-var<storage> target_audio: type_7_;
+var<storage> target_audio: type_30_;
 @group(0) @binding(3) 
-var<storage> bezout_taps: type_11_;
+var<storage> bezout_taps: type_10_;
 @group(0) @binding(4) 
-var<storage, read_write> d_loss_d_pred: type_7_;
+var<storage, read_write> d_loss_d_pred: type_30_;
 @group(0) @binding(5) 
-var<storage, read_write> band_losses: type_11_;
+var<storage, read_write> band_losses: type_10_;
 var<workgroup> buf_a: array<vec4<f32>, 256>;
 var<workgroup> buf_b: array<vec4<f32>, 256>;
 var<workgroup> buf_c: array<vec2<f32>, 256>;
@@ -323,7 +323,7 @@ fn function_() {
     var phi_285_: bool;
     var phi_301_: bool;
     var phi_317_: bool;
-    var phi_363_: type_22_;
+    var phi_363_: type_20_;
     var phi_366_: f32;
     var phi_368_: f32;
     var phi_370_: f32;
@@ -336,8 +336,8 @@ fn function_() {
     var phi_384_: f32;
     var phi_386_: f32;
     var phi_388_: f32;
-    var phi_364_: type_22_;
-    var phi_411_: type_22_;
+    var phi_364_: type_20_;
+    var phi_411_: type_20_;
     var phi_433_: u32;
     var phi_464_: bool;
     var phi_480_: bool;
@@ -455,11 +455,11 @@ fn function_() {
     var phi_1702_: bool;
     var phi_1723_: bool;
     var phi_1754_: u32;
-    var phi_1836_: type_22_;
+    var phi_1836_: type_20_;
     var phi_1839_: f32;
     var phi_1841_: f32;
-    var phi_1837_: type_22_;
-    var phi_1864_: type_22_;
+    var phi_1837_: type_20_;
+    var phi_1864_: type_20_;
     var phi_1887_: u32;
     var phi_1972_: bool;
     var phi_1989_: bool;
@@ -607,7 +607,7 @@ fn function_() {
                 }
                 workgroupBarrier();
                 if _e1716_ {
-                    phi_363_ = type_22_(0u, _e1712_);
+                    phi_363_ = type_20_(0u, _e1712_);
                     phi_366_ = 0f;
                     phi_368_ = 0f;
                     phi_370_ = 0f;
@@ -647,11 +647,11 @@ fn function_() {
                         local_31_ = _e1817_;
                         local_32_ = _e1819_;
                         if (_e1795_.member < _e1795_.member_1_) {
-                            phi_364_ = type_22_((_e1795_.member + 1u), _e1795_.member_1_);
-                            phi_411_ = type_22_(1u, _e1795_.member);
+                            phi_364_ = type_20_((_e1795_.member + 1u), _e1795_.member_1_);
+                            phi_411_ = type_20_(1u, _e1795_.member);
                         } else {
                             phi_364_ = _e1795_;
-                            phi_411_ = type_22_(0u, u32());
+                            phi_411_ = type_20_(0u, u32());
                         }
                         let _e1832_ = phi_364_;
                         let _e1834_ = phi_411_;
@@ -1666,7 +1666,7 @@ fn function_() {
                 buf_c[_e2002_].y = (_e2648_ * _e2634_);
                 workgroupBarrier();
                 if _e1716_ {
-                    phi_1836_ = type_22_(0u, _e1712_);
+                    phi_1836_ = type_20_(0u, _e1712_);
                     phi_1839_ = 0f;
                     phi_1841_ = 0f;
                     loop {
@@ -1676,11 +1676,11 @@ fn function_() {
                         local_15_ = _e2662_;
                         local_16_ = _e2660_;
                         if (_e2658_.member < _e2658_.member_1_) {
-                            phi_1837_ = type_22_((_e2658_.member + 1u), _e2658_.member_1_);
-                            phi_1864_ = type_22_(1u, _e2658_.member);
+                            phi_1837_ = type_20_((_e2658_.member + 1u), _e2658_.member_1_);
+                            phi_1864_ = type_20_(1u, _e2658_.member);
                         } else {
                             phi_1837_ = _e2658_;
-                            phi_1864_ = type_22_(0u, u32());
+                            phi_1864_ = type_20_(0u, u32());
                         }
                         let _e2675_ = phi_1837_;
                         let _e2677_ = phi_1864_;

@@ -9,7 +9,7 @@ use crate::abi::{
 };
 use dnam_kernels::{
     LinearScanElem, TptAdjointElem, TptScanElem, apply_linear_scan, apply_tpt_adjoint,
-    apply_tpt_init, canonicalize_zero_f32_bits, compose_paralru_adjoint_scan,
+    apply_tpt_init, canonicalize_zero_f32_bits, compose_linear_scan, compose_paralru_adjoint_scan,
     compose_tpt_adjoint_scan, compose_tpt_scan,
 };
 #[cfg(all(target_arch = "spirv", feature = "subgroups"))]
@@ -115,6 +115,172 @@ fn load_linear_elem(
         a: scan_scratch[a_idx],
         b: scan_scratch[b_idx],
     }
+}
+
+const SUBTILE_FRAMES: usize = TILE_FRAMES / 2;
+
+#[inline(always)]
+fn store_tpt_elem_sub(
+    scan_scratch: &mut [f32; FORWARD_SCAN_SCRATCH_FLOATS],
+    base_floats: usize,
+    idx: usize,
+    e: TptScanElem,
+) {
+    let i = idx & 127;
+    scan_scratch[base_floats + i] = e.m00;
+    scan_scratch[base_floats + SUBTILE_FRAMES + i] = e.m01;
+    scan_scratch[base_floats + 2 * SUBTILE_FRAMES + i] = e.m10;
+    scan_scratch[base_floats + 3 * SUBTILE_FRAMES + i] = e.m11;
+    scan_scratch[base_floats + 4 * SUBTILE_FRAMES + i] = e.b0;
+    scan_scratch[base_floats + 5 * SUBTILE_FRAMES + i] = e.b1;
+}
+
+#[inline(always)]
+fn load_tpt_elem_sub(
+    scan_scratch: &[f32; FORWARD_SCAN_SCRATCH_FLOATS],
+    base_floats: usize,
+    idx: usize,
+) -> TptScanElem {
+    let i = idx & 127;
+    TptScanElem {
+        m00: scan_scratch[base_floats + i],
+        m01: scan_scratch[base_floats + SUBTILE_FRAMES + i],
+        m10: scan_scratch[base_floats + 2 * SUBTILE_FRAMES + i],
+        m11: scan_scratch[base_floats + 3 * SUBTILE_FRAMES + i],
+        b0: scan_scratch[base_floats + 4 * SUBTILE_FRAMES + i],
+        b1: scan_scratch[base_floats + 5 * SUBTILE_FRAMES + i],
+    }
+}
+
+/// Runs simultaneous `128`-frame `O(log2 128)` Hillis-Steele `TPT-SVF` exclusive scans for `L`
+/// (`lid in 0..128`, `scan_scratch[0..768]`) and `R` (`lid in 128..256`, `scan_scratch[768..1536]`),
+/// writing prior `(s_prev_out_0, s_prev_out_1)` and returning the inclusive sub-tile end state.
+#[inline]
+pub fn tpt_exclusive_scan_128_pair(
+    scan_scratch: &mut [f32; FORWARD_SCAN_SCRATCH_FLOATS],
+    lid: usize,
+    sub_valid_len: usize,
+    elem: TptScanElem,
+    init: [f32; 2],
+    s_prev_out_0: &mut f32,
+    s_prev_out_1: &mut f32,
+) -> [f32; 2] {
+    let is_r = (lid >> 7) != 0;
+    let i = lid & 127;
+    let base = if is_r { 6 * SUBTILE_FRAMES } else { 0 };
+    let mut cur = elem;
+    store_tpt_elem_sub(scan_scratch, base, i, cur);
+    wg_barrier();
+
+    let mut step = 1_usize;
+    while step < SUBTILE_FRAMES {
+        let next = if i >= step {
+            let pred = load_tpt_elem_sub(scan_scratch, base, i - step);
+            compose_tpt_scan(pred, cur)
+        } else {
+            cur
+        };
+        wg_barrier();
+        store_tpt_elem_sub(scan_scratch, base, i, next);
+        cur = next;
+        wg_barrier();
+        step <<= 1;
+    }
+
+    let [p0, p1] = if i == 0 {
+        init
+    } else {
+        let prev_elem = load_tpt_elem_sub(scan_scratch, base, i - 1);
+        apply_tpt_init(prev_elem, init)
+    };
+    *s_prev_out_0 = p0;
+    *s_prev_out_1 = p1;
+
+    let end_state = if sub_valid_len > 0 {
+        let last = if sub_valid_len <= SUBTILE_FRAMES {
+            sub_valid_len - 1
+        } else {
+            SUBTILE_FRAMES - 1
+        };
+        apply_tpt_init(load_tpt_elem_sub(scan_scratch, base, last), init)
+    } else {
+        init
+    };
+    wg_barrier();
+    end_state
+}
+
+#[inline(always)]
+fn store_linear_sub(
+    scan_scratch: &mut [f32; FORWARD_SCAN_SCRATCH_FLOATS],
+    base: usize,
+    idx: usize,
+    e: LinearScanElem,
+) {
+    let i = idx & 127;
+    scan_scratch[base + i] = e.a;
+    scan_scratch[base + SUBTILE_FRAMES + i] = e.b;
+}
+
+#[inline(always)]
+fn load_linear_sub(
+    scan_scratch: &[f32; FORWARD_SCAN_SCRATCH_FLOATS],
+    base: usize,
+    idx: usize,
+) -> LinearScanElem {
+    let i = idx & 127;
+    LinearScanElem {
+        a: scan_scratch[base + i],
+        b: scan_scratch[base + SUBTILE_FRAMES + i],
+    }
+}
+
+/// Runs simultaneous `128`-frame `O(log2 128)` Hillis-Steele forward linear scans for `L`
+/// (`lid in 0..128`, `scan_scratch[0..256]`) and `R` (`lid in 128..256`, `scan_scratch[256..512]`),
+/// returning `(inclusive_state_t, subtile_end_state)`.
+#[inline]
+pub fn linear_forward_exclusive_scan_128_pair(
+    scan_scratch: &mut [f32; FORWARD_SCAN_SCRATCH_FLOATS],
+    lid: usize,
+    sub_valid_len: usize,
+    elem: LinearScanElem,
+    v_init: f32,
+) -> (f32, f32) {
+    let is_r = (lid >> 7) != 0;
+    let i = lid & 127;
+    let base = if is_r { 2 * SUBTILE_FRAMES } else { 0 };
+    let mut cur = elem;
+    store_linear_sub(scan_scratch, base, i, cur);
+    wg_barrier();
+
+    let mut step = 1_usize;
+    while step < SUBTILE_FRAMES {
+        let next = if i >= step {
+            let pred = load_linear_sub(scan_scratch, base, i - step);
+            compose_linear_scan(pred, cur)
+        } else {
+            cur
+        };
+        wg_barrier();
+        store_linear_sub(scan_scratch, base, i, next);
+        cur = next;
+        wg_barrier();
+        step <<= 1;
+    }
+
+    let v_incl = apply_linear_scan(cur, v_init);
+    let v_end = if sub_valid_len > 0 {
+        let last = if sub_valid_len <= SUBTILE_FRAMES {
+            sub_valid_len - 1
+        } else {
+            SUBTILE_FRAMES - 1
+        };
+        apply_linear_scan(load_linear_sub(scan_scratch, base, last), v_init)
+    } else {
+        v_init
+    };
+    wg_barrier();
+    (v_incl, v_end)
 }
 
 /// Runs a `256`-wide `O(log2 256)` Hillis-Steele inclusive `TPT-SVF` scan in `scan_scratch`,

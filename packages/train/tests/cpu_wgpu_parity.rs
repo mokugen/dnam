@@ -7,6 +7,8 @@
 
 mod cpu_wgpu_parity {
     #[cfg(feature = "gpu-wgpu")]
+    pub(crate) mod m22_pipeline;
+    #[cfg(feature = "gpu-wgpu")]
     pub(crate) mod support;
 }
 
@@ -22,9 +24,10 @@ mod gpu_parity {
         WgpuRunner,
         abi::{
             AdjointScanUniforms, CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, FusedScanUniforms,
-            GaborBezoutUniforms, InnerOptUniforms, OZAKI_WORDS_PER_PAIR, OzakiGramUniforms,
-            PRESCREEN_SEED_PARAM_STRIDE, PrescreenUniforms, QUAD_PARAMS_VEC4_STRIDE,
-            TILE_CKPT_VEC4_STRIDE, TILE_FRAMES, quad_param_slots,
+            GaborBezoutUniforms, INNER_OPT_MODE_LSSBROYDEN, InnerOptUniforms,
+            OZAKI_PAIR_TILE_ROWS_DEFAULT, OZAKI_SPLIT64_WORDS_PER_PAIR, OZAKI_WORDS_PER_PAIR,
+            OzakiGramUniforms, PRESCREEN_SEED_PARAM_STRIDE, PrescreenUniforms,
+            QUAD_PARAMS_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, TILE_FRAMES, quad_param_slots,
         },
         plan_core_scan_execution, uplo_u_index, uplo_u_packed_len,
     };
@@ -91,9 +94,9 @@ mod gpu_parity {
                     target_channels: tc as u32,
                     chunk_len: 1024,
                     num_chunks: 2,
-                    _pad0: 0,
-                    _pad1: 0,
-                    _pad2: 0,
+                    pair_tile_rows: OZAKI_PAIR_TILE_ROWS_DEFAULT,
+                    reduce_pass: 0,
+                    _pad: 0,
                 },
                 features: &features,
                 targets: &targets,
@@ -118,7 +121,8 @@ mod gpu_parity {
             // target_channels == 0 sentinel guard
             let sentinel = 0x5A5A_5A5A_i32;
             let gp = uplo_u_packed_len(3);
-            let seed = vec![sentinel; (gp + 2) * OZAKI_WORDS_PER_PAIR];
+            let tail_base = gp * OZAKI_SPLIT64_WORDS_PER_PAIR;
+            let seed = vec![sentinel; tail_base + (gp + 2) * OZAKI_WORDS_PER_PAIR];
             let z_in = OzakiGramInput {
                 uniforms: OzakiGramUniforms {
                     num_frames: 128,
@@ -126,9 +130,9 @@ mod gpu_parity {
                     target_channels: 0,
                     chunk_len: 1024,
                     num_chunks: 1,
-                    _pad0: 0,
-                    _pad1: 0,
-                    _pad2: 0,
+                    pair_tile_rows: OZAKI_PAIR_TILE_ROWS_DEFAULT,
+                    reduce_pass: 0,
+                    _pad: 0,
                 },
                 features: &features[..3 * 128],
                 targets: &[],
@@ -139,7 +143,7 @@ mod gpu_parity {
             let z_gpu = gpu.ozaki_gram_rhs_i32(&z_in).unwrap();
             assert_eq!(z_gpu.ozaki_buckets, z_cpu.ozaki_buckets);
             assert_eq!(
-                &z_gpu.ozaki_buckets[gp * OZAKI_WORDS_PER_PAIR..],
+                &z_gpu.ozaki_buckets[tail_base + gp * OZAKI_WORDS_PER_PAIR..],
                 &vec![sentinel; 2 * OZAKI_WORDS_PER_PAIR]
             );
 
@@ -246,7 +250,7 @@ mod gpu_parity {
             let mut th_c = vec![1.5_f32; 32];
             let mut th_g = th_c.clone();
             let grad = vec![0.4_f32; 32];
-            let bnd = vec![[-1.0_f32, 1.0]; 32];
+            let bnd = vec![[-1.0_f32, 1.0, 1.0, 0.0]; 32];
             let sy = vec![[0.0_f32; 4]; 5 * 32];
             let dir = vec![0.0_f32; 32];
             let o_c = cpu
@@ -255,12 +259,13 @@ mod gpu_parity {
                         num_params: 32,
                         history_m: 4,
                         step_idx: 0,
-                        line_search_iter: 0,
+                        mode_flags: INNER_OPT_MODE_LSSBROYDEN,
                         step_size: 0.5,
                         damping_lambda: 1.0e-4,
                         min_bound_eps: 1.0e-4,
-                        _pad: 0,
+                        grad_clip_norm: 0.0,
                     },
+                    num_candidates: 1,
                     theta: &th_c,
                     grad: &grad,
                     param_bounds: &bnd,
@@ -274,12 +279,13 @@ mod gpu_parity {
                         num_params: 32,
                         history_m: 4,
                         step_idx: 0,
-                        line_search_iter: 0,
+                        mode_flags: INNER_OPT_MODE_LSSBROYDEN,
                         step_size: 0.5,
                         damping_lambda: 1.0e-4,
                         min_bound_eps: 1.0e-4,
-                        _pad: 0,
+                        grad_clip_norm: 0.0,
                     },
+                    num_candidates: 1,
                     theta: &th_g,
                     grad: &grad,
                     param_bounds: &bnd,
@@ -479,6 +485,7 @@ mod gpu_parity {
                 tile_checkpoints: &fwd_gpu.tile_checkpoints,
                 d_loss_d_features: &d_loss,
                 feature_outputs: &fwd_gpu.feature_outputs,
+                exit_adj_boundary: None,
             };
             let adj_cpu = cpu.adjoint_scan_256(&adj_in).unwrap();
             let adj_gpu = gpu.adjoint_scan_256(&adj_in).unwrap();
@@ -640,6 +647,7 @@ mod gpu_parity {
             tile_checkpoints: &fwd_cpu.tile_checkpoints,
             d_loss_d_features: &d_loss,
             feature_outputs: &fwd_cpu.feature_outputs,
+            exit_adj_boundary: None,
         };
         let adj_cpu = cpu.adjoint_scan_256(&adj_in).unwrap();
 
@@ -722,9 +730,9 @@ mod gpu_parity {
                     target_channels: 0,
                     chunk_len: 1024,
                     num_chunks: 1,
-                    _pad0: 0,
-                    _pad1: 0,
-                    _pad2: 0,
+                    pair_tile_rows: OZAKI_PAIR_TILE_ROWS_DEFAULT,
+                    reduce_pass: 0,
+                    _pad: 0,
                 },
                 features: &feats,
                 targets: &[],

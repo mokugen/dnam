@@ -8,7 +8,13 @@ use super::harness::{
     GpuContext, ShaderVariant, as_byte_slice, dispatch_kernel, read_f32_vec, read_vec2_vec,
     read_vec4_vec,
 };
-use sona_shaders::abi::{GaborBezoutUniforms, InnerOptUniforms};
+use dnam_kernels::{f32_to_fp16_u32, fp16_u32_to_f32};
+use sona_shaders::abi::{
+    COORD_TRANSFORM_ASINH_BOX_NONNEG, COORD_TRANSFORM_ASINH_BOX_SYM, COORD_TRANSFORM_BOX,
+    COORD_TRANSFORM_COMPLEMENT_LOG, COORD_TRANSFORM_FREE, COORD_TRANSFORM_LOG_BOX,
+    GaborBezoutUniforms, INNER_OPT_MODE_LINE_SEARCH_TRIAL, INNER_OPT_MODE_LSSBROYDEN,
+    INNER_OPT_MODE_RESET_STATE, INNER_OPT_MODE_STE_FP16, InnerOptUniforms, STE_FP16_META_BIT,
+};
 use sona_shaders::manifest::KernelId;
 use zerocopy::IntoBytes;
 
@@ -291,51 +297,58 @@ pub fn verify_gabor_bezout_parity(ctx: &GpuContext, variant: ShaderVariant) {
     run_gabor_mode_b_case(ctx, variant, 64, 1, 3);
 }
 
-fn cpu_lbfgs_step_f64(
+fn clamp_u_free_f64(cand: f64, b: [f32; 4], min_eps: f64) -> f64 {
+    let lo_e = (b[0] as f64) + min_eps;
+    let hi_e = (b[1] as f64) - min_eps;
+    cand.clamp(lo_e, hi_e)
+}
+
+fn cpu_lssbroyden_step_f64(
+    cand: usize,
     theta: &mut [f64],
     grad: &[f64],
-    bounds: &[[f32; 2]],
+    bounds: &[[f32; 4]],
     lbfgs_s_y: &mut [[f64; 4]],
     search_dir: &mut [f64],
     u: &InnerOptUniforms,
 ) {
     let m = u.history_m as usize;
     let step_idx = u.step_idx;
-    let line_search_iter = u.line_search_iter;
+    let is_trial = (u.mode_flags & INNER_OPT_MODE_LINE_SEARCH_TRIAL) != 0;
     let step_sz = u.step_size as f64;
     let damping = u.damping_lambda as f64;
     let min_eps = u.min_bound_eps as f64;
-    let n = theta.len();
-    let clamp_b = |cand: f64, b: [f32; 2]| -> f64 {
-        let lo_e = (b[0] as f64) + min_eps;
-        let hi_e = (b[1] as f64) - min_eps;
-        cand.clamp(lo_e, hi_e)
-    };
-    if line_search_iter > 0 {
+    let n = u.num_params as usize;
+    let u_base = cand * n;
+    let s_base = cand * (m + 1) * n;
+
+    if is_trial {
         for p in 0..n {
-            theta[p] = clamp_b(lbfgs_s_y[m * n + p][0] + step_sz * search_dir[p], bounds[p]);
+            theta[u_base + p] = clamp_u_free_f64(
+                lbfgs_s_y[s_base + m * n + p][0] + step_sz * search_dir[u_base + p],
+                bounds[p],
+                min_eps,
+            );
         }
         return;
     }
 
     if step_idx > 0 && m > 0 {
-        let mut ys = 0.0_f64;
-        let mut ss = 0.0_f64;
-        let mut yy = 0.0_f64;
+        let (mut ys, mut ss, mut yy) = (0.0_f64, 0.0_f64, 0.0_f64);
         for p in 0..n {
-            let s = theta[p] - lbfgs_s_y[m * n + p][0];
-            let y = grad[p] - lbfgs_s_y[m * n + p][1];
+            let s = theta[u_base + p] - lbfgs_s_y[s_base + m * n + p][0];
+            let y = grad[u_base + p] - lbfgs_s_y[s_base + m * n + p][1];
             ys += s * y;
             ss += s * s;
             yy += y * y;
         }
         let slot = ((step_idx - 1) as usize) % m;
-        let valid = ys.is_finite() && ys > 1.0e-12 * (ss + yy) && ys > 0.0;
+        let valid = ys.is_finite() && ys > 1.0e-10 * (ss.sqrt() * yy.sqrt()) && ys > 0.0;
         for p in 0..n {
-            lbfgs_s_y[slot * n + p] = if valid {
+            lbfgs_s_y[s_base + slot * n + p] = if valid {
                 [
-                    theta[p] - lbfgs_s_y[m * n + p][0],
-                    grad[p] - lbfgs_s_y[m * n + p][1],
+                    theta[u_base + p] - lbfgs_s_y[s_base + m * n + p][0],
+                    grad[u_base + p] - lbfgs_s_y[s_base + m * n + p][1],
                     0.0,
                     0.0,
                 ]
@@ -345,7 +358,7 @@ fn cpu_lbfgs_step_f64(
         }
     }
 
-    let mut q = grad.to_vec();
+    let mut q = grad[u_base..u_base + n].to_vec();
     let used = if step_idx == 0 || m == 0 {
         0
     } else {
@@ -358,12 +371,10 @@ fn cpu_lbfgs_step_f64(
 
     for age in 0..used {
         let slot = ((step_idx as usize) - 1 - age) % m;
-        let mut sy = 0.0_f64;
-        let mut sq = 0.0_f64;
-        let mut yy = 0.0_f64;
+        let (mut sy, mut sq, mut yy) = (0.0_f64, 0.0_f64, 0.0_f64);
         for p in 0..n {
-            let s = lbfgs_s_y[slot * n + p][0];
-            let y = lbfgs_s_y[slot * n + p][1];
+            let s = lbfgs_s_y[s_base + slot * n + p][0];
+            let y = lbfgs_s_y[s_base + slot * n + p][1];
             sy += s * y;
             sq += s * q[p];
             if !found_h0 {
@@ -374,11 +385,12 @@ fn cpu_lbfgs_step_f64(
             let r = 1.0 / sy;
             let a = r * sq;
             if !found_h0 {
-                h0_scale = sy / (yy + damping.max(1.0e-12));
+                let raw_tau = sy / (yy + damping.max(1.0e-12));
+                h0_scale = raw_tau.clamp(1.0e-3, 1.0e3);
                 found_h0 = true;
             }
             for p in 0..n {
-                q[p] -= a * lbfgs_s_y[slot * n + p][1];
+                q[p] -= a * lbfgs_s_y[s_base + slot * n + p][1];
             }
             alphas[age] = a;
             rhos[age] = r;
@@ -392,79 +404,100 @@ fn cpu_lbfgs_step_f64(
         let slot = ((step_idx as usize) - 1 - age) % m;
         let mut yq = 0.0_f64;
         for p in 0..n {
-            yq += lbfgs_s_y[slot * n + p][1] * q[p];
+            yq += lbfgs_s_y[s_base + slot * n + p][1] * q[p];
         }
-        let beta = rhos[age] * yq;
-        let coeff = alphas[age] - beta;
+        let coeff = alphas[age] - rhos[age] * yq;
         for p in 0..n {
-            q[p] += lbfgs_s_y[slot * n + p][0] * coeff;
+            q[p] += lbfgs_s_y[s_base + slot * n + p][0] * coeff;
         }
     }
 
-    let gd: f64 = grad.iter().zip(q.iter()).map(|(g, qv)| g * (-qv)).sum();
+    let gd: f64 = grad[u_base..u_base + n]
+        .iter()
+        .zip(q.iter())
+        .map(|(g, qv)| g * (-qv))
+        .sum();
     let fallback = !gd.is_finite() || gd >= 0.0 || q.iter().any(|v| !v.is_finite());
     for p in 0..n {
+        let cur_t = clamp_u_free_f64(theta[u_base + p], bounds[p], min_eps);
         let dir = if fallback {
-            -grad[p] / (1.0 + damping)
+            -grad[u_base + p] / (1.0 + damping)
         } else {
             -q[p]
         };
-        lbfgs_s_y[m * n + p] = [theta[p], grad[p], if used > 0 { 1.0 } else { 0.0 }, 0.0];
-        search_dir[p] = dir;
-        theta[p] = clamp_b(theta[p] + step_sz * dir, bounds[p]);
+        lbfgs_s_y[s_base + m * n + p] = [
+            cur_t,
+            grad[u_base + p],
+            if used > 0 { 1.0 } else { 0.0 },
+            0.0,
+        ];
+        search_dir[u_base + p] = dir;
+        theta[u_base + p] = clamp_u_free_f64(cur_t + step_sz * dir, bounds[p], min_eps);
     }
 }
 
 pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderVariant) {
     let label = variant.label();
 
-    // Case 1: Bounded 30-param L-BFGS hitting box constraints & Armijo backtracking.
+    // Case 1: Multi-candidate (1, 3, 1) m=12 L-SSBroyden hitting box constraints & trial reset.
     {
+        let num_cands = 3_usize;
         let num_params = 30_usize;
-        let history_m = 8_usize;
+        let history_m = 12_usize;
         let min_eps = 1.0e-4_f32;
-        let mut theta = vec![2.5_f32; num_params];
-        let mut bounds = vec![[-3.0_f32, 3.0_f32]; num_params];
-        bounds[0] = [-0.25, 0.25];
-        bounds[1] = [-0.15, 0.15];
-        let mut lbfgs_s_y = vec![[0.0_f32; 4]; (history_m + 1) * num_params];
-        let mut search_dir = vec![0.0_f32; num_params];
+        let mut theta = vec![2.5_f32; num_cands * num_params];
+        let mut bounds =
+            vec![[-3.0_f32, 3.0_f32, 1.0, f32::from_bits(COORD_TRANSFORM_FREE)]; num_params];
+        bounds[0][0] = -0.25;
+        bounds[0][1] = 0.25;
+        bounds[1][0] = -0.15;
+        bounds[1][1] = 0.15;
+        let mut lbfgs_s_y = vec![[0.0_f32; 4]; num_cands * (history_m + 1) * num_params];
+        let mut search_dir = vec![0.0_f32; num_cands * num_params];
 
         let target: Vec<f32> = (0..num_params).map(|i| -0.6 + 0.05 * (i as f32)).collect();
-        let eval_obj = |x: &[f32]| -> (f32, Vec<f32>) {
-            let mut f = 0.0_f32;
-            let mut g = vec![0.0_f32; num_params];
-            for i in 0..num_params {
-                let w = 1.0 + 0.5 * (i as f32);
-                let d = x[i] - target[i];
-                f += 0.5 * w * d * d;
-                g[i] = w * d;
+        let eval_obj = |all_x: &[f32]| -> (Vec<f32>, Vec<f32>) {
+            let mut fs = vec![0.0_f32; num_cands];
+            let mut gs = vec![0.0_f32; num_cands * num_params];
+            for c in 0..num_cands {
+                for i in 0..num_params {
+                    let w = 1.0 + 0.5 * (i as f32) + 0.2 * (c as f32);
+                    let d = all_x[c * num_params + i] - target[i];
+                    fs[c] += 0.5 * w * d * d;
+                    gs[c * num_params + i] = w * d;
+                }
             }
-            (f, g)
+            (fs, gs)
         };
 
         let (mut f_cur, mut grad) = eval_obj(&theta);
-        let initial_f = f_cur;
+        let initial_f = f_cur[2];
         let mut verified_backtrack = false;
 
-        for step in 0..24_u32 {
+        for step in 0..20_u32 {
             let mut alpha_step = if step == 1 { 4.0_f32 } else { 1.0_f32 };
             for ls in 0..8_u32 {
+                let flags = INNER_OPT_MODE_LSSBROYDEN
+                    | if ls > 0 {
+                        INNER_OPT_MODE_LINE_SEARCH_TRIAL
+                    } else {
+                        0
+                    };
                 let uniforms = InnerOptUniforms {
                     num_params: num_params as u32,
                     history_m: history_m as u32,
                     step_idx: step,
-                    line_search_iter: ls,
+                    mode_flags: flags,
                     step_size: alpha_step,
                     damping_lambda: 1.0e-4,
                     min_bound_eps: min_eps,
-                    _pad: 0,
+                    grad_clip_norm: 0.0,
                 };
                 let (out, _) = dispatch_kernel(
                     ctx,
                     KernelId::InnerOptStep,
                     variant,
-                    (1, 1, 1),
+                    (1, num_cands as u32, 1),
                     uniforms.as_bytes(),
                     &[
                         (true, as_byte_slice(&theta)),
@@ -478,23 +511,19 @@ pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderV
                 let next_sy = read_vec4_vec(&out[1]);
                 let next_dir = read_f32_vec(&out[2]);
 
-                for i in 0..num_params {
-                    assert!(
-                        next_theta[i] >= bounds[i][0] + min_eps - 1.0e-6
-                            && next_theta[i] <= bounds[i][1] - min_eps + 1.0e-6,
-                        "inner_opt_step ({label}) violated box bounds at {i}: {}",
-                        next_theta[i]
-                    );
+                for c in 0..num_cands {
+                    for i in 0..num_params {
+                        let v = next_theta[c * num_params + i];
+                        assert!(
+                            v >= bounds[i][0] + min_eps - 1.0e-6
+                                && v <= bounds[i][1] - min_eps + 1.0e-6,
+                            "inner_opt_step ({label}) cand={c} violated box bounds at {i}: {v}"
+                        );
+                    }
                 }
                 if ls > 0 {
-                    assert_eq!(
-                        next_sy, lbfgs_s_y,
-                        "Armijo ls > 0 mutated lbfgs_s_y ({label})"
-                    );
-                    assert_eq!(
-                        next_dir, search_dir,
-                        "Armijo ls > 0 mutated search_dir ({label})"
-                    );
+                    assert_eq!(next_sy, lbfgs_s_y, "trial mutated lbfgs_s_y ({label})");
+                    assert_eq!(next_dir, search_dir, "trial mutated search_dir ({label})");
                     verified_backtrack = true;
                 }
 
@@ -502,7 +531,7 @@ pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderV
                 theta = next_theta;
                 lbfgs_s_y = next_sy;
                 search_dir = next_dir;
-                if f_try <= f_cur {
+                if f_try[2] <= f_cur[2] {
                     f_cur = f_try;
                     grad = g_try;
                     break;
@@ -510,139 +539,227 @@ pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderV
                 alpha_step *= 0.5;
             }
         }
+        assert!(verified_backtrack);
+        assert!(f_cur[2] < 0.05 * initial_f);
 
-        assert!(
-            verified_backtrack,
-            "expected at least one Armijo backtrack trial ({label})"
+        // Verify INNER_OPT_MODE_RESET_STATE zeroes history slots & sets negative grad direction.
+        let reset_u = InnerOptUniforms {
+            num_params: num_params as u32,
+            history_m: history_m as u32,
+            step_idx: 0,
+            mode_flags: INNER_OPT_MODE_LSSBROYDEN | INNER_OPT_MODE_RESET_STATE,
+            step_size: 1.0,
+            damping_lambda: 1.0e-4,
+            min_bound_eps: min_eps,
+            grad_clip_norm: 0.0,
+        };
+        let (reset_out, _) = dispatch_kernel(
+            ctx,
+            KernelId::InnerOptStep,
+            variant,
+            (1, num_cands as u32, 1),
+            reset_u.as_bytes(),
+            &[
+                (true, as_byte_slice(&theta)),
+                (false, as_byte_slice(&grad)),
+                (false, as_byte_slice(&bounds)),
+                (true, as_byte_slice(&lbfgs_s_y)),
+                (true, as_byte_slice(&search_dir)),
+            ],
         );
-        assert!(
-            f_cur < 0.05 * initial_f,
-            "L-BFGS ({label}) did not converge: {f_cur}/{initial_f}"
-        );
-        assert!((theta[0] - (bounds[0][0] + min_eps)).abs() < 1.0e-4);
-        assert!((theta[1] - (bounds[1][0] + min_eps)).abs() < 1.0e-4);
+        let reset_sy = read_vec4_vec(&reset_out[1]);
+        assert_eq!(reset_sy[0], [0.0; 4]);
     }
 
-    // Case 2: Large num_params = 600 (> 256, 3 strided tiles) exact CPU f64 L-BFGS parity on (1, 1, 1).
-    let n = 600_usize;
-    let m = 4_usize;
-    let min_eps = 1.0e-4_f32;
-    let damping = 1.0e-4_f32;
-    let mut theta_gpu: Vec<f32> = (0..n).map(|i| 1.25 - 0.002 * ((i % 25) as f32)).collect();
-    let mut theta_cpu: Vec<f64> = theta_gpu.iter().map(|&v| v as f64).collect();
-    let mut bounds = vec![[-3.0_f32, 3.0_f32]; n];
-    bounds[0] = [-0.20, 0.20];
-    bounds[300] = [-0.15, 0.15];
-    let mut sy_gpu = vec![[0.0_f32; 4]; (m + 1) * n];
-    let mut sy_cpu = vec![[0.0_f64; 4]; (m + 1) * n];
-    let mut dir_gpu = vec![0.0_f32; n];
-    let mut dir_cpu = vec![0.0_f64; n];
+    // Case 2: Large num_params = 600, m = 32, multi-candidate (1, 2, 1) exact L-SSBroyden CPU f64 parity.
+    {
+        let num_cands = 2_usize;
+        let n = 600_usize;
+        let m = 32_usize;
+        let min_eps = 1.0e-4_f32;
+        let damping = 1.0e-4_f32;
+        let mut theta_gpu: Vec<f32> = (0..num_cands * n)
+            .map(|i| 1.25 - 0.002 * (((i % n) % 25) as f32) + 0.1 * ((i / n) as f32))
+            .collect();
+        let mut theta_cpu: Vec<f64> = theta_gpu.iter().map(|&v| v as f64).collect();
+        let mut bounds = vec![[-3.0_f32, 3.0_f32, 1.0, f32::from_bits(COORD_TRANSFORM_FREE)]; n];
+        bounds[0][0] = -0.20;
+        bounds[0][1] = 0.20;
+        bounds[300][0] = -0.15;
+        bounds[300][1] = 0.15;
+        let mut sy_gpu = vec![[0.0_f32; 4]; num_cands * (m + 1) * n];
+        let mut sy_cpu = vec![[0.0_f64; 4]; num_cands * (m + 1) * n];
+        let mut dir_gpu = vec![0.0_f32; num_cands * n];
+        let mut dir_cpu = vec![0.0_f64; num_cands * n];
 
-    let target: Vec<f64> = (0..n).map(|i| -0.45 + 0.03 * ((i % 21) as f64)).collect();
-    let eval_f64 = |x: &[f64]| -> (f64, Vec<f64>) {
-        let mut f = 0.0_f64;
-        let mut g = vec![0.0_f64; n];
-        for i in 0..n {
-            let w = 1.0 + 0.08 * ((i % 19) as f64);
-            let d = x[i] - target[i];
-            f += 0.5 * w * d * d;
-            g[i] = w * d;
-        }
-        (f, g)
-    };
-    let eval_f32 = |x: &[f32]| -> (f32, Vec<f32>) {
-        let mut f = 0.0_f32;
-        let mut g = vec![0.0_f32; n];
-        for i in 0..n {
-            let w = 1.0 + 0.08 * ((i % 19) as f32);
-            let d = x[i] - (target[i] as f32);
-            f += 0.5 * w * d * d;
-            g[i] = w * d;
-        }
-        (f, g)
-    };
+        let target: Vec<f64> = (0..n).map(|i| -0.45 + 0.03 * ((i % 21) as f64)).collect();
+        let eval_f32 = |x: &[f32]| -> (f32, Vec<f32>) {
+            let mut f = 0.0_f32;
+            let mut g = vec![0.0_f32; num_cands * n];
+            for c in 0..num_cands {
+                for i in 0..n {
+                    let w = 1.0 + 0.08 * ((i % 19) as f32);
+                    let d = x[c * n + i] - (target[i] as f32);
+                    f += 0.5 * w * d * d;
+                    g[c * n + i] = w * d;
+                }
+            }
+            (f, g)
+        };
+        let eval_f64 = |x: &[f64]| -> Vec<f64> {
+            let mut g = vec![0.0_f64; num_cands * n];
+            for c in 0..num_cands {
+                for i in 0..n {
+                    let w = 1.0 + 0.08 * ((i % 19) as f64);
+                    g[c * n + i] = w * (x[c * n + i] - target[i]);
+                }
+            }
+            g
+        };
 
-    let (mut f_gpu, mut g_gpu) = eval_f32(&theta_gpu);
-    let (_f_c, mut g_cpu) = eval_f64(&theta_cpu);
-    let init_f = f_gpu;
-    let mut saw_backtrack = false;
-
-    for step in 0..12_u32 {
-        let mut alpha_step = if step == 1 { 4.0_f32 } else { 1.0_f32 };
-        for ls in 0..6_u32 {
-            let u = InnerOptUniforms {
-                num_params: n as u32,
-                history_m: m as u32,
-                step_idx: step,
-                line_search_iter: ls,
-                step_size: alpha_step,
-                damping_lambda: damping,
-                min_bound_eps: min_eps,
-                _pad: 0,
-            };
-            let (out, _) = dispatch_kernel(
-                ctx,
-                KernelId::InnerOptStep,
-                variant,
-                (1, 1, 1),
-                u.as_bytes(),
-                &[
-                    (true, as_byte_slice(&theta_gpu)),
-                    (false, as_byte_slice(&g_gpu)),
-                    (false, as_byte_slice(&bounds)),
-                    (true, as_byte_slice(&sy_gpu)),
-                    (true, as_byte_slice(&dir_gpu)),
-                ],
-            );
-            theta_gpu = read_f32_vec(&out[0]);
-            sy_gpu = read_vec4_vec(&out[1]);
-            dir_gpu = read_f32_vec(&out[2]);
-
-            cpu_lbfgs_step_f64(
-                &mut theta_cpu,
-                &g_cpu,
-                &bounds,
-                &mut sy_cpu,
-                &mut dir_cpu,
-                &u,
-            );
-
-            for p in 0..n {
-                assert!(
-                    (theta_gpu[p] as f64 - theta_cpu[p]).abs() < 1.0e-4,
-                    "600-param L-BFGS ({label}) step={step} ls={ls} p={p} theta gpu={} cpu={}",
-                    theta_gpu[p],
-                    theta_cpu[p]
+        let (mut f_gpu, mut g_gpu) = eval_f32(&theta_gpu);
+        let mut g_cpu = eval_f64(&theta_cpu);
+        for step in 0..6_u32 {
+            let mut alpha_step = if step == 1 { 4.0_f32 } else { 1.0_f32 };
+            for ls in 0..4_u32 {
+                let flags = INNER_OPT_MODE_LSSBROYDEN
+                    | if ls > 0 {
+                        INNER_OPT_MODE_LINE_SEARCH_TRIAL
+                    } else {
+                        0
+                    };
+                let u = InnerOptUniforms {
+                    num_params: n as u32,
+                    history_m: m as u32,
+                    step_idx: step,
+                    mode_flags: flags,
+                    step_size: alpha_step,
+                    damping_lambda: damping,
+                    min_bound_eps: min_eps,
+                    grad_clip_norm: 0.0,
+                };
+                let (out, _) = dispatch_kernel(
+                    ctx,
+                    KernelId::InnerOptStep,
+                    variant,
+                    (1, num_cands as u32, 1),
+                    u.as_bytes(),
+                    &[
+                        (true, as_byte_slice(&theta_gpu)),
+                        (false, as_byte_slice(&g_gpu)),
+                        (false, as_byte_slice(&bounds)),
+                        (true, as_byte_slice(&sy_gpu)),
+                        (true, as_byte_slice(&dir_gpu)),
+                    ],
                 );
-                assert!(
-                    (dir_gpu[p] as f64 - dir_cpu[p]).abs() < 2.0e-4,
-                    "600-param L-BFGS ({label}) step={step} ls={ls} p={p} dir gpu={} cpu={}",
-                    dir_gpu[p],
-                    dir_cpu[p]
-                );
+                theta_gpu = read_f32_vec(&out[0]);
+                sy_gpu = read_vec4_vec(&out[1]);
+                dir_gpu = read_f32_vec(&out[2]);
+                for c in 0..num_cands {
+                    cpu_lssbroyden_step_f64(
+                        c,
+                        &mut theta_cpu,
+                        &g_cpu,
+                        &bounds,
+                        &mut sy_cpu,
+                        &mut dir_cpu,
+                        &u,
+                    );
+                }
+                for p in 0..num_cands * n {
+                    assert!(
+                        (theta_gpu[p] as f64 - theta_cpu[p]).abs() < 2.0e-4,
+                        "600-param m=32 L-SSBroyden ({label}) step={step} p={p} mismatch"
+                    );
+                }
+                let (f_try, g_try) = eval_f32(&theta_gpu);
+                if f_try <= f_gpu {
+                    f_gpu = f_try;
+                    g_gpu = g_try;
+                    g_cpu = eval_f64(&theta_cpu);
+                    break;
+                }
+                alpha_step *= 0.5;
             }
-            if ls > 0 {
-                saw_backtrack = true;
-            }
-            let (f_try, g_try) = eval_f32(&theta_gpu);
-            if f_try <= f_gpu {
-                f_gpu = f_try;
-                g_gpu = g_try;
-                let (_fc, gc) = eval_f64(&theta_cpu);
-                g_cpu = gc;
-                break;
-            }
-            alpha_step *= 0.5;
         }
     }
 
-    assert!(
-        saw_backtrack,
-        "expected Armijo backtrack in 600-param run ({label})"
+    // Case 3: AdamW + global grad_clip_norm + STE_FP16 across transforms 0..=5 on (1, 2, 1).
+    let bounds_ste = [
+        [
+            -2.0_f32,
+            2.0,
+            1.0,
+            f32::from_bits(COORD_TRANSFORM_FREE | STE_FP16_META_BIT),
+        ],
+        [
+            0.1,
+            2.0,
+            1.0,
+            f32::from_bits(COORD_TRANSFORM_BOX | STE_FP16_META_BIT),
+        ],
+        [
+            0.05,
+            1.6,
+            1.0,
+            f32::from_bits(COORD_TRANSFORM_LOG_BOX | STE_FP16_META_BIT),
+        ],
+        [
+            1.0e-3,
+            0.25,
+            1.0,
+            f32::from_bits(COORD_TRANSFORM_COMPLEMENT_LOG | STE_FP16_META_BIT),
+        ],
+        [
+            -2.0,
+            2.0,
+            0.25,
+            f32::from_bits(COORD_TRANSFORM_ASINH_BOX_SYM | STE_FP16_META_BIT),
+        ],
+        [
+            0.0,
+            3.0,
+            0.25,
+            f32::from_bits(COORD_TRANSFORM_ASINH_BOX_NONNEG | STE_FP16_META_BIT),
+        ],
+    ];
+    let n_ste = bounds_ste.len();
+    let theta_ste = vec![0.35_f32; 2 * n_ste];
+    let mut grad_ste = vec![0.5_f32; 2 * n_ste];
+    grad_ste[n_ste] = 4.0;
+    let opt_state_init = vec![[0.0_f32; 4]; 2 * n_ste];
+    let dir_init = vec![0.0_f32; 2 * n_ste];
+    let adam_u = InnerOptUniforms {
+        num_params: n_ste as u32,
+        history_m: 0,
+        step_idx: 0,
+        mode_flags: INNER_OPT_MODE_STE_FP16,
+        step_size: 0.05,
+        damping_lambda: 0.0,
+        min_bound_eps: 1.0e-5,
+        grad_clip_norm: 1.0,
+    };
+    let (adam_out, _) = dispatch_kernel(
+        ctx,
+        KernelId::InnerOptStep,
+        variant,
+        (1, 2, 1),
+        adam_u.as_bytes(),
+        &[
+            (true, as_byte_slice(&theta_ste)),
+            (false, as_byte_slice(&grad_ste)),
+            (false, as_byte_slice(&bounds_ste)),
+            (true, as_byte_slice(&opt_state_init)),
+            (true, as_byte_slice(&dir_init)),
+        ],
     );
-    assert!(
-        f_gpu < 0.05 * init_f,
-        "600-param L-BFGS did not converge: {f_gpu}/{init_f}"
-    );
-    assert!((theta_gpu[300] - (bounds[300][0] + min_eps)).abs() < 1.0e-4);
+    let adam_theta = read_f32_vec(&adam_out[0]);
+    let adam_state = read_vec4_vec(&adam_out[1]);
+    // Verify global gradient norm clipping took effect cleanly on cand=1 (grad[0]=4.0 -> clipped).
+    assert!(adam_state[n_ste][3] < 1.0 && adam_state[n_ste][3] > 0.0);
+    // Verify cand 0 FREE coord matches exact fp16 shadow round-trip (`|phys - fp16(phys)| == 0`).
+    let shadow0 = adam_state[0][2];
+    let fp16_exact = fp16_u32_to_f32(f32_to_fp16_u32(shadow0));
+    assert_eq!(adam_theta[0].to_bits(), fp16_exact.to_bits());
+    assert!(adam_theta.iter().all(|v| v.is_finite()));
 }

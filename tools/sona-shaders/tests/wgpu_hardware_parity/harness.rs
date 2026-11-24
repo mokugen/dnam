@@ -11,6 +11,7 @@ use sona_shaders::abi::{QUAD_PARAMS_VEC4_STRIDE, quad_param_slots};
 use sona_shaders::compiler::ShaderPaths;
 use sona_shaders::manifest::KernelId;
 use std::fs;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -40,6 +41,20 @@ pub struct GpuContext {
     pub queue: wgpu::Queue,
     pub supports_subgroups: bool,
     paths: ShaderPaths,
+    pipelines: Mutex<[Option<wgpu::ComputePipeline>; 14]>,
+}
+
+fn pipeline_slot(id: KernelId, variant: ShaderVariant) -> usize {
+    let k = match id {
+        KernelId::PrescreenPopulation => 0,
+        KernelId::FusedCoreScan256 => 1,
+        KernelId::AdjointScan256 => 2,
+        KernelId::TileMixFwdAdj => 3,
+        KernelId::GaborBezoutGrad => 4,
+        KernelId::OzakiGramRhsI32 => 5,
+        KernelId::InnerOptStep => 6,
+    };
+    k * 2 + usize::from(variant.uses_subgroups())
 }
 
 impl GpuContext {
@@ -50,6 +65,37 @@ impl GpuContext {
             .wgsl_file_path(id.entry_point(), variant.uses_subgroups());
         fs::read_to_string(&p)
             .unwrap_or_else(|e| panic!("failed to read WGSL '{}': {e}", p.display()))
+    }
+
+    pub fn pipeline(&self, id: KernelId, variant: ShaderVariant) -> wgpu::ComputePipeline {
+        let slot = pipeline_slot(id, variant);
+        let mut guard = self
+            .pipelines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(ref existing) = guard[slot] {
+            return existing.clone();
+        }
+        let wgsl = self.load_wgsl(id, variant);
+        let entry = id.entry_point();
+        let module = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(entry),
+                source: wgpu::ShaderSource::Wgsl(wgsl.into()),
+            });
+        let built = self
+            .device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(entry),
+                layout: None,
+                module: &module,
+                entry_point: Some(entry),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: None,
+            });
+        guard[slot] = Some(built.clone());
+        built
     }
 
     #[must_use]
@@ -104,6 +150,7 @@ pub fn init_gpu_context() -> Option<GpuContext> {
         queue,
         supports_subgroups,
         paths: ShaderPaths::workspace_default(),
+        pipelines: Mutex::new(std::array::from_fn(|_| None)),
     })
 }
 
@@ -115,24 +162,8 @@ pub fn dispatch_kernel(
     uniform_bytes: &[u8],
     buffers: &[(bool, &[u8])],
 ) -> (Vec<Vec<u8>>, Duration) {
-    let wgsl = ctx.load_wgsl(id, variant);
     let entry = id.entry_point();
-    let module = ctx
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some(entry),
-            source: wgpu::ShaderSource::Wgsl(wgsl.into()),
-        });
-    let pipeline = ctx
-        .device
-        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some(entry),
-            layout: None,
-            module: &module,
-            entry_point: Some(entry),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
-        });
+    let pipeline = ctx.pipeline(id, variant);
 
     let uniform_buf = ctx.device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("uniforms"),
@@ -247,6 +278,16 @@ pub fn read_i32_vec(bytes: &[u8]) -> Vec<i32> {
         .0
         .iter()
         .map(|c| i32::read_from_bytes(c).unwrap())
+        .collect()
+}
+
+#[must_use]
+pub fn read_u32_vec(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::read_from_bytes(c).unwrap())
         .collect()
 }
 
@@ -416,4 +457,85 @@ pub fn cpu_params_from_packed(packed: &[[f32; 4]]) -> CoreQuadParamsStereo4<GpuV
 #[must_use]
 pub fn as_byte_slice<T: IntoBytes + zerocopy::Immutable>(slice: &[T]) -> &[u8] {
     slice.as_bytes()
+}
+
+pub struct Adjoint3PassResult {
+    pub du: Vec<[f32; 4]>,
+    pub param_grads: Vec<[f32; 4]>,
+    pub exit_boundary: Vec<[f32; 4]>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_adjoint_3pass(
+    ctx: &GpuContext,
+    variant: ShaderVariant,
+    num_frames: usize,
+    num_tiles: usize,
+    num_quads: usize,
+    num_stems: usize,
+    wg_x: usize,
+    block_idx: u32,
+    soft_rect_eps: f32,
+    tiny_crossing_eps: f32,
+    core_inputs: &[u8],
+    quad_params: &[u8],
+    tile_checkpoints: &[u8],
+    d_loss_d_features: &[u8],
+    feature_outputs: &[u8],
+    init_exit_adj_boundary: Option<&[u8]>,
+) -> Adjoint3PassResult {
+    use sona_shaders::abi::{
+        AdjointScanUniforms, EXIT_ADJ_BOUNDARY_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE,
+        TILE_ADJ_BOUNDARY_VEC4_STRIDE,
+    };
+
+    let mut du_buf = vec![0_u8; core_inputs.len()];
+    let mut pgrad_buf =
+        vec![0_u8; num_stems * num_quads * num_tiles * QUAD_PARAMS_VEC4_STRIDE * 16];
+    let exit_bytes = num_stems * wg_x * EXIT_ADJ_BOUNDARY_VEC4_STRIDE * 16;
+    let tile_bytes = num_stems * wg_x * num_tiles * TILE_ADJ_BOUNDARY_VEC4_STRIDE * 16;
+    let mut adj_bound_buf = vec![0_u8; exit_bytes + tile_bytes];
+    if let Some(seed) = init_exit_adj_boundary {
+        assert!(seed.len() >= exit_bytes);
+        adj_bound_buf[..exit_bytes].copy_from_slice(&seed[..exit_bytes]);
+    }
+
+    for (pass_mode, wg_y) in [(0_u32, num_tiles as u32), (1, 1), (2, num_tiles as u32)] {
+        let u = AdjointScanUniforms {
+            num_frames: num_frames as u32,
+            num_tiles: num_tiles as u32,
+            num_quads: num_quads as u32,
+            num_stems: num_stems as u32,
+            pass_mode,
+            soft_rect_eps,
+            tiny_crossing_eps,
+            block_idx,
+        };
+        let (out, _) = dispatch_kernel(
+            ctx,
+            KernelId::AdjointScan256,
+            variant,
+            (wg_x as u32, wg_y, num_stems as u32),
+            u.as_bytes(),
+            &[
+                (false, core_inputs),
+                (false, quad_params),
+                (false, tile_checkpoints),
+                (false, d_loss_d_features),
+                (true, &du_buf),
+                (true, &pgrad_buf),
+                (true, &adj_bound_buf),
+                (false, feature_outputs),
+            ],
+        );
+        du_buf = out[0].clone();
+        pgrad_buf = out[1].clone();
+        adj_bound_buf = out[2].clone();
+    }
+
+    Adjoint3PassResult {
+        du: read_vec4_vec(&du_buf),
+        param_grads: read_vec4_vec(&pgrad_buf),
+        exit_boundary: read_vec4_vec(&adj_bound_buf[..exit_bytes]),
+    }
 }

@@ -318,6 +318,7 @@ function checkSonaShadersArtifacts(): void {
     "prescreen_population",
     "fused_core_scan_256",
     "adjoint_scan_256",
+    "tile_mix_fwd_adj",
     "gabor_bezout_grad",
     "ozaki_gram_rhs_i32",
     "inner_opt_step",

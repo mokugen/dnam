@@ -5,6 +5,7 @@
 
 use super::harness::{
     GpuContext, ShaderVariant, as_byte_slice, dispatch_kernel, read_f32_vec, read_i32_vec,
+    read_u32_vec,
 };
 use dnam_kernels::{
     GpuVec4, KernelVec4, MIN_SAG_GAIN, SonaParaLruDuhemCoeffs4, TptSvfCoeffs4,
@@ -13,31 +14,51 @@ use dnam_kernels::{
     step_paralru_duhem_vec4, step_tpt_svf_vec4,
 };
 use sona_shaders::abi::{
+    OZAKI_FLAG_ACCUMULATE_SPLIT64, OZAKI_PAIR_TILE_ROWS_DEFAULT, OZAKI_SPLIT64_WORDS_PER_PAIR,
     OZAKI_WORDS_PER_PAIR, OzakiGramUniforms, PRESCREEN_SEED_PARAM_STRIDE, PrescreenUniforms,
 };
 use sona_shaders::manifest::KernelId;
 use zerocopy::IntoBytes;
 
+fn split64_from_chunks(chunks: &[[i32; 6]]) -> [u32; 4] {
+    let mut total_hi: i64 = 0;
+    let mut total_lo: i64 = 0;
+    for c in chunks {
+        total_hi = total_hi
+            .wrapping_add((i64::from(c[0]) << 16) + (i64::from(c[1]) << 8) + i64::from(c[2]));
+        total_lo = total_lo.wrapping_add((i64::from(c[3]) << 8) + i64::from(c[4]));
+    }
+    let hi_u = total_hi as u64;
+    let lo_u = total_lo as u64;
+    [
+        hi_u as u32,
+        (hi_u >> 32) as u32,
+        lo_u as u32,
+        (lo_u >> 32) as u32,
+    ]
+}
+
+fn ozaki_2d_wg(total_pairs: usize, rows: u32) -> (u32, u32) {
+    let r = rows.max(1) as usize;
+    ((total_pairs.min(r)) as u32, total_pairs.div_ceil(r) as u32)
+}
+
 pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderVariant) {
     let label = variant.label();
 
-    // < 1 ms startup probe: extreme dynamic-range cancellation [+1e4, -1e4, +1e-3] and NaN/Inf scrubbing.
+    // < 1 ms startup probe: extreme dynamic-range cancellation [+1e4, -1e4, +1e-3] and NaN/Inf scrubbing,
+    // verified via 2-pass split-64 (reduce_pass = 0 -> reduce_pass = 1).
     let probe_frames = 128_usize;
     let mut probe_feat = vec![0.0_f32; 2 * probe_frames];
     let mut probe_tgt = vec![0.0_f32; probe_frames];
     for t in 0..probe_frames {
-        probe_feat[t] = if t == 0 {
-            1.0e4
-        } else if t == 1 {
-            -1.0e4
-        } else if t == 2 {
-            1.0e-3
-        } else if t == 3 {
-            f32::NAN
-        } else if t == 4 {
-            f32::INFINITY
-        } else {
-            ((t as f32) * 0.13).sin() * 0.5
+        probe_feat[t] = match t {
+            0 => 1.0e4,
+            1 => -1.0e4,
+            2 => 1.0e-3,
+            3 => f32::NAN,
+            4 => f32::INFINITY,
+            _ => ((t as f32) * 0.13).sin() * 0.5,
         };
         probe_feat[probe_frames + t] = 1.0;
         probe_tgt[t] = if t == 2 { 1.0 } else { 0.0 };
@@ -47,31 +68,48 @@ pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderV
         [1.0_f32, 1.0_f32],
         [1.0_f32, 0.0_f32],
     ];
-    let probe_u = OzakiGramUniforms {
+    let probe_pairs = 5_usize;
+    let probe_tail_base = probe_pairs * OZAKI_SPLIT64_WORDS_PER_PAIR;
+    let probe_init = vec![0_i32; probe_tail_base + probe_pairs * OZAKI_WORDS_PER_PAIR];
+    let mut probe_u = OzakiGramUniforms {
         num_frames: probe_frames as u32,
         feature_dim: 2,
         target_channels: 1,
         chunk_len: 1024,
         num_chunks: 1,
-        _pad0: 0,
-        _pad1: 0,
-        _pad2: 0,
+        pair_tile_rows: OZAKI_PAIR_TILE_ROWS_DEFAULT,
+        reduce_pass: 0,
+        _pad: 0,
     };
-    let probe_out_init = vec![0_i32; 5 * OZAKI_WORDS_PER_PAIR];
-    let (probe_out, _probe_elapsed) = dispatch_kernel(
+    let (probe_p0, _) = dispatch_kernel(
         ctx,
         KernelId::OzakiGramRhsI32,
         variant,
-        (5, 1, 1),
+        (probe_pairs as u32, 1, 1),
         probe_u.as_bytes(),
         &[
             (false, as_byte_slice(&probe_feat)),
             (false, as_byte_slice(&probe_tgt)),
             (false, as_byte_slice(&probe_scales)),
-            (true, as_byte_slice(&probe_out_init)),
+            (true, as_byte_slice(&probe_init)),
         ],
     );
-    let probe_got = read_i32_vec(&probe_out[0]);
+    probe_u.reduce_pass = 1;
+    let (probe_p1, _) = dispatch_kernel(
+        ctx,
+        KernelId::OzakiGramRhsI32,
+        variant,
+        (probe_pairs as u32, 1, 1),
+        probe_u.as_bytes(),
+        &[
+            (false, as_byte_slice(&probe_feat)),
+            (false, as_byte_slice(&probe_tgt)),
+            (false, as_byte_slice(&probe_scales)),
+            (true, &probe_p0[0]),
+        ],
+    );
+    let probe_got_i32 = read_i32_vec(&probe_p1[0]);
+    let probe_got_u32 = read_u32_vec(&probe_p1[0]);
     let ref_cancel = accum_ozaki_chunk_i32(
         &probe_feat[..probe_frames],
         &probe_feat[probe_frames..],
@@ -79,9 +117,15 @@ pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderV
         probe_scales[1][1],
     );
     assert_eq!(
-        &probe_got[OZAKI_WORDS_PER_PAIR..2 * OZAKI_WORDS_PER_PAIR],
+        &probe_got_i32
+            [probe_tail_base + OZAKI_WORDS_PER_PAIR..probe_tail_base + 2 * OZAKI_WORDS_PER_PAIR],
         &ref_cancel,
-        "Ozaki probe cancellation mismatch ({label})"
+        "Ozaki probe pass-0 cancellation mismatch ({label})"
+    );
+    assert_eq!(
+        &probe_got_u32[OZAKI_SPLIT64_WORDS_PER_PAIR..2 * OZAKI_SPLIT64_WORDS_PER_PAIR],
+        &split64_from_chunks(&[ref_cancel]),
+        "Ozaki probe split-64 cancellation mismatch ({label})"
     );
     let cancel_dot = reconstruct_ozaki_dot_f64(&ref_cancel, probe_scales[0][0], probe_scales[1][0]);
     assert!(
@@ -89,13 +133,14 @@ pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderV
         "Ozaki probe NaN/Inf scrubbing failed ({label})"
     );
 
-    // Multi-column, multi-chunk full Gram + RHS parity at bit-exact 0 ULP.
+    // Multi-column (>256 pairs => 2D wg_y > 1), multi-chunk Gram+RHS parity + accumulate mode at 0 ULP.
     let num_frames = 1500_usize;
-    let feature_dim = 5_usize;
+    let feature_dim = 24_usize;
     let target_channels = 2_usize;
     let chunk_len = 1024_usize;
     let num_chunks = 2_usize;
     let total_pairs = feature_dim * (feature_dim + 1) / 2 + feature_dim * target_channels;
+    assert!(total_pairs > 256);
 
     let mut features = vec![0.0_f32; feature_dim * num_frames];
     let mut targets = vec![0.0_f32; target_channels * num_frames];
@@ -103,7 +148,7 @@ pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderV
     for c in 0..feature_dim {
         let mut max_abs = 0.0_f32;
         for t in 0..num_frames {
-            let v = ((t as f32) * 0.037 * ((c + 1) as f32)).sin() * (1.5 + c as f32);
+            let v = ((t as f32) * 0.037 * ((c + 1) as f32)).sin() * (1.5 + 0.1 * c as f32);
             features[c * num_frames + t] = v;
             max_abs = max_abs.max(v.abs());
         }
@@ -124,22 +169,24 @@ pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderV
         col_scales[feature_dim + ch] = [max_abs, 0.0];
     }
 
-    let uniforms = OzakiGramUniforms {
+    let (wg_x, wg_y) = ozaki_2d_wg(total_pairs, OZAKI_PAIR_TILE_ROWS_DEFAULT);
+    let tail_base = total_pairs * OZAKI_SPLIT64_WORDS_PER_PAIR;
+    let buckets_init = vec![0_i32; tail_base + total_pairs * num_chunks * OZAKI_WORDS_PER_PAIR];
+    let mut uniforms = OzakiGramUniforms {
         num_frames: num_frames as u32,
         feature_dim: feature_dim as u32,
         target_channels: target_channels as u32,
         chunk_len: chunk_len as u32,
         num_chunks: num_chunks as u32,
-        _pad0: 0,
-        _pad1: 0,
-        _pad2: 0,
+        pair_tile_rows: OZAKI_PAIR_TILE_ROWS_DEFAULT,
+        reduce_pass: 0,
+        _pad: 0,
     };
-    let buckets_init = vec![0_i32; total_pairs * num_chunks * OZAKI_WORDS_PER_PAIR];
-    let (out, _) = dispatch_kernel(
+    let (out_p0, _) = dispatch_kernel(
         ctx,
         KernelId::OzakiGramRhsI32,
         variant,
-        (total_pairs as u32, num_chunks as u32, 1),
+        (wg_x, wg_y, num_chunks as u32),
         uniforms.as_bytes(),
         &[
             (false, as_byte_slice(&features)),
@@ -148,14 +195,29 @@ pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderV
             (true, as_byte_slice(&buckets_init)),
         ],
     );
-    let got = read_i32_vec(&out[0]);
+    uniforms.reduce_pass = 1;
+    let (out_p1, _) = dispatch_kernel(
+        ctx,
+        KernelId::OzakiGramRhsI32,
+        variant,
+        (wg_x, wg_y, 1),
+        uniforms.as_bytes(),
+        &[
+            (false, as_byte_slice(&features)),
+            (false, as_byte_slice(&targets)),
+            (false, as_byte_slice(&col_scales)),
+            (true, &out_p0[0]),
+        ],
+    );
+    let got_i32 = read_i32_vec(&out_p1[0]);
+    let got_u32 = read_u32_vec(&out_p1[0]);
 
     let mut pair = 0_usize;
     for i in 0..feature_dim {
         let (sx, isx) = pow2_ceil_fp32(col_scales[i][0]);
         for j in i..feature_dim {
             let (sy, isy) = pow2_ceil_fp32(col_scales[j][0]);
-            let mut f64_sum = 0.0_f64;
+            let mut ref_chunks = Vec::with_capacity(num_chunks);
             for ch in 0..num_chunks {
                 let s = ch * chunk_len;
                 let e = (s + chunk_len).min(num_frames);
@@ -165,14 +227,26 @@ pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderV
                     isx,
                     isy,
                 );
-                let base = (pair * num_chunks + ch) * OZAKI_WORDS_PER_PAIR;
+                let base = tail_base + (pair * num_chunks + ch) * OZAKI_WORDS_PER_PAIR;
                 assert_eq!(
-                    &got[base..base + OZAKI_WORDS_PER_PAIR],
+                    &got_i32[base..base + OZAKI_WORDS_PER_PAIR],
                     &ref_acc,
                     "Ozaki ({label}) Gram 0-ULP mismatch pair={pair} ch={ch}"
                 );
-                f64_sum += reconstruct_ozaki_dot_f64(&ref_acc, sx, sy);
+                ref_chunks.push(ref_acc);
             }
+            let s64_base = pair * OZAKI_SPLIT64_WORDS_PER_PAIR;
+            let expected_s64 = split64_from_chunks(&ref_chunks);
+            assert_eq!(
+                &got_u32[s64_base..s64_base + OZAKI_SPLIT64_WORDS_PER_PAIR],
+                &expected_s64,
+                "Ozaki ({label}) split-64 Gram mismatch pair={pair}"
+            );
+            let hi = (((expected_s64[1] as u64) << 32) | (expected_s64[0] as u64)) as i64;
+            let lo = (((expected_s64[3] as u64) << 32) | (expected_s64[2] as u64)) as i64;
+            let total_i128 = ((hi as i128) << 16) + (lo as i128);
+            let f64_recon =
+                (total_i128 as f64) * (2.0_f64).powi(-48) * f64::from(sx) * f64::from(sy);
             let (exact, l1_sum): (f64, f64) =
                 (0..num_frames).fold((0.0_f64, 0.0_f64), |(acc, l1), t| {
                     let p = (features[i * num_frames + t] as f64)
@@ -180,16 +254,17 @@ pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderV
                     (acc + p, l1 + p.abs())
                 });
             assert!(
-                (f64_sum - exact).abs() <= 1.0e-5 * l1_sum.max(1.0),
-                "Ozaki ({label}) f64 recon pair={pair}: recon={f64_sum} exact={exact} l1={l1_sum}"
+                (f64_recon - exact).abs() <= 1.0e-5 * l1_sum.max(1.0),
+                "Ozaki ({label}) split64 recon pair={pair}: recon={f64_recon} exact={exact}"
             );
             pair += 1;
         }
     }
     for i in 0..feature_dim {
-        let (sx, isx) = pow2_ceil_fp32(col_scales[i][0]);
+        let isx = pow2_ceil_fp32(col_scales[i][0]).1;
         for tc in 0..target_channels {
-            let (sy, isy) = pow2_ceil_fp32(col_scales[feature_dim + tc][0]);
+            let isy = pow2_ceil_fp32(col_scales[feature_dim + tc][0]).1;
+            let mut ref_chunks = Vec::with_capacity(num_chunks);
             for ch in 0..num_chunks {
                 let s = ch * chunk_len;
                 let e = (s + chunk_len).min(num_frames);
@@ -199,16 +274,48 @@ pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderV
                     isx,
                     isy,
                 );
-                let base = (pair * num_chunks + ch) * OZAKI_WORDS_PER_PAIR;
+                let base = tail_base + (pair * num_chunks + ch) * OZAKI_WORDS_PER_PAIR;
                 assert_eq!(
-                    &got[base..base + OZAKI_WORDS_PER_PAIR],
+                    &got_i32[base..base + OZAKI_WORDS_PER_PAIR],
                     &ref_acc,
                     "Ozaki ({label}) RHS 0-ULP mismatch pair={pair} ch={ch}"
                 );
-                let _ = reconstruct_ozaki_dot_f64(&ref_acc, sx, sy);
+                ref_chunks.push(ref_acc);
             }
+            let s64_base = pair * OZAKI_SPLIT64_WORDS_PER_PAIR;
+            assert_eq!(
+                &got_u32[s64_base..s64_base + OZAKI_SPLIT64_WORDS_PER_PAIR],
+                &split64_from_chunks(&ref_chunks),
+                "Ozaki ({label}) split-64 RHS mismatch pair={pair}"
+            );
             pair += 1;
         }
+    }
+
+    // Verify OZAKI_FLAG_ACCUMULATE_SPLIT64 doubles every pair cleanly when re-running reduce_pass = 1.
+    uniforms._pad = OZAKI_FLAG_ACCUMULATE_SPLIT64;
+    let (out_acc, _) = dispatch_kernel(
+        ctx,
+        KernelId::OzakiGramRhsI32,
+        variant,
+        (wg_x, wg_y, 1),
+        uniforms.as_bytes(),
+        &[
+            (false, as_byte_slice(&features)),
+            (false, as_byte_slice(&targets)),
+            (false, as_byte_slice(&col_scales)),
+            (true, &out_p1[0]),
+        ],
+    );
+    let got_acc = read_u32_vec(&out_acc[0]);
+    for p in 0..total_pairs {
+        let b = p * OZAKI_SPLIT64_WORDS_PER_PAIR;
+        let single_hi = ((got_u32[b + 1] as u64) << 32) | (got_u32[b] as u64);
+        let single_lo = ((got_u32[b + 3] as u64) << 32) | (got_u32[b + 2] as u64);
+        let double_hi = ((got_acc[b + 1] as u64) << 32) | (got_acc[b] as u64);
+        let double_lo = ((got_acc[b + 3] as u64) << 32) | (got_acc[b + 2] as u64);
+        assert_eq!(double_hi, single_hi.wrapping_mul(2));
+        assert_eq!(double_lo, single_lo.wrapping_mul(2));
     }
 
     // Zero target channels guard: pairs >= num_gram_pairs must remain untouched sentinel.
@@ -216,6 +323,7 @@ pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderV
     let zero_tc_dim = 3_usize;
     let zero_tc_gram_pairs = zero_tc_dim * (zero_tc_dim + 1) / 2;
     let zero_tc_dispatch = zero_tc_gram_pairs + 2;
+    let zero_tc_tail = zero_tc_gram_pairs * OZAKI_SPLIT64_WORDS_PER_PAIR;
     let sentinel = 0x5A5A_5A5A_i32;
     let mut zt_feats = vec![0.0_f32; zero_tc_dim * zero_tc_frames];
     let mut zt_scales = vec![[1.0_f32, 1.0_f32]; zero_tc_dim];
@@ -226,16 +334,16 @@ pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderV
         zt_scales[c] = [1.0, 1.0];
     }
     let dummy_target = [999.0_f32; 1];
-    let zt_init = vec![sentinel; zero_tc_dispatch * OZAKI_WORDS_PER_PAIR];
+    let zt_init = vec![sentinel; zero_tc_tail + zero_tc_dispatch * OZAKI_WORDS_PER_PAIR];
     let zt_u = OzakiGramUniforms {
         num_frames: zero_tc_frames as u32,
         feature_dim: zero_tc_dim as u32,
         target_channels: 0,
         chunk_len: 1024,
         num_chunks: 1,
-        _pad0: 0,
-        _pad1: 0,
-        _pad2: 0,
+        pair_tile_rows: OZAKI_PAIR_TILE_ROWS_DEFAULT,
+        reduce_pass: 0,
+        _pad: 0,
     };
     let (zt_out, _) = dispatch_kernel(
         ctx,
@@ -252,7 +360,7 @@ pub fn verify_startup_probes_and_ozaki_parity(ctx: &GpuContext, variant: ShaderV
     );
     let zt_got = read_i32_vec(&zt_out[0]);
     for slot in zero_tc_gram_pairs..zero_tc_dispatch {
-        let base = slot * OZAKI_WORDS_PER_PAIR;
+        let base = zero_tc_tail + slot * OZAKI_WORDS_PER_PAIR;
         assert_eq!(
             &zt_got[base..base + OZAKI_WORDS_PER_PAIR],
             &[sentinel; OZAKI_WORDS_PER_PAIR],

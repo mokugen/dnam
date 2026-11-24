@@ -90,13 +90,14 @@ pub use planner::{
     BROWSER_WEBGPU_BUDGET_BYTES, CPU_WASM_BUDGET_BYTES, CoreScanBindingFootprints, CoreScanPlan,
     CoreScanWorkload, DESKTOP_CAPSULE_BUDGET_BYTES, ExecutionMode, MAX_WEBGPU_BINDING_BYTES,
     MemoryBudgetProfile, STREAMED_CKPT_EXTRA_TILES, STREAMING_HOST_DEFAULT_BUDGET_BYTES,
-    STREAMING_HOST_MAX_TENSOR_BYTES, plan_core_scan_execution,
+    STREAMING_HOST_MAX_TENSOR_BYTES, WAVE_STREAMING_MAX_FRAMES, plan_core_scan_execution,
 };
 pub use runner::{
     ActiveComputeBackend, AdjointScanInput, AdjointScanOutput, FusedCoreScanInput,
     FusedCoreScanOutput, GaborBezoutInput, GaborBezoutOutput, InnerOptInput, InnerOptOutput,
-    OzakiGramInput, OzakiGramOutput, PrescreenInput, TrainRunner, pack_core_quad_params,
-    unpack_core_quad_params,
+    OzakiGramInput, OzakiGramOutput, OzakiSplit64Output, PrescreenInput, TileMixInput,
+    TileMixOutput, TrainRunner, WaveCoreAdjointInput, WaveCoreAdjointOutput, WaveCoreCascadeInput,
+    WaveCoreCascadeOutput, pack_core_quad_params, pack_tile_descriptor, unpack_core_quad_params,
 };
 pub use solver::{
     AtomicDnprProgress, ControlAudioStem, CoreQuadF64, DIMINISHING_RETURNS_DELTA_DB, DNPR_MAGIC,

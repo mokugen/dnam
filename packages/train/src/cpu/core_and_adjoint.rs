@@ -19,8 +19,9 @@ use dnam_kernels::{
 
 use crate::error::TrainError;
 use crate::gpu::abi::{
-    CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE,
-    TILE_FRAMES, quad_param_slots,
+    BLOCK_IDX_DIRECT_LINEAR, CORE_INPUT_VEC4_STRIDE, EXIT_ADJ_BOUNDARY_VEC4_STRIDE,
+    FEATURE_VEC4_STRIDE, FUSED_FLAG_FIXED_POINT_SCAN, QUAD_PARAMS_VEC4_STRIDE,
+    TILE_CKPT_VEC4_STRIDE, TILE_FRAMES, block_quad_count, quad_param_slots, resolve_quad_idx,
 };
 use crate::runner::types::{
     AdjointScanInput, AdjointScanOutput, FusedCoreScanInput, FusedCoreScanOutput,
@@ -139,41 +140,59 @@ pub fn run_fused_core_scan_cpu(
     let max_tiles = num_frames.div_ceil(TILE_FRAMES).min(num_tiles);
     let tile_start = (u.tile_start as usize).min(max_tiles);
     let resuming = tile_start > 0 && tile_start < num_tiles;
-    let is_phs = u.block_idx == 0;
+    let is_direct = u.block_idx == BLOCK_IDX_DIRECT_LINEAR;
+    let raw_block = if is_direct {
+        BLOCK_IDX_DIRECT_LINEAR
+    } else {
+        u.block_idx & !FUSED_FLAG_FIXED_POINT_SCAN
+    };
+    let is_phs = !is_direct && (raw_block & 3) == 0;
+    let wg_x = if is_direct {
+        num_quads
+    } else {
+        block_quad_count((raw_block & 3) as usize, num_quads)
+    };
 
-    for q_global in 0..total_q {
-        let mut state = if resuming {
-            read_checkpoint(&tile_checkpoints, q_global, num_tiles, tile_start)
-        } else {
-            SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero()
-        };
-        for tile in tile_start..max_tiles {
-            if !(resuming && tile == tile_start) {
-                write_checkpoint(&mut tile_checkpoints, q_global, num_tiles, tile, &state);
+    for stem in 0..num_stems {
+        for q_local in 0..wg_x {
+            let quad_idx = resolve_quad_idx(raw_block, q_local, num_quads);
+            if quad_idx >= num_quads {
+                continue;
             }
-            let base_frame = tile * TILE_FRAMES;
-            let end_frame = (base_frame + TILE_FRAMES).min(num_frames);
-            for t in base_frame..end_frame {
-                let in_idx = (q_global * num_frames + t) * CORE_INPUT_VEC4_STRIDE;
-                let u_vec = InterleavedStereo8::from_lr(
-                    GpuVec4::from_array(input.core_inputs[in_idx].map(flush_zero)),
-                    GpuVec4::from_array(input.core_inputs[in_idx + 1].map(flush_zero)),
-                );
-                let out = if is_phs {
-                    step_core_quad_phs_stereo8(u_vec, &mut state, &params[q_global])
-                } else {
-                    step_core_quad_stereo8(u_vec, &mut state, &params[q_global])
-                };
-                let (vl, vr) = out.lru_state.into_lr();
-                let (ol, or) = out.adaa_odd.into_lr();
-                let (el, er) = out.adaa_even.into_lr();
-                let f_idx = (q_global * num_frames + t) * FEATURE_VEC4_STRIDE;
-                feature_outputs[f_idx] = canon_vec4(vl);
-                feature_outputs[f_idx + 1] = canon_vec4(vr);
-                feature_outputs[f_idx + 2] = canon_vec4(ol);
-                feature_outputs[f_idx + 3] = canon_vec4(or);
-                feature_outputs[f_idx + 4] = canon_vec4(el);
-                feature_outputs[f_idx + 5] = canon_vec4(er);
+            let q_global = stem * num_quads + quad_idx;
+            let mut state = if resuming {
+                read_checkpoint(&tile_checkpoints, q_global, num_tiles, tile_start)
+            } else {
+                SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero()
+            };
+            for tile in tile_start..max_tiles {
+                if !(resuming && tile == tile_start) {
+                    write_checkpoint(&mut tile_checkpoints, q_global, num_tiles, tile, &state);
+                }
+                let base_frame = tile * TILE_FRAMES;
+                let end_frame = (base_frame + TILE_FRAMES).min(num_frames);
+                for t in base_frame..end_frame {
+                    let in_idx = (q_global * num_frames + t) * CORE_INPUT_VEC4_STRIDE;
+                    let u_vec = InterleavedStereo8::from_lr(
+                        GpuVec4::from_array(input.core_inputs[in_idx].map(flush_zero)),
+                        GpuVec4::from_array(input.core_inputs[in_idx + 1].map(flush_zero)),
+                    );
+                    let out = if is_phs {
+                        step_core_quad_phs_stereo8(u_vec, &mut state, &params[q_global])
+                    } else {
+                        step_core_quad_stereo8(u_vec, &mut state, &params[q_global])
+                    };
+                    let (vl, vr) = out.lru_state.into_lr();
+                    let (ol, or) = out.adaa_odd.into_lr();
+                    let (el, er) = out.adaa_even.into_lr();
+                    let f_idx = (q_global * num_frames + t) * FEATURE_VEC4_STRIDE;
+                    feature_outputs[f_idx] = canon_vec4(vl);
+                    feature_outputs[f_idx + 1] = canon_vec4(vr);
+                    feature_outputs[f_idx + 2] = canon_vec4(ol);
+                    feature_outputs[f_idx + 3] = canon_vec4(or);
+                    feature_outputs[f_idx + 4] = canon_vec4(el);
+                    feature_outputs[f_idx + 5] = canon_vec4(er);
+                }
             }
         }
     }
@@ -241,10 +260,12 @@ pub(crate) fn write_lane_param_grads(
 /// `SVF_G >= MIN_TPT_G`, cross-lane GLU, and `PolyADAA1` tile seams).
 pub fn run_adjoint_scan_cpu(input: &AdjointScanInput<'_>) -> Result<AdjointScanOutput, TrainError> {
     let u = &input.uniforms;
-    let is_phs = u.block_idx == 0;
+    let is_phs = u.block_idx != BLOCK_IDX_DIRECT_LINEAR && (u.block_idx & 3) == 0;
     let num_frames = u.num_frames as usize;
     let num_tiles = (u.num_tiles as usize).max(1);
-    let total_q = (u.num_quads as usize) * (u.num_stems as usize);
+    let num_quads = u.num_quads as usize;
+    let num_stems = u.num_stems as usize;
+    let total_q = num_quads * num_stems;
     if num_frames == 0 || total_q == 0 {
         return Err(TrainError::InvalidDimensions {
             context: "adjoint_scan_256",
@@ -252,6 +273,12 @@ pub fn run_adjoint_scan_cpu(input: &AdjointScanInput<'_>) -> Result<AdjointScanO
             actual: 0,
         });
     }
+    let wg_x = if u.block_idx == BLOCK_IDX_DIRECT_LINEAR {
+        num_quads
+    } else {
+        block_quad_count((u.block_idx & 3) as usize, num_quads)
+    };
+    let exit_vecs = num_stems * wg_x * EXIT_ADJ_BOUNDARY_VEC4_STRIDE;
     let need_in = total_q * num_frames * CORE_INPUT_VEC4_STRIDE;
     let need_feat = total_q * num_frames * FEATURE_VEC4_STRIDE;
     let need_ckpt = total_q * num_tiles * TILE_CKPT_VEC4_STRIDE;
@@ -269,6 +296,17 @@ pub fn run_adjoint_scan_cpu(input: &AdjointScanInput<'_>) -> Result<AdjointScanO
                 .min(input.d_loss_d_features.len()),
         });
     }
+    let mut entry_adj_boundary = vec![[0.0_f32; 4]; exit_vecs];
+    if let Some(seed) = input.exit_adj_boundary {
+        if seed.len() < exit_vecs {
+            return Err(TrainError::InvalidDimensions {
+                context: "adjoint_scan_256(exit_adj_boundary)",
+                expected: exit_vecs,
+                actual: seed.len(),
+            });
+        }
+        entry_adj_boundary.copy_from_slice(&seed[..exit_vecs]);
+    }
     let quads = unpack_all_quads(input.quad_params, total_q)?;
     let mut d_loss_d_inputs = vec![[0.0_f32; 4]; need_in];
     let mut param_grads = vec![[0.0_f32; 4]; total_q * QUAD_PARAMS_VEC4_STRIDE * num_tiles];
@@ -278,71 +316,105 @@ pub fn run_adjoint_scan_cpu(input: &AdjointScanInput<'_>) -> Result<AdjointScanO
         TINY_CROSSING_EPS
     };
 
-    for q_global in 0..total_q {
-        let q_params = &quads[q_global];
-        let q_packed_base = q_global * QUAD_PARAMS_VEC4_STRIDE;
-        let svf_g_arr = input.quad_params[q_packed_base + quad_param_slots::SVF_G];
-        let mut tile_fwd = vec![FwdFrameState::default(); TILE_FRAMES];
+    for stem in 0..num_stems {
+        for q_local in 0..wg_x {
+            let quad_idx = resolve_quad_idx(u.block_idx, q_local, num_quads);
+            if quad_idx >= num_quads {
+                continue;
+            }
+            let q_global = stem * num_quads + quad_idx;
+            let exit_base = (stem * wg_x + q_local) * EXIT_ADJ_BOUNDARY_VEC4_STRIDE;
+            let q_params = &quads[q_global];
+            let q_packed_base = q_global * QUAD_PARAMS_VEC4_STRIDE;
+            let svf_g_arr = input.quad_params[q_packed_base + quad_param_slots::SVF_G];
+            let mut tile_fwd = vec![FwdFrameState::default(); TILE_FRAMES];
 
-        for c in 0..4 {
-            let lp = LaneParams::extract(q_params, svf_g_arr, c);
-            let svf_c = lp.svf_coeffs();
-            let lru_c = lp.lru_coeffs();
-            let mut carry = ReverseCarry::default();
-
-            for tile in (0..num_tiles).rev() {
-                let tile_base = tile * TILE_FRAMES;
-                let valid_len = num_frames.saturating_sub(tile_base).min(TILE_FRAMES);
-                if valid_len == 0 {
-                    continue;
-                }
-                let ckpt_base = (q_global * num_tiles + tile) * TILE_CKPT_VEC4_STRIDE;
-                let mut lane_state = [
-                    input.tile_checkpoints[ckpt_base][c],
-                    input.tile_checkpoints[ckpt_base + 2][c],
-                    input.tile_checkpoints[ckpt_base + 1][c],
-                    input.tile_checkpoints[ckpt_base + 3][c],
-                    input.tile_checkpoints[ckpt_base + 4][c],
-                    input.tile_checkpoints[ckpt_base + 5][c],
-                    input.tile_checkpoints[ckpt_base + 6][c],
-                    input.tile_checkpoints[ckpt_base + 7][c],
-                ];
-                for local_t in 0..valid_len {
-                    let frame = tile_base + local_t;
-                    let in_base = (q_global * num_frames + frame) * CORE_INPUT_VEC4_STRIDE;
-                    let u_l = flush_zero(input.core_inputs[in_base][c]);
-                    let u_r = flush_zero(input.core_inputs[in_base + 1][c]);
-                    tile_fwd[local_t] =
-                        step_lane_forward(&lp, &svf_c, &lru_c, u_l, u_r, &mut lane_state, is_phs);
-                }
-
-                let ctx = ReverseStepContext {
-                    d_loss_d_features: input.d_loss_d_features,
-                    feature_outputs: input.feature_outputs,
-                    q_global,
-                    num_frames,
-                    c,
-                    tiny_eps,
+            for c in 0..4 {
+                let lp = LaneParams::extract(q_params, svf_g_arr, c);
+                let svf_c = lp.svf_coeffs();
+                let lru_c = lp.lru_coeffs();
+                let s_exit = entry_adj_boundary[exit_base + c];
+                let mut carry = ReverseCarry {
+                    adj_r_next_l: entry_adj_boundary[exit_base + 6][c],
+                    adj_r_next_r: entry_adj_boundary[exit_base + 7][c],
+                    lam_after_l: entry_adj_boundary[exit_base + 4][c],
+                    lam_after_r: entry_adj_boundary[exit_base + 5][c],
+                    adj_s_out_l: [s_exit[0], s_exit[1]],
+                    adj_s_out_r: [s_exit[2], s_exit[3]],
                 };
-                let mut acc = TileGradAccum::default();
-                for local_t in (0..valid_len).rev() {
-                    let frame = tile_base + local_t;
-                    let (du_l, du_r) = step_lane_reverse(
-                        &ctx,
-                        &tile_fwd[local_t],
-                        &lp,
-                        frame,
-                        &mut carry,
-                        &mut acc,
-                        is_phs,
-                    );
-                    let out_base = (q_global * num_frames + frame) * CORE_INPUT_VEC4_STRIDE;
-                    d_loss_d_inputs[out_base][c] = du_l;
-                    d_loss_d_inputs[out_base + 1][c] = du_r;
+
+                for tile in (0..num_tiles).rev() {
+                    let tile_base = tile * TILE_FRAMES;
+                    let valid_len = num_frames.saturating_sub(tile_base).min(TILE_FRAMES);
+                    if valid_len == 0 {
+                        continue;
+                    }
+                    let ckpt_base = (q_global * num_tiles + tile) * TILE_CKPT_VEC4_STRIDE;
+                    let mut lane_state = [
+                        input.tile_checkpoints[ckpt_base][c],
+                        input.tile_checkpoints[ckpt_base + 2][c],
+                        input.tile_checkpoints[ckpt_base + 1][c],
+                        input.tile_checkpoints[ckpt_base + 3][c],
+                        input.tile_checkpoints[ckpt_base + 4][c],
+                        input.tile_checkpoints[ckpt_base + 5][c],
+                        input.tile_checkpoints[ckpt_base + 6][c],
+                        input.tile_checkpoints[ckpt_base + 7][c],
+                    ];
+                    for local_t in 0..valid_len {
+                        let frame = tile_base + local_t;
+                        let in_base = (q_global * num_frames + frame) * CORE_INPUT_VEC4_STRIDE;
+                        let u_l = flush_zero(input.core_inputs[in_base][c]);
+                        let u_r = flush_zero(input.core_inputs[in_base + 1][c]);
+                        tile_fwd[local_t] = step_lane_forward(
+                            &lp,
+                            &svf_c,
+                            &lru_c,
+                            u_l,
+                            u_r,
+                            &mut lane_state,
+                            is_phs,
+                        );
+                    }
+
+                    let ctx = ReverseStepContext {
+                        d_loss_d_features: input.d_loss_d_features,
+                        feature_outputs: input.feature_outputs,
+                        q_global,
+                        num_frames,
+                        c,
+                        tiny_eps,
+                    };
+                    let mut acc = TileGradAccum::default();
+                    for local_t in (0..valid_len).rev() {
+                        let frame = tile_base + local_t;
+                        let (du_l, du_r) = step_lane_reverse(
+                            &ctx,
+                            &tile_fwd[local_t],
+                            &lp,
+                            frame,
+                            &mut carry,
+                            &mut acc,
+                            is_phs,
+                        );
+                        let out_base = (q_global * num_frames + frame) * CORE_INPUT_VEC4_STRIDE;
+                        d_loss_d_inputs[out_base][c] = du_l;
+                        d_loss_d_inputs[out_base + 1][c] = du_r;
+                    }
+
+                    let pg_base = (q_global * num_tiles + tile) * QUAD_PARAMS_VEC4_STRIDE;
+                    write_lane_param_grads(&mut param_grads, pg_base, c, &lp, &acc, is_phs);
                 }
 
-                let pg_base = (q_global * num_tiles + tile) * QUAD_PARAMS_VEC4_STRIDE;
-                write_lane_param_grads(&mut param_grads, pg_base, c, &lp, &acc, is_phs);
+                entry_adj_boundary[exit_base + 8 + c] = [
+                    carry.adj_s_out_l[0],
+                    carry.adj_s_out_l[1],
+                    carry.adj_s_out_r[0],
+                    carry.adj_s_out_r[1],
+                ];
+                entry_adj_boundary[exit_base + 12][c] = carry.lam_after_l;
+                entry_adj_boundary[exit_base + 13][c] = carry.lam_after_r;
+                entry_adj_boundary[exit_base + 14][c] = carry.adj_r_next_l;
+                entry_adj_boundary[exit_base + 15][c] = carry.adj_r_next_r;
             }
         }
     }
@@ -351,6 +423,7 @@ pub fn run_adjoint_scan_cpu(input: &AdjointScanInput<'_>) -> Result<AdjointScanO
     Ok(AdjointScanOutput {
         d_loss_d_inputs,
         param_grads,
+        entry_adj_boundary,
     })
 }
 
@@ -521,6 +594,7 @@ mod tests {
             tile_checkpoints: &res.tile_checkpoints,
             d_loss_d_features: &d_loss,
             feature_outputs: &res.feature_outputs,
+            exit_adj_boundary: None,
         })
         .unwrap();
 
@@ -572,6 +646,7 @@ mod tests {
             tile_checkpoints: &res.tile_checkpoints,
             d_loss_d_features: &d_loss,
             feature_outputs: &res.feature_outputs,
+            exit_adj_boundary: None,
         })
         .unwrap();
         assert_eq!(adj_zero.param_grads[quad_param_slots::SVF_G], [0.0; 4]);
@@ -635,6 +710,7 @@ mod tests {
             tile_checkpoints: &fwd_b1_nz.tile_checkpoints,
             d_loss_d_features: &d_loss,
             feature_outputs: &fwd_b1_nz.feature_outputs,
+            exit_adj_boundary: None,
         })
         .unwrap();
         for tile in 0..num_tiles {
@@ -703,6 +779,7 @@ mod tests {
                 tile_checkpoints: &res.tile_checkpoints,
                 d_loss_d_features: &d_loss,
                 feature_outputs: &res.feature_outputs,
+                exit_adj_boundary: None,
             }),
             Err(TrainError::InvalidDimensions { .. })
         ));
@@ -723,8 +800,81 @@ mod tests {
                 tile_checkpoints: &res.tile_checkpoints,
                 d_loss_d_features: &d_loss,
                 feature_outputs: &res.feature_outputs,
+                exit_adj_boundary: None,
             }),
             Err(TrainError::InvalidDimensions { .. })
         ));
+
+        // Verify 2-chunk exit_adj_boundary -> entry_adj_boundary chaining matches resident execution.
+        let rem_frames = num_frames - TILE_FRAMES;
+        let rem_tiles = rem_frames.div_ceil(TILE_FRAMES);
+        let mut seed_chunk0 = vec![[0.0_f32; 4]; EXIT_ADJ_BOUNDARY_VEC4_STRIDE];
+        let c1 = run_adjoint_scan_cpu(&AdjointScanInput {
+            uniforms: crate::gpu::abi::AdjointScanUniforms {
+                num_frames: rem_frames as u32,
+                num_tiles: rem_tiles as u32,
+                num_quads: 1,
+                num_stems: 1,
+                pass_mode: 2,
+                soft_rect_eps: SOFT_RECT_EPS,
+                tiny_crossing_eps: TINY_CROSSING_EPS,
+                block_idx: 0,
+            },
+            core_inputs: &core_inputs[TILE_FRAMES * CORE_INPUT_VEC4_STRIDE..],
+            quad_params: &packed,
+            tile_checkpoints: &res.tile_checkpoints[TILE_CKPT_VEC4_STRIDE..],
+            d_loss_d_features: &d_loss[TILE_FRAMES * FEATURE_VEC4_STRIDE..],
+            feature_outputs: &res.feature_outputs[TILE_FRAMES * FEATURE_VEC4_STRIDE..],
+            exit_adj_boundary: None,
+        })
+        .unwrap();
+        seed_chunk0[0..8].copy_from_slice(&c1.entry_adj_boundary[8..16]);
+        let c0 = run_adjoint_scan_cpu(&AdjointScanInput {
+            uniforms: crate::gpu::abi::AdjointScanUniforms {
+                num_frames: TILE_FRAMES as u32,
+                num_tiles: 1,
+                num_quads: 1,
+                num_stems: 1,
+                pass_mode: 2,
+                soft_rect_eps: SOFT_RECT_EPS,
+                tiny_crossing_eps: TINY_CROSSING_EPS,
+                block_idx: 0,
+            },
+            core_inputs: &core_inputs[..TILE_FRAMES * CORE_INPUT_VEC4_STRIDE],
+            quad_params: &packed,
+            tile_checkpoints: &res.tile_checkpoints[..TILE_CKPT_VEC4_STRIDE],
+            d_loss_d_features: &d_loss[..TILE_FRAMES * FEATURE_VEC4_STRIDE],
+            feature_outputs: &res.feature_outputs[..TILE_FRAMES * FEATURE_VEC4_STRIDE],
+            exit_adj_boundary: Some(&seed_chunk0),
+        })
+        .unwrap();
+        for (a, b) in adj_out
+            .d_loss_d_inputs
+            .iter()
+            .zip(c0.d_loss_d_inputs.iter().chain(c1.d_loss_d_inputs.iter()))
+        {
+            for k in 0..4 {
+                assert!((a[k] - b[k]).abs() <= 1.0e-6);
+            }
+        }
+
+        // Regression: BLOCK_IDX_DIRECT_LINEAR must not be masked by FUSED_FLAG_FIXED_POINT_SCAN.
+        let direct = run_fused_core_scan_cpu(&FusedCoreScanInput {
+            uniforms: FusedScanUniforms {
+                block_idx: BLOCK_IDX_DIRECT_LINEAR,
+                ..u
+            },
+            core_inputs: &core_inputs,
+            quad_params: &packed,
+            initial_checkpoints: None,
+        })
+        .unwrap();
+        assert_eq!(direct.feature_outputs, res.feature_outputs);
+        assert!(
+            direct.tile_checkpoints[TILE_CKPT_VEC4_STRIDE..]
+                .iter()
+                .flat_map(|v| v.iter())
+                .any(|&x| x.abs() > 1.0e-4)
+        );
     }
 }

@@ -13,12 +13,12 @@ use super::pullback::{
 };
 use crate::abi::{
     ADJOINT_AUX_FLOATS, ADJOINT_SCAN_SCRATCH_FLOATS, ADJOINT_U_TONE2_VEC2S, ADJOINT_V_TRAJ2_VEC2S,
-    AdjointScanUniforms, TILE_FRAMES,
+    AdjointScanUniforms, EXIT_ADJ_BOUNDARY_VEC4_STRIDE, TILE_FRAMES,
 };
 use crate::core_math::{
     CORE_INPUT_VEC4_STRIDE, PhsFrameTerms, QUAD_PARAMS_VEC4_STRIDE, QuadParamsUnpacked,
     TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_ADJ_LANE_VEC4_STRIDE, eval_tpt_svf_phs_frame,
-    eval_tpt_svf_scalar, linear_adjoint_reverse_suffix_256_lr, load_vec4, param_slots,
+    eval_tpt_svf_scalar, get_lane, linear_adjoint_reverse_suffix_256_lr, load_vec4, param_slots,
     reduce_batch6_in_scratch, reduce_sum_256_in_aux, set_lane, store_vec4, sub_sat_usize,
     tpt_adjoint_reverse_suffix_256,
 };
@@ -37,12 +37,14 @@ fn write_param_grad_lane(param_grads: &mut [Vec4], base: usize, slot: usize, c: 
     store_vec4(param_grads, idx, vec);
 }
 
-/// Executes `adjoint_scan_256` `pass_mode = 2` for one `(q_global, tile)` workgroup.
+/// Executes `adjoint_scan_256` `pass_mode = 2` for one `(q_tier, q_wave, tile)` workgroup.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn run_pass2(
-    q_global: usize,
-    _total_q: usize,
+    q_tier: usize,
+    q_wave: usize,
+    tile_base: usize,
+    is_phs: bool,
     tile: usize,
     lid: usize,
     sg_lid: u32,
@@ -73,9 +75,9 @@ pub fn run_pass2(
     let frame = tile * TILE_FRAMES + i;
     let is_active = i < valid_len;
     let tiny_eps = uniforms.tiny_crossing_eps;
-    let is_phs = uniforms.block_idx == 0;
+    let exit_base = q_wave * EXIT_ADJ_BOUNDARY_VEC4_STRIDE;
 
-    let params = QuadParamsUnpacked::load(quad_params, q_global * QUAD_PARAMS_VEC4_STRIDE);
+    let params = QuadParamsUnpacked::load(quad_params, q_tier * QUAD_PARAMS_VEC4_STRIDE);
     let mut out_du_l = Vec4::ZERO;
     let mut out_du_r = Vec4::ZERO;
 
@@ -88,7 +90,7 @@ pub fn run_pass2(
             u_tone2,
             v_traj2,
             scan_scratch,
-            q_global,
+            q_tier,
             num_frames,
             num_tiles,
             tile,
@@ -99,7 +101,8 @@ pub fn run_pass2(
             is_phs,
         );
 
-        let slot = (q_global * num_tiles + tile) * TILE_ADJ_BOUNDARY_VEC4_STRIDE
+        let slot = tile_base
+            + (q_wave * num_tiles + tile) * TILE_ADJ_BOUNDARY_VEC4_STRIDE
             + c * TILE_ADJ_LANE_VEC4_STRIDE;
         let (adj_s_out_l, adj_s_out_r, adj_v_out_l, adj_v_out_r) = if tile_active {
             let s0 = load_vec4(tile_adj_boundaries, slot);
@@ -118,13 +121,21 @@ pub fn run_pass2(
         } else {
             (0.0, 0.0)
         };
+        let exit_adj_r_prev_seam = if tile + 1 == num_tiles && valid_len > 0 && i + 1 == valid_len {
+            (
+                get_lane(load_vec4(tile_adj_boundaries, exit_base + 6), c),
+                get_lane(load_vec4(tile_adj_boundaries, exit_base + 7), c),
+            )
+        } else {
+            (0.0, 0.0)
+        };
 
         let nonlin = eval_adaa_local_and_seam_pullback(
             d_loss_d_features,
             feature_outputs,
             scan_scratch,
             &fwd,
-            q_global,
+            q_tier,
             num_frames,
             num_tiles,
             tile,
@@ -135,6 +146,7 @@ pub fn run_pass2(
             &lp,
             tiny_eps,
             r_next_seam,
+            exit_adj_r_prev_seam,
         );
         let sag = eval_sag_and_stereo_pullback(&fwd, &nonlin, &lp, is_active);
 
@@ -411,7 +423,7 @@ pub fn run_pass2(
         let g_glu_mix = reduce_sum_256_in_aux(aux, i, sg_lid, nonlin.grad_glu_mix);
 
         if i == 0 && tile_active {
-            let pg_base = (q_global * num_tiles + tile) * QUAD_PARAMS_VEC4_STRIDE;
+            let pg_base = (q_tier * num_tiles + tile) * QUAD_PARAMS_VEC4_STRIDE;
             write_param_grad_lane(param_grads, pg_base, param_slots::SVF_A1, c, r0[0]);
             write_param_grad_lane(param_grads, pg_base, param_slots::SVF_A2, c, r0[1]);
             write_param_grad_lane(param_grads, pg_base, param_slots::SVF_A3, c, r0[2]);
@@ -470,7 +482,7 @@ pub fn run_pass2(
         }
     }
 
-    let in_base = (q_global * num_frames + frame) * CORE_INPUT_VEC4_STRIDE;
+    let in_base = (q_tier * num_frames + frame) * CORE_INPUT_VEC4_STRIDE;
     if is_active {
         store_vec4(d_loss_d_inputs, in_base, out_du_l);
         store_vec4(d_loss_d_inputs, in_base + 1, out_du_r);

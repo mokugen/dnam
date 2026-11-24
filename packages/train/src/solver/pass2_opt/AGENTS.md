@@ -4,7 +4,7 @@ Scoped discovery guide for [`../pass2_opt.rs`](../pass2_opt.rs) (parent [`../AGE
 
 | Module | Responsibility | Canonical Spec (SSOT) |
 | :--- | :--- | :--- |
-| [`../pass2_opt.rs`](../pass2_opt.rs), [`hybrid.rs`](hybrid.rs), [`windows.rs`](hybrid/windows.rs) | `Pass2OptConfig`, Phase 2A–2D hybrid `AdamW`+`VarPro` $\to$ `L-SSBroyden` $\to$ QAT driver & windowing | [`webgpu_and_varpro_solver.md`](../../../../../docs/specs/training/webgpu_and_varpro_solver.md) |
+| [`../pass2_opt.rs`](../pass2_opt.rs), [`hybrid.rs`](hybrid.rs), [`windows.rs`](hybrid/windows.rs) | `Pass2OptConfig`, Phase 2A–2D hybrid `AdamW`+`VarPro` → `L-SSBroyden` → QAT driver & windowing | [`webgpu_and_varpro_solver.md`](../../../../../docs/specs/training/webgpu_and_varpro_solver.md) |
 | [`prescreen.rs`](prescreen.rs), [`varpro_sync.rs`](varpro_sync.rs), [`basis.rs`](varpro_sync/basis.rs) | Sobol seed gen, Top-K diverse basin selection, onset-decoupled `uplo='U'` VarPro refresh | [`webgpu_and_varpro_solver.md`](../../../../../docs/specs/training/webgpu_and_varpro_solver.md) |
 | [`matryoshka.rs`](matryoshka.rs), [`qat_polish.rs`](qat_polish.rs) | `4 -> 6 -> 8 -> 10` growth, `ln(L_t+1e-8)` + `PCGrad`, `u`-space STE `fp16` QAT | [`webgpu_and_varpro_solver.md`](../../../../../docs/specs/training/webgpu_and_varpro_solver.md) |
 | [`theta.rs`](theta.rs), [`domains.rs`](theta/domains.rs), [`arena.rs`](theta/domains/arena.rs) | Full-subspace descriptors, `Arena0..3`/Readout masks, `1/N` ZOH scaling | [`webgpu_and_varpro_solver.md`](../../../../../docs/specs/training/webgpu_and_varpro_solver.md) |

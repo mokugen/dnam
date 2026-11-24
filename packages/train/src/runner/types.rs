@@ -9,7 +9,8 @@ use dnam_kernels::{
 use crate::error::TrainError;
 use crate::gpu::abi::{
     AdjointScanUniforms, GaborBezoutUniforms, InnerOptUniforms, OzakiGramUniforms,
-    PRESCREEN_SEED_PARAM_STRIDE, PrescreenUniforms, QUAD_PARAMS_VEC4_STRIDE, quad_param_slots,
+    PRESCREEN_SEED_PARAM_STRIDE, PrescreenUniforms, QUAD_PARAMS_VEC4_STRIDE, TILE_DESC_VEC4_STRIDE,
+    TileMixUniforms, quad_param_slots,
 };
 
 /// Packs a [`CoreQuadParamsStereo4`] into the canonical `25 × [f32; 4]` GPU/CPU uniform-stride block
@@ -186,6 +187,8 @@ pub struct AdjointScanInput<'a> {
     pub d_loss_d_features: &'a [[f32; 4]],
     /// Forward `feature_outputs` (`total_q * num_frames * 6`) for cross-lane GLU pullback.
     pub feature_outputs: &'a [[f32; 4]],
+    /// Optional `Slot 7` reverse-block exit boundary seed (`num_stems * wg_x * 16`).
+    pub exit_adj_boundary: Option<&'a [[f32; 4]]>,
 }
 
 /// Output buffers produced by `adjoint_scan_256`.
@@ -195,6 +198,8 @@ pub struct AdjointScanOutput {
     pub d_loss_d_inputs: Vec<[f32; 4]>,
     /// Per-tile parameter gradients (`total_q * num_tiles * 25`).
     pub param_grads: Vec<[f32; 4]>,
+    /// `Slot 7` header boundary buffer (`num_stems * wg_x * 16`, `[8..16]` holding entry adjoints).
+    pub entry_adj_boundary: Vec<[f32; 4]>,
 }
 
 /// Shared input bundle for `gabor_bezout_grad`.
@@ -237,7 +242,7 @@ pub struct OzakiGramInput<'a> {
 /// Output `i32` Ozaki accumulators produced by `ozaki_gram_rhs_i32`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OzakiGramOutput {
-    /// Flat `i32` accumulators `[pair * num_chunks * 6 + ch * 6 + word]`.
+    /// Flat `i32` buffer containing leading split-64 region (`num_pairs * 4`) followed by chunk buckets.
     pub ozaki_buckets: Vec<i32>,
     /// Number of chunk tiles along `num_frames`.
     pub num_chunks: usize,
@@ -245,20 +250,163 @@ pub struct OzakiGramOutput {
     pub num_pairs: usize,
 }
 
-/// Shared input bundle for `inner_opt_step`.
+/// Compact split-64 Ozaki result containing only `4 × u32` limbs `[hi_lo, hi_hi, lo_lo, lo_hi]` per pair.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OzakiSplit64Output {
+    /// Packed split-64 words `[hi_lo, hi_hi, lo_lo, lo_hi]` per pair (`num_pairs * 4`).
+    pub split64_words: Vec<u32>,
+    /// Active pair count (`gram_pairs + feature_dim * target_channels`).
+    pub num_pairs: usize,
+}
+
+/// Packs one inter-block coupling tile into the `13 × [f32; 4]` `Slot 2` descriptor expected
+/// by `tile_mix_fwd_adj` (`weights` indexed `[src_lane][dst_lane]`).
+#[inline]
+#[must_use]
+pub fn pack_tile_descriptor(
+    src_quad: u32,
+    dst_quad: u32,
+    src_block: u32,
+    dst_block: u32,
+    w_odd: &[[f32; 4]; 4],
+    w_even: &[[f32; 4]; 4],
+    w_lru: &[[f32; 4]; 4],
+) -> [[f32; 4]; TILE_DESC_VEC4_STRIDE] {
+    let mut out = [[0.0_f32; 4]; TILE_DESC_VEC4_STRIDE];
+    out[0] = [
+        f32::from_bits(src_quad),
+        f32::from_bits(dst_quad),
+        f32::from_bits(src_block),
+        f32::from_bits(dst_block),
+    ];
+    out[1..5].copy_from_slice(w_odd);
+    out[5..9].copy_from_slice(w_even);
+    out[9..13].copy_from_slice(w_lru);
+    out
+}
+
+/// Shared input bundle for direct `tile_mix_fwd_adj` dispatch.
+#[derive(Clone, Debug)]
+pub struct TileMixInput<'a> {
+    /// Mode (`dir_mode in 0..=3`), dimensions, and active `block_wave`.
+    pub uniforms: TileMixUniforms,
+    /// Forward `core_inputs` or adjoint `d_loss_d_inputs` (`num_stems * num_quads * num_frames * 2`).
+    pub block_inputs_or_d_loss_d_inputs: &'a [[f32; 4]],
+    /// Packed `13 × Vec4` tile descriptors (`num_active_tiles * 13`).
+    pub tile_descriptors: &'a [[f32; 4]],
+    /// Forward `feature_outputs` (`num_stems * num_quads * num_frames * 6`).
+    pub feature_outputs: &'a [[f32; 4]],
+    /// Partial/reduced tile weight gradients (`active_tiles * (1 + num_stems * num_tiles) * 48`).
+    pub tile_weight_grads: &'a [f32],
+    /// Forward-accumulated feature gradients (`num_stems * num_quads * num_frames * 6`).
+    pub d_loss_d_features: &'a [[f32; 4]],
+}
+
+/// Output buffers returned by direct `tile_mix_fwd_adj` execution.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TileMixOutput {
+    /// Updated `core_inputs` (in `dir_mode = 0`) or echoed `d_loss_d_inputs`.
+    pub block_inputs_or_d_loss_d_inputs: Vec<[f32; 4]>,
+    /// Updated `tile_weight_grads` buffer.
+    pub tile_weight_grads: Vec<f32>,
+    /// Updated `d_loss_d_features` buffer (in `dir_mode = 1`).
+    pub d_loss_d_features: Vec<[f32; 4]>,
+}
+
+/// Wave-batched forward cascade input executing Waves `0..=3` + `tile_mix_fwd_adj(0)` in 1 submit per chunk.
+#[derive(Clone, Debug)]
+pub struct WaveCoreCascadeInput<'a> {
+    /// Frames per stem.
+    pub num_frames: usize,
+    /// Active `CoreQuad` count (`1..=10`).
+    pub num_quads: usize,
+    /// Stem count.
+    pub num_stems: usize,
+    /// Active `SONA_INTERBLOCK_TILES` count (`3`, `13`, `23`, or `35`).
+    pub active_tiles: usize,
+    /// Whether to return `tile_checkpoints` (`true` for training backward pass).
+    pub write_checkpoints: bool,
+    /// Whether to set `FUSED_FLAG_FIXED_POINT_SCAN` during `fused_core_scan_256`.
+    pub fixed_point_scan: bool,
+    /// Soft rectifier smoothing epsilon (`SOFT_RECT_EPS`).
+    pub soft_rect_eps: f32,
+    /// `PolyADAA1` tiny crossing distance threshold (`TINY_CROSSING_EPS`).
+    pub tiny_crossing_eps: f32,
+    /// Base per-quad stereo inputs (`num_stems * num_quads * num_frames * 2`) before inter-block mixing.
+    pub base_core_inputs: &'a [[f32; 4]],
+    /// Packed `25 × Vec4` parameters (`num_stems * num_quads * 25`).
+    pub quad_params: &'a [[f32; 4]],
+    /// Packed `13 × Vec4` inter-block tile descriptors (`active_tiles * 13`).
+    pub tile_descriptors: &'a [[f32; 4]],
+}
+
+/// Wave-batched forward cascade output matching `CausalCascadeOutput`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WaveCoreCascadeOutput {
+    /// Post-`tile_mix` core inputs (`num_stems * num_quads * num_frames * 2`).
+    pub core_inputs: Vec<[f32; 4]>,
+    /// Tile boundary checkpoints (`num_stems * num_quads * num_tiles * 8` when `write_checkpoints`).
+    pub tile_checkpoints: Vec<[f32; 4]>,
+    /// Core feature outputs (`num_stems * num_quads * num_frames * 6`).
+    pub feature_outputs: Vec<[f32; 4]>,
+}
+
+/// Wave-batched reverse BPTT input executing reverse Waves `3..=0` + `tile_mix_fwd_adj(1,2,3)` in 1 submit per chunk.
+#[derive(Clone, Debug)]
+pub struct WaveCoreAdjointInput<'a> {
+    /// Frames per stem.
+    pub num_frames: usize,
+    /// Active `CoreQuad` count (`1..=10`).
+    pub num_quads: usize,
+    /// Stem count.
+    pub num_stems: usize,
+    /// Active `SONA_INTERBLOCK_TILES` count (`3`, `13`, `23`, or `35`).
+    pub active_tiles: usize,
+    /// Soft rectifier smoothing epsilon (`SOFT_RECT_EPS`).
+    pub soft_rect_eps: f32,
+    /// `PolyADAA1` tiny crossing distance threshold (`TINY_CROSSING_EPS`).
+    pub tiny_crossing_eps: f32,
+    /// Post-`tile_mix` forward `core_inputs` (`num_stems * num_quads * num_frames * 2`).
+    pub core_inputs: &'a [[f32; 4]],
+    /// Packed `25 × Vec4` parameters (`num_stems * num_quads * 25`).
+    pub quad_params: &'a [[f32; 4]],
+    /// Forward `tile_checkpoints` (`num_stems * num_quads * num_tiles * 8`).
+    pub tile_checkpoints: &'a [[f32; 4]],
+    /// Loss gradient w.r.t. readout-side `feature_outputs` (`num_stems * num_quads * num_frames * 6`).
+    pub d_loss_d_features: &'a [[f32; 4]],
+    /// Forward `feature_outputs` (`num_stems * num_quads * num_frames * 6`).
+    pub feature_outputs: &'a [[f32; 4]],
+    /// Packed `13 × Vec4` inter-block tile descriptors (`active_tiles * 13`).
+    pub tile_descriptors: &'a [[f32; 4]],
+}
+
+/// Wave-batched reverse BPTT output containing quad input/parameter grads and exact deterministic tile weight grads.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WaveCoreAdjointOutput {
+    /// Gradient w.r.t. post-`tile_mix` `core_inputs` (`num_stems * num_quads * num_frames * 2`).
+    pub d_loss_d_inputs: Vec<[f32; 4]>,
+    /// Per-tile parameter gradients (`num_stems * num_quads * num_tiles * 25`).
+    pub param_grads: Vec<[f32; 4]>,
+    /// Deterministic reduced tile weight gradients (`active_tiles * 48`: `[odd 4×4, even 4×4, lru 4×4]`).
+    pub tile_weight_grads: Vec<f32>,
+}
+
+/// Shared input bundle for multi-candidate `inner_opt_step`.
 #[derive(Clone, Debug)]
 pub struct InnerOptInput<'a> {
-    /// Step index, L-BFGS history window `history_m <= 8`, line search iter, and damping parameters.
+    /// Step index, L-SSBroyden history `m <= 32`, mode flags, step size, damping, margin, clip norm.
     pub uniforms: InnerOptUniforms,
-    /// Current parameter vector (`num_params`).
+    /// Number of parallel candidates dispatched across `(1, num_candidates, 1)`.
+    pub num_candidates: usize,
+    /// Current unconstrained parameter vectors (`num_candidates * num_params`).
     pub theta: &'a [f32],
-    /// Current objective gradient (`num_params`).
+    /// Current objective gradients (`num_candidates * num_params`).
     pub grad: &'a [f32],
-    /// Inclusive parameter box bounds `[lo, hi]` (`num_params`).
-    pub param_bounds: &'a [[f32; 2]],
-    /// L-BFGS circular `(s, y)` history plus anchor row `(history_m + 1) * num_params`.
+    /// Packed `[lo, hi, scale_s, f32::from_bits(packed_meta)]` per parameter (`num_params`).
+    pub param_bounds: &'a [[f32; 4]],
+    /// Optimizer state: L-SSBroyden `(s, y)` pairs (`num_candidates * (history_m + 1) * num_params`) or AdamW `[m, v, u_shadow, g]`.
     pub lbfgs_s_y: &'a [[f32; 4]],
-    /// Search direction vector (`num_params`).
+    /// Search direction / last step delta (`num_candidates * num_params`).
     pub search_dir: &'a [f32],
 }
 

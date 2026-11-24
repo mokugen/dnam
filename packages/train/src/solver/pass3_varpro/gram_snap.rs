@@ -4,7 +4,8 @@
 
 use dnam_kernels::{f32_to_fp16, fp16_to_f32};
 
-use crate::wide_gram::uplo_u_index;
+use crate::linalg::cholesky::{factorize_uplo_u_cholesky, solve_factorized_uplo_u};
+use crate::wide_gram::{uplo_u_index, uplo_u_packed_len};
 
 use super::features::TIER_KAUTZ_CAPS;
 
@@ -169,8 +170,60 @@ fn eval_quad_diff(w: &[f64], w_cont: &[f64], gram_uplo_u: &[f64], lambda_diag: &
     err
 }
 
-/// Minimizes `0.5 * (w - w_cont)^T (G + diag(lambda_diag)) (w - w_cont)` via 2 cyclic Gauss-Seidel
-/// sweeps over quantized `fp16` columns followed by continuous `f32` columns.
+fn polish_continuous_f32_block(
+    w: &[f64],
+    w_cont: &[f64],
+    gram_uplo_u: &[f64],
+    lam: &[f64],
+    col_specs: &[ColWireSpec],
+) -> Option<Vec<f64>> {
+    let f32_cols: Vec<usize> = col_specs
+        .iter()
+        .enumerate()
+        .filter_map(|(j, s)| (!s.is_fp16()).then_some(j))
+        .collect();
+    let fp16_cols: Vec<usize> = col_specs
+        .iter()
+        .enumerate()
+        .filter_map(|(j, s)| s.is_fp16().then_some(j))
+        .collect();
+    let k = f32_cols.len();
+    if k == 0 || fp16_cols.is_empty() {
+        return None;
+    }
+
+    let mut h_cc = vec![0.0_f64; uplo_u_packed_len(k)];
+    let mut rhs_c = vec![0.0_f64; k];
+    for (b, &j) in f32_cols.iter().enumerate() {
+        for (a, &i) in f32_cols[..=b].iter().enumerate() {
+            let diag = if a == b { lam[i] } else { 0.0 };
+            h_cc[uplo_u_index(a, b)] = gram_uplo_u[uplo_u_index(i, j)] + diag;
+        }
+    }
+    for (a, &i) in f32_cols.iter().enumerate() {
+        let mut acc = 0.0_f64;
+        for &q in &fp16_cols {
+            acc -= gram_uplo_u[uplo_u_index(i, q)] * (w[q] - w_cont[q]);
+        }
+        rhs_c[a] = acc;
+    }
+
+    let r_cc = factorize_uplo_u_cholesky(k, &h_cc, 1.0e-15).ok()?;
+    let delta_c = solve_factorized_uplo_u(k, &r_cc, &rhs_c).ok()?;
+    if !delta_c.iter().all(|v| v.is_finite()) {
+        return None;
+    }
+
+    let mut w_cand = w.to_vec();
+    for (&i, &dc) in f32_cols.iter().zip(&delta_c) {
+        w_cand[i] = col_specs[i].snap(w_cont[i] + dc);
+    }
+    Some(w_cand)
+}
+
+/// Minimizes `0.5 * (w - w_cont)^T (G + diag(lambda_diag)) (w - w_cont)` via up to 4 cyclic
+/// Gauss-Seidel sweeps over quantized `fp16` / `f32` columns followed by an exact `f32`-subspace
+/// Cholesky conditional solve.
 #[must_use]
 pub(super) fn snap_weights_gram_coordinate(
     w_cont: &[f64],
@@ -195,10 +248,10 @@ pub(super) fn snap_weights_gram_coordinate(
     // Maintain residual r = (G + diag(lam))(w - w_cont), initially exact zero at w = w_cont.
     let mut r = vec![0.0_f64; dim];
 
-    let apply_col_update = |j: usize, w_new: f64, w_buf: &mut [f64], r_buf: &mut [f64]| {
+    let apply_col_update = |j: usize, w_new: f64, w_buf: &mut [f64], r_buf: &mut [f64]| -> f64 {
         let delta = w_new - w_buf[j];
         if delta == 0.0 || !delta.is_finite() {
-            return;
+            return 0.0;
         }
         w_buf[j] = w_new;
         for (i, ri) in r_buf.iter_mut().enumerate() {
@@ -206,9 +259,12 @@ pub(super) fn snap_weights_gram_coordinate(
             let h_ij = if i == j { g_ij + lam[j] } else { g_ij };
             *ri += h_ij * delta;
         }
+        delta.abs()
     };
 
-    for _sweep in 0..2 {
+    for _sweep in 0..4 {
+        let mut fp16_changed = false;
+        let mut max_f32_delta = 0.0_f64;
         for want_fp16 in [true, false] {
             for (j, spec) in col_specs.iter().enumerate() {
                 if spec.is_fp16() != want_fp16 {
@@ -221,15 +277,39 @@ pub(super) fn snap_weights_gram_coordinate(
                     w[j]
                 };
                 let w_new = spec.snap(w_target);
-                apply_col_update(j, w_new, &mut w, &mut r);
+                let moved = apply_col_update(j, w_new, &mut w, &mut r);
+                if moved > 0.0 {
+                    if want_fp16 {
+                        fp16_changed = true;
+                    } else {
+                        max_f32_delta = max_f32_delta.max(moved);
+                    }
+                }
             }
+        }
+        if !fp16_changed && max_f32_delta < 1.0e-12 {
+            break;
+        }
+    }
+
+    let mut best_w = w;
+    let mut best_err = eval_quad_diff(&best_w, w_cont, gram_uplo_u, &lam);
+    if let Some(w_pol) = polish_continuous_f32_block(&best_w, w_cont, gram_uplo_u, &lam, col_specs)
+    {
+        let err_pol = eval_quad_diff(&w_pol, w_cont, gram_uplo_u, &lam);
+        if err_pol.is_finite() && err_pol < best_err {
+            best_w = w_pol;
+            best_err = err_pol;
         }
     }
 
     let w_direct = snap_weights_direct(w_cont, col_specs);
-    let err_gs = eval_quad_diff(&w, w_cont, gram_uplo_u, &lam);
     let err_dir = eval_quad_diff(&w_direct, w_cont, gram_uplo_u, &lam);
-    if err_gs <= err_dir { w } else { w_direct }
+    if best_err <= err_dir {
+        best_w
+    } else {
+        w_direct
+    }
 }
 
 #[cfg(test)]
@@ -394,5 +474,55 @@ mod tests {
         assert!(k3[..24].iter().all(|s| !s.is_fp16()));
         assert!(k3[24..48].iter().all(|s| s.is_fp16()));
         assert!(k3[48..].iter().all(|s| !s.is_fp16()));
+    }
+
+    #[test]
+    fn test_snap_weights_correlated_high_cond_f32_subspace_polish() {
+        let mut specs = Vec::with_capacity(16);
+        specs.extend(std::iter::repeat_n(
+            ColWireSpec::Fp16 { lo: -8.0, hi: 8.0 },
+            8,
+        ));
+        specs.extend(std::iter::repeat_n(
+            ColWireSpec::F32 { lo: -8.0, hi: 8.0 },
+            8,
+        ));
+
+        let mut gram = vec![0.0_f64; uplo_u_packed_len(16)];
+        for n in 0..512 {
+            let t = (n as f64) * 0.037;
+            let base = t.sin() + 0.5 * (2.3 * t + 0.2).cos();
+            let mut row = [0.0_f64; 16];
+            for j in 0..8 {
+                let perturb = 2.0e-3 * (((n * (j + 3)) % 19) as f64 - 9.0)
+                    + 5.0e-3 * (t * ((j + 1) as f64 * 0.41)).cos();
+                row[j] = base + perturb;
+                row[8 + j] = base + 1.0e-3 * (t * ((j + 1) as f64 * 0.73)).sin();
+            }
+            for b in 0..16 {
+                for a in 0..=b {
+                    gram[uplo_u_index(a, b)] += row[a] * row[b];
+                }
+            }
+        }
+
+        let w_cont: Vec<f64> = (0..16)
+            .map(|j| {
+                let s = if j % 2 == 0 { 1.0 } else { -1.0 };
+                s * (0.42 + 0.0713 * (j as f64))
+            })
+            .collect();
+        let lam = vec![1.0e-9_f64; 16];
+        let w_pol = snap_weights_gram_coordinate(&w_cont, &gram, &lam, &specs);
+        let w_dir = snap_weights_direct(&w_cont, &specs);
+        let err_pol = eval_quad_diff(&w_pol, &w_cont, &gram, &lam);
+        let err_dir = eval_quad_diff(&w_dir, &w_cont, &gram, &lam);
+        assert!(
+            err_pol < err_dir * 0.05,
+            "expected f32 subspace polish to crush correlated fp16 error: pol={err_pol} dir={err_dir}"
+        );
+        for (j, spec) in specs.iter().enumerate() {
+            assert_eq!(w_pol[j], spec.snap(w_pol[j]));
+        }
     }
 }

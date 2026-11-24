@@ -5,16 +5,15 @@
 
 use super::harness::{
     GpuContext, ShaderVariant, as_byte_slice, build_core_quad_bundle, cpu_params_from_packed,
-    dispatch_kernel, read_vec4_vec,
+    dispatch_adjoint_3pass, dispatch_kernel, read_vec4_vec,
 };
 use dnam_kernels::{
     CoreQuadParamsStereo4, GpuVec4, InterleavedStereo8, KernelVec4, SOFT_RECT_EPS,
     SonaBlockStateStereo8, StereoVec8, TINY_CROSSING_EPS, step_core_quad_stereo8,
 };
 use sona_shaders::abi::{
-    AdjointScanUniforms, CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, FusedScanUniforms,
-    QUAD_PARAMS_VEC4_STRIDE, TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE,
-    quad_param_slots,
+    BLOCK_IDX_DIRECT_LINEAR, CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, FusedScanUniforms,
+    QUAD_PARAMS_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, quad_param_slots,
 };
 use sona_shaders::manifest::KernelId;
 use zerocopy::IntoBytes;
@@ -57,7 +56,7 @@ fn make_core_inputs(num_frames: usize, zero_mode: bool) -> Vec<[f32; 4]> {
     core_inputs
 }
 
-fn eval_cpu_features_loss(
+pub(super) fn eval_cpu_features_loss(
     core_inputs: &[[f32; 4]],
     params_cpu: &[CoreQuadParamsStereo4<GpuVec4>],
     weights: &[[f32; 4]],
@@ -117,7 +116,7 @@ pub fn verify_fused_core_scan_256_parity_and_zero_dc(ctx: &GpuContext, variant: 
         tile_start: 0,
         soft_rect_eps: SOFT_RECT_EPS,
         tiny_crossing_eps: TINY_CROSSING_EPS,
-        block_idx: 1,
+        block_idx: BLOCK_IDX_DIRECT_LINEAR,
     };
 
     let (out, _elapsed) = dispatch_kernel(
@@ -349,7 +348,7 @@ fn verify_adjoint_pass1_multiblock_fd(ctx: &GpuContext, variant: ShaderVariant) 
         tile_start: 0,
         soft_rect_eps: SOFT_RECT_EPS,
         tiny_crossing_eps: TINY_CROSSING_EPS,
-        block_idx: 1,
+        block_idx: BLOCK_IDX_DIRECT_LINEAR,
     };
     let (fwd_out, _) = dispatch_kernel(
         ctx,
@@ -378,43 +377,25 @@ fn verify_adjoint_pass1_multiblock_fd(ctx: &GpuContext, variant: ShaderVariant) 
         }
     }
 
-    let mut du_buf = vec![0_u8; inputs.len() * 16];
-    let mut pgrad_buf = vec![0_u8; num_tiles * QUAD_PARAMS_VEC4_STRIDE * 16];
-    let mut adj_b_buf = vec![0_u8; num_tiles * TILE_ADJ_BOUNDARY_VEC4_STRIDE * 16];
-    for (pass_mode, wg_y) in [(0_u32, num_tiles as u32), (1, 1), (2, num_tiles as u32)] {
-        let u = AdjointScanUniforms {
-            num_frames: num_frames as u32,
-            num_tiles: num_tiles as u32,
-            num_quads: 1,
-            num_stems: 1,
-            pass_mode,
-            soft_rect_eps: SOFT_RECT_EPS,
-            tiny_crossing_eps: TINY_CROSSING_EPS,
-            block_idx: 1,
-        };
-        let (out, _) = dispatch_kernel(
-            ctx,
-            KernelId::AdjointScan256,
-            variant,
-            (1, wg_y, 1),
-            u.as_bytes(),
-            &[
-                (false, as_byte_slice(&inputs)),
-                (false, as_byte_slice(&packed_p)),
-                (false, &fwd_out[0]),
-                (false, as_byte_slice(&d_loss)),
-                (true, &du_buf),
-                (true, &pgrad_buf),
-                (true, &adj_b_buf),
-                (false, &fwd_out[1]),
-            ],
-        );
-        du_buf = out[0].clone();
-        pgrad_buf = out[1].clone();
-        adj_b_buf = out[2].clone();
-    }
-
-    let got_du = read_vec4_vec(&du_buf);
+    let got_du = dispatch_adjoint_3pass(
+        ctx,
+        variant,
+        num_frames,
+        num_tiles,
+        1,
+        1,
+        1,
+        BLOCK_IDX_DIRECT_LINEAR,
+        SOFT_RECT_EPS,
+        TINY_CROSSING_EPS,
+        as_byte_slice(&inputs),
+        as_byte_slice(&packed_p),
+        &fwd_out[0],
+        as_byte_slice(&d_loss),
+        &fwd_out[1],
+        None,
+    )
+    .du;
     let params_slice = [cpu_p];
     let eps = 3.0e-3_f32;
     for &t in &[
@@ -464,7 +445,7 @@ pub fn verify_adjoint_scan_256_fd_parity(ctx: &GpuContext, variant: ShaderVarian
         tile_start: 0,
         soft_rect_eps: SOFT_RECT_EPS,
         tiny_crossing_eps: TINY_CROSSING_EPS,
-        block_idx: 1,
+        block_idx: BLOCK_IDX_DIRECT_LINEAR,
     };
     let (fwd_out, _) = dispatch_kernel(
         ctx,
@@ -498,45 +479,26 @@ pub fn verify_adjoint_scan_256_fd_parity(ctx: &GpuContext, variant: ShaderVarian
         }
     }
 
-    let mut du_buf = vec![0_u8; core_inputs.len() * 16];
-    let mut pgrad_buf = vec![0_u8; TOTAL_Q * NUM_TILES * QUAD_PARAMS_VEC4_STRIDE * 16];
-    let mut adj_bound_buf = vec![0_u8; TOTAL_Q * NUM_TILES * TILE_ADJ_BOUNDARY_VEC4_STRIDE * 16];
-
-    for (pass_mode, wg_y) in [(0_u32, NUM_TILES as u32), (1, 1), (2, NUM_TILES as u32)] {
-        let u = AdjointScanUniforms {
-            num_frames: NUM_FRAMES as u32,
-            num_tiles: NUM_TILES as u32,
-            num_quads: NUM_QUADS as u32,
-            num_stems: NUM_STEMS as u32,
-            pass_mode,
-            soft_rect_eps: SOFT_RECT_EPS,
-            tiny_crossing_eps: TINY_CROSSING_EPS,
-            block_idx: 1,
-        };
-        let (out, _) = dispatch_kernel(
-            ctx,
-            KernelId::AdjointScan256,
-            variant,
-            (NUM_QUADS as u32, wg_y, NUM_STEMS as u32),
-            u.as_bytes(),
-            &[
-                (false, as_byte_slice(&core_inputs)),
-                (false, as_byte_slice(&quad_params_packed)),
-                (false, tile_checkpoints),
-                (false, as_byte_slice(&d_loss_d_features)),
-                (true, &du_buf),
-                (true, &pgrad_buf),
-                (true, &adj_bound_buf),
-                (false, feature_outputs),
-            ],
-        );
-        du_buf = out[0].clone();
-        pgrad_buf = out[1].clone();
-        adj_bound_buf = out[2].clone();
-    }
-
-    let got_du = read_vec4_vec(&du_buf);
-    let got_pgrad = read_vec4_vec(&pgrad_buf);
+    let adj_res = dispatch_adjoint_3pass(
+        ctx,
+        variant,
+        NUM_FRAMES,
+        NUM_TILES,
+        NUM_QUADS,
+        NUM_STEMS,
+        NUM_QUADS,
+        BLOCK_IDX_DIRECT_LINEAR,
+        SOFT_RECT_EPS,
+        TINY_CROSSING_EPS,
+        as_byte_slice(&core_inputs),
+        as_byte_slice(&quad_params_packed),
+        tile_checkpoints,
+        as_byte_slice(&d_loss_d_features),
+        feature_outputs,
+        None,
+    );
+    let got_du = adj_res.du;
+    let got_pgrad = adj_res.param_grads;
 
     // Check input sensitivities at interior frames, cross-tile seams (255<->256, 511<->512), & tail end (599).
     let eps_u = 3.0e-3_f32;
@@ -671,4 +633,6 @@ pub fn verify_adjoint_scan_256_fd_parity(ctx: &GpuContext, variant: ShaderVarian
     }
 
     verify_adjoint_pass1_multiblock_fd(ctx, variant);
+    super::wave_and_streamed::verify_alpha_rel_0999_multitile_and_streamed_adjoint(ctx, variant);
+    super::wave_and_streamed::verify_canonical_4wave_ultra_hierarchy_parity(ctx, variant);
 }

@@ -13,18 +13,13 @@ pub use quads::{
     TierReadoutPrefixF64, TransportQuadF64,
 };
 
-use dnam_kernels::{SOFT_RECT_EPS, TINY_CROSSING_EPS};
 use dnam_vm::SONA_CORE_QUAD_BLOCK_AND_LOCAL;
 
 use crate::control::clamp::{Phase1ClampOutput, StageStabilityConstraint};
 use crate::control::cp1::Cp1WireBundle;
 use crate::error::TrainError;
-use crate::gpu::abi::{FusedScanUniforms, QUAD_PARAMS_VEC4_STRIDE, TILE_FRAMES};
-use crate::planner::{CoreScanWorkload, MemoryBudgetProfile, plan_core_scan_execution};
-use crate::runner::{
-    ActiveComputeBackend, FusedCoreScanInput, FusedCoreScanOutput, TrainRunner,
-    pack_core_quad_params,
-};
+use crate::gpu::abi::QUAD_PARAMS_VEC4_STRIDE;
+use crate::runner::pack_core_quad_params;
 
 use clamp_and_quant::{clamp_model_stability_bounds, sanitize_clamp};
 
@@ -246,56 +241,6 @@ impl<'a> StereoTrainingPairs<'a> {
             .min(self.target_l.len())
             .min(self.target_r.len())
     }
-}
-
-/// Plans via [`plan_core_scan_execution`] and executes `fused_core_scan_256` on `runner`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn run_planned_core_scan(
-    runner: &TrainRunner,
-    num_frames: usize,
-    num_quads: usize,
-    num_stems: usize,
-    include_adjoint: bool,
-    block_idx: u32,
-    core_inputs: &[[f32; 4]],
-    quad_params: &[[f32; 4]],
-) -> Result<FusedCoreScanOutput, TrainError> {
-    let adapter_cap = match runner.active_backend() {
-        ActiveComputeBackend::CpuSimd { .. } => None,
-        #[cfg(feature = "gpu-wgpu")]
-        ActiveComputeBackend::Wgpu {
-            max_storage_binding_bytes,
-            ..
-        } => Some(max_storage_binding_bytes),
-    };
-    let plan = plan_core_scan_execution(
-        CoreScanWorkload {
-            num_frames,
-            num_quads,
-            num_stems,
-            include_adjoint,
-        },
-        MemoryBudgetProfile::DesktopCapsule,
-        adapter_cap,
-    )?;
-    runner.run_fused_core_scan_planned(
-        &FusedCoreScanInput {
-            uniforms: FusedScanUniforms {
-                num_frames: num_frames as u32,
-                num_tiles: num_frames.div_ceil(TILE_FRAMES) as u32,
-                num_quads: num_quads as u32,
-                num_stems: num_stems as u32,
-                tile_start: 0,
-                soft_rect_eps: SOFT_RECT_EPS,
-                tiny_crossing_eps: TINY_CROSSING_EPS,
-                block_idx,
-            },
-            core_inputs,
-            quad_params,
-            initial_checkpoints: None,
-        },
-        &plan,
-    )
 }
 
 #[cfg(test)]

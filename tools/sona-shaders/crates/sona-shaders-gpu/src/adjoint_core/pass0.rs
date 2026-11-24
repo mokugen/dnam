@@ -7,12 +7,13 @@
 
 use super::common::{eval_adaa_local_and_seam_pullback, recompute_tile_forward_lane};
 use super::pullback::{
-    build_tpt_adjoint_elem, build_tpt_phs_adjoint_elem, eval_duhem_and_tone_pullback,
-    eval_frame_duhem_terms_lr, eval_sag_and_stereo_pullback, phs_k_eff_loc_bar,
+    DuhemTonePullback, SagStereoPullback, build_tpt_adjoint_elem, build_tpt_phs_adjoint_elem,
+    eval_duhem_and_tone_pullback, eval_frame_duhem_terms_lr, eval_sag_and_stereo_pullback,
+    phs_k_eff_loc_bar,
 };
 use crate::abi::{
     ADJOINT_SCAN_SCRATCH_FLOATS, ADJOINT_U_TONE2_VEC2S, ADJOINT_V_TRAJ2_VEC2S, AdjointScanUniforms,
-    TILE_FRAMES,
+    EXIT_ADJ_BOUNDARY_VEC4_STRIDE, TILE_FRAMES,
 };
 use crate::core_math::{
     CORE_INPUT_VEC4_STRIDE, MIN_SAG_GAIN, PhsFrameTerms, QUAD_PARAMS_VEC4_STRIDE, QuadLaneParams,
@@ -22,8 +23,71 @@ use crate::core_math::{
     step_duhem_stereo_scalar, step_tpt_svf_phs_scalar, store_vec4, sub_sat_usize,
     tpt_adjoint_reverse_suffix_256,
 };
-use dnam_kernels::LinearScanElem;
+use dnam_kernels::{LinearScanElem, TptAdjointElem};
 use spirv_std::glam::{Vec2, Vec4};
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn build_channel_tpt_pair(
+    is_phs: bool,
+    is_active: bool,
+    lp: &QuadLaneParams,
+    phs_l: &PhsFrameTerms,
+    phs_r: &PhsFrameTerms,
+    taps_l_1: f32,
+    taps_r_1: f32,
+    dt: &DuhemTonePullback,
+) -> (TptAdjointElem, TptAdjointElem) {
+    if is_phs {
+        let k_loc_l = phs_k_eff_loc_bar(
+            phs_l.a2,
+            phs_l.a3,
+            taps_l_1,
+            dt.adj_hp_l,
+            dt.adj_ap_l,
+            dt.adj_v1_l,
+            dt.adj_v2_l,
+        );
+        let k_loc_r = phs_k_eff_loc_bar(
+            phs_r.a2,
+            phs_r.a3,
+            taps_r_1,
+            dt.adj_hp_r,
+            dt.adj_ap_r,
+            dt.adj_v1_r,
+            dt.adj_v2_r,
+        );
+        (
+            build_tpt_phs_adjoint_elem(
+                phs_l.a1,
+                phs_l.a2,
+                phs_l.a3,
+                taps_l_1,
+                phs_l.gamma,
+                dt.adj_v1_l,
+                dt.adj_v2_l,
+                k_loc_l,
+                is_active,
+            ),
+            build_tpt_phs_adjoint_elem(
+                phs_r.a1,
+                phs_r.a2,
+                phs_r.a3,
+                taps_r_1,
+                phs_r.gamma,
+                dt.adj_v1_r,
+                dt.adj_v2_r,
+                k_loc_r,
+                is_active,
+            ),
+        )
+    } else {
+        (
+            build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_l, dt.adj_v2_l, is_active),
+            build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_r, dt.adj_v2_r, is_active),
+        )
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
@@ -92,11 +156,15 @@ fn compute_next_tile_first_r(
     )
 }
 
-/// Executes `adjoint_scan_256` `pass_mode = 0` for one `(q_global, tile)` workgroup.
+/// Executes `adjoint_scan_256` `pass_mode = 0` for one `(q_tier, q_wave, tile)` workgroup,
+/// emitting level-1 reverse summaries, frame-0 `adj_r_prev`, and cross-operator `k_vs` into `Slot 7`.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn run_pass0(
-    q_global: usize,
+    q_tier: usize,
+    q_wave: usize,
+    tile_base: usize,
+    is_phs: bool,
     tile: usize,
     lid: usize,
     uniforms: &AdjointScanUniforms,
@@ -121,9 +189,8 @@ pub fn run_pass0(
     };
     let is_active = i < valid_len;
     let tiny_eps = uniforms.tiny_crossing_eps;
-    let is_phs = uniforms.block_idx == 0;
-
-    let params = QuadParamsUnpacked::load(quad_params, q_global * QUAD_PARAMS_VEC4_STRIDE);
+    let exit_base = q_wave * EXIT_ADJ_BOUNDARY_VEC4_STRIDE;
+    let params = QuadParamsUnpacked::load(quad_params, q_tier * QUAD_PARAMS_VEC4_STRIDE);
 
     for c in 0..4 {
         let lp = params.lane(c);
@@ -134,7 +201,7 @@ pub fn run_pass0(
             u_tone2,
             v_traj2,
             scan_scratch,
-            q_global,
+            q_tier,
             num_frames,
             num_tiles,
             tile,
@@ -151,7 +218,7 @@ pub fn run_pass0(
             compute_next_tile_first_r(
                 core_inputs,
                 tile_checkpoints,
-                q_global,
+                q_tier,
                 num_frames,
                 num_tiles,
                 tile + 1,
@@ -162,13 +229,21 @@ pub fn run_pass0(
         } else {
             (0.0, 0.0)
         };
+        let exit_adj_r_prev_seam = if tile + 1 == num_tiles && valid_len > 0 && i + 1 == valid_len {
+            (
+                get_lane(load_vec4(tile_adj_boundaries, exit_base + 6), c),
+                get_lane(load_vec4(tile_adj_boundaries, exit_base + 7), c),
+            )
+        } else {
+            (0.0, 0.0)
+        };
 
         let nonlin = eval_adaa_local_and_seam_pullback(
             d_loss_d_features,
             feature_outputs,
             scan_scratch,
             &fwd,
-            q_global,
+            q_tier,
             num_frames,
             num_tiles,
             tile,
@@ -179,6 +254,7 @@ pub fn run_pass0(
             &lp,
             tiny_eps,
             r_next_seam,
+            exit_adj_r_prev_seam,
         );
         let sag = eval_sag_and_stereo_pullback(&fwd, &nonlin, &lp, is_active);
 
@@ -243,55 +319,9 @@ pub fn run_pass0(
             &lp, is_active,
         );
 
-        let (tpt_elem_l, tpt_elem_r) = if is_phs {
-            let k_loc_l = phs_k_eff_loc_bar(
-                phs_l.a2,
-                phs_l.a3,
-                taps_l.1,
-                dt.adj_hp_l,
-                dt.adj_ap_l,
-                dt.adj_v1_l,
-                dt.adj_v2_l,
-            );
-            let k_loc_r = phs_k_eff_loc_bar(
-                phs_r.a2,
-                phs_r.a3,
-                taps_r.1,
-                dt.adj_hp_r,
-                dt.adj_ap_r,
-                dt.adj_v1_r,
-                dt.adj_v2_r,
-            );
-            (
-                build_tpt_phs_adjoint_elem(
-                    phs_l.a1,
-                    phs_l.a2,
-                    phs_l.a3,
-                    taps_l.1,
-                    phs_l.gamma,
-                    dt.adj_v1_l,
-                    dt.adj_v2_l,
-                    k_loc_l,
-                    is_active,
-                ),
-                build_tpt_phs_adjoint_elem(
-                    phs_r.a1,
-                    phs_r.a2,
-                    phs_r.a3,
-                    taps_r.1,
-                    phs_r.gamma,
-                    dt.adj_v1_r,
-                    dt.adj_v2_r,
-                    k_loc_r,
-                    is_active,
-                ),
-            )
-        } else {
-            (
-                build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_l, dt.adj_v2_l, is_active),
-                build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_r, dt.adj_v2_r, is_active),
-            )
-        };
+        let (tpt_elem_l, tpt_elem_r) = build_channel_tpt_pair(
+            is_phs, is_active, &lp, &phs_l, &phs_r, taps_l.1, taps_r.1, &dt,
+        );
 
         let mut psi0_l = 0.0_f32;
         let mut psi1_l = 0.0_f32;
@@ -315,8 +345,51 @@ pub fn run_pass0(
             &mut psi1_r,
         );
 
+        // Compute cross-operator Jacobian coupling `k_vs = d v_out / d s_in` inside `14,848 B` SRAM.
+        let unit_lru_l = if is_active {
+            LinearScanElem { a: tl.jac, b: 0.0 }
+        } else {
+            LinearScanElem::identity()
+        };
+        let unit_lru_r = if is_active {
+            LinearScanElem { a: tr.jac, b: 0.0 }
+        } else {
+            LinearScanElem::identity()
+        };
+        let (_sum_u_l, _sum_u_r, p_after_l, p_after_r) =
+            linear_adjoint_reverse_suffix_256_lr(scan_scratch, i, unit_lru_l, unit_lru_r, 1.0, 1.0);
+        let unit_lam_l = if is_active { p_after_l } else { 0.0 };
+        let unit_lam_r = if is_active { p_after_r } else { 0.0 };
+        let zero_sag = SagStereoPullback::zero();
+        let dt_k = eval_duhem_and_tone_pullback(
+            &fwd, &zero_sag, &tl, &tr, unit_lam_l, unit_lam_r, taps_l, taps_r, ke_l, two_ke_l,
+            ke_r, two_ke_r, &lp, is_active,
+        );
+        let (tpt_k_l, tpt_k_r) = build_channel_tpt_pair(
+            is_phs, is_active, &lp, &phs_l, &phs_r, taps_l.1, taps_r.1, &dt_k,
+        );
+        let mut dummy0 = 0.0_f32;
+        let mut dummy1 = 0.0_f32;
+        let sum_k_l = tpt_adjoint_reverse_suffix_256(
+            scan_scratch,
+            i,
+            tpt_k_l,
+            [0.0, 0.0],
+            &mut dummy0,
+            &mut dummy1,
+        );
+        let sum_k_r = tpt_adjoint_reverse_suffix_256(
+            scan_scratch,
+            i,
+            tpt_k_r,
+            [0.0, 0.0],
+            &mut dummy0,
+            &mut dummy1,
+        );
+
         if i == 0 && tile < num_tiles {
-            let slot = (q_global * num_tiles + tile) * TILE_ADJ_BOUNDARY_VEC4_STRIDE
+            let slot = tile_base
+                + (q_wave * num_tiles + tile) * TILE_ADJ_BOUNDARY_VEC4_STRIDE
                 + c * TILE_ADJ_LANE_VEC4_STRIDE;
             store_vec4(
                 tile_adj_boundaries,
@@ -336,12 +409,22 @@ pub fn run_pass0(
             store_vec4(
                 tile_adj_boundaries,
                 slot + 3,
-                Vec4::new(r_first_l, r_first_r, 0.0, 0.0),
+                Vec4::new(
+                    r_first_l,
+                    r_first_r,
+                    nonlin.adj_r_prev_l,
+                    nonlin.adj_r_prev_r,
+                ),
             );
             store_vec4(
                 tile_adj_boundaries,
                 slot + 4,
                 Vec4::new(sum_tpt_r.t00, sum_tpt_r.t01, sum_tpt_r.t10, sum_tpt_r.t11),
+            );
+            store_vec4(
+                tile_adj_boundaries,
+                slot + 5,
+                Vec4::new(sum_k_l.g0, sum_k_l.g1, sum_k_r.g0, sum_k_r.g1),
             );
         }
     }
