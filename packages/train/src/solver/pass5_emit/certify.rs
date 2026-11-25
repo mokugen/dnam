@@ -14,7 +14,9 @@ use crate::control::clamp::{
 };
 use crate::control::stability::{MAX_RO_POLE_48K_F32, MAX_RO_POLE_48K_F64};
 use crate::error::TrainError;
-use crate::losses::{TierCertificationReport, certify_tier_audio, is_tier_pair_monotone};
+use crate::losses::{
+    DrySilentGapMask, TierCertificationReport, certify_tier_audio_with_gaps, is_tier_pair_monotone,
+};
 
 use super::super::model::{InterBlockTileF64, SonaModelF64, TierReadoutPrefixF64};
 
@@ -333,6 +335,7 @@ pub(super) fn certify_single_tier_stereo(
     target_r: &[f64],
     sr_hz: f64,
     warmup: usize,
+    gap_masks: Option<&[DrySilentGapMask; 2]>,
 ) -> Result<
     (
         f64,
@@ -344,11 +347,14 @@ pub(super) fn certify_single_tier_stereo(
 > {
     let n = target_l.len().min(target_r.len());
     let lufs = compute_itu_bs1770_lufs(&render.0, &render.1, sr_hz, warmup);
-    let rep_l = certify_tier_audio(tier, &render.0, &target_l[..n], None, sr_hz, warmup)?;
-    let rep_r = if render.0 == render.1 && target_l[..n] == target_r[..n] {
+    let mask_l = gap_masks.map(|m| &m[0]);
+    let mask_r = gap_masks.map(|m| &m[1]);
+    let rep_l =
+        certify_tier_audio_with_gaps(tier, &render.0, &target_l[..n], None, sr_hz, warmup, mask_l)?;
+    let rep_r = if render.0 == render.1 && target_l[..n] == target_r[..n] && mask_l == mask_r {
         rep_l
     } else {
-        certify_tier_audio(tier, &render.1, &target_r[..n], None, sr_hz, warmup)?
+        certify_tier_audio_with_gaps(tier, &render.1, &target_r[..n], None, sr_hz, warmup, mask_r)?
     };
     Ok((lufs, worst_stereo_report(rep_l, rep_r), rep_l, rep_r))
 }
@@ -372,6 +378,7 @@ pub(super) fn certify_all_tier_renders_stereo(
     target_r: &[f64],
     sr_hz: f64,
     warmup: usize,
+    gap_masks: Option<&[DrySilentGapMask; 2]>,
 ) -> Result<StereoCertBundle, TrainError> {
     let mut tier_lufs = [0.0_f64; 4];
     let mut combined = Vec::with_capacity(4);
@@ -381,8 +388,15 @@ pub(super) fn certify_all_tier_renders_stereo(
         .into_iter()
         .enumerate()
     {
-        let (lufs, worst, rep_l, rep_r) =
-            certify_single_tier_stereo(tier, &renders[i], target_l, target_r, sr_hz, warmup)?;
+        let (lufs, worst, rep_l, rep_r) = certify_single_tier_stereo(
+            tier,
+            &renders[i],
+            target_l,
+            target_r,
+            sr_hz,
+            warmup,
+            gap_masks,
+        )?;
         tier_lufs[i] = lufs;
         combined.push(worst);
         rep_l_vec.push(rep_l);

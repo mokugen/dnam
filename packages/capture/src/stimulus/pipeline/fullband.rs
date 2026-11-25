@@ -322,6 +322,18 @@ pub(super) fn render_and_seal_fullband_stem(
             spec.user_metadata
                 .insert("wet_polarity_inverted".to_string(), serde_json::json!(true));
         }
+        if req.shared_align.invert_r {
+            spec.user_metadata.insert(
+                "wet_r_polarity_inverted".to_string(),
+                serde_json::json!(true),
+            );
+        }
+        if req.shared_align.clock_drift_ppm != 0.0 {
+            spec.user_metadata.insert(
+                "clock_drift_ppm".to_string(),
+                serde_json::json!(req.shared_align.clock_drift_ppm),
+            );
+        }
     }
     if let Some(ext) = extracted_opt {
         spec.extracted_physics = Some(ext);

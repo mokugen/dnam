@@ -441,7 +441,7 @@ pub fn verify_extreme_corners_zero_dc_256(
     tier: Tier,
     corners: &[Vec<(usize, f32)>],
 ) -> Result<ExtremeCornerDcReport, TrainError> {
-    let mut vm = SonaVm::<DefaultMathBackend>::from_view_owned(view, tier, 48_000.0, true)?;
+    let mut vm = SonaVm::<DefaultMathBackend>::from_view_owned(view, tier, 48_000.0, false)?;
     let in_l = [0.0_f32; ZERO_DC_CORNER_FRAMES];
     let in_r = [0.0_f32; ZERO_DC_CORNER_FRAMES];
     let mut out_l = [0.0_f32; ZERO_DC_CORNER_FRAMES];

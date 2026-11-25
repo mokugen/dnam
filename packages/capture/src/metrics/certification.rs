@@ -5,7 +5,9 @@ mod scope;
 pub mod universal;
 
 pub use scope::certify_holdout_for_family;
-pub use universal::{certify_4metric_universal, certify_holdout_universal};
+pub use universal::{
+    certify_4metric_universal, certify_4metric_universal_with_dry_gaps, certify_holdout_universal,
+};
 
 use super::companion::LtasTargetCache;
 use super::{

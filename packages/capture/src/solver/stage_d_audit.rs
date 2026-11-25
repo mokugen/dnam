@@ -39,18 +39,29 @@ pub struct StageDAuditOptions {
     pub full_backbone_audit: bool,
     /// `true` on Path 2 to calibrate `<= 0.05 LU` inter-tier `tier_gain_trim` multipliers.
     pub calibrate_tier_trims: bool,
+    /// `true` to re-run `run_pass5_emit_and_certify` on the `StarCenter` backbone during Stage D.
+    pub reemit_pass5_backbone: bool,
 }
 
 impl StageDAuditOptions {
-    /// Path 2 full backbone audit with inter-tier loudness trim calibration.
+    /// Path 2 full backbone audit with inter-tier loudness trim calibration and Pass-5 emission.
     pub const PATH2_FULL: Self = Self {
         full_backbone_audit: true,
         calibrate_tier_trims: true,
+        reemit_pass5_backbone: true,
+    };
+    /// Path 2 full audit after Stage B already certified Pass-5 `StarCenter` trims and overrides,
+    /// avoiding post-Stage-C `tier_gain_trim` or `tier_overrides` mutations.
+    pub const PATH2_POST_STAGE_B_CERTIFIED: Self = Self {
+        full_backbone_audit: true,
+        calibrate_tier_trims: false,
+        reemit_pass5_backbone: false,
     };
     /// Path 1 incremental head-only audit preserving existing trims and `StarCenter` outputs.
     pub const PATH1_HEAD_ONLY: Self = Self {
         full_backbone_audit: false,
         calibrate_tier_trims: false,
+        reemit_pass5_backbone: false,
     };
 }
 
@@ -221,13 +232,9 @@ fn eval_tiers_via_vm(
         } else {
             max_t
         };
-        let mut vm = SonaVm::<DefaultMathBackend>::from_view_owned(
-            &view,
-            eff_tier,
-            48_000.0,
-            mono_out && !dual_in,
-        )
-        .map_err(map_stage_err)?;
+        let mut vm =
+            SonaVm::<DefaultMathBackend>::from_view_owned(&view, eff_tier, 48_000.0, false)
+                .map_err(map_stage_err)?;
         let (mut out_l, mut out_r) = (vec![0.0_f32; len], vec![0.0_f32; len]);
         vm.process_block(&in_l, &in_r, &mut out_l, &mut out_r)
             .map_err(map_stage_err)?;
@@ -300,7 +307,7 @@ pub fn finalize_stage_d_and_audit_with_panama_rows(
     let mut tier_lufs = [-120.0_f64; 4];
     let mut tier_esr_db = fallback_esr.unwrap_or([0.0; 4]);
 
-    if audit_opts.full_backbone_audit
+    if audit_opts.reemit_pass5_backbone
         && let Some(wet_slice) = star_wet_lr
         && n_eval > warmup + 8
     {

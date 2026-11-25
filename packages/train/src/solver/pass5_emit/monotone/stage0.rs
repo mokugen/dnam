@@ -22,6 +22,7 @@ pub(super) fn try_stage_0_fp32_w_ro_only(
         target_r,
         warmup,
         config,
+        ..
     } = *eval;
     if model.prefix_override_needed[1..].iter().any(|&v| v) {
         return None;

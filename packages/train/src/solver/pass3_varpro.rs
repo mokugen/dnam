@@ -8,10 +8,20 @@ mod pre_conv_proj;
 mod ro_sweep;
 mod spectral_refine;
 mod stat_and_patch;
+mod tier_gate;
 
 pub use stat_and_patch::{
     WeightedReadoutStem, extract_stat_256d_gram, patch_model_readouts_weighted_cholesky,
 };
+
+/// Optional Pass-3 `VarPro` feature-selection controls (`ref[train.pipeline.nested-varpro-schur]`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Pass3VarProOptions {
+    /// Omit direct-bypass linear columns (`direct_s2_u_gain` and `direct_s2_hp_gain` / `ro_pole_48k`).
+    pub suppress_direct_s2_linear: bool,
+    /// Bitmask over core lanes `0..40` whose post-convolver `w_ro[l][6..12]` columns are omitted.
+    pub suppress_post_core_lane_mask: u64,
+}
 
 use crate::control::stability::MAX_RO_POLE_48K_F64;
 use crate::error::TrainError;
@@ -19,17 +29,16 @@ use crate::linalg::varpro::assemble_ozaki_normal_equations;
 use crate::runner::{ActiveComputeBackend, TrainRunner};
 use crate::wide_gram::hash_gram_input_v3_f32;
 
-use super::model::SonaModelF64;
 use super::model::cascade::downsample_lane_2x_f64;
+use super::model::{SonaModelF64, StereoTrainingPairs};
 use super::pass2_opt::op_t_quad::has_wet_op_t_output;
 use features::{
     TIER_KAUTZ_CAPS, apply_op_t_series_channel_bank, build_pass3_feature_sets, eval_highpass_pole,
-    has_higher_tier_wet_op_t, unpack_weights_into_prefix,
+    has_higher_tier_wet_op_t,
 };
 use ro_sweep::{build_per_tier_rhs, sweep_ro_pole_48k_joint_stereo};
 use spectral_refine::{
-    ChannelSpectralCtx, compute_channel_hf_mse, compute_channel_mse,
-    refine_channel_tier_emr_and_ltas_kkt, solve_bounded_uplo_u,
+    ChannelSpectralCtx, refine_channel_tier_emr_and_ltas_kkt, solve_bounded_uplo_u,
 };
 
 /// Result returned by Pass-3 nested 4-tier `VarPro` readout identification.
@@ -181,12 +190,11 @@ pub(super) struct Pass3InnerOutcome {
 fn run_pass3_varpro_readout_inner(
     runner: &TrainRunner,
     model: &mut SonaModelF64,
-    in_l: &[f64],
-    in_r: &[f64],
-    target_l: &[f64],
-    target_r: &[f64],
+    pairs: &StereoTrainingPairs<'_>,
     w: usize,
+    options: Pass3VarProOptions,
 ) -> Result<(Pass3VarProReport, Pass3InnerOutcome), TrainError> {
+    let (in_l, in_r, target_l, target_r) = (pairs.in_l, pairs.in_r, pairs.target_l, pairs.target_r);
     let n = in_l
         .len()
         .min(in_r.len())
@@ -196,15 +204,13 @@ fn run_pass3_varpro_readout_inner(
 
     model.ro_pole_48k = 0.0;
     model.pre_conv_hp_gain = [0.0, 0.0];
-    let mut fset = build_pass3_feature_sets(
-        runner,
-        model,
-        &in_l[..n],
-        &in_r[..n],
-        &target_l[..n],
-        &target_r[..n],
-        w,
-    )?;
+    let pairs_n = StereoTrainingPairs {
+        in_l: &in_l[..n],
+        in_r: &in_r[..n],
+        target_l: &target_l[..n],
+        target_r: &target_r[..n],
+    };
+    let mut fset = build_pass3_feature_sets(runner, model, &pairs_n, w, options)?;
     let total_dim = fset.dims[3];
     let force_wide192 = matches!(
         runner.active_backend(),
@@ -232,18 +238,29 @@ fn run_pass3_varpro_readout_inner(
     let base_rl: Vec<f64> = base_rl_v.into_iter().map(|v| v[0]).collect();
     let base_rr: Vec<f64> = base_rr_v.into_iter().map(|v| v[0]).collect();
 
-    let sweep =
-        sweep_ro_pole_48k_joint_stereo(model, &fset, &base_gl, &base_rl, &base_gr, &base_rr, w);
-    model.ro_pole_48k = sweep.best_ro.clamp(0.0, MAX_RO_POLE_48K_F64);
-    fset.feats_l_post[m..(2 * m)].copy_from_slice(&sweep.best_hp_l);
-    fset.feats_r_post[m..(2 * m)].copy_from_slice(&sweep.best_hp_r);
+    let (best_gram_l, best_rhs_l, best_gram_r, best_rhs_r) = if options.suppress_direct_s2_linear {
+        model.ro_pole_48k = 0.0;
+        (base_gl, base_rl, base_gr, base_rr)
+    } else {
+        let sweep =
+            sweep_ro_pole_48k_joint_stereo(model, &fset, &base_gl, &base_rl, &base_gr, &base_rr, w);
+        model.ro_pole_48k = sweep.best_ro.clamp(0.0, MAX_RO_POLE_48K_F64);
+        fset.feats_l_post[m..(2 * m)].copy_from_slice(&sweep.best_hp_l);
+        fset.feats_r_post[m..(2 * m)].copy_from_slice(&sweep.best_hp_r);
+        (
+            sweep.best_gram_l,
+            sweep.best_rhs_l,
+            sweep.best_gram_r,
+            sweep.best_rhs_r,
+        )
+    };
 
     let active_k = model.active_kautz_pairs.min(model.kautz.len());
     let rhs_l_tiers = build_per_tier_rhs(
         model,
         &fset.feats_l_post,
         &fset,
-        &sweep.best_rhs_l,
+        &best_rhs_l,
         active_k,
         false,
     );
@@ -251,7 +268,7 @@ fn run_pass3_varpro_readout_inner(
         model,
         &fset.feats_r_post,
         &fset,
-        &sweep.best_rhs_r,
+        &best_rhs_r,
         active_k,
         true,
     );
@@ -315,26 +332,26 @@ fn run_pass3_varpro_readout_inner(
 
     let mut wl_tiers = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
     let mut wr_tiers = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
-    let mut ridge_l_tiers = [1.0e-5_f64; 4];
-    let mut ridge_r_tiers = [1.0e-5_f64; 4];
+    let mut rel_l_tiers = [1.0e-5_f64; 4];
+    let mut rel_r_tiers = [1.0e-5_f64; 4];
     for (ti, &dim_t) in fset.dims.iter().enumerate() {
         if ti < 3
             && let Some(ref ts) = tier_opt_sol[ti]
         {
             wl_tiers[ti] = ts.wl.clone();
             wr_tiers[ti] = ts.wr.clone();
-            ridge_l_tiers[ti] = ts.rl_ridge;
-            ridge_r_tiers[ti] = ts.rr_ridge;
+            rel_l_tiers[ti] = ts.rl_ridge;
+            rel_r_tiers[ti] = ts.rr_ridge;
         } else {
             let (wl, rdl) = solve_bounded_uplo_u(
-                &sweep.best_gram_l,
+                &best_gram_l,
                 &rhs_l_tiers[ti],
                 dim_t,
                 model.ro_pole_48k,
                 model.sample_rate_hz,
             )?;
             let (wr, rdr) = solve_bounded_uplo_u(
-                &sweep.best_gram_r,
+                &best_gram_r,
                 &rhs_r_tiers[ti],
                 dim_t,
                 model.ro_pole_48k,
@@ -342,8 +359,8 @@ fn run_pass3_varpro_readout_inner(
             )?;
             wl_tiers[ti] = wl;
             wr_tiers[ti] = wr;
-            ridge_l_tiers[ti] = rdl;
-            ridge_r_tiers[ti] = rdr;
+            rel_l_tiers[ti] = rdl;
+            rel_r_tiers[ti] = rdr;
         }
     }
 
@@ -374,18 +391,19 @@ fn run_pass3_varpro_readout_inner(
 
     let mut tier_mse = [0.0_f64; 4];
     let mut tier_hf_mse = [0.0_f64; 2];
+    let mut prev_tier_sol: Option<(Vec<f64>, Vec<f64>, f64)> = None;
     for (ti, &dim_t) in fset.dims.iter().enumerate() {
         let (
             wl_init,
             gl_ref,
             rl_ref,
-            rl_ridge,
+            rl_rel,
             fl_ref,
             tl_ref,
             wr_init,
             gr_ref,
             rr_ref,
-            rr_ridge,
+            rr_rel,
             fr_ref,
             tr_ref,
         ) = if ti == 0
@@ -431,15 +449,15 @@ fn run_pass3_varpro_readout_inner(
         } else {
             (
                 &wl_tiers[ti][..],
-                &sweep.best_gram_l[..],
+                &best_gram_l[..],
                 &rhs_l_tiers[ti][..],
-                ridge_l_tiers[ti],
+                rel_l_tiers[ti],
                 &fset.feats_l_post[..],
                 fset.tier_tgts_l(ti),
                 &wr_tiers[ti][..],
-                &sweep.best_gram_r[..],
+                &best_gram_r[..],
                 &rhs_r_tiers[ti][..],
-                ridge_r_tiers[ti],
+                rel_r_tiers[ti],
                 &fset.feats_r_post[..],
                 fset.tier_tgts_r(ti),
             )
@@ -457,7 +475,7 @@ fn run_pass3_varpro_readout_inner(
                 ro_pole_48k: model.ro_pole_48k,
                 active_fir_taps: fset.active_fir_taps,
                 emit_prefix_overrides,
-                used_ridge: rl_ridge,
+                used_rel: rl_rel,
             },
         );
         let wr_refined = refine_channel_tier_emr_and_ltas_kkt(
@@ -473,38 +491,36 @@ fn run_pass3_varpro_readout_inner(
                 ro_pole_48k: model.ro_pole_48k,
                 active_fir_taps: fset.active_fir_taps,
                 emit_prefix_overrides,
-                used_ridge: rr_ridge,
+                used_rel: rr_rel,
             },
         );
-        tier_mse[ti] = 0.5
-            * (compute_channel_mse(&wl_refined, fl_ref, tl_ref, dim_t)
-                + compute_channel_mse(&wr_refined, fr_ref, tr_ref, dim_t));
-        if ti <= 1 {
-            tier_hf_mse[ti] = 0.5
-                * (compute_channel_hf_mse(&wl_refined, fl_ref, tl_ref, dim_t)
-                    + compute_channel_hf_mse(&wr_refined, fr_ref, tr_ref, dim_t));
-        }
-
-        let pfx = unpack_weights_into_prefix(
-            &wl_refined,
-            &wr_refined,
-            fset.active_fir_taps,
-            fset.pc_gain,
-            ti,
+        let same_basis = ti >= 1
+            && (ti >= 2 || lite_1x_sol.is_none())
+            && tier_opt_sol[ti - 1].is_none()
+            && (ti == 3 || tier_opt_sol[ti].is_none())
+            && active_k <= TIER_KAUTZ_CAPS[ti - 1];
+        tier_gate::commit_tier_with_inheritance(
             model,
+            tier_gate::TierCommitCtx {
+                ti,
+                dim_t,
+                active_fir_taps: fset.active_fir_taps,
+                pc_gain: fset.pc_gain,
+                emit_prefix_overrides,
+                same_basis,
+                fl_ref,
+                tl_ref,
+                fr_ref,
+                tr_ref,
+            },
+            wl_refined,
+            wr_refined,
+            tier_gate::TierCommitState {
+                prev_sol: &mut prev_tier_sol,
+                tier_mse: &mut tier_mse[ti],
+                tier_hf_mse: &mut tier_hf_mse,
+            },
         );
-        if ti == 3 {
-            model.direct_s2_u_gain = pfx.direct_s2_u_gain;
-            model.direct_s2_hp_gain = pfx.direct_s2_hp_gain;
-            model.pre_conv_u_gain = pfx.pre_conv_u_gain;
-            model.pre_conv_hp_gain = pfx.pre_conv_hp_gain;
-            for l in 0..40 {
-                model.w_ro[l][6..12].copy_from_slice(&pfx.w_ro[l][6..12]);
-            }
-            model.fir_l = pfx.fir_l;
-            model.fir_r = pfx.fir_r;
-        }
-        model.tier_overrides[ti] = Some(Box::new(pfx));
     }
 
     let mut feats_row_major = vec![0.0_f32; m * total_dim];
@@ -538,24 +554,22 @@ fn run_pass3_varpro_readout_inner(
 pub(super) fn run_pass3_varpro_readout_with_os2x_fallback(
     runner: &TrainRunner,
     model: &mut SonaModelF64,
-    in_l: &[f64],
-    in_r: &[f64],
-    target_l: &[f64],
-    target_r: &[f64],
+    pairs: &StereoTrainingPairs<'_>,
     w: usize,
+    options: Pass3VarProOptions,
 ) -> Result<(Pass3VarProReport, Pass3InnerOutcome), TrainError> {
-    let n = in_l
+    let n = pairs
+        .in_l
         .len()
-        .min(in_r.len())
-        .min(target_l.len())
-        .min(target_r.len());
+        .min(pairs.in_r.len())
+        .min(pairs.target_l.len())
+        .min(pairs.target_r.len());
     let m = n - w;
-    let (report_2x, outcome_2x) =
-        run_pass3_varpro_readout_inner(runner, model, in_l, in_r, target_l, target_r, w)?;
+    let (report_2x, outcome_2x) = run_pass3_varpro_readout_inner(runner, model, pairs, w, options)?;
     let inv_cnt = 1.0 / (m as f64);
     let tgt_var = 0.5
-        * (target_l[w..n].iter().map(|&v| v * v).sum::<f64>()
-            + target_r[w..n].iter().map(|&v| v * v).sum::<f64>())
+        * (pairs.target_l[w..n].iter().map(|&v| v * v).sum::<f64>()
+            + pairs.target_r[w..n].iter().map(|&v| v * v).sum::<f64>())
         * inv_cnt;
     let eps_floor = (1.0e-7 * tgt_var).max(1.0e-12);
     if model.oversample_upper_tiers_2x
@@ -566,9 +580,59 @@ pub(super) fn run_pass3_varpro_readout_with_os2x_fallback(
     {
         model.oversample_upper_tiers_2x = false;
         model.tier_overrides = [None, None, None, None];
-        return run_pass3_varpro_readout_inner(runner, model, in_l, in_r, target_l, target_r, w);
+        return run_pass3_varpro_readout_inner(runner, model, pairs, w, options);
     }
     Ok((report_2x, outcome_2x))
+}
+
+/// Variant of [`run_pass3_varpro_readout`] parameterized by [`Pass3VarProOptions`].
+pub fn run_pass3_varpro_readout_with_options(
+    runner: &TrainRunner,
+    model: &mut SonaModelF64,
+    pairs: &StereoTrainingPairs<'_>,
+    warmup: usize,
+    options: Pass3VarProOptions,
+) -> Result<Pass3VarProReport, TrainError> {
+    let n = pairs
+        .in_l
+        .len()
+        .min(pairs.in_r.len())
+        .min(pairs.target_l.len())
+        .min(pairs.target_r.len());
+    let w = warmup.min(n / 4);
+    let m = n - w;
+    if m < 32 {
+        return Err(TrainError::InvalidDimensions {
+            context: "run_pass3_varpro_readout",
+            expected: 32,
+            actual: m,
+        });
+    }
+
+    let pairs_n = StereoTrainingPairs {
+        in_l: &pairs.in_l[..n],
+        in_r: &pairs.in_r[..n],
+        target_l: &pairs.target_l[..n],
+        target_r: &pairs.target_r[..n],
+    };
+    let (report, outcome) =
+        run_pass3_varpro_readout_with_os2x_fallback(runner, model, &pairs_n, w, options)?;
+    if options.suppress_direct_s2_linear || options.suppress_post_core_lane_mask != 0 {
+        return Ok(report);
+    }
+    pre_conv_proj::maybe_refine_with_pre_conv_projection(
+        runner,
+        model,
+        StereoVarProPairs {
+            in_l: pairs_n.in_l,
+            in_r: pairs_n.in_r,
+            target_l: pairs_n.target_l,
+            target_r: pairs_n.target_r,
+        },
+        w,
+        report,
+        outcome,
+    )
 }
 
 /// Runs Pass-3 joint 4-tier causally nested `VarPro` readout identification across `Lite..Ultra`
@@ -583,42 +647,17 @@ pub fn run_pass3_varpro_readout(
     target_r: &[f64],
     warmup: usize,
 ) -> Result<Pass3VarProReport, TrainError> {
-    let n = in_l
-        .len()
-        .min(in_r.len())
-        .min(target_l.len())
-        .min(target_r.len());
-    let w = warmup.min(n / 4);
-    let m = n - w;
-    if m < 32 {
-        return Err(TrainError::InvalidDimensions {
-            context: "run_pass3_varpro_readout",
-            expected: 32,
-            actual: m,
-        });
-    }
-
-    let (report, outcome) = run_pass3_varpro_readout_with_os2x_fallback(
+    run_pass3_varpro_readout_with_options(
         runner,
         model,
-        &in_l[..n],
-        &in_r[..n],
-        &target_l[..n],
-        &target_r[..n],
-        w,
-    )?;
-    pre_conv_proj::maybe_refine_with_pre_conv_projection(
-        runner,
-        model,
-        StereoVarProPairs {
-            in_l: &in_l[..n],
-            in_r: &in_r[..n],
-            target_l: &target_l[..n],
-            target_r: &target_r[..n],
+        &StereoTrainingPairs {
+            in_l,
+            in_r,
+            target_l,
+            target_r,
         },
-        w,
-        report,
-        outcome,
+        warmup,
+        Pass3VarProOptions::default(),
     )
 }
 

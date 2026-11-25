@@ -230,7 +230,16 @@ pub(super) fn maybe_refine_with_pre_conv_projection(
     cand.tier_overrides = [None, None, None, None];
     cand.prefix_override_needed = [false; 4];
     let (cand_report, cand_outcome) = run_pass3_varpro_readout_with_os2x_fallback(
-        runner, &mut cand, in_l, in_r, target_l, target_r, w,
+        runner,
+        &mut cand,
+        &super::super::model::StereoTrainingPairs {
+            in_l,
+            in_r,
+            target_l,
+            target_r,
+        },
+        w,
+        super::Pass3VarProOptions::default(),
     )?;
 
     if cand_outcome.ultra_mse < cur_outcome.ultra_mse * 0.90
@@ -332,11 +341,14 @@ mod tests {
         let base_rep = run_pass3_varpro_readout_with_os2x_fallback(
             &runner,
             &mut baseline,
-            &in_l,
-            &in_r,
-            &tgt_l,
-            &tgt_r,
+            &crate::solver::model::StereoTrainingPairs {
+                in_l: &in_l,
+                in_r: &in_r,
+                target_l: &tgt_l,
+                target_r: &tgt_r,
+            },
             w,
+            crate::Pass3VarProOptions::default(),
         )
         .unwrap()
         .0;

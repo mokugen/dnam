@@ -2,9 +2,17 @@
 //! `LTAS` KKT refinement, and MSE-guarded Gram coordinate snapping for Pass-3 `VarPro`
 //! (`ref[train.pipeline.nested-varpro-schur]`, `ref[qual.tiers.floors-not-stopping-criteria]`).
 
+mod ridge_solve;
+
+use ridge_solve::{
+    MAX_CANDIDATE_ABS_BEFORE_SNAP, MIN_RIDGE_ABS_FLOOR, build_scale_invariant_diag_ridge,
+    within_6db_and_bounds,
+};
+pub(super) use ridge_solve::{
+    compute_channel_hf_mse, compute_channel_mse, solve_bounded_uplo_u, solve_diag_ridge_uplo_u,
+};
+
 use crate::control::clamp::{MAX_GAIN_6DB_LIN, evaluate_readout_spectral_magnitudes};
-use crate::error::TrainError;
-use crate::linalg::cholesky::solve_uplo_u_cholesky;
 use crate::linalg::spectral_kkt::{
     EmrMmConfig, EmrSpectralProblem, LtasKktConfig, solve_emr_mm_cholesky, solve_ltas_newton_kkt,
 };
@@ -19,13 +27,18 @@ use super::gram_snap::{
 /// Canonical per-tier 33-band LTAS max tilt limits `[Lite, Full, Pro, Ultra]` in dB
 /// (`ref[qual.tiers.floors-not-stopping-criteria]`).
 const TIER_LTAS_TILT_BUDGET_DB: [f64; 4] = [0.75, 0.35, 0.15, 0.10];
+/// Aspiration per-tier 33-band LTAS KKT polish targets so higher tiers actively polish residual
+/// HF ridge droop instead of stopping at hard floors (`ref[qual.tiers.floors-not-stopping-criteria]`).
+const TIER_LTAS_POLISH_TARGET_DB: [f64; 4] = [0.20, 0.05, 0.03, 0.02];
 
-/// Safe pre-snap magnitude ceiling leaving headroom inside the `[-8.0, +8.0]` readout wire range.
-const MAX_READOUT_ABS_BEFORE_SNAP: f64 = 7.5;
-const MAX_CANDIDATE_ABS_BEFORE_SNAP: f64 = 7.8;
-/// Maximum BIBO l1 gain norm across linear readout + FIR columns (`ref[train.audit.phase2.clamp-rail]`).
-const MAX_READOUT_L1_NORM: f64 = 48.0;
-const _: () = assert!(MAX_READOUT_L1_NORM > 0.0 && MAX_READOUT_L1_NORM < 100.0);
+const _: () = assert!(
+    TIER_LTAS_POLISH_TARGET_DB[0] > TIER_LTAS_POLISH_TARGET_DB[1]
+        && TIER_LTAS_POLISH_TARGET_DB[1] > TIER_LTAS_POLISH_TARGET_DB[2]
+        && TIER_LTAS_POLISH_TARGET_DB[2] > TIER_LTAS_POLISH_TARGET_DB[3]
+        && TIER_LTAS_POLISH_TARGET_DB[3] > 0.0
+        && TIER_LTAS_POLISH_TARGET_DB[0] < TIER_LTAS_TILT_BUDGET_DB[0]
+        && TIER_LTAS_POLISH_TARGET_DB[3] < TIER_LTAS_TILT_BUDGET_DB[3]
+);
 
 pub(super) struct ChannelSpectralCtx<'a> {
     pub gram: &'a [f64],
@@ -36,144 +49,12 @@ pub(super) struct ChannelSpectralCtx<'a> {
     pub ro_pole_48k: f64,
     pub active_fir_taps: usize,
     pub emit_prefix_overrides: bool,
-    pub used_ridge: f64,
-}
-
-/// Evaluates mean-squared error across `tgts_post` for one channel weight vector of length `dim`.
-pub(super) fn compute_channel_mse(
-    weights: &[f64],
-    feats_post: &[f32],
-    tgts_post: &[f32],
-    dim: usize,
-) -> f64 {
-    let n = tgts_post.len();
-    let m = n.max(1);
-    let mut sq = 0.0_f64;
-    for (t, &tgt) in tgts_post.iter().enumerate() {
-        let mut pred = 0.0_f64;
-        for (c, &wc) in weights.iter().enumerate().take(dim) {
-            pred += wc * f64::from(feats_post[c * n + t]);
-        }
-        let d = f64::from(tgt) - pred;
-        sq += d * d;
-    }
-    sq / (m as f64)
-}
-
-/// Evaluates first-difference high-frequency error MSE `mean((e[t] - e[t-1])^2)` across
-/// `tgts_post` for comparing `1x` Lite vs `2x` Full high-frequency fidelity.
-pub(super) fn compute_channel_hf_mse(
-    weights: &[f64],
-    feats_post: &[f32],
-    tgts_post: &[f32],
-    dim: usize,
-) -> f64 {
-    let n = tgts_post.len();
-    if n < 2 {
-        return 0.0;
-    }
-    let mut prev_err = 0.0_f64;
-    let mut sq = 0.0_f64;
-    for (t, &tgt) in tgts_post.iter().enumerate() {
-        let mut pred = 0.0_f64;
-        for (c, &wc) in weights.iter().enumerate().take(dim) {
-            pred += wc * f64::from(feats_post[c * n + t]);
-        }
-        let err = f64::from(tgt) - pred;
-        if t > 0 {
-            let de = err - prev_err;
-            sq += de * de;
-        }
-        prev_err = err;
-    }
-    sq / ((n - 1) as f64)
-}
-
-/// Computes trace-scaled Cholesky regularization `(rel * mean_diag).max(1e-5)` over `dim` columns.
-pub(super) fn trace_scaled_ridge(gram: &[f64], dim: usize, rel: f64) -> f64 {
-    let mut trace = 0.0_f64;
-    for j in 0..dim {
-        trace += gram[uplo_u_index(j, j)].max(0.0);
-    }
-    let mean_diag = (trace / (dim.max(1) as f64)).max(1.0e-12);
-    (rel * mean_diag).max(1.0e-5)
-}
-
-/// Checks wire amplitude & `+6 dB` readout spectral ceiling (`[MAX_GAIN_6DB_LIN]`).
-#[inline]
-pub(super) fn within_6db_and_bounds(
-    weights: &[f64],
-    ro_pole_48k: f64,
-    sr_hz: f64,
-    max_abs_bound: f64,
-) -> bool {
-    if weights.len() < 2
-        || weights
-            .iter()
-            .any(|&v| !v.is_finite() || v.abs() > max_abs_bound)
-    {
-        return false;
-    }
-    let l1_norm: f64 = weights.iter().map(|v| v.abs()).sum();
-    if !l1_norm.is_finite() || l1_norm > MAX_READOUT_L1_NORM {
-        return false;
-    }
-    let mags =
-        evaluate_readout_spectral_magnitudes(&[weights[0], weights[1]], ro_pole_48k, sr_hz, 16);
-    mags.iter().all(|&v| v.is_finite() && v <= MAX_GAIN_6DB_LIN)
-}
-
-/// Solves a prefix sub-system `(gram[..packed(dim)], rhs[..dim])` with escalating trace-scaled
-/// ridge `[1e-5 .. 1e4] * mean_diag` until weights remain well-conditioned inside `[-7.5, +7.5]`,
-/// respect the BIBO `l1` norm ceiling, and respect the `+6 dB` head-gain limit.
-pub(super) fn solve_bounded_uplo_u(
-    gram: &[f64],
-    rhs: &[f64],
-    dim: usize,
-    ro_pole_48k: f64,
-    sr_hz: f64,
-) -> Result<(Vec<f64>, f64), TrainError> {
-    let packed = uplo_u_packed_len(dim);
-    let g_sub = &gram[..packed];
-    let r_sub = &rhs[..dim];
-    let mut last_sol = vec![0.0_f64; dim];
-    let mut last_ridge = trace_scaled_ridge(g_sub, dim, 1.0e-5);
-
-    for &rel in &[
-        1.0e-5_f64, 1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1.0, 10.0, 100.0, 1.0e3, 1.0e4,
-    ] {
-        let ridge = trace_scaled_ridge(g_sub, dim, rel);
-        if let Ok(sol) = solve_uplo_u_cholesky(g_sub, r_sub, ridge) {
-            last_ridge = ridge;
-            last_sol = sol;
-            if within_6db_and_bounds(&last_sol, ro_pole_48k, sr_hz, MAX_READOUT_ABS_BEFORE_SNAP) {
-                return Ok((last_sol, ridge));
-            }
-        }
-    }
-
-    let mut max_abs = 0.0_f64;
-    let mut l1_norm = 0.0_f64;
-    for v in &mut last_sol {
-        if !v.is_finite() {
-            *v = 0.0;
-        } else {
-            let av = v.abs();
-            max_abs = max_abs.max(av);
-            l1_norm += av;
-        }
-    }
-    let scale = (MAX_READOUT_ABS_BEFORE_SNAP / max_abs.max(1.0e-12))
-        .min(MAX_READOUT_L1_NORM / l1_norm.max(1.0e-12))
-        .min(1.0);
-    for v in &mut last_sol {
-        *v *= scale;
-    }
-    Ok((last_sol, last_ridge))
+    pub used_rel: f64,
 }
 
 struct KktResnapCtx<'a> {
     ctx: &'a ChannelSpectralCtx<'a>,
+    scalar_ridge: f64,
     tier_idx: usize,
     dim: usize,
     n_act: usize,
@@ -216,7 +97,7 @@ fn try_damped_kkt_resnap(
     snap_tilt: f64,
     fallback_tilt: f64,
 ) -> Option<Vec<f64>> {
-    let ridge = p.ctx.used_ridge.max(1.0e-5);
+    let ridge = p.scalar_ridge.max(MIN_RIDGE_ABS_FLOOR);
     let target_tilt = (TIER_LTAS_TILT_BUDGET_DB[p.tier_idx] * 0.85).max(0.05);
     let kkt2 = solve_ltas_newton_kkt(
         p.dim,
@@ -288,17 +169,29 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
     let mut tgt_im_all = vec![0.0_f64; n_bands];
     let mut band_rows_all = vec![0.0_f64; n_bands * dim];
     let mut band_amps_all = vec![0.0_f64; n_bands];
+    let mut basis_amps_all = vec![0.0_f64; n_bands];
+    let hann_denom = dft_len.saturating_sub(1).max(1) as f64;
+    let hann_win: Vec<f64> = (0..dft_len)
+        .map(|t| {
+            if dft_len > 1 {
+                0.5 * (1.0 - (core::f64::consts::TAU * (t as f64) / hann_denom).cos())
+            } else {
+                1.0
+            }
+        })
+        .collect();
 
     for (b, &fc_hz) in centers.iter().enumerate() {
         let omega = core::f64::consts::TAU * fc_hz / ctx.sr_hz.max(8_000.0);
         let (mut yr, mut yi) = (0.0_f64, 0.0_f64);
         for t in 0..dft_len {
+            let win_t = hann_win[t];
             let (s, c) = (omega * (t as f64)).sin_cos();
-            let yt = f64::from(ctx.tgts_post[t]);
+            let yt = win_t * f64::from(ctx.tgts_post[t]);
             yr += yt * c;
             yi -= yt * s;
             for col in 0..dim {
-                let fv = f64::from(ctx.feats_post[col * m + t]);
+                let fv = win_t * f64::from(ctx.feats_post[col * m + t]);
                 basis_re_all[b * dim + col] += fv * c;
                 basis_im_all[b * dim + col] -= fv * s;
             }
@@ -312,19 +205,30 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
         } else {
             (1.0, 0.0)
         };
+        let mut basis_sq = 0.0_f64;
         for col in 0..dim {
-            band_rows_all[b * dim + col] =
-                ur * basis_re_all[b * dim + col] + ui * basis_im_all[b * dim + col];
+            let br = basis_re_all[b * dim + col];
+            let bi = basis_im_all[b * dim + col];
+            basis_sq += br * br + bi * bi;
+            band_rows_all[b * dim + col] = ur * br + ui * bi;
         }
+        basis_amps_all[b] = basis_sq.sqrt();
     }
 
     let max_band_amp = band_amps_all.iter().copied().fold(0.0_f64, f64::max);
+    let max_basis_amp = basis_amps_all.iter().copied().fold(0.0_f64, f64::max);
     let passband_floor = (1.0e-2 * max_band_amp).max(1.0e-6);
     let active_indices: Vec<usize> = (0..n_bands)
         .filter(|&b| band_amps_all[b] >= passband_floor)
         .collect();
+    // Only treat an unenergetic output band as a true stopband if the input basis had energy there
+    // (otherwise Schoukens-Pintelon Law 0.C mains-hum masked bins are misread as stopbands).
     let stop_indices: Vec<usize> = (0..n_bands)
-        .filter(|&b| band_amps_all[b] < passband_floor)
+        .filter(|&b| {
+            band_amps_all[b] < passband_floor
+                && max_basis_amp > 1.0e-6
+                && basis_amps_all[b] >= 0.05 * max_basis_amp
+        })
         .collect();
 
     let n_act = active_indices.len();
@@ -403,7 +307,8 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
             let cand_mse = compute_channel_mse(&cand, ctx.feats_post, ctx.tgts_post, dim);
             let cand_tilt = eval_max_tilt_db(&cand);
             let cand_stop_pwr = eval_stopband_power(&cand);
-            let tilt_ok = active_indices.is_empty() || cand_tilt <= best_tilt + 0.5;
+            let tilt_ok = active_indices.is_empty()
+                || cand_tilt <= best_tilt.max(TIER_LTAS_TILT_BUDGET_DB[tier_idx]) + 0.05;
             if cand_stop_pwr < best_stop_pwr && cand_mse <= best_mse * 1.15 + 1.0e-12 && tilt_ok {
                 best_w = cand;
                 best_mse = cand_mse;
@@ -412,6 +317,8 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
             }
         }
     }
+
+    let (lambda_diag, scalar_ridge) = build_scale_invariant_diag_ridge(gram_sub, dim, ctx.used_rel);
 
     if n_act >= 2
         && let Ok(emr) = solve_emr_mm_cholesky(
@@ -425,7 +332,7 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
                 target_im: &act_tgt_im,
             },
             EmrMmConfig {
-                ridge: ctx.used_ridge.clamp(1.0e-8, 1.0e-2),
+                ridge: scalar_ridge.clamp(1.0e-8, 1.0e-2),
                 ..EmrMmConfig::default()
             },
         )
@@ -443,8 +350,10 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
         }
     }
 
+    let kkt_target = TIER_LTAS_POLISH_TARGET_DB[tier_idx];
+    let over_budget = best_tilt > TIER_LTAS_TILT_BUDGET_DB[tier_idx];
     if n_act >= 2
-        && best_tilt > TIER_LTAS_TILT_BUDGET_DB[tier_idx]
+        && best_tilt > kkt_target
         && let Ok(kkt) = solve_ltas_newton_kkt(
             dim,
             n_act,
@@ -453,9 +362,13 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
             &act_rows,
             &act_amps,
             LtasKktConfig {
-                ridge: ctx.used_ridge.max(1.0e-5),
+                ridge: scalar_ridge.max(MIN_RIDGE_ABS_FLOOR),
                 max_outer_iters: 8,
-                max_tilt_db: TIER_LTAS_TILT_BUDGET_DB[tier_idx],
+                max_tilt_db: if over_budget {
+                    TIER_LTAS_TILT_BUDGET_DB[tier_idx]
+                } else {
+                    kkt_target
+                },
                 penalty_rho: 2.0,
             },
         )
@@ -465,7 +378,12 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
         let kkt_tilt = eval_max_tilt_db(&kkt.weights);
         let kkt_stop_pwr = eval_stopband_power(&kkt.weights);
         let stop_ok = stop_indices.is_empty() || kkt_stop_pwr <= best_stop_pwr * 1.05 + 1.0e-12;
-        if kkt_mse <= best_mse * 1.5 && kkt_tilt < best_tilt && stop_ok {
+        let mse_limit = if over_budget {
+            best_mse * 1.5
+        } else {
+            best_mse * 1.08 + 1.0e-12
+        };
+        if kkt_mse <= mse_limit && kkt_tilt < best_tilt && stop_ok {
             best_w = kkt.weights;
             best_mse = kkt_mse;
             best_tilt = kkt_tilt;
@@ -504,9 +422,12 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
         }
     }
 
-    let lambda_diag = vec![ctx.used_ridge.max(1.0e-5); dim];
     let snapped = snap_weights_gram_coordinate(&best_w, gram_sub, &lambda_diag, &col_specs);
-    let tilt_budget = best_tilt.max(TIER_LTAS_TILT_BUDGET_DB[tier_idx]) + 0.05;
+    let tilt_budget = if best_tilt <= TIER_LTAS_TILT_BUDGET_DB[tier_idx] {
+        (best_tilt + 0.05).min(TIER_LTAS_TILT_BUDGET_DB[tier_idx])
+    } else {
+        best_tilt + 0.05
+    };
     if snapped.iter().all(|v| v.is_finite()) && (!base_within_6db || within_6db(&snapped)) {
         let snap_mse = compute_channel_mse(&snapped, ctx.feats_post, ctx.tgts_post, dim);
         let fallback_mse = compute_channel_mse(&fallback, ctx.feats_post, ctx.tgts_post, dim);
@@ -521,6 +442,7 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
             let fallback_tilt = eval_max_tilt_db(&fallback);
             let resnap_ctx = KktResnapCtx {
                 ctx,
+                scalar_ridge,
                 tier_idx,
                 dim,
                 n_act,
@@ -598,7 +520,7 @@ mod tests {
             ro_pole_48k: 0.0,
             active_fir_taps: 128,
             emit_prefix_overrides: true,
-            used_ridge: 1.0e-5,
+            used_rel: 1.0e-5,
         };
         let refined = refine_channel_tier_emr_and_ltas_kkt(&skewed, dim, 3, &ctx);
         assert_eq!(refined.len(), dim);
@@ -615,6 +537,7 @@ mod tests {
         let act_amps = vec![1.0_f64; 2];
         let mut p_test = KktResnapCtx {
             ctx: &ctx,
+            scalar_ridge: 1.0e-5,
             tier_idx: 3,
             dim,
             n_act: 2,
@@ -641,50 +564,5 @@ mod tests {
         p_test.best_mse = 1.0;
         p_test.rhs_sub = &rhs_nan;
         assert!(try_damped_kkt_resnap(&p_test, 5.0, 5.0).is_none());
-    }
-
-    #[test]
-    fn test_solve_bounded_uplo_u_enforces_l1_norm_and_bibo_uniform_scaling() {
-        let dim = 32_usize;
-        let sr = 48_000.0_f64;
-        let mut gram = vec![0.0_f64; uplo_u_packed_len(dim)];
-        let mut rhs = vec![0.0_f64; dim];
-        // Collinear features whose unregularized inverse produces huge +/- coefficients.
-        for t in 0..64 {
-            let base = ((t as f64) * 0.13).sin();
-            let row: Vec<f64> = (0..dim)
-                .map(|c| base + 1.0e-3 * (((t * 7 + c * 3) % 11) as f64 - 5.0))
-                .collect();
-            let tgt = 0.4 * base + 2.0 * (((t % 2) as f64) - 0.5);
-            for c in 0..dim {
-                rhs[c] += row[c] * tgt;
-                for r in 0..=c {
-                    gram[uplo_u_index(r, c)] += row[r] * row[c];
-                }
-            }
-        }
-        let (sol, _) = solve_bounded_uplo_u(&gram, &rhs, dim, 0.0, sr).unwrap();
-        let l1: f64 = sol.iter().map(|v| v.abs()).sum();
-        assert!(
-            within_6db_and_bounds(&sol, 0.0, sr, MAX_READOUT_ABS_BEFORE_SNAP),
-            "collinear solve must satisfy BIBO bounds: l1={l1}"
-        );
-        assert!(l1 <= MAX_READOUT_L1_NORM + 1.0e-9);
-
-        // Extreme RHS forcing uniform scaling fallback preserves finite l1 <= MAX_READOUT_L1_NORM.
-        let tiny_gram: Vec<f64> = (0..dim)
-            .flat_map(|c| (0..=c).map(move |r| if r == c { 1.0e-6 } else { 0.0 }))
-            .collect();
-        let huge_rhs: Vec<f64> = (0..dim)
-            .map(|c| if c % 2 == 0 { 10.0 } else { -10.0 })
-            .collect();
-        let (fallback_sol, _) = solve_bounded_uplo_u(&tiny_gram, &huge_rhs, dim, 0.0, sr).unwrap();
-        let fb_l1: f64 = fallback_sol.iter().map(|v| v.abs()).sum();
-        assert!(
-            fallback_sol
-                .iter()
-                .all(|v| v.is_finite() && v.abs() <= MAX_READOUT_ABS_BEFORE_SNAP + 1.0e-9)
-        );
-        assert!(fb_l1 <= MAX_READOUT_L1_NORM + 1.0e-9, "fb_l1={fb_l1}");
     }
 }

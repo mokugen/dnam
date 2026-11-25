@@ -6,7 +6,7 @@ use dnam_vm::Tier;
 use dnam_vm::bin::{DnamBinView, strip_dnam_bin_to_tier};
 
 use crate::error::TrainError;
-use crate::losses::TierCertificationReport;
+use crate::losses::{DrySilentGapMask, TierCertificationReport};
 
 use super::super::super::model::{
     NUM_FIR_TAPS_ULTRA, NUM_KAUTZ_PAIRS_ULTRA, SonaModelF64, TierReadoutPrefixF64,
@@ -31,6 +31,7 @@ pub(in crate::solver::pass5_emit) struct MonotoneEvalCtx<'a> {
     pub target_l: &'a [f64],
     pub target_r: &'a [f64],
     pub warmup: usize,
+    pub gap_masks: &'a [DrySilentGapMask; 2],
     pub config: Pass5EmitConfig,
 }
 
@@ -407,12 +408,22 @@ pub(super) fn re_eval(
     let final_bin = encode_model_to_dnam_bin(model, config)?;
     let _ = DnamBinView::parse(&final_bin)?;
     let final_bundle = render_all_tiers(&final_bin, in_l, in_r, sr_f32)?;
+    let n = in_l
+        .len()
+        .min(in_r.len())
+        .min(target_l.len())
+        .min(target_r.len());
+    let gap_masks = [
+        DrySilentGapMask::detect(&in_l[..n], &target_l[..n], warmup, model.sample_rate_hz),
+        DrySilentGapMask::detect(&in_r[..n], &target_r[..n], warmup, model.sample_rate_hz),
+    ];
     let cert = certify_all_tier_renders_stereo(
         &final_bundle.renders,
         target_l,
         target_r,
         model.sample_rate_hz,
         warmup,
+        Some(&gap_masks),
     )?;
     Ok((final_bin, final_bundle, cert))
 }
@@ -497,6 +508,7 @@ pub(super) fn re_eval_dirty(
         target_l,
         target_r,
         warmup,
+        gap_masks,
         config,
     } = *eval;
     let sr_f64 = model.sample_rate_hz;
@@ -545,8 +557,15 @@ pub(super) fn re_eval_dirty(
             continue;
         }
         let (_, render) = render_single_tier(&final_bin, TIERS[k], &in_l32, &in_r32, sr_f32)?;
-        let (lufs, worst, rep_l, rep_r) =
-            certify_single_tier_stereo(TIERS[k], &render, target_l, target_r, sr_f64, warmup)?;
+        let (lufs, worst, rep_l, rep_r) = certify_single_tier_stereo(
+            TIERS[k],
+            &render,
+            target_l,
+            target_r,
+            sr_f64,
+            warmup,
+            Some(gap_masks),
+        )?;
         cert.tier_lufs[k] = lufs;
         cert.tier_reports[k] = worst;
         cert.rep_l[k] = rep_l;
@@ -625,12 +644,14 @@ mod tests {
         }
         materialize_tier_overrides(&mut base);
         let cfg = Pass5EmitConfig::default();
+        let gap_masks = [DrySilentGapMask::default(), DrySilentGapMask::default()];
         let eval = MonotoneEvalCtx {
             in_l: &in_l,
             in_r: &in_r,
             target_l: &tgt_l,
             target_r: &tgt_r,
             warmup: 64,
+            gap_masks: &gap_masks,
             config: cfg,
         };
         let (init_bin, init_bdl, init_cert) =

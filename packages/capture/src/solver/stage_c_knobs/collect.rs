@@ -57,11 +57,12 @@ pub(super) fn collect_stage_c_points(
     } else {
         active_frames_hint.min(avail)
     };
-    let n_fit = if n_active >= 48_000 {
+    let n_fit_static = if n_active >= 48_000 {
         4_096
     } else {
         2_048.min(n_active)
     };
+    let n_fit_sweep = 2_048.min(n_active);
 
     let mut observed_points = Vec::new();
     let mut pending = Vec::new();
@@ -106,7 +107,7 @@ pub(super) fn collect_stage_c_points(
                 &SweepStemInputs {
                     dry_lr,
                     wet_lr: &wet_lr,
-                    n_fit,
+                    n_fit: n_fit_sweep,
                     n_active,
                     windows: &stmc_view.windows,
                     base_meta_ctrls: &base_meta_ctrls,
@@ -116,11 +117,24 @@ pub(super) fn collect_stage_c_points(
             )
         {
             for win in extracted {
+                let win_dry = &dry_lr[win.start_frame..win.start_frame + n_fit_sweep];
+                let dry_msq = win_dry
+                    .iter()
+                    .map(|&[l, r]| {
+                        let lf = f64::from(l);
+                        let rf = f64::from(r);
+                        0.5 * (lf * lf + rf * rf)
+                    })
+                    .sum::<f64>()
+                    / (n_fit_sweep.max(1) as f64);
+                if dry_msq.sqrt() <= 1.0e-5 {
+                    continue;
+                }
                 observed_points.push(win.phys_controls.clone());
-                let wet_slice = wet_lr[win.start_frame..win.start_frame + n_fit].to_vec();
+                let wet_slice = wet_lr[win.start_frame..win.start_frame + n_fit_sweep].to_vec();
                 pending.push(PendingPoint {
                     dry_off: win.start_frame,
-                    len: n_fit,
+                    len: n_fit_sweep,
                     wet_lr: wet_slice,
                     phys_controls: win.phys_controls,
                 });
@@ -144,7 +158,7 @@ pub(super) fn collect_stage_c_points(
                     phys_controls: base_meta_ctrls,
                 });
             } else {
-                let len = wet_lr.len().min(n_fit).min(dry_lr.len());
+                let len = wet_lr.len().min(n_fit_static).min(dry_lr.len());
                 let wet_slice = wet_lr[..len].to_vec();
                 pending.push(PendingPoint {
                     dry_off: 0,

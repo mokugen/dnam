@@ -6,10 +6,132 @@ use dnam_vm::Tier;
 use crate::error::TrainError;
 
 use super::bezout::{
-    compute_besr_channel, compute_seg_esr_channel_db, evaluate_noise_qualified_besr,
+    compute_besr_channel, compute_seg_esr_channel_db_with_gaps, evaluate_noise_qualified_besr,
 };
 use super::ltas::{Welch33TargetCache, compute_ltas_channel};
-use super::mr_iir::{MrIirTargetCache, compute_mr_iir_channel};
+use super::mr_iir::{MrIirTargetCache, compute_mr_iir_channel_with_gaps};
+
+/// Schroeder `T60` (`-60 dB`) amplitude completion threshold $10^{-60/20} = 10^{-3}$ relative to
+/// active target RMS used to detect dead-silent post-decay interiors inside dry-silent gaps.
+pub const POST_T60_GAP_AMP_RATIO: f64 = 1.0 / 1_000.0;
+
+/// Minimum contiguous dry-silence duration (`20 ms`, matching one `SegESR` frame) eligible for
+/// post-`T60` gap detection inside multi-regime stimuli such as `Schoukens–Pintelon` `Regime 2`.
+pub const MIN_DRY_SILENT_GAP_SECS: f64 = 1.0 / 50.0;
+
+/// Exact/numeric silence floor on dry stimulus samples (`|dry| <= DRY_SILENCE_EPS`).
+pub const DRY_SILENCE_EPS: f64 = 1.0e-9;
+
+const MIN_POST_T60_GAP_SAMPLES: usize = 256;
+
+const _: () = assert!(
+    POST_T60_GAP_AMP_RATIO > 0.0
+        && POST_T60_GAP_AMP_RATIO <= 1.0e-3
+        && MIN_DRY_SILENT_GAP_SECS > 0.0
+        && DRY_SILENCE_EPS > 0.0
+        && MIN_POST_T60_GAP_SAMPLES == 256
+);
+
+/// Post-`T60` dead-silent `[start, end)` sample intervals detected purely from `(dry, target)` inside
+/// `>= 20 ms` dry-silent gaps where target output has decayed below `-60 dB` of active RMS.
+///
+/// Used exclusively on noiseless (`noise == None`) captures so `f32` IIR sub-`-100 dBFS` DC-blocker /
+/// modal tails inside zero-excitation `Regime 2` decay gaps do not trigger spurious log-underflow
+/// penalties while enforcing a strict `-60 dB` residual ceiling throughout every gap.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DrySilentGapMask {
+    /// Sorted disjoint `[start, end)` sample spans inside `[warmup, n)`.
+    pub spans: Vec<(usize, usize)>,
+    /// Post-warmup target RMS computed across active (`|dry| > DRY_SILENCE_EPS`) samples.
+    pub active_target_rms: f64,
+}
+
+impl DrySilentGapMask {
+    /// Detects post-`T60` dead-silent intervals strictly from aligned `(dry, target)` pairs.
+    #[must_use]
+    pub fn detect(dry: &[f64], target: &[f64], warmup: usize, sample_rate_hz: f64) -> Self {
+        let n = dry.len().min(target.len());
+        if n <= warmup
+            || !(8_000.0..=1_536_000.0).contains(&sample_rate_hz)
+            || !sample_rate_hz.is_finite()
+        {
+            return Self::default();
+        }
+        let mut active_sq_sum = 0.0_f64;
+        let mut active_count = 0_usize;
+        for i in warmup..n {
+            let d = dry[i];
+            let y = target[i];
+            if !d.is_finite() || !y.is_finite() {
+                return Self::default();
+            }
+            if d.abs() > DRY_SILENCE_EPS {
+                active_sq_sum += y * y;
+                active_count += 1;
+            }
+        }
+        if active_count == 0 || !active_sq_sum.is_finite() {
+            return Self::default();
+        }
+        let active_target_rms = (active_sq_sum / (active_count as f64)).sqrt();
+        if !active_target_rms.is_finite() || active_target_rms <= 1.0e-12 {
+            return Self::default();
+        }
+
+        let min_gap = (sample_rate_hz * MIN_DRY_SILENT_GAP_SECS).round().max(1.0) as usize;
+        let t60_thresh = POST_T60_GAP_AMP_RATIO * active_target_rms;
+        let mut spans = Vec::new();
+        let mut i = warmup;
+        while i < n {
+            if dry[i].abs() <= DRY_SILENCE_EPS {
+                let s_dry = i;
+                while i < n && dry[i].abs() <= DRY_SILENCE_EPS {
+                    i += 1;
+                }
+                let e_dry = i;
+                if e_dry - s_dry >= min_gap {
+                    let mut last_above = None;
+                    for j in (s_dry..e_dry).rev() {
+                        if target[j].abs() > t60_thresh {
+                            last_above = Some(j);
+                            break;
+                        }
+                    }
+                    let s_t60 = last_above.map_or(s_dry, |idx| idx + 1);
+                    if e_dry.saturating_sub(s_t60) >= MIN_POST_T60_GAP_SAMPLES {
+                        spans.push((s_t60, e_dry));
+                    }
+                }
+            } else {
+                i += 1;
+            }
+        }
+        Self {
+            spans,
+            active_target_rms,
+        }
+    }
+
+    /// Returns `true` when no post-`T60` dead-silent gap spans were detected.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.spans.is_empty()
+            || !self.active_target_rms.is_finite()
+            || self.active_target_rms <= 0.0
+    }
+
+    /// Returns the first span `(s, e)` overlapping half-open `[start, end)`, if any.
+    #[must_use]
+    pub fn overlap_span(&self, start: usize, end: usize) -> Option<(usize, usize)> {
+        if start >= end {
+            return None;
+        }
+        self.spans
+            .iter()
+            .copied()
+            .find(|&(s, e)| end > s && start < e)
+    }
+}
 
 /// Normative 4-tier quality benchmark floors (`ref[qual.tiers.benchmark-matrix]`).
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -86,14 +208,16 @@ pub struct TierCertificationReport {
     pub meets_floor: bool,
 }
 
-/// Evaluates all 4 canonical metrics (`bESR`, `MR-IIR`, `LTAS`, `SegESR`) for a single tier output channel.
-pub fn certify_tier_audio(
+/// Evaluates all 4 canonical metrics (`bESR`, `MR-IIR`, `LTAS`, `SegESR`) for a single tier output
+/// channel, optionally gating noiseless post-`T60` dry-silent gaps via `gap_mask`.
+pub fn certify_tier_audio_with_gaps(
     tier: Tier,
     pred: &[f64],
     target: &[f64],
     noise: Option<&[f64]>,
     sample_rate_hz: f64,
     warmup: usize,
+    gap_mask: Option<&DrySilentGapMask>,
 ) -> Result<TierCertificationReport, TrainError> {
     let n = pred.len().min(target.len());
     if n <= warmup {
@@ -103,18 +227,29 @@ pub fn certify_tier_audio(
             actual: n,
         });
     }
+    let eff_gaps = if noise.is_some() {
+        None
+    } else {
+        gap_mask.filter(|g| !g.is_empty())
+    };
     let besr_rep = compute_besr_channel(&pred[..n], &target[..n], noise, sample_rate_hz, warmup);
     let floors = TierQualityFloors::for_tier(tier);
     let nq =
         evaluate_noise_qualified_besr(&besr_rep, floors.per_band_besr_db, floors.composite_besr_db);
     let mr_iir = MrIirTargetCache::new(&target[..n], noise, warmup, sample_rate_hz)
         .map_or(f64::INFINITY, |c| {
-            compute_mr_iir_channel(&c, &pred[..n], noise)
+            compute_mr_iir_channel_with_gaps(&c, &pred[..n], noise, eff_gaps)
         });
     let ltas_cache = Welch33TargetCache::new(&target[..n], warmup, sample_rate_hz)?;
     let ltas_rep = compute_ltas_channel(&ltas_cache, &pred[..n], noise);
-    let seg_esr_db =
-        compute_seg_esr_channel_db(&pred[..n], &target[..n], noise, sample_rate_hz, warmup);
+    let seg_esr_db = compute_seg_esr_channel_db_with_gaps(
+        &pred[..n],
+        &target[..n],
+        noise,
+        sample_rate_hz,
+        warmup,
+        eff_gaps,
+    );
     let meets_floor = nq.passes
         && !ltas_rep.excluded_band_guard_failed
         && ltas_rep.max_adj_deviation_db <= floors.max_ltas_db;
@@ -130,6 +265,18 @@ pub fn certify_tier_audio(
         excluded_band_residuals: ltas_rep.residual_band_power,
         meets_floor,
     })
+}
+
+/// Evaluates all 4 canonical metrics (`bESR`, `MR-IIR`, `LTAS`, `SegESR`) for a single tier output channel.
+pub fn certify_tier_audio(
+    tier: Tier,
+    pred: &[f64],
+    target: &[f64],
+    noise: Option<&[f64]>,
+    sample_rate_hz: f64,
+    warmup: usize,
+) -> Result<TierCertificationReport, TrainError> {
+    certify_tier_audio_with_gaps(tier, pred, target, noise, sample_rate_hz, warmup, None)
 }
 
 /// Checks monotone non-regression for a single adjacent tier pair `(lo, hi)` across
@@ -228,5 +375,110 @@ mod tests {
         arr[0].excluded_band_residuals[0] = 1.0e-6;
         arr[1].excluded_band_residuals[0] = 2.0e-6;
         assert!(!check_adjacent_tier_monotone(&arr));
+    }
+
+    #[test]
+    fn test_dry_silent_gap_mask_detection_and_guards() {
+        let sr = 48_000.0_f64;
+        let tau = core::f64::consts::TAU;
+        let n = 16_384_usize;
+        let warmup = 64_usize;
+
+        // Burst -> 250 ms exact-zero gap -> burst.
+        let mut dry = vec![0.0_f64; n];
+        let mut target = vec![0.0_f64; n];
+        for i in 0..n {
+            if !(2_400..14_400).contains(&i) {
+                let s = 0.25 * (tau * 440.0 * (i as f64) / sr).sin()
+                    + 0.15 * (tau * 1_650.0 * (i as f64) / sr).cos();
+                dry[i] = s;
+                target[i] = 0.9 * s;
+            }
+        }
+        let mask = DrySilentGapMask::detect(&dry, &target, warmup, sr);
+        assert_eq!(mask.spans, vec![(2_400, 14_400)]);
+        assert!(mask.active_target_rms > 0.15);
+
+        // Sub--100 dBFS IIR/DC tail inside exact-zero gap fails without gap mask, passes with it.
+        let mut pred_dc_tail = target.clone();
+        for (i, slot) in pred_dc_tail.iter_mut().enumerate().take(14_400).skip(2_400) {
+            let decay = (-((i - 2_400) as f64) / 2_000.0).exp();
+            *slot = 2.0e-6 * decay;
+        }
+        let rep_raw = certify_tier_audio(Tier::Ultra, &pred_dc_tail, &target, None, sr, warmup)
+            .expect("raw cert");
+        assert!(rep_raw.seg_esr_db.is_infinite());
+
+        let rep_gap = certify_tier_audio_with_gaps(
+            Tier::Ultra,
+            &pred_dc_tail,
+            &target,
+            None,
+            sr,
+            warmup,
+            Some(&mask),
+        )
+        .expect("gap cert");
+        assert!(rep_gap.seg_esr_db.is_finite());
+        assert!(rep_gap.mr_iir.is_finite() && rep_gap.mr_iir < 0.05);
+        assert!(rep_gap.meets_floor);
+
+        // Unstable ringing above -60 dB inside dry-silent gap MUST fail SegESR & MR-IIR with inf.
+        let mut pred_ring = target.clone();
+        for (i, slot) in pred_ring.iter_mut().enumerate().take(14_000).skip(2_600) {
+            *slot = 1.0e-2 * (tau * 880.0 * (i as f64) / sr).sin();
+        }
+        let rep_ring = certify_tier_audio_with_gaps(
+            Tier::Ultra,
+            &pred_ring,
+            &target,
+            None,
+            sr,
+            warmup,
+            Some(&mask),
+        )
+        .expect("ring cert");
+        assert!(rep_ring.seg_esr_db.is_infinite());
+        assert!(rep_ring.mr_iir.is_infinite());
+
+        // Sustained reverb tail (> -60 dB in gap) leaves gap mask empty.
+        let mut reverb_tgt = target.clone();
+        for (i, slot) in reverb_tgt.iter_mut().enumerate().take(14_400).skip(2_400) {
+            *slot = 0.02 * (tau * 330.0 * (i as f64) / sr).sin();
+        }
+        let rev_mask = DrySilentGapMask::detect(&dry, &reverb_tgt, warmup, sr);
+        assert!(rev_mask.is_empty());
+
+        // Muted target (`target == 0` under active dry) keeps mask empty and rejects nonzero pred.
+        let muted = vec![0.0_f64; n];
+        let muted_mask = DrySilentGapMask::detect(&dry, &muted, warmup, sr);
+        assert!(muted_mask.is_empty());
+        let rep_muted = certify_tier_audio_with_gaps(
+            Tier::Ultra,
+            &pred_dc_tail,
+            &muted,
+            None,
+            sr,
+            warmup,
+            Some(&muted_mask),
+        )
+        .expect("muted cert");
+        assert!(rep_muted.seg_esr_db.is_infinite() && rep_muted.mr_iir.is_infinite());
+
+        // Explicit noise trace bypasses gap_mask cleanly.
+        let noise: Vec<f64> = (0..n)
+            .map(|i| 1.0e-4 * (tau * 3_111.0 * (i as f64) / sr).sin())
+            .collect();
+        let rep_noise = certify_tier_audio_with_gaps(
+            Tier::Ultra,
+            &pred_dc_tail,
+            &target,
+            Some(&noise),
+            sr,
+            warmup,
+            Some(&mask),
+        )
+        .expect("noise cert");
+        assert!(rep_noise.mr_iir.is_finite());
     }
 }

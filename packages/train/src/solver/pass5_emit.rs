@@ -17,7 +17,7 @@ use dnam_vm::bin::DnamBinView;
 
 use crate::control::stability::run_phase2_rail_burst;
 use crate::error::TrainError;
-use crate::losses::{TierCertificationReport, check_adjacent_tier_monotone};
+use crate::losses::{DrySilentGapMask, TierCertificationReport, check_adjacent_tier_monotone};
 use crate::wide_gram::hash_gram_input_v3_f32;
 
 use super::model::SonaModelF64;
@@ -113,12 +113,17 @@ pub fn run_pass5_emit_and_certify_with_digest(
     let final_bin = encode_model_to_dnam_bin(model, config)?;
     let _ = DnamBinView::parse(&final_bin)?;
     let final_bundle = render_all_tiers(&final_bin, &in_l[..n], &in_r[..n], sr_f32)?;
+    let gap_masks = [
+        DrySilentGapMask::detect(&in_l[..n], &target_l[..n], warmup, model.sample_rate_hz),
+        DrySilentGapMask::detect(&in_r[..n], &target_r[..n], warmup, model.sample_rate_hz),
+    ];
     let cert = certify_all_tier_renders_stereo(
         &final_bundle.renders,
         &target_l[..n],
         &target_r[..n],
         model.sample_rate_hz,
         warmup,
+        Some(&gap_masks),
     )?;
 
     let monotone_eval = MonotoneEvalCtx {
@@ -127,6 +132,7 @@ pub fn run_pass5_emit_and_certify_with_digest(
         target_l: &target_l[..n],
         target_r: &target_r[..n],
         warmup,
+        gap_masks: &gap_masks,
         config,
     };
     let MonotoneState {

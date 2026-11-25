@@ -3,7 +3,7 @@
 
 use std::f64::consts::PI;
 
-use super::MAX_METRIC_SAMPLE_RATE_HZ;
+use super::{DrySilentGapMask, MAX_METRIC_SAMPLE_RATE_HZ, POST_T60_GAP_AMP_RATIO};
 
 const SCALES: [usize; 5] = [256, 512, 1024, 2048, 4096];
 const NUM_PROBES: usize = 32;
@@ -493,6 +493,36 @@ impl MrIirTargetCache {
     }
 }
 
+/// Computes the 5-Scale Floor-Clamped Multi-Resolution IIR Resonator Bank Loss (`MR-IIR`),
+/// optionally gating noiseless post-`T60` dry-silent gaps via `gap_mask` while enforcing a strict
+/// `-60 dB` residual guard across each excluded gap.
+#[must_use]
+pub fn compute_mr_iir_loss_with_gaps(
+    target: &[f64],
+    model: &[f64],
+    noise: Option<&[f64]>,
+    sample_rate_hz: f64,
+    warmup_samples: usize,
+    gap_mask: Option<&DrySilentGapMask>,
+) -> f64 {
+    let eff_gaps = if noise.is_some() {
+        None
+    } else {
+        gap_mask.filter(|g| !g.is_empty())
+    };
+    if eff_gaps.is_none() {
+        return compute_mr_iir_loss(target, model, noise, sample_rate_hz, warmup_samples);
+    }
+    compute_mr_iir_loss_general_with_gaps(
+        target,
+        model,
+        noise,
+        sample_rate_hz,
+        warmup_samples,
+        eff_gaps,
+    )
+}
+
 /// Computes the 5-Scale Floor-Clamped Multi-Resolution IIR Resonator Bank Loss (`MR-IIR`,
 /// $M \in \{256, 512, 1024, 2048, 4096\}$, pole radius $r_M = \exp(-\pi / M)$, hop $H = M / 4$,
 /// $K = 32$ log-spaced probes, `ref[qual.companion.mr-iir]`, `ref[qual.besr.finite-timeline]`).
@@ -523,6 +553,24 @@ pub(crate) fn compute_mr_iir_loss_general(
     noise: Option<&[f64]>,
     sample_rate_hz: f64,
     warmup_samples: usize,
+) -> f64 {
+    compute_mr_iir_loss_general_with_gaps(
+        target,
+        model,
+        noise,
+        sample_rate_hz,
+        warmup_samples,
+        None,
+    )
+}
+
+fn compute_mr_iir_loss_general_with_gaps(
+    target: &[f64],
+    model: &[f64],
+    noise: Option<&[f64]>,
+    sample_rate_hz: f64,
+    warmup_samples: usize,
+    eff_gaps: Option<&DrySilentGapMask>,
 ) -> f64 {
     if !(8_000.0..=MAX_METRIC_SAMPLE_RATE_HZ).contains(&sample_rate_hz)
         || target.is_empty()
@@ -660,24 +708,38 @@ pub(crate) fn compute_mr_iir_loss_general(
                 }
             }
 
-            let mut eval_energies = |e_t: f64,
-                                     e_m: f64,
-                                     e_n: f64,
-                                     ht: bool,
-                                     hm: bool,
-                                     hn: bool,
-                                     w: usize|
+            let mut eval_energies = |e3: (f64, f64, f64),
+                                     h3: (bool, bool, bool),
+                                     span: (usize, usize, usize)|
              -> Result<(), ()> {
+                let (e_t, e_m, e_n) = e3;
+                let (ht, hm, hn) = h3;
+                let (abs_s, abs_e, w) = span;
                 if !e_t.is_finite() || !e_m.is_finite() || !e_n.is_finite() {
                     return Err(());
                 }
-                scale_nz |= ht || hm || hn;
-                scale_nz_n |= hn;
-                scale_nse_sq += e_n;
                 let inv_sqrt_len = 1.0 / (w as f64).sqrt();
                 let rms_t = e_t.sqrt() * inv_sqrt_len;
                 let rms_m = e_m.sqrt() * inv_sqrt_len;
                 let sigma = e_n.sqrt() * inv_sqrt_len;
+                if let Some(gm) = eff_gaps
+                    && let Some((gs, ge)) = gm.overlap_span(abs_s, abs_e)
+                    && ((abs_s >= gs && abs_e <= ge)
+                        || rms_t <= POST_T60_GAP_AMP_RATIO * gm.active_target_rms)
+                {
+                    if !rms_m.is_finite()
+                        || (ht && (e_t == 0.0 || rms_t == 0.0))
+                        || (hm && (e_m == 0.0 || rms_m == 0.0))
+                        || (rms_m - rms_t).abs()
+                            > 2.0 * POST_T60_GAP_AMP_RATIO * gm.active_target_rms
+                    {
+                        return Err(());
+                    }
+                    return Ok(());
+                }
+                scale_nz |= ht || hm || hn;
+                scale_nz_n |= hn;
+                scale_nse_sq += e_n;
                 if (hn && (e_n == 0.0 || sigma == 0.0))
                     || (((ht && (e_t == 0.0 || rms_t == 0.0))
                         || (hm && (e_m == 0.0 || rms_m == 0.0)))
@@ -722,7 +784,13 @@ pub(crate) fn compute_mr_iir_loss_general(
 
             if t_sel < m_scale {
                 let (et, em, en, ht, hm, hn) = sum_tail(t_sel, &tail_t, &tail_m, &tail_n);
-                if eval_energies(et, em, en, ht, hm, hn, t_sel).is_err() {
+                if eval_energies(
+                    (et, em, en),
+                    (ht, hm, hn),
+                    (warmup_samples, warmup_samples + t_sel, t_sel),
+                )
+                .is_err()
+                {
                     return f64::INFINITY;
                 }
             } else {
@@ -737,7 +805,14 @@ pub(crate) fn compute_mr_iir_loss_general(
                     let ht = nz_t[c0..c_end].iter().any(|&b| b);
                     let hm = nz_m[c0..c_end].iter().any(|&b| b);
                     let hn = nz_n[c0..c_end].iter().any(|&b| b);
-                    if eval_energies(et, em, en, ht, hm, hn, m_scale).is_err() {
+                    let abs_s = warmup_samples + c0 * SUB_CHUNK;
+                    if eval_energies(
+                        (et, em, en),
+                        (ht, hm, hn),
+                        (abs_s, abs_s + m_scale, m_scale),
+                    )
+                    .is_err()
+                    {
                         return f64::INFINITY;
                     }
                     c0 += chunks_per_hop;
@@ -746,7 +821,14 @@ pub(crate) fn compute_mr_iir_loss_general(
                 let last_start = t_sel - m_scale;
                 if last_start + hop != start {
                     let (et, em, en, ht, hm, hn) = sum_tail(m_scale, &tail_t, &tail_m, &tail_n);
-                    if eval_energies(et, em, en, ht, hm, hn, m_scale).is_err() {
+                    let abs_s = warmup_samples + last_start;
+                    if eval_energies(
+                        (et, em, en),
+                        (ht, hm, hn),
+                        (abs_s, warmup_samples + t_sel, m_scale),
+                    )
+                    .is_err()
+                    {
                         return f64::INFINITY;
                     }
                 }
@@ -757,6 +839,7 @@ pub(crate) fn compute_mr_iir_loss_general(
             || !sc_den_sq.is_finite()
             || !mag_diff_sum.is_finite()
             || (scale_nz_n && scale_nse_sq == 0.0)
+            || (eff_gaps.is_some() && cell_count == 0)
         {
             return f64::INFINITY;
         }

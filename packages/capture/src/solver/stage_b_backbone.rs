@@ -3,15 +3,18 @@
 //!
 //! Canonical Reference: `docs/specs/training/webgpu_and_varpro_solver.md` (`ref[train.pipeline.backbone-trajectory-opt]`).
 
+pub(crate) mod spectral_bus;
+
 use dnam_engine::schema::DnamError;
 use dnam_train::solver::StereoTrainingPairs;
 use dnam_train::solver::pass2_opt::Pass2OptConfig;
 use dnam_train::{
-    Pass1ProbeResult, SonaModelF64, TrainRunner, WeightedReadoutStem, decode_dnam_bin_to_model,
-    extract_stat_256d_gram, patch_model_readouts_weighted_cholesky, run_pass1_probe,
-    run_pass2_optimize, run_pass3_varpro_readout, uplo_u_packed_len,
+    Pass1ProbeResult, Pass5EmitConfig, SonaModelF64, TrainRunner, WeightedReadoutStem,
+    decode_dnam_bin_to_model, extract_stat_256d_gram, patch_model_readouts_weighted_cholesky,
+    run_pass1_probe, run_pass2_optimize, run_pass3_varpro_readout, run_pass5_emit_and_certify,
+    uplo_u_packed_len,
 };
-use dnam_vm::bin::{ARENA_TIER_BYTES, DnamBinView};
+use dnam_vm::bin::{ARENA_TIER_BYTES, DNBN_FLAG_STEREO_OUT, DnamBinView};
 use dnam_vm::math::DefaultMathBackend;
 use dnam_vm::{SonaVm, Tier};
 use zerocopy::IntoBytes;
@@ -28,7 +31,7 @@ use crate::solver::progress::{
     TrainerProgressHandle, TrainerProgressSnapshot, TrainingPhase, TrainingStatus,
 };
 use crate::solver::stage_a_probe::{encode_with_preserved_controls, has_populated_v3_backbone};
-use crate::solver::{SolverQualityMode, canonical_besr_warmup};
+use crate::solver::{ComputeBackendPreference, SolverQualityMode, canonical_besr_warmup};
 
 /// Borrowed stereo stem reference and regression weight for fast weighted readout patching.
 #[derive(Debug, Clone, Copy)]
@@ -68,8 +71,14 @@ pub struct StageBSolveConfig {
     pub preserve_existing_backbone: bool,
     /// Optimization convergence vs. threshold-stop quality policy.
     pub quality_mode: SolverQualityMode,
+    /// Compute backend selection policy (`Auto`, `Cpu`, or fail-closed `Wgpu`).
+    pub backend_preference: ComputeBackendPreference,
     /// Optional empirical left/right repeatability profiles measured strictly from `(x, y)` probes.
     pub rep_profiles: Option<[crate::metrics::TargetRepeatabilityProfile; 2]>,
+    /// Optional audio-driven `TPT-SVF` spectral control-bus pivot frequency in Hz for Stage C eq/voicing modulation.
+    pub spectral_control_pivot_hz: Option<f64>,
+    /// When `true`, finalizes Pass-5 `LUFS` trim calibration, monotone repair & certification at the end of Stage B.
+    pub finalize_pass5: bool,
 }
 
 impl Default for StageBSolveConfig {
@@ -78,7 +87,10 @@ impl Default for StageBSolveConfig {
             gram_frame_stride: 4,
             preserve_existing_backbone: false,
             quality_mode: SolverQualityMode::BestUntilDiminishingReturns,
+            backend_preference: ComputeBackendPreference::Auto,
             rep_profiles: None,
+            spectral_control_pivot_hz: None,
+            finalize_pass5: false,
         }
     }
 }
@@ -174,9 +186,8 @@ fn eval_tier_esr_db(
         return Ok(0.0);
     }
     let view = DnamBinView::parse(dnam_bin).map_err(map_stage_err)?;
-    let mut vm =
-        SonaVm::<DefaultMathBackend>::from_view_owned(&view, tier, 48_000.0, mono_out && !dual_in)
-            .map_err(map_stage_err)?;
+    let mut vm = SonaVm::<DefaultMathBackend>::from_view_owned(&view, tier, 48_000.0, false)
+        .map_err(map_stage_err)?;
     let keep_in_r = dual_in || !mono_out;
     let in_l: Vec<f32> = dry_lr[..n].iter().map(|lr| lr[0]).collect();
     let in_r: Vec<f32> = dry_lr[..n]
@@ -266,10 +277,13 @@ fn select_pass2_config(quality_mode: SolverQualityMode, warmup: usize) -> Pass2O
         SolverQualityMode::ThresholdStop {
             max_polish_iters, ..
         } => Pass2OptConfig {
+            num_prescreen_seeds: (max_polish_iters * 4).clamp(16, 64),
+            top_k_seeds: (max_polish_iters / 2).clamp(1, 4),
             max_epochs: max_polish_iters.clamp(2, 16),
             adamw_steps: (max_polish_iters * 2).clamp(4, 24),
+            ssbroyden_block_iters: max_polish_iters.clamp(2, 12),
             diminishing_patience: 2,
-            qat_polish_steps: 2,
+            qat_polish_steps: (max_polish_iters / 2).clamp(1, 4),
             ..Pass2OptConfig::browser_webgpu(48_000.0, warmup)
         },
     }
@@ -331,7 +345,10 @@ pub fn solve_stage_b_backbone(
             gram_frame_stride,
             preserve_existing_backbone,
             quality_mode: SolverQualityMode::BestUntilDiminishingReturns,
+            backend_preference: ComputeBackendPreference::Auto,
             rep_profiles: None,
+            spectral_control_pivot_hz: None,
+            finalize_pass5: false,
         },
         &TrainerProgressHandle::default(),
     )
@@ -401,9 +418,11 @@ pub fn solve_stage_b_backbone_with_pass1(
     let eval_len =
         crate::solver::resolve_eval_active_len(manifest, dry_lr, Some(wet_lr), active_samples);
 
-    let runner = TrainRunner::auto_detect();
+    let runner = config.backend_preference.resolve_runner()?;
     let warmup = canonical_besr_warmup(active_samples).min(active_samples.saturating_sub(1));
 
+    let eval_warmup = canonical_besr_warmup(eval_len).min(eval_len.saturating_sub(1));
+    let mut pass5_esr_opt: Option<[f32; 4]> = None;
     if active_samples > warmup + 1 {
         let (in_l, in_r, tgt_l, tgt_r) =
             build_stereo_buffers(dry_lr, wet_lr, mono_out, dual_in, active_samples);
@@ -453,22 +472,65 @@ pub fn solve_stage_b_backbone_with_pass1(
             let pass2_cfg = select_pass2_config(config.quality_mode, warmup);
             run_pass2_optimize(&runner, &mut model, &pairs, pass2_cfg, None)
                 .map_err(map_stage_err)?;
-            run_pass3_varpro_readout(&runner, &mut model, &in_l, &in_r, &tgt_l, &tgt_r, warmup)
-                .map_err(map_stage_err)?;
+            let spectral_applied = if let Some(pivot_hz) = config.spectral_control_pivot_hz {
+                spectral_bus::try_apply_spectral_control_bus_pass3(
+                    &runner, &mut model, &pairs, warmup, pivot_hz,
+                )?
+            } else {
+                false
+            };
+            if !spectral_applied {
+                run_pass3_varpro_readout(&runner, &mut model, &in_l, &in_r, &tgt_l, &tgt_r, warmup)
+                    .map_err(map_stage_err)?;
+            }
             emit_stage_b_milestone(progress, &model, dry_lr, &anchor, 900, 2);
 
             *dnam_bin = encode_with_preserved_controls(&mut model, dnam_bin, mono_out, dual_in)?;
             verify_dnam_bin_zero_dc(dnam_bin)?;
         }
+
+        if config.finalize_pass5 && eval_len > eval_warmup + 8 {
+            let prev_stereo = DnamBinView::parse(dnam_bin).ok().map_or(!mono_out, |v| {
+                (v.header.flags.get() & DNBN_FLAG_STEREO_OUT) != 0
+            });
+            let (eval_in_l, eval_in_r, eval_tgt_l, eval_tgt_r) =
+                build_stereo_buffers(dry_lr, wet_lr, mono_out, dual_in, eval_len);
+            let mut p5_model = decode_dnam_bin_to_model(dnam_bin).map_err(map_stage_err)?;
+            let emit_cfg = Pass5EmitConfig {
+                stereo_out: prev_stereo,
+                single_input: !dual_in && !prev_stereo,
+                calibrate_lufs_trims: true,
+                ..Default::default()
+            };
+            let p5_res = run_pass5_emit_and_certify(
+                &mut p5_model,
+                &eval_in_l,
+                &eval_in_r,
+                &eval_tgt_l,
+                &eval_tgt_r,
+                eval_warmup,
+                emit_cfg,
+            )
+            .map_err(map_stage_err)?;
+            *dnam_bin = p5_res.dnam_bin;
+            verify_dnam_bin_zero_dc(dnam_bin)?;
+            pass5_esr_opt = Some(core::array::from_fn(|t| {
+                p5_res.tier_reports[t].besr_db as f32
+            }));
+        }
     }
 
-    let prefix_esr_db = eval_all_four_tier_esr_db(
-        dnam_bin,
-        mono_out,
-        dual_in,
-        &dry_lr[..eval_len],
-        &wet_lr[..eval_len],
-    )?;
+    let prefix_esr_db = if let Some(esr) = pass5_esr_opt {
+        esr
+    } else {
+        eval_all_four_tier_esr_db(
+            dnam_bin,
+            mono_out,
+            dual_in,
+            &dry_lr[..eval_len],
+            &wet_lr[..eval_len],
+        )?
+    };
     if progress.is_active() {
         progress.emit(&TrainerProgressSnapshot {
             status: TrainingStatus::Running,
@@ -557,7 +619,10 @@ mod tests {
                     target_slack_milli_db: 0,
                     max_polish_iters: 4,
                 },
+                backend_preference: ComputeBackendPreference::Auto,
                 rep_profiles: None,
+                spectral_control_pivot_hz: None,
+                finalize_pass5: true,
             },
             &TrainerProgressHandle::default(),
         )
@@ -651,5 +716,59 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_eval_tier_esr_db_mono_uses_live_1x_without_bounce_delay() {
+        let mut model = SonaModelF64::new(48_000.0);
+        model.oversample_upper_tiers_2x = false;
+        model.active_fir_taps = Tier::Ultra.early_fir_taps();
+        model.pre_conv_u_gain = [1.0, 1.0];
+        model.direct_s2_u_gain = [0.0, 0.0];
+        model.tank_dry_mix = 1.0;
+        model.fir_l[0] = 0.5;
+        model.fir_l[1] = -0.25;
+        model.fir_r = model.fir_l;
+        let bin = encode_model_to_dnam_bin(
+            &model,
+            Pass5EmitConfig {
+                stereo_out: false,
+                single_input: true,
+                calibrate_lufs_trims: false,
+                ..Pass5EmitConfig::default()
+            },
+        )
+        .expect("mono 1x model encodes");
+
+        let centers = dnam_train::losses::canonical_ltas_33_centers_hz();
+        let n = 1_024_usize;
+        let dry: Vec<[f32; 2]> = (0..n)
+            .map(|i| {
+                let t = (i as f64) / 48_000.0;
+                let s: f64 = centers
+                    .iter()
+                    .enumerate()
+                    .map(|(k, &hz)| (TAU * hz * t + 0.13 * (k as f64)).sin())
+                    .sum();
+                let x = (0.04 * s) as f32;
+                [x, 0.0]
+            })
+            .collect();
+        let wet: Vec<[f32; 2]> = (0..n)
+            .map(|i| {
+                let x0 = dry[i][0];
+                let x1 = if i > 0 { dry[i - 1][0] } else { 0.0 };
+                let y = 0.5 * x0 - 0.25 * x1;
+                [y, y]
+            })
+            .collect();
+
+        for tier in ALL_TIERS {
+            let esr = eval_tier_esr_db(&bin, tier, true, false, &dry, &wet).unwrap();
+            assert!(
+                esr < -60.0,
+                "mono 1->1 eval_tier_esr_db on {tier:?} must match 1x response without 4x bounce delay (got {esr:.2} dB)"
+            );
+        }
     }
 }

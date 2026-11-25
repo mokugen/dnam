@@ -2,20 +2,25 @@
 //! Differentiable `31`-slot reverse-mode adjoint + persistent-`SonaVm` stage-target solver for
 //! one Stage C control point (`ref[train.pipeline.control-projection-fit]`).
 
+mod scoring;
+
 use dnam_engine::schema::DnamError;
 use dnam_train::control::{
-    ControlKindSpec, ControlSpec, Cp1ControlSample, FourBandTptBank, StageTargetBounds,
-    StageTargetSolveConfig, StageTargetSolveInput, solve_point_stage_targets_adjoint,
-    solve_two_pass_four_band_wiener,
+    ControlSpec, Cp1ControlSample, FourBandTptBank, StageTargetBounds, StageTargetSolveConfig,
+    StageTargetSolveInput, solve_point_stage_targets_adjoint, solve_two_pass_four_band_wiener,
 };
-use dnam_train::{
-    CompositeLossConfig, CompositeLossWeights, SonaModelF64, SsBroydenConfig, TrainRunner,
-};
+use dnam_train::{CompositeLossWeights, SonaModelF64, SsBroydenConfig, TrainRunner};
 use dnam_vm::control::STAGE_TARGET_SLOTS;
 use dnam_vm::math::DefaultMathBackend;
 use dnam_vm::{SonaVm, Tier};
 
 use super::map_stage_err;
+use scoring::{
+    CompositeLossWeightsZero, LiteGuardCtx, WindowScoreCtx, eval_vm_window_score,
+    extract_switch_options, guard_lite_stage_base, inv_tier_trim, is_broadband_dry_window,
+    mid_signal, pack_post_warmup, pass1_loss_and_reg, render_vm_with_stage_targets,
+    select_adjoint_window, vec_mean_square, vec_mse, window_mean_square_stereo,
+};
 
 /// All `31` active dispatch slots (`0..30`, slot `31` reserved `+0.0`).
 pub(super) const PASS4_ALL_ACTIVE_SLOTS: [usize; 31] = [
@@ -23,8 +28,27 @@ pub(super) const PASS4_ALL_ACTIVE_SLOTS: [usize; 31] = [
     26, 27, 28, 29, 30,
 ];
 
+const BROADBAND_GAIN_DRIVE_SLOTS: [usize; 2] = [22, 30];
 const MAX_ADJOINT_CORE_FRAMES: usize = 2_048;
+const PASS0_EARLY_EXIT_NESR: f64 = 2.5e-4;
+const PASS0_PARSIMONY_NESR: f64 = 2.5e-3;
+const PASS0_NARROWBAND_KEEP_NESR: f64 = 1.0e-3;
+const PASS0_EARLY_EXIT_REL_RESID: f64 = 0.05;
+const PASS0_PARSIMONY_REL_RESID: f64 = 0.25;
+const PASS1_PARSIMONY_REL_IMPROVE: f64 = 0.70;
 const _: () = assert!(MAX_ADJOINT_CORE_FRAMES == 2_048);
+const _: () = assert!(
+    BROADBAND_GAIN_DRIVE_SLOTS[0] == 22
+        && BROADBAND_GAIN_DRIVE_SLOTS[1] == 30
+        && PASS0_EARLY_EXIT_NESR > 0.0
+        && PASS0_EARLY_EXIT_NESR < PASS0_NARROWBAND_KEEP_NESR
+        && PASS0_NARROWBAND_KEEP_NESR < PASS0_PARSIMONY_NESR
+        && PASS0_EARLY_EXIT_REL_RESID > 0.0
+        && PASS0_EARLY_EXIT_REL_RESID < PASS0_PARSIMONY_REL_RESID
+        && PASS0_PARSIMONY_REL_RESID < 1.0
+        && PASS1_PARSIMONY_REL_IMPROVE > 0.0
+        && PASS1_PARSIMONY_REL_IMPROVE < 1.0
+);
 
 /// Immutable inputs and pre-decoded models passed to [`solve_point_cp1_sample`].
 pub(super) struct PointSolveInputs<'a> {
@@ -48,204 +72,252 @@ pub(super) struct PointSolveVms<'a, 'b> {
     pub vm_lite: &'a mut SonaVm<'b, DefaultMathBackend>,
 }
 
-fn render_vm_with_stage_targets(
-    vm: &mut SonaVm<'_, DefaultMathBackend>,
-    in_l: &[f32],
-    in_r: &[f32],
-    st32: &[f64; STAGE_TARGET_SLOTS],
-) -> Result<(Vec<f64>, Vec<f64>), DnamError> {
-    let mut st32_f32 = [0.0_f32; STAGE_TARGET_SLOTS];
-    for (dst, &src) in st32_f32[..STAGE_TARGET_SLOTS - 1].iter_mut().zip(st32) {
-        *dst = if src.is_finite() { src as f32 } else { 0.0 };
-    }
-    vm.reset_with_latched_stage_targets(&st32_f32, &[0.0_f32; 8]);
-    let n = in_l.len().min(in_r.len());
-    let (mut out_l, mut out_r) = (vec![0.0_f32; n], vec![0.0_f32; n]);
-    vm.process_block(&in_l[..n], &in_r[..n], &mut out_l, &mut out_r)
-        .map_err(map_stage_err)?;
-    Ok((
-        out_l.into_iter().map(f64::from).collect(),
-        out_r.into_iter().map(f64::from).collect(),
-    ))
+struct AdjointStageState {
+    st: [f64; STAGE_TARGET_SLOTS],
+    l: Vec<f64>,
+    r: Vec<f64>,
+    mse: f64,
+    score: f64,
 }
 
-#[inline]
-fn pack_post_warmup(l: &[f64], r: &[f64], warmup: usize, mono_out: bool) -> Vec<f64> {
-    if mono_out {
-        l[warmup..].to_vec()
-    } else {
-        let mut v = Vec::with_capacity((l.len() - warmup) * 2);
-        v.extend_from_slice(&l[warmup..]);
-        v.extend_from_slice(&r[warmup..]);
-        v
-    }
-}
-
-#[inline]
-fn vec_mse(pred: &[f64], target: &[f64]) -> f64 {
-    let n = pred.len().min(target.len());
-    if n == 0 {
-        return 0.0;
-    }
-    let mut sq = 0.0_f64;
-    for (&p, &t) in pred[..n].iter().zip(&target[..n]) {
-        let d = p - t;
-        sq += d * d;
-    }
-    sq / (n as f64)
-}
-
-#[inline]
-fn vec_mean_square(v: &[f64]) -> f64 {
-    if v.is_empty() {
-        return 0.0;
-    }
-    let sq: f64 = v.iter().map(|&x| x * x).sum();
-    sq / (v.len() as f64)
-}
-
-#[inline]
-fn window_mean_square_stereo(in_l: &[f64], in_r: &[f64], start: usize, len: usize) -> f64 {
-    if len == 0 {
-        return 0.0;
-    }
-    let end = start + len;
-    let sq: f64 = in_l[start..end]
-        .iter()
-        .zip(&in_r[start..end])
-        .map(|(&l, &r)| l * l + r * r)
-        .sum();
-    sq / (2.0 * (len as f64))
-}
-
-#[inline]
-fn select_adjoint_window(
-    in_l: &[f64],
-    in_r: &[f64],
-    n: usize,
-    max_frames: usize,
-) -> (usize, usize) {
-    let cap = max_frames.max(64);
-    if n <= cap {
-        return (0, n);
-    }
-    let head_energy = window_mean_square_stereo(in_l, in_r, 0, cap);
-    let tail_off = n - cap;
-    let tail_energy = window_mean_square_stereo(in_l, in_r, tail_off, cap);
-    if tail_energy > 2.0 * head_energy {
-        (tail_off, cap)
-    } else {
-        (0, cap)
-    }
-}
-
-#[inline]
-fn extract_switch_options(specs: &[ControlSpec], phys_controls: &[f32]) -> Vec<u8> {
-    specs
-        .iter()
-        .enumerate()
-        .map(|(i, sp)| match sp.kind {
-            ControlKindSpec::Switch { num_options, .. } => {
-                let raw = phys_controls.get(i).copied().unwrap_or(0.0);
-                (raw.round().max(0.0) as u8).min(num_options.saturating_sub(1))
-            }
-            ControlKindSpec::Range { .. } => 0,
-        })
-        .collect()
-}
-
-#[inline]
-fn mid_signal(l: &[f64], r: &[f64]) -> Vec<f64> {
-    l.iter().zip(r).map(|(&lv, &rv)| 0.5 * (lv + rv)).collect()
-}
-
-#[inline]
-fn inv_tier_trim(model: &SonaModelF64, tier: Tier) -> f64 {
-    let trim = model.tier_gain_trim[tier.index()];
-    if trim.is_finite() && trim.abs() > 1.0e-6 {
-        1.0 / trim
-    } else {
-        1.0
-    }
-}
-
-struct LiteGuardCtx<'a> {
-    inp: &'a PointSolveInputs<'a>,
+struct AdjWindowSlices<'a> {
     in_l32: &'a [f32],
     in_r32: &'a [f32],
-    in_l64: &'a [f64],
-    in_r64: &'a [f64],
-    wet_l64: &'a [f64],
-    wet_r64: &'a [f64],
-    tgt_gn: &'a [f64],
-    warmup: usize,
-    adj_off: usize,
-    n_adj: usize,
+    in_l: &'a [f64],
+    in_r: &'a [f64],
+    tgt_l: &'a [f64],
+    tgt_r: &'a [f64],
+    wet_m: &'a [f64],
+    y_star_u: &'a [f64],
+    y_star_l: &'a [f64],
     warmup_adj: usize,
-    mse_lite_zero: f64,
+    mse_ultra_zero: f64,
+    broadband_adj: bool,
 }
 
-fn guard_lite_stage_base(
-    vm_lite: &mut SonaVm<'_, DefaultMathBackend>,
-    ctx: &LiteGuardCtx<'_>,
-    st_final: &[f64; STAGE_TARGET_SLOTS],
-) -> Result<([f64; STAGE_TARGET_SLOTS], Option<[f64; STAGE_TARGET_SLOTS]>), DnamError> {
-    if ctx.inp.max_tier != Tier::Ultra {
-        return Ok((*st_final, None));
+fn run_pass0_broadband_scale(
+    inp: &PointSolveInputs<'_>,
+    vm_ultra: &mut SonaVm<'_, DefaultMathBackend>,
+    score_ctx: &WindowScoreCtx<'_>,
+    adj: &AdjWindowSlices<'_>,
+    zero_state: AdjointStageState,
+) -> Result<AdjointStageState, DnamError> {
+    let pass0_cfg = StageTargetSolveConfig {
+        active_slots: BROADBAND_GAIN_DRIVE_SLOTS.to_vec(),
+        tier: inp.max_tier,
+        warmup_frames: adj.warmup_adj,
+        loss_weights: CompositeLossWeights {
+            w_mse: 1.0,
+            ..CompositeLossWeights::zero()
+        },
+        barrier_weight: 0.0,
+        l2_reg: 1.0e-7,
+        opt: SsBroydenConfig {
+            max_iters: 8,
+            max_line_search: 4,
+            rel_tol: 1.0e-6,
+            patience: 2,
+            ..SsBroydenConfig::default()
+        },
+        vm_micro_polish_iters: 0,
+        ..StageTargetSolveConfig::default()
+    };
+    let Ok(rep0) = solve_point_stage_targets_adjoint(
+        &StageTargetSolveInput {
+            runner: inp.runner,
+            base: inp.base_ultra,
+            in_l: adj.in_l,
+            in_r: adj.in_r,
+            target_l: adj.tgt_l,
+            target_r: adj.tgt_r,
+            init_targets: &zero_state.st,
+            z_stage: &[0.0; 8],
+            bounds: inp.bounds,
+        },
+        &pass0_cfg,
+        None,
+    ) else {
+        return Ok(zero_state);
+    };
+    let mut st0 = rep0.stage_targets;
+    st0[STAGE_TARGET_SLOTS - 1] = 0.0;
+    let (l0, r0) = render_vm_with_stage_targets(vm_ultra, adj.in_l32, adj.in_r32, &st0)?;
+    let (mse0, score0) = eval_vm_window_score(score_ctx, &l0, &r0);
+    if mse0 < zero_state.mse {
+        Ok(AdjointStageState {
+            st: st0,
+            l: l0,
+            r: r0,
+            mse: mse0,
+            score: score0,
+        })
+    } else {
+        Ok(zero_state)
     }
-    let (lf, rf) = render_vm_with_stage_targets(vm_lite, ctx.in_l32, ctx.in_r32, st_final)?;
-    let mse_lite_final = vec_mse(
-        &pack_post_warmup(&lf, &rf, ctx.warmup, ctx.inp.mono_out),
-        ctx.tgt_gn,
-    );
-    if mse_lite_final <= ctx.mse_lite_zero * 1.01 {
-        return Ok((*st_final, None));
-    }
+}
 
-    let mut best_st = [0.0_f64; STAGE_TARGET_SLOTS];
-    let mut best_mse = ctx.mse_lite_zero;
-    for alpha in [0.75_f64, 0.5, 0.25, 0.125, 0.0] {
-        let mut cand = [0.0_f64; STAGE_TARGET_SLOTS];
-        if alpha > 0.0 {
-            for s in PASS4_ALL_ACTIVE_SLOTS {
-                cand[s] = (alpha * st_final[s]).clamp(ctx.inp.bounds.min[s], ctx.inp.bounds.max[s]);
+fn refine_full_slots_pass1_and_pass2(
+    inp: &PointSolveInputs<'_>,
+    vms: &mut PointSolveVms<'_, '_>,
+    score_ctx: &WindowScoreCtx<'_>,
+    adj: &AdjWindowSlices<'_>,
+    mut cur: AdjointStageState,
+) -> Result<[f64; STAGE_TARGET_SLOTS], DnamError> {
+    let pass0_explained_bulk = cur.mse <= PASS0_PARSIMONY_REL_RESID * adj.mse_ultra_zero;
+    let pass0_already_good =
+        pass0_explained_bulk && cur.mse <= PASS0_PARSIMONY_NESR * score_ctx.target_msq.max(1.0e-18);
+    let clean_broadband_seed = adj.broadband_adj && !pass0_already_good;
+    let (p1_max_iters, p1_max_ls, p1_patience, p1_init_st) = if clean_broadband_seed {
+        (32, 6, 4, [0.0_f64; STAGE_TARGET_SLOTS])
+    } else {
+        (
+            if adj.broadband_adj { 20 } else { 14 },
+            if adj.broadband_adj { 5 } else { 4 },
+            if adj.broadband_adj { 3 } else { 2 },
+            cur.st,
+        )
+    };
+    let (p1_weights, p1_reg) = pass1_loss_and_reg(adj.broadband_adj);
+    let pass1_cfg = StageTargetSolveConfig {
+        active_slots: PASS4_ALL_ACTIVE_SLOTS.to_vec(),
+        tier: inp.max_tier,
+        warmup_frames: adj.warmup_adj,
+        loss_weights: p1_weights,
+        barrier_weight: 0.0,
+        l2_reg: p1_reg,
+        opt: SsBroydenConfig {
+            max_iters: p1_max_iters,
+            max_line_search: p1_max_ls,
+            rel_tol: 1.0e-5,
+            patience: p1_patience,
+            ..SsBroydenConfig::default()
+        },
+        vm_micro_polish_iters: 0,
+        ..StageTargetSolveConfig::default()
+    };
+
+    let rep1 = solve_point_stage_targets_adjoint(
+        &StageTargetSolveInput {
+            runner: inp.runner,
+            base: inp.base_ultra,
+            in_l: adj.in_l,
+            in_r: adj.in_r,
+            target_l: adj.tgt_l,
+            target_r: adj.tgt_r,
+            init_targets: &p1_init_st,
+            z_stage: &[0.0; 8],
+            bounds: inp.bounds,
+        },
+        &pass1_cfg,
+        None,
+    )
+    .map_err(map_stage_err)?;
+
+    let req_factor = if pass0_already_good {
+        PASS1_PARSIMONY_REL_IMPROVE
+    } else {
+        1.0
+    };
+    let mut st_pass1 = rep1.stage_targets;
+    st_pass1[STAGE_TARGET_SLOTS - 1] = 0.0;
+    let (p1_l, p1_r) =
+        render_vm_with_stage_targets(vms.vm_ultra, adj.in_l32, adj.in_r32, &st_pass1)?;
+    let (mse1, score1) = eval_vm_window_score(score_ctx, &p1_l, &p1_r);
+    let accept_p1 = if adj.broadband_adj {
+        score1 < req_factor * cur.score && mse1 <= cur.mse * 1.15 + 1.0e-12
+    } else {
+        mse1 < req_factor * cur.mse
+    };
+    if accept_p1 {
+        cur = AdjointStageState {
+            st: st_pass1,
+            l: p1_l,
+            r: p1_r,
+            mse: mse1,
+            score: score1,
+        };
+    } else if !pass0_already_good && cur.mse >= adj.mse_ultra_zero {
+        let mut polish_cfg = pass1_cfg;
+        polish_cfg.opt.max_iters = 2;
+        polish_cfg.opt.max_line_search = 2;
+        polish_cfg.opt.rel_tol = 1.0e-4;
+        polish_cfg.opt.patience = 1;
+        polish_cfg.vm_micro_polish_iters = 1;
+        if let Ok(pol) = solve_point_stage_targets_adjoint(
+            &StageTargetSolveInput {
+                runner: inp.runner,
+                base: inp.base_ultra,
+                in_l: adj.in_l,
+                in_r: adj.in_r,
+                target_l: adj.tgt_l,
+                target_r: adj.tgt_r,
+                init_targets: &st_pass1,
+                z_stage: &[0.0; 8],
+                bounds: inp.bounds,
+            },
+            &polish_cfg,
+            Some(vms.vm_ultra),
+        ) {
+            let mut pol_st = pol.stage_targets;
+            pol_st[STAGE_TARGET_SLOTS - 1] = 0.0;
+            if let Ok((pl, pr)) =
+                render_vm_with_stage_targets(vms.vm_ultra, adj.in_l32, adj.in_r32, &pol_st)
+            {
+                let (mse_pol, score_pol) = eval_vm_window_score(score_ctx, &pl, &pr);
+                if score_pol < cur.score && mse_pol < adj.mse_ultra_zero {
+                    cur = AdjointStageState {
+                        st: pol_st,
+                        l: pl,
+                        r: pr,
+                        mse: mse_pol,
+                        score: score_pol,
+                    };
+                }
             }
         }
-        let (cl, cr) = render_vm_with_stage_targets(vm_lite, ctx.in_l32, ctx.in_r32, &cand)?;
-        let mse = vec_mse(
-            &pack_post_warmup(&cl, &cr, ctx.warmup, ctx.inp.mono_out),
-            ctx.tgt_gn,
-        );
-        if mse < best_mse {
-            best_mse = mse;
-            best_st = cand;
-        }
     }
 
-    if best_mse >= ctx.mse_lite_zero * 0.995 {
-        let inv_l = inv_tier_trim(ctx.inp.base_lite, Tier::Lite);
-        let adj_end = ctx.adj_off + ctx.n_adj;
-        let lite_tl: Vec<f64> = ctx.wet_l64[ctx.adj_off..adj_end]
-            .iter()
-            .map(|&v| v * inv_l)
-            .collect();
-        let lite_tr: Vec<f64> = ctx.wet_r64[ctx.adj_off..adj_end]
-            .iter()
-            .map(|&v| v * inv_l)
-            .collect();
-        let cfg = StageTargetSolveConfig {
-            active_slots: PASS4_ALL_ACTIVE_SLOTS.to_vec(),
-            tier: Tier::Lite,
-            warmup_frames: ctx.warmup_adj,
-            loss_weights: CompositeLossWeights {
-                w_besr: 1.0,
+    let y_mdl_u = mid_signal(&cur.l, &cur.r);
+    let (ml, mr) = render_vm_with_stage_targets(vms.vm_lite, adj.in_l32, adj.in_r32, &cur.st)?;
+    let y_mdl_l = mid_signal(&ml, &mr);
+    let wr = solve_two_pass_four_band_wiener(
+        inp.bank,
+        adj.wet_m,
+        adj.y_star_u,
+        adj.y_star_l,
+        &y_mdl_u,
+        &y_mdl_l,
+        score_ctx.warmup,
+    )
+    .map_err(map_stage_err)?;
+
+    let mut st_final = cur.st;
+    if wr.pass2_triggered && (accept_p1 || !pass0_already_good) {
+        let p2_weights = if adj.broadband_adj {
+            CompositeLossWeights {
+                w_mse: 0.40,
+                w_besr: 0.40,
+                w_mr_iir: 0.20,
                 ..CompositeLossWeights::zero()
-            },
+            }
+        } else {
+            CompositeLossWeights {
+                w_mse: 0.50,
+                w_mr_iir: 0.30,
+                w_seg_esr: 0.20,
+                ..CompositeLossWeights::zero()
+            }
+        };
+        let pass2_cfg = StageTargetSolveConfig {
+            active_slots: PASS4_ALL_ACTIVE_SLOTS.to_vec(),
+            tier: inp.max_tier,
+            warmup_frames: adj.warmup_adj,
+            loss_weights: p2_weights,
             barrier_weight: 0.0,
-            l2_reg: 1.0e-6,
+            l2_reg: p1_reg,
             opt: SsBroydenConfig {
                 max_iters: 8,
-                max_line_search: 3,
+                max_line_search: 4,
                 rel_tol: 1.0e-4,
                 patience: 2,
                 ..SsBroydenConfig::default()
@@ -253,47 +325,39 @@ fn guard_lite_stage_base(
             vm_micro_polish_iters: 0,
             ..StageTargetSolveConfig::default()
         };
-        if let Ok(rep) = solve_point_stage_targets_adjoint(
+        if let Ok(rep2) = solve_point_stage_targets_adjoint(
             &StageTargetSolveInput {
-                runner: ctx.inp.runner,
-                base: ctx.inp.base_lite,
-                in_l: &ctx.in_l64[ctx.adj_off..adj_end],
-                in_r: &ctx.in_r64[ctx.adj_off..adj_end],
-                target_l: &lite_tl,
-                target_r: &lite_tr,
-                init_targets: &best_st,
+                runner: inp.runner,
+                base: inp.base_ultra,
+                in_l: adj.in_l,
+                in_r: adj.in_r,
+                target_l: adj.tgt_l,
+                target_r: adj.tgt_r,
+                init_targets: &cur.st,
                 z_stage: &[0.0; 8],
-                bounds: ctx.inp.bounds,
+                bounds: inp.bounds,
             },
-            &cfg,
+            &pass2_cfg,
             None,
-        ) && let Ok((cl, cr)) =
-            render_vm_with_stage_targets(vm_lite, ctx.in_l32, ctx.in_r32, &rep.stage_targets)
-        {
-            let mse = vec_mse(
-                &pack_post_warmup(&cl, &cr, ctx.warmup, ctx.inp.mono_out),
-                ctx.tgt_gn,
-            );
-            if mse < best_mse && mse < ctx.mse_lite_zero {
-                best_mse = mse;
-                best_st = rep.stage_targets;
+        ) {
+            let mut rep2_st = rep2.stage_targets;
+            rep2_st[STAGE_TARGET_SLOTS - 1] = 0.0;
+            if let Ok((wl2, wr2)) =
+                render_vm_with_stage_targets(vms.vm_ultra, adj.in_l32, adj.in_r32, &rep2_st)
+            {
+                let (mse_w, score_w) = eval_vm_window_score(score_ctx, &wl2, &wr2);
+                if score_w < cur.score && mse_w <= cur.mse * 1.05 {
+                    st_final = rep2_st;
+                }
             }
         }
     }
-
-    if best_mse >= ctx.mse_lite_zero {
-        best_st = [0.0_f64; STAGE_TARGET_SLOTS];
-    }
-    let mut delta = [0.0_f64; STAGE_TARGET_SLOTS];
-    for s in PASS4_ALL_ACTIVE_SLOTS {
-        delta[s] = st_final[s] - best_st[s];
-    }
-    Ok((best_st, Some(delta)))
+    Ok(st_final)
 }
 
 /// Solves bounded `31`-slot `stage_targets` (`slot 31 == +0.0`) for one Stage C point using
-/// reverse-mode `Pass2` adjoints (`SsBroydenState`) + persistent `SonaVm` parity & two-pass
-/// 4-band Wiener recovery (`ref[train.pipeline.control-projection-fit]`).
+/// parsimonious Pass-0 (`[22, 30]`) + bandwidth-aware reverse-mode adjoints + persistent `SonaVm`
+/// parity & two-pass 4-band Wiener recovery (`ref[train.pipeline.control-projection-fit]`).
 pub(super) fn solve_point_cp1_sample(
     inp: PointSolveInputs<'_>,
     vms: &mut PointSolveVms<'_, '_>,
@@ -319,21 +383,38 @@ pub(super) fn solve_point_cp1_sample(
     let adj_tgt_r: Vec<f64> = wet_r.iter().map(|&v| v * inv_u).collect();
 
     let warmup = (n / 8).min(256).min(n.saturating_sub(8));
-    let tgt_gn = pack_post_warmup(&wet_l, &wet_r, warmup, inp.mono_out);
     let zero_st = [0.0_f64; STAGE_TARGET_SLOTS];
+    if n <= warmup + 8 || window_mean_square_stereo(&in_l64, &in_r64, warmup, n - warmup) <= 1.0e-12
+    {
+        let switch_options = extract_switch_options(inp.specs, &inp.phys_controls);
+        return Ok(Cp1ControlSample {
+            phys_controls: inp.phys_controls,
+            switch_options,
+            stage_targets_base: zero_st,
+            stage_targets_ultra_delta: None,
+        });
+    }
+    let tgt_gn = pack_post_warmup(&wet_l, &wet_r, warmup, inp.mono_out);
+    let target_msq = vec_mean_square(&tgt_gn);
+    let broadband_full = is_broadband_dry_window(&in_l64, warmup);
+    let score_ctx = WindowScoreCtx {
+        wet_l: &wet_l,
+        wet_r: &wet_r,
+        tgt_gn: &tgt_gn,
+        warmup,
+        mono_out: inp.mono_out,
+        target_msq,
+        is_broadband: broadband_full,
+    };
 
     let (su0, sr_u0) = render_vm_with_stage_targets(vms.vm_ultra, &in_l32, &in_r32, &zero_st)?;
     let y_star_u = mid_signal(&su0, &sr_u0);
-    let mse_ultra_zero = vec_mse(
-        &pack_post_warmup(&su0, &sr_u0, warmup, inp.mono_out),
-        &tgt_gn,
-    );
+    let (mse_ultra_zero, score_ultra_zero) = eval_vm_window_score(&score_ctx, &su0, &sr_u0);
 
     let (sl0, sr0) = render_vm_with_stage_targets(vms.vm_lite, &in_l32, &in_r32, &zero_st)?;
     let y_star_l = mid_signal(&sl0, &sr0);
     let mse_lite_zero = vec_mse(&pack_post_warmup(&sl0, &sr0, warmup, inp.mono_out), &tgt_gn);
 
-    let target_msq = vec_mean_square(&tgt_gn);
     if mse_ultra_zero <= 1.0e-10 * target_msq.max(1.0e-18) {
         let switch_options = extract_switch_options(inp.specs, &inp.phys_controls);
         return Ok(Cp1ControlSample {
@@ -353,151 +434,47 @@ pub(super) fn solve_point_cp1_sample(
     let (adj_off, n_adj) = select_adjoint_window(&in_l64, &in_r64, n, max_adj_frames);
     let adj_end = adj_off + n_adj;
     let warmup_adj = (n_adj / 8).min(256).min(n_adj.saturating_sub(8));
-
-    let pass1_cfg = StageTargetSolveConfig {
-        active_slots: PASS4_ALL_ACTIVE_SLOTS.to_vec(),
-        tier: inp.max_tier,
-        warmup_frames: warmup_adj,
-        loss_weights: CompositeLossWeights {
-            w_besr: 1.0,
-            ..CompositeLossWeights::zero()
-        },
-        barrier_weight: 0.0,
-        l2_reg: 1.0e-6,
-        opt: SsBroydenConfig {
-            max_iters: 18,
-            max_line_search: 5,
-            rel_tol: 1.0e-5,
-            patience: 2,
-            ..SsBroydenConfig::default()
-        },
-        vm_micro_polish_iters: 0,
-        ..StageTargetSolveConfig::default()
+    let broadband_adj = is_broadband_dry_window(&in_l64[adj_off..adj_end], warmup_adj);
+    let wet_m = mid_signal(&wet_l, &wet_r);
+    let adj_slices = AdjWindowSlices {
+        in_l32: &in_l32,
+        in_r32: &in_r32,
+        in_l: &in_l64[adj_off..adj_end],
+        in_r: &in_r64[adj_off..adj_end],
+        tgt_l: &adj_tgt_l[adj_off..adj_end],
+        tgt_r: &adj_tgt_r[adj_off..adj_end],
+        wet_m: &wet_m,
+        y_star_u: &y_star_u,
+        y_star_l: &y_star_l,
+        warmup_adj,
+        mse_ultra_zero,
+        broadband_adj,
     };
 
-    let rep1 = solve_point_stage_targets_adjoint(
-        &StageTargetSolveInput {
-            runner: inp.runner,
-            base: inp.base_ultra,
-            in_l: &in_l64[adj_off..adj_end],
-            in_r: &in_r64[adj_off..adj_end],
-            target_l: &adj_tgt_l[adj_off..adj_end],
-            target_r: &adj_tgt_r[adj_off..adj_end],
-            init_targets: &zero_st,
-            z_stage: &[0.0; 8],
-            bounds: inp.bounds,
+    let cur = run_pass0_broadband_scale(
+        &inp,
+        vms.vm_ultra,
+        &score_ctx,
+        &adj_slices,
+        AdjointStageState {
+            st: zero_st,
+            l: su0,
+            r: sr_u0,
+            mse: mse_ultra_zero,
+            score: score_ultra_zero,
         },
-        &pass1_cfg,
-        None,
-    )
-    .map_err(map_stage_err)?;
+    )?;
 
-    let mut st_pass1 = rep1.stage_targets;
-    st_pass1[STAGE_TARGET_SLOTS - 1] = 0.0;
-
-    let (mut cur_l, mut cur_r) =
-        render_vm_with_stage_targets(vms.vm_ultra, &in_l32, &in_r32, &st_pass1)?;
-    let mut cur_mse = vec_mse(
-        &pack_post_warmup(&cur_l, &cur_r, warmup, inp.mono_out),
-        &tgt_gn,
-    );
-    if cur_mse >= mse_ultra_zero {
-        let mut polish_cfg = pass1_cfg;
-        polish_cfg.opt.max_iters = 2;
-        polish_cfg.opt.max_line_search = 2;
-        polish_cfg.opt.rel_tol = 1.0e-4;
-        polish_cfg.opt.patience = 1;
-        polish_cfg.vm_micro_polish_iters = 1;
-        if let Ok(pol) = solve_point_stage_targets_adjoint(
-            &StageTargetSolveInput {
-                runner: inp.runner,
-                base: inp.base_ultra,
-                in_l: &in_l64[adj_off..adj_end],
-                in_r: &in_r64[adj_off..adj_end],
-                target_l: &adj_tgt_l[adj_off..adj_end],
-                target_r: &adj_tgt_r[adj_off..adj_end],
-                init_targets: &st_pass1,
-                z_stage: &[0.0; 8],
-                bounds: inp.bounds,
-            },
-            &polish_cfg,
-            Some(vms.vm_ultra),
-        ) && let Ok((pl, pr)) =
-            render_vm_with_stage_targets(vms.vm_ultra, &in_l32, &in_r32, &pol.stage_targets)
-        {
-            let mse_pol = vec_mse(&pack_post_warmup(&pl, &pr, warmup, inp.mono_out), &tgt_gn);
-            if mse_pol < cur_mse {
-                st_pass1 = pol.stage_targets;
-                cur_l = pl;
-                cur_r = pr;
-                cur_mse = mse_pol;
-            }
-        }
-    }
-    if cur_mse > mse_ultra_zero * 1.0001 {
-        st_pass1 = zero_st;
-        cur_l = su0;
-        cur_r = sr_u0;
-        cur_mse = mse_ultra_zero;
-    }
-
-    let tgt_m = mid_signal(&wet_l, &wet_r);
-    let y_mdl_u = mid_signal(&cur_l, &cur_r);
-    let (ml, mr) = render_vm_with_stage_targets(vms.vm_lite, &in_l32, &in_r32, &st_pass1)?;
-    let y_mdl_l = mid_signal(&ml, &mr);
-
-    let wr = solve_two_pass_four_band_wiener(
-        inp.bank, &tgt_m, &y_star_u, &y_star_l, &y_mdl_u, &y_mdl_l, warmup,
-    )
-    .map_err(map_stage_err)?;
-
-    let mut st_final = st_pass1;
-    if wr.pass2_triggered {
-        let pass2_cfg = StageTargetSolveConfig {
-            active_slots: PASS4_ALL_ACTIVE_SLOTS.to_vec(),
-            tier: inp.max_tier,
-            warmup_frames: warmup_adj,
-            loss_weights: CompositeLossWeights {
-                w_besr: 0.35,
-                w_mr_iir: 0.35,
-                w_seg_esr: 0.30,
-                ..CompositeLossWeights::zero()
-            },
-            barrier_weight: 0.0,
-            l2_reg: 1.0e-6,
-            opt: SsBroydenConfig {
-                max_iters: 8,
-                max_line_search: 4,
-                rel_tol: 1.0e-4,
-                patience: 2,
-                ..SsBroydenConfig::default()
-            },
-            vm_micro_polish_iters: 0,
-            ..StageTargetSolveConfig::default()
-        };
-        if let Ok(rep2) = solve_point_stage_targets_adjoint(
-            &StageTargetSolveInput {
-                runner: inp.runner,
-                base: inp.base_ultra,
-                in_l: &in_l64[adj_off..adj_end],
-                in_r: &in_r64[adj_off..adj_end],
-                target_l: &adj_tgt_l[adj_off..adj_end],
-                target_r: &adj_tgt_r[adj_off..adj_end],
-                init_targets: &st_pass1,
-                z_stage: &[0.0; 8],
-                bounds: inp.bounds,
-            },
-            &pass2_cfg,
-            None,
-        ) && let Ok((wl2, wr2)) =
-            render_vm_with_stage_targets(vms.vm_ultra, &in_l32, &in_r32, &rep2.stage_targets)
-        {
-            let mse_w = vec_mse(&pack_post_warmup(&wl2, &wr2, warmup, inp.mono_out), &tgt_gn);
-            if mse_w < cur_mse {
-                st_final = rep2.stage_targets;
-            }
-        }
-    }
+    let tgt_scale = target_msq.max(1.0e-18);
+    let pass0_explained_nearly_all = cur.mse <= PASS0_EARLY_EXIT_REL_RESID * mse_ultra_zero;
+    let keep_pass0 = pass0_explained_nearly_all
+        && (cur.mse <= PASS0_EARLY_EXIT_NESR * tgt_scale
+            || (!broadband_adj && cur.mse <= PASS0_NARROWBAND_KEEP_NESR * tgt_scale));
+    let st_final = if keep_pass0 {
+        cur.st
+    } else {
+        refine_full_slots_pass1_and_pass2(&inp, vms, &score_ctx, &adj_slices, cur)?
+    };
 
     let (st_base, st_ultra_delta) = {
         let lite_ctx = LiteGuardCtx {
@@ -514,6 +491,7 @@ pub(super) fn solve_point_cp1_sample(
             n_adj,
             warmup_adj,
             mse_lite_zero,
+            broadband_adj,
         };
         guard_lite_stage_base(vms.vm_lite, &lite_ctx, &st_final)?
     };
@@ -528,30 +506,10 @@ pub(super) fn solve_point_cp1_sample(
     })
 }
 
-trait CompositeLossWeightsZero {
-    fn zero() -> Self;
-}
-
-impl CompositeLossWeightsZero for CompositeLossWeights {
-    fn zero() -> Self {
-        CompositeLossWeights::from_config(&CompositeLossConfig {
-            w_besr: 0.0,
-            w_mr_iir: 0.0,
-            w_spec_ot: 0.0,
-            w_gabor: 0.0,
-            w_if_gd: 0.0,
-            w_ltas: 0.0,
-            w_seg_esr: 0.0,
-            w_nyquist: 0.0,
-            ..CompositeLossConfig::default()
-        })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dnam_train::control::hoist_stage_targets_onto_model;
+    use dnam_train::control::{ControlKindSpec, hoist_stage_targets_onto_model};
     use dnam_train::{Pass5EmitConfig, decode_dnam_bin_to_model, encode_model_to_dnam_bin};
     use dnam_vm::bin::{DnamBinView, strip_dnam_bin_to_tier};
     use std::f64::consts::TAU;

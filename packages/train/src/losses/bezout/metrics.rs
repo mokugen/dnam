@@ -4,6 +4,7 @@
 
 use crate::error::TrainError;
 
+use super::super::certification::{DrySilentGapMask, POST_T60_GAP_AMP_RATIO};
 use super::super::noise_floor::{smooth_excess_sq, snr_weight};
 use super::{Bezout7FilterBank, esr_ratio, linear_to_db};
 
@@ -219,14 +220,15 @@ pub fn evaluate_joint_interval_besr(
 }
 
 /// Computes normative duration-weighted `20 ms` (`L = round(fs/50)`) `SegESR` in dB for one channel
-/// (`ref[qual.companion.seg-esr]`).
+/// (`ref[qual.companion.seg-esr]`), optionally gating noiseless post-`T60` dry-silent gaps via `gap_mask`.
 #[must_use]
-pub fn compute_seg_esr_channel_db(
+pub fn compute_seg_esr_channel_db_with_gaps(
     pred: &[f64],
     target: &[f64],
     noise: Option<&[f64]>,
     sample_rate_hz: f64,
     warmup: usize,
+    gap_mask: Option<&DrySilentGapMask>,
 ) -> f64 {
     let n = pred.len().min(target.len());
     if n <= warmup
@@ -242,6 +244,11 @@ pub fn compute_seg_esr_channel_db(
     {
         return f64::INFINITY;
     }
+    let eff_gaps = if noise.is_some() {
+        None
+    } else {
+        gap_mask.filter(|g| !g.is_empty())
+    };
     let bank = Bezout7FilterBank::new(sample_rate_hz);
     let y_b = bank.split_3band(&target[..n]);
     let yh_b = bank.split_3band(&pred[..n]);
@@ -258,6 +265,21 @@ pub fn compute_seg_esr_channel_db(
         let w_f = nf / sample_rate_hz;
         let y_frame_e: f64 = target[start..end].iter().map(|v| v * v).sum();
         let f_frame_e: f64 = noise.map_or(0.0, |ns| ns[start..end].iter().map(|v| v * v).sum());
+        if let Some(gm) = eff_gaps
+            && gm.overlap_span(start, end).is_some()
+            && (y_frame_e / nf).sqrt() <= POST_T60_GAP_AMP_RATIO * gm.active_target_rms
+        {
+            let r_frame_e: f64 = target[start..end]
+                .iter()
+                .zip(&pred[start..end])
+                .map(|(y, yh)| (yh - y) * (yh - y))
+                .sum();
+            if (r_frame_e / nf).sqrt() > POST_T60_GAP_AMP_RATIO * gm.active_target_rms {
+                return f64::INFINITY;
+            }
+            start = end;
+            continue;
+        }
         let is_active = if f_frame_e > 0.0 {
             y_frame_e > active_factor * f_frame_e
         } else {
@@ -301,10 +323,27 @@ pub fn compute_seg_esr_channel_db(
         start = end;
     }
     if w_sum <= 0.0 {
-        linear_to_db(0.0)
+        if eff_gaps.is_some() {
+            f64::INFINITY
+        } else {
+            linear_to_db(0.0)
+        }
     } else {
         linear_to_db(num_sum / w_sum)
     }
+}
+
+/// Computes normative duration-weighted `20 ms` (`L = round(fs/50)`) `SegESR` in dB for one channel
+/// (`ref[qual.companion.seg-esr]`).
+#[must_use]
+pub fn compute_seg_esr_channel_db(
+    pred: &[f64],
+    target: &[f64],
+    noise: Option<&[f64]>,
+    sample_rate_hz: f64,
+    warmup: usize,
+) -> f64 {
+    compute_seg_esr_channel_db_with_gaps(pred, target, noise, sample_rate_hz, warmup, None)
 }
 
 #[derive(Clone, Debug)]

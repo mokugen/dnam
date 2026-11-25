@@ -3,6 +3,7 @@
 
 use core::f64::consts::PI;
 
+use super::certification::{DrySilentGapMask, POST_T60_GAP_AMP_RATIO};
 use super::noise_floor::{smooth_excess_sq, snr_weight};
 
 const SCALES: [usize; 5] = [256, 512, 1024, 2048, 4096];
@@ -336,12 +337,14 @@ fn backprop_group(
 }
 
 /// Evaluates normative exact `MR-IIR` score `0.2 * sum_M L_M` (`|ln A - ln A_hat|`, unsmoothed,
-/// using scale-matched resonator-filtered noise RMS `sigma_{M,k,h}` and exact zero-floor rules).
+/// using scale-matched resonator-filtered noise RMS `sigma_{M,k,h}` and exact zero-floor rules),
+/// optionally gating noiseless post-`T60` dry-silent gaps via `gap_mask`.
 #[must_use]
-pub fn compute_mr_iir_channel(
+pub fn compute_mr_iir_channel_with_gaps(
     cache: &MrIirTargetCache,
     pred: &[f64],
     noise: Option<&[f64]>,
+    gap_mask: Option<&DrySilentGapMask>,
 ) -> f64 {
     let n = cache.warmup + cache.t_sel;
     if pred.len() < n || !pred[..n].iter().all(|v| v.is_finite()) {
@@ -352,6 +355,11 @@ pub fn compute_mr_iir_channel(
     {
         return f64::INFINITY;
     }
+    let eff_gaps = if noise.is_some() {
+        None
+    } else {
+        gap_mask.filter(|g| !g.is_empty())
+    };
     let y_slice = &pred[..n];
     let inv_scales = 1.0 / (cache.scales.len() as f64);
     let mut total = 0.0_f64;
@@ -374,6 +382,7 @@ pub fn compute_mr_iir_channel(
         let mut num_sq = 0.0_f64;
         let mut den_sq = 0.0_f64;
         let mut log_sum = 0.0_f64;
+        let mut eval_cells = 0_usize;
         for (g, &trc) in scale.trc.iter().enumerate() {
             step_group_checkpoints_sq(
                 y_slice,
@@ -385,11 +394,24 @@ pub fn compute_mr_iir_channel(
                 &mut cp_ps,
             );
             for (w, &(cp_ws, cp_we)) in scale.win_cp_idx.iter().enumerate() {
+                let abs_s = cache.warmup + scale.checkpoints[cp_ws];
+                let abs_e = cache.warmup + scale.checkpoints[cp_we];
+                let gap_span = eff_gaps.and_then(|gm| gm.overlap_span(abs_s, abs_e));
                 for l in 0..4 {
                     let sigma = sigma_src[g][w][l].max(0.0);
                     let a_t = scale.win_rms_t[g][w][l].max(sigma);
                     let e = (cp_ps[cp_we][l] - cp_ps[cp_ws][l]).max(0.0);
                     let a_p = (e * scale.inv_win_len).sqrt().max(sigma);
+                    if let Some(gm) = eff_gaps
+                        && let Some((gs, ge)) = gap_span
+                        && ((abs_s >= gs && abs_e <= ge)
+                            || a_t <= POST_T60_GAP_AMP_RATIO * gm.active_target_rms)
+                    {
+                        if (a_p - a_t).abs() > 2.0 * POST_T60_GAP_AMP_RATIO * gm.active_target_rms {
+                            return f64::INFINITY;
+                        }
+                        continue;
+                    }
                     let diff = a_t - a_p;
                     num_sq += diff * diff;
                     den_sq += a_t * a_t;
@@ -400,8 +422,12 @@ pub fn compute_mr_iir_channel(
                     } else {
                         log_sum += (a_t.ln() - a_p.ln()).abs();
                     }
+                    eval_cells += 1;
                 }
             }
+        }
+        if eval_cells == 0 {
+            return f64::INFINITY;
         }
         let sc = if den_sq > 0.0 {
             num_sq.sqrt() / den_sq.sqrt()
@@ -410,9 +436,20 @@ pub fn compute_mr_iir_channel(
         } else {
             0.0
         };
-        total += inv_scales * (sc + log_sum / scale.cell_count);
+        total += inv_scales * (sc + log_sum / (eval_cells as f64));
     }
     total
+}
+
+/// Evaluates normative exact `MR-IIR` score `0.2 * sum_M L_M` (`|ln A - ln A_hat|`, unsmoothed,
+/// using scale-matched resonator-filtered noise RMS `sigma_{M,k,h}` and exact zero-floor rules).
+#[must_use]
+pub fn compute_mr_iir_channel(
+    cache: &MrIirTargetCache,
+    pred: &[f64],
+    noise: Option<&[f64]>,
+) -> f64 {
+    compute_mr_iir_channel_with_gaps(cache, pred, noise, None)
 }
 
 /// Evaluates smooth differentiable `MR-IIR` loss and accumulates exact reverse-time 2nd-order

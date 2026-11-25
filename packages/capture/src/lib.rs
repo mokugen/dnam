@@ -35,11 +35,11 @@ pub use resampler::{
     scale_freeze_window,
 };
 pub use solver::{
-    AtomicTrainerProgress, BuyerWatermarkConfig, PROGRESS_MAGIC_DNPR, PROGRESS_WIRE_BYTES,
-    PROGRESS_WIRE_WORDS, SolverOptions, SolverQualityMode, StageAConfig, StageAReport,
-    StageBOutputs, StageBSolveConfig, StageCKnobsOutput, StageDAuditOptions, StageDFinalizeInputs,
-    StageDSolveOutput, TrainerProgressHandle, TrainerProgressSnapshot, TrainingPhase,
-    TrainingStatus, Wide192Accum, accumulate_uplo_u_wide192, canonical_besr_warmup,
+    AtomicTrainerProgress, BuyerWatermarkConfig, ComputeBackendPreference, PROGRESS_MAGIC_DNPR,
+    PROGRESS_WIRE_BYTES, PROGRESS_WIRE_WORDS, SolverOptions, SolverQualityMode, StageAConfig,
+    StageAReport, StageBOutputs, StageBSolveConfig, StageCKnobsOutput, StageDAuditOptions,
+    StageDFinalizeInputs, StageDSolveOutput, TrainerProgressHandle, TrainerProgressSnapshot,
+    TrainingPhase, TrainingStatus, Wide192Accum, accumulate_uplo_u_wide192, canonical_besr_warmup,
     compute_integrated_lufs, contract_256d_gram_tiled_wide192, derive_buyer_gauge_params,
     derive_buyer_phase_seed, derive_buyer_tardos_codebook, export_runtime_dnam_watermarked,
     extract_arena_pole_angles_16, extract_arena_pole_angles_32, extract_arena_pole_angles_34,

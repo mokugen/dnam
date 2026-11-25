@@ -8,8 +8,9 @@ mod metrics;
 
 pub use metrics::{
     BesrIntervalBounds, BesrIntervalDecision, BesrJointIntervalBounds, SegEsrTargetCache,
-    compute_seg_esr_channel_db, eval_seg_esr_cached_and_adjoint, eval_seg_esr_loss_and_adjoint,
-    evaluate_joint_interval_besr, evaluate_uncertain_floor_besr,
+    compute_seg_esr_channel_db, compute_seg_esr_channel_db_with_gaps,
+    eval_seg_esr_cached_and_adjoint, eval_seg_esr_loss_and_adjoint, evaluate_joint_interval_besr,
+    evaluate_uncertain_floor_besr,
 };
 
 use super::noise_floor::{smooth_excess_sq, snr_weight};

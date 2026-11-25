@@ -308,6 +308,7 @@ pub fn solve_point_stage_targets_adjoint(
         w_ltas: config.loss_weights.w_ltas,
         w_seg_esr: config.loss_weights.w_seg_esr,
         w_nyquist: config.loss_weights.w_nyquist,
+        w_mse: config.loss_weights.w_mse,
         ..CompositeLossConfig::default()
     };
     let loss_eval = CompositeLossEvaluator::new(&target_l[..n], &target_r[..n], loss_cfg)?;

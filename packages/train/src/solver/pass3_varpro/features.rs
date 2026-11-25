@@ -332,6 +332,7 @@ struct ExtractMatrixSpec<'a> {
     max_tier_idx: usize,
     w: usize,
     active_taps: usize,
+    options: super::Pass3VarProOptions,
 }
 
 fn extract_channel_tier_matrix(model: &SonaModelF64, spec: &ExtractMatrixSpec<'_>) -> Vec<f32> {
@@ -357,8 +358,10 @@ fn extract_channel_tier_matrix(model: &SonaModelF64, spec: &ExtractMatrixSpec<'_
         }
     };
 
-    write_col(0, spec.ux_base);
-    // Col 1 is populated cleanly during `ro_pole_48k` joint sweep.
+    if !spec.options.suppress_direct_s2_linear {
+        write_col(0, spec.ux_base);
+    }
+    // Col 1 is populated cleanly during `ro_pole_48k` joint sweep unless suppressed.
 
     let lite_fir = spec.active_taps.min(32);
     let full_fir = spec.active_taps.saturating_sub(32).min(16);
@@ -378,6 +381,10 @@ fn extract_channel_tier_matrix(model: &SonaModelF64, spec: &ExtractMatrixSpec<'_
             break;
         }
         for l in lane_range {
+            if l < 64 && (spec.options.suppress_post_core_lane_mask & (1_u64 << l)) != 0 {
+                col += 3;
+                continue;
+            }
             let q = l / 4;
             let k = l % 4;
             for sub_off in [2_usize, 4_usize, 0_usize] {
@@ -423,6 +430,7 @@ struct StereoExtractBase<'a> {
     tier_dims: [usize; 4],
     w: usize,
     active_taps: usize,
+    options: super::Pass3VarProOptions,
 }
 
 fn extract_stereo_tier_matrices(
@@ -443,6 +451,7 @@ fn extract_stereo_tier_matrices(
             max_tier_idx,
             w: base.w,
             active_taps: base.active_taps,
+            options: base.options,
         },
     );
     let fr = extract_channel_tier_matrix(
@@ -458,6 +467,7 @@ fn extract_stereo_tier_matrices(
             max_tier_idx,
             w: base.w,
             active_taps: base.active_taps,
+            options: base.options,
         },
     );
     (fl, fr)
@@ -513,12 +523,11 @@ pub(super) fn eval_pass3_frontend_1x(
 pub(super) fn build_pass3_feature_sets(
     runner: &TrainRunner,
     model: &mut SonaModelF64,
-    in_l: &[f64],
-    in_r: &[f64],
-    target_l: &[f64],
-    target_r: &[f64],
+    pairs: &super::super::model::StereoTrainingPairs<'_>,
     w: usize,
+    options: super::Pass3VarProOptions,
 ) -> Result<StereoFeatureSet, TrainError> {
+    let (in_l, in_r, target_l, target_r) = (pairs.in_l, pairs.in_r, pairs.target_l, pairs.target_r);
     let n = in_l
         .len()
         .min(in_r.len())
@@ -621,6 +630,7 @@ pub(super) fn build_pass3_feature_sets(
                 max_tier_idx: 0,
                 w,
                 active_taps,
+                options,
             },
         ));
         let lite_1x_r_post = Some(extract_channel_tier_matrix(
@@ -636,6 +646,7 @@ pub(super) fn build_pass3_feature_sets(
                 max_tier_idx: 0,
                 w,
                 active_taps,
+                options,
             },
         ));
 
@@ -681,6 +692,7 @@ pub(super) fn build_pass3_feature_sets(
             tier_dims: dims,
             w,
             active_taps,
+            options,
         };
         let (feats_l_post, feats_r_post) = extract_stereo_tier_matrices(model, &upper_base, 3);
         let tier_opt_feats_post = build_tier_opt_feats_post(model, &upper_base);
@@ -745,6 +757,7 @@ pub(super) fn build_pass3_feature_sets(
             tier_dims: dims,
             w,
             active_taps,
+            options,
         };
         let (feats_l_post, feats_r_post) = extract_stereo_tier_matrices(model, &base_1x, 3);
         let tier_opt_feats_post = build_tier_opt_feats_post(model, &base_1x);

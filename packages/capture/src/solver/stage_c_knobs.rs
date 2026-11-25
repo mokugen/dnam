@@ -393,7 +393,6 @@ pub fn solve_stage_c_knobs(
 
     let mono_out = manifest.base.io_config.output_mode == "mono";
     let dual_in = manifest.base.io_config.inputs >= 2;
-    let single_in = mono_out && !dual_in;
     let bounds = StageTargetBounds::canonical(true, min_base_delay);
     let bank = FourBandTptBank::new(48_000.0);
     // Single-stem <= 2,048-frame Stage C adjoint steps run on CPU to avoid global WgpuRunner arena
@@ -408,20 +407,12 @@ pub fn solve_stage_c_knobs(
         let base_lite = decode_dnam_bin_to_model(lite_slice).map_err(map_stage_err)?;
         let ultra_view = DnamBinView::parse(ultra_slice).map_err(map_stage_err)?;
         let lite_view = DnamBinView::parse(lite_slice).map_err(map_stage_err)?;
-        let mut vm_ultra = SonaVm::<DefaultMathBackend>::from_view_owned(
-            &ultra_view,
-            max_tier,
-            48_000.0,
-            single_in,
-        )
-        .map_err(map_stage_err)?;
-        let mut vm_lite = SonaVm::<DefaultMathBackend>::from_view_owned(
-            &lite_view,
-            Tier::Lite,
-            48_000.0,
-            single_in,
-        )
-        .map_err(map_stage_err)?;
+        let mut vm_ultra =
+            SonaVm::<DefaultMathBackend>::from_view_owned(&ultra_view, max_tier, 48_000.0, false)
+                .map_err(map_stage_err)?;
+        let mut vm_lite =
+            SonaVm::<DefaultMathBackend>::from_view_owned(&lite_view, Tier::Lite, 48_000.0, false)
+                .map_err(map_stage_err)?;
 
         let mut vms = PointSolveVms {
             vm_ultra: &mut vm_ultra,
@@ -473,10 +464,9 @@ pub fn solve_stage_c_knobs(
 
     if !collected.mode_a_sweeps.is_empty() && !dry_lr.is_empty() {
         let post_view = DnamBinView::parse(dnam_bin).map_err(map_stage_err)?;
-        let mut vm_sweep = SonaVm::<DefaultMathBackend>::from_view_owned(
-            &post_view, max_tier, 48_000.0, single_in,
-        )
-        .map_err(map_stage_err)?;
+        let mut vm_sweep =
+            SonaVm::<DefaultMathBackend>::from_view_owned(&post_view, max_tier, 48_000.0, false)
+                .map_err(map_stage_err)?;
         for sweep in &collected.mode_a_sweeps {
             let _ = eval_mode_a_sweep_3khz_trajectory_mse(
                 dnam_bin,

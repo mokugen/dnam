@@ -25,8 +25,9 @@ pub use pass2_opt::{
     generate_generic_sobol_seeds, run_pass2_optimize, run_pass2_optimize_with_noise,
 };
 pub use pass3_varpro::{
-    Pass3VarProReport, WeightedReadoutStem, extract_stat_256d_gram,
+    Pass3VarProOptions, Pass3VarProReport, WeightedReadoutStem, extract_stat_256d_gram,
     patch_model_readouts_weighted_cholesky, run_pass3_varpro_readout,
+    run_pass3_varpro_readout_with_options,
 };
 pub use pass5_emit::{
     MAX_INTER_TIER_LU_DRIFT, Pass5EmitConfig, Pass5EmitResult, compute_itu_bs1770_lufs,

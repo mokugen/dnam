@@ -60,6 +60,42 @@ pub enum SolverQualityMode {
     },
 }
 
+/// Compute backend selection policy for `Stage B` `SONA` backbone optimization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ComputeBackendPreference {
+    /// Auto-detect WebGPU (`gpu-wgpu`) and transparently fall back to host CPU SIMD.
+    #[default]
+    Auto,
+    /// Force deterministic host CPU SIMD execution.
+    Cpu,
+    /// Require native WebGPU (`gpu-wgpu`), failing closed if no compliant adapter is available.
+    Wgpu,
+}
+
+impl ComputeBackendPreference {
+    /// Resolves a [`TrainRunner`] honoring this backend preference, failing closed for
+    /// [`Self::Wgpu`] when no compliant WebGPU adapter is available.
+    pub fn resolve_runner(self) -> Result<TrainRunner, dnam_engine::schema::DnamError> {
+        match self {
+            Self::Auto => Ok(TrainRunner::auto_detect()),
+            Self::Cpu => Ok(TrainRunner::cpu()),
+            Self::Wgpu => {
+                let runner = TrainRunner::auto_detect();
+                if !matches!(
+                    runner.active_backend(),
+                    dnam_train::ActiveComputeBackend::CpuSimd { .. }
+                ) {
+                    Ok(runner)
+                } else {
+                    Err(dnam_engine::schema::DnamError::SchemaValidationError(
+                        "requested WebGPU compute backend (`ComputeBackendPreference::Wgpu`), but no compliant WebGPU adapter is available".to_string(),
+                    ))
+                }
+            }
+        }
+    }
+}
+
 /// Tuning options for the `v3` 4-Stage Analytical Pipeline (`Stage A..D`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SolverOptions {
@@ -71,6 +107,8 @@ pub struct SolverOptions {
     pub clear_dynamic_w_ctrl: bool,
     /// Convergence vs. early-threshold stopping policy across Stage B and Stage IV.
     pub quality_mode: SolverQualityMode,
+    /// Compute backend selection policy (`Auto`, `Cpu`, or fail-closed `Wgpu`).
+    pub backend_preference: ComputeBackendPreference,
     /// Optional empirical left/right repeatability profiles measured strictly from `(x, y)` probes.
     pub rep_profiles: Option<[crate::metrics::TargetRepeatabilityProfile; 2]>,
 }
@@ -82,6 +120,7 @@ impl Default for SolverOptions {
             gram_frame_stride: 4,
             clear_dynamic_w_ctrl: true,
             quality_mode: SolverQualityMode::BestUntilDiminishingReturns,
+            backend_preference: ComputeBackendPreference::Auto,
             rep_profiles: None,
         }
     }
@@ -100,6 +139,7 @@ impl SolverOptions {
             gram_frame_stride: 4,
             clear_dynamic_w_ctrl: false,
             quality_mode: SolverQualityMode::BestUntilDiminishingReturns,
+            backend_preference: ComputeBackendPreference::Auto,
             rep_profiles: None,
         }
     }
@@ -360,6 +400,27 @@ mod tests {
             resolve_eval_active_len(&manifest, &dry_padded, Some(&wet_padded), 8_000),
             6_400
         );
+    }
+
+    #[test]
+    fn test_compute_backend_preference_resolution() {
+        let cpu = ComputeBackendPreference::Cpu.resolve_runner().unwrap();
+        assert!(matches!(
+            cpu.active_backend(),
+            dnam_train::ActiveComputeBackend::CpuSimd { .. }
+        ));
+        let auto = ComputeBackendPreference::Auto.resolve_runner().unwrap();
+        match ComputeBackendPreference::Wgpu.resolve_runner() {
+            Ok(wgpu_runner) => assert!(!matches!(
+                wgpu_runner.active_backend(),
+                dnam_train::ActiveComputeBackend::CpuSimd { .. }
+            )),
+            Err(err) => assert!(matches!(
+                err,
+                dnam_engine::schema::DnamError::SchemaValidationError(_)
+            )),
+        }
+        let _ = auto.active_backend();
     }
 
     proptest! {

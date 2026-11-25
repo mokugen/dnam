@@ -331,6 +331,7 @@ pub(super) fn rebuild_vault_container_with_progress(
         crate::solver::stage_c_knobs::clear_dnam_bin_control_bus_state(&mut dnam_bin)?;
     }
 
+    let mut stage_b_certified_pass5 = false;
     if need_path2 {
         if let Some(ref star_entry) = active_star
             && let Some(star_stmc_bytes) = state.stmc_by_id.get(&star_entry.chunk_id)
@@ -376,7 +377,15 @@ pub(super) fn rebuild_vault_container_with_progress(
                 }
             }
 
-            // Stage B: Joint 4-Tier SONA Backbone & 256-D uplo='U' STAT Contraction
+            let spectral_control_pivot_hz =
+                crate::solver::stage_b_backbone::spectral_bus::detect_offcenter_spectral_pivot_hz(
+                    &state.manifest,
+                    &state.stmc_by_id,
+                    &wet_lr,
+                    active_frames,
+                );
+
+            // Stage B: Joint 4-Tier SONA Backbone, Pass-5 Certification & 256-D uplo='U' STAT Contraction
             let stage_b = solve_stage_b_backbone_with_pass1(
                 &state.manifest,
                 &mut dnam_bin,
@@ -388,12 +397,16 @@ pub(super) fn rebuild_vault_container_with_progress(
                         gram_frame_stride: options.gram_frame_stride,
                         preserve_existing_backbone: stage_a_rep.preserved_backbone,
                         quality_mode: options.quality_mode,
+                        backend_preference: options.backend_preference,
                         rep_profiles: options.rep_profiles,
+                        spectral_control_pivot_hz,
+                        finalize_pass5: true,
                     },
                     precomputed_pass1: pass1_res,
                 },
                 &progress.subrange(120, 760),
             )?;
+            stage_b_certified_pass5 = true;
             accum_solve_ms += stage_b.elapsed_ms;
             stat_out = Some((stage_b.stat_bytes, None));
             fallback_esr = Some(stage_b.prefix_esr_db);
@@ -432,7 +445,9 @@ pub(super) fn rebuild_vault_container_with_progress(
         audit_clamp_count(&state.manifest),
         fallback_esr.unwrap_or([f32::NAN; 4]),
     );
-    let audit_opts = if need_path2 {
+    let audit_opts = if stage_b_certified_pass5 {
+        StageDAuditOptions::PATH2_POST_STAGE_B_CERTIFIED
+    } else if need_path2 {
         StageDAuditOptions::PATH2_FULL
     } else {
         StageDAuditOptions::PATH1_HEAD_ONLY

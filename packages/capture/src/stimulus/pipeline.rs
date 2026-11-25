@@ -32,7 +32,10 @@ use crate::proj::schema::DnamProjManifest;
 use crate::proj::vault::{
     initialize_backbone_dnam_bin_if_needed, solve_captures_batch_with_progress,
 };
-use crate::solver::{SolverOptions, TrainerProgressHandle, TrainingPhase, TrainingStatus};
+use crate::solver::{
+    ComputeBackendPreference, SolverOptions, SolverQualityMode, TrainerProgressHandle,
+    TrainingPhase, TrainingStatus,
+};
 use crate::targets::DistillationTarget;
 
 use super::StimulusConfig;
@@ -75,6 +78,10 @@ pub struct AdaptiveTrainingOptions {
     pub use_spcm_tier1: bool,
     /// Condensed coreset frame length (`96_000..=120_000`, `% 16 == 0`; `default = 120_000` / `2.5 s`).
     pub coreset_frames_48k: usize,
+    /// Convergence vs. early-threshold stopping policy for `Stage B` / `Stage IV`.
+    pub quality_mode: SolverQualityMode,
+    /// Compute backend preference (`Auto`, `Cpu`, or fail-closed `Wgpu`) for `Stage B`.
+    pub backend_preference: ComputeBackendPreference,
 }
 
 impl Default for AdaptiveTrainingOptions {
@@ -90,6 +97,8 @@ impl Default for AdaptiveTrainingOptions {
             calb: None,
             use_spcm_tier1: false,
             coreset_frames_48k: CORESET_FP32_CANONICAL_25S_FRAMES,
+            quality_mode: SolverQualityMode::BestUntilDiminishingReturns,
+            backend_preference: ComputeBackendPreference::Auto,
         }
     }
 }
@@ -309,6 +318,8 @@ pub fn train_adaptive_target_with_progress(
         captured_specs,
         Some(&inpc_bytes),
         SolverOptions {
+            quality_mode: options.quality_mode,
+            backend_preference: options.backend_preference,
             rep_profiles,
             ..SolverOptions::default()
         },

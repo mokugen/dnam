@@ -57,15 +57,14 @@ pub fn extract_stat_256d_gram(
     }
 
     let mut m_tmp = model.clone();
-    let mut fset = build_pass3_feature_sets(
-        runner,
-        &mut m_tmp,
-        &in_l[..n],
-        &in_r[..n],
-        &target_l[..n],
-        &target_r[..n],
-        w,
-    )?;
+    let pairs = StereoTrainingPairs {
+        in_l: &in_l[..n],
+        in_r: &in_r[..n],
+        target_l: &target_l[..n],
+        target_r: &target_r[..n],
+    };
+    let opts = super::Pass3VarProOptions::default();
+    let mut fset = build_pass3_feature_sets(runner, &mut m_tmp, &pairs, w, opts)?;
     let hp_l = eval_hp_post_for_ro(
         &m_tmp,
         &fset.raw_l_col0,
@@ -257,15 +256,14 @@ fn patch_model_readouts_weighted_cholesky_inner(
         if m < 32 {
             continue;
         }
-        let mut fset = build_pass3_feature_sets(
-            runner,
-            model,
-            &in_l[..n],
-            &in_r[..n],
-            &tgt_l[..n],
-            &tgt_r[..n],
-            w,
-        )?;
+        let pairs = StereoTrainingPairs {
+            in_l: &in_l[..n],
+            in_r: &in_r[..n],
+            target_l: &tgt_l[..n],
+            target_r: &tgt_r[..n],
+        };
+        let opts = super::Pass3VarProOptions::default();
+        let mut fset = build_pass3_feature_sets(runner, model, &pairs, w, opts)?;
         let hp_l = eval_hp_post_for_ro(
             model,
             &fset.raw_l_col0,

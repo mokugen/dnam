@@ -179,6 +179,10 @@ Accumulated tier-prefix normal equations $\mathbf{G}_{1:D_T, 1:D_T} + \boldsymbo
 
 Normal equations are weighted across 4th-order Bezout LF/MF/HF bands (`ref[qual.besr.bezout-crossover]`), subject to 33-band 1/3-octave LTAS tilt bounds (`ref[qual.companion.ltas]`), while refining continuous Kautz poles and lag-ordered `ModalConvolver` early FIR taps (32 / 48 / 96 / 128 taps), conditioning pre-nonlinear crossbar and `CP1`/`U_int` subspaces, and baking StarCenter readout statistics into `STAT` (`ref[container.proj.stat-uplo-u]`).
 
+Host LTAS KKT polish uses periodic-equivalent Hann-windowed Welch FFT projection (`eval_ltas_and_nyquist_fused`), excludes bins whose target input basis amplitude falls below 5% of peak basis amplitude so Schoukens-Pintelon Regime-1 Law 0.C notch gaps never destabilize normal equations, and targets aspiration LTAS ceilings [0.20, 0.05, 0.03, 0.02] dB across Lite..Ultra (`ref[qual.tiers.floors-not-stopping-criteria]`).
+
+When adjacent tiers share the same basis (`same_basis`) and the lower tier already reaches normalized MSE below 1e-4 (`INHERIT_HIGH_ACCURACY_NESR_CEIL`), upper-tier inheritance (`tier_gate`) copies zero-padded lower-tier weights into the child whenever child MSE exceeds `(1 - min_rel_drop)` times parent MSE. The required drop is 0.50 (`INHERIT_DEEP_MIN_REL_DROP`) when parent NESR is below 1e-5 (`INHERIT_DEEP_FLOOR_NESR_CEIL`), and `clamp(0.001 * delta_dim, 0.02, 0.08)` otherwise, keeping holdout tiers monotone.
+
 ### 2.4 Pass 4 — Parametric Control-Bus & `CP1` Subspace Identification
 
 `r[train.pipeline.control-projection-fit]`
@@ -196,6 +200,10 @@ To preserve exact 0-ULP SO(4) buyer-watermark gauge invariance without mutating 
 Additionally, joint control optimization unlocks per-lane `stage_latent_core_mods_fp16[0..1024]` (`SONA_META_CORE_MODS_PRESENT`, zeroed cols 120..128, `[-4.0, +4.0]`) alongside per-block `stage_latent_mods_fp16[48..80]` and per-quad `stage_latent_ctrl_ultra_fp16[0..160]` coordinated with Tardos masking.
 
 Meanwhile, collinear `[8..48]` stays zero while `default_knobs`, `op_p_to_core`, and `ou_to_z_stage_ultra_fp16` stay untouched.
+
+When off-center `STMC` stems exhibit at least 0.75 dB inter-stem 33-band spectral spread (`MIN_SPECTRAL_SHAPE_SPREAD_DB`), Pass 3 configures a data-driven 4-block Arena 0 partition-of-unity TPT-SVF plus `tone_dir` spectral control bus bounded inside 300..6,500 Hz. Dedicated `PolyADAA1` lanes (drive 1/32, -24.0 / +48.0 weights) feed `pre_conv` with zero unmodulated bypass using two-stage pure-vs-hybrid selection (-48.0 dB pure sufficiency, -38.0 dB 2x trigger, both strictly below Ultra's -34.0 dB floor).
+
+Pass 4 point-wise optimization gates Pass-0 slots [22, 30] early exit (0.05 relative residual, 2.5e-4 broadband or 1.0e-3 narrowband NESR) and parsimony (0.25 relative residual, 2.5e-3 NESR) before running broadband (0.45 MSE + 0.55 bESR, 1e-6 L2) or narrowband (1.0 MSE, 1e-5 L2) Pass-1 adjoint optimization and optional 4-band Wiener Pass-2 recovery (0.40 MSE + 0.40 bESR + 0.20 MR-IIR broadband).
 
 For continuous dynamic sweeps (`MODE_A_SWEEP`, `bit 1<<2` in `STMC`, `ref[container.proj.stmc-capsule]`), Pass 4 executes primary batched end-to-end continuous 3 kHz trajectory optimization over the decoded $u(t)$ knot schedule (`R <= 36` uniform knot grid linear interpolation onto every 16-sample tick) paired with sampled stationary coreset stems under StarCenter Mode-0 lock and 3-Phase Control-Space clamping (`ref[train.audit.phase1.clamp-stability]`).
 

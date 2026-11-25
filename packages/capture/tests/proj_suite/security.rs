@@ -37,14 +37,16 @@ use super::test_support::{
 };
 use dnam_capture::proj::verify_dnam_bin_zero_dc;
 use dnam_engine::Tier;
-use dnam_engine::container::{DnamContainerView, build_dnam_container};
+use dnam_engine::container::{DnamContainerView, build_dnam_container, extract_dnam_bin};
 use dnam_engine::provenance::DefaultCryptoProvider;
 use dnam_engine::schema::{
     ControlCalibration, ControlCalibrationRole, ControlSchemaDef, DistributionPolicy, DnamError,
     DnamJsonHeader, DnamProtectionProfile,
 };
+use dnam_vm::SonaVm;
 use dnam_vm::bin::{
-    ARENA_TIER_BYTES, Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire,
+    ARENA_TIER_BYTES, Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire,
+    Arena3UltraDeltaWire, DnamBinView,
 };
 use dnam_vm::control::Cp1ContributorSlot;
 use dnam_vm::math::DefaultMathBackend;
@@ -643,14 +645,42 @@ fn test_two_path_capture_vault_editing_and_wav_subsample_alignment() {
         view_s0_s1.chunk_slice(ProjChunkKind::Stat, 0).unwrap(),
         stat_s0_bytes.as_slice()
     );
+    let dbin = extract_dnam_bin(view_s0_s1.chunk_slice(ProjChunkKind::Wght, 0).unwrap()).unwrap();
+    let dv = DnamBinView::parse(dbin).unwrap();
+    let w_nz = |b: &[u8]| b.iter().any(|&x| x != 0);
     assert!(
-        a0_s1
-            .control_bus_lite
-            .w_ctrl
-            .as_bytes()
+        w_nz(a0_s1.control_bus_lite.w_ctrl.as_bytes())
+            || dv.cext.is_some_and(|c| w_nz(c.w_ctrl_ext.as_bytes())),
+        "Stage C must populate non-zero 31-slot W_ctrl/CEXT weights for off_1"
+    );
+    assert!(
+        a0_s1.control_bus_lite.cp1_dir.cp1_dir_count.get() > 0
+            && w_nz(&a0_s1.control_bus_lite.cp1_base),
+        "Stage C must populate non-zero CP1 weights for off_1"
+    );
+    let es = (n / 8).max(512).min(n.saturating_sub(64));
+    let render_mse = |ctrls: &[(usize, f32)]| -> f64 {
+        let mut vm = SonaVm::<DefaultMathBackend>::from_view_owned(
+            &dv,
+            dnam_vm::Tier::Ultra,
+            48_000.0,
+            false,
+        )
+        .unwrap();
+        vm.set_controls_batch(ctrls).unwrap();
+        let (mut ol, mut or) = (vec![0.0_f32; n], vec![0.0_f32; n]);
+        vm.process_block(&dry_0, &dry_0, &mut ol, &mut or).unwrap();
+        ol[es..n]
             .iter()
-            .any(|&b| b != 0),
-        "Stage C must populate non-zero W_ctrl weights for off_1"
+            .zip(&wet_1[es..n])
+            .map(|(&p, &w)| (f64::from(p) - f64::from(w)).powi(2))
+            .sum::<f64>()
+            / ((n - es) as f64)
+    };
+    let (mse_star, mse_off1) = (render_mse(&[]), render_mse(&[(0, 8.0), (1, 1.0)]));
+    assert!(
+        mse_off1 < 0.25 * mse_star,
+        "off1={mse_off1:.3e} star={mse_star:.3e}"
     );
     assert_eq!(
         view_s0_s1.manifest.base.controls_schema[0].safe_clamped_range,

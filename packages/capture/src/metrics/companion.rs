@@ -14,7 +14,7 @@ pub use ltas::{
     evaluate_ltas_33band_report, evaluate_ltas_33band_report_with_max_freq,
 };
 pub(crate) use mr_iir::MrIirTargetCache;
-pub use mr_iir::compute_mr_iir_loss;
+pub use mr_iir::{compute_mr_iir_loss, compute_mr_iir_loss_with_gaps};
 
 use super::bezout::{const_abs_f64, const_exp_f64, split_bezout_3band_series};
 
@@ -46,6 +46,10 @@ const _: () = assert!(const_abs_f64(SIX_DB_POWER_FACTOR - 3.981_071_705_534_972_
 
 pub(crate) const MAX_METRIC_SAMPLE_RATE_HZ: f64 = 1_536_000.0;
 
+pub use dnam_train::losses::{
+    DRY_SILENCE_EPS, DrySilentGapMask, MIN_DRY_SILENT_GAP_SECS, POST_T60_GAP_AMP_RATIO,
+};
+
 // ============================================================================
 // Segmental Frame-Wise ESR (`SegESR`, r[qual.companion.seg-esr])
 // ============================================================================
@@ -59,14 +63,14 @@ pub struct MultiRateSegEsrSlice<'a> {
     pub noise: Option<&'a [f64]>,
 }
 
-/// Evaluates duration-weighted `20 ms` (`L = round(fs / 50)`) 3-band Bézout RMS energy-envelope
-/// `SegESR` across one or more constant-rate segments without spanning rate transitions, retaining
-/// exact-duration-weighted partial tail frames and enforcing the `+1.0 dB` excluded-frame residual
-/// guard (`ref[qual.companion.seg-esr]`).
+/// Variant of [`compute_multirate_seg_esr_with_profile_db`] that gates noiseless post-`T60`
+/// dry-silent gaps via `gap_mask` while enforcing a strict `-60 dB` residual guard across each gap.
 #[must_use]
-pub fn compute_multirate_seg_esr_with_profile_db(
+pub fn compute_multirate_seg_esr_with_gaps_db(
     segments: &[MultiRateSegEsrSlice<'_>],
     env_inc_ratio: [f64; 3],
+    gap_mask: Option<&DrySilentGapMask>,
+    seg_abs_offset: usize,
 ) -> (f64, usize, bool) {
     if segments.is_empty()
         || !env_inc_ratio
@@ -75,9 +79,11 @@ pub fn compute_multirate_seg_esr_with_profile_db(
     {
         return (f64::INFINITY, 0, false);
     }
+    let eff_gaps = gap_mask.filter(|g| !g.is_empty());
     let mut weighted_lin_sum = 0.0_f64;
     let mut weight_sum = 0.0_f64;
     let mut active_segs = 0usize;
+    let mut cur_offset = seg_abs_offset;
 
     for seg in segments {
         let fs = seg.sample_rate_hz;
@@ -144,6 +150,19 @@ pub fn compute_multirate_seg_esr_with_profile_db(
             {
                 return (f64::INFINITY, active_segs, false);
             }
+            if seg.noise.is_none()
+                && let Some(gm) = eff_gaps
+                && gm
+                    .overlap_span(cur_offset + start, cur_offset + end)
+                    .is_some()
+                && (e_sig_bb * inv_nf).sqrt() <= POST_T60_GAP_AMP_RATIO * gm.active_target_rms
+            {
+                if (e_err_bb * inv_nf).sqrt() > POST_T60_GAP_AMP_RATIO * gm.active_target_rms {
+                    return (f64::INFINITY, active_segs, false);
+                }
+                start = end;
+                continue;
+            }
             let is_active = if e_nse_bb > 0.0 {
                 e_sig_bb > SIX_DB_POWER_FACTOR * e_nse_bb
             } else {
@@ -185,6 +204,7 @@ pub fn compute_multirate_seg_esr_with_profile_db(
             }
             start = end;
         }
+        cur_offset = cur_offset.saturating_add(n);
     }
 
     if active_segs == 0
@@ -204,6 +224,18 @@ pub fn compute_multirate_seg_esr_with_profile_db(
         10.0 * r_bar.log10()
     };
     (db, active_segs, true)
+}
+
+/// Evaluates duration-weighted `20 ms` (`L = round(fs / 50)`) 3-band Bézout RMS energy-envelope
+/// `SegESR` across one or more constant-rate segments without spanning rate transitions, retaining
+/// exact-duration-weighted partial tail frames and enforcing the `+1.0 dB` excluded-frame residual
+/// guard (`ref[qual.companion.seg-esr]`).
+#[must_use]
+pub fn compute_multirate_seg_esr_with_profile_db(
+    segments: &[MultiRateSegEsrSlice<'_>],
+    env_inc_ratio: [f64; 3],
+) -> (f64, usize, bool) {
+    compute_multirate_seg_esr_with_gaps_db(segments, env_inc_ratio, None, 0)
 }
 
 /// Evaluates duration-weighted `20 ms` (`L = round(fs / 50)`) 3-band Bézout RMS energy-envelope

@@ -97,7 +97,7 @@ pub(super) fn extract_sweep_windows_for_stem(
         .iter()
         .map(|&[l, r]| 0.5 * (f64::from(l) + f64::from(r)))
         .collect();
-    let hop = (n_fit / 4).max(64).min(body_cap.max(64));
+    let hop = (n_fit / 16).max(64).min(body_cap.max(64));
     let rms_segs = extract_sweep_window_midpoints(&dry_mono, hop, 1.0e-5);
     let traj_len = wet_bound;
 
@@ -105,7 +105,20 @@ pub(super) fn extract_sweep_windows_for_stem(
         .iter()
         .filter(|s| s.end_frame.saturating_sub(s.start_frame) >= n_fit)
         .collect();
-    if rms_segs.len() >= 2 && valid_segs.len() == rms_segs.len() {
+    let min_seg_len = valid_segs
+        .iter()
+        .map(|s| s.end_frame - s.start_frame)
+        .min()
+        .unwrap_or(0);
+    let max_seg_len = valid_segs
+        .iter()
+        .map(|s| s.end_frame - s.start_frame)
+        .max()
+        .unwrap_or(0);
+    let uniform_bursts = rms_segs.len() >= 2
+        && valid_segs.len() == rms_segs.len()
+        && max_seg_len <= 3 * min_seg_len.max(1);
+    if uniform_bursts {
         let k_pick = valid_segs.len().min(4);
         for idx in 0..k_pick {
             let seg_idx = (idx * (valid_segs.len() - 1)) / (k_pick - 1);
@@ -117,6 +130,43 @@ pub(super) fn extract_sweep_windows_for_stem(
             out_windows.push(ExtractedSweepWindow {
                 start_frame: off_w,
                 phys_controls: eval_sweep_schedule_at_frame(&sched, seg.midpoint_frame, traj_len),
+            });
+        }
+        return true;
+    }
+
+    if !valid_segs.is_empty() {
+        let first_start = valid_segs[0].start_frame;
+        let last_end = valid_segs.last().unwrap().end_frame;
+        let last_max_off = last_end.saturating_sub(n_fit);
+        let active_span = last_end.saturating_sub(first_start);
+        let n_wins = if last_max_off <= first_start {
+            1
+        } else {
+            (active_span / n_fit).clamp(2, 4)
+        };
+        let min_sep = (n_fit / 4).max(1);
+        for w_idx in 0..n_wins {
+            let target_off = if n_wins <= 1 {
+                first_start
+            } else {
+                first_start + (w_idx * (last_max_off - first_start)) / (n_wins - 1)
+            };
+            let snapped_off = valid_segs
+                .iter()
+                .map(|seg| target_off.clamp(seg.start_frame, seg.end_frame - n_fit))
+                .min_by_key(|&cand| cand.abs_diff(target_off))
+                .unwrap_or(first_start);
+            if out_windows
+                .iter()
+                .any(|w| w.start_frame.abs_diff(snapped_off) < min_sep)
+            {
+                continue;
+            }
+            let mid_frame = (snapped_off + n_fit / 2).min(traj_len.saturating_sub(1));
+            out_windows.push(ExtractedSweepWindow {
+                start_frame: snapped_off,
+                phys_controls: eval_sweep_schedule_at_frame(&sched, mid_frame, traj_len),
             });
         }
         return true;
@@ -558,5 +608,54 @@ mod tests {
         ));
         assert_eq!(mx_pairs, vec![(0, 1)]);
         assert!(!mx_out.is_empty());
+
+        // Asymmetric Schoukens-like 96k gapped excitation: [0..16384] active, 4 short bursts +
+        // 4 silent gaps in [16384..52384], and [52384..96000] active continuous tail.
+        let n96 = 96_000_usize;
+        let mut dry96 = vec![[0.0_f32; 2]; n96];
+        let tone = |i: usize| {
+            let s = 0.25 * (TAU * 310.0 * (i as f64) / 48_000.0).sin() as f32;
+            [s, s]
+        };
+        for (i, slot) in dry96[0..16_384].iter_mut().enumerate() {
+            *slot = tone(i);
+        }
+        for (b_start, b_end) in [
+            (20_500_usize, 24_600_usize),
+            (25_600, 30_700),
+            (35_000, 41_000),
+            (44_500, 48_400),
+        ] {
+            for (i, slot) in dry96[b_start..b_end].iter_mut().enumerate() {
+                *slot = tone(b_start + i);
+            }
+        }
+        for (i, slot) in dry96[52_384..n96].iter_mut().enumerate() {
+            *slot = tone(52_384 + i);
+        }
+        let (mut p96, mut out96) = (Vec::new(), Vec::new());
+        assert!(extract_sweep_windows_for_stem(
+            &SweepStemInputs {
+                dry_lr: &dry96,
+                wet_lr: &dry96,
+                n_fit: 4_096,
+                n_active: n96,
+                windows: &[mk_win(0, -1.0), mk_win(0, 1.0)],
+                base_meta_ctrls: &[0.0],
+            },
+            &mut p96,
+            &mut out96,
+        ));
+        assert_eq!(out96.len(), 4, "got {} windows", out96.len());
+        for win in &out96 {
+            let msq: f64 = dry96[win.start_frame..win.start_frame + 4_096]
+                .iter()
+                .map(|&[l, r]| 0.5 * (f64::from(l).powi(2) + f64::from(r).powi(2)))
+                .sum::<f64>()
+                / 4_096.0;
+            assert!(msq.sqrt() > 1.0e-3, "silent gap at {}", win.start_frame);
+        }
+        assert!(out96[0].phys_controls[0] < -0.80, "first={:?}", out96[0]);
+        assert!(out96[3].phys_controls[0] > 0.80, "last={:?}", out96[3]);
     }
 }

@@ -19,12 +19,14 @@ pub use bezout::{
     BESR_WORST_BAND_OFFSET_DB, BesrChannelReport, BesrIntervalBounds, BesrIntervalDecision,
     BesrJointIntervalBounds, BesrLossSpec, Bezout7FilterBank, NoiseQualification,
     ONE_DB_POWER_FACTOR, SegEsrTargetCache, compute_besr_channel, compute_seg_esr_channel_db,
-    eval_seg_esr_cached_and_adjoint, eval_seg_esr_loss_and_adjoint, evaluate_joint_interval_besr,
-    evaluate_noise_qualified_besr, evaluate_uncertain_floor_besr,
+    compute_seg_esr_channel_db_with_gaps, eval_seg_esr_cached_and_adjoint,
+    eval_seg_esr_loss_and_adjoint, evaluate_joint_interval_besr, evaluate_noise_qualified_besr,
+    evaluate_uncertain_floor_besr,
 };
 pub use certification::{
-    TierCertificationReport, TierQualityFloors, certify_tier_audio, check_adjacent_tier_monotone,
-    is_tier_pair_monotone,
+    DRY_SILENCE_EPS, DrySilentGapMask, MIN_DRY_SILENT_GAP_SECS, POST_T60_GAP_AMP_RATIO,
+    TierCertificationReport, TierQualityFloors, certify_tier_audio, certify_tier_audio_with_gaps,
+    check_adjacent_tier_monotone, is_tier_pair_monotone,
 };
 pub use fft::{Radix2FftPlan, build_hann_window, compute_welch_seg_starts};
 pub use ltas::{
@@ -32,7 +34,10 @@ pub use ltas::{
     canonical_ltas_33_centers_hz, canonical_ltas_33_intervals_hz, compute_ltas_channel,
     eval_ltas_and_nyquist_fused, eval_ltas_loss_and_adjoint, eval_nyquist_hinge_and_adjoint,
 };
-pub use mr_iir::{MrIirTargetCache, compute_mr_iir_channel, eval_mr_iir_loss_and_adjoint};
+pub use mr_iir::{
+    MrIirTargetCache, compute_mr_iir_channel, compute_mr_iir_channel_with_gaps,
+    eval_mr_iir_loss_and_adjoint,
+};
 pub use noise_floor::{EXCESS_TAU_FRAC, EXCESS_TAU_MIN, SNR_EPS, smooth_excess_sq, snr_weight};
 pub use phase_ot::{
     IfGdTargetCache, SpecOtTargetCache, eval_if_gd_loss_and_adjoint, eval_spec_ot_loss_and_adjoint,
@@ -62,6 +67,8 @@ pub struct CompositeLossWeights {
     pub w_seg_esr: f64,
     /// Ultrasonic above-20 kHz `UltrasonicHinge` weight (`0.25` constant on homotopy schedule).
     pub w_nyquist: f64,
+    /// Energy-normalized time-domain waveform MSE weight (`0.0` on homotopy schedule).
+    pub w_mse: f64,
 }
 
 impl CompositeLossWeights {
@@ -77,6 +84,7 @@ impl CompositeLossWeights {
             w_ltas: cfg.w_ltas,
             w_seg_esr: cfg.w_seg_esr,
             w_nyquist: cfg.w_nyquist,
+            w_mse: cfg.w_mse,
         }
     }
 
@@ -101,6 +109,7 @@ impl CompositeLossWeights {
             w_ltas: 0.10,
             w_seg_esr: 0.20 - 0.10 * h,
             w_nyquist: 0.25,
+            w_mse: 0.0,
         }
     }
 }
@@ -137,6 +146,8 @@ pub struct CompositeLossConfig {
     pub w_seg_esr: f64,
     /// Ultrasonic `[20 kHz, fs/2]` excess-energy stopband weight.
     pub w_nyquist: f64,
+    /// Energy-normalized time-domain waveform MSE weight (`0.0` default).
+    pub w_mse: f64,
     /// STFT FFT length for `SpecOT` and `IF+GD`.
     pub stft_fft_size: usize,
 }
@@ -158,6 +169,7 @@ impl Default for CompositeLossConfig {
             },
             w_seg_esr: 0.20,
             w_nyquist: 0.15,
+            w_mse: 0.0,
             stft_fft_size: 256,
         }
     }
@@ -184,6 +196,8 @@ pub struct CompositeLossBreakdown {
     pub seg_esr: f64,
     /// Unweighted ultrasonic `[20 kHz, fs/2]` hinge component.
     pub nyquist: f64,
+    /// Unweighted energy-normalized time-domain MSE component.
+    pub mse: f64,
 }
 
 /// Reusable stereo composite loss & reverse-mode time-domain adjoint evaluator.
@@ -203,6 +217,7 @@ pub struct CompositeLossEvaluator {
 struct ChannelCachesWrapper {
     bezout_target_e: [f64; 3],
     bezout_noise_e: Option<[f64; 3]>,
+    target_post_e: f64,
     mr_iir: Option<MrIirTargetCache>,
     ltas: Option<Welch33TargetCache>,
     gabor: GaborTargetCache,
@@ -225,6 +240,7 @@ impl ChannelCachesWrapper {
         let bezout_target_e = bank.split_3band_and_energies(target, w, &mut tmp);
         let bezout_noise_e =
             noise.map(|ns| bank.split_3band_and_energies(&ns[..target.len()], w, &mut tmp));
+        let target_post_e = target[w..].iter().map(|&v| v * v).sum::<f64>();
         let mr_iir = (build_all || cfg.w_mr_iir > 0.0)
             .then(|| MrIirTargetCache::new(target, noise, w, cfg.sample_rate_hz))
             .flatten();
@@ -262,6 +278,7 @@ impl ChannelCachesWrapper {
         Ok(Self {
             bezout_target_e,
             bezout_noise_e,
+            target_post_e,
             mr_iir,
             ltas,
             gabor,
@@ -464,6 +481,26 @@ impl CompositeLossEvaluator {
             (0.0, 0.0)
         };
 
+        let mut mse = 0.0;
+        if weights.w_mse > 0.0 {
+            let denom = (caches.target_post_e + 1.0e-6).max(1.0e-6);
+            let mut err_sq = 0.0_f64;
+            if let Some(dst) = grad_opt.as_deref_mut() {
+                let scale = 2.0 * weights.w_mse / denom;
+                for t in w..self.len {
+                    let diff = pred[t] - target[t];
+                    err_sq += diff * diff;
+                    dst[t] += scale * diff;
+                }
+            } else {
+                for t in w..self.len {
+                    let diff = pred[t] - target[t];
+                    err_sq += diff * diff;
+                }
+            }
+            mse = err_sq / denom;
+        }
+
         let mut seg_esr = 0.0;
         if weights.w_seg_esr > 0.0 {
             local_g.fill(0.0);
@@ -493,7 +530,8 @@ impl CompositeLossEvaluator {
             + weights.w_if_gd * if_gd
             + weights.w_ltas * ltas
             + weights.w_seg_esr * seg_esr
-            + weights.w_nyquist * nyquist;
+            + weights.w_nyquist * nyquist
+            + weights.w_mse * mse;
         CompositeLossBreakdown {
             total,
             besr,
@@ -504,6 +542,7 @@ impl CompositeLossEvaluator {
             ltas,
             seg_esr,
             nyquist,
+            mse,
         }
     }
 
@@ -557,6 +596,7 @@ impl CompositeLossEvaluator {
         bl.ltas = 0.5 * (bl.ltas + br.ltas);
         bl.seg_esr = 0.5 * (bl.seg_esr + br.seg_esr);
         bl.nyquist = 0.5 * (bl.nyquist + br.nyquist);
+        bl.mse = 0.5 * (bl.mse + br.mse);
         Ok(bl)
     }
 
@@ -701,6 +741,52 @@ mod tests {
                 (hgl[idx] - fd_l).abs() <= 1.0e-4 * hgl[idx].abs().max(1.0e-3),
                 "Homotopy noisy L idx={idx} ana={} fd={fd_l}",
                 hgl[idx]
+            );
+        }
+
+        // Verify normalized time-domain MSE (`w_mse = 1.0`, others `0.0`) warmup zeroing and FD.
+        let mse_eval = CompositeLossEvaluator::new(
+            &tgt_l,
+            &tgt_r,
+            CompositeLossConfig {
+                sample_rate_hz: sr,
+                warmup_frames: 64,
+                w_besr: 0.0,
+                w_mr_iir: 0.0,
+                w_spec_ot: 0.0,
+                w_gabor: 0.0,
+                w_if_gd: 0.0,
+                w_ltas: 0.0,
+                w_seg_esr: 0.0,
+                w_nyquist: 0.0,
+                w_mse: 1.0,
+                ..CompositeLossConfig::default()
+            },
+        )
+        .unwrap();
+        let (mut mgl, mut mgr) = (vec![0.0_f64; n], vec![0.0_f64; n]);
+        let mbd = mse_eval
+            .eval_and_adjoint(&pred_l, &pred_r, Some(&mut mgl), Some(&mut mgr))
+            .unwrap();
+        assert!(mbd.mse > 0.0 && (mbd.total - mbd.mse).abs() < 1.0e-12);
+        assert!(mgl[..64].iter().chain(&mgr[..64]).all(|&v| v == 0.0));
+        for idx in [150, 500, 900] {
+            let (mut ppl, mut pml) = (pred_l.clone(), pred_l.clone());
+            ppl[idx] += eps;
+            pml[idx] -= eps;
+            let fd_l = (mse_eval
+                .eval_and_adjoint(&ppl, &pred_r, None, None)
+                .unwrap()
+                .total
+                - mse_eval
+                    .eval_and_adjoint(&pml, &pred_r, None, None)
+                    .unwrap()
+                    .total)
+                / (2.0 * eps);
+            assert!(
+                (mgl[idx] - fd_l).abs() <= 1.0e-7,
+                "MSE L idx={idx} ana={} fd={fd_l}",
+                mgl[idx]
             );
         }
     }

@@ -129,6 +129,7 @@ fn try_stage_c_readout_fallback(
         target_r,
         warmup,
         config,
+        ..
     } = *eval;
     let mut any_changed = false;
     if state.cert.tier_reports[3].besr_db >= state.cert.tier_reports[0].besr_db - 0.5 {
@@ -218,6 +219,7 @@ pub(super) fn enforce_monotone_tiers_non_destructive(
         target_r,
         warmup,
         config,
+        ..
     } = *eval;
     materialize_tier_overrides(model);
     let mut best_model = model.clone();
@@ -320,12 +322,17 @@ mod tests {
         target_r: &[f64],
         config: Pass5EmitConfig,
     ) -> StereoCertBundle {
+        let gap_masks = [
+            crate::losses::DrySilentGapMask::detect(in_l, target_l, 64, model.sample_rate_hz),
+            crate::losses::DrySilentGapMask::detect(in_r, target_r, 64, model.sample_rate_hz),
+        ];
         let eval = MonotoneEvalCtx {
             in_l,
             in_r,
             target_l,
             target_r,
             warmup: 64,
+            gap_masks: &gap_masks,
             config,
         };
         let (final_bin, final_bundle, cert) =

@@ -3,13 +3,12 @@
 
 use crate::control::clamp::{MAX_GAIN_6DB_LIN, evaluate_readout_spectral_magnitudes};
 use crate::control::stability::MAX_RO_POLE_48K_F64;
-use crate::linalg::cholesky::solve_uplo_u_cholesky;
 use crate::wide_gram::uplo_u_index;
 
 use super::super::model::SonaModelF64;
 use super::eval_hp_post_for_ro;
 use super::features::{StereoFeatureSet, TIER_KAUTZ_CAPS, has_higher_tier_wet_op_t};
-use super::spectral_refine::{compute_channel_mse, trace_scaled_ridge};
+use super::spectral_refine::{compute_channel_mse, solve_diag_ridge_uplo_u};
 
 pub(super) struct SweepStereoResult {
     pub best_ro: f64,
@@ -118,11 +117,9 @@ pub(super) fn sweep_ro_pole_48k_joint_stereo(
             &hp_r,
             dim,
         );
-        let ridge_l = trace_scaled_ridge(&gl, dim, 1.0e-5);
-        let ridge_r = trace_scaled_ridge(&gr, dim, 1.0e-5);
         let (Ok(wl), Ok(wr)) = (
-            solve_uplo_u_cholesky(&gl, &rl, ridge_l),
-            solve_uplo_u_cholesky(&gr, &rr, ridge_r),
+            solve_diag_ridge_uplo_u(&gl, &rl, dim, 1.0e-5),
+            solve_diag_ridge_uplo_u(&gr, &rr, dim, 1.0e-5),
         ) else {
             continue;
         };
