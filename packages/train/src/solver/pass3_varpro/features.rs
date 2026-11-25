@@ -2,19 +2,26 @@
 //! `1×`/`2×` `Full..Ultra` causal core cascades, FIR taps, ZOH-rescaled `ro_pole_48k`, and
 //! `tank_dry_mix * I + Op-T` filtering (`ref[train.pipeline.nested-varpro-schur]`).
 
+mod helpers;
+
 use crate::control::stability::MAX_RO_POLE_48K_F64;
 use crate::error::TrainError;
 use crate::runner::TrainRunner;
 
 use super::super::model::cascade::{
     CascadeCrossbarSpec, downsample_lane_2x_f64, run_causal_core_cascade_with_crossbar,
-    sanitize_unit_f64, upsample_stereo_2x_f64,
+    upsample_stereo_2x_f64,
 };
-use super::super::model::{NUM_FIR_TAPS_ULTRA, SonaModelF64, TierReadoutPrefixF64};
+use super::super::model::{NUM_FIR_TAPS_ULTRA, SonaModelF64};
 use super::super::pass2_opt::crossbar::{eval_crossbar_forward, eval_crossbar_forward_os2x};
-use super::super::pass2_opt::op_t_quad::{eval_op_t_bank_stereo_and_adjoint, has_wet_op_t_output};
+use super::super::pass2_opt::op_t_quad::has_wet_op_t_output;
 use super::super::pass2_opt::sensory::eval_sensory_quad_and_adjoint;
 use super::super::pass2_opt::{eval_kautz_modal_channel_and_adjoint, eval_op_n_pre_and_adjoint};
+
+pub(super) use helpers::{
+    apply_op_t_series_channel_bank, eval_highpass_pole, unpack_weights_into_prefix,
+};
+use helpers::{apply_op_t_stereo_bank, is_op_t_active_up_to, is_op_t_strictly_lti_up_to};
 
 /// Shared conjugate Kautz pair capacity per tier `[Lite, Full, Pro, Ultra]`.
 pub(super) const TIER_KAUTZ_CAPS: [usize; 4] = [8, 12, 24, 32];
@@ -81,86 +88,6 @@ impl StereoFeatureSet {
             &self.tgts_r_post
         }
     }
-}
-
-/// Evaluates the scalar 1-pole high-pass branch `u[t] - lp(u; pole)[t]`.
-#[must_use]
-pub(super) fn eval_highpass_pole(sig: &[f64], pole: f64) -> Vec<f64> {
-    let mut hp = vec![0.0_f64; sig.len()];
-    if pole <= 0.0 || !pole.is_finite() {
-        return hp;
-    }
-    let p = pole.clamp(0.0, MAX_RO_POLE_48K_F64);
-    let one_m_p = 1.0 - p;
-    let mut lp = 0.0_f64;
-    for (i, &u) in sig.iter().enumerate() {
-        lp = p * lp + one_m_p * u;
-        hp[i] = u - lp;
-    }
-    hp
-}
-
-#[inline]
-pub(super) fn is_op_t_active_up_to(model: &SonaModelF64, active_opt: usize) -> bool {
-    model.transport_quads[..active_opt.min(model.transport_quads.len())]
-        .iter()
-        .any(has_wet_op_t_output)
-}
-
-pub(super) fn apply_op_t_series_channel_bank(
-    model: &SonaModelF64,
-    sig: &[f64],
-    is_right: bool,
-    active_opt: usize,
-) -> Vec<f64> {
-    let dry = sanitize_unit_f64(model.tank_dry_mix, -2.0, 2.0, 1.0);
-    let q_opt = active_opt.clamp(1, model.transport_quads.len());
-    if !is_op_t_active_up_to(model, q_opt) {
-        return sig.iter().map(|&v| dry * v).collect();
-    }
-    let zeros = vec![0.0_f64; sig.len()];
-    let (xl, xr) = if is_right {
-        (zeros.as_slice(), sig)
-    } else {
-        (sig, zeros.as_slice())
-    };
-    let (tl, tr, _) = eval_op_t_bank_stereo_and_adjoint(
-        xl,
-        xr,
-        &model.transport_quads,
-        q_opt,
-        model.sample_rate_hz,
-        None,
-    );
-    let wet = if is_right { &tr } else { &tl };
-    sig.iter().zip(wet).map(|(&s, &w)| dry * s + w).collect()
-}
-
-pub(super) fn apply_op_t_stereo_bank(
-    model: &SonaModelF64,
-    sig_l: &[f64],
-    sig_r: &[f64],
-    active_opt: usize,
-) -> (Vec<f64>, Vec<f64>) {
-    let dry = sanitize_unit_f64(model.tank_dry_mix, -2.0, 2.0, 1.0);
-    let q_opt = active_opt.clamp(1, model.transport_quads.len());
-    if !is_op_t_active_up_to(model, q_opt) {
-        return (
-            sig_l.iter().map(|&v| dry * v).collect(),
-            sig_r.iter().map(|&v| dry * v).collect(),
-        );
-    }
-    let (tl, tr, _) = eval_op_t_bank_stereo_and_adjoint(
-        sig_l,
-        sig_r,
-        &model.transport_quads,
-        q_opt,
-        model.sample_rate_hz,
-        None,
-    );
-    let out_l = sig_l.iter().zip(&tl).map(|(&s, &w)| dry * s + w).collect();
-    let out_r = sig_r.iter().zip(&tr).map(|(&s, &w)| dry * s + w).collect();
-    (out_l, out_r)
 }
 
 fn subtract_modal_contributions_per_tier(
@@ -344,7 +271,7 @@ fn extract_channel_tier_matrix(model: &SonaModelF64, spec: &ExtractMatrixSpec<'_
     let (dec_p1, dec_c0) = (model.os_dec_c_prev1, model.os_dec_c0);
     let mut feats_post = vec![0.0_f32; total_dim * m];
 
-    let mut write_col = |col_idx: usize, full_col: &[f64]| {
+    let write_col = |feats: &mut [f32], col_idx: usize, full_col: &[f64]| {
         if col_idx >= total_dim {
             return;
         }
@@ -354,12 +281,12 @@ fn extract_channel_tier_matrix(model: &SonaModelF64, spec: &ExtractMatrixSpec<'_
             full_col.to_vec()
         };
         for t in 0..m {
-            feats_post[col_idx * m + t] = filtered[spec.w + t] as f32;
+            feats[col_idx * m + t] = filtered[spec.w + t] as f32;
         }
     };
 
     if !spec.options.suppress_direct_s2_linear {
-        write_col(0, spec.ux_base);
+        write_col(&mut feats_post, 0, spec.ux_base);
     }
     // Col 1 is populated cleanly during `ro_pole_48k` joint sweep unless suppressed.
 
@@ -405,14 +332,40 @@ fn extract_channel_tier_matrix(model: &SonaModelF64, spec: &ExtractMatrixSpec<'_
                         })
                         .collect()
                 };
-                write_col(col, &raw_sig);
+                write_col(&mut feats_post, col, &raw_sig);
                 col += 1;
             }
         }
+        let pre_conv_lti_op_t = if !fir_range.is_empty()
+            && ((op_t && is_op_t_strictly_lti_up_to(model, active_opt))
+                || (!op_t && (model.tank_dry_mix - 1.0).abs() > 1.0e-12))
+        {
+            Some(apply_op_t_series_channel_bank(
+                model,
+                spec.pre_conv_chan,
+                spec.is_right,
+                active_opt,
+            ))
+        } else {
+            None
+        };
         for k in fir_range {
-            let mut tap_col = vec![0.0_f64; n];
-            tap_col[k..n].copy_from_slice(&spec.pre_conv_chan[..(n - k)]);
-            write_col(col, &tap_col);
+            if let Some(ref pre_filt) = pre_conv_lti_op_t {
+                if col < total_dim {
+                    for t in 0..m {
+                        let t_abs = spec.w + t;
+                        feats_post[col * m + t] = if t_abs >= k {
+                            pre_filt[t_abs - k] as f32
+                        } else {
+                            0.0_f32
+                        };
+                    }
+                }
+            } else {
+                let mut tap_col = vec![0.0_f64; n];
+                tap_col[k..n].copy_from_slice(&spec.pre_conv_chan[..(n - k)]);
+                write_col(&mut feats_post, col, &tap_col);
+            }
             col += 1;
         }
     }
@@ -589,32 +542,32 @@ pub(super) fn build_pass3_feature_sets(
 
     let tgts_post_fn = |adj: &[f64]| adj[w..n].iter().map(|&v| v as f32).collect::<Vec<f32>>();
     let rho_1x = 48_000.0 / model.sample_rate_hz.max(8_000.0);
+    let skip_cascade = options.suppress_post_core_lane_mask == u64::MAX
+        && model.w_ro.iter().all(|r| r[0..6].iter().all(|&v| v == 0.0));
 
     if model.oversample_upper_tiers_2x {
-        let cb_1x = eval_crossbar_forward(model, &u_sense_l, &u_sense_r, 4, false);
-        let cas_1x = run_causal_core_cascade_with_crossbar(
-            runner,
-            model,
-            &ux_l,
-            &ux_r,
-            CascadeCrossbarSpec {
-                active_quads: 4,
-                rho_core: rho_1x,
-                write_checkpoints: false,
-                crossbar_add: cb_1x
-                    .active
-                    .then_some((cb_1x.cb_add_l.as_slice(), cb_1x.cb_add_r.as_slice())),
-            },
-        )?;
-        let (pre_1x_l, pre_1x_r) = build_pre_conv_bus(
-            model,
-            &ux_l,
-            &ux_r,
-            &cas_1x.feature_outputs,
-            4,
-            rho_1x,
-            false,
-        );
+        let cas_1x_feats = if skip_cascade {
+            Vec::new()
+        } else {
+            let cb_1x = eval_crossbar_forward(model, &u_sense_l, &u_sense_r, 4, false);
+            run_causal_core_cascade_with_crossbar(
+                runner,
+                model,
+                &ux_l,
+                &ux_r,
+                CascadeCrossbarSpec {
+                    active_quads: 4,
+                    rho_core: rho_1x,
+                    write_checkpoints: false,
+                    crossbar_add: cb_1x
+                        .active
+                        .then_some((cb_1x.cb_add_l.as_slice(), cb_1x.cb_add_r.as_slice())),
+                },
+            )?
+            .feature_outputs
+        };
+        let (pre_1x_l, pre_1x_r) =
+            build_pre_conv_bus(model, &ux_l, &ux_r, &cas_1x_feats, 4, rho_1x, false);
         let (adj_1x_l, adj_1x_r) =
             subtract_modal_contributions_per_tier(model, &pre_1x_l, &pre_1x_r, target_l, target_r);
         let lite_1x_l_post = Some(extract_channel_tier_matrix(
@@ -622,7 +575,7 @@ pub(super) fn build_pass3_feature_sets(
             &ExtractMatrixSpec {
                 ux_base: &ux_l,
                 pre_conv_chan: &pre_1x_l,
-                cascade_feats: &cas_1x.feature_outputs,
+                cascade_feats: &cas_1x_feats,
                 cascade_frames: n,
                 is_2x: false,
                 is_right: false,
@@ -638,7 +591,7 @@ pub(super) fn build_pass3_feature_sets(
             &ExtractMatrixSpec {
                 ux_base: &ux_r,
                 pre_conv_chan: &pre_1x_r,
-                cascade_feats: &cas_1x.feature_outputs,
+                cascade_feats: &cas_1x_feats,
                 cascade_frames: n,
                 is_2x: false,
                 is_right: true,
@@ -654,30 +607,28 @@ pub(super) fn build_pass3_feature_sets(
         let dec_ux_l = downsample_lane_2x_f64(&up_l, model.os_dec_c_prev1, model.os_dec_c0);
         let dec_ux_r = downsample_lane_2x_f64(&up_r, model.os_dec_c_prev1, model.os_dec_c0);
         let rho_2x = 0.5 * rho_1x;
-        let cb_2x = eval_crossbar_forward_os2x(model, &u_sense_l, &u_sense_r, 10, true);
-        let cas_2x = run_causal_core_cascade_with_crossbar(
-            runner,
-            model,
-            &up_l,
-            &up_r,
-            CascadeCrossbarSpec {
-                active_quads: 10,
-                rho_core: rho_2x,
-                write_checkpoints: false,
-                crossbar_add: cb_2x
-                    .active
-                    .then_some((cb_2x.cb_add_l.as_slice(), cb_2x.cb_add_r.as_slice())),
-            },
-        )?;
-        let (pre_2x_l, pre_2x_r) = build_pre_conv_bus(
-            model,
-            &up_l,
-            &up_r,
-            &cas_2x.feature_outputs,
-            10,
-            rho_2x,
-            true,
-        );
+        let cas_2x_feats = if skip_cascade {
+            Vec::new()
+        } else {
+            let cb_2x = eval_crossbar_forward_os2x(model, &u_sense_l, &u_sense_r, 10, true);
+            run_causal_core_cascade_with_crossbar(
+                runner,
+                model,
+                &up_l,
+                &up_r,
+                CascadeCrossbarSpec {
+                    active_quads: 10,
+                    rho_core: rho_2x,
+                    write_checkpoints: false,
+                    crossbar_add: cb_2x
+                        .active
+                        .then_some((cb_2x.cb_add_l.as_slice(), cb_2x.cb_add_r.as_slice())),
+                },
+            )?
+            .feature_outputs
+        };
+        let (pre_2x_l, pre_2x_r) =
+            build_pre_conv_bus(model, &up_l, &up_r, &cas_2x_feats, 10, rho_2x, true);
         let (adj_tgt_l, adj_tgt_r) =
             subtract_modal_contributions_per_tier(model, &pre_2x_l, &pre_2x_r, target_l, target_r);
 
@@ -686,7 +637,7 @@ pub(super) fn build_pass3_feature_sets(
             ux_r: &dec_ux_r,
             pre_l: &pre_2x_l,
             pre_r: &pre_2x_r,
-            cascade_feats: &cas_2x.feature_outputs,
+            cascade_feats: &cas_2x_feats,
             cascade_frames: 2 * n,
             is_2x: true,
             tier_dims: dims,
@@ -727,23 +678,27 @@ pub(super) fn build_pass3_feature_sets(
             lite_1x_raw_r: ux_r,
         })
     } else {
-        let cb = eval_crossbar_forward(model, &u_sense_l, &u_sense_r, 10, true);
-        let cas = run_causal_core_cascade_with_crossbar(
-            runner,
-            model,
-            &ux_l,
-            &ux_r,
-            CascadeCrossbarSpec {
-                active_quads: 10,
-                rho_core: rho_1x,
-                write_checkpoints: false,
-                crossbar_add: cb
-                    .active
-                    .then_some((cb.cb_add_l.as_slice(), cb.cb_add_r.as_slice())),
-            },
-        )?;
-        let (pre_l, pre_r) =
-            build_pre_conv_bus(model, &ux_l, &ux_r, &cas.feature_outputs, 10, rho_1x, false);
+        let cas_feats = if skip_cascade {
+            Vec::new()
+        } else {
+            let cb = eval_crossbar_forward(model, &u_sense_l, &u_sense_r, 10, true);
+            run_causal_core_cascade_with_crossbar(
+                runner,
+                model,
+                &ux_l,
+                &ux_r,
+                CascadeCrossbarSpec {
+                    active_quads: 10,
+                    rho_core: rho_1x,
+                    write_checkpoints: false,
+                    crossbar_add: cb
+                        .active
+                        .then_some((cb.cb_add_l.as_slice(), cb.cb_add_r.as_slice())),
+                },
+            )?
+            .feature_outputs
+        };
+        let (pre_l, pre_r) = build_pre_conv_bus(model, &ux_l, &ux_r, &cas_feats, 10, rho_1x, false);
         let (adj_tgt_l, adj_tgt_r) =
             subtract_modal_contributions_per_tier(model, &pre_l, &pre_r, target_l, target_r);
         let base_1x = StereoExtractBase {
@@ -751,7 +706,7 @@ pub(super) fn build_pass3_feature_sets(
             ux_r: &ux_r,
             pre_l: &pre_l,
             pre_r: &pre_r,
-            cascade_feats: &cas.feature_outputs,
+            cascade_feats: &cas_feats,
             cascade_frames: n,
             is_2x: false,
             tier_dims: dims,
@@ -792,67 +747,4 @@ pub(super) fn build_pass3_feature_sets(
             lite_1x_raw_r: ux_r,
         })
     }
-}
-
-pub(super) fn unpack_weights_into_prefix(
-    weights_l: &[f64],
-    weights_r: &[f64],
-    active_taps: usize,
-    pc_gain: [f64; 2],
-    max_tier_idx: usize,
-    base_model: &SonaModelF64,
-) -> TierReadoutPrefixF64 {
-    let mut pfx = TierReadoutPrefixF64 {
-        pre_conv_u_gain: pc_gain,
-        pre_conv_hp_gain: base_model.pre_conv_hp_gain,
-        direct_s2_u_gain: [weights_l[0].clamp(-8.0, 8.0), weights_r[0].clamp(-8.0, 8.0)],
-        direct_s2_hp_gain: [weights_l[1].clamp(-8.0, 8.0), weights_r[1].clamp(-8.0, 8.0)],
-        ..TierReadoutPrefixF64::default()
-    };
-    for l in 0..40 {
-        pfx.w_ro[l][0..6].copy_from_slice(&base_model.w_ro[l][0..6]);
-    }
-    for (k, kz) in base_model.kautz.iter().enumerate() {
-        pfx.kautz_b_gamma[k] = kz.b_gamma;
-        pfx.kautz_c_re_l[k] = kz.c_re_l;
-        pfx.kautz_c_im_l[k] = kz.c_im_l;
-        pfx.kautz_c_re_r[k] = kz.c_re_r;
-        pfx.kautz_c_im_r[k] = kz.c_im_r;
-    }
-    let tier_defs = [
-        (0..16_usize, 0..active_taps.min(32)),
-        (
-            16..24_usize,
-            32..(32 + active_taps.saturating_sub(32).min(16)),
-        ),
-        (
-            24..32_usize,
-            48..(48 + active_taps.saturating_sub(48).min(48)),
-        ),
-        (
-            32..40_usize,
-            96..(96 + active_taps.saturating_sub(96).min(32)),
-        ),
-    ];
-    let mut col = 2_usize;
-    for (ti, (lane_range, fir_range)) in tier_defs.into_iter().enumerate() {
-        if ti > max_tier_idx {
-            break;
-        }
-        for l in lane_range {
-            pfx.w_ro[l][6] = weights_l[col].clamp(-8.0, 8.0);
-            pfx.w_ro[l][7] = weights_r[col].clamp(-8.0, 8.0);
-            pfx.w_ro[l][8] = weights_l[col + 1].clamp(-8.0, 8.0);
-            pfx.w_ro[l][9] = weights_r[col + 1].clamp(-8.0, 8.0);
-            pfx.w_ro[l][10] = weights_l[col + 2].clamp(-8.0, 8.0);
-            pfx.w_ro[l][11] = weights_r[col + 2].clamp(-8.0, 8.0);
-            col += 3;
-        }
-        for k in fir_range {
-            pfx.fir_l[k] = weights_l[col].clamp(-8.0, 8.0);
-            pfx.fir_r[k] = weights_r[col].clamp(-8.0, 8.0);
-            col += 1;
-        }
-    }
-    pfx
 }

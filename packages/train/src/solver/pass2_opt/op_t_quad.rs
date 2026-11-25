@@ -217,7 +217,26 @@ pub fn eval_op_t_quad_stereo_and_adjoint(
     sample_rate_hz: f64,
     adj: Option<OpTQuadAdjointSlices<'_>>,
 ) -> (Vec<f64>, Vec<f64>, OpTQuadAdjointGrads) {
-    eval_op_t_quad_with_cb(x_l, x_r, tq, sample_rate_hz, adj, None)
+    eval_op_t_quad_with_cb(
+        x_l,
+        x_r,
+        tq,
+        sample_rate_hz,
+        adj,
+        None,
+        f64::from(dnam_vm::math::DC_BLOCKER_5HZ_48K_F32),
+    )
+}
+
+pub(crate) fn eval_op_t_quad_stereo_with_wet_dc_and_adjoint(
+    x_l: &[f64],
+    x_r: &[f64],
+    tq: &TransportQuadF64,
+    sample_rate_hz: f64,
+    adj: Option<OpTQuadAdjointSlices<'_>>,
+    wet_dc_pole_48k: f64,
+) -> (Vec<f64>, Vec<f64>, OpTQuadAdjointGrads) {
+    eval_op_t_quad_with_cb(x_l, x_r, tq, sample_rate_hz, adj, None, wet_dc_pole_48k)
 }
 
 pub(crate) fn eval_op_t_quad_with_cb(
@@ -227,12 +246,13 @@ pub(crate) fn eval_op_t_quad_with_cb(
     sample_rate_hz: f64,
     adj: Option<OpTQuadAdjointSlices<'_>>,
     d_v_read_cb: Option<&[[f64; 4]]>,
+    wet_dc_pole_48k: f64,
 ) -> (Vec<f64>, Vec<f64>, OpTQuadAdjointGrads) {
     let n = x_l.len().min(x_r.len());
     if n == 0 {
         return (Vec::new(), Vec::new(), OpTQuadAdjointGrads::default());
     }
-    let resolved = OpTResolvedParams::from_quad(tq, sample_rate_hz, n);
+    let resolved = OpTResolvedParams::from_quad_with_wet_dc(tq, sample_rate_hz, n, wet_dc_pole_48k);
     let mut fwd = OpTQuadStepState::new(resolved, n, adj.is_some());
     let mut out_l = Vec::with_capacity(n);
     let mut out_r = Vec::with_capacity(n);
@@ -281,6 +301,7 @@ pub(crate) fn eval_op_t_bank_stereo_and_adjoint(
     quads: &[TransportQuadF64; 4],
     active_quads: usize,
     sample_rate_hz: f64,
+    wet_dc_pole_48k: f64,
     mut adj_opt: Option<OpTQuadAdjointSlices<'_>>,
 ) -> (Vec<f64>, Vec<f64>, [OpTQuadAdjointGrads; 4]) {
     let n = x_l.len().min(x_r.len());
@@ -302,8 +323,14 @@ pub(crate) fn eval_op_t_bank_stereo_and_adjoint(
             grad_x_l: a.grad_x_l.as_deref_mut().map(|s| &mut s[..n]),
             grad_x_r: a.grad_x_r.as_deref_mut().map(|s| &mut s[..n]),
         });
-        let (ql, qr, qg) =
-            eval_op_t_quad_stereo_and_adjoint(x_l, x_r, &quads[q], sample_rate_hz, adj);
+        let (ql, qr, qg) = eval_op_t_quad_stereo_with_wet_dc_and_adjoint(
+            x_l,
+            x_r,
+            &quads[q],
+            sample_rate_hz,
+            adj,
+            wet_dc_pole_48k,
+        );
         for t in 0..n {
             out_l[t] += ql[t];
             out_r[t] += qr[t];
@@ -436,12 +463,14 @@ mod tests {
         qs[1] = q2;
         let mut bg_x_l = vec![0.0_f64; n];
         let mut bg_x_r = vec![0.0_f64; n];
+        let dc_5hz = f64::from(dnam_vm::math::DC_BLOCKER_5HZ_48K_F32);
         let (bl, br, bg) = eval_op_t_bank_stereo_and_adjoint(
             &in_l,
             &in_r,
             &qs,
             2,
             48_000.0,
+            dc_5hz,
             Some(OpTQuadAdjointSlices {
                 d_out_l: &d_out_l,
                 d_out_r: &d_out_r,
@@ -457,9 +486,9 @@ mod tests {
             qsp[qi].delay_samples[0] += eps_b;
             qsm[qi].delay_samples[0] -= eps_b;
             let (pl, pr, _) =
-                eval_op_t_bank_stereo_and_adjoint(&in_l, &in_r, &qsp, 2, 48_000.0, None);
+                eval_op_t_bank_stereo_and_adjoint(&in_l, &in_r, &qsp, 2, 48_000.0, dc_5hz, None);
             let (ml, mr, _) =
-                eval_op_t_bank_stereo_and_adjoint(&in_l, &in_r, &qsm, 2, 48_000.0, None);
+                eval_op_t_bank_stereo_and_adjoint(&in_l, &in_r, &qsm, 2, 48_000.0, dc_5hz, None);
             let fd = (obj(&pl, &pr) - obj(&ml, &mr)) / (2.0 * eps_b);
             assert_fd(
                 &format!("bank q={qi} delay[0]"),
@@ -482,8 +511,15 @@ mod tests {
         assert!(!has_wet_op_t_output(&dormant));
         assert!(is_op_t_quad_active(&dormant));
         let dormant_bank = [dormant; 4];
-        let (dl, dr, _) =
-            eval_op_t_bank_stereo_and_adjoint(&in_l, &in_r, &dormant_bank, 4, 48_000.0, None);
+        let (dl, dr, _) = eval_op_t_bank_stereo_and_adjoint(
+            &in_l,
+            &in_r,
+            &dormant_bank,
+            4,
+            48_000.0,
+            dc_5hz,
+            None,
+        );
         assert!(dl.iter().chain(&dr).all(|&v| v == 0.0));
     }
 }

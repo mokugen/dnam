@@ -452,4 +452,86 @@ mod tests {
         assert!(read_dnwb_stem_response(&mut Cursor::new(&extra)).is_err());
         assert!(read_dnwb_stem_response(&mut Cursor::new(&wire[..wire.len() - 4])).is_err());
     }
+
+    #[test]
+    fn test_response_postcard_4ch_and_malformed_wire_guards() {
+        let mut nodes = BTreeMap::new();
+        nodes.insert(String::from("n1"), vec![0.1, 0.2]);
+        let resp = StemResponse {
+            stem_id: String::from("stem_pc_4ch"),
+            sample_rate_hz: 48_000,
+            out_1: vec![0.1, -0.1],
+            out_2: Some(vec![0.2, -0.2]),
+            out_3: Some(vec![0.3, -0.3]),
+            out_4: Some(vec![0.4, -0.4]),
+            internal_nodes: nodes,
+        };
+        let mut wire = Vec::new();
+        let hdr =
+            write_dnwb_postcard_stem_response(&mut wire, DnwbCommand::RenderStem, &resp).unwrap();
+        let (_, rt) = read_dnwb_stem_response(&mut Cursor::new(&wire)).unwrap();
+        assert_eq!(rt, resp);
+
+        // Postcard trailing bytes & truncated metadata guards.
+        let mut hdr_extra = hdr;
+        hdr_extra.payload_byte_len += 4;
+        let mut extra = hdr_extra.to_bytes().to_vec();
+        extra.extend_from_slice(&wire[64..]);
+        extra.extend_from_slice(&[0u8; 4]);
+        assert!(read_dnwb_stem_response(&mut Cursor::new(&extra)).is_err());
+
+        let bad_meta = DnwbPostcardResponseMeta {
+            stem_id: String::from("dup"),
+            internal_node_meta: vec![(String::from("k"), 1), (String::from("k"), 1)],
+        };
+        let enc_bad = postcard::to_allocvec(&bad_meta).unwrap();
+        let mut dup_payload = Vec::new();
+        dup_payload.extend_from_slice(U32::new(enc_bad.len() as u32).as_bytes());
+        dup_payload.extend_from_slice(&enc_bad);
+        push_f32_slice_wire(&mut dup_payload, &[0.0]);
+        push_f32_slice_wire(&mut dup_payload, &[0.0]);
+        push_f32_slice_wire(&mut dup_payload, &[0.0]);
+        let mut hdr_dup = hdr;
+        hdr_dup.flags =
+            DNWB_FLAG_STRUCTURED_V1 | DNWB_FLAG_POSTCARD_CTRL | (0b0001 << DNWB_CHANNEL_MASK_SHIFT);
+        hdr_dup.num_frames = 1;
+        hdr_dup.num_output_channels = 1;
+        hdr_dup.num_internal_nodes = 2;
+        hdr_dup.payload_byte_len = dup_payload.len() as u64;
+        let mut dup_wire = hdr_dup.to_bytes().to_vec();
+        dup_wire.extend_from_slice(&dup_payload);
+        assert!(read_dnwb_stem_response(&mut Cursor::new(&dup_wire)).is_err());
+
+        let mut bad_len_hdr = hdr;
+        bad_len_hdr.payload_byte_len = 8;
+        let mut trunc_meta_wire = bad_len_hdr.to_bytes().to_vec();
+        trunc_meta_wire.extend_from_slice(U32::new(100).as_bytes());
+        trunc_meta_wire.extend_from_slice(&[0u8; 4]);
+        assert!(read_dnwb_stem_response(&mut Cursor::new(&trunc_meta_wire)).is_err());
+
+        // Channel mask popcount mismatch, missing out_1 on non-empty, & structured truncated ids.
+        let mut pop_hdr = hdr;
+        pop_hdr.num_output_channels = 1;
+        let mut pop_wire = pop_hdr.to_bytes().to_vec();
+        pop_wire.extend_from_slice(&wire[64..]);
+        assert!(read_dnwb_stem_response(&mut Cursor::new(&pop_wire)).is_err());
+
+        let mut struct_wire = Vec::new();
+        let sh =
+            write_dnwb_stem_response(&mut struct_wire, DnwbCommand::RenderStem, &resp).unwrap();
+        let mut bad_id_hdr = sh;
+        bad_id_hdr.payload_byte_len = 4;
+        let mut bad_id = bad_id_hdr.to_bytes().to_vec();
+        bad_id.extend_from_slice(U16::new(99).as_bytes());
+        bad_id.extend_from_slice(&[0u8; 2]);
+        assert!(read_dnwb_stem_response(&mut Cursor::new(&bad_id)).is_err());
+
+        let mut bad_nan = resp.clone();
+        bad_nan
+            .internal_nodes
+            .insert(String::from("bad"), vec![f32::NAN]);
+        assert!(
+            write_dnwb_stem_response(&mut Vec::new(), DnwbCommand::RenderStem, &bad_nan).is_err()
+        );
+    }
 }

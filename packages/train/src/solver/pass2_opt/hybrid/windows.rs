@@ -35,6 +35,7 @@ pub(super) struct HybridCtx<'a> {
     pub config: Pass2OptConfig,
     pub warmup: usize,
     pub max_tau: f64,
+    pub kautz_r_max: f64,
     pub max_tier: usize,
     pub fast_mode: bool,
     pub progress: Option<&'a AtomicDnprProgress>,
@@ -114,17 +115,85 @@ pub(super) fn build_windows(
         return Ok(vec![build_window_at(ctx, 0, wl)?]);
     }
     let count = max_windows.max(1);
-    let slack = n - wl;
+    if count == 1 {
+        let start = pick_representative_window_start(
+            &ctx.pairs.target_l[..n],
+            &ctx.pairs.target_r[..n],
+            wl,
+        );
+        return Ok(vec![build_window_at(ctx, start, wl)?]);
+    }
+    let q_base = n / count;
     let mut windows = Vec::with_capacity(count);
     for w_i in 0..count {
-        let start = if count == 1 {
-            0
+        let qs = w_i * q_base;
+        let qe = if w_i + 1 == count {
+            n
         } else {
-            (w_i * slack) / (count - 1)
+            (w_i + 1) * q_base
+        };
+        let q_len = qe - qs;
+        let start = if q_len > wl {
+            qs + pick_representative_window_start(
+                &ctx.pairs.target_l[qs..qe],
+                &ctx.pairs.target_r[qs..qe],
+                wl,
+            )
+        } else {
+            qs.min(n - wl)
         };
         windows.push(build_window_at(ctx, start, wl)?);
     }
     Ok(windows)
+}
+
+#[must_use]
+pub(super) fn is_pure_linear_pass1_model(model: &SonaModelF64) -> bool {
+    let has_modal = model.active_fir_taps > 0 || model.active_kautz_pairs > 0;
+    let core_inert = model.core_quads.iter().all(|q| {
+        q.adaa_drive.iter().all(|&d| d.abs() <= 1.0e-12)
+            && q.wavefolder_mix.iter().all(|&v| v.abs() <= 1.0e-12)
+            && q.svf_k_nl.iter().all(|&v| v.abs() <= 1.0e-12)
+    });
+    let w_ro_zero = model
+        .w_ro
+        .iter()
+        .all(|row| row.iter().all(|&v| v.abs() <= 1.0e-12));
+    let op_n_pre_inert = model.op_n_pre_gamma_bc.abs() <= 1.0e-12
+        && model.op_n_pre_zoh_hold_depth.abs() <= 1.0e-12
+        && model.op_n_pre_beta_q.abs() <= 1.0e-12;
+    has_modal && core_inert && w_ro_zero && op_n_pre_inert
+}
+
+#[must_use]
+pub(super) fn phase2_layout_for_tier(
+    model: &SonaModelF64,
+    tier_idx: usize,
+    linear_only: bool,
+    include_extras: bool,
+    include_direct_readouts: bool,
+    max_tau: f64,
+    kautz_r_max: f64,
+) -> ThetaLayout {
+    if linear_only {
+        ThetaLayout::for_tier_from_model_linear_modal(
+            model,
+            tier_idx,
+            include_extras,
+            include_direct_readouts,
+            max_tau,
+            kautz_r_max,
+        )
+    } else {
+        ThetaLayout::for_tier_from_model_pass2(
+            model,
+            tier_idx,
+            include_extras,
+            include_direct_readouts,
+            max_tau,
+            kautz_r_max,
+        )
+    }
 }
 
 pub(super) fn build_representative_window(
@@ -299,6 +368,7 @@ pub(super) fn run_phase2d_guarded_qat(
     work_model: &mut SonaModelF64,
     pre_qat_loss: f64,
     pre_qat_besr_db: f64,
+    linear_only: bool,
 ) -> Result<(usize, f64, f64, f64), TrainError> {
     let max_tier = ctx.max_tier;
     sync_top_level_from_tier_override(work_model, max_tier);
@@ -316,8 +386,24 @@ pub(super) fn run_phase2d_guarded_qat(
 
     let q_final = TIER_QUADS[max_tier];
     let include_extras = has_active_op_t(work_model, q_final) || work_model.active_kautz_pairs > 0;
-    let qat_layout =
-        ThetaLayout::for_tier_from_model_qat(work_model, max_tier, include_extras, ctx.max_tau);
+    let qat_layout = if linear_only {
+        ThetaLayout::for_tier_from_model_linear_modal(
+            work_model,
+            max_tier,
+            true,
+            true,
+            ctx.max_tau,
+            ctx.kautz_r_max,
+        )
+    } else {
+        ThetaLayout::for_tier_from_model_qat(
+            work_model,
+            max_tier,
+            include_extras,
+            ctx.max_tau,
+            ctx.kautz_r_max,
+        )
+    };
     let qat_win = build_representative_window(ctx, n.min(4_096))?;
     let qat = run_pass2_ste_qat_polish(
         ctx.runner,
@@ -493,6 +579,7 @@ pub(super) fn explore_candidate_short(
         include_extras,
         include_readouts,
         ctx.max_tau,
+        ctx.kautz_r_max,
     );
     let (init_phys, bounds) = layout.pack(cand);
     let scales = layout.coord_scales(win.len());
@@ -668,6 +755,7 @@ mod tests {
             config: cfg,
             warmup: 32,
             max_tau: 512.0,
+            kautz_r_max: 0.9992,
             max_tier: 1,
             fast_mode: true,
             progress: Some(&prog),
@@ -680,7 +768,6 @@ mod tests {
 
         let sub_w = build_windows(&ctx, 512, 3).unwrap();
         assert_eq!(sub_w.len(), 3);
-        assert_eq!((sub_w[0].start, sub_w[2].end), (0, n));
         assert!(
             sub_w
                 .iter()

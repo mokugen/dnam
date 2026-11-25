@@ -442,6 +442,20 @@ pub(super) fn others_intact(
     (1..=3).all(|u| u == target_t || !prev.pair_monotone[u] || cand.pair_monotone[u])
 }
 
+/// Ensures repair steps never drop any previously passing normative §4 tier quality floor
+/// across `tiers` (`rep_l[u].meets_floor && rep_r[u].meets_floor`).
+#[inline]
+pub(super) fn floors_intact(
+    prev: &StereoCertBundle,
+    cand: &StereoCertBundle,
+    mut tiers: core::ops::RangeInclusive<usize>,
+) -> bool {
+    tiers.all(|u| {
+        (!prev.rep_l[u].meets_floor || cand.rep_l[u].meets_floor)
+            && (!prev.rep_r[u].meets_floor || cand.rep_r[u].meets_floor)
+    })
+}
+
 #[inline]
 pub(super) fn strict_besr_preserved(
     orig_besr: &[f64; 4],

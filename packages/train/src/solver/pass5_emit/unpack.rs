@@ -330,6 +330,10 @@ pub fn decode_dnam_bin_to_model(dnam_bin: &[u8]) -> Result<SonaModelF64, TrainEr
     let sr = f64::from(view.header.reference_sample_rate_hz.get());
     let mut model = SonaModelF64::new(sr);
     model.ro_pole_48k = f64::from(view.runtime_meta.ro_pole_48k.get());
+    let raw_wet_dc = view.runtime_meta.dc_blocker_pole_5hz.get();
+    if raw_wet_dc.is_finite() && raw_wet_dc > 0.8 && raw_wet_dc < 1.0 {
+        model.dc_blocker_pole_5hz = f64::from(raw_wet_dc);
+    }
 
     let meta = a0.crossbar.sona_meta_flags.get();
     model.oversample_upper_tiers_2x = (meta & SONA_META_OS2X) != 0;
@@ -610,6 +614,7 @@ mod tests {
         model.kautz[0].c_re_l = 0.25;
         model.transport_quads[0].scat_psi = 0.5;
         model.transport_quads[0].r_dc = 0.985;
+        model.dc_blocker_pole_5hz = f64::from(dnam_kernels::MAX_PARALRU_R_F32);
         model.transport_quads[0].lfo_phase_off_q16 = [0, 16_384, 32_768, 49_152];
         model.transport_quads[0].ramp_phase_off_q16 = [0, 32_768, 16_384, 49_152];
         model.transport_quads[0].allpass_delays = [3, 5, 7, 11];
@@ -635,6 +640,10 @@ mod tests {
             [0x1234_5678, 0x9ABC_DEF0, 0x4000_0000, 0x8000_0000]
         );
         assert!((decoded.transport_quads[0].r_dc - 0.985).abs() < 1.0e-6);
+        assert!(
+            (decoded.dc_blocker_pole_5hz - f64::from(dnam_kernels::MAX_PARALRU_R_F32)).abs()
+                < 1.0e-7
+        );
         assert_eq!(
             decoded.transport_quads[0].lfo_phase_off_q16,
             [0, 16_384, 32_768, 49_152]

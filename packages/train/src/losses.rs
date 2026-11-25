@@ -25,7 +25,8 @@ pub use bezout::{
 };
 pub use certification::{
     DRY_SILENCE_EPS, DrySilentGapMask, MIN_DRY_SILENT_GAP_SECS, POST_T60_GAP_AMP_RATIO,
-    TierCertificationReport, TierQualityFloors, certify_tier_audio, certify_tier_audio_with_gaps,
+    SEG_ESR_UNEXCITED_BAND_AMP_RATIO, SEG_ESR_UNEXCITED_BAND_GUARD_RATIO, TierCertificationReport,
+    TierQualityFloors, certify_tier_audio, certify_tier_audio_with_gaps,
     check_adjacent_tier_monotone, is_tier_pair_monotone,
 };
 pub use fft::{Radix2FftPlan, build_hann_window, compute_welch_seg_starts};

@@ -1,16 +1,19 @@
 //! 1/12-octave Excitation-Masking Ratio (`MM-Cholesky`) and active-set 33-band LTAS
 //! Newton-KKT linear solvers (`ref[train.pipeline.nested-varpro-schur]`).
 
+mod affine_box;
+
 use crate::error::TrainError;
 use crate::wide_gram::{uplo_u_index, uplo_u_packed_len};
 
 use super::cholesky::{solve_uplo_adaptive_ridge, solve_uplo_u_cholesky, symv_uplo_u};
+pub(crate) use affine_box::{AffineBoxKktProblem, solve_ltas_affine_box_kkt};
 
 const DEFAULT_DB_NOISE_FLOOR: f64 = 1.0e-12;
 const EMR_LOCK_HZ: f64 = 1_500.0;
 const EMR_PHASE_LOCK_DB: f64 = 0.25;
 const EMR_MIN_PHASE_ALPHA: f64 = 0.5;
-const KKT_PRIMAL_RIDGE_MIN: f64 = 1.0e-10;
+pub(super) const KKT_PRIMAL_RIDGE_MIN: f64 = 1.0e-10;
 
 /// Configuration for 1/12-octave Excitation/Masking weighted `MM-Cholesky` (`ref[train.pipeline.nested-varpro-schur]`).
 #[derive(Clone, Copy, Debug, PartialEq)]

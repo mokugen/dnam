@@ -3,6 +3,7 @@
 //! (`ref[train.pipeline.nested-varpro-schur]`, `ref[qual.tiers.floors-not-stopping-criteria]`).
 
 mod ridge_solve;
+mod welch_kkt;
 
 use ridge_solve::{
     MAX_CANDIDATE_ABS_BEFORE_SNAP, MIN_RIDGE_ABS_FLOOR, build_scale_invariant_diag_ridge,
@@ -11,12 +12,13 @@ use ridge_solve::{
 pub(super) use ridge_solve::{
     compute_channel_hf_mse, compute_channel_mse, solve_bounded_uplo_u, solve_diag_ridge_uplo_u,
 };
+use welch_kkt::{WelchSqpParams, eval_total_pred_welch33_tilt_db, polish_weights_welch33_sqp_kkt};
 
 use crate::control::clamp::{MAX_GAIN_6DB_LIN, evaluate_readout_spectral_magnitudes};
 use crate::linalg::spectral_kkt::{
     EmrMmConfig, EmrSpectralProblem, LtasKktConfig, solve_emr_mm_cholesky, solve_ltas_newton_kkt,
 };
-use crate::losses::canonical_ltas_33_centers_hz;
+use crate::losses::{Welch33TargetCache, canonical_ltas_33_centers_hz};
 use crate::wide_gram::{uplo_u_index, uplo_u_packed_len};
 
 use super::gram_snap::{
@@ -45,6 +47,8 @@ pub(super) struct ChannelSpectralCtx<'a> {
     pub rhs: &'a [f64],
     pub feats_post: &'a [f32],
     pub tgts_post: &'a [f32],
+    pub raw_target_post: Option<&'a [f32]>,
+    pub welch_cache: Option<&'a Welch33TargetCache>,
     pub sr_hz: f64,
     pub ro_pole_48k: f64,
     pub active_fir_taps: usize,
@@ -390,6 +394,50 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
         }
     }
 
+    let mut best_welch_tilt = None;
+    if let (Some(raw_post), Some(welch)) = (ctx.raw_target_post, ctx.welch_cache)
+        && raw_post.len() == ctx.tgts_post.len()
+        && welch.len == ctx.tgts_post.len()
+    {
+        let (cur_wt, _, _) = eval_total_pred_welch33_tilt_db(
+            welch,
+            raw_post,
+            ctx.tgts_post,
+            ctx.feats_post,
+            &best_w,
+            false,
+        );
+        let budget_db = TIER_LTAS_TILT_BUDGET_DB[tier_idx];
+        let mse_limit = if cur_wt > budget_db {
+            best_mse * 2.0 + 1.0e-12
+        } else {
+            best_mse * 1.08 + 1.0e-12
+        };
+        if let Some((w_sqp, mse_sqp, wt_sqp)) = polish_weights_welch33_sqp_kkt(&WelchSqpParams {
+            base_w: &best_w,
+            gram_sub,
+            rhs_sub,
+            lambda_diag: &lambda_diag,
+            feats_post: ctx.feats_post,
+            tgts_post: ctx.tgts_post,
+            raw_target_post: raw_post,
+            welch,
+            sr_hz: ctx.sr_hz,
+            ro_pole_48k: ctx.ro_pole_48k,
+            budget_db,
+            polish_target_db: kkt_target,
+            base_mse: best_mse,
+            mse_limit,
+        }) {
+            best_w = w_sqp;
+            best_mse = mse_sqp;
+            best_tilt = eval_max_tilt_db(&best_w);
+            best_welch_tilt = Some(wt_sqp);
+        } else {
+            best_welch_tilt = Some(cur_wt);
+        }
+    }
+
     let base_within_6db = within_6db(&best_w);
     let col_specs =
         build_tier_col_wire_specs(tier_idx, ctx.active_fir_taps, ctx.emit_prefix_overrides);
@@ -432,6 +480,45 @@ pub(super) fn refine_channel_tier_emr_and_ltas_kkt(
         let snap_mse = compute_channel_mse(&snapped, ctx.feats_post, ctx.tgts_post, dim);
         let fallback_mse = compute_channel_mse(&fallback, ctx.feats_post, ctx.tgts_post, dim);
         let snap_tilt = eval_max_tilt_db(&snapped);
+        let snap_welch_ok = if let (Some(base_wt), Some(raw_post), Some(welch)) =
+            (best_welch_tilt, ctx.raw_target_post, ctx.welch_cache)
+        {
+            let snap_wt = eval_total_pred_welch33_tilt_db(
+                welch,
+                raw_post,
+                ctx.tgts_post,
+                ctx.feats_post,
+                &snapped,
+                false,
+            )
+            .0;
+            let welch_budget = if base_wt <= TIER_LTAS_TILT_BUDGET_DB[tier_idx] {
+                (base_wt + 0.04).min(TIER_LTAS_TILT_BUDGET_DB[tier_idx])
+            } else {
+                base_wt + 0.04
+            };
+            let fb_wt = eval_total_pred_welch33_tilt_db(
+                welch,
+                raw_post,
+                ctx.tgts_post,
+                ctx.feats_post,
+                &fallback,
+                false,
+            )
+            .0;
+            snap_wt <= welch_budget || snap_wt <= fb_wt + 0.01
+        } else {
+            true
+        };
+        if best_welch_tilt.is_some() {
+            if snap_welch_ok
+                && snap_mse <= best_mse * 1.15 + 1.0e-12
+                && snap_mse <= fallback_mse * 1.05 + 1.0e-12
+            {
+                return snapped;
+            }
+            return fallback;
+        }
         if snap_tilt <= tilt_budget
             && snap_mse <= best_mse * 1.15 + 1.0e-12
             && snap_mse <= fallback_mse * 1.05 + 1.0e-12
@@ -516,6 +603,8 @@ mod tests {
             rhs: &rhs,
             feats_post: &feats,
             tgts_post: &tgts,
+            raw_target_post: None,
+            welch_cache: None,
             sr_hz: sr,
             ro_pole_48k: 0.0,
             active_fir_taps: 128,

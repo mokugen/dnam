@@ -4,11 +4,13 @@
 
 pub(crate) mod features;
 mod gram_snap;
+mod linear_gate;
 mod pre_conv_proj;
 mod ro_sweep;
 mod spectral_refine;
 mod stat_and_patch;
 mod tier_gate;
+mod tier_opt_sol;
 
 pub use stat_and_patch::{
     WeightedReadoutStem, extract_stat_256d_gram, patch_model_readouts_weighted_cholesky,
@@ -40,6 +42,7 @@ use ro_sweep::{build_per_tier_rhs, sweep_ro_pole_48k_joint_stereo};
 use spectral_refine::{
     ChannelSpectralCtx, refine_channel_tier_emr_and_ltas_kkt, solve_bounded_uplo_u,
 };
+use tier_opt_sol::{TierOptChannelSol, TierOptSolveInputs, solve_tier_opt_channel_sol};
 
 /// Result returned by Pass-3 nested 4-tier `VarPro` readout identification.
 #[derive(Clone, Debug, PartialEq)]
@@ -79,94 +82,6 @@ fn eval_hp_post_for_ro(
     };
     let eff = apply_op_t_series_channel_bank(model, &hp_sig, is_right, active_opt);
     eff[w..n].iter().map(|&v| v as f32).collect()
-}
-
-struct TierOptChannelSol {
-    gl: Vec<f64>,
-    rl: Vec<f64>,
-    wl: Vec<f64>,
-    rl_ridge: f64,
-    gr: Vec<f64>,
-    rr: Vec<f64>,
-    wr: Vec<f64>,
-    rr_ridge: f64,
-}
-
-struct TierOptSolveInputs<'a> {
-    fl: &'a mut [f32],
-    fr: &'a mut [f32],
-    tl: &'a [f32],
-    tr: &'a [f32],
-    raw_l: &'a [f64],
-    raw_r: &'a [f64],
-    raw_l_2x: Option<&'a [f64]>,
-    raw_r_2x: Option<&'a [f64]>,
-    dim_t: usize,
-    active_opt: usize,
-    w: usize,
-    force_wide192: bool,
-}
-
-fn solve_tier_opt_channel_sol(
-    runner: &TrainRunner,
-    model: &SonaModelF64,
-    inp: TierOptSolveInputs<'_>,
-) -> Result<TierOptChannelSol, TrainError> {
-    let m = inp.tl.len();
-    let hp_l = eval_hp_post_for_ro(
-        model,
-        inp.raw_l,
-        inp.raw_l_2x,
-        model.ro_pole_48k,
-        inp.w,
-        false,
-        inp.active_opt,
-    );
-    let hp_r = eval_hp_post_for_ro(
-        model,
-        inp.raw_r,
-        inp.raw_r_2x,
-        model.ro_pole_48k,
-        inp.w,
-        true,
-        inp.active_opt,
-    );
-    inp.fl[m..(2 * m)].copy_from_slice(&hp_l);
-    inp.fr[m..(2 * m)].copy_from_slice(&hp_r);
-    let (gl, rl_v) = assemble_ozaki_normal_equations(
-        runner,
-        inp.fl,
-        inp.tl,
-        m,
-        inp.dim_t,
-        1,
-        inp.force_wide192,
-    )?;
-    let (gr, rr_v) = assemble_ozaki_normal_equations(
-        runner,
-        inp.fr,
-        inp.tr,
-        m,
-        inp.dim_t,
-        1,
-        inp.force_wide192,
-    )?;
-    let rl: Vec<f64> = rl_v.into_iter().map(|v| v[0]).collect();
-    let rr: Vec<f64> = rr_v.into_iter().map(|v| v[0]).collect();
-    let (wl, rl_ridge) =
-        solve_bounded_uplo_u(&gl, &rl, inp.dim_t, model.ro_pole_48k, model.sample_rate_hz)?;
-    let (wr, rr_ridge) =
-        solve_bounded_uplo_u(&gr, &rr, inp.dim_t, model.ro_pole_48k, model.sample_rate_hz)?;
-    Ok(TierOptChannelSol {
-        gl,
-        rl,
-        wl,
-        rl_ridge,
-        gr,
-        rr,
-        wr,
-        rr_ridge,
-    })
 }
 
 #[derive(Clone, Copy)]
@@ -389,6 +304,12 @@ fn run_pass3_varpro_readout_inner(
     }
     let emit_prefix_overrides = model.prefix_override_needed[1..].iter().any(|&v| v);
 
+    let welch_l =
+        crate::losses::Welch33TargetCache::new(&pairs_n.target_l[w..n], 0, model.sample_rate_hz)?;
+    let welch_r =
+        crate::losses::Welch33TargetCache::new(&pairs_n.target_r[w..n], 0, model.sample_rate_hz)?;
+    let raw_l_post: Vec<f32> = pairs_n.target_l[w..n].iter().map(|&v| v as f32).collect();
+    let raw_r_post: Vec<f32> = pairs_n.target_r[w..n].iter().map(|&v| v as f32).collect();
     let mut tier_mse = [0.0_f64; 4];
     let mut tier_hf_mse = [0.0_f64; 2];
     let mut prev_tier_sol: Option<(Vec<f64>, Vec<f64>, f64)> = None;
@@ -462,6 +383,7 @@ fn run_pass3_varpro_readout_inner(
                 fset.tier_tgts_r(ti),
             )
         };
+        let l_match = tl_ref.len() == raw_l_post.len();
         let wl_refined = refine_channel_tier_emr_and_ltas_kkt(
             wl_init,
             dim_t,
@@ -471,6 +393,8 @@ fn run_pass3_varpro_readout_inner(
                 rhs: rl_ref,
                 feats_post: fl_ref,
                 tgts_post: tl_ref,
+                raw_target_post: l_match.then_some(&raw_l_post[..]),
+                welch_cache: l_match.then_some(&welch_l),
                 sr_hz: model.sample_rate_hz,
                 ro_pole_48k: model.ro_pole_48k,
                 active_fir_taps: fset.active_fir_taps,
@@ -478,6 +402,7 @@ fn run_pass3_varpro_readout_inner(
                 used_rel: rl_rel,
             },
         );
+        let r_match = tr_ref.len() == raw_r_post.len();
         let wr_refined = refine_channel_tier_emr_and_ltas_kkt(
             wr_init,
             dim_t,
@@ -487,6 +412,8 @@ fn run_pass3_varpro_readout_inner(
                 rhs: rr_ref,
                 feats_post: fr_ref,
                 tgts_post: tr_ref,
+                raw_target_post: r_match.then_some(&raw_r_post[..]),
+                welch_cache: r_match.then_some(&welch_r),
                 sr_hz: model.sample_rate_hz,
                 ro_pole_48k: model.ro_pole_48k,
                 active_fir_taps: fset.active_fir_taps,
@@ -615,9 +542,49 @@ pub fn run_pass3_varpro_readout_with_options(
         target_l: &pairs.target_l[..n],
         target_r: &pairs.target_r[..n],
     };
-    let (report, outcome) =
+    let exact_w_ro_pre_zero = model.w_ro.iter().all(|r| r[0..6].iter().all(|&v| v == 0.0));
+    if options.suppress_post_core_lane_mask == 0
+        && !options.suppress_direct_s2_linear
+        && exact_w_ro_pre_zero
+        && linear_gate::has_zero_core_nonlinear_drives(model)
+        && model
+            .w_ro
+            .iter()
+            .all(|r| r[6..12].iter().all(|&v| v == 0.0))
+    {
+        let lin_opts = Pass3VarProOptions {
+            suppress_direct_s2_linear: false,
+            suppress_post_core_lane_mask: u64::MAX,
+        };
+        let (report, _) =
+            run_pass3_varpro_readout_with_os2x_fallback(runner, model, &pairs_n, w, lin_opts)?;
+        return Ok(report);
+    }
+
+    let pre_pass3_snapshot = (options.suppress_post_core_lane_mask == 0
+        && !options.suppress_direct_s2_linear
+        && exact_w_ro_pre_zero)
+        .then(|| model.clone());
+    let (mut report, outcome) =
         run_pass3_varpro_readout_with_os2x_fallback(runner, model, &pairs_n, w, options)?;
-    if options.suppress_direct_s2_linear || options.suppress_post_core_lane_mask != 0 {
+    let mut pure_linear_selected = false;
+    if let Some(base_snapshot) = pre_pass3_snapshot
+        && let Some((lin_rep, _)) = linear_gate::maybe_select_pure_linear_pass3(
+            runner,
+            model,
+            &base_snapshot,
+            &pairs_n,
+            w,
+            outcome,
+        )?
+    {
+        report = lin_rep;
+        pure_linear_selected = true;
+    }
+    if pure_linear_selected
+        || options.suppress_direct_s2_linear
+        || options.suppress_post_core_lane_mask != 0
+    {
         return Ok(report);
     }
     pre_conv_proj::maybe_refine_with_pre_conv_projection(
@@ -854,5 +821,64 @@ mod tests {
             .map(|t| f64::from(lite_l[t]).powi(2) + f64::from(lite_r[t]).powi(2))
             .sum::<f64>();
         assert!(err / sig.max(1.0e-12) < 1.0e-5, "nesr={}", err / sig);
+    }
+
+    #[test]
+    fn test_pass3_lti_op_t_shift_invariance_matches_direct_per_column_eval() {
+        let sr = 48_000.0_f64;
+        let n = 1_024_usize;
+        let w = 64_usize;
+        let in_l: Vec<f64> = (0..n)
+            .map(|t| 0.35 * ((t as f64) * 0.07).sin() + 0.15 * ((t as f64) * 0.41).cos())
+            .collect();
+        let in_r: Vec<f64> = (0..n)
+            .map(|t| 0.30 * ((t as f64) * 0.11).cos() - 0.10 * ((t as f64) * 0.29).sin())
+            .collect();
+
+        let mut model = SonaModelF64::new(sr);
+        model.oversample_upper_tiers_2x = false;
+        model.active_fir_taps = 64;
+        model.pre_conv_u_gain = [1.0, 1.0];
+        model.tank_dry_mix = 1.0;
+        model.transport_quads[0].delay_samples = [45.0, 57.0, 73.0, 91.0];
+        model.transport_quads[0].input_gains = [1.0, 1.0, 1.0, 1.0];
+        model.transport_quads[0].wet_tap_l = [0.24, 0.0, -0.14, 0.0];
+        model.transport_quads[0].wet_tap_r = [0.0, 0.22, 0.0, 0.12];
+        model.transport_quads[0].g_loop = 0.0;
+
+        let fset_lti = build_pass3_feature_sets(
+            &TrainRunner::cpu(),
+            &mut model,
+            &StereoTrainingPairs {
+                in_l: &in_l,
+                in_r: &in_r,
+                target_l: &in_l,
+                target_r: &in_r,
+            },
+            w,
+            Pass3VarProOptions::default(),
+        )
+        .unwrap();
+
+        let m = n - w;
+        let pre_filt_l = apply_op_t_series_channel_bank(&model, &in_l, false, 4);
+        let col0_off = 2 + 16 * 3;
+        for k in 0..32 {
+            let mut tap_col = vec![0.0_f64; n];
+            tap_col[k..n].copy_from_slice(&in_l[..(n - k)]);
+            let direct = apply_op_t_series_channel_bank(&model, &tap_col, false, 4);
+            for t in 0..m {
+                let got = fset_lti.feats_l_post[(col0_off + k) * m + t];
+                assert_eq!(got, direct[w + t] as f32);
+                assert_eq!(
+                    got,
+                    if w + t >= k {
+                        pre_filt_l[w + t - k] as f32
+                    } else {
+                        0.0
+                    }
+                );
+            }
+        }
     }
 }

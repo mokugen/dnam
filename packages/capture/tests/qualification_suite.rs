@@ -7,5 +7,7 @@ pub(crate) mod adapter;
 pub(crate) mod excitations;
 #[path = "qualification_suite/harness.rs"]
 pub(crate) mod harness;
+#[path = "qualification_suite/phase_a.rs"]
+mod phase_a;
 #[path = "qualification_suite/self_tests.rs"]
 mod self_tests;

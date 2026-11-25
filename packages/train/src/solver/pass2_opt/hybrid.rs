@@ -6,6 +6,7 @@
 //!    paired with monotone-gated VarPro refresh and `BestUntilDiminishingReturns` stopping.
 //! 4. **Phase 2D:** Conditioned `u`-space STE `fp16` QAT polish under monotone non-regression.
 
+mod phase2a;
 mod windows;
 
 use crate::error::TrainError;
@@ -20,14 +21,15 @@ use dnam_vm::Tier;
 use super::super::model::{SonaModelF64, StereoTrainingPairs};
 use super::super::progress::AtomicDnprProgress;
 use super::matryoshka::{MatryoshkaEvalCtx, eval_joint_matryoshka_and_grad, expand_model_to_tier};
-use super::prescreen::{prescreen_top_k_diverse, seed_pass1_inert_defaults, tier_index_for_quads};
-use super::theta::{TIER_QUADS, ThetaLayout, has_active_op_t};
+use super::prescreen::tier_index_for_quads;
+use super::theta::{TIER_QUADS, has_active_op_t};
 use super::{DIMINISHING_RETURNS_DELTA_DB, Pass2OptConfig};
+use phase2a::run_phase2a;
 use windows::{
-    HybridCtx, allocate_stage_steps, build_representative_window, build_windows,
-    eval_full_capsule_metrics, eval_single_tier_with_grad, eval_tier_prefix_metrics,
-    explore_candidate_short, is_pass2_metrics_acceptable, publish_progress,
-    refresh_active_tiers_varpro, refresh_lower_tiers_varpro_full, run_phase2d_guarded_qat,
+    HybridCtx, allocate_stage_steps, build_windows, eval_full_capsule_metrics,
+    eval_single_tier_with_grad, eval_tier_prefix_metrics, is_pass2_metrics_acceptable,
+    phase2_layout_for_tier, publish_progress, refresh_active_tiers_varpro,
+    refresh_lower_tiers_varpro_full, run_phase2d_guarded_qat,
 };
 
 /// Raw outcome of the hybrid Phase 2A–2D pipeline prior to timing annotation.
@@ -62,88 +64,19 @@ fn maybe_update_stage_best(
     }
 }
 
-fn run_phase2a(
-    ctx: &HybridCtx<'_>,
-    base_model: &SonaModelF64,
-) -> Result<(SonaModelF64, usize), TrainError> {
-    let top_k = if ctx.fast_mode {
-        ctx.config.top_k_seeds.clamp(1, 2)
-    } else {
-        ctx.config.top_k_seeds.clamp(1, 8)
-    };
-    let mut cands = prescreen_top_k_diverse(
-        ctx.runner,
-        base_model,
-        ctx.pairs,
-        ctx.config,
-        top_k,
-        ctx.noise_pair,
-    )?;
-    if cands.is_empty() {
-        return Ok((base_model.clone(), 0));
-    }
-
-    let (mut best_cand, best_seed) = if ctx.fast_mode || cands.len() == 1 {
-        let win = cands.remove(0);
-        (win.model, win.seed_index)
-    } else {
-        let explore_n = cands.len().min(top_k.min(4));
-        let rep_win = build_representative_window(ctx, ctx.config.chunk_frames.min(2_048))?;
-        let init_ti = if ctx.config.use_progressive_matryoshka && ctx.max_tier > 0 {
-            0
-        } else {
-            ctx.max_tier
-        };
-        let mut picked = cands[0].model.clone();
-        let mut picked_seed = cands[0].seed_index;
-        let mut best_score = f64::INFINITY;
-        for cand in cands.iter_mut().take(explore_n) {
-            let sc = explore_candidate_short(ctx, &mut cand.model, &rep_win, init_ti, 4)?;
-            if sc.is_finite() && sc < best_score {
-                best_score = sc;
-                picked = cand.model.clone();
-                picked_seed = cand.seed_index;
-            }
-        }
-        (picked, picked_seed)
-    };
-
-    let has_pass1_modal = base_model.active_fir_taps > 0 || base_model.active_kautz_pairs > 0;
-    if has_pass1_modal {
-        let pass1_seeded = seed_pass1_inert_defaults(
-            base_model,
-            None,
-            best_seed,
-            (
-                ctx.config.num_prescreen_seeds,
-                ctx.config.prescreen_seed_offset,
-                ctx.config.sample_rate_hz,
-            ),
-        );
-        let use_joint = ctx.config.use_progressive_matryoshka && ctx.max_tier > 0;
-        let weights_final = CompositeLossWeights::homotopy_at(1.0);
-        let p1_m = eval_full_capsule_metrics(ctx, &pass1_seeded, use_joint, weights_final)?;
-        let cand_m = eval_full_capsule_metrics(ctx, &best_cand, use_joint, weights_final)?;
-        if !is_pass2_metrics_acceptable(p1_m, cand_m, use_joint, false) {
-            best_cand = pass1_seeded;
-        }
-    }
-
-    Ok((best_cand, best_seed))
-}
-
 fn run_phase2b_progressive_adamw(
     ctx: &HybridCtx<'_>,
     model: &mut SonaModelF64,
     global_epochs: &mut usize,
+    linear_only: bool,
 ) -> Result<(f64, f64, f64), TrainError> {
     let use_joint = ctx.config.use_progressive_matryoshka && ctx.max_tier > 0;
-    let stages: Vec<usize> = if use_joint {
-        (0..=ctx.max_tier).collect()
-    } else {
+    let stages: Vec<usize> = if linear_only || !use_joint {
         vec![ctx.max_tier]
+    } else {
+        (0..=ctx.max_tier).collect()
     };
-    let total_steps = if ctx.fast_mode {
+    let mut total_steps = if ctx.fast_mode {
         ctx.config
             .adamw_steps
             .min(ctx.config.max_epochs.max(1) * 4)
@@ -151,6 +84,9 @@ fn run_phase2b_progressive_adamw(
     } else {
         ctx.config.adamw_steps.max(stages.len() * 4)
     };
+    if linear_only {
+        total_steps = total_steps.min(16);
+    }
     let stage_plan = allocate_stage_steps(&stages, total_steps);
     let chunks = build_windows(ctx, ctx.config.chunk_frames, 4)?;
     let refresh_every = ctx.config.varpro_refresh_interval.max(1);
@@ -203,13 +139,15 @@ fn run_phase2b_progressive_adamw(
         let q_t = TIER_QUADS[stage_ti];
         let has_op_t = has_active_op_t(model, q_t);
         let include_extras = has_op_t || model.active_kautz_pairs > 0;
-        let include_readouts = has_op_t;
-        let layout = ThetaLayout::for_tier_from_model_pass2(
+        let include_readouts = has_op_t || linear_only;
+        let layout = phase2_layout_for_tier(
             model,
             stage_ti,
+            linear_only,
             include_extras,
             include_readouts,
             ctx.max_tau,
+            ctx.kautz_r_max,
         );
         let (init_phys, bounds) = layout.pack(model);
         let scales = layout.coord_scales(chunks[0].len());
@@ -394,18 +332,21 @@ fn run_phase2c_ssbroyden(
     model: &mut SonaModelF64,
     global_epochs: &mut usize,
     init_metrics: (f64, f64, f64),
+    linear_only: bool,
 ) -> Result<(f64, f64, bool), TrainError> {
     let final_ti = ctx.max_tier;
     let use_joint = ctx.config.use_progressive_matryoshka && final_ti > 0;
     let weights = CompositeLossWeights::homotopy_at(1.0);
     let n = ctx.pairs.aligned_len();
     let block_len = if ctx.fast_mode { n } else { n.min(4_096) };
-    let blocks = build_windows(ctx, block_len, 2)?;
     let max_blocks = if ctx.fast_mode {
         1
-    } else {
+    } else if linear_only {
         ctx.config.max_epochs.div_ceil(4).clamp(1, 4)
+    } else {
+        ctx.config.max_epochs.div_ceil(4).clamp(1, 2)
     };
+    let blocks = build_windows(ctx, block_len, max_blocks)?;
     let iters_per_block = if ctx.fast_mode {
         ctx.config
             .ssbroyden_block_iters
@@ -430,13 +371,15 @@ fn run_phase2c_ssbroyden(
         let q_t = TIER_QUADS[final_ti];
         let has_op_t = has_active_op_t(&work_model, q_t);
         let include_extras = has_op_t || work_model.active_kautz_pairs > 0;
-        let include_readouts = has_op_t;
-        let layout = ThetaLayout::for_tier_from_model_pass2(
+        let include_readouts = has_op_t || linear_only;
+        let layout = phase2_layout_for_tier(
             &work_model,
             final_ti,
+            linear_only,
             include_extras,
             include_readouts,
             ctx.max_tau,
+            ctx.kautz_r_max,
         );
         let (init_phys, bounds) = layout.pack(&work_model);
         let scales = layout.coord_scales(win.len());
@@ -574,6 +517,14 @@ pub(super) fn run_hybrid_pass2_optimize(
     let warmup = config.warmup_frames.min(n / 4);
     let max_tau = ((n / 2).min(4_096) as f64).max(8.0);
     let fast_mode = config.max_epochs <= 6;
+    let kautz_r_max = super::super::pass1_probe::kautz_fit::estimate_physical_kautz_r_ceil(
+        &pairs.in_l[..n],
+        &pairs.in_r[..n],
+        &pairs.target_l[..n],
+        &pairs.target_r[..n],
+        warmup,
+        config.sample_rate_hz,
+    );
 
     let noise_l = noise_pair.map(|(nl, _)| nl);
     let noise_r = noise_pair.map(|(_, nr)| nr);
@@ -597,21 +548,34 @@ pub(super) fn run_hybrid_pass2_optimize(
         config,
         warmup,
         max_tau,
+        kautz_r_max,
         max_tier,
         fast_mode,
         progress,
     };
 
-    let (mut work_model, winning_seed_index) = run_phase2a(&ctx, model)?;
+    let (mut work_model, winning_seed_index, linear_only) = run_phase2a(&ctx, model)?;
     publish_progress(progress, 50, 0, 1, f64::INFINITY, Tier::Lite);
 
     let mut epochs_run = 0_usize;
-    let phase2b_metrics = run_phase2b_progressive_adamw(&ctx, &mut work_model, &mut epochs_run)?;
-    let (phase2c_loss, phase2c_besr_db, converged) =
-        run_phase2c_ssbroyden(&ctx, &mut work_model, &mut epochs_run, phase2b_metrics)?;
+    let phase2b_metrics =
+        run_phase2b_progressive_adamw(&ctx, &mut work_model, &mut epochs_run, linear_only)?;
+    let (phase2c_loss, phase2c_besr_db, converged) = run_phase2c_ssbroyden(
+        &ctx,
+        &mut work_model,
+        &mut epochs_run,
+        phase2b_metrics,
+        linear_only,
+    )?;
 
     let (qat_polish_steps_run, qat_baseline_loss, best_loss, best_besr_db) =
-        run_phase2d_guarded_qat(&ctx, &mut work_model, phase2c_loss, phase2c_besr_db)?;
+        run_phase2d_guarded_qat(
+            &ctx,
+            &mut work_model,
+            phase2c_loss,
+            phase2c_besr_db,
+            linear_only,
+        )?;
 
     *model = work_model;
     publish_progress(

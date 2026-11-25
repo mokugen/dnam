@@ -15,6 +15,14 @@ use super::mr_iir::{MrIirTargetCache, compute_mr_iir_channel_with_gaps};
 /// active target RMS used to detect dead-silent post-decay interiors inside dry-silent gaps.
 pub const POST_T60_GAP_AMP_RATIO: f64 = 1.0 / 1_000.0;
 
+/// Relative target-band amplitude threshold ($10^{-3} = -60\text{ dB}$ vs frame broadband RMS) below
+/// which a noiseless `SegESR` band in an active 20 ms frame is treated as an unexcited crossover skirt.
+pub const SEG_ESR_UNEXCITED_BAND_AMP_RATIO: f64 = 1.0 / 1_000.0;
+
+/// Strict residual guard ($10^{-2} = -40\text{ dB}$ vs frame broadband RMS) enforced on unexcited
+/// noiseless `SegESR` bands (`|E_b(y_hat) - E_b(y)| <= 10^-2 E_bb(y)`).
+pub const SEG_ESR_UNEXCITED_BAND_GUARD_RATIO: f64 = 1.0 / 100.0;
+
 /// Minimum contiguous dry-silence duration (`20 ms`, matching one `SegESR` frame) eligible for
 /// post-`T60` gap detection inside multi-regime stimuli such as `Schoukens–Pintelon` `Regime 2`.
 pub const MIN_DRY_SILENT_GAP_SECS: f64 = 1.0 / 50.0;
@@ -22,14 +30,19 @@ pub const MIN_DRY_SILENT_GAP_SECS: f64 = 1.0 / 50.0;
 /// Exact/numeric silence floor on dry stimulus samples (`|dry| <= DRY_SILENCE_EPS`).
 pub const DRY_SILENCE_EPS: f64 = 1.0e-9;
 
-const MIN_POST_T60_GAP_SAMPLES: usize = 256;
+pub(crate) const MIN_POST_T60_GAP_SAMPLES: usize = 256;
+pub(crate) const GAP_PRERING_TRIM_MAX_SAMPLES: usize = 64;
 
 const _: () = assert!(
     POST_T60_GAP_AMP_RATIO > 0.0
         && POST_T60_GAP_AMP_RATIO <= 1.0e-3
+        && SEG_ESR_UNEXCITED_BAND_AMP_RATIO == POST_T60_GAP_AMP_RATIO
+        && SEG_ESR_UNEXCITED_BAND_GUARD_RATIO == 10.0 * SEG_ESR_UNEXCITED_BAND_AMP_RATIO
         && MIN_DRY_SILENT_GAP_SECS > 0.0
         && DRY_SILENCE_EPS > 0.0
         && MIN_POST_T60_GAP_SAMPLES == 256
+        && GAP_PRERING_TRIM_MAX_SAMPLES == 64
+        && GAP_PRERING_TRIM_MAX_SAMPLES < MIN_POST_T60_GAP_SAMPLES
 );
 
 /// Post-`T60` dead-silent `[start, end)` sample intervals detected purely from `(dry, target)` inside
@@ -90,16 +103,27 @@ impl DrySilentGapMask {
                 }
                 let e_dry = i;
                 if e_dry - s_dry >= min_gap {
+                    let mut e_end = e_dry;
+                    if e_dry < n {
+                        let ring_lo = e_dry
+                            .saturating_sub(GAP_PRERING_TRIM_MAX_SAMPLES)
+                            .max(s_dry);
+                        if let Some(first_ring) =
+                            (ring_lo..e_dry).find(|&j| target[j].abs() > t60_thresh)
+                        {
+                            e_end = first_ring;
+                        }
+                    }
                     let mut last_above = None;
-                    for j in (s_dry..e_dry).rev() {
+                    for j in (s_dry..e_end).rev() {
                         if target[j].abs() > t60_thresh {
                             last_above = Some(j);
                             break;
                         }
                     }
                     let s_t60 = last_above.map_or(s_dry, |idx| idx + 1);
-                    if e_dry.saturating_sub(s_t60) >= MIN_POST_T60_GAP_SAMPLES {
-                        spans.push((s_t60, e_dry));
+                    if e_end.saturating_sub(s_t60) >= MIN_POST_T60_GAP_SAMPLES {
+                        spans.push((s_t60, e_end));
                     }
                 }
             } else {
@@ -480,5 +504,33 @@ mod tests {
         )
         .expect("noise cert");
         assert!(rep_noise.mr_iir.is_finite());
+
+        // Trailing Kaiser-64 boundary pre-ringing inside [e_dry - 28 .. e_dry) trims cleanly instead
+        // of collapsing the dead-silent interior span to empty.
+        let mut prering_tgt = target.clone();
+        for (i, slot) in prering_tgt
+            .iter_mut()
+            .enumerate()
+            .take(14_400)
+            .skip(14_400 - 28)
+        {
+            let phase = (i - (14_400 - 28)) as f64;
+            *slot = 5.0e-3 * (-0.08 * (28.0 - phase)).exp() * (0.7 * phase).cos();
+        }
+        let prering_mask = DrySilentGapMask::detect(&dry, &prering_tgt, warmup, sr);
+        assert_eq!(prering_mask.spans, vec![(2_400, 14_400 - 28)]);
+
+        // Active > -60 dB tail throughout the entire dry-silent gap leaves spans empty.
+        let mut genuine_tail_tgt = target.clone();
+        for (i, slot) in genuine_tail_tgt
+            .iter_mut()
+            .enumerate()
+            .take(14_400)
+            .skip(2_400)
+        {
+            *slot = 5.0e-3 * (tau * 110.0 * (i as f64) / sr).sin();
+        }
+        let genuine_tail_mask = DrySilentGapMask::detect(&dry, &genuine_tail_tgt, warmup, sr);
+        assert!(genuine_tail_mask.spans.is_empty());
     }
 }

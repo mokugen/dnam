@@ -48,6 +48,7 @@ pub(crate) const MAX_METRIC_SAMPLE_RATE_HZ: f64 = 1_536_000.0;
 
 pub use dnam_train::losses::{
     DRY_SILENCE_EPS, DrySilentGapMask, MIN_DRY_SILENT_GAP_SECS, POST_T60_GAP_AMP_RATIO,
+    SEG_ESR_UNEXCITED_BAND_AMP_RATIO, SEG_ESR_UNEXCITED_BAND_GUARD_RATIO,
 };
 
 // ============================================================================
@@ -170,7 +171,9 @@ pub fn compute_multirate_seg_esr_with_gaps_db(
             };
 
             if is_active {
+                let bb_sig_rms = (e_sig_bb * inv_nf).sqrt();
                 let mut r_sum = 0.0_f64;
+                let mut excited_bands = 0_usize;
                 for b in 0..3 {
                     let y_sq: f64 =
                         t_bands[b][start..end].iter().map(|&v| v * v).sum::<f64>() * inv_nf;
@@ -182,10 +185,21 @@ pub fn compute_multirate_seg_esr_with_gaps_db(
                     if !y_sq.is_finite() || !m_sq.is_finite() || !n_sq.is_finite() {
                         return (f64::INFINITY, active_segs, false);
                     }
+                    let y_rms = y_sq.sqrt();
+                    let m_rms = m_sq.sqrt();
                     let f_env = n_sq + env_inc_ratio[b] * y_sq;
+                    if seg.noise.is_none()
+                        && f_env == 0.0
+                        && y_rms <= SEG_ESR_UNEXCITED_BAND_AMP_RATIO * bb_sig_rms
+                    {
+                        if (m_rms - y_rms).abs() > SEG_ESR_UNEXCITED_BAND_GUARD_RATIO * bb_sig_rms {
+                            return (f64::INFINITY, active_segs, false);
+                        }
+                        continue;
+                    }
                     let denom = y_sq + f_env;
                     let r_b = if denom > 0.0 {
-                        let d_rms = m_sq.sqrt() - y_sq.sqrt();
+                        let d_rms = m_rms - y_rms;
                         (d_rms * d_rms - f_env).max(0.0) / denom
                     } else if m_sq == 0.0 {
                         0.0
@@ -193,8 +207,12 @@ pub fn compute_multirate_seg_esr_with_gaps_db(
                         return (f64::INFINITY, active_segs, false);
                     };
                     r_sum += r_b;
+                    excited_bands += 1;
                 }
-                let r_f = r_sum / 3.0;
+                if excited_bands == 0 {
+                    return (f64::INFINITY, active_segs, false);
+                }
+                let r_f = r_sum / (excited_bands as f64);
                 let w_f = (n_f as f64) / fs;
                 weighted_lin_sum += w_f * r_f;
                 weight_sum += w_f;
@@ -351,5 +369,147 @@ mod tests {
         assert!(!sil_rep.available && sil_rep.max_adj_deviation_db.is_infinite());
         assert!(sil_rep.residual_band_power.iter().all(|&p| p == 0.0));
         assert!(!cache_ltas.eval_model(&[0.0; 16]).available);
+
+        // Noiseless SegESR unexcited-band guard: -55 dB LF transient on active 17 kHz chirp
+        // passes cleanly without 1/y^2 singularity, while -30 dB spurious LF fails closed.
+        let n_hf = 3_840_usize;
+        let tau = std::f64::consts::TAU;
+        let tgt_17k: Vec<f64> = (0..n_hf)
+            .map(|i| 0.4 * (tau * 17_000.0 * (i as f64) / sr).sin())
+            .collect();
+        let mdl_lf_ok: Vec<f64> = tgt_17k
+            .iter()
+            .enumerate()
+            .map(|(i, &y)| y + 0.4 * 1.8e-3 * (tau * 25.0 * (i as f64) / sr).sin())
+            .collect();
+        let (seg_ok_db, seg_ok_cnt, seg_ok) =
+            compute_multirate_seg_esr_db(&[MultiRateSegEsrSlice {
+                sample_rate_hz: sr,
+                target: &tgt_17k[960..],
+                model: &mdl_lf_ok[960..],
+                noise: None,
+            }]);
+        assert!(
+            seg_ok && seg_ok_cnt == 3 && seg_ok_db < -25.0,
+            "seg_ok_db={seg_ok_db}"
+        );
+
+        let mdl_lf_bad: Vec<f64> = tgt_17k
+            .iter()
+            .enumerate()
+            .map(|(i, &y)| y + 0.4 * 3.0e-2 * (tau * 25.0 * (i as f64) / sr).sin())
+            .collect();
+        let (seg_bad_db, _, seg_bad) = compute_multirate_seg_esr_db(&[MultiRateSegEsrSlice {
+            sample_rate_hz: sr,
+            target: &tgt_17k[960..],
+            model: &mdl_lf_bad[960..],
+            noise: None,
+        }]);
+        assert!(!seg_bad && seg_bad_db.is_infinite());
+
+        // Cover compute_seg_esr_20ms_db (self-null -> NEG_INFINITY), gap_mask pass/fail,
+        // noise floor gating (+6 dB active / +1 dB passive guard), and input validation guards.
+        let (self_db, self_cnt) =
+            compute_seg_esr_20ms_db(&tgt_17k[960..], &tgt_17k[960..], None, sr);
+        assert!(self_db == f64::NEG_INFINITY && self_cnt > 0);
+
+        let gap_mask = DrySilentGapMask {
+            spans: vec![(0, 960)],
+            active_target_rms: 0.4 * std::f64::consts::FRAC_1_SQRT_2,
+        };
+        let gap_tgt = vec![0.0_f64; 960];
+        let mut sig_tail = gap_tgt.clone();
+        sig_tail.extend_from_slice(&tgt_17k[960..]);
+        let mut mdl_gap_ok = vec![1.0e-5_f64; 960];
+        mdl_gap_ok.extend_from_slice(&tgt_17k[960..]);
+        let (gap_ok_db, gap_ok_cnt, gap_ok) = compute_multirate_seg_esr_with_gaps_db(
+            &[MultiRateSegEsrSlice {
+                sample_rate_hz: sr,
+                target: &sig_tail,
+                model: &mdl_gap_ok,
+                noise: None,
+            }],
+            [0.0; 3],
+            Some(&gap_mask),
+            0,
+        );
+        assert!(
+            gap_ok && gap_ok_cnt > 0 && gap_ok_db < -60.0,
+            "gap_ok_db={gap_ok_db}"
+        );
+
+        let mut mdl_gap_bad = vec![0.05_f64; 960];
+        mdl_gap_bad.extend_from_slice(&tgt_17k[960..]);
+        let (gap_bad_db, _, gap_bad) = compute_multirate_seg_esr_with_gaps_db(
+            &[MultiRateSegEsrSlice {
+                sample_rate_hz: sr,
+                target: &sig_tail,
+                model: &mdl_gap_bad,
+                noise: None,
+            }],
+            [0.0; 3],
+            Some(&gap_mask),
+            0,
+        );
+        assert!(!gap_bad && gap_bad_db.is_infinite());
+
+        let quiet_noise = vec![1.0e-3_f64; sig_tail.len()];
+        let (nse_fail_db, _, nse_fail) = compute_multirate_seg_esr_db(&[MultiRateSegEsrSlice {
+            sample_rate_hz: sr,
+            target: &sig_tail,
+            model: &mdl_gap_bad,
+            noise: Some(&quiet_noise),
+        }]);
+        assert!(!nse_fail && nse_fail_db.is_infinite());
+
+        let (nse_ok_db, nse_ok_cnt, nse_ok) =
+            compute_multirate_seg_esr_db(&[MultiRateSegEsrSlice {
+                sample_rate_hz: sr,
+                target: &tgt_17k[960..],
+                model: &mdl_lf_ok[960..],
+                noise: Some(&quiet_noise[..tgt_17k[960..].len()]),
+            }]);
+        assert!(nse_ok && nse_ok_cnt > 0 && nse_ok_db.is_finite());
+
+        assert!(!compute_multirate_seg_esr_db(&[]).2);
+        assert!(
+            !compute_multirate_seg_esr_with_profile_db(
+                &[MultiRateSegEsrSlice {
+                    sample_rate_hz: sr,
+                    target: &tgt_17k[960..],
+                    model: &tgt_17k[960..],
+                    noise: None,
+                }],
+                [-1.0, 0.0, 0.0],
+            )
+            .2
+        );
+        assert!(
+            !compute_multirate_seg_esr_db(&[MultiRateSegEsrSlice {
+                sample_rate_hz: 4_000.0,
+                target: &tgt_17k[960..],
+                model: &tgt_17k[960..],
+                noise: None,
+            }])
+            .2
+        );
+        assert!(
+            !compute_multirate_seg_esr_db(&[MultiRateSegEsrSlice {
+                sample_rate_hz: sr,
+                target: &tgt_17k[960..],
+                model: &tgt_17k[960..968],
+                noise: None,
+            }])
+            .2
+        );
+        assert!(
+            !compute_multirate_seg_esr_db(&[MultiRateSegEsrSlice {
+                sample_rate_hz: sr,
+                target: &tgt_17k[960..],
+                model: &tgt_17k[960..],
+                noise: Some(&quiet_noise[..8]),
+            }])
+            .2
+        );
     }
 }

@@ -285,31 +285,15 @@ pub fn certify_4metric_universal_with_dry_gaps(
     .0
 }
 
-/// Evaluates unseen holdout certification universally using `profile` (`(reported_besr_db, pass)`).
-/// Sparse multi-tone holdout stems omit full-band `33`-band `LTAS`; when any band qualifies via
-/// repeatability flooring, also verifies `MR-IIR <= 1.0`, `SegESR <= 3.0 dB`, and `<= 1.75 dB`
-/// 3-band spectral balance (`r[qual.eval.metric-scope]`).
-#[must_use]
-pub fn certify_holdout_universal(
+fn eval_holdout_from_summary(
     tier: Tier,
+    summary: &PerceptualCertificationSummary,
     target: &[f64],
     model: &[f64],
     profile: &TargetRepeatabilityProfile,
     sample_rate_hz: f64,
     warmup_samples: usize,
 ) -> (f64, bool) {
-    let summary = eval_universal_core(
-        tier,
-        target,
-        model,
-        None,
-        profile,
-        sample_rate_hz,
-        warmup_samples,
-        None,
-        None,
-        None,
-    );
     let valid_core = !summary.mr_iir.is_nan()
         && summary.mr_iir >= 0.0
         && summary.mr_iir < f64::INFINITY
@@ -335,6 +319,74 @@ pub fn certify_holdout_universal(
     let bal_ok = env_ok
         && bezout_3band_balance_within_db(target, model, sample_rate_hz, warmup_samples, 1.75);
     (summary.besr_db, bal_ok)
+}
+
+/// Evaluates unseen holdout certification universally using `profile` (`(reported_besr_db, pass)`).
+/// Sparse multi-tone holdout stems omit full-band `33`-band `LTAS`; when any band qualifies via
+/// repeatability flooring, also verifies `MR-IIR <= 1.0`, `SegESR <= 3.0 dB`, and `<= 1.75 dB`
+/// 3-band spectral balance (`r[qual.eval.metric-scope]`).
+#[must_use]
+pub fn certify_holdout_universal(
+    tier: Tier,
+    target: &[f64],
+    model: &[f64],
+    profile: &TargetRepeatabilityProfile,
+    sample_rate_hz: f64,
+    warmup_samples: usize,
+) -> (f64, bool) {
+    let summary = eval_universal_core(
+        tier,
+        target,
+        model,
+        None,
+        profile,
+        sample_rate_hz,
+        warmup_samples,
+        None,
+        None,
+        None,
+    );
+    eval_holdout_from_summary(
+        tier,
+        &summary,
+        target,
+        model,
+        profile,
+        sample_rate_hz,
+        warmup_samples,
+    )
+}
+
+/// Variant of [`certify_holdout_universal`] that gates noiseless post-`T60` dry-silent gaps detected
+/// strictly from `(dry, target)` while still enforcing the `-60 dB` residual guard across every gap.
+#[must_use]
+pub fn certify_holdout_universal_with_dry_gaps(
+    tier: Tier,
+    dry: &[f64],
+    target: &[f64],
+    model: &[f64],
+    profile: &TargetRepeatabilityProfile,
+    sample_rate_hz: f64,
+    warmup_samples: usize,
+) -> (f64, bool) {
+    let summary = certify_4metric_universal_with_dry_gaps(
+        tier,
+        dry,
+        target,
+        model,
+        profile,
+        sample_rate_hz,
+        warmup_samples,
+    );
+    eval_holdout_from_summary(
+        tier,
+        &summary,
+        target,
+        model,
+        profile,
+        sample_rate_hz,
+        warmup_samples,
+    )
 }
 
 #[cfg(test)]
@@ -533,5 +585,26 @@ mod tests {
             warmup,
         );
         assert!(noisy_ok.passes_target && noisy_ok.mr_iir.is_finite());
+
+        let (hold_gap_db, hold_gap_ok) = certify_holdout_universal_with_dry_gaps(
+            Tier::Ultra,
+            &dry,
+            &tgt,
+            &mdl_dc_tail,
+            &prof_det,
+            sr,
+            warmup,
+        );
+        assert!(hold_gap_ok && hold_gap_db < -34.0);
+        let (_, hold_ring_ok) = certify_holdout_universal_with_dry_gaps(
+            Tier::Ultra,
+            &dry,
+            &tgt,
+            &mdl_ring,
+            &prof_det,
+            sr,
+            warmup,
+        );
+        assert!(!hold_ring_ok);
     }
 }

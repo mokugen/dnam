@@ -5,7 +5,7 @@ use super::super::super::model::SonaModelF64;
 use super::helpers::{
     MonotoneEvalCtx, MonotoneState, RepairBaseline, blend_override_toward,
     blur_lower_tier_override, commit_dirty_eval, damp_lower_tier_detail, damp_lower_tier_override,
-    others_intact, re_eval_dirty, strict_besr_preserved, tier_lufs_and_trim_ok,
+    floors_intact, others_intact, re_eval_dirty, strict_besr_preserved, tier_lufs_and_trim_ok,
 };
 
 pub(super) fn try_stage_b_bottom_up(
@@ -61,6 +61,7 @@ pub(super) fn try_stage_b_bottom_up(
                 let c = &res.cert;
                 if c.pair_monotone[t]
                     && others_intact(&state.cert, c, t)
+                    && floors_intact(&state.cert, c, (t - 1)..=(t - 1))
                     && strict_besr_preserved(base.besr, c, t)
                     && strict_besr_preserved(base.besr, c, t - 1)
                     && tier_lufs_and_trim_ok(
@@ -106,6 +107,7 @@ pub(super) fn try_stage_b_bottom_up(
                     let c = &res.cert;
                     if c.pair_monotone[t]
                         && others_intact(&state.cert, c, t)
+                        && floors_intact(&state.cert, c, (t - 1)..=(t - 1))
                         && strict_besr_preserved(base.besr, c, t)
                         && (t == 1 || strict_besr_preserved(base.besr, c, t - 1))
                         && tier_lufs_and_trim_ok(
@@ -156,6 +158,7 @@ pub(super) fn try_stage_b_bottom_up(
                     let strict_ok = (1..=t).all(|k| strict_besr_preserved(base.besr, c, k));
                     if prefix_monotone
                         && upper_ok
+                        && floors_intact(&state.cert, c, 0..=(t - 1))
                         && strict_ok
                         && tier_lufs_and_trim_ok(
                             &cand_model,
@@ -197,6 +200,7 @@ pub(super) fn try_stage_b_bottom_up(
                 let strict_ok = (1..=t).all(|k| strict_besr_preserved(base.besr, c, k));
                 if prefix_monotone
                     && upper_ok
+                    && floors_intact(&state.cert, c, 0..=(t - 1))
                     && strict_ok
                     && tier_lufs_and_trim_ok(&cand_model, base.trims, c, config, 0..=(t - 1), false)
                     && commit_dirty_eval(state, res).is_ok()

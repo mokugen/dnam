@@ -15,7 +15,7 @@ use crate::error::TrainError;
 use super::super::model::{SonaModelF64, TierReadoutPrefixF64};
 use super::certify::zero_tier_delta_weights;
 use helpers::{
-    DirtyEvalResult, RepairBaseline, blend_override_toward, commit_dirty_eval,
+    DirtyEvalResult, RepairBaseline, blend_override_toward, commit_dirty_eval, floors_intact,
     materialize_tier_overrides, others_intact, pair_deficit_score, pass_count, re_eval,
     re_eval_dirty, snap_override_fp16_slice, tier_lufs_and_trim_ok, zero_tier_delta_readouts_only,
 };
@@ -48,7 +48,7 @@ fn try_stage_a_blend(
         let strictly_better =
             state.cert.tier_reports[t].besr_db < state.cert.tier_reports[t - 1].besr_db - 0.5;
         let alphas: &[f64] = if strictly_better {
-            &[0.98, 0.95, 0.90, 0.85, 0.78]
+            &[0.98, 0.95, 0.90, 0.85, 0.78, 0.65, 0.50, 0.35]
         } else {
             &[0.92, 0.85, 0.70, 0.50, 0.25, 0.10, 0.0]
         };
@@ -70,6 +70,7 @@ fn try_stage_a_blend(
                     && c.tier_reports[t].besr_db < c.tier_reports[t - 1].besr_db);
             if c.pair_monotone[t]
                 && others_intact(&state.cert, c, t)
+                && floors_intact(&state.cert, c, t..=t)
                 && acc_ok
                 && tier_lufs_and_trim_ok(&cand_model, base.trims, c, config, t..=t, true)
             {

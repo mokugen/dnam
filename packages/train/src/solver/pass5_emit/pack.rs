@@ -363,7 +363,12 @@ pub fn encode_model_to_dnam_bin(
         ext_ring_lines: ext_lines,
         ext_ring_format: ext_fmt,
         declared_max_delay_48k: max_delay_48k,
-        dc_blocker_pole_5hz: TANK_DC_BLOCKER_48K_F32,
+        dc_blocker_pole_5hz: sanitize_clamp_f32(
+            model.dc_blocker_pole_5hz,
+            0.8001,
+            MAX_PARALRU_R_F32,
+            TANK_DC_BLOCKER_48K_F32,
+        ),
         tail_time_ms: sanitize_clamp_f32(f64::from(config.tail_time_ms), 0.0, 60_000.0, 80.0),
         ro_pole_48k: ro_pole,
         switch_xfade_samples: config.switch_xfade_samples,

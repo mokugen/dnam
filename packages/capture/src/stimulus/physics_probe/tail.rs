@@ -243,23 +243,38 @@ pub(super) fn detect_short_delay_and_chorus_lfo(
             short_gain = best_score.clamp(0.0, 1.5);
         }
     }
-    let mut side_env = Vec::new();
     let blk = 48_usize;
-    for (wl, opt_r) in [(wc_l, coreset_wet_r), (comb_wet_l, comb_wet_r)] {
-        if let Some(wr) = opt_r {
-            for m in 0..(wl.len().min(wr.len()) / blk) {
+    let build_side_env = |wl: &[f32], wr: &[f32]| -> Vec<f64> {
+        let m_blocks = wl.len().min(wr.len()) / blk;
+        (0..m_blocks)
+            .map(|m| {
                 let de: f64 = (m * blk..(m + 1) * blk)
                     .map(|i| {
                         let d = f64::from(wl[i]) - f64::from(wr[i]);
                         d * d
                     })
                     .sum();
-                side_env.push((de / (blk as f64)).sqrt());
-            }
+                (de / (blk as f64)).sqrt()
+            })
+            .collect()
+    };
+    let core_side = coreset_wet_r
+        .map(|wr| build_side_env(wc_l, wr))
+        .unwrap_or_default();
+    let single_env = if core_side.len() >= 200 {
+        core_side
+    } else if let Some(cr) = comb_wet_r {
+        let comb_side = build_side_env(comb_wet_l, cr);
+        if comb_side.len() > core_side.len() {
+            comb_side
+        } else {
+            core_side
         }
-    }
-    let (lfo_hz, lfo_depth) = if side_env.len() >= 160 {
-        estimate_lfo_modulation(&side_env)
+    } else {
+        core_side
+    };
+    let (lfo_hz, lfo_depth) = if single_env.len() >= 200 {
+        estimate_lfo_modulation(&single_env)
     } else {
         (0.0, 0.0)
     };
@@ -413,6 +428,34 @@ mod tests {
         assert!((short_ms - 7.5).abs() < 0.5);
         assert!(short_gain > 0.1);
         assert!((chorus_hz - 2.4).abs() < 0.3);
+
+        // Static stereo difference across coreset + differently scaled comb must NOT concatenate
+        // into a step discontinuity triggering false chorus LFO detection.
+        let static_wet_r: Vec<f32> = wet_l
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let prev = if i > 12 { dry[i - 12] } else { 0.0 };
+                v + 0.35 * prev
+            })
+            .collect();
+        let comb_l_scaled: Vec<f32> = dry[..4_608].iter().map(|&v| 2.5 * v).collect();
+        let comb_r_scaled: Vec<f32> = comb_l_scaled
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let prev = if i > 18 { comb_l_scaled[i - 18] } else { 0.0 };
+                v - 0.40 * prev
+            })
+            .collect();
+        let (_, _, static_lfo_hz, _) = detect_short_delay_and_chorus_lfo(
+            &dry,
+            &wet_l,
+            Some(&static_wet_r),
+            &comb_l_scaled,
+            Some(&comb_r_scaled),
+        );
+        assert_eq!(static_lfo_hz, 0.0);
 
         // Sub--46 dB (`tail_energy_ratio <= 0.005`) oscillating tail noise must NOT trigger LFO detection.
         let mut faint_osc = vec![0.0_f32; n_tail];

@@ -171,6 +171,8 @@ pub struct Welch33TargetCache {
     plan: Radix2FftPlan,
 }
 
+pub(crate) type WelchWindowSpec = (Vec<f64>, Vec<f64>);
+
 impl Welch33TargetCache {
     /// Builds a Welch 33-band LTAS target summary on `target[warmup..]`.
     pub fn new(target: &[f64], warmup: usize, sample_rate_hz: f64) -> Result<Self, TrainError> {
@@ -325,6 +327,36 @@ impl Welch33TargetCache {
             w_idx += 2;
         }
         (band_p, nyq_p, win_specs)
+    }
+
+    /// Evaluates total `Welch-33` band powers for a full predicted channel waveform,
+    /// optionally retaining paired window FFT spectra for exact RMS adjoint backprop.
+    pub(crate) fn eval_pred_band_powers_and_spectra(
+        &self,
+        pred: &[f64],
+        retain_spectra: bool,
+    ) -> ([f64; 33], Vec<WelchWindowSpec>) {
+        let (band_p, _nyq_p, win_specs) = self.accumulate_signal_powers(pred, retain_spectra);
+        (band_p, win_specs)
+    }
+
+    /// Computes exact time-domain RMS gradient `grad_out = d(sqrt(P_b)) / dy` for active
+    /// band `band_idx` using retained Welch window spectra from `eval_pred_band_powers_and_spectra`.
+    pub(crate) fn accum_band_rms_adjoint(
+        &self,
+        win_specs: &[WelchWindowSpec],
+        band_idx: usize,
+        band_power: f64,
+        grad_out: &mut [f64],
+    ) {
+        grad_out.fill(0.0);
+        if band_idx >= 33 || !self.active[band_idx] || !band_power.is_finite() || band_power <= 0.0
+        {
+            return;
+        }
+        let mut d_band = [0.0_f64; 33];
+        d_band[band_idx] = 0.5 / band_power.sqrt();
+        backprop_welch33_adjoint(self, win_specs, &d_band, 0.0, grad_out);
     }
 }
 

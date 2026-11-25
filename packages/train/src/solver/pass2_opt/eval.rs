@@ -296,6 +296,7 @@ pub(crate) fn eval_model_pass2_audio(
         &model.transport_quads,
         active_opt,
         model.sample_rate_hz,
+        model.dc_blocker_pole_5hz,
         None,
     );
     for t in 0..n {
@@ -398,6 +399,7 @@ pub(crate) fn assemble_pass2_gradients(
         &model.transport_quads,
         active_opt,
         model.sample_rate_hz,
+        model.dc_blocker_pole_5hz,
         Some(OpTQuadAdjointSlices {
             d_out_l: &gl_wet,
             d_out_r: &gr_wet,

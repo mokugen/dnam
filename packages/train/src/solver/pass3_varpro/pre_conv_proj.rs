@@ -11,8 +11,8 @@ use super::super::model::cascade::{
 };
 use super::super::model::{KautzPairF64, NUM_KAUTZ_PAIRS_ULTRA, SonaModelF64};
 use super::super::pass1_probe::kautz_fit::{
-    KautzFitInputs, append_log_octave_h2_candidates, fit_early_fir_taps, fit_joint_kautz_bank,
-    residual_after_fir,
+    KautzFitInputs, append_log_octave_h2_candidates, estimate_physical_kautz_r_ceil,
+    fit_early_fir_taps, fit_joint_kautz_bank, residual_after_fir,
 };
 use super::super::pass2_opt::crossbar::{eval_crossbar_forward, eval_crossbar_forward_os2x};
 use super::features::{build_pre_conv_bus, eval_pass3_frontend_1x};
@@ -43,6 +43,18 @@ fn post_warmup_stereo_rms(l: &[f64], r: &[f64], w: usize, n: usize) -> f64 {
         .map(|(&a, &b)| a * a + b * b)
         .sum();
     (0.5 * e / (m as f64)).sqrt()
+}
+
+fn post_warmup_stereo_peak(l: &[f64], r: &[f64], w: usize, n: usize) -> f64 {
+    if n <= w {
+        return 0.0;
+    }
+    l[w..n]
+        .iter()
+        .chain(&r[w..n])
+        .filter(|v| v.is_finite())
+        .map(|v| v.abs())
+        .fold(0.0_f64, f64::max)
 }
 
 /// Attempts one non-destructive alternating Hammerstein–Wiener Pass-3 projection onto the shared
@@ -176,7 +188,14 @@ pub(super) fn maybe_refine_with_pre_conv_projection(
     if rms_ux <= 1.0e-12 || rms_pre <= 1.0e-12 {
         return Ok(cur_report);
     }
-    let scale = (rms_ux / rms_pre).clamp(0.0625, 16.0);
+    let peak_ux = post_warmup_stereo_peak(&ux_l, &ux_r, w, n);
+    let peak_pre = post_warmup_stereo_peak(&pre_raw_l, &pre_raw_r, w, n);
+    let peak_ratio = if peak_pre > 1.0e-12 {
+        peak_ux / peak_pre
+    } else {
+        1.0
+    };
+    let scale = (rms_ux / rms_pre).min(peak_ratio).clamp(0.0625, 4.0);
     for c in 0..2 {
         cand.pre_conv_u_gain[c] = snap_fp16_bounded(cand.pre_conv_u_gain[c] * scale, -8.0, 8.0);
     }
@@ -207,6 +226,8 @@ pub(super) fn maybe_refine_with_pre_conv_projection(
         .collect();
     append_log_octave_h2_candidates(&mut poles, cand.sample_rate_hz, NUM_KAUTZ_PAIRS_ULTRA);
     let start16 = w.max(fir_onset_n).min(n / 4);
+    let r_max_phys =
+        estimate_physical_kautz_r_ceil(in_l, in_r, target_l, target_r, w, cand.sample_rate_hz);
     let (accepted_kautz, _, _) = fit_joint_kautz_bank(&KautzFitInputs {
         candidates: &poles,
         input_l: &pre_l,
@@ -215,6 +236,9 @@ pub(super) fn maybe_refine_with_pre_conv_projection(
         res_in_r: &res_16_r,
         start: start16,
         k_limit: NUM_KAUTZ_PAIRS_ULTRA,
+        sample_rate_hz: cand.sample_rate_hz,
+        r_max: r_max_phys,
+        lock_prefix_lens: [0, 0],
     });
     cand.kautz = [KautzPairF64::default(); NUM_KAUTZ_PAIRS_ULTRA];
     if accepted_kautz.is_empty() {

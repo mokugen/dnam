@@ -9,4 +9,5 @@ Read [`../AGENTS.md`](../AGENTS.md). Zero `unsafe_code`, `< 900` lines/file, and
 | [`excitations.rs`](excitations.rs) | Unseen `48 kHz` broadband/`A5` holdouts and off-knot interior control generators. |
 | [`harness.rs`](harness.rs) | 3-level (`L1`/`L2`/`L3`) pipeline orchestrator, alignment extractor, and zero-ULP checks. |
 | [`harness/eval.rs`](harness/eval.rs) | 4-tier VM renderer, 4-metric evaluator (`DrySilentGapMask` `L1`), and assertions. |
+| [`phase_a.rs`](phase_a.rs) | `M25` Phase A component-isolating (`L1 -> L2 -> L3` CPU) fixture qualification tests. |
 | [`self_tests.rs`](self_tests.rs) | Synthetic `BlackBoxModel` positive & negative falsification checks (CPU + `wgpu`). |

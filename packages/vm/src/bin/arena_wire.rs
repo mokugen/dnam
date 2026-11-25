@@ -360,7 +360,7 @@ pub struct TransportQuadWire {
     pub ramp_spans_samples: [F32; 4],
     /// Feedback loop attenuation scalar (`[0.0, 0x3F7F_BE76]`).
     pub g_loop: F32,
-    /// Loop DC/AC blocker pole (`[0.95, 0.9999]`).
+    /// Loop DC/AC blocker pole (`[0.95, 0.999995]`).
     pub r_dc: F32,
     /// Low-pass loop damping pole (`[0.0, 0.9995]`).
     pub damp_pole: F32,

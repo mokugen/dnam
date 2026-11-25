@@ -3,6 +3,7 @@
 //! subtle chorus, silent target guard) (`ref[train.pipeline.physics-probe]`).
 
 mod peaks;
+pub(super) mod reflections;
 
 use crate::control::stability::MIN_DELAY_CROSSBAR_SAMP;
 
@@ -22,6 +23,8 @@ pub(super) struct OpTSeedOutcome {
     pub dominant_delay_samples: f64,
     pub estimated_loop_gain: f64,
     pub incoherent_echo_only_soft_seed: bool,
+    pub mod_detected: bool,
+    pub tgt_subtracted: bool,
     pub tgt_no_opt_l: Vec<f64>,
     pub tgt_no_opt_r: Vec<f64>,
 }
@@ -126,6 +129,8 @@ pub(super) fn seed_soft_op_t_quads(
             dominant_delay_samples: 0.0,
             estimated_loop_gain: 0.0,
             incoherent_echo_only_soft_seed: false,
+            mod_detected: false,
+            tgt_subtracted: false,
             tgt_no_opt_l,
             tgt_no_opt_r,
         };
@@ -209,6 +214,8 @@ pub(super) fn seed_soft_op_t_quads(
                     dominant_delay_samples: crisp_lag,
                     estimated_loop_gain: g_init,
                     incoherent_echo_only_soft_seed: false,
+                    mod_detected: false,
+                    tgt_subtracted: true,
                     tgt_no_opt_l,
                     tgt_no_opt_r,
                 };
@@ -271,6 +278,8 @@ pub(super) fn seed_soft_op_t_quads(
             dominant_delay_samples: 0.0,
             estimated_loop_gain: 0.0,
             incoherent_echo_only_soft_seed: false,
+            mod_detected: false,
+            tgt_subtracted: false,
             tgt_no_opt_l,
             tgt_no_opt_r,
         };
@@ -386,6 +395,7 @@ pub(super) fn seed_soft_op_t_quads(
         &cand_quads,
         OPT_MAX_QUADS,
         sample_rate_hz,
+        model.dc_blocker_pole_5hz,
         None,
     );
     let (mut num, mut den, mut res_eval_e) = (0.0_f64, 0.0_f64, 0.0_f64);
@@ -414,6 +424,8 @@ pub(super) fn seed_soft_op_t_quads(
             dominant_delay_samples: 0.0,
             estimated_loop_gain: 0.0,
             incoherent_echo_only_soft_seed: false,
+            mod_detected: false,
+            tgt_subtracted: false,
             tgt_no_opt_l,
             tgt_no_opt_r,
         };
@@ -435,6 +447,7 @@ pub(super) fn seed_soft_op_t_quads(
             &model.transport_quads,
             OPT_MAX_QUADS,
             sample_rate_hz,
+            model.dc_blocker_pole_5hz,
             None,
         );
         for t in 0..n {
@@ -447,6 +460,8 @@ pub(super) fn seed_soft_op_t_quads(
         dominant_delay_samples: delays[0],
         estimated_loop_gain: soft_g,
         incoherent_echo_only_soft_seed: !coherent && !has_decay_tail && !mod_detected && !has_hint,
+        mod_detected,
+        tgt_subtracted: coherent,
         tgt_no_opt_l,
         tgt_no_opt_r,
     }

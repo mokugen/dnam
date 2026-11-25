@@ -118,7 +118,14 @@ fn stabilize_ar_coeffs(a: &[f64]) -> Vec<f64> {
     coeffs[0] = (1.0, 0.0);
     for r in &mut roots {
         let mag = (r.0 * r.0 + r.1 * r.1).sqrt();
-        if mag >= MAX_STABILIZED_POLE_R {
+        if mag > 1.0 {
+            // Reflect unstable AR roots by conjugate reciprocal (1 / z*) into the unit disk
+            // so spurious unconstrained poles never pile up on MAX_STABILIZED_POLE_R = 0.9992.
+            let target_r = (1.0 / mag).min(MAX_STABILIZED_POLE_R);
+            let s = target_r / mag;
+            r.0 *= s;
+            r.1 *= s;
+        } else if mag >= MAX_STABILIZED_POLE_R {
             let s = MAX_STABILIZED_POLE_R / mag.max(1.0e-12);
             r.0 *= s;
             r.1 *= s;
@@ -241,7 +248,12 @@ pub fn steiglitz_mcbride_poles(
         if !re.is_finite() || !im.is_finite() || im < -1.0e-6 {
             continue;
         }
-        let r = (re * re + im * im).sqrt().clamp(0.0, MAX_STABILIZED_POLE_R);
+        let raw_r = (re * re + im * im).sqrt();
+        let r = if raw_r > 1.0 {
+            (1.0 / raw_r).min(MAX_STABILIZED_POLE_R)
+        } else {
+            raw_r.min(MAX_STABILIZED_POLE_R)
+        };
         let theta = im.abs().atan2(re).clamp(1.0e-4, PI - 1.0e-4);
         if !pairs
             .iter()
@@ -308,5 +320,18 @@ mod tests {
             "50 Hz theta mismatch: {:?} vs {th_50}",
             poles_50[0]
         );
+
+        // Conjugate-reciprocal root reflection: unstable root at |z| = 1.25 reflects to 0.80,
+        // never piling onto MAX_STABILIZED_POLE_R = 0.9992.
+        let unstab_a = [-2.0 * 1.25 * (0.4_f64).cos(), 1.25 * 1.25];
+        let stab_a = stabilize_ar_coeffs(&unstab_a);
+        let refl_roots = find_monic_roots(&stab_a);
+        for (re, im) in refl_roots {
+            let mag = re.hypot(im);
+            assert!(
+                (mag - 0.80).abs() < 1.0e-5,
+                "expected reflected radius 0.80, got {mag}"
+            );
+        }
     }
 }

@@ -46,7 +46,12 @@ fn clamp_transport_quad_wire(t: &mut TransportQuadWire) {
         *d = clamp_f32_wire(*d, 5.0, 48_000.0, 5.0);
     }
     t.g_loop = clamp_f32_wire(t.g_loop, 0.0, TANK_MAX_G_LIN_F32, 0.0);
-    t.r_dc = clamp_f32_wire(t.r_dc, 0.95, 0.9999, TANK_DC_BLOCKER_48K_F32);
+    t.r_dc = clamp_f32_wire(
+        t.r_dc,
+        0.95,
+        dnam_kernels::MAX_PARALRU_R_F32,
+        TANK_DC_BLOCKER_48K_F32,
+    );
     t.damp_pole = clamp_f32_wire(t.damp_pole, 0.0, 0.9995, 0.0);
     t.lfo_rate_hz = clamp_f32_wire(t.lfo_rate_hz, 0.0, 16.0, 0.0);
     t.ramp_rate_hz = clamp_f32_wire(t.ramp_rate_hz, -16.0, 16.0, 0.0);

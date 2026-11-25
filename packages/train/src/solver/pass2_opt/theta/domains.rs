@@ -4,6 +4,11 @@
 //! (`ref[train.pipeline.backbone-trajectory-opt]`).
 
 mod arena;
+mod linear_subspace;
+mod opt_subspace;
+
+pub(super) use linear_subspace::append_linear_modal_transport_entries;
+pub(super) use opt_subspace::active_opt_quad_spec;
 
 use core::f64::consts::PI;
 
@@ -423,9 +428,11 @@ pub(super) struct NonlinearSubspaceSpec {
     pub include_stereo_phase: bool,
     pub k_count: usize,
     pub active_opt_quads: usize,
+    pub opt_feedforward_only_mask: [bool; 4],
     pub include_extras: bool,
     pub sr_hz: f64,
     pub max_tau: f64,
+    pub kautz_r_max: f64,
 }
 
 /// Appends the canonical full-subspace continuous nonlinear descriptors matching
@@ -440,9 +447,11 @@ pub(super) fn append_nonlinear_entries(
         include_stereo_phase,
         k_count,
         active_opt_quads,
+        opt_feedforward_only_mask,
         include_extras,
         sr_hz,
         max_tau,
+        kautz_r_max,
     } = *spec;
     let g_lo = f64::from(MIN_TPT_G);
     let r_hi = f64::from(MAX_PARALRU_R_F32);
@@ -589,10 +598,16 @@ pub(super) fn append_nonlinear_entries(
         }
     }
     if include_extras {
-        for i in 0..(active_opt_quads * 4) {
-            for c in 0..2 {
-                // Hydrated binary16 across ALL tiers (f32le on Lite wire, fp16 on Full..Ultra wire).
-                entries.push(ThetaEntry::fp16(ParamKind::OptToLr(i, c), glu_box));
+        for q in 0..active_opt_quads {
+            if opt_feedforward_only_mask[q] {
+                continue;
+            }
+            for lane in 0..4 {
+                let i = q * 4 + lane;
+                for c in 0..2 {
+                    // Hydrated binary16 across ALL tiers (f32le on Lite wire, fp16 on Full..Ultra wire).
+                    entries.push(ThetaEntry::fp16(ParamKind::OptToLr(i, c), glu_box));
+                }
             }
         }
     }
@@ -623,13 +638,15 @@ pub(super) fn append_nonlinear_entries(
             hi_c: 1.0,
         },
     ));
+    let r_hi = kautz_r_max.clamp(0.5, 0.9995);
     let kautz_r_box = ParamBoundSpec::ComplementLog {
-        lo_c: 1.0 - 0.9995,
+        lo_c: 1.0 - r_hi,
         hi_c: 1.0 - 0.25,
     };
+    let (th_min, th_max) = crate::solver::pass1_probe::kautz_fit::audible_kautz_theta_bounds(sr_hz);
     let kautz_theta_box = ParamBoundSpec::LogBox {
-        lo: 1.0e-4,
-        hi: PI - 1.0e-4,
+        lo: th_min,
+        hi: th_max,
     };
     for k in 0..k_count {
         entries.push(ThetaEntry::f32(ParamKind::KautzRLow(k), kautz_r_box));
@@ -661,7 +678,7 @@ pub(super) fn append_nonlinear_entries(
         hi_c: 1.0,
     };
     let rdc_box = ParamBoundSpec::ComplementLog {
-        lo_c: 1.0 - 0.9999,
+        lo_c: 1.0 - f64::from(dnam_kernels::MAX_PARALRU_R_F32),
         hi_c: 1.0 - 0.95,
     };
     let damp_box = ParamBoundSpec::ComplementLog {
@@ -690,6 +707,17 @@ pub(super) fn append_nonlinear_entries(
     };
     let freeze_box = ParamBoundSpec::Box { lo: 0.0, hi: 0.999 };
     for q in 0..active_opt_quads {
+        if opt_feedforward_only_mask[q] {
+            for l in 0..4 {
+                entries.push(ThetaEntry::f32(ParamKind::OpTDelay(q, l), delay_box));
+                entries.push(ThetaEntry::fp16(ParamKind::OpTInputGain(q, l), tap_box));
+                if include_extras {
+                    entries.push(ThetaEntry::fp16(ParamKind::OpTWetTapL(q, l), tap_box));
+                    entries.push(ThetaEntry::fp16(ParamKind::OpTWetTapR(q, l), tap_box));
+                }
+            }
+            continue;
+        }
         for l in 0..4 {
             entries.push(ThetaEntry::f32(ParamKind::OpTDelay(q, l), delay_box));
             entries.push(ThetaEntry::f32(ParamKind::OpTRampSpan(q, l), span_box));

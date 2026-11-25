@@ -327,6 +327,7 @@ fn test_m25_00_harness_l1_l2_cpu_and_negative_falsification() {
     let bad_eval = evaluate_tier_outputs_4metric(
         EvalMatrixConfig {
             level_name: "NEG",
+            is_holdout_eval: false,
             require_target_floors: true,
             require_monotone: true,
             require_lufs_parity: true,
@@ -361,6 +362,7 @@ fn test_m25_00_harness_l1_l2_cpu_and_negative_falsification() {
     let ring_eval = evaluate_tier_outputs_4metric(
         EvalMatrixConfig {
             level_name: "NEG_GAP_RING",
+            is_holdout_eval: false,
             require_target_floors: true,
             require_monotone: true,
             require_lufs_parity: true,

@@ -2,16 +2,17 @@
 //! `SONA v3.0` Matryoshka domains with conditioned coordinate transforms, exact `fp16`/`f32` wire
 //! masks, and discrete polarity/phase preservation (`ref[train.pipeline.backbone-trajectory-opt]`).
 
+mod codec;
 mod domains;
 
-use crate::linalg::lbfgs::ParamBoundSpec;
-
 use super::super::model::SonaModelF64;
-use super::eval::Pass2ParamGrads;
 use super::eval::core_adj::{active_opt_quads_for_core_quads, active_tiles_for_quads};
+#[cfg(test)]
+use domains::ParamKind;
 use domains::{
-    NonlinearSubspaceSpec, ThetaEntry, append_joint_readout_entries, append_nonlinear_entries,
-    append_qat_readout_entries, append_shared_pre_conv_entries,
+    NonlinearSubspaceSpec, ThetaEntry, active_opt_quad_spec, append_joint_readout_entries,
+    append_linear_modal_transport_entries, append_nonlinear_entries, append_qat_readout_entries,
+    append_shared_pre_conv_entries,
 };
 
 /// Canonical tier core-quad counts `[Lite, Full, Pro, Ultra]`, consumed by M21 per-tier
@@ -106,9 +107,11 @@ impl ThetaLayout {
                 include_stereo_phase: ti > 0,
                 k_count,
                 active_opt_quads,
+                opt_feedforward_only_mask: [false; 4],
                 include_extras,
                 sr_hz: 48_000.0,
                 max_tau,
+                kautz_r_max: 0.9992,
             },
         );
         Self::finalize(q_count, k_count, zoh_hold_depth_idx, [true; 32], entries)
@@ -129,7 +132,7 @@ impl ThetaLayout {
         } else {
             ReadoutSubspaceMode::None
         };
-        Self::for_tier_from_model_inner(model, tier_idx, include_extras, ro_mode, max_tau)
+        Self::for_tier_from_model_inner(model, tier_idx, include_extras, ro_mode, max_tau, 0.9992)
     }
 
     /// Pass-2 variant unlocking tier-invariant `Lite`-shared pre-convolver coupling
@@ -142,6 +145,7 @@ impl ThetaLayout {
         include_extras: bool,
         include_direct_readouts: bool,
         max_tau: f64,
+        kautz_r_max: f64,
     ) -> Self {
         let include_pre_conv = model.active_fir_taps > 0 || model.active_kautz_pairs > 0;
         let ro_mode = if include_direct_readouts {
@@ -151,7 +155,14 @@ impl ThetaLayout {
         } else {
             ReadoutSubspaceMode::None
         };
-        Self::for_tier_from_model_inner(model, tier_idx, include_extras, ro_mode, max_tau)
+        Self::for_tier_from_model_inner(
+            model,
+            tier_idx,
+            include_extras,
+            ro_mode,
+            max_tau,
+            kautz_r_max,
+        )
     }
 
     /// Phase-2D STE `QAT` variant unlocking full direct readouts together with strictly shared
@@ -163,6 +174,7 @@ impl ThetaLayout {
         tier_idx: usize,
         include_extras: bool,
         max_tau: f64,
+        kautz_r_max: f64,
     ) -> Self {
         Self::for_tier_from_model_inner(
             model,
@@ -170,6 +182,7 @@ impl ThetaLayout {
             include_extras,
             ReadoutSubspaceMode::QatTierSafe,
             max_tau,
+            kautz_r_max,
         )
     }
 
@@ -179,17 +192,15 @@ impl ThetaLayout {
         include_extras: bool,
         ro_mode: ReadoutSubspaceMode,
         max_tau: f64,
+        kautz_r_max: f64,
     ) -> Self {
         let ti = tier_idx.min(3);
         let q_count = TIER_QUADS[ti];
         let k_count = model.active_kautz_pairs.min(TIER_KAUTZ[ti]);
         let active_tiles = active_tiles_for_quads(q_count);
         let max_opt_quads = active_opt_quads_for_core_quads(q_count);
-        let active_opt_quads = if has_active_op_t(model, q_count) {
-            max_opt_quads
-        } else {
-            0
-        };
+        let (active_opt_quads, opt_feedforward_only_mask) =
+            active_opt_quad_spec(model, max_opt_quads);
         let mut entries = Vec::with_capacity(3200);
         let zoh_hold_depth_idx = append_nonlinear_entries(
             &mut entries,
@@ -199,9 +210,11 @@ impl ThetaLayout {
                 include_stereo_phase: ti > 0,
                 k_count,
                 active_opt_quads,
+                opt_feedforward_only_mask,
                 include_extras,
                 sr_hz: model.sample_rate_hz,
                 max_tau,
+                kautz_r_max,
             },
         );
         match ro_mode {
@@ -229,6 +242,30 @@ impl ThetaLayout {
         )
     }
 
+    /// Pass-2 pure-linear modal + active `Op-T` layout omitting all `CoreQuad`, `InterBlockTile`,
+    /// `SensoryQuad`, `Crossbar`, `Op-N[Pre]`, and `w_ro` coordinates for strictly LTI capsules.
+    #[must_use]
+    pub(super) fn for_tier_from_model_linear_modal(
+        model: &SonaModelF64,
+        tier_idx: usize,
+        include_extras: bool,
+        include_direct_readouts: bool,
+        max_tau: f64,
+        kautz_r_max: f64,
+    ) -> Self {
+        let mut entries = Vec::with_capacity(192);
+        let (q_count, k_count, kautz_active_mask) = append_linear_modal_transport_entries(
+            &mut entries,
+            model,
+            tier_idx,
+            include_extras,
+            include_direct_readouts,
+            max_tau,
+            kautz_r_max,
+        );
+        Self::finalize(q_count, k_count, None, kautz_active_mask, entries)
+    }
+
     /// Builds the joint continuous nonlinear + active linear readout layout used by Pass-2
     /// tests verifying joint readout gradients.
     #[cfg(test)]
@@ -249,9 +286,11 @@ impl ThetaLayout {
                 include_stereo_phase: q_count > 4,
                 k_count,
                 active_opt_quads,
+                opt_feedforward_only_mask: [false; 4],
                 include_extras: op_t_active,
                 sr_hz: model.sample_rate_hz,
                 max_tau,
+                kautz_r_max: 0.9992,
             },
         );
         append_joint_readout_entries(&mut entries, q_count, k_count);
@@ -268,62 +307,18 @@ impl ThetaLayout {
         )
     }
 
+    /// Returns the kind descriptor of each parameter entry in this layout.
+    #[cfg(test)]
+    #[must_use]
+    fn entries_kinds(&self) -> Vec<ParamKind> {
+        self.entries.iter().map(|e| e.kind).collect()
+    }
+
     /// Number of scalar parameters in this layout.
     #[inline]
     #[must_use]
     pub(super) fn dim(&self) -> usize {
         self.entries.len()
-    }
-
-    /// Returns a boolean mask marking coordinates directly coupled to linear VarPro readouts
-    /// (`ro_pole_48k`, `kautz.*`, and joint readout coordinates when present).
-    #[must_use]
-    pub(super) fn readout_coupled_mask(&self) -> Vec<bool> {
-        self.entries
-            .iter()
-            .map(|e| e.kind.is_readout_coupled())
-            .collect()
-    }
-
-    /// Returns per-coordinate `ScaledCoordSpace` scales (`num_frames` for `zoh_hold_depth` to cancel
-    /// secular `2 * pi * n` derivative growth, `1.0` elsewhere).
-    #[must_use]
-    pub(super) fn coord_scales(&self, num_frames: usize) -> Vec<f64> {
-        let mut scales = vec![1.0_f64; self.entries.len()];
-        if let Some(idx) = self.zoh_hold_depth_idx
-            && idx < scales.len()
-        {
-            scales[idx] = num_frames.max(1) as f64;
-        }
-        scales
-    }
-
-    /// Packs the active Pass-2 subspace from `m` alongside matching coordinate bijections.
-    pub(super) fn pack(&self, m: &SonaModelF64) -> (Vec<f64>, Vec<ParamBoundSpec>) {
-        let mut x = Vec::with_capacity(self.entries.len());
-        let mut b = Vec::with_capacity(self.entries.len());
-        for entry in &self.entries {
-            x.push(entry.read(m));
-            b.push(entry.bound);
-        }
-        (x, b)
-    }
-
-    /// Clamps and unpacks `cand` into `m`, snapping `lo == 0.0` `ComplementLog` values `< 1e-7` to
-    /// `0.0`, preserving inactive Kautz `0.0` sentinels and discrete polarity/phase fields, and
-    /// enforcing Table-4 stability bounds on exit.
-    pub(super) fn unpack(&self, cand: &[f64], m: &mut SonaModelF64) {
-        for (i, entry) in self.entries.iter().enumerate() {
-            entry.write(m, cand[i], &self.kautz_active_mask);
-        }
-        m.clamp_all_stability_bounds(true);
-    }
-
-    /// Writes `grads` into `out` in the exact coordinate order produced by [`Self::pack`].
-    pub(super) fn write_grad(&self, grads: &Pass2ParamGrads, out: &mut [f64]) {
-        for (i, entry) in self.entries.iter().enumerate() {
-            out[i] = entry.read_grad(grads, &self.kautz_active_mask);
-        }
     }
 }
 
@@ -793,7 +788,7 @@ mod tests {
         assert_eq!(m_lite.k_opt, 8);
         assert_eq!(m_lite.arena_of_param.iter().filter(|&&a| a == 4).count(), 0);
 
-        let p2_lite = ThetaLayout::for_tier_from_model_pass2(&model, 0, true, false, 128.0);
+        let p2_lite = ThetaLayout::for_tier_from_model_pass2(&model, 0, true, false, 128.0, 0.9992);
         assert_eq!(
             p2_lite.arena_of_param.iter().filter(|&&a| a == 4).count(),
             16 * 6 + 2
@@ -810,7 +805,8 @@ mod tests {
                 | ParamKind::KautzCImR(_)
         )));
 
-        let p2_ultra = ThetaLayout::for_tier_from_model_pass2(&model, 3, true, false, 128.0);
+        let p2_ultra =
+            ThetaLayout::for_tier_from_model_pass2(&model, 3, true, false, 128.0, 0.9992);
         assert_eq!(
             p2_ultra.arena_of_param.iter().filter(|&&a| a == 4).count(),
             16 * 6 + 2
@@ -820,7 +816,7 @@ mod tests {
             ParamKind::PreConvHp(_) | ParamKind::WReadout(16..=39, 0..=5)
         )));
 
-        let qat_ultra = ThetaLayout::for_tier_from_model_qat(&model, 3, true, 128.0);
+        let qat_ultra = ThetaLayout::for_tier_from_model_qat(&model, 3, true, 128.0, 0.9992);
         assert!(!qat_ultra.entries.iter().any(|e| matches!(
             e.kind,
             ParamKind::PreConvHp(_) | ParamKind::WReadout(16..=39, 0..=5)

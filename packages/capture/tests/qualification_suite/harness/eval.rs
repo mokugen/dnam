@@ -4,6 +4,7 @@
 use dnam_capture::metrics::MAX_TIER_LOUDNESS_STEP_LU;
 use dnam_capture::metrics::certification::universal::{
     certify_4metric_universal, certify_4metric_universal_with_dry_gaps, certify_holdout_universal,
+    certify_holdout_universal_with_dry_gaps,
 };
 use dnam_capture::metrics::certification::{
     PerceptualCertificationSummary, verify_monotone_4tier_summaries,
@@ -65,6 +66,7 @@ pub(crate) struct FixtureQualificationReport {
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct EvalMatrixConfig<'a> {
     pub level_name: &'a str,
+    pub is_holdout_eval: bool,
     pub require_target_floors: bool,
     pub require_monotone: bool,
     pub require_lufs_parity: bool,
@@ -190,8 +192,20 @@ pub(crate) fn evaluate_tier_outputs_4metric(
             } else {
                 certify_4metric_universal(tier, tgt, mdl, prof, cfg.sample_rate_hz, cfg.warmup)
             };
-            let (holdout_besr_db, holdout_pass) = if dry_by_channel.is_some() {
+            let (holdout_besr_db, holdout_pass) = if !cfg.is_holdout_eval {
                 (summary.besr_db, summary.passes_target)
+            } else if let Some(drys) = dry_by_channel
+                && let Some(dry_ch) = drys.get(c)
+            {
+                certify_holdout_universal_with_dry_gaps(
+                    tier,
+                    dry_ch,
+                    tgt,
+                    mdl,
+                    prof,
+                    cfg.sample_rate_hz,
+                    cfg.warmup,
+                )
             } else {
                 certify_holdout_universal(tier, tgt, mdl, prof, cfg.sample_rate_hz, cfg.warmup)
             };

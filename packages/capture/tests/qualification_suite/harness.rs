@@ -333,6 +333,7 @@ where
     let level1 = evaluate_tier_outputs_4metric(
         EvalMatrixConfig {
             level_name: "L1",
+            is_holdout_eval: false,
             require_target_floors: true,
             require_monotone: true,
             require_lufs_parity: true,
@@ -367,6 +368,21 @@ where
         .unwrap();
     let l2_targets =
         align_live_response(&live_l2.out_1, live_l2.out_2.as_deref(), n_out, star_align);
+    let mut l2_dry = vec![
+        holdout_l
+            .iter()
+            .copied()
+            .map(f64::from)
+            .collect::<Vec<f64>>(),
+    ];
+    if n_out >= 2 {
+        let dry_r_sl = if n_in >= 2 {
+            holdout_r.as_deref().unwrap_or(&holdout_l)
+        } else {
+            &holdout_l
+        };
+        l2_dry.push(dry_r_sl.iter().copied().map(f64::from).collect());
+    }
     let l2_render = render_dnam_tiers(
         &l1_train.proj_bytes,
         n_out,
@@ -380,6 +396,7 @@ where
     let level2 = evaluate_tier_outputs_4metric(
         EvalMatrixConfig {
             level_name: "L2",
+            is_holdout_eval: true,
             require_target_floors: true,
             require_monotone: true,
             require_lufs_parity: false,
@@ -388,7 +405,7 @@ where
             zero_dc_ok: true,
         },
         &l2_targets,
-        None,
+        Some(&l2_dry),
         &l2_render.models_by_channel,
         &star_profiles,
         &l2_render.lufs_by_channel,
@@ -423,6 +440,21 @@ where
             topo,
             config.holdout_frames_48k,
         );
+        let mut l3_dry = vec![
+            l3_dry_l
+                .iter()
+                .copied()
+                .map(f64::from)
+                .collect::<Vec<f64>>(),
+        ];
+        if n_out >= 2 {
+            let dry_r_sl = if n_in >= 2 {
+                l3_dry_r.as_deref().unwrap_or(&l3_dry_l)
+            } else {
+                &l3_dry_l
+            };
+            l3_dry.push(dry_r_sl.iter().copied().map(f64::from).collect());
+        }
         let warmup_l3 = canonical_besr_warmup(l3_dry_l.len());
         let zero_ulp_ok = check_star_center_zero_ulp_invariance(
             &l3_train.proj_bytes,
@@ -500,6 +532,7 @@ where
             let mut eval = evaluate_tier_outputs_4metric(
                 EvalMatrixConfig {
                     level_name: &format!("L3:{}", setting.label),
+                    is_holdout_eval: true,
                     require_target_floors: false,
                     require_monotone: true,
                     require_lufs_parity: false,
@@ -508,7 +541,7 @@ where
                     zero_dc_ok: !check_zero_ulp || zero_ulp_ok,
                 },
                 &l3_targets,
-                None,
+                Some(&l3_dry),
                 &l3_render.models_by_channel,
                 &prof_for_setting,
                 &l3_render.lufs_by_channel,

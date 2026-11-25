@@ -207,7 +207,11 @@ When the floor is identically zero, $\sigma_{M,k,h} = 0$, cell log-magnitude dis
 
 For noiseless captures with $\sigma_{M,k,h} = 0$ and no empirical noise trace evaluated on aligned `(dry, target)` timelines, `DrySilentGapMask` detects post-warmup active target RMS $y_{\text{rms,act}} > 10^{-12}$ strictly over samples $|x[t]| > 10^{-9}$ (`DRY_SILENCE_EPS = 1e-9`) and computes Schroeder -60 dB threshold $\tau_{60} = 10^{-3} y_{\text{rms,act}}$ (`POST_T60_GAP_AMP_RATIO = 1e-3`).
 
-Within each contiguous dry-silence run $|x[t]| \le 10^{-9}$ of length $\ge \max(1, \mathrm{round}(0.020 f_s))$ (`MIN_DRY_SILENT_GAP_SECS = 0.020 s`), let $s_{T60}$ be one sample past the last target sample exceeding $\tau_{60}$ and retain $[s_{T60}, e_{\text{dry}})$ whenever $e_{\text{dry}} - s_{T60} \ge 256$ samples. Any MR-IIR window $[a_s, a_e)$ overlapping a retained span $[g_s, g_e)$ with $[a_s, a_e) \subseteq [g_s, g_e)$ or $A_{M,k,h} \le \tau_{60}$ is excluded iff $|\hat{A}_{M,k,h} - A_{M,k,h}| \le 2\tau_{60}$ (2x bandpass transient allowance); any violation or zero remaining cells returns $+\infty$.
+Within each contiguous dry-silence run $|x[t]| \le 10^{-9}$ of length $\ge \max(1, \mathrm{round}(0.020 f_s))$ (`MIN_DRY_SILENT_GAP_SECS = 0.020 s`), when $e_{\text{dry}} < N$ (non-EOF boundary), trim trailing fractional-alignment (`Kaiser-64`) pre-ringing up to `GAP_PRERING_TRIM_MAX_SAMPLES = 64` samples by setting $e_{\text{end}}$ to the earliest sample in $[\max(s_{\text{dry}}, e_{\text{dry}} - 64), e_{\text{dry}})$ exceeding $\tau_{60}$, or $e_{\text{end}} = e_{\text{dry}}$ otherwise.
+
+Let $s_{T60}$ be one sample past the last target sample in $[s_{\text{dry}}, e_{\text{end}})$ exceeding $\tau_{60}$ and retain $[s_{T60}, e_{\text{end}})$ whenever $e_{\text{end}} - s_{T60} \ge 256$ samples.
+
+Any MR-IIR window $[a_s, a_e)$ overlapping a retained span $[g_s, g_e)$ whose resonator target RMS has decayed to $A_{M,k,h} \le \tau_{60}$ is excluded iff $|\hat{A}_{M,k,h} - A_{M,k,h}| \le 2\tau_{60}$ (2x bandpass transient allowance). Windows where a long-scale resonator such as $M = 4096$ is still actively ringing above $\tau_{60}$ remain scored normally, and any guard violation or zero remaining cells returns $+\infty$.
 
 ### 3.2 Noise-Adjusted LTAS
 
@@ -243,6 +247,10 @@ $$r_{f,c} = \frac{1}{3} \sum_{b \in \lbrace \text{LF}, \text{MF}, \text{HF} \rbr
 Set full-frame length $L = \mathrm{round}(f_{s,f} / 50)$ (960 samples at 48 kHz), and segment aligned timelines at sample-rate transitions so no frame spans a rate change. Retain eligible final partial frames weighted by exact duration $w_f = n_f / f_{s,f}$ without zero-padding or averaging ratios in dB. Include all confirmed active frames (> 6.0 dB above the matched frame floor); excluded noise-limited frames must satisfy $R_{f,c} \le 10^{0.1} F_{f,c}$ under jointly valid bounds.
 
 On noiseless captures with no empirical noise trace, a 20 ms frame $[a_s, a_e)$ overlapping a retained §3.1 post-T60 dry-silent span whose target frame RMS satisfies $\sqrt{\frac{1}{n_f} \sum y[t]^2} \le \tau_{60}$ is excluded from active `SegESR` weighting iff its direct residual RMS satisfies $\sqrt{\frac{1}{n_f} \sum (\hat{y}[t] - y[t])^2} \le \tau_{60}$ (1x ceiling); any violation or zero remaining active frames returns $+\infty$.
+
+On noiseless captures with zero frame-band envelope floor $F_{f,b,c}^{\text{env}} = 0$ and no empirical noise trace, consider any active 20 ms frame with positive broadband target RMS $E_{f,\mathrm{bb},c}(y) > 0$. Any Bezout band $b$ whose target band RMS lies at or below $-60\text{ dB}$ of that frame's broadband RMS, i.e., $E_{f,b,c}(y) \le 10^{-3} E_{f,\mathrm{bb},c}(y)$ on an unexcited crossover skirt, is excluded from the frame band average iff its envelope residual satisfies $|E_{f,b,c}(\hat{y}) - E_{f,b,c}(y)| \le 10^{-2} E_{f,\mathrm{bb},c}(y)$, a $-40\text{ dB}$ guard ceiling above which it fails closed with $+\infty$.
+
+The per-frame ratio $r_{f,c}$ averages across the remaining excited bands $N_{f,\mathrm{exc}} \in \lbrace 1, 2, 3 \rbrace$, guaranteed to be $\ge 1$ by the Bezout partition identity $H_{\mathrm{LF}} + H_{\mathrm{MF}} + H_{\mathrm{HF}} \equiv I$ via $E_{f,\mathrm{bb}} \le \sum_b E_{f,b}$. Because the band-exclusion predicate depends strictly on target $y$, all tiers share identical frame-band support.
 
 ---
 

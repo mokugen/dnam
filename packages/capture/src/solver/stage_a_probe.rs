@@ -116,6 +116,7 @@ pub fn has_populated_v3_backbone(dnam_bin: &[u8]) -> bool {
             .transport_lite
             .wet_tap_l_fp16
             .iter()
+            .chain(&a0.transport_lite.wet_tap_r_fp16)
             .any(|w| w.get() != 0);
     let readout_active = a0
         .linear_readout_lite
@@ -217,6 +218,10 @@ pub fn pass1_hint_from_manifest(manifest: &DnamProjManifest) -> Pass1PhysicsHint
         .extracted_physics
         .as_ref()
         .is_some_and(|ep| ep.bla_mag_33_db.len() == 33);
+    let schoukens_ltv = stem
+        .extracted_physics
+        .as_ref()
+        .is_some_and(|ep| ep.law0a_ltv_flag);
     if let Some(ref ep) = stem.extracted_physics {
         if let Some(&d) = ep.delays_ms.iter().find(|&&v| v.is_finite() && v > 0.0) {
             hint.delay_ms = Some(f64::from(d));
@@ -231,7 +236,9 @@ pub fn pass1_hint_from_manifest(manifest: &DnamProjManifest) -> Pass1PhysicsHint
                 }
             }
         }
-        if let Some(&r) = ep.lfo_freqs_hz.iter().find(|&&v| v.is_finite() && v > 0.0) {
+        if (!has_schoukens || ep.law0a_ltv_flag)
+            && let Some(&r) = ep.lfo_freqs_hz.iter().find(|&&v| v.is_finite() && v > 0.0)
+        {
             hint.modulation_rate_hz = Some(f64::from(r));
         }
         if ep.edc_t60_s.is_finite() {
@@ -311,7 +318,9 @@ pub fn pass1_hint_from_manifest(manifest: &DnamProjManifest) -> Pass1PhysicsHint
     }
     if let Some(v) = read_f64("phys_modulation_rate_hz") {
         hint.modulation_rate_hz = Some(v);
-    } else if let Some(v) = read_f64("phys_lfo_hz").filter(|v| v.is_finite() && *v > 0.0) {
+    } else if (!has_schoukens || schoukens_ltv)
+        && let Some(v) = read_f64("phys_lfo_hz").filter(|v| v.is_finite() && *v > 0.0)
+    {
         hint.modulation_rate_hz = Some(v);
     }
     if let Some(v) = read_f64("phys_noise_floor_db") {
@@ -639,6 +648,7 @@ mod tests {
         stale_meta.insert("phys_odd_harm".to_string(), serde_json::json!(0.9));
         stale_meta.insert("phys_even_harm".to_string(), serde_json::json!(0.9));
         stale_meta.insert("phys_rt60_ms".to_string(), serde_json::json!(450.0));
+        stale_meta.insert("phys_lfo_hz".to_string(), serde_json::json!(1.85));
         manifest
             .stems_registry
             .push(crate::proj::schema::StemRegistryEntry {
@@ -660,6 +670,7 @@ mod tests {
                     noise_var_33_lin: vec![1.0e-6 / 33.0; 33],
                     edc_t60_s: 1.45,
                     law0a_ltv_flag: true,
+                    lfo_freqs_hz: vec![1.85],
                     coreset_regime_offsets: [0, 32_768, 73_568, 99_968, 120_000],
                     ..Default::default()
                 }),
@@ -669,13 +680,16 @@ mod tests {
         assert!((hint.thd_ratio.unwrap() - 0.10_f64.hypot(0.01)).abs() < 1.0e-6);
         assert!(hint.even_odd_asymmetry.unwrap() > 0.8);
         assert!((hint.noise_floor_db.unwrap() + 60.0).abs() < 0.05);
-        assert_eq!(hint.modulation_rate_hz, Some(1.0));
-        // Dry Schoukens target (edc_t60_s = 0.0) must NOT inherit legacy phys_rt60_ms.
-        manifest.stems_registry[0]
+        assert_eq!(hint.modulation_rate_hz, Some(1.85));
+        // Dry LTI Schoukens target (edc_t60_s = 0.0, law0a_ltv_flag = false) must NOT inherit legacy phys_rt60_ms or phys_lfo_hz.
+        let ep_mut = manifest.stems_registry[0]
             .extracted_physics
             .as_mut()
-            .unwrap()
-            .edc_t60_s = 0.0;
-        assert!(pass1_hint_from_manifest(&manifest).rt60_s.is_none());
+            .unwrap();
+        ep_mut.edc_t60_s = 0.0;
+        ep_mut.law0a_ltv_flag = false;
+        let lti_hint = pass1_hint_from_manifest(&manifest);
+        assert!(lti_hint.rt60_s.is_none());
+        assert!(lti_hint.modulation_rate_hz.is_none());
     }
 }

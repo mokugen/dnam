@@ -90,7 +90,12 @@ pub(crate) fn eval_causal_loop_forward(
             let active = is_op_t_quad_active(&model.transport_quads[q]);
             opt_active[q] = active;
             active.then(|| {
-                let p = OpTResolvedParams::from_quad(&model.transport_quads[q], sr, n);
+                let p = OpTResolvedParams::from_quad_with_wet_dc(
+                    &model.transport_quads[q],
+                    sr,
+                    n,
+                    model.dc_blocker_pole_5hz,
+                );
                 OpTQuadStepState::new(p, n, record_trace)
             })
         })

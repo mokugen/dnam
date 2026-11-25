@@ -25,10 +25,11 @@ use super::{
 };
 
 const R_DC_WIRE_MIN: f32 = 0.95;
-const R_DC_WIRE_MAX: f32 = 0.9999;
+const R_DC_WIRE_MAX: f32 = dnam_kernels::MAX_PARALRU_R_F32;
 const LOOP_DC_ZOH_MIN: f32 = 1.0e-4;
 const LOOP_DC_ZOH_MAX: f32 = 0.999_995;
 const DAMP_WIRE_MAX: f32 = 0.9995;
+const _: () = assert!(R_DC_WIRE_MAX == LOOP_DC_ZOH_MAX);
 
 #[inline]
 fn zoh_scale_pole(
@@ -305,6 +306,30 @@ mod tests {
             .unwrap();
         assert_eq!(meta_reconf.cap, 256);
         assert_ne!(q_clamped.flags & QUAD_FLAG_HOST_WRITE_LOCK, 0);
+
+        // Verify passive feed-forward high-pole hydration (0.999995 = MAX_PARALRU_R_F32) at 48 kHz
+        // and bounded ZOH rescaling at 96 kHz.
+        let mut w_hi = TransportQuadWire::new_zeroed();
+        w_hi.delay_samples = [53.0, 67.0, 79.0, 89.0].map(F32::new);
+        w_hi.r_dc = F32::new(dnam_kernels::MAX_PARALRU_R_F32);
+        let cfg_hi_48 = QuadHydrateConfig {
+            dc_blocker_pole_5hz: dnam_kernels::MAX_PARALRU_R_F32,
+            ..cfg0
+        };
+        let (q_hi_48, _) = TransportQuadHotCompact::from_wire(&w_hi, &cfg_hi_48).unwrap();
+        assert_eq!(q_hi_48.r_dc, dnam_kernels::MAX_PARALRU_R_F32);
+        assert_eq!(q_hi_48.wet_dc_pole, dnam_kernels::MAX_PARALRU_R_F32);
+        let (q_hi_96, _) = TransportQuadHotCompact::from_wire(
+            &w_hi,
+            &QuadHydrateConfig {
+                fs_vm: 96_000.0,
+                rho_vm: 0.5,
+                ..cfg_hi_48
+            },
+        )
+        .unwrap();
+        assert!(q_hi_96.r_dc <= LOOP_DC_ZOH_MAX && q_hi_96.wet_dc_pole <= LOOP_DC_ZOH_MAX);
+
         assert_eq!(
             TransportQuadHotCompact::from_wire(&w0, &QuadHydrateConfig { fs_vm: 0.0, ..cfg0 },)
                 .unwrap_err(),

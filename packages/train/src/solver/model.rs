@@ -58,6 +58,8 @@ pub struct SonaModelF64 {
     pub direct_s2_hp_gain: [f64; 2],
     /// Learned `48 kHz` `LinearReadout` leak pole `ro_pole_48k` (`[0.0, 0x3F7F_FFAC]`).
     pub ro_pole_48k: f64,
+    /// `Op-T` `48 kHz` stereo wet DF-I DC blocker pole (`(0.8, 0x3F7F_FFAC]`, `5 Hz` default).
+    pub dc_blocker_pole_5hz: f64,
     /// Ultra-nested Left readout row matrix `[40][12]` (Lite uses `0..16`, Full `0..24`, Pro `0..32`).
     pub w_ro: [[f64; 12]; 40],
     /// `ModalConvolver` Left early FIR (`128` taps).
@@ -160,6 +162,7 @@ impl SonaModelF64 {
             direct_s2_u_gain: [1.0, 1.0],
             direct_s2_hp_gain: [0.0; 2],
             ro_pole_48k: 0.0,
+            dc_blocker_pole_5hz: f64::from(dnam_vm::math::TANK_DC_BLOCKER_48K_F32),
             w_ro: [[0.0; 12]; 40],
             fir_l: [0.0; NUM_FIR_TAPS_ULTRA],
             fir_r: [0.0; NUM_FIR_TAPS_ULTRA],

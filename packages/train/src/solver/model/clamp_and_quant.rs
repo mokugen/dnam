@@ -232,7 +232,7 @@ pub(super) fn clamp_model_stability_bounds(model: &mut SonaModelF64, crossbar_co
             tq.allpass_g[k] = sanitize_clamp(tq.allpass_g[k], -0.75, 0.75, 0.0);
         }
         tq.g_loop = sanitize_clamp(tq.g_loop, 0.0, g_loop_max, 0.0);
-        tq.r_dc = sanitize_clamp(tq.r_dc, 0.95, 0.9999, r_dc_fallback);
+        tq.r_dc = sanitize_clamp(tq.r_dc, 0.95, f64::from(MAX_PARALRU_R_F32), r_dc_fallback);
         tq.damp_pole = sanitize_clamp(tq.damp_pole, 0.0, 0.9995, 0.0);
         tq.lfo_rate_hz = sanitize_clamp(tq.lfo_rate_hz, 0.0, 16.0, 0.0);
         tq.ramp_rate_hz = sanitize_clamp(tq.ramp_rate_hz, -16.0, 16.0, 0.0);
@@ -266,6 +266,12 @@ pub(super) fn clamp_model_stability_bounds(model: &mut SonaModelF64, crossbar_co
     model.stage_latent_mods.clamp_bounds();
     model.sense_vca_bias = sanitize_clamp(model.sense_vca_bias, -1.0, 1.0, 0.0);
     model.op_t_wet_scale = sanitize_clamp(model.op_t_wet_scale, 0.0, 2.0, 1.0);
+    model.dc_blocker_pole_5hz = sanitize_clamp(
+        model.dc_blocker_pole_5hz,
+        0.8001,
+        f64::from(MAX_PARALRU_R_F32),
+        r_dc_fallback,
+    );
 }
 
 /// Snaps all non-readout parameters across `CoreQuad`, `InterBlockTile`, `Op-N[Pre]`, `Op-T`,
@@ -349,7 +355,7 @@ pub fn snap_non_readout_fp16(model: &mut SonaModelF64) {
             tq.allpass_g[k] = snap_fp16(tq.allpass_g[k], -0.75, 0.75, 0.0);
         }
         tq.g_loop = snap_f32(tq.g_loop, 0.0, TANK_MAX_G_LIN_F32, 0.0);
-        tq.r_dc = snap_f32(tq.r_dc, 0.95, 0.9999, TANK_DC_BLOCKER_48K_F32);
+        tq.r_dc = snap_f32(tq.r_dc, 0.95, MAX_PARALRU_R_F32, TANK_DC_BLOCKER_48K_F32);
         tq.damp_pole = snap_f32(tq.damp_pole, 0.0, 0.9995, 0.0);
         tq.lfo_rate_hz = snap_f32(tq.lfo_rate_hz, 0.0, 16.0, 0.0);
         tq.ramp_rate_hz = snap_f32(tq.ramp_rate_hz, -16.0, 16.0, 0.0);
@@ -416,6 +422,12 @@ pub fn snap_non_readout_fp16(model: &mut SonaModelF64) {
         }
     }
     model.ro_pole_48k = snap_f32(model.ro_pole_48k, 0.0, MAX_RO_POLE_48K_F32, 0.0);
+    model.dc_blocker_pole_5hz = snap_f32(
+        model.dc_blocker_pole_5hz,
+        0.8001,
+        MAX_PARALRU_R_F32,
+        TANK_DC_BLOCKER_48K_F32,
+    );
     model.tank_dry_mix = snap_fp16(model.tank_dry_mix, -2.0, 2.0, 1.0);
     model.os_up_quad_coeff = snap_f32(model.os_up_quad_coeff, -0.20, 0.05, -0.125);
     model.os_dec_c_prev1 = snap_f32(model.os_dec_c_prev1, 0.0, 0.28, 0.15);

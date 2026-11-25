@@ -173,7 +173,7 @@ pub(super) fn pack_transport_quad_wire(t: &TransportQuadF64) -> TransportQuadWir
     w.r_dc = F32::new(sanitize_clamp_f32(
         t.r_dc,
         0.95,
-        0.9999,
+        MAX_PARALRU_R_F32,
         TANK_DC_BLOCKER_48K_F32,
     ));
     w.damp_pole = F32::new(sanitize_clamp_f32(t.damp_pole, 0.0, 0.9995, 0.0));

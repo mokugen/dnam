@@ -396,16 +396,16 @@ pub fn compute_mr_iir_channel_with_gaps(
             for (w, &(cp_ws, cp_we)) in scale.win_cp_idx.iter().enumerate() {
                 let abs_s = cache.warmup + scale.checkpoints[cp_ws];
                 let abs_e = cache.warmup + scale.checkpoints[cp_we];
-                let gap_span = eff_gaps.and_then(|gm| gm.overlap_span(abs_s, abs_e));
+                let gap_overlap =
+                    eff_gaps.is_some_and(|gm| gm.overlap_span(abs_s, abs_e).is_some());
                 for l in 0..4 {
                     let sigma = sigma_src[g][w][l].max(0.0);
                     let a_t = scale.win_rms_t[g][w][l].max(sigma);
                     let e = (cp_ps[cp_we][l] - cp_ps[cp_ws][l]).max(0.0);
                     let a_p = (e * scale.inv_win_len).sqrt().max(sigma);
                     if let Some(gm) = eff_gaps
-                        && let Some((gs, ge)) = gap_span
-                        && ((abs_s >= gs && abs_e <= ge)
-                            || a_t <= POST_T60_GAP_AMP_RATIO * gm.active_target_rms)
+                        && gap_overlap
+                        && a_t <= POST_T60_GAP_AMP_RATIO * gm.active_target_rms
                     {
                         if (a_p - a_t).abs() > 2.0 * POST_T60_GAP_AMP_RATIO * gm.active_target_rms {
                             return f64::INFINITY;
@@ -637,5 +637,62 @@ mod tests {
                 grad_n[idx]
             );
         }
+    }
+
+    #[test]
+    fn test_mr_iir_gap_guard_scores_actively_ringing_long_scale_windows_and_rejects_silent_ringing()
+    {
+        let sr = 48_000.0_f64;
+        let tau = core::f64::consts::TAU;
+        let warmup = 64_usize;
+        let n = 16_384_usize;
+        let mut dry = vec![0.0_f64; n];
+        for (i, slot) in dry.iter_mut().enumerate() {
+            if !(2_400..14_400).contains(&i) {
+                *slot = 0.30 * (tau * 180.0 * (i as f64) / sr).sin()
+                    + 0.20 * (tau * 1_100.0 * (i as f64) / sr).cos();
+            }
+        }
+        // Fast-decaying resonant plant (T60 < 30 ms) followed by 250 ms silent gap.
+        let r_p = 0.992_f64;
+        let (ar, ai) = (
+            r_p * (tau * 110.0 / sr).cos(),
+            r_p * (tau * 110.0 / sr).sin(),
+        );
+        let (mut sr_st, mut si_st) = (0.0_f64, 0.0_f64);
+        let mut target = vec![0.0_f64; n];
+        for i in 0..n {
+            let nsr = ar * sr_st - ai * si_st + dry[i];
+            let nsi = ai * sr_st + ar * si_st;
+            sr_st = nsr;
+            si_st = nsi;
+            target[i] = 0.55 * dry[i] + 0.04 * sr_st;
+        }
+        let gap_mask = DrySilentGapMask::detect(&dry, &target, warmup, sr);
+        assert!(!gap_mask.is_empty());
+
+        // -26 dB approximate LTI model leaves M=4096 actively ringing above tau_60 right after gs:
+        // must score finitely instead of throwing ringing windows into the 2*tau_60 silent guard.
+        let mut approx_pred: Vec<f64> = target.iter().map(|&v| 0.95 * v).collect();
+        for (i, slot) in approx_pred.iter_mut().enumerate().take(14_400).skip(6_500) {
+            *slot = 1.0e-5 * (-((i - 6_500) as f64) / 2_000.0).exp();
+        }
+        let cache = MrIirTargetCache::new(&target, None, warmup, sr).unwrap();
+        let mr_ok = compute_mr_iir_channel_with_gaps(&cache, &approx_pred, None, Some(&gap_mask));
+        assert!(
+            mr_ok.is_finite() && mr_ok > 0.0,
+            "expected finite MR-IIR, got {mr_ok}"
+        );
+
+        // Ringing above 2 * tau_60 inside a genuinely decayed (a_t <= tau_60) cell must still fail (+inf).
+        let mut ring_pred = approx_pred;
+        for (i, slot) in ring_pred.iter_mut().enumerate().take(14_000).skip(7_200) {
+            *slot = 0.015 * (tau * 440.0 * (i as f64) / sr).sin();
+        }
+        let mr_bad = compute_mr_iir_channel_with_gaps(&cache, &ring_pred, None, Some(&gap_mask));
+        assert!(
+            mr_bad.is_infinite(),
+            "expected +inf for silent-gap ringing, got {mr_bad}"
+        );
     }
 }

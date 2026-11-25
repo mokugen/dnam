@@ -310,7 +310,7 @@ pub(crate) fn compile_arena_and_cp1_with_ext_to_dnam_bin(
     if manifest.base.io_config.inputs == 1 {
         header_flags |= DNBN_FLAG_SINGLE_INPUT;
     }
-    let dc_pole = a0.transport_lite.r_dc.get().clamp(0.95, 0.9999);
+    let dc_pole = a0.transport_lite.r_dc.get().clamp(0.95, MAX_PARALRU_R_F32);
     let tail_ms = manifest.base.io_config.tail_time_ms.clamp(0.0, 60_000.0);
     let ro_pole = manifest
         .base

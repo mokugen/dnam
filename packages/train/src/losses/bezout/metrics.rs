@@ -4,7 +4,10 @@
 
 use crate::error::TrainError;
 
-use super::super::certification::{DrySilentGapMask, POST_T60_GAP_AMP_RATIO};
+use super::super::certification::{
+    DrySilentGapMask, POST_T60_GAP_AMP_RATIO, SEG_ESR_UNEXCITED_BAND_AMP_RATIO,
+    SEG_ESR_UNEXCITED_BAND_GUARD_RATIO,
+};
 use super::super::noise_floor::{smooth_excess_sq, snr_weight};
 use super::{Bezout7FilterBank, esr_ratio, linear_to_db};
 
@@ -303,22 +306,37 @@ pub fn compute_seg_esr_channel_db_with_gaps(
             continue;
         }
 
+        let bb_sig_rms = (y_frame_e / nf).sqrt();
         let mut r_f = 0.0_f64;
+        let mut excited_bands = 0_usize;
         for b in 0..3 {
             let ey = (y_b[b][start..end].iter().map(|v| v * v).sum::<f64>() / nf).sqrt();
             let ep = (yh_b[b][start..end].iter().map(|v| v * v).sum::<f64>() / nf).sqrt();
             let f_env = n_b.as_ref().map_or(0.0, |nb| {
                 nb[b][start..end].iter().map(|v| v * v).sum::<f64>() / nf
             });
+            if noise.is_none()
+                && f_env == 0.0
+                && ey <= SEG_ESR_UNEXCITED_BAND_AMP_RATIO * bb_sig_rms
+            {
+                if (ep - ey).abs() > SEG_ESR_UNEXCITED_BAND_GUARD_RATIO * bb_sig_rms {
+                    return f64::INFINITY;
+                }
+                continue;
+            }
             let denom = ey * ey + f_env;
             if denom > 0.0 {
                 let d = ep - ey;
                 r_f += ((d * d - f_env).max(0.0)) / denom;
+                excited_bands += 1;
             } else if ep > 0.0 {
                 return f64::INFINITY;
             }
         }
-        num_sum += w_f * (r_f / 3.0);
+        if excited_bands == 0 {
+            return f64::INFINITY;
+        }
+        num_sum += w_f * (r_f / (excited_bands as f64));
         w_sum += w_f;
         start = end;
     }
@@ -702,5 +720,38 @@ mod tests {
             - eval_seg_esr_cached_and_adjoint(&seg_cache, &bank, &pm, None))
             / (2.0 * eps);
         assert!((g_sn[500] - fd_sn).abs() <= 1.0e-5 * g_sn[500].abs().max(1.0e-4));
+
+        // Unexcited LF band on pure 17 kHz active tone: -55 dB LF transient passes cleanly,
+        // while -30 dB spurious LF (> 1e-2 * bb_sig_rms) fails closed with +inf.
+        let n_hf = 3_840_usize;
+        let tau = core::f64::consts::TAU;
+        let tgt_17k: Vec<f64> = (0..n_hf)
+            .map(|i| 0.4 * (tau * 17_000.0 * (i as f64) / 48_000.0).sin())
+            .collect();
+        let mdl_lf_ok: Vec<f64> = tgt_17k
+            .iter()
+            .enumerate()
+            .map(|(i, &y)| y + 0.4 * 1.8e-3 * (tau * 25.0 * (i as f64) / 48_000.0).sin())
+            .collect();
+        let seg_hf_ok = compute_seg_esr_channel_db(&mdl_lf_ok, &tgt_17k, None, 48_000.0, 960);
+        assert!(
+            seg_hf_ok.is_finite() && seg_hf_ok < -30.0,
+            "seg_hf_ok={seg_hf_ok}"
+        );
+
+        let mdl_lf_bad: Vec<f64> = tgt_17k
+            .iter()
+            .enumerate()
+            .map(|(i, &y)| y + 0.4 * 3.0e-2 * (tau * 25.0 * (i as f64) / 48_000.0).sin())
+            .collect();
+        assert!(
+            compute_seg_esr_channel_db(&mdl_lf_bad, &tgt_17k, None, 48_000.0, 960).is_infinite()
+        );
+
+        let zero_noise = vec![1.0e-12_f64; n_hf];
+        assert!(
+            compute_seg_esr_channel_db(&mdl_lf_ok, &tgt_17k, Some(&zero_noise), 48_000.0, 960)
+                .is_finite()
+        );
     }
 }

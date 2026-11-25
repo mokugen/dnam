@@ -246,6 +246,13 @@ pub(super) fn compute_star_schoukens_physics(
         },
     );
     sp.apply_to_extracted_physics(&mut base.extracted);
+    if inputs.r1_settled_periods_l.len() >= 2 && !sp.law0a_ltv_flag {
+        base.extracted.lfo_freqs_hz.clear();
+        base.metadata
+            .insert("phys_lfo_hz".to_string(), serde_json::json!(0.0));
+        base.metadata
+            .insert("phys_lfo_depth".to_string(), serde_json::json!(0.0));
+    }
     if !sp.edc_t60_s.is_finite() || sp.edc_t60_s == 0.0 {
         base.extracted.edc_t60_s = 0.0;
     } else {
@@ -581,6 +588,30 @@ mod tests {
                 crate::stimulus::pipeline::schoukens::SCHOUKENS_CORESET_20S_OFFSETS,
             calb_noise_floor_dbfs: -100.0,
         });
+        let comb_r_mismatch: Vec<f32> = exc.dry_l[..4_608].iter().map(|&v| -0.4 * v).collect();
+        let (lti_ep, lti_meta) = compute_star_schoukens_physics(StarPhysicsInputs {
+            plan: &plan,
+            r1_dry_period_l: r1,
+            r1_settled_periods_l: &[r1, r1],
+            r1_settled_periods_r: Some(&[r1, r1]),
+            aligned_wet_r2_l: r2,
+            aligned_wet_r2_r: Some(r2),
+            r2_gap_ranges: &[(5_000, 10_000)],
+            coreset_dry_l: &exc.dry_l[..13_824],
+            coreset_dry_r: None,
+            coreset_wet_l: &exc.dry_l[..13_824],
+            coreset_wet_r: Some(&exc.dry_l[..13_824]),
+            probe_comb_dry_l: &exc.dry_l[..4_608],
+            probe_comb_wet_l: &exc.dry_l[..4_608],
+            probe_comb_wet_r: Some(&comb_r_mismatch),
+            probe_carrier_bins: &[23, 57],
+            coreset_regime_offsets:
+                crate::stimulus::pipeline::schoukens::SCHOUKENS_CORESET_20S_OFFSETS,
+            calb_noise_floor_dbfs: -100.0,
+        });
+        assert!(!lti_ep.law0a_ltv_flag);
+        assert!(lti_ep.lfo_freqs_hz.is_empty());
+        assert_eq!(lti_meta.get("phys_lfo_hz"), Some(&serde_json::json!(0.0)));
         let (_, spec_short_r) = render_and_seal_fullband_stem(
             &mut target,
             FullbandStemRequest {

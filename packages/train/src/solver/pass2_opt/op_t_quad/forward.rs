@@ -18,7 +18,7 @@ use super::{
 };
 
 const R_DC_MIN: f64 = 0.95;
-const R_DC_MAX: f64 = 0.9999;
+const R_DC_MAX: f64 = dnam_kernels::MAX_PARALRU_R_F32 as f64;
 const DAMP_MAX: f64 = 0.9995;
 const DAMP_EFF_MAX: f64 = 0.999_95;
 const LOOP_DC_ZOH_MIN: f64 = 1.0e-4;
@@ -82,6 +82,17 @@ pub(crate) struct OpTResolvedParams {
     pub scat_open: bool,
     pub window_depth: f64,
     pub window_depth_open: bool,
+    pub lfo_static: bool,
+    pub s_lfo_const: [f64; 4],
+    pub c_lfo_const: [f64; 4],
+    pub ramp_static: bool,
+    pub phi_ramp_const: [f64; 4],
+    pub du_dphi_const: [f64; 4],
+    pub h_win_const: [f64; 4],
+    pub dh_du_const: [f64; 4],
+    pub click_guard_raw_const: [f64; 4],
+    pub mu_win_const: [f64; 4],
+    pub win_w_const: [f64; 4],
     pub input_gains: [f64; 4],
     pub input_gain_open: [bool; 4],
     pub wet_tap_l: [f64; 4],
@@ -94,7 +105,12 @@ pub(crate) struct OpTResolvedParams {
 }
 
 impl OpTResolvedParams {
-    pub(crate) fn from_quad(tq: &TransportQuadF64, sample_rate_hz: f64, n_frames: usize) -> Self {
+    pub(crate) fn from_quad_with_wet_dc(
+        tq: &TransportQuadF64,
+        sample_rate_hz: f64,
+        n_frames: usize,
+        wet_dc_pole_48k: f64,
+    ) -> Self {
         let sr = if sample_rate_hz.is_finite() && sample_rate_hz > 0.0 {
             sample_rate_hz
         } else {
@@ -323,7 +339,12 @@ impl OpTResolvedParams {
             (d_e, d)
         };
 
-        let wet_dc_base = f64::from(DC_BLOCKER_5HZ_48K_F32);
+        let wet_dc_base =
+            if wet_dc_pole_48k.is_finite() && wet_dc_pole_48k > 0.8 && wet_dc_pole_48k < 1.0 {
+                wet_dc_pole_48k
+            } else {
+                f64::from(DC_BLOCKER_5HZ_48K_F32)
+            };
         let wet_dc_pole = if exact_48k {
             wet_dc_base.clamp(LOOP_DC_ZOH_MIN, LOOP_DC_ZOH_MAX)
         } else {
@@ -356,6 +377,34 @@ impl OpTResolvedParams {
         };
         let window_depth_open =
             tq.window_depth.is_finite() && tq.window_depth >= 0.0 && tq.window_depth < 1.0;
+
+        let lfo_static = lfo_rate_hz == 0.0;
+        let ramp_static = ramp_rate_hz == 0.0;
+        let mut s_lfo_const = [0.0_f64; 4];
+        let mut c_lfo_const = [1.0_f64; 4];
+        let mut phi_ramp_const = [0.0_f64; 4];
+        let mut du_dphi_const = [2.0_f64; 4];
+        let mut h_win_const = [0.0_f64; 4];
+        let mut dh_du_const = [0.0_f64; 4];
+        let click_guard_raw_const = [-1.0_f64; 4];
+        let mu_win_const = [window_depth; 4];
+        let mut win_w_const = [1.0_f64; 4];
+        for k in 0..4 {
+            let lfo_ph = f64::from(tq.lfo_phase_off_q16[k]) / 65_536.0;
+            (s_lfo_const[k], c_lfo_const[k]) = (TAU * lfo_ph).sin_cos();
+            let phi_r = (f64::from(tq.ramp_phase_off_q16[k]) / 65_536.0).rem_euclid(1.0);
+            let (u_t, du_dp) = if phi_r <= 0.5 {
+                (2.0 * phi_r, 2.0)
+            } else {
+                (2.0 * (1.0 - phi_r), -2.0)
+            };
+            let h_w = u_t * u_t * (3.0 - 2.0 * u_t);
+            phi_ramp_const[k] = phi_r;
+            du_dphi_const[k] = du_dp;
+            h_win_const[k] = h_w;
+            dh_du_const[k] = 6.0 * u_t * (1.0 - u_t);
+            win_w_const[k] = (1.0 - window_depth) + window_depth * h_w;
+        }
 
         let input_gains = tq.input_gains.map(|v| {
             if v.is_finite() {
@@ -428,6 +477,17 @@ impl OpTResolvedParams {
             scat_open,
             window_depth,
             window_depth_open,
+            lfo_static,
+            s_lfo_const,
+            c_lfo_const,
+            ramp_static,
+            phi_ramp_const,
+            du_dphi_const,
+            h_win_const,
+            dh_du_const,
+            click_guard_raw_const,
+            mu_win_const,
+            win_w_const,
             input_gains,
             input_gain_open,
             wet_tap_l,
@@ -523,11 +583,45 @@ impl OpTQuadStepState {
         let ramp_active = p.ramp_rate_hz.abs() > 1.0e-6;
 
         for k in 0..4 {
-            let lfo_ph = tf * p.lfo_rate_hz / p.sr + f64::from(p.lfo_phase_off_q16[k]) / 65_536.0;
-            let (s_lfo, c_lfo) = (TAU * lfo_ph).sin_cos();
-            let phi_ramp = (tf * p.ramp_rate_hz / p.sr
-                + f64::from(p.ramp_phase_off_q16[k]) / 65_536.0)
-                .rem_euclid(1.0);
+            let (s_lfo, c_lfo) = if p.lfo_static {
+                (p.s_lfo_const[k], p.c_lfo_const[k])
+            } else {
+                let lfo_ph =
+                    tf * p.lfo_rate_hz / p.sr + f64::from(p.lfo_phase_off_q16[k]) / 65_536.0;
+                (TAU * lfo_ph).sin_cos()
+            };
+            let (phi_ramp, h_win, dh_du, du_dphi, cg_raw, mu_win, win_w) = if p.ramp_static {
+                (
+                    p.phi_ramp_const[k],
+                    p.h_win_const[k],
+                    p.dh_du_const[k],
+                    p.du_dphi_const[k],
+                    p.click_guard_raw_const[k],
+                    p.mu_win_const[k],
+                    p.win_w_const[k],
+                )
+            } else {
+                let phi_r = (tf * p.ramp_rate_hz / p.sr
+                    + f64::from(p.ramp_phase_off_q16[k]) / 65_536.0)
+                    .rem_euclid(1.0);
+                let (u_tri, du_d) = if phi_r <= 0.5 {
+                    (2.0 * phi_r, 2.0)
+                } else {
+                    (2.0 * (1.0 - phi_r), -2.0)
+                };
+                let hw = u_tri * u_tri * (3.0 - 2.0 * u_tri);
+                let dhw = 6.0 * u_tri * (1.0 - u_tri);
+                let abs_span = if ramp_active {
+                    p.span_tap[k].abs()
+                } else {
+                    0.0
+                };
+                let cg_r = (abs_span - 0.25) * 4.0;
+                let cg = cg_r.clamp(0.0, 1.0);
+                let mu_w = p.window_depth.max(cg);
+                let ww = (1.0 - mu_w) + mu_w * hw;
+                (phi_r, hw, dhw, du_d, cg_r, mu_w, ww)
+            };
             let tau_raw = p.d_eff[k] + p.lfo_d_eff[k] * s_lfo + p.span_tap[k] * (phi_ramp - 0.5);
             let tau = tau_raw.clamp(MIN_DELAY_CROSSBAR_SAMP, p.max_tau);
             let dk = (tau.floor() as usize).max(MIN_DELAY_CROSSBAR_SAMP as usize);
@@ -553,23 +647,6 @@ impl OpTQuadStepState {
             let (rr, d_mu, _) =
                 blend_catmull_rom_with_derivs(s_m1, s_0, s_1, s_2, mu_frac, p.half_alpha);
             let y_curv = omt * (2.0 * s_0 - s_m1 - s_1) + mu_frac * (2.0 * s_1 - s_0 - s_2);
-
-            let (u_tri, du_dphi) = if phi_ramp <= 0.5 {
-                (2.0 * phi_ramp, 2.0)
-            } else {
-                (2.0 * (1.0 - phi_ramp), -2.0)
-            };
-            let h_win = u_tri * u_tri * (3.0 - 2.0 * u_tri);
-            let dh_du = 6.0 * u_tri * (1.0 - u_tri);
-            let abs_span = if ramp_active {
-                p.span_tap[k].abs()
-            } else {
-                0.0
-            };
-            let cg_raw = (abs_span - 0.25) * 4.0;
-            let cg = cg_raw.clamp(0.0, 1.0);
-            let mu_win = p.window_depth.max(cg);
-            let win_w = (1.0 - mu_win) + mu_win * h_win;
 
             tr.r_raw[k] = rr;
             tr.r_win[k] = win_w * rr;
@@ -701,6 +778,24 @@ impl OpTQuadStepState {
             });
         }
         self.t_idx += 1;
+        (yl, yr)
+    }
+
+    /// Evaluates causal wet stereo output `(yl, yr)` for `top` without mutating quad state.
+    #[inline]
+    pub(crate) fn preview_wet_output(&self, top: &OpTTopRead) -> (f64, f64) {
+        let p = &self.p;
+        let (mut wl_sum, mut wr_sum) = (0.0_f64, 0.0_f64);
+        for k in 0..4 {
+            wl_sum += p.wet_tap_l[k] * top.v_read[k];
+            wr_sum += p.wet_tap_r[k] * top.v_read[k];
+        }
+        let wl_raw = p.cos_psi * wl_sum - p.sin_psi * wr_sum;
+        let wr_raw = p.sin_psi * wl_sum + p.cos_psi * wr_sum;
+        let yl =
+            p.alpha_wet_dc * (wl_raw - self.wet_raw_prev[0]) + p.wet_dc_pole * self.wet_out_prev[0];
+        let yr =
+            p.alpha_wet_dc * (wr_raw - self.wet_raw_prev[1]) + p.wet_dc_pole * self.wet_out_prev[1];
         (yl, yr)
     }
 }

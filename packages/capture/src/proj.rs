@@ -307,15 +307,39 @@ mod tests {
         assert_eq!(uplo_u_packed_len(256) * 8 + 4_096, PROJ_STAT_BYTES_ULTRA);
         assert_eq!(PROJ_STAT_BYTES_ULTRA % 64, 0);
 
-        let vals = [0.0_f32, -0.0, 1.0, -1.0, 0.25, 1.0e-6, 99_999.0, f32::NAN];
+        let vals = [
+            0.0_f32,
+            -0.0,
+            1.0,
+            -1.0,
+            0.25,
+            1.0e-6,
+            -1.0e-6,
+            1.0e-9,
+            65_520.0,
+            99_999.0,
+            f32::NAN,
+        ];
         let enc = f32_to_fp16_rne_bytes(&vals);
         let dec = fp16_bytes_to_f32(&enc);
         assert_eq!(dec[0], 0.0);
+        assert!(dec[1] == 0.0 && dec[1].is_sign_negative());
         assert_eq!(dec[2], 1.0);
         assert_eq!(dec[3], -1.0);
         assert_eq!(dec[4], 0.25);
-        assert!(dec[6].is_finite() && dec[6] > 65_000.0);
+        assert!(dec[5] > 0.0);
+        assert!(dec[6] < 0.0);
         assert_eq!(dec[7], 0.0);
+        assert!(dec[8].is_finite() && dec[8] > 65_000.0);
+        assert!(dec[9].is_finite() && dec[9] > 65_000.0);
+        assert_eq!(dec[10], 0.0);
+
+        // exp==31 -> 0.0, negative subnormal, and odd-length slice guard
+        assert_eq!(fp16_bytes_to_f32(&[0x00, 0x7C]), vec![0.0]);
+        let neg_sub = fp16_bytes_to_f32(&[0x01, 0x80]);
+        assert_eq!(neg_sub.len(), 1);
+        assert!(neg_sub[0] < 0.0);
+        assert!(fp16_bytes_to_f32(&[0x00]).is_empty());
     }
 
     proptest! {
