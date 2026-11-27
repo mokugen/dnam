@@ -34,3 +34,4 @@ This record justifies the delay history, pitch windowing, and feedback stability
 
 - **2026-11-20T02:07:00-05:00:** Amended to make transport loops continuously differentiable for black-box solver discovery without discrete mode switches or bespoke freeze forks (`ADR-0022`).
 - **2026-11-20T23:02:00-05:00:** Amended to eliminate asymmetric quad special cases and non-differentiable Schmitt/knee heuristics while fitting active state into `216 B` (`ADR-0022`).
+- **2026-11-27T14:00:00Z:** Amended for `Op-T v4` adding per-quad modulation routing and per-tap readout, passive convex `M_fb`, bipolar `g_loop ∈ [-0.9990, +0.9990]`, causal lower-triangular `M_series`, `alpha_sum_fb`, `±64 Hz` ramp, modulatable `ramp_spans_samples`, wired 3-phase B-spline, `lfo_rate_ratio`, quadrature AM, passive shimmer (`V_ceil = 4.0`), unitary `H_4(1)` freeze, `0.25` samp/samp delay slew, and `64`-frame inline ring ([`ADR-0024`](0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md)).

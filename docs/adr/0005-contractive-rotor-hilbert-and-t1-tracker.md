@@ -33,3 +33,4 @@ This record justifies the modal, Hilbert, and tracker formulations in [`../specs
 
 - **2026-11-20T02:07:00-05:00:** Amended to maintain sub-degree quadrature accuracy up to `192 kHz` and support stereo and silent-input carrier modulation (`ADR-0022`).
 - **2026-11-20T23:02:00-05:00:** Amended to eliminate octave-divider step aliasing, prevent quarter-angle norm drift, and keep LFO harmonic skew learned (`ADR-0022`).
+- **2026-11-27T14:00:00Z:** Amended for `SONA v4.0` to run `H1` natively at `2×`, expand `T1` to 8-feature `T1+` (pre-LPF, `3`-FMA `2θ` doubler, `|u|-env` Octavia, soft-square OC-2, stereo/2-band), add `ModalConvolver` `ErSparseBank` + per-bank Kautz onset (reclaiming `dr`), and replace `q=2` zero-stuffing with cold-load Kaiser polyphase sinc ([`ADR-0024`](0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md)).

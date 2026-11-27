@@ -53,7 +53,7 @@ flowchart TD
     end
 
     subgraph ADRs ["Layer 3: Architectural Decision Records — The 'Why' (docs/adr/)"]
-        A1["ADR-0001..ADR-0022: MADR Design Decisions & Counterexamples (adr/0001..0022-*.md)"]
+        A1["ADR-0001..ADR-0025: MADR Design Decisions & Counterexamples (adr/0001..0025-*.md)"]
     end
 
     G1 --> G2
@@ -71,7 +71,7 @@ flowchart TD
 
 | Document | Rule / ID Prefix | Authoritative Scope |
 | :--- | :---: | :--- |
-| **[`requirements/system_goals_and_requirements.md`](requirements/system_goals_and_requirements.md)** | `REQ-1.1`–`REQ-8.8` | **Implementation-Agnostic System Goals, Hardware Budgets & Security Requirements (41 Formal Requirements):** Universal nonlinear/LTI/state-space/delay, full-rig coverage & universal trainable/data-programmable black-box runtime (`REQ-1.1`–`REQ-1.9`), device-agnostic bESR quality, non-stop clamping & 12-subdivision tempo sync (`REQ-2.1`–`REQ-2.5`), progressive single-project capture vault refinement & capsule persistence (`REQ-3.1`–`REQ-3.3`), portable 32-bit WebGPU acceleration, split-precision 64-bit host solver accuracy & 2-D streamed memory ceilings (`REQ-4.1`–`REQ-4.3`), single-run slimmable multi-tier training & dynamic tier scaling (`REQ-5.1`–`REQ-5.6`), embedded real-time budgets & loop constraints (`REQ-6.1`–`REQ-6.3`), unclipped 32-bit float I/O & 1→1 / 2→1 / 1→2 / 2→2 topologies (`REQ-7.1`–`REQ-7.4`), and provenance, hardware DRM, watermarking & marketplace security (`REQ-8.1`–`REQ-8.8`). |
+| **[`requirements/system_goals_and_requirements.md`](requirements/system_goals_and_requirements.md)** | `REQ-1.1`–`REQ-8.8` | **Implementation-Agnostic System Goals, Hardware Budgets & Security Requirements (41 Formal Requirements):** Universal nonlinear/LTI/state-space/delay, full-rig coverage & universal trainable/data-programmable black-box runtime (`REQ-1.1`–`REQ-1.9`), device-agnostic bESR quality, non-stop clamping & 12-subdivision tempo sync (`REQ-2.1`–`REQ-2.5`), progressive single-project capture vault refinement & capsule persistence (`REQ-3.1`–`REQ-3.3`), portable 32-bit WebGPU acceleration, split-precision 64-bit host solver accuracy & desktop browser worker / 2-D streamed memory ceilings (`REQ-4.1`–`REQ-4.3`), single-run slimmable multi-tier training & dynamic tier scaling (`REQ-5.1`–`REQ-5.6`), embedded real-time budgets & loop constraints (`REQ-6.1`–`REQ-6.3`), unclipped 32-bit float I/O & 1→1 / 2→1 / 1→2 / 2→2 topologies (`REQ-7.1`–`REQ-7.4`), and provenance, hardware DRM, watermarking & marketplace security (`REQ-8.1`–`REQ-8.8`). |
 
 ### Layer 2A — System Architecture & Psychoacoustic Quality Specifications (`docs/specs/architecture/`)
 
@@ -138,6 +138,8 @@ flowchart TD
 | **[`adr/0021-superseded-unified-matryoshka-gru-and-direct-register-stages.md`](adr/0021-superseded-unified-matryoshka-gru-and-direct-register-stages.md)** | Superseded by ADR-0022 | Historical TORA v3 Zero-DC Matryoshka GRU and sequential CPU L-BFGS solver, superseded by SONA v3.0 (ADR-0022). |
 | **[`adr/0022-sona-state-space-operator-and-webgpu-architecture.md`](adr/0022-sona-state-space-operator-and-webgpu-architecture.md)** | Accepted | SONA v3.0 Top-of-Frame Causal Operator Crossbar, passive 2×2 TPT-SVF, contractive 1D ParaLRU, pure-`f32` PolyADAA1 + `rcp_pos_quad_nr2`, compile-time `const SonaTierSpec` locking, shared `#![no_std]` `packages/kernels/` + offline AOT WGSL + 32-bit WebGPU + host-`f64` VarPro, `process_tick16_const`/`StereoVec8`/`SonaHotSlab`, and clean v3.0 `"sona"` `zerocopy` containers. |
 | **[`adr/0023-tiered-serialization-and-ipc-formats.md`](adr/0023-tiered-serialization-and-ipc-formats.md)** | Accepted | Four-tier serialization policy separating fixed `zerocopy 0.8` wire/arena structs, RFC 8785 JCS manifests/presets, `buffa` Protobuf Editions RPCs, and compact `#![no_std]` `postcard` Rust↔Rust ephemeral IPC. |
+| **[`adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md`](adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md)** | Accepted | SONA v4.0 kernel math (`AlgADAA1` 4096 NR3, C² quartic `soft_rect`, `g_pre` + `SE-Bus`, Predictor-Corrector PHS, 2-block LR4), all-tier 2× 15-tap symmetric linear-phase HB-FIR OS2X with 4,432-byte Lite hot L1D, perimeter `Op-N[Pre]` / `Op-T` / `ModalConvolver` / `Op-P` / `SensoryQuad` v4 upgrades, and `ControlBus` v4 (SwiGLU + Padé-[1/1] + anchored 1.5-Entmax). |
+| **[`adr/0025-unified-runtime-and-non-causal-trainer-attention.md`](adr/0025-unified-runtime-and-non-causal-trainer-attention.md)** | Accepted | Co-designed runtime attention (anchored 1.5-Entmax prototypes, post-ADAA `SE-Bus`, 6-edge and per-quad `Op-T` soft routing), hardened offline trainer attention (RBA, 2-stage delay dictionary, macro-window EnvOT / TF-Sinkhorn, 54-D NW-PANAMA, dual-peak SSM-LFO, contrastive FiLM disentanglement), and desktop-class 8M–16M Perceiver IO warm-starter sizing under `REQ-4.3`. |
 | **[`templates/requirement_template.md`](templates/requirement_template.md)** · **[`spec_template.md`](templates/spec_template.md)** · **[`adr_template.md`](templates/adr_template.md)** | Templates | Canonical authoring templates for `REQ-X.Y` requirements, `r[...]` normative specifications, and MADR `NNNN-*.md` records. |
 
 ---

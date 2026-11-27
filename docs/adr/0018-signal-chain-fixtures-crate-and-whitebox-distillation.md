@@ -68,3 +68,4 @@ We adopt the **Acyclic Pure-Rust + TypeScript Workspace**, superseding [`ADR-001
 ## Amendment Appendix
 
 - **2026-11-20T02:07:00-05:00:** Amended to cover continuous pitch/shimmer, barberpole, and quantizer identification without runtime or solver special cases (`ADR-0020`, `ADR-0022`).
+- **2026-11-27T14:00:00Z:** Amended to certify the expanded 18-chain black-box matrix (`Chain-01..18`) across the `T0–T4` qualification pyramid with strict zero pretraining under `REQ-1.9` ([`ADR-0024`](0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [`ADR-0025`](0025-unified-runtime-and-non-causal-trainer-attention.md)).

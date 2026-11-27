@@ -125,3 +125,4 @@ flowchart TD
 
 - **2026-11-20T02:07:00-05:00:** Amended to keep embedded and plugin runtimes free of JSON, crypto, and solver dependencies while allowing standalone reuse of low-level training primitives.
 - **2026-11-20T23:02:00-05:00:** Amended to isolate multi-port studio patchbay routing inside `dnam-engine` so `dnam-vm` remains a pure stereo register machine (`ADR-0022`).
+- **2026-11-27T14:00:00Z:** Amended for `SONA v4.0` `zerocopy` arenas (`MAX_OUTGOING_PER_QUAD = 7`, `6,336 B` reclaimed control bytes, `layout_7680` `offset_of!` Tardos stability), optional desktop-only `packages/train-warmstart` (`8M–16M` `Perceiver IO`), and decoupled desktop web-trainer vs ultra-lean `AudioWorklet` budgets ([`ADR-0024`](0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [`ADR-0025`](0025-unified-runtime-and-non-causal-trainer-attention.md)).

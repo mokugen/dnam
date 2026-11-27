@@ -103,3 +103,4 @@ Chosen architecture: **Two-Level Domain-Scoped SIMD Trait Architecture**, organi
 
 - **2026-11-20T02:07:00-05:00:** Amended to keep real-time `f32` VM binaries free of `f64` solver bloat, guarantee block-size invariance, and fit active-hot working sets within `64 KiB` L1D (`ADR-0020`, `ADR-0022`).
 - **2026-11-20T23:02:00-05:00:** Amended to eliminate hardcoded runtime cutoffs and non-differentiable perimeter branches while keeping joint stereo SIMD/WebGPU scan parity within L1D and SRAM caps (`ADR-0022`).
+- **2026-11-27T14:00:00Z:** Amended for `SONA v4.0` Quad-Major 4-frame/8-subsample register-resident fusion (deleting `cold.hoisted_core` for `4,432 B` `Lite 2×` hot L1D), `15`-tap `HB-FIR` `OS2X`, `AlgADAA1(4096, NR3)`, `C²` quartic `soft_rect`, 3-op NEON `scrub_recursive_state`, x86 `#[target_feature]` + `__m256` `Avx2Stereo8`, and x86/WASM lane overrides ([`ADR-0024`](0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md)).

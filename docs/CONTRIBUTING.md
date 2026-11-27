@@ -26,7 +26,7 @@ Every document in [docs/](index.md) has a strict engineering role separating **W
 flowchart LR
     Idx["docs/index.md<br/>(Master Specification Router)"] --> L1["Layer 1: docs/requirements/<br/>The 'What' (REQ-1.1..REQ-8.8)"]
     Idx --> L2["Layer 2: docs/specs/<br/>The 'How' (r[arch/qual/repo/dsp/train/container/sec/sdk.*])"]
-    Idx --> L3["Layer 3: docs/adr/<br/>The 'Why' (MADR 0001..0022-*.md)"]
+    Idx --> L3["Layer 3: docs/adr/<br/>The 'Why' (MADR 0001..0025-*.md)"]
     Idx --> Tmpl["docs/templates/<br/>requirement / spec / adr Templates"]
 ```
 
@@ -37,7 +37,7 @@ flowchart LR
 | **Layer 2B: Real-Time DSP (`docs/specs/dsp/`)** | [op_t_transport.md](specs/dsp/op_t_transport.md), [op_m_modal_kautz.md](specs/dsp/op_m_modal_kautz.md), [op_n_paralru_and_polyadaa.md](specs/dsp/op_n_paralru_and_polyadaa.md), [router_and_crossbar_topology.md](specs/dsp/router_and_crossbar_topology.md), [parametric_control_bus.md](specs/dsp/parametric_control_bus.md) | `r[dsp.op-t.*]`, `r[dsp.op-m.*]`, `r[dsp.op-n.*]`, `r[dsp.router.*]`, `r[dsp.crossbar.*]`, `r[dsp.core.*]`, `r[dsp.cabinet.*]`, `r[dsp.tank.*]`, `r[dsp.head.*]`, `r[dsp.zoh.*]`, `r[dsp.ctrl.*]`, `r[dsp.tempo.*]` | [spec_template.md](templates/spec_template.md) |
 | **Layer 2C: Capture, Training & Audit (`docs/specs/training/`)** | [capture_and_alignment.md](specs/training/capture_and_alignment.md), [webgpu_and_varpro_solver.md](specs/training/webgpu_and_varpro_solver.md), [iterative_resume_and_caching.md](specs/training/iterative_resume_and_caching.md), [control_space_audit.md](specs/training/control_space_audit.md) | `r[train.capture.*]`, `r[train.pipeline.*]`, `r[train.gram.*]`, `r[train.resume.*]`, `r[train.cache.*]`, `r[train.cloud.*]`, `r[train.audit.*]` | [spec_template.md](templates/spec_template.md) |
 | **Layer 2D: Containers, Security & SDKs (`docs/specs/containers/`, `docs/specs/security/`, `docs/specs/sdks/`)** | [dnam_binary_format.md](specs/containers/dnam_binary_format.md), [project_container_format.md](specs/containers/project_container_format.md), [provenance_and_enclave_drm.md](specs/security/provenance_and_enclave_drm.md), [watermarking_and_marketplace.md](specs/security/watermarking_and_marketplace.md), [rust_sdk.md](specs/sdks/rust_sdk.md), [typescript_sdk.md](specs/sdks/typescript_sdk.md) | `r[container.dnam.*]`, `r[container.proj.*]`, `r[sec.*]`, `r[sdk.rust.*]`, `r[sdk.ts.*]` | [spec_template.md](templates/spec_template.md) |
-| **Layer 3: ADRs (`docs/adr/`)** | [ADR-0001](adr/0001-superseded-tri-physics-prototype.md) .. [ADR-0022](adr/0022-sona-state-space-operator-and-webgpu-architecture.md) | `ADR-0001`–`ADR-0022` | [adr_template.md](templates/adr_template.md) |
+| **Layer 3: ADRs (`docs/adr/`)** | [ADR-0001](adr/0001-superseded-tri-physics-prototype.md) .. [ADR-0025](adr/0025-unified-runtime-and-non-causal-trainer-attention.md) | `ADR-0001`–`ADR-0025` | [adr_template.md](templates/adr_template.md) |
 
 ---
 

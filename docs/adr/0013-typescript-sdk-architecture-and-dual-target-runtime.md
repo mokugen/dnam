@@ -97,4 +97,5 @@ We establish the **`@dnam-project/dnam` TypeScript 7 SDK architecture** ([`../sp
 
 - **2026-11-20T02:07:00-05:00:** Amended to support bare `.dnam-bin` VM images and zero-WASM-bloat browser WebGPU training while retiring special-case Freeze APIs (`ADR-0020`, `ADR-0022`).
 - **2026-11-20T23:02:00-05:00:** Amended to align schema codecs, Tardos exclusion sets, and L1D working-set budgets with the pure stereo VM boundary and operator-neutral model sections (`ADR-0022`).
+- **2026-11-27T14:00:00Z:** Amended for `SONA v4.0` schema/container alignment and to decouple desktop-only browser trainer worker limits (`<= 1–2 GiB` WebGPU / `<= 512 MiB` CPU WASM fallback with OPFS-cached `Perceiver IO` warm-starter under amended `REQ-4.3`) while keeping `<= 128 MiB` storage bindings and lean `AudioWorklet` runtime under `REQ-6.1` ([`ADR-0024`](0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [`ADR-0025`](0025-unified-runtime-and-non-causal-trainer-attention.md)).
 
