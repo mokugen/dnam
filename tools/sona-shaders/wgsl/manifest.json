@@ -5,7 +5,7 @@
     {
       "name": "prescreen_population",
       "wgsl_path": "prescreen_population.wgsl",
-      "sha256": "7a8680419939d829ea68edaf6b5c3ca04a4bcd5a0df8d6bbbac4f9a7ae08642b",
+      "sha256": "4326877d04eb6303c3205d3aa96fedbe9b45a8ec0aefd0fe996aacee166780fa",
       "workgroup_sram_bytes": 8192,
       "bindings": [
         {
@@ -38,7 +38,7 @@
     {
       "name": "fused_core_scan_256",
       "wgsl_path": "fused_core_scan_256.wgsl",
-      "sha256": "36f36ae66ba7e799e90dd497ef2f733feb5a9fc07748fa34122a39fa610106c3",
+      "sha256": "d68af1bb8d2e2620bdb80ac4a5e3b106d206c37809123ca5150d81b2e1b89b4e",
       "workgroup_sram_bytes": 15360,
       "bindings": [
         {
@@ -71,7 +71,7 @@
     {
       "name": "adjoint_scan_256",
       "wgsl_path": "adjoint_scan_256.wgsl",
-      "sha256": "53d6a3f4eefae02008955395ca508ee2c9b9e50c7aa01f5d4f214c7377deaafe",
+      "sha256": "02291a335d5434b85003d4f53cc390179d7cae88236017201a89d1c5edb810ee",
       "workgroup_sram_bytes": 14848,
       "bindings": [
         {
@@ -278,7 +278,7 @@
     {
       "name": "prescreen_population",
       "wgsl_path": "subgroups/prescreen_population.wgsl",
-      "sha256": "7e9f5e37829dbfb117217ea778d0bbf6ebba7a5704a36099a0832badcecc34d7",
+      "sha256": "257055978b7650a467d1a189a16a333ca0936cb4fa6a42a563a0bd4b796455ff",
       "workgroup_sram_bytes": 8192,
       "bindings": [
         {
@@ -311,7 +311,7 @@
     {
       "name": "fused_core_scan_256",
       "wgsl_path": "subgroups/fused_core_scan_256.wgsl",
-      "sha256": "36f36ae66ba7e799e90dd497ef2f733feb5a9fc07748fa34122a39fa610106c3",
+      "sha256": "d68af1bb8d2e2620bdb80ac4a5e3b106d206c37809123ca5150d81b2e1b89b4e",
       "workgroup_sram_bytes": 15360,
       "bindings": [
         {
@@ -344,7 +344,7 @@
     {
       "name": "adjoint_scan_256",
       "wgsl_path": "subgroups/adjoint_scan_256.wgsl",
-      "sha256": "ba35999133e7f50afaf8b314cd932f94ff3bc0c9723d48c519bf83ba2787c0af",
+      "sha256": "d756a94329b85d9fe8186542bf7a929aafb2681ae166224b683cf334be70507c",
       "workgroup_sram_bytes": 14848,
       "bindings": [
         {
