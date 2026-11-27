@@ -15,7 +15,11 @@ specs:
   - ../specs/dsp/router_and_crossbar_topology.md
   - ../specs/dsp/parametric_control_bus.md
   - ../specs/training/control_space_audit.md
+  - ../specs/training/capture_and_alignment.md
+  - ../specs/training/iterative_resume_and_caching.md
+  - ../specs/training/webgpu_and_varpro_solver.md
   - ../specs/containers/dnam_binary_format.md
+  - ../specs/containers/project_container_format.md
   - ../specs/security/watermarking_and_marketplace.md
   - ../specs/sdks/rust_sdk.md
   - ../specs/sdks/typescript_sdk.md

@@ -12,7 +12,7 @@
 1. **Zero Stalls in Real-Time Loops (`REQ-6.2`, `REQ-6.3`):** Avoid `FDIV`, `FSQRT`, `IDIV`/`DIV`, `libm` (`fmodf`), unbounded loops, heap allocs, locks, or uncached syscalls in `48 kHz`/`3 kHz` loops; see [`op_n_paralru_and_polyadaa.md`](docs/specs/dsp/op_n_paralru_and_polyadaa.md), [`op_m_modal_kautz.md`](docs/specs/dsp/op_m_modal_kautz.md), and [`op_t_transport.md`](docs/specs/dsp/op_t_transport.md).
 2. **Unconditional BIBO, Lyapunov, $\mathcal{H}_2$ & Zero-DC Stability:** Enforce [`control_space_audit.md`](docs/specs/training/control_space_audit.md) bounds across `SONA` crossbar, core, cabinet, and tank (`TPT-SVF`, `ParaLRU`, `PolyADAA1`, `Kautz`, `Op-T`).
 3. **Non-Stop 3-Phase Control Clamping:** Clamp unobserved ranges, switches, and corners via `ControlBus` per [`parametric_control_bus.md`](docs/specs/dsp/parametric_control_bus.md) across `WebGPU` + CPU `VarPro`.
-4. **Fail-Fast `64B`-Aligned `zerocopy` `v3.0` Containers:** Validate `v3.0` `"sona"` `.dnam`/`.dnam-proj` via `zerocopy` wire structs, `Ed25519`, and `uplo='U'` per [`dnam_binary_format.md`](docs/specs/containers/dnam_binary_format.md) and [`project_container_format.md`](docs/specs/containers/project_container_format.md).
+4. **Fail-Fast `64B`-Aligned `zerocopy` `v4.0` Containers:** Validate `v4.0` `"sona"` `.dnam`/`.dnam-proj` via `zerocopy` wire structs, `Ed25519`, and `uplo='U'` per [`dnam_binary_format.md`](docs/specs/containers/dnam_binary_format.md) and [`project_container_format.md`](docs/specs/containers/project_container_format.md).
 
 ## 3. Progressive Disclosure & Codebase Discovery Map
 

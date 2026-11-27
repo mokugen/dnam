@@ -208,7 +208,7 @@ At the Top-of-Frame Crossbar, continuous pre-core conditioning executes `Op-N[Pr
 
 | Region / Offset | Bytes | Fields & Types | Clamped Domain, Zero-Init & Control-Bus Invariant |
 | :--- | :---: | :--- | :--- |
-| Crossbar Wire 180..192 | 12 | `gamma_bc: f32le`, `zoh_hold_depth: f32le`, `beta_q: f32le` | Base wire `[0.0, 1.0]`, `[0.0, 0.9999]`, `[0.0, 16.0]` (log2 bit-depth above 0; 0 = bypass); slots 26..28 |
+| Crossbar Wire 180..192 | 12 | `gamma_bc: f32le`, `zoh_hold_depth: f32le`, `beta_q: u16le`, `kappa_h: u16le` | Base wire `[0.0, 1.0]`, `[0.0, 0.9999]` / `log2_rho_zoh`, `[0.0, 16.0]` `fp16` (0 = bypass), and hold sharpness `kappa_h` in `[0.0, 1.0]` `fp16`; slots 26..28 |
 | Active-Hot State 0..16 | 16 | `held: f32[2]`, `phase_q32: u32`, `inc_q32: u32` | `OpNPreHotState` prefix: unclipped L/R ZOH latch states plus 32-bit `Q0.32` ZOH accumulator and increment |
 | Active-Hot State 16..28+ | 12+ | `gamma_bc: f32`, `beta_q: f32`, `zoh_hold_depth_eff: f32`, `s_q`, `kappa_h` | Effective wet blend `[0.0, 1.0]`, hoisted log2 scale `[0.0, 16.0]`, ZOH hold depth `[0.0, 0.9999]`, quantizer sharpness `s_q`, and hold sharpness `kappa_h` |
 

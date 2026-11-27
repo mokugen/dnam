@@ -2,7 +2,7 @@
 id: spec.container.proj
 title: "Single-File Cloud-Ready Project & Capture Vault Container (.dnam-proj / DNPJ)"
 status: canonical
-version: "3.0.0"
+version: "4.0.0"
 domain: containers
 rule_prefixes:
   - "r[container.proj."
@@ -17,13 +17,14 @@ requirements:
 adrs:
   - ADR-0020
   - ADR-0022
+  - ADR-0024
 ---
 
 # Single-File Cloud-Ready Project & Capture Vault Container (`.dnam-proj` / `DNPJ`)
 
-This specification defines the `.dnam-proj` (`"DNPJ"`, v3.0, `"architecture": "sona"`) Project & Capture Vault Binary Format using packed little-endian 64 B-aligned binary records.
+This specification defines the `.dnam-proj` (`"DNPJ"`, v4.0, `"architecture": "sona"`) Project & Capture Vault Binary Format using packed little-endian 64 B-aligned binary records.
 
-It pairs with [dnam_binary_format.md](dnam_binary_format.md) and `DNWB` white-box pipe headers (64-byte `DNWB` Header, wire framing version 1) to fulfill [REQ-3.1–REQ-3.3, REQ-5.3, REQ-8.1, REQ-8.2, REQ-8.8](../../requirements/system_goals_and_requirements.md), [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md), and [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md).
+It pairs with [dnam_binary_format.md](dnam_binary_format.md) and `DNWB` white-box pipe headers (64-byte `DNWB` Header, wire framing version 1) to fulfill [REQ-3.1–REQ-3.3, REQ-5.3, REQ-8.1, REQ-8.2, REQ-8.8](../../requirements/system_goals_and_requirements.md), [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), and [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md).
 
 ---
 
@@ -42,10 +43,10 @@ stateDiagram-v2
 
 ```text
 +===================================================================================================+
-| .dnam-proj ("DNPJ", v3.0, "sona") FRONT-LOADED 64-BYTE-ALIGNED BINARY LAYOUT                      |
+| .dnam-proj ("DNPJ", v4.0, "sona") FRONT-LOADED 64-BYTE-ALIGNED BINARY LAYOUT                      |
 +===================================================================================================+
 | [0 .. 64)                  Project Container Preamble (64 B, 64-byte aligned, little-endian)        |
-|   [0..4]    magic = "DNPJ"            | [4..6]   version_major = 3 (u16le)| [6..8] version_minor=0|
+|   [0..4]    magic = "DNPJ"            | [4..6]   version_major = 4 (u16le)| [6..8] version_minor=0|
 |   [8..12]   lifecycle_flags (u32le)   | [12..16] chunk_count (N, u32le)   | [16..24] chunk_dir_off|
 |   [24..32]  manifest_offset (u64le)   | [32..40] manifest_len (u64le)     | [40..44] header_crc32c|
 |   [44..64]  reserved = 20 zero bytes  |                                                           |
@@ -63,7 +64,7 @@ stateDiagram-v2
 |   • INPC (640 B INPC Header + fp32)    Shared 2.0-2.5 s (96k-120k) full-bandwidth fp32 dry capsule|
 |   • STMC (128 B STMC Header + fp32)    128 B hdr + R<=36 16 B Trajectory Windows + 4096 B + fp32  |
 |   • STAT (cached trajectories + uploU) StarCenter SONA trajectories + f64 uplo='U' fixed Gram     |
-|   • WGHT (canonical v3.0 .dnam bytes)  "sona" .dnam wrapper around embedded .dnam-bin VM (< 0.2 ms)|
+|   • WGHT (canonical v4.0 .dnam bytes)  "sona" .dnam wrapper around embedded .dnam-bin VM (< 0.2 ms)|
 |   • AUTH (128 B AUTH Record)           Creator signature ("DNPJ-PROJECT-MANIFEST-V3")             |
 +===================================================================================================+
 ```
@@ -72,9 +73,9 @@ stateDiagram-v2
 
 `r[container.proj.preamble-and-directory]`
 
-Every v3.0 `.dnam-proj` container is a declarative, code-execution-free binary file (REQ-8.8) parsed from fixed little-endian binary records with strict bounds validation.
+Every v4.0 `.dnam-proj` container is a declarative, code-execution-free binary file (REQ-8.8) parsed from fixed little-endian binary records with strict bounds validation.
 
-Parsing begins with the 64-byte Project Container Preamble at byte 0 (`magic = "DNPJ"`, `version_major = 3`, `version_minor = 0`), rejecting any mismatched version fail-fast with `UnsupportedVersion`.
+Parsing begins with the 64-byte Project Container Preamble at byte 0 (`magic = "DNPJ"`, `version_major = 4`, `version_minor = 0`), rejecting any mismatched version fail-fast with `UnsupportedVersion`.
 
 To enable single-request cloud inspection via HTTP Range (`bytes=0-65535`), `chunk_dir_offset` must equal 64 and `manifest_offset` must equal `64 + 64 * chunk_count`. Cloud clients issue a single range read to inspect all project metadata and chunk SHA-256 digests in one round-trip, issuing a second exact range read to `align64(manifest_offset + manifest_len)` only when the manifest exceeds 64 KB.
 
@@ -89,7 +90,7 @@ Every chunk payload must also satisfy matching CRC-32C and SHA-256 digests over 
 | Offset | Bytes | LE Wire Type | Field Name | Clean-Room Validation Invariant |
 | :---: | :---: | :--- | :--- | :--- |
 | 0..4 | 4 | `u8[4]` | `magic` | Exact `"DNPJ"` |
-| 4..6 | 2 | `u16le` | `version_major` | Must equal 3 |
+| 4..6 | 2 | `u16le` | `version_major` | Must equal 4 |
 | 6..8 | 2 | `u16le` | `version_minor` | Must equal 0 |
 | 8..12 | 4 | `u32le` | `lifecycle_flags` | `PROJ_FLAG_*`: `1<<0` `HAS_CALIBRATION`, `1<<1` `HAS_RAW_STEMS`, `1<<2` `HAS_CAPSULES`, `1<<3` `HAS_STAT`, `1<<4` `HAS_WGHT`, `1<<5` `HAS_AUTH`, `1<<6` `STEREO_OUT`, `1<<7` `COMPACTED_CAPSULES` (`KNOWN_MASK = 0x00FF`) |
 | 12..16 | 4 | `u32le` | `chunk_count` | Number of 64 B TOC records `N` (0–4,096 = `MAX_PROJ_CHUNKS`) |
@@ -116,7 +117,7 @@ Every chunk payload must also satisfy matching CRC-32C and SHA-256 digests over 
 | Chunk | Offset | Bytes | LE Wire Type | Field & Invariant |
 | :--- | :---: | :---: | :--- | :--- |
 | `CALB` (64 B) | 0..4 | 4 | `u8[4]` | `magic`: ASCII `"CALB"` |
-| `CALB` | 4..6 | 2 | `u16le` | `version`: Must equal 3 |
+| `CALB` | 4..6 | 2 | `u16le` | `version`: Must equal 4 |
 | `CALB` | 6..7 | 1 | `u8` | `bit_depth_code`: 0=Int12, 1=Int16, 2=Int24, 3=Int32, 4=Float32 (> 4 rejected) |
 | `CALB` | 7..8 | 1 | `u8` | `polarity_inverted`: 0 or 1 (> 1 rejected) |
 | `CALB` | 8..12 | 4 | `u32le` | `sample_rate_device_hz`: 8,000–384,000 |
@@ -161,10 +162,10 @@ The manifest slice at `[manifest_offset .. manifest_offset + manifest_len)` stor
 
 | Manifest Section | Required Fields | Normative Invariant |
 | :--- | :--- | :--- |
-| Envelope & Nested `base` Header | `version = "3.0.0"`, `container_kind = "dnam-proj"`, `base` (v3.0 JSON header with `base.container_kind = "dnam"`, `base.architecture = "sona"`) | Shares the exact validated v3.0 `"sona"` JSON header schema (`ref[container.dnam.jcs-header-schema]`). |
-| `project_meta`, `rig_routing` & `calibration_summary` | `project_meta.{project_id, rig_notes, updated_at}`, `rig_routing.{sample_rate_device_hz, bit_depth, input_channels, output_channels, reamp_send_channel}`, `calibration_summary` | Tracks project identity, native hardware rate (8..384 kHz), bit depth (`int12`, `int16`, `int24`, `int32`, `float32`), and 64-byte `CALB` v3 telemetry. |
+| Envelope & Nested `base` Header | `version = "4.0.0"`, `container_kind = "dnam-proj"`, `base` (v4.0 JSON header with `base.container_kind = "dnam"`, `base.architecture = "sona"`) | Shares the exact validated v4.0 `"sona"` JSON header schema (`ref[container.dnam.jcs-header-schema]`). |
+| `project_meta`, `rig_routing` & `calibration_summary` | `project_meta.{project_id, rig_notes, updated_at}`, `rig_routing.{sample_rate_device_hz, bit_depth, input_channels, output_channels, reamp_send_channel}`, `calibration_summary` | Tracks project identity, native hardware rate (8..384 kHz), bit depth (`int12`, `int16`, `int24`, `int32`, `float32`), and 64-byte `CALB` v4 telemetry. |
 | `stems_registry` | Ordered `StemRegistryEntry` list (`stem_id`, `chunk_id`, `enabled`, `is_star_center`, `controls_meta`, `provenance`, `user_metadata`, `extracted_physics`) | Binds each stem's `chunk_id` (`u16` `STMC` `stem_index`), SHA-256 dry/wet `<f4` PCM provenance, and `DNAM-GRAM-INPUT-V3` fingerprint (REQ-3.2); optional `extracted_physics` carries the 12 physical descriptor fields defined below under strict unknown-key rejection. |
-| `audit_report` & `solver_telemetry` | `audit_report` (`AuditReport`), `solver_telemetry.{active_stem_count, total_solve_ms, tier_esr_db}` | Persists Phase-1 control-space audit clamps, deterministic `[PANAMA]` corner recommendations inside `audit_report.prescriptions` (zero manifest key additions), and 4-tier ESR certification metrics across incremental vault edits. |
+| `audit_report` & `solver_telemetry` | `audit_report` (`AuditReport`), `solver_telemetry.{active_stem_count, total_solve_ms, tier_esr_db}` | Persists `O(P+M)` convex-hull BIBO clamps, deterministic 54-D `NW-PANAMA` corner recommendations inside `audit_report.prescriptions` (zero manifest key additions), and 4-tier ESR certification metrics across incremental vault edits. |
 
 Under `stems_registry[*].extracted_physics`, strict JCS schema decoding retains `delays_ms`, `lfo_freqs_hz`, and `decay_gains_lin` (number arrays, empty default), `detected_grain_size_ms` and `detected_pitch_shift_semitones` (numbers, 0.0 default), and adds seven optional defaulting capture fields:
 
@@ -189,7 +190,7 @@ Trained and signed containers add `HAS_STAT`, `HAS_WGHT`, and `HAS_AUTH` to trac
 | Lifecycle State | Embedded Chunks | Key Behavioral Invariant |
 | :--- | :--- | :--- |
 | Active Capture | `CALB` + `SPCM` + `INPC`/`STMC` | Retains lossless raw `SPCM` stems (spanning full 8.0–12.0 s StarCenter 4-regime sequences for Pass 1 physics identification) alongside extracted condensed `INPC`/`STMC` capsules |
-| Trained Full Project | `+ STAT + WGHT` (+ optional `AUTH`) | Embeds `StarCenter` `uplo='U'` sufficient statistics (`STAT`) and certified 4-tier v3.0 `.dnam` weights (`WGHT`, wrapping the compiled `.dnam-bin` `"DNBN"` register program) |
+| Trained Full Project | `+ STAT + WGHT` (+ optional `AUTH`) | Embeds `StarCenter` `uplo='U'` sufficient statistics (`STAT`) and certified 4-tier v4.0 `.dnam` weights (`WGHT`, wrapping the compiled `.dnam-bin` `"DNBN"` register program) |
 | Capsule Compaction | Strips `SPCM`, keeps `INPC`/`STMC`/`STAT`/`WGHT` | Requires condensed `INPC`/`STMC` whenever `stems_registry` is non-empty; preserves `PROJ_FLAG_COMPACTED_CAPSULES` across capsule edits and shrinks 16-stem stereo captures to <= 16.4 MB of capsules (~16.7 MB / <= 16.0 MiB full `.dnam-proj` with `STAT` and `WGHT`, under < 20 MB REQ-3.3) |
 
 ---
@@ -205,7 +206,7 @@ The `INPC` chunk (`chunk_id = 0`) stores the shared 2.0–2.5 s (96,000–120,00
 | Offset | Bytes | LE Wire Type | Field Name | Clean-Room Invariant |
 | :---: | :---: | :--- | :--- | :--- |
 | 0..4 | 4 | `u8[4]` | `magic` | Exact `"INPC"` |
-| 4..6 | 2 | `u16le` | `version` | Must equal 3 |
+| 4..6 | 2 | `u16le` | `version` | Must equal 4 |
 | 6..8 | 2 | `u16le` | `channels` | 1 (mono) or 2 (stereo) |
 | 8..12 | 4 | `u32le` | `sample_rate_hz` | Must equal 48,000 |
 | 12..16 | 4 | `u32le` | `num_frames` | Coreset frame count (96,000–120,000, divisible by 16) |
@@ -229,7 +230,7 @@ Each stem s in `stems_registry` owns a dedicated STMC chunk (`chunk_id == stem_i
 | Offset | Bytes | LE Wire Type | Field Name | Clean-Room Invariant |
 | :---: | :---: | :--- | :--- | :--- |
 | 0..4 | 4 | `u8[4]` | `magic` | Exact `"STMC"` |
-| 4..6 | 2 | `u16le` | `version` | Must equal 3 |
+| 4..6 | 2 | `u16le` | `version` | Must equal 4 |
 | 6..8 | 2 | `u16le` | `stem_index` | Matches `stems_registry[*].chunk_id` |
 | 8..10 | 2 | `u16le` | `flags` | `1<<0 ENABLED`, `1<<1 STAR_CENTER`, `1<<2 MODE_A_SWEEP`, `1<<3 STEREO`, `1<<4 WET_POLARITY_INVERTED` (`KNOWN_MASK = 0x001F`) |
 | 10..12 | 2 | `u16le` | `n_windows` | Active trajectory window count `R` (1–36 = `STMC_MAX_TRAJECTORY_WINDOWS`) |
@@ -281,7 +282,7 @@ At active tier readout dimension $D_T$ (fixed per tier), `STAT` packs $D_T(D_T +
 
 `r[container.proj.wght-and-export]`
 
-Every trained v3.0 `.dnam-proj` embeds a complete, self-contained v3.0 (`"architecture": "sona"`) `.dnam` byte stream inside its `WGHT` chunk (`chunk_id = 0`), wrapping the compiled Layer 0 `.dnam-bin` (`"DNBN"`) VM register image together with the shell JCS header, security tables, and mutable trailer footer; see [dnam_binary_format.md](dnam_binary_format.md).
+Every trained v4.0 `.dnam-proj` embeds a complete, self-contained v4.0 (`"architecture": "sona"`) `.dnam` byte stream inside its `WGHT` chunk (`chunk_id = 0`), wrapping the compiled Layer 0 `.dnam-bin` (`"DNBN"`) VM register image together with the shell JCS header, security tables, and mutable trailer footer; see [dnam_binary_format.md](dnam_binary_format.md).
 
 Container assembly and validation enforce `[STAB-ZERO-DC]` invariants across Arena 0..3 (`b_head == 0.0`, resting DC <= 1e-5), rejecting non-zero DC bias payloads immediately.
 
@@ -289,7 +290,7 @@ Runtime `.dnam` export completes in < 0.2 ms at any target tier (Lite, Full, Pro
 
 Export validates `DistributionPolicy` and merges mutable `presets`, `user_metadata`, `stem_user_metadata`, and `controls_schema[*].user_metadata` into the `DMU1` suffix, growing compact 48 B frames up to the 4,096 B mutable `DMU1` + `DMUE` trailer ceiling.
 
-Export then applies lossless keyless prefix truncation (`ref[container.dnam.tier-prefix]`), slicing both the shell prefix and the embedded `.dnam-bin` payload at its immutable `tier_end_offsets[t]` while retaining self-contained 1×-calibrated Arena 0 controls and Lite `CP1`/`W_readout` slices without re-signing.
+Export then applies lossless keyless prefix truncation (`ref[container.dnam.tier-prefix]`), slicing both the shell prefix and the embedded `.dnam-bin` payload at its immutable `tier_end_offsets[t]`. This preserves self-contained 2×-calibrated 15-tap HB-FIR Arena 0 controls, 2,048 B Arena 0 `control_bus_lite` `GRA`, retained half-precision `W_ro_head`, and Lite `CP1` slices without re-signing.
 
 ### 3.2 Cryptographic Provenance Envelope (`AUTH`)
 
@@ -300,7 +301,7 @@ When signed (`PROJ_FLAG_HAS_AUTH`), the `AUTH` chunk (`chunk_id = 0`) stores an 
 | Offset / Segment | Bytes | LE Wire Type | Field & Signing Transcript |
 | :--- | :---: | :--- | :--- |
 | `AUTH` 0..4 | 4 | `u8[4]` | `magic`: Exact `"AUTH"` |
-| `AUTH` 4..6 | 2 | `u16le` | `version`: Must equal 3 |
+| `AUTH` 4..6 | 2 | `u16le` | `version`: Must equal 4 |
 | `AUTH` 6..32 | 26 | `u8[26]` | `reserved`: All 26 bytes must equal `0x00` |
 | `AUTH` 32..64 | 32 | `u8[32]` | `signer_pubkey_ed25519`: Creator Ed25519 verifying public key |
 | `AUTH` 64..128 | 64 | `u8[64]` | `signature_ed25519`: Ed25519 signature over concatenated `encode_domain_field` tuples below |

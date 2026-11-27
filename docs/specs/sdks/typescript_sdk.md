@@ -2,7 +2,7 @@
 id: spec.sdks.typescript
 title: "TypeScript SDK (@dnam-project/dnam): Idiomatic TypeScript 7 Interface, Dual-Target N-API v10 + WASM SIMD128 Runtime, WebGPU Trainer & WebAudio Contract"
 status: canonical
-version: "3.0.0"
+version: "4.0.0"
 domain: sdks
 rule_prefixes:
   - "r[sdk.ts."
@@ -19,6 +19,7 @@ requirements:
   - REQ-7.1
   - REQ-7.4
   - REQ-8.1
+  - REQ-8.5
   - REQ-8.7
   - REQ-8.8
 adrs:
@@ -28,13 +29,15 @@ adrs:
   - ADR-0018
   - ADR-0019
   - ADR-0022
+  - ADR-0024
+  - ADR-0025
 ---
 
 # TypeScript SDK (`@dnam-project/dnam`): Idiomatic TypeScript 7 Interface, Dual-Target N-API v10 + WASM SIMD128 Runtime, WebGPU Trainer & WebAudio Contract
 
-This specification defines the normative architecture, feature-module layout, TypeScript 7 typing and Biome hygiene rules, dual-target N-API v10 plus WebAssembly SIMD128 runtime invariants, browser WebGPU trainer driver, WebAudio `AudioWorklet` bridge, and native behavioral parity contracts for `@dnam-project/dnam` ([JavaScript SDK README](../../../packages/js/README.md)).
+This specification defines the normative architecture, feature-module layout, TypeScript 7 typing and Biome hygiene rules, dual-target N-API v10 plus WebAssembly SIMD128 runtime invariants, WebGPU trainer driver, WebAudio `AudioWorklet` bridge, and native behavioral parity contracts for `@dnam-project/dnam` ([JavaScript SDK README](../../../packages/js/README.md)).
 
-The TypeScript SDK consumes the native runtime engine and shared mathematical kernels defined in the [Rust Implementation Specification](rust_sdk.md) for SONA v3.0 ([SONA architecture](../architecture/sona_architecture.md)). Design rationales and concurrency trade-offs appear in [`ADR-0013`](../../adr/0013-typescript-sdk-architecture-and-dual-target-runtime.md), [`ADR-0015`](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md), and [`ADR-0022`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md).
+The TypeScript SDK consumes the native runtime engine and shared mathematical kernels defined in the [Rust Implementation Specification](rust_sdk.md) for SONA v4.0 ([SONA architecture](../architecture/sona_architecture.md)). Design rationales and concurrency trade-offs appear in [`ADR-0013`](../../adr/0013-typescript-sdk-architecture-and-dual-target-runtime.md), [`ADR-0015`](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md), [`ADR-0022`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [`ADR-0024`](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), and [`ADR-0025`](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md).
 
 ---
 
@@ -53,11 +56,11 @@ flowchart LR
         Mod["model/: Model, .dnam-bin VM loader/inspector, GramMatrix"]
         Eng["engine/: Engine, process, render, stream, bypass scopes"]
         Par["parameters/ & tempo/: Parameter, ControlSpace, clampParameters, Tempo, Subdivisions"]
-        Sch["schema/: Pure TS Interfaces, v3.0 sona camelCase Codec, Native Schema + JCS"]
+        Sch["schema/: Pure TS Interfaces, v4.0 sona camelCase Codec, Native Schema + JCS"]
         Prov["provenance/: verify, sign, seal/unseal, dau1, preview, watermark"]
-        Dsp["dsp/: SONA Reference Kernels (transport, modal, tpt-svf, paralru, polyadaa, control-bus, mixing)"]
+        Dsp["dsp/: SONA v4.0 Reference Kernels (transport, modal, tpt-svf, paralru, algadaa1, gra-bus, mixing)"]
         Web["web-audio/: DnamAudioNode, AudioWorkletProcessor, SAB + Atomics"]
-        Gpu["trainer/: Browser navigator.gpu .wgsl Driver (<= 128 MiB, < 256 MiB) + WasmSimd128 Fallback"]
+        Gpu["trainer/: Desktop/Worker WebGPU .wgsl Driver (<= 128 MiB/bind, <= 1.5 GiB WebGPU / <= 512 MiB WASM) + Fallback"]
         Int["internal/native/: NativeDriver, NapiDriver, WasmDriver (Private)"]
     end
 
@@ -144,7 +147,7 @@ Worklet runtime modules `src/web-audio/processor.ts` and `src/web-audio/shared-s
 
 `r[sdk.ts.api.resources-and-data]`
 
-The public API separates explicit-lifetime native wrappers from deeply frozen plain objects. `@dnam-project/dnam` targets strictly the v3.0 (`"architecture": "sona"`, `version_major = 3`, `version_minor = 0`) container and DSP schema:
+The public API separates explicit-lifetime native wrappers from deeply frozen plain objects. `@dnam-project/dnam` targets strictly the v4.0 (`"architecture": "sona"`, `version_major = 4`, `version_minor = 0`) container and DSP schema:
 
 | Category | Public Types / Classes | Ownership & Immutability Contract |
 | :--- | :--- | :--- |
@@ -240,7 +243,7 @@ Every native runtime error maps exhaustively from the native engine error taxono
 
 `packages/js/src/` and its thin native binding glue must never reimplement any algorithm, validation rule, or domain constant already owned by the native engine and shared kernels ([Rust Implementation Specification](rust_sdk.md), `ref[sdk.rust.shared-nostd-kernels]`).
 
-All DSP, ZOH rescaling (`ref[dsp.zoh.ctrl-stride]`), 3-Phase control clamping, Lobatto calibration inversion, preset loading, tempo sync, and v3.0 `"sona"` header validation execute in compiled native code via the unified runtime seam.
+All DSP, ZOH rescaling (`ref[dsp.zoh.ctrl-stride]`), 3-Phase control clamping, Lobatto calibration inversion, preset loading, tempo sync, and v4.0 `"sona"` header validation execute in compiled native code via the unified runtime seam.
 
 RFC 8785 JCS canonicalization, immutable-header projection (`ref[sec.jcs.immutable-header-digest]`), and creator or marketplace tier-prefix signing (`ref[sec.sig.prefix-delegation]`) likewise execute natively. The TypeScript layer handles only idiomatic API ergonomics, camelCase/snake_case key translation, input coercion, WebGPU `.wgsl` dispatch orchestration (§4.5), and handle lifecycle management.
 
@@ -292,26 +295,26 @@ On hardware SIMD backends (`neon`, `x86-simd`, `wasm-simd128`), `NapiDriver` mat
 
 ## 4. Schema Codec, Containers, Provenance, DSP, WebAudio Worklet & WebGPU Trainer
 
-### 4.1 Bijective CamelCase v3.0 `"sona"` Schema Codec & RFC 8785 JCS Parity
+### 4.1 Bijective CamelCase v4.0 `"sona"` Schema Codec & RFC 8785 JCS Parity
 
 `r[sdk.ts.schema.camel-case-codec-parity]`
 
-`@dnam-project/dnam/schema` provides pure `readonly` TypeScript interfaces with zero runtime JS dependencies for every v3.0 `"sona"` schema object and union defined in [dnam_binary_format.md](../containers/dnam_binary_format.md).
+`@dnam-project/dnam/schema` provides pure `readonly` TypeScript interfaces with zero runtime JS dependencies for every v4.0 `"sona"` schema object and union defined in [dnam_binary_format.md](../containers/dnam_binary_format.md).
 
 Mirrored definitions cover header metadata, I/O capabilities, slimmable tier profiles, operator topology, delay histories, tensor slices, controls, presets, and cryptographic provenance:
 
 | Canonical Wire Schema ([dnam_binary_format.md](../containers/dnam_binary_format.md)) | `@dnam-project/dnam/schema` TypeScript Interface | Schema Domain |
 | :--- | :--- | :--- |
-| Layer 0 `.dnam-bin` VM preamble (`"DNBN"` / `"DBRM"` / `"TSYN"`) | `DnamBinHeader`, `DnamBinRuntimeMeta`, `TempoSyncEntry` | Fixed-VM binary header, active-hot metadata, and tempo-sync calibration table |
-| Top-level header & `metadata` (`"3.0.0"`, `"sona"`, 48000 Hz, `"dnam" \| "preview"`) | `ModelHeader`, `ModelMetadata` | Discriminants (`"3.0.0"`, `"sona"`, 48000 Hz, `"dnam" \| "preview"`), identity, and attribution |
-| `io_config`, `capabilities`, `leveling`, `slimmable_tiers` | `IoConfig`, `ModelCapabilities`, `LevelingConfig`, `SlimmableTiersConfig`, `TierProfile` | Channel topology, capabilities (without dedicated freeze flags), auto-unity leveling, and per-tier arena profiles |
-| `crossbar_and_sensory`, `modal_convolver`, `transport`, `linear_readout`, `control_bus` | `CrossbarSensoryConfig`, `ModalConvolverConfig`, `TransportConfig`, `LinearReadoutConfig`, `ControlBusConfig` | `SensoryQuad`, `ModalConvolver` (`ro_pole_48k` optional), `Transport`, `LinearReadout`, and 3 kHz control bus configurations |
+| Layer 0 `.dnam-bin` VM preamble (`"DNBN"` / `"DBRM"` / `"TSYN"`, `cext_len == 0`) | `DnamBinHeader`, `DnamBinRuntimeMeta`, `TempoSyncEntry` | Fixed-VM binary header, active-hot metadata (`128 <= shared_controls <= TSYN <= arena0_offset`), and tempo-sync `subdivision_override` table |
+| Top-level header & `metadata` (`"4.0.0"`, `"sona"`, 48000 Hz, `"dnam" \| "preview"`) | `ModelHeader`, `ModelMetadata` | Discriminants (`"4.0.0"`, `"sona"`, 48000 Hz, `"dnam" \| "preview"`), identity, and attribution |
+| `io_config`, `capabilities`, `leveling`, `slimmable_tiers` | `IoConfig`, `ModelCapabilities`, `LevelingConfig`, `SlimmableTiersConfig`, `TierProfile` | Channel topology, capabilities (without dedicated freeze flags), auto-unity leveling, and per-tier arena profiles (`[1,1,1,1]..[3,3,2,2]`) |
+| `crossbar_and_sensory`, `modal_convolver`, `transport`, `linear_readout`, `control_bus` | `CrossbarSensoryConfig`, `ModalConvolverConfig`, `TransportConfig`, `LinearReadoutConfig`, `ControlBusConfig` | `SensoryQuad` (Log-Knee VCA `[-5.0, +4.0]` octaves), `ModalConvolver` (`ErSparseBank` 8/16, `ro_pole_48k` optional), `Op-T v4` (`V_ceil = 4.0`), split `W_ro_head`, and 3 kHz `GRA` control bus (`K_ctrl = 16`) |
 | `delay_histories`, `tensor_directory`, `controls_schema`, `presets` | `DelayHistoryEntry`, `TensorSliceEntry`, `ParameterDescriptor`, `ParameterCalibration`, `ParameterUiHints`, `Preset` | Delay capacities (`owner: "transport" \| "crossbar"`), 64 B-aligned tensor slices, 10 calibration roles, macro controls, and factory presets |
 | `metadata.signatures`, `authorized_devices`, `royalty_splits`, `distribution_policy`, `provenance` | `ModelSignatures`, `CreatorSignature`, `MarketplaceReceipt`, `AuthorizedDevice`, `RoyaltySplit`, `DistributionPolicy`, `DatasetProvenance`, `OemDeviceCertificate` | Cryptographic provenance, distribution policies, receipts, and OEM device certs |
 
 `decodeHeader(wireJson)` and `encodeHeader(header)` delegate validation and default population directly to the native schema validator ([Rust Implementation Specification](rust_sdk.md)), returning deeply frozen camelCase `ModelHeader` values or canonical snake_case wire JSON.
 
-Decoding any natively emitted v3.0 `"sona"` header (both minimal reference headers and fully populated headers exercising every optional field and union variant) via `decodeHeader` and re-encoding via `encodeHeader` plus `canonicalJson` produces byte-identical UTF-8 output and identical `immutableHeaderSha256` digests.
+Decoding any natively emitted v4.0 `"sona"` header (both minimal reference headers and fully populated headers exercising every optional field and union variant) via `decodeHeader` and re-encoding via `encodeHeader` plus `canonicalJson` produces byte-identical UTF-8 output and identical `immutableHeaderSha256` digests.
 
 `canonicalJson` delegates natively to enforce -0.0 normalization to `"0"`, UTF-16 code-unit sorting, finite checks, and absent/null optional field omission (`ref[sec.jcs.immutable-header-digest]`).
 
@@ -323,11 +326,13 @@ Before hashing, canonicalization performs non-recursive stripping of the seven c
 
 Asynchronous `await Model.load(source)` accepts Node.js paths as well as `URL`, `Response`, `Blob`, `ArrayBuffer`, or `Uint8Array` inputs.
 
-Raw Layer 0 .dnam-bin VM executables load directly via `inspectDnamBin(bytes)`, `Model.fromDnamBin(bytes)`, and `stripDnamBinToTier(bytes, maxTier)`.
+Raw Layer 0 `.dnam-bin` VM executables load directly via `inspectDnamBin(bytes)`, `Model.fromDnamBin(bytes)`, and `stripDnamBinToTier(bytes, maxTier)`.
 
-Together with `Model.from(bytes)`, `Model.reference(options?)`, and `Model.build(header, arenaBytes)`, every factory validates 64 B-aligned v3.0 `.dnam-bin` and `.dnam` containers fail-fast (`ref[container.dnam.load-validation]`, `ref[sdk.rust.zerocopy-wire-structs]`, `REQ-8.8`).
+Together with `Model.from(bytes)`, `Model.reference(options?)`, and `Model.build(header, arenaBytes)`, every factory validates 64 B-aligned v4.0 `.dnam-bin` and `.dnam` containers fail-fast (`ref[container.dnam.load-validation]`, `ref[sdk.rust.zerocopy-wire-structs]`, `REQ-8.8`).
 
-Cumulative SONA v3.0 tier arena boundaries span `[4_608, 7_936, 15_872, 30_720]` B across Lite, Full, Pro, and Ultra. Arena 0 carries 1× Lite weights and self-contained parametric controls, while Arena 1..3 carry 2×-OS incremental deltas; loaders reject invalid major/minor versions or non-`"sona"` / non-`"DNBN"` headers with `"ERR_DNAM_CONTAINER"`.
+Cumulative SONA v4.0 tiers span `[1,1,1,1]`, `[2,2,1,1]`, `[2,2,2,2]`, and `[3,3,2,2]` (5 / 13 / 24 / 37 tiles, 4,432 B Lite 2× active-hot footprint inside 4,608 / 8,192 / 16,384 / 32,768 B L1D ceilings).
+
+Arena 0 carries all-tier 2× 15-tap HB-FIR OS2X Lite weights and self-contained 2,048 B `control_bus_lite` GRA parametric controls (`cext_len == 0`), while Arena 1..3 carry 2× incremental deltas (including Arena 3 `control_bus_ultra_delta` <= 9,280 B cum.); loaders reject invalid versions (`version_major != 4`) or non-"sona" / non-"DNBN" headers with `"ERR_DNAM_CONTAINER"`.
 
 When a `.dnam` container embeds an executable `dbin_prefix`, its Region 4 payload stays 0 B so weights are never duplicated; `model.extractDnamBin()` slices that embedded binary directly, while `stripDnamBinToTier` truncates `.dnam-bin` at `tierEndOffsets[maxTier]` with zero-mutation parity (`REQ-5.6`).
 
@@ -341,7 +346,7 @@ Transform and factory methods include `model.withHeader(updater)` (in-place with
 
 Parameter normalization and clamping enforce the 3-Phase pipeline (`ref[train.audit.phase1.clamp-range]`, `ref[train.audit.phase1.clamp-switch]`, `ref[train.audit.phase1.clamp-stability]`).
 
-`@dnam-project/dnam/tempo` provides `computeZoh(...)`, `controlStride(sampleRate)`, `subdivisionPhase(...)`, and 32-step binary-search `invertTempoCalibration(...)` (`ref[dsp.tempo.physical-inversion]`).
+`@dnam-project/dnam/tempo` provides `computeZoh(...)`, `controlStride(sampleRate)`, `subdivisionPhase(...)`, bare `.dnam-bin` `subdivisionOverride`, and 32-step binary-search `invertTempoCalibration(...)` (`ref[dsp.tempo.physical-inversion]`).
 
 ### 4.3 Marketplace Provenance, Hardware Sealing & Forensic Watermarking
 
@@ -358,9 +363,9 @@ Both `verify` and `unseal` MUST fail closed (`"ERR_DNAM_PROVENANCE"`) whenever a
 | **Verification & Signing** | `verify`, `enforcePolicy`, `immutableHeaderSha256`, `signCreatorHeader`, `signMarketplaceReceipt`, `signDeviceCertificate`, `verifyDeviceCertificate` | `ref[sec.sig.prefix-delegation]`, `ref[sec.drm.oem-certificate]` |
 | **HPKE `.dnam-seal` (`DNSL`) & Envelopes** | `seal`, `unseal` (RFC 9180 HPKE `0x0020` / `0x0001` / `0x0003` + ChaCha20-Poly1305 AEAD), `encodeDau1`, `decodeDau1`, `buildDme1Header`, `parseDme1Plaintext` | `ref[sec.drm.dnsl-public-framing]`, `ref[sec.sig.dau1-envelope]` |
 | **Preview Containment (`.dnam-prev`)** | `computePreviewWindow`, `validatePreviewSwitchOptions`, plus DAW/hardware host rejection of `containerKind === "preview"` on load and hot-swap `reload` | `ref[sec.preview.containment]` |
-| **Buyer Watermarking & Structural Hash** | `applyGaugeWatermark` (`ModalConvolver` Kautz + `SO(4)` + 40-lane `CoreQuad` sign-flip incl. cyclic `GLU`), `generateTardosCode`, `applyTardosWatermark` (5,807-coord Role B across 7,680-coord partition with `2 * fp16_ulp(w)` floor), `scoreTardosWatermark`, `extractStructuralHash`, `structuralCosineSimilarity` | `ref[sec.watermark.reciprocal-gauge]`, `ref[sec.watermark.tardos-code]`, `ref[sec.anticlone.cabinet-fingerprint]` |
+| **Buyer Watermarking & Structural Hash** | `applyGaugeWatermark` (`ModalConvolver` Kautz + `~1e-6` `SO(4)` + `CoreQuad` `rect_sign_mask` / cyclic `GLU` + `W_ro_head_odd` + 5/8/11/13 tiles), `generateTardosCode`, `applyTardosWatermark` (retained `fp16` Role B coordinates under `REQ-8.5` with `2 * fp16_ulp(w)` floor), `scoreTardosWatermark`, `extractStructuralHash` (224-D / `15*M_tier` omitting `dr`), `structuralCosineSimilarity` | `ref[sec.watermark.reciprocal-gauge]`, `ref[sec.watermark.tardos-code]`, `ref[sec.anticlone.cabinet-fingerprint]` |
 
-`applyTardosWatermark` mutates only linear Role B coordinates (`W_readout` and `W_mod` plus linear reserves) in place, leaving DBRM, `shared_controls`, TSYN, CEXT, crossbar, SensoryQuad, `ou_to_z_stage_ultra`, `Op-N[Pre]`, and nonlinear SONA core trajectories untouched.
+`applyTardosWatermark` mutates only retained half-precision linear Role B coordinates (`W_ro_head` and `W_mod` plus linear reserves) in place. It leaves DBRM, `shared_controls`, TSYN, Arena 0/3 GRA control tables (`control_bus_lite` 2,048 B and `control_bus_ultra_delta` <= 9,280 B cum.), 128 B Kautz `dr`, ErSparseBank, crossbar, SensoryQuad, Op-N[Pre], and nonlinear core trajectories untouched.
 
 When emitting a signed or sealed buyer container carrying `dbin_prefix_bytes > 0` (`authKind === 1` or `.dnam-seal`), buyer issuance updates integrity digests over the watermarked arenas.
 
@@ -374,19 +379,19 @@ Specifically, issuance recomputes `tier_arena_crc32c`, `prefix_crc32c`, `crc_dbi
 
 | Submodule / Operator | Exported Reference Kernels | Specification Reference |
 | :--- | :--- | :--- |
-| `transport` (`Op-T`) | `catmullRomHermite`, `catmullRomHermiteSlice`, `coerciveStep`, `tankSlice` | `ref[dsp.op-t.reader.catmull-rom]` |
+| `transport` (`Op-T v4`) | `catmullRomHermite`, `catmullRomHermiteSlice`, `coerciveStep`, `tankSlice` | `ref[dsp.op-t.reader.catmull-rom]` |
 | `modal` (`Op-M`) | `modalStep`, `modalSlice`, `unitRotor`, `unitRotorSlice` | `ref[dsp.op-m.recurrence.symplectic]`, `ref[dsp.op-m.rotor.contractive]` |
-| `nonlinear` (`Op-N` & SONA Core) | `polyAdaaAlgebraic`, `polyAdaaStep`, `polyAdaaSlice` | `ref[dsp.op-n.polyadaa.midpoint]` |
-| `control-bus` | `lobattoBasis`, `lobattoBasisSlice`, `rank4Fm`, `rank4FmSlice`, `chebyshevLfo`, `chebyshevLfoSlice`, `trustRegionSoftclip`, `trustRegionSoftclipSlice` | `ref[dsp.ctrl.basis.lobatto]`, `ref[dsp.ctrl.op-n.trust-clip]` |
+| `nonlinear` (`Op-N` & SONA Core) | `polyAdaaAlgebraic`, `polyAdaaStep`, `polyAdaaSlice` (`AlgADAA1(4096, NR3)`) | `ref[dsp.op-n.polyadaa.midpoint]` |
+| `control-bus` (`GRA` v4) | `lobattoBasis`, `lobattoBasisSlice`, `rank4Fm`, `rank4FmSlice`, `chebyshevLfo`, `chebyshevLfoSlice`, `trustRegionSoftclip`, `trustRegionSoftclipSlice` | `ref[dsp.ctrl.basis.lobatto]`, `ref[dsp.ctrl.op-n.trust-clip]` |
 | `mixing` | `cubicLagrangeWeights`, `cubicLagrangeWeightsSlice`, `givensHouseholder8ch`, `givensHouseholder8chSlice`, `givensHouseholder16ch`, `givensHouseholder16chSlice` | `ref[dsp.tank.feedback-loop]` |
 
 All slice-accepting DSP functions execute in compiled native loops (`ref[sdk.rust.shared-nostd-kernels]`) with zero per-sample JavaScript iteration, accept optional `{ output }` pre-allocated `Float64Array` buffers, and agree with their single-sample counterparts to 0 ULP.
 
-### 4.5 Lock-Free WebAudio `AudioWorklet` Bridge & Browser `navigator.gpu` WebGPU Trainer
+### 4.5 Lock-Free WebAudio `AudioWorklet` Bridge & WebGPU Trainer
 
 `r[sdk.ts.web-audio.realtime-bridge]`
 
-`DnamAudioNode.create(context, model, options?)` in `@dnam-project/dnam/web-audio` registers the standalone zero-dependency `web-audio-processor.js` module and forwards the pre-compiled `WebAssembly.Module`, optional shared `WebAssembly.Memory`, and v3.0 container bytes via `processorOptions`.
+`DnamAudioNode.create(context, model, options?)` in `@dnam-project/dnam/web-audio` registers the standalone zero-dependency `web-audio-processor.js` module and forwards the pre-compiled `WebAssembly.Module`, optional shared `WebAssembly.Memory`, and v4.0 container bytes via `processorOptions`.
 
 Each node instance exposes the identical `node.parameters`, `node.applyPreset(id)`, `node.tempo`, `node.bypass(...)`, and typed `"telemetry"` events as the synchronous `Engine` API.
 
@@ -394,12 +399,12 @@ End-to-end Worklet rendering is verified in headless Chromium (`OfflineAudioCont
 
 When `crossOriginIsolated === true`, parameter updates, transport commands, and telemetry snapshots flow across a lock-free `SharedArrayBuffer` (`Int32Array` / `Float32Array` + `Atomics`) with zero allocations on the audio thread. When `crossOriginIsolated === false`, the bridge falls back transparently to `MessagePort`.
 
-The browser `navigator.gpu` trainer driver (`src/trainer/`, internal to `@dnam-project/dnam`) accelerates SONA v3.0 capture training in background Web Workers (REQ-4.1, REQ-4.2, REQ-4.3, `ref[train.pipeline.webgpu-scans-and-ozaki]`):
+The `navigator.gpu` trainer driver (`src/trainer/`, internal to `@dnam-project/dnam`) accelerates SONA v4.0 capture training in background desktop Web Workers (REQ-4.1, REQ-4.2, REQ-4.3, `ref[train.pipeline.webgpu-scans-and-ozaki]`):
 
-| Browser Trainer Component | Normative Resource & Shader Contract |
+| WebGPU Trainer Component | Normative Resource & Shader Contract |
 | :--- | :--- |
-| **Checked-In AOT `.wgsl` Pipelines** | Compiles the seven AOT `naga`-validated `.wgsl` compute kernels (`prescreen_population.wgsl`, `fused_core_scan_256.wgsl`, `adjoint_scan_256.wgsl`, `tile_mix_fwd_adj.wgsl`, `gabor_bezout_grad.wgsl`, `ozaki_gram_rhs_i32.wgsl`, `inner_opt_step.wgsl`) via `device.createShaderModule` with 0 KB added to `dnam.wasm`. |
-| **Startup Probes, Persistent Arena & Time-Block Streaming** | Runs < 1 ms startup WGSL numerics probes (`i32` Ozaki dot exactness, `pow2_ceil_fp32`, >= 16 KiB workgroup SRAM), executes persistent GpuTrainArena pooling paired with 16,384-frame 2× time-block streamed full-batch BPTT paired with `exit_adj_boundary` (<= 128 MiB per storage binding, < 256 MiB total browser worker memory, <= 1.2 MiB `mapAsync` split-64 Ozaki readbacks to host WASM float64 VarPro), and falls back to the WebAssembly SIMD128 CPU trainer path (< 64 MiB worker cap) when `navigator.gpu` is absent or fails probes. |
+| **Checked-In AOT `.wgsl` Pipelines** | Compiles the seven AOT `naga`-validated `.wgsl` compute kernels (`prescreen_population.wgsl`, `fused_core_scan_256.wgsl`, `adjoint_scan_256.wgsl`, `tile_mix_fwd_adj.wgsl`, `gabor_bezout_grad.wgsl`, `ozaki_gram_rhs_i32.wgsl`, `inner_opt_step.wgsl`) inside `<= 15.0 KiB` workgroup SRAM via `device.createShaderModule` with 0 KB added to `dnam.wasm`. |
+| **Startup Probes, Persistent Arena & Time-Block Streaming** | Runs < 1 ms startup WGSL numerics probes (`i32` Ozaki dot exactness, `pow2_ceil_fp32`, `>= 16 KiB` workgroup SRAM), executes persistent `GpuTrainArena` pooling paired with 16,384-frame 2× time-block streamed full-batch BPTT (`exit_adj_boundary`, `<= 128 MiB` per storage binding, `<= 1.5 GiB` inside the 1–2 GiB desktop WebGPU ceiling, `<= 1.2 MiB` `mapAsync` split-64 Ozaki readbacks to host WASM float64 VarPro), and falls back to the WebAssembly SIMD128 CPU trainer path (`<= 512 MiB` fallback cap) when `navigator.gpu` is absent or fails probes. |
 
 ### 4.6 Profiling Methodology & Real-Time FFI Overhead Budgets
 
@@ -421,14 +426,14 @@ Throughput suites also profile `ControlSpace.clampNumericInto` (alongside `Contr
 
 The WebAssembly SIMD128 and shared portable math backends defined in the [Rust Implementation Specification](rust_sdk.md) (`ref[sdk.rust.explicit-simd-and-coverage]`, `ref[sdk.rust.shared-nostd-kernels]`) implement 4-lane SIMD128 floating-point, `fp16` packing, subnormal-flushing, and Newton–Raphson reciprocal primitives.
 
-Floating-point and SIMD lane layouts follow `ref[arch.fp.callback-env]` and `ref[arch.simd.lane-packing]`, pairing interleaved 8-lane stereo SIMD cascade kernels across all four SONA tiers ([1,1,1,1] at 1× Lite, [2,2,1,1] at 2× Full, [3,2,2,1] at 2× Pro, [4,3,2,1] at 2× Ultra; 4,544 / 7,552 / 11,136 / 14,592 B hot working sets inside 4,608 / 7,936 / 15,872 / 28,672 B L1D ceilings; 1–4 `TransportQuad`s = 4–16 `Transport` lines) and the 3 kHz control bus.
+Floating-point and SIMD lane layouts follow `ref[arch.fp.callback-env]` and `ref[arch.simd.lane-packing]`, pairing interleaved 8-lane stereo SIMD cascade kernels across all four v4.0 SONA tiers (`[1,1,1,1]` Lite, `[2,2,1,1]` Full, `[2,2,2,2]` Pro, `[3,3,2,2]` Ultra; 5 / 13 / 24 / 37 tiles; 4,432 B Lite 2× inside 4,608 / 8,192 / 16,384 / 32,768 B L1D ceilings; 1–4 TransportQuad blocks) and the 3 kHz GRA control bus (K_ctrl = 16, 4-frame micro-ramp).
 
 To preserve L1 instruction-cache locality and keep `dnam.wasm` compact (with 0 KB added for `.wgsl` shaders), the native audio-loop and JSON schema boundaries prevent cross-unit inlining and monomorphization bloat per the [Rust Implementation Specification](rust_sdk.md) (`ref[sdk.rust.c-abi-and-host-handle]`).
 
 At 48 kHz stereo (where a 128-frame WebAudio quantum equals 2,666.67 us), in-place `engine.process(input, { output })` on both N-API v10 and WASM SIMD128 (bounded or `SharedArrayBuffer` `WebAssembly.Memory`) must meet these budgets with zero JS heap allocations:
 
-| Target & Memory Mode | `lite` (`[1,1,1,1]` @ 1× / 1 `TransportQuad` / 32 FIR) | `full` (`[2,2,1,1]` @ 2× / 2 `TransportQuad`s / 48 FIR) | `pro` (`[3,2,2,1]` @ 2× / 3 `TransportQuad`s / 96 FIR) | `ultra` (`[4,3,2,1]` @ 2× / 4 `TransportQuad`s / 128 FIR) | Real-Time Block Budget (128 Frames @ 48 kHz) |
+| Target & Memory Mode | `lite` (`[1,1,1,1]` @ 2× / 5 tiles / 32 FIR) | `full` (`[2,2,1,1]` @ 2× / 13 tiles / 48 FIR) | `pro` (`[2,2,2,2]` @ 2× / 24 tiles / 96 FIR) | `ultra` (`[3,3,2,2]` @ 2× / 37 tiles / 128 FIR) | Real-Time Block Budget (128 Frames @ 48 kHz) |
 | :--- | :---: | :---: | :---: | :---: | :---: |
 | **Node.js 26 N-API v10 (`neon` / `avx2` / `sme`)** | In-place < 250 us | In-place < 250 us | In-place < 250 us | In-place < 250 us | < 250 us (> 10x real-time headroom, 0 JS allocs) |
 | **Node.js 26 / Chromium WASM SIMD128 (`bounded` / `shared`)** | In-place < 250 us | In-place < 250 us | In-place < 250 us | In-place < 250 us | < 250 us (> 10x real-time headroom, 0 JS allocs) |
-| **Browser Trainer (`navigator.gpu` / `WasmSimd128` Fallback)** | <= 128 MiB/binding | <= 128 MiB/binding | <= 128 MiB/binding | <= 128 MiB/binding | < 256 MiB WebGPU / < 64 MiB WASM CPU (0 KB `dnam.wasm` shader bloat) |
+| **Desktop / Worker Trainer (`navigator.gpu` / `WasmSimd128` Fallback)** | `<= 128 MiB/bind` | `<= 128 MiB/bind` | `<= 128 MiB/bind` | `<= 128 MiB/bind` | `<= 1.5 GiB` WebGPU (1–2 GiB ceil) / `<= 512 MiB` WASM CPU (0 KB `dnam.wasm` shader bloat) |

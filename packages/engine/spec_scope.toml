@@ -985,6 +985,10 @@ reason = "DistillationTarget and DNWB out-of-process white-box runners owned by 
 scope = "out-of-scope"
 reason = "Multi-regime parabolic sub-sample capture alignment owned by packages/capture"
 
+[rules."train.capture.attention-and-qualification"]
+scope = "out-of-scope"
+reason = "Capture-side offline trainer attention (#2-#7) and T0-T4 qualification integration owned by packages/capture and packages/train"
+
 # ==============================================================================
 # 14. Training: Control Space Audit (`docs/specs/training/control_space_audit.md`)
 # ==============================================================================
@@ -1053,7 +1057,7 @@ reason = "Parallel multi-knob 3 kHz CP1/U_int/W_ctrl control-bus and W_readout p
 
 [rules."train.pipeline.host-parity-and-export"]
 scope = "out-of-scope"
-reason = "Deterministic host CPU SonaInstance + Wide192Accum parity pass, intrinsic TPT-SVF/ParaLRU/Op-T/Kautz stability audit, [STAB-ZERO-DC], and v3.0 container emission owned by packages/capture"
+reason = "Deterministic host CPU SonaInstance + Wide192Accum parity pass, intrinsic TPT-SVF/ParaLRU/Op-T/Kautz stability audit, [STAB-ZERO-DC], and v4.0 container emission owned by packages/capture"
 
 [rules."train.gram.accuracy-contract"]
 scope = "out-of-scope"
@@ -1074,6 +1078,14 @@ reason = "Closed-form control-dispatch normal-equation solver owned by packages/
 [rules."train.pipeline.fixtures-matrix"]
 scope = "out-of-scope"
 reason = "Black-box signal-chain fixtures (packages/fixtures) and 4-Tier fixture matrix + DNWB white-box runner verification owned by packages/capture"
+
+[rules."train.pipeline.offline-attention"]
+scope = "out-of-scope"
+reason = "Offline non-causal trainer attention mechanisms (#1-#7) owned by packages/train and packages/capture"
+
+[rules."train.pipeline.qualification-pyramid"]
+scope = "out-of-scope"
+reason = "Five-tier fail-fast qualification pyramid (T0-T4) owned by packages/train, packages/capture, and packages/fixtures"
 
 # ==============================================================================
 # 16. Training: Capture Vault & Cloud Sync (`docs/specs/training/iterative_resume_and_caching.md`)
@@ -1104,7 +1116,7 @@ reason = "Unchanged-stem non-regression verification owned by packages/capture"
 
 [rules."train.resume.windowed-refresh"]
 scope = "out-of-scope"
-reason = "2-D memory-bounded RESIDENT_BATCHED / STREAMED refresh budgets (<= 128 MiB/binding, < 256 MiB browser WebGPU, < 64 MiB WASM fallback, < 512 MiB desktop) owned by packages/capture"
+reason = "2-D memory-bounded RESIDENT_BATCHED / STREAMED refresh budgets (<= 128 MiB/binding, <= 1.5 GiB inside 1-2 GiB desktop WebGPU ceiling, <= 512 MiB WASM/portable CPU SIMD fallback, REQ-4.3) owned by packages/train and packages/capture"
 
 [rules."train.cache.proj-vault"]
 scope = "out-of-scope"

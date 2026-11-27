@@ -2,25 +2,29 @@
 id: spec.container.dnam
 title: ".dnam Hybrid Binary Container & < 50 ns Zero-Copy Hardware Loader"
 status: canonical
-version: "3.0.0"
+version: "4.0.0"
 domain: containers
 rule_prefixes:
   - "r[container.dnam."
 requirements:
+  - REQ-2.5
   - REQ-5.1
   - REQ-5.6
+  - REQ-6.1
   - REQ-8.1
+  - REQ-8.5
   - REQ-8.8
 adrs:
   - ADR-0007
   - ADR-0009
   - ADR-0020
   - ADR-0022
+  - ADR-0024
 ---
 
 # `.dnam` Hybrid Binary Container & < 50 ns Zero-Copy Hardware Loader
 
-DNAM defines five companion 64 B cache-line and SIMD-aligned v3.0 (`"architecture": "sona"`) binary container formats across a three-layer stack using declarative little-endian binary records. Together these containers satisfy [REQ-5.1, REQ-5.6](../../requirements/system_goals_and_requirements.md#6-goal-5--single-run-slimmable-multi-tier-architecture-lite--full--pro--ultra), [REQ-8.1, REQ-8.8](../../requirements/system_goals_and_requirements.md#9-goal-8--model-provenance-hardware-drm-forensic-watermarking--marketplace-security), [ADR-0007](../../adr/0007-exact-integer-control-bus-and-tempo-inversion.md), [ADR-0009](../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md), [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md), and [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md).
+DNAM defines five companion 64 B cache-line and SIMD-aligned v4.0 (`"architecture": "sona"`) binary container formats across a three-layer stack using declarative little-endian binary records. Together these containers satisfy [REQ-2.5](../../requirements/system_goals_and_requirements.md), [REQ-5.1, REQ-5.6](../../requirements/system_goals_and_requirements.md#6-goal-5--single-run-slimmable-multi-tier-architecture-lite--full--pro--ultra), [REQ-6.1](../../requirements/system_goals_and_requirements.md#7-goal-6--real-time-commodity-hardware-budget--execution-constraints), [REQ-8.1, REQ-8.5, REQ-8.8](../../requirements/system_goals_and_requirements.md#9-goal-8--model-provenance-hardware-drm-forensic-watermarking--marketplace-security), [ADR-0007](../../adr/0007-exact-integer-control-bus-and-tempo-inversion.md), [ADR-0009](../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md), [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), and [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md).
 
 ---
 
@@ -28,23 +32,23 @@ DNAM defines five companion 64 B cache-line and SIMD-aligned v3.0 (`"architectur
 
 `r[container.dnam.wire-framing]`
 
-Every v3.0 container enforces declarative little-endian framing, strict 64 B alignment at every binary region boundary, and fail-closed validation prior to audio rendering. Real-time virtual machines load bare `.dnam-bin` images (`"DNBN"`) or zero-copy embedded slices inside `.dnam` wrappers into L1D-resident memory in < 50 ns without executing a JSON parser on the audio thread.
+Every v4.0 container enforces declarative little-endian framing, strict 64 B alignment at every binary region boundary, and fail-closed validation prior to audio rendering. Real-time virtual machines load bare `.dnam-bin` images (`"DNBN"`) or zero-copy embedded slices inside `.dnam` wrappers into L1D-resident memory in < 50 ns without executing a JSON parser on the audio thread.
 
-### 1.1 Companion v3.0 Container Formats
+### 1.1 Companion v4.0 Container Formats
 
 `r[container.dnam.formats]`
 
-All five companion v3.0 formats use packed little-endian binary record layouts with fixed 64 B region alignment and explicit byte offsets across the three-layer architecture (Layer 0 `.dnam-bin`, Layer 1 `.dnam` / `.dnam-seal` / `.dnam-prev`, and Layer 2 `.dnam-proj`).
+All five companion v4.0 formats use packed little-endian binary record layouts with fixed 64 B region alignment and explicit byte offsets across the three-layer architecture (Layer 0 `.dnam-bin`, Layer 1 `.dnam` / `.dnam-seal` / `.dnam-prev`, and Layer 2 `.dnam-proj`).
 
-Loaders validate header fields fail-closed and reject any container with `version_major != 3`, `version_minor != 0`, or a non-`"sona"` architecture using `UnsupportedVersion`.
+Loaders validate header fields fail-closed and reject any container with `version_major != 4`, `version_minor != 0`, or a non-`"sona"` architecture using `UnsupportedVersion`.
 
 | Container Format | Magic / Kind | Version & Architecture | Primary Role & Payload Summary | Canonical Cross-Reference |
 | :--- | :--- | :--- | :--- | :--- |
-| `.dnam-bin` | `"DNBN"` | v3.0, `"sona"` | Layer 0 zero-JSON VM binary carrying 64 B `"DNBN"` header, 64 B `"DBRM"` runtime metadata, `shared_controls`, `"TSYN"` tempo array, optional `"CEXT"` dispatch, and nested Arena 0..3 payloads (`§1.4`) | This specification (`§1.4`) |
-| `.dnam` | `"DNAM"` | v3.0, `"sona"` | Layer 1 runtime shell wrapping verbatim embedded `.dnam-bin` (at `dbin_offset`, `Region 4 == 0 B`) alongside 64 B preamble, 128 B directory, RFC 8785 JCS header, Region 5 `auth_extent`, and `DMU1` + `DMUE` suffix | This specification (`§1.2–§1.3`) |
-| `.dnam-proj` | `"DNPJ"` | v3.0, `"sona"` | Layer 2 cloud-ready Capture Vault front-loading a 64 B preamble, SHA-256 chunk directory, and JCS manifest alongside `CALB`, `SPCM`, `INPC`/`STMC` 2.0–2.5 s fp32 capsules, `STAT`, `WGHT`, and `AUTH` | [project_container_format.md](project_container_format.md) |
-| `.dnam-seal` | `"DNSL"` | v3.0 | Opaque 64 B-aligned OEM hardware-enclave wrapper using `EnclaveSealed`, `DSA1` manifest, optional verbatim `dbin_prefix` inside `logical_prefix` (`DAI1`-signed), and `DME1` + `DMUE` suffix | [provenance_and_enclave_drm.md §3](../security/provenance_and_enclave_drm.md#3-pillar-2-hardware-enclave--oem-drm-oemdevicecertificate-attestation--dnam-seal-dnsl-wrapper) |
-| `.dnam-prev` | `container_kind: "preview"` | v3.0, `"sona"` | Lite-only storefront auditioning container that physically omits Full, Pro, and Ultra payloads while retaining Arena 0 control descriptors and Lite `CP1`/`W_readout` slices | [watermarking_and_marketplace.md §3](../security/watermarking_and_marketplace.md#3-commercial-storefront-platform-auditioning-royalty-splits--storefront-metadata) |
+| `.dnam-bin` | `"DNBN"` | v4.0, `"sona"` | Layer 0 zero-JSON VM binary carrying 64 B `"DNBN"` header, 64 B `"DBRM"` runtime metadata, `shared_controls`, `"TSYN"` tempo array (`cext_offset == 0`, `cext_len == 0`), and nested Arena 0..3 payloads (`§1.4`) | This specification (`§1.4`) |
+| `.dnam` | `"DNAM"` | v4.0, `"sona"` | Layer 1 runtime shell wrapping verbatim embedded `.dnam-bin` (at `dbin_offset`, Region 4 == 0 B) alongside 64 B preamble, 128 B directory, RFC 8785 JCS header, Region 5 `auth_extent`, and `DMU1` + `DMUE` suffix | This specification (`§1.2–§1.3`) |
+| `.dnam-proj` | `"DNPJ"` | v4.0, `"sona"` | Layer 2 cloud-ready Capture Vault front-loading a 64 B preamble, SHA-256 chunk directory, and JCS manifest alongside `CALB`, `SPCM`, `INPC`/`STMC` 2.0–2.5 s fp32 capsules, `STAT`, `WGHT`, and `AUTH` | [project_container_format.md](project_container_format.md) |
+| `.dnam-seal` | `"DNSL"` | v4.0 | Opaque 64 B-aligned OEM hardware-enclave wrapper using `EnclaveSealed`, `DSA1` manifest, optional verbatim `dbin_prefix` inside `logical_prefix` (`DAI1`-signed), and `DME1` + `DMUE` suffix | [provenance_and_enclave_drm.md §3](../security/provenance_and_enclave_drm.md#3-pillar-2-hardware-enclave--oem-drm-oemdevicecertificate-attestation--dnam-seal-dnsl-wrapper) |
+| `.dnam-prev` | `container_kind: "preview"` | v4.0, `"sona"` | Lite-only storefront auditioning container that physically omits Full, Pro, and Ultra payloads while retaining Arena 0 self-contained 2×-calibrated control descriptors, GRA tables, and `fp16` `W_ro` slices | [watermarking_and_marketplace.md §3](../security/watermarking_and_marketplace.md#3-commercial-storefront-platform-auditioning-royalty-splits--storefront-metadata) |
 
 When a `.dnam` wrapper embeds an aligned `.dnam-bin` prefix (`dbin_prefix_bytes > 0` after Region 5), Region 4 (`shared_extent`) has zero length so control tables reside once inside `dbin_prefix`. When absent, Region 4 stores the `P` × 64 B descriptor table plus any overflow `CP1` stream.
 
@@ -52,28 +56,30 @@ Region 5 (`auth_extent`) holds a 64-byte `DCRC` Authentication Record (`"DCRC"`)
 
 Authentication flags in the `DCRC` record track creator signatures (`FLAG_HAS_SIGNATURES`) and ChaCha20 encryption over `[tier_start..retained_end]` (`FLAG_ENCRYPTED_ARENA`); Open containers may instead use `DAU1`.
 
-The four nested fixed-shape tier payloads obey Lite ⊂ Full ⊂ Pro ⊂ Ultra. Arena 0 carries 1×-calibrated Lite weights within 4,608 B, while Arena 1..3 store 2×-OS incremental deltas at cumulative 64 B-aligned wire boundaries of 4,608 / 7,936 / 15,872 / 30,720 B (actual L1D `ActiveHot` of 4,544 / 7,552 / 11,136 / 14,592 B within 4,608 / 7,936 / 15,872 / 28,672 B ceilings).
+All four nested fixed-shape tier payloads obey Lite ⊂ Full ⊂ Pro ⊂ Ultra (`[1,1,1,1]`, `[2,2,1,1]`, `[2,2,2,2]`, `[3,3,2,2]`) at unified all-tier 2× 15-tap symmetric linear-phase HB-FIR oversampling (`OS2X`, zero Tier-1 core override).
+
+Lite active-hot L1D fits inside 4,432 B (14× = 60.59 KiB <= 64 KiB), while Full/Pro/Ultra active-hot ceilings stay inside 8,192 / 16,384 / 32,768 B. Cumulative compile-time 64 B-aligned wire arenas (`ARENA_LITE_BYTES..ARENA_ULTRA_BYTES`, ~31–35 KiB Ultra wire) retain half-precision CoreQuad, InterBlockTile, and W_ro weights (REQ-8.5) while reclaiming 6,336 B of non-Tardos control bytes for GRA (2,048 B in Arena 0).
 
 ```mermaid
 flowchart LR
-    subgraph Header ["1. Fixed Preamble, Directory, Signed Header & Auth (Little-Endian v3.0)"]
+    subgraph Header ["1. Fixed Preamble, Directory, Signed Header & Auth (Little-Endian v4.0)"]
         direction TB
-        P["Region 1 (0..63, 64 B): Container Preamble<br/>Magic DNAM, Version 3.0, Profile, AuthKind, MaxTier, Train SR"]
+        P["Region 1 (0..63, 64 B): Container Preamble<br/>Magic DNAM, Version 4.0, Profile, AuthKind, MaxTier, Train SR"]
         D["Region 2 (64..191, 128 B): Chunk Directory<br/>u64le Offsets, dbin_offset/dbin_prefix_bytes & 4 Original Tier Ends"]
         H["Region 3 (192..): RFC 8785 JCS Header + Opt. Region 4 (0 B w/ dbin)<br/>+ Region 5 auth_extent (DCRC w/ crc_dbin_prefix or Open DAU1)"]
         P --> D --> H
     end
 
     subgraph DbinPrefix ["2. Optional Embedded Layer 0 VM Prefix (dbin_offset..tier_start)"]
-        DB["64 B DNBN Header + 64 B DBRM Metadata + shared_controls<br/>+ 40 B x N TSYN Array + Opt. 1,280 B CEXT"]
+        DB["64 B DNBN Header + 64 B DBRM Metadata (cext_len == 0)<br/>+ shared_controls + 40 B x N TSYN Array (subdivision_override OK)"]
     end
 
-    subgraph Arenas ["3. Contiguous 64B-Aligned Constant-Size SONA Tier Payloads (tier_start..tier_end)"]
+    subgraph Arenas ["3. Contiguous 64B-Aligned Constant-Size SONA v4.0 Tier Payloads (tier_start..tier_end)"]
         direction TB
-        A0["Arena 0 (Lite Payload, 4,608 B = 72 CL):<br/>[1,1,1,1] CoreQuads @ 1x + 32 Convolver FIR + 8 Kautz + 128 B Quad 0 + Ctrl & W_ro"]
-        A1["Arena 1 (Full Delta Payload, +3,328 B = 52 CL, cum. 7,936 B):<br/>[2,2,1,1] @ 2x OS Delta + +16 FIR (48) + +4 Kautz (12) + 128 B Quad 1"]
-        A2["Arena 2 (Pro Delta Payload, +7,936 B = 124 CL, cum. 15,872 B):<br/>[3,2,2,1] @ 2x OS Delta + +48 FIR (96) + +12 Kautz (24) + Quad 2 + Reserve"]
-        A3["Arena 3 (Ultra Delta Payload, +14,848 B = 232 CL, cum. 30,720 B):<br/>[4,3,2,1] @ 2x OS Delta + +32 FIR (128) + +8 Kautz (32) + Quad 3 + Ultra Ctrl"]
+        A0["Arena 0 (Lite 2x HB-FIR, 4,432 B True-Hot L1D <= 4,608 B):<br/>[1,1,1,1] CoreQuads + 5 Tiles + 32 FIR + 8 ErSparse + 8 Kautz + 64-fr Quad 0 + 2,048 B GRA + fp16 W_ro"]
+        A1["Arena 1 (Full 2x HB-FIR Delta):<br/>[2,2,1,1] (+2 Quads, +8 Tiles = 13) + 16 FIR (48) + 8 ErSparse (16) + 4 Kautz (12) + Quad 1"]
+        A2["Arena 2 (Pro 2x HB-FIR Delta):<br/>[2,2,2,2] (+2 Quads, +11 Tiles = 24) + 48 FIR (96) + 12 Kautz (24) + Quad 2 + Role B Reserve"]
+        A3["Arena 3 (Ultra 2x HB-FIR Delta, ~31-35 KiB cum.):<br/>[3,3,2,2] (+2 Quads, +13 Tiles = 37, max 7/quad) + 32 FIR (128) + 8 Kautz (32) + Quad 3 + GRA Delta"]
         A0 --> A1 --> A2 --> A3
     end
 
@@ -88,7 +94,7 @@ flowchart LR
 +-----------------------------------------------------------------------+ 0x0000 (Byte 0, 64B-aligned)
 | 1. Container Preamble (64 B, 64-byte aligned, little-endian)          |
 |    • 0..4:   magic = "DNAM" (.dnam-seal uses DNSL Outer Preamble)     |
-|    • 4..8:   version_major = 3 (u16le), version_minor = 0 (u16le)     |
+|    • 4..8:   version_major = 4 (u16le), version_minor = 0 (u16le)     |
 |    • 8..12:  protection_profile(u8), auth_kind(u8), maximum_tier(u8)  |
 |    • 12..16: sample_rate_train_hz = 48000 (u32le) | 16..64: zero(48B) |
 +-----------------------------------------------------------------------+ 0x0040 (Byte 64, 64B-aligned)
@@ -107,17 +113,17 @@ flowchart LR
 | 5. Region 5 auth_extent (64 B DCRC or Open DAU1) + Zero Pad to 64 B   |
 +-----------------------------------------------------------------------+ dbin_offset (optional, 64B-aligned)
 | 5B. Opt. Verbatim Layer 0 .dnam-bin Prefix [dbin_offset..tier_start)  |
-|     ("DNBN" + "DBRM" + shared_controls + "TSYN" + opt. "CEXT")        |
+|     ("DNBN" + "DBRM" [cext_len==0] + shared_controls + "TSYN")        |
 |     -> Zero-copy slice [dbin_offset..retained_tier_end] is .dnam-bin! |
 +=======================================================================+ tier_start (64B-aligned)
-| 6A. Arena 0: Lite Payload [tier_start .. lite_end]                    | <- Lite strip boundary
-|     (Includes self-contained Lite controls, CP1, U_int, W_ctrl & RO)  |
+| 6A. Arena 0: Lite 2x Payload [tier_start .. original_tier_ends[0]]    | <- Lite strip boundary
+|     (Self-contained Lite controls, CP1, U_int, 2,048 B GRA & fp16 RO) |
 +-----------------------------------------------------------------------+ original_tier_ends[0] (64B-aligned)
-| 6B. Arena 1: Full Delta Payload [lite_end .. full_end]                | <- Full strip boundary
+| 6B. Arena 1: Full Delta Payload [ends[0] .. original_tier_ends[1]]    | <- Full strip boundary
 +-----------------------------------------------------------------------+ original_tier_ends[1] (64B-aligned)
-| 6C. Arena 2: Pro Delta Payload [full_end .. pro_end]                  | <- Pro strip boundary
+| 6C. Arena 2: Pro Delta Payload [ends[1] .. original_tier_ends[2]]     | <- Pro strip boundary
 +-----------------------------------------------------------------------+ original_tier_ends[2] (64B-aligned)
-| 6D. Arena 3: Ultra Delta Payload [pro_end .. ultra_end]               | <- Ultra strip boundary
+| 6D. Arena 3: Ultra Delta Payload [ends[2] .. original_tier_ends[3]]   | <- Ultra strip boundary
 +=======================================================================+ retained_tier_end (64B-aligned)
 | 7. Growable DMU1 Mutable Frame (.dnam-seal uses DME1 HPKE) + 16-Byte  |
 |    Mutable Footer (magic "DMUE" + u64le frame_len + u32le reserved=0) |
@@ -145,7 +151,7 @@ Header offsets in `slimmable_tiers` and `tensor_directory` remain relative to `t
 | Offset | Bytes | LE Wire Type | Field Name | Clean-Room Validation Invariant |
 | :---: | :---: | :--- | :--- | :--- |
 | 0..4 | 4 | `u8[4]` | `magic` | Exact `"DNAM"` (`.dnam-seal` uses the `DNSL` Outer Preamble defined in [provenance_and_enclave_drm.md §3](../security/provenance_and_enclave_drm.md#3-pillar-2-hardware-enclave--oem-drm-oemdevicecertificate-attestation--dnam-seal-dnsl-wrapper)) |
-| 4..6 | 2 | `u16le` | `version_major` | Must equal 3 |
+| 4..6 | 2 | `u16le` | `version_major` | Must equal 4 |
 | 6..8 | 2 | `u16le` | `version_minor` | Must equal 0 |
 | 8..9 | 1 | `u8` | `protection_profile` | 0 = Open, 1 = DeviceAllowlisted, 2 = EnclaveSealed; > 2 rejected |
 | 9..10 | 1 | `u8` | `auth_kind` | 0 = CreatorOnly, 1 = CreatorAndMarketplace; > 1 rejected |
@@ -167,7 +173,7 @@ Header offsets in `slimmable_tiers` and `tensor_directory` remain relative to `t
 | 48..56 | 8 | `u64le` | `dbin_offset` | Equals 0 when absent; else 64 B-aligned offset immediately after `auth_extent` (`>= align64(auth_offset + auth_len)`) |
 | 56..64 | 8 | `u64le` | `dbin_prefix_bytes` | Equals 0 when absent; else > 0 and 64 B-aligned (`dbin_prefix_bytes % 64 == 0`), matching the byte span `[dbin_offset .. tier_start)` |
 | 64..72 | 8 | `u64le` | `tier_start` | 64 B-aligned start of Arena 0 (`>= align64(auth_offset + auth_len)` when `dbin_prefix_bytes == 0`, else `== align64(dbin_offset + dbin_prefix_bytes)`) |
-| 72..104 | 32 | `u64le[4]` | `original_tier_ends` | `[lite_end, full_end, pro_end, ultra_end]`, 64 B-aligned (`end[t] - tier_start == ARENA_*_BYTES` through `maximum_tier`, monotone `end[t] <= end[t+1]`) |
+| 72..104 | 32 | `u64le[4]` | `original_tier_ends` | `[lite_end, full_end, pro_end, ultra_end]`, 64 B-aligned (`end[t] - tier_start == ARENA_TIER_BYTES[t]` through `maximum_tier`, compile-time derived 64 B-aligned v4.0 tier ceilings, monotone `end[t] <= end[t+1]`) |
 | 104..128 | 24 | `u8[24]` | `reserved_tail` | All 24 bytes must equal `0x00` |
 
 **3. 64-byte `DCRC` Authentication Record (64 B, 1-byte aligned, Region 5 `auth_extent`) & In-Memory `FLAG_*` Bitmask:**
@@ -215,7 +221,7 @@ Operation `5 = and_max_keep` updates `eff_max` identically when active and match
 
 `r[container.dnam.open-layout]`
 
-The fixed 64 B Container Preamble (`[0..64)`) and 128 B Chunk Directory (`[64..192)`) enforce `version_major = 3`, `version_minor = 0`, `protection_profile = 0` for Open, and `auth_kind = 0` (creator-only) or 1 (creator plus buyer).
+The fixed 64 B Container Preamble (`[0..64)`) and 128 B Chunk Directory (`[64..192)`) enforce `version_major = 4`, `version_minor = 0`, `protection_profile = 0` for Open, and `auth_kind = 0` (creator-only) or 1 (creator plus buyer).
 
 Stripping a container to tier `T` retains the original preamble, directory, immutable header, shared binary, authentication envelope, optional `dbin_prefix`, and tier payloads through `original_tier_ends[T]`. Full Arena 0 controls remain intact even when stripping to Lite, and the mutable frame plus 16-byte `DMUE` Footer sit immediately after `original_tier_ends[T]` without re-signing.
 
@@ -258,48 +264,48 @@ On container load, the loader validates `DMU1`/`DME1` header CRC-32C and `DMUE` 
 
 The bare `.dnam-bin` (`"DNBN"`) Layer 0 format carries a complete, strictly numeric, 64 B-aligned VM register program with zero JSON, zero strings, zero dynamic memory allocation requirements, and zero dedicated freeze flags. Real-time virtual machines load standalone `.dnam-bin` files or zero-copy embedded `[dbin_offset..retained_tier_end]` slices extracted from `.dnam` wrappers in < 50 ns.
 
-Every `.dnam-bin` payload begins with a fixed 64 B **VM Binary Header** (`"DNBN"`, bytes 0..64) immediately followed by a fixed 64 B **VM Runtime Metadata Record** (`"DBRM"`, bytes 64..128), aligned `shared_controls`, `TSYN` tempo entries, optional `CEXT` matrices, and Arena 0..3 payloads.
+Every `.dnam-bin` payload begins with a fixed 64 B **VM Binary Header** (`"DNBN"`, bytes 0..64) immediately followed by a fixed 64 B **VM Runtime Metadata Record** (`"DBRM"`, bytes 64..128), aligned `shared_controls`, `TSYN` tempo entries (`cext_offset == 0`, `cext_len == 0` in v4.0), and Arena 0..3 payloads.
 
 Stripping `.dnam-bin` to tier `t` per `REQ-5.6` slices raw file bytes directly to `[0..tier_end_offsets[t]]` with zero mutation to any header byte.
 
 **1. VM Binary Header (`"DNBN"`, 64 B at offset 0..64) & VM Runtime Metadata Record (`"DBRM"`, 64 B at offset 64..128):**
 
-The following 64 B `"DNBN"` Header (bytes 0..64), 64 B `"DBRM"` Runtime Metadata Record (bytes 64..128), 40 B `TSYN` entry, and 1,280 B `CEXT` matrix define the normative wire contract:
+The following 64 B `"DNBN"` Header (bytes 0..64), 64 B `"DBRM"` Runtime Metadata Record (bytes 64..128), and 40 B `TSYN` entry define the normative wire contract (reclaiming the legacy 1,280 B `CEXT` slot into Arena 0 and Arena 3 `ControlBus` v4 `GRA` weights):
 
 | Record & Offset | Bytes | LE Wire Type | Field Name | Clean-Room Validation Invariant |
 | :--- | :---: | :--- | :--- | :--- |
 | `DNBN` 0..4 | 4 | `u8[4]` | `magic` | Exact `"DNBN"` |
-| `DNBN` 4..8 | 4 | `2 × u16le` | `version_major`, `version_minor` | Must equal 3 and 0 |
+| `DNBN` 4..8 | 4 | `2 × u16le` | `version_major`, `version_minor` | Must equal 4 and 0 |
 | `DNBN` 8..9 | 1 | `u8` | `max_present_tier` | Original emitted ceiling in 0..=3 (Lite..Ultra; never mutated on `REQ-5.6` strip) |
 | `DNBN` 9..10 | 1 | `u8` | `reserved0` | Must equal 0 |
 | `DNBN` 10..12 | 2 | `u16le` | `flags` | Bits 0..3 `HAS_LITE..HAS_ULTRA_DELTA`; bit 4 `SINGLE_INPUT`; bits 5..6 strictly 0 (reserved); bit 7 `WET_POLARITY_INV` (applies `eff_trim = -clamp(tier_gain_trim[tier], 0.0625, 16.0)` and ±1.0e9 safety clamp inside the pure 2×2 VM ahead of host-shell M/S width); bit 8 `AUTO_UNITY_ENABLED`; bit 9 `STEREO_OUT`; bits 10..15 strictly 0 |
 | `DNBN` 12..14 | 2 | `u16le` | `num_controls` | Total physical controls `P` (`0..=255`) |
 | `DNBN` 14..16 | 2 | `u16le` | `tsyn_count` | Count of 40 B `TSYN` rows (`tsyn_len == tsyn_count * 40`) |
 | `DNBN` 16..20 | 4 | `u32le` | `reference_sample_rate_hz` | Strictly in `[44,100..=96,000]` |
-| `DNBN` 20..24 | 4 | `u32le` | `prefix_crc32c` | Castagnoli CRC-32C over `[0..20) \|\| [24..arena0_offset)` (excludes itself; covers Header + `DBRM` + `shared_controls` + `TSYN` + `CEXT` + 64 B pad) |
+| `DNBN` 20..24 | 4 | `u32le` | `prefix_crc32c` | Castagnoli CRC-32C over `[0..20) \|\| [24..arena0_offset)` (excludes itself; covers Header + `DBRM` + `shared_controls` + `TSYN` + 64 B pad) |
 | `DNBN` 24..28 | 4 | `u32le` | `arena0_offset` | Relative 64 B-aligned Arena 0 start (`>= 128`, `arena0_offset % 64 == 0`, relative to byte 0 of `.dnam-bin`) |
-| `DNBN` 28..44 | 16 | `u32le[4]` | `tier_end_offsets` | `arena0_offset + [4,608, 7,936, 15,872, 30,720][t]` for `t <= max_present_tier`, else 0; immutable under `REQ-5.6` truncation |
+| `DNBN` 28..44 | 16 | `u32le[4]` | `tier_end_offsets` | `arena0_offset + ARENA_TIER_BYTES[t]` for `t <= max_present_tier`, else 0; compile-time 64 B-aligned tier lengths immutable under `REQ-5.6` truncation |
 | `DNBN` 44..60 | 16 | `u32le[4]` | `tier_arena_crc32c` | Castagnoli CRC-32C over `[arena0_offset..tier_end_offsets[t])` for `t <= max_present_tier`, else 0 |
 | `DNBN` 60..62 | 2 | `u16le` | `runtime_meta_bytes` | Must equal 64 |
 | `DNBN` 62..64 | 2 | `u16le` | `reserved_flags_hi` | Must equal 0 |
 | `DBRM` 0..4 | 4 | `u8[4]` | `magic` | Exact `"DBRM"` (at file offset 64..68) |
 | `DBRM` 4..12 | 8 | `2 × u32le` | `shared_controls_offset`, `shared_controls_len` | `offset == 0` iff `len == 0`, else `>= 128 && % 64 == 0`; `len == num_controls * 64 + cp1_overflow_bytes` (`cp1_overflow_bytes` is 0 or `>= 8`) |
 | `DBRM` 12..20 | 8 | `2 × u32le` | `tsyn_offset`, `tsyn_len` | `offset == 0` iff `len == 0`, else `% 64 == 0 && >= max(128, align64(shared_controls_end))`; `len == tsyn_count * 40` |
-| `DBRM` 20..28 | 8 | `2 × u32le` | `cext_offset`, `cext_len` | `offset == 0` iff `len == 0`, else `% 64 == 0 && >= max(128, align64(shared_controls_end), align64(tsyn_end))`; `len` strictly 0 or 1,280 B |
+| `DBRM` 20..28 | 8 | `2 × u32le` | `cext_offset`, `cext_len` | Strictly 0 and 0 in canonical v4.0 (`CEXT` removed; legacy 1,280 B reclaimed into ControlBus v4 GRA inside Arena 0..3) |
 | `DBRM` 28..31 | 3 | `3 × u8` | `ext_ring_pow2_frames`, `ext_ring_lines`, `ext_ring_format` | `pow2`: 0 or 7..=19 (`2^k` in 128..=524,288 frames at 384 kHz); `lines`: 0..=16; `format`: `0 = fp16`, `1 = f32` (> 1 rejected; logical OR across active quads sets `ext_ring_format`, sizing `(has_ext[q], cap[q])` per [op_t_transport.md §1.1.1](../dsp/op_t_transport.md#111-ring-declaration-unified-4-lane-quad-wire--active-hot-state)) |
 | `DBRM` 31..32 | 1 | `u8` | `reserved0` | Must equal 0 |
 | `DBRM` 32..36 | 4 | `u32le` | `declared_max_delay_48k` | Declared 48 kHz Transport delay ceiling (`<= 48,000`) |
 | `DBRM` 36..48 | 12 | `3 × f32le` | `dc_blocker_pole_5hz`, `tail_time_ms`, `ro_pole_48k` | Finite 5 Hz pole (`(0.8, 1.0)` else fallback `0x3F7F_D51F`, ZOH-scaled into `wet_dc_pole` per [op_t_transport.md §1.1.1](../dsp/op_t_transport.md#111-ring-declaration-unified-4-lane-quad-wire--active-hot-state)), tail (`>= 0.0`), and learned `LinearReadout` leak pole (`[0.0, 0x3F7F_FFAC]`, ZOH-scaled via `ro_pole_48k^rho_core` or 0.0 bypass when `<= 0.0`) |
 | `DBRM` 48..50 | 2 | `u16le` | `switch_xfade_samples` | Switch transition crossfade duration in samples |
 | `DBRM` 50..52 | 2 | `u16le` | `reserved_cond_zero` | Must equal 0 (conditional clamp rules occupy the 3 inline slots inside each 64 B descriptor) |
-| `DBRM` 52..60 | 8 | `u8[8]` | `content_hash_prefix` | First 8 B of SHA-256 of canonical JCS header when exported with `.dnam`, else SHA-256 of `"DNAM-BIN-CONTENT-V3\0" \|\| arena_0_lite` |
+| `DBRM` 52..60 | 8 | `u8[8]` | `content_hash_prefix` | First 8 B of SHA-256 of canonical JCS header when exported with `.dnam`, else SHA-256 of `"DNAM-BIN-CONTENT-V4\0" \|\| arena_0_lite` |
 | `DBRM` 60..64 | 4 | `u32le` | `cp1_overflow_bytes` | Exact `"CP1\0"` trailing byte length inside `shared_controls` (0 when inline-only, else `>= 8`) |
 
-All `.dnam-bin` region offsets are relative to byte 0 of the `.dnam-bin` slice (identical standalone or extracted at `dbin_offset`), zero-padded to 64 B alignment, and strictly ordered `128 <= shared_controls <= TSYN <= CEXT <= arena0_offset`.
+All `.dnam-bin` region offsets are relative to byte 0 of the `.dnam-bin` slice (identical standalone or extracted at `dbin_offset`), zero-padded to 64 B alignment, and strictly ordered `128 <= shared_controls <= TSYN <= arena0_offset` with `cext_offset == 0` and `cext_len == 0`.
 
 Retained tier `T` on load or zero-mutation `REQ-5.6` truncation is uniquely determined by matching `bytes.len() == tier_end_offsets[T]` for `T` in `0..=max_present_tier`, validating `prefix_crc32c` over the full prefix and `tier_arena_crc32c[T]` over `[arena0_offset..bytes.len())`.
 
-**2. `TSYN` Physical Tempo-Sync Array (40 B × `tsyn_count`, `tsyn_offset % 64 == 0`) & Unwatermarked `CEXT` Matrix (1,280 B):**
+**2. `TSYN` Physical Tempo-Sync Array (40 B × `tsyn_count`, `tsyn_offset % 64 == 0`, with `subdivision_override` Support):**
 
 | Record & Offset | Bytes | LE Wire Type | Field Name | Clean-Room Validation Invariant |
 | :--- | :---: | :--- | :--- | :--- |
@@ -309,8 +315,10 @@ Retained tier `T` on load or zero-mutation `REQ-5.6` truncation is uniquely dete
 | `TSYN` 12..20 | 8 | `2 × f32le` | `div_ratio`, `bpm_factor` | Precomputed rational subdivision ratio and scaling factor (both finite and > 0.0; fail closed otherwise) |
 | `TSYN` 20..32 | 12 | `f32le[3]` | `lobatto_anchors` | Physical anchor values `[v_min, v_mid, v_max]` for zero-JSON tempo inversion (all three finite; fails closed otherwise; multi-row per conditional rule) |
 | `TSYN` 32..40 | 8 | `2 × f32le` | `declared_min`, `declared_max` | Finite declared physical control interval (`declared_min <= declared_max`; fails closed otherwise) |
-| `CEXT` 0..1,024 | 1,024 | `f32le[16][16]` | `w_ctrl_ext` | Unwatermarked 3 kHz extended dispatch weights mapping `q16` to `stage_targets[16..31]`; cols 0..4 (`z_head[0..4]`) and row 15 (`stage_targets[31]`) fixed at +0.0 for SO(4) gauge invariance with immutable `dbin_prefix` |
-| `CEXT` 1,024..1,280 | 256 | `f32le[16][4]` | `w_ctrl_ultra_ext` | Ultra 3 kHz extended dispatch delta mapping `qu` to `stage_targets[16..31]` with row 15 fixed at +0.0 (defaults to +0.0 when `cext_len == 0`) |
+
+Bare `.dnam-bin` execution supports runtime `subdivision_override` (0..11) directly against binary `TSYN` rows without requiring a JSON header (REQ-2.5).
+
+When `subdivision_override` is supplied on a tempo-sync call, runtime evaluation overrides `default_subdiv` using the canonical rational `div_ratio` for that subdivision alongside the `lobatto_anchors`, `declared_min`, and `declared_max` bounds.
 
 ---
 
@@ -322,13 +330,15 @@ Retained tier `T` on load or zero-mutation `REQ-5.6` truncation is uniquely dete
 
 Every tier's runtime topology is locked to fixed nested tier capacities (Lite ⊂ Full ⊂ Pro ⊂ Ultra) with zero capture-time tier resizing (`ref[arch.tiers.maximize-quality-within-budget]`).
 
-This yields constant-size arena payloads aligned strictly to 64 B cache lines: `ARENA_LITE_BYTES` is 4,608 B (72 CL), `ARENA_FULL_BYTES` is 7,936 B (124 CL), `ARENA_PRO_BYTES` is 15,872 B (248 CL), and `ARENA_ULTRA_BYTES` is 30,720 B (480 CL).
+All four tiers execute natively at unified 2× oversampling via the 15-tap symmetric linear-phase HB-FIR `OS2X` (zero Tier-1 core override), locking `[1,1,1,1]`, `[2,2,1,1]`, `[2,2,2,2]`, and `[3,3,2,2]` block profiles (4 / 6 / 8 / 10 CoreQuads, 5 / 13 / 24 / 37 tiles with `MAX_OUTGOING_PER_QUAD = 7`).
 
-The Arena 0 Lite payload (Arena 0, 0..4,608 B, 72 CL) is 100% self-contained and stores the 1×-calibrated 48 kHz Lite `[1,1,1,1]` base parameters. It packs the `SensoryQuad` and Crossbar Block, 32 `ModalConvolver` early FIR taps, 8 Kautz pairs, Quad 0 `TransportQuad` (`Op-T`, 4 lanes), Lite `LinearReadout`, and self-contained base control tables (Arena 0 Control Plane), so extracting or running Lite never reads Arena 1..3 (REQ-5.6).
+Lite active-hot L1D occupies 4,432 B (14× = 60.59 KiB <= 64 KiB Cortex-A76 L1D), Full/Pro/Ultra active-hot ceilings stay inside 8,192 / 16,384 / 32,768 B, and cumulative 64 B-aligned wire arenas (`ARENA_LITE_BYTES..ARENA_ULTRA_BYTES`, ~31–35 KiB Ultra wire) retain half-precision weights (REQ-8.5).
 
-Arena 1..3 Delta payloads (4,608..30,720 B) store causally nested 2×-OS calibrated state deltas for Full (`[2,2,1,1]`, +3,328 B / 52 CL), Pro (`[3,2,2,1]`, +7,936 B / 124 CL), and Ultra (`[4,3,2,1]`, +14,848 B / 232 CL). They hold incremental `ModalConvolver` FIR/Kautz blocks, `TransportQuad`s, per-tier `LinearReadout` deltas, and the Arena 3 Control Plane (REQ-5.1, REQ-5.2), while analytical ZOH adapts both 1× Arena 0 and 2×-OS Arena 1..3 models to host sample rates across 44.1–384 kHz.
+The Arena 0 Lite payload is 100% self-contained and stores the 2×-calibrated Lite `[1,1,1,1]` base parameters. It packs SensoryQuad v4, the Crossbar Block, 5 inter-block tiles, 32 ModalConvolver early FIR taps, 8 `ErSparseBank` MIMO taps, 8 Kautz pairs (with reclaimed `dr` holding `onset_delay_samp` and `c_cross_fp16`), a 64-frame inline Quad 0 ring, Lite half-precision LinearReadout + split `W_ro_head`, and 2,048 B self-contained Arena 0 GRA tables, so running Lite never reads Arena 1..3 (REQ-5.6).
 
-All alignment reserve ranges remain strictly zeroed (0x00) in unwatermarked .dnam containers and are populated only in Tardos Role B watermarked copies. Those ranges are Pro CoreQuad Delta `reserve` (9,856..12,544), `transport_pro[1]` (13,440..13,568), Ultra CoreQuad Delta `reserve` (20,096..22,528), `transport_ultra[1]` (23,168..23,296), and Arena 3 Control Plane `reserve` (30,144..30,720).
+Arena 1..3 Delta payloads store causally nested 2×-OS calibrated deltas for Full (`[2,2,1,1]`, +2 quads, +8 tiles = 13, +16 FIR, +8 `ErSparseBank` = 16, +4 Kautz, Quad 1), Pro (`[2,2,2,2]`, +2 quads, +11 tiles = 24, +48 FIR, +12 Kautz, Quad 2), and Ultra (`[3,3,2,2]`, +2 quads, +13 tiles = 37, +32 FIR, +8 Kautz, Quad 3, and Ultra GRA delta <= 9,280 B total control footprint, deleting `stage_latent_core_mods_fp16`) (REQ-5.1, REQ-5.2). Analytical ZOH and Kaiser polyphase FIR adapt all four tiers across 44.1–384 kHz.
+
+All Tardos Role B alignment reserve spans remain strictly zeroed (0x00) in unwatermarked `.dnam` containers and are populated only in watermarked buyer copies, with every byte offset derived at compile time from the canonical 64 B-aligned tier arena field layout (Pro CoreQuad/Transport reserves, Ultra CoreQuad/Transport reserves, and Arena 3 Control Plane reserve).
 
 ### 2.2 Model-Declared Delay Histories (`delay_histories`)
 
@@ -359,81 +369,81 @@ Loaders validate all binary record headers, tensor offsets, 64 B alignments, sha
 
 `r[container.dnam.tensor-directory]`
 
-Every slice declared in `tensor_directory` has a 64 B-aligned `byte_offset` relative to `tier_start` (`byte_offset % 64 == 0`) and a `byte_length` bounded by `original_tier_ends[t] - tier_start` (4,608 / 7,936 / 15,872 / 30,720 B, or 72 / 124 / 248 / 480 CL across Lite..Ultra).
+Every slice declared in `tensor_directory` has a 64 B-aligned `byte_offset` relative to `tier_start` (`byte_offset % 64 == 0`) and a `byte_length` bounded by `original_tier_ends[t] - tier_start == ARENA_TIER_BYTES[t]` (compile-time derived 64 B-aligned tier sizes across Lite..Ultra, reaching ~31–35 KiB cumulative Ultra wire).
 
-Active working memory (`ActiveHot`) fits strictly inside each tier ceiling (4,544 / 7,552 / 11,136 / 14,592 B actual vs. 4,608 / 7,936 / 15,872 / 28,672 B ceilings), and each slice maps directly onto the packed 1-byte-aligned binary blocks listed below.
+True-hot active working memory fits strictly inside each tier L1D ceiling (4,432 B Lite 2× actual within 4,608 B ceiling = 60.59 KiB at 14× <= 64 KiB, plus <= 8,192 / 16,384 / 32,768 B Full..Ultra ceilings), and each slice maps directly onto the packed little-endian binary blocks listed below.
 
-| Slice Identifier | Arena Offset (rel. `tier_start`) | Bytes (64 B CL) | Binary Block & Canonical Contents |
+| Slice Identifier | Arena & Alignment | Cumulative Capacity | Binary Block & Canonical v4.0 Contents |
 | :--- | :---: | :---: | :--- |
-| `crossbar_and_sensory` | 0..256 (Arena 0) | 256 B (4 CL) | Crossbar Block: `SensoryQuad` (`sense_svf_*`, `sense_lru_*`, `sense_in_*`, `sense_tone_*`, `sense_vca_w_fp16`), SONA Meta fields, Oversampling, 3-Basis Carrier & Op-N[Pre] Base, Cell Descriptor & 4× Q0.32 Phasors |
-| `sona_core_lite` | 256..1,408 (Arena 0) | 1,152 B (18 CL) | Lite SONA Core: `core_quads` (4 × 192 B `CoreQuad` Blocks = 768 B) + `tiles` (3 × 128 B Inter-Block Tile Pairs = 384 B) |
-| `conv_fir_lite` | 1,408..1,664 (Arena 0) | 256 B (4 CL) | `ModalConvolver` Early FIR (32): 32 L + 32 R `f32le` taps (`CONVOLVER_EARLY_FIR_BASES[0] = 1,408`) |
-| `conv_kautz_lite` | 1,664..1,920 (Arena 0) | 256 B (4 CL) | 2 × Kautz SoA Blocks: 8 pairs = 16 poles (`CONVOLVER_KAUTZ_BASES[0] = 1,664`) |
-| `transport_lite` | 1,920..2,048 (Arena 0) | 128 B (2 CL) | `TransportQuad` 0 (`lanes 0..4`, 128 B symmetric orthogonal descriptor, `freeze_mix_fp16`, Schroeder, `ext_f32`; 128-frame / 1,024 B `fp16[128][4]` inline ring in 216 B hot state; `TRANSPORT_DELAY_BASES[0] = 1,920`) |
-| `linear_readout_lite` | 2,048..2,688 (Arena 0) | 640 B (10 CL) | Lite `LinearReadout`: `[L, R]` readout gains + `stage_latent_mods_fp16[96]` + `w_ro_fp16[208]` (`LINEAR_READOUT_BASES[0] = 2,048`) |
-| `control_bus_lite` | 2,688..4,608 (Arena 0) | 1,920 B (30 CL) | Arena 0 Control Plane: `lfo_skew_fp16[2]`, `tank_dry_mix_fp16`, `ou_to_z_stage_fp16[4]`, `cp1_dir`, `u_int_base`, `cp1_base`, `w_ctrl`, `rho_head_and_ctrl_tail` (`ARENA_LITE_BYTES = 4,608`) |
-| `sona_core_full` | 4,608..6,528 (Arena 1) | 1,920 B (30 CL) | Full SONA Core Delta: `core_quads[2]` (384 B) + `tiles[10]` (1,280 B) + SONA Crossbar Coupling Block (256 B) |
-| `conv_fir_full` | 6,528..6,656 (Arena 1) | 128 B (2 CL) | `ModalConvolver` Early FIR (16): +16 L/R taps (48 cum., `CONVOLVER_EARLY_FIR_BASES[1] = 6,528`) |
-| `conv_kautz_full` | 6,656..6,784 (Arena 1) | 128 B (2 CL) | 1 × Kautz SoA Block: +4 pairs (12 cum., `CONVOLVER_KAUTZ_BASES[1] = 6,656`) |
-| `transport_full` | 6,784..6,912 (Arena 1) | 128 B (2 CL) | `TransportQuad` 1 (lanes 4..8, 8 cum. lanes; `TRANSPORT_DELAY_BASES[1] = 6,784`) |
-| `linear_readout_full` | 6,912..7,936 (Arena 1) | 1,024 B (16 CL) | Full `LinearReadout`: Full Convolver Prefix Override (192 B) + `w_ro_and_mods_fp16[416]` (`ARENA_FULL_BYTES = 7,936`) |
-| `sona_core_pro` | 7,936..12,544 (Arena 2) | 4,608 B (72 CL) | Pro SONA Core Delta: `core_quads[2]` (384 B) + `tiles[10]` (1,280 B) + `crossbar_pro` (256 B) + `reserve: u8[2,688]` (`0x00` unless Tardos Role B watermarked) |
-| `conv_fir_pro` | 12,544..12,928 (Arena 2) | 384 B (6 CL) | `ModalConvolver` Early FIR (48): +48 L/R taps (96 cum., `CONVOLVER_EARLY_FIR_BASES[2] = 12,544`) |
-| `conv_kautz_pro` | 12,928..13,312 (Arena 2) | 384 B (6 CL) | 3 × Kautz SoA Blocks: +12 pairs (24 cum., `CONVOLVER_KAUTZ_BASES[2] = 12,928`) |
-| `transport_pro` | 13,312..13,568 (Arena 2) | 256 B (4 CL) | 2 × `TransportQuad`s: `[0]` = Quad 2 (lanes 8..12, 12 cum. lanes), `[1]` = 128 B `reserve` (`0x00` unless Tardos Role B watermarked; `TRANSPORT_DELAY_BASES[2] = 13,312`) |
-| `linear_readout_pro` | 13,568..15,872 (Arena 2) | 2,304 B (36 CL) | Pro `LinearReadout`: Pro Convolver Prefix Override (384 B) + `w_ro_and_mods_fp16[960]` (`ARENA_PRO_BYTES = 15,872`) |
-| `sona_core_ultra` | 15,872..22,528 (Arena 3) | 6,656 B (104 CL) | Ultra SONA Core Delta: `core_quads[2]` + `tiles[12]` + `crossbar_ultra` + `stage_latent_core_mods_fp16[1,024]` (0 unless `SONA_META_CORE_MODS_PRESENT`) + `reserve[2,432]` (`0x00` unless Tardos Role B watermarked) |
-| `conv_fir_ultra` | 22,528..22,784 (Arena 3) | 256 B (4 CL) | `ModalConvolver` Early FIR (32): +32 L/R taps (128 cum., `CONVOLVER_EARLY_FIR_BASES[3] = 22,528`) |
-| `conv_kautz_ultra` | 22,784..23,040 (Arena 3) | 256 B (4 CL) | 2 × Kautz SoA Blocks: +8 pairs (32 cum., `CONVOLVER_KAUTZ_BASES[3] = 22,784`) |
-| `transport_ultra` | 23,040..23,296 (Arena 3) | 256 B (4 CL) | 2 × `TransportQuad`s: `[0]` = Quad 3 (lanes 12..16, 16 cum. lanes; completes 4 quads × 4 lanes = 16 partitioned per-lane Schroeder all-pass stages across Quads 0..3, up to 16,384 samples at 384 kHz, `abs(a_diff) <= 0.75`), `[1]` = 128 B `reserve` (`0x00` unless Tardos Role B watermarked; preserves Quads 0..2 and `ref[dsp.head.tier-equivalence]`; `TRANSPORT_DELAY_BASES[3] = 23,040`) |
-| `linear_readout_ultra` | 23,296..26,880 (Arena 3) | 3,584 B (56 CL) | Ultra `LinearReadout`: Ultra Convolver Prefix Override (576 B) + `w_ro_and_mods_fp16[1,504]` |
-| `control_bus_ultra_delta` | 26,880..30,720 (Arena 3) | 3,840 B (60 CL) | Arena 3 Control Plane: `w_ctrl_ultra` + `u_int_ultra` + `cp1_ultra` + `stage_latent_ctrl_ultra_fp16[256]` (incl. `ou_to_z_stage_ultra_fp16` at `[160..164]`) + `reserve[576]` (`0x00` unless Tardos Role B watermarked; `ARENA_ULTRA_BYTES = 30,720`) |
+| `crossbar_and_sensory` | Arena 0 (0..256) | 256 B (4 CL) | Crossbar Block: `SensoryQuad` v4 (`sense_svf_*`, `sense_lru_*`, `sense_in_*`, `sense_tone_*`, Log-Knee VCA `b_makeup`, `s_slope`, `l_scale`, `c_knee`, `theta_lin`, `peak_rms_mix`), SONA Meta (`version_major = 4`, `tier_os2x = [true; 4]`), `Op-P` v4 `T1+` + 3-Basis Carrier, `Op-N[Pre]` v4 (`kappa_h`), Cell Descriptor & 4× Q0.32 Phasors |
+| `sona_core_lite` | Arena 0 (64 B CL) | 4 quads, 5 tiles | Lite SONA Core: `core_quads[4]` (`CoreQuad` v4 `fp16` blocks) + `tiles[5]` (`InterBlockTilePair` `(0,1),(1,2),(2,3),(0,2),(1,3)`, `fp16` `w_even`/`w_lru`) + explicit `u16` `rect_sign_mask` |
+| `conv_fir_lite` | Arena 0 (64 B CL) | 32 FIR/ch + 8 ErSparse | `ModalConvolver` Early FIR (32 L + 32 R `f32le` taps) + `ErSparseBank[8]` MIMO early reflection taps on the 1,024-sample ring (`CONVOLVER_EARLY_FIR_BASES[0]`) |
+| `conv_kautz_lite` | Arena 0 (64 B CL) | 8 pairs (2 blks) | 2 × Kautz SoA Blocks (128 B each, reclaimed `dr` bytes 16..32 hold `onset_delay_samp: u16le[4]` + `c_cross_fp16: u16le[4]`, `CONVOLVER_KAUTZ_BASES[0]`) |
+| `transport_lite` | Arena 0 (64 B CL) | 1 quad (4 lanes) | `TransportQuad` 0 v4 (`M_fb`, bipolar `g_loop`, ±64 Hz ramp, `sigma_knee <= 4.0`, `QuadCtrlRoute`, 64-frame / 512 B `fp16[64][4]` inline ring in hot state, `TRANSPORT_DELAY_BASES[0]`) |
+| `linear_readout_lite` | Arena 0 (64 B CL) | 16 lanes | Lite `fp16` `LinearReadout`: `[L, R]` gains + `stage_latent_mods_fp16` + compact `fp16` `w_ro_fp16` (`REQ-8.5`) + split `W_ro_head` (`odd` + `even_lru`) (`LINEAR_READOUT_BASES[0]`) |
+| `control_bus_lite` | Arena 0 (64 B CL) | 2,048 B `GRA` | Self-contained Arena 0 `ControlBus` v4 `GRA`: `cp1_dir`, `ExactIntMainAccumulator` `u_int_base[:,0..4]`, unrotated `CP1`, Zero-Anchored `SwiGLU` (H=8) + `Padé-[1/1]`, `1.5-Entmax` prototypes (M=8), bilinear gates, `rho_head_and_ctrl_tail` |
+| `sona_core_full` | Arena 1 (64 B CL) | 6 quads, 13 tiles | Full SONA Core Delta: `core_quads[2]` (4, 5) + `tiles[8]` (5..13) + SONA Crossbar Coupling Block (256 B) |
+| `conv_fir_full` | Arena 1 (64 B CL) | 48 FIR/ch + 16 ErSparse | `ModalConvolver` Early FIR (+16 L/R taps = 48 cum.) + +8 `ErSparseBank` taps (16 cum.) + 2-basis `fp16` FIR voicing morph (`CONVOLVER_EARLY_FIR_BASES[1]`) |
+| `conv_kautz_full` | Arena 1 (64 B CL) | 12 pairs (3 blks) | 1 × Kautz SoA Block (+4 pairs = 12 cum., `CONVOLVER_KAUTZ_BASES[1]`) |
+| `transport_full` | Arena 1 (64 B CL) | 2 quads (8 lanes) | `TransportQuad` 1 v4 (lanes 4..8, `M_series` lower-tri row, `TRANSPORT_DELAY_BASES[1]`) |
+| `linear_readout_full` | Arena 1 (64 B CL) | 24 lanes | Full `fp16` `LinearReadout`: Full Convolver Prefix Override (192 B) + `w_ro_and_mods_fp16` + split `W_ro_head` delta (`ARENA_FULL_BYTES`) |
+| `sona_core_pro` | Arena 2 (64 B CL) | 8 quads, 24 tiles | Pro SONA Core Delta (`[2,2,2,2]`): `core_quads[2]` (6, 7) + `tiles[11]` (13..24) + `crossbar_pro` (256 B) + `reserve` (`0x00` unless Tardos Role B watermarked) |
+| `conv_fir_pro` | Arena 2 (64 B CL) | 96 FIR/ch | `ModalConvolver` Early FIR (+48 L/R taps = 96 cum., `CONVOLVER_EARLY_FIR_BASES[2]`) |
+| `conv_kautz_pro` | Arena 2 (64 B CL) | 24 pairs (6 blks) | 3 × Kautz SoA Blocks (+12 pairs = 24 cum., `CONVOLVER_KAUTZ_BASES[2]`) |
+| `transport_pro` | Arena 2 (64 B CL) | 3 quads (12 lanes) | 2 × `TransportQuad`s: `[0]` = Quad 2 (lanes 8..12, `M_series`), `[1]` = 128 B `reserve` (`0x00` unless Tardos Role B watermarked; `TRANSPORT_DELAY_BASES[2]`) |
+| `linear_readout_pro` | Arena 2 (64 B CL) | 32 lanes | Pro `fp16` `LinearReadout`: Pro Convolver Prefix Override (384 B) + `w_ro_and_mods_fp16` + split `W_ro_head` delta (`ARENA_PRO_BYTES`) |
+| `sona_core_ultra` | Arena 3 (64 B CL) | 10 quads, 37 tiles | Ultra SONA Core Delta (`[3,3,2,2]`, `MAX_OUTGOING_PER_QUAD = 7`): `core_quads[2]` (8, 9) + `tiles[13]` (24..37) + `crossbar_ultra` (256 B) + `reserve` (`stage_latent_core_mods_fp16` 2,048 B deleted / reclaimed into `GRA`) |
+| `conv_fir_ultra` | Arena 3 (64 B CL) | 128 FIR/ch | `ModalConvolver` Early FIR (+32 L/R taps = 128 cum., `CONVOLVER_EARLY_FIR_BASES[3]`) |
+| `conv_kautz_ultra` | Arena 3 (64 B CL) | 32 pairs (8 blks) | 2 × Kautz SoA Blocks (+8 pairs = 32 cum., `CONVOLVER_KAUTZ_BASES[3]`) |
+| `transport_ultra` | Arena 3 (64 B CL) | 4 quads (16 lanes) | 2 × `TransportQuad`s: `[0]` = Quad 3 (lanes 12..16, 16 Schroeder stages up to 16,384 samples at 384 kHz, `abs(a_diff) <= 0.75`, `M_series`, unitary freeze), `[1]` = 128 B `reserve` (`TRANSPORT_DELAY_BASES[3]`) |
+| `linear_readout_ultra` | Arena 3 (64 B CL) | 40 lanes | Ultra `fp16` `LinearReadout`: Ultra Convolver Prefix Override (576 B) + `w_ro_and_mods_fp16` + split `W_ro_head` delta (`LINEAR_READOUT_BASES[3]`) |
+| `control_bus_ultra_delta` | Arena 3 (64 B CL) | <= 9,280 B cum. | Arena 3 `GRA` Ultra Delta: `w_ctrl_ultra`, `u_int_ultra[0]` (`z_head[0..4]` `SO(4)` only), `SwiGLU` (`H=16`) + `1.5-Entmax` (`M=16`) + `g_edge[0..6]` + `op_t_q[0..16]` + `stage_latent_ctrl_ultra_fp16[256]` + `reserve` (`ARENA_ULTRA_BYTES`) |
 
 **1. Crossbar & SensoryQuad Block (256 B, Arena 0, bytes 0..256):**
 
 | Arena Offset | Block Member (Bytes) | LE Wire Type | Clean-Room Sub-Fields & Bit Flags |
 | :---: | :--- | :--- | :--- |
-| 0..16 | `sense_svf_g` (16 B) | `f32le[4]` | `SensoryQuad` 48 kHz TPT-SVF cutoff tangent gains `[1e-5, 64.0]` (ZOH via `rescale_tpt_svf_g_zoh`, fallback 0.25). |
+| 0..16 | `sense_svf_g` (16 B) | `f32le[4]` | `SensoryQuad` 48 kHz TPT-SVF cutoff tangent gains `[1e-5, 64.0]` (ZOH via `rescale_tpt_svf_g_zoh`, modulated by `sense_svf_g_oct[0..4]`, fallback 0.25). |
 | 16..32 | `sense_lru_alpha_rel` (16 B) | `f32le[4]` | `SensoryQuad` 48 kHz ParaLRU release poles `[0.0, 0x3F7F_FFAC]` (ZOH `^rho_vm`, fallback 0.0). |
 | 32..48 | `sense_lru_alpha_atk` (16 B) | `f32le[4]` | `SensoryQuad` 48 kHz ParaLRU attack poles `[0.0, 1.0]` (ZOH `^rho_vm`, fallback 0.0). |
 | 48..56 | `sense_svf_k_fp16` (8 B) | `u16le[4]` | `SensoryQuad` TPT-SVF damping `[0.0, 8.0]` (`fp16`, fallback `1 / sqrt(2)`). |
 | 56..64 | `sense_lru_kappa_fp16` (8 B) | `u16le[4]` | `SensoryQuad` ParaLRU self-feedback `[0.0, 1.0]` (`fp16`, fallback 0.0). |
-| 64..68 | `meta.pipeline_flags` (4 B) | `u32le` | `ARENA0_PIPELINE_FLAGS_OFFSET = 64`; upper half `PIPE_MAGIC_HI = 0x444E_0000` (`PIPE_MAGIC_MASK = 0xFFFF_0000`); bits 0–2 reserved 0; `1<<3` `PIPE_FLAG_CONVOLVER_EXT`; `1<<4` `PIPE_FLAG_TRANSPORT_EXT`; `1<<5` `PIPE_FLAG_UNIFIED_W_CTRL`; `1<<6` `PIPE_FLAG_V3_MATRYOSHKA`; `1<<7` `PIPE_FLAG_SONA` (`PIPE_FLAG_ALL_SONA = 0x00F8`, canonical v3.0 `0x444E_00F8`). |
+| 64..68 | `meta.pipeline_flags` (4 B) | `u32le` | `ARENA0_PIPELINE_FLAGS_OFFSET = 64`; upper half `PIPE_MAGIC_HI = 0x444E_0000` (`PIPE_MAGIC_MASK = 0xFFFF_0000`); bits 0–2 reserved 0; `1<<3` `PIPE_FLAG_CONVOLVER_EXT`; `1<<4` `PIPE_FLAG_TRANSPORT_EXT`; `1<<5` `PIPE_FLAG_UNIFIED_W_CTRL`; `1<<6` `PIPE_FLAG_V4_MATRYOSHKA`; `1<<7` `PIPE_FLAG_SONA` (`PIPE_FLAG_ALL_SONA = 0x00F8`, canonical v4.0 `0x444E_00F8`). |
 | 68..84 | `meta.tier_gain_trim` (16 B) | `f32le[4]` | `ARENA0_TIER_GAIN_TRIM_OFFSET = 68`; `[Lite, Full, Pro, Ultra]` output trim (<= 0.05 LU). |
-| 84..88 | `meta.sona_meta_flags` (4 B) | `u32le` | `ARENA0_SONA_META_OFFSET = 84` (mirrored identically in SONA Cell Descriptor `cell_flags` at 204..208): bits 0–3 `tier_os2x[0..4]`; bit 4 (`0x10`) `SONA_META_OS2X`; bit 5 (`0x20`) reserved 0; bit 6 (`0x40`) `SONA_META_TIER_OS_EXPLICIT`; bit 7 (`0x80`) `SONA_META_CONVOLVER_PREFIX_OVERRIDES`; bit 8 (`0x100`) `SONA_META_OS_EXT_PRESENT`; bit 9 (`0x200`) `SONA_META_CORE_MODS_PRESENT`; bits 16–20 (`1<<16` `SONA_META_TRANSPORT_TAP_GAINS`, `1<<17` `SONA_META_SENSORY_QUAD`, `1<<18` reserved 0, `1<<19` reserved 0, `1<<20` `SONA_META_TRANSPORT_LFO`). |
-| 88..128 | `sense_mix` & crossbar scalars (40 B) | `u16le` + `f32le` | 88..96 `sense_in_l_fp16: u16le[4]` (`[-4.0, 4.0]`), 96..104 `sense_in_r_fp16: u16le[4]` (`[-4.0, 4.0]`), 104..112 `sense_tone_lp_fp16: u16le[4]` (`[-16.0, 16.0]`), 112..120 `sense_tone_bp_fp16: u16le[4]` (`[-16.0, 16.0]`), 120..124 `crossbar_op_gains_fp16: u16le[2]` (`[op_p_crossbar_gain, op_t_crossbar_gain]` in `[-4.0, 4.0]`), 124..128 `anti_zipper_ramp_scale: f32le` (48 kHz ref step fraction in `(0.0, 1.0]`, default 0.0625 when `<= 1.0e-7` or non-finite). |
-| 128..192 | `os_and_front_ext` (64 B) | `f32le[7]` + `u16le[3][4]` + `f32le[3]` | `ARENA0_OS_PARAMS_OFFSET = 128`: 128..156 `os_up_quad_coeff`, `os_dec_c_prev1`, `os_dec_c0`, `os_up_pre_emph`, `os_dec_aa_mix`, `os_up_aa_mix`, `os_up_zoh_mix` (`dec_c1 = 1.0 - os_dec_c_prev1 - os_dec_c0`); 156..180 `carrier_basis_w_fp16: u16le[3][4]` (`[hi*cos, hq*sin, sin]` carrier projection); 180..192 Op-N[Pre] Base Record (`gamma_bc: f32le`, `zoh_hold_depth: f32le` encoding `1.0 - rho_zoh` in `[0.0, 0.9999]` so zero-init decodes ZOH bypass, `beta_q: f32le`). |
-| 192..208 | `cell_phasors.cell_desc` (16 B) | `SONA Cell Descriptor` | +0..4 `magic = "SONA"`, +4..6 `version_major = 3 (u16le)`, +6..8 `version_minor = 0 (u16le)`, +8..10 `tier_flags: u16le` (`0x01=Lite`, `0x03=Full`, `0x07=Pro`, `0x0F=Ultra`), +10..12 `oversample_factor: u16le` (`1 \| 2`), +12..16 `cell_flags: u32le` (mirrors `sona_meta_flags`). |
+| 84..88 | `meta.sona_meta_flags` (4 B) | `u32le` | `ARENA0_SONA_META_OFFSET = 84` (mirrored identically in SONA Cell Descriptor `cell_flags` at 204..208): bits 0–3 `tier_os2x[0..4]` (`[true, true, true, true]` in v4.0); bit 4 (`0x10`) `SONA_META_OS2X` (1); bit 5 (`0x20`) reserved 0; bit 6 (`0x40`) `SONA_META_TIER_OS_EXPLICIT`; bit 7 (`0x80`) `SONA_META_CONVOLVER_PREFIX_OVERRIDES`; bit 8 (`0x100`) `SONA_META_OS_EXT_PRESENT`; bit 9 (`0x200`) retired / strictly 0 (`stage_latent_core_mods_fp16` reclaimed into `GRA`); bits 16–20 (`1<<16` `SONA_META_TRANSPORT_TAP_GAINS`, `1<<17` `SONA_META_SENSORY_QUAD`, `1<<18` `SONA_META_GRA_CONTROL_BUS`, `1<<19` reserved 0, `1<<20` `SONA_META_TRANSPORT_LFO`). |
+| 88..128 | `sense_mix` & crossbar scalars (40 B) | `u16le` + `f32le` | 88..96 `sense_in_l_fp16: u16le[4]` (`[-4.0, 4.0]`), 96..104 `sense_in_r_fp16: u16le[4]` (`[-4.0, 4.0]`), 104..112 `sense_tone_lp_fp16: u16le[4]` (`[-16.0, 16.0]`), 112..120 `sense_tone_bp_fp16: u16le[4]` (`[-16.0, 16.0]`), 120..124 `crossbar_op_gains_fp16: u16le[2]` (`[op_p_crossbar_gain, op_t_crossbar_gain]` in `[-4.0, 4.0]`), 124..128 `anti_zipper_ramp_scale: f32le` (`4 / K_ctrl` microchunk step fraction in `(0.0, 1.0]`, default 0.25 for `K_ctrl = 16` when `<= 1.0e-7` or non-finite). |
+| 128..192 | `os_and_front_ext` (64 B) | `u16le` + `f32le` | `ARENA0_OS_PARAMS_OFFSET = 128`: 128..156 repurposed from legacy poly3/HB-IIR scalars (since 15-tap HB-FIR taps are compile-time fixed) into `SensoryQuad` v4 Unified Log-Knee VCA (`b_makeup`, `s_slope`, `l_scale`, `c_knee`, `theta_lin`, `peak_rms_mix`) + `Op-P` v4 `T1+` (`pole_trk`, `alpha_oct`, `beta_oc2`, `stereo_2band`); 156..180 `carrier_basis_w_fp16: u16le[3][4]` (`[hi*cos, hq*sin, sin]`); 180..192 `Op-N[Pre]` v4 Record (`gamma_bc: f32le`, `zoh_hold_depth: f32le` / `log2_rho_zoh`, `beta_q: u16le` + `kappa_h: u16le` hold sharpness in `[0.0, 1.0]`). |
+| 192..208 | `cell_phasors.cell_desc` (16 B) | `SONA Cell Descriptor` | +0..4 `magic = "SONA"`, +4..6 `version_major = 4 (u16le)`, +6..8 `version_minor = 0 (u16le)`, +8..10 `tier_flags: u16le` (`0x01=Lite`, `0x03=Full`, `0x07=Pro`, `0x0F=Ultra`), +10..12 `oversample_factor: u16le` (2 across all tiers in v4.0), +12..16 `cell_flags: u32le` (mirrors `sona_meta_flags`). |
 | 208..240 | `cell_phasors` clocks (32 B) | `f32le[4]`, `u32le[4]` | 208..224 `phasor_freq_hz: f32le[4]`, 224..240 `phasor_init_phase_q32: u32le[4]`. |
-| 240..256 | `sense_hp_and_vca_fp16` (16 B) | `u16le[8]` | 240..248 `sense_tone_hp_fp16: u16le[4]` (`[-16.0, 16.0]`), 248..256 `sense_vca_w_fp16: u16le[4]` (`[-512.0, 512.0]`, driving smooth input VCA `g_in` uniformly across L and R). |
+| 240..256 | `sense_hp_and_vca_fp16` (16 B) | `u16le[8]` | 240..248 `sense_tone_hp_fp16: u16le[4]` (`[-16.0, 16.0]`), 248..256 `sense_vca_w_fp16: u16le[4]` (`[-512.0, 512.0]`, driving Unified 0-FDIV Log-Knee VCA `[-5.0, +4.0]` octaves and 4-frame `block_vca_gain[0..4]`). |
 
-Loaders ALWAYS validate `meta.pipeline_flags` at offset 64 via `(flags & 0xFFFF_0000) == 0x444E_0000 && (flags & 0x00E0) == 0x00E0` (`PIPE_FLAG_SONA | PIPE_FLAG_V3_MATRYOSHKA | PIPE_FLAG_UNIFIED_W_CTRL`, canonical v3.0 `0x444E_00F8`), rejecting `pipeline_flags == 0` fail-closed while treating bits 3 (`PIPE_FLAG_CONVOLVER_EXT`) and 4 (`PIPE_FLAG_TRANSPORT_EXT`) as informational.
+Loaders ALWAYS validate `meta.pipeline_flags` at offset 64 via `(flags & 0xFFFF_0000) == 0x444E_0000 && (flags & 0x00E0) == 0x00E0` (`PIPE_FLAG_SONA | PIPE_FLAG_V4_MATRYOSHKA | PIPE_FLAG_UNIFIED_W_CTRL`, canonical v4.0 `0x444E_00F8`), rejecting `pipeline_flags == 0` fail-closed while treating bits 3 (`PIPE_FLAG_CONVOLVER_EXT`) and 4 (`PIPE_FLAG_TRANSPORT_EXT`) as informational.
 
 The following table defines the flag-gated decoding rules for all defined bits in `sona_meta_flags` (offset 84, mirrored in `cell_flags` at bytes 204..208):
 
 | Flag Constant | Bit | Behavior When Set (1) | Behavior When Clear (0) |
 | :--- | :---: | :--- | :--- |
-| `tier_os2x[0..4]` | 0–3 | Per-tier 2× core OS bits (`Lite..Ultra`), governed by bit 6 `SONA_META_TIER_OS_EXPLICIT`; runtime enables 2× core iff `os2x_active = (tier > 0) && !offline_bounce && tier_os2x[tier] && (2.0 * f_{s,vm} <= 384_000.0)` | Runs tier at 1× `f_{s,vm}` when bit 6 is 1; else Full–Ultra OR with `[false, true, true, true]` (still gated by `os2x_active`) |
-| `SONA_META_OS2X` | 4 (`0x10`) | Summary core OS bit (`os2x = ((flags & 0x10) != 0) \|\| cell_desc.oversample_factor > 1`); execution still uses `tier_os2x[tier]` | Summary OS bit clear (`os2x` follows `cell_desc.oversample_factor > 1`); execution still uses `tier_os2x[tier]` |
-| `SONA_META_TIER_OS_EXPLICIT` | 6 (`0x40`) | Bits 0–3 authoritatively specify `tier_os2x[0..4]` verbatim so disabling 2× OS on any tier round-trips cleanly | Loaders OR bits 0–3 with `[false, true, true, true]` |
-| `SONA_META_CONVOLVER_PREFIX_OVERRIDES` | 7 (`0x80`) | Set iff tier `t` in 1–3 overrides its preceding `ModalConvolver` prefix by > 1e-7; applies `f32` override plus `fp16` slots (`[296..352]` Full, `[392..452]` Pro, `[488..656]` Ultra) | Retains inherited `f32` `ModalConvolver` Early FIR and Kautz SoA weights verbatim |
-| `SONA_META_OS_EXT_PRESENT` | 8 (`0x100`) | Decodes bytes 128..192 verbatim (7 `f32le` oversampler scalars, `carrier_basis_w_fp16`, 3 `f32le` `Op-N[Pre]` scalars) even when `os_up_quad_coeff == 0.0` and `os_dec_c0 == 0.0` | Sets explicit defaults (`os_up_quad_coeff = -0.125`, `os_dec_c_prev1 = 0.15`, `os_dec_c0 = 0.50`, `os_up_pre_emph = 0.0`, `os_dec_aa_mix = 0.0`, `os_up_aa_mix = 0.0`, `os_up_zoh_mix = 0.0`, derived `dec_c1 = 0.35`), forces `carrier_basis_w_fp16 = [0; 12]`, and bypasses `Op-N[Pre]` ([router_and_crossbar_topology.md §5](../dsp/router_and_crossbar_topology.md#5-4-block-matryoshka-sona-core)) |
-| `SONA_META_CORE_MODS_PRESENT` | 9 (`0x200`) | Guards Arena 3 Ultra `stage_latent_core_mods_fp16[0..1024]` (bytes 18,048..20,096 rel. `tier_start`) for per-lane modulation | All 1,024 `u16le` entries (2,048 B) are `0x0000` and runtime skips them with 0 MAC overhead |
-| `SONA_META_TRANSPORT_TAP_GAINS` & `SONA_META_TRANSPORT_LFO` | 16 (`0x1_0000`), 20 (`0x10_0000`) | Canonical 1 in v3.0; decoders ALWAYS unpack every 128 B `TransportQuad` record unconditionally | Unpacks every 128 B `TransportQuad` record verbatim regardless of bits 16/20 (`freeze_mix_fp16` clamps to `[0.0, 1.0]`, `NaN` -> 0.0; `sigma_knee_fp16` clamps to `[1e-3, 0.984375]`; finite `r_dc` clamps to `[0.95, 0.999995]` (`0x3F7F_FFAC`) with `0x3F7F_D51F` non-finite fallback; stage-level `tank_dry_mix_fp16 = 0x0000` decodes 0.0, `NaN` -> 1.0) |
-| `SONA_META_SENSORY_QUAD` | 17 (`0x2_0000`) | Canonical 1 in v3.0; decoders ALWAYS unpack all `SensoryQuad` fields (0..64, 88..120, 240..256) and `crossbar_op_gains_fp16` (120..124) unconditionally | Decoded unconditionally even if bit 17 is clear because zero-initialized sensing weights yield exact identity `g_in == 1.0` |
-| Reserved bits | 5, 10–15, 18–19, 21–31 | Must equal 0 in canonical v3.0 containers | Ignored / 0 |
+| `tier_os2x[0..4]` | 0–3 | Per-tier 2× 15-tap HB-FIR core OS bits (`[true, true, true, true]` in v4.0); runtime enables 2× core iff `os2x_active = !offline_bounce && tier_os2x[tier] && (2.0 * f_{s,vm} <= 384_000.0)` | Runs tier at 1× `f_{s,vm}` only when `2.0 * f_{s,vm} > 384_000.0` (above 192 kHz) or explicitly cleared under `SONA_META_TIER_OS_EXPLICIT` |
+| `SONA_META_OS2X` | 4 (`0x10`) | Canonical 1 in v4.0 (`os2x = ((flags & 0x10) != 0) \|\| cell_desc.oversample_factor > 1`) | Summary OS bit clear (`os2x` follows `cell_desc.oversample_factor > 1`) |
+| `SONA_META_TIER_OS_EXPLICIT` | 6 (`0x40`) | Bits 0–3 authoritatively specify `tier_os2x[0..4]` verbatim (canonical `[true, true, true, true]` across Lite..Ultra) | Loaders OR bits 0–3 with `[true, true, true, true]` |
+| `SONA_META_CONVOLVER_PREFIX_OVERRIDES` | 7 (`0x80`) | Set iff tier `t` in 1–3 overrides its preceding `ModalConvolver` prefix by > 1e-7; applies `f32` override plus `fp16` slots | Retains inherited `f32` `ModalConvolver` Early FIR and Kautz SoA weights verbatim |
+| `SONA_META_OS_EXT_PRESENT` | 8 (`0x100`) | Decodes bytes 128..192 verbatim (`SensoryQuad` v4 Log-Knee VCA, `Op-P` v4 `T1+`, `carrier_basis_w_fp16`, `Op-N[Pre]` v4 scalars including `kappa_h`) | Applies identity Log-Knee VCA (`g_vca == 1.0`), zeros `T1+` and `carrier_basis_w_fp16`, and bypasses `Op-N[Pre]` ([router_and_crossbar_topology.md §5](../dsp/router_and_crossbar_topology.md#5-4-block-matryoshka-sona-core)) |
+| `SONA_META_CORE_MODS_PRESENT` | 9 (`0x200`) | Retired in v4.0 (`stage_latent_core_mods_fp16` 2,048 B reclaimed into `GRA`); loaders reject bit 9 set or treat 0 B | Must equal 0 in canonical v4.0 containers |
+| `SONA_META_TRANSPORT_TAP_GAINS` & `SONA_META_TRANSPORT_LFO` | 16 (`0x1_0000`), 20 (`0x10_0000`) | Canonical 1 in v4.0; decoders ALWAYS unpack every extended `TransportQuad` record unconditionally | Unpacks every `TransportQuad` v4 record verbatim regardless of bits 16/20 (`freeze_mix_fp16` clamps to `[0.0, 1.0]`, `sigma_knee_fp16` clamps to `[1e-3, 4.0]` `0x4400`, finite `r_dc` clamps to `[0.95, 0.999995]`, `g_loop` clamps to `[-0.9990, +0.9990]`) |
+| `SONA_META_SENSORY_QUAD` & `SONA_META_GRA_CONTROL_BUS` | 17 (`0x2_0000`), 18 (`0x4_0000`) | Canonical 1 in v4.0; decoders unpack all `SensoryQuad` v4 fields, `crossbar_op_gains_fp16`, and `ControlBus` v4 `GRA` tables unconditionally | `SensoryQuad` decoded unconditionally (`g_vca == 1.0` default); `GRA` bit 18 required in canonical v4.0 |
+| Reserved bits | 5, 10–15, 19, 21–31 | Must equal 0 in canonical v4.0 containers | Ignored / 0 |
 
 **2. SONA Core Element & Delta Binary Blocks (Arena 0..3):**
 
-| Binary Block | Bytes (1-byte aligned) | Exact Relative Field Offsets & Types |
+| Binary Block | Bytes / Shape | Exact Clean-Room Field Layout & v4.0 Invariants |
 | :--- | :---: | :--- |
-| `CoreQuad` Block (4 lanes) | 192 B | 0..16 `svf_g f32le[4]`, 16..32 `lru_alpha_rel f32le[4]`, 32..48 `lru_alpha_atk f32le[4]`, 48..56 `svf_k_fp16 u16le[4]`, 56..64 `lru_kappa_fp16 u16le[4]`, 64..72 `adaa_drive_fp16 u16le[4]`, 72..80 `lru_bias_drive_fp16 u16le[4]`, 80..88 `tone_lp_fp16 u16le[4]`, 88..96 `tone_bp_fp16 u16le[4]`, 96..104 `tone_hp_fp16 u16le[4]`, 104..112 `tone_ap_fp16 u16le[4]`, 112..120 `tone_dir_fp16 u16le[4]`, 120..128 `sag_depth_fp16 u16le[4]`, 128..136 `wavefolder_mix_fp16 u16le[4]` (bit 15 `0x8000` encodes `rect_sign`: 0 = +1.0, 1 = -1.0; bits 0..=14 `raw & 0x7FFF` encode unsigned `wavefolder_mix` in [0.0, 1.0]), 136..144 `svf_k_nl_fp16 u16le[4]` ([0.0, 16.0] on Block 0 quads {0, 4, 6, 8}, i.e. `core_quads[0]` in Arena 0..3; strictly `0x0000` fail-closed on Blocks 1..3 quads {1, 2, 3, 5, 7, 9}), 144..152 `in_mid_weight_fp16 u16le[4]`, 152..160 `in_side_weight_fp16 u16le[4]`, 160..168 `lru_stereo_link_fp16 u16le[4]`, 168..176 `lru_duhem_gamma_fp16 u16le[4]`, 176..184 `lru_signed_mix_fp16 u16le[4]`, 184..192 `glu_mix_fp16 u16le[4]` |
-| Inter-Block Tile Pair | 128 B | 0..64 `w_odd_4x4 f32le[4][4]`, 64..96 `w_even_4x4_fp16 u16le[4][4]`, 96..128 `w_lru_4x4_fp16 u16le[4][4]` (column-major `[src_lane][dst_lane]` / `[col][row]` layout) |
+| `CoreQuad` Block (4 lanes, `fp16` retained per REQ-8.5) | 176 B hot (`fp16` + `f32` poles) | `svf_g f32le[4]`, `lru_alpha_rel f32le[4]`, `lru_alpha_atk f32le[4]`, `svf_k_fp16`, `lru_kappa_fp16`, `adaa_drive_fp16`, `lru_bias_drive_fp16`, 3 folded orthogonal tone coefficients `c_lp_fp16`, `c_bp_fp16`, `c_u_fp16` on Blocks 1..3 (plus `c_kbp_fp16` / `svf_k_nl_fp16` in `[0.0, 16.0]` on Block 0 quads `{0, 4, 8}`, strictly `0x0000` on Blocks 1..3 `{1, 2, 3, 5, 6, 7, 9}`), `g0_fp16` & `g_inf_fp16` (`[0.0, 2.5]`), `d_pre_fp16`, `lin_mix_fp16` (polarized `{0, 1}`), `se_w_sq_fp16` & `se_d_bus_fp16` (`SE-Bus`), `out_gain_fp16` (`[-4.0, +4.0]`), `wavefolder_mix_fp16` (strictly unsigned `[0.0, 1.0]`), **explicit `rect_sign_mask: u16le`** (1 bit/lane, never bit-15 -0.0), `in_mid_weight_fp16`, `in_side_weight_fp16`, `lru_stereo_link_fp16`, `lru_duhem_gamma_fp16`, `lru_signed_mix_fp16`, `glu_mix_fp16` |
+| Inter-Block Tile Pair | 128 B (5 / 13 / 24 / 37) | 0..64 `w_odd_4x4 f32le[4][4]`, 64..96 `w_even_4x4_fp16 u16le[4][4]`, 96..128 `w_lru_4x4_fp16 u16le[4][4]` (`[src_lane][dst_lane]`, modulated via 6 scalar `g_edge[0..6]` gates with 0 tile rewrites; `MAX_OUTGOING_PER_QUAD = 7`) |
 | SONA Crossbar Coupling Block | 256 B | 0..80 `op_p_to_core_fp16 u16le[10][4]`, 80..160 `phasor_to_core_fp16 u16le[10][4]`, 160..224 `opt_to_lr_fp16 u16le[16][2]`, 224..240 `phasor_stereo_phase_fp16 u16le[8]`, 240..256 `crossbar_reserved_fp16 u16le[8]` |
-| Lite SONA Core (Arena 0: 256..1,408) | 1,152 B | 0..768 `core_quads[4]` (quads 0..4, 4 × 192 B `CoreQuad` Blocks), 768..1,152 `tiles[3]` (tiles 0..3, 3 × 128 B Inter-Block Tile Pairs) |
-| Full SONA Core Delta (Arena 1: 4,608..6,528) | 1,920 B | 0..384 `core_quads[2]` (4..6), 384..1,664 `tiles[10]` (3..13), 1,664..1,920 `crossbar` (256 B SONA Crossbar Coupling Block) |
-| Pro SONA Core Delta (Arena 2: 7,936..12,544) | 4,608 B | 0..384 `core_quads[2]` (6..8), 384..1,664 `tiles[10]` (13..23), 1,664..1,920 `crossbar_pro` (256 B SONA Crossbar Coupling Block), 1,920..4,608 `reserve u8[2,688]` (`0x00` in unwatermarked `.dnam`; populated only in Tardos Role B watermarked copies) |
-| Ultra SONA Core Delta (Arena 3: 15,872..22,528) | 6,656 B | 0..384 `core_quads[2]` (8..10), 384..1,920 `tiles[12]` (23..35), 1,920..2,176 `crossbar_ultra` (256 B SONA Crossbar Coupling Block), 2,176..4,224 `stage_latent_core_mods_fp16 u16le[1,024]` (row-major `[k in 0..8][col in 0..128]`; zeroed unless `SONA_META_CORE_MODS_PRESENT`), 4,224..6,656 `reserve u8[2,432]` (`0x00` in unwatermarked `.dnam`; populated only in Tardos Role B watermarked copies) |
+| Lite SONA Core (Arena 0) | 4 quads, 5 tiles | `core_quads[4]` (quads 0..4, `[1,1,1,1]`) + `tiles[5]` (`(0,1),(1,2),(2,3),(0,2),(1,3)`) |
+| Full SONA Core Delta (Arena 1) | +2 quads, +8 tiles | `core_quads[2]` (4, 5, `[2,2,1,1]`) + `tiles[8]` (5..13) + `crossbar` (256 B SONA Crossbar Coupling Block) |
+| Pro SONA Core Delta (Arena 2) | +2 quads, +11 tiles | `core_quads[2]` (6, 7, `[2,2,2,2]`) + `tiles[11]` (13..24) + `crossbar_pro` (256 B) + `reserve` (`0x00` unless Tardos Role B watermarked) |
+| Ultra SONA Core Delta (Arena 3) | +2 quads, +13 tiles | `core_quads[2]` (8, 9, `[3,3,2,2]`) + `tiles[13]` (24..37, `MAX_OUTGOING_PER_QUAD = 7`) + `crossbar_ultra` (256 B) + `reserve` (`0x00` unless Tardos Role B watermarked; `stage_latent_core_mods_fp16` deleted and reclaimed into `GRA`) |
 
 Inside each 256 B `SONA Crossbar Coupling Block`, `phasor_stereo_phase_fp16[0..4]` (bytes 224..232) encodes right-minus-left relative stereo phase offsets in radians clamped to $[-\pi, +\pi]$ (Lite defaults `[0.0; 4]`).
 
@@ -441,41 +451,20 @@ With `(c_st, s_st) = algebraic_unit_rotor_f32(rad)`, decoders compute `cos_R = c
 
 Higher-tier 256 B `SONA Crossbar Coupling Blocks` (`crossbar` in Full Arena 1, `crossbar_pro` in Pro Arena 2, and `crossbar_ultra` in Ultra Arena 3) execute **complete tier replacement** on load, overwriting lower-tier crossbar coupling arrays in full (including Lite Arena 0 `rho_head_and_ctrl_tail[24..32]` `opt_to_lr`) rather than summing as additive deltas.
 
-In the Ultra SONA Core Delta, `stage_latent_core_mods_fp16[0..1024]` occupies 2,048 B at bytes 2,176..4,224 (18,048..20,096 rel. `tier_start`) using row-major layout `[k][col]` for `k` in 0..8 and `col` in 0..128.
-
-It is indexed strictly by unrotated stage latents `z_stage[0..8]` (concatenating `ctrl_basis_4[0..4]` and `z_stage_ultra[0..4]`), preserving 0-ULP invariance under `SO(4)` gauge `Q_buyer` on `z_head[0..4]`.
-
-Tardos Role B watermarking never embeds into these 1,024 slots; Role B carriers reside exclusively in the disjoint linear and reserve ranges documented in [watermarking_and_marketplace.md](../security/watermarking_and_marketplace.md).
-
-When `SONA_META_CORE_MODS_PRESENT` (`0x0000_0200`) is set in Ultra mode (`D_s = 8`), each 3 kHz control boundary accumulates three per-lane shifts for global lane `l` in 0..40 using sequential `k = 0..8` unfused `binary32` (`FP_CONTRACT OFF`) inner products starting from +0.0:
-
-| Column Slice (`col`) | Target Parameter | Accumulation & Clamp Law |
-| :--- | :--- | :--- |
-| `col = l` (0..40) | `svf_g[l]` octave shift | Computes `g_oct_lane[l] = clamp(svf_g_oct + sum_{k=0..7} fp16(k, l) * z_stage[k], -3.0, +3.0)` oct total, then scales `svf_g[l]` by `exp2_clamped5(g_oct_lane[l])` clamped to `[1e-5, 64.0]` |
-| `col = 40 + l` (40..80) | `svf_k[l]` damping shift | Computes `svf_k_eff[l] = clamp(svf_k[l] + svf_k_delta + sum_{k=0..7} fp16(k, 40 + l) * z_stage[k], 0.0, 8.0)` |
-| `col = 80 + l` (80..120) | `wavefolder_mix[l]` delta | Adds `sum_{k=0..7} fp16(k, 80 + l) * z_stage[k]` onto the decoded unsigned `wavefolder_mix[l]` magnitude clamped to `[0.0, 1.0]`, leaving `rect_sign[l]` unchanged |
-| `col` in 120..128 | Reserved | Must equal `0x0000` |
-
 **3. ModalConvolver, Transport & LinearReadout Binary Blocks (Arena 0..3):**
 
-| Binary Block | Bytes (1-byte aligned) | Exact Relative Field Offsets & Arena 0 Crossbar Sub-Slots |
+| Binary Block | Bytes / Shape | Exact Relative Field Offsets & Clean-Room Invariants |
 | :--- | :---: | :--- |
-| `ModalConvolver` Early FIR (16 / 32 / 48) | 128 / 256 / 384 B | `fir_l: f32le[N]` followed by `fir_r: f32le[N]` for `N` in `{16, 32, 48}` (`CONVOLVER_EARLY_FIR_BASES = [1,408, 6,528, 12,544, 22,528]`) |
-| Kautz SoA Block (4 shared pairs) | 128 B | 0..16 `r_low`, 16..32 `dr`, 32..48 `theta`, 48..64 `b_gamma`, 64..80 `c_re_l`, 80..96 `c_im_l`, 96..112 `c_re_r`, 112..128 `c_im_r` (all `f32le[4]`; `CONVOLVER_KAUTZ_BASES = [1,664, 6,656, 12,928, 22,784]`, `CONVOLVER_KAUTZ_BLOCKS_PER_TIER = [2, 1, 3, 2]`, `CONVOLVER_KAUTZ_TIER_CHANNEL_BASE = [0, 8, 12, 24]`) |
-| `TransportQuad` (4 `Op-T` lanes) | 128 B | 0..16 `delay_samples f32le[4]`, 16..32 `ramp_spans_samples f32le[4]`, 32..52 `g_loop`, `r_dc`, `damp_pole`, `lfo_rate_hz`, `ramp_rate_hz` (`5 × f32le`), 52..56 `reserved_52_56 f32le` (0.0), 56..64 `lfo_depths_fp16 u16le[4]`, 64..72 `lfo_phase_off_q16 u16le[4]`, 72..80 `ramp_phase_off_q16 u16le[4]`, 80..88 `input_gains_fp16 u16le[4]`, 88..96 `wet_tap_l_fp16 u16le[4]`, 96..104 `wet_tap_r_fp16 u16le[4]`, 104..112 `allpass_g_fp16 u16le[4]`, 112..122 `fb_psi_fp16`, `sigma_knee_fp16`, `freeze_mix_fp16`, `window_depth_fp16`, `scat_psi_fp16` (`5 × u16le`; `scat_psi_fp16` in `[-pi, pi]`, default 0.0), 122..126 `allpass_delays u8[4]` (`<= 255` at 48 kHz; 0 allocates 0 B cold ring RAM on `[0; 4]`, nonzero scales up to 16,384 samples at 384 kHz), 126 `flags u8` (`bit 0 = 0` reserved, `bit 1 = ext_f32` governing this quad's ring precision `0 = fp16` vs `1 = f32`, whose logical OR across active quads sets the VM Runtime Metadata Record `ext_ring_format` for cold buffer sizing, bits 2..7 = 0; zero discrete stage-bypass, mode, or freeze bits), 127 `reserved u8` (0; `TRANSPORT_DELAY_BASES = [1,920, 6,784, 13,312, 23,040]`) |
-| Full Convolver Prefix Override | 192 B | 0..64 `fir_l f32le[16]`, 64..128 `fir_r f32le[16]`, 128..144 `c_re_l f32le[4]`, 144..160 `c_im_l f32le[4]`, 160..176 `c_re_r f32le[4]`, 176..192 `c_im_r f32le[4]` (`LINEAR_READOUT_BASES[1] = 6,912`) |
-| Pro Convolver Prefix Override | 384 B | 0..128 `fir_l f32le[32]`, 128..256 `fir_r f32le[32]`, 256..288 `c_re_l f32le[8]`, 288..320 `c_im_l f32le[8]`, 320..352 `c_re_r f32le[8]`, 352..384 `c_im_r f32le[8]` (`LINEAR_READOUT_BASES[2] = 13,568`) |
-| Ultra Convolver Prefix Override | 576 B | 0..192 `fir_l f32le[48]`, 192..384 `fir_r f32le[48]`, 384..432 `c_re_l f32le[12]`, 432..480 `c_im_l f32le[12]`, 480..528 `c_re_r f32le[12]`, 528..576 `c_im_r f32le[12]` (`LINEAR_READOUT_BASES[3] = 23,296`) |
-| Lite `LinearReadout` (Arena 0: 2,048..2,688) | 640 B | 0..8 `pre_conv_u_gain f32le[2]`, 8..16 `pre_conv_hp_gain f32le[2]`, 16..24 `direct_s2_u_gain f32le[2]`, 24..32 `direct_s2_hp_gain f32le[2]` (direct `[L, R]` channel gains unpacked into `ro_gains_fp16[0..8]` with zero M/S conversion), 32..224 `stage_latent_mods_fp16 u16le[96]`, 224..640 `w_ro_fp16 u16le[208]` |
-| Full `LinearReadout` (Arena 1: 6,912..7,936) | 1,024 B | 0..192 `prefix_override`, 192..1,024 `w_ro_and_mods_fp16 u16le[416]` (`ARENA_FULL_BYTES = 7,936`) |
-| Pro `LinearReadout` (Arena 2: 13,568..15,872) | 2,304 B | 0..384 `prefix_override`, 384..2,304 `w_ro_and_mods_fp16 u16le[960]` (`ARENA_PRO_BYTES = 15,872`) |
-| Ultra `LinearReadout` (Arena 3: 23,296..26,880) | 3,584 B | 0..576 `prefix_override`, 576..3,584 `w_ro_and_mods_fp16 u16le[1,504]` |
+| `ModalConvolver` Early FIR & `ErSparseBank` | 128..384 B FIR + 80 / 80 B `ErSparse` | `fir_l: f32le[N]` + `fir_r: f32le[N]` (`N` in `{16, 32, 48}`) + `ErSparseBank` (8 Lite / +8 = 16 Full–Ultra 2×2 MIMO taps on the 1,024-sample ring) + 2-basis `fp16` FIR voicing morph (`CONVOLVER_EARLY_FIR_BASES`) |
+| Kautz SoA Block (4 shared pairs) | 128 B | 0..16 `r_low f32le[4]`, 16..24 **`onset_delay_samp u16le[4]`** (reclaimed from `dr`, `[0, 1023]`), 24..32 **`c_cross_fp16 u16le[4]`** (reclaimed from `dr`), 32..48 `theta f32le[4]`, 48..64 `b_gamma f32le[4]`, 64..128 `c_{re,im}_{l,r} f32le[4]` (`CONVOLVER_KAUTZ_BASES`, `[2, 1, 3, 2]` blocks/tier) |
+| `TransportQuad` v4 (4 `Op-T` lanes) | Extended v4 descriptor + 64-frame inline Quad 0 ring | `delay_samples f32le[4]`, `ramp_spans_samples f32le[4]` (modulatable), **bipolar `g_loop`** (`[-0.9990, +0.9990]`), `r_dc`, `damp_pole`, `lfo_rate_hz`, `ramp_rate_hz` (`[-64.0, +64.0]` Hz), `lfo_depths_fp16[4]`, `lfo_rate_ratio_fp16[4]`, `lfo_phase_off_q16[4]`, `ramp_phase_off_q16[4]`, `input_gains_fp16[4]`, `wet_tap_l/r_fp16[4]`, `allpass_g_fp16[4]`, `M_fb(alpha, beta)`, causal lower-triangular `M_series[q_dst][q_src]` (12 B `fp16`), `alpha_sum_fb`, `am_depth`, `eta_even`, `freeze_ortho_mix`, `sigma_knee_fp16` (`[1e-3, 4.0]` `0x4400`, `V_ceil = 4.0`), `freeze_mix_fp16`, `window_depth_fp16`, `scat_psi_fp16`, `allpass_delays u8[4]`, `flags u8` (`bit 1 = ext_f32`; Quad 0 inline ring shrunk to 64 frames = 512 B `fp16[64][4]`, setting `has_ext[0]` if `delay > 56.0` or `req_frames[0] > 64`) |
+| Full / Pro / Ultra Convolver Prefix Override | 192 / 384 / 576 B | `fir_l: f32le[N]` + `fir_r: f32le[N]` + `c_{re,im}_{l,r}: f32le[N/4]` for `N` in `{16, 32, 48}` (`LINEAR_READOUT_BASES[1..3]`) |
+| Lite `LinearReadout` (Arena 0) | `fp16` (`REQ-8.5`) | `pre_conv_{u,hp}_gain f32le[2]`, `direct_s2_{u,hp}_gain f32le[2]`, `stage_latent_mods_fp16[96]`, compact `fp16` `w_ro_fp16[208]`, plus additive **split `W_ro_head` (`odd` + `even_lru`)** deltas driven by `z_head[0..8]` |
+| Full / Pro / Ultra `LinearReadout` | `fp16` (`REQ-8.5`) | `prefix_override` (192 / 384 / 576 B) + `w_ro_and_mods_fp16` (416 / 960 / 1,504 base + split `W_ro_head` delta, `ARENA_{FULL,PRO}_BYTES`) |
 
-The Lite, Full, Pro, and Ultra `LinearReadout` blocks store a single static base readout matrix `W_ro,0` (16×12, 24×12, 32×12, or 40×12), while 3 kHz latent sensitivity enters through `stage_latent_mods_fp16`, `stage_latent_ctrl_ultra_fp16`, and `W_ctrl`.
+The Lite, Full, Pro, and Ultra LinearReadout blocks store a compact static half-precision base readout matrix `W_ro,0` (16×12, 24×12, 32×12, or 40×12, preserving `REQ-8.5` Tardos survival) paired with additive split `W_ro_head` deltas driven by `z_head[0..8]`.
 
-Because buyer SO(4) gauge `Q_buyer` rotates only `z_head[0..4]` (plus columns 0..4 of `main_base`, `u_int_base`, `w_ctrl`, and `u_int_ultra` Block 0), every `stage_latent_*` sensitivity table indexes strictly unrotated `z_stage[0..D_s]`.
-
-Here `D_s = 4` covers `ctrl_basis_4[0..4]` across Lite through Pro, and `D_s = 8` concatenates `[ctrl_basis_4[0..4], z_stage_ultra[0..4]]` on Ultra.
+Meanwhile, 3 kHz latent sensitivity enters through `stage_latent_mods_fp16`, `stage_latent_ctrl_ultra_fp16`, and ControlBus v4 GRA weights. Because buyer gauge `Q_buyer` rotates only `z_head[0..4]` (plus columns 0..4 of main_base, u_int_base, w_ctrl, and u_int_ultra Block 0), `W_ro_head_odd` flips cleanly with Mechanism A2 while every stage latent table indexes strictly unrotated `z_stage[0..D_s]`.
 
 The table below gives the exact `fp16` index partitions inside the Lite `LinearReadout` (`stage_latent_mods_fp16[0..96]` and `w_ro_fp16[0..208]`):
 
@@ -490,7 +479,7 @@ The table below gives the exact `fp16` index partitions inside the Lite `LinearR
 
 In Full, Pro, and Ultra `LinearReadout` blocks (`w_ro_and_mods_fp16`), the first `12 * L_t` slots store lanes `l = 4 * g + local_lane` in tier-introduction global quad order `g` in `0..N_g` (N_g in 4, 6, 8, 10).
 
-Runtime decoders unpack those slots per global quad `g`, while core execution traverses active quads in block-major `SONA_BLOCK_QUAD_SLOTS` order (`[0, 4, 6, 8, 1, 5, 9, 2, 7, 3]` at Ultra).
+Runtime decoders unpack those slots per global quad `g`, while core execution traverses active quads in Quad-Major `SONA_BLOCK_QUAD_SLOTS` order (`[0, 4, 8, 1, 5, 9, 2, 6, 3, 7]` at Ultra).
 
 Immediately following those `12 * L_t` lane weights are 8 `[L, R]` channel gain slots: `[pre_conv_u_gain_fp16[2], pre_conv_hp_gain_fp16[2], direct_s2_u_gain_fp16[2], direct_s2_hp_gain_fp16[2]]`.
 
@@ -507,21 +496,15 @@ These store `[L, R]` channel gains directly and execute full-tier replacement un
 | Wire Section | Field(s) | Finite Clamp Domain | Non-Finite Fallback & Notes |
 | :--- | :--- | :--- | :--- |
 | Crossbar / Output Trim | `tier_gain_trim[0..4]` | [0.0625, 16.0] | 1.0 (used directly and sign-flipped by `WET_POLARITY_INV`) |
-| `SensoryQuad` & Op Gains | `sense_svf_g`, `sense_lru_alpha_*`, `sense_svf_k`, `sense_lru_kappa`, `sense_in_*`, `sense_tone_*`, `sense_vca_w`, `crossbar_op_gains` | `sense_svf_g` [1e-5, 64.0]; `sense_lru_alpha_rel` `[0.0, 0x3F7F_FFAC]`; `sense_lru_alpha_atk`, `sense_lru_kappa` [0.0, 1.0]; `sense_svf_k` [0.0, 8.0]; `sense_in_l/r`, `crossbar_op_gains` [-4.0, 4.0]; `sense_tone_{lp,bp,hp}` [-16.0, 16.0]; `sense_vca_w` [-512.0, 512.0] | `sense_svf_g` -> 0.25; `sense_svf_k` -> 1 / sqrt(2); all other `SensoryQuad` and `crossbar_op_gains` fields -> 0.0 (`alpha_rel/atk` ZOH `^rho_vm`; `svf_g` via `rescale_tpt_svf_g_zoh`) |
-| Crossbar Meta & OS Ext | `anti_zipper_ramp_scale`, `os_up_quad_coeff`, `os_dec_c_prev1`, `os_dec_c0`, `os_dec_c1`, `os_up_pre_emph`, `os_*_mix` | `anti_zipper_ramp_scale` (0.0, 1.0]; `os_up_quad_coeff` [-0.20, 0.05]; `os_dec_c_prev1` [0.0, 0.28]; `os_dec_c0` [0.0, 0.55]; `os_dec_c1 = 1 - prev1 - c0`; `os_up_pre_emph` [-0.28, 1.0]; `os_*_mix` [0.0, 1.0] | `anti_zipper_ramp_scale` 0.0625 if <= 1e-7 or non-finite; `os_up_quad_coeff` `NaN` -> 0.0 (-0.125 on `SONA_META_OS_EXT_PRESENT == 0` zeroed fallback); non-finite or `SONA_META_OS_EXT_PRESENT == 0` defaults: `os_dec_c_prev1` 0.15, `os_dec_c0` 0.50, others 0.0 |
-| Crossbar Carrier, Op-N[Pre] & Phasor Init | `carrier_basis_w_fp16`, `gamma_bc`, `zoh_hold_depth`, `beta_q`, `phasor_init_phase_q32` | `carrier_basis_w_fp16` [-8.0, 8.0] (`fp16` roundtrip); Op-N[Pre] `gamma_bc` [0.0, 1.0], `zoh_hold_depth` [0.0, 0.9999], `beta_q` [0.0, 16.0]; `phasor_init_phase_q32` (`u32`, all bits valid) | 0.0 on non-finite (forced to 0.0 bypass when `SONA_META_OS_EXT_PRESENT == 0`); `phasor_init_phase_q32` wraps mod 2^32 |
-| `CoreQuad` Block (Poles & Rectifier) | `svf_g`, `svf_k`, `svf_k_nl`, `lru_alpha_rel`, `lru_alpha_atk`, `lru_kappa`, `lru_stereo_link`, `lru_duhem_gamma`, `lru_signed_mix` | `svf_g` [1e-5, 64.0]; `svf_k` [0.0, 8.0] (`fp16`); `svf_k_nl` `[0.0, 16.0]` on Block 0 (`fp16`, rate-invariant) and fail-closed raw `0x0000` on Blocks 1..3; `lru_alpha_rel` `[0.0, 0x3F7F_FFAC]` (`MAX_PARALRU_R_F32`); `lru_alpha_atk`, `lru_kappa`, `lru_stereo_link`, `lru_signed_mix` [0.0, 1.0]; `lru_duhem_gamma` [0.0, 64.0] | `svf_g` 0.25; `svf_k` 1 / sqrt(2); all other pole, nonlinear-damping, rectifier, and coupling fields -> 0.0 (`lru_stereo_link`, `lru_duhem_gamma`, `lru_signed_mix`, `svf_k`, `svf_k_nl`, `lru_kappa` use `fp16` roundtrip) |
-| `CoreQuad` Block (Mix, M/S, GLU & Wavefolder) | `adaa_drive`, `lru_bias_drive`, `in_mid_weight`, `in_side_weight`, `tone_*`, `sag_depth`, `wavefolder_mix`, `rect_sign`, `glu_mix` | `adaa_drive` [-32.0, 32.0]; `lru_bias_drive`, `in_mid_weight`, `in_side_weight`, `tone_*` [-16.0, 16.0]; `sag_depth` [-8.0, 8.0]; unsigned `wavefolder_mix` (`raw & 0x7FFF`) in `[0.0, 1.0]`; `rect_sign` in `{-1.0, +1.0}` decoded from raw bit 15 (`(raw & 0x8000) != 0 ? -1.0 : +1.0`, preserving `-0.0 = 0x8000`); `glu_mix` [-4.0, 4.0] | Non-finite magnitude -> 0.0 while preserving raw bit-15 `rect_sign` |
-| Inter-Block Tiles | `w_odd_4x4`, `w_even_4x4`, `w_lru_4x4` | [-8.0, 8.0] | 0.0 (`w_even_4x4` and `w_lru_4x4` decode from `fp16`) |
-| Crossbar Coupling | `op_p_to_core`, `phasor_to_core`, `opt_to_lr`, `phasor_freq_hz`, `phasor_stereo_phase` | `opt_to_lr` [-4.0, 4.0]; `op_p`/`phasor_to_core` [-8.0, 8.0]; `phasor_freq_hz` `[-0.49 * f_{s,vm}, +0.49 * f_{s,vm}]`; `phasor_stereo_phase` [-pi, pi] | 0.0 (Lite `opt_to_lr` overwritten when Full+ loads) |
-| `LinearReadout` (Lite) | `pre_conv_u_gain`, `pre_conv_hp_gain`, `direct_s2_u_gain`, `direct_s2_hp_gain` (`f32le[2]`) | Finite-clamped to [-65504.0, 65504.0] before `f32` -> `fp16` conversion into `ro_gains_fp16[0..8]` | 0.0 on non-finite (`ro_pole_48k` in `"DBRM"` clamps to `[0.0, 0x3F7F_FFAC]`, non-finite -> 0.0) |
-| `LinearReadout` (Full..Ultra & Matrix) | Full..Ultra `*_gain_fp16[2]` and all `w_ro_*` (`w_ro_fp16`, `w_ro_and_mods_fp16`) | Finite `fp16` values preserved verbatim | 0.0 on `NaN` / ±Inf |
-| `ModalConvolver` Early FIR & Residues | `fir_l/r`, `b_gamma`, `c_re_l/r`, `c_im_l/r` | `fir_l/r` [-16.0, 16.0]; `b_gamma >= 0.0` verbatim; `c_re_l/r`, `c_im_l/r` finite `f32` verbatim | 0.0 on non-finite (`b_gamma == 0.0` keeps inactive poles zero) |
-| `ModalConvolver` Kautz Poles | `r_low`, `dr`, `theta` | `r_base = clamp(r_low + 0.5 * dr, 0.0, 0.9995)`; ZOH pre-clamp `r` [0.25, 0.9985] & active post-clamp [0.25, 0.9995]; `theta` [0.0, pi - 1e-4] | 0.0 on non-finite (`r_base == 0.0` inactive sentinel preserved; ZOH interior `theta` [1e-4, pi - 1e-4]) |
-| `TransportQuad` (128 B × 4: Delays, Loop & Rates) | `delay_samples`, `ramp_spans_samples`, `g_loop`, `r_dc`, `damp_pole`, `lfo_rate_hz`, `ramp_rate_hz`, `lfo_depths` ([op_t_transport.md §1.1.1](../dsp/op_t_transport.md#111-ring-declaration-unified-4-lane-quad-wire--active-hot-state)) | `delay_samples` [5.0, max_tau] (48 kHz <= 48,000.0); `ramp_spans_samples` [0.0, max_span]; `g_loop` [0.0, `0x3F7F_BE76`]; `r_dc` `[0.95, 0.999995]` (`0x3F7F_FFAC`); `damp_pole` [0.0, 0.9995]; `lfo_rate_hz` [0.0, 16.0]; `ramp_rate_hz` [-16.0, 16.0]; `lfo_depths` [0.0, 512.0] | `delay_samples` ZOH fallback 5.0; `r_dc` non-finite -> `0x3F7F_D51F`; others non-finite -> 0.0 (`reserved_52_56` ignored / 0.0; see [op_t_transport.md §1.1.1](../dsp/op_t_transport.md#111-ring-declaration-unified-4-lane-quad-wire--active-hot-state) for full ZOH & `cap` rules) |
-| `TransportQuad` (Mix, Diffuser & Freeze) | `input_gains`, `wet_tap_l/r`, `freeze_mix`, `allpass_g`, `allpass_delays`, `fb_psi`, `sigma_knee`, `window_depth`, `scat_psi` | `input_gains`, `wet_tap_l/r` [-2.0, 2.0]; `freeze_mix` [0.0, 1.0]; `allpass_g` [-0.75, 0.75]; `allpass_delays` [0..255] (`u8`); `fb_psi`, `scat_psi` [-pi, pi]; `sigma_knee` [1e-3, 0.984375] (`TANK_MAX_SIGMA_SAT_FP16 = 0x3BE0`); `window_depth` [0.0, 1.0] | `sigma_knee` -> 0.984375 (`0x3BE0`); `freeze_mix`, `scat_psi` -> 0.0; others -> 0.0 |
-| Arena 0 & Arena 3 Control Plane (Scalars) | `lfo_dphi_train`, `sigma_drift`, `rho_drift_train`, `lfo_skew`, `tank_dry_mix`, `ou_to_z_stage`, `ou_to_z_stage_ultra`, `trust_radius_mh` | `lfo_dphi_train` [-pi, pi]; `sigma_drift` [0.0, 2.0]; `rho_drift_train` (0.0, 0.9999]; `lfo_skew` [-1.0, 1.0]; `tank_dry_mix` [-2.0, 2.0]; `ou_to_z_stage*` [-4.0, 4.0]; `trust_radius_mh` [0.01, 16.0] | `tank_dry_mix` `0x0000` -> 0.0 and non-finite -> 1.0 (default builder emits 1.0); `lfo_dphi_train`, `sigma_drift`, `lfo_skew`, `ou_to_z_stage*` -> 0.0; `rho_drift_train` -> 0.999 if `<= 0.0` or non-finite; `trust_radius_mh` -> 2.5 nominal / 1.0 if <= 0.0 or non-finite |
-| Control Matrices, CP1 & Latent Mods | `w_adaa_drive_scale`, `w_lru_bias_shift`, `stage_latent_core_mods`, `u_int*`, `w_ctrl*`, `cp1_*`, `stage_latent_mods` | `w_adaa_drive_scale` [-1.5, 1.5]; `w_lru_bias_shift` [-2.0, 2.0]; `stage_latent_core_mods`, `u_int*`, `w_ctrl*`, `cp1_*`, `stage_latent_mods` finite `f32` / `fp16` verbatim | 0.0 on non-finite; encoders clamp `stage_latent_core_mods` to `[-4.0, 4.0]` with cols 120..128 reserved 0 and runtime clamping per §2.3; Ultra overrides Lite `[48..80]` via `stage_latent_ctrl_ultra_fp16` (excluding `[160..164]` `ou_to_z_stage_ultra_fp16`) |
+| `SensoryQuad` v4 & Op Gains | `sense_svf_g`, `sense_lru_alpha_*`, `sense_svf_k`, `sense_lru_kappa`, `sense_in_*`, `sense_tone_*`, Log-Knee VCA, `crossbar_op_gains` | `sense_svf_g` [1e-5, 64.0]; `sense_lru_alpha_rel` `[0.0, 0x3F7F_FFAC]`; `sense_lru_alpha_atk`, `sense_lru_kappa` [0.0, 1.0]; `sense_svf_k` [0.0, 8.0]; `sense_in_l/r`, `crossbar_op_gains` [-4.0, 4.0]; `sense_tone_{lp,bp,hp}` [-16.0, 16.0]; Log-Knee VCA `b_makeup` `[-5.0, +4.0]` oct, `s_slope` `[0.0, 4.0]`, `c_knee` `>= 1e-6`, `sense_vca_w` [-512.0, 512.0] | `sense_svf_g` -> 0.25; `sense_svf_k` -> 1 / sqrt(2); Log-Knee VCA -> identity (1.0); all other `SensoryQuad` and `crossbar_op_gains` fields -> 0.0 (`alpha_rel/atk` ZOH `^rho_vm`; `svf_g` via `rescale_tpt_svf_g_zoh`) |
+| Crossbar Meta, `Op-P` v4 & `Op-N[Pre]` v4 | `anti_zipper_ramp_scale`, `T1+` scalars, `carrier_basis_w_fp16`, `gamma_bc`, `zoh_hold_depth`, `beta_q`, `kappa_h`, `phasor_init_phase_q32` | `anti_zipper_ramp_scale` (0.0, 1.0]; `carrier_basis_w_fp16` [-8.0, 8.0]; `Op-N[Pre]` `gamma_bc` [0.0, 1.0], `zoh_hold_depth` [0.0, 0.9999], `beta_q` [0.0, 16.0], `kappa_h` [0.0, 1.0]; `phasor_init_phase_q32` (`u32`, all bits valid) | `anti_zipper_ramp_scale` 0.25 (`4 / K_ctrl` for `K_ctrl = 16`) if `<= 1e-7` or non-finite; non-finite `Op-P` / `Op-N[Pre]` scalars -> 0.0 (forced bypass when `SONA_META_OS_EXT_PRESENT == 0`) |
+| `CoreQuad` v4 Block (Poles & Rectifier) | `svf_g`, `svf_k`, `svf_k_nl`, `lru_alpha_rel`, `lru_alpha_atk`, `lru_kappa`, `lru_stereo_link`, `lru_duhem_gamma`, `lru_signed_mix` | `svf_g` [1e-5, 64.0]; `svf_k` [0.0, 8.0] (`fp16`); `svf_k_nl` `[0.0, 16.0]` on Block 0 (`{0, 4, 8}`, `fp16`) and fail-closed raw `0x0000` on Blocks 1..3; `lru_alpha_rel` `[0.0, 0x3F7F_FFAC]`; `lru_alpha_atk`, `lru_kappa`, `lru_stereo_link`, `lru_signed_mix` [0.0, 1.0]; `lru_duhem_gamma` [0.0, 64.0] | `svf_g` 0.25; `svf_k` 1 / sqrt(2); all other pole, nonlinear-damping, rectifier, and coupling fields -> 0.0 |
+| `CoreQuad` v4 Block (Mix, `g_pre`, `SE-Bus`, `GLU`) | `adaa_drive`, `lru_bias_drive`, `in_mid_weight`, `in_side_weight`, `c_lp`, `c_bp`, `c_u`, `g0`, `g_inf`, `d_pre`, `lin_mix`, `se_w_sq`, `se_d_bus`, `out_gain`, `wavefolder_mix`, `rect_sign_mask`, `glu_mix` | `adaa_drive` [-32.0, 32.0]; `lru_bias_drive`, `in_*`, `c_*` [-16.0, 16.0]; `g0`, `g_inf` [0.0, 2.5]; `d_pre`, `se_d_bus` >= 0.0; `lin_mix`, `wavefolder_mix` [0.0, 1.0]; `out_gain`, `glu_mix` [-4.0, 4.0]; explicit `u16` `rect_sign_mask` (1 bit/lane: `0 = +1.0, 1 = -1.0`) | Non-finite magnitude -> 0.0 (`out_gain` -> 1.0 if unset, preserving explicit `rect_sign_mask` bit) |
+| Inter-Block Tiles & Crossbar | `w_odd_4x4`, `w_even_4x4`, `w_lru_4x4`, `op_p_to_core`, `phasor_to_core`, `opt_to_lr`, `phasor_freq_hz`, `phasor_stereo_phase` | Tiles [-8.0, 8.0]; `opt_to_lr` [-4.0, 4.0]; `op_p`/`phasor_to_core` [-8.0, 8.0]; `phasor_freq_hz` `[-0.49 * f_{s,vm}, +0.49 * f_{s,vm}]`; `phasor_stereo_phase` [-pi, pi] | 0.0 (`w_even_4x4` and `w_lru_4x4` decode from `fp16`) |
+| `LinearReadout` & `W_ro_head` | `*_gain`, `w_ro_*` (`W_ro,0`), split `W_ro_head_odd`, `W_ro_head_even_lru` | Finite `fp16` values preserved verbatim (`REQ-8.5`); `pre_conv`/`direct_s2` Lite gains finite-clamped to [-65504.0, 65504.0] | 0.0 on `NaN` / ±Inf (`ro_pole_48k` in `"DBRM"` clamps to `[0.0, 0x3F7F_FFAC]`, non-finite -> 0.0) |
+| `ModalConvolver` v4 FIR, `ErSparseBank` & Kautz | `fir_l/r`, `ErSparseBank`, `b_gamma`, `c_{re,im}_{l,r}`, `r_low`, `onset_delay_samp`, `c_cross_fp16`, `theta` | `fir_l/r` [-16.0, 16.0]; `ErSparseBank` tap delays `[0, 1020]`; `b_gamma >= 0.0`; `r_base_48k = clamp(r_low, 0.0, 0.9995)` (`dr` retired); `onset_delay_samp` `[0, 1023]` (`u16le` ZOH-rescaled); `theta` `[0.0, pi - 1e-4]` | 0.0 on non-finite (`b_gamma == 0.0` keeps inactive poles zero; ZOH interior `theta` `[1e-4, pi - 1e-4]`) |
+| `TransportQuad` v4 (Delays, Loop & Rates) | `delay_samples`, `ramp_spans_samples`, `g_loop`, `r_dc`, `damp_pole`, `lfo_rate_hz`, `ramp_rate_hz`, `lfo_depths`, `lfo_rate_ratio_fp16`, `M_fb`, `M_series`, `sigma_knee`, `freeze_mix`, `allpass_g`, `scat_psi` | `delay_samples` [5.0, max_tau] (48 kHz <= 48,000.0); `g_loop` `[-0.9990, +0.9990]` (`±0x3F7F_BE76`); `r_dc` `[0.95, 0.999995]`; `damp_pole` [0.0, 0.9995]; `lfo_rate_hz` [0.0, 16.0]; `ramp_rate_hz` `[-64.0, +64.0]`; `sigma_knee` `[1e-3, 4.0]` (`0x4400`, `V_ceil = 4.0`); `allpass_g` [-0.75, 0.75]; `||M_fb||_2 <= 1`; causal lower-tri `M_series` | `delay_samples` ZOH fallback 5.0; `r_dc` non-finite -> `0x3F7F_D51F`; `sigma_knee` -> 4.0 (`0x4400`); others non-finite -> 0.0 (see [op_t_transport.md §1.1.1](../dsp/op_t_transport.md#111-ring-declaration-unified-4-lane-quad-wire--active-hot-state)) |
+| Control Plane (`GRA`, `CP1`, `U_int`) | `lfo_dphi_train`, `sigma_drift`, `rho_drift_train`, `lfo_skew`, `tank_dry_mix`, `ou_to_z_stage*`, `trust_radius_mh`, `SwiGLU`, `Padé-[1/1]`, `1.5-Entmax`, `g_edge[0..6]`, `op_t_q[0..16]`, `u_int*`, `w_ctrl*`, `cp1_*`, `stage_latent_*` | `lfo_dphi_train` [-pi, pi]; `sigma_drift` [0.0, 2.0]; `rho_drift_train` `(0.0, 0.9999]`; `lfo_skew` [-1.0, 1.0]; `tank_dry_mix` [-2.0, 2.0]; `ou_to_z_stage*` [-4.0, 4.0]; `trust_radius_mh` [0.01, 16.0]; `Padé-[1/1]` denominator offset `d_r` `[-0.75, +7.0]`; finite `f32`/`fp16` `GRA` weights verbatim | `tank_dry_mix` `0x0000` -> 0.0 and non-finite -> 1.0; `rho_drift_train` -> 0.999; `trust_radius_mh` -> 2.5 nominal / 1.0 fallback; others -> 0.0 (`GRA` `StarCenter` `k* == 1` fast-exit) |
 
 ---
 
@@ -531,38 +514,38 @@ These store `[L, R]` channel gains directly and execute full-tier replacement un
 
 `r[container.dnam.cabinet-slices]`
 
-Each tier stores its `ModalConvolver` early FIR taps and shared-pole Kautz modal blocks in separate, non-overlapping 64 B-aligned slices ([op_m_modal_kautz.md](../dsp/op_m_modal_kautz.md)).
+Each tier stores its ModalConvolver v4 early FIR taps, `ErSparseBank` MIMO early reflections (8 Lite / 16 Full–Ultra), and shared-pole Kautz modal blocks in separate, non-overlapping 64 B-aligned slices ([op_m_modal_kautz.md](../dsp/op_m_modal_kautz.md)).
 
-The early FIR slice (32 / 48 / 96 / 128 cumulative taps/ch) packs Left `f32` taps followed by Right `f32` taps (+32 taps/ch = 256 B in Lite, +16 = 128 B in Full, +48 = 384 B in Pro, +32 = 256 B in Ultra; 1,024 B total).
+The early FIR slice (32 / 48 / 96 / 128 cumulative taps/ch) packs Left `f32` taps followed by Right `f32` taps (+32 taps/ch = 256 B in Lite, +16 = 128 B in Full, +48 = 384 B in Pro, +32 = 256 B in Ultra; 1,024 B total), paired with 2-basis `fp16` FIR voicing morph weights and Kaiser polyphase high-SR interpolation.
 
-The Kautz modal slice (8 / 12 / 24 / 32 cumulative pairs) packs 4 shared pole pairs per 128 B block (`[r_low, dr, theta, b_gamma, c_re_l, c_im_l, c_re_r, c_im_r]`).
+The Kautz modal slice (8 / 12 / 24 / 32 cumulative pairs) packs 4 shared pole pairs per 128 B block (`[r_low, onset_delay_samp_u16[4], c_cross_fp16[4], theta, b_gamma, c_re_l, c_im_l, c_re_r, c_im_r]`). Reclaiming the legacy 128 B `dr` field into per-bank `onset_delay_samp` (`u16le[4]`, ZOH-rescaled in `[0, 1023]`) and `c_cross_fp16` (`u16le[4]`) fixes `r_base_48k[m] = clamp(r_low[m], 0.0, 0.9995)` across all tiers.
 
 ```text
-+-----------------------------------------------------------------------------------+
-| MODAL CONVOLVER 64B-ALIGNED SLICE LAYOUT ACROSS ARENA 0..3 (SONA v3.0)            |
-+-----------------------------------------------------------------------------------+
-|  Tier    | New Pairs | Early FIR Slice      | Kautz Modal Slice (8-Vec SoA) | Sum |
-|  Lite    |     8     | +32 taps/ch = 256 B  |  2 blocks = 256 B (4 CL)      | 512 |
-|  Full    |     4     | +16 taps/ch = 128 B  |  1 block  = 128 B (2 CL)      | 256 |
-|  Pro     |    12     | +48 taps/ch = 384 B  |  3 blocks = 384 B (6 CL)      | 768 |
-|  Ultra   |     8     | +32 taps/ch = 256 B  |  2 blocks = 256 B (4 CL)      | 512 |
-|  Total   |    32     | 128 taps/ch = 1,024B |  8 blocks = 1,024 B (16 CL)   |2,048|
-+-----------------------------------------------------------------------------------+
++--------------------------------------------------------------------------------------------+
+| MODAL CONVOLVER v4 64B-ALIGNED SLICE LAYOUT ACROSS ARENA 0..3 (SONA v4.0)                  |
++--------------------------------------------------------------------------------------------+
+|  Tier    | New Pairs | Early FIR Slice      | ErSparseBank | Kautz Modal Slice (128 B/blk) |
+|  Lite    |     8     | +32 taps/ch = 256 B  |  8 taps (2x2)|  2 blocks = 256 B (4 CL)      |
+|  Full    |     4     | +16 taps/ch = 128 B  | +8 = 16 taps |  1 block  = 128 B (2 CL)      |
+|  Pro     |    12     | +48 taps/ch = 384 B  |  16 cum.     |  3 blocks = 384 B (6 CL)      |
+|  Ultra   |     8     | +32 taps/ch = 256 B  |  16 cum.     |  2 blocks = 256 B (4 CL)      |
+|  Total   |    32     | 128 taps/ch = 1,024B |  16 MIMO taps|  8 blocks = 1,024 B (16 CL)   |
++--------------------------------------------------------------------------------------------+
 ```
 
-Canonical relative tier array bases (`rel. tier_start`) are `CONVOLVER_EARLY_FIR_BASES = [1_408, 6_528, 12_544, 22_528]`, `CONVOLVER_KAUTZ_BASES = [1_664, 6_656, 12_928, 22_784]`, `TRANSPORT_DELAY_BASES = [1_920, 6_784, 13_312, 23_040]`, `LINEAR_READOUT_BASES = [2_048, 6_912, 13,568, 23,296]`, and `ARENA{1,2,3}_CONVOLVER_PREFIX_OVERRIDE_OFFSET = LINEAR_READOUT_BASES[1..3]`.
+Canonical relative tier array bases (`rel. tier_start`) follow the compile-time 64 B-aligned constants `CONVOLVER_EARLY_FIR_BASES`, `CONVOLVER_KAUTZ_BASES`, `TRANSPORT_DELAY_BASES`, `LINEAR_READOUT_BASES`, and `ARENA{1,2,3}_CONVOLVER_PREFIX_OVERRIDE_OFFSET = LINEAR_READOUT_BASES[1..3]` derived from the Arena 0..3 layouts.
 
 #### Packed Control Projection Profile
 
 `r[container.dnam.cp1-profile]`
 
-The `CP1` profile places all Lite..Pro base control descriptors, `CP1` contributor streams, `U_int`, `W_ctrl`, `opt_to_lr[0..4]`, and Lite `W_readout` inside Arena 0 (Arena 0 Lite payload).
+The `CP1` profile and ControlBus v4 GRA place all Lite..Pro base control descriptors, contributor streams, `ExactIntMainAccumulator` `u_int_base[:,0..4]`, self-contained Arena 0 GRA weights (2,048 B), `opt_to_lr[0..4]`, and Lite half-precision readout inside Arena 0. Stripping to Lite preserves full parametric controls without reading Arena 1..3 or `shared_extent` (REQ-5.6).
 
-Stripping to Lite preserves full parametric controls without reading Arena 1..3 or `shared_extent` (REQ-5.6).
+Reclaiming 6,336 B of strictly non-Tardos control bytes (cp1_base 576 B + `u_int_base[:,4..8]` 64 B + CEXT 1,280 B + `u_int_ultra[1..3]` 256 B + cp1_ultra 2,112 B + `stage_latent_core_mods_fp16` 2,048 B) funds ControlBus v4 GRA inside the <= 9,280 B control footprint while keeping `z_head[0..4]`, `w_ctrl`, and `w_ctrl_ultra` plus `rho_head_and_ctrl_tail[1..24]` and stage latent ultra controls intact.
 
 Contributors follow `controls_schema` order: each `range` with `lobatto_degree = k > 0` emits one `k`-lane record (`k = 0` emits none), and each option in `represented_switch_options` emits one 1-lane record.
 
-When contributors exceed 8 slots or 576 B, an overflow `"CP1\0"` binary stream (stored inside `.dnam-bin` `shared_controls` when `dbin_prefix_bytes > 0` with `Region 4 == 0 B`, or in Region 4 `shared_extent` when `dbin_prefix_bytes == 0`) takes canonical precedence whenever non-empty:
+When contributors exceed 8 slots or inline `GRA` capacity, an overflow `"CP1\0"` binary stream (stored inside `.dnam-bin` `shared_controls` when `dbin_prefix_bytes > 0` with `Region 4 == 0 B`, or in Region 4 `shared_extent` when `dbin_prefix_bytes == 0`) takes canonical precedence whenever non-empty:
 
 | Stream Offset | Bytes | LE Wire Type | Field Name & Clean-Room Encoding |
 | :--- | :---: | :--- | :--- |
@@ -573,29 +556,24 @@ When contributors exceed 8 slots or 576 B, an overflow `"CP1\0"` binary stream (
 | 8..8+4*C | `4 * C` | `4-byte entry[C]` | Packed 4 B directory per slot `s`: +0..2 `control_idx: u16le`, +2 `raw_kl: u8` (`((ctrl_kind & 3) << 2) \| (lanes & 3)`), +3 `aux: u8` (`partner_control_id` when `ctrl_kind == 2`, else `option_idx`) |
 | `8+4*C..` | var | `f32le[...]` | Concatenated `base_bytes` records (`4 * (9k + 4)` B each in row-major `[lane in 0..k][latent_dim in 0..8]` order: `main_base[k][8] \|\| emb[k] \|\| v_base[4]`), followed when `(flags & 1) != 0` by `ultra_bytes` records (`4 * (8k + 4)` B each in row-major `[lane in 0..k][latent_dim in 0..8]` order: `main_ultra[k][8] \|\| v_ultra[4]`) |
 
-Inside Arena 0 (Arena 0 Control Plane, 1,920 B at 2,688..4,608) and Arena 3 (Arena 3 Control Plane, 3,840 B at 26,880..30,720), control tables occupy fixed cache-line offsets:
+Inside Arena 0 (ControlBus v4 GRA, 2,048 B self-contained) and Arena 3 (Ultra GRA delta, total control footprint <= 9,280 B), control tables occupy fixed compile-time 64 B-aligned offsets:
 
-| Arena Block & Offset (rel. `tier_start`) | Relative Block Offset | Bytes | LE Wire Type | Field Name & Sub-Slot Assignment |
-| :--- | :---: | :---: | :--- | :--- |
-| Arena 0 Control Plane (2,688..4,608) | 0..36 | 36 | `f32le` + `u16le` | `lfo_dphi_train[2]` (`f32le[2]`, 0..8), `sigma_drift` (`f32le`, 8..12), `rho_drift_train` (`f32le` in `(0.0, 0.9999]`, default/fallback 0.999, 12..16), `lfo_skew_fp16[2]` (`u16le[2]`, `beta_0, beta_1 in [-1.0, 1.0]`, 16..20), `tank_dry_mix_fp16` (`u16le`, `[-2.0, 2.0]`, `0x0000 -> 0.0`, NaN -> 1.0, default builder 1.0, 20..22), `reserved_ctrl_fp16` (`u16le = 0`, 22..24), `ou_to_z_stage_fp16[4]` (`u16le[4]`, OU drift projection onto `z_stage[0..4]`, 24..32), `trust_radius_mh` (`f32le` in `[0.01, 16.0]`, default 2.5, fallback 1.0, at 32..36 mirrored by `rho_head_and_ctrl_tail[0]`; clips all four 4-D vectors `z_head`, `ctrl_basis_4`, `z_head_ultra`, `z_stage_ultra`) |
-| Arena 0 Control Plane (2,724) | 36..64 | 28 | `Inline CP1 Directory` | `cp1_dir` (`ARENA0_CP1_DIR_OFFSET = 2,724`): +0..2 `cp1_dir_count: u16le` (0–8), +2..4 `flags: u16le = 0`, +4..28 `entries: u8[8][3]` packing `[ctrl_idx, kind_and_lanes, aux]` (`kind = (b1 >> 4) & 0x0F`, `lanes = b1 & 0x0F`) |
-| Arena 0 Control Plane (2,752) | 64..192 | 128 | `f32le[4][8]` | `u_int_base` (`ARENA0_UINT_BASE_OFFSET = 2,752`) |
-| Arena 0 Control Plane (2,880) | 192..768 | 576 | `u8[576]` | `cp1_base` (`ARENA0_CP1_BASE_OFFSET = 2,880`, end 3,456; concatenates `4 * (9k + 4)` B row-major `[k][8]` `base` slices sequentially in `cp1_dir[0..cp1_dir_count]` order zero-padded to 576 B, failing closed if overflowing 576 B; overridden by non-empty `"CP1\0"` stream in `shared_controls` / `shared_extent`) |
-| Arena 0 Control Plane (3,456) | 768..1,792 | 1,024 | `f32le[16][16]` | `w_ctrl` (`ARENA0_W_CTRL_OFFSET = 3,456`, end 4,480) |
-| Arena 0 Control Plane (4,480) | 1,792..1,920 | 128 | `f32le[32]` | `rho_head_and_ctrl_tail` (`ARENA0_RHO_HEAD_OFFSET = 4,480`; `[0]` mirrors `trust_radius_mh` 2,720..2,724; `[1..24]` at bytes 4,484..4,576 is zero in unwatermarked builds, ignored by VM audio/control paths, and holds the 23 Role B Tardos watermark carrier slots when watermarked per [watermarking_and_marketplace.md](../security/watermarking_and_marketplace.md); `[24..32] = opt_to_lr[0..4][0..2]` in `f32le[4][2]`, overwritten on load by Full/Pro/Ultra 256 B Crossbar `opt_to_lr_fp16[16][2]` when present) |
-| Arena 3 Control Plane (26,880..30,720) | 0..256 | 256 | `f32le[16][4]` | `w_ctrl_ultra` (`ARENA3_W_CTRL_ULTRA_OFFSET = 26,880`; row-major `[16][4]` mapping `qu` to `stage_targets[0..16]`) |
-| Arena 3 Control Plane (27,136) | 256..640 | 384 | `f32le[3][4][8]` | `u_int_ultra` (`ARENA3_UINT_ULTRA_OFFSET = 27,136`; Block 0 maps `z_fm^(4..7) -> Δz_raw[0..8]`, matching [parametric_control_bus.md](../dsp/parametric_control_bus.md); Block 1: `z_fm_base -> z_raw[8..16]`; Block 2: `z_fm_ultra -> z_raw[8..16]`) |
-| Arena 3 Control Plane (27,520) | 640..2,752 | 2,112 | `u8[2,112]` | `cp1_ultra` (`ARENA3_CP1_ULTRA_OFFSET = 27,520`, end 29,632; concatenates `4 * (8k + 4)` B row-major `[k][8]` `ultra` delta slices sequentially in `cp1_dir[0..cp1_dir_count]` order zero-padded to 2,112 B, failing closed if overflowing 2,112 B) |
-| Arena 3 Control Plane (29,632) | 2,752..3,264 | 512 | `u16le[256]` | `stage_latent_ctrl_ultra_fp16` (`[0..80]` row-major `[8][10]` `w_adaa_drive_scale`, `[80..160]` row-major `[8][10]` `w_lru_bias_shift`, `[160..164]` `ou_to_z_stage_ultra_fp16[4]` projecting OU drift onto `z_stage_ultra[0..4]`, `[164..256]` reserved 0; overrides Arena 0 `[48..80]` on Ultra) |
-| Arena 3 Control Plane (30,144) | 3,264..3,840 | 576 | `u8[576]` | `reserve` (`0x00` pad to 30,720 B in unwatermarked `.dnam`; non-zero only in Tardos Role B watermarked copies) |
+| Arena Block | Bytes / Scope | LE Wire Type | Field Name & Sub-Slot Assignment |
+| :--- | :---: | :--- | :--- |
+| Arena 0 Control Scalars | 36 B | `f32le` + `u16le` | `lfo_dphi_train[2]`, `sigma_drift`, `rho_drift_train` (`(0.0, 0.9999]`, default 0.999), `lfo_skew_fp16[2]`, `tank_dry_mix_fp16` (`[-2.0, 2.0]`, default 1.0), `reserved_ctrl_fp16 = 0`, `ou_to_z_stage_fp16[4]`, `trust_radius_mh` (`[0.01, 16.0]`, default 2.5, fallback 1.0, mirrored by `rho_head_and_ctrl_tail[0]`) |
+| Arena 0 `cp1_dir` | 28 B | `Inline CP1 Directory` | `cp1_dir_count: u16le` (0–8), `flags: u16le = 0`, `entries: u8[8][3]` `[ctrl_idx, kind_and_lanes, aux]` |
+| Arena 0 `u_int_base` | 64 B active (`[:,0..4]`) | `f32le[4][4]` | `ExactIntMainAccumulator` `U_int^base[:,0..4]` for `SO(4)`-rotated `z_head[0..4]`; legacy `[:,4..8]` (64 B) reclaimed into `GRA` |
+| Arena 0 `GRA` Weights | within 2,048 B | `f32le` + `fp16` | Unrotated `W_in` (`CP1`), Zero-Anchored `SwiGLU` (`H=8`), `Padé-[1/1]` (`0 FDIV`), Anchored `1.5-Entmax` prototypes (`M=8`, `m=0` `StarCenter`), bilinear dynamic/inertia gates (`q2`, `q3`), 6-edge `g_edge[0..6]`, `op_t_q[0..16]`, and **`slot 31 L/R`** stereo quadrature AM (reclaiming `cp1_base` 576 B + `CEXT` 1,280 B) |
+| Arena 0 `w_ctrl` & `rho_head` | 1,024 B + 128 B | `f32le` | `w_ctrl` (`[16][16]`) + `rho_head_and_ctrl_tail[0..32]` (`[0]` mirrors `trust_radius_mh`, `[1..24]` Role B Tardos carriers, `[24..32]` `opt_to_lr[0..4][0..2]`) |
+| Arena 3 `GRA` Ultra Delta | <= 9,280 B total | `f32le` + `u16le[256]` | `w_ctrl_ultra` (256 B), `u_int_ultra[0]` (`SO(4)` Block 0 `z_head[0..4]`), Ultra `SwiGLU` (`H=16`) + `1.5-Entmax` (`M=16`) delta (reclaiming `u_int_ultra[1..3]` 256 B + `cp1_ultra` 2,112 B + `stage_latent_core_mods_fp16` 2,048 B), `stage_latent_ctrl_ultra_fp16[256]` (`[0..80]` `w_adaa_drive_scale`, `[80..160]` `w_lru_bias_shift`, `[160..164]` `ou_to_z_stage_ultra_fp16[4]`), and 576 B Tardos `reserve` |
 
-During full-graph VM execution, `SensoryQuad` feeds its 4-lane ParaLRU rectifier vector `[e_0, e_1, e_2, e_3]` directly into `env_states[0..4]` (`q3`) at each `K_ctrl` boundary ([router_and_crossbar_topology.md §2.6](../dsp/router_and_crossbar_topology.md#26-sensoryquad-op-mnsense-sensing-bank--input-vca)). Standalone control invocations initialize `env_states = [0.0; 4]` deterministically without fallback envelope filters.
+During full-graph VM execution, SensoryQuad v4 feeds its 16-sample CIC-boxcar anti-aliased 4-lane ParaLRU rectifier vector `[e_0, e_1, e_2, e_3]` into `env_states[0..4]` (q3) at each `K_ctrl` boundary (`K_ctrl(44.1 kHz) = K_ctrl(48 kHz) = 16`, gcd 4). It micro-ramps stage targets, `z_stage`, `z_head`, `g_edge`, and `op_t_q` once per 4-frame microchunk (alpha_chunk = 0.25) with active slot 31 L/R stereo differential quadrature AM ([router_and_crossbar_topology.md §2.6](../dsp/router_and_crossbar_topology.md#26-sensoryquad-op-mnsense-sensing-bank--input-vca), [parametric_control_bus.md §1.1](../dsp/parametric_control_bus.md#11-op-mctrl-3-khz-4-lane-symplectic-complex--ballistic-engine)).
 
-When Ultra (`D_s = 8`, Arena 3 loaded) is active, the Arena 3 Control Plane `stage_latent_ctrl_ultra_fp16[0..160]` overrides (rather than sums with) Arena 0's 4×4 subset in the Lite `LinearReadout` `stage_latent_mods_fp16[48..80]`.
+When Ultra (`D_s = 8`, Arena 3 loaded) is active, the Arena 3 Control Plane `stage_latent_ctrl_ultra_fp16[0..160]` overrides (rather than sums with) Arena 0's 4×4 subset in the Lite LinearReadout `stage_latent_mods_fp16[48..80]`.
 
-It computes `quad_adaa_oct[g]` and `quad_lru_bias[g]` directly across all 10 `CoreQuad` blocks `g` in 0..10 from `stage_targets[2 + block_of(g)]` and `stage_targets[6 + block_of(g)]` plus the unrotated inner product over `eff_z_stage[0..8]`, where `block_of` maps quads {0,4,6,8}->0, {1,5,9}->1, {2,7}->2, and {3}->3.
+It computes `quad_adaa_oct[g]` and `quad_lru_bias[g]` directly across all 10 CoreQuad blocks from `stage_targets[2 + block_of(g)]` and `stage_targets[6 + block_of(g)]` plus the unrotated inner product over `eff_z_stage[0..8]`, mapping quads {0, 4, 8}, {1, 5, 9}, {2, 6}, and {3, 7} onto Blocks 0 through 3.
 
-The Arena 0 Inline `CP1` Directory (`cp1_dir`) supports up to 8 inline contributors fitting inside `cp1_base` (such as 8 single-lane records at 52 B each = 416 B or 4 three-lane records at 124 B each = 496 B). Whenever fewer than two distinct physical controls carry contributors, both `u_int_base` and `u_int_ultra` are zeroed.
+The Arena 0 Inline `CP1` Directory (`cp1_dir`) supports up to 8 inline contributors fitting inside Arena 0 `GRA` / `CP1` slices. Whenever fewer than two distinct physical controls carry contributors, `u_int_base` and `u_int_ultra` are zeroed.
 
 Each 3 B entry `[ctrl_idx, kind_and_lanes, aux]` encodes `ctrl_kind` (0 = Range, 1 = Switch, 2 = `BilinearCrossTerm` per [parametric_control_bus.md §2.4](../dsp/parametric_control_bus.md#24-multi-option-switch-contributors--exact-integer-realization)) in the high nibble and lane count 1–3 in the low nibble, with `aux` holding the option index for Switch, `partner_control_id` for `ctrl_kind == 2`, or `0xFF` for Range.
 
@@ -657,7 +635,7 @@ $$\gamma_{\text{skew}} = \frac{\ln(0.5)}{\ln\left(\frac{x_{\text{mid}} - x_{\min
 
 `r[container.dnam.sample-rate-anchor]`
 
-All v3.0 `.dnam` models serialize discrete-time parameters at the canonical reference rate `sample_rate_train_hz = 48000`, including the `ModalConvolver` 16-sample modal onset. Source captures recorded at other rates are converted to aligned 48 kHz working copies during training while preserving source PCM provenance. At runtime, hosts operating at 44.1–384 kHz or 4× offline bounce apply analytical bilinear frequency prewarping (`TPT-SVF`) and continuous-time ZOH transformations per [router_and_crossbar_topology.md](../dsp/router_and_crossbar_topology.md).
+All v4.0 `.dnam` models serialize discrete-time parameters at the canonical reference rate `sample_rate_train_hz = 48000`, including per-bank `ModalConvolver` Kautz `onset_delay_samp[4]` (reclaimed from legacy `dr` and ZOH-rescaled across host rates). Source captures recorded at other rates are converted to aligned 48 kHz working copies during training while preserving source PCM provenance. At runtime, hosts operating at 44.1–384 kHz or 4× offline bounce apply analytical bilinear frequency prewarping (`TPT-SVF`), continuous-time ZOH transformations, and Kaiser polyphase high-SR FIR conversion per [router_and_crossbar_topology.md](../dsp/router_and_crossbar_topology.md).
 
 ---
 
@@ -665,7 +643,7 @@ All v3.0 `.dnam` models serialize discrete-time parameters at the canonical refe
 
 `r[container.dnam.jcs-header-schema]`
 
-The RFC 8785 JCS immutable header locks the canonical v3.0 `"sona"` JSON schema in snake_case. Encoders must emit UTF-8 without a BOM, forbid duplicate keys, ensure all floating-point numbers are finite IEEE-754 binary64 values, and omit `null` or absent optional members prior to canonicalization so clean-room decoders across languages compute identical `immutable_header_sha256` digests.
+The RFC 8785 JCS immutable header locks the canonical v4.0 `"sona"` JSON schema in snake_case. Encoders must emit UTF-8 without a BOM, forbid duplicate keys, ensure all floating-point numbers are finite IEEE-754 binary64 values, and omit `null` or absent optional members prior to canonicalization so clean-room decoders across languages compute identical `immutable_header_sha256` digests.
 
 Top-level optional `presets`, `user_metadata`, and `stem_user_metadata` — alongside `metadata.signatures`, `controls_schema[*].user_metadata`, `stems_registry[*].user_metadata`, and `slimmable_tiers.{lite,full,pro,ultra}.prefix_crc32c` — are stripped before hashing `immutable_header_sha256`.
 
@@ -675,7 +653,7 @@ At runtime, mutable suffix entries from `DMU1` or `DME1` (§1.3) overlay these s
 
 | Schema Object / Key | JSON Type | Default / Constraint | Normative Specification |
 | :--- | :--- | :--- | :--- |
-| `header.version` | `string` | Default `"3.0.0"` | Exact v3.0 container schema semver |
+| `header.version` | `string` | Default `"4.0.0"` | Exact v4.0 container schema semver |
 | `header.container_kind` | `string` | Default `"dnam"` (`"dnam" \| "preview"`) | Runtime model vs. storefront preview container |
 | `header.architecture` | `string` | Default `"sona"` | Universal SONA state-space operator architecture |
 | `header.sample_rate_train_hz` | `u32` | Default 48,000 | Canonical training grid sample rate in Hz |
@@ -686,9 +664,9 @@ At runtime, mutable suffix entries from `DMU1` or `DME1` (§1.3) overlay these s
 | `header.slimmable_tiers` | `SlimmableTiersConfig` | Required | Per-tier dimensions, offsets, calibration, and certification metrics |
 | `header.controls_schema` | `ControlDescriptorJson[]` | Optional (default `[]`; max 255) | Ordered `range`/`switch` control descriptors |
 | `header.presets` | `PresetDef[]` | Optional (default `[]`; JCS-stripped) | Creator factory presets (0–64) overlaid from `DMU1`/`DME1` |
-| `header.control_bus` | `ControlBusConfig` | Optional (defaults populated) | 3 kHz control-plane dimensions, `CP1` count, and trust radius |
-| `header.modal_convolver` | `ModalConvolverConfig` | Optional (defaults populated) | `ModalConvolver` early FIR + shared conjugate Kautz modal bank metadata |
-| `header.transport` | `TransportConfig` | Optional (defaults populated) | `TransportQuad` delay quads, stability ceilings, and hold-ramp invariants |
+| `header.control_bus` | `ControlBusConfig` | Optional (defaults populated) | 3 kHz `ControlBus` v4 `GRA` dimensions, `CP1` count, micro-ramp, and trust radius |
+| `header.modal_convolver` | `ModalConvolverConfig` | Optional (defaults populated) | `ModalConvolver` v4 early FIR, `ErSparseBank`, voicing morph, and Kautz bank metadata |
+| `header.transport` | `TransportConfig` | Optional (defaults populated) | `TransportQuad` v4 delay quads, stability ceilings, and hold-ramp invariants |
 | `header.linear_readout` | `LinearReadoutConfig` | Optional (defaults populated) | `LinearReadout` metadata including runtime `ro_pole_48k` tilt/shelf pole |
 | `header.delay_histories` | `DelayHistoryEntry[]` | Optional (omitted when empty; default `[]`) | Cold/inline delay history allocations (`owner: "transport" \| "crossbar"`) |
 | `header.tensor_directory` | `map<string, TensorSliceEntry>` | Optional (default `{}`) | Canonical 64 B-aligned slice directory (`§2.3`) |
@@ -697,7 +675,7 @@ At runtime, mutable suffix entries from `DMU1` or `DME1` (§1.3) overlay these s
 | `ModelMetadata.description` | `string \| null` | Optional (default `null`) | Notes describing modeled hardware rig |
 | `ModelMetadata.license` | `string \| null` | Optional (default `null`) | SPDX or custom license identifier |
 | `ModelMetadata.created_at` | `string` | Required | ISO-8601 / RFC 3339 UTC creation timestamp |
-| `ModelMetadata.input_reference_dbfs` | `f32` | Default -20.5 | Calibrated `1 dBu` (`0.869 Vrms`) reference level in dBFS |
+| `ModelMetadata.input_reference_dbfs` | `f32` | Default -20.5 | Calibrated 1 dBu (0.869 Vrms) reference level in dBFS |
 | `ModelMetadata.provenance` | `DatasetProvenance` | Optional (defaults empty / 0) | `{ dataset_manifest_sha256: string, config_recipe_sha256: string \| null, epochs_trained: u32 }` |
 | `ModelMetadata.distribution_policy` | `DistributionPolicy` | Optional (omitted when `null`) | `{ allowed_protection_profiles: ("open" \| "device_allowlisted" \| "enclave_sealed")[], allowed_oem_vendors: string[] }` |
 | `ModelMetadata.signatures` | `ModelSignatures \| null` | Optional (default `null`; JCS-stripped) | JSON signature & `DeviceAllowlisted` CEK-wrap envelope excluded from `immutable_header_sha256` (below) |
@@ -739,7 +717,7 @@ At runtime, mutable suffix entries from `DMU1` or `DME1` (§1.3) overlay these s
 | `IoConfig.leveling.unity_gain_offset_db` | `f32` | Default 0.0 | `reference_input_level_db - measured_default_output_level_db` |
 | `IoConfig.leveling.target_gain_db` | `f32` | Default 0.0 | Creator-configured target offset relative to unity (e.g., +3.0 dB boost) |
 | `IoConfig.leveling.calibrated_trim_db` | `f32` | Default 0.0 | Total trim applied (`unity_gain_offset_db + target_gain_db` if `auto_unity_enabled`, else `target_gain_db`) |
-| `SlimmableTiersConfig.{lite,full,pro,ultra}` | `TierProfile` | `lite`, `full`, `ultra` required; `pro` defaults to canonical Pro profile | `{ feature_bus_dim: u16 (64..256), channels: u8 (16..40), early_fir_taps: u8 (32..128), kautz_modes: u8 (8..32), transport_lines: u8 (4..16), head_svd_rank: u8 (4 \| 8), loudness_lufs: f32, output_trim_db: f32, validation_esr_db: f32, arena_end_byte_offset: u32, prefix_crc32c: u32 }`; `prefix_crc32c` is stripped prior to JCS digest |
+| `SlimmableTiersConfig.{lite,full,pro,ultra}` | `TierProfile` | `lite`, `full`, `ultra` required; `pro` defaults to canonical `[2,2,2,2]` Pro profile | `{ feature_bus_dim: u16 (64..256), channels: u8 (16..40), tiles: u8 (5 \| 13 \| 24 \| 37), oversample_factor: u8 (2), early_fir_taps: u8 (32..128), er_sparse_taps: u8 (8 \| 16), kautz_modes: u8 (8..32), transport_lines: u8 (4..16), head_svd_rank: u8 (4 \| 8), loudness_lufs: f32, output_trim_db: f32, validation_esr_db: f32, arena_end_byte_offset: u32, prefix_crc32c: u32 }`; `prefix_crc32c` is stripped prior to JCS digest |
 
 **3. `controls_schema[*]` (`ControlDescriptorJson`), `conditional_bounds`, `calibration`, `ui_hints` & `presets[*]`:**
 
@@ -772,9 +750,9 @@ At runtime, mutable suffix entries from `DMU1` or `DME1` (§1.3) overlay these s
 
 | Schema Object (`header` Key) | Required / Canonical Fields & Defaults | Normative Invariant |
 | :--- | :--- | :--- |
-| `ControlBusConfig` (`"control_bus"`) | `envelopes: u8` (4), `lfo_oscillators: u8` (2), `fm_interaction_rank: u8` (4), `modulation_bus_dim: u8` (16 or 32), `head_trust_region_radius: f32` (2.5) | Declares 4 `SensoryQuad` envelope bands, 2 skewed quadrature `Q0.192` LFOs, Rank-4 FM interaction, 16 base + optional 16 `CEXT` modulation slots, and outward trust-clip radius `M_h` |
-| `ModalConvolverConfig` (`"modal_convolver"`) | `fir_taps: u8` (32), `kautz_modals: u8` (8) | Base Lite early FIR tap count and shared Kautz modal pair count; numeric weights live in `conv_fir_*` & `conv_kautz_*` |
-| `TransportConfig` (`"transport"`) | `delay_storage: string` (`"fp16"`), `interp: string` (`"catmull_rom_cubic"`), `tzf_reference_tap_samples: f32` (64.0), `switch_xfade_samples: u16` (128), `allpass_delays_samples: u16[]` (8 or 16 elements; default `[19, 31, 47, 73, 103, 139, 179, 223, 29, 53, 83, 113, 151, 191, 233, 251]`), `dc_blocker_pole: f32` (0.995), `loop_ceiling: f32` (0.985) | Declares transport delay storage, Catmull-Rom interpolation, TZF tap, Schroeder all-pass primes, and loop ceiling; `switch_xfade_samples` gives discrete switch-control crossfade duration (distinct from the fixed 48-frame runtime tier crossfade), and `dc_blocker_pole` in `(0.8, 1.0)` populates `DBRM` `dc_blocker_pole_5hz` (JSON schema default 0.995; VM fallback `0x3F7F_D51F`) |
+| `ControlBusConfig` (`"control_bus"`) | `envelopes: u8` (4), `lfo_oscillators: u8` (2), `fm_interaction_rank: u8` (4), `gra_hidden_dim: u8` (8 \| 16), `entmax_prototypes: u8` (8 \| 16), `modulation_bus_dim: u8` (32, plus `g_edge[6]` & `op_t_q[16]`), `k_ctrl_44k1_48k: u8` (16), `micro_ramp_frames: u8` (4), `head_trust_region_radius: f32` (2.5) | Declares 4 `SensoryQuad` v4 envelopes, 2 skewed quadrature `Q0.192` LFOs, Rank-4 `SO(4)`-isolated FM, `ControlBus` v4 `GRA` (`SwiGLU + Padé-[1/1] + 1.5-Entmax`), 32 `stage_targets` (`slot 31 L/R` active), 6-edge gates, 16 `Op-T` deltas, 4-frame micro-ramp, and outward trust radius |
+| `ModalConvolverConfig` (`"modal_convolver"`) | `fir_taps: u8` (32), `er_sparse_taps: u8` (8 \| 16), `voicing_morph_bases: u8` (2), `kautz_modals: u8` (8), `per_bank_kautz_onset: bool` (`true`) | Base Lite early FIR tap count, `ErSparseBank` MIMO early taps, 2-basis `fp16` FIR voicing morph, shared Kautz modal pair count, and per-bank `onset_delay_samp` |
+| `TransportConfig` (`"transport"`) | `delay_storage: string` (`"fp16"`), `interp: string` (`"catmull_rom_cubic"`), `inline_quad0_frames: u16` (64), `tzf_reference_tap_samples: f32` (64.0), `switch_xfade_samples: u16` (128), `allpass_delays_samples: u16[]` (8 or 16 elements), `dc_blocker_pole: f32` (0.995), `loop_ceiling: f32` (0.9990), `ramp_rate_max_hz: f32` (64.0), `sigma_sat_ceiling: f32` (4.0) | Declares transport delay storage, Catmull-Rom interpolation, 64-frame inline Quad 0 ring, Schroeder all-pass primes, bipolar loop ceiling 0.9990, ±64 Hz ramp ceiling, `sigma_knee <= 4.0`, and `DBRM` `dc_blocker_pole_5hz` |
 | `LinearReadoutConfig` (`"linear_readout"`) | `ro_pole_48k: f32` (0.0) | Learned 48 kHz readout leak pole clamped to `[0.0, 0x3F7F_FFAC]` (`MAX_PARALRU_R_F32`) backing `"DBRM"` `ro_pole_48k` (0.0 disables `hp_lp` state evaluation) |
 | `DelayHistoryEntry` (`delay_histories[*]`) | `id: string`, `owner: "transport" \| "crossbar"`, `kind: "fractional" \| "allpass"`, `introduced_tier: "lite" \| "full" \| "pro" \| "ultra"`, `sample_format: "fp16" \| "f32"` (default `"fp16"`), `reference_samples: map<Tier, string>` | Declares every cold/inline delay buffer (`reference_samples` encoded as canonical nonzero `u64` ASCII decimal text at 48 kHz) |
 | `TensorSliceEntry` (`tensor_directory[*]`) | `arena: u8` (0–3), `dtype: "f32" \| "f64"`, `packing?: string`, `feature_dim?: u32`, `packed_len?: u32`, `shape?: u64[]`, `byte_offset: u32`, `byte_length: u32` | `byte_offset` and `byte_length` are 64 B-aligned relative to `tier_start` (`§2.3`) |
@@ -790,6 +768,6 @@ At runtime, mutable suffix entries from `DMU1` or `DME1` (§1.3) overlay these s
 | Preset-Safe Canonical Digest | SHA-256 of the projected RFC 8785 JCS immutable header (`immutable_header_sha256`). | [provenance_and_enclave_drm.md §2.1](../security/provenance_and_enclave_drm.md#21-preset-safe-canonical-header-digest-rfc-8785-jcs) |
 | Creator Exclusivity Policy | `metadata.distribution_policy` (`allowed_protection_profiles`, `allowed_oem_vendors`). | [provenance_and_enclave_drm.md §2.2](../security/provenance_and_enclave_drm.md#22-creator-signed-distributionpolicy--protection-profile-exclusivity) |
 | 2-Certificate Ed25519 Delegation & 4-Tier Stripping | Binary `DAU1` (Open `.dnam`, binding `dbin_prefix` when present) and `DAI1` (inner `DNPL` / `.dnam-seal` with `logical_prefix` `dbin_prefix`) envelopes plus Region 3 JSON `metadata.signatures` (`DCRC` `crc_dbin_prefix`) binding 4-tier prefix-digest lists + self-contained Arena 0 controls. | [provenance_and_enclave_drm.md §2.3](../security/provenance_and_enclave_drm.md#23-two-certificate-ed25519-delegation-chain--4-tier-cumulative-arena-digests) |
-| OEM Hardware Enclave & `.dnam-seal` (`"DNSL"`) | `DSA1` outer manifest + optional `dbin_prefix` after aligned JCS header + RFC 9180 HPKE recipient slots + ChaCha20-Poly1305 tier records (v3.0 little-endian binary). | [provenance_and_enclave_drm.md §3](../security/provenance_and_enclave_drm.md#3-pillar-2-hardware-enclave--oem-drm-oemdevicecertificate-attestation--dnam-seal-dnsl-wrapper) |
-| Dual-Mechanism Buyer Watermarking (Arena 0..3) | 0-ULP odd-symmetric SONA (`PolyADAA1`/`ParaLRU`/cyclic `GLU`) hidden-lane sign-flip gauge + `ModalConvolver` Kautz gauges + EMR-masked Tardos code. | [watermarking_and_marketplace.md §1](../security/watermarking_and_marketplace.md#1-pillar-3-forensic-traitor-tracing--02-ms-dual-mechanism-buyer-watermarking) |
+| OEM Hardware Enclave & `.dnam-seal` (`"DNSL"`) | `DSA1` outer manifest + optional `dbin_prefix` after aligned JCS header + RFC 9180 HPKE recipient slots + ChaCha20-Poly1305 tier records (v4.0 little-endian binary). | [provenance_and_enclave_drm.md §3](../security/provenance_and_enclave_drm.md#3-pillar-2-hardware-enclave--oem-drm-oemdevicecertificate-attestation--dnam-seal-dnsl-wrapper) |
+| Dual-Mechanism Buyer Watermarking (Arena 0..3) | 0-ULP odd-symmetric SONA (`AlgADAA1`/`ParaLRU`/`SE-Bus`/cyclic `GLU` + explicit `u16` `rect_sign_mask` + `W_ro_head_odd`) hidden-lane sign-flip gauge + `ModalConvolver` Kautz gauges + EMR-masked `fp16`-ULP Tardos code (6,336 B `GRA` & 128 B Kautz `dr` isolated). | [watermarking_and_marketplace.md §1](../security/watermarking_and_marketplace.md#1-pillar-3-forensic-traitor-tracing--02-ms-dual-mechanism-buyer-watermarking) |
 | 3 Container Protection Profiles | Open, `DeviceAllowlisted`, and `EnclaveSealed`. | [provenance_and_enclave_drm.md §4](../security/provenance_and_enclave_drm.md#4-three-container-protection-profiles--loader-auto-detection) |

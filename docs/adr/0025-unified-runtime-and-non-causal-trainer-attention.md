@@ -10,6 +10,7 @@ specs:
   - ../specs/training/webgpu_and_varpro_solver.md
   - ../specs/training/capture_and_alignment.md
   - ../specs/training/control_space_audit.md
+  - ../specs/training/iterative_resume_and_caching.md
   - ../specs/architecture/sona_architecture.md
   - ../specs/dsp/parametric_control_bus.md
   - ../specs/dsp/router_and_crossbar_topology.md

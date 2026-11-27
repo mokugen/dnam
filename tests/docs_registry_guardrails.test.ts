@@ -796,6 +796,9 @@ describe("DNAM Documentation Registry, Rules, ADRs & Traceability Guardrails", (
       "dsp.op-t.loop.convex-shimmer-freeze",
       "dsp.ctrl.gra.rational-and-entmax",
       "dsp.ctrl.gra.bibo-convex-hull",
+      "train.pipeline.offline-attention",
+      "train.pipeline.qualification-pyramid",
+      "train.capture.attention-and-qualification",
     ]);
     const rules = collectSpecRules();
     const verifiedIds = new Set(collectTestVerifyTokens().map(([ruleId]) => ruleId));
