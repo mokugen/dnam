@@ -1,64 +1,23 @@
 #![forbid(unsafe_code)]
 
 //! Hardware parity and deterministic reduction verification for `tile_mix_fwd_adj` (`dir_mode in 0..=3`)
-//! across all `35` lower-triangular Ultra DAG connections (`num_quads = 10`).
+//! across all `37` lower-triangular SONA v4.0 Ultra DAG connections (`[3, 3, 2, 2]`, `num_quads = 10`).
 
 use super::harness::{
     GpuContext, ShaderVariant, as_byte_slice, dispatch_kernel, read_f32_vec, read_vec4_vec,
 };
+use dnam_kernels::SONA_V4_CORE_QUAD_BLOCK_AND_LOCAL;
 use sona_shaders::abi::{
-    BLOCK_WAVE_ALL, CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, TILE_DESC_VEC4_STRIDE,
-    TILE_FRAMES, TILE_MIX_DIR_FORWARD, TILE_MIX_DIR_PARTIAL_WEIGHTS, TILE_MIX_DIR_PULLBACK,
-    TILE_MIX_DIR_REDUCE_WEIGHTS, TILE_WEIGHT_GRAD_FLOATS, TileMixUniforms, block_quad_count,
+    BLOCK_WAVE_ALL, CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, SONA_INTERBLOCK_TILES,
+    TILE_DESC_VEC4_STRIDE, TILE_FRAMES, TILE_MIX_DIR_FORWARD, TILE_MIX_DIR_PARTIAL_WEIGHTS,
+    TILE_MIX_DIR_PULLBACK, TILE_MIX_DIR_REDUCE_WEIGHTS, TILE_WEIGHT_GRAD_FLOATS, TileMixUniforms,
+    block_quad_count,
 };
 use sona_shaders::manifest::KernelId;
 use zerocopy::IntoBytes;
 
-const ULTRA_TILES_35: [(usize, usize); 35] = [
-    (0, 1),
-    (1, 2),
-    (2, 3),
-    (0, 5),
-    (4, 1),
-    (4, 5),
-    (0, 2),
-    (4, 2),
-    (0, 3),
-    (4, 3),
-    (5, 2),
-    (1, 3),
-    (5, 3),
-    (6, 1),
-    (6, 5),
-    (0, 7),
-    (4, 7),
-    (6, 2),
-    (6, 7),
-    (6, 3),
-    (1, 7),
-    (5, 7),
-    (7, 3),
-    (0, 9),
-    (4, 9),
-    (6, 9),
-    (8, 1),
-    (8, 5),
-    (8, 9),
-    (8, 2),
-    (8, 7),
-    (8, 3),
-    (9, 2),
-    (9, 7),
-    (9, 3),
-];
-
 fn block_of_quad(q: usize) -> u32 {
-    match q {
-        0 | 4 | 6 | 8 => 0,
-        1 | 5 | 9 => 1,
-        2 | 7 => 2,
-        _ => 3,
-    }
+    SONA_V4_CORE_QUAD_BLOCK_AND_LOCAL[q].0 as u32
 }
 
 pub fn verify_tile_mix_ultra_dag_parity(ctx: &GpuContext, variant: ShaderVariant) {
@@ -67,7 +26,7 @@ pub fn verify_tile_mix_ultra_dag_parity(ctx: &GpuContext, variant: ShaderVariant
     let num_tiles = num_frames.div_ceil(TILE_FRAMES);
     let num_quads = 10_usize;
     let num_stems = 2_usize;
-    let active_tiles = ULTRA_TILES_35.len();
+    let active_tiles = SONA_INTERBLOCK_TILES.len();
 
     let mut base_inputs =
         vec![[0.0_f32; 4]; num_stems * num_quads * num_frames * CORE_INPUT_VEC4_STRIDE];
@@ -102,7 +61,7 @@ pub fn verify_tile_mix_ultra_dag_parity(ctx: &GpuContext, variant: ShaderVariant
     }
 
     let mut descs = Vec::with_capacity(active_tiles * TILE_DESC_VEC4_STRIDE);
-    for (tile_i, &(src_q, dst_q)) in ULTRA_TILES_35.iter().enumerate() {
+    for (tile_i, &(src_q, dst_q)) in SONA_INTERBLOCK_TILES.iter().enumerate() {
         descs.push([
             f32::from_bits(src_q as u32),
             f32::from_bits(dst_q as u32),
@@ -163,7 +122,7 @@ pub fn verify_tile_mix_ultra_dag_parity(ctx: &GpuContext, variant: ShaderVariant
     for (i, v) in base_inputs.iter().enumerate() {
         cpu_inputs[i] = v.map(f64::from);
     }
-    for (tile_i, &(src_q, dst_q)) in ULTRA_TILES_35.iter().enumerate() {
+    for (tile_i, &(src_q, dst_q)) in SONA_INTERBLOCK_TILES.iter().enumerate() {
         let db = tile_i * TILE_DESC_VEC4_STRIDE;
         for stem in 0..num_stems {
             for t in 0..num_frames {
@@ -222,7 +181,7 @@ pub fn verify_tile_mix_ultra_dag_parity(ctx: &GpuContext, variant: ShaderVariant
     );
     let gpu_dl_feats = read_vec4_vec(&pb_out[2]);
     let mut cpu_dl_feats = vec![[0.0_f64; 4]; feats.len()];
-    for (tile_i, &(src_q, dst_q)) in ULTRA_TILES_35.iter().enumerate() {
+    for (tile_i, &(src_q, dst_q)) in SONA_INTERBLOCK_TILES.iter().enumerate() {
         let db = tile_i * TILE_DESC_VEC4_STRIDE;
         for stem in 0..num_stems {
             for t in 0..num_frames {
@@ -308,7 +267,7 @@ pub fn verify_tile_mix_ultra_dag_parity(ctx: &GpuContext, variant: ShaderVariant
     }
 
     let mut cpu_wg = vec![0.0_f64; active_tiles * TILE_WEIGHT_GRAD_FLOATS];
-    for (tile_i, &(src_q, dst_q)) in ULTRA_TILES_35.iter().enumerate() {
+    for (tile_i, &(src_q, dst_q)) in SONA_INTERBLOCK_TILES.iter().enumerate() {
         let base = tile_i * TILE_WEIGHT_GRAD_FLOATS;
         for stem in 0..num_stems {
             for t in 0..num_frames {

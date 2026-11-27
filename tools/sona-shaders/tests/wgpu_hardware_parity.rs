@@ -20,6 +20,8 @@ mod ozaki_and_prescreen;
 mod paralru_fastpath;
 #[path = "wgpu_hardware_parity/tile_mix.rs"]
 mod tile_mix;
+#[path = "wgpu_hardware_parity/v4_adjoint_and_clamp.rs"]
+mod v4_adjoint_and_clamp;
 #[path = "wgpu_hardware_parity/wave_and_streamed.rs"]
 mod wave_and_streamed;
 
@@ -123,5 +125,18 @@ fn test_wgpu_paralru_fastpath_and_const_m_scans() {
     };
     for variant in ctx.variants() {
         paralru_fastpath::verify_paralru_fastpath_and_const_m_scans(&ctx, variant);
+    }
+}
+
+/// verify[train.pipeline.webgpu-scans-and-ozaki]
+/// verify[dsp.op-n.polyadaa.clamp]
+/// verify[dsp.op-n.core.interblock-tiles]
+#[test]
+fn test_wgpu_v4_adjoint_clamp_se_bus_and_pred_corr_phs() {
+    let Some(ctx) = init_gpu_context() else {
+        return;
+    };
+    for variant in ctx.variants() {
+        v4_adjoint_and_clamp::verify_v4_adjoint_and_clamp_suite(&ctx, variant);
     }
 }

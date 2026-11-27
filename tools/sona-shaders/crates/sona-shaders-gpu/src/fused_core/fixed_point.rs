@@ -1,9 +1,8 @@
 #![forbid(unsafe_code)]
 
-//! Optional bounded fixed-point forward scans (`<= 6` iters, `<= 1e-6` error with exact
+//! Optional bounded fixed-point forward scan (`<= 6` iters, `<= 1e-6` error with exact
 //! sequential fallback) executing strictly inside `scan_scratch` (`6,144 B`) & `aux_scratch`
 //! (`ref[train.pipeline.webgpu-scans-and-ozaki]`):
-//! - Block 0 PHS `TPT-SVF`: Passive Picard (`||A(k_eff)||_2 <= 1`, non-expansive linear step).
 //! - Selective-Duhem `ParaLRU`: Backtracking-damped `1D` `DEER` (`alpha in {1.0, 0.5, 0.25}`).
 
 use crate::abi::{
@@ -11,21 +10,19 @@ use crate::abi::{
     MAX_WORKGROUP_SRAM_BYTES,
 };
 use crate::core_math::{
-    QuadLaneParams, eval_duhem_step_terms, eval_tone_scalar, eval_tpt_svf_scalar, flush_zero,
-    linear_forward_exclusive_scan_128_pair, step_paralru_duhem_scalar, step_tpt_svf_phs_scalar,
-    tpt_exclusive_scan_128_pair,
+    QuadLaneParams, eval_duhem_step_terms, flush_zero, linear_forward_exclusive_scan_128_pair,
+    step_paralru_duhem_scalar,
 };
 use crate::reduce::{clamp_f32_safe, is_finite_bits, rcp_pos_f32, wg_barrier};
 use dnam_kernels::{
-    GpuVec4, KernelVec4, LinearScanElem, MAX_PARALRU_R_F32, MIN_TPT_G, SVF_PHS_E_MAX, TptScanElem,
-    step_paralru_duhem_vec4,
+    GpuVec4, KernelVec4, LinearScanElem, MAX_PARALRU_R_F32, step_paralru_duhem_v4_vec4,
 };
 
 const SUBTILE_FRAMES: usize = 128;
 const FIXED_POINT_MAX_ITERS: usize = 6;
 const FIXED_POINT_TOL: f32 = 5.0e-7;
 const NONFINITE_PENALTY: f32 = 1.0e9;
-const REDUCE_AUX_BASE: usize = 32;
+const REDUCE_AUX_BASE: usize = 48;
 
 const _: () = assert!(REDUCE_AUX_BASE + SUBTILE_FRAMES <= FORWARD_AUX_SCRATCH_FLOATS);
 const _: () = assert!(FORWARD_SCAN_SCRATCH_FLOATS == 1536);
@@ -54,7 +51,7 @@ fn rel_err_finite(a: f32, b: f32) -> f32 {
 }
 
 /// Reduces a `256`-thread nonnegative max error (paired across `L` `0..128` and `R` `128..256`)
-/// inside `aux_scratch[32..160]` (`0` touch on `aux_scratch[0..32]`), broadcasting to all threads.
+/// inside `aux_scratch[48..176]` (`0` touch on `aux_scratch[0..48]`), broadcasting to all threads.
 #[inline]
 fn reduce_max_256_in_aux(
     aux_scratch: &mut [f32; FORWARD_AUX_SCRATCH_FLOATS],
@@ -88,25 +85,10 @@ fn reduce_max_256_in_aux(
 }
 
 #[inline(always)]
-fn phs_passive_step_coeffs(s1_prev: f32, lp: &QuadLaneParams) -> (f32, f32, f32, f32) {
-    let g_safe = (lp.two_svf_g * 0.5).max(MIN_TPT_G);
-    let k_safe = lp.k.max(0.0);
-    let k_nl_safe = lp.svf_k_nl.max(0.0);
-    let s1_sq = s1_prev * s1_prev;
-    let e = s1_sq.min(SVF_PHS_E_MAX);
-    let k_eff = k_safe + k_nl_safe * e;
-    let denom = 1.0 + g_safe * (g_safe + k_eff);
-    let a1 = GpuVec4::splat(denom).rcp_ge1_nr2().to_array()[0];
-    let a2 = g_safe * a1;
-    let a3 = g_safe * a2;
-    (a1, a2, a3, k_eff)
-}
-
-#[inline(always)]
 fn eval_duhem_step_raw_and_jac(tone: f32, bp: f32, v_prev: f32, lp: &QuadLaneParams) -> (f32, f32) {
     let lru_c = lp.to_lru_coeffs();
     let mut v_reg = GpuVec4::splat(v_prev);
-    let v_raw = step_paralru_duhem_vec4(
+    let v_raw = step_paralru_duhem_v4_vec4(
         GpuVec4::splat(lp.rect_sign * tone),
         GpuVec4::splat(lp.two_svf_g * bp),
         &mut v_reg,
@@ -126,144 +108,6 @@ fn eval_duhem_step_raw_and_jac(tone: f32, bp: f32, v_prev: f32, lp: &QuadLanePar
     );
     let jac = clamp_f32_safe(terms.jac, -MAX_PARALRU_R_F32, MAX_PARALRU_R_F32);
     (v_raw, jac)
-}
-
-/// Optional Passive-Picard Block 0 PHS forward sub-tile solver (`<= 6` iters, `<= 1e-6` tol)
-/// with exact `lid in {0, 1}` sequential fallback on exceedance.
-#[allow(clippy::too_many_arguments)]
-#[inline]
-pub(super) fn run_phs_passive_picard_subtile(
-    lid: usize,
-    sub_valid_len: usize,
-    c: usize,
-    u_my: f32,
-    lp: &QuadLaneParams,
-    scan_scratch: &mut [f32; FORWARD_SCAN_SCRATCH_FLOATS],
-    lane_buf: &mut [f32; FORWARD_LANE_BUF_FLOATS],
-    aux_scratch: &mut [f32; FORWARD_AUX_SCRATCH_FLOATS],
-) {
-    let is_r = (lid >> 7) != 0;
-    let t = lid & 127;
-    let active = t < sub_valid_len;
-    let init_base = if is_r { 8 + c } else { c };
-    let init = [aux_scratch[init_base], aux_scratch[init_base + 4]];
-
-    let mut s1_cur = init[0];
-    let mut s2_cur = init[1];
-    let mut end_state = init;
-    let mut prev_end_state = init;
-    let mut converged = false;
-
-    for iter in 0..FIXED_POINT_MAX_ITERS {
-        if !converged {
-            let (a1, a2, a3, _) = phs_passive_step_coeffs(s1_cur, lp);
-            let elem = if active {
-                TptScanElem::from_step(a1, a2, a3, u_my)
-            } else {
-                TptScanElem::identity()
-            };
-            let mut s1_next = 0.0_f32;
-            let mut s2_next = 0.0_f32;
-            end_state = tpt_exclusive_scan_128_pair(
-                scan_scratch,
-                lid,
-                sub_valid_len,
-                elem,
-                init,
-                &mut s1_next,
-                &mut s2_next,
-            );
-            let err_t = if active {
-                let e1 = rel_err_finite(s1_next, s1_cur);
-                let e2 = rel_err_finite(s2_next, s2_cur);
-                let e12 = if e2 > e1 { e2 } else { e1 };
-                if iter > 0 && t + 1 == sub_valid_len {
-                    let ee1 = rel_err_finite(end_state[0], prev_end_state[0]);
-                    let ee2 = rel_err_finite(end_state[1], prev_end_state[1]);
-                    let ee = if ee2 > ee1 { ee2 } else { ee1 };
-                    if ee > e12 { ee } else { e12 }
-                } else {
-                    e12
-                }
-            } else {
-                0.0
-            };
-            let max_err = reduce_max_256_in_aux(aux_scratch, lid, err_t);
-            s1_cur = s1_next;
-            s2_cur = s2_next;
-            prev_end_state = end_state;
-            if max_err <= FIXED_POINT_TOL && (iter > 0 || max_err == 0.0) {
-                converged = true;
-            }
-        }
-    }
-
-    if !converged {
-        let ch_off = if is_r { SUBTILE_FRAMES } else { 0 };
-        if active {
-            scan_scratch[ch_off + t] = u_my;
-        } else if t < SUBTILE_FRAMES {
-            scan_scratch[ch_off + t] = 0.0;
-        }
-        wg_barrier();
-        if lid == 0 {
-            let mut s1 = aux_scratch[c];
-            let mut s2 = aux_scratch[4 + c];
-            for k in 0..sub_valid_len {
-                let ti = k & 127;
-                let u = scan_scratch[ti];
-                let (tap_lp, tap_bp, tap_hp, tap_ap) =
-                    step_tpt_svf_phs_scalar(u, &mut s1, &mut s2, lp);
-                lane_buf[lane_slot(c, 0, ti)] =
-                    eval_tone_scalar(tap_lp, tap_bp, tap_hp, tap_ap, u, lp);
-                lane_buf[lane_slot(c, 1, ti)] = tap_bp;
-            }
-            aux_scratch[c] = s1;
-            aux_scratch[4 + c] = s2;
-        }
-        if lid == 1 {
-            let mut s1 = aux_scratch[8 + c];
-            let mut s2 = aux_scratch[12 + c];
-            for k in 0..sub_valid_len {
-                let ti = k & 127;
-                let u = scan_scratch[SUBTILE_FRAMES + ti];
-                let (tap_lp, tap_bp, tap_hp, tap_ap) =
-                    step_tpt_svf_phs_scalar(u, &mut s1, &mut s2, lp);
-                lane_buf[lane_slot(c, 2, ti)] =
-                    eval_tone_scalar(tap_lp, tap_bp, tap_hp, tap_ap, u, lp);
-                lane_buf[lane_slot(c, 3, ti)] = tap_bp;
-            }
-            aux_scratch[8 + c] = s1;
-            aux_scratch[12 + c] = s2;
-        }
-        wg_barrier();
-    } else {
-        if active {
-            let (a1, a2, a3, k_eff) = phs_passive_step_coeffs(s1_cur, lp);
-            let svf_c = dnam_kernels::TptSvfCoeffs4 {
-                a1: GpuVec4::splat(a1),
-                a2: GpuVec4::splat(a2),
-                a3: GpuVec4::splat(a3),
-                k: GpuVec4::splat(k_eff),
-                two_k: GpuVec4::splat(2.0 * k_eff),
-            };
-            let (tap_lp, tap_bp, tap_hp, tap_ap) =
-                eval_tpt_svf_scalar(u_my, s1_cur, s2_cur, &svf_c);
-            let tone = eval_tone_scalar(tap_lp, tap_bp, tap_hp, tap_ap, u_my, lp);
-            let tone_f = if is_r { 2 } else { 0 };
-            lane_buf[lane_slot(c, tone_f, t)] = tone;
-            lane_buf[lane_slot(c, tone_f + 1, t)] = tap_bp;
-        }
-        if lid == 0 {
-            aux_scratch[c] = end_state[0];
-            aux_scratch[4 + c] = end_state[1];
-        }
-        if lid == SUBTILE_FRAMES {
-            aux_scratch[8 + c] = end_state[0];
-            aux_scratch[12 + c] = end_state[1];
-        }
-        wg_barrier();
-    }
 }
 
 /// Optional backtracking-damped `1D` `DEER` Selective-Duhem `ParaLRU` solver (`alpha in {1.0, 0.5, 0.25}`,

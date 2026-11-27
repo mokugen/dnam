@@ -10,9 +10,9 @@ use super::harness::{
     cpu_params_from_packed, dispatch_adjoint_3pass, dispatch_kernel, read_vec4_vec,
 };
 use dnam_kernels::{
-    CoreQuadParamsStereo4, GpuVec4, InterleavedStereo8, KernelVec4, SOFT_RECT_EPS,
-    SonaBlockStateStereo8, StereoVec8, TINY_CROSSING_EPS, TptSvfCoeffs4,
-    prewarp_tan_pi_f_over_fs_f32, step_core_quad_phs_stereo8, step_core_quad_stereo8,
+    CoreQuadV4Block0StateStereo8, CoreQuadV4ParamsStereo4, GpuVec4, InterleavedStereo8, KernelVec4,
+    SOFT_RECT_EPS, StereoVec8, TINY_CROSSING_EPS, TptSvfCoeffs4, prewarp_tan_pi_f_over_fs_f32,
+    step_core_quad_v4_phs_stereo8, step_core_quad_v4_stereo8,
 };
 use sona_shaders::abi::{
     CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, FUSED_FLAG_FIXED_POINT_SCAN, FusedScanUniforms,
@@ -40,24 +40,24 @@ fn make_asymmetric_phs_inputs(num_frames: usize) -> Vec<[f32; 4]> {
             let drive_l = 26.0 + 6.0 * (0.23 * ph).cos();
             core_inputs[base] = [
                 drive_l * ph.sin(),
-                2.8 * (1.25 * ph).cos(),
-                2.2 * (0.75 * ph).sin(),
-                1.9 * (1.55 * ph).cos(),
+                6.5 * (1.25 * ph).cos(),
+                14.0 * (0.75 * ph).sin(),
+                12.5 * (1.55 * ph).cos(),
             ];
             core_inputs[base + 1] = [
                 0.35 * (1.1 * ph).cos(),
-                0.42 * (0.85 * ph).sin() + 0.08,
-                0.28 * (1.9 * ph).cos() - 0.06 * ph.sin(),
-                0.40 * (1.3 * ph).sin(),
+                0.65 * (0.85 * ph).sin() + 0.12,
+                0.75 * (1.9 * ph).cos() - 0.10 * ph.sin(),
+                0.85 * (1.3 * ph).sin(),
             ];
         }
     }
     core_inputs
 }
 
-fn build_phs_quad_bundles() -> (Vec<CoreQuadParamsStereo4<GpuVec4>>, Vec<[f32; 4]>) {
+fn build_phs_quad_bundles() -> (Vec<CoreQuadV4ParamsStereo4<GpuVec4>>, Vec<[f32; 4]>) {
     let k_nl_sets = [
-        [0.02_f32, 0.45, 1.10, 3.25],
+        [0.05_f32, 0.45, 1.10, 3.25],
         [0.0_f32; 4],
         [0.0_f32; 4],
         [0.0_f32; 4],
@@ -67,21 +67,19 @@ fn build_phs_quad_bundles() -> (Vec<CoreQuadParamsStereo4<GpuVec4>>, Vec<[f32; 4
     let mut cpu_params = Vec::with_capacity(TOTAL_Q);
     let mut packed_params = Vec::with_capacity(TOTAL_Q * QUAD_PARAMS_VEC4_STRIDE);
     for (q, k_nl) in k_nl_sets.into_iter().enumerate() {
-        let profile_idx = if q == 4 { 1 } else { q % 4 };
+        let profile_idx = if q == 4 { 2 } else { q % 4 };
         let (mut cpu_p, mut gpu_p) = build_core_quad_bundle_with_k_nl(0, profile_idx, k_nl);
         if q == 0 {
             let mut g_arr = gpu_p[quad_param_slots::SVF_G];
             g_arr[0] = prewarp_tan_pi_f_over_fs_f32(0.04);
-            let k_low = [0.50_f32, 0.55, 0.75, 1.05];
+            let k_low = [0.48_f32, 0.55, 0.75, 1.05];
             let svf =
                 TptSvfCoeffs4::from_gk(GpuVec4::from_array(g_arr), GpuVec4::from_array(k_low));
             gpu_p[quad_param_slots::SVF_A1] = svf.a1.to_array();
             gpu_p[quad_param_slots::SVF_A2] = svf.a2.to_array();
             gpu_p[quad_param_slots::SVF_A3] = svf.a3.to_array();
             gpu_p[quad_param_slots::SVF_G] = g_arr;
-            gpu_p[quad_param_slots::TWO_SVF_G] = g_arr.map(|v| v * 2.0);
             gpu_p[quad_param_slots::SVF_K] = k_low;
-            gpu_p[quad_param_slots::SVF_TWO_K] = k_low.map(|v| v * 2.0);
             cpu_p = cpu_params_from_packed(&gpu_p);
         }
         cpu_params.push(cpu_p);
@@ -92,17 +90,17 @@ fn build_phs_quad_bundles() -> (Vec<CoreQuadParamsStereo4<GpuVec4>>, Vec<[f32; 4
 
 fn eval_cpu_phs_loss(
     core_inputs: &[[f32; 4]],
-    params_cpu: &[CoreQuadParamsStereo4<GpuVec4>],
+    params_cpu: &[CoreQuadV4ParamsStereo4<GpuVec4>],
     weights: &[[f32; 4]],
     q_global: usize,
     num_frames: usize,
 ) -> (f64, bool, bool) {
-    let mut state = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+    let mut state = CoreQuadV4Block0StateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
     let mut loss = 0.0_f64;
     let mut saw_saturated = false;
     let mut saw_unsaturated_nonzero = false;
     for t in 0..num_frames {
-        let (s1_l, _) = state.svf_s1.into_lr();
+        let (s1_l, _) = state.svf_lin_s1.into_lr();
         let s1_sq = s1_l.to_array()[0] * s1_l.to_array()[0];
         if s1_sq >= 64.0 {
             saw_saturated = true;
@@ -114,10 +112,10 @@ fn eval_cpu_phs_loss(
             GpuVec4::from_array(core_inputs[in_base]),
             GpuVec4::from_array(core_inputs[in_base + 1]),
         );
-        let out = step_core_quad_phs_stereo8(u, &mut state, &params_cpu[q_global]);
+        let out = step_core_quad_v4_phs_stereo8(u, &mut state, &params_cpu[q_global]);
         let (vl, vr) = out.lru_state.into_lr();
-        let (ol, or) = out.adaa_odd.into_lr();
-        let (el, er) = out.adaa_even.into_lr();
+        let (ol, or) = out.o_tilde.into_lr();
+        let (el, er) = out.e_tilde.into_lr();
         let feats = [
             vl.to_array(),
             vr.to_array(),
@@ -238,27 +236,27 @@ fn verify_k_nl_zero_linear_parity(ctx: &GpuContext, variant: ShaderVariant, inpu
     let feats_phs = read_vec4_vec(&out_phs[1]);
     let feats_lin_all = read_vec4_vec(&out_lin[1]);
     let feats_lin = &feats_lin_all[NUM_FRAMES * FEATURE_VEC4_STRIDE..];
-    let mut state_phs = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
-    let mut state_lin = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+    let mut state_phs = CoreQuadV4Block0StateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+    let mut state_lin = dnam_kernels::SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
     let cpu_zero = cpu_params_from_packed(&packed_zero);
     for t in 0..NUM_FRAMES {
         let u = InterleavedStereo8::from_lr(
             GpuVec4::from_array(single_in[t * 2]),
             GpuVec4::from_array(single_in[t * 2 + 1]),
         );
-        let op = step_core_quad_phs_stereo8(u, &mut state_phs, &cpu_zero);
-        let ol = step_core_quad_stereo8(u, &mut state_lin, &cpu_zero);
+        let op = step_core_quad_v4_phs_stereo8(u, &mut state_phs, &cpu_zero);
+        let ol = step_core_quad_v4_stereo8(u, &mut state_lin, &cpu_zero);
         assert_eq!(
             op.lru_state.into_lr().0.to_array().map(f32::to_bits),
             ol.lru_state.into_lr().0.to_array().map(f32::to_bits)
         );
         assert_eq!(
-            op.adaa_odd.into_lr().1.to_array().map(f32::to_bits),
-            ol.adaa_odd.into_lr().1.to_array().map(f32::to_bits)
+            op.o_tilde.into_lr().1.to_array().map(f32::to_bits),
+            ol.o_tilde.into_lr().1.to_array().map(f32::to_bits)
         );
         assert_eq!(
-            op.adaa_even.into_lr().0.to_array().map(f32::to_bits),
-            ol.adaa_even.into_lr().0.to_array().map(f32::to_bits)
+            op.e_tilde.into_lr().0.to_array().map(f32::to_bits),
+            ol.e_tilde.into_lr().0.to_array().map(f32::to_bits)
         );
         // Sequential Block 0 PHS (k_nl == 0) vs O(log2 N) Blelloch Block 1 scan agrees within
         // 32-bit associative reassociation tolerance (`1e-4 * max(1, |x|)`), while CPU steps match 0-ULP.
@@ -311,10 +309,10 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
     let gpu_ckpts = read_vec4_vec(&fwd_out[0]);
     let gpu_feats = read_vec4_vec(&fwd_out[1]);
 
-    // Check forward parity against step_core_quad_phs_stereo8 and Zero-DC at block_idx = 0.
+    // Check forward parity against step_core_quad_v4_phs_stereo8 and Zero-DC at block_idx = 0.
     for (ql, &q_global) in WAVE0_QUADS.iter().enumerate() {
         assert_eq!(resolve_quad_idx(0, ql, NUM_QUADS), q_global);
-        let mut state = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+        let mut state = CoreQuadV4Block0StateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
         let mut cpu_feats = Vec::with_capacity(NUM_FRAMES * FEATURE_VEC4_STRIDE);
         let mut peak = 1.0_f32;
         for t in 0..NUM_FRAMES {
@@ -323,10 +321,10 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
                 GpuVec4::from_array(core_inputs[in_base]),
                 GpuVec4::from_array(core_inputs[in_base + 1]),
             );
-            let out = step_core_quad_phs_stereo8(u, &mut state, &quad_params_cpu[q_global]);
+            let out = step_core_quad_v4_phs_stereo8(u, &mut state, &quad_params_cpu[q_global]);
             let (vl, vr) = out.lru_state.into_lr();
-            let (ol, or) = out.adaa_odd.into_lr();
-            let (el, er) = out.adaa_even.into_lr();
+            let (ol, or) = out.o_tilde.into_lr();
+            let (el, er) = out.e_tilde.into_lr();
             for arr in [
                 vl.to_array(),
                 vr.to_array(),
@@ -498,7 +496,7 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
 
     let mut d_loss_d_features = vec![[0.0_f32; 4]; TOTAL_Q * NUM_FRAMES * FEATURE_VEC4_STRIDE];
     for idx in 0..d_loss_d_features.len() {
-        let base = (idx as f32) * 0.019;
+        let base = (idx as f32) * 0.023;
         d_loss_d_features[idx] = [
             0.30 * base.sin(),
             0.25 * (1.2 * base).cos(),
@@ -545,12 +543,13 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
             for ch in 0..CORE_INPUT_VEC4_STRIDE {
                 let idx = (q_global * NUM_FRAMES + t) * CORE_INPUT_VEC4_STRIDE + ch;
                 for lane in [0_usize, 1, 2, 3] {
-                    // Scale step to drive amplitude: high-drive lane 0 avoids f32 FD cancellation; lower-drive lanes avoid |bp|=0 Duhem kinks.
+                    // Scale step to drive amplitude (`26..32` on `ch=0 lane=0`): `1e-2` avoids `f32` FD
+                    // cancellation on `600`-frame PHS; `t=0` (`u=0`) uses `4e-3` to stay inside the `z=0` knee.
                     let eps_u = if ch == 0 && lane == 0 {
-                        if quad_params_cpu[q_global].svf_k_nl.to_array()[lane] == 0.0 {
-                            1.0e-2_f32
-                        } else {
+                        if t == 0 && quad_params_cpu[q_global].svf_k_nl.to_array()[lane] != 0.0 {
                             4.0e-3_f32
+                        } else {
+                            1.0e-2_f32
                         }
                     } else {
                         1.0e-3_f32
@@ -588,14 +587,16 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
 
     // High-drive lane 0 reaches |s1|=8 saturation; smaller FD steps avoid curvature/kink drift.
     let phs_slots: &[(usize, f32, f32)] = &[
-        (quad_param_slots::SVF_K_NL, 1.0e-4, 1.0e-3),
+        (quad_param_slots::SVF_K_NL, 2.0e-5, 5.0e-4),
         (quad_param_slots::SVF_K, 2.0e-3, 2.0e-3),
-        (quad_param_slots::SVF_G, 5.0e-4, 1.0e-3),
-        (quad_param_slots::TONE_LP, 2.0e-3, 2.0e-3),
-        (quad_param_slots::TONE_BP, 5.0e-4, 2.0e-3),
-        (quad_param_slots::TONE_HP, 2.0e-3, 2.0e-3),
+        (quad_param_slots::SVF_G, 1.5e-4, 1.0e-3),
+        (quad_param_slots::TONE_C_LP, 2.0e-3, 2.5e-4),
+        (quad_param_slots::TONE_C_BP, 5.0e-4, 5.0e-4),
+        (quad_param_slots::TONE_C_KBP, 1.0e-3, 1.0e-3),
+        (quad_param_slots::TONE_C_U, 5.0e-4, 2.5e-4),
         (quad_param_slots::ADAA_DRIVE, 2.0e-3, 2.0e-3),
         (quad_param_slots::GLU_MIX, 2.0e-3, 2.0e-3),
+        (quad_param_slots::OUT_GAIN, 2.0e-3, 2.0e-3),
     ];
     for &q_global in &WAVE0_QUADS {
         let base_slice = &quad_params_packed
@@ -604,7 +605,6 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
             quad_param_slots::SVF_A1,
             quad_param_slots::SVF_A2,
             quad_param_slots::SVF_A3,
-            quad_param_slots::SVF_TWO_K,
         ] {
             for tile in 0..NUM_TILES {
                 let p_idx = (q_global * NUM_TILES + tile) * QUAD_PARAMS_VEC4_STRIDE + zero_slot;
@@ -619,12 +619,6 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
                 for tile in 0..NUM_TILES {
                     let p_idx = (q_global * NUM_TILES + tile) * QUAD_PARAMS_VEC4_STRIDE + slot;
                     g_gpu += got_pgrad[p_idx][lane] as f64;
-                }
-                if slot == quad_param_slots::SVF_K_NL {
-                    assert!(
-                        g_gpu.abs() > 1.0e-3,
-                        "expected nonzero SVF_K_NL gradient on PHS q={q_global} lane={lane}, got {g_gpu}"
-                    );
                 }
                 let mut p_plus_packed = base_slice.to_vec();
                 let mut p_minus_packed = base_slice.to_vec();
@@ -661,6 +655,12 @@ pub fn verify_block0_phs_core_and_adjoint_fd(ctx: &GpuContext, variant: ShaderVa
                     (g_gpu - fd).abs() <= tol,
                     "PHS ({label}) param FD mismatch q={q_global} slot={slot} lane={lane}: got={g_gpu} fd={fd} tol={tol}"
                 );
+                if slot == quad_param_slots::SVF_K_NL {
+                    assert!(
+                        g_gpu.abs() > 1.0e-3,
+                        "expected nonzero SVF_K_NL gradient on PHS q={q_global} lane={lane}, got {g_gpu} (fd={fd})"
+                    );
+                }
             }
         }
     }

@@ -11,6 +11,7 @@ pub mod pass0;
 pub mod pass1;
 pub mod pass2;
 pub mod pullback;
+pub mod se_and_adaa;
 
 use crate::abi::{
     ADJOINT_AUX_FLOATS, ADJOINT_S_PREV2_VEC4S, ADJOINT_SCAN_SCRATCH_FLOATS, ADJOINT_U_TONE2_VEC2S,
@@ -75,6 +76,7 @@ pub fn adjoint_scan_256_impl(
             quad_params,
             tile_checkpoints,
             d_loss_d_features,
+            d_loss_d_inputs,
             tile_adj_boundaries,
             feature_outputs,
             s_prev2,

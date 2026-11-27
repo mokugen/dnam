@@ -4,6 +4,22 @@
 //! (`ref[train.pipeline.webgpu-scans-and-ozaki]`, `ref[repo.code.constant-eval-and-derivations]`).
 
 use core::mem::{align_of, offset_of, size_of};
+use dnam_kernels::{
+    MAX_OUTGOING_PER_QUAD_V4, MAX_SONA_TILES_V4, SONA_V4_BLOCK_QUAD_SLOTS,
+    SONA_V4_INTERBLOCK_TILES, SONA_V4_TILE_COUNTS,
+};
+
+/// Maximum outgoing inter-block tiles per `CoreQuad` across `SONA v4.0` (`7`).
+pub const MAX_OUTGOING_PER_QUAD: usize = MAX_OUTGOING_PER_QUAD_V4;
+
+/// Maximum lower-triangular `4x4` inter-block tiles across `SONA v4.0` (`37`).
+pub const MAX_SONA_TILES: usize = MAX_SONA_TILES_V4;
+
+/// Cumulative `SONA v4.0` inter-block tile counts per tier `[Lite, Full, Pro, Ultra]`.
+pub const SONA_TILE_COUNTS: [usize; 4] = SONA_V4_TILE_COUNTS;
+
+/// Canonical `37` `SONA v4.0` lower-triangular inter-block edges `(src_quad, dst_quad)`.
+pub const SONA_INTERBLOCK_TILES: [(usize, usize); MAX_SONA_TILES_V4] = SONA_V4_INTERBLOCK_TILES;
 
 /// Number of threads per workgroup and frames per tile across all core scan kernels.
 pub const WORKGROUP_SIZE: usize = 256;
@@ -19,17 +35,18 @@ pub const CORE_INPUT_VEC4_STRIDE: usize = 2;
 /// Number of `Vec4` vectors per `(stem, quad)` in `quad_params` and per `(stem, q_local, tile)` in `param_grads`.
 pub const QUAD_PARAMS_VEC4_STRIDE: usize = param_slots::TOTAL_SLOTS;
 /// Number of `Vec4` vectors per `(stem, q_local, tile)` checkpoint in `tile_checkpoints`.
-pub const TILE_CKPT_VEC4_STRIDE: usize = 8;
+pub const TILE_CKPT_VEC4_STRIDE: usize = 12;
 /// Number of `Vec4` vectors per `(stem, q_local, frame)` in `feature_outputs` and `d_loss_d_features`.
 pub const FEATURE_VEC4_STRIDE: usize = 6;
 /// Number of `Vec4` summary vectors per lane channel `c in 0..4` in `tile_adj_boundaries`
-/// (`T_L`, `(g0_L, g1_L, g0_R, g1_R)`, `ParaLRU`, `ADAA seam + frame-0 adj_r_prev`, `T_R`, `k_vs`).
-pub const TILE_ADJ_LANE_VEC4_STRIDE: usize = 6;
-/// Number of `Vec4` vectors per `(stem, q_local, tile)` in `tile_adj_boundaries` (`4` lanes × `6` slots = `384 B`).
+/// (`T_b_L / s_b_out`, `g_b`, `ParaLRU`, `ADAA seam`, `T_b_R`, `k_vs_b`, `T_lin / s_lin_out`,
+/// `g_lin_0`, `g_lin_k`, `g_lin_b0`, `g_lin_b1`).
+pub const TILE_ADJ_LANE_VEC4_STRIDE: usize = 11;
+/// Number of `Vec4` vectors per `(stem, q_local, tile)` in `tile_adj_boundaries` (`4` lanes × `11` slots = `44` `Vec4`s = `704 B`).
 pub const TILE_ADJ_BOUNDARY_VEC4_STRIDE: usize = 4 * TILE_ADJ_LANE_VEC4_STRIDE;
 /// Number of `Vec4` vectors per `(stem, q_local)` in `Slot 7` (`tile_adj_boundaries`) leading
-/// wave-local cross-block header (`in_exit[0..8]` + `out_entry[8..16]` = `256 B`).
-pub const EXIT_ADJ_BOUNDARY_VEC4_STRIDE: usize = 16;
+/// wave-local cross-block header (`in_exit[0..12]` + `out_entry[12..24]` = `384 B`).
+pub const EXIT_ADJ_BOUNDARY_VEC4_STRIDE: usize = 24;
 /// Number of `f32` scalars per seed/quad entry in `seed_params`.
 pub const PRESCREEN_SEED_PARAM_STRIDE: usize = 16;
 /// Number of `i32` words stored per `(pair, chunk)` entry in Ozaki pass 0 (`[d0, d1, d2, d3, d4, 0]`).
@@ -53,13 +70,40 @@ pub const BLOCK_WAVE_ALL: u32 = 0xFFFF_FFFF;
 /// Optional `FusedScanUniforms.block_idx` flag bit enabling damped-DEER / passive-Picard fixed-point mode.
 pub const FUSED_FLAG_FIXED_POINT_SCAN: u32 = 1 << 30;
 
-/// Canonical 4-block Matryoshka wave -> `CoreQuad` index map
-/// (Block 0 `{0,4,6,8}`, Block 1 `{1,5,9}`, Block 2 `{2,7}`, Block 3 `{3}`).
+const fn option_slot_or_invalid(slot: Option<usize>) -> usize {
+    match slot {
+        Some(idx) => idx,
+        None => INVALID_QUAD_SLOT,
+    }
+}
+
+/// Canonical `SONA v4.0` 4-block Matryoshka `[3,3,2,2]` wave -> `CoreQuad` index map
+/// (Block 0 `{0,4,8}`, Block 1 `{1,5,9}`, Block 2 `{2,6}`, Block 3 `{3,7}`).
 pub const BLOCK_QUAD_SLOTS: [[usize; 4]; 4] = [
-    [0, 4, 6, 8],
-    [1, 5, 9, INVALID_QUAD_SLOT],
-    [2, 7, INVALID_QUAD_SLOT, INVALID_QUAD_SLOT],
-    [3, INVALID_QUAD_SLOT, INVALID_QUAD_SLOT, INVALID_QUAD_SLOT],
+    [
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[0][0]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[0][1]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[0][2]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[0][3]),
+    ],
+    [
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[1][0]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[1][1]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[1][2]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[1][3]),
+    ],
+    [
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[2][0]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[2][1]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[2][2]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[2][3]),
+    ],
+    [
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[3][0]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[3][1]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[3][2]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[3][3]),
+    ],
 ];
 
 /// Returns the number of active quads belonging to `block_idx` under `num_quads`.
@@ -126,34 +170,37 @@ pub const COORD_TRANSFORM_ASINH_BOX_SYM: u32 = 4;
 pub const COORD_TRANSFORM_ASINH_BOX_NONNEG: u32 = 5;
 pub const STE_FP16_META_BIT: u32 = 1 << 8;
 
-/// Canonical `25`-slot indices matching `sona_shaders::abi::quad_param_slots`.
+/// Canonical `28`-slot indices matching `sona_shaders::abi::quad_param_slots`.
 pub mod param_slots {
     pub const SVF_A1: usize = 0;
     pub const SVF_A2: usize = 1;
     pub const SVF_A3: usize = 2;
     pub const SVF_K: usize = 3;
-    pub const SVF_TWO_K: usize = 4;
-    pub const TONE_LP: usize = 5;
-    pub const TONE_BP: usize = 6;
-    pub const TONE_HP: usize = 7;
-    pub const TONE_AP: usize = 8;
-    pub const TONE_DIR: usize = 9;
-    pub const LRU_ALPHA_REL: usize = 10;
-    pub const LRU_ALPHA_ATK: usize = 11;
-    pub const LRU_KAPPA: usize = 12;
-    pub const LRU_GAMMA_DUHEM: usize = 13;
-    pub const LRU_SIGNED_MIX: usize = 14;
-    pub const LRU_STEREO_LINK: usize = 15;
-    pub const TWO_SVF_G: usize = 16;
-    pub const RECT_SIGN: usize = 17;
-    pub const SAG_DEPTH: usize = 18;
-    pub const ADAA_DRIVE: usize = 19;
-    pub const LRU_BIAS_DRIVE: usize = 20;
-    pub const WAVEFOLDER_MIX: usize = 21;
-    pub const GLU_MIX: usize = 22;
-    pub const SVF_G: usize = 23;
-    pub const SVF_K_NL: usize = 24;
-    pub const TOTAL_SLOTS: usize = SVF_K_NL + 1;
+    pub const TONE_C_LP: usize = 4;
+    pub const TONE_C_BP: usize = 5;
+    pub const TONE_C_KBP: usize = 6;
+    pub const TONE_C_U: usize = 7;
+    pub const LRU_ALPHA_REL: usize = 8;
+    pub const LRU_ALPHA_ATK: usize = 9;
+    pub const LRU_KAPPA: usize = 10;
+    pub const LRU_GAMMA_DUHEM: usize = 11;
+    pub const LRU_SIGNED_MIX: usize = 12;
+    pub const LRU_STEREO_LINK: usize = 13;
+    pub const SVF_G: usize = 14;
+    pub const SVF_K_NL: usize = 15;
+    pub const RECT_SIGN: usize = 16;
+    pub const G0: usize = 17;
+    pub const G_INF: usize = 18;
+    pub const D_PRE: usize = 19;
+    pub const SE_W_SQ: usize = 20;
+    pub const SE_D_BUS: usize = 21;
+    pub const ADAA_DRIVE: usize = 22;
+    pub const LRU_BIAS_DRIVE: usize = 23;
+    pub const LIN_MIX: usize = 24;
+    pub const WAVEFOLDER_MIX: usize = 25;
+    pub const GLU_MIX: usize = 26;
+    pub const OUT_GAIN: usize = 27;
+    pub const TOTAL_SLOTS: usize = OUT_GAIN + 1;
 }
 
 /// Forward workgroup SRAM partitioning (`15,360 B <= 15,872 B`).
@@ -276,20 +323,21 @@ const _: () = assert!(MAX_WEBGPU_STORAGE_BUFFERS_PER_STAGE == 8);
 const _: () = assert!(FORWARD_LANE_BUF_FLOATS == 2_048);
 const _: () = assert!(TILE_MIX_REDUCE_A_FLOATS + TILE_MIX_REDUCE_B_FLOATS == 512);
 const _: () = assert!(CORE_INPUT_VEC4_STRIDE == 2);
-const _: () = assert!(QUAD_PARAMS_VEC4_STRIDE == 25);
-const _: () = assert!(TILE_CKPT_VEC4_STRIDE == 8);
+const _: () = assert!(QUAD_PARAMS_VEC4_STRIDE == 28);
+const _: () = assert!(TILE_CKPT_VEC4_STRIDE == 12);
 const _: () = assert!(FEATURE_VEC4_STRIDE == 6);
-const _: () = assert!(TILE_ADJ_LANE_VEC4_STRIDE == 6);
-const _: () = assert!(TILE_ADJ_BOUNDARY_VEC4_STRIDE == 24);
-const _: () = assert!(EXIT_ADJ_BOUNDARY_VEC4_STRIDE == 16);
+const _: () = assert!(TILE_ADJ_LANE_VEC4_STRIDE == 11);
+const _: () = assert!(TILE_ADJ_BOUNDARY_VEC4_STRIDE == 44);
+const _: () = assert!(EXIT_ADJ_BOUNDARY_VEC4_STRIDE == 24);
+const _: () = assert!(MAX_OUTGOING_PER_QUAD == 7 && MAX_SONA_TILES == 37);
 const _: () = assert!(TILE_DESC_VEC4_STRIDE == 13);
 const _: () = assert!(TILE_WEIGHT_GRAD_FLOATS == 48);
 const _: () = assert!(PRESCREEN_SEED_PARAM_STRIDE == 16);
 const _: () = assert!(OZAKI_WORDS_PER_PAIR == 6 && OZAKI_SPLIT64_WORDS_PER_PAIR == 4);
 const _: () = assert!(LSSBROYDEN_MAX_HISTORY_M == 32 && LBFGS_MAX_HISTORY_M == 32);
-const _: () = assert!(block_quad_count(0, 4) == 1 && block_quad_count(0, 10) == 4);
+const _: () = assert!(block_quad_count(0, 4) == 1 && block_quad_count(0, 10) == 3);
 const _: () = assert!(block_quad_count(1, 10) == 3 && block_quad_count(2, 10) == 2);
-const _: () = assert!(block_quad_count(3, 10) == 1);
+const _: () = assert!(block_quad_count(3, 10) == 2);
 
 const _: () = assert!(size_of::<PrescreenUniforms>() == 32 && align_of::<PrescreenUniforms>() == 4);
 const _: () = assert!(offset_of!(PrescreenUniforms, _pad1) == 28);

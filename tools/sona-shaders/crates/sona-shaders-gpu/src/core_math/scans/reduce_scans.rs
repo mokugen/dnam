@@ -5,51 +5,13 @@
 
 use super::wg_barrier;
 use crate::abi::{ADJOINT_AUX_FLOATS, ADJOINT_SCAN_SCRATCH_FLOATS, TILE_FRAMES};
-use dnam_kernels::{TptAdjointElem, canonicalize_zero_f32_bits, compose_tpt_adjoint_scan};
+#[cfg(test)]
+use dnam_kernels::compose_tpt_adjoint_scan;
+use dnam_kernels::{TptAdjointElem, canonicalize_zero_f32_bits};
 #[cfg(all(target_arch = "spirv", feature = "subgroups"))]
 use spirv_std::arch::subgroup_f_add;
 
 const HALF_TILE: usize = TILE_FRAMES / 2;
-
-#[inline(always)]
-fn store_dual_adj(
-    scan_scratch: &mut [f32; ADJOINT_SCAN_SCRATCH_FLOATS],
-    k: usize,
-    a: TptAdjointElem,
-    gb: [f32; 2],
-) {
-    let slot = k & 127;
-    scan_scratch[slot] = a.t00;
-    scan_scratch[HALF_TILE + slot] = a.t01;
-    scan_scratch[2 * HALF_TILE + slot] = a.t10;
-    scan_scratch[3 * HALF_TILE + slot] = a.t11;
-    scan_scratch[4 * HALF_TILE + slot] = a.g0;
-    scan_scratch[5 * HALF_TILE + slot] = a.g1;
-    scan_scratch[6 * HALF_TILE + slot] = gb[0];
-    scan_scratch[7 * HALF_TILE + slot] = gb[1];
-}
-
-#[inline(always)]
-fn load_dual_adj(
-    scan_scratch: &[f32; ADJOINT_SCAN_SCRATCH_FLOATS],
-    k: usize,
-) -> (TptAdjointElem, [f32; 2]) {
-    let slot = k & 127;
-    (
-        TptAdjointElem {
-            t00: scan_scratch[slot],
-            t01: scan_scratch[HALF_TILE + slot],
-            t10: scan_scratch[2 * HALF_TILE + slot],
-            t11: scan_scratch[3 * HALF_TILE + slot],
-            g0: scan_scratch[4 * HALF_TILE + slot],
-            g1: scan_scratch[5 * HALF_TILE + slot],
-        },
-        [
-            scan_scratch[6 * HALF_TILE + slot],
-            scan_scratch[7 * HALF_TILE + slot],
-        ],
-    )
-}
 
 #[inline(always)]
 fn store_quad_g(
@@ -110,67 +72,6 @@ fn matmul2(
         a00 * b01 + a01 * b11,
         a10 * b00 + a11 * b10,
         a10 * b01 + a11 * b11,
-    )
-}
-
-/// Paired non-commutative `256 -> 1` binary-tree reduction (`9` barriers) for `(elem_a, elem_b)`
-/// sharing identical `2x2` matrix `T` (e.g. Block 0 PHS `sum_tpt` and `sum_k`), returning the exact
-/// full-tile pair on `lid & 255 == 0`.
-#[inline]
-pub fn tpt_adjoint_dual_reduce_256(
-    scan_scratch: &mut [f32; ADJOINT_SCAN_SCRATCH_FLOATS],
-    lid: usize,
-    elem_a: TptAdjointElem,
-    elem_b: TptAdjointElem,
-) -> (TptAdjointElem, TptAdjointElem) {
-    let i = lid & 255;
-    let k = i >> 1;
-    let is_even = (i & 1) == 0;
-
-    if !is_even {
-        store_dual_adj(scan_scratch, k, elem_a, [elem_b.g0, elem_b.g1]);
-    }
-    wg_barrier();
-
-    let mut cur_a = elem_a;
-    let mut cur_gb = [elem_b.g0, elem_b.g1];
-    if is_even {
-        let (sa, sgb) = load_dual_adj(scan_scratch, k);
-        cur_gb = [
-            cur_a.t00 * sgb[0] + cur_a.t01 * sgb[1] + cur_gb[0],
-            cur_a.t10 * sgb[0] + cur_a.t11 * sgb[1] + cur_gb[1],
-        ];
-        cur_a = compose_tpt_adjoint_scan(cur_a, sa);
-        store_dual_adj(scan_scratch, k, cur_a, cur_gb);
-    }
-    wg_barrier();
-
-    let mut stride = 1_usize;
-    while stride < HALF_TILE {
-        let mask = (stride << 1) - 1;
-        if is_even && (k & mask) == 0 {
-            let (sa, sgb) = load_dual_adj(scan_scratch, k + stride);
-            cur_gb = [
-                cur_a.t00 * sgb[0] + cur_a.t01 * sgb[1] + cur_gb[0],
-                cur_a.t10 * sgb[0] + cur_a.t11 * sgb[1] + cur_gb[1],
-            ];
-            cur_a = compose_tpt_adjoint_scan(cur_a, sa);
-            store_dual_adj(scan_scratch, k, cur_a, cur_gb);
-        }
-        wg_barrier();
-        stride <<= 1;
-    }
-
-    (
-        cur_a,
-        TptAdjointElem {
-            t00: cur_a.t00,
-            t01: cur_a.t01,
-            t10: cur_a.t10,
-            t11: cur_a.t11,
-            g0: cur_gb[0],
-            g1: cur_gb[1],
-        },
     )
 }
 

@@ -14,11 +14,11 @@ pub use linear_scans::{
 };
 pub use reduce_scans::{
     reduce_batch6_in_scratch, reduce_sum_256_in_aux, tpt_adjoint_const_m_reduce_256_lr,
-    tpt_adjoint_dual_reduce_256,
 };
 pub use tpt_scans::{
-    tpt_adjoint_reverse_suffix_256, tpt_const_m_scan_128_pair, tpt_const_m_scan_256_lr,
-    tpt_exclusive_scan_128_pair,
+    tpt_adjoint_reverse_suffix_256, tpt_adjoint_reverse_suffix_with_after_256,
+    tpt_const_m_scan_128_pair, tpt_const_m_scan_256_lr, tpt_exclusive_scan_128_pair,
+    tpt_forward_exclusive_scan_256,
 };
 
 use crate::abi::{

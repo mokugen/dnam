@@ -1,163 +1,38 @@
 #![forbid(unsafe_code)]
 
-//! `adjoint_scan_256` `pass_mode = 0`: parallel per-tile forward trajectory recomputation,
-//! exact inter-tile seam `r_{256}` scalar evaluation, and level-1 reverse `ParaLRU` / `TPT-SVF`
-//! boundary summary emission into `Slot 7` (`tile_adj_boundaries`)
-//! (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
+//! `adjoint_scan_256` `pass_mode = 0`: optional race-free `Slot 5` `b_all` staging, parallel
+//! per-tile forward trajectory recomputation, exact inter-tile seam `r_{256}` scalar evaluation,
+//! and level-1 reverse `ParaLRU` / `TPT-SVF` / 2-pass `Pred-Corr PHS` boundary summary emission
+//! into `11`-Vec4-per-lane `Slot 7` (`tile_adj_boundaries`)
+//! (`ref[dsp.op-n.core.tpt-tone-basis]`, `ref[train.pipeline.webgpu-scans-and-ozaki]`).
 
-use super::common::{eval_adaa_local_and_seam_pullback, recompute_tile_forward_lane};
+use super::common::{phs_pass_a_lin_coeffs, recompute_tile_forward_lane};
 use super::pullback::{
-    DuhemTonePullback, SagStereoPullback, build_tpt_adjoint_elem, build_tpt_phs_adjoint_elem,
-    eval_duhem_and_tone_pullback, eval_frame_duhem_terms_lr, eval_sag_and_stereo_pullback,
-    phs_k_eff_loc_bar,
+    StereoPullback, build_tpt_adjoint_elem, eval_duhem_and_tone_pullback,
+    eval_frame_duhem_terms_lr, eval_phs_adj_v1_lin, eval_stereo_link_pullback,
+};
+use super::se_and_adaa::{
+    compute_next_tile_first_seam, eval_se_and_adaa_local_and_seam_pullback, needs_b_staging,
+    stage_b_all_into_slot5,
 };
 use crate::abi::{
     ADJOINT_SCAN_SCRATCH_FLOATS, ADJOINT_U_TONE2_VEC2S, ADJOINT_V_TRAJ2_VEC2S, AdjointScanUniforms,
     EXIT_ADJ_BOUNDARY_VEC4_STRIDE, TILE_FRAMES,
 };
 use crate::core_math::{
-    CORE_INPUT_VEC4_STRIDE, MIN_SAG_GAIN, PhsFrameTerms, QUAD_PARAMS_VEC4_STRIDE, QuadLaneParams,
-    QuadParamsUnpacked, TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_ADJ_LANE_VEC4_STRIDE,
-    TILE_CKPT_VEC4_STRIDE, eval_tone_scalar, eval_tpt_svf_phs_frame, eval_tpt_svf_scalar,
-    flush_zero, get_lane, linear_adjoint_reverse_suffix_256_lr, load_vec4,
-    step_duhem_stereo_scalar, step_tpt_svf_phs_scalar, store_vec4, sub_sat_usize,
-    tpt_adjoint_const_m_reduce_256_lr, tpt_adjoint_dual_reduce_256,
+    QUAD_PARAMS_VEC4_STRIDE, QuadParamsUnpacked, TILE_ADJ_BOUNDARY_VEC4_STRIDE,
+    TILE_ADJ_LANE_VEC4_STRIDE, eval_tpt_svf_lp_bp_scalar, get_lane,
+    linear_adjoint_reverse_suffix_256_lr, load_vec4, store_vec4, sub_sat_usize,
+    tpt_adjoint_const_m_reduce_256_lr, tpt_adjoint_reverse_suffix_with_after_256,
 };
-use dnam_kernels::{LinearScanElem, TptAdjointElem};
+use dnam_kernels::{
+    LinearScanElem, PhsPredCorrPassBCoeffs, TptAdjointElem, eval_phs_pred_corr_pass_b_coeffs,
+    phs_pred_corr_pass_b_adjoint_elem,
+};
 use spirv_std::glam::{Vec2, Vec4};
 
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn build_channel_tpt_pair(
-    is_phs: bool,
-    is_active: bool,
-    lp: &QuadLaneParams,
-    phs_l: &PhsFrameTerms,
-    phs_r: &PhsFrameTerms,
-    taps_l_1: f32,
-    taps_r_1: f32,
-    dt: &DuhemTonePullback,
-) -> (TptAdjointElem, TptAdjointElem) {
-    if is_phs {
-        let k_loc_l = phs_k_eff_loc_bar(
-            phs_l.a2,
-            phs_l.a3,
-            taps_l_1,
-            dt.adj_hp_l,
-            dt.adj_ap_l,
-            dt.adj_v1_l,
-            dt.adj_v2_l,
-        );
-        let k_loc_r = phs_k_eff_loc_bar(
-            phs_r.a2,
-            phs_r.a3,
-            taps_r_1,
-            dt.adj_hp_r,
-            dt.adj_ap_r,
-            dt.adj_v1_r,
-            dt.adj_v2_r,
-        );
-        (
-            build_tpt_phs_adjoint_elem(
-                phs_l.a1,
-                phs_l.a2,
-                phs_l.a3,
-                taps_l_1,
-                phs_l.gamma,
-                dt.adj_v1_l,
-                dt.adj_v2_l,
-                k_loc_l,
-                is_active,
-            ),
-            build_tpt_phs_adjoint_elem(
-                phs_r.a1,
-                phs_r.a2,
-                phs_r.a3,
-                taps_r_1,
-                phs_r.gamma,
-                dt.adj_v1_r,
-                dt.adj_v2_r,
-                k_loc_r,
-                is_active,
-            ),
-        )
-    } else {
-        (
-            build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_l, dt.adj_v2_l, is_active),
-            build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_r, dt.adj_v2_r, is_active),
-        )
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn compute_next_tile_first_r(
-    core_inputs: &[Vec4],
-    tile_checkpoints: &[Vec4],
-    q_global: usize,
-    num_frames: usize,
-    num_tiles: usize,
-    next_tile: usize,
-    c: usize,
-    lp: &QuadLaneParams,
-    is_phs: bool,
-) -> (f32, f32) {
-    let next_frame = next_tile * TILE_FRAMES;
-    if next_frame >= num_frames {
-        return (0.0, 0.0);
-    }
-    let ckpt_base = (q_global * num_tiles + next_tile) * TILE_CKPT_VEC4_STRIDE;
-    let s1_l = get_lane(load_vec4(tile_checkpoints, ckpt_base), c);
-    let s1_r = get_lane(load_vec4(tile_checkpoints, ckpt_base + 1), c);
-    let s2_l = get_lane(load_vec4(tile_checkpoints, ckpt_base + 2), c);
-    let s2_r = get_lane(load_vec4(tile_checkpoints, ckpt_base + 3), c);
-    let mut vl = get_lane(load_vec4(tile_checkpoints, ckpt_base + 4), c);
-    let mut vr = get_lane(load_vec4(tile_checkpoints, ckpt_base + 5), c);
-
-    let in_base = (q_global * num_frames + next_frame) * CORE_INPUT_VEC4_STRIDE;
-    let u_l = flush_zero(get_lane(load_vec4(core_inputs, in_base), c));
-    let u_r = flush_zero(get_lane(load_vec4(core_inputs, in_base + 1), c));
-
-    let ((lp_l, bp_l, hp_l, ap_l), (lp_r, bp_r, hp_r, ap_r)) = if is_phs {
-        let mut s1_l_tmp = s1_l;
-        let mut s2_l_tmp = s2_l;
-        let mut s1_r_tmp = s1_r;
-        let mut s2_r_tmp = s2_r;
-        (
-            step_tpt_svf_phs_scalar(u_l, &mut s1_l_tmp, &mut s2_l_tmp, lp),
-            step_tpt_svf_phs_scalar(u_r, &mut s1_r_tmp, &mut s2_r_tmp, lp),
-        )
-    } else {
-        let svf_c = lp.to_svf_coeffs();
-        (
-            eval_tpt_svf_scalar(u_l, s1_l, s2_l, &svf_c),
-            eval_tpt_svf_scalar(u_r, s1_r, s2_r, &svf_c),
-        )
-    };
-    let tone_l = eval_tone_scalar(lp_l, bp_l, hp_l, ap_l, u_l, lp);
-    let tone_r = eval_tone_scalar(lp_r, bp_r, hp_r, ap_r, u_r, lp);
-
-    let lru_coeffs = lp.to_lru_coeffs();
-    let (_rl, _rr, ve_l, ve_r) = step_duhem_stereo_scalar(
-        tone_l,
-        tone_r,
-        bp_l,
-        bp_r,
-        &mut vl,
-        &mut vr,
-        lp,
-        &lru_coeffs,
-    );
-    let sag_l = (1.0 - lp.sag_depth * ve_l).max(MIN_SAG_GAIN);
-    let sag_r = (1.0 - lp.sag_depth * ve_r).max(MIN_SAG_GAIN);
-    (
-        ((tone_l * lp.adaa_drive) * sag_l + lp.lru_bias_drive * ve_l) + 0.0,
-        ((tone_r * lp.adaa_drive) * sag_r + lp.lru_bias_drive * ve_r) + 0.0,
-    )
-}
-
 /// Executes `adjoint_scan_256` `pass_mode = 0` for one `(q_tier, q_wave, tile)` workgroup,
-/// emitting level-1 reverse summaries, frame-0 `adj_r_prev`, and cross-operator `k_vs` into `Slot 7`.
+/// emitting level-1 reverse summaries, frame-0 `adj_r_prev`, and cross-operator coupling into `Slot 7`.
 #[allow(clippy::too_many_arguments)]
 #[inline]
 pub fn run_pass0(
@@ -172,6 +47,7 @@ pub fn run_pass0(
     quad_params: &[Vec4],
     tile_checkpoints: &[Vec4],
     d_loss_d_features: &[Vec4],
+    d_loss_d_inputs: &mut [Vec4],
     tile_adj_boundaries: &mut [Vec4],
     feature_outputs: &[Vec4],
     s_prev2: &mut [Vec4; TILE_FRAMES],
@@ -191,6 +67,28 @@ pub fn run_pass0(
     let tiny_eps = uniforms.tiny_crossing_eps;
     let exit_base = q_wave * EXIT_ADJ_BOUNDARY_VEC4_STRIDE;
     let params = QuadParamsUnpacked::load(quad_params, q_tier * QUAD_PARAMS_VEC4_STRIDE);
+    let stage_b = needs_b_staging(&params);
+
+    if stage_b {
+        stage_b_all_into_slot5(
+            core_inputs,
+            tile_checkpoints,
+            feature_outputs,
+            d_loss_d_inputs,
+            s_prev2,
+            u_tone2,
+            v_traj2,
+            scan_scratch,
+            &params,
+            q_tier,
+            num_frames,
+            num_tiles,
+            tile,
+            valid_len,
+            i,
+            is_phs,
+        );
+    }
 
     for c in 0..4 {
         let lp = params.lane(c);
@@ -214,20 +112,23 @@ pub fn run_pass0(
         let r_first_l = fwd.r_curr_l;
         let r_first_r = fwd.r_curr_r;
 
-        let r_next_seam = if i == TILE_FRAMES - 1 && tile + 1 < num_tiles {
-            compute_next_tile_first_r(
+        let (r_next_seam, b_next_seam) = if i == TILE_FRAMES - 1 && tile + 1 < num_tiles {
+            let (rs, bl, br) = compute_next_tile_first_seam(
                 core_inputs,
                 tile_checkpoints,
+                feature_outputs,
+                &params,
                 q_tier,
                 num_frames,
                 num_tiles,
                 tile + 1,
                 c,
-                &lp,
                 is_phs,
-            )
+                stage_b,
+            );
+            (rs, (bl, br))
         } else {
-            (0.0, 0.0)
+            ((0.0, 0.0), (Vec4::ZERO, Vec4::ZERO))
         };
         let exit_adj_r_prev_seam = if tile + 1 == num_tiles && valid_len > 0 && i + 1 == valid_len {
             (
@@ -238,11 +139,14 @@ pub fn run_pass0(
             (0.0, 0.0)
         };
 
-        let nonlin = eval_adaa_local_and_seam_pullback(
+        let nonlin = eval_se_and_adaa_local_and_seam_pullback(
             d_loss_d_features,
             feature_outputs,
+            d_loss_d_inputs,
             scan_scratch,
             &fwd,
+            &params,
+            &lp,
             q_tier,
             num_frames,
             num_tiles,
@@ -250,34 +154,43 @@ pub fn run_pass0(
             valid_len,
             i,
             c,
-            params.glu_mix,
-            &lp,
             tiny_eps,
             r_next_seam,
+            b_next_seam,
             exit_adj_r_prev_seam,
+            stage_b,
         );
-        let sag = eval_sag_and_stereo_pullback(&fwd, &nonlin, &lp, is_active);
+        let st = eval_stereo_link_pullback(&fwd, &nonlin, &lp, is_active);
 
         let sp = s_prev2[i];
-        let (phs_l, phs_r, taps_l, taps_r) = if is_phs {
-            let fl = eval_tpt_svf_phs_frame(fwd.u_l, sp.x, sp.y, &lp);
-            let fr = eval_tpt_svf_phs_frame(fwd.u_r, sp.z, sp.w, &lp);
-            (fl, fr, fl.taps, fr.taps)
+        let (pb_l, pb_r, lp_l, bp_l, lp_r, bp_r, k_eff_l, k_eff_r) = if is_phs {
+            let pbl = eval_phs_pred_corr_pass_b_coeffs(fwd.v1_lin_l, lp.svf_g, lp.k, lp.svf_k_nl);
+            let pbr = eval_phs_pred_corr_pass_b_coeffs(fwd.v1_lin_r, lp.svf_g, lp.k, lp.svf_k_nl);
+            let bpl = pbl.a1 * sp.x + pbl.a2 * (fwd.u_l - sp.y);
+            let lpl = sp.y + pbl.a2 * sp.x + pbl.a3 * (fwd.u_l - sp.y);
+            let bpr = pbr.a1 * sp.z + pbr.a2 * (fwd.u_r - sp.w);
+            let lpr = sp.w + pbr.a2 * sp.z + pbr.a3 * (fwd.u_r - sp.w);
+            (pbl, pbr, lpl, bpl, lpr, bpr, pbl.k_eff, pbr.k_eff)
         } else {
             let svf_c = lp.to_svf_coeffs();
-            (
-                PhsFrameTerms::zero(),
-                PhsFrameTerms::zero(),
-                eval_tpt_svf_scalar(fwd.u_l, sp.x, sp.y, &svf_c),
-                eval_tpt_svf_scalar(fwd.u_r, sp.z, sp.w, &svf_c),
-            )
+            let (lpl, bpl) = eval_tpt_svf_lp_bp_scalar(fwd.u_l, sp.x, sp.y, &svf_c);
+            let (lpr, bpr) = eval_tpt_svf_lp_bp_scalar(fwd.u_r, sp.z, sp.w, &svf_c);
+            let z_pb = PhsPredCorrPassBCoeffs {
+                v1_lin: 0.0,
+                e: 0.0,
+                k_eff: lp.k,
+                a1: lp.a1,
+                a2: lp.a2,
+                a3: lp.a3,
+            };
+            (z_pb, z_pb, lpl, bpl, lpr, bpr, lp.k, lp.k)
         };
-        let (tl, tr) = eval_frame_duhem_terms_lr(v_traj2, &fwd, taps_l.1, taps_r.1, i, &lp);
+        let (tl, tr) = eval_frame_duhem_terms_lr(v_traj2, &fwd, bp_l, bp_r, i, &lp);
 
         let lru_elem_l = if is_active {
             LinearScanElem {
                 a: tl.jac,
-                b: tl.jac * sag.adj_v_raw_l,
+                b: tl.jac * st.adj_v_raw_l,
             }
         } else {
             LinearScanElem::identity()
@@ -285,7 +198,7 @@ pub fn run_pass0(
         let lru_elem_r = if is_active {
             LinearScanElem {
                 a: tr.jac,
-                b: tr.jac * sag.adj_v_raw_r,
+                b: tr.jac * st.adj_v_raw_r,
             }
         } else {
             LinearScanElem::identity()
@@ -294,54 +207,320 @@ pub fn run_pass0(
             linear_adjoint_reverse_suffix_256_lr(scan_scratch, i, lru_elem_l, lru_elem_r, 0.0, 0.0);
 
         let lam_l = if is_active {
-            sag.adj_v_raw_l + lam_after_l
+            st.adj_v_raw_l + lam_after_l
         } else {
             0.0
         };
         let lam_r = if is_active {
-            sag.adj_v_raw_r + lam_after_r
+            st.adj_v_raw_r + lam_after_r
         } else {
             0.0
         };
-
-        let (ke_l, two_ke_l, ke_r, two_ke_r) = if is_phs {
-            (
-                phs_l.k_eff,
-                phs_l.k_eff + phs_l.k_eff,
-                phs_r.k_eff,
-                phs_r.k_eff + phs_r.k_eff,
-            )
-        } else {
-            (lp.k, lp.two_k, lp.k, lp.two_k)
-        };
         let dt = eval_duhem_and_tone_pullback(
-            &fwd, &sag, &tl, &tr, lam_l, lam_r, taps_l, taps_r, ke_l, two_ke_l, ke_r, two_ke_r,
-            &lp, is_active,
+            &fwd, &st, &tl, &tr, lam_l, lam_r, lp_l, bp_l, lp_r, bp_r, k_eff_l, k_eff_r, &lp,
+            is_active,
         );
 
-        let (tpt_elem_l, tpt_elem_r) = build_channel_tpt_pair(
-            is_phs, is_active, &lp, &phs_l, &phs_r, taps_l.1, taps_r.1, &dt,
-        );
-
-        // Reuse `after_{l,r}.a` directly (`0-ULP` equal to a `unit_lru` scan with `b = 0.0`,
-        // eliminating `-72` barriers/tile) and reduce `sum_tpt`/`sum_k` via binary tree.
         let unit_lam_l = if is_active { p_after_l } else { 0.0 };
         let unit_lam_r = if is_active { p_after_r } else { 0.0 };
-        let zero_sag = SagStereoPullback::zero();
+        let zero_st = StereoPullback::zero();
         let dt_k = eval_duhem_and_tone_pullback(
-            &fwd, &zero_sag, &tl, &tr, unit_lam_l, unit_lam_r, taps_l, taps_r, ke_l, two_ke_l,
-            ke_r, two_ke_r, &lp, is_active,
-        );
-        let (tpt_k_l, tpt_k_r) = build_channel_tpt_pair(
-            is_phs, is_active, &lp, &phs_l, &phs_r, taps_l.1, taps_r.1, &dt_k,
+            &fwd, &zero_st, &tl, &tr, unit_lam_l, unit_lam_r, lp_l, bp_l, lp_r, bp_r, k_eff_l,
+            k_eff_r, &lp, is_active,
         );
 
-        let (sum_tpt_l, sum_tpt_r, sum_k_l_g, sum_k_r_g) = if is_phs {
-            let (st_l, sk_l) = tpt_adjoint_dual_reduce_256(scan_scratch, i, tpt_elem_l, tpt_k_l);
-            let (st_r, sk_r) = tpt_adjoint_dual_reduce_256(scan_scratch, i, tpt_elem_r, tpt_k_r);
-            (st_l, st_r, [sk_l.g0, sk_l.g1], [sk_r.g0, sk_r.g1])
+        if is_phs {
+            let elem_b_l = if is_active {
+                phs_pred_corr_pass_b_adjoint_elem(&pb_l, dt.adj_v1_l, dt.adj_v2_l)
+            } else {
+                TptAdjointElem::identity()
+            };
+            let elem_b_r = if is_active {
+                phs_pred_corr_pass_b_adjoint_elem(&pb_r, dt.adj_v1_r, dt.adj_v2_r)
+            } else {
+                TptAdjointElem::identity()
+            };
+            let elem_kb_l = if is_active {
+                phs_pred_corr_pass_b_adjoint_elem(&pb_l, dt_k.adj_v1_l, dt_k.adj_v2_l)
+            } else {
+                TptAdjointElem::identity()
+            };
+            let elem_kb_r = if is_active {
+                phs_pred_corr_pass_b_adjoint_elem(&pb_r, dt_k.adj_v1_r, dt_k.adj_v2_r)
+            } else {
+                TptAdjointElem::identity()
+            };
+
+            let (sum_b_l, after_b_l) =
+                tpt_adjoint_reverse_suffix_with_after_256(scan_scratch, i, elem_b_l);
+            let (sum_b_r, after_b_r) =
+                tpt_adjoint_reverse_suffix_with_after_256(scan_scratch, i, elem_b_r);
+            let (sum_kb_l, after_kb_l) =
+                tpt_adjoint_reverse_suffix_with_after_256(scan_scratch, i, elem_kb_l);
+            let (sum_kb_r, after_kb_r) =
+                tpt_adjoint_reverse_suffix_with_after_256(scan_scratch, i, elem_kb_r);
+
+            let (lin_a1, lin_a2, lin_a3) = phs_pass_a_lin_coeffs(&lp);
+            let v1_0_l = if is_active {
+                eval_phs_adj_v1_lin(
+                    &pb_l,
+                    [sp.x, sp.y],
+                    fwd.u_l,
+                    lp.svf_g,
+                    lp.svf_k_nl,
+                    dt.adj_v1_l,
+                    dt.adj_v2_l,
+                    dt.adj_k_eff_tone_l,
+                    [after_b_l.g0, after_b_l.g1],
+                )
+            } else {
+                0.0
+            };
+            let v1_0_r = if is_active {
+                eval_phs_adj_v1_lin(
+                    &pb_r,
+                    [sp.z, sp.w],
+                    fwd.u_r,
+                    lp.svf_g,
+                    lp.svf_k_nl,
+                    dt.adj_v1_r,
+                    dt.adj_v2_r,
+                    dt.adj_k_eff_tone_r,
+                    [after_b_r.g0, after_b_r.g1],
+                )
+            } else {
+                0.0
+            };
+            let v1_k_l = if is_active {
+                eval_phs_adj_v1_lin(
+                    &pb_l,
+                    [sp.x, sp.y],
+                    fwd.u_l,
+                    lp.svf_g,
+                    lp.svf_k_nl,
+                    dt_k.adj_v1_l,
+                    dt_k.adj_v2_l,
+                    dt_k.adj_k_eff_tone_l,
+                    [after_kb_l.g0, after_kb_l.g1],
+                )
+            } else {
+                0.0
+            };
+            let v1_k_r = if is_active {
+                eval_phs_adj_v1_lin(
+                    &pb_r,
+                    [sp.z, sp.w],
+                    fwd.u_r,
+                    lp.svf_g,
+                    lp.svf_k_nl,
+                    dt_k.adj_v1_r,
+                    dt_k.adj_v2_r,
+                    dt_k.adj_k_eff_tone_r,
+                    [after_kb_r.g0, after_kb_r.g1],
+                )
+            } else {
+                0.0
+            };
+            let v1_b0_l = if is_active {
+                eval_phs_adj_v1_lin(
+                    &pb_l,
+                    [sp.x, sp.y],
+                    fwd.u_l,
+                    lp.svf_g,
+                    lp.svf_k_nl,
+                    0.0,
+                    0.0,
+                    0.0,
+                    [after_b_l.t00, after_b_l.t10],
+                )
+            } else {
+                0.0
+            };
+            let v1_b0_r = if is_active {
+                eval_phs_adj_v1_lin(
+                    &pb_r,
+                    [sp.z, sp.w],
+                    fwd.u_r,
+                    lp.svf_g,
+                    lp.svf_k_nl,
+                    0.0,
+                    0.0,
+                    0.0,
+                    [after_b_r.t00, after_b_r.t10],
+                )
+            } else {
+                0.0
+            };
+            let v1_b1_l = if is_active {
+                eval_phs_adj_v1_lin(
+                    &pb_l,
+                    [sp.x, sp.y],
+                    fwd.u_l,
+                    lp.svf_g,
+                    lp.svf_k_nl,
+                    0.0,
+                    0.0,
+                    0.0,
+                    [after_b_l.t01, after_b_l.t11],
+                )
+            } else {
+                0.0
+            };
+            let v1_b1_r = if is_active {
+                eval_phs_adj_v1_lin(
+                    &pb_r,
+                    [sp.z, sp.w],
+                    fwd.u_r,
+                    lp.svf_g,
+                    lp.svf_k_nl,
+                    0.0,
+                    0.0,
+                    0.0,
+                    [after_b_r.t01, after_b_r.t11],
+                )
+            } else {
+                0.0
+            };
+
+            let (sum_lin_0_l, sum_lin_0_r, sum_lin_k_l_g, sum_lin_k_r_g) =
+                tpt_adjoint_const_m_reduce_256_lr(
+                    scan_scratch,
+                    i,
+                    valid_len,
+                    lin_a1,
+                    lin_a2,
+                    lin_a3,
+                    [lin_a1 * v1_0_l, -lin_a2 * v1_0_l],
+                    [lin_a1 * v1_0_r, -lin_a2 * v1_0_r],
+                    [lin_a1 * v1_k_l, -lin_a2 * v1_k_l],
+                    [lin_a1 * v1_k_r, -lin_a2 * v1_k_r],
+                );
+            let (sum_lin_b0_l, sum_lin_b0_r, sum_lin_b1_l_g, sum_lin_b1_r_g) =
+                tpt_adjoint_const_m_reduce_256_lr(
+                    scan_scratch,
+                    i,
+                    valid_len,
+                    lin_a1,
+                    lin_a2,
+                    lin_a3,
+                    [lin_a1 * v1_b0_l, -lin_a2 * v1_b0_l],
+                    [lin_a1 * v1_b0_r, -lin_a2 * v1_b0_r],
+                    [lin_a1 * v1_b1_l, -lin_a2 * v1_b1_l],
+                    [lin_a1 * v1_b1_r, -lin_a2 * v1_b1_r],
+                );
+
+            if i == 0 && tile < num_tiles {
+                let slot = tile_base
+                    + (q_wave * num_tiles + tile) * TILE_ADJ_BOUNDARY_VEC4_STRIDE
+                    + c * TILE_ADJ_LANE_VEC4_STRIDE;
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot,
+                    Vec4::new(sum_b_l.t00, sum_b_l.t01, sum_b_l.t10, sum_b_l.t11),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 1,
+                    Vec4::new(sum_b_l.g0, sum_b_l.g1, sum_b_r.g0, sum_b_r.g1),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 2,
+                    Vec4::new(sum_lru_l.a, sum_lru_l.b, sum_lru_r.a, sum_lru_r.b),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 3,
+                    Vec4::new(
+                        r_first_l,
+                        r_first_r,
+                        nonlin.adj_r_prev_l,
+                        nonlin.adj_r_prev_r,
+                    ),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 4,
+                    Vec4::new(sum_b_r.t00, sum_b_r.t01, sum_b_r.t10, sum_b_r.t11),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 5,
+                    Vec4::new(sum_kb_l.g0, sum_kb_l.g1, sum_kb_r.g0, sum_kb_r.g1),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 6,
+                    Vec4::new(
+                        sum_lin_0_l.t00,
+                        sum_lin_0_l.t01,
+                        sum_lin_0_l.t10,
+                        sum_lin_0_l.t11,
+                    ),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 7,
+                    Vec4::new(
+                        sum_lin_0_l.g0,
+                        sum_lin_0_l.g1,
+                        sum_lin_0_r.g0,
+                        sum_lin_0_r.g1,
+                    ),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 8,
+                    Vec4::new(
+                        sum_lin_k_l_g[0],
+                        sum_lin_k_l_g[1],
+                        sum_lin_k_r_g[0],
+                        sum_lin_k_r_g[1],
+                    ),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 9,
+                    Vec4::new(
+                        sum_lin_b0_l.g0,
+                        sum_lin_b0_l.g1,
+                        sum_lin_b0_r.g0,
+                        sum_lin_b0_r.g1,
+                    ),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 10,
+                    Vec4::new(
+                        sum_lin_b1_l_g[0],
+                        sum_lin_b1_l_g[1],
+                        sum_lin_b1_r_g[0],
+                        sum_lin_b1_r_g[1],
+                    ),
+                );
+            }
         } else {
-            tpt_adjoint_const_m_reduce_256_lr(
+            let tpt_elem_l =
+                build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_l, dt.adj_v2_l, is_active);
+            let tpt_elem_r =
+                build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_r, dt.adj_v2_r, is_active);
+            let tpt_k_l = build_tpt_adjoint_elem(
+                lp.a1,
+                lp.a2,
+                lp.a3,
+                dt_k.adj_v1_l,
+                dt_k.adj_v2_l,
+                is_active,
+            );
+            let tpt_k_r = build_tpt_adjoint_elem(
+                lp.a1,
+                lp.a2,
+                lp.a3,
+                dt_k.adj_v1_r,
+                dt_k.adj_v2_r,
+                is_active,
+            );
+            let (sum_tpt_l, sum_tpt_r, sum_k_l_g, sum_k_r_g) = tpt_adjoint_const_m_reduce_256_lr(
                 scan_scratch,
                 i,
                 valid_len,
@@ -352,48 +531,53 @@ pub fn run_pass0(
                 [tpt_elem_r.g0, tpt_elem_r.g1],
                 [tpt_k_l.g0, tpt_k_l.g1],
                 [tpt_k_r.g0, tpt_k_r.g1],
-            )
-        };
+            );
 
-        if i == 0 && tile < num_tiles {
-            let slot = tile_base
-                + (q_wave * num_tiles + tile) * TILE_ADJ_BOUNDARY_VEC4_STRIDE
-                + c * TILE_ADJ_LANE_VEC4_STRIDE;
-            store_vec4(
-                tile_adj_boundaries,
-                slot,
-                Vec4::new(sum_tpt_l.t00, sum_tpt_l.t01, sum_tpt_l.t10, sum_tpt_l.t11),
-            );
-            store_vec4(
-                tile_adj_boundaries,
-                slot + 1,
-                Vec4::new(sum_tpt_l.g0, sum_tpt_l.g1, sum_tpt_r.g0, sum_tpt_r.g1),
-            );
-            store_vec4(
-                tile_adj_boundaries,
-                slot + 2,
-                Vec4::new(sum_lru_l.a, sum_lru_l.b, sum_lru_r.a, sum_lru_r.b),
-            );
-            store_vec4(
-                tile_adj_boundaries,
-                slot + 3,
-                Vec4::new(
-                    r_first_l,
-                    r_first_r,
-                    nonlin.adj_r_prev_l,
-                    nonlin.adj_r_prev_r,
-                ),
-            );
-            store_vec4(
-                tile_adj_boundaries,
-                slot + 4,
-                Vec4::new(sum_tpt_r.t00, sum_tpt_r.t01, sum_tpt_r.t10, sum_tpt_r.t11),
-            );
-            store_vec4(
-                tile_adj_boundaries,
-                slot + 5,
-                Vec4::new(sum_k_l_g[0], sum_k_l_g[1], sum_k_r_g[0], sum_k_r_g[1]),
-            );
+            if i == 0 && tile < num_tiles {
+                let slot = tile_base
+                    + (q_wave * num_tiles + tile) * TILE_ADJ_BOUNDARY_VEC4_STRIDE
+                    + c * TILE_ADJ_LANE_VEC4_STRIDE;
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot,
+                    Vec4::new(sum_tpt_l.t00, sum_tpt_l.t01, sum_tpt_l.t10, sum_tpt_l.t11),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 1,
+                    Vec4::new(sum_tpt_l.g0, sum_tpt_l.g1, sum_tpt_r.g0, sum_tpt_r.g1),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 2,
+                    Vec4::new(sum_lru_l.a, sum_lru_l.b, sum_lru_r.a, sum_lru_r.b),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 3,
+                    Vec4::new(
+                        r_first_l,
+                        r_first_r,
+                        nonlin.adj_r_prev_l,
+                        nonlin.adj_r_prev_r,
+                    ),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 4,
+                    Vec4::new(sum_tpt_r.t00, sum_tpt_r.t01, sum_tpt_r.t10, sum_tpt_r.t11),
+                );
+                store_vec4(
+                    tile_adj_boundaries,
+                    slot + 5,
+                    Vec4::new(sum_k_l_g[0], sum_k_l_g[1], sum_k_r_g[0], sum_k_r_g[1]),
+                );
+                store_vec4(tile_adj_boundaries, slot + 6, Vec4::ZERO);
+                store_vec4(tile_adj_boundaries, slot + 7, Vec4::ZERO);
+                store_vec4(tile_adj_boundaries, slot + 8, Vec4::ZERO);
+                store_vec4(tile_adj_boundaries, slot + 9, Vec4::ZERO);
+                store_vec4(tile_adj_boundaries, slot + 10, Vec4::ZERO);
+            }
         }
     }
 }

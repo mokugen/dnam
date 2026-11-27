@@ -9,8 +9,9 @@ use super::harness::{
     dispatch_adjoint_3pass, dispatch_kernel, read_vec4_vec,
 };
 use dnam_kernels::{
-    GpuVec4, InterleavedStereo8, KernelVec4, SOFT_RECT_EPS, SonaBlockStateStereo8, StereoVec8,
-    TINY_CROSSING_EPS, step_core_quad_phs_stereo8, step_core_quad_stereo8,
+    CoreQuadV4Block0StateStereo8, GpuVec4, InterleavedStereo8, KernelVec4, SOFT_RECT_EPS,
+    SonaBlockStateStereo8, StereoVec8, TINY_CROSSING_EPS, step_core_quad_v4_phs_stereo8,
+    step_core_quad_v4_stereo8,
 };
 use sona_shaders::abi::{
     BLOCK_IDX_DIRECT_LINEAR, CORE_INPUT_VEC4_STRIDE, EXIT_ADJ_BOUNDARY_VEC4_STRIDE,
@@ -50,7 +51,7 @@ pub fn verify_alpha_rel_0999_multitile_and_streamed_adjoint(
     packed[quad_param_slots::LRU_KAPPA] = [0.55; 4];
     packed[quad_param_slots::LRU_GAMMA_DUHEM] = [0.40; 4];
     packed[quad_param_slots::LRU_STEREO_LINK] = [0.25; 4];
-    packed[quad_param_slots::SAG_DEPTH] = [0.35; 4];
+    packed[quad_param_slots::D_PRE] = [2.5; 4];
     let cpu_p = cpu_params_from_packed(&packed);
 
     let ckpt_init = vec![[0.0_f32; 4]; num_tiles * TILE_CKPT_VEC4_STRIDE];
@@ -155,7 +156,7 @@ pub fn verify_alpha_rel_0999_multitile_and_streamed_adjoint(
         None,
     );
     let mut seed_c0 = vec![[0.0_f32; 4]; EXIT_ADJ_BOUNDARY_VEC4_STRIDE];
-    seed_c0[0..8].copy_from_slice(&c1.exit_boundary[8..16]);
+    seed_c0[0..12].copy_from_slice(&c1.exit_boundary[12..24]);
     let c0 = dispatch_adjoint_3pass(
         ctx,
         variant,
@@ -231,7 +232,7 @@ pub fn verify_canonical_4wave_ultra_hierarchy_parity(ctx: &GpuContext, variant: 
             ];
         }
         let (_, mut packed) = build_core_quad_bundle(0, q);
-        if matches!(q, 0 | 4 | 6 | 8) {
+        if matches!(q, 0 | 4 | 8) {
             packed[quad_param_slots::SVF_K_NL] = [0.25 + 0.1 * (q as f32); 4];
         }
         quad_params_cpu.push(cpu_params_from_packed(&packed));
@@ -269,9 +270,10 @@ pub fn verify_canonical_4wave_ultra_hierarchy_parity(ctx: &GpuContext, variant: 
         gpu_feats = read_vec4_vec(&out[1]);
     }
 
-    // Verify all 10 quads match CPU reference step_core_quad[_phs]_stereo8.
+    // Verify all 10 quads match CPU reference step_core_quad_v4[_phs]_stereo8 ([3, 3, 2, 2]).
     for q in 0..num_quads {
-        let is_phs = matches!(q, 0 | 4 | 6 | 8);
+        let is_phs = matches!(q, 0 | 4 | 8);
+        let mut st_phs = CoreQuadV4Block0StateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
         let mut st = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
         for t in 0..num_frames {
             let in_b = (q * num_frames + t) * CORE_INPUT_VEC4_STRIDE;
@@ -280,9 +282,9 @@ pub fn verify_canonical_4wave_ultra_hierarchy_parity(ctx: &GpuContext, variant: 
                 GpuVec4::from_array(core_inputs[in_b + 1]),
             );
             let out = if is_phs {
-                step_core_quad_phs_stereo8(u, &mut st, &quad_params_cpu[q])
+                step_core_quad_v4_phs_stereo8(u, &mut st_phs, &quad_params_cpu[q])
             } else {
-                step_core_quad_stereo8(u, &mut st, &quad_params_cpu[q])
+                step_core_quad_v4_stereo8(u, &mut st, &quad_params_cpu[q])
             };
             let (vl, vr) = out.lru_state.into_lr();
             let f_b = (q * num_frames + t) * FEATURE_VEC4_STRIDE;
@@ -346,7 +348,7 @@ pub fn verify_canonical_4wave_ultra_hierarchy_parity(ctx: &GpuContext, variant: 
         let idx = (q * num_frames + 255) * CORE_INPUT_VEC4_STRIDE;
         let eval_q = |ci: &[[f32; 4]]| -> f64 {
             if is_phs {
-                let mut st = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+                let mut st = CoreQuadV4Block0StateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
                 let mut loss = 0.0_f64;
                 for t in 0..num_frames {
                     let ib = (q * num_frames + t) * CORE_INPUT_VEC4_STRIDE;
@@ -354,10 +356,10 @@ pub fn verify_canonical_4wave_ultra_hierarchy_parity(ctx: &GpuContext, variant: 
                         GpuVec4::from_array(ci[ib]),
                         GpuVec4::from_array(ci[ib + 1]),
                     );
-                    let out = step_core_quad_phs_stereo8(u, &mut st, &quad_params_cpu[q]);
+                    let out = step_core_quad_v4_phs_stereo8(u, &mut st, &quad_params_cpu[q]);
                     let (vl, vr) = out.lru_state.into_lr();
-                    let (ol, or) = out.adaa_odd.into_lr();
-                    let (el, er) = out.adaa_even.into_lr();
+                    let (ol, or) = out.o_tilde.into_lr();
+                    let (el, er) = out.e_tilde.into_lr();
                     let arrs = [
                         vl.to_array(),
                         vr.to_array(),

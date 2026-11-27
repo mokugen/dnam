@@ -12,7 +12,7 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// Target triple passed to `spirv-builder`.
 pub const SHADER_TARGET_TRIPLE: &str = "spirv-unknown-naga-wgsl";
 
-/// Canonical identifiers of all seven 32-bit SONA v3.0 WebGPU compute kernels.
+/// Canonical identifiers of all seven 32-bit SONA v4.0 WebGPU compute kernels.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KernelId {
@@ -318,7 +318,7 @@ const INNER_OPT_BINDINGS: &[BindingSpec] = &[
     },
 ];
 
-/// Canonical specification table for all seven SONA v3.0 WebGPU compute kernels.
+/// Canonical specification table for all seven SONA v4.0 WebGPU compute kernels.
 pub const EXPECTED_KERNELS: [ExpectedKernelSpec; 7] = [
     ExpectedKernelSpec {
         id: KernelId::PrescreenPopulation,

@@ -1,12 +1,28 @@
 #![forbid(unsafe_code)]
 
 //! Shared `32 B` `zerocopy` uniform structs, `15,872 B` workgroup SRAM ceilings, and
-//! `CoreQuadParamsStereo4` `25 × Vec4` buffer layout strides (`ref[train.pipeline.webgpu-scans-and-ozaki]`,
+//! `CoreQuadV4ParamsStereo4` `28 × Vec4` buffer layout strides (`ref[train.pipeline.webgpu-scans-and-ozaki]`,
 //! `ref[sdk.rust.zerocopy-wire-structs]`, `ref[repo.code.constant-eval-and-derivations]`).
 
 use core::mem::{align_of, offset_of, size_of};
-use dnam_kernels::{CoreQuadParamsStereo4, GpuVec4, OZAKI_MAX_CHUNK_LEN, SOFT_RECT_EPS};
+use dnam_kernels::{
+    CoreQuadV4ParamsStereo4, GpuVec4, MAX_OUTGOING_PER_QUAD_V4, MAX_SONA_TILES_V4,
+    OZAKI_MAX_CHUNK_LEN, SOFT_RECT_EPS, SONA_V4_BLOCK_QUAD_SLOTS, SONA_V4_INTERBLOCK_TILES,
+    SONA_V4_TILE_COUNTS,
+};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
+
+/// Maximum outgoing inter-block tiles per `CoreQuad` across `SONA v4.0` (`7`).
+pub const MAX_OUTGOING_PER_QUAD: usize = MAX_OUTGOING_PER_QUAD_V4;
+
+/// Maximum lower-triangular `4x4` inter-block tiles across `SONA v4.0` (`37`).
+pub const MAX_SONA_TILES: usize = MAX_SONA_TILES_V4;
+
+/// Cumulative `SONA v4.0` inter-block tile counts per tier `[Lite, Full, Pro, Ultra]`.
+pub const SONA_TILE_COUNTS: [usize; 4] = SONA_V4_TILE_COUNTS;
+
+/// Canonical `37` `SONA v4.0` lower-triangular inter-block edges `(src_quad, dst_quad)`.
+pub const SONA_INTERBLOCK_TILES: [(usize, usize); MAX_SONA_TILES_V4] = SONA_V4_INTERBLOCK_TILES;
 
 /// Maximum Ozaki chunk length imported directly from `dnam-kernels` (`1024`).
 pub const GPU_OZAKI_MAX_CHUNK_LEN: usize = OZAKI_MAX_CHUNK_LEN;
@@ -69,41 +85,46 @@ pub const ADJOINT_CORE_SRAM_BYTES: usize = ADJOINT_S_PREV2_VEC4S * size_of::<[f3
     + ADJOINT_SCAN_SCRATCH_FLOATS * size_of::<f32>()
     + ADJOINT_AUX_FLOATS * size_of::<f32>();
 
-/// Slot indices (`0..25`) for the exact uncompressed `25 × [f32; 4]` packing of
-/// [`dnam_kernels::CoreQuadParamsStereo4`] per `(stem, quad)` in `quad_params` & `param_grads`:
-/// - `0..=4`: `svf.{a1, a2, a3, k, two_k}` (`5 × Vec4`)
-/// - `5..=9`: `tone.{lp, bp, hp, ap, dir}` (`5 × Vec4`)
-/// - `10..=15`: `lru.{alpha_rel, alpha_atk, kappa, gamma_duhem, signed_mix, stereo_link}` (`6 × Vec4`)
-/// - `16..=22`: `two_svf_g, rect_sign, sag_depth, adaa_drive, lru_bias_drive, wavefolder_mix, glu_mix` (`7 × Vec4`)
-/// - `23`: `svf_g` (`two_svf_g * 0.5` for `TPT-SVF` `g` / flux sensitivity, or `0.0` when reserved)
-/// - `24`: `svf_k_nl` (Block 0 PHS diode-bandpass damping `[0.0, 16.0]`; `0.0` on Blocks 1..3)
+/// Slot indices (`0..28`) for the canonical `28 × [f32; 4]` SONA v4.0 packing of
+/// [`dnam_kernels::CoreQuadV4ParamsStereo4`] per `(stem, quad)` in `quad_params` & `param_grads`
+/// (`two_k = k + k` and `two_svf_g = svf_g + svf_g` are derived in `QuadLaneParams`):
+/// - `0..=3`: `SVF_A1..A3, SVF_K` (`4 × Vec4`)
+/// - `4..=7`: `TONE_C_{LP, BP, KBP, U}` (`4 × Vec4`, folded 3-tap + Block 0 PHS `c_kbp`)
+/// - `8..=13`: `LRU_{ALPHA_REL, ALPHA_ATK, KAPPA, GAMMA_DUHEM, SIGNED_MIX, STEREO_LINK}` (`6 × Vec4`)
+/// - `14..=15`: `SVF_G, SVF_K_NL` (`2 × Vec4`)
+/// - `16..=19`: `RECT_SIGN, G0, G_INF, D_PRE` (`4 × Vec4`)
+/// - `20..=21`: `SE_W_SQ, SE_D_BUS` (`2 × Vec4`)
+/// - `22..=27`: `ADAA_DRIVE, LRU_BIAS_DRIVE, LIN_MIX, WAVEFOLDER_MIX, GLU_MIX, OUT_GAIN` (`6 × Vec4`)
 pub mod quad_param_slots {
     pub const SVF_A1: usize = 0;
     pub const SVF_A2: usize = 1;
     pub const SVF_A3: usize = 2;
     pub const SVF_K: usize = 3;
-    pub const SVF_TWO_K: usize = 4;
-    pub const TONE_LP: usize = 5;
-    pub const TONE_BP: usize = 6;
-    pub const TONE_HP: usize = 7;
-    pub const TONE_AP: usize = 8;
-    pub const TONE_DIR: usize = 9;
-    pub const LRU_ALPHA_REL: usize = 10;
-    pub const LRU_ALPHA_ATK: usize = 11;
-    pub const LRU_KAPPA: usize = 12;
-    pub const LRU_GAMMA_DUHEM: usize = 13;
-    pub const LRU_SIGNED_MIX: usize = 14;
-    pub const LRU_STEREO_LINK: usize = 15;
-    pub const TWO_SVF_G: usize = 16;
-    pub const RECT_SIGN: usize = 17;
-    pub const SAG_DEPTH: usize = 18;
-    pub const ADAA_DRIVE: usize = 19;
-    pub const LRU_BIAS_DRIVE: usize = 20;
-    pub const WAVEFOLDER_MIX: usize = 21;
-    pub const GLU_MIX: usize = 22;
-    pub const SVF_G: usize = 23;
-    pub const SVF_K_NL: usize = 24;
-    pub const TOTAL_SLOTS: usize = SVF_K_NL + 1;
+    pub const TONE_C_LP: usize = 4;
+    pub const TONE_C_BP: usize = 5;
+    pub const TONE_C_KBP: usize = 6;
+    pub const TONE_C_U: usize = 7;
+    pub const LRU_ALPHA_REL: usize = 8;
+    pub const LRU_ALPHA_ATK: usize = 9;
+    pub const LRU_KAPPA: usize = 10;
+    pub const LRU_GAMMA_DUHEM: usize = 11;
+    pub const LRU_SIGNED_MIX: usize = 12;
+    pub const LRU_STEREO_LINK: usize = 13;
+    pub const SVF_G: usize = 14;
+    pub const SVF_K_NL: usize = 15;
+    pub const RECT_SIGN: usize = 16;
+    pub const G0: usize = 17;
+    pub const G_INF: usize = 18;
+    pub const D_PRE: usize = 19;
+    pub const SE_W_SQ: usize = 20;
+    pub const SE_D_BUS: usize = 21;
+    pub const ADAA_DRIVE: usize = 22;
+    pub const LRU_BIAS_DRIVE: usize = 23;
+    pub const LIN_MIX: usize = 24;
+    pub const WAVEFOLDER_MIX: usize = 25;
+    pub const GLU_MIX: usize = 26;
+    pub const OUT_GAIN: usize = 27;
+    pub const TOTAL_SLOTS: usize = OUT_GAIN + 1;
 }
 
 /// W3C WebGPU baseline limit for storage buffers per compute shader stage (`8`).
@@ -115,25 +136,26 @@ pub const CORE_INPUT_VEC4_STRIDE: usize = 2;
 /// Number of `Vec4` (`f32[4]`) vectors per `(stem, quad)` in `quad_params` and `param_grads`.
 pub const QUAD_PARAMS_VEC4_STRIDE: usize = quad_param_slots::TOTAL_SLOTS;
 
-/// Number of `Vec4` vectors per `(stem, q_local, tile)` checkpoint
-/// `(s1_L, s1_R, s2_L, s2_R, v_L, v_R, adaa_prev_L, adaa_prev_R)`.
-pub const TILE_CKPT_VEC4_STRIDE: usize = 8;
+/// Number of `Vec4` vectors per `(stem, q_local, tile)` checkpoint:
+/// `(s1_L, s1_R, s2_L, s2_R, v_L, v_R, adaa_prev_L, adaa_prev_R, s1_lin_L, s1_lin_R, s2_lin_L, s2_lin_R)`.
+pub const TILE_CKPT_VEC4_STRIDE: usize = 12;
 
 /// Number of `Vec4` vectors per `(stem, q_local, frame)` emitted into `feature_outputs`
-/// `(v_eff_L, v_eff_R, adaa_odd_L, adaa_odd_R, adaa_even_L, adaa_even_R)`.
+/// `(v_eff_L, v_eff_R, o_tilde_L, o_tilde_R, e_tilde_L, e_tilde_R)`.
 pub const FEATURE_VEC4_STRIDE: usize = 6;
 
 /// Number of `Vec4` summary vectors per lane channel `c in 0..4` in `tile_adj_boundaries`
-/// (`T_L`, `(g0_L, g1_L, g0_R, g1_R)`, `ParaLRU`, `ADAA seam + frame-0 adj_r_prev`, `T_R`, `k_vs`).
-pub const TILE_ADJ_LANE_VEC4_STRIDE: usize = 6;
+/// (`T_b_L / s_b_out`, `g_b`, `ParaLRU`, `ADAA seam`, `T_b_R`, `k_vs_b`, `T_lin / s_lin_out`,
+/// `g_lin_0`, `g_lin_k`, `g_lin_b0`, `g_lin_b1`).
+pub const TILE_ADJ_LANE_VEC4_STRIDE: usize = 11;
 
 /// Number of `Vec4` vectors per `(stem, q_local, tile)` in `tile_adj_boundaries`
-/// (`4` lane channels × `6` summary `Vec4`s = `384 B`).
+/// (`4` lane channels × `11` summary `Vec4`s = `44` `Vec4`s = `704 B`).
 pub const TILE_ADJ_BOUNDARY_VEC4_STRIDE: usize = 4 * TILE_ADJ_LANE_VEC4_STRIDE;
 
 /// Number of `Vec4` vectors per `(stem, q_local)` in `Slot 7` (`tile_adj_boundaries`) leading
-/// wave-local cross-block header (`in_exit[0..8]` + `out_entry[8..16]` = `256 B`).
-pub const EXIT_ADJ_BOUNDARY_VEC4_STRIDE: usize = 16;
+/// wave-local cross-block header (`in_exit[0..12]` + `out_entry[12..24]` = `384 B`).
+pub const EXIT_ADJ_BOUNDARY_VEC4_STRIDE: usize = 24;
 
 /// Number of `f32` scalars per seed in `prescreen_population`'s `seed_params`.
 pub const PRESCREEN_SEED_PARAM_STRIDE: usize = 16;
@@ -163,13 +185,40 @@ pub const BLOCK_WAVE_ALL: u32 = 0xFFFF_FFFF;
 /// Optional `FusedScanUniforms.block_idx` flag bit enabling damped-DEER / passive-Picard fixed-point mode.
 pub const FUSED_FLAG_FIXED_POINT_SCAN: u32 = 1 << 30;
 
-/// Canonical 4-block Matryoshka wave -> `CoreQuad` index map
-/// (Block 0 `{0,4,6,8}`, Block 1 `{1,5,9}`, Block 2 `{2,7}`, Block 3 `{3}`).
+const fn option_slot_or_invalid(slot: Option<usize>) -> usize {
+    match slot {
+        Some(idx) => idx,
+        None => INVALID_QUAD_SLOT,
+    }
+}
+
+/// Canonical `SONA v4.0` 4-block Matryoshka `[3,3,2,2]` wave -> `CoreQuad` index map
+/// (Block 0 `{0,4,8}`, Block 1 `{1,5,9}`, Block 2 `{2,6}`, Block 3 `{3,7}`).
 pub const BLOCK_QUAD_SLOTS: [[usize; 4]; 4] = [
-    [0, 4, 6, 8],
-    [1, 5, 9, INVALID_QUAD_SLOT],
-    [2, 7, INVALID_QUAD_SLOT, INVALID_QUAD_SLOT],
-    [3, INVALID_QUAD_SLOT, INVALID_QUAD_SLOT, INVALID_QUAD_SLOT],
+    [
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[0][0]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[0][1]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[0][2]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[0][3]),
+    ],
+    [
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[1][0]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[1][1]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[1][2]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[1][3]),
+    ],
+    [
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[2][0]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[2][1]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[2][2]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[2][3]),
+    ],
+    [
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[3][0]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[3][1]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[3][2]),
+        option_slot_or_invalid(SONA_V4_BLOCK_QUAD_SLOTS[3][3]),
+    ],
 ];
 
 /// Returns the number of active quads belonging to `block_idx` under `num_quads`.
@@ -373,26 +422,27 @@ const _: () = assert!(GABOR_BEZOUT_SRAM_BYTES <= MAX_WORKGROUP_SRAM_BYTES as u32
 const _: () = assert!(OZAKI_GRAM_SRAM_BYTES <= MAX_WORKGROUP_SRAM_BYTES as u32);
 const _: () = assert!(INNER_OPT_SRAM_BYTES <= MAX_WORKGROUP_SRAM_BYTES as u32);
 const _: () = assert!(CORE_INPUT_VEC4_STRIDE == 2);
-const _: () = assert!(QUAD_PARAMS_VEC4_STRIDE == 25);
+const _: () = assert!(QUAD_PARAMS_VEC4_STRIDE == 28);
 const _: () = assert!(
-    size_of::<CoreQuadParamsStereo4<GpuVec4>>()
-        == (QUAD_PARAMS_VEC4_STRIDE - 1) * size_of::<[f32; 4]>()
+    size_of::<CoreQuadV4ParamsStereo4<GpuVec4>>()
+        == (QUAD_PARAMS_VEC4_STRIDE + 1) * size_of::<[f32; 4]>()
 );
 const _: () = assert!(GPU_OZAKI_MAX_CHUNK_LEN == 1024);
 const _: () = assert!(GPU_SOFT_RECT_EPS > 0.0);
-const _: () = assert!(TILE_CKPT_VEC4_STRIDE == 8);
+const _: () = assert!(TILE_CKPT_VEC4_STRIDE == 12);
 const _: () = assert!(FEATURE_VEC4_STRIDE == 6);
-const _: () = assert!(TILE_ADJ_LANE_VEC4_STRIDE == 6);
-const _: () = assert!(TILE_ADJ_BOUNDARY_VEC4_STRIDE == 24);
-const _: () = assert!(EXIT_ADJ_BOUNDARY_VEC4_STRIDE == 16);
+const _: () = assert!(TILE_ADJ_LANE_VEC4_STRIDE == 11);
+const _: () = assert!(TILE_ADJ_BOUNDARY_VEC4_STRIDE == 44);
+const _: () = assert!(EXIT_ADJ_BOUNDARY_VEC4_STRIDE == 24);
+const _: () = assert!(MAX_OUTGOING_PER_QUAD == 7 && MAX_SONA_TILES == 37);
 const _: () = assert!(TILE_DESC_VEC4_STRIDE == 13);
 const _: () = assert!(TILE_WEIGHT_GRAD_FLOATS == 48);
 const _: () = assert!(PRESCREEN_SEED_PARAM_STRIDE == 16);
 const _: () = assert!(OZAKI_WORDS_PER_PAIR == 6 && OZAKI_SPLIT64_WORDS_PER_PAIR == 4);
 const _: () = assert!(LSSBROYDEN_MAX_HISTORY_M == 32 && LBFGS_MAX_HISTORY_M == 32);
-const _: () = assert!(block_quad_count(0, 4) == 1 && block_quad_count(0, 10) == 4);
+const _: () = assert!(block_quad_count(0, 4) == 1 && block_quad_count(0, 10) == 3);
 const _: () = assert!(block_quad_count(1, 10) == 3 && block_quad_count(2, 10) == 2);
-const _: () = assert!(block_quad_count(3, 10) == 1);
+const _: () = assert!(block_quad_count(3, 10) == 2);
 
 const _: () = assert!(size_of::<PrescreenUniforms>() == UNIFORM_STRUCT_BYTES);
 const _: () = assert!(align_of::<PrescreenUniforms>() == 4);

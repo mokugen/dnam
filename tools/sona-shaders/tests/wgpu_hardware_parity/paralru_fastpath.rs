@@ -11,9 +11,9 @@ use super::harness::{
     cpu_params_from_packed, dispatch_adjoint_3pass, dispatch_kernel, read_vec4_vec,
 };
 use dnam_kernels::{
-    CoreQuadParamsStereo4, GpuVec4, InterleavedStereo8, KernelVec4, SOFT_RECT_EPS,
-    SonaBlockStateStereo8, SonaParaLruDuhemCoeffs4, StereoVec8, TINY_CROSSING_EPS,
-    step_core_quad_phs_stereo8, step_core_quad_stereo8,
+    CoreQuadV4Block0StateStereo8, CoreQuadV4ParamsStereo4, GpuVec4, InterleavedStereo8, KernelVec4,
+    SOFT_RECT_EPS, SonaBlockStateStereo8, SonaParaLruDuhemCoeffs4, StereoVec8, TINY_CROSSING_EPS,
+    step_core_quad_v4_phs_stereo8, step_core_quad_v4_stereo8,
 };
 use sona_shaders::abi::{
     CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, FUSED_FLAG_FIXED_POINT_SCAN, FusedScanUniforms,
@@ -48,7 +48,7 @@ fn make_inputs(num_frames: usize) -> Vec<[f32; 4]> {
 fn build_mixed_decoupled_bundle(
     k_nl: [f32; 4],
 ) -> (
-    CoreQuadParamsStereo4<GpuVec4>,
+    CoreQuadV4ParamsStereo4<GpuVec4>,
     [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE],
 ) {
     let (mut cpu_p, mut packed) = build_core_quad_bundle_with_k_nl(0, 0, k_nl);
@@ -80,11 +80,12 @@ fn build_mixed_decoupled_bundle(
 
 fn eval_cpu_loss_block(
     core_inputs: &[[f32; 4]],
-    params_cpu: &CoreQuadParamsStereo4<GpuVec4>,
+    params_cpu: &CoreQuadV4ParamsStereo4<GpuVec4>,
     weights: &[[f32; 4]],
     is_phs: bool,
 ) -> f64 {
-    let mut state = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+    let mut state_phs = CoreQuadV4Block0StateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+    let mut state_lin = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
     let mut loss = 0.0_f64;
     for t in 0..NUM_FRAMES {
         let in_base = t * CORE_INPUT_VEC4_STRIDE;
@@ -93,13 +94,13 @@ fn eval_cpu_loss_block(
             GpuVec4::from_array(core_inputs[in_base + 1]),
         );
         let out = if is_phs {
-            step_core_quad_phs_stereo8(u, &mut state, params_cpu)
+            step_core_quad_v4_phs_stereo8(u, &mut state_phs, params_cpu)
         } else {
-            step_core_quad_stereo8(u, &mut state, params_cpu)
+            step_core_quad_v4_stereo8(u, &mut state_lin, params_cpu)
         };
         let (vl, vr) = out.lru_state.into_lr();
-        let (ol, or) = out.adaa_odd.into_lr();
-        let (el, er) = out.adaa_even.into_lr();
+        let (ol, or) = out.o_tilde.into_lr();
+        let (el, er) = out.e_tilde.into_lr();
         let feats = [
             vl.to_array(),
             vr.to_array(),
@@ -163,10 +164,10 @@ pub fn verify_paralru_fastpath_and_const_m_scans(ctx: &GpuContext, variant: Shad
             GpuVec4::from_array(inputs[t * 2]),
             GpuVec4::from_array(inputs[t * 2 + 1]),
         );
-        let out = step_core_quad_stereo8(u, &mut cpu_state, &cpu_p);
+        let out = step_core_quad_v4_stereo8(u, &mut cpu_state, &cpu_p);
         let (vl, vr) = out.lru_state.into_lr();
-        let (ol, or) = out.adaa_odd.into_lr();
-        let (el, er) = out.adaa_even.into_lr();
+        let (ol, or) = out.o_tilde.into_lr();
+        let (el, er) = out.e_tilde.into_lr();
         for arr in [
             vl.to_array(),
             vr.to_array(),
@@ -423,9 +424,7 @@ pub fn verify_paralru_fastpath_and_const_m_scans(ctx: &GpuContext, variant: Shad
         packed2[quad_param_slots::SVF_A2][0] = a2;
         packed2[quad_param_slots::SVF_A3][0] = a3;
         packed2[quad_param_slots::SVF_K][0] = k0;
-        packed2[quad_param_slots::SVF_TWO_K][0] = 2.0 * k0;
         packed2[quad_param_slots::SVF_G][0] = g0;
-        packed2[quad_param_slots::TWO_SVF_G][0] = 2.0 * g0;
         let dual_in2 = [inputs2.as_slice(), inputs2.as_slice()].concat();
         let dual_p2 = [packed2, packed2].concat();
         let ckpt2 = vec![[0.0_f32; 4]; 2 * LOW_FC_TILES * TILE_CKPT_VEC4_STRIDE];
@@ -541,13 +540,11 @@ pub fn verify_paralru_fastpath_and_const_m_scans(ctx: &GpuContext, variant: Shad
                     p[quad_param_slots::SVF_A1][0] = a1;
                     p[quad_param_slots::SVF_A2][0] = a2;
                     p[quad_param_slots::SVF_A3][0] = a3;
-                    p[quad_param_slots::SVF_TWO_K][0] = 2.0 * k;
-                    p[quad_param_slots::TWO_SVF_G][0] = 2.0 * g;
                 }
             };
         for &(slot, eps) in &[
             (quad_param_slots::SVF_A1, 3.0e-5_f32),
-            (quad_param_slots::TWO_SVF_G, 5.0e-4_f32),
+            (quad_param_slots::SVF_G, 1.0e-4_f32),
             (quad_param_slots::SVF_K, 1.0e-3_f32),
             (quad_param_slots::LRU_ALPHA_REL, 1.5e-3_f32),
         ] {

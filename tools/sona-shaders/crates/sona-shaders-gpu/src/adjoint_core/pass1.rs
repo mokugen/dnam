@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 
 //! `adjoint_scan_256` `pass_mode = 1`: level-2 `O(log2 num_tiles)` reverse suffix scan in
-//! `256`-tile chunks across `Slot 7` (`tile_adj_boundaries`), seeded by and exporting into
-//! double-buffered wave header (`[0..tile_base)`) with cross-operator `k_vs * adj_v_out`
-//! coupling injection ahead of the `TPT-SVF` scan (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
+//! `256`-tile chunks across `11`-Vec4-per-lane `Slot 7` (`tile_adj_boundaries`), seeded by and
+//! exporting into double-buffered `24`-Vec4 wave header (`[0..tile_base)`) with cross-operator
+//! `ParaLRU -> Pass B -> Pass A` Pred-Corr PHS coupling injection
+//! (`ref[dsp.op-n.core.tpt-tone-basis]`, `ref[train.pipeline.webgpu-scans-and-ozaki]`).
 
 use crate::abi::{
-    ADJOINT_SCAN_SCRATCH_FLOATS, AdjointScanUniforms, EXIT_ADJ_BOUNDARY_VEC4_STRIDE, TILE_FRAMES,
+    ADJOINT_SCAN_SCRATCH_FLOATS, AdjointScanUniforms, BLOCK_IDX_DIRECT_LINEAR,
+    EXIT_ADJ_BOUNDARY_VEC4_STRIDE, TILE_FRAMES,
 };
 use crate::core_math::{
     TILE_ADJ_BOUNDARY_VEC4_STRIDE, TILE_ADJ_LANE_VEC4_STRIDE, get_lane,
@@ -30,6 +32,7 @@ pub fn run_pass1(
     if num_tiles == 0 {
         return;
     }
+    let is_phs = uniforms.block_idx != BLOCK_IDX_DIRECT_LINEAR && (uniforms.block_idx & 0x3) == 0;
     let num_blocks = ((num_tiles - 1) >> 8) + 1;
     let exit_base = q_wave * EXIT_ADJ_BOUNDARY_VEC4_STRIDE;
     let in_exit_vl = load_vec4(tile_adj_boundaries, exit_base + 4);
@@ -46,6 +49,13 @@ pub fn run_pass1(
         let mut carry_s_r = [s_exit.z, s_exit.w];
         let mut carry_v_l = get_lane(in_exit_vl, c);
         let mut carry_v_r = get_lane(in_exit_vr, c);
+        let s_lin_exit = if is_phs {
+            load_vec4(tile_adj_boundaries, exit_base + 8 + c)
+        } else {
+            Vec4::ZERO
+        };
+        let mut carry_s_lin_l = [s_lin_exit.x, s_lin_exit.y];
+        let mut carry_s_lin_r = [s_lin_exit.z, s_lin_exit.w];
 
         for b_rev in 0..num_blocks {
             let b = (num_blocks - 1) - b_rev;
@@ -153,13 +163,106 @@ pub fn run_pass1(
             }
             carry_s_l = apply_tpt_adjoint(full_s_l, carry_s_l);
             carry_s_r = apply_tpt_adjoint(full_s_r, carry_s_r);
+
+            if is_phs {
+                let (lin_elem_l, lin_elem_r) = if in_range {
+                    let s6 = load_vec4(tile_adj_boundaries, slot + 6);
+                    let s7 = load_vec4(tile_adj_boundaries, slot + 7);
+                    let s8 = load_vec4(tile_adj_boundaries, slot + 8);
+                    let s9 = load_vec4(tile_adj_boundaries, slot + 9);
+                    let s10 = load_vec4(tile_adj_boundaries, slot + 10);
+                    (
+                        TptAdjointElem {
+                            t00: s6.x,
+                            t01: s6.y,
+                            t10: s6.z,
+                            t11: s6.w,
+                            g0: s7.x
+                                + s8.x * adj_v_out_l
+                                + s9.x * adj_s1_l_out
+                                + s10.x * adj_s2_l_out,
+                            g1: s7.y
+                                + s8.y * adj_v_out_l
+                                + s9.y * adj_s1_l_out
+                                + s10.y * adj_s2_l_out,
+                        },
+                        TptAdjointElem {
+                            t00: s6.x,
+                            t01: s6.y,
+                            t10: s6.z,
+                            t11: s6.w,
+                            g0: s7.z
+                                + s8.z * adj_v_out_r
+                                + s9.z * adj_s1_r_out
+                                + s10.z * adj_s2_r_out,
+                            g1: s7.w
+                                + s8.w * adj_v_out_r
+                                + s9.w * adj_s1_r_out
+                                + s10.w * adj_s2_r_out,
+                        },
+                    )
+                } else {
+                    (TptAdjointElem::identity(), TptAdjointElem::identity())
+                };
+
+                let mut adj_s1_lin_l_out = 0.0_f32;
+                let mut adj_s2_lin_l_out = 0.0_f32;
+                let full_lin_l = tpt_adjoint_reverse_suffix_256(
+                    scan_scratch,
+                    i,
+                    lin_elem_l,
+                    carry_s_lin_l,
+                    &mut adj_s1_lin_l_out,
+                    &mut adj_s2_lin_l_out,
+                );
+
+                let mut adj_s1_lin_r_out = 0.0_f32;
+                let mut adj_s2_lin_r_out = 0.0_f32;
+                let full_lin_r = tpt_adjoint_reverse_suffix_256(
+                    scan_scratch,
+                    i,
+                    lin_elem_r,
+                    carry_s_lin_r,
+                    &mut adj_s1_lin_r_out,
+                    &mut adj_s2_lin_r_out,
+                );
+
+                if in_range {
+                    store_vec4(
+                        tile_adj_boundaries,
+                        slot + 6,
+                        Vec4::new(
+                            adj_s1_lin_l_out,
+                            adj_s2_lin_l_out,
+                            adj_s1_lin_r_out,
+                            adj_s2_lin_r_out,
+                        ),
+                    );
+                }
+                carry_s_lin_l = apply_tpt_adjoint(full_lin_l, carry_s_lin_l);
+                carry_s_lin_r = apply_tpt_adjoint(full_lin_r, carry_s_lin_r);
+            }
         }
 
         if i == 0 {
             store_vec4(
                 tile_adj_boundaries,
-                exit_base + 8 + c,
+                exit_base + 12 + c,
                 Vec4::new(carry_s_l[0], carry_s_l[1], carry_s_r[0], carry_s_r[1]),
+            );
+            store_vec4(
+                tile_adj_boundaries,
+                exit_base + 20 + c,
+                if is_phs {
+                    Vec4::new(
+                        carry_s_lin_l[0],
+                        carry_s_lin_l[1],
+                        carry_s_lin_r[0],
+                        carry_s_lin_r[1],
+                    )
+                } else {
+                    Vec4::ZERO
+                },
             );
             out_entry_vl[c] = carry_v_l;
             out_entry_vr[c] = carry_v_r;
@@ -176,22 +279,22 @@ pub fn run_pass1(
     if i == 0 {
         store_vec4(
             tile_adj_boundaries,
-            exit_base + 12,
+            exit_base + 16,
             Vec4::from(out_entry_vl),
         );
         store_vec4(
             tile_adj_boundaries,
-            exit_base + 13,
+            exit_base + 17,
             Vec4::from(out_entry_vr),
         );
         store_vec4(
             tile_adj_boundaries,
-            exit_base + 14,
+            exit_base + 18,
             Vec4::from(out_entry_rprev_l),
         );
         store_vec4(
             tile_adj_boundaries,
-            exit_base + 15,
+            exit_base + 19,
             Vec4::from(out_entry_rprev_r),
         );
     }

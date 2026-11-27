@@ -9,9 +9,9 @@ use super::harness::{
 };
 use dnam_kernels::{
     GpuVec4, KernelVec4, MIN_SAG_GAIN, SonaParaLruDuhemCoeffs4, TptSvfCoeffs4,
-    accum_ozaki_chunk_i32, apply_stereo_link_vec4_pair, eval_poly_adaa1_odd_even_vec4,
-    pow2_ceil_fp32, prewarp_tan_pi_f_over_fs_f32, reconstruct_ozaki_dot_f64,
-    step_paralru_duhem_vec4, step_tpt_svf_vec4,
+    accum_ozaki_chunk_i32, apply_stereo_link_vec4_pair, eval_alg_adaa1_vec4, pow2_ceil_fp32,
+    prewarp_tan_pi_f_over_fs_f32, reconstruct_ozaki_dot_f64, scrub_clamped_alg_endpoint_f32,
+    step_paralru_duhem_v4_vec4, step_tpt_svf_vec4,
 };
 use sona_shaders::abi::{
     OZAKI_FLAG_ACCUMULATE_SPLIT64, OZAKI_PAIR_TILE_ROWS_DEFAULT, OZAKI_SPLIT64_WORDS_PER_PAIR,
@@ -459,23 +459,23 @@ pub fn verify_prescreen_population_parity(ctx: &GpuContext, variant: ShaderVaria
                         let u_rr = GpuVec4::splat(seed_params[b + 12] * tone_r);
                         let fl = GpuVec4::splat(2.0 * g * svf_l.bp.to_array()[0]);
                         let fr = GpuVec4::splat(2.0 * g * svf_r.bp.to_array()[0]);
-                        let vl = step_paralru_duhem_vec4(u_rl, fl, &mut v_l, &lru);
-                        let vr = step_paralru_duhem_vec4(u_rr, fr, &mut v_r, &lru);
+                        let vl = step_paralru_duhem_v4_vec4(u_rl, fl, &mut v_l, &lru);
+                        let vr = step_paralru_duhem_v4_vec4(u_rr, fr, &mut v_r, &lru);
                         let (vel, ver) = apply_stereo_link_vec4_pair(vl, vr, lru.stereo_link);
                         let sag_l =
                             (1.0 - seed_params[b + 13] * vel.to_array()[0]).max(MIN_SAG_GAIN);
                         let sag_r =
                             (1.0 - seed_params[b + 13] * ver.to_array()[0]).max(MIN_SAG_GAIN);
-                        let r_l = GpuVec4::splat(
+                        let r_l = GpuVec4::splat(scrub_clamped_alg_endpoint_f32(
                             tone_l * seed_params[b + 14] * sag_l
                                 + seed_params[b + 15] * vel.to_array()[0],
-                        );
-                        let r_r = GpuVec4::splat(
+                        ));
+                        let r_r = GpuVec4::splat(scrub_clamped_alg_endpoint_f32(
                             tone_r * seed_params[b + 14] * sag_r
                                 + seed_params[b + 15] * ver.to_array()[0],
-                        );
-                        let (ol, _, _) = eval_poly_adaa1_odd_even_vec4(r_prev_l, r_l);
-                        let (or, _, _) = eval_poly_adaa1_odd_even_vec4(r_prev_r, r_r);
+                        ));
+                        let (ol, _, _) = eval_alg_adaa1_vec4(r_prev_l, r_l);
+                        let (or, _, _) = eval_alg_adaa1_vec4(r_prev_r, r_r);
                         r_prev_l = r_l;
                         r_prev_r = r_r;
                         pred[local_t][0] += ol.to_array()[0];

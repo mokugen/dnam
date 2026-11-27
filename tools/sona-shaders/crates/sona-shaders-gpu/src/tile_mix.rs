@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! Conflict-free wave-level inter-block DAG mixing forward and adjoint pullback kernel
-//! (`tile_mix_fwd_adj`) executing all `35` lower-triangular `SONA_INTERBLOCK_TILES` strictly in
+//! (`tile_mix_fwd_adj`) executing all `37` lower-triangular `SONA_V4_INTERBLOCK_TILES` strictly in
 //! `2,048 B` SRAM with zero `f32` atomics (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
 
 use crate::abi::{

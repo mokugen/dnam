@@ -318,18 +318,80 @@ pub fn tpt_const_m_scan_256_lr(
     (s_prev_l, s_prev_r)
 }
 
-/// Runs an `8`-step reverse suffix doubling scan over `TptAdjointElem` in `scan_scratch`,
-/// writing `psi_t = dL_{future > t} / ds_t` into `(psi_out_0, psi_out_1)` and returning the
-/// full-tile reverse summary `[0]`.
+/// Runs an `8`-step forward exclusive Hillis-Steele `256`-wide `TPT-SVF` scan over `TptScanElem`
+/// in `scan_scratch[0..1536]` for a single channel (`L` or `R`), returning `(s1_prev, s2_prev)`.
 #[inline]
-pub fn tpt_adjoint_reverse_suffix_256(
+pub fn tpt_forward_exclusive_scan_256(
+    scan_scratch: &mut [f32; ADJOINT_SCAN_SCRATCH_FLOATS],
+    lid: usize,
+    elem: TptScanElem,
+    init: [f32; 2],
+) -> [f32; 2] {
+    let i = lid & 255;
+    let mut cur = elem;
+    scan_scratch[i] = cur.m00;
+    scan_scratch[TILE_FRAMES + i] = cur.m01;
+    scan_scratch[2 * TILE_FRAMES + i] = cur.m10;
+    scan_scratch[3 * TILE_FRAMES + i] = cur.m11;
+    scan_scratch[4 * TILE_FRAMES + i] = cur.b0;
+    scan_scratch[5 * TILE_FRAMES + i] = cur.b1;
+    wg_barrier();
+
+    let mut step = 1_usize;
+    while step < TILE_FRAMES {
+        let next = if i >= step {
+            let p = (i - step) & 255;
+            let pred = TptScanElem {
+                m00: scan_scratch[p],
+                m01: scan_scratch[TILE_FRAMES + p],
+                m10: scan_scratch[2 * TILE_FRAMES + p],
+                m11: scan_scratch[3 * TILE_FRAMES + p],
+                b0: scan_scratch[4 * TILE_FRAMES + p],
+                b1: scan_scratch[5 * TILE_FRAMES + p],
+            };
+            compose_tpt_scan(pred, cur)
+        } else {
+            cur
+        };
+        wg_barrier();
+        scan_scratch[i] = next.m00;
+        scan_scratch[TILE_FRAMES + i] = next.m01;
+        scan_scratch[2 * TILE_FRAMES + i] = next.m10;
+        scan_scratch[3 * TILE_FRAMES + i] = next.m11;
+        scan_scratch[4 * TILE_FRAMES + i] = next.b0;
+        scan_scratch[5 * TILE_FRAMES + i] = next.b1;
+        cur = next;
+        wg_barrier();
+        step <<= 1;
+    }
+
+    let s_prev = if i == 0 {
+        init
+    } else {
+        let p = (i - 1) & 255;
+        let prev_elem = TptScanElem {
+            m00: scan_scratch[p],
+            m01: scan_scratch[TILE_FRAMES + p],
+            m10: scan_scratch[2 * TILE_FRAMES + p],
+            m11: scan_scratch[3 * TILE_FRAMES + p],
+            b0: scan_scratch[4 * TILE_FRAMES + p],
+            b1: scan_scratch[5 * TILE_FRAMES + p],
+        };
+        apply_tpt_init(prev_elem, init)
+    };
+    wg_barrier();
+    s_prev
+}
+
+/// Runs an `8`-step reverse suffix doubling scan over `TptAdjointElem` in `scan_scratch`,
+/// returning `(summary_0, after_elem_i)` where `after_elem_i` is the exclusive future suffix
+/// `[i + 1 .. 256)` (`TptAdjointElem::identity()` at `i == 255`).
+#[inline]
+pub fn tpt_adjoint_reverse_suffix_with_after_256(
     scan_scratch: &mut [f32; ADJOINT_SCAN_SCRATCH_FLOATS],
     lid: usize,
     elem: TptAdjointElem,
-    adj_s_out: [f32; 2],
-    psi_out_0: &mut f32,
-    psi_out_1: &mut f32,
-) -> TptAdjointElem {
+) -> (TptAdjointElem, TptAdjointElem) {
     let i = lid & 255;
     let mut cur = elem;
     store_tpt_adj_elem(scan_scratch, i, cur);
@@ -355,11 +417,27 @@ pub fn tpt_adjoint_reverse_suffix_256(
     } else {
         TptAdjointElem::identity()
     };
+    let summary = load_tpt_adj_elem(scan_scratch, 0);
+    wg_barrier();
+    (summary, after_elem)
+}
+
+/// Runs an `8`-step reverse suffix doubling scan over `TptAdjointElem` in `scan_scratch`,
+/// writing `psi_t = dL_{future > t} / ds_t` into `(psi_out_0, psi_out_1)` and returning the
+/// full-tile reverse summary `[0]`.
+#[inline]
+pub fn tpt_adjoint_reverse_suffix_256(
+    scan_scratch: &mut [f32; ADJOINT_SCAN_SCRATCH_FLOATS],
+    lid: usize,
+    elem: TptAdjointElem,
+    adj_s_out: [f32; 2],
+    psi_out_0: &mut f32,
+    psi_out_1: &mut f32,
+) -> TptAdjointElem {
+    let (summary, after_elem) = tpt_adjoint_reverse_suffix_with_after_256(scan_scratch, lid, elem);
     let [psi0, psi1] = apply_tpt_adjoint(after_elem, adj_s_out);
     *psi_out_0 = psi0;
     *psi_out_1 = psi1;
-    let summary = load_tpt_adj_elem(scan_scratch, 0);
-    wg_barrier();
     summary
 }
 

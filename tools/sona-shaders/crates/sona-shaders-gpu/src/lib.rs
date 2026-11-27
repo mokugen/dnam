@@ -1,7 +1,7 @@
 #![cfg_attr(target_arch = "spirv", no_std)]
 #![forbid(unsafe_code)]
 
-//! Single-source SPIR-V compute entry points for SONA v3.0 WebGPU training
+//! Single-source SPIR-V compute entry points for SONA v4.0 WebGPU training
 //! (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
 
 pub mod abi;

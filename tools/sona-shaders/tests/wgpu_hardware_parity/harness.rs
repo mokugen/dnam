@@ -4,7 +4,7 @@
 //! CPU/GPU parameter packing for `wgpu_hardware_parity` tests.
 
 use dnam_kernels::{
-    CoreQuadParamsStereo4, GpuVec4, KernelVec4, SonaParaLruDuhemCoeffs4, SonaToneWeights4,
+    CoreQuadV4ParamsStereo4, GpuVec4, KernelVec4, SonaParaLruDuhemCoeffs4, SonaToneFoldedBlock0,
     TptSvfCoeffs4, prewarp_tan_pi_f_over_fs_f32,
 };
 use sona_shaders::abi::{QUAD_PARAMS_VEC4_STRIDE, quad_param_slots};
@@ -315,7 +315,7 @@ pub fn build_core_quad_bundle(
     stem: usize,
     quad: usize,
 ) -> (
-    CoreQuadParamsStereo4<GpuVec4>,
+    CoreQuadV4ParamsStereo4<GpuVec4>,
     [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE],
 ) {
     build_core_quad_bundle_with_k_nl(stem, quad, [0.0; 4])
@@ -326,7 +326,7 @@ pub fn build_core_quad_bundle_with_k_nl(
     quad: usize,
     k_nl: [f32; 4],
 ) -> (
-    CoreQuadParamsStereo4<GpuVec4>,
+    CoreQuadV4ParamsStereo4<GpuVec4>,
     [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE],
 ) {
     let f = (stem * 2 + quad) as f32;
@@ -340,12 +340,11 @@ pub fn build_core_quad_bundle_with_k_nl(
     let k = GpuVec4::from_array([0.55 + 0.05 * f, 0.85, 1.15, 1.45]);
     let svf = TptSvfCoeffs4::from_gk(g, k);
 
-    let tone = SonaToneWeights4 {
-        lp: GpuVec4::from_array([0.45, 0.20, -0.15, 0.10]),
-        bp: GpuVec4::from_array([0.25, 0.40, 0.30, -0.20]),
-        hp: GpuVec4::from_array([-0.15, 0.15, 0.35, 0.45]),
-        ap: GpuVec4::from_array([0.10, -0.10, 0.15, 0.10]),
-        dir: GpuVec4::from_array([0.20, 0.15, -0.10, 0.25]),
+    let tone = SonaToneFoldedBlock0 {
+        c_lp: GpuVec4::from_array([0.60, 0.05, -0.50, -0.35]),
+        c_bp: GpuVec4::from_array([0.25, 0.40, 0.30, -0.20]),
+        c_kbp: GpuVec4::from_array([-0.10, -0.25, -0.45, -0.65]),
+        c_u: GpuVec4::from_array([0.15, 0.20, 0.40, 0.80]),
     };
 
     let alpha_rel = GpuVec4::from_array([0.92, 0.86, 0.78, 0.68]);
@@ -353,7 +352,7 @@ pub fn build_core_quad_bundle_with_k_nl(
     let kappa = GpuVec4::from_array([0.15, 0.35, 0.60, 0.85]);
     let gamma_duhem = GpuVec4::from_array([0.12, 0.28, 0.45, 0.65]);
     let signed_mix = GpuVec4::from_array([0.20, 0.40, 0.55, 0.70]);
-    let stereo_link = GpuVec4::from_array([0.05, 0.25, 0.45, 0.65]);
+    let stereo_link = GpuVec4::from_array([0.08, 0.25, 0.45, 0.65]);
     let lru = SonaParaLruDuhemCoeffs4::from_clamped(
         alpha_rel,
         alpha_atk,
@@ -366,70 +365,84 @@ pub fn build_core_quad_bundle_with_k_nl(
     let two_svf_g = g.add(g);
     let svf_k_nl = GpuVec4::from_array(k_nl);
     let rect_sign = GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]);
-    let sag_depth = GpuVec4::from_array([0.18, 0.32, 0.45, 0.22]);
+    let g0 = GpuVec4::from_array([1.2, 0.4, 2.0, 0.8]);
+    let g_inf = GpuVec4::from_array([0.6, 1.8, 0.5, 2.2]);
+    let d_pre = GpuVec4::from_array([1.5, 3.0, 4.0, 0.5]);
+    let se_w_sq = GpuVec4::from_array([1.0, 0.5, 0.25, 0.125]);
+    let se_d_bus = GpuVec4::from_array([0.2, 0.8, 1.5, 2.5]);
     let adaa_drive = GpuVec4::from_array([1.15, 1.65, 2.10, 1.35]);
     let lru_bias_drive = GpuVec4::from_array([0.15, -0.22, 0.30, -0.18]);
+    let lin_mix = GpuVec4::from_array([0.0, 0.20, 0.45, 0.80]);
     let wavefolder_mix = GpuVec4::from_array([0.0, 0.35, 0.70, 1.0]);
     let glu_mix = if quad.is_multiple_of(2) {
         GpuVec4::from_array([0.65, -0.45, 0.80, -0.55])
     } else {
         GpuVec4::from_array([-0.50, 0.70, -0.35, 0.45])
     };
+    let out_gain = GpuVec4::from_array([1.0, -1.25, 1.50, -0.85]);
 
     let mut packed = [[0.0_f32; 4]; QUAD_PARAMS_VEC4_STRIDE];
     packed[quad_param_slots::SVF_A1] = svf.a1.to_array();
     packed[quad_param_slots::SVF_A2] = svf.a2.to_array();
     packed[quad_param_slots::SVF_A3] = svf.a3.to_array();
     packed[quad_param_slots::SVF_K] = svf.k.to_array();
-    packed[quad_param_slots::SVF_TWO_K] = svf.two_k.to_array();
-    packed[quad_param_slots::TONE_LP] = tone.lp.to_array();
-    packed[quad_param_slots::TONE_BP] = tone.bp.to_array();
-    packed[quad_param_slots::TONE_HP] = tone.hp.to_array();
-    packed[quad_param_slots::TONE_AP] = tone.ap.to_array();
-    packed[quad_param_slots::TONE_DIR] = tone.dir.to_array();
+    packed[quad_param_slots::TONE_C_LP] = tone.c_lp.to_array();
+    packed[quad_param_slots::TONE_C_BP] = tone.c_bp.to_array();
+    packed[quad_param_slots::TONE_C_KBP] = tone.c_kbp.to_array();
+    packed[quad_param_slots::TONE_C_U] = tone.c_u.to_array();
     packed[quad_param_slots::LRU_ALPHA_REL] = lru.alpha_rel.to_array();
     packed[quad_param_slots::LRU_ALPHA_ATK] = lru.alpha_atk.to_array();
     packed[quad_param_slots::LRU_KAPPA] = lru.kappa.to_array();
     packed[quad_param_slots::LRU_GAMMA_DUHEM] = lru.gamma_duhem.to_array();
     packed[quad_param_slots::LRU_SIGNED_MIX] = lru.signed_mix.to_array();
     packed[quad_param_slots::LRU_STEREO_LINK] = lru.stereo_link.to_array();
-    packed[quad_param_slots::TWO_SVF_G] = two_svf_g.to_array();
-    packed[quad_param_slots::RECT_SIGN] = rect_sign.to_array();
-    packed[quad_param_slots::SAG_DEPTH] = sag_depth.to_array();
-    packed[quad_param_slots::ADAA_DRIVE] = adaa_drive.to_array();
-    packed[quad_param_slots::LRU_BIAS_DRIVE] = lru_bias_drive.to_array();
-    packed[quad_param_slots::WAVEFOLDER_MIX] = wavefolder_mix.to_array();
-    packed[quad_param_slots::GLU_MIX] = glu_mix.to_array();
     packed[quad_param_slots::SVF_G] = g.to_array();
     packed[quad_param_slots::SVF_K_NL] = svf_k_nl.to_array();
+    packed[quad_param_slots::RECT_SIGN] = rect_sign.to_array();
+    packed[quad_param_slots::G0] = g0.to_array();
+    packed[quad_param_slots::G_INF] = g_inf.to_array();
+    packed[quad_param_slots::D_PRE] = d_pre.to_array();
+    packed[quad_param_slots::SE_W_SQ] = se_w_sq.to_array();
+    packed[quad_param_slots::SE_D_BUS] = se_d_bus.to_array();
+    packed[quad_param_slots::ADAA_DRIVE] = adaa_drive.to_array();
+    packed[quad_param_slots::LRU_BIAS_DRIVE] = lru_bias_drive.to_array();
+    packed[quad_param_slots::LIN_MIX] = lin_mix.to_array();
+    packed[quad_param_slots::WAVEFOLDER_MIX] = wavefolder_mix.to_array();
+    packed[quad_param_slots::GLU_MIX] = glu_mix.to_array();
+    packed[quad_param_slots::OUT_GAIN] = out_gain.to_array();
 
-    let cpu_params = CoreQuadParamsStereo4 {
+    let cpu_params = CoreQuadV4ParamsStereo4 {
         svf,
         tone,
         lru,
         two_svf_g,
         svf_k_nl,
         rect_sign,
-        sag_depth,
+        g0,
+        g_inf,
+        d_pre,
+        se_w_sq,
+        se_d_bus,
         adaa_drive,
         lru_bias_drive,
+        lin_mix,
         wavefolder_mix,
         glu_mix,
+        out_gain,
     };
     (cpu_params, packed)
 }
 
 #[must_use]
-pub fn cpu_params_from_packed(packed: &[[f32; 4]]) -> CoreQuadParamsStereo4<GpuVec4> {
+pub fn cpu_params_from_packed(packed: &[[f32; 4]]) -> CoreQuadV4ParamsStereo4<GpuVec4> {
     let g = GpuVec4::from_array(packed[quad_param_slots::SVF_G]);
     let k = GpuVec4::from_array(packed[quad_param_slots::SVF_K]);
     let svf = TptSvfCoeffs4::from_gk(g, k);
-    let tone = SonaToneWeights4 {
-        lp: GpuVec4::from_array(packed[quad_param_slots::TONE_LP]),
-        bp: GpuVec4::from_array(packed[quad_param_slots::TONE_BP]),
-        hp: GpuVec4::from_array(packed[quad_param_slots::TONE_HP]),
-        ap: GpuVec4::from_array(packed[quad_param_slots::TONE_AP]),
-        dir: GpuVec4::from_array(packed[quad_param_slots::TONE_DIR]),
+    let tone = SonaToneFoldedBlock0 {
+        c_lp: GpuVec4::from_array(packed[quad_param_slots::TONE_C_LP]),
+        c_bp: GpuVec4::from_array(packed[quad_param_slots::TONE_C_BP]),
+        c_kbp: GpuVec4::from_array(packed[quad_param_slots::TONE_C_KBP]),
+        c_u: GpuVec4::from_array(packed[quad_param_slots::TONE_C_U]),
     };
     let lru = SonaParaLruDuhemCoeffs4::from_clamped(
         GpuVec4::from_array(packed[quad_param_slots::LRU_ALPHA_REL]),
@@ -439,18 +452,24 @@ pub fn cpu_params_from_packed(packed: &[[f32; 4]]) -> CoreQuadParamsStereo4<GpuV
         GpuVec4::from_array(packed[quad_param_slots::LRU_SIGNED_MIX]),
         GpuVec4::from_array(packed[quad_param_slots::LRU_STEREO_LINK]),
     );
-    CoreQuadParamsStereo4 {
+    CoreQuadV4ParamsStereo4 {
         svf,
         tone,
         lru,
         two_svf_g: g.add(g),
         svf_k_nl: GpuVec4::from_array(packed[quad_param_slots::SVF_K_NL]),
         rect_sign: GpuVec4::from_array(packed[quad_param_slots::RECT_SIGN]),
-        sag_depth: GpuVec4::from_array(packed[quad_param_slots::SAG_DEPTH]),
+        g0: GpuVec4::from_array(packed[quad_param_slots::G0]),
+        g_inf: GpuVec4::from_array(packed[quad_param_slots::G_INF]),
+        d_pre: GpuVec4::from_array(packed[quad_param_slots::D_PRE]),
+        se_w_sq: GpuVec4::from_array(packed[quad_param_slots::SE_W_SQ]),
+        se_d_bus: GpuVec4::from_array(packed[quad_param_slots::SE_D_BUS]),
         adaa_drive: GpuVec4::from_array(packed[quad_param_slots::ADAA_DRIVE]),
         lru_bias_drive: GpuVec4::from_array(packed[quad_param_slots::LRU_BIAS_DRIVE]),
+        lin_mix: GpuVec4::from_array(packed[quad_param_slots::LIN_MIX]),
         wavefolder_mix: GpuVec4::from_array(packed[quad_param_slots::WAVEFOLDER_MIX]),
         glu_mix: GpuVec4::from_array(packed[quad_param_slots::GLU_MIX]),
+        out_gain: GpuVec4::from_array(packed[quad_param_slots::OUT_GAIN]),
     }
 }
 

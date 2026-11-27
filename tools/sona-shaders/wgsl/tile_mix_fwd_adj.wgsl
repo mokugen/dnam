@@ -388,7 +388,7 @@ fn function_() {
                     } else {
                         let _e1904_ = (_e54_.x < 4u);
                         if _e1904_ {
-                            local_1_ = array<array<u32, 4>, 4>(array<u32, 4>(0u, 4u, 6u, 8u), array<u32, 4>(1u, 5u, 9u, 16u), array<u32, 4>(2u, 7u, 16u, 16u), array<u32, 4>(3u, 16u, 16u, 16u));
+                            local_1_ = array<array<u32, 4>, 4>(array<u32, 4>(0u, 4u, 8u, 16u), array<u32, 4>(1u, 5u, 9u, 16u), array<u32, 4>(2u, 6u, 16u, 16u), array<u32, 4>(3u, 7u, 16u, 16u));
                             let _e1905_ = (_e1901_ & 3u);
                             if (_e1905_ < 4u) {
                             } else {
@@ -889,7 +889,7 @@ fn function_() {
                         } else {
                             let _e1108_ = (_e54_.x < 4u);
                             if _e1108_ {
-                                local = array<array<u32, 4>, 4>(array<u32, 4>(0u, 4u, 6u, 8u), array<u32, 4>(1u, 5u, 9u, 16u), array<u32, 4>(2u, 7u, 16u, 16u), array<u32, 4>(3u, 16u, 16u, 16u));
+                                local = array<array<u32, 4>, 4>(array<u32, 4>(0u, 4u, 8u, 16u), array<u32, 4>(1u, 5u, 9u, 16u), array<u32, 4>(2u, 6u, 16u, 16u), array<u32, 4>(3u, 7u, 16u, 16u));
                                 let _e1109_ = (_e1105_ & 3u);
                                 if (_e1109_ < 4u) {
                                 } else {

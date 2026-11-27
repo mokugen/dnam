@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 //! Persistent `256`-frame forward scan kernel (`fused_core_scan_256_impl`) executing
-//! `TPT-SVF -> Selective-Duhem ParaLRU + Stereo Link -> Sag -> PolyADAA1 + C^2 Wavefolder -> GLU`
+//! `3-tap Folded SVF / Pred-Corr PHS -> Smooth ParaLRU + Stereo Link -> g_pre -> AlgADAA1(4096) + Wavefolder -> SE-Bus -> GLU -> out_gain`
 //! strictly inside `15,360 B` (`15.0 KiB`) workgroup SRAM across `2 × 128` sequential sub-tiles
 //! (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
 
@@ -14,17 +14,20 @@ use crate::abi::{
     TILE_FRAMES, resolve_quad_idx,
 };
 use crate::core_math::{
-    MIN_SAG_GAIN, QuadParamsUnpacked, clamp_nonneg_safe, div_ceil_divfree,
-    eval_paralru_duhem_affine_step, eval_tone_scalar, eval_tpt_svf_scalar, flush_zero, get_lane,
-    gpu_to_vec4, is_duhem_decoupled, linear_forward_exclusive_scan_128_pair, load_vec4,
-    scrub_endpoint, step_paralru_duhem_scalar, step_tpt_svf_phs_scalar, store_vec4, sub_sat_usize,
-    tpt_const_m_scan_128_pair, vec4_to_gpu, wg_barrier,
+    QuadParamsUnpacked, clamp_nonneg_safe, clamp_range_safe, div_ceil_divfree,
+    eval_paralru_duhem_affine_step, eval_tone_block0_scalar, eval_tpt_svf_folded3_scalar,
+    flush_zero, get_lane, gpu_to_vec4, is_duhem_decoupled, linear_forward_exclusive_scan_128_pair,
+    load_vec4, scrub_endpoint, step_paralru_duhem_scalar, store_vec4, sub_sat_usize,
+    tpt_const_m_scan_128_pair, tpt_exclusive_scan_128_pair, vec4_to_gpu, wg_barrier,
 };
 use dnam_kernels::{
-    GpuVec4, InterleavedStereo8, KernelVec4, LinearScanElem, StereoVec8,
-    apply_stereo_link_vec4_pair, eval_c2_wavefolder_adaa_vec4, eval_poly_adaa1_odd_even_vec4,
+    GpuVec4, InterleavedStereo8, KernelVec4, LinearScanElem, MAX_ADAA_DRIVE, MAX_GLU_MIX,
+    MAX_LRU_BIAS_DRIVE, MAX_OUT_GAIN, MIN_TPT_G, StereoVec8, TptScanElem, TptSvfCoeffs4,
+    apply_stereo_link_vec4_pair, eval_alg_adaa1_with_wavefolder_vec4, eval_bounded_glu_stereo8,
+    eval_g_pre_vec4, eval_phs_pred_corr_pass_b_coeffs, eval_se_bus_gain_vec4,
+    phs_pred_corr_pass_b_scan_elem, scrub_clamped_alg_endpoint_vec4,
 };
-use fixed_point::{lane_slot, run_duhem_damped_deer_subtile_lane, run_phs_passive_picard_subtile};
+use fixed_point::{lane_slot, run_duhem_damped_deer_subtile_lane};
 use spirv_std::glam::{UVec3, Vec4};
 
 const SUBTILE_FRAMES: usize = TILE_FRAMES / 2;
@@ -50,6 +53,16 @@ fn scrub_vec4_endpoints(v: Vec4) -> GpuVec4 {
 }
 
 #[inline(always)]
+fn clamp_vec4_range(v: Vec4, lo: f32, hi: f32) -> GpuVec4 {
+    GpuVec4::from_array([
+        clamp_range_safe(v.x, lo, hi),
+        clamp_range_safe(v.y, lo, hi),
+        clamp_range_safe(v.z, lo, hi),
+        clamp_range_safe(v.w, lo, hi),
+    ])
+}
+
+#[inline(always)]
 fn load_ckpt_to_aux(
     tile_checkpoints: &[Vec4],
     q_tier: usize,
@@ -66,6 +79,10 @@ fn load_ckpt_to_aux(
     let v_r = canonicalize_vec4_zero(load_vec4(tile_checkpoints, ckpt_base + 5)).to_array();
     let ap_l = scrub_vec4_endpoints(load_vec4(tile_checkpoints, ckpt_base + 6)).to_array();
     let ap_r = scrub_vec4_endpoints(load_vec4(tile_checkpoints, ckpt_base + 7)).to_array();
+    let s1_lin_l = canonicalize_vec4_zero(load_vec4(tile_checkpoints, ckpt_base + 8)).to_array();
+    let s1_lin_r = canonicalize_vec4_zero(load_vec4(tile_checkpoints, ckpt_base + 9)).to_array();
+    let s2_lin_l = canonicalize_vec4_zero(load_vec4(tile_checkpoints, ckpt_base + 10)).to_array();
+    let s2_lin_r = canonicalize_vec4_zero(load_vec4(tile_checkpoints, ckpt_base + 11)).to_array();
     for c in 0..4 {
         aux_scratch[c] = s1_l[c];
         aux_scratch[4 + c] = s2_l[c];
@@ -75,6 +92,10 @@ fn load_ckpt_to_aux(
         aux_scratch[20 + c] = v_r[c];
         aux_scratch[24 + c] = ap_l[c];
         aux_scratch[28 + c] = ap_r[c];
+        aux_scratch[32 + c] = s1_lin_l[c];
+        aux_scratch[36 + c] = s2_lin_l[c];
+        aux_scratch[40 + c] = s1_lin_r[c];
+        aux_scratch[44 + c] = s2_lin_r[c];
     }
 }
 
@@ -87,110 +108,26 @@ fn store_aux_to_ckpt(
     aux_scratch: &[f32; FORWARD_AUX_SCRATCH_FLOATS],
 ) {
     let ckpt_base = (q_tier * ckpt_tiles + tile) * TILE_CKPT_VEC4_STRIDE;
-    let s1_l = Vec4::new(
-        aux_scratch[0],
-        aux_scratch[1],
-        aux_scratch[2],
-        aux_scratch[3],
-    );
-    let s2_l = Vec4::new(
-        aux_scratch[4],
-        aux_scratch[5],
-        aux_scratch[6],
-        aux_scratch[7],
-    );
-    let s1_r = Vec4::new(
-        aux_scratch[8],
-        aux_scratch[9],
-        aux_scratch[10],
-        aux_scratch[11],
-    );
-    let s2_r = Vec4::new(
-        aux_scratch[12],
-        aux_scratch[13],
-        aux_scratch[14],
-        aux_scratch[15],
-    );
-    let v_l = Vec4::new(
-        aux_scratch[16],
-        aux_scratch[17],
-        aux_scratch[18],
-        aux_scratch[19],
-    );
-    let v_r = Vec4::new(
-        aux_scratch[20],
-        aux_scratch[21],
-        aux_scratch[22],
-        aux_scratch[23],
-    );
-    let ap_l = Vec4::new(
-        aux_scratch[24],
-        aux_scratch[25],
-        aux_scratch[26],
-        aux_scratch[27],
-    );
-    let ap_r = Vec4::new(
-        aux_scratch[28],
-        aux_scratch[29],
-        aux_scratch[30],
-        aux_scratch[31],
-    );
-    store_vec4(tile_checkpoints, ckpt_base, canonicalize_vec4_zero(s1_l));
-    store_vec4(
-        tile_checkpoints,
-        ckpt_base + 1,
-        canonicalize_vec4_zero(s1_r),
-    );
-    store_vec4(
-        tile_checkpoints,
-        ckpt_base + 2,
-        canonicalize_vec4_zero(s2_l),
-    );
-    store_vec4(
-        tile_checkpoints,
-        ckpt_base + 3,
-        canonicalize_vec4_zero(s2_r),
-    );
-    store_vec4(tile_checkpoints, ckpt_base + 4, canonicalize_vec4_zero(v_l));
-    store_vec4(tile_checkpoints, ckpt_base + 5, canonicalize_vec4_zero(v_r));
-    store_vec4(
-        tile_checkpoints,
-        ckpt_base + 6,
-        canonicalize_vec4_zero(ap_l),
-    );
-    store_vec4(
-        tile_checkpoints,
-        ckpt_base + 7,
-        canonicalize_vec4_zero(ap_r),
-    );
-}
-
-#[inline(always)]
-fn eval_lane_block_outputs(
-    r_prev_l: GpuVec4,
-    r_curr_l: GpuVec4,
-    r_prev_r: GpuVec4,
-    r_curr_r: GpuVec4,
-    wf_mix_g: GpuVec4,
-    glu_mix_g: GpuVec4,
-) -> (GpuVec4, GpuVec4, GpuVec4, GpuVec4) {
-    let (mut odd_l, even_l, _) = eval_poly_adaa1_odd_even_vec4(r_prev_l, r_curr_l);
-    let (mut odd_r, even_r, _) = eval_poly_adaa1_odd_even_vec4(r_prev_r, r_curr_r);
-
-    if !wf_mix_g.all_le(GpuVec4::zero()) {
-        let (wf_odd_l, _) = eval_c2_wavefolder_adaa_vec4(r_prev_l, r_curr_l);
-        let (wf_odd_r, _) = eval_c2_wavefolder_adaa_vec4(r_prev_r, r_curr_r);
-        let one_minus_wf = GpuVec4::splat(1.0).sub(wf_mix_g);
-        odd_l = odd_l.mul(one_minus_wf).fma(wf_mix_g, wf_odd_l);
-        odd_r = odd_r.mul(one_minus_wf).fma(wf_mix_g, wf_odd_r);
-    }
-
-    let odd_st = InterleavedStereo8::from_lr(odd_l, odd_r);
-    let even_st = InterleavedStereo8::from_lr(even_l, even_r);
-    let glu_term = odd_st.mul(odd_st.rotate_left_1());
-    let even_glu = even_st.fma(InterleavedStereo8::broadcast_half(glu_mix_g), glu_term);
-    let (even_l_out, even_r_out) = even_glu.into_lr();
-    (odd_l, odd_r, even_l_out, even_r_out)
+    let pack = |off: usize| {
+        canonicalize_vec4_zero(Vec4::new(
+            aux_scratch[off],
+            aux_scratch[off + 1],
+            aux_scratch[off + 2],
+            aux_scratch[off + 3],
+        ))
+    };
+    store_vec4(tile_checkpoints, ckpt_base, pack(0));
+    store_vec4(tile_checkpoints, ckpt_base + 1, pack(8));
+    store_vec4(tile_checkpoints, ckpt_base + 2, pack(4));
+    store_vec4(tile_checkpoints, ckpt_base + 3, pack(12));
+    store_vec4(tile_checkpoints, ckpt_base + 4, pack(16));
+    store_vec4(tile_checkpoints, ckpt_base + 5, pack(20));
+    store_vec4(tile_checkpoints, ckpt_base + 6, pack(24));
+    store_vec4(tile_checkpoints, ckpt_base + 7, pack(28));
+    store_vec4(tile_checkpoints, ckpt_base + 8, pack(32));
+    store_vec4(tile_checkpoints, ckpt_base + 9, pack(40));
+    store_vec4(tile_checkpoints, ckpt_base + 10, pack(36));
+    store_vec4(tile_checkpoints, ckpt_base + 11, pack(44));
 }
 
 /// Executes the persistent wave-mapped `2 × 128` sub-tile forward `CoreQuad` scan (`15,360 B` SRAM).
@@ -253,19 +190,28 @@ pub fn fused_core_scan_256_impl(
 
     let q_base = q_tier * QUAD_PARAMS_VEC4_STRIDE;
     let params = QuadParamsUnpacked::load(quad_params, q_base);
-    let wf_mix_g = GpuVec4::from_array([
-        clamp_nonneg_safe(params.wavefolder_mix.x, 1.0),
-        clamp_nonneg_safe(params.wavefolder_mix.y, 1.0),
-        clamp_nonneg_safe(params.wavefolder_mix.z, 1.0),
-        clamp_nonneg_safe(params.wavefolder_mix.w, 1.0),
-    ]);
     let stereo_link_g = GpuVec4::from_array([
         clamp_nonneg_safe(params.lru_stereo_link.x, 1.0),
         clamp_nonneg_safe(params.lru_stereo_link.y, 1.0),
         clamp_nonneg_safe(params.lru_stereo_link.z, 1.0),
         clamp_nonneg_safe(params.lru_stereo_link.w, 1.0),
     ]);
-    let glu_mix_g = vec4_to_gpu(params.glu_mix);
+    let g0_g = vec4_to_gpu(params.g0);
+    let g_inf_g = vec4_to_gpu(params.g_inf);
+    let d_pre_g = vec4_to_gpu(params.d_pre);
+    let se_w_sq_g = vec4_to_gpu(params.se_w_sq);
+    let se_d_bus_g = vec4_to_gpu(params.se_d_bus);
+    let adaa_drive_g = clamp_vec4_range(params.adaa_drive, -MAX_ADAA_DRIVE, MAX_ADAA_DRIVE);
+    let lru_bias_g = clamp_vec4_range(
+        params.lru_bias_drive,
+        -MAX_LRU_BIAS_DRIVE,
+        MAX_LRU_BIAS_DRIVE,
+    );
+    let lin_mix_g = clamp_vec4_range(params.lin_mix, 0.0, 1.0);
+    let wf_mix_g = clamp_vec4_range(params.wavefolder_mix, 0.0, 1.0);
+    let glu_mix_g = clamp_vec4_range(params.glu_mix, -MAX_GLU_MIX, MAX_GLU_MIX);
+    let out_gain_g = clamp_vec4_range(params.out_gain, -MAX_OUT_GAIN, MAX_OUT_GAIN);
+    let one_minus_lin_g = GpuVec4::splat(1.0).sub(lin_mix_g);
 
     let resuming_from_ckpt = num_windows <= 1 && tile_start > 0 && tile_start < ckpt_tiles;
     if lid == 0 {
@@ -278,7 +224,7 @@ pub fn fused_core_scan_256_impl(
                 aux_scratch,
             );
         } else {
-            for k in 0..32 {
+            for k in 0..48 {
                 aux_scratch[k] = 0.0;
             }
         }
@@ -308,74 +254,91 @@ pub fn fused_core_scan_256_impl(
                     (Vec4::ZERO, Vec4::ZERO)
                 };
 
-                // Stage 1: TPT-SVF across 4 lanes (`tone`, `bp` written to `lane_buf[0..2048]`).
-                if is_phs {
-                    if !use_fixed_point {
-                        if lid < SUBTILE_FRAMES {
-                            let u_l_vec = if active128 { in_l } else { Vec4::ZERO };
-                            let u_r_vec = if active128 { in_r } else { Vec4::ZERO };
-                            for c in 0..4 {
-                                scan_scratch[(c * 2) * SUBTILE_FRAMES + t128] =
-                                    flush_zero(get_lane(u_l_vec, c));
-                                scan_scratch[(c * 2 + 1) * SUBTILE_FRAMES + t128] =
-                                    flush_zero(get_lane(u_r_vec, c));
-                            }
+                // Stage 1: 3-tap folded TPT-SVF or 2-pass O(log2 128) Predictor-Corrector PHS.
+                for c in 0..4 {
+                    let lp = params.lane(c);
+                    let u_my = if active128 {
+                        flush_zero(get_lane(if is_r128 { in_r } else { in_l }, c))
+                    } else {
+                        0.0
+                    };
+                    let s1_idx = if is_r128 { 8 + c } else { c };
+                    let s2_idx = if is_r128 { 12 + c } else { 4 + c };
+
+                    if is_phs {
+                        let s1_lin_idx = if is_r128 { 40 + c } else { 32 + c };
+                        let s2_lin_idx = if is_r128 { 44 + c } else { 36 + c };
+                        let g_safe = if lp.svf_g > MIN_TPT_G {
+                            lp.svf_g
+                        } else {
+                            MIN_TPT_G
+                        };
+                        let k_safe = if lp.k > 0.0 { lp.k } else { 0.0 };
+                        let lin_c =
+                            TptSvfCoeffs4::from_gk(GpuVec4::splat(g_safe), GpuVec4::splat(k_safe));
+                        let lin_a1 = lin_c.a1.to_array()[0];
+                        let lin_a2 = lin_c.a2.to_array()[0];
+                        let lin_a3 = lin_c.a3.to_array()[0];
+                        let mut s1_lin_prev = 0.0_f32;
+                        let mut s2_lin_prev = 0.0_f32;
+                        let s_lin_end = tpt_const_m_scan_128_pair(
+                            scan_scratch,
+                            lid,
+                            sub_valid_len,
+                            lin_a1,
+                            lin_a2,
+                            lin_a3,
+                            u_my,
+                            active128,
+                            [aux_scratch[s1_lin_idx], aux_scratch[s2_lin_idx]],
+                            &mut s1_lin_prev,
+                            &mut s2_lin_prev,
+                        );
+                        let v1_lin = lin_a1 * s1_lin_prev + lin_a2 * (u_my - s2_lin_prev);
+                        let pass_b =
+                            eval_phs_pred_corr_pass_b_coeffs(v1_lin, lp.svf_g, lp.k, lp.svf_k_nl);
+                        let elem_b = if active128 {
+                            phs_pred_corr_pass_b_scan_elem(&pass_b, u_my)
+                        } else {
+                            TptScanElem::identity()
+                        };
+                        let mut s1_b_prev = 0.0_f32;
+                        let mut s2_b_prev = 0.0_f32;
+                        let s_b_end = tpt_exclusive_scan_128_pair(
+                            scan_scratch,
+                            lid,
+                            sub_valid_len,
+                            elem_b,
+                            [aux_scratch[s1_idx], aux_scratch[s2_idx]],
+                            &mut s1_b_prev,
+                            &mut s2_b_prev,
+                        );
+                        if active128 {
+                            let bp_s = pass_b.a1 * s1_b_prev + pass_b.a2 * (u_my - s2_b_prev);
+                            let lp_s =
+                                s2_b_prev + pass_b.a2 * s1_b_prev + pass_b.a3 * (u_my - s2_b_prev);
+                            let tone_s =
+                                eval_tone_block0_scalar(lp_s, bp_s, pass_b.k_eff, u_my, &lp);
+                            let tone_f = if is_r128 { 2 } else { 0 };
+                            lane_buf[lane_slot(c, tone_f, t128)] = tone_s;
+                            lane_buf[lane_slot(c, tone_f + 1, t128)] = bp_s;
                         }
-                        wg_barrier();
-                        if lid < 8 {
-                            let c = lid >> 1;
-                            let is_r = (lid & 1) != 0;
-                            let lp = params.lane(c);
-                            let s1_idx = if is_r { 8 + c } else { c };
-                            let s2_idx = if is_r { 12 + c } else { 4 + c };
-                            let mut s1 = aux_scratch[s1_idx];
-                            let mut s2 = aux_scratch[s2_idx];
-                            let u_base = (c * 2 + (lid & 1)) * SUBTILE_FRAMES;
-                            let tone_f = if is_r { 2 } else { 0 };
-                            for k in 0..sub_valid_len {
-                                let ti = k & 127;
-                                let u = scan_scratch[u_base + ti];
-                                let (lp_s, bp_s, hp_s, ap_s) =
-                                    step_tpt_svf_phs_scalar(u, &mut s1, &mut s2, &lp);
-                                lane_buf[lane_slot(c, tone_f, ti)] =
-                                    eval_tone_scalar(lp_s, bp_s, hp_s, ap_s, u, &lp);
-                                lane_buf[lane_slot(c, tone_f + 1, ti)] = bp_s;
-                            }
-                            aux_scratch[s1_idx] = flush_zero(s1);
-                            aux_scratch[s2_idx] = flush_zero(s2);
+                        if lid == 0 {
+                            aux_scratch[c] = flush_zero(s_b_end[0]);
+                            aux_scratch[4 + c] = flush_zero(s_b_end[1]);
+                            aux_scratch[32 + c] = flush_zero(s_lin_end[0]);
+                            aux_scratch[36 + c] = flush_zero(s_lin_end[1]);
+                        }
+                        if lid == SUBTILE_FRAMES {
+                            aux_scratch[8 + c] = flush_zero(s_b_end[0]);
+                            aux_scratch[12 + c] = flush_zero(s_b_end[1]);
+                            aux_scratch[40 + c] = flush_zero(s_lin_end[0]);
+                            aux_scratch[44 + c] = flush_zero(s_lin_end[1]);
                         }
                         wg_barrier();
                     } else {
-                        for c in 0..4 {
-                            let lp = params.lane(c);
-                            let u_my = if active128 {
-                                flush_zero(get_lane(if is_r128 { in_r } else { in_l }, c))
-                            } else {
-                                0.0
-                            };
-                            run_phs_passive_picard_subtile(
-                                lid,
-                                sub_valid_len,
-                                c,
-                                u_my,
-                                &lp,
-                                scan_scratch,
-                                lane_buf,
-                                aux_scratch,
-                            );
-                        }
-                    }
-                } else {
-                    for c in 0..4 {
-                        let lp = params.lane(c);
                         let svf_c = lp.to_svf_coeffs();
-                        let u_my = if active128 {
-                            flush_zero(get_lane(if is_r128 { in_r } else { in_l }, c))
-                        } else {
-                            0.0
-                        };
-                        let s1_idx = if is_r128 { 8 + c } else { c };
-                        let s2_idx = if is_r128 { 12 + c } else { 4 + c };
+                        let tone3 = lp.to_tone_folded3();
                         let mut s1_prev = 0.0_f32;
                         let mut s2_prev = 0.0_f32;
                         let s_end = tpt_const_m_scan_128_pair(
@@ -392,9 +355,8 @@ pub fn fused_core_scan_256_impl(
                             &mut s2_prev,
                         );
                         if active128 {
-                            let (lp_s, bp_s, hp_s, ap_s) =
-                                eval_tpt_svf_scalar(u_my, s1_prev, s2_prev, &svf_c);
-                            let tone_s = eval_tone_scalar(lp_s, bp_s, hp_s, ap_s, u_my, &lp);
+                            let (tone_s, bp_s) =
+                                eval_tpt_svf_folded3_scalar(u_my, s1_prev, s2_prev, &svf_c, &tone3);
                             let tone_f = if is_r128 { 2 } else { 0 };
                             lane_buf[lane_slot(c, tone_f, t128)] = tone_s;
                             lane_buf[lane_slot(c, tone_f + 1, t128)] = bp_s;
@@ -411,9 +373,7 @@ pub fn fused_core_scan_256_impl(
                     }
                 }
 
-                // Stage 2: Selective-Duhem ParaLRU storing `v_raw` in dead `bp` slots `lane_slot(c, 1/3, t)`:
-                // Pass 2A runs exact `O(log2 128)` parallel scan across `256` threads when `kappa*(1-eta)==0`;
-                // Pass 2B runs `8`-thread `L/R × 4-lane` split (or DEER) for coupled lanes.
+                // Stage 2: Smooth SONA v4.0 Selective-Duhem ParaLRU storing `v_raw` into `bp` slots.
                 for c in 0..4 {
                     let lp = params.lane(c);
                     if is_duhem_decoupled(&lp) {
@@ -487,11 +447,15 @@ pub fn fused_core_scan_256_impl(
                     }
                 }
 
-                // Stage 3: Stereo Link -> Sag -> r_curr (`scan_scratch[0..1024]`) -> PolyADAA1 + Wavefolder + GLU.
-                let mut my_veff_l = [0.0_f32; 4];
-                let mut my_veff_r = [0.0_f32; 4];
-                let mut my_r_l = [0.0_f32; 4];
-                let mut my_r_r = [0.0_f32; 4];
+                // Stage 3: Stereo Link -> g_pre -> AlgADAA1(4096) + Wavefolder -> SE-Bus -> GLU -> out_gain.
+                let mut my_veff_l = GpuVec4::zero();
+                let mut my_veff_r = GpuVec4::zero();
+                let mut my_tl = GpuVec4::zero();
+                let mut my_tr = GpuVec4::zero();
+                let mut my_g_pre_l = GpuVec4::zero();
+                let mut my_g_pre_r = GpuVec4::zero();
+                let mut my_r_l = GpuVec4::zero();
+                let mut my_r_r = GpuVec4::zero();
                 if lid < SUBTILE_FRAMES && active128 {
                     let mut tl_arr = [0.0_f32; 4];
                     let mut tr_arr = [0.0_f32; 4];
@@ -503,29 +467,34 @@ pub fn fused_core_scan_256_impl(
                         tr_arr[c] = lane_buf[lane_slot(c, 2, t128)];
                         vr_r[c] = lane_buf[lane_slot(c, 3, t128)];
                     }
+                    my_tl = GpuVec4::from_array(tl_arr);
+                    my_tr = GpuVec4::from_array(tr_arr);
                     let (eff_l_v, eff_r_v) = apply_stereo_link_vec4_pair(
                         GpuVec4::from_array(vr_l),
                         GpuVec4::from_array(vr_r),
                         stereo_link_g,
                     );
-                    let eff_l_arr = eff_l_v.to_array();
-                    let eff_r_arr = eff_r_v.to_array();
+                    my_veff_l = eff_l_v;
+                    my_veff_r = eff_r_v;
+                    my_g_pre_l = eval_g_pre_vec4(eff_l_v, g0_g, g_inf_g, d_pre_g);
+                    my_g_pre_r = eval_g_pre_vec4(eff_r_v, g0_g, g_inf_g, d_pre_g);
+                    my_r_l = scrub_clamped_alg_endpoint_vec4(
+                        my_g_pre_l
+                            .mul(adaa_drive_g)
+                            .mul(my_tl)
+                            .fma(lru_bias_g, eff_l_v),
+                    );
+                    my_r_r = scrub_clamped_alg_endpoint_vec4(
+                        my_g_pre_r
+                            .mul(adaa_drive_g)
+                            .mul(my_tr)
+                            .fma(lru_bias_g, eff_r_v),
+                    );
+                    let rl_arr = my_r_l.to_array();
+                    let rr_arr = my_r_r.to_array();
                     for c in 0..4 {
-                        let lp = params.lane(c);
-                        let tl = tl_arr[c];
-                        let tr = tr_arr[c];
-                        let vel = eff_l_arr[c];
-                        let ver = eff_r_arr[c];
-                        my_veff_l[c] = vel;
-                        my_veff_r[c] = ver;
-                        let sag_l = (1.0 - lp.sag_depth * vel).max(MIN_SAG_GAIN);
-                        let sag_r = (1.0 - lp.sag_depth * ver).max(MIN_SAG_GAIN);
-                        let rl = flush_zero((tl * lp.adaa_drive) * sag_l + lp.lru_bias_drive * vel);
-                        let rr = flush_zero((tr * lp.adaa_drive) * sag_r + lp.lru_bias_drive * ver);
-                        my_r_l[c] = rl;
-                        my_r_r[c] = rr;
-                        scan_scratch[c * SUBTILE_FRAMES + t128] = rl;
-                        scan_scratch[(4 + c) * SUBTILE_FRAMES + t128] = rr;
+                        scan_scratch[c * SUBTILE_FRAMES + t128] = rl_arr[c];
+                        scan_scratch[(4 + c) * SUBTILE_FRAMES + t128] = rr_arr[c];
                     }
                 }
                 wg_barrier();
@@ -545,49 +514,73 @@ pub fn fused_core_scan_256_impl(
                             rp_r[c] = scan_scratch[(4 + c) * SUBTILE_FRAMES + prev];
                         }
                     }
-                    let (odd_l, odd_r, even_l_out, even_r_out) = eval_lane_block_outputs(
+                    let (a_odd_wf_l, a_even_l, r_safe_l) = eval_alg_adaa1_with_wavefolder_vec4(
                         GpuVec4::from_array(rp_l),
-                        GpuVec4::from_array(my_r_l),
-                        GpuVec4::from_array(rp_r),
-                        GpuVec4::from_array(my_r_r),
+                        my_r_l,
                         wf_mix_g,
-                        glu_mix_g,
                     );
+                    let (a_odd_wf_r, a_even_r, r_safe_r) = eval_alg_adaa1_with_wavefolder_vec4(
+                        GpuVec4::from_array(rp_r),
+                        my_r_r,
+                        wf_mix_g,
+                    );
+                    let g_se_l = eval_se_bus_gain_vec4(my_veff_l, se_w_sq_g, se_d_bus_g);
+                    let g_se_r = eval_se_bus_gain_vec4(my_veff_r, se_w_sq_g, se_d_bus_g);
+                    let o_pre_l = one_minus_lin_g
+                        .mul(a_odd_wf_l)
+                        .fma(lin_mix_g, my_g_pre_l.mul(my_tl));
+                    let o_pre_r = one_minus_lin_g
+                        .mul(a_odd_wf_r)
+                        .fma(lin_mix_g, my_g_pre_r.mul(my_tr));
+                    let o_tilde_l = out_gain_g.mul(g_se_l).mul(o_pre_l).flush_recursive_state();
+                    let o_tilde_r = out_gain_g.mul(g_se_r).mul(o_pre_r).flush_recursive_state();
+                    let e_tilde = eval_bounded_glu_stereo8(
+                        InterleavedStereo8::from_lr(a_odd_wf_l, a_odd_wf_r),
+                        InterleavedStereo8::from_lr(a_even_l, a_even_r),
+                        InterleavedStereo8::from_lr(g_se_l, g_se_r),
+                        lin_mix_g,
+                        glu_mix_g,
+                        out_gain_g,
+                    );
+                    let (e_tilde_l, e_tilde_r) = e_tilde.into_lr();
+
                     let feat_base = (q_tier * num_frames + frame) * FEATURE_VEC4_STRIDE;
                     store_vec4(
                         feature_outputs,
                         feat_base,
-                        canonicalize_vec4_zero(Vec4::from(my_veff_l)),
+                        canonicalize_vec4_zero(gpu_to_vec4(my_veff_l)),
                     );
                     store_vec4(
                         feature_outputs,
                         feat_base + 1,
-                        canonicalize_vec4_zero(Vec4::from(my_veff_r)),
+                        canonicalize_vec4_zero(gpu_to_vec4(my_veff_r)),
                     );
                     store_vec4(
                         feature_outputs,
                         feat_base + 2,
-                        canonicalize_vec4_zero(gpu_to_vec4(odd_l)),
+                        canonicalize_vec4_zero(gpu_to_vec4(o_tilde_l)),
                     );
                     store_vec4(
                         feature_outputs,
                         feat_base + 3,
-                        canonicalize_vec4_zero(gpu_to_vec4(odd_r)),
+                        canonicalize_vec4_zero(gpu_to_vec4(o_tilde_r)),
                     );
                     store_vec4(
                         feature_outputs,
                         feat_base + 4,
-                        canonicalize_vec4_zero(gpu_to_vec4(even_l_out)),
+                        canonicalize_vec4_zero(gpu_to_vec4(e_tilde_l)),
                     );
                     store_vec4(
                         feature_outputs,
                         feat_base + 5,
-                        canonicalize_vec4_zero(gpu_to_vec4(even_r_out)),
+                        canonicalize_vec4_zero(gpu_to_vec4(e_tilde_r)),
                     );
                     if t128 + 1 == sub_valid_len {
+                        let safe_l = r_safe_l.to_array();
+                        let safe_r = r_safe_r.to_array();
                         for c in 0..4 {
-                            aux_scratch[24 + c] = scrub_endpoint(my_r_l[c]);
-                            aux_scratch[28 + c] = scrub_endpoint(my_r_r[c]);
+                            aux_scratch[24 + c] = safe_l[c];
+                            aux_scratch[28 + c] = safe_r[c];
                         }
                     }
                 }

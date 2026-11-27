@@ -8,8 +8,8 @@ use super::harness::{
     dispatch_adjoint_3pass, dispatch_kernel, read_vec4_vec,
 };
 use dnam_kernels::{
-    CoreQuadParamsStereo4, GpuVec4, InterleavedStereo8, KernelVec4, SOFT_RECT_EPS,
-    SonaBlockStateStereo8, StereoVec8, TINY_CROSSING_EPS, step_core_quad_stereo8,
+    CoreQuadV4ParamsStereo4, GpuVec4, InterleavedStereo8, KernelVec4, SOFT_RECT_EPS,
+    SonaBlockStateStereo8, StereoVec8, TINY_CROSSING_EPS, step_core_quad_v4_stereo8,
 };
 use sona_shaders::abi::{
     BLOCK_IDX_DIRECT_LINEAR, CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, FusedScanUniforms,
@@ -58,7 +58,7 @@ fn make_core_inputs(num_frames: usize, zero_mode: bool) -> Vec<[f32; 4]> {
 
 pub(super) fn eval_cpu_features_loss(
     core_inputs: &[[f32; 4]],
-    params_cpu: &[CoreQuadParamsStereo4<GpuVec4>],
+    params_cpu: &[CoreQuadV4ParamsStereo4<GpuVec4>],
     weights: &[[f32; 4]],
     q_global: usize,
     num_frames: usize,
@@ -71,10 +71,10 @@ pub(super) fn eval_cpu_features_loss(
             GpuVec4::from_array(core_inputs[in_base]),
             GpuVec4::from_array(core_inputs[in_base + 1]),
         );
-        let out = step_core_quad_stereo8(u, &mut state, &params_cpu[q_global]);
+        let out = step_core_quad_v4_stereo8(u, &mut state, &params_cpu[q_global]);
         let (vl, vr) = out.lru_state.into_lr();
-        let (ol, or) = out.adaa_odd.into_lr();
-        let (el, er) = out.adaa_even.into_lr();
+        let (ol, or) = out.o_tilde.into_lr();
+        let (el, er) = out.e_tilde.into_lr();
         let feats = [
             vl.to_array(),
             vr.to_array(),
@@ -155,16 +155,20 @@ pub fn verify_fused_core_scan_256_parity_and_zero_dc(ctx: &GpuContext, variant: 
                 cpu_ckpts.push(v_r.to_array());
                 cpu_ckpts.push(ap_l.to_array());
                 cpu_ckpts.push(ap_r.to_array());
+                cpu_ckpts.push([0.0; 4]);
+                cpu_ckpts.push([0.0; 4]);
+                cpu_ckpts.push([0.0; 4]);
+                cpu_ckpts.push([0.0; 4]);
             }
             let in_base = (q_global * NUM_FRAMES + t) * CORE_INPUT_VEC4_STRIDE;
             let u = InterleavedStereo8::from_lr(
                 GpuVec4::from_array(core_inputs[in_base]),
                 GpuVec4::from_array(core_inputs[in_base + 1]),
             );
-            let out = step_core_quad_stereo8(u, &mut state, &quad_params_cpu[q_global]);
+            let out = step_core_quad_v4_stereo8(u, &mut state, &quad_params_cpu[q_global]);
             let (vl, vr) = out.lru_state.into_lr();
-            let (ol, or) = out.adaa_odd.into_lr();
-            let (el, er) = out.adaa_even.into_lr();
+            let (ol, or) = out.o_tilde.into_lr();
+            let (el, er) = out.e_tilde.into_lr();
             for arr in [
                 vl.to_array(),
                 vr.to_array(),
@@ -220,8 +224,8 @@ pub fn verify_fused_core_scan_256_parity_and_zero_dc(ctx: &GpuContext, variant: 
     // Exact +0.0 Zero-DC invariance check across pure -0.0 zero inputs & negative weights.
     let neg_zero_inputs = vec![[-0.0_f32; 4]; core_inputs.len()];
     let mut neg_weight_params = quad_params_packed.clone();
-    neg_weight_params[quad_param_slots::TONE_LP] = [-0.8, -0.5, -0.4, -0.3];
-    neg_weight_params[quad_param_slots::TONE_BP] = [-0.4, -0.3, -0.2, -0.1];
+    neg_weight_params[quad_param_slots::TONE_C_LP] = [-0.8, -0.5, -0.4, -0.3];
+    neg_weight_params[quad_param_slots::TONE_C_BP] = [-0.4, -0.3, -0.2, -0.1];
     neg_weight_params[quad_param_slots::ADAA_DRIVE] = [-1.5, -1.2, -1.1, -1.3];
     neg_weight_params[quad_param_slots::LRU_BIAS_DRIVE] = [-0.6, -0.4, -0.5, -0.3];
     neg_weight_params[quad_param_slots::GLU_MIX] = [-0.7, -0.5, -0.8, -0.6];
@@ -301,7 +305,7 @@ fn cpu_params_with_raw_slot(
     slot: usize,
     lane: usize,
     val: f32,
-) -> CoreQuadParamsStereo4<GpuVec4> {
+) -> CoreQuadV4ParamsStereo4<GpuVec4> {
     let mut patched = packed.to_vec();
     patched[slot][lane] = val;
     let mut params = cpu_params_from_packed(&patched);
@@ -310,8 +314,6 @@ fn cpu_params_with_raw_slot(
         quad_param_slots::SVF_A1 => params.svf.a1 = override_vec,
         quad_param_slots::SVF_A2 => params.svf.a2 = override_vec,
         quad_param_slots::SVF_A3 => params.svf.a3 = override_vec,
-        quad_param_slots::SVF_TWO_K => params.svf.two_k = override_vec,
-        quad_param_slots::TWO_SVF_G => params.two_svf_g = override_vec,
         _ => {}
     }
     params
@@ -553,25 +555,28 @@ pub fn verify_adjoint_scan_256_fd_parity(ctx: &GpuContext, variant: ShaderVarian
         (quad_param_slots::SVF_A2, 1.0e-4),
         (quad_param_slots::SVF_A3, 1.0e-4),
         (quad_param_slots::SVF_K, 2.0e-3),
-        (quad_param_slots::SVF_TWO_K, 2.0e-3),
-        (quad_param_slots::TWO_SVF_G, 1.0e-4),
         (quad_param_slots::SVF_G, 1.0e-4),
-        (quad_param_slots::TONE_LP, 2.0e-3),
-        (quad_param_slots::TONE_BP, 2.0e-3),
-        (quad_param_slots::TONE_HP, 2.0e-3),
-        (quad_param_slots::TONE_AP, 2.0e-3),
-        (quad_param_slots::TONE_DIR, 2.0e-3),
-        (quad_param_slots::LRU_ALPHA_REL, 1.5e-3),
-        (quad_param_slots::LRU_ALPHA_ATK, 1.5e-3),
-        (quad_param_slots::LRU_KAPPA, 1.5e-3),
-        (quad_param_slots::LRU_GAMMA_DUHEM, 1.5e-3),
-        (quad_param_slots::LRU_SIGNED_MIX, 1.5e-3),
-        (quad_param_slots::LRU_STEREO_LINK, 1.5e-3),
-        (quad_param_slots::SAG_DEPTH, 2.0e-3),
-        (quad_param_slots::ADAA_DRIVE, 2.0e-3),
-        (quad_param_slots::LRU_BIAS_DRIVE, 2.0e-3),
+        (quad_param_slots::TONE_C_LP, 2.5e-4),
+        (quad_param_slots::TONE_C_BP, 2.5e-4),
+        (quad_param_slots::TONE_C_KBP, 2.5e-4),
+        (quad_param_slots::TONE_C_U, 2.5e-4),
+        (quad_param_slots::LRU_ALPHA_REL, 2.0e-4),
+        (quad_param_slots::LRU_ALPHA_ATK, 2.0e-4),
+        (quad_param_slots::LRU_KAPPA, 2.0e-4),
+        (quad_param_slots::LRU_GAMMA_DUHEM, 2.0e-4),
+        (quad_param_slots::LRU_SIGNED_MIX, 2.0e-4),
+        (quad_param_slots::LRU_STEREO_LINK, 5.0e-4),
+        (quad_param_slots::G0, 5.0e-4),
+        (quad_param_slots::G_INF, 5.0e-4),
+        (quad_param_slots::D_PRE, 5.0e-4),
+        (quad_param_slots::SE_W_SQ, 5.0e-4),
+        (quad_param_slots::SE_D_BUS, 5.0e-4),
+        (quad_param_slots::ADAA_DRIVE, 5.0e-4),
+        (quad_param_slots::LRU_BIAS_DRIVE, 5.0e-4),
+        (quad_param_slots::LIN_MIX, 1.0e-4),
         (quad_param_slots::WAVEFOLDER_MIX, 1.0e-4),
-        (quad_param_slots::GLU_MIX, 2.0e-3),
+        (quad_param_slots::GLU_MIX, 5.0e-4),
+        (quad_param_slots::OUT_GAIN, 5.0e-4),
     ];
 
     for q_global in [0_usize, 3] {
@@ -590,7 +595,9 @@ pub fn verify_adjoint_scan_256_fd_parity(ctx: &GpuContext, variant: ShaderVarian
                 }
 
                 let base_val = cpu_packed_base[slot][lane];
-                let (val_plus, val_minus) = if slot == quad_param_slots::WAVEFOLDER_MIX && lane == 0
+                let (val_plus, val_minus) = if (slot == quad_param_slots::WAVEFOLDER_MIX
+                    || slot == quad_param_slots::LIN_MIX)
+                    && lane == 0
                 {
                     (base_val + eps, base_val)
                 } else if slot == quad_param_slots::WAVEFOLDER_MIX && lane == 3 {

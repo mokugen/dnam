@@ -13,8 +13,9 @@ use core::f32::consts::FRAC_1_SQRT_2;
 use core::mem::size_of;
 use dnam_kernels::{
     GpuVec4, KernelVec4, MIN_SAG_GAIN, SonaParaLruDuhemCoeffs4, TptScanElem, TptSvfCoeffs4,
-    apply_stereo_link_vec4_pair, apply_tpt_init, compose_tpt_scan, eval_poly_adaa1_odd_even_vec4,
-    prewarp_tan_pi_f_over_fs_f32, step_paralru_duhem_vec4, step_tpt_svf_vec4,
+    apply_stereo_link_vec4_pair, apply_tpt_init, compose_tpt_scan, eval_alg_adaa1_vec4,
+    prewarp_tan_pi_f_over_fs_f32, scrub_clamped_alg_endpoint_f32, step_paralru_duhem_v4_vec4,
+    step_tpt_svf_vec4,
 };
 use spirv_std::glam::{UVec3, Vec2};
 
@@ -237,8 +238,8 @@ fn step_paralru_tile_on_thread0(
         let flux_l = GpuVec4::splat(coeffs.two_svf_g * bp_l);
         let flux_r = GpuVec4::splat(coeffs.two_svf_g * bp_r);
 
-        let v_raw_l = step_paralru_duhem_vec4(u_rect_l, flux_l, &mut v_l, &coeffs.lru);
-        let v_raw_r = step_paralru_duhem_vec4(u_rect_r, flux_r, &mut v_r, &coeffs.lru);
+        let v_raw_l = step_paralru_duhem_v4_vec4(u_rect_l, flux_l, &mut v_l, &coeffs.lru);
+        let v_raw_r = step_paralru_duhem_v4_vec4(u_rect_r, flux_r, &mut v_r, &coeffs.lru);
         let (v_eff_l, v_eff_r) =
             apply_stereo_link_vec4_pair(v_raw_l, v_raw_r, coeffs.lru.stereo_link);
 
@@ -326,12 +327,16 @@ pub fn prescreen_population_impl(
         let sag_l = (1.0 - coeffs.sag_depth * ve_l).max(MIN_SAG_GAIN);
         let sag_r = (1.0 - coeffs.sag_depth * ve_r).max(MIN_SAG_GAIN);
         let r_curr_l = if active {
-            flush_zero(tone_l * coeffs.adaa_drive * sag_l + coeffs.lru_bias_drive * ve_l)
+            scrub_clamped_alg_endpoint_f32(
+                tone_l * coeffs.adaa_drive * sag_l + coeffs.lru_bias_drive * ve_l,
+            )
         } else {
             0.0
         };
         let r_curr_r = if active {
-            flush_zero(tone_r * coeffs.adaa_drive * sag_r + coeffs.lru_bias_drive * ve_r)
+            scrub_clamped_alg_endpoint_f32(
+                tone_r * coeffs.adaa_drive * sag_r + coeffs.lru_bias_drive * ve_r,
+            )
         } else {
             0.0
         };
@@ -353,9 +358,9 @@ pub fn prescreen_population_impl(
         };
 
         let (odd_l, _even_l, _) =
-            eval_poly_adaa1_odd_even_vec4(GpuVec4::splat(r_prev_l), GpuVec4::splat(r_curr_l));
+            eval_alg_adaa1_vec4(GpuVec4::splat(r_prev_l), GpuVec4::splat(r_curr_l));
         let (odd_r, _even_r, _) =
-            eval_poly_adaa1_odd_even_vec4(GpuVec4::splat(r_prev_r), GpuVec4::splat(r_curr_r));
+            eval_alg_adaa1_vec4(GpuVec4::splat(r_prev_r), GpuVec4::splat(r_curr_r));
 
         if active {
             pred_l += odd_l.to_array()[0];
