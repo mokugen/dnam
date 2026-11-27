@@ -2,26 +2,34 @@
 id: spec.arch.quality
 title: "Psychoacoustic Quality Standard (bESR) & 4-Tier Benchmarks"
 status: canonical
-version: "3.0.0"
+version: "4.0.0"
 domain: architecture
 rule_prefixes:
   - "r[qual."
 requirements:
+  - REQ-1.9
   - REQ-2.1
   - REQ-2.2
   - REQ-2.3
+  - REQ-5.1
   - REQ-5.2
+  - REQ-5.3
+  - REQ-5.4
+  - REQ-5.5
+  - REQ-5.6
+  - REQ-6.1
 adrs:
   - ADR-0003
   - ADR-0016
   - ADR-0022
+  - ADR-0024
 ---
 
 # Psychoacoustic Quality Standard (bESR) & 4-Tier Benchmarks
 
-This specification defines the perceptual quality evaluation framework (bESR, MR-IIR, LTAS spectral tilt, and SegESR), device-agnostic noise-floor rules, quiet versus muted stem classification, and 4-tier (Lite, Full, Pro, and Ultra) acceptance benchmarks for **Dynamic Neural Audio Modeler (DNAM)**.
+This specification defines the perceptual quality evaluation framework (bESR, MR-IIR, LTAS spectral tilt, and SegESR), device-agnostic noise-floor rules, quiet versus muted stem classification, and SONA v4.0 4-tier (Lite, Full, Pro, and Ultra) acceptance benchmarks with unified all-tier 2× 15-tap linear-phase HB-FIR oversampling (`OS2X`) for **Dynamic Neural Audio Modeler (DNAM)**.
 
-For overarching system goals and hardware budgets, see the [system goals and requirements](../../requirements/system_goals_and_requirements.md). For why plain broadband ESR and fixed pre-emphasis fail, see [ADR-0003](../../adr/0003-band-balanced-besr-and-noise-qualification.md); for SONA tier sizing and optimization budgets, see [sona_architecture.md §2.2](sona_architecture.md#22-hardware--dsp-benchmark-summary) and [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md). Fitting statistics and certification are specified in [webgpu_and_varpro_solver.md](../training/webgpu_and_varpro_solver.md) (`ref[train.pipeline.nested-varpro-schur]`).
+For overarching system goals and hardware budgets, see the [system goals and requirements](../../requirements/system_goals_and_requirements.md). For why plain broadband ESR and fixed pre-emphasis fail, see [ADR-0003](../../adr/0003-band-balanced-besr-and-noise-qualification.md); for SONA v4.0 tier sizing, all-tier 2× oversampling, and optimization budgets, see [sona_architecture.md §2.2](sona_architecture.md#22-hardware--dsp-benchmark-summary), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), and [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md). Fitting statistics and certification are specified in [webgpu_and_varpro_solver.md](../training/webgpu_and_varpro_solver.md) (`ref[train.pipeline.nested-varpro-schur]`).
 
 ---
 
@@ -260,14 +268,18 @@ The per-frame ratio $r_{f,c}$ averages across the remaining excited bands $N_{f,
 
 Each compile-time fixed-capacity tier (Lite, Full, Pro, and Ultra; hardware dimensions in [sona_architecture.md §2.1](sona_architecture.md#21-lower-block-triangular-arena-hierarchy)) and output channel is evaluated identically under one universal, label-free repeatability contract across captured and held-out controls.
 
+Under SONA v4.0, all four tiers execute natively at 2× core oversampling via the 15-tap symmetric linear-phase HB-FIR oversampler (7 1×-sample or 0.146 ms pure integer delay at 48 kHz with 0.000° phase dispersion). Eliminating the legacy 1× versus 2× rate split restores exact `CoreQuad[0..4]` prefix sharing across the rebalanced Matryoshka pyramid (`REQ-5.1`–`REQ-5.6`), click-free tier transitions (`REQ-5.4`), and -48.31 dB 4×-bounce parity (`REQ-5.5`), while keeping Lite 2× active-hot L1D at 4,432 B (14× = 62,048 B = 60.59 KiB ≤ 64 KiB Cortex-A76 L1D, zero cold spills, `REQ-6.1`).
+
+Universal qualification spans an 18-archetype black-box matrix covering pure LTI cabinet and room acoustics, asymmetric gated fuzz, parallel clean-blend drives, multi-stage tube preamps with 5-D rational tone stacks and supply sag, envelope-controlled resonant filters, polyrhythmic dual-LFO chorus and rotary modulation, BBD shimmer and FDN freeze, optical and multi-band VCA compressors, octave dividers and doublers, bi-amp crossovers with Duhem hysteresis, stereo full rigs, dual-grain pitch shifters, 3-phase barberpole flangers, and ZOH bitcrushers—evaluated with zero pretraining and zero archetype carve-outs (`REQ-1.9`, `REQ-2.2`).
+
 In addition to the absolute floors below, adjacent retained tiers must satisfy universal monotone per-output non-regression: on identical aligned inputs, targets, controls, and initial state, a higher tier's raw composite and per-band bESR, MR-IIR, maximum absolute noise-adjusted LTAS, excluded-band LTAS residuals, and SegESR must be no worse than the lower tier's.
 
-| DNAM Tier | Target Grade | Noise-Qualified Composite Acceptance | Per-Band Requirement (LF / MF / HF or ≤ NoiseFloor + 1.0 dB) | Max Absolute Noise-Adjusted LTAS (dB) | Multi-Control Unseen Acceptance | Primary Application |
+| DNAM Tier | SONA v4.0 Core Geometry & Rate | Noise-Qualified Composite Acceptance | Per-Band Requirement (LF / MF / HF or ≤ NoiseFloor + 1.0 dB) | Max Absolute Noise-Adjusted LTAS (dB) | Multi-Control Unseen Acceptance | Primary Application |
 | :--- | :--- | :---: | :--- | :---: | :---: | :--- |
-| **Lite** | **Mix-Ready / Live Grade** | **≤ -18 dB** | LF ≤ -23 dB, MF ≤ -20 dB, HF ≤ -15 dB | **≤ 0.75 dB** | **≤ -16 dB** | High-density live pedalboard chains & browser previews |
-| **Full** | **True Studio Quality** | **≤ -23 dB** | LF ≤ -27 dB, MF ≤ -25 dB, HF ≤ -20 dB | **≤ 0.35 dB** | **≤ -21 dB** | Default studio & stage flagship block |
-| **Pro** | **Mastering / Reference Grade** | **≤ -30 dB** | LF ≤ -34 dB, MF ≤ -31 dB, HF ≤ -26 dB | **≤ 0.15 dB** | **≤ -27 dB** | Mastering & critical solo reference rigs |
-| **Ultra** | **Unconstrained Workstation Max** | **≤ -34 dB** | LF ≤ -38 dB, MF ≤ -35 dB, HF ≤ -30 dB | **≤ 0.10 dB** | **≤ -32 dB** | Archival workstation & 4× 64-tap full-band (43-sample PDC) bounce |
+| **Lite** | `[1,1,1,1]`, 4 quads / 16 lanes / 5 tiles, 2× HB-FIR (4,432 B hot L1D) | **≤ -18 dB** | LF ≤ -23 dB, MF ≤ -20 dB, HF ≤ -15 dB | **≤ 0.75 dB** | **≤ -16 dB** | High-density live pedalboard chains (14× ≤ 64 KiB L1D) & browser previews |
+| **Full** | `[2,2,1,1]`, 6 quads / 24 lanes / 13 tiles, 2× HB-FIR | **≤ -23 dB** | LF ≤ -27 dB, MF ≤ -25 dB, HF ≤ -20 dB | **≤ 0.35 dB** | **≤ -21 dB** | Default studio & stage flagship block (8× ≤ 64 KiB L1D) |
+| **Pro** | `[2,2,2,2]`, 8 quads / 32 lanes / 24 tiles, 2× HB-FIR | **≤ -30 dB** | LF ≤ -34 dB, MF ≤ -31 dB, HF ≤ -26 dB | **≤ 0.15 dB** | **≤ -27 dB** | Mastering & critical solo reference rigs (4× ≤ 64 KiB L1D) |
+| **Ultra** | `[3,3,2,2]`, 10 quads / 40 lanes / 37 tiles (`MAX_OUTGOING_PER_QUAD = 7`), 2× HB-FIR | **≤ -34 dB** | LF ≤ -38 dB, MF ≤ -35 dB, HF ≤ -30 dB | **≤ 0.10 dB** | **≤ -32 dB** | Archival workstation (2× ≤ 64 KiB L1D) & 4× 64-tap full-band (43-sample PDC) bounce |
 
 ### 4.1 Qualification Floors Are Not Solver Stopping Criteria
 

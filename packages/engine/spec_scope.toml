@@ -430,6 +430,14 @@ reason = "Offline Steiglitz-McBride / Warped Kautz pole-extraction solver owned 
 scope = "out-of-scope"
 reason = "Owned and verified by packages/vm (Op-M pole control slew)"
 
+[rules."dsp.op-m.tracker.t1-plus"]
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels and packages/vm (Op-P v4 T1+ and native 2x H1)"
+
+[rules."dsp.op-m.kautz.er-sparse-bank"]
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ModalConvolver v4 ErSparseBank, per-bank onset/cross-feed, and Kaiser polyphase high-SR FIR)"
+
 # ==============================================================================
 # 7. DSP: Op-N ParaLRU & PolyADAA (`docs/specs/dsp/op_n_paralru_and_polyadaa.md`)
 # ==============================================================================
@@ -615,6 +623,14 @@ reason = "Owned and verified by packages/vm (dynamic ducking VCA)"
 [rules."dsp.op-t.zero-fdiv"]
 scope = "engine"
 
+[rules."dsp.op-t.routing.per-quad-and-series"]
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (Op-T v4 per-quad modulation routing, per-tap attention, and causal series coupling)"
+
+[rules."dsp.op-t.loop.convex-shimmer-freeze"]
+scope = "out-of-scope"
+reason = "Owned and verified by packages/kernels and packages/vm (Op-T v4 passive convex M_fb, bipolar g_loop, quadrature AM, shimmer, and unitary freeze)"
+
 # ==============================================================================
 # 9. DSP: Parametric Control Bus (`docs/specs/dsp/parametric_control_bus.md`)
 # ==============================================================================
@@ -728,6 +744,14 @@ reason = "Owned and verified by packages/vm (TempoSync coprime delay inversion)"
 [rules."dsp.tempo.transport-jump"]
 scope = "out-of-scope"
 reason = "Owned and verified by packages/vm (TempoSync transport jump)"
+
+[rules."dsp.ctrl.gra.rational-and-entmax"]
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm (ControlBus v4 GRA SwiGLU, Pade-[1/1], and anchored 1.5-Entmax prototypes)"
+
+[rules."dsp.ctrl.gra.bibo-convex-hull"]
+scope = "out-of-scope"
+reason = "Owned and verified by packages/vm and packages/capture (ControlBus v4 GRA bilinear gate and O(P+M) convex-hull BIBO audit)"
 
 # ==============================================================================
 # 10. DSP: Router & Crossbar Topology (`docs/specs/dsp/router_and_crossbar_topology.md`)

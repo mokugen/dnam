@@ -789,7 +789,14 @@ describe("DNAM Documentation Registry, Rules, ADRs & Traceability Guardrails", (
   });
 
   it("test_spec_rules_verified_in_tests", () => {
-    const specFirstPendingVerifyRules: ReadonlySet<string> = new Set();
+    const specFirstPendingVerifyRules: ReadonlySet<string> = new Set([
+      "dsp.op-m.tracker.t1-plus",
+      "dsp.op-m.kautz.er-sparse-bank",
+      "dsp.op-t.routing.per-quad-and-series",
+      "dsp.op-t.loop.convex-shimmer-freeze",
+      "dsp.ctrl.gra.rational-and-entmax",
+      "dsp.ctrl.gra.bibo-convex-hull",
+    ]);
     const rules = collectSpecRules();
     const verifiedIds = new Set(collectTestVerifyTokens().map(([ruleId]) => ruleId));
     for (const pendingId of specFirstPendingVerifyRules) {

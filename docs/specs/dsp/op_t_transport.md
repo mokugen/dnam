@@ -2,7 +2,7 @@
 id: spec.dsp.op-t
 title: "Op-T: Universal Transport, Granular Windowing & All-Pass Diffusion Operator"
 status: canonical
-version: "3.0.0"
+version: "4.0.0"
 domain: dsp
 rule_prefixes:
   - "r[dsp.op-t."
@@ -13,13 +13,16 @@ adrs:
   - ADR-0006
   - ADR-0019
   - ADR-0022
+  - ADR-0024
 ---
 
 # Op-T: Universal Transport, Granular Windowing & All-Pass Diffusion Operator
 
-This specification defines Op-T (Transport), governing causal top-of-frame fractional delay reads (with $\tau_{\min} = 5.0$ samples across 4-frame crossbar/`TransportQuad` micro-chunks and $\tau[n] \ge 4.0$ on standalone single-sample rings), pitch-warped granular windows, barberpole phase sweeps, bounded-history coercive feedback loops, continuous passive `freeze_mix` + host `WE` RAM write lock, and fused `SO(4)` paraunitary Schroeder all-pass diffusion across Dynamic Neural Audio Modeler (DNAM) SONA v3.0 ([sona_architecture.md](../architecture/sona_architecture.md), [REQ-1.4, REQ-6.2](../../requirements/system_goals_and_requirements.md)).
+This specification defines Op-T (Transport), governing causal top-of-frame fractional delay reads (tau_min = 5.0 samples across 4-frame crossbar/TransportQuad micro-chunks and tau[n] >= 4.0 on standalone single-sample rings) along with pitch-warped granular windows and wired 3-phase B-spline barberpole phase sweeps across Dynamic Neural Audio Modeler (DNAM) SONA v4.0.
 
-Every SONA Op-T read executes inside a single unified continuous 4-lane Top-of-Frame Causal Operator Crossbar pipeline before the 4-block Matryoshka core, while coercive loop writes update delay rings at frame end. This unified placement expresses pre-drive chorus, rotary modulation, and reverb-into-fuzz chains alongside post-core tape/BBD echoes, granular pitch shifters, barberpole sweeps, and shimmer holds strictly via learned weights ([ADR-0006](../../adr/0006-model-declared-delays-and-tank-feedback-guard.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)).
+Op-T additionally specifies bounded-history coercive feedback loops with passive convex `M_fb`, bipolar `g_loop`, causal series coupling `M_series`, per-quad `ControlBus` routing, shimmer, unitary freeze, and fused `SO(4)` paraunitary Schroeder diffusion ([sona_architecture.md](../architecture/sona_architecture.md), [REQ-1.4, REQ-6.2](../../requirements/system_goals_and_requirements.md)).
+
+Every SONA Op-T read executes inside a single unified continuous 4-lane Top-of-Frame Causal Operator Crossbar pipeline before the 4-block Matryoshka core, while coercive loop writes update delay rings at frame end. This unified placement expresses pre-drive chorus, polyrhythmic rotary modulation with quadrature AM, and reverb-into-fuzz chains alongside post-core tape/BBD echoes, granular pitch shifters, barberpole sweeps, and shimmer/unitary holds strictly via learned weights ([ADR-0006](../../adr/0006-model-declared-delays-and-tank-feedback-guard.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md)).
 
 ---
 
@@ -45,24 +48,24 @@ Op-T separates standalone arbitrary-length delay lines with block max-tree feedb
 +---------------------------------------------------------------------------------------------------+
 ```
 
-In compact `TransportQuad`s, Quad 0 places short lines (such as primes `[53, 67, 79, 89]`) inline inside the 64-byte-aligned hot working set as 128 frame-major `fp16` vectors (1,024 B = 16 cache lines), requiring zero heap allocations when `max_delay <= 120` and `max_delay + ceil(lfo_depth) + 6 <= 128`.
+In compact `TransportQuad`s, Quad 0 places short lines (such as primes `[53]` and up to 56 samples) inline inside the 64-byte-aligned hot working set as 64 frame-major `fp16` vectors (512 B = 8 cache lines, fitting Lite 2× inside 4,432 B active-hot L1D), requiring zero heap allocations when `max_delay <= 56` and `req_frames[0] <= 64`.
 
-Longer lines (up to 48,000 reference samples at 48 kHz and 524,288 power-of-two capacity covering 8× rate headroom up to 384 kHz) allocate power-of-two cold external delay buffers during load and wrap via bitmask `& (cap - 1)` with zero division.
+Longer lines (up to 48,000 reference samples at 48 kHz and 524,288 power-of-two capacity covering 8× rate headroom up to 384 kHz) allocate power-of-two cold external delay buffers during load (`cap >= 128`) and wrap via bitmask `& (cap - 1)` with zero division.
 
 | Tier Profile | Quads | Delay Lines (M) | Inline Quad 0 (Hot Working Set) | Cold External Buffer Format |
 | :--- | :---: | :---: | :--- | :--- |
-| Lite | 1 | 4 | 128 frames `fp16` (1,024 B) | Optional `"fp16"` (2 B) power-of-two |
-| Full | 2 | 8 | 128 frames `fp16` (1,024 B) | Optional `"fp16"` (2 B) power-of-two |
-| Pro | 3 | 12 | 128 frames `fp16` (1,024 B) | Optional `"fp16"` or `"f32"` (2 B or 4 B) |
-| Ultra | 4 | 16 | 128 frames `fp16` (1,024 B) | Optional `"fp16"` or `"f32"` (2 B or 4 B) |
+| Lite | 1 | 4 | 64 frames `fp16` (512 B = 8 CL) | Optional `"fp16"` (2 B) power-of-two (`>= 128`) |
+| Full | 2 | 8 | 64 frames `fp16` (512 B = 8 CL) | Optional `"fp16"` (2 B) power-of-two (`>= 128`) |
+| Pro | 3 | 12 | 64 frames `fp16` (512 B = 8 CL) | Optional `"fp16"` or `"f32"` (2 B or 4 B) |
+| Ultra | 4 | 16 | 64 frames `fp16` (512 B = 8 CL) | Optional `"fp16"` or `"f32"` (2 B or 4 B) |
 
-Each `TransportQuad` is serialized in the tier arena as a 128-byte little-endian descriptor (bytes 0..128) encoding 32-bit float delays and ramp spans (preventing `fp16` overflow at high rates), loop/damping poles, half-precision modulation gains, continuous `freeze_mix_fp16`, 48 kHz Schroeder delays, and mode-free flags:
+Each `TransportQuad` is serialized in the tier arena as a 128-byte little-endian descriptor (bytes 0..128) encoding 32-bit float delays and ramp spans, bipolar loop feedback, damping poles, half-precision modulation gains, `freeze_mix_fp16`, 48 kHz Schroeder delays, and mode-free flags. Op-T v4 per-quad extensions supply `M_fb` mixing (alpha, beta), lfo_rate_ratio_fp16[4], am_depth, eta_even, alpha_sum_fb, freeze_ortho_mix, and lower-triangular `M_series` ([dnam_binary_format.md](../containers/dnam_binary_format.md)):
 
 | Wire Offset | Bytes | LE Type | Field Name | Clean-Room Role & Cold-Load Constraint |
 | :---: | :---: | :--- | :--- | :--- |
 | 0..16 | 16 | `f32le[4]` | `delay_samples[4]` | 48 kHz base per-lane delays (`[5.0, 48,000.0]` on crossbar/`TransportQuad`s) |
-| 16..32 | 16 | `f32le[4]` | `ramp_spans_samples[4]` | 48 kHz base ramp spans per lane (`f32` avoids `fp16` overflow at 384 kHz) |
-| 32..56 | 24 | 6 × `f32le` | `g_loop`, `r_dc`, `damp_pole`, `lfo_rate_hz`, `ramp_rate_hz`, `reserved_52_56` | Loop feedback, 5 Hz DC pole, HF damp pole, LFO/ramp rates, and reserved 0.0 at 52..56 |
+| 16..32 | 16 | `f32le[4]` | `ramp_spans_samples[4]` | 48 kHz base ramp spans per lane (`f32` avoids `fp16` overflow at 384 kHz; modulatable via `ControlBus`) |
+| 32..56 | 24 | 6 × `f32le` | `g_loop`, `r_dc`, `damp_pole`, `lfo_rate_hz`, `ramp_rate_hz`, `reserved_52_56` | Bipolar loop feedback in `[-0.9990, +0.9990]`, 5 Hz DC pole, HF damp pole, LFO rate `[0, 16]` Hz, ramp rate `[-64.0, +64.0]` Hz, and reserved 0.0 at 52..56 |
 | 56..112 | 56 | 7 × `u16le[4]` | `lfo_depths_fp16[4]`, `lfo_phase_off_q16[4]`, `ramp_phase_off_q16[4]`, `input_gains_fp16[4]`, `wet_tap_l_fp16[4]`, `wet_tap_r_fp16[4]`, `allpass_g_fp16[4]` | Per-lane LFO depths/offsets, ramp phase offsets, injection gains, L/R wet tap gains, and Schroeder `allpass_g` in `[-0.75, 0.75]` |
 | 112..122 | 10 | 5 × `u16le` | `fb_psi_fp16`, `sigma_knee_fp16`, `freeze_mix_fp16`, `window_depth_fp16`, `scat_psi_fp16` | Givens rotation, unified loop limiter ceiling, passive `freeze_mix`, window depth, and `SO(4)` paraunitary scattering angle `[-pi, +pi]` (default 0.0) |
 | 122..126 | 4 | `u8[4]` | `allpass_delays[4]` | 48 kHz base Schroeder lengths <= 255; expanded into rate-scaled integer host buffers on load up to 16,384 samples at 384 kHz |
@@ -86,22 +89,22 @@ At rate ratio $\rho_{\mathrm{vm}} = 48{,}000 / f_{s,\mathrm{vm}}$ (`scale = 1.0 
 req_frames[q] = ceil(max_k((wire_delay_48k[q][k] + 0.5 * abs(wire_ramp_span_48k[q][k]) + wire_lfo_depth_48k[q][k]) * scale)) + 6
 dbrm_pow2_cap = (ext_ring_pow2_frames >= 7) ? (1 << ext_ring_pow2_frames) : 0
 decl_scaled   = ceil(f64(declared_max_delay_48k) * scale) + 8
-has_ext[q]    = (q > 0) || ((quad_wire_flags[0] & 0x02) != 0) || (max_k(wire_delay_48k[0][k] * scale) > 120.0) || (req_frames[0] > 128) || (ext_ring_pow2_frames >= 8)
-cap[q]        = !has_ext[q] ? 128 : clamp(next_pow2(max(128, req_frames[q], decl_scaled, dbrm_pow2_cap)), 128, 524_288)
+has_ext[q]    = (q > 0) || ((quad_wire_flags[0] & 0x02) != 0) || (max_k(wire_delay_48k[0][k] * scale) > 56.0) || (req_frames[0] > 64) || (ext_ring_pow2_frames >= 7)
+cap[q]        = !has_ext[q] ? 64 : clamp(next_pow2(max(128, req_frames[q], decl_scaled, dbrm_pow2_cap)), 128, 524_288)
 ```
 
-When `!has_ext[0]`, Quad 0 uses the 128-frame inline `fp16` hot ring (0 B cold storage). Whenever `has_ext[q]` is true (always for expansion quads `q >= 1` on Full..Ultra, or when Quad 0 exceeds inline limits or selects `ext_f32`), cold load provisions `cap[q]` power-of-two frames in element format `(quad_wire_flags[q] & 0x02) != 0 ? f32 : fp16` (failing closed if caller-provided fixed arenas are undersized).
+When `!has_ext[0]`, Quad 0 uses the 64-frame (512 B) inline `fp16` hot ring (0 B cold storage). Whenever `has_ext[q]` is true (always for expansion quads `q >= 1` on Full..Ultra, or when Quad 0 exceeds inline limits or selects `ext_f32`), cold load provisions `cap[q] >= 128` power-of-two frames in element format `(quad_wire_flags[q] & 0x02) != 0 ? f32 : fp16` (failing closed if caller-provided fixed arenas are undersized).
 
 Active `TransportQuad` blocks rescale and clamp runtime parameters at cold load using `rho_vm = 48_000.0 / f_{s,vm}` against each quad's resolved `(has_ext[q], cap[q])`:
 
 | Parameter | Clamped Cold-Load Domain | Notes & Invariants |
 | :--- | :--- | :--- |
 | `delay_samples[0..4]` | `[5.0, max_tau]` at `f_{s,vm}` (`[4.0, max_tau]` standalone) | ZOH-rescaled by `1 / rho_vm` from 48 kHz `[5.0, 48,000.0]`; `max_tau = cap - 3` if modulated else `cap - 2` |
-| `ramp_spans_samples[0..4]` | `[0.0, max_span]` samples | ZOH-rescaled by `1 / rho_vm` on cold load; `max_span = max(0.0, max_tau - 5.0)` |
+| `ramp_spans_samples[0..4]` | `[0.0, max_span]` samples | ZOH-rescaled by `1 / rho_vm` on cold load and modulatable via `ControlBus` `ramp_span_scale[q]`; `max_span = max(0.0, max_tau - 5.0)` |
 | `allpass_delays[0..4]` | `[0, 16,384]` samples | 48 kHz `u8 <= 255`; 0 sets `A_k` to unity with `y_1,k = x_1,k` and zero cold ring accesses while `R_even`/`R_odd` still run whenever not in full hold, with `[0; 4]` allocating 0 B cold ring RAM; nonzero lengths expand via `max(1, round(D_48k / rho_vm))` |
 | `allpass_g_fp16[0..4]` | `[-0.75, 0.75]` | Per-lane Schroeder all-pass coefficients tapered by `(1 - mu_freeze)` during feedback recirculation |
-| `g_loop` | `[0.0, MAX_LOOP_GAIN_F32]` | Clamped by `TANK_MAX_G_LIN_BITS` (`0x3F7F_BE76`, 0.9990) and pitch-down energy limit (§2) |
-| `sigma_knee_fp16` | `[1.0e-3, 0.984375]` (`0x3BE0`) | Unified loop saturator ceiling `sigma_sat` (non-finite fallback `0.984375 = 0x3BE0`) with cold `inv_sigma_23 = 2 / (3 * sigma_sat)` |
+| `g_loop` | `[-MAX_LOOP_GAIN_F32, +MAX_LOOP_GAIN_F32]` | Bipolar signed gain bounded by `±0x3F7F_BE76` (±0.9990) with `|g_loop_eff|` clamped by pitch-down energy limit (§2) |
+| `sigma_knee_fp16` | `[1.0e-3, 4.0]` (`V_ceil = 4.0`) | Unified loop saturator ceiling `sigma_sat` (lifted to support passive shimmer headroom up to `V_ceil = 4.0`) with cold `inv_sigma_23 = 2 / (3 * sigma_sat)` |
 | `freeze_mix_fp16` | `[0.0, 1.0]` | Base continuous passive recirculation mix (non-finite fallback 0.0); stage-level `tank_dry_mix_fp16` resides in Arena 0 Control Plane |
 | `base_psi_fp16` | `[-pi, pi]` rad | Base Givens angle; `target_psi = clamp(base_psi + tank_psi_delta, -pi, +pi)` (clamped, never wrapped mod `2*pi`), slewed `<= 0.25` rad/tick via `algebraic_unit_rotor_f32` |
 | `scat_psi_fp16` | `[-pi, pi]` rad | Base SO(4) paraunitary scattering angle with non-finite fallback 0.0 stored in cold quad metadata outside the 216-byte active-hot state block; evaluates effective angle `(1 - freeze_mix) * base_scat_psi` from unlocked continuous `freeze_mix = clamp(base_freeze_mix + t[16], 0.0, 1.0)` via `algebraic_unit_rotor_f32` into cached `(cos_scat, sin_scat)` on cold load, reset, and register latches `(sample_tick & 3) == 0 || ctrl_sub_counter == 0` during slot-16 ramps so releasing `HOST_WRITE_LOCK` never retains stale `(1.0, 0.0)` |
@@ -109,7 +112,7 @@ Active `TransportQuad` blocks rescale and clamp runtime parameters at cold load 
 | `wet_tap_l_fp16`, `wet_tap_r_fp16` | `[-2.0, 2.0]` | Stereo per-lane L/R wet tap weights |
 | `r_dc` | `[0.95, 0.999995]` | Finite inputs clamp to `[0.95, 0.999995]` (`0x3F7F_FFAC`, matching Eq. 173's ZOH ceiling 0.999995) before ZOH `r_dc^rho_vm`; only non-finite inputs fall back to `0x3F7F_D51F` (5 Hz at 48 kHz). Passive feed-forward quads (`g_loop == 0`) may place `r_dc` and `dc_blocker_pole_5hz` near 0.999995 while strictly preserving exact DC zero `H(1) = 0` and contractivity `p < 1` |
 | `damp_pole` | `[0.0, 0.9995]` at 48 kHz; `[0.0, 0.99995]` eff | Cold ZOH `(base <= 1e-7) ? 0.0 : clamp(base^rho_vm, 0.0, 0.99995)`; 3 kHz `damp_pole_eff = clamp(damp_pole_zoh + op_t_damp_pole_delta, 0.0, 0.99995)` |
-| `lfo_rate_hz`, `ramp_rate_hz` | `[0.0, 16.0]` Hz / `[-16.0, 16.0]` Hz | Advances `u32` `lfo_inc_q32` LFO quadrature and signed `i32` `ramp_inc_q32` ramp accumulator |
+| `lfo_rate_hz`, `ramp_rate_hz` | `[0.0, 16.0]` Hz / `[-64.0, 64.0]` Hz | Advances `u32` `lfo_inc_q32` (with per-lane `lfo_rate_ratio_fp16[4]`) and signed `i32` `ramp_inc_q32` ramp accumulator |
 | `lfo_depths_fp16[0..4]` | `[0.0, min(512.0, floor(cap / 4) as f32)]` | ZOH-rescales by `1 / rho_vm` on cold load before clamping to `[0.0, min(512.0, floor(cap / 4) as f32)]` |
 | `window_depth_fp16` | `[0.0, 1.0]` | Base Hermite-Hann diagonal window blend before boundary-click safety clamp (§2) |
 
@@ -128,11 +131,11 @@ Calling quad hot-state `reset()` restores deterministic zero-state resting equil
 
 Inside each active transport quad, `lfo_phase_q32` and `ramp_phase_q32` execute in evaluate-then-advance order, quantizing increments via cold 6-step Newton reciprocal `inv_fs_vm = 1.0 / f_{s,vm}` as `lfo_inc_q32 = (rate <= 0.0 || max_k(lfo_depth_eff[k]) <= 0.0) ? 0 : ((f64(rate) * 2^32 * inv_fs_vm + 0.5) as u64) as u32` and signed `ramp_inc_q32 = round_half_away(f64(ramp_rate) * 2^32 * inv_fs_vm) as i64 as i32`, where `round_half_away(x) = (x >= 0.0) ? floor(x + 0.5) : ceil(x - 0.5)`.
 
-Per-lane LFO output $s_{\phi,k}$ evaluates the zero-at-origin Hermite-5 **sine** curve `q32_smooth_sin(lfo_phase_q32 + (u32(lfo_phase_off_q16[k]) << 16))` (hitting 0.0 at phase 0, +1.0 at `0x4000_0000`, 0.0 at `0x8000_0000`, and -1.0 at `0xC000_0000`), while sawtooth phase $\phi_{\mathrm{ramp},k} \in [0, 1)$ evaluates at `ramp_phase_q32 + (u32(ramp_phase_off_q16[k]) << 16)` ahead of wrapping-adding `lfo_inc_q32` and signed `ramp_inc_q32`.
+Per-lane LFO output $s_{\phi,k}$ evaluates `q32_smooth_sin` using per-lane `lfo_rate_ratio_fp16[k]` multipliers on `lfo_phase_q32` plus `lfo_phase_off_q16[k]`, enabling polyrhythmic chorus ratios. Sawtooth phase $\phi_{\mathrm{ramp},k} \in [0, 1)$ evaluates at `ramp_phase_q32 + (u32(ramp_phase_off_q16[k]) << 16)` ahead of increment wraps, while paired LFO quadrature `(c_k, s_k)` drives optional quadrature AM (`am_depth` in 2 FMAs/sample) on wet taps.
 
-Each VM frame combines cold ZOH-rescaled `delay_samples[k]`, clamped octave scaling, LFO and ramp sweeps `ramp_spans_samples[k] * (phi_ramp,k - 0.5)`, and `tank_delay_mod` (`stage_targets[12]` in 48 kHz samples converted via `1 / rho_vm`), clamped inside $[5.0, \tau_{\max}]$:
+Each VM frame combines cold ZOH-rescaled `delay_samples[k]`, per-quad octave scaling `delay_oct[q]`, LFO and modulatable ramp sweeps `(ramp_spans_samples[k] * ramp_span_scale[q]) * (phi_ramp,k - 0.5)`, and `tank_delay_mod` (`stage_targets[12]` in 48 kHz samples converted via `1 / rho_vm`), clamped inside `[5.0, max_tau]`:
 
-$$\tau_k[n] = \mathrm{clamp}\left(D_k \cdot 2^{\mathrm{clamp}(\Delta_{\mathrm{oct}}, -3.0, +3.0)} + d_{\mathrm{lfo},k} s_{\phi,k} + S_{\mathrm{span},k}\big(\phi_{\mathrm{ramp},k} - 0.5\big) + \Delta_{\mathrm{ctrl,48k}} \cdot \frac{1}{\rho_{\mathrm{vm}}},\ 5.0,\ \tau_{\max}\right)$$
+$$\tau_k[n] = \mathrm{clamp}\left(D_k \cdot 2^{\mathrm{clamp}(\Delta_{\mathrm{oct},q}, -3.0, +3.0)} + d_{\mathrm{lfo},k} s_{\phi,k} + S_{\mathrm{span},k,q}\big(\phi_{\mathrm{ramp},k} - 0.5\big) + \Delta_{\mathrm{ctrl,48k}} \cdot \frac{1}{\rho_{\mathrm{vm}}},\ 5.0,\ \tau_{\max}\right)$$
 
 Here $\Delta_{\mathrm{oct}} =$ `stage_targets[17]` (`op_t_delay_scale_oct`) clamps before exponentiation as `2^clamp(stage_targets[17], -3.0, +3.0)`, while $\Delta_{\mathrm{ctrl,48k}} =$ `stage_targets[12]` rescales 48 kHz samples into VM frames. Upper bound $\tau_{\max} = \mathtt{cap} - 3$ applies when modulated (`lfo_depths`, `ramp_spans`, `|stage_targets[17]| > 1.0e-6`, or $|\Delta_{\mathrm{ctrl,48k}}| > 10^{-6}$ nonzero), and $\tau_{\max} = \mathtt{cap} - 2$ otherwise.
 
@@ -154,21 +157,25 @@ On full hold (`mu_freeze >= 1.0 - 1.0e-6` or bit 2 `HOST_WRITE_LOCK` set), the e
 
 When active, any lane with zero `allpass_delays` evaluates $A_k(z) = 1$ with zero cold ring accesses while `R_even` and `R_odd` execute; when all four delays are 0, `H(z)` collapses to lossless memoryless `SO(4)` rotation, preserving 0-ULP identity at zero scattering angle.
 
-Feedback conditioning applies cold-precomputed `inv_sigma_23 = 2 / (3 * sigma_sat)` and `sigma_sat = clamp(sigma_knee, 1.0e-3, 0.984375)` (`TANK_MAX_SIGMA_SAT_FP16 = 0x3BE0`) in one unity-slope cubic saturator (`TANK_MAX_V_CEIL_BITS = 0x3F7C_28F5`, 0.985, zero loop `NR2` reciprocal) ahead of pairwise 2×2 Givens `R_block2(psi)` and unitary 4×4 Householder reflection $\mathbf{H}_4(\mathbf{1}) = \mathbf{I}_4 - 0.5\mathbf{1}\mathbf{1}^\top$ plus input injection.
+Feedback conditioning applies cold-precomputed `inv_sigma_23` and `sigma_sat = clamp(sigma_knee, 1.0e-3, 4.0)` in one unity-slope cubic saturator (`V_ceil = 4.0`, zero loop reciprocal) ahead of pairwise 2×2 Givens rotation `R_block2(psi)` and passive convex mixing $\mathbf{M}_{\mathrm{fb}}(\alpha, \beta) = \alpha \mathbf{H}_4(\mathbf{1}) + (1 - \alpha)(\cos\beta \mathbf{I}_4 + \sin\beta \mathbf{J}_{2\times 2})$, where $\Vert \mathbf{M}_{\mathrm{fb}} \Vert_2 \le 1$.
+
+The conditioned loop then adds bounded even-harmonic shimmer $\eta_{\mathrm{even}}(|v| - \mathrm{lpf}(|v|))$, causal lower-triangular series coupling $\mathbf{M}_{\mathrm{series}}[q_{\mathrm{dst}}][q_{\mathrm{src}}]$ for $0 \le q_{\mathrm{src}} < q_{\mathrm{dst}} < P_Q$, post-sum feedback tap `alpha_sum_fb`, and input injection.
 
 On adjacent 2×2 lane pairs `(0, 1)` and `(2, 3)`, `R_block2(psi)` acts on $\mathbf{v} = [v_0, v_1, v_2, v_3]^\top$ via `v * cos(psi) + [-v_1, v_0, -v_3, v_2] * sin(psi)`:
 
 $$\mathbf{R}_{\mathrm{block2}}(\psi)\mathbf{v} = \big[v_0\cos\psi - v_1\sin\psi,\ v_0\sin\psi + v_1\cos\psi,\ v_2\cos\psi - v_3\sin\psi,\ v_2\sin\psi + v_3\cos\psi\big]^\top$$
 
-Immediately after $\mathbf{v}_{\mathrm{fb}}$ and before the loop DF-I DC blocker, where $\alpha_{\mathrm{dc}} = 0.5(1 + r_{\mathrm{dc}})$, per-lane 1-pole HF damping applies `v_damp[j] = (1 - damp_pole_eff) * v_fb[j] + damp_pole_eff * damp_state[j]` and `damp_state'[j] = flush(v_damp[j])`. Setting `damp_pole_eff == 0.0` yields identity pass-through into `y_dc[n]`, passive recirculation blends `w_ring = (1 - mu_freeze) * y_dc + mu_freeze * r_win` into both `fp16` and `f32` rings, and writes saturate to ±65,504.0 on `fp16` lines:
+Immediately after $\mathbf{v}_{\mathrm{fb}}$ and before the loop DF-I DC blocker where $\alpha_{\mathrm{dc}} = 0.5(1 + r_{\mathrm{dc}})$, per-lane 1-pole HF damping updates `v_damp[j] = (1 - p_damp) * v_fb[j] + p_damp * d_state[j]` and `d_state'[j] = flush(v_damp[j])` with identity pass-through at `p_damp == 0.0`.
 
-$$\mathbf{v}_{\mathrm{loop}} = \mathcal{S}_{\mathrm{ceil}}\big(\mathbf{v}_{\mathrm{read}}; g_{\mathrm{loop,eff}}, \sigma_{\mathrm{sat}}\big), \qquad \mathbf{v}_{\mathrm{fb}} = \mathbf{H}_4(\mathbf{1})\mathbf{R}_{\mathrm{block2}}(\psi)\mathbf{v}_{\mathrm{loop}} + \mathbf{g}_{\mathrm{inj}} \odot [x_L, x_R, x_L, x_R]^\top$$
+Passive recirculation blends `w_ring = (1 - mu_freeze) * y_dc + mu_freeze * r_hold` into both `fp16` and `f32` rings (saturating `fp16` writes to ±65,504.0), where `r_hold` blends `r_win` with unitary-circulating $\mathbf{H}_4(\mathbf{1})\mathbf{r}_{\mathrm{win}}$ via `freeze_ortho_mix`:
+
+$$\mathbf{v}_{\mathrm{loop}} = \mathcal{S}_{\mathrm{ceil}}\big(\mathbf{v}_{\mathrm{read}}; g_{\mathrm{loop,eff}}, \sigma_{\mathrm{sat}}\big), \qquad \mathbf{v}_{\mathrm{fb}} = \mathbf{M}_{\mathrm{fb}}(\alpha, \beta)\mathbf{R}_{\mathrm{block2}}(\psi)\mathbf{v}_{\mathrm{loop}} + \eta_{\mathrm{even}}\big(|\mathbf{v}_{\mathrm{loop}}| - \mathrm{lpf}(|\mathbf{v}_{\mathrm{loop}}|)\big) + \mathbf{g}_{\mathrm{inj}} \odot [x_{q,L}, x_{q,R}, x_{q,L}, x_{q,R}]^\top + \mathbf{s}_{\mathrm{sum},q}$$
 $$\mathbf{v}_{\mathrm{damp}}[n] = (1 - p_{\mathrm{damp}})\mathbf{v}_{\mathrm{fb}}[n] + p_{\mathrm{damp}}\mathbf{d}_{\mathrm{state}}[n-1], \qquad \mathbf{d}_{\mathrm{state}}[n] = \mathrm{flush}\big(\mathbf{v}_{\mathrm{damp}}[n]\big)$$
-$$y_{\mathrm{dc}}[n] = \mathrm{flush}\Big(\alpha_{\mathrm{dc}}\big(v_{\mathrm{damp}}[n] - v_{\mathrm{damp}}[n-1]\big) + r_{\mathrm{dc}} y_{\mathrm{dc}}[n-1]\Big), \qquad \mathbf{w}_{\mathrm{ring}}[n] = (1 - \mu_{\mathrm{freeze}})\mathbf{y}_{\mathrm{dc}}[n] + \mu_{\mathrm{freeze}}\mathbf{r}_{\mathrm{win}}[n]$$
+$$y_{\mathrm{dc}}[n] = \mathrm{flush}\Big(\alpha_{\mathrm{dc}}\big(v_{\mathrm{damp}}[n] - v_{\mathrm{damp}}[n-1]\big) + r_{\mathrm{dc}} y_{\mathrm{dc}}[n-1]\Big), \qquad \mathbf{w}_{\mathrm{ring}}[n] = (1 - \mu_{\mathrm{freeze}})\mathbf{y}_{\mathrm{dc}}[n] + \mu_{\mathrm{freeze}}\mathbf{r}_{\mathrm{hold}}[n]$$
 
-Here $\mathcal{S}_{\mathrm{ceil}}(u; g, \sigma_{\mathrm{sat}}) = \mathrm{clamp}(g \sigma_{\mathrm{sat}} \cdot v(1.5 - 0.5 v^2), -V_{\mathrm{ceil}}, V_{\mathrm{ceil}})$ with $v = \mathrm{clamp}(u \cdot \mathrm{inv-sigma-23}, -1, 1)$, $\mathrm{inv-sigma-23} = 2/(3\sigma_{\mathrm{sat}})$, $V_{\mathrm{ceil}} \approx 0.985$ (`TANK_MAX_V_CEIL_BITS = 0x3F7C_28F5`), $p_{\mathrm{damp}} =$ `damp_pole_eff`, and $\mathbf{d}_{\mathrm{state}} =$ `damp_state`.
+Here $\mathcal{S}_{\mathrm{ceil}}(u; g, \sigma_{\mathrm{sat}}) = \mathrm{clamp}(g \sigma_{\mathrm{sat}} \cdot v(1.5 - 0.5 v^2), -V_{\mathrm{ceil}}, V_{\mathrm{ceil}})$ with $v = \mathrm{clamp}(u \cdot \mathrm{inv-sigma-23}, -1, 1)$, $\mathrm{inv-sigma-23} = 2/(3\sigma_{\mathrm{sat}})$, $V_{\mathrm{ceil}} = 4.0$, $p_{\mathrm{damp}} =$ `damp_pole_eff`, and $\mathbf{s}_{\mathrm{sum},q}$ carries optional `alpha_sum_fb` post-sum feedback plus causal series coupling from quads $q_{\mathrm{src}} < q$.
 
-All `P_Q` active `TransportQuad` blocks receive `x_tank = (direct_s2_l + conv_l, direct_s2_r + conv_r)` with $x_L = x_{\mathrm{tank},L}$ and $x_R = x_{\mathrm{tank},R}$. On each pure-wet quad $q \in [0, P_Q)$, weighted taps form stereo sum $y_{\text{raw},L} = \sum_k w_{L,k} v_k$ and $y_{\text{raw},R} = \sum_k w_{R,k} v_k$, rotate through unitary 2×2 Givens matrix $\mathbf{R}(\psi)$, and step the 5 Hz stereo wet Direct-Form I DC blocker into pure-wet output $y_{\mathrm{wet},q,c}$:
+All `P_Q` active `TransportQuad` blocks receive `x_tank = (direct_s2_l + conv_l, direct_s2_r + conv_r)` augmented by strictly causal series outputs $\sum_{q' < q} M_{\mathrm{series}}[q][q'] y_{\mathrm{wet},q'}$. On each pure-wet quad $q \in [0, P_Q)$, per-tap soft-attention readout `m_tap[q][0..4]` scales wet taps $w_{L,k}, w_{R,k}$ to form stereo sum $y_{\text{raw},L}, y_{\text{raw},R}$ (with optional LFO-coupled quadrature AM), rotates through unitary 2×2 Givens matrix $\mathbf{R}(\psi)$, and steps the 5 Hz stereo wet Direct-Form I DC blocker into pure-wet output $y_{\mathrm{wet},q,c}$:
 
 $$p_{\mathrm{wet}} = \mathrm{clamp}\big(p_{\mathrm{dc,base}}^{\rho_{\mathrm{vm}}}, 10^{-4}, 0.999995\big), \qquad \alpha_{\mathrm{wet}} = \frac{1 + p_{\mathrm{wet}}}{2}, \qquad y_{\mathrm{wdc},c}[n] = \mathrm{flush}\Big(\alpha_{\mathrm{wet}}\big(y_{\mathrm{wet},c}[n] - y_{\mathrm{wet},c}[n-1]\big) + p_{\mathrm{wet}} y_{\mathrm{wdc},c}[n-1]\Big)$$
 
@@ -179,7 +186,7 @@ Stage-level dry pass-through `tank_dry_mix_fp16` (slot 22, decoded verbatim with
 $$y_{\text{rot},L} = \cos(\psi) y_{\text{raw},L} - \sin(\psi) y_{\text{raw},R}, \qquad y_{\text{rot},R} = \sin(\psi) y_{\text{raw},L} + \cos(\psi) y_{\text{raw},R}$$
 $$g_{\mathrm{dry,eff}} = \mathrm{clamp}\big(\mathrm{tank-dry-mix} + t_{22}, -2.0, +2.0\big), \qquad y_{\mathrm{tank},c} = g_{\mathrm{dry,eff}} x_{\mathrm{tank},c} + w_{\mathrm{scale}} \sum_{q=0}^{P_Q - 1} y_{\mathrm{wet},q,c}, \qquad c \in \lbrace L, R \rbrace$$
 
-`ControlBus` slots 12..14 and 16..25 apply uniformly across every active quad (`q in 0..P_Q`), while slot 22 (`op_t_dry_mix_mod`) modulates the stage-level `g_dry_eff` scalar cleanly across all four tiers.
+Global ControlBus slots 12..14 and 16..25 supply shared base modulation across active quads while per-quad `QuadCtrlRoute` deltas (`op_t_q[0..16]`, §1.5: delay_oct, g_loop_delta, damp_delta, lfo_rate_delta, lfo_depth_scale, ramp_span_scale) specialize each quad independently, and slot 22 (`op_t_dry_mix_mod`) modulates stage-level `g_dry_eff` across all four tiers.
 
 The `Transport` stage outputs $y_{\mathrm{tank},c}$ into `mono_out` folding, the 48-frame linear tier crossfade (`rem` counting down from 48 to 1 with `a = f32(rem) * (1.0 / 48.0)` per [router_and_crossbar_topology.md §8.1](router_and_crossbar_topology.md#81-canonical-midside-output-head-factorization)), polarity-signed `eff_trim` (`WET_POLARITY_INV`), and ±1.0e9 VM safety clamping ahead of host-shell M/S output width.
 
@@ -198,7 +205,7 @@ During full hold, each lane $k \in \lbrace 0, 1, 2, 3 \rbrace$ reads integer lag
 | LFO & Ramp Phase Accumulators | `lfo_phase_q32` and `ramp_phase_q32` hold with zero increment |
 | Main Ring Read & Window | Reads `(write_ptr + lag_k) & mask` at `w_k = 1.0`; advances `we_hold_off[k]` branchlessly |
 | `SO(4)` Schroeder All-Pass Diffuser | Bypasses fused `SO(4)` diffuser evaluation (`v_read,k = r_frozen,k`); lane-major SoA Schroeder buffer and `ap_wr` freeze at 0-ULP |
-| Feedback & Ring Writeback | Skips main ring `write_ptr` writes, loop feedback, HF damping (`damp_state`), and loop DC (`dc_x_prev`, `dc_y_prev`) |
+| Feedback & Ring Writeback | When `freeze_ortho_mix == 0.0`, skips main ring `write_ptr` writes, loop feedback, HF damping, and loop DC at 0-ULP hold; when `freeze_ortho_mix > 0.0`, recirculates passively via unitary `H_4(1)` (`||H_4(1)||_2 = 1`) |
 | Non-Recirculating Wet Readout | Continues `wet_tap_l/r`, Givens `psi`, wet DC blocker, and stage `g_dry_eff * x_tank` |
 
 #### 1.1.2 Cold-Path Capacity Sizing
@@ -295,7 +302,7 @@ In standalone delay lines with block max-tree guards, active writes clamp agains
 $$w_i[n] = x_i[n] + g_i[n] \cdot \mathrm{clamp}\big(v_i[n], -M_n, M_n\big), \qquad 0 \le g_i[n] \le g_{\max} < 1$$
 $$v_{\text{knee}} = \mathrm{clamp}\left(\frac{2}{3} x_{\text{finite}} r_\sigma, -1, 1\right), \qquad y_{\text{lim}} = \mathrm{flush}\Big(g \cdot \mathrm{clamp}\big(\sigma v_{\text{knee}}(1.5 - 0.5 v_{\text{knee}}^2), -\sigma, \sigma\big)\Big)$$
 
-In compact TransportQuads, end-of-frame feedback clamps `g_loop` by `0x3F7F_BE76` (0.9990) and evaluates the unified `sigma_sat` cubic saturator (`TANK_MAX_SIGMA_SAT_FP16 = 0x3BE0`, cold-precomputed `inv_sigma_23 = 2 / (3 * sigma_sat)`, `TANK_MAX_V_CEIL_BITS = 0x3F7C_28F5` = 0.985, zero loop NR2 reciprocal) before Givens/Householder mixing (§1.1.1).
+In compact TransportQuads, end-of-frame feedback clamps `|g_loop| <= 0.9990` (`±0x3F7F_BE76`) and evaluates the unified `sigma_sat` cubic saturator (`V_ceil = 4.0`, cold-precomputed `inv_sigma_23 = 2 / (3 * sigma_sat)`, zero loop NR2 reciprocal) ahead of Givens and passive convex `M_fb(alpha, beta)` mixing (`||M_fb||_2 <= 1`) (§1.1.1).
 
 #### 1.3.2 Grouped Max-Tree Tracking
 
@@ -313,13 +320,13 @@ To eliminate hardware integer division (`pos / block_size` or `pos % block_size 
 
 `r[dsp.op-t.guard.bibo-decay]`
 
-Under bounded input $|x_i[n]| \le B$, history magnitude stays bounded by $C = \max(M_0, B / (1 - g_{\max}))$; under zero input $x_i[n] = 0$, $M_n$ decays by at least $g_{\max}$ every $L_{\max} + H$ frames regardless of read-head velocity.
+Under bounded input $|x_i[n]| \le B$ and signed loop gain $|g_{\text{loop}}| \le g_{\max} \le 0.9990$ paired with passive convex mixing $\Vert \mathbf{M}_{\mathrm{fb}}(\alpha, \beta) \Vert_2 \le 1$ and $V_{\mathrm{ceil}} = 4.0$, history magnitude stays bounded by $C = \max(M_0, B / (1 - g_{\max}))$; under zero input $x_i[n] = 0$, $M_n$ decays by at least $g_{\max}$ every $L_{\max} + H$ frames regardless of read-head velocity.
 
 #### 1.3.5 Directed `fp16` Decay Rule
 
 `r[dsp.op-t.guard.fp16-decay]`
 
-Capping loop feedback at `0x3F7F_BE76` (`TANK_MAX_G_LIN_BITS`, 0.9990) and rounding `fp16` delay writes toward zero forces subnormal ring contents to decay strictly to zero without nonzero `fp16` limit cycles.
+Capping signed loop feedback magnitude at `0x3F7F_BE76` (`TANK_MAX_G_LIN_BITS`, `|g_loop| <= 0.9990`) and rounding `fp16` delay writes toward zero forces subnormal ring contents to decay strictly to zero without nonzero `fp16` limit cycles.
 
 ---
 
@@ -329,10 +336,10 @@ Capping loop feedback at `0x3F7F_BE76` (`TANK_MAX_G_LIN_BITS`, 0.9990) and round
 
 | Control Event | Transition Law | Physical & Acoustic Role |
 | :--- | :--- | :--- |
-| Continuous `range` Knob Sweep | 1-pole exponential delay slew bounded at 0.25 samples/sample | Models smooth analog BBD or tape Doppler pitch glide |
+| Continuous `range` Knob Sweep | Division-free per-sample delay slew `d_curr += clamp(d_target - d_curr, -0.25, +0.25)` | Models smooth analog BBD or tape Doppler pitch glide at 0.25 samples/sample |
 | Discrete `switch` Delay Jump | Hold endpoints and crossfade over `max(16, round(128 / rho_vm))` frames (128 at 48 kHz) | Prevents clicks and unmodeled pitch sweeps on discrete jumps |
 
-For crossfade step $k \in \lbrace 0, \dots, L_{\text{xfade}} - 1 \rbrace$, cold preparation synthesizes `alpha_xf[k]` without `FDIV` or external math libraries using the Cody-Waite degree-13/14 rotor `algebraic_unit_rotor_f32` ([op_m_modal_kautz.md §1.2.4](op_m_modal_kautz.md#124-q0192-control-lfo--4-lane-q032-crossbar-phasors)) and blends endpoints in unfused `binary32` (`FP_CONTRACT OFF`):
+For continuous `range` delay sweeps, each active quad slews its effective delay directly per sample (`d_curr += clamp(d_target - d_curr, -0.25, +0.25)`, zero `FDIV`) so pitch-glide Doppler shifts track smoothly without sample-rate-dependent zipper noise. For crossfade step $k \in \lbrace 0, \dots, L_{\text{xfade}} - 1 \rbrace$, cold preparation synthesizes `alpha_xf[k]` without `FDIV` or external math libraries using the Cody-Waite degree-13/14 rotor `algebraic_unit_rotor_f32` ([op_m_modal_kautz.md §1.2.4](op_m_modal_kautz.md#124-q0192-control-lfo--4-lane-q032-crossbar-phasors)) and blends endpoints in unfused `binary32` (`FP_CONTRACT OFF`):
 
 ```text
 inv_denom   = f32(rcp_nr6_f64(f64(L_xfade - 1)))
@@ -342,6 +349,21 @@ d[n]        = (1.0 - alpha_xf[k]) * d_old[n] + alpha_xf[k] * d_new[n]    // unfu
 ```
 
 While a fade runs, its two endpoints stay frozen and newer accepted delay changes coalesce into one pending target governed by [host automation timing](parametric_control_bus.md#112-host-automation-timing), latching on the first sample after completion while honoring conditional batch bounds ([parametric_control_bus.md §2.4.2](parametric_control_bus.md#242-conditional-batch-safety)).
+
+---
+
+### 1.5 Per-Quad Modulation Routing, Tap Attention & Causal Series Coupling
+
+`r[dsp.op-t.routing.per-quad-and-series]`
+
+To prevent multi-effect modulation collisions across `P_Q` active quads (such as delay taps colliding with FDN reverb damping or modulation depth), `Op-T` v4 replaces uniform quad broadcast with per-quad `QuadCtrlRoute` modulation targets (`op_t_q[0..16]`), per-tap soft-attention readout weights, post-sum feedback, and strictly causal inter-quad series routing:
+
+| `Op-T` v4 Routing Mechanism | Mathematical Definition & Bounds | Architectural Invariant |
+| :--- | :--- | :--- |
+| **Per-Quad Modulation (`QuadCtrlRoute`)** | Independent `(delay_oct[q], g_loop_delta[q], damp_delta[q], lfo_rate_delta[q], lfo_depth_scale[q], ramp_span_scale[q])` per quad `q in 0..P_Q` | Allows Delay, Chorus, Rotary, Shifter, and Reverb quads to modulate independently (zero extra audio MACs) |
+| **Per-Tap Soft-Attention (`m_tap[q][0..4]`)** | Scales per-lane wet tap sums `sum_k m_tap[q][k] * w_{c,k} * v_k` (`0 <= m_tap[q][k] <= 1`) | Shapes stereo ping-pong and diffused echo patterns without altering loop stability |
+| **Causal Series Coupling (`M_series`)** | Strictly lower-triangular `M_series[q_dst][q_src]` (`0 <= q_src < q_dst < P_Q`) feeding `y_{wet,q_src}` into quad `q_dst` input | Acyclic by construction (zero algebraic loops); models BBD → FDN, Chorus → Rotary, and Shifter → FDN |
+| **Post-Sum Feedback (`alpha_sum_fb`)** | Feeds normalized post-sum wet signal back into active quad loop injection (`|alpha_sum_fb| <= 0.5`) | Enables dual-grain regeneration without window-boundary amplitude holes |
 
 ---
 
@@ -367,10 +389,10 @@ To eliminate boundary clicks when any nonzero ramp sweep wraps across a nonzero 
 
 $$\mu_{\mathrm{win},k} = \max\Big(\mu_{\mathrm{win,base}},\ \mathrm{clamp}\big((|S_k| - 0.25) \cdot 4.0,\ 0.0,\ 1.0\big)\Big)$$
 
-To prevent energy accumulation under downward pitch time-stretching, downward slope $\nu_{\mathrm{down},k}$ is positive when reading backward or slower to lower pitch and negative before clamping on upward pitch shimmers, leaving `g_loop` unattenuated on pitch-up shimmers:
+To prevent energy accumulation under downward pitch time-stretching, downward slope $\nu_{\mathrm{down},k}$ is positive when reading backward or slower to lower pitch and negative before clamping on upward pitch shimmers, leaving `|g_loop|` unattenuated on pitch-up shimmers (`ramp_rate_hz` in `[-64.0, +64.0]` Hz):
 
 $$\nu_{\mathrm{down},k} = \mathrm{clamp}\left(\frac{S_{\mathrm{span},k} \cdot f_{\mathrm{ramp,eff}}}{f_{s,\mathrm{vm}}},\ 0.0,\ 0.75\right)$$
-$$g_{\mathrm{loop,eff}} = \min\big(g_{\mathrm{loop}},\ \mathtt{0x3F7FBE76}\big) \cdot \min_k \sqrt{\max\big(0.0,\ 1.0 - \min(0.9999,\ \nu_{\mathrm{down},k})\big)}$$
+$$g_{\mathrm{loop,eff}} = \mathrm{clamp}\big(g_{\mathrm{loop}},\ -\mathtt{0x3F7FBE76},\ +\mathtt{0x3F7FBE76}\big) \cdot \min_k \sqrt{\max\big(0.0,\ 1.0 - \min(0.9999,\ \nu_{\mathrm{down},k})\big)}$$
 
 Cold and 3 kHz setup evaluate the square root without audio-loop `FSQRT` or `FDIV` via unfused scalar 2-step Newton inverse square root (`FP_CONTRACT OFF`):
 
@@ -384,7 +406,7 @@ sqrt_u = (u <= 0.0) ? 0.0 : (u * y2)
 | :--- | :--- | :--- | :--- |
 | Delay, Chorus, TZF & Passive Hold | `ramp_rate_hz == 0.0`, `ramp_spans == 0.0` | `window_depth == 0.0` (`S_k == 0.0`) | Diagonal gain `w_k == 1.0` across all 4 lanes; full hold (`mu_freeze >= 1.0 - 1e-6` or `HOST_WRITE_LOCK` bit 2) bypasses Schroeder (`v_read,k = r_frozen,k`) and locks writes at 0 ULP |
 | Hermite-Hann Pitch & Shimmer | Nonzero sweep across grain span `G` | Complementary offsets (`[0, 0.5]` pairs or `[0, 0.25, 0.5, 0.75]`) | Exact `H(phi_A) + H(phi_B) == 1.000000` plus boundary and pitch-down clamps |
-| Continuous Barberpole Sweep | Staggered sawtooth `ramp_spans != 0` | Quarter-turn or staggered offsets | Boundary clamp tapers wrap edges to zero; standalone 3-phase `B_2` sum `== 1.0` |
+| Continuous Barberpole Sweep | Staggered sawtooth `ramp_spans != 0` | Quarter-turn or 3-phase staggered offsets | Boundary clamp tapers wrap edges to zero; wired 3-phase `B_2` sum `== 1.0` |
 
 ### 2.1 Delay, Chorus, Through-Zero Flanging & `WE` RAM Hold
 
@@ -398,7 +420,7 @@ Engaging full passive hold (`mu_freeze >= 1.0 - 1e-6` or `HOST_WRITE_LOCK` bit 2
 
 `r[dsp.op-t.window.m2-pitch]`
 
-For pitch offset $\Delta p \in [-24, +24]$ semitones, time-warp rate $\nu = 1 - 2^{\Delta p / 12} \in [-3.0, 0.75]$ derives from the [control-bus pitch profile](parametric_control_bus.md#51-pitch-ratio-and-time-warp-profile). Base-delay slew limits (0.25 samples/sample) govern center delay $D_c$ while complementary 2-grain or 4-grain `ramp_phase_off_q16` offsets sweep across even integer grain duration $G$:
+For pitch offset $\Delta p \in [-24, +24]$ semitones, time-warp rate $\nu = 1 - 2^{\Delta p / 12} \in [-3.0, 0.75]$ derives from the [control-bus pitch profile](parametric_control_bus.md#51-pitch-ratio-and-time-warp-profile). Base-delay slew limits (0.25 samples/sample) govern center delay $D_c$ while complementary 2-grain or 4-grain `ramp_phase_off_q16` offsets and `ControlBus`-modulatable `ramp_spans_samples` sweep across even integer grain duration $G$ (supporting short 20–80 ms grains up to ±64.0 Hz ramp rates):
 
 $$\phi_A[n] = \mathrm{frac}(n/G), \qquad \phi_B[n] = \mathrm{frac}(\phi_A[n] + 1/2), \qquad \tau_j[n] = D_c + \nu G\big(\phi_j[n] - 1/2\big) \in \big[D_c - |\nu|G/2, D_c + |\nu|G/2\big]$$
 
@@ -412,11 +434,23 @@ For a 100 ms grain at 48 kHz with $G = 4{,}800$ and +24 semitones where $\nu = -
 
 `r[dsp.op-t.window.m3-barberpole]`
 
-Continuous barberpole modulation drives staggered sawtooth `ramp_spans_samples` across lanes 0..3 with staggered `ramp_phase_off_q16` offsets, where the boundary-click safety clamp automatically forces $\mu_{\mathrm{win},k} \to 1.0$ whenever $|S_k| \ge 0.5$ so wrap boundaries fade smoothly to zero. Standalone 3-head sweeps spaced by $1/3$ cycle apply precomputed raised-cosine or 3-piece cardinal quadratic B-spline windows without runtime `FDIV` or standard math library calls:
+Continuous barberpole modulation drives staggered sawtooth `ramp_spans_samples` across lanes 0..3 with staggered `ramp_phase_off_q16` offsets, where the boundary-click safety clamp automatically forces $\mu_{\mathrm{win},k} \to 1.0$ whenever $|S_k| \ge 0.5$ so wrap boundaries fade smoothly to zero. Both `TransportQuad` runtime pipelines and standalone 3-head sweeps spaced by $1/3$ cycle wire `bspline_barberpole_3phase` 3-piece cardinal quadratic B-spline windows across lanes 0..3 (or raised-cosine windows) without runtime `FDIV` or standard math library calls:
 
 $$\sum_{m=0}^2 B_2\big(3 \cdot \mathrm{frac}(\phi + m/3)\big) \equiv 1.000000000000$$
 
 Here $B_2(t) = 0.5 t^2$ on $[0, 1)$, $B_2(t) = -t^2 + 3t - 1.5$ on $[1, 2)$, and $B_2(t) = 0.5(3 - t)^2$ on $[2, 3)$.
+
+### 2.4 Passive Convex Mixing, Bipolar Feedback, Shimmer & Unitary Freeze
+
+`r[dsp.op-t.loop.convex-shimmer-freeze]`
+
+To span pure multi-tap echoes, stereo cross-coupled chorus, rotary AM cabinets, negative-regeneration comb flangers, bounded shimmer octaves, and reverberant freeze holds within one strictly passive operator, each `TransportQuad` combines five unified loop laws with zero `FDIV` or `FSQRT`:
+
+1. **Convex Feedback:** Matrix $\mathbf{M}_{\mathrm{fb}} = \alpha \mathbf{H}_4 + (1 - \alpha)(\cos\beta \mathbf{I} + \sin\beta \mathbf{J})$ obeys $\Vert \mathbf{M}_{\mathrm{fb}} \Vert_2 \le 1$.
+2. **Bipolar Gain:** Slope $g_{\mathrm{loop}} \in [-0.9990, +0.9990]$ (`0x3F7F_BE76`) supports inverting flangers with $V_{\mathrm{ceil}} = 4.0$ shimmer headroom.
+3. **Polyrhythmic AM:** Per-lane `lfo_rate_ratio_fp16[4]` scales LFO rate across lanes 0..3 while quadrature AM (`am_depth`) modulates taps in 2 FMAs.
+4. **In-Loop Shimmer:** Bounded $\eta_{\mathrm{even}}(|v| - \mathrm{lpf}(|v|))$ adds octave shimmer inside the loop ahead of $\sigma_{\mathrm{sat}}$ saturation.
+5. **Unitary Freeze:** Nonzero `freeze_ortho_mix` circulates energy through unitary $\mathbf{H}_4(\mathbf{1})$, whereas 0.0 retains 0-ULP `we_hold_off` hold.
 
 ---
 
@@ -505,6 +539,6 @@ $$g_{\text{duck}}[n] = \mathrm{clamp}\Big(1.0 - \kappa_{\text{duck}}\big(e_{\tex
 | Unified 4-lane windowing | Real-time `cos(pi * phi)` + mode branching | Branchless 32-bit signed tri fold + Hermite `u^2 * (3 - 2u)` and B-spline `B_2` (§2) |
 | Boundary & pitch-down guards | Per-sample `FDIV` / `FSQRT` | 3 kHz / cold computation of `S_k` safety clamp and `g_loop,eff` (§2) |
 | Schroeder all-pass | Direct-form rational division | Coupled state recurrence `v = x - a*u`, `y = a*v + u` (§3.2) |
-| Base-delay slew | Per-sample rate division | Precomputed 1-pole slew capped at 0.25 samples/sample (§1.4) |
+| Base-delay slew | Per-sample rate division | Division-free per-sample 0.25 slew `clamp(d_target - d_curr, -0.25, +0.25)` (§1.4) |
 | Switch crossfade | Real-time `cos(pi * k / L)` | Cached 6-step `f64` Newton reciprocal of `L_xfade - 1` + `algebraic_unit_rotor_f32` cosine rotor (§1.4) |
 | Max-tree block index | `pos / block_size` (`UDIV`) | Incremental `(block_idx, in_block_offset)` counters (§1.3.3) |

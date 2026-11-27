@@ -2,26 +2,31 @@
 id: spec.dsp.op-n
 title: "Op-N: Contractive ParaLRU, Divided-Difference PolyADAA1, Wavefolder & Bitcrusher"
 status: canonical
-version: "3.0.0"
+version: "4.0.0"
 domain: dsp
 rule_prefixes:
   - "r[dsp.op-n."
 requirements:
   - REQ-1.1
+  - REQ-1.9
   - REQ-6.2
+  - REQ-7.1
+  - REQ-7.2
+  - REQ-8.5
 adrs:
   - ADR-0019
   - ADR-0022
+  - ADR-0024
 ---
 
 # Op-N: Contractive `ParaLRU`, Divided-Difference `PolyADAA1`, Wavefolder & Bitcrusher
 
-This specification defines Op-N (Nonlinear and Parallel State-Space) for Dynamic Neural Audio Modeler (DNAM) SONA v3.0 ([sona_architecture.md](../architecture/sona_architecture.md), [REQ-1.1, REQ-6.2](../../requirements/system_goals_and_requirements.md), [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)), covering four interlocking primitives:
+This specification defines Op-N (Nonlinear and Parallel State-Space) for Dynamic Neural Audio Modeler (DNAM) SONA v4.0 ([sona_architecture.md](../architecture/sona_architecture.md), [REQ-1.1, REQ-6.2](../../requirements/system_goals_and_requirements.md), [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md)), covering four interlocking primitives:
 
-1. The 4-block Matryoshka SONA core across the four tier profiles with lower-triangular 4×4 inter-block mixing and 0-ULP parity across 8-lane and interleaved 4-lane SIMD execution.
-2. Decoupled 1-D `ParaLRU` plus Block 0 linearly-implicit PHS and Blocks 1..3 linear `TPT-SVF` with 256-sample reverse Blelloch suffix scans.
-3. Pure `f32` divided-difference `PolyADAA1` and cubic $C^2$ wavefolder saturation with batched 2-step Newton rail-crossing correction and zero-DC equilibrium.
-4. Smooth raised-cosine ZOH & Fourier staircase quantization (`Op-N[Pre]`, Family 5) and `Op-N[Ctrl]` control-plane operators.
+1. All-tier 2× `OS2X` (15-tap HB-FIR) 4-block Matryoshka core (`[1,1,1,1]`, `[2,2,1,1]`, `[2,2,2,2]`, `[3,3,2,2]`, max 7 outgoing tiles/quad) with Quad-Major 8-subsample execution.
+2. Smooth non-saturating `ParaLRU` (C² quartic `soft_rect`), 3-tap folded `TPT-SVF`, Predictor-Corrector passive PHS (Block 0), and 2-block partial-fraction LR4 scans.
+3. Clamped `AlgADAA1(0.5)` (`MAX_ALG_R = 4096.0`, NR3) with GL/Möbius backward adjoints, `g_pre(v²)` + SE-Bus + GLU, explicit `rect_sign_mask`, and 1× `PolyADAA1` references.
+4. Op-N[Pre] v4 (`quantize -> ZOH`: 4-FMA Hermite quantizer + hard-capable `Q0.32` wrap ZOH) and `Op-N[Ctrl]` (`ControlBus` v4 GRA).
 
 ---
 
@@ -31,12 +36,16 @@ This specification defines Op-N (Nonlinear and Parallel State-Space) for Dynamic
 
 `r[dsp.op-n.polyadaa.clamp]`
 
-Inside every SONA core block, linear signal paths clamp only at the ±1e9 safety boundary (`REQ-7.1`). Both `PolyADAA1` and the cubic $C^2$ wavefolder store the prior unclamped endpoint $r_{n-1}$ and pre-clamp endpoints via $\bar{r}_n = \mathrm{clamp}(r_n, -1.0, +1.0)$ before polynomial evaluation so out-of-range inputs never yield `Inf - Inf` NaNs. Whenever $\max(|r_{n-1}|, |r_n|) \le 0.0$, explicit zero masking writes `0x0000_0000` (+0.0) so odd symmetry holds without -0.0 residues.
+Inside every SONA v4.0 CoreQuad block, linear signal paths clamp only at the ±1e9 safety boundary (`REQ-7.1`, `REQ-7.2`). `AlgADAA1(0.5)` clamps `r_curr = clamp(g_pre * d_adaa * u_tone + b_bias, -4096.0, +4096.0)` (`MAX_ALG_R = 4096.0`, where cubic 4096³ = 6.87e10 << 3.40e38) **before** storing `adaa_prev`, eliminating `f32` overflow under ±1e9 inputs.
+
+Core sag scaling replaces `max(0.05, 1.0 - d_sag * v_lru)` with $C^\infty$ bounded pre-ADAA gain $g_{\mathrm{pre}}(v_{\mathrm{eff}}^2)$ using $e_i = \min(v_{\mathrm{eff},i}^2, 10^6)$ and `g0_i`, `g_inf_i` in `[0.0, 2.5]`—realizing a 12 dB/oct noise gate and B+ sag drive with zero kink under Duhem `eta > 0`.
+
+Lane polarity uses explicit `u16` `rect_sign_mask` (+1.0 / -1.0, never -0.0 in `f32`), emitting canonical +0.0 (`0x0000_0000`) whenever $\max(|r_{n-1}|, |r_n|) \le 0.0$.
 
 | Evaluation Context | Pre-Activation Drive Formula | Parameter Domains & Scaling Semantics |
 | :--- | :--- | :--- |
-| SONA Core (4-Lane Stereo Group) | `r_n = u_tone[n] * d_adaa * g_sag + b_lru * v_lru[n]` | `g_sag = max(0.05, 1.0 - d_sag * v_lru)`; `sag_depth` in `[-8.0, 8.0]`, `adaa_drive` in `[-32.0, 32.0]`, `lru_bias_drive` in `[-16.0, 16.0]` |
-| Normalized Kernel Evaluation | Normalized pre-scaled `(u_prev, u_curr)` inputs | Drive `(2 / 3) * d` pre-multiplied upstream in `adaa_drive`; the ADAA kernel evaluates endpoints directly |
+| SONA Core (`AlgADAA1(0.5)`) | `r_n = clamp(g_pre * d_adaa * u_tone + b_bias, -4096.0, +4096.0)` | `g_pre = (g0 + g_inf * d_pre * e) * rcp_ge1_nr2(1.0 + d_pre * e)` (`g0, g_inf` in `[0, 2.5]`); `d_adaa` in `[-32.0, 32.0]`, `b_bias` in `[-16.0, 16.0]` |
+| Standalone Reference (`PolyADAA1`) | Pre-clamp endpoints `bar_r = clamp(r_n, -1.0, +1.0)` | Drive `(2 / 3) * d` pre-multiplied upstream; standalone 1× kernels evaluate piecewise polynomial ADAA1 directly |
 
 ### 1.2 Pure-`f32` Division-Free Primitives & Midpoint Factorization
 
@@ -64,6 +73,7 @@ Clamped base-2 exponential scaling uses one canonical degree-5 minimax Horner de
 | :--- | :--- | :--- | :--- |
 | `exp2_clamped5` (Octave / Filter) | `[-5.0, +5.0]` | Nearest int `k = round_ties_even(clamp(x, -5.0, +5.0))` via `BIASED_INT_MAGIC_F32 = 0x4B40_0000`, `f = x - k` in `[-0.5, +0.5]`, scale `(k + 127) << 23` | 1.0 (`0x3F80_0000`), `LN_2 = 0.6931471824645996` (`0x3F31_7218`), `EXP2_C2 = 0.24022109` (`0x3E75_FC84`), `EXP2_C3 = 0.05550411` (`0x3D63_5847`), `EXP2_C4 = 0.009675892` (`0x3C1E_87A2`), `EXP2_C5 = 0.0013333558` (`0x3AAE_C3FF`) |
 | `exp2_clamped16` (`Op-N[Pre]` Scale / Step) | `[-16.0, +16.0]` | Same nearest-int split `k = round_ties_even(clamp(x, -16.0, +16.0))` via `BIASED_INT_MAGIC_F32 = 0x4B40_0000`, `f = x - k` in `[-0.5, +0.5]`, scale `(k + 127) << 23` | Exact same 6 degree-5 minimax Horner `f32` coefficients above (`0x3F80_0000` through `0x3AAE_C3FF`) |
+| `fast_log2_f32` (Log-Knee VCA) | Positive finite `f32` (`x > 0`) | Exponent `E` + normalized mantissa `m in [1, 2)` split (`log2(1 + f)` via degree-4 minimax polynomial) | 0.0079 oct (0.047 dB) max error across full dynamic range; zero `FDIV`, `FSQRT`, or `libm` |
 
 Software `fp16` serialization extracts sign `(bits >> 16) & 0x8000`, exponent `(bits >> 23) & 0xFF`, and mantissa `bits & 0x007F_FFFF` strictly via `u32` bit manipulation without clamping infinity or NaN prior to classification (`new_exp = exp - 112`):
 
@@ -76,7 +86,14 @@ Software `fp16` serialization extracts sign `(bits >> 16) & 0x8000`, exponent `(
 | 5. Subnormal | `-10 <= new_exp <= 0` | Shift `0x0080_0000 \| mant` right by `14 - new_exp` with ties-to-even | Normalize leading `mant16` bit into `binary32` |
 | 6. Normal | `1 <= new_exp <= 30` | `(new_exp << 10) \| rounded(mant >> 13)`; overflow saturates to `sign \| 0x7BFF` | `(sign << 16) \| ((exp16 + 112) << 23) \| (mant16 << 13)` |
 
-Interior `PolyADAA1` evaluates four interior FMAs (five including rail-crossing) over pre-clamped endpoints $u_n, u_{n-1} \in [-1, 1]$ using midpoint $m_n = \frac{1}{2}(u_n + u_{n-1})$ and half-difference $d_n = \frac{1}{2}(u_n - u_{n-1})$:
+Inside CoreQuad blocks, clamped `AlgADAA1(0.5)` evaluates $f(r) = r / \sqrt{1 + r^2}$ over clamped endpoints $r_p, r_n \in [-4096.0, +4096.0]$ using 3-step Newton-Raphson NR3 primitives (`rsqrt_pos_nr3` and `rcp_ge1_nr3`). Precomputation forms `q_k = 1 + r_k^2`, `inv_s_k = rsqrt_pos_nr3(q_k)`, `s_k = q_k * inv_s_k`, `t_k = r_k^2 * rcp_ge1_nr3(s_k + 1)`, and `inv_sum = rcp_ge1_nr3(s_n + s_p)`.
+
+`AlgADAA1(0.5)` `A_even` natively spans [0.0, 1.0] directly without a runtime 4.0× scale factor, whereas legacy `PolyADAA1` `A_even` in [0.0, 0.25] uses 4.0× normalization to map onto [0.0, 1.0] (16× better `w_even` conditioning, max odd err <= 7.59e-8, max even err <= 1.79e-7 across [-1e9, +1e9]):
+
+$$\mathcal{A}_{\text{odd}}^{\text{alg}}(r_p, r_n) = (r_n + r_p) \mathrm{invsum} \cdot \big(1.0 + 0.5 \mathrm{invs}_n \mathrm{invs}_p\big)$$
+$$\mathcal{A}_{\text{even}}^{\text{alg}}(r_p, r_n) = \mathrm{clamp}\Big(\big(2(t_n + t_p) + (t_n + t_p)^2 + t_n t_p (1 + t_n + t_p) + r_n r_p\big) \mathrm{invsum} \mathrm{invs}_n \mathrm{invs}_p, 0.0, 1.0\Big)$$
+
+For standalone 1× reference kernels, `PolyADAA1` evaluates four interior FMAs (five including rail-crossing) over pre-clamped endpoints $u_n, u_{n-1} \in [-1, 1]$ using midpoint $m_n = \frac{1}{2}(u_n + u_{n-1})$ and half-difference $d_n = \frac{1}{2}(u_n - u_{n-1})$:
 
 $$\mathcal{A}_{\text{odd}}[n] = m_n \Big(1.5 - 0.5\big(m_n^2 + d_n^2\big)\Big), \qquad \mathcal{A}_{\text{even}}[n] = \left(m_n^2 + \frac{1}{3}d_n^2\right) - \left(m_n^4 + 2 m_n^2 d_n^2 + \frac{1}{5}d_n^4\right)$$
 
@@ -91,11 +108,17 @@ raw_even   = lin_even - quar_even                          // canonical +0.0 whe
 
 When $r_n = r_{n-1} = u \in [-1, 1]$, $d_n = 0$ and these collapse to $g_{\mathrm{odd}}(u) = 1.5u - 0.5u^3$ and $g_{\mathrm{even}}(u) = u^2 - u^4$ with zero derivative at the rails, $g_{\mathrm{odd}}'(\pm 1) = 0$. Offline Padé-[5/4] reference constants $(n_1, n_2, d_1, d_2) = (61/600, 11/19200, 87/200, 47/3840)$ solve $d_1 - n_1 = 1/3$, $d_2 - n_2 - d_1/3 = -2/15$, $P_5(R) = Q_4(R)$, and $(P_5/Q_4)'(R) = 0$ at $R = 4$.
 
-### 1.3 Saturated-Curve Rail Crossing (Pure-`f32` Batched Newton Reciprocal)
+### 1.3 Cancellation-Free `AlgADAA1` Backward & Saturated-Curve Rail Crossing
 
 `r[dsp.op-n.polyadaa.rail-crossing]`
 
-When consecutive inputs $a = \min(r_{n-1}, r_n) < b = \max(r_{n-1}, r_n)$ cross $\pm 1$, the span $b - a$ partitions into interior length $\ell_0 = \max(0, \min(b, 1) - \max(a, -1))$ and plateau lengths $\ell_- = \max(0, \min(b, -1) - a)$ and $\ell_+ = \max(0, b - \max(a, 1))$, evaluating $\mathcal{A}_{\text{odd}}, \mathcal{A}_{\text{even}}$ on $[\max(a, -1), \min(b, 1)]$:
+For `AlgADAA1(0.5)` backward sensitivity inside GPU adjoint scans, direct finite differences suffer 253× cancellation at `r = 100` and sign flips at `r = 1e4`. Evaluating strictly positive $P(r_p, r_n) = 1 + s_n s_p - r_n r_p$ for $r_n r_p \le 0$ or $1 + (1 + r_n^2 + r_p^2)/(s_n s_p + r_n r_p)$ for $r_n r_p > 0$ gives exact `deven` with relative error $\le 4.08 \times 10^{-7}$, while `dodd` branches on `prod = r_n * r_p`, `lo = min(|r_p|, |r_n|)`, and `hi = max(|r_p|, |r_n|)`:
+
+1. When `prod >= 0 && lo > 2.0 && |r_n - r_p| <= 0.15 * hi`: 4-point linear Gauss-Legendre on $[0, 1]$ of $1.5 t (1 + (r_p + t(r_n - r_p))^2)^{-5/2}$.
+2. When `prod >= 0 && lo > 2.0 && |r_n - r_p| > 0.15 * hi`: 5-point Rational-Möbius Gauss-Legendre using $r(u) = \frac{(lo+1)(hi+1)}{hi+1 - u(hi-lo)} - 1$ (zero `FDIV`, zero `exp`/`log`).
+3. Otherwise (`prod <= 0 || lo <= 2.0`): exact algebraic form (<= 8.68e-6 max relative error across 578 exhaustive pairs in `[-4096, 4096]²`, zero sign flips).
+
+For standalone 1× `PolyADAA1` reference kernels when consecutive inputs $a = \min(r_{n-1}, r_n) < b = \max(r_{n-1}, r_n)$ cross $\pm 1$, the span $b - a$ partitions into interior length $\ell_0 = \max(0, \min(b, 1) - \max(a, -1))$ and plateau lengths $\ell_- = \max(0, \min(b, -1) - a)$ and $\ell_+ = \max(0, b - \max(a, 1))$, evaluating $\mathcal{A}_{\text{odd}}, \mathcal{A}_{\text{even}}$ on $[\max(a, -1), \min(b, 1)]$:
 
 $$A_{\text{odd,sat}} = \big(\ell_0 \mathcal{A}_{\text{odd}} + \ell_+ - \ell_-\big) \cdot y, \qquad A_{\text{even,sat}} = \big(\ell_0 \mathcal{A}_{\text{even}}\big) \cdot y$$
 
@@ -106,21 +129,23 @@ even_cross = (inside * even_int) * inv
 
 Whenever $|r_n - r_{n-1}| \le 10^{-6}$ (`TINY_CROSSING_EPS = 1.0e-6`), the kernel returns the algebraic midpoint result directly to avoid zero-span division. Otherwise, the ADAA kernel computes $y \approx (b - a)^{-1}$ in pure 32-bit float via a 2-step Newton reciprocal of $\max(b - a, \varepsilon_{\text{span}})$ with floor $\varepsilon_{\text{span}} = 10^{-6}$ (`RAIL_CROSSING_MIN_SPAN`). Because $g_{\mathrm{odd}}'(\pm 1) = 0$, crossing differences remain $C^1$ smooth with bounded condition number in `binary32`, reserving 6-step `f64` Newton reciprocals solely for offline test oracles.
 
-### 1.4 Amortized Fast-Path `PolyADAA1` & Batched Newton Stereo Execution
+### 1.4 Amortized Fast-Path `AlgADAA1` & `PolyADAA1` + Wavefolder Execution
 
 `r[dsp.op-n.polyadaa.stereo-and-rail-guard]`
 
-Whenever all lanes of a 4-lane or 8-lane stereo SIMD register satisfy $|r_{n-1}| \le 1.0$ and $|r_n| \le 1.0$, the interior `PolyADAA1` fast path evaluates branchlessly with zero reciprocal calls.
+Inside `CoreQuad` blocks, fused `AlgADAA1 + Wavefolder` evaluates `all_lanes_le_one` fast-path checks (`|r_{n-1}| <= 1.0` and `|r_n| <= 1.0`) directly across 4-lane and 8-lane stereo SIMD registers, dropping dead `_wf_even` evaluation because `wavefolder_mix` blends only the odd channel.
 
-If any lane crosses $\pm 1$, the rail-crossing path evaluates 2-step Newton reciprocals across the 8-lane stereo vector or batches dual 4-lane vector pairs without register spills ([ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)).
+For standalone `PolyADAA1` kernels, whenever all lanes satisfy $|r_{n-1}| \le 1.0$ and $|r_n| \le 1.0$, the interior fast path evaluates branchlessly with zero reciprocal calls, otherwise evaluating batched 2-step Newton reciprocals across the 8-lane stereo vector or dual 4-lane vector pairs without register spills ([ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)).
 
 ### 1.5 Un-Delayed Linear Separation & 1× Passive B-Spline Blend
 
-#### 1.5.1 Un-Delayed Linear Residual Path
+#### 1.5.1 Un-Delayed Linear Residual Path & `lin_mix`
 
 `r[dsp.op-n.polyadaa.linear-residual]`
 
-The linear residual path evaluates $\alpha_c x_c[n]$ directly with zero ADAA delay, preserving unity passband gain within $10^{-12}$ dB up to 22 kHz at 48 kHz.
+Inside CoreQuad blocks, bounded linear bypass weight $\mu_{\mathrm{lin}} \in [0, 1]$ (`lin_mix`) blends `A_odd_wf` with `g_pre * u_tone` before post-ADAA SE-Bus (`o_pre = (1 - mu_lin) * A_odd_wf + mu_lin * g_pre * u_tone`) while zeroing the even channel by `(1 - mu_lin)`. Under unified 2× oversampling (96 kHz), 0.5 2×-sample ADAA1 delay equals 0.25 1×-sample (-1.41 dB at 20 kHz), and `lin_mix` polarizes toward 0 or 1 lanes to avoid single-lane mixed-phase blends.
+
+For standalone 1× reference kernels, the linear residual path evaluates $\alpha_c x_c[n]$ directly with zero ADAA delay, preserving unity passband gain within $10^{-12}$ dB up to 22 kHz at 48 kHz.
 
 #### 1.5.2 Passive Quadratic B-Spline Blend (0.875, 0.125) + AC Coupling
 
@@ -149,7 +174,7 @@ Standalone 1× reference `PolyADAA1` multi-drive kernels using profile $d_{\text
 
 To preserve $C^2$ continuity at $\pm 1$ with vanishing value, slope, and curvature at $\bar u = \pm 1$, `Op-N` pairs `PolyADAA1` with cubed-envelope odd and even wavefolders evaluated by one branchless single-precision kernel running identically across CPU SIMD targets and 32-bit GPU training shaders.
 
-Inside every 4-block SONA core group, `wavefolder_mix` with $\mu_{\text{wf}} \in [0, 1]$ convexly blends **only the odd harmonic channel** via $\mathcal{A}_{\text{odd}} \leftarrow (1 - \mu_{\text{wf}})\mathcal{A}_{\text{odd}} + \mu_{\text{wf}} w_{\text{odd,ADAA}}$ while passing `PolyADAA1`'s $\mathcal{A}_{\text{even}}$ unmodified, whereas standalone wavefolder kernels emit both $(A_{\text{odd},3}, A_{\text{even},3})$ using pre-clamped inputs $\bar u = \mathrm{clamp}(u, -1, 1)$:
+Inside every 4-block SONA core group, `wavefolder_mix` with $\mu_{\text{wf}} \in [0, 1]$ convexly blends **only the odd harmonic channel** via $\mathcal{A}_{\text{odd}} \leftarrow (1 - \mu_{\text{wf}})\mathcal{A}_{\text{odd}} + \mu_{\text{wf}} w_{\text{odd,ADAA}}$ (with lane sign polarity stored in explicit `u16` `rect_sign_mask` rather than bit 15 of `wavefolder_mix_fp16`) while passing `AlgADAA1`'s $\mathcal{A}_{\text{even}}$ unmodified, whereas standalone wavefolder kernels emit both $(A_{\text{odd},3}, A_{\text{even},3})$ using pre-clamped inputs $\bar u = \mathrm{clamp}(u, -1, 1)$:
 
 $$w_{\text{odd},3}(u) = \bar u\big(1 - \bar u^2\big)^3, \qquad w_{\text{even},3}(u) = \bar u^2\big(1 - \bar u^2\big)^3$$
 
@@ -179,51 +204,40 @@ $$h_{\text{hyst}}[n] = s_{\text{re}}[n] \cdot \big(s_{\text{re}}[n] - s_{\text{r
 
 `r[dsp.op-n.bitcrusher.quantizer]`
 
-At the Top-of-Frame Crossbar, continuous pre-core conditioning executes through the 3-parameter `Op-N[Pre]` front-end configured by a 12-byte little-endian base wire descriptor at Arena 0 `Crossbar[180..192)` (`base_gamma_bc`, `base_zoh_hold_depth`, and `base_beta_q`, modulated at 3 kHz by `ControlBus` slots 26..28) and backed by the 28-byte 4-byte-aligned `OpNPreHotState` with zero 64-bit runtime integers in the audio callback:
+At the Top-of-Frame Crossbar, continuous pre-core conditioning executes `Op-N[Pre]` v4 strictly in **`quantize -> ZOH -> post-DAC CoreQuad SVF`** order ahead of `OS2X`, configured by a base wire descriptor (`Crossbar[180..192)` plus `s_q` / `kappa_h` / `log2_rho_zoh` controls) and a 4-byte-aligned `OpNPreHotState` with zero 64-bit runtime integers:
 
 | Region / Offset | Bytes | Fields & Types | Clamped Domain, Zero-Init & Control-Bus Invariant |
 | :--- | :---: | :--- | :--- |
 | Crossbar Wire 180..192 | 12 | `gamma_bc: f32le`, `zoh_hold_depth: f32le`, `beta_q: f32le` | Base wire `[0.0, 1.0]`, `[0.0, 0.9999]`, `[0.0, 16.0]` (log2 bit-depth above 0; 0 = bypass); slots 26..28 |
-| Active-Hot State 0..16 | 16 | `held: f32[2]`, `phase_q32: u32`, `inc_q32: u32` | `OpNPreHotState` prefix: unclipped L/R track-and-hold states plus 32-bit `Q0.32` ZOH accumulator and increment |
-| Active-Hot State 16..28 | 12 | `gamma_bc: f32`, `beta_q: f32`, `zoh_hold_depth_eff: f32` | Effective wet blend `[0.0, 1.0]`, hoisted log2 quantizer scale `[0.0, 16.0]`, and ZOH-rescaled hold depth `[0.0, 0.9999]` |
+| Active-Hot State 0..16 | 16 | `held: f32[2]`, `phase_q32: u32`, `inc_q32: u32` | `OpNPreHotState` prefix: unclipped L/R ZOH latch states plus 32-bit `Q0.32` ZOH accumulator and increment |
+| Active-Hot State 16..28+ | 12+ | `gamma_bc: f32`, `beta_q: f32`, `zoh_hold_depth_eff: f32`, `s_q`, `kappa_h` | Effective wet blend `[0.0, 1.0]`, hoisted log2 scale `[0.0, 16.0]`, ZOH hold depth `[0.0, 0.9999]`, quantizer sharpness `s_q`, and hold sharpness `kappa_h` |
 
-Encoding `zoh_hold_depth = 1.0 - rho_zoh` in `[0.0, 0.9999]` rather than `rho_zoh` directly enforces a critical zero-initialization identity invariant: zero-filled arenas (`zoh_hold_depth == 0.0`) decode `rho_zoh = 1.0` (ZOH bypass), so `g_clk == 1.0` passes every sample transparently instead of latching zero permanently.
+Encoding `zoh_hold_depth = 1.0 - rho_zoh` in `[0.0, 0.9999]` and `log2_rho_zoh` enforces zero-init pass-through (`g_clk == 1.0`) while keeping clock scaling rate-invariant across 44.1–192 kHz. Positioned after Op-T addition and ahead of OS2X, Op-N[Pre] v4 replaces the 1-harmonic Fourier quantizer with the **4-FMA $C^1$ Hermite deadzone staircase quantizer** (zero FDIV, faster than sine evaluation).
 
-Positioned immediately after `Op-T` crossbar addition and ahead of `OS2X` upsampling, `Op-N[Pre]` executes once per VM frame at $f_{s,\text{vm}}$ (`f_{s,host}` in real-time, or `4 * f_{s,host}` in 4× offline bounce where internal `OS2X` is bypassed), so `OS2X` never doubles its rate.
+For sharpness $s_q \in [0, 1]$, deadzone width $w = \max(1 - s_q, 2^{-12})$, pre-multiplied inverse width $w_{\text{inv}} = \mathrm{rcp}(w)$, and step $\Delta_q = 2^{-\mathrm{clamp}(\beta_q, -16, 16)}$ over $x_{\text{clip}} = \mathrm{clamp}(x_c, -100.0, +100.0)$:
 
-Cold setup defines `rho_vm = 48_000.0 / f_{s,vm}` with zero audio-thread `FDIV`. Micro-ramped `ControlBus` slots 26..28 (`op_n_pre_{gamma_bc,zoh_hold,beta_q}_delta`) update `OpNPreHotState` across cold load, `K_ctrl` ticks, and per-frame VM execution:
+$$n = \mathrm{round}(x_{\text{clip}} D_q), \qquad r = x_{\text{clip}} D_q - n \in [-0.5, 0.5], \qquad t = \mathrm{clamp}\big((|r| - (0.5 - 0.5 w)) w_{\text{inv}}, 0, 1\big)$$
+$$Q(x_c) = \Delta_q \Big(n + \mathrm{sgn}(r) \cdot 0.5 t^2(3 - 2t)\Big)$$
 
-- **Clamped targets:** `gamma_bc = clamp(base_gamma_bc + t[26], 0.0, 1.0)`, `z_h = clamp(base_zoh_hold_depth + t[27], 0.0, 0.9999)`, `beta_q = clamp(base_beta_q + t[28], 0.0, 16.0)`.
-- **Effective ZOH rate & depth:** `rho_zoh = 1.0 - z_h` yields `rho_eff = clamp(rho_zoh * rho_vm, 1.0e-5, 1.0)` and `z_h_eff = (z_h <= 0.0) ? 0.0 : clamp(z_h^rho_vm, 0.0, 0.9999)`.
-- **Scaled increment:** `inc_q32 = (rho_eff >= 1.0 - 1.0e-7 || z_h_eff <= 0.0) ? 0 : max(1, round(rho_eff * 2^32))`, scaling proportionally by `rho_vm` without 64-bit integers.
-
-Per VM sub-block hoist or frame update, `beta_q` prepares `D_q = exp2_clamped16(beta_q)` and `Delta_q = exp2_clamped16(-beta_q)` via `exp2_clamped16` rather than `exp2_clamped5` (§1.2, nearest-integer split, IEEE-754 exponent injection, and degree-5 Horner polynomial on `[-0.5, +0.5]`), incurring zero division inside the 28-byte `OpNPreHotState`.
-
-Over the certified [-100, 100] signal envelope in f32, integer floor splitting computes `h_clip = clamp(held_c, -100.0, 100.0)`, `v = h_clip * D_q`, truncates toward zero to signed i32 `t = v as i32`, forms `k = t - (v < t as f32) as i32` with clamped fractional residual `f = clamp(v - k as f32, 0.0, 1.0)`, wraps `phi_q32` into u32 [0, 2^32) with zero overflow, and drives `q32_smooth_sin(phi_q32)` using compile-time `INV_TAU = 1.0 / (2 * pi)`:
-
-$$\widetilde{Q}(h; \Delta_q) = h_{\text{clip}} - \Delta_q \mathrm{INV-TAU} \cdot \mathrm{q32-smooth-sin}(\phi_{q32})$$
-
-#### 2.3.2 Raised-Cosine Clocked Track-and-Hold & Smooth Fourier Quantizer
+#### 2.3.2 Hard-Capable `Q0.32` Phase-Wrap ZOH & Quantize-First Latch
 
 `r[dsp.op-n.bitcrusher.zoh-phase]`
 
-Executing once per VM frame at $f_{s,\text{vm}}$ ahead of `OS2X` (`f_{s,host}` in real-time, or `4 * f_{s,host}` in 4× offline bounce with `OS2X` bypassed), stereo `Op-N[Pre]` combines a raised-cosine track-and-hold with a smooth Fourier staircase quantizer using strictly 32-bit runtime integers:
+Executing once per VM frame at $f_{s,\text{vm}}$ ahead of `OS2X`, `Op-N[Pre]` v4 applies `Q(x_c)` first (`q_c = clamp(x_c, -100.0, 100.0)` when `beta_q <= 1e-6`, else 4-FMA $C^1$ Hermite staircase), blends wet quantized signal `q_wet = x_c + gamma_bc * (q_c - x_c)`, and feeds the **decoupled hard-capable `Q0.32` phase-wrap ZOH** using strictly 32-bit runtime integers:
 
-**Raised-Cosine Clock Gain** sets `g_clk = 1.0` when `inc_q32 == 0`, otherwise advancing `phase_q32 = phase_q32.wrapping_add(inc_q32)`, evaluating `cos_phi = q32_smooth_sin(phase_q32.wrapping_add(0x4000_0000))`, `u = 0.5 * (1.0 + cos_phi)`, `w = u * u`, and `g_clk = (1.0 - z_h_eff) + z_h_eff * w`.
+- **Log-Frequency Clock:** `rho_eff = exp2_clamped16(log2_rho_zoh) * rho_vm` maps across 44.1–192 kHz into `inc_q32 = (rho_eff >= 1.0 - 1.0e-7 || z_h_eff <= 0.0) ? 0 : max(1, round(rho_eff * 2^32))`.
+- **Phase-Wrap Hold Latch:** Wrapping `phase_q32` sets `wrap = (new_phase < phase_q32) ? 1.0 : 0.0` alongside soft raised-cosine edge `w(phi) = 0.25 * (1 + cos(2*pi*phi))^2`.
+- **Independent Hold Sharpness:** Blending `kappa_h` in `[0, 1]` yields `g_clk = (inc_q32 == 0) ? 1.0 : ((1 - z_h_eff) + z_h_eff * ((1 - kappa_h) * w(phi) + kappa_h * wrap))` (0-ULP bypass when `gamma_bc <= 0.0 && z_h_eff <= 0.0`).
 
-**Continuous State Update & Bypass** always updates unclipped `held_c = flush((1.0 - g_clk) * held_c + g_clk * x_c)` per channel and returns `(x_L, x_R)` unchanged (0-ULP pass-through preserving tracked history) whenever `gamma_bc <= 0.0`.
+$$g_{\mathrm{clk}}[n] = (1 - z_{h,\mathrm{eff}}) + z_{h,\mathrm{eff}} \big((1 - \kappa_h) w(\phi[n]) + \kappa_h \cdot \mathbf{1}_{\mathrm{wrap}}[n]\big), \qquad h_c[n] = (1 - g_{\mathrm{clk}}[n]) h_c[n-1] + g_{\mathrm{clk}}[n] q_{\mathrm{wet},c}[n]$$
 
-**Smooth Fourier Quantizer & Wet Blend** sets `q_c = clamp(held_c, -100.0, 100.0)` when `beta_q <= 1.0e-6`, otherwise evaluating $\widetilde{Q}(held_c)$ via signed i32 floor-splitting and `q32_smooth_sin` (§2.3.1), and emits `y_c = x_c + gamma_bc * (q_c - x_c)`.
+When `inc_q32 == 0`, `g_clk == 1.0` tracks every sample cleanly with exact Zero-DC (`0.0 -> 0.0`) and unconditional BIBO contractivity (`0 <= 1 - g_clk < 1`). Standalone fixed-Hertz exact-rate tracking retains $F = 2^{32}$ units per Hz with $D = \mathrm{round}_{\text{even}}(F f_s)$ and $I = \mathrm{round}_{\text{even}}(F f_{\text{target}})$.
 
-$$w(\phi) = \left(\frac{1 + \cos(2\pi\phi)}{2}\right)^2, \qquad g_{\mathrm{clk}}[n] = (1 - z_{h,\mathrm{eff}}) + z_{h,\mathrm{eff}} w(\phi[n]), \qquad h_c[n] = (1 - g_{\mathrm{clk}}[n]) h_c[n-1] + g_{\mathrm{clk}}[n] x_c[n]$$
-
-When `inc_q32 == 0` (such as `zoh_hold_depth == 0.0` at 48 kHz), `g_clk == 1.0` tracks every input sample cleanly with Zero-DC (`0.0 -> 0.0`) and unconditional BIBO contractivity (`0 <= 1 - g_clk <= 0.9999 < 1`). For standalone fixed-Hertz exact-rate tracking using $F = 2^{32}$ units per Hz, cold preparation computes $D = \mathrm{round}_{\text{even}}(F f_s)$ and $I = \mathrm{round}_{\text{even}}(F f_{\text{target}})$ with $0 \le I \le D$, stepping phase $P \in [0, D)$ via $A = P + I$, carry $b = \mathbf{1}[A \ge D]$, and $P \leftarrow A - bD$.
-
-#### 2.3.3 Division-Free `Q0.32` & Fixed-Hertz Effective-Rate Phase Transfer
+#### 2.3.3 Division-Free `Q0.32` & Log-Frequency Effective-Rate Phase Transfer
 
 `r[dsp.op-n.bitcrusher.rate-transfer]`
 
-Across host sample-rate changes or 4× offline bounce transitions, internal `OS2X` never doubles the `Op-N[Pre]` rate because execution runs ahead of upsampling at $f_{s,\text{vm}}$. Normalized 32-bit `phase_q32` encodes a dimensionless fraction in $[0, 1)$ of one hold period and transfers across rates unchanged without 64-bit integers, while cold and 3 kHz setup rescale `inc_q32` and `z_h_eff` proportionally by $\rho_{\text{vm}} = 48{,}000 / f_{s,\text{vm}}$.
+Across host sample-rate changes from 44.1 kHz through 192 kHz or 4× offline bounce transitions, internal `OS2X` never doubles the `Op-N[Pre]` rate because execution runs ahead of upsampling at $f_{s,\text{vm}}$. Normalized 32-bit `phase_q32` transfers unchanged across sample rates, while `log2_rho_zoh` maps via `exp2_clamped16(log2_rho_zoh) * rho_vm` directly to `inc_q32` so ZOH cutoff frequencies remain invariant across 44.1–192 kHz with zero 64-bit integers in the audio callback.
 
 For standalone fixed-Hertz exact-rate tracking, precomputing `u64` reciprocal $R = \lfloor 2^{104} / D_{\text{old}} \rfloor$ on the cold path lets sample-rate transitions form $N = P_{\text{old}} D_{\text{new}} < 2^{102}$ in 128-bit unsigned integer arithmetic, evaluate quotient $q_0 = \lfloor N R / 2^{104} \rfloor$ via bit shifts, refine remainder $r_0 = N - q_0 D_{\text{old}}$, round ties-to-even, and clamp to $D_{\text{new}} - 1$ so imminent carries stay imminent:
 
@@ -231,11 +245,11 @@ $$P_{\text{new}} = \min\left(\mathrm{round}_{\text{even}}\left(\frac{P_{\text{ol
 
 Here $N = N_{\text{hi}}2^{64} + N_{\text{lo}}$, $a = N_{\text{lo}}R$, $c = N_{\text{hi}}R$, $M = 2^{64} - 1$, $m = (a \gg 64) + (c \mathbin{\mathrm{and}} M)$, and $h = (c \gg 64) + (m \gg 64)$, keeping frequency error $|f_s(I/D) - f_{\text{target}}| \le 2^{-32}$ Hz.
 
-#### 2.3.4 Exact $C^\infty$ Training & 1-D Affine Track-and-Hold Gradients
+#### 2.3.4 Exact $C^1$ Hermite & Phase-Wrap ZOH Training Gradients
 
 `r[dsp.op-n.bitcrusher.surrogate]`
 
-Because raised-cosine track-and-hold is a 1-D scalar affine recurrence, with $0 \le 1 - g_{\text{clk}}[n] < 1$ , and $\widetilde{Q}(h)$ is $C^\infty$ differentiable with zero discontinuous jumps, WebGPU training executes exact forward and reverse adjoint passes using the shared 1-D affine `LinearScanElem` scan across $(x, z_h, \omega_{\text{clk}}, \Delta_q, \gamma_{\text{bc}})$ with zero straight-through estimators (`STE`).
+Because the 4-FMA $C^1$ Hermite deadzone quantizer is $C^1$ differentiable in $(x, \beta_q, s_q)$ and the phase-wrap ZOH is a 1-D scalar affine recurrence with $0 \le 1 - g_{\text{clk}}[n] < 1$, WebGPU training evaluates exact forward and reverse adjoint passes using the shared 1-D affine `LinearScanElem` scan across $(x, z_h, \kappa_h, \log_2\rho_{\text{zoh}}, \beta_q, s_q, \gamma_{\text{bc}})$ with zero straight-through estimators (`STE`), achieving -30.6..-55.3 dB at smooth `(0.98, 1.0)` and -325+ dB at exact `(1.0, 1.0)`.
 
 ---
 
@@ -245,7 +259,7 @@ Because raised-cosine track-and-hold is a 1-D scalar affine recurrence, with $0 
 
 `r[dsp.op-n.commuted.theorem1]`
 
-SONA v3.0 applies Theorem 1 to fold `LinearReadout` 3 kHz linear projections (`pre_conv` and `direct_s2`) directly inside SIMD registers across the 4-block core with zero intermediate scratch gather buffers.
+SONA v4.0 applies Theorem 1 to fold `LinearReadout` (`W_ro,0` + additive `W_ro_head` deltas) directly inside SIMD registers across the 4-block core with zero intermediate scratch gather buffers.
 
 **Theorem 1 (Exact LTI Basis Commutativity).** Let $\mathbf{u}[n] \in \mathbb{R}^P$ be bounded per-channel block activations satisfying $\sup_{n, p} |u_p[n]| \le U_{\max} < \infty$, let $\lbrace \mathcal{L}_k \rbrace_{k=0}^{K-1}$ be causal, stable LTI filters with impulse responses $h_k \in \ell_1(\mathbb{Z})$, and let $\lbrace \mathbf{W}_k \rbrace_{k=0}^{K-1} \subset \mathbb{R}^{P \times C}$ be constant projection matrices. Then for every output channel $c \in [0, C-1]$ and sample $n \in \mathbb{Z}$:
 
@@ -259,7 +273,7 @@ $$\sum_{k=0}^{K-1} \Big(\mathcal{L}_k\big(\mathbf{u}\big)[n]\Big) \mathbf{W}_k \
 
 `r[dsp.op-n.commuted.causality]`
 
-All Top-of-Frame Crossbar `Op-T` reads where $\tau_{\min} = 5.0$ samples across 4-frame causal micro-chunks (and $\tau \ge 4.0$ on standalone single-sample rings), `TPT-SVF` / `ParaLRU` / `PolyADAA1` updates, `poly3` decimation filters, and `ModalConvolver` interfaces in SONA v3.0 are strictly causal with $d \ge 0$, maintaining sample-accurate phase alignment across 1× and 2× (4× bounce) paths.
+All Top-of-Frame Crossbar `Op-T` reads where $\tau_{\min} = 5.0$ samples across 4-frame causal micro-chunks (and $\tau \ge 4.0$ on standalone single-sample rings), `TPT-SVF` / `ParaLRU` / `AlgADAA1` updates, the all-tier 2× 15-tap symmetric linear-phase HB-FIR oversampler (exact 7 1×-sample pure integer delay), and `ModalConvolver` v4 interfaces in SONA v4.0 are strictly causal with $d \ge 0$, maintaining sample-accurate phase alignment across 2× and 4× bounce paths.
 
 ---
 
@@ -267,11 +281,9 @@ All Top-of-Frame Crossbar `Op-T` reads where $\tau_{\min} = 5.0$ samples across 
 
 `r[dsp.op-n.commuted.project-then-filter]`
 
-Under 3 kHz control modulation of core filters, drive nonlinearities, and readout matrices, ControlBus advances all 32 slots in `current_stage_params` uniformly per VM frame across `K_ctrl(f_{s,vm}) = max(8, round(f_{s,vm} / 3_000.0))` (including slot 16 `freeze_mix_drive` and slot 30 `sense_vca_gain_delta`), while recursive slews (Kautz `prev_oct` and Op-T `current_psi`) update strictly when `ctrl_sub_counter == 0`.
+Under 3 kHz control modulation of core filters, drive nonlinearities, routing gates, and readout deltas, `ControlBus` v4 uses 4-frame aligned stride $K_{\text{ctrl}}(f_{s,\text{vm}}) = 4 \cdot \max(2, \mathrm{round}(f_{s,\text{vm}} / 12{,}000.0))$ (`K_ctrl(44.1 kHz) = 16`, `gcd(16, 4) = 4`, eliminating 196 Hz beat jitter and scalar peeling) and micro-ramps `[stage_targets(32), z_stage(8), z_head(8), g_edge(6), op_t_q(16)]` once per 4-frame micro-chunk (`alpha_chunk = 4 / K_ctrl = 0.25`), while recursive slews (Kautz `prev_oct` and Op-T `current_psi`) update strictly when `ctrl_sub_counter == 0`.
 
-Hot `CoreQuad`, crossbar, `Op-N[Pre]`, and `Op-T` registers latch `(current_stage_params, eff_z_stage)` strictly when `(sample_tick & 3) == 0 || ctrl_sub_counter == 0`, entering 4-frame micro-chunks only when `(sample_tick & 3) == 0 && rem_frames >= 4 && rem_tick >= 4` and otherwise peeling 1 frame while holding latched registers across `(sample_tick & 3) in 1..4`.
-
-Because both `ControlBus` increments and register-latch boundaries depend solely on sample phase, `process(1) * N == process(4) * (N/4) == process(16) * (N/16)` holds at 0 ULP across every sample rate (including 44.1 kHz with `K_ctrl = 15`) even under active control sweeps, bounding the commutator residual against continuous evaluation:
+Hot `CoreQuad`, crossbar, `Op-N[Pre]`, and `Op-T` registers latch strictly at 4-frame chunk boundaries (`(sample_tick & 3) == 0 || ctrl_sub_counter == 0`), guaranteeing 0-ULP equivalence `process(1) * N == process(4) * (N/4) == process(16) * (N/16)` across every sample rate including 44.1 kHz (`K_ctrl = 16`) with zero tile rewrites:
 
 $$\Delta_{\text{comm}}[n] \le \frac{B_u \nu_{\text{ctrl}}}{f_s} \cdot \frac{r_k}{1 - r_k}$$
 
@@ -281,7 +293,7 @@ $$\Delta_{\text{comm}}[n] \le \frac{B_u \nu_{\text{ctrl}}}{f_s} \cdot \frac{r_k}
 
 `r[dsp.op-n.commuted.dc-equilibrium]`
 
-With decoupled 1-D `ParaLRU` recurrence $v_i[n] = \alpha_{\text{rel},i} v_i[n-1] + (1 - \alpha_{\text{atk},i})\phi_{\text{rect}}(u_i[n] - \kappa_i \alpha_{\text{rel},i} v_i[n-1])$ satisfying $\phi_{\text{rect}}(0) = 0$, analytical zero-DC resting bias centering at `StarCenter` where $u_{\text{eq}} = 0.0$, `PolyADAA1` zero equilibrium satisfying $g_{\mathrm{odd}}(+0.0) = g_{\mathrm{even}}(+0.0) = +0.0$, and zero-initialized integrators, all recursive state settles at exact 0.000000 DC equilibrium (`h_eq == +0.0`, `b_head == 0.0`):
+With decoupled 1-D `ParaLRU` recurrence using the $C^2$ quartic spline `soft_rect` satisfying $\phi_{\text{rect}}(0) = +0.0$, analytical zero-DC resting bias centering at `StarCenter` where $u_{\text{eq}} = +0.0$, `AlgADAA1(0.5)` zero equilibrium satisfying $\mathcal{A}_{\mathrm{odd}}^{\mathrm{alg}}(+0.0, +0.0) = \mathcal{A}_{\mathrm{even}}^{\mathrm{alg}}(+0.0, +0.0) = +0.0$, and zero-initialized integrators, all recursive state settles at exact 0.000000 DC equilibrium (`h_eq == +0.0`, `b_head == 0.0`):
 
 1. Core `ParaLRU` lanes initialize at $v_{\text{init}} = +0.0$ across 16, 24, 32, or 40 lanes per channel from Lite through Ultra.
 2. `TPT-SVF` and AC coupling filters initialize states $s_1 = s_2 = +0.0$ at idle equilibrium.
@@ -292,60 +304,41 @@ With decoupled 1-D `ParaLRU` recurrence $v_i[n] = \alpha_{\text{rel},i} v_i[n-1]
 
 `r[dsp.op-n.core.matryoshka-blocks]`
 
-SONA v3.0 models nonlinear preamps, resonant diode filters, magnetic hysteresis, stereo-linked bus compression, crossovers, and sweeps via a 4-block Matryoshka state-space core sorted across 10 logical 4-lane CoreQuads `[(0,0), (1,0), (2,0), (3,0), (0,1), (1,1), (0,2), (2,1), (0,3), (1,2)]` and 35 causal lower-triangular inter-block mixing tiles.
+SONA v4.0 models nonlinear preamps, resonant diode filters, magnetic hysteresis, stereo-linked bus compression, crossovers, and sweeps via a rebalanced 4-block Matryoshka state-space core sorted across 10 logical 4-lane CoreQuads `[(0,0), (1,0), (2,0), (3,0), (0,1), (1,1), (2,1), (3,1), (0,2), (1,2)]` and 37 causal lower-triangular inter-block mixing tiles (`MAX_OUTGOING_PER_QUAD = 7`).
 
-Each CoreQuad chains M/S input coupling (`in_mid_weight_fp16`, `in_side_weight_fp16`), passive 2×2 TPT-SVF (linearly-implicit PHS diode-bandpass saturation `svf_k_nl` on Block 0 and linear ZDF TPT-SVF on Blocks 1..3), Selective-Duhem stereo-linked ParaLRU, pure f32 PolyADAA1 plus C² wavefolder (`wavefolder_mix_fp16` with bit-15 `rect_sign`), and bounded GLU across the four tier profiles:
+Each CoreQuad chains M/S input coupling (`in_mid_weight_fp16`, `in_side_weight_fp16`), 3-tap folded TPT-SVF (Predictor-Corrector passive PHS on Block 0 and linear ZDF TPT-SVF on Blocks 1..3), and smooth Selective-Duhem stereo-linked ParaLRU with C² quartic spline `soft_rect`.
 
-| Tier Profile | `CoreQuad`s & Lanes | Inter-Block Tiles | Core Rate | `TPT-SVF` Quads / Modes | `ModalConvolver` (FIR / Kautz) | `TransportQuad`s (`Lines`) | Hot Working Budget |
+Nonlinear drive applies `g_pre(v²)` and clamped `AlgADAA1(0.5)` (`MAX_ALG_R = 4096.0`, NR3) with `lin_mix`, C² wavefolder (`rect_sign_mask`), post-ADAA rank-1 SE-Bus, bounded GLU, and micro-ramped `out_gain`:
+
+| Tier Profile | `CoreQuad`s & Lanes | Inter-Block Tiles | Core Rate | `TPT-SVF` Quads / Modes | `ModalConvolver` (FIR / `ErSparse` / Kautz) | `TransportQuad`s (`Lines`) | Hot L1D Working Set |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Lite `[1, 1, 1, 1]` | 4 quads (16 lanes) | 3 | 1× `PolyADAA1` | 4 quads (16 modes) | 32 taps / 8 pairs | 1 quad (4 lines) | <= 4,608 B |
-| Full `[2, 2, 1, 1]` | 6 quads (24 lanes) | 13 | 2× OS (96 kHz) | 6 quads (24 modes) | 48 taps / 12 pairs | 2 quads (8 lines) | <= 7,936 B |
-| Pro `[3, 2, 2, 1]` | 8 quads (32 lanes) | 23 | 2× OS (96 kHz) | 8 quads (32 modes) | 96 taps / 24 pairs | 3 quads (12 lines) | <= 15,872 B |
-| Ultra `[4, 3, 2, 1]` | 10 quads (40 lanes) | 35 | 2× OS (4× Bounce) | 10 quads (40 modes) | 128 taps / 32 pairs | 4 quads (16 lines) | <= 28,672 B |
+| Lite `[1, 1, 1, 1]` | 4 quads (16 lanes) | 5 | 2× HB-FIR | 4 quads (16 modes) | 32 taps / 8 `ErSparse` / 8 pairs | 1 quad (4 lines, 64-fr inline) | 4,432 B (`14× = 60.59 KiB <= 64 KiB`) |
+| Full `[2, 2, 1, 1]` | 6 quads (24 lanes) | 13 | 2× HB-FIR | 6 quads (24 modes) | 48 taps / 16 `ErSparse` / 12 pairs | 2 quads (8 lines) | <= 8,192 B (`8× <= 64 KiB`) |
+| Pro `[2, 2, 2, 2]` | 8 quads (32 lanes) | 24 | 2× HB-FIR | 8 quads (32 modes) | 96 taps / 16 `ErSparse` / 24 pairs | 3 quads (12 lines) | <= 16,384 B (`4× <= 64 KiB`) |
+| Ultra `[3, 3, 2, 2]` | 10 quads (40 lanes) | 37 | 2× HB-FIR (4× Bounce) | 10 quads (40 modes) | 128 taps / 16 `ErSparse` / 32 pairs | 4 quads (16 lines) | <= 32,768 B (`2× <= 64 KiB`) |
 
-With `SOFT_RECT_EPS` $\varepsilon = 10^{-3}$ and `SOFT_RECT_LARGE_Z = 1.0e15`, the zero-DC soft rectifier sets $z_{\text{safe}} = \min(|z|, 10^{15})$, $q = z_{\text{safe}}^2 + \varepsilon^2$, evaluates $r_{\text{inv}} = q^{-1/2}$ via a 3-step Newton inverse square root, $r_{\text{rad}} = q \cdot r_{\text{inv}}$, and evaluates $w_\varepsilon = (r_{\text{rad}} + \varepsilon)^{-1}$ and $w_z = (r_{\text{rad}} + z_{\text{safe}})^{-1}$ via 3-step Newton reciprocals across three cancellation-free branches for $\phi_{\text{rect}}(z) = \frac{1}{2}(z + \sqrt{z^2 + \varepsilon^2} - \varepsilon)$:
+Replacing the 84-op square-root rectifier (6 `NR3` chains/quad) with a **C² quartic spline `soft_rect`** (12–14 NEON ops, zero `rsqrt` or `rcp`, -70c/quad modeled CPU, zero negative leak, $C^2$ continuous curvature for `L-SSBroyden`) sets $t = \mathrm{clamp}(z / (2\epsilon), 0, 1)$ with `SOFT_RECT_EPS` $\varepsilon = 10^{-3}$:
 
-- Zero branch for $|z| \le 0.0$: emits canonical +0.0 (`0x0000_0000`) with derivative 0.5.
-- Positive branch for $z > 0$: evaluates $\phi_{\text{rect}}(z) = \frac{1}{2}(z_{\text{safe}} + z_{\text{safe}}^2 w_\varepsilon)$ and $\phi_{\text{rect}}'(z) = \frac{1}{2}(1 + z_{\text{safe}} r_{\text{inv}})$.
-- Negative branch for $z < 0$: uses rationalized evaluation to avoid square-root cancellation, saturating at $(-\varepsilon/2, 0.0)$ when $|z| > 10^{15}$:
+$$\phi_{\text{rect}}(z) = \epsilon t^3(2 - t) + \max(z - 2\epsilon, 0), \qquad \phi_{\text{rect}}'(z) = t^2(3 - 2t) \in [0, 1]$$
 
-$$\phi_{\text{rect}}(z) = -\frac{\varepsilon}{2} (z_{\text{safe}} w_z)(1 + z_{\text{safe}} w_\varepsilon), \qquad \phi_{\text{rect}}'(z) = \frac{\varepsilon^2 r_{\text{inv}}}{2(r_{\text{rad}} + z_{\text{safe}})}$$
+Every `ParaLRU` lane clamps $\alpha_{\text{rel}} \in [0.0, r_{\max}]$ (`MAX_PARALRU_R_F32 = 0x3F7F_FFAC`), $\alpha_{\text{atk}} \in [0.0, 1.0]$ in continuous-time log coordinates where ZOH scaling is exact scalar $\lambda \mapsto \rho\lambda$, $\kappa \in [0.0, 1.0]$, stereo link $\lambda \in [0.0, 1.0]$, Duhem gate $\gamma_{\text{duhem}} \in [0.0, 64.0]$, and signed blend $\eta \in [0.0, 1.0]$. Replacing hard-clamped `rho` with the **smooth non-saturating `ParaLRU` ODE** (zero gradient collapse):
 
-Every `ParaLRU` lane clamps $\alpha_{\text{rel}} \in [0.0, r_{\max}]$ with `MAX_PARALRU_R_F32 = 0x3F7F_FFAC` (0.999995), $\alpha_{\text{atk}} \in [0.0, 1.0]$, $\kappa \in [0.0, 1.0]$, stereo link $\lambda \in [0.0, 1.0]$, Duhem derivative gate $\gamma_{\text{duhem}} \in [0.0, 64.0]$, and signed blend $\eta \in [0.0, 1.0]$. Reusing the `TPT-SVF` flux increment $\Delta s_{2,i}[n] = 2 g_i \mathrm{BP}_i[n]$ in registers with zero extra state (`Mamba` / Duhem gating):
-
-$$\rho_i[n] = \mathrm{clamp}\big((1 - \alpha_{\text{atk},i}) + \gamma_{\text{duhem},i} \lvert 2 g_i \cdot \mathrm{BP}_i[n] \rvert, 0.0, 1.0\big)$$
+$$\rho_i[n] = 1.0 - \alpha_{\text{atk},i}\cdot\mathrm{rcp-ge1-nr2}\big(1.0 + \gamma_{\text{duhem},i} \lvert 2 g_i \cdot \mathrm{BP}_i[n] \rvert\big)$$
 $$d_i[n] = \alpha_{\text{rel},i} v_i[n-1], \qquad z_i[n] = s_i u_{\text{tone},i}[n] - \kappa_i (1 - \eta_i) d_i[n]$$
 $$\bar{z}_i[n] = \mathrm{clamp}\big(z_i[n], -1.0, 1.0\big), \qquad \psi_1\big(z_i[n]\big) = \bar{z}_i[n]\left(1.0 - \frac{1}{3}\bar{z}_i[n]^2\right)$$
 $$\phi_{\eta,i}\big(z_i[n]\big) = (1 - \eta_i)\phi_{\text{rect}}\big(z_i[n]\big) + \eta_i\psi_1\big(z_i[n]\big)$$
 $$v_i[n] = \mathrm{flush}\Big(\big(1 - \eta_i \rho_i[n]\big) d_i[n] + \rho_i[n] \phi_{\eta,i}\big(z_i[n]\big)\Big)$$
 $$J_i[n] = \frac{\partial v_i[n]}{\partial v_i[n-1]} = \alpha_{\text{rel},i}\Big((1 - \eta_i \rho_i[n]) - \rho_i[n] \kappa_i (1 - \eta_i)\phi_{\eta,i}'(z_i[n])\Big) \in \big[(1 - \rho_i[n])\alpha_{\text{rel},i}, \alpha_{\text{rel},i}\big] \subset [0, 1)$$
 
-Because $J_i[n] \in [(1 - \rho_i[n])\alpha_{\text{rel},i}, \alpha_{\text{rel},i}] \subset [0, 1)$, Selective-Duhem ParaLRU is unconditionally contractive without post-hoc ISS clamping. At $\gamma_{\text{duhem}} = 0, \eta = 0$, it reduces bit-for-bit to the scalar diode-RC rectifier, while $\eta = 1, \alpha_{\text{atk}} = 1, \gamma_{\text{duhem}} > 0$ holds coercive magnetic remanence across extrema as $\Delta s_2 \to 0$.
+Because $J_i[n] \in [(1 - \rho_i[n])\alpha_{\text{rel},i}, \alpha_{\text{rel},i}] \subset [0, 1)$, Selective-Duhem `ParaLRU` is unconditionally contractive without post-hoc ISS clamping. At $\gamma_{\text{duhem}} = 0, \eta = 0$, it reduces bit-for-bit to the scalar diode-RC rectifier, while $\eta = 1, \alpha_{\text{atk}} = 1, \gamma_{\text{duhem}} > 0$ holds coercive magnetic remanence across extrema as $\Delta s_2 \to 0$.
 
-WebGPU training runs joint 4-thread `(L, R)` in-SRAM stepping (<= 15.0 KiB, [webgpu_and_varpro_solver.md](../training/webgpu_and_varpro_solver.md)) so stereo linking $\lambda_i$ requires zero cross-workgroup sync and matches same-FMA-class CPU 4-lane execution at 0-ULP parity (<= 1.5 ULP/step across FMA vs non-FMA CPU/GPU targets).
+WebGPU training executes an **8-thread L/R × 4-lane `ParaLRU` split** in SRAM (<= 15.0 KiB, eliminating 97%–99.6% thread starvation) with an exact $O(\log_2 N)$ associative scan fast path whenever $\kappa(1 - \eta) == 0$ (feedforward and pure-Duhem lanes).
 
-Each CoreQuad applies audio-rate stereo linking $v_{\mathrm{eff},c,i} = v_{c,i} + \lambda_i(v_{\mathrm{mid},i} - v_{c,i})$, where $v_{\mathrm{mid},i} = 0.5(v_{L,i} + v_{R,i})$ , right after updating `(v_L, v_R)`. Downstream sag gain `max(0.05, 1 - sag_depth * v_eff)` and bias `lru_bias_eff` consume `v_eff`, preserving 0° image drift at $\lambda_i = 1$ .
-
-Effective bias `b_lru_eff` (`b_lru_base = base_lru_bias_drive`) drives PolyADAA1 via `r_curr = ((tone_in * d_adaa_eff) * sag_gain).fma(b_lru_eff, v_eff)`, where $s_{\mathrm{rect}}$ denotes `rect_sign` decoded from bit 15 (`0x8000`) of `wavefolder_mix_fp16`:
+Audio-rate stereo linking $v_{\mathrm{eff},c,i} = v_{c,i} + \lambda_i(v_{\mathrm{mid},i} - v_{c,i})$ feeds $C^\infty$ bounded pre-ADAA gain $g_{\mathrm{pre}}(v_{\mathrm{eff}}^2)$ and clamped AlgADAA1 (`r_curr = clamp(g_pre * d_adaa_eff * tone_in + b_lru_eff, -4096.0, +4096.0)`), where $s_{\mathrm{rect}}$ denotes explicit `u16` `rect_sign_mask` (replacing bit-15 XOR of `wavefolder_mix_fp16` so `f32` never carries -0.0):
 
 $$b_{\mathrm{lru,eff}} = \mathrm{clamp}\big(b_{\mathrm{lru,base}} + s_{\mathrm{rect}} \cdot \theta_{\mathrm{lru}}, -16.0, +16.0\big)$$
 
-Mechanism A2 watermarking flips `in_mid_weight`, `in_side_weight`, and `b_lru_base` by lane sign $s_l \in \lbrace -1, +1 \rbrace$ and unconditionally XORs bit 15 (`^ 0x8000`, including 0x0000 <-> 0x8000) of `wavefolder_mix_fp16[l]` for `rect_sign` whenever $s_l = -1$.
-
-This keeps $|2 g \cdot \mathrm{BP}_l|$, $\rho_l$, and Block 0 PHS damping $k_{\mathrm{nl}} \min(s_{1,l}^2, E_{\max})$ even-symmetric (`svf_k_nl_fp16` untouched), preserves $v_l$ at 0 ULP across $\eta \in [0, 1]$, and flips `glu_mix[l]` by $s_l \cdot s_{(l+1)\bmod 4}$ across static and modulated states ([parametric_control_bus.md §3.1](parametric_control_bus.md#31-operator-parameter-dispatch-matrix--sensitivity-laws)).
-
-For backward gradients inside the reverse-time adjoint scan tile, recomputing `(v_L, v_R)` from checkpoints gives linear reverse-time scan elements `(J_i, J_i * adj_v[i])` over $N + 1$ inclusive suffix slots starting from sentinel `suffix[N] = (1.0, 0.0)`:
-
-$$e_i = (a_i, b_i) = \big(J_i, J_i \bar{v}_i\big), \qquad e_{\mathrm{id}} = (1.0, 0.0)$$
-$$\mathrm{compose}(e_{\mathrm{first}}, e_{\mathrm{second}}) = \big(e_{\mathrm{second}}.a \cdot e_{\mathrm{first}}.a, e_{\mathrm{second}}.a \cdot e_{\mathrm{first}}.b + e_{\mathrm{second}}.b\big)$$
-$$\mathtt{suffix}[N] = (1.0, 0.0), \qquad \mathtt{suffix}[i] = \mathrm{compose}\big(\mathtt{suffix}[i+1], e_i\big)$$
-
-Because stereo linking transforms `(v_L, v_R) -> (v_eff,L, v_eff,R)` outside the recurrence state `v`, the backward pass backpropagates `adj_v` through the linear stereo-link transpose prior to the suffix scan, propagates $\bar{v}_{\text{out}}$ across tiles, and propagates $\nabla_{\rho_i} L$ back into $\nabla_{\mathrm{BP}_i} L$ through the Selective-Duhem gate:
-
-$$\bar{v}_{c} \mathrel{+}= \big(1 - 0.5\lambda\big)\bar{v}_{\mathrm{eff},c} + 0.5\lambda\bar{v}_{\mathrm{eff},\bar{c}}, \qquad \lambda_i = \bar{v}_i + \mathtt{suffix}[i+1].a \cdot \bar{v}_{\text{out}} + \mathtt{suffix}[i+1].b$$
-$$\nabla_{\rho_i} L = \lambda_i \big(\phi_{\eta,i}(z_i) - \eta_i d_i\big), \qquad \nabla_{\mathrm{BP}_i} L \mathrel{+}= \nabla_{\rho_i} L \cdot \mathbf{1}_{\rho \in (0, 1)} \cdot 2 g_i \gamma_{\text{duhem},i} \mathrm{sign}(\mathrm{BP}_i)$$
-$$\nabla_{\alpha_{\text{rel}}} L = \sum_{i=0}^{N-1} \lambda_i v_{i-1}\Big((1 - \eta_i \rho_i) - \rho_i \kappa_i (1 - \eta_i)\phi_{\eta,i}'(z_i)\Big), \qquad \nabla_{\gamma_{\text{duhem}}} L = \sum_{i=0}^{N-1} \nabla_{\rho_i} L \cdot \mathbf{1}_{\rho \in (0, 1)} \cdot |2 g_i \mathrm{BP}_i|$$
-$$\nabla_{g} L \mathrel{+}= \sum_{i=0}^{N-1} \nabla_{\rho_i} L \cdot \mathbf{1}_{\rho \in (0, 1)} \cdot 2 \gamma_{\text{duhem},i} \lvert \mathrm{BP}_i \rvert$$
+Mechanism A2 watermarking flips `in_mid_weight`, `in_side_weight`, `b_lru_base`, `rect_sign_mask`, and `W_ro_head_odd` cleanly by lane sign $s_l \in \lbrace -1, +1 \rbrace$ while keeping $|2 g \cdot \mathrm{BP}_l|$, $\rho_l$, $g_{\mathrm{pre}}(v_{\mathrm{eff}}^2)$, $p_{\mathrm{bus}}$, and Block 0 PHS damping $k_{\mathrm{nl}} \min(v_{1,\mathrm{lin}}^2, 64.0)$ strictly even-symmetric (0-ULP A2 invariant). For backward gradients, `adj_rho -> adj_BP` propagates smoothly through $\partial\rho_i / \partial |\mathrm{BP}_i|$ with zero hard clipping mask `1_{rho in (0, 1)}`.
 
 ```text
 // Inclusive Reverse-Time Adjoint Suffix Scan Kernel (N + 1 Slots per Lane, Joint 4-Thread L/R Workgroup)
@@ -370,149 +363,111 @@ The ratio $(1 - a_{\text{atk}}^{\rho_{\text{sr}}}) / (1 - a_{\text{atk}})$ appro
 
 ---
 
-### 4.1 Passive & Block 0 Port-Hamiltonian 2×2 ZDF `TPT-SVF` Four-Filter Tone Basis & Associative Scans
+### 4.1 3-Tap Folded `TPT-SVF` Tone, Predictor-Corrector `PHS` & 2-Block `LR4`
 
 `r[dsp.op-n.core.tpt-tone-basis]`
 
-Each 2×2 ZDF `TPT-SVF` mode clamps $g \in [10^{-5}, 64.0]$ with cutoff relation $f_c = (f_s/\pi)\arctan(g)$ and effective linear damping $k \in [0.0, 8.0]$ from clamped `svf_k_eff`. Block 0 `CoreQuad`s `{0, 4, 6, 8}` (count 1, 2, 3, or 4 across Lite..Ultra) apply rate-invariant nonlinear diode-bandpass damping $k_{\mathrm{nl}} \in [0.0, 16.0]$ added on top of $k$ without re-clamping $k_{\mathrm{eff}}[n]$ to 8.0, whereas Blocks 1..3 `{1, 2, 3, 5, 7, 9}` enforce zero `svf_k_nl_fp16` (`0x0000` fail-closed on wire).
+Each 2×2 ZDF TPT-SVF mode clamps $g \in [10^{-5}, 64.0]$, optimized in $\log(f_c / f_s)$ and $\log k$, with cutoff relation $f_c = (f_s/\pi)\arctan(g)$ and effective linear damping $k \in [0.0, 8.0]$. To eliminate 80 redundant zero Hessian eigenvalues at Ultra while saving 4 vector ops/quad, Blocks 1..3 collapse the 5-tap basis into **3 orthogonal folded coefficients (`c_lp, c_bp, c_u`)**, whereas Block 0 retains `(c_lp, c_bp, c_kbp, c_u)`.
 
-With compile-time derived energy bound `SVF_PHS_E_MAX` equal to $E_{\max} = 2^6 = 64.0$ and $a_1[n]$ evaluated from $D[n]$ via `rcp_ge1_nr2` (§1.2):
+On Block 0 `CoreQuad`s `{0, 4, 8}`, nonlinear diode-bandpass damping $k_{\mathrm{nl}} \in [0.0, 16.0]$ executes as a **1-step Predictor-Corrector Passive PHS**: Pass A steps the linear TPT-SVF to obtain $v_{1,\mathrm{lin}}[n]$, and Pass B runs passive LTV TPT-SVF with $E[n] = \min(v_{1,\mathrm{lin}}[n]^2, 64.0)$ and $k_{\mathrm{eff}}[n] = k + k_{\mathrm{nl}} E[n]$, guaranteeing $\Vert \mathbf{M}_n \Vert_2 \le 1$ and $O(\log_2 N)$ 256-thread GPU parallelism.
 
-$$E[n] = \min\big(s_1[n-1]^2,\ E_{\max}\big), \qquad k_{\mathrm{eff}}[n] = k + k_{\mathrm{nl}} \cdot E[n] \in [0.0,\ 1032.0]$$
-$$D[n] = 1 + g\big(g + k_{\mathrm{eff}}[n]\big) \in [1.0,\ 70145.0], \qquad a_2[n] = g a_1[n], \qquad a_3[n] = g a_2[n]$$
+Because $H_{\text{LR4-Mid}}(s) = [H_{\text{HP2}}(s/\omega_{\text{lo}})\cdot H_{\text{LP2}}(s/\omega_{\text{hi}})]^2$ factors into two distinct complex-conjugate pole pairs, partial-fraction decomposition realizes $H_{\text{HP2}} \cdot H_{\text{LP2}}$ as a 2-lane parallel TPT-SVF sum in Block 0 squared in Block 1 (-285.69 dB exactness), leaving Block 2 for drive and Block 3 for post-tilt.
 
-With $k_{\mathrm{nl}} = 0$ (all Blocks 1..3 quads, and linear Block 0 quads), $k_{\mathrm{eff}}[n] \equiv k$ is sample-invariant: `(a1, a2, a3)` hoist per 3 kHz control tick on CPU via `rcp_ge1_nr2` (§1.2) and execute via $O(\log_2 N)$ exclusive 2×2 Blelloch scans on GPU.
-
-Across Block 0 using the frozen-state linearly-implicit Port-Hamiltonian trapezoidal step, each lane updates subnormal-flushed states $s_1, s_2$ without Newton iterations:
-
-$$v_3 = u - s_2, \qquad v_1 = a_1[n] s_1 + a_2[n] v_3, \qquad v_2 = s_2 + a_2[n] s_1 + a_3[n] v_3$$
-$$\mathrm{bp} = v_1, \qquad \mathrm{lp} = v_2, \qquad \mathrm{hp} = u - k_{\mathrm{eff}}[n] v_1 - v_2, \qquad \mathrm{ap} = u - 2 k_{\mathrm{eff}}[n] v_1$$
-$$s_1' = \mathrm{flush}(2 v_1 - s_1), \qquad s_2' = \mathrm{flush}(2 v_2 - s_2)$$
-
-At zero input $u = 0$, the discrete state energy satisfies $(s_1[n]^2 + s_2[n]^2) - (s_1[n-1]^2 + s_2[n-1]^2) = -4 g k_{\mathrm{eff}}[n] v_1[n]^2 \le 0$ for all $g > 0, k \ge 0, k_{\mathrm{nl}} \ge 0$. This guarantees unconditional BIBO stability, +0.0 Zero-DC equilibrium, and slow algebraic transient decay without autonomous limit cycles.
-
-Linear tap mix `y_tone` (`binary16` weights in [-16.0, 16.0]) evaluates left-to-right chained vector FMA `((((lp * w_lp).fma(bp, w_bp)).fma(hp, w_hp)).fma(ap, w_ap)).fma(u, w_dir)`, lowering to hardware IEEE-754 FMA or non-FMA multiply-add (`<= 1.5` ULP/step per [sona_architecture.md §1.5.3](../architecture/sona_architecture.md#153-single-library-per-architecture-runtime-simd-dispatch--0000000-ulp-parity)) to discover arbitrary crossovers and diode-clamped tone stacks via data (`REQ-1.9`).
-
-In matrix form on Blocks 1..3 where $\mathbf{s}_{n+1} = \mathbf{A}_{\text{tpt}}\mathbf{s}_n + \mathbf{b}_{\text{tpt}} u_n$, forward scans compose via $(\mathbf{A}_2, \mathbf{b}_2) \circ (\mathbf{A}_1, \mathbf{b}_1) = (\mathbf{A}_2 \mathbf{A}_1, \mathbf{A}_2 \mathbf{b}_1 + \mathbf{b}_2)$ with spectral norm bound $\Vert \mathbf{A}_{\text{tpt}} \Vert_2 \le 1$, where $(\mathbf{A}_{\text{tpt}})_{11} = 2a_1 - 1$, $(\mathbf{A}_{\text{tpt}})_{12} = -2a_2$, $(\mathbf{A}_{\text{tpt}})_{21} = 2a_2$, $(\mathbf{A}_{\text{tpt}})_{22} = 1 - 2a_3$, $b_1 = 2a_2$, and $b_2 = 2a_3$.
-
-Across all four blocks including Block 0 `svf_k_nl > 0`, discrete state sensitivity along a saved trajectory $(s_1[n-1], s_2[n-1], v_1[n])$ obeys an exact linear reverse-time $O(\log_2 N)$ parallel suffix scan with independent stereo transition matrices $\mathbf{T}_c[n] = \mathbf{J}_c[n]^\top$. Setting $\gamma[n] = (s_1[n-1]^2 < E_{\max}) \mathbin{?} 2 k_{\mathrm{nl}} s_1[n-1] : 0.0$ per channel defines Jacobian entries:
-
-$$J_{11} = (2a_1 - 1) - 2 a_2 v_1 \gamma, \qquad J_{12} = -2 a_2, \qquad J_{21} = 2 a_2 - 2 a_3 v_1 \gamma, \qquad J_{22} = 1 - 2 a_3$$
-$$\bar{v}_1 = \bar{y}_{\mathrm{bp,total}} - k_{\mathrm{eff}} \bar{y}_{\mathrm{hp}} - 2 k_{\mathrm{eff}} \bar{y}_{\mathrm{ap}}, \qquad \bar{v}_2 = \bar{y}_{\mathrm{lp}} - \bar{y}_{\mathrm{hp}}, \qquad \bar{k}_{\mathrm{eff,loc}} = (-\bar{y}_{\mathrm{hp}} - 2 \bar{y}_{\mathrm{ap}}) v_1 - v_1 (a_2 \bar{v}_1 + a_3 \bar{v}_2)$$
-$$g_0 = a_1 \bar{v}_1 + a_2 \bar{v}_2 + \bar{k}_{\mathrm{eff,loc}} \gamma, \qquad g_1 = -a_2 \bar{v}_1 + (1 - a_3) \bar{v}_2$$
-
-Reverse-time elements $(\mathbf{T}[n], \mathbf{g}[n])$ compose identically via $(\mathbf{T}_1, \mathbf{g}_1) \circ_{\text{rev}} (\mathbf{T}_2, \mathbf{g}_2) = (\mathbf{T}_1 \mathbf{T}_2, \mathbf{T}_1 \mathbf{g}_2 + \mathbf{g}_1)$ over $N + 1$ inclusive suffix slots anchored at $\mathtt{suffix}[N] = (\mathbf{I}_2, \mathbf{0})$ with $\mathtt{suffix}[n] = (\mathbf{T}[n], \mathbf{g}[n]) \circ_{\text{rev}} \mathtt{suffix}[n+1]$.
-
-Combined with incoming boundary adjoint $\boldsymbol{\psi}_{\text{out}}$ from tile + 1, per-frame sensitivity $\boldsymbol{\psi}[n] = (\psi_0[n], \psi_1[n])^\top = \mathtt{suffix}[n+1].\mathbf{T}\cdot \boldsymbol{\psi}_{\text{out}} + \mathtt{suffix}[n+1].\mathbf{g}$ and outgoing initial-state handoff $\boldsymbol{\psi}_{\text{init}} = \mathtt{suffix}[0].\mathbf{T}\cdot \boldsymbol{\psi}_{\text{out}} + \mathtt{suffix}[0].\mathbf{g}$ define $\tilde{v}_1 = \bar{v}_1 + 2\psi_0$ and $\tilde{v}_2 = \bar{v}_2 + 2\psi_1$.
-
-These give exact pullbacks $\bar{k}_{\mathrm{eff}}[n] = \bar{k}_{\mathrm{eff,loc}}[n] - 2 v_1 (a_2 \psi_0 + a_3 \psi_1)$ plus complete $\nabla_u\mathcal{L}[n]$ and $\nabla_g\mathcal{L}$:
-
-$$\nabla_k\mathcal{L} \mathrel{+}= \bar{k}_{\mathrm{eff}}[n], \qquad \nabla_{k_{\mathrm{nl}}}\mathcal{L} \mathrel{+}= \bar{k}_{\mathrm{eff}}[n]\ E[n], \qquad \nabla_u\mathcal{L}[n] \mathrel{+}= \bar{y}_{\mathrm{hp}} + \bar{y}_{\mathrm{ap}} + \bar{y}_{\mathrm{dir}} + a_2\tilde{v}_1 + a_3\tilde{v}_2$$
-$$\nabla_g\mathcal{L}\Big|_{\mathrm{tpt}} \mathrel{+}= \tilde{v}_2 v_1 + (a_1 \tilde{v}_1 + a_2 \tilde{v}_2)\big(v_3 - (2g + k_{\mathrm{eff}}[n])v_1\big)$$
-
-Because `a1`, `a2`, and `a3` vary per frame and stereo channel under Block 0 `svf_k_nl > 0`, reverse tiles evaluate this per-frame per-channel $\nabla_g\mathcal{L}|_{\mathrm{tpt}}$ directly alongside the Selective-Duhem flux-gate term ahead of workgroup reduction.
+On Blocks 1..3 where $k_{\mathrm{nl}} = 0$, GPU forward scans execute constant-M register-squaring stereo scans (`M^(2^k)` in 4 registers, scanning both L and R in one pass inside 4,096 B <= 6,144 B SRAM), while `pass0` binary-tree reductions save 216 barriers per tile (596 -> ~220) inside <= 15.0 KiB SRAM.
 
 ---
 
-### 4.2 Stereo M/S Input, Lower-Triangular Inter-Block Mixing & Bounded `GLU`
+### 4.2 Stereo M/S Input, 6-Edge Routing, Post-ADAA `SE-Bus`, `GLU` & Split `W_ro_head`
 
 `r[dsp.op-n.core.interblock-tiles]`
 
-Inter-lane mixing across the 4-block `CoreQuad` stack visits active quads strictly in block-major `SONA_BLOCK_QUAD_SLOTS` order (`Block 0 -> 1 -> 2 -> 3`, matching `[0, 4, 6, 8, 1, 5, 9, 2, 7, 3]` at Ultra) with strict tier prefix nesting:
+Inter-lane mixing across the 4-block `CoreQuad` stack visits active quads strictly in block-major `SONA_BLOCK_QUAD_SLOTS` order (`Block 0 -> 1 -> 2 -> 3`, matching `[0, 4, 8, 1, 5, 9, 2, 6, 3, 7]` at Ultra) with strict tier prefix nesting (5 / 13 / 24 / 37 tiles, `MAX_OUTGOING_PER_QUAD = 7`) and 6 scalar routing gates `g_edge[0..6]` without rewriting tiles at 12 kHz:
 
 | Block (`blk`) | Active Count (`B_{blk}` at Lite / Full / Pro / Ultra) | `SONA_BLOCK_QUAD_SLOTS[blk]` (`-` unused) |
 | :--- | :---: | :--- |
-| Block 0 | 1 / 2 / 3 / 4 | `[0, 4, 6, 8]` |
+| Block 0 | 1 / 2 / 2 / 3 | `[0, 4, 8, -]` |
 | Block 1 | 1 / 2 / 2 / 3 | `[1, 5, 9, -]` |
-| Block 2 | 1 / 1 / 2 / 2 | `[2, 7, -, -]` |
-| Block 3 | 1 / 1 / 1 / 1 | `[3, -, -, -]` |
+| Block 2 | 1 / 1 / 2 / 2 | `[2, 6, -, -]` |
+| Block 3 | 1 / 1 / 2 / 2 | `[3, 7, -, -]` |
 
 ```text
 u_mid = 0.5 * (u_L + u_R);  u_side = 0.5 * (u_L - u_R)
-u_acc = 0.0
+u_acc_pair[0..6] = 0.0  // 6 causal block-pair accumulators: (0->1, 0->2, 0->3, 1->2, 1->3, 2->3)
 for prev_blk = 0..blk, s = 0..B_{prev_blk}, src_g = SONA_BLOCK_QUAD_SLOTS[prev_blk][s]:
-  if edge_in_tier_prefix(src_g, dst_g, T_CAP): // Lite (T_CAP = 3): prev_blk == blk - 1 only; Full..Ultra: all prev_blk < blk
-    u_acc = step_tile_odd(u_acc, w_odd_4x4, A_odd_wf[src_g])
-    u_acc = step_tile_even(u_acc, w_even_4x4_fp16, A_even_glu[src_g])
-    u_acc = step_tile_lru(u_acc, w_lru_4x4_fp16, v_eff[src_g])
-u_{g,L}[n] = (u_acc_L + in_mid_weight * u_mid + in_side_weight * u_side) + ((op_p_to_core * (op_p_gain * T1)) + (phasor_to_core * car_L))
-u_{g,R}[n] = (u_acc_R + in_mid_weight * u_mid - in_side_weight * u_side) + ((op_p_to_core * (op_p_gain * T1)) + (phasor_to_core * car_R))
+  if edge_in_tier_prefix(src_g, dst_g, T_CAP): // Lite (T_CAP=5): adj + (0,2),(1,3); Full..Ultra: 13, 24, 37
+    u_acc_pair[pair_idx(prev_blk, blk)] += tile_odd(w_odd, o_tilde[src_g]) + tile_even(w_even_fp16, e_tilde[src_g]) + tile_lru(w_lru_fp16, v_eff[src_g])
+u_acc = sum_{prev_blk < blk} g_edge[pair_idx(prev_blk, blk)] * u_acc_pair[pair_idx(prev_blk, blk)]
+u_{g,L/R}[n] = (u_acc_L/R + in_mid_weight * u_mid ± in_side_weight * u_side) + ((op_p_to_core * T1_feat) + (phasor_to_core * car_L/R))
 
-// Bounded GLU evaluated after wavefolder_mix with +0.0 canonicalization:
-A_odd_wf = (1 - mu_wf) * A_odd + mu_wf * wf_odd
-A_even_glu[i] = canonical_zero_pos(A_even[i] + glu_mix[i] * (A_odd_wf[i] * A_odd_wf[(i + 1) & 3]))
-
-Active CoreQuads in SONA_BLOCK_QUAD_SLOTS order -> wire LinearReadout W_ro,0[g] (g in 0..N_g, l = 4 * g + local_lane)
-  --[ (acc.fma(ro_odd, A_odd_wf)).fma(ro_even, A_even_glu).fma(ro_lru, v_eff) + (a_0+a_1)+(a_2+a_3) ]--> (pre_conv, direct_s2)
+// Bounded Pre-Gain -> AlgADAA1 -> Post-ADAA Rank-1 SE-Bus -> Bounded GLU -> out_gain:
+A_odd_wf  = (1 - mu_wf) * A_odd + mu_wf * wf_odd
+p_bus     = sum_{j=0..3} w_sq[j] * min(|v_eff[j]|, 1e6)
+g_se      = rcp_ge1_nr2(1.0 + d_bus * p_bus)                 // (0, 1], +0 B WebGPU SRAM via Slot 8
+o_pre     = (1 - mu_lin) * A_odd_wf + mu_lin * g_pre * u_tone
+o_tilde   = g_out * g_se * o_pre
+e_tilde   = canonical_zero_pos(g_out * (1 - mu_lin) * (g_se * A_even + mu_glu * (g_se * A_odd_wf) * rotl1(g_se * A_odd_wf)))
 ```
 
-For each destination CoreQuad `g = SONA_BLOCK_QUAD_SLOTS[blk][d]`, the inter-block loop evaluates edges inside tier prefix `0..T_CAP` (`T_CAP` in {3, 13, 23, 35}) in `odd -> even -> lru` order into `u_acc`, adding voltage-normalized M/S input drive `(in_mid_weight * u_mid ± in_side_weight * u_side)` plus crossbar `(op_p_to_core, phasor_to_core)` terms.
+For each destination CoreQuad `g = SONA_BLOCK_QUAD_SLOTS[blk][d]`, the inter-block loop evaluates edges inside tier prefix `0..T_CAP` (`T_CAP` in `{5, 13, 24, 37}`, `MAX_OUTGOING_PER_QUAD = 7`) and scales the 6 block-pair tile sums directly by micro-ramped `g_edge[0..6]` without ever rewriting tile matrices at 12 kHz.
 
-Lite (`T_CAP = 3`) executes strictly adjacent-block edges `prev_blk == blk - 1`, whereas Full, Pro, and Ultra evaluate all causal edges `prev_blk < blk`. Inside each quad after `wavefolder_mix`, cross-lane GLU multiplies adjacent odd channels `A_odd_wf[i] * A_odd_wf[(i+1)&3]` weighted by `glu_mix_fp16` in [-4.0, 4.0] onto A_even with +0.0 canonicalization, encoding bilinear multiplicative gating without overflow (|A_odd_wf| <= 1.0).
+Inside each quad, post-ADAA rank-1 SE-Bus computes `g_se[i] = rcp_ge1_nr2(1.0 + d_bus[i] * p_bus)` from `v_eff` (+0 B WebGPU SRAM via `Slot 8` pullback), followed by bounded GLU evaluated strictly on `g_se * A_odd_wf` (never unbounded `o_pre`) and micro-ramped `out_gain` in `[-4.0, +4.0]`.
 
-Every inter-block tile (`w_odd_4x4`, `w_even_4x4_fp16`, `w_lru_4x4_fp16`) uses column-major `[src_lane][dst_lane]` storage (source lane 0..4 by destination lane 0..4), evaluating `p01 = (c0 * x_0).fma(c1, x_1)`, `p23 = (c2 * x_2).fma(c3, x_3)`, and unfused `u_acc = u_acc + (p01 + p23)` per [watermarking_and_marketplace.md §1.1](../security/watermarking_and_marketplace.md#mechanism-a1-reciprocal-kautz-gauge--mechanism-a2-0-ulp-40-lane-sona-sign-flip-gauge).
+Every inter-block tile uses column-major `[src_lane][dst_lane]` storage decoded once per 8 subsamples in Quad-Major order (8× fewer `fp16` decodes). Binary LinearReadout (`W_ro,0` plus additive split `W_ro_head` `odd` and `even_lru` deltas) traverses quads in block-major sequence `[0, 4, 8, 1, 5, 9, 2, 6, 3, 7]` and accumulates `(pre_conv, direct_s2)` ahead of ModalConvolver and Op-T.
 
-Binary LinearReadout `W_ro,0` (`w_ro_fp16` or `w_ro_and_mods_fp16`) serializes lanes `l = 4 * g + local_lane` by tier-introduction global quad g in 0..N_g and unpacks per CoreQuad. Runtime execution visits active quads in block-major `SONA_BLOCK_QUAD_SLOTS` order ([0, 4, 6, 8, 1, 5, 9, 2, 7, 3] at Ultra) and accumulates `(acc.fma(ro_odd, A_odd_wf)).fma(ro_even, A_even_glu).fma(ro_lru, v_eff)`, adding downstream `ro_pole_48k` readout damping before routing pre_conv to ModalConvolver and direct_s2 to Transport.
-
-Unlike standalone 1× `Op-N` reference kernels (§1.5.2), the 4-block `CoreQuad` stack omits the (0.875, 0.125) passive B-spline blend and `R_ac` AC coupling, passing `(A_odd_wf, A_even_glu, v_eff)` directly into downstream tiles and `LinearReadout` weights.
+Unlike standalone 1× `Op-N` reference kernels (§1.5.2), the 4-block `CoreQuad` stack omits the (0.875, 0.125) passive B-spline blend and `R_ac` AC coupling, passing `(o_tilde, e_tilde, v_eff)` directly into downstream tiles and `LinearReadout` weights.
 
 ---
 
-### 4.3 Wide-ISA 8-Lane Stereo & Interleaved 4-Lane SIMD Execution
+### 4.3 Quad-Major 8-Subsample Register-Resident Execution & Wide-ISA SIMD
 
 `r[dsp.op-n.core.stereo-simd]`
 
-Inside 16-frame register-hoisted sub-blocks, SONA steps Left (4 lanes) and Right (4 lanes) simultaneously in 256-bit or scalable 8-lane stereo SIMD registers or interleaved 4-lane 128-bit vector pairs. Pinning filter coefficients, `ParaLRU` parameters, `PolyADAA1` history, and mixing tiles in SIMD registers yields 0-ULP parity across same-FMA-class 8-lane stereo and interleaved 4-lane backends with fixed 4-lane pair reduction trees (`<= 1.5` ULP/step across FMA vs non-FMA targets per [sona_architecture.md §1.5.3](../architecture/sona_architecture.md#153-single-library-per-architecture-runtime-simd-dispatch--0000000-ulp-parity), [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)).
+Inside each 4-frame / 8-subsample micro-chunk, SONA executes Quad-Major in topological order: load `state[q]` once, decode `fp16` `CoreQuadHot`, `ReadoutHot`, and outgoing `TileHot` coefficients **once per 8 subsamples** (8× fewer `fp16` tile decodes at Ultra: 2,240 -> 280, zero cold spills).
+
+Each active quad steps all 8 subsamples in 256-bit 8-lane stereo SIMD registers or interleaved 4-lane 128-bit vector pairs (with 3-op subnormal scrubbing and target-ISA block-entry dispatch), and stores `state[q]` once. Fixed 4-lane pair reduction trees guarantee 0-ULP parity across same-FMA-class targets (`<= 1.5` ULP/step across FMA vs non-FMA targets per [sona_architecture.md §1.5.3](../architecture/sona_architecture.md#153-single-library-per-architecture-runtime-simd-dispatch--0000000-ulp-parity), [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md)).
 
 ---
 
-### 4.4 3 kHz Gauge-Invariant `z_stage` Control Sensitivity & Static `W_ro,0` Readout
+### 4.4 4-Frame Gauge-Invariant `z_stage` Sensitivity & Split `W_ro_head`
 
 `r[dsp.op-n.core.control-sensitivity]`
 
-`SO(4)` buyer gauge `Q_buyer` rotates only `z_head[0..4]` along with columns 0..4 of `main_base`, `u_int_base`, `w_ctrl`, and `u_int_ultra` Block 0.
+`SO(4)` buyer gauge `Q_buyer` rotates only `z_head[0..4]` along with watermarked main and interaction blocks, while `z_stage[0..8]`, `z_head[0..8]`, and the 6 edge gates `g_edge[0..6]` micro-ramp once per 4-frame micro-chunk (`alpha_chunk = 0.25`).
 
-Unrotated `z_stage` spans `ctrl_basis_4` for Lite..Pro (`D_s = 4`) and adds `z_stage_ultra` for Ultra (`D_s = 8`, columns 4..8 and Blocks 1..2).
-
-The readout tier block stores one static base matrix `W_ro,0` (sized 16×12, 24×12, 32×12, or 40×12 across tiers) with zero per-latent matrices or wire biases. At each 3 kHz boundary, `z_head` stays inside `W_ctrl` (`f32`) while `stage_latent_*` half-precision sensitivity tables index strictly unrotated `z_stage`, keeping 0-ULP `SO(4)` watermark invariance.
-
-| Modulation Reference | Scope & Canonical Definition |
-| :--- | :--- |
-| Sensitivity Laws (SSOT) | `stage_targets[0..32]` (0..16 base + 16..31 active `"CEXT"`, slot 31 fixed +0.0), `stage_latent_mods_fp16[0..80]`, Ultra `stage_latent_ctrl_ultra_fp16[0..256]`, and `SONA_META_CORE_MODS_PRESENT`-gated `stage_latent_core_mods_fp16[0..1024]` ([parametric_control_bus.md §3.1](parametric_control_bus.md#31-operator-parameter-dispatch-matrix--sensitivity-laws)) |
-| Container Layout | 64-byte-aligned binary arena field offsets, alignment, and tier sizes ([dnam_binary_format.md](../containers/dnam_binary_format.md)) |
+The readout block stores static base matrix `W_ro,0` plus additive split `W_ro_head` (`odd` and `even_lru` deltas) so Mechanism A2 flips `W_ro_head_odd` cleanly and StarCenter-muted lanes activate without bias drift (~1e-6 `f32` invariance; [parametric_control_bus.md §3.1](parametric_control_bus.md#31-operator-parameter-dispatch-matrix--sensitivity-laws), [dnam_binary_format.md](../containers/dnam_binary_format.md)).
 
 ---
 
-## 5. `Op-N[Ctrl]`: 3 kHz Algebraic Polynomial & `O(1)` Sufficient-Statistic Engine
+## 5. `Op-N[Ctrl]`: 3 kHz `ControlBus` v4 (`GRA`) Algebraic Polynomial & Sufficient-Statistic Engine
 
 ### 5.1 Incremental Sufficient-Statistic Update
 
 `r[dsp.op-n.ctrl.incremental-update]`
 
-When control $p \in \mathcal{I}_{\text{moved}}$ moves from $u_{p,\text{old}}$ to $u_{p,\text{new}}$, the control engine updates exact-integer main-effect and rank $R$ pair-statistic accumulators (64 B in Lite..Pro, 128 B in Ultra, self-contained in Arena 0; [parametric_control_bus.md §2.3](parametric_control_bus.md#23-o1-additive-latent-sufficient-statistic-control-scaling)):
+When control $p \in \mathcal{I}_{\text{moved}}$ moves from $u_{p,\text{old}}$ to $u_{p,\text{new}}$, Op-N[Ctrl] updates `ExactIntMainAccumulator` on SO(4)-isolated `z_head[0..4]` (preserving 0-ULP StarCenter and buyer watermark isolation) and builds unrotated `CP1` basis `h_0 = W_in * xi` in $\mathbb{R}^D$, with $D = 8$ Lite or $16$ Full–Ultra, inside reclaimed Arena 0 space per [parametric_control_bus.md §2.3](parametric_control_bus.md#23-o1-additive-latent-sufficient-statistic-control-scaling):
 
 $$\Delta\mathbf{z}_{\text{main}} = \mathbf{W}_{\text{main}, p} \cdot \big(\boldsymbol{\psi}_p(u_{p, \text{new}}) - \boldsymbol{\psi}_p(u_{p, \text{old}})\big)$$
 
-### 5.2 Node-Anchored Control Basis
+### 5.2 Node-Anchored Control Basis & Zero-Anchored `SwiGLU + Padé-[1/1]`
 
 `r[dsp.op-n.ctrl.lobatto-basis]`
 
-Basis evaluation interpolates persisted observed anchor nodes and switch contributor slices as defined in [parametric_control_bus.md §2.2](parametric_control_bus.md#22-cardinality-bounded-node-anchored-newtonlobatto-basis).
+Basis evaluation interpolates persisted observed anchor nodes and switch contributor slices (`xi == +0.0` at StarCenter), feeding Zero-Anchored SwiGLU, with $H = 8$ Lite or $16$ Full–Ultra, and a Padé-[1/1] rational head (`recip_nr3_pos_vec4`) followed by anchored 1.5-Entmax residual prototypes (`M = 8` Lite–Pro or 16 Ultra, `m = 0` implicit StarCenter anchor, `O(P + M)` global BIBO) per [parametric_control_bus.md §2.2](parametric_control_bus.md#22-cardinality-bounded-node-anchored-newtonlobatto-basis) and [§3.1.2](parametric_control_bus.md#312-controlbus-v4-gated-rational-attention-gra-pipeline).
 
 ### 5.3 Skewed Quadrature LFO Waveshaping (Second-Harmonic Chebyshev)
 
 `r[dsp.op-n.ctrl.chebyshev-lfo]`
 
-Quadrature LFO states evaluate `(c_j, s_j)` per oscillator and apply learned second-degree Chebyshev harmonic skew `T_2(x) = 2x^2 - 1` weighted by `beta_j = lfo_skew_fp16[j]` in `[-1.0, 1.0]`, emitting `[c_0 + beta_0 * (2*c_0^2 - 1), s_0, c_1 + beta_1 * (2*c_1^2 - 1), s_1]` into control vector `q2`, while higher-order Chebyshev terms $T_3(x) = 4x^3 - 3x$ and $T_4(x) = 8x^4 - 8x^2 + 1$ remain available in standalone control kernels.
+Quadrature LFO states evaluate `(c_j, s_j)` per oscillator with asymmetric inertia slew and live `TSYN` lock, applying learned second-degree Chebyshev harmonic skew `T_2(x) = 2x^2 - 1` weighted by `beta_j = lfo_skew_fp16[j]` in `[-1.0, 1.0]` into control vector `q2`, while higher-order Chebyshev terms $T_3(x)$ and $T_4(x)$ remain available in standalone control kernels.
 
 ### 5.4 Rank-4/8 FM Bilinear Interaction
 
 `r[dsp.op-n.ctrl.fm-interaction]`
 
-Pairwise FM interactions combine scalar embeddings $z_p = \mathbf{w}_{\text{proj},p}^\top\boldsymbol{\psi}_p(u_p)$ through $\mathbf{U}_{\text{int}}$, a 4×8 base matrix in Arena 0 (`[4][8]`, 4 FM factors by 8 latent coordinates) plus three 4×8 delta blocks in Arena 3.
+Pairwise FM interactions and SwiGLU bilinear couplings (`(v, +g)` / `(v, -g)` symmetric pairs reproducing `v * g` to 1.776e-15) combine scalar embeddings over `U_int^base` (128 B on SO4-isolated `z_head[0..4]`) and `W_g`/`W_v` within the unified ControlBus v4 (`GRA`) pipeline ([parametric_control_bus.md §3.1.2](parametric_control_bus.md#312-controlbus-v4-gated-rational-attention-gra-pipeline)).
 
 ### 5.5 Groupwise Trust-Region Clipping
 
 `r[dsp.op-n.ctrl.trust-clip]`
 
-Outward-checked trust-region clipping runs independently on `z_head[0..4]`, `ctrl_basis_4[0..4]`, `z_head_ultra[0..4]`, and `z_stage_ultra[0..4]` via `trust_clip_outward_4d` using scalar `trust_radius_mh` per [parametric_control_bus.md §1.2.1](parametric_control_bus.md#121-outward-checked-trust-region-clip).
+Outward-checked trust-region clipping runs independently on `SO(4)`-isolated `z_head[0..4]` via `trust_clip_outward_4d`, while `GRA` hidden vector `h_1 = trust_clip(h_0 + W_o * a)` enforces $\Vert \mathbf{h}_1 \Vert_2 \le R_{\text{trust}}$ to certify global `O(P + M)` convex-hull BIBO bounds per [parametric_control_bus.md §1.2.1](parametric_control_bus.md#121-outward-checked-trust-region-clip) and [§3.1.3](parametric_control_bus.md#313-global-op--m-convex-hull-bibo-stability).
