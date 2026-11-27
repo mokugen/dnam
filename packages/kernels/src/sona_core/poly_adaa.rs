@@ -3,10 +3,17 @@
 //! `ref[dsp.op-n.polyadaa.rail-crossing]`, `ref[dsp.op-n.polyadaa.stereo-and-rail-guard]`,
 //! `ref[dsp.op-n.wavefolder.cubic-c2]`).
 
+pub mod alg_adaa;
 pub mod wavefolder;
 
 use crate::simd::{KernelVec4, StereoVec8};
 
+pub use alg_adaa::{
+    AlgAdaa1BackwardOut, MAX_ALG_R, eval_alg_adaa1_backward_f32, eval_alg_adaa1_f32,
+    eval_alg_adaa1_stereo8, eval_alg_adaa1_vec4, eval_alg_adaa1_with_wavefolder_stereo8,
+    eval_alg_adaa1_with_wavefolder_vec4, scrub_clamped_alg_endpoint_f32,
+    scrub_clamped_alg_endpoint_stereo8, scrub_clamped_alg_endpoint_vec4,
+};
 pub use wavefolder::{
     QuadratureHysteresis2D, eval_c2_wavefolder_adaa_stereo8, eval_c2_wavefolder_adaa_vec4,
 };

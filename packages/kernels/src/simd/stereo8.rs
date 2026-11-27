@@ -126,6 +126,13 @@ pub trait StereoVec8: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
         Self::from_lr(l.rcp_ge1_nr2(), r.rcp_ge1_nr2())
     }
 
+    /// Accurate positive reciprocal `1.0 / self` (`self >= 1.0`) using seed + 3 NR steps (`< 1 ULP`).
+    #[inline(always)]
+    fn rcp_ge1_nr3(self) -> Self {
+        let (l, r) = self.into_lr();
+        Self::from_lr(l.rcp_ge1_nr3(), r.rcp_ge1_nr3())
+    }
+
     /// Clamped positive reciprocal `1.0 / max(self, 1.0e-6)` using seed + 2 NR steps.
     fn rcp_pos_nr2(self) -> Self;
 
@@ -298,6 +305,14 @@ impl<V: KernelVec4> StereoVec8 for InterleavedStereo8<V> {
         Self {
             left: self.left.rcp_ge1_nr2(),
             right: self.right.rcp_ge1_nr2(),
+        }
+    }
+
+    #[inline(always)]
+    fn rcp_ge1_nr3(self) -> Self {
+        Self {
+            left: self.left.rcp_ge1_nr3(),
+            right: self.right.rcp_ge1_nr3(),
         }
     }
 
@@ -550,11 +565,16 @@ mod tests {
             let inv = pos.rcp_pos_nr2();
             let pos_ge1 = v.abs().add(S8::splat(1.0));
             let inv_ge1 = pos_ge1.rcp_ge1_nr2();
+            let inv_ge1_nr3 = pos_ge1.rcp_ge1_nr3();
             let dv_ge1 = dv.abs().add(DefaultTraitStereo8::splat(1.0)).rcp_ge1_nr2();
+            let dv_ge1_nr3 = dv.abs().add(DefaultTraitStereo8::splat(1.0)).rcp_ge1_nr3();
             prop_assert_eq!(inv_ge1.into_lr().0.to_array(), dv_ge1.into_lr().0.to_array());
             prop_assert_eq!(inv_ge1.into_lr().1.to_array(), dv_ge1.into_lr().1.to_array());
+            prop_assert_eq!(inv_ge1_nr3.into_lr().0.to_array(), dv_ge1_nr3.into_lr().0.to_array());
+            prop_assert_eq!(inv_ge1_nr3.into_lr().1.to_array(), dv_ge1_nr3.into_lr().1.to_array());
             let (inv_l, inv_r) = inv.into_lr();
             let (g1_l, g1_r) = inv_ge1.into_lr();
+            let (g3_l, g3_r) = inv_ge1_nr3.into_lr();
             for i in 0..4 {
                 let d_l = f64::from(l[i].abs() + 0.5);
                 let d_r = f64::from(r[i].abs() + 0.5);
@@ -562,6 +582,8 @@ mod tests {
                 prop_assert!((f64::from(inv_r.to_array()[i]) * d_r - 1.0).abs() < 1.0e-5);
                 prop_assert!((f64::from(g1_l.to_array()[i]) * f64::from(l[i].abs() + 1.0) - 1.0).abs() < 1.0e-5);
                 prop_assert!((f64::from(g1_r.to_array()[i]) * f64::from(r[i].abs() + 1.0) - 1.0).abs() < 1.0e-5);
+                prop_assert!((f64::from(g3_l.to_array()[i]) * f64::from(l[i].abs() + 1.0) - 1.0).abs() < 1.0e-6);
+                prop_assert!((f64::from(g3_r.to_array()[i]) * f64::from(r[i].abs() + 1.0) - 1.0).abs() < 1.0e-6);
             }
         }
     }

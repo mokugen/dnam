@@ -1,8 +1,21 @@
-//! SONA v3.0 4-lane `CoreQuad` kernel (`TPT-SVF -> Selective-Duhem ParaLRU + Stereo Link ->
-//! Power-Supply Sag -> PolyADAA1 + C^2 Wavefolder -> Bounded Cross-Lane GLU`) and M/S input
-//! coupling (`ref[dsp.op-n.core.matryoshka-blocks]`, `ref[dsp.op-n.core.interblock-tiles]`).
+//! SONA v3.0 & v4.0 4-lane `CoreQuad` kernels (`TPT-SVF -> Selective-Duhem ParaLRU + Stereo Link ->
+//! `g_pre` / Sag -> `AlgADAA1` / `PolyADAA1` + $C^2$ Wavefolder -> `SE-Bus` -> Bounded Cross-Lane `GLU`)
+//! and M/S input coupling (`ref[dsp.op-n.core.matryoshka-blocks]`, `ref[dsp.op-n.core.interblock-tiles]`).
+
+pub mod dynamics;
+pub mod v4;
 
 use crate::simd::{KernelVec4, StereoVec8};
+
+pub use dynamics::{
+    G_PRE_E_MAX, MAX_G_PRE_GAIN, SE_BUS_ABS_MAX, eval_bounded_glu_stereo8, eval_g_pre_stereo8,
+    eval_g_pre_vec4, eval_se_bus_gain_stereo8, eval_se_bus_gain_vec4,
+};
+pub use v4::{
+    CoreQuadV4OutputStereo8, CoreQuadV4ParamsStereo4, MAX_ADAA_DRIVE, MAX_E_TILDE_ABS, MAX_GLU_MIX,
+    MAX_LRU_BIAS_DRIVE, MAX_OUT_GAIN, rect_sign_from_mask, step_core_quad_v4_phs_stereo8,
+    step_core_quad_v4_stereo8,
+};
 
 use super::paralru::{
     SonaParaLruDuhemCoeffs4, apply_stereo_link_stereo8, step_paralru_duhem_stereo8,

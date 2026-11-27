@@ -12,8 +12,12 @@ pub mod poly_adaa;
 pub mod tpt_svf;
 
 pub use core_quad::{
-    CoreQuadParamsStereo4, MIN_SAG_GAIN, couple_ms_input_stereo8, step_core_quad_phs_stereo8,
-    step_core_quad_stereo8,
+    CoreQuadParamsStereo4, CoreQuadV4OutputStereo8, CoreQuadV4ParamsStereo4, G_PRE_E_MAX,
+    MAX_ADAA_DRIVE, MAX_E_TILDE_ABS, MAX_G_PRE_GAIN, MAX_GLU_MIX, MAX_LRU_BIAS_DRIVE, MAX_OUT_GAIN,
+    MIN_SAG_GAIN, SE_BUS_ABS_MAX, couple_ms_input_stereo8, eval_bounded_glu_stereo8,
+    eval_g_pre_stereo8, eval_g_pre_vec4, eval_se_bus_gain_stereo8, eval_se_bus_gain_vec4,
+    rect_sign_from_mask, step_core_quad_phs_stereo8, step_core_quad_stereo8,
+    step_core_quad_v4_phs_stereo8, step_core_quad_v4_stereo8,
 };
 pub use op_n_pre::{
     OP_N_PRE_BETA_BYPASS_EPS, OP_N_PRE_FULL_PASS_THRESH, OP_N_PRE_INV_TAU_F32, OP_N_PRE_MAX_BETA_Q,
@@ -27,21 +31,30 @@ use crate::simd::{KernelVec4, MAX_PARALRU_R_F32, StereoVec8};
 pub use paralru::{
     LinearScanElem, MAX_PARALRU_DUHEM_GAMMA_F32, MAX_PARALRU_TWO_SVF_G_F32, ONE_THIRD_F32,
     ParaLruDuhemAdjointTrace, ParaLruDuhemForwardOut, ParaLruDuhemParams, ParaLruDuhemTileGrads,
-    ParaLruParams, ParaLruTileGrads, SOFT_RECT_EPS, SonaParaLruDuhemCoeffs4, apply_linear_scan,
-    apply_stereo_link_stereo8, apply_stereo_link_vec4_pair, compose_linear_scan,
-    compose_paralru_adjoint_scan, paralru_adjoint_step_elem, paralru_duhem_adjoint_step_elem,
+    ParaLruParams, ParaLruTileGrads, SOFT_RECT_EPS, SOFT_RECT_INV_TWO_EPS, SOFT_RECT_TWO_EPS,
+    SonaParaLruDuhemCoeffs4, apply_linear_scan, apply_stereo_link_stereo8,
+    apply_stereo_link_vec4_pair, compose_linear_scan, compose_paralru_adjoint_scan,
+    paralru_adjoint_step_elem, paralru_duhem_adjoint_step_elem, paralru_duhem_v4_adjoint_step_elem,
     run_paralru_adjoint_scan_partial_tile, run_paralru_adjoint_scan_tile,
     run_paralru_duhem_adjoint_scan_partial_tile, run_paralru_duhem_adjoint_scan_tile,
     run_paralru_duhem_forward_partial_tile, run_paralru_duhem_forward_tile,
+    run_paralru_duhem_v4_adjoint_scan_partial_tile, run_paralru_duhem_v4_adjoint_scan_tile,
+    run_paralru_duhem_v4_forward_partial_tile, run_paralru_duhem_v4_forward_tile,
     run_paralru_forward_partial_tile, run_paralru_forward_tile, scan_linear_prefix_tile,
+    soft_rect_quartic_f32, soft_rect_quartic_stereo8, soft_rect_quartic_vec4,
     soft_rect_zero_dc_f32, soft_rect_zero_dc_stereo8, soft_rect_zero_dc_vec4,
-    step_paralru_duhem_stereo8, step_paralru_duhem_vec4, step_paralru_stereo8, step_paralru_vec4,
+    step_paralru_duhem_stereo8, step_paralru_duhem_v4_stereo8, step_paralru_duhem_v4_vec4,
+    step_paralru_duhem_vec4, step_paralru_stereo8, step_paralru_v4_stereo8, step_paralru_v4_vec4,
+    step_paralru_vec4,
 };
 pub use poly_adaa::{
-    MAX_ADAA_ENDPOINT, QuadratureHysteresis2D, TINY_CROSSING_EPS, eval_c2_wavefolder_adaa_stereo8,
-    eval_c2_wavefolder_adaa_vec4, eval_poly_adaa1_odd_even_vec4, eval_poly_adaa1_quad_batched,
-    eval_poly_adaa1_stereo8, eval_poly_adaa1_with_wavefolder_stereo8,
-    eval_poly_adaa1_with_wavefolder_vec4,
+    AlgAdaa1BackwardOut, MAX_ADAA_ENDPOINT, MAX_ALG_R, QuadratureHysteresis2D, TINY_CROSSING_EPS,
+    eval_alg_adaa1_backward_f32, eval_alg_adaa1_f32, eval_alg_adaa1_stereo8, eval_alg_adaa1_vec4,
+    eval_alg_adaa1_with_wavefolder_stereo8, eval_alg_adaa1_with_wavefolder_vec4,
+    eval_c2_wavefolder_adaa_stereo8, eval_c2_wavefolder_adaa_vec4, eval_poly_adaa1_odd_even_vec4,
+    eval_poly_adaa1_quad_batched, eval_poly_adaa1_stereo8, eval_poly_adaa1_with_wavefolder_stereo8,
+    eval_poly_adaa1_with_wavefolder_vec4, scrub_clamped_alg_endpoint_f32,
+    scrub_clamped_alg_endpoint_stereo8, scrub_clamped_alg_endpoint_vec4,
 };
 pub use tpt_svf::{
     MAX_SVF_K_NL, MIN_TPT_G, SVF_PHS_E_MAX, TptAdjointElem, TptScanElem, TptSvfCoeffs4,

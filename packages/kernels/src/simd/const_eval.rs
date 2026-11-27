@@ -156,6 +156,21 @@ pub const MAX_LOOP_GAIN_F32: f32 = f32::from_bits(const_max_f32_bits_le_ratio(99
 /// Largest `binary32` value `<= 0.999995` (`0x3F7F_FFAC`, upper `ParaLRU` and ZOH pole bound).
 pub const MAX_PARALRU_R_F32: f32 = f32::from_bits(const_max_f32_bits_le_ratio(999_995, 1_000_000));
 
+/// Clamped pre-activation endpoint magnitude bound `2^12 = 4096.0` for `AlgADAA1(0.5)` (`MAX_ALG_R^3 < 1e11 << f32::MAX`, `ref[dsp.op-n.polyadaa.clamp]`).
+pub const MAX_ALG_R: f32 = const_f32_pow2(12);
+
+/// Upper gain bound `[0.0, 2.5]` for $C^\infty$ `g_pre(v_eff^2)` pre-ADAA scaling (`ref[dsp.op-n.polyadaa.clamp]`).
+pub const G_PRE_MAX: f32 = 2.5;
+
+/// Saturation energy bound `min(v_eff^2, 1.0e6)` for `g_pre(v_eff^2)` (`ref[dsp.op-n.polyadaa.clamp]`).
+pub const G_PRE_E_MAX: f32 = 1.0e6;
+
+/// Saturation magnitude bound `min(|v_eff|, 1.0e6)` for post-ADAA rank-1 `SE-Bus` (`ref[dsp.op-n.core.interblock-tiles]`).
+pub const SE_BUS_ABS_MAX: f32 = 1.0e6;
+
+/// Upper bound on `|2 * svf_g * bp|` (`1.0e18`) preventing `gamma_duhem * |flux|` overflow to `+Inf` (`ref[dsp.op-n.core.matryoshka-blocks]`).
+pub const MAX_DUHEM_FLUX_ABS: f32 = 1.0e18;
+
 /// Compile-time fixed-shape tier capacity profile locked at `Gate 0b` (`Lite ⊂ Full ⊂ Pro ⊂ Ultra`).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SonaTierSpec {
@@ -442,6 +457,14 @@ const _: () = assert!(const_abs_f32(-2.5) == 2.5);
 const _: () = assert!(const_taylor_inv_fact_f32(0, false) == 1.0);
 const _: () = assert!(const_taylor_inv_fact_f32(2, true) == -0.5);
 const _: () = assert!(const_abs_f32(const_taylor_inv_fact_f32(3, false) - 1.0 / 6.0) < 1.0e-7);
+const _: () = assert!(MAX_ALG_R == 4_096.0);
+const _: () = assert!(
+    (MAX_ALG_R * MAX_ALG_R * MAX_ALG_R).is_finite() && MAX_ALG_R * MAX_ALG_R * MAX_ALG_R < 1.0e11
+);
+const _: () = assert!(G_PRE_MAX == 2.5 && G_PRE_MAX > 0.0);
+const _: () = assert!(G_PRE_E_MAX == 1.0e6 && (64.0 * G_PRE_E_MAX).is_finite());
+const _: () = assert!(SE_BUS_ABS_MAX == 1.0e6 && (4.0 * SE_BUS_ABS_MAX).is_finite());
+const _: () = assert!(MAX_DUHEM_FLUX_ABS == 1.0e18 && (64.0 * MAX_DUHEM_FLUX_ABS).is_finite());
 
 #[cfg(test)]
 mod tests {
@@ -500,6 +523,11 @@ mod tests {
         assert_eq!(DC_BLOCKER_10HZ_48K_BITS, 0x3F7F_AA45);
         assert_eq!(MAX_LOOP_GAIN_F32.to_bits(), 0x3F7F_BE76);
         assert_eq!(MAX_PARALRU_R_F32.to_bits(), 0x3F7F_FFAC);
+        assert_eq!(MAX_ALG_R, 4_096.0);
+        assert_eq!(G_PRE_MAX, 2.5);
+        assert_eq!(G_PRE_E_MAX, 1.0e6);
+        assert_eq!(SE_BUS_ABS_MAX, 1.0e6);
+        assert_eq!(MAX_DUHEM_FLUX_ABS, 1.0e18);
 
         assert_eq!(
             DC_BLOCKER_5HZ_48K_F32.to_bits(),

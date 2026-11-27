@@ -14,17 +14,19 @@ pub mod stereo8;
 
 pub use const_eval::{
     BIASED_INT_MAGIC_F32, DC_BLOCKER_5HZ_48K_F32, DC_BLOCKER_10HZ_48K_BITS,
-    F32_INT_EXACT_THRESHOLD, FP16_FINITE_MAX_F32, FULL_SPEC, IEEE754_F32_ABS_MASK,
-    IEEE754_F32_EXP_ALL_ONES, IEEE754_F32_EXP_BIAS, IEEE754_F32_EXP_MASK, IEEE754_F32_IMPLICIT_BIT,
-    IEEE754_F32_MANTISSA_BITS, IEEE754_F32_MANTISSA_MASK, IEEE754_F32_MIN_NORMAL_EXP,
-    IEEE754_F32_MIN_SUBNORMAL_EXP, IEEE754_F32_NORMAL_MANTISSA_EXP_OFFSET, IEEE754_F32_ONE_BITS,
-    IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED, IEEE754_F32_SIGN_MASK,
-    IEEE754_F32_SIGNIFICAND_BITS, IEEE754_F32_TO_FP16_MANTISSA_SHIFT, IEEE754_F64_EXP_ALL_ONES,
-    IEEE754_F64_EXP_BIAS, IEEE754_F64_MANTISSA_BITS, IEEE754_F64_MAX_NORMAL_BIASED_EXP,
-    IEEE754_FP16_ABS_MASK, IEEE754_FP16_EXP_ALL_ONES, IEEE754_FP16_EXP_BIAS, IEEE754_FP16_EXP_MASK,
+    F32_INT_EXACT_THRESHOLD, FP16_FINITE_MAX_F32, FULL_SPEC, G_PRE_E_MAX, G_PRE_MAX,
+    IEEE754_F32_ABS_MASK, IEEE754_F32_EXP_ALL_ONES, IEEE754_F32_EXP_BIAS, IEEE754_F32_EXP_MASK,
+    IEEE754_F32_IMPLICIT_BIT, IEEE754_F32_MANTISSA_BITS, IEEE754_F32_MANTISSA_MASK,
+    IEEE754_F32_MIN_NORMAL_EXP, IEEE754_F32_MIN_SUBNORMAL_EXP,
+    IEEE754_F32_NORMAL_MANTISSA_EXP_OFFSET, IEEE754_F32_ONE_BITS, IEEE754_F32_RCP_SEED,
+    IEEE754_F32_RSQRT_SEED, IEEE754_F32_SIGN_MASK, IEEE754_F32_SIGNIFICAND_BITS,
+    IEEE754_F32_TO_FP16_MANTISSA_SHIFT, IEEE754_F64_EXP_ALL_ONES, IEEE754_F64_EXP_BIAS,
+    IEEE754_F64_MANTISSA_BITS, IEEE754_F64_MAX_NORMAL_BIASED_EXP, IEEE754_FP16_ABS_MASK,
+    IEEE754_FP16_EXP_ALL_ONES, IEEE754_FP16_EXP_BIAS, IEEE754_FP16_EXP_MASK,
     IEEE754_FP16_MANTISSA_BITS, IEEE754_FP16_MANTISSA_MASK, IEEE754_FP16_MAX_FINITE_BITS,
-    IEEE754_FP16_SIGN_MASK, LITE_SPEC, MAX_LOOP_GAIN_F32, MAX_PARALRU_R_F32, PRO_SPEC,
-    SonaTierSpec, ULTRA_SPEC, const_abs_f32, const_f32_pow2, const_taylor_inv_fact_f32,
+    IEEE754_FP16_SIGN_MASK, LITE_SPEC, MAX_ALG_R, MAX_DUHEM_FLUX_ABS, MAX_LOOP_GAIN_F32,
+    MAX_PARALRU_R_F32, PRO_SPEC, SE_BUS_ABS_MAX, SonaTierSpec, ULTRA_SPEC, const_abs_f32,
+    const_f32_pow2, const_taylor_inv_fact_f32,
 };
 pub use fp16::{
     f32_to_fp16, f32_to_fp16_u32, fp16_to_f32, fp16_u32_to_f32, pack_fp16x2_u32,
@@ -370,6 +372,16 @@ pub trait KernelVec4: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
         let y1 = y0.fma(y0, err0);
         let err1 = one.fms(self, y1);
         y1.fma(y1, err1)
+    }
+
+    /// Accurate positive reciprocal `1.0 / self` (`self >= 1.0`) via Chebyshev seed + 3 FMA/FMS NR steps (`< 1 ULP`).
+    #[inline(always)]
+    fn rcp_ge1_nr3(self) -> Self {
+        let one = Self::splat(1.0);
+        let y0 = self.rcp_pos_seed_bits();
+        let y1 = y0.fma(y0, one.fms(self, y0));
+        let y2 = y1.fma(y1, one.fms(self, y1));
+        y2.fma(y2, one.fms(self, y2))
     }
 
     /// Clamped positive reciprocal `1.0 / max(self, 1.0e-6)` via seed + 2 FMA/FMS NR steps.
@@ -723,6 +735,10 @@ mod tests {
             prop_assert_eq!(
                 dv.add(DefaultTraitVec4::splat(1.0)).rcp_ge1_nr2().to_array(),
                 gv.add(GpuVec4::splat(1.0)).rcp_ge1_nr2().to_array()
+            );
+            prop_assert_eq!(
+                dv.add(DefaultTraitVec4::splat(1.0)).rcp_ge1_nr3().to_array(),
+                gv.add(GpuVec4::splat(1.0)).rcp_ge1_nr3().to_array()
             );
             prop_assert_eq!(dv.rsqrt_pos_nr2().to_array(), gv.rsqrt_pos_nr2().to_array());
             prop_assert_eq!(dv.rsqrt_pos_nr3().to_array(), gv.rsqrt_pos_nr3().to_array());

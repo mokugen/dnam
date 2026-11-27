@@ -5,9 +5,11 @@
 pub mod adjoint;
 pub mod duhem_adjoint;
 pub mod duhem_scans;
+pub mod duhem_v4;
 pub mod scans;
+pub mod soft_rect;
 
-use crate::simd::{GpuVec4, KernelVec4, MAX_PARALRU_R_F32, StereoVec8};
+use crate::simd::{KernelVec4, MAX_PARALRU_R_F32, StereoVec8};
 
 pub use adjoint::{
     ParaLruTileGrads, compose_paralru_adjoint_scan, paralru_adjoint_step_elem,
@@ -21,9 +23,20 @@ pub use duhem_scans::{
     MAX_PARALRU_TWO_SVF_G_F32, ParaLruDuhemForwardOut, ParaLruDuhemParams,
     run_paralru_duhem_forward_partial_tile, run_paralru_duhem_forward_tile,
 };
+pub use duhem_v4::{
+    paralru_duhem_v4_adjoint_step_elem, run_paralru_duhem_v4_adjoint_scan_partial_tile,
+    run_paralru_duhem_v4_adjoint_scan_tile, run_paralru_duhem_v4_forward_partial_tile,
+    run_paralru_duhem_v4_forward_tile, step_paralru_duhem_v4_stereo8, step_paralru_duhem_v4_vec4,
+    step_paralru_v4_stereo8, step_paralru_v4_vec4,
+};
 pub use scans::{
     LinearScanElem, apply_linear_scan, compose_linear_scan, run_paralru_forward_partial_tile,
     run_paralru_forward_tile, scan_linear_prefix_tile,
+};
+pub use soft_rect::{
+    SOFT_RECT_EPS, SOFT_RECT_INV_TWO_EPS, SOFT_RECT_TWO_EPS, soft_rect_quartic_f32,
+    soft_rect_quartic_stereo8, soft_rect_quartic_vec4, soft_rect_zero_dc_f32,
+    soft_rect_zero_dc_stereo8, soft_rect_zero_dc_vec4,
 };
 
 /// Compile-time `1 / 3` constant for the Selective-Duhem odd cubic saturation `psi_1(z) = z_bar * (1 - z_bar^2 / 3)`.
@@ -32,17 +45,8 @@ pub const ONE_THIRD_F32: f32 = 1.0 / 3.0;
 /// Maximum clamped Selective-Duhem derivative gate gain `gamma_duhem` (`[0.0, 64.0]`).
 pub const MAX_PARALRU_DUHEM_GAMMA_F32: f32 = 64.0;
 
-/// Smoothing radius `epsilon` for `soft_rect_zero_dc_*` (`phi(0) == +0.0`, `phi'(0) == 0.5`).
-pub const SOFT_RECT_EPS: f32 = 1.0e-3;
-const SOFT_RECT_EPS2: f32 = SOFT_RECT_EPS * SOFT_RECT_EPS;
-const SOFT_RECT_HALF_EPS: f32 = 0.5 * SOFT_RECT_EPS;
-/// Magnitude threshold above which `z^2 + eps^2` equals `z^2` in `binary32` without `f32` overflow.
-const SOFT_RECT_LARGE_Z: f32 = 1.0e15;
-
 const _: () = assert!(ONE_THIRD_F32.to_bits() == 0x3EAA_AAAB);
 const _: () = assert!(MAX_PARALRU_DUHEM_GAMMA_F32 == 64.0);
-const _: () = assert!(SOFT_RECT_EPS > 0.0 && SOFT_RECT_EPS2 > 0.0);
-const _: () = assert!(SOFT_RECT_LARGE_Z > 1.0e6);
 
 /// Clamped scalar `ParaLRU` parameters (`alpha_rel in [0, MAX_PARALRU_R_F32]`, `alpha_atk, kappa in [0, 1]`).
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -118,108 +122,6 @@ impl ParaLruParams {
             kappa: clamp_f32_safe(kappa, 0.0, 1.0),
         }
     }
-}
-
-/// Evaluates the zero-DC smooth rectifier `phi(z) = 0.5 * (z + sqrt(z^2 + eps^2) - eps)` and its
-/// analytical derivative `phi'(z) = 0.5 * (1 + z / sqrt(z^2 + eps^2))` on 4 SIMD lanes.
-///
-/// Guarantees bit-exact `+0.0` at `z == ±0.0`, `0 <= phi'(z) <= 1`, zero `FDIV`, zero `FSQRT`,
-/// and cancellation-free evaluation across `[−f32::MAX, +f32::MAX]`.
-#[inline(always)]
-#[must_use]
-pub fn soft_rect_zero_dc_vec4<V: KernelVec4>(z: V) -> (V, V) {
-    let zero = V::zero();
-    let half = V::splat(0.5);
-    let one = V::splat(1.0);
-    let eps = V::splat(SOFT_RECT_EPS);
-    let eps2 = V::splat(SOFT_RECT_EPS2);
-    let half_eps_neg = V::splat(-SOFT_RECT_HALF_EPS);
-    let large_z = V::splat(SOFT_RECT_LARGE_Z);
-
-    let z_abs = z.abs();
-    let z_safe = z_abs.min(large_z);
-    let z2 = z_safe.mul(z_safe);
-    let q = z2.add(eps2);
-    let inv_r = q.rsqrt_pos_nr3();
-    let rad = q.mul(inv_r);
-
-    let inv_rad_plus_eps = rad.add(eps).rcp_pos_nr3();
-    let inv_rad_plus_abs = rad.add(z_safe).rcp_pos_nr3();
-
-    let one_plus_frac_eps = one.fma(z_safe, inv_rad_plus_eps);
-    let phi_pos_small = half.mul(z_safe.fma(z2, inv_rad_plus_eps));
-    let phi_pos = V::select_le(z_abs, large_z, phi_pos_small, z_abs);
-
-    let phi_neg_small = half
-        .mul(eps)
-        .mul(z_safe.mul(inv_rad_plus_abs))
-        .mul(one_plus_frac_eps)
-        .neg();
-    let phi_neg = V::select_le(z_abs, large_z, phi_neg_small, half_eps_neg);
-    let raw_phi = V::select_le(z, zero, phi_neg, phi_pos);
-    let phi = V::select_le(z_abs, zero, zero, raw_phi);
-
-    let prime_pos_small = half.mul(one.fma(z_safe, inv_r));
-    let prime_pos = V::select_le(z_abs, large_z, prime_pos_small, one);
-    let prime_neg_small = half.mul(eps2).mul(inv_r).mul(inv_rad_plus_abs);
-    let prime_neg = V::select_le(z_abs, large_z, prime_neg_small, zero);
-    let raw_prime = V::select_le(z, zero, prime_neg, prime_pos);
-    let phi_prime = V::select_le(z_abs, zero, half, raw_prime).clamp(zero, one);
-
-    (phi, phi_prime)
-}
-
-/// Evaluates [`soft_rect_zero_dc_vec4`] across a stereo `StereoVec8` register (`0-ULP` parity).
-#[inline(always)]
-#[must_use]
-pub fn soft_rect_zero_dc_stereo8<S: StereoVec8>(z: S) -> (S, S) {
-    let zero = S::zero();
-    let half = S::splat(0.5);
-    let one = S::splat(1.0);
-    let eps = S::splat(SOFT_RECT_EPS);
-    let eps2 = S::splat(SOFT_RECT_EPS2);
-    let half_eps_neg = S::splat(-SOFT_RECT_HALF_EPS);
-    let large_z = S::splat(SOFT_RECT_LARGE_Z);
-
-    let z_abs = z.abs();
-    let z_safe = z_abs.min(large_z);
-    let z2 = z_safe.mul(z_safe);
-    let q = z2.add(eps2);
-    let inv_r = q.rsqrt_pos_nr3();
-    let rad = q.mul(inv_r);
-
-    let inv_rad_plus_eps = rad.add(eps).rcp_pos_nr3();
-    let inv_rad_plus_abs = rad.add(z_safe).rcp_pos_nr3();
-
-    let one_plus_frac_eps = one.fma(z_safe, inv_rad_plus_eps);
-    let phi_pos_small = half.mul(z_safe.fma(z2, inv_rad_plus_eps));
-    let phi_pos = S::select_le(z_abs, large_z, phi_pos_small, z_abs);
-
-    let phi_neg_small = half
-        .mul(eps)
-        .mul(z_safe.mul(inv_rad_plus_abs))
-        .mul(one_plus_frac_eps)
-        .neg();
-    let phi_neg = S::select_le(z_abs, large_z, phi_neg_small, half_eps_neg);
-    let raw_phi = S::select_le(z, zero, phi_neg, phi_pos);
-    let phi = S::select_le(z_abs, zero, zero, raw_phi);
-
-    let prime_pos_small = half.mul(one.fma(z_safe, inv_r));
-    let prime_pos = S::select_le(z_abs, large_z, prime_pos_small, one);
-    let prime_neg_small = half.mul(eps2).mul(inv_r).mul(inv_rad_plus_abs);
-    let prime_neg = S::select_le(z_abs, large_z, prime_neg_small, zero);
-    let raw_prime = S::select_le(z, zero, prime_neg, prime_pos);
-    let phi_prime = S::select_le(z_abs, zero, half, raw_prime).clamp(zero, one);
-
-    (phi, phi_prime)
-}
-
-/// Scalar `f32` wrapper over [`soft_rect_zero_dc_vec4`] for CPU/WGSL scalar scans (`0 FDIV`, `0 FSQRT`).
-#[inline(always)]
-#[must_use]
-pub fn soft_rect_zero_dc_f32(z: f32) -> (f32, f32) {
-    let (phi, phi_prime) = soft_rect_zero_dc_vec4(GpuVec4::splat(z));
-    (phi.to_array()[0], phi_prime.to_array()[0])
 }
 
 /// Steps 4 decoupled `1D` scalar `ParaLRU` lanes (`v_new = alpha_rel * v + (1 - alpha_atk) * phi(u - kappa * alpha_rel * v)`).
@@ -376,57 +278,8 @@ pub fn apply_stereo_link_stereo8<S: StereoVec8>(v: S, lambda: S::Half) -> S {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::simd::InterleavedStereo8;
+    use crate::simd::{GpuVec4, InterleavedStereo8};
     use proptest::prelude::*;
-
-    fn soft_rect_f64(z: f64) -> (f64, f64) {
-        let eps = SOFT_RECT_EPS as f64;
-        let r = (z * z + eps * eps).sqrt();
-        let phi = 0.5 * (z + r - eps);
-        let dphi = 0.5 * (1.0 + z / r);
-        (phi, dphi)
-    }
-
-    #[test]
-    fn test_soft_rect_zero_dc_exact_bits_and_extremes() {
-        for z_zero in [0.0_f32, -0.0_f32] {
-            let (phi, dphi) = soft_rect_zero_dc_f32(z_zero);
-            assert_eq!(phi.to_bits(), 0, "expected bit-exact +0.0 at z={z_zero:?}");
-            assert_eq!(dphi, 0.5);
-        }
-
-        let extremes = [
-            -1.0e20_f32,
-            -1.0e9,
-            -100.0,
-            -10.0,
-            -1.0e-7,
-            1.0e-7,
-            10.0,
-            100.0,
-            1.0e9,
-            1.0e20,
-        ];
-        let mut prev_phi = f32::NEG_INFINITY;
-        for x in extremes {
-            let (phi, dphi) = soft_rect_zero_dc_f32(x);
-            assert!(phi.is_finite());
-            assert!(dphi.is_finite());
-            assert!(phi >= -0.5 * SOFT_RECT_EPS - 1.0e-7);
-            assert!((0.0..=1.0).contains(&dphi));
-            assert!(phi >= prev_phi);
-            prev_phi = phi;
-        }
-
-        let v_in = GpuVec4::from_array([-1.0e20, -1.0e-4, 0.0, 1.0e20]);
-        let (vp, vdp) = soft_rect_zero_dc_vec4(v_in);
-        let st_in = InterleavedStereo8::from_lr(v_in, v_in.neg());
-        let (sp, sdp) = soft_rect_zero_dc_stereo8(st_in);
-        let (sp_l, _sp_r) = sp.into_lr();
-        let (sdp_l, _sdp_r) = sdp.into_lr();
-        assert_eq!(vp.to_array(), sp_l.to_array());
-        assert_eq!(vdp.to_array(), sdp_l.to_array());
-    }
 
     #[test]
     fn test_paralru_step_zero_equilibrium_and_subnormal_flush() {
@@ -476,20 +329,6 @@ mod tests {
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
-
-        #[test]
-        fn prop_soft_rect_matches_f64_oracle_and_finite_diff(z in -10.0_f32..10.0_f32) {
-            let (phi, dphi) = soft_rect_zero_dc_f32(z);
-            let (phi64, dphi64) = soft_rect_f64(z as f64);
-            prop_assert!((phi as f64 - phi64).abs() < 2.0e-6);
-            prop_assert!((dphi as f64 - dphi64).abs() < 2.0e-6);
-
-            let h = if z.abs() < 0.05 { 2.0e-5_f32 } else { 5.0e-3_f32 };
-            let (p_plus, _) = soft_rect_zero_dc_f32(z + h);
-            let (p_minus, _) = soft_rect_zero_dc_f32(z - h);
-            let fd = (p_plus - p_minus) / (2.0 * h);
-            prop_assert!((dphi - fd).abs() < 5.0e-4, "z={z}, dphi={dphi}, fd={fd}");
-        }
 
         #[test]
         fn prop_duhem_step_neutral_zero_mode_and_stereo_link_parity(
