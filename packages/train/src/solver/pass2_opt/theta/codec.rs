@@ -62,6 +62,8 @@ impl ThetaLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::linalg::coords::ScaledCoordSpace;
+    use crate::linalg::lbfgs::diag_precond_f32_from_jac;
 
     #[test]
     fn test_theta_codec_pack_unpack_scales_mask_and_grad() {
@@ -83,5 +85,15 @@ mod tests {
         let mut grad_out = vec![1.0_f64; x.len()];
         layout.write_grad(&grads, &mut grad_out);
         assert!(grad_out.iter().all(|&g| g == 0.0));
+
+        let (space, u) =
+            ScaledCoordSpace::new("ThetaLayout::diag_precond_f32", &x, &bounds, Some(&scales))
+                .expect("scaled coord space for tier 0 layout");
+        let mut x_tmp = vec![0.0_f64; x.len()];
+        let mut jac = vec![1.0_f64; x.len()];
+        space.decode(&u, &mut x_tmp, &mut jac);
+        let dp = diag_precond_f32_from_jac(&jac);
+        assert_eq!(dp.len(), x.len());
+        assert!(dp.iter().all(|&v| v.is_finite() && v > 0.0 && v <= 1.0));
     }
 }

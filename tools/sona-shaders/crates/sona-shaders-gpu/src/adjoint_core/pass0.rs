@@ -21,7 +21,7 @@ use crate::core_math::{
     TILE_CKPT_VEC4_STRIDE, eval_tone_scalar, eval_tpt_svf_phs_frame, eval_tpt_svf_scalar,
     flush_zero, get_lane, linear_adjoint_reverse_suffix_256_lr, load_vec4,
     step_duhem_stereo_scalar, step_tpt_svf_phs_scalar, store_vec4, sub_sat_usize,
-    tpt_adjoint_reverse_suffix_256,
+    tpt_adjoint_const_m_reduce_256_lr, tpt_adjoint_dual_reduce_256,
 };
 use dnam_kernels::{LinearScanElem, TptAdjointElem};
 use spirv_std::glam::{Vec2, Vec4};
@@ -290,7 +290,7 @@ pub fn run_pass0(
         } else {
             LinearScanElem::identity()
         };
-        let (sum_lru_l, sum_lru_r, lam_after_l, lam_after_r) =
+        let (sum_lru_l, sum_lru_r, lam_after_l, lam_after_r, p_after_l, p_after_r) =
             linear_adjoint_reverse_suffix_256_lr(scan_scratch, i, lru_elem_l, lru_elem_r, 0.0, 0.0);
 
         let lam_l = if is_active {
@@ -323,41 +323,8 @@ pub fn run_pass0(
             is_phs, is_active, &lp, &phs_l, &phs_r, taps_l.1, taps_r.1, &dt,
         );
 
-        let mut psi0_l = 0.0_f32;
-        let mut psi1_l = 0.0_f32;
-        let sum_tpt_l = tpt_adjoint_reverse_suffix_256(
-            scan_scratch,
-            i,
-            tpt_elem_l,
-            [0.0, 0.0],
-            &mut psi0_l,
-            &mut psi1_l,
-        );
-
-        let mut psi0_r = 0.0_f32;
-        let mut psi1_r = 0.0_f32;
-        let sum_tpt_r = tpt_adjoint_reverse_suffix_256(
-            scan_scratch,
-            i,
-            tpt_elem_r,
-            [0.0, 0.0],
-            &mut psi0_r,
-            &mut psi1_r,
-        );
-
-        // Compute cross-operator Jacobian coupling `k_vs = d v_out / d s_in` inside `14,848 B` SRAM.
-        let unit_lru_l = if is_active {
-            LinearScanElem { a: tl.jac, b: 0.0 }
-        } else {
-            LinearScanElem::identity()
-        };
-        let unit_lru_r = if is_active {
-            LinearScanElem { a: tr.jac, b: 0.0 }
-        } else {
-            LinearScanElem::identity()
-        };
-        let (_sum_u_l, _sum_u_r, p_after_l, p_after_r) =
-            linear_adjoint_reverse_suffix_256_lr(scan_scratch, i, unit_lru_l, unit_lru_r, 1.0, 1.0);
+        // Reuse `after_{l,r}.a` directly (`0-ULP` equal to a `unit_lru` scan with `b = 0.0`,
+        // eliminating `-72` barriers/tile) and reduce `sum_tpt`/`sum_k` via binary tree.
         let unit_lam_l = if is_active { p_after_l } else { 0.0 };
         let unit_lam_r = if is_active { p_after_r } else { 0.0 };
         let zero_sag = SagStereoPullback::zero();
@@ -368,24 +335,25 @@ pub fn run_pass0(
         let (tpt_k_l, tpt_k_r) = build_channel_tpt_pair(
             is_phs, is_active, &lp, &phs_l, &phs_r, taps_l.1, taps_r.1, &dt_k,
         );
-        let mut dummy0 = 0.0_f32;
-        let mut dummy1 = 0.0_f32;
-        let sum_k_l = tpt_adjoint_reverse_suffix_256(
-            scan_scratch,
-            i,
-            tpt_k_l,
-            [0.0, 0.0],
-            &mut dummy0,
-            &mut dummy1,
-        );
-        let sum_k_r = tpt_adjoint_reverse_suffix_256(
-            scan_scratch,
-            i,
-            tpt_k_r,
-            [0.0, 0.0],
-            &mut dummy0,
-            &mut dummy1,
-        );
+
+        let (sum_tpt_l, sum_tpt_r, sum_k_l_g, sum_k_r_g) = if is_phs {
+            let (st_l, sk_l) = tpt_adjoint_dual_reduce_256(scan_scratch, i, tpt_elem_l, tpt_k_l);
+            let (st_r, sk_r) = tpt_adjoint_dual_reduce_256(scan_scratch, i, tpt_elem_r, tpt_k_r);
+            (st_l, st_r, [sk_l.g0, sk_l.g1], [sk_r.g0, sk_r.g1])
+        } else {
+            tpt_adjoint_const_m_reduce_256_lr(
+                scan_scratch,
+                i,
+                valid_len,
+                lp.a1,
+                lp.a2,
+                lp.a3,
+                [tpt_elem_l.g0, tpt_elem_l.g1],
+                [tpt_elem_r.g0, tpt_elem_r.g1],
+                [tpt_k_l.g0, tpt_k_l.g1],
+                [tpt_k_r.g0, tpt_k_r.g1],
+            )
+        };
 
         if i == 0 && tile < num_tiles {
             let slot = tile_base
@@ -424,7 +392,7 @@ pub fn run_pass0(
             store_vec4(
                 tile_adj_boundaries,
                 slot + 5,
-                Vec4::new(sum_k_l.g0, sum_k_l.g1, sum_k_r.g0, sum_k_r.g1),
+                Vec4::new(sum_k_l_g[0], sum_k_l_g[1], sum_k_r_g[0], sum_k_r_g[1]),
             );
         }
     }

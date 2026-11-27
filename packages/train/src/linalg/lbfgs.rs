@@ -4,7 +4,7 @@
 pub use super::coords::ParamBoundSpec;
 
 use crate::error::TrainError;
-use crate::gpu::abi::InnerOptUniforms;
+use crate::gpu::abi::{INNER_OPT_MODE_DIAG_PRECOND, InnerOptUniforms};
 use crate::runner::{InnerOptInput, TrainRunner};
 
 use super::cholesky::factorize_uplo_u_cholesky;
@@ -378,6 +378,47 @@ impl WhitenedLbfgs {
     }
 }
 
+/// Computes `f32` diagonal `H_0` weights `1 / clamp(j^2, 1, 1e12)` from coordinate Jacobians
+/// via [`ScaledCoordSpace::diag_h0_from_jac`] for GPU/CPU `inner_opt_step` preconditioning.
+#[must_use]
+pub fn diag_precond_f32_from_jac(jac: &[f64]) -> Vec<f32> {
+    let mut h0 = vec![1.0_f64; jac.len()];
+    ScaledCoordSpace::diag_h0_from_jac(jac, &mut h0);
+    h0.into_iter().map(|v| v as f32).collect()
+}
+
+/// Bridges an iterative polish loop to `TrainRunner::inner_opt_step` (`m <= 32`) with optional
+/// per-family diagonal preconditioning (`diag_precond`).
+#[allow(clippy::too_many_arguments)]
+pub fn step_runner_inner_opt_precond(
+    runner: &TrainRunner,
+    mut uniforms: InnerOptUniforms,
+    theta: &mut Vec<f32>,
+    grad: &[f32],
+    param_bounds: &[[f32; 4]],
+    lbfgs_s_y: &mut Vec<[f32; 4]>,
+    search_dir: &mut Vec<f32>,
+    diag_precond: Option<&[f32]>,
+) -> Result<(), TrainError> {
+    if diag_precond.is_some() {
+        uniforms.mode_flags |= INNER_OPT_MODE_DIAG_PRECOND;
+    }
+    let out = runner.inner_opt_step(&InnerOptInput {
+        uniforms,
+        num_candidates: 1,
+        theta,
+        grad,
+        param_bounds,
+        lbfgs_s_y,
+        search_dir,
+        diag_precond,
+    })?;
+    *theta = out.theta;
+    *lbfgs_s_y = out.lbfgs_s_y;
+    *search_dir = out.search_dir;
+    Ok(())
+}
+
 /// Bridges an iterative polish loop to `TrainRunner::inner_opt_step` (`m <= 32`).
 pub fn step_runner_inner_opt(
     runner: &TrainRunner,
@@ -388,19 +429,16 @@ pub fn step_runner_inner_opt(
     lbfgs_s_y: &mut Vec<[f32; 4]>,
     search_dir: &mut Vec<f32>,
 ) -> Result<(), TrainError> {
-    let out = runner.inner_opt_step(&InnerOptInput {
+    step_runner_inner_opt_precond(
+        runner,
         uniforms,
-        num_candidates: 1,
         theta,
         grad,
         param_bounds,
         lbfgs_s_y,
         search_dir,
-    })?;
-    *theta = out.theta;
-    *lbfgs_s_y = out.lbfgs_s_y;
-    *search_dir = out.search_dir;
-    Ok(())
+        None,
+    )
 }
 
 #[cfg(test)]
@@ -531,6 +569,37 @@ mod tests {
         )
         .unwrap();
         assert!(th.iter().all(|v| v.is_finite() && *v < 0.4));
+
+        let jac = [1.0_f64, 10.0, 100.0, 1.0e4];
+        let diag = diag_precond_f32_from_jac(&jac);
+        assert!((diag[0] - 1.0).abs() < 1.0e-6);
+        assert!((diag[1] - 1.0e-2).abs() < 1.0e-6);
+        assert!((diag[2] - 1.0e-4).abs() < 1.0e-8);
+        assert!((diag[3] - 1.0e-8).abs() < 1.0e-12);
+        let mut th_p = vec![0.4_f32; 4];
+        let mut sy_p = vec![[0.0_f32; 4]; 12];
+        let mut dir_p = vec![0.0_f32; 4];
+        step_runner_inner_opt_precond(
+            &runner,
+            InnerOptUniforms {
+                num_params: 4,
+                history_m: 2,
+                step_idx: 0,
+                mode_flags: INNER_OPT_MODE_LSSBROYDEN,
+                step_size: 0.2,
+                damping_lambda: 0.0,
+                min_bound_eps: 1.0e-4,
+                grad_clip_norm: 0.0,
+            },
+            &mut th_p,
+            &grad,
+            &bnd,
+            &mut sy_p,
+            &mut dir_p,
+            Some(&diag),
+        )
+        .unwrap();
+        assert!((dir_p[0] / dir_p[1] - 100.0).abs() < 1.0e-2);
     }
 
     #[test]

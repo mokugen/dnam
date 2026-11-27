@@ -80,7 +80,7 @@ pub fn run_pass1(
                 )
             };
 
-            let (full_v_l, full_v_r, adj_v_out_l, adj_v_out_r) =
+            let (full_v_l, full_v_r, adj_v_out_l, adj_v_out_r, _, _) =
                 linear_adjoint_reverse_suffix_256_lr(
                     scan_scratch,
                     i,

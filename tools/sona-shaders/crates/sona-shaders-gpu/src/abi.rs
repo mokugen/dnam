@@ -115,6 +115,7 @@ pub const INNER_OPT_MODE_LSSBROYDEN: u32 = 1 << 0;
 pub const INNER_OPT_MODE_STE_FP16: u32 = 1 << 1;
 pub const INNER_OPT_MODE_LINE_SEARCH_TRIAL: u32 = 1 << 2;
 pub const INNER_OPT_MODE_RESET_STATE: u32 = 1 << 3;
+pub const INNER_OPT_MODE_DIAG_PRECOND: u32 = 1 << 4;
 
 /// `inner_opt_step` `Slot 3` `packed_meta` coordinate transform IDs (bits `0..4`) and `ste_fp16` bit `8`.
 pub const COORD_TRANSFORM_FREE: u32 = 0;

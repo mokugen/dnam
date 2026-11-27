@@ -11,8 +11,9 @@ use crate::abi::{
     MAX_WORKGROUP_SRAM_BYTES,
 };
 use crate::core_math::{
-    QuadLaneParams, eval_duhem_step_terms, eval_tone_scalar, eval_tpt_svf_scalar,
-    linear_forward_exclusive_scan_128_pair, step_tpt_svf_phs_scalar, tpt_exclusive_scan_128_pair,
+    QuadLaneParams, eval_duhem_step_terms, eval_tone_scalar, eval_tpt_svf_scalar, flush_zero,
+    linear_forward_exclusive_scan_128_pair, step_paralru_duhem_scalar, step_tpt_svf_phs_scalar,
+    tpt_exclusive_scan_128_pair,
 };
 use crate::reduce::{clamp_f32_safe, is_finite_bits, rcp_pos_f32, wg_barrier};
 use dnam_kernels::{
@@ -400,46 +401,36 @@ pub(super) fn run_duhem_damped_deer_subtile_lane(
     let max_final = reduce_max_256_in_aux(aux_scratch, lid, final_err);
 
     if max_final > FIXED_POINT_TOL {
-        // Guaranteed `0-ULP` fallback using `bp_l, bp_r` still intact in `lane_buf`.
-        if lid == 0 {
+        // Guaranteed `0-ULP` fallback split across `lid < 2` (`L` and `R` independently),
+        // storing `v_raw` into dead `bp` slots `(f = 1, 3)` cleanly without disturbing `tone`.
+        if lid < 2 {
+            let is_r_fb = lid == 1;
             let lru_c = lp.to_lru_coeffs();
-            let mut vl = aux_scratch[16 + c];
-            let mut vr = aux_scratch[20 + c];
+            let tone_f = if is_r_fb { 2 } else { 0 };
+            let bp_f = tone_f + 1;
+            let v_idx = if is_r_fb { 20 + c } else { 16 + c };
+            let mut v = aux_scratch[v_idx];
             for k in 0..sub_valid_len {
                 let ti = k & 127;
-                let tl = lane_buf[lane_slot(c, 0, ti)];
-                let bl = lane_buf[lane_slot(c, 1, ti)];
-                let tr = lane_buf[lane_slot(c, 2, ti)];
-                let br = lane_buf[lane_slot(c, 3, ti)];
-                let (_rl, _rr, eff_l, eff_r) = crate::core_math::step_duhem_stereo_scalar(
-                    tl, tr, bl, br, &mut vl, &mut vr, lp, &lru_c,
-                );
-                // Store into dead `bp` slots `(f = 1, 3)` cleanly without disturbing `tone` (`f = 0, 2`).
-                lane_buf[lane_slot(c, 1, ti)] = eff_l;
-                lane_buf[lane_slot(c, 3, ti)] = eff_r;
+                let tone = lane_buf[lane_slot(c, tone_f, ti)];
+                let bp = lane_buf[lane_slot(c, bp_f, ti)];
+                let v_raw = step_paralru_duhem_scalar(tone, bp, &mut v, lp, &lru_c);
+                lane_buf[lane_slot(c, bp_f, ti)] = v_raw;
             }
-            aux_scratch[16 + c] = vl;
-            aux_scratch[20 + c] = vr;
+            aux_scratch[v_idx] = flush_zero(v);
         }
         wg_barrier();
     } else {
-        // Exchange `L`/`R` raw `v_cur` via `scan_scratch[512..768]` to compute `stereo_link`,
-        // writing `(v_eff_L, v_eff_R)` into dead `bp` slots `(f = 1, 3)` before `WgBarrier`.
+        // Store `(v_raw_L, v_raw_R)` into dead `bp` slots `(f = 1, 3)` before Stage 3 stereo link.
         wg_barrier();
         if lid < SUBTILE_FRAMES && active {
-            let vl_raw = scan_scratch[512 + t];
-            let vr_raw = scan_scratch[640 + t];
-            let v_mid = 0.5 * (vl_raw + vr_raw);
-            let lam = lp.stereo_link;
-            let eff_l = vl_raw + lam * (v_mid - vl_raw);
-            let eff_r = vr_raw + lam * (v_mid - vr_raw);
-            lane_buf[lane_slot(c, 1, t)] = eff_l;
-            lane_buf[lane_slot(c, 3, t)] = eff_r;
+            lane_buf[lane_slot(c, 1, t)] = scan_scratch[512 + t];
+            lane_buf[lane_slot(c, 3, t)] = scan_scratch[640 + t];
         }
         if lid == 0 && sub_valid_len > 0 {
             let last = (sub_valid_len - 1) & 127;
-            aux_scratch[16 + c] = scan_scratch[512 + last];
-            aux_scratch[20 + c] = scan_scratch[640 + last];
+            aux_scratch[16 + c] = flush_zero(scan_scratch[512 + last]);
+            aux_scratch[20 + c] = flush_zero(scan_scratch[640 + last]);
         }
         wg_barrier();
     }

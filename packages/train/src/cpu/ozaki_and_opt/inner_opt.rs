@@ -5,15 +5,16 @@
 
 use dnam_kernels::{
     IEEE754_F32_ABS_MASK, IEEE754_F32_EXP_BIAS, IEEE754_F32_MANTISSA_BITS, IEEE754_F32_ONE_BITS,
-    canonicalize_zero_f32_bits, f32_to_fp16_u32, fp16_u32_to_f32,
+    canonicalize_zero_f32_bits, f32_to_fp16_u32, flush_subnormal_f32_bits, fp16_u32_to_f32,
 };
 
 use crate::error::TrainError;
 use crate::gpu::abi::{
     COORD_TRANSFORM_ASINH_BOX_NONNEG, COORD_TRANSFORM_ASINH_BOX_SYM, COORD_TRANSFORM_BOX,
     COORD_TRANSFORM_COMPLEMENT_LOG, COORD_TRANSFORM_FREE, COORD_TRANSFORM_LOG_BOX,
-    INNER_OPT_MODE_LINE_SEARCH_TRIAL, INNER_OPT_MODE_LSSBROYDEN, INNER_OPT_MODE_RESET_STATE,
-    INNER_OPT_MODE_STE_FP16, LSSBROYDEN_MAX_HISTORY_M, STE_FP16_META_BIT,
+    INNER_OPT_MODE_DIAG_PRECOND, INNER_OPT_MODE_LINE_SEARCH_TRIAL, INNER_OPT_MODE_LSSBROYDEN,
+    INNER_OPT_MODE_RESET_STATE, INNER_OPT_MODE_STE_FP16, LSSBROYDEN_MAX_HISTORY_M,
+    STE_FP16_META_BIT,
 };
 use crate::runner::types::{InnerOptInput, InnerOptOutput};
 
@@ -22,7 +23,25 @@ const LSSBROYDEN_CURVATURE_EPS: f32 = 1.0e-10;
 const TAU_K_MIN: f32 = 1.0e-3;
 const TAU_K_MAX: f32 = 1.0e3;
 const MIN_H0_DENOM: f32 = 1.0e-12;
+const H0_DIAG_MIN: f32 = 1.0e-12;
+const H0_DIAG_MAX: f32 = 1.0e12;
 const ADAMW_BETA1: f32 = 0.9;
+
+#[inline(always)]
+fn load_h0_diag(diag_precond: Option<&[f32]>, p: usize, use_diag_precond: bool) -> f32 {
+    if !use_diag_precond {
+        return 1.0;
+    }
+    let Some(dp) = diag_precond else {
+        return 1.0;
+    };
+    let raw = flush_subnormal_f32_bits(dp[p.min(dp.len().saturating_sub(1))]);
+    if raw.is_finite() && raw > 0.0 {
+        clamp_f32_safe(raw, H0_DIAG_MIN, H0_DIAG_MAX)
+    } else {
+        1.0
+    }
+}
 const ADAMW_BETA2: f32 = 0.999;
 const ADAMW_EPS: f32 = 1.0e-8;
 const EXP2_C2: f32 = 0.240_221_09;
@@ -353,6 +372,7 @@ fn step_lssbroyden_cand(
         0.0
     };
     let use_ste = (u.mode_flags & INNER_OPT_MODE_STE_FP16) != 0;
+    let use_diag_precond = (u.mode_flags & INNER_OPT_MODE_DIAG_PRECOND) != 0;
 
     if (u.mode_flags & INNER_OPT_MODE_RESET_STATE) != 0 {
         for slot in 0..m {
@@ -363,8 +383,9 @@ fn step_lssbroyden_cand(
         for p in 0..n {
             let cur_u = clamp_u_for_meta(theta[u_base + p], input.param_bounds[p], u.min_bound_eps);
             let cur_g = flush_zero(input.grad[u_base + p]);
+            let h0_p = load_h0_diag(input.diag_precond, p, use_diag_precond);
             state[s_base + m * n + p] = [cur_u, cur_g, 0.0, 0.0];
-            dir[u_base + p] = flush_zero(-cur_g);
+            dir[u_base + p] = flush_zero(-cur_g * h0_p);
         }
         return;
     }
@@ -435,7 +456,8 @@ fn step_lssbroyden_cand(
             sy += pair[0] * pair[1];
             sq += pair[0] * dir[u_base + p];
             if !found_h0 {
-                yy += pair[1] * pair[1];
+                let h0_p = load_h0_diag(input.diag_precond, p, use_diag_precond);
+                yy += h0_p * pair[1] * pair[1];
             }
         }
         if sy.is_finite() && sy > 0.0 {
@@ -454,7 +476,8 @@ fn step_lssbroyden_cand(
         }
     }
     for p in 0..n {
-        dir[u_base + p] = flush_zero(dir[u_base + p] * h0_scale);
+        let h0_p = load_h0_diag(input.diag_precond, p, use_diag_precond);
+        dir[u_base + p] = flush_zero(dir[u_base + p] * (h0_scale * h0_p));
     }
     for rev in 0..used {
         let age = used - 1 - rev;
@@ -485,8 +508,9 @@ fn step_lssbroyden_cand(
         let meta = input.param_bounds[p];
         let cur_t = clamp_u_for_meta(theta[u_base + p], meta, u.min_bound_eps);
         let cur_g = flush_zero(input.grad[u_base + p]);
+        let h0_p = load_h0_diag(input.diag_precond, p, use_diag_precond);
         let dir_p = if fallback {
-            flush_zero(-cur_g * inv_damping)
+            flush_zero(-cur_g * h0_p * inv_damping)
         } else {
             flush_zero(-dir[u_base + p])
         };
@@ -533,6 +557,15 @@ pub fn run_inner_opt_step_cpu(input: &InnerOptInput<'_>) -> Result<InnerOptOutpu
             actual: input.lbfgs_s_y.len(),
         });
     }
+    if let Some(dp) = input.diag_precond
+        && dp.len() < n
+    {
+        return Err(TrainError::InvalidDimensions {
+            context: "inner_opt_step(diag_precond)",
+            expected: n,
+            actual: dp.len(),
+        });
+    }
 
     let mut theta = input.theta[..exp_vec].to_vec();
     let mut state = input.lbfgs_s_y.to_vec();
@@ -549,4 +582,184 @@ pub fn run_inner_opt_step_cpu(input: &InnerOptInput<'_>) -> Result<InnerOptOutpu
         lbfgs_s_y: state,
         search_dir: dir,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use proptest::prelude::*;
+
+    use super::*;
+    use crate::gpu::abi::InnerOptUniforms;
+    use crate::linalg::ssbroyden::{SsBroydenConfig, SsBroydenState};
+
+    #[test]
+    fn test_diag_precond_rejects_short_slice_and_handles_invalid_entries() {
+        let bounds = [[-10.0_f32, 10.0, 1.0, f32::from_bits(COORD_TRANSFORM_FREE)]; 4];
+        let err = run_inner_opt_step_cpu(&InnerOptInput {
+            uniforms: InnerOptUniforms {
+                num_params: 4,
+                history_m: 2,
+                step_idx: 0,
+                mode_flags: INNER_OPT_MODE_LSSBROYDEN | INNER_OPT_MODE_DIAG_PRECOND,
+                step_size: 0.5,
+                damping_lambda: 1.0e-6,
+                min_bound_eps: 0.0,
+                grad_clip_norm: 0.0,
+            },
+            num_candidates: 1,
+            theta: &[1.0; 4],
+            grad: &[0.5; 4],
+            param_bounds: &bounds,
+            lbfgs_s_y: &[[0.0; 4]; 12],
+            search_dir: &[0.0; 4],
+            diag_precond: Some(&[1.0, 2.0]),
+        })
+        .unwrap_err();
+        assert!(matches!(err, TrainError::InvalidDimensions { .. }));
+
+        let sanitized = run_inner_opt_step_cpu(&InnerOptInput {
+            uniforms: InnerOptUniforms {
+                num_params: 4,
+                history_m: 2,
+                step_idx: 0,
+                mode_flags: INNER_OPT_MODE_LSSBROYDEN
+                    | INNER_OPT_MODE_DIAG_PRECOND
+                    | INNER_OPT_MODE_RESET_STATE,
+                step_size: 0.5,
+                damping_lambda: 0.0,
+                min_bound_eps: 0.0,
+                grad_clip_norm: 0.0,
+            },
+            num_candidates: 1,
+            theta: &[1.0; 4],
+            grad: &[1.0, 1.0, 1.0, 1.0],
+            param_bounds: &bounds,
+            lbfgs_s_y: &[[0.0; 4]; 12],
+            search_dir: &[0.0; 4],
+            diag_precond: Some(&[f32::NAN, -2.0, 1.0e-18, 1.0e18]),
+        })
+        .unwrap();
+        assert_eq!(sanitized.search_dir[0], -1.0);
+        assert_eq!(sanitized.search_dir[1], -1.0);
+        assert_eq!(sanitized.search_dir[2], -H0_DIAG_MIN);
+        assert_eq!(sanitized.search_dir[3], -H0_DIAG_MAX);
+
+        let subnormal = run_inner_opt_step_cpu(&InnerOptInput {
+            uniforms: InnerOptUniforms {
+                num_params: 4,
+                history_m: 2,
+                step_idx: 0,
+                mode_flags: INNER_OPT_MODE_LSSBROYDEN
+                    | INNER_OPT_MODE_DIAG_PRECOND
+                    | INNER_OPT_MODE_RESET_STATE,
+                step_size: 0.5,
+                damping_lambda: 0.0,
+                min_bound_eps: 0.0,
+                grad_clip_norm: 0.0,
+            },
+            num_candidates: 1,
+            theta: &[1.0; 4],
+            grad: &[0.25, 0.25, 0.25, 0.25],
+            param_bounds: &bounds,
+            lbfgs_s_y: &[[0.0; 4]; 12],
+            search_dir: &[0.0; 4],
+            diag_precond: Some(&[1.0e-40_f32, -1.0e-40_f32, f32::MIN_POSITIVE, 1.0]),
+        })
+        .unwrap();
+        assert_eq!(subnormal.search_dir[0], -0.25);
+        assert_eq!(subnormal.search_dir[1], -0.25);
+        assert_eq!(subnormal.search_dir[2], -0.25 * H0_DIAG_MIN);
+        assert_eq!(subnormal.search_dir[3], -0.25);
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(32))]
+
+        #[test]
+        fn prop_cpu_inner_opt_diag_precond_matches_ssbroyden_state(
+            n in 4_usize..=20,
+            exps in proptest::collection::vec(-4.0_f64..2.0_f64, 20),
+            w_vals in proptest::collection::vec(0.2_f64..4.0_f64, 20),
+            x_vals in proptest::collection::vec(-1.5_f64..1.5_f64, 20),
+        ) {
+            let h0_f64: Vec<f64> = exps[..n].iter().map(|&e| 10.0_f64.powf(e)).collect();
+            let h0_f32: Vec<f32> = h0_f64.iter().map(|&v| v as f32).collect();
+            let hess: Vec<f64> = w_vals[..n]
+                .iter()
+                .zip(&h0_f64)
+                .map(|(&w, &h0)| w / h0.max(1.0))
+                .collect();
+            let bounds = vec![[-1.0e6_f32, 1.0e6, 1.0, f32::from_bits(COORD_TRANSFORM_FREE)]; n];
+
+            let m = 8_usize;
+            let cfg = SsBroydenConfig {
+                history_m: m,
+                dense_dim_threshold: 0,
+                tau_min: f64::from(TAU_K_MIN),
+                tau_max: f64::from(TAU_K_MAX),
+                damping_lambda: 1.0e-12,
+                curvature_tol: f64::from(LSSBROYDEN_CURVATURE_EPS),
+                ..SsBroydenConfig::default()
+            };
+            let mut ssb = SsBroydenState::new(n, &cfg, Some(&h0_f64));
+            let mut x_ssb: Vec<f64> = x_vals[..n].to_vec();
+            let mut x_cpu: Vec<f32> = x_ssb.iter().map(|&v| v as f32).collect();
+            let mut sy_cpu = vec![[0.0_f32; 4]; (m + 1) * n];
+            let mut dir_cpu = vec![0.0_f32; n];
+            let mut prev_x_ssb = x_ssb.clone();
+            let mut prev_g_ssb = vec![0.0_f64; n];
+
+            for step in 0..4_u32 {
+                let g_ssb: Vec<f64> = x_ssb.iter().zip(&hess).map(|(&x, &w)| w * x).collect();
+                let g_cpu: Vec<f32> = x_cpu.iter().zip(&hess).map(|(&x, &w)| (w as f32) * x).collect();
+                if step > 0 {
+                    let s: Vec<f64> = x_ssb.iter().zip(&prev_x_ssb).map(|(a, b)| a - b).collect();
+                    let y: Vec<f64> = g_ssb.iter().zip(&prev_g_ssb).map(|(a, b)| a - b).collect();
+                    let _ = ssb.update(&s, &y, &cfg);
+                }
+                let mut dir_ssb = vec![0.0_f64; n];
+                ssb.compute_direction(&g_ssb, &h0_f64, &cfg, &mut dir_ssb);
+
+                let out = run_inner_opt_step_cpu(&InnerOptInput {
+                    uniforms: InnerOptUniforms {
+                        num_params: n as u32,
+                        history_m: m as u32,
+                        step_idx: step,
+                        mode_flags: INNER_OPT_MODE_LSSBROYDEN | INNER_OPT_MODE_DIAG_PRECOND,
+                        step_size: 0.1,
+                        damping_lambda: 1.0e-12,
+                        min_bound_eps: 0.0,
+                        grad_clip_norm: 0.0,
+                    },
+                    num_candidates: 1,
+                    theta: &x_cpu,
+                    grad: &g_cpu,
+                    param_bounds: &bounds,
+                    lbfgs_s_y: &sy_cpu,
+                    search_dir: &dir_cpu,
+                    diag_precond: Some(&h0_f32),
+                })
+                .unwrap();
+
+                for p in 0..n {
+                    let tol = 2.0e-4 * dir_ssb[p].abs().max(1.0);
+                    prop_assert!(
+                        (f64::from(out.search_dir[p]) - dir_ssb[p]).abs() <= tol,
+                        "step={step} p={p}: cpu={} ssb={}",
+                        out.search_dir[p],
+                        dir_ssb[p]
+                    );
+                }
+
+                prev_x_ssb.clone_from(&x_ssb);
+                prev_g_ssb.clone_from(&g_ssb);
+                for p in 0..n {
+                    x_ssb[p] += 0.1 * dir_ssb[p];
+                }
+                x_cpu = out.theta;
+                sy_cpu = out.lbfgs_s_y;
+                dir_cpu = out.search_dir;
+            }
+        }
+    }
 }

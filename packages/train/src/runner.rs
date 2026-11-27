@@ -475,6 +475,7 @@ mod tests {
                 param_bounds: &[[-1.0, 1.0, 1.0, f32::from_bits(COORD_TRANSFORM_FREE)]; 4],
                 lbfgs_s_y: &[[0.0; 4]; 12],
                 search_dir: &[0.0; 4],
+                diag_precond: None,
             })
             .unwrap();
         assert_eq!(opt.theta.len(), 4);

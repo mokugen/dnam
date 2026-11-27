@@ -7,11 +7,15 @@
 pub mod adaa_deriv;
 pub mod scans;
 
-pub use adaa_deriv::{DuhemStepTerms, eval_adaa_and_wf_with_derivs, eval_duhem_step_terms};
+pub use adaa_deriv::{
+    DuhemStepTerms, eval_adaa_and_wf_with_derivs, eval_duhem_step_terms,
+    eval_paralru_duhem_affine_step, is_duhem_decoupled,
+};
 pub use scans::{
     linear_adjoint_reverse_suffix_256_lr, linear_forward_exclusive_scan_128_pair,
-    reduce_batch6_in_scratch, reduce_sum_256_in_aux, tpt_adjoint_reverse_suffix_256,
-    tpt_exclusive_scan_128_pair, tpt_exclusive_scan_256, wg_barrier,
+    linear_forward_inclusive_scan_256_lr, reduce_batch6_in_scratch, reduce_sum_256_in_aux,
+    tpt_adjoint_const_m_reduce_256_lr, tpt_adjoint_dual_reduce_256, tpt_adjoint_reverse_suffix_256,
+    tpt_const_m_scan_128_pair, tpt_const_m_scan_256_lr, tpt_exclusive_scan_128_pair, wg_barrier,
 };
 
 use crate::abi::TILE_FRAMES;
@@ -518,4 +522,26 @@ pub fn step_duhem_stereo_scalar(
     *v_l = rl;
     *v_r = rr;
     (rl, rr, eff_l.to_array()[0], eff_r.to_array()[0])
+}
+
+/// Steps one single-channel Selective-Duhem `ParaLRU` sample via `dnam_kernels`, returning `v_raw`.
+#[inline(always)]
+#[must_use]
+pub fn step_paralru_duhem_scalar(
+    tone: f32,
+    bp: f32,
+    v: &mut f32,
+    p: &QuadLaneParams,
+    lru: &SonaParaLruDuhemCoeffs4<GpuVec4>,
+) -> f32 {
+    let mut v_reg = GpuVec4::splat(*v);
+    let raw = step_paralru_duhem_vec4(
+        GpuVec4::splat(p.rect_sign * tone),
+        GpuVec4::splat(p.two_svf_g * bp),
+        &mut v_reg,
+        lru,
+    )
+    .to_array()[0];
+    *v = raw;
+    raw
 }

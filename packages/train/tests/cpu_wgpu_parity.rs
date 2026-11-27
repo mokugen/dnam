@@ -7,6 +7,8 @@
 
 mod cpu_wgpu_parity {
     #[cfg(feature = "gpu-wgpu")]
+    pub(crate) mod inner_opt;
+    #[cfg(feature = "gpu-wgpu")]
     pub(crate) mod m22_pipeline;
     #[cfg(feature = "gpu-wgpu")]
     pub(crate) mod support;
@@ -271,6 +273,7 @@ mod gpu_parity {
                     param_bounds: &bnd,
                     lbfgs_s_y: &sy,
                     search_dir: &dir,
+                    diag_precond: None,
                 })
                 .unwrap();
             let o_g = gpu
@@ -291,6 +294,7 @@ mod gpu_parity {
                     param_bounds: &bnd,
                     lbfgs_s_y: &sy,
                     search_dir: &dir,
+                    diag_precond: None,
                 })
                 .unwrap();
             th_c = o_c.theta;

@@ -253,6 +253,8 @@ pub const INNER_OPT_MODE_STE_FP16: u32 = 1 << 1;
 pub const INNER_OPT_MODE_LINE_SEARCH_TRIAL: u32 = 1 << 2;
 /// `inner_opt_step` `mode_flags` bit resetting AdamW/L-SSBroyden state buffers.
 pub const INNER_OPT_MODE_RESET_STATE: u32 = 1 << 3;
+/// `inner_opt_step` `mode_flags` bit enabling per-family diagonal `H_0` preconditioning (`@binding(6)`).
+pub const INNER_OPT_MODE_DIAG_PRECOND: u32 = 1 << 4;
 
 /// Coordinate transform ID `Free` (`0`).
 pub const COORD_TRANSFORM_FREE: u32 = 0;
@@ -429,7 +431,7 @@ pub struct InnerOptUniforms {
     pub history_m: u32,
     /// Outer optimization step index (`0..`).
     pub step_idx: u32,
-    /// Bitflags (`bit 0`: L-SSBroyden, `bit 1`: STE fp16, `bit 2`: line-search trial, `bit 3`: reset state).
+    /// Bitflags (`bit 0`: L-SSBroyden, `bit 1`: STE fp16, `bit 2`: line-search trial, `bit 3`: reset state, `bit 4`: diagonal precond).
     pub mode_flags: u32,
     /// Step size / learning rate `alpha`.
     pub step_size: f32,

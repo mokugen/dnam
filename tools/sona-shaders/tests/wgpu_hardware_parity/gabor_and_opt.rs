@@ -12,8 +12,9 @@ use dnam_kernels::{f32_to_fp16_u32, fp16_u32_to_f32};
 use sona_shaders::abi::{
     COORD_TRANSFORM_ASINH_BOX_NONNEG, COORD_TRANSFORM_ASINH_BOX_SYM, COORD_TRANSFORM_BOX,
     COORD_TRANSFORM_COMPLEMENT_LOG, COORD_TRANSFORM_FREE, COORD_TRANSFORM_LOG_BOX,
-    GaborBezoutUniforms, INNER_OPT_MODE_LINE_SEARCH_TRIAL, INNER_OPT_MODE_LSSBROYDEN,
-    INNER_OPT_MODE_RESET_STATE, INNER_OPT_MODE_STE_FP16, InnerOptUniforms, STE_FP16_META_BIT,
+    GaborBezoutUniforms, INNER_OPT_MODE_DIAG_PRECOND, INNER_OPT_MODE_LINE_SEARCH_TRIAL,
+    INNER_OPT_MODE_LSSBROYDEN, INNER_OPT_MODE_RESET_STATE, INNER_OPT_MODE_STE_FP16,
+    InnerOptUniforms, STE_FP16_META_BIT,
 };
 use sona_shaders::manifest::KernelId;
 use zerocopy::IntoBytes;
@@ -303,24 +304,58 @@ fn clamp_u_free_f64(cand: f64, b: [f32; 4], min_eps: f64) -> f64 {
     cand.clamp(lo_e, hi_e)
 }
 
-fn cpu_lssbroyden_step_f64(
+fn h0_diag_at(diag_precond: Option<&[f32]>, p: usize, enabled: bool) -> f64 {
+    if !enabled {
+        return 1.0;
+    }
+    let Some(dp) = diag_precond else {
+        return 1.0;
+    };
+    let v = dp[p] as f64;
+    if v.is_finite() && v > 0.0 {
+        v.clamp(1.0e-12, 1.0e12)
+    } else {
+        1.0
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn cpu_lssbroyden_step_f64(
     cand: usize,
     theta: &mut [f64],
     grad: &[f64],
     bounds: &[[f32; 4]],
     lbfgs_s_y: &mut [[f64; 4]],
     search_dir: &mut [f64],
+    diag_precond: Option<&[f32]>,
     u: &InnerOptUniforms,
 ) {
     let m = u.history_m as usize;
     let step_idx = u.step_idx;
     let is_trial = (u.mode_flags & INNER_OPT_MODE_LINE_SEARCH_TRIAL) != 0;
+    let is_reset = (u.mode_flags & INNER_OPT_MODE_RESET_STATE) != 0;
+    let use_diag = (u.mode_flags & INNER_OPT_MODE_DIAG_PRECOND) != 0;
     let step_sz = u.step_size as f64;
     let damping = u.damping_lambda as f64;
     let min_eps = u.min_bound_eps as f64;
     let n = u.num_params as usize;
     let u_base = cand * n;
     let s_base = cand * (m + 1) * n;
+
+    if is_reset {
+        for slot in 0..m {
+            for p in 0..n {
+                lbfgs_s_y[s_base + slot * n + p] = [0.0; 4];
+            }
+        }
+        for p in 0..n {
+            let cur_u = clamp_u_free_f64(theta[u_base + p], bounds[p], min_eps);
+            let h0 = h0_diag_at(diag_precond, p, use_diag);
+            lbfgs_s_y[s_base + m * n + p] = [cur_u, grad[u_base + p], 0.0, 0.0];
+            search_dir[u_base + p] = -grad[u_base + p] * h0;
+        }
+        return;
+    }
 
     if is_trial {
         for p in 0..n {
@@ -378,7 +413,7 @@ fn cpu_lssbroyden_step_f64(
             sy += s * y;
             sq += s * q[p];
             if !found_h0 {
-                yy += y * y;
+                yy += h0_diag_at(diag_precond, p, use_diag) * y * y;
             }
         }
         if sy > 0.0 {
@@ -396,8 +431,8 @@ fn cpu_lssbroyden_step_f64(
             rhos[age] = r;
         }
     }
-    for v in &mut q {
-        *v *= h0_scale;
+    for (p, v) in q.iter_mut().enumerate() {
+        *v *= h0_scale * h0_diag_at(diag_precond, p, use_diag);
     }
     for rev in 0..used {
         let age = used - 1 - rev;
@@ -421,7 +456,7 @@ fn cpu_lssbroyden_step_f64(
     for p in 0..n {
         let cur_t = clamp_u_free_f64(theta[u_base + p], bounds[p], min_eps);
         let dir = if fallback {
-            -grad[u_base + p] / (1.0 + damping)
+            -grad[u_base + p] * h0_diag_at(diag_precond, p, use_diag) / (1.0 + damping)
         } else {
             -q[p]
         };
@@ -454,6 +489,7 @@ pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderV
         bounds[1][1] = 0.15;
         let mut lbfgs_s_y = vec![[0.0_f32; 4]; num_cands * (history_m + 1) * num_params];
         let mut search_dir = vec![0.0_f32; num_cands * num_params];
+        let dummy_diag = vec![1.0_f32; 4];
 
         let target: Vec<f32> = (0..num_params).map(|i| -0.6 + 0.05 * (i as f32)).collect();
         let eval_obj = |all_x: &[f32]| -> (Vec<f32>, Vec<f32>) {
@@ -505,6 +541,7 @@ pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderV
                         (false, as_byte_slice(&bounds)),
                         (true, as_byte_slice(&lbfgs_s_y)),
                         (true, as_byte_slice(&search_dir)),
+                        (false, as_byte_slice(&dummy_diag)),
                     ],
                 );
                 let next_theta = read_f32_vec(&out[0]);
@@ -565,6 +602,7 @@ pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderV
                 (false, as_byte_slice(&bounds)),
                 (true, as_byte_slice(&lbfgs_s_y)),
                 (true, as_byte_slice(&search_dir)),
+                (false, as_byte_slice(&dummy_diag)),
             ],
         );
         let reset_sy = read_vec4_vec(&reset_out[1]);
@@ -591,6 +629,7 @@ pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderV
         let mut sy_cpu = vec![[0.0_f64; 4]; num_cands * (m + 1) * n];
         let mut dir_gpu = vec![0.0_f32; num_cands * n];
         let mut dir_cpu = vec![0.0_f64; num_cands * n];
+        let dummy_diag = vec![1.0_f32; 4];
 
         let target: Vec<f64> = (0..n).map(|i| -0.45 + 0.03 * ((i % 21) as f64)).collect();
         let eval_f32 = |x: &[f32]| -> (f32, Vec<f32>) {
@@ -650,6 +689,7 @@ pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderV
                         (false, as_byte_slice(&bounds)),
                         (true, as_byte_slice(&sy_gpu)),
                         (true, as_byte_slice(&dir_gpu)),
+                        (false, as_byte_slice(&dummy_diag)),
                     ],
                 );
                 theta_gpu = read_f32_vec(&out[0]);
@@ -663,6 +703,7 @@ pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderV
                         &bounds,
                         &mut sy_cpu,
                         &mut dir_cpu,
+                        None,
                         &u,
                     );
                 }
@@ -729,6 +770,7 @@ pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderV
     grad_ste[n_ste] = 4.0;
     let opt_state_init = vec![[0.0_f32; 4]; 2 * n_ste];
     let dir_init = vec![0.0_f32; 2 * n_ste];
+    let dummy_diag = vec![1.0_f32; 4];
     let adam_u = InnerOptUniforms {
         num_params: n_ste as u32,
         history_m: 0,
@@ -751,6 +793,7 @@ pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderV
             (false, as_byte_slice(&bounds_ste)),
             (true, as_byte_slice(&opt_state_init)),
             (true, as_byte_slice(&dir_init)),
+            (false, as_byte_slice(&dummy_diag)),
         ],
     );
     let adam_theta = read_f32_vec(&adam_out[0]);
@@ -762,4 +805,6 @@ pub fn verify_inner_opt_step_lbfgs_and_bounds(ctx: &GpuContext, variant: ShaderV
     let fp16_exact = fp16_u32_to_f32(f32_to_fp16_u32(shadow0));
     assert_eq!(adam_theta[0].to_bits(), fp16_exact.to_bits());
     assert!(adam_theta.iter().all(|v| v.is_finite()));
+
+    super::inner_opt_diag::verify_inner_opt_diag_precond(ctx, variant, label);
 }

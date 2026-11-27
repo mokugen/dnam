@@ -301,6 +301,35 @@ pub(super) fn enforce_monotone_tiers_non_destructive(
         state.final_bin = b;
         state.final_bundle = bdl;
         state.cert = c;
+        if state.cert.pair_monotone[1..].iter().all(|&m| m) {
+            break;
+        }
+        // After a Stage-D tier fallback changes an adjacent pair, re-attempt non-destructive
+        // Stage-A upper-tier blending before escalating to destructive weight zeroing on another tier.
+        let step_besr: [f64; 4] = core::array::from_fn(|t| state.cert.tier_reports[t].besr_db);
+        let step_overrides: [TierReadoutPrefixF64; 4] = core::array::from_fn(|t| {
+            model.tier_overrides[t]
+                .as_deref()
+                .cloned()
+                .unwrap_or_default()
+        });
+        let step_base = RepairBaseline {
+            besr: &step_besr,
+            trims: &orig_trims,
+            overrides: &step_overrides,
+        };
+        let _ = try_stage_a_blend(model, eval, &step_base, &mut state);
+        if state.cert.pair_monotone[1..].iter().all(|&m| m) {
+            break;
+        }
+        let protect_full_or_ultra = !state.cert.pair_monotone[1]
+            || state.cert.tier_reports[3].besr_db < state.cert.tier_reports[2].besr_db - 10.0;
+        if protect_full_or_ultra {
+            let _ = try_stage_b_bottom_up(model, eval, &step_base, &mut state);
+            if state.cert.pair_monotone[1..].iter().all(|&m| m) {
+                break;
+            }
+        }
     }
 
     Ok(state)
@@ -702,5 +731,66 @@ mod tests {
         assert!(model.kautz[24].c_re_l.abs() > 0.0);
         assert!(model.tiles[23].w_odd_4x4[0][0].abs() > 0.0);
         assert!(final_cert.tier_reports[3].besr_db < final_cert.tier_reports[0].besr_db);
+    }
+
+    #[test]
+    fn test_stage_d_fallback_repairs_multi_tier_regression_preserving_ultra() {
+        let n = 1_024_usize;
+        let sr = 48_000.0_f64;
+        let in_l: Vec<f64> = (0..n)
+            .map(|i| 0.25 * ((i as f64) * 0.07).sin() + 0.12 * ((i as f64) * 0.29).cos())
+            .collect();
+        let in_r = in_l.clone();
+        let mut model = SonaModelF64::new(sr);
+        model.oversample_upper_tiers_2x = false;
+        model.active_fir_taps = 128;
+        model.active_kautz_pairs = 32;
+        model.pre_conv_u_gain = [0.75, 0.75];
+        model.direct_s2_u_gain = [0.25, 0.25];
+        model.fir_l[100] = 0.08;
+        model.fir_r[100] = 0.08;
+        model.tiles[23].w_odd_4x4[0][0] = 0.05;
+        model.w_ro[32][6] = 0.12;
+        for k in 0..32 {
+            model.kautz[k].r_low = 0.87;
+            model.kautz[k].theta = 0.06 + 0.09 * (k as f64);
+            model.kautz[k].b_gamma = 0.5;
+            model.kautz[k].c_re_l = if k < 8 { 0.03 } else { 0.05 };
+            model.kautz[k].c_re_r = model.kautz[k].c_re_l;
+        }
+        let cfg = Pass5EmitConfig::default();
+        let clean_bin = encode_model_to_dnam_bin(&model, cfg).unwrap();
+        let (tgt_l, tgt_r) = render_all_tiers(&clean_bin, &in_l, &in_r, sr as f32)
+            .unwrap()
+            .renders[3]
+            .clone();
+
+        model.prefix_override_needed = [false, true, true, true];
+        materialize_tier_overrides(&mut model);
+        if let Some(ref mut std_ov) = model.tier_overrides[1] {
+            std_ov.kautz_c_re_l[0] += 0.45;
+            std_ov.kautz_c_re_r[0] += 0.45;
+            std_ov.w_ro[10][6] += 0.35;
+        }
+        if let Some(ref mut full_ov) = model.tier_overrides[2] {
+            full_ov.kautz_c_re_l[0] += 0.55;
+            full_ov.kautz_c_re_r[0] += 0.55;
+            full_ov.w_ro[10][6] += 0.40;
+        }
+        let (_, _, init_cert) = re_eval(&mut model, &in_l, &in_r, &tgt_l, &tgt_r, 64, cfg).unwrap();
+        assert!(!init_cert.pair_monotone[1]);
+        assert!(!init_cert.pair_monotone[2]);
+        assert!(init_cert.tier_reports[3].besr_db < init_cert.tier_reports[0].besr_db - 1.0);
+
+        let final_cert = run_monotone_test(&mut model, &in_l, &in_r, &tgt_l, &tgt_r, cfg);
+        assert!(check_adjacent_tier_monotone(&final_cert.tier_reports));
+        assert!(model.kautz[24].c_re_l.abs() > 0.0);
+        assert!(model.tiles[23].w_odd_4x4[0][0].abs() > 0.0);
+        assert!(
+            final_cert.tier_reports[3].besr_db < final_cert.tier_reports[0].besr_db - 1.0,
+            "Ultra must retain meaningful gain over Lite after Stage D fallback + Stage A/B retry: lite={:.2} ultra={:.2}",
+            final_cert.tier_reports[0].besr_db,
+            final_cert.tier_reports[3].besr_db,
+        );
     }
 }

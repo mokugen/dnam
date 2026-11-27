@@ -225,6 +225,7 @@ mod tests {
             param_bounds: &bounds,
             lbfgs_s_y: &state,
             search_dir: &dir,
+            diag_precond: None,
         })
         .unwrap();
         assert_eq!(adam_res.theta.len(), num_cands * n);
@@ -250,6 +251,7 @@ mod tests {
             param_bounds: &free_bounds,
             lbfgs_s_y: &state,
             search_dir: &dir,
+            diag_precond: None,
         })
         .unwrap();
         let trial = run_inner_opt_step_cpu(&InnerOptInput {
@@ -264,6 +266,7 @@ mod tests {
             param_bounds: &free_bounds,
             lbfgs_s_y: &s0.lbfgs_s_y,
             search_dir: &s0.search_dir,
+            diag_precond: None,
         })
         .unwrap();
         assert_eq!(trial.lbfgs_s_y, s0.lbfgs_s_y);
@@ -279,6 +282,7 @@ mod tests {
             param_bounds: &free_bounds,
             lbfgs_s_y: &trial.lbfgs_s_y,
             search_dir: &trial.search_dir,
+            diag_precond: None,
         })
         .unwrap();
         assert_eq!(reset.lbfgs_s_y[0], [0.0; 4]);
@@ -293,6 +297,7 @@ mod tests {
                 param_bounds: &free_bounds,
                 lbfgs_s_y: &state,
                 search_dir: &dir,
+                diag_precond: None,
             }),
             Err(TrainError::InvalidDimensions { .. })
         ));

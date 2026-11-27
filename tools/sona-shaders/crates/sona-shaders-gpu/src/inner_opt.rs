@@ -8,9 +8,9 @@
 pub mod ste;
 
 use crate::abi::{
-    COORD_TRANSFORM_FREE, INNER_OPT_MODE_LINE_SEARCH_TRIAL, INNER_OPT_MODE_LSSBROYDEN,
-    INNER_OPT_MODE_RESET_STATE, INNER_OPT_MODE_STE_FP16, InnerOptUniforms,
-    LSSBROYDEN_MAX_HISTORY_M, MAX_WORKGROUP_SRAM_BYTES,
+    COORD_TRANSFORM_FREE, INNER_OPT_MODE_DIAG_PRECOND, INNER_OPT_MODE_LINE_SEARCH_TRIAL,
+    INNER_OPT_MODE_LSSBROYDEN, INNER_OPT_MODE_RESET_STATE, INNER_OPT_MODE_STE_FP16,
+    InnerOptUniforms, LSSBROYDEN_MAX_HISTORY_M, MAX_WORKGROUP_SRAM_BYTES,
 };
 use crate::reduce::{
     WG_THREADS, clamp_f32_safe, clamp_idx, flush_zero, is_finite_bits, rcp_pos_f32,
@@ -43,9 +43,24 @@ const LSSBROYDEN_CURVATURE_EPS: f32 = 1.0e-10;
 const TAU_K_MIN: f32 = 1.0e-3;
 const TAU_K_MAX: f32 = 1.0e3;
 const MIN_H0_DENOM: f32 = 1.0e-12;
+const H0_DIAG_MIN: f32 = 1.0e-12;
+const H0_DIAG_MAX: f32 = 1.0e12;
 const ADAMW_BETA1: f32 = 0.9;
 const ADAMW_BETA2: f32 = 0.999;
 const ADAMW_EPS: f32 = 1.0e-8;
+
+#[inline(always)]
+fn load_h0_diag(diag_precond: &[f32], p: usize, use_diag_precond: bool) -> f32 {
+    let raw = diag_precond[clamp_idx(p, diag_precond.len())];
+    if !use_diag_precond {
+        return 1.0;
+    }
+    if is_finite_bits(raw) && raw > 0.0 {
+        clamp_f32_safe(raw, H0_DIAG_MIN, H0_DIAG_MAX)
+    } else {
+        1.0
+    }
+}
 
 #[inline(always)]
 fn clamp_u_for_meta(u: f32, bound_meta: Vec4, min_bound_eps: f32) -> f32 {
@@ -276,6 +291,7 @@ fn run_lssbroyden_step(
     param_bounds: &[Vec4],
     lbfgs_s_y: &mut [Vec4],
     search_dir: &mut [f32],
+    diag_precond: &[f32],
     scratch_q: &mut [f32; INNER_OPT_Q_FLOATS],
     dot_scratch: &mut [f32; INNER_OPT_DOT_FLOATS],
     lbfgs_scalars: &mut [f32; INNER_OPT_SCALAR_FLOATS],
@@ -298,6 +314,7 @@ fn run_lssbroyden_step(
     };
     let use_ste = (uniforms.mode_flags & INNER_OPT_MODE_STE_FP16) != 0;
     let reset_state = (uniforms.mode_flags & INNER_OPT_MODE_RESET_STATE) != 0;
+    let use_diag_precond = (uniforms.mode_flags & INNER_OPT_MODE_DIAG_PRECOND) != 0;
 
     if reset_state {
         for slot in 0..m {
@@ -316,9 +333,10 @@ fn run_lssbroyden_step(
                 uniforms.min_bound_eps,
             );
             let cur_g = flush_zero(grad[clamp_idx(u_base + p, grad.len())]);
+            let h0_p = load_h0_diag(diag_precond, p, use_diag_precond);
             lbfgs_s_y[clamp_idx(state_base + m * num_params + p, lbfgs_s_y.len())] =
                 Vec4::new(cur_u, cur_g, 0.0, 0.0);
-            search_dir[clamp_idx(u_base + p, search_dir.len())] = flush_zero(-cur_g);
+            search_dir[clamp_idx(u_base + p, search_dir.len())] = flush_zero(-cur_g * h0_p);
             p += WG_THREADS;
         }
         return;
@@ -373,7 +391,8 @@ fn run_lssbroyden_step(
             sy_local += pair.x * pair.y;
             sq_local += pair.x * q_p;
             if !found_h0 {
-                yy_local += pair.y * pair.y;
+                let h0_p = load_h0_diag(diag_precond, p, use_diag_precond);
+                yy_local += h0_p * pair.y * pair.y;
             }
             p += WG_THREADS;
         }
@@ -418,7 +437,8 @@ fn run_lssbroyden_step(
     let mut p = lid;
     while p < num_params {
         let idx = clamp_idx(u_base + p, search_dir.len());
-        search_dir[idx] = flush_zero(search_dir[idx] * h0_scale);
+        let h0_p = load_h0_diag(diag_precond, p, use_diag_precond);
+        search_dir[idx] = flush_zero(search_dir[idx] * (h0_scale * h0_p));
         p += WG_THREADS;
     }
     if lid == 0 {
@@ -487,8 +507,9 @@ fn run_lssbroyden_step(
         );
         let cur_g = flush_zero(grad[clamp_idx(u_base + p, grad.len())]);
         let raw_q = search_dir[clamp_idx(u_base + p, search_dir.len())];
+        let h0_p = load_h0_diag(diag_precond, p, use_diag_precond);
         let dir_p = if fallback {
-            flush_zero(-cur_g * inv_damping)
+            flush_zero(-cur_g * h0_p * inv_damping)
         } else {
             flush_zero(-raw_q)
         };
@@ -520,6 +541,7 @@ pub fn inner_opt_step_impl(
     param_bounds: &[Vec4],
     lbfgs_s_y: &mut [Vec4],
     search_dir: &mut [f32],
+    diag_precond: &[f32],
     scratch_q: &mut [f32; INNER_OPT_Q_FLOATS],
     dot_scratch: &mut [f32; INNER_OPT_DOT_FLOATS],
     lbfgs_scalars: &mut [f32; INNER_OPT_SCALAR_FLOATS],
@@ -560,6 +582,7 @@ pub fn inner_opt_step_impl(
             param_bounds,
             lbfgs_s_y,
             search_dir,
+            diag_precond,
             scratch_q,
             dot_scratch,
             lbfgs_scalars,

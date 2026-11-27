@@ -327,6 +327,7 @@ fn test_wgpu_inner_opt_multi_candidate_adamw_lssb_ste_fp16_and_streamed_seams() 
             param_bounds: &bounds,
             lbfgs_s_y: &adam_state0,
             search_dir: &dir0,
+            diag_precond: None,
         })
         .unwrap();
 
@@ -413,6 +414,7 @@ fn test_wgpu_inner_opt_multi_candidate_adamw_lssb_ste_fp16_and_streamed_seams() 
                 param_bounds: &bounds,
                 lbfgs_s_y: &adam_state0,
                 search_dir: &dir0,
+                diag_precond: None,
             })
             .unwrap();
         for (i, (&c, &g)) in adam_c.theta.iter().zip(&adam_g.theta).enumerate() {
@@ -455,6 +457,7 @@ fn test_wgpu_inner_opt_multi_candidate_adamw_lssb_ste_fp16_and_streamed_seams() 
                     param_bounds: &bounds,
                     lbfgs_s_y: &syc,
                     search_dir: &dc,
+                    diag_precond: None,
                 })
                 .unwrap();
             let og = gpu
@@ -466,6 +469,7 @@ fn test_wgpu_inner_opt_multi_candidate_adamw_lssb_ste_fp16_and_streamed_seams() 
                     param_bounds: &bounds,
                     lbfgs_s_y: &syg,
                     search_dir: &dg,
+                    diag_precond: None,
                 })
                 .unwrap();
             tc = oc.theta;

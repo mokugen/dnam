@@ -438,6 +438,15 @@ pub(in super::super) fn inner_opt_step(
             actual: input.lbfgs_s_y.len(),
         });
     }
+    if let Some(dp) = input.diag_precond
+        && dp.len() < n_p
+    {
+        return Err(TrainError::InvalidDimensions {
+            context: "inner_opt_step(diag_precond)",
+            expected: n_p,
+            actual: dp.len(),
+        });
+    }
 
     let ctx = arena.context();
     let cap = ctx.max_storage_binding_bytes();
@@ -452,6 +461,10 @@ pub(in super::super) fn inner_opt_step(
         let st = &mut *st_guard;
         let budget = st.total_budget_bytes;
         let alloc = &mut st.allocated_bytes;
+        let limits = ArenaLimits {
+            cap_bytes: cap,
+            budget_bytes: budget,
+        };
         let b_theta = st
             .opt_theta
             .ensure_storage(dev, theta_bytes as u64, cap, budget, alloc)?;
@@ -471,6 +484,16 @@ pub(in super::super) fn inner_opt_step(
         let b_dir = st
             .opt_dir
             .ensure_storage(dev, theta_bytes as u64, cap, budget, alloc)?;
+        let diag_slice = input.diag_precond.map_or(&[][..], |d| &d[..n_p]);
+        let b_diag = upload_or_dummy(
+            dev,
+            queue,
+            &mut st.opt_diag_precond,
+            &mut st.dummy_tiny,
+            diag_slice,
+            limits,
+            alloc,
+        )?;
 
         aligned_upload(queue, &b_theta, &input.theta[..exp_vec]);
         aligned_upload(queue, &b_grad, &input.grad[..exp_vec]);
@@ -488,13 +511,8 @@ pub(in super::super) fn inner_opt_step(
             "inner_opt_step",
             (1, num_cands as u32, 1),
             u.as_bytes(),
-            &[&b_theta, &b_grad, &b_bounds, &b_state, &b_dir],
+            &[&b_theta, &b_grad, &b_bounds, &b_state, &b_dir, &b_diag],
         );
-
-        let limits = ArenaLimits {
-            cap_bytes: cap,
-            budget_bytes: budget,
-        };
         let rb_th = encode_readback_copy(
             dev,
             &mut encoder,

@@ -4,9 +4,9 @@
 //! Selective-Duhem `ParaLRU` steps (`ref[dsp.op-n.polyadaa.rail-crossing]`,
 //! `ref[dsp.op-n.wavefolder.cubic-c2]`, `ref[dsp.op-n.core.matryoshka-blocks]`).
 
-use super::{is_finite_bits, scrub_endpoint};
+use super::{QuadLaneParams, is_finite_bits, scrub_endpoint};
 use dnam_kernels::{
-    GpuVec4, KernelVec4, MAX_ADAA_ENDPOINT, ONE_THIRD_F32, TINY_CROSSING_EPS,
+    GpuVec4, KernelVec4, LinearScanElem, MAX_ADAA_ENDPOINT, ONE_THIRD_F32, TINY_CROSSING_EPS,
     canonicalize_zero_f32_bits, const_f32_pow2, soft_rect_zero_dc_f32,
 };
 
@@ -361,5 +361,54 @@ pub fn eval_duhem_step_terms(
         sign_bp,
         v_clean,
         bp_clean,
+    }
+}
+
+/// Returns `true` when `kappa * (1.0 - signed_mix) == 0.0` (after `[0, 1]` clamping), reducing
+/// Selective-Duhem `ParaLRU` to an exact `O(log2 N)` linear affine recurrence.
+#[inline(always)]
+#[must_use]
+pub fn is_duhem_decoupled(lp: &QuadLaneParams) -> bool {
+    lp.kappa == 0.0 || lp.signed_mix >= 1.0
+}
+
+/// Evaluates the exact `O(log2 N)` `LinearScanElem` `{ a, b }` for a decoupled
+/// (`kappa * (1 - signed_mix) == 0`) Selective-Duhem `ParaLRU` frame.
+#[inline]
+#[must_use]
+pub fn eval_paralru_duhem_affine_step(u_rect: f32, bp: f32, lp: &QuadLaneParams) -> LinearScanElem {
+    let flux_abs = canonicalize_zero_f32_bits(lp.two_svf_g * canonicalize_zero_f32_bits(bp)).abs();
+    let duhem_mod = if lp.gamma_duhem <= 0.0 {
+        0.0
+    } else {
+        lp.gamma_duhem * flux_abs
+    };
+    let rho_raw = (1.0 - lp.alpha_atk) + duhem_mod;
+    let rho = if rho_raw <= 0.0 {
+        0.0
+    } else if rho_raw >= 1.0 {
+        1.0
+    } else {
+        rho_raw
+    };
+    let z = canonicalize_zero_f32_bits(u_rect);
+    let (phi_rect, _) = soft_rect_zero_dc_f32(z);
+    let z_bar = if z <= -1.0 {
+        -1.0
+    } else if z >= 1.0 {
+        1.0
+    } else {
+        z
+    };
+    let psi_1 = z_bar * (1.0 - ONE_THIRD_F32 * (z_bar * z_bar));
+    let one_minus_eta = 1.0 - lp.signed_mix;
+    let phi_eta = if lp.signed_mix <= 0.0 {
+        phi_rect
+    } else {
+        one_minus_eta * phi_rect + lp.signed_mix * psi_1
+    };
+    LinearScanElem {
+        a: canonicalize_zero_f32_bits((1.0 - lp.signed_mix * rho) * lp.alpha_rel),
+        b: canonicalize_zero_f32_bits(rho * phi_eta),
     }
 }

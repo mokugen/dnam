@@ -311,6 +311,11 @@ const INNER_OPT_BINDINGS: &[BindingSpec] = &[
         name: "search_dir",
         access: BindingAccess::StorageReadWrite,
     },
+    BindingSpec {
+        binding: 6,
+        name: "diag_precond",
+        access: BindingAccess::StorageRead,
+    },
 ];
 
 /// Canonical specification table for all seven SONA v3.0 WebGPU compute kernels.

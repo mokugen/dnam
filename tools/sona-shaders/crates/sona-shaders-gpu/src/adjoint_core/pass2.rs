@@ -182,7 +182,7 @@ pub fn run_pass2(
         } else {
             LinearScanElem::identity()
         };
-        let (_sum_lru_l, _sum_lru_r, lam_after_l, lam_after_r) =
+        let (_sum_lru_l, _sum_lru_r, lam_after_l, lam_after_r, _, _) =
             linear_adjoint_reverse_suffix_256_lr(
                 scan_scratch,
                 i,
@@ -218,7 +218,7 @@ pub fn run_pass2(
             &lp, is_active,
         );
 
-        let (k_loc_l, k_loc_r, tpt_elem_l, tpt_elem_r) = if is_phs {
+        let (k_loc_l, k_loc_r, psi0_l, psi1_l, psi0_r, psi1_r) = if is_phs {
             let kl = phs_k_eff_loc_bar(
                 phs_l.a2,
                 phs_l.a3,
@@ -237,62 +237,76 @@ pub fn run_pass2(
                 dt.adj_v1_r,
                 dt.adj_v2_r,
             );
-            (
+            let tpt_elem_l = build_tpt_phs_adjoint_elem(
+                phs_l.a1,
+                phs_l.a2,
+                phs_l.a3,
+                taps_l.1,
+                phs_l.gamma,
+                dt.adj_v1_l,
+                dt.adj_v2_l,
                 kl,
+                is_active,
+            );
+            let tpt_elem_r = build_tpt_phs_adjoint_elem(
+                phs_r.a1,
+                phs_r.a2,
+                phs_r.a3,
+                taps_r.1,
+                phs_r.gamma,
+                dt.adj_v1_r,
+                dt.adj_v2_r,
                 kr,
-                build_tpt_phs_adjoint_elem(
-                    phs_l.a1,
-                    phs_l.a2,
-                    phs_l.a3,
-                    taps_l.1,
-                    phs_l.gamma,
-                    dt.adj_v1_l,
-                    dt.adj_v2_l,
-                    kl,
-                    is_active,
-                ),
-                build_tpt_phs_adjoint_elem(
-                    phs_r.a1,
-                    phs_r.a2,
-                    phs_r.a3,
-                    taps_r.1,
-                    phs_r.gamma,
-                    dt.adj_v1_r,
-                    dt.adj_v2_r,
-                    kr,
-                    is_active,
-                ),
-            )
+                is_active,
+            );
+            let mut p0_l = 0.0_f32;
+            let mut p1_l = 0.0_f32;
+            let _ = tpt_adjoint_reverse_suffix_256(
+                scan_scratch,
+                i,
+                tpt_elem_l,
+                adj_s_out_l,
+                &mut p0_l,
+                &mut p1_l,
+            );
+            let mut p0_r = 0.0_f32;
+            let mut p1_r = 0.0_f32;
+            let _ = tpt_adjoint_reverse_suffix_256(
+                scan_scratch,
+                i,
+                tpt_elem_r,
+                adj_s_out_r,
+                &mut p0_r,
+                &mut p1_r,
+            );
+            (kl, kr, p0_l, p1_l, p0_r, p1_r)
         } else {
-            (
-                0.0,
-                0.0,
-                build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_l, dt.adj_v2_l, is_active),
-                build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_r, dt.adj_v2_r, is_active),
-            )
+            let tpt_elem_l =
+                build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_l, dt.adj_v2_l, is_active);
+            let tpt_elem_r =
+                build_tpt_adjoint_elem(lp.a1, lp.a2, lp.a3, dt.adj_v1_r, dt.adj_v2_r, is_active);
+            let mut p0_l = 0.0_f32;
+            let mut p1_l = 0.0_f32;
+            let _ = tpt_adjoint_reverse_suffix_256(
+                scan_scratch,
+                i,
+                tpt_elem_l,
+                adj_s_out_l,
+                &mut p0_l,
+                &mut p1_l,
+            );
+            let mut p0_r = 0.0_f32;
+            let mut p1_r = 0.0_f32;
+            let _ = tpt_adjoint_reverse_suffix_256(
+                scan_scratch,
+                i,
+                tpt_elem_r,
+                adj_s_out_r,
+                &mut p0_r,
+                &mut p1_r,
+            );
+            (0.0, 0.0, p0_l, p1_l, p0_r, p1_r)
         };
-
-        let mut psi0_l = 0.0_f32;
-        let mut psi1_l = 0.0_f32;
-        let _ = tpt_adjoint_reverse_suffix_256(
-            scan_scratch,
-            i,
-            tpt_elem_l,
-            adj_s_out_l,
-            &mut psi0_l,
-            &mut psi1_l,
-        );
-
-        let mut psi0_r = 0.0_f32;
-        let mut psi1_r = 0.0_f32;
-        let _ = tpt_adjoint_reverse_suffix_256(
-            scan_scratch,
-            i,
-            tpt_elem_r,
-            adj_s_out_r,
-            &mut psi0_r,
-            &mut psi1_r,
-        );
 
         let (
             g_a1,

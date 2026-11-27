@@ -14,14 +14,15 @@ use crate::abi::{
     TILE_FRAMES, resolve_quad_idx,
 };
 use crate::core_math::{
-    MIN_SAG_GAIN, QuadParamsUnpacked, clamp_nonneg_safe, div_ceil_divfree, eval_tone_scalar,
-    eval_tpt_svf_scalar, flush_zero, get_lane, gpu_to_vec4, load_vec4, scrub_endpoint,
-    step_duhem_stereo_scalar, step_tpt_svf_phs_scalar, store_vec4, sub_sat_usize,
-    tpt_exclusive_scan_128_pair, vec4_to_gpu, wg_barrier,
+    MIN_SAG_GAIN, QuadParamsUnpacked, clamp_nonneg_safe, div_ceil_divfree,
+    eval_paralru_duhem_affine_step, eval_tone_scalar, eval_tpt_svf_scalar, flush_zero, get_lane,
+    gpu_to_vec4, is_duhem_decoupled, linear_forward_exclusive_scan_128_pair, load_vec4,
+    scrub_endpoint, step_paralru_duhem_scalar, step_tpt_svf_phs_scalar, store_vec4, sub_sat_usize,
+    tpt_const_m_scan_128_pair, vec4_to_gpu, wg_barrier,
 };
 use dnam_kernels::{
-    GpuVec4, InterleavedStereo8, KernelVec4, StereoVec8, TptScanElem, eval_c2_wavefolder_adaa_vec4,
-    eval_poly_adaa1_odd_even_vec4,
+    GpuVec4, InterleavedStereo8, KernelVec4, LinearScanElem, StereoVec8,
+    apply_stereo_link_vec4_pair, eval_c2_wavefolder_adaa_vec4, eval_poly_adaa1_odd_even_vec4,
 };
 use fixed_point::{lane_slot, run_duhem_damped_deer_subtile_lane, run_phs_passive_picard_subtile};
 use spirv_std::glam::{UVec3, Vec4};
@@ -258,6 +259,12 @@ pub fn fused_core_scan_256_impl(
         clamp_nonneg_safe(params.wavefolder_mix.z, 1.0),
         clamp_nonneg_safe(params.wavefolder_mix.w, 1.0),
     ]);
+    let stereo_link_g = GpuVec4::from_array([
+        clamp_nonneg_safe(params.lru_stereo_link.x, 1.0),
+        clamp_nonneg_safe(params.lru_stereo_link.y, 1.0),
+        clamp_nonneg_safe(params.lru_stereo_link.z, 1.0),
+        clamp_nonneg_safe(params.lru_stereo_link.w, 1.0),
+    ]);
     let glu_mix_g = vec4_to_gpu(params.glu_mix);
 
     let resuming_from_ckpt = num_windows <= 1 && tile_start > 0 && tile_start < ckpt_tiles;
@@ -367,20 +374,19 @@ pub fn fused_core_scan_256_impl(
                         } else {
                             0.0
                         };
-                        let elem = if active128 {
-                            TptScanElem::from_step(lp.a1, lp.a2, lp.a3, u_my)
-                        } else {
-                            TptScanElem::identity()
-                        };
                         let s1_idx = if is_r128 { 8 + c } else { c };
                         let s2_idx = if is_r128 { 12 + c } else { 4 + c };
                         let mut s1_prev = 0.0_f32;
                         let mut s2_prev = 0.0_f32;
-                        let s_end = tpt_exclusive_scan_128_pair(
+                        let s_end = tpt_const_m_scan_128_pair(
                             scan_scratch,
                             lid,
                             sub_valid_len,
-                            elem,
+                            lp.a1,
+                            lp.a2,
+                            lp.a3,
+                            u_my,
+                            active128,
                             [aux_scratch[s1_idx], aux_scratch[s2_idx]],
                             &mut s1_prev,
                             &mut s2_prev,
@@ -405,58 +411,111 @@ pub fn fused_core_scan_256_impl(
                     }
                 }
 
-                // Stage 2: Selective-Duhem ParaLRU + stereo link (`4` concurrent lanes or DEER),
-                // saving `(v_eff_L, v_eff_R)` in dead `bp` slots `lane_slot(c, 1/3, t)` (`tone` kept).
-                if !use_fixed_point {
-                    if lid < 4 {
-                        let c = lid;
-                        let lp = params.lane(c);
-                        let lru_c = lp.to_lru_coeffs();
-                        let mut vl = aux_scratch[16 + c];
-                        let mut vr = aux_scratch[20 + c];
-                        for k in 0..sub_valid_len {
-                            let ti = k & 127;
-                            let tl = lane_buf[lane_slot(c, 0, ti)];
-                            let bl = lane_buf[lane_slot(c, 1, ti)];
-                            let tr = lane_buf[lane_slot(c, 2, ti)];
-                            let br = lane_buf[lane_slot(c, 3, ti)];
-                            let (_rl, _rr, eff_l, eff_r) = step_duhem_stereo_scalar(
-                                tl, tr, bl, br, &mut vl, &mut vr, &lp, &lru_c,
-                            );
-                            lane_buf[lane_slot(c, 1, ti)] = eff_l;
-                            lane_buf[lane_slot(c, 3, ti)] = eff_r;
+                // Stage 2: Selective-Duhem ParaLRU storing `v_raw` in dead `bp` slots `lane_slot(c, 1/3, t)`:
+                // Pass 2A runs exact `O(log2 128)` parallel scan across `256` threads when `kappa*(1-eta)==0`;
+                // Pass 2B runs `8`-thread `L/R × 4-lane` split (or DEER) for coupled lanes.
+                for c in 0..4 {
+                    let lp = params.lane(c);
+                    if is_duhem_decoupled(&lp) {
+                        let tone_f = if is_r128 { 2 } else { 0 };
+                        let bp_f = tone_f + 1;
+                        let elem = if active128 {
+                            let tone_my = lane_buf[lane_slot(c, tone_f, t128)];
+                            let bp_my = lane_buf[lane_slot(c, bp_f, t128)];
+                            eval_paralru_duhem_affine_step(lp.rect_sign * tone_my, bp_my, &lp)
+                        } else {
+                            LinearScanElem::identity()
+                        };
+                        let v_init = aux_scratch[16 + (if is_r128 { 4 } else { 0 }) + c];
+                        let (v_incl, v_end) = linear_forward_exclusive_scan_128_pair(
+                            scan_scratch,
+                            lid,
+                            sub_valid_len,
+                            elem,
+                            v_init,
+                        );
+                        if active128 {
+                            lane_buf[lane_slot(c, bp_f, t128)] = flush_zero(v_incl);
                         }
-                        aux_scratch[16 + c] = flush_zero(vl);
-                        aux_scratch[20 + c] = flush_zero(vr);
+                        if lid == 0 {
+                            aux_scratch[16 + c] = flush_zero(v_end);
+                        }
+                        if lid == SUBTILE_FRAMES {
+                            aux_scratch[20 + c] = flush_zero(v_end);
+                        }
+                        wg_barrier();
+                    }
+                }
+
+                if !use_fixed_point {
+                    if lid < 8 {
+                        let c = lid >> 1;
+                        let is_r = (lid & 1) != 0;
+                        let lp = params.lane(c);
+                        if !is_duhem_decoupled(&lp) {
+                            let lru_c = lp.to_lru_coeffs();
+                            let tone_f = if is_r { 2 } else { 0 };
+                            let bp_f = tone_f + 1;
+                            let v_idx = if is_r { 20 + c } else { 16 + c };
+                            let mut v = aux_scratch[v_idx];
+                            for k in 0..sub_valid_len {
+                                let ti = k & 127;
+                                let tone = lane_buf[lane_slot(c, tone_f, ti)];
+                                let bp = lane_buf[lane_slot(c, bp_f, ti)];
+                                let v_raw =
+                                    step_paralru_duhem_scalar(tone, bp, &mut v, &lp, &lru_c);
+                                lane_buf[lane_slot(c, bp_f, ti)] = v_raw;
+                            }
+                            aux_scratch[v_idx] = flush_zero(v);
+                        }
                     }
                     wg_barrier();
                 } else {
                     for c in 0..4 {
                         let lp = params.lane(c);
-                        run_duhem_damped_deer_subtile_lane(
-                            lid,
-                            sub_valid_len,
-                            c,
-                            &lp,
-                            scan_scratch,
-                            lane_buf,
-                            aux_scratch,
-                        );
+                        if !is_duhem_decoupled(&lp) {
+                            run_duhem_damped_deer_subtile_lane(
+                                lid,
+                                sub_valid_len,
+                                c,
+                                &lp,
+                                scan_scratch,
+                                lane_buf,
+                                aux_scratch,
+                            );
+                        }
                     }
                 }
 
-                // Stage 3: Sag + r_curr (`scan_scratch[0..1024]`) -> PolyADAA1 + Wavefolder + GLU.
+                // Stage 3: Stereo Link -> Sag -> r_curr (`scan_scratch[0..1024]`) -> PolyADAA1 + Wavefolder + GLU.
                 let mut my_veff_l = [0.0_f32; 4];
                 let mut my_veff_r = [0.0_f32; 4];
                 let mut my_r_l = [0.0_f32; 4];
                 let mut my_r_r = [0.0_f32; 4];
                 if lid < SUBTILE_FRAMES && active128 {
+                    let mut tl_arr = [0.0_f32; 4];
+                    let mut tr_arr = [0.0_f32; 4];
+                    let mut vr_l = [0.0_f32; 4];
+                    let mut vr_r = [0.0_f32; 4];
+                    for c in 0..4 {
+                        tl_arr[c] = lane_buf[lane_slot(c, 0, t128)];
+                        vr_l[c] = lane_buf[lane_slot(c, 1, t128)];
+                        tr_arr[c] = lane_buf[lane_slot(c, 2, t128)];
+                        vr_r[c] = lane_buf[lane_slot(c, 3, t128)];
+                    }
+                    let (eff_l_v, eff_r_v) = apply_stereo_link_vec4_pair(
+                        GpuVec4::from_array(vr_l),
+                        GpuVec4::from_array(vr_r),
+                        stereo_link_g,
+                    );
+                    let eff_l_arr = eff_l_v.to_array();
+                    let eff_r_arr = eff_r_v.to_array();
                     for c in 0..4 {
                         let lp = params.lane(c);
-                        let tl = lane_buf[lane_slot(c, 0, t128)];
-                        let vel = lane_buf[lane_slot(c, 1, t128)];
-                        let tr = lane_buf[lane_slot(c, 2, t128)];
-                        let ver = lane_buf[lane_slot(c, 3, t128)];
+                        let tl = tl_arr[c];
+                        let tr = tr_arr[c];
+                        let vel = eff_l_arr[c];
+                        let ver = eff_r_arr[c];
                         my_veff_l[c] = vel;
                         my_veff_r[c] = ver;
                         let sag_l = (1.0 - lp.sag_depth * vel).max(MIN_SAG_GAIN);

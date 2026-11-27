@@ -70,11 +70,11 @@ pub use linalg::{
     LbfgsResult, LtasKktConfig, LtasKktResult, MIN_CHOLESKY_RIDGE, NestedTierPrefixResult,
     OptResult, ParamBoundSpec, ScaledCoordSpace, SsBroydenConfig, SsBroydenState, TwoLoopLbfgs,
     WhitenedLbfgs, apply_arena_scoped_pcgrad, assemble_ozaki_normal_equations,
-    checked_uplo_u_packed_len, cosine_lr_with_warmup, factorize_uplo_u_cholesky,
-    solve_emr_mm_cholesky, solve_factorized_uplo_u, solve_factorized_uplo_u_2ch,
-    solve_ltas_newton_kkt, solve_nested_tier_prefix_schur, solve_uplo_adaptive_ridge,
-    solve_uplo_norm_bounded, solve_uplo_u_cholesky, solve_uplo_u_cholesky_2ch,
-    step_runner_inner_opt, symv_uplo_u,
+    checked_uplo_u_packed_len, cosine_lr_with_warmup, diag_precond_f32_from_jac,
+    factorize_uplo_u_cholesky, solve_emr_mm_cholesky, solve_factorized_uplo_u,
+    solve_factorized_uplo_u_2ch, solve_ltas_newton_kkt, solve_nested_tier_prefix_schur,
+    solve_uplo_adaptive_ridge, solve_uplo_norm_bounded, solve_uplo_u_cholesky,
+    solve_uplo_u_cholesky_2ch, step_runner_inner_opt, step_runner_inner_opt_precond, symv_uplo_u,
 };
 pub use losses::{
     AnalyticGaborBank, BESR_WORST_BAND_OFFSET_DB, BesrChannelReport, BesrIntervalBounds,

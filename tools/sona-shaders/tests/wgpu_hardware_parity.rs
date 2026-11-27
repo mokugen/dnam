@@ -12,8 +12,12 @@ mod core_and_adjoint;
 mod gabor_and_opt;
 #[path = "wgpu_hardware_parity/harness.rs"]
 mod harness;
+#[path = "wgpu_hardware_parity/inner_opt_diag.rs"]
+mod inner_opt_diag;
 #[path = "wgpu_hardware_parity/ozaki_and_prescreen.rs"]
 mod ozaki_and_prescreen;
+#[path = "wgpu_hardware_parity/paralru_fastpath.rs"]
+mod paralru_fastpath;
 #[path = "wgpu_hardware_parity/tile_mix.rs"]
 mod tile_mix;
 #[path = "wgpu_hardware_parity/wave_and_streamed.rs"]
@@ -107,5 +111,17 @@ fn test_wgpu_tile_mix_fwd_adj_ultra_dag_parity_and_determinism() {
     };
     for variant in ctx.variants() {
         tile_mix::verify_tile_mix_ultra_dag_parity(&ctx, variant);
+    }
+}
+
+/// verify[train.pipeline.webgpu-scans-and-ozaki]
+/// verify[dsp.op-n.core.matryoshka-blocks]
+#[test]
+fn test_wgpu_paralru_fastpath_and_const_m_scans() {
+    let Some(ctx) = init_gpu_context() else {
+        return;
+    };
+    for variant in ctx.variants() {
+        paralru_fastpath::verify_paralru_fastpath_and_const_m_scans(&ctx, variant);
     }
 }

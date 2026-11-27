@@ -202,6 +202,7 @@ pub(crate) fn verify_auto_detect_and_wgpu_validation_guards(
             param_bounds: &[[-1.0, 1.0, 1.0, 0.0]; 4],
             lbfgs_s_y: &[[0.0; 4]; 8],
             search_dir: &[0.0; 4],
+            diag_precond: None,
         })
         .is_ok()
     );
@@ -359,6 +360,7 @@ pub(crate) fn verify_auto_detect_and_wgpu_validation_guards(
             param_bounds: &[],
             lbfgs_s_y: &[],
             search_dir: &[],
+            diag_precond: None,
         })
         .is_err()
     );

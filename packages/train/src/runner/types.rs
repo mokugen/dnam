@@ -408,6 +408,8 @@ pub struct InnerOptInput<'a> {
     pub lbfgs_s_y: &'a [[f32; 4]],
     /// Search direction / last step delta (`num_candidates * num_params`).
     pub search_dir: &'a [f32],
+    /// Optional per-parameter diagonal `H_0` preconditioner (`num_params`) enabled by `INNER_OPT_MODE_DIAG_PRECOND`.
+    pub diag_precond: Option<&'a [f32]>,
 }
 
 /// Updated optimization state emitted by `inner_opt_step`.

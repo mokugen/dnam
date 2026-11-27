@@ -348,6 +348,7 @@ fn test_cpu_runner_all_six_kernels_end_to_end() {
             param_bounds: &[[-3.0, 3.0, 1.0, 0.0]; 4],
             lbfgs_s_y: &[[0.0; 4]; 20],
             search_dir: &[0.0; 4],
+            diag_precond: None,
         })
         .unwrap();
     assert!(opt.theta[0] < 1.0);

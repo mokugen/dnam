@@ -17,7 +17,10 @@ pub use cholesky::{
     solve_uplo_u_cholesky_2ch, symv_uplo_u,
 };
 pub use coords::{OptResult, ParamBoundSpec, ScaledCoordSpace};
-pub use lbfgs::{LbfgsConfig, LbfgsResult, TwoLoopLbfgs, WhitenedLbfgs, step_runner_inner_opt};
+pub use lbfgs::{
+    LbfgsConfig, LbfgsResult, TwoLoopLbfgs, WhitenedLbfgs, diag_precond_f32_from_jac,
+    step_runner_inner_opt, step_runner_inner_opt_precond,
+};
 pub use spectral_kkt::{
     EmrMmConfig, EmrMmResult, EmrSpectralProblem, LtasKktConfig, LtasKktResult,
     solve_emr_mm_cholesky, solve_ltas_newton_kkt,

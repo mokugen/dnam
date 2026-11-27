@@ -8,11 +8,12 @@ use crate::abi::{
 };
 use crate::core_math::{
     CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, MIN_SAG_GAIN, QuadLaneParams,
-    TILE_CKPT_VEC4_STRIDE, eval_adaa_and_wf_with_derivs, eval_tone_scalar, eval_tpt_svf_scalar,
-    flush_zero, get_lane, load_vec4, step_duhem_stereo_scalar, step_tpt_svf_phs_scalar,
-    tpt_exclusive_scan_256, wg_barrier,
+    TILE_CKPT_VEC4_STRIDE, eval_adaa_and_wf_with_derivs, eval_paralru_duhem_affine_step,
+    eval_tone_scalar, eval_tpt_svf_scalar, flush_zero, get_lane, is_duhem_decoupled,
+    linear_forward_inclusive_scan_256_lr, load_vec4, step_paralru_duhem_scalar,
+    step_tpt_svf_phs_scalar, tpt_const_m_scan_256_lr, wg_barrier,
 };
-use dnam_kernels::TptScanElem;
+use dnam_kernels::LinearScanElem;
 use spirv_std::glam::{Vec2, Vec4};
 
 /// Per-frame, per-lane precomputed forward state stored across `pass_mode = 0` and `pass_mode = 2`.
@@ -70,34 +71,28 @@ fn apply_stereo_link_scalar(vl: f32, vr: f32, lam: f32) -> (f32, f32) {
 }
 
 #[inline]
-fn step_duhem_tile_into_sram(
-    scan_scratch: &[f32; ADJOINT_SCAN_SCRATCH_FLOATS],
-    v_traj2: &mut [Vec2; ADJOINT_V_TRAJ2_VEC2S],
+fn step_duhem_channel_into_scratch(
+    scan_scratch: &mut [f32; ADJOINT_SCAN_SCRATCH_FLOATS],
     valid_len: usize,
-    v_init_l: f32,
-    v_init_r: f32,
+    is_r: bool,
+    v_init: f32,
     lp: &QuadLaneParams,
 ) {
     let lru_coeffs = lp.to_lru_coeffs();
-    let mut vl = v_init_l;
-    let mut vr = v_init_r;
+    let tone_base = if is_r { 2 * TILE_FRAMES } else { 0 };
+    let bp_base = if is_r { 3 * TILE_FRAMES } else { TILE_FRAMES };
+    let out_base = if is_r {
+        5 * TILE_FRAMES
+    } else {
+        4 * TILE_FRAMES
+    };
+    let mut v = v_init;
     for t in 0..valid_len {
-        let i = t & 255;
-        let tone_l = scan_scratch[i];
-        let bp_l = scan_scratch[TILE_FRAMES + i];
-        let tone_r = scan_scratch[2 * TILE_FRAMES + i];
-        let bp_r = scan_scratch[3 * TILE_FRAMES + i];
-        let (rl, rr, _eff_l, _eff_r) = step_duhem_stereo_scalar(
-            tone_l,
-            tone_r,
-            bp_l,
-            bp_r,
-            &mut vl,
-            &mut vr,
-            lp,
-            &lru_coeffs,
-        );
-        v_traj2[i] = Vec2::new(rl, rr);
+        let ti = t & 255;
+        let tone = scan_scratch[tone_base + ti];
+        let bp = scan_scratch[bp_base + ti];
+        let raw = step_paralru_duhem_scalar(tone, bp, &mut v, lp, &lru_coeffs);
+        scan_scratch[out_base + ti] = raw;
     }
 }
 
@@ -197,60 +192,83 @@ pub fn recompute_tile_forward_lane(
         wg_barrier();
     } else {
         let svf_c = lp.to_svf_coeffs();
-        let elem_l = if is_active {
-            TptScanElem::from_step(lp.a1, lp.a2, lp.a3, u_l)
-        } else {
-            TptScanElem::identity()
-        };
-        let mut s1_prev_l = 0.0_f32;
-        let mut s2_prev_l = 0.0_f32;
-        let _ = tpt_exclusive_scan_256(
+        let ([s1_prev_l, s2_prev_l], [s1_prev_r, s2_prev_r]) = tpt_const_m_scan_256_lr(
             scan_scratch,
             i,
             valid_len,
-            elem_l,
+            lp.a1,
+            lp.a2,
+            lp.a3,
+            u_l,
+            u_r,
+            is_active,
             [s1_init_l, s2_init_l],
-            &mut s1_prev_l,
-            &mut s2_prev_l,
+            [s1_init_r, s2_init_r],
         );
         let (lp_l, bp_l, hp_l, ap_l) = eval_tpt_svf_scalar(u_l, s1_prev_l, s2_prev_l, &svf_c);
         let tone_l = eval_tone_scalar(lp_l, bp_l, hp_l, ap_l, u_l, lp);
-        u_tone2[i] = Vec2::new(tone_l, bp_l);
-
-        let elem_r = if is_active {
-            TptScanElem::from_step(lp.a1, lp.a2, lp.a3, u_r)
-        } else {
-            TptScanElem::identity()
-        };
-        let mut s1_prev_r = 0.0_f32;
-        let mut s2_prev_r = 0.0_f32;
-        let _ = tpt_exclusive_scan_256(
-            scan_scratch,
-            i,
-            valid_len,
-            elem_r,
-            [s1_init_r, s2_init_r],
-            &mut s1_prev_r,
-            &mut s2_prev_r,
-        );
         let (lp_r, bp_r, hp_r, ap_r) = eval_tpt_svf_scalar(u_r, s1_prev_r, s2_prev_r, &svf_c);
         let tone_r = eval_tone_scalar(lp_r, bp_r, hp_r, ap_r, u_r, lp);
 
-        let saved_l = u_tone2[i];
-        s_prev2[i] = Vec4::new(s1_prev_l, s2_prev_l, s1_prev_r, s2_prev_r);
-        u_tone2[i] = Vec2::new(saved_l.x, tone_r);
-        scan_scratch[i] = saved_l.x;
-        scan_scratch[TILE_FRAMES + i] = saved_l.y;
-        scan_scratch[2 * TILE_FRAMES + i] = tone_r;
-        scan_scratch[3 * TILE_FRAMES + i] = bp_r;
-        if !is_active {
-            v_traj2[i] = Vec2::ZERO;
+        if is_active {
+            s_prev2[i] = Vec4::new(s1_prev_l, s2_prev_l, s1_prev_r, s2_prev_r);
+            u_tone2[i] = Vec2::new(tone_l, tone_r);
+            scan_scratch[i] = tone_l;
+            scan_scratch[TILE_FRAMES + i] = bp_l;
+            scan_scratch[2 * TILE_FRAMES + i] = tone_r;
+            scan_scratch[3 * TILE_FRAMES + i] = bp_r;
+        } else {
+            s_prev2[i] = Vec4::ZERO;
+            u_tone2[i] = Vec2::ZERO;
+            scan_scratch[i] = 0.0;
+            scan_scratch[TILE_FRAMES + i] = 0.0;
+            scan_scratch[2 * TILE_FRAMES + i] = 0.0;
+            scan_scratch[3 * TILE_FRAMES + i] = 0.0;
         }
         wg_barrier();
     }
 
-    if i == 0 {
-        step_duhem_tile_into_sram(scan_scratch, v_traj2, valid_len, v_init_l, v_init_r, lp);
+    if is_duhem_decoupled(lp) {
+        let (elem_l, elem_r) = if is_active {
+            let tone_l = scan_scratch[i];
+            let bp_l = scan_scratch[TILE_FRAMES + i];
+            let tone_r = scan_scratch[2 * TILE_FRAMES + i];
+            let bp_r = scan_scratch[3 * TILE_FRAMES + i];
+            (
+                eval_paralru_duhem_affine_step(lp.rect_sign * tone_l, bp_l, lp),
+                eval_paralru_duhem_affine_step(lp.rect_sign * tone_r, bp_r, lp),
+            )
+        } else {
+            (LinearScanElem::identity(), LinearScanElem::identity())
+        };
+        let (vl, vr) = linear_forward_inclusive_scan_256_lr(
+            scan_scratch,
+            i,
+            elem_l,
+            elem_r,
+            v_init_l,
+            v_init_r,
+        );
+        v_traj2[i] = if is_active {
+            Vec2::new(flush_zero(vl), flush_zero(vr))
+        } else {
+            Vec2::ZERO
+        };
+    } else {
+        if i < 2 {
+            let is_r = i == 1;
+            let v_init = if is_r { v_init_r } else { v_init_l };
+            step_duhem_channel_into_scratch(scan_scratch, valid_len, is_r, v_init, lp);
+        }
+        wg_barrier();
+        v_traj2[i] = if is_active {
+            Vec2::new(
+                scan_scratch[4 * TILE_FRAMES + i],
+                scan_scratch[5 * TILE_FRAMES + i],
+            )
+        } else {
+            Vec2::ZERO
+        };
     }
     wg_barrier();
 
