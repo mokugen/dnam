@@ -7,6 +7,7 @@
 //! Canonical Reference: `docs/specs/training/capture_and_alignment.md`
 //! (`ref[train.capture.alignment.multi-regime]`, `ref[train.capture.invariants]`).
 
+mod causal_check;
 mod hilbert_env;
 mod hybrid_parabolic;
 mod ppm_drift;
@@ -31,8 +32,9 @@ pub use ppm_drift::{
 };
 
 use super::{AlignError, estimate_subsample_lag_and_gain};
+use causal_check::guard_lag_causal_onset;
 use hilbert_env::compute_analytic_envelopes_stereo_pair;
-use hybrid_parabolic::refine_fractional_lag_hybrid;
+use hybrid_parabolic::{normalized_corr_at_fractional_lag, refine_fractional_lag_hybrid};
 
 /// Detected physical signal-path regime during sub-sample alignment
 /// (`ref[train.capture.alignment.multi-regime]`).
@@ -278,7 +280,8 @@ fn detect_dispersive_wavefront(
                     hf_gain
                 };
                 let guarded_lag = tau_coarse_opt.map_or(hf_lag, |tc| {
-                    constrain_subsample_around_coarse(hf_lag, 0.0, tc)
+                    let clag = constrain_subsample_around_coarse(hf_lag, 0.0, tc);
+                    guard_lag_causal_onset(dry, wet, clag, hf_lag, Some(tc))
                 });
                 return Some((guarded_lag, eff_gain, inv));
             }
@@ -302,7 +305,8 @@ fn detect_dispersive_wavefront(
                         hp_coh < 0.0
                     };
                     let guarded_lag = tau_coarse_opt.map_or(hp_lag, |tc| {
-                        constrain_subsample_around_coarse(hp_lag, 0.0, tc)
+                        let clag = constrain_subsample_around_coarse(hp_lag, 0.0, tc);
+                        guard_lag_causal_onset(dry, wet, clag, hp_lag, Some(tc))
                     });
                     return Some((guarded_lag, lin_gain, inv));
                 }
@@ -378,7 +382,7 @@ pub fn estimate_hybrid_multiregime_alignment(
             let guarded_init = tau_coarse_opt.map_or(unconstrained_lag, |tc| {
                 constrain_subsample_around_coarse(unconstrained_lag, 0.0, tc)
             });
-            let (env_lag, env_coh) =
+            let (env_lag, raw_env_lag, env_coh) =
                 match estimate_subsample_lag_and_gain(&env_dry, &env_wet, max_lag_samples) {
                     Ok(env_est) => {
                         let (elag, ecoh, _) = refine_fractional_lag_hybrid(
@@ -387,15 +391,16 @@ pub fn estimate_hybrid_multiregime_alignment(
                             env_est.total_lag_samples,
                             tau_coarse_opt,
                         );
-                        (elag, ecoh.abs())
+                        (elag, env_est.total_lag_samples, ecoh.abs())
                     }
-                    Err(_) => (guarded_init, 0.0),
+                    Err(_) => (guarded_init, unconstrained_lag, 0.0),
                 };
-            let use_lag = if env_coh > lin_coherence {
-                env_lag
+            let (cand_lag, cand_raw_lag) = if env_coh > lin_coherence {
+                (env_lag, raw_env_lag)
             } else {
-                guarded_init
+                (guarded_init, unconstrained_lag)
             };
+            let use_lag = guard_lag_causal_onset(dry, wet, cand_lag, cand_raw_lag, tau_coarse_opt);
             let rms_dry = dry
                 .iter()
                 .map(|&x| f64::from(x) * f64::from(x))
@@ -426,7 +431,13 @@ pub fn estimate_hybrid_multiregime_alignment(
             let (final_lag, final_gain) = if let Some(tc) = tau_coarse_opt {
                 let (glag, _, ggain) =
                     refine_fractional_lag_hybrid(dry, wet, coarse.total_lag_samples, Some(tc));
-                (glag, ggain)
+                let clag = guard_lag_causal_onset(dry, wet, glag, unconstrained_lag, Some(tc));
+                let cgain = if (clag - glag).abs() > 1.0e-6 {
+                    lin_gain
+                } else {
+                    ggain
+                };
+                (clag, cgain)
             } else {
                 (unconstrained_lag, lin_gain)
             };
@@ -492,18 +503,34 @@ pub fn estimate_hybrid_multiregime_alignment(
                 let (ref_lag, ref_coh, ref_gain) =
                     refine_fractional_lag_hybrid(dry, &wet_unskewed, seed_lag, tau_coarse_opt);
                 if ref_coh.abs() >= 0.35 {
-                    let inv = ref_gain < 0.0;
+                    let clag = guard_lag_causal_onset(
+                        dry,
+                        &wet_unskewed,
+                        ref_lag,
+                        ppm_est.lag_at_zero_samples,
+                        tau_coarse_opt,
+                    );
+                    let (eff_coh, eff_gain) = if (clag - ref_lag).abs() > 1.0e-6 {
+                        normalized_corr_at_fractional_lag(
+                            dry,
+                            &wet_unskewed,
+                            ppm_est.lag_at_zero_samples,
+                        )
+                    } else {
+                        (ref_coh, ref_gain)
+                    };
+                    let inv = eff_gain < 0.0;
                     let prom_regime = if inv {
                         AlignmentRegime::PolarityInverted
                     } else {
                         AlignmentRegime::CleanLinear
                     };
                     (
-                        ref_lag,
-                        ref_gain,
+                        clag,
+                        eff_gain,
                         inv,
                         prom_regime,
-                        lin_coherence.max(ref_coh.abs().clamp(0.0, 1.0)),
+                        lin_coherence.max(eff_coh.abs().clamp(0.0, 1.0)),
                         ppm_est.applied_ppm,
                     )
                 } else {
@@ -687,5 +714,51 @@ mod tests {
             estimate_hybrid_multiregime_alignment(&short_d, &short_w, 48_000, 64, None, false)
                 .unwrap();
         assert_eq!(low.clock_drift_ppm, 0.0);
+    }
+
+    #[test]
+    fn test_ppm_drift_causal_onset_clamp_preserves_gain_and_polarity() {
+        let seed = [0x93_u8; 256];
+        let (dry, _) = crate::stimulus::waveforms::synthesize_a5_musical_transient_coreset(
+            &seed, 48_000, 1, 48_000,
+        );
+        // Causal 1-pole LPF (~4.5 kHz) preserves quarter coherence >= 0.75 for PPM lock while
+        // introducing ~1 sample of minimum-phase group delay that Guard 2 clamps back to `tc`.
+        let a_lp = 1.0 - (-2.0 * PI * 4_500.0 / 48_000.0).exp();
+        let mut lp_st = 0.0_f64;
+        let lpf_wet: Vec<f32> = dry
+            .iter()
+            .map(|&x| {
+                lp_st += a_lp * (f64::from(x) - lp_st);
+                lp_st as f32
+            })
+            .collect();
+
+        for &(tc, invert) in &[(0.0_f64, false), (24.0_f64, true)] {
+            let wet_ppm = realign_fractional_kaiser64(&lpf_wet, -tc, -45.0, invert);
+            let unc =
+                estimate_hybrid_multiregime_alignment(&dry, &wet_ppm, 48_000, 128, None, false)
+                    .unwrap();
+            assert!(
+                unc.total_lag_samples > tc + 0.1,
+                "unconstrained lag should reflect LPF group delay (> {tc} + 0.1), got {}",
+                unc.total_lag_samples
+            );
+            let est =
+                estimate_hybrid_multiregime_alignment(&dry, &wet_ppm, 48_000, 128, Some(tc), false)
+                    .unwrap();
+            assert_eq!(
+                est.total_lag_samples, tc,
+                "tc={tc} invert={invert} got lag={}",
+                est.total_lag_samples
+            );
+            assert_eq!(est.polarity_inverted, invert, "tc={tc} invert={invert}");
+            assert_eq!(est.signed_gain < 0.0, est.polarity_inverted);
+            assert!(
+                est.clock_drift_ppm > 20.0 && est.clock_drift_ppm < 60.0,
+                "expected positive ~45 ppm lock (within LPF group-delay phrase variance), got {}",
+                est.clock_drift_ppm
+            );
+        }
     }
 }

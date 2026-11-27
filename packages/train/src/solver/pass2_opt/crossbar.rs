@@ -3,14 +3,16 @@
 //! crossbar / `opt_to_lr` adjoints (`ref[dsp.op-m.hilbert.lattice]`, `ref[dsp.op-m.rotor.q0-192-lfo]`,
 //! `ref[train.pipeline.backbone-trajectory-opt]`).
 
+mod t1;
+
 use core::f64::consts::{PI, TAU};
 
 use dnam_kernels::{
-    HILBERT_H1_STAGES, HilbertH1StereoKernel, T1SubHarmonicKernel,
-    compute_t1_dc_blocker_coeffs_clamped, interpolate_hilbert_h1_alphas_f64,
+    HILBERT_H1_STAGES, compute_t1_dc_blocker_coeffs_clamped, interpolate_hilbert_h1_alphas_f64,
 };
 
 use super::super::model::SonaModelF64;
+use t1::{T1SubHarmonicF64, accumulate_t1_1x_iq_grads};
 
 const Q32_TO_RAD: f64 = TAU / 4_294_967_296.0;
 
@@ -142,16 +144,14 @@ fn fold_os2x_iq_grad(d_iq: &[f64], os2x: bool) -> Vec<f64> {
         .collect()
 }
 
-fn pullback_iq_to_u_sense(
+fn pullback_1x_iq_to_u_sense(
     trace: &CrossbarForwardTrace,
-    d_i: &[f64],
-    d_q: &[f64],
+    d_i_1x: &[f64],
+    d_q_1x: &[f64],
     grad_u_sense: &mut [f64],
 ) {
-    let d_i_1x = fold_os2x_iq_grad(d_i, trace.os2x);
-    let d_q_1x = fold_os2x_iq_grad(d_q, trace.os2x);
     let n_1x = d_i_1x.len();
-    let d_dc_from_i = reverse_allpass_chain_f64(&trace.alpha_i, &d_i_1x);
+    let d_dc_from_i = reverse_allpass_chain_f64(&trace.alpha_i, d_i_1x);
     let mut d_q_shifted = vec![0.0_f64; n_1x];
     if n_1x > 1 {
         d_q_shifted[..n_1x - 1].copy_from_slice(&d_q_1x[1..]);
@@ -265,7 +265,7 @@ fn eval_crossbar_forward_impl(
     let (mut s0_i_r, mut s1_i_r) = ([0.0_f64; HILBERT_H1_STAGES], [0.0_f64; HILBERT_H1_STAGES]);
     let (mut s0_q_r, mut s1_q_r) = ([0.0_f64; HILBERT_H1_STAGES], [0.0_f64; HILBERT_H1_STAGES]);
     let (mut q_prev_l, mut q_prev_r) = (0.0_f64, 0.0_f64);
-    let mut t1 = T1SubHarmonicKernel::new();
+    let mut t1 = T1SubHarmonicF64::new();
 
     let mut iq_lr = Vec::with_capacity(out_n);
     let mut op_p_feat = Vec::with_capacity(out_n);
@@ -335,7 +335,6 @@ fn eval_crossbar_forward_impl(
         }
     };
 
-    let _ = HilbertH1StereoKernel::new();
     let mut prev_iq = [0.0_f64; 4];
     let mut prev_feat = [0.0_f64; 4];
     for t in 0..n {
@@ -350,9 +349,8 @@ fn eval_crossbar_forward_impl(
         q_prev_l = q_l_next;
         q_prev_r = q_r_next;
 
-        let feat = t1.step((0.5 * (i_l + i_r)) as f32, (0.5 * (q_l + q_r)) as f32);
+        let feat_cur = t1.step(0.5 * (i_l + i_r), 0.5 * (q_l + q_r));
         let iq_cur = [i_l, q_l, i_r, q_r];
-        let feat_cur = feat.map(f64::from);
 
         if os2x {
             let iq_mid = core::array::from_fn(|k| 0.5 * (prev_iq[k] + iq_cur[k]));
@@ -432,15 +430,16 @@ pub(crate) fn assemble_crossbar_adjoint(
     };
 
     let need_u_sense = grad_u_sense_l_opt.is_some() || grad_u_sense_r_opt.is_some();
-    let (mut d_il, mut d_ql, mut d_ir, mut d_qr) = if need_u_sense {
+    let (mut d_il, mut d_ql, mut d_ir, mut d_qr, mut d_feat) = if need_u_sense {
         (
             vec![0.0_f64; n],
             vec![0.0_f64; n],
             vec![0.0_f64; n],
             vec![0.0_f64; n],
+            vec![[0.0_f64; 4]; n],
         )
     } else {
-        (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
     };
 
     for t in 0..n {
@@ -475,7 +474,9 @@ pub(crate) fn assemble_crossbar_adjoint(
                 d_car_r += gr * ph_w;
             }
 
-            grads.d_crossbar_op_gains[0] += d_op_vec * feat[l];
+            if model.crossbar_op_gains[0].is_finite() && model.crossbar_op_gains[0].abs() < 4.0 {
+                grads.d_crossbar_op_gains[0] += d_op_vec * feat[l];
+            }
             grads.d_carrier_basis_w[0][l] += d_car_l * (i_l * cos_l) + d_car_r * (i_r * cos_r);
             grads.d_carrier_basis_w[1][l] += d_car_l * (q_l * sin_l) + d_car_r * (q_r * sin_r);
             grads.d_carrier_basis_w[2][l] += d_car_l * sin_l + d_car_r * sin_r;
@@ -493,6 +494,7 @@ pub(crate) fn assemble_crossbar_adjoint(
             }
 
             if need_u_sense {
+                d_feat[t][l] = d_op_vec * op_p_gain;
                 d_il[t] += d_car_l * w0 * cos_l;
                 d_ql[t] += d_car_l * w1 * sin_l;
                 d_ir[t] += d_car_r * w0 * cos_r;
@@ -501,11 +503,25 @@ pub(crate) fn assemble_crossbar_adjoint(
         }
     }
 
-    if let Some(gl) = grad_u_sense_l_opt {
-        pullback_iq_to_u_sense(trace, &d_il, &d_ql, gl);
-    }
-    if let Some(gr) = grad_u_sense_r_opt {
-        pullback_iq_to_u_sense(trace, &d_ir, &d_qr, gr);
+    if need_u_sense {
+        let mut d_il_1x = fold_os2x_iq_grad(&d_il, trace.os2x);
+        let mut d_ql_1x = fold_os2x_iq_grad(&d_ql, trace.os2x);
+        let mut d_ir_1x = fold_os2x_iq_grad(&d_ir, trace.os2x);
+        let mut d_qr_1x = fold_os2x_iq_grad(&d_qr, trace.os2x);
+        accumulate_t1_1x_iq_grads(
+            trace,
+            &d_feat,
+            &mut d_il_1x,
+            &mut d_ql_1x,
+            &mut d_ir_1x,
+            &mut d_qr_1x,
+        );
+        if let Some(gl) = grad_u_sense_l_opt {
+            pullback_1x_iq_to_u_sense(trace, &d_il_1x, &d_ql_1x, gl);
+        }
+        if let Some(gr) = grad_u_sense_r_opt {
+            pullback_1x_iq_to_u_sense(trace, &d_ir_1x, &d_qr_1x, gr);
+        }
     }
 
     grads
@@ -787,5 +803,83 @@ mod tests {
             "os2x u_r[7]: ana={} fd={fd_ur7}",
             gu2_r[7]
         );
+    }
+
+    fn verify_u_sense_fd_case(model: &SonaModelF64, os2x: bool, probes: &[usize], label: &str) {
+        let n = 48_usize;
+        let q_c = 4_usize;
+        let out_n = if os2x { 2 * n } else { n };
+        let u_l: Vec<f64> = (0..n).map(|t| 0.45 * ((t as f64) * 0.27).sin()).collect();
+        let u_r: Vec<f64> = (0..n).map(|t| -0.38 * ((t as f64) * 0.31).cos()).collect();
+        let d_l: Vec<[f64; 4]> = (0..q_c * out_n)
+            .map(|i| core::array::from_fn(|l| ((i * 3 + l + 1) as f64 * 0.07).sin()))
+            .collect();
+        let d_r: Vec<[f64; 4]> = (0..q_c * out_n)
+            .map(|i| core::array::from_fn(|l| ((i * 5 + l + 2) as f64 * 0.09).cos()))
+            .collect();
+        let eval_fwd = |ul: &[f64], ur: &[f64]| -> CrossbarForwardTrace {
+            if os2x {
+                eval_crossbar_forward_os2x(model, ul, ur, q_c, true)
+            } else {
+                eval_crossbar_forward(model, ul, ur, q_c, true)
+            }
+        };
+        let obj = |tr: &CrossbarForwardTrace| -> f64 {
+            tr.cb_add_l
+                .iter()
+                .zip(&d_l)
+                .chain(tr.cb_add_r.iter().zip(&d_r))
+                .map(|(a, b)| (0..4).map(|k| a[k] * b[k]).sum::<f64>())
+                .sum()
+        };
+
+        let trace = eval_fwd(&u_l, &u_r);
+        let mut g_l = vec![0.0_f64; n];
+        let mut g_r = vec![0.0_f64; n];
+        assemble_crossbar_adjoint(model, &trace, &d_l, &d_r, Some(&mut g_l), Some(&mut g_r));
+
+        // Verify one-sided (Some/None and None/Some) calls match full stereo call identically.
+        let mut g_l_only = vec![0.0_f64; n];
+        let mut g_r_only = vec![0.0_f64; n];
+        assemble_crossbar_adjoint(model, &trace, &d_l, &d_r, Some(&mut g_l_only), None);
+        assemble_crossbar_adjoint(model, &trace, &d_l, &d_r, None, Some(&mut g_r_only));
+        assert_eq!(g_l_only, g_l);
+        assert_eq!(g_r_only, g_r);
+
+        let eps = 1.0e-6_f64;
+        for &idx in probes {
+            let (mut ulp, mut ulm) = (u_l.clone(), u_l.clone());
+            ulp[idx] += eps;
+            ulm[idx] -= eps;
+            let fd_l = (obj(&eval_fwd(&ulp, &u_r)) - obj(&eval_fwd(&ulm, &u_r))) / (2.0 * eps);
+            let rel_l = (g_l[idx] - fd_l).abs() / g_l[idx].abs().max(fd_l.abs()).max(1.0e-3);
+            assert!(
+                rel_l < 1.0e-6,
+                "{label} os2x={os2x} u_l[{idx}]: ana={} fd={fd_l} rel={rel_l}",
+                g_l[idx]
+            );
+
+            let (mut urp, mut urm) = (u_r.clone(), u_r.clone());
+            urp[idx] += eps;
+            urm[idx] -= eps;
+            let fd_r = (obj(&eval_fwd(&u_l, &urp)) - obj(&eval_fwd(&u_l, &urm))) / (2.0 * eps);
+            let rel_r = (g_r[idx] - fd_r).abs() / g_r[idx].abs().max(fd_r.abs()).max(1.0e-3);
+            assert!(
+                rel_r < 1.0e-6,
+                "{label} os2x={os2x} u_r[{idx}]: ana={} fd={fd_r} rel={rel_r}",
+                g_r[idx]
+            );
+        }
+    }
+
+    #[test]
+    fn test_crossbar_t1_hilbert_dc_and_joint_carrier_u_sense_fd_parity() {
+        let mut pure_op_p = test_crossbar_model();
+        pure_op_p.phasor_to_core = [[0.0; 4]; 10];
+        let joint = test_crossbar_model();
+        for os2x in [false, true] {
+            verify_u_sense_fd_case(&pure_op_p, os2x, &[5, 17, 31], "pure_op_p");
+            verify_u_sense_fd_case(&joint, os2x, &[5, 17, 31], "joint_op_p_carrier");
+        }
     }
 }

@@ -3,6 +3,8 @@
 
 #[path = "stimulus_and_align_suite/align_and_capsules_edges.rs"]
 mod align_and_capsules_edges;
+#[path = "stimulus_and_align_suite/causal_onset_alignment.rs"]
+mod causal_onset_alignment;
 #[path = "stimulus_and_align_suite/dual_mode_and_align.rs"]
 mod dual_mode_and_align;
 #[path = "stimulus_and_align_suite/live_null_autopatch.rs"]

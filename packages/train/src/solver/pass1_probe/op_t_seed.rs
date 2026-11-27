@@ -381,7 +381,9 @@ pub(super) fn seed_soft_op_t_quads(
         ];
         tq.ramp_phase_off_q16 = [0, 32_768, 16_384, 49_152];
         if shimmer_detected {
-            tq.ramp_rate_hz = 1.5;
+            // Negative ramp rate = decreasing delay over time = pitch-UP shimmer
+            // (preserving g_loop without pitch-down contraction).
+            tq.ramp_rate_hz = -1.5;
             tq.ramp_spans_samples = [64.0, 64.0, 64.0, 64.0];
             tq.window_depth = 0.5;
         }
@@ -768,5 +770,83 @@ mod tests {
         assert_eq!(out_c7.estimated_loop_gain, 0.0);
         assert_eq!(mdl_res_cab.transport_quads[0].g_loop, 0.0);
         assert_eq!(mdl_res_cab.transport_quads[0].lfo_rate_hz, 0.0);
+    }
+
+    #[test]
+    fn test_shimmer_seed_uses_negative_pitch_up_ramp_and_preserves_g_loop() {
+        let n = 2_048_usize;
+        let sr = 48_000.0_f64;
+        let start = 64_usize;
+        let mut dry = vec![0.0_f64; n];
+        let mut res_hf = vec![0.0_f64; n];
+        let mut seed = 0xA5A5_5A5A_1234_5678_u64;
+        let mut prev = 0.0_f64;
+        for t in 0..n {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let white = ((seed >> 32) as f64) / (u32::MAX as f64) * 2.0 - 1.0;
+            // First-order differentiator concentrates energy above fs/4 (hf_ratio > 0.35) with low autocorr.
+            let hp = 0.5 * (white - prev);
+            prev = white;
+            if t < n / 2 {
+                dry[t] = 0.5 * white;
+            }
+            res_hf[t] = 0.35 * hp;
+        }
+        let tgt_e: f64 = 2.0 * res_hf[start..].iter().map(|v| v * v).sum::<f64>();
+
+        for hint_rt60 in [None, Some(4.0_f64)] {
+            let dry_case = if hint_rt60.is_some() {
+                // With hint_rt60, even a sustained dry excitation triggers shimmer_detected.
+                vec![0.15_f64; n]
+            } else {
+                dry.clone()
+            };
+            let hint_val = hint_rt60.map(|rt| Pass1PhysicsHint {
+                rt60_s: Some(rt),
+                ..Default::default()
+            });
+            let mut mdl = SonaModelF64::new(sr);
+            let _out = seed_soft_op_t_quads(
+                &mut mdl,
+                &OpTSeedInput {
+                    input_l: &dry_case,
+                    input_r: &dry_case,
+                    target_l: &res_hf,
+                    target_r: &res_hf,
+                    res_fir_l: &res_hf,
+                    res_fir_r: &res_hf,
+                    start,
+                    tgt_tot_e: tgt_e,
+                    res_fir_tot_e: tgt_e,
+                    sample_rate_hz: sr,
+                    hint: hint_val.as_ref(),
+                },
+            );
+            let tq = &mdl.transport_quads[0];
+            assert_eq!(tq.ramp_rate_hz, -1.5, "hint_rt60={hint_rt60:?}");
+            assert_eq!(tq.ramp_spans_samples, [64.0; 4]);
+            assert_eq!(tq.window_depth, 0.5);
+            assert_eq!(tq.ramp_phase_off_q16, [0, 32_768, 16_384, 49_152]);
+
+            let ramp_inc_q32 = dnam_vm::control::bus::laws::quantize_transport_ramp_inc_q32(
+                tq.ramp_rate_hz as f32,
+                1.0 / sr,
+            );
+            assert!(
+                ramp_inc_q32 < 0,
+                "pitch-up shimmer must produce negative ramp_inc_q32, got {ramp_inc_q32}"
+            );
+            let g_eff = dnam_kernels::compute_op_t_pitch_down_g_loop_eff(
+                tq.g_loop as f32,
+                tq.ramp_spans_samples.map(|v| v as f32),
+                ramp_inc_q32,
+            );
+            assert_eq!(
+                g_eff, tq.g_loop as f32,
+                "pitch-up shimmer must not trigger pitch-down g_loop contraction"
+            );
+        }
     }
 }
