@@ -8,10 +8,12 @@ use dnam_kernels::{
 };
 use dnam_vm::{SONA_CORE_QUAD_BLOCK_AND_LOCAL, SONA_ULTRA_QUAD_TRAVERSAL_ORDER};
 
-use crate::cpu::core_and_adjoint::{canon_vec4, flush_zero, write_checkpoint};
-use crate::gpu::abi::{FEATURE_VEC4_STRIDE, TILE_CKPT_VEC4_STRIDE, TILE_FRAMES};
+use crate::gpu::abi::{FEATURE_VEC4_STRIDE, TILE_FRAMES};
 
 use super::super::super::model::cascade::sanitize_unit_f64;
+use super::super::super::model::v3_core_bridge::{
+    V3_TILE_CKPT_VEC4_STRIDE, canon_vec4, flush_zero, write_v3_checkpoint,
+};
 use super::super::super::model::{NUM_FIR_TAPS_ULTRA, SonaModelF64};
 use super::super::adjoints::{KautzChannelStepper, RoPoleResolved};
 use super::super::crossbar::{
@@ -136,7 +138,7 @@ pub(crate) fn eval_causal_loop_forward(
 
     let num_tiles = n_core.div_ceil(TILE_FRAMES);
     let ckpt_per_quad = if record_trace {
-        num_tiles * TILE_CKPT_VEC4_STRIDE
+        num_tiles * V3_TILE_CKPT_VEC4_STRIDE
     } else {
         0
     };
@@ -249,7 +251,7 @@ pub(crate) fn eval_causal_loop_forward(
                 if sub_t.is_multiple_of(TILE_FRAMES) {
                     let tile = sub_t / TILE_FRAMES;
                     for q in 0..q_count {
-                        write_checkpoint(
+                        write_v3_checkpoint(
                             &mut tile_checkpoints,
                             q,
                             num_tiles,

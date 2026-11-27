@@ -3,17 +3,15 @@
 use dnam_kernels::{KernelVec4, StereoVec8, TINY_CROSSING_EPS};
 use dnam_vm::{SONA_CORE_QUAD_BLOCK_AND_LOCAL, SONA_ULTRA_QUAD_TRAVERSAL_ORDER};
 
-use crate::cpu::core_and_adjoint::{
-    FwdFrameState, LaneParams, ReverseCarry, ReverseStepContext, TileGradAccum, flush_zero,
-    read_checkpoint, step_lane_forward, step_lane_reverse, write_lane_param_grads,
-};
-use crate::gpu::abi::{
-    FEATURE_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE, TILE_FRAMES, quad_param_slots,
-};
-use crate::runner::pack_core_quad_params;
+use crate::gpu::abi::{FEATURE_VEC4_STRIDE, TILE_FRAMES};
 
 use super::super::super::model::SonaModelF64;
 use super::super::super::model::cascade::sanitize_unit_f64;
+use super::super::super::model::v3_core_bridge::{
+    FwdFrameState, LaneParams, ReverseCarry, ReverseStepContext, TileGradAccum,
+    V3_QUAD_PARAMS_VEC4_STRIDE, flush_zero, pack_v3_core_quad_params, read_v3_checkpoint,
+    step_lane_forward, step_lane_reverse, v3_quad_param_slots, write_v3_lane_param_grads,
+};
 use super::super::adjoints::KautzChannelReverseState;
 use super::super::crossbar::assemble_crossbar_adjoint;
 use super::super::eval::core_adj::{
@@ -216,9 +214,10 @@ pub(crate) fn assemble_causal_loop_adjoint(
             let kp = model.core_quads[q]
                 .rescaled_for_rho(buf.rho_core)
                 .to_kernel_params_for_block(block_idx);
-            let qp = pack_core_quad_params(&kp);
-            let lps: [LaneParams; 4] =
-                core::array::from_fn(|c| LaneParams::extract(&kp, qp[quad_param_slots::SVF_G], c));
+            let qp = pack_v3_core_quad_params(&kp);
+            let lps: [LaneParams; 4] = core::array::from_fn(|c| {
+                LaneParams::extract(&kp, qp[v3_quad_param_slots::SVF_G], c)
+            });
             (block_idx == 0, lps)
         })
         .collect();
@@ -257,7 +256,7 @@ pub(crate) fn assemble_causal_loop_adjoint(
             continue;
         }
         for q in 0..q_count {
-            let ckpt = read_checkpoint(&buf.tile_checkpoints, q, num_tiles, tile);
+            let ckpt = read_v3_checkpoint(&buf.tile_checkpoints, q, num_tiles, tile);
             let (s1_l, s1_r) = ckpt.svf_s1.into_lr();
             let (s2_l, s2_r) = ckpt.svf_s2.into_lr();
             let (v_l, v_r) = ckpt.lru_v.into_lr();
@@ -430,12 +429,12 @@ pub(crate) fn assemble_causal_loop_adjoint(
             }
         }
 
-        let mut pg_buf = [[0.0_f32; 4]; QUAD_PARAMS_VEC4_STRIDE];
+        let mut pg_buf = [[0.0_f32; 4]; V3_QUAD_PARAMS_VEC4_STRIDE];
         for q in 0..q_count {
             let block_idx = SONA_CORE_QUAD_BLOCK_AND_LOCAL[q].0 as u32;
             let is_phs = block_idx == 0;
             for c in 0..4 {
-                write_lane_param_grads(
+                write_v3_lane_param_grads(
                     &mut pg_buf,
                     0,
                     c,

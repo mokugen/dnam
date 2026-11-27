@@ -12,6 +12,8 @@ mod cpu_wgpu_parity {
     pub(crate) mod m22_pipeline;
     #[cfg(feature = "gpu-wgpu")]
     pub(crate) mod support;
+    #[cfg(feature = "gpu-wgpu")]
+    pub(crate) mod v4_parity;
 }
 
 #[cfg(feature = "gpu-wgpu")]
@@ -453,7 +455,7 @@ mod gpu_parity {
             let neg_in = vec![[-0.0_f32; 4]; core_inputs.len()];
             let mut neg_params = quad_params.clone();
             for q in 0..total_q {
-                neg_params[q * QUAD_PARAMS_VEC4_STRIDE + quad_param_slots::TONE_LP] = [-0.7; 4];
+                neg_params[q * QUAD_PARAMS_VEC4_STRIDE + quad_param_slots::TONE_C_LP] = [-0.7; 4];
                 neg_params[q * QUAD_PARAMS_VEC4_STRIDE + quad_param_slots::GLU_MIX] = [-0.6; 4];
             }
             let z_out = gpu
@@ -524,7 +526,9 @@ mod gpu_parity {
                 }
             }
 
-            // Explicit SVF_G == 0.0 (< MIN_TPT_G) zero-guard parity across CPU and GPU.
+            // Explicit SVF_G == 0.0 (< MIN_TPT_G) zero-guard parity across CPU and GPU:
+            // with gamma_duhem > 0, derived two_svf_g contributes 2 * dL/d(two_svf_g); with
+            // gamma_duhem == 0, SVF_G gradient must vanish strictly to +0.0.
             let mut zero_g_params = Vec::with_capacity(total_q * QUAD_PARAMS_VEC4_STRIDE);
             for s in 0..num_stems {
                 for q in 0..num_quads {
@@ -539,8 +543,31 @@ mod gpu_parity {
             let zg_gpu = gpu.adjoint_scan_256(&zero_g_in).unwrap();
             for tile_block in 0..(total_q * num_tiles) {
                 let svf_g_idx = tile_block * QUAD_PARAMS_VEC4_STRIDE + quad_param_slots::SVF_G;
-                assert_eq!(zg_cpu.param_grads[svf_g_idx], [0.0; 4]);
-                assert_eq!(zg_gpu.param_grads[svf_g_idx], [0.0; 4]);
+                for l in 0..4 {
+                    assert!(
+                        (zg_cpu.param_grads[svf_g_idx][l] - zg_gpu.param_grads[svf_g_idx][l]).abs()
+                            <= 5.0e-3 * zg_cpu.param_grads[svf_g_idx][l].abs().max(1.0),
+                        "zero-g duhem SVF_G parity ({label}) lane={l}: cpu={} gpu={}",
+                        zg_cpu.param_grads[svf_g_idx][l],
+                        zg_gpu.param_grads[svf_g_idx][l]
+                    );
+                }
+            }
+            let mut zero_g_no_duhem = zero_g_params.clone();
+            for q in 0..total_q {
+                zero_g_no_duhem[q * QUAD_PARAMS_VEC4_STRIDE + quad_param_slots::LRU_GAMMA_DUHEM] =
+                    [0.0; 4];
+            }
+            let zg0_in = AdjointScanInput {
+                quad_params: &zero_g_no_duhem,
+                ..adj_in
+            };
+            let zg0_cpu = cpu.adjoint_scan_256(&zg0_in).unwrap();
+            let zg0_gpu = gpu.adjoint_scan_256(&zg0_in).unwrap();
+            for tile_block in 0..(total_q * num_tiles) {
+                let svf_g_idx = tile_block * QUAD_PARAMS_VEC4_STRIDE + quad_param_slots::SVF_G;
+                assert_eq!(zg0_cpu.param_grads[svf_g_idx], [0.0; 4]);
+                assert_eq!(zg0_gpu.param_grads[svf_g_idx], [0.0; 4]);
             }
         }
 
@@ -582,9 +609,7 @@ mod gpu_parity {
                 blk[quad_param_slots::SVF_A2] = svf.a2.0;
                 blk[quad_param_slots::SVF_A3] = svf.a3.0;
                 blk[quad_param_slots::SVF_G] = g_arr;
-                blk[quad_param_slots::TWO_SVF_G] = g_arr.map(|v| v * 2.0);
                 blk[quad_param_slots::SVF_K] = k_low;
-                blk[quad_param_slots::SVF_TWO_K] = k_low.map(|v| v * 2.0);
             }
             quad_params.extend_from_slice(&blk);
         }

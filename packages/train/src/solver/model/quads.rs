@@ -2,8 +2,10 @@
 //! `KautzPair`, and `Op-T` `TransportQuad` (`ref[dsp.op-n.core.matryoshka-blocks]`).
 
 use dnam_kernels::{
-    CoreQuadParamsStereo4, GpuVec4, KernelVec4, MAX_PARALRU_DUHEM_GAMMA_F32, MAX_PARALRU_R_F32,
-    MAX_SVF_K_NL, MIN_TPT_G, SonaParaLruDuhemCoeffs4, SonaToneWeights4, TptSvfCoeffs4,
+    CoreQuadParamsStereo4, CoreQuadV4ParamsStereo4, GpuVec4, KernelVec4, MAX_ADAA_DRIVE,
+    MAX_G_PRE_GAIN, MAX_GLU_MIX, MAX_LRU_BIAS_DRIVE, MAX_OUT_GAIN, MAX_PARALRU_DUHEM_GAMMA_F32,
+    MAX_PARALRU_R_F32, MAX_SVF_K_NL, MIN_TPT_G, SonaParaLruDuhemCoeffs4, SonaToneFolded3,
+    SonaToneFoldedBlock0, SonaToneWeights4, TptSvfCoeffs4,
 };
 use dnam_vm::math::{TANK_DC_BLOCKER_48K_F32, rescale_real_pole_zoh, rescale_tpt_svf_g_zoh};
 use dnam_vm::rescale_paralru_lane;
@@ -64,6 +66,20 @@ pub struct CoreQuadF64 {
     pub wavefolder_mix: [f64; 4],
     /// Cross-lane bounded `GLU` mix `[-4.0, 4.0]`.
     pub glu_mix: [f64; 4],
+    /// `SONA v4.0` dynamic pre-shaper resting gain `g0 in [0.0, 2.5]` (default `1.0`).
+    pub g0: [f64; 4],
+    /// `SONA v4.0` dynamic pre-shaper asymptotic gain `g_inf in [0.0, 2.5]` (default `1.0`).
+    pub g_inf: [f64; 4],
+    /// `SONA v4.0` dynamic pre-shaper envelope sensitivity `d_pre >= 0.0` (default `0.0`).
+    pub d_pre: [f64; 4],
+    /// `SONA v4.0` post-ADAA rank-1 `SE-Bus` energy weight `se_w_sq >= 0.0` (default `0.0`).
+    pub se_w_sq: [f64; 4],
+    /// `SONA v4.0` post-ADAA rank-1 `SE-Bus` gain reduction depth `se_d_bus >= 0.0` (default `0.0`).
+    pub se_d_bus: [f64; 4],
+    /// `SONA v4.0` clean pre-shaper parallel feedforward mix `lin_mix in [0.0, 1.0]` (default `0.0`).
+    pub lin_mix: [f64; 4],
+    /// `SONA v4.0` per-lane output trim `out_gain in [-4.0, 4.0]` (default `1.0`).
+    pub out_gain: [f64; 4],
     /// Mid input coupling weight.
     pub in_mid_weight: [f64; 4],
     /// Side input coupling weight.
@@ -93,6 +109,13 @@ impl Default for CoreQuadF64 {
             lru_bias_drive: [0.0; 4],
             wavefolder_mix: [0.0; 4],
             glu_mix: [0.0; 4],
+            g0: [1.0; 4],
+            g_inf: [1.0; 4],
+            d_pre: [0.0; 4],
+            se_w_sq: [0.0; 4],
+            se_d_bus: [0.0; 4],
+            lin_mix: [0.0; 4],
+            out_gain: [1.0; 4],
             in_mid_weight: [1.0; 4],
             in_side_weight: [1.0; 4],
         }
@@ -201,6 +224,123 @@ impl CoreQuadF64 {
     #[must_use]
     pub fn to_kernel_params(&self) -> CoreQuadParamsStereo4<GpuVec4> {
         self.to_kernel_params_for_block(0)
+    }
+
+    /// Converts `self` into `32-bit` `SONA v4.0` GPU/CPU uniform params for `block_idx`, folding
+    /// the 5-tap tone weights into [`SonaToneFoldedBlock0`] (Block `0`) or [`SonaToneFolded3`]
+    /// lifted with `c_kbp = 0.0` (Blocks `1..=3`), and masking `svf_k_nl` to `0.0` on Blocks `1..=3`.
+    #[must_use]
+    pub fn to_v4_kernel_params_for_block(
+        &self,
+        block_idx: u32,
+    ) -> CoreQuadV4ParamsStereo4<GpuVec4> {
+        #[inline]
+        fn clamp_f32_finite(v: f64, lo: f32, hi: f32, fallback: f32) -> f32 {
+            if v.is_finite() {
+                (v as f32).clamp(lo, hi)
+            } else {
+                fallback
+            }
+        }
+        let g = GpuVec4::from_array(
+            self.svf_g
+                .map(|v| clamp_f32_finite(v, MIN_TPT_G, 64.0, 0.125)),
+        );
+        let k = GpuVec4::from_array(
+            self.svf_k
+                .map(|v| clamp_f32_finite(v, 0.0, 8.0, core::f32::consts::FRAC_1_SQRT_2)),
+        );
+        let tone_w = SonaToneWeights4 {
+            lp: GpuVec4::from_array(self.tone_lp.map(|v| clamp_f32_finite(v, -16.0, 16.0, 0.0))),
+            bp: GpuVec4::from_array(self.tone_bp.map(|v| clamp_f32_finite(v, -16.0, 16.0, 0.0))),
+            hp: GpuVec4::from_array(self.tone_hp.map(|v| clamp_f32_finite(v, -16.0, 16.0, 0.0))),
+            ap: GpuVec4::from_array(self.tone_ap.map(|v| clamp_f32_finite(v, -16.0, 16.0, 0.0))),
+            dir: GpuVec4::from_array(self.tone_dir.map(|v| clamp_f32_finite(v, -16.0, 16.0, 0.0))),
+        };
+        let tone = if block_idx == 0 {
+            SonaToneFoldedBlock0::from_weights(&tone_w)
+        } else {
+            SonaToneFoldedBlock0::from_folded3(&SonaToneFolded3::from_weights(&tone_w, k))
+        };
+        let svf_k_nl = if block_idx == 0 {
+            GpuVec4::from_array(
+                self.svf_k_nl
+                    .map(|v| clamp_f32_finite(v, 0.0, MAX_SVF_K_NL, 0.0)),
+            )
+        } else {
+            GpuVec4::from_array([0.0; 4])
+        };
+        CoreQuadV4ParamsStereo4 {
+            svf: TptSvfCoeffs4::from_gk(g, k),
+            tone,
+            lru: SonaParaLruDuhemCoeffs4 {
+                alpha_rel: GpuVec4::from_array(
+                    self.lru_alpha_rel
+                        .map(|v| clamp_f32_finite(v, 0.0, MAX_PARALRU_R_F32, 0.995)),
+                ),
+                alpha_atk: GpuVec4::from_array(
+                    self.lru_alpha_atk
+                        .map(|v| clamp_f32_finite(v, 0.0, 1.0, 0.25)),
+                ),
+                kappa: GpuVec4::from_array(
+                    self.lru_kappa.map(|v| clamp_f32_finite(v, 0.0, 1.0, 0.0)),
+                ),
+                gamma_duhem: GpuVec4::from_array(
+                    self.lru_duhem_gamma
+                        .map(|v| clamp_f32_finite(v, 0.0, MAX_PARALRU_DUHEM_GAMMA_F32, 0.0)),
+                ),
+                signed_mix: GpuVec4::from_array(
+                    self.lru_signed_mix
+                        .map(|v| clamp_f32_finite(v, 0.0, 1.0, 0.0)),
+                ),
+                stereo_link: GpuVec4::from_array(
+                    self.lru_stereo_link
+                        .map(|v| clamp_f32_finite(v, 0.0, 1.0, 0.0)),
+                ),
+            },
+            two_svf_g: g.mul(GpuVec4::from_array([2.0; 4])),
+            svf_k_nl,
+            rect_sign: GpuVec4::from_array(
+                self.rect_sign
+                    .map(|v| if v.is_finite() && v < 0.0 { -1.0 } else { 1.0 }),
+            ),
+            g0: GpuVec4::from_array(
+                self.g0
+                    .map(|v| clamp_f32_finite(v, 0.0, MAX_G_PRE_GAIN, 1.0)),
+            ),
+            g_inf: GpuVec4::from_array(
+                self.g_inf
+                    .map(|v| clamp_f32_finite(v, 0.0, MAX_G_PRE_GAIN, 1.0)),
+            ),
+            d_pre: GpuVec4::from_array(self.d_pre.map(|v| clamp_f32_finite(v, 0.0, 1.0e12, 0.0))),
+            se_w_sq: GpuVec4::from_array(
+                self.se_w_sq.map(|v| clamp_f32_finite(v, 0.0, 1.0e6, 0.0)),
+            ),
+            se_d_bus: GpuVec4::from_array(
+                self.se_d_bus.map(|v| clamp_f32_finite(v, 0.0, 1.0e12, 0.0)),
+            ),
+            adaa_drive: GpuVec4::from_array(
+                self.adaa_drive
+                    .map(|v| clamp_f32_finite(v, -MAX_ADAA_DRIVE, MAX_ADAA_DRIVE, 0.0)),
+            ),
+            lru_bias_drive: GpuVec4::from_array(
+                self.lru_bias_drive
+                    .map(|v| clamp_f32_finite(v, -MAX_LRU_BIAS_DRIVE, MAX_LRU_BIAS_DRIVE, 0.0)),
+            ),
+            lin_mix: GpuVec4::from_array(self.lin_mix.map(|v| clamp_f32_finite(v, 0.0, 1.0, 0.0))),
+            wavefolder_mix: GpuVec4::from_array(
+                self.wavefolder_mix
+                    .map(|v| clamp_f32_finite(v, 0.0, 1.0, 0.0)),
+            ),
+            glu_mix: GpuVec4::from_array(
+                self.glu_mix
+                    .map(|v| clamp_f32_finite(v, -MAX_GLU_MIX, MAX_GLU_MIX, 0.0)),
+            ),
+            out_gain: GpuVec4::from_array(
+                self.out_gain
+                    .map(|v| clamp_f32_finite(v, -MAX_OUT_GAIN, MAX_OUT_GAIN, 1.0)),
+            ),
+        }
     }
 
     /// Rescales `CoreQuadF64` from reference `1x` parameters to execution rate ratio `rho_core`

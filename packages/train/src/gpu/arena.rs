@@ -464,14 +464,15 @@ impl GpuTrainArena {
     }
 }
 
-const _: () = assert!(EXIT_ADJ_BOUNDARY_VEC4_STRIDE == 16);
+const _: () = assert!(EXIT_ADJ_BOUNDARY_VEC4_STRIDE == 24);
 const _: () = assert!(OZAKI_WORDS_PER_PAIR == 6 && OZAKI_SPLIT64_WORDS_PER_PAIR == 4);
 
 #[cfg(test)]
 pub(super) mod tests {
     use dnam_kernels::{
-        CoreQuadParamsStereo4, GpuVec4, KernelVec4, SOFT_RECT_EPS, SonaParaLruDuhemCoeffs4,
-        SonaToneWeights4, TINY_CROSSING_EPS, TptSvfCoeffs4, prewarp_tan_pi_f_over_fs_f32,
+        CoreQuadV4ParamsStereo4, GpuVec4, KernelVec4, SOFT_RECT_EPS, SonaParaLruDuhemCoeffs4,
+        SonaToneFoldedBlock0, SonaToneWeights4, TINY_CROSSING_EPS, TptSvfCoeffs4,
+        prewarp_tan_pi_f_over_fs_f32,
     };
 
     use super::super::abi::{CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE};
@@ -510,15 +511,17 @@ pub(super) mod tests {
             prewarp_tan_pi_f_over_fs_f32(0.24),
         ]);
         let k = GpuVec4::from_array([0.65 + 0.08 * w, 0.85, 1.15, 1.35]);
-        let params = CoreQuadParamsStereo4 {
-            svf: TptSvfCoeffs4::from_gk(g, k),
-            tone: SonaToneWeights4 {
-                lp: GpuVec4::from_array([0.40 + 0.04 * w, 0.20, -0.15, 0.10]),
-                bp: GpuVec4::from_array([0.25, 0.35 + 0.03 * w, 0.20, -0.15]),
-                hp: GpuVec4::from_array([-0.10, 0.15, 0.30, 0.40]),
-                ap: GpuVec4::from_array([0.08, -0.06, 0.12, 0.09]),
-                dir: GpuVec4::from_array([0.20, 0.15, -0.08, 0.22]),
-            },
+        let svf = TptSvfCoeffs4::from_gk(g, k);
+        let tone_weights = SonaToneWeights4 {
+            lp: GpuVec4::from_array([0.40 + 0.04 * w, 0.20, -0.15, 0.10]),
+            bp: GpuVec4::from_array([0.25, 0.35 + 0.03 * w, 0.20, -0.15]),
+            hp: GpuVec4::from_array([-0.10, 0.15, 0.30, 0.40]),
+            ap: GpuVec4::from_array([0.08, -0.06, 0.12, 0.09]),
+            dir: GpuVec4::from_array([0.20, 0.15, -0.08, 0.22]),
+        };
+        let params = CoreQuadV4ParamsStereo4 {
+            svf,
+            tone: SonaToneFoldedBlock0::from_weights(&tone_weights),
             lru: SonaParaLruDuhemCoeffs4::from_clamped(
                 GpuVec4::splat(0.99),
                 GpuVec4::from_array([0.30, 0.42, 0.55, 0.68]),
@@ -528,13 +531,19 @@ pub(super) mod tests {
                 GpuVec4::from_array([0.05, 0.18, 0.32, 0.48]),
             ),
             two_svf_g: g.add(g),
-            svf_k_nl: GpuVec4::from_array([0.04 * (w + 1.0), -0.02, 0.03, 0.01]),
+            svf_k_nl: GpuVec4::from_array([0.04 * (w + 1.0), 0.02, 0.03, 0.01]),
             rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
-            sag_depth: GpuVec4::from_array([0.16, 0.28, 0.36, 0.20]),
+            g0: GpuVec4::from_array([0.90, 1.05, 0.85, 1.15]),
+            g_inf: GpuVec4::from_array([1.20, 0.85, 1.10, 0.95]),
+            d_pre: GpuVec4::from_array([0.16, 0.28, 0.36, 0.20]),
+            se_w_sq: GpuVec4::from_array([0.45, 0.25, 0.60, 0.15]),
+            se_d_bus: GpuVec4::from_array([0.35, 0.20, 0.40, 0.15]),
             adaa_drive: GpuVec4::from_array([1.10 + 0.12 * w, 1.45, 1.85, 1.25]),
             lru_bias_drive: GpuVec4::from_array([0.12, -0.18, 0.24, -0.14]),
+            lin_mix: GpuVec4::from_array([0.05, 0.12, 0.08, 0.15]),
             wavefolder_mix: GpuVec4::from_array([0.10, 0.30, 0.55, 0.80]),
             glu_mix: GpuVec4::from_array([0.55, -0.40, 0.70, -0.50]),
+            out_gain: GpuVec4::from_array([1.0, 0.95, 1.05, 0.90]),
         };
         let quad_params = pack_core_quad_params(&params)[..QUAD_PARAMS_VEC4_STRIDE].to_vec();
 

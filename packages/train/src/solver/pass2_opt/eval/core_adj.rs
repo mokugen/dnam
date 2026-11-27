@@ -2,12 +2,16 @@
 //! helpers shared across the fast block-DAG path (`eval`) and frame-interleaved `causal_loop`
 //! (`ref[train.pipeline.backbone-trajectory-opt]`).
 
-use dnam_kernels::{MAX_SVF_K_NL, MIN_TPT_G};
+use dnam_kernels::{
+    MAX_ADAA_DRIVE, MAX_G_PRE_GAIN, MAX_GLU_MIX, MAX_LRU_BIAS_DRIVE, MAX_OUT_GAIN, MAX_SVF_K_NL,
+    MIN_TPT_G,
+};
 use dnam_vm::{SONA_INTERBLOCK_TILES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER};
 
 use crate::gpu::abi::{FEATURE_VEC4_STRIDE, TILE_WEIGHT_GRAD_FLOATS, quad_param_slots};
 
 use super::super::super::model::cascade::sanitize_unit_f64;
+use super::super::super::model::v3_core_bridge::v3_quad_param_slots;
 use super::super::super::model::{CoreQuadF64, SonaModelF64};
 use super::super::crossbar::CrossbarGrads;
 use super::super::op_n_pre::OpNPreGrads;
@@ -71,6 +75,13 @@ pub(crate) struct Pass2CoreQuadGrads {
     pub lru_bias_drive: [f64; 4],
     pub wavefolder_mix: [f64; 4],
     pub glu_mix: [f64; 4],
+    pub g0: [f64; 4],
+    pub g_inf: [f64; 4],
+    pub d_pre: [f64; 4],
+    pub se_w_sq: [f64; 4],
+    pub se_d_bus: [f64; 4],
+    pub lin_mix: [f64; 4],
+    pub out_gain: [f64; 4],
     pub in_mid_weight: [f64; 4],
     pub in_side_weight: [f64; 4],
 }
@@ -127,7 +138,7 @@ impl Pass2FullGrads {
     }
 }
 
-/// Accumulates all non-derived `QUAD_PARAMS_VEC4_STRIDE` slots for `tile` (`pg_base = tile * 25`)
+/// Accumulates all non-derived `V3_QUAD_PARAMS_VEC4_STRIDE` slots for `tile` (`pg_base = tile * 25`)
 /// across all `4` lanes of quad `q`, respecting clamp boundaries and Block 0 `svf_k_nl` gating.
 pub(crate) fn add_tile_param_grads_to_quad(
     quad: &CoreQuadF64,
@@ -142,47 +153,153 @@ pub(crate) fn add_tile_param_grads_to_quad(
 
     for c in 0..4 {
         if open_range(quad.svf_g[c], f64::from(MIN_TPT_G), 64.0) {
-            dst.svf_g[c] += slot_val(quad_param_slots::SVF_G, c);
+            dst.svf_g[c] += slot_val(v3_quad_param_slots::SVF_G, c);
         }
         if open_range(quad.svf_k[c], 0.0, 8.0) {
-            dst.svf_k[c] += slot_val(quad_param_slots::SVF_K, c);
+            dst.svf_k[c] += slot_val(v3_quad_param_slots::SVF_K, c);
+        }
+        if block_idx == 0 && open_range(quad.svf_k_nl[c], 0.0, f64::from(MAX_SVF_K_NL)) {
+            dst.svf_k_nl[c] += slot_val(v3_quad_param_slots::SVF_K_NL, c);
+        }
+        if open_abs(quad.tone_lp[c], 16.0) {
+            dst.tone_lp[c] += slot_val(v3_quad_param_slots::TONE_LP, c);
+        }
+        if open_abs(quad.tone_bp[c], 16.0) {
+            dst.tone_bp[c] += slot_val(v3_quad_param_slots::TONE_BP, c);
+        }
+        if open_abs(quad.tone_hp[c], 16.0) {
+            dst.tone_hp[c] += slot_val(v3_quad_param_slots::TONE_HP, c);
+        }
+        if open_abs(quad.tone_ap[c], 16.0) {
+            dst.tone_ap[c] += slot_val(v3_quad_param_slots::TONE_AP, c);
+        }
+        if open_abs(quad.tone_dir[c], 16.0) {
+            dst.tone_dir[c] += slot_val(v3_quad_param_slots::TONE_DIR, c);
+        }
+        dst.lru_alpha_rel[c] += slot_val(v3_quad_param_slots::LRU_ALPHA_REL, c);
+        dst.lru_alpha_atk[c] += slot_val(v3_quad_param_slots::LRU_ALPHA_ATK, c);
+        dst.lru_kappa[c] += slot_val(v3_quad_param_slots::LRU_KAPPA, c);
+        dst.lru_duhem_gamma[c] += slot_val(v3_quad_param_slots::LRU_GAMMA_DUHEM, c);
+        dst.lru_signed_mix[c] += slot_val(v3_quad_param_slots::LRU_SIGNED_MIX, c);
+        dst.lru_stereo_link[c] += slot_val(v3_quad_param_slots::LRU_STEREO_LINK, c);
+        if open_abs(quad.sag_depth[c], 8.0) {
+            dst.sag_depth[c] += slot_val(v3_quad_param_slots::SAG_DEPTH, c);
+        }
+        if open_abs(quad.adaa_drive[c], 32.0) {
+            dst.adaa_drive[c] += slot_val(v3_quad_param_slots::ADAA_DRIVE, c);
+        }
+        if open_abs(quad.lru_bias_drive[c], 16.0) {
+            dst.lru_bias_drive[c] += slot_val(v3_quad_param_slots::LRU_BIAS_DRIVE, c);
+        }
+        dst.wavefolder_mix[c] += slot_val(v3_quad_param_slots::WAVEFOLDER_MIX, c);
+        if open_abs(quad.glu_mix[c], 4.0) {
+            dst.glu_mix[c] += slot_val(v3_quad_param_slots::GLU_MIX, c);
+        }
+    }
+}
+
+/// Accumulates all non-derived `SONA v4.0` `QUAD_PARAMS_VEC4_STRIDE` (`28 × Vec4`) slots for
+/// `tile`, pulling folded `TONE_C_{LP,BP,KBP,U}` back via the exact transpose Jacobian into
+/// `(tone_lp, tone_bp, tone_hp, tone_ap, tone_dir)` and (on Blocks `1..=3`) `svf_k`.
+#[allow(dead_code)]
+pub(crate) fn add_v4_tile_param_grads_to_quad(
+    quad: &CoreQuadF64,
+    block_idx: u32,
+    tile_grads: &[[f32; 4]],
+    pg_base: usize,
+    dst: &mut Pass2CoreQuadGrads,
+) {
+    let slot_val = |slot: usize, c: usize| -> f64 { f64::from(tile_grads[pg_base + slot][c]) };
+    let open_abs = |v: f64, limit: f64| -> bool { v.is_finite() && v.abs() < limit };
+    let open_range = |v: f64, lo: f64, hi: f64| -> bool { v.is_finite() && v >= lo && v < hi };
+
+    for c in 0..4 {
+        if open_range(quad.svf_g[c], f64::from(MIN_TPT_G), 64.0) {
+            dst.svf_g[c] += slot_val(quad_param_slots::SVF_G, c);
+        }
+        let g_c_lp = slot_val(quad_param_slots::TONE_C_LP, c);
+        let g_c_bp = slot_val(quad_param_slots::TONE_C_BP, c);
+        let g_c_kbp = slot_val(quad_param_slots::TONE_C_KBP, c);
+        let g_c_u = slot_val(quad_param_slots::TONE_C_U, c);
+
+        let k_clamped =
+            sanitize_unit_f64(quad.svf_k[c], 0.0, 8.0, core::f64::consts::FRAC_1_SQRT_2);
+        let hp_c = sanitize_unit_f64(quad.tone_hp[c], -16.0, 16.0, 0.0);
+        let ap_c = sanitize_unit_f64(quad.tone_ap[c], -16.0, 16.0, 0.0);
+
+        if open_range(quad.svf_k[c], 0.0, 8.0) {
+            let dk_tone = if block_idx == 0 {
+                0.0
+            } else {
+                -g_c_bp * (hp_c + 2.0 * ap_c)
+            };
+            dst.svf_k[c] += slot_val(quad_param_slots::SVF_K, c) + dk_tone;
         }
         if block_idx == 0 && open_range(quad.svf_k_nl[c], 0.0, f64::from(MAX_SVF_K_NL)) {
             dst.svf_k_nl[c] += slot_val(quad_param_slots::SVF_K_NL, c);
         }
+
         if open_abs(quad.tone_lp[c], 16.0) {
-            dst.tone_lp[c] += slot_val(quad_param_slots::TONE_LP, c);
+            dst.tone_lp[c] += g_c_lp;
         }
         if open_abs(quad.tone_bp[c], 16.0) {
-            dst.tone_bp[c] += slot_val(quad_param_slots::TONE_BP, c);
+            dst.tone_bp[c] += g_c_bp;
         }
         if open_abs(quad.tone_hp[c], 16.0) {
-            dst.tone_hp[c] += slot_val(quad_param_slots::TONE_HP, c);
+            dst.tone_hp[c] += if block_idx == 0 {
+                -g_c_lp - g_c_kbp + g_c_u
+            } else {
+                -g_c_lp - k_clamped * g_c_bp + g_c_u
+            };
         }
         if open_abs(quad.tone_ap[c], 16.0) {
-            dst.tone_ap[c] += slot_val(quad_param_slots::TONE_AP, c);
+            dst.tone_ap[c] += if block_idx == 0 {
+                -2.0 * g_c_kbp + g_c_u
+            } else {
+                -2.0 * k_clamped * g_c_bp + g_c_u
+            };
         }
         if open_abs(quad.tone_dir[c], 16.0) {
-            dst.tone_dir[c] += slot_val(quad_param_slots::TONE_DIR, c);
+            dst.tone_dir[c] += g_c_u;
         }
+
         dst.lru_alpha_rel[c] += slot_val(quad_param_slots::LRU_ALPHA_REL, c);
         dst.lru_alpha_atk[c] += slot_val(quad_param_slots::LRU_ALPHA_ATK, c);
         dst.lru_kappa[c] += slot_val(quad_param_slots::LRU_KAPPA, c);
         dst.lru_duhem_gamma[c] += slot_val(quad_param_slots::LRU_GAMMA_DUHEM, c);
         dst.lru_signed_mix[c] += slot_val(quad_param_slots::LRU_SIGNED_MIX, c);
         dst.lru_stereo_link[c] += slot_val(quad_param_slots::LRU_STEREO_LINK, c);
-        if open_abs(quad.sag_depth[c], 8.0) {
-            dst.sag_depth[c] += slot_val(quad_param_slots::SAG_DEPTH, c);
+
+        if open_range(quad.g0[c], 0.0, f64::from(MAX_G_PRE_GAIN)) {
+            dst.g0[c] += slot_val(quad_param_slots::G0, c);
         }
-        if open_abs(quad.adaa_drive[c], 32.0) {
+        if open_range(quad.g_inf[c], 0.0, f64::from(MAX_G_PRE_GAIN)) {
+            dst.g_inf[c] += slot_val(quad_param_slots::G_INF, c);
+        }
+        if open_range(quad.d_pre[c], 0.0, 1.0e12) {
+            dst.d_pre[c] += slot_val(quad_param_slots::D_PRE, c);
+        }
+        if open_range(quad.se_w_sq[c], 0.0, 1.0e6) {
+            dst.se_w_sq[c] += slot_val(quad_param_slots::SE_W_SQ, c);
+        }
+        if open_range(quad.se_d_bus[c], 0.0, 1.0e12) {
+            dst.se_d_bus[c] += slot_val(quad_param_slots::SE_D_BUS, c);
+        }
+        if open_abs(quad.adaa_drive[c], f64::from(MAX_ADAA_DRIVE)) {
             dst.adaa_drive[c] += slot_val(quad_param_slots::ADAA_DRIVE, c);
         }
-        if open_abs(quad.lru_bias_drive[c], 16.0) {
+        if open_abs(quad.lru_bias_drive[c], f64::from(MAX_LRU_BIAS_DRIVE)) {
             dst.lru_bias_drive[c] += slot_val(quad_param_slots::LRU_BIAS_DRIVE, c);
         }
+        if open_range(quad.lin_mix[c], 0.0, 1.0) {
+            dst.lin_mix[c] += slot_val(quad_param_slots::LIN_MIX, c);
+        }
         dst.wavefolder_mix[c] += slot_val(quad_param_slots::WAVEFOLDER_MIX, c);
-        if open_abs(quad.glu_mix[c], 4.0) {
+        if open_abs(quad.glu_mix[c], f64::from(MAX_GLU_MIX)) {
             dst.glu_mix[c] += slot_val(quad_param_slots::GLU_MIX, c);
+        }
+        if open_abs(quad.out_gain[c], f64::from(MAX_OUT_GAIN)) {
+            dst.out_gain[c] += slot_val(quad_param_slots::OUT_GAIN, c);
         }
     }
 }
@@ -431,4 +548,165 @@ pub(crate) fn backprop_core_input_frame(
     }
 
     (g_ux_l, g_ux_r)
+}
+
+#[cfg(test)]
+mod tests {
+    use dnam_kernels::{SOFT_RECT_EPS, TINY_CROSSING_EPS};
+
+    use super::*;
+    use crate::gpu::abi::{AdjointScanUniforms, FusedScanUniforms};
+    use crate::runner::{AdjointScanInput, FusedCoreScanInput, TrainRunner, pack_core_quad_params};
+
+    #[test]
+    fn test_v4_tone_c_transpose_pullback_and_quad_grads_match_fd() {
+        let runner = TrainRunner::cpu();
+        let quad = CoreQuadF64 {
+            svf_g: [0.18, 0.25, 0.35, 0.45],
+            svf_k: [0.65, 0.85, 1.1, 1.4],
+            svf_k_nl: [0.9, 0.4, 0.2, 1.3],
+            tone_lp: [0.45, 0.25, -0.1, 0.15],
+            tone_bp: [0.22, 0.35, 0.18, -0.12],
+            tone_hp: [-0.15, 0.20, 0.28, -0.09],
+            tone_ap: [0.12, -0.08, 0.14, 0.06],
+            tone_dir: [0.18, 0.10, -0.06, 0.22],
+            lru_alpha_rel: [0.92; 4],
+            lru_alpha_atk: [0.32; 4],
+            lru_kappa: [0.22; 4],
+            lru_duhem_gamma: [0.18; 4],
+            lru_signed_mix: [0.35; 4],
+            lru_stereo_link: [0.15; 4],
+            rect_sign: [1.0, -1.0, 1.0, -1.0],
+            g0: [0.92; 4],
+            g_inf: [1.18; 4],
+            d_pre: [0.35; 4],
+            se_w_sq: [0.40; 4],
+            se_d_bus: [0.25; 4],
+            adaa_drive: [1.65; 4],
+            lru_bias_drive: [0.18; 4],
+            lin_mix: [0.10; 4],
+            wavefolder_mix: [0.25; 4],
+            glu_mix: [0.35; 4],
+            out_gain: [1.05; 4],
+            ..CoreQuadF64::default()
+        };
+        let n = 48_usize;
+        let mut core_in = vec![[0.0_f32; 4]; n * 2];
+        for t in 0..n {
+            let tf = t as f32;
+            core_in[t * 2] = [
+                0.45 * (0.13 * tf).sin(),
+                0.35 * (0.17 * tf).cos(),
+                0.3,
+                -0.25,
+            ];
+            core_in[t * 2 + 1] = [
+                -0.35 * (0.11 * tf).cos(),
+                0.4 * (0.19 * tf).sin(),
+                -0.2,
+                0.3,
+            ];
+        }
+        let dl_feat = vec![[0.14_f32, -0.09, 0.16, -0.11]; n * FEATURE_VEC4_STRIDE];
+
+        for &block_idx in &[0_u32, 1_u32] {
+            let eval_fn = |q: &CoreQuadF64| -> f64 {
+                let qp = pack_core_quad_params(&q.to_v4_kernel_params_for_block(block_idx));
+                let fwd = runner
+                    .fused_core_scan_256(&FusedCoreScanInput {
+                        uniforms: FusedScanUniforms {
+                            num_frames: n as u32,
+                            num_tiles: 1,
+                            num_quads: 1,
+                            num_stems: 1,
+                            tile_start: 0,
+                            soft_rect_eps: SOFT_RECT_EPS,
+                            tiny_crossing_eps: TINY_CROSSING_EPS,
+                            block_idx,
+                        },
+                        core_inputs: &core_in,
+                        quad_params: &qp,
+                        initial_checkpoints: None,
+                    })
+                    .unwrap();
+                fwd.feature_outputs
+                    .iter()
+                    .zip(dl_feat.iter())
+                    .map(|(a, b)| {
+                        (0..4)
+                            .map(|j| f64::from(a[j]) * f64::from(b[j]))
+                            .sum::<f64>()
+                    })
+                    .sum()
+            };
+            let qp = pack_core_quad_params(&quad.to_v4_kernel_params_for_block(block_idx));
+            let fwd = runner
+                .fused_core_scan_256(&FusedCoreScanInput {
+                    uniforms: FusedScanUniforms {
+                        num_frames: n as u32,
+                        num_tiles: 1,
+                        num_quads: 1,
+                        num_stems: 1,
+                        tile_start: 0,
+                        soft_rect_eps: SOFT_RECT_EPS,
+                        tiny_crossing_eps: TINY_CROSSING_EPS,
+                        block_idx,
+                    },
+                    core_inputs: &core_in,
+                    quad_params: &qp,
+                    initial_checkpoints: None,
+                })
+                .unwrap();
+            let adj = runner
+                .adjoint_scan_256(&AdjointScanInput {
+                    uniforms: AdjointScanUniforms {
+                        num_frames: n as u32,
+                        num_tiles: 1,
+                        num_quads: 1,
+                        num_stems: 1,
+                        pass_mode: 2,
+                        soft_rect_eps: SOFT_RECT_EPS,
+                        tiny_crossing_eps: TINY_CROSSING_EPS,
+                        block_idx,
+                    },
+                    core_inputs: &core_in,
+                    quad_params: &qp,
+                    tile_checkpoints: &fwd.tile_checkpoints,
+                    d_loss_d_features: &dl_feat,
+                    feature_outputs: &fwd.feature_outputs,
+                    exit_adj_boundary: None,
+                })
+                .unwrap();
+            let mut g_quad = Pass2CoreQuadGrads::default();
+            add_v4_tile_param_grads_to_quad(&quad, block_idx, &adj.param_grads, 0, &mut g_quad);
+
+            type QuadParamProbe<'a> = (&'a str, f64, fn(&mut CoreQuadF64, f64));
+            let eps = 2.0e-3_f64;
+            let checks: [QuadParamProbe<'_>; 12] = [
+                ("svf_k", g_quad.svf_k[0], |q, d| q.svf_k[0] += d),
+                ("tone_lp", g_quad.tone_lp[0], |q, d| q.tone_lp[0] += d),
+                ("tone_bp", g_quad.tone_bp[0], |q, d| q.tone_bp[0] += d),
+                ("tone_hp", g_quad.tone_hp[0], |q, d| q.tone_hp[0] += d),
+                ("tone_ap", g_quad.tone_ap[0], |q, d| q.tone_ap[0] += d),
+                ("tone_dir", g_quad.tone_dir[0], |q, d| q.tone_dir[0] += d),
+                ("g0", g_quad.g0[0], |q, d| q.g0[0] += d),
+                ("g_inf", g_quad.g_inf[0], |q, d| q.g_inf[0] += d),
+                ("d_pre", g_quad.d_pre[0], |q, d| q.d_pre[0] += d),
+                ("se_w_sq", g_quad.se_w_sq[0], |q, d| q.se_w_sq[0] += d),
+                ("lin_mix", g_quad.lin_mix[0], |q, d| q.lin_mix[0] += d),
+                ("out_gain", g_quad.out_gain[0], |q, d| q.out_gain[0] += d),
+            ];
+            for (name, got, setter) in checks {
+                let mut qp_p = quad;
+                let mut qp_m = quad;
+                setter(&mut qp_p, eps);
+                setter(&mut qp_m, -eps);
+                let fd = (eval_fn(&qp_p) - eval_fn(&qp_m)) / (2.0 * eps);
+                assert!(
+                    (got - fd).abs() <= 5.0e-3 * fd.abs().max(1.0),
+                    "block={block_idx} {name}: got={got} fd={fd}"
+                );
+            }
+        }
+    }
 }

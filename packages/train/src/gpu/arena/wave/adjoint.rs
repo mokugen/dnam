@@ -391,15 +391,18 @@ pub(in super::super) fn run_wave_core_adjoint(
                         );
                     }
                     if has_prev_chunk {
+                        const HALF_EXIT_ADJ_VEC4: usize = EXIT_ADJ_BOUNDARY_VEC4_STRIDE / 2;
                         for qw in 0..wave_count {
-                            let src_off = ((qw * EXIT_ADJ_BOUNDARY_VEC4_STRIDE + 8) * 16) as u64;
+                            let src_off = ((qw * EXIT_ADJ_BOUNDARY_VEC4_STRIDE
+                                + HALF_EXIT_ADJ_VEC4)
+                                * 16) as u64;
                             let dst_off = (qw * EXIT_ADJ_BOUNDARY_VEC4_STRIDE * 16) as u64;
                             encoder.copy_buffer_to_buffer(
                                 &b_adj_b,
                                 src_off,
                                 &b_exit_b,
                                 dst_off,
-                                8 * 16,
+                                (HALF_EXIT_ADJ_VEC4 * 16) as u64,
                             );
                         }
                     }

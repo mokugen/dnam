@@ -9,9 +9,7 @@ use dnam_kernels::{SOFT_RECT_EPS, TINY_CROSSING_EPS};
 use dnam_vm::SONA_CORE_QUAD_BLOCK_AND_LOCAL;
 
 use crate::error::TrainError;
-use crate::gpu::abi::{
-    CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE, TILE_FRAMES,
-};
+use crate::gpu::abi::{CORE_INPUT_VEC4_STRIDE, FEATURE_VEC4_STRIDE, TILE_FRAMES};
 use crate::runner::TrainRunner;
 use crate::runner::types::WaveCoreAdjointInput;
 
@@ -20,6 +18,7 @@ use super::super::model::cascade::{
     downsample_lane_2x_f64, pack_wave_quads_and_tiles, run_causal_core_cascade_with_crossbar,
     sanitize_unit_f64, upsample_lane_2x_adjoint_f64, upsample_stereo_2x_f64,
 };
+use super::super::model::v3_core_bridge::{V3_QUAD_PARAMS_VEC4_STRIDE, run_v3_wave_core_adjoint};
 use super::super::model::{NUM_FIR_TAPS_ULTRA, SonaModelF64};
 use super::adjoints::{eval_kautz_modal_channel_and_adjoint, eval_ro_pole_hp_and_adjoint};
 use super::causal_loop::{
@@ -340,7 +339,7 @@ pub(crate) struct Pass2AdjInput<'a> {
 }
 
 pub(crate) fn assemble_pass2_gradients(
-    runner: &TrainRunner,
+    _runner: &TrainRunner,
     inp: &Pass2AdjInput<'_>,
 ) -> Result<Pass2ParamGrads, TrainError> {
     let Pass2AdjInput {
@@ -543,7 +542,7 @@ pub(crate) fn assemble_pass2_gradients(
 
     let (quad_params, tile_descriptors) =
         pack_wave_quads_and_tiles(model, q_count, active_tiles_topo, rho_core);
-    let wave_adj = runner.run_wave_core_adjoint(&WaveCoreAdjointInput {
+    let wave_adj = run_v3_wave_core_adjoint(&WaveCoreAdjointInput {
         num_frames: n_core,
         num_quads: q_count,
         num_stems: 1,
@@ -572,7 +571,7 @@ pub(crate) fn assemble_pass2_gradients(
                 &model.core_quads[q],
                 block_idx,
                 &wave_adj.param_grads,
-                (q * num_tiles + tile) * QUAD_PARAMS_VEC4_STRIDE,
+                (q * num_tiles + tile) * V3_QUAD_PARAMS_VEC4_STRIDE,
                 &mut grads.core_quads[q],
             );
         }

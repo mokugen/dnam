@@ -522,8 +522,9 @@ pub fn run_wave_core_adjoint_cpu(
 #[cfg(test)]
 mod tests {
     use dnam_kernels::{
-        CoreQuadParamsStereo4, GpuVec4, KernelVec4, SOFT_RECT_EPS, SonaParaLruDuhemCoeffs4,
-        SonaToneWeights4, TINY_CROSSING_EPS, TptSvfCoeffs4, prewarp_tan_pi_f_over_fs_f32,
+        CoreQuadV4ParamsStereo4, GpuVec4, KernelVec4, SOFT_RECT_EPS, SonaParaLruDuhemCoeffs4,
+        SonaToneFolded3, SonaToneFoldedBlock0, SonaToneWeights4, TINY_CROSSING_EPS, TptSvfCoeffs4,
+        prewarp_tan_pi_f_over_fs_f32,
     };
 
     use super::*;
@@ -532,15 +533,22 @@ mod tests {
     fn test_quad_params(idx: usize) -> [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE] {
         let g = GpuVec4::splat(prewarp_tan_pi_f_over_fs_f32(0.05 + 0.015 * (idx as f32)));
         let k = GpuVec4::splat(0.75);
-        pack_core_quad_params(&CoreQuadParamsStereo4 {
+        let weights = SonaToneWeights4 {
+            lp: GpuVec4::splat(0.45),
+            bp: GpuVec4::splat(0.20),
+            hp: GpuVec4::splat(-0.08),
+            ap: GpuVec4::splat(0.04),
+            dir: GpuVec4::splat(0.25),
+        };
+        let is_block0 = matches!(idx, 0 | 4 | 8);
+        let tone = if is_block0 {
+            SonaToneFoldedBlock0::from_weights(&weights)
+        } else {
+            SonaToneFoldedBlock0::from_folded3(&SonaToneFolded3::from_weights(&weights, k))
+        };
+        pack_core_quad_params(&CoreQuadV4ParamsStereo4 {
             svf: TptSvfCoeffs4::from_gk(g, k),
-            tone: SonaToneWeights4 {
-                lp: GpuVec4::splat(0.45),
-                bp: GpuVec4::splat(0.20),
-                hp: GpuVec4::splat(-0.08),
-                ap: GpuVec4::splat(0.04),
-                dir: GpuVec4::splat(0.25),
-            },
+            tone,
             lru: SonaParaLruDuhemCoeffs4::from_clamped(
                 GpuVec4::splat(0.82),
                 GpuVec4::splat(0.32),
@@ -550,17 +558,19 @@ mod tests {
                 GpuVec4::splat(0.15),
             ),
             two_svf_g: g.add(g),
-            svf_k_nl: GpuVec4::splat(if matches!(idx, 0 | 4 | 6 | 8) {
-                0.2
-            } else {
-                0.0
-            }),
+            svf_k_nl: GpuVec4::splat(if is_block0 { 0.2 } else { 0.0 }),
             rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
-            sag_depth: GpuVec4::splat(0.18),
+            g0: GpuVec4::splat(0.95),
+            g_inf: GpuVec4::splat(1.15),
+            d_pre: GpuVec4::splat(0.18),
+            se_w_sq: GpuVec4::splat(0.35),
+            se_d_bus: GpuVec4::splat(0.22),
             adaa_drive: GpuVec4::splat(1.35),
             lru_bias_drive: GpuVec4::splat(0.08),
+            lin_mix: GpuVec4::splat(0.06),
             wavefolder_mix: GpuVec4::splat(0.22),
             glu_mix: GpuVec4::splat(0.30),
+            out_gain: GpuVec4::splat(1.05),
         })
     }
 

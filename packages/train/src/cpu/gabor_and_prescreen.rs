@@ -7,8 +7,8 @@ use core::f32::consts::FRAC_1_SQRT_2;
 use dnam_kernels::{
     GpuVec4, KernelVec4, MIN_SAG_GAIN, SonaParaLruDuhemCoeffs4, TptSvfCoeffs4,
     algebraic_unit_rotor_f32, apply_stereo_link_vec4_pair, canonicalize_zero_f32_bits,
-    const_f32_pow2, eval_poly_adaa1_odd_even_vec4, prewarp_tan_pi_f_over_fs_f32,
-    step_paralru_duhem_vec4, step_tpt_svf_vec4,
+    const_f32_pow2, eval_alg_adaa1_vec4, prewarp_tan_pi_f_over_fs_f32,
+    scrub_clamped_alg_endpoint_f32, step_paralru_duhem_v4_vec4, step_tpt_svf_vec4,
 };
 
 use crate::error::TrainError;
@@ -150,13 +150,13 @@ pub fn run_prescreen_population_cpu(input: &PrescreenInput<'_>) -> Result<Vec<f3
                             + sr.bp.to_array()[0] * qp.w_bp
                             + sr.hp.to_array()[0] * qp.w_hp
                             + in_r * qp.w_dir;
-                        let vl = step_paralru_duhem_vec4(
+                        let vl = step_paralru_duhem_v4_vec4(
                             GpuVec4::splat(qp.rect_sign * tone_l),
                             GpuVec4::splat(qp.two_svf_g * sl.bp.to_array()[0]),
                             &mut v_l,
                             &qp.lru,
                         );
-                        let vr = step_paralru_duhem_vec4(
+                        let vr = step_paralru_duhem_v4_vec4(
                             GpuVec4::splat(qp.rect_sign * tone_r),
                             GpuVec4::splat(qp.two_svf_g * sr.bp.to_array()[0]),
                             &mut v_r,
@@ -165,14 +165,14 @@ pub fn run_prescreen_population_cpu(input: &PrescreenInput<'_>) -> Result<Vec<f3
                         let (vel, ver) = apply_stereo_link_vec4_pair(vl, vr, qp.lru.stereo_link);
                         let sag_l = (1.0 - qp.sag_depth * vel.to_array()[0]).max(MIN_SAG_GAIN);
                         let sag_r = (1.0 - qp.sag_depth * ver.to_array()[0]).max(MIN_SAG_GAIN);
-                        let r_l = GpuVec4::splat(
+                        let r_l = GpuVec4::splat(scrub_clamped_alg_endpoint_f32(
                             tone_l * qp.adaa_drive * sag_l + qp.lru_bias_drive * vel.to_array()[0],
-                        );
-                        let r_r = GpuVec4::splat(
+                        ));
+                        let r_r = GpuVec4::splat(scrub_clamped_alg_endpoint_f32(
                             tone_r * qp.adaa_drive * sag_r + qp.lru_bias_drive * ver.to_array()[0],
-                        );
-                        let (ol, _, _) = eval_poly_adaa1_odd_even_vec4(rp_l, r_l);
-                        let (or, _, _) = eval_poly_adaa1_odd_even_vec4(rp_r, r_r);
+                        ));
+                        let (ol, _, _) = eval_alg_adaa1_vec4(rp_l, r_l);
+                        let (or, _, _) = eval_alg_adaa1_vec4(rp_r, r_r);
                         rp_l = r_l;
                         rp_r = r_r;
                         pred[lt][0] += ol.to_array()[0];

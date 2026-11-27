@@ -6,11 +6,14 @@ use dnam_kernels::{SOFT_RECT_EPS, TINY_CROSSING_EPS};
 use dnam_vm::{SONA_CORE_QUAD_BLOCK_AND_LOCAL, SONA_INTERBLOCK_TILES};
 
 use crate::error::TrainError;
-use crate::gpu::abi::{CORE_INPUT_VEC4_STRIDE, QUAD_PARAMS_VEC4_STRIDE, TILE_DESC_VEC4_STRIDE};
+use crate::gpu::abi::{CORE_INPUT_VEC4_STRIDE, TILE_DESC_VEC4_STRIDE};
+use crate::runner::TrainRunner;
 use crate::runner::types::{WaveCoreCascadeInput, pack_tile_descriptor};
-use crate::runner::{TrainRunner, pack_core_quad_params};
 
 use super::SonaModelF64;
+use super::v3_core_bridge::{
+    V3_QUAD_PARAMS_VEC4_STRIDE, pack_v3_core_quad_params, run_v3_wave_core_cascade,
+};
 
 /// Output returned by [`run_causal_core_cascade_stereo`].
 #[derive(Clone, Debug)]
@@ -172,11 +175,11 @@ pub(crate) fn pack_wave_quads_and_tiles(
     active_tiles: usize,
     rho_core: f64,
 ) -> (Vec<[f32; 4]>, Vec<[f32; 4]>) {
-    let mut quad_params = Vec::with_capacity(q_count * QUAD_PARAMS_VEC4_STRIDE);
+    let mut quad_params = Vec::with_capacity(q_count * V3_QUAD_PARAMS_VEC4_STRIDE);
     for q in 0..q_count {
         let block_idx = SONA_CORE_QUAD_BLOCK_AND_LOCAL[q].0 as u32;
         let quad = model.core_quads[q].rescaled_for_rho(rho_core);
-        quad_params.extend_from_slice(&pack_core_quad_params(
+        quad_params.extend_from_slice(&pack_v3_core_quad_params(
             &quad.to_kernel_params_for_block(block_idx),
         ));
     }
@@ -280,7 +283,8 @@ pub(crate) fn run_causal_core_cascade_with_crossbar(
 
     let (quad_params, tile_descriptors) =
         pack_wave_quads_and_tiles(model, q_count, active_tiles, rho_core);
-    let wave = runner.run_wave_core_cascade(&WaveCoreCascadeInput {
+    let _ = runner;
+    let wave = run_v3_wave_core_cascade(&WaveCoreCascadeInput {
         num_frames: n,
         num_quads: q_count,
         num_stems: 1,

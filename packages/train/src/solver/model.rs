@@ -6,6 +6,7 @@ pub(crate) mod cascade;
 mod clamp_and_quant;
 mod quads;
 pub mod stage_latent;
+pub(crate) mod v3_core_bridge;
 
 pub use clamp_and_quant::{snap_model_fp16, snap_non_readout_fp16};
 pub use quads::{
@@ -15,7 +16,7 @@ pub use quads::{
 };
 pub use stage_latent::SonaStageLatentModsF64;
 
-use dnam_vm::SONA_CORE_QUAD_BLOCK_AND_LOCAL;
+use dnam_kernels::SONA_V4_CORE_QUAD_BLOCK_AND_LOCAL;
 
 use crate::control::clamp::{Phase1ClampOutput, StageStabilityConstraint};
 use crate::control::cp1::Cp1WireBundle;
@@ -217,9 +218,9 @@ impl SonaModelF64 {
         }
         let mut flat = Vec::with_capacity(num_quads * QUAD_PARAMS_VEC4_STRIDE);
         for (q_idx, q) in self.core_quads[..num_quads].iter().enumerate() {
-            let block_idx = SONA_CORE_QUAD_BLOCK_AND_LOCAL[q_idx].0 as u32;
+            let block_idx = SONA_V4_CORE_QUAD_BLOCK_AND_LOCAL[q_idx].0 as u32;
             flat.extend_from_slice(&pack_core_quad_params(
-                &q.to_kernel_params_for_block(block_idx),
+                &q.to_v4_kernel_params_for_block(block_idx),
             ));
         }
         Ok(flat)

@@ -5,8 +5,9 @@
 //! `verify[train.pipeline.isomorphism-parity]`).
 
 use dnam_kernels::{
-    CoreQuadParamsStereo4, GpuVec4, KernelVec4, SOFT_RECT_EPS, SonaParaLruDuhemCoeffs4,
-    SonaToneWeights4, TINY_CROSSING_EPS, TptSvfCoeffs4, prewarp_tan_pi_f_over_fs_f32,
+    CoreQuadV4ParamsStereo4, GpuVec4, KernelVec4, SOFT_RECT_EPS, SonaParaLruDuhemCoeffs4,
+    SonaToneFoldedBlock0, SonaToneWeights4, TINY_CROSSING_EPS, TptSvfCoeffs4,
+    prewarp_tan_pi_f_over_fs_f32,
 };
 use dnam_train::{
     ActiveComputeBackend, AdjointScanInput, BROWSER_WEBGPU_BUDGET_BYTES, CPU_WASM_BUDGET_BYTES,
@@ -32,15 +33,15 @@ fn sample_quad_params(stem: usize, quad: usize) -> [[f32; 4]; QUAD_PARAMS_VEC4_S
     let fc = [0.03 + 0.01 * f, 0.08 + 0.01 * f, 0.17 + 0.01 * f, 0.29];
     let g = GpuVec4::from_array(fc.map(prewarp_tan_pi_f_over_fs_f32));
     let k = GpuVec4::from_array([0.6 + 0.05 * f, 0.85, 1.15, 1.45]);
-    let p = CoreQuadParamsStereo4 {
+    let p = CoreQuadV4ParamsStereo4 {
         svf: TptSvfCoeffs4::from_gk(g, k),
-        tone: SonaToneWeights4 {
+        tone: SonaToneFoldedBlock0::from_weights(&SonaToneWeights4 {
             lp: GpuVec4::from_array([0.42, 0.22, -0.14, 0.12]),
             bp: GpuVec4::from_array([0.24, 0.38, 0.28, -0.18]),
             hp: GpuVec4::from_array([-0.14, 0.16, 0.32, 0.42]),
             ap: GpuVec4::from_array([0.11, -0.09, 0.14, 0.08]),
             dir: GpuVec4::from_array([0.19, 0.14, -0.08, 0.24]),
-        },
+        }),
         lru: SonaParaLruDuhemCoeffs4::from_clamped(
             GpuVec4::from_array([0.91, 0.85, 0.77, 0.67]),
             GpuVec4::from_array([0.26, 0.41, 0.56, 0.72]),
@@ -52,11 +53,17 @@ fn sample_quad_params(stem: usize, quad: usize) -> [[f32; 4]; QUAD_PARAMS_VEC4_S
         two_svf_g: g.add(g),
         svf_k_nl: GpuVec4::zero(),
         rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
-        sag_depth: GpuVec4::from_array([0.17, 0.31, 0.42, 0.20]),
+        g0: GpuVec4::from_array([0.90, 1.05, 0.85, 1.15]),
+        g_inf: GpuVec4::from_array([1.20, 0.85, 1.10, 0.95]),
+        d_pre: GpuVec4::from_array([0.17, 0.31, 0.42, 0.20]),
+        se_w_sq: GpuVec4::from_array([0.40, 0.25, 0.55, 0.15]),
+        se_d_bus: GpuVec4::from_array([0.30, 0.20, 0.40, 0.15]),
         adaa_drive: GpuVec4::from_array([1.15, 1.60, 2.05, 1.32]),
         lru_bias_drive: GpuVec4::from_array([0.14, -0.21, 0.28, -0.16]),
+        lin_mix: GpuVec4::from_array([0.05, 0.12, 0.08, 0.15]),
         wavefolder_mix: GpuVec4::from_array([0.15, 0.35, 0.65, 0.90]),
         glu_mix: GpuVec4::from_array([0.60, -0.42, 0.74, -0.48]),
+        out_gain: GpuVec4::from_array([1.0, 0.95, 1.05, 0.90]),
     };
     pack_core_quad_params(&p)
 }

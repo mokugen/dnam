@@ -83,6 +83,23 @@ fn clamp_core_quad_f64(q: &mut CoreQuadF64, is_block0: bool) {
         q.lru_bias_drive[l] = sanitize_clamp(q.lru_bias_drive[l], -16.0, 16.0, 0.0);
         q.wavefolder_mix[l] = sanitize_clamp(q.wavefolder_mix[l], 0.0, 1.0, 0.0);
         q.glu_mix[l] = sanitize_clamp(q.glu_mix[l], -4.0, 4.0, 0.0);
+        q.g0[l] = sanitize_clamp(q.g0[l], 0.0, f64::from(dnam_kernels::MAX_G_PRE_GAIN), 1.0);
+        q.g_inf[l] = sanitize_clamp(
+            q.g_inf[l],
+            0.0,
+            f64::from(dnam_kernels::MAX_G_PRE_GAIN),
+            1.0,
+        );
+        q.d_pre[l] = sanitize_clamp(q.d_pre[l], 0.0, 1.0e12, 0.0);
+        q.se_w_sq[l] = sanitize_clamp(q.se_w_sq[l], 0.0, 1.0e6, 0.0);
+        q.se_d_bus[l] = sanitize_clamp(q.se_d_bus[l], 0.0, 1.0e12, 0.0);
+        q.lin_mix[l] = sanitize_clamp(q.lin_mix[l], 0.0, 1.0, 0.0);
+        q.out_gain[l] = sanitize_clamp(
+            q.out_gain[l],
+            -f64::from(dnam_kernels::MAX_OUT_GAIN),
+            f64::from(dnam_kernels::MAX_OUT_GAIN),
+            1.0,
+        );
         q.in_mid_weight[l] = sanitize_clamp(q.in_mid_weight[l], -16.0, 16.0, 0.0);
         q.in_side_weight[l] = sanitize_clamp(q.in_side_weight[l], -16.0, 16.0, 0.0);
     }
@@ -312,6 +329,18 @@ pub fn snap_non_readout_fp16(model: &mut SonaModelF64) {
             q.lru_duhem_gamma[l] = snap_fp16(q.lru_duhem_gamma[l], 0.0, duh_hi, 0.0);
             q.lru_signed_mix[l] = snap_fp16(q.lru_signed_mix[l], 0.0, 1.0, 0.0);
             q.glu_mix[l] = snap_fp16(q.glu_mix[l], -4.0, 4.0, 0.0);
+            q.g0[l] = snap_fp16(q.g0[l], 0.0, dnam_kernels::MAX_G_PRE_GAIN, 1.0);
+            q.g_inf[l] = snap_fp16(q.g_inf[l], 0.0, dnam_kernels::MAX_G_PRE_GAIN, 1.0);
+            q.d_pre[l] = snap_fp16(q.d_pre[l], 0.0, 65_504.0, 0.0);
+            q.se_w_sq[l] = snap_fp16(q.se_w_sq[l], 0.0, 65_504.0, 0.0);
+            q.se_d_bus[l] = snap_fp16(q.se_d_bus[l], 0.0, 65_504.0, 0.0);
+            q.lin_mix[l] = snap_fp16(q.lin_mix[l], 0.0, 1.0, 0.0);
+            q.out_gain[l] = snap_fp16(
+                q.out_gain[l],
+                -dnam_kernels::MAX_OUT_GAIN,
+                dnam_kernels::MAX_OUT_GAIN,
+                1.0,
+            );
 
             let wf = if q.wavefolder_mix[l].is_finite() {
                 (q.wavefolder_mix[l] as f32).clamp(0.0, 1.0)

@@ -2,8 +2,9 @@
 //! Shared test fixtures and validation-guard helpers for `tests/cpu_wgpu_parity.rs`.
 
 use dnam_kernels::{
-    CoreQuadParamsStereo4, GpuVec4, KernelVec4, SOFT_RECT_EPS, SonaParaLruDuhemCoeffs4,
-    SonaToneWeights4, TINY_CROSSING_EPS, TptSvfCoeffs4, prewarp_tan_pi_f_over_fs_f32,
+    CoreQuadV4ParamsStereo4, GpuVec4, KernelVec4, SOFT_RECT_EPS, SONA_V4_CORE_QUAD_BLOCK_AND_LOCAL,
+    SONA_V4_INTERBLOCK_TILES, SonaParaLruDuhemCoeffs4, SonaToneFoldedBlock0, SonaToneWeights4,
+    TINY_CROSSING_EPS, TptSvfCoeffs4, prewarp_tan_pi_f_over_fs_f32,
 };
 use dnam_train::{
     ActiveComputeBackend, AdjointScanInput, CoreScanWorkload, ExecutionMode, FusedCoreScanInput,
@@ -17,7 +18,6 @@ use dnam_train::{
     },
     pack_core_quad_params, pack_tile_descriptor, plan_core_scan_execution,
 };
-use dnam_vm::{SONA_CORE_QUAD_BLOCK_AND_LOCAL, SONA_INTERBLOCK_TILES};
 
 pub(crate) fn build_quad(
     stem: usize,
@@ -37,15 +37,16 @@ pub(crate) fn build_quad_with_k_nl(
     let fc = [0.02 + 0.015 * f, 0.07 + 0.012 * f, 0.16 + 0.01 * f, 0.28];
     let g = GpuVec4::from_array(fc.map(prewarp_tan_pi_f_over_fs_f32));
     let k = GpuVec4::from_array([0.55 + 0.05 * f, 0.85, 1.15, 1.45]);
-    let p = CoreQuadParamsStereo4 {
+    let tone_w = SonaToneWeights4 {
+        lp: GpuVec4::from_array([0.45, 0.20, -0.15, 0.10]),
+        bp: GpuVec4::from_array([0.25, 0.40, 0.30, -0.20]),
+        hp: GpuVec4::from_array([-0.15, 0.15, 0.35, 0.45]),
+        ap: GpuVec4::from_array([0.10, -0.10, 0.15, 0.10]),
+        dir: GpuVec4::from_array([0.20, 0.15, -0.10, 0.25]),
+    };
+    let p = CoreQuadV4ParamsStereo4 {
         svf: TptSvfCoeffs4::from_gk(g, k),
-        tone: SonaToneWeights4 {
-            lp: GpuVec4::from_array([0.45, 0.20, -0.15, 0.10]),
-            bp: GpuVec4::from_array([0.25, 0.40, 0.30, -0.20]),
-            hp: GpuVec4::from_array([-0.15, 0.15, 0.35, 0.45]),
-            ap: GpuVec4::from_array([0.10, -0.10, 0.15, 0.10]),
-            dir: GpuVec4::from_array([0.20, 0.15, -0.10, 0.25]),
-        },
+        tone: SonaToneFoldedBlock0::from_weights(&tone_w),
         lru: SonaParaLruDuhemCoeffs4::from_clamped(
             GpuVec4::from_array([0.92, 0.86, 0.78, 0.68]),
             GpuVec4::from_array([0.25, 0.40, 0.55, 0.75]),
@@ -57,11 +58,17 @@ pub(crate) fn build_quad_with_k_nl(
         two_svf_g: g.add(g),
         svf_k_nl: GpuVec4::from_array(k_nl),
         rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
-        sag_depth: GpuVec4::from_array([0.18, 0.32, 0.45, 0.22]),
+        g0: GpuVec4::from_array([0.92, 1.08, 0.88, 1.15]),
+        g_inf: GpuVec4::from_array([1.22, 0.88, 1.12, 0.94]),
+        d_pre: GpuVec4::from_array([0.18, 0.32, 0.45, 0.22]),
+        se_w_sq: GpuVec4::from_array([0.45, 0.25, 0.55, 0.20]),
+        se_d_bus: GpuVec4::from_array([0.35, 0.22, 0.42, 0.18]),
         adaa_drive: GpuVec4::from_array([1.15, 1.65, 2.10, 1.35]),
         lru_bias_drive: GpuVec4::from_array([0.15, -0.22, 0.30, -0.18]),
+        lin_mix: GpuVec4::from_array([0.05, 0.12, 0.08, 0.15]),
         wavefolder_mix: GpuVec4::from_array([0.05, 0.35, 0.70, 0.95]),
         glu_mix: GpuVec4::from_array([0.65, -0.45, 0.80, -0.55]),
+        out_gain: GpuVec4::from_array([1.0, 0.95, 1.05, 0.90]),
     };
     let mut packed = pack_core_quad_params(&p);
     if zero_g {
@@ -368,9 +375,9 @@ pub(crate) fn verify_auto_detect_and_wgpu_validation_guards(
 
 pub(crate) fn build_wave_descriptors(active_tiles: usize, gain: f32) -> Vec<[f32; 4]> {
     let mut out = Vec::with_capacity(active_tiles * TILE_DESC_VEC4_STRIDE);
-    for (tile_idx, &(src_q, dst_q)) in SONA_INTERBLOCK_TILES[..active_tiles].iter().enumerate() {
-        let s_blk = SONA_CORE_QUAD_BLOCK_AND_LOCAL[src_q].0 as u32;
-        let d_blk = SONA_CORE_QUAD_BLOCK_AND_LOCAL[dst_q].0 as u32;
+    for (tile_idx, &(src_q, dst_q)) in SONA_V4_INTERBLOCK_TILES[..active_tiles].iter().enumerate() {
+        let s_blk = SONA_V4_CORE_QUAD_BLOCK_AND_LOCAL[src_q].0 as u32;
+        let d_blk = SONA_V4_CORE_QUAD_BLOCK_AND_LOCAL[dst_q].0 as u32;
         let mut wo = [[0.0_f32; 4]; 4];
         let mut we = [[0.0_f32; 4]; 4];
         let mut wl = [[0.0_f32; 4]; 4];

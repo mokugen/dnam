@@ -517,7 +517,7 @@ fn test_wgpu_inner_opt_multi_candidate_adamw_lssb_ste_fp16_and_streamed_seams() 
         let gpu_res = run_adj_slice(0, num_frames, None);
         let c1 = run_adj_slice(TILE_FRAMES, num_frames, None);
         let mut seed_c0 = vec![[0.0_f32; 4]; EXIT_ADJ_BOUNDARY_VEC4_STRIDE];
-        seed_c0[0..8].copy_from_slice(&c1.entry_adj_boundary[8..16]);
+        seed_c0[0..12].copy_from_slice(&c1.entry_adj_boundary[12..24]);
         let c0 = run_adj_slice(0, TILE_FRAMES, Some(&seed_c0));
         let du_streamed: Vec<[f32; 4]> = c0
             .d_loss_d_inputs
@@ -633,11 +633,11 @@ fn test_wgpu_ultra_wave_cascade_adjoint_resident_streamed_and_arena_reuse() {
     }
     let cpu = CpuRunner::detect();
     let num_quads = 10_usize;
-    let active_tiles = 35_usize;
+    let active_tiles = 37_usize;
     let mut quad_params = Vec::with_capacity(num_quads * QUAD_PARAMS_VEC4_STRIDE);
     for q in 0..num_quads {
         let mut qp = build_quad(0, q, false);
-        if matches!(q, 0 | 4 | 6 | 8) {
+        if matches!(q, 0 | 4 | 8) {
             qp[quad_param_slots::SVF_K_NL] = [0.15 + 0.05 * (q as f32); 4];
         }
         quad_params.extend_from_slice(&qp);

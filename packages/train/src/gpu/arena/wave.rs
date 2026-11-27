@@ -517,7 +517,7 @@ mod tests {
                 num_stems: 16,
                 num_quads: 10,
                 chunk_frames: 7_000,
-                active_tiles: 35,
+                active_tiles: 37,
                 write_checkpoints: true,
                 has_prev: false,
                 has_next: false,
@@ -530,7 +530,7 @@ mod tests {
                 num_stems: 1,
                 num_quads: 10,
                 chunk_frames: 7_000,
-                active_tiles: 35,
+                active_tiles: 37,
                 write_checkpoints: true,
                 has_prev: false,
                 has_next: false,
@@ -542,7 +542,7 @@ mod tests {
             16,
             10,
             7_000,
-            35,
+            37,
             browser_cap,
             browser_total,
         ));
@@ -551,7 +551,7 @@ mod tests {
             1,
             10,
             7_000,
-            35,
+            37,
             browser_cap,
             browser_total,
         ));
@@ -688,8 +688,13 @@ mod tests {
                 tile_descriptors: &[],
             })
             .unwrap();
-        let expected_slot7 =
-            (4 * (EXIT_ADJ_BOUNDARY_VEC4_STRIDE + TILE_ADJ_BOUNDARY_VEC4_STRIDE) * 16) as u64;
+        let max_wave_quads = (0..4_usize)
+            .map(|b| block_quad_count(b, 10))
+            .max()
+            .unwrap_or(0);
+        let expected_slot7 = (max_wave_quads
+            * (EXIT_ADJ_BOUNDARY_VEC4_STRIDE + TILE_ADJ_BOUNDARY_VEC4_STRIDE)
+            * 16) as u64;
         assert_eq!(
             q10_arena.lock_state().tile_adj_boundaries.size(),
             expected_slot7

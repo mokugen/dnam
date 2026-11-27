@@ -2,7 +2,7 @@
 //! [`crate::cpu::CpuRunner`] and `WgpuRunner` (`ref[train.pipeline.webgpu-scans-and-ozaki]`).
 
 use dnam_kernels::{
-    CoreQuadParamsStereo4, GpuVec4, KernelVec4, SonaParaLruDuhemCoeffs4, SonaToneWeights4,
+    CoreQuadV4ParamsStereo4, GpuVec4, KernelVec4, SonaParaLruDuhemCoeffs4, SonaToneFoldedBlock0,
     TptSvfCoeffs4,
 };
 
@@ -13,11 +13,11 @@ use crate::gpu::abi::{
     TileMixUniforms, quad_param_slots,
 };
 
-/// Packs a [`CoreQuadParamsStereo4`] into the canonical `25 × [f32; 4]` GPU/CPU uniform-stride block
-/// (including `SVF_G = two_svf_g * 0.5` and `SVF_K_NL`).
+/// Packs a [`CoreQuadV4ParamsStereo4`] into the canonical `28 × [f32; 4]` GPU/CPU uniform-stride
+/// block (`SVF_G = two_svf_g * 0.5`; `two_k` and `two_svf_g` are derived on unpack).
 #[must_use]
 pub fn pack_core_quad_params(
-    params: &CoreQuadParamsStereo4<GpuVec4>,
+    params: &CoreQuadV4ParamsStereo4<GpuVec4>,
 ) -> [[f32; 4]; QUAD_PARAMS_VEC4_STRIDE] {
     let g = params.two_svf_g.mul(GpuVec4::splat(0.5));
     let mut out = [[0.0_f32; 4]; QUAD_PARAMS_VEC4_STRIDE];
@@ -25,34 +25,37 @@ pub fn pack_core_quad_params(
     out[quad_param_slots::SVF_A2] = params.svf.a2.to_array();
     out[quad_param_slots::SVF_A3] = params.svf.a3.to_array();
     out[quad_param_slots::SVF_K] = params.svf.k.to_array();
-    out[quad_param_slots::SVF_TWO_K] = params.svf.two_k.to_array();
-    out[quad_param_slots::TONE_LP] = params.tone.lp.to_array();
-    out[quad_param_slots::TONE_BP] = params.tone.bp.to_array();
-    out[quad_param_slots::TONE_HP] = params.tone.hp.to_array();
-    out[quad_param_slots::TONE_AP] = params.tone.ap.to_array();
-    out[quad_param_slots::TONE_DIR] = params.tone.dir.to_array();
+    out[quad_param_slots::TONE_C_LP] = params.tone.c_lp.to_array();
+    out[quad_param_slots::TONE_C_BP] = params.tone.c_bp.to_array();
+    out[quad_param_slots::TONE_C_KBP] = params.tone.c_kbp.to_array();
+    out[quad_param_slots::TONE_C_U] = params.tone.c_u.to_array();
     out[quad_param_slots::LRU_ALPHA_REL] = params.lru.alpha_rel.to_array();
     out[quad_param_slots::LRU_ALPHA_ATK] = params.lru.alpha_atk.to_array();
     out[quad_param_slots::LRU_KAPPA] = params.lru.kappa.to_array();
     out[quad_param_slots::LRU_GAMMA_DUHEM] = params.lru.gamma_duhem.to_array();
     out[quad_param_slots::LRU_SIGNED_MIX] = params.lru.signed_mix.to_array();
     out[quad_param_slots::LRU_STEREO_LINK] = params.lru.stereo_link.to_array();
-    out[quad_param_slots::TWO_SVF_G] = params.two_svf_g.to_array();
-    out[quad_param_slots::RECT_SIGN] = params.rect_sign.to_array();
-    out[quad_param_slots::SAG_DEPTH] = params.sag_depth.to_array();
-    out[quad_param_slots::ADAA_DRIVE] = params.adaa_drive.to_array();
-    out[quad_param_slots::LRU_BIAS_DRIVE] = params.lru_bias_drive.to_array();
-    out[quad_param_slots::WAVEFOLDER_MIX] = params.wavefolder_mix.to_array();
-    out[quad_param_slots::GLU_MIX] = params.glu_mix.to_array();
     out[quad_param_slots::SVF_G] = g.to_array();
     out[quad_param_slots::SVF_K_NL] = params.svf_k_nl.to_array();
+    out[quad_param_slots::RECT_SIGN] = params.rect_sign.to_array();
+    out[quad_param_slots::G0] = params.g0.to_array();
+    out[quad_param_slots::G_INF] = params.g_inf.to_array();
+    out[quad_param_slots::D_PRE] = params.d_pre.to_array();
+    out[quad_param_slots::SE_W_SQ] = params.se_w_sq.to_array();
+    out[quad_param_slots::SE_D_BUS] = params.se_d_bus.to_array();
+    out[quad_param_slots::ADAA_DRIVE] = params.adaa_drive.to_array();
+    out[quad_param_slots::LRU_BIAS_DRIVE] = params.lru_bias_drive.to_array();
+    out[quad_param_slots::LIN_MIX] = params.lin_mix.to_array();
+    out[quad_param_slots::WAVEFOLDER_MIX] = params.wavefolder_mix.to_array();
+    out[quad_param_slots::GLU_MIX] = params.glu_mix.to_array();
+    out[quad_param_slots::OUT_GAIN] = params.out_gain.to_array();
     out
 }
 
-/// Unpacks one `25 × [f32; 4]` quad parameter slice back into [`CoreQuadParamsStereo4<GpuVec4>`].
+/// Unpacks one `28 × [f32; 4]` quad parameter slice back into [`CoreQuadV4ParamsStereo4<GpuVec4>`].
 pub fn unpack_core_quad_params(
     packed: &[[f32; 4]],
-) -> Result<CoreQuadParamsStereo4<GpuVec4>, TrainError> {
+) -> Result<CoreQuadV4ParamsStereo4<GpuVec4>, TrainError> {
     if packed.len() < QUAD_PARAMS_VEC4_STRIDE {
         return Err(TrainError::InvalidDimensions {
             context: "unpack_core_quad_params",
@@ -60,19 +63,19 @@ pub fn unpack_core_quad_params(
             actual: packed.len(),
         });
     }
+    let k = GpuVec4::from_array(packed[quad_param_slots::SVF_K]);
     let svf = TptSvfCoeffs4 {
         a1: GpuVec4::from_array(packed[quad_param_slots::SVF_A1]),
         a2: GpuVec4::from_array(packed[quad_param_slots::SVF_A2]),
         a3: GpuVec4::from_array(packed[quad_param_slots::SVF_A3]),
-        k: GpuVec4::from_array(packed[quad_param_slots::SVF_K]),
-        two_k: GpuVec4::from_array(packed[quad_param_slots::SVF_TWO_K]),
+        k,
+        two_k: k.add(k),
     };
-    let tone = SonaToneWeights4 {
-        lp: GpuVec4::from_array(packed[quad_param_slots::TONE_LP]),
-        bp: GpuVec4::from_array(packed[quad_param_slots::TONE_BP]),
-        hp: GpuVec4::from_array(packed[quad_param_slots::TONE_HP]),
-        ap: GpuVec4::from_array(packed[quad_param_slots::TONE_AP]),
-        dir: GpuVec4::from_array(packed[quad_param_slots::TONE_DIR]),
+    let tone = SonaToneFoldedBlock0 {
+        c_lp: GpuVec4::from_array(packed[quad_param_slots::TONE_C_LP]),
+        c_bp: GpuVec4::from_array(packed[quad_param_slots::TONE_C_BP]),
+        c_kbp: GpuVec4::from_array(packed[quad_param_slots::TONE_C_KBP]),
+        c_u: GpuVec4::from_array(packed[quad_param_slots::TONE_C_U]),
     };
     let lru = SonaParaLruDuhemCoeffs4::from_clamped(
         GpuVec4::from_array(packed[quad_param_slots::LRU_ALPHA_REL]),
@@ -82,18 +85,25 @@ pub fn unpack_core_quad_params(
         GpuVec4::from_array(packed[quad_param_slots::LRU_SIGNED_MIX]),
         GpuVec4::from_array(packed[quad_param_slots::LRU_STEREO_LINK]),
     );
-    Ok(CoreQuadParamsStereo4 {
+    let svf_g = GpuVec4::from_array(packed[quad_param_slots::SVF_G]);
+    Ok(CoreQuadV4ParamsStereo4 {
         svf,
         tone,
         lru,
-        two_svf_g: GpuVec4::from_array(packed[quad_param_slots::TWO_SVF_G]),
+        two_svf_g: svf_g.add(svf_g),
         svf_k_nl: GpuVec4::from_array(packed[quad_param_slots::SVF_K_NL]),
         rect_sign: GpuVec4::from_array(packed[quad_param_slots::RECT_SIGN]),
-        sag_depth: GpuVec4::from_array(packed[quad_param_slots::SAG_DEPTH]),
+        g0: GpuVec4::from_array(packed[quad_param_slots::G0]),
+        g_inf: GpuVec4::from_array(packed[quad_param_slots::G_INF]),
+        d_pre: GpuVec4::from_array(packed[quad_param_slots::D_PRE]),
+        se_w_sq: GpuVec4::from_array(packed[quad_param_slots::SE_W_SQ]),
+        se_d_bus: GpuVec4::from_array(packed[quad_param_slots::SE_D_BUS]),
         adaa_drive: GpuVec4::from_array(packed[quad_param_slots::ADAA_DRIVE]),
         lru_bias_drive: GpuVec4::from_array(packed[quad_param_slots::LRU_BIAS_DRIVE]),
+        lin_mix: GpuVec4::from_array(packed[quad_param_slots::LIN_MIX]),
         wavefolder_mix: GpuVec4::from_array(packed[quad_param_slots::WAVEFOLDER_MIX]),
         glu_mix: GpuVec4::from_array(packed[quad_param_slots::GLU_MIX]),
+        out_gain: GpuVec4::from_array(packed[quad_param_slots::OUT_GAIN]),
     })
 }
 
@@ -322,7 +332,7 @@ pub struct WaveCoreCascadeInput<'a> {
     pub num_quads: usize,
     /// Stem count.
     pub num_stems: usize,
-    /// Active `SONA_INTERBLOCK_TILES` count (`3`, `13`, `23`, or `35`).
+    /// Active `SONA_INTERBLOCK_TILES` count (`5`, `13`, `24`, or `37`).
     pub active_tiles: usize,
     /// Whether to return `tile_checkpoints` (`true` for training backward pass).
     pub write_checkpoints: bool,
@@ -330,11 +340,11 @@ pub struct WaveCoreCascadeInput<'a> {
     pub fixed_point_scan: bool,
     /// Soft rectifier smoothing epsilon (`SOFT_RECT_EPS`).
     pub soft_rect_eps: f32,
-    /// `PolyADAA1` tiny crossing distance threshold (`TINY_CROSSING_EPS`).
+    /// `AlgADAA1` tiny crossing distance threshold (`TINY_CROSSING_EPS`).
     pub tiny_crossing_eps: f32,
     /// Base per-quad stereo inputs (`num_stems * num_quads * num_frames * 2`) before inter-block mixing.
     pub base_core_inputs: &'a [[f32; 4]],
-    /// Packed `25 × Vec4` parameters (`num_stems * num_quads * 25`).
+    /// Packed `28 × Vec4` parameters (`num_stems * num_quads * 28`).
     pub quad_params: &'a [[f32; 4]],
     /// Packed `13 × Vec4` inter-block tile descriptors (`active_tiles * 13`).
     pub tile_descriptors: &'a [[f32; 4]],
@@ -345,7 +355,7 @@ pub struct WaveCoreCascadeInput<'a> {
 pub struct WaveCoreCascadeOutput {
     /// Post-`tile_mix` core inputs (`num_stems * num_quads * num_frames * 2`).
     pub core_inputs: Vec<[f32; 4]>,
-    /// Tile boundary checkpoints (`num_stems * num_quads * num_tiles * 8` when `write_checkpoints`).
+    /// Tile boundary checkpoints (`num_stems * num_quads * num_tiles * 12` when `write_checkpoints`).
     pub tile_checkpoints: Vec<[f32; 4]>,
     /// Core feature outputs (`num_stems * num_quads * num_frames * 6`).
     pub feature_outputs: Vec<[f32; 4]>,
@@ -360,17 +370,17 @@ pub struct WaveCoreAdjointInput<'a> {
     pub num_quads: usize,
     /// Stem count.
     pub num_stems: usize,
-    /// Active `SONA_INTERBLOCK_TILES` count (`3`, `13`, `23`, or `35`).
+    /// Active `SONA_INTERBLOCK_TILES` count (`5`, `13`, `24`, or `37`).
     pub active_tiles: usize,
     /// Soft rectifier smoothing epsilon (`SOFT_RECT_EPS`).
     pub soft_rect_eps: f32,
-    /// `PolyADAA1` tiny crossing distance threshold (`TINY_CROSSING_EPS`).
+    /// `AlgADAA1` tiny crossing distance threshold (`TINY_CROSSING_EPS`).
     pub tiny_crossing_eps: f32,
     /// Post-`tile_mix` forward `core_inputs` (`num_stems * num_quads * num_frames * 2`).
     pub core_inputs: &'a [[f32; 4]],
-    /// Packed `25 × Vec4` parameters (`num_stems * num_quads * 25`).
+    /// Packed `28 × Vec4` parameters (`num_stems * num_quads * 28`).
     pub quad_params: &'a [[f32; 4]],
-    /// Forward `tile_checkpoints` (`num_stems * num_quads * num_tiles * 8`).
+    /// Forward `tile_checkpoints` (`num_stems * num_quads * num_tiles * 12`).
     pub tile_checkpoints: &'a [[f32; 4]],
     /// Loss gradient w.r.t. readout-side `feature_outputs` (`num_stems * num_quads * num_frames * 6`).
     pub d_loss_d_features: &'a [[f32; 4]],
@@ -385,7 +395,7 @@ pub struct WaveCoreAdjointInput<'a> {
 pub struct WaveCoreAdjointOutput {
     /// Gradient w.r.t. post-`tile_mix` `core_inputs` (`num_stems * num_quads * num_frames * 2`).
     pub d_loss_d_inputs: Vec<[f32; 4]>,
-    /// Per-tile parameter gradients (`num_stems * num_quads * num_tiles * 25`).
+    /// Per-tile parameter gradients (`num_stems * num_quads * num_tiles * 28`).
     pub param_grads: Vec<[f32; 4]>,
     /// Deterministic reduced tile weight gradients (`active_tiles * 48`: `[odd 4×4, even 4×4, lru 4×4]`).
     pub tile_weight_grads: Vec<f32>,
@@ -426,7 +436,8 @@ pub struct InnerOptOutput {
 #[cfg(test)]
 mod tests {
     use dnam_kernels::{
-        SonaParaLruDuhemCoeffs4, SonaToneWeights4, TptSvfCoeffs4, prewarp_tan_pi_f_over_fs_f32,
+        SonaParaLruDuhemCoeffs4, SonaToneFoldedBlock0, SonaToneWeights4, TptSvfCoeffs4,
+        prewarp_tan_pi_f_over_fs_f32,
     };
 
     use super::*;
@@ -435,15 +446,15 @@ mod tests {
     fn test_pack_and_unpack_core_quad_params_roundtrip() {
         let g = GpuVec4::splat(prewarp_tan_pi_f_over_fs_f32(0.08));
         let k = GpuVec4::splat(0.75);
-        let orig = CoreQuadParamsStereo4 {
+        let orig = CoreQuadV4ParamsStereo4 {
             svf: TptSvfCoeffs4::from_gk(g, k),
-            tone: SonaToneWeights4 {
+            tone: SonaToneFoldedBlock0::from_weights(&SonaToneWeights4 {
                 lp: GpuVec4::splat(0.4),
                 bp: GpuVec4::splat(0.2),
                 hp: GpuVec4::splat(-0.1),
                 ap: GpuVec4::splat(0.05),
                 dir: GpuVec4::splat(0.3),
-            },
+            }),
             lru: SonaParaLruDuhemCoeffs4::from_clamped(
                 GpuVec4::splat(0.85),
                 GpuVec4::splat(0.35),
@@ -455,17 +466,27 @@ mod tests {
             two_svf_g: g.add(g),
             svf_k_nl: GpuVec4::zero(),
             rect_sign: GpuVec4::from_array([1.0, -1.0, 1.0, -1.0]),
-            sag_depth: GpuVec4::splat(0.25),
+            g0: GpuVec4::splat(0.95),
+            g_inf: GpuVec4::splat(1.15),
+            d_pre: GpuVec4::splat(0.25),
+            se_w_sq: GpuVec4::splat(0.40),
+            se_d_bus: GpuVec4::splat(0.30),
             adaa_drive: GpuVec4::splat(1.5),
             lru_bias_drive: GpuVec4::splat(0.1),
+            lin_mix: GpuVec4::splat(0.08),
             wavefolder_mix: GpuVec4::splat(0.4),
             glu_mix: GpuVec4::splat(0.5),
+            out_gain: GpuVec4::splat(1.1),
         };
         let packed = pack_core_quad_params(&orig);
         assert_eq!(packed[quad_param_slots::SVF_G], g.to_array());
         let unpacked = unpack_core_quad_params(&packed).unwrap();
         assert_eq!(unpacked.svf.a1.to_array(), orig.svf.a1.to_array());
+        assert_eq!(unpacked.svf.two_k.to_array(), orig.svf.two_k.to_array());
+        assert_eq!(unpacked.tone.c_kbp.to_array(), orig.tone.c_kbp.to_array());
+        assert_eq!(unpacked.se_w_sq.to_array(), orig.se_w_sq.to_array());
         assert_eq!(unpacked.glu_mix.to_array(), orig.glu_mix.to_array());
+        assert_eq!(unpacked.out_gain.to_array(), orig.out_gain.to_array());
         assert!(matches!(
             unpack_core_quad_params(&packed[..4]),
             Err(TrainError::InvalidDimensions { .. })
