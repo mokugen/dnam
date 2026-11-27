@@ -15,8 +15,16 @@ use crate::math::crc32c::{Crc32cBackend, crc32c_software_slice};
 use crate::math::{
     BackendKind, IEEE754_F32_ABS_MASK, IEEE754_F32_EXP_BIAS, IEEE754_F32_EXP_MASK,
     IEEE754_F32_IMPLICIT_BIT, IEEE754_F32_MANTISSA_BITS, IEEE754_F32_RCP_SEED,
-    IEEE754_F32_RSQRT_SEED, MathBackend, SimdVec4,
+    IEEE754_F32_RSQRT_SEED, IEEE754_F32_SIGN_MASK, MathBackend, SimdVec4,
 };
+
+pub(super) const SCRUB_BIAS_SIGNED_I32: i32 =
+    ((IEEE754_F32_IMPLICIT_BIT << 1) ^ IEEE754_F32_SIGN_MASK) as i32;
+pub(super) const SCRUB_LIMIT_SIGNED_I32: i32 =
+    (((IEEE754_F32_EXP_MASK - IEEE754_F32_IMPLICIT_BIT) << 1) ^ IEEE754_F32_SIGN_MASK) as i32;
+
+const _: () = assert!(SCRUB_BIAS_SIGNED_I32 == 0x8100_0000_u32 as i32);
+const _: () = assert!(SCRUB_LIMIT_SIGNED_I32 == 0x7E00_0000_i32);
 
 /// x86-64 architectural baseline `SSE2` 128-bit `f32` vector (`__m128`).
 #[repr(transparent)]
@@ -31,6 +39,20 @@ unsafe impl Sync for Sse2Vec4 {}
 impl fmt::Debug for Sse2Vec4 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("Sse2Vec4").field(&self.to_array()).finish()
+    }
+}
+
+impl Sse2Vec4 {
+    #[inline(always)]
+    pub(super) fn splat_lane<const LANE: usize>(self) -> Self {
+        const { assert!(LANE < 4) };
+        Self(match LANE {
+            0 => _mm_shuffle_ps::<0x00>(self.0, self.0),
+            1 => _mm_shuffle_ps::<0x55>(self.0, self.0),
+            2 => _mm_shuffle_ps::<0xAA>(self.0, self.0),
+            3 => _mm_shuffle_ps::<0xFF>(self.0, self.0),
+            _ => unreachable!(),
+        })
     }
 }
 
@@ -81,6 +103,16 @@ impl SimdVec4 for Sse2Vec4 {
     fn fma(self, a: Self, b: Self) -> Self {
         // `SSE2` baseline computes unfused `self + a * b`.
         Self(_mm_add_ps(self.0, _mm_mul_ps(a.0, b.0)))
+    }
+
+    #[inline(always)]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        self.fma(a, v.splat_lane::<LANE>())
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        self.mul(v.splat_lane::<LANE>())
     }
 
     #[inline(always)]
@@ -143,17 +175,15 @@ impl SimdVec4 for Sse2Vec4 {
 
     #[inline(always)]
     fn scrub_recursive_state(self) -> Self {
-        // Scrubs `exp == 0xFF` (`NaN`/`±Inf`) to `+0.0` and subnormals to signed zero.
+        // Signed-bias range check keeps normal finite lanes intact while canonicalizing `-0.0`,
+        // subnormals, `±Inf`, and `NaN` to `+0.0` (`0x0000_0000`).
         let bits = _mm_castps_si128(self.0);
-        let abs_bits = _mm_and_si128(bits, _mm_set1_epi32(IEEE754_F32_ABS_MASK as i32));
-        let is_sub = _mm_cmplt_epi32(abs_bits, _mm_set1_epi32(IEEE754_F32_IMPLICIT_BIT as i32));
-        let signed_zero = _mm_and_si128(bits, _mm_set1_epi32(i32::MIN));
-        let flushed = _mm_or_si128(
-            _mm_and_si128(is_sub, signed_zero),
-            _mm_andnot_si128(is_sub, bits),
+        let biased = _mm_sub_epi32(
+            _mm_slli_epi32::<1>(bits),
+            _mm_set1_epi32(SCRUB_BIAS_SIGNED_I32),
         );
-        let is_finite = _mm_cmplt_epi32(abs_bits, _mm_set1_epi32(IEEE754_F32_EXP_MASK as i32));
-        Self(_mm_castsi128_ps(_mm_and_si128(flushed, is_finite)))
+        let is_normal = _mm_cmplt_epi32(biased, _mm_set1_epi32(SCRUB_LIMIT_SIGNED_I32));
+        Self(_mm_castsi128_ps(_mm_and_si128(bits, is_normal)))
     }
 
     #[inline(always)]

@@ -1,6 +1,7 @@
 //! Dual-mode `#![no_std]` + `!alloc`-capable `3 kHz` [`ControlBus`] and [`ControlBusBacking`].
 
 pub mod dispatch;
+mod inline_hot;
 pub mod laws;
 mod load;
 mod tick;
@@ -13,12 +14,11 @@ use core::marker::PhantomData;
 
 use dispatch::{
     DEFAULT_DRIFT_PRNG_SEED, DispatchInputs, DispatchMatrices, STAGE_TARGET_SLOTS,
-    advance_micro_ramp_frame, control_stride_for_rate, control_tick_ratio, evaluate_w_ctrl_32,
-    prepare_micro_ramp_deltas, step_ou_drift,
+    control_stride_for_rate, control_tick_ratio, evaluate_w_ctrl_32,
 };
 use tick::{
     StaticEvalInputs, StaticEvalOutputs, compute_has_internal_modulators, eval_skewed_lfo_q2,
-    evaluate_static_cp1_latents, step_lfos_and_skewed_q2, update_env_states,
+    evaluate_static_cp1_latents,
 };
 
 use crate::bin::TempoSyncEntryWire;
@@ -628,62 +628,19 @@ impl<'a, B: MathBackend> ControlBus<'a, B> {
     /// Executes one `3 kHz` control-boundary update: optional static basis eval (only if `is_dirty`),
     /// skewed `Q0.192` LFO step, `SensoryQuad` envelope latch, `W_ctrl` + `"CEXT"` dispatch,
     /// `ou_drift_state` step (projected via [`Self::eff_z_stage`]), and uniform 32-slot ramp setup.
+    #[inline(never)]
     pub fn tick_control_boundary(&mut self, sensory_env: Option<[f32; 4]>) {
-        if !self.should_tick() {
-            return;
-        }
-        self.clamp_and_eval_static_if_dirty();
-        let q2 = step_lfos_and_skewed_q2(
-            &mut self.lfo_phases_q192,
-            &self.lfo_dphi_host_bits,
-            &mut self.lfo_phasors,
-            &self.lfo_skew,
-        );
-        update_env_states(&mut self.env_states, sensory_env);
-        self.eval_dispatch_with_q2(&q2);
-        step_ou_drift(
-            self.live_analog_drift_enabled,
-            self.offline_bounce,
-            self.sigma_drift,
-            self.rho_drift_host,
-            &mut self.drift_prng_state,
-            &mut self.ou_drift_state,
-        );
-        prepare_micro_ramp_deltas::<B>(
-            &self.stage_targets,
-            &mut self.prev_stage_targets,
-            &mut self.current_stage_params,
-            &mut self.stage_ramp_deltas,
-            self.alpha_ramp,
-        );
+        self.tick_control_boundary_inline(sensory_env);
     }
 
     /// Advances the control bus by one VM audio frame, returning `Some(&current_stage_params)`
     /// when ticking or `None` when completely idle (`!self.should_tick()`).
-    #[inline]
+    #[inline(never)]
     pub fn step_frame(
         &mut self,
         sensory_env: Option<[f32; 4]>,
     ) -> Option<&[f32; STAGE_TARGET_SLOTS]> {
-        if !self.should_tick() {
-            return None;
-        }
-        if self.ctrl_sub_counter == 0 {
-            self.tick_control_boundary(sensory_env);
-        }
-        advance_micro_ramp_frame::<B>(
-            &self.stage_targets,
-            &self.prev_stage_targets,
-            &mut self.current_stage_params,
-            &self.stage_ramp_deltas,
-            self.ctrl_sub_counter,
-            self.ctrl_stride,
-        );
-        self.ctrl_sub_counter += 1;
-        if self.ctrl_sub_counter >= self.ctrl_stride {
-            self.ctrl_sub_counter = 0;
-        }
-        Some(&self.current_stage_params)
+        self.step_frame_inline(sensory_env)
     }
 }
 

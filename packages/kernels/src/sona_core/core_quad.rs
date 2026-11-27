@@ -7,7 +7,7 @@ use crate::simd::{KernelVec4, StereoVec8};
 use super::paralru::{
     SonaParaLruDuhemCoeffs4, apply_stereo_link_stereo8, step_paralru_duhem_stereo8,
 };
-use super::poly_adaa::{self, eval_c2_wavefolder_adaa_stereo8, eval_poly_adaa1_stereo8};
+use super::poly_adaa;
 use super::tpt_svf::{TptSvfCoeffs4, step_tpt_svf_phs_stereo8, step_tpt_svf_stereo8};
 use super::{SonaBlockOutputStereo8, SonaBlockStateStereo8, SonaToneWeights4, TptSvfOutputs};
 
@@ -94,20 +94,12 @@ fn step_core_quad_post_svf_stereo8<S: StereoVec8>(
         .mul(sag_gain)
         .fma(S::broadcast_half(params.lru_bias_drive), v_eff);
 
-    let (mut adaa_odd, mut adaa_even) = eval_poly_adaa1_stereo8(state.adaa_prev, r_curr);
-    let wf_clamped = params
-        .wavefolder_mix
-        .clamp(S::Half::zero(), S::Half::splat(1.0));
-    if !wf_clamped.all_le(S::Half::zero()) {
-        let (wf_odd, _wf_even) = eval_c2_wavefolder_adaa_stereo8(state.adaa_prev, r_curr);
-        let wf_mix = S::broadcast_half(wf_clamped);
-        let one_minus_wf = S::splat(1.0).sub(wf_mix);
-        adaa_odd = adaa_odd
-            .mul(one_minus_wf)
-            .fma(wf_mix, wf_odd)
-            .add(S::zero());
-    }
-    state.adaa_prev = poly_adaa::scrub_endpoint_stereo8(r_curr);
+    let (adaa_odd, mut adaa_even, u_curr_safe) = poly_adaa::eval_poly_adaa1_with_wavefolder_stereo8(
+        state.adaa_prev,
+        r_curr,
+        params.wavefolder_mix,
+    );
+    state.adaa_prev = u_curr_safe;
 
     let odd_rot = adaa_odd.rotate_left_1();
     let glu_term = adaa_odd.mul(odd_rot);

@@ -24,11 +24,9 @@ use super::microchunk::core_step::HoistedCoreChunk;
 
 const PSI_SLEW_MAX_RAD: f32 = 0.25;
 
-/// Hoists latched `ControlBus` `(current_stage_params, eff_z_stage)` targets into hot
-/// `Op-N[Pre]`, Crossbar gains/phasor increments, `Transport` dry mix and non-slew targets, and
-/// per-lane `CoreQuad` modulation arrays (`0` slew step).
-#[inline(never)]
-pub fn hoist_core_quads_and_readouts<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>) {
+/// Always-inlined `hoist_core_quads_and_readouts` helper for `#[target_feature]` block dispatch.
+#[inline(always)]
+pub(crate) fn hoist_core_quads_and_readouts_inline<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>) {
     let t = slab.cold().latched_stage_params;
     let z = slab.cold().latched_z_stage;
     let is_ultra = matches!(slab.lite.tier, Tier::Ultra);
@@ -121,6 +119,15 @@ pub fn hoist_core_quads_and_readouts<B: GraphBackend>(slab: &mut SonaHotSlab<'_,
     }
 }
 
+/// Hoists latched `ControlBus` `(current_stage_params, eff_z_stage)` targets into hot
+/// `Op-N[Pre]`, Crossbar gains/phasor increments, `Transport` dry mix and non-slew targets, and
+/// per-lane `CoreQuad` modulation arrays (`0` slew step).
+#[inline(never)]
+pub fn hoist_core_quads_and_readouts<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>) {
+    hoist_core_quads_and_readouts_inline(slab);
+}
+
+#[inline(always)]
 fn step_control_tick_3khz_inner<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
     immediate_snap: bool,
@@ -171,7 +178,13 @@ fn step_control_tick_3khz_inner<B: GraphBackend>(
         *slab.transport_quad_hot_mut(q) = quad;
     }
 
-    hoist_core_quads_and_readouts(slab);
+    hoist_core_quads_and_readouts_inline(slab);
+}
+
+/// Always-inlined `3 kHz` boundary control tick for `#[target_feature]` block dispatch.
+#[inline(always)]
+pub(crate) fn step_control_tick_3khz_inline<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>) {
+    step_control_tick_3khz_inner(slab, false);
 }
 
 /// Executes one `3 kHz` boundary control tick (`Kautz` slew, `TransportQuad` Givens `psi` slew,

@@ -40,7 +40,8 @@ pub use paralru::{
 pub use poly_adaa::{
     MAX_ADAA_ENDPOINT, QuadratureHysteresis2D, TINY_CROSSING_EPS, eval_c2_wavefolder_adaa_stereo8,
     eval_c2_wavefolder_adaa_vec4, eval_poly_adaa1_odd_even_vec4, eval_poly_adaa1_quad_batched,
-    eval_poly_adaa1_stereo8,
+    eval_poly_adaa1_stereo8, eval_poly_adaa1_with_wavefolder_stereo8,
+    eval_poly_adaa1_with_wavefolder_vec4,
 };
 pub use tpt_svf::{
     MAX_SVF_K_NL, MIN_TPT_G, SVF_PHS_E_MAX, TptAdjointElem, TptScanElem, TptSvfCoeffs4,

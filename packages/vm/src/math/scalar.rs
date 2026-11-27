@@ -273,7 +273,7 @@ impl dnam_kernels::KernelVec4 for ScalarVec4 {
 
     #[inline(always)]
     fn flush_recursive_state(self) -> Self {
-        Self(self.0.map(dnam_kernels::scrub_and_flush_f32_bits))
+        Self(self.0.map(dnam_kernels::canonicalize_zero_f32_bits))
     }
 
     #[inline(always)]

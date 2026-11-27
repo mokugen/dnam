@@ -2,7 +2,7 @@
 //! across host CPUs and `spirv-unknown-naga-wgsl` compute shaders
 //! (`ref[arch.simd.two-level-traits]`, `ref[sdk.rust.shared-nostd-kernels]`).
 
-use super::{KernelVec4, scrub_and_flush_f32_bits};
+use super::{KernelVec4, canonicalize_zero_f32_bits};
 
 /// Portable `[f32; 4]` vector implementing [`KernelVec4`] cleanly for both scalar CPU and `spirv` WGSL.
 #[derive(Copy, Clone, Debug, Default, PartialEq)]
@@ -161,10 +161,10 @@ impl KernelVec4 for GpuVec4 {
     #[inline(always)]
     fn flush_recursive_state(self) -> Self {
         Self([
-            scrub_and_flush_f32_bits(self.0[0]),
-            scrub_and_flush_f32_bits(self.0[1]),
-            scrub_and_flush_f32_bits(self.0[2]),
-            scrub_and_flush_f32_bits(self.0[3]),
+            canonicalize_zero_f32_bits(self.0[0]),
+            canonicalize_zero_f32_bits(self.0[1]),
+            canonicalize_zero_f32_bits(self.0[2]),
+            canonicalize_zero_f32_bits(self.0[3]),
         ])
     }
 
@@ -247,14 +247,14 @@ mod tests {
         ]);
         assert_eq!(
             dirty.flush_recursive_state().to_array().map(f32::to_bits),
-            [0, 0x8000_0000, 0, 0]
+            [0, 0, 0, 0]
         );
         assert_eq!(
             GpuVec4::from_array([f32::INFINITY, -1.25, 2.5, f32::from_bits(0x807F_FFFF)])
                 .flush_recursive_state()
                 .to_array()
                 .map(f32::to_bits),
-            [0, (-1.25_f32).to_bits(), 2.5_f32.to_bits(), 0x8000_0000]
+            [0, (-1.25_f32).to_bits(), 2.5_f32.to_bits(), 0]
         );
 
         let quad = GpuVec4::rcp_pos_quad_nr2([

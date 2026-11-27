@@ -72,7 +72,8 @@ pub(crate) struct DispatchMatrices<'a> {
 
 /// Evaluates all 32 `stage_targets` across base `W_ctrl` (`0..16`) and optional `"CEXT"`
 /// (`16..31`, reserving `[31] == 0.0`) using 4-lane `B::Vec4` FMA and balanced pairwise tree sum.
-pub(crate) fn evaluate_w_ctrl_32<B: MathBackend>(
+#[inline(always)]
+pub(crate) fn evaluate_w_ctrl_32_inline<B: MathBackend>(
     inputs: DispatchInputs<'_>,
     mats: DispatchMatrices<'_>,
     stage_targets: &mut [f32; STAGE_TARGET_SLOTS],
@@ -123,6 +124,15 @@ pub(crate) fn evaluate_w_ctrl_32<B: MathBackend>(
     stage_targets[31] = 0.0;
 }
 
+/// Non-`#[inline(always)]` dispatch entrypoint preserving RT disassembly audit roots.
+pub(crate) fn evaluate_w_ctrl_32<B: MathBackend>(
+    inputs: DispatchInputs<'_>,
+    mats: DispatchMatrices<'_>,
+    stage_targets: &mut [f32; STAGE_TARGET_SLOTS],
+) {
+    evaluate_w_ctrl_32_inline::<B>(inputs, mats, stage_targets);
+}
+
 /// Steps optional `xorshift64*` Ornstein–Uhlenbeck analog drift state (`ou_drift_state[0..4]`)
 /// for projection onto `eff_z_stage`, or resets drift state to `+0.0` when disabled.
 #[inline]
@@ -158,7 +168,7 @@ pub(crate) fn step_ou_drift(
 
 /// Recomputes per-sample linear micro-ramp deltas uniformly across all 32 slots (`0..32`,
 /// reserving `[31] == 0.0`, `ref[dsp.ctrl.dispatch.micro-ramp]`).
-#[inline]
+#[inline(always)]
 pub(crate) fn prepare_micro_ramp_deltas<B: MathBackend>(
     stage_targets: &[f32; STAGE_TARGET_SLOTS],
     prev_stage_targets: &mut [f32; STAGE_TARGET_SLOTS],
@@ -187,7 +197,7 @@ pub(crate) fn prepare_micro_ramp_deltas<B: MathBackend>(
 
 /// Advances all 32 micro-ramps uniformly by one VM frame with bounded interval clamping
 /// (no overshoot) and final end-of-stride snap (`[31] == 0.0`).
-#[inline]
+#[inline(always)]
 pub(crate) fn advance_micro_ramp_frame<B: MathBackend>(
     stage_targets: &[f32; STAGE_TARGET_SLOTS],
     prev_stage_targets: &[f32; STAGE_TARGET_SLOTS],

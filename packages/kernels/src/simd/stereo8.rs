@@ -111,8 +111,8 @@ pub trait StereoVec8: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
     /// Flushes subnormals to signed zero across all 8 lanes.
     fn flush_subnormal(self) -> Self;
 
-    /// Scrubs non-finite lanes (`NaN`/`±Inf`) to `+0.0` and flushes subnormals to signed zero
-    /// across all 8 lanes.
+    /// Canonicalizes `-0.0`, subnormals, `±Inf`, and `NaN` to `+0.0` (`0x0000_0000`) across all
+    /// 8 lanes while preserving all normal finite lanes.
     #[inline(always)]
     fn flush_recursive_state(self) -> Self {
         let (l, r) = self.into_lr();
@@ -459,7 +459,7 @@ mod tests {
         );
         assert_eq!(
             scrubbed.into_lr().1.to_array().map(f32::to_bits),
-            [0x8000_0000, 0, (-2.5_f32).to_bits(), 0]
+            [0, 0, (-2.5_f32).to_bits(), 0]
         );
 
         let da = DefaultTraitStereo8::from_lr(a.left, a.right);

@@ -156,10 +156,13 @@ impl KautzStereoBank4 {
         out
     }
 
-    /// Steps one stereo frame across a slice of active Kautz banks with `0-ULP` parity against
-    /// [`Self::step_chunk`].
-    #[inline]
-    pub fn step_banks_stereo<B: MathBackend>(banks: &mut [Self], x_l: f32, x_r: f32) -> (f32, f32) {
+    /// Always-inlined stereo step across active Kautz banks for `#[target_feature]` block dispatch.
+    #[inline(always)]
+    pub fn step_banks_stereo_inline<B: MathBackend>(
+        banks: &mut [Self],
+        x_l: f32,
+        x_r: f32,
+    ) -> (f32, f32) {
         let mut sum_l = 0.0_f32;
         let mut sum_r = 0.0_f32;
         for bank in banks.iter_mut() {
@@ -168,6 +171,13 @@ impl KautzStereoBank4 {
             sum_r += yr;
         }
         (sum_l, sum_r)
+    }
+
+    /// Steps one stereo frame across a slice of active Kautz banks with `0-ULP` parity against
+    /// [`Self::step_chunk`].
+    #[inline]
+    pub fn step_banks_stereo<B: MathBackend>(banks: &mut [Self], x_l: f32, x_r: f32) -> (f32, f32) {
+        Self::step_banks_stereo_inline::<B>(banks, x_l, x_r)
     }
 
     /// Hoists each bank's [`KautzQuadState`] into SIMD registers across all `C` samples of a

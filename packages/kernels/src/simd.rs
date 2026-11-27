@@ -290,15 +290,15 @@ pub trait KernelVec4: Copy + Clone + core::fmt::Debug + Send + Sync + 'static {
         ])
     }
 
-    /// Scrubs non-finite lanes (`NaN`/`±Inf`) to `+0.0` and flushes subnormals to signed zero.
+    /// Scrubs non-finite lanes (`NaN`/`±Inf`) and subnormals/signed-zero (`-0.0`) to `+0.0`.
     #[inline(always)]
     fn flush_recursive_state(self) -> Self {
         let a = self.to_array();
         Self::from_array([
-            scrub_and_flush_f32_bits(a[0]),
-            scrub_and_flush_f32_bits(a[1]),
-            scrub_and_flush_f32_bits(a[2]),
-            scrub_and_flush_f32_bits(a[3]),
+            canonicalize_zero_f32_bits(a[0]),
+            canonicalize_zero_f32_bits(a[1]),
+            canonicalize_zero_f32_bits(a[2]),
+            canonicalize_zero_f32_bits(a[3]),
         ])
     }
 
@@ -645,7 +645,14 @@ mod tests {
         );
         assert_eq!(
             dirty.flush_recursive_state().to_array().map(f32::to_bits),
-            [0, 0x8000_0000, 0, 0]
+            [0, 0, 0, 0]
+        );
+        assert_eq!(
+            DefaultTraitVec4::from_array([-0.0, f32::from_bits(0x807F_FFFF), -1.25, 2.5])
+                .flush_recursive_state()
+                .to_array()
+                .map(f32::to_bits),
+            [0, 0, (-1.25_f32).to_bits(), 2.5_f32.to_bits()]
         );
         assert_eq!(canonicalize_zero_f32_bits(-0.0).to_bits(), 0);
         assert_eq!(canonicalize_zero_f32_bits(0.0).to_bits(), 0);

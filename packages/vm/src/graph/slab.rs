@@ -8,6 +8,8 @@ pub mod hydrate;
 pub mod layout;
 pub mod microchunk;
 
+#[allow(unused_imports)]
+pub(crate) use ctrl_latch::step_control_tick_3khz_inline;
 pub use ctrl_latch::{
     hoist_core_quads_and_readouts, latch_immediate_at_init_or_reset, step_control_tick_3khz,
 };
@@ -33,6 +35,11 @@ pub use microchunk::core_step::HoistedCoreChunk;
 pub use microchunk::{
     evaluate_matryoshka_core_quads, process_block_sona, process_tick16_const, step_frame_4x_sona,
     step_frame_sona,
+};
+#[cfg(target_arch = "x86_64")]
+pub(crate) use microchunk::{
+    process_block_sona_inline, process_tick16_const_inline, step_frame_4x_sona_inline,
+    step_frame_sona_inline,
 };
 
 use crate::graph::GraphBackend;

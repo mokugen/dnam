@@ -223,15 +223,39 @@ impl DynamicSonaVm {
                 )?,
             ))),
             #[cfg(target_arch = "x86_64")]
-            BackendKind::X86Avx2Fma | BackendKind::X86Simd => Ok(Self::X86Avx2Fma(Box::new(
-                SonaVm::<X86Avx2FmaBackend>::from_view_owned_with_headroom(
-                    view,
-                    active_tier,
-                    host_rate_hz,
-                    offline_bounce,
-                    headroom,
-                )?,
-            ))),
+            BackendKind::X86Avx2Fma | BackendKind::X86Simd => {
+                if X86Avx2FmaBackend::is_supported_cached() {
+                    Ok(Self::X86Avx2Fma(Box::new(
+                        SonaVm::<X86Avx2FmaBackend>::from_view_owned_with_headroom(
+                            view,
+                            active_tier,
+                            host_rate_hz,
+                            offline_bounce,
+                            headroom,
+                        )?,
+                    )))
+                } else if X86Sse42Backend::is_supported_cached() {
+                    Ok(Self::X86Sse42(Box::new(
+                        SonaVm::<X86Sse42Backend>::from_view_owned_with_headroom(
+                            view,
+                            active_tier,
+                            host_rate_hz,
+                            offline_bounce,
+                            headroom,
+                        )?,
+                    )))
+                } else {
+                    Ok(Self::X86Sse2(Box::new(
+                        SonaVm::<X86Sse2Backend>::from_view_owned_with_headroom(
+                            view,
+                            active_tier,
+                            host_rate_hz,
+                            offline_bounce,
+                            headroom,
+                        )?,
+                    )))
+                }
+            }
             #[cfg(target_arch = "wasm32")]
             BackendKind::WasmSimd128 => Ok(Self::WasmSimd128(Box::new(
                 SonaVm::<WasmSimd128Backend>::from_view_owned_with_headroom(

@@ -197,7 +197,7 @@ impl<B: GraphBackend> HoistedCoreChunk<B> {
     }
 
     /// Materializes active quad DSP parameters, readout matrices, and crossbar weights into registers.
-    #[inline]
+    #[inline(always)]
     pub fn from_slab(slab: &SonaHotSlab<'_, B>) -> Self {
         let tier = slab.lite.tier;
         let num_quads = tier.simd_groups();
@@ -251,7 +251,7 @@ impl<B: GraphBackend> HoistedCoreChunk<B> {
 
     /// Updates only the `3 kHz`/`12 kHz` modulated quad parameters and crossbar gains while
     /// preserving static readout/carrier/phasor matrices decoded at tier/rate hydration.
-    #[inline]
+    #[inline(always)]
     pub fn refresh_modulated(&mut self, slab: &SonaHotSlab<'_, B>) {
         let cold = slab.cold();
         let wet_scale =

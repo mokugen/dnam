@@ -23,8 +23,8 @@ pub const fn detect_wasm_backend() -> BackendKind {
 mod simd128_impl {
     use core::arch::wasm32::{
         f32x4, f32x4_abs, f32x4_add, f32x4_extract_lane, f32x4_le, f32x4_max, f32x4_min, f32x4_mul,
-        f32x4_neg, f32x4_splat, f32x4_sub, i32x4_shl, i32x4_shuffle, i32x4_splat, u32x4_add,
-        u32x4_ge, u32x4_lt, u32x4_shr, u32x4_splat, u32x4_sub, v128, v128_and, v128_andnot,
+        f32x4_neg, f32x4_splat, f32x4_sub, i32x4_all_true, i32x4_shl, i32x4_shuffle, i32x4_splat,
+        u32x4_add, u32x4_lt, u32x4_shl, u32x4_shr, u32x4_splat, u32x4_sub, v128, v128_and,
         v128_bitselect, v128_xor,
     };
     use core::fmt;
@@ -35,10 +35,30 @@ mod simd128_impl {
         IEEE754_F32_SIGN_MASK, SimdVec4,
     };
 
+    const SCRUB_SHIFTED_EXP_STEP: u32 = IEEE754_F32_IMPLICIT_BIT << 1;
+    const SCRUB_SHIFTED_NORMAL_SPAN: u32 = (IEEE754_F32_EXP_MASK - IEEE754_F32_IMPLICIT_BIT) << 1;
+
+    const _: () = assert!(SCRUB_SHIFTED_EXP_STEP == 0x0100_0000);
+    const _: () = assert!(SCRUB_SHIFTED_NORMAL_SPAN == 0xFE00_0000);
+
     /// WebAssembly `128-bit` `simd128` 4-lane `f32` vector register (`v128`).
     #[repr(transparent)]
     #[derive(Copy, Clone)]
     pub struct WasmVec4(pub v128);
+
+    impl WasmVec4 {
+        #[inline(always)]
+        fn splat_lane<const LANE: usize>(self) -> Self {
+            const { assert!(LANE < 4) };
+            Self(match LANE {
+                0 => i32x4_shuffle::<0, 0, 0, 0>(self.0, self.0),
+                1 => i32x4_shuffle::<1, 1, 1, 1>(self.0, self.0),
+                2 => i32x4_shuffle::<2, 2, 2, 2>(self.0, self.0),
+                3 => i32x4_shuffle::<3, 3, 3, 3>(self.0, self.0),
+                _ => unreachable!(),
+            })
+        }
+    }
 
     impl fmt::Debug for WasmVec4 {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -86,6 +106,16 @@ mod simd128_impl {
         }
 
         #[inline(always)]
+        fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+            self.fma(a, v.splat_lane::<LANE>())
+        }
+
+        #[inline(always)]
+        fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+            self.mul(v.splat_lane::<LANE>())
+        }
+
+        #[inline(always)]
         fn fms(self, a: Self, b: Self) -> Self {
             Self(f32x4_sub(self.0, f32x4_mul(a.0, b.0)))
         }
@@ -107,12 +137,9 @@ mod simd128_impl {
 
         #[inline(always)]
         fn scrub_recursive_state(self) -> Self {
-            let abs_bits = v128_and(self.0, u32x4_splat(IEEE754_F32_ABS_MASK));
-            let is_sub = u32x4_lt(abs_bits, u32x4_splat(IEEE754_F32_IMPLICIT_BIT));
-            let signed_zero = v128_and(self.0, u32x4_splat(IEEE754_F32_SIGN_MASK));
-            let flushed = v128_bitselect(signed_zero, self.0, is_sub);
-            let non_finite = u32x4_ge(abs_bits, u32x4_splat(IEEE754_F32_EXP_MASK));
-            Self(v128_andnot(flushed, non_finite))
+            let biased = u32x4_sub(u32x4_shl(self.0, 1), u32x4_splat(SCRUB_SHIFTED_EXP_STEP));
+            let is_normal = u32x4_lt(biased, u32x4_splat(SCRUB_SHIFTED_NORMAL_SPAN));
+            Self(v128_and(self.0, is_normal))
         }
 
         #[inline(always)]
@@ -142,8 +169,21 @@ mod simd128_impl {
 
         #[inline(always)]
         fn horizontal_sum(self) -> f32 {
-            let a = self.to_array();
-            (a[0] + a[1]) + (a[2] + a[3])
+            // Strict `(a0 + a1) + (a2 + a3)` pairwise reduction in registers (zero stack spills).
+            let pair_swapped = i32x4_shuffle::<1, 0, 3, 2>(self.0, self.0);
+            let pair_sums = f32x4_add(self.0, pair_swapped);
+            let hi = i32x4_shuffle::<2, 3, 0, 1>(pair_sums, pair_sums);
+            f32x4_extract_lane::<0>(f32x4_add(pair_sums, hi))
+        }
+
+        #[inline(always)]
+        fn horizontal_sum_pair(self, rhs: Self) -> (f32, f32) {
+            let p_self = f32x4_add(self.0, i32x4_shuffle::<1, 0, 3, 2>(self.0, self.0));
+            let p_rhs = f32x4_add(rhs.0, i32x4_shuffle::<1, 0, 3, 2>(rhs.0, rhs.0));
+            let lo = i32x4_shuffle::<0, 4, 0, 4>(p_self, p_rhs);
+            let hi = i32x4_shuffle::<2, 6, 2, 6>(p_self, p_rhs);
+            let sums = f32x4_add(lo, hi);
+            (f32x4_extract_lane::<0>(sums), f32x4_extract_lane::<1>(sums))
         }
 
         #[inline(always)]
@@ -215,6 +255,16 @@ mod simd128_impl {
         }
 
         #[inline(always)]
+        fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+            <Self as SimdVec4>::fma_lane::<LANE>(self, a, v)
+        }
+
+        #[inline(always)]
+        fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+            <Self as SimdVec4>::mul_lane::<LANE>(self, v)
+        }
+
+        #[inline(always)]
         fn max(self, rhs: Self) -> Self {
             <Self as SimdVec4>::max(self, rhs)
         }
@@ -244,6 +294,11 @@ mod simd128_impl {
         }
 
         #[inline(always)]
+        fn all_le(self, rhs: Self) -> bool {
+            i32x4_all_true(f32x4_le(self.0, rhs.0))
+        }
+
+        #[inline(always)]
         fn pair_swap_neg(self) -> Self {
             <Self as SimdVec4>::pair_swap_neg(self)
         }
@@ -261,6 +316,11 @@ mod simd128_impl {
         #[inline(always)]
         fn horizontal_sum(self) -> f32 {
             <Self as SimdVec4>::horizontal_sum(self)
+        }
+
+        #[inline(always)]
+        fn horizontal_sum_pair(self, rhs: Self) -> (f32, f32) {
+            <Self as SimdVec4>::horizontal_sum_pair(self, rhs)
         }
 
         #[inline(always)]
@@ -339,6 +399,16 @@ impl SimdVec4 for WasmVec4 {
     }
 
     #[inline(always)]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        Self(self.0.fma_lane::<LANE>(a.0, v.0))
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        Self(self.0.mul_lane::<LANE>(v.0))
+    }
+
+    #[inline(always)]
     fn fms(self, a: Self, b: Self) -> Self {
         Self(self.0.fms(a.0, b.0))
     }
@@ -381,6 +451,11 @@ impl SimdVec4 for WasmVec4 {
     #[inline(always)]
     fn horizontal_sum(self) -> f32 {
         self.0.horizontal_sum()
+    }
+
+    #[inline(always)]
+    fn horizontal_sum_pair(self, rhs: Self) -> (f32, f32) {
+        self.0.horizontal_sum_pair(rhs.0)
     }
 
     #[inline(always)]
@@ -447,6 +522,16 @@ impl dnam_kernels::KernelVec4 for WasmVec4 {
     }
 
     #[inline(always)]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        <Self as SimdVec4>::fma_lane::<LANE>(self, a, v)
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        <Self as SimdVec4>::mul_lane::<LANE>(self, v)
+    }
+
+    #[inline(always)]
     fn max(self, rhs: Self) -> Self {
         <Self as SimdVec4>::max(self, rhs)
     }
@@ -459,6 +544,11 @@ impl dnam_kernels::KernelVec4 for WasmVec4 {
     #[inline(always)]
     fn abs(self) -> Self {
         <Self as SimdVec4>::abs(self)
+    }
+
+    #[inline(always)]
+    fn all_le(self, rhs: Self) -> bool {
+        <ScalarVec4 as dnam_kernels::KernelVec4>::all_le(self.0, rhs.0)
     }
 
     #[inline(always)]
@@ -479,6 +569,16 @@ impl dnam_kernels::KernelVec4 for WasmVec4 {
     #[inline(always)]
     fn horizontal_sum(self) -> f32 {
         <Self as SimdVec4>::horizontal_sum(self)
+    }
+
+    #[inline(always)]
+    fn horizontal_sum_pair(self, rhs: Self) -> (f32, f32) {
+        <Self as SimdVec4>::horizontal_sum_pair(self, rhs)
+    }
+
+    #[inline(always)]
+    fn flush_recursive_state(self) -> Self {
+        <Self as SimdVec4>::scrub_recursive_state(self)
     }
 
     #[inline(always)]

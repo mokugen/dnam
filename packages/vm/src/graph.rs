@@ -66,6 +66,7 @@ pub use transport::{
 pub use zoh::{ZohRateContext, ballistic_alpha_f32, rescale_paralru_lane, round_sample_count_zoh};
 
 use crate::math::{DefaultMathBackend, MathBackend, ScalarBackend};
+use crate::types::VmError;
 
 /// ISA-specialized `16`-tap stereo `ModalConvolver` Early FIR inner product backend (`0 FDIV`, `0 alloc`).
 pub trait ConvolverBackend: MathBackend {
@@ -79,7 +80,51 @@ pub trait ConvolverBackend: MathBackend {
 }
 
 /// Complete real-time `SONA v3.0` DSP graph SIMD backend capability trait across all 8 ISA targets.
-pub trait GraphBackend: MathBackend + ConvolverBackend {}
+pub trait GraphBackend: MathBackend + ConvolverBackend {
+    /// Processes a stereo audio block on `slab` (`#[target_feature]`-specialized on `X86Avx2Fma`).
+    #[inline(always)]
+    fn process_block_slab(
+        slab: &mut SonaHotSlab<'_, Self>,
+        in_l: &[f32],
+        in_r: &[f32],
+        out_l: &mut [f32],
+        out_r: &mut [f32],
+    ) -> Result<(), VmError> {
+        process_block_sona(slab, in_l, in_r, out_l, out_r)
+    }
+
+    /// Processes a fixed `16`-frame slice on `slab`.
+    #[inline(always)]
+    fn process_tick16_slab(
+        slab: &mut SonaHotSlab<'_, Self>,
+        in_l: &[f32; 16],
+        in_r: &[f32; 16],
+        out_l: &mut [f32; 16],
+        out_r: &mut [f32; 16],
+    ) -> Result<(), VmError> {
+        slab.process_tick16_const(in_l, in_r, out_l, out_r)
+    }
+
+    /// Steps one stereo host sample (`1x` live or `4x` offline bounce) on `slab`.
+    #[inline(always)]
+    fn step_frame_slab(
+        slab: &mut SonaHotSlab<'_, Self>,
+        in_l: f32,
+        in_r: f32,
+    ) -> Result<(f32, f32), VmError> {
+        if slab.cold().offline_bounce {
+            step_frame_4x_sona(slab, in_l, in_r)
+        } else {
+            step_frame_sona(slab, in_l, in_r)
+        }
+    }
+
+    /// Executes one `3 kHz` control boundary tick on `slab`.
+    #[inline(always)]
+    fn step_control_tick_slab(slab: &mut SonaHotSlab<'_, Self>) {
+        step_control_tick_3khz(slab);
+    }
+}
 
 impl ConvolverBackend for ScalarBackend {
     #[inline(always)]
@@ -189,7 +234,43 @@ impl ConvolverBackend for crate::math::x86::X86Avx2FmaBackend {
 }
 
 #[cfg(target_arch = "x86_64")]
-impl GraphBackend for crate::math::x86::X86Avx2FmaBackend {}
+impl GraphBackend for crate::math::x86::X86Avx2FmaBackend {
+    #[inline(always)]
+    fn process_block_slab(
+        slab: &mut SonaHotSlab<'_, Self>,
+        in_l: &[f32],
+        in_r: &[f32],
+        out_l: &mut [f32],
+        out_r: &mut [f32],
+    ) -> Result<(), VmError> {
+        crate::math::x86::avx2::dispatch_avx2_process_block(slab, in_l, in_r, out_l, out_r)
+    }
+
+    #[inline(always)]
+    fn process_tick16_slab(
+        slab: &mut SonaHotSlab<'_, Self>,
+        in_l: &[f32; 16],
+        in_r: &[f32; 16],
+        out_l: &mut [f32; 16],
+        out_r: &mut [f32; 16],
+    ) -> Result<(), VmError> {
+        crate::math::x86::avx2::dispatch_avx2_process_tick16(slab, in_l, in_r, out_l, out_r)
+    }
+
+    #[inline(always)]
+    fn step_frame_slab(
+        slab: &mut SonaHotSlab<'_, Self>,
+        in_l: f32,
+        in_r: f32,
+    ) -> Result<(f32, f32), VmError> {
+        crate::math::x86::avx2::dispatch_avx2_step_frame(slab, in_l, in_r)
+    }
+
+    #[inline(always)]
+    fn step_control_tick_slab(slab: &mut SonaHotSlab<'_, Self>) {
+        crate::math::x86::avx2::dispatch_avx2_step_control_tick(slab);
+    }
+}
 
 #[cfg(target_arch = "wasm32")]
 impl ConvolverBackend for crate::math::wasm::WasmSimd128Backend {
@@ -350,7 +431,9 @@ mod tests {
         {
             verify_dot16::<crate::math::x86::X86Sse2Backend>();
             verify_dot16::<crate::math::x86::X86Sse42Backend>();
-            verify_dot16::<crate::math::x86::X86Avx2FmaBackend>();
+            if crate::math::x86::X86Avx2FmaBackend::is_supported_cached() {
+                verify_dot16::<crate::math::x86::X86Avx2FmaBackend>();
+            }
         }
         #[cfg(target_arch = "wasm32")]
         {

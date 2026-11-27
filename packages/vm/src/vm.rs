@@ -11,9 +11,8 @@ use dnam_kernels::QUAD_FLAG_HOST_WRITE_LOCK;
 use crate::bin::DnamBinView;
 use crate::graph::slab::{
     SonaHotSlab, SonaSlabBacking, check_reload_slab_capacity, hydrate_slab_from_dnam_bin,
-    process_block_sona, reload_slab_from_dnam_bin_in_place, reset_to_dc_equilibrium,
-    retime_sample_rate, set_offline_bounce, set_op_t_write_enable, set_quad_write_enable,
-    step_control_tick_3khz, step_frame_4x_sona, step_frame_sona, switch_tier,
+    reload_slab_from_dnam_bin_in_place, reset_to_dc_equilibrium, retime_sample_rate,
+    set_offline_bounce, set_op_t_write_enable, set_quad_write_enable, switch_tier,
 };
 #[cfg(feature = "alloc")]
 use crate::graph::slab::{VmReloadHeadroom, hydrate_slab_owned_with_headroom};
@@ -216,7 +215,7 @@ impl<'a, B: GraphBackend> SonaVm<'a, B> {
         out_r: &mut [f32],
     ) -> Result<(), VmError> {
         let _ftz = FtzDazGuard::new();
-        process_block_sona(&mut self.slab, in_l, in_r, out_l, out_r)
+        B::process_block_slab(&mut self.slab, in_l, in_r, out_l, out_r)
     }
 
     /// Processes a fixed `16`-frame slice (`3 kHz` tick at `48 kHz`) under `FTZ`/`DAZ` guard.
@@ -229,24 +228,20 @@ impl<'a, B: GraphBackend> SonaVm<'a, B> {
         out_r: &mut [f32; 16],
     ) -> Result<(), VmError> {
         let _ftz = FtzDazGuard::new();
-        self.slab.process_tick16_const(in_l, in_r, out_l, out_r)
+        B::process_tick16_slab(&mut self.slab, in_l, in_r, out_l, out_r)
     }
 
     /// Steps one stereo host sample (`1x` live or `4x` offline bounce) under `FTZ`/`DAZ` guard.
     #[inline(never)]
     pub fn step_frame(&mut self, in_l: f32, in_r: f32) -> Result<(f32, f32), VmError> {
         let _ftz = FtzDazGuard::new();
-        if self.slab.cold().offline_bounce {
-            step_frame_4x_sona(&mut self.slab, in_l, in_r)
-        } else {
-            step_frame_sona(&mut self.slab, in_l, in_r)
-        }
+        B::step_frame_slab(&mut self.slab, in_l, in_r)
     }
 
     /// Executes one `3 kHz` boundary control tick (`Kautz`, `Transport`, and core hoisting).
     #[inline(never)]
     pub fn step_control_tick_3khz(&mut self) {
-        step_control_tick_3khz(&mut self.slab);
+        B::step_control_tick_slab(&mut self.slab);
     }
 
     /// Updates a single physical control value and flags the control plane for refresh.

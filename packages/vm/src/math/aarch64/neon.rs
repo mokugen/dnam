@@ -4,10 +4,10 @@
 pub mod backend;
 
 use core::arch::aarch64::{
-    float32x4_t, uint32x4_t, vabsq_f32, vaddq_f32, vaddq_u32, vandq_u32, vbicq_u32, vbslq_u32,
-    vcgeq_u32, vcleq_f32, vcltq_u32, vdupq_laneq_f64, vdupq_n_f32, vdupq_n_u32, veorq_u32,
-    vextq_f32, vfmaq_f32, vfmaq_laneq_f32, vfmsq_f32, vld1q_f32, vmaxq_f32, vminq_f32, vminvq_u32,
-    vmulq_f32, vmulq_laneq_f32, vnegq_f32, vreinterpretq_f32_f64, vreinterpretq_f32_u32,
+    float32x4_t, uint32x4_t, vabsq_f32, vaddq_f32, vaddq_u32, vandq_u32, vbslq_u32, vcleq_f32,
+    vcltq_u32, vdupq_laneq_f64, vdupq_n_f32, vdupq_n_u32, veorq_u32, vextq_f32, vfmaq_f32,
+    vfmaq_laneq_f32, vfmsq_f32, vld1q_f32, vmaxq_f32, vminq_f32, vminvq_u32, vmulq_f32,
+    vmulq_laneq_f32, vnegq_f32, vreinterpretq_f32_f64, vreinterpretq_f32_u32,
     vreinterpretq_f64_f32, vreinterpretq_u32_f32, vrev64q_f32, vshlq_n_u32, vshrq_n_u32, vst1q_f32,
     vsubq_f32, vsubq_u32,
 };
@@ -22,6 +22,12 @@ use crate::math::{
     IEEE754_F32_MANTISSA_BITS, IEEE754_F32_RCP_SEED, IEEE754_F32_RSQRT_SEED, IEEE754_F32_SIGN_MASK,
     SimdVec4,
 };
+
+const SCRUB_SHIFTED_EXP_STEP: u32 = IEEE754_F32_IMPLICIT_BIT << 1;
+const SCRUB_SHIFTED_NORMAL_SPAN: u32 = (IEEE754_F32_EXP_MASK - IEEE754_F32_IMPLICIT_BIT) << 1;
+
+const _: () = assert!(SCRUB_SHIFTED_EXP_STEP == 0x0100_0000);
+const _: () = assert!(SCRUB_SHIFTED_NORMAL_SPAN == 0xFE00_0000);
 
 /// ARM64 128-bit NEON 4-lane `f32` vector register (`float32x4_t`).
 #[repr(transparent)]
@@ -208,15 +214,14 @@ impl SimdVec4 for NeonVec4 {
 
     #[inline(always)]
     fn scrub_recursive_state(self) -> Self {
-        // SAFETY: Clears non-finite (`exp == 0xFF`) lanes to `+0.0` and subnormals to signed zero.
+        // SAFETY: 3-op / 2-constant range check `(bits << 1) - 0x0100_0000 < 0xFE00_0000` keeps
+        // normal finite lanes intact while canonicalizing `-0.0`, subnormals, `±Inf`, and `NaN`
+        // to `+0.0` (`0x0000_0000`) with zero `FPCR`/`FPSR` interaction.
         Self(unsafe {
             let bits = vreinterpretq_u32_f32(self.0);
-            let abs_bits = vandq_u32(bits, vdupq_n_u32(IEEE754_F32_ABS_MASK));
-            let is_subnormal = vcltq_u32(abs_bits, vdupq_n_u32(IEEE754_F32_IMPLICIT_BIT));
-            let signed_zero = vandq_u32(bits, vdupq_n_u32(IEEE754_F32_SIGN_MASK));
-            let flushed = vbslq_u32(is_subnormal, signed_zero, bits);
-            let non_finite = vcgeq_u32(abs_bits, vdupq_n_u32(IEEE754_F32_EXP_MASK));
-            vreinterpretq_f32_u32(vbicq_u32(flushed, non_finite))
+            let biased = vsubq_u32(vshlq_n_u32::<1>(bits), vdupq_n_u32(SCRUB_SHIFTED_EXP_STEP));
+            let is_normal = vcltq_u32(biased, vdupq_n_u32(SCRUB_SHIFTED_NORMAL_SPAN));
+            vreinterpretq_f32_u32(vandq_u32(bits, is_normal))
         })
     }
 
@@ -451,6 +456,18 @@ mod tests {
         let sf = flush_recursive_state_vec4(ScalarVec4::load(&dirty)).to_array();
         for i in 0..4 {
             assert_eq!(nf[i].to_bits(), sf[i].to_bits());
+        }
+        let edge_zeros = [
+            -0.0_f32,
+            0.0_f32,
+            f32::INFINITY,
+            f32::from_bits(0x7F80_0001),
+        ];
+        let nzf = flush_recursive_state_vec4(NeonVec4::load(&edge_zeros)).to_array();
+        let szf = flush_recursive_state_vec4(ScalarVec4::load(&edge_zeros)).to_array();
+        for i in 0..4 {
+            assert_eq!(nzf[i].to_bits(), 0);
+            assert_eq!(nzf[i].to_bits(), szf[i].to_bits());
         }
         let v = NeonVec4::from_array([1.0, 2.0, 3.0, 4.0]);
         assert_eq!(v.dup_low_pair().to_array(), [1.0, 2.0, 1.0, 2.0]);

@@ -103,6 +103,7 @@ impl<V: KernelVec4> SegmentGeom4<V> {
 
 #[derive(Copy, Clone, Debug)]
 pub(super) struct SegmentGeom8<S: StereoVec8> {
+    pub(super) u_curr_safe: S,
     pub(super) lower: S,
     pub(super) upper: S,
     pub(super) m: S,
@@ -140,6 +141,7 @@ impl<S: StereoVec8> SegmentGeom8<S> {
         let max_abs = u0.abs().max(u1.abs());
 
         Self {
+            u_curr_safe: u1,
             lower,
             upper,
             m,
@@ -326,6 +328,88 @@ pub fn eval_poly_adaa1_stereo8<S: StereoVec8>(u_prev: S, u_curr: S) -> (S, S) {
     }
     let inv = geom.distance.rcp_pos_nr2();
     finish_rail_crossing_odd_even_stereo8(&geom, odd_int, even_int, inv)
+}
+
+/// Fused evaluation of `PolyADAA1` odd/even and odd-only $C^2$ wavefolder blend on 4 SIMD lanes,
+/// sharing segment geometry, the `all_lanes_le_one` fast path, and a single `rcp_pos_nr2` on
+/// rail crossings while skipping `_wf_even` (`0-ULP` identical to separate evaluation + blend).
+#[inline(always)]
+#[must_use]
+pub fn eval_poly_adaa1_with_wavefolder_vec4<V: KernelVec4>(
+    u_prev: V,
+    u_curr: V,
+    wf_mix: V,
+) -> (V, V, V) {
+    let wf_clamped = wf_mix.clamp(V::zero(), V::splat(1.0));
+    let geom = SegmentGeom4::from_endpoints(u_prev, u_curr);
+    let (odd_int, even_int) = eval_interior_odd_even_vec4(geom.m, geom.m2, geom.d2, geom.max_abs);
+    let interior = all_lanes_le_one_vec4(geom.max_abs);
+    if wf_clamped.all_le(V::zero()) {
+        if interior {
+            return (odd_int, even_int, geom.u_curr_safe);
+        }
+        let inv = geom.distance.rcp_pos_nr2();
+        let (odd, even) = finish_rail_crossing_odd_even_vec4(&geom, odd_int, even_int, inv);
+        return (odd, even, geom.u_curr_safe);
+    }
+    let wf_odd_int =
+        wavefolder::eval_c2_wf_odd_interior_vec4(geom.m, geom.m2, geom.d2, geom.max_abs);
+    let (adaa_odd, adaa_even, wf_odd) = if interior {
+        (odd_int, even_int, wf_odd_int)
+    } else {
+        let inv = geom.distance.rcp_pos_nr2();
+        let (odd, even) = finish_rail_crossing_odd_even_vec4(&geom, odd_int, even_int, inv);
+        let wf_odd = wavefolder::finish_c2_wf_odd_rail_crossing_vec4(&geom, wf_odd_int, inv);
+        (odd, even, wf_odd)
+    };
+    let one_minus_wf = V::splat(1.0).sub(wf_clamped);
+    let mixed_odd = adaa_odd
+        .mul(one_minus_wf)
+        .fma(wf_clamped, wf_odd)
+        .add(V::zero());
+    (mixed_odd, adaa_even, geom.u_curr_safe)
+}
+
+/// Fused evaluation of `PolyADAA1` odd/even and odd-only $C^2$ wavefolder blend across an
+/// `8`-lane `StereoVec8` register, returning `(odd_mixed, even, u_curr_safe)` with `0-ULP`
+/// parity against [`eval_poly_adaa1_stereo8`] + [`eval_c2_wavefolder_adaa_stereo8`].
+#[inline(always)]
+#[must_use]
+pub fn eval_poly_adaa1_with_wavefolder_stereo8<S: StereoVec8>(
+    u_prev: S,
+    u_curr: S,
+    wf_mix: S::Half,
+) -> (S, S, S) {
+    let wf_clamped = wf_mix.clamp(S::Half::zero(), S::Half::splat(1.0));
+    let geom = SegmentGeom8::from_endpoints(u_prev, u_curr);
+    let (odd_int, even_int) =
+        eval_interior_odd_even_stereo8(geom.m, geom.m2, geom.d2, geom.max_abs);
+    let interior = all_lanes_le_one_stereo8(geom.max_abs);
+    if wf_clamped.all_le(S::Half::zero()) {
+        if interior {
+            return (odd_int, even_int, geom.u_curr_safe);
+        }
+        let inv = geom.distance.rcp_pos_nr2();
+        let (odd, even) = finish_rail_crossing_odd_even_stereo8(&geom, odd_int, even_int, inv);
+        return (odd, even, geom.u_curr_safe);
+    }
+    let wf_odd_int =
+        wavefolder::eval_c2_wf_odd_interior_stereo8(geom.m, geom.m2, geom.d2, geom.max_abs);
+    let (adaa_odd, adaa_even, wf_odd) = if interior {
+        (odd_int, even_int, wf_odd_int)
+    } else {
+        let inv = geom.distance.rcp_pos_nr2();
+        let (odd, even) = finish_rail_crossing_odd_even_stereo8(&geom, odd_int, even_int, inv);
+        let wf_odd = wavefolder::finish_c2_wf_odd_rail_crossing_stereo8(&geom, wf_odd_int, inv);
+        (odd, even, wf_odd)
+    };
+    let wf_mix_s = S::broadcast_half(wf_clamped);
+    let one_minus_wf = S::splat(1.0).sub(wf_mix_s);
+    let mixed_odd = adaa_odd
+        .mul(one_minus_wf)
+        .fma(wf_mix_s, wf_odd)
+        .add(S::zero());
+    (mixed_odd, adaa_even, geom.u_curr_safe)
 }
 
 #[cfg(test)]
@@ -535,6 +619,161 @@ mod tests {
                 prop_assert!((o_l.to_array()[idx] as f64 - exp_o).abs() < 1.0e-5);
                 prop_assert!((e_l.to_array()[idx] as f64 - exp_e).abs() < 1.0e-5);
             }
+        }
+
+        #[test]
+        fn prop_fused_poly_adaa1_with_wavefolder_zero_ulp_equivalence(
+            prev_l in prop::array::uniform4(prop_oneof![Just(-0.0_f32), Just(0.0_f32), -8.0_f32..8.0_f32]),
+            curr_l in prop::array::uniform4(prop_oneof![Just(-0.0_f32), Just(0.0_f32), -8.0_f32..8.0_f32]),
+            prev_r in prop::array::uniform4(prop_oneof![Just(-1.0_f32), Just(1.0_f32), -0.95_f32..0.95_f32]),
+            curr_r in prop::array::uniform4(prop_oneof![Just(-1.0_f32), Just(1.0_f32), -0.95_f32..0.95_f32]),
+            wf_mix in prop::array::uniform4(prop_oneof![Just(0.0_f32), Just(1.0_f32), 0.01_f32..0.99_f32]),
+        ) {
+            let pl = GpuVec4::from_array(prev_l);
+            let cl = GpuVec4::from_array(curr_l);
+            let pr = GpuVec4::from_array(prev_r);
+            let cr = GpuVec4::from_array(curr_r);
+            let wf = GpuVec4::from_array(wf_mix);
+
+            let (mut ref_ol, ref_el, ref_next_l) = eval_poly_adaa1_odd_even_vec4(pl, cl);
+            let (mut ref_or, ref_er, ref_next_r) = eval_poly_adaa1_odd_even_vec4(pr, cr);
+            if !wf.all_le(GpuVec4::zero()) {
+                let (wfl, _) = eval_c2_wavefolder_adaa_vec4(pl, cl);
+                let (wfr, _) = eval_c2_wavefolder_adaa_vec4(pr, cr);
+                let omw = GpuVec4::splat(1.0).sub(wf);
+                ref_ol = ref_ol.mul(omw).fma(wf, wfl).add(GpuVec4::zero());
+                ref_or = ref_or.mul(omw).fma(wf, wfr).add(GpuVec4::zero());
+            }
+
+            let (f_ol, f_el, f_next_l) = eval_poly_adaa1_with_wavefolder_vec4(pl, cl, wf);
+            let (f_or, f_er, f_next_r) = eval_poly_adaa1_with_wavefolder_vec4(pr, cr, wf);
+            prop_assert_eq!(f_ol.to_array().map(f32::to_bits), ref_ol.to_array().map(f32::to_bits));
+            prop_assert_eq!(f_el.to_array().map(f32::to_bits), ref_el.to_array().map(f32::to_bits));
+            prop_assert_eq!(f_next_l.to_array().map(f32::to_bits), ref_next_l.to_array().map(f32::to_bits));
+            prop_assert_eq!(f_or.to_array().map(f32::to_bits), ref_or.to_array().map(f32::to_bits));
+            prop_assert_eq!(f_er.to_array().map(f32::to_bits), ref_er.to_array().map(f32::to_bits));
+            prop_assert_eq!(f_next_r.to_array().map(f32::to_bits), ref_next_r.to_array().map(f32::to_bits));
+
+            let st_p = InterleavedStereo8::from_lr(pl, pr);
+            let st_c = InterleavedStereo8::from_lr(cl, cr);
+            let (f_s_odd, f_s_even, f_s_next) =
+                eval_poly_adaa1_with_wavefolder_stereo8(st_p, st_c, wf);
+            let (fol, for_) = f_s_odd.into_lr();
+            let (fel, fer) = f_s_even.into_lr();
+            let (fnl, fnr) = f_s_next.into_lr();
+            prop_assert_eq!(fol.to_array().map(f32::to_bits), ref_ol.to_array().map(f32::to_bits));
+            prop_assert_eq!(for_.to_array().map(f32::to_bits), ref_or.to_array().map(f32::to_bits));
+            prop_assert_eq!(fel.to_array().map(f32::to_bits), ref_el.to_array().map(f32::to_bits));
+            prop_assert_eq!(fer.to_array().map(f32::to_bits), ref_er.to_array().map(f32::to_bits));
+            prop_assert_eq!(fnl.to_array().map(f32::to_bits), ref_next_l.to_array().map(f32::to_bits));
+            prop_assert_eq!(fnr.to_array().map(f32::to_bits), ref_next_r.to_array().map(f32::to_bits));
+        }
+    }
+
+    #[test]
+    fn test_fused_poly_adaa1_with_wavefolder_edge_cases_zero_ulp() {
+        type WfEdgeCase = ([f32; 4], [f32; 4], [f32; 4], [f32; 4], [f32; 4]);
+        let edge_cases: [WfEdgeCase; 5] = [
+            // Interior with -0.0 and wf_mix == 0
+            (
+                [-0.0, 0.25, -0.75, 1.0],
+                [0.0, -0.5, 0.75, -1.0],
+                [-0.2, 0.0, 0.5, -0.5],
+                [0.3, -0.0, -0.5, 0.5],
+                [0.0, 0.0, 0.0, 0.0],
+            ),
+            // Interior with mixed wf_mix including 0 and (0, 1)
+            (
+                [-0.0, 0.25, -0.75, 1.0],
+                [0.0, -0.5, 0.75, -1.0],
+                [-0.2, 0.0, 0.5, -0.5],
+                [0.3, -0.0, -0.5, 0.5],
+                [0.0, 0.25, 0.75, 1.0],
+            ),
+            // Mixed L interior / R rail-crossing
+            (
+                [-0.5, 0.2, -0.8, 0.1],
+                [0.4, -0.3, 0.9, -0.1],
+                [-3.0, 0.5, -2.5, 1.5],
+                [2.5, -2.0, 3.0, 4.0],
+                [0.0, 0.4, 0.8, 1.0],
+            ),
+            // Non-finite NaN / ±Inf scrubbing
+            (
+                [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.0],
+                [0.5, -0.5, f32::NAN, f32::INFINITY],
+                [f32::NEG_INFINITY, 2.0, -2.0, f32::NAN],
+                [1.0, f32::NAN, -1.0, -0.0],
+                [0.0, 0.3, 0.7, 1.0],
+            ),
+            // Rail-crossing with wf_mix == 0
+            (
+                [-4.0, -0.5, 2.0, -1.5],
+                [4.0, 3.0, 5.0, -3.5],
+                [-2.0, 1.5, -0.25, 0.0],
+                [2.0, -1.5, 2.5, 4.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ),
+        ];
+
+        for (case_idx, &(pl_a, cl_a, pr_a, cr_a, wf_a)) in edge_cases.iter().enumerate() {
+            let pl = GpuVec4::from_array(pl_a);
+            let cl = GpuVec4::from_array(cl_a);
+            let pr = GpuVec4::from_array(pr_a);
+            let cr = GpuVec4::from_array(cr_a);
+            let wf = GpuVec4::from_array(wf_a);
+            let st_p = InterleavedStereo8::from_lr(pl, pr);
+            let st_c = InterleavedStereo8::from_lr(cl, cr);
+
+            let (mut ref_o, ref_e) = eval_poly_adaa1_stereo8(st_p, st_c);
+            if !wf.all_le(GpuVec4::zero()) {
+                let (wfo, _) = eval_c2_wavefolder_adaa_stereo8(st_p, st_c);
+                let wf_s = InterleavedStereo8::broadcast_half(wf);
+                let omw = InterleavedStereo8::splat(1.0).sub(wf_s);
+                ref_o = ref_o
+                    .mul(omw)
+                    .fma(wf_s, wfo)
+                    .add(InterleavedStereo8::zero());
+            }
+            let ref_next = scrub_endpoint_stereo8(st_c);
+
+            let (f_o, f_e, f_next) = eval_poly_adaa1_with_wavefolder_stereo8(st_p, st_c, wf);
+            let (fol, for_) = f_o.into_lr();
+            let (rol, ror) = ref_o.into_lr();
+            let (fel, fer) = f_e.into_lr();
+            let (rel, rer) = ref_e.into_lr();
+            let (fnl, fnr) = f_next.into_lr();
+            let (rnl, rnr) = ref_next.into_lr();
+            assert_eq!(
+                fol.to_array().map(f32::to_bits),
+                rol.to_array().map(f32::to_bits),
+                "case {case_idx}"
+            );
+            assert_eq!(
+                for_.to_array().map(f32::to_bits),
+                ror.to_array().map(f32::to_bits),
+                "case {case_idx}"
+            );
+            assert_eq!(
+                fel.to_array().map(f32::to_bits),
+                rel.to_array().map(f32::to_bits),
+                "case {case_idx}"
+            );
+            assert_eq!(
+                fer.to_array().map(f32::to_bits),
+                rer.to_array().map(f32::to_bits),
+                "case {case_idx}"
+            );
+            assert_eq!(
+                fnl.to_array().map(f32::to_bits),
+                rnl.to_array().map(f32::to_bits),
+                "case {case_idx}"
+            );
+            assert_eq!(
+                fnr.to_array().map(f32::to_bits),
+                rnr.to_array().map(f32::to_bits),
+                "case {case_idx}"
+            );
         }
     }
 }

@@ -15,10 +15,16 @@ use zerocopy::IntoBytes;
 
 use super::sse2::Sse2Vec4;
 use super::sse42::X86Sse42Backend;
+use crate::graph::slab::{
+    SonaHotSlab, process_block_sona, process_block_sona_inline, process_tick16_const,
+    process_tick16_const_inline, step_control_tick_3khz, step_control_tick_3khz_inline,
+    step_frame_4x_sona, step_frame_4x_sona_inline, step_frame_sona, step_frame_sona_inline,
+};
 use crate::math::crc32c::Crc32cBackend;
 use crate::math::{
     BackendKind, FP16_FINITE_MAX_F32, MathBackend, SimdVec4, f32_to_fp16, fp16_to_f32,
 };
+use crate::types::VmError;
 
 const CACHE_UNSET: u8 = 0;
 const CACHE_UNSUPPORTED: u8 = 1;
@@ -66,7 +72,7 @@ fn probe_avx2_fma_support() -> bool {
 }
 
 #[inline(always)]
-fn is_avx2_fma_hot() -> bool {
+pub(super) fn is_avx2_fma_hot() -> bool {
     if cfg!(all(
         target_feature = "avx2",
         target_feature = "fma",
@@ -191,6 +197,16 @@ impl SimdVec4 for Avx2FmaVec4 {
     }
 
     #[inline(always)]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        self.fma(a, Self(v.0.splat_lane::<LANE>()))
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        self.mul(Self(v.0.splat_lane::<LANE>()))
+    }
+
+    #[inline(always)]
     fn fms(self, a: Self, b: Self) -> Self {
         if is_avx2_fma_hot() {
             // SAFETY: `is_avx2_fma_hot()` verified pre-warmed hardware `FMA` support.
@@ -310,6 +326,16 @@ impl dnam_kernels::KernelVec4 for Avx2FmaVec4 {
     #[inline(always)]
     fn fms(self, a: Self, b: Self) -> Self {
         <Self as SimdVec4>::fms(self, a, b)
+    }
+
+    #[inline(always)]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        <Self as SimdVec4>::fma_lane::<LANE>(self, a, v)
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        <Self as SimdVec4>::mul_lane::<LANE>(self, v)
     }
 
     #[inline(always)]
@@ -467,6 +493,111 @@ impl MathBackend for X86Avx2FmaBackend {
     fn fp16x4_to_f32x4(src: &[u16; 4]) -> [f32; 4] {
         Self::fp16x4_to_vec4(src).to_array()
     }
+}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn process_block_avx2_hw(
+    slab: &mut SonaHotSlab<'_, X86Avx2FmaBackend>,
+    in_l: &[f32],
+    in_r: &[f32],
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+) -> Result<(), VmError> {
+    process_block_sona_inline(slab, in_l, in_r, out_l, out_r)
+}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn process_tick16_avx2_hw(
+    slab: &mut SonaHotSlab<'_, X86Avx2FmaBackend>,
+    in_l: &[f32; 16],
+    in_r: &[f32; 16],
+    out_l: &mut [f32; 16],
+    out_r: &mut [f32; 16],
+) -> Result<(), VmError> {
+    process_tick16_const_inline(slab, in_l, in_r, out_l, out_r)
+}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn step_frame_avx2_hw(
+    slab: &mut SonaHotSlab<'_, X86Avx2FmaBackend>,
+    in_l: f32,
+    in_r: f32,
+) -> Result<(f32, f32), VmError> {
+    if slab.cold().offline_bounce {
+        step_frame_4x_sona_inline(slab, in_l, in_r)
+    } else {
+        step_frame_sona_inline(slab, in_l, in_r)
+    }
+}
+
+#[target_feature(enable = "avx2,fma,f16c")]
+unsafe fn step_control_tick_avx2_hw(slab: &mut SonaHotSlab<'_, X86Avx2FmaBackend>) {
+    step_control_tick_3khz_inline(slab);
+}
+
+/// Dispatches `SonaHotSlab::process_block` inside a `#[target_feature(enable = "avx2,fma,f16c")]`
+/// block region after checking host support once at entry (falling back safely on non-AVX2 CPUs).
+#[inline(always)]
+pub(crate) fn dispatch_avx2_process_block(
+    slab: &mut SonaHotSlab<'_, X86Avx2FmaBackend>,
+    in_l: &[f32],
+    in_r: &[f32],
+    out_l: &mut [f32],
+    out_r: &mut [f32],
+) -> Result<(), VmError> {
+    if !X86Avx2FmaBackend::is_supported_cached() {
+        return process_block_sona(slab, in_l, in_r, out_l, out_r);
+    }
+    // SAFETY: `is_supported_cached()` verified `AVX2 + FMA + F16C` support at block entry.
+    unsafe { process_block_avx2_hw(slab, in_l, in_r, out_l, out_r) }
+}
+
+/// Dispatches `process_tick16_const` inside a `#[target_feature(enable = "avx2,fma,f16c")]`
+/// tick region after checking host support once at entry (falling back safely on non-AVX2 CPUs).
+#[inline(always)]
+pub(crate) fn dispatch_avx2_process_tick16(
+    slab: &mut SonaHotSlab<'_, X86Avx2FmaBackend>,
+    in_l: &[f32; 16],
+    in_r: &[f32; 16],
+    out_l: &mut [f32; 16],
+    out_r: &mut [f32; 16],
+) -> Result<(), VmError> {
+    if !X86Avx2FmaBackend::is_supported_cached() {
+        return process_tick16_const(slab, in_l, in_r, out_l, out_r);
+    }
+    // SAFETY: `is_supported_cached()` verified `AVX2 + FMA + F16C` support at tick entry.
+    unsafe { process_tick16_avx2_hw(slab, in_l, in_r, out_l, out_r) }
+}
+
+/// Dispatches `step_frame` inside a `#[target_feature(enable = "avx2,fma,f16c")]` frame region
+/// after checking host support once at entry (falling back safely on non-AVX2 CPUs).
+#[inline(always)]
+pub(crate) fn dispatch_avx2_step_frame(
+    slab: &mut SonaHotSlab<'_, X86Avx2FmaBackend>,
+    in_l: f32,
+    in_r: f32,
+) -> Result<(f32, f32), VmError> {
+    if !X86Avx2FmaBackend::is_supported_cached() {
+        return if slab.cold().offline_bounce {
+            step_frame_4x_sona(slab, in_l, in_r)
+        } else {
+            step_frame_sona(slab, in_l, in_r)
+        };
+    }
+    // SAFETY: `is_supported_cached()` verified `AVX2 + FMA + F16C` support at frame entry.
+    unsafe { step_frame_avx2_hw(slab, in_l, in_r) }
+}
+
+/// Dispatches `step_control_tick_3khz` inside a `#[target_feature(enable = "avx2,fma,f16c")]`
+/// control-tick region after checking host support once at entry (falling back safely on non-AVX2 CPUs).
+#[inline(always)]
+pub(crate) fn dispatch_avx2_step_control_tick(slab: &mut SonaHotSlab<'_, X86Avx2FmaBackend>) {
+    if !X86Avx2FmaBackend::is_supported_cached() {
+        step_control_tick_3khz(slab);
+        return;
+    }
+    // SAFETY: `is_supported_cached()` verified `AVX2 + FMA + F16C` support at control-tick entry.
+    unsafe { step_control_tick_avx2_hw(slab) }
 }
 
 #[cfg(test)]

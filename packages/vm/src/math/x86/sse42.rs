@@ -113,6 +113,16 @@ impl SimdVec4 for Sse42Vec4 {
     }
 
     #[inline(always)]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        Self(self.0.fma_lane::<LANE>(a.0, v.0))
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        Self(self.0.mul_lane::<LANE>(v.0))
+    }
+
+    #[inline(always)]
     fn fms(self, a: Self, b: Self) -> Self {
         Self(self.0.fms(a.0, b.0))
     }
@@ -227,6 +237,16 @@ impl dnam_kernels::KernelVec4 for Sse42Vec4 {
     #[inline(always)]
     fn fms(self, a: Self, b: Self) -> Self {
         <Self as SimdVec4>::fms(self, a, b)
+    }
+
+    #[inline(always)]
+    fn fma_lane<const LANE: usize>(self, a: Self, v: Self) -> Self {
+        <Self as SimdVec4>::fma_lane::<LANE>(self, a, v)
+    }
+
+    #[inline(always)]
+    fn mul_lane<const LANE: usize>(self, v: Self) -> Self {
+        <Self as SimdVec4>::mul_lane::<LANE>(self, v)
     }
 
     #[inline(always)]

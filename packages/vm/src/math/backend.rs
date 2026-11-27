@@ -3,7 +3,7 @@
 
 pub mod simd_vec4;
 
-use dnam_kernels::{StereoVec8, scrub_and_flush_f32_bits};
+use dnam_kernels::{StereoVec8, canonicalize_zero_f32_bits};
 pub use simd_vec4::SimdVec4;
 
 use super::{BackendKind, IEEE754_F32_RSQRT_SEED, algebraic_unit_rotor, f32_to_fp16, fp16_to_f32};
@@ -15,13 +15,13 @@ pub const fn flush_subnormal_f32_bits(value: f32) -> f32 {
     dnam_kernels::flush_subnormal_f32_bits(value)
 }
 
-/// Scrubs non-finite states (`NaN`/`±Inf`) to `+0.0` and flushes subnormals to signed zero.
+/// Scrubs non-finite states (`NaN`/`±Inf`), subnormals, and `-0.0` to canonical `+0.0`.
 #[inline(always)]
 pub const fn flush_recursive_state_f32(value: f32) -> f32 {
-    scrub_and_flush_f32_bits(value)
+    canonicalize_zero_f32_bits(value)
 }
 
-/// Scrubs non-finite lanes (`NaN`/`±Inf`) to `+0.0` and flushes subnormals to signed zero across 4 lanes.
+/// Scrubs non-finite lanes (`NaN`/`±Inf`), subnormals, and `-0.0` to `+0.0` across 4 lanes.
 #[inline(always)]
 pub fn flush_recursive_state_vec4<V: SimdVec4>(value: V) -> V {
     value.scrub_recursive_state()
@@ -202,9 +202,17 @@ pub(crate) mod tests {
         ]);
         let flushed = flush_recursive_state_vec4(dirty).to_array();
         assert_eq!(flushed[0].to_bits(), 0);
-        assert_eq!(flushed[1].to_bits(), 0x8000_0000);
+        assert_eq!(flushed[1].to_bits(), 0);
         assert_eq!(flushed[2].to_bits(), 0);
         assert_eq!(flushed[3].to_bits(), (-0.5_f32).to_bits());
+
+        let neg_zero = V::from_array([-0.0, f32::INFINITY, f32::NEG_INFINITY, 1.5])
+            .scrub_recursive_state()
+            .to_array();
+        assert_eq!(neg_zero[0].to_bits(), 0);
+        assert_eq!(neg_zero[1].to_bits(), 0);
+        assert_eq!(neg_zero[2].to_bits(), 0);
+        assert_eq!(neg_zero[3].to_bits(), 1.5_f32.to_bits());
     }
 
     pub(crate) fn verify_math_backend_ops<B: MathBackend>() {

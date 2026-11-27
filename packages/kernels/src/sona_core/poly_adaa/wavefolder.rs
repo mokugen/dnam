@@ -62,9 +62,20 @@ impl QuadratureHysteresis2D {
 }
 
 #[inline(always)]
-fn eval_c2_wf_interior_vec4<V: KernelVec4>(m: V, m2: V, d2: V, max_abs: V) -> (V, V) {
+pub(super) fn eval_c2_wf_odd_interior_vec4<V: KernelVec4>(m: V, m2: V, d2: V, max_abs: V) -> V {
     let zero = V::zero();
     let one = V::splat(1.0);
+    let four = V::splat(4.0);
+
+    let s = m2.add(d2);
+    let oms = one.sub(s);
+    let raw_odd = m.mul(oms).mul(oms.mul(oms).fma(four.mul(m2), d2));
+    V::select_le(max_abs, zero, zero, raw_odd).add(zero)
+}
+
+#[inline(always)]
+fn eval_c2_wf_interior_vec4<V: KernelVec4>(m: V, m2: V, d2: V, max_abs: V) -> (V, V) {
+    let zero = V::zero();
     let two = V::splat(2.0);
     let three = V::splat(3.0);
     let four = V::splat(4.0);
@@ -76,10 +87,7 @@ fn eval_c2_wf_interior_vec4<V: KernelVec4>(m: V, m2: V, d2: V, max_abs: V) -> (V
     let one_ninth = V::splat(ONE_NINTH);
     let twenty_eight_thirds = V::splat(TWENTY_EIGHT_THIRDS);
 
-    let s = m2.add(d2);
-    let oms = one.sub(s);
-    let raw_odd = m.mul(oms).mul(oms.mul(oms).fma(four.mul(m2), d2));
-    let wf_odd = V::select_le(max_abs, zero, zero, raw_odd).add(zero);
+    let wf_odd = eval_c2_wf_odd_interior_vec4(m, m2, d2, max_abs);
 
     let m4 = m2.mul(m2);
     let d4 = d2.mul(d2);
@@ -106,9 +114,20 @@ fn eval_c2_wf_interior_vec4<V: KernelVec4>(m: V, m2: V, d2: V, max_abs: V) -> (V
 }
 
 #[inline(always)]
-fn eval_c2_wf_interior_stereo8<S: StereoVec8>(m: S, m2: S, d2: S, max_abs: S) -> (S, S) {
+pub(super) fn eval_c2_wf_odd_interior_stereo8<S: StereoVec8>(m: S, m2: S, d2: S, max_abs: S) -> S {
     let zero = S::zero();
     let one = S::splat(1.0);
+    let four = S::splat(4.0);
+
+    let s = m2.add(d2);
+    let oms = one.sub(s);
+    let raw_odd = m.mul(oms).mul(oms.mul(oms).fma(four.mul(m2), d2));
+    S::select_le(max_abs, zero, zero, raw_odd).add(zero)
+}
+
+#[inline(always)]
+fn eval_c2_wf_interior_stereo8<S: StereoVec8>(m: S, m2: S, d2: S, max_abs: S) -> (S, S) {
+    let zero = S::zero();
     let two = S::splat(2.0);
     let three = S::splat(3.0);
     let four = S::splat(4.0);
@@ -120,10 +139,7 @@ fn eval_c2_wf_interior_stereo8<S: StereoVec8>(m: S, m2: S, d2: S, max_abs: S) ->
     let one_ninth = S::splat(ONE_NINTH);
     let twenty_eight_thirds = S::splat(TWENTY_EIGHT_THIRDS);
 
-    let s = m2.add(d2);
-    let oms = one.sub(s);
-    let raw_odd = m.mul(oms).mul(oms.mul(oms).fma(four.mul(m2), d2));
-    let wf_odd = S::select_le(max_abs, zero, zero, raw_odd).add(zero);
+    let wf_odd = eval_c2_wf_odd_interior_stereo8(m, m2, d2, max_abs);
 
     let m4 = m2.mul(m2);
     let d4 = d2.mul(d2);
@@ -149,6 +165,62 @@ fn eval_c2_wf_interior_stereo8<S: StereoVec8>(m: S, m2: S, d2: S, max_abs: S) ->
     (wf_odd, wf_even)
 }
 
+#[inline(always)]
+pub(super) fn finish_c2_wf_odd_rail_crossing_vec4<V: KernelVec4>(
+    geom: &SegmentGeom4<V>,
+    wf_odd_int: V,
+    inv: V,
+) -> V {
+    let zero = V::zero();
+    let one = V::splat(1.0);
+    let neg_one = V::splat(-1.0);
+    let tiny = V::splat(TINY_CROSSING_EPS);
+
+    let wf_odd_cross = geom.inside.mul(wf_odd_int).mul(inv);
+
+    let is_int_lo = V::select_le(neg_one, geom.lower, one, zero);
+    let is_int_hi = V::select_le(geom.upper, one, one, zero);
+    let use_int = V::select_le(geom.distance, tiny, one, is_int_lo.mul(is_int_hi));
+
+    let wf_odd_base = V::select_le(use_int, zero, wf_odd_cross, wf_odd_int);
+
+    V::select_le(
+        geom.upper,
+        neg_one,
+        zero,
+        V::select_le(one, geom.lower, zero, wf_odd_base),
+    )
+    .add(zero)
+}
+
+#[inline(always)]
+pub(super) fn finish_c2_wf_odd_rail_crossing_stereo8<S: StereoVec8>(
+    geom: &SegmentGeom8<S>,
+    wf_odd_int: S,
+    inv: S,
+) -> S {
+    let zero = S::zero();
+    let one = S::splat(1.0);
+    let neg_one = S::splat(-1.0);
+    let tiny = S::splat(TINY_CROSSING_EPS);
+
+    let wf_odd_cross = geom.inside.mul(wf_odd_int).mul(inv);
+
+    let is_int_lo = S::select_le(neg_one, geom.lower, one, zero);
+    let is_int_hi = S::select_le(geom.upper, one, one, zero);
+    let use_int = S::select_le(geom.distance, tiny, one, is_int_lo.mul(is_int_hi));
+
+    let wf_odd_base = S::select_le(use_int, zero, wf_odd_cross, wf_odd_int);
+
+    S::select_le(
+        geom.upper,
+        neg_one,
+        zero,
+        S::select_le(one, geom.lower, zero, wf_odd_base),
+    )
+    .add(zero)
+}
+
 /// Evaluates the $C^2$ compactly supported cubed-envelope wavefolder `ADAA1` odd and even responses
 /// `w_odd(u) = u_bar * (1 - u_bar^2)^3`, `w_even(u) = u_bar^2 * (1 - u_bar^2)^3` on 4 SIMD lanes
 /// (`ref[dsp.op-n.wavefolder.cubic-c2]`, zero outside `[-1, 1]`).
@@ -158,6 +230,9 @@ pub fn eval_c2_wavefolder_adaa_vec4<V: KernelVec4>(u_prev: V, u_curr: V) -> (V, 
     let geom = SegmentGeom4::from_endpoints(u_prev, u_curr);
     let (wf_odd_int, wf_even_int) =
         eval_c2_wf_interior_vec4(geom.m, geom.m2, geom.d2, geom.max_abs);
+    if super::all_lanes_le_one_vec4(geom.max_abs) {
+        return (wf_odd_int, wf_even_int);
+    }
 
     let zero = V::zero();
     let one = V::splat(1.0);
@@ -165,23 +240,14 @@ pub fn eval_c2_wavefolder_adaa_vec4<V: KernelVec4>(u_prev: V, u_curr: V) -> (V, 
     let tiny = V::splat(TINY_CROSSING_EPS);
 
     let inv = geom.distance.rcp_pos_nr2();
-    let wf_odd_cross = geom.inside.mul(wf_odd_int).mul(inv);
+    let wf_odd = finish_c2_wf_odd_rail_crossing_vec4(&geom, wf_odd_int, inv);
     let wf_even_cross = geom.inside.mul(wf_even_int).mul(inv);
 
     let is_int_lo = V::select_le(neg_one, geom.lower, one, zero);
     let is_int_hi = V::select_le(geom.upper, one, one, zero);
     let use_int = V::select_le(geom.distance, tiny, one, is_int_lo.mul(is_int_hi));
 
-    let wf_odd_base = V::select_le(use_int, zero, wf_odd_cross, wf_odd_int);
     let wf_even_base = V::select_le(use_int, zero, wf_even_cross, wf_even_int);
-
-    let wf_odd = V::select_le(
-        geom.upper,
-        neg_one,
-        zero,
-        V::select_le(one, geom.lower, zero, wf_odd_base),
-    )
-    .add(zero);
     let wf_even = V::select_le(
         geom.upper,
         neg_one,
@@ -199,6 +265,9 @@ pub fn eval_c2_wavefolder_adaa_stereo8<S: StereoVec8>(u_prev: S, u_curr: S) -> (
     let geom = SegmentGeom8::from_endpoints(u_prev, u_curr);
     let (wf_odd_int, wf_even_int) =
         eval_c2_wf_interior_stereo8(geom.m, geom.m2, geom.d2, geom.max_abs);
+    if super::all_lanes_le_one_stereo8(geom.max_abs) {
+        return (wf_odd_int, wf_even_int);
+    }
 
     let zero = S::zero();
     let one = S::splat(1.0);
@@ -206,23 +275,14 @@ pub fn eval_c2_wavefolder_adaa_stereo8<S: StereoVec8>(u_prev: S, u_curr: S) -> (
     let tiny = S::splat(TINY_CROSSING_EPS);
 
     let inv = geom.distance.rcp_pos_nr2();
-    let wf_odd_cross = geom.inside.mul(wf_odd_int).mul(inv);
+    let wf_odd = finish_c2_wf_odd_rail_crossing_stereo8(&geom, wf_odd_int, inv);
     let wf_even_cross = geom.inside.mul(wf_even_int).mul(inv);
 
     let is_int_lo = S::select_le(neg_one, geom.lower, one, zero);
     let is_int_hi = S::select_le(geom.upper, one, one, zero);
     let use_int = S::select_le(geom.distance, tiny, one, is_int_lo.mul(is_int_hi));
 
-    let wf_odd_base = S::select_le(use_int, zero, wf_odd_cross, wf_odd_int);
     let wf_even_base = S::select_le(use_int, zero, wf_even_cross, wf_even_int);
-
-    let wf_odd = S::select_le(
-        geom.upper,
-        neg_one,
-        zero,
-        S::select_le(one, geom.lower, zero, wf_odd_base),
-    )
-    .add(zero);
     let wf_even = S::select_le(
         geom.upper,
         neg_one,

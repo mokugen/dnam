@@ -98,7 +98,8 @@ pub trait SimdVec4: Copy + Clone + Send + Sync + 'static {
         Self::from_array(self.to_array().map(flush_subnormal_f32_bits))
     }
 
-    /// Scrubs non-finite lanes (`NaN`/`±Inf`) to `+0.0` and flushes subnormals to signed zero.
+    /// Canonicalizes `-0.0`, subnormals, `±Inf`, and `NaN` to `+0.0` (`0x0000_0000`) while
+    /// preserving all normal finite lanes.
     fn scrub_recursive_state(self) -> Self;
 
     /// Horizontal sum across all 4 lanes (`lane0 + lane1 + lane2 + lane3`).
@@ -358,7 +359,7 @@ pub(crate) mod tests {
             ])
         }
         fn scrub_recursive_state(self) -> Self {
-            Self(self.0.map(dnam_kernels::scrub_and_flush_f32_bits))
+            Self(self.0.map(dnam_kernels::canonicalize_zero_f32_bits))
         }
         fn horizontal_sum(self) -> f32 {
             (self.0[0] + self.0[1]) + (self.0[2] + self.0[3])
@@ -524,6 +525,14 @@ pub(crate) mod tests {
             [1.5, -4.0, 0.5, -4.5]
         );
         assert!(<V as KernelVec4>::all_le(a, <V as KernelVec4>::splat(4.0)));
+        assert!(!<V as KernelVec4>::all_le(
+            <V as KernelVec4>::load(&[1.0, f32::NAN, 3.0, -4.0]),
+            <V as KernelVec4>::splat(10.0),
+        ));
+        assert!(!<V as KernelVec4>::all_le(
+            a,
+            <V as KernelVec4>::load(&[10.0, 10.0, f32::NAN, 10.0]),
+        ));
         assert_eq!(
             <V as KernelVec4>::pair_swap_neg(a).to_array(),
             [2.5, 1.5, 4.5, 3.5]
