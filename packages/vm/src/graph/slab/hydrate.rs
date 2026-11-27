@@ -35,7 +35,7 @@ use crate::graph::convolver::high_sr::ConvolverHighSrFirExt;
 #[cfg(feature = "alloc")]
 use crate::graph::convolver::high_sr::EXT_FIR_STORAGE_F32_LEN;
 use crate::graph::oversample::{Bounce4xDecimator, Bounce4xOversampler};
-use crate::graph::sensory::SensoryQuadCold;
+use crate::graph::sensory::{SensoryParamsHot, SensoryQuadCold};
 use crate::graph::transport::{
     PartitionedSchroederBank, QuadColdMeta, QuadEffectiveTargets, QuadHydrateConfig,
     TRANSPORT_INLINE_QUAD0_CAP, TRANSPORT_MAX_QUADS, TransportExtRing, TransportQuadHotCompact,
@@ -197,10 +197,12 @@ fn prepare_common_cold_in_place<B: GraphBackend>(
     cold.offline_bounce = offline;
     cold.base_tank_dry_mix = base_tank_dry_mix;
     cold.ro_pole_48k = ro_pole_48k;
-    cold.sensory_cold = SensoryQuadCold::from_crossbar_wire(&cb, zoh.rho_vm);
+    let sensory_cold = SensoryQuadCold::from_crossbar_wire(&cb, zoh.rho_vm);
+    cold.sensory_cold = sensory_cold;
     cold.bounce4x = Bounce4xOversampler::new();
     cold.bounce4x_core_decim = Bounce4xDecimator::new();
     cold.bounce4x_wet_decim = Bounce4xDecimator::new();
+    slab.sensory_params = SensoryParamsHot::from_cold(&sensory_cold);
     setup_phasor_increments(slab, zoh);
     Ok(())
 }
@@ -450,6 +452,7 @@ pub fn reload_slab_from_dnam_bin_in_place<B: GraphBackend>(
     slab.full_delta = SonaFullHotDelta::empty();
     slab.pro_delta = SonaProHotDelta::empty();
     slab.ultra_delta = SonaUltraHotDelta::empty();
+    slab.sensory_params = SensoryParamsHot::zero();
     slab.cold_mut().reset_metadata_preserving_backing();
 
     populate_crossbar_and_core_quads(view, slab);

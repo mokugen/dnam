@@ -19,11 +19,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use dnam_kernels::OpNPreHotState;
 use dnam_vm::{
     ControlBus, ConvolverFirHistorySlices, ConvolverFirWeightSlices, CrossbarFrame,
-    DefaultControlBus, DefaultMathBackend, DnamBinView, DynamicSonaVm, HoistedCoreChunk,
-    MathBackend, PartitionedSchroederBank, QuadColdMeta, QuadEffectiveTargets, QuadTopRead,
-    SensoryQuadCold, SensoryQuadHot, SonaHotSlab, SonaTelemetrySnapshot, SonaVm,
-    TRANSPORT_MAX_QUADS, Tier, TransportExtRing, TransportModSlots, TransportQuadHotCompact,
-    TransportStageState, TransportTopOfFrameResult, VmError, bind_dnam_bin_prevalidated,
+    DefaultControlBus, DefaultMathBackend, DnamBinView, DynamicSonaVm, MathBackend,
+    PartitionedSchroederBank, QuadColdMeta, QuadEffectiveTargets, QuadTopRead, SensoryQuadCold,
+    SensoryQuadHot, SonaHotSlab, SonaTelemetrySnapshot, SonaVm, TRANSPORT_MAX_QUADS, Tier,
+    TransportExtRing, TransportModSlots, TransportQuadHotCompact, TransportStageState,
+    TransportTopOfFrameResult, VmError, bind_dnam_bin_prevalidated,
     reload_slab_from_dnam_bin_in_place, sona_graph_convolver_chunk_default,
     sona_graph_dispatch_transport_3khz_default, sona_graph_eval_core_quads_default,
     sona_graph_op_n_pre_step_default, sona_graph_sensory_step_default,
@@ -141,7 +141,6 @@ fn retain_vm_realtime_roots() {
     core::hint::black_box::<
         fn(
             &mut SonaHotSlab<'_, DefaultMathBackend>,
-            &HoistedCoreChunk<DefaultMathBackend>,
             &CrossbarFrame<<DefaultMathBackend as MathBackend>::Vec4>,
             (f32, f32),
         ) -> ((f32, f32), (f32, f32)),

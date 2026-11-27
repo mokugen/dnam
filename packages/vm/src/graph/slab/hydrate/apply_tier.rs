@@ -231,7 +231,6 @@ pub(super) fn apply_tier_weights_and_rescale<B: GraphBackend>(
     cold.core_mods_active = cold.core_mods_present && matches!(tier, Tier::Ultra);
     cold.active_kautz_blocks = active_banks;
     cold.active_transport_quads = t_idx + 1;
-    cold.hoisted_core_valid = false;
 
     let (fir_l, fir_r) = (slab.cold().tier_fir_l[t_idx], slab.cold().tier_fir_r[t_idx]);
     pack_fir_tiles(&mut slab.lite.fir_weights_l, &fir_l[0..LITE_FIR_END]);

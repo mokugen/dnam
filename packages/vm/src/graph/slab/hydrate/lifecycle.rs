@@ -14,7 +14,7 @@ use crate::control::bus::laws::{
 use crate::graph::GraphBackend;
 use crate::graph::convolver::high_sr::ConvolverHighSrFirExt;
 use crate::graph::convolver::kautz::MAX_KAUTZ_BANKS;
-use crate::graph::sensory::SensoryQuadCold;
+use crate::graph::sensory::{SensoryParamsHot, SensoryQuadCold};
 use crate::graph::transport::{
     QuadEffectiveTargets, QuadHydrateConfig, TRANSPORT_MAX_QUADS, TransportModSlots,
     compute_quad_ext_requirements, compute_schroeder_requirements, latch_quad_nonslew_targets,
@@ -222,9 +222,10 @@ fn retime_with_bounce<B: GraphBackend>(
 
     {
         let cb = slab.cold().wire_crossbar;
+        let sensory_cold = SensoryQuadCold::from_crossbar_wire(&cb, zoh.rho_vm);
         let cold = slab.cold_mut();
         cold.zoh = zoh;
-        cold.sensory_cold = SensoryQuadCold::from_crossbar_wire(&cb, zoh.rho_vm);
+        cold.sensory_cold = sensory_cold;
         if let Some(bus) = cold.ctrl_bus.as_mut() {
             bus.retime_sample_rate(zoh.f_s_vm as f32);
         }
@@ -236,6 +237,7 @@ fn retime_with_bounce<B: GraphBackend>(
             zoh.f_s_vm,
             new_offline,
         )?;
+        slab.sensory_params = SensoryParamsHot::from_cold(&sensory_cold);
     }
 
     setup_phasor_increments(slab, &zoh);

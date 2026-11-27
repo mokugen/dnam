@@ -31,7 +31,6 @@ pub use layout::{
     SonaProHotDelta, SonaSlabBacking, SonaUltraHotDelta, TIER_SWITCH_XFADE_SAMPLES,
     TierCrossbarSnapshot,
 };
-pub use microchunk::core_step::HoistedCoreChunk;
 pub use microchunk::{
     evaluate_matryoshka_core_quads, process_block_sona, process_tick16_const, step_frame_4x_sona,
     step_frame_sona,

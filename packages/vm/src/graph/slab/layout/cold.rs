@@ -17,8 +17,7 @@ use crate::graph::convolver::kautz::{
     KautzColdSlewState, KautzStereoBank4, MAX_KAUTZ_BANKS, MAX_KAUTZ_PAIRS,
 };
 use crate::graph::oversample::{Bounce4xDecimator, Bounce4xOversampler, SonaOs2xHot};
-use crate::graph::sensory::SensoryQuadCold;
-use crate::graph::slab::microchunk::core_step::HoistedCoreChunk;
+use crate::graph::sensory::{SensoryParamsHot, SensoryQuadCold};
 use crate::graph::transport::ring::{PartitionedSchroederBank, TransportExtRing};
 use crate::graph::transport::{
     QuadColdMeta, QuadEffectiveTargets, TRANSPORT_MAX_QUADS, TransportQuadHotCompact,
@@ -150,8 +149,6 @@ pub struct SonaColdTail<'a, B: GraphBackend> {
     pub dc_blocker_pole_5hz: f32,
     pub active_kautz_blocks: usize,
     pub active_transport_quads: usize,
-    pub hoisted_core: HoistedCoreChunk<B>,
-    pub hoisted_core_valid: bool,
 }
 
 impl<B: GraphBackend> SonaColdTail<'_, B> {
@@ -235,8 +232,6 @@ impl<B: GraphBackend> SonaColdTail<'_, B> {
             dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
             active_kautz_blocks: 2,
             active_transport_quads: 1,
-            hoisted_core: HoistedCoreChunk::empty(),
-            hoisted_core_valid: false,
         }
     }
 
@@ -304,8 +299,6 @@ impl<B: GraphBackend> SonaColdTail<'_, B> {
         self.dc_blocker_pole_5hz = crate::math::TANK_DC_BLOCKER_48K_F32;
         self.active_kautz_blocks = 2;
         self.active_transport_quads = 1;
-        self.hoisted_core = HoistedCoreChunk::empty();
-        self.hoisted_core_valid = false;
     }
 }
 
@@ -344,6 +337,7 @@ pub struct SonaHotSlab<'a, B: GraphBackend = DefaultMathBackend> {
     pub pro_delta: SonaProHotDelta<B>,
     pub ultra_delta: SonaUltraHotDelta<B>,
     pub cold: ColdBuf<'a, SonaColdTail<'a, B>>,
+    pub sensory_params: SensoryParamsHot,
 }
 
 impl<'a, B: GraphBackend> SonaHotSlab<'a, B> {
@@ -357,6 +351,7 @@ impl<'a, B: GraphBackend> SonaHotSlab<'a, B> {
             pro_delta: SonaProHotDelta::empty(),
             ultra_delta: SonaUltraHotDelta::empty(),
             cold,
+            sensory_params: SensoryParamsHot::zero(),
         }
     }
 
@@ -467,6 +462,16 @@ impl<'a, B: GraphBackend> SonaHotSlab<'a, B> {
     #[inline(always)]
     pub(crate) fn core_quad_ext(&self, q: usize) -> &CoreQuadExtCold {
         &self.cold().base_core_ext[q]
+    }
+
+    #[inline(always)]
+    pub(crate) fn tile_hot(&self, t: usize) -> &SonaInterBlockTileHot {
+        match t {
+            0..=2 => &self.lite.tiles[t],
+            3..=12 => &self.full_delta.tiles_full[t - 3],
+            13..=22 => &self.pro_delta.tiles_pro[t - 13],
+            _ => &self.ultra_delta.tiles_ultra[t - 23],
+        }
     }
 
     #[inline(always)]

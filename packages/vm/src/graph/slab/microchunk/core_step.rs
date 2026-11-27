@@ -4,10 +4,9 @@
 #![forbid(unsafe_code)]
 
 use dnam_kernels::{
-    CarrierBasisWeightsVec4, CoreQuadParamsStereo4, SonaBlockStateStereo8, SonaParaLruDuhemCoeffs4,
-    SonaToneWeights4, StereoAnalyticQuadrature, StereoCarrierRotorVec4, StereoVec8, TptSvfCoeffs4,
-    couple_ms_input_stereo8, eval_carrier_3basis_stereo_vec4, os2x_midpoint_f32x4,
-    step_core_quad_phs_stereo8, step_core_quad_stereo8,
+    CarrierBasisWeightsVec4, CoreQuadParamsStereo4, StereoAnalyticQuadrature,
+    StereoCarrierRotorVec4, StereoVec8, couple_ms_input_stereo8, eval_carrier_3basis_stereo_vec4,
+    os2x_midpoint_f32x4, step_core_quad_phs_stereo8, step_core_quad_stereo8,
 };
 
 use crate::graph::GraphBackend;
@@ -16,14 +15,14 @@ use crate::types::Tier;
 
 use super::super::layout::{
     CoreQuadReadoutRegs, CrossbarFrame, FLAG_CROSSBAR_ACTIVE, MAX_CORE_QUADS, MAX_SONA_TILES,
-    SONA_INTERBLOCK_TILES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER, SonaHotSlab, SonaInterBlockTileHot,
+    SONA_INTERBLOCK_TILES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER, SonaHotSlab,
 };
 
 const MAX_OUTGOING_PER_QUAD: usize = 6;
-const TILE_EMPTY: u8 = 0xFF;
+pub(super) const TILE_EMPTY: u8 = 0xFF;
 
 /// Compile-time outgoing tile index table per source quad `0..10` covering all `35` tiles.
-const SONA_SRC_OUTGOING_TILES: [[u8; MAX_OUTGOING_PER_QUAD]; MAX_CORE_QUADS] =
+pub(super) const SONA_SRC_OUTGOING_TILES: [[u8; MAX_OUTGOING_PER_QUAD]; MAX_CORE_QUADS] =
     build_outgoing_tile_table();
 
 const fn build_outgoing_tile_table() -> [[u8; MAX_OUTGOING_PER_QUAD]; MAX_CORE_QUADS] {
@@ -65,202 +64,73 @@ pub(crate) struct OpP1xFrame {
     pub feat: [f32; 4],
 }
 
-/// Register-resident hoisted Matryoshka core parameters + crossbars held constant across a
-/// `1`- or `4`-frame micro-chunk (`0-ULP` parity).
-#[derive(Clone, Copy, Debug)]
-pub struct HoistedCoreChunk<B: GraphBackend> {
-    pub num_quads: usize,
-    pub num_tiles: usize,
-    pub params: [CoreQuadParamsStereo4<B::Vec4>; MAX_CORE_QUADS],
-    pub readouts: [CoreQuadReadoutRegs<B::Vec4, B::Stereo8>; MAX_CORE_QUADS],
-    pub carrier_w: CarrierBasisWeightsVec4<B::Vec4>,
-    pub cos_st: B::Vec4,
-    pub sin_st: B::Vec4,
-    pub ro_gains: [f32; 8],
-    pub op_p_gain: f32,
-    pub op_t_gain: f32,
-    pub wet_scale: f32,
-    pub hp_lp_pole: f32,
+/// Returns `(active_quads, active_tiles)` for `tier`.
+#[inline(always)]
+pub(super) const fn active_quad_and_tile_counts(tier: Tier) -> (usize, usize) {
+    let num_quads = tier.simd_groups();
+    let num_tiles = match tier {
+        Tier::Lite => 3,
+        Tier::Full => 13,
+        Tier::Pro => 23,
+        Tier::Ultra => 35,
+    };
+    (num_quads, num_tiles)
 }
 
+/// Decodes modulated `CoreQuadParamsStereo4` directly from `CoreQuadHot` + `CoreQuadExtCold` +
+/// `cold` modulations into `f32` SIMD registers (`0-ULP`, never re-quantized to `fp16`).
 #[inline(always)]
-fn zero_quad_params<B: GraphBackend>() -> CoreQuadParamsStereo4<B::Vec4> {
-    let z = B::Vec4::zero();
-    CoreQuadParamsStereo4 {
-        svf: TptSvfCoeffs4 {
-            a1: z,
-            a2: z,
-            a3: z,
-            k: z,
-            two_k: z,
-        },
-        tone: SonaToneWeights4 {
-            lp: z,
-            bp: z,
-            hp: z,
-            ap: z,
-            dir: z,
-        },
-        lru: SonaParaLruDuhemCoeffs4::from_clamped(z, z, z, z, z, z),
-        two_svf_g: z,
-        svf_k_nl: z,
-        rect_sign: B::Vec4::splat(1.0),
-        sag_depth: z,
-        adaa_drive: z,
-        lru_bias_drive: z,
-        wavefolder_mix: z,
-        glu_mix: z,
-    }
-}
-
-#[inline(always)]
-fn zero_quad_readouts<B: GraphBackend>() -> CoreQuadReadoutRegs<B::Vec4, B::Stereo8> {
-    let z = B::Vec4::zero();
-    let zs = B::Stereo8::zero();
-    CoreQuadReadoutRegs {
-        in_mid_weight: z,
-        in_side_weight: z,
-        op_p_w: z,
-        ph_w: z,
-        pre_conv_odd: zs,
-        pre_conv_even: zs,
-        pre_conv_lru: zs,
-        direct_odd: zs,
-        direct_even: zs,
-        direct_lru: zs,
-    }
-}
-
-#[inline(always)]
-fn hoist_quad_params_into<B: GraphBackend>(
+pub(super) fn decode_core_quad_params<B: GraphBackend>(
     slab: &SonaHotSlab<'_, B>,
-    num_quads: usize,
-    params: &mut [CoreQuadParamsStereo4<B::Vec4>; MAX_CORE_QUADS],
-) {
+    q: usize,
+) -> CoreQuadParamsStereo4<B::Vec4> {
     let cold = slab.cold();
-    for q in 0..num_quads {
-        let qh = slab.core_quad_hot(q);
-        let ext = slab.core_quad_ext(q);
-        let l0 = q * 4;
-        params[q] = qh.to_kernel_params_modulated::<B>(
-            ext,
-            crate::graph::slab::CoreQuadModulation {
-                g_scale: B::Vec4::load(&[
-                    cold.lane_g_scale[l0],
-                    cold.lane_g_scale[l0 + 1],
-                    cold.lane_g_scale[l0 + 2],
-                    cold.lane_g_scale[l0 + 3],
-                ]),
-                k_delta: B::Vec4::load(&[
-                    cold.lane_k_delta[l0],
-                    cold.lane_k_delta[l0 + 1],
-                    cold.lane_k_delta[l0 + 2],
-                    cold.lane_k_delta[l0 + 3],
-                ]),
-                adaa_scale: cold.quad_adaa_scale[q],
-                bias_delta: cold.quad_lru_bias[q],
-                wf_delta: B::Vec4::load(&[
-                    cold.lane_wf_delta[l0],
-                    cold.lane_wf_delta[l0 + 1],
-                    cold.lane_wf_delta[l0 + 2],
-                    cold.lane_wf_delta[l0 + 3],
-                ]),
-                rect_mask4: slab.rect_mask4(q),
-            },
-        );
-    }
+    let qh = slab.core_quad_hot(q);
+    let ext = slab.core_quad_ext(q);
+    let l0 = q * 4;
+    qh.to_kernel_params_modulated::<B>(
+        ext,
+        crate::graph::slab::CoreQuadModulation {
+            g_scale: B::Vec4::load(&[
+                cold.lane_g_scale[l0],
+                cold.lane_g_scale[l0 + 1],
+                cold.lane_g_scale[l0 + 2],
+                cold.lane_g_scale[l0 + 3],
+            ]),
+            k_delta: B::Vec4::load(&[
+                cold.lane_k_delta[l0],
+                cold.lane_k_delta[l0 + 1],
+                cold.lane_k_delta[l0 + 2],
+                cold.lane_k_delta[l0 + 3],
+            ]),
+            adaa_scale: cold.quad_adaa_scale[q],
+            bias_delta: cold.quad_lru_bias[q],
+            wf_delta: B::Vec4::load(&[
+                cold.lane_wf_delta[l0],
+                cold.lane_wf_delta[l0 + 1],
+                cold.lane_wf_delta[l0 + 2],
+                cold.lane_wf_delta[l0 + 3],
+            ]),
+            rect_mask4: slab.rect_mask4(q),
+        },
+    )
 }
 
-impl<B: GraphBackend> HoistedCoreChunk<B> {
-    /// Returns a zero-initialized core snapshot (`!alloc`, `0` NR calls) for unhydrated slabs.
-    #[must_use]
-    pub fn empty() -> Self {
-        let z = B::Vec4::zero();
-        Self {
-            num_quads: 0,
-            num_tiles: 0,
-            params: [zero_quad_params::<B>(); MAX_CORE_QUADS],
-            readouts: [zero_quad_readouts::<B>(); MAX_CORE_QUADS],
-            carrier_w: CarrierBasisWeightsVec4 {
-                w0: z,
-                w1: z,
-                w2: z,
-            },
-            cos_st: B::Vec4::splat(1.0),
-            sin_st: z,
-            ro_gains: [0.0; 8],
-            op_p_gain: 0.0,
-            op_t_gain: 0.0,
-            wet_scale: 1.0,
-            hp_lp_pole: 0.0,
-        }
-    }
-
-    /// Materializes active quad DSP parameters, readout matrices, and crossbar weights into registers.
-    #[inline(always)]
-    pub fn from_slab(slab: &SonaHotSlab<'_, B>) -> Self {
-        let tier = slab.lite.tier;
-        let num_quads = tier.simd_groups();
-        let num_tiles = match tier {
-            Tier::Lite => 3,
-            Tier::Full => 13,
-            Tier::Pro => 23,
-            Tier::Ultra => 35,
-        };
-        let cold = slab.cold();
-        let wet_scale =
-            crate::control::bus::laws::eval_crossbar_wet_scale(cold.latched_stage_params[15]);
-        let mut params = [zero_quad_params::<B>(); MAX_CORE_QUADS];
-        let mut readouts = [zero_quad_readouts::<B>(); MAX_CORE_QUADS];
-        hoist_quad_params_into(slab, num_quads, &mut params);
-        for q in 0..num_quads {
-            let qh = slab.core_quad_hot(q);
-            let ext = slab.core_quad_ext(q);
-            readouts[q] = slab.readout_hot(q).decode_regs::<B>(
-                qh.in_mid_weight_vec4::<B>(),
-                ext.in_side_weight_vec4::<B>(),
-                B::fp16x4_to_vec4(slab.op_p_to_core_fp16(q)),
-                B::fp16x4_to_vec4(slab.phasor_to_core_fp16(q)),
-            );
-        }
-
-        let mut ro_gains = [0.0_f32; 8];
-        for (i, &bits) in slab.lite.ro_gains_fp16.iter().enumerate() {
-            ro_gains[i] = fp16_to_f32(bits);
-        }
-        let carrier_w = CarrierBasisWeightsVec4 {
-            w0: B::fp16x4_to_vec4(&slab.lite.carrier_basis_w_fp16[0]),
-            w1: B::fp16x4_to_vec4(&slab.lite.carrier_basis_w_fp16[1]),
-            w2: B::fp16x4_to_vec4(&slab.lite.carrier_basis_w_fp16[2]),
-        };
-        Self {
-            num_quads,
-            num_tiles,
-            params,
-            readouts,
-            carrier_w,
-            cos_st: B::fp16x4_to_vec4(&slab.lite.phasor_st_cos_fp16),
-            sin_st: B::fp16x4_to_vec4(&slab.lite.phasor_st_sin_fp16),
-            ro_gains,
-            op_p_gain: cold.base_op_p_gain * wet_scale,
-            op_t_gain: cold.base_op_t_gain * wet_scale,
-            wet_scale,
-            hp_lp_pole: slab.lite.hp_lp_pole,
-        }
-    }
-
-    /// Updates only the `3 kHz`/`12 kHz` modulated quad parameters and crossbar gains while
-    /// preserving static readout/carrier/phasor matrices decoded at tier/rate hydration.
-    #[inline(always)]
-    pub fn refresh_modulated(&mut self, slab: &SonaHotSlab<'_, B>) {
-        let cold = slab.cold();
-        let wet_scale =
-            crate::control::bus::laws::eval_crossbar_wet_scale(cold.latched_stage_params[15]);
-        hoist_quad_params_into(slab, self.num_quads, &mut self.params);
-        self.op_p_gain = cold.base_op_p_gain * wet_scale;
-        self.op_t_gain = cold.base_op_t_gain * wet_scale;
-        self.wet_scale = wet_scale;
-    }
+/// Decodes `CoreQuadReadoutRegs` directly from `CoreQuadHot`, `CoreQuadExtCold`,
+/// `CoreQuadReadoutHot`, and hot crossbar matrices into `f32` SIMD registers (`0-ULP`).
+#[inline(always)]
+pub(super) fn decode_core_quad_readout<B: GraphBackend>(
+    slab: &SonaHotSlab<'_, B>,
+    q: usize,
+) -> CoreQuadReadoutRegs<B::Vec4, B::Stereo8> {
+    let qh = slab.core_quad_hot(q);
+    let ext = slab.core_quad_ext(q);
+    slab.readout_hot(q).decode_regs::<B>(
+        qh.in_mid_weight_vec4::<B>(),
+        ext.in_side_weight_vec4::<B>(),
+        B::fp16x4_to_vec4(slab.op_p_to_core_fp16(q)),
+        B::fp16x4_to_vec4(slab.phasor_to_core_fp16(q)),
+    )
 }
 
 #[inline(always)]
@@ -281,51 +151,6 @@ fn fma_fp16_tile<B: GraphBackend>(
     B::Stereo8::from_lr(nl, nr)
 }
 
-struct HotStatesMut<'a, B: GraphBackend> {
-    lite: &'a mut [SonaBlockStateStereo8<B::Stereo8>; 4],
-    full: &'a mut [SonaBlockStateStereo8<B::Stereo8>; 2],
-    pro: &'a mut [SonaBlockStateStereo8<B::Stereo8>; 2],
-    ultra: &'a mut [SonaBlockStateStereo8<B::Stereo8>; 2],
-}
-
-impl<B: GraphBackend> HotStatesMut<'_, B> {
-    #[inline(always)]
-    fn state_mut(&mut self, q: usize) -> &mut SonaBlockStateStereo8<B::Stereo8> {
-        match q {
-            0..=3 => &mut self.lite[q],
-            4..=5 => &mut self.full[q - 4],
-            6..=7 => &mut self.pro[q - 6],
-            _ => &mut self.ultra[q - 8],
-        }
-    }
-}
-
-struct HotTilesRef<'a> {
-    lite: &'a [SonaInterBlockTileHot; 3],
-    full: &'a [SonaInterBlockTileHot; 10],
-    pro: &'a [SonaInterBlockTileHot; 10],
-    ultra: &'a [SonaInterBlockTileHot; 12],
-}
-
-impl HotTilesRef<'_> {
-    #[inline(always)]
-    fn tile_hot(&self, t: usize) -> &SonaInterBlockTileHot {
-        match t {
-            0..=2 => &self.lite[t],
-            3..=12 => &self.full[t - 3],
-            13..=22 => &self.pro[t - 13],
-            _ => &self.ultra[t - 23],
-        }
-    }
-}
-
-struct CoreEvalCtx<'a, B: GraphBackend> {
-    tiles: &'a HotTilesRef<'a>,
-    hoisted: &'a HoistedCoreChunk<B>,
-    crossbar: &'a CrossbarFrame<B::Vec4>,
-    u_lr: (f32, f32),
-}
-
 struct CoreAccumulators<S> {
     quad_in: [S; MAX_CORE_QUADS],
     pre_conv: S,
@@ -335,37 +160,41 @@ struct CoreAccumulators<S> {
 #[inline(always)]
 fn eval_core_quad_step<B: GraphBackend, const BLOCK0_PHS: bool>(
     q: usize,
-    states: &mut HotStatesMut<'_, B>,
-    ctx: &CoreEvalCtx<'_, B>,
+    num_tiles: usize,
+    slab: &mut SonaHotSlab<'_, B>,
+    crossbar: &CrossbarFrame<B::Vec4>,
+    u_lr: (f32, f32),
     acc: &mut CoreAccumulators<B::Stereo8>,
 ) {
-    let reg = &ctx.hoisted.readouts[q];
+    let params_q = decode_core_quad_params(slab, q);
+    let reg = decode_core_quad_readout(slab, q);
     let mut u_q = couple_ms_input_stereo8(
         if BLOCK0_PHS {
             B::Stereo8::zero()
         } else {
             acc.quad_in[q]
         },
-        ctx.u_lr.0,
-        ctx.u_lr.1,
+        u_lr.0,
+        u_lr.1,
         reg.in_mid_weight,
         reg.in_side_weight,
     );
-    if ctx.crossbar.active {
-        let op_p_vec_w = ctx.crossbar.op_p_vec.mul(reg.op_p_w);
+    if crossbar.active {
+        let op_p_vec_w = crossbar.op_p_vec.mul(reg.op_p_w);
         let op_p_s8 = B::Stereo8::from_lr(op_p_vec_w, op_p_vec_w);
-        let car_s8 = B::Stereo8::from_lr(
-            ctx.crossbar.car_l.mul(reg.ph_w),
-            ctx.crossbar.car_r.mul(reg.ph_w),
-        );
+        let car_s8 =
+            B::Stereo8::from_lr(crossbar.car_l.mul(reg.ph_w), crossbar.car_r.mul(reg.ph_w));
         u_q = u_q.add(op_p_s8.add(car_s8));
     }
 
+    let mut state_q = *slab.state_mut(q);
     let out = if BLOCK0_PHS {
-        step_core_quad_phs_stereo8::<B::Stereo8>(u_q, states.state_mut(q), &ctx.hoisted.params[q])
+        step_core_quad_phs_stereo8::<B::Stereo8>(u_q, &mut state_q, &params_q)
     } else {
-        step_core_quad_stereo8::<B::Stereo8>(u_q, states.state_mut(q), &ctx.hoisted.params[q])
+        step_core_quad_stereo8::<B::Stereo8>(u_q, &mut state_q, &params_q)
     };
+    *slab.state_mut(q) = state_q;
+
     acc.pre_conv = acc
         .pre_conv
         .fma(out.adaa_odd, reg.pre_conv_odd)
@@ -382,52 +211,16 @@ fn eval_core_quad_step<B: GraphBackend, const BLOCK0_PHS: bool>(
             break;
         }
         let t_idx = usize::from(tile_raw);
-        if t_idx >= ctx.hoisted.num_tiles {
+        if t_idx >= num_tiles {
             continue;
         }
         let dq = SONA_INTERBLOCK_TILES[t_idx].1;
-        let tile = ctx.tiles.tile_hot(t_idx);
+        let tile = slab.tile_hot(t_idx);
         let tile_acc =
             B::Stereo8::fma_mat4x4_shared(acc.quad_in[dq], &tile.w_odd_4x4, out.adaa_odd);
         let tile_acc = fma_fp16_tile::<B>(tile_acc, &tile.w_even_4x4_fp16, out.adaa_even);
         acc.quad_in[dq] = fma_fp16_tile::<B>(tile_acc, &tile.w_lru_4x4_fp16, out.lru_state);
     }
-}
-
-#[inline(always)]
-fn evaluate_matryoshka_core_quads_disjoint<B: GraphBackend>(
-    states: &mut HotStatesMut<'_, B>,
-    tiles: &HotTilesRef<'_>,
-    hoisted: &HoistedCoreChunk<B>,
-    crossbar: &CrossbarFrame<B::Vec4>,
-    u_lr: (f32, f32),
-) -> ((f32, f32), (f32, f32)) {
-    let ctx = CoreEvalCtx {
-        tiles,
-        hoisted,
-        crossbar,
-        u_lr,
-    };
-    let mut acc = CoreAccumulators {
-        quad_in: [B::Stereo8::zero(); MAX_CORE_QUADS],
-        pre_conv: B::Stereo8::zero(),
-        direct: B::Stereo8::zero(),
-    };
-
-    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[..4] {
-        if q < hoisted.num_quads {
-            eval_core_quad_step::<B, true>(q, states, &ctx, &mut acc);
-        }
-    }
-    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[4..] {
-        if q < hoisted.num_quads {
-            eval_core_quad_step::<B, false>(q, states, &ctx, &mut acc);
-        }
-    }
-
-    let (pl, pr) = acc.pre_conv.into_lr();
-    let (dl, dr) = acc.direct.into_lr();
-    (pl.horizontal_sum_pair(pr), dl.horizontal_sum_pair(dr))
 }
 
 /// Evaluates all active Matryoshka `CoreQuad`s in causal block-major order (`0..num_quads`),
@@ -436,23 +229,30 @@ fn evaluate_matryoshka_core_quads_disjoint<B: GraphBackend>(
 #[inline(always)]
 pub fn evaluate_matryoshka_core_quads<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
-    hoisted: &HoistedCoreChunk<B>,
     crossbar: &CrossbarFrame<B::Vec4>,
     u_lr: (f32, f32),
 ) -> ((f32, f32), (f32, f32)) {
-    let mut states = HotStatesMut {
-        lite: &mut slab.lite.core_states,
-        full: &mut slab.full_delta.core_states_full,
-        pro: &mut slab.pro_delta.core_states_pro,
-        ultra: &mut slab.ultra_delta.core_states_ultra,
+    let (num_quads, num_tiles) = active_quad_and_tile_counts(slab.lite.tier);
+    let mut acc = CoreAccumulators {
+        quad_in: [B::Stereo8::zero(); MAX_CORE_QUADS],
+        pre_conv: B::Stereo8::zero(),
+        direct: B::Stereo8::zero(),
     };
-    let tiles = HotTilesRef {
-        lite: &slab.lite.tiles,
-        full: &slab.full_delta.tiles_full,
-        pro: &slab.pro_delta.tiles_pro,
-        ultra: &slab.ultra_delta.tiles_ultra,
-    };
-    evaluate_matryoshka_core_quads_disjoint(&mut states, &tiles, hoisted, crossbar, u_lr)
+
+    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[..4] {
+        if q < num_quads {
+            eval_core_quad_step::<B, true>(q, num_tiles, slab, crossbar, u_lr, &mut acc);
+        }
+    }
+    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[4..] {
+        if q < num_quads {
+            eval_core_quad_step::<B, false>(q, num_tiles, slab, crossbar, u_lr, &mut acc);
+        }
+    }
+
+    let (pl, pr) = acc.pre_conv.into_lr();
+    let (dl, dr) = acc.direct.into_lr();
+    (pl.horizontal_sum_pair(pr), dl.horizontal_sum_pair(dr))
 }
 
 #[inline(always)]
@@ -482,7 +282,6 @@ pub(crate) fn step_core_subsample<B: GraphBackend>(
     sub_idx: usize,
     u_lr: (f32, f32),
 ) -> [f32; 4] {
-    let hoisted = &slab.cold.as_slice()[0].hoisted_core;
     let crossbar = if (slab.lite.flags & FLAG_CROSSBAR_ACTIVE) != 0 {
         let (iq_sub, feat_sub) = if !os2x {
             (op_p_1x.iq_lr, op_p_1x.feat)
@@ -496,24 +295,29 @@ pub(crate) fn step_core_subsample<B: GraphBackend>(
             slab.os2x_hot.op_p_prev_feat = op_p_1x.feat;
             (op_p_1x.iq_lr, op_p_1x.feat)
         };
-        let (cos_l, sin_l) = slab.lite.phasors.step_quadrature_vec4::<B::Vec4>();
-        let rotor = StereoCarrierRotorVec4::from_left_and_offset(
-            cos_l,
-            sin_l,
-            hoisted.cos_st,
-            hoisted.sin_st,
+        let wet_scale = crate::control::bus::laws::eval_crossbar_wet_scale(
+            slab.cold().latched_stage_params[15],
         );
+        let op_p_gain = slab.cold().base_op_p_gain * wet_scale;
+        let cos_st = B::fp16x4_to_vec4(&slab.lite.phasor_st_cos_fp16);
+        let sin_st = B::fp16x4_to_vec4(&slab.lite.phasor_st_sin_fp16);
+        let carrier_w = CarrierBasisWeightsVec4 {
+            w0: B::fp16x4_to_vec4(&slab.lite.carrier_basis_w_fp16[0]),
+            w1: B::fp16x4_to_vec4(&slab.lite.carrier_basis_w_fp16[1]),
+            w2: B::fp16x4_to_vec4(&slab.lite.carrier_basis_w_fp16[2]),
+        };
+        let (cos_l, sin_l) = slab.lite.phasors.step_quadrature_vec4::<B::Vec4>();
+        let rotor = StereoCarrierRotorVec4::from_left_and_offset(cos_l, sin_l, cos_st, sin_st);
         let quad = StereoAnalyticQuadrature {
             i_l: iq_sub[0],
             q_l: iq_sub[1],
             i_r: iq_sub[2],
             q_r: iq_sub[3],
         };
-        let (car_l, car_r) =
-            eval_carrier_3basis_stereo_vec4(&quad, &rotor, &hoisted.carrier_w, hoisted.wet_scale);
+        let (car_l, car_r) = eval_carrier_3basis_stereo_vec4(&quad, &rotor, &carrier_w, wet_scale);
         CrossbarFrame {
             active: true,
-            op_p_vec: B::Vec4::load(&feat_sub).mul(B::Vec4::splat(hoisted.op_p_gain)),
+            op_p_vec: B::Vec4::load(&feat_sub).mul(B::Vec4::splat(op_p_gain)),
             car_l,
             car_r,
         }
@@ -531,28 +335,15 @@ pub(crate) fn step_core_subsample<B: GraphBackend>(
         }
     };
 
-    let mut states = HotStatesMut {
-        lite: &mut slab.lite.core_states,
-        full: &mut slab.full_delta.core_states_full,
-        pro: &mut slab.pro_delta.core_states_pro,
-        ultra: &mut slab.ultra_delta.core_states_ultra,
-    };
-    let tiles = HotTilesRef {
-        lite: &slab.lite.tiles,
-        full: &slab.full_delta.tiles_full,
-        pro: &slab.pro_delta.tiles_pro,
-        ultra: &slab.ultra_delta.tiles_ultra,
-    };
-    let ((pre_l, pre_r), (dir_l, dir_r)) =
-        evaluate_matryoshka_core_quads_disjoint(&mut states, &tiles, hoisted, &crossbar, u_lr);
+    let ((pre_l, pre_r), (dir_l, dir_r)) = evaluate_matryoshka_core_quads(slab, &crossbar, u_lr);
 
-    let pole = hoisted.hp_lp_pole;
+    let pole = slab.lite.hp_lp_pole;
     let one_m_p = 1.0 - pole;
     let lp_l = flush_recursive_state_f32(pole * slab.lite.hp_lp_state[0] + one_m_p * u_lr.0);
     let lp_r = flush_recursive_state_f32(pole * slab.lite.hp_lp_state[1] + one_m_p * u_lr.1);
     slab.lite.hp_lp_state = [lp_l, lp_r];
     let (hp_l, hp_r) = (u_lr.0 - lp_l, u_lr.1 - lp_r);
-    let rg = &hoisted.ro_gains;
+    let rg = slab.lite.ro_gains_fp16.map(fp16_to_f32);
     [
         pre_l + rg[0] * u_lr.0 + rg[2] * hp_l,
         pre_r + rg[1] * u_lr.1 + rg[3] * hp_r,

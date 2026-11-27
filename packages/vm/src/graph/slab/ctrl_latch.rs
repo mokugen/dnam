@@ -20,7 +20,6 @@ use crate::types::Tier;
 
 use super::hydrate::apply_tier::compute_op_n_pre_hoisted;
 use super::layout::SonaHotSlab;
-use super::microchunk::core_step::HoistedCoreChunk;
 
 const PSI_SLEW_MAX_RAD: f32 = 0.25;
 
@@ -105,17 +104,6 @@ pub(crate) fn hoist_core_quads_and_readouts_inline<B: GraphBackend>(slab: &mut S
             );
         }
         *slab.transport_quad_hot_mut(q) = quad;
-    }
-
-    if !slab.cold().hoisted_core_valid {
-        let hc = HoistedCoreChunk::<B>::from_slab(slab);
-        let cold = slab.cold_mut();
-        cold.hoisted_core = hc;
-        cold.hoisted_core_valid = true;
-    } else {
-        let mut hc = slab.cold().hoisted_core;
-        hc.refresh_modulated(slab);
-        slab.cold_mut().hoisted_core = hc;
     }
 }
 

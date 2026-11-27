@@ -29,21 +29,21 @@ pub use oversample::{
     Bounce4xDecimator, Bounce4xOversampler, OFFLINE_BOUNCE_PDC_SAMPLES, SonaOs2xHot,
     SonaOversamplerParams, SonaStereoOversampler2x,
 };
-pub use sensory::{SensoryQuadCold, SensoryQuadHot};
+pub use sensory::{SensoryChunkRegs, SensoryParamsHot, SensoryQuadCold, SensoryQuadHot};
 pub use slab::{
     CoreQuadExtCold, CoreQuadHot, CoreQuadModulation, CoreQuadReadoutHot, CoreQuadReadoutRegs,
     CrossbarFrame, FLAG_COLD_FIR_EXT, FLAG_CROSSBAR_ACTIVE, FLAG_MONO_OUT, FLAG_OS2X,
-    FLAG_SINGLE_INPUT, FLAG_WET_POLARITY_INV, FLAG_XFADE_ACTIVE, HoistedCoreChunk, MAX_CORE_QUADS,
-    MAX_SONA_TILES, MAX_TOTAL_SONA_LANES, NUM_SONA_BLOCKS, SONA_BLOCK_QUAD_SLOTS,
-    SONA_CORE_QUAD_BLOCK_AND_LOCAL, SONA_FULL_HOT_DELTA_BYTES, SONA_INTERBLOCK_TILES,
-    SONA_LITE_HOT_BYTES, SONA_OS2X_HOT_BYTES, SONA_PRO_HOT_DELTA_BYTES, SONA_ULTRA_HOT_DELTA_BYTES,
-    SONA_ULTRA_QUAD_TRAVERSAL_ORDER, SonaColdTail, SonaFullHotDelta, SonaHotSlab,
-    SonaInterBlockTileHot, SonaLiteHotPrefix, SonaProHotDelta, SonaSlabBacking, SonaUltraHotDelta,
-    TIER_SWITCH_XFADE_SAMPLES, TierCrossbarSnapshot, evaluate_matryoshka_core_quads,
-    hoist_core_quads_and_readouts, hydrate_slab_from_dnam_bin, latch_immediate_at_init_or_reset,
-    process_block_sona, process_tick16_const, reset_to_dc_equilibrium, retime_sample_rate,
-    set_offline_bounce, set_op_t_write_enable, set_quad_write_enable, step_control_tick_3khz,
-    step_frame_4x_sona, step_frame_sona, switch_tier,
+    FLAG_SINGLE_INPUT, FLAG_WET_POLARITY_INV, FLAG_XFADE_ACTIVE, MAX_CORE_QUADS, MAX_SONA_TILES,
+    MAX_TOTAL_SONA_LANES, NUM_SONA_BLOCKS, SONA_BLOCK_QUAD_SLOTS, SONA_CORE_QUAD_BLOCK_AND_LOCAL,
+    SONA_FULL_HOT_DELTA_BYTES, SONA_INTERBLOCK_TILES, SONA_LITE_HOT_BYTES, SONA_OS2X_HOT_BYTES,
+    SONA_PRO_HOT_DELTA_BYTES, SONA_ULTRA_HOT_DELTA_BYTES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER,
+    SonaColdTail, SonaFullHotDelta, SonaHotSlab, SonaInterBlockTileHot, SonaLiteHotPrefix,
+    SonaProHotDelta, SonaSlabBacking, SonaUltraHotDelta, TIER_SWITCH_XFADE_SAMPLES,
+    TierCrossbarSnapshot, evaluate_matryoshka_core_quads, hoist_core_quads_and_readouts,
+    hydrate_slab_from_dnam_bin, latch_immediate_at_init_or_reset, process_block_sona,
+    process_tick16_const, reset_to_dc_equilibrium, retime_sample_rate, set_offline_bounce,
+    set_op_t_write_enable, set_quad_write_enable, step_control_tick_3khz, step_frame_4x_sona,
+    step_frame_sona, switch_tier,
 };
 #[cfg(feature = "alloc")]
 pub use slab::{SonaSlabOwnedBacking, hydrate_slab_owned, hydrate_slab_owned_with_headroom};
@@ -292,11 +292,10 @@ impl GraphBackend for crate::math::wasm::WasmSimd128Backend {}
 #[inline(never)]
 pub fn sona_graph_eval_core_quads_default(
     slab: &mut SonaHotSlab<'_, DefaultMathBackend>,
-    hoisted: &HoistedCoreChunk<DefaultMathBackend>,
     crossbar: &CrossbarFrame<<DefaultMathBackend as MathBackend>::Vec4>,
     u_lr: (f32, f32),
 ) -> ((f32, f32), (f32, f32)) {
-    evaluate_matryoshka_core_quads::<DefaultMathBackend>(slab, hoisted, crossbar, u_lr)
+    evaluate_matryoshka_core_quads::<DefaultMathBackend>(slab, crossbar, u_lr)
 }
 
 /// Concrete `DefaultMathBackend` audit entry point evaluating a `4`-frame convolver FIR chunk.
@@ -446,7 +445,6 @@ mod tests {
         let mut cold_tail = SonaColdTail::<DefaultMathBackend>::empty();
         let mut slab =
             SonaHotSlab::empty_with_cold(ColdBuf::Borrowed(core::slice::from_mut(&mut cold_tail)));
-        let hoisted = HoistedCoreChunk::<DefaultMathBackend>::empty();
         let zero_v = <DefaultMathBackend as MathBackend>::Vec4::zero();
         let crossbar = CrossbarFrame {
             active: false,
@@ -455,7 +453,7 @@ mod tests {
             car_r: zero_v,
         };
         let (core_u, core_hp) =
-            sona_graph_eval_core_quads_default(&mut slab, &hoisted, &crossbar, (0.25, -0.25));
+            sona_graph_eval_core_quads_default(&mut slab, &crossbar, (0.25, -0.25));
         assert!(core_u.0.is_finite() && core_hp.0.is_finite());
 
         let (mut hist_l, mut hist_r) = ([0.0_f32; 32], [0.0_f32; 32]);

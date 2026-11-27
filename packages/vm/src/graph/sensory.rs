@@ -15,7 +15,7 @@ use zerocopy::byteorder::little_endian::{F32, U16};
 
 use crate::bin::arena_wire::CrossbarWire;
 use crate::math::{
-    MathBackend, ScalarVec4, SimdVec4, clamp_finite_f32, const_abs_f64, fp16_to_f32, powf_f64,
+    MathBackend, ScalarVec4, clamp_finite_f32, const_abs_f64, fp16_to_f32, powf_f64,
     rescale_tpt_svf_g_zoh,
 };
 
@@ -288,51 +288,199 @@ impl SensoryQuadCold {
         x_r: f32,
         vca_bias_slot30: f32,
     ) -> (f32, f32) {
-        let u_sense = B::Vec4::splat(x_l)
-            .mul(B::Vec4::load(&self.in_l))
-            .fma(B::Vec4::splat(x_r), B::Vec4::load(&self.in_r));
+        let mut regs = SensoryChunkRegs::<B::Vec4>::load_from_cold(self, hot, vca_bias_slot30);
+        let out = regs.step_frame(x_l, x_r);
+        regs.store(hot);
+        out
+    }
+}
 
-        let mut s1 = B::Vec4::load(&hot.svf_s1);
-        let mut s2 = B::Vec4::load(&hot.svf_s2);
-        let svf_k = B::Vec4::load(&self.svf_k);
-        let svf = TptSvfCoeffs4 {
-            a1: B::Vec4::load(&self.svf_a1),
-            a2: B::Vec4::load(&self.svf_a2),
-            a3: B::Vec4::load(&self.svf_a3),
-            k: svf_k,
-            two_k: svf_k.add(svf_k),
-        };
-        let out = step_tpt_svf_vec4(u_sense, &mut s1, &mut s2, &svf);
+/// Hot `208 B` (`16 B`-aligned) copy of the 13 active `[f32; 4]` `SensoryQuad` parameter arrays
+/// (omitting `svf_g`, which is only needed at rate hydration) stored inline on `SonaHotSlab`.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SensoryParamsHot {
+    pub svf_k: [f32; 4],
+    pub svf_a1: [f32; 4],
+    pub svf_a2: [f32; 4],
+    pub svf_a3: [f32; 4],
+    pub in_l: [f32; 4],
+    pub in_r: [f32; 4],
+    pub tone_lp: [f32; 4],
+    pub tone_bp: [f32; 4],
+    pub tone_hp: [f32; 4],
+    pub lru_alpha_rel: [f32; 4],
+    pub lru_alpha_atk: [f32; 4],
+    pub lru_kappa: [f32; 4],
+    pub vca_w: [f32; 4],
+}
+
+const _: () = assert!(size_of::<SensoryParamsHot>() == 208);
+const _: () = assert!(align_of::<SensoryParamsHot>() == 16);
+
+impl Default for SensoryParamsHot {
+    #[inline]
+    fn default() -> Self {
+        Self::zero()
+    }
+}
+
+impl SensoryParamsHot {
+    /// Returns the safe identity hot configuration matching [`SensoryQuadCold::zero`].
+    #[inline]
+    #[must_use]
+    pub fn zero() -> Self {
+        Self::from_cold(&SensoryQuadCold::zero())
+    }
+
+    /// Copies the 13 audio-loop parameter vectors from [`SensoryQuadCold`].
+    #[inline]
+    #[must_use]
+    pub const fn from_cold(cold: &SensoryQuadCold) -> Self {
+        Self {
+            svf_k: cold.svf_k,
+            svf_a1: cold.svf_a1,
+            svf_a2: cold.svf_a2,
+            svf_a3: cold.svf_a3,
+            in_l: cold.in_l,
+            in_r: cold.in_r,
+            tone_lp: cold.tone_lp,
+            tone_bp: cold.tone_bp,
+            tone_hp: cold.tone_hp,
+            lru_alpha_rel: cold.lru_alpha_rel,
+            lru_alpha_atk: cold.lru_alpha_atk,
+            lru_kappa: cold.lru_kappa,
+            vca_w: cold.vca_w,
+        }
+    }
+
+    /// Steps one frame via [`SensoryChunkRegs`] with exact `0-ULP` parity vs [`SensoryQuadCold::step_frame`].
+    #[inline(always)]
+    pub fn step_frame<B: MathBackend>(
+        &self,
+        hot: &mut SensoryQuadHot,
+        x_l: f32,
+        x_r: f32,
+        vca_bias_slot30: f32,
+    ) -> (f32, f32) {
+        let mut regs = SensoryChunkRegs::<B::Vec4>::load(self, hot, vca_bias_slot30);
+        let out = regs.step_frame(x_l, x_r);
+        regs.store(hot);
+        out
+    }
+}
+
+/// Register-hoisted `SensoryQuad` parameter and recursive state cache held across a 4-frame microchunk.
+#[derive(Clone, Copy, Debug)]
+pub struct SensoryChunkRegs<V: dnam_kernels::KernelVec4> {
+    pub in_l: V,
+    pub in_r: V,
+    pub svf: TptSvfCoeffs4<V>,
+    pub tone_lp: V,
+    pub tone_bp: V,
+    pub tone_hp: V,
+    pub lru_alpha_rel: V,
+    pub lru_alpha_atk: V,
+    pub lru_kappa: V,
+    pub vca_w: V,
+    pub s1: V,
+    pub s2: V,
+    pub lru_v: V,
+    pub bias30: f32,
+}
+
+impl<V: dnam_kernels::KernelVec4> SensoryChunkRegs<V> {
+    /// Loads all 13 parameter vectors, recursive state, and clamped `slot30` VCA bias into registers.
+    #[inline(always)]
+    #[must_use]
+    pub fn load(params: &SensoryParamsHot, hot: &SensoryQuadHot, vca_bias_slot30: f32) -> Self {
+        let svf_k = V::load(&params.svf_k);
+        Self {
+            in_l: V::load(&params.in_l),
+            in_r: V::load(&params.in_r),
+            svf: TptSvfCoeffs4 {
+                a1: V::load(&params.svf_a1),
+                a2: V::load(&params.svf_a2),
+                a3: V::load(&params.svf_a3),
+                k: svf_k,
+                two_k: svf_k.add(svf_k),
+            },
+            tone_lp: V::load(&params.tone_lp),
+            tone_bp: V::load(&params.tone_bp),
+            tone_hp: V::load(&params.tone_hp),
+            lru_alpha_rel: V::load(&params.lru_alpha_rel),
+            lru_alpha_atk: V::load(&params.lru_alpha_atk),
+            lru_kappa: V::load(&params.lru_kappa),
+            vca_w: V::load(&params.vca_w),
+            s1: V::load(&hot.svf_s1),
+            s2: V::load(&hot.svf_s2),
+            lru_v: V::load(&hot.lru_v),
+            bias30: clamp_finite_f32(
+                vca_bias_slot30,
+                -SENSE_VCA_BIAS_LIMIT,
+                SENSE_VCA_BIAS_LIMIT,
+                0.0,
+            ),
+        }
+    }
+
+    #[inline(always)]
+    #[must_use]
+    fn load_from_cold(cold: &SensoryQuadCold, hot: &SensoryQuadHot, vca_bias_slot30: f32) -> Self {
+        let svf_k = V::load(&cold.svf_k);
+        Self {
+            in_l: V::load(&cold.in_l),
+            in_r: V::load(&cold.in_r),
+            svf: TptSvfCoeffs4 {
+                a1: V::load(&cold.svf_a1),
+                a2: V::load(&cold.svf_a2),
+                a3: V::load(&cold.svf_a3),
+                k: svf_k,
+                two_k: svf_k.add(svf_k),
+            },
+            tone_lp: V::load(&cold.tone_lp),
+            tone_bp: V::load(&cold.tone_bp),
+            tone_hp: V::load(&cold.tone_hp),
+            lru_alpha_rel: V::load(&cold.lru_alpha_rel),
+            lru_alpha_atk: V::load(&cold.lru_alpha_atk),
+            lru_kappa: V::load(&cold.lru_kappa),
+            vca_w: V::load(&cold.vca_w),
+            s1: V::load(&hot.svf_s1),
+            s2: V::load(&hot.svf_s2),
+            lru_v: V::load(&hot.lru_v),
+            bias30: clamp_finite_f32(
+                vca_bias_slot30,
+                -SENSE_VCA_BIAS_LIMIT,
+                SENSE_VCA_BIAS_LIMIT,
+                0.0,
+            ),
+        }
+    }
+
+    /// Steps one frame entirely in registers (`0-ULP` vs [`SensoryQuadCold::step_frame`]).
+    #[inline(always)]
+    pub fn step_frame(&mut self, x_l: f32, x_r: f32) -> (f32, f32) {
+        let u_sense = V::splat(x_l).mul(self.in_l).fma(V::splat(x_r), self.in_r);
+        let out = step_tpt_svf_vec4(u_sense, &mut self.s1, &mut self.s2, &self.svf);
         let s_sense = out
             .lp
-            .mul(B::Vec4::load(&self.tone_lp))
-            .fma(out.bp, B::Vec4::load(&self.tone_bp))
-            .fma(out.hp, B::Vec4::load(&self.tone_hp));
+            .mul(self.tone_lp)
+            .fma(out.bp, self.tone_bp)
+            .fma(out.hp, self.tone_hp);
 
-        let mut lru_v = B::Vec4::load(&hot.lru_v);
         let rect = s_sense.abs();
         let e = step_paralru_vec4(
             rect,
-            &mut lru_v,
-            B::Vec4::load(&self.lru_alpha_rel),
-            B::Vec4::load(&self.lru_alpha_atk),
-            B::Vec4::load(&self.lru_kappa),
+            &mut self.lru_v,
+            self.lru_alpha_rel,
+            self.lru_alpha_atk,
+            self.lru_kappa,
         );
 
-        s1.store(&mut hot.svf_s1);
-        s2.store(&mut hot.svf_s2);
-        lru_v.store(&mut hot.lru_v);
-
-        let vca_prod = e.mul(B::Vec4::load(&self.vca_w)).to_array();
+        let vca_prod = e.mul(self.vca_w).to_array();
         let vca_dot = (vca_prod[0] + vca_prod[1]) + (vca_prod[2] + vca_prod[3]);
-        let bias30 = clamp_finite_f32(
-            vca_bias_slot30,
-            -SENSE_VCA_BIAS_LIMIT,
-            SENSE_VCA_BIAS_LIMIT,
-            0.0,
-        );
         let g_in = clamp_finite_f32(
-            1.0 + bias30 + vca_dot,
+            1.0 + self.bias30 + vca_dot,
             SENSE_VCA_GAIN_MIN,
             SENSE_VCA_GAIN_MAX,
             1.0,
@@ -342,6 +490,21 @@ impl SensoryQuadCold {
         } else {
             (g_in * x_l, g_in * x_r)
         }
+    }
+
+    /// Returns the current 4-lane envelopes `e[0..4]` for `ControlBus` `q3`.
+    #[inline(always)]
+    #[must_use]
+    pub fn envelopes_array(&self) -> [f32; 4] {
+        self.lru_v.to_array()
+    }
+
+    /// Stores updated `TPT-SVF` and `ParaLRU` states back to [`SensoryQuadHot`].
+    #[inline(always)]
+    pub fn store(&self, hot: &mut SensoryQuadHot) {
+        self.s1.store(&mut hot.svf_s1);
+        self.s2.store(&mut hot.svf_s2);
+        self.lru_v.store(&mut hot.lru_v);
     }
 }
 
@@ -525,5 +688,58 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_sensory_chunk_regs_zero_ulp_parity_vs_cold_step_frame() {
+        let mut cb = CrossbarWire::new_zeroed();
+        cb.sense_svf_g = [0.05, 0.25, 1.0, 4.0].map(F32::new);
+        cb.sense_svf_k_fp16 = [0.5, 0.707, 1.0, 2.0].map(|v| U16::new(f32_to_fp16(v)));
+        cb.sense_in_l_fp16 = [1.0, 0.5, 0.5, 0.0].map(|v| U16::new(f32_to_fp16(v)));
+        cb.sense_in_r_fp16 = [0.0, 0.5, -0.5, 1.0].map(|v| U16::new(f32_to_fp16(v)));
+        cb.sense_tone_lp_fp16 = [1.0, 0.0, 0.0, 0.5].map(|v| U16::new(f32_to_fp16(v)));
+        cb.sense_tone_bp_fp16 = [0.0, 1.0, 0.0, 0.5].map(|v| U16::new(f32_to_fp16(v)));
+        cb.sense_tone_hp_fp16 = [0.0, 0.0, 1.0, -0.5].map(|v| U16::new(f32_to_fp16(v)));
+        cb.sense_lru_alpha_rel = [0.99, 0.96, 0.90, 0.81].map(F32::new);
+        cb.sense_lru_alpha_atk = [0.25, 0.50, 0.0, 0.75].map(F32::new);
+        cb.sense_lru_kappa_fp16 = [0.25, 0.5, 0.0, 0.125].map(|v| U16::new(f32_to_fp16(v)));
+        cb.sense_vca_w_fp16 = [0.75, -0.5, 0.25, 1.0].map(|v| U16::new(f32_to_fp16(v)));
+
+        let cold = SensoryQuadCold::from_crossbar_wire(&cb, 1.0);
+        let params_hot = SensoryParamsHot::from_cold(&cold);
+        let inputs = [[0.4_f32, -0.3], [-0.8, 0.6], [0.15, 0.9], [-0.25, -0.7]];
+        let bias30 = 0.125_f32;
+
+        let mut hot_ref = SensoryQuadHot::zero();
+        let mut hot_regs = SensoryQuadHot::zero();
+        let mut regs = SensoryChunkRegs::<<DefaultMathBackend as MathBackend>::Vec4>::load(
+            &params_hot,
+            &hot_regs,
+            bias30,
+        );
+
+        for &[xl, xr] in &inputs {
+            let ref_out = cold.step_frame::<DefaultMathBackend>(&mut hot_ref, xl, xr, bias30);
+            let reg_out = regs.step_frame(xl, xr);
+            assert_eq!(ref_out.0.to_bits(), reg_out.0.to_bits());
+            assert_eq!(ref_out.1.to_bits(), reg_out.1.to_bits());
+            assert_eq!(
+                hot_ref.envelopes().map(f32::to_bits),
+                regs.envelopes_array().map(f32::to_bits)
+            );
+        }
+        regs.store(&mut hot_regs);
+        assert_eq!(
+            hot_ref.svf_s1.map(f32::to_bits),
+            hot_regs.svf_s1.map(f32::to_bits)
+        );
+        assert_eq!(
+            hot_ref.svf_s2.map(f32::to_bits),
+            hot_regs.svf_s2.map(f32::to_bits)
+        );
+        assert_eq!(
+            hot_ref.lru_v.map(f32::to_bits),
+            hot_regs.lru_v.map(f32::to_bits)
+        );
     }
 }
