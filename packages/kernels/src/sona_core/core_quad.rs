@@ -12,9 +12,9 @@ pub use dynamics::{
     eval_g_pre_vec4, eval_se_bus_gain_stereo8, eval_se_bus_gain_vec4,
 };
 pub use v4::{
-    CoreQuadV4OutputStereo8, CoreQuadV4ParamsStereo4, MAX_ADAA_DRIVE, MAX_E_TILDE_ABS, MAX_GLU_MIX,
-    MAX_LRU_BIAS_DRIVE, MAX_OUT_GAIN, rect_sign_from_mask, step_core_quad_v4_phs_stereo8,
-    step_core_quad_v4_stereo8,
+    CoreQuadV4Block0StateStereo8, CoreQuadV4OutputStereo8, CoreQuadV4ParamsStereo4, MAX_ADAA_DRIVE,
+    MAX_E_TILDE_ABS, MAX_GLU_MIX, MAX_LRU_BIAS_DRIVE, MAX_OUT_GAIN, rect_sign_from_mask,
+    step_core_quad_v4_phs_stereo8, step_core_quad_v4_stereo8,
 };
 
 use super::paralru::{

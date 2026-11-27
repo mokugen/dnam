@@ -18,8 +18,9 @@ pub use op_p::{
     CarrierBasisWeightsVec4, HILBERT_ALPHA_I, HILBERT_ALPHA_I_BITS, HILBERT_ALPHA_Q,
     HILBERT_ALPHA_Q_BITS, HILBERT_H1_ANCHOR_BITS, HILBERT_H1_ANCHOR_RATES_HZ, HILBERT_H1_STAGES,
     HilbertH1Kernel, HilbertH1RemapHistory, HilbertH1StereoKernel, StereoAnalyticQuadrature,
-    StereoCarrierRotorVec4, T1DcBlockerKernel, T1DcBlockerStereo, T1SubHarmonicKernel,
-    eval_carrier_3basis_stereo_vec4, halve_signed_q32_increments,
+    StereoCarrierRotorVec4, T1_PLUS_DEFAULT_SUB_LPF_96K_F32, T1_PLUS_DEFAULT_TRK_LPF_96K_F32,
+    T1DcBlockerKernel, T1DcBlockerStereo, T1PlusKernel, T1PlusParams, T1SubHarmonicKernel,
+    eval_carrier_3basis_stereo_vec4, eval_t1_plus_soft_square_f32, halve_signed_q32_increments,
     remap_allpass_chain_states_from_outputs, rotate_carrier_stereo_phase_vec4,
     tracker_crosses_branch_cut_f32,
 };

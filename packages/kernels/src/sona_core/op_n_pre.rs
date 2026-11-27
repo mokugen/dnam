@@ -5,6 +5,13 @@
 //! Strictly 32-bit (`#![no_std]`, zero 64-bit runtime integers, zero `FDIV`, zero `libm`) and
 //! layout-matched to the `28 B` Arena 0 hot slot (`OpNPreHotState`).
 
+pub mod v4;
+
+pub use v4::{
+    OP_N_PRE_MIN_DEADZONE_WIDTH, OP_N_PRE_V4_MAX_ZOH_HOLD_DEPTH, OpNPreV4Hoisted, OpNPreV4HotState,
+    compute_op_n_pre_v4_inc_q32, quantize_hermite_v4_f32,
+};
+
 use crate::modal_and_transport::op_t::q32_smooth_sin_f32;
 use crate::simd::{
     Q32_INV_2POW32_F32, const_abs_f32, const_f32_pow2, exp2_clamped16_f32, scrub_and_flush_f32_bits,

@@ -6,6 +6,7 @@
 pub mod carrier_3basis;
 pub mod dc_and_tracker;
 pub mod hilbert_stereo;
+pub mod t1_plus;
 
 pub use carrier_3basis::{
     CarrierBasisWeightsVec4, StereoAnalyticQuadrature, StereoCarrierRotorVec4,
@@ -23,3 +24,7 @@ pub use hilbert_stereo::{
 };
 #[cfg(not(target_arch = "spirv"))]
 pub use hilbert_stereo::{interpolate_hilbert_h1_alphas, interpolate_hilbert_h1_alphas_f64};
+pub use t1_plus::{
+    T1_PLUS_DEFAULT_SUB_LPF_96K_F32, T1_PLUS_DEFAULT_TRK_LPF_96K_F32, T1PlusKernel, T1PlusParams,
+    eval_t1_plus_soft_square_f32,
+};

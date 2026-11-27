@@ -6,6 +6,15 @@
 //! targets and 32-bit `spirv-unknown-naga-wgsl` shaders.
 
 mod fixed_point;
+pub mod tiers;
+
+pub use tiers::{
+    FULL_SPEC, FULL_V4_SPEC, LITE_SPEC, LITE_V4_SPEC, MAX_CORE_QUADS_V4, MAX_OUTGOING_PER_QUAD_V4,
+    MAX_SONA_TILES_V4, MAX_TOTAL_SONA_LANES_V4, NUM_SONA_BLOCKS_V4, PRO_SPEC, PRO_V4_SPEC,
+    SONA_V4_BLOCK_QUAD_SLOTS, SONA_V4_CORE_QUAD_BLOCK_AND_LOCAL, SONA_V4_INTERBLOCK_TILES,
+    SONA_V4_TILE_COUNTS, SONA_V4_ULTRA_QUAD_TRAVERSAL_ORDER, SonaTierSpec, ULTRA_SPEC,
+    ULTRA_V4_SPEC, is_matryoshka_monotonic, verify_tier_spec,
+};
 
 use fixed_point::{
     ONE_Q60, U64Limb, div_fixed_q60, mul_q60, mul_u32_wide, mul_u64_u32_div_u32, pi_q60,
@@ -171,93 +180,62 @@ pub const SE_BUS_ABS_MAX: f32 = 1.0e6;
 /// Upper bound on `|2 * svf_g * bp|` (`1.0e18`) preventing `gamma_duhem * |flux|` overflow to `+Inf` (`ref[dsp.op-n.core.matryoshka-blocks]`).
 pub const MAX_DUHEM_FLUX_ABS: f32 = 1.0e18;
 
-/// Compile-time fixed-shape tier capacity profile locked at `Gate 0b` (`Lite ⊂ Full ⊂ Pro ⊂ Ultra`).
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct SonaTierSpec {
-    /// Number of 4-lane `Vec4` quads in each of the 4 Matryoshka `SONA` core blocks.
-    pub blocks: [usize; 4],
-    /// Number of 4-mode `TPT-SVF` `Vec4` quads in the `SONA` core.
-    pub svf_quads: usize,
-    /// Number of cabinet early-reflection FIR taps per stereo channel.
-    pub fir_taps: usize,
-    /// Number of cabinet shared conjugate Kautz modal pole pairs.
-    pub kautz_pairs: usize,
-    /// Number of `Op-T` transport delay lines (`M` lines = `4 * quads`).
-    pub opt_lines: usize,
-    /// Core oversampling factor (`1` for `Lite`, `2` for `Full`/`Pro`/`Ultra` real-time).
-    pub oversample_factor: usize,
+/// Constrained equiripple Chebyshev half-band minimax odd tap `h_1` (`fp = 17.35 kHz` @ `96 kHz`,
+/// `H(0) == 1.0`, `H(pi/2) == 0.5`, `H(pi) == 0.0`, `ref[dsp.router.signal-flow]`).
+const HB15_CHEBY_H1: f32 = 0.624_758_66;
+/// Constrained equiripple Chebyshev half-band minimax odd tap `h_3` (`ref[dsp.router.signal-flow]`).
+const HB15_CHEBY_H3: f32 = -0.171_615_56;
+/// Constrained equiripple Chebyshev half-band minimax odd tap `h_5` (`ref[dsp.router.signal-flow]`).
+const HB15_CHEBY_H5: f32 = 0.072_826_09;
+/// Exact unity-DC residual outer tap `h_7 = 0.5 - (h_1 + h_3 + h_5)` (`ref[repo.code.constant-eval-and-derivations]`).
+const HB15_CHEBY_H7: f32 = 0.5 - (HB15_CHEBY_H1 + HB15_CHEBY_H3 + HB15_CHEBY_H5);
+
+/// `15`-tap symmetric linear-phase half-band FIR outer-to-inner odd-pair coefficients
+/// `[h_7, h_5, h_3, h_1]` (`sum == 0.5`, `0.000°` phase dispersion, `7` `1x`-sample delay,
+/// `-31.99 dB` @ `30 kHz`, `-42.59 dB` @ `32 kHz`, `ref[dsp.router.signal-flow]`).
+pub const HB15_ODD_TAPS_OUTER: [f32; 4] =
+    [HB15_CHEBY_H7, HB15_CHEBY_H5, HB15_CHEBY_H3, HB15_CHEBY_H1];
+
+/// Pre-halved downsampler odd-pair taps `0.5 * [h_7, h_5, h_3, h_1]` (`sum == 0.25`) avoiding
+/// extra scaling in `2x -> 1x` decimation (`ref[dsp.router.signal-flow]`).
+pub const HB15_DN_ODD_TAPS_OUTER: [f32; 4] = [
+    0.5 * HB15_CHEBY_H7,
+    0.5 * HB15_CHEBY_H5,
+    0.5 * HB15_CHEBY_H3,
+    0.5 * HB15_CHEBY_H1,
+];
+
+/// Compile-time pure-`f32` cosine on `[0, 8*pi]` via `2*pi` reduction and degree-10 Maclaurin
+/// series (`ref[repo.code.constant-eval-and-derivations]`).
+#[must_use]
+const fn const_cos_f32(omega: f32) -> f32 {
+    let mut x = const_abs_f32(omega);
+    while x > core::f32::consts::PI {
+        x -= core::f32::consts::TAU;
+    }
+    x = const_abs_f32(x);
+    let negate = x > core::f32::consts::FRAC_PI_2;
+    let t = if negate { core::f32::consts::PI - x } else { x };
+    let z = t * t;
+    let c = 1.0
+        + z * (const_taylor_inv_fact_f32(2, true)
+            + z * (const_taylor_inv_fact_f32(4, false)
+                + z * (const_taylor_inv_fact_f32(6, true)
+                    + z * (const_taylor_inv_fact_f32(8, false)
+                        + z * const_taylor_inv_fact_f32(10, true)))));
+    if negate { -c } else { c }
 }
 
-impl SonaTierSpec {
-    /// Constructs a compile-time `SONA` tier profile with `svf_quads` derived from `blocks`
-    /// and `opt_lines = 4 * tank_quads`.
-    #[inline(always)]
-    #[must_use]
-    pub const fn new(
-        blocks: [usize; 4],
-        fir_taps: usize,
-        kautz_pairs: usize,
-        tank_quads: usize,
-        oversample_factor: usize,
-    ) -> Self {
-        let svf_quads = blocks[0] + blocks[1] + blocks[2] + blocks[3];
-        Self {
-            blocks,
-            svf_quads,
-            fir_taps,
-            kautz_pairs,
-            opt_lines: 4 * tank_quads,
-            oversample_factor,
-        }
-    }
-
-    /// Returns the total number of 4-lane `Vec4` groups across all 4 Matryoshka `SONA` blocks.
-    #[inline(always)]
-    #[must_use]
-    pub const fn total_groups(&self) -> usize {
-        self.blocks[0] + self.blocks[1] + self.blocks[2] + self.blocks[3]
-    }
-
-    /// Returns the total number of 4-lane `Vec4` quads across all 4 Matryoshka `SONA` core blocks.
-    #[inline(always)]
-    #[must_use]
-    pub const fn block_sum(&self) -> usize {
-        self.total_groups()
-    }
-
-    /// Returns the total number of scalar `SONA` core lanes (`4 * self.total_groups()`).
-    #[inline(always)]
-    #[must_use]
-    pub const fn lanes(&self) -> usize {
-        4 * self.total_groups()
-    }
-
-    /// Returns the total number of scalar `SONA` core lanes (`4 * self.block_sum()`).
-    #[inline(always)]
-    #[must_use]
-    pub const fn total_lanes(&self) -> usize {
-        self.lanes()
-    }
-
-    /// Returns the number of tank `Op-T` transport delay quads (`opt_lines >> 2`).
-    #[inline(always)]
-    #[must_use]
-    pub const fn tank_quads(&self) -> usize {
-        self.opt_lines >> 2
-    }
+/// Evaluates the zero-phase DFT response
+/// `H(omega) = 0.5 + h_1 cos(w) + h_3 cos(3w) + h_5 cos(5w) + h_7 cos(7w)` of [`HB15_ODD_TAPS_OUTER`]
+/// at compile time (`ref[repo.code.constant-eval-and-derivations]`).
+#[must_use]
+pub const fn const_hb15_zero_phase_response_f32(taps_outer: &[f32; 4], omega_rad: f32) -> f32 {
+    0.5 + taps_outer[3] * const_cos_f32(omega_rad)
+        + taps_outer[2] * const_cos_f32(3.0 * omega_rad)
+        + taps_outer[1] * const_cos_f32(5.0 * omega_rad)
+        + taps_outer[0] * const_cos_f32(7.0 * omega_rad)
 }
-
-/// `Lite` compile-time tier capacity profile (`[1, 1, 1, 1]`, `16` lanes, `4` SVF quads, `32` FIR, `8` Kautz).
-pub const LITE_SPEC: SonaTierSpec = SonaTierSpec::new([1, 1, 1, 1], 32, 8, 1, 1);
-
-/// `Full` compile-time tier capacity profile (`[2, 2, 1, 1]`, `24` lanes @ `2x`, `6` SVF quads, `48` FIR, `12` Kautz).
-pub const FULL_SPEC: SonaTierSpec = SonaTierSpec::new([2, 2, 1, 1], 48, 12, 2, 2);
-
-/// `Pro` compile-time tier capacity profile (`[3, 2, 2, 1]`, `32` lanes @ `2x`, `8` SVF quads, `96` FIR, `24` Kautz).
-pub const PRO_SPEC: SonaTierSpec = SonaTierSpec::new([3, 2, 2, 1], 96, 24, 3, 2);
-
-/// `Ultra` compile-time tier capacity profile (`[4, 3, 2, 1]`, `40` lanes @ `2x`, `10` SVF quads, `128` FIR, `32` Kautz).
-pub const ULTRA_SPEC: SonaTierSpec = SonaTierSpec::new([4, 3, 2, 1], 128, 32, 4, 2);
 
 /// Compile-time Chebyshev minimax `binary32` positive reciprocal integer-sub seed
 /// `((2 * E_bias - 1) << 23) + round((2 * sqrt(6) - 4) * 2^23) == 0x7EF3_11C3`
@@ -373,40 +351,6 @@ pub const fn const_dc_blocker_pole_bits(fc_hz: u32, fs_hz: u32) -> u32 {
     (exp << IEEE754_F32_MANTISSA_BITS) | (sig & IEEE754_F32_MANTISSA_MASK)
 }
 
-const fn verify_tier_spec(
-    spec: &SonaTierSpec,
-    expected_groups: usize,
-    expected_tank_quads: usize,
-    expected_fir: usize,
-    expected_kautz: usize,
-    expected_os: usize,
-) -> bool {
-    spec.total_groups() == expected_groups
-        && spec.block_sum() == expected_groups
-        && spec.svf_quads == expected_groups
-        && spec.svf_quads * 4 == spec.lanes()
-        && spec.lanes() == spec.total_lanes()
-        && (spec.opt_lines & 3) == 0
-        && spec.tank_quads() == expected_tank_quads
-        && spec.opt_lines == expected_tank_quads * 4
-        && spec.fir_taps == expected_fir
-        && spec.kautz_pairs == expected_kautz
-        && spec.oversample_factor == expected_os
-}
-
-const fn is_matryoshka_monotonic(lo: &SonaTierSpec, hi: &SonaTierSpec) -> bool {
-    lo.blocks[0] <= hi.blocks[0]
-        && lo.blocks[1] <= hi.blocks[1]
-        && lo.blocks[2] <= hi.blocks[2]
-        && lo.blocks[3] <= hi.blocks[3]
-        && lo.svf_quads <= hi.svf_quads
-        && lo.fir_taps <= hi.fir_taps
-        && lo.kautz_pairs <= hi.kautz_pairs
-        && lo.opt_lines <= hi.opt_lines
-        && lo.oversample_factor <= hi.oversample_factor
-        && lo.total_lanes() < hi.total_lanes()
-}
-
 const _: () = assert!(IEEE754_F32_RCP_SEED == 0x7EF3_11C3);
 const _: () = assert!(DC_BLOCKER_5HZ_48K_F32.to_bits() == 0x3F7F_D51F);
 const _: () = assert!(DC_BLOCKER_10HZ_48K_BITS == 0x3F7F_AA45);
@@ -414,17 +358,55 @@ const _: () = assert!(MAX_LOOP_GAIN_F32.to_bits() == 0x3F7F_BE76);
 const _: () = assert!(MAX_LOOP_GAIN_F32 <= 0.9990);
 const _: () = assert!(MAX_PARALRU_R_F32.to_bits() == 0x3F7F_FFAC);
 const _: () = assert!(MAX_PARALRU_R_F32 <= 0.999_995);
-const _: () = assert!(LITE_SPEC.svf_quads * 4 == LITE_SPEC.lanes());
-const _: () = assert!(FULL_SPEC.svf_quads * 4 == FULL_SPEC.lanes());
-const _: () = assert!(PRO_SPEC.svf_quads * 4 == PRO_SPEC.lanes());
-const _: () = assert!(ULTRA_SPEC.svf_quads * 4 == ULTRA_SPEC.lanes());
-const _: () = assert!(verify_tier_spec(&LITE_SPEC, 4, 1, 32, 8, 1));
-const _: () = assert!(verify_tier_spec(&FULL_SPEC, 6, 2, 48, 12, 2));
-const _: () = assert!(verify_tier_spec(&PRO_SPEC, 8, 3, 96, 24, 2));
-const _: () = assert!(verify_tier_spec(&ULTRA_SPEC, 10, 4, 128, 32, 2));
-const _: () = assert!(is_matryoshka_monotonic(&LITE_SPEC, &FULL_SPEC));
-const _: () = assert!(is_matryoshka_monotonic(&FULL_SPEC, &PRO_SPEC));
-const _: () = assert!(is_matryoshka_monotonic(&PRO_SPEC, &ULTRA_SPEC));
+const _: () = assert!(
+    HB15_ODD_TAPS_OUTER[0]
+        + HB15_ODD_TAPS_OUTER[1]
+        + HB15_ODD_TAPS_OUTER[2]
+        + HB15_ODD_TAPS_OUTER[3]
+        == 0.5
+);
+const _: () = assert!(
+    HB15_DN_ODD_TAPS_OUTER[0]
+        + HB15_DN_ODD_TAPS_OUTER[1]
+        + HB15_DN_ODD_TAPS_OUTER[2]
+        + HB15_DN_ODD_TAPS_OUTER[3]
+        == 0.25
+);
+const _: () = assert!(
+    const_abs_f32(const_hb15_zero_phase_response_f32(&HB15_ODD_TAPS_OUTER, 0.0) - 1.0) < 1.0e-6
+);
+const _: () = assert!(
+    const_abs_f32(
+        const_hb15_zero_phase_response_f32(&HB15_ODD_TAPS_OUTER, core::f32::consts::FRAC_PI_2)
+            - 0.5
+    ) < 1.0e-6
+);
+const _: () = assert!(
+    const_abs_f32(const_hb15_zero_phase_response_f32(
+        &HB15_ODD_TAPS_OUTER,
+        core::f32::consts::PI
+    )) < 1.0e-6
+);
+const _: () = assert!(
+    const_abs_f32(
+        const_hb15_zero_phase_response_f32(
+            &HB15_ODD_TAPS_OUTER,
+            2.0 * core::f32::consts::PI * 17.35 / 96.0
+        ) - 1.0
+    ) < 0.009
+);
+const _: () = assert!(
+    const_abs_f32(const_hb15_zero_phase_response_f32(
+        &HB15_ODD_TAPS_OUTER,
+        2.0 * core::f32::consts::PI * 30.0 / 96.0
+    )) <= 0.025_41
+);
+const _: () = assert!(
+    const_abs_f32(const_hb15_zero_phase_response_f32(
+        &HB15_ODD_TAPS_OUTER,
+        2.0 * core::f32::consts::PI * 32.0 / 96.0
+    )) <= 0.008_71
+);
 const _: () = assert!(IEEE754_FP16_EXP_BIAS == 15);
 const _: () = assert!(IEEE754_F64_EXP_BIAS == 1023);
 const _: () = assert!(IEEE754_F32_MIN_NORMAL_EXP == -126);
@@ -550,27 +532,20 @@ mod tests {
         assert_eq!(const_max_f32_bits_le_ratio(1, 3), 0x3EAA_AAAA);
 
         assert_eq!(DC_BLOCKER_5HZ_48K_F32, 0.999_345_7_f32);
-        assert!(verify_tier_spec(&LITE_SPEC, 4, 1, 32, 8, 1));
-        assert!(verify_tier_spec(&FULL_SPEC, 6, 2, 48, 12, 2));
-        assert!(verify_tier_spec(&PRO_SPEC, 8, 3, 96, 24, 2));
-        assert!(verify_tier_spec(&ULTRA_SPEC, 10, 4, 128, 32, 2));
-        assert_eq!(LITE_SPEC.svf_quads, 4);
-        assert_eq!(FULL_SPEC.svf_quads, 6);
-        assert_eq!(PRO_SPEC.svf_quads, 8);
-        assert_eq!(ULTRA_SPEC.svf_quads, 10);
-        assert_eq!(LITE_SPEC.total_groups(), 4);
-        assert_eq!(FULL_SPEC.total_groups(), 6);
-        assert_eq!(PRO_SPEC.total_groups(), 8);
-        assert_eq!(ULTRA_SPEC.total_groups(), 10);
-        assert_eq!(LITE_SPEC.tank_quads(), 1);
-        assert_eq!(FULL_SPEC.tank_quads(), 2);
-        assert_eq!(PRO_SPEC.tank_quads(), 3);
-        assert_eq!(ULTRA_SPEC.tank_quads(), 4);
-        assert_eq!(LITE_SPEC.lanes(), 16);
-        assert_eq!(FULL_SPEC.lanes(), 24);
-        assert_eq!(PRO_SPEC.lanes(), 32);
-        assert_eq!(ULTRA_SPEC.lanes(), 40);
-        assert!(!is_matryoshka_monotonic(&FULL_SPEC, &LITE_SPEC));
+        let h_dc = const_hb15_zero_phase_response_f32(&HB15_ODD_TAPS_OUTER, 0.0);
+        let h_nyq = const_hb15_zero_phase_response_f32(&HB15_ODD_TAPS_OUTER, core::f32::consts::PI);
+        let h_30k = const_hb15_zero_phase_response_f32(
+            &HB15_ODD_TAPS_OUTER,
+            2.0 * core::f32::consts::PI * 30.0 / 96.0,
+        );
+        let h_32k = const_hb15_zero_phase_response_f32(
+            &HB15_ODD_TAPS_OUTER,
+            2.0 * core::f32::consts::PI * 32.0 / 96.0,
+        );
+        assert!((h_dc - 1.0).abs() < 1.0e-6);
+        assert!(h_nyq.abs() < 1.0e-6);
+        assert!(20.0 * h_30k.abs().log10() <= -31.9);
+        assert!(20.0 * h_32k.abs().log10() <= -41.2);
     }
 
     proptest! {

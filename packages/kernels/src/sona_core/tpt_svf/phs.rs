@@ -1,12 +1,23 @@
-//! Block 0 frozen-state linearly-implicit Port-Hamiltonian (`PHS`) diode-bandpass `2x2` ZDF
-//! `TPT-SVF` kernel (`ref[dsp.op-n.core.tpt-tone-basis]`).
+//! Block 0 Port-Hamiltonian (`PHS`) diode-bandpass `2x2` ZDF `TPT-SVF` kernels
+//! (`ref[dsp.op-n.core.tpt-tone-basis]`, `ref[dsp.op-m.recurrence.symplectic]`).
 //!
-//! Uses `k_eff[n] = k + k_nl * min(s1[n-1]^2, E_max)` with `E_max = 64.0` and zero inner
-//! Newton iterations, evaluating `a1 = rcp_ge1_nr2(1 + g * (g + k_eff))` with zero `FDIV`.
+//! Preserves v3.0 frozen-state `step_tpt_svf_phs_*` (`k_eff[n] = k + k_nl * min(s1[n-1]^2, 64)`)
+//! alongside v4.0 1-step Predictor-Corrector Passive `PHS` (`step_tpt_svf_pred_corr_phs_*`,
+//! `||M_n||_2 <= 1`, `O(log2 N)` 2-pass GPU scan).
+
+pub mod scans;
+
+pub use scans::{
+    PhsPredCorrAdjointTerms, PhsPredCorrPassBCoeffs, PhsPredCorrStepContext,
+    eval_phs_pred_corr_pass_b_coeffs, eval_phs_pred_corr_step_adjoint,
+    phs_pred_corr_pass_a_adjoint_elem, phs_pred_corr_pass_a_scan_elem,
+    phs_pred_corr_pass_b_adjoint_elem, phs_pred_corr_pass_b_scan_elem,
+};
 
 use crate::simd::{KernelVec4, StereoVec8, const_f32_pow2};
 
-use super::{MIN_TPT_G, TptSvfOutputs};
+use super::tone_folded::SonaToneFoldedBlock0;
+use super::{MIN_TPT_G, TptSvfCoeffs4, TptSvfOutputs};
 
 /// Compile-time capacitor/inductor energy saturation ceiling `E_max = 2^6 = 64.0` for Block 0 PHS.
 pub const SVF_PHS_E_MAX: f32 = const_f32_pow2(6);
@@ -102,6 +113,196 @@ pub fn step_tpt_svf_phs_stereo8<S: StereoVec8>(
         hp,
         ap,
     }
+}
+
+/// Dual-pass recursive state for Block `0` 1-step Predictor-Corrector Passive `PHS` `TPT-SVF`
+/// (`Pass A` linear predictor `(s1_lin, s2_lin)` + `Pass B` passive LTV corrector `(s1, s2)`,
+/// `ref[dsp.op-n.core.tpt-tone-basis]`).
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct TptSvfPhsPredCorrState<T> {
+    pub s1_lin: T,
+    pub s2_lin: T,
+    pub s1: T,
+    pub s2: T,
+}
+
+impl<V: KernelVec4> TptSvfPhsPredCorrState<V> {
+    /// Initializes all predictor and corrector states to canonical `+0.0`.
+    #[inline(always)]
+    #[must_use]
+    pub fn zero_vec4() -> Self {
+        Self {
+            s1_lin: V::zero(),
+            s2_lin: V::zero(),
+            s1: V::zero(),
+            s2: V::zero(),
+        }
+    }
+}
+
+impl<S: StereoVec8> TptSvfPhsPredCorrState<S> {
+    /// Initializes stereo predictor and corrector states to canonical `+0.0`.
+    #[inline(always)]
+    #[must_use]
+    pub fn zero_stereo8() -> Self {
+        Self {
+            s1_lin: S::zero(),
+            s2_lin: S::zero(),
+            s1: S::zero(),
+            s2: S::zero(),
+        }
+    }
+}
+
+/// Advances 4 `KernelVec4` modes via 1-step Predictor-Corrector Passive `PHS` `TPT-SVF`
+/// (`k_eff = k + k_nl * min(v1_lin^2, 64.0)`, `0-ULP` parity vs linear when `k_nl == 0.0`,
+/// `ref[dsp.op-n.core.tpt-tone-basis]`).
+#[inline(always)]
+pub fn step_tpt_svf_pred_corr_phs_vec4<V: KernelVec4>(
+    u: V,
+    state: &mut TptSvfPhsPredCorrState<V>,
+    g: V,
+    k: V,
+    k_nl: V,
+) -> TptSvfOutputs<V> {
+    let u_safe = u.flush_recursive_state();
+    let g_safe = g.max(V::splat(MIN_TPT_G));
+    let k_safe = k.max(V::zero());
+    let k_nl_safe = k_nl.max(V::zero());
+
+    // Pass A: Linear predictor (v1_lin)
+    let lin = TptSvfCoeffs4::from_gk(g_safe, k_safe);
+    let s1_a = state.s1_lin;
+    let s2_a = state.s2_lin;
+    let v3_a = u_safe.sub(s2_a);
+    let v1_lin = lin.a1.mul(s1_a).fma(lin.a2, v3_a);
+    let v2_a = s2_a.fma(lin.a2, s1_a).fma(lin.a3, v3_a);
+    state.s1_lin = v1_lin.add(v1_lin).sub(s1_a).flush_recursive_state();
+    state.s2_lin = v2_a.add(v2_a).sub(s2_a).flush_recursive_state();
+
+    // Pass B: Passive LTV corrector
+    let e = v1_lin.mul(v1_lin).min(V::splat(SVF_PHS_E_MAX));
+    let k_eff = k_safe.fma(k_nl_safe, e);
+    let denom = V::splat(1.0).fma(g_safe, g_safe.add(k_eff));
+    let a1 = denom.rcp_ge1_nr2();
+    let a2 = g_safe.mul(a1);
+    let a3 = g_safe.mul(a2);
+    let two_k_eff = k_eff.add(k_eff);
+
+    let s1_b = state.s1;
+    let s2_b = state.s2;
+    let v3_b = u_safe.sub(s2_b);
+    let v1 = a1.mul(s1_b).fma(a2, v3_b);
+    let v2 = s2_b.fma(a2, s1_b).fma(a3, v3_b);
+    state.s1 = v1.add(v1).sub(s1_b).flush_recursive_state();
+    state.s2 = v2.add(v2).sub(s2_b).flush_recursive_state();
+    let hp = u_safe.fms(k_eff, v1).sub(v2);
+    let ap = u_safe.fms(two_k_eff, v1);
+    TptSvfOutputs {
+        lp: v2,
+        bp: v1,
+        hp,
+        ap,
+    }
+}
+
+/// Advances stereo `L+R` Block `0` 1-step Predictor-Corrector Passive `PHS` `TPT-SVF` across
+/// `StereoVec8` (`0-ULP` stereo symmetry and `0-ULP` linear parity when `k_nl == 0.0`).
+#[inline(always)]
+pub fn step_tpt_svf_pred_corr_phs_stereo8<S: StereoVec8>(
+    u: S,
+    state: &mut TptSvfPhsPredCorrState<S>,
+    g: S::Half,
+    k: S::Half,
+    k_nl: S::Half,
+) -> TptSvfOutputs<S> {
+    let u_safe = u.flush_recursive_state();
+    let g_safe = S::broadcast_half(g.max(S::Half::splat(MIN_TPT_G)));
+    let k_safe = S::broadcast_half(k.max(S::Half::zero()));
+    let k_nl_safe = S::broadcast_half(k_nl.max(S::Half::zero()));
+
+    let lin = TptSvfCoeffs4::from_gk(g.max(S::Half::splat(MIN_TPT_G)), k.max(S::Half::zero()));
+    let a1_a = S::broadcast_half(lin.a1);
+    let a2_a = S::broadcast_half(lin.a2);
+    let a3_a = S::broadcast_half(lin.a3);
+    let s1_a = state.s1_lin;
+    let s2_a = state.s2_lin;
+    let v3_a = u_safe.sub(s2_a);
+    let v1_lin = a1_a.mul(s1_a).fma(a2_a, v3_a);
+    let v2_a = s2_a.fma(a2_a, s1_a).fma(a3_a, v3_a);
+    state.s1_lin = v1_lin.add(v1_lin).sub(s1_a).flush_recursive_state();
+    state.s2_lin = v2_a.add(v2_a).sub(s2_a).flush_recursive_state();
+
+    let e = v1_lin.mul(v1_lin).min(S::splat(SVF_PHS_E_MAX));
+    let k_eff = k_safe.fma(k_nl_safe, e);
+    let denom = S::splat(1.0).fma(g_safe, g_safe.add(k_eff));
+    let a1 = denom.rcp_ge1_nr2();
+    let a2 = g_safe.mul(a1);
+    let a3 = g_safe.mul(a2);
+    let two_k_eff = k_eff.add(k_eff);
+
+    let s1_b = state.s1;
+    let s2_b = state.s2;
+    let v3_b = u_safe.sub(s2_b);
+    let v1 = a1.mul(s1_b).fma(a2, v3_b);
+    let v2 = s2_b.fma(a2, s1_b).fma(a3, v3_b);
+    state.s1 = v1.add(v1).sub(s1_b).flush_recursive_state();
+    state.s2 = v2.add(v2).sub(s2_b).flush_recursive_state();
+    let hp = u_safe.fms(k_eff, v1).sub(v2);
+    let ap = u_safe.fms(two_k_eff, v1);
+    TptSvfOutputs {
+        lp: v2,
+        bp: v1,
+        hp,
+        ap,
+    }
+}
+
+/// Advances Block `0` 1-step Predictor-Corrector Passive `PHS` `TPT-SVF` with folded
+/// [`SonaToneFoldedBlock0`] readout (eliminating `HP`/`AP`), returning `(tone_out, bp)`.
+#[inline(always)]
+pub fn step_tpt_svf_pred_corr_phs_folded_stereo8<S: StereoVec8>(
+    u: S,
+    state: &mut TptSvfPhsPredCorrState<S>,
+    g: S::Half,
+    k: S::Half,
+    k_nl: S::Half,
+    tone: &SonaToneFoldedBlock0<S::Half>,
+) -> (S, S) {
+    let u_safe = u.flush_recursive_state();
+    let g_h = g.max(S::Half::splat(MIN_TPT_G));
+    let k_h = k.max(S::Half::zero());
+    let g_safe = S::broadcast_half(g_h);
+    let k_safe = S::broadcast_half(k_h);
+    let k_nl_safe = S::broadcast_half(k_nl.max(S::Half::zero()));
+
+    let lin = TptSvfCoeffs4::from_gk(g_h, k_h);
+    let a1_a = S::broadcast_half(lin.a1);
+    let a2_a = S::broadcast_half(lin.a2);
+    let a3_a = S::broadcast_half(lin.a3);
+    let s1_a = state.s1_lin;
+    let s2_a = state.s2_lin;
+    let v3_a = u_safe.sub(s2_a);
+    let v1_lin = a1_a.mul(s1_a).fma(a2_a, v3_a);
+    let v2_a = s2_a.fma(a2_a, s1_a).fma(a3_a, v3_a);
+    state.s1_lin = v1_lin.add(v1_lin).sub(s1_a).flush_recursive_state();
+    state.s2_lin = v2_a.add(v2_a).sub(s2_a).flush_recursive_state();
+
+    let e = v1_lin.mul(v1_lin).min(S::splat(SVF_PHS_E_MAX));
+    let k_eff = k_safe.fma(k_nl_safe, e);
+    let denom = S::splat(1.0).fma(g_safe, g_safe.add(k_eff));
+    let a1 = denom.rcp_ge1_nr2();
+    let a2 = g_safe.mul(a1);
+    let a3 = g_safe.mul(a2);
+
+    let s1_b = state.s1;
+    let s2_b = state.s2;
+    let v3_b = u_safe.sub(s2_b);
+    let v1 = a1.mul(s1_b).fma(a2, v3_b);
+    let v2 = s2_b.fma(a2, s1_b).fma(a3, v3_b);
+    state.s1 = v1.add(v1).sub(s1_b).flush_recursive_state();
+    state.s2 = v2.add(v2).sub(s2_b).flush_recursive_state();
+    (tone.eval_stereo8(v2, v1, k_eff, u_safe), v1)
 }
 
 #[cfg(test)]
@@ -260,5 +461,114 @@ mod tests {
                 prop_assert!(((e_post - e_pre) - rhs).abs() <= 1.0e-3 * e_pre.max(1.0));
             }
         }
+    }
+
+    #[test]
+    fn test_pred_corr_phs_zero_dc_knl0_parity_extremes_and_passivity() {
+        let g = GpuVec4::from_array([0.05, 0.25, 1.5, MAX_SVF_G]);
+        let k = GpuVec4::from_array([0.0, 0.5, 2.0, MAX_SVF_K]);
+        let k_nl = GpuVec4::from_array([1.0, 4.0, 8.0, MAX_SVF_K_NL]);
+
+        // Zero-DC +0.0 even under -0.0 / subnormal / NaN / Inf inputs
+        let mut st_dc = TptSvfPhsPredCorrState::<InterleavedStereo8<GpuVec4>>::zero_stereo8();
+        for &dirty in &[0.0_f32, -0.0, f32::from_bits(1), f32::NAN, f32::INFINITY] {
+            let out = step_tpt_svf_pred_corr_phs_stereo8(
+                InterleavedStereo8::splat(dirty),
+                &mut st_dc,
+                g,
+                k,
+                k_nl,
+            );
+            for v in [
+                st_dc.s1,
+                st_dc.s2,
+                st_dc.s1_lin,
+                st_dc.s2_lin,
+                out.lp,
+                out.bp,
+            ] {
+                let (vl, vr) = v.into_lr();
+                assert_eq!(vl.to_array().map(f32::to_bits), [0; 4]);
+                assert_eq!(vr.to_array().map(f32::to_bits), [0; 4]);
+            }
+        }
+
+        // k_nl == 0.0 -> 0-ULP parity vs linear step_tpt_svf_stereo8 & folded3
+        let coeffs = TptSvfCoeffs4::from_gk(g, k);
+        let tone0 = SonaToneFoldedBlock0 {
+            c_lp: GpuVec4::splat(0.4),
+            c_bp: GpuVec4::splat(0.3),
+            c_kbp: GpuVec4::splat(-0.2),
+            c_u: GpuVec4::splat(0.15),
+        };
+        let tone3 = tone0.to_folded3(k);
+        let mut st_pc = TptSvfPhsPredCorrState::<InterleavedStereo8<GpuVec4>>::zero_stereo8();
+        let mut st_pc_f = TptSvfPhsPredCorrState::<InterleavedStereo8<GpuVec4>>::zero_stereo8();
+        let mut lin_s1 = InterleavedStereo8::<GpuVec4>::zero();
+        let mut lin_s2 = InterleavedStereo8::<GpuVec4>::zero();
+        let mut fold_s1 = InterleavedStereo8::<GpuVec4>::zero();
+        let mut fold_s2 = InterleavedStereo8::<GpuVec4>::zero();
+
+        for n in 0..16 {
+            let u = InterleavedStereo8::splat_lr(0.7 * (n as f32).sin(), -0.4 * (n as f32).cos());
+            let o_pc = step_tpt_svf_pred_corr_phs_stereo8(u, &mut st_pc, g, k, GpuVec4::zero());
+            let o_lin = step_tpt_svf_stereo8(u, &mut lin_s1, &mut lin_s2, &coeffs);
+            assert_eq!(
+                o_pc.lp.into_lr().0.to_array().map(f32::to_bits),
+                o_lin.lp.into_lr().0.to_array().map(f32::to_bits)
+            );
+            assert_eq!(
+                o_pc.bp.into_lr().1.to_array().map(f32::to_bits),
+                o_lin.bp.into_lr().1.to_array().map(f32::to_bits)
+            );
+
+            let (tf_pc, bp_pc) = step_tpt_svf_pred_corr_phs_folded_stereo8(
+                u,
+                &mut st_pc_f,
+                g,
+                k,
+                GpuVec4::zero(),
+                &tone0,
+            );
+            let (tf_lin, bp_lin) = super::super::tone_folded::step_tpt_svf_folded3_stereo8(
+                u,
+                &mut fold_s1,
+                &mut fold_s2,
+                &coeffs,
+                &tone3,
+            );
+            assert_eq!(
+                tf_pc.into_lr().0.to_array().map(f32::to_bits),
+                tf_lin.into_lr().0.to_array().map(f32::to_bits)
+            );
+            assert_eq!(
+                bp_pc.into_lr().1.to_array().map(f32::to_bits),
+                bp_lin.into_lr().1.to_array().map(f32::to_bits)
+            );
+        }
+
+        // ||M_n||_2 <= 1 zero-input energy dissipation + +-1e9 finite safety
+        let mut st_e = TptSvfPhsPredCorrState {
+            s1_lin: GpuVec4::splat(8.0),
+            s2_lin: GpuVec4::splat(-4.0),
+            s1: GpuVec4::splat(8.0),
+            s2: GpuVec4::splat(-4.0),
+        };
+        let mut prev_e = st_e.s1.0[0] * st_e.s1.0[0] + st_e.s2.0[0] * st_e.s2.0[0];
+        for _ in 0..16 {
+            let _ = step_tpt_svf_pred_corr_phs_vec4(GpuVec4::zero(), &mut st_e, g, k, k_nl);
+            let e = st_e.s1.0[0] * st_e.s1.0[0] + st_e.s2.0[0] * st_e.s2.0[0];
+            assert!(e <= prev_e + 1.0e-5);
+            prev_e = e;
+        }
+        let ext = step_tpt_svf_pred_corr_phs_vec4(
+            GpuVec4::from_array([1.0e9, -1.0e9, f32::NAN, f32::INFINITY]),
+            &mut st_e,
+            g,
+            k,
+            k_nl,
+        );
+        assert!(ext.lp.to_array().iter().all(|v| v.is_finite()));
+        assert!(ext.bp.to_array().iter().all(|v| v.is_finite()));
     }
 }

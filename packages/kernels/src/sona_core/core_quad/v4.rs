@@ -8,12 +8,15 @@ use crate::simd::{KernelVec4, StereoVec8};
 use super::dynamics::{
     clamp_range_safe_vec4, eval_bounded_glu_stereo8, eval_g_pre_stereo8, eval_se_bus_gain_stereo8,
 };
+use crate::sona_core::SonaBlockStateStereo8;
 use crate::sona_core::paralru::{
     SonaParaLruDuhemCoeffs4, apply_stereo_link_stereo8, step_paralru_duhem_v4_stereo8,
 };
 use crate::sona_core::poly_adaa::eval_alg_adaa1_with_wavefolder_stereo8;
-use crate::sona_core::tpt_svf::{TptSvfCoeffs4, step_tpt_svf_phs_stereo8, step_tpt_svf_stereo8};
-use crate::sona_core::{SonaBlockStateStereo8, SonaToneWeights4, TptSvfOutputs};
+use crate::sona_core::tpt_svf::{
+    SonaToneFoldedBlock0, TptSvfCoeffs4, TptSvfPhsPredCorrState, step_tpt_svf_folded3_stereo8,
+    step_tpt_svf_pred_corr_phs_folded_stereo8,
+};
 
 /// Maximum clamped `adaa_drive` magnitude (`[-32.0, 32.0]`).
 pub const MAX_ADAA_DRIVE: f32 = 32.0;
@@ -53,7 +56,8 @@ pub fn rect_sign_from_mask<V: KernelVec4>(mask: u16) -> V {
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct CoreQuadV4ParamsStereo4<V: KernelVec4> {
     pub svf: TptSvfCoeffs4<V>,
-    pub tone: SonaToneWeights4<V>,
+    /// Folded `TPT-SVF` tone basis (`c_kbp == 0.0` on Blocks `1..3`, non-zero on Block `0` PHS).
+    pub tone: SonaToneFoldedBlock0<V>,
     pub lru: SonaParaLruDuhemCoeffs4<V>,
     /// Precomputed `2 * svf_g` (`[2e-5, 128.0]`) scaling `TPT-SVF` bandpass into Selective-Duhem flux.
     pub two_svf_g: V,
@@ -94,21 +98,37 @@ pub struct CoreQuadV4OutputStereo8<S: StereoVec8> {
     pub e_tilde: S,
 }
 
+/// Block `0` SONA v4.0 recursive stereo state combining [`SonaBlockStateStereo8`] with the Pass A
+/// linear predictor `(svf_lin_s1, svf_lin_s2)` for 1-step Predictor-Corrector Passive `PHS`
+/// (`ref[dsp.op-n.core.tpt-tone-basis]`).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct CoreQuadV4Block0StateStereo8<S: StereoVec8> {
+    pub block: SonaBlockStateStereo8<S>,
+    pub svf_lin_s1: S,
+    pub svf_lin_s2: S,
+}
+
+impl<S: StereoVec8> CoreQuadV4Block0StateStereo8<S> {
+    /// Initializes Block `0` state at analytical Zero-DC resting equilibrium (`+0.0`).
+    #[inline]
+    #[must_use]
+    pub fn zero() -> Self {
+        Self {
+            block: SonaBlockStateStereo8::zero(),
+            svf_lin_s1: S::zero(),
+            svf_lin_s2: S::zero(),
+        }
+    }
+}
+
 #[inline(always)]
 fn step_core_quad_v4_post_svf_stereo8<S: StereoVec8>(
-    u: S,
-    svf_out: TptSvfOutputs<S>,
+    tone_in: S,
+    bp: S,
     state: &mut SonaBlockStateStereo8<S>,
     params: &CoreQuadV4ParamsStereo4<S::Half>,
 ) -> CoreQuadV4OutputStereo8<S> {
-    let tone_in = svf_out
-        .lp
-        .mul(S::broadcast_half(params.tone.lp))
-        .fma(svf_out.bp, S::broadcast_half(params.tone.bp))
-        .fma(svf_out.hp, S::broadcast_half(params.tone.hp))
-        .fma(svf_out.ap, S::broadcast_half(params.tone.ap))
-        .fma(u, S::broadcast_half(params.tone.dir));
-    let flux_inc = S::broadcast_half(params.two_svf_g).mul(svf_out.bp);
+    let flux_inc = S::broadcast_half(params.two_svf_g).mul(bp);
 
     let rect_in = S::broadcast_half(params.rect_sign).mul(tone_in);
     let v_raw = step_paralru_duhem_v4_stereo8(rect_in, flux_inc, &mut state.lru_v, &params.lru);
@@ -153,8 +173,8 @@ fn step_core_quad_v4_post_svf_stereo8<S: StereoVec8>(
     }
 }
 
-/// Executes one Blocks 1..3 SONA v4.0 passive linear `CoreQuad` step (`0 FDIV`, `0 FSQRT`,
-/// `0-ULP` Mechanism A2 sign-flip conjugation invariance).
+/// Executes one Blocks `1..3` SONA v4.0 passive linear `CoreQuad` step using `3`-tap folded
+/// `TPT-SVF` (`0 FDIV`, `0 FSQRT`, `0-ULP` Mechanism A2 sign-flip conjugation invariance).
 #[inline(always)]
 pub fn step_core_quad_v4_stereo8<S: StereoVec8>(
     u: S,
@@ -162,35 +182,54 @@ pub fn step_core_quad_v4_stereo8<S: StereoVec8>(
     params: &CoreQuadV4ParamsStereo4<S::Half>,
 ) -> CoreQuadV4OutputStereo8<S> {
     let u_safe = u.flush_recursive_state();
-    let svf_out = step_tpt_svf_stereo8(u_safe, &mut state.svf_s1, &mut state.svf_s2, &params.svf);
-    step_core_quad_v4_post_svf_stereo8(u_safe, svf_out, state, params)
+    let tone_folded = params.tone.to_folded3(params.svf.k);
+    let (tone_in, bp) = step_tpt_svf_folded3_stereo8(
+        u_safe,
+        &mut state.svf_s1,
+        &mut state.svf_s2,
+        &params.svf,
+        &tone_folded,
+    );
+    step_core_quad_v4_post_svf_stereo8(tone_in, bp, state, params)
 }
 
-/// Executes one Block 0 SONA v4.0 Port-Hamiltonian (`PHS`) `CoreQuad` step with `0-ULP` parity
-/// against [`step_core_quad_v4_stereo8`] when `params.svf_k_nl == 0.0`.
+/// Executes one Block `0` SONA v4.0 1-step Predictor-Corrector Passive Port-Hamiltonian (`PHS`)
+/// `CoreQuad` step with `0-ULP` parity against [`step_core_quad_v4_stereo8`] when
+/// `params.svf_k_nl == 0.0`.
 #[inline(always)]
 pub fn step_core_quad_v4_phs_stereo8<S: StereoVec8>(
     u: S,
-    state: &mut SonaBlockStateStereo8<S>,
+    state: &mut CoreQuadV4Block0StateStereo8<S>,
     params: &CoreQuadV4ParamsStereo4<S::Half>,
 ) -> CoreQuadV4OutputStereo8<S> {
     let u_safe = u.flush_recursive_state();
     let svf_g = params.two_svf_g.mul(S::Half::splat(0.5));
-    let svf_out = step_tpt_svf_phs_stereo8(
+    let mut phs_state = TptSvfPhsPredCorrState {
+        s1_lin: state.svf_lin_s1,
+        s2_lin: state.svf_lin_s2,
+        s1: state.block.svf_s1,
+        s2: state.block.svf_s2,
+    };
+    let (tone_in, bp) = step_tpt_svf_pred_corr_phs_folded_stereo8(
         u_safe,
-        &mut state.svf_s1,
-        &mut state.svf_s2,
+        &mut phs_state,
         svf_g,
         params.svf.k,
         params.svf_k_nl,
+        &params.tone,
     );
-    step_core_quad_v4_post_svf_stereo8(u_safe, svf_out, state, params)
+    state.svf_lin_s1 = phs_state.s1_lin;
+    state.svf_lin_s2 = phs_state.s2_lin;
+    state.block.svf_s1 = phs_state.s1;
+    state.block.svf_s2 = phs_state.s2;
+    step_core_quad_v4_post_svf_stereo8(tone_in, bp, &mut state.block, params)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::simd::{GpuVec4, InterleavedStereo8, MAX_ALG_R};
+    use crate::sona_core::SonaToneWeights4;
     use crate::sona_core::core_quad::couple_ms_input_stereo8;
     use crate::sona_core::paralru::SonaParaLruDuhemCoeffs4;
     use crate::sona_core::tpt_svf::prewarp_tan_pi_f_over_fs_f32;
@@ -199,15 +238,16 @@ mod tests {
     fn sample_v4_params(g_val: f32) -> CoreQuadV4ParamsStereo4<GpuVec4> {
         let g = GpuVec4::splat(g_val);
         let k = GpuVec4::from_array([0.5, 0.707_106_77, 1.0, 1.4]);
+        let weights = SonaToneWeights4 {
+            lp: GpuVec4::from_array([0.4, 0.2, 0.1, 0.0]),
+            bp: GpuVec4::from_array([0.3, 0.4, 0.2, 0.5]),
+            hp: GpuVec4::from_array([0.0, 0.2, 0.3, 0.2]),
+            ap: GpuVec4::from_array([0.1, 0.0, 0.2, 0.1]),
+            dir: GpuVec4::from_array([0.2, 0.2, 0.2, 0.2]),
+        };
         CoreQuadV4ParamsStereo4 {
             svf: TptSvfCoeffs4::from_gk(g, k),
-            tone: SonaToneWeights4 {
-                lp: GpuVec4::from_array([0.4, 0.2, 0.1, 0.0]),
-                bp: GpuVec4::from_array([0.3, 0.4, 0.2, 0.5]),
-                hp: GpuVec4::from_array([0.0, 0.2, 0.3, 0.2]),
-                ap: GpuVec4::from_array([0.1, 0.0, 0.2, 0.1]),
-                dir: GpuVec4::from_array([0.2, 0.2, 0.2, 0.2]),
-            },
+            tone: SonaToneFoldedBlock0::from_weights(&weights),
             lru: SonaParaLruDuhemCoeffs4::from_clamped(
                 GpuVec4::from_array([0.98, 0.94, 0.88, 0.75]),
                 GpuVec4::from_array([0.25, 0.4, 0.65, 0.8]),
@@ -297,7 +337,7 @@ mod tests {
         p_sag.lin_mix = GpuVec4::splat(1.0);
         p_sag.se_d_bus = GpuVec4::zero();
         p_sag.out_gain = GpuVec4::splat(1.0);
-        p_sag.tone = SonaToneWeights4::direct_only();
+        p_sag.tone = SonaToneFoldedBlock0::direct_only();
         let p_nosag = CoreQuadV4ParamsStereo4 {
             d_pre: GpuVec4::zero(),
             ..p_sag
@@ -332,7 +372,7 @@ mod tests {
 
         // 5. High-drive (3996.0, 4096.0) and (-3996.0, -4096.0) regression: |e_tilde| <= MAX_E_TILDE_ABS (20.0).
         let mut p_edge = p;
-        p_edge.tone = SonaToneWeights4::direct_only();
+        p_edge.tone = SonaToneFoldedBlock0::direct_only();
         p_edge.g0 = GpuVec4::splat(1.0);
         p_edge.g_inf = GpuVec4::splat(1.0);
         p_edge.d_pre = GpuVec4::zero();
@@ -421,9 +461,9 @@ mod tests {
 
             let mid_w = GpuVec4::splat(0.6);
             let side_w = GpuVec4::splat(-0.35);
-            let mut st_o = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
-            let mut st_c = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
-            let mut st_l = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+            let mut st_o = CoreQuadV4Block0StateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+            let mut st_c = CoreQuadV4Block0StateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
+            let mut st_l = CoreQuadV4Block0StateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
             let mut st_r = SonaBlockStateStereo8::<InterleavedStereo8<GpuVec4>>::zero();
 
             for (&ul, &ur) in stim_l.iter().zip(stim_r.iter()) {

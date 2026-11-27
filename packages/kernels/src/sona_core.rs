@@ -7,23 +7,31 @@
 
 pub mod core_quad;
 pub mod op_n_pre;
+pub mod os2x_hbfir;
 pub mod paralru;
 pub mod poly_adaa;
 pub mod tpt_svf;
 
 pub use core_quad::{
-    CoreQuadParamsStereo4, CoreQuadV4OutputStereo8, CoreQuadV4ParamsStereo4, G_PRE_E_MAX,
-    MAX_ADAA_DRIVE, MAX_E_TILDE_ABS, MAX_G_PRE_GAIN, MAX_GLU_MIX, MAX_LRU_BIAS_DRIVE, MAX_OUT_GAIN,
-    MIN_SAG_GAIN, SE_BUS_ABS_MAX, couple_ms_input_stereo8, eval_bounded_glu_stereo8,
-    eval_g_pre_stereo8, eval_g_pre_vec4, eval_se_bus_gain_stereo8, eval_se_bus_gain_vec4,
-    rect_sign_from_mask, step_core_quad_phs_stereo8, step_core_quad_stereo8,
-    step_core_quad_v4_phs_stereo8, step_core_quad_v4_stereo8,
+    CoreQuadParamsStereo4, CoreQuadV4Block0StateStereo8, CoreQuadV4OutputStereo8,
+    CoreQuadV4ParamsStereo4, G_PRE_E_MAX, MAX_ADAA_DRIVE, MAX_E_TILDE_ABS, MAX_G_PRE_GAIN,
+    MAX_GLU_MIX, MAX_LRU_BIAS_DRIVE, MAX_OUT_GAIN, MIN_SAG_GAIN, SE_BUS_ABS_MAX,
+    couple_ms_input_stereo8, eval_bounded_glu_stereo8, eval_g_pre_stereo8, eval_g_pre_vec4,
+    eval_se_bus_gain_stereo8, eval_se_bus_gain_vec4, rect_sign_from_mask,
+    step_core_quad_phs_stereo8, step_core_quad_stereo8, step_core_quad_v4_phs_stereo8,
+    step_core_quad_v4_stereo8,
 };
 pub use op_n_pre::{
     OP_N_PRE_BETA_BYPASS_EPS, OP_N_PRE_FULL_PASS_THRESH, OP_N_PRE_INV_TAU_F32, OP_N_PRE_MAX_BETA_Q,
-    OP_N_PRE_MAX_ZOH_HOLD_DEPTH, OP_N_PRE_MIN_RHO_EFF, OP_N_PRE_QUANT_CLAMP_F32, OpNPreHoisted,
-    OpNPreHotState, compute_op_n_pre_inc_q32, quantize_nearest_step_f32,
-    quantize_smooth_fourier_f32,
+    OP_N_PRE_MAX_ZOH_HOLD_DEPTH, OP_N_PRE_MIN_DEADZONE_WIDTH, OP_N_PRE_MIN_RHO_EFF,
+    OP_N_PRE_QUANT_CLAMP_F32, OP_N_PRE_V4_MAX_ZOH_HOLD_DEPTH, OpNPreHoisted, OpNPreHotState,
+    OpNPreV4Hoisted, OpNPreV4HotState, compute_op_n_pre_inc_q32, compute_op_n_pre_v4_inc_q32,
+    quantize_hermite_v4_f32, quantize_nearest_step_f32, quantize_smooth_fourier_f32,
+};
+pub use os2x_hbfir::{
+    HB15_DELAY_SAMPLES_1X, HB15_HIST_LEN, HB15_ODD_DELAY_LEN, HbFir15Downsampler4Ch,
+    HbFir15UpsamplerStereo, eval_hb15_downsample_4ch_vec4, eval_hb15_downsample_stereo,
+    eval_hb15_upsample_stereo,
 };
 
 use crate::simd::{KernelVec4, MAX_PARALRU_R_F32, StereoVec8};
@@ -57,10 +65,16 @@ pub use poly_adaa::{
     scrub_clamped_alg_endpoint_stereo8, scrub_clamped_alg_endpoint_vec4,
 };
 pub use tpt_svf::{
-    MAX_SVF_K_NL, MIN_TPT_G, SVF_PHS_E_MAX, TptAdjointElem, TptScanElem, TptSvfCoeffs4,
-    TptSvfOutputs, apply_tpt_adjoint, apply_tpt_init, compose_tpt_adjoint_scan, compose_tpt_scan,
-    prewarp_tan_pi_f_over_fs_f32, step_tpt_svf_phs_stereo8, step_tpt_svf_phs_vec4,
-    step_tpt_svf_stereo8, step_tpt_svf_vec4,
+    MAX_SVF_K_NL, MIN_TPT_G, PhsPredCorrAdjointTerms, PhsPredCorrPassBCoeffs,
+    PhsPredCorrStepContext, SVF_PHS_E_MAX, SonaToneFolded3, SonaToneFoldedBlock0, TptAdjointElem,
+    TptScanElem, TptSvfCoeffs4, TptSvfOutputs, TptSvfPhsPredCorrState, apply_tpt_adjoint,
+    apply_tpt_init, compose_tpt_adjoint_scan, compose_tpt_scan, eval_phs_pred_corr_pass_b_coeffs,
+    eval_phs_pred_corr_step_adjoint, phs_pred_corr_pass_a_adjoint_elem,
+    phs_pred_corr_pass_a_scan_elem, phs_pred_corr_pass_b_adjoint_elem,
+    phs_pred_corr_pass_b_scan_elem, prewarp_tan_pi_f_over_fs_f32, step_tpt_svf_folded3_stereo8,
+    step_tpt_svf_folded3_vec4, step_tpt_svf_phs_stereo8, step_tpt_svf_phs_vec4,
+    step_tpt_svf_pred_corr_phs_folded_stereo8, step_tpt_svf_pred_corr_phs_stereo8,
+    step_tpt_svf_pred_corr_phs_vec4, step_tpt_svf_stereo8, step_tpt_svf_vec4,
 };
 
 /// Simultaneous 4-mode `TPT-SVF` + direct-feed tone mixing weights (`ref[dsp.op-n.core.tpt-tone-basis]`).
