@@ -8,14 +8,14 @@ All contributions must also comply with the root [`CONTRIBUTING.md`](../../CONTR
 
 ## 1. Crate Architecture, Rule Scope & Directory Layout
 
-Consult [`AGENTS.md`](AGENTS.md) and the submodule `AGENTS.md` files for progressive-disclosure routing:
+Consult the [root `AGENTS.md`](../../AGENTS.md) for the workspace discovery map and the module layout below:
 
-- **`src/engine/` ([`src/engine/AGENTS.md`](src/engine/AGENTS.md)) & [`src/engine/patchbay/AGENTS.md`](src/engine/patchbay/AGENTS.md):** `DnamEngine<'a, B>` wrapper over `dnam_vm::SonaVm`, Layer 1 `HostShellPatchbay` (Stereo, Mono, `4CM`, `WDW`, DualAmp, return/parallel alignment, M-S width), presets, tempo sync, and offline bounce.
-- **`src/dynamic/` ([`src/dynamic/AGENTS.md`](src/dynamic/AGENTS.md)):** Runtime SIMD backend dispatch (`DynamicDnamEngine<'a>`) with zero per-sample branching.
-- **`src/host/` ([`src/host/AGENTS.md`](src/host/AGENTS.md)):** Lock-free 3-lane SPSC control ingress, `AcceptedStateShadow`, 64 B Seqlock telemetry, ping-pong model swap, and `DnamHostHandle`.
-- **`src/container/` ([`src/container/AGENTS.md`](src/container/AGENTS.md)):** 64 B `.dnam` preamble, `zerocopy` v3.0 `DnamContainerView`, `DMU1`/`DMUE` mutable suffix framing, prefix tier slimming, and zero-copy `.dnam-bin` extraction (`extract_dnam_bin`).
-- **`src/provenance/` ([`src/provenance/AGENTS.md`](src/provenance/AGENTS.md)):** `DAU1` authentication envelopes, RFC 8785 JCS header digests, Ed25519 prefix commitments, `OemDeviceCertificate` attestation, RFC 9180 HPKE + ChaCha20-Poly1305 `.dnam-seal` (`DNSL`), buyer watermarking, and `.dnam-prev` containment (`PreviewGuardState`).
-- **`src/schema/` ([`src/schema/AGENTS.md`](src/schema/AGENTS.md)):** `#![no_std]` `serde` JSON header types, UI skew curves, `ControlClampDescriptor` compilation, and `DnamError`.
+- **`src/engine/` & `src/engine/patchbay/`:** `DnamEngine<'a, B>` wrapper over `dnam_vm::SonaVm`, Layer 1 `HostShellPatchbay` (Stereo, Mono, `4CM`, `WDW`, DualAmp, return/parallel alignment, M-S width), presets, tempo sync, and offline bounce.
+- **`src/dynamic/`:** Runtime SIMD backend dispatch (`DynamicDnamEngine<'a>`) with zero per-sample branching.
+- **`src/host/`:** Lock-free 3-lane SPSC control ingress, `AcceptedStateShadow`, 64 B Seqlock telemetry, ping-pong model swap, and `DnamHostHandle`.
+- **`src/container/`:** 64 B `.dnam` preamble, `zerocopy` v3.0 `DnamContainerView`, `DMU1`/`DMUE` mutable suffix framing, prefix tier slimming, and zero-copy `.dnam-bin` extraction (`extract_dnam_bin`).
+- **`src/provenance/`:** `DAU1` authentication envelopes, RFC 8785 JCS header digests, Ed25519 prefix commitments, `OemDeviceCertificate` attestation, RFC 9180 HPKE + ChaCha20-Poly1305 `.dnam-seal` (`DNSL`), buyer watermarking, and `.dnam-prev` containment (`PreviewGuardState`).
+- **`src/schema/`:** `#![no_std]` `serde` JSON header types, UI skew curves, `ControlClampDescriptor` compilation, and `DnamError`.
 
 ### Specification Rule Scope (`spec_scope.toml`)
 
@@ -88,4 +88,4 @@ Coverage is a floor, not a bug-free guarantee. Independently challenge the speci
 - [ ] Every new or modified module includes `proptest!` property-based tests (alongside exact boundary/vector tests) co-located in its source file (`#[cfg(test)]`), with `verify[...]` citations matching [`spec_scope.toml`](spec_scope.toml).
 - [ ] `moon check engine` passes all formatting, Clippy (`-D warnings`), build, and unit/`proptest`/integration suites (`tests/realtime_safety.rs`, `tests/backend_parity.rs`, `tests/realtime_disassembly_audit.rs`).
 - [ ] `moon run engine:coverage` confirms ≥ 95% line coverage, including all newly added or modified functions and tier branches.
-- [ ] If any public API or C-ABI signature changed, `packages/js/rust/` bindings and scoped `AGENTS.md` files (< 2,500 B) are updated accordingly.
+- [ ] If any public API or C-ABI signature changed, `packages/js/rust/` bindings and [`README.md`](README.md) / [`CONTRIBUTING.md`](CONTRIBUTING.md) are updated accordingly.

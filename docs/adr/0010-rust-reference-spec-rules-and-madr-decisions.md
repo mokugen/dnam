@@ -54,3 +54,9 @@ We adopt the three-layer documentation architecture and rule-tracking system def
    - `verify[<domain>.<subdomain>.<rule>]` cites that rule in test suites (`tests/`, `packages/**/tests/`), allowing `test_spec_rules_verified_in_tests` to report unverified specification rules as engine and trainer implementations progress.
 3. **Progressive-Disclosure & Rendering Guardrails (`ref[repo.docs.agents-md-budgets]`, `ref[repo.docs.markdown-table-math]`, `ref[repo.docs.github-latex-and-mermaid]`, `ref[repo.docs.relative-links-and-anchors]`):**
    - Automated guardrails enforce `< 5,000 B` root / `< 2,500 B` scoped `AGENTS.md` routing maps, CommonMark + MathJax LaTeX compatibility, zero raw `$` in Markdown table rows, and relative link/anchor resolution.
+
+---
+
+## Amendment Appendix
+
+- **2026-11-28 (`C2.6-docs`):** Collapsed the `57`-file two-tier `AGENTS.md` hierarchy (`< 5,000 B` root / `< 2,500 B` scoped) to a single root [`AGENTS.md`](../../AGENTS.md) (`< 5,000 B`) with zero nested `AGENTS.md` files, offloading package invariants and workflows to per-package `CONTRIBUTING.md` guides (`ref[repo.docs.agents-md-budgets]`).

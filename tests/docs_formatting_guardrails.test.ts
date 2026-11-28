@@ -1,5 +1,5 @@
 /**
- * Documentation Formatting, `AGENTS.md` Byte Budgets, Table Math, GitHub LaTeX/Mermaid,
+ * Documentation Formatting, Root `AGENTS.md` Byte Budget, Table Math, GitHub LaTeX/Mermaid,
  * Relative Links & Anchors, Index, and Root `README.md` Guardrail Tests.
  *
  * verify[repo.docs.agents-md-budgets]
@@ -305,18 +305,17 @@ describe("DNAM Documentation Formatting, Links & Progressive Disclosure Guardrai
   it("test_progressive_disclosure_agents_md_byte_limits", () => {
     const allAgents = walkMarkdownFiles(REPO_ROOT).filter((p) => path.basename(p) === "AGENTS.md");
     const rootAgents = path.join(REPO_ROOT, "AGENTS.md");
-    expect(allAgents.includes(rootAgents)).toBe(true);
+    expect(allAgents).toEqual([rootAgents]);
     expect(fs.statSync(rootAgents).size).toBeLessThan(5000);
-    expect(allAgents.filter((p) => p !== rootAgents).length).toBeGreaterThanOrEqual(19);
 
-    for (const agentsPath of allAgents) {
-      if (agentsPath !== rootAgents) {
-        const size = fs.statSync(agentsPath).size;
-        expect(size, `${relPath(agentsPath)} is ${size} B (>= 2,500)`).toBeLessThan(2500);
-      }
-      const clean = stripFencedCodeBlocks(fs.readFileSync(agentsPath, "utf8"));
-      expect(clean).not.toContain("$$");
-      expect(clean.match(SPEC_RULE_DEF_RE)).toBeNull();
+    const clean = stripFencedCodeBlocks(fs.readFileSync(rootAgents, "utf8"));
+    expect(clean).not.toContain("$$");
+    expect(clean.match(SPEC_RULE_DEF_RE)).toBeNull();
+
+    for (const pkgEntry of fs.readdirSync(PACKAGES_DIR, { withFileTypes: true })) {
+      if (!pkgEntry.isDirectory()) continue;
+      const contribPath = path.join(PACKAGES_DIR, pkgEntry.name, "CONTRIBUTING.md");
+      expect(fs.existsSync(contribPath), `Missing ${relPath(contribPath)}`).toBe(true);
     }
   });
 

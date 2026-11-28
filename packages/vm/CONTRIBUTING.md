@@ -6,7 +6,7 @@ This guide defines the safety, `#![no_std]` / `!alloc`, `zerocopy`, testing, and
 
 ## 1. Crate Architecture & Dependency Isolation
 
-Consult [`AGENTS.md`](AGENTS.md) for the full module routing map:
+Consult the [root `AGENTS.md`](../../AGENTS.md) for the workspace discovery map:
 
 - **`src/lib.rs`:** Crate root enforcing `#![cfg_attr(not(any(feature = "std", test)), no_std)]`, `#![deny(unsafe_code)]`, and `#![warn(unreachable_pub)]`.
 - **`Cargo.toml` Dependencies:** Strictly limited to [`dnam-kernels`](../kernels/CONTRIBUTING.md) and `zerocopy` (`proptest` in `[dev-dependencies]` only). Zero `serde`, JSON parsers, filesystem/network crates, `crypto`, `wgpu`, or `64-bit` trainer traits.
@@ -38,4 +38,4 @@ moon check tests
 - [ ] Every modified file passes `moon check vm` (`fmt`, `clippy -D warnings`, `check`, `build --release`, `test`) and bare `--no-default-features` checks.
 - [ ] `moon run vm:coverage` achieves `>= 95%` instrumented line coverage across `packages/vm/src/`.
 - [ ] `moon run vm:bench` (`cargo bench -p dnam-vm --bench realtime_wcet`) certifies `>= 14x / 8x / 4x / 2x` real-time margins across `Lite..Ultra` (`48 kHz`) and `< 50 ns` `DnamBinView::bind_prevalidated` median latency.
-- [ ] `moon check tests` passes all `AGENTS.md` budgets, `zerocopy`, `#![no_std]`, and clean-label guardrails.
+- [ ] `moon check tests` passes the root `AGENTS.md` budget, `zerocopy`, `#![no_std]`, and clean-label guardrails.

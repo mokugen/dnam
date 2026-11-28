@@ -8,7 +8,7 @@ All contributions must also comply with the root [`CONTRIBUTING.md`](../../CONTR
 
 ## 1. Unified Dual-Target Architecture & Zero-Duplication Rule
 
-Consult [`AGENTS.md`](AGENTS.md) for the module-to-spec discovery table:
+Consult the [root `AGENTS.md`](../../AGENTS.md) for the workspace discovery map:
 
 1. **Zero Duplicated Engine Logic (`ref[sdk.ts.runtime.dual-target-drivers]`):**
    - Never reimplement DSP, ZOH sample-rate rescaling, 3-Phase control clamping, Lobatto calibration inversion, `v3.0` `"sona"` `zerocopy` container validation (`ref[sdk.rust.zerocopy-wire-structs]`), JSON schema validation, RFC 8785 JCS canonicalization, or provenance signature/receipt construction in TypeScript or in `packages/js/rust/`.

@@ -8,7 +8,7 @@ All contributions must also comply with the root [`CONTRIBUTING.md`](../../CONTR
 
 ## 1. Crate Architecture & Directory Layout
 
-Consult [`AGENTS.md`](AGENTS.md), [`src/AGENTS.md`](src/AGENTS.md), [`src/align/AGENTS.md`](src/align/AGENTS.md), [`src/audit/AGENTS.md`](src/audit/AGENTS.md), [`src/stimulus/AGENTS.md`](src/stimulus/AGENTS.md), [`src/proj/AGENTS.md`](src/proj/AGENTS.md), [`src/metrics/AGENTS.md`](src/metrics/AGENTS.md), [`src/whitebox/AGENTS.md`](src/whitebox/AGENTS.md), [`src/solver/AGENTS.md`](src/solver/AGENTS.md), and [`tests/AGENTS.md`](tests/AGENTS.md):
+Consult the [root `AGENTS.md`](../../AGENTS.md) for the workspace discovery map and the module layout below:
 
 - **`src/lib.rs`:** Crate root (`#![forbid(unsafe_code)]`, pure IO buffers, zero CLI/OS audio), `DNAM-GRAM-INPUT-V3` SHA-256 fingerprint (`compute_gram_input_fingerprint`), and IEEE-754 RNE `fp16` coreset quantization (`f32_to_fp16_bits`, `fp16_bits_to_f32`).
 - **`src/align.rs`, `src/align/{wav_wire,regimes,calibration}.rs`, `src/targets.rs`, `src/resampler.rs` & `src/audit{,.rs,/manifest.rs}`:** 5-bit-depth (`Int12`/`Int16`/`Int24`/`Int32`/`Float32`) `zerocopy` in-memory WAV PCM codec, `<f4` SHA-256 provenance digest, Phase-0 `CALB` loopback deconvolution, 4-regime Kaiser-sinc sub-sample alignment (`<= 0.02` samples), `< 0.05 dB` acoustic null homing, `<= 0.15 dB` thermal recovery gate, `400 ms` mic-pad probe ratio, `DistillationTarget`, zero-phase Kaiser-sinc `8..192 kHz <-> 48 kHz` resampling, and Non-Stop 3-Phase Control-Space Audit helpers.
@@ -17,7 +17,7 @@ Consult [`AGENTS.md`](AGENTS.md), [`src/AGENTS.md`](src/AGENTS.md), [`src/align/
 - **`src/metrics.rs` & `src/metrics/{bezout,companion,certification,repeatability}.rs`:** 4-metric psychoacoustic certification suite (`bESR`, 5-scale 32-probe `MR-IIR`, 33-band Welch `LTAS`, `SegESR`) and 4-tier non-regression verification (`§4` minimum floors to surpass).
 - **`src/whitebox.rs` & `src/whitebox/{wire,runners,faust,ipc,session}.rs`:** `64 B` `DnwbHeader64BWire` `zerocopy` & `postcard` pipe IPC framing, `FaustRunner`, `SpiceRunner` (`PCHIP` $4f_s$ + `309`-tap Kaiser-sinc $4\times \to 1\times$ decimation), and persistent `DnwbWorkerSession`.
 - **`src/solver.rs` & `src/solver/{progress,stage_a_probe,stage_b_backbone,stage_c_knobs,stage_d_audit,stages}.rs`:** Column-major `uplo='U'` Gram accumulation (`i32` Ozaki on WebGPU / `Wide192Accum` on CPU via `dnam-train`), regularized `f64` `MM-Cholesky` + `33`-band `LTAS` KKT solver, `CP1` / `"CEXT"` control projection, sum-denominator Noise-Subtracted `bESR`, continuous `Kautz`/`Op-T` polish (`BestUntilDiminishingReturns`), and Non-Stop 3-Phase Control-Space Audit bounds.
-- **`tests/*.rs`:** Integration, adversarial boundary, and `proptest!` verification suites (`verify[...]`, see [`tests/AGENTS.md`](tests/AGENTS.md)).
+- **`tests/*.rs`:** Integration, adversarial boundary, and `proptest!` verification suites (`verify[...]`).
 - **`benches/bench_capture.rs`:** Criterion throughput benchmarks for `uplo='U'` Cholesky solves, `compact_to_capsules`, and `export_runtime_dnam`.
 
 ---

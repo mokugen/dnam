@@ -6,7 +6,7 @@ This guide defines the safety, numerical, `#![no_std]` / `SPIR-V`, testing, and 
 
 ## 1. Crate Architecture & Module Routing
 
-Consult [`AGENTS.md`](AGENTS.md) for the file routing table:
+Consult the [root `AGENTS.md`](../../AGENTS.md) for the workspace discovery map and the module layout below:
 
 - **`src/lib.rs`:** Crate root enforcing `#![cfg_attr(not(test), no_std)]` and `#![forbid(unsafe_code)]`.
 - **`src/simd.rs` & `src/simd/{const_eval,fp16,gpu_vec4,stereo8}.rs`:** `KernelVec4`, `GpuVec4`, `StereoVec8`, `InterleavedStereo8<V>`, compile-time `const fn` seeds/poles, branchless `fp16` codecs, and subnormal/NaN bit flushing.
@@ -48,4 +48,4 @@ moon check tests
 
 - [ ] Every modified `.rs` module passes `moon check kernels` (`fmt`, `clippy -D warnings`, `check`, `build --release`, `test`) with zero `f64`/`i64`/`u64`/`FDIV`/`FSQRT`/`libm` in non-test code.
 - [ ] `moon run kernels:coverage` achieves `>= 95%` instrumented line coverage across `packages/kernels/src/`.
-- [ ] `moon check tests` passes all `AGENTS.md` byte budgets (`< 2,500 B`), `verify[...]` / `ref[...]` checks, and Markdown link integrity checks.
+- [ ] `moon check tests` passes the root `AGENTS.md` byte budget (`< 5,000 B`, zero nested `AGENTS.md` files), `verify[...]` / `ref[...]` checks, and Markdown link integrity checks.

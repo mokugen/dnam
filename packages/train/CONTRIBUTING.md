@@ -6,7 +6,7 @@ This guide defines the safety, crate-boundary, `wgpu`, testing, and coverage rul
 
 ## 1. Crate Architecture & Dependency Isolation
 
-Consult [`AGENTS.md`](AGENTS.md) for module routing:
+Consult the [root `AGENTS.md`](../../AGENTS.md) for the workspace discovery map:
 
 - **`src/lib.rs`:** Enforces `#![deny(unsafe_code)]`, `#![warn(missing_docs)]`, and `#![warn(unreachable_pub)]`.
 - **Approved `unsafe` Scope (`ref[sdk.rust.safe-rust-and-boundaries]`):** `#[allow(unsafe_code)]` is restricted exclusively to hardware SIMD intrinsics inside `src/math/{aarch64,x86}/**` (with module-level `#[allow(unsafe_code)]` in `src/math.rs`). All other modules (`linalg`, `losses`, `control`, `solver`, `wide_gram`, `planner`, `runner`, `cpu`, `gpu`, `error`, `math/trainer`, `math/wasm`, and `tests/`) enforce `#[forbid(unsafe_code)]`.
@@ -20,7 +20,7 @@ Consult [`AGENTS.md`](AGENTS.md) for module routing:
 1. **Zero-ULP IEEE-754 & `Wide192Accum` Determinism:** Hardware `TrainerMathBackend` tile contractions and Bézout lowpass cascades use strict non-FMA arithmetic for bit-exact parity against `ScalarBackend`. Canonical SHA-256 input-gram hashing (`DNAM-GRAM-INPUT-V3`), GPU ABI buffers, `"CP1\0"`/`"TSYN"` records, and `DNPR` seqlock snapshots use declarative `#[repr(C)]` `zerocopy 0.8` wire structs rather than manual `to_le_bytes`/`from_le_bytes` slicing.
 2. **Checked-In AOT `.wgsl` Consumption & Startup Probes (`ref[train.pipeline.webgpu-scans-and-ozaki]`):** Embed all twelve `.wgsl` artifacts and `manifest.json` from `../../tools/sona-shaders/wgsl/` via `include_str!`. Always verify SHA-256 digests, workgroup SRAM limits (`15,872 B`), and the sub-millisecond `ozaki_gram_rhs_i32` startup probe before dispatching GPU kernels, falling back transparently to `CpuRunner` if unavailable.
 3. **2-D VRAM Planning:** Keep every GPU storage buffer binding within `min(128 MiB, device_max_storage_binding_size)` (for non-streaming profiles), falling back automatically from `ResidentBatched` to checkpointed `Streamed` execution.
-4. **Modularity & Coverage (`ref[sdk.rust.modular-layout-and-proptest]`):** Zero `mod.rs` files, zero `coverage(off)`, zero `macro_rules!` in `src/math/**`, every `.rs` file below 900 lines (targeting 250–650), every scoped `AGENTS.md` below 2,500 B, and inline `#[cfg(test)] mod tests` with `proptest!` suites co-located at the bottom of source files.
+4. **Modularity & Coverage (`ref[sdk.rust.modular-layout-and-proptest]`):** Zero `mod.rs` files, zero `coverage(off)`, zero `macro_rules!` in `src/math/**`, every `.rs` file below 900 lines (targeting 250–650), zero nested `AGENTS.md` files, and inline `#[cfg(test)] mod tests` with `proptest!` suites co-located at the bottom of source files.
 
 ---
 

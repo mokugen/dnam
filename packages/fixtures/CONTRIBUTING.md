@@ -1,6 +1,6 @@
 # Contributing to `dnam-fixtures` (`packages/fixtures`)
 
-Before editing `packages/fixtures/`, review the root [`CONTRIBUTING.md`](../../CONTRIBUTING.md), [`packages/fixtures/AGENTS.md`](AGENTS.md), and [`ADR-0018`](../../docs/adr/0018-signal-chain-fixtures-crate-and-whitebox-distillation.md).
+Before editing `packages/fixtures/`, review the root [`CONTRIBUTING.md`](../../CONTRIBUTING.md), [root `AGENTS.md`](../../AGENTS.md), and [`ADR-0018`](../../docs/adr/0018-signal-chain-fixtures-crate-and-whitebox-distillation.md).
 
 ---
 

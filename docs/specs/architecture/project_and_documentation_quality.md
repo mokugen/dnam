@@ -60,7 +60,7 @@ Large functions, UI components, state hooks, wide parameter lists, and growing m
 
 Production source trees organize growing domains into nested child submodules (`module -> sub-aspect -> leaf`) using parent files as clean facades rather than flat sibling dumps. Internal modules import concrete leaf paths directly with zero internal barrel re-export files or wildcard re-exports; explicit named re-exports are restricted strictly to declared public package entrypoints.
 
-Contributors must never play code golf by collapsing multi-statement blocks onto single lines, inserting line-continuation escapes, nesting ternary chains, or stripping comments and docstrings to save lines. Growing directory maps must be delegated across scoped child `AGENTS.md` files rather than compressing routing prose.
+Contributors must never play code golf by collapsing multi-statement blocks onto single lines, inserting line-continuation escapes, nesting ternary chains, or stripping comments and docstrings to save lines. Detailed module invariants and local workflows must be offloaded to package contributing guides and canonical specifications rather than compressing root `AGENTS.md` routing prose.
 
 | Test Tier | Normative Placement & Scope | Prohibited Anti-Patterns |
 | :--- | :--- | :--- |
@@ -87,16 +87,17 @@ Model identification, seed initialization, and control-bus conditioning inside c
 
 ---
 
-## 2. Two-Tier `AGENTS.md` Progressive-Disclosure Hierarchy
+## 2. Single-Root `AGENTS.md` & Package Discovery Hierarchy
 
 `r[repo.docs.agents-md-budgets]`
 
-`AGENTS.md` files serve strictly as concise navigation maps pointing to canonical specifications and contributing guides, never duplicating mathematical derivations or schemas. Full normative rules belong in specifications written in calm, structured technical-manual prose (up to 650 characters per paragraph, crisp tables, and strict inline code pill discipline as enforced in §4).
+The repository maintains exactly one root `AGENTS.md` file as a concise top-level navigation map pointing to package contributing guides and canonical specifications, never duplicating mathematical derivations or schemas. Full normative rules belong in specifications written in calm, structured technical-manual prose (up to 650 characters per paragraph, crisp tables, and strict inline code pill discipline as enforced in §4).
 
-| `AGENTS.md` Tier | Target Files | Strict Byte Ceiling | Required Content |
+| Discovery File | Scope & Location | Structural & Byte Constraint | Required Content |
 | :--- | :--- | :---: | :--- |
-| **Tier 1 (Monorepo Root)** | [root agent router](../../../AGENTS.md) | < 5,000 B | Global orchestration commands, core cross-cutting invariants, and the top-level package discovery table. |
-| **Tier 2 (Scoped Module / Suite)** | Package, module, and test-suite `AGENTS.md` files | < 2,500 B | Module-to-file routing table, local task commands, and links to canonical specification files. |
+| **Root Agent Router** | [root agent router](../../../AGENTS.md) | Exactly 1 file, < 5,000 B | Global orchestration commands, core cross-cutting invariants, and the top-level package discovery table. |
+| **Nested `AGENTS.md` Files** | Any subdirectory across packages, tools, or tests | 0 files (prohibited) | Offload module invariants, build/test commands, and checklists to package contributing guides and canonical specifications. |
+| **Package Contributing Guides** | Each package `CONTRIBUTING.md` guide | 1 required per package | Package dependency boundaries, safety and numerical invariants, local verification commands, and pre-commit checklists. |
 
 ---
 

@@ -48,7 +48,7 @@ These cognitive and process standards are mandatory for every research, design, 
 
 7. **Spec-First ADRs & Canonical Documentation Hygiene (`docs/CONTRIBUTING.md`):**
    - Update `docs/adr/` (`docs/templates/adr_template.md`, sequential `ADR-NNNN`, descriptive candidate names, `git mv NNNN-superseded-*.md` or terse `## Amendment Appendix`) and SSOT `docs/specs/` **before** changing contracts.
-   - Run `moon check tests` after every doc or `AGENTS.md` edit (clean-room separation in the 16 domain specs, zero raw `$` in Markdown tables, GitHub MathJax escapes, strict inline code pill ban in `docs/specs/`, prose `<= 650` chars / list `<= 240` chars, standalone `r[...]` / `verify[...]` rules, and `AGENTS.md` byte limits).
+   - Run `moon check tests` after every doc or `AGENTS.md` edit (clean-room separation in the 16 domain specs, zero raw `$` in Markdown tables, GitHub MathJax escapes, strict inline code pill ban in `docs/specs/`, prose `<= 650` chars / list `<= 240` chars, standalone `r[...]` / `verify[...]` rules, single root `AGENTS.md` `< 5,000 B` budget with zero nested `AGENTS.md` files, and required `<pkg>/CONTRIBUTING.md` guides).
 
 8. **Small Atomic Commits & Persistent Task Ledger:**
    - Keep each commit to **1 cohesive concern/layer** (`~150–450` net prod LOC, `<= 600` max excluding generated `.wgsl`; every file `< 900` LOC per `modular-decomposition.md`).

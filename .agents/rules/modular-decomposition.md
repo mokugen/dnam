@@ -2,7 +2,7 @@
 trigger: always_on
 ---
 
-# Modular Decomposition, `AGENTS.md` Delegation & Co-Located Unit Tests
+# Modular Decomposition, Root `AGENTS.md` Offloading & Co-Located Unit Tests
 
 These architectural rules are mandatory for every code and documentation edit in DNAM:
 
@@ -28,5 +28,5 @@ These architectural rules are mandatory for every code and documentation edit in
      - **Rust:** **Never** create isolated unit-test `.rs` files inside `src/` or `rust/` (`tests.rs`, `*_tests.rs`, `test_*.rs`) or external `mod tests;` / `mod *_tests;` file declarations. Isolated test-only `.rs` modules are allowed **strictly for shared test helpers and builders** (`test_support.rs`, `test_utils.rs`, `testing.rs`, or helper submodules under `tests/<suite>/*.rs`).
      - **TypeScript / React / JS:** **Never** create `src/**/__tests__/` subdirectories, generic unpaired `src/**/test.ts(x)` / `src/**/tests.ts(x)` files, or `src/**/*.spec.ts(x)` files (reserve `*.spec.ts` for `tests/e2e/`). Shared TS test helpers belong in `test-support.ts`, `test-utils.ts`, `testing.ts`, or `packages/<pkg>/tests/setup.ts`.
 
-3. **Never Wordsmith `AGENTS.md` to Fit Byte Budgets (`CONTRIBUTING.md` §5.1.3):**
-   - When an `AGENTS.md` approaches `2,500 B`, create a scoped subdirectory `AGENTS.md` (`< 2,500 B`) and link it from the parent `AGENTS.md`, or offload non-routing prose to `packages/<pkg>/CONTRIBUTING.md` / `docs/specs/`. Never compress wording in `AGENTS.md` to squeeze rows.
+3. **Never Wordsmith Root `AGENTS.md` to Fit Byte Budgets (`CONTRIBUTING.md` §5.1.3):**
+   - Maintain a single root `AGENTS.md` (`< 5,000 B`) with zero nested `AGENTS.md` files across `packages/`, `tools/`, or `tests/`. When root `AGENTS.md` approaches `5,000 B`, offload module details to `packages/<pkg>/CONTRIBUTING.md` or `docs/specs/` rather than compressing wording or creating nested `AGENTS.md` files.
