@@ -10,7 +10,7 @@ pub enum VmError {
     TruncatedPrefix,
     /// `"DNBN"` or `"DBRM"` magic tag does not match.
     InvalidMagic,
-    /// Unsupported binary container version (expected `v3.0`).
+    /// Unsupported binary container version (expected `v4.0`).
     UnsupportedVersion,
     /// Reserved byte, flag bit (including evicted freeze bits `5..=6`), or metadata size is non-zero / invalid.
     InvalidHeaderFlagsOrReserved,
@@ -47,7 +47,7 @@ impl fmt::Display for VmError {
         let msg = match self {
             Self::TruncatedPrefix => "truncated .dnam-bin prefix (< 128 B)",
             Self::InvalidMagic => "invalid .dnam-bin or DBRM magic bytes",
-            Self::UnsupportedVersion => "unsupported .dnam-bin container version (expected v3.0)",
+            Self::UnsupportedVersion => "unsupported .dnam-bin container version (expected v4.0)",
             Self::InvalidHeaderFlagsOrReserved => {
                 "invalid .dnam-bin header flags or non-zero reserved field"
             }

@@ -232,7 +232,7 @@ pub fn decode_cp1_contributors(
             return Err(VmError::InvalidCp1Stream);
         }
         let base_bytes = 4 * (9 * usize::from(lanes) + 4);
-        if base_cursor + base_bytes > arena0_cb.cp1_base.len() {
+        if base_cursor + base_bytes > arena0_cb.gra_lite.len() {
             return Err(VmError::InvalidCp1Stream);
         }
         let mut slot = Cp1ContributorSlot::zero();
@@ -242,18 +242,18 @@ pub fn decode_cp1_contributors(
         slot.aux = aux;
         read_base_slice(
             &mut slot,
-            &arena0_cb.cp1_base[base_cursor..base_cursor + base_bytes],
+            &arena0_cb.gra_lite[base_cursor..base_cursor + base_bytes],
         )?;
         base_cursor += base_bytes;
 
         if let Some(a3) = arena3_cb {
             let ultra_bytes = 4 * (8 * usize::from(lanes) + 4);
-            if ultra_cursor + ultra_bytes > a3.cp1_ultra.len() {
+            if ultra_cursor + ultra_bytes > a3.gra_ultra_delta.len() {
                 return Err(VmError::InvalidCp1Stream);
             }
             read_ultra_slice(
                 &mut slot,
-                &a3.cp1_ultra[ultra_cursor..ultra_cursor + ultra_bytes],
+                &a3.gra_ultra_delta[ultra_cursor..ultra_cursor + ultra_bytes],
             )?;
             ultra_cursor += ultra_bytes;
         }
@@ -334,8 +334,8 @@ mod tests {
         slice0[0] = F32::new(0.5);
         slice0[8] = F32::new(1.0);
         slice0[9] = F32::new(0.25);
-        a0_cb.cp1_base[..52].copy_from_slice(slice0.as_bytes());
-        a0_cb.cp1_base[52..104].copy_from_slice(slice0.as_bytes());
+        a0_cb.gra_lite[..52].copy_from_slice(slice0.as_bytes());
+        a0_cb.gra_lite[52..104].copy_from_slice(slice0.as_bytes());
 
         let mut out = [Cp1ContributorSlot::zero(); 4];
         let n = decode_cp1_contributors(&a0_cb, None, &[], 2, &mut out).unwrap();

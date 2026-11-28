@@ -7,6 +7,11 @@ use core::mem::{align_of, offset_of, size_of};
 use zerocopy::byteorder::little_endian::{F32, U16, U32};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 
+use super::arena_wire::{
+    ARENA0_LITE_BYTES, ARENA1_FULL_CUMULATIVE_BYTES, ARENA2_PRO_CUMULATIVE_BYTES,
+    ARENA3_ULTRA_CUMULATIVE_BYTES,
+};
+
 /// `.dnam-bin` File Header magic (`"DNBN"`).
 pub const DNBN_MAGIC: [u8; 4] = *b"DNBN";
 /// `.dnam-bin` Runtime Metadata Record magic (`"DBRM"`).
@@ -16,13 +21,18 @@ pub const CP1_STREAM_MAGIC: [u8; 4] = *b"CP1\0";
 /// Embedded SONA Cell Descriptor magic (`"SONA"`).
 pub const SONA_CELL_MAGIC: [u8; 4] = *b"SONA";
 
-/// Supported container major version (`3`).
-pub const DNBN_VERSION_MAJOR: u16 = 3;
+/// Supported container major version (`4`).
+pub const DNBN_VERSION_MAJOR: u16 = 4;
 /// Supported container minor version (`0`).
 pub const DNBN_VERSION_MINOR: u16 = 0;
 
 /// Fixed cumulative byte footprints (`[Lite, Full, Pro, Ultra]`) per `ref[container.dnam.tier-prefix]`.
-pub const ARENA_TIER_BYTES: [usize; 4] = [4_608, 7_936, 15_872, 30_720];
+pub const ARENA_TIER_BYTES: [usize; 4] = [
+    ARENA0_LITE_BYTES,
+    ARENA1_FULL_CUMULATIVE_BYTES,
+    ARENA2_PRO_CUMULATIVE_BYTES,
+    ARENA3_ULTRA_CUMULATIVE_BYTES,
+];
 /// Byte size of the optional unwatermarked `"CEXT"` dispatch extension (`1,280 B`).
 pub const CEXT_DISPATCH_BYTES: usize = 1_280;
 /// Byte size of one `"TSYN"` physical tempo-sync entry (`40 B`).
@@ -63,7 +73,7 @@ pub const fn align64(len: usize) -> usize {
 pub struct DnamBinHeaderWire {
     /// Magic tag: `"DNBN"`.
     pub magic: [u8; 4],
-    /// Major format version (`3`).
+    /// Major format version (`4`).
     pub version_major: U16,
     /// Minor format version (`0`).
     pub version_minor: U16,
@@ -328,7 +338,7 @@ mod tests {
         hdr.version_major = U16::new(DNBN_VERSION_MAJOR);
         let parsed = DnamBinHeaderWire::ref_from_bytes(hdr.as_bytes()).unwrap();
         assert_eq!(parsed.magic, DNBN_MAGIC);
-        assert_eq!(parsed.version_major.get(), 3);
+        assert_eq!(parsed.version_major.get(), 4);
 
         let meta = DnamBinRuntimeMetaWire::new_zeroed();
         assert_eq!(meta.as_bytes().len(), 64);

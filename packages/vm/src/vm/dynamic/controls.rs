@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 use crate::bin::DnamBinView;
+use crate::graph::oversample::RenderMode;
 use crate::types::{Tier, VmError};
 
 use super::super::SonaTelemetrySnapshot;
@@ -214,7 +215,7 @@ impl DynamicSonaVm {
         }
     }
 
-    /// Toggles `4x` offline bounce oversampling.
+    /// Selects [`RenderMode::Live`] (`false`) or [`RenderMode::Master`] (`true`).
     #[inline(never)]
     pub fn set_offline_bounce(&mut self, offline: bool) -> Result<(), VmError> {
         match self {
@@ -233,6 +234,28 @@ impl DynamicSonaVm {
             Self::X86Avx2Fma(vm) => vm.set_offline_bounce(offline),
             #[cfg(target_arch = "wasm32")]
             Self::WasmSimd128(vm) => vm.set_offline_bounce(offline),
+        }
+    }
+
+    /// Explicitly switches between [`RenderMode::Live`] and [`RenderMode::Master`].
+    #[inline(never)]
+    pub fn set_render_mode(&mut self, mode: RenderMode) -> Result<(), VmError> {
+        match self {
+            Self::Scalar(vm) => vm.set_render_mode(mode),
+            #[cfg(target_arch = "aarch64")]
+            Self::ArmNeon(vm) => vm.set_render_mode(mode),
+            #[cfg(target_arch = "aarch64")]
+            Self::ArmSve2(vm) => vm.set_render_mode(mode),
+            #[cfg(target_arch = "aarch64")]
+            Self::ArmSme(vm) => vm.set_render_mode(mode),
+            #[cfg(target_arch = "x86_64")]
+            Self::X86Sse2(vm) => vm.set_render_mode(mode),
+            #[cfg(target_arch = "x86_64")]
+            Self::X86Sse42(vm) => vm.set_render_mode(mode),
+            #[cfg(target_arch = "x86_64")]
+            Self::X86Avx2Fma(vm) => vm.set_render_mode(mode),
+            #[cfg(target_arch = "wasm32")]
+            Self::WasmSimd128(vm) => vm.set_render_mode(mode),
         }
     }
 

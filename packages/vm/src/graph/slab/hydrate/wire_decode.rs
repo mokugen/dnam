@@ -7,7 +7,6 @@ use core::mem::{align_of, size_of};
 
 use dnam_kernels::{
     MAX_PARALRU_DUHEM_GAMMA_F32, MAX_PARALRU_R_F32, MAX_SVF_K_NL, algebraic_unit_rotor_f32,
-    unpack_wf_mix_and_rect_sign_fp16,
 };
 use zerocopy::byteorder::little_endian::{F32, U16};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
@@ -15,8 +14,7 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout, Unaligned};
 use crate::bin::{
     CONVOLVER_KAUTZ_BLOCKS_PER_TIER, CoreQuadWire, DnamBinView, LinearReadoutFullWire,
     LinearReadoutLiteWire, LinearReadoutProWire, LinearReadoutUltraWire,
-    SONA_META_CONVOLVER_PREFIX_OVERRIDES, SONA_META_OS2X, SONA_META_TIER_OS_EXPLICIT,
-    SonaCrossbarBlockWire, SonaInterBlockTilePairWire,
+    SONA_META_CONVOLVER_PREFIX_OVERRIDES, SonaCrossbarBlockWire, SonaInterBlockTilePairWire,
 };
 use crate::graph::GraphBackend;
 use crate::math::{
@@ -142,29 +140,15 @@ pub(super) fn fp16_sanitized(bits: u16) -> u16 {
     ))
 }
 
-pub(super) fn compute_tier_os2x_flags(meta_flags: u32, oversample_factor: u16) -> [bool; 4] {
-    if (meta_flags & SONA_META_TIER_OS_EXPLICIT) != 0 {
-        [
-            false,
-            (meta_flags & (1 << 1)) != 0,
-            (meta_flags & (1 << 2)) != 0,
-            (meta_flags & (1 << 3)) != 0,
-        ]
-    } else {
-        let on = (meta_flags & SONA_META_OS2X) != 0 || oversample_factor >= 2;
-        [false, on, on, on]
-    }
-}
-
-/// Decodes one `192 B` [`CoreQuadWire`] into (`144 B` [`CoreQuadHot`], `48 B` [`CoreQuadExtCold`],
-/// `4`-bit rectifier sign mask).
+/// Decodes one `240 B` [`CoreQuadWire`] into (`144 B` [`CoreQuadHot`], `48 B` [`CoreQuadExtCold`],
+/// `4`-bit rectifier sign mask from explicit `rect_sign_mask`).
 pub(super) fn decode_core_quad_wire(
     wire: &CoreQuadWire,
     is_block0: bool,
 ) -> (CoreQuadHot, CoreQuadExtCold, u8) {
     let mut quad = CoreQuadHot::default();
     let mut ext = CoreQuadExtCold::default();
-    let mut rect_bits = 0_u8;
+    let rect_bits = (wire.rect_sign_mask.get() & 0x000F) as u8;
     for l in 0..4 {
         quad.svf_g[l] = clamp_finite_f32(wire.svf_g[l].get(), 1.0e-5, 64.0, 0.25);
         quad.lru_alpha_rel[l] =
@@ -183,18 +167,19 @@ pub(super) fn decode_core_quad_wire(
             clamp_finite_fp16(wire.lru_bias_drive_fp16[l].get(), -16.0, 16.0, 0.0);
         quad.in_mid_weight_fp16[l] =
             clamp_finite_fp16(wire.in_mid_weight_fp16[l].get(), -16.0, 16.0, 0.0);
-        quad.tone_lp_fp16[l] = clamp_finite_fp16(wire.tone_lp_fp16[l].get(), -16.0, 16.0, 0.0);
-        quad.tone_bp_fp16[l] = clamp_finite_fp16(wire.tone_bp_fp16[l].get(), -16.0, 16.0, 0.0);
-        quad.tone_hp_fp16[l] = clamp_finite_fp16(wire.tone_hp_fp16[l].get(), -16.0, 16.0, 0.0);
-        quad.tone_ap_fp16[l] = clamp_finite_fp16(wire.tone_ap_fp16[l].get(), -16.0, 16.0, 0.0);
-        quad.tone_dir_fp16[l] = clamp_finite_fp16(wire.tone_dir_fp16[l].get(), -16.0, 16.0, 0.0);
-        quad.sag_depth_fp16[l] = clamp_finite_fp16(wire.sag_depth_fp16[l].get(), -8.0, 8.0, 0.0);
-        let (wf_mix, rect_sign) =
-            unpack_wf_mix_and_rect_sign_fp16(wire.wavefolder_mix_fp16[l].get());
-        if rect_sign < 0.0 {
-            rect_bits |= 1 << l;
-        }
-        quad.wavefolder_mix_fp16[l] = f32_to_fp16(wf_mix);
+        quad.tone_lp_fp16[l] = clamp_finite_fp16(wire.c_lp_fp16[l].get(), -16.0, 16.0, 0.0);
+        quad.tone_bp_fp16[l] = clamp_finite_fp16(wire.c_bp_fp16[l].get(), -16.0, 16.0, 0.0);
+        quad.tone_hp_fp16[l] = if is_block0 {
+            clamp_finite_fp16(wire.c_kbp_fp16[l].get(), -16.0, 16.0, 0.0)
+        } else {
+            0
+        };
+        quad.tone_ap_fp16[l] = 0;
+        quad.tone_dir_fp16[l] = clamp_finite_fp16(wire.c_u_fp16[l].get(), -16.0, 16.0, 0.0);
+        quad.sag_depth_fp16[l] =
+            clamp_finite_fp16(wire.se_d_bus_fp16[l].get(), 0.0, FP16_ABS_MAX, 0.0);
+        quad.wavefolder_mix_fp16[l] =
+            clamp_finite_fp16(wire.wavefolder_mix_fp16[l].get(), 0.0, 1.0, 0.0);
         ext.svf_k_nl_fp16[l] = if is_block0 {
             clamp_finite_fp16(wire.svf_k_nl_fp16[l].get(), 0.0, MAX_SVF_K_NL, 0.0)
         } else {
@@ -214,6 +199,7 @@ pub(super) fn decode_core_quad_wire(
         ext.lru_signed_mix_fp16[l] =
             clamp_finite_fp16(wire.lru_signed_mix_fp16[l].get(), 0.0, 1.0, 0.0);
         ext.glu_mix_fp16[l] = clamp_finite_fp16(wire.glu_mix_fp16[l].get(), -4.0, 4.0, 0.0);
+        ext.lin_mix_fp16[l] = clamp_finite_fp16(wire.lin_mix_fp16[l].get(), 0.0, 1.0, 0.0);
     }
     (quad, ext, rect_bits)
 }
@@ -553,19 +539,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_compute_tier_os2x_flags_explicit_vs_global() {
-        assert_eq!(
-            compute_tier_os2x_flags(SONA_META_TIER_OS_EXPLICIT | 0b1010, 1),
-            [false, true, false, true]
-        );
-        assert_eq!(
-            compute_tier_os2x_flags(SONA_META_OS2X, 1),
-            [false, true, true, true]
-        );
-        assert_eq!(compute_tier_os2x_flags(0, 1), [false, false, false, false]);
-    }
-
-    #[test]
     fn test_wire_decode_clamps_and_interleaved_override_residues() {
         use crate::math::ScalarBackend;
         use zerocopy::FromZeros;
@@ -575,19 +548,21 @@ mod tests {
         cw.lru_kappa_fp16[0] = U16::new(f32_to_fp16(12.0));
         cw.adaa_drive_fp16[0] = U16::new(f32_to_fp16(-12.5));
         cw.lru_bias_drive_fp16[0] = U16::new(f32_to_fp16(-25.0));
-        cw.sag_depth_fp16[0] = U16::new(f32_to_fp16(-6.0));
+        cw.se_d_bus_fp16[0] = U16::new(f32_to_fp16(6.0));
         cw.in_mid_weight_fp16[0] = U16::new(f32_to_fp16(20.0));
         cw.in_side_weight_fp16[0] = U16::new(f32_to_fp16(-20.0));
         cw.lru_stereo_link_fp16[0] = U16::new(f32_to_fp16(2.5));
         cw.lru_duhem_gamma_fp16[0] = U16::new(f32_to_fp16(100.0));
         cw.lru_signed_mix_fp16[0] = U16::new(f32_to_fp16(0.5));
         cw.glu_mix_fp16[0] = U16::new(f32_to_fp16(-6.0));
+        cw.rect_sign_mask = U16::new(0b1110);
         cw.wavefolder_mix_fp16[1] = U16::new(0x8000);
-        cw.wavefolder_mix_fp16[2] = U16::new(f32_to_fp16(-0.25));
+        cw.wavefolder_mix_fp16[2] = U16::new(f32_to_fp16(0.25));
         cw.wavefolder_mix_fp16[3] = U16::new(0xFC00);
         cw.svf_k_nl_fp16[0] = U16::new(f32_to_fp16(24.0));
         cw.svf_k_nl_fp16[1] = U16::new(f32_to_fp16(-2.0));
         cw.svf_k_nl_fp16[2] = U16::new(f32_to_fp16(f32::NAN));
+        cw.c_kbp_fp16[0] = U16::new(f32_to_fp16(1.5));
         let (hq, h_ext, rect_bits) = decode_core_quad_wire(&cw, true);
         assert_eq!(rect_bits, 0b1110);
         assert_eq!(fp16_to_f32(hq.wavefolder_mix_fp16[1]), 0.0);
@@ -596,13 +571,15 @@ mod tests {
         assert_eq!(fp16_to_f32(h_ext.svf_k_nl_fp16[0]), 16.0);
         assert_eq!(h_ext.svf_k_nl_fp16[1], 0);
         assert_eq!(h_ext.svf_k_nl_fp16[2], 0);
-        let (_, lin_ext, _) = decode_core_quad_wire(&cw, false);
+        assert_eq!(fp16_to_f32(hq.tone_hp_fp16[0]), 1.5);
+        let (lin_hq, lin_ext, _) = decode_core_quad_wire(&cw, false);
         assert_eq!(lin_ext.svf_k_nl_fp16, [0; 4]);
+        assert_eq!(lin_hq.tone_hp_fp16[0], 0);
         assert_eq!(hq.svf_g[0], 0.25);
         assert_eq!(fp16_to_f32(hq.lru_kappa_fp16[0]), 1.0);
         assert_eq!(fp16_to_f32(hq.adaa_drive_fp16[0]), -12.5);
         assert_eq!(fp16_to_f32(hq.lru_bias_drive_fp16[0]), -16.0);
-        assert_eq!(fp16_to_f32(hq.sag_depth_fp16[0]), -6.0);
+        assert_eq!(fp16_to_f32(hq.sag_depth_fp16[0]), 6.0);
         assert_eq!(fp16_to_f32(hq.in_mid_weight_fp16[0]), 16.0);
         assert_eq!(fp16_to_f32(h_ext.in_side_weight_fp16[0]), -16.0);
         assert_eq!(fp16_to_f32(h_ext.lru_stereo_link_fp16[0]), 1.0);

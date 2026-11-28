@@ -25,8 +25,7 @@ use telemetry::{BlockTelemetry, finalize_frame_output_with_telem};
 pub use core_step::evaluate_matryoshka_core_quads;
 #[cfg(target_arch = "x86_64")]
 pub(crate) use inline_hot::{
-    process_block_sona_inline, process_tick16_const_inline, step_frame_4x_sona_inline,
-    step_frame_sona_inline,
+    process_block_sona_inline, process_tick16_const_inline, step_frame_sona_inline,
 };
 
 #[inline(always)]
@@ -197,20 +196,41 @@ fn step_post_sensory_with_reads<B: GraphBackend>(
         .step_stereo(s0_l, s0_r, d_scale, delta_step);
     tel.last_in = [ux_l, ux_r];
 
-    let os2x = slab.os2x();
-    let [pre_l, pre_r, dir_l, dir_r] = if os2x {
-        let os_params = slab.os2x_hot.os_params;
-        let (u0, u1) = slab
-            .os2x_hot
-            .os_stereo
-            .upsample_stereo::<B>(ux_l, ux_r, &os_params);
-        let s0 = step_core_subsample(slab, &op_p_1x, true, 0, (u0[0], u0[1]));
-        let s1 = step_core_subsample(slab, &op_p_1x, true, 1, (u1[0], u1[1]));
-        slab.os2x_hot
-            .os_stereo
-            .downsample_4ch::<B>(s0, s1, &os_params)
-    } else {
-        step_core_subsample(slab, &op_p_1x, false, 0, (ux_l, ux_r))
+    let (m_core, is_master) = {
+        let cold = slab.cold();
+        (
+            cold.zoh.m_core,
+            matches!(
+                cold.render_mode,
+                crate::graph::oversample::RenderMode::Master
+            ),
+        )
+    };
+    if is_master && m_core == 4 && (slab.lite.sample_tick & 3) == 0 {
+        core_step::advance_master_ctrl_delay_if_chunk_start(slab);
+    }
+    let [pre_l, pre_r, dir_l, dir_r] = match (is_master, m_core) {
+        (false, 2) => {
+            let up = slab.lite.live_os.upsample_stereo(ux_l, ux_r);
+            let s0 = step_core_subsample(slab, &op_p_1x, 2, 0, (up[0][0], up[0][1]));
+            let s1 = step_core_subsample(slab, &op_p_1x, 2, 1, (up[1][0], up[1][1]));
+            slab.lite.live_os.downsample_4ch::<B>(s0, s1)
+        }
+        (true, 4) => {
+            let up = slab.cold_mut().master_os.upsample_1x_to_4x(ux_l, ux_r);
+            let mut sub = [[0.0_f32; 4]; 4];
+            for s in 0..4 {
+                sub[s] = step_core_subsample(slab, &op_p_1x, 4, s, (up[s][0], up[s][1]));
+            }
+            slab.cold_mut().master_os.downsample_4x_to_1x::<B>(sub)
+        }
+        (true, 2) => {
+            let up = slab.cold_mut().master_os.upsample_1x_to_2x(ux_l, ux_r);
+            let s0 = step_core_subsample(slab, &op_p_1x, 2, 0, (up[0][0], up[0][1]));
+            let s1 = step_core_subsample(slab, &op_p_1x, 2, 1, (up[1][0], up[1][1]));
+            slab.cold_mut().master_os.downsample_2x_to_1x::<B>([s0, s1])
+        }
+        _ => step_core_subsample(slab, &op_p_1x, 1, 0, (ux_l, ux_r)),
     };
     tel.last_s2_dir = [pre_l, pre_r, dir_l, dir_r];
 
@@ -248,16 +268,6 @@ pub fn step_frame_sona<B: GraphBackend>(
     in_r: f32,
 ) -> Result<(f32, f32), VmError> {
     inline_hot::step_frame_sona_inner::<B, false>(slab, in_l, in_r)
-}
-
-/// Executes one host sample under deterministic `4x` offline bounce oversampling (`Bounce4xOversampler`).
-#[inline(never)]
-pub fn step_frame_4x_sona<B: GraphBackend>(
-    slab: &mut SonaHotSlab<'_, B>,
-    in_l: f32,
-    in_r: f32,
-) -> Result<(f32, f32), VmError> {
-    inline_hot::step_frame_4x_sona_inner::<B, false>(slab, in_l, in_r)
 }
 
 #[inline]

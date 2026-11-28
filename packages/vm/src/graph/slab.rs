@@ -1,4 +1,4 @@
-//! Prefix-nested L1D hot execution slab (`4,544..14,592 B`), `!alloc` hydration, `3 kHz` control
+//! Prefix-nested L1D hot execution slab (`4,544..14,336 B`), `!alloc` hydration, `3 kHz` control
 //! latching, and `0-ULP` chunk-split invariant micro-chunking (`#![no_std]`, `#![forbid(unsafe_code)]`).
 
 #![forbid(unsafe_code)]
@@ -18,27 +18,25 @@ pub use hydrate::{SonaSlabOwnedBacking, hydrate_slab_owned, hydrate_slab_owned_w
 pub use hydrate::{
     VmReloadHeadroom, check_reload_slab_capacity, hydrate_slab_from_dnam_bin,
     reload_slab_from_dnam_bin_in_place, reset_to_dc_equilibrium, retime_sample_rate,
-    set_offline_bounce, set_op_t_write_enable, set_quad_write_enable, switch_tier,
+    set_offline_bounce, set_op_t_write_enable, set_quad_write_enable, set_render_mode, switch_tier,
 };
 pub use layout::{
     CoreQuadExtCold, CoreQuadHot, CoreQuadModulation, CoreQuadReadoutHot, CoreQuadReadoutRegs,
     CrossbarFrame, FLAG_COLD_FIR_EXT, FLAG_CROSSBAR_ACTIVE, FLAG_MONO_OUT, FLAG_OS2X,
     FLAG_SINGLE_INPUT, FLAG_WET_POLARITY_INV, FLAG_XFADE_ACTIVE, MAX_CORE_QUADS, MAX_SONA_TILES,
     MAX_TOTAL_SONA_LANES, NUM_SONA_BLOCKS, SONA_BLOCK_QUAD_SLOTS, SONA_CORE_QUAD_BLOCK_AND_LOCAL,
-    SONA_FULL_HOT_DELTA_BYTES, SONA_INTERBLOCK_TILES, SONA_LITE_HOT_BYTES, SONA_OS2X_HOT_BYTES,
+    SONA_FULL_HOT_DELTA_BYTES, SONA_INTERBLOCK_TILES, SONA_LITE_HOT_BYTES,
     SONA_PRO_HOT_DELTA_BYTES, SONA_ULTRA_HOT_DELTA_BYTES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER,
     SonaColdTail, SonaFullHotDelta, SonaHotSlab, SonaInterBlockTileHot, SonaLiteHotPrefix,
     SonaProHotDelta, SonaSlabBacking, SonaUltraHotDelta, TIER_SWITCH_XFADE_SAMPLES,
     TierCrossbarSnapshot,
 };
 pub use microchunk::{
-    evaluate_matryoshka_core_quads, process_block_sona, process_tick16_const, step_frame_4x_sona,
-    step_frame_sona,
+    evaluate_matryoshka_core_quads, process_block_sona, process_tick16_const, step_frame_sona,
 };
 #[cfg(target_arch = "x86_64")]
 pub(crate) use microchunk::{
-    process_block_sona_inline, process_tick16_const_inline, step_frame_4x_sona_inline,
-    step_frame_sona_inline,
+    process_block_sona_inline, process_tick16_const_inline, step_frame_sona_inline,
 };
 
 use crate::graph::GraphBackend;
@@ -86,7 +84,7 @@ mod tests {
     use zerocopy::FromZeros;
     use zerocopy::byteorder::little_endian::{F32, U16};
 
-    fn make_lite_bin_bytes() -> ([u8; 128 + 4_608], usize) {
+    fn make_lite_bin_bytes() -> ([u8; 128 + crate::bin::ARENA0_LITE_BYTES + 256], usize) {
         let mut a0 = DnamBinBuildInput::default_arena0_lite();
         a0.transport_lite.delay_samples = [12.0, 17.0, 23.0, 31.0].map(F32::new);
         a0.transport_lite.g_loop = F32::new(0.4);
@@ -99,7 +97,7 @@ mod tests {
             [0.5, 0.25, 0.0, 0.0].map(|v| U16::new(f32_to_fp16(v)));
         a0.core_quads[0].svf_g = [0.2; 4].map(F32::new);
         a0.core_quads[0].svf_k_fp16 = [U16::new(f32_to_fp16(0.7)); 4];
-        a0.core_quads[0].tone_dir_fp16 = [U16::new(f32_to_fp16(1.0)); 4];
+        a0.core_quads[0].c_u_fp16 = [U16::new(f32_to_fp16(1.0)); 4];
         a0.linear_readout_lite.w_ro_fp16[6] = U16::new(f32_to_fp16(0.5));
         a0.linear_readout_lite.w_ro_fp16[7] = U16::new(f32_to_fp16(0.5));
         let input = DnamBinBuildInput {
@@ -123,7 +121,7 @@ mod tests {
             arena2: None,
             arena3: None,
         };
-        let mut buf = [0_u8; 128 + 4_608];
+        let mut buf = [0_u8; 128 + crate::bin::ARENA0_LITE_BYTES + 256];
         let n = encode_dnam_bin_into(&input, &mut buf).unwrap();
         (buf, n)
     }
@@ -191,7 +189,7 @@ mod tests {
                 SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Pro, true),
                 SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Ultra, true),
             ],
-            [4_544, 4_800, 7_552, 11_136, 14_592]
+            [4_544, 4_544, 7_040, 10_752, 14_336]
         );
         let (buf, n) = make_lite_bin_bytes();
         let bytes = &buf[..n];

@@ -305,12 +305,12 @@ mod tests {
     /// verify[dsp.op-t.ring.capacity]
     #[test]
     fn test_lite_inline_with_empty_ext_and_fail_closed_when_missing() {
-        let w0 = make_quad_wire([53.0, 67.0, 79.0, 89.0], 0.0, 0);
+        let w0 = make_quad_wire([23.0, 31.0, 41.0, 47.0], 0.0, 0);
         let cfg0 = QuadHydrateConfig {
             quad_idx: 0,
             fs_vm: 48_000.0,
             rho_vm: 1.0,
-            declared_max_delay_48k: 89,
+            declared_max_delay_48k: 47,
             ext_ring_pow2_frames: 7,
             dc_blocker_pole_5hz: DC_BLOCKER_5HZ_48K_F32,
         };

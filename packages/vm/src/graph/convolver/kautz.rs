@@ -365,7 +365,7 @@ pub fn hydrate_kautz_slice_and_zoh(
         let bank = &mut banks[blk_idx];
         for lane in 0..4 {
             let m = blk_idx * 4 + lane;
-            let r_raw = blk.r_low[lane].get() + 0.5 * blk.dr[lane].get();
+            let r_raw = blk.r_low[lane].get();
             let r_base_48k = clamp_finite_f32(r_raw, 0.0, KAUTZ_R_MAX, 0.0);
             let th_base_48k = sanitize_finite_f32(blk.theta[lane].get());
             let (b_stored, [c_re_l, c_im_l, c_re_r, c_im_r]) =
@@ -526,13 +526,14 @@ mod tests {
 
     fn make_wire_block(
         r_low: [f32; 4],
-        dr: [f32; 4],
+        _dr: [f32; 4],
         theta: [f32; 4],
         bg: [f32; 4],
     ) -> KautzSoaBlockWire {
         KautzSoaBlockWire {
             r_low: r_low.map(F32::new),
-            dr: dr.map(F32::new),
+            onset_delay_samp: [zerocopy::byteorder::little_endian::U16::new(0); 4],
+            c_cross_fp16: [zerocopy::byteorder::little_endian::U16::new(0); 4],
             theta: theta.map(F32::new),
             b_gamma: bg.map(F32::new),
             c_re_l: [0.5, -0.3, 0.2, 0.1].map(F32::new),

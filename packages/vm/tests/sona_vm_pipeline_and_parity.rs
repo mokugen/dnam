@@ -1,4 +1,4 @@
-//! End-to-end SONA v3.0 `dnam-vm` integration tests: 0-ULP chunk-split invariance, Matryoshka
+//! End-to-end SONA v4.0 `dnam-vm` integration tests: 0-ULP chunk-split invariance, Matryoshka
 //! prefix stripping & crossfade, cross-ISA parity, `SO(4)` `Q_buyer` gauge invariance, ZOH
 //! multi-rate Cases (a)-(d) + `4x` PDC, saturation telemetry, and `!alloc` execution.
 
@@ -11,11 +11,12 @@ mod sona_vm_pipeline_and_parity {
     pub(crate) mod m9_contracts;
 }
 
+use dnam_kernels::{CORE_OS_LIVE_LATENCY_1X, CORE_OS_MASTER_4X_LATENCY_1X};
 use dnam_vm::graph::ConvolverHighSrMode;
 use dnam_vm::math::{detect_best_backend, saturation_flags};
 use dnam_vm::{
-    BackendKind, DefaultMathBackend, DynamicSonaVm, OFFLINE_BOUNCE_PDC_SAMPLES, ScalarBackend,
-    SonaVm, TIER_SWITCH_XFADE_SAMPLES, Tier, control_stride_for_rate, detect_cpu_simd_features,
+    BackendKind, DefaultMathBackend, DynamicSonaVm, ScalarBackend, SonaVm,
+    TIER_SWITCH_XFADE_SAMPLES, Tier, control_stride_for_rate, detect_cpu_simd_features,
     strip_dnam_bin_to_tier,
 };
 use sona_vm_pipeline_and_parity::helpers::{
@@ -435,20 +436,21 @@ fn test_multi_rate_zoh_cases_abcd_os2x_bypass_retime_and_4x_pdc() {
         assert_finite_non_silent(&ol, &or, &format!("open rate={rate}"));
     }
 
-    // 4x offline bounce Case (c) at 44.1 kHz (176.4 kHz effective VM rate) + OS2X auto-bypass.
+    // Core-only Master oversampling at 44.1 kHz keeps f_s_vm == 44.1 kHz (Convolver CaseB) while
+    // running 4x HB63+HB23 core oversampling with PDC = 37.
     let mut vm_b44 =
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&ultra, Tier::Ultra, 44_100.0).unwrap();
     vm_b44.set_offline_bounce(true).unwrap();
     assert_eq!(
         vm_b44.slab().cold().convolver_fir_ext.mode(),
-        ConvolverHighSrMode::CaseC
+        ConvolverHighSrMode::CaseB
     );
-    assert!(!vm_b44.telemetry().os2x_active);
-    assert_eq!(vm_b44.get_latency_samples(), OFFLINE_BOUNCE_PDC_SAMPLES);
+    assert!(vm_b44.telemetry().os2x_active);
+    assert_eq!(vm_b44.get_latency_samples(), CORE_OS_MASTER_4X_LATENCY_1X);
     vm_b44
         .process_block(&in_l, &in_r, &mut ol, &mut or)
         .unwrap();
-    assert_finite_non_silent(&ol, &or, "4x offline bounce 44.1k");
+    assert_finite_non_silent(&ol, &or, "4x Master oversampling 44.1k");
 
     // Live retime_sample_rate across 44.1..=384 kHz.
     let mut vm_live =
@@ -463,7 +465,7 @@ fn test_multi_rate_zoh_cases_abcd_os2x_bypass_retime_and_4x_pdc() {
         assert_finite_non_silent(&ol, &or, &format!("live retime={rate}"));
     }
 
-    // Exact 12-sample PDC group-delay alignment on a low-frequency windowed sine pulse.
+    // Exact PDC group-delay difference (37 - 7 = 30 samples) between Live HB15 and Master HB63+HB23.
     let lite_bytes = strip_dnam_bin_to_tier(&ultra, Tier::Lite).unwrap();
     let mut pulse = vec![0.0_f32; 220];
     for (i, sample) in pulse[20..100].iter_mut().enumerate() {
@@ -478,8 +480,8 @@ fn test_multi_rate_zoh_cases_abcd_os2x_bypass_retime_and_4x_pdc() {
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(lite_bytes, Tier::Lite, 48_000.0)
             .unwrap();
     vm_b1.set_offline_bounce(true).unwrap();
-    assert_eq!(vm_l1.get_latency_samples(), 0);
-    assert_eq!(vm_b1.get_latency_samples(), 12);
+    assert_eq!(vm_l1.get_latency_samples(), CORE_OS_LIVE_LATENCY_1X);
+    assert_eq!(vm_b1.get_latency_samples(), CORE_OS_MASTER_4X_LATENCY_1X);
 
     let (mut live_l, mut live_r, mut bnc_l, mut bnc_r) = (
         vec![0.0_f32; 220],
@@ -496,9 +498,9 @@ fn test_multi_rate_zoh_cases_abcd_os2x_bypass_retime_and_4x_pdc() {
 
     let mut best_lag = 0_usize;
     let mut best_corr = f64::NEG_INFINITY;
-    for lag in 0..=24_usize {
+    for lag in 0..=48_usize {
         let mut corr = 0.0_f64;
-        for n in 20..(220 - 24) {
+        for n in 20..(220 - 48) {
             corr += f64::from(live_l[n]) * f64::from(bnc_l[n + lag]);
         }
         if corr > best_corr {
@@ -506,7 +508,10 @@ fn test_multi_rate_zoh_cases_abcd_os2x_bypass_retime_and_4x_pdc() {
             best_lag = lag;
         }
     }
-    assert_eq!(best_lag, OFFLINE_BOUNCE_PDC_SAMPLES);
+    assert_eq!(
+        best_lag,
+        CORE_OS_MASTER_4X_LATENCY_1X - CORE_OS_LIVE_LATENCY_1X
+    );
 }
 
 #[test]
@@ -553,7 +558,9 @@ fn test_saturation_telemetry_and_no_alloc_lite_parity() {
     let mut vm_sat =
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&sat_bin, Tier::Lite, 48_000.0).unwrap();
 
-    let _ = vm_sat.step_frame(2_000_000.0, 2_000_000.0).unwrap();
+    for _ in 0..=CORE_OS_LIVE_LATENCY_1X {
+        let _ = vm_sat.step_frame(2_000_000.0, 2_000_000.0).unwrap();
+    }
     assert_ne!(
         vm_sat.saturation_flags() & saturation_flags::FP16_SATURATED,
         0
@@ -564,7 +571,7 @@ fn test_saturation_telemetry_and_no_alloc_lite_parity() {
     );
     vm_sat.clear_saturation_flags();
 
-    for _ in 0..4 {
+    for _ in 0..=CORE_OS_LIVE_LATENCY_1X {
         let (clamped_l, clamped_r) = vm_sat.step_frame(2.0e9, 2.0e9).unwrap();
         assert!(clamped_l.abs() <= 1.0e9 && clamped_r.abs() <= 1.0e9);
     }

@@ -10,6 +10,7 @@ use dnam_kernels::{
 };
 
 use crate::graph::GraphBackend;
+use crate::graph::oversample::RenderMode;
 use crate::math::{SimdVec4, flush_recursive_state_f32, fp16_to_f32};
 use crate::types::Tier;
 
@@ -18,10 +19,10 @@ use super::super::layout::{
     SONA_INTERBLOCK_TILES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER, SonaHotSlab,
 };
 
-const MAX_OUTGOING_PER_QUAD: usize = 6;
+const MAX_OUTGOING_PER_QUAD: usize = dnam_kernels::MAX_OUTGOING_PER_QUAD_V4;
 pub(super) const TILE_EMPTY: u8 = 0xFF;
 
-/// Compile-time outgoing tile index table per source quad `0..10` covering all `35` tiles.
+/// Compile-time outgoing tile index table per source quad `0..10` covering all `37` tiles.
 pub(super) const SONA_SRC_OUTGOING_TILES: [[u8; MAX_OUTGOING_PER_QUAD]; MAX_CORE_QUADS] =
     build_outgoing_tile_table();
 
@@ -64,21 +65,31 @@ pub(crate) struct OpP1xFrame {
     pub feat: [f32; 4],
 }
 
-/// Returns `(active_quads, active_tiles)` for `tier`.
+/// Returns `(active_quads, active_tiles)` for `tier` (`v4.0`: `[5, 13, 24, 37]`).
 #[inline(always)]
 pub(super) const fn active_quad_and_tile_counts(tier: Tier) -> (usize, usize) {
     let num_quads = tier.simd_groups();
     let num_tiles = match tier {
-        Tier::Lite => 3,
+        Tier::Lite => 5,
         Tier::Full => 13,
-        Tier::Pro => 23,
-        Tier::Ultra => 35,
+        Tier::Pro => 24,
+        Tier::Ultra => 37,
     };
     (num_quads, num_tiles)
 }
 
+/// Advances `MasterCtrlDelayRingCold` (`delta_D_up = 16`) at each `4`-frame microchunk start.
+#[inline(always)]
+pub(crate) fn advance_master_ctrl_delay_if_chunk_start<B: GraphBackend>(
+    slab: &mut SonaHotSlab<'_, B>,
+) {
+    let cold = slab.cold_mut();
+    let snap = cold.master_ctrl_snapshot();
+    cold.master_os.active_master_core_ctrl = cold.master_os.ctrl_delay_ring.push_and_pop(snap);
+}
+
 /// Decodes modulated `CoreQuadParamsStereo4` directly from `CoreQuadHot` + `CoreQuadExtCold` +
-/// `cold` modulations into `f32` SIMD registers (`0-ULP`, never re-quantized to `fp16`).
+/// `cold` modulations (or delayed `Master` `delta_D_up = 16` snapshot) into `f32` SIMD registers.
 #[inline(always)]
 pub(super) fn decode_core_quad_params<B: GraphBackend>(
     slab: &SonaHotSlab<'_, B>,
@@ -88,28 +99,37 @@ pub(super) fn decode_core_quad_params<B: GraphBackend>(
     let qh = slab.core_quad_hot(q);
     let ext = slab.core_quad_ext(q);
     let l0 = q * 4;
+    let use_delayed = matches!(cold.render_mode, RenderMode::Master) && cold.zoh.m_core == 4;
+    let (lane_g, lane_k, lane_wf, adaa_scale, bias_delta) = if use_delayed {
+        let act = &cold.master_os.active_master_core_ctrl;
+        (
+            &act.lane_g_scale,
+            &act.lane_k_delta,
+            &act.lane_wf_delta,
+            act.quad_adaa_scale[q],
+            act.quad_lru_bias[q],
+        )
+    } else {
+        (
+            &cold.lane_g_scale,
+            &cold.lane_k_delta,
+            &cold.lane_wf_delta,
+            cold.quad_adaa_scale[q],
+            cold.quad_lru_bias[q],
+        )
+    };
     qh.to_kernel_params_modulated::<B>(
         ext,
         crate::graph::slab::CoreQuadModulation {
-            g_scale: B::Vec4::load(&[
-                cold.lane_g_scale[l0],
-                cold.lane_g_scale[l0 + 1],
-                cold.lane_g_scale[l0 + 2],
-                cold.lane_g_scale[l0 + 3],
-            ]),
-            k_delta: B::Vec4::load(&[
-                cold.lane_k_delta[l0],
-                cold.lane_k_delta[l0 + 1],
-                cold.lane_k_delta[l0 + 2],
-                cold.lane_k_delta[l0 + 3],
-            ]),
-            adaa_scale: cold.quad_adaa_scale[q],
-            bias_delta: cold.quad_lru_bias[q],
+            g_scale: B::Vec4::load(&[lane_g[l0], lane_g[l0 + 1], lane_g[l0 + 2], lane_g[l0 + 3]]),
+            k_delta: B::Vec4::load(&[lane_k[l0], lane_k[l0 + 1], lane_k[l0 + 2], lane_k[l0 + 3]]),
+            adaa_scale,
+            bias_delta,
             wf_delta: B::Vec4::load(&[
-                cold.lane_wf_delta[l0],
-                cold.lane_wf_delta[l0 + 1],
-                cold.lane_wf_delta[l0 + 2],
-                cold.lane_wf_delta[l0 + 3],
+                lane_wf[l0],
+                lane_wf[l0 + 1],
+                lane_wf[l0 + 2],
+                lane_wf[l0 + 3],
             ]),
             rect_mask4: slab.rect_mask4(q),
         },
@@ -223,6 +243,78 @@ fn eval_core_quad_step<B: GraphBackend, const BLOCK0_PHS: bool>(
     }
 }
 
+#[inline(always)]
+fn eval_core_quad_step_master<B: GraphBackend, const BLOCK0_PHS: bool>(
+    q: usize,
+    num_tiles: usize,
+    slab: &mut SonaHotSlab<'_, B>,
+    crossbar: &CrossbarFrame<B::Vec4>,
+    u_lr: (f32, f32),
+    acc: &mut CoreAccumulators<B::Stereo8>,
+) {
+    let params_q = decode_core_quad_params(slab, q);
+    let reg = decode_core_quad_readout(slab, q);
+    let mut u_q = couple_ms_input_stereo8(
+        if BLOCK0_PHS {
+            B::Stereo8::zero()
+        } else {
+            acc.quad_in[q]
+        },
+        u_lr.0,
+        u_lr.1,
+        reg.in_mid_weight,
+        reg.in_side_weight,
+    );
+    if crossbar.active {
+        let op_p_vec_w = crossbar.op_p_vec.mul(reg.op_p_w);
+        let op_p_s8 = B::Stereo8::from_lr(op_p_vec_w, op_p_vec_w);
+        let car_s8 =
+            B::Stereo8::from_lr(crossbar.car_l.mul(reg.ph_w), crossbar.car_r.mul(reg.ph_w));
+        u_q = u_q.add(op_p_s8.add(car_s8));
+    }
+
+    let mut state_q = *slab.state_mut(q);
+    let out = if BLOCK0_PHS {
+        step_core_quad_phs_stereo8::<B::Stereo8>(u_q, &mut state_q, &params_q)
+    } else {
+        step_core_quad_stereo8::<B::Stereo8>(u_q, &mut state_q, &params_q)
+    };
+    *slab.state_mut(q) = state_q;
+
+    let lin_v4 = B::fp16x4_to_vec4(&slab.core_quad_ext(q).lin_mix_fp16);
+    let lin_mix = B::Stereo8::from_lr(lin_v4, lin_v4);
+    let (box_odd, box_even) =
+        slab.cold_mut()
+            .master_os
+            .apply_box2_quad::<B>(q, out.adaa_odd, out.adaa_even, lin_mix);
+
+    acc.pre_conv = acc
+        .pre_conv
+        .fma(box_odd, reg.pre_conv_odd)
+        .fma(box_even, reg.pre_conv_even)
+        .fma(out.lru_state, reg.pre_conv_lru);
+    acc.direct = acc
+        .direct
+        .fma(box_odd, reg.direct_odd)
+        .fma(box_even, reg.direct_even)
+        .fma(out.lru_state, reg.direct_lru);
+
+    for &tile_raw in &SONA_SRC_OUTGOING_TILES[q] {
+        if tile_raw == TILE_EMPTY {
+            break;
+        }
+        let t_idx = usize::from(tile_raw);
+        if t_idx >= num_tiles {
+            continue;
+        }
+        let dq = SONA_INTERBLOCK_TILES[t_idx].1;
+        let tile = slab.tile_hot(t_idx);
+        let tile_acc = B::Stereo8::fma_mat4x4_shared(acc.quad_in[dq], &tile.w_odd_4x4, box_odd);
+        let tile_acc = fma_fp16_tile::<B>(tile_acc, &tile.w_even_4x4_fp16, box_even);
+        acc.quad_in[dq] = fma_fp16_tile::<B>(tile_acc, &tile.w_lru_4x4_fp16, out.lru_state);
+    }
+}
+
 /// Evaluates all active Matryoshka `CoreQuad`s in causal block-major order (`0..num_quads`),
 /// accumulating inter-block `4x4` tiles (`odd -> even -> lru`) and `VarPro` readouts into
 /// `((pre_conv_l, r), (dir_l, r))`.
@@ -239,12 +331,12 @@ pub fn evaluate_matryoshka_core_quads<B: GraphBackend>(
         direct: B::Stereo8::zero(),
     };
 
-    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[..4] {
+    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[..3] {
         if q < num_quads {
             eval_core_quad_step::<B, true>(q, num_tiles, slab, crossbar, u_lr, &mut acc);
         }
     }
-    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[4..] {
+    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[3..] {
         if q < num_quads {
             eval_core_quad_step::<B, false>(q, num_tiles, slab, crossbar, u_lr, &mut acc);
         }
@@ -278,26 +370,63 @@ pub(crate) fn step_op_p_1x<B: GraphBackend>(
 pub(crate) fn step_core_subsample<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
     op_p_1x: &OpP1xFrame,
-    os2x: bool,
+    m_core: usize,
     sub_idx: usize,
     u_lr: (f32, f32),
 ) -> [f32; 4] {
     let crossbar = if (slab.lite.flags & FLAG_CROSSBAR_ACTIVE) != 0 {
-        let (iq_sub, feat_sub) = if !os2x {
-            (op_p_1x.iq_lr, op_p_1x.feat)
-        } else if sub_idx == 0 {
-            (
-                os2x_midpoint_f32x4(slab.os2x_hot.op_p_prev_iq_lr, op_p_1x.iq_lr),
-                os2x_midpoint_f32x4(slab.os2x_hot.op_p_prev_feat, op_p_1x.feat),
-            )
-        } else {
-            slab.os2x_hot.op_p_prev_iq_lr = op_p_1x.iq_lr;
-            slab.os2x_hot.op_p_prev_feat = op_p_1x.feat;
-            (op_p_1x.iq_lr, op_p_1x.feat)
+        let (iq_sub, feat_sub) = match m_core {
+            4 => {
+                let prev_iq = slab.lite.op_p_prev_iq_lr;
+                let prev_feat = slab.lite.op_p_prev_feat;
+                match sub_idx {
+                    0 => {
+                        let iq =
+                            core::array::from_fn(|k| 0.75 * prev_iq[k] + 0.25 * op_p_1x.iq_lr[k]);
+                        let ft =
+                            core::array::from_fn(|k| 0.75 * prev_feat[k] + 0.25 * op_p_1x.feat[k]);
+                        (iq, ft)
+                    }
+                    1 => (
+                        os2x_midpoint_f32x4(prev_iq, op_p_1x.iq_lr),
+                        os2x_midpoint_f32x4(prev_feat, op_p_1x.feat),
+                    ),
+                    2 => {
+                        let iq =
+                            core::array::from_fn(|k| 0.25 * prev_iq[k] + 0.75 * op_p_1x.iq_lr[k]);
+                        let ft =
+                            core::array::from_fn(|k| 0.25 * prev_feat[k] + 0.75 * op_p_1x.feat[k]);
+                        (iq, ft)
+                    }
+                    _ => {
+                        slab.lite.op_p_prev_iq_lr = op_p_1x.iq_lr;
+                        slab.lite.op_p_prev_feat = op_p_1x.feat;
+                        (op_p_1x.iq_lr, op_p_1x.feat)
+                    }
+                }
+            }
+            2 => {
+                if sub_idx == 0 {
+                    (
+                        os2x_midpoint_f32x4(slab.lite.op_p_prev_iq_lr, op_p_1x.iq_lr),
+                        os2x_midpoint_f32x4(slab.lite.op_p_prev_feat, op_p_1x.feat),
+                    )
+                } else {
+                    slab.lite.op_p_prev_iq_lr = op_p_1x.iq_lr;
+                    slab.lite.op_p_prev_feat = op_p_1x.feat;
+                    (op_p_1x.iq_lr, op_p_1x.feat)
+                }
+            }
+            _ => (op_p_1x.iq_lr, op_p_1x.feat),
         };
-        let wet_scale = crate::control::bus::laws::eval_crossbar_wet_scale(
-            slab.cold().latched_stage_params[15],
-        );
+        let cold = slab.cold();
+        let use_delayed = matches!(cold.render_mode, RenderMode::Master) && cold.zoh.m_core == 4;
+        let stage_15 = if use_delayed {
+            cold.master_os.active_master_core_ctrl.latched_stage_params[15]
+        } else {
+            cold.latched_stage_params[15]
+        };
+        let wet_scale = crate::control::bus::laws::eval_crossbar_wet_scale(stage_15);
         let op_p_gain = slab.cold().base_op_p_gain * wet_scale;
         let cos_st = B::fp16x4_to_vec4(&slab.lite.phasor_st_cos_fp16);
         let sin_st = B::fp16x4_to_vec4(&slab.lite.phasor_st_sin_fp16);
@@ -322,9 +451,9 @@ pub(crate) fn step_core_subsample<B: GraphBackend>(
             car_r,
         }
     } else {
-        if os2x && sub_idx == 1 {
-            slab.os2x_hot.op_p_prev_iq_lr = op_p_1x.iq_lr;
-            slab.os2x_hot.op_p_prev_feat = op_p_1x.feat;
+        if (m_core == 2 && sub_idx == 1) || (m_core == 4 && sub_idx == 3) {
+            slab.lite.op_p_prev_iq_lr = op_p_1x.iq_lr;
+            slab.lite.op_p_prev_feat = op_p_1x.feat;
         }
         slab.lite.phasors.advance();
         CrossbarFrame {
@@ -335,7 +464,37 @@ pub(crate) fn step_core_subsample<B: GraphBackend>(
         }
     };
 
-    let ((pre_l, pre_r), (dir_l, dir_r)) = evaluate_matryoshka_core_quads(slab, &crossbar, u_lr);
+    let master_4x = matches!(slab.cold().render_mode, RenderMode::Master) && m_core == 4;
+    let (pre_l, pre_r, dir_l, dir_r) = if master_4x {
+        let (num_quads, num_tiles) = active_quad_and_tile_counts(slab.lite.tier);
+        let mut acc = CoreAccumulators {
+            quad_in: [B::Stereo8::zero(); MAX_CORE_QUADS],
+            pre_conv: B::Stereo8::zero(),
+            direct: B::Stereo8::zero(),
+        };
+        for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[..3] {
+            if q < num_quads {
+                eval_core_quad_step_master::<B, true>(
+                    q, num_tiles, slab, &crossbar, u_lr, &mut acc,
+                );
+            }
+        }
+        for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[3..] {
+            if q < num_quads {
+                eval_core_quad_step_master::<B, false>(
+                    q, num_tiles, slab, &crossbar, u_lr, &mut acc,
+                );
+            }
+        }
+        let (pl, pr) = acc.pre_conv.into_lr();
+        let (dl, dr) = acc.direct.into_lr();
+        let (p_l, p_r) = pl.horizontal_sum_pair(pr);
+        let (d_l, d_r) = dl.horizontal_sum_pair(dr);
+        (p_l, p_r, d_l, d_r)
+    } else {
+        let ((p_l, p_r), (d_l, d_r)) = evaluate_matryoshka_core_quads(slab, &crossbar, u_lr);
+        (p_l, p_r, d_l, d_r)
+    };
 
     let pole = slab.lite.hp_lp_pole;
     let one_m_p = 1.0 - pole;

@@ -2,8 +2,8 @@
 
 use crate::bin::arena_wire::{
     Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, CoreQuadWire,
-    PIPE_MAGIC_MASK, PIPE_REQUIRED_SONA_MASK, SONA_META_CORE_MODS_PRESENT, SONA_META_RESERVED_MASK,
-    SonaCrossbarBlockWire, TRANSPORT_FLAG_EXT_F32, TransportQuadWire,
+    PIPE_MAGIC_MASK, PIPE_REQUIRED_SONA_MASK, SONA_META_RESERVED_MASK, SonaCrossbarBlockWire,
+    TRANSPORT_FLAG_EXT_F32, TransportQuadWire,
 };
 use crate::bin::header::{
     DNBN_VERSION_MAJOR, DNBN_VERSION_MINOR, DnamBinRuntimeMetaWire, SONA_CELL_MAGIC,
@@ -11,15 +11,35 @@ use crate::bin::header::{
 use crate::types::{Tier, VmError};
 
 fn validate_quad(quad: &TransportQuadWire) -> Result<bool, VmError> {
-    if (quad.flags & !TRANSPORT_FLAG_EXT_F32) != 0 || quad.reserved != 0 {
+    if (quad.flags & !TRANSPORT_FLAG_EXT_F32) != 0
+        || quad.reserved != 0
+        || !quad.reserved_v4_ext.iter().all(|v| v.get() == 0)
+    {
         return Err(VmError::InvalidArenaHeader);
     }
     Ok((quad.flags & TRANSPORT_FLAG_EXT_F32) != 0)
 }
 
+fn validate_core_quads_v4(quads: &[CoreQuadWire]) -> Result<(), VmError> {
+    for quad in quads {
+        if (quad.rect_sign_mask.get() & !0x000F) != 0
+            || !quad.reserved_rect_pad.iter().all(|v| v.get() == 0)
+            || !quad
+                .wavefolder_mix_fp16
+                .iter()
+                .all(|v| (v.get() & 0x8000) == 0)
+        {
+            return Err(VmError::InvalidArenaHeader);
+        }
+    }
+    Ok(())
+}
+
 fn validate_linear_blocks_zero_k_nl(quads: &[CoreQuadWire]) -> Result<(), VmError> {
     for quad in quads {
-        if !quad.svf_k_nl_fp16.iter().all(|v| v.get() == 0) {
+        if !quad.svf_k_nl_fp16.iter().all(|v| v.get() == 0)
+            || !quad.c_kbp_fp16.iter().all(|v| v.get() == 0)
+        {
             return Err(VmError::InvalidArenaHeader);
         }
     }
@@ -62,7 +82,9 @@ fn validate_inline_cp1_dir(
             ultra_bytes += 4 * (8 * lanes + 4);
         }
     }
-    if base_bytes > 576 || ultra_bytes > 2_112 {
+    if base_bytes > arena0.control_bus_lite.gra_lite.len()
+        || ultra_bytes > arena3.map_or(2_432, |a3| a3.control_bus_ultra_delta.gra_ultra_delta.len())
+    {
         return Err(VmError::InvalidCp1Stream);
     }
     Ok(())
@@ -113,7 +135,7 @@ pub(in crate::bin::view) fn validate_arena0_and_quads(
         || cell.version_major.get() != DNBN_VERSION_MAJOR
         || cell.version_minor.get() != DNBN_VERSION_MINOR
         || cell.tier_flags.get() != expected_tier_flags
-        || !matches!(cell.oversample_factor.get(), 1 | 2)
+        || cell.oversample_factor.get() != 2
         || cell.cell_flags.get() != meta_flags
     {
         return Err(VmError::InvalidArenaHeader);
@@ -126,36 +148,39 @@ pub(in crate::bin::view) fn validate_arena0_and_quads(
         return Err(VmError::InvalidCp1Stream);
     }
 
-    if arena0.control_bus_lite.reserved_ctrl_fp16.get() != 0 {
+    if arena0.control_bus_lite.reserved_ctrl_fp16.get() != 0
+        || !arena0
+            .control_bus_lite
+            .reserved_gra_scalars
+            .iter()
+            .all(|&b| b == 0)
+    {
         return Err(VmError::InvalidArenaHeader);
     }
 
+    validate_core_quads_v4(&arena0.core_quads)?;
     validate_linear_blocks_zero_k_nl(&arena0.core_quads[1..4])?;
     let mut any_ext_f32 = validate_quad(&arena0.transport_lite)?;
     if let Some(a1) = arena1 {
+        validate_core_quads_v4(&a1.core_quads)?;
         validate_linear_blocks_zero_k_nl(&a1.core_quads[1..2])?;
         any_ext_f32 |= validate_quad(&a1.transport_full)?;
         validate_crossbar_block_reserved(&a1.crossbar_full)?;
     }
     if let Some(a2) = arena2 {
-        validate_linear_blocks_zero_k_nl(&a2.core_quads[1..2])?;
+        validate_core_quads_v4(&a2.core_quads)?;
+        validate_linear_blocks_zero_k_nl(&a2.core_quads)?;
         any_ext_f32 |= validate_quad(&a2.transport_pro[0])?;
         validate_crossbar_block_reserved(&a2.crossbar_pro)?;
     }
     if let Some(a3) = arena3 {
+        validate_core_quads_v4(&a3.core_quads)?;
         validate_linear_blocks_zero_k_nl(&a3.core_quads[1..2])?;
         any_ext_f32 |= validate_quad(&a3.transport_ultra[0])?;
         validate_crossbar_block_reserved(&a3.crossbar_ultra)?;
-        for k in 0..8 {
-            if !a3.stage_latent_core_mods_fp16[k * 128 + 120..k * 128 + 128]
-                .iter()
-                .all(|v| v.get() == 0)
-            {
-                return Err(VmError::InvalidArenaHeader);
-            }
-        }
-        if (meta_flags & SONA_META_CORE_MODS_PRESENT) == 0
-            && !a3.stage_latent_core_mods_fp16.iter().all(|v| v.get() == 0)
+        if !a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[160..164]
+            .iter()
+            .all(|v| v.get() == 0)
         {
             return Err(VmError::InvalidArenaHeader);
         }
@@ -245,9 +270,10 @@ mod tests {
             VmError::InvalidArenaHeader
         );
 
+        // Retired `ou_to_z_stage_ultra_fp16` `[160..164]` fails closed when non-zero in v4.0.
         let mut a3_ou = a3;
         a3_ou.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[160] = U16::new(0x3C00);
-        assert!(
+        assert_eq!(
             validate_arena0_and_quads(ArenaValidationInput {
                 arena0: view.arena0,
                 arena1: Some(&a1),
@@ -259,7 +285,8 @@ mod tests {
                 retained_tier: Tier::Ultra,
                 meta: view.runtime_meta,
             })
-            .is_ok()
+            .unwrap_err(),
+            VmError::InvalidArenaHeader
         );
 
         // `stage_latent_ctrl_ultra_fp16[164..256]` holds Tardos Role B carriers `5,779..5,871`
@@ -283,14 +310,38 @@ mod tests {
             .is_ok()
         );
 
-        let mut bad_a3 = a3;
-        bad_a3.stage_latent_core_mods_fp16[120] = U16::new(1);
+        // Retired bits `1 << 6` (TIER_OS_EXPLICIT) & `1 << 9` (CORE_MODS_PRESENT) fail closed.
+        for retired_bit in [1_u32 << 6, 1_u32 << 9] {
+            let mut a0_retired = *view.arena0;
+            let mf = a0_retired.crossbar.sona_meta_flags.get() | retired_bit;
+            a0_retired.crossbar.sona_meta_flags = U32::new(mf);
+            a0_retired.crossbar.cell_desc.cell_flags = U32::new(mf);
+            assert_eq!(
+                validate_arena0_and_quads(ArenaValidationInput {
+                    arena0: &a0_retired,
+                    arena1: Some(&a1),
+                    arena2: Some(&a2),
+                    arena3: Some(&a3),
+                    cp1_overflow_empty: true,
+                    num_controls: 0,
+                    max_present_tier: 3,
+                    retained_tier: Tier::Ultra,
+                    meta: view.runtime_meta,
+                })
+                .unwrap_err(),
+                VmError::InvalidArenaHeader
+            );
+        }
+
+        // CoreQuad rect_sign_mask reserved bits, signed wavefolder_mix, and non-zero c_kbp on Block 1..3 fail closed.
+        let mut bad_rect = *view.arena0;
+        bad_rect.core_quads[0].rect_sign_mask = U16::new(0x0010);
         assert_eq!(
             validate_arena0_and_quads(ArenaValidationInput {
-                arena0: view.arena0,
+                arena0: &bad_rect,
                 arena1: Some(&a1),
                 arena2: Some(&a2),
-                arena3: Some(&bad_a3),
+                arena3: Some(&a3),
                 cp1_overflow_empty: true,
                 num_controls: 0,
                 max_present_tier: 3,
@@ -300,15 +351,14 @@ mod tests {
             .unwrap_err(),
             VmError::InvalidArenaHeader
         );
-
-        bad_a3 = a3;
-        bad_a3.stage_latent_core_mods_fp16[0] = U16::new(1);
+        let mut bad_wf = *view.arena0;
+        bad_wf.core_quads[0].wavefolder_mix_fp16[0] = U16::new(0x8000);
         assert_eq!(
             validate_arena0_and_quads(ArenaValidationInput {
-                arena0: view.arena0,
+                arena0: &bad_wf,
                 arena1: Some(&a1),
                 arena2: Some(&a2),
-                arena3: Some(&bad_a3),
+                arena3: Some(&a3),
                 cp1_overflow_empty: true,
                 num_controls: 0,
                 max_present_tier: 3,
@@ -318,24 +368,22 @@ mod tests {
             .unwrap_err(),
             VmError::InvalidArenaHeader
         );
-
-        let mut a0_core_mods = *view.arena0;
-        let mf = a0_core_mods.crossbar.sona_meta_flags.get() | SONA_META_CORE_MODS_PRESENT;
-        a0_core_mods.crossbar.sona_meta_flags = U32::new(mf);
-        a0_core_mods.crossbar.cell_desc.cell_flags = U32::new(mf);
-        assert!(
+        let mut bad_ckbp = *view.arena0;
+        bad_ckbp.core_quads[2].c_kbp_fp16[0] = U16::new(0x3C00);
+        assert_eq!(
             validate_arena0_and_quads(ArenaValidationInput {
-                arena0: &a0_core_mods,
+                arena0: &bad_ckbp,
                 arena1: Some(&a1),
                 arena2: Some(&a2),
-                arena3: Some(&bad_a3),
+                arena3: Some(&a3),
                 cp1_overflow_empty: true,
                 num_controls: 0,
                 max_present_tier: 3,
                 retained_tier: Tier::Ultra,
                 meta: view.runtime_meta,
             })
-            .is_ok()
+            .unwrap_err(),
+            VmError::InvalidArenaHeader
         );
     }
 

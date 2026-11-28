@@ -255,7 +255,7 @@ mod tests {
     #[test]
     fn test_wire_hydration_sigma_sat_freeze_mix_and_zoh_bounds() {
         let mut w0 = TransportQuadWire::new_zeroed();
-        w0.delay_samples = [53.0, 67.0, 79.0, 89.0].map(F32::new);
+        w0.delay_samples = [23.0, 31.0, 41.0, 47.0].map(F32::new);
         (w0.g_loop, w0.r_dc, w0.damp_pole) = (F32::new(0.85), F32::new(0.5), F32::new(0.2));
         w0.sigma_knee_fp16 = U16::new(0x7E00); // NaN fallback -> TANK_MAX_SIGMA_SAT_FP16 (0x3BE0).
         w0.freeze_mix_fp16 = U16::new(0x7E00); // NaN fallback -> 0.0.
@@ -264,7 +264,7 @@ mod tests {
             quad_idx: 0,
             fs_vm: 48_000.0,
             rho_vm: 1.0,
-            declared_max_delay_48k: 89,
+            declared_max_delay_48k: 47,
             ext_ring_pow2_frames: 7,
             dc_blocker_pole_5hz: DC_BLOCKER_5HZ_48K_F32,
         };
@@ -304,7 +304,7 @@ mod tests {
                 None,
             )
             .unwrap();
-        assert_eq!(meta_reconf.cap, 256);
+        assert_eq!(meta_reconf.cap, 128);
         assert_ne!(q_clamped.flags & QUAD_FLAG_HOST_WRITE_LOCK, 0);
 
         // Verify passive feed-forward high-pole hydration (0.999995 = MAX_PARALRU_R_F32) at 48 kHz

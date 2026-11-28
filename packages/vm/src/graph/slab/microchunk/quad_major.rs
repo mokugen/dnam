@@ -11,6 +11,7 @@ use dnam_kernels::{
 
 use crate::control::bus::laws::eval_crossbar_wet_scale;
 use crate::graph::GraphBackend;
+use crate::graph::oversample::RenderMode;
 use crate::graph::transport::{QuadTopRead, TRANSPORT_MAX_QUADS};
 use crate::math::{SimdVec4, flush_recursive_state_f32, fp16_to_f32};
 use crate::types::VmError;
@@ -20,8 +21,9 @@ use super::super::layout::{
     SONA_ULTRA_QUAD_TRAVERSAL_ORDER, SonaHotSlab,
 };
 use super::core_step::{
-    SONA_SRC_OUTGOING_TILES, TILE_EMPTY, active_quad_and_tile_counts, decode_core_quad_params,
-    decode_core_quad_readout, step_op_p_1x,
+    SONA_SRC_OUTGOING_TILES, TILE_EMPTY, active_quad_and_tile_counts,
+    advance_master_ctrl_delay_if_chunk_start, decode_core_quad_params, decode_core_quad_readout,
+    step_op_p_1x,
 };
 use super::telemetry::{BlockTelemetry, finalize_frame_output_with_telem};
 use super::{eval_op_t_crossbar_taps, step_transport_end_via_slab_with_telem};
@@ -38,14 +40,16 @@ struct CrossbarSubParams<V: dnam_kernels::KernelVec4> {
 
 pub(super) struct PreparedMicrochunkInputs<V: SimdVec4> {
     pub num_sub: usize,
-    pub u_sub: [(f32, f32); 8],
-    pub crossbar_sub: [CrossbarFrame<V>; 8],
+    pub m_core: usize,
+    pub is_master: bool,
+    pub u_sub: [(f32, f32); 16],
+    pub crossbar_sub: [CrossbarFrame<V>; 16],
 }
 
 struct CoreChunkBuffers<S> {
-    quad_in: [[S; MAX_CORE_QUADS]; 8],
-    pre_conv_acc: [S; 8],
-    direct_acc: [S; 8],
+    quad_in: [[S; MAX_CORE_QUADS]; 16],
+    pre_conv_acc: [S; 16],
+    direct_acc: [S; 16],
 }
 
 #[inline(always)]
@@ -101,14 +105,30 @@ pub(super) fn prepare_microchunk_crossbar_and_u_sub<B: GraphBackend>(
     u_sense_lr: &[[f32; 2]; 4],
     tel: &mut BlockTelemetry,
 ) -> PreparedMicrochunkInputs<B::Vec4> {
-    let os2x = slab.os2x();
+    let (m_core, is_master) = {
+        let cold = slab.cold();
+        (
+            cold.zoh.m_core,
+            matches!(cold.render_mode, RenderMode::Master),
+        )
+    };
+    if is_master && m_core == 4 {
+        advance_master_ctrl_delay_if_chunk_start(slab);
+    }
     let crossbar_active = (slab.lite.flags & FLAG_CROSSBAR_ACTIVE) != 0;
-    let wet_scale = eval_crossbar_wet_scale(slab.cold().latched_stage_params[15]);
-    let op_p_gain = slab.cold().base_op_p_gain * wet_scale;
-    let op_t_gain = slab.cold().base_op_t_gain * wet_scale;
+    let cold = slab.cold();
+    let wet_scale_1x = eval_crossbar_wet_scale(cold.latched_stage_params[15]);
+    let core_stage_15 = if is_master && m_core == 4 {
+        cold.master_os.active_master_core_ctrl.latched_stage_params[15]
+    } else {
+        cold.latched_stage_params[15]
+    };
+    let wet_scale_core = eval_crossbar_wet_scale(core_stage_15);
+    let op_p_gain = cold.base_op_p_gain * wet_scale_core;
+    let op_t_gain = cold.base_op_t_gain * wet_scale_1x;
     let (d_scale, delta_step) = (
-        slab.cold().op_n_pre_hoisted.d_scale,
-        slab.cold().op_n_pre_hoisted.delta_step,
+        cold.op_n_pre_hoisted.d_scale,
+        cold.op_n_pre_hoisted.delta_step,
     );
 
     let (cos_st, sin_st, carrier_w) = if crossbar_active {
@@ -138,22 +158,21 @@ pub(super) fn prepare_microchunk_crossbar_and_u_sub<B: GraphBackend>(
         cos_st,
         sin_st,
         carrier_w,
-        wet_scale,
+        wet_scale: wet_scale_core,
         op_p_gain,
     };
 
-    let os_params = slab.os2x_hot.os_params;
-    let mut prev_iq_lr = slab.os2x_hot.op_p_prev_iq_lr;
-    let mut prev_feat = slab.os2x_hot.op_p_prev_feat;
+    let mut prev_iq_lr = slab.lite.op_p_prev_iq_lr;
+    let mut prev_feat = slab.lite.op_p_prev_feat;
 
-    let mut u_sub = [(0.0_f32, 0.0_f32); 8];
+    let mut u_sub = [(0.0_f32, 0.0_f32); 16];
     let empty_cb = CrossbarFrame {
         active: false,
         op_p_vec: B::Vec4::zero(),
         car_l: B::Vec4::zero(),
         car_r: B::Vec4::zero(),
     };
-    let mut crossbar_sub = [empty_cb; 8];
+    let mut crossbar_sub = [empty_cb; 16];
 
     for f in 0..4 {
         let op_p_1x = step_op_p_1x(slab, u_sense_lr[f][0], u_sense_lr[f][1]);
@@ -168,35 +187,67 @@ pub(super) fn prepare_microchunk_crossbar_and_u_sub<B: GraphBackend>(
             tel.last_op_p_feat = op_p_1x.feat;
             tel.last_in = [ux_l, ux_r];
         }
-        if os2x {
-            let (u0, u1) = slab
-                .os2x_hot
-                .os_stereo
-                .upsample_stereo::<B>(ux_l, ux_r, &os_params);
-            let s0 = 2 * f;
-            u_sub[s0] = (u0[0], u0[1]);
-            u_sub[s0 + 1] = (u1[0], u1[1]);
-            let iq0 = os2x_midpoint_f32x4(prev_iq_lr, op_p_1x.iq_lr);
-            let feat0 = os2x_midpoint_f32x4(prev_feat, op_p_1x.feat);
-            crossbar_sub[s0] = build_crossbar_sub::<B>(slab, &cb_params, iq0, feat0);
-            prev_iq_lr = op_p_1x.iq_lr;
-            prev_feat = op_p_1x.feat;
-            crossbar_sub[s0 + 1] =
-                build_crossbar_sub::<B>(slab, &cb_params, op_p_1x.iq_lr, op_p_1x.feat);
-        } else {
-            u_sub[f] = (ux_l, ux_r);
-            crossbar_sub[f] =
-                build_crossbar_sub::<B>(slab, &cb_params, op_p_1x.iq_lr, op_p_1x.feat);
+        match (is_master, m_core) {
+            (false, 2) | (true, 2) => {
+                let up = if is_master {
+                    slab.cold_mut().master_os.upsample_1x_to_2x(ux_l, ux_r)
+                } else {
+                    slab.lite.live_os.upsample_stereo(ux_l, ux_r)
+                };
+                let s0 = 2 * f;
+                u_sub[s0] = (up[0][0], up[0][1]);
+                u_sub[s0 + 1] = (up[1][0], up[1][1]);
+                let iq0 = os2x_midpoint_f32x4(prev_iq_lr, op_p_1x.iq_lr);
+                let feat0 = os2x_midpoint_f32x4(prev_feat, op_p_1x.feat);
+                crossbar_sub[s0] = build_crossbar_sub::<B>(slab, &cb_params, iq0, feat0);
+                prev_iq_lr = op_p_1x.iq_lr;
+                prev_feat = op_p_1x.feat;
+                crossbar_sub[s0 + 1] =
+                    build_crossbar_sub::<B>(slab, &cb_params, op_p_1x.iq_lr, op_p_1x.feat);
+            }
+            (true, 4) => {
+                let up = slab.cold_mut().master_os.upsample_1x_to_4x(ux_l, ux_r);
+                let s0 = 4 * f;
+                for sub in 0..4 {
+                    u_sub[s0 + sub] = (up[sub][0], up[sub][1]);
+                }
+                let iq_quarter =
+                    core::array::from_fn(|k| 0.75 * prev_iq_lr[k] + 0.25 * op_p_1x.iq_lr[k]);
+                let feat_quarter =
+                    core::array::from_fn(|k| 0.75 * prev_feat[k] + 0.25 * op_p_1x.feat[k]);
+                let iq_mid = os2x_midpoint_f32x4(prev_iq_lr, op_p_1x.iq_lr);
+                let feat_mid = os2x_midpoint_f32x4(prev_feat, op_p_1x.feat);
+                let iq_three_q =
+                    core::array::from_fn(|k| 0.25 * prev_iq_lr[k] + 0.75 * op_p_1x.iq_lr[k]);
+                let feat_three_q =
+                    core::array::from_fn(|k| 0.25 * prev_feat[k] + 0.75 * op_p_1x.feat[k]);
+                crossbar_sub[s0] =
+                    build_crossbar_sub::<B>(slab, &cb_params, iq_quarter, feat_quarter);
+                crossbar_sub[s0 + 1] = build_crossbar_sub::<B>(slab, &cb_params, iq_mid, feat_mid);
+                crossbar_sub[s0 + 2] =
+                    build_crossbar_sub::<B>(slab, &cb_params, iq_three_q, feat_three_q);
+                prev_iq_lr = op_p_1x.iq_lr;
+                prev_feat = op_p_1x.feat;
+                crossbar_sub[s0 + 3] =
+                    build_crossbar_sub::<B>(slab, &cb_params, op_p_1x.iq_lr, op_p_1x.feat);
+            }
+            _ => {
+                u_sub[f] = (ux_l, ux_r);
+                crossbar_sub[f] =
+                    build_crossbar_sub::<B>(slab, &cb_params, op_p_1x.iq_lr, op_p_1x.feat);
+            }
         }
     }
 
-    if os2x {
-        slab.os2x_hot.op_p_prev_iq_lr = prev_iq_lr;
-        slab.os2x_hot.op_p_prev_feat = prev_feat;
+    if m_core >= 2 {
+        slab.lite.op_p_prev_iq_lr = prev_iq_lr;
+        slab.lite.op_p_prev_feat = prev_feat;
     }
 
     PreparedMicrochunkInputs {
-        num_sub: if os2x { 8 } else { 4 },
+        num_sub: 4 * m_core,
+        m_core,
+        is_master,
         u_sub,
         crossbar_sub,
     }
@@ -215,9 +266,13 @@ fn eval_core_quad_chunk_pass<B: GraphBackend, const BLOCK0_PHS: bool>(
     let mut state_q = *slab.state_mut(q);
     let num_sub = inputs.num_sub;
 
-    let mut q_out_odd = [B::Stereo8::zero(); 8];
-    let mut q_out_even = [B::Stereo8::zero(); 8];
-    let mut q_out_lru = [B::Stereo8::zero(); 8];
+    let master_box2 = inputs.is_master && inputs.m_core == 4;
+    let lin_v4 = B::fp16x4_to_vec4(&slab.core_quad_ext(q).lin_mix_fp16);
+    let lin_mix = B::Stereo8::from_lr(lin_v4, lin_v4);
+
+    let mut q_out_odd = [B::Stereo8::zero(); 16];
+    let mut q_out_even = [B::Stereo8::zero(); 16];
+    let mut q_out_lru = [B::Stereo8::zero(); 16];
 
     for s in 0..num_sub {
         let mut u_q = couple_ms_input_stereo8(
@@ -244,16 +299,23 @@ fn eval_core_quad_chunk_pass<B: GraphBackend, const BLOCK0_PHS: bool>(
         } else {
             step_core_quad_stereo8::<B::Stereo8>(u_q, &mut state_q, &params_q)
         };
+        let (eff_odd, eff_even) = if master_box2 {
+            slab.cold_mut()
+                .master_os
+                .apply_box2_quad::<B>(q, out.adaa_odd, out.adaa_even, lin_mix)
+        } else {
+            (out.adaa_odd, out.adaa_even)
+        };
         bufs.pre_conv_acc[s] = bufs.pre_conv_acc[s]
-            .fma(out.adaa_odd, reg_q.pre_conv_odd)
-            .fma(out.adaa_even, reg_q.pre_conv_even)
+            .fma(eff_odd, reg_q.pre_conv_odd)
+            .fma(eff_even, reg_q.pre_conv_even)
             .fma(out.lru_state, reg_q.pre_conv_lru);
         bufs.direct_acc[s] = bufs.direct_acc[s]
-            .fma(out.adaa_odd, reg_q.direct_odd)
-            .fma(out.adaa_even, reg_q.direct_even)
+            .fma(eff_odd, reg_q.direct_odd)
+            .fma(eff_even, reg_q.direct_even)
             .fma(out.lru_state, reg_q.direct_lru);
-        q_out_odd[s] = out.adaa_odd;
-        q_out_even[s] = out.adaa_even;
+        q_out_odd[s] = eff_odd;
+        q_out_even[s] = eff_even;
         q_out_lru[s] = out.lru_state;
     }
 
@@ -305,17 +367,17 @@ pub(super) fn eval_core_quads_quad_major<B: GraphBackend>(
 ) -> ([[f32; 2]; 4], [[f32; 2]; 4]) {
     let (num_quads, num_tiles) = active_quad_and_tile_counts(slab.lite.tier);
     let mut bufs = CoreChunkBuffers {
-        quad_in: [[B::Stereo8::zero(); MAX_CORE_QUADS]; 8],
-        pre_conv_acc: [B::Stereo8::zero(); 8],
-        direct_acc: [B::Stereo8::zero(); 8],
+        quad_in: [[B::Stereo8::zero(); MAX_CORE_QUADS]; 16],
+        pre_conv_acc: [B::Stereo8::zero(); 16],
+        direct_acc: [B::Stereo8::zero(); 16],
     };
 
-    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[..4] {
+    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[..3] {
         if q < num_quads {
             eval_core_quad_chunk_pass::<B, true>(q, num_tiles, slab, inputs, &mut bufs);
         }
     }
-    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[4..] {
+    for &q in &SONA_ULTRA_QUAD_TRAVERSAL_ORDER[3..] {
         if q < num_quads {
             eval_core_quad_chunk_pass::<B, false>(q, num_tiles, slab, inputs, &mut bufs);
         }
@@ -326,7 +388,7 @@ pub(super) fn eval_core_quads_quad_major<B: GraphBackend>(
     let one_m_p = 1.0 - pole;
     let [mut lp_l, mut lp_r] = slab.lite.hp_lp_state;
     let rg = slab.lite.ro_gains_fp16.map(fp16_to_f32);
-    let mut sub_out = [[0.0_f32; 4]; 8];
+    let mut sub_out = [[0.0_f32; 4]; 16];
     for s in 0..num_sub {
         let (pl, pr) = bufs.pre_conv_acc[s].into_lr();
         let (dl, dr) = bufs.direct_acc[s].into_lr();
@@ -346,21 +408,45 @@ pub(super) fn eval_core_quads_quad_major<B: GraphBackend>(
 
     let mut pre_lr = [[0.0_f32; 2]; 4];
     let mut dir_lr = [[0.0_f32; 2]; 4];
-    if num_sub == 8 {
-        let os_params = slab.os2x_hot.os_params;
-        for f in 0..4 {
-            let d = slab.os2x_hot.os_stereo.downsample_4ch::<B>(
-                sub_out[2 * f],
-                sub_out[2 * f + 1],
-                &os_params,
-            );
-            pre_lr[f] = [d[0], d[1]];
-            dir_lr[f] = [d[2], d[3]];
+    match (inputs.is_master, inputs.m_core) {
+        (false, 2) => {
+            for f in 0..4 {
+                let d = slab
+                    .lite
+                    .live_os
+                    .downsample_4ch::<B>(sub_out[2 * f], sub_out[2 * f + 1]);
+                pre_lr[f] = [d[0], d[1]];
+                dir_lr[f] = [d[2], d[3]];
+            }
         }
-    } else {
-        for f in 0..4 {
-            pre_lr[f] = [sub_out[f][0], sub_out[f][1]];
-            dir_lr[f] = [sub_out[f][2], sub_out[f][3]];
+        (true, 4) => {
+            for f in 0..4 {
+                let b = 4 * f;
+                let d = slab.cold_mut().master_os.downsample_4x_to_1x::<B>([
+                    sub_out[b],
+                    sub_out[b + 1],
+                    sub_out[b + 2],
+                    sub_out[b + 3],
+                ]);
+                pre_lr[f] = [d[0], d[1]];
+                dir_lr[f] = [d[2], d[3]];
+            }
+        }
+        (true, 2) => {
+            for f in 0..4 {
+                let d = slab
+                    .cold_mut()
+                    .master_os
+                    .downsample_2x_to_1x::<B>([sub_out[2 * f], sub_out[2 * f + 1]]);
+                pre_lr[f] = [d[0], d[1]];
+                dir_lr[f] = [d[2], d[3]];
+            }
+        }
+        _ => {
+            for f in 0..4 {
+                pre_lr[f] = [sub_out[f][0], sub_out[f][1]];
+                dir_lr[f] = [sub_out[f][2], sub_out[f][3]];
+            }
         }
     }
     tel.last_s2_dir = [pre_lr[3][0], pre_lr[3][1], dir_lr[3][0], dir_lr[3][1]];
@@ -401,8 +487,8 @@ mod tests {
     use crate::bin::{
         Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, ControlClampDescriptorWire,
         DNBN_FLAG_SINGLE_INPUT, DNBN_FLAG_STEREO_OUT, DNBN_FLAG_WET_POLARITY_INV,
-        DnamBinBuildInput, DnamBinView, SONA_META_CORE_MODS_PRESENT, SONA_META_OS_EXT_PRESENT,
-        SONA_META_SENSORY_QUAD, encode_dnam_bin_into,
+        DnamBinBuildInput, DnamBinView, SONA_META_GRA_CONTROL_BUS, SONA_META_OS_EXT_PRESENT,
+        SONA_META_OS2X, SONA_META_SENSORY_QUAD, encode_dnam_bin_into,
     };
     use crate::graph::GraphBackend;
     use crate::graph::slab::hydrate::hydrate_slab_owned;
@@ -412,23 +498,21 @@ mod tests {
     use zerocopy::FromZeros;
     use zerocopy::byteorder::little_endian::{F32, U16, U32};
 
-    fn build_rich_parity_bin(
-        os_all_tiers: bool,
-        single_input: bool,
-        mono_out: bool,
-    ) -> ([u8; 32_768], usize) {
+    fn build_rich_parity_bin(single_input: bool, mono_out: bool) -> ([u8; 32_768], usize) {
         let mut a0 = DnamBinBuildInput::default_arena0_lite();
-        let meta_flags =
-            SONA_META_SENSORY_QUAD | SONA_META_OS_EXT_PRESENT | SONA_META_CORE_MODS_PRESENT;
+        let meta_flags = SONA_META_OS2X
+            | SONA_META_SENSORY_QUAD
+            | SONA_META_OS_EXT_PRESENT
+            | SONA_META_GRA_CONTROL_BUS;
         a0.crossbar.sona_meta_flags = U32::new(meta_flags);
         a0.crossbar.cell_desc.cell_flags = U32::new(meta_flags);
         a0.crossbar.cell_desc.tier_flags = U16::new(0x000F);
-        a0.crossbar.cell_desc.oversample_factor = U16::new(if os_all_tiers { 2 } else { 1 });
+        a0.crossbar.cell_desc.oversample_factor = U16::new(2);
         a0.crossbar.crossbar_op_gains_fp16 =
             [U16::new(f32_to_fp16(0.35)), U16::new(f32_to_fp16(-0.25))];
         a0.crossbar.op_n_pre_base.gamma_bc = F32::new(0.4);
         a0.crossbar.op_n_pre_base.zoh_hold_depth = F32::new(0.3);
-        a0.crossbar.op_n_pre_base.beta_q = F32::new(0.8);
+        a0.crossbar.op_n_pre_base.beta_q_fp16 = U16::new(f32_to_fp16(0.8));
         a0.crossbar.phasor_freq_hz = [110.0, 220.0, 330.0, 440.0].map(F32::new);
         a0.crossbar.carrier_basis_w_fp16 = [
             [0.2, -0.1, 0.15, 0.05].map(|v| U16::new(f32_to_fp16(v))),
@@ -456,11 +540,11 @@ mod tests {
             a0.core_quads[q].lru_alpha_rel = [F32::new(0.95); 4];
             a0.core_quads[q].lru_alpha_atk = [F32::new(0.25); 4];
             a0.core_quads[q].lru_kappa_fp16 = [U16::new(f32_to_fp16(0.2)); 4];
-            a0.core_quads[q].tone_lp_fp16 = [U16::new(f32_to_fp16(0.5)); 4];
-            a0.core_quads[q].tone_dir_fp16 = [U16::new(f32_to_fp16(0.7)); 4];
+            a0.core_quads[q].c_lp_fp16 = [U16::new(f32_to_fp16(0.5)); 4];
+            a0.core_quads[q].c_u_fp16 = [U16::new(f32_to_fp16(0.7)); 4];
             a0.core_quads[q].wavefolder_mix_fp16 = [U16::new(f32_to_fp16(0.15)); 4];
         }
-        for t in 0..3 {
+        for t in 0..5 {
             a0.tiles[t].w_odd_4x4 = [[F32::new(0.08); 4]; 4];
             a0.tiles[t].w_even_4x4_fp16 = [[U16::new(f32_to_fp16(0.04)); 4]; 4];
             a0.tiles[t].w_lru_4x4_fp16 = [[U16::new(f32_to_fp16(0.03)); 4]; 4];
@@ -472,7 +556,8 @@ mod tests {
             a0.conv_fir_lite.fir_r[i] = F32::new(-((i as f32) + 1.0) * 0.002);
         }
         a0.conv_kautz_lite[0].r_low = [F32::new(0.75); 4];
-        a0.conv_kautz_lite[0].dr = [F32::new(0.05); 4];
+        a0.conv_kautz_lite[0].onset_delay_samp = [U16::new(0); 4];
+        a0.conv_kautz_lite[0].c_cross_fp16 = [U16::new(0); 4];
         a0.conv_kautz_lite[0].theta = [F32::new(0.25); 4];
         a0.conv_kautz_lite[0].b_gamma = [F32::new(0.2); 4];
         a0.conv_kautz_lite[0].c_re_l = [F32::new(0.3); 4];
@@ -540,24 +625,24 @@ mod tests {
 
     fn verify_block_vs_step_frame_zero_ulp<B: GraphBackend>(
         tier: Tier,
-        os_all_tiers: bool,
+        master: bool,
         single_input: bool,
         mono_out: bool,
         trigger_xfade: bool,
     ) {
-        let (bin, bin_len) = build_rich_parity_bin(os_all_tiers, single_input, mono_out);
+        let (bin, bin_len) = build_rich_parity_bin(single_input, mono_out);
         let view = DnamBinView::parse(&bin[..bin_len]).unwrap();
 
         let init_tier = if trigger_xfade { Tier::Ultra } else { tier };
-        let mut slab_a = hydrate_slab_owned::<B>(&view, init_tier, 48_000.0, false).unwrap();
-        let mut slab_b = hydrate_slab_owned::<B>(&view, init_tier, 48_000.0, false).unwrap();
+        let mut slab_a = hydrate_slab_owned::<B>(&view, init_tier, 48_000.0, master).unwrap();
+        let mut slab_b = hydrate_slab_owned::<B>(&view, init_tier, 48_000.0, master).unwrap();
 
         if trigger_xfade && tier != Tier::Ultra {
             switch_tier(&mut slab_a, tier).unwrap();
             switch_tier(&mut slab_b, tier).unwrap();
             assert!(slab_a.xfade_active());
         }
-        assert_eq!(slab_a.os2x(), tier != Tier::Lite && os_all_tiers);
+        assert!(slab_a.os2x());
 
         // 53 frames: exercises multiple 16-frame 3 kHz ticks, 4-frame microchunks, and peel.
         let mut in_l = [0.0_f32; 53];

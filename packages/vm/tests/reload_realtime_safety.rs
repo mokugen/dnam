@@ -57,13 +57,13 @@ fn build_lite_inline_model() -> Vec<u8> {
     let mut a0 = DnamBinBuildInput::default_arena0_lite();
     a0.crossbar.crossbar_op_gains_fp16 = [U16::new(f32_to_fp16(0.5)), U16::new(f32_to_fp16(0.25))];
     a0.core_quads[0].svf_g = [0.22; 4].map(F32::new);
-    a0.core_quads[0].tone_dir_fp16 = [U16::new(f32_to_fp16(0.8)); 4];
+    a0.core_quads[0].c_u_fp16 = [U16::new(f32_to_fp16(0.8)); 4];
     a0.linear_readout_lite.w_ro_fp16[0] = U16::new(f32_to_fp16(0.4));
     a0.linear_readout_lite.w_ro_fp16[1] = U16::new(f32_to_fp16(0.3));
     a0.control_bus_lite.tank_dry_mix_fp16 = U16::new(f32_to_fp16(0.5));
     a0.control_bus_lite.cp1_dir.cp1_dir_count = U16::new(1);
     a0.control_bus_lite.cp1_dir.entries[0] = [0, 0x01, 0];
-    a0.control_bus_lite.cp1_base[..4].copy_from_slice(F32::new(0.25).as_bytes());
+    a0.control_bus_lite.gra_lite[..4].copy_from_slice(F32::new(0.25).as_bytes());
     a0.control_bus_lite.w_ctrl[0][0] = F32::new(0.15);
     a0.transport_lite.delay_samples = [24.0, 32.0, 40.0, 48.0].map(F32::new);
     a0.transport_lite.g_loop = F32::new(0.35);
@@ -98,8 +98,8 @@ fn build_ultra_ext_model(want_f32: bool, num_controls: usize, with_tsyn: bool) -
     a0.crossbar.crossbar_op_gains_fp16 = [U16::new(f32_to_fp16(0.35)), U16::new(f32_to_fp16(0.45))];
     for q in 0..4 {
         a0.core_quads[q].svf_g = [0.31; 4].map(F32::new);
-        a0.core_quads[q].tone_lp_fp16 = [U16::new(f32_to_fp16(0.6)); 4];
-        a0.core_quads[q].tone_dir_fp16 = [U16::new(f32_to_fp16(0.4)); 4];
+        a0.core_quads[q].c_lp_fp16 = [U16::new(f32_to_fp16(0.6)); 4];
+        a0.core_quads[q].c_u_fp16 = [U16::new(f32_to_fp16(0.4)); 4];
         a0.core_quads[q].adaa_drive_fp16 = [U16::new(f32_to_fp16(1.2)); 4];
     }
     a0.linear_readout_lite.w_ro_fp16[0] = U16::new(f32_to_fp16(-0.25));
@@ -185,7 +185,7 @@ fn test_owned_headroom_reload_zero_alloc_zero_drop_and_0ulp_parity() {
     assert_eq!(vm_small.telemetry().active_tier, Tier::Lite);
     assert_eq!(capture_backing_signature(&vm_small), small_sig);
 
-    // Also verify undersized ext-ring headroom fails closed at 4x bounce (`1024 > 512`) without disturbing backing pointers.
+    // Also verify undersized ext-ring headroom fails closed when retiming to 192 kHz (1024 > 512) without disturbing backing pointers.
     let small_ring_headroom =
         VmReloadHeadroom::for_live_engine().with_transport_headroom(512, 512, 512);
     let mut vm_small_ring =
@@ -198,7 +198,7 @@ fn test_owned_headroom_reload_zero_alloc_zero_drop_and_0ulp_parity() {
         .unwrap();
     let small_ring_sig = capture_backing_signature(&vm_small_ring);
     let ring_err = vm_small_ring
-        .reload_from_view_in_place(&view_u_f32, Tier::Ultra, 48_000.0, true)
+        .reload_from_view_in_place(&view_u_f32, Tier::Ultra, 192_000.0, true)
         .unwrap_err();
     assert_eq!(ring_err, VmError::InsufficientBackingCapacity);
     assert_eq!(capture_backing_signature(&vm_small_ring), small_ring_sig);

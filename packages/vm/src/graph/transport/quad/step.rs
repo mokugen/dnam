@@ -353,8 +353,8 @@ mod tests {
     #[test]
     fn test_tapered_ramp_spans_mu_freeze_blend_and_full_hold_freeze() {
         let mut inline_ring = [[0_u16; 4]; TRANSPORT_INLINE_QUAD0_CAP];
-        inline_ring[120] = [f32_to_fp16(0.5); 4];
-        inline_ring[110] = [f32_to_fp16(1.0); 4];
+        inline_ring[TRANSPORT_INLINE_QUAD0_CAP - 8] = [f32_to_fp16(0.5); 4];
+        inline_ring[TRANSPORT_INLINE_QUAD0_CAP - 18] = [f32_to_fp16(1.0); 4];
 
         let mut ap_wire = TransportQuadWire::new_zeroed();
         ap_wire.allpass_delays = [7, 0, 0, 0];

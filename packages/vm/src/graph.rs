@@ -1,4 +1,4 @@
-//! Real-time Layer 0 `SONA v3.0` DSP graph, `ConvolverBackend` / `GraphBackend` traits, and
+//! Real-time Layer 0 `SONA v4.0` DSP graph, `ConvolverBackend` / `GraphBackend` traits, and
 //! cache-locked L1D `SonaHotSlab` (`#![no_std]`, `#![forbid(unsafe_code)]`, `0 FDIV`, `0 FSQRT`).
 //!
 //! Organizes dual-rate [`zoh`], continuous `4`-lane [`sensory`] bank, zero-lag `2x`/`4x`
@@ -26,8 +26,8 @@ pub use convolver::{
     process_convolver_48k_chunk,
 };
 pub use oversample::{
-    Bounce4xDecimator, Bounce4xOversampler, OFFLINE_BOUNCE_PDC_SAMPLES, SonaOs2xHot,
-    SonaOversamplerParams, SonaStereoOversampler2x,
+    CoreOversampler, CoreOversamplerLiveHot, CoreOversamplerMasterCold,
+    MASTER_CTRL_DELAY_MICROCHUNKS, MasterCtrlDelayRingCold, MasterCtrlSnapshotCold, RenderMode,
 };
 pub use sensory::{SensoryChunkRegs, SensoryParamsHot, SensoryQuadCold, SensoryQuadHot};
 pub use slab::{
@@ -35,14 +35,14 @@ pub use slab::{
     CrossbarFrame, FLAG_COLD_FIR_EXT, FLAG_CROSSBAR_ACTIVE, FLAG_MONO_OUT, FLAG_OS2X,
     FLAG_SINGLE_INPUT, FLAG_WET_POLARITY_INV, FLAG_XFADE_ACTIVE, MAX_CORE_QUADS, MAX_SONA_TILES,
     MAX_TOTAL_SONA_LANES, NUM_SONA_BLOCKS, SONA_BLOCK_QUAD_SLOTS, SONA_CORE_QUAD_BLOCK_AND_LOCAL,
-    SONA_FULL_HOT_DELTA_BYTES, SONA_INTERBLOCK_TILES, SONA_LITE_HOT_BYTES, SONA_OS2X_HOT_BYTES,
+    SONA_FULL_HOT_DELTA_BYTES, SONA_INTERBLOCK_TILES, SONA_LITE_HOT_BYTES,
     SONA_PRO_HOT_DELTA_BYTES, SONA_ULTRA_HOT_DELTA_BYTES, SONA_ULTRA_QUAD_TRAVERSAL_ORDER,
     SonaColdTail, SonaFullHotDelta, SonaHotSlab, SonaInterBlockTileHot, SonaLiteHotPrefix,
     SonaProHotDelta, SonaSlabBacking, SonaUltraHotDelta, TIER_SWITCH_XFADE_SAMPLES,
     TierCrossbarSnapshot, evaluate_matryoshka_core_quads, hoist_core_quads_and_readouts,
     hydrate_slab_from_dnam_bin, latch_immediate_at_init_or_reset, process_block_sona,
     process_tick16_const, reset_to_dc_equilibrium, retime_sample_rate, set_offline_bounce,
-    set_op_t_write_enable, set_quad_write_enable, step_control_tick_3khz, step_frame_4x_sona,
+    set_op_t_write_enable, set_quad_write_enable, set_render_mode, step_control_tick_3khz,
     step_frame_sona, switch_tier,
 };
 #[cfg(feature = "alloc")]
@@ -79,7 +79,7 @@ pub trait ConvolverBackend: MathBackend {
     ) -> (f32, f32);
 }
 
-/// Complete real-time `SONA v3.0` DSP graph SIMD backend capability trait across all 8 ISA targets.
+/// Complete real-time `SONA v4.0` DSP graph SIMD backend capability trait across all 8 ISA targets.
 pub trait GraphBackend: MathBackend + ConvolverBackend {
     /// Processes a stereo audio block on `slab` (`#[target_feature]`-specialized on `X86Avx2Fma`).
     #[inline(always)]
@@ -105,18 +105,14 @@ pub trait GraphBackend: MathBackend + ConvolverBackend {
         slab.process_tick16_const(in_l, in_r, out_l, out_r)
     }
 
-    /// Steps one stereo host sample (`1x` live or `4x` offline bounce) on `slab`.
+    /// Steps one stereo host sample (`RenderMode::Live` or `RenderMode::Master`) on `slab`.
     #[inline(always)]
     fn step_frame_slab(
         slab: &mut SonaHotSlab<'_, Self>,
         in_l: f32,
         in_r: f32,
     ) -> Result<(f32, f32), VmError> {
-        if slab.cold().offline_bounce {
-            step_frame_4x_sona(slab, in_l, in_r)
-        } else {
-            step_frame_sona(slab, in_l, in_r)
-        }
+        step_frame_sona(slab, in_l, in_r)
     }
 
     /// Executes one `3 kHz` control boundary tick on `slab`.

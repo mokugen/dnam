@@ -99,18 +99,6 @@ impl SonaTierSpec {
     }
 }
 
-/// `v3.0` `Lite` compile-time tier capacity profile (`[1, 1, 1, 1]`, `16` lanes @ `1x`).
-pub const LITE_SPEC: SonaTierSpec = SonaTierSpec::new([1, 1, 1, 1], 32, 8, 1, 1);
-
-/// `v3.0` `Full` compile-time tier capacity profile (`[2, 2, 1, 1]`, `24` lanes @ `2x`).
-pub const FULL_SPEC: SonaTierSpec = SonaTierSpec::new([2, 2, 1, 1], 48, 12, 2, 2);
-
-/// `v3.0` `Pro` compile-time tier capacity profile (`[3, 2, 2, 1]`, `32` lanes @ `2x`).
-pub const PRO_SPEC: SonaTierSpec = SonaTierSpec::new([3, 2, 2, 1], 96, 24, 3, 2);
-
-/// `v3.0` `Ultra` compile-time tier capacity profile (`[4, 3, 2, 1]`, `40` lanes @ `2x`).
-pub const ULTRA_SPEC: SonaTierSpec = SonaTierSpec::new([4, 3, 2, 1], 128, 32, 4, 2);
-
 /// `SONA v4.0` `Lite` compile-time tier profile (`[1, 1, 1, 1]`, `16` lanes @ `2x HB-FIR`, `5` tiles).
 pub const LITE_V4_SPEC: SonaTierSpec = SonaTierSpec::new([1, 1, 1, 1], 32, 8, 1, 2);
 
@@ -122,6 +110,18 @@ pub const PRO_V4_SPEC: SonaTierSpec = SonaTierSpec::new([2, 2, 2, 2], 96, 24, 3,
 
 /// `SONA v4.0` `Ultra` compile-time tier profile (`[3, 3, 2, 2]`, `40` lanes @ `2x HB-FIR`, `37` tiles).
 pub const ULTRA_V4_SPEC: SonaTierSpec = SonaTierSpec::new([3, 3, 2, 2], 128, 32, 4, 2);
+
+/// `SONA v4.0` `Lite` compile-time tier capacity profile (`[1, 1, 1, 1]`, `16` lanes @ `2x HB-FIR`).
+pub const LITE_SPEC: SonaTierSpec = LITE_V4_SPEC;
+
+/// `SONA v4.0` `Full` compile-time tier capacity profile (`[2, 2, 1, 1]`, `24` lanes @ `2x HB-FIR`).
+pub const FULL_SPEC: SonaTierSpec = FULL_V4_SPEC;
+
+/// `SONA v4.0` `Pro` compile-time tier capacity profile (`[2, 2, 2, 2]`, `32` lanes @ `2x HB-FIR`).
+pub const PRO_SPEC: SonaTierSpec = PRO_V4_SPEC;
+
+/// `SONA v4.0` `Ultra` compile-time tier capacity profile (`[3, 3, 2, 2]`, `40` lanes @ `2x HB-FIR`).
+pub const ULTRA_SPEC: SonaTierSpec = ULTRA_V4_SPEC;
 
 /// Canonical `SONA v4.0` global `(block_idx, local_quad_idx)` assignment for `CoreQuad` slots `0..10`
 /// (`ref[arch.simd.lane-packing]`).
@@ -323,7 +323,7 @@ const _: () = assert!(LITE_SPEC.svf_quads * 4 == LITE_SPEC.lanes());
 const _: () = assert!(FULL_SPEC.svf_quads * 4 == FULL_SPEC.lanes());
 const _: () = assert!(PRO_SPEC.svf_quads * 4 == PRO_SPEC.lanes());
 const _: () = assert!(ULTRA_SPEC.svf_quads * 4 == ULTRA_SPEC.lanes());
-const _: () = assert!(verify_tier_spec(&LITE_SPEC, 4, 1, 32, 8, 1));
+const _: () = assert!(verify_tier_spec(&LITE_SPEC, 4, 1, 32, 8, 2));
 const _: () = assert!(verify_tier_spec(&FULL_SPEC, 6, 2, 48, 12, 2));
 const _: () = assert!(verify_tier_spec(&PRO_SPEC, 8, 3, 96, 24, 2));
 const _: () = assert!(verify_tier_spec(&ULTRA_SPEC, 10, 4, 128, 32, 2));
@@ -351,7 +351,7 @@ mod tests {
     /// verify[dsp.op-n.core.interblock-tiles]
     #[test]
     fn test_v3_and_v4_tier_specs_matryoshka_and_37_tile_topology() {
-        assert!(verify_tier_spec(&LITE_SPEC, 4, 1, 32, 8, 1));
+        assert!(verify_tier_spec(&LITE_SPEC, 4, 1, 32, 8, 2));
         assert!(verify_tier_spec(&FULL_SPEC, 6, 2, 48, 12, 2));
         assert!(verify_tier_spec(&PRO_SPEC, 8, 3, 96, 24, 2));
         assert!(verify_tier_spec(&ULTRA_SPEC, 10, 4, 128, 32, 2));

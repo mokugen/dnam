@@ -21,7 +21,7 @@ use crate::types::{Tier, VmError};
 
 use super::SonaVm;
 
-/// Runtime-dispatched owned `SONA v3.0` VM selecting the host's highest safe SIMD backend.
+/// Runtime-dispatched owned `SONA v4.0` VM selecting the host's highest safe SIMD backend.
 pub enum DynamicSonaVm {
     Scalar(Box<SonaVm<'static, ScalarBackend>>),
     #[cfg(target_arch = "aarch64")]
@@ -120,13 +120,13 @@ impl DynamicSonaVm {
         offline_bounce: bool,
         backend: BackendKind,
     ) -> Result<Self, VmError> {
-        Self::from_view_with_headroom_and_backend(
+        Self::from_view_dispatch(
             view,
             active_tier,
             host_rate_hz,
             offline_bounce,
             backend,
-            VmReloadHeadroom::zero(),
+            None,
         )
     }
 
@@ -170,111 +170,129 @@ impl DynamicSonaVm {
         backend: BackendKind,
         headroom: VmReloadHeadroom,
     ) -> Result<Self, VmError> {
+        Self::from_view_dispatch(
+            view,
+            active_tier,
+            host_rate_hz,
+            offline_bounce,
+            backend,
+            Some(headroom),
+        )
+    }
+
+    fn open_typed<B: crate::graph::GraphBackend>(
+        view: &DnamBinView<'_>,
+        active_tier: Tier,
+        host_rate_hz: f32,
+        offline_bounce: bool,
+        headroom: Option<VmReloadHeadroom>,
+    ) -> Result<Box<SonaVm<'static, B>>, VmError> {
+        let vm = match headroom {
+            Some(hr) => SonaVm::<B>::from_view_owned_with_headroom(
+                view,
+                active_tier,
+                host_rate_hz,
+                offline_bounce,
+                hr,
+            )?,
+            None => SonaVm::<B>::from_view_owned(view, active_tier, host_rate_hz, offline_bounce)?,
+        };
+        Ok(Box::new(vm))
+    }
+
+    fn from_view_dispatch(
+        view: &DnamBinView<'_>,
+        active_tier: Tier,
+        host_rate_hz: f32,
+        offline_bounce: bool,
+        backend: BackendKind,
+        headroom: Option<VmReloadHeadroom>,
+    ) -> Result<Self, VmError> {
         warm_simd_feature_caches();
         match backend {
             #[cfg(target_arch = "aarch64")]
-            BackendKind::ArmNeon | BackendKind::Neon => Ok(Self::ArmNeon(Box::new(
-                SonaVm::<NeonBackend>::from_view_owned_with_headroom(
-                    view,
-                    active_tier,
-                    host_rate_hz,
-                    offline_bounce,
-                    headroom,
-                )?,
-            ))),
+            BackendKind::ArmNeon | BackendKind::Neon => Ok(Self::ArmNeon(Self::open_typed(
+                view,
+                active_tier,
+                host_rate_hz,
+                offline_bounce,
+                headroom,
+            )?)),
             #[cfg(target_arch = "aarch64")]
-            BackendKind::ArmSve2 => Ok(Self::ArmSve2(Box::new(
-                SonaVm::<ArmSve2Backend>::from_view_owned_with_headroom(
-                    view,
-                    active_tier,
-                    host_rate_hz,
-                    offline_bounce,
-                    headroom,
-                )?,
-            ))),
+            BackendKind::ArmSve2 => Ok(Self::ArmSve2(Self::open_typed(
+                view,
+                active_tier,
+                host_rate_hz,
+                offline_bounce,
+                headroom,
+            )?)),
             #[cfg(target_arch = "aarch64")]
-            BackendKind::ArmSme => Ok(Self::ArmSme(Box::new(
-                SonaVm::<ArmSmeBackend>::from_view_owned_with_headroom(
-                    view,
-                    active_tier,
-                    host_rate_hz,
-                    offline_bounce,
-                    headroom,
-                )?,
-            ))),
+            BackendKind::ArmSme => Ok(Self::ArmSme(Self::open_typed(
+                view,
+                active_tier,
+                host_rate_hz,
+                offline_bounce,
+                headroom,
+            )?)),
             #[cfg(target_arch = "x86_64")]
-            BackendKind::X86Sse2 => Ok(Self::X86Sse2(Box::new(
-                SonaVm::<X86Sse2Backend>::from_view_owned_with_headroom(
-                    view,
-                    active_tier,
-                    host_rate_hz,
-                    offline_bounce,
-                    headroom,
-                )?,
-            ))),
+            BackendKind::X86Sse2 => Ok(Self::X86Sse2(Self::open_typed(
+                view,
+                active_tier,
+                host_rate_hz,
+                offline_bounce,
+                headroom,
+            )?)),
             #[cfg(target_arch = "x86_64")]
-            BackendKind::X86Sse42 => Ok(Self::X86Sse42(Box::new(
-                SonaVm::<X86Sse42Backend>::from_view_owned_with_headroom(
-                    view,
-                    active_tier,
-                    host_rate_hz,
-                    offline_bounce,
-                    headroom,
-                )?,
-            ))),
+            BackendKind::X86Sse42 => Ok(Self::X86Sse42(Self::open_typed(
+                view,
+                active_tier,
+                host_rate_hz,
+                offline_bounce,
+                headroom,
+            )?)),
             #[cfg(target_arch = "x86_64")]
             BackendKind::X86Avx2Fma | BackendKind::X86Simd => {
                 if X86Avx2FmaBackend::is_supported_cached() {
-                    Ok(Self::X86Avx2Fma(Box::new(
-                        SonaVm::<X86Avx2FmaBackend>::from_view_owned_with_headroom(
-                            view,
-                            active_tier,
-                            host_rate_hz,
-                            offline_bounce,
-                            headroom,
-                        )?,
-                    )))
+                    Ok(Self::X86Avx2Fma(Self::open_typed(
+                        view,
+                        active_tier,
+                        host_rate_hz,
+                        offline_bounce,
+                        headroom,
+                    )?))
                 } else if X86Sse42Backend::is_supported_cached() {
-                    Ok(Self::X86Sse42(Box::new(
-                        SonaVm::<X86Sse42Backend>::from_view_owned_with_headroom(
-                            view,
-                            active_tier,
-                            host_rate_hz,
-                            offline_bounce,
-                            headroom,
-                        )?,
-                    )))
+                    Ok(Self::X86Sse42(Self::open_typed(
+                        view,
+                        active_tier,
+                        host_rate_hz,
+                        offline_bounce,
+                        headroom,
+                    )?))
                 } else {
-                    Ok(Self::X86Sse2(Box::new(
-                        SonaVm::<X86Sse2Backend>::from_view_owned_with_headroom(
-                            view,
-                            active_tier,
-                            host_rate_hz,
-                            offline_bounce,
-                            headroom,
-                        )?,
-                    )))
+                    Ok(Self::X86Sse2(Self::open_typed(
+                        view,
+                        active_tier,
+                        host_rate_hz,
+                        offline_bounce,
+                        headroom,
+                    )?))
                 }
             }
             #[cfg(target_arch = "wasm32")]
-            BackendKind::WasmSimd128 => Ok(Self::WasmSimd128(Box::new(
-                SonaVm::<WasmSimd128Backend>::from_view_owned_with_headroom(
-                    view,
-                    active_tier,
-                    host_rate_hz,
-                    offline_bounce,
-                    headroom,
-                )?,
-            ))),
-            _ => Ok(Self::Scalar(Box::new(
-                SonaVm::<ScalarBackend>::from_view_owned_with_headroom(
-                    view,
-                    active_tier,
-                    host_rate_hz,
-                    offline_bounce,
-                    headroom,
-                )?,
-            ))),
+            BackendKind::WasmSimd128 => Ok(Self::WasmSimd128(Self::open_typed(
+                view,
+                active_tier,
+                host_rate_hz,
+                offline_bounce,
+                headroom,
+            )?)),
+            _ => Ok(Self::Scalar(Self::open_typed(
+                view,
+                active_tier,
+                host_rate_hz,
+                offline_bounce,
+                headroom,
+            )?)),
         }
     }
 
@@ -409,7 +427,7 @@ mod tests {
             arena2: None,
             arena3: None,
         };
-        let mut buf = [0_u8; 128 + 4_608];
+        let mut buf = [0_u8; 128 + crate::bin::ARENA0_LITE_BYTES];
         let n = encode_dnam_bin_into(&input, &mut buf).unwrap();
         let mut vm_best = DynamicSonaVm::open_dnam_bin(&buf[..n], Tier::Lite, 48_000.0).unwrap();
         let mut vm_pre =
@@ -473,7 +491,7 @@ mod tests {
             arena2: None,
             arena3: None,
         };
-        let mut buf = [0_u8; 128 + 4_608 + 512];
+        let mut buf = [0_u8; 128 + crate::bin::ARENA0_LITE_BYTES + 512];
         let n = encode_dnam_bin_into(&input, &mut buf).unwrap();
 
         let kinds: &[BackendKind] = &[
@@ -502,7 +520,7 @@ mod tests {
             )
             .unwrap();
             vm.set_live_analog_drift_enabled(true);
-            assert_eq!(vm.get_latency_samples(), 0);
+            assert_eq!(vm.get_latency_samples(), 7);
             assert_eq!(vm.saturation_flags(), 0);
             assert_eq!(vm.apply_tempo_bpm(f32::NAN), 0);
             assert_ne!(vm.saturation_flags(), 0);
@@ -523,8 +541,9 @@ mod tests {
             assert!(((core_lr[0] + wet_lr[0]) - ol).abs() < 1.0e-5);
             assert!(((core_lr[1] + wet_lr[1]) - or).abs() < 1.0e-5);
             vm.set_offline_bounce(true).unwrap();
-            assert_eq!(vm.get_latency_samples(), 12);
+            assert_eq!(vm.get_latency_samples(), 37);
             vm.set_offline_bounce(false).unwrap();
+            assert_eq!(vm.get_latency_samples(), 7);
             vm.retime_sample_rate(96_000.0).unwrap();
             let snap = vm.telemetry();
             assert_eq!(snap.active_tier, Tier::Lite);

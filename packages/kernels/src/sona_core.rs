@@ -29,9 +29,14 @@ pub use op_n_pre::{
     quantize_hermite_v4_f32, quantize_nearest_step_f32, quantize_smooth_fourier_f32,
 };
 pub use os2x_hbfir::{
-    HB15_DELAY_SAMPLES_1X, HB15_HIST_LEN, HB15_ODD_DELAY_LEN, HbFir15Downsampler4Ch,
-    HbFir15UpsamplerStereo, eval_hb15_downsample_4ch_vec4, eval_hb15_downsample_stereo,
-    eval_hb15_upsample_stereo,
+    CORE_OS_LIVE_LATENCY_1X, CORE_OS_MASTER_2X_LATENCY_1X, CORE_OS_MASTER_4X_LATENCY_1X,
+    HB15_DELAY_SAMPLES_1X, HB15_HIST_LEN, HB15_ODD_DELAY_LEN, HB23_DELAY_SAMPLES_4X, HB23_HIST_LEN,
+    HB23_ODD_DELAY_LEN, HB63_DELAY_SAMPLES_2X, HB63_HIST_LEN, HB63_ODD_DELAY_LEN,
+    HbFir15Downsampler4Ch, HbFir15UpsamplerStereo, HbFir23Downsampler4Ch, HbFir23UpsamplerStereo,
+    HbFir63Downsampler4Ch, HbFir63UpsamplerStereo, box2_quadrature_f32, box2_quadrature_stereo8,
+    eval_hb15_downsample_4ch_vec4, eval_hb15_downsample_stereo, eval_hb15_upsample_stereo,
+    eval_hb23_downsample_4ch_vec4, eval_hb23_upsample_stereo, eval_hb63_downsample_4ch_vec4,
+    eval_hb63_upsample_stereo,
 };
 
 use crate::simd::{KernelVec4, MAX_PARALRU_R_F32, StereoVec8};

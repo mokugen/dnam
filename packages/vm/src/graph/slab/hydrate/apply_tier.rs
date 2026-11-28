@@ -6,18 +6,16 @@
 use dnam_kernels::{
     MAX_PARALRU_R_F32, OP_N_PRE_MAX_BETA_Q, OP_N_PRE_MAX_ZOH_HOLD_DEPTH, OpNPreHoisted,
 };
-use zerocopy::byteorder::little_endian::F32;
+use zerocopy::byteorder::little_endian::{F32, U16};
 
 use crate::bin::{
     CONVOLVER_KAUTZ_BLOCKS_PER_TIER, DNBN_FLAG_SINGLE_INPUT, DNBN_FLAG_STEREO_OUT,
-    DNBN_FLAG_WET_POLARITY_INV, DnamBinView, OpNPreBaseWire, SONA_META_CORE_MODS_PRESENT,
-    SONA_META_OS_EXT_PRESENT,
+    DNBN_FLAG_WET_POLARITY_INV, DnamBinView, OpNPreBaseWire, SONA_META_OS_EXT_PRESENT,
 };
 use crate::graph::GraphBackend;
 use crate::graph::convolver::kautz::{
     KautzPrefixOverride, MAX_KAUTZ_BANKS, MAX_KAUTZ_PAIRS, hydrate_kautz_slice_and_zoh,
 };
-use crate::graph::oversample::SonaOs2xHot;
 use crate::graph::zoh::{ZohRateContext, rescale_paralru_lane};
 use crate::math::{
     clamp_finite_f32, const_abs_f64, f32_to_fp16, fp16_to_f32, powf_f64, rescale_tpt_svf_g_zoh,
@@ -27,11 +25,10 @@ use crate::types::{Tier, VmError};
 
 use super::super::layout::{
     FLAG_CROSSBAR_ACTIVE, FLAG_MONO_OUT, FLAG_SINGLE_INPUT, FLAG_WET_POLARITY_INV, MAX_CORE_QUADS,
-    MAX_SONA_TILES, MAX_TOTAL_SONA_LANES, NUM_SONA_BLOCKS, SonaHotSlab,
+    MAX_SONA_TILES, NUM_SONA_BLOCKS, SonaHotSlab,
 };
 use super::wire_decode::{
-    clamp_finite_fp16, compute_tier_os2x_flags, decode_core_quad_wire, decode_tile_wire,
-    fp16_sanitized,
+    clamp_finite_fp16, decode_core_quad_wire, decode_tile_wire, fp16_sanitized,
 };
 
 const RHO_UNITY_EPS_F64: f64 = 1.0e-12;
@@ -52,9 +49,9 @@ const FULL_FIR_END: usize = Tier::Full.early_fir_taps();
 const PRO_FIR_END: usize = Tier::Pro.early_fir_taps();
 const ULTRA_FIR_END: usize = Tier::Ultra.early_fir_taps();
 
-const LITE_TILE_END: usize = 3;
+const LITE_TILE_END: usize = 5;
 const FULL_TILE_END: usize = 13;
-const PRO_TILE_END: usize = 23;
+const PRO_TILE_END: usize = 24;
 const ULTRA_TILE_END: usize = MAX_SONA_TILES;
 
 const STAGE_LATENT_DEFAULTS_LEN: usize = 8;
@@ -70,21 +67,7 @@ const ULTRA_LATENT_DIM: usize = Tier::Ultra.stage_latent_dim();
 const ULTRA_CTRL_ADAA_END: usize = ULTRA_LATENT_DIM * ULTRA_QUAD_END;
 const ULTRA_CTRL_LRU_END: usize = ULTRA_CTRL_ADAA_END + ULTRA_LATENT_DIM * ULTRA_QUAD_END;
 
-const STAGE_CORE_MOD_ROW_STRIDE: usize = 128;
-const STAGE_CORE_MOD_ROW_MASK: usize = STAGE_CORE_MOD_ROW_STRIDE - 1;
-const STAGE_CORE_MOD_ACTIVE_COLS: usize = MAX_TOTAL_SONA_LANES * 3;
-
-const _: () = assert!(
-    LITE_QUAD_END == 4
-        && FULL_QUAD_END == 6
-        && PRO_QUAD_END == 8
-        && ULTRA_QUAD_END == MAX_CORE_QUADS
-);
-const _: () =
-    assert!(LITE_TANK_END == 4 && FULL_TANK_END == 8 && PRO_TANK_END == 12 && ULTRA_TANK_END == 16);
-const _: () =
-    assert!(LITE_FIR_END == 32 && FULL_FIR_END == 48 && PRO_FIR_END == 96 && ULTRA_FIR_END == 128);
-const _: () = assert!(ULTRA_TILE_END == 35);
+const _: () = assert!(ULTRA_TILE_END == 37);
 const _: () = assert!(
     STAGE_LATENT_QUAD_ADAA_START == 48
         && STAGE_LATENT_QUAD_ADAA_END == 64
@@ -92,12 +75,6 @@ const _: () = assert!(
         && STAGE_LATENT_OP_P_TO_CORE_END == 96
 );
 const _: () = assert!(ULTRA_CTRL_ADAA_END == 80 && ULTRA_CTRL_LRU_END == 160);
-const _: () = assert!(STAGE_CORE_MOD_ROW_STRIDE.is_power_of_two());
-const _: () = assert!(
-    STAGE_CORE_MOD_ACTIVE_COLS == 120
-        && STAGE_CORE_MOD_ACTIVE_COLS < STAGE_CORE_MOD_ROW_STRIDE
-        && ULTRA_LATENT_DIM * STAGE_CORE_MOD_ROW_STRIDE == 1_024
-);
 
 /// Computes hoisted [`OpNPreHoisted`] parameters with ZOH hold-depth exponentiation
 /// `z_h_eff = z_h^rho_vm` (`0` when `z_h <= 0`, exact `z_h` when `|rho_vm - 1.0| < 1e-12`).
@@ -221,14 +198,13 @@ pub(super) fn apply_tier_weights_and_rescale<B: GraphBackend>(
     let ro = clamp_finite_f32(slab.cold().ro_pole_48k, 0.0, MAX_PARALRU_R_F32, 0.0);
     slab.lite.hp_lp_pole = if ro <= 0.0 {
         0.0
-    } else if const_abs_f64(zoh.rho_core - 1.0) < RHO_UNITY_EPS_F64 {
+    } else if const_abs_f64(zoh.rho_vm - 1.0) < RHO_UNITY_EPS_F64 {
         ro.clamp(0.0, RO_POLE_MAX_EFFECTIVE)
     } else {
-        (powf_f64(f64::from(ro), zoh.rho_core) as f32).clamp(0.0, RO_POLE_MAX_EFFECTIVE)
+        (powf_f64(f64::from(ro), zoh.rho_vm) as f32).clamp(0.0, RO_POLE_MAX_EFFECTIVE)
     };
     slab.lite.tank_dry_mix_eff_fp16 = f32_to_fp16(slab.cold().base_tank_dry_mix);
     let cold = slab.cold_mut();
-    cold.core_mods_active = cold.core_mods_present && matches!(tier, Tier::Ultra);
     cold.active_kautz_blocks = active_banks;
     cold.active_transport_quads = t_idx + 1;
 
@@ -361,41 +337,44 @@ pub(super) fn populate_crossbar_and_core_quads<B: GraphBackend>(
                 OP_N_PRE_MAX_ZOH_HOLD_DEPTH,
                 0.0,
             )),
-            beta_q: F32::new(clamp_finite_f32(
-                cb.op_n_pre_base.beta_q.get(),
+            beta_q_fp16: U16::new(f32_to_fp16(clamp_finite_f32(
+                fp16_to_f32(cb.op_n_pre_base.beta_q_fp16.get()),
                 0.0,
                 OP_N_PRE_MAX_BETA_Q,
                 0.0,
-            )),
+            ))),
+            kappa_h_fp16: U16::new(f32_to_fp16(clamp_finite_f32(
+                fp16_to_f32(cb.op_n_pre_base.kappa_h_fp16.get()),
+                0.0,
+                1.0,
+                0.0,
+            ))),
         }
     } else {
         OpNPreBaseWire {
             gamma_bc: F32::new(0.0),
             zoh_hold_depth: F32::new(0.0),
-            beta_q: F32::new(0.0),
+            beta_q_fp16: U16::new(0),
+            kappa_h_fp16: U16::new(0),
         }
     };
-    slab.os2x_hot = if os_ext {
-        SonaOs2xHot::from_crossbar_wire(cb)
-    } else {
-        SonaOs2xHot::default()
-    };
+    slab.lite.live_os.reset();
+    slab.lite.op_p_prev_iq_lr = [0.0; 4];
+    slab.lite.op_p_prev_feat = [0.0; 4];
 
     let cold = slab.cold_mut();
     cold.wire_crossbar = *cb;
     cold.meta_flags = meta_flags;
-    cold.tier_os2x = compute_tier_os2x_flags(meta_flags, cb.cell_desc.oversample_factor.get());
     cold.tier_gain_trim = trims;
     cold.base_op_n_pre = op_n_pre_base;
     cold.op_n_pre_hoisted = compute_op_n_pre_hoisted(
         op_n_pre_base.gamma_bc.get(),
         op_n_pre_base.zoh_hold_depth.get(),
-        op_n_pre_base.beta_q.get(),
+        fp16_to_f32(op_n_pre_base.beta_q_fp16.get()),
         1.0,
     );
     cold.base_op_p_gain = op_p_gain;
     cold.base_op_t_gain = op_t_gain;
-    cold.core_mods_present = (meta_flags & SONA_META_CORE_MODS_PRESENT) != 0;
     for l in 0..4 {
         cold.base_phasor_freq_hz[l] = sanitize_finite_f32(cb.phasor_freq_hz[l].get());
         cold.base_phasor_init_phase_q32[l] = cb.phasor_init_phase_q32[l].get();
@@ -479,14 +458,6 @@ pub(super) fn populate_crossbar_and_core_quads<B: GraphBackend>(
                 ULTRA_CTRL_ADAA_END..ULTRA_CTRL_LRU_END => clamp_finite_fp16(bits, -2.0, 2.0, 0.0),
                 _ => 0,
             };
-        }
-        for (i, w) in a3.stage_latent_core_mods_fp16.iter().enumerate() {
-            slab.cold_mut().stage_latent_core_mods_fp16[i] =
-                if (i & STAGE_CORE_MOD_ROW_MASK) < STAGE_CORE_MOD_ACTIVE_COLS {
-                    fp16_sanitized(w.get())
-                } else {
-                    0
-                };
         }
     }
 }

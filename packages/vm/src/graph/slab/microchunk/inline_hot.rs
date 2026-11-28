@@ -10,9 +10,7 @@ use crate::graph::slab::ctrl_latch::{
     step_control_tick_3khz_inline,
 };
 use crate::graph::slab::layout::SonaHotSlab;
-use crate::math::{
-    CERTIFIED_INPUT_ENVELOPE_MIN_F32, sanitize_input_sample, sanitize_output_sample,
-};
+use crate::math::{CERTIFIED_INPUT_ENVELOPE_MIN_F32, sanitize_input_sample};
 use crate::types::VmError;
 
 use super::convolver_chunk::step_convolver_chunk4;
@@ -104,63 +102,6 @@ pub(super) fn step_frame_sona_inner<B: GraphBackend, const INLINE_HOT: bool>(
 }
 
 #[inline(always)]
-fn step_frame_4x_sona_with_telem<B: GraphBackend, const INLINE_HOT: bool>(
-    slab: &mut SonaHotSlab<'_, B>,
-    in_l: f32,
-    in_r: f32,
-    tel: &mut BlockTelemetry,
-) -> Result<(f32, f32), VmError> {
-    let in_r = if slab.single_input() { in_l } else { in_r };
-    let clean_l = sanitize_input_sample(in_l, CERTIFIED_INPUT_ENVELOPE_MIN_F32, &mut tel.sat_flags);
-    let clean_r = sanitize_input_sample(in_r, CERTIFIED_INPUT_ENVELOPE_MIN_F32, &mut tel.sat_flags);
-    let up4 = slab.cold.as_mut_slice()[0]
-        .bounce4x
-        .upsample_4x(clean_l, clean_r);
-    let mut sub_out = [[0.0_f32; 2]; 4];
-    let mut sub_core = [[0.0_f32; 2]; 4];
-    let mut sub_wet = [[0.0_f32; 2]; 4];
-    for (s, &[sl, sr]) in up4.iter().enumerate() {
-        let (ol, or) = step_frame_sona_with_telem::<B, INLINE_HOT>(slab, sl, sr, tel)?;
-        sub_out[s] = [ol, or];
-        sub_core[s] = tel.last_core_lr;
-        sub_wet[s] = tel.last_transport_wet_lr;
-    }
-    let (dl, dr, d_core_l, d_core_r, d_wet_l, d_wet_r) = {
-        let cold = slab.cold_mut();
-        let [dl, dr] = cold.bounce4x.downsample_4x(sub_out);
-        let [d_core_l, d_core_r] = cold.bounce4x_core_decim.downsample_4x(sub_core);
-        let [d_wet_l, d_wet_r] = cold.bounce4x_wet_decim.downsample_4x(sub_wet);
-        (dl, dr, d_core_l, d_core_r, d_wet_l, d_wet_r)
-    };
-    let (out_l, out_r) = (
-        sanitize_output_sample(dl, &mut tel.sat_flags),
-        sanitize_output_sample(dr, &mut tel.sat_flags),
-    );
-    let mut part_flags = 0_u32;
-    tel.last_core_lr = [
-        sanitize_output_sample(d_core_l, &mut part_flags),
-        sanitize_output_sample(d_core_r, &mut part_flags),
-    ];
-    tel.last_transport_wet_lr = [
-        sanitize_output_sample(d_wet_l, &mut part_flags),
-        sanitize_output_sample(d_wet_r, &mut part_flags),
-    ];
-    Ok((out_l, out_r))
-}
-
-#[inline(always)]
-pub(super) fn step_frame_4x_sona_inner<B: GraphBackend, const INLINE_HOT: bool>(
-    slab: &mut SonaHotSlab<'_, B>,
-    in_l: f32,
-    in_r: f32,
-) -> Result<(f32, f32), VmError> {
-    let mut tel = BlockTelemetry::begin_block(slab);
-    let res = step_frame_4x_sona_with_telem::<B, INLINE_HOT>(slab, in_l, in_r, &mut tel);
-    tel.flush_into(slab);
-    res
-}
-
-#[inline(always)]
 pub(super) fn process_microchunk_4_inner<B: GraphBackend, const INLINE_HOT: bool>(
     slab: &mut SonaHotSlab<'_, B>,
     in_l: &[f32],
@@ -233,22 +174,6 @@ pub(super) fn process_block_sona_inner<B: GraphBackend, const INLINE_HOT: bool>(
         return Ok(());
     }
     let mut tel = BlockTelemetry::begin_block(slab);
-    if slab.cold().offline_bounce {
-        for i in 0..n {
-            match step_frame_4x_sona_with_telem::<B, INLINE_HOT>(slab, in_l[i], in_r[i], &mut tel) {
-                Ok((yl, yr)) => {
-                    out_l[i] = yl;
-                    out_r[i] = yr;
-                }
-                Err(e) => {
-                    tel.flush_into(slab);
-                    return Err(e);
-                }
-            }
-        }
-        tel.flush_into(slab);
-        return Ok(());
-    }
 
     let mut idx = 0_usize;
     while idx < n {
@@ -312,17 +237,6 @@ pub(crate) fn step_frame_sona_inline<B: GraphBackend>(
     in_r: f32,
 ) -> Result<(f32, f32), VmError> {
     step_frame_sona_inner::<B, true>(slab, in_l, in_r)
-}
-
-/// Always-inlined `4x` bounce single-frame execution for `#[target_feature]` dispatchers.
-#[cfg(target_arch = "x86_64")]
-#[inline(always)]
-pub(crate) fn step_frame_4x_sona_inline<B: GraphBackend>(
-    slab: &mut SonaHotSlab<'_, B>,
-    in_l: f32,
-    in_r: f32,
-) -> Result<(f32, f32), VmError> {
-    step_frame_4x_sona_inner::<B, true>(slab, in_l, in_r)
 }
 
 /// Always-inlined block execution for `#[target_feature]` dispatchers (`0-ULP`).

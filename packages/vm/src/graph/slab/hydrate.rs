@@ -12,13 +12,14 @@ use alloc::vec;
 #[cfg(feature = "alloc")]
 use core::marker::PhantomData;
 
+#[cfg(feature = "alloc")]
+use dnam_kernels::QUAD_FLAG_HAS_EXT;
 use dnam_kernels::{
     HilbertH1StereoKernel, MAX_PARALRU_R_F32, compute_t1_dc_blocker_coeffs_clamped,
     interpolate_hilbert_h1_alphas_f64,
 };
 use zerocopy::FromZeros;
 
-use super::super::oversample::SonaOs2xHot;
 #[cfg(feature = "alloc")]
 use super::super::transport::ring::ExtRingAllocSpec;
 use super::layout::{
@@ -34,7 +35,7 @@ use crate::graph::GraphBackend;
 use crate::graph::convolver::high_sr::ConvolverHighSrFirExt;
 #[cfg(feature = "alloc")]
 use crate::graph::convolver::high_sr::EXT_FIR_STORAGE_F32_LEN;
-use crate::graph::oversample::{Bounce4xDecimator, Bounce4xOversampler};
+use crate::graph::oversample::{CoreOversamplerMasterCold, RenderMode};
 use crate::graph::sensory::{SensoryParamsHot, SensoryQuadCold};
 use crate::graph::transport::{
     PartitionedSchroederBank, QuadColdMeta, QuadEffectiveTargets, QuadHydrateConfig,
@@ -42,8 +43,6 @@ use crate::graph::transport::{
     compute_quad_ext_requirements, compute_schroeder_requirements,
 };
 use crate::graph::zoh::ZohRateContext;
-#[cfg(feature = "alloc")]
-use crate::math::rcp_nr6_f64;
 use crate::math::{clamp_finite_f32, f32_to_fp16};
 use crate::types::{ColdBuf, Tier, VmError};
 
@@ -54,7 +53,7 @@ use wire_decode::decode_readout_and_overrides;
 
 pub use lifecycle::{
     reset_to_dc_equilibrium, retime_sample_rate, set_offline_bounce, set_op_t_write_enable,
-    set_quad_write_enable, switch_tier,
+    set_quad_write_enable, set_render_mode, switch_tier,
 };
 
 /// Pre-allocated capacity headroom for zero-allocation in-place model reload
@@ -154,7 +153,7 @@ fn prepare_common_cold_in_place<B: GraphBackend>(
     active_tier: Tier,
     zoh: &ZohRateContext,
 ) -> Result<(), VmError> {
-    let offline = zoh.is_bounce_4x;
+    let is_master = matches!(zoh.render_mode, RenderMode::Master);
     let active_taps = active_tier.early_fir_taps();
     let (ai, aq) = interpolate_hilbert_h1_alphas_f64(zoh.f_s_vm);
     let (dc_pole, _) = compute_t1_dc_blocker_coeffs_clamped(zoh.f_s_vm);
@@ -170,19 +169,19 @@ fn prepare_common_cold_in_place<B: GraphBackend>(
             .ctrl_bus
             .as_mut()
             .ok_or(VmError::InsufficientBackingCapacity)?;
-        bus.offline_bounce = offline;
+        bus.offline_bounce = is_master;
         cold.convolver_fir_ext.prepare(
             &cold.tier_fir_l[active_tier.index()][..active_taps],
             &cold.tier_fir_r[active_tier.index()][..active_taps],
             zoh.f_s_vm,
-            offline,
+            false,
         )?;
         bus.base_tank_dry_mix()
     };
 
-    let use_cold_fir = ConvolverHighSrFirExt::required_f32_len(zoh.f_s_vm, offline) > 0;
+    let use_cold_fir = ConvolverHighSrFirExt::required_f32_len(zoh.f_s_vm, false) > 0;
     slab.set_flag(FLAG_COLD_FIR_EXT, use_cold_fir);
-    slab.set_flag(FLAG_OS2X, zoh.os2x_active);
+    slab.set_flag(FLAG_OS2X, zoh.m_core >= 2);
     slab.lite.tier = active_tier;
     slab.lite.hilbert = HilbertH1StereoKernel::with_coeffs(ai, aq);
     slab.lite.t1_dc.set_pole(dc_pole);
@@ -194,14 +193,12 @@ fn prepare_common_cold_in_place<B: GraphBackend>(
     cold.max_present_tier = Tier::from_u8(view.header.max_present_tier);
     cold.retained_tier = view.retained_tier;
     cold.zoh = *zoh;
-    cold.offline_bounce = offline;
+    cold.render_mode = zoh.render_mode;
     cold.base_tank_dry_mix = base_tank_dry_mix;
     cold.ro_pole_48k = ro_pole_48k;
     let sensory_cold = SensoryQuadCold::from_crossbar_wire(&cb, zoh.rho_vm);
     cold.sensory_cold = sensory_cold;
-    cold.bounce4x = Bounce4xOversampler::new();
-    cold.bounce4x_core_decim = Bounce4xDecimator::new();
-    cold.bounce4x_wet_decim = Bounce4xDecimator::new();
+    cold.master_os = CoreOversamplerMasterCold::new();
     slab.sensory_params = SensoryParamsHot::from_cold(&sensory_cold);
     setup_phasor_increments(slab, zoh);
     Ok(())
@@ -314,15 +311,18 @@ pub fn hydrate_slab_from_dnam_bin<'a, B: GraphBackend>(
     decode_readout_and_overrides(view, &mut slab)?;
     setup_transport_wire_slots(view, &mut slab);
 
-    let tier_os2x = slab.cold().tier_os2x[active_tier.index()];
+    let mode = if offline_bounce {
+        RenderMode::Master
+    } else {
+        RenderMode::Live
+    };
     let ref_hz = view.header.reference_sample_rate_hz.get() as f32;
-    let zoh =
-        ZohRateContext::compute(ref_hz, host_rate_hz, active_tier, tier_os2x, offline_bounce)?;
+    let zoh = ZohRateContext::compute(ref_hz, host_rate_hz, mode)?;
     let bus = ControlBus::from_dnam_bin(view, active_tier, zoh.f_s_vm as f32, backing.control_bus)?;
     let fir_ext = if backing.convolver_fir_ext.is_empty() {
         ConvolverHighSrFirExt::from_slice(&mut [], 48_000.0, false)?
     } else {
-        ConvolverHighSrFirExt::from_slice(backing.convolver_fir_ext, zoh.f_s_vm, offline_bounce)?
+        ConvolverHighSrFirExt::from_slice(backing.convolver_fir_ext, zoh.f_s_vm, false)?
     };
     slab.cold_mut().ctrl_bus = Some(bus);
     slab.cold_mut().convolver_fir_ext = fir_ext;
@@ -349,16 +349,15 @@ fn validate_reload_slab_capacity<B: GraphBackend>(
     if active_tier.index() > view.retained_tier.index() {
         return Err(VmError::InvalidTier);
     }
-    let cb_a0 = &view.arena0.crossbar;
-    let tier_os2x = wire_decode::compute_tier_os2x_flags(
-        cb_a0.sona_meta_flags.get(),
-        cb_a0.cell_desc.oversample_factor.get(),
-    )[active_tier.index()];
+    let mode = if offline_bounce {
+        RenderMode::Master
+    } else {
+        RenderMode::Live
+    };
     let ref_hz = view.header.reference_sample_rate_hz.get() as f32;
-    let zoh =
-        ZohRateContext::compute(ref_hz, host_rate_hz, active_tier, tier_os2x, offline_bounce)?;
+    let zoh = ZohRateContext::compute(ref_hz, host_rate_hz, mode)?;
 
-    let req_fir_len = ConvolverHighSrFirExt::required_f32_len(zoh.f_s_vm, offline_bounce);
+    let req_fir_len = ConvolverHighSrFirExt::required_f32_len(zoh.f_s_vm, false);
     if req_fir_len > slab.cold().convolver_fir_ext.backing_f32_capacity() {
         return Err(VmError::InsufficientBackingCapacity);
     }
@@ -448,7 +447,6 @@ pub fn reload_slab_from_dnam_bin_in_place<B: GraphBackend>(
 
     // All fail-closed capacity checks passed; reload control bus & reset hot/cold metadata in place.
     slab.lite = SonaLiteHotPrefix::empty();
-    slab.os2x_hot = SonaOs2xHot::default();
     slab.full_delta = SonaFullHotDelta::empty();
     slab.pro_delta = SonaProHotDelta::empty();
     slab.ultra_delta = SonaUltraHotDelta::empty();
@@ -518,6 +516,25 @@ pub fn hydrate_slab_owned_with_headroom<B: GraphBackend>(
     offline_bounce: bool,
     headroom: VmReloadHeadroom,
 ) -> Result<SonaHotSlab<'static, B>, VmError> {
+    hydrate_slab_owned_inner(
+        view,
+        active_tier,
+        host_rate_hz,
+        offline_bounce,
+        headroom,
+        false,
+    )
+}
+
+#[cfg(feature = "alloc")]
+fn hydrate_slab_owned_inner<B: GraphBackend>(
+    view: &DnamBinView<'_>,
+    active_tier: Tier,
+    host_rate_hz: f32,
+    offline_bounce: bool,
+    headroom: VmReloadHeadroom,
+    prealloc_384k: bool,
+) -> Result<SonaHotSlab<'static, B>, VmError> {
     crate::math::warm_simd_feature_caches();
     if active_tier.index() > view.retained_tier.index() {
         return Err(VmError::InvalidTier);
@@ -529,10 +546,13 @@ pub fn hydrate_slab_owned_with_headroom<B: GraphBackend>(
     decode_readout_and_overrides(view, &mut slab)?;
     setup_transport_wire_slots(view, &mut slab);
 
-    let tier_os2x = slab.cold().tier_os2x[active_tier.index()];
+    let mode = if offline_bounce {
+        RenderMode::Master
+    } else {
+        RenderMode::Live
+    };
     let ref_hz = view.header.reference_sample_rate_hz.get() as f32;
-    let zoh =
-        ZohRateContext::compute(ref_hz, host_rate_hz, active_tier, tier_os2x, offline_bounce)?;
+    let zoh = ZohRateContext::compute(ref_hz, host_rate_hz, mode)?;
 
     let req_contrib = required_cp1_contributors(view)?;
     let ctrl_backing = ControlBusBacking::new_owned_with_capacity(
@@ -545,7 +565,7 @@ pub fn hydrate_slab_owned_with_headroom<B: GraphBackend>(
     let fir_ext = ConvolverHighSrFirExt::from_cold_buf(
         ColdBuf::Owned(vec![0.0_f32; EXT_FIR_STORAGE_F32_LEN]),
         zoh.f_s_vm,
-        offline_bounce,
+        false,
     )?;
     slab.cold_mut().ctrl_bus = Some(bus);
     slab.cold_mut().convolver_fir_ext = fir_ext;
@@ -557,9 +577,12 @@ pub fn hydrate_slab_owned_with_headroom<B: GraphBackend>(
         slab.cold().ext_ring_pow2_frames,
         slab.cold().dc_blocker_pole_5hz,
     );
-    let min_rho_384k =
-        f64::from(view.header.reference_sample_rate_hz.get()) * rcp_nr6_f64(384_000.0);
-    let alloc_rho = zoh.rho_vm.min(min_rho_384k).min(0.125);
+    let alloc_rho = if prealloc_384k {
+        let min_rho_384k = f64::from(ref_hz) * crate::math::rcp_nr6_f64(384_000.0);
+        zoh.rho_vm.min(min_rho_384k)
+    } else {
+        zoh.rho_vm
+    };
     let disabled_wire = TransportQuadWire::new_zeroed();
     for (q, wire) in wires.iter().enumerate() {
         if q > view.retained_tier.index() {
@@ -596,7 +619,8 @@ pub fn hydrate_slab_owned_with_headroom<B: GraphBackend>(
         slab.cold_mut().transport_quad_meta[q] = meta_q;
         slab.cold_mut().transport_quad_eff[q] =
             QuadEffectiveTargets::from_quad_and_meta(&hot_q, &meta_q);
-        let active_cap = (meta_q.cap > 0).then_some(meta_q.cap);
+        let active_cap =
+            ((hot_q.flags & QUAD_FLAG_HAS_EXT) != 0 && meta_q.cap > 0).then_some(meta_q.cap);
         let ext_ring = TransportExtRing::new_owned_with_headroom(
             wire,
             &ExtRingAllocSpec {
@@ -634,12 +658,13 @@ pub fn hydrate_slab_owned<B: GraphBackend>(
     host_rate_hz: f32,
     offline_bounce: bool,
 ) -> Result<SonaHotSlab<'static, B>, VmError> {
-    hydrate_slab_owned_with_headroom(
+    hydrate_slab_owned_inner(
         view,
         active_tier,
         host_rate_hz,
         offline_bounce,
         VmReloadHeadroom::zero(),
+        true,
     )
 }
 

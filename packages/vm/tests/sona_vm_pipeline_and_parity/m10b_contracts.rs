@@ -1,4 +1,4 @@
-//! SONA v3.0 operator parity & routing integration tests for `dnam-vm`:
+//! SONA v4.0 operator parity & routing integration tests for `dnam-vm`:
 //! pure `2x2` channel routing (`1->1`, `2->1`, `1->2`, `2->2`), `SensoryQuad` VCA (`slot 30`),
 //! smooth `Op-N[Pre]` `zoh_hold_depth` & ZOH invariance, `ro_pole_48k` ZOH invariance, `CoreQuad`
 //! M/S coupling + Selective-Duhem + stereo-link + `GLU`, `T1SubHarmonicKernel` 2-stage rotor,
@@ -17,12 +17,12 @@ use dnam_vm::bin::{
 use dnam_vm::control::bus::laws::eval_op_t_freeze_mix_eff;
 use dnam_vm::math::{exp2_signed_oct_f32, powf_f64};
 use dnam_vm::{
-    CextDispatchWire, ControlClampDescriptor, CoreQuadWire, DefaultMathBackend, DnamBinBuildInput,
-    SONA_FULL_HOT_DELTA_BYTES, SONA_LITE_HOT_BYTES, SONA_OS2X_HOT_BYTES, SONA_PRO_HOT_DELTA_BYTES,
-    SONA_ULTRA_HOT_DELTA_BYTES, SonaHotSlab, SonaVm, Tier, encode_dnam_bin,
+    CoreQuadWire, DefaultMathBackend, DnamBinBuildInput, SONA_FULL_HOT_DELTA_BYTES,
+    SONA_LITE_HOT_BYTES, SONA_PRO_HOT_DELTA_BYTES, SONA_ULTRA_HOT_DELTA_BYTES, SonaHotSlab, SonaVm,
+    Tier, encode_dnam_bin,
 };
+use zerocopy::FromZeros;
 use zerocopy::byteorder::little_endian::{F32, U16, U32};
-use zerocopy::{FromZeros, IntoBytes};
 
 use super::helpers::{
     assert_finite_non_silent, build_full_pipeline_ultra_fixture, encode_lite_fixture, fp16_arr,
@@ -178,25 +178,11 @@ fn test_m10b_sensory_quad_vca_slot30_and_control_bus_envelope_loop() {
     a0_vca.crossbar.sense_tone_lp_fp16 = fp16_arr([1.0; 4]);
     a0_vca.crossbar.sense_tone_bp_fp16 = fp16_arr([0.5; 4]);
     a0_vca.crossbar.sense_vca_w_fp16 = fp16_arr([-0.6, -0.5, -0.4, -0.3]);
+    a0_vca.control_bus_lite.w_ctrl[0][12] = F32::new(-0.35);
 
-    // Wire ctrl 0 -> main_base -> slot 30 (sense_vca_gain_delta) via CextDispatchWire row 14.
-    let ctrl_desc = ControlClampDescriptor::range(-1.0, 1.0, 0.0, 1, [0.0; 3]).to_wire();
-    a0_vca.control_bus_lite.cp1_dir.cp1_dir_count = U16::new(1);
-    a0_vca.control_bus_lite.cp1_dir.entries[0] = [0, 1, 0xFF];
-    a0_vca.control_bus_lite.cp1_base[32..36].copy_from_slice(F32::new(1.0).as_bytes());
-    a0_vca.control_bus_lite.cp1_base[36..40].copy_from_slice(F32::new(1.0).as_bytes());
-    let mut cext = CextDispatchWire::new_zeroed();
-    cext.w_ctrl_ext[14][0] = F32::new(-0.45); // ctrl 0 -> z_head[0] -> slot 30 bias
-    cext.w_ctrl_ext[14][12] = F32::new(-0.35); // det_env[0] -> q3 -> slot 30 compression loop
-
+    // Route envelope via SensoryQuad VCA weights (CEXT retired in v4; GRA adds slot 30 in C3.3).
     let bin_pass = encode_lite_fixture(&a0_pass, DNBN_FLAG_STEREO_OUT, 0.99, &[], None);
-    let bin_vca = encode_lite_fixture(
-        &a0_vca,
-        DNBN_FLAG_STEREO_OUT,
-        0.99,
-        &[ctrl_desc],
-        Some(&cext),
-    );
+    let bin_vca = encode_lite_fixture(&a0_vca, DNBN_FLAG_STEREO_OUT, 0.99, &[], None);
 
     let mut vm_pass =
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&bin_pass, Tier::Lite, 48_000.0).unwrap();
@@ -212,17 +198,13 @@ fn test_m10b_sensory_quad_vca_slot30_and_control_bus_envelope_loop() {
         .process_block(&in_l, &in_r, &mut vl, &mut vr)
         .unwrap();
 
-    // SensoryQuad builds non-zero ballistic envelopes that loop back via ControlBus q3 -> slot 30.
+    // SensoryQuad builds non-zero ballistic envelopes that loop back via ControlBus.
     let bus_env = vm_vca.slab().cold().ctrl_bus.as_ref().unwrap().env_states;
     assert!(bus_env.iter().all(|&e| e > 1.0e-4 && e.is_finite()));
-    assert!(vm_vca.slab().cold().latched_stage_params[30] < -1.0e-4);
 
     let pass_rms: f64 = pl.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
     let vca_rms: f64 = vl.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
-    assert!(
-        vca_rms < pass_rms * 0.85,
-        "VCA + slot 30 must attenuate RMS"
-    );
+    assert!(vca_rms < pass_rms * 0.85, "VCA must attenuate RMS");
 }
 
 /// verify[dsp.op-n.bitcrusher.rate-transfer]
@@ -256,7 +238,7 @@ fn test_m10b_op_n_pre_smooth_zoh_depth_and_sample_rate_invariance() {
     a0.crossbar.cell_desc.cell_flags = U32::new(SONA_META_SENSORY_QUAD);
     a0.crossbar.op_n_pre_base.gamma_bc = F32::new(1.0);
     a0.crossbar.op_n_pre_base.zoh_hold_depth = F32::new(0.88);
-    a0.crossbar.op_n_pre_base.beta_q = F32::new(6.0);
+    a0.crossbar.op_n_pre_base.beta_q_fp16 = fp16_val(6.0);
     a0.core_quads[0] = make_core_quad(0);
     a0.conv_fir_lite.fir_l[0] = F32::new(1.0);
     a0.conv_fir_lite.fir_r[0] = F32::new(1.0);
@@ -396,7 +378,7 @@ fn test_m10b_core_quad_ms_coupling_duhem_stereo_link_and_glu_mix() {
     q0.lru_alpha_atk = le_f32([0.25; 4]);
     q0.lru_kappa_fp16 = fp16_arr([0.5; 4]);
     q0.adaa_drive_fp16 = fp16_arr([1.5; 4]);
-    q0.tone_dir_fp16 = fp16_arr([1.0; 4]);
+    q0.c_u_fp16 = fp16_arr([1.0; 4]);
     q0.wavefolder_mix_fp16 = [U16::new(0); 4];
     q0.in_mid_weight_fp16 = fp16_arr([1.0; 4]);
     q0.in_side_weight_fp16 = fp16_arr([0.0; 4]);
@@ -541,17 +523,24 @@ fn test_m10b_op_t_sigma_sat_freeze_mix_dry_mix_and_immediate_write_lock() {
     a0.control_bus_lite.tank_dry_mix_fp16 = fp16_val(1.0);
     let bin_with_dry = encode_lite_fixture(&a0, DNBN_FLAG_STEREO_OUT, 0.99, &[], None);
 
-    // 1) Stage tank_dry_mix law (0.0 vs 1.0): frame 0 pure wet is 0 before delay read arrival.
+    // 1) Stage tank_dry_mix law (0.0 vs 1.0): Live HB15 PDC = 7; pure wet outputs 0 across 0..=7,
+    // while dry path arrives at n = CORE_OS_LIVE_LATENCY_1X.
     let mut vm_wet =
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&bin_pure_wet, Tier::Lite, 48_000.0)
             .unwrap();
     let mut vm_dry =
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&bin_with_dry, Tier::Lite, 48_000.0)
             .unwrap();
-    let (wl0, wr0) = vm_wet.step_frame(0.5, -0.3).unwrap();
-    let (dl0, dr0) = vm_dry.step_frame(0.5, -0.3).unwrap();
-    assert_eq!((wl0, wr0), (0.0, 0.0));
-    assert!(dl0.abs() > 1.0e-3 && dr0.abs() > 1.0e-3);
+    let (mut max_dry_l, mut max_dry_r) = (0.0_f32, 0.0_f32);
+    for n in 0..=dnam_kernels::CORE_OS_LIVE_LATENCY_1X {
+        let (x_l, x_r) = if n == 0 { (0.5, -0.3) } else { (0.0, 0.0) };
+        let (wl, wr) = vm_wet.step_frame(x_l, x_r).unwrap();
+        let (dl, dr) = vm_dry.step_frame(x_l, x_r).unwrap();
+        assert_eq!((wl, wr), (0.0, 0.0));
+        max_dry_l = max_dry_l.max(dl.abs());
+        max_dry_r = max_dry_r.max(dr.abs());
+    }
+    assert!(max_dry_l > 1.0e-3 && max_dry_r > 1.0e-3);
 
     // 2) Extreme drive stays strictly bounded by unified sigma_sat cubic limiter.
     for _ in 0..512 {
@@ -600,43 +589,30 @@ fn test_m10b_op_t_sigma_sat_freeze_mix_dry_mix_and_immediate_write_lock() {
     a0_freeze.transport_lite.sigma_knee_fp16 = fp16_val(2.0);
     a0_freeze.transport_lite.freeze_mix_fp16 = fp16_val(0.0);
 
-    // Route ctrl 0 in [0, 1] -> z_head[0] -> slot 16 (op_t_freeze_mix_delta) cleanly at 1:1 scale.
-    let freeze_ctrl = ControlClampDescriptor::range(0.0, 1.0, 0.0, 1, [-1.0, 0.0, 0.0]).to_wire();
-    a0_freeze.control_bus_lite.cp1_dir.cp1_dir_count = U16::new(1);
-    a0_freeze.control_bus_lite.cp1_dir.entries[0] = [0, 1, 0xFF];
-    a0_freeze.control_bus_lite.cp1_base[0..4].copy_from_slice(F32::new(0.5).as_bytes());
-    let mut freeze_cext = CextDispatchWire::new_zeroed();
-    freeze_cext.w_ctrl_ext[0][0] = F32::new(1.0);
-
-    let bin_freeze_decay = encode_lite_fixture(
-        &a0_freeze,
-        DNBN_FLAG_STEREO_OUT,
-        0.99,
-        &[freeze_ctrl],
-        Some(&freeze_cext),
-    );
-    let mut energies = [0.0_f64; 5];
-    let fmix_levels = [0.0_f32, 0.25, 0.5, 0.75, 1.0];
+    // Sweep transport freeze_mix across [0.0..=0.95] (CEXT retired in v4; GRA adds slot 16 in C3.3).
+    let mut decay_ratios = [0.0_f64; 5];
+    let fmix_levels = [0.0_f32, 0.25, 0.5, 0.75, 0.95];
     for (idx, &fmix) in fmix_levels.iter().enumerate() {
+        a0_freeze.transport_lite.freeze_mix_fp16 = fp16_val(fmix);
+        let bin_freeze_decay =
+            encode_lite_fixture(&a0_freeze, DNBN_FLAG_STEREO_OUT, 0.99, &[], None);
         let mut vm = SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(
             &bin_freeze_decay,
             Tier::Lite,
             48_000.0,
         )
         .unwrap();
-        // Prime ring cleanly with sustained non-zero drive across 3 full 3 kHz ticks (48 frames).
-        for n in 0..48 {
+        let mut prime_energy = 0.0_f64;
+        for n in 0..64 {
             let s = 0.35 * (2.0 * core::f32::consts::PI * (n as f32) / 16.0).sin();
             let c = 0.25 * (2.0 * core::f32::consts::PI * (n as f32) / 16.0).cos();
-            let _ = vm.step_frame(s, c).unwrap();
-        }
-        vm.set_control_physical(0, fmix).unwrap();
-        // Complete the 16-sample uniform micro-ramp + 1 boundary frame so slot 16 latches fmix.
-        for _ in 0..17 {
-            let _ = vm.step_frame(0.0, 0.0).unwrap();
+            let (yl, yr) = vm.step_frame(s, c).unwrap();
+            if n >= 48 {
+                prime_energy += f64::from(yl) * f64::from(yl) + f64::from(yr) * f64::from(yr);
+            }
         }
         assert!(
-            (vm.slab().cold().transport_quad_eff[0].mu_freeze - fmix).abs() < 1.0e-5,
+            (vm.slab().cold().transport_quad_eff[0].mu_freeze - fmix).abs() < 1.0e-3,
             "fmix={fmix} vs mu_freeze={}",
             vm.slab().cold().transport_quad_eff[0].mu_freeze
         );
@@ -648,22 +624,23 @@ fn test_m10b_op_t_sigma_sat_freeze_mix_dry_mix_and_immediate_write_lock() {
             tail_energy += f64::from(yl) * f64::from(yl) + f64::from(yr) * f64::from(yr);
         }
         assert!(
-            tail_energy > 1.0e-4,
-            "expected non-zero tail at fmix={fmix}"
+            tail_energy > 1.0e-4 && prime_energy > 1.0e-4,
+            "expected non-zero tail at fmix={fmix}: tail={tail_energy}, prime={prime_energy}"
         );
-        energies[idx] = tail_energy;
+        decay_ratios[idx] = tail_energy / prime_energy;
     }
     assert!(
-        energies[0] < energies[1]
-            && energies[1] < energies[2]
-            && energies[2] < energies[3]
-            && energies[3] < energies[4],
-        "expected strictly monotonic freeze_mix retained tail energies, got {energies:?}"
+        decay_ratios[0] < decay_ratios[1]
+            && decay_ratios[1] < decay_ratios[2]
+            && decay_ratios[2] < decay_ratios[3]
+            && decay_ratios[3] < decay_ratios[4],
+        "expected strictly monotonic freeze_mix retained tail ratios, got {decay_ratios:?}"
     );
 
     // 4b) freeze_mix == 1.0 with unity loop gain / zero damping produces 0-ULP ring hold and periodic sustain.
     a0_freeze.transport_lite.g_loop = F32::new(TANK_MAX_G_LIN_F32);
-    let bin_sustain = encode_dnam_bin(&DnamBinBuildInput {
+    a0_freeze.transport_lite.freeze_mix_fp16 = fp16_val(0.0);
+    let bin_drive = encode_dnam_bin(&DnamBinBuildInput {
         reference_sample_rate_hz: 48_000,
         header_flags: DNBN_FLAG_STEREO_OUT,
         ext_ring_pow2_frames: 0,
@@ -675,10 +652,10 @@ fn test_m10b_op_t_sigma_sat_freeze_mix_dry_mix_and_immediate_write_lock() {
         ro_pole_48k: 0.99,
         switch_xfade_samples: 0,
         content_hash_prefix: [0; 8],
-        controls: &[freeze_ctrl],
+        controls: &[],
         cp1_overflow: &[],
         tsyn: &[],
-        cext: Some(&freeze_cext),
+        cext: None,
         arena0: &a0_freeze,
         arena1: None,
         arena2: None,
@@ -686,17 +663,15 @@ fn test_m10b_op_t_sigma_sat_freeze_mix_dry_mix_and_immediate_write_lock() {
     })
     .unwrap();
     let mut vm_sus =
-        SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&bin_sustain, Tier::Lite, 48_000.0)
+        SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&bin_drive, Tier::Lite, 48_000.0)
             .unwrap();
     for n in 0..48 {
         let s = 0.35 * (2.0 * core::f32::consts::PI * (n as f32) / 16.0).sin();
         let c = 0.25 * (2.0 * core::f32::consts::PI * (n as f32) / 16.0).cos();
         let _ = vm_sus.step_frame(s, c).unwrap();
     }
-    vm_sus.set_control_physical(0, 1.0).unwrap();
-    for _ in 0..17 {
-        let _ = vm_sus.step_frame(0.0, 0.0).unwrap();
-    }
+    // Engage immediate write-lock hold (equivalent to mu_freeze == 1.0) without ring step glitch.
+    vm_sus.set_op_t_write_enable(true);
     assert_eq!(vm_sus.slab().cold().transport_quad_eff[0].mu_freeze, 1.0);
     let frozen_ring = vm_sus.slab().lite.transport0_ring;
     for _ in 0..192 {
@@ -728,38 +703,30 @@ fn test_m10b_op_t_sigma_sat_freeze_mix_dry_mix_and_immediate_write_lock() {
         );
     }
 
-    // 4c) Dynamically sweeping slot 16 (op_t_freeze_mix_delta) from 0.0 -> 1.0 has no step glitch.
+    // 4c) Wire freeze_mix == 0.75 settles cleanly with bounded step transitions.
+    a0_freeze.transport_lite.freeze_mix_fp16 = fp16_val(0.75);
+    let bin_freeze_mid = encode_lite_fixture(&a0_freeze, DNBN_FLAG_STEREO_OUT, 0.99, &[], None);
     let mut vm_sweep =
-        SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&bin_freeze_decay, Tier::Lite, 48_000.0)
+        SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&bin_freeze_mid, Tier::Lite, 48_000.0)
             .unwrap();
     let (mut prev_l, mut prev_r) = (0.0_f32, 0.0_f32);
-    let mut prev_mu = -1.0_f32;
     let mut max_step_delta = 0.0_f32;
-    for tick in 0..=64 {
-        let fmix = (tick as f32) / 64.0;
-        vm_sweep.set_control_physical(0, fmix).unwrap();
-        for f in 0..16 {
-            let n = tick * 16 + f;
-            let s = 0.25 * (2.0 * core::f32::consts::PI * 220.0 * (n as f32) / 48_000.0).sin();
-            let (yl, yr) = vm_sweep.step_frame(s, -0.8 * s).unwrap();
-            assert!(yl.is_finite() && yr.is_finite());
-            let cur_mu = vm_sweep.slab().cold().transport_quad_eff[0].mu_freeze;
-            assert!(cur_mu >= prev_mu, "monotonic slot-16 sweep at sample={n}");
-            prev_mu = cur_mu;
-            if n > 0 {
-                max_step_delta = max_step_delta
-                    .max((yl - prev_l).abs())
-                    .max((yr - prev_r).abs());
-            }
-            (prev_l, prev_r) = (yl, yr);
+    for n in 0..128 {
+        let s = 0.25 * (2.0 * core::f32::consts::PI * 220.0 * (n as f32) / 48_000.0).sin();
+        let (yl, yr) = vm_sweep.step_frame(s, -0.8 * s).unwrap();
+        assert!(yl.is_finite() && yr.is_finite());
+        if n > 0 {
+            max_step_delta = max_step_delta
+                .max((yl - prev_l).abs())
+                .max((yr - prev_r).abs());
         }
+        (prev_l, prev_r) = (yl, yr);
     }
-    let _ = vm_sweep.step_frame(0.0, 0.0).unwrap();
     let final_mu = vm_sweep.slab().cold().transport_quad_eff[0].mu_freeze;
-    assert!((final_mu - 1.0).abs() < 1.0e-5, "final_mu={final_mu}");
+    assert!((final_mu - 0.75).abs() < 1.0e-3, "final_mu={final_mu}");
     assert!(
         max_step_delta < 0.25,
-        "unexpected freeze_mix sweep step glitch: {max_step_delta}"
+        "unexpected freeze_mix step delta: {max_step_delta}"
     );
 }
 
@@ -773,23 +740,22 @@ fn test_m10b_tier_switching_monotonicity_and_bounded_rt_invariants() {
     );
     assert_eq!(
         SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Full, true),
-        7_552
+        7_040
     );
     assert_eq!(
         SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Pro, true),
-        11_136
+        10_752
     );
     assert_eq!(
         SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Ultra, true),
-        14_592
+        14_336
     );
     assert_eq!(
         SONA_LITE_HOT_BYTES
-            + SONA_OS2X_HOT_BYTES
             + SONA_FULL_HOT_DELTA_BYTES
             + SONA_PRO_HOT_DELTA_BYTES
             + SONA_ULTRA_HOT_DELTA_BYTES,
-        14_592
+        14_336
     );
 
     let ultra = build_full_pipeline_ultra_fixture();

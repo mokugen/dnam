@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 autobins = false
-description = "Pure Rust #![no_std] + !alloc-capable zero-JSON SONA v3.0 real-time virtual machine (.dnam-bin loader, ControlBus, and multi-ISA f32 SIMD backend)"
+description = "Pure Rust #![no_std] + !alloc-capable zero-JSON SONA v4.0 real-time virtual machine (.dnam-bin loader, ControlBus, and multi-ISA f32 SIMD backend)"
 
 [lib]
 name = "dnam_vm"

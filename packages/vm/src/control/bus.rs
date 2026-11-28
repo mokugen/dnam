@@ -699,7 +699,7 @@ mod tests {
             arena2: None,
             arena3: None,
         };
-        let mut buf = [0u8; 128 + 4_608];
+        let mut buf = [0u8; 128 + crate::bin::ARENA0_LITE_BYTES];
         encode_dnam_bin_into(&input, &mut buf).unwrap();
         let view = DnamBinView::parse(&buf).unwrap();
 

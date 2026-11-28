@@ -6,6 +6,17 @@
 //! Strictly `#![no_std]`, `#![forbid(unsafe_code)]`, zero `FDIV`/`FSQRT`/`IDIV`/`libm`,
 //! and `spirv-unknown-naga-wgsl`-clean.
 
+pub mod master;
+
+pub use master::{
+    CORE_OS_LIVE_LATENCY_1X, CORE_OS_MASTER_2X_LATENCY_1X, CORE_OS_MASTER_4X_LATENCY_1X,
+    HB23_DELAY_SAMPLES_4X, HB23_HIST_LEN, HB23_ODD_DELAY_LEN, HB63_DELAY_SAMPLES_2X, HB63_HIST_LEN,
+    HB63_ODD_DELAY_LEN, HbFir23Downsampler4Ch, HbFir23UpsamplerStereo, HbFir63Downsampler4Ch,
+    HbFir63UpsamplerStereo, box2_quadrature_f32, box2_quadrature_stereo8,
+    eval_hb23_downsample_4ch_vec4, eval_hb23_upsample_stereo, eval_hb63_downsample_4ch_vec4,
+    eval_hb63_upsample_stereo,
+};
+
 use crate::simd::{
     HB15_DN_ODD_TAPS_OUTER, HB15_ODD_TAPS_OUTER, KernelVec4, canonicalize_zero_f32_bits,
 };

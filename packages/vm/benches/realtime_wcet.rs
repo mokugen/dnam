@@ -11,16 +11,16 @@ use std::time::Instant;
 
 use dnam_kernels::pack_wf_mix_and_rect_sign_fp16;
 use dnam_vm::bin::{
-    DNBN_FLAG_STEREO_OUT, PIPE_CANONICAL_V3_SONA, SONA_META_CORE_MODS_PRESENT,
-    SONA_META_OS_EXT_PRESENT, SONA_META_SENSORY_QUAD, SONA_META_TRANSPORT_LFO,
+    DNBN_FLAG_STEREO_OUT, PIPE_CANONICAL_V4_SONA, SONA_META_SENSORY_QUAD, SONA_META_TRANSPORT_LFO,
     SONA_META_TRANSPORT_TAP_GAINS, TRANSPORT_FLAG_EXT_F32,
 };
 use dnam_vm::math::{TANK_DC_BLOCKER_48K_F32, f32_to_fp16};
 use dnam_vm::{
-    Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, CextDispatchWire,
-    ControlClampDescriptor, CoreQuadWire, DefaultMathBackend, DnamBinBuildInput, DnamBinView,
-    DynamicSonaVm, FtzDazGuard, KautzSoaBlockWire, OpNPreBaseWire, SonaCrossbarBlockWire,
-    SonaHotSlab, SonaInterBlockTilePairWire, Tier, TransportQuadWire, encode_dnam_bin,
+    Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, ControlClampDescriptor,
+    CoreQuadWire, DefaultMathBackend, DnamBinBuildInput, DnamBinView, DynamicSonaVm, FtzDazGuard,
+    KautzSoaBlockWire, OpNPreBaseWire, SONA_FULL_HOT_DELTA_BYTES, SONA_LITE_HOT_BYTES,
+    SONA_PRO_HOT_DELTA_BYTES, SONA_ULTRA_HOT_DELTA_BYTES, SonaCrossbarBlockWire, SonaHotSlab,
+    SonaInterBlockTilePairWire, Tier, TransportQuadWire, encode_dnam_bin,
 };
 use zerocopy::byteorder::little_endian::{F32, U16, U32};
 use zerocopy::{FromZeros, IntoBytes};
@@ -40,6 +40,7 @@ fn fp16_val(v: f32) -> U16 {
 fn make_core_quad(q: usize) -> CoreQuadWire {
     let s = 1.0 + 0.05 * (q as f32);
     let rs = if (q & 1) == 0 { 1.0_f32 } else { -1.0_f32 };
+    let is_block0 = matches!(q, 0 | 4 | 8);
     CoreQuadWire {
         svf_g: le_f32([0.14 * s, 0.28 * s, 0.45 * s, 0.70 * s]),
         lru_alpha_rel: le_f32([0.85, 0.87, 0.89, 0.91]),
@@ -48,15 +49,16 @@ fn make_core_quad(q: usize) -> CoreQuadWire {
         lru_kappa_fp16: fp16_arr([0.35, 0.40, 0.45, 0.50]),
         adaa_drive_fp16: fp16_arr([0.30, 0.34, 0.28, 0.32]),
         lru_bias_drive_fp16: fp16_arr([0.04 * rs, -0.03 * rs, 0.05 * rs, -0.02 * rs]),
-        tone_lp_fp16: fp16_arr([0.35, 0.30, 0.25, 0.20]),
-        tone_bp_fp16: fp16_arr([0.20, 0.25, 0.20, 0.15]),
-        tone_hp_fp16: fp16_arr([0.15, 0.15, 0.20, 0.25]),
-        tone_ap_fp16: fp16_arr([0.10, 0.12, 0.15, 0.18]),
-        tone_dir_fp16: fp16_arr([0.20, 0.18, 0.20, 0.22]),
-        sag_depth_fp16: fp16_arr([0.05; 4]),
-        wavefolder_mix_fp16: [rs, -rs, rs, -rs]
-            .map(|sign| U16::new(pack_wf_mix_and_rect_sign_fp16(0.04, sign))),
-        svf_k_nl_fp16: if matches!(q, 0 | 4 | 6 | 8) {
+        c_lp_fp16: fp16_arr([0.35, 0.30, 0.25, 0.20]),
+        c_bp_fp16: fp16_arr([0.20, 0.25, 0.20, 0.15]),
+        c_kbp_fp16: if is_block0 {
+            fp16_arr([0.15, 0.15, 0.20, 0.25])
+        } else {
+            [U16::new(0); 4]
+        },
+        c_u_fp16: fp16_arr([0.20, 0.18, 0.20, 0.22]),
+        wavefolder_mix_fp16: [U16::new(pack_wf_mix_and_rect_sign_fp16(0.04, 1.0)); 4],
+        svf_k_nl_fp16: if is_block0 {
             fp16_arr([1.25, 0.85, 1.50, 0.60])
         } else {
             [U16::new(0); 4]
@@ -67,6 +69,8 @@ fn make_core_quad(q: usize) -> CoreQuadWire {
         lru_duhem_gamma_fp16: fp16_arr([0.50; 4]),
         lru_signed_mix_fp16: fp16_arr([0.60; 4]),
         glu_mix_fp16: fp16_arr([0.10, -0.08, 0.08, -0.06]),
+        rect_sign_mask: U16::new(0b0101),
+        ..CoreQuadWire::new_zeroed()
     }
 }
 
@@ -99,7 +103,8 @@ fn make_crossbar() -> SonaCrossbarBlockWire {
 fn make_kautz() -> KautzSoaBlockWire {
     KautzSoaBlockWire {
         r_low: le_f32([0.68, 0.72, 0.76, 0.80]),
-        dr: le_f32([0.04, 0.05, 0.04, 0.06]),
+        onset_delay_samp: [0, 2, 4, 6].map(U16::new),
+        c_cross_fp16: fp16_arr([0.04, 0.05, 0.04, 0.06]),
         theta: le_f32([0.14, 0.30, 0.48, 0.70]),
         b_gamma: le_f32([0.08, 0.07, 0.06, 0.05]),
         c_re_l: le_f32([0.025, -0.018, 0.015, -0.012]),
@@ -149,6 +154,7 @@ fn make_quad(q: usize) -> TransportQuadWire {
         allpass_delays: if q == 0 { [11, 17, 23, 31] } else { [0; 4] },
         flags: if q == 0 { 0 } else { TRANSPORT_FLAG_EXT_F32 },
         reserved: 0,
+        ..TransportQuadWire::new_zeroed()
     }
 }
 
@@ -174,12 +180,8 @@ fn fill_ro(words: &mut [U16], lanes: usize, write_tail_gains: bool) {
 
 fn build_bench_ultra_fixture() -> Vec<u8> {
     let mut a0 = DnamBinBuildInput::default_arena0_lite();
-    let meta = SONA_META_SENSORY_QUAD
-        | SONA_META_OS_EXT_PRESENT
-        | SONA_META_TRANSPORT_TAP_GAINS
-        | SONA_META_TRANSPORT_LFO
-        | SONA_META_CORE_MODS_PRESENT;
-    a0.crossbar.pipeline_flags = U32::new(PIPE_CANONICAL_V3_SONA);
+    let meta = SONA_META_SENSORY_QUAD | SONA_META_TRANSPORT_TAP_GAINS | SONA_META_TRANSPORT_LFO;
+    a0.crossbar.pipeline_flags = U32::new(PIPE_CANONICAL_V4_SONA);
     a0.crossbar.sona_meta_flags = U32::new(meta);
     a0.crossbar.sense_svf_g = le_f32([0.08, 0.18, 0.35, 0.62]);
     a0.crossbar.sense_lru_alpha_rel = le_f32([0.92, 0.94, 0.96, 0.97]);
@@ -198,7 +200,8 @@ fn build_bench_ultra_fixture() -> Vec<u8> {
     a0.crossbar.op_n_pre_base = OpNPreBaseWire {
         gamma_bc: F32::new(0.05),
         zoh_hold_depth: F32::new(0.04),
-        beta_q: F32::new(0.08),
+        beta_q_fp16: fp16_val(0.08),
+        kappa_h_fp16: fp16_val(0.0),
     };
     a0.crossbar.phasor_freq_hz = le_f32([1.5, 3.0, 5.0, 7.0]);
     a0.core_quads = core::array::from_fn(make_core_quad);
@@ -216,7 +219,7 @@ fn build_bench_ultra_fixture() -> Vec<u8> {
     a0.control_bus_lite.cp1_dir.entries[0] = [0, 1, 0xFF];
     a0.control_bus_lite.cp1_dir.entries[1] = [1, 1, 0xFF];
     for f in 0..4 {
-        for d in 0..8 {
+        for d in 0..4 {
             let sign = if (f + d) % 2 == 0 { 1.0 } else { -1.0 };
             a0.control_bus_lite.u_int_base[f][d] = F32::new(sign * (0.015 + 0.002 * d as f32));
         }
@@ -229,13 +232,13 @@ fn build_bench_ultra_fixture() -> Vec<u8> {
     }
     for i in 0..13 {
         let off = i * 4;
-        a0.control_bus_lite.cp1_base[off..off + 4].copy_from_slice(F32::new(0.1).as_bytes());
-        a0.control_bus_lite.cp1_base[52 + off..56 + off].copy_from_slice(F32::new(0.08).as_bytes());
+        a0.control_bus_lite.gra_lite[off..off + 4].copy_from_slice(F32::new(0.1).as_bytes());
+        a0.control_bus_lite.gra_lite[52 + off..56 + off].copy_from_slice(F32::new(0.08).as_bytes());
     }
 
     let mut a1 = Arena1FullDeltaWire::new_zeroed();
     a1.core_quads = [make_core_quad(4), make_core_quad(5)];
-    a1.tiles = core::array::from_fn(|t| make_tile(3 + t));
+    a1.tiles = core::array::from_fn(|t| make_tile(5 + t));
     a1.crossbar_full = make_crossbar();
     a1.conv_kautz_full = make_kautz();
     a1.transport_full = make_quad(1);
@@ -251,13 +254,8 @@ fn build_bench_ultra_fixture() -> Vec<u8> {
 
     let mut a3 = Arena3UltraDeltaWire::new_zeroed();
     a3.core_quads = [make_core_quad(8), make_core_quad(9)];
-    a3.tiles = core::array::from_fn(|t| make_tile(23 + t));
+    a3.tiles = core::array::from_fn(|t| make_tile(24 + t));
     a3.crossbar_ultra = make_crossbar();
-    for k in 0..8 {
-        for col in 0..120 {
-            a3.stage_latent_core_mods_fp16[k * 128 + col] = fp16_val(0.01);
-        }
-    }
     a3.conv_kautz_ultra = [make_kautz(), make_kautz()];
     a3.transport_ultra[0] = make_quad(3);
     fill_ro(&mut a3.linear_readout_ultra.w_ro_and_mods_fp16, 40, true);
@@ -268,19 +266,17 @@ fn build_bench_ultra_fixture() -> Vec<u8> {
             a3.control_bus_ultra_delta.w_ctrl_ultra[r][c] = F32::new(sign * 0.005);
         }
     }
-    for b in 0..3 {
-        for f in 0..4 {
-            for d in 0..8 {
-                let sign = if (b + f + d) % 2 == 0 { 1.0 } else { -1.0 };
-                a3.control_bus_ultra_delta.u_int_ultra[b][f][d] = F32::new(sign * 0.01);
-            }
+    for f in 0..4 {
+        for d in 0..4 {
+            let sign = if (f + d) % 2 == 0 { 1.0 } else { -1.0 };
+            a3.control_bus_ultra_delta.u_int_ultra[f][d] = F32::new(sign * 0.01);
         }
     }
     for i in 0..12 {
         let off = i * 4;
-        a3.control_bus_ultra_delta.cp1_ultra[off..off + 4]
+        a3.control_bus_ultra_delta.gra_ultra_delta[off..off + 4]
             .copy_from_slice(F32::new(0.04).as_bytes());
-        a3.control_bus_ultra_delta.cp1_ultra[48 + off..52 + off]
+        a3.control_bus_ultra_delta.gra_ultra_delta[48 + off..52 + off]
             .copy_from_slice(F32::new(0.03).as_bytes());
     }
     for idx in 0..160 {
@@ -290,17 +286,6 @@ fn build_bench_ultra_fixture() -> Vec<u8> {
 
     let c0 = ControlClampDescriptor::range(0.0, 1.0, 0.5, 2, [0.0; 3]).to_wire();
     let c1 = ControlClampDescriptor::range(0.0, 1.0, 0.5, 2, [0.0; 3]).to_wire();
-    let mut cext = CextDispatchWire::new_zeroed();
-    for r in 0..16 {
-        for c in 0..16 {
-            let sign = if (r + c) % 2 == 0 { 1.0 } else { -1.0 };
-            cext.w_ctrl_ext[r][c] = F32::new(sign * 0.003);
-        }
-        for c in 0..4 {
-            let sign = if (r + c) % 2 == 0 { 1.0 } else { -1.0 };
-            cext.w_ctrl_ultra_ext[r][c] = F32::new(sign * 0.002);
-        }
-    }
 
     encode_dnam_bin(&DnamBinBuildInput {
         reference_sample_rate_hz: 48_000,
@@ -317,7 +302,7 @@ fn build_bench_ultra_fixture() -> Vec<u8> {
         controls: &[c0, c1],
         cp1_overflow: &[],
         tsyn: &[],
-        cext: Some(&cext),
+        cext: None,
         arena0: &a0,
         arena1: Some(&a1),
         arena2: Some(&a2),
@@ -423,6 +408,19 @@ fn bench_vm_block(ultra_bytes: &[u8], tier: Tier, block_frames: usize, label: &s
 
 fn main() {
     let _ftz = FtzDazGuard::new();
+    const EXPECTED_LITE_HOT: usize = SONA_LITE_HOT_BYTES;
+    const EXPECTED_FULL_HOT: usize = EXPECTED_LITE_HOT + SONA_FULL_HOT_DELTA_BYTES;
+    const EXPECTED_PRO_HOT: usize = EXPECTED_FULL_HOT + SONA_PRO_HOT_DELTA_BYTES;
+    const EXPECTED_ULTRA_HOT: usize = EXPECTED_PRO_HOT + SONA_ULTRA_HOT_DELTA_BYTES;
+    assert_eq!(
+        [
+            EXPECTED_LITE_HOT,
+            EXPECTED_FULL_HOT,
+            EXPECTED_PRO_HOT,
+            EXPECTED_ULTRA_HOT,
+        ],
+        [4_544, 7_040, 10_752, 14_336]
+    );
     assert_eq!(
         [
             SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Lite, false),
@@ -430,7 +428,12 @@ fn main() {
             SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Pro, true),
             SonaHotSlab::<DefaultMathBackend>::active_hot_bytes(Tier::Ultra, true),
         ],
-        [4_544, 7_552, 11_136, 14_592]
+        [
+            EXPECTED_LITE_HOT,
+            EXPECTED_FULL_HOT,
+            EXPECTED_PRO_HOT,
+            EXPECTED_ULTRA_HOT,
+        ]
     );
 
     let ultra_bytes = build_bench_ultra_fixture();
@@ -447,7 +450,7 @@ fn main() {
         "=========================================================================================="
     );
     println!(
-        " dnam-vm Real-Time WCET @ 48 kHz (Hot Bytes: Lite=4544, Full=7552, Pro=11136, Ultra=14592)"
+        " dnam-vm Real-Time WCET @ 48 kHz (Hot Bytes: Lite={EXPECTED_LITE_HOT}, Full={EXPECTED_FULL_HOT}, Pro={EXPECTED_PRO_HOT}, Ultra={EXPECTED_ULTRA_HOT})"
     );
     println!(
         "=========================================================================================="
@@ -469,7 +472,7 @@ fn main() {
     );
 
     let tiers = [
-        (Tier::Lite, "Lite  (1x, C=16)", 14.0_f64),
+        (Tier::Lite, "Lite  (2x, C=16)", 14.0_f64),
         (Tier::Full, "Full  (2x, C=24)", 8.0_f64),
         (Tier::Pro, "Pro   (2x, C=32)", 4.0_f64),
         (Tier::Ultra, "Ultra (2x, C=40)", 2.0_f64),

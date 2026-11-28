@@ -3,11 +3,12 @@
 
 #![forbid(unsafe_code)]
 
+use super::oversample::{CoreOversampler, RenderMode};
 use crate::math::{
     MAX_PARALRU_R_F32, clamp_finite_f32, const_abs_f64, exp_f64, powf_f64, rcp_nr6_f64,
     round_half_away_f64,
 };
-use crate::types::{Tier, VmError};
+use crate::types::VmError;
 
 /// Minimum valid reference sample rate in Hz (`44,100 Hz`).
 pub const MIN_REF_SAMPLE_RATE_HZ: f64 = 44_100.0;
@@ -15,51 +16,48 @@ pub const MIN_REF_SAMPLE_RATE_HZ: f64 = 44_100.0;
 pub const MAX_REF_SAMPLE_RATE_HZ: f64 = 96_000.0;
 /// Minimum valid host sample rate in Hz (`44,100 Hz`).
 pub const MIN_HOST_SAMPLE_RATE_HZ: f64 = 44_100.0;
-/// Maximum valid host or effective VM sample rate in Hz (`384,000 Hz`).
+/// Maximum valid host or Core sample rate in Hz (`384,000 Hz`).
 pub const MAX_HOST_SAMPLE_RATE_HZ: f64 = 384_000.0;
-/// Nominal `3 kHz` control-plane rate in Hz.
-const CTRL_NOMINAL_RATE_HZ: f64 = 3_000.0;
-/// Minimum control-bus decimation stride in VM frames (`ref[dsp.zoh.ctrl-stride]`).
-const MIN_CTRL_STRIDE: usize = 8;
-/// Offline bounce oversampling factor (`4x`).
-const BOUNCE_FACTOR: f64 = 4.0;
+/// Nominal `12 kHz` microchunk-quad control stride divisor (`4 * round(f_host / 12_000).max(2)`).
+const CTRL_QUARTER_RATE_HZ: f64 = 12_000.0;
+/// Minimum `4`-frame control blocks per tick (`4 * 2 = 8` minimum frames).
+const MIN_CTRL_QUADS: usize = 2;
 
 const _: () = assert!(MIN_REF_SAMPLE_RATE_HZ <= MAX_REF_SAMPLE_RATE_HZ);
 const _: () = assert!(MIN_HOST_SAMPLE_RATE_HZ <= MAX_HOST_SAMPLE_RATE_HZ);
-const _: () = assert!(MIN_CTRL_STRIDE == 8);
 
-/// Precomputed dual-rate VM / SONA-core sample-rate context (`0 FDIV`, `0 FSQRT`, `0 libm`).
+/// Precomputed Core-Only Multirate VM / Core sample-rate context (`0 FDIV`, `0 FSQRT`, `0 libm`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ZohRateContext {
     /// Model reference sample rate in Hz (`[44_100, 96_000]`).
     pub reference_rate_hz: f32,
     /// Host callback sample rate in Hz (`[44_100, 384_000]`).
     pub host_rate_hz: f32,
-    /// Perimeter VM execution rate in Hz (`host` live, or `4 * host` in `4x` offline bounce).
+    /// Active render mode (`Live` 2× vs `Master` 4× capped at `384 kHz`).
+    pub render_mode: RenderMode,
+    /// Perimeter VM execution rate in Hz (`== host_rate_hz` unconditionally in `SONA v4.0`).
     pub f_s_vm: f64,
-    /// Dimensionless ZOH perimeter rate ratio `reference_rate_hz / f_s_vm`.
+    /// Dimensionless ZOH perimeter rate ratio `reference_rate_hz / f_host`.
     pub rho_vm: f64,
-    /// Whether internal `2x` oversampling (`OS2X`) wraps the 4-block SONA core.
-    pub os2x_active: bool,
-    /// 4-block SONA core execution rate in Hz (`2 * f_s_vm` under `OS2X`, else `f_s_vm`).
+    /// Effective Core integer oversampling factor `m_core in {1, 2, 4}` (`m_core * f_host <= 384 kHz`).
+    pub m_core: usize,
+    /// Exact Core oversampling PDC latency `D_os` in `1x` host samples (`7`, `37`, `31`, or `0`).
+    pub os_latency_samples: usize,
+    /// 4-block SONA Core execution rate in Hz (`m_core * f_host <= 384_000.0`).
     pub f_s_core: f64,
-    /// Dimensionless ZOH core rate ratio `reference_rate_hz / f_s_core`.
+    /// Dimensionless ZOH Core rate ratio `reference_rate_hz / f_s_core`.
     pub rho_core: f64,
-    /// Control-bus decimation stride `max(8, round_half_away(f_s_vm / 3_000.0))`.
+    /// Control-bus decimation stride `4 * max(2, round(f_host / 12_000.0))` (`k_ctrl(44.1k) == 16`).
     pub k_ctrl: usize,
-    /// Whether `4x` offline bounce oversampling is active.
-    pub is_bounce_4x: bool,
 }
 
 impl ZohRateContext {
-    /// Computes and validates the two-rate [`ZohRateContext`] (`ref[dsp.router.signal-flow]`,
-    /// `ref[dsp.zoh.ctrl-stride]`).
+    /// Computes and validates the Core-Only Multirate [`ZohRateContext`] (`ADR-0026`,
+    /// `ref[dsp.router.signal-flow]`, `ref[dsp.zoh.ctrl-stride]`).
     pub fn compute(
         reference_rate_hz: f32,
         host_rate_hz: f32,
-        tier: Tier,
-        tier_os2x: bool,
-        offline_bounce: bool,
+        render_mode: RenderMode,
     ) -> Result<Self, VmError> {
         if !reference_rate_hz.is_finite() || !host_rate_hz.is_finite() {
             return Err(VmError::InvalidSampleRate);
@@ -71,19 +69,10 @@ impl ZohRateContext {
         {
             return Err(VmError::InvalidSampleRate);
         }
-        let f_s_vm = if offline_bounce {
-            BOUNCE_FACTOR * f_host
-        } else {
-            f_host
-        };
-        if !f_s_vm.is_finite() || f_s_vm > MAX_HOST_SAMPLE_RATE_HZ {
-            return Err(VmError::InvalidSampleRate);
-        }
-        let os2x_active = !matches!(tier, Tier::Lite)
-            && !offline_bounce
-            && tier_os2x
-            && (2.0 * f_s_vm <= MAX_HOST_SAMPLE_RATE_HZ);
-        let f_s_core = if os2x_active { 2.0 * f_s_vm } else { f_s_vm };
+        let f_s_vm = f_host;
+        let (m_core, os_latency_samples) =
+            CoreOversampler::resolve_m_core_and_pdc(render_mode, f_host);
+        let f_s_core = (m_core as f64) * f_host;
 
         let rho_vm = if const_abs_f64(f_s_vm - f_ref) <= 1.0e-12 {
             1.0
@@ -95,19 +84,21 @@ impl ZohRateContext {
         } else {
             f_ref * rcp_nr6_f64(f_s_core)
         };
-        let k_ctrl = (round_half_away_f64(f_s_vm * rcp_nr6_f64(CTRL_NOMINAL_RATE_HZ)) as usize)
-            .max(MIN_CTRL_STRIDE);
+        let k_quads = (round_half_away_f64(f_host * rcp_nr6_f64(CTRL_QUARTER_RATE_HZ)) as usize)
+            .max(MIN_CTRL_QUADS);
+        let k_ctrl = 4 * k_quads;
 
         Ok(Self {
             reference_rate_hz,
             host_rate_hz,
+            render_mode,
             f_s_vm,
             rho_vm,
-            os2x_active,
+            m_core,
+            os_latency_samples,
             f_s_core,
             rho_core,
             k_ctrl,
-            is_bounce_4x: offline_bounce,
         })
     }
 
@@ -125,19 +116,20 @@ impl ZohRateContext {
 }
 
 impl Default for ZohRateContext {
-    /// Returns a nominal `48,000 Hz` live [`Tier::Lite`] context (`rho_vm = 1.0`, `k_ctrl = 16`).
+    /// Returns a nominal `48,000 Hz` Live `2x` (`96 kHz` core, `D_os = 7`, `k_ctrl = 16`) context.
     #[inline]
     fn default() -> Self {
         Self {
             reference_rate_hz: 48_000.0,
             host_rate_hz: 48_000.0,
+            render_mode: RenderMode::Live,
             f_s_vm: 48_000.0,
             rho_vm: 1.0,
-            os2x_active: false,
-            f_s_core: 48_000.0,
-            rho_core: 1.0,
+            m_core: 2,
+            os_latency_samples: 7,
+            f_s_core: 96_000.0,
+            rho_core: 0.5,
             k_ctrl: 16,
-            is_bounce_4x: false,
         }
     }
 }
@@ -236,60 +228,63 @@ mod tests {
     #[test]
     fn test_zoh_rate_context_rules_and_bounds() {
         assert_eq!(
-            ZohRateContext::compute(44_099.0, 48_000.0, Tier::Full, true, false).unwrap_err(),
+            ZohRateContext::compute(44_099.0, 48_000.0, RenderMode::Live).unwrap_err(),
             VmError::InvalidSampleRate
         );
         assert_eq!(
-            ZohRateContext::compute(96_001.0, 48_000.0, Tier::Full, true, false).unwrap_err(),
+            ZohRateContext::compute(96_001.0, 48_000.0, RenderMode::Live).unwrap_err(),
             VmError::InvalidSampleRate
         );
         assert_eq!(
-            ZohRateContext::compute(48_000.0, 44_099.0, Tier::Full, true, false).unwrap_err(),
+            ZohRateContext::compute(48_000.0, 44_099.0, RenderMode::Live).unwrap_err(),
             VmError::InvalidSampleRate
         );
         assert_eq!(
-            ZohRateContext::compute(48_000.0, 384_001.0, Tier::Full, true, false).unwrap_err(),
+            ZohRateContext::compute(48_000.0, 384_001.0, RenderMode::Live).unwrap_err(),
             VmError::InvalidSampleRate
         );
         assert_eq!(
-            ZohRateContext::compute(48_000.0, f32::NAN, Tier::Full, true, false).unwrap_err(),
-            VmError::InvalidSampleRate
-        );
-        assert_eq!(
-            ZohRateContext::compute(48_000.0, 176_400.0, Tier::Ultra, true, true).unwrap_err(),
+            ZohRateContext::compute(48_000.0, f32::NAN, RenderMode::Master).unwrap_err(),
             VmError::InvalidSampleRate
         );
 
-        let lite = ZohRateContext::compute(48_000.0, 48_000.0, Tier::Lite, true, false).unwrap();
-        assert!(!lite.os2x_active);
-        assert_eq!(lite.f_s_vm.to_bits(), 48_000.0_f64.to_bits());
-        assert_eq!(lite.f_s_core.to_bits(), 48_000.0_f64.to_bits());
-        assert_eq!(lite.k_ctrl, 16);
+        let live48 = ZohRateContext::compute(48_000.0, 48_000.0, RenderMode::Live).unwrap();
+        assert_eq!(live48.m_core, 2);
+        assert_eq!(live48.os_latency_samples, 7);
+        assert_eq!(live48.f_s_vm.to_bits(), 48_000.0_f64.to_bits());
+        assert_eq!(live48.f_s_core.to_bits(), 96_000.0_f64.to_bits());
+        assert!((live48.rho_vm - 1.0).abs() < 1.0e-12);
+        assert!((live48.rho_core - 0.5).abs() < 1.0e-12);
+        assert_eq!(live48.k_ctrl, 16);
 
-        let full_48 = ZohRateContext::compute(48_000.0, 48_000.0, Tier::Full, true, false).unwrap();
-        assert!(full_48.os2x_active);
-        assert_eq!(full_48.f_s_core.to_bits(), 96_000.0_f64.to_bits());
-        assert!((full_48.rho_core - 0.5).abs() < 1.0e-12);
-        assert_eq!(full_48.k_ctrl, 16);
+        let sr441 = ZohRateContext::compute(48_000.0, 44_100.0, RenderMode::Live).unwrap();
+        assert_eq!(sr441.f_s_vm.to_bits(), 44_100.0_f64.to_bits());
+        assert_eq!(sr441.m_core, 2);
+        assert_eq!(sr441.k_ctrl, 16);
 
-        let sr441 = ZohRateContext::compute(48_000.0, 44_100.0, Tier::Pro, false, false).unwrap();
-        assert!(!sr441.os2x_active);
-        assert_eq!(sr441.k_ctrl, 15);
+        let sr192_master =
+            ZohRateContext::compute(48_000.0, 192_000.0, RenderMode::Master).unwrap();
+        assert_eq!(sr192_master.m_core, 2);
+        assert_eq!(sr192_master.os_latency_samples, 31);
+        assert_eq!(sr192_master.f_s_vm.to_bits(), 192_000.0_f64.to_bits());
+        assert_eq!(sr192_master.f_s_core.to_bits(), 384_000.0_f64.to_bits());
+        assert_eq!(sr192_master.k_ctrl, 64);
 
-        let sr384 = ZohRateContext::compute(48_000.0, 384_000.0, Tier::Ultra, true, false).unwrap();
-        assert!(!sr384.os2x_active);
+        let sr384 = ZohRateContext::compute(48_000.0, 384_000.0, RenderMode::Master).unwrap();
+        assert_eq!(sr384.m_core, 1);
+        assert_eq!(sr384.os_latency_samples, 0);
+        assert_eq!(sr384.f_s_vm.to_bits(), 384_000.0_f64.to_bits());
         assert_eq!(sr384.f_s_core.to_bits(), 384_000.0_f64.to_bits());
         assert_eq!(sr384.k_ctrl, 128);
 
-        let bounce96 =
-            ZohRateContext::compute(48_000.0, 96_000.0, Tier::Ultra, true, true).unwrap();
-        assert!(bounce96.is_bounce_4x);
-        assert!(!bounce96.os2x_active);
-        assert_eq!(bounce96.f_s_vm.to_bits(), 384_000.0_f64.to_bits());
-        assert_eq!(bounce96.f_s_core.to_bits(), 384_000.0_f64.to_bits());
-        assert_eq!(bounce96.k_ctrl, 128);
-        assert!((bounce96.inv_f_s_vm() * 384_000.0 - 1.0).abs() < 1.0e-12);
-        assert!((bounce96.inv_f_s_core() * 384_000.0 - 1.0).abs() < 1.0e-12);
+        let master96 = ZohRateContext::compute(48_000.0, 96_000.0, RenderMode::Master).unwrap();
+        assert_eq!(master96.m_core, 4);
+        assert_eq!(master96.os_latency_samples, 37);
+        assert_eq!(master96.f_s_vm.to_bits(), 96_000.0_f64.to_bits());
+        assert_eq!(master96.f_s_core.to_bits(), 384_000.0_f64.to_bits());
+        assert_eq!(master96.k_ctrl, 32);
+        assert!((master96.inv_f_s_vm() * 96_000.0 - 1.0).abs() < 1.0e-12);
+        assert!((master96.inv_f_s_core() * 384_000.0 - 1.0).abs() < 1.0e-12);
     }
 
     /// verify[dsp.zoh.core-paralru]

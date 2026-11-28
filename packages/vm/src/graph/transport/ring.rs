@@ -24,8 +24,8 @@ pub use schroeder::{
     compute_schroeder_requirements,
 };
 
-/// Inline `Quad 0` frame-major `fp16` delay ring capacity (`128` frames = `1,024 B`).
-pub const TRANSPORT_INLINE_QUAD0_CAP: usize = 128;
+/// Inline `Quad 0` frame-major `fp16` delay ring capacity (`64` frames = `512 B`).
+pub const TRANSPORT_INLINE_QUAD0_CAP: usize = 64;
 
 /// Minimum external quad delay ring capacity (`128` frames).
 pub const TRANSPORT_MIN_EXT_CAP: usize = 128;
@@ -138,7 +138,7 @@ pub fn compute_quad_ext_requirements(
 
     let has_ext = (quad_idx > 0)
         || ((quad.flags & TRANSPORT_FLAG_EXT_F32) != 0)
-        || (max_wire_delay_scaled > 120.0)
+        || (max_wire_delay_scaled > (TRANSPORT_INLINE_QUAD0_CAP.saturating_sub(8)) as f64)
         || (req_frames > TRANSPORT_INLINE_QUAD0_CAP)
         || (ext_ring_pow2_frames >= 8);
 
@@ -669,20 +669,20 @@ mod tests {
     /// verify[dsp.op-t.ring.capacity]
     #[test]
     fn test_quad_ext_sizing_boundaries_and_fail_closed() {
-        let q0_inline = base_wire([53.0, 67.0, 79.0, 120.0], [0; 4], 0);
+        let q0_inline = base_wire([23.0, 37.0, 49.0, 56.0], [0; 4], 0);
         assert_eq!(
-            compute_quad_ext_requirements(&q0_inline, 0, 1.0, 120, 7),
-            (false, 128)
+            compute_quad_ext_requirements(&q0_inline, 0, 1.0, 56, 6),
+            (false, 64)
         );
-        assert_eq!(required_ext_elements(&q0_inline, 0, 1.0, 120, 7), (0, 0));
+        assert_eq!(required_ext_elements(&q0_inline, 0, 1.0, 56, 6), (0, 0));
 
-        // Delay > 120 on Quad 0 forces external fp16 allocation.
-        let q0_121 = base_wire([53.0, 67.0, 79.0, 121.0], [0; 4], 0);
+        // Delay > 56 on Quad 0 forces external fp16 allocation.
+        let q0_57 = base_wire([23.0, 37.0, 49.0, 57.0], [0; 4], 0);
         assert_eq!(
-            compute_quad_ext_requirements(&q0_121, 0, 1.0, 121, 7),
-            (true, 256)
+            compute_quad_ext_requirements(&q0_57, 0, 1.0, 57, 6),
+            (true, 128)
         );
-        assert_eq!(required_ext_elements(&q0_121, 0, 1.0, 121, 7), (1_024, 0));
+        assert_eq!(required_ext_elements(&q0_57, 0, 1.0, 57, 6), (512, 0));
 
         // 48,000 samples @ 384 kHz (rho_vm = 0.125) caps at 524,288 frames.
         let q1_ultra = base_wire([48_000.0; 4], [0; 4], TRANSPORT_FLAG_EXT_F32);

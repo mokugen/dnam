@@ -321,7 +321,10 @@ mod tests {
         for b in 0..2 {
             for p in 0..4 {
                 a0.conv_kautz_lite[b].r_low[p] = F32::new(0.80 - 0.05 * (p as f32));
-                a0.conv_kautz_lite[b].dr[p] = F32::new(0.05);
+                a0.conv_kautz_lite[b].onset_delay_samp[p] =
+                    zerocopy::byteorder::little_endian::U16::new((p as u16) * 2);
+                a0.conv_kautz_lite[b].c_cross_fp16[p] =
+                    zerocopy::byteorder::little_endian::U16::new(crate::math::f32_to_fp16(0.05));
                 a0.conv_kautz_lite[b].theta[p] = F32::new(0.15 + 0.1 * (p as f32));
                 a0.conv_kautz_lite[b].b_gamma[p] = F32::new(0.25);
                 a0.conv_kautz_lite[b].c_re_l[p] = F32::new(0.4);

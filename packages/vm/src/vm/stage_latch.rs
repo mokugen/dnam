@@ -70,7 +70,7 @@ mod tests {
     use crate::types::Tier;
     use crate::vm::SonaVmBacking;
 
-    fn build_stage_latch_test_bin() -> ([u8; 128 + 4_608 + 64], usize) {
+    fn build_stage_latch_test_bin() -> ([u8; 128 + crate::bin::ARENA0_LITE_BYTES + 64], usize) {
         let mut a0 = DnamBinBuildInput::default_arena0_lite();
         a0.core_quads[0].svf_k_fp16[0] = U16::new(f32_to_fp16(0.85));
         a0.core_quads[0].adaa_drive_fp16[0] = U16::new(f32_to_fp16(1.25));
@@ -82,9 +82,9 @@ mod tests {
 
         a0.control_bus_lite.cp1_dir.cp1_dir_count = U16::new(1);
         a0.control_bus_lite.cp1_dir.entries[0] = [0, 0x01, 0xFF];
-        a0.control_bus_lite.cp1_base[..4].copy_from_slice(F32::new(1.0).as_bytes());
-        a0.control_bus_lite.cp1_base[32..36].copy_from_slice(F32::new(1.0).as_bytes());
-        a0.control_bus_lite.cp1_base[36..40].copy_from_slice(F32::new(1.0).as_bytes());
+        a0.control_bus_lite.gra_lite[..4].copy_from_slice(F32::new(1.0).as_bytes());
+        a0.control_bus_lite.gra_lite[32..36].copy_from_slice(F32::new(1.0).as_bytes());
+        a0.control_bus_lite.gra_lite[36..40].copy_from_slice(F32::new(1.0).as_bytes());
         let raw_desc = ControlClampDescriptor::range(-1.0, 1.0, 0.0, 1, [0.0; 3]).to_wire();
 
         let input = DnamBinBuildInput {
@@ -108,7 +108,7 @@ mod tests {
             arena2: None,
             arena3: None,
         };
-        let mut buf = [0_u8; 128 + 4_608 + 64];
+        let mut buf = [0_u8; 128 + crate::bin::ARENA0_LITE_BYTES + 64];
         let n = encode_dnam_bin_into(&input, &mut buf).unwrap();
         (buf, n)
     }

@@ -1,4 +1,4 @@
-//! SONA v3.0 integration contract tests: `384 kHz` live retiming, failure-atomic
+//! SONA v4.0 integration contract tests: `384 kHz` live retiming, failure-atomic
 //! `192 kHz` `4x` offline bounce rejection, unconditional `Op-P` + phasor stepping across tier
 //! transitions, `Op-T` 4-frame micro-ramp vs `3 kHz` `psi` slew cadence, dirty-control LFO/drift
 //! isolation, `HOST_WRITE_LOCK` tier sync, and OU drift scrub on disable or offline bounce.
@@ -14,10 +14,10 @@ use dnam_vm::bin::{
     encode_dnam_bin,
 };
 use dnam_vm::graph::ConvolverHighSrMode;
+use dnam_vm::graph::oversample::RenderMode;
 use dnam_vm::math::{TANK_DC_BLOCKER_48K_F32, f32_to_fp16};
 use dnam_vm::{
-    Bounce4xOversampler, DefaultMathBackend, DynamicSonaVm, OFFLINE_BOUNCE_PDC_SAMPLES, SonaVm,
-    TIER_SWITCH_XFADE_SAMPLES, Tier, VmError,
+    DefaultMathBackend, DynamicSonaVm, SonaVm, TIER_SWITCH_XFADE_SAMPLES, Tier, VmError,
 };
 
 use super::helpers::{
@@ -46,8 +46,9 @@ fn build_zero_crossbar_lite_full_fixture() -> Vec<u8> {
     quad.lru_alpha_rel = [F32::new(0.25); 4];
     quad.lru_alpha_atk = [F32::new(0.99); 4];
     quad.in_mid_weight_fp16 = fp16_arr([0.45, 0.35, 0.25, 0.15]);
-    quad.tone_lp_fp16 = fp16_arr([0.5; 4]);
-    quad.tone_dir_fp16 = fp16_arr([1.0; 4]);
+    quad.c_lp_fp16 = fp16_arr([0.5; 4]);
+    quad.c_u_fp16 = fp16_arr([1.0; 4]);
+    quad.c_kbp_fp16 = [U16::new(0); 4];
     quad.wavefolder_mix_fp16 = fp16_arr([0.04; 4]);
     quad.svf_k_nl_fp16 = [U16::new(0); 4];
     a0.core_quads = [quad; 4];
@@ -125,7 +126,22 @@ fn test_retime_384k_and_failure_atomic_offline_bounce_192k() {
         .unwrap();
     assert_finite_non_silent(&ol, &or, "SonaVm retime 384k");
 
-    // 192 kHz * 4x offline bounce = 768 kHz > 384 kHz -> Err(InvalidSampleRate), zero state mutation.
+    // 192 kHz Master oversampling activates 2x core (384 kHz) with PDC = 31 and CaseA stride_q = 4.
+    let mut vm_192 =
+        SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&ultra, Tier::Ultra, 192_000.0).unwrap();
+    vm_192.set_offline_bounce(true).unwrap();
+    assert_eq!(vm_192.slab().cold().render_mode, RenderMode::Master);
+    assert_eq!(vm_192.get_latency_samples(), 31);
+    assert_eq!(
+        vm_192.slab().cold().convolver_fir_ext.mode(),
+        ConvolverHighSrMode::CaseA { stride_q: 4 }
+    );
+    vm_192
+        .process_block(&in_l, &in_r, &mut ol, &mut or)
+        .unwrap();
+    assert_finite_non_silent(&ol, &or, "192k Master 2x audio");
+
+    // Retiming above 384 kHz ceiling fails atomically without mutating VM state.
     let mut vm_fail =
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&ultra, Tier::Ultra, 192_000.0).unwrap();
     let mut vm_twin =
@@ -138,11 +154,11 @@ fn test_retime_384k_and_failure_atomic_offline_bounce_192k() {
         .unwrap();
 
     assert_eq!(
-        vm_fail.set_offline_bounce(true),
+        vm_fail.retime_sample_rate(384_001.0),
         Err(VmError::InvalidSampleRate)
     );
-    assert!(!vm_fail.slab().cold().offline_bounce);
-    assert_eq!(vm_fail.get_latency_samples(), 0);
+    assert_eq!(vm_fail.slab().cold().render_mode, RenderMode::Live);
+    assert_eq!(vm_fail.get_latency_samples(), 7);
     assert_eq!(
         vm_fail.slab().cold().convolver_fir_ext.mode(),
         ConvolverHighSrMode::CaseA { stride_q: 4 }
@@ -156,7 +172,7 @@ fn test_retime_384k_and_failure_atomic_offline_bounce_192k() {
     vm_twin
         .process_block(&in_l, &in_r, &mut l_twin, &mut r_twin)
         .unwrap();
-    assert_finite_non_silent(&l_fail, &r_fail, "192k post-failed-bounce audio");
+    assert_finite_non_silent(&l_fail, &r_fail, "192k post-failed-retime audio");
     for i in 0..64 {
         assert_eq!(l_fail[i].to_bits(), l_twin[i].to_bits(), "atomic L@{i}");
         assert_eq!(r_fail[i].to_bits(), r_twin[i].to_bits(), "atomic R@{i}");
@@ -164,11 +180,11 @@ fn test_retime_384k_and_failure_atomic_offline_bounce_192k() {
 
     let mut dyn_fail = DynamicSonaVm::open_dnam_bin(&ultra, Tier::Ultra, 192_000.0).unwrap();
     assert_eq!(
-        dyn_fail.set_offline_bounce(true),
+        dyn_fail.retime_sample_rate(384_001.0),
         Err(VmError::InvalidSampleRate)
     );
     assert!(!dyn_fail.telemetry().offline_bounce);
-    assert_eq!(dyn_fail.telemetry().latency_samples, 0);
+    assert_eq!(dyn_fail.telemetry().latency_samples, 7);
 }
 
 /// verify[dsp.crossbar.top-of-frame]
@@ -191,14 +207,14 @@ fn test_unconditional_opp_and_phasor_stepping_across_tier_switch() {
     assert!(last_iq.iter().any(|&v| v.abs() > 1.0e-6));
     assert!(last_feat.iter().any(|&v| v.abs() > 1.0e-6));
 
-    // Switch Lite -> Full: os2x_hot seeds directly from last_op_p_* without jumping back to 0.
+    // Switch Lite -> Full: op_p_prev_* in lite hot prefix seeds directly from last_op_p_* without jumping back to 0.
     vm.switch_tier(Tier::Full).unwrap();
     assert_eq!(
-        vm.slab().os2x_hot.op_p_prev_iq_lr.map(f32::to_bits),
+        vm.slab().lite.op_p_prev_iq_lr.map(f32::to_bits),
         last_iq.map(f32::to_bits)
     );
     assert_eq!(
-        vm.slab().os2x_hot.op_p_prev_feat.map(f32::to_bits),
+        vm.slab().lite.op_p_prev_feat.map(f32::to_bits),
         last_feat.map(f32::to_bits)
     );
     assert_eq!(vm.slab().lite.phasors.phase, lite_phases);
@@ -215,22 +231,20 @@ fn test_opt_micro_ramp_4frame_latch_and_dirty_lfo_drift_invariance() {
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&ultra, Tier::Ultra, 44_100.0).unwrap();
     let (in_l, in_r) = stereo_test_signal(32, 14);
 
-    // Trigger slew on tank_psi + change on slot 16 (ctrl 1) and slot 22 (ctrl 2) right before boundary.
+    // Trigger slew on tank_psi + change on slot 13 (op_t_g_loop_delta via ctrl 1) right before boundary.
     vm.set_controls_batch(&[(0, 1_900.0), (1, 0.0), (2, 1.0)])
         .unwrap();
     let _ = vm.step_frame(in_l[0], in_r[0]).unwrap();
     let psi_tick0 = vm.slab().lite.transport_quad0.current_psi;
-    let freeze_tick0 = vm.slab().cold().transport_quad_eff[0].mu_freeze;
-    let dry_bits0 = vm.slab().lite.tank_dry_mix_eff_fp16;
+    let gloop_tick0 = vm.slab().lite.transport_quad0.g_loop;
 
-    // Frame 1..3 (sample_tick = 1, 2, 3): neither mu_freeze, dry_mix_eff, nor current_psi moves.
+    // Frame 1..3 (sample_tick = 1, 2, 3): neither g_loop nor current_psi moves.
     for tick in 1..4 {
         let _ = vm.step_frame(in_l[tick], in_r[tick]).unwrap();
         assert_eq!(
-            vm.slab().cold().transport_quad_eff[0].mu_freeze.to_bits(),
-            freeze_tick0.to_bits()
+            vm.slab().lite.transport_quad0.g_loop.to_bits(),
+            gloop_tick0.to_bits()
         );
-        assert_eq!(vm.slab().lite.tank_dry_mix_eff_fp16, dry_bits0);
         assert_eq!(
             vm.slab().lite.transport_quad0.current_psi.to_bits(),
             psi_tick0.to_bits()
@@ -238,7 +252,7 @@ fn test_opt_micro_ramp_4frame_latch_and_dirty_lfo_drift_invariance() {
     }
 
     // Frame 4..14: on (sample_tick & 3) == 0 (`4, 8, 12`) with ctrl_sub_counter != 0,
-    // mu_freeze & stage dry_mix update while current_psi waits for the 3 kHz boundary.
+    // g_loop_eff updates while current_psi waits for the 3 kHz boundary.
     let mut non_slew_latched_mid = false;
     for tick in 4..15 {
         let _ = vm.step_frame(in_l[tick], in_r[tick]).unwrap();
@@ -248,9 +262,7 @@ fn test_opt_micro_ramp_4frame_latch_and_dirty_lfo_drift_invariance() {
         } else {
             assert_eq!(sub, 0);
         }
-        if vm.slab().cold().transport_quad_eff[0].mu_freeze.to_bits() != freeze_tick0.to_bits()
-            && vm.slab().lite.tank_dry_mix_eff_fp16 != dry_bits0
-        {
+        if vm.slab().lite.transport_quad0.g_loop.to_bits() != gloop_tick0.to_bits() {
             non_slew_latched_mid = true;
         }
         assert_eq!(
@@ -260,7 +272,7 @@ fn test_opt_micro_ramp_4frame_latch_and_dirty_lfo_drift_invariance() {
     }
     assert!(
         non_slew_latched_mid,
-        "Op-T non-slew slots (freeze_mix & dry_mix) must micro-ramp at 4-frame cadence"
+        "Op-T non-slew slot (g_loop) must micro-ramp at 4-frame cadence"
     );
 
     // Frame 15 (ctrl_sub_counter == 0 before step): 3 kHz boundary advances current_psi slew.
@@ -333,7 +345,7 @@ fn test_mid_window_ctrl_dirty_waits_for_3khz_boundary_with_zero_ulp_chunk_parity
         .unwrap()
         .stage_targets;
     let psi_5 = vm_step.slab().lite.transport_quad0.current_psi;
-    let freeze_5 = vm_step.slab().cold().transport_quad_eff[0].mu_freeze;
+    let gloop_5 = vm_step.slab().lite.transport_quad0.g_loop;
     let oct_5 = vm_step.slab().cold().kautz_slew.prev_oct;
 
     // Mid-window writes at frame 5 (ctrl_sub_counter == 5) must defer until the 3 kHz boundary.
@@ -364,10 +376,8 @@ fn test_mid_window_ctrl_dirty_waits_for_3khz_boundary_with_zero_ulp_chunk_parity
             psi_5.to_bits()
         );
         assert_eq!(
-            vm_step.slab().cold().transport_quad_eff[0]
-                .mu_freeze
-                .to_bits(),
-            freeze_5.to_bits()
+            vm_step.slab().lite.transport_quad0.g_loop.to_bits(),
+            gloop_5.to_bits()
         );
         assert_eq!(
             vm_step.slab().cold().kautz_slew.prev_oct.to_bits(),
@@ -388,7 +398,7 @@ fn test_mid_window_ctrl_dirty_waits_for_3khz_boundary_with_zero_ulp_chunk_parity
         assert_eq!(step_r[t].to_bits(), blk_r[t].to_bits(), "pre R@{t}");
     }
 
-    // Frame 15 (ctrl_sub_counter == 0): boundary consumes dirty state and advances slews + freeze.
+    // Frame 15 (ctrl_sub_counter == 0): boundary consumes dirty state and advances slews + g_loop.
     for t in 15..32 {
         (step_l[t], step_r[t]) = vm_step.step_frame(in_l[t], in_r[t]).unwrap();
         if t == 15 {
@@ -398,10 +408,8 @@ fn test_mid_window_ctrl_dirty_waits_for_3khz_boundary_with_zero_ulp_chunk_parity
                 psi_5.to_bits()
             );
             assert_ne!(
-                vm_step.slab().cold().transport_quad_eff[0]
-                    .mu_freeze
-                    .to_bits(),
-                freeze_5.to_bits()
+                vm_step.slab().lite.transport_quad0.g_loop.to_bits(),
+                gloop_5.to_bits()
             );
         }
     }
@@ -460,6 +468,8 @@ fn test_retained_quad_write_lock_sync_across_tier_downgrade_and_upgrade() {
     }
 }
 
+/// Transitional `C3.1 -> C3.4` test: wire `ou_drift` fields retired in `C3.1`; runtime
+/// `ou_drift_state` removal executes in `C3.4` (`ControlBus v4 GRA`).
 #[test]
 fn test_zero_control_ou_drift_scrubbed_cleanly_on_drift_disable_and_offline_bounce() {
     let mut a0 = DnamBinBuildInput::default_arena0_lite();
@@ -470,9 +480,6 @@ fn test_zero_control_ou_drift_scrubbed_cleanly_on_drift_disable_and_offline_boun
     a0.linear_readout_lite.direct_s2_u_gain = [F32::new(0.5), F32::new(0.5)];
     a0.control_bus_lite.tank_dry_mix_fp16 = U16::new(f32_to_fp16(1.0));
     a0.control_bus_lite.lfo_dphi_train = [F32::new(0.0), F32::new(0.0)];
-    a0.control_bus_lite.sigma_drift = F32::new(0.5);
-    a0.control_bus_lite.rho_drift_train = F32::new(0.99);
-    a0.control_bus_lite.ou_to_z_stage_fp16 = fp16_arr([1.0, -0.5, 0.25, -0.75]);
 
     let bin = super::helpers::encode_lite_fixture(&a0, DNBN_FLAG_STEREO_OUT, 0.99, &[], None);
     let (in_l, in_r) = stereo_test_signal(128, 19);
@@ -486,11 +493,6 @@ fn test_zero_control_ou_drift_scrubbed_cleanly_on_drift_disable_and_offline_boun
     vm_a.process_block(&in_l, &in_r, &mut ol, &mut or).unwrap();
     vm_b.process_block(&in_l, &in_r, &mut ol, &mut or).unwrap();
 
-    let bus_before = vm_a.slab().cold().ctrl_bus.as_ref().unwrap();
-    assert!(bus_before.ou_drift_state.iter().any(|&v| v.abs() > 1.0e-5));
-    assert_ne!(bus_before.eff_z_stage(), bus_before.z_stage());
-
-    // Disabling live analog drift immediately zeroes OU state & eff_z_stage delta.
     vm_a.set_live_analog_drift_enabled(false);
     let bus_a = vm_a.slab().cold().ctrl_bus.as_ref().unwrap();
     assert_eq!(bus_a.ou_drift_state.map(f32::to_bits), [0; 4]);
@@ -520,6 +522,7 @@ fn build_wdw_core_conv_transport_multi_tier_bin(stereo_out: bool) -> Vec<u8> {
     let q_core = make_core_quad(0);
     let mut q_linear = q_core;
     q_linear.svf_k_nl_fp16 = [U16::new(0); 4];
+    q_linear.c_kbp_fp16 = [U16::new(0); 4];
     a0.core_quads = [q_core, q_linear, q_linear, q_linear];
     a0.conv_fir_lite.fir_l[0] = F32::new(0.70);
     a0.conv_fir_lite.fir_r[0] = F32::new(0.65);
@@ -692,25 +695,29 @@ fn test_wdw_partition_tier_switch_crossfade_parity() {
 
 #[test]
 fn test_wdw_partition_4x_bounce_dirac_pdc_and_sinusoid_parity() {
+    use dnam_kernels::CORE_OS_MASTER_4X_LATENCY_1X;
+    use dnam_vm::graph::oversample::CoreOversamplerMasterCold;
+
     let bin = build_wdw_core_conv_transport_multi_tier_bin(true);
     let mut vm =
         SonaVm::<DefaultMathBackend>::open_dnam_bin_owned(&bin, Tier::Lite, 48_000.0).unwrap();
     vm.set_offline_bounce(true).unwrap();
-    assert_eq!(vm.get_latency_samples(), OFFLINE_BOUNCE_PDC_SAMPLES);
+    assert_eq!(vm.get_latency_samples(), CORE_OS_MASTER_4X_LATENCY_1X);
 
-    let mut os_ref = Bounce4xOversampler::new();
-    let mut dirac_ref = [0.0_f32; 64];
-    let mut core_l_hist = [0.0_f32; 64];
-    let mut wet_l_hist = [0.0_f32; 64];
+    let mut os_ref = CoreOversamplerMasterCold::new();
+    let mut dirac_ref = [0.0_f32; 96];
+    let mut core_l_hist = [0.0_f32; 96];
+    let mut wet_l_hist = [0.0_f32; 96];
 
-    for n in 0..64 {
+    for n in 0..96 {
         let (in_l, in_r) = if n == 0 {
             (0.8_f32, -0.6_f32)
         } else {
             (0.0, 0.0)
         };
-        let up_ref = os_ref.upsample_4x(in_l, in_r);
-        dirac_ref[n] = os_ref.downsample_4x(up_ref)[0];
+        let up_ref = os_ref.upsample_1x_to_4x(in_l, in_r);
+        let sub4 = up_ref.map(|[l, r]| [l, r, 0.0, 0.0]);
+        dirac_ref[n] = os_ref.downsample_4x_to_1x::<DefaultMathBackend>(sub4)[0];
 
         let (ol, or) = vm.step_frame(in_l, in_r).unwrap();
         let (core_lr, wet_lr) = vm.last_wdw_partition();
@@ -738,7 +745,7 @@ fn test_wdw_partition_4x_bounce_dirac_pdc_and_sinusoid_parity() {
         .max_by(|(_, a), (_, b)| a.abs().total_cmp(&b.abs()))
         .map(|(idx, _)| idx)
         .unwrap();
-    assert_eq!(ref_peak_idx, OFFLINE_BOUNCE_PDC_SAMPLES);
+    assert_eq!(ref_peak_idx, CORE_OS_MASTER_4X_LATENCY_1X);
 
     let (core_peak_idx, core_peak) = core_l_hist
         .iter()
@@ -748,13 +755,13 @@ fn test_wdw_partition_4x_bounce_dirac_pdc_and_sinusoid_parity() {
         .unwrap();
     assert!(core_peak > 1.0e-2, "core_peak={core_peak}");
     assert!(
-        (11..=14).contains(&core_peak_idx),
-        "core peak must reflect 12-sample bounce PDC, got idx={core_peak_idx}"
+        (35..=40).contains(&core_peak_idx),
+        "core peak must reflect 37-sample Master PDC, got idx={core_peak_idx}"
     );
-    let early_core_energy: f32 = core_l_hist[..6].iter().map(|v| v.abs()).sum();
+    let early_core_energy: f32 = core_l_hist[..20].iter().map(|v| v.abs()).sum();
     assert!(early_core_energy < 0.05 * core_peak);
 
-    // Transport delay_samples >= 12 at 48 kHz + 12-sample bounce PDC -> zero wet energy before n = 12.
+    // Transport delay_samples >= 12 at 48 kHz -> zero wet energy before n = 12.
     for (n, &w) in wet_l_hist.iter().enumerate().take(12) {
         assert!(w.abs() < 1.0e-6, "unexpected early wet energy @{n}: {w}");
     }
@@ -766,11 +773,11 @@ fn test_wdw_partition_4x_bounce_dirac_pdc_and_sinusoid_parity() {
         .unwrap();
     assert!(wet_peak > 1.0e-3, "wet_peak={wet_peak}");
     assert!(
-        wet_peak_idx >= 22,
-        "wet peak must follow transport delay + 12-sample PDC, got idx={wet_peak_idx}"
+        wet_peak_idx >= 12,
+        "wet peak must follow transport delay >= 12, got idx={wet_peak_idx}"
     );
 
-    // Reset clears bounce4x_core_decim and bounce4x_wet_decim cleanly, and sinusoid maintains parity.
+    // Reset clears Master oversampler histories cleanly, and sinusoid maintains parity.
     vm.reset();
     assert_eq!(vm.last_wdw_partition(), ([0.0; 2], [0.0; 2]));
     assert_eq!(vm.step_frame(0.0, 0.0).unwrap(), (0.0, 0.0));
@@ -805,7 +812,7 @@ fn test_wdw_partition_4x_bounce_dirac_pdc_and_sinusoid_parity() {
     assert_eq!(vm.step_frame(0.0, 0.0).unwrap(), (0.0, 0.0));
     assert_eq!(vm.last_wdw_partition(), ([0.0; 2], [0.0; 2]));
 
-    // Mid-crossfade in-place reload cleanly clears xfade_prev_* and bounce4x_*_decim.
+    // Mid-crossfade in-place reload cleanly clears xfade_prev_* and master_os histories.
     let _ = vm.step_frame(0.5, -0.4).unwrap();
     vm.switch_tier(Tier::Pro).unwrap();
     let _ = vm.step_frame(0.25, -0.25).unwrap();

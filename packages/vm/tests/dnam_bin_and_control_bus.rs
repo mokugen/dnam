@@ -16,25 +16,24 @@ use dnam_vm::control::bus::laws::{
 };
 use dnam_vm::math::{exp2_signed_oct_f32, f32_to_fp16};
 use dnam_vm::{
-    Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, CextDispatchWire, ControlBus,
-    ControlBusBacking, ControlClampDescriptor, Cp1ContributorSlot, Cp1StreamDirEntryWire,
-    Cp1StreamHeaderWire, DnamBinBuildInput, DnamBinView, ScalarBackend, TempoSyncEntryWire, Tier,
-    VmError, computed_dnam_bin_byte_len, encode_dnam_bin, encode_dnam_bin_into,
-    eval_3node_calibration_f64, eval_tsyn_target_value, invert_tsyn_lobatto_anchors,
-    strip_dnam_bin_to_tier,
+    Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire, ControlBus, ControlBusBacking,
+    ControlClampDescriptor, Cp1ContributorSlot, Cp1StreamDirEntryWire, Cp1StreamHeaderWire,
+    DnamBinBuildInput, DnamBinView, ScalarBackend, TempoSyncEntryWire, Tier, VmError,
+    computed_dnam_bin_byte_len, encode_dnam_bin, encode_dnam_bin_into, eval_3node_calibration_f64,
+    eval_tsyn_target_value, invert_tsyn_lobatto_anchors, strip_dnam_bin_to_tier,
 };
 use proptest::prelude::*;
 use zerocopy::byteorder::little_endian::{F32, U16, U32};
 use zerocopy::{FromZeros, IntoBytes};
 
 fn build_rich_ultra_fixture(
-    with_cext: bool,
+    _with_cext: bool,
     with_cp1_overflow: bool,
     rot_q_buyer: Option<[[f32; 4]; 4]>,
 ) -> Vec<u8> {
     assert_eq!(core::mem::size_of::<CrossbarWire>(), 256);
-    assert_eq!(core::mem::size_of::<CoreQuadWire>(), 192);
-    assert_eq!(core::mem::size_of::<TransportQuadWire>(), 128);
+    assert_eq!(core::mem::size_of::<CoreQuadWire>(), 240);
+    assert_eq!(core::mem::size_of::<TransportQuadWire>(), 192);
 
     let mut a0 = DnamBinBuildInput::default_arena0_lite();
     a0.crossbar.cell_desc.tier_flags = U16::new(0x000F);
@@ -53,16 +52,12 @@ fn build_rich_ultra_fixture(
     a0.linear_readout_lite.pre_conv_hp_gain = [F32::new(0.05), F32::new(0.05)];
     a0.control_bus_lite.lfo_skew_fp16 = [U16::new(f32_to_fp16(0.5)), U16::new(f32_to_fp16(-0.5))];
     a0.control_bus_lite.tank_dry_mix_fp16 = U16::new(f32_to_fp16(0.75));
-    a0.control_bus_lite.ou_to_z_stage_fp16 =
-        [0.5, -0.25, 0.125, -0.75].map(|v| U16::new(f32_to_fp16(v)));
 
     let a1 = Arena1FullDeltaWire::new_zeroed();
     let mut a2 = Arena2ProDeltaWire::new_zeroed();
     let mut a3 = Arena3UltraDeltaWire::new_zeroed();
     // Mark Quad 2 ext_f32 to test OR propagation to DBRM::ext_ring_format.
     a2.transport_pro[0].flags = TRANSPORT_FLAG_EXT_F32;
-    a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[160] = U16::new(f32_to_fp16(1.25));
-    a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[163] = U16::new(f32_to_fp16(-1.5));
 
     // 2 range controls + 1 switch control + optional conditional rule.
     let mut c0 = ControlClampDescriptor::range(100.0, 1_000.0, 550.0, 3, [0.0, -0.5, 0.5]);
@@ -79,8 +74,8 @@ fn build_rich_ultra_fixture(
     // Define base main_base[0][0..8], v_base[4], w_ctrl[16][16], u_int_base[4][8].
     let mut main_b0 = [0.4_f32, -0.2, 0.1, 0.3, 0.25, -0.15, 0.05, 0.2];
     let mut main_b1 = [-0.3_f32, 0.2, 0.15, -0.1, 0.1, 0.2, -0.25, 0.05];
-    let mut u_int_b = [[0.0_f32; 8]; 4];
-    u_int_b[0] = [0.2, -0.1, 0.05, 0.15, 0.12, 0.08, -0.04, 0.02];
+    let mut u_int_b = [[0.0_f32; 4]; 4];
+    u_int_b[0] = [0.2, -0.1, 0.05, 0.15];
 
     let mut w_ctrl = [[0.0_f32; 16]; 16];
     w_ctrl[0][0] = 0.5;
@@ -88,18 +83,6 @@ fn build_rich_ultra_fixture(
     w_ctrl[0][4] = 0.3;
     w_ctrl[13][0] = 0.2;
     w_ctrl[15][4] = 0.4;
-
-    let mut cext = CextDispatchWire::new_zeroed();
-    let mut w_ext0 = [0.0_f32; 16];
-    w_ext0[0] = 0.8; // slot 16 op_t_freeze_mix_delta
-    w_ext0[4] = 0.25;
-
-    let mut w_ext1 = [0.0_f32; 16];
-    w_ext1[0] = 0.35;
-    w_ext1[4] = 0.5;
-
-    let mut w_ext14 = [0.0_f32; 16];
-    w_ext14[0] = -0.6; // slot 30 sense_vca_gain_delta
 
     if let Some(q) = rot_q_buyer {
         let rot4 = |v: &mut [f32]| {
@@ -117,18 +100,10 @@ fn build_rich_ultra_fixture(
         for row in &mut w_ctrl {
             rot4(row);
         }
-        rot4(&mut w_ext0);
-        rot4(&mut w_ext1);
-        rot4(&mut w_ext14);
     }
 
-    for col in 0..16 {
-        cext.w_ctrl_ext[0][col] = F32::new(w_ext0[col]);
-        cext.w_ctrl_ext[1][col] = F32::new(w_ext1[col]);
-        cext.w_ctrl_ext[14][col] = F32::new(w_ext14[col]);
-    }
     for f in 0..4 {
-        for d in 0..8 {
+        for d in 0..4 {
             a0.control_bus_lite.u_int_base[f][d] = F32::new(u_int_b[f][d]);
         }
     }
@@ -186,15 +161,17 @@ fn build_rich_ultra_fixture(
         a0.control_bus_lite.cp1_dir.entries[0] = [0, 1, 0xFF];
         a0.control_bus_lite.cp1_dir.entries[1] = [1, 1, 0xFF];
         for (i, &v) in s0_base.iter().enumerate() {
-            a0.control_bus_lite.cp1_base[i * 4..(i + 1) * 4]
+            a0.control_bus_lite.gra_lite[i * 4..(i + 1) * 4]
                 .copy_from_slice(F32::new(v).as_bytes());
         }
         for (i, &v) in s1_base.iter().enumerate() {
             let off = 52 + i * 4;
-            a0.control_bus_lite.cp1_base[off..off + 4].copy_from_slice(F32::new(v).as_bytes());
+            a0.control_bus_lite.gra_lite[off..off + 4].copy_from_slice(F32::new(v).as_bytes());
         }
-        a3.control_bus_ultra_delta.cp1_ultra[16..20].copy_from_slice(F32::new(0.3).as_bytes());
-        a3.control_bus_ultra_delta.cp1_ultra[32..36].copy_from_slice(F32::new(0.1).as_bytes());
+        a3.control_bus_ultra_delta.gra_ultra_delta[16..20]
+            .copy_from_slice(F32::new(0.3).as_bytes());
+        a3.control_bus_ultra_delta.gra_ultra_delta[32..36]
+            .copy_from_slice(F32::new(0.1).as_bytes());
     }
 
     let tsyn = [
@@ -243,7 +220,7 @@ fn build_rich_ultra_fixture(
         controls: &controls,
         cp1_overflow: &cp1_stream,
         tsyn: &tsyn,
-        cext: if with_cext { Some(&cext) } else { None },
+        cext: None,
         arena0: &a0,
         arena1: Some(&a1),
         arena2: Some(&a2),
@@ -355,7 +332,7 @@ fn test_ultra_roundtrip_strip_to_lite_bind_latency_and_fail_closed_corruption() 
 
     let mut bad_prefix_crc = ultra_bytes.clone();
     let a0_off = view.header.arena0_offset.get() as usize;
-    bad_prefix_crc[a0_off - 1] ^= 1; // last byte of 1,280 B CEXT (aligned to 64 B)
+    bad_prefix_crc[tsyn_pad - 1] ^= 1; // last byte of TSYN payload (no CEXT in v4)
     assert_eq!(
         DnamBinView::parse(&bad_prefix_crc).unwrap_err(),
         VmError::PrefixCrcMismatch
@@ -460,28 +437,28 @@ fn test_starcenter_0ulp_sweeps_no_alloc_parity_and_so4_qbuyer_invariance() {
         }
     }
 
-    // Uniform 32-slot anti-zipper ramping across slots 0, 16, and 30 without instant snap laglessness.
+    // Uniform anti-zipper ramping across base slots 0, 13, and 15 without instant snap laglessness.
     let prev_slot0 = bus_alloc.current_stage_params[0];
-    let prev_slot16 = bus_alloc.current_stage_params[16];
-    let prev_slot30 = bus_alloc.current_stage_params[30];
+    let prev_slot13 = bus_alloc.current_stage_params[13];
+    let prev_slot15 = bus_alloc.current_stage_params[15];
     bus_alloc
         .set_controls_batch(&[(0, 1_000.0), (1, -12.0)])
         .unwrap();
     bus_alloc.step_frame(None);
     assert!(bus_alloc.stage_ramp_deltas[0].abs() > 0.0);
-    assert!(bus_alloc.stage_ramp_deltas[16].abs() > 0.0);
-    assert!(bus_alloc.stage_ramp_deltas[30].abs() > 0.0);
+    assert!(bus_alloc.stage_ramp_deltas[13].abs() > 0.0);
+    assert!(bus_alloc.stage_ramp_deltas[15].abs() > 0.0);
     assert!(
         (bus_alloc.current_stage_params[0] - prev_slot0).abs()
             < (bus_alloc.stage_targets[0] - prev_slot0).abs()
     );
     assert!(
-        (bus_alloc.current_stage_params[16] - prev_slot16).abs()
-            < (bus_alloc.stage_targets[16] - prev_slot16).abs()
+        (bus_alloc.current_stage_params[13] - prev_slot13).abs()
+            < (bus_alloc.stage_targets[13] - prev_slot13).abs()
     );
     assert!(
-        (bus_alloc.current_stage_params[30] - prev_slot30).abs()
-            < (bus_alloc.stage_targets[30] - prev_slot30).abs()
+        (bus_alloc.current_stage_params[15] - prev_slot15).abs()
+            < (bus_alloc.stage_targets[15] - prev_slot15).abs()
     );
     assert_eq!(
         eval_crossbar_wet_scale(bus_alloc.current_stage_params[15]),
@@ -681,25 +658,15 @@ fn test_control_bus_m10b_skewed_lfo_ou_uniform_ramping_and_table4_bounds() {
     // Extreme wire lfo_skew clamps to [-1.0, +1.0].
     a0.control_bus_lite.lfo_skew_fp16 = [U16::new(f32_to_fp16(2.5)), U16::new(f32_to_fp16(-2.5))];
     a0.control_bus_lite.tank_dry_mix_fp16 = U16::new(0x7E00); // NaN -> Table 4 fallback 1.0
-    a0.control_bus_lite.sigma_drift = F32::new(0.1);
-    a0.control_bus_lite.rho_drift_train = F32::new(0.95);
-    // Out-of-bounds OU weights clamp to [-4.0, +4.0].
-    a0.control_bus_lite.ou_to_z_stage_fp16 =
-        [8.0, -8.0, 0.5, 0.0].map(|v| U16::new(f32_to_fp16(v)));
-    // Route q2[0], q2[2] into slots 0, 15 and q3[0..4] into slots 16, 30.
+    // Route q2[0], q2[2] into slots 0, 15 and q3[0] into slot 0, q3[3] into slot 13.
     a0.control_bus_lite.w_ctrl[0][8] = F32::new(1.0);
     a0.control_bus_lite.w_ctrl[15][10] = F32::new(1.0);
     a0.control_bus_lite.w_ctrl[0][12] = F32::new(0.5);
+    a0.control_bus_lite.w_ctrl[13][15] = F32::new(-1.0);
 
     let a1 = Arena1FullDeltaWire::new_zeroed();
     let a2 = Arena2ProDeltaWire::new_zeroed();
-    let mut a3 = Arena3UltraDeltaWire::new_zeroed();
-    a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[160] = U16::new(f32_to_fp16(10.0));
-    a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[161] = U16::new(f32_to_fp16(-10.0));
-
-    let mut cext = CextDispatchWire::new_zeroed();
-    cext.w_ctrl_ext[0][12] = F32::new(1.0); // slot 16 <- det_env[0]
-    cext.w_ctrl_ext[14][15] = F32::new(-1.0); // slot 30 <- -det_env[3]
+    let a3 = Arena3UltraDeltaWire::new_zeroed();
 
     let input = DnamBinBuildInput {
         reference_sample_rate_hz: 48_000,
@@ -716,7 +683,7 @@ fn test_control_bus_m10b_skewed_lfo_ou_uniform_ramping_and_table4_bounds() {
         controls: &[],
         cp1_overflow: &[],
         tsyn: &[],
-        cext: Some(&cext),
+        cext: None,
         arena0: &a0,
         arena1: Some(&a1),
         arena2: Some(&a2),
@@ -755,23 +722,20 @@ fn test_control_bus_m10b_skewed_lfo_ou_uniform_ramping_and_table4_bounds() {
     bus.tick_control_boundary(None);
     assert_eq!(bus.env_states, [0.0; 4]);
 
-    // Drive slot 16 and slot 30 via sensory envelope through step_frame(Some(det_env)) and verify uniform ramping.
+    // Drive slot 0 and slot 13 via sensory envelope through step_frame(Some(det_env)) and verify uniform ramping.
     bus.reset();
     let targets_snapshot_before_ou = bus.stage_targets;
     bus.live_analog_drift_enabled = true;
     bus.offline_bounce = false;
     let first = *bus.step_frame(Some([0.8, 0.1, 0.2, 0.5])).unwrap();
-    assert!((bus.stage_targets[16] - 0.8).abs() < 1.0e-6);
-    assert!((bus.stage_targets[30] - (-0.5)).abs() < 1.0e-6);
-    assert!(first[16] > 0.0 && first[16] < 0.8);
-    assert!(first[30] < 0.0 && first[30] > -0.5);
+    assert!(bus.stage_targets[0] > 0.39);
+    assert!((bus.stage_targets[13] - (-0.5)).abs() < 1.0e-6);
+    assert!(first[13] < 0.0 && first[13] > -0.5);
 
-    // OU drive updates eff_z_stage() strictly while leaving z_stage() untouched and suppressing on bounce/disable.
     let z_s = bus.z_stage();
     let eff = bus.eff_z_stage();
-    assert_ne!(eff, z_s);
-    assert!((eff[0] - z_s[0]).abs() <= 4.0 * 1.0 + 1.0e-5);
-    assert!(bus.set_offline_bounce(true));
+    assert_eq!(eff.map(f32::to_bits), z_s.map(f32::to_bits));
+    bus.set_offline_bounce(true);
     assert_eq!(bus.eff_z_stage().map(f32::to_bits), z_s.map(f32::to_bits));
     let _ = targets_snapshot_before_ou;
 }

@@ -1,4 +1,4 @@
-//! Prefix-ordered L1D `SonaHotSlab` (`4,544 / 4,800 / 7,552 / 11,136 / 14,592 B`) layouts and
+//! Prefix-ordered L1D `SonaHotSlab` (`4,544 / 7,040 / 10,752 / 14,336 B`) layouts and
 //! canonical Matryoshka topology constants (`#![no_std]`, `#![forbid(unsafe_code)]`, `ref[arch.tiers.state-ram]`).
 
 #![forbid(unsafe_code)]
@@ -8,14 +8,16 @@ pub mod cold;
 use core::mem::{align_of, offset_of, size_of};
 
 use dnam_kernels::{
-    CoreQuadParamsStereo4, HilbertH1StereoKernel, MAX_SVF_K_NL, OpNPreHotState, PhasorQ32Bank4,
-    SonaBlockStateStereo8, SonaParaLruDuhemCoeffs4, SonaToneWeights4, StereoVec8,
-    T1DcBlockerStereo, T1SubHarmonicKernel, TptSvfCoeffs4,
+    CoreQuadParamsStereo4, HilbertH1StereoKernel, MAX_CORE_QUADS_V4, MAX_SONA_TILES_V4,
+    MAX_SVF_K_NL, MAX_TOTAL_SONA_LANES_V4, NUM_SONA_BLOCKS_V4, OpNPreHotState, PhasorQ32Bank4,
+    SONA_V4_BLOCK_QUAD_SLOTS, SONA_V4_CORE_QUAD_BLOCK_AND_LOCAL, SONA_V4_INTERBLOCK_TILES,
+    SONA_V4_ULTRA_QUAD_TRAVERSAL_ORDER, SonaBlockStateStereo8, SonaParaLruDuhemCoeffs4,
+    SonaToneWeights4, StereoVec8, T1DcBlockerStereo, T1SubHarmonicKernel, TptSvfCoeffs4,
 };
 
 use crate::graph::GraphBackend;
 use crate::graph::convolver::kautz::KautzStereoBank4;
-use crate::graph::oversample::SonaOs2xHot;
+use crate::graph::oversample::CoreOversamplerLiveHot;
 use crate::graph::sensory::SensoryQuadHot;
 use crate::graph::transport::TransportQuadHotCompact;
 use crate::graph::transport::ring::TRANSPORT_INLINE_QUAD0_CAP;
@@ -42,89 +44,38 @@ pub const FLAG_WET_POLARITY_INV: u8 = 1 << 6;
 pub const TIER_SWITCH_XFADE_SAMPLES: u16 = 48;
 
 /// Exact byte footprint of [`SonaLiteHotPrefix`].
+/// Exact byte footprint of [`SonaLiteHotPrefix`] (`4,544 B <= 4,608 B` = `71 CL`).
 pub const SONA_LITE_HOT_BYTES: usize = 4_544;
-/// Exact byte footprint of [`SonaOs2xHot`].
-pub const SONA_OS2X_HOT_BYTES: usize = 256;
-/// Exact byte delta of [`SonaFullHotDelta`].
-pub const SONA_FULL_HOT_DELTA_BYTES: usize = 2_752;
-/// Exact byte delta of [`SonaProHotDelta`].
-pub const SONA_PRO_HOT_DELTA_BYTES: usize = 3_584;
-/// Exact byte delta of [`SonaUltraHotDelta`].
-pub const SONA_ULTRA_HOT_DELTA_BYTES: usize = 3_456;
+/// Exact byte delta of [`SonaFullHotDelta`] (`2,496 B` = `39 CL`).
+pub const SONA_FULL_HOT_DELTA_BYTES: usize = 2_496;
+/// Exact byte delta of [`SonaProHotDelta`] (`3,712 B` = `58 CL`).
+pub const SONA_PRO_HOT_DELTA_BYTES: usize = 3_712;
+/// Exact byte delta of [`SonaUltraHotDelta`] (`3,584 B` = `56 CL`).
+pub const SONA_ULTRA_HOT_DELTA_BYTES: usize = 3_584;
 
 /// Maximum sequential Matryoshka blocks across every SONA tier (`4`).
-pub const NUM_SONA_BLOCKS: usize = 4;
-/// Maximum `4`-lane stereo `CoreQuad` blocks across `Ultra` (`4 + 3 + 2 + 1 = 10`).
-pub const MAX_CORE_QUADS: usize = 10;
+pub const NUM_SONA_BLOCKS: usize = NUM_SONA_BLOCKS_V4;
+/// Maximum `4`-lane stereo `CoreQuad` blocks across `Ultra` (`3 + 3 + 2 + 2 = 10`).
+pub const MAX_CORE_QUADS: usize = MAX_CORE_QUADS_V4;
 /// Maximum total SONA core lanes (`10 * 4 = 40`).
-pub const MAX_TOTAL_SONA_LANES: usize = MAX_CORE_QUADS * 4;
-/// Maximum lower-triangular `4x4` inter-block tile pairs (`3 + 10 + 10 + 12 = 35`).
-pub const MAX_SONA_TILES: usize = 35;
+pub const MAX_TOTAL_SONA_LANES: usize = MAX_TOTAL_SONA_LANES_V4;
+/// Maximum lower-triangular `4x4` inter-block tile pairs (`5 + 8 + 11 + 13 = 37`).
+pub const MAX_SONA_TILES: usize = MAX_SONA_TILES_V4;
 
-/// Canonical global `(block_idx, local_quad_idx)` assignment for `CoreQuad` slots `0..10`.
-pub const SONA_CORE_QUAD_BLOCK_AND_LOCAL: [(usize, usize); MAX_CORE_QUADS] = [
-    (0, 0),
-    (1, 0),
-    (2, 0),
-    (3, 0),
-    (0, 1),
-    (1, 1),
-    (0, 2),
-    (2, 1),
-    (0, 3),
-    (1, 2),
-];
+/// Canonical global `(block_idx, local_quad_idx)` assignment for `CoreQuad` slots `0..10` (`v4.0`).
+pub const SONA_CORE_QUAD_BLOCK_AND_LOCAL: [(usize, usize); MAX_CORE_QUADS] =
+    SONA_V4_CORE_QUAD_BLOCK_AND_LOCAL;
 
-/// `CoreQuad` slots per Matryoshka block `[Block 0..Block 3]` in prefix-nested order.
-pub const SONA_BLOCK_QUAD_SLOTS: [[Option<usize>; 4]; NUM_SONA_BLOCKS] = [
-    [Some(0), Some(4), Some(6), Some(8)],
-    [Some(1), Some(5), Some(9), None],
-    [Some(2), Some(7), None, None],
-    [Some(3), None, None, None],
-];
+/// `CoreQuad` slots per Matryoshka block `[Block 0..Block 3]` in `v4.0` `[3, 3, 2, 2]` order.
+pub const SONA_BLOCK_QUAD_SLOTS: [[Option<usize>; 4]; NUM_SONA_BLOCKS] = SONA_V4_BLOCK_QUAD_SLOTS;
 
-/// Causal Matryoshka block-major `CoreQuad` evaluation sequence across all `10` Ultra quads.
-pub const SONA_ULTRA_QUAD_TRAVERSAL_ORDER: [usize; MAX_CORE_QUADS] = [0, 4, 6, 8, 1, 5, 9, 2, 7, 3];
+/// Causal Matryoshka block-major `CoreQuad` evaluation sequence across all `10` Ultra quads (`v4.0`).
+pub const SONA_ULTRA_QUAD_TRAVERSAL_ORDER: [usize; MAX_CORE_QUADS] =
+    SONA_V4_ULTRA_QUAD_TRAVERSAL_ORDER;
 
-/// All `35` lower-triangular inter-block edges `(src_quad, dst_quad)` ordered by tier arrival
-/// (`0..3` `Lite`, `3..13` `Full`, `13..23` `Pro`, `23..35` `Ultra`).
-pub const SONA_INTERBLOCK_TILES: [(usize, usize); MAX_SONA_TILES] = [
-    (0, 1),
-    (1, 2),
-    (2, 3),
-    (0, 5),
-    (4, 1),
-    (4, 5),
-    (0, 2),
-    (4, 2),
-    (0, 3),
-    (4, 3),
-    (5, 2),
-    (1, 3),
-    (5, 3),
-    (6, 1),
-    (6, 5),
-    (0, 7),
-    (4, 7),
-    (6, 2),
-    (6, 7),
-    (6, 3),
-    (1, 7),
-    (5, 7),
-    (7, 3),
-    (0, 9),
-    (4, 9),
-    (6, 9),
-    (8, 1),
-    (8, 5),
-    (8, 9),
-    (8, 2),
-    (8, 7),
-    (8, 3),
-    (9, 2),
-    (9, 7),
-    (9, 3),
-];
+/// All `37` lower-triangular inter-block edges `(src_quad, dst_quad)` ordered by tier arrival
+/// (`0..5` `Lite`, `5..13` `Full`, `13..24` `Pro`, `24..37` `Ultra`).
+pub const SONA_INTERBLOCK_TILES: [(usize, usize); MAX_SONA_TILES] = SONA_V4_INTERBLOCK_TILES;
 
 const fn verify_interblock_tiles_and_slots() -> bool {
     let mut i = 0;
@@ -226,6 +177,8 @@ pub struct CoreQuadExtCold {
     pub glu_mix_fp16: [u16; 4],
     /// Block 0 linearly-implicit PHS nonlinear SVF damping (`[0.0, 16.0]`, `fp16`; `0x0000` on Blocks 1..3).
     pub svf_k_nl_fp16: [u16; 4],
+    /// Polarized linear bypass mix `lin_mix` (`[0.0, 1.0]`, `fp16`, controls Master `Box2` bypass).
+    pub lin_mix_fp16: [u16; 4],
 }
 
 impl CoreQuadExtCold {
@@ -426,12 +379,15 @@ pub struct CrossbarFrame<V: SimdVec4> {
 pub struct SonaLiteHotPrefix<B: GraphBackend> {
     pub core_states: [SonaBlockStateStereo8<B::Stereo8>; 4],
     pub core_quads: [CoreQuadHot; 4],
-    pub tiles: [SonaInterBlockTileHot; 3],
+    pub tiles: [SonaInterBlockTileHot; 5],
     pub readouts: [CoreQuadReadoutHot; 4],
     pub kautz: [KautzStereoBank4; 2],
     pub sensory_quad: SensoryQuadHot,
     pub transport_quad0: TransportQuadHotCompact,
     pub transport0_ring: [[u16; 4]; TRANSPORT_INLINE_QUAD0_CAP],
+    pub live_os: CoreOversamplerLiveHot,
+    pub op_p_prev_iq_lr: [f32; 4],
+    pub op_p_prev_feat: [f32; 4],
     pub fir_weights_l: [[[f32; 4]; 4]; 2],
     pub fir_weights_r: [[[f32; 4]; 4]; 2],
     pub fir_hist_l: [f32; 32],
@@ -452,7 +408,7 @@ pub struct SonaLiteHotPrefix<B: GraphBackend> {
     pub phasor_st_cos_fp16: [u16; 4],
     pub phasor_st_sin_fp16: [u16; 4],
     pub tank_dry_mix_eff_fp16: u16,
-    pub _reserved_hot_header_u16: [u16; 9],
+    pub _reserved_hot_header_u16: [u16; 5],
     pub rect_sign_mask_lite: u16,
     pub tier: Tier,
     pub flags: u8,
@@ -465,12 +421,15 @@ impl<B: GraphBackend> SonaLiteHotPrefix<B> {
         Self {
             core_states: [SonaBlockStateStereo8::zero(); 4],
             core_quads: [CoreQuadHot::default(); 4],
-            tiles: [SonaInterBlockTileHot::default(); 3],
+            tiles: [SonaInterBlockTileHot::default(); 5],
             readouts: [CoreQuadReadoutHot::default(); 4],
             kautz: [KautzStereoBank4::default(); 2],
             sensory_quad: SensoryQuadHot::zero(),
             transport_quad0: TransportQuadHotCompact::default(),
             transport0_ring: [[0; 4]; TRANSPORT_INLINE_QUAD0_CAP],
+            live_os: CoreOversamplerLiveHot::new(),
+            op_p_prev_iq_lr: [0.0; 4],
+            op_p_prev_feat: [0.0; 4],
             fir_weights_l: [[[0.0; 4]; 4]; 2],
             fir_weights_r: [[[0.0; 4]; 4]; 2],
             fir_hist_l: [0.0; 32],
@@ -491,7 +450,7 @@ impl<B: GraphBackend> SonaLiteHotPrefix<B> {
             phasor_st_cos_fp16: [f32_to_fp16(1.0); 4],
             phasor_st_sin_fp16: [0; 4],
             tank_dry_mix_eff_fp16: 0,
-            _reserved_hot_header_u16: [0; 9],
+            _reserved_hot_header_u16: [0; 5],
             rect_sign_mask_lite: 0,
             tier: Tier::Lite,
             flags: 0,
@@ -499,13 +458,13 @@ impl<B: GraphBackend> SonaLiteHotPrefix<B> {
     }
 }
 
-/// `Tier::Full` hot delta (`2,752 B` = `43 CL`; cumulative `7,552 B` after `SonaOs2xHot`).
+/// `Tier::Full` hot delta (`2,496 B` = `39 CL`).
 #[repr(C, align(64))]
 #[derive(Clone, Debug)]
 pub struct SonaFullHotDelta<B: GraphBackend> {
     pub core_states_full: [SonaBlockStateStereo8<B::Stereo8>; 2],
     pub core_quads_full: [CoreQuadHot; 2],
-    pub tiles_full: [SonaInterBlockTileHot; 10],
+    pub tiles_full: [SonaInterBlockTileHot; 8],
     pub readouts_full: [CoreQuadReadoutHot; 2],
     pub fir_weights_l_full: [[[f32; 4]; 4]; 1],
     pub fir_weights_r_full: [[[f32; 4]; 4]; 1],
@@ -525,7 +484,7 @@ impl<B: GraphBackend> SonaFullHotDelta<B> {
         Self {
             core_states_full: [SonaBlockStateStereo8::zero(); 2],
             core_quads_full: [CoreQuadHot::default(); 2],
-            tiles_full: [SonaInterBlockTileHot::default(); 10],
+            tiles_full: [SonaInterBlockTileHot::default(); 8],
             readouts_full: [CoreQuadReadoutHot::default(); 2],
             fir_weights_l_full: [[[0.0; 4]; 4]; 1],
             fir_weights_r_full: [[[0.0; 4]; 4]; 1],
@@ -541,13 +500,13 @@ impl<B: GraphBackend> SonaFullHotDelta<B> {
     }
 }
 
-/// `Tier::Pro` hot delta (`3,584 B` = `56 CL`; cumulative `11,136 B`).
+/// `Tier::Pro` hot delta (`3,712 B` = `58 CL`).
 #[repr(C, align(64))]
 #[derive(Clone, Debug)]
 pub struct SonaProHotDelta<B: GraphBackend> {
     pub core_states_pro: [SonaBlockStateStereo8<B::Stereo8>; 2],
     pub core_quads_pro: [CoreQuadHot; 2],
-    pub tiles_pro: [SonaInterBlockTileHot; 10],
+    pub tiles_pro: [SonaInterBlockTileHot; 11],
     pub readouts_pro: [CoreQuadReadoutHot; 2],
     pub fir_weights_l_pro: [[[f32; 4]; 4]; 3],
     pub fir_weights_r_pro: [[[f32; 4]; 4]; 3],
@@ -567,7 +526,7 @@ impl<B: GraphBackend> SonaProHotDelta<B> {
         Self {
             core_states_pro: [SonaBlockStateStereo8::zero(); 2],
             core_quads_pro: [CoreQuadHot::default(); 2],
-            tiles_pro: [SonaInterBlockTileHot::default(); 10],
+            tiles_pro: [SonaInterBlockTileHot::default(); 11],
             readouts_pro: [CoreQuadReadoutHot::default(); 2],
             fir_weights_l_pro: [[[0.0; 4]; 4]; 3],
             fir_weights_r_pro: [[[0.0; 4]; 4]; 3],
@@ -583,13 +542,13 @@ impl<B: GraphBackend> SonaProHotDelta<B> {
     }
 }
 
-/// `Tier::Ultra` hot delta (`3,456 B` = `54 CL`; cumulative `14,592 B`).
+/// `Tier::Ultra` hot delta (`3,584 B` = `56 CL`).
 #[repr(C, align(64))]
 #[derive(Clone, Debug)]
 pub struct SonaUltraHotDelta<B: GraphBackend> {
     pub core_states_ultra: [SonaBlockStateStereo8<B::Stereo8>; 2],
     pub core_quads_ultra: [CoreQuadHot; 2],
-    pub tiles_ultra: [SonaInterBlockTileHot; 12],
+    pub tiles_ultra: [SonaInterBlockTileHot; 13],
     pub readouts_ultra: [CoreQuadReadoutHot; 2],
     pub fir_weights_l_ultra: [[[f32; 4]; 4]; 2],
     pub fir_weights_r_ultra: [[[f32; 4]; 4]; 2],
@@ -609,7 +568,7 @@ impl<B: GraphBackend> SonaUltraHotDelta<B> {
         Self {
             core_states_ultra: [SonaBlockStateStereo8::zero(); 2],
             core_quads_ultra: [CoreQuadHot::default(); 2],
-            tiles_ultra: [SonaInterBlockTileHot::default(); 12],
+            tiles_ultra: [SonaInterBlockTileHot::default(); 13],
             readouts_ultra: [CoreQuadReadoutHot::default(); 2],
             fir_weights_l_ultra: [[[0.0; 4]; 4]; 2],
             fir_weights_r_ultra: [[[0.0; 4]; 4]; 2],
@@ -626,19 +585,20 @@ impl<B: GraphBackend> SonaUltraHotDelta<B> {
 }
 
 const _: () = assert!(size_of::<CoreQuadHot>() == 144 && align_of::<CoreQuadHot>() == 16);
-const _: () = assert!(size_of::<CoreQuadExtCold>() == 48 && align_of::<CoreQuadExtCold>() == 8);
+const _: () = assert!(size_of::<CoreQuadExtCold>() == 56 && align_of::<CoreQuadExtCold>() == 8);
 const _: () =
     assert!(size_of::<SonaInterBlockTileHot>() == 128 && align_of::<SonaInterBlockTileHot>() == 16);
 const _: () =
     assert!(size_of::<CoreQuadReadoutHot>() == 96 && align_of::<CoreQuadReadoutHot>() == 8);
-const _: () =
-    assert!(size_of::<SonaOs2xHot>() == SONA_OS2X_HOT_BYTES && align_of::<SonaOs2xHot>() == 64);
+const _: () = assert!(
+    size_of::<CoreOversamplerLiveHot>() == 232 && align_of::<CoreOversamplerLiveHot>() == 4
+);
 
-const _: () = assert!(offset_of!(SonaLiteHotPrefix<ScalarBackend>, sensory_quad) == 2_208);
-const _: () = assert!(offset_of!(SonaLiteHotPrefix<ScalarBackend>, transport_quad0) == 2_256);
-const _: () = assert!(offset_of!(SonaLiteHotPrefix<ScalarBackend>, tank_dry_mix_eff_fp16) == 4_520);
+const _: () = assert!(offset_of!(SonaLiteHotPrefix<ScalarBackend>, sensory_quad) == 2_464);
+const _: () = assert!(offset_of!(SonaLiteHotPrefix<ScalarBackend>, transport_quad0) == 2_512);
+const _: () = assert!(offset_of!(SonaLiteHotPrefix<ScalarBackend>, tank_dry_mix_eff_fp16) == 4_528);
 const _: () =
-    assert!(offset_of!(SonaLiteHotPrefix<ScalarBackend>, _reserved_hot_header_u16) == 4_522);
+    assert!(offset_of!(SonaLiteHotPrefix<ScalarBackend>, _reserved_hot_header_u16) == 4_530);
 const _: () = assert!(offset_of!(SonaLiteHotPrefix<ScalarBackend>, rect_sign_mask_lite) == 4_540);
 const _: () = assert!(offset_of!(SonaLiteHotPrefix<ScalarBackend>, tier) == 4_542);
 const _: () = assert!(offset_of!(SonaLiteHotPrefix<ScalarBackend>, flags) == 4_543);
@@ -693,13 +653,10 @@ mod tests {
         assert_eq!(core::mem::size_of::<CoreQuadReadoutHot>(), 96);
         assert_eq!(
             SONA_ULTRA_QUAD_TRAVERSAL_ORDER,
-            [0, 4, 6, 8, 1, 5, 9, 2, 7, 3]
+            [0, 4, 8, 1, 5, 9, 2, 6, 3, 7]
         );
-        assert_eq!(SONA_INTERBLOCK_TILES.len(), 35);
-        assert_eq!(
-            SONA_BLOCK_QUAD_SLOTS[0],
-            [Some(0), Some(4), Some(6), Some(8)]
-        );
+        assert_eq!(SONA_INTERBLOCK_TILES.len(), 37);
+        assert_eq!(SONA_BLOCK_QUAD_SLOTS[0], [Some(0), Some(4), Some(8), None]);
         let lit = SonaLiteHotPrefix::<ScalarBackend>::empty();
         assert_eq!(lit.tank_dry_mix_eff_fp16, 0);
         assert_eq!(lit.sensory_quad, SensoryQuadHot::zero());
@@ -711,6 +668,7 @@ mod tests {
         }
         let ext = CoreQuadExtCold {
             svf_k_nl_fp16: [0; 4],
+            lin_mix_fp16: [0; 4],
             in_side_weight_fp16: [f32_to_fp16(0.5); 4],
             lru_stereo_link_fp16: [f32_to_fp16(0.25); 4],
             lru_duhem_gamma_fp16: [f32_to_fp16(12.0); 4],

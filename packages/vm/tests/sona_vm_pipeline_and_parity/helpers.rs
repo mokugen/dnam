@@ -1,11 +1,10 @@
-//! Deterministic SONA v3.0 fixture builders and `!alloc` stack runners for `dnam-vm` integration suites.
+//! Deterministic SONA v4.0 fixture builders and `!alloc` stack runners for `dnam-vm` integration suites.
 
 #![forbid(unsafe_code)]
 
 use dnam_kernels::pack_wf_mix_and_rect_sign_fp16;
 use dnam_vm::bin::{
-    DNBN_FLAG_STEREO_OUT, PIPE_CANONICAL_V3_SONA, SONA_META_CORE_MODS_PRESENT,
-    SONA_META_OS_EXT_PRESENT, SONA_META_SENSORY_QUAD, SONA_META_TRANSPORT_LFO,
+    DNBN_FLAG_STEREO_OUT, PIPE_CANONICAL_V4_SONA, SONA_META_SENSORY_QUAD, SONA_META_TRANSPORT_LFO,
     SONA_META_TRANSPORT_TAP_GAINS, TRANSPORT_FLAG_EXT_F32,
 };
 use dnam_vm::math::{TANK_DC_BLOCKER_48K_F32, f32_to_fp16};
@@ -97,6 +96,7 @@ pub(crate) fn encode_lite_fixture(
 pub(crate) fn make_core_quad(q: usize) -> CoreQuadWire {
     let s = 1.0 + 0.08 * (q as f32);
     let rs = if (q & 1) == 0 { 1.0_f32 } else { -1.0_f32 };
+    let is_block0 = matches!(q, 0 | 4 | 8);
     CoreQuadWire {
         svf_g: le_f32([0.12 * s, 0.24 * s, 0.42 * s, 0.68 * s]),
         lru_alpha_rel: le_f32([0.82, 0.85, 0.88, 0.91]),
@@ -105,19 +105,21 @@ pub(crate) fn make_core_quad(q: usize) -> CoreQuadWire {
         lru_kappa_fp16: fp16_arr([0.35, 0.40, 0.45, 0.50]),
         adaa_drive_fp16: fp16_arr([0.30, 0.35, 0.28, 0.32]),
         lru_bias_drive_fp16: fp16_arr([0.04 * rs, -0.03 * rs, 0.05 * rs, -0.02 * rs]),
-        tone_lp_fp16: fp16_arr([0.35, 0.30, 0.25, 0.20]),
-        tone_bp_fp16: fp16_arr([0.20, 0.25, 0.20, 0.15]),
-        tone_hp_fp16: fp16_arr([0.15, 0.15, 0.20, 0.25]),
-        tone_ap_fp16: fp16_arr([0.10, 0.12, 0.15, 0.18]),
-        tone_dir_fp16: fp16_arr([0.20, 0.18, 0.20, 0.22]),
-        sag_depth_fp16: fp16_arr([0.06, 0.05, 0.07, 0.04]),
+        c_lp_fp16: fp16_arr([0.35, 0.30, 0.25, 0.20]),
+        c_bp_fp16: fp16_arr([0.20, 0.25, 0.20, 0.15]),
+        c_kbp_fp16: if is_block0 {
+            fp16_arr([0.15, 0.15, 0.20, 0.25])
+        } else {
+            [U16::new(0); 4]
+        },
+        c_u_fp16: fp16_arr([0.20, 0.18, 0.20, 0.22]),
         wavefolder_mix_fp16: [
-            U16::new(pack_wf_mix_and_rect_sign_fp16(0.04, rs)),
-            U16::new(pack_wf_mix_and_rect_sign_fp16(0.03, -rs)),
-            U16::new(pack_wf_mix_and_rect_sign_fp16(0.05, rs)),
-            U16::new(pack_wf_mix_and_rect_sign_fp16(0.04, -rs)),
+            U16::new(pack_wf_mix_and_rect_sign_fp16(0.04, 1.0)),
+            U16::new(pack_wf_mix_and_rect_sign_fp16(0.03, 1.0)),
+            U16::new(pack_wf_mix_and_rect_sign_fp16(0.05, 1.0)),
+            U16::new(pack_wf_mix_and_rect_sign_fp16(0.04, 1.0)),
         ],
-        svf_k_nl_fp16: if matches!(q, 0 | 4 | 6 | 8) {
+        svf_k_nl_fp16: if is_block0 {
             fp16_arr([1.25, 0.85, 1.50, 0.60])
         } else {
             [U16::new(0); 4]
@@ -128,6 +130,8 @@ pub(crate) fn make_core_quad(q: usize) -> CoreQuadWire {
         lru_duhem_gamma_fp16: fp16_arr([0.50, 0.75, 0.60, 0.80]),
         lru_signed_mix_fp16: fp16_arr([0.60, 0.55, 0.65, 0.50]),
         glu_mix_fp16: fp16_arr([0.12, -0.08, 0.10, -0.06]),
+        rect_sign_mask: U16::new(0b0101),
+        ..CoreQuadWire::new_zeroed()
     }
 }
 
@@ -204,7 +208,8 @@ fn make_kautz_block(b: usize) -> KautzSoaBlockWire {
     let f = b as f32;
     KautzSoaBlockWire {
         r_low: le_f32([0.68, 0.72, 0.76, 0.80]),
-        dr: le_f32([0.04, 0.05, 0.04, 0.06]),
+        onset_delay_samp: [0, 2, 4, 6].map(U16::new),
+        c_cross_fp16: fp16_arr([0.04, 0.05, 0.04, 0.06]),
         theta: le_f32([
             0.12 + 0.04 * f,
             0.28 + 0.05 * f,
@@ -255,6 +260,7 @@ pub(crate) fn make_transport_quad(q: usize) -> TransportQuadWire {
         allpass_delays: if q == 0 { [11, 17, 23, 31] } else { [0; 4] },
         flags,
         reserved: 0,
+        ..TransportQuadWire::new_zeroed()
     }
 }
 
@@ -299,12 +305,9 @@ fn fill_quads_and_tiles(
 }
 
 pub(crate) fn configure_default_sensory_and_crossbar(a0: &mut Arena0LiteWire, tier_flags: u16) {
-    let meta_flags = SONA_META_SENSORY_QUAD
-        | SONA_META_OS_EXT_PRESENT
-        | SONA_META_TRANSPORT_TAP_GAINS
-        | SONA_META_TRANSPORT_LFO
-        | SONA_META_CORE_MODS_PRESENT;
-    a0.crossbar.pipeline_flags = U32::new(PIPE_CANONICAL_V3_SONA);
+    let meta_flags =
+        SONA_META_SENSORY_QUAD | SONA_META_TRANSPORT_TAP_GAINS | SONA_META_TRANSPORT_LFO;
+    a0.crossbar.pipeline_flags = U32::new(PIPE_CANONICAL_V4_SONA);
     a0.crossbar.sona_meta_flags = U32::new(meta_flags);
     a0.crossbar.sense_svf_g = le_f32([0.08, 0.18, 0.35, 0.62]);
     a0.crossbar.sense_lru_alpha_rel = le_f32([0.92, 0.94, 0.96, 0.97]);
@@ -321,13 +324,6 @@ pub(crate) fn configure_default_sensory_and_crossbar(a0: &mut Arena0LiteWire, ti
     a0.crossbar.cell_desc.tier_flags = U16::new(tier_flags);
     a0.crossbar.cell_desc.oversample_factor = U16::new(2);
     a0.crossbar.cell_desc.cell_flags = U32::new(meta_flags);
-    a0.crossbar.os_up_quad_coeff = F32::new(-0.125);
-    a0.crossbar.os_dec_c_prev1 = F32::new(0.15);
-    a0.crossbar.os_dec_c0 = F32::new(0.50);
-    a0.crossbar.os_up_pre_emph = F32::new(0.05);
-    a0.crossbar.os_dec_aa_mix = F32::new(0.04);
-    a0.crossbar.os_up_aa_mix = F32::new(0.04);
-    a0.crossbar.os_up_zoh_mix = F32::new(0.02);
     a0.crossbar.carrier_basis_w_fp16 = [
         fp16_arr([0.14, -0.09, 0.11, -0.07]),
         fp16_arr([-0.08, 0.12, -0.06, 0.10]),
@@ -336,7 +332,8 @@ pub(crate) fn configure_default_sensory_and_crossbar(a0: &mut Arena0LiteWire, ti
     a0.crossbar.op_n_pre_base = OpNPreBaseWire {
         gamma_bc: F32::new(0.08),
         zoh_hold_depth: F32::new(0.05),
-        beta_q: F32::new(0.10),
+        beta_q_fp16: fp16_val(0.10),
+        kappa_h_fp16: fp16_val(0.0),
     };
     a0.crossbar.phasor_freq_hz = le_f32([1.5, 3.2, 5.1, 7.3]);
     a0.crossbar.phasor_init_phase_q32 = [0, 0x4000_0000, 0x8000_0000, 0xC000_0000].map(U32::new);
@@ -380,9 +377,6 @@ pub(crate) fn build_full_pipeline_ultra_fixture() -> Vec<u8> {
     a0.control_bus_lite.lfo_dphi_train = le_f32([0.004, 0.009]);
     a0.control_bus_lite.lfo_skew_fp16 = fp16_arr([0.25, -0.25]);
     a0.control_bus_lite.tank_dry_mix_fp16 = fp16_val(0.65);
-    a0.control_bus_lite.sigma_drift = F32::new(0.02);
-    a0.control_bus_lite.rho_drift_train = F32::new(0.99);
-    a0.control_bus_lite.ou_to_z_stage_fp16 = fp16_arr([0.10, -0.05, 0.04, -0.02]);
     for &(r, c, v) in &[
         (0, 0, 0.18),
         (1, 1, 0.12),
@@ -425,11 +419,11 @@ pub(crate) fn build_full_pipeline_ultra_fixture() -> Vec<u8> {
         ),
     ];
     for (off, vals) in &cp1_slots {
-        write_f32_slice(&mut a0.control_bus_lite.cp1_base, *off, vals);
+        write_f32_slice(&mut a0.control_bus_lite.gra_lite, *off, vals);
     }
 
     let mut a1 = Arena1FullDeltaWire::new_zeroed();
-    fill_quads_and_tiles(&mut a1.core_quads, 4, &mut a1.tiles, 3);
+    fill_quads_and_tiles(&mut a1.core_quads, 4, &mut a1.tiles, 5);
     a1.crossbar_full = make_crossbar_block(1);
     fill_fir_taps(
         &mut a1.conv_fir_full.fir_l,
@@ -459,19 +453,8 @@ pub(crate) fn build_full_pipeline_ultra_fixture() -> Vec<u8> {
     populate_ro_words(&mut a2.linear_readout_pro.w_ro_and_mods_fp16, 32, true);
 
     let mut a3 = Arena3UltraDeltaWire::new_zeroed();
-    fill_quads_and_tiles(&mut a3.core_quads, 8, &mut a3.tiles, 23);
+    fill_quads_and_tiles(&mut a3.core_quads, 8, &mut a3.tiles, 24);
     a3.crossbar_ultra = make_crossbar_block(3);
-    for k in 0..8 {
-        let base = k * 128;
-        for col in 0..120 {
-            let s = if ((k + col) & 1) == 0 {
-                1.0_f32
-            } else {
-                -1.0_f32
-            };
-            a3.stage_latent_core_mods_fp16[base + col] = fp16_val(0.015 * s);
-        }
-    }
     fill_fir_taps(
         &mut a3.conv_fir_ultra.fir_l,
         &mut a3.conv_fir_ultra.fir_r,
@@ -483,7 +466,7 @@ pub(crate) fn build_full_pipeline_ultra_fixture() -> Vec<u8> {
     populate_ro_words(&mut a3.linear_readout_ultra.w_ro_and_mods_fp16, 40, true);
     a3.control_bus_ultra_delta.w_ctrl_ultra[0][0] = F32::new(0.08);
     write_f32_slice(
-        &mut a3.control_bus_ultra_delta.cp1_ultra,
+        &mut a3.control_bus_ultra_delta.gra_ultra_delta,
         0,
         &[
             0.06, -0.04, 0.03, 0.05, 0.05, 0.0, 0.0, 0.0, 0.04, 0.0, 0.0, 0.0,
@@ -492,9 +475,6 @@ pub(crate) fn build_full_pipeline_ultra_fixture() -> Vec<u8> {
     for i in 0..160 {
         let s = if (i & 1) == 0 { 1.0_f32 } else { -1.0_f32 };
         a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[i] = fp16_val(0.02 * s);
-    }
-    for i in 0..4 {
-        a3.control_bus_ultra_delta.stage_latent_ctrl_ultra_fp16[160 + i] = fp16_val(0.03);
     }
 
     let mut c0 = ControlClampDescriptor::range(20.0, 2_000.0, 500.0, 3, [0.0, -0.5, 0.5]);
@@ -524,14 +504,8 @@ pub(crate) fn build_full_pipeline_ultra_fixture() -> Vec<u8> {
         declared_max: F32::new(2_000.0),
     }];
 
-    let mut cext = CextDispatchWire::new_zeroed();
-    // Row 0 -> slot 16 (op_t_freeze_mix_delta): ctrl 1 modulates freeze mix via q16_basis[0] (col 4).
-    cext.w_ctrl_ext[0][4] = F32::new(0.60);
-    // Row 6 -> slot 22 (op_t_dry_mix_mod): ctrl 2 modulates stage tank_dry_mix via q16_basis[1] (col 5).
-    cext.w_ctrl_ext[6][5] = F32::new(0.35);
-    cext.w_ctrl_ext[1][0] = F32::new(0.04);
-    // Row 14 -> slot 30 (sense_vca_gain_delta).
-    cext.w_ctrl_ext[14][0] = F32::new(0.05);
+    // Row 13 -> slot 13 (op_t_g_loop_delta): ctrl 1 modulates g_loop via q16_basis[0] (col 4).
+    a0.control_bus_lite.w_ctrl[13][4] = F32::new(0.25);
 
     encode_dnam_bin(&DnamBinBuildInput {
         reference_sample_rate_hz: 48_000,
@@ -548,7 +522,7 @@ pub(crate) fn build_full_pipeline_ultra_fixture() -> Vec<u8> {
         controls: &controls,
         cp1_overflow: &[],
         tsyn: &tsyn,
-        cext: Some(&cext),
+        cext: None,
         arena0: &a0,
         arena1: Some(&a1),
         arena2: Some(&a2),
@@ -683,8 +657,8 @@ impl GaugeWeights {
             quad.lru_alpha_rel = le_f32([0.25; 4]);
             quad.lru_alpha_atk = le_f32([0.996; 4]);
             quad.in_mid_weight_fp16 = fp16_arr(self.in_mid[q]);
-            quad.tone_lp_fp16 = fp16_arr([0.5; 4]);
-            quad.tone_dir_fp16 = fp16_arr([1.0; 4]);
+            quad.c_lp_fp16 = fp16_arr([0.5; 4]);
+            quad.c_u_fp16 = fp16_arr([1.0; 4]);
             quad.wavefolder_mix_fp16 = [U16::new(0); 4];
             a0.core_quads[q] = quad;
         }

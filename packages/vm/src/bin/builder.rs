@@ -10,14 +10,15 @@ use zerocopy::{FromZeros, IntoBytes};
 
 use super::arena_wire::{
     Arena0LiteWire, Arena1FullDeltaWire, Arena2ProDeltaWire, Arena3UltraDeltaWire,
-    PIPE_CANONICAL_V3_SONA, SONA_META_OS_EXT_PRESENT, SONA_META_SENSORY_QUAD,
-    SONA_META_TRANSPORT_LFO, SONA_META_TRANSPORT_TAP_GAINS, TRANSPORT_FLAG_EXT_F32,
+    PIPE_CANONICAL_V4_SONA, SONA_META_GRA_CONTROL_BUS, SONA_META_OS_EXT_PRESENT, SONA_META_OS2X,
+    SONA_META_SENSORY_QUAD, SONA_META_TRANSPORT_LFO, SONA_META_TRANSPORT_TAP_GAINS,
+    TRANSPORT_FLAG_EXT_F32,
 };
 use super::header::{
-    ARENA_TIER_BYTES, CEXT_DISPATCH_BYTES, CextDispatchWire, ControlClampDescriptorWire,
-    DBRM_MAGIC, DNBN_FLAG_FREEZE_EVICTED_MASK, DNBN_FLAG_RESERVED_HI_MASK, DNBN_MAGIC,
-    DNBN_VERSION_MAJOR, DNBN_VERSION_MINOR, DnamBinHeaderWire, DnamBinRuntimeMetaWire,
-    MAX_NUM_CONTROLS, SONA_CELL_MAGIC, TSYN_ENTRY_BYTES, TempoSyncEntryWire, align64,
+    ARENA_TIER_BYTES, CextDispatchWire, ControlClampDescriptorWire, DBRM_MAGIC,
+    DNBN_FLAG_FREEZE_EVICTED_MASK, DNBN_FLAG_RESERVED_HI_MASK, DNBN_MAGIC, DNBN_VERSION_MAJOR,
+    DNBN_VERSION_MINOR, DnamBinHeaderWire, DnamBinRuntimeMetaWire, MAX_NUM_CONTROLS,
+    SONA_CELL_MAGIC, TSYN_ENTRY_BYTES, TempoSyncEntryWire, align64,
 };
 use super::view::DnamBinView;
 use crate::math::{Crc32cBackend, DefaultMathBackend, f32_to_fp16};
@@ -71,7 +72,7 @@ pub struct DnamBinBuildInput<'a> {
 }
 
 impl DnamBinBuildInput<'_> {
-    /// Creates a valid default Lite [`Arena0LiteWire`] carrying canonical `SONA v3.0` headers.
+    /// Creates a valid default Lite [`Arena0LiteWire`] carrying canonical `SONA v4.0` headers.
     pub fn default_arena0_lite() -> Arena0LiteWire {
         use zerocopy::byteorder::little_endian::{F32, U16, U32};
 
@@ -82,22 +83,23 @@ impl DnamBinBuildInput<'_> {
                 U16::new(f32_to_fp16(core::f32::consts::FRAC_1_SQRT_2));
             a0.crossbar.tier_gain_trim[i] = F32::new(1.0);
         }
-        a0.crossbar.pipeline_flags = U32::new(PIPE_CANONICAL_V3_SONA);
-        let meta_flags = SONA_META_OS_EXT_PRESENT
+        a0.crossbar.pipeline_flags = U32::new(PIPE_CANONICAL_V4_SONA);
+        let meta_flags = SONA_META_OS2X
+            | SONA_META_OS_EXT_PRESENT
             | SONA_META_SENSORY_QUAD
+            | SONA_META_GRA_CONTROL_BUS
             | SONA_META_TRANSPORT_TAP_GAINS
             | SONA_META_TRANSPORT_LFO;
         a0.crossbar.sona_meta_flags = U32::new(meta_flags);
-        a0.crossbar.anti_zipper_ramp_scale = F32::new(0.0625);
+        a0.crossbar.anti_zipper_ramp_scale = F32::new(0.25);
         a0.crossbar.cell_desc.magic = SONA_CELL_MAGIC;
         a0.crossbar.cell_desc.version_major = U16::new(DNBN_VERSION_MAJOR);
         a0.crossbar.cell_desc.tier_flags = U16::new(0x0001);
-        a0.crossbar.cell_desc.oversample_factor = U16::new(1);
+        a0.crossbar.cell_desc.oversample_factor = U16::new(2);
         a0.crossbar.cell_desc.cell_flags = U32::new(meta_flags);
         a0.transport_lite.r_dc = F32::new(crate::math::TANK_DC_BLOCKER_48K_F32);
         a0.transport_lite.sigma_knee_fp16 = U16::new(TANK_MAX_SIGMA_SAT_FP16);
         a0.control_bus_lite.tank_dry_mix_fp16 = U16::new(f32_to_fp16(1.0));
-        a0.control_bus_lite.rho_drift_train = F32::new(0.999);
         a0.control_bus_lite.trust_radius_mh = F32::new(2.5);
         a0.control_bus_lite.rho_head_and_ctrl_tail[0] = F32::new(2.5);
         a0
@@ -112,6 +114,9 @@ fn determine_max_tier_and_offsets(
     }
     if !(input.cp1_overflow.is_empty() || input.cp1_overflow.len() >= 8) {
         return Err(VmError::InvalidCp1Stream);
+    }
+    if input.cext.is_some() {
+        return Err(VmError::InvalidRegionLayout);
     }
     let max_tier = match (input.arena1, input.arena2, input.arena3) {
         (None, None, None) => Tier::Lite,
@@ -137,13 +142,7 @@ fn determine_max_tier_and_offsets(
     } else {
         0
     };
-    let cext_off = if input.cext.is_some() {
-        let off = cursor;
-        cursor = align64(off + CEXT_DISPATCH_BYTES);
-        off
-    } else {
-        0
-    };
+    let cext_off = 0usize;
     let arena0_off = align64(cursor);
     let total_len = arena0_off + ARENA_TIER_BYTES[max_tier.index()];
     Ok((max_tier, sc_off, tsyn_off, cext_off, arena0_off, total_len))
@@ -185,11 +184,7 @@ pub fn encode_dnam_bin_into_with_crc<C: Crc32cBackend>(
     let flags = (input.header_flags & !0x000F) | tier_mask;
     let sc_len = input.controls.len() * 64 + input.cp1_overflow.len();
     let tsyn_len = input.tsyn.len() * TSYN_ENTRY_BYTES;
-    let cext_len = if input.cext.is_some() {
-        CEXT_DISPATCH_BYTES
-    } else {
-        0
-    };
+    let cext_len = 0usize;
 
     if sc_len > 0 {
         let mut cursor = sc_off;
@@ -209,10 +204,6 @@ pub fn encode_dnam_bin_into_with_crc<C: Crc32cBackend>(
                 .map_err(|_| VmError::InsufficientBackingCapacity)?;
             cursor += TSYN_ENTRY_BYTES;
         }
-    }
-    if let Some(cext) = input.cext {
-        cext.write_to_prefix(&mut dst[cext_off..])
-            .map_err(|_| VmError::InsufficientBackingCapacity)?;
     }
 
     input
@@ -353,8 +344,8 @@ mod tests {
             arena3: None,
         };
         let len = computed_dnam_bin_byte_len(&input).unwrap();
-        assert_eq!(len, 128 + 4_608);
-        let mut stack_buf = [0u8; 128 + 4_608];
+        assert_eq!(len, 128 + crate::bin::ARENA0_LITE_BYTES);
+        let mut stack_buf = [0u8; 128 + crate::bin::ARENA0_LITE_BYTES];
         let written = encode_dnam_bin_into(&input, &mut stack_buf).unwrap();
         assert_eq!(written, len);
         let view = DnamBinView::parse(&stack_buf).unwrap();
@@ -377,7 +368,7 @@ mod tests {
             arena1: Some(&a1),
             ..input
         };
-        let mut full_buf = [0u8; 128 + 7_936];
+        let mut full_buf = [0u8; 128 + crate::bin::ARENA1_FULL_CUMULATIVE_BYTES];
         let full_written = encode_dnam_bin_into(&full_input, &mut full_buf).unwrap();
         assert_eq!(
             DnamBinView::parse(&full_buf[..full_written])
@@ -394,7 +385,7 @@ mod tests {
             arena2: Some(&a2),
             ..input
         };
-        let mut pro_buf = [0u8; 128 + 15_872];
+        let mut pro_buf = [0u8; 128 + crate::bin::ARENA2_PRO_CUMULATIVE_BYTES];
         let pro_written = encode_dnam_bin_into(&pro_input, &mut pro_buf).unwrap();
         assert_eq!(
             DnamBinView::parse(&pro_buf[..pro_written])
@@ -428,7 +419,7 @@ mod tests {
             arena2: None,
             arena3: None,
         };
-        let mut buf = [0u8; 128 + 4_608];
+        let mut buf = [0u8; 128 + crate::bin::ARENA0_LITE_BYTES];
 
         let n_2to1 = encode_dnam_bin_into(&base_input, &mut buf).unwrap();
         let view_2to1 = DnamBinView::parse(&buf[..n_2to1]).unwrap();

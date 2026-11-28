@@ -6,8 +6,15 @@
 //! targets and 32-bit `spirv-unknown-naga-wgsl` shaders.
 
 mod fixed_point;
+pub mod hbfir;
 pub mod tiers;
 
+pub use hbfir::{
+    HB23_DN_ODD_TAPS_OUTER, HB23_HALF_ORDER, HB23_ODD_TAP_COUNT, HB23_ODD_TAPS_OUTER,
+    HB63_DN_ODD_TAPS_OUTER, HB63_HALF_ORDER, HB63_KAISER_BETA, HB63_ODD_TAP_COUNT,
+    HB63_ODD_TAPS_OUTER, const_hb23_zero_phase_response_f32, const_hb63_odd_taps_outer,
+    const_hb63_zero_phase_response_f32,
+};
 pub use tiers::{
     FULL_SPEC, FULL_V4_SPEC, LITE_SPEC, LITE_V4_SPEC, MAX_CORE_QUADS_V4, MAX_OUTGOING_PER_QUAD_V4,
     MAX_SONA_TILES_V4, MAX_TOTAL_SONA_LANES_V4, NUM_SONA_BLOCKS_V4, PRO_SPEC, PRO_V4_SPEC,

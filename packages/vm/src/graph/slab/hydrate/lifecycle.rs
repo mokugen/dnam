@@ -9,11 +9,12 @@ use dnam_kernels::{
 
 use crate::bin::CONVOLVER_KAUTZ_BLOCKS_PER_TIER;
 use crate::control::bus::laws::{
-    eval_op_t_freeze_mix_eff, eval_phasor_inc_core_q32, eval_phasor_inc_vm_q32,
+    eval_op_t_freeze_mix_eff, eval_phasor_inc_core_multirate_q32, eval_phasor_inc_vm_q32,
 };
 use crate::graph::GraphBackend;
 use crate::graph::convolver::high_sr::ConvolverHighSrFirExt;
 use crate::graph::convolver::kautz::MAX_KAUTZ_BANKS;
+use crate::graph::oversample::RenderMode;
 use crate::graph::sensory::{SensoryParamsHot, SensoryQuadCold};
 use crate::graph::transport::{
     QuadEffectiveTargets, QuadHydrateConfig, TRANSPORT_MAX_QUADS, TransportModSlots,
@@ -47,12 +48,12 @@ pub(super) fn setup_phasor_increments<B: GraphBackend>(
 ) {
     let inv_fs = zoh.inv_f_s_vm();
     let fs_vm_f32 = zoh.f_s_vm as f32;
-    let os2x = zoh.os2x_active;
+    let m_core = zoh.m_core;
     let base_freqs = slab.cold().base_phasor_freq_hz;
     let mut inc_core = [0_u32; 4];
     for (i, dst) in inc_core.iter_mut().enumerate() {
         let inc_vm = eval_phasor_inc_vm_q32(base_freqs[i], 0.0, fs_vm_f32, inv_fs);
-        *dst = eval_phasor_inc_core_q32(inc_vm, os2x) as u32;
+        *dst = eval_phasor_inc_core_multirate_q32(inc_vm, m_core) as u32;
     }
     slab.lite.phasors.inc = inc_core;
 }
@@ -107,28 +108,15 @@ pub fn switch_tier<B: GraphBackend>(
         return Ok(());
     }
     let prev_zoh = slab.cold().zoh;
-    let tier_os2x = slab.cold().tier_os2x[to_tier.index()];
     let zoh = ZohRateContext::compute(
         prev_zoh.reference_rate_hz,
         prev_zoh.host_rate_hz,
-        to_tier,
-        tier_os2x,
-        prev_zoh.is_bounce_4x,
+        prev_zoh.render_mode,
     )?;
 
-    let was_os2x = slab.os2x();
-    if !was_os2x && zoh.os2x_active {
-        let last_in = slab.cold().last_in;
-        let last_s2 = slab.cold().last_s2_dir;
-        let last_iq = slab.cold().last_op_p_iq_lr;
-        let last_feat = slab.cold().last_op_p_feat;
-        slab.os2x_hot.warm_seed(last_in, last_s2);
-        slab.os2x_hot.op_p_prev_iq_lr = last_iq;
-        slab.os2x_hot.op_p_prev_feat = last_feat;
-    }
     zero_inactive_tier_states(slab, from_tier, to_tier);
 
-    slab.set_flag(FLAG_OS2X, zoh.os2x_active);
+    slab.set_flag(FLAG_OS2X, zoh.m_core >= 2);
     slab.lite.tier = to_tier;
     slab.cold_mut().zoh = zoh;
     if let Some(bus) = slab.cold_mut().ctrl_bus.as_mut() {
@@ -149,7 +137,7 @@ pub fn switch_tier<B: GraphBackend>(
             &fl[..active_taps],
             &fr[..active_taps],
             zoh.f_s_vm,
-            zoh.is_bounce_4x,
+            false,
         )?;
     }
 
@@ -159,17 +147,16 @@ pub fn switch_tier<B: GraphBackend>(
     Ok(())
 }
 
-fn retime_with_bounce<B: GraphBackend>(
+fn retime_with_mode<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
     new_host_rate_hz: f32,
-    new_offline: bool,
+    new_mode: RenderMode,
 ) -> Result<(), VmError> {
     let tier = slab.lite.tier;
-    let tier_os2x = slab.cold().tier_os2x[tier.index()];
     let ref_hz = slab.cold().zoh.reference_rate_hz;
-    let zoh = ZohRateContext::compute(ref_hz, new_host_rate_hz, tier, tier_os2x, new_offline)?;
+    let zoh = ZohRateContext::compute(ref_hz, new_host_rate_hz, new_mode)?;
 
-    let req_fir_len = ConvolverHighSrFirExt::required_f32_len(zoh.f_s_vm, new_offline);
+    let req_fir_len = ConvolverHighSrFirExt::required_f32_len(zoh.f_s_vm, false);
     if req_fir_len > slab.cold().convolver_fir_ext.backing_f32_capacity() {
         return Err(VmError::InsufficientBackingCapacity);
     }
@@ -195,20 +182,20 @@ fn retime_with_bounce<B: GraphBackend>(
         }
     }
 
-    let bounce_changed = slab.cold().offline_bounce != new_offline;
-    if bounce_changed {
+    let mode_changed = slab.cold().render_mode != new_mode;
+    if mode_changed {
         let cold = slab.cold_mut();
-        cold.offline_bounce = new_offline;
-        cold.bounce4x.reset();
-        cold.bounce4x_core_decim.reset();
-        cold.bounce4x_wet_decim.reset();
+        cold.render_mode = new_mode;
+        cold.master_os.reset();
         if let Some(bus) = cold.ctrl_bus.as_mut() {
-            bus.set_offline_bounce(new_offline);
+            bus.set_offline_bounce(matches!(new_mode, RenderMode::Master));
         }
-        slab.os2x_hot.reset();
+        slab.lite.live_os.reset();
+        slab.lite.op_p_prev_iq_lr = [0.0; 4];
+        slab.lite.op_p_prev_feat = [0.0; 4];
     }
 
-    slab.set_flag(FLAG_OS2X, zoh.os2x_active);
+    slab.set_flag(FLAG_OS2X, zoh.m_core >= 2);
     let use_cold_fir = req_fir_len > 0;
     slab.set_flag(FLAG_COLD_FIR_EXT, use_cold_fir);
 
@@ -235,7 +222,7 @@ fn retime_with_bounce<B: GraphBackend>(
             &fl[..active_taps],
             &fr[..active_taps],
             zoh.f_s_vm,
-            new_offline,
+            false,
         )?;
         slab.sensory_params = SensoryParamsHot::from_cold(&sensory_cold);
     }
@@ -286,20 +273,38 @@ pub fn retime_sample_rate<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
     new_host_rate_hz: f32,
 ) -> Result<(), VmError> {
-    let offline = slab.cold().offline_bounce;
-    retime_with_bounce(slab, new_host_rate_hz, offline)
+    let mode = slab.cold().render_mode;
+    retime_with_mode(slab, new_host_rate_hz, mode)
 }
 
-/// Switches between live `1x` execution and deterministic `4x` offline bounce oversampling.
+/// Switches Core oversampling [`RenderMode`] between `Live` (`2x`) and `Master` (`4x`/`2x` `Box2`),
+/// resetting recursive audio/oversampler states to deterministic zero-DC equilibrium.
+pub fn set_render_mode<B: GraphBackend>(
+    slab: &mut SonaHotSlab<'_, B>,
+    mode: RenderMode,
+) -> Result<(), VmError> {
+    if slab.cold().render_mode == mode {
+        return Ok(());
+    }
+    let host_hz = slab.cold().zoh.host_rate_hz;
+    retime_with_mode(slab, host_hz, mode)?;
+    reset_to_dc_equilibrium(slab);
+    Ok(())
+}
+
+/// Adapter switching between [`RenderMode::Live`] (`offline = false`) and [`RenderMode::Master`].
 pub fn set_offline_bounce<B: GraphBackend>(
     slab: &mut SonaHotSlab<'_, B>,
     offline: bool,
 ) -> Result<(), VmError> {
-    if slab.cold().offline_bounce == offline {
-        return Ok(());
-    }
-    let host_hz = slab.cold().zoh.host_rate_hz;
-    retime_with_bounce(slab, host_hz, offline)
+    set_render_mode(
+        slab,
+        if offline {
+            RenderMode::Master
+        } else {
+            RenderMode::Live
+        },
+    )
 }
 
 /// Restores deterministic resting zero-DC equilibrium while strictly preserving bit 2
@@ -319,7 +324,9 @@ pub fn reset_to_dc_equilibrium<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>) {
     slab.pro_delta.fir_hist_r_pro.fill(0.0);
     slab.ultra_delta.fir_hist_l_ultra.fill(0.0);
     slab.ultra_delta.fir_hist_r_ultra.fill(0.0);
-    slab.os2x_hot.reset();
+    slab.lite.live_os.reset();
+    slab.lite.op_p_prev_iq_lr = [0.0; 4];
+    slab.lite.op_p_prev_feat = [0.0; 4];
     slab.lite.sensory_quad.reset();
     slab.lite.hilbert.reset();
     slab.lite.t1.reset();
@@ -350,9 +357,7 @@ pub fn reset_to_dc_equilibrium<B: GraphBackend>(slab: &mut SonaHotSlab<'_, B>) {
         let cold = slab.cold_mut();
         cold.convolver_fir_ext.reset();
         cold.kautz_slew.reset_slew();
-        cold.bounce4x.reset();
-        cold.bounce4x_core_decim.reset();
-        cold.bounce4x_wet_decim.reset();
+        cold.master_os.reset();
         cold.rem_hist.reset();
         cold.xfade_rem = 0;
         cold.xfade_prev_out = [0.0; 2];

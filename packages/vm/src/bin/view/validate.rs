@@ -6,11 +6,10 @@ pub(super) use arena::{ArenaValidationInput, validate_arena0_and_quads};
 use zerocopy::FromBytes;
 
 use crate::bin::header::{
-    CEXT_DISPATCH_BYTES, CP1_STREAM_FLAG_HAS_ULTRA, CP1_STREAM_MAGIC, ControlClampDescriptorWire,
-    Cp1StreamDirEntryWire, Cp1StreamHeaderWire, DBRM_MAGIC, DNBN_FLAG_FREEZE_EVICTED_MASK,
-    DNBN_FLAG_RESERVED_HI_MASK, DNBN_MAGIC, DNBN_VERSION_MAJOR, DNBN_VERSION_MINOR,
-    DnamBinHeaderWire, DnamBinRuntimeMetaWire, MAX_NUM_CONTROLS, TSYN_ENTRY_BYTES,
-    TempoSyncEntryWire,
+    CP1_STREAM_FLAG_HAS_ULTRA, CP1_STREAM_MAGIC, ControlClampDescriptorWire, Cp1StreamDirEntryWire,
+    Cp1StreamHeaderWire, DBRM_MAGIC, DNBN_FLAG_FREEZE_EVICTED_MASK, DNBN_FLAG_RESERVED_HI_MASK,
+    DNBN_MAGIC, DNBN_VERSION_MAJOR, DNBN_VERSION_MINOR, DnamBinHeaderWire, DnamBinRuntimeMetaWire,
+    MAX_NUM_CONTROLS, TSYN_ENTRY_BYTES, TempoSyncEntryWire,
 };
 use crate::control::MAX_EXACT_CONTRIBUTORS;
 use crate::types::VmError;
@@ -143,20 +142,10 @@ pub(super) fn validate_region_layout_and_padding(
 
     let cext_off = meta.cext_offset.get() as usize;
     let cext_len = meta.cext_len.get() as usize;
-    if !(cext_len == 0 || cext_len == CEXT_DISPATCH_BYTES)
-        || (cext_len == 0 && cext_off != 0)
-        || (cext_len > 0 && ((cext_off & 63) != 0 || cext_off < tsyn_end_aligned))
-    {
+    if cext_off != 0 || cext_len != 0 {
         return Err(VmError::InvalidRegionLayout);
     }
-    let cext_end = cext_off
-        .checked_add(cext_len)
-        .ok_or(VmError::InvalidRegionLayout)?;
-    let cext_end_aligned = if cext_len > 0 {
-        checked_align64(cext_end).ok_or(VmError::InvalidRegionLayout)?
-    } else {
-        tsyn_end_aligned
-    };
+    let cext_end_aligned = tsyn_end_aligned;
     if cext_end_aligned > arena0_off {
         return Err(VmError::InvalidRegionLayout);
     }
@@ -177,14 +166,6 @@ pub(super) fn validate_region_layout_and_padding(
                 .ok_or(VmError::InvalidRegionLayout)?,
         )?;
         cursor = tsyn_end;
-    }
-    if cext_len > 0 {
-        ensure_all_zero(
-            bytes
-                .get(cursor..cext_off)
-                .ok_or(VmError::InvalidRegionLayout)?,
-        )?;
-        cursor = cext_end;
     }
     ensure_all_zero(
         bytes
@@ -366,7 +347,7 @@ mod tests {
     use zerocopy::byteorder::little_endian::{F32, U16, U32};
     use zerocopy::{FromZeros, IntoBytes};
 
-    fn make_lite_bytes() -> [u8; 128 + 4_608] {
+    fn make_lite_bytes() -> [u8; 128 + crate::bin::ARENA0_LITE_BYTES] {
         let a0 = DnamBinBuildInput::default_arena0_lite();
         let input = DnamBinBuildInput {
             reference_sample_rate_hz: 48_000,
@@ -389,7 +370,7 @@ mod tests {
             arena2: None,
             arena3: None,
         };
-        let mut buf = [0u8; 128 + 4_608];
+        let mut buf = [0u8; 128 + crate::bin::ARENA0_LITE_BYTES];
         encode_dnam_bin_into(&input, &mut buf).unwrap();
         buf
     }

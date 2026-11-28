@@ -12,7 +12,7 @@ tags:
 
 project:
   name: "dnam-vm"
-  description: "Pure Rust #![no_std] + !alloc-capable zero-JSON SONA v3.0 real-time virtual machine"
+  description: "Pure Rust #![no_std] + !alloc-capable zero-JSON SONA v4.0 real-time virtual machine"
 
 dependsOn:
   - "kernels"

@@ -16,7 +16,7 @@ use crate::graph::convolver::high_sr::ConvolverHighSrFirExt;
 use crate::graph::convolver::kautz::{
     KautzColdSlewState, KautzStereoBank4, MAX_KAUTZ_BANKS, MAX_KAUTZ_PAIRS,
 };
-use crate::graph::oversample::{Bounce4xDecimator, Bounce4xOversampler, SonaOs2xHot};
+use crate::graph::oversample::{CoreOversamplerMasterCold, RenderMode};
 use crate::graph::sensory::{SensoryParamsHot, SensoryQuadCold};
 use crate::graph::transport::ring::{PartitionedSchroederBank, TransportExtRing};
 use crate::graph::transport::{
@@ -30,21 +30,19 @@ use super::{
     CoreQuadExtCold, CoreQuadHot, CoreQuadReadoutHot, FLAG_COLD_FIR_EXT, FLAG_CROSSBAR_ACTIVE,
     FLAG_MONO_OUT, FLAG_OS2X, FLAG_SINGLE_INPUT, FLAG_WET_POLARITY_INV, FLAG_XFADE_ACTIVE,
     MAX_CORE_QUADS, MAX_TOTAL_SONA_LANES, SONA_FULL_HOT_DELTA_BYTES, SONA_LITE_HOT_BYTES,
-    SONA_OS2X_HOT_BYTES, SONA_PRO_HOT_DELTA_BYTES, SONA_ULTRA_HOT_DELTA_BYTES, SonaFullHotDelta,
-    SonaInterBlockTileHot, SonaLiteHotPrefix, SonaProHotDelta, SonaUltraHotDelta,
+    SONA_PRO_HOT_DELTA_BYTES, SONA_ULTRA_HOT_DELTA_BYTES, SonaFullHotDelta, SonaInterBlockTileHot,
+    SonaLiteHotPrefix, SonaProHotDelta, SonaUltraHotDelta,
 };
 
-const CUM_OS2X_OFFSET: usize = SONA_LITE_HOT_BYTES;
-const CUM_FULL_OFFSET: usize = CUM_OS2X_OFFSET + SONA_OS2X_HOT_BYTES;
+const CUM_FULL_OFFSET: usize = SONA_LITE_HOT_BYTES;
 const CUM_PRO_OFFSET: usize = CUM_FULL_OFFSET + SONA_FULL_HOT_DELTA_BYTES;
 const CUM_ULTRA_OFFSET: usize = CUM_PRO_OFFSET + SONA_PRO_HOT_DELTA_BYTES;
 const CUM_COLD_OFFSET: usize = CUM_ULTRA_OFFSET + SONA_ULTRA_HOT_DELTA_BYTES;
 
-const _: () = assert!(CUM_OS2X_OFFSET == 4_544);
-const _: () = assert!(CUM_FULL_OFFSET == 4_800);
-const _: () = assert!(CUM_PRO_OFFSET == 7_552);
-const _: () = assert!(CUM_ULTRA_OFFSET == 11_136);
-const _: () = assert!(CUM_COLD_OFFSET == 14_592);
+const _: () = assert!(CUM_FULL_OFFSET == 4_544);
+const _: () = assert!(CUM_PRO_OFFSET == 7_040);
+const _: () = assert!(CUM_ULTRA_OFFSET == 10_752);
+const _: () = assert!(CUM_COLD_OFFSET == 14_336);
 
 /// Per-tier crossbar replacement weights cached in cold storage for seamless `switch_tier`.
 #[derive(Clone, Copy, Debug)]
@@ -91,9 +89,7 @@ pub struct SonaColdTail<'a, B: GraphBackend> {
     pub transport_quad_eff: [QuadEffectiveTargets; TRANSPORT_MAX_QUADS],
     pub transport_ext: [TransportExtRing<'a>; TRANSPORT_MAX_QUADS],
     pub transport_schroeder: [PartitionedSchroederBank<'a>; TRANSPORT_MAX_QUADS],
-    pub bounce4x: Bounce4xOversampler,
-    pub bounce4x_core_decim: Bounce4xDecimator,
-    pub bounce4x_wet_decim: Bounce4xDecimator,
+    pub master_os: CoreOversamplerMasterCold,
     pub wire_crossbar: CrossbarWire,
     pub wire_kautz: [KautzSoaBlockWire; MAX_KAUTZ_BANKS],
     pub wire_transport_quads: [TransportQuadWire; TRANSPORT_MAX_QUADS],
@@ -114,11 +110,7 @@ pub struct SonaColdTail<'a, B: GraphBackend> {
     pub base_op_n_pre: OpNPreBaseWire,
     pub stage_latent_mods_fp16: [u16; 96],
     pub stage_latent_ctrl_ultra_fp16: [u16; 256],
-    pub stage_latent_core_mods_fp16: [u16; 1_024],
-    pub tier_os2x: [bool; 4],
     pub tier_gain_trim: [f32; 4],
-    pub core_mods_present: bool,
-    pub core_mods_active: bool,
     pub meta_flags: u32,
     pub max_present_tier: Tier,
     pub retained_tier: Tier,
@@ -143,7 +135,7 @@ pub struct SonaColdTail<'a, B: GraphBackend> {
     pub last_core_lr: [f32; 2],
     pub last_transport_wet_lr: [f32; 2],
     pub saturation_flags: u32,
-    pub offline_bounce: bool,
+    pub render_mode: RenderMode,
     pub declared_max_delay_48k: u32,
     pub ext_ring_pow2_frames: u8,
     pub dc_blocker_pole_5hz: f32,
@@ -174,9 +166,7 @@ impl<B: GraphBackend> SonaColdTail<'_, B> {
                 PartitionedSchroederBank::disabled(),
                 PartitionedSchroederBank::disabled(),
             ],
-            bounce4x: Bounce4xOversampler::new(),
-            bounce4x_core_decim: Bounce4xDecimator::new(),
-            bounce4x_wet_decim: Bounce4xDecimator::new(),
+            master_os: CoreOversamplerMasterCold::new(),
             wire_crossbar: CrossbarWire::new_zeroed(),
             wire_kautz: [KautzSoaBlockWire::new_zeroed(); MAX_KAUTZ_BANKS],
             wire_transport_quads: [TransportQuadWire::new_zeroed(); TRANSPORT_MAX_QUADS],
@@ -197,11 +187,7 @@ impl<B: GraphBackend> SonaColdTail<'_, B> {
             base_op_n_pre: OpNPreBaseWire::new_zeroed(),
             stage_latent_mods_fp16: [0; 96],
             stage_latent_ctrl_ultra_fp16: [0; 256],
-            stage_latent_core_mods_fp16: [0; 1_024],
-            tier_os2x: [false; 4],
             tier_gain_trim: [1.0; 4],
-            core_mods_present: false,
-            core_mods_active: false,
             meta_flags: 0,
             max_present_tier: Tier::Lite,
             retained_tier: Tier::Lite,
@@ -226,12 +212,27 @@ impl<B: GraphBackend> SonaColdTail<'_, B> {
             last_core_lr: [0.0; 2],
             last_transport_wet_lr: [0.0; 2],
             saturation_flags: 0,
-            offline_bounce: false,
+            render_mode: RenderMode::Live,
             declared_max_delay_48k: 4_096,
             ext_ring_pow2_frames: 0,
             dc_blocker_pole_5hz: crate::math::TANK_DC_BLOCKER_48K_F32,
             active_kautz_blocks: 2,
             active_transport_quads: 1,
+        }
+    }
+
+    /// Captures the current latched Core-bound control snapshot for `Master` `delta_D_up = 16` delay.
+    #[inline(always)]
+    #[must_use]
+    pub fn master_ctrl_snapshot(&self) -> crate::graph::oversample::MasterCtrlSnapshotCold {
+        crate::graph::oversample::MasterCtrlSnapshotCold {
+            latched_stage_params: self.latched_stage_params,
+            latched_z_stage: self.latched_z_stage,
+            lane_g_scale: self.lane_g_scale,
+            lane_k_delta: self.lane_k_delta,
+            lane_wf_delta: self.lane_wf_delta,
+            quad_adaa_scale: self.quad_adaa_scale,
+            quad_lru_bias: self.quad_lru_bias,
         }
     }
 
@@ -241,9 +242,7 @@ impl<B: GraphBackend> SonaColdTail<'_, B> {
         self.kautz_slew = KautzColdSlewState::default();
         self.transport_quad_meta = [QuadColdMeta::default(); TRANSPORT_MAX_QUADS];
         self.transport_quad_eff = [QuadEffectiveTargets::default(); TRANSPORT_MAX_QUADS];
-        self.bounce4x = Bounce4xOversampler::new();
-        self.bounce4x_core_decim = Bounce4xDecimator::new();
-        self.bounce4x_wet_decim = Bounce4xDecimator::new();
+        self.master_os.reset();
         self.wire_crossbar = CrossbarWire::new_zeroed();
         self.wire_kautz = [KautzSoaBlockWire::new_zeroed(); MAX_KAUTZ_BANKS];
         self.wire_transport_quads = [TransportQuadWire::new_zeroed(); TRANSPORT_MAX_QUADS];
@@ -264,11 +263,7 @@ impl<B: GraphBackend> SonaColdTail<'_, B> {
         self.base_op_n_pre = OpNPreBaseWire::new_zeroed();
         self.stage_latent_mods_fp16 = [0; 96];
         self.stage_latent_ctrl_ultra_fp16 = [0; 256];
-        self.stage_latent_core_mods_fp16 = [0; 1_024];
-        self.tier_os2x = [false; 4];
         self.tier_gain_trim = [1.0; 4];
-        self.core_mods_present = false;
-        self.core_mods_active = false;
         self.meta_flags = 0;
         self.max_present_tier = Tier::Lite;
         self.retained_tier = Tier::Lite;
@@ -293,7 +288,7 @@ impl<B: GraphBackend> SonaColdTail<'_, B> {
         self.last_core_lr = [0.0; 2];
         self.last_transport_wet_lr = [0.0; 2];
         self.saturation_flags = 0;
-        self.offline_bounce = false;
+        self.render_mode = RenderMode::Live;
         self.declared_max_delay_48k = 4_096;
         self.ext_ring_pow2_frames = 0;
         self.dc_blocker_pole_5hz = crate::math::TANK_DC_BLOCKER_48K_F32;
@@ -327,12 +322,11 @@ impl<B: GraphBackend> fmt::Debug for SonaSlabBacking<'_, B> {
     }
 }
 
-/// Prefix-ordered `64 B`-aligned `SONA v3.0` L1D hot execution slab (`4,544..14,592 B` active hot).
+/// Prefix-ordered `64 B`-aligned `SONA v4.0` L1D hot execution slab (`4,544..14,336 B` active hot).
 #[repr(C, align(64))]
 #[derive(Debug)]
 pub struct SonaHotSlab<'a, B: GraphBackend = DefaultMathBackend> {
     pub lite: SonaLiteHotPrefix<B>,
-    pub os2x_hot: SonaOs2xHot,
     pub full_delta: SonaFullHotDelta<B>,
     pub pro_delta: SonaProHotDelta<B>,
     pub ultra_delta: SonaUltraHotDelta<B>,
@@ -346,7 +340,6 @@ impl<'a, B: GraphBackend> SonaHotSlab<'a, B> {
     pub fn empty_with_cold(cold: ColdBuf<'a, SonaColdTail<'a, B>>) -> Self {
         Self {
             lite: SonaLiteHotPrefix::empty(),
-            os2x_hot: SonaOs2xHot::default(),
             full_delta: SonaFullHotDelta::empty(),
             pro_delta: SonaProHotDelta::empty(),
             ultra_delta: SonaUltraHotDelta::empty(),
@@ -355,26 +348,19 @@ impl<'a, B: GraphBackend> SonaHotSlab<'a, B> {
         }
     }
 
-    /// Active prefix hot working-set byte footprint for `(tier, os2x)`.
+    /// Active prefix hot working-set byte footprint for `tier` (`CoreOversamplerLiveHot` embedded in `lite`).
     #[inline(always)]
     #[must_use]
-    pub const fn active_hot_bytes(tier: Tier, os2x: bool) -> usize {
+    pub const fn active_hot_bytes(tier: Tier, _os2x: bool) -> usize {
         let lite = core::mem::size_of::<SonaLiteHotPrefix<B>>();
-        let os = core::mem::size_of::<SonaOs2xHot>();
         let full = core::mem::size_of::<SonaFullHotDelta<B>>();
         let pro = core::mem::size_of::<SonaProHotDelta<B>>();
         let ultra = core::mem::size_of::<SonaUltraHotDelta<B>>();
         match tier {
-            Tier::Lite => {
-                if os2x {
-                    lite + os
-                } else {
-                    lite
-                }
-            }
-            Tier::Full => lite + os + full,
-            Tier::Pro => lite + os + full + pro,
-            Tier::Ultra => lite + os + full + pro + ultra,
+            Tier::Lite => lite,
+            Tier::Full => lite + full,
+            Tier::Pro => lite + full + pro,
+            Tier::Ultra => lite + full + pro + ultra,
         }
     }
 
@@ -467,20 +453,20 @@ impl<'a, B: GraphBackend> SonaHotSlab<'a, B> {
     #[inline(always)]
     pub(crate) fn tile_hot(&self, t: usize) -> &SonaInterBlockTileHot {
         match t {
-            0..=2 => &self.lite.tiles[t],
-            3..=12 => &self.full_delta.tiles_full[t - 3],
-            13..=22 => &self.pro_delta.tiles_pro[t - 13],
-            _ => &self.ultra_delta.tiles_ultra[t - 23],
+            0..=4 => &self.lite.tiles[t],
+            5..=12 => &self.full_delta.tiles_full[t - 5],
+            13..=23 => &self.pro_delta.tiles_pro[t - 13],
+            _ => &self.ultra_delta.tiles_ultra[t - 24],
         }
     }
 
     #[inline(always)]
     pub(crate) fn tile_hot_mut(&mut self, t: usize) -> &mut SonaInterBlockTileHot {
         match t {
-            0..=2 => &mut self.lite.tiles[t],
-            3..=12 => &mut self.full_delta.tiles_full[t - 3],
-            13..=22 => &mut self.pro_delta.tiles_pro[t - 13],
-            _ => &mut self.ultra_delta.tiles_ultra[t - 23],
+            0..=4 => &mut self.lite.tiles[t],
+            5..=12 => &mut self.full_delta.tiles_full[t - 5],
+            13..=23 => &mut self.pro_delta.tiles_pro[t - 13],
+            _ => &mut self.ultra_delta.tiles_ultra[t - 24],
         }
     }
 
@@ -588,14 +574,12 @@ impl<'a, B: GraphBackend> SonaHotSlab<'a, B> {
 }
 
 const _: () = assert!(offset_of!(SonaHotSlab<'_, ScalarBackend>, lite) == 0);
-const _: () = assert!(offset_of!(SonaHotSlab<'_, ScalarBackend>, os2x_hot) == CUM_OS2X_OFFSET);
 const _: () = assert!(offset_of!(SonaHotSlab<'_, ScalarBackend>, full_delta) == CUM_FULL_OFFSET);
 const _: () = assert!(offset_of!(SonaHotSlab<'_, ScalarBackend>, pro_delta) == CUM_PRO_OFFSET);
 const _: () = assert!(offset_of!(SonaHotSlab<'_, ScalarBackend>, ultra_delta) == CUM_ULTRA_OFFSET);
 const _: () = assert!(offset_of!(SonaHotSlab<'_, ScalarBackend>, cold) == CUM_COLD_OFFSET);
 
 const _: () = assert!(offset_of!(SonaHotSlab<'_, DefaultMathBackend>, lite) == 0);
-const _: () = assert!(offset_of!(SonaHotSlab<'_, DefaultMathBackend>, os2x_hot) == CUM_OS2X_OFFSET);
 const _: () =
     assert!(offset_of!(SonaHotSlab<'_, DefaultMathBackend>, full_delta) == CUM_FULL_OFFSET);
 const _: () = assert!(offset_of!(SonaHotSlab<'_, DefaultMathBackend>, pro_delta) == CUM_PRO_OFFSET);
@@ -618,19 +602,19 @@ mod tests {
         );
         assert_eq!(
             SonaHotSlab::<ScalarBackend>::active_hot_bytes(Tier::Lite, true),
-            4_800
+            4_544
         );
         assert_eq!(
-            SonaHotSlab::<ScalarBackend>::active_hot_bytes(Tier::Full, false),
-            7_552
+            SonaHotSlab::<ScalarBackend>::active_hot_bytes(Tier::Full, true),
+            7_040
         );
         assert_eq!(
             SonaHotSlab::<ScalarBackend>::active_hot_bytes(Tier::Pro, true),
-            11_136
+            10_752
         );
         assert_eq!(
             SonaHotSlab::<ScalarBackend>::active_hot_bytes(Tier::Ultra, true),
-            14_592
+            14_336
         );
     }
 }

@@ -1,4 +1,4 @@
-//! Deterministic `#![no_std]` + `!alloc`-capable `SONA v3.0` Virtual Machine (`SonaVm`),
+//! Deterministic `#![no_std]` + `!alloc`-capable `SONA v4.0` Virtual Machine (`SonaVm`),
 //! `!alloc` [`SonaVmBacking`], optional `alloc` [`SonaInstance`] / [`dynamic::DynamicSonaVm`],
 //! telemetry, and concrete RT disassembly audit roots (`#![forbid(unsafe_code)]`).
 
@@ -8,15 +8,18 @@ mod stage_latch;
 
 use dnam_kernels::QUAD_FLAG_HOST_WRITE_LOCK;
 
+#[cfg(test)]
+use crate::bin::ARENA0_LITE_BYTES;
 use crate::bin::DnamBinView;
+use crate::graph::GraphBackend;
+use crate::graph::oversample::RenderMode;
 use crate::graph::slab::{
     SonaHotSlab, SonaSlabBacking, check_reload_slab_capacity, hydrate_slab_from_dnam_bin,
     reload_slab_from_dnam_bin_in_place, reset_to_dc_equilibrium, retime_sample_rate,
-    set_offline_bounce, set_op_t_write_enable, set_quad_write_enable, switch_tier,
+    set_offline_bounce, set_op_t_write_enable, set_quad_write_enable, set_render_mode, switch_tier,
 };
 #[cfg(feature = "alloc")]
-use crate::graph::slab::{VmReloadHeadroom, hydrate_slab_owned_with_headroom};
-use crate::graph::{Bounce4xOversampler, GraphBackend};
+use crate::graph::slab::{VmReloadHeadroom, hydrate_slab_owned, hydrate_slab_owned_with_headroom};
 use crate::math::{DefaultMathBackend, saturation_flags};
 use crate::types::{FtzDazGuard, Tier, VmError};
 
@@ -44,7 +47,7 @@ pub struct SonaTelemetrySnapshot {
     pub sample_tick: u32,
 }
 
-/// Deterministic pure `2x2` `SONA v3.0` Virtual Machine wrapping [`SonaHotSlab`]
+/// Deterministic pure `2x2` `SONA v4.0` Virtual Machine wrapping [`SonaHotSlab`]
 /// (`#![no_std]`, `#![forbid(unsafe_code)]`).
 #[derive(Debug)]
 pub struct SonaVm<'a, B: GraphBackend = DefaultMathBackend> {
@@ -117,13 +120,8 @@ impl<'a, B: GraphBackend> SonaVm<'a, B> {
         host_rate_hz: f32,
         offline_bounce: bool,
     ) -> Result<SonaVm<'static, B>, VmError> {
-        Self::from_view_owned_with_headroom(
-            view,
-            active_tier,
-            host_rate_hz,
-            offline_bounce,
-            VmReloadHeadroom::zero(),
-        )
+        let slab = hydrate_slab_owned(view, active_tier, host_rate_hz, offline_bounce)?;
+        Ok(SonaVm { slab })
     }
 
     /// Parses, CRC-verifies, and heap-hydrates a `.dnam-bin` payload with pre-allocated reload
@@ -309,9 +307,14 @@ impl<'a, B: GraphBackend> SonaVm<'a, B> {
         retime_sample_rate(&mut self.slab, new_host_rate_hz)
     }
 
-    /// Toggles `4x` offline bounce linear-phase oversampling.
+    /// Selects [`RenderMode::Live`] (`false`) or [`RenderMode::Master`] (`true`).
     pub fn set_offline_bounce(&mut self, offline: bool) -> Result<(), VmError> {
         set_offline_bounce(&mut self.slab, offline)
+    }
+
+    /// Explicitly switches between [`RenderMode::Live`] and [`RenderMode::Master`].
+    pub fn set_render_mode(&mut self, mode: RenderMode) -> Result<(), VmError> {
+        set_render_mode(&mut self.slab, mode)
     }
 
     /// Restores deterministic resting zero equilibrium while preserving `HOST_WRITE_LOCK` (bit 2).
@@ -319,7 +322,7 @@ impl<'a, B: GraphBackend> SonaVm<'a, B> {
         reset_to_dc_equilibrium(&mut self.slab);
     }
 
-    /// Enables or disables optional live OU analog drift (automatically bypassed on `offline_bounce`).
+    /// Enables or disables optional live OU analog drift (automatically bypassed on `RenderMode::Master`).
     #[inline(never)]
     pub fn set_live_analog_drift_enabled(&mut self, enabled: bool) {
         let scrubbed = if let Some(bus) = self.slab.cold_mut().ctrl_bus.as_mut() {
@@ -332,15 +335,11 @@ impl<'a, B: GraphBackend> SonaVm<'a, B> {
         }
     }
 
-    /// Returns processing latency in host samples (`0` live, `12` in `4x` offline bounce).
+    /// Returns processing latency in host samples (`7`/`0` in `Live`, `37`/`31`/`0` in `Master`).
     #[inline]
     #[must_use]
     pub fn get_latency_samples(&self) -> usize {
-        if self.slab.cold().offline_bounce {
-            Bounce4xOversampler::pdc_host_samples()
-        } else {
-            0
-        }
+        self.slab.cold().zoh.os_latency_samples
     }
 
     /// Returns accumulated saturation/non-finite telemetry flags (`crate::math::saturation_flags`).
@@ -372,7 +371,7 @@ impl<'a, B: GraphBackend> SonaVm<'a, B> {
             max_present_tier: cold.max_present_tier,
             retained_tier: cold.retained_tier,
             os2x_active: self.slab.os2x(),
-            offline_bounce: cold.offline_bounce,
+            offline_bounce: matches!(cold.render_mode, RenderMode::Master),
             host_write_lock: host_lock,
             latency_samples: self.get_latency_samples(),
             sample_tick: self.slab.lite.sample_tick,
@@ -479,7 +478,7 @@ mod tests {
             arena2: None,
             arena3: None,
         };
-        let mut buf = [0_u8; 128 + 4_608];
+        let mut buf = [0_u8; 128 + ARENA0_LITE_BYTES];
         let n = encode_dnam_bin_into(&input, &mut buf).unwrap();
 
         let mut cold = [SonaColdTail::<DefaultMathBackend>::empty()];
@@ -507,7 +506,7 @@ mod tests {
         let mut vm =
             SonaVm::<DefaultMathBackend>::open_dnam_bin(&buf[..n], Tier::Lite, 48_000.0, backing)
                 .unwrap();
-        assert_eq!(vm.get_latency_samples(), 0);
+        assert_eq!(vm.get_latency_samples(), 7);
         assert_eq!(vm.apply_tempo_bpm(f32::NAN), 0);
         assert_ne!(
             vm.saturation_flags() & saturation_flags::INVALID_NONFINITE,
@@ -581,7 +580,7 @@ mod tests {
     fn build_wdw_test_lite_bin(
         header_flags: u16,
         controls: &[crate::bin::ControlClampDescriptorWire],
-    ) -> ([u8; 128 + 4_608 + 512], usize) {
+    ) -> ([u8; 128 + ARENA0_LITE_BYTES + 512], usize) {
         use crate::math::f32_to_fp16;
         use zerocopy::byteorder::little_endian::{F32, U16};
 
@@ -593,8 +592,8 @@ mod tests {
         a0.core_quads[0].svf_g = [0.28; 4].map(F32::new);
         a0.core_quads[0].svf_k_fp16 = [U16::new(f32_to_fp16(0.707)); 4];
         a0.core_quads[0].adaa_drive_fp16 = [U16::new(f32_to_fp16(1.2)); 4];
-        a0.core_quads[0].tone_lp_fp16 = [U16::new(f32_to_fp16(0.4)); 4];
-        a0.core_quads[0].tone_dir_fp16 = [U16::new(f32_to_fp16(0.8)); 4];
+        a0.core_quads[0].c_lp_fp16 = [U16::new(f32_to_fp16(0.4)); 4];
+        a0.core_quads[0].c_u_fp16 = [U16::new(f32_to_fp16(0.8)); 4];
         a0.core_quads[0].lru_alpha_rel = [0.2; 4].map(F32::new);
         a0.core_quads[0].lru_alpha_atk = [0.9; 4].map(F32::new);
         a0.core_quads[0].lru_kappa_fp16 = [U16::new(f32_to_fp16(0.25)); 4];
@@ -637,7 +636,7 @@ mod tests {
             arena2: None,
             arena3: None,
         };
-        let mut buf = [0_u8; 128 + 4_608 + 512];
+        let mut buf = [0_u8; 128 + ARENA0_LITE_BYTES + 512];
         let n = encode_dnam_bin_into(&input, &mut buf).unwrap();
         (buf, n)
     }
@@ -835,7 +834,7 @@ mod tests {
             Err(VmError::InvalidTier)
         );
         assert_eq!(
-            vm_a.check_reload_capacity(&view_1, Tier::Lite, 192_000.0, true),
+            vm_a.check_reload_capacity(&view_1, Tier::Lite, 384_001.0, true),
             Err(VmError::InvalidSampleRate)
         );
         assert_eq!(vm_a.telemetry(), snap_before);

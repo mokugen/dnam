@@ -18,7 +18,7 @@ use super::sse42::X86Sse42Backend;
 use crate::graph::slab::{
     SonaHotSlab, process_block_sona, process_block_sona_inline, process_tick16_const,
     process_tick16_const_inline, step_control_tick_3khz, step_control_tick_3khz_inline,
-    step_frame_4x_sona, step_frame_4x_sona_inline, step_frame_sona, step_frame_sona_inline,
+    step_frame_sona, step_frame_sona_inline,
 };
 use crate::math::crc32c::Crc32cBackend;
 use crate::math::{
@@ -523,11 +523,7 @@ unsafe fn step_frame_avx2_hw(
     in_l: f32,
     in_r: f32,
 ) -> Result<(f32, f32), VmError> {
-    if slab.cold().offline_bounce {
-        step_frame_4x_sona_inline(slab, in_l, in_r)
-    } else {
-        step_frame_sona_inline(slab, in_l, in_r)
-    }
+    step_frame_sona_inline(slab, in_l, in_r)
 }
 
 #[target_feature(enable = "avx2,fma,f16c")]
@@ -578,11 +574,7 @@ pub(crate) fn dispatch_avx2_step_frame(
     in_r: f32,
 ) -> Result<(f32, f32), VmError> {
     if !X86Avx2FmaBackend::is_supported_cached() {
-        return if slab.cold().offline_bounce {
-            step_frame_4x_sona(slab, in_l, in_r)
-        } else {
-            step_frame_sona(slab, in_l, in_r)
-        };
+        return step_frame_sona(slab, in_l, in_r);
     }
     // SAFETY: `is_supported_cached()` verified `AVX2 + FMA + F16C` support at frame entry.
     unsafe { step_frame_avx2_hw(slab, in_l, in_r) }

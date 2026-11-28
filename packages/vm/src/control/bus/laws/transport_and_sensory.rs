@@ -290,6 +290,17 @@ pub const fn eval_phasor_inc_core_q32(inc_vm_q32: i32, os2x_active: bool) -> i32
     }
 }
 
+/// Converts VM-rate signed `Q0.32` phasor increment to core-rate increment for multirate
+/// `m_core in {1, 2, 4}` (`ADR-0026`, `0 FDIV`).
+#[inline]
+pub const fn eval_phasor_inc_core_multirate_q32(inc_vm_q32: i32, m_core: usize) -> i32 {
+    match m_core {
+        4 => inc_vm_q32 >> 2,
+        2 => inc_vm_q32 >> 1,
+        _ => inc_vm_q32,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

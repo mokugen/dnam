@@ -17,18 +17,18 @@ use core::mem::{align_of, size_of};
 use dnam_kernels::{FULL_SPEC, LITE_SPEC, PRO_SPEC, SonaTierSpec, ULTRA_SPEC};
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
-/// Slimmable `SONA v3.0` execution tier (`Lite`, `Full`, `Pro`, or `Ultra`).
+/// Slimmable `SONA v4.0` execution tier (`Lite`, `Full`, `Pro`, or `Ultra`).
 #[forbid(unsafe_code)]
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Tier {
-    /// `Lite`: `16` channels, `4` tank lines, `D_h = 4`, `4,608 B` (`72` cache lines).
+    /// `Lite`: `16` channels, `4` tank lines, `D_h = 4`, `5,376 B` (`84` cache lines).
     Lite = 0,
-    /// `Full`: `24` channels, `8` tank lines, `D_h = 4`, `7,936 B` (`124` cache lines).
+    /// `Full`: `24` channels, `8` tank lines, `D_h = 4`, `8,768 B` (`137` cache lines).
     Full = 1,
-    /// `Pro`: `32` channels, `12` tank lines, `D_h = 4`, `15,872 B` (`248` cache lines).
+    /// `Pro`: `32` channels, `12` tank lines, `D_h = 4`, `17,088 B` (`267` cache lines).
     Pro = 2,
-    /// `Ultra`: `40` channels, `16` tank lines, `D_h = 8`, `30,720 B` (`480` cache lines).
+    /// `Ultra`: `40` channels, `16` tank lines, `D_h = 8`, `30,272 B` (`473` cache lines).
     Ultra = 3,
 }
 
@@ -170,7 +170,7 @@ impl Tier {
         self.svd_control_modes()
     }
 
-    /// Returns the cumulative `SONA v3.0` arena byte footprint (`4,608`, `7,936`, `15,872`, or `30,720`).
+    /// Returns the cumulative `SONA v4.0` arena byte footprint (`5,376`, `8,768`, `17,088`, or `30,272`).
     #[inline]
     pub const fn expected_arena_bytes(self) -> usize {
         crate::bin::ARENA_TIER_BYTES[self.index()]
@@ -182,7 +182,7 @@ impl Tier {
         self.expected_arena_bytes()
     }
 
-    /// Returns the cumulative number of `64 B` cache lines (`72`, `124`, `248`, or `480`).
+    /// Returns the cumulative number of `64 B` cache lines (`84`, `137`, `267`, or `473`).
     #[inline]
     pub const fn expected_cache_lines(self) -> usize {
         self.expected_arena_bytes() / 64
@@ -254,12 +254,12 @@ mod tests {
         assert_eq!(Tier::Ultra.stage_latent_dim(), 8);
         assert_eq!(Tier::Ultra.fm_interaction_rank(), 8);
 
-        assert_eq!(Tier::Lite.arena_bytes(), 4_608);
-        assert_eq!(Tier::Full.arena_bytes(), 7_936);
-        assert_eq!(Tier::Pro.arena_bytes(), 15_872);
-        assert_eq!(Tier::Ultra.arena_bytes(), 30_720);
-        assert_eq!(Tier::Lite.expected_cache_lines(), 72);
-        assert_eq!(Tier::Ultra.expected_cache_lines(), 480);
+        assert_eq!(Tier::Lite.arena_bytes(), 5_376);
+        assert_eq!(Tier::Full.arena_bytes(), 8_768);
+        assert_eq!(Tier::Pro.arena_bytes(), 17_088);
+        assert_eq!(Tier::Ultra.arena_bytes(), 30_272);
+        assert_eq!(Tier::Lite.expected_cache_lines(), 84);
+        assert_eq!(Tier::Ultra.expected_cache_lines(), 473);
 
         let cl = CacheLine64::default();
         assert_eq!(cl.0, [0u8; 64]);
