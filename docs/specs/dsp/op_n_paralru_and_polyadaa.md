@@ -17,13 +17,14 @@ adrs:
   - ADR-0019
   - ADR-0022
   - ADR-0024
+  - ADR-0026
 ---
 
 # Op-N: Contractive `ParaLRU`, Divided-Difference `PolyADAA1`, Wavefolder & Bitcrusher
 
-This specification defines Op-N (Nonlinear and Parallel State-Space) for Dynamic Neural Audio Modeler (DNAM) SONA v4.0 ([sona_architecture.md](../architecture/sona_architecture.md), [REQ-1.1, REQ-6.2](../../requirements/system_goals_and_requirements.md), [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md)), covering four interlocking primitives:
+This specification defines Op-N (Nonlinear and Parallel State-Space) for Dynamic Neural Audio Modeler (DNAM) SONA v4.0 ([sona_architecture.md](../architecture/sona_architecture.md), [REQ-1.1, REQ-6.2](../../requirements/system_goals_and_requirements.md), [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [ADR-0026](../../adr/0026-core-only-multirate-offline-and-crossbar-latency-invariance.md)), covering four interlocking primitives:
 
-1. All-tier 2× `OS2X` (15-tap HB-FIR) 4-block Matryoshka core (`[1,1,1,1]`, `[2,2,1,1]`, `[2,2,2,2]`, `[3,3,2,2]`, max 7 outgoing tiles/quad) with Quad-Major 8-subsample execution.
+1. CoreOversampler (Live 2× / Master up to 4× + `Box2`) 4-block Matryoshka core (`[1,1,1,1]`, `[2,2,1,1]`, `[2,2,2,2]`, `[3,3,2,2]`, max 7 outgoing tiles/quad) with Quad-Major execution.
 2. Smooth non-saturating `ParaLRU` (C² quartic `soft_rect`), 3-tap folded `TPT-SVF`, Predictor-Corrector passive PHS (Block 0), and 2-block partial-fraction LR4 scans.
 3. Clamped `AlgADAA1(0.5)` (`MAX_ALG_R = 4096.0`, NR3) with GL/Möbius backward adjoints, `g_pre(v²)` + SE-Bus + GLU, explicit `rect_sign_mask`, and 1× `PolyADAA1` references.
 4. Op-N[Pre] v4 (`quantize -> ZOH`: 4-FMA Hermite quantizer + hard-capable `Q0.32` wrap ZOH) and `Op-N[Ctrl]` (`ControlBus` v4 GRA).
@@ -204,7 +205,7 @@ $$h_{\text{hyst}}[n] = s_{\text{re}}[n] \cdot \big(s_{\text{re}}[n] - s_{\text{r
 
 `r[dsp.op-n.bitcrusher.quantizer]`
 
-At the Top-of-Frame Crossbar, continuous pre-core conditioning executes `Op-N[Pre]` v4 strictly in **`quantize -> ZOH -> post-DAC CoreQuad SVF`** order ahead of `OS2X`, configured by a base wire descriptor (`Crossbar[180..192)` plus `s_q` / `kappa_h` / `log2_rho_zoh` controls) and a 4-byte-aligned `OpNPreHotState` with zero 64-bit runtime integers:
+At the Top-of-Frame Crossbar, continuous pre-core conditioning executes `Op-N[Pre]` v4 strictly in **`quantize -> ZOH -> post-DAC CoreQuad SVF`** order ahead of `CoreOversampler`, configured by a base wire descriptor (`Crossbar[180..192)` plus `s_q` / `kappa_h` / `log2_rho_zoh` controls) and a 4-byte-aligned `OpNPreHotState` with zero 64-bit runtime integers:
 
 | Region / Offset | Bytes | Fields & Types | Clamped Domain, Zero-Init & Control-Bus Invariant |
 | :--- | :---: | :--- | :--- |
@@ -212,7 +213,7 @@ At the Top-of-Frame Crossbar, continuous pre-core conditioning executes `Op-N[Pr
 | Active-Hot State 0..16 | 16 | `held: f32[2]`, `phase_q32: u32`, `inc_q32: u32` | `OpNPreHotState` prefix: unclipped L/R ZOH latch states plus 32-bit `Q0.32` ZOH accumulator and increment |
 | Active-Hot State 16..28+ | 12+ | `gamma_bc: f32`, `beta_q: f32`, `zoh_hold_depth_eff: f32`, `s_q`, `kappa_h` | Effective wet blend `[0.0, 1.0]`, hoisted log2 scale `[0.0, 16.0]`, ZOH hold depth `[0.0, 0.9999]`, quantizer sharpness `s_q`, and hold sharpness `kappa_h` |
 
-Encoding `zoh_hold_depth = 1.0 - rho_zoh` in `[0.0, 0.9999]` and `log2_rho_zoh` enforces zero-init pass-through (`g_clk == 1.0`) while keeping clock scaling rate-invariant across 44.1–192 kHz. Positioned after Op-T addition and ahead of OS2X, Op-N[Pre] v4 replaces the 1-harmonic Fourier quantizer with the **4-FMA $C^1$ Hermite deadzone staircase quantizer** (zero FDIV, faster than sine evaluation).
+Encoding `zoh_hold_depth = 1.0 - rho_zoh` in `[0.0, 0.9999]` and `log2_rho_zoh` enforces zero-init pass-through (`g_clk == 1.0`) while keeping clock scaling rate-invariant across 44.1–192 kHz. Positioned after Op-T addition and ahead of `CoreOversampler`, Op-N[Pre] v4 replaces the 1-harmonic Fourier quantizer with the **4-FMA $C^1$ Hermite deadzone staircase quantizer** (zero FDIV, faster than sine evaluation).
 
 For sharpness $s_q \in [0, 1]$, deadzone width $w = \max(1 - s_q, 2^{-12})$, pre-multiplied inverse width $w_{\text{inv}} = \mathrm{rcp}(w)$, and step $\Delta_q = 2^{-\mathrm{clamp}(\beta_q, -16, 16)}$ over $x_{\text{clip}} = \mathrm{clamp}(x_c, -100.0, +100.0)$:
 
@@ -223,7 +224,7 @@ $$Q(x_c) = \Delta_q \Big(n + \mathrm{sgn}(r) \cdot 0.5 t^2(3 - 2t)\Big)$$
 
 `r[dsp.op-n.bitcrusher.zoh-phase]`
 
-Executing once per VM frame at $f_{s,\text{vm}}$ ahead of `OS2X`, `Op-N[Pre]` v4 applies `Q(x_c)` first (`q_c = clamp(x_c, -100.0, 100.0)` when `beta_q <= 1e-6`, else 4-FMA $C^1$ Hermite staircase), blends wet quantized signal `q_wet = x_c + gamma_bc * (q_c - x_c)`, and feeds the **decoupled hard-capable `Q0.32` phase-wrap ZOH** using strictly 32-bit runtime integers:
+Executing once per VM frame at $f_{s,\text{vm}}$ ahead of `CoreOversampler`, `Op-N[Pre]` v4 applies `Q(x_c)` first (`q_c = clamp(x_c, -100.0, 100.0)` when `beta_q <= 1e-6`, else 4-FMA $C^1$ Hermite staircase), blends wet quantized signal `q_wet = x_c + gamma_bc * (q_c - x_c)`, and feeds the **decoupled hard-capable `Q0.32` phase-wrap ZOH** using strictly 32-bit runtime integers:
 
 - **Log-Frequency Clock:** `rho_eff = exp2_clamped16(log2_rho_zoh) * rho_vm` maps across 44.1–192 kHz into `inc_q32 = (rho_eff >= 1.0 - 1.0e-7 || z_h_eff <= 0.0) ? 0 : max(1, round(rho_eff * 2^32))`.
 - **Phase-Wrap Hold Latch:** Wrapping `phase_q32` sets `wrap = (new_phase < phase_q32) ? 1.0 : 0.0` alongside soft raised-cosine edge `w(phi) = 0.25 * (1 + cos(2*pi*phi))^2`.
@@ -237,7 +238,7 @@ When `inc_q32 == 0`, `g_clk == 1.0` tracks every sample cleanly with exact Zero-
 
 `r[dsp.op-n.bitcrusher.rate-transfer]`
 
-Across host sample-rate changes from 44.1 kHz through 192 kHz or 4× offline bounce transitions, internal `OS2X` never doubles the `Op-N[Pre]` rate because execution runs ahead of upsampling at $f_{s,\text{vm}}$. Normalized 32-bit `phase_q32` transfers unchanged across sample rates, while `log2_rho_zoh` maps via `exp2_clamped16(log2_rho_zoh) * rho_vm` directly to `inc_q32` so ZOH cutoff frequencies remain invariant across 44.1–192 kHz with zero 64-bit integers in the audio callback.
+Across host sample rates from 44.1 kHz through 192 kHz in both Live and Master render modes, Op-N[Pre] always executes at `f_{s,vm} == f_{s,host}` ahead of `CoreOversampler` upsampling. Normalized 32-bit `phase_q32` transfers unchanged across sample rates, while `log2_rho_zoh` maps via `exp2_clamped16(log2_rho_zoh) * rho_vm` directly to `inc_q32` so ZOH cutoff frequencies remain invariant across 44.1–192 kHz with zero 64-bit integers in the audio callback.
 
 For standalone fixed-Hertz exact-rate tracking, precomputing `u64` reciprocal $R = \lfloor 2^{104} / D_{\text{old}} \rfloor$ on the cold path lets sample-rate transitions form $N = P_{\text{old}} D_{\text{new}} < 2^{102}$ in 128-bit unsigned integer arithmetic, evaluate quotient $q_0 = \lfloor N R / 2^{104} \rfloor$ via bit shifts, refine remainder $r_0 = N - q_0 D_{\text{old}}$, round ties-to-even, and clamp to $D_{\text{new}} - 1$ so imminent carries stay imminent:
 
@@ -273,7 +274,7 @@ $$\sum_{k=0}^{K-1} \Big(\mathcal{L}_k\big(\mathbf{u}\big)[n]\Big) \mathbf{W}_k \
 
 `r[dsp.op-n.commuted.causality]`
 
-All Top-of-Frame Crossbar `Op-T` reads where $\tau_{\min} = 5.0$ samples across 4-frame causal micro-chunks (and $\tau \ge 4.0$ on standalone single-sample rings), `TPT-SVF` / `ParaLRU` / `AlgADAA1` updates, the all-tier 2× 15-tap symmetric linear-phase HB-FIR oversampler (exact 7 1×-sample pure integer delay), and `ModalConvolver` v4 interfaces in SONA v4.0 are strictly causal with $d \ge 0$, maintaining sample-accurate phase alignment across 2× and 4× bounce paths.
+All Top-of-Frame Crossbar Op-T reads (`tau_eff >= 42.0` so `tau_ring_cb = tau_eff - D_os >= 5.0`), self-feedback `TransportQuad` reads (`tau_min = 5.0`), standalone rings (`tau >= 4.0`), TPT-SVF/ParaLRU/AlgADAA1 updates, the 2-mode `CoreOversampler` (Live D_os 7/0; Master D_os 37/31/0 with `Box2` composite quadrature + 2× midpoint `lin_mix`), and ModalConvolver v4 interfaces are strictly causal with $d \ge 0$, maintaining sample-accurate phase alignment across Live and Master paths.
 
 ---
 
@@ -308,14 +309,14 @@ SONA v4.0 models nonlinear preamps, resonant diode filters, magnetic hysteresis,
 
 Each CoreQuad chains M/S input coupling (`in_mid_weight_fp16`, `in_side_weight_fp16`), 3-tap folded TPT-SVF (Predictor-Corrector passive PHS on Block 0 and linear ZDF TPT-SVF on Blocks 1..3), and smooth Selective-Duhem stereo-linked ParaLRU with C² quartic spline `soft_rect`.
 
-Nonlinear drive applies `g_pre(v²)` and clamped `AlgADAA1(0.5)` (`MAX_ALG_R = 4096.0`, NR3) with `lin_mix`, C² wavefolder (`rect_sign_mask`), post-ADAA rank-1 SE-Bus, bounded GLU, and micro-ramped `out_gain`:
+Nonlinear drive applies `g_pre(v²)` and clamped AlgADAA1(0.5) (`MAX_ALG_R = 4096.0`, NR3) with `lin_mix` (evaluated at exact 2× midpoint `0.5 * (x_{2n} + x_{2n+1})` inside Master 4× CoreQuad blocks alongside `Box2` 2-point sub-sample averaging on 4×->2× writes), C² wavefolder (`rect_sign_mask`), post-ADAA rank-1 SE-Bus, bounded GLU, and micro-ramped `out_gain`:
 
 | Tier Profile | `CoreQuad`s & Lanes | Inter-Block Tiles | Core Rate | `TPT-SVF` Quads / Modes | `ModalConvolver` (FIR / `ErSparse` / Kautz) | `TransportQuad`s (`Lines`) | Hot L1D Working Set |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| Lite `[1, 1, 1, 1]` | 4 quads (16 lanes) | 5 | 2× HB-FIR | 4 quads (16 modes) | 32 taps / 8 `ErSparse` / 8 pairs | 1 quad (4 lines, 64-fr inline) | 4,432 B (`14× = 60.59 KiB <= 64 KiB`) |
-| Full `[2, 2, 1, 1]` | 6 quads (24 lanes) | 13 | 2× HB-FIR | 6 quads (24 modes) | 48 taps / 16 `ErSparse` / 12 pairs | 2 quads (8 lines) | <= 8,192 B (`8× <= 64 KiB`) |
-| Pro `[2, 2, 2, 2]` | 8 quads (32 lanes) | 24 | 2× HB-FIR | 8 quads (32 modes) | 96 taps / 16 `ErSparse` / 24 pairs | 3 quads (12 lines) | <= 16,384 B (`4× <= 64 KiB`) |
-| Ultra `[3, 3, 2, 2]` | 10 quads (40 lanes) | 37 | 2× HB-FIR (4× Bounce) | 10 quads (40 modes) | 128 taps / 16 `ErSparse` / 32 pairs | 4 quads (16 lines) | <= 32,768 B (`2× <= 64 KiB`) |
+| Lite `[1, 1, 1, 1]` | 4 quads (16 lanes) | 5 | Live 2× / Master 4× | 4 quads (16 modes) | 32 taps / 8 `ErSparse` / 8 pairs | 1 quad (4 lines, 64-fr inline) | 4,432 B (`14× = 60.59 KiB <= 64 KiB`) |
+| Full `[2, 2, 1, 1]` | 6 quads (24 lanes) | 13 | Live 2× / Master 4× | 6 quads (24 modes) | 48 taps / 16 `ErSparse` / 12 pairs | 2 quads (8 lines) | <= 8,192 B (`8× <= 64 KiB`) |
+| Pro `[2, 2, 2, 2]` | 8 quads (32 lanes) | 24 | Live 2× / Master 4× | 8 quads (32 modes) | 96 taps / 16 `ErSparse` / 24 pairs | 3 quads (12 lines) | <= 16,384 B (`4× <= 64 KiB`) |
+| Ultra `[3, 3, 2, 2]` | 10 quads (40 lanes) | 37 | Live 2× / Master 4× | 10 quads (40 modes) | 128 taps / 16 `ErSparse` / 32 pairs | 4 quads (16 lines) | <= 32,768 B (`2× <= 64 KiB`) |
 
 Replacing the 84-op square-root rectifier (6 `NR3` chains/quad) with a **C² quartic spline `soft_rect`** (12–14 NEON ops, zero `rsqrt` or `rcp`, -70c/quad modeled CPU, zero negative leak, $C^2$ continuous curvature for `L-SSBroyden`) sets $t = \mathrm{clamp}(z / (2\epsilon), 0, 1)$ with `SOFT_RECT_EPS` $\varepsilon = 10^{-3}$:
 

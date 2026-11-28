@@ -16,18 +16,19 @@ adrs:
   - ADR-0019
   - ADR-0022
   - ADR-0024
+  - ADR-0026
 ---
 
 # Op-M: Universal `TPT-SVF` Scan, Symplectic Modal, `Op-P` Hilbert/Tracker & Kautz Operator
 
 This specification defines Op-M (Modal and Linear State-Space) along with the input-only Op-P analytic basis for Dynamic Neural Audio Modeler (DNAM) SONA v4.0. Op-M governs four coupled subsystems across real-time execution and GPU training:
 
-1. Unconditionally passive 2×2 `ZDF` `TPT-SVF` associative scans inside the all-tier 2× `OS2X` 4-block Matryoshka SONA core (with Block 0 Predictor-Corrector passive PHS) across 44.1–384 kHz.
+1. Unconditionally passive 2×2 ZDF TPT-SVF associative scans inside the Core-Only Multirate (Live 2× / Master 4×) 4-block Matryoshka SONA core (with Block 0 Predictor-Corrector passive PHS) across 44.1–384 kHz.
 2. Top-of-Frame Causal Crossbar signed `Q0.32` quadrature phasors (spanning `[-0.49 f_s, +0.49 f_s]`, typical audible magnitudes 0.05 Hz–20 kHz) and `Q0.192` contractive control rotors (`Op-M[Ctrl]`).
 3. Input-only Op-P v4 analytic basis executing natively at `f_{s,core}` (6-section H1 Hilbert lattice, learned 1-pole pre-T1 LPF `g_trk`, 8-feature T1+ tracker, and decoupled crossbar gates).
-4. `ModalConvolver` v4 (Kaiser polyphase high-SR FIR, `ErSparseBank` MIMO early taps, 2-basis `fp16` FIR voicing morph, and shared-pole Kautz banks with per-bank onset/cross-feed).
+4. ModalConvolver v4 (Kaiser polyphase high-SR FIR up to 192 kHz at `f_{s,vm} == f_{s,host}`, `ErSparseBank` MIMO early taps, 2-basis `fp16` FIR voicing morph, and shared-pole Kautz banks with per-bank onset/cross-feed).
 
-For requirements and architectural context, see [sona_architecture.md](../architecture/sona_architecture.md) and [REQ-1.2, REQ-1.3, REQ-2.5, REQ-6.2](../../requirements/system_goals_and_requirements.md). For mathematical derivations and counterexamples, see [ADR-0005](../../adr/0005-contractive-rotor-hilbert-and-t1-tracker.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), and [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md).
+For requirements and architectural context, see [sona_architecture.md](../architecture/sona_architecture.md) and [REQ-1.2, REQ-1.3, REQ-2.5, REQ-6.2](../../requirements/system_goals_and_requirements.md). For mathematical derivations and counterexamples, see [ADR-0005](../../adr/0005-contractive-rotor-hilbert-and-t1-tracker.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), and [ADR-0026](../../adr/0026-core-only-multirate-offline-and-crossbar-latency-invariance.md).
 
 ---
 
@@ -39,7 +40,7 @@ For requirements and architectural context, see [sona_architecture.md](../archit
 
 `r[dsp.op-m.recurrence.symplectic]`
 
-Inside the all-tier 2× `OS2X` (15-tap symmetric linear-phase HB-FIR) 4-block Matryoshka SONA core, resonant and crossover filter quads occupy 4, 6, 8, or 10 `svf_quads` across Lite, Full, Pro, and Ultra with strict `CoreQuad[0..4]` prefix sharing, yielding 16, 24, 32, or 40 scalar TPT-SVF modes (one quad per 4-lane CoreQuad). Block 0 applies 1-step Predictor-Corrector passive PHS (`k_eff[n] = k + k_nl * min(v_1lin[n]², 64.0)`), while Blocks 1..3 run linear passive 2×2 ZDF trapezoidal state-variable filters with zero `FDIV`, `log`, or `exp` instructions in the audio loop.
+Inside the `CoreOversampler` (Live 2× 15-tap / Master 4× 63/23-tap symmetric linear-phase HB-FIR, 1× bypass at 352.8–384 kHz) 4-block Matryoshka SONA core, resonant and crossover filter quads occupy 4, 6, 8, or 10 `svf_quads` across Lite, Full, Pro, and Ultra with strict `CoreQuad[0..4]` prefix sharing, yielding 16, 24, 32, or 40 scalar TPT-SVF modes (one quad per 4-lane CoreQuad). Block 0 applies 1-step Predictor-Corrector passive PHS (`k_eff[n] = k + k_nl * min(v_1lin[n]², 64.0)`), while Blocks 1..3 run linear passive 2×2 ZDF trapezoidal state-variable filters with zero `FDIV`, `log`, or `exp` instructions in the audio loop.
 
 For a mode with cutoff frequency $f_c[n]$, prewarped ZOH tangent gain $g[n] = \tan(\pi f_c[n] / f_{s,\text{eff}}) > 0$, damping $k[n] = 1/Q[n] \ge 0$, $a_1 = 1 / (1 + g(g + k))$, $a_2 = g a_1$, and $a_3 = g a_2$, the nodal update and state transition follow:
 
@@ -142,7 +143,7 @@ Per K_ctrl Tick (Pure-32-Bit Rotor, Zero f64 VM Math):
   q2[2*j] = c + beta_j * (2.0 * c * c - 1.0); q2[2*j + 1] = s   // beta_j = lfo_skew_fp16[j] in [-1.0, 1.0]
 ```
 
-At audio rate inside the Top-of-Frame crossbar, each `Q0.32` carrier computes `cycles = clamp(freq_hz * inv_sr, -0.49, +0.49)` and signed `inc_q32: i32 = round(cycles * 2^32)`. This signed formulation supports negative frequencies and arithmetic `inc_1x >> 1` at 2× `OS2X` ([router_and_crossbar_topology.md §4](router_and_crossbar_topology.md#4-top-of-frame-causal-operator-crossbar)).
+At audio rate inside the Top-of-Frame crossbar, each `Q0.32` carrier evaluates `inc_core = round_half_away((f_eff * 2^32) / f_{s,core})` directly at `f_{s,core} = M_core * f_{s,vm}` across `CoreOversampler` (Live 2×, Master 4×, or 1× bypass at 352.8–384 kHz). This signed formulation supports negative frequencies without +0.5 floor bias ([router_and_crossbar_topology.md §4](router_and_crossbar_topology.md#4-top-of-frame-causal-operator-crossbar)).
 
 By contrast, the unsigned `[0.0, 0.49999994]` (`0x3EFF_FFFE`) bound with `inc_q32 = u32(clamp(cycles * 2^32 + 0.5, 0.0, 2^31))` applies solely to positive-only `u32` `PhasorQ32Bank4` APIs.
 
@@ -219,15 +220,15 @@ When $f_s \ne 48$ kHz, the `H1` Hilbert lattice sets L and R coefficients symmet
 
 Inside the Top-of-Frame Crossbar, true-stereo `H1` analytic pairs $(I_L, Q_L, I_R, Q_R)$ combine with the 4-lane `Q0.32` quadrature carriers $(c[n], s[n])$ through the 24 B half-precision 3-basis carrier readout `carrier_basis_w_fp16` (Arena 0 Crossbar bytes 156..180), forming projections `[hi * p_cos, hq * p_sin, p_sin]` for SSB shifting $I c \mp Q s$, ring modulation, and quadrature stereo modulation.
 
-During all-tier 2× oversampled execution (`OS2X` active on Lite through Ultra when `!offline_bounce && 2 * f_{s,vm} <= 384_000`), Op-P (H1, pre-T1 tracking LPF, T1+, and 4× Q0.32 carrier phasors) executes natively at `f_{s,core}` using the 15-rate `HILBERT-H1-ANCHORS` table (44.1–384 kHz). Native 2× H1 execution eliminates -4.6..-15.3 dB midpoint interpolation imaging without storing 1× midpoint history buffers.
+During oversampled core execution (Live 2× up to 192 kHz, or Master 4× up to 96 kHz and 2× at 176.4–192 kHz), Op-P (H1, pre-T1 tracking LPF, T1+, and 4× `Q0.32` carrier phasors) executes natively at `f_{s,core}` using the 15-rate `HILBERT-H1-ANCHORS` table (44.1–384 kHz). Native `f_{s,core}` H1 execution eliminates midpoint interpolation imaging without storing 1× midpoint history buffers.
 
-In the Top-of-Frame Crossbar, Op-P and Q0.32 phasor crossbar injection gains (`op_p_to_core` and `phasor_to_core`) operate as dedicated crossbar gates decoupled from Op-T `wet_scale` (`stage_targets[15]`), while Q0.32 phasors step at `inc_core` under `OS2X` after optional octave modulation via slot 29 `op_p_phasor_rate_oct`. Because Op-P depends solely on dry input $x[n]$, training pipelines precompute native `f_{s,core}` tracks on CPU in under 0.5 ms before GPU upload.
+In the Top-of-Frame Crossbar, Op-P and Q0.32 phasor crossbar injection gains (`op_p_to_core` and `phasor_to_core`) operate as dedicated crossbar gates decoupled from Op-T `wet_scale` (`stage_targets[15]`), while Q0.32 phasors step at `inc_core` under active `CoreOversampler` scaling after optional octave modulation via slot 29 `op_p_phasor_rate_oct`. Because Op-P depends solely on dry input $x[n]$, training pipelines precompute native `f_{s,core}` tracks on CPU in under 0.5 ms before GPU upload.
 
 ### 2.1 Hilbert Coefficient Profile `H1`
 
 `r[dsp.op-m.hilbert.h1-anchors]`
 
-The 48,000 Hz row below provides the canonical runtime `HILBERT_ALPHA_I_BITS` and `HILBERT_ALPHA_Q_BITS` anchor coefficients, while off-48 kHz rates interpolate across consecutive rows of the 15-rate table (§2.1.1). The complete reference table stores IEEE-754 `f32` bit patterns (six `I`-branch then six `Q`-branch coefficients; 780 B little-endian payload, SHA-256 `bd236421110a57438536f20286ada3d2d16de8709f418f7322136d80c639c352`) spanning 44,100–384,000 Hz across 1× live, bridged 2× host, and 4× bounce bands:
+The 48,000 Hz row below provides the canonical runtime `HILBERT_ALPHA_I_BITS` and `HILBERT_ALPHA_Q_BITS` anchor coefficients, while off-48 kHz rates interpolate across consecutive rows of the 15-rate table (§2.1.1). The complete reference table stores IEEE-754 `f32` bit patterns (six I-branch then six Q-branch coefficients; 780 B little-endian payload, SHA-256 `bd236421110a57438536f20286ada3d2d16de8709f418f7322136d80c639c352`) spanning 44,100–384,000 Hz across 1× host bypass, Live 2×, and Master 4× core bands:
 
 ```text
 HILBERT-H1-ANCHORS
@@ -276,7 +277,7 @@ $$s'[n-i] = s[n-i] + (\beta - \alpha)y[n-i], \qquad i \in \lbrace 1, 2 \rbrace$$
 
 ```mermaid
 flowchart LR
-    X["Gated Input (g_in * x_L, g_in * x_R) @ f_s,core"] --> DC["Stereo 5 Hz DC Blocker (24 B)"] --> H1["Native 2x True Stereo H1 Lattice (128 B hot)"] --> Mid["Mid Analytic Pair 0.5*(i_L+i_R, q_L+q_R)"] --> LPF["1-Pole Pre-T1 LPF (g_trk)"] --> Tracker["8-Feature T1+ Rotor (56 B, rsqrt_pos_nr3):<br/>feat[0..4] Sub + feat[4..6] 2theta + feat[6] Octavia + feat[7] Stereo"]
+    X["Gated Input (g_in * x_L, g_in * x_R) @ f_s,core"] --> DC["Stereo 5 Hz DC Blocker (24 B)"] --> H1["Native f_s,core True Stereo H1 Lattice (128 B hot)"] --> Mid["Mid Analytic Pair 0.5*(i_L+i_R, q_L+q_R)"] --> LPF["1-Pole Pre-T1 LPF (g_trk)"] --> Tracker["8-Feature T1+ Rotor (56 B, rsqrt_pos_nr3):<br/>feat[0..4] Sub + feat[4..6] 2theta + feat[6] Octavia + feat[7] Stereo"]
     H1 -->|"carrier_basis_w_fp16 (24 B) * Q0.32"| Crossbar["Top-of-Frame Crossbar (Decoupled from Op-T wet_scale)"]
     X --> Crossbar --> Core["4-Block CoreQuad Cascade"]
     Tracker -->|"op_p_to_core_fp16"| Crossbar
@@ -287,8 +288,8 @@ The input-only `Op-P` v4 pipeline executes one identical stereo-input analytic c
 | Pipeline Component | Placement, Footprint & Constants | Runtime & ZOH Rate Law |
 | :--- | :--- | :--- |
 | Stereo `T1` 5 Hz DC Blocker | 24 B stereo 5 Hz 1-pole blocker (`0x3F7F_D51F`, `0x3F7F_EA90`) conditioning L/R before `H1` | Scales `R_trk,eff` cleanly with `f_{s,core}` (`rho_core`); zero duplicate post-`H1` blockers |
-| Native 2× True Stereo `H1` Lattice | `H1` state (128 B compact hot layout, shared `alpha_i`/`alpha_q` + L/R TDF-II `z^-2` and `q_prev`) | 15-rate `HILBERT-H1-ANCHORS` 128-bit ties-to-even interpolation at `f_{s,core}` over `[44,100 ..= 384,000]` Hz, endpoint-clamped; 0.0976 deg (< 0.10 deg) @ 48 kHz, <= 0.19 deg all 15 anchors, <= 0.34 deg across `[44.1, 96]` & `[176.4, 384]` kHz |
-| 3-Basis Carrier & Phasor Block | 24 B `carrier_basis_w_fp16` (`[hi*p_cos, hq*p_sin, p_sin]`); 48 B 4× `Q0.32` phasors | Native `f_{s,core}` evaluation (`inc_1x >> 1` under `OS2X`), zero midpoint interpolation lag or aliasing |
+| Native `f_{s,core}` True Stereo `H1` Lattice | `H1` state (128 B compact hot layout, shared `alpha_i`/`alpha_q` + L/R TDF-II `z^-2` and `q_prev`) | 15-rate `HILBERT-H1-ANCHORS` 128-bit ties-to-even interpolation at `f_{s,core}` over `[44,100 ..= 384,000]` Hz, endpoint-clamped; 0.0976 deg (< 0.10 deg) @ 48 kHz, <= 0.19 deg all 15 anchors, <= 0.34 deg across `[44.1, 96]` & `[176.4, 384]` kHz |
+| 3-Basis Carrier & Phasor Block | 24 B `carrier_basis_w_fp16` (`[hi*p_cos, hq*p_sin, p_sin]`); 48 B 4× `Q0.32` phasors | Native `f_{s,core}` evaluation (`inc_core = round_half_away((f_eff * 2^32) / f_{s,core})` under `CoreOversampler`), zero midpoint interpolation lag or aliasing |
 | Pre-`T1` LPF & 8-Feature `T1+` Rotor | 56 B hot state (`g_trk` LPF, `prev_w1_re`, `prev_w1_im`, `sheet2`, `env_dc`, stereo/2-band state) | Emits `feat[0..8]` (4 sub-harmonic + `2theta` doubler + Octavia/OC-2 + stereo/2-band) via decoupled `op_p_to_core` |
 
 The upstream 5 Hz DC blocker state update and ZOH rate law compute:
@@ -435,7 +436,7 @@ At runtime, each 16-byte-aligned 4-pair stereo Kautz bank expands a block into e
 +---------------------------------------------------------------------------------------------------+
 ```
 
-Across tiers, incremental slices add 2, 1, 3, and 2 serialized Kautz SoA blocks, while inside each 4-frame host micro-chunk executed post-HB-FIR downsampling at `f_{s,vm}`, all 11 SoA vectors of active 4-pair stereo Kautz banks stay register-resident across 4-frame batches synchronized with batched FIR ring shifts. See [dnam_binary_format.md](../containers/dnam_binary_format.md) for container arena offsets.
+Across tiers, incremental slices add 2, 1, 3, and 2 serialized Kautz SoA blocks, while inside each 4-frame host micro-chunk executed post-`CoreOversampler` downsampling at `f_{s,vm} == f_{s,host}` (with `Box2` + midpoint `lin_mix` preserving phase parity), all 11 SoA vectors of active 4-pair stereo Kautz banks stay register-resident across 4-frame batches synchronized with batched FIR ring shifts. See [dnam_binary_format.md](../containers/dnam_binary_format.md) for container arena offsets.
 
 ---
 
@@ -514,7 +515,7 @@ host_b_gamma[m]    = inactive[m] ? 0.0 : (|rho - 1.0| < 1.0e-12 ? b_gamma_stored
 host_inv_1mr2[m]   = f32(rcp_nr6_f64(max(1.0 - f64(r_host[m]) * f64(r_host[m]), 1.0e-7)))
 ```
 
-For cold $f_{s,\text{vm}} > 48{,}000\text{ Hz}$, including integer multiples $q \cdot 48{,}000\text{ Hz}$ where $q \in \lbrace 2, 4, 8 \rbrace$, ModalConvolver v4 replaces `q = 2` zero-stuffing with cold-load Kaiser-windowed polyphase sinc interpolation over the 48 kHz reference FIR taps, eliminating 0 dB mirror-image spectral leakage while keeping native 48 kHz taps bit-for-bit verbatim. Per-bank Kautz onset delays read the 1,024-sample (`mask = 1,023`) extended FIR history ring at `clamp(round(onset_48k / rho), 0, 1023)` alongside [router_and_crossbar_topology.md §9](router_and_crossbar_topology.md#9-continuous-time-zoh-rate-adaptation).
+For cold $48{,}000 < f_{s,\text{vm}} \le 192{,}000\text{ Hz}$ (since `f_{s,vm} == f_{s,host}` caps ModalConvolver rates at 192 kHz, covering integer multiples `2 * 48,000` and `4 * 48,000` Hz with zero Lagrange or `q = 8` paths), ModalConvolver v4 replaces `q = 2` zero-stuffing with cold-load Kaiser-windowed polyphase sinc interpolation over the 48 kHz reference FIR taps, keeping native 48 kHz taps bit-for-bit verbatim. Per-bank Kautz onset delays read the 1,024-sample (`mask = 1,023`) extended FIR history ring at `clamp(round(onset_48k / rho), 0, 1023)` alongside [router_and_crossbar_topology.md §9](router_and_crossbar_topology.md#9-continuous-time-zoh-rate-adaptation).
 
 ---
 
@@ -560,7 +561,7 @@ To capture early room reflections spanning 50–1,000 samples (up to 21.3 ms at 
 
 Each sparse tap stores a 48 kHz fractional delay index (`[0.0, 1020.0]`) and 2×2 MIMO gain matrix `(g_ll, g_lr, g_rl, g_rr)` scaled via linear sub-sample interpolation under `1 / rho_vm` ZOH rate conversion (FDIV-free). Combined with per-bank `onset_delay_samp[4]` (`u16[4]` in reclaimed `dr` bytes) and `c_cross_fp16[4]` stereo cross-feed, a 2-basis `fp16` early-FIR voicing morph enables parametric cabinet-voicing interpolation with zero StarCenter ULP drift.
 
-For all high sample rates where $f_{s,\text{vm}} > 48{,}000\text{ Hz}$, cold load synthesizes early-FIR taps via Kaiser-windowed polyphase sinc interpolation from the 48 kHz canonical taps instead of zero-stuffing, rejecting Nyquist mirror images while keeping native 48 kHz taps exact.
+For high sample rates where $48{,}000 < f_{s,\text{vm}} \le 192{,}000\text{ Hz}$ at `f_{s,vm} == f_{s,host}`, cold load synthesizes early-FIR taps via Kaiser-windowed polyphase sinc interpolation from the 48 kHz canonical taps instead of zero-stuffing, rejecting Nyquist mirror images while keeping native 48 kHz taps exact.
 
 ---
 

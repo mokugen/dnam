@@ -141,3 +141,9 @@ $$
    - **Full `f32` Hot-Slab CoreQuad, Tile & Readout Storage:** Rejected because it bloats `Lite` `14×` L1D to `96–99 KiB > 64 KiB` and destroys `-80 dB` `REQ-8.5` Tardos `f32 → fp16` survival.
    - **Pure Unanchored `1.5-Entmax` Prototypes Without `SwiGLU + Padé-[1/1]`:** Rejected after empirical 5-D FMV testing showed `-12 dB` regression against `SwiGLU + Padé-[1/1]` (`-22.5..-24.5 dB` vs `-35.3 dB`).
    - **Per-Tick `12 kHz` Inter-Block Tile Rewriting:** Rejected because folding dynamic gains into `37` tiles every `4` frames explodes control-update CPU (`~1,400 FLOPs/sample`); applying micro-ramped `out_gain` and `6` scalar edge gates achieves identical semantics at `O(1)` cost.
+
+---
+
+## Amendment Appendix
+
+- **2026-11-28T02:30:00Z:** Amended by [`ADR-0026`](0026-core-only-multirate-offline-and-crossbar-latency-invariance.md) to enforce unconditional perimeter `f_{s,vm} == f_{s,host}`, replace Whole-VM `4×` bounce with two-mode `CoreOversampler` (`RenderMode::Live` `2×` `15`-tap `PDC=7` vs `RenderMode::Master` `4×` `63/23`-tap + `z⁻¹@2×` `PDC=37/31/0` + `Box2` composite quadrature + midpoint `lin_mix` + cold `4`-slot control delay ring), lock crossbar taps at `tau_eff >= 42.0` (`tau_ring_cb = tau_eff - vm.latency_samples() >= 5.0`), align `HostShellPatchbay` via `vm.latency_samples()`, cap `ModalConvolver`/`Op-T` Schroeder sizing at `<= 192 kHz`, and retire `tier_os2x`/`SonaOversamplerParams` plus `ou_drift` (`+24 B` reclaimed, 100% deterministic `ControlBus GRA`).

@@ -18,15 +18,16 @@ adrs:
   - ADR-0022
   - ADR-0024
   - ADR-0025
+  - ADR-0026
 ---
 
 # Self-Similar 3 kHz Dual-Rate Control Plane & Parametric Control Bus
 
-This specification defines the SONA v4.0 nominal 3 kHz Dual-Rate Control Plane (`ControlBus` v4 `GRA` — Gated Rational Attention) operating on a 4-frame-aligned stride (`K_ctrl(44.1 kHz) = K_ctrl(48 kHz) = 16`, `gcd(16, 4) = 4`) within the reclaimed 6,336 B non-Tardos, non-`SO(4)` budget (`<= 9,280 B`, zero static MACs) ([sona_architecture.md](../architecture/sona_architecture.md), [REQ-2.4, REQ-2.5, REQ-6.2](../../requirements/system_goals_and_requirements.md)).
+This specification defines the SONA v4.0 nominal 3 kHz Dual-Rate Control Plane (`ControlBus` v4 `GRA` — Gated Rational Attention) operating at host rate (`f_{s,vm} == f_{s,host}`) on a 4-frame-aligned stride (`K_ctrl(44.1 kHz) = K_ctrl(48 kHz) = 16`, `gcd(16, 4) = 4`) within the reclaimed 6,336 B + 24 B non-Tardos, non-`SO(4)` budget (`<= 9,280 B`, zero static MACs) ([sona_architecture.md](../architecture/sona_architecture.md), [REQ-2.4, REQ-2.5, REQ-6.2](../../requirements/system_goals_and_requirements.md)).
 
 Keeping base descriptors, `ExactIntMainAccumulator` on SO(4)-isolated `z_head[0..4]`, unrotated CP1, Zero-Anchored SwiGLU + Padé-[1/1], and anchored 1.5-Entmax prototypes (`A.1`) inside Arena 0 lets Lite tier stripping retain full parametric conditioning (`REQ-5.6`) with zero static 48 kHz MACs, 0-ULP StarCenter invariance, and O(P + M) global BIBO stability.
 
-The specification also covers outward-checked trust clipping, 4-frame aligned micro-ramped dispatch over `[stage_targets(32), z_stage(8), z_head(8), g_edge(6), op_t_q(16)]` (including `slot 31 L/R` stereo differential quadrature AM, `g_edge[0..6]` 6-edge soft routing, and `op_t_q[0..16]` per-quad `Op-T` deltas), bilinear dynamic/inertia gates, live `TSYN` `Q32`/`Q64` locking across 20–400 BPM ([ADR-0007](../../adr/0007-exact-integer-control-bus-and-tempo-inversion.md), [ADR-0015](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md), [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [ADR-0025](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md)).
+The specification also covers outward-checked trust clipping, 4-frame aligned micro-ramped dispatch over `[stage_targets(32), z_stage(8), z_head(8), g_edge(6), op_t_q(16)]` (including slot 31 L/R stereo differential quadrature AM, `g_edge[0..6]` 6-edge soft routing, `op_t_q[0..16]` per-quad Op-T deltas, and cold Master `delta_D_up` snapshot alignment), bilinear dynamic/inertia gates, live TSYN `Q32`/`Q64` locking across 20–400 BPM ([ADR-0007](../../adr/0007-exact-integer-control-bus-and-tempo-inversion.md), [ADR-0015](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md), [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [ADR-0025](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md), [ADR-0026](../../adr/0026-core-only-multirate-offline-and-crossbar-latency-invariance.md)).
 
 ---
 
@@ -59,9 +60,9 @@ flowchart LR
 
 At each control boundary with 4-frame aligned stride $K_{\text{ctrl}}(f_{s,\mathrm{vm}}) = 4 \cdot \max(2, \mathrm{round}(f_{s,\mathrm{vm}} / 12{,}000.0))$ (`K_ctrl(44,100) = 16`, `gcd(16, 4) = 4`, 2,756.25 Hz, eliminating 196 Hz beat jitter and discarded ramp steps) and tick ratio $\rho_{\text{ctrl}} = \frac{48000 \cdot K_{\text{ctrl}}(f_{s,\mathrm{vm}})}{16 \cdot f_{s,\mathrm{vm}}}$, the 3 kHz control tick runs whenever any dynamic or dirty source is active.
 
-Across each control window, `ControlBus` v4 micro-ramps `[stage_targets(32), z_stage(8), z_head(8), g_edge(6), op_t_q(16)]` **once per 4-frame microchunk** (`alpha_chunk = 4 / K_ctrl = 0.25`), while recursive slews (Kautz `prev_oct` and Op-T `current_psi`) update strictly when `ctrl_sub_counter == 0`. Under normal 4-frame aligned `K_ctrl`, execution runs strictly in 4-frame microchunk latches with zero 1-frame peeling, preserving 0-ULP equivalence `process(1) * N == process(4) * (N/4) == process(16) * (N/16)` across 44.1–384 kHz.
+Across each control window at `f_{s,vm} == f_{s,host}`, ControlBus v4 micro-ramps `[stage_targets(32), z_stage(8), z_head(8), g_edge(6), op_t_q(16)]` **once per 4-frame microchunk** (alpha_chunk = 4 / K_ctrl = 0.25; Master mode delays core-bound snapshots through a cold 4-slot microchunk delay ring `delta_D_up = 16`), while recursive slews (`prev_oct`, `current_psi`) update strictly when `ctrl_sub_counter == 0`. Under 4-frame aligned `K_ctrl`, execution runs in 4-frame microchunk latches with zero 1-frame peeling, preserving 0-ULP equivalence `process(1) * N == process(4) * (N/4) == process(16) * (N/16)` across 44.1–384 kHz.
 
-Ticking is gated cleanly on `is_dirty || ramp_chunks_remaining > 0 || has_internal_modulators || is_analog_drift_active()`, yielding zero static CPU control MACs when idle while keeping `static_z_stage` separate from runtime `eff_z_stage` and preserving 0-ULP `StarCenter` pass-through identity.
+Ticking is gated strictly on `is_dirty || ramp_chunks_remaining > 0 || has_internal_modulators`, yielding 100% deterministic execution with zero static CPU control MACs when idle and preserving 0-ULP `StarCenter` pass-through identity across `Live` and `Master` render modes.
 
 At every `K_ctrl` boundary, a full-graph VM latches the **16-sample CIC-boxcar anti-aliased** SensoryQuad ParaLRU rectifier outputs `[e_0, e_1, e_2, e_3]` ([router_and_crossbar_topology.md §2.6](router_and_crossbar_topology.md#26-sensoryquad-op-mnsense-sensing-bank--input-vca)) into ControlBus `env_states[0..4]` (`q3`).
 
@@ -120,7 +121,7 @@ Six `f64` Newton steps seeded from $y_0 = 2^{-\lfloor (E_s + 2)/2 \rfloor}$, whe
 
 `r[dsp.ctrl.op-n.static-and-interior-fastpath]`
 
-Control-bus ticking gates strictly on `is_dirty || ramp_chunks_remaining > 0 || has_internal_modulators || is_analog_drift_active()`, yielding zero static control MACs when controls and modulators are idle (`REQ-6.1`, [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md)).
+Control-bus ticking gates strictly on `is_dirty || ramp_chunks_remaining > 0 || has_internal_modulators`, yielding zero static control MACs when controls and modulators are idle (`REQ-6.1`, [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md)).
 
 When `is_dirty == false`, Op-N[Ctrl] skips static CP1 and GRA evaluation and retains cached `z_head`, `z_stage`, `g_edge`, `op_t_q`, and `W_ro_head` vectors intact, stepping only active dynamic gates when modulators or ramp chunks remain active.
 
@@ -274,7 +275,7 @@ Per lane `j` and coordinate `d`, main deltas materialize unfused `f32(W_main[j][
 
 Every 3 kHz control boundary combines Op-M[Ctrl] and Op-N[Ctrl] into skewed LFO quadrature `q2` (`lfo_skew_fp16`) and 16-sample CIC-boxcar SensoryQuad envelopes `q3`, coupled through a **bilinear dynamic gate** (Knob × LFO with asymmetric `alpha_up` / `alpha_dn`, plus Knob × Padé/Log-Knee Env) driving `stage_targets` and `z_stage_dyn`.
 
-Cold init and reset zero `lfo_phases_q192`, `env_states`, and `ou_drift_state`, set `lfo_phasors` to unity cosine identity, evaluate static dispatch with q3 zeroed, and snap `current_stage_params`. Analog drift (`live_analog_drift_enabled`) defaults to false and disables during offline bounce for 0-ULP determinism.
+Cold init and reset zero `lfo_phases_q192` and `env_states`, set `lfo_phasors` to unity cosine identity, evaluate static dispatch with q3 zeroed, snap `current_stage_params`, and pre-fill any Master 4-slot cold control delay ring with the snapped core snapshot for 100% deterministic execution across `Live` and `Master` render modes.
 
 ### 3.1 Operator Parameter Dispatch Matrix & Sensitivity Laws
 
@@ -313,7 +314,7 @@ Non-recursive send safety is enforced structurally by $S_{\text{ret}\to\text{sen
 | `stage_targets[30]` | `SensoryQuad` VCA | `sense_vca_log_bias_delta` offsetting log-knee VCA threshold/makeup bias across `[-5.0, +4.0]` octaves (`-30..+24 dB`) |
 | `stage_targets[31]` | Stereo Diff Gain (`L/R`) | `slot 31 L/R` differential stereo quadrature AM output gain (rotary speaker amplitude modulation) |
 
-#### 3.1.1 Gauge-Invariant `eff_z_stage` Operator Sensitivity & Split `W_ro_head` Readout Laws
+#### 3.1.1 Gauge-Invariant `z_stage` Operator Sensitivity & Split `W_ro_head` Readout Laws
 
 `r[dsp.ctrl.dispatch.modulation-laws]`
 
@@ -321,7 +322,7 @@ At 4-frame control ticks, ControlBus v4 updates `stage_targets[0..32]`, `z_stage
 
 Each tier LinearReadout block stores static base `W_ro,0` plus additive split `W_ro_head` (odd and even_lru deltas) unpacked into `pre_conv` and `direct_s2` stereo accumulators. Mechanism A2 flips `b_lru_base`, `rect_sign_mask` (u16), and `W_ro_head_odd` cleanly so StarCenter-muted lanes activate without bias drift (~1e-6 f32 invariance; [op_n_paralru_and_polyadaa.md §4](op_n_paralru_and_polyadaa.md#4-4-block-matryoshka-corequad-stack-tpt-svf-selective-duhem-paralru-polyadaa1--glu)).
 
-| Modulation Law | Exact Combining Equation (`dot_s = sum_{k=0..D_s-1} fp16_to_f32(w[k]) * eff_z_stage[k]`, `FP_CONTRACT OFF`) |
+| Modulation Law | Exact Combining Equation (`dot_s = sum_{k=0..D_s-1} fp16_to_f32(w[k]) * z_stage[k]`, `FP_CONTRACT OFF`) |
 | :--- | :--- |
 | `svf_g_oct` & `svf_k_delta` | `clamp(t[0] + dot_s(w_svf_g_oct), -3.0, 3.0)` via `exp2_clamped5` inside `[1e-5, 64.0]`; `clamp(t[1] + dot_s(w_svf_k_delta), -0.8, 1.5)` inside `[0.0, 8.0]` |
 | `kautz_oct_delta` & `kautz_damp_delta` | `clamp(t[10] + dot_s(w_kautz_oct), -1.5, 1.5)` and `clamp(t[11] + dot_s(w_kautz_damp), -1.5, 1.5)` driving 3 kHz Kautz retuning |
@@ -341,7 +342,7 @@ Inside the 6,336 B reclaimed non-Tardos, non-`SO(4)` budget (<= 9,280 B, 0 B gro
 - **Step 2 (Zero-Anchored SwiGLU + Padé-[1/1]):** SwiGLU, with $H = 8$ Lite or $16$ Full–Ultra, and Padé-[1/1] rational projections (`1.0 + d_r >= 0.25`) evaluate via `recip_nr3_pos_vec4` with zero FDIV.
 - **Step 3 (Anchored 1.5-Entmax Prototypes, A.1):** Over $M = 8$ Lite–Pro or $M = 16$ Ultra prototypes (`m = 0` StarCenter anchor, `V_0 = 0`), a branchless sorting network and `k* == 1` fast-exit emit sparse regime deltas.
 - **Step 4 (Bilinear Dynamic Gate, Inertia & TSYN):** Couples Knob × LFO (asymmetric `alpha_up` / `alpha_dn`), Knob × q3_eff, `slot 31 L/R` differential AM, and live `TSYN` Q32/Q64 beat-phase locking.
-- **Step 5 (4-Frame Micro-Ramp & Zero-Cost Idle):** Micro-ramps `[stage_targets, z_stage, z_head, g_edge, op_t_q]` (`K_ctrl = 16`, `alpha_chunk = 0.25`) skip with 0 MACs unless `is_dirty || ramp_chunks > 0 || modulators || drift`.
+- **Step 5 (4-Frame Micro-Ramp & Zero-Cost Idle):** Micro-ramps `[stage_targets, z_stage, z_head, g_edge, op_t_q]` (`K_ctrl = 16`, `alpha_chunk = 0.25`) skip with 0 MACs unless `is_dirty || ramp_chunks > 0 || modulators`.
 
 In Step 2, $g = W_g h_0$, $v = W_v h_0$, $a = v \odot (g \sigma_{\text{poly}}(g))$, $h_1 = \mathrm{trust-clip}(h_0 + W_o a)$, $d_r = \mathrm{clamp}(W_{\text{den}}[r] \cdot h_1, -0.75, +7.0)$, $\rho_r = \mathrm{recip-nr3-pos-vec4}(1.0 + d_r)$, and $y_{\text{rat},m} = (W_{\text{num}}[m] \cdot h_1) \rho_{r(m)}$. In Step 3, the compile-time `INV_K` exact Welford scan uses 1 `rsqrt_pos_nr3` call and emits deltas onto `stage_targets`, `z_stage`, `g_edge[0..6]`, and `op_t_q[0..16]`:
 
@@ -368,25 +369,17 @@ Across all sample rates, `ControlBus` v4 aligns its control decimation stride to
 
 $$\Delta\boldsymbol{\theta}_{\text{chunk}}[k] = \big(\boldsymbol{\theta}_{\text{target}}[k+1] - \boldsymbol{\theta}_{\text{curr}}[k]\big) \cdot \alpha_{\text{chunk}}, \qquad \boldsymbol{\theta}_{\text{curr}}[c+1] = \boldsymbol{\theta}_{\text{curr}}[c] + \Delta\boldsymbol{\theta}_{\text{chunk}}[k]$$
 
-Once per 4-frame microchunk (`(sample_tick & 3) == 0`), ControlBus advances its compact ramped targets (`stage_targets`, `z_stage`, `z_head`, g_edge, op_t_q), folding `ou_to_z_stage` into `z_stage` and snapping when `ctrl_sub_counter + 4 >= K_ctrl`. Recursive slews update at control boundaries, while out_gain and `g_edge[0..6]` scale directly without rewriting InterBlockTiles.
+Once per 4-frame microchunk (`(sample_tick & 3) == 0`), ControlBus advances its compact ramped targets (`stage_targets`, `z_stage`, `z_head`, `g_edge`, `op_t_q`) and snaps when `ctrl_sub_counter + 4 >= K_ctrl`. Recursive slews update at control boundaries, while out_gain and g_edge scale directly without rewriting InterBlockTiles.
 
-#### 3.2.1 Sparse Fast-Path, 4-Frame Micro-Ramp & `eff_z_stage` Drift
+#### 3.2.1 Sparse Fast-Path, 4-Frame Micro-Ramp & Master Snapshot Delay
 
 `r[dsp.ctrl.dispatch.sparse-and-active-ramps]`
 
-When `is_dirty == false && ramp_chunks_remaining == 0 && !has_internal_modulators && !is_analog_drift_active()`, control evaluation exits immediately with zero static MACs.
+When `is_dirty == false && ramp_chunks_remaining == 0 && !has_internal_modulators`, control evaluation exits immediately with zero static MACs.
 
-Active ticks accumulate `stage_targets`, `z_stage`, `z_head`, `g_edge`, and `op_t_q` in 4-lane SIMD vectors ([ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)) and step optional OU analog drift via `xorshift64*`:
+Active ticks accumulate `stage_targets`, `z_stage`, `z_head`, `g_edge`, and `op_t_q` deterministically in 4-lane SIMD vectors ([ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md)), yielding identical trajectories in streaming and offline render (+24 B reclaimed across Arena 0 and Arena 3).
 
-```text
-seed = 0x853C_49E6_748F_EA9B when drift_prng_state == 0
-x ^= x >> 12; x ^= x << 25; x ^= x >> 27; drift_prng_state = x
-rand_u32 = ((x.wrapping_mul(0x2545_F491_4F6C_DD1D)) >> 32) as u32
-xi = ((rand_u32 >> 8) as f32) * 2^-23 - 1.0
-ou[d] = flush(rho * ou[d] + sigma_drift * (1.0 - rho) * xi)
-```
-
-Strictly when `live_analog_drift_enabled && !offline_bounce && sigma_drift > 0.0`, cold setup sets `rho_drift_host = clamp(f32(powf_f64(f64(rho_drift_train), rho_ctrl)), 0.0, 0.9999)` via [router_and_crossbar_topology.md §9.1](router_and_crossbar_topology.md#91-causal-crossbar-sensoryquad-core-tpt-svf--kautz-conversion), and the generator steps `ou[0..4]` with `rho = rho_drift_host`, projecting through `ou_to_z_stage_fp16[8]` across `z_stage[0..8]` into runtime `eff_z_stage = static_z_stage + w_ou * ou` at 4-frame micro-ramp boundaries (§3.2); otherwise `ou` resets to zero.
+In Master mode (4× core oversampling at 44.1–96 kHz), a cold 4-slot microchunk delay ring delays core-bound snapshots by `delta_D_up = 16` host samples (< 16 us delta vs `K_ctrl = 16` at 48 kHz) to align with the Master FIR upsampler group delay (0 slots in Live mode or 352.8–384 kHz bypass, pre-filled at cold init/reset and reset on mode transitions without audio-thread allocations).
 
 ---
 

@@ -17,11 +17,12 @@ adrs:
   - ADR-0009
   - ADR-0022
   - ADR-0024
+  - ADR-0026
 ---
 
 # Forensic Watermarking, 3-Gate Anti-Cloning Pipeline & Marketplace Edge Infrastructure
 
-Complementing Cryptographic Provenance and Hardware Enclave DRM ([provenance and enclave DRM](provenance_and_enclave_drm.md), [`ADR-0009`](../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md), [`ADR-0022`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [`ADR-0024`](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md)), this specification defines Pillar 3 (Dual-Mechanism Buyer Watermarking for SONA v4.0), Pillar 4 (the 3-Gate Anti-Cloning Pipeline), the Commercial Storefront Platform (`.dnam-prev`), and the Cloudflare and TiDB Edge Infrastructure. Together, these subsystems fulfill [`REQ-8.5`–`REQ-8.7`](../../requirements/system_goals_and_requirements.md#9-goal-8--model-provenance-hardware-drm-forensic-watermarking--marketplace-security).
+Complementing Cryptographic Provenance and Hardware Enclave DRM ([provenance and enclave DRM](provenance_and_enclave_drm.md), [`ADR-0009`](../../adr/0009-jcs-prefix-signing-hpke-and-preview-containment.md), [`ADR-0022`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [`ADR-0024`](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [`ADR-0026`](../../adr/0026-core-only-multirate-offline-and-crossbar-latency-invariance.md)), this specification defines Pillar 3 (Dual-Mechanism Buyer Watermarking for SONA v4.0), Pillar 4 (the 3-Gate Anti-Cloning Pipeline), the Commercial Storefront Platform (`.dnam-prev`), and the Cloudflare and TiDB Edge Infrastructure. Together, these subsystems fulfill [`REQ-8.5`–`REQ-8.7`](../../requirements/system_goals_and_requirements.md#9-goal-8--model-provenance-hardware-drm-forensic-watermarking--marketplace-security).
 
 ---
 
@@ -86,7 +87,7 @@ The rotation excludes `v_base` to preserve FM $0.5 \cdot ((\sum v_p z_p)^2 - \su
 
 Because `Q_buyer` rotates binary32 inner products across `z_head[0..4]` and split `W_ro_head`, isometric invariance holds to single-precision floating-point tolerance (`~1e-6`), while unrotated GRA, `z_stage`, slot 31 L/R, and Mechanism A2 retain exact 0-ULP invariance and byte-identical `dbin_prefix`.
 
-Sensitivity tables dot strictly against unrotated stage latents (`ctrl_basis_4` plus Arena 3 stage latents), never rotated head channels 0..4. This covers Lite LinearReadout `stage_latent_mods_fp16[0..80]` and Arena 3 `stage_latent_ctrl_ultra_fp16[0..160]` (`ou_to_z_stage_ultra_fp16` stays excluded from Tardos Role B; legacy `stage_latent_core_mods_fp16` is retired and reclaimed into GRA).
+Sensitivity tables dot strictly against unrotated stage latents (`ctrl_basis_4` plus Arena 3 stage latents), never rotated head channels 0..4. This covers Lite LinearReadout `stage_latent_mods_fp16[0..80]` and Arena 3 `stage_latent_ctrl_ultra_fp16[0..160]` (`[160..256]` is reclaimed zero/reserved tail; legacy `stage_latent_core_mods_fp16` is retired and reclaimed into GRA).
 
 Layer 2 Kautz pole-angle phase coding perturbs pole angles within quantized 0.01 rad cells using a `[0.2, 0.8]` guard-band snap (leaving reclaimed Kautz `onset_delay_samp` and `c_cross_fp16` untouched) so quantized structural hashes remain 100% invariant:
 
@@ -132,7 +133,7 @@ The exact compile-time field-offset-derived 0..7,680 coordinate partition across
 | Tier 2 (Arena 2) | 2,103..3,051 (948) | `fp16` | Pro `LinearReadout` `w_ro_and_mods_fp16[0..424]` & `[436..960]` | Role B linear `fp16` `W_readout` / `W_mod` & tail (excludes `[424..436]` `kautz_b_gamma[0..12]`) |
 | Tier 3 (Arena 3) | 3,051..3,067 (16) | `f32le` | Arena 3 `w_ctrl_ultra[0..4][0..4]` | Role A (`chip = 0.0`, `accusation_weight = 0.0`) |
 | Tier 3 (Arena 3) | 3,067..4,139 (1,072) | `f32le` | Ultra core `reserve` (608), `transport_ultra[1]` `reserve` (32), `conv_fir_ultra` (64), `conv_kautz_ultra.c_*` (32), `prefix_override` (144), `w_ctrl_ultra[4..16][0..4]` (48), Arena 3 control `reserve` (144) | Role B Ultra linear `f32` & spare reserves |
-| Tier 3 (Arena 3) | 4,139..5,871 (1,732) | `fp16` | Ultra `LinearReadout` `w_ro_and_mods_fp16[0..584, 608..1,504]` (1,480), `stage_latent_ctrl_ultra_fp16[0..160, 164..256]` (252) | Role B Ultra linear `fp16` `W_readout` / `W_mod` & `stage_latent_ctrl_ultra_fp16` (excludes `b_gamma`, `ou_to_z_stage_ultra_fp16[4]` at `[160..164]`, `SensoryQuad`, Crossbar, `GRA`, and nonlinear SONA core) |
+| Tier 3 (Arena 3) | 4,139..5,871 (1,732) | `fp16` | Ultra `LinearReadout` `w_ro_and_mods_fp16[0..584, 608..1,504]` (1,480), `stage_latent_ctrl_ultra_fp16[0..160, 164..256]` (252) | Role B Ultra linear `fp16` `W_readout` / `W_mod` & `stage_latent_ctrl_ultra_fp16` (excludes `b_gamma`, reclaimed `[160..164]` tail, `SensoryQuad`, Crossbar, `GRA`, and nonlinear SONA core) |
 | Unassigned Tail | 5,871..7,680 (1,809) | 0.0 | Unassigned Tail (`chip = 0.0`, `accusation_weight = 0.0`) | Strictly unperturbed (0.0 chip & 0.0 accusation weight) |
 
 All nonlinear trajectories, `ControlBus` v4 `GRA` weights, crossbar weights, control basis descriptors, and recursive poles remain strictly excluded from Tardos Role B perturbation:
@@ -141,12 +142,12 @@ All nonlinear trajectories, `ControlBus` v4 `GRA` weights, crossbar weights, con
 | :--- | :--- |
 | **Crossbar, `Op-N[Pre]` & `SensoryQuad` v4** | Crossbar & `SensoryQuad` Block (0..256, including `Op-N[Pre]` v4 at 180..192 and `sense_*` / Log-Knee VCA / `Op-P` `T1+` fields), all SONA Crossbar Coupling matrices, and Lite `LinearReadout` crossbar aliases (`stage_latent_mods_fp16[80..96]`, `w_ro_fp16[192..208]`) |
 | **Nonlinear SONA Core & `TransportQuad` v4** | All `CoreQuad` v4 blocks (incl. `rect_sign_mask`, `g_pre`, `SE-Bus`, `lin_mix`, `out_gain`), Inter-Block Tile Pairs, split `W_ro_head`, and active `TransportQuad` v4 blocks (`TRANSPORT_DELAY_BASES[0..4]`) |
-| **`ControlBus` v4 `GRA`, Reclaimed 6,336 B & Kautz `dr`/Poles** | All 6,336 B reclaimed `GRA` regions (reclaimed `cp1_base`, `u_int_base[:, 4..8]`, reclaimed `CEXT`, `u_int_ultra[1..3]`, `cp1_ultra`, reclaimed `stage_latent_core_mods_fp16`), `GRA` weights (`SwiGLU`, `Padé-[1/1]`, `1.5-Entmax`, `g_edge[0..6]`, `op_t_q[0..16]`, `slot 31 L/R`), control scalars (`lfo_skew_fp16`, `tank_dry_mix_fp16`, `ou_to_z_stage_fp16`, `ou_to_z_stage_ultra_fp16` at `[160..164]`), `U_int`, `CP1`, `trust_radius_mh`, `rho_head_and_ctrl_tail[0]`, `opt_to_lr`, `ErSparseBank` (8/16), 2-basis FIR morph, reclaimed 128 B Kautz `dr` (`onset_delay_samp[4]` + `c_cross_fp16[4]`), and Kautz pole fields (`r_low`, `theta`, `b_gamma`, `kautz_b_gamma`) |
+| **`ControlBus` v4 `GRA`, Reclaimed 6,336 B & Kautz `dr`/Poles** | All 6,336 B reclaimed `GRA` regions (reclaimed `cp1_base`, `u_int_base[:, 4..8]`, reclaimed `CEXT`, `u_int_ultra[1..3]`, `cp1_ultra`, reclaimed `stage_latent_core_mods_fp16`), `GRA` weights (`SwiGLU`, `Padé-[1/1]`, `1.5-Entmax`, `g_edge[0..6]`, `op_t_q[0..16]`, `slot 31 L/R`), control scalars (`lfo_skew_fp16`, `tank_dry_mix_fp16`, reclaimed +24 B deterministic Arena 0/3 tail), `U_int`, `CP1`, `trust_radius_mh`, `rho_head_and_ctrl_tail[0]`, `opt_to_lr`, `ErSparseBank` (8/16), 2-basis FIR morph, reclaimed 128 B Kautz `dr` (`onset_delay_samp[4]` + `c_cross_fp16[4]`), and Kautz pole fields (`r_low`, `theta`, `b_gamma`, `kautz_b_gamma`) |
 | **`.dnam-bin` Prefix (`dbin_prefix`) & Framing** | Region 4 (0 B when `dbin_prefix_bytes > 0`), Region 5 `auth_extent`, embedded `dbin_prefix` (`[dbin_offset..tier_start)`: `"DNBN"`, `"DBRM"` with `cext_len == 0`, `shared_controls`, `"TSYN"`), and unassigned tail 5,871..7,680 |
 
 When a container embeds a Layer 0 prefix (`dbin_prefix_bytes > 0`), Region 4 (`shared_extent`) MUST equal zero bytes (0 B) while `dbin_prefix` precedes `tier_start` (Arena 0..3). All 0..5,871 Tardos Role A and Role B coordinates reside strictly inside Arena 0..3, while 5,871..7,680 stays an unperturbed guard tail.
 
-Tardos watermark embedding and extraction operate strictly on Role B coordinates inside Arena 0..3, leaving `"DBRM"`, `shared_controls`, `"TSYN"`, `GRA` weights, reclaimed 6,336 B/128 B `dr` slots, crossbar, `SensoryQuad`, `Op-N[Pre]`, `ou_to_z_stage_ultra_fp16`, and unassigned slots untouched.
+Tardos watermark embedding and extraction operate strictly on Role B coordinates inside Arena 0..3, leaving `"DBRM"`, `shared_controls`, `"TSYN"`, `GRA` weights, reclaimed 6,336 B/128 B `dr` slots, crossbar, `SensoryQuad`, `Op-N[Pre]`, reclaimed +24 B slots, and unassigned slots untouched.
 
 When issuing a watermarked buyer container with `dbin_prefix_bytes > 0` (`auth_kind == 1` or `.dnam-seal`), buyer issuance MUST recompute layer-0 `tier_arena_crc32c` and `prefix_crc32c` digests over the buyer arenas.
 

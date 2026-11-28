@@ -31,13 +31,14 @@ adrs:
   - ADR-0022
   - ADR-0024
   - ADR-0025
+  - ADR-0026
 ---
 
 # TypeScript SDK (`@dnam-project/dnam`): Idiomatic TypeScript 7 Interface, Dual-Target N-API v10 + WASM SIMD128 Runtime, WebGPU Trainer & WebAudio Contract
 
 This specification defines the normative architecture, feature-module layout, TypeScript 7 typing and Biome hygiene rules, dual-target N-API v10 plus WebAssembly SIMD128 runtime invariants, WebGPU trainer driver, WebAudio `AudioWorklet` bridge, and native behavioral parity contracts for `@dnam-project/dnam` ([JavaScript SDK README](../../../packages/js/README.md)).
 
-The TypeScript SDK consumes the native runtime engine and shared mathematical kernels defined in the [Rust Implementation Specification](rust_sdk.md) for SONA v4.0 ([SONA architecture](../architecture/sona_architecture.md)). Design rationales and concurrency trade-offs appear in [`ADR-0013`](../../adr/0013-typescript-sdk-architecture-and-dual-target-runtime.md), [`ADR-0015`](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md), [`ADR-0022`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [`ADR-0024`](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), and [`ADR-0025`](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md).
+The TypeScript SDK consumes the native runtime engine and shared mathematical kernels defined in the [Rust Implementation Specification](rust_sdk.md) for SONA v4.0 ([SONA architecture](../architecture/sona_architecture.md)). Design rationales and concurrency trade-offs appear in [`ADR-0013`](../../adr/0013-typescript-sdk-architecture-and-dual-target-runtime.md), [`ADR-0015`](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md), [`ADR-0022`](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [`ADR-0024`](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [`ADR-0025`](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md), and [`ADR-0026`](../../adr/0026-core-only-multirate-offline-and-crossbar-latency-invariance.md).
 
 ---
 
@@ -273,11 +274,13 @@ Specifying a bounded `maximum` enables V8 static guard-page bounds-check elision
 
 Concurrent rendering or `.dispose()` calls during an in-flight `processAsync` reject with `"ERR_DNAM_BUSY"`, while parameter, preset, tempo, bypass, and tier updates (`ref[dsp.ctrl.op-m.spsc-ingress]`) plus `engine.telemetry` reads (`ref[arch.telemetry.seqlock-publication]`) complete synchronously and non-blockingly on the main thread.
 
-### 3.3 Offline `render` (4x Bounce) & Web `TransformStream`
+### 3.3 Offline `render` (Master Mode) & Web `TransformStream`
 
 `r[sdk.ts.engine.streaming-and-render]`
 
-`engine.render(input, options?: { sampleRate?: number; blockSize?: number; reset?: boolean; oversample?: 1 | 4; maxTier?: boolean })` optionally updates `sampleRate`, resets to analytical resting equilibrium (`ref[dsp.op-n.commuted.dc-equilibrium]`) when `reset ?? true`, and renders in chunks of `blockSize`. Setting `oversample: 4` engages 4x linear-phase polyphase oversampling with 12-sample PDC lead-in stripping (`ref[arch.bounce.oversampling]`), and `engine.bounce(input, { maxTier? })` provides a concise 4x shorthand.
+`engine.render(input, options?: { sampleRate?: number; blockSize?: number; reset?: boolean; oversample?: 1 | 4; maxTier?: boolean })` optionally updates `sampleRate`, resets to analytical resting equilibrium (`ref[dsp.op-n.commuted.dc-equilibrium]`) when `reset ?? true`, and renders in chunks of `blockSize`.
+
+Setting `oversample: 4` engages Core-Only Master mode (4× 63/23-tap HB-FIR + `Box2` at 44.1–96 kHz, 2× at 176.4–192 kHz, 1× bypass at 352.8–384 kHz, stripping exact `latencySamples` 37 / 31 / 0 with 0-ULP streaming parity, `ref[arch.bounce.oversampling]`), while `engine.bounce(input, { maxTier? })` provides a Master shorthand.
 
 `engine.stream(options?: { blockSize?: number }): TransformStream<Float32Array | readonly Float32Array[], Float32Array[]>` exposes a standard WHATWG Web Streams stage for piping chunked audio through the engine.
 
@@ -285,7 +288,7 @@ Concurrent rendering or `.dispose()` calls during an in-flight `processAsync` re
 
 `r[sdk.ts.engine.behavioral-parity]`
 
-When instantiated with `backend: "scalar"` on the same host ISA, `NapiDriver` and the native reference engine ([Rust Implementation Specification](rust_sdk.md)) produce bit-identical (0 ULP) `Float32Array` samples across all tiers (Lite, Full, Pro, Ultra), topologies, and block sizes. Host sample rates spanning 44.1–192 kHz obey `M_os * f_{s,host} <= 384 kHz` (44.1–96 kHz at 2× RT and 4× bounce; 176.4–192 kHz at 1× or 2×).
+When instantiated with `backend: "scalar"` on the same host ISA, `NapiDriver` and the native reference engine ([Rust Implementation Specification](rust_sdk.md)) produce bit-identical (0 ULP) `Float32Array` samples across all tiers (Lite, Full, Pro, Ultra), topologies, and block sizes. Host rates spanning 44.1–384 kHz keep perimeter rate equal to host rate while `CoreOversampler` scales up to 384 kHz (Live 2× to 192 kHz or 1× above; Master 4× to 96 kHz, 2× at 176.4–192 kHz, or 1× above).
 
 `WasmDriver` (IEEE-754 non-fused `f32.mul` plus `f32.add`) agrees with host `NapiDriver` (hardware `fmadd`) within <= 4 ULP (< 5e-7) on scalar WASM and < 1e-5 on WASM SIMD128.
 
@@ -332,7 +335,7 @@ Together with `Model.from(bytes)`, `Model.reference(options?)`, and `Model.build
 
 Cumulative SONA v4.0 tiers span `[1,1,1,1]`, `[2,2,1,1]`, `[2,2,2,2]`, and `[3,3,2,2]` (5 / 13 / 24 / 37 tiles, 4,432 B Lite 2× active-hot footprint inside 4,608 / 8,192 / 16,384 / 32,768 B L1D ceilings).
 
-Arena 0 carries all-tier 2× 15-tap HB-FIR OS2X Lite weights and self-contained 2,048 B `control_bus_lite` GRA parametric controls (`cext_len == 0`), while Arena 1..3 carry 2× incremental deltas (including Arena 3 `control_bus_ultra_delta` <= 9,280 B cum.); loaders reject invalid versions (`version_major != 4`) or non-"sona" / non-"DNBN" headers with `"ERR_DNAM_CONTAINER"`.
+Arena 0 carries Lite weights calibrated at Live 2× HB-FIR CoreOversampler (with Master 4× Box2 parity) and self-contained 2,048 B `control_bus_lite` GRA parametric controls (`cext_len == 0`), while Arena 1..3 carry incremental tier deltas (including Arena 3 `control_bus_ultra_delta` <= 9,280 B cum.); loaders reject invalid versions (`version_major != 4`) or non-"sona" / non-"DNBN" headers with `"ERR_DNAM_CONTAINER"`.
 
 When a `.dnam` container embeds an executable `dbin_prefix`, its Region 4 payload stays 0 B so weights are never duplicated; `model.extractDnamBin()` slices that embedded binary directly, while `stripDnamBinToTier` truncates `.dnam-bin` at `tierEndOffsets[maxTier]` with zero-mutation parity (`REQ-5.6`).
 

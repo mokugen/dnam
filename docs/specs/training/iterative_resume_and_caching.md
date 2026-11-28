@@ -19,13 +19,14 @@ adrs:
   - ADR-0022
   - ADR-0024
   - ADR-0025
+  - ADR-0026
 ---
 
 # Capture Vault Editing, Capsule Persistence & Cloud Sync Protocol
 
 This specification defines non-destructive v4.0 `.dnam-proj` (`DNPJ`) Capture Vault stem editing (adding, removing, replacing, and toggling enablement of capture stems) and Two-Path compositional re-solving.
 
-It specifies < 50 ms Path 1 Vault edits over fixed-dimension `uplo='U'` `STAT` blocks, raw-audio-free Path 2 GPU or CPU re-pooling, 2.0–2.5 s fp32 `INPC`/`STMC` capsule persistence, and HTTP Range cloud synchronization. These mechanisms satisfy [REQ-3.1–REQ-3.3, REQ-4.3, REQ-5.3](../../requirements/system_goals_and_requirements.md), [sona_architecture.md](../architecture/sona_architecture.md), [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), and [ADR-0025](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md).
+It specifies < 50 ms Path 1 Vault edits over fixed-dimension `uplo='U'` `STAT` blocks, raw-audio-free Path 2 GPU or CPU re-pooling, 2.0–2.5 s fp32 `INPC`/`STMC` capsule persistence, and HTTP Range cloud synchronization. These mechanisms satisfy [REQ-3.1–REQ-3.3, REQ-4.3, REQ-5.3](../../requirements/system_goals_and_requirements.md), [sona_architecture.md](../architecture/sona_architecture.md), [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [ADR-0025](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md), and [ADR-0026](../../adr/0026-core-only-multirate-offline-and-crossbar-latency-invariance.md).
 
 ---
 
@@ -78,7 +79,7 @@ Vault mutations execute through either an incremental host fast-path or a full c
 
 | Execution Path | Trigger Condition | Execution Scope & Guarantees |
 | :--- | :--- | :--- |
-| Path 1 — Incremental Fast-Path (< 50 ms) | `extracted_physics` and StarCenter (`s = 0`) remain valid across stem addition, removal, replacement, or enablement changes (including corners added from 54-D `NW-PANAMA` prescriptions) | Freezes SONA v4.0 core (3-tap `TPT-SVF`, `ParaLRU`, `AlgADAA1(4096, NR3)`, `ErSparseBank`) and StarCenter `STAT` (0-ULP invariance, REQ-4.2); fits `CP1` (inline or `"CP1\0"`), `U_int`, reclaimed 6,336 B `GRA` over `Slot 0..31` (incl. `slot 16`, `slot 22`, `slot 30`, `slot 31 L/R`), 40 B `"TSYN"`, `lfo_skew_fp16`, and `ou_to_z_stage*_fp16` in host float64 while holding static `W_ro_head` untouched; runs `O(P+M)` global convex-hull BIBO clamps (< 5 µs) and updates `WGHT` |
+| Path 1 — Incremental Fast-Path (< 50 ms) | `extracted_physics` and StarCenter (`s = 0`) remain valid across stem addition, removal, replacement, or enablement changes (including corners added from 54-D `NW-PANAMA` prescriptions) | Freezes SONA v4.0 core (3-tap `TPT-SVF`, `ParaLRU`, `AlgADAA1(4096, NR3)`, `ErSparseBank`) and StarCenter `STAT` (0-ULP invariance, REQ-4.2); fits `CP1` (inline or `"CP1\0"`), `U_int`, reclaimed 6,336 B `GRA` over `Slot 0..31` (incl. `slot 16`, `slot 22`, `slot 30`, `slot 31 L/R`), 40 B `"TSYN"`, and `lfo_skew_fp16` in host float64 while holding static `W_ro_head` untouched; runs `O(P+M)` global convex-hull BIBO clamps (< 5 µs) and updates `WGHT` |
 | Path 2 — Full Re-Pool (Zero Raw Audio) | StarCenter is replaced or a new capture invalidates the upstream basis | Re-runs Solver Passes 1–5 + Mechanisms `#1–#7` over embedded `SPCM` stems (spanning 8.0–12.0 s StarCenter captures when present) or compacted 2.5 s (120,000-frame, 2.0–2.5 s contract) 4-regime `INPC` + enabled `STMC` capsules (< 20 MB, REQ-3.3) via <= 15.0 KiB SRAM 32-bit WebGPU or CPU SIMD fallback without external WAVs, emitting updated `STAT`, 54-D `NW-PANAMA` prescriptions, and `WGHT` |
 
 #### Cryptographic Provenance & Dependency Invalidation

@@ -22,11 +22,12 @@ adrs:
   - ADR-0022
   - ADR-0024
   - ADR-0025
+  - ADR-0026
 ---
 
 # Hardware Excitation, Multi-Mic Calibration & Router Alignment
 
-This specification defines the universal hardware excitation schedule, two-step converter calibration, multi-regime sub-sample latency alignment, capture-side offline attention seeding, and white-box or grey-box distillation contracts for SONA v4.0. It fulfills [REQ-1.5–REQ-1.9, REQ-4.3, REQ-7.2, REQ-7.3](../../requirements/system_goals_and_requirements.md), [sona_architecture.md](../architecture/sona_architecture.md), [ADR-0016](../../adr/0016-codesigned-disjoint-comb-stimulus-and-null-homing-capture.md), [ADR-0018](../../adr/0018-signal-chain-fixtures-crate-and-whitebox-distillation.md), [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), and [ADR-0025](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md).
+This specification defines the universal hardware excitation schedule, two-step converter calibration, multi-regime sub-sample latency alignment, capture-side offline attention seeding, and white-box or grey-box distillation contracts for SONA v4.0. It fulfills [REQ-1.5–REQ-1.9, REQ-4.3, REQ-7.2, REQ-7.3](../../requirements/system_goals_and_requirements.md), [sona_architecture.md](../architecture/sona_architecture.md), [ADR-0016](../../adr/0016-codesigned-disjoint-comb-stimulus-and-null-homing-capture.md), [ADR-0018](../../adr/0018-signal-chain-fixtures-crate-and-whitebox-distillation.md), [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [ADR-0025](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md), and [ADR-0026](../../adr/0026-core-only-multirate-offline-and-crossbar-latency-invariance.md).
 
 ---
 
@@ -138,7 +139,7 @@ Given dry excitation $x[n]$ and recorded wet return $y[n]$ after subtracting loo
 | `DispersiveAllPass` | Broadband linear coherence `gamma_lin >= 0.35`, dispersed phase | Coarse causal wavefront lock bounded ahead of signed parabolic sub-sample refinement |
 | `NonlinearEnvelopeFallback` | Hard clipping or octave division pushes `gamma_lin < 0.35` | Stereo 6-pair Jacobi elliptic H1 Hilbert envelope cross-correlation |
 
-First, the coarse causal wavefront probe determines earliest envelope/wavefront onset $\tau_{\text{coarse}}$ and polarity, then applies a strict causal onset alignment verification guard ensuring $\tau_{\text{coarse}}$ tracks actual wet causal impulse arrival rather than pre-response sidelobes or subtractive `HB-FIR` group-delay artifacts (7 samples round-trip under uniform 2× `OS2X`), preventing dispersive all-pass group delay from pulling alignment past causal arrival.
+First, the coarse causal wavefront probe determines earliest envelope/wavefront onset $\tau_{\text{coarse}}$ and polarity, then applies a strict causal onset alignment verification guard ensuring $\tau_{\text{coarse}}$ tracks actual wet causal impulse arrival rather than pre-response sidelobes or active `Live` 2× 7-sample / `Master` `D_os` `HB-FIR` group-delay artifacts, preventing dispersive all-pass group delay from pulling alignment past causal arrival.
 
 Next, 3-point parabolic vertex interpolation around magnitude peak $k^\star$ solves $\delta \in [-0.5, +0.5]$ inside $\Delta\tau = \mathrm{clamp}(k^\star + \delta - \tau_{\text{coarse}}, -1.5, +1.5)$ (setting $\delta = 0.0$ on flat plateaus where the denominator magnitude <= 1e-12), yielding aligned lag $\hat{\tau} = \max(0.0, \tau_{\text{coarse}} + \Delta\tau)$ :
 $$\delta = \frac{\lvert R[k^\star - 1] \rvert - \lvert R[k^\star + 1] \rvert}{2\big(\lvert R[k^\star - 1] \rvert - 2 \lvert R[k^\star] \rvert + \lvert R[k^\star + 1] \rvert\big)} \in [-0.5, +0.5], \qquad \hat{\tau} = \max\big(0.0, \tau_{\text{coarse}} + \mathrm{clamp}(k^\star + \delta - \tau_{\text{coarse}}, -1.5, +1.5)\big)$$
@@ -159,7 +160,7 @@ Capture pipelines directly feed Mechanisms `#2–#7` without cross-device pretra
 
 | Capture/Attention Interface | Normative Telemetry & Qualification Contract |
 | :--- | :--- |
-| **`#2` Causal Delay Seeding & `HB-FIR` Compensation** | Provides aligned causal onset telemetry and subtracts the exact 7-sample `HB-FIR` perimeter round-trip offset prior to two-phase delay dictionary lookup across 5..24,000 samples |
+| **`#2` Causal Delay Seeding & `HB-FIR` Compensation** | Provides aligned causal onset telemetry, subtracts active Live `D_os` (7) before two-phase delay dictionary lookup across 5..24,000 samples, and serializes crossbar taps with `tau_eff >= 42.0` |
 | **`#3` Macro-Window Persistence (`>= 32,768` fr)** | Retains `>= 32,768`-frame macro-windows in `INPC`/`STMC` and live tail extensions so macro `EnvOT` and `TF-Sinkhorn` capture long ambient decays and optical release curves |
 | **`#4` 54-D `NW-PANAMA` Active Corner Selection** | Extracts 54-D physical/modulation telemetry (38-D base + 16-D harmonic/spectral/modulation descriptors) validated under `N_int >= 2` LOOCV to schedule high-uncertainty corners inside `<= 100`-stem budgets |
 | **`#5` Level-Invariant 34-Feature `SSM-LFO` Extraction** | Applies global RMS normalization across aligned returns before extracting 34 dual-peak modulation features so bipolar ±64 Hz shimmer/Doppler sign (+1.5 Hz) remains immune to pad/gain scaling |

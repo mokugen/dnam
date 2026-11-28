@@ -32,13 +32,14 @@ adrs:
   - ADR-0022
   - ADR-0024
   - ADR-0025
+  - ADR-0026
 ---
 
 # Split-Precision WebGPU & Analytical VarPro Identification Solver
 
 This specification defines the Black-Box Fixed-Shape Asymptotic SONA Identification Solver (v4.0). It combines portable 32-bit GPU associative scans (`<= 15.0 KiB` SRAM), 32-bit integer Ozaki reductions, seven training-only non-causal neural/spectral attention mechanisms (`#1–#7`), host IEEE-754 float64 `MM-Cholesky`, 33-band LTAS Newton-KKT, Schur prefix re-balancing, and a deterministic CPU SIMD solver fallback.
 
-Together these mechanisms satisfy [REQ-1.5, REQ-1.6, REQ-1.8, REQ-1.9, REQ-2.1, REQ-4.1–REQ-4.3, REQ-5.1–REQ-5.6, REQ-6.1, REQ-6.2, REQ-7.1, REQ-7.2](../../requirements/system_goals_and_requirements.md), [sona_architecture.md](../architecture/sona_architecture.md), [ADR-0018](../../adr/0018-signal-chain-fixtures-crate-and-whitebox-distillation.md), [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), and [ADR-0025](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md).
+Together these mechanisms satisfy [REQ-1.5, REQ-1.6, REQ-1.8, REQ-1.9, REQ-2.1, REQ-4.1–REQ-4.3, REQ-5.1–REQ-5.6, REQ-6.1, REQ-6.2, REQ-7.1, REQ-7.2](../../requirements/system_goals_and_requirements.md), [sona_architecture.md](../architecture/sona_architecture.md), [ADR-0018](../../adr/0018-signal-chain-fixtures-crate-and-whitebox-distillation.md), [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [ADR-0025](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md), and [ADR-0026](../../adr/0026-core-only-multirate-offline-and-crossbar-latency-invariance.md).
 
 ---
 
@@ -55,12 +56,12 @@ flowchart LR
     P4 --> P5["Pass 5: Host Parity & Export<br/>~25 ms 0-ULP CPU Pass + STAT + T0..T4 Audit<br/>-> .dnam-bin, v4.0 DNAM & DNPJ"]
 ```
 
-The solver operates as a 100% black-box, fixed-shape asymptotic identifier (`REQ-1.6`, `REQ-1.9`, `ref[repo.code.universal-black-box]`) with zero external pretraining, zero circuit-specific seed templates, zero hardcoded crossover frequencies, and zero capture-time tier resizing (`ref[arch.tiers.maximize-quality-within-budget]`). All four causally nested SONA v4.0 fixed-shape tiers execute over uniform 2× oversampling (15-tap HB-FIR `OS2X` perimeter) and optimize jointly in one self-contained run without external machine-learning framework dependencies (`REQ-4.1`, `REQ-5.1`, `REQ-5.2`).
+The solver operates as a 100% black-box, fixed-shape asymptotic identifier (`REQ-1.6`, `REQ-1.9`, `ref[repo.code.universal-black-box]`) with zero external pretraining, zero circuit-specific seed templates, zero hardcoded crossover frequencies, and zero capture-time tier resizing (`ref[arch.tiers.maximize-quality-within-budget]`). All four causally nested SONA v4.0 fixed-shape tiers train at 2× oversampling (Live 2× 15-tap HB-FIR CoreOversampler, deploying identically to Master 4× via Box2) and optimize jointly in one self-contained run without external machine-learning framework dependencies (`REQ-4.1`, `REQ-5.1`, `REQ-5.2`).
 
 | Solver Property | Lite / Full / Pro / Ultra Nesting (Lite ⊂ Full ⊂ Pro ⊂ Ultra) |
 | :--- | :--- |
 | 4-Block Matryoshka Core | `[1,1,1,1]` / `[2,2,1,1]` / `[2,2,2,2]` / `[3,3,2,2]` (CoreQuad count: 4 / 6 / 8 / 10; InterBlockTile count: 5 / 13 / 24 / 37; `MAX_OUTGOING_PER_QUAD = 7`) |
-| Perimeter & Continuous Nonlinear Dim | All-tier 2× 15-tap HB-FIR `OS2X`; 64-frame Quad 0 inline ring; continuous subspace partitioned across CoreQuads, InterBlockTiles, SensoryQuad, Crossbar, Op-N[Pre], Kautz poles, `ro_pole_48k`, and TransportQuads |
+| Core Oversampling & Continuous Nonlinear Dim | Live 2× 15-tap HB-FIR `CoreOversampler` training (`Master` 4× `Box2` deployment parity); 64-frame Quad 0 inline ring; continuous subspace partitioned across CoreQuads, InterBlockTiles, SensoryQuad, Crossbar, Op-N[Pre], Kautz poles, `ro_pole_48k`, and TransportQuads |
 | ModalConvolver FIR, Kautz & ER Sparse | 32 / 48 / 96 / 128 FIR taps per channel; 8 / 12 / 24 / 32 shared Kautz pole pairs; ErSparseBank (8 Lite / 16 Full..Ultra sparse echoes) |
 | TransportQuad (Op-T v4) & SensoryQuad v4 | 1 / 2 / 3 / 4 quads = 4 / 8 / 12 / 16 delay lines with `||M_fb||_2 <= 1`, series matrix `M_series`, ±64 Hz shimmer/Doppler, Op-T loop saturator (`V_ceil = 4.0`), and SensoryQuad Log-Knee VCA (`[-5.0, +4.0]` octaves; `sense_vca_w` in `[-512.0, 512.0]`) |
 | Desktop Worker Memory & Qualification | <= 1.5 GiB desktop WebGPU (1–2 GiB worker ceiling, <= 128 MiB storage binding, <= 512 MiB WASM CPU fallback, `REQ-4.3`); `BestUntilDiminishingReturns` (`|ΔbESR| < 0.01` dB/epoch) and T0..T4 pyramid |
@@ -79,7 +80,7 @@ The identification solver executes sequentially across five deterministic passes
 
 On the aligned StarCenter reference stem (`s = 0`), Pass 1 performs 100% data-driven physical identification with zero device names, control-name matching, or circuit templates (REQ-1.6, REQ-1.9). It executes once over the complete active coreset—consuming full 8.0–12.0 s StarCenter capture recordings when present ahead of compaction to extract `BLA`, even/odd nonlinear distortion products, repeatability noise variance, and Schroeder energy-decay curves.
 
-Pass 1 persists those structured `extracted_physics` summaries directly for Pass 2 reuse without redundant probe recomputation or short-prefix truncation. It applies hybrid multi-regime alignment with causal onset verification (`ref[train.capture.alignment.multi-regime]`) and precomputes the input-only Op-P basis once on host CPU in < 0.5 ms prior to GPU buffer upload, spanning the stereo 6-pair Hilbert H1 lattice, 3-basis carrier, and mid-derived 2-stage `rsqrt_pos_nr3` T1 −1 and −2 octave tracker channels across uniform 2× oversampling.
+Pass 1 persists those structured `extracted_physics` summaries directly for Pass 2 reuse without redundant probe recomputation or short-prefix truncation. It applies hybrid multi-regime alignment with causal onset verification (`ref[train.capture.alignment.multi-regime]`) and precomputes the input-only Op-P basis once on host CPU in < 0.5 ms prior to GPU buffer upload, spanning the stereo 6-pair Hilbert H1 lattice, 3-basis carrier, and mid-derived 2-stage `rsqrt_pos_nr3` T1 −1 and −2 octave tracker channels across 2× `CoreOversampler` training.
 
 Next, Pass 1 estimates initial early FIR taps (32 / 48 / 96 / 128 per channel) via O(N log N) zero-padded radix-2 FFT Toeplitz autocorrelation and cross-correlation of transform length $L_{\mathrm{fft}} = 2^{\lceil \log_2(N + P) \rceil}$ with filter span $P = 128$, using biased lag estimates and diagonal ridge $10^{-6} r_x[0]$ for Levinson–Durbin stability.
 
@@ -87,7 +88,7 @@ It then identifies shared conjugate Kautz modal poles $\lbrace (r_m, \theta_m) \
 
 Alongside Kautz poles, Pass 1 estimates initial SensoryQuad parameters (including `[-5.0, +4.0]`-octave Log-Knee VCA behavior and Op-T loop saturator `V_ceil = 4.0`) and continuous Op-N[Pre] settings (`gamma_bc`, `zoh_hold_depth` in `[0.0, 0.9999]`, and `beta_q`) solely from aligned dry/wet telemetry.
 
-Pass 1 also seeds causal Op-T v4 echo and comb delays via **Attention Mechanism `#2`** (Two-Stage Cross-Spectral Delay Dictionary Attention over 5..24,000 samples, subtracting the deterministic 7-sample HB-FIR perimeter round-trip group delay offset prior to candidate lookup) across 1 / 2 / 3 / 4 TransportQuad blocks (4..16 delay lines) rather than hard delay overrides under low linear coherence.
+Pass 1 also seeds causal Op-T v4 echo and comb delays via **Attention Mechanism `#2`** (Two-Stage Cross-Spectral Delay Dictionary Attention over 5..24,000 samples, subtracting active `CoreOversampler` latency `D_os`, which is 7 in Live 2× training, and serializing crossbar taps with `tau_eff >= 42.0` for `tau_ring_cb >= 5.0`) across 1 / 2 / 3 / 4 TransportQuad blocks (4..16 lines).
 
 Whenever no dynamic modulation is active (`!mod_detected`), Pass 1 runs post-modal Welch cross-spectral Wiener deconvolution $S_{R\hat{B}} / (S_{\hat{B}\hat{B}} + \lambda)$ against the raw Lite-horizon modal prediction $\hat{b}$ on lags at least 32, solves passive per-channel least-squares wet taps on feed-forward Quad 0 (`g_loop == 0.0`), applies causal $(I + \text{Op-T}_0)^{-1}$ series inversion before refitting Kautz, ErSparseBank, and FIR taps, and commits passive Quad 0 whenever it beats both Lite (< 0.80) and Ultra (< 0.90) baselines when Op-T was inactive, or beats both by < 0.50 when superseding a static feedback seed.
 
@@ -269,7 +270,7 @@ To maximize model quality inside locked v4.0 runtime shapes (`REQ-1.9`, `REQ-5.3
 | Attention Mechanism | Offline Trainer Execution Point | Exact Role & Clean-Room Guarantee |
 | :--- | :--- | :--- |
 | **`#1` Residual-Band Attention (`RBA`)** | Pass 2 Phase 2B & Phase 2C | Noise-floored cross-band inverse-variance weighting over the 33 LTAS bands (`N_floor` noise-gated) directing capacity toward residual-heavy bands without chasing converter noise |
-| **`#2` Two-Stage Delay Dictionary** | Pass 1 Op-T v4 delay seeding | Coarse correlation + fine cross-spectral dictionary attention over 5..24,000 samples after subtracting the exact 7-sample HB-FIR perimeter round-trip group delay |
+| **`#2` Two-Stage Delay Dictionary** | Pass 1 Op-T v4 delay seeding | Coarse correlation + fine cross-spectral dictionary attention over 5..24,000 samples subtracting active `D_os` (7 in Live 2×) and emitting crossbar `tau_eff >= 42.0` |
 | **`#3` Macro EnvOT & TF-Sinkhorn** | Pass 2 Phase 2B (>= 32,768 frames) | Multi-scale macro-window Envelope Optimal Transport and time-frequency Sinkhorn alignment locking slow reverbs, echoes, and optical release curves |
 | **`#4` 54-D NW-PANAMA Selector** | Pass 4 active corner recommender | Expands telemetry to 54 physical/modulation descriptors under `N_int >= 2` LOOCV validation to pick minimum-uncertainty control corners |
 | **`#5` 34-Feature SSM-LFO Seeder** | Pass 1 modulation/shimmer init | Dual-peak modulation state-space seeder initializing LFO and bipolar ±64 Hz Doppler/shimmer rates (preserving +1.5 Hz shimmer sign) |
@@ -402,7 +403,7 @@ In `inner_opt_step`, one strided `(1, num_candidates, 1)` workgroup per candidat
 
 `r[train.pipeline.isomorphism-parity]`
 
-Because the identification solver and runtime audio engine execute identical fixed-precision DSP operator formulations (SensoryQuad, 15-tap HB-FIR `OS2X`, ModalConvolver FIR/Kautz/ErSparseBank, 3-tap folded SVF / Block 0 Pred-Corr PHS, Selective-Duhem stereo-linked ParaLRU, `AlgADAA1(4096, NR3)`, C^2 wavefolder, SE-Bus, GLU, smooth Op-N[Pre] v4, and pure-wet Op-T v4), GPU and host solves agree across all modules.
+Because the identification solver and runtime audio engine execute identical fixed-precision DSP operator formulations (SensoryQuad, Live 2× 15-tap HB-FIR `CoreOversampler` + Master `Box2` parity, ModalConvolver FIR/Kautz/ErSparseBank, 3-tap folded SVF / Block 0 Pred-Corr PHS, Selective-Duhem stereo-linked ParaLRU, `AlgADAA1(4096, NR3)`, C^2 wavefolder, SE-Bus, GLU, smooth Op-N[Pre] v4, and pure-wet Op-T v4), GPU and host solves agree across all modules.
 
 Every GPU-accelerated solve concludes with a deterministic host CPU reference pass and 3-limb compensated binary64 summation, so exporting `WGHT` (wrapping `.dnam-bin`) from `.dnam-proj` reproduces the solver's predicted waveform to 0 ULP (`Oracle-01..03`, `bESR` <= -60 dB).
 
@@ -462,6 +463,6 @@ Every trainer or runtime modification must ascend the five-tier fail-fast qualif
 | :--- | :--- | :--- |
 | **`T0` Operator Micro-Oracles** | Individual kernel & module suites (< 5 s) | Exact binary64/decimal oracle parity, central FD `rel_err < 1e-6`, CPU/GPU hardware parity, ±1e9 finite safety (REQ-7.2), zero-division/alloc RT disassembly checks, < 15.5 KiB GPU SRAM, binary wire layout assertions, and GRA convex-hull BIBO (< 5 µs) |
 | **`T1` Lite Canary Quartet** | Lite L1 `fast_self_test` on `Chain-05`, 01, 02, 18 (< 30 s) | Isolates aligner, Pass 1–5, and v4.0 wire ahead of Full..Ultra or L3; clears `Chain-05` < -38 dB and `Chain-01`/02/18 < -22..-26 dB (exceeding -18 dB Lite floor) |
-| **`T2` Nested Matryoshka Gate** | Lite ⊂ Full ⊂ Pro ⊂ Ultra (L1 -> L2) + WCET | 7-metric adjacent-tier monotonicity (REQ-5.1–5.2), `STAT` `uplo='U'` parity (REQ-5.3), click-free Lite–Ultra switch (REQ-5.4), 4× bounce parity (REQ-5.5), 4,432 B Lite 2× L1D (14× <= 64 KiB), 14×/8×/4×/2× WCET, and 0-ULP `StarCenter` invariance |
+| **`T2` Nested Matryoshka Gate** | Lite ⊂ Full ⊂ Pro ⊂ Ultra (L1 -> L2) + WCET | 7-metric adjacent-tier monotonicity (REQ-5.1–5.2), `STAT` `uplo='U'` parity (REQ-5.3), click-free Lite–Ultra switch (REQ-5.4), `Master` 4× core / `Live` 2× parity (REQ-5.5), 4,432 B Lite 2× L1D (14× <= 64 KiB), 14×/8×/4×/2× WCET, and 0-ULP `StarCenter` invariance |
 | **`T3` Stratified 5-Wave (`L1 -> L2 -> L3`)** | `Chain-01..18` Waves 1–5 + `Cases #1..#26` + `DNWB` | Sequential L1 -> L2 -> L3 via `DNAM_DIAG_STOP_AFTER_L2` across Wave 1 (05, 01, 03, 02), Wave 2 (09, 06, 18), Wave 3 (10, 07, 17, 08, 16), Wave 4 (15, 04, 11, 13, 14), Wave 5 (12 4CM/WDW) with zero external pretraining (REQ-1.9) |
 | **`T4` Full Production Certification** | Full 18-chain CPU<->GPU, 44.1..192 kHz SR, `#6` OOD | 18/18 chains pass CPU<->GPU parity, 44.1/48/96/192 kHz SR invariance (REQ-2.5), REQ-8.5 watermark f32->fp16 (~1e-6 SO(4) + 224-D hash), Op-T/LFO `TSYN` phase-lock, >= 95% coverage, and `#6` Perceiver IO desktop OOD gate (REQ-4.3) |

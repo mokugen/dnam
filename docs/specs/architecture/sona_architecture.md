@@ -34,19 +34,22 @@ adrs:
   - ADR-0022
   - ADR-0024
   - ADR-0025
+  - ADR-0026
 ---
 
 # State-Space Operator Neural Architecture (SONA) System Overview
 
 This specification defines the State-Space Operator Neural Architecture (SONA v4.0) for **Dynamic Neural Audio Modeler (DNAM)** across its portable 32-bit operator library, deterministic zero-allocation DSP virtual machine, compiled GPU compute shaders, unified client runtime, and non-causal trainer attention / split-precision solver.
 
-SONA v4.0 unifies analog, digital, and acoustic hardware inside a pure 2-in / 2-out DSP virtual machine: a Top-of-Frame Crossbar (SensoryQuad v4 Log-Knee VCA, `Op-N[Pre]` v4 `quantize -> ZOH`, all-tier 2× 15-tap HB-FIR OS2X, native 2× Op-P v4 with decoupled gates, and 64-frame inline Op-T reads) feeding a Quad-Major 8-subsample 4-Block Matryoshka Core (3-tap SVF, Pred-Corr PHS, smooth `ParaLRU`, `AlgADAA1(4096)`, `SE-Bus`, GLU, `g_edge[0..6]`, and split `W_ro_head`).
+SONA v4.0 unifies analog, digital, and acoustic hardware inside a pure 2-in / 2-out DSP virtual machine running unconditionally at host rate `f_{s,vm} == f_{s,host}`. Its Top-of-Frame Crossbar combines SensoryQuad v4 Log-Knee VCA, Op-N[Pre] v4 (`quantize -> ZOH`), Core-Only 2-mode HB-FIR (`Live` 2× / `Master` up to 4×), native Op-P v4 with decoupled gates, and `tau_eff >= 42.0` Op-T reads.
 
-Downstream stages comprise ModalConvolver v4 (early FIR, 2-basis `fp16` morph, `ErSparseBank`, Kaiser polyphase high-SR FIR, and per-bank onset Kautz), LinearReadout (`ro_pole_48k` + split `W_ro_head`), and Op-T v4 (`M_fb`, bipolar `g_loop`, `M_series`, quadrature AM, shimmer, unitary freeze, and `slot 31 L/R`) driven by ControlBus v4 GRA, while host multi-port 4CM/WDW routing wraps outside the VM.
+That crossbar drives a Quad-Major 8-subsample 4-Block Matryoshka Core (3-tap SVF, Pred-Corr PHS, smooth ParaLRU, `AlgADAA1(4096)`, `Box2` in Master, SE-Bus, GLU, `g_edge[0..6]`, and split `W_ro_head`).
 
-A unified runtime spans web, desktop, and DAW plugin hosts alongside offline desktop training workers (1–2 GiB WebGPU compute or 512 MiB WASM CPU fallback running 8M–16M non-causal `Perceiver IO` teacher/OOD generalization; `REQ-4.3`), cleanly decoupled from the lean real-time audio-thread VM (`REQ-6.1`, 6,336 B reclaimed non-Tardos/non-`SO(4)` container footprint).
+Downstream stages comprise ModalConvolver v4 (early FIR, 2-basis `fp16` morph, `ErSparseBank`, Kaiser polyphase high-SR FIR up to 192 kHz, and per-bank onset Kautz), LinearReadout (`ro_pole_48k` + split `W_ro_head`), and Op-T v4 (`M_fb`, bipolar `g_loop`, `M_series`, quadrature AM, shimmer, unitary freeze, and slot 31 L/R) driven by deterministic ControlBus v4 GRA (+24 B reclaimed), while host multi-port 4CM/WDW routing wraps outside the VM.
 
-For implementation-agnostic requirements, see [system_goals_and_requirements.md](../../requirements/system_goals_and_requirements.md). For psychoacoustic quality tiers, see [psychoacoustic_quality_and_tiers.md](psychoacoustic_quality_and_tiers.md). For architectural rationales and trade-offs, see [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [ADR-0025](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0015](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md), [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), and [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md).
+A unified runtime spans web, desktop, and DAW plugin hosts alongside offline desktop training workers (1–2 GiB WebGPU compute or 512 MiB WASM CPU fallback running 8M–16M non-causal `Perceiver IO` teacher/OOD generalization; `REQ-4.3`), cleanly decoupled from the lean real-time audio-thread VM (`REQ-6.1`, 6,336 B + 24 B reclaimed non-Tardos/non-`SO(4)` container footprint).
+
+For implementation-agnostic requirements, see [system_goals_and_requirements.md](../../requirements/system_goals_and_requirements.md). For psychoacoustic quality tiers, see [psychoacoustic_quality_and_tiers.md](psychoacoustic_quality_and_tiers.md). For architectural rationales and trade-offs, see [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [ADR-0025](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md), [ADR-0026](../../adr/0026-core-only-multirate-offline-and-crossbar-latency-invariance.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0015](../../adr/0015-realtime-host-concurrency-spsc-and-telemetry-seqlock.md), [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), and [ADR-0020](../../adr/0020-modular-monorepo-and-dnam-proj-container.md).
 
 ---
 
@@ -68,19 +71,19 @@ SONA factors `ControlBus` v4 (`GRA`) latent trajectories (`z_stage[0..8]`, `z_he
 
 `ControlBus` v4 (`GRA`) executes at 4-frame aligned cadence `K_ctrl(f_{s,vm}) = 4 * max(2, round(f_{s,vm} / 12_000.0))` (`K_ctrl = 16` at both 44.1 kHz and 48 kHz, `gcd(K_ctrl, 4) = 4`), ramping `[stage_targets(32), z_stage(8), z_head(8), g_edge(6), op_t_q(16)]` via 4-frame micro-ramps (`alpha_chunk = 0.25`) while skipping with zero static MACs when idle.
 
-Across sample rates, the VM separates perimeter rate $f_{s,\mathrm{vm}}$ from core rate $f_{s,\mathrm{core}}$. In live 44.1–384 kHz execution, $f_{s,\mathrm{vm}} = f_{s,\mathrm{host}}$; in offline 4× bounce, internal `OS2X` is bypassed and $f_{s,\mathrm{vm}} = 4 f_{s,\mathrm{host}}$, with $\rho_{\mathrm{vm}} = 48000 / f_{s,\mathrm{vm}}$.
+Across sample rates and render modes, the VM locks the perimeter unconditionally to host rate $f_{s,\mathrm{vm}} = f_{s,\mathrm{host}}$ (44.1–384 kHz) with $\rho_{\mathrm{vm}} = 48000 / f_{s,\mathrm{vm}}$, while only Op-P v4 plus the 4-block CoreQuad stack switch between Live and Master core oversampling.
 
-All four tiers (Lite, Full, Pro, Ultra) run native 2× 15-tap linear-phase HB-FIR OS2X at $f_{s,\mathrm{core}} = 2 f_{s,\mathrm{vm}}$ whenever `os2x_active = !offline_bounce && (2.0 * f_{s,vm} <= 384_000.0)`, and $f_{s,\mathrm{core}} = f_{s,\mathrm{vm}}$ otherwise, with $\rho_{\mathrm{core}} = 48000 / f_{s,\mathrm{core}}$.
+All four tiers (Lite, Full, Pro, Ultra) evaluate `CoreOversampler` with $M_{\mathrm{core}} = \min(M_{\mathrm{target}}, \lfloor 384000.0 / f_{s,\mathrm{host}} \rfloor)$ (`M_target = 2` in `Live`, `M_target = 4` in `Master`), giving $f_{s,\mathrm{core}} = M_{\mathrm{core}} f_{s,\mathrm{vm}} \le 384{,}000.0$ and $\rho_{\mathrm{core}} = 48000 / f_{s,\mathrm{core}}$.
 
-Cold load precomputes base core `TPT-SVF` poles $g_{\mathrm{host}} = \tan(\pi f_c / f_{s,\mathrm{core}})$, `k_base = 1/Q`, `SensoryQuad` v4 SVF/ParaLRU ZOH scaling, continuous-time `ComplementLog` decay rates, Kaiser polyphase high-SR FIR taps, and `ro_pole_48k` readout decay (`hp_lp_pole`).
+Cold load precomputes base core `TPT-SVF` poles $g_{\mathrm{host}} = \tan(\pi f_c / f_{s,\mathrm{core}})$, `k_base = 1/Q`, `SensoryQuad` v4 SVF/ParaLRU ZOH scaling, continuous-time `ComplementLog` decay rates, Kaiser polyphase high-SR FIR taps (scoped to host rates `<= 192 kHz`), and `ro_pole_48k` readout decay (`hp_lp_pole`).
 
-Each `K_ctrl` tick updates ControlBus GRA (SwiGLU + Padé-[1/1] + anchored 1.5-Entmax), inertia slew, 2× Q0.192 skewed LFOs, live `TSYN` lock, CIC-16 `SensoryQuad` `q3`, native 2× Q0.32 phasors, and 4-frame micro-ramp targets ([router_and_crossbar_topology.md](../dsp/router_and_crossbar_topology.md)).
+Each `K_ctrl` tick updates deterministic ControlBus GRA (SwiGLU + Padé-[1/1] + anchored 1.5-Entmax), inertia slew, 2× Q0.192 skewed LFOs, live `TSYN` lock, CIC-16 `SensoryQuad` `q3`, native `Op-P` Q0.32 phasors, and 4-frame micro-ramp targets ([router_and_crossbar_topology.md](../dsp/router_and_crossbar_topology.md)), with `Master` delaying core-bound snapshots through a cold 4-slot microchunk delay ring (`delta_D_up = 16`).
 
 #### 1.1.3 Pillar 3: Self-Contained 2,048 B `GRA` Control Arena & Tier-Local Projections
 
 `r[arch.pillars.cp1-projections]`
 
-SONA v4.0 supports $P \ge 0$ physical controls with clamp descriptors, `GRA` 2,048 B arena weights, `TSYN` tempo tables, compact `fp16` `W_ro,0` (`REQ-8.5`), and split `W_ro_head` stored inside the Layer 0 container per [dnam_binary_format.md](../containers/dnam_binary_format.md), reclaiming 6,336 B of redundant v3 control/routing slabs without altering Tardos or `SO(4)` watermark bounds.
+SONA v4.0 supports $P \ge 0$ physical controls with clamp descriptors, `GRA` 2,048 B arena weights, `TSYN` tempo tables, compact `fp16` `W_ro,0` (`REQ-8.5`), and split `W_ro_head` stored inside the Layer 0 container per [dnam_binary_format.md](../containers/dnam_binary_format.md), reclaiming 6,336 B of redundant v3 control/routing slabs plus 24 B from retired drift scalars without altering Tardos or `SO(4)` watermark bounds.
 
 All tiers use the unified 20-D GRA input (`[z_ctl, q1, q2, q3, c_user]` with `O(P + M)` convex-hull BIBO certification) emitting `z_stage[0..8]`, `z_head[0..8]`, `g_edge[0..6]`, `op_t_q[0..16]`, `stage_targets[0..32]`, and `slot 31 L/R` stereo AM modulation ([parametric_control_bus.md §2.3](../dsp/parametric_control_bus.md#23-o1-additive-latent-sufficient-statistic-control-scaling)).
 
@@ -88,7 +91,7 @@ All tiers use the unified 20-D GRA input (`[z_ctl, q1, q2, q3, c_user]` with `O(
 
 `r[arch.pillars.universal-black-box]`
 
-Every SONA v4.0 tier executes a fixed, unconditional 2-in / 2-out mathematical basis parameterized strictly by learned weights. The Crossbar combines SensoryQuad v4 (Log-Knee VCA, CIC-16 `q3`, `block_vca_gain[0..4]`), `Op-N[Pre]` v4 (`quantize -> ZOH`), all-tier 15-tap HB-FIR OS2X, native 2× Op-P v4 (H1, `g_trk` LPF, T1+, decoupled crossbar gates), and 64-frame inline Op-T reads with $\tau_{\min} = 5.0$.
+Every SONA v4.0 tier executes a fixed, unconditional 2-in / 2-out mathematical basis parameterized strictly by learned weights. The Crossbar combines SensoryQuad v4 (Log-Knee VCA, CIC-16 `q3`, `block_vca_gain[0..4]`), Op-N[Pre] v4 (quantize -> ZOH), CoreOversampler (Live 2× 15-tap / Master 4× 63/23-tap + Box2), native Op-P v4 (H1, `g_trk` LPF, T1+, decoupled crossbar gates), and Op-T reads (`tau_eff >= 42.0` yielding `tau_ring_cb >= 5.0` on crossbar taps, `tau_min = 5.0` on self-feedback).
 
 Downstream, signal flow passes unconditionally through the Quad-Major 8-subsample 4-Block Matryoshka Core (tiling `[1,1,1,1]` / `[2,2,1,1]` / `[2,2,2,2]` / `[3,3,2,2]` with 5/13/24/37 tiles, 3-tap folded SVF, Pred-Corr PHS, smooth ParaLRU, `g_pre(v²)`, `AlgADAA1(4096)`, SE-Bus, GLU, `g_edge[0..6]`, and split `W_ro_head`), ModalConvolver v4 (FIR, 2-basis morph, ErSparseBank, onset Kautz), and LinearReadout.
 
@@ -100,23 +103,23 @@ Output conditioning runs through `Op-T` v4 (per-quad routing, passive convex `M_
 flowchart LR
     HostPatch["Outer Host Shell (Outside 2x2 VM)<br/>(8-Port 4CM/WDW Patchbay, Parallel Align, M/S Width)"]
 
-    subgraph TopCrossbar ["1. Top-of-Frame Crossbar & All-Tier 2x HB-FIR OS2X"]
+    subgraph TopCrossbar ["1. Top-of-Frame Crossbar & CoreOversampler (Live 2x / Master 4x)"]
         Sense["SensoryQuad v4 (Modulated TPT-SVF + Peak/RMS + CIC-16)<br/>(Log-Knee VCA g_vca & block_vca_gain[0..4])"]
-        PreN["Op-N[Pre] v4 & 15-Tap HB-FIR OS2X (All 4 Tiers)<br/>(4-FMA Hermite Q -> Q0.32 ZOH; 4-FMA FIR, 7-samp Delay)"]
-        OpP["Native 2x Op-P v4 & 4x Q0.32 Phasors @ f_s,core<br/>(H1 128B + g_trk LPF + 8-Feat T1+; Decoupled Gates)"]
-        OpTRead["Causal Op-T Ring Reads (tau_min = 5.0)<br/>(64-Frame Inline Quad 0 / Ext, 4-Frame Micro-Chunks)"]
+        PreN["Op-N[Pre] v4 & CoreOversampler (Live 15-Tap / Master 63/23-Tap)<br/>(4-FMA Hermite Q -> Q0.32 ZOH; Integer PDC D_os: 7 / 37 / 31 / 0)"]
+        OpP["Native Op-P v4 & 4x Q0.32 Phasors @ f_s,core<br/>(H1 128B + g_trk LPF + 8-Feat T1+; Decoupled Gates)"]
+        OpTRead["Causal Op-T Ring Reads (tau_ring_cb = tau_eff - D_os >= 5.0)<br/>(64-Frame Inline Quad 0 / Ext, 4-Frame Micro-Chunks)"]
     end
 
     subgraph SonaCore ["2. Quad-Major 4-Block Core (5 / 13 / 24 / 37 Tiles, g_edge[0..6])"]
         SVF["3-Tap Folded TPT-SVF & Predictor-Corrector PHS<br/>(2-Block LR4 in Block 0->1, k_nl in 0..16, ||A_tpt||_2 <= 1)"]
         LRU["Smooth ParaLRU + C2 soft_rect + Stereo Link<br/>(Exact Fwd / GL-Mobius O(log2 N) Bwd <= 8.68e-6)"]
-        ADAA["g_pre(v^2) + AlgADAA1(4096) + SE-Bus + GLU + Split W_ro_head<br/>(Quad-Major 8-Subsample Fusion & 4-Frame Micro-Ramp)"]
+        ADAA["g_pre(v^2) + AlgADAA1(4096) + Box2(Master) + SE-Bus + GLU + Split W_ro_head<br/>(Quad-Major 8-Subsample Fusion & 4-Frame Micro-Ramp)"]
         SVF --> LRU --> ADAA
     end
 
     subgraph ReadoutLoop ["3. ModalConvolver v4, ControlBus GRA & Op-T v4"]
-        Conv["ModalConvolver v4 (FIR + 2-Basis Morph + ErSparseBank)<br/>+ Kaiser Polyphase High-SR + Per-Bank Onset Kautz"]
-        Ctrl["ControlBus v4 GRA (2,048 B Arena, SwiGLU + Pade + 1.5-Entmax)<br/>(K_ctrl = 16 @ 44.1/48k, 4-Frame Micro-Ramp, Slot 31 L/R)"]
+        Conv["ModalConvolver v4 (FIR + 2-Basis Morph + ErSparseBank)<br/>+ Kaiser Polyphase High-SR (<= 192k) + Per-Bank Onset Kautz"]
+        Ctrl["ControlBus v4 GRA (Deterministic, +24 B Reclaimed, SwiGLU + Pade + 1.5-Entmax)<br/>(K_ctrl = 16 @ 44.1/48k, 4-Frame Micro-Ramp, Master delta_D_up Ring)"]
         LoopFB["Op-T v4 (Convex M_fb, Bipolar g_loop, Causal M_series)<br/>+ ±64 Hz Ramp, Quad AM, Shimmer & Unitary Freeze"]
         Out["Zero-DC Trim & 1e9 Safety Out<br/>(+/- 100.0 Envelope -> Host Shell)"]
     end
@@ -125,19 +128,21 @@ flowchart LR
     Sense -.->|"CIC-16 q3"| Ctrl
     Sense -->|"g_vca * x"| PreN
     OpTRead --> PreN
-    PreN -->|"2x HB-FIR"| OpP & SonaCore
+    PreN -->|"CoreOversampler Up"| OpP & SonaCore
     OpP --> SonaCore
     SonaCore -->|"pre_conv"| Conv
     SonaCore -->|"direct_s2"| LoopFB
     Conv -->|"conv_out"| LoopFB
     Ctrl -->|"4-Frame Mod & W_ro_head"| Sense & PreN & OpP & SonaCore & Conv & LoopFB
-    LoopFB -. "z^-tau (tau_min = 5.0)" .-> OpTRead
+    LoopFB -. "z^-tau (Self-FB tau_min = 5.0)" .-> OpTRead
     LoopFB --> Out -->|"2x2 L/R"| HostPatch
 ```
 
-Positioning Op-T reads with causal floor $\tau_{\min} = 5.0$ above `Op-N[Pre]`, all-tier 2× 15-tap HB-FIR OS2X, native 2× Op-P v4, and the Quad-Major SONA core yields 0-ULP block-size invariance across 1-frame and 16-frame buffers while enforcing exact integer OS2X group delay (7 1×-samples = 0.146 ms at 48 kHz, 0.000° phase dispersion, -48.31 dB alias parity vs 4× bounce).
+Positioning Op-T crossbar reads at `tau_eff >= 42.0` (`tau_ring_cb = tau_eff - D_os >= 5.0`, self-feedback `tau_min = 5.0`) above Op-N[Pre], 2-mode `CoreOversampler`, native Op-P v4, and the Quad-Major SONA core yields 0-ULP block-size invariance across 1-frame and 16-frame buffers.
 
-Native 2× Op-P v4 steps H1 (128 B hot state, <= 0.128° phase error across 20 Hz..Nyquist without rate-bridge workarounds or midpoint interpolation), 1-pole pre-T1 LPF (`g_trk`), and 8-feature T1+ (56 B) directly at $f_{s,\mathrm{core}}$ with `op_p_to_core` and `phasor_to_core` decoupled from `Op-T` `wet_scale`.
+It enforces exact integer `D_os` latency (7 Live, 37 or 31 Master, 0 bypass at 352.8–384 kHz), achieving -74.8 dB alias rejection and -37.6 dB high-gain / -42.6 dB clean / -27.2 dB 24-tone `Live↔Master` parity.
+
+Native `f_{s,core}` Op-P v4 steps H1 (128 B hot state, <= 0.128° phase error across 20 Hz..Nyquist without rate-bridge workarounds or midpoint interpolation), 1-pole pre-T1 LPF (`g_trk`), and 8-feature T1+ (56 B) directly at $f_{s,\mathrm{core}}$ with `op_p_to_core` and `phasor_to_core` decoupled from `Op-T` `wet_scale`.
 
 Blending `Op-T` v4 feedback through passive convex cross-quad mixing `M_fb`, bipolar `g_loop in [-0.9990, +0.9990]`, causal `M_series`, `eta_even` shimmer, quadrature AM, and unitary `H_4(1)` `freeze_mix` (0.25 slew) delivers rich spatial modulation inside 64-frame inline Quad 0 + external rings with zero audible hold drift.
 
@@ -160,32 +165,34 @@ sequenceDiagram
     Host->>CtrlM: Latch SensoryQuad v4 CIC-16 e[0..4] at K_ctrl (16 @ 44.1/48k)
     CtrlM->>CtrlM: Advance 2x Q0.192 LFOs (live TSYN lock) & q3
     CtrlM->>CtrlN: Emit z_in = [z_ctl, q1, q2, q3, c_user] (20-D)
-    alt Controls dirty, TSYN active, modulators active, or drift enabled
+    alt Controls dirty, TSYN active, or modulators active
         CtrlN->>CtrlN: Evaluate SwiGLU + Pade-[1/1] + anchored 1.5-Entmax + inertia
         CtrlN->>Audio: Emit stage_targets(32), z_stage(8), z_head(8), g_edge(6), op_t_q(16)
     end
-    loop Per 4-frame microchunk at f_s,vm (1-frame peel on remainder)
-        Audio->>Audio: Step 4-frame micro-ramp (alpha_chunk = 0.25) on g_edge & split W_ro_head
+    loop Per 4-frame microchunk at f_s,vm == f_s,host (1-frame peel on remainder)
+        Audio->>Audio: Step 4-frame micro-ramp (alpha_chunk = 0.25, Master 4-slot ctrl delay ring delta_D_up)
         Host->>Audio: SensoryQuad v4 (Log-Knee VCA) + Op-T Read + Op-N[Pre] v4 -> u_1x
-        Audio->>Audio: 15-Tap HB-FIR OS2X Up -> Native 2x Op-P v4 + Quad-Major 8-Sub Core -> HB-FIR Down
+        Audio->>Audio: CoreOversampler Up (Live 2x / Master 4x) -> Op-P v4 + CoreQuads (+ Box2 in Master) -> Down
         Audio->>Audio: ModalConvolver v4 (FIR + ErSparseBank + Kautz) -> Op-T v4 (M_fb/M_series/Slot 31 L/R) -> Out
     end
 ```
 
-Cold init and `reset()` zero dynamic modulators and `env_states`, set `lfo_phasors` to unit identity, evaluate `GRA` with skewed identity `q2` and zeroed `q3`, and snap `current_stage_params = stage_targets` ahead of frame 0:
+Cold init and `reset()` zero dynamic modulators and `env_states`, set `lfo_phasors` to unit identity, evaluate `GRA` with skewed identity `q2` and zeroed `q3`, pre-fill any Master 4-slot cold control delay ring (`delta_D_up = 16`), and snap `current_stage_params = stage_targets` ahead of frame 0:
 
 ```text
-lfo_phases_q192 = [[0; 3]; 2],  lfo_phasors = [[1.0, 0.0], [1.0, 0.0]],  env_states = [0.0; 4],  ou_drift_state = [0.0; 4]
+lfo_phases_q192 = [[0; 3]; 2],  lfo_phasors = [[1.0, 0.0], [1.0, 0.0]],  env_states = [0.0; 4]
 ctrl_sub_counter = 0,  sample_tick = 0,  current_stage_params = stage_targets,  deltas = [0.0; 32]
 ```
 
-At frame 0 and every `ctrl_sub_counter == 0` (`K_ctrl = 4 * max(2, round(f_{s,vm} / 12_000.0))` giving 16 at 44.1/48 kHz), `ControlBus` v4 runs `GRA` when active (zero static MACs when idle), updating recursive slews (`prev_oct`, `current_psi`) and feeding 4-frame micro-ramps (`alpha_chunk = 4.0 / K_ctrl = 0.25`).
+At frame 0 and every `ctrl_sub_counter == 0` (`K_ctrl = 4 * max(2, round(f_{s,vm} / 12_000.0))` giving 16 at 44.1/48 kHz), `ControlBus` v4 runs `GRA` deterministically when active (zero static MACs when idle), updating recursive slews (`prev_oct`, `current_psi`) and feeding 4-frame micro-ramps (`alpha_chunk = 4.0 / K_ctrl = 0.25`, delayed through the cold 4-slot ring in `Master` mode).
 
-Callbacks enter 4-frame micro-chunks strictly when `(sample_tick & 3) == 0 && rem_frames >= 4 && rem_tick >= 4`, executing Quad-Major 8-subsample `CoreQuad` blocks under all-tier `HB-FIR` `OS2X` (`g_edge[0..6]` and split `W_ro_head` scaled per 4-frame boundary with zero per-frame tile rewrites) for exact 0-ULP split invariance.
+Callbacks enter 4-frame micro-chunks strictly when `(sample_tick & 3) == 0 && rem_frames >= 4 && rem_tick >= 4`, executing Quad-Major 8-subsample `CoreQuad` blocks under `CoreOversampler` (`g_edge[0..6]` and split `W_ro_head` scaled per 4-frame boundary with zero per-frame tile rewrites) for exact 0-ULP split invariance.
 
-Per VM frame, SensoryQuad v4 feeds Log-Knee VCA (`g_vca`) and 4-frame `block_vca_gain[0..4]`, Op-T reads feed `(s0_L, s0_R)` into `Op-N[Pre]` v4 (`quantize -> ZOH`), and 15-tap HB-FIR OS2X feeds native 2× Op-P v4 (H1, `g_trk` LPF, T1+) alongside Quad-Major 8-subsample `CoreQuad` blocks.
+Per VM frame, SensoryQuad v4 feeds Log-Knee VCA (`g_vca`) and 4-frame `block_vca_gain[0..4]`, while Op-T crossbar reads (`tau_ring_cb = tau_eff - D_os >= 5.0`) combine into `(s0_L, s0_R)` for Op-N[Pre] v4 (`quantize -> ZOH`).
 
-Downstream, HB-FIR downsamples `(pre_conv, direct_s2)`, ModalConvolver v4 adds early FIR + `ErSparseBank` + Kautz, and Op-T v4 applies `M_fb`, `M_series`, `slot 31 L/R` stereo AM, `mono_out`, 48-fr crossfade, `eff_trim`, and ±1.0e9 safety clamp.
+Next, `CoreOversampler` (Live 2× 15-tap / Master 4× 63/23-tap + `z^-1@2x`) feeds native Op-P v4 (H1, `g_trk` LPF, T1+) alongside Quad-Major CoreQuad blocks (`Box2` + midpoint `lin_mix` in Master).
+
+Downstream, `CoreOversampler` downsamples `(pre_conv, direct_s2)` back to `f_{s,vm} == f_{s,host}`, ModalConvolver v4 adds early FIR + ErSparseBank + Kautz, and Op-T v4 applies `M_fb`, `M_series`, slot 31 L/R stereo AM, `mono_out`, 48-fr crossfade, `eff_trim`, and ±1.0e9 safety clamp.
 
 All `stage_latent_*` and `GRA` `z_stage` projections index the unrotated operator latent slice rather than `z_head` (which modulates split `W_ro_head` additive deltas), keeping buyer `SO(4)` gauge `Q_buyer` invariant with 0-ULP compatibility.
 
@@ -243,9 +250,9 @@ flowchart LR
         T1["• 64-Frame Inline Quad 0 (512 B) + Ext Rings (tau_min = 5.0)<br/>• QuadCtrlRoute (op_t_q[0..16]), ±64 Hz Ramp & 3-Phase B-Spline<br/>• Convex M_fb, Bipolar g_loop, Causal M_series, Quad AM & Shimmer<br/>• SoA Schroeder SO(4) & Unitary H_4(1) freeze_mix + Slot 31 L/R"]
     end
 
-    subgraph OpM ["Op-P v4 & Op-M: Analytic 2x Basis, SensoryQuad, TPT-SVF & Kautz"]
+    subgraph OpM ["Op-P v4 & Op-M: Analytic Core Basis, SensoryQuad, TPT-SVF & Kautz"]
         direction TB
-        M1["• 3-Tap Folded TPT-SVF + Pred-Corr PHS (2-Block LR4 in Block 0->1)<br/>• SensoryQuad v4 (sense_svf_g_oct, Peak/RMS, CIC-16, Log-Knee VCA)<br/>• Native 2x Op-P v4: 128 B H1 + g_trk LPF + 8-Feat T1+ (Decoupled Gates)<br/>• ModalConvolver v4: FIR + 2-Basis Morph + ErSparseBank + Onset Kautz"]
+        M1["• 3-Tap Folded TPT-SVF + Pred-Corr PHS (2-Block LR4 in Block 0->1)<br/>• SensoryQuad v4 (sense_svf_g_oct, Peak/RMS, CIC-16, Log-Knee VCA)<br/>• Native f_s,core Op-P v4: 128 B H1 + g_trk LPF + 8-Feat T1+ (Decoupled Gates)<br/>• ModalConvolver v4: FIR + 2-Basis Morph + ErSparseBank + Onset Kautz"]
     end
 
     subgraph OpN ["Op-N v4: Quantize->ZOH, Smooth ParaLRU, AlgADAA1 & SE-Bus/GLU"]
@@ -270,8 +277,8 @@ Downstream Op-N v4 nonlinearities apply amplitude scaling `g_pre(v^2)`, shared `
 | Universal Operator Family | Audio-Rate Execution (`f_{s,vm}` / `f_{s,core}`) | Control-Plane Execution (`f_{s,vm} / K_ctrl`, 4-Frame Micro-Ramp) | Shared SIMD / GPU Compute Mechanism |
 | :--- | :--- | :--- | :--- |
 | **Op-T v4 (Transport)** | 64-frame inline Quad 0 + ext rings (`tau_min = 5.0`), per-quad `M_fb` + `M_series`, bipolar `g_loop`, ±64 Hz ramp, 3-phase B-spline, quad AM, shimmer, unitary `H_4(1)` freeze | `ControlBus` v4 `op_t_q[0..16]`, `stage_targets[16..25]`, `slot 31 L/R` stereo AM, 4× `Q0.32` phasors | Branchless power-of-two ring wrap masking, 32-bit GPU-safe triangle fold, Catmull-Rom Horner FMA |
-| **Op-P / Op-M (SVF, Analytic & Modal)** | `SensoryQuad` v4 (`TPT-SVF` + CIC-16 + Log-Knee VCA), 3-tap folded `CoreQuad` SVF + Pred-Corr PHS (`f_{s,core}`), native 2× `Op-P` v4 (`H1` + `g_trk` + `T1+`), `ModalConvolver` v4 (`f_{s,vm}`) | `TPT-SVF` `g_host * exp2_clamped5`, `sense_svf_g_oct[0..4]`, Kautz ZOH (`rho_vm`), Kaiser polyphase high-SR FIR, `Q0.192` LFOs, `TSYN` lock | Energy-preserving 2×2 ZDF / Pred-Corr PHS step, 4-lane / paired stereo FMA, batched 4-frame FIR shift |
-| **Op-N v4 (Pre, ParaLRU & Nonlinear)** | `Op-N[Pre]` v4 `quantize -> ZOH` (`f_{s,vm}`), all-tier 15-tap `HB-FIR` `OS2X`, smooth `C²` `soft_rect` `ParaLRU` + `SE-Bus` + `AlgADAA1(4096)` + `GLU` | ControlBus v4 GRA (2,048 B, SwiGLU + Padé-[1/1] + anchored 1.5-Entmax), `g_edge[0..6]`, split `W_ro_head`, `O(P+M)` BIBO hull | 4-FMA Hermite quantizer, GL/Möbius scan bwd, 4-FMA `HB-FIR`, `NR3` / FMA (CPU == GPU) |
+| **Op-P / Op-M (SVF, Analytic & Modal)** | `SensoryQuad` v4 (`TPT-SVF` + CIC-16 + Log-Knee VCA), 3-tap folded `CoreQuad` SVF + Pred-Corr PHS (`f_{s,core}`), native `f_{s,core}` `Op-P` v4 (`H1` + `g_trk` + `T1+`), `ModalConvolver` v4 (`f_{s,vm}`) | `TPT-SVF` `g_host * exp2_clamped5`, `sense_svf_g_oct[0..4]`, Kautz ZOH (`rho_vm`), Kaiser polyphase high-SR FIR, `Q0.192` LFOs, `TSYN` lock | Energy-preserving 2×2 ZDF / Pred-Corr PHS step, 4-lane / paired stereo FMA, batched 4-frame FIR shift |
+| **Op-N v4 (Pre, ParaLRU & Nonlinear)** | `Op-N[Pre]` v4 `quantize -> ZOH` (`f_{s,vm}`), 2-mode `CoreOversampler` (`Live` 2× 15-tap / `Master` 4× 63/23-tap + `Box2`), smooth `C²` `soft_rect` `ParaLRU` + `SE-Bus` + `AlgADAA1(4096)` + `GLU` | ControlBus v4 GRA (2,048 B, SwiGLU + Padé-[1/1] + anchored 1.5-Entmax), `g_edge[0..6]`, split `W_ro_head`, `O(P+M)` BIBO hull | 4-FMA Hermite quantizer, GL/Möbius scan bwd, 4-FMA `HB-FIR`, `NR3` / FMA (CPU == GPU) |
 
 ### 1.5 SIMD Architecture, Lane Packing & Zero-Stall Dispatch
 
@@ -288,19 +295,19 @@ SONA v4.0 4-Block Matryoshka 4-Lane SIMD Hierarchy (Compile-Time Fixed-Capacity 
 +--------------------+--------------------+--------------------+--------------------+
 | Block 0 (4-Lane B) | Block 1 (4-Lane B) | Block 2 (4-Lane B) | Block 3 (4-Lane B) | -> Tier / Mode
 +--------------------+--------------------+--------------------+--------------------+
-| 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | -> Lite  [1,1,1,1] (16 lanes @ 2x HB-FIR)
-| 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | -> Full  [2,2,1,1] (24 lanes @ 2x HB-FIR)
-| 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | -> Pro   [2,2,2,2] (32 lanes @ 2x HB-FIR)
-| 3 x Vec4 (12 lanes)| 3 x Vec4 (12 lanes)| 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | -> Ultra [3,3,2,2] (40 lanes @ 2x / 4x)
+| 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | -> Lite  [1,1,1,1] (16 lanes @ 2x Live / 4x Master)
+| 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | 1 x Vec4 (4 lanes) | 1 x Vec4 (4 lanes) | -> Full  [2,2,1,1] (24 lanes @ 2x Live / 4x Master)
+| 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | -> Pro   [2,2,2,2] (32 lanes @ 2x Live / 4x Master)
+| 3 x Vec4 (12 lanes)| 3 x Vec4 (12 lanes)| 2 x Vec4 (8 lanes) | 2 x Vec4 (8 lanes) | -> Ultra [3,3,2,2] (40 lanes @ 2x Live / 4x Master)
 +--------------------+--------------------+--------------------+--------------------+
 ```
 
 | Tier | CoreQuad Block Profile & Lanes | TPT-SVF Quads & Tiles | Oversample Factor | ModalConvolver (FIR + ErSparse + Kautz) | TransportQuads (Op-T v4) | Active-Hot L1D Working Set vs Ceiling |
 | :--- | :---: | :---: | :---: | :---: | :---: | :--- |
-| **Lite** (Tier 0) | `[1, 1, 1, 1]` (4 CoreQuads = 16 lanes) | 4 quads, 5 tiles (0..5) | 2 (All-Tier 15-tap HB-FIR `OS2X` + `AlgADAA1(4096)`) | 32 FIR/ch + 8 ErSparse + 8 Kautz (2 blks = 16 poles) | 1 quad (4 lanes, 64-frame / 512 B inline `fp16` Quad 0 + opt. ext) | 4,432 B true-hot <= 4,608 B ceiling (14× = 60.59 KiB <= 64 KiB) |
-| **Full** (Tier 1) | `[2, 2, 1, 1]` (6 CoreQuads = 24 lanes) | 6 quads, 13 tiles (0..13) | 2 (All-Tier 15-tap HB-FIR `OS2X` + `AlgADAA1(4096)`) | 48 FIR/ch + 16 ErSparse + 12 Kautz (3 blks = 24 poles) | 2 quads (8 lanes + `M_fb`/`M_series` + 8 Schroeder; Quad 0 64-frame inline + Quad 1) | <= 8,192 B active-hot ceiling |
-| **Pro** (Tier 2) | `[2, 2, 2, 2]` (8 CoreQuads = 32 lanes) | 8 quads, 24 tiles (0..24) | 2 (All-Tier 15-tap HB-FIR `OS2X` + `AlgADAA1(4096)`) | 96 FIR/ch + 16 ErSparse + 24 Kautz (6 blks = 48 poles) | 3 quads (12 lanes + `M_fb`/`M_series` + shimmer + 12 Schroeder; opt. `fp16`/`f32` cold ext) | <= 16,384 B active-hot ceiling |
-| **Ultra** (Tier 3) | `[3, 3, 2, 2]` (10 CoreQuads = 40 lanes) | 10 quads, 37 tiles (0..37, max 7 out/quad) | 2 RT HB-FIR (4× bounce 64-tap PDC) | 128 FIR/ch + 16 ErSparse + 32 Kautz (8 blks = 64 poles) | 4 quads (16 lanes + 16 partitioned Schroeder stages across Quads 0..3 up to 16,384 samples at 384 kHz, `abs(a_diff) <= 0.75`, unitary freeze) | <= 32,768 B active-hot ceiling |
+| **Lite** (Tier 0) | `[1, 1, 1, 1]` (4 CoreQuads = 16 lanes) | 4 quads, 5 tiles (0..5) | 2× Live / 4× Master (Core-Only HB-FIR + `AlgADAA1(4096)`) | 32 FIR/ch + 8 ErSparse + 8 Kautz (2 blks = 16 poles) | 1 quad (4 lanes, 64-frame / 512 B inline `fp16` Quad 0 + opt. ext) | 4,432 B true-hot <= 4,608 B ceiling (14× = 60.59 KiB <= 64 KiB) |
+| **Full** (Tier 1) | `[2, 2, 1, 1]` (6 CoreQuads = 24 lanes) | 6 quads, 13 tiles (0..13) | 2× Live / 4× Master (Core-Only HB-FIR + `AlgADAA1(4096)`) | 48 FIR/ch + 16 ErSparse + 12 Kautz (3 blks = 24 poles) | 2 quads (8 lanes + `M_fb`/`M_series` + 8 Schroeder; Quad 0 64-frame inline + Quad 1) | <= 8,192 B active-hot ceiling |
+| **Pro** (Tier 2) | `[2, 2, 2, 2]` (8 CoreQuads = 32 lanes) | 8 quads, 24 tiles (0..24) | 2× Live / 4× Master (Core-Only HB-FIR + `AlgADAA1(4096)`) | 96 FIR/ch + 16 ErSparse + 24 Kautz (6 blks = 48 poles) | 3 quads (12 lanes + `M_fb`/`M_series` + shimmer + 12 Schroeder; opt. `fp16`/`f32` cold ext) | <= 16,384 B active-hot ceiling |
+| **Ultra** (Tier 3) | `[3, 3, 2, 2]` (10 CoreQuads = 40 lanes) | 10 quads, 37 tiles (0..37, max 7 out/quad) | 2× Live / 4× Master (63/23-tap + `Box2`, 37/31/0 PDC) | 128 FIR/ch + 16 ErSparse + 32 Kautz (8 blks = 64 poles) | 4 quads (16 lanes + 16 partitioned Schroeder stages across Quads 0..3 up to 4,096 samples at <= 192 kHz, `abs(a_diff) <= 0.75`, unitary freeze) | <= 32,768 B active-hot ceiling |
 
 **Exact Matryoshka Block/Group Indexing & 37-Tile Lower-Triangular Edge Topology (`MAX_OUTGOING_PER_QUAD = 7`):**
 
@@ -337,7 +344,7 @@ Portable single-precision mathematical primitives are cleanly separated from gra
 | Layer | Responsibility & Shared Capabilities |
 | :--- | :--- |
 | **Vector & Constants Layer** | 4-lane vector arithmetic, paired 8-lane stereo operations, compile-time derived filter/table constants, software IEEE-754 half-precision codecs, and fixed-point Ozaki slice helpers |
-| **Operator Kernel Layer** | `SensoryQuad` v4 sensing, 2×2 ZDF TPT-SVF step/compose + Pred-Corr PHS, Selective-Duhem 1-D `ParaLRU` (`C² soft_rect`), `AlgADAA1(4096)` (plus 1× `PolyADAA1` refs), wavefolder, `SE-Bus`, bounded `GLU`, `ErSparseBank` + Kautz modal banks, `Op-T` v4 readers, native 2× `H1` Hilbert lattice, and 8-feature `T1+` rotor |
+| **Operator Kernel Layer** | `SensoryQuad` v4 sensing, 2×2 ZDF TPT-SVF step/compose + Pred-Corr PHS, Selective-Duhem 1-D `ParaLRU` (`C² soft_rect`), `AlgADAA1(4096)` (plus 1× `PolyADAA1` refs), wavefolder, `SE-Bus`, bounded `GLU`, `ErSparseBank` + Kautz modal banks, `Op-T` v4 readers, native `f_{s,core}` `H1` Hilbert lattice, and 8-feature `T1+` rotor |
 | **Backend Primitives** | Target-neutral vector abstractions, fused 4×4 matrix-vector multiply-add, branchless Newton-Raphson reciprocals, CRC32C checksumming, and subnormal flushing |
 
 Above the mathematical primitives, the runtime graph engine composes execution-ordered cache-locked state slabs, executing register-hoisted stereo sub-blocks while enforcing a strict acyclic layered dependency hierarchy (from outer host runtime through execution topology, operator evaluation, vector algebra, and portable 32-bit primitives; see [ADR-0019](../../adr/0019-simd-kernel-architecture-and-realtime-execution-optimizations.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md)).
@@ -389,19 +396,19 @@ Weights use a four-tier causally nested lower-block-triangular delta layout acro
 
 All four tiers use fixed compile-time capacities tuned to stay inside the 64 KiB ARM Cortex-A76 L1D cache budget (`REQ-5.1`, `REQ-5.2`).
 
-Arena 0 (4,608 B / 72 CL hot prefix ceiling, self-contained 2,048 B GRA arena, and compact `fp16` `W_ro,0`) carries Lite base weights calibrated at native 2× HB-FIR OS2X, SensoryQuad v4, native 2× Op-P v4, `Op-N[Pre]` v4, 32 FIR + 8 `ErSparseBank` + 8 Kautz pairs, and Quad 0 Op-T v4, saving 6,336 B across redundant v3 slabs.
+Arena 0 (4,608 B / 72 CL hot prefix ceiling, self-contained 2,048 B GRA arena, and compact `fp16` `W_ro,0`) carries Lite base weights calibrated at 2× Live HB-FIR CoreOversampler (with Master 4× `Box2` parity), SensoryQuad v4, native `f_{s,core}` Op-P v4, `Op-N[Pre]` v4, 32 FIR + 8 `ErSparseBank` + 8 Kautz pairs, and Quad 0 Op-T v4, saving 6,336 B across redundant v3 slabs plus 24 B from retired drift scalars.
 
 Stripping a container to Lite reads Arena 0 directly without touching Arena 1..3 (`REQ-5.6`), while ControlBus v4 drives 4-frame micro-ramped `stage_targets[0..32]`, `g_edge[0..6]`, `op_t_q[0..16]`, `z_stage`, `z_head`, and `slot 31 L/R`, keeping buyer SO(4) gauge invariance on `z_head`.
 
-Arena 1..3 hold incremental deltas for Full, Pro, and Ultra, with analytical continuous-time ZOH and Kaiser polyphase FIR adapting cleanly across 44.1–384 kHz (`REQ-8.5`). All 48 kHz operator dimensions remain compile-time fixed; only cold `Op-T` extended rings (`REQ-6.3`) and declared 3 kHz control count $P$ (zero static MACs when idle per `REQ-6.1`) vary per capture.
+Arena 1..3 hold incremental deltas for Full, Pro, and Ultra, with analytical continuous-time ZOH across 44.1–384 kHz host rates (`REQ-8.5`) and Kaiser polyphase high-SR FIR scoped up to 192 kHz. All 48 kHz operator dimensions remain compile-time fixed; only cold `Op-T` extended rings (`REQ-6.3`, allocated strictly at 1× host rate) and declared 3 kHz control count $P$ (zero static MACs when idle per `REQ-6.1`) vary per capture.
 
 | Parameter | Lite (Arena 0) | Full (Arena 0..1) | Pro (Arena 0..2) | Ultra (Arena 0..3) |
 | :--- | :---: | :---: | :---: | :---: |
 | **Active Hot Working Set vs L1D Ceiling** | 4,432 B <= 4,608 B (14× = 60.59 KiB <= 64 KiB) | <= 8,192 B ceiling | <= 16,384 B ceiling | <= 32,768 B ceiling |
-| **4-Block Matryoshka Core (`CoreQuad`s)** | `[1, 1, 1, 1]` (4 quads / 16 lanes, 5 tiles) @ 2× HB-FIR | `[2, 2, 1, 1]` (6 quads / 24 lanes, 13 tiles) @ 2× HB-FIR | `[2, 2, 2, 2]` (8 quads / 32 lanes, 24 tiles) @ 2× HB-FIR | `[3, 3, 2, 2]` (10 quads / 40 lanes, 37 tiles) @ 2× RT / 4× Bounce |
+| **4-Block Matryoshka Core (`CoreQuad`s)** | `[1, 1, 1, 1]` (4 quads / 16 lanes, 5 tiles) @ 2× Live / 4× Master | `[2, 2, 1, 1]` (6 quads / 24 lanes, 13 tiles) @ 2× Live / 4× Master | `[2, 2, 2, 2]` (8 quads / 32 lanes, 24 tiles) @ 2× Live / 4× Master | `[3, 3, 2, 2]` (10 quads / 40 lanes, 37 tiles) @ 2× Live / 4× Master |
 | **`ModalConvolver` v4 (FIR + `ErSparse` + Kautz)** | 32 FIR + 8 ErSparse + 8 Kautz pairs | 48 FIR + 16 ErSparse + 12 Kautz pairs | 96 FIR + 16 ErSparse + 24 Kautz pairs | 128 FIR + 16 ErSparse + 32 Kautz pairs |
-| **`Op-T` v4 (`TransportQuad`) & Diffusion** | 1 quad (64-frame / 512 B inline Quad 0 + opt. ext) | 2 quads + `M_fb`/`M_series` + 8 Schroeder | 3 quads + `M_fb`/`M_series` + shimmer + 12 Schroeder | 4 quads + `M_fb`/`M_series` + 16 Schroeder + unitary freeze |
-| **Control Bus Architecture (`GRA`)** | 2,048 B `GRA` (`20-D -> [32, 8, 8, 6, 16]`) | Unified `GRA` + Tier Deltas | Unified `GRA` + Tier Deltas | Unified `GRA` + Tier Deltas (`W_ro` `fp16` `REQ-8.5`) |
+| **`Op-T` v4 (`TransportQuad`) & Diffusion** | 1 quad (64-frame / 512 B inline Quad 0 + opt. ext) | 2 quads + `M_fb`/`M_series` + 8 Schroeder | 3 quads + `M_fb`/`M_series` + shimmer + 12 Schroeder | 4 quads + `M_fb`/`M_series` + 16 Schroeder (<= 192 kHz) + unitary freeze |
+| **Control Bus Architecture (`GRA`)** | Deterministic 2,048 B `GRA` (`20-D -> [32, 8, 8, 6, 16]`) | Unified `GRA` + Tier Deltas | Unified `GRA` + Tier Deltas | Unified `GRA` + Tier Deltas (+24 B reclaimed, `W_ro` `fp16` `REQ-8.5`) |
 
 ### 2.2 Hardware & DSP Benchmark Summary
 
@@ -416,9 +423,9 @@ $$t_{\text{A76+LV2}}(t, B) = \kappa_{\text{cache}} \left(\alpha_{\text{uarch}}(t
 | Tier Profile | Target 1× A76 Budget (85–90% Utilization) | Active Hot Working Set vs 64 KiB L1D | Normative Serial Core Budget (1× A76 @ 80% RT Cap) | Safe Serial (2× A76 Cores) | Real-Time Instruction Invariant |
 | :--- | :---: | :---: | :---: | :---: | :--- |
 | **Lite** (`[1,1,1,1]` @ 2× HB-FIR, 4 quads, 5 tiles, 32 FIR, 8 ErSparse, 8 Kautz, 1 quad) | <= 1,000 ns/sample | 14 × 4,432 B = 62,048 B <= 64 KiB | **>= 14×** (<= 1,190 ns/sample) | **>= 28×** | Zero FDIV, FSQRT, IDIV/UDIV/SDIV, math-lib, allocs, locks, or syscalls (`REQ-6.2`, `REQ-6.3`) |
-| **Full** (`[2,2,1,1]` @ 2× HB-FIR, 6 quads, 13 tiles, 48 FIR, 16 ErSparse, 12 Kautz, 2 quads) | <= 1,800 ns/sample | <= 8,192 B active-hot ceiling | **>= 8×** (<= 2,083 ns/sample) | **>= 16×** | All-tier 2× 15-tap HB-FIR (-48.31 dB bounce parity, 0.000° dispersion) inside Studio flagship budget |
-| **Pro** (`[2,2,2,2]` @ 2× HB-FIR, 8 quads, 24 tiles, 96 FIR, 16 ErSparse, 24 Kautz, 3 quads) | <= 3,600 ns/sample | <= 16,384 B active-hot ceiling | **>= 4×** (<= 4,166 ns/sample) | **>= 8×** | Mastering reference capacity (`ErSparseBank` + 48 Kautz poles + 12 delay lines + shimmer) |
-| **Ultra** (`[3,3,2,2]` @ 2×/4×, 10 quads, 37 tiles, 128 FIR, 16 ErSparse, 32 Kautz, 4 quads) | <= 7,200 ns/sample | <= 32,768 B active-hot ceiling | **>= 2×** (<= 8,333 ns/sample) + Bounce | **>= 4×** | Dual-rig workstation max + 4× bounce + 16 partitioned Schroeder stages + unitary freeze |
+| **Full** (`[2,2,1,1]` @ 2×/4× HB-FIR, 6 quads, 13 tiles, 48 FIR, 16 ErSparse, 12 Kautz, 2 quads) | <= 1,800 ns/sample | <= 8,192 B active-hot ceiling | **>= 8×** (<= 2,083 ns/sample) | **>= 16×** | Core-Only `Live` 2× 15-tap HB-FIR (0.000° dispersion) & `Master` 4× (-74.8 dB alias floor) inside Studio budget |
+| **Pro** (`[2,2,2,2]` @ 2×/4× HB-FIR, 8 quads, 24 tiles, 96 FIR, 16 ErSparse, 24 Kautz, 3 quads) | <= 3,600 ns/sample | <= 16,384 B active-hot ceiling | **>= 4×** (<= 4,166 ns/sample) | **>= 8×** | Mastering reference capacity (`ErSparseBank` + 48 Kautz poles + 12 delay lines + shimmer) |
+| **Ultra** (`[3,3,2,2]` @ 2×/4× HB-FIR, 10 quads, 37 tiles, 128 FIR, 16 ErSparse, 32 Kautz, 4 quads) | <= 7,200 ns/sample | <= 32,768 B active-hot ceiling | **>= 2×** (<= 8,333 ns/sample) + Master | **>= 4×** | Dual-rig workstation max + `Master` 4× (63/23-tap + `Box2`) + 16 Schroeder stages (`<= 192 kHz`) + unitary freeze |
 
 For prior-art LV2 instance comparisons against grey-box Multi-FX, NAM A2, GuitarML Proteus, and NAM ParametricOD, see [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md) and [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md).
 
@@ -455,10 +462,11 @@ The Quad-Major hot working-set slab packs hot weights and recursive states conti
 |      - Ultra Delta: CoreQuads[8..10], tiles[24..37], FIR[96..128], Kautz 32, Quad 3                |
 +---------------------------------------------------------------------------------------------------+
 | COLD TAIL [ActiveHot..) — Zero L1D Footprint on Hot 48 kHz Audio Loops:                             |
-|   - ControlBus v4 GRA (2,048 B Arena) + Control Clamp Descriptors[P] + TSYN                        |
-|   - Per-Quad Partitioned Schroeder Banks (16 stages across Quads 0..3) & Kaiser High-SR FIR Tables |
+|   - Master Cold Oversampler (63/23-Tap HB-FIR ~1.8 KiB) + 4-Slot Microchunk Ctrl Delay Ring (~1.2 KiB)|
+|   - Deterministic ControlBus v4 GRA (2,048 B Arena, +24 B Reclaimed) + Descriptors[P] + TSYN       |
+|   - Per-Quad Partitioned Schroeder Banks (16 stages <= 192 kHz) & Kaiser High-SR FIR (<= 192 kHz)   |
 |   - Cold fp16 LinearReadout Base W_ro,0 (REQ-8.5) & Lock-Free Epoch-Retired Ping-Pong Swap         |
-|   - Cold Op-T Extended Ring (0 B dry .. multi-second power-of-two DRAM, a in {2, 4} bytes/sample) |
+|   - Cold Op-T Extended Ring (1x f_host RAM, 0 B dry .. multi-second power-of-two DRAM, a in {2, 4})|
 +---------------------------------------------------------------------------------------------------+
 ```
 
@@ -470,7 +478,7 @@ The Quad-Major hot working-set slab packs hot weights and recursive states conti
 | **`readouts_hot[4]`** (4 × 96 B, incl. split `W_ro_head`) | 384 B | Compact `W_ro` slice + `odd`/`even_lru` deltas (2 × fp16 ULP Tardos floor, `REQ-8.5`) |
 | **`tiles_hot[5]`** (5 × 96 B + scalar `g_edge`) | 480 B | 5 causal Lite tiles decoded once per 8 subsamples; 6 scalar `g_edge[0..6]` gates |
 | **`sensory_hot`** (48 B state + 128 B params + `svf_a1`) | 176 B | Modulated 4-lane `TPT-SVF` + Peak/RMS + `ParaLRU` + CIC-16 + Log-Knee VCA |
-| **`op_p`** (128 B `H1` + 56 B `T1+` + 48 B phasors) + **`op_n_pre`** (48 B) + **Crossbar** (96 B) | 376 B | Native 2× `Op-P` v4, `Op-N[Pre]` v4, and decoupled crossbar coupling |
+| **`op_p`** (128 B `H1` + 56 B `T1+` + 48 B phasors) + **`op_n_pre`** (48 B) + **Crossbar** (96 B) | 376 B | Native `f_{s,core}` `Op-P` v4, `Op-N[Pre]` v4, and decoupled crossbar coupling |
 | **`fir_32`** (128 B w + 256 B hist) + **`ErSparseBank[8]`** (80 B) | 464 B | Contiguous Lite early FIR slice (32 taps) + 8 early-reflection 2×2 MIMO taps |
 | **`kautz_hot[2]`** (2 × 176 B) | 352 B | 2 shared-pole stereo Kautz banks (8 pairs, per-bank `onset_delay_samp` + `c_cross`) |
 | **`transport0_hot`** (216 B) + **Inline 64-Frame Ring** (512 B) | 728 B | 512 B 64-frame `fp16` ring + Quad 0 hot routing/limiter/B-spline/AM registers |
@@ -483,7 +491,7 @@ Within the hot layout, ModalConvolver v4 stores one contiguous FIR history ring 
 
 `r[arch.tiers.efficiency]`
 
-Every active SONA tier executes all topological operators unconditionally on every 4-frame causal micro-chunk (8 subsamples under native 2× `HB-FIR` `OS2X`) with zero operator-bypass flags, zero dynamic resizing, and zero heap allocations or locks.
+Every active SONA tier executes all topological operators unconditionally on every 4-frame causal micro-chunk (`4 * M_core` subsamples under `CoreOversampler`: 8 in Live 2×, 16 in Master 4×) with zero operator-bypass flags, zero dynamic resizing, and zero heap allocations or locks.
 
 Hot loops execute via 8-lane stereo or interleaved 4-lane vector math, Quad-Major 8-subsample register pinning, clamped `AlgADAA1(4096)` with 3-step `NR3` reciprocals and inverse square roots, and zero-spill cache-locked working sets. Mono (`1 → 1`, `2 → 1`) topologies emit the phase-coherent Mid readout while advancing dual-channel histories, and all inline and cold extended delay memory is admitted against the host memory ceiling before activation.
 
@@ -512,13 +520,13 @@ flowchart TD
 
     PreRouter & DownRouter -->|"2x2 Stereo L/R"| Sense["SensoryQuad v4 (Modulated TPT-SVF + Peak/RMS + CIC-16)<br/>• Unified Log-Knee VCA g_vca & block_vca_gain[0..4]"]
     Sense -.-> OpN
-    Sense -->|"g_vca * (x_L, x_R)"| Crossbar["Top-of-Frame Crossbar & All-Tier 15-Tap HB-FIR OS2X<br/>• Op-N[Pre] v4 quantize->ZOH -> 2x HB-FIR Up (4 FMAs, 7-samp)<br/>• Native 2x Op-P v4 (128B H1 + g_trk + T1+) & Op-T Reads (tau_min=5)"]
+    Sense -->|"g_vca * (x_L, x_R)"| Crossbar["Top-of-Frame Crossbar & 2-Mode CoreOversampler<br/>• Op-N[Pre] v4 quantize->ZOH -> CoreOversampler Up (Live 15-tap / Master 63/23-tap)<br/>• Native Op-P v4 (128B H1 + g_trk + T1+) & Op-T Reads (tau_eff - D_os >= 5.0)"]
 
-    Crossbar --> SonaCore["Quad-Major 8-Sub Core (5 / 13 / 24 / 37 Tiles) & Split W_ro_head<br/>3-Tap SVF / Pred-Corr PHS -> Smooth ParaLRU -> AlgADAA1 + SE-Bus + GLU -> HB-FIR Down"]
-    SonaCore -->|"pre_conv"| Conv["ModalConvolver v4<br/>32..128 FIR + 2-Basis Morph + ErSparse (8/16) + Onset Kautz"]
+    Crossbar --> SonaCore["Quad-Major 8-Sub Core (5 / 13 / 24 / 37 Tiles), Box2 (Master) & Split W_ro_head<br/>3-Tap SVF / Pred-Corr PHS -> Smooth ParaLRU -> AlgADAA1 + SE-Bus + GLU -> Down"]
+    SonaCore -->|"pre_conv"| Conv["ModalConvolver v4<br/>32..128 FIR (<= 192k) + 2-Basis Morph + ErSparse (8/16) + Onset Kautz"]
     SonaCore -->|"direct_s2"| LoopFB["Op-T v4 (transport, ||G_loop|| < 1)<br/>• 64-fr Inline Quad 0, Convex M_fb, Bipolar g_loop, Causal M_series<br/>• ±64 Hz Ramp, Quad AM, Shimmer, Unitary Freeze & Slot 31 L/R"]
     Conv -->|"conv_out"| LoopFB
-    LoopFB -. "z^-tau (tau_min = 5.0)" .-> Crossbar
+    LoopFB -. "z^-tau (Self-FB tau_min = 5.0)" .-> Crossbar
     LoopFB --> MixOut["Trim, Crossfade & 1e9 Safety -> Host Patchbay M/S Width & Port Out 2/3"]
 
     CtrlDispatch --> Sense & Crossbar & SonaCore & Conv & LoopFB
@@ -530,7 +538,7 @@ flowchart TD
 
 The DSP virtual machine operates across a clean 2-in / 2-out stereo boundary supporting 1 → 1, 2 → 1, 1 → 2, and 2 → 2 channel topologies (REQ-7.4), using voltage-normalized Mid/Side, where `x_mid = 0.5 * (L + R)` and `x_side = 0.5 * (L - R)`, for unity-gain stereo reconstruction. At input, SensoryQuad v4 runs modulated TPT-SVF (`sense_svf_g_oct`), Peak/RMS + ParaLRU + CIC-16 `q3`, Log-Knee VCA `g_vca`, and 4-frame `block_vca_gain[0..4]` with 0° stereo shift and zero fixed crossovers.
 
-Multi-port studio topologies sit cleanly in the outer host engine shell via the 8-Port Patchbay (`4CM`/`7CM`/`WDW`, parallel latency alignment, zero $\mathbf{S}_{\text{ret}\to\text{send}}$ return-to-send isolation, and post-VM M/S width), composing split-point rigs by chaining separate pure 2×2 VM instances:
+Multi-port studio topologies sit cleanly in the outer host engine shell via the 8-Port Patchbay (`4CM`/`7CM`/`WDW`, 1× host-rate parallel latency alignment tracking reported VM latency $D_{\mathrm{os}}$, zero $\mathbf{S}_{\text{ret}\to\text{send}}$ return-to-send isolation, and post-VM M/S width), composing split-point rigs by chaining separate pure 2×2 VM instances:
 
 - **Port In 0..1:** Instrument In Left / Right.
 - **Port In 2..3:** FX Loop Return Left / Right (or Aux Key).
@@ -557,7 +565,7 @@ stateDiagram-v2
     [*] --> Active: Tier T_old Running
     Active --> Admitted: Request T_eff != T_old with Pre-Allocated Cold Storage & WCET Margin
     Active --> Rejected: Insufficient Pre-Allocated Cold Storage or WCET Margin
-    Admitted --> Crossfading: In-Place Prefix/Weight Update (All-Tier 2x HB-FIR Unchanged, Zero Tail Clear), xfade_rem = 48
+    Admitted --> Crossfading: In-Place Prefix/Weight Update (Live/Master CoreOversampler Unchanged, Zero Tail Clear), xfade_rem = 48
     Crossfading --> Active: 48 Frames Elapsed (xfade_rem == 0) -> Commit T_new & Unfreeze prev Latch
     Rejected --> Active: Retain T_old & Report Reason
 ```
@@ -565,7 +573,7 @@ stateDiagram-v2
 | Transition Phase | Normative Execution Requirement |
 | :--- | :--- |
 | **1. Request & Admission** | Resolve effective tier `min(t_req, t_ceiling, t_avail)` against hardware ceiling and pre-allocated cold storage capacity (`REQ-5.4`). Reject non-destructively without allocation if cold ring capacity or WCET margin is unavailable. |
-| **2. In-Place Weight & State Transfer** | Update `CoreQuad`, tile, `LinearReadout`, and `TransportQuad` parameters in-place with zero heap allocations, preserve phase/recursive/control/tempo and `HB-FIR` `OS2X` delay history seamlessly (zero `warm_seed` transients), zero-fill newly unlocked FIR/modal slots, and snap Kautz `prev_oct`. |
+| **2. In-Place Weight & State Transfer** | Update `CoreQuad`, tile, `LinearReadout`, and `TransportQuad` parameters in-place with zero heap allocations, preserve phase/recursive/control/tempo and `CoreOversampler` delay history seamlessly (zero `warm_seed` transients), zero-fill newly unlocked FIR/modal slots, and snap Kautz `prev_oct`. Render mode toggles (`Live` ↔ `Master`) execute in-place without heap allocation by remapping only `CoreQuad` ZOH and `Op-P` `H1` poles. |
 | **3. Active Tail & Lock Preservation** | Keep retained `TransportQuad`, modal, control, continuous `freeze_mix` (`slot 16`), and host write-lock (`bit 2`) state intact across admitted transitions with zero silent buffer wipes. |
 | **4. 48-Frame Frozen-`prev` Linear Crossfade** | Latch `xfade_rem = 48` on transition and freeze the last rendered output `prev` across all 48 frames (`a = f32(xfade_rem) * (1.0 / 48.0)` in unfused `binary32`), guaranteeing 0-ULP split invariance across arbitrary host block sizes. |
 
@@ -596,15 +604,26 @@ stateDiagram-v2
     }
 ```
 
-### 3.5 $4\times$ ZOH Polyphase Oversampling on Offline Bounce
+### 3.5 Core-Only Multirate Offline Rendering (Live and Master)
 
 `r[arch.bounce.oversampling]`
 
-When a DAW host renders offline with automatic tier maximization enabled, the engine promotes to $t_{\text{bounce}} = \min(t_{\text{avail}}, t_{\text{max-sup}})$, sets $f_{s,\mathrm{vm}} = 4 f_{s,\mathrm{host}}$, and bypasses internal `OS2X` so $f_{s,\mathrm{core}} = f_{s,\mathrm{vm}}$ and $\rho_{\mathrm{core}} = \rho_{\mathrm{vm}}$.
+When a host renders live or bounces offline (`REQ-5.5`), the VM perimeter (SensoryQuad, Op-N[Pre], ModalConvolver, Op-T, `ControlBus` GRA, and host-shell alignment) remains unconditionally at $f_{s,\mathrm{vm}} = f_{s,\mathrm{host}}$. Only Op-P v4 and the 4-block `CoreQuad` stack switch between Live and Master modes via `CoreOversampler` with $M_{\mathrm{core}} = \min(M_{\mathrm{target}}, \lfloor 384{,}000.0 / f_{s,\mathrm{host}} \rfloor)$ and $f_{s,\mathrm{core}} = M_{\mathrm{core}} \cdot f_{s,\mathrm{vm}}$, while offline bounce promotes to $t_{\text{bounce}} = \min(t_{\text{avail}}, t_{\text{max-sup}})$.
 
-The entire VM (SensoryQuad v4, TPT-SVF, ParaLRU, `Q0.32` phasors, Op-P v4, Kautz, Op-T v4, and `K_ctrl`) steps uniformly at $4 f_{s,\mathrm{host}}$ through a 2-stage linear-phase half-band polyphase upsampler and downsampler with > 95 dB stopband attenuation and 12 host samples of oversampler PDC (while live all-tier 2× 15-tap HB-FIR OS2X maintains -48.31 dB alias parity vs 4× bounce with 7 1×-samples = 0.146 ms group delay and 0.000° dispersion).
+| Render Mode | Core Factor & Rate (44.1..384 kHz) | Symmetric `HB-FIR` Cascade | Exact Integer `PDC` (`D_os`) | Residence, Cold State & Fidelity |
+| :--- | :--- | :--- | :---: | :--- |
+| **Live** | 2× (44.1..192 kHz), 1× bypass (352.8–384 kHz) | 15-tap Kaiser `β=5.6` (4 odd pairs) | 7 (44.1..192k), 0 (352.8–384k) | Hot L1D (192 B), 0.126 dB <= 18 kHz, -31.9 dB >= 30 kHz, 0.000° dispersion |
+| **Master** | 4× (44.1..96 kHz), 2× (176.4–192 kHz), 1× bypass (352.8–384 kHz) | 63-tap Kaiser `β=10.2` primary `1×↔2×` + 23-tap Minimax `f_p=24k` secondary `2×↔4×` + `z⁻¹@2×` | 37 (44.1..96k), 31 (176.4–192k), 0 (352.8–384k) | Cold Slab (~1.8 KiB FIR + ~1.2 KiB 4-slot ctrl ring `ΔD_up = 16`), <= 0.025 dB <= 20 kHz, -101.0 dB >= 30 kHz / -98.7 dB >= 72 kHz |
 
-Host-shell parallel-alignment groups outside the 2×2 VM promote to 64-tap full-band alignment (31 host samples centering offset, yielding 43 host samples combined nominal PDC per [router_and_crossbar_topology.md](../dsp/router_and_crossbar_topology.md), `ref[dsp.router.parallel-alignment]`). Offline bounce runs on an isolated state or restores live monitoring state and tier upon completion without disturbing active delay histories.
+In Master mode at 4× core rate, CoreQuad nonlinearities evaluate 2-subpanel composite quadrature `Box2` over adjacent `(adaa_odd, adaa_even)` pairs (`0.5 * (A[m] + A[m-1])`, bypassed when `lin_mix = 1`) paired with midpoint `lin_mix` alignment `0.5 * (r_n + r_{n-1})`. For normalized frequency $\omega$, where $\omega = 1$ at $1\times$ Nyquist and $\mathrm{sinc}(x) = \sin(\pi x)/(\pi x)$, this yields -74.8 dB 6.23 kHz alias rejection and -37.6 dB high-gain / -42.6 dB clean / -27.2 dB 24-tone `Live↔Master` parity:
+
+$$
+\bar{y}[m] = 0.5\big(\mathcal{A}[m] + \mathcal{A}[m - 1]\big), \qquad H_{\mathrm{ADAA1}}^{(4)}(\omega)\cdot \frac{1 + e^{-j\pi\omega/4}}{2} = \mathrm{sinc}\left(\frac{\omega}{8}\right)\cos\left(\frac{\pi\omega}{8}\right) e^{-j\pi\omega/4} \equiv \mathrm{sinc}\left(\frac{\omega}{4}\right) e^{-j\pi\omega/4} = H_{\mathrm{ADAA1}}^{(2)}(\omega)
+$$
+
+Crossbar Op-T taps (`opt_to_lr != 0`) serialize effective loop delay `tau_eff >= 42.0` (`>= 0.875 ms` at 48 kHz) so VM rings read `tau_ring_cb = tau_eff - D_os >= 5.0` identically across Live and Master while self-feedback keeps `tau_min = 5.0`. In Master mode, a cold 4-slot microchunk delay ring delays core-bound `ControlBus` snapshots by `ΔD_up = 16` host samples.
+
+Outer host-shell alignment (`HostShellPatchbay`) always runs at 1× $f_{s,\mathrm{host}}$ using reported VM causal latency `D_os` ([router_and_crossbar_topology.md](../dsp/router_and_crossbar_topology.md), `ref[dsp.router.parallel-alignment]`). Both streaming DAW bounce and standalone offline bounce execute the identical causal kernel (0-ULP streaming-to-file identity after `D_os` lead-in strip and trailing zero pad).
 
 ---
 
@@ -614,13 +633,13 @@ Host-shell parallel-alignment groups outside the 2×2 VM promote to 64-tap full-
 
 ```mermaid
 flowchart TD
-    subgraph HostShell ["Host-Shell 8-Port Patchbay (Outside Pure 2x2 VM)"]
-        F7["Family 7: Multi-Input Sidechain / 4CM / 7CM / WDW<br/>• Chained 2x2 VM instances & return isolation<br/>• 64-tap full-band / live parallel alignment & WDW tap"]
+    subgraph HostShell ["Host-Shell 8-Port Patchbay (Outside Pure 2x2 VM, Always 1x f_host)"]
+        F7["Family 7: Multi-Input Sidechain / 4CM / 7CM / WDW<br/>• Chained 2x2 VM instances & return isolation<br/>• 1x 64-tap/16-tap/4-tap alignment tracking D_os & WDW tap"]
     end
 
-    subgraph Crossbar ["Top-of-Frame Crossbar & All-Tier 15-Tap HB-FIR OS2X"]
-        F1["Family 1: Bistables & PLL Synths<br/>• Native 2x Op-P v4: g_trk LPF + 8-Feat T1+ (56 B)<br/>• Smooth Half & Quarter-Angle Sub-Octaves via rsqrt_pos_nr3"]
-        F2["Family 2: Carrier Mod & Stereo Hilbert SSB<br/>• Native 2x H1 (128 B, <= 0.128 deg) + 3-Basis (Decoupled)<br/>• 4x Q0.32 Quadrature Phasors (Slot 31 L/R Stereo AM)"]
+    subgraph Crossbar ["Top-of-Frame Crossbar & 2-Mode CoreOversampler"]
+        F1["Family 1: Bistables & PLL Synths<br/>• Native Op-P v4: g_trk LPF + 8-Feat T1+ (56 B)<br/>• Smooth Half & Quarter-Angle Sub-Octaves via rsqrt_pos_nr3"]
+        F2["Family 2: Carrier Mod & Stereo Hilbert SSB<br/>• Native H1 (128 B, <= 0.128 deg) + 3-Basis (Decoupled)<br/>• 4x Q0.32 Quadrature Phasors (Slot 31 L/R Stereo AM)"]
         F3["Family 3: Pitch Shifters & Shimmer<br/>• Op-T v4: 64-fr Quad 0 + M_fb + M_series + ±64 Hz Ramp<br/>• Bipolar g_loop, Quad AM, Shimmer & Unitary Freeze"]
     end
 
@@ -635,8 +654,8 @@ flowchart TD
 
 | Family | Hardware Archetypes | SONA v4.0 Operator & Crossbar Mapping | Core Zero-FDIV Audio-Rate Formulation | Differentiable GPU/CPU Surrogate | Acceptance Criterion |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Family 1: Bistables & PLL Synths** | Boss OC-2, Mu-Tron Octave Divider, Schumann PLL | Native 2× `Op-P` v4 (`g_trk` LPF + 8-feat `T1+` 56 B) → `CoreQuad`s | Stereo-mid 5 Hz DC blocker, 50 Hz `g_trk` LPF, 32-bit branch-cut guard, `rsqrt_pos_nr3` `T1+` features with decoupled `op_p_to_core` | Native 2× `Op-P` pass with `T1+` smooth phase-difference tracking | Sub-octave frequency/amplitude tracking and zero DC offset |
-| **Family 2: Carrier Mod & Hilbert SSB** | Moog MF-102 Ring Mod, Bode 735 Frequency Shifter | Native 2× `Op-P` v4 (`128 B H1`, 3-basis) + 4× `Q0.32` + `slot 31 L/R` | Native 2× `H1` (`<= 0.128°` across 20 Hz..Nyquist) + decoupled `phasor_to_core` + `slot 31 L/R` stereo AM | Phase-insensitive MR-IIR / 33-band Gabor / SpecOT / IF+GD loss + analytical `Q0.32` carrier | SSB rejection >= 42.0 dB across 100 Hz–10 kHz, clean audio-rate Ring Mod |
+| **Family 1: Bistables & PLL Synths** | Boss OC-2, Mu-Tron Octave Divider, Schumann PLL | Native `f_{s,core}` `Op-P` v4 (`g_trk` LPF + 8-feat `T1+` 56 B) → `CoreQuad`s | Stereo-mid 5 Hz DC blocker, 50 Hz `g_trk` LPF, 32-bit branch-cut guard, `rsqrt_pos_nr3` `T1+` features with decoupled `op_p_to_core` | Native 2× `Op-P` pass with `T1+` smooth phase-difference tracking | Sub-octave frequency/amplitude tracking and zero DC offset |
+| **Family 2: Carrier Mod & Hilbert SSB** | Moog MF-102 Ring Mod, Bode 735 Frequency Shifter | Native `f_{s,core}` `Op-P` v4 (`128 B H1`, 3-basis) + 4× `Q0.32` + `slot 31 L/R` | Native `f_{s,core}` `H1` (`<= 0.128°` across 20 Hz..Nyquist) + decoupled `phasor_to_core` + `slot 31 L/R` stereo AM | Phase-insensitive MR-IIR / 33-band Gabor / SpecOT / IF+GD loss + analytical `Q0.32` carrier | SSB rejection >= 42.0 dB across 100 Hz–10 kHz, clean audio-rate Ring Mod |
 | **Family 3: Polyphonic & Scale Pitch Shifters** | Eventide H3000, DigiTech Whammy, EHX POG | `Op-T` v4 (64-fr Quad 0 + ext, `tau_min = 5.0`, `QuadCtrlRoute`) | Convex `M_fb`, causal `M_series`, ±64 Hz ramp, 3-phase B-spline, quadrature AM, `eta_even` shimmer (`V_ceil = 4.0`), unitary freeze | Continuous Softmax Diatonic Scale Quantizer + Catmull-Rom `∂d/∂μ` | Pitched chord THD+N <= -68 dB and click-free sweep transitions |
 | **Family 4: Hysteretic Dynamics & Ducking** | Boss NS-2, SG-1 Slow Gear, UREI 1176LN, SPL Transient, TC 2290 | `SensoryQuad` v4 (`Log-Knee VCA` + CIC-16) + smooth `ParaLRU` + freeze | Modulated `sense_svf_g_oct`, 0-FDIV Log-Knee VCA `-30..+24 dB`, 4-fr `block_vca_gain`, `C²` `soft_rect` smooth `ParaLRU`, unitary freeze | GL/Möbius scan backward (`<= 8.68e-6` error across 4,096 samples, zero BPTT truncation) | Silence noise floor reduction >= 72 dB; zero gate chatter |
 | **Family 5: Bitcrushers & ZOH Reducers** | E-mu SP-1200, WMD Geiger Counter | `Op-N[Pre]` v4 (`quantize -> ZOH`) + `CoreQuad`s (`AlgADAA1`, `SE-Bus`, `GLU`) | 4-FMA C¹ Hermite quantizer -> decoupled hard-capable `Q0.32` wrap ZOH + `g_pre(v²)` + `AlgADAA1(4096, NR3)` + `SE-Bus` + `GLU` | Analytic `quantize -> ZOH` & `AlgADAA1` gradients (zero STE) | Smooth frequency-aliased folddown and full-rate/fractional latch parity |
@@ -647,13 +666,13 @@ flowchart TD
 
 `r[arch.families.f1-bistables]`
 
-Analog archetypes include the Boss OC-2, Mu-Tron Octave Divider, and Schumann PLL, which use CMOS 4013 dual D-flip-flops and 4046 VCO PLLs to derive $f_0/2$ and $f_0/4$ sub-octaves. SONA realizes this family via native 2× `Op-P` v4 (`T1+`: 1-pole 50 Hz pre-`T1` LPF `g_trk`, 5 Hz stereo DC blocker, 32-bit branch-cut guards, `rsqrt_pos_nr3`, and 8 continuous sub-harmonic features in 56 B with decoupled `op_p_to_core` gating per [op_m_modal_kautz.md §3](../dsp/op_m_modal_kautz.md#3-family-1-sub-harmonic-synthesizers-bistable-dividers--pll-tracking)).
+Analog archetypes include the Boss OC-2, Mu-Tron Octave Divider, and Schumann PLL, which use CMOS 4013 dual D-flip-flops and 4046 VCO PLLs to derive $f_0/2$ and $f_0/4$ sub-octaves. SONA realizes this family via native `f_{s,core}` `Op-P` v4 (`T1+`: 1-pole 50 Hz pre-`T1` LPF `g_trk`, 5 Hz stereo DC blocker, 32-bit branch-cut guards, `rsqrt_pos_nr3`, and 8 continuous sub-harmonic features in 56 B with decoupled `op_p_to_core` gating per [op_m_modal_kautz.md §3](../dsp/op_m_modal_kautz.md#3-family-1-sub-harmonic-synthesizers-bistable-dividers--pll-tracking)).
 
 ### 4.2 Family 2: Audio-Rate Carrier Modulation & Hilbert SSB
 
 `r[arch.families.f2-hilbert-ssb]`
 
-Analog archetypes include the Moog MF-102 Ring Modulator and Bode 735 Frequency Shifter built around 4-quadrant multipliers and dual 90° dome networks. SONA pairs native 2× stereo `H1` (128 B hot state, <= 0.128° phase error across 20 Hz..Nyquist without rate-bridge workarounds) and a decoupled 3-basis carrier with 4-lane `Q0.32` quadrature phasors and `slot 31 L/R` stereo differential AM per [op_m_modal_kautz.md §2](../dsp/op_m_modal_kautz.md#2-family-2-hilbert-ssb-lattice--carrier-modulation).
+Analog archetypes include the Moog MF-102 Ring Modulator and Bode 735 Frequency Shifter built around 4-quadrant multipliers and dual 90° dome networks. SONA pairs native `f_{s,core}` stereo `H1` (128 B hot state, <= 0.128° phase error across 20 Hz..Nyquist without rate-bridge workarounds) and a decoupled 3-basis carrier with 4-lane `Q0.32` quadrature phasors and `slot 31 L/R` stereo differential AM per [op_m_modal_kautz.md §2](../dsp/op_m_modal_kautz.md#2-family-2-hilbert-ssb-lattice--carrier-modulation).
 
 ### 4.3 Family 3: Polyphonic Phase-Locked & Intelligent Scale Pitch Shifters
 
@@ -683,7 +702,7 @@ Analog archetypes include the EMS Vocoder 2000, EHX Talking Pedal, and Maestro S
 
 `r[arch.families.f7-multi-input]`
 
-Rig topologies include external 4CM/7CM dual-amp loops, auxiliary key sidechain compression and gating, and Wet-Dry-Wet (WDW) rigs. The outer host engine shell wraps an 8-Port Patchbay enforcing strict return-to-send isolation, pre-spatial-core or direct-dry WDW tapping (`ref[dsp.router.wdw-contract]`), and 64-tap full-band, 16-tap low-latency, or 4-tap minimal-latency parallel alignment (`ref[dsp.router.parallel-alignment]`) around pure 2-in / 2-out VM instances.
+Rig topologies include external 4CM/7CM dual-amp loops, auxiliary key sidechain compression and gating, and Wet-Dry-Wet (WDW) rigs. The outer host engine shell wraps an 8-Port Patchbay strictly at 1× host rate enforcing return-to-send isolation, pre-spatial-core or direct-dry WDW tapping (`ref[dsp.router.wdw-contract]`), and 64-tap full-band, 16-tap low-latency, or 4-tap minimal-latency parallel alignment tracking reported VM latency $D_{\mathrm{os}}$ (`ref[dsp.router.parallel-alignment]`) around pure 2-in / 2-out VM instances.
 
 Inside each 2-in / 2-out VM instance, `SensoryQuad` v4 runs four modulated `TPT-SVF` + Peak/RMS + `ParaLRU` + CIC-16 sensing lanes feeding Unified Log-Knee VCA and 4-frame `block_vca_gain[0..4]` alongside per-`CoreQuad` Mid/Side coupling.
 
@@ -705,7 +724,7 @@ SONA v4.0 serializes SensoryQuad v4 (`sense_svf_g_oct`, Peak/RMS, Log-Knee VCA),
 
 Core output structures additionally serialize SE-Bus, GLU, 5/13/24/37 tiles (`g_edge[0..6]`), ModalConvolver v4 (FIR, 2-basis morph, `ErSparseBank`, onset Kautz), compact `fp16` `W_ro,0` (`REQ-8.5`), and split `W_ro_head`.
 
-It additionally serializes Op-T v4 (64-frame Quad 0, `M_fb`, bipolar `g_loop`, `M_series`, quadrature AM, ±64 Hz ramp, 3-phase B-spline, shimmer, unitary freeze), `Op-N[Pre]` v4 (`quantize -> ZOH`), native 2× Op-P v4 (H1, `g_trk` LPF, T1+, decoupled crossbar gates), and the 2,048 B ControlBus v4 GRA arena (6,336 B reclaimed; [webgpu_and_varpro_solver.md §4.1](../training/webgpu_and_varpro_solver.md#41-zero-ulp-engine-capture-isomorphism-parity)).
+It additionally serializes Op-T v4 (`tau_eff >= 42.0` crossbar / `tau_min = 5.0` self-FB, 64-frame Quad 0, `M_fb`, bipolar `g_loop`, `M_series`, quadrature AM, ±64 Hz ramp, 3-phase B-spline, shimmer, unitary freeze), `Op-N[Pre]` v4 (`quantize -> ZOH`), native Op-P v4 (H1, `g_trk` LPF, T1+, decoupled crossbar gates), and the deterministic 2,048 B ControlBus v4 GRA arena (6,336 B + 24 B reclaimed; [webgpu_and_varpro_solver.md §4.1](../training/webgpu_and_varpro_solver.md#41-zero-ulp-engine-capture-isomorphism-parity)).
 
 ### 5.3 Split-Precision 32-Bit WebGPU & 64-Bit Host VarPro Pipeline
 
@@ -743,13 +762,15 @@ Captured models persist v4.0 `"sona"` runtime weights (`WGHT`), cached `StarCent
 
 `r[arch.refinements.summary]`
 
-Causal $\tau_{\min} = 5.0$ Op-T reads sit ahead of `Op-N[Pre]` v4 (`quantize -> ZOH`), all-tier 15-tap HB-FIR OS2X, and native 2× Op-P v4 (128 B H1 + `g_trk` + T1+ with decoupled gates), while Op-T v4 enforces convex `M_fb`, bipolar `g_loop`, causal `M_series`, `eta_even` shimmer, quadrature AM, and unitary `freeze_mix`.
+Causal `tau_eff >= 42.0` Op-T crossbar reads (`tau_ring_cb = tau_eff - D_os >= 5.0`; self-FB `tau_min = 5.0`) sit ahead of Op-N[Pre] v4 (`quantize -> ZOH`), 2-mode `CoreOversampler` (Live 2× 15-tap / Master 4× 63/23-tap + `Box2`), and native Op-P v4 (128 B H1 + `g_trk` + T1+ with decoupled gates).
 
-Pre-core SensoryQuad v4 (CIC-16 `q3`, Log-Knee VCA, `block_vca_gain[0..4]`) and Quad-Major `CoreQuad`s (3-tap SVF + Pred-Corr PHS, smooth ParaLRU, `g_pre(v²)` + `AlgADAA1(4096)` + SE-Bus + GLU, explicit `rect_sign_mask`, 6 scalar `g_edge[0..6]`, and split `W_ro_head`) anchor the unconditional core.
+Meanwhile, Op-T v4 enforces convex `M_fb`, bipolar `g_loop`, causal `M_series`, `eta_even` shimmer, quadrature AM, and unitary `freeze_mix` at 1× host rate (<= 192 kHz Schroeder/FIR cap).
+
+Pre-core SensoryQuad v4 (CIC-16 `q3`, Log-Knee VCA, `block_vca_gain[0..4]`) and Quad-Major CoreQuads (3-tap SVF + Pred-Corr PHS, smooth ParaLRU, `g_pre(v²)` + `AlgADAA1(4096)` + `Box2` in Master + SE-Bus + GLU, explicit `rect_sign_mask`, 6 scalar `g_edge[0..6]`, and split `W_ro_head`) anchor the unconditional core.
 
 These operators compose identically across CPU SIMD execution (4-frame causal micro-chunks synced to `K_ctrl(44.1k) = 16`, target-ISA 256-bit SIMD dispatch) and compiled GPU compute shaders using `pass0` binary-tree reductions (`<= 15.0 KiB` SRAM), `GL/Möbius` backward scans, and signed 32-bit Ozaki reductions.
 
-Execution-ordered cache-locked working sets (4,432 B Lite 2× `14× = 60.59 KiB <= 64 KiB` and `<= 8,192 / 16,384 / 32,768 B` ceilings, zero `cold.hoisted_core`) and 64-byte-aligned binary arenas (reclaiming 6,336 B across non-Tardos/non-`SO(4)` slabs) keep `.dnam-bin` Arena 0 control-complete (`REQ-5.6`).
+Execution-ordered cache-locked working sets (4,432 B Lite 2× `14× = 60.59 KiB <= 64 KiB` and `<= 8,192 / 16,384 / 32,768 B` ceilings, zero `cold.hoisted_core`) and 64-byte-aligned binary arenas (reclaiming 6,336 B + 24 B across non-Tardos/non-`SO(4)` slabs) keep `.dnam-bin` Arena 0 control-complete (`REQ-5.6`).
 
 ### 5.8 Canonical SONA Requirement Realization Matrix (`REQ-1`–`REQ-8.8`)
 
@@ -757,7 +778,7 @@ Execution-ordered cache-locked working sets (4,432 B Lite 2× `14× = 60.59 KiB 
 
 | Goal ID | Requirement Domain | SONA v4.0 Architectural Realization | Canonical Specifications |
 | :--- | :--- | :--- | :--- |
-| **`REQ-1`** | **Model Classes & Accuracy** | Top-of-Frame Crossbar (`SensoryQuad` v4, `Op-N[Pre]` v4, 15-tap `HB-FIR` `OS2X`, native 2× `Op-P` v4, `Op-T` `tau_min = 5.0`) + Quad-Major `CoreQuad`s + `ModalConvolver` v4 + `Op-T` v4. | [op_t_transport.md](../dsp/op_t_transport.md), [op_m_modal_kautz.md](../dsp/op_m_modal_kautz.md), [op_n_paralru_and_polyadaa.md](../dsp/op_n_paralru_and_polyadaa.md) |
+| **`REQ-1`** | **Model Classes & Accuracy** | Top-of-Frame Crossbar (`SensoryQuad` v4, `Op-N[Pre]` v4, 2-mode `CoreOversampler`, native `Op-P` v4, `Op-T` `tau_eff >= 42.0` / self-FB `tau_min = 5.0`) + Quad-Major `CoreQuad`s + `ModalConvolver` v4 (`<= 192 kHz`) + `Op-T` v4. | [op_t_transport.md](../dsp/op_t_transport.md), [op_m_modal_kautz.md](../dsp/op_m_modal_kautz.md), [op_n_paralru_and_polyadaa.md](../dsp/op_n_paralru_and_polyadaa.md) |
 | **`REQ-1.5`** | **Full-Rig Multi-Control Modeling** | Self-contained 2,048 B `ControlBus` v4 `GRA` (`[stage_targets(32), z_stage(8), z_head(8), g_edge(6), op_t_q(16)]`, `slot 31 L/R` stereo AM) + 4-frame micro-ramp (`K_ctrl = 16` @ 44.1/48 kHz). | [parametric_control_bus.md](../dsp/parametric_control_bus.md), [webgpu_and_varpro_solver.md](../training/webgpu_and_varpro_solver.md) |
 | **`REQ-1.9`** | **Universal Black-Box Runtime & Solver** | Fixed unconditional tier basis parameterized strictly by learned weights (`ref[arch.pillars.universal-black-box]`, `ref[repo.code.universal-black-box]`), zero white-box sub-circuits, zero bypass flags, and data-driven ID. | [sona_architecture.md §1.1](#11-four-foundational-pillars-of-sona), [project_and_documentation_quality.md §1](project_and_documentation_quality.md#1-static-type-safety--package-import-boundaries) |
 | **`REQ-2`** | **Quality, Control Bus & Tempo Sync** | Per-output noise-adjusted bESR, MR-IIR, 33-band LTAS, SegESR (§4 floors surpassed to `\|ΔbESR\| < 0.01 dB/epoch` per `ref[qual.tiers.floors-not-stopping-criteria]`), and `O(P+M)` convex-hull BIBO clamping. | [psychoacoustic_quality_and_tiers.md](psychoacoustic_quality_and_tiers.md), [control_space_audit.md](../training/control_space_audit.md) |
@@ -781,11 +802,11 @@ The tables below index every canonical specification and active architectural de
 | :--- | :--- | :--- |
 | **Architecture** | [psychoacoustic_quality_and_tiers.md](psychoacoustic_quality_and_tiers.md) | Noise-adjusted bESR, MR-IIR, LTAS, SegESR, and 4-tier quality floors (`ref[qual.tiers.floors-not-stopping-criteria]`, 18-archetype black-box summary). |
 | **Architecture** | [project_and_documentation_quality.md](project_and_documentation_quality.md) | Repository 5-layer diamond code boundaries, strict typing, modular decomposition, constant evaluation, black-box purity, and documentation guardrails (`r[repo.*]`). |
-| **Real-Time DSP** | [op_t_transport.md](../dsp/op_t_transport.md) | `Op-T` v4 (64-fr Quad 0 + ext, per-quad routing, convex `M_fb`, bipolar `g_loop`, causal `M_series`, ±64 Hz ramp, 3-phase B-spline, quad AM, shimmer, unitary freeze). |
-| **Real-Time DSP** | [op_m_modal_kautz.md](../dsp/op_m_modal_kautz.md) | Modulated `TPT-SVF`, native 2× `Op-P` v4 (`128 B H1`, `g_trk` LPF, 8-feat `T1+`, decoupled gates), `ModalConvolver` v4 (FIR, 2-basis morph, `ErSparseBank`, Kaiser high-SR, onset Kautz). |
-| **Real-Time DSP** | [op_n_paralru_and_polyadaa.md](../dsp/op_n_paralru_and_polyadaa.md) | 3-tap folded `TPT-SVF` + Pred-Corr `PHS` (`LR4`), `Op-N[Pre]` v4 (`quantize -> ZOH`), `C²` `soft_rect` smooth `ParaLRU` (GL/Möbius bwd), `g_pre(v²)` + `AlgADAA1(4096)` + `SE-Bus` + `GLU`, `rect_sign_mask`. |
-| **Real-Time DSP** | [router_and_crossbar_topology.md](../dsp/router_and_crossbar_topology.md) | Pure 2×2 VM (`SensoryQuad` v4 Log-Knee VCA, crossbar, all-tier 15-tap `HB-FIR` `OS2X`, Quad-Major `CoreQuad`s, `ModalConvolver` v4, split `W_ro_head`, `Op-T` v4), host 8-Port Patchbay, and ZOH. |
-| **Real-Time DSP** | [parametric_control_bus.md](../dsp/parametric_control_bus.md) | 2,048 B `ControlBus` v4 `GRA` (`SwiGLU` + `Padé-[1/1]` + anchored 1.5-Entmax, `O(P+M)` BIBO hull), `K_ctrl(44.1k)=16`, 4-frame micro-ramp, `slot 31 L/R`, and live `TSYN` lock. |
+| **Real-Time DSP** | [op_t_transport.md](../dsp/op_t_transport.md) | `Op-T` v4 (`tau_eff >= 42.0` crossbar / `tau_min = 5.0` self-FB, 64-fr Quad 0 + ext `1× f_host`, per-quad routing, convex `M_fb`, bipolar `g_loop`, causal `M_series`, ±64 Hz ramp, 3-phase B-spline, quad AM, shimmer, unitary freeze). |
+| **Real-Time DSP** | [op_m_modal_kautz.md](../dsp/op_m_modal_kautz.md) | Modulated `TPT-SVF`, native `Op-P` v4 (`128 B H1`, `g_trk` LPF, 8-feat `T1+`, decoupled gates), `ModalConvolver` v4 (FIR, 2-basis morph, `ErSparseBank`, Kaiser high-SR `<= 192 kHz`, onset Kautz). |
+| **Real-Time DSP** | [op_n_paralru_and_polyadaa.md](../dsp/op_n_paralru_and_polyadaa.md) | 3-tap folded `TPT-SVF` + Pred-Corr `PHS` (`LR4`), `Op-N[Pre]` v4 (`quantize -> ZOH`), `C²` `soft_rect` smooth `ParaLRU` (GL/Möbius bwd), `g_pre(v²)` + `AlgADAA1(4096)` + `Box2` + `SE-Bus` + `GLU`, `rect_sign_mask`. |
+| **Real-Time DSP** | [router_and_crossbar_topology.md](../dsp/router_and_crossbar_topology.md) | Pure 2×2 VM at `f_{s,vm} == f_{s,host}` (`SensoryQuad` v4 Log-Knee VCA, `tau_eff >= 42.0` crossbar, 2-mode `CoreOversampler` `Live`/`Master`, Quad-Major `CoreQuad`s, `ModalConvolver` v4, split `W_ro_head`, `Op-T` v4), 1× host 8-Port Patchbay via `D_os`, and ZOH. |
+| **Real-Time DSP** | [parametric_control_bus.md](../dsp/parametric_control_bus.md) | Deterministic 2,048 B `ControlBus` v4 `GRA` (+24 B reclaimed, `SwiGLU` + `Padé-[1/1]` + anchored 1.5-Entmax, `O(P+M)` BIBO hull), `K_ctrl(44.1k)=16`, 4-frame micro-ramp, `Master` 4-slot cold ctrl delay ring, `slot 31 L/R`, and live `TSYN` lock. |
 | **Training & Audit** | [webgpu_and_varpro_solver.md](../training/webgpu_and_varpro_solver.md) | SONA split-precision 32-bit WebGPU (`<= 15.0 KiB` SRAM, non-causal `Perceiver IO` teacher per `REQ-4.3`) and 64-bit host VarPro solver pipeline. |
 | **Training & Audit** | [iterative_resume_and_caching.md](../training/iterative_resume_and_caching.md) | Dual-space factored control stem resume and Two-Path Vault editing. |
 | **Training & Audit** | [control_space_audit.md](../training/control_space_audit.md) | Non-stop 3-phase control-space audit and automatic clamping. |
@@ -812,3 +833,4 @@ The tables below index every canonical specification and active architectural de
 | [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md) | SONA state-space operator and WebGPU architecture |
 | [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md) | SONA v4.0 kernel refinements, 15-tap HB-FIR, perimeter v4, and ControlBus GRA |
 | [ADR-0025](../../adr/0025-unified-runtime-and-non-causal-trainer-attention.md) | Unified runtime and non-causal Perceiver IO trainer attention |
+| [ADR-0026](../../adr/0026-core-only-multirate-offline-and-crossbar-latency-invariance.md) | Core-Only 2-mode multirate (`Live`/`Master` + `Box2`), latency-invariant `tau_eff >= 42.0` crossbar, and deterministic ControlBus GRA |

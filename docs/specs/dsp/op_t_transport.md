@@ -14,15 +14,16 @@ adrs:
   - ADR-0019
   - ADR-0022
   - ADR-0024
+  - ADR-0026
 ---
 
 # Op-T: Universal Transport, Granular Windowing & All-Pass Diffusion Operator
 
-This specification defines Op-T (Transport), governing causal top-of-frame fractional delay reads (tau_min = 5.0 samples across 4-frame crossbar/TransportQuad micro-chunks and tau[n] >= 4.0 on standalone single-sample rings) along with pitch-warped granular windows and wired 3-phase B-spline barberpole phase sweeps across Dynamic Neural Audio Modeler (DNAM) SONA v4.0.
+This specification defines Op-T (Transport), governing causal top-of-frame fractional delay reads (`tau_eff >= 42.0` on crossbar taps for `tau_ring_cb = tau_eff - D_os >= 5.0`, `tau_min = 5.0` on self-feedback `TransportQuad` micro-chunks, and `tau[n] >= 4.0` on standalone single-sample rings) along with pitch-warped granular windows and wired 3-phase B-spline barberpole phase sweeps across Dynamic Neural Audio Modeler (DNAM) SONA v4.0.
 
 Op-T additionally specifies bounded-history coercive feedback loops with passive convex `M_fb`, bipolar `g_loop`, causal series coupling `M_series`, per-quad `ControlBus` routing, shimmer, unitary freeze, and fused `SO(4)` paraunitary Schroeder diffusion ([sona_architecture.md](../architecture/sona_architecture.md), [REQ-1.4, REQ-6.2](../../requirements/system_goals_and_requirements.md)).
 
-Every SONA Op-T read executes inside a single unified continuous 4-lane Top-of-Frame Causal Operator Crossbar pipeline before the 4-block Matryoshka core, while coercive loop writes update delay rings at frame end. This unified placement expresses pre-drive chorus, polyrhythmic rotary modulation with quadrature AM, and reverb-into-fuzz chains alongside post-core tape/BBD echoes, granular pitch shifters, barberpole sweeps, and shimmer/unitary holds strictly via learned weights ([ADR-0006](../../adr/0006-model-declared-delays-and-tank-feedback-guard.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md)).
+Every SONA Op-T read executes at `f_{s,vm} == f_{s,host}` inside a unified continuous 4-lane Top-of-Frame Causal Operator Crossbar pipeline before the `CoreOversampler` and 4-block Matryoshka core, while coercive loop writes update delay rings at frame end. This unified placement expresses pre-drive chorus, polyrhythmic rotary modulation with quadrature AM, and reverb-into-fuzz chains alongside post-core tape/BBD echoes, granular pitch shifters, barberpole sweeps, and shimmer/unitary holds strictly via learned weights ([ADR-0006](../../adr/0006-model-declared-delays-and-tank-feedback-guard.md), [ADR-0022](../../adr/0022-sona-state-space-operator-and-webgpu-architecture.md), [ADR-0024](../../adr/0024-sona-v4-kernel-hb-fir-perimeter-and-control-bus-gra.md), [ADR-0026](../../adr/0026-core-only-multirate-offline-and-crossbar-latency-invariance.md)).
 
 ---
 
@@ -50,7 +51,7 @@ Op-T separates standalone arbitrary-length delay lines with block max-tree feedb
 
 In compact `TransportQuad`s, Quad 0 places short lines (such as primes `[53]` and up to 56 samples) inline inside the 64-byte-aligned hot working set as 64 frame-major `fp16` vectors (512 B = 8 cache lines, fitting Lite 2× inside 4,432 B active-hot L1D), requiring zero heap allocations when `max_delay <= 56` and `req_frames[0] <= 64`.
 
-Longer lines (up to 48,000 reference samples at 48 kHz and 524,288 power-of-two capacity covering 8× rate headroom up to 384 kHz) allocate power-of-two cold external delay buffers during load (`cap >= 128`) and wrap via bitmask `& (cap - 1)` with zero division.
+Longer lines (up to 48,000 reference samples at 48 kHz executing unconditionally at `f_{s,vm} == f_{s,host} <= 192 kHz`, capping 1 s expansion at 262,144 frames with up to 524,288 power-of-two capacity for longer tails without 384 kHz perimeter inflation) allocate power-of-two cold external delay buffers during load (`cap >= 128`) and wrap via bitmask `& (cap - 1)` with zero division.
 
 | Tier Profile | Quads | Delay Lines (M) | Inline Quad 0 (Hot Working Set) | Cold External Buffer Format |
 | :--- | :---: | :---: | :--- | :--- |
@@ -63,12 +64,12 @@ Each `TransportQuad` is serialized in the tier arena as a 128-byte little-endian
 
 | Wire Offset | Bytes | LE Type | Field Name | Clean-Room Role & Cold-Load Constraint |
 | :---: | :---: | :--- | :--- | :--- |
-| 0..16 | 16 | `f32le[4]` | `delay_samples[4]` | 48 kHz base per-lane delays (`[5.0, 48,000.0]` on crossbar/`TransportQuad`s) |
-| 16..32 | 16 | `f32le[4]` | `ramp_spans_samples[4]` | 48 kHz base ramp spans per lane (`f32` avoids `fp16` overflow at 384 kHz; modulatable via `ControlBus`) |
+| 0..16 | 16 | `f32le[4]` | `delay_samples[4]` | 48 kHz base per-lane delays (`[5.0, 48,000.0]` on self-feedback `TransportQuad`s; serialized `tau_eff` in `[42.0, 48,000.0]` on crossbar taps) |
+| 16..32 | 16 | `f32le[4]` | `ramp_spans_samples[4]` | 48 kHz base ramp spans per lane (`f32` avoids `fp16` overflow at `<= 192 kHz` host rates; modulatable via `ControlBus`) |
 | 32..56 | 24 | 6 × `f32le` | `g_loop`, `r_dc`, `damp_pole`, `lfo_rate_hz`, `ramp_rate_hz`, `reserved_52_56` | Bipolar loop feedback in `[-0.9990, +0.9990]`, 5 Hz DC pole, HF damp pole, LFO rate `[0, 16]` Hz, ramp rate `[-64.0, +64.0]` Hz, and reserved 0.0 at 52..56 |
 | 56..112 | 56 | 7 × `u16le[4]` | `lfo_depths_fp16[4]`, `lfo_phase_off_q16[4]`, `ramp_phase_off_q16[4]`, `input_gains_fp16[4]`, `wet_tap_l_fp16[4]`, `wet_tap_r_fp16[4]`, `allpass_g_fp16[4]` | Per-lane LFO depths/offsets, ramp phase offsets, injection gains, L/R wet tap gains, and Schroeder `allpass_g` in `[-0.75, 0.75]` |
 | 112..122 | 10 | 5 × `u16le` | `fb_psi_fp16`, `sigma_knee_fp16`, `freeze_mix_fp16`, `window_depth_fp16`, `scat_psi_fp16` | Givens rotation, unified loop limiter ceiling, passive `freeze_mix`, window depth, and `SO(4)` paraunitary scattering angle `[-pi, +pi]` (default 0.0) |
-| 122..126 | 4 | `u8[4]` | `allpass_delays[4]` | 48 kHz base Schroeder lengths <= 255; expanded into rate-scaled integer host buffers on load up to 16,384 samples at 384 kHz |
+| 122..126 | 4 | `u8[4]` | `allpass_delays[4]` | 48 kHz base Schroeder lengths <= 255; expanded into rate-scaled integer host buffers on load at 1× `f_{s,host}` (`<= 4,096` samples up to 192 kHz) |
 | 126..127 | 1 | `u8` | `flags` | Bit 0 = 0 reserved, bit 1 = `ext_f32` (`0 = fp16`, `1 = f32` ring precision for this quad; logical OR sets cold sizing `ext_ring_format`); bits 2..7 strictly 0 (zero discrete stage-bypass, mode, or freeze bits) |
 | 127..128 | 1 | `u8` | `_pad` | Reserved pad byte; must equal `0x00` |
 
@@ -81,7 +82,7 @@ At runtime, each pure-wet active `TransportQuad` occupies a 216-byte 8-byte-alig
 | 96..144 | 48 | 5 × 32-bit + 7 × `f32` | `write_ptr: u32`, `lfo_phase_q32: u32`, `lfo_inc_q32: u32`, `ramp_phase_q32: u32`, `ramp_inc_q32: i32`, `g_loop`, `r_dc`, `damp_pole`, `current_psi`, `cos_psi`, `sin_psi`, `wet_dc_pole` | Backward write cursor, LFO/ramp accumulators, loop/wet DC and damp poles, and cached Givens `(cos, sin)` |
 | 144..216 | 72 | `u16`/`u8` + pad | `we_hold_off[4]: u16` (inline hold offset; 32-bit counters in cold storage when `HAS_EXT`), `lfo_phase_off_q16[4]`, `ramp_phase_off_q16[4]`, `lfo_depths_fp16[4]`, `input_gains_fp16[4]`, `wet_tap_l_fp16[4]`, `wet_tap_r_fp16[4]`, 6 scalar `fp16` (`window_depth_fp16`, `freeze_mix_fp16`, `sigma_sat_fp16`, `inv_sigma_23_fp16`, `half_alpha_cubic_fp16`, `base_psi_fp16`), `flags: u8`, `_pad8: u8`, `_pad16: u16` | Hold offsets, per-lane Q16/`fp16` gains, scalar `fp16` params (`inv_sigma_23 = 2/(3*sigma_sat)`), and `flags` (`bit 0 = 0` reserved, `bit 1 = HAS_EXT`, `bit 2 = HOST_WRITE_LOCK`, bits 3..7 = 0) |
 
-All active crossbar and `TransportQuad` blocks execute at `f_{s,vm}` (`rho_vm = 48_000.0 / f_{s,vm}`) and enforce the causal delay floor `tau_min = 5.0` samples (`delay_int >= 5`) at Top-of-Frame so 4-tap Catmull-Rom accesses remain at least 4 samples behind the newest frame in each 4-frame causal micro-chunk (`i_m1 = write_idx + 1 - delay_int <= write_idx - 4`). This preserves 0-ULP equivalence between 1-frame and 4-frame micro-chunk stepping (`ref[dsp.op-t.ring.q0-32-pointer]`), while standalone single-sample rings allow `tau >= 4.0`.
+All active crossbar and TransportQuad blocks execute at `f_{s,vm} == f_{s,host}` (`rho_vm = 48_000.0 / f_{s,vm}`), enforcing `tau_eff >= 42.0` (`tau_ring_cb = tau_eff - D_os >= 5.0`) on crossbar taps and tau_min = 5.0 (`delay_int >= 5`) on self-feedback TransportQuads so 4-tap Catmull-Rom accesses remain at least 4 samples behind the newest frame in each 4-frame micro-chunk (`i_m1 = write_idx + 1 - delay_int <= write_idx - 4`). This preserves 0-ULP equivalence between 1-frame and 4-frame stepping (`ref[dsp.op-t.ring.q0-32-pointer]`), while standalone rings allow `tau >= 4.0`.
 
 At rate ratio $\rho_{\mathrm{vm}} = 48{,}000 / f_{s,\mathrm{vm}}$ (`scale = 1.0 / rho_vm`), each active quad $q \in [0, P_Q)$ deterministically computes external buffer selection `has_ext[q]` (hot `flags` bit 1 `HAS_EXT`) and power-of-two ring capacity `cap[q]` from wire fields, `declared_max_delay_48k`, and `ext_ring_pow2_frames`:
 
@@ -99,9 +100,9 @@ Active `TransportQuad` blocks rescale and clamp runtime parameters at cold load 
 
 | Parameter | Clamped Cold-Load Domain | Notes & Invariants |
 | :--- | :--- | :--- |
-| `delay_samples[0..4]` | `[5.0, max_tau]` at `f_{s,vm}` (`[4.0, max_tau]` standalone) | ZOH-rescaled by `1 / rho_vm` from 48 kHz `[5.0, 48,000.0]`; `max_tau = cap - 3` if modulated else `cap - 2` |
+| `delay_samples[0..4]` | `[5.0, max_tau]` self-FB; `[42.0 - D_os, max_tau]` crossbar (`[4.0, max_tau]` standalone) | ZOH-rescaled by `1 / rho_vm` from 48 kHz (`[5.0, 48,000.0]` self-FB or `[42.0, 48,000.0]` crossbar); `max_tau = cap - 3` if modulated else `cap - 2` |
 | `ramp_spans_samples[0..4]` | `[0.0, max_span]` samples | ZOH-rescaled by `1 / rho_vm` on cold load and modulatable via `ControlBus` `ramp_span_scale[q]`; `max_span = max(0.0, max_tau - 5.0)` |
-| `allpass_delays[0..4]` | `[0, 16,384]` samples | 48 kHz `u8 <= 255`; 0 sets `A_k` to unity with `y_1,k = x_1,k` and zero cold ring accesses while `R_even`/`R_odd` still run whenever not in full hold, with `[0; 4]` allocating 0 B cold ring RAM; nonzero lengths expand via `max(1, round(D_48k / rho_vm))` |
+| `allpass_delays[0..4]` | `[0, 4,096]` samples (`<= 192 kHz`) | 48 kHz `u8 <= 255`; 0 sets `A_k` to unity with `y_1,k = x_1,k` and zero cold ring accesses while `R_even`/`R_odd` still run whenever not in full hold, with `[0; 4]` allocating 0 B cold ring RAM; nonzero lengths expand via `max(1, round(D_48k / rho_vm))` |
 | `allpass_g_fp16[0..4]` | `[-0.75, 0.75]` | Per-lane Schroeder all-pass coefficients tapered by `(1 - mu_freeze)` during feedback recirculation |
 | `g_loop` | `[-MAX_LOOP_GAIN_F32, +MAX_LOOP_GAIN_F32]` | Bipolar signed gain bounded by `±0x3F7F_BE76` (±0.9990) with `|g_loop_eff|` clamped by pitch-down energy limit (§2) |
 | `sigma_knee_fp16` | `[1.0e-3, 4.0]` (`V_ceil = 4.0`) | Unified loop saturator ceiling `sigma_sat` (lifted to support passive shimmer headroom up to `V_ceil = 4.0`) with cold `inv_sigma_23 = 2 / (3 * sigma_sat)` |
@@ -133,11 +134,11 @@ Inside each active transport quad, `lfo_phase_q32` and `ramp_phase_q32` execute 
 
 Per-lane LFO output $s_{\phi,k}$ evaluates `q32_smooth_sin` using per-lane `lfo_rate_ratio_fp16[k]` multipliers on `lfo_phase_q32` plus `lfo_phase_off_q16[k]`, enabling polyrhythmic chorus ratios. Sawtooth phase $\phi_{\mathrm{ramp},k} \in [0, 1)$ evaluates at `ramp_phase_q32 + (u32(ramp_phase_off_q16[k]) << 16)` ahead of increment wraps, while paired LFO quadrature `(c_k, s_k)` drives optional quadrature AM (`am_depth` in 2 FMAs/sample) on wet taps.
 
-Each VM frame combines cold ZOH-rescaled `delay_samples[k]`, per-quad octave scaling `delay_oct[q]`, LFO and modulatable ramp sweeps `(ramp_spans_samples[k] * ramp_span_scale[q]) * (phi_ramp,k - 0.5)`, and `tank_delay_mod` (`stage_targets[12]` in 48 kHz samples converted via `1 / rho_vm`), clamped inside `[5.0, max_tau]`:
+Each VM frame combines cold ZOH-rescaled `delay_samples[k]`, per-quad octave scaling `delay_oct[q]`, LFO and modulatable ramp sweeps `(ramp_spans_samples[k] * ramp_span_scale[q]) * (phi_ramp,k - 0.5)`, and `tank_delay_mod` (stage_targets[12] in 48 kHz samples converted via 1 / rho_vm), subtracting `D_os` on crossbar taps and clamping to `[tau_floor, max_tau]` (tau_floor = 5.0):
 
-$$\tau_k[n] = \mathrm{clamp}\left(D_k \cdot 2^{\mathrm{clamp}(\Delta_{\mathrm{oct},q}, -3.0, +3.0)} + d_{\mathrm{lfo},k} s_{\phi,k} + S_{\mathrm{span},k,q}\big(\phi_{\mathrm{ramp},k} - 0.5\big) + \Delta_{\mathrm{ctrl,48k}} \cdot \frac{1}{\rho_{\mathrm{vm}}},\ 5.0,\ \tau_{\max}\right)$$
+$$\tau_k[n] = \mathrm{clamp}\left(D_k \cdot 2^{\mathrm{clamp}(\Delta_{\mathrm{oct},q}, -3.0, +3.0)} + d_{\mathrm{lfo},k} s_{\phi,k} + S_{\mathrm{span},k,q}\big(\phi_{\mathrm{ramp},k} - 0.5\big) + \Delta_{\mathrm{ctrl,48k}} \cdot \frac{1}{\rho_{\mathrm{vm}}} - D_{\mathrm{os,tap}},\ 5.0,\ \tau_{\max}\right)$$
 
-Here $\Delta_{\mathrm{oct}} =$ `stage_targets[17]` (`op_t_delay_scale_oct`) clamps before exponentiation as `2^clamp(stage_targets[17], -3.0, +3.0)`, while $\Delta_{\mathrm{ctrl,48k}} =$ `stage_targets[12]` rescales 48 kHz samples into VM frames. Upper bound $\tau_{\max} = \mathtt{cap} - 3$ applies when modulated (`lfo_depths`, `ramp_spans`, `|stage_targets[17]| > 1.0e-6`, or $|\Delta_{\mathrm{ctrl,48k}}| > 10^{-6}$ nonzero), and $\tau_{\max} = \mathtt{cap} - 2$ otherwise.
+Here $D_{\mathrm{os,tap}} = D_{\mathrm{os}}$ on causal crossbar taps (serialized $\tau_{\mathrm{eff}} \ge 42.0$ ) and $0$ on self-feedback rings; $\Delta_{\mathrm{oct}} =$ `stage_targets[17]` (`op_t_delay_scale_oct`) clamps to `2^clamp(stage_targets[17], -3.0, +3.0)`, while $\Delta_{\mathrm{ctrl,48k}} =$ `stage_targets[12]` rescales 48 kHz samples into VM frames. Upper bound $\tau_{\max} = \mathtt{cap} - 3$ applies when modulated (LFO depths, ramp spans, `|stage_targets[17]| > 1.0e-6`, or $|\Delta_{\mathrm{ctrl,48k}}| > 10^{-6}$ nonzero), and $\tau_{\max} = \mathtt{cap} - 2$ otherwise.
 
 For each lane $\tau_k = D_{\mathrm{int},k} + \mu_k$, modulated Catmull-Rom readout blends linear and cubic interpolation via `half_alpha_cubic_fp16`, denoted $\alpha_{\mathrm{half}}[g]$, computed at cold load and 3 kHz ticks from `g_loop,eff` using a 2-step Newton-Raphson reciprocal of `max(|g_loop,eff|, 0.5)` and scaled by `(1.0 - mu_freeze)` so passive freeze reaches lossless non-expansive hold at $\mu_{\mathrm{freeze}} = 1.0$:
 
@@ -216,7 +217,7 @@ At effective sample rate $f_{\mathrm{eff}} = M 2^{e-52}$, cold initialization co
 
 $$D_{\mathrm{eff}} = \left\lceil \frac{D_{\mathrm{ref}} f_{\mathrm{eff}}}{48000} \right\rceil, \qquad L = D_{\mathrm{eff}} + 2, \qquad B = 64 \left\lceil \frac{aL}{64} \right\rceil$$
 
-The 2-sample guard preserves the oldest 4-tap Catmull-Rom neighbor while maintaining $\tau[n] \ge 5.0$ on Top-of-Frame crossbar/transport quads (and $\tau[n] \ge 4.0$ on standalone single-sample rings). Crossbar reads finish across all active heads before end-of-frame writes update the ring.
+The 2-sample guard preserves the oldest 4-tap Catmull-Rom neighbor while maintaining $\tau_{\mathrm{ring}}[n] \ge 5.0$ on self-feedback `TransportQuad`s, $\tau_{\mathrm{eff}} \ge 42.0$ on crossbar taps, and $\tau[n] \ge 4.0$ on standalone single-sample rings. Crossbar reads finish across all active heads before end-of-frame writes update the ring.
 
 #### 1.1.3 Host Memory-Ceiling Admission
 
@@ -247,7 +248,7 @@ In compact transport quads, the End-of-Frame write `ring[wr] = sat_write(w_ring)
 
 Standalone delay positions store an integer sample lag $D_{\mathrm{int}}$ plus an unsigned `Q0.32` fractional word rather than a single `f32` total delay, preventing sub-sample quantization drift on multi-second lines. Converting only the fractional part via $\mu = \mathtt{f32}(\mathrm{frac}) \cdot 2^{-32} \in [0.0, 1.0)$ carries any rounding overflow 1.0 to $(D_{\mathrm{int}} + 1, 0.0)$ and clamps total lag strictly inside `[4.0, L - 2.0]` for standalone rings.
 
-For Top-of-Frame crossbar and transport quads executed in 4-frame causal micro-chunks, clamping `delay_int >= 5` (`tau_min = 5.0`) keeps `i_m1 = write_idx + 1 - delay_int <= write_idx - 4` on every step, preserving exact 0-ULP equivalence between 1-frame and 4-frame micro-chunk stepping.
+For transport quads executed in 4-frame causal micro-chunks, clamping the ring lag `delay_int >= 5` (`tau_min = 5.0` on self-feedback rings and `tau_ring_cb = tau_eff - D_os >= 5.0` with `tau_eff >= 42.0` on Top-of-Frame crossbar reads) keeps `i_m1 = write_idx + 1 - delay_int <= write_idx - 4` on every step, preserving exact 0-ULP equivalence between 1-frame and 4-frame micro-chunk stepping.
 
 #### 1.1.6 `fp16` Write Saturation Telemetry
 
@@ -428,7 +429,7 @@ Evaluating the branchless 32-bit triangle fold yields $u_A = 1 - |2\phi_A - 1| \
 
 $$H(\phi_A) = u_A^2\big(3 - 2u_A\big), \qquad H(\phi_B) = 1.0 - H(\phi_A), \qquad H(\phi_A) + H(\phi_B) \equiv 1.000000000000$$
 
-For a 100 ms grain at 48 kHz with $G = 4{,}800$ and +24 semitones where $\nu = -3$, the modulated delay reaches $7{,}205 + 3 \cdot 4{,}800 / 2 = 14{,}405$ samples. Because $\tau_{\max} = \mathtt{cap} - 3$ when modulated, satisfying the 5-sample crossbar causal floor requires $D_c \ge 7{,}205$ samples and ring capacity $\ge 14{,}408$ samples (power-of-two `cap >= 16,384` in transport quads).
+For a 100 ms grain at 48 kHz with $G = 4{,}800$ and +24 semitones where $\nu = -3$, half-span $|\nu|G/2 = 7{,}200$ samples requires $D_c \ge 7{,}205$ for the 5-sample self-feedback ring floor (reaching $14{,}405$ samples) or $D_{c,\mathrm{eff}} \ge 7{,}242$ for the crossbar `tau_eff >= 42.0` (`tau_ring_cb >= 5.0` at `D_os = 37`), both needing ring capacity $\ge 14{,}445$ (power-of-two `cap >= 16,384` in transport quads).
 
 ### 2.3 Continuous Barberpole Frequency Sweep (`Family 6`)
 
@@ -470,7 +471,7 @@ When active, any lane with zero `allpass_delays[k]` sets $A_k(z) = 1$ with zero 
 
 Setting all four delays to 0 yields a lossless memoryless `SO(4)` rotation, preserving 0-ULP identity when $\theta_{\mathrm{eff}} = 0$.
 
-Nonzero reference delays rescale via $D_{\text{ap},m}(f_{s,\text{vm}}) = \max(1, \mathrm{round}(D_{\text{ap},m}(48000) / \rho_{\text{vm}}))$ up to 16,384 samples ([router_and_crossbar_topology.md §9](router_and_crossbar_topology.md#9-continuous-time-zoh-rate-adaptation)); 223 samples at 48 kHz scale to 1,784 samples at 384 kHz, while `allpass_g` and `scat_psi` taper continuously by `1 - mu_freeze`.
+Nonzero reference delays rescale via $D_{\text{ap},m}(f_{s,\text{vm}}) = \max(1, \mathrm{round}(D_{\text{ap},m}(48000) / \rho_{\text{vm}}))$ at 1× `f_{s,host}` up to 4,096 samples (`<= 192 kHz`) ([router_and_crossbar_topology.md §9](router_and_crossbar_topology.md#9-continuous-time-zoh-rate-adaptation)); 223 samples at 48 kHz scale to 892 samples at 192 kHz, eliminating 384 kHz ring inflation while `allpass_g` and `scat_psi` taper continuously by `1 - mu_freeze`.
 
 During 4-frame causal micro-chunk stepping (`process_microchunk_4`), active execution when not in full hold (`!full_hold`) branches cleanly over three delay regimes matching 1-frame `step_vec4` at 0 ULP:
 
