@@ -124,7 +124,7 @@ pub(super) fn run_pass2_ste_qat_polish(
             },
         )?;
         gx.fill(0.0);
-        layout.write_grad(&grads, &mut gx);
+        layout.write_grad(&current_model, &grads, &mut gx);
         space.pullback_grad(&gx, &jac_shadow, &mut gu);
 
         let lr = cosine_lr_with_warmup(step, steps, &adamw_cfg);

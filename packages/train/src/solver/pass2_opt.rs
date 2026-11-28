@@ -6,7 +6,7 @@
 pub mod adjoints;
 mod causal_loop;
 pub(crate) mod crossbar;
-pub(crate) mod eval;
+pub mod eval;
 mod hybrid;
 mod matryoshka;
 pub(crate) mod op_n_pre;
@@ -14,7 +14,7 @@ pub mod op_t_quad;
 mod prescreen;
 mod qat_polish;
 pub(crate) mod sensory;
-mod theta;
+pub mod theta;
 mod varpro_sync;
 mod zoh_jacobian;
 

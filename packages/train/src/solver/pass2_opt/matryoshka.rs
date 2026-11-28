@@ -224,7 +224,7 @@ pub(super) fn eval_joint_matryoshka_and_grad(
                 },
             )?;
             let mut gx = vec![0.0_f64; dim];
-            ctx.layout.write_grad(&grads, &mut gx);
+            ctx.layout.write_grad(&view, &grads, &mut gx);
             tier_grads[ti] = if ctx.use_pcgrad
                 && let Some((space, jac)) = ctx.space_jac
             {

@@ -96,26 +96,32 @@ pub(crate) struct Pass2TileGrads {
 
 /// Complete full-subspace Pass-2 continuous + readout gradients matching [`SonaModelF64`].
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Pass2FullGrads {
-    pub core_quads: Vec<Pass2CoreQuadGrads>,
-    pub tiles: Vec<Pass2TileGrads>,
-    pub sensory: SensoryQuadGrads,
-    pub crossbar: CrossbarGrads,
-    pub op_n_pre: OpNPreGrads,
-    pub d_ro_pole_48k: f64,
+pub struct Pass2FullGrads {
+    pub(crate) core_quads: Vec<Pass2CoreQuadGrads>,
+    pub(crate) tiles: Vec<Pass2TileGrads>,
+    pub(crate) sensory: SensoryQuadGrads,
+    pub(crate) crossbar: CrossbarGrads,
+    pub(crate) op_n_pre: OpNPreGrads,
+    pub(crate) d_ro_pole_48k: f64,
     /// Per-pair Kautz gradients `[d_r_low, d_theta, d_b_gamma, d_c_re_l, d_c_im_l, d_c_re_r, d_c_im_r]`.
-    pub d_kautz: Vec<[f64; 7]>,
-    pub op_t: [OpTQuadAdjointGrads; 4],
-    pub d_tank_dry_mix: f64,
-    pub d_op_t_wet_scale: f64,
-    pub d_w_ro: Vec<[f64; 12]>,
-    pub d_direct_s2_u: [f64; 2],
-    pub d_direct_s2_hp: [f64; 2],
-    pub d_pre_conv_u: [f64; 2],
-    pub d_pre_conv_hp: [f64; 2],
+    pub(crate) d_kautz: Vec<[f64; 7]>,
+    pub(crate) op_t: [OpTQuadAdjointGrads; 4],
+    pub(crate) d_tank_dry_mix: f64,
+    pub(crate) d_op_t_wet_scale: f64,
+    pub(crate) d_w_ro: Vec<[f64; 12]>,
+    pub(crate) d_direct_s2_u: [f64; 2],
+    pub(crate) d_direct_s2_hp: [f64; 2],
+    pub(crate) d_pre_conv_u: [f64; 2],
+    pub(crate) d_pre_conv_hp: [f64; 2],
 }
 
 impl Pass2FullGrads {
+    /// Returns the `svf_k_nl` gradients for core quad `q`.
+    #[must_use]
+    pub fn core_quad_svf_k_nl(&self, q: usize) -> [f64; 4] {
+        self.core_quads.get(q).map_or([0.0; 4], |c| c.svf_k_nl)
+    }
+
     #[must_use]
     pub(crate) fn with_dims(q_count: usize, k_count: usize) -> Self {
         Self {

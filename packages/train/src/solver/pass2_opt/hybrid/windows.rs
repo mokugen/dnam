@@ -537,7 +537,7 @@ pub(super) fn eval_single_tier_with_grad(
             },
         )?;
         gx.resize(layout.dim(), 0.0);
-        layout.write_grad(&grads, &mut gx);
+        layout.write_grad(&view, &grads, &mut gx);
     }
     Ok((bd.total, gx))
 }
